@@ -12,7 +12,7 @@
 #                checked against the native x64 build of the same source (a mismatch fails the run)
 #   fxunit       the in-process translated-loop tests in fx_translator_tests (core_perf_*); needs build dirs
 #   blender      Blender.app headless: process CPU of -b --factory-startup + one operator (startup-dominated)
-#   cycles       Blender.app headless Cycles render of the factory cube (320x180, 16 samples, 2 threads)
+#   cycles       Blender.app headless Cycles render of the factory cube (640x360, 64 samples, 2 threads; about 8 s of render)
 #   plugin       a Blender renderer plug-in's headless cube render, on a scratch copy of the plug-in's Alchemy root
 #                (-PluginRoot: a folder under -Artifacts; -PluginScript: the cube script's guest path)
 #   qlab         QLab 5 to its first frame (ALCHEMY_PERF "first frame presented") on a scratch copy of alchemy-root
@@ -273,8 +273,8 @@ function Bench-Blender($side, [string]$dir) {
 function Bench-Cycles($side, [string]$dir) {
     $user = Join-Path $Out 'blender-user'; New-Item -ItemType Directory -Force $user | Out-Null
     $env = @{ TRANSMUTE_FX_CACHE_DIR = $side.cache; BLENDER_USER_RESOURCES = (Guest $user) }
-    $expr = "import bpy, time; s = bpy.context.scene; s.render.engine = 'CYCLES'; s.cycles.device = 'CPU'; s.cycles.samples = 16; " +
-            "s.cycles.use_denoising = False; s.render.resolution_x = 320; s.render.resolution_y = 180; s.render.resolution_percentage = 100; " +
+    $expr = "import bpy, time; s = bpy.context.scene; s.render.engine = 'CYCLES'; s.cycles.device = 'CPU'; s.cycles.samples = 64; " +
+            "s.cycles.use_denoising = False; s.render.resolution_x = 640; s.render.resolution_y = 360; s.render.resolution_percentage = 100; " +
             "s.render.threads_mode = 'FIXED'; s.render.threads = 2; t = time.perf_counter(); bpy.ops.render.render(); " +
             "print('FXPERF render_s=%.3f' % (time.perf_counter() - t)); px = bpy.data.images['Render Result']; print('FXPERF done')"
     $r = Invoke-Measured $side.exe (Blender-Args $expr) $env (Join-Path $dir 'cycles') 900 0x5

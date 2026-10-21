@@ -37,7 +37,7 @@ scripts/perf/fx_ab.ps1 ... -Bench sp-jitless,js-jitless,js-jit,fps -Rounds 3   #
 | `micro` | fxbench's kernels (below), translated, pinned to two P-cores (affinity 0x5), high priority and QoS; `fxbench_llsc` for the two atomics kernels | ns per iteration, median of `-MicroReps` in-process repetitions |
 | `fxunit` | `fx_translator_tests --filter core_perf_`: hand-encoded LCG, memory and call loops in-process, and translation speed | ns per iteration; thread cycles per 12-instruction region |
 | `blender` | Blender.app `-b --factory-startup` plus one operator | process CPU and wall seconds |
-| `cycles` | Blender.app headless Cycles render of the factory cube, 320x180, 16 samples, 2 threads | render seconds (`time.perf_counter` around `render()`) |
+| `cycles` | Blender.app headless Cycles render of the factory cube, 640x360, 64 samples, 2 threads (about 8 s of render on main) | render seconds (`time.perf_counter` around `render()`) |
 | `plugin` | a Blender renderer plug-in's headless cube render on a scratch copy of its Alchemy root (`-PluginRoot`, `-PluginScript`, or `ALCHEMY_PERF_PLUGIN_ROOT`/`_SCRIPT`) | "render returned in" seconds, plug-in enable seconds |
 | `qlab` | QLab 5 to its first frame on a scratch copy of `alchemy-root` (`ALCHEMY_PERF`) | "first frame presented" ms |
 | `sp-jitless`, `sp-jit` | Speedometer 3.0 (browserbench.org), `-SpeedometerIterations` (1), software compositor | score |
