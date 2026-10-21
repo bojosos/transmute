@@ -1,0 +1,5 @@
+converted=1 is_fiber=1 data=99
+trace=m;f0:0:0;f1:100:1;m;f0:1:0;f1:101:1;m;f0:2:0;f1:102:1;m-final;f0-done:0;f1-done:1;
+main fls=50 current-is-main=1
+fls callbacks after DeleteFiber=2
+ConvertFiberToThread=1 is_fiber=0

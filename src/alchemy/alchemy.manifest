@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Alchemy executables accept Win32 paths longer than MAX_PATH when the host
+     enables them (LongPathsEnabled). macOS bundles nest deeply: Chrome's
+     Helpers/GoogleUpdater.app/.../GoogleSoftwareUpdateAgent is 255 characters
+     below Google Chrome.app, so an installed root path passes 260. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings xmlns:ws2="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+      <ws2:longPathAware>true</ws2:longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

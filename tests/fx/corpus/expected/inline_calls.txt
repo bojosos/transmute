@@ -1,0 +1,16 @@
+calls total=1271250 finally=3000
+k=1 mode=0 r=200 code=00000000 in_load=0 in_sum=0 finally=1
+k=2 mode=0 r=603 code=00000000 in_load=0 in_sum=0 finally=1
+k=3 mode=0 r=1313 code=00000000 in_load=0 in_sum=0 finally=1
+k=4 mode=0 r=-1 code=c0000005 in_load=0 in_sum=1 finally=1
+k=5 mode=0 r=-1 code=c0000005 in_load=0 in_sum=1 finally=1
+k=1 mode=1 r=200 code=00000000 in_load=0 in_sum=0 finally=1
+k=2 mode=1 r=603 code=00000000 in_load=0 in_sum=0 finally=1
+k=3 mode=1 r=1313 code=00000000 in_load=0 in_sum=0 finally=1
+k=4 mode=1 r=-1 code=c0000005 in_load=1 in_sum=0 finally=1
+k=5 mode=1 r=-1 code=c0000005 in_load=1 in_sum=0 finally=1
+null code=c0000005 in_load=1 finally=1
+after faults total=96200
+rwx leaf patch: 13 270000 -> 83 1670000
+leaf repatch total=134550
+wx leaf patch: 3007500 -> 787500 (fn(1)=155)

@@ -1,0 +1,46 @@
+{
+  "comment": "fx end-to-end corpus. Each program is built for ARM64 (run under transmute-fx) and x64 (run natively; its output is the expected output). DLLs are listed before their users. Fields: name, sources, kind (exe|dll), entry (main|wmain), def, link (corpus DLLs to link), flags (both targets; /EHa makes clang catch faults raised directly in __try bodies), linkFlags, args, env, exit, expected (expected-output name), arm64Flags, x64Flags, timeout (seconds).",
+  "programs": [
+    { "name": "fxcorpus_dll", "kind": "dll", "sources": ["fxcorpus_dll.c"], "def": "fxcorpus_dll.def" },
+    { "name": "hello", "sources": ["hello.c"] },
+    {
+      "name": "args_env",
+      "sources": ["args_env.c"],
+      "args": ["alpha", "two words", "quote\"inside", "back\\slash\\", "", "trailing\\\\", "--flag=1"],
+      "env": { "FX_CORPUS_VAR": "value-123", "FX_CORPUS_OTHER": "other value with spaces" },
+      "exit": 7
+    },
+    {
+      "name": "wargs",
+      "sources": ["wargs.c"],
+      "entry": "wmain",
+      "args": ["plain", "héllo wörld", "日本語", "tab\tsep"],
+      "env": { "FX_CORPUS_WIDE": "ünicöde" },
+      "exit": 5
+    },
+    { "name": "heap_stress", "sources": ["heap_stress.c"] },
+    { "name": "file_io", "sources": ["file_io.c"] },
+    { "name": "threads", "sources": ["threads.cpp"] },
+    { "name": "atomics", "sources": ["atomics.cpp"] },
+    { "name": "atomics_lse", "sources": ["atomics.cpp"], "arm64Flags": ["/clang:-march=armv8.1-a"], "expected": "atomics" },
+    { "name": "tls", "sources": ["tls.cpp"] },
+    { "name": "seh", "sources": ["seh.c"], "flags": ["/EHa"] },
+    { "name": "stack_overflow", "sources": ["stack_overflow.c"], "flags": ["/EHa"] },
+    { "name": "big_stack_main", "sources": ["big_stack_main.c"], "linkFlags": ["/STACK:16777216"] },
+    { "name": "big_stack_threads", "sources": ["big_stack_threads.c"] },
+    { "name": "stack_limits", "sources": ["stack_limits.c"] },
+    { "name": "cpp_exceptions", "sources": ["cpp_exceptions.cpp"] },
+    { "name": "setjmp_longjmp", "sources": ["setjmp_longjmp.c"], "flags": ["/EHa"] },
+    { "name": "sort_search", "sources": ["sort_search.c"] },
+    { "name": "stl", "sources": ["stl.cpp"] },
+    { "name": "dll_user", "sources": ["dll_user.c"], "link": ["fxcorpus_dll"] },
+    { "name": "dynload", "sources": ["dynload.c"] },
+    { "name": "jit_smc", "sources": ["jit_smc.c"] },
+    { "name": "inline_calls", "sources": ["inline_calls.c"], "flags": ["/EHa"] },
+    { "name": "win32_callbacks", "sources": ["win32_callbacks.c"] },
+    { "name": "fibers", "sources": ["fibers.c"] },
+    { "name": "fp_math", "sources": ["fp_math.c"] },
+    { "name": "neon", "sources": ["neon.c"] },
+    { "name": "static_init", "sources": ["static_init.cpp"], "exit": 3 }
+  ]
+}

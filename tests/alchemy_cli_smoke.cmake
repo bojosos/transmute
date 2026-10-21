@@ -1,0 +1,25 @@
+if(NOT DEFINED ALCHEMY OR NOT DEFINED PROGRAM)
+    message(FATAL_ERROR "ALCHEMY and PROGRAM are required")
+endif()
+foreach(mode IN ITEMS interpreter jit)
+    set(options)
+    if(mode STREQUAL "jit")
+        list(APPEND options --jit)
+    endif()
+    execute_process(COMMAND "${ALCHEMY}" ${options} "${PROGRAM}"
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 15)
+    if(NOT result STREQUAL "0" OR NOT output STREQUAL "Hello World from MacOS: 27\n" OR NOT errors STREQUAL "")
+        message(FATAL_ERROR "${mode}: exit=${result}, stdout=[${output}], stderr=[${errors}]")
+    endif()
+endforeach()
+execute_process(COMMAND "${ALCHEMY}" --jit-stats "${PROGRAM}"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 15)
+if(NOT result STREQUAL "0" OR NOT output STREQUAL "Hello World from MacOS: 27\n" OR
+   NOT errors MATCHES "native guest instructions [1-9][0-9]*")
+    message(FATAL_ERROR "JIT proof failed: exit=${result}, stdout=[${output}], stderr=[${errors}]")
+endif()
+execute_process(COMMAND "${ALCHEMY}" doctor "${PROGRAM}"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 15)
+if(NOT result STREQUAL "0" OR NOT output MATCHES "Architecture: ARM64" OR NOT errors STREQUAL "")
+    message(FATAL_ERROR "doctor failed: exit=${result}, stdout=[${output}], stderr=[${errors}]")
+endif()

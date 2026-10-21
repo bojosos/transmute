@@ -1,0 +1,13 @@
+u8: fa 4 4 d8 58 59 a6 4d 63 2a ff 0 cas=0,1 lock_free=1
+u16: fa 104 104 ffd8 5a58 da59 25a6 4d 63 12a ffff 0 cas=0,1 lock_free=1
+u32: fa 104 104 ffffffd8 5a5a5a58 5a5ada59 5a5a25a6 4d 63 12a ffffffff 0 cas=0,1 lock_free=1
+u64: fa 104 104 ffffffffffffffd8 5a5a5a5a5a5a5a58 5a5a5a5a5a5ada59 5a5a5a5a5a5a25a6 4d 63 12a ffffffffffffffff 0 cas=0,1 lock_free=1
+interlocked: b a a 2a 7 ff0 f0 10f0 3e9 3e9 fffffffffffffc18 6 6 3 8 238
+pointer cas old-null=1 exchanged=1 final-null=1
+cas128 ok=1 pair=10,20 ok2=0 observed=10,20
+bittest 0 1 1 bits=0
+contention c64=1200000 c32=400000 c16=58752 c8=128 legacy=400000 max=1000002 or=ffffffffffffffff guarded=50000
+atomic<16 bytes> lo=40000 hi=80000
+atomic<double> sum=20000.0
+message passing rounds=20000 bad=0
+dekker rounds=20000 both-zero=0

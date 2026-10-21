@@ -1,0 +1,9 @@
+argc=5
+argv[1]=[plain] len=5
+argv[2]=[h\u00e9llo w\u00f6rld] len=11
+argv[3]=[\u65e5\u672c\u8a9e] len=3
+argv[4]=[tab\u0009sep] len=7
+_wgetenv FX_CORPUS_WIDE=[\u00fcnic\u00f6de]
+envp FX_CORPUS_WIDE entries=1
+utf8 bytes=14: 68 c3 a9 6c 6c 6f 20 77 c3 b6 72 6c 64
+swprintf=[12-w-0.50]

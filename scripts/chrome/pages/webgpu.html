@@ -1,0 +1,265 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy WebGPU: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+td, th { padding: 2px 10px; text-align: left; vertical-align: top; }
+canvas { border: 1px solid #888; }
+</style>
+</head>
+<body>
+<h1 id="h">Alchemy WebGPU smoke</h1>
+<p>A WebGPU smoke written for Alchemy: adapter and device, a compute pass whose storage buffer is
+read back through <code>mapAsync</code>, an indexed, instanced render pass with a uniform buffer, a
+sampled texture and a vertex buffer into an offscreen texture (read back), and a render pass into a
+canvas through <code>getCurrentTexture()</code> (copied out and read back). Every step runs inside a
+validation error scope and under a time limit. The verdict goes into <code>document.title</code>
+(<code>Alchemy WebGPU: PASS</code> or <code>Alchemy WebGPU: FAIL &lt;test&gt;</code>) and into
+<code>body[data-verdict]</code>. <code>--dump-dom</code> waits for it: a chain of failing image
+loads holds the load event until the verdict is set (at most 90 s).</p>
+<pre id="adapter">adapter: pending</pre>
+<table>
+<thead><tr><th>test</th><th>result</th><th>detail</th></tr></thead>
+<tbody id="results"></tbody>
+</table>
+<p id="status">not run</p>
+<pre id="errors"></pre>
+<canvas id="canvas" width="64" height="64"></canvas>
+<script>
+"use strict";
+var finished = false, holdUntil = Date.now() + 90000;
+(function hold() {
+  if (finished || Date.now() > holdUntil) return;
+  var img = new Image();
+  img.onerror = img.onload = function () { img.remove(); hold(); };
+  img.src = "missing-" + Math.random() + ".png";
+  document.body.appendChild(img);
+})();
+
+var rows = document.getElementById("results");
+var failures = [];
+function row(name, ok, detail) {
+  var tr = document.createElement("tr");
+  var verdict = ok === null ? "skip" : ok ? "pass" : "FAIL";
+  tr.innerHTML = "<td></td><td></td><td></td>";
+  tr.children[0].textContent = name;
+  tr.children[1].textContent = verdict;
+  tr.children[2].textContent = detail || "";
+  tr.id = "t-" + name;
+  tr.dataset.result = verdict;
+  rows.appendChild(tr);
+  if (ok === false) failures.push(name);
+}
+function within(promise, seconds, what) {
+  return Promise.race([promise, new Promise(function (_, reject) {
+    setTimeout(function () { reject(new Error(what + " did not settle within " + seconds + " s")); }, seconds * 1000);
+  })]);
+}
+var uncaptured = [];
+async function step(device, name, body) {
+  device.pushErrorScope("validation");
+  device.pushErrorScope("out-of-memory");
+  var problems = [];
+  try {
+    var result = await body(device);
+    if (result) problems.push(result);
+  } catch (e) { problems.push("threw " + e.message); }
+  try {
+    var oom = await within(device.popErrorScope(), 20, "popErrorScope");
+    if (oom) problems.push("out-of-memory: " + oom.message);
+    var val = await within(device.popErrorScope(), 20, "popErrorScope");
+    if (val) problems.push("validation: " + val.message);
+  } catch (e) { problems.push(e.message); }
+  row(name, problems.length === 0, problems.join("; "));
+}
+function near(got, want, tol) {
+  for (var i = 0; i < want.length; i++) if (Math.abs(got[i] - want[i]) > tol) return false;
+  return true;
+}
+// Reads the RGBA8 (or BGRA8, swizzled to RGBA) pixel (x, y) from a mapped copy with 256-byte rows.
+function pixelAt(bytes, x, y, bgra) {
+  var o = y * 256 + x * 4;
+  return bgra ? [bytes[o + 2], bytes[o + 1], bytes[o], bytes[o + 3]] : [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
+}
+async function readTexture(device, texture, bgra, points) {
+  var buf = device.createBuffer({ size: 256 * 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture: texture }, { buffer: buf, bytesPerRow: 256, rowsPerImage: 64 }, [64, 64, 1]);
+  device.queue.submit([enc.finish()]);
+  await within(buf.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var bytes = new Uint8Array(buf.getMappedRange().slice(0));
+  buf.unmap(); buf.destroy();
+  var problems = [];
+  points.forEach(function (p) {
+    var got = pixelAt(bytes, p[0], p[1], bgra);
+    if (!near(got, p[2], 3)) problems.push(p[3] + " (" + p[0] + "," + p[1] + ") = " + got.join(",") + ", want " + p[2].join(","));
+  });
+  return problems.join("; ");
+}
+
+var COMPUTE_WGSL = `
+@group(0) @binding(0) var<storage, read_write> data : array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+  let i = id.x;
+  if (i < arrayLength(&data)) { data[i] = i * i + 7u + data[i]; }
+}`;
+
+// Four instances of one indexed quad, each in its own quadrant; colour = uniform tint * texel.
+// The 2x2 texture has one texel per instance; the instance picks it.
+var RENDER_WGSL = `
+struct Uniforms { tint : vec4<f32> };
+@group(0) @binding(0) var<uniform> u : Uniforms;
+@group(0) @binding(1) var tex : texture_2d<f32>;
+@group(0) @binding(2) var samp : sampler;
+struct VOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+@vertex
+fn vs(@location(0) corner : vec2<f32>, @builtin(instance_index) inst : u32) -> VOut {
+  let cell = vec2<f32>(f32(inst % 2u), f32(inst / 2u));
+  var o : VOut;
+  o.pos = vec4<f32>(corner + cell - vec2<f32>(1.0, 1.0), 0.0, 1.0);
+  o.uv = (cell + vec2<f32>(0.5, 0.5)) * 0.5;
+  return o;
+}
+@fragment
+fn fs(v : VOut) -> @location(0) vec4<f32> { return textureSample(tex, samp, v.uv) * u.tint; }`;
+
+var TRIANGLE_WGSL = `
+@vertex
+fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  return vec4<f32>(p[i], 0.0, 1.0);
+}
+@fragment
+fn fs(@builtin(position) pos : vec4<f32>) -> @location(0) vec4<f32> {
+  if (pos.x < 32.0) { return vec4<f32>(1.0, 0.5, 0.0, 1.0); }
+  return vec4<f32>(0.0, 0.25, 1.0, 1.0);
+}`;
+
+async function computeTest(device) {
+  var n = 1024;
+  var storage = device.createBuffer({ size: n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  var init = new Uint32Array(n);
+  for (var i = 0; i < n; i++) init[i] = 3 * i;
+  device.queue.writeBuffer(storage, 0, init);
+  var readback = device.createBuffer({ size: n * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var module = device.createShaderModule({ code: COMPUTE_WGSL });
+  var pipeline = await within(device.createComputePipelineAsync({ layout: "auto", compute: { module: module, entryPoint: "main" } }), 60, "createComputePipelineAsync");
+  var group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: storage } }] });
+  var enc = device.createCommandEncoder();
+  var pass = enc.beginComputePass();
+  pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.dispatchWorkgroups(n / 64);
+  pass.end();
+  enc.copyBufferToBuffer(storage, 0, readback, 0, n * 4);
+  device.queue.submit([enc.finish()]);
+  await within(device.queue.onSubmittedWorkDone(), 30, "onSubmittedWorkDone");
+  await within(readback.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var out = new Uint32Array(readback.getMappedRange().slice(0));
+  readback.unmap();
+  for (var j = 0; j < n; j++) {
+    var want = (j * j + 7 + 3 * j) >>> 0;
+    if (out[j] !== want) return "data[" + j + "] = " + out[j] + ", want " + want;
+  }
+  storage.destroy(); readback.destroy();
+  return "";
+}
+
+async function offscreenTest(device) {
+  var target = device.createTexture({ size: [64, 64], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  var tex = device.createTexture({ size: [2, 2], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  device.queue.writeTexture({ texture: tex }, new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]),
+    { bytesPerRow: 8, rowsPerImage: 2 }, [2, 2, 1]);
+  var sampler = device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
+  var uniforms = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(uniforms, 0, new Float32Array([1, 1, 1, 0.5]));
+  var verts = device.createBuffer({ size: 32, usage: GPUBufferUsage.VERTEX, mappedAtCreation: true });
+  new Float32Array(verts.getMappedRange()).set([0, 0, 1, 0, 0, 1, 1, 1]);
+  verts.unmap();
+  var indices = device.createBuffer({ size: 12, usage: GPUBufferUsage.INDEX, mappedAtCreation: true });
+  new Uint16Array(indices.getMappedRange()).set([0, 1, 2, 2, 1, 3]);
+  indices.unmap();
+  var module = device.createShaderModule({ code: RENDER_WGSL });
+  var pipeline = await within(device.createRenderPipelineAsync({
+    layout: "auto",
+    vertex: { module: module, entryPoint: "vs", buffers: [{ arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }] }] },
+    fragment: { module: module, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
+    primitive: { topology: "triangle-list" }
+  }), 60, "createRenderPipelineAsync");
+  var group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: uniforms } }, { binding: 1, resource: tex.createView() }, { binding: 2, resource: sampler }] });
+  var enc = device.createCommandEncoder();
+  var pass = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }] });
+  pass.setPipeline(pipeline); pass.setBindGroup(0, group);
+  pass.setVertexBuffer(0, verts); pass.setIndexBuffer(indices, "uint16");
+  pass.drawIndexed(6, 4);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  // Framebuffer y grows downwards in WebGPU: instance 0 (clip y -1..0) is the bottom-left quadrant,
+  // i.e. texture rows 32..63. Texture row 0 of the 2x2 texture (red, green) is v = 0..0.5.
+  var problems = await readTexture(device, target, false, [
+    [16, 48, [255, 0, 0, 128], "instance 0"], [48, 48, [0, 255, 0, 128], "instance 1"],
+    [16, 16, [0, 0, 255, 128], "instance 2"], [48, 16, [255, 255, 255, 128], "instance 3"]]);
+  target.destroy(); tex.destroy(); uniforms.destroy(); verts.destroy(); indices.destroy();
+  return problems;
+}
+
+async function canvasTest(device) {
+  var canvas = document.getElementById("canvas");
+  var ctx = canvas.getContext("webgpu");
+  if (!ctx) return "canvas.getContext('webgpu') returned null";
+  var format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device: device, format: format, alphaMode: "opaque", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  var module = device.createShaderModule({ code: TRIANGLE_WGSL });
+  var pipeline = await within(device.createRenderPipelineAsync({
+    layout: "auto", vertex: { module: module, entryPoint: "vs" },
+    fragment: { module: module, entryPoint: "fs", targets: [{ format: format }] }
+  }), 60, "createRenderPipelineAsync");
+  var texture = ctx.getCurrentTexture();
+  var enc = device.createCommandEncoder();
+  var pass = enc.beginRenderPass({ colorAttachments: [{ view: texture.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }] });
+  pass.setPipeline(pipeline); pass.draw(3);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  var problems = await readTexture(device, texture, format === "bgra8unorm", [
+    [10, 32, [255, 128, 0, 255], "left half"], [54, 32, [0, 64, 255, 255], "right half"]]);
+  return (problems ? problems + " " : "") + (problems ? "(format " + format + ")" : "");
+}
+
+(async function main() {
+  if (!("gpu" in navigator)) { row("navigator.gpu", false, "absent (isSecureContext=" + window.isSecureContext + ")"); return; }
+  var adapter = null;
+  try { adapter = await within(navigator.gpu.requestAdapter(), 120, "requestAdapter"); }
+  catch (e) { row("adapter", false, e.message); return; }
+  if (!adapter) { row("adapter", false, "requestAdapter() returned null"); return; }
+  var info = adapter.info || {};
+  var fallback = info.isFallbackAdapter !== undefined ? info.isFallbackAdapter : adapter.isFallbackAdapter;
+  document.getElementById("adapter").textContent = "adapter: vendor=" + info.vendor + " architecture=" + info.architecture +
+    " device=" + info.device + " description=" + info.description + " isFallbackAdapter=" + fallback;
+  row("adapter", true, info.vendor + " " + info.architecture + (fallback ? " (fallback)" : ""));
+  var device = null;
+  try { device = await within(adapter.requestDevice(), 60, "requestDevice"); }
+  catch (e) { row("device", false, e.message); return; }
+  row("device", !!device && !!device.queue, device ? "" : "null device");
+  if (!device) return;
+  device.addEventListener("uncapturederror", function (e) { uncaptured.push(e.error.message); });
+  var lost = null;
+  device.lost.then(function (i) { lost = i.reason + ": " + i.message; });
+  await step(device, "compute", computeTest);
+  await step(device, "offscreen", offscreenTest);
+  await step(device, "canvas", canvasTest);
+  if (lost) row("device.lost", false, lost);
+  if (uncaptured.length) row("uncapturederror", false, uncaptured.slice(0, 3).join("; "));
+})().catch(function (e) { row("main", false, "threw " + e.message); }).finally(function () {
+  var verdict = failures.length ? "FAIL " + failures[0] : "PASS";
+  document.getElementById("status").textContent = verdict +
+    (failures.length > 1 ? " (+" + (failures.length - 1) + " more: " + failures.slice(1).join(", ") + ")" : "");
+  document.getElementById("h").setAttribute("data-js", "ran");
+  document.body.dataset.verdict = verdict;
+  document.title = "Alchemy WebGPU: " + verdict;
+  finished = true;
+});
+</script>
+</body>
+</html>

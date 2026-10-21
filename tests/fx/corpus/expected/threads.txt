@@ -1,0 +1,16 @@
+_beginthreadex wait=0 12742320 12742320 12742320 12742320
+critical section counter=400000 consistent=1
+srwlock a=100000 b=-100000 inconsistent=0 try=1
+condition variable consumed=40000 sum=400020000
+std::condition_variable consumed=40000 sum=799980000
+recursive depth=11 timed try_lock=1
+shared_mutex value=120000 torn=0
+call_once calls=1
+thread id differs=1 hardware_concurrency>0=1
+event ping-pong rounds=2000
+manual event before=258 after=0 again=0 reset=258
+semaphore waits=0,0,258 previous=0 over-release=0 error=298
+mutex recursive=0 extra-release=0 error=288
+WaitOnAddress seen=5050
+suspended still-active=1 wait=258 resume=1 exit=1234
+sleepers=8

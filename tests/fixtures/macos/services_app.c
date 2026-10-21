@@ -1,0 +1,60 @@
+/* No SDK headers. These declarations describe only the exercised Darwin ABI. */
+typedef unsigned long size_t;
+typedef long ssize_t;
+extern void *calloc(size_t, size_t);
+extern void *realloc(void *, size_t);
+extern void free(void *);
+extern int memcmp(const void *, const void *, size_t);
+extern char *getenv(const char *);
+extern int setenv(const char *, const char *, int);
+extern int strcmp(const char *, const char *);
+extern int open(const char *, int, ...);
+extern int close(int);
+extern ssize_t write(int, const void *, size_t);
+extern ssize_t read(int, void *, size_t);
+extern long lseek(int, long, int);
+extern int unlink(const char *);
+extern int snprintf(char *, size_t, const char *, ...);
+extern int printf(const char *, ...);
+extern int clock_gettime(int, void *);
+extern int getentropy(void *, size_t);
+extern int atexit(void (*)(void));
+extern int getpagesize(void);
+extern long sysconf(int);
+extern int sysctlbyname(const char *, void *, size_t *, const void *, size_t);
+extern void *mmap(void *, size_t, int, int, int, long);
+extern int munmap(void *, size_t);
+struct timespec { long seconds, nanoseconds; };
+static void finish(void) { printf("services finalized\n"); }
+int main(int argc, char **argv) {
+    if (argc != 2) return 10;
+    unsigned char *memory = calloc(32, 1);
+    if (!memory) return 11;
+    for (int n = 0; n < 32; ++n) if (memory[n]) return 12;
+    memory[0] = 27;
+    memory = realloc(memory, 64);
+    if (!memory || memory[0] != 27) return 13;
+    if (setenv("ALCHEMY_TEST_VALUE", "guest", 1) || strcmp(getenv("ALCHEMY_TEST_VALUE"), "guest")) return 14;
+    char message[64];
+    int length = snprintf(message, sizeof(message), "%s:%04d:%lx:%.2f\n", getenv("ALCHEMY_TEST_VALUE"), 27, 0xabcUL, 1.25);
+    if (length != 20 || strcmp(message, "guest:0027:abc:1.25\n")) return 15;
+    int descriptor = open(argv[1], 2 | 0x200 | 0x400, 0600);
+    if (descriptor < 0 || write(descriptor, message, (size_t)length) != length || lseek(descriptor, 0, 0)) return 16;
+    char copied[64] = {0};
+    if (read(descriptor, copied, sizeof(copied)) != length || memcmp(copied, message, (size_t)length)) return 17;
+    if (close(descriptor) || unlink(argv[1])) return 18;
+    struct timespec timestamp;
+    if (clock_gettime(6, &timestamp) || timestamp.nanoseconds < 0 || timestamp.nanoseconds >= 1000000000) return 19;
+    if (getentropy(memory, 16)) return 20;
+    size_t page_size = 0, page_size_length = sizeof(page_size);
+    if (getpagesize() != 16384 || sysconf(29) != 16384 ||
+        sysctlbyname("hw.pagesize", &page_size, &page_size_length, 0, 0) || page_size != 16384) return 22;
+    unsigned char *mapping = mmap(0, 4097, 3, 0x1002, -1, 0);
+    if (mapping == (void *)-1 || (unsigned long)mapping % page_size) return 23;
+    mapping[page_size - 1] = 27;
+    if (mapping[page_size - 1] != 27 || munmap(mapping, 4097)) return 24;
+    free(memory);
+    if (atexit(finish)) return 21;
+    printf("services passed\n");
+    return 0;
+}

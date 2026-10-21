@@ -1,0 +1,60 @@
+typedef void* pthread_t;
+typedef struct { long sig; char opaque[56]; } pthread_mutex_t;
+typedef struct { long sig; char opaque[40]; } pthread_cond_t;
+extern int pthread_create(pthread_t*, const void*, void* (*)(void*), void*);
+extern int pthread_join(pthread_t, void**);
+extern int pthread_mutex_lock(pthread_mutex_t*);
+extern int pthread_mutex_unlock(pthread_mutex_t*);
+extern int pthread_cond_wait(pthread_cond_t*, pthread_mutex_t*);
+extern int pthread_cond_broadcast(pthread_cond_t*);
+extern void* dlopen(const char*, int);
+extern void* dlsym(void*, const char*);
+extern int dlclose(void*);
+extern int puts(const char*);
+static pthread_mutex_t mutex = {0x32aaaba7, {0}};
+static pthread_cond_t condition = {0x3cb0b1bb, {0}};
+static int ready;
+static int released;
+static int (*plugin)(int);
+static void* plugin_handle;
+static int* worker_values[2];
+static void* worker(void* argument) {
+    if (pthread_mutex_lock(&mutex)) return (void*)1;
+    ++ready;
+    if (pthread_cond_broadcast(&condition)) return (void*)2;
+    while (!released) if (pthread_cond_wait(&condition, &mutex)) return (void*)3;
+    if (pthread_mutex_unlock(&mutex)) return (void*)4;
+    int* local = (int*)dlsym(plugin_handle, "alchemy_tls_value");
+    if (!local || *local != 7) return (void*)6;
+    worker_values[(long)argument == 27 ? 0 : 1] = local;
+    const int first = plugin((int)(long)argument);
+    const int second = plugin(1);
+    if (second != first + 1 || *local != second) return (void*)5;
+    return (void*)(long)second;
+}
+int main(int argc, char** argv) {
+    pthread_t a, b;
+    void* ra;
+    void* rb;
+    if (argc != 2) return 1;
+    if (pthread_create(&a, 0, worker, (void*)27) || pthread_create(&b, 0, worker, (void*)42)) return 2;
+    if (pthread_mutex_lock(&mutex)) return 3;
+    while (ready != 2) if (pthread_cond_wait(&condition, &mutex)) return 4;
+    void* handle = dlopen(argv[1], 2);
+    if (!handle) return 5;
+    plugin_handle = handle;
+    plugin = (int (*)(int))dlsym(handle, "alchemy_tls_add");
+    if (!plugin) return 6;
+    int* main_value = (int*)dlsym(handle, "alchemy_tls_value");
+    if (!main_value || *main_value != 7) return 12;
+    released = 1;
+    if (pthread_cond_broadcast(&condition)) return 7;
+    if (pthread_mutex_unlock(&mutex)) return 8;
+    if (pthread_join(a, &ra) || pthread_join(b, &rb)) return 9;
+    if (ra != (void*)35 || rb != (void*)50 || plugin(1) != 8) return 10;
+    if (*main_value != 8 || worker_values[0] == worker_values[1] ||
+        worker_values[0] == main_value || worker_values[1] == main_value) return 13;
+    if (dlclose(handle)) return 11;
+    puts("Late dylib TLS: 35 50 8");
+    return 0;
+}

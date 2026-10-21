@@ -1,0 +1,178 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy Wasm</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+td, th { padding: 2px 10px; text-align: right; }
+td:first-child, th:first-child { text-align: left; }
+</style>
+</head>
+<body>
+<h1 id="h">Alchemy WebAssembly</h1>
+<p>An inline, hand-assembled WebAssembly module: <code>add</code>, <code>mul</code>, <code>fill</code>
+(writes linear memory), <code>sum</code> (a checksum loop over linear memory) and <code>dispatch</code>
+(a call through a table). It is compiled with <code>new WebAssembly.Module</code> and instantiated
+synchronously; <code>sum</code> is then called until hot so V8 tiers it up from Liftoff to TurboFan.
+<code>WebAssembly.instantiate</code> is also called; its result lands in <code>#async</code> if it
+resolves before the dump. Without WebAssembly (V8's jitless mode) the page says so.</p>
+<table>
+<thead><tr><th>step</th><th>ms</th><th>result</th></tr></thead>
+<tbody id="results"></tbody>
+</table>
+<p id="status">not run</p>
+<p id="async">async: pending</p>
+<script>
+"use strict";
+(function () {
+  var rows = document.getElementById("results");
+  function row(name, ms, value) {
+    var tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + name + "</td><td id=\"r-" + name + "\">" + (ms === null ? "" : ms.toFixed(1)) +
+      "</td><td id=\"v-" + name + "\">" + value + "</td>";
+    rows.appendChild(tr);
+  }
+  function finish(state, text) {
+    document.getElementById("status").textContent = text;
+    document.body.dataset.wasm = state;
+    document.getElementById("h").setAttribute("data-js", "ran");
+    document.body.dataset.done = "1";
+  }
+
+  // --- The module's bytes (WebAssembly binary format 1). ---
+  function leb(n) { var out = []; do { var b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n); return out; }
+  function vec(items) { var out = leb(items.length); items.forEach(function (i) { out = out.concat(i); }); return out; }
+  function section(id, bytes) { return [id].concat(leb(bytes.length), bytes); }
+  function name(text) { var out = leb(text.length); for (var i = 0; i < text.length; i++) out.push(text.charCodeAt(i)); return out; }
+  function body(locals, code) { var bytes = locals.concat(code); return leb(bytes.length).concat(bytes); }
+  var I32 = 0x7f;
+  var types = vec([
+    [0x60, 0x02, I32, I32, 0x01, I32],        // 0: (i32, i32) -> i32
+    [0x60, 0x01, I32, 0x00],                  // 1: (i32) -> ()
+    [0x60, 0x03, I32, I32, I32, 0x01, I32]    // 2: (i32, i32, i32) -> i32
+  ]);
+  var functions = vec([[0x00], [0x00], [0x01], [0x00], [0x02]]);   // add, mul, fill, sum, dispatch
+  var table = vec([[0x70, 0x00, 0x02]]);                              // funcref, min 2
+  var memory = vec([[0x00, 0x01]]);                                   // min 1 page
+  var exports = vec([
+    name("add").concat([0x00, 0]), name("mul").concat([0x00, 1]), name("fill").concat([0x00, 2]),
+    name("sum").concat([0x00, 3]), name("dispatch").concat([0x00, 4]), name("mem").concat([0x02, 0])
+  ]);
+  var elements = vec([[0x00, 0x41, 0x00, 0x0b].concat(vec([[0], [1]]))]);   // table[0..1] = add, mul
+  var code = vec([
+    // add(a, b) = a + b
+    body([0x00], [0x20, 0, 0x20, 1, 0x6a, 0x0b]),
+    // mul(a, b) = a * b
+    body([0x00], [0x20, 0, 0x20, 1, 0x6c, 0x0b]),
+    // fill(n): for (i = 0; i < n; i++) mem[i] = i * 31 + 7
+    body([0x01, 0x01, I32], [
+      0x02, 0x40, 0x03, 0x40,
+      0x20, 1, 0x20, 0, 0x4f, 0x0d, 1,                          // if (i >= n) break
+      0x20, 1, 0x20, 1, 0x41, 31, 0x6c, 0x41, 7, 0x6a, 0x3a, 0x00, 0x00,   // store8(i, i * 31 + 7)
+      0x20, 1, 0x41, 1, 0x6a, 0x21, 1,                          // i++
+      0x0c, 0, 0x0b, 0x0b, 0x0b]),
+    // sum(n, rounds): for (r < rounds) for (i < n) acc = (acc * 31 + mem[i]) ^ r
+    body([0x01, 0x03, I32], [                                   // locals r = 2, i = 3, acc = 4
+      0x02, 0x40, 0x03, 0x40,
+      0x20, 2, 0x20, 1, 0x4f, 0x0d, 1,                          // if (r >= rounds) break
+      0x41, 0, 0x21, 3,                                         // i = 0
+      0x02, 0x40, 0x03, 0x40,
+      0x20, 3, 0x20, 0, 0x4f, 0x0d, 1,                          // if (i >= n) break
+      0x20, 4, 0x41, 31, 0x6c, 0x20, 3, 0x2d, 0x00, 0x00, 0x6a, 0x20, 2, 0x73, 0x21, 4,
+      0x20, 3, 0x41, 1, 0x6a, 0x21, 3,                          // i++
+      0x0c, 0, 0x0b, 0x0b,
+      0x20, 2, 0x41, 1, 0x6a, 0x21, 2,                          // r++
+      0x0c, 0, 0x0b, 0x0b,
+      0x20, 4, 0x0b]),
+    // dispatch(index, a, b) = table[index](a, b)
+    body([0x00], [0x20, 1, 0x20, 2, 0x20, 0, 0x11, 0x00, 0x00, 0x0b])
+  ]);
+  var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00].concat(
+    section(1, types), section(3, functions), section(4, table), section(5, memory),
+    section(7, exports), section(9, elements), section(10, code)));
+
+  // The same checksum in JavaScript.
+  function reference(n, rounds) {
+    var mem = new Uint8Array(n), acc = 0;
+    for (var i = 0; i < n; i++) mem[i] = Math.imul(i, 31) + 7;
+    for (var r = 0; r < rounds; r++) for (var j = 0; j < n; j++) acc = ((Math.imul(acc, 31) + mem[j]) | 0) ^ r;
+    return acc >>> 0;
+  }
+
+  row("bytes", null, bytes.length);
+  if (typeof WebAssembly !== "object") {
+    var smallRef = reference(4096, 2);
+    row("js-reference", null, smallRef);
+    finish("unavailable", "WebAssembly is not available (typeof WebAssembly: " + typeof WebAssembly + ")");
+    return;
+  }
+  try {
+    var t = performance.now();
+    if (!WebAssembly.validate(bytes)) throw new Error("WebAssembly.validate: false");
+    var module = new WebAssembly.Module(bytes);
+    row("compile", performance.now() - t, "ok");
+    t = performance.now();
+    var instance = new WebAssembly.Instance(module, {});
+    var e = instance.exports;
+    row("instantiate", performance.now() - t, "ok");
+
+    var failures = [];
+    function check(what, got, want) { if (got !== want) failures.push(what + " " + got + " != " + want); }
+    check("add", e.add(40, 2), 42);
+    check("add-wrap", e.add(0x7fffffff, 1), -0x80000000);
+    check("dispatch-add", e.dispatch(0, 20, 22), 42);
+    check("dispatch-mul", e.dispatch(1, 6, 7), 42);
+    var trapped = "no trap";
+    try { e.dispatch(2, 1, 1); } catch (error) { trapped = error instanceof WebAssembly.RuntimeError ? "RuntimeError" : String(error); }
+    check("dispatch-out-of-table", trapped, "RuntimeError");
+
+    var n = 65536, rounds = 16, calls = 24;
+    t = performance.now();
+    e.fill(n);
+    var view = new Uint8Array(e.mem.buffer);
+    check("fill", view[1000], (1000 * 31 + 7) & 0xff);
+    check("small", e.sum(4096, 2) >>> 0, reference(4096, 2));
+    var first = e.sum(n, rounds) >>> 0;
+    var firstMs = performance.now() - t;
+    row("first-sum", firstMs, first);
+
+    // Hot calls: V8's dynamic tiering moves sum to TurboFan after enough work (design).
+    var times = [], value = first;
+    for (var c = 0; c < calls; c++) {
+      var s = performance.now();
+      value = e.sum(n, rounds) >>> 0;
+      times.push(performance.now() - s);
+      check("hot-" + c, value, first);
+    }
+    times.sort(function (a, b) { return a - b; });
+    row("hot-sum-min", times[0], value);
+    row("hot-sum-median", times[times.length >> 1], value);
+    row("hot-sum-last", times.length ? times[times.length - 1] : 0, calls + " calls");
+    t = performance.now();
+    var want = reference(n, rounds);
+    row("js-reference", performance.now() - t, want);
+    check("sum", first, want);
+
+    if (failures.length) finish("bad", "failed: " + failures.join("; "));
+    else finish("ok", "ok: " + (calls + 1) + " sums of " + n + " bytes x " + rounds + " rounds");
+  } catch (error) {
+    finish("error", "error: " + (error && error.message ? error.message : String(error)));
+  }
+
+  // Asynchronous instantiation of the same module (may land after the dump).
+  try {
+    WebAssembly.instantiate(module).then(function (other) {
+      document.getElementById("async").textContent = "async: " + (other.exports.add(1, 2) === 3 ? "ok" : "bad");
+      document.body.dataset.wasmAsync = "ok";
+    }, function (error) {
+      document.getElementById("async").textContent = "async: error " + error;
+      document.body.dataset.wasmAsync = "error";
+    });
+  } catch (error) {
+    document.getElementById("async").textContent = "async: threw " + error;
+  }
+})();
+</script>
+</body>
+</html>

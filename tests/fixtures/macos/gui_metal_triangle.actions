@@ -1,0 +1,28 @@
+# scripts/alchemy_gui_harness.ps1 actions for gui_metal_triangle --interactive
+# (ctest alchemy_gui_metal_triangle_capture): what the window shows at its
+# initial size, after a real resize, and after a simulated DPI change
+# ('d': backing scale 2, so the 2x drawable is scaled down into the same
+# swapchain). References: tests/fixtures/macos/reference/, keyed by the
+# captured client size; tolerance: channel difference 48 on at most 1.5% of
+# the channels (triangle edge rasterization and filtering).
+wait-line ready drawable=
+wait-frames 3
+sleep 400
+screenshot initial.png client
+compare initial.png tests/fixtures/macos/reference/gui_metal_triangle_{size}.png 48 1.5
+resize 400 300
+sleep 600
+wait-frames 10
+screenshot resized.png client
+compare resized.png tests/fixtures/macos/reference/gui_metal_triangle_{size}.png 48 1.5
+post-key d
+wait-line simulated scale 2
+wait-line drawable=\d+x\d+ scale=2\.0
+sleep 600
+screenshot scaled.png client
+compare scaled.png tests/fixtures/macos/reference/gui_metal_triangle_{size}.png 48 1.5
+post-key d
+wait-line simulated scale off
+sleep 300
+close
+wait-exit 15

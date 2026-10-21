@@ -1,0 +1,4 @@
+LIBRARY fxl_cycle_a.dll
+EXPORTS
+  cycle_a_value
+  cycle_a_calls_b

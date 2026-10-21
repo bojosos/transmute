@@ -1,0 +1,26 @@
+// Clang modules over the project-authored declarations, for building
+// Alchemy's Swift overlays (libswiftFoundation, ...) with the Swift
+// ClangImporter. No SDK content.
+module ObjectiveC [system] {
+  header "objc/objc.h"
+  header "objc/runtime.h"
+  header "objc/message.h"
+  header "objc/NSObjCRuntime.h"
+  header "objc/NSObject.h"
+  export *
+}
+
+module CoreFoundation [system] {
+  header "CoreFoundation/CoreFoundation.h"
+  export *
+}
+
+module Foundation [system] {
+  header "Foundation/Foundation.h"
+  export *
+}
+
+module os [system] {
+  header "os/log.h"
+  export *
+}

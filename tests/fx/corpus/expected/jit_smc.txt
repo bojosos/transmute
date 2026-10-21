@@ -1,0 +1,7 @@
+wx patch: 11 -> 22
+rwx same page: a 15 -> 60, b 300 -> 300
+repatch total=1999000
+loop step1=500500 hot=5500 step3=1501500
+tail call=73
+realloc before=1234 after=4321
+recommit zeroed=1 result=78

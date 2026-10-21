@@ -1,0 +1,65 @@
+# Build and test on a GitHub-hosted Windows runner, in two configurations:
+#
+# * core: the default configuration. transmute, alchemy, their core suites and the
+#   ARM64 PE and Mach-O fixtures that Visual Studio's Clang builds.
+# * fx: -DTRANSMUTE_WITH_FX=ON adds the fx engine, alchemy-fx and the GUI providers.
+#   The runner has no Vulkan SDK, so Metal builds without a device (its headless
+#   shells) and the Vulkan-only tests are left out.
+#
+# The runner has no artifacts/ directory (guest LLVM, Swift and Expat runtimes,
+# application roots), and CMake leaves out the tests that need it.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64 (Release, ${{ matrix.name }})
+    runs-on: windows-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            cmake_options: ""
+          - name: fx
+            cmake_options: "-DTRANSMUTE_WITH_FX=ON"
+    defaults:
+      run:
+        shell: powershell
+    env:
+      # GUI tests: no visible windows, no focus changes, no crash dialogs.
+      ALCHEMY_GUI_CLOAK: "1"
+      ALCHEMY_GUI_NO_ACTIVATE: "1"
+      ALCHEMY_GUI_NO_CRASH_DIALOG: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          . scripts/dev/build_env.ps1 -CacheDirectory "$env:RUNNER_TEMP\sccache"
+          cmake -S . -B build -G "Ninja Multi-Config" -DCMAKE_CONFIGURATION_TYPES=Release ${{ matrix.cmake_options }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        run: |
+          . scripts/dev/build_env.ps1 -CacheDirectory "$env:RUNNER_TEMP\sccache"
+          cmake --build build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # A few core tests assert that worker threads overlap, which a loaded
+      # machine can miss; a failing test gets up to three tries.
+      - name: Test
+        run: |
+          ctest --test-dir build -C Release -j 2 --output-on-failure --timeout 900 --repeat until-pass:3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

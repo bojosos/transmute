@@ -1,0 +1,32 @@
+// Clang modules over project-authored declarations for the QLab Swift
+// overlays built by scripts/build_alchemy_swift.ps1 (passed only to the
+// overlay that imports each). No SDK content.
+module Dispatch [system] {
+  header "AlchemyDispatch.h"
+  export *
+}
+
+module OSLog [system] {
+  header "AlchemyOSLog.h"
+  export *
+}
+
+module CoreAudio [system] {
+  header "AlchemyCoreAudio.h"
+  export *
+}
+
+module CoreMIDI [system] {
+  header "AlchemyCoreMIDI.h"
+  export *
+}
+
+module CoreMedia [system] {
+  header "AlchemyCoreMedia.h"
+  export *
+}
+
+module AVFoundation [system] {
+  header "AlchemyAVFoundation.h"
+  export *
+}

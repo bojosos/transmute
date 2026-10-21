@@ -1,0 +1,10 @@
+LIBRARY fxl_exports.dll
+EXPORTS
+  named_one @1
+  by_ordinal @5 NONAME
+  data_value DATA
+  rwx_probe
+  fwd_leaf = fxl_fwd_target.target_answer
+  fwd_host = KERNEL32.GetCurrentProcessId
+  fwd_ord = fxl_fwd_target.#3
+  fwd_chain = fxl_exports.fwd_leaf

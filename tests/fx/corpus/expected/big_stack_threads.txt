@@ -1,0 +1,5 @@
+_beginthreadex commit: reserve>=16MiB=1 contains-local=1 sum=412608 used>=12MiB=1 within-limits=1
+_beginthreadex reserve: reserve>=16MiB=1 contains-local=1 sum=412608 used>=12MiB=1 within-limits=1
+CreateThread commit: reserve>=16MiB=1 contains-local=1 sum=412608 used>=12MiB=1 within-limits=1
+CreateThread reserve: reserve>=16MiB=1 contains-local=1 sum=412608 used>=12MiB=1 within-limits=1
+concurrent 16 MiB threads ok=1

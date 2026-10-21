@@ -1,0 +1,12 @@
+{
+  "name": "alchemy-probe",
+  "displayName": "Alchemy probe",
+  "description": "Exercises VS Code's editor, search and terminal through the extension API and reports what happened (scripts/vscode/run_vscode.ps1 -Probe).",
+  "version": "0.0.1",
+  "publisher": "alchemy",
+  "license": "MIT",
+  "engines": { "vscode": "^1.80.0" },
+  "activationEvents": ["onStartupFinished"],
+  "enabledApiProposals": ["findTextInFiles", "terminalDataWriteEvent"],
+  "main": "./extension.js"
+}

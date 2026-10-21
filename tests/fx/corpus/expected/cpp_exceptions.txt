@@ -1,0 +1,26 @@
+kind 0: int 42 trace=+L1+L2+V1+V2+L3-L3-V1-V2-L2-L1
+kind 1: std::exception runtime failure trace=+L1+L2+V1+V2+L3-L3-V1-V2-L2-L1
+kind 2: Derived code=7 detail-text what=Derived trace=+L1+L2+V1+V2+L3-L3-V1-V2-L2-L1
+kind 3: ellipsis trace=+L1+L2+V1+V2+L3-L3-V1-V2-L2-L1
+kind 4: string string payload trace=+L1+L2+V1+V2+L3-L3-V1-V2-L2-L1
+kind 5: double 2.500000 trace=+L1+L2+V1+V2+L3-L3-V1-V2-L2-L1
+kind 6: const char* c-string trace=+L1+L2+V1+V2+L3-L3-V1-V2-L2-L1
+kind 7: none trace=+L1+L2+V1+V2+L3-L3-V1-V2-L2-L1
+caught by base: code=3 what=Derived dynamic_cast=1 typeid=struct Derived
+rethrow trace=+R-R[inner first][outer first][replaced replaced]
+exception_ptr null=0 uncaught=0
+rethrow_exception: stored
+make_exception_ptr code=11
+nested outer=outer-nested inner=inner-nested
+constructor trace=+M1+M2+M3+M1+M2-M2-M1-M3-M2-M1[ctor]
+smart pointer trace=+U+S-S-U[caught]
+vector::at threw out_of_range
+string::substr threw out_of_range
+reserve threw bad_alloc
+operator new threw bad_alloc what=bad allocation
+nothrow new null=1
+stoi threw invalid_argument
+dynamic_cast threw bad_cast
+deep caught=0 constructed=41 destroyed=41
+loop total=1001000
+uncaught at end=0

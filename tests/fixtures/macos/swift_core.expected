@@ -1,0 +1,13 @@
+shapes square=9,rectangle=10 total=5
+animals generic:... rex:woof
+released 2
+casts Int(42) String(text) Double(2.5) Animal(woof) Array(3)
+errors ok(42) negative(-4) error(tooLarge)
+string count=10 utf8=16 upper=GRÜSSE, 世界! reversed=!界世 ,eßürG
+words 9 longest=quick
+dictionary brown:1,dog:1,fox:1,jumps:1,lazy:1,over:1,quick:1,the:2
+set [2, 3, 5, 7]
+array 1036 sorted=[20, 19, 17]
+generic value 21 closure=42
+optional 124 -1
+Swift runtime: done

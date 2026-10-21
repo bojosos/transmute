@@ -1,0 +1,464 @@
+#include "alchemy/darwin/kit/fwgaps/fwgaps.hpp"
+
+#include "alchemy/gui/cg_event_record.hpp"
+#include "alchemy/host/ui.hpp"
+
+#include <array>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <vector>
+
+// Graphics-side gaps of the Qt WebEngine images: CoreGraphics, QuartzCore,
+// CoreText, OpenGL (CGL), IOSurface, CoreImage, Carbon and
+// ApplicationServices.
+//
+// - CGEvent objects are real (type, location, flags, timestamp, integer
+//   fields; CGEventCreate(NULL) samples the mouse location) and round-trip
+//   through CGEventCreateData/CGEventCreateFromData. Seconds since the last
+//   input event come from the host's last-input time.
+// - Screen capture (display streams, window images, window lists) is not
+//   available: creation returns NULL and the access checks answer "denied".
+// - PDF documents and contexts cannot be created (NULL); the private CGS
+//   window-server calls report kCGErrorInvalidConnection.
+// - CGL: no OpenGL renderer exists, so pixel formats and contexts cannot be
+//   created; the OpenGL calls (fixed-function matrices, and the shader,
+//   buffer, texture and framebuffer calls Syphon's GL server binds) behave
+//   as OpenGL calls with no current context (no effect, as support kit's GL
+//   entry points; creation answers 0).
+// - CATransform3D helpers, CoreText font collections, available tables,
+//   character sets and system-UI-font checks are real. Font variations are
+//   not modelled (NULL).
+namespace alchemy::gui::fill {
+namespace {
+
+constexpr std::int32_t cg_illegal_argument = 1001, cg_invalid_connection = 1002;
+constexpr std::int32_t cgl_bad_pixel_format = 10002, cgl_bad_context = 10004, cgl_bad_display = 10006;
+
+struct CgEvent final : ObjectPayload {
+    std::mutex mutex;
+    std::uint32_t type{};
+    double x{}, y{};
+    std::uint64_t flags{}, timestamp{};
+    std::map<std::uint32_t, std::int64_t> fields;
+};
+
+struct FontCollection final : ObjectPayload { Address descriptors{}; };
+
+class GraphicsGaps final : public Provider {
+public:
+    using Provider::Provider;
+    Address event_class{}, collection_class{};
+    std::mutex mutex;
+    std::uint32_t secure_input{};
+
+    // A non-null argument of a type Alchemy can never create is a caller error.
+    static void impossible(std::uint64_t object, std::string_view what) {
+        if (object) throw std::runtime_error("Alchemy: " + std::string(what) + " received an object that cannot exist under Alchemy");
+    }
+    std::shared_ptr<CgEvent> event(Address object) {
+        const auto value = object ? objc.find_host_state<CgEvent>(object) : nullptr;
+        if (!value) throw std::runtime_error("Alchemy: the object is not a CGEvent");
+        return value;
+    }
+    Address make_event(std::shared_ptr<CgEvent> value) {
+        const auto object = objc.allocate(event_class);
+        static_cast<void>(objc.host_state<CgEvent>(object, [&] { return value; }));
+        return object;
+    }
+    // The mouse location in global display coordinates (top-left origin).
+    std::pair<double, double> mouse_location() {
+        try {
+            const auto event_type = objc.find_class("NSEvent");
+            const auto screen_type = objc.find_class("NSScreen");
+            if (!event_type || !screen_type) return {0, 0};
+            const auto point = objc.send(event_type, "mouseLocation");
+            const auto screens = objc.send(screen_type, "screens").x0;
+            if (!screens || cf.length(screens) == 0) return {point.d(0), point.d(1)};
+            const auto frame = objc.send(cf.element(screens, 0), "frame");
+            return {point.d(0), frame.d(3) - point.d(1)};
+        } catch (const std::exception&) {
+            return {0, 0};
+        }
+    }
+
+    void install();
+    void install_core_graphics();
+    void install_quartz_core();
+    void install_core_text();
+    void install_opengl();
+    void install_misc();
+};
+
+void GraphicsGaps::install_core_graphics() {
+    event_class = objc.find_class("__AlchemyCGEvent");
+    if (!event_class) event_class = objc.register_native_class("__AlchemyCGEvent", objc.find_class("NSObject"), 8);
+    register_type(event_class, TypeId::cg_event);
+    raw(core_graphics, "_CGEventCreate", [this](CpuState& s, GuestMemory&) {
+        auto value = std::make_shared<CgEvent>();
+        const auto [x, y] = mouse_location();
+        value->x = x;
+        value->y = y;
+        value->timestamp = call(libsystem, "_mach_absolute_time", {});
+        s.x[0] = make_event(value);
+    });
+    raw(core_graphics, "_CGEventGetLocation", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]);
+        std::lock_guard lock(value->mutex);
+        return_real(s, value->x, 0);
+        return_real(s, value->y, 1);
+    });
+    raw(core_graphics, "_CGEventGetIntegerValueField", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]);
+        std::lock_guard lock(value->mutex);
+        const auto found = value->fields.find(static_cast<std::uint32_t>(s.x[1]));
+        s.x[0] = found == value->fields.end() ? 0 : static_cast<std::uint64_t>(found->second);
+    });
+    // CGEventCreateData / CGEventCreateFromData: Alchemy's own serialization
+    // (alchemy/gui/cg_event_record.hpp; AppKit's NSEvent bridging uses it).
+    raw(core_graphics, "_CGEventCreateData", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[1]);
+        cg_event::Record record;
+        {
+            std::lock_guard lock(value->mutex);
+            record = {value->type, value->x, value->y, value->flags, value->timestamp, value->fields};
+        }
+        s.x[0] = bridge->data(cg_event::encode(record));
+    });
+    raw(core_graphics, "_CGEventCreateFromData", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[1] || !bridge->is_data(s.x[1])) { s.x[0] = 0; return; }
+        const auto bytes = bridge->bytes(s.x[1]);
+        const auto record = cg_event::decode(bytes);
+        if (!record) { s.x[0] = 0; return; }
+        auto value = std::make_shared<CgEvent>();
+        value->type = record->type;
+        value->x = record->x;
+        value->y = record->y;
+        value->flags = record->flags;
+        value->timestamp = record->timestamp;
+        value->fields = record->fields;
+        s.x[0] = make_event(value);
+    });
+    // double CGEventSourceSecondsSinceLastEventType(stateID, eventType): the
+    // host's last-input time (all input types share it).
+    raw(core_graphics, "_CGEventSourceSecondsSinceLastEventType", [](CpuState& s, GuestMemory&) {
+        double seconds = 0;
+        if (const auto idle = alchemy::host::ui::idle_ms()) seconds = static_cast<double>(*idle) / 1000.0;
+        return_real(s, seconds);
+    });
+    unsupported(core_graphics, "_CGEventSourceCounterForEventType", "Alchemy does not count input events per type");
+    // CGEventTapCreate: listen-only taps are the support kit taps (never fed);
+    // filtering taps need accessibility access and are refused (NULL).
+    raw(core_graphics, "_CGEventTapCreate", [this](CpuState& s, GuestMemory&) {
+        if (s.x[2] != 1) { s.x[0] = 0; return; }
+        s.x[0] = call(core_graphics, "_CGEventTapCreateForPid",
+            {call(libsystem, "_getpid", {}), s.x[1], s.x[2], s.x[3], s.x[4], s.x[5]});
+    });
+    // Displays.
+    raw(core_graphics, "_CGDisplayCopyColorSpace", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[0] ? call(core_graphics, "_CGColorSpaceCreateDeviceRGB", {}) : 0;
+    });
+    constant_real(core_graphics, "_CGDisplayRotation", 0.0);
+    constant(core_graphics, "_CGDisplayUsesForceToGray", 0);
+    constant(core_graphics, "_CGFontRenderingGetFontSmoothingDisabled", 0);
+    // Screen capture is not available.
+    constant(core_graphics, "_CGPreflightScreenCaptureAccess", 0);
+    constant(core_graphics, "_CGRequestScreenCaptureAccess", 0);
+    constant(core_graphics, "_CGDisplayStreamCreate", 0);
+    raw(core_graphics, "_CGDisplayStreamGetRunLoopSource", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGDisplayStreamGetRunLoopSource"); s.x[0] = 0; });
+    for (const auto* name : {"_CGDisplayStreamStart", "_CGDisplayStreamStop"})
+        raw(core_graphics, name, [](CpuState& s, GuestMemory&) { s.x[0] = status(cg_illegal_argument); });
+    raw(core_graphics, "_CGDisplayStreamUpdateGetRects", [](CpuState& s, GuestMemory& m) {
+        if (s.x[2]) m.write64(s.x[2], 0);
+        s.x[0] = 0;
+    });
+    for (const auto* name : {"_CGWindowListCopyWindowInfo", "_CGWindowListCreateDescriptionFromArray", "_CGWindowListCreateImage",
+                             "_CGWindowListCreateImageFromArray"})
+        constant(core_graphics, name, 0);
+    // CGWindowLevel CGWindowLevelForKey(CGWindowLevelKey): CGWindowLevel.h's
+    // levels, which AppKit's NS*WindowLevel values equal (normal 0, floating 3,
+    // modal panel 8, main menu 24, status 25, pop-up menu 101, screen saver
+    // 1000). The maximum and cursor levels are unverified (INT32_MAX - 16 and
+    // one less, as commonly reported).
+    raw(core_graphics, "_CGWindowLevelForKey", [](CpuState& s, GuestMemory&) {
+        constexpr std::int32_t base = std::numeric_limits<std::int32_t>::min(), minimum = base + 1, desktop = minimum + 20,
+                               maximum = std::numeric_limits<std::int32_t>::max() - 16;
+        constexpr std::array<std::int32_t, 21> levels{
+            base, minimum, desktop, -20 /* backstop menu */, 0 /* normal */, 3 /* floating */, 3 /* torn-off menu */,
+            20 /* dock */, 24 /* main menu */, 25 /* status */, 8 /* modal panel */, 101 /* pop-up menu */, 500 /* dragging */,
+            1000 /* screen saver */, maximum, 102 /* overlay */, 200 /* help */, 19 /* utility */, desktop + 20 /* desktop icon */,
+            maximum - 1 /* cursor */, 1500 /* assistive tech high */};
+        const auto key = static_cast<std::uint32_t>(s.x[0]);
+        s.x[0] = static_cast<std::uint32_t>(key < levels.size() ? levels[key] : 0);
+    });
+    // Private window-server connection calls.
+    constant(core_graphics, "_CGSMainConnectionID", 0);
+    constant(core_graphics, "__CGSDefaultConnection", 0);
+    for (const auto* name : {"_CGSSetWindowAlpha", "_CGSSetWindowTransform", "_CGSSetWindowWarp", "_CGSSetDenyWindowServerConnections"})
+        failure(core_graphics, name, cg_invalid_connection);
+    // PDF: no PDF parser or writer.
+    constant(core_graphics, "_CGPDFDocumentCreateWithProvider", 0);
+    raw(core_graphics, "_CGPDFDocumentGetNumberOfPages", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGPDFDocumentGetNumberOfPages"); s.x[0] = 0; });
+    raw(core_graphics, "_CGPDFDocumentGetPage", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGPDFDocumentGetPage"); s.x[0] = 0; });
+    raw(core_graphics, "_CGPDFPageGetBoxRect", [](CpuState& s, GuestMemory&) {
+        impossible(s.x[0], "CGPDFPageGetBoxRect");
+        const auto infinity = std::numeric_limits<double>::infinity();
+        return_real(s, infinity, 0); return_real(s, infinity, 1); return_real(s, 0, 2); return_real(s, 0, 3);   // CGRectNull
+    });
+    raw(core_graphics, "_CGPDFPageGetRotationAngle", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGPDFPageGetRotationAngle"); s.x[0] = 0; });
+    raw(core_graphics, "_CGContextDrawPDFPage", [](CpuState& s, GuestMemory&) { impossible(s.x[1], "CGContextDrawPDFPage"); });
+    constant(core_graphics, "_CGPDFContextCreate", 0);
+    raw(core_graphics, "_CGPDFContextClose", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGPDFContextClose"); });
+    // Keys.
+    for (const auto* name : {"kCGDisplayStreamColorSpace", "kCGDisplayStreamDestinationRect", "kCGDisplayStreamMinimumFrameTime",
+                             "kCGDisplayStreamPreserveAspectRatio", "kCGDisplayStreamShowCursor", "kCGWindowBounds",
+                             "kCGWindowIsOnscreen", "kCGWindowLayer", "kCGWindowName", "kCGWindowNumber", "kCGWindowOwnerName",
+                             "kCGWindowOwnerPID", "kCGColorSpaceITUR_2100_HLG", "kCGColorSpaceITUR_2100_PQ"})
+        string(core_graphics, "_" + std::string(name), name);
+}
+
+void GraphicsGaps::install_quartz_core() {
+    // CATransform3D: 16 doubles (m11 ... m44).
+    std::array<double, 16> identity{};
+    identity[0] = identity[5] = identity[10] = identity[15] = 1.0;
+    std::vector<std::uint8_t> bytes(128);
+    std::memcpy(bytes.data(), identity.data(), 128);
+    data(quartz_core, "_CATransform3DIdentity", bytes, 8);
+    string(quartz_core, "_kCATransactionDisableActions", "disableActions");
+    // Remote layer hosting (CAContext, CALayerHost) is not available; EDR
+    // metadata and OpenGL / transform layers are class shells. CAContext
+    // declares no properties, so class_getProperty(CAContext, "contextId")
+    // is NULL and Chrome's RemoteLayerAPISupported probe falls back to
+    // IOSurface presentation *(design)*.
+    const auto context_class = cls(quartz_core, "CAContext", "NSObject");
+    for (const auto* selector : {"contextWithCGSConnection:options:", "remoteContextWithOptions:", "localContext"})
+        method(context_class, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true);
+    static_cast<void>(cls(quartz_core, "CAEDRMetadata", "NSObject"));
+    static_cast<void>(cls(quartz_core, "CALayerHost", "CALayer"));
+    static_cast<void>(cls(quartz_core, "CAOpenGLLayer", "CALayer"));
+    static_cast<void>(cls(quartz_core, "CATransformLayer", "CALayer"));
+}
+
+void GraphicsGaps::install_core_text() {
+    for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 10>{{
+             {"_kCTFontCollectionRemoveDuplicatesOption", "RemoveDuplicates"},
+             {"_kCTFontFeatureTypeIdentifierKey", "CTFeatureTypeIdentifier"},
+             {"_kCTFontFeatureSelectorIdentifierKey", "CTFeatureSelectorIdentifier"},
+             {"_kCTFontFormatAttribute", "NSCTFontFormatAttribute"},
+             {"_kCTFontVariationAttribute", "NSCTFontVariationAttribute"},
+             {"_kCTFontVariationAxisDefaultValueKey", "NSCTVariationAxisDefaultValue"},
+             {"_kCTFontVariationAxisIdentifierKey", "NSCTVariationAxisIdentifier"},
+             {"_kCTFontVariationAxisMaximumValueKey", "NSCTVariationAxisMaximumValue"},
+             {"_kCTFontVariationAxisMinimumValueKey", "NSCTVariationAxisMinimumValue"},
+             {"_kCTFontVariationAxisNameKey", "NSCTVariationAxisName"}}})
+        string(core_text, symbol, value);
+    // kCTVersionNumber14_0: the reported system is macOS 14.
+    constant(core_text, "_CTGetCoreTextVersion", 0x00100000);
+    // Font collections: every available family.
+    collection_class = objc.find_class("__AlchemyCTFontCollection");
+    if (!collection_class) collection_class = objc.register_native_class("__AlchemyCTFontCollection", objc.find_class("NSObject"), 8);
+    if (!has(core_text, "_CTFontCollectionCreateFromAvailableFonts")) {
+        static_cast<void>(objc.add_native_method(collection_class, "dealloc", [self = shared_from_this(), this](CpuState& s, GuestMemory&) {
+            if (const auto value = objc.find_host_state<FontCollection>(s.x[0])) release(std::exchange(value->descriptors, 0));
+            static_cast<void>(objc.send_super(s.x[0], collection_class, objc.selector("dealloc")));
+        }, false, "v@:"));
+    }
+    raw(core_text, "_CTFontCollectionCreateFromAvailableFonts", [this](CpuState& s, GuestMemory&) {
+        const auto families = call(core_text, "_CTFontManagerCopyAvailableFontFamilyNames", {});
+        const auto key = bridge->constant(core_text, "_kCTFontFamilyNameAttribute");
+        std::vector<Address> descriptors;
+        for (const auto family : families ? cf.array_values(families) : std::vector<Address>{}) {
+            const auto attributes = cf.dictionary(std::vector<std::pair<Address, Address>>{{key, family}});
+            const auto descriptor = call(core_text, "_CTFontDescriptorCreateWithAttributes", {attributes});
+            release(attributes);
+            if (descriptor) descriptors.push_back(descriptor);
+        }
+        release(families);
+        auto value = std::make_shared<FontCollection>();
+        value->descriptors = cf.array(descriptors);
+        for (const auto descriptor : descriptors) release(descriptor);
+        const auto object = objc.allocate(collection_class);
+        static_cast<void>(objc.host_state<FontCollection>(object, [&] { return value; }));
+        s.x[0] = object;
+    });
+    raw(core_text, "_CTFontCollectionCreateMatchingFontDescriptors", [this](CpuState& s, GuestMemory&) {
+        const auto value = s.x[0] ? objc.find_host_state<FontCollection>(s.x[0]) : nullptr;
+        if (!value) throw std::runtime_error("Alchemy: CTFontCollectionCreateMatchingFontDescriptors needs a CTFontCollection");
+        s.x[0] = cf.copy(value->descriptors);
+    });
+    // CTFontCopyAvailableTables(font, options): the tags CTFontCopyTable finds
+    // (an array of CTFontTableTag values, not CF objects).
+    raw(core_text, "_CTFontCopyAvailableTables", [this](CpuState& s, GuestMemory& m) {
+        static constexpr std::array<const char*, 64> tags{
+            "BASE", "CBDT", "CBLC", "CFF ", "CFF2", "COLR", "CPAL", "DSIG", "EBDT", "EBLC", "EBSC", "GDEF", "GPOS", "GSUB",
+            "HVAR", "JSTF", "LTSH", "MATH", "MERG", "MVAR", "OS/2", "PCLT", "STAT", "SVG ", "VDMX", "VORG", "VVAR", "ankr",
+            "avar", "bdat", "bhed", "bloc", "bsln", "cmap", "cvar", "cvt ", "feat", "fpgm", "fvar", "gasp", "glyf", "gvar",
+            "hdmx", "head", "hhea", "hmtx", "just", "kern", "kerx", "lcar", "loca", "ltag", "maxp", "meta", "morx", "name",
+            "opbd", "post", "prep", "prop", "sbix", "trak", "vhea", "vmtx"};
+        std::vector<Address> found;
+        for (const auto* tag : tags) {
+            const auto code = (static_cast<std::uint32_t>(static_cast<unsigned char>(tag[0])) << 24) |
+                (static_cast<std::uint32_t>(static_cast<unsigned char>(tag[1])) << 16) |
+                (static_cast<std::uint32_t>(static_cast<unsigned char>(tag[2])) << 8) | static_cast<unsigned char>(tag[3]);
+            const auto table = call(core_text, "_CTFontCopyTable", {s.x[0], code, 0});
+            if (table) { found.push_back(code); release(table); }
+        }
+        const auto values = process.allocate_guest(std::max<std::size_t>(found.size(), 1) * 8);
+        for (std::size_t index = 0; index < found.size(); ++index) m.write64(values + index * 8, found[index]);
+        s.x[0] = call(core_foundation, "_CFArrayCreate", {0, values, found.size(), 0});
+        process.release_guest(values);
+    });
+    // CTFontCopyCharacterSet(font): the BMP characters the font maps to glyphs.
+    raw(core_text, "_CTFontCopyCharacterSet", [this](CpuState& s, GuestMemory& m) {
+        const auto set = call(core_foundation, "_CFCharacterSetCreateMutable", {0});
+        constexpr std::uint32_t chunk = 4096;
+        const auto characters = process.allocate_guest(chunk * 2), glyphs = process.allocate_guest(chunk * 2);
+        std::vector<std::uint8_t> units(chunk * 2), mapped(chunk * 2);
+        for (std::uint32_t base = 0; base < 0x10000; base += chunk) {
+            for (std::uint32_t i = 0; i < chunk; ++i) {
+                auto c = base + i;
+                if (c >= 0xd800 && c < 0xe000) c = 0;   // surrogate units are not characters
+                units[i * 2] = static_cast<std::uint8_t>(c);
+                units[i * 2 + 1] = static_cast<std::uint8_t>(c >> 8);
+            }
+            m.write_bytes(characters, units);
+            m.fill_bytes(glyphs, 0, chunk * 2);
+            static_cast<void>(call(core_text, "_CTFontGetGlyphsForCharacters", {s.x[0], characters, glyphs, chunk}));
+            m.read_bytes(glyphs, mapped);
+            std::uint32_t run = 0, start = 0;
+            for (std::uint32_t i = 0; i <= chunk; ++i) {
+                const auto c = base + i;
+                const bool present = i < chunk && !(c >= 0xd800 && c < 0xe000) && c != 0 && (mapped[i * 2] | mapped[i * 2 + 1]);
+                if (present) { if (!run) start = c; ++run; }
+                else if (run) { static_cast<void>(call(core_foundation, "_CFCharacterSetAddCharactersInRange", {set, start, run})); run = 0; }
+            }
+        }
+        process.release_guest(characters);
+        process.release_guest(glyphs);
+        s.x[0] = set;
+    });
+    // Font variations are not modelled.
+    constant(core_text, "_CTFontCopyVariation", 0);
+    constant(core_text, "_CTFontCopyVariationAxes", 0);
+    // ATS font references do not exist.
+    raw(core_text, "_CTFontGetPlatformFont", [](CpuState& s, GuestMemory& m) { if (s.x[1]) m.write64(s.x[1], 0); s.x[0] = 0; });
+    // System UI fonts have names starting with '.' (".SFNS-Regular").
+    raw(core_text, "_CTFontDescriptorIsSystemUIFont", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[0]) { s.x[0] = 0; return; }
+        const auto name = call(core_text, "_CTFontDescriptorCopyAttribute", {s.x[0], bridge->constant(core_text, "_kCTFontNameAttribute")});
+        const bool system = name && bridge->is_string(name) && cf.utf8(name).starts_with(".");
+        release(name);
+        s.x[0] = system;
+    });
+}
+
+void GraphicsGaps::install_opengl() {
+    // No OpenGL renderer exists under Alchemy.
+    raw(opengl, "_CGLChoosePixelFormat", [](CpuState& s, GuestMemory& m) {
+        if (s.x[1]) m.write64(s.x[1], 0);
+        if (s.x[2]) m.write32(s.x[2], 0);
+        s.x[0] = cgl_bad_display;
+    });
+    failure(opengl, "_CGLCreateContext", cgl_bad_pixel_format, {2});
+    failure(opengl, "_CGLDescribePixelFormat", cgl_bad_pixel_format);
+    failure(opengl, "_CGLDestroyContext", cgl_bad_context);
+    raw(opengl, "_CGLReleaseContext", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLReleaseContext"); });
+    raw(opengl, "_CGLReleasePixelFormat", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLReleasePixelFormat"); });
+    raw(opengl, "_CGLRetainContext", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLRetainContext"); s.x[0] = 0; });
+    raw(opengl, "_CGLGetContextRetainCount", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLGetContextRetainCount"); s.x[0] = 0; });
+    constant(opengl, "_CGLGetCurrentContext", 0);
+    raw(opengl, "_CGLSetCurrentContext", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[0] ? cgl_bad_context : 0; });
+    for (const auto* name : {"_CGLGetParameter", "_CGLGetVirtualScreen", "_CGLSetVirtualScreen"}) failure(opengl, name, cgl_bad_context);
+    raw(opengl, "_CGLErrorString", [this](CpuState& s, GuestMemory&) {
+        static const std::map<std::int32_t, std::string_view> texts{
+            {0, "no error"}, {10000, "invalid pixel format attribute"}, {10001, "invalid renderer property"},
+            {10002, "invalid pixel format"}, {10003, "invalid renderer info"}, {10004, "invalid context"},
+            {10005, "invalid drawable"}, {10006, "invalid graphics device"}, {10007, "invalid context state"},
+            {10008, "invalid numerical value"}, {10009, "invalid share context"}, {10010, "invalid enumerant"},
+            {10011, "invalid offscreen drawable"}, {10012, "invalid fullscreen drawable"}, {10013, "invalid window"},
+            {10014, "invalid pointer"}, {10015, "invalid code module"}, {10016, "invalid memory allocation"},
+            {10017, "invalid CoreGraphics connection"}};
+        const auto found = texts.find(static_cast<std::int32_t>(s.x[0]));
+        const auto text = found == texts.end() ? std::string_view("unknown error") : found->second;
+        std::lock_guard lock(mutex);
+        static std::map<std::string_view, Address> cache;
+        auto& slot = cache[text];
+        if (!slot) slot = cstring(text);
+        s.x[0] = slot;
+    });
+    // CGLGetPixelFormat(ctx): no context can exist.
+    raw(opengl, "_CGLGetPixelFormat", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLGetPixelFormat"); s.x[0] = 0; });
+    // OpenGL calls with no current context (none can be made current): no
+    // effect, output parameters untouched (glGetError answers
+    // GL_INVALID_OPERATION), object creation answers 0 (no object),
+    // attribute lookups -1 and framebuffer status 0 (an error), as GL does
+    // for a failed call.
+    for (const auto* name : {"_glLoadIdentity", "_glLoadMatrixf", "_glMatrixMode", "_glOrtho", "_glAttachShader", "_glBindBuffer",
+                             "_glBindFramebuffer", "_glBindRenderbuffer", "_glBindTexture", "_glBindVertexArray", "_glBlitFramebuffer",
+                             "_glBufferData", "_glCompileShader", "_glDeleteBuffers", "_glDeleteFramebuffers", "_glDeleteProgram",
+                             "_glDeleteRenderbuffers", "_glDeleteShader", "_glDeleteTextures", "_glDeleteVertexArrays", "_glDrawArrays",
+                             "_glEnableVertexAttribArray", "_glFlush", "_glFlushRenderAPPLE", "_glFramebufferRenderbuffer",
+                             "_glFramebufferTexture2D", "_glGenBuffers", "_glGenFramebuffers", "_glGenRenderbuffers", "_glGenTextures",
+                             "_glGenVertexArrays", "_glGetProgramiv", "_glGetShaderiv", "_glLinkProgram", "_glRenderbufferStorageMultisample",
+                             "_glShaderSource", "_glUseProgram", "_glVertexAttribPointer", "_glViewport"})
+        raw(opengl, name, [](CpuState&, GuestMemory&) {});
+    for (const auto* name : {"_glCreateProgram", "_glCreateShader", "_glCheckFramebufferStatus"}) constant(opengl, name, 0);
+    raw(opengl, "_glGetAttribLocation", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<std::uint32_t>(-1); });
+}
+
+void GraphicsGaps::install_misc() {
+    // IOSurface (its Mach ports are QuartzCore's iosurface.cpp).
+    string(iosurface, "_kIOSurfacePlaneBytesPerElement", "IOSurfacePlaneBytesPerElement");
+    // CoreImage: no feature detectors are available.
+    for (const auto* name : {"CIDetectorAccuracy", "CIDetectorAccuracyHigh", "CIDetectorAccuracyLow", "CIDetectorTypeFace",
+                             "CIDetectorTypeQRCode", "CIDetectorTypeText"})
+        string(core_image, "_" + std::string(name), name);
+    const auto detector = cls(core_image, "CIDetector", "NSObject");
+    method(detector, "detectorOfType:context:options:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true);
+    // Carbon.
+    raw(carbon, "_EnableSecureEventInput", [this](CpuState& s, GuestMemory&) { std::lock_guard lock(mutex); ++secure_input; s.x[0] = 0; });
+    raw(carbon, "_DisableSecureEventInput", [this](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(mutex);
+        if (secure_input) --secure_input;
+        s.x[0] = 0;
+    });
+    // PhysicalKeyboardLayoutType KBGetLayoutType(keyboardType): from the host keyboard.
+    raw(carbon, "_KBGetLayoutType", [](CpuState& s, GuestMemory&) {
+        std::uint32_t layout = fourcc("ANSI");
+        if (const auto kind = alchemy::host::ui::keyboard_kind()) {
+            if (*kind == alchemy::host::ui::KeyboardKind::jis) layout = fourcc("JIS ");
+            else if (*kind == alchemy::host::ui::KeyboardKind::iso) layout = fourcc("ISO ");
+        }
+        s.x[0] = layout;
+    });
+    raw(carbon, "_LMGetKbdLast", [this](CpuState& s, GuestMemory&) { s.x[0] = call(carbon, "_LMGetKbdType", {}) & 0xff; });
+    raw(carbon, "_TISCreateASCIICapableInputSourceList", [this](CpuState& s, GuestMemory&) {
+        const auto source = call(carbon, "_TISCopyCurrentASCIICapableKeyboardInputSource", {});
+        std::vector<Address> values;
+        if (source) values.push_back(source);
+        s.x[0] = cf.array(values);
+        release(source);
+    });
+    // Text Services Manager documents are not modelled.
+    failure(carbon, "_TSMSetDocumentProperty", -50);
+    failure(carbon, "_TSMRemoveDocumentProperty", -50);
+    // ApplicationServices (process manager / universal access).
+    failure(application_services, "_GetProcessInformation", -600);   // procNotFound
+    // No Dock exists, so every Alchemy process already behaves as a daemon (no Dock tile).
+    constant(application_services, "_SetApplicationIsDaemon", 0);
+    constant(application_services, "_UAZoomEnabled", 0);
+}
+
+void GraphicsGaps::install() {
+    install_core_graphics();
+    install_quartz_core();
+    install_core_text();
+    install_opengl();
+    install_misc();
+}
+
+} // namespace
+
+void install_graphics_gaps(InstallContext& context) { std::make_shared<GraphicsGaps>(context)->install(); }
+
+} // namespace alchemy::gui::fill

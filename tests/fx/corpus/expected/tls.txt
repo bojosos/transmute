@@ -1,0 +1,13 @@
+tls indices allocated ok=1
+main initial counter=100 text=initial zero=0 string=dynamic-42 tracker=5 plain=7
+thread 1 counter=101 text=thread-1 zero=1000 string=dynamic-42-1 tracker=6 plain=14 tls=1001 many=1
+thread 2 counter=102 text=thread-2 zero=2000 string=dynamic-42-2 tracker=7 plain=21 tls=1002 many=1
+thread 3 counter=103 text=thread-3 zero=3000 string=dynamic-42-3 tracker=8 plain=28 tls=1003 many=1
+thread 4 counter=104 text=thread-4 zero=4000 string=dynamic-42-4 tracker=9 plain=35 tls=1004 many=1
+thread 5 counter=105 text=thread-5 zero=5000 string=dynamic-42-5 tracker=10 plain=42 tls=1005 many=1
+thread 6 counter=106 text=thread-6 zero=6000 string=dynamic-42-6 tracker=11 plain=49 tls=1006 many=1
+win32 thread exit=566
+main after counter=100 text=initial string=dynamic-42 tls=77 fls=88
+string inits=8 trackers constructed=8 destroyed=7 fls callbacks=6
+TlsFree=1 FlsFree=1
+fls callbacks after FlsFree=7

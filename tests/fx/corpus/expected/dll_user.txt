@@ -1,0 +1,13 @@
+name=fxcorpus_dll initializer=5150 process_attach=1
+add=42 counter 1000 -> 1001
+counter after write=6
+mul64=-12193209765585
+mix=1.500000
+sum_many=506
+sum_fp_many=357.500
+apply=315
+point=8,15
+big=7000021,28000084,42000126 weight=0.875
+vsum=140 285
+thread tls=1017 main tls=5 attach delta=1 detach delta=1
+ordinal export=307 by-name-null=1

@@ -1,0 +1,18 @@
+read AV code=c0000005 params=2 write=0 addr=0
+write AV code=c0000005 write=1 addr=10
+readonly write code=c0000005 write=1 offset=200 value-intact=1
+guard page code=80000001 offset=300
+after guard write=3
+noaccess code=c0000005 offset=4104
+raise code=e0000001 flags=0 params=3 1111 2222 3333
+noncontinuable flags=1
+continue execution resumed=1
+breakpoint code=80000003
+unwind trace=raise;f-inner;f-outer;fin0!;fin1!;fin2!;fin3!;h-outer;
+finally trace=body;fin-normal;before-leave;leave-normal;
+nested trace=handler1;f2;handler2;
+loop count=34300
+vectored hits=5 remove=1
+vectored hits after remove=5
+vectored resume reached=1
+unhandled filter roundtrip=1

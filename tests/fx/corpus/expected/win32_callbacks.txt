@@ -1,0 +1,11 @@
+threadpool work count=10 sum=70
+TrySubmitThreadpoolCallback count=5
+threadpool timer wait=0 calls=1
+threadpool wait wait=0 calls=1 result=0
+timer queue wait=0 calls=1 fired=1
+periodic timer at-least-3=1 stopped=1
+QueueUserWorkItem wait=0 calls=1
+RegisterWaitForSingleObject wait=0 calls=1 timed_out=0
+RegisterWaitForSingleObject timeout wait=0 calls=1 timed_out=1
+APC value=42 SleepEx=192
+InitOnce calls=1 ok=1,1 context=84,84

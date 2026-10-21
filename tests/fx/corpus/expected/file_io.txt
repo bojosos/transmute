@@ -1,0 +1,37 @@
+mkdir=1
+data fnv=2de52785
+fwrite=200000 fclose=0
+stat=0 size=200000
+fread=16 ftell=5016 bytes=abacd5dec7c8f1fae3e4ed161f000932
+end ftell=200000
+fgetc at end-10=119 feof=0
+fgetc at end=-1 feof=1
+full read=200000 equal=1
+text file bytes=36
+fgets=[line one]
+fgets=[line two 42 2.500]
+fgets=[third]
+fscanf fields=6 two 42 2.500
+append lines=4
+_write=4096
+_lseek=1000
+_read=16 match=1
+_filelength=4096 _close=0
+WriteFile ok=1 bytes=200000
+GetFileSizeEx=200000 ReadFile ok=1 bytes=16 match=1
+after append size=200004
+mapped fnv=2de52785 tail=tail
+ReadFile at offset ok=1 bytes=8 match=1
+MoveFileA=1
+CopyFileA=1
+CopyFileA exists=0 error=80
+rename=0 remove=0
+FindNextFile end error=18
+entry copy.bin:200004
+entry data.bin:200000
+entry low2.bin:4096
+entry renamed.bin:200004
+missing attrs=ffffffff error=2
+open missing invalid=1 error=2
+fopen missing null=1 errno=2
+cleanup exists=0

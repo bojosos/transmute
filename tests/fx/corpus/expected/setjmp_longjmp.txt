@@ -1,0 +1,5 @@
+first return r=42 counter=10 fp=1.7500
+longjmp(0) delivered r=1
+loop iterations=100 sum=5050
+finally r=5 trace=jump;fin0;fin1;fin2;fin3;landed;
+after jump a=11 b=22 c=33 d=1.25 r=9

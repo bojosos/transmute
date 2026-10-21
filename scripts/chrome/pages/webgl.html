@@ -1,0 +1,363 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy WebGL: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+td, th { padding: 2px 10px; text-align: left; vertical-align: top; }
+canvas { border: 1px solid #888; margin-right: 8px; }
+</style>
+</head>
+<body>
+<h1 id="h">Alchemy WebGL smoke</h1>
+<p>A conformance-style WebGL smoke written for Alchemy (no downloaded suite). Each test draws into a
+64x64 canvas (or a framebuffer object), reads pixels back and compares them with tolerances, and
+checks <code>getError()</code> after each step. WebGL 1 runs the first group; WebGL 2 runs it again
+plus float textures and instancing. The verdict goes into <code>document.title</code>
+(<code>Alchemy WebGL: PASS</code> or <code>Alchemy WebGL: FAIL &lt;test&gt;</code>) and into
+<code>body[data-verdict]</code>; each test's result is a row below (for <code>--dump-dom</code>).</p>
+<pre id="renderer">renderer: pending</pre>
+<table>
+<thead><tr><th>test</th><th>result</th><th>detail</th></tr></thead>
+<tbody id="results"></tbody>
+</table>
+<p id="status">not run</p>
+<div id="canvases"></div>
+<script>
+"use strict";
+var TOL = 3;
+var rows = document.getElementById("results");
+var failures = [];
+function row(name, ok, detail) {
+  var tr = document.createElement("tr");
+  var verdict = ok === null ? "skip" : ok ? "pass" : "FAIL";
+  tr.innerHTML = "<td></td><td></td><td></td>";
+  tr.children[0].textContent = name;
+  tr.children[1].textContent = verdict;
+  tr.children[2].textContent = detail || "";
+  tr.id = "t-" + name;
+  tr.dataset.result = verdict;
+  rows.appendChild(tr);
+  if (ok === false) failures.push(name);
+}
+
+function Check(gl, name) {
+  this.gl = gl; this.name = name; this.problems = [];
+}
+Check.prototype.err = function (step) {
+  var e = this.gl.getError();
+  if (e !== this.gl.NO_ERROR) this.problems.push(step + ": glError 0x" + e.toString(16));
+};
+Check.prototype.pixel = function (x, y, want, step) {
+  var gl = this.gl, px = new Uint8Array(4);
+  gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  this.err(step + " readPixels");
+  for (var i = 0; i < 4; i++) {
+    if (Math.abs(px[i] - want[i]) > TOL) {
+      this.problems.push(step + " (" + x + "," + y + ") = " + Array.prototype.join.call(px, ",") + ", want " + want.join(","));
+      return;
+    }
+  }
+};
+Check.prototype.expect = function (cond, what) { if (!cond) this.problems.push(what); };
+Check.prototype.done = function () {
+  if (this.gl.isContextLost()) this.problems.push("context lost");
+  row(this.name, this.problems.length === 0, this.problems.join("; "));
+};
+
+function compile(gl, vsSrc, fsSrc) {
+  function shader(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error("compile: " + gl.getShaderInfoLog(s));
+    return s;
+  }
+  var p = gl.createProgram();
+  gl.attachShader(p, shader(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fsSrc));
+  gl.bindAttribLocation(p, 0, "aPos");
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("link: " + gl.getProgramInfoLog(p));
+  return p;
+}
+function buffer(gl, data) {
+  var b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+  return b;
+}
+// A triangle that covers the whole viewport: clip (-1,-1), (3,-1), (-1,3).
+var FULL = [-1, -1, 3, -1, -1, 3];
+// A rectangle (two triangles) from (x0,y0) to (x1,y1) in clip space, at depth z.
+function rect(x0, y0, x1, y1, z) {
+  return [x0, y0, z, x1, y0, z, x0, y1, z, x0, y1, z, x1, y0, z, x1, y1, z];
+}
+var VS_FLAT = "attribute vec3 aPos; void main() { gl_Position = vec4(aPos, 1.0); }";
+var FS_COLOR = "precision mediump float; uniform vec4 uColor; void main() { gl_FragColor = uColor; }";
+var VS_TEX = "attribute vec2 aPos; varying vec2 vUv; void main() { vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }";
+var FS_TEX = "precision mediump float; varying vec2 vUv; uniform sampler2D uTex; void main() { gl_FragColor = texture2D(uTex, vUv); }";
+
+function drawColor(gl, prog, verts, color) {
+  gl.useProgram(prog);
+  var b = buffer(gl, verts);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  var loc = gl.getUniformLocation(prog, "uColor");
+  if (loc) gl.uniform4fv(loc, color);
+  gl.drawArrays(gl.TRIANGLES, 0, verts.length / 3);
+  gl.deleteBuffer(b);
+}
+
+function makeContext(kind) {
+  var canvas = document.createElement("canvas");
+  canvas.width = 64; canvas.height = 64;
+  canvas.title = kind;
+  document.getElementById("canvases").appendChild(canvas);
+  var error = "";
+  canvas.addEventListener("webglcontextcreationerror", function (e) { error = e.statusMessage || "(no message)"; });
+  var gl = canvas.getContext(kind, { antialias: false, depth: true, stencil: false, alpha: true,
+    premultipliedAlpha: false, preserveDrawingBuffer: true, failIfMajorPerformanceCaveat: false });
+  return { gl: gl, error: error };
+}
+
+function runSuite(kind) {
+  var made = makeContext(kind);
+  var gl = made.gl;
+  if (!gl) { row(kind + ".context", false, "null context; creation error: " + (made.error || "(none reported)")); return null; }
+  var c = new Check(gl, kind + ".context");
+  c.expect(!!gl.getParameter(gl.VERSION), "no VERSION");
+  c.err("getParameter"); c.done();
+  var tests = [clearTest, textureTest, fboTest, depthTest, blendTest];
+  if (kind === "webgl2") tests.push(floatTextureTest, floatRenderTest, instancingTest);
+  tests.forEach(function (t) {
+    var name = kind + "." + t.name.replace(/Test$/, "");
+    try {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, 64, 64);
+      gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+      t(gl, name, kind);
+    } catch (e) { row(name, false, "threw " + e.message); }
+  });
+  return gl;
+}
+
+function clearTest(gl, name) {
+  var c = new Check(gl, name);
+  gl.clearColor(0.2, 0.4, 0.6, 1.0); gl.clear(gl.COLOR_BUFFER_BIT); c.err("clear");
+  c.pixel(0, 0, [51, 102, 153, 255], "corner");
+  c.pixel(63, 63, [51, 102, 153, 255], "opposite corner");
+  c.pixel(31, 17, [51, 102, 153, 255], "inside");
+  c.done();
+}
+
+// A 2x2 RGBA texture (NEAREST) drawn over the whole canvas: one texel per quadrant.
+function textureTest(gl, name) {
+  var c = new Check(gl, name);
+  var prog = compile(gl, VS_TEX, FS_TEX);
+  var tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  var texels = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, texels);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  c.err("texImage2D");
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.uniform1i(gl.getUniformLocation(prog, "uTex"), 0);
+  var b = buffer(gl, FULL);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3); c.err("draw");
+  // readPixels' origin is bottom-left, like texture coordinates without UNPACK_FLIP_Y.
+  c.pixel(16, 16, [255, 0, 0, 255], "texel (0,0)");
+  c.pixel(48, 16, [0, 255, 0, 255], "texel (1,0)");
+  c.pixel(16, 48, [0, 0, 255, 255], "texel (0,1)");
+  c.pixel(48, 48, [255, 255, 255, 255], "texel (1,1)");
+  gl.deleteBuffer(b); gl.deleteTexture(tex); gl.deleteProgram(prog);
+  c.done();
+}
+
+// Render into a texture through a framebuffer object, then sample that texture on screen.
+function fboTest(gl, name) {
+  var c = new Check(gl, name);
+  var tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 32, 32, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  var fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  var status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  c.expect(status === gl.FRAMEBUFFER_COMPLETE, "framebuffer status 0x" + status.toString(16));
+  c.err("framebuffer");
+  gl.viewport(0, 0, 32, 32);
+  gl.clearColor(1, 1, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  // Left half magenta.
+  var flat = compile(gl, VS_FLAT, FS_COLOR);
+  drawColor(gl, flat, rect(-1, -1, 0, 1, 0), [1, 0, 1, 1]);
+  c.err("draw into fbo");
+  c.pixel(8, 16, [255, 0, 255, 255], "fbo left");
+  c.pixel(24, 16, [255, 255, 0, 255], "fbo right");
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, 64, 64);
+  var prog = compile(gl, VS_TEX, FS_TEX);
+  gl.useProgram(prog);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(gl.getUniformLocation(prog, "uTex"), 0);
+  var b = buffer(gl, FULL);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3); c.err("sample fbo texture");
+  c.pixel(10, 40, [255, 0, 255, 255], "screen left");
+  c.pixel(54, 40, [255, 255, 0, 255], "screen right");
+  gl.deleteBuffer(b); gl.deleteFramebuffer(fb); gl.deleteTexture(tex); gl.deleteProgram(prog); gl.deleteProgram(flat);
+  c.done();
+}
+
+// Depth: the near rectangle drawn first must win over the far one drawn after it (LESS).
+function depthTest(gl, name) {
+  var c = new Check(gl, name);
+  var bits = gl.getParameter(gl.DEPTH_BITS);
+  c.expect(bits >= 16, "DEPTH_BITS " + bits);
+  var prog = compile(gl, VS_FLAT, FS_COLOR);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true);
+  gl.clearColor(0, 0, 0, 1); gl.clearDepth(1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  drawColor(gl, prog, rect(-1, -1, 1, 1, -0.5), [1, 0, 0, 1]);   // near, whole canvas
+  drawColor(gl, prog, rect(-1, -1, 1, 1, 0.5), [0, 1, 0, 1]);    // far: hidden
+  drawColor(gl, prog, rect(0, -1, 1, 1, -0.8), [0, 0, 1, 1]);    // nearer, right half
+  c.err("draws");
+  c.pixel(16, 32, [255, 0, 0, 255], "left (near red)");
+  c.pixel(48, 32, [0, 0, 255, 255], "right (nearer blue)");
+  gl.disable(gl.DEPTH_TEST);
+  gl.deleteProgram(prog);
+  c.done();
+}
+
+// Blending: half-transparent red over opaque blue with SRC_ALPHA, ONE_MINUS_SRC_ALPHA (colour),
+// ONE, ZERO (alpha).
+function blendTest(gl, name) {
+  var c = new Check(gl, name);
+  var prog = compile(gl, VS_FLAT, FS_COLOR);
+  gl.clearColor(0, 0, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ZERO);
+  drawColor(gl, prog, rect(-1, -1, 0, 1, 0), [1, 0, 0, 0.5]);
+  c.err("blended draw");
+  c.pixel(16, 32, [128, 0, 127, 128], "blended");
+  c.pixel(48, 32, [0, 0, 255, 255], "untouched");
+  gl.disable(gl.BLEND);
+  gl.deleteProgram(prog);
+  c.done();
+}
+
+// WebGL 2: an RGBA32F texture with values outside [0, 1], sampled (NEAREST) and scaled into RGBA8.
+function floatTextureTest(gl, name) {
+  var c = new Check(gl, name);
+  var vs = "#version 300 es\nin vec2 aPos; out vec2 vUv; void main() { vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }";
+  var fs = "#version 300 es\nprecision highp float; in vec2 vUv; uniform highp sampler2D uTex; out vec4 o;" +
+    " void main() { o = texture(uTex, vUv) * 0.25; }";
+  var prog = compile(gl, vs, fs);
+  var tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 1, 1, 0, gl.RGBA, gl.FLOAT, new Float32Array([4.0, 2.0, 1.0, 4.0]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  c.err("texImage2D RGBA32F");
+  gl.useProgram(prog);
+  gl.uniform1i(gl.getUniformLocation(prog, "uTex"), 0);
+  var b = buffer(gl, FULL);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3); c.err("draw");
+  c.pixel(32, 32, [255, 128, 64, 255], "scaled float texel");
+  gl.deleteBuffer(b); gl.deleteTexture(tex); gl.deleteProgram(prog);
+  c.done();
+}
+
+// WebGL 2 + EXT_color_buffer_float: render into RGBA16F and read back floats.
+function floatRenderTest(gl, name) {
+  if (!gl.getExtension("EXT_color_buffer_float")) { row(name, null, "EXT_color_buffer_float not exposed"); return; }
+  var c = new Check(gl, name);
+  var tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, 8, 8, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  var fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  var status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  c.expect(status === gl.FRAMEBUFFER_COMPLETE, "framebuffer status 0x" + status.toString(16));
+  gl.viewport(0, 0, 8, 8);
+  var vs = "#version 300 es\nin vec3 aPos; void main() { gl_Position = vec4(aPos, 1.0); }";
+  var fs = "#version 300 es\nprecision highp float; out vec4 o; void main() { o = vec4(2.5, -1.0, 0.125, 1.0); }";
+  var prog = compile(gl, vs, fs);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  drawColor(gl, prog, rect(-1, -1, 1, 1, 0), [0, 0, 0, 0]);
+  c.err("draw RGBA16F");
+  var px = new Float32Array(4);
+  gl.readPixels(4, 4, 1, 1, gl.RGBA, gl.FLOAT, px); c.err("readPixels FLOAT");
+  var want = [2.5, -1.0, 0.125, 1.0];
+  for (var i = 0; i < 4; i++) {
+    if (Math.abs(px[i] - want[i]) > 0.01) { c.problems.push("float pixel " + Array.prototype.join.call(px, ",") + ", want " + want.join(",")); break; }
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.deleteFramebuffer(fb); gl.deleteTexture(tex); gl.deleteProgram(prog);
+  c.done();
+}
+
+// WebGL 2 instancing: one quad drawn 4 times, per-instance offset and colour (divisor 1).
+function instancingTest(gl, name) {
+  var c = new Check(gl, name);
+  var vs = "#version 300 es\nlayout(location=0) in vec2 aPos; layout(location=1) in vec2 aOffset; layout(location=2) in vec4 aColor;" +
+    " out vec4 vColor; void main() { vColor = aColor; gl_Position = vec4(aPos + aOffset, 0.0, 1.0); }";
+  var fs = "#version 300 es\nprecision mediump float; in vec4 vColor; out vec4 o; void main() { o = vColor; }";
+  var prog = compile(gl, vs, fs);
+  var vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  var quad = buffer(gl, [0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1]);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  var offs = buffer(gl, [-1, -1, 0, -1, -1, 0, 0, 0]);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(1, 1);
+  var cols = buffer(gl, [1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1]);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(2, 1);
+  gl.useProgram(prog);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, 4); c.err("drawArraysInstanced");
+  c.pixel(16, 16, [255, 0, 0, 255], "instance 0");
+  c.pixel(48, 16, [0, 255, 0, 255], "instance 1");
+  c.pixel(16, 48, [0, 0, 255, 255], "instance 2");
+  c.pixel(48, 48, [255, 255, 0, 255], "instance 3");
+  gl.bindVertexArray(null);
+  gl.deleteVertexArray(vao); gl.deleteBuffer(quad); gl.deleteBuffer(offs); gl.deleteBuffer(cols); gl.deleteProgram(prog);
+  c.done();
+}
+
+var info = [];
+["webgl", "webgl2"].forEach(function (kind) {
+  var gl = null;
+  try { gl = runSuite(kind); } catch (e) { row(kind + ".suite", false, "threw " + e.message); }
+  if (gl) {
+    var dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    info.push(kind + ": " + gl.getParameter(gl.VERSION) + " | " +
+      (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)));
+  }
+});
+document.getElementById("renderer").textContent = "renderer:\n  " + info.join("\n  ");
+var verdict = failures.length ? "FAIL " + failures[0] : "PASS";
+document.getElementById("status").textContent = verdict +
+  (failures.length > 1 ? " (+" + (failures.length - 1) + " more: " + failures.slice(1).join(", ") + ")" : "");
+document.getElementById("h").setAttribute("data-js", "ran");
+document.body.dataset.verdict = verdict;
+document.title = "Alchemy WebGL: " + verdict;
+</script>
+</body>
+</html>

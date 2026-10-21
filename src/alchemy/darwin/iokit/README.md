@@ -1,0 +1,25 @@
+# IOKit
+
+**Covers:** the read-only IOKit registry describing the host
+(`iokit_registry.cpp`: platform expert, Ethernet interfaces, and one
+IOPCIDevice with an IOGraphicsAccelerator2 child per host GPU, the
+accelerator's entry ID being the GPU's MTLDevice.registryID), HID managers with no devices, power and
+notification gaps, ForceFeedback, DiskArbitration gaps (`iokit.cpp`,
+fill-only), wireless, controller, location and authentication frameworks
+(`peripherals.cpp`), and Chrome's IOKit gaps (`iokit_gaps.cpp`).
+
+**Headless:** `iokit_headless.cpp` (alchemy.exe only), empty `iokit_fx.cpp`
+in alchemy-fx (`darwin/shells.hpp`).
+
+**Host dependencies:** `host::system` (machine UUID, power requests, power
+status, sleep and power-source notifications), the registry's adapter
+queries, and the GPU list of `darwin/metal/gpu_identity.hpp` (Vulkan
+physical devices; empty without Vulkan).
+
+**Unsupported:** HID devices and IOConnect calls never exist; their calls
+fail with IOKit's error codes.
+
+## Moved from darwin/identities/
+
+* `empty_registry.cpp`: headless, every build: matching dictionaries are real, and the empty registry finds no service.
+* `tests/iokit_registry_tests.cpp`: the registry as a renderer plug-in's images query it (ctest `alchemy_gui_iokit_registry`).

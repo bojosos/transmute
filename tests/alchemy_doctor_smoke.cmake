@@ -1,0 +1,13 @@
+if(NOT DEFINED ALCHEMY OR NOT DEFINED PROGRAM)
+    message(FATAL_ERROR "ALCHEMY and PROGRAM required")
+endif()
+execute_process(COMMAND "${ALCHEMY}" doctor --deps --json "${PROGRAM}"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 30)
+if(NOT result EQUAL 0 OR NOT errors STREQUAL "")
+    message(FATAL_ERROR "doctor JSON failed: ${result}: ${errors}")
+endif()
+string(JSON schema GET "${output}" schema)
+string(JSON count LENGTH "${output}" images)
+if(NOT schema EQUAL 1 OR count LESS 1)
+    message(FATAL_ERROR "invalid doctor report")
+endif()

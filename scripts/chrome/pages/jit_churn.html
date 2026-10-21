@@ -1,0 +1,97 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy JIT churn: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+</style>
+</head>
+<body>
+<h1>Alchemy JIT churn</h1>
+<p>Makes V8 compile and throw away machine code for a while, as long benchmarks do
+(Speedometer, JetStream): every round creates new functions with <code>new Function</code>, runs
+them hot enough for V8's optimizing tiers, and drops the oldest ones, so the garbage collector
+frees their code and V8 writes new code into the same pages.
+<code>?seconds=N</code> sets the run time (default 120), <code>?batch=N</code> the functions per
+round (default 64), <code>?keep=N</code> how many stay alive (default 512).
+The title ends as <code>Alchemy JIT churn: PASS ...</code> or <code>Alchemy JIT churn: FAIL ...</code>.</p>
+<p id="status">not run</p>
+<script>
+"use strict";
+(function () {
+  function param(name, fallback, lo, hi) {
+    var m = new RegExp("[?&]" + name + "=([0-9.]+)").exec(location.search);
+    return m ? Math.min(hi, Math.max(lo, parseFloat(m[1]))) : fallback;
+  }
+  var seconds = param("seconds", 120, 1, 7200);
+  var batch = param("batch", 64, 1, 4096) | 0;
+  var keep = param("keep", 512, 0, 1 << 20) | 0;
+  var status = document.getElementById("status");
+  var start = performance.now();
+  var live = [];
+  var made = 0, rounds = 0, checksum = 0, failed = "";
+
+  // A function whose body differs in constants and shape, so V8 compiles each one anew.
+  function make(n) {
+    var k = (n * 2654435761) >>> 0;
+    var body =
+      "var s = " + (k & 0xffff) + ", o = {a: " + (n & 255) + ", b" + (n % 7) + ": x};\n" +
+      "for (var i = 0; i < x; i++) {\n" +
+      "  s = (s + Math.imul(i, " + ((k >>> 8) & 1023 | 1) + ")) | 0;\n" +
+      "  if ((i & " + ((n % 5) + 3) + ") === 0) s ^= o.a + i;\n" +
+      "  o.a = (o.a + " + (n % 13) + ") & 1023;\n" +
+      "}\n" +
+      "return (s ^ " + n + ") >>> 0;";
+    return new Function("x", body);
+  }
+  // The same arithmetic in plain JavaScript, to check what the compiled functions return.
+  function expect(n, x) {
+    var k = (n * 2654435761) >>> 0, s = k & 0xffff, a = n & 255;
+    for (var i = 0; i < x; i++) {
+      s = (s + Math.imul(i, (k >>> 8) & 1023 | 1)) | 0;
+      if ((i & ((n % 5) + 3)) === 0) s ^= a + i;
+      a = (a + (n % 13)) & 1023;
+    }
+    return (s ^ n) >>> 0;
+  }
+
+  function round() {
+    for (var b = 0; b < batch; b++) {
+      var n = made++;
+      var f = make(n);
+      var r = 0;
+      // Enough calls (and loop iterations) to reach Sparkplug, Maglev and TurboFan.
+      for (var c = 0; c < 400; c++) r = f(64 + (c & 63));
+      var want = expect(n, 64 + (399 & 63));
+      if (r !== want && !failed) failed = "function " + n + " returned " + r + ", expected " + want;
+      checksum = (checksum + r) >>> 0;
+      live.push(f);
+    }
+    while (live.length > keep) live.shift();
+    rounds++;
+  }
+
+  function step() {
+    var t0 = performance.now();
+    while (performance.now() - t0 < 200) round();
+    var elapsed = (performance.now() - start) / 1000;
+    var line = rounds + " rounds, " + made + " functions, " + elapsed.toFixed(0) + " s, checksum " + checksum;
+    status.textContent = line;
+    if (failed) {
+      document.title = "Alchemy JIT churn: FAIL " + failed;
+      status.textContent = "FAIL " + failed + " (" + line + ")";
+      return;
+    }
+    if (elapsed >= seconds) {
+      document.title = "Alchemy JIT churn: PASS " + line;
+      return;
+    }
+    document.title = "Alchemy JIT churn: running " + elapsed.toFixed(0) + " s";
+    setTimeout(step, 0);
+  }
+  setTimeout(step, 0);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+LIBRARY fxl_fwd_target.dll
+EXPORTS
+  target_answer
+  target_ord3 = target_by_ordinal @3 NONAME

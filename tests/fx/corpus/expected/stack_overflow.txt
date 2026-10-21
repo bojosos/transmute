@@ -1,0 +1,6 @@
+attempt 0 caught stack overflow reset=1
+attempt 1 caught stack overflow reset=1
+big frame sum=48
+alloca sum=2
+thread exit=2
+main big frame sum=80

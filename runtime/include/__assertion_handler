@@ -1,0 +1,4 @@
+#ifndef ALCHEMY_LIBCPP_ASSERTION_HANDLER
+#define ALCHEMY_LIBCPP_ASSERTION_HANDLER
+#define _LIBCPP_ASSERTION_HANDLER(message) __builtin_trap()
+#endif

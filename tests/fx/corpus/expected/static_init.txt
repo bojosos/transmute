@@ -1,0 +1,11 @@
+order=C;ctor first;ctor second;ctor inline;ctor template;
+dynamic_value=50
+local static constructions=1 sum=336
+main returns
+dtor function-static
+atexit two
+atexit one
+dtor template
+dtor inline
+dtor second
+dtor first

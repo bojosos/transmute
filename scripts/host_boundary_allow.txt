@@ -1,0 +1,12 @@
+# Files that still include OS headers outside the host backends (scripts/check_host_boundary.ps1).
+# The host-boundary work removes entries; nothing is added. Regenerate a line only when a file moves.
+# src/fx entries: see docs/FX_HOST_SEAMS.md for the seams documented and left.
+src/fx/abi/bind.cpp
+src/fx/abi/diagnostics.cpp
+src/fx/abi/overrides.cpp
+src/fx/abi/overrides_crt.cpp
+src/fx/abi/overrides_fiber.cpp
+src/fx/loader/image.cpp
+src/fx/loader/loader_internal.hpp
+src/fx/loader/process.cpp
+src/fx/seh/seh.hpp

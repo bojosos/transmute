@@ -1,0 +1,145 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy GPU report: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1 id="h">Alchemy GPU report</h1>
+<p>The page-side equivalent of <code>chrome://gpu</code>: WebGL and WebGL 2 strings (through
+<code>WEBGL_debug_renderer_info</code>), extensions, limits and context attributes, and the WebGPU
+adapter's info, features and limits, each classified as <b>hardware</b>, <b>software</b>
+(SwiftShader, a fallback adapter) or <b>unavailable</b>. The classification is in
+<code>body[data-webgl]</code>, <code>[data-webgl2]</code>, <code>[data-webgpu]</code> and in
+<code>document.title</code>: <code>Alchemy GPU report: HW</code> when all three are hardware,
+otherwise <code>Alchemy GPU report: webgl=... webgl2=... webgpu=...</code>. <code>--dump-dom</code>
+waits for the WebGPU part (a chain of failing image loads holds the load event, at most 150 s).</p>
+<pre id="summary">summary: pending</pre>
+<pre id="webgl">webgl: pending</pre>
+<pre id="webgl2">webgl2: pending</pre>
+<pre id="webgpu">webgpu: pending</pre>
+<pre id="webgpu-fallback">webgpu-fallback: pending</pre>
+<script>
+"use strict";
+var finished = false, holdUntil = Date.now() + 150000;
+(function hold() {
+  if (finished || Date.now() > holdUntil) return;
+  var img = new Image();
+  img.onerror = img.onload = function () { img.remove(); hold(); };
+  img.src = "missing-" + Math.random() + ".png";
+  document.body.appendChild(img);
+})();
+function put(id, lines) { document.getElementById(id).textContent = id + ":\n  " + lines.join("\n  "); }
+function within(promise, seconds, what) {
+  return Promise.race([promise, new Promise(function (_, reject) {
+    setTimeout(function () { reject(new Error(what + " did not settle within " + seconds + " s")); }, seconds * 1000);
+  })]);
+}
+// Software renderers Chrome can end up on: SwiftShader (ANGLE's Vulkan back end on it, or WebGPU's
+// fallback adapter), and the generic names Mesa or Chrome's own disabled strings would carry.
+function isSoftware(text) { return /swiftshader|software|llvmpipe|basic render|disabled/i.test(text || ""); }
+
+var result = { webgl: "unavailable", webgl2: "unavailable", webgpu: "unavailable" };
+
+function webgl(kind) {
+  var canvas = document.createElement("canvas"), error = "";
+  canvas.addEventListener("webglcontextcreationerror", function (e) { error = e.statusMessage || "(no message)"; });
+  var gl = null;
+  try { gl = canvas.getContext(kind, { failIfMajorPerformanceCaveat: false }); } catch (e) { return ["getContext threw " + e]; }
+  if (!gl) return ["null context; creation error: " + (error || "(none reported)")];
+  var lines = [];
+  function p(name, value) { lines.push(name + "=" + value); }
+  p("VERSION", gl.getParameter(gl.VERSION));
+  p("SHADING_LANGUAGE_VERSION", gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
+  p("VENDOR", gl.getParameter(gl.VENDOR));
+  p("RENDERER", gl.getParameter(gl.RENDERER));
+  var renderer = gl.getParameter(gl.RENDERER);
+  var info = gl.getExtension("WEBGL_debug_renderer_info");
+  if (info) {
+    p("UNMASKED_VENDOR", gl.getParameter(info.UNMASKED_VENDOR_WEBGL));
+    renderer = gl.getParameter(info.UNMASKED_RENDERER_WEBGL);
+    p("UNMASKED_RENDERER", renderer);
+  } else p("WEBGL_debug_renderer_info", "absent");
+  var names = ["MAX_TEXTURE_SIZE", "MAX_CUBE_MAP_TEXTURE_SIZE", "MAX_RENDERBUFFER_SIZE", "MAX_VERTEX_ATTRIBS",
+    "MAX_VERTEX_UNIFORM_VECTORS", "MAX_FRAGMENT_UNIFORM_VECTORS", "MAX_VARYING_VECTORS", "MAX_TEXTURE_IMAGE_UNITS",
+    "MAX_VERTEX_TEXTURE_IMAGE_UNITS", "MAX_COMBINED_TEXTURE_IMAGE_UNITS", "MAX_VIEWPORT_DIMS", "ALIASED_LINE_WIDTH_RANGE",
+    "ALIASED_POINT_SIZE_RANGE", "DEPTH_BITS", "STENCIL_BITS", "SAMPLES"];
+  if (kind === "webgl2") names = names.concat(["MAX_3D_TEXTURE_SIZE", "MAX_ARRAY_TEXTURE_LAYERS", "MAX_DRAW_BUFFERS",
+    "MAX_COLOR_ATTACHMENTS", "MAX_SAMPLES", "MAX_UNIFORM_BUFFER_BINDINGS", "MAX_UNIFORM_BLOCK_SIZE",
+    "MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS", "MAX_ELEMENT_INDEX", "MAX_SERVER_WAIT_TIMEOUT"]);
+  names.forEach(function (n) {
+    var v = gl.getParameter(gl[n]);
+    p(n, v && v.length !== undefined ? Array.prototype.join.call(v, "x") : v);
+  });
+  p("contextAttributes", JSON.stringify(gl.getContextAttributes()));
+  var exts = gl.getSupportedExtensions() || [];
+  p("extensions(" + exts.length + ")", exts.join(" "));
+  gl.clearColor(0, 1, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  var px = new Uint8Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  p("clear readback", Array.prototype.join.call(px, ","));
+  p("glError", gl.getError());
+  p("contextLost", gl.isContextLost());
+  var cls = isSoftware(renderer) ? "software" : "hardware";
+  result[kind] = cls;
+  lines.unshift("class=" + cls);
+  return lines;
+}
+try { put("webgl", webgl("webgl")); } catch (e) { put("webgl", ["threw " + e]); }
+try { put("webgl2", webgl("webgl2")); } catch (e) { put("webgl2", ["threw " + e]); }
+
+async function adapterReport(options) {
+  var adapter = await within(navigator.gpu.requestAdapter(options), 120, "requestAdapter");
+  if (!adapter) return { lines: ["requestAdapter(" + JSON.stringify(options) + ") returned null"], cls: "unavailable" };
+  var lines = [];
+  var info = adapter.info || {};
+  var fallback = info.isFallbackAdapter !== undefined ? info.isFallbackAdapter : adapter.isFallbackAdapter;
+  lines.push("vendor=" + info.vendor + " architecture=" + info.architecture + " device=" + info.device +
+    " description=" + info.description);
+  if (info.subgroupMinSize !== undefined) lines.push("subgroupMinSize=" + info.subgroupMinSize + " subgroupMaxSize=" + info.subgroupMaxSize);
+  lines.push("isFallbackAdapter=" + fallback);
+  lines.push("features=" + Array.from(adapter.features).sort().join(" "));
+  var limits = [];
+  for (var key in adapter.limits) limits.push(key + "=" + adapter.limits[key]);
+  lines.push("limits " + limits.sort().join(" "));
+  try {
+    var device = await within(adapter.requestDevice(), 60, "requestDevice");
+    lines.push("requestDevice ok; queue=" + !!device.queue);
+    device.destroy();
+  } catch (e) { lines.push("requestDevice failed: " + e.message); }
+  var cls = fallback || isSoftware(info.vendor + " " + info.architecture + " " + info.description) ? "software" : "hardware";
+  lines.unshift("class=" + cls);
+  return { lines: lines, cls: cls };
+}
+
+(async function () {
+  if (!("gpu" in navigator)) {
+    put("webgpu", ["navigator.gpu absent (isSecureContext=" + window.isSecureContext + ")"]);
+    put("webgpu-fallback", ["skipped"]);
+    return;
+  }
+  try {
+    var r = await adapterReport({ powerPreference: "high-performance" });
+    result.webgpu = r.cls;
+    put("webgpu", r.lines);
+  } catch (e) { put("webgpu", ["threw " + e.message]); }
+  try { put("webgpu-fallback", (await adapterReport({ forceFallbackAdapter: true })).lines); }
+  catch (e) { put("webgpu-fallback", ["threw " + e.message]); }
+})().finally(function () {
+  var hw = result.webgl === "hardware" && result.webgl2 === "hardware" && result.webgpu === "hardware";
+  var verdict = hw ? "HW" : "webgl=" + result.webgl + " webgl2=" + result.webgl2 + " webgpu=" + result.webgpu;
+  document.getElementById("summary").textContent = "summary: " + verdict;
+  document.body.dataset.webgl = result.webgl;
+  document.body.dataset.webgl2 = result.webgl2;
+  document.body.dataset.webgpu = result.webgpu;
+  document.body.dataset.verdict = verdict;
+  document.getElementById("h").setAttribute("data-js", "ran");
+  document.title = "Alchemy GPU report: " + verdict;
+  finished = true;
+});
+</script>
+</body>
+</html>

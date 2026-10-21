@@ -1,0 +1,23 @@
+argc=8
+argv[0] base=args_env.exe
+argv[1]=[alpha] len=5
+argv[2]=[two words] len=9
+argv[3]=[quote"inside] len=12
+argv[4]=[back\slash\] len=11
+argv[5]=[] len=0
+argv[6]=[trailing\\] len=10
+argv[7]=[--flag=1] len=8
+argv[argc]=null
+__argc=8 same-argv=1
+tail=[alpha "two words" "quote\"inside" back\slash\ "" trailing\\ --flag=1]
+getenv FX_CORPUS_VAR=value-123
+getenv FX_CORPUS_MISSING=(null)
+envp FX_CORPUS_* count=2
+  FX_CORPUS_OTHER=other value with spaces
+  FX_CORPUS_VAR=value-123
+GetEnvironmentVariableA FX_CORPUS_OTHER=other value with spaces len=23
+GetEnvironmentVariableA missing len=0 error=203
+after _putenv_s getenv=set-by-guest
+after _putenv_s GetEnvironmentVariableA=set-by-guest
+SetEnvironmentVariableA then Get=os-level
+ExpandEnvironmentStringsA=[value-123]

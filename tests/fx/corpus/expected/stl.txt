@@ -1,0 +1,30 @@
+vector unique=1000 sum=504678 lower_bound(500)=494
+list: delta charlie bravo alpha zulu
+deque front=98 back=99 [50]=1
+map: brown=1 dog=1 end=1 fox=1 jumps=1 lazy=1 over=1 quick=1 the=3
+unordered_map size=500 weighted=685287 find(31)=1
+set intersection=2 union=8
+unordered_set size=3 count(b)=1
+array: 9 8 7 5 4 3 2 1 nth=10
+shapes total=14.5625 first=rect
+shared use_count=2 expired=0 after reset expired=1
+bitset count=32 str=00001111
+upper=HELLO, WORLD find=7 rfind=10 sub=WOR starts=1
+joined=0,1,4,9,16 stoi=-1234 stoull=65535 stod=625
+to_string(double)=0.333333 to_string(-0.5f)=-0.500000
+fixed=3.142 0.667 sci=1.23e+05 default=0.3
+hex=0xff 0XABCDEF dec=255
+[******42][ab****] bool=true
+ostringstream=x=10 y=2.5 z=c istringstream=17/3.75/word/31
+wstring length=11
+format: 42      r l     | 0003.142 ff 0b101 1.234500e+03
+format: second first 2
+regex: 2024/01/15 2025/12/31 1999/07/04 replaced=a#b#c#
+mt19937: 3992670690 3823185381 1358822685 561383553 mt19937_64=17823261523276863291
+dice: 992 1016 982 1012 1016 982
+optional has=0 value_or=-1 now=5
+variant index=1 visit=text
+any type int=1 cast=10
+function fact(10)=3628800 bind=123
+chrono seconds=5415 ms=5415000
+steady monotonic=1

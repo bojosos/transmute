@@ -1,0 +1,8 @@
+main: contains-local=1 page-aligned=1 near-top=1 reserve KiB=1024
+thread default: contains-local=1 page-aligned=1 near-top=1 reserve KiB=1024
+thread reserve 4MiB: contains-local=1 page-aligned=1 near-top=1 reserve KiB=4096
+thread commit 2MiB: contains-local=1 page-aligned=1 near-top=1
+thread commit 2MiB reserve>=2MiB=1
+thread stacks distinct from main=1
+callback: contains-local=1 same-as-main=1
+TEB StackBase matches high=1 StackLimit within=1

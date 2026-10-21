@@ -1,0 +1,6 @@
+malloc=60168 calloc=29865 realloc=22211 free=90033 bytes=378337878
+checksum=3256c1e916cd744d errors=0
+aligned misaligned=0
+_msize=1000
+private heap sum=1501440 validate=1 destroy=1
+huge malloc null=1 errno=12

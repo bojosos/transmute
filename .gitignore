@@ -1,0 +1,10 @@
+/build/
+/out/
+/.vs/
+/.vscode/
+/artifacts/
+/build-*/
+/build-*.log
+/.claude/
+__pycache__/
+CMakeUserPresets.json

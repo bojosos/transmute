@@ -1,0 +1,20 @@
+LIBRARY fxcorpus_dll.dll
+EXPORTS
+    fxdll_add @1
+    fxdll_mul64 @2
+    fxdll_mix @3
+    fxdll_sum_many @4
+    fxdll_sum_fp_many @5
+    fxdll_apply @6
+    fxdll_by_ordinal @7 NONAME
+    fxdll_name @8
+    fxdll_make_point @9
+    fxdll_make_big @10
+    fxdll_vsum @11
+    fxdll_tls_get @12
+    fxdll_tls_set @13
+    fxdll_initializer_ran @14
+    fxdll_counter @20 DATA
+    fxdll_process_attach @21 DATA
+    fxdll_thread_attach @22 DATA
+    fxdll_thread_detach @23 DATA

@@ -1,0 +1,8 @@
+qsort ints sorted=1 first=-50000 last=49999 hash=21c0a6407f2c4d4c calls=893412
+bsearch hits=1036 misses=1667
+qsort strings: [] [Zebra] [apple] [apple] [apricot] [banana] [cherry] [date] [elderberry] [fig] [grape] [kiwi] [lemon] [mango] [pear] [zebra]
+bsearch kiwi index=11
+records: 0/12.25/r256 0/5.00/r180 1/10.25/r863 1/5.50/r721 2/11.50/r272 2/2.50/r596 3/8.50/r990 3/1.50/r625 4/4.00/r295
+qsort_s desc: 999 907 693 574 442 342 251 118
+_lfind found=1 value-match=1
+_lfind absent=1
