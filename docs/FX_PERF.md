@@ -39,7 +39,7 @@ scripts/perf/fx_ab.ps1 ... -Bench sp-jitless,js-jitless,js-jit,fps -Rounds 3   #
 | `blender` | Blender.app `-b --factory-startup` plus one operator | process CPU and wall seconds |
 | `cycles` | Blender.app headless Cycles render of the factory cube, 640x360, 64 samples, 2 threads (about 8 s of render on main) | render seconds (`time.perf_counter` around `render()`) |
 | `plugin` | a Blender renderer plug-in's headless cube render on a scratch copy of its Alchemy root (`-PluginRoot`, `-PluginScript`, or `ALCHEMY_PERF_PLUGIN_ROOT`/`_SCRIPT`) | "render returned in" seconds, plug-in enable seconds |
-| `qlab` | QLab 5 to its first frame on a scratch copy of `alchemy-root` (`ALCHEMY_PERF`) | "first frame presented" ms |
+| `qlab` | QLab 5 for 45 s on a scratch copy of `alchemy-root`, its windows captured (`ALCHEMY_CONTENTS_CAPTURE`) | seconds to the first captured window (the welcome window), windows captured |
 | `sp-jitless`, `sp-jit` | Speedometer 3.0 (browserbench.org), `-SpeedometerIterations` (1), software compositor | score |
 | `js-jitless`, `js-jit` | JetStream 2.2, one fresh browser per test of `-JetStreamTests` (richards, delta-blue, crypto, navier-stokes, splay, Box2D) | score per test and their geometric mean |
 | `fps`, `fps-sw` | `pages/raf_box.html`, 20 s, SwiftShader GPU process / software compositor | rAF callbacks per second |
@@ -118,7 +118,7 @@ translated than native).
   instructions of the 24 dumped hot regions: context access (r15-relative: guest registers kept in memory, spills,
   reloads), flag handling, atomics, indirect branches and exits, direct branches, guest memory operands, SIMD and FP,
   other integer. For guest fixtures `--image` names regions by symbol. Percentages are sample locations, not
-  removable time. Guest apps are never disassembled: only host code is.
+  removable time. Only fx's own translated host code is classified; a guest application's code is not examined.
 * The profile counts every thread; Chrome and Blender keep many threads waiting. Read the per-thread table and
   divide by the busy thread's share.
 
@@ -148,7 +148,7 @@ waiting. Cycles' render threads: almost all translated. fxbench: 60 % translated
 ### Anatomy of a jitless JavaScript dispatch
 
 JetStream richards jitless (renderer main thread 91.5 % translated; 3 regions hold 53 % of its samples, 17 hold
-91 %; the hottest is 12.5 KB of host code). Read from the host code only. A bytecode handler ends in `br x17`, and
+91 %; the hottest is 12.5 KB of host code). The figures come from fx's translated host code. A bytecode handler ends in `br x17`, and
 the translated exit is:
 
 | Part | Host instructions | What |

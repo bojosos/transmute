@@ -15,7 +15,7 @@
 #   cycles       Blender.app headless Cycles render of the factory cube (640x360, 64 samples, 2 threads; about 8 s of render)
 #   plugin       a Blender renderer plug-in's headless cube render, on a scratch copy of the plug-in's Alchemy root
 #                (-PluginRoot: a folder under -Artifacts; -PluginScript: the cube script's guest path)
-#   qlab         QLab 5 to its first frame (ALCHEMY_PERF "first frame presented") on a scratch copy of alchemy-root
+#   qlab         QLab 5 to its first captured window (ALCHEMY_CONTENTS_CAPTURE) on a scratch copy of alchemy-root
 #   sp-jitless, sp-jit   Speedometer 3 (browserbench.org), -SpeedometerIterations iterations, software compositor
 #   js-jitless, js-jit   JetStream 2.2, one fresh browser per test in -JetStreamTests (?test=<name>)
 #   fps          scripts/perf/pages/raf_box.html, rAF callbacks per second over 20 s, SwiftShader GPU process
@@ -308,10 +308,20 @@ function Bench-Qlab($side, [string]$dir) {
     $root = Copy-Root 'alchemy-root'
     $user = "fxperf-$($side.label)"
     New-Item -ItemType Directory -Force (Join-Path $root "Users\$user") | Out-Null
+    # Cloaked, QLab presents no frame for ALCHEMY_PERF's first-frame table; its windows' contents are captured
+    # (ALCHEMY_CONTENTS_CAPTURE), so the metric is the time from launch to the first captured window (the welcome
+    # window), as the wave's earlier QLab checks measured it. It runs 45 s, then its process tree is ended.
+    $capture = Join-Path $dir 'capture'
+    Remove-Item -Recurse -Force $capture -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force $capture | Out-Null
+    $launched = Get-Date
     $r = Invoke-Measured $side.exe "--runtime-dir `"$llvm`" --runtime-dir `"$swift`" --root `"$root`" /Applications/QLab.app" `
-        @{ TRANSMUTE_FX_CACHE_DIR = $side.cache; HOME = "/Users/$user"; ALCHEMY_PERF = '1' } (Join-Path $dir 'qlab') 120 0 'startup phases \(first frame\)' 3
-    $m = [regex]::Match($r.text, '\[alchemy perf\]\s+([0-9.]+)\s+first frame presented')
-    @(Sample 'first_frame_ms' $(if ($m.Success) { [double]$m.Groups[1].Value } else { -1 }) 'ms' 'lower' $(if ($m.Success) { 'ok' } else { 'fail' }))
+        @{ TRANSMUTE_FX_CACHE_DIR = $side.cache; HOME = "/Users/$user"; ALCHEMY_CONTENTS_CAPTURE = $capture } (Join-Path $dir 'qlab') 45
+    $first = Get-ChildItem $capture -Filter *.bmp -ErrorAction SilentlyContinue | Sort-Object CreationTime | Select-Object -First 1
+    $windows = @(Get-ChildItem $capture -Filter *.bmp -ErrorAction SilentlyContinue).Count
+    $ok = [bool]$first -and $r.text -notmatch 'alchemy: stopping'
+    @((Sample 'first_window_s' $(if ($first) { [math]::Round(($first.CreationTime - $launched).TotalSeconds, 2) } else { -1 }) 's' 'lower' $(if ($ok) { 'ok' } else { 'fail' })),
+      (Sample 'windows_captured' $windows 'count' 'higher' $(if ($windows) { 'ok' } else { 'fail' })))
 }
 function Invoke-Chrome($side, [string]$dir, [string]$url, [string]$action, [bool]$jit, [bool]$swiftshader, [int]$play = 5) {
     New-Item -ItemType Directory -Force $dir | Out-Null
