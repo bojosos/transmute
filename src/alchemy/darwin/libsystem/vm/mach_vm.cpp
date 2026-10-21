@@ -531,6 +531,9 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
                     return resource_shortage;
                 }
                 if (!replaced) return refuse("the overwritten range is neither Mach VM pages nor mmap'd memory");
+                // Executable image text copied: its translations can come from
+                // the image's cache (validated by content, per region).
+                if (executable) engine_code_copy(engine, target, begin, extent);
                 memory.write32(current_output, current);
                 memory.write32(maximum_output, current);
                 return success;
@@ -542,6 +545,7 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
                 engine.set_memory_access(address, true, false, executable);
                 pages.at(address).current = current;
             }
+            if (executable) engine_code_copy(engine, target, begin, extent);
             memory.write32(current_output, current);
             memory.write32(maximum_output, current);
             return success;

@@ -1,5 +1,6 @@
 // Differential tests: SIMD&FP loads and stores against host memory, every
 // addressing and writeback form, SP base, structures and lanes (owner: neon).
+#include "fx/translator/emit_neon_internal.hpp"
 #include "fx/translator/emit_neon_test_util.hpp"
 
 #include <cstdio>
@@ -149,6 +150,10 @@ FX_TEST(vector_ldp_stp) {
 
 FX_TEST(vector_ld_st_multiple) {
     fill_buffer(6);
+    // Both structure lowerings (TRANSMUTE_FX_NEON=oldstruct: every chunk in a temp).
+    struct RestoreKnobs { ~RestoreKnobs() { neon::neon_set_knobs_for_testing(-1); } } restore;
+    for (const int knobs : {0, static_cast<int>(neon::neon_old_struct)}) {
+    neon::neon_set_knobs_for_testing(knobs);
     std::uint64_t state = 47;
     for (const unsigned opcode : {0x0u, 0x2u, 0x4u, 0x6u, 0x7u, 0x8u, 0xau})
         for (unsigned l = 0; l < 2; ++l)
@@ -170,6 +175,7 @@ FX_TEST(vector_ld_st_multiple) {
                             if (!run_one(word, ctx, "ld_st_multiple", valid)) break;
                         }
                     }
+    }
     print_stats("after ld_st_multiple");
 }
 

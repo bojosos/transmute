@@ -82,6 +82,29 @@ bool in_registered_ranges(std::uint64_t address) noexcept {
     return address >= it->first && address < it->second;
 }
 
+// Copies of guest code (register_guest_code_copy): sorted, disjoint
+// [begin, end) of the copy with copy - source. Published like RangeSet; a
+// guest makes a handful (V8: one per isolate).
+struct CopySet {
+    struct Copy {
+        std::uint64_t begin, end;
+        std::int64_t delta;
+    };
+    std::vector<Copy> copies;
+};
+std::atomic<const CopySet*> g_copies{nullptr};
+std::mutex g_copies_mutex;
+std::vector<std::unique_ptr<CopySet>> g_copy_sets;
+
+// g_copies_mutex held.
+void publish_copies(std::vector<CopySet::Copy> copies) {
+    std::sort(copies.begin(), copies.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+    auto set = std::make_unique<CopySet>();
+    set->copies = std::move(copies);
+    g_copies.store(set.get(), std::memory_order_release);
+    g_copy_sets.push_back(std::move(set));
+}
+
 bool readable_committed(std::uint64_t page) noexcept {
     namespace vm = host::vm;
     vm::RegionInfo info;
@@ -108,6 +131,33 @@ bool read_pdata_words(const std::uint32_t* entry, std::uint32_t& begin, std::uin
 } // namespace
 
 bool in_registered_code_memory(std::uint64_t address) noexcept { return in_registered_ranges(address); }
+
+bool guest_code_copy_delta(std::uint64_t address, std::int64_t& delta) noexcept {
+    const auto* set = g_copies.load(std::memory_order_acquire);
+    if (!set) return false;
+    for (const auto& c : set->copies) {
+        if (address < c.begin) return false;
+        if (address < c.end) {
+            delta = c.delta;
+            return true;
+        }
+    }
+    return false;
+}
+
+void drop_guest_code_copies(std::uint64_t begin, std::uint64_t end) {
+    const auto* set = g_copies.load(std::memory_order_acquire);
+    if (!set || set->copies.empty()) return;
+    std::lock_guard lock(g_copies_mutex);
+    set = g_copies.load(std::memory_order_acquire);
+    std::vector<CopySet::Copy> kept;
+    bool changed = false;
+    for (const auto& c : set->copies) {
+        if (c.begin < end && begin < c.end) changed = true;
+        else kept.push_back(c);
+    }
+    if (changed) publish_copies(std::move(kept));
+}
 
 std::size_t registered_code_range_count() noexcept {
     const auto* set = g_ranges.load(std::memory_order_acquire);
@@ -140,15 +190,17 @@ bool guest_code_range(std::uint64_t address, std::uint64_t& lo, std::uint64_t& h
 // VirtualQuery costs ~1 us normally but can take over 100 us in processes with
 // large reservations (it computes the size of the region of equal attributes),
 // and the JIT asks for every page it reads code from. Entries are dropped when
-// the invalidation epoch changes (every guest protection change invalidates
-// translated code first); a stale entry could only let safe_read32 see a fault.
+// the memory access epoch changes (every guest protection change, unmap and
+// decommit invalidates translated code first); a stale entry could only let
+// safe_read32 see a fault. Not the invalidation epoch: V8's code writes bump
+// that on every SMC fault, and the JIT then queried every page again.
 bool readable_page_cached(std::uint64_t page) noexcept {
     struct Slot {
         std::uint64_t page;
         std::uint64_t epoch;
     };
     thread_local Slot slots[1024];
-    const std::uint64_t epoch = invalidation_epoch();
+    const std::uint64_t epoch = memory_access_epoch();
     Slot& slot = slots[(page >> 12) & 1023];
     if (slot.page == page && slot.epoch == epoch) return true;
     if (!readable_committed(page)) return false;
@@ -159,6 +211,8 @@ bool readable_page_cached(std::uint64_t page) noexcept {
 void LiveCodeSource::reset() {
     page_ = ~std::uint64_t{0};
     page_ok_ = false;
+    data_page_ = ~std::uint64_t{0};
+    data_page_ok_ = false;
     code_lo_ = code_hi_ = 0;
     reads_.clear();
     host_entries_only = false;
@@ -182,6 +236,24 @@ bool LiveCodeSource::read(std::uint64_t address, std::uint32_t& word) const {
                    readable_page_cached(page);
     }
     if (!page_ok_ || !safe_read32(address, word)) return false;
+    reads_.emplace_back(address, word);
+    return true;
+}
+
+bool LiveCodeSource::read_data(std::uint64_t address, std::uint32_t& word) const {
+    if (read(address, word)) return true;
+    if ((address & 3) != 0) return false;
+    const auto page = address & ~std::uint64_t{0xfff};
+    if (page != data_page_) {
+        namespace vm = host::vm;
+        data_page_ = page;
+        vm::RegionInfo info;
+        data_page_ok_ = vm::query(reinterpret_cast<const void*>(page), info) && info.committed() &&
+                        (info.protect & vm::kGuard) == 0 &&
+                        ((info.protect & 0xff) == vm::kReadOnly || (info.protect & 0xff) == vm::kExecuteRead) &&
+                        transmute::fx::guest_page_protection(page) == 0;   // not write-protected by fx over a guest protection
+    }
+    if (!data_page_ok_ || !safe_read32(address, word)) return false;
     reads_.emplace_back(address, word);
     return true;
 }
@@ -255,6 +327,18 @@ void register_guest_code_memory(std::uint64_t base, std::uint64_t size) {
     auto ranges = rt::current_ranges();
     ranges.emplace_back(base, end);
     rt::publish(std::move(ranges));
+}
+
+void register_guest_code_copy(std::uint64_t copy, std::uint64_t source, std::uint64_t size) {
+    if (size == 0 || copy == source || copy + size < copy || source + size < source) return;
+    std::lock_guard lock(rt::g_copies_mutex);
+    const auto* set = rt::g_copies.load(std::memory_order_acquire);
+    std::vector<rt::CopySet::Copy> copies;
+    if (set)
+        for (const auto& c : set->copies)
+            if (c.end <= copy || copy + size <= c.begin) copies.push_back(c);
+    copies.push_back({copy, copy + size, static_cast<std::int64_t>(copy - source)});
+    rt::publish_copies(std::move(copies));
 }
 
 void unregister_guest_code_memory(std::uint64_t base, std::uint64_t size) {

@@ -18,7 +18,9 @@ namespace transmute::fx {
 //   hit   = (pc & 3) == 0 && (entry >> 32) == tag   (compare the full 64-bit tag)
 //   host  = runtime_arena_base() + (std::uint32_t)entry
 // An empty slot is 0, which decodes to the miss stub at arena offset 0, so a
-// stray hit on an empty slot still lands in a correct (miss) path.
+// stray hit on an empty slot still lands in a correct (miss) path. That stub
+// stores rcx as ctx->pc: inline lookups keep the target in rcx (and may
+// store ctx->pc only on their own miss path).
 inline constexpr unsigned kLookupIndexBits = 20;
 inline constexpr unsigned kLookupTagShift = kLookupIndexBits + 2;
 const void* runtime_arena_base() noexcept;
@@ -167,6 +169,19 @@ struct RuntimeStats {
     std::uint64_t retired_regions{};
     double reclaim_seconds{};
     double reclaim_scan_seconds{};
+    // (additive) JIT write windows (guest_jit_write_window): SMC faults inside
+    // a window that deferred their page instead of invalidating it; deferred
+    // pages checked when a window closed; regions on them kept (guest bytes
+    // unchanged) and killed (changed).
+    std::uint64_t jit_window_deferred{};
+    std::uint64_t jit_window_pages_checked{};
+    std::uint64_t jit_window_regions_kept{};
+    std::uint64_t jit_window_regions_killed{};
+    // (additive) Copies of image code (register_guest_code_copy): JIT
+    // translations made in a copy, and regions of a copy installed from the
+    // source module's cache instead.
+    std::uint64_t copy_translations{};
+    std::uint64_t copy_cache_hits{};
 };
 RuntimeStats runtime_stats();
 

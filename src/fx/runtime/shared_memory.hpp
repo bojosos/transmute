@@ -19,5 +19,9 @@ extern std::atomic<bool> g_shared_aliases;
 // Appends to `out`; nothing for unshared pages. Callable under the region
 // map lock (the shared-memory lock nests inside it).
 void shared_memory_aliases(std::uint64_t page, std::vector<std::uint64_t>& out);
+// The same for every page of [begin, end), in one walk of the views that
+// overlap it (invalidating a range page by page cost a lock and a lookup per
+// page: ~6 % of a jitless Speedometer renderer).
+void shared_memory_aliases(std::uint64_t begin, std::uint64_t end, std::vector<std::uint64_t>& out);
 
 } // namespace transmute::fx::rt

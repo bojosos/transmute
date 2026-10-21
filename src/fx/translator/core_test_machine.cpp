@@ -72,7 +72,9 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
             if ((conv.guest_mask >> g) & 1u) a.mov(64, ptr(Gp::r15, x_disp(g)), x64::gp(static_cast<unsigned>(conv.host[g])));
     };
     // Arena offset 0: the lookup miss stub (empty lookup slots decode here,
-    // as in the runtime; see fx/runtime/runtime.hpp).
+    // as in the runtime; see fx/runtime/runtime.hpp): rcx is the target.
+    // stub_indirect follows (ctx->pc already stored).
+    a.mov(64, ptr(Gp::r15, ctx_disp(offsetof(GuestContext, pc))), Gp::rcx);
     const auto indirect = a.size();
     store_globals();
     a.mov(32, ptr(Gp::r15, exit_reason), static_cast<std::int32_t>(ExitReason::lookup_miss));
@@ -149,10 +151,12 @@ void TestMachine::prepare(GuestContext& ctx) const {
     ctx.stub_indirect_live = stub_indirect_;   // only translated code jumps there
     ctx.stub_host_return = nullptr;            // no host entries
     ctx.stub_dispatch_exit = stub_exit_;
-    // Inline indirect-branch lookups (same encoding as the runtime).
-    ctx.lookup_table = lookup_.data();
-    ctx.lookup_mask = kLookupSlots - 1;
-    ctx.arena_base = inline_lookup ? arena_ : nullptr;
+    // Inline indirect-branch lookups (same encoding as the runtime). Without
+    // them, a one-slot table whose tag no pc has: every lookup misses.
+    static const std::uint64_t never[1] = {0xffffffff00000000ULL};
+    ctx.lookup_table = inline_lookup ? lookup_.data() : never;
+    ctx.lookup_mask = inline_lookup ? kLookupSlots - 1 : 0;
+    ctx.arena_base = arena_;
     for (unsigned i = 0; i < kHelperSlots; ++i) ctx.helpers[i] = helpers_[i];
 }
 

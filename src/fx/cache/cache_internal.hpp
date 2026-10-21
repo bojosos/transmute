@@ -12,6 +12,12 @@
 namespace transmute::fx::cache_detail {
 
 cachefmt::Key make_key(std::uint64_t image_hash, std::uint64_t file_size, const TranslateOptions& options);
+// Hash of the translator, emitter, cache-format and translated-code-ABI
+// sources of this build (generated: cmake/FxTranslatorFingerprint.cmake).
+// make_key folds it into every key, so another build's code generation never
+// reuses this one's files. Tests may replace it (0 restores the build's).
+std::uint64_t translator_source_fingerprint() noexcept;
+void set_source_fingerprint_for_tests(std::uint64_t value) noexcept;
 // Effective cache directory (no trailing separator) and JIT options.
 std::wstring effective_directory();
 TranslateOptions configured_options();

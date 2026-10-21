@@ -20,6 +20,7 @@ std::atomic<int> g_translate_calls{0};
 std::atomic<int> g_attach_calls{0};
 std::atomic<int> g_detach_calls{0};
 std::atomic<int> g_cache_stores{0};
+std::atomic<int> g_cache_copy_stores{0};
 std::atomic<int> g_cache_configures{0};
 std::atomic<int> g_cache_lookups{0};
 std::atomic<bool> g_last_lazy{false};
@@ -294,6 +295,24 @@ bool cache_lookup(std::uint64_t pc, TranslatedRegion& region) {
     return true;
 }
 void cache_store(const TranslatedRegion&) { ++rtt::g_cache_stores; }
+// Copies: the region "stored" for the source pc, moved by delta as the real
+// cache rebuilds it at the copy.
+bool cache_lookup_copy(std::uint64_t source_pc, std::int64_t delta, TranslatedRegion& region) {
+    if (!cache_lookup(source_pc, region)) return false;
+    const auto d = static_cast<std::uint64_t>(delta);
+    region.guest_start += d;
+    for (auto& [begin, end] : region.guest_ranges) begin += d, end += d;
+    for (auto& e : region.entries) e.guest_pc += d;
+    for (auto& e : region.exits) e.target_pc += d;
+    for (auto& f : region.faults) f.guest_pc += d;
+    for (auto& f : region.fixups) {
+        if (f.kind != FixupKind::guest_address_imm64) continue;
+        f.value += d;
+        std::memcpy(region.code.data() + f.offset, &f.value, 8);
+    }
+    return true;
+}
+void cache_store_copy(const TranslatedRegion&, std::int64_t) { ++rtt::g_cache_copy_stores; }
 bool cache_exit_quiescent() noexcept { return true; }
 void cache_prepare_exit() noexcept {}
 void cache_set_module_ready_handler(CacheModuleReadyHandler handler) { rtt::g_ready_handler.store(handler); }

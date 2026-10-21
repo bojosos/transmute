@@ -33,6 +33,41 @@ enum IselKnob : std::uint32_t {
 std::uint32_t isel_knob_bits();
 inline bool isel_on(std::uint32_t knob) { return (isel_knob_bits() & knob) == 0; }
 
+// Further TRANSMUTE_FX_CORE knobs restoring a previous lowering (read once):
+//   nobranchdirty - dirty cached registers are stored before every
+//                   conditional branch outside loops, even when both
+//                   successors take the cache over (dirty_crosses_branch)
+//   nodeadpinloads - entries load every pin, also those the code overwrites
+//                   before anything observes them (pins_dead_at_entry)
+//   noflagsave    - flags that outlive an EFLAGS-clobbering instruction are
+//                   always converted to ctx->nzcv (save_flags_around)
+//   noccmpfusion  - CCMP is branchy even when its only reader follows it
+//                   (e_ccmp: setcc/test fusion with B.cond and CSEL)
+//   nogprreuse    - a GPR result never reuses the host that cached the
+//                   destination's old value (reusable_gpr)
+//   nobrdeadflags - NZCV stays live at every BR. By default (abi_flags) it
+//                   is dead at a BR that does not look intra-function (no
+//                   recognised table, no ADR/ADRP in its block), as at
+//                   BL/BLR/RET (region_plan.cpp flags liveness)
+// and opt-in ones (on when named):
+//   mergedirty    - dirty cached registers also cross forward jumps and
+//                   fall-throughs into merge points outside loops
+//                   (dirty_into_merge)
+// All are folded into the translator fingerprint (region_plan.cpp).
+enum CodegenKnob : std::uint32_t {
+    knob_no_branch_dirty = 1u,
+    knob_no_br_flags_dead = 2u,
+    knob_no_dead_pin_loads = 4u,
+    knob_no_flag_save = 8u,
+    knob_no_ccmp_fusion = 16u,
+    knob_no_gpr_reuse = 32u,
+    knob_merge_dirty = 64u,
+};
+std::uint32_t codegen_p2_knob_bits();
+// Tests: use `bits` instead of the environment (~0u: the environment again).
+void set_p2_knobs_for_testing(std::uint32_t bits);
+inline bool codegen_on(std::uint32_t knob) { return (codegen_p2_knob_bits() & knob) == 0; }
+
 // Facts about the value of Xg before instruction `index` (bit set = holds).
 enum ExtFact : unsigned {
     ext_zero32 = 1u,   // bits 63..32 are zero (Xg == UXTW(Wg))

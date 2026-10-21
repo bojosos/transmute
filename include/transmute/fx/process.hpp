@@ -112,6 +112,20 @@ void register_host_entry(std::uint64_t guest_pc, const void* host_code);
 // ctx.pc. Registering a pc again replaces the entry.
 using HostCallback = void (*)(GuestContext& ctx, void* user);
 void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void* user);
+// A leaf in front of a host callback, for calls that only read and write
+// integer argument and result registers (x0..x7 in ctx) and guest memory:
+// `leaf(ctx)` is called straight from translated code, without the FP
+// handoff, and with the cross-region convention registers still in their
+// host registers (a Win64 callee keeps them) -- so their context slots,
+// ctx.pc, x30's slot and the FP state are not current, and the leaf must not
+// read them, change MXCSR, call guest code, raise or exit. If it returns
+// true, execution continues at x30 (the return address). If it returns
+// false it must have changed nothing, and the call runs `callback` exactly
+// as register_host_callback would. When the convention holds an argument
+// register (TRANSMUTE_FX_GLOBALS with one of x0..x7), the entry is the
+// callback alone.
+using HostLeaf = bool (*)(GuestContext& ctx);
+void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user);
 // Removes a register_host_entry / register_host_callback entry (no-op if
 // `guest_pc` has none). Exits linked to it are unlinked; the next branch to
 // `guest_pc` resolves it again (e.g. translates guest code there).
@@ -139,6 +153,30 @@ void flush_guest_code(std::uint64_t address, std::uint64_t size);
 // (the bytes cannot change through a non-writable page). A writable
 // protection needs invalidate_guest_code instead.
 void guest_protection_lowered(std::uint64_t address, std::uint64_t size);
+
+// (additive) The calling guest thread opens (open = true) or closes a JIT
+// write window: Darwin pthread_jit_write_protect_np(0) / (1). Under the
+// MAP_JIT contract a thread writes JIT memory only inside such a window and
+// executes it only outside, and code it wrote is not guaranteed visible to
+// any thread before an instruction-cache flush (flush_guest_code). So an SMC
+// fault inside a window on registered (non-image) guest code gives the page
+// its guest protection back without invalidating it; the translations on it
+// stay valid for other threads (as stale instructions may run on ARM until
+// the flush). Flushes still invalidate at once. When a window closes, each
+// translation on a page deferred so far is checked against the guest bytes
+// it was translated from and killed only if they changed, and pages that
+// keep translations are write-protected again. Faults outside a window keep
+// the exact behaviour (invalidate the page). Safe from any guest thread.
+void guest_jit_write_window(bool open);
+
+// (additive) [copy, copy + size) now holds an exact copy of the guest code at
+// [source, source + size) (Darwin vm_remap of image text, e.g. V8 placing its
+// embedded builtins next to its JIT code). Translations of the copy may then
+// come from the source's persistent cache, relocated, and new ones are stored
+// there for the next process: each is used only while the copy's guest bytes
+// still equal the source's. The copy must be registered guest code memory.
+// The pairing ends with any invalidate_guest_code of the copy's range.
+void register_guest_code_copy(std::uint64_t copy, std::uint64_t source, std::uint64_t size);
 
 // (additive) The page protection the guest set on the page at `address` when
 // fx has write-protected it because it holds translated code (its host

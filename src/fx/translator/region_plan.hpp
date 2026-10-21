@@ -79,10 +79,16 @@ struct PlanInst {
 // wI inside the region and checks that xN equals the entry's target, so the
 // recognition (and the table bound) only decides how fast a BR is, never
 // where it goes: anything else takes the ordinary indirect exit.
+// LLVM's lowering (clang, Mach-O images) loads with [xT, xI{, lsl #k}], often
+// with xT set up before a loop and xI reused before the BR:
+//   adr xB, base; ldr{b,h,sw} wO, [xT, xI, lsl #k]; add xN, xB, xO, lsl #2; br xN
+// Those tables (by_target) dispatch on the target xN itself: a dense host
+// table over the aligned case pcs maps each case to its label.
 struct JumpTable {
     std::uint32_t first;              // into Plan::table_pcs / table_targets
     std::uint32_t count;              // entries (bound from cmp + b.hi/b.hs, uxtb, ...)
-    std::uint8_t index_reg;           // wI: the table index at the BR (UXTW)
+    std::uint8_t index_reg;           // wI: the table index at the BR (UXTW); unused by_target
+    bool by_target{};                 // dispatch on the target (index unknown at the BR)
 };
 
 struct PlanEntry {
@@ -126,6 +132,7 @@ struct Plan {
     bool write_back{true};            // register cache keeps results dirty until an observation point
     bool reuse_dest{true};            // reuse a cached destination overwritten by this instruction
     bool vec_facts{true};             // vector value facts for fusions (EmitContext::vec_fact)
+    bool vzero_join{true};            // p3: zero-above facts of V registers joined at block starts
     // Tier 2 (TRANSMUTE_FX_CORE=tier2, TranslateOptions::optimize): the
     // optimizing tier of hot regions. count_hot: a first-tier (lazy) region
     // counts its entries (count_loops: and loop iterations) to get there;
@@ -158,6 +165,8 @@ struct Plan {
     bool cold_layout{true};
     bool inline_entries{true};        // cold_layout: continuation entry stubs in line (not coldentries)
     bool align_loops{};               // cold_layout: every loop header aligned (loopalign)
+    bool align_hot{};                 // cold_layout, tier 2: loop headers aligned whatever the loop's size (hotalign)
+    unsigned loop_alignment{16};      // bytes (align32: 32)
     unsigned interpret_count{};
     unsigned blocks{};
     // TranslateOptions::lazy formation stopped early (an unfollowed call
@@ -212,6 +221,7 @@ struct PlanOverrides {
     bool no_write_back{};
     bool no_reuse_dest{};             // TRANSMUTE_FX_CORE=noreusedest
     bool no_vec_facts{};              // TRANSMUTE_FX_CORE=nofacts (also after a facts retry)
+    bool no_vzero_join{};             // TRANSMUTE_FX_CORE=novzjoin (zero-above facts forgotten at every label)
     bool tier2{};                     // TRANSMUTE_FX_CORE=tier2: hot regions get the optimizing tier
     bool t2_no_alias{};               // TRANSMUTE_FX_CORE=t2noalias: tier 2 without vector copy aliases
     bool t2_carry{};                  // TRANSMUTE_FX_CORE=t2carry: tier 2 carries dirty values across loop edges
@@ -256,6 +266,8 @@ struct PlanOverrides {
     // secondary entry stub in the cold section; loopalign aligns every loop.
     bool cold_entries{};
     bool align_loops{};
+    bool align_hot{};                 // hotalign: tier-2 regions align loop headers of any size
+    bool align32{};                   // align32: loop headers aligned to 32 bytes, not 16
 };
 
 struct FamilyTable {

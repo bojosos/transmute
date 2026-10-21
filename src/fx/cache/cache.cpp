@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <cwctype>
 #include <memory>
 #include <unordered_map>
@@ -606,6 +607,11 @@ bool with_module(Global& g, std::uint64_t address, Fn&& fn) {
 // ---------------------------------------------------------------------------
 // lookup
 
+// cache_lookup_copy on this thread: records are rebuilt at the module's base
+// plus this delta (an exact copy of its code elsewhere), and pinned ones refused.
+thread_local bool t_copy_lookup = false;
+thread_local std::int64_t t_copy_delta = 0;
+
 bool try_record(Global& g, const CacheModule& m, const std::uint8_t* data, std::size_t avail, std::uint32_t rva,
                 TranslatedRegion& out, RecordView* used = nullptr, bool verify_checksum = true) {
     RecordView v;
@@ -618,7 +624,7 @@ bool try_record(Global& g, const CacheModule& m, const std::uint8_t* data, std::
     for (std::uint32_t i = 0; i < h.n_entries && !is_entry; ++i) is_entry = v.entries[i].rva == rva;
     if (!is_entry) return false;
     // Pinned code embeds addresses of the base it was translated at.
-    if (!cachefmt::usable_at(h, m.base)) {
+    if (!cachefmt::usable_at(h, m.base) || (t_copy_lookup && (h.flags & cachefmt::kRecordPinned) != 0)) {
         g.pinned_mismatches.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -638,7 +644,7 @@ bool try_record(Global& g, const CacheModule& m, const std::uint8_t* data, std::
             return false;
         }
     }
-    cachefmt::rebuild_region(v, m.base, out);
+    cachefmt::rebuild_region(v, t_copy_lookup ? m.base + static_cast<std::uint64_t>(t_copy_delta) : m.base, out);
     g.hits.fetch_add(1, std::memory_order_relaxed);
     if (used) *used = v;
     return true;
@@ -910,6 +916,15 @@ std::wstring file_name_of(const std::wstring& path) {
 // translator cache tests do not link; fall back to 0 there.
 std::uint64_t family_fingerprint() { return translator_family_fingerprint(); }
 
+std::atomic<std::uint64_t> g_source_fingerprint_override{0};
+
+void set_source_fingerprint_for_tests(std::uint64_t value) noexcept { g_source_fingerprint_override.store(value); }
+
+std::uint64_t source_fingerprint() noexcept {
+    const std::uint64_t value = g_source_fingerprint_override.load(std::memory_order_relaxed);
+    return value ? value : translator_source_fingerprint();
+}
+
 Key make_key(std::uint64_t image_hash, std::uint64_t file_size, const TranslateOptions& options) {
     Key key{};
     key.format_version = cachefmt::kFormatVersion;
@@ -917,8 +932,10 @@ Key make_key(std::uint64_t image_hash, std::uint64_t file_size, const TranslateO
     key.image_hash = image_hash;
     key.file_size = file_size;
     key.cpu_features = cache_cpu_feature_mask();
-    // Regions also depend on which instruction families were registered.
-    key.options_hash = cachefmt::mix64(cache_options_hash(options), family_fingerprint());
+    // Regions also depend on which instruction families were registered, and
+    // on the code generation of this build.
+    key.options_hash = cachefmt::mix64(cachefmt::mix64(cache_options_hash(options), family_fingerprint()),
+                                       source_fingerprint());
     return key;
 }
 
@@ -1164,6 +1181,44 @@ void cache_store(const TranslatedRegion& region) {
     if (cache_detail::external_aot_active()) cache_detail::external_aot_note_region(region);
     const bool queued = with_module(g, region.guest_start, [&](const CacheModule& m, const ModuleFiles& f) {
         return store_in(g, m, f, region);
+    });
+    if (!queued) g.stores_ignored.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool cache_lookup_copy(std::uint64_t source_pc, std::int64_t delta, TranslatedRegion& region) {
+    if (!g_enabled.load(std::memory_order_relaxed) || delta == 0) return false;
+    Global& g = G();
+    g.lookups.fetch_add(1, std::memory_order_relaxed);
+    struct Scope {
+        Scope(std::int64_t d) { t_copy_lookup = true; t_copy_delta = d; }
+        ~Scope() { t_copy_lookup = false; t_copy_delta = 0; }
+    } scope(delta);
+    return with_module(g, source_pc, [&](const CacheModule& m, const ModuleFiles& f) {
+        return lookup_files(g, m, f, source_pc, region);
+    });
+}
+
+void cache_store_copy(const TranslatedRegion& region, std::int64_t delta) {
+    if (!g_enabled.load(std::memory_order_relaxed) || delta == 0) return;
+    Global& g = G();
+    g.stores.fetch_add(1, std::memory_order_relaxed);
+    thread_local TranslatedRegion moved;
+    moved = region;
+    const auto d = static_cast<std::uint64_t>(delta);
+    moved.guest_start -= d;
+    for (auto& [begin, end] : moved.guest_ranges) begin -= d, end -= d;
+    for (auto& e : moved.entries) e.guest_pc -= d;
+    for (auto& e : moved.exits) e.target_pc -= d;
+    for (auto& f : moved.faults) f.guest_pc -= d;
+    for (auto& f : moved.fixups) {
+        if (f.kind != FixupKind::guest_address_imm64) continue;
+        f.value -= d;
+        std::memcpy(moved.code.data() + f.offset, &f.value, 8);
+    }
+    const bool queued = with_module(g, moved.guest_start, [&](const CacheModule& m, const ModuleFiles& f) {
+        // An address in the copy embedded without a fixup would not move with it.
+        if (cachefmt::unrecorded_address(region, m.base + d, m.size) >= 0) return false;
+        return store_in(g, m, f, moved);
     });
     if (!queued) g.stores_ignored.fetch_add(1, std::memory_order_relaxed);
 }

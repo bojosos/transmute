@@ -46,6 +46,7 @@ constexpr unsigned kRaxSaveSlot = 63;
 constexpr unsigned kFcmpConstSlot = 62;
 constexpr unsigned kHelperArgSlot = 56;
 constexpr unsigned kLoopCounterSlot = 55;   // tier 2: per-thread loop iteration counter (counted code)
+constexpr unsigned kBoolSlot = 61;          // e_ccmp fusion: the parked answer (park_bool)
 constexpr std::int32_t kEvictLookahead = 64;    // instructions scanned for a cache entry's next use
 
 constexpr Cond kSubCond[14] = {Cond::e, Cond::ne, Cond::ae, Cond::b, Cond::s, Cond::ns, Cond::o,
@@ -180,9 +181,24 @@ Gp RegionEmitter::alloc() {
 }
 
 void RegionEmitter::take(Gp r) {
+    if (r == Gp::rax && flags_saved_) materialize();   // save_flags_around, then an implicit rax user
+                                                           // (SMULH/UMULH): the flags go to ctx->nzcv after all
     if (!is_free(r)) throw std::logic_error("RegionEmitter::take: register in use");
     evict_gpr(x64::id(r));
     free_gpr_ &= ~(1u << x64::id(r));
+}
+
+void RegionEmitter::take_value(Gp r, const Val& v) {
+    const auto h = x64::id(r);
+    if (v.is_mem() && gc_.host[v.g] == static_cast<std::int8_t>(h) && is_free(r) && galias_of_[h] == 0) {
+        if ((gc_.dirty >> h) & 1u) a_.mov(64, gmem(v.g), r);   // the context gets the value too
+        cache_drop_host(gc_, h);
+        free_gpr_ &= ~(1u << h);
+        return;
+    }
+    take(r);
+    if (v.is_zero()) a_.mov_imm(r, 0);
+    else load(64, r, v);
 }
 
 x64::Xmm RegionEmitter::alloc_vec() {
@@ -345,6 +361,35 @@ void RegionEmitter::carried_dirty(std::int32_t index, std::uint32_t& keep_g, std
     keep_matching(s_.cache_snaps[static_cast<std::size_t>(slot)], keep_g, keep_v);
 }
 
+bool RegionEmitter::dirty_crosses_branch(std::int32_t index) const {
+    if (!branch_dirty_ || !carry_ || !write_back_ || !fault_maps_) return false;
+    const auto& pi = plan_.insts[static_cast<std::size_t>(index)];
+    if (pi.flow != Flow::cond || pi.table >= 0) return false;
+    const auto k = pi.inst.kind;
+    if (k != Kind::branch_cond && k != Kind::compare_branch && k != Kind::test_branch) return false;
+    const auto single = [&](std::int32_t t) {
+        if (t < 0) return true;   // an exit: its stub stores the dirty snapshot
+        const auto& s = plan_.insts[static_cast<std::size_t>(t)];
+        if (lent_at(t) != lent_) return false;
+        if (!s.leader) return t == index + 1;   // the fall-through continues the block with the cache as it is
+        return (t > index && s.inherit_flags && s.first_pred == index) || dirty_into_merge(t);
+    };
+    return single(pi.taken) && single(pi.fall);
+}
+
+// Opt-in TRANSMUTE_FX_CORE=mergedirty: a forward edge into a merge point
+// outside loops whose entry state is not decided yet carries its dirty
+// entries too. The merge keeps those every predecessor holds in the same
+// host (dirty if dirty in any); the edges store the rest (edge stubs for
+// jumps, inline on the fall-through), instead of every predecessor storing
+// everything first.
+bool RegionEmitter::dirty_into_merge(std::int32_t t) const {
+    if (!merge_dirty_ || !carry_ || !write_back_ || !fault_maps_ || alloc_pass_ == 2 || t <= index_) return false;
+    const auto& s = plan_.insts[static_cast<std::size_t>(t)];
+    return s.leader && !s.inherit_flags && !s.entry && !s.loop_header && s_.loop_of[static_cast<std::size_t>(t)] < 0 &&
+           s_.loop_of[static_cast<std::size_t>(index_)] < 0 && lent_at(t) == lent_ && is_pending_target(t);
+}
+
 // True if `target` (-1: outside the region) is outside the innermost loop of `index`.
 bool RegionEmitter::leaves_loop(std::int32_t index, std::int32_t target) const {
     const auto h = s_.loop_of[static_cast<std::size_t>(index)];
@@ -496,9 +541,32 @@ Gp RegionEmitter::dst(unsigned index, bool sp) {
     note_write(index);
     if (pinned(index)) return pin(index);
     if (pending_gpr_count_ >= std::size(pending_gpr_)) throw RetryTranslation{pc_, false};
+    if (const auto h = reusable_gpr(index); h != Gp::none) {   // the guest's own cached host
+        free_gpr_ &= ~(1u << x64::id(h));
+        pending_gpr_[pending_gpr_count_++] = {static_cast<std::uint8_t>(index), h};
+        return h;
+    }
     const auto t = alloc();
     pending_gpr_[pending_gpr_count_++] = {static_cast<std::uint8_t>(index), t};
     return t;
+}
+
+// A core instruction that overwrites guest `index` without reading it, and
+// cannot fault or branch, writes the result into the host register that
+// caches the old value (r8-r11 only: rax, rcx and rdx have implicit users
+// that take() them later). The guest then stays in one host across
+// instructions, so the predecessors of a merge point agree more often (no
+// reload there). TRANSMUTE_FX_CORE=nogprreuse: a fresh register each time.
+Gp RegionEmitter::reusable_gpr(unsigned index) const {
+    if (!codegen_on(knob_no_gpr_reuse) || family_mode_ || !cur_ || !may_cache()) return Gp::none;
+    if (((cur_->reads >> index) & 1u) || cur_->may_fault || cur_->conservative_writes || cur_->flow != Flow::normal ||
+        cur_->inst.kind == Kind::unknown)
+        return Gp::none;
+    const auto h = gc_.host[index];
+    if (h < 8 || h > 11) return Gp::none;
+    const auto r = x64::gp(static_cast<unsigned>(h));
+    if (!is_free(r) || galias_of_[static_cast<unsigned>(h)] != 0) return Gp::none;
+    return r;
 }
 
 Gp RegionEmitter::dst_rmw(unsigned index, bool sp) {
@@ -543,15 +611,39 @@ void RegionEmitter::load_pins() {
         if (vpinned(v)) vmove(vpin(v), ptr(Gp::r15, v_disp(v)));
 }
 
-void RegionEmitter::entry_pins() {
+std::uint32_t RegionEmitter::pins_dead_at_entry(std::int32_t index) const {
+    if (!codegen_on(knob_no_dead_pin_loads) || index < 0) return 0;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    if (plan_.insts[static_cast<std::size_t>(index)].loop_header) return 0;   // its interrupt stub stores dirty pins
+    std::uint32_t want = plan_.pinned & ~plan_.globals & ~static_cast<std::uint32_t>(lent_);
+    std::uint32_t dead = 0;
+    for (std::int32_t j = index; j < n && j < index + 16 && want != 0; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (j != index && pj.leader) break;
+        if (pj.family >= 0 || pj.try_family || pj.inst.kind == Kind::unknown || pj.conservative_writes ||
+            pj.may_fault || pj.flow != Flow::normal || pj.inline_call || pj.inline_ret)
+            break;
+        // An ADD/SUB the next access may fold reports a fault there with its own state before it.
+        if ((pj.inst.kind == Kind::add_sub_imm || pj.inst.kind == Kind::add_sub_shift || pj.inst.kind == Kind::add_sub_ext) &&
+            j + 1 < n && plan_.insts[static_cast<std::size_t>(j) + 1].may_fault)
+            break;
+        want &= ~pj.reads;
+        dead |= pj.writes & want;
+        want &= ~pj.writes;
+    }
+    return dead;
+}
+
+void RegionEmitter::entry_pins(std::int32_t index) {
     const auto& conv = translator_register_convention();
     // Tier 2: convention registers lent at this entry go to the context like evicted ones.
     for (auto m = plan_.evicted | (plan_.globals & static_cast<std::uint32_t>(lent_)); m; m &= m - 1) {
         const auto g = static_cast<unsigned>(std::countr_zero(m));
         a_.mov(64, gmem(g), x64::gp(static_cast<unsigned>(conv.host[g])));
     }
+    const auto dead = pins_dead_at_entry(index);
     for (unsigned g = 0; g < 32; ++g)
-        if (pinned(g) && !global(g)) a_.mov(64, pin(g), gmem(g));
+        if (pinned(g) && !global(g) && !((dead >> g) & 1u)) a_.mov(64, pin(g), gmem(g));
     for (unsigned v = 0; v < 32; ++v)
         if (vpinned(v)) vmove(vpin(v), ptr(Gp::r15, v_disp(v)));
 }
@@ -586,17 +678,80 @@ void RegionEmitter::flush_pins(std::uint64_t dirty) {
 // ---- flags ------------------------------------------------------------------------
 
 bool RegionEmitter::keep_flags() const {
-    return is_host(flags_) && (cur_reads_flags_ || (live_out_ && !cur_writes_flags_));
+    return is_host(flags_) && !flags_saved_ && (cur_reads_flags_ || (live_out_ && !cur_writes_flags_));
 }
 
 void RegionEmitter::prepare_clobber() {
-    if (!is_host(flags_)) return;
-    if (cur_reads_flags_ || (live_out_ && !cur_writes_flags_)) materialize();
-    else flags_ = FlagsState::ctx;   // dead
+    if (!is_host(flags_) || flags_saved_) return;
+    if (bool_reader_ >= 0) {   // a fused CCMP's answer: kept in the context until its reader
+        park_bool();
+        return;
+    }
+    if (!(cur_reads_flags_ || (live_out_ && !cur_writes_flags_))) {
+        flags_ = FlagsState::ctx;   // dead
+        return;
+    }
+    if (save_flags_around()) return;
+    materialize();
+}
+
+// The flags outlive an instruction that must clobber EFLAGS (EOR/ORR/AND,
+// shifts without BMI2, ...) and are read again within a few instructions:
+// keep them in host form by saving AH/OF in rax around it (lahf; seto al
+// ... add al, 0x7f; sahf in end_instruction) instead of converting them to
+// ctx->nzcv and testing them there. Not for instructions that read or write
+// the flags, may fault (FlagsLocation has no saved form), branch, or are
+// family code; not with rax in use.
+bool RegionEmitter::save_flags_around() {
+    if (!codegen_on(knob_no_flag_save) || !in_instruction_ || family_mode_ || !cur_ || is_fcmp(flags_)) return false;
+    if (cur_reads_flags_ || cur_writes_flags_ || cur_->may_fault || cur_->flow != Flow::normal || cur_->conservative_writes)
+        return false;
+    if (!is_free(Gp::rax)) return false;
+    // The next flags reader in this block within three instructions.
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    bool near = false;
+    for (std::int32_t j = index_ + 1; j < n && j <= index_ + 3; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (pj.leader) break;
+        if (pj.reads_flags) { near = true; break; }
+        if (pj.writes_flags || pj.flow != Flow::normal) break;
+    }
+    if (!near) return false;
+    evict_gpr(x64::id(Gp::rax));
+    take(Gp::rax);
+    a_.lahf();
+    a_.setcc(Cond::o, Gp::rax);
+    flags_saved_ = true;
+    return true;
+}
+
+// A fused CCMP's answer (ZF clear: the reader is taken) is about to be
+// clobbered before its reader: setnz into kBoolSlot; the reader tests it
+// there (condition()). NZCV itself is dead after the reader and nothing in
+// between reads it or may fault, so the context's NZCV is left stale.
+void RegionEmitter::park_bool() {
+    // The scratch is released right away: the instruction parking the answer
+    // may take() a fixed register next (SMULH: rax, rdx; shifts: rcx).
+    const auto t = alloc();
+    a_.setcc(Cond::ne, t);
+    a_.mov(8, ptr(Gp::r15, spill_disp(kBoolSlot)), t);
+    free_gpr_ |= 1u << x64::id(t);
+    bool_in_slot_ = true;
+    flags_ = FlagsState::ctx;
 }
 
 void RegionEmitter::materialize() {
     if (!is_host(flags_)) return;
+    if (bool_reader_ >= 0) {
+        park_bool();
+        return;
+    }
+    if (flags_saved_) {   // save_flags_around: EFLAGS back first, rax no longer held
+        a_.alu(Alu::add, 8, Gp::rax, 0x7f);
+        a_.sahf();
+        flags_saved_ = false;
+        free_gpr_ |= 1u << x64::id(Gp::rax);
+    }
     const bool save = !is_free(Gp::rax);
     if (!save) evict_gpr(x64::id(Gp::rax));   // rax is clobbered
     materialize_state(flags_, save);
@@ -1392,12 +1547,25 @@ void RegionEmitter::begin_instruction(std::int32_t index) {
     live_out_ = cur_->flags_live_out;
     cur_reads_flags_ = cur_->reads_flags;
     cur_writes_flags_ = cur_->writes_flags;
+    if (bool_reader_ >= 0 && bool_reader_ < index) {   // its reader was not reached (cannot happen)
+        bool_reader_ = -1;
+        bool_in_slot_ = false;
+    }
+    // NZCV dead at a BL/BLR/RET exit (TranslateOptions::abi_flags; strict
+    // flags keep them live): drop host flags instead of materializing them.
+    if (is_host(flags_) && !cur_->flags_live_in && (cur_->flow == Flow::call || cur_->flow == Flow::indirect))
+        flags_ = FlagsState::ctx;
     cf_mark_ = a_.control_flow_count();
     in_instruction_ = true;
     after_last_ = index;
 }
 
 void RegionEmitter::end_instruction() {
+    if (flags_saved_) {   // save_flags_around: OF from al (al + 0x7f overflows iff al == 1), SF ZF CF from ah
+        a_.alu(Alu::add, 8, Gp::rax, 0x7f);
+        a_.sahf();
+        flags_saved_ = false;
+    }
     fault_close();
     // Write-back: the result stays dirty in its register (stored at the next
     // observation point unless overwritten first). Write-through without it.
@@ -1446,11 +1614,11 @@ void RegionEmitter::start_block(std::int32_t index) {
             decide_entry(index, false);
         }
         a_.bind(entry_labels_[static_cast<std::size_t>(pi.entry_slot)]);
-        entry_pins();
+        entry_pins(index);
         load_entry_state(index);
         s_.entry_inline[static_cast<std::size_t>(pi.entry_slot)] = 1;
     } else if (pi.loop_header &&
-               (!plan_.cold_layout || plan_.align_loops ||
+               (!plan_.cold_layout || plan_.align_loops || (plan_.align_hot && plan_.optimize) ||
                 s_.loop_end[static_cast<std::size_t>(index)] - index < kSmallLoop) &&
                // Tier 2: not when the code above falls into the header (the
                // padding would run on that path, e.g. every iteration of an
@@ -1458,10 +1626,11 @@ void RegionEmitter::start_block(std::int32_t index) {
                !(plan_.t2_align && index > 0 && plan_.insts[static_cast<std::size_t>(index) - 1].fall == index)) {
         // Small loops start on a 16-byte boundary (fewer fetch blocks per
         // iteration); in larger ones the padding only costs code bytes.
-        a_.align(16);
+        // Layout knobs: hotalign (every tier-2 loop), align32.
+        a_.align(plan_.loop_alignment);
     }
     a_.bind(label_of(index));
-    forget_vec_zero();   // fp/neon: other predecessors may differ
+    vzero_block_start(index);   // fp/neon: the facts every predecessor agrees on (p3)
     alias_guard();       // tier 2: resolved by every predecessor
     alias_forget_knowledge();
     tz_clz_ = -1;        // RBIT->TZCNT never spans blocks
@@ -1574,7 +1743,8 @@ void RegionEmitter::emit_fallthrough(std::int32_t index, unsigned consumed) {
     // Leaving the region (or entering an entry stub): store the dirty cache.
     // Edges into leaders reconcile it (edge_inline); without carry it is
     // stored before every leader.
-    if (!adjacent || pi.flow == Flow::interpret || ((!carry_ || carry_clean_) && plan_.insts[next].leader)) {
+    if (!adjacent || pi.flow == Flow::interpret ||
+        ((!carry_ || carry_clean_) && plan_.insts[next].leader && !dirty_into_merge(next))) {
         flush_dirty();
     } else if (alloc_pass_ == 2 && plan_.insts[next].leader &&
                !(next < static_cast<std::int32_t>(s_.preset_of.size()) && s_.preset_of[static_cast<std::size_t>(next)] >= 0)) {
@@ -1648,7 +1818,10 @@ void RegionEmitter::emit_instruction(std::int32_t index) {
     // stay in registers across blocks); elsewhere they store it first, which
     // keeps exit paths short (clean entries are still carried). Tier 2's
     // second pass: every edge stores what its target's entry state drops.
-    if (alloc_pass_ == 2 && !carry_clean_ && (pi.flow == Flow::jump || pi.flow == Flow::cond) && pi.table < 0) {
+    if (dirty_crosses_branch(index) || (pi.flow == Flow::jump && pi.table < 0 && pi.taken >= 0 && dirty_into_merge(pi.taken))) {
+        // Both successors take over the cache as it is (single predecessor,
+        // or an exit stub that stores the dirty snapshot): no stores here.
+    } else if (alloc_pass_ == 2 && !carry_clean_ && (pi.flow == Flow::jump || pi.flow == Flow::cond) && pi.table < 0) {
         // Tier 2: dirty values stay in registers only along back edges whose
         // loop header keeps them dirty there (stores move out of the loop);
         // every other one is stored here, as with clean carrying, unless no
@@ -1802,7 +1975,7 @@ void RegionEmitter::emit_stubs() {
         a_.align(16);
         a_.bind(entry_labels_[k]);
         set_lent(lent_at(plan_.entries[k].index));
-        entry_pins();
+        entry_pins(plan_.entries[k].index);
         load_entry_state(plan_.entries[k].index);
         a_.jmp(label_of(plan_.entries[k].index));
     }
@@ -1835,11 +2008,17 @@ void RegionEmitter::run() {
     out_.guest_start = plan_.start;
     reset_scratch();
     forget_vec_zero();       // fp/neon
+    vzero_prepare();         // p3: facts across labels
     cache_on_ = plan_.reg_cache;
+    bool_reader_ = -1;       // e_ccmp fusion
+    bool_in_slot_ = false;
+    flags_saved_ = false;    // save_flags_around
     write_back_ = cache_on_ && plan_.write_back;
     carry_ = cache_on_ && plan_.carry;
     carry_clean_ = plan_.carry_clean;
     belady_ = plan_.belady;
+    branch_dirty_ = codegen_on(knob_no_branch_dirty);
+    merge_dirty_ = (codegen_p2_knob_bits() & knob_merge_dirty) != 0;
     // Tier 2 (region_alloc.cpp): liveness, dropped interrupt checks; pass 2
     // starts every block that has a preset with it, and dirty values cross
     // edges (each edge stores what its target does not keep).
@@ -1914,7 +2093,7 @@ void RegionEmitter::run() {
     }
     const auto start_index = plan_.entries[0].index;
     set_lent(lent_at(start_index));   // tier 2: the start block may lie in a loop that lends pins
-    entry_pins();
+    entry_pins(start_index);
     jump_edge(start_index, -1, start_index == 0);   // from the empty cache (may load a loop's registers)
 
     prepare_facts();
@@ -1929,7 +2108,9 @@ void RegionEmitter::run() {
             std::snprintf(where, sizeof(where), " (instruction 0x%08x at 0x%llx)", pi.inst.word, static_cast<unsigned long long>(pi.pc));
             throw std::logic_error(std::string(error.what()) + where);
         }
+        vzero_record(skip_until_ > i ? skip_until_ - 1 : i);   // p3: the facts on this instruction's edges
     }
+    vzero_finish();
     // A fusion relied on a checked flag: its load must have emitted the check
     // (it always does when it is translated: an interpreted load leaves the
     // region, so the fusion is unreachable from it), and no helper that may
@@ -2099,6 +2280,7 @@ EmitContext::GprSrc RegionEmitter::gsrc(unsigned index, bool sp) {
 x64::Xmm RegionEmitter::write_vec(unsigned index) {
     vzero32_ &= ~(1u << index);   // fp/neon: re-noted by the writer if known
     vzero64_ &= ~(1u << index);
+    vzwritten_ |= 1u << index;    // p3: written in this block (vzero_record)
     if (vpinned(index)) {
         vwritten_ |= 1u << index;
         return vpin(index);
@@ -2132,6 +2314,137 @@ void RegionEmitter::note_vec_zero_above(unsigned index, unsigned width) {
     if (!written) return;
     if (width <= 32) vzero32_ |= 1u << index;
     if (width <= 64) vzero64_ |= 1u << index;
+}
+
+// ---- p3: zero-above facts across labels (Plan::vzero_join) -------------------------------------
+
+void RegionEmitter::vzero_prepare() {
+    const auto n = plan_.insts.size();
+    s_.vz32.assign(n, 0);
+    s_.vz64.assign(n, 0);
+    s_.vz_w.assign(n, 0);
+    s_.vz_blk.assign(n, -1);
+    s_.vz_rec.assign(n, 0);
+    vzblock_ = -1;
+    vzsolved_ = false;
+    if (alloc_pass_ != 2) {   // pass 2 reads pass 1's records (vzero_finish)
+        s_.vz1_32.clear();
+        s_.vz1_64.clear();
+        s_.vz1_w.clear();
+        s_.vz1_blk.clear();
+        s_.vz1_rec.clear();
+    }
+    if (!plan_.vzero_join) return;
+    s_.vz_entry.assign(n, 0);
+    for (const auto& e : plan_.entries)
+        if (e.index >= 0 && static_cast<std::size_t>(e.index) < n) s_.vz_entry[static_cast<std::size_t>(e.index)] = 1;
+    s_.vz_pred_head.assign(n, -1);
+    s_.vz_pred_next.clear();
+    s_.vz_pred_from.clear();
+    for (std::int32_t j = 0; j < static_cast<std::int32_t>(n); ++j) {
+        if (plan_.insts[static_cast<std::size_t>(j)].entry) s_.vz_entry[static_cast<std::size_t>(j)] = 1;
+        plan_.for_each_successor(j, [&](std::int32_t t) {
+            if (t < 0 || static_cast<std::size_t>(t) >= n) return;
+            s_.vz_pred_from.push_back(j);
+            s_.vz_pred_next.push_back(s_.vz_pred_head[static_cast<std::size_t>(t)]);
+            s_.vz_pred_head[static_cast<std::size_t>(t)] = static_cast<std::int32_t>(s_.vz_pred_from.size() - 1);
+        });
+    }
+    if (alloc_pass_ == 2 && s_.vz1_rec.size() == n) vzero_solve();
+}
+
+// Tier 2, before pass 2: the facts at every block start, as the greatest
+// fixpoint of in[b] = AND over predecessors p of out(p), out(p) = (in[block of
+// p] & ~W[p]) | (G[p] & W[p]) from pass 1's records: W[p] the V registers
+// written in p's block up to p, G[p] the facts there (for written registers a
+// lower bound: computed with pass 1's knowledge). Region entries and blocks
+// with a predecessor without a record start with none. Loop-invariant values
+// keep their facts across back edges.
+void RegionEmitter::vzero_solve() {
+    const auto n = s_.vz1_rec.size();
+    s_.vz_in32.assign(n, ~0u);
+    s_.vz_in64.assign(n, ~0u);
+    for (std::size_t t = 0; t < n; ++t)
+        if (s_.vz_entry[t] || !plan_.insts[t].leader) s_.vz_in32[t] = s_.vz_in64[t] = 0;
+    for (unsigned round = 0; round < 64; ++round) {
+        bool changed = false;
+        for (std::size_t t = 0; t < n; ++t) {
+            if (s_.vz_entry[t] || !plan_.insts[t].leader) continue;
+            std::uint32_t z32 = ~0u, z64 = ~0u;
+            bool any = false;
+            for (auto e = s_.vz_pred_head[t]; e >= 0; e = s_.vz_pred_next[static_cast<std::size_t>(e)]) {
+                const auto p = static_cast<std::size_t>(s_.vz_pred_from[static_cast<std::size_t>(e)]);
+                any = true;
+                if (!s_.vz1_rec[p]) {
+                    z32 = z64 = 0;
+                    break;
+                }
+                const auto b = s_.vz1_blk[p];
+                const std::uint32_t in32 = b >= 0 ? s_.vz_in32[static_cast<std::size_t>(b)] : 0u;
+                const std::uint32_t in64 = b >= 0 ? s_.vz_in64[static_cast<std::size_t>(b)] : 0u;
+                const auto w = s_.vz1_w[p];
+                z32 &= (in32 & ~w) | (s_.vz1_32[p] & w);
+                z64 &= (in64 & ~w) | (s_.vz1_64[p] & w);
+            }
+            if (!any) z32 = z64 = 0;
+            z64 |= z32;
+            if (z32 != s_.vz_in32[t] || z64 != s_.vz_in64[t]) {
+                s_.vz_in32[t] = z32;
+                s_.vz_in64[t] = z64;
+                changed = true;
+            }
+        }
+        if (!changed) {
+            vzsolved_ = true;
+            return;
+        }
+    }
+    // No fixpoint within the bound: keep the forward join (never wrong).
+}
+
+void RegionEmitter::vzero_record(std::int32_t last) {
+    if (!plan_.vzero_join || last < 0 || static_cast<std::size_t>(last) >= s_.vz_rec.size()) return;
+    const auto i = static_cast<std::size_t>(last);
+    s_.vz32[i] = vzero32_;
+    s_.vz64[i] = vzero64_;
+    s_.vz_w[i] = vzwritten_;
+    s_.vz_blk[i] = vzblock_;
+    s_.vz_rec[i] = 1;
+}
+
+void RegionEmitter::vzero_block_start(std::int32_t index) {
+    forget_vec_zero();
+    vzwritten_ = 0;
+    vzblock_ = index;
+    const auto i = static_cast<std::size_t>(index);
+    if (!plan_.vzero_join || i >= s_.vz_entry.size() || s_.vz_entry[i]) return;
+    if (vzsolved_) {   // tier 2, pass 2
+        vzero32_ = s_.vz_in32[i];
+        vzero64_ = s_.vz_in64[i];
+        return;
+    }
+    // Forward predecessors already emitted in this pass (a back edge: none).
+    std::uint32_t z32 = ~0u, z64 = ~0u;
+    bool any = false;
+    for (auto e = s_.vz_pred_head[i]; e >= 0; e = s_.vz_pred_next[static_cast<std::size_t>(e)]) {
+        const auto p = static_cast<std::size_t>(s_.vz_pred_from[static_cast<std::size_t>(e)]);
+        if (p >= i || !s_.vz_rec[p]) return;
+        z32 &= s_.vz32[p];
+        z64 &= s_.vz64[p];
+        any = true;
+    }
+    if (!any) return;   // no internal predecessor
+    vzero32_ = z32;
+    vzero64_ = z64 | z32;
+}
+
+void RegionEmitter::vzero_finish() {
+    if (alloc_pass_ != 1 || !plan_.vzero_join) return;
+    s_.vz1_32 = s_.vz32;
+    s_.vz1_64 = s_.vz64;
+    s_.vz1_w = s_.vz_w;
+    s_.vz1_blk = s_.vz_blk;
+    s_.vz1_rec = s_.vz_rec;
 }
 
 void RegionEmitter::clobber_host_flags() { prepare_clobber(); }
@@ -2230,6 +2543,16 @@ Gp RegionEmitter::get_nzcv() {
 
 Cond RegionEmitter::condition(unsigned arm_condition) {
     if (arm_condition >= 14) throw std::logic_error("condition(): AL/NV must be handled by the emitter");
+    if (bool_reader_ >= 0 && bool_reader_ == index_) {
+        // The reader of a fused CCMP (e_ccmp): its answer is in ZF, or parked
+        // in kBoolSlot. NZCV is dead from here on (stale in the context, like
+        // dead flags at merge points and calls).
+        if (bool_in_slot_) a_.test(8, ptr(Gp::r15, spill_disp(kBoolSlot)), 1);
+        bool_reader_ = -1;
+        bool_in_slot_ = false;
+        flags_ = FlagsState::ctx;
+        return Cond::ne;
+    }
     return host_condition(arm_condition);
 }
 
@@ -2792,6 +3115,7 @@ bool RegionEmitter::emit_vec_copy(const PlanInst& pi) {
     }
     vzero32_ = (vzero32_ & ~bit_d) | ((vzero32_ & bit_n) ? bit_d : 0u);   // fp/neon: a copy
     vzero64_ = (vzero64_ & ~bit_d) | ((vzero64_ & bit_n) ? bit_d : 0u);
+    vzwritten_ |= bit_d;   // p3
     reset_scratch();
     return true;
 }

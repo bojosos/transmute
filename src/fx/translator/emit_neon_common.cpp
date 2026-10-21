@@ -37,6 +37,9 @@ std::uint32_t env_knob_bits() {
             if (all || has("nozero64")) b |= neon_no_zero64;
             if (all || has("nomaskfusion")) b |= neon_no_mask_fusion;
             if (all || has("notblderived")) b |= neon_no_tbl_derived;
+            if (all || has("oldvarshift")) b |= neon_old_var_shift;
+            if (all || has("oldpmull8")) b |= neon_old_pmull8;
+            if (all || has("oldstruct")) b |= neon_old_struct;
         }
         return b;
     }();
@@ -63,6 +66,9 @@ const char* neon_knob_suffix() {
         // regions must not hide the new lowering during an A/B comparison.
         n += (b & neon_no_mask_fusion) ? "+nomaskfusion" : "+maskfusion2";
         if (b & neon_no_tbl_derived) n += "+notblderived";
+        n += (b & neon_old_var_shift) ? "+oldvarshift" : "+varshift16";
+        n += (b & neon_old_pmull8) ? "+oldpmull8" : "+pmull8mul";
+        n += (b & neon_old_struct) ? "+oldstruct" : "+struct6";
         return n;
     }();
     return suffix.c_str();

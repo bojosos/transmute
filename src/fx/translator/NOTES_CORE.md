@@ -59,8 +59,14 @@ region tests: keep its API additive).
   `oldlayout`).
 - Retries on scratch exhaustion: fewer vector pins (10 -> 4 -> 0), then no
   r10/r11 pins, then interpret the instruction.
-- Entries load all pins; exits store only possibly-dirty pins (forward
-  dataflow over the region CFG, entries start clean).
+- Entries load all pins, except GPR pins the straight-line code from that
+  entry overwrites before anything observes them (a read, an access that
+  may fault, an ADD a following access folds, a family or interpreted
+  instruction, any branch or block end; not at loop headers, whose interrupt
+  stub stores dirty pins): pins_dead_at_entry, `TRANSMUTE_FX_CORE=
+  nodeadpinloads` loads them all. V8's bytecode handlers start by
+  overwriting a pinned scratch register. Exits store only possibly-dirty
+  pins (forward dataflow over the region CFG, entries start clean).
 - Cross-region convention (translator_register_convention; docs/FX_ENGINE.md):
   its registers are pins in fixed hosts that entries never load and exits
   never store (current_dirty() always includes them, so helpers store them).
@@ -95,13 +101,37 @@ region tests: keep its API additive).
   materialize (inline on fall-through, edge stub on taken jcc).
 - Materialization (no pushfq): `[cmc] lahf; seto al; and eax,0xC101;
   imul eax,eax,0x10210000; and eax,0xF0000000; mov [nzcv],rax`.
+- NZCV is dead at BL/BLR/RET exits (abi_flags): host flags are dropped
+  there, not materialized (begin_instruction). Also at a BR that does not
+  look intra-function (no recognised table, no ADR/ADRP in its block): tail
+  calls, veneers and V8's bytecode dispatch, whose BR otherwise kept NZCV
+  live back through the handler (materializations at its loop headers and
+  merge points too). Measured: jitless JetStream richards 1.16x. A clang
+  switch table or computed goto builds its target from a PC-relative table
+  and keeps the strict model; `TRANSMUTE_FX_CORE=nobrdeadflags` keeps every
+  BR live, `exactflags` / abi_flags = false everything.
+- Flags that outlive an instruction that must clobber EFLAGS (EOR/ORR/AND,
+  shifts without a flag-free form, REV, ...) and are read within three
+  instructions stay in host form: `lahf; seto al` before it and
+  `add al, 0x7f; sahf` after it (save_flags_around; not for instructions that
+  may fault, branch, read or write flags, or with rax in use; an implicit
+  rax user such as SMULH falls back to materializing).
+  `TRANSMUTE_FX_CORE=noflagsave` always materializes.
 - Conditions with flags in ctx: single-bit `test dword [nzcv],bit`, else
   `bt` against a 16-bit truth table indexed by NZCV.
 - Liveness (backward, exits live) decides `keep_flags()`: emitters then
   pick flag-free forms (lea add/sub, shlx/shrx/sarx/rorx, mulx, not+lea
   negate, cmov/setcc) instead of materializing.
 - CCMP/CCMN: branchy; false path loads the immediate NZCV into EFLAGS with
-  `mov eax,img; add al,0x7f (OF); sahf`.
+  `mov eax,img; add al,0x7f (OF); sahf`. When the next instruction is its
+  only reader (B.cond or CSEL family, same block, NZCV dead after it, at
+  most three flag-free non-faulting instructions in between) it is
+  branchless instead: with K = the reader's condition on the immediate
+  NZCV, `set<c1|!c1> t1; cmp; set<c2> t2; test|or t1, t2` and the reader
+  uses NE (e_ccmp, bool_reader_; `TRANSMUTE_FX_CORE=noccmpfusion`). An
+  instruction in between that must clobber EFLAGS parks the answer first
+  (park_bool: setnz into spill slot 61; the reader tests it there). The
+  dead NZCV is then stale in the context, as at merge points and calls.
 
 ## Register cache across blocks
 - s_.cache_slot[leader] -> entry state (CacheSnapshot). Single-predecessor
@@ -124,8 +154,23 @@ region tests: keep its API additive).
 - Default carry_clean: dirty entries are stored before every branch and
   block end, so entry states are clean (exit paths stay short; carrying
   dirty values, knob carrydirty, measured no faster and grows code).
+  Exception (dirty_crosses_branch; `TRANSMUTE_FX_CORE=nobranchdirty`
+  restores the stores): a B.cond/CBZ/TBZ whose fall-through continues the
+  block and whose taken target has it as its only predecessor (or is an
+  exit, whose stub spills the dirty snapshot) stores nothing: both paths
+  take the cache over as it is and fault maps describe the dirty values.
+  V8's JIT code stored temporaries before nearly every type-check branch.
+  Opt-in `TRANSMUTE_FX_CORE=mergedirty` (dirty_into_merge): forward jumps,
+  fall-throughs and taken edges into merge points outside loops carry their
+  dirty entries too; the merge keeps those every predecessor holds in the
+  same host (dirty if dirty in any) and the edges store the rest.
 - rax never appears in a merge point's entry state: flag materialization on
   edges and edge stubs clobber it.
+- GPR destinations (reusable_gpr): a core instruction that overwrites Xd
+  without reading it, cannot fault and does not branch writes the result
+  into the host (r8-r11) that caches Xd's old value, so a guest stays in one
+  host and merge points agree more often (a max(x, 3) diamond reloaded x
+  at the merge). `TRANSMUTE_FX_CORE=nogprreuse`: a fresh register.
 - Victims (alloc/alloc_vec): evict_cost = store (dirty) + reload (read again
   in the block, or after it within 64 instructions), then next-use distance,
   then LRU. Vector LDP / LD1 multi-register loads write unpinned destinations

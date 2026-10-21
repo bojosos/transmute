@@ -23,7 +23,8 @@ namespace {
 // across BL/RET), familypins7 (no r10/r11 pins in regions with family
 // instructions), norbit (no RBIT+CLZ -> TZCNT), nowriteback (register cache
 // stores results immediately), noreusedest (do not reuse overwritten cached
-// destinations), nofacts (no vector value facts for fusions), notier2 (no
+// destinations), nofacts (no vector value facts for fusions), novzjoin (V
+// registers' zero-above facts forgotten at every label), notier2 (no
 // optimizing tier: on by default, region_alloc.cpp; tier2 is accepted), the
 // tier-2 features t2nochecks, t2noalign, t2noalloc, t2nodead, t2nogalias,
 // t2noderived, t2noalias (vector copy aliases), t2lend (opt-in pin lending),
@@ -48,7 +49,9 @@ namespace {
 // in line, every loop aligned, rel32 branches only), oldcap (regions stop at
 // max_instructions inside large .pdata functions), coldentries (secondary
 // entry stubs stay in the cold section), loopalign (every loop header
-// aligned to 16; codegen_layout_bits); nocache..norbit
+// aligned to 16; codegen_layout_bits), hotalign (tier-2 regions align loop
+// headers of any size, not only small loops), align32 (loop headers aligned
+// to 32 bytes instead of 16); nocache..norbit
 // the code generation before the register cache. Folded into
 // translator_family_fingerprint(), so persistent
 // caches never mix code generated with different knobs.
@@ -85,6 +88,7 @@ const PlanOverrides& default_overrides() {
             d.no_write_back = k("nowriteback");
             d.no_reuse_dest = k("noreusedest");
             d.no_vec_facts = k("nofacts");
+            d.no_vzero_join = k("novzjoin");
             // Tier 2 is on by default (docs/FX_ENGINE.md, "Tier 2"); notier2 turns it off.
             d.tier2 = kTier2ByDefault ? !k("notier2") : k("tier2");
             d.t2_no_alias = k("t2noalias");
@@ -114,6 +118,8 @@ const PlanOverrides& default_overrides() {
             d.old_cap = k("oldcap");
             d.cold_entries = k("coldentries");
             d.align_loops = k("loopalign");
+            d.align_hot = k("hotalign");
+            d.align32 = k("align32");
         }
         if (const char* v = std::getenv("TRANSMUTE_FX_INLINE")) d.inline_max = static_cast<unsigned>(std::strtoul(v, nullptr, 10));
         return d;
@@ -140,7 +146,8 @@ std::uint32_t codegen_knob_bits() {
 
 std::uint32_t codegen_layout_bits() {
     const auto& o = default_overrides();
-    return (o.cold_entries ? 1u : 0u) | (o.align_loops ? 2u : 0u);
+    return (o.cold_entries ? 1u : 0u) | (o.align_loops ? 2u : 0u) | (o.align_hot ? 4u : 0u) | (o.align32 ? 8u : 0u) |
+           (o.no_vzero_join ? 16u : 0u);
 }
 
 unsigned codegen_inline_max() { return default_overrides().inline_max; }
@@ -296,8 +303,9 @@ void translate_region(std::uint64_t guest_pc, const CodeSource& code, const Tran
             if (trace_retry) {
                 std::uint32_t word = 0;
                 code.read(retry.pc, word);
-                std::fprintf(stderr, "retry at %llx word %08x extra_pins %d\n",
-                             static_cast<unsigned long long>(retry.pc), word, plan.extra_pins ? 1 : 0);
+                std::fprintf(stderr, "retry at %llx word %08x extra_pins %d resource %d\n",
+                             static_cast<unsigned long long>(retry.pc), word, plan.extra_pins ? 1 : 0,
+                             static_cast<int>(retry.resource));
             }
             if (retry.resource == core::RetryTranslation::Resource::aliases &&
                 (!overrides.no_vec_alias || !overrides.no_galias)) {

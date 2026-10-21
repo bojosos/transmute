@@ -152,8 +152,12 @@ private:
 };
 
 // Guest pc -> list of exit references (linked exits targeting it, or pending
-// exits waiting for it). Lists are singly linked through a shared node pool,
-// so adding a reference allocates nothing in steady state.
+// exits waiting for it). Lists are doubly linked through a shared node pool,
+// so adding a reference allocates nothing in steady state, and each exit
+// records its node (ExitInfo::ref_node): killing a region removes each of its
+// exits in O(1). A popular target (a V8 builtin trampoline) has thousands of
+// exits waiting for it; a list walk per removal made every SMC kill of V8 code
+// quadratic (a third of a Speedometer renderer's main thread).
 class ExitRefs {
 public:
     void add(std::uint64_t key, ExitRef ref) {
@@ -161,14 +165,16 @@ public:
         auto [head, inserted] = heads_.insert(key, node);
         if (!inserted) {
             nodes_[node].next = *head;
+            nodes_[*head].prev = node;
             *head = node;
         }
+        ref.region->exits[ref.index].ref_node = node;
     }
     [[nodiscard]] bool contains(std::uint64_t key) const noexcept { return heads_.find(key) != nullptr; }
-    // Removes the list of `key` and calls fn(ref) for each reference; fn may
-    // add references (to any key).
     // Number of references (diagnostics and tests).
     [[nodiscard]] std::size_t size() const noexcept { return nodes_.size() - free_count_; }
+    // Removes the list of `key` and calls fn(ref) for each reference; fn may
+    // add references (to any key).
     template <typename F>
     void take(std::uint64_t key, F&& fn) {
         const std::uint32_t* head = heads_.find(key);
@@ -178,25 +184,28 @@ public:
         while (node != kNone) {
             const Node n = nodes_[node];
             release(node);
+            n.ref.region->exits[n.ref.index].ref_node = kNone;
             fn(n.ref);
             node = n.next;
         }
     }
-    // Removes every reference to exit `index` of `region` from the list of `key`.
-    void remove(std::uint64_t key, const Region* region, std::uint32_t index) {
-        std::uint32_t* head = heads_.find(key);
-        if (!head) return;
-        std::uint32_t* link = head;
-        while (*link != kNone) {
-            const std::uint32_t node = *link;
-            if (nodes_[node].ref.region == region && nodes_[node].ref.index == index) {
-                *link = nodes_[node].next;
-                release(node);
-            } else {
-                link = &nodes_[node].next;
-            }
+    // Removes the reference to exit `index` of `region` from the list of `key`.
+    void remove(std::uint64_t key, Region* region, std::uint32_t index) {
+        ExitInfo& exit = region->exits[index];
+        const std::uint32_t node = exit.ref_node;
+        exit.ref_node = kNone;
+        if (node >= nodes_.size() || nodes_[node].ref.region != region || nodes_[node].ref.index != index) return;
+        const Node n = nodes_[node];
+        if (n.prev != kNone) {
+            nodes_[n.prev].next = n.next;
+        } else {
+            std::uint32_t* head = heads_.find(key);
+            if (!head || *head != node) return;   // not in this list (never: an exit is in one list)
+            if (n.next == kNone) heads_.erase(key);
+            else *head = n.next;
         }
-        if (*head == kNone) heads_.erase(key);
+        if (n.next != kNone) nodes_[n.next].prev = n.prev;
+        release(node);
     }
 
 private:
@@ -204,6 +213,7 @@ private:
     struct Node {
         ExitRef ref;
         std::uint32_t next;
+        std::uint32_t prev;
     };
     std::uint32_t allocate(ExitRef ref) {
         std::uint32_t node = free_;
@@ -214,12 +224,11 @@ private:
             node = static_cast<std::uint32_t>(nodes_.size());
             nodes_.push_back({});
         }
-        nodes_[node] = {ref, kNone};
+        nodes_[node] = {ref, kNone, kNone};
         return node;
     }
     void release(std::uint32_t node) {
-        nodes_[node].ref = {};
-        nodes_[node].next = free_;
+        nodes_[node] = {{}, free_, kNone};
         free_ = node;
         ++free_count_;
     }
@@ -309,6 +318,9 @@ struct State {
     // Guest pages that lost a live region (stats only: an install on one of
     // them is a re-translation). Never shrinks; bounded by the code pages.
     std::unordered_set<std::uint64_t> killed_pages;
+    // Pages an SMC fault inside a JIT write window gave back to the guest
+    // without invalidating them; checked when a window closes.
+    std::unordered_set<std::uint64_t> deferred_pages;
     // Regions are freed with their code chunk, by reclaim, once dead and unreachable.
     std::atomic<std::uint64_t> epoch{0};                       // bumped by every invalidation
 };
@@ -634,7 +646,7 @@ bool invalidate_locked(std::uint64_t begin, std::uint64_t end, bool restore_prot
     // a change through one address changes the code at all of them.
     if (g_shared_aliases.load(std::memory_order_acquire) && end - begin <= (64u << 20)) {
         std::vector<std::uint64_t> aliases;
-        for (auto page = begin & ~(kPage - 1); page < end; page += kPage) shared_memory_aliases(page, aliases);
+        shared_memory_aliases(begin, end, aliases);
         for (const std::uint64_t alias : aliases) {
             g.pages.for_each(alias, [&](Region* r) {
                 if (overlaps(*r, alias, alias + kPage) && seen.insert(r).second) victims.push_back(r);
@@ -657,41 +669,59 @@ bool invalidate_locked(std::uint64_t begin, std::uint64_t end, bool restore_prot
     return !victims.empty();
 }
 
+// Map lock held exclusively. Write-protects one guest page unless fx already
+// protects it or it is not writable. True if it was writable by the guest.
+bool protect_page(std::uint64_t page) {
+    if (g.protected_pages.count(page) || known_readonly(page)) return false;
+    vm::RegionInfo info;
+    if (!vm::query(reinterpret_cast<const void*>(page), info) || !info.committed()) return false;
+    const vm::Protection protect = info.protect;
+    if (!writable(protect)) {
+        const auto run_begin = info.base;
+        forget_readonly(run_begin, run_begin + info.size);   // keep ranges disjoint
+        g.readonly_ranges.emplace(run_begin, run_begin + info.size);
+        return false;
+    }
+    vm::Protection old;
+    if (vm::protect(reinterpret_cast<void*>(page), kPage, read_only_for(protect), &old)) {
+        g.protected_pages.emplace(page, old);
+        ++g.protection_changes;
+    }
+    return true;
+}
+
 // Map lock held exclusively. Write-protects writable guest pages the region
 // depends on (a page that cannot be protected just loses SMC detection).
 // Returns true if a page was writable by the guest until now: a check of its
 // contents made before this call (a cached region's guest hash) may be stale.
 bool protect_pages(const Region& r) {
     bool newly_protected = false;
-    const auto protect_page = [&](std::uint64_t page) {
-        if (g.protected_pages.count(page) || known_readonly(page)) return;
-        vm::RegionInfo info;
-        if (!vm::query(reinterpret_cast<const void*>(page), info) || !info.committed()) return;
-        const vm::Protection protect = info.protect;
-        if (!writable(protect)) {
-            const auto run_begin = info.base;
-            forget_readonly(run_begin, run_begin + info.size);   // keep ranges disjoint
-            g.readonly_ranges.emplace(run_begin, run_begin + info.size);
-            return;
-        }
-        newly_protected = true;
-        vm::Protection old;
-        if (vm::protect(reinterpret_cast<void*>(page), kPage, read_only_for(protect), &old)) {
-            g.protected_pages.emplace(page, old);
-            ++g.protection_changes;
-        }
-    };
     const bool shared = g_shared_aliases.load(std::memory_order_acquire);
     std::vector<std::uint64_t> aliases;
-    for_each_page(r, [&](std::uint64_t page) {
-        protect_page(page);
-        // The same page mapped elsewhere (shared guest memory): protect it there too.
-        if (!shared) return;
-        aliases.clear();
-        shared_memory_aliases(page, aliases);
-        for (const std::uint64_t alias : aliases) protect_page(alias);
-    });
+    for_each_page(r, [&](std::uint64_t page) { newly_protected |= protect_page(page); });
+    // The same pages mapped elsewhere (shared guest memory): protect them there too.
+    if (shared) {
+        for (const auto& [begin, end] : r.guest_ranges) shared_memory_aliases(begin, end, aliases);
+        for (const std::uint64_t alias : aliases) newly_protected |= protect_page(alias);
+    }
     return newly_protected;
+}
+
+// Hash of a region's guest bytes (its guest ranges, which the translator
+// names as everything the code depends on); never 0, and 0 if a word cannot
+// be read.
+std::uint64_t guest_bytes_hash(const Region& r) {
+    std::uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (const auto& [begin, end] : r.guest_ranges) {
+        h = (h ^ begin) * 0xff51afd7ed558ccdull;
+        for (std::uint64_t address = begin & ~std::uint64_t{3}; address < end; address += 4) {
+            std::uint32_t word;
+            if (!safe_read32(address, word)) return 0;
+            h = (h ^ word) * 0xc4ceb9fe1a85ec53ull;
+            h ^= h >> 29;
+        }
+    }
+    return h | 1;
 }
 
 bool verify_reads(const LiveCodeSource& source) {
@@ -882,6 +912,7 @@ const void* install(const TranslatedRegion& t, std::uint64_t pc, std::uint64_t e
     if (!source && g.epoch.load(std::memory_order_acquire) != epoch) return nullptr;
     const bool newly_protected = protect_pages(*region);
     if (source && !verify_reads(*source)) return nullptr;                   // modified meanwhile: retry
+    if (source && in_registered_code_memory(pc)) region->guest_hash = guest_bytes_hash(*region);
     if (!source && newly_protected) {
         if (recheck) *recheck = true;
         return nullptr;
@@ -979,6 +1010,14 @@ TranslateOptions jit_translate_options() noexcept {
 }
 
 std::uint64_t invalidation_epoch() noexcept { return g.epoch.load(std::memory_order_acquire); }
+
+namespace {
+// Bumped by explicit invalidations (protection changes, unmaps, decommits),
+// not by SMC faults or code flushes, which change no page's accessibility.
+std::atomic<std::uint64_t> g_access_epoch{0};
+} // namespace
+
+std::uint64_t memory_access_epoch() noexcept { return g_access_epoch.load(std::memory_order_acquire); }
 
 bool has_host_entry(std::uint64_t pc) {
     SharedLock lock(g.map);
@@ -1082,6 +1121,55 @@ void keep_reusable(std::uint64_t pc, const TranslatedRegion& region, const LiveC
 }
 } // namespace
 
+namespace {
+// A region for the copy at `delta` from its source (register_guest_code_copy)
+// is usable only where the copy's guest bytes equal the source's: fills
+// `source` with the copy's words over the region's guest ranges (install
+// verifies them again under write protection). False if any differs.
+bool copy_matches_source(const TranslatedRegion& region, std::int64_t delta, LiveCodeSource& source) {
+    thread_local std::vector<std::pair<std::uint64_t, std::uint32_t>> words;
+    words.clear();
+    const auto d = static_cast<std::uint64_t>(delta);
+    for (const auto& [begin, end] : region.guest_ranges) {
+        for (std::uint64_t address = begin & ~std::uint64_t{3}; address < end; address += 4) {
+            std::uint32_t here, there;
+            if (!safe_read32(address, here) || !safe_read32(address - d, there) || here != there) return false;
+            words.emplace_back(address, here);
+        }
+    }
+    source.reset();
+    source.assign_reads(words);
+    return true;
+}
+
+// A translation of a copy of image code from the source module's cache.
+const void* install_from_copy_source(std::uint64_t pc, std::int64_t delta, LiveCodeSource& source, bool tier1) {
+    thread_local TranslatedRegion copied;
+    bool hit;
+    {
+        TickScope t{g_counters.cache_ticks};
+        hit = cache_lookup_copy(pc - static_cast<std::uint64_t>(delta), delta, copied) &&
+              (!tier1 || copied.tier >= 1) && region_is_valid(copied, pc) && copy_matches_source(copied, delta, source);
+    }
+    if (!hit) return nullptr;
+    TickScope t{g_counters.install_ticks};
+    const void* host = install(copied, pc, 0, &source);
+    if (host) count(g_counters.copy_cache_hits);
+    return host;
+}
+
+// Persists a JIT translation: in its module's cache, or in the source
+// module's cache for a copy whose guest bytes equal the source's.
+void store_translation(const TranslatedRegion& region, bool copy, std::int64_t delta) {
+    if (!copy) {
+        cache_store(region);
+        return;
+    }
+    thread_local LiveCodeSource check;
+    if (copy_matches_source(region, delta, check)) cache_store_copy(region, delta);
+}
+} // namespace
+
 const void* translate_and_install(std::uint64_t pc) {
     TickScope total{g_counters.translate_ticks};
     std::lock_guard serialize(g.translate);
@@ -1132,6 +1220,10 @@ const void* translate_and_install(std::uint64_t pc) {
                 }
             }
         }
+        std::int64_t copy_delta = 0;
+        const bool copy = registered && cache && guest_code_copy_delta(pc, copy_delta);
+        if (copy && attempt == 0)
+            if (const void* host = install_from_copy_source(pc, copy_delta, source, false)) return host;
         source.reset();
         std::uint32_t word;
         if (!source.read(pc, word)) return nullptr;
@@ -1149,13 +1241,14 @@ const void* translate_and_install(std::uint64_t pc) {
         count(g_counters.translations);
         count(g_counters.jit_guest_instructions, region.stats.guest_instructions);
         if (registered) count(g_counters.registered_code_translations);
+        if (copy) count(g_counters.copy_translations);
         const void* installed;
         {
             TickScope t{g_counters.install_ticks};
             installed = install(region, pc, 0, &source);
         }
         if (installed) {
-            if (cache) cache_store(region);
+            if (cache) store_translation(region, copy, copy_delta);
             if (registered) keep_reusable(pc, region, source);
             return installed;
         }
@@ -1222,6 +1315,17 @@ void tier_up(std::uint64_t pc) {
             if (!recheck) break;
         }
     }
+    std::int64_t copy_delta = 0;
+    const bool copy = cache && in_registered_code_memory(pc) && guest_code_copy_delta(pc, copy_delta);
+    if (copy) {
+        thread_local LiveCodeSource copy_source;
+        install_from_copy_source(pc, copy_delta, copy_source, true);
+        if (!pending()) {
+            count(g_counters.tier_ups);
+            count(g_counters.tier_up_cached);
+            return;
+        }
+    }
     for (unsigned attempt = 0; attempt < 4; ++attempt) {
         if (attempt && !pending()) return;
         thread_local LiveCodeSource source;
@@ -1249,7 +1353,7 @@ void tier_up(std::uint64_t pc) {
         }
         if (!pending()) {
             count(g_counters.tier_ups);
-            if (cache) cache_store(region);
+            if (cache) store_translation(region, copy, copy_delta);
             return;
         }
     }
@@ -1999,6 +2103,78 @@ std::uint32_t saved_page_protection(std::uint64_t page) noexcept {
     return it == g.protected_pages.end() ? 0 : it->second;
 }
 
+// ---- JIT write windows ----------------------------------------------------------
+// Darwin's MAP_JIT contract: a thread writes JIT memory only between
+// pthread_jit_write_protect_np(0) and (1) (on Apple silicon it cannot even
+// store to it otherwise), and code it wrote need not be visible to any thread
+// before sys_icache_invalidate. V8 writes each new code object next to live
+// code; on the page-granular SMC fault that killed every translation on the
+// page, interrupted every thread and had most of them installed again with
+// the same bytes. Inside a window the fault now only gives the page back to
+// the guest (deferred). Flushes still kill what they cover at once. When any
+// window closes, the deferred pages are write-protected again and every
+// translation on them is checked against the hash of the guest bytes it was
+// translated from: unchanged ones stay, changed ones die. Faults outside a
+// window, on image code or on shared memory keep the exact path.
+namespace {
+thread_local bool t_jit_window = false;
+std::atomic<bool> g_deferred_any{false};   // !g.deferred_pages.empty(), read without the lock
+
+// Map lock held exclusively; `page` is in g.protected_pages. False if the
+// fault must take the exact path.
+bool defer_page(std::uint64_t page) {
+    if (!in_registered_code_memory(page) || !in_registered_code_memory(page + kPage - 1)) return false;
+    if (g_shared_aliases.load(std::memory_order_acquire)) {
+        std::vector<std::uint64_t> aliases;
+        shared_memory_aliases(page, aliases);
+        if (!aliases.empty()) return false;
+    }
+    const auto it = g.protected_pages.find(page);
+    const vm::Protection now = current_protection(page);
+    if (now != 0 && (now & 0xff) == (read_only_for(it->second) & 0xff))
+        vm::protect(reinterpret_cast<void*>(page), kPage, it->second);
+    g.protected_pages.erase(it);
+    ++g.protection_changes;
+    g.deferred_pages.insert(page);
+    g_deferred_any.store(true, std::memory_order_release);
+    // Cached installs validate a guest hash taken before now with the epoch.
+    g.epoch.fetch_add(1, std::memory_order_acq_rel);
+    count(g_counters.jit_window_deferred);
+    return true;
+}
+
+// Map lock held exclusively: the check of every deferred page (see above).
+void check_deferred_pages() {
+    if (g.deferred_pages.empty()) return;
+    std::vector<std::uint64_t> pages(g.deferred_pages.begin(), g.deferred_pages.end());
+    g.deferred_pages.clear();
+    g_deferred_any.store(false, std::memory_order_release);
+    std::vector<Region*> victims;
+    std::unordered_set<Region*> seen;
+    for (const std::uint64_t page : pages) {
+        if (!g.pages.any(page)) continue;
+        count(g_counters.jit_window_pages_checked);
+        // Protect first: a store after this faults and waits for the lock.
+        protect_page(page);
+        g.pages.for_each(page, [&](Region* r) {
+            if (!seen.insert(r).second) return;
+            if (r->guest_hash != 0 && guest_bytes_hash(*r) == r->guest_hash) {
+                count(g_counters.jit_window_regions_kept);
+            } else {
+                victims.push_back(r);
+            }
+        });
+    }
+    if (victims.empty()) return;
+    for (Region* r : victims) kill(*r);
+    count(g_counters.jit_window_regions_killed, victims.size());
+    for (Region* r : victims) for_each_page(*r, [](std::uint64_t page) { restore_page(page); });
+    g.epoch.fetch_add(1, std::memory_order_acq_rel);
+    for_each_context([](GuestContext& ctx) { ctx.interrupt_pending = 1; });
+    count(g_counters.invalidation_interrupts);
+}
+} // namespace
+
 WriteFault smc_handle_write_fault(std::uint64_t address, std::uint64_t& changes) {
     const auto page = address & ~(kPage - 1);
     const auto writable_now = [page, &changes] {
@@ -2015,7 +2191,7 @@ WriteFault smc_handle_write_fault(std::uint64_t address, std::uint64_t& changes)
         ExclusiveLock lock(g.map);
         if (!g.protected_pages.count(page)) return writable_now();   // another thread restored it
         count(g_counters.smc_write_faults);
-        invalidate_locked(page, page + kPage, true);
+        if (!t_jit_window || !defer_page(page)) invalidate_locked(page, page + kPage, true);
     }
     count(g_counters.smc_fault_ticks, ticks_now() - start);
     return WriteFault::smc;
@@ -2046,10 +2222,11 @@ void register_host_entry(std::uint64_t guest_pc, const void* host_code) {
 //   ts->fp_host = 0; MXCSR = state(ctx.fpcr, ctx.fpsr); ctx.fpsr &= ~mirrored
 //   cmp [pc], rbx; jne -> jmp [stub_indirect]          (callback moved pc)
 //   mov rbx, [x30]; RSB top == rbx ? pop, jmp entry : pc = rbx, jmp [stub_indirect]
-void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void* user) {
+namespace {
+
+const void* host_callback_code(HostCallback callback, void* user) {
     using x64::Gp;
     using x64::ptr;
-    rt::ensure_initialized();
     const auto field = [](std::size_t offset) { return ptr(Gp::r15, ctx_disp(offset)); };
     const std::int32_t rsb = ctx_disp(offsetof(GuestContext, rsb));
     x64::Assembler a(160);
@@ -2083,6 +2260,77 @@ void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void*
     void* code = rt::arena_allocate(a.size(), 16);
     std::memcpy(code, a.data(), a.size());
     host::vm::flush_instruction_cache(code, a.size());
+    return code;
+}
+
+} // namespace
+
+void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void* user) {
+    rt::ensure_initialized();
+    rt::install_host_entry(guest_pc, host_callback_code(callback, user));
+}
+
+// The leaf entry (process.hpp): entered by jmp from translated code, flushed,
+// with the convention registers live and rsp == ctx->host_rsp, so the leaf is
+// an ordinary Win64 call that keeps them (and the arena's generic unwind
+// entry covers it). It is installed without an adapter; the callback's own
+// entry, behind its adapter, is the fallback.
+//   lea rcx, [ctx]; mov rax, leaf; call rax; test al, al; jz fallback
+//   RSB top == x30 ? pop, jmp entry : pc = x30, jmp [stub_indirect_live]
+void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user) {
+    using x64::Gp;
+    using x64::ptr;
+    rt::ensure_initialized();
+    const auto field = [](std::size_t offset) { return ptr(Gp::r15, ctx_disp(offset)); };
+    const std::int32_t rsb = ctx_disp(offsetof(GuestContext, rsb));
+    const auto& conv = translator_register_convention();
+    if ((conv.guest_mask & 0xffu) != 0) {
+        // Argument registers live in convention hosts (TRANSMUTE_FX_GLOBALS): their
+        // context slots are stale where the leaf would read them. The callback alone.
+        rt::install_host_entry(guest_pc, host_callback_code(callback, user));
+        return;
+    }
+    const void* fallback = host_callback_code(callback, user);
+    {
+        rt::ExclusiveLock lock(rt::g.map);
+        fallback = rt::host_entry_adapter(fallback);
+    }
+    const int lr_host = (conv.guest_mask >> 30) & 1u ? conv.host[30] : -1;
+    x64::Assembler a(128);
+    const x64::Label slow = a.new_label(), miss = a.new_label(), data = a.new_label();
+    a.lea(64, Gp::rcx, ptr(Gp::r15, -kContextBias));
+    a.mov_imm64(Gp::rax, reinterpret_cast<std::uint64_t>(leaf));
+    a.call(Gp::rax);
+    a.test(8, Gp::rax, Gp::rax);
+    a.jcc(x64::Cond::e, slow);
+    Gp x30 = Gp::r8;   // x30: in its convention host (kept by the call), else its context slot
+    if (lr_host >= 0) x30 = x64::gp(static_cast<unsigned>(lr_host));
+    else a.mov(64, x30, ptr(Gp::r15, x_disp(30)));
+    a.mov(32, Gp::rax, field(offsetof(GuestContext, rsb_top)));
+    a.sub(32, Gp::rax, 1);
+    a.and_(32, Gp::rax, static_cast<std::int32_t>(kRsbEntries - 1));
+    a.mov(32, Gp::rdx, Gp::rax);
+    a.shl(32, Gp::rdx, 4);
+    a.cmp(64, x30, ptr(Gp::r15, Gp::rdx, 1, rsb));
+    a.jcc(x64::Cond::ne, miss);
+    a.mov(32, field(offsetof(GuestContext, rsb_top)), Gp::rax);
+    a.jmp(ptr(Gp::r15, Gp::rdx, 1, rsb + 8));   // the continuation expects the convention registers live
+    a.bind(miss);
+    a.mov(64, field(offsetof(GuestContext, pc)), x30);
+    a.jmp(field(offsetof(GuestContext, stub_indirect_live)));
+    a.bind(slow);
+    a.jmp(x64::rip(data));
+    a.align(8);
+    a.bind(data);
+    a.dq(reinterpret_cast<std::uint64_t>(fallback));
+    a.finalize();
+    void* code = rt::arena_allocate(a.size(), 16);
+    std::memcpy(code, a.data(), a.size());
+    host::vm::flush_instruction_cache(code, a.size());
+    {
+        rt::ExclusiveLock lock(rt::g.map);
+        rt::g_adapter_code.insert(code);   // live-state code: no adapter
+    }
     rt::install_host_entry(guest_pc, code);
 }
 
@@ -2098,6 +2346,8 @@ void invalidate_guest_code(std::uint64_t address, std::uint64_t size) {
     if (size == 0) return;
     const auto end = address + size < address ? ~std::uint64_t{0} : address + size;
     rt::drop_reusable(address, end);
+    rt::drop_guest_code_copies(address, end);
+    rt::g_access_epoch.fetch_add(1, std::memory_order_acq_rel);
     rt::ExclusiveLock lock(rt::g.map);
     rt::invalidate_locked(address, end, true);
 }
@@ -2107,6 +2357,7 @@ void guest_protection_lowered(std::uint64_t address, std::uint64_t size) {
     if (size == 0) return;
     const auto begin = address & ~(rt::kPage - 1);
     const auto end = address + size < address ? ~std::uint64_t{0} : address + size;
+    rt::g_access_epoch.fetch_add(1, std::memory_order_acq_rel);
     rt::ExclusiveLock lock(rt::g.map);
     auto& saved = rt::g.protected_pages;
     if (saved.empty()) return;
@@ -2115,6 +2366,14 @@ void guest_protection_lowered(std::uint64_t address, std::uint64_t size) {
     } else {
         for (auto page = begin; page < end; page += rt::kPage) saved.erase(page);
     }
+}
+
+void guest_jit_write_window(bool open) {
+    rt::ensure_initialized();
+    rt::t_jit_window = open;
+    if (open || !rt::g_deferred_any.load(std::memory_order_acquire)) return;
+    rt::ExclusiveLock lock(rt::g.map);
+    rt::check_deferred_pages();
 }
 
 void flush_guest_code(std::uint64_t address, std::uint64_t size) {

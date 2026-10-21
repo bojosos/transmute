@@ -1,6 +1,6 @@
 // Runtime stubs, generated once into the first 64 KiB of the code arena.
 //
-//   offset 0  miss            exit_reason = lookup_miss (empty lookup slots decode here)
+//   offset 0  miss            ctx->pc = rcx; exit_reason = lookup_miss (empty slots of inline lookups decode here)
 //             indirect        inline lookup of ctx->pc; hit -> jmp entry, miss -> miss
 //             link            rax = &rel32, ctx->pc = target -> exit(link, exit_arg = rax)
 //             dispatch_exit   restore the C++ frame saved by enter and return
@@ -167,6 +167,11 @@ void generate_stubs() {
     const Label miss = a.new_label();   // flushed state (no stores)
 
     // ---- miss (offset 0): entered from translated inline lookups ------------
+    // An empty slot "hits" here (tag 0: a target below 4 MiB). Inline lookups
+    // store ctx->pc only on their own miss path, so the target (rcx) is
+    // stored here. Only inline lookups come here: `indirect` checks for empty
+    // slots and takes `miss`.
+    a.mov(64, ptr(Gp::r15, kPc), Gp::rcx);
     store_globals(a);
     a.bind(miss);
     a.mov(32, ptr(Gp::r15, kExitReason), static_cast<std::int32_t>(ExitReason::lookup_miss));
@@ -186,10 +191,8 @@ void generate_stubs() {
     a.and_(32, Gp::rcx, static_cast<std::int32_t>(kLookupMask));
     a.mov(64, Gp::rdx, ptr(Gp::r15, kLookupTable));
     a.mov(64, Gp::rdx, ptr(Gp::rdx, Gp::rcx, 8));
-    if (globals) {   // an empty slot would "hit" offset 0, which stores
-        a.test(64, Gp::rdx, Gp::rdx);
-        a.jcc(Cond::e, miss);
-    }
+    a.test(64, Gp::rdx, Gp::rdx);   // an empty slot would "hit" offset 0, which stores rcx and the globals
+    a.jcc(Cond::e, miss);
     a.mov(64, Gp::rcx, Gp::rdx);
     a.shr(64, Gp::rcx, 32);
     a.cmp(64, Gp::rax, Gp::rcx);

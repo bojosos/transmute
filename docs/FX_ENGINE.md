@@ -61,8 +61,13 @@ JIT on miss, persistent cache for warm runs, optional AOT from `.pdata`.
   to and return from a public interface, and Windows ARM64 compilers never
   pass flags through a call. The translator therefore treats NZCV as dead at
   BL/BLR and RET exits (it is not materialized for them; a guest context
-  captured after a call or return may show a stale NZCV). Every other exit
-  (B to another region, BR, fall-through out of a region, traps, interpret
+  captured after a call or return may show a stale NZCV). The same holds at
+  a BR that does not look intra-function: a tail call, a veneer or an
+  interpreter's dispatch enters code that cannot assume incoming flags. A BR
+  through a recognised jump table, or with an ADR/ADRP in its block (clang
+  switch tables, computed gotos), keeps them live
+  (`TRANSMUTE_FX_CORE=nobrdeadflags` keeps every BR live). Every other exit
+  (B to another region, fall-through out of a region, traps, interpret
   exits, interrupts at live points) keeps the strict model.
   `TranslateOptions::abi_flags = false` (part of the cache options hash) or
   `TRANSMUTE_FX_CORE=exactflags` (folded into the translator fingerprint)
@@ -165,19 +170,26 @@ aliased, duplicated or cut: its written pages exist only in it.
     fallbacks, interpret/SVC/BRK exits, entry stubs that are not in line,
     constant pool, switch tables. Call continuation entry stubs are laid out
     in line after the call (`coldentries`: cold), except at loop headers;
-    only small loops are aligned (`loopalign`: all); backward branches use
+    only small loops are aligned (`loopalign`: all; `hotalign`: tier-2 loops of
+    any size; `align32`: 32 bytes instead of 16); backward branches use
     rel8 in reach; vector context moves use movups. src/fx/translator/
     NOTES_CORE.md has the details, docs/FX_CLASSROOM_PROFILE.md the
     measurements.
-  - Indirect: `mov [r15+pc], target`; then the stub_indirect lookup inlined
+  - Indirect: the stub_indirect lookup inlined on the target in rcx
     (fx/runtime/runtime.hpp encoding, `host = ctx->arena_base + (u32)entry`,
-    one predicted `jmp` per site); misses, misaligned targets and contexts
-    with `arena_base == nullptr` take `jmp [r15+stub_indirect_live]`.
+    one predicted `jmp` per site); misses and misaligned targets store
+    `ctx->pc` and take `jmp [r15+stub_indirect_live]` (an empty slot "hits"
+    the miss stub at arena offset 0, which stores rcx as `ctx->pc`).
   - Switch dispatch: a BR through a recognised MSVC jump table (`adr;
     ldr{sw,sb,sh,b,h} [xT, wI, uxtw]; [adr]; add; br`, bound from `cmp; b.hi`,
     `uxtb`/`and`, or the table contents) stays in the region: `wI < n` and
     `xN == target_k` select host table entry k (`{target - region start,
-    label - table}`), else the indirect exit. The targets are internal edges
+    label - table}`), else the indirect exit. LLVM's lowering (clang,
+    Mach-O: `adr xB, base; ldr{b,h,sw} [xT, xI{, lsl #k}]; add xN, xB, xO,
+    lsl #2; br xN`, with the table address often set up before a loop and xI
+    reused before the BR) needs a bound and dispatches on the target: `xN -
+    lo` (aligned, at most `hi - lo`) indexes a dense host table over the case
+    pcs, other slots take the indirect exit. The targets are internal edges
     (pins stay, the register cache is empty on them); targets outside the
     region are linkable direct exits. Regions holding a table may grow to 4x
     the instruction limit, so an interpreter loop is one region.

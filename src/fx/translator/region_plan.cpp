@@ -1,5 +1,7 @@
 #include "fx/translator/region_plan.hpp"
 
+#include "fx/translator/core_isel.hpp"   // codegen_p2_knob_bits (fingerprint, flags at BR)
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -53,6 +55,10 @@ std::uint64_t translator_family_fingerprint() {
     if (const auto layout = core::codegen_layout_bits(); layout != 0) {
         mix(0xfc);   // code layout knobs
         mix(static_cast<unsigned char>(layout));
+    }
+    if (const auto p2 = core::codegen_p2_knob_bits(); p2 != 0) {
+        mix(0xfa);   // core_isel.hpp CodegenKnob (fx perf wave p2)
+        mix(static_cast<unsigned char>(p2));
     }
     if (const auto t2 = core::codegen_tier2_bits(); t2 != 0) {
         mix(0xfb);   // tier-2 feature knobs
@@ -227,12 +233,22 @@ constexpr unsigned kCalleeSavedPins = 7;
 //   [cmp wI, #n; b.hi default | uxtb wI, ...]  ...
 //   adr xT, table;  ldr{sw,sb,sh,b,h} xO, [xT, wI, uxtw #size]
 //   [adr xB, base]; add xN, xB|xT, xO, lsl #s;  br xN
+// LLVM's lowering (AArch64AsmPrinter::LowerJumpTableDest; clang, Mach-O):
+//   [cmp wI, #n; b.hi default]  ...  [adrp xT, table; add xT, xT, :lo12:table]
+//   adr xB, base;  ldr{b,h,sw} wO, [xT, xI{, lsl #size}];  add xN, xB, xO, lsl #2;  br xN
+// where the table address is often set up before a loop (out of the
+// straight-line window: a further backward scan finds it) and xI may be
+// reused between the load and the BR. Those dispatch on the target
+// (JumpTable::by_target).
 // Found by a backward linear scan from the BR (straight-line code only). The
 // result is a hint: the emitter checks the computed target against each
 // entry at run time, so a wrong match or bound only costs speed.
 constexpr unsigned kTableScan = 12;        // instructions scanned back from the BR
 constexpr unsigned kTableBoundScan = 16;   // further back from the first ADR for the bound
+constexpr unsigned kTableFarScan = 256;    // further back for a table address set up before the window
 constexpr unsigned kMaxTableEntries = 1024;
+// by_target tables: the dense host table covers the case pcs' span (4 bytes per guest instruction).
+constexpr std::uint64_t kMaxTargetSpan = 4u * 4096u;
 
 struct TableMatch {
     std::uint8_t index_reg;
@@ -242,6 +258,9 @@ struct TableMatch {
     bool sign32;         // ... to 32 bits (W destination), then zero-extended
     unsigned shift;      // target = base + (entry << shift)
     unsigned count;
+    bool by_target;      // the index is not usable at the BR: dispatch on the target
+    bool absolute;       // 8-byte entries holding the targets themselves (label tables)
+    const char* fail;    // diagnostics: the step that did not match
 };
 
 // Decodes the straight-line instruction at `pc` (false: unreadable or not core).
@@ -270,8 +289,117 @@ bool adr_value(const Inst* insts, int j, unsigned r, std::uint64_t& value) {
     return false;
 }
 
+// Value of xR from its nearest writer before `pc` in address order (an ADR,
+// or an ADD #imm of an ADRP), scanning back at most kTableFarScan
+// instructions. Control flow is ignored, and instructions the core does not
+// decode (FP/SIMD, hints) are skipped: a hint only (see above).
+bool far_adr_value(const CodeSource& code, std::uint64_t pc, unsigned r, std::uint64_t& value) {
+    std::uint64_t offset = 0;
+    bool add_seen = false;
+    for (unsigned k = 0; k < kTableFarScan && pc >= 4; ++k) {
+        pc -= 4;
+        std::uint32_t word = 0;
+        if (!code.read(pc, word)) return false;
+        Inst d;
+        decode(word, pc, d);
+        if (d.kind == Kind::unknown || !writes_reg(d, r)) continue;
+        if (d.kind == Kind::adr && d.rd == r) {
+            value = static_cast<std::uint64_t>(d.imm) + offset;
+            return true;
+        }
+        // ADD xR, xS, #imm: then xS's own writer (an ADRP), once.
+        if (add_seen || d.kind != Kind::add_sub_imm || d.op != 0 || d.s || !d.sf || d.rd != r || d.rn == 31) return false;
+        add_seen = true;
+        offset = static_cast<std::uint64_t>(d.imm);
+        r = d.rn;
+    }
+    return false;
+}
+
+// The number of table entries the index wI can select, from the code before
+// the table load at `ld_pc` (at most `limit` instructions back): cmp + b.hi/b.hs
+// past the default, or the index's own range. 0: none found.
+unsigned scan_bound(const CodeSource& code, std::uint64_t ld_pc, unsigned limit, unsigned ri) {
+    std::uint64_t pc = ld_pc;
+    unsigned count = 0;
+    for (unsigned k = 0; k < limit && count == 0; ++k) {
+        pc -= 4;
+        Inst d;
+        if (!decode_at(code, pc, d)) break;
+        if (d.kind == Kind::branch_cond && (d.cond == 8 || d.cond == 2)) {   // b.hi / b.hs past the default
+            for (unsigned c = 1; c <= 4; ++c) {
+                Inst f;
+                if (!decode_at(code, pc - 4u * c, f) || is_branch(f)) break;
+                const auto u = usage(f);
+                if (f.kind == Kind::add_sub_imm && f.op == 1 && f.s && f.rd == 31 && f.rn == ri) {   // cmp wI/xI, #imm
+                    const auto imm = static_cast<std::uint64_t>(f.imm);
+                    count = static_cast<unsigned>(std::min<std::uint64_t>(d.cond == 8 ? imm + 1 : imm, kMaxTableEntries + 1));
+                    break;
+                }
+                if (u.writes_flags || ((u.write >> ri) & 1u)) break;
+            }
+            break;
+        }
+        if (is_branch(d)) break;
+        if (writes_reg(d, ri)) {
+            // The index's own range: UBFX/UXTB/LSR (a field of imms - immr + 1 bits), AND with a low
+            // mask, or an unsigned byte load (switch on a char read from memory).
+            if (d.kind == Kind::bitfield && d.op == 2 && d.imms >= d.amount && d.imms - d.amount < 10)
+                count = 1u << (d.imms - d.amount + 1);
+            else if (d.kind == Kind::logic_imm && d.op == 0 && (static_cast<std::uint64_t>(d.imm) & (static_cast<std::uint64_t>(d.imm) + 1)) == 0)
+                count = static_cast<unsigned>(std::min<std::uint64_t>(static_cast<std::uint64_t>(d.imm) + 1, kMaxTableEntries + 1));
+            else if (d.kind == Kind::load_store && d.mem == MemOp::load && d.size == 0 && d.rd == ri)
+                count = 256;
+            break;
+        }
+    }
+    return count;
+}
+
+// A label table (computed goto: `goto *labels[i]`, or a dispatch table):
+//   [adrp xT, labels; add xT, xT, :lo12:labels]  ...  ldr xN, [xT, xI, lsl #3];  br xN
+// with absolute 8-byte entries in read-only data (CodeSource::read_data). It
+// dispatches on the target (by_target). With no bound the caller sizes it from
+// its contents. A table whose address is not an ADR/ADRP+ADD (V8's Ignition
+// dispatch table, in the heap) is not one.
+bool match_label_table(const Inst* insts, int lo, int ld, std::uint64_t br_pc, const CodeSource& code, TableMatch& m) {
+    const auto& l = insts[ld];
+    const bool extend_ok = l.shift == 2 || l.shift == 3 || l.shift == 6 || l.shift == 7;
+    // The index scaled by 8 (lsl #3), or already a byte offset (amount 0).
+    if (l.mem != MemOp::load || l.rn == 31 || l.rm == 31 || (l.amount != 3 && l.amount != 0) || !extend_ok) {
+        m.fail = "xN loaded from [xT, xI]: not a label table load";
+        return false;
+    }
+    const unsigned rt = l.rn, ri = l.rm;
+    int tdef = -1;
+    for (int j = ld - 1; j >= lo && tdef < 0; --j)
+        if (writes_reg(insts[j], rt)) tdef = j;
+    const auto window_pc = br_pc - 4u * (kTableScan - static_cast<unsigned>(lo));
+    if (tdef >= 0 ? !adr_value(insts, tdef, rt, m.table) : !far_adr_value(code, window_pc, rt, m.table)) {
+        m.fail = "xN loaded from [xT, xI]: table not at an ADR/ADRP+ADD (a dispatch table in memory)";
+        return false;
+    }
+    m.index_reg = static_cast<std::uint8_t>(ri);
+    m.size = 3;
+    m.sign = m.sign32 = false;
+    m.shift = 0;
+    m.base = 0;
+    m.absolute = true;
+    m.by_target = true;
+    int first = tdef >= 0 ? std::min(ld, tdef) : ld;
+    if (first > 0 && insts[first].kind == Kind::add_sub_imm) --first;
+    m.count = scan_bound(code, br_pc - 4u * (kTableScan - static_cast<unsigned>(ld)),
+                         kTableBoundScan + static_cast<unsigned>(ld - first), ri);
+    if (l.amount == 0) m.count = (m.count + 7) / 8;   // a byte-offset bound
+    return m.count <= kMaxTableEntries;   // 0: sized from the contents (build_plan)
+}
+
 bool match_table(std::uint64_t br_pc, unsigned rn, const CodeSource& code, TableMatch& m) {
-    if (rn >= 31 || br_pc < 4 * kTableScan) return false;
+    const auto no = [&](const char* why) {
+        m.fail = why;
+        return false;
+    };
+    if (rn >= 31 || br_pc < 4 * kTableScan) return no("no register");
     // insts[0] is the furthest back; insts[kTableScan - 1] precedes the BR.
     Inst insts[kTableScan];
     int lo = static_cast<int>(kTableScan);
@@ -284,73 +412,74 @@ bool match_table(std::uint64_t br_pc, unsigned rn, const CodeSource& code, Table
     int add = -1;
     for (int j = static_cast<int>(kTableScan) - 1; j >= lo && add < 0; --j)
         if (writes_reg(insts[j], rn)) add = j;
-    if (add < 0) return false;
+    if (add < 0) return no("no writer of xN");
     const auto& a = insts[add];
     if (a.kind != Kind::add_sub_shift || a.op != 0 || a.s || !a.sf || a.shift != 0 || a.amount > 4 || a.rn == 31 ||
-        a.rm == 31 || a.rd != rn)
-        return false;
+        a.rm == 31 || a.rd != rn) {
+        if (a.kind == Kind::load_store && a.mode == AddrMode::reg && a.size == 3 && a.rd == rn)
+            return match_label_table(insts, lo, add, br_pc, code, m);
+        return no("xN not ADD xB, xO, LSL");
+    }
     const unsigned rb = a.rn, ro = a.rm;
     // The writer of xO: the table load.
     int ld = -1;
     for (int j = add - 1; j >= lo && ld < 0; --j)
         if (writes_reg(insts[j], ro)) ld = j;
-    if (ld < 0) return false;
+    if (ld < 0) return no("no writer of xO");
     const auto& l = insts[ld];
+    // Index extend: UXTW (MSVC), LSL/UXTX or SXTW/SXTX (LLVM).
+    const bool extend_ok = l.shift == 2 || l.shift == 3 || l.shift == 6 || l.shift == 7;
     if (l.kind != Kind::load_store || l.mode != AddrMode::reg || l.rd != ro || l.rn == 31 || l.rm == 31 ||
-        l.shift != 2 /* UXTW */ || l.size > 2 || (l.amount != l.size && !(l.amount == 0 && l.size == 0)))
-        return false;
-    if (l.mem != MemOp::load && l.mem != MemOp::load_signed64 && l.mem != MemOp::load_signed32) return false;
+        !extend_ok || l.size > 2 || (l.amount != l.size && !(l.amount == 0 && l.size == 0)))
+        return no("xO not a register-offset load");
+    if (l.mem != MemOp::load && l.mem != MemOp::load_signed64 && l.mem != MemOp::load_signed32) return no("xO load kind");
     const unsigned rt = l.rn, ri = l.rm;
-    // wI is the index until the BR.
+    // Index dispatch needs wI (UXTW) to be the index until the BR, else the
+    // table dispatches on the target.
+    bool by_target = l.shift != 2;
     for (int j = ld + 1; j < static_cast<int>(kTableScan); ++j)
-        if (writes_reg(insts[j], ri)) return false;
-    // The table address: ADR xT (or ADRP+ADD) before the load, xT unchanged in between.
+        if (writes_reg(insts[j], ri)) by_target = true;
+    // The table address: ADR xT (or ADRP+ADD) before the load, xT unchanged in
+    // between; or, with no writer in the window, set up further back.
     int tdef = -1;
     for (int j = ld - 1; j >= lo && tdef < 0; --j)
         if (writes_reg(insts[j], rt)) tdef = j;
-    if (tdef < 0 || !adr_value(insts, tdef, rt, m.table)) return false;
-    // The base: xB's writer before the add.
+    const auto window_pc = br_pc - 4u * (kTableScan - static_cast<unsigned>(lo));   // insts[lo]
+    if (tdef >= 0) {
+        if (!adr_value(insts, tdef, rt, m.table)) return no("table: not ADR/ADRP+ADD");
+    } else {
+        if (!far_adr_value(code, window_pc, rt, m.table)) return no("table: no ADR/ADRP+ADD found");
+        by_target = true;
+    }
+    // The base: xB's writer before the add (likewise).
     int bdef = -1;
     for (int j = add - 1; j >= lo && bdef < 0; --j)
         if (writes_reg(insts[j], rb)) bdef = j;
-    if (bdef < 0 || !adr_value(insts, bdef, rb, m.base)) return false;
+    if (bdef >= 0) {
+        if (!adr_value(insts, bdef, rb, m.base)) return no("base: not ADR/ADRP+ADD");
+    } else {
+        if (!far_adr_value(code, window_pc, rb, m.base)) return no("base: no ADR/ADRP+ADD found");
+        by_target = true;
+    }
     m.index_reg = static_cast<std::uint8_t>(ri);
     m.size = l.size;
     m.sign = l.mem != MemOp::load;
     m.sign32 = l.mem == MemOp::load_signed32;
     m.shift = a.amount;
-    // The bound: scan back from the first instruction of the pattern.
-    int first = std::min(tdef, bdef);
+    m.by_target = by_target;
+    // The bound: scan back from the table load, kTableBoundScan instructions past the first
+    // instruction of the pattern in the window (the table and base setup between them never
+    // writes wI). A table address set up before a loop may be early in the window, before wI's
+    // writer, so the scan starts at the load.
+    int first = ld;
+    if (tdef >= 0) first = std::min(first, tdef);
+    if (bdef >= 0) first = std::min(first, bdef);
     if (first > 0 && insts[first].kind == Kind::add_sub_imm) --first;   // ADRP of an ADRP+ADD
-    std::uint64_t pc = br_pc - 4u * (kTableScan - static_cast<unsigned>(first));
-    m.count = 0;
-    for (unsigned k = 0; k < kTableBoundScan && m.count == 0; ++k) {
-        pc -= 4;
-        Inst d;
-        if (!decode_at(code, pc, d)) break;
-        if (d.kind == Kind::branch_cond && (d.cond == 8 || d.cond == 2)) {   // b.hi / b.hs past the default
-            for (unsigned c = 1; c <= 4; ++c) {
-                Inst f;
-                if (!decode_at(code, pc - 4u * c, f) || is_branch(f)) break;
-                const auto u = usage(f);
-                if (f.kind == Kind::add_sub_imm && f.op == 1 && f.s && f.rd == 31 && f.rn == ri) {   // cmp wI/xI, #imm
-                    const auto imm = static_cast<std::uint64_t>(f.imm);
-                    m.count = static_cast<unsigned>(std::min<std::uint64_t>(d.cond == 8 ? imm + 1 : imm, kMaxTableEntries + 1));
-                    break;
-                }
-                if (u.writes_flags || ((u.write >> ri) & 1u)) break;
-            }
-            break;
-        }
-        if (is_branch(d)) break;
-        if (writes_reg(d, ri)) {
-            if (d.kind == Kind::bitfield && d.op == 2 && d.amount == 0 && d.imms == 7) m.count = 256;   // uxtb
-            else if (d.kind == Kind::logic_imm && d.op == 0 && (static_cast<std::uint64_t>(d.imm) & (static_cast<std::uint64_t>(d.imm) + 1)) == 0)
-                m.count = static_cast<unsigned>(std::min<std::uint64_t>(static_cast<std::uint64_t>(d.imm) + 1, kMaxTableEntries + 1));
-            break;
-        }
-    }
-    // 0: no bound found (the caller may size the table from its contents).
+    m.count = scan_bound(code, br_pc - 4u * (kTableScan - static_cast<unsigned>(ld)),
+                         kTableBoundScan + static_cast<unsigned>(ld - first), ri);
+    // 0: no bound found (the caller may size an MSVC table from its contents;
+    // LLVM places tables in a data section, so by_target ones need a bound).
+    if (m.by_target && m.count == 0) return no("no bound");
     return m.count <= kMaxTableEntries;
 }
 
@@ -358,7 +487,13 @@ bool match_table(std::uint64_t br_pc, unsigned rn, const CodeSource& code, Table
 bool table_target(const CodeSource& code, const TableMatch& m, unsigned k, std::uint64_t& target) {
     const auto at = m.table + (static_cast<std::uint64_t>(k) << m.size);
     std::uint32_t word = 0;
-    if (!code.read(at & ~std::uint64_t{3}, word)) return false;
+    if (m.absolute) {
+        std::uint32_t high = 0;
+        if ((at & 3) != 0 || !code.read_data(at, word) || !code.read_data(at + 4, high)) return false;
+        target = (static_cast<std::uint64_t>(high) << 32) | word;
+        return true;
+    }
+    if (!code.read_data(at & ~std::uint64_t{3}, word)) return false;
     std::uint64_t raw = word >> (8 * (at & 3));
     std::int64_t value;
     switch (m.size) {
@@ -413,6 +548,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     plan.write_back = !overrides.no_write_back;
     plan.reuse_dest = !overrides.no_reuse_dest;
     plan.vec_facts = !overrides.no_vec_facts;
+    plan.vzero_join = !overrides.no_vzero_join;
     const bool tier2 = options.optimize > 0 || (options.optimize < 0 && overrides.tier2);
     plan.count_hot = tier2 && options.lazy;
     plan.count_loops = plan.count_hot && (overrides.t2_loops || options.optimize == 2);
@@ -436,6 +572,8 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     plan.cold_layout = !overrides.old_layout;
     plan.inline_entries = !overrides.cold_entries;
     plan.align_loops = overrides.align_loops;
+    plan.align_hot = overrides.align_hot;
+    plan.loop_alignment = overrides.align32 ? 32u : 16u;
     plan.carry_clean = !overrides.carry_dirty && !(plan.optimize && overrides.t2_carry);   // t2carry: dirty across loop edges
     stack.clear();
     continuations.clear();
@@ -644,6 +782,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
         std::uint64_t br_pc;
         std::uint32_t first, count;
         std::uint8_t index_reg;
+        bool by_target;
     };
     thread_local std::vector<FoundTable> found_tables;
     thread_local std::vector<std::uint64_t> found_pcs;
@@ -734,8 +873,23 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
                 static const bool trace_tables = std::getenv("TRANSMUTE_FX_TRACE_TABLES") != nullptr;
                 if (trace_tables)
                     std::fprintf(stderr, "table: br %llx %s %u entries\n", static_cast<unsigned long long>(pc),
-                                 matched ? "matched" : "not matched", matched ? m.count : 0u);
-                if (matched && m.count == 0 && bound_end != ~0ULL && m.table >= bound_begin && m.table < bound_end) {
+                                 matched ? (m.absolute ? "matched label table" : m.by_target ? "matched by target" : "matched")
+                                         : "not matched",
+                                 matched ? m.count : 0u);
+                if (trace_tables && !matched && m.fail)
+                    std::fprintf(stderr, "table: br %llx: %s\n", static_cast<unsigned long long>(pc), m.fail);
+                if (matched && m.absolute) {
+                    // Label tables: the entries while they are guest code (within the bound, if
+                    // any); a computed goto usually has no bound check at all.
+                    const unsigned limit = m.count ? m.count : kMaxTableEntries;
+                    unsigned k = 0;
+                    std::uint32_t word = 0;
+                    for (std::uint64_t t = 0; k < limit; ++k)
+                        if (!table_target(code, m, k, t) || (t & 3) != 0 || !code.read(t, word)) break;
+                    m.count = k >= 2 ? k : 0;
+                    if (trace_tables && m.count == 0)
+                        std::fprintf(stderr, "table: br %llx: label table without code entries\n", static_cast<unsigned long long>(pc));
+                } else if (matched && m.count == 0 && bound_end != ~0ULL && m.table >= bound_begin && m.table < bound_end) {
                     // No bound in sight (checked elsewhere): MSVC places the
                     // tables after the function's code, so entries run while
                     // they point into the function below the table.
@@ -755,10 +909,28 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
                         if (ok && (t & 3) == 0 && t >= bound_begin && t < bound_end) ++inside;
                     }
                     if (!ok || inside * 2 < m.count) {   // not a table of this function
+                        if (trace_tables)
+                            std::fprintf(stderr, "table: br %llx: %s\n", static_cast<unsigned long long>(pc),
+                                         ok ? "cases outside the function" : "table unreadable");
                         found_pcs.resize(first);
                         break;
                     }
-                    found_tables.push_back({pc, first, m.count, m.index_reg});
+                    if (m.by_target) {   // the dense host table spans the aligned case pcs
+                        std::uint64_t lo_t = ~0ULL, hi_t = 0;
+                        for (unsigned k = 0; k < m.count; ++k) {
+                            const auto t = found_pcs[first + k];
+                            if ((t & 3) != 0) continue;
+                            lo_t = std::min(lo_t, t);
+                            hi_t = std::max(hi_t, t);
+                        }
+                        if (lo_t > hi_t || hi_t - lo_t >= kMaxTargetSpan) {
+                            if (trace_tables)
+                                std::fprintf(stderr, "table: br %llx: cases span too far\n", static_cast<unsigned long long>(pc));
+                            found_pcs.resize(first);
+                            break;
+                        }
+                    }
+                    found_tables.push_back({pc, first, m.count, m.index_reg, m.by_target});
                     if (overrides.table_exits) break;   // every entry a linkable direct exit (cases are own regions)
                     insn_limit = std::max<std::size_t>(insn_limit, std::min(kTableRegionMax, kTableRegionScale * max_insts));
                     // Pushed in reverse: the depth-first walk then lays out low cases first.
@@ -920,7 +1092,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
         if (br < 0) continue;
         auto& pi = plan.insts[static_cast<std::size_t>(br)];
         pi.table = static_cast<std::int32_t>(plan.tables.size());
-        plan.tables.push_back({static_cast<std::uint32_t>(plan.table_pcs.size()), ft.count, ft.index_reg});
+        plan.tables.push_back({static_cast<std::uint32_t>(plan.table_pcs.size()), ft.count, ft.index_reg, ft.by_target});
         for (std::uint32_t k = 0; k < ft.count; ++k) {
             const auto t = found_pcs[ft.first + k];
             plan.table_pcs.push_back(t);
@@ -1013,6 +1185,20 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     // successor follows in layout, so one pass in the right direction is the
     // fixed point.)
     const bool strict_flags = overrides.exact_flags || !options.abi_flags;
+    // A BR that does not look intra-function is flag-dead too (abi_flags;
+    // TRANSMUTE_FX_CORE=nobrdeadflags keeps every BR live, core_isel.hpp). Tail calls, veneers and
+    // interpreter dispatch enter code that cannot assume incoming flags; a
+    // recognised switch table or an ADR/ADRP in the BR's block (clang switch
+    // tables, computed gotos) keeps them live.
+    const bool br_flags_dead = !strict_flags && (core::codegen_p2_knob_bits() & core::knob_no_br_flags_dead) == 0;
+    const auto br_live = [&](std::int32_t i) {
+        if (!br_flags_dead || plan.insts[i].table >= 0) return true;
+        for (std::int32_t j = i; j >= 0; --j) {
+            if (plan.insts[j].inst.kind == Kind::adr) return true;
+            if (plan.insts[j].leader) break;
+        }
+        return false;
+    };
     for (bool changed = true; changed; changed = changed && back_edges) {
         changed = false;
         for (std::int32_t i = n - 1; i >= 0; --i) {
@@ -1026,7 +1212,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
                       plan.insts[pi.fall].flags_live_in;
                 break;
             case Flow::call: out = strict_flags; break;
-            case Flow::indirect: out = strict_flags || pi.inst.kind != Kind::ret; break;
+            case Flow::indirect: out = strict_flags || (pi.inst.kind != Kind::ret && br_live(i)); break;
             default: out = true; break;
             }
             const bool in = pi.reads_flags || (out && !pi.writes_flags);

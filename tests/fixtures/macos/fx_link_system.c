@@ -52,4 +52,13 @@ LINK_ONLY(dlsym)
 LINK_ONLY(pthread_once)
 LINK_ONLY(_tlv_bootstrap)
 LINK_ONLY(sys_icache_invalidate)
+LINK_ONLY(pthread_jit_write_protect_np)
 unsigned mach_task_self_ = 0;
+/* Pure memory/string calls (fx_leaf_calls), with their own prototypes. */
+void* memcpy(void* d, const void* s, unsigned long n) { (void)s; (void)n; return d; }
+void* memmove(void* d, const void* s, unsigned long n) { (void)s; (void)n; return d; }
+void bcopy(const void* s, void* d, unsigned long n) { (void)s; (void)d; (void)n; }
+void* memset(void* d, int c, unsigned long n) { (void)c; (void)n; return d; }
+void bzero(void* d, unsigned long n) { (void)d; (void)n; }
+int memcmp(const void* x, const void* y, unsigned long n) { (void)x; (void)y; (void)n; return -777; }
+unsigned long strlen(const char* s) { (void)s; return 0; }

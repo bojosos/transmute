@@ -273,6 +273,13 @@ unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words
     const Xmm t2 = !exact ? ctx.temp_vec() : Xmm{};
     const Gp guard = !exact ? (counter != Gp::none ? counter : ctx.temp_gpr()) : Gp::none;
     const Gp out = m.extract ? ctx.write_gpr(m.wt) : ctx.temp_gpr();
+    // The destination too: allocated after the labels it could evict a dirty
+    // cached register there, a write-back retry that leaves the whole region
+    // without write-back (every vector result stored at once). Allocating it
+    // early is safe: dst is written only by the final MOVD, after every read
+    // of n, the counts and the mask (also when one of them is Vd: its host
+    // or its unchanged slot still holds the old value until then).
+    const Xmm dst = ctx.write_vec(m.rd);
     const auto fast = a.new_label(), done = a.new_label();
 
     if (!exact) {
@@ -319,8 +326,7 @@ unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words
         a.movmskps(out, t0);
     }
     a.bind(done);
-    const Xmm dst = ctx.write_vec(m.rd);   // every source is consumed
-    a.movd(dst, out);
+    a.movd(dst, out);   // every source is consumed
     ctx.note_vec_zero_above(m.rd, 32);
     return m.extract ? 4u : 3u;
 }

@@ -134,6 +134,22 @@ bool invalidate_engine_code(Engine& engine, std::uint64_t address, std::uint64_t
     }
 }
 
+// Optional engine capability: the calling guest thread opens (open = true) or
+// closes a JIT write window (pthread_jit_write_protect_np(0) / (1)). Engines
+// without it need no notice: they track guest code writes themselves.
+template <class Engine>
+void engine_jit_write_window(Engine& engine, bool open) {
+    if constexpr (requires { engine.jit_write_window(open); }) engine.jit_write_window(open);
+}
+
+// Optional engine capability: [copy, copy + size) was just filled with an
+// exact copy of the guest code at [source, source + size) (vm_remap of image
+// text), so the engine may reuse the source's translations there.
+template <class Engine>
+void engine_code_copy(Engine& engine, std::uint64_t copy, std::uint64_t source, std::uint64_t size) {
+    if constexpr (requires { engine.code_copy(copy, source, size); }) engine.code_copy(copy, source, size);
+}
+
 // Optional engine capability: TPIDR_EL0 of the calling guest thread (Darwin
 // user code leaves it unused; Alchemy keeps the thread's TLV table there).
 template <class Engine>
@@ -155,6 +171,14 @@ bool set_engine_thread_pointer(Engine& engine, std::uint64_t value) {
 template <class Engine>
 void mark_engine_call_integer_only(Engine& engine, std::uint64_t address) {
     if constexpr (requires { engine.set_guest_call_integer_only(address); }) engine.set_guest_call_integer_only(address);
+}
+
+// Optional engine capability: the synthetic call at `address` is libSystem's
+// `symbol`, untraced; an engine may run the pure memory/string functions
+// among them without their handler while no guest byte faults.
+template <class Engine>
+void mark_engine_call_leaf(Engine& engine, std::uint64_t address, std::string_view symbol) {
+    if constexpr (requires { engine.set_guest_call_leaf(address, symbol); }) engine.set_guest_call_leaf(address, symbol);
 }
 
 // ---- process stop (Darwin exit and fatal signals) ---------------------------

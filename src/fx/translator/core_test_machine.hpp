@@ -68,7 +68,7 @@ public:
     void reset();
 
     bool link = true;
-    bool inline_lookup = true;   // ctx->arena_base set: translated code inlines indirect lookups
+    bool inline_lookup = true;   // false: ctx->lookup_table never matches (every indirect branch exits)
     TranslateOptions options;
     std::vector<TranslatedRegion> regions;
     void set_helper(unsigned id, const void* fn) { helpers_[id] = fn; }

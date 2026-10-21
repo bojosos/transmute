@@ -61,14 +61,23 @@ class ImageSource final : public CodeSource {
 public:
     ImageSource(const pe::Image& image, std::vector<pe::Function> functions)
         : image_(image), base_(image.image_base()), functions_(std::move(functions)) {
-        for (const pe::Section& s : image.sections())
+        for (const pe::Section& s : image.sections()) {
             if (s.executable) executable_.push_back(s);
+            // Read-only data (.rdata: jump and label tables), for read_data.
+            constexpr std::uint32_t kRead = 0x40000000u, kWrite = 0x80000000u;
+            if (!s.executable && (s.characteristics & kRead) && !(s.characteristics & kWrite)) read_only_.push_back(s);
+        }
     }
 
-    bool read(std::uint64_t address, std::uint32_t& word) const override {
+    bool read(std::uint64_t address, std::uint32_t& word) const override { return read_from(executable_, address, word); }
+    bool read_data(std::uint64_t address, std::uint32_t& word) const override {
+        return read_from(executable_, address, word) || read_from(read_only_, address, word);
+    }
+
+    bool read_from(const std::vector<pe::Section>& sections, std::uint64_t address, std::uint32_t& word) const {
         std::uint32_t rva = 0;
         if (!to_rva(address, rva) || (rva & 3) != 0) return false;
-        for (const pe::Section& s : executable_) {
+        for (const pe::Section& s : sections) {
             if (rva >= s.rva && std::uint64_t{rva - s.rva} + 4 <= s.raw_size) {
                 std::memcpy(&word, image_.data() + s.raw_offset + (rva - s.rva), 4);
                 return true;
@@ -130,6 +139,7 @@ private:
     std::uint64_t base_;
     std::vector<pe::Function> functions_;  // sorted by begin, non-empty
     std::vector<pe::Section> executable_;
+    std::vector<pe::Section> read_only_;
     const std::vector<std::uint32_t>* static_roots_{};
     const AtomicBitmap* claimed_{};
     const AtomicBitmap* covered_{};

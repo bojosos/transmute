@@ -1,8 +1,9 @@
 ﻿// Differential tests for lowerings from the SIMD&FP cost audit (owner: neon):
 // 64-bit vector results that skip the upper-half zeroing when every source
 // is known zero above bit 64, and USHL/SSHL by register (vpsignd negation on
-// S lanes, the AVX2 vpsllvq/vpsrlvq sequence on D lanes). Each runs with the
-// new lowering and with TRANSMUTE_FX_NEON=nozero64,oldshl (knob override), at
+// S lanes, the AVX2 vpsllvq/vpsrlvq sequence on D lanes), and 16-bit lanes of
+// every register shift through the AVX2 dword variable shifts, PMULL .8B by PMULLW. Each runs with the
+// new lowering and with TRANSMUTE_FX_NEON=nozero64,oldshl,oldvarshift,oldpmull8 (knob override), at
 // every host feature level and in every harness configuration, including the
 // known-zero-upper context (claims derived from the start state).
 #include "fx/translator/emit_neon_internal.hpp"
@@ -16,7 +17,7 @@ using namespace transmute::fx::neon_test;
 
 namespace {
 
-constexpr int kOld = neon::neon_no_zero64 | neon::neon_old_shl;
+constexpr int kOld = neon::neon_no_zero64 | neon::neon_old_shl | neon::neon_old_var_shift | neon::neon_old_pmull8;
 
 template <class F> void for_both_lowerings(F&& body) {
     for (const int bits : {0, kOld}) {
@@ -103,4 +104,61 @@ FX_TEST(neon_lowering_register_shift_all_counts) {
     });
     std::printf("    %u words\n", words);
     print_stats("after register_shift_all_counts");
+}
+
+FX_TEST(neon_lowering_register_shift_h_lanes) {
+    unsigned words = 0;
+    for_both_lowerings([&] {
+        // SSHL/USHL, SQSHL/UQSHL, SRSHL/URSHL, SQRSHL/UQRSHL on .4H, .8H and
+        // scalar H (saturating forms): every count byte (-128..127) in some
+        // lane, garbage in the count's high bytes, boundary-biased values.
+        for (unsigned opc = 0x08; opc <= 0x0b; ++opc)
+            for (unsigned u = 0; u < 2; ++u)
+                for (const std::uint32_t base : {0x0e600400u, 0x4e600400u, 0x5e600400u}) {
+                    if (base == 0x5e600400u && (opc & 1) == 0) continue;   // scalar H: saturating forms only
+                    const unsigned lanes = base == 0x0e600400u ? 4 : 8;
+                    std::uint64_t state = base + opc * 2 + u;
+                    for (unsigned c0 = 0; c0 < 256; c0 += lanes) {
+                        for (const auto [rd, rn, rm] : {std::tuple{0u, 1u, 2u}, std::tuple{1u, 1u, 2u}, std::tuple{2u, 1u, 2u},
+                                                        std::tuple{3u, 2u, 2u}}) {
+                            auto ctx = special_context(rnd(state), 1);
+                            auto* bytes = reinterpret_cast<std::uint8_t*>(ctx.v[rm]);
+                            for (unsigned l = 0; l < 8; ++l) bytes[2 * l] = static_cast<std::uint8_t>(c0 + l % lanes);
+                            if (rnd(state) % 2) ctx.v[rn][1] = 0;
+                            const std::uint32_t w = base | (u << 29) | (rm << 16) | (opc << 11) | (rn << 5) | rd;
+                            if (!run_word(w, ctx, "h-lane register shift")) return;
+                            ++words;
+                        }
+                    }
+                }
+    });
+    std::printf("    %u words\n", words);
+    print_stats("after register_shift_h_lanes");
+}
+
+FX_TEST(neon_lowering_pmull8) {
+    unsigned words = 0;
+    for_both_lowerings([&] {
+        // PMULL and PMULL2 .8H from .8B/.16B: random and boundary bytes, aliasing.
+        std::uint64_t state = 0x9e11;
+        for (const std::uint32_t base : {0x0e20e000u, 0x4e20e000u})
+            for (unsigned s = 0; s < 64; ++s)
+                for (const auto [rd, rn, rm] : {std::tuple{0u, 1u, 2u}, std::tuple{1u, 1u, 2u}, std::tuple{2u, 1u, 2u},
+                                                std::tuple{3u, 4u, 4u}}) {
+                    auto ctx = special_context(rnd(state), 0);
+                    if (s < 16) {   // every byte value against every single bit and 0xff
+                        auto* bn = reinterpret_cast<std::uint8_t*>(ctx.v[rn]);
+                        auto* bm = reinterpret_cast<std::uint8_t*>(ctx.v[rm]);
+                        for (unsigned l = 0; l < 16; ++l) {
+                            bn[l] = static_cast<std::uint8_t>(s * 16 + l);
+                            bm[l] = static_cast<std::uint8_t>(l < 8 ? 1u << l : 0xffu - (l & 3));
+                        }
+                    }
+                    const std::uint32_t w = base | (rm << 16) | (rn << 5) | rd;
+                    if (!run_word(w, ctx, "pmull .8b")) return;
+                    ++words;
+                }
+    });
+    std::printf("    %u words\n", words);
+    print_stats("after pmull8");
 }

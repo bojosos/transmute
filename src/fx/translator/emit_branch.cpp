@@ -3,6 +3,7 @@
 
 #include "fx/runtime/runtime.hpp"   // lookup table encoding (constants only)
 
+#include <algorithm>
 #include <bit>
 
 namespace transmute::fx::core {
@@ -14,15 +15,13 @@ using x64::ptr;
 
 // Indirect branch to the guest address in rcx with the state flushed: the
 // runtime's stub_indirect lookup inlined (fx/runtime/runtime.hpp), so every
-// BR/BLR/RET-miss site has its own predicted `jmp`. Misses, misaligned
-// targets and contexts without arena_base take stub_indirect. Clobbers rax,
-// rdx, r8, r9 and EFLAGS.
+// BR/BLR/RET-miss site has its own predicted `jmp`. Misses and misaligned
+// targets store ctx->pc and take stub_indirect_live. A hit on an empty slot
+// (a target below 4 MiB) lands in the miss stub at arena offset 0, which
+// stores rcx as ctx->pc itself. Contexts without an inline lookup (tests)
+// give a table whose slots never match. Clobbers rax, rdx, r9 and EFLAGS.
 void RegionEmitter::emit_indirect_jump() {
     const auto stub = a_.new_label();
-    a_.mov(64, ctx_mem(offsetof(GuestContext, pc)), Gp::rcx);   // the miss path (and empty slots) read it
-    a_.mov(64, Gp::r8, ctx_mem(offsetof(GuestContext, arena_base)));
-    a_.test(64, Gp::r8, Gp::r8);
-    a_.jcc_short(Cond::e, stub);
     a_.test(8, Gp::rcx, 3);
     a_.jcc_short(Cond::ne, stub);
     a_.mov(64, Gp::rax, Gp::rcx);
@@ -38,9 +37,10 @@ void RegionEmitter::emit_indirect_jump() {
     a_.cmp(64, Gp::rax, Gp::r9);
     a_.jcc_short(Cond::ne, stub);
     a_.mov(32, Gp::rdx, Gp::rdx);
-    a_.add(64, Gp::rdx, Gp::r8);
+    a_.alu(x64::Alu::add, 64, Gp::rdx, ctx_mem(offsetof(GuestContext, arena_base)));
     a_.jmp(Gp::rdx);
     a_.bind(stub);
+    a_.mov(64, ctx_mem(offsetof(GuestContext, pc)), Gp::rcx);       // the miss path reads it
     a_.jmp(ctx_mem(offsetof(GuestContext, stub_indirect_live)));   // convention registers live
 }
 
@@ -131,13 +131,12 @@ void RegionEmitter::e_call(const PlanInst& pi) {
         return;
     }
     const bool indirect = d.kind == Kind::branch_link_reg;
+    // The target first (before x30 changes: BLR x30), while the register
+    // cache may still hold it in rax/rdx/r8.
+    if (indirect) take_value(Gp::rcx, val(d.rn));
     take(Gp::rax);
     take(Gp::rdx);
     take(Gp::r8);
-    if (indirect) {
-        take(Gp::rcx);
-        load(64, Gp::rcx, val(d.rn));   // target before x30 changes (BLR x30)
-    }
     materialize_state(flags_, false);
     flags_ = FlagsState::ctx;
     // x30 = return pc. Plan::cold_layout: straight into x30's pin (the RSB
@@ -182,7 +181,7 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
     materialize_state(flags_, false);   // clobbers rax only
     flags_ = FlagsState::ctx;
     load(64, Gp::rcx, val(pi.inst.rn));          // target
-    load(32, Gp::rdx, val(t.index_reg));         // index (UXTW)
+    if (!t.by_target) load(32, Gp::rdx, val(t.index_reg));   // index (UXTW)
     reset_cache(gc_);                            // clean (stored): the context holds every value
     reset_cache(vc_);
     forget_vec_zero();
@@ -194,6 +193,53 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
     auto& ht = host_tables_.emplace_back();
     ht.label = a_.new_label();
     ht.table = pi.table;
+    // One label per distinct target: in-region blocks (multiway edges), else a linkable direct exit.
+    const auto case_label = [&](std::uint32_t k) {
+        const auto target = plan_.table_targets[t.first + k];
+        return target >= 0 ? multiway_label(target)
+                           : add_stub(Stub::K::direct_exit, FlagsState::ctx, dirty, plan_.table_pcs[t.first + k], -1, -1);
+    };
+    if (t.by_target) {
+        // Target dispatch (LLVM tables): d = xN - lo selects host table slot
+        // d / 4 when d <= hi - lo and d is aligned; slots of case pcs hold
+        // their label, every other slot the fallback. The host table is dense
+        // (guest_rel empty: emit_host_tables), one int32 offset per slot.
+        std::uint64_t lo = ~0ULL, hi = 0;
+        for (std::uint32_t k = 0; k < t.count; ++k)
+            if (const auto pc = plan_.table_pcs[t.first + k]; (pc & 3) == 0) {
+                lo = std::min(lo, pc);
+                hi = std::max(hi, pc);
+            }
+        if (lo <= hi) {   // the plan bounds hi - lo (kMaxTargetSpan)
+            a_.mov(64, Gp::rax, Gp::rcx);
+            fixup_imm64(Gp::rdx, lo);
+            a_.sub(64, Gp::rax, Gp::rdx);
+            a_.cmp(64, Gp::rax, static_cast<std::int32_t>(hi - lo));
+            a_.jcc(Cond::a, generic);
+            a_.test(8, Gp::rax, 3);
+            a_.jcc(Cond::ne, generic);
+            a_.lea(64, Gp::r8, x64::rip(ht.label));
+            a_.movsx(64, Gp::r9, ptr(Gp::r8, Gp::rax, 1), 32);
+            a_.add(64, Gp::r9, Gp::r8);
+            a_.jmp(Gp::r9);
+            ht.entries.assign(static_cast<std::size_t>((hi - lo) / 4 + 1), generic);
+            for (std::uint32_t k = 0; k < t.count; ++k) {
+                const auto pc = plan_.table_pcs[t.first + k];
+                auto& slot = ht.entries[static_cast<std::size_t>((pc - lo) / 4)];
+                if ((pc & 3) == 0 && slot.id == generic.id) slot = case_label(k);
+            }
+        } else {
+            a_.jmp(generic);
+            ht.entries.assign(1, generic);
+        }
+        if (!cold) {
+            a_.bind(generic);
+            exit_pins(dirty);
+            emit_indirect_jump();   // rcx = target
+        }
+        core_counters().tables.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     a_.cmp(32, Gp::rdx, static_cast<std::int32_t>(t.count));
     a_.jcc(Cond::ae, generic);
     a_.lea(64, Gp::r8, x64::rip(ht.label));
@@ -205,8 +251,7 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
     a_.movsx(64, Gp::r9, ptr(Gp::r8, Gp::rdx, 8, 4), 32);
     a_.add(64, Gp::r9, Gp::r8);
     a_.jmp(Gp::r9);
-    // One label per distinct target: in-region blocks (multiway edges), else
-    // a linkable direct exit; unrepresentable entries take the fallback.
+    // Unrepresentable entries take the fallback.
     ht.entries.resize(t.count);
     ht.guest_rel.resize(t.count);
     for (std::uint32_t k = 0; k < t.count; ++k) {
@@ -225,9 +270,7 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
             ht.entries[k] = ht.entries[same];
             continue;
         }
-        const auto target = plan_.table_targets[t.first + k];
-        ht.entries[k] = target >= 0 ? multiway_label(target)
-                                    : add_stub(Stub::K::direct_exit, FlagsState::ctx, dirty, pc, -1, -1);
+        ht.entries[k] = case_label(k);
     }
     if (!cold) {
         a_.bind(generic);
@@ -248,11 +291,18 @@ x64::Label RegionEmitter::multiway_label(std::int32_t target) {
     return label_of(target);
 }
 
+// Index tables: {guest target - region start, host offset} per entry. Target
+// (dense) tables, guest_rel empty: one host offset per slot.
 void RegionEmitter::emit_host_tables() {
     for (auto& ht : host_tables_) {
-        a_.align(8);
+        const bool dense = ht.guest_rel.empty();
+        a_.align(dense ? 4 : 8);
         a_.bind(ht.label);
         ht.offset = static_cast<std::uint32_t>(a_.size());
+        if (dense) {
+            for (std::size_t k = 0; k < ht.entries.size(); ++k) a_.dd(0);   // host offset (patch_host_tables)
+            continue;
+        }
         for (const auto rel : ht.guest_rel) {
             a_.dd(static_cast<std::uint32_t>(rel));
             a_.dd(0);   // host offset (patch_host_tables)
@@ -261,11 +311,13 @@ void RegionEmitter::emit_host_tables() {
 }
 
 void RegionEmitter::patch_host_tables() {
-    for (const auto& ht : host_tables_)
+    for (const auto& ht : host_tables_) {
+        const std::size_t stride = ht.guest_rel.empty() ? 4 : 8, at = ht.guest_rel.empty() ? 0 : 4;
         for (std::size_t k = 0; k < ht.entries.size(); ++k) {
             const auto host = static_cast<std::int64_t>(a_.offset_of(ht.entries[k])) - static_cast<std::int64_t>(ht.offset);
-            a_.put32(ht.offset + 8 * k + 4, static_cast<std::uint32_t>(static_cast<std::int32_t>(host)));
+            a_.put32(ht.offset + stride * k + at, static_cast<std::uint32_t>(static_cast<std::int32_t>(host)));
         }
+    }
 }
 
 void RegionEmitter::e_indirect(const PlanInst& pi) {
@@ -290,8 +342,7 @@ void RegionEmitter::e_indirect(const PlanInst& pi) {
         if (!restored) target = v.r;
     }
     if (target == Gp::rcx) {
-        take(Gp::rcx);
-        load(64, Gp::rcx, val(d.rn));
+        take_value(Gp::rcx, val(d.rn));
     }
     materialize_state(flags_, false);
     flags_ = FlagsState::ctx;

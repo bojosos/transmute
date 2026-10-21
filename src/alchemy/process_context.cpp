@@ -286,11 +286,12 @@ std::uint64_t ProcessContext::install_function(std::string symbol,
     registration_audit::record_export(system_alias(library) ? libsystem : std::string_view(library), symbol, where,
         system_alias(library));
     const auto& prefixes = traced_call_prefixes();
-    if (!prefixes.empty() &&
+    const bool traced = !prefixes.empty() &&
         std::any_of(prefixes.begin(), prefixes.end(),
             [&](const std::string& prefix) { return prefix.empty() || (prefix.front() != '-' && symbol.starts_with(prefix)); }) &&
         std::none_of(prefixes.begin(), prefixes.end(),
-            [&](const std::string& prefix) { return prefix.size() > 1 && prefix.front() == '-' && symbol.starts_with(prefix.substr(1)); })) {
+            [&](const std::string& prefix) { return prefix.size() > 1 && prefix.front() == '-' && symbol.starts_with(prefix.substr(1)); });
+    if (traced) {
         handler = [this, inner = std::move(handler), name = symbol](transmute::CpuState& state, transmute::GuestMemory& memory) {
             char line[256];
             const auto process = static_cast<unsigned long long>(host::process::current_pid());
@@ -342,6 +343,10 @@ std::uint64_t ProcessContext::install_function(std::string symbol,
     if (library == libsystem || library == "/usr/lib/libobjc.A.dylib" || library == "alchemy.internal")
         if (std::find(integer_only.begin(), integer_only.end(), symbol) != integer_only.end())
             mark_engine_call_integer_only(engine_, address);
+    // libSystem's pure memory/string functions may skip their handler (and the
+    // fork-child check, which allows them) while no byte faults; a traced call
+    // keeps its trace.
+    if (library == libsystem && !traced) mark_engine_call_leaf(engine_, address, symbol);
     try {
         std::lock_guard lock(mutex_);
         callbacks_.push_back(address);

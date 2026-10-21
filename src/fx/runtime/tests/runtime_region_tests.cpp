@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <cstdio>
 #include <stdexcept>
 
 using namespace rtt;
@@ -693,6 +694,106 @@ FX_TEST(exit_references_follow_region_lifetimes) {
     }
 }
 
+// Thousands of exits wait for one target (V8 code calling a common builtin
+// trampoline). Each removal is O(1) through the exit's own list node, in any
+// order: from the middle of the pending list, while linked, and in reverse.
+// (Removal walked the target's list; an SMC kill of V8 code was quadratic.)
+FX_TEST(many_exits_to_one_target_are_removed_in_any_order) {
+    init();
+    constexpr unsigned kRegions = 4096;
+    GuestCode code({}, 0x20000);
+    const auto target = code.at(kRegions * 4 + 64);
+    const auto pc = [&](unsigned i) { return code.at(i * 4); };
+    for (unsigned i = 0; i < kRegions; ++i) {
+        set_region_factory(pc(i), [&, i](std::uint64_t) {
+            RegionBuilder b(pc(i));
+            b.entry(pc(i));
+            add_x0(b, 1);
+            b.return_via_x30();
+            b.direct_exit(target);
+            return b.finish();
+        });
+    }
+    set_region_factory(target, [&](std::uint64_t) {
+        RegionBuilder b(target);
+        b.entry(target);
+        add_x0(b, 10);
+        b.return_via_x30();
+        return b.finish();
+    });
+    std::size_t linked0 = 0;
+    const std::size_t pending0 = rt::exit_refs_for_tests(&linked0);
+    const std::uint64_t args[] = {0};
+    for (unsigned i = 0; i < kRegions; ++i) FX_REQUIRE(call_guest(pc(i), args) == 1u);
+    std::size_t linked = 0;
+    FX_CHECK_EQ(rt::exit_refs_for_tests(&linked), pending0 + kRegions);
+    const double t0 = now_ns();
+    for (unsigned i = 1; i < kRegions; i += 2) invalidate_guest_code(pc(i), 4);   // every other one
+    FX_CHECK_EQ(rt::exit_refs_for_tests(&linked), pending0 + kRegions / 2);
+    FX_CHECK_EQ(call_guest(target, args), 10u);   // links the survivors
+    FX_CHECK_EQ(rt::exit_refs_for_tests(&linked), pending0);
+    FX_CHECK_EQ(linked, linked0 + kRegions / 2);
+    for (unsigned i = 0; i < kRegions; i += 4) invalidate_guest_code(pc(i), 4);    // linked ones
+    FX_CHECK_EQ(rt::exit_refs_for_tests(&linked), pending0);
+    FX_CHECK_EQ(linked, linked0 + kRegions / 4);
+    invalidate_guest_code(target, 4);   // the rest wait again
+    FX_CHECK_EQ(rt::exit_refs_for_tests(&linked), pending0 + kRegions / 4);
+    FX_CHECK_EQ(linked, linked0);
+    for (unsigned i = kRegions; i-- > 0;)
+        if (i % 4 == 2) invalidate_guest_code(pc(i), 4);
+    FX_CHECK_EQ(rt::exit_refs_for_tests(&linked), pending0);
+    FX_CHECK_EQ(linked, linked0);
+    std::printf("  %u exits to one target removed in %.1f ms\n", kRegions, (now_ns() - t0) / 1e6);
+    for (unsigned i = 0; i < kRegions; ++i) set_region_factory(pc(i), nullptr);
+    set_region_factory(target, nullptr);
+}
+
+// An exact copy of code (V8's builtins remapped from image text into its code
+// range) gets its translations from the source's cache, relocated, while its
+// guest bytes equal the source's; its own translations are stored for the
+// source. A copy whose bytes changed is translated itself and not stored.
+FX_TEST(code_copy_uses_the_sources_cache_while_its_bytes_match) {
+    init();
+    set_mini_translator(true);
+    GuestCode source({movz(0, 1), kRet, movz(0, 2), kRet});
+    GuestCode copy({movz(0, 1), kRet, movz(0, 2), kRet});
+    register_guest_code_copy(copy.base(), source.base(), 0x4000);
+    // The "cached" region at the source adds 42: running it proves where it came from.
+    set_cached_region(source.at(0), [&](std::uint64_t pc) {
+        RegionBuilder b(pc);
+        b.entry(pc);
+        add_x0(b, 42);
+        b.return_via_x30();
+        return b.finish();
+    });
+    const std::uint64_t args[] = {0};
+    const auto s0 = runtime_stats();
+    const int translations0 = g_translate_calls.load();
+    FX_CHECK_EQ(call_guest(copy.at(0), args), 42u);
+    const auto s1 = runtime_stats();
+    FX_CHECK_EQ(s1.copy_cache_hits - s0.copy_cache_hits, 1u);
+    FX_CHECK_EQ(g_translate_calls.load(), translations0);
+    // No cached region at the source: translated in the copy, stored for the source.
+    const int copy_stores0 = g_cache_copy_stores.load();
+    FX_CHECK_EQ(call_guest(copy.at(2), args), 2u);
+    FX_CHECK_EQ(g_translate_calls.load(), translations0 + 1);
+    FX_CHECK_EQ(runtime_stats().copy_translations - s1.copy_translations, 1u);
+    FX_CHECK_EQ(g_cache_copy_stores.load(), copy_stores0 + 1);
+    // The copy changes: its bytes no longer match, so the source's region is
+    // not used and the copy's own translation is not stored.
+    copy.words()[0] = movz(0, 7);
+    invalidate_guest_code(copy.at(0), 16);   // also ends the pairing
+    register_guest_code_copy(copy.base(), source.base(), 0x4000);
+    const auto s2 = runtime_stats();
+    FX_CHECK_EQ(call_guest(copy.at(0), args), 7u);
+    FX_CHECK_EQ(runtime_stats().copy_cache_hits, s2.copy_cache_hits);
+    FX_CHECK_EQ(g_translate_calls.load(), translations0 + 2);
+    FX_CHECK_EQ(g_cache_copy_stores.load(), copy_stores0 + 1);
+    invalidate_guest_code(copy.base(), 0x4000);
+    set_cached_region(source.at(0), nullptr);
+    set_mini_translator(false);
+}
+
 FX_TEST(cached_region_on_a_newly_protected_page_is_looked_up_again) {
     init();
     // The cache hashed the guest bytes before the install write-protected
@@ -845,6 +946,72 @@ FX_TEST(host_callback_runs_from_translated_code_without_a_dispatcher_exit) {
     set_region_factory(callee, nullptr);
     set_region_factory(pm, nullptr);
     set_region_factory(target, nullptr);
+}
+
+namespace {
+int g_leaf_calls = 0;
+// Even x0: halves it (handled). Odd x0: declines, changing nothing.
+bool halve_even(GuestContext& ctx) {
+    ++g_leaf_calls;
+    if (ctx.x[0] & 1) return false;
+    ctx.x[0] /= 2;
+    return true;
+}
+} // namespace
+
+// register_host_leaf: the leaf runs from translated code without a dispatcher
+// exit and returns through the RSB; when it declines, the callback runs as a
+// register_host_callback entry would (ctx.pc = return address).
+FX_TEST(host_leaf_runs_or_falls_back_to_its_callback) {
+    init();
+    GuestCode code({});
+    const auto pm = code.at(0), cont = code.at(2), callee = code.at(16);
+    CallbackLog log;
+    register_host_leaf(callee, &halve_even, &host_callback, &log);
+    // M: bl callee; x0 += 100; ret.
+    set_region_factory(pm, [&](std::uint64_t) {
+        RegionBuilder b(pm);
+        b.entry(pm);
+        auto& a = b.as();
+        a.mov(64, Gp::rax, ptr(Gp::r15, x_disp(30)));
+        a.mov(64, ptr(Gp::r15, x_disp(19)), Gp::rax);
+        const Label continuation = a.new_label();
+        b.call(cont, continuation, callee);
+        a.bind(continuation);
+        b.entry(cont);
+        add_x0(b, 100);
+        a.mov(64, Gp::rax, ptr(Gp::r15, x_disp(19)));
+        a.mov(64, ptr(Gp::r15, x_disp(30)), Gp::rax);
+        b.ret(9);
+        b.cover(pm, pm + 12);
+        return b.finish();
+    });
+    GuestContext& ctx = ensure_thread_context();
+    g_leaf_calls = 0;
+    for (int run = 0; run < 3; ++run) {
+        const auto s0 = runtime_stats();
+        ctx.x[0] = 10;
+        call_guest_prepared(ctx, pm);
+        FX_CHECK_EQ(ctx.x[0], 105u);           // 10 / 2 + 100: the leaf
+        if (run > 0) {
+            const auto d = delta(s0, runtime_stats());
+            FX_CHECK_EQ(total_exits(d), 1u);   // only the return to the host
+        }
+    }
+    FX_CHECK_EQ(log.calls, 0);
+    ctx.x[0] = 5;
+    call_guest_prepared(ctx, pm);
+    FX_CHECK_EQ(ctx.x[0], 116u);              // 5 * 3 + 1 + 100: the callback
+    FX_CHECK_EQ(log.calls, 1);
+    FX_CHECK_EQ(log.pc_seen, cont);
+    FX_CHECK_EQ(g_leaf_calls, 4);
+    // Called directly from the host (call_guest): returns to x30 = kReturnToHostPc.
+    const std::uint64_t even[] = {8}, odd[] = {3};
+    FX_CHECK_EQ(call_guest(callee, even), 4u);
+    FX_CHECK_EQ(call_guest(callee, odd), 10u);
+    FX_CHECK_EQ(log.calls, 2);
+    unregister_host_entry(callee);
+    set_region_factory(pm, nullptr);
 }
 
 // ---- process exit ---------------------------------------------------------------------------------

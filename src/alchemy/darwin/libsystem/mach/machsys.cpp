@@ -622,10 +622,15 @@ void Machsys::install_libc() {
         s.x[0] = 0;
     });
     // MAP_JIT memory is mapped read-write-execute for every thread, so the
-    // per-thread write-protect toggle has no state to change: after (0) the
+    // per-thread write-protect toggle changes no protection: after (0) the
     // thread can write the memory, after (1) it can execute it, as the
-    // contract says. V8 toggles it around every code write.
-    raw(libsystem, "_pthread_jit_write_protect_np", [](CpuState&, GuestMemory&) {});
+    // contract says. V8 toggles it around every code write. The engine hears
+    // of it: inside a write window (0) a store to translated JIT code need not
+    // invalidate at once (the contract makes it visible only after
+    // sys_icache_invalidate), and closing the window (1) reconciles.
+    raw(libsystem, "_pthread_jit_write_protect_np", [this](CpuState& s, GuestMemory&) {
+        engine_jit_write_window(process.calling_engine(), s.x[0] == 0);
+    });
     // So the toggle is supported (as on Apple silicon): 1.
     raw(libsystem, "_pthread_jit_write_protect_supported_np", [](CpuState& s, GuestMemory&) { s.x[0] = 1; });
     // posix_spawn attributes with no Alchemy meaning are refused.

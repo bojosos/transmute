@@ -206,6 +206,21 @@ void pmull8(V& v, bool high, Xmm d, Xmm n, Xmm m) {
         v.un(op::pmovzxbw, x, n);
         v.un(op::pmovzxbw, y, m);
     }
+    if (neon_on(neon_old_pmull8)) {
+        // x * (y & 2^i) is x << i or 0: a single-bit multiplier never carries, so
+        // the integer products are the carry-less partial products.
+        for (unsigned i = 0; i < 8; ++i) {
+            v.op(op::pand, mask, y, splat16(static_cast<std::uint16_t>(1u << i)));
+            if (i == 0) {
+                v.op(op::pmullw, acc, x, mask, true);
+                continue;
+            }
+            v.op(op::pmullw, mask, x, mask, true);
+            if (i == 7) v.pxor(d, acc, mask);
+            else v.pxor(acc, acc, mask);
+        }
+        return;
+    }
     v.zero(acc);
     for (unsigned i = 0; i < 8; ++i) {
         const auto b = static_cast<std::uint16_t>(1u << i);

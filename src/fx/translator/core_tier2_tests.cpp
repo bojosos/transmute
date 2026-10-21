@@ -563,3 +563,53 @@ FX_TEST(core_tier2_interrupt_checks) {
     FX_CHECK(r.last.interrupts >= 1u);
     r.machine.options.optimize = -1;
 }
+
+// An interpreter's shape (fxbench interp_switch): a case falls into the
+// shared tail, which falls into the dispatch, and each of the three is a
+// loop header of its own. Every cycle passes the dispatch, so tier 2 keeps
+// only its check; deciding the headers first to last kept the tail's too.
+FX_TEST(core_tier2_interrupt_checks_header_chain) {
+    register_families();
+    DiffRunner r;
+    using namespace a64;
+    const std::vector<std::uint32_t> prog = {
+        movw(false, 2, 0, 40, 12),                       // 0 mov w12, #40
+        b(3),                                            // 1 b dispatch (4)
+        add_imm(true, false, false, 0, 0, 1),            // 2 case: add x0, x0, #1
+        add_imm(true, false, false, 1, 1, 3),            // 3 tail: add x1, x1, #3
+        add_imm(false, true, true, 12, 12, 1),           // 4 dispatch: subs w12, w12, #1
+        bcond(0, 5),                                     // 5 b.eq end (10)
+        tbz(true, 0, -4, 12),                            // 6 tbnz w12, #0, case (2)
+        tbz(true, 1, -4, 12),                            // 7 tbnz w12, #1, tail (3)
+        b(-4),                                           // 8 b dispatch (4)
+        nop(),                                           // 9
+        nop(),                                           // 10 end
+    };
+    auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
+    std::memcpy(program, prog.data(), prog.size() * 4);
+    const BufferCode code(r.code_base(), r.program_base() + prog.size() * 4);
+    const auto disp = static_cast<std::int32_t>(offsetof(GuestContext, interrupt_pending)) - static_cast<std::int32_t>(kContextBias);
+    const auto count_checks = [&](const TranslatedRegion& t) {
+        unsigned n = 0;
+        for (std::size_t k = 0; k + 8 <= t.code.size(); ++k) {
+            std::int32_t d;
+            std::memcpy(&d, t.code.data() + k + 3, 4);
+            n += t.code[k] == 0x41 && t.code[k + 1] == 0x83 && t.code[k + 2] == 0xbf && d == disp;
+        }
+        return n;
+    };
+    TranslateOptions plain, opt;
+    plain.optimize = 0;
+    opt.optimize = 1;
+    FX_CHECK_EQ(count_checks(translate_region(r.program_base(), code, plain)), 4u);   // start, case, tail, dispatch
+    FX_CHECK_EQ(count_checks(translate_region(r.program_base(), code, opt)), 2u);     // start, dispatch
+    for (const int optimize : {0, 1}) {
+        r.machine.options.optimize = optimize;
+        FX_CHECK(r.run(prog, r.context(7), "header chain"));
+        auto ctx = r.context(8);
+        ctx.interrupt_pending = 1;
+        FX_REQUIRE(r.run(prog, ctx, "interrupt in a header chain"));
+        FX_CHECK(r.last.interrupts >= 1u);
+    }
+    r.machine.options.optimize = -1;
+}

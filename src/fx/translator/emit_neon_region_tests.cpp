@@ -8,12 +8,14 @@
 #include "fx/translator/emit_fp.hpp"
 #include "fx/translator/emit_neon.hpp"
 #include "fx/translator/emit_neon_internal.hpp"
+#include "fx/translator/region_emitter.hpp"
 #include "fx/translator/translator.hpp"
 
 #include <windows.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -1084,4 +1086,531 @@ FX_TEST(neon_region_tier2_loop_tier_up) {
     FX_CHECK_EQ(runner.last.interprets, 0u);
     FX_CHECK(runner.last.tier_ups >= 1u);
     runner.machine.options = TranslateOptions{};
+}
+
+// ---- random NEON regions ------------------------------------------------------------
+// Random blocks of integer SIMD words from every data-processing group the neon
+// family decodes (random fields, a small register set so results feed later
+// instructions, pinned and unpinned registers), structure and single-element
+// loads/stores, lane moves to and from general registers, loops and forward
+// branches, against the interpreter: full guest state and memory, in optimized
+// (tier-2) and plain translations. Inputs mix random lanes with saturation edges.
+// NEON_RANDOM_PROGRAMS / NEON_RANDOM_SEED scale it, NEON_RANDOM_TRACE prints each
+// program, NEON_RANDOM_ONLY=<i> runs program i translated-only first (crashes).
+
+namespace {
+namespace rn {
+
+struct Group {
+    std::uint32_t mask, value;
+};
+// emit_neon_dispatch.cpp dispatch_data, in order.
+constexpr Group kGroups[] = {
+    {0x9f200400u, 0x0e200400u}, {0x9f200c00u, 0x0e200000u}, {0x9f3e0c00u, 0x0e200800u}, {0x9f3e0c00u, 0x0e300800u},
+    {0x9fe08400u, 0x0e000400u}, {0xbfe08c00u, 0x0e000000u}, {0xbf208c00u, 0x0e000800u}, {0xbfe08400u, 0x2e000000u},
+    {0x9f208400u, 0x0e008400u}, {0x9ff80400u, 0x0f000400u}, {0x9f800400u, 0x0f000400u}, {0x9f000400u, 0x0f000000u},
+    {0xdf200400u, 0x5e200400u}, {0xdf200c00u, 0x5e200000u}, {0xdf208400u, 0x5e008400u}, {0xdf3e0c00u, 0x5e200800u},
+    {0xdf3e0c00u, 0x5e300800u}, {0xdfe08400u, 0x5e000400u}, {0xdf800400u, 0x5f000400u}, {0xdf000400u, 0x5f000000u},
+};
+
+// General registers a generated word may write: not x0 (loop counter), x12/x14
+// (register strides), x16/x17 (bases), x30, SP.
+constexpr std::uint32_t kGprWritable = (0x0000fffeu & ~((1u << 12) | (1u << 14))) | (0x1fffu << 18);
+
+struct Gen {
+    coretest::Rng& rng;
+    unsigned base, span;
+    unsigned reg() { return (base + rng.below(span)) & 31u; }
+
+    // A data-processing word handled by the neon family (not fp), accepted by the
+    // oracle, writing no reserved general register.
+    std::uint32_t data() {
+        for (;;) {
+            const auto& g = kGroups[rng.below(static_cast<unsigned>(std::size(kGroups)))];
+            std::uint32_t w = g.value | (static_cast<std::uint32_t>(rng.next()) & ~g.mask);
+            w = (w & ~0x3ffu) | (reg() << 5) | reg();
+            // Rm (bits 20:16) for the three-register groups and TBL; others keep their random fields.
+            if (g.value == 0x0e200400u || g.value == 0x0e200000u || g.value == 0x0e008400u || g.value == 0x5e200400u ||
+                g.value == 0x5e200000u || g.value == 0x5e008400u || g.value == 0x0e000800u || g.value == 0x2e000000u ||
+                g.value == 0x0e000000u)
+                w = (w & ~(31u << 16)) | (reg() << 16);
+            InstructionUse use{}, fuse{};
+            if (!describe_neon(w, use) || fp_describe(w, fuse)) continue;
+            if (use.gpr_write & ~kGprWritable) continue;
+            // The oracle's UQRSHRN #1 from 64-bit lanes overflows (NOTES_NEON.md).
+            if ((w & 0xafbffc00u) == 0x2f3f9c00u) continue;   // vector and scalar
+            GuestContext probe{};
+            if (!testing::oracle_step(probe, w)) continue;
+            return w;
+        }
+    }
+
+    // A SIMD&FP load or store from x16/x17: no offset, unsigned or signed
+    // immediate offsets, pre/post-index by immediate, post-index by register
+    // (x12: 1..4, x14: 0..255) and register offsets.
+    std::uint32_t memory() {
+        const unsigned rn = 16 + rng.below(2);
+        const unsigned stride = rng.chance(50) ? 12u : 14u;
+        for (;;) {
+            std::uint32_t w;
+            switch (rng.below(7)) {
+            case 0: {   // LD1-LD4 / ST1-ST4 multiple structures
+                static constexpr unsigned kOpc[] = {0x0, 0x2, 0x4, 0x6, 0x7, 0x8, 0xa};
+                w = 0x0c000000u | (rng.below(2) << 30) | (rng.below(2) << 22) | (kOpc[rng.below(7)] << 12) |
+                    (rng.below(4) << 10) | (rn << 5) | reg();
+                if (rng.chance(60)) w |= 0x00800000u | ((rng.chance(50) ? 31u : stride) << 16);   // post-index
+                break;
+            }
+            case 1: {   // single structure (and LDnR)
+                w = 0x0d000000u | (rng.below(2) << 30) | (rng.below(2) << 22) | (rng.below(2) << 21) |
+                    (rng.below(8) << 13) | (rng.below(2) << 12) | (rng.below(4) << 10) | (rn << 5) | reg();
+                if (rng.chance(60)) w |= 0x00800000u | ((rng.chance(50) ? 31u : stride) << 16);
+                break;
+            }
+            case 2:
+                w = vf::ldst_uimm(rng.below(5), rng.chance(60), rng.below(32), rn, reg());
+                break;
+            case 3: {   // LDUR/STUR, or pre/post-index (bits 11:10 = 01 post, 11 pre)
+                const int imm9 = static_cast<int>(rng.below(512)) - 256;
+                w = vf::ldst_unscaled(rng.below(5), rng.chance(60), imm9, rn, reg());
+                const unsigned mode = rng.below(3);
+                if (mode) w |= (mode == 1 ? 1u : 3u) << 10;
+                break;
+            }
+            case 4: {   // register offset: LSL #0/#size or SXTW/UXTW of x12/x14
+                static constexpr unsigned kOption[] = {2, 3, 6, 7};   // UXTW LSL SXTW SXTX
+                w = vf::ldst_reg(rng.below(5), rng.chance(60), stride, kOption[rng.below(4)], rng.chance(50), rn, reg());
+                break;
+            }
+            default: {   // LDP/STP (offset, pre-index, post-index) and LDNP/STNP
+                const unsigned rt = reg(), rt2 = reg();
+                const bool load = rng.chance(60);
+                if (load && rt == rt2) continue;   // CONSTRAINED UNPREDICTABLE
+                static constexpr unsigned kMode[] = {0, 1, 2, 3};   // non-temporal, post, offset, pre
+                w = vf::ldst_pair(rng.below(3), kMode[rng.below(4)], load, static_cast<int>(rng.below(32)) - 16, rt2, rn, rt);
+                break;
+            }
+            }
+            InstructionUse use{};
+            if (!describe_vector_memory(w, use)) continue;
+            if (use.gpr_write & ~kGprWritable & ~(1u << rn)) continue;
+            alignas(16) static std::uint8_t scratch[4096];
+            GuestContext probe{};
+            probe.x[16] = probe.x[17] = reinterpret_cast<std::uint64_t>(scratch) + 2048;
+            probe.x[12] = 4;
+            probe.x[14] = 255;
+            if (!testing::oracle_step(probe, w)) continue;
+            return w;
+        }
+    }
+};
+
+std::vector<std::uint32_t> make_program(coretest::Rng& rng) {
+    std::vector<std::uint32_t> w;
+    std::vector<std::size_t> branches;
+    const bool loop = rng.chance(40);
+    if (loop) w.push_back(movz_x(0, 3));
+    const auto body = w.size();
+    if (loop) w.push_back(subs_x_imm(0, 0, 1));
+    Gen g{rng, rng.below(32), rng.chance(60) ? 5u : 12u + rng.below(21)};
+    const unsigned n = 6 + rng.below(30);
+    for (unsigned i = 0; i < n; ++i) {
+        const unsigned kind = rng.below(100);
+        if (kind < 72) {
+            w.push_back(g.data());
+        } else if (kind < 90) {
+            w.push_back(g.memory());
+        } else if (kind < 94) {
+            w.push_back(ta::mov16b(g.reg(), g.reg()));
+        } else if (i + 3 < n) {
+            branches.push_back(w.size());
+            w.push_back(mf::cbz_x(1 + rng.below(6), 2 + static_cast<int>(rng.below(3))));
+        }
+    }
+    if (loop) {
+        w.push_back(0xf100001fu);   // cmp x0, #0
+        w.push_back(b_cond(kNe, -static_cast<int>(w.size() - body)));
+    }
+    for (const auto k : branches) {
+        const auto room = static_cast<std::uint32_t>(w.size() - k);
+        const auto off = (w[k] >> 5) & 0x7ffffu;
+        if (off > room) w[k] = (w[k] & ~(0x7ffffu << 5)) | (room << 5);
+    }
+    return w;
+}
+
+void edge_lanes(GuestContext& ctx, coretest::Rng& rng) {
+    static constexpr std::uint64_t kEdges[] = {
+        0, ~0ull, 0x8000000000000000ull, 0x7fffffffffffffffull, 0x8000000080000000ull, 0x7fffffff7fffffffull,
+        0x8000800080008000ull, 0x7fff7fff7fff7fffull, 0x8080808080808080ull, 0x7f7f7f7f7f7f7f7full,
+        0x0001000100010001ull, 0xffff0000ffff0000ull, 0x00000000ffffffffull, 0x0f0e0d0c0b0a0908ull,
+        0x1f1e1d1c13121110ull, 0x00ff00ff00ff00ffull,
+    };
+    for (unsigned r = 0; r < 32; ++r)
+        for (unsigned h = 0; h < 2; ++h)
+            if (rng.chance(30)) ctx.v[r][h] = kEdges[rng.below(static_cast<unsigned>(std::size(kEdges)))];
+    for (unsigned r = 1; r < 16; ++r)   // x12 and x14 stay small strides
+        if (r != 12 && r != 14 && rng.chance(30)) ctx.x[r] = kEdges[rng.below(static_cast<unsigned>(std::size(kEdges)))];
+}
+
+} // namespace rn
+} // namespace
+
+FX_TEST(neon_region_random_differential) {
+    ensure_registered();
+    DiffRunner runner;
+    // Random immediates (MOVI, pool constants) can look like image addresses to
+    // the relocation audit; the semantics are what this test checks.
+    runner.check_relocatable = false;
+    const char* env = std::getenv("NEON_RANDOM_PROGRAMS");
+    const unsigned programs = env ? static_cast<unsigned>(std::strtoul(env, nullptr, 10)) : 1500u;
+    const char* seed_env = std::getenv("NEON_RANDOM_SEED");
+    coretest::Rng rng(seed_env ? std::strtoull(seed_env, nullptr, 10) : 20261020u);
+    unsigned failures = 0, interpreted = 0;
+    for (unsigned i = 0; i < programs && failures < 6; ++i) {
+        const auto words = rn::make_program(rng);
+        static const bool trace = std::getenv("NEON_RANDOM_TRACE") != nullptr;
+        if (trace) {
+            std::printf("program %u:%s\n", i, ta::hex(words).c_str());
+            std::fflush(stdout);
+        }
+        auto ctx = runner.context(990000 + i);
+        rn::edge_lanes(ctx, rng);
+        for (unsigned g = 1; g < 7; ++g) ctx.x[g] &= 1;   // CBZ takes both ways
+        if (const char* only = std::getenv("NEON_RANDOM_ONLY")) {   // debugging: one program, translated run first
+            if (std::strtoul(only, nullptr, 10) != i) continue;
+            runner.machine.options.optimize = 1;
+            std::printf("translated: %d\n", runner.run_translated(words, ctx) ? 1 : 0);
+            std::fflush(stdout);
+        }
+        for (const int optimize : {1, 0}) {
+            runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+            // Quiet run: DiffRunner compares only general registers and memory without
+            // reporting, so the vector registers are compared here.
+            const auto fails = [&](const std::vector<std::uint32_t>& program) {
+                runner.report = false;
+                runner.last = {};
+                const bool equal = runner.run(program, ctx, "");
+                runner.report = true;
+                if (!runner.last.ok || runner.expected.pc != runner.actual.pc) return false;   // oracle or run failed
+                return !equal || std::memcmp(runner.expected.v, runner.actual.v, sizeof runner.expected.v) != 0;
+            };
+            if (fails(words)) {
+                // Minimize: replace words with NOPs (branch offsets stay valid) while it still fails.
+                auto small = words;
+                for (std::size_t k = 0; k < small.size(); ++k) {
+                    const auto keep = small[k];
+                    if (keep == 0xd503201fu) continue;
+                    small[k] = 0xd503201fu;
+                    if (!fails(small)) small[k] = keep;
+                }
+                runner.run(small, ctx, "random neon" + std::string(optimize ? " opt" : " plain") + " (minimized)" +
+                                           ta::hex(small) + "; full" + ta::hex(words));
+                ++failures;
+                break;
+            }
+            if (!runner.last.ok || runner.expected.pc != runner.actual.pc) {   // report it as it is
+                runner.run(words, ctx, "random neon" + std::string(optimize ? " opt" : " plain") + ta::hex(words));
+                ++failures;
+                break;
+            }
+            interpreted += runner.last.interprets != 0;
+        }
+    }
+    runner.machine.options.optimize = -1;
+    std::printf("    %u programs, %u runs with interpreted words\n", programs, interpreted);
+}
+
+// ---- zero-above facts across labels (Plan::vzero_join) ---------------------------------------
+// A block starts with the facts all its predecessors agree on: forward
+// predecessors from this pass, back edges from tier 2's pass 1. Loop-carried
+// scalar FP values then need no upper-lane zeroing in the loop body; a back
+// edge that leaves garbage above the scalar (fp_region_loop_resets_upper_lane_knowledge,
+// the random programs below) keeps the zeroing.
+
+namespace {
+namespace vz {
+
+constexpr std::uint32_t fp3(std::uint32_t base, unsigned d, unsigned n, unsigned m) {
+    return base | (m << 16) | (n << 5) | d;
+}
+constexpr std::uint32_t fp2(std::uint32_t base, unsigned d, unsigned n) { return base | (n << 5) | d; }
+constexpr std::uint32_t kFaddS = 0x1e202800u, kFsubS = 0x1e203800u, kFmulS = 0x1e200800u, kFmaxS = 0x1e204800u,
+                        kFminS = 0x1e205800u, kFmaxnmS = 0x1e206800u, kFminnmS = 0x1e207800u, kFaddD = 0x1e602800u,
+                        kFmulD = 0x1e600800u, kFabsS = 0x1e20c000u, kFnegS = 0x1e214000u, kFmovS = 0x1e204000u,
+                        kScvtfSW = 0x1e220000u, kFcvtDS = 0x1e22c000u, kFcvtSD = 0x1e624000u, kFaddV4s = 0x4e20d400u,
+                        kFaddV2s = 0x0e20d400u;
+constexpr std::uint32_t fmov_imm_s(unsigned d, unsigned imm8) { return 0x1e201000u | (imm8 << 13) | d; }
+constexpr std::uint32_t ins_s(unsigned d, unsigned lane, unsigned n) {
+    return 0x4e001c00u | (((lane << 3) | 4u) << 16) | (n << 5) | d;
+}
+
+// vinsertps xmm, xmm, xmm, 0x0e (VEX.128.66.0F3A 21 /r ib): the scalar upper-lane zeroing.
+unsigned count_zeroing(const std::vector<std::uint8_t>& code, std::size_t hot) {
+    unsigned n = 0;
+    for (std::size_t k = 0; k + 5 < hot && k + 5 < code.size(); ++k)
+        n += code[k] == 0xc4 && (code[k + 1] & 0x1f) == 0x03 && code[k + 3] == 0x21 && (code[k + 4] & 0xc0) == 0xc0 &&
+             code[k + 5] == 0x0e;
+    return n;
+}
+
+bool has_nan(const GuestContext& c) {
+    for (unsigned r = 0; r < 32; ++r)
+        for (unsigned h = 0; h < 2; ++h)
+            for (unsigned l = 0; l < 2; ++l) {
+                const auto bits = static_cast<std::uint32_t>(c.v[r][h] >> (32 * l));
+                if ((bits & 0x7f800000u) == 0x7f800000u) return true;   // NaN or infinity (a double's top half too)
+            }
+    return false;
+}
+
+// Finite floats in every lane and in x1-x3 (INS sources); x4-x6 small integers (SCVTF).
+void finite_inputs(GuestContext& ctx, coretest::Rng& rng) {
+    const auto f = [&] {
+        const float v = (static_cast<float>(rng.below(4000)) - 2000.0f) / 256.0f;
+        std::uint32_t b;
+        std::memcpy(&b, &v, 4);
+        return b;
+    };
+    for (unsigned r = 0; r < 32; ++r)
+        for (unsigned h = 0; h < 2; ++h) ctx.v[r][h] = f() | (std::uint64_t{f()} << 32);
+    for (unsigned r = 1; r <= 3; ++r) ctx.x[r] = f();
+    for (unsigned r = 4; r <= 6; ++r) ctx.x[r] = rng.below(200);
+    ctx.fpcr = 0;
+    ctx.fpsr = 0;
+}
+
+std::vector<std::uint32_t> fp_program(coretest::Rng& rng) {
+    std::vector<std::uint32_t> w;
+    const auto reg = [&] { return rng.below(8); };
+    const auto op = [&] {
+        switch (rng.below(16)) {
+        case 0: return fp3(kFaddS, reg(), reg(), reg());
+        case 1: return fp3(kFsubS, reg(), reg(), reg());
+        case 2: return fp3(kFmulS, reg(), reg(), reg());
+        // Min/max in double precision: the oracle's single-precision forms
+        // leak source bits 63:32 into the result (NOTES_FP.md).
+        case 3: return fp3(kFmaxS | 0x00400000u, reg(), reg(), reg());
+        case 4: return fp3(kFminnmS | 0x00400000u, reg(), reg(), reg());
+        case 5: return fp3(kFmaxnmS | 0x00400000u, reg(), reg(), reg());
+        case 6: return fp3(kFminS | 0x00400000u, reg(), reg(), reg());
+        case 7: return fp2(rng.chance(50) ? kFabsS : kFnegS, reg(), reg());
+        case 8: return fp2(kFmovS, reg(), reg());
+        case 9: return fp2(kScvtfSW, reg(), 4 + rng.below(3));
+        case 10: return fp2(rng.chance(50) ? kFcvtDS : kFcvtSD, reg(), reg());
+        case 11: return fp3(rng.chance(50) ? kFaddD : kFmulD, reg(), reg(), reg());
+        case 12: return ins_s(reg(), rng.below(4), 1 + rng.below(3));   // garbage above the scalar
+        case 13: return fp3(rng.chance(50) ? kFaddV4s : kFaddV2s, reg(), reg(), reg());
+        case 14: return ta::mov16b(reg(), reg());
+        default: return fmov_imm_s(reg(), 0x60u + rng.below(32));
+        }
+    };
+    for (unsigned i = rng.below(4); i > 0; --i) w.push_back(op());   // preheader
+    const bool loop = rng.chance(70);
+    if (loop) w.push_back(movz_x(0, 3));
+    const auto body = w.size();
+    if (loop) w.push_back(subs_x_imm(0, 0, 1));
+    std::vector<std::size_t> branches;
+    const unsigned n = 4 + rng.below(16);
+    for (unsigned i = 0; i < n; ++i) {
+        if (i + 3 < n && rng.chance(12)) {
+            branches.push_back(w.size());
+            w.push_back(mf::cbz_x(4 + rng.below(3), 2 + static_cast<int>(rng.below(3))));
+        } else {
+            w.push_back(op());
+        }
+    }
+    if (loop) {
+        w.push_back(0xf100001fu);   // cmp x0, #0
+        w.push_back(b_cond(kNe, -static_cast<int>(w.size() - body)));
+    }
+    for (const auto k : branches) {
+        const auto room = static_cast<std::uint32_t>(w.size() - k);
+        const auto off = (w[k] >> 5) & 0x7ffffu;
+        if (off > room) w[k] = (w[k] & ~(0x7ffffu << 5)) | (room << 5);
+    }
+    return w;
+}
+
+struct OverrideGuard {
+    core::PlanOverrides o{};
+    explicit OverrideGuard(bool join) {
+        o = core::default_plan_overrides();
+        o.no_vzero_join = !join;
+        core::set_overrides_for_testing(&o);
+    }
+    ~OverrideGuard() { core::set_overrides_for_testing(nullptr); }
+};
+
+} // namespace vz
+} // namespace
+
+FX_TEST(fp_region_vzero_join_loop_needs_no_zeroing) {
+    using namespace vz;
+    ensure_registered();
+    if (!fp_features().avx) return;   // the count looks for the VEX zeroing
+    // s0 and s1 are known zero above the scalar before the loop (FMOV) and on
+    // the back edge (scalar results): the loop body needs no zeroing.
+    // s5 is loop-invariant (FMOV before the loop, never written in it): its
+    // fact needs the fixpoint over the back edge (vzero_solve).
+    const std::vector<std::uint32_t> w{
+        movz_x(0, 50), fmov_imm_s(0, 0x70), fmov_imm_s(1, 0x60), fmov_imm_s(5, 0x78),
+        fp3(kFaddS, 0, 0, 1),   // loop: fadd s0, s0, s1
+        fp3(kFmulS, 2, 0, 1),   //       fmul s2, s0, s1
+        fp3(kFsubS, 0, 2, 1),   //       fsub s0, s2, s1
+        fp3(kFmaxnmS, 3, 0, 2), //       fmaxnm s3, s0, s2
+        fp3(kFsubS, 4, 5, 3),   //       fsub s4, s5, s3 (invariant first source)
+        subs_x_imm(0, 0, 1), b_cond(kNe, -6),
+    };
+    unsigned zeroing[2] = {};
+    for (const bool join : {true, false}) {
+        OverrideGuard guard(join);
+        for (const int optimize : {1, 0}) {
+            DiffRunner runner;
+            runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+            auto ctx = runner.context(7100 + optimize);
+            FX_REQUIRE(runner.run(w, ctx, std::string("vzero join loop") + (join ? " join" : " nojoin") + (optimize ? " opt" : " plain")));
+            FX_CHECK_EQ(runner.last.interprets, 0u);
+            if (optimize)
+                for (const auto& r : runner.machine.regions)
+                    zeroing[join ? 0 : 1] += count_zeroing(r.code, r.stats.hot_bytes ? r.stats.hot_bytes : r.code.size());
+        }
+    }
+    std::printf("    upper-lane zeroing in the tier-2 loop: join %u, no join %u\n", zeroing[0], zeroing[1]);
+    FX_CHECK(zeroing[0] < zeroing[1]);
+    FX_CHECK_EQ(zeroing[0], 0u);
+}
+
+FX_TEST(fp_region_vzero_join_random_differential) {
+    using namespace vz;
+    ensure_registered();
+    const char* env = std::getenv("VZERO_RANDOM_PROGRAMS");
+    const unsigned programs = env ? static_cast<unsigned>(std::strtoul(env, nullptr, 10)) : 1500u;
+    coretest::Rng rng(20261021);
+    unsigned failures = 0, nan_skipped = 0;
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    for (unsigned i = 0; i < programs && failures < 6; ++i) {
+        const auto words = fp_program(rng);
+        auto ctx = runner.context(720000 + i);
+        finite_inputs(ctx, rng);
+        for (const int optimize : {1, 0}) {
+            runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+            runner.report = false;
+            runner.last = {};
+            const bool equal = runner.run(words, ctx, "");
+            runner.report = true;
+            const bool ran = runner.last.ok && runner.expected.pc == runner.actual.pc;
+            const bool same = ran && equal && std::memcmp(runner.expected.v, runner.actual.v, sizeof runner.expected.v) == 0;
+            if (same) continue;
+            if (ran && (has_nan(runner.expected) || has_nan(runner.actual))) {   // NaN payloads are host policy
+                ++nan_skipped;
+                continue;
+            }
+            runner.run(words, ctx, "vzero join random" + std::string(optimize ? " opt" : " plain") + ta::hex(words));
+            ++failures;
+            break;
+        }
+    }
+    runner.machine.options.optimize = -1;
+    std::printf("    %u programs, %u skipped (NaN or infinity)\n", programs, nan_skipped);
+}
+
+// The mask reduction's general path has internal labels: every register it
+// writes must be allocated before them. Allocating Vd after the labels could
+// evict a dirty cached register there, which is a write-back retry and makes
+// the whole region write-through (every vector result stored at once): seen
+// in the hottest region of the Cycles render. Pinned idiom sources, dirty
+// unpinned registers right before the idiom, inline guard (sources from the
+// context): no retry, and the same state as the interpreter.
+FX_TEST(neon_region_mask_reduce_no_writeback_retry) {
+    using namespace mf;
+    ensure_registered();
+    DiffRunner runner;
+    unsigned variants = 0;
+    // form 0: AND Vd, Vn, Vm; 1: AND Vd, Vd, Vm (as in the render); 2: USHR #31.
+    // Vd (v28) is cold (only in the context); the mask and counts are pinned or cold.
+    for (unsigned dirty = 0; dirty <= 8; ++dirty)
+        for (unsigned form = 0; form < 3; ++form)
+            for (const bool pinned_sources : {true, false}) {
+            const unsigned rd = 28, rn = form == 1 ? 28u : 21u;
+            std::vector<std::uint32_t> w{movz_x(0, 4)};
+            // loop: the idiom's sources (or not) and more registers are used often (pins)
+            const auto body = w.size();
+            for (unsigned rep = 0; rep < 3; ++rep) {
+                for (unsigned r : {0u, 1u, 2u, 3u, 4u, 5u, 6u}) w.push_back(ta::add4s(r, r, r));
+                if (pinned_sources)
+                    for (unsigned r : {21u, 22u, 23u}) w.push_back(ta::add4s(9, r, r));   // read, not written
+                else
+                    for (unsigned r : {7u, 8u, 9u}) w.push_back(ta::add4s(r, r, r));
+            }
+            for (unsigned k = 0; k < dirty; ++k) w.push_back(ta::add4s(10 + k, 10 + k, 0));   // dirty, unpinned
+            w.push_back(form == 2 ? ushr31(rd, rn) : and16b(rd, rn, 22));
+            w.push_back(ushl4s(rd, rd, 23));
+            w.push_back(addv4s(rd, rd));
+            w.push_back(fmov_ws(13, rd));
+            for (unsigned k = 0; k < dirty; ++k) w.push_back(ta::add4s(10 + k, 10 + k, 10 + k));   // still live
+            w.push_back(subs_x_imm(0, 0, 1));
+            w.push_back(b_cond(kNe, -static_cast<int>(w.size() - body)));
+            for (const int optimize : {1, 0}) {
+                runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+                auto ctx = runner.context(5300 + dirty * 8 + form * 2 + (pinned_sources ? 1 : 0));
+                ctx.v[23][0] = 0x0000000100000000ull;   // {0,1,2,3}: the short path is taken at run time
+                ctx.v[23][1] = 0x0000000300000002ull;
+                const auto before = core::core_counters().retries.load();
+                const std::string label = "mask reduce, " + std::to_string(dirty) + " dirty, form " + std::to_string(form) +
+                                          (pinned_sources ? " pinned" : " cold") + (optimize ? " opt" : " plain");
+                if (!runner.run(w, ctx, label)) return;
+                FX_CHECK_EQ(runner.last.interprets, 0u);
+                if (core::core_counters().retries.load() != before)
+                    testing::report_failure(__FILE__, __LINE__, label + ": the translation retried");
+                ++variants;
+            }
+        }
+    runner.machine.options.optimize = -1;
+    std::printf("    %u variants\n", variants);
+}
+
+// LD3/LD4/ST3/ST4 beside 10 pinned vector registers: the structure lowerings fit
+// the 6 XMM registers left (LD4 Q needed 10 before). Running out of XMM
+// registers retries the whole region with 4 pins (core_translator.cpp).
+FX_TEST(neon_region_structure_access_with_pins_no_retry) {
+    ensure_registered();
+    struct RestoreKnobs { ~RestoreKnobs() { neon::neon_set_knobs_for_testing(-1); } } restore;
+    DiffRunner runner;
+    unsigned retried[2] = {};
+    for (const int knobs : {0, static_cast<int>(neon::neon_old_struct)}) {
+        neon::neon_set_knobs_for_testing(knobs);
+        for (unsigned form = 0; form < 8; ++form)
+            for (const unsigned size : {0u, 1u, 2u}) {
+                // ld4 Q, ld4 D, ld3 Q, st4 Q, st4 D, ld2 Q, st3 Q, st3 D into v16.. (cold), base x16, post-index by the size.
+                static constexpr std::uint32_t kForms[] = {0x4cdf0000u, 0x0cdf0000u, 0x4cdf4000u, 0x4c9f0000u, 0x0c9f0000u,
+                                                           0x4cdf8000u, 0x4c9f4000u, 0x0c9f4000u};
+                std::vector<std::uint32_t> w{movz_x(0, 3)};
+                const auto body = w.size();
+                for (unsigned rep = 0; rep < 3; ++rep)
+                    for (unsigned r = 0; r < 10; ++r) w.push_back(ta::add4s(r, r, (r + 1) % 10));   // pins
+                w.push_back(kForms[form] | (size << 10) | (16u << 5) | 16u);
+                w.push_back(ta::add4s(0, 16, 17));
+                w.push_back(subs_x_imm(0, 0, 1));
+                w.push_back(b_cond(kNe, -static_cast<int>(w.size() - body)));
+                for (const int optimize : {1, 0}) {
+                    runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+                    auto ctx = runner.context(6600 + form * 8 + size);
+                    const auto before = core::core_counters().retries.load();
+                    if (!runner.run(w, ctx, "structure with pins form " + std::to_string(form) + " size " + std::to_string(size)))
+                        return;
+                    FX_CHECK_EQ(runner.last.interprets, 0u);
+                    const bool again = core::core_counters().retries.load() != before;
+                    retried[knobs ? 1 : 0] += again;
+                    if (again && !knobs)
+                        testing::report_failure(__FILE__, __LINE__, "structure form " + std::to_string(form) + " size " +
+                                                                        std::to_string(size) + (optimize ? " opt" : " plain") +
+                                                                        ": the translation retried");
+                }
+            }
+    }
+    runner.machine.options.optimize = -1;
+    std::printf("    translations that retried: %u (old lowering %u)\n", retried[0], retried[1]);
+    FX_CHECK_EQ(retried[0], 0u);
 }

@@ -530,3 +530,32 @@ FX_TEST(core_inline_indirect_lookup) {
     }
     r.machine.inline_lookup = true;
 }
+
+// Inline lookups store ctx->pc only on their miss path. A target below 4 MiB
+// has tag 0, so an empty slot (0) "hits" and enters the miss stub at arena
+// offset 0, which stores the target itself; misaligned targets take the miss
+// path. Either way the exit names the target.
+FX_TEST(core_inline_lookup_miss_pc) {
+    auto& r = runner();
+    using namespace a64;
+    for (const std::uint64_t target : {0x1000ull, 0x3ffffcull, 0x1002ull, 0x7fff00001234ull, 0x7fff00001233ull}) {
+        for (const bool inline_lookup : {true, false}) {
+            r.machine.inline_lookup = inline_lookup;
+            r.machine.reset();
+            // movz x9, #lo; movk x9, #hi, lsl #16; movk x9, #top, lsl #32; br x9
+            auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
+            program[0] = movw(true, 2, 0, static_cast<unsigned>(target & 0xffff), 9);
+            program[1] = movw(true, 3, 1, static_cast<unsigned>((target >> 16) & 0xffff), 9);
+            program[2] = movw(true, 3, 2, static_cast<unsigned>((target >> 32) & 0xffff), 9);
+            program[3] = br(9);
+            const BufferCode code(r.code_base(), r.program_base() + 16);
+            auto ctx = r.context(77);
+            ctx.pc = r.program_base();
+            const auto res = r.machine.run(ctx, code, kReturnToHostPc);
+            FX_CHECK(!res.ok && res.error == "unreadable guest pc");
+            FX_CHECK_EQ(res.lookups, 1u);
+            FX_CHECK_EQ(ctx.pc, target);
+        }
+    }
+    r.machine.inline_lookup = true;
+}

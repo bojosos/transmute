@@ -328,6 +328,38 @@ void var_shift(V& v, unsigned size, Dir dir, Xmm d, Xmm x, Xmm c, Xmm t1, Xmm t2
             return;
         }
     }
+    if (v.avx2 && size == 1 && neon_on(neon_old_var_shift)) {
+        // 16-bit lanes through the dword variable shifts: even lanes in the low
+        // halves (counts c & 0xffff), odd lanes in the high halves (counts
+        // c >> 16), recombined with one PBLENDW. Bits that cross into the
+        // other half are cut off by masking the source (left: the odd lanes'
+        // low halves; right: the even lanes' high halves) or by the blend.
+        static const Const128 kLow16 = splat32(0x0000ffffu), kHigh16 = splat32(0xffff0000u);
+        v.op(op::pand, t1, c, kLow16);                 // even counts
+        switch (dir) {
+        case Dir::left:
+            v.vex3(vop::vpsllvd, t1, x, t1);           // even results (low halves)
+            v.psrld(t2, c, 16);                        // odd counts
+            v.op(op::pand, d, x, kHigh16);
+            v.vex3(vop::vpsllvd, d, d, t2);            // odd results (high halves)
+            break;
+        case Dir::right_u:
+            v.op(op::pand, t2, x, kLow16);
+            v.vex3(vop::vpsrlvd, t1, t2, t1);
+            v.psrld(t2, c, 16);
+            v.vex3(vop::vpsrlvd, d, x, t2);
+            break;
+        case Dir::right_s:
+            v.pslld(t2, x, 16);                        // even lanes on top: their sign fills
+            v.vex3(vop::vpsravd, t2, t2, t1);
+            v.psrld(t1, t2, 16);
+            v.psrld(t2, c, 16);
+            v.vex3(vop::vpsravd, d, x, t2);
+            break;
+        }
+        v.op_imm(op::pblendw, d, t1, d, 0xaa);
+        return;
+    }
     // Binary decomposition of the count: conditionally shift by 1, 2, 4, ...
     const unsigned esize = 8u << size;
     v.mov(d, x);
@@ -408,6 +440,24 @@ void emit_register_shift(EmitContext& ctx, unsigned size, unsigned lanes, RegShi
             v.blendv_lane(3, out, l, r, s);
         }
         if (scalar) v.keep_element0(3, d, out);
+        return;
+    }
+    if (v.avx2 && size == 1 && !kind.saturating && !kind.rounding && neon_on(neon_old_var_shift)) {
+        // USHL/SSHL on 16-bit lanes: the dword variable shifts of var_shift give
+        // 0 (or the sign fill) for counts >= 16 and for negative counts, which
+        // read as huge, so no clamping: USHL = (x << s) | (x >> -s), SSHL
+        // selects by the sign of s (both bytes of each sign-extended count lane
+        // carry it, so PBLENDVB works per lane). SSHL/USHL have no scalar H form.
+        const Xmm s = v.temp(), n = v.temp(), l = v.temp(), r = v.temp(), a = v.temp(), b = v.temp();
+        v.psllw(s, m, 8);
+        v.psraw(s, s, 8);
+        v.zero(n);
+        v.op(kSub[1], n, n, s);
+        var_shift(v, 1, Dir::left, l, x, s, a, b);
+        var_shift(v, 1, kind.is_unsigned ? Dir::right_u : Dir::right_s, r, x, n, a, b);
+        if (kind.is_unsigned) v.por(d, l, r);
+        else v.blendv(d, l, r, s);
+        v.finish(d, q);
         return;
     }
     // Fixed temp set: S count, N negative mask, K clamped count, L left

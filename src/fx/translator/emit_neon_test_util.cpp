@@ -31,7 +31,7 @@ class AliasingEmitContext final : public EmitContext {
 public:
     AliasingEmitContext(x64::Assembler& a, std::uint64_t pc, bool mem_sources = false, std::uint32_t zero32 = 0,
                         std::uint32_t zero64 = 0)
-        : as_(a), pc_(pc), mem_sources_(mem_sources), zero32_(zero32), zero64_(zero64) {}
+        : as_(a), pc_(pc), mem_sources_(mem_sources), zero32_(zero32), zero64_(zero64), cf_start_(a.control_flow_count()) {}
     // Known-zero upper bits (claims derived from the start state; only for
     // the first instruction of a run, like a region forgetting at labels).
     [[nodiscard]] std::uint32_t vec_zero_above(unsigned width) const override {
@@ -145,6 +145,7 @@ public:
         pc_ = pc;
         temps_ = 0;
         next_gpr_ = next_vec_ = 0;
+        cf_start_ = as_.control_flow_count();
         for (auto& e : gpr_) e = {};
         for (auto& e : vec_) e = {};
     }
@@ -159,11 +160,21 @@ public:
     }
 
 private:
+    // Rule: every register before the instruction's first label or branch.
+    // In a region an allocation there may evict a dirty cached register, whose
+    // store would run on one path only: the region emitter then retries the
+    // whole region without write-back (every result stored at once).
+    void check_no_control_flow() const {
+        if (as_.control_flow_count() != cf_start_)
+            throw std::logic_error("AliasingEmitContext: register allocated after the instruction's control flow");
+    }
     Gp alloc_gpr() {
+        check_no_control_flow();
         if (next_gpr_ >= std::size(kGprPool)) throw std::logic_error("AliasingEmitContext: out of GPRs");
         return kGprPool[next_gpr_++];
     }
     Xmm alloc_vec() {
+        check_no_control_flow();
         if (next_vec_ >= 16) throw std::logic_error("AliasingEmitContext: out of XMM registers");
         return x64::xmm(next_vec_++);
     }
@@ -174,6 +185,7 @@ private:
     bool mem_sources_{};
     std::uint32_t zero32_{}, zero64_{};
     unsigned next_gpr_{}, next_vec_{}, fault_marks_{}, temps_{};
+    std::uint32_t cf_start_{};
     std::array<GprEntry, 32> gpr_{};
     std::array<VecEntry, 32> vec_{};
 };

@@ -3,6 +3,7 @@
 
 #include "fx/common/cpu_features.hpp"
 
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <string>
@@ -104,6 +105,31 @@ std::uint32_t isel_knob_bits() {
             if (all || s.find("nozext") != std::string::npos) b |= isel_no_zext;
             if (all || s.find("nosrcreg") != std::string::npos) b |= isel_no_srcreg;
             if (all || s.find("nomovk") != std::string::npos) b |= isel_no_movk;
+        }
+        return b;
+    }();
+    return bits;
+}
+
+namespace {
+std::atomic<std::uint32_t> g_p2_test_knobs{~0u};
+}
+
+void set_p2_knobs_for_testing(std::uint32_t bits) { g_p2_test_knobs.store(bits, std::memory_order_relaxed); }
+
+std::uint32_t codegen_p2_knob_bits() {
+    if (const auto t = g_p2_test_knobs.load(std::memory_order_relaxed); t != ~0u) return t;
+    static const std::uint32_t bits = [] {
+        std::uint32_t b = 0;
+        if (const char* v = std::getenv("TRANSMUTE_FX_CORE")) {
+            const std::string s(v);
+            if (s.find("nobranchdirty") != std::string::npos) b |= knob_no_branch_dirty;
+            if (s.find("nobrdeadflags") != std::string::npos) b |= knob_no_br_flags_dead;
+            if (s.find("nodeadpinloads") != std::string::npos) b |= knob_no_dead_pin_loads;
+            if (s.find("noflagsave") != std::string::npos) b |= knob_no_flag_save;
+            if (s.find("noccmpfusion") != std::string::npos) b |= knob_no_ccmp_fusion;
+            if (s.find("nogprreuse") != std::string::npos) b |= knob_no_gpr_reuse;
+            if (s.find("mergedirty") != std::string::npos) b |= knob_merge_dirty;
         }
         return b;
     }();
@@ -1055,6 +1081,27 @@ void RegionEmitter::e_ccmp(const Inst& d) {
         set_flags(producer);
         return;
     }
+    // The next instruction is the only reader of the result (B.cond/CSEL
+    // family, NZCV dead after it): no branch. With c1 the condition, c2 the
+    // reader's and K = c2 on the immediate NZCV (known here), the reader is
+    // taken iff c1 ? c2(compare) : K, i.e. (c1 & c2) or (!c1 | c2): two
+    // setcc and one test/or, read as NE (bool_reader_).
+    if (const auto reader = ccmp_bool_reader(); reader >= 0) {
+        const unsigned c2 = plan_.insts[static_cast<std::size_t>(reader)].inst.cond;
+        const bool k = condition_holds(c2, static_cast<std::uint32_t>(d.imms) << 28);
+        const auto t1 = alloc();
+        const auto c = condition(d.cond);
+        a_.setcc(k ? x64::invert(c) : c, t1);
+        do_compare();
+        set_flags(producer);
+        const auto t2 = alloc();
+        a_.setcc(condition(c2), t2);
+        if (k) a_.alu(Alu::or_, 8, t1, t2);
+        else a_.test(8, t1, t2);
+        set_flags(FlagsProducer::logic);
+        bool_reader_ = reader;
+        return;
+    }
     const auto c = condition(d.cond);
     const auto lfalse = a_.new_label(), ldone = a_.new_label();
     a_.jcc_short(x64::invert(c), lfalse);
@@ -1072,6 +1119,29 @@ void RegionEmitter::e_ccmp(const Inst& d) {
     }
     a_.bind(ldone);
     set_flags(producer);
+}
+
+// CCMP fusion (e_ccmp): index of its flags reader when that is a B.cond or a
+// CSEL-family instruction in the same block after which NZCV is dead, with
+// at most three instructions in between that neither touch the flags nor
+// may fault (they keep EFLAGS or park the answer: RegionEmitter::park_bool);
+// else -1.
+std::int32_t RegionEmitter::ccmp_bool_reader() const {
+    if (!codegen_on(knob_no_ccmp_fusion) || is_fcmp(flags_)) return -1;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    for (std::int32_t j = index_ + 1; j < n && j <= index_ + 4; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (pj.leader || pj.pc != plan_.insts[static_cast<std::size_t>(j) - 1].pc + 4 || pj.family >= 0 ||
+            pj.try_family || pj.inst.kind == Kind::unknown || pj.conservative_writes || pj.inline_call || pj.inline_ret)
+            return -1;
+        if (pj.reads_flags) {
+            if (pj.flags_live_out || pj.writes_flags) return -1;
+            if (pj.inst.kind != Kind::branch_cond && pj.inst.kind != Kind::csel) return -1;
+            return pj.inst.cond < 14 ? j : -1;
+        }
+        if (pj.writes_flags || pj.may_fault || pj.flow != Flow::normal) return -1;
+    }
+    return -1;
 }
 
 void RegionEmitter::e_csel(const Inst& d) {

@@ -264,6 +264,27 @@ void shared_memory_aliases(std::uint64_t page, std::vector<std::uint64_t>& out) 
     }
 }
 
+void shared_memory_aliases(std::uint64_t begin, std::uint64_t end, std::vector<std::uint64_t>& out) {
+    if (end <= begin) return;
+    begin &= ~(kPage - 1);
+    State& s = S();
+    Shared lock(s.lock);
+    auto it = s.views.upper_bound(begin);
+    if (it != s.views.begin()) --it;
+    for (; it != s.views.end() && it->first < end; ++it) {
+        const std::uint64_t base = it->first, limit = base + it->second.size;
+        if (limit <= begin) continue;
+        const std::uint64_t lo = it->second.offset + (std::max(begin, base) - base);
+        const std::uint64_t hi = it->second.offset + (std::min(end, limit) - base);
+        for (const std::uint64_t other : it->second.section->views) {
+            if (other == base) continue;
+            const View& w = s.views.at(other);
+            const std::uint64_t from = std::max(lo, w.offset), to = std::min(hi, w.offset + w.size);
+            for (std::uint64_t offset = from; offset < to; offset += kPage) out.push_back(other + (offset - w.offset));
+        }
+    }
+}
+
 } // namespace transmute::fx::rt
 
 namespace transmute::fx {

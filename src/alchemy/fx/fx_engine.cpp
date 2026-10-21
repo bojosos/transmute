@@ -356,7 +356,9 @@ void print_invalidation_statistics(const fx::RuntimeStats& stats, const char* wh
                  "alchemy-fx invalidation%s: smc faults %llu (%.3f s in the fault path), icache flushes %llu "
                  "(%llu KiB, %llu dropped code), invalidations that interrupted threads %llu, pages kept protected %llu, "
                  "translations of registered code %llu, re-translations %llu (reused unchanged %llu), code ranges %llu "
-                 "(published %llu); translations %llu (jit %.3f s, install %.3f s)\n",
+                 "(published %llu); translations %llu (jit %.3f s, install %.3f s); jit write windows: deferred "
+                 "faults %llu, pages checked %llu, regions kept %llu, killed %llu; code copies: translations %llu, "
+                 "from the source's cache %llu\n",
                  when ? when : "", static_cast<unsigned long long>(stats.smc_write_faults), stats.smc_fault_seconds,
                  static_cast<unsigned long long>(stats.code_flushes),
                  static_cast<unsigned long long>(stats.code_flush_bytes / 1024),
@@ -368,7 +370,13 @@ void print_invalidation_statistics(const fx::RuntimeStats& stats, const char* wh
                  static_cast<unsigned long long>(stats.jit_reuses),
                  static_cast<unsigned long long>(stats.code_ranges),
                  static_cast<unsigned long long>(stats.code_range_publishes),
-                 static_cast<unsigned long long>(stats.translations), stats.jit_seconds, stats.install_seconds);
+                 static_cast<unsigned long long>(stats.translations), stats.jit_seconds, stats.install_seconds,
+                 static_cast<unsigned long long>(stats.jit_window_deferred),
+                 static_cast<unsigned long long>(stats.jit_window_pages_checked),
+                 static_cast<unsigned long long>(stats.jit_window_regions_kept),
+                 static_cast<unsigned long long>(stats.jit_window_regions_killed),
+                 static_cast<unsigned long long>(stats.copy_translations),
+                 static_cast<unsigned long long>(stats.copy_cache_hits));
     // The code arena's reclaim (fx runtime, "arena reclaim").
     std::fprintf(stderr,
                  "alchemy-fx arena%s: used %llu KiB in %llu chunks (%llu free), committed %llu KiB, region metadata "
@@ -533,6 +541,8 @@ struct FxEngine::Shared {
     std::vector<std::shared_ptr<const GuestCallHandler>> retired_calls;
     // Slots whose handlers use no SIMD/FP register (set_guest_call_integer_only).
     std::unique_ptr<std::atomic<std::uint8_t>[]> integer_only{new std::atomic<std::uint8_t>[kMaximumGuestCalls]{}};
+    // Slots with a leaf fast path (set_guest_call_leaf): a Leaf value.
+    std::unique_ptr<std::atomic<std::uint8_t>[]> leaf{new std::atomic<std::uint8_t>[kMaximumGuestCalls]{}};
     // Slots that have their native host-callback entry (set under call_lock).
     // A slot gets it at its first call, through the SVC slot: a Chrome process
     // registers about 14,000 provider calls and calls a small part of them,
@@ -1452,6 +1462,74 @@ std::uint64_t FxEngine::register_guest_call(GuestCallHandler handler) {
     return kGuestCallBase + index * kGuestCallStride;
 }
 
+// ---- leaf fast paths ----------------------------------------------------------
+// libSystem's pure memory/string functions, run on the guest registers by a
+// leaf entry (fx::register_host_leaf): no adapter, FP handoff, CpuState
+// copies, handler chain or perf frame. They do exactly what their handlers
+// (darwin/libsystem/services.cpp) do when no guest byte faults, including
+// x1 = 0 (DarwinServices::Impl::install) and x0 untouched by bzero/bcopy.
+// Anything else -- a fault, a string longer than the handler's limit, a
+// memcmp longer than the leaf's buffers -- declines (changing nothing), and
+// the call runs the handler from the start through host_callback, which
+// faults or fails exactly as before. A copy or fill that faulted part-way is
+// then redone; the call faults anyway.
+namespace {
+enum Leaf : std::uint8_t { kLeafNone, kLeafMemcpy, kLeafBcopy, kLeafMemset, kLeafBzero, kLeafMemcmp, kLeafStrlen };
+
+constexpr std::size_t kLeafCompareBytes = 256;
+constexpr std::size_t kLeafStringLimit = std::size_t{1} << 20;   // = services' string_limit
+
+bool leaf_compare(std::uint64_t a, std::uint64_t b, std::uint64_t count, std::uint64_t& result) {
+    if (count > kLeafCompareBytes) return false;
+    std::uint8_t x[kLeafCompareBytes], y[kLeafCompareBytes];
+    if (count && (!guarded_move(x, host(a), count) || !guarded_move(y, host(b), count))) return false;
+    result = 0;
+    if (std::memcmp(x, y, count) == 0) return true;
+    for (std::size_t i = 0; i < count; ++i)
+        if (x[i] != y[i]) {
+            result = static_cast<std::uint64_t>(static_cast<std::int64_t>(x[i]) - y[i]);
+            break;
+        }
+    return true;
+}
+
+template <Leaf kind>
+bool leaf_call(fx::GuestContext& ctx) {
+    auto& x = ctx.x;
+    if constexpr (kind == kLeafMemcpy) {
+        if (x[2] && !guarded_move(host(x[0]), host(x[1]), x[2])) return false;
+    } else if constexpr (kind == kLeafBcopy) {
+        if (x[2] && !guarded_move(host(x[1]), host(x[0]), x[2])) return false;
+    } else if constexpr (kind == kLeafMemset) {
+        if (x[2] && !guarded_fill(host(x[0]), static_cast<std::uint8_t>(x[1]), x[2])) return false;
+    } else if constexpr (kind == kLeafBzero) {
+        if (x[1] && !guarded_fill(host(x[0]), 0, x[1])) return false;
+    } else if constexpr (kind == kLeafMemcmp) {
+        std::uint64_t result = 0;
+        if (!leaf_compare(x[0], x[1], x[2], result)) return false;
+        x[0] = result;
+    } else if constexpr (kind == kLeafStrlen) {
+        const auto length = guarded_length(static_cast<const std::uint8_t*>(host(x[0])), 1, kLeafStringLimit);
+        if (length < 0 || static_cast<std::size_t>(length) >= kLeafStringLimit) return false;
+        x[0] = static_cast<std::uint64_t>(length);
+    }
+    x[1] = 0;
+    return true;
+}
+} // namespace
+
+void FxEngine::set_guest_call_leaf(std::uint64_t address, std::string_view symbol) {
+    if (address < kGuestCallBase || address >= kGuestCallEnd) return;
+    Leaf kind = kLeafNone;
+    if (symbol == "_memcpy" || symbol == "_memmove") kind = kLeafMemcpy;
+    else if (symbol == "_bcopy") kind = kLeafBcopy;
+    else if (symbol == "_memset") kind = kLeafMemset;
+    else if (symbol == "_bzero") kind = kLeafBzero;
+    else if (symbol == "_memcmp") kind = kLeafMemcmp;
+    else if (symbol == "_strlen") kind = kLeafStrlen;
+    shared_->leaf[(address - kGuestCallBase) / kGuestCallStride].store(kind, std::memory_order_relaxed);
+}
+
 void FxEngine::install_native_entry(std::uint64_t pc) {
     if (!native_synthetic_calls() || pc < kGuestCallBase || pc >= kGuestCallEnd) return;
     const auto index = (pc - kGuestCallBase) / kGuestCallStride;
@@ -1461,7 +1539,21 @@ void FxEngine::install_native_entry(std::uint64_t pc) {
     // (the rethrow must leave through the dispatcher).
     if (index >= shared_->next_call || !shared_->calls[index] || shared_->native_entry[index].load(std::memory_order_relaxed))
         return;
-    fx::register_host_callback(pc, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
+    // Leaf fast paths skip the perf frame: with ALCHEMY_PERF every call is counted by its handler.
+    fx::HostLeaf leaf = nullptr;
+    if (!alchemy::perf::enabled()) {
+        switch (shared_->leaf[index].load(std::memory_order_relaxed)) {
+        case kLeafMemcpy: leaf = &leaf_call<kLeafMemcpy>; break;
+        case kLeafBcopy: leaf = &leaf_call<kLeafBcopy>; break;
+        case kLeafMemset: leaf = &leaf_call<kLeafMemset>; break;
+        case kLeafBzero: leaf = &leaf_call<kLeafBzero>; break;
+        case kLeafMemcmp: leaf = &leaf_call<kLeafMemcmp>; break;
+        case kLeafStrlen: leaf = &leaf_call<kLeafStrlen>; break;
+        default: break;
+        }
+    }
+    if (leaf) fx::register_host_leaf(pc, leaf, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
+    else fx::register_host_callback(pc, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
     shared_->native_entry[index].store(1, std::memory_order_release);
     shared_->native_entries.fetch_add(1, std::memory_order_relaxed);
 }
@@ -2114,6 +2206,12 @@ void FxEngine::flush_translations() {
 }
 
 void FxEngine::invalidate_code(std::uint64_t address, std::uint64_t size) { fx::flush_guest_code(address, size); }
+
+void FxEngine::jit_write_window(bool open) { fx::guest_jit_write_window(open); }
+
+void FxEngine::code_copy(std::uint64_t copy, std::uint64_t source, std::uint64_t size) {
+    fx::register_guest_code_copy(copy, source, size);
+}
 
 void FxEngine::protect_range(std::uint64_t address, std::uint64_t size, bool readable, bool writable,
                              bool executable) {

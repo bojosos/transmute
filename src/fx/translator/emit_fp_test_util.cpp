@@ -358,7 +358,8 @@ x64::Mem nzcv_field() { return ptr(kCtx, ctx_disp(offsetof(GuestContext, nzcv)))
 class AliasEmitContext final : public EmitContext {
 public:
     AliasEmitContext(x64::Assembler& a, std::uint64_t pc, const AliasOptions& options = {})
-        : as_(a), pc_(pc), opt_(options), zero32_(options.zero32), zero64_(options.zero64 | options.zero32) {}
+        : as_(a), pc_(pc), opt_(options), zero32_(options.zero32), zero64_(options.zero64 | options.zero32),
+          cf_start_(a.control_flow_count()) {}
     x64::Assembler& as() override { return as_; }
     [[nodiscard]] std::uint64_t pc() const override { return pc_; }
 
@@ -443,7 +444,7 @@ public:
     Xmm temp_vec() override { return alloc_vec(); }
     void clobber_host_flags() override {}
     void set_flags(FlagsProducer producer) override {
-        const Gp flags = alloc_gpr(), result = alloc_gpr(), bit = alloc_gpr();
+        const Gp flags = alloc_gpr(false), result = alloc_gpr(false), bit = alloc_gpr(false);
         as_.pushfq();
         as_.pop(flags);
         as_.mov(32, result, flags);
@@ -468,13 +469,13 @@ public:
     }
     void set_nzcv(Gp value) override { as_.mov(64, nzcv_field(), value); }
     Gp get_nzcv() override {
-        const Gp r = alloc_gpr();
+        const Gp r = alloc_gpr(false);
         as_.mov(32, r, nzcv_field());
         return r;
     }
     x64::Cond condition(unsigned arm_condition) override {
         if (arm_condition >= 14) throw std::logic_error("condition(): AL/NV");
-        const Gp nzcv = alloc_gpr(), image = alloc_gpr(), bit = alloc_gpr();
+        const Gp nzcv = alloc_gpr(false), image = alloc_gpr(false), bit = alloc_gpr(false);
         as_.mov(32, nzcv, nzcv_field());
         as_.mov_imm(image, 2);
         as_.mov(32, bit, nzcv);
@@ -502,6 +503,7 @@ public:
     void begin(std::uint64_t pc) {
         pc_ = pc;
         ngpr_ = nvec_ = 0;
+        cf_start_ = as_.control_flow_count();
         gmap_.clear(); vmap_.clear(); gdirty_.clear(); vdirty_.clear();
     }
     // Every register obtained is stored back, read-only ones included: an
@@ -513,11 +515,22 @@ public:
     }
 
 private:
-    Gp alloc_gpr() {
+    // Rule: every register before the instruction's first label or branch.
+    // In a region an allocation there may evict a dirty cached register, whose
+    // store would run on one path only: the region emitter then retries the
+    // whole region without write-back. (The core's own flag code, simulated
+    // by set_flags/condition/get_nzcv here, is exempt.)
+    void check_no_control_flow() const {
+        if (as_.control_flow_count() != cf_start_)
+            throw std::logic_error("AliasEmitContext: register allocated after the instruction's control flow");
+    }
+    Gp alloc_gpr(bool check = true) {
+        if (check) check_no_control_flow();
         if (ngpr_ >= std::size(kGprPool)) throw std::logic_error("AliasEmitContext: out of GPRs");
         return kGprPool[ngpr_++];
     }
     Xmm alloc_vec() {
+        check_no_control_flow();
         if (nvec_ >= 16) throw std::logic_error("AliasEmitContext: out of XMMs");
         // Hand out registers from the top so they differ from MemoryEmitContext's.
         return x64::xmm(15 - nvec_++);
@@ -527,6 +540,7 @@ private:
     AliasOptions opt_;
     std::uint32_t zero32_ = 0, zero64_ = 0;
     unsigned ngpr_ = 0, nvec_ = 0;
+    std::uint32_t cf_start_ = 0;
     std::map<unsigned, Gp> gmap_, gdirty_;
     std::map<unsigned, Xmm> vmap_, vdirty_;
 };

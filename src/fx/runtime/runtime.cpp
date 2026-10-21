@@ -157,6 +157,12 @@ RuntimeStats runtime_stats() {
     stats.registered_code_translations = c.registered_code_translations.load(std::memory_order_relaxed);
     stats.retranslations = c.retranslations.load(std::memory_order_relaxed);
     stats.jit_reuses = c.jit_reuses.load(std::memory_order_relaxed);
+    stats.jit_window_deferred = c.jit_window_deferred.load(std::memory_order_relaxed);
+    stats.jit_window_pages_checked = c.jit_window_pages_checked.load(std::memory_order_relaxed);
+    stats.jit_window_regions_kept = c.jit_window_regions_kept.load(std::memory_order_relaxed);
+    stats.jit_window_regions_killed = c.jit_window_regions_killed.load(std::memory_order_relaxed);
+    stats.copy_translations = c.copy_translations.load(std::memory_order_relaxed);
+    stats.copy_cache_hits = c.copy_cache_hits.load(std::memory_order_relaxed);
     stats.code_ranges = rt::registered_code_range_count();
     stats.code_range_publishes = c.code_range_publishes.load(std::memory_order_relaxed);
     stats.reclaim_passes = c.reclaim_passes.load(std::memory_order_relaxed);

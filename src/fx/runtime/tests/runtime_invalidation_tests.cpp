@@ -356,3 +356,95 @@ FX_TEST(concurrent_writers_on_a_code_page_never_fault) {
     FX_CHECK(stores.load() >= 400u);
     set_mini_translator(false);
 }
+
+// Inside a JIT write window (pthread_jit_write_protect_np(0)) a store to a
+// translated JIT page defers the page instead of killing its translations:
+// they keep running (stale until a flush, as the MAP_JIT contract allows),
+// a flush kills exactly what it covers, and closing the window keeps the
+// unchanged translations and write-protects their page again.
+FX_TEST(jit_write_window_defers_and_keeps_unchanged_translations) {
+    init();
+    set_mini_translator(true);
+    GuestCode code({});
+    const auto a = code.at(0), b = code.at(16);
+    code.words()[0] = movz(0, 1);
+    code.words()[1] = kRet;
+    code.words()[16] = movz(0, 2);
+    code.words()[17] = kRet;
+    FX_CHECK_EQ(run(a), 1u);
+    FX_CHECK_EQ(run(b), 2u);
+    FX_CHECK(guest_page_protection(a) != 0);
+    const auto s0 = runtime_stats();
+    guest_jit_write_window(true);
+    code.words()[200] = 0xd503201f;   // new code next to a and b: one deferred fault
+    code.words()[201] = kRet;
+    code.words()[16] = movz(0, 5);    // b rewritten, not flushed yet
+    const auto s1 = runtime_stats();
+    FX_CHECK_EQ(s1.smc_write_faults - s0.smc_write_faults, 1u);
+    FX_CHECK_EQ(s1.jit_window_deferred - s0.jit_window_deferred, 1u);
+    FX_CHECK_EQ(s1.invalidated_regions - s0.invalidated_regions, 0u);
+    FX_CHECK_EQ(rt::live_regions_on_page(a), 2u);
+    FX_CHECK_EQ(guest_page_protection(a), 0u);   // given back to the guest
+    FX_CHECK_EQ(run(b), 2u);                       // stale until the flush
+    flush_guest_code(b, 4);                        // exactly b
+    FX_CHECK_EQ(rt::live_regions_on_page(a), 1u);
+    FX_CHECK_EQ(run(a), 1u);
+    guest_jit_write_window(false);
+    const auto s2 = runtime_stats();
+    FX_CHECK_EQ(s2.jit_window_pages_checked - s1.jit_window_pages_checked, 1u);
+    FX_CHECK(s2.jit_window_regions_kept - s1.jit_window_regions_kept >= 1u);   // a (and b's new translation)
+    FX_CHECK_EQ(s2.jit_window_regions_killed - s1.jit_window_regions_killed, 0u);
+    FX_CHECK(guest_page_protection(a) != 0);       // protected again
+    FX_CHECK_EQ(run(a), 1u);
+    FX_CHECK_EQ(run(b), 5u);
+    FX_CHECK_EQ(runtime_stats().translations - s0.translations, 1u);   // only b again
+    // Outside a window a store takes the exact path: the page's translations die.
+    code.words()[300] = 0;
+    const auto s3 = runtime_stats();
+    FX_CHECK_EQ(s3.smc_write_faults - s2.smc_write_faults, 1u);
+    FX_CHECK_EQ(s3.jit_window_deferred, s2.jit_window_deferred);
+    FX_CHECK_EQ(rt::live_regions_on_page(a), 0u);
+    set_mini_translator(false);
+}
+
+// A rewrite inside a window that is never flushed is caught when the window
+// closes: the translation's guest bytes changed, so it dies there.
+FX_TEST(jit_write_window_close_kills_changed_translations) {
+    init();
+    set_mini_translator(true);
+    GuestCode code({movz(0, 1), kRet});
+    const auto a = code.at(0);
+    FX_CHECK_EQ(run(a), 1u);
+    const auto s0 = runtime_stats();
+    guest_jit_write_window(true);
+    code.words()[0] = movz(0, 9);
+    FX_CHECK_EQ(runtime_stats().jit_window_deferred - s0.jit_window_deferred, 1u);
+    FX_CHECK_EQ(run(a), 1u);   // stale: no flush, window still open
+    guest_jit_write_window(false);
+    const auto s1 = runtime_stats();
+    FX_CHECK_EQ(s1.jit_window_regions_killed - s0.jit_window_regions_killed, 1u);
+    FX_CHECK_EQ(rt::live_regions_on_page(a), 0u);
+    FX_CHECK_EQ(guest_page_protection(a), 0u);   // nothing left to protect
+    FX_CHECK_EQ(run(a), 9u);
+    // A window that closes with nothing deferred costs nothing.
+    guest_jit_write_window(true);
+    guest_jit_write_window(false);
+    FX_CHECK_EQ(runtime_stats().jit_window_pages_checked, s1.jit_window_pages_checked);
+    set_mini_translator(false);
+}
+
+// Another thread's store to a deferred page while the window is open (the
+// page is writable then) is caught at the close too.
+FX_TEST(jit_write_window_close_sees_other_threads_stores) {
+    init();
+    set_mini_translator(true);
+    GuestCode code({movz(0, 1), kRet});
+    const auto a = code.at(0);
+    FX_CHECK_EQ(run(a), 1u);
+    guest_jit_write_window(true);
+    code.words()[100] = 0;   // deferred
+    std::thread([&] { code.words()[0] = movz(0, 4); }).join();   // no fault: the page is the guest's now
+    guest_jit_write_window(false);
+    FX_CHECK_EQ(run(a), 4u);
+    set_mini_translator(false);
+}

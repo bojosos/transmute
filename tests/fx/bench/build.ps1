@@ -27,7 +27,10 @@ $variants = @(
     @{ Name = "memcpy";      Define = "B_MEMCPY"; Vcruntime = $true },
     @{ Name = "interp";      Define = "B_INTERP" },
     # SIMD kernels (bench_simd.c, owner: neon/fp): NEON intrinsics vs SSE4.1/AVX2.
-    @{ Name = "simd";        Define = "B_SIMD"; Source = "bench_simd.c"; X64Flags = @("/arch:AVX2") }
+    @{ Name = "simd";        Define = "B_SIMD"; Source = "bench_simd.c"; X64Flags = @("/arch:AVX2") },
+    # Self-checking NEON kernels (neon_kernels.c): scalar models built without vectorization.
+    @{ Name = "neonk";       Define = "B_NEONK"; Source = "neon_kernels.c"; Arm64Only = $true;
+       Arm64Flags = @("/clang:-fno-vectorize", "/clang:-fno-slp-vectorize") }
 )
 
 $crt = $null

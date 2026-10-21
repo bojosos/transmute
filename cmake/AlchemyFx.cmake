@@ -77,6 +77,7 @@ if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD AND macos_dir)
     alchemy_object(fx_mach_ports fx_mach_ports.c)
     alchemy_object(fx_mach_cross fx_mach_cross.c)
     alchemy_object(fx_mach_link_system fx_mach_link_system.c)
+    alchemy_object(fx_leaf_calls fx_leaf_calls.c)
     add_custom_command(OUTPUT "${macos_dir}/fx_link_system.dylib"
         COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -dylib
             -install_name /usr/lib/libSystem.B.dylib "${macos_dir}/fx_link_system.o"
@@ -127,8 +128,12 @@ if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD AND macos_dir)
         COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main
             "${macos_dir}/fx_mach_cross.o" "${macos_dir}/fx_mach_link_system.dylib" -o "${macos_dir}/fx_mach_cross"
         DEPENDS "${macos_dir}/fx_mach_cross.o" "${macos_dir}/fx_mach_link_system.dylib" VERBATIM)
+    add_custom_command(OUTPUT "${macos_dir}/fx_leaf_calls"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main
+            "${macos_dir}/fx_leaf_calls.o" "${macos_dir}/fx_link_system.dylib" -o "${macos_dir}/fx_leaf_calls"
+        DEPENDS "${macos_dir}/fx_leaf_calls.o" "${macos_dir}/fx_link_system.dylib" VERBATIM)
     add_custom_target(alchemy_fx_engine_fixtures DEPENDS "${macos_dir}/fx_threads" "${macos_dir}/fx_frint_probe"
-        "${macos_dir}/fx_tlv" "${macos_dir}/fx_tlv_plugin.bundle"
+        "${macos_dir}/fx_tlv" "${macos_dir}/fx_tlv_plugin.bundle" "${macos_dir}/fx_leaf_calls"
         "${macos_dir}/fx_vm_remap" "${macos_dir}/fx_vm_reserve" "${macos_dir}/fx_vm_lazy" "${macos_dir}/fx_mach_ports"
         "${macos_dir}/fx_mach_cross" "${macos_dir}/fx_jit_flush")
     add_executable(alchemy_fx_engine_tests tests/alchemy_fx_engine_tests.cpp)
@@ -152,6 +157,20 @@ if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD AND macos_dir)
     add_test(NAME alchemy_fx_mach_cross COMMAND alchemy-fx "${macos_dir}/fx_mach_cross")
     set_tests_properties(alchemy_fx_mach_cross PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx mach cross: ok"
         ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1")
+    # libSystem's pure memory/string calls: the engine's leaf fast path
+    # (FxEngine::set_guest_call_leaf) and, with ALCHEMY_PERF=1 (no leaf
+    # entries), their handlers give the same results and registers.
+    add_test(NAME alchemy_fx_leaf_calls COMMAND alchemy-fx "${macos_dir}/fx_leaf_calls")
+    set_tests_properties(alchemy_fx_leaf_calls PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx leaf calls: ok"
+        ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1")
+    add_test(NAME alchemy_fx_leaf_calls_handlers COMMAND alchemy-fx "${macos_dir}/fx_leaf_calls")
+    set_tests_properties(alchemy_fx_leaf_calls_handlers PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx leaf calls: ok"
+        ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_PERF=1")
+    # x0/x1 in the cross-region convention: their context slots are stale at a
+    # leaf entry, so the engine's leaves must fall back to the handlers.
+    add_test(NAME alchemy_fx_leaf_calls_globals COMMAND alchemy-fx "${macos_dir}/fx_leaf_calls")
+    set_tests_properties(alchemy_fx_leaf_calls_globals PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx leaf calls: ok"
+        ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1;TRANSMUTE_FX_GLOBALS=sp,x0,x1,x19,x20,fp,lr")
     # Mach-O thread-local variables through __tlv_bootstrap and its TPIDR_EL0
     # fast path: late dlopen, two images, contention, thread reuse, callbacks.
     add_test(NAME alchemy_fx_tlv COMMAND alchemy-fx "${macos_dir}/fx_tlv" "${macos_dir}/fx_tlv_plugin.bundle")

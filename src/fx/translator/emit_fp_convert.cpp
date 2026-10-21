@@ -41,9 +41,12 @@ void cvtt_scalar(FpEmit& e, bool dbl, Xmm x, Gp g, unsigned ibits, bool uns, Gp 
     if (!uns) {
         cvtt(e, dbl, g, x, ibits);
         // x64 returns the "integer indefinite" (INT_MIN) for NaN and overflow.
-        if (ibits == 32) {
+        if (ibits == 32 && !fp_on(fp_old_cvt)) {
             a.cmp(32, g, static_cast<std::int32_t>(0x80000000u));
             a.jcc_short(Cond::ne, done);
+        } else if (ibits == 32) {
+            a.cmp(32, g, 1);   // overflows only for INT_MIN; imm8 form, 3 bytes shorter
+            a.jcc_short(Cond::no, done);
         } else {
             a.cmp(64, g, 1);   // overflows only for INT64_MIN
             a.jcc_short(Cond::no, done);

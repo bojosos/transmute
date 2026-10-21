@@ -45,19 +45,21 @@ void RegionEmitter::compute_tier2() {
     // Interrupt checks (Plan::t2_checks): every cycle of the region passes a
     // loop header; a header H needs no check of its own when another header
     // H2 that keeps its check lies on every path from H to each back edge
-    // into H (each cycle through H then contains H2). H2 is then locked: it
-    // keeps its check. Exits leave the region (a region start checks).
+    // into H (each cycle through H then contains H2). Headers are decided
+    // from the last one back, so every H2 a header relies on is already
+    // final (it keeps its check for good). In layout order a chain of
+    // headers falling into one another (a loop's shared tail, then its
+    // dispatch) then keeps only its last check; deciding them first to last
+    // locked the second and kept two.
     s_.no_check.assign(static_cast<std::size_t>(n), 0);
     if (plan_.t2_checks && options_.interrupt_checks && !plan_.count_loops) {
-        std::vector<std::uint8_t> locked(static_cast<std::size_t>(n), 0);
         std::vector<std::uint32_t> seen(static_cast<std::size_t>(n), 0);
         std::vector<std::int32_t> stack;
         std::uint32_t stamp = 0;
         unsigned budget = 4u << 20;   // bounds the analysis on huge regions (successor visits)
-        for (std::int32_t h = 0; h < n && budget != 0; ++h) {
+        for (std::int32_t h = n - 1; h >= 0 && budget != 0; --h) {
             if (!insts[static_cast<std::size_t>(h)].loop_header) continue;
             const auto end = s_.loop_end[static_cast<std::size_t>(h)];
-            if (locked[static_cast<std::size_t>(h)]) continue;
             for (std::int32_t h2 = h + 1; h2 <= end && budget != 0; ++h2) {
                 const auto& p2 = insts[static_cast<std::size_t>(h2)];
                 if (!p2.loop_header || s_.no_check[static_cast<std::size_t>(h2)]) continue;
@@ -80,7 +82,6 @@ void RegionEmitter::compute_tier2() {
                 }
                 if (escapes || budget == 0) continue;
                 s_.no_check[static_cast<std::size_t>(h)] = 1;
-                locked[static_cast<std::size_t>(h2)] = 1;
                 break;
             }
         }

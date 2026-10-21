@@ -12,6 +12,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -431,4 +432,349 @@ FX_TEST(isel_folded_access_faults_are_exact) {
     check_fold_fault(pinned_first_w, 5, "ldp w pinned first, second faults", false, 4096 - 4, 4096);
     std::vector<std::uint32_t> pinned_first_b = pinned_first;
     check_fold_fault(pinned_first_b, 5, "ldp pinned first, first faults", false, 4096, 4096);
+}
+
+// ---- flags at call and return exits ---------------------------------------------
+
+namespace {
+// The EFLAGS -> NZCV conversion of a flags materialization: imul eax, eax, 0x10210000.
+bool materializes_flags(const TranslatedRegion& region) {
+    static constexpr std::uint8_t kImul[] = {0x69, 0xc0, 0x00, 0x00, 0x21, 0x10};
+    return std::search(region.code.begin(), region.code.end(), std::begin(kImul), std::end(kImul)) != region.code.end();
+}
+
+TranslatedRegion translate_words(const std::vector<std::uint32_t>& words, bool abi_flags) {
+    auto& r = runner();
+    auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
+    std::memcpy(program, words.data(), words.size() * 4);
+    const BufferCode code(r.code_base(), r.program_base() + words.size() * 4);
+    TranslateOptions options;
+    options.abi_flags = abi_flags;
+    return translate_region(r.program_base(), code, options);
+}
+} // namespace
+
+// TranslateOptions::abi_flags: NZCV is dead at BL/BLR and RET, so flags a
+// compare left in EFLAGS are not converted into the context there; strict
+// flags (and BR, which keeps them live) still convert them.
+FX_TEST(core_abi_flags_not_materialized_at_calls_and_returns) {
+    using namespace a64;
+    const auto cmp = add_shift(true, true, true, 0, 2, 0, 1, 31);   // cmp x1, x2
+    struct Case { const char* label; std::vector<std::uint32_t> words; bool live_with_abi; };
+    const Case cases[] = {
+        {"cmp; bl", {cmp, bl(64)}, false},
+        {"cmp; blr", {cmp, blr(9)}, false},
+        {"cmp; ret", {cmp, ret()}, false},
+        {"cmp; br", {cmp, br(9)}, false},   // register-target BR: flag-dead too (core_br_flags_dead_knob)
+        {"cmp; b.eq; bl", {cmp, bcond(0, 2), bl(64), ret()}, false},
+    };
+    core::set_p2_knobs_for_testing(0);
+    for (const auto& c : cases) {
+        if (!materializes_flags(translate_words(c.words, false)))
+            testing::report_failure(__FILE__, __LINE__, std::string(c.label) + ": strict flags not materialized");
+        if (materializes_flags(translate_words(c.words, true)) != c.live_with_abi)
+            testing::report_failure(__FILE__, __LINE__, std::string(c.label) + ": abi flags");
+    }
+    core::set_p2_knobs_for_testing(~0u);
+}
+
+// ---- dirty cache across branches into single-predecessor blocks ------------------
+
+// x1 and x2 are written (dirty in the register cache) before a CBZ/TBNZ whose
+// successors each have it as their only predecessor; both successors fault.
+// The values cross the branch unstored (dirty_crosses_branch), so the fault
+// map must describe them, and resuming at the reported pc must finish like
+// the reference. TRANSMUTE_FX_CORE=nobranchdirty stores them first.
+FX_TEST(core_dirty_cache_crosses_branches_exact_at_faults) {
+    using namespace a64;
+    for (const bool taken : {false, true}) {
+        for (const bool test_bit : {false, true}) {
+            const std::vector<std::uint32_t> prog = {
+                add_imm(true, false, false, 1, 1, 5),             // 0 add x1, x1, #5
+                add_imm(true, false, false, 2, 1, 7),             // 1 add x2, x1, #7
+                movw(true, 2, 0, taken ? 0 : 1, 3),               // 2 movz x3, #(0|1)
+                test_bit ? tbz(false, 0, 3, 3) : cbz(true, false, 3, 3),   // 3 tbz x3, #0 / cbz x3 -> 6
+                ldst_uimm(3, 1, 0, 9, 4),                         // 4 ldr x4, [x9] (faults)
+                b(3),                                             // 5 b 8
+                ldst_uimm(3, 1, 1, 9, 5),                         // 6 ldr x5, [x9, #8] (faults)
+                add_imm(true, false, false, 6, 5, 1),             // 7 add x6, x5, #1
+                add_imm(true, false, false, 7, 2, 3),             // 8 add x7, x2, #3
+            };
+            const std::string label = std::string(test_bit ? "tbz" : "cbz") + (taken ? " taken" : " not taken");
+            check_fold_fault(prog, taken ? 5 : 3, label.c_str(), false);
+            if (core::codegen_on(core::knob_no_branch_dirty))
+                FX_CHECK((g_ff.in_host & 6u) == 6u);   // x1, x2 still in registers at the fault
+        }
+    }
+}
+
+// A BR to a register target (tail call, veneer, interpreter dispatch) is
+// flag-dead under abi_flags by default; a BR whose block builds its target
+// from an ADR/ADRP (a switch table, a computed goto) keeps NZCV live, strict
+// flags keep every BR live, and TRANSMUTE_FX_CORE=nobrdeadflags all BRs.
+FX_TEST(core_br_flags_dead_knob) {
+    using namespace a64;
+    const auto cmp = add_shift(true, true, true, 0, 2, 0, 1, 31);   // cmp x1, x2
+    const std::vector<std::uint32_t> reg_target = {cmp, br(9)};
+    const std::vector<std::uint32_t> computed_goto = {
+        adr(false, 16, 10),                     // adr x10, table
+        ldst_reg(3, 1, 11, 3, true, 10, 9),     // ldr x9, [x10, x11, lsl #3]
+        cmp,
+        br(9),
+    };
+    const std::vector<std::uint32_t> switch_table = {
+        add_imm(false, true, true, 31, 14, 3),   // cmp w14, #3
+        bcond(8, 6),                            // b.hi default
+        adr(false, 20, 9),                      // adr x9, table
+        ldst_reg(0, 1, 14, 2, false, 9, 8),     // ldrb w8, [x9, w14, uxtw]
+        add_shift(true, false, false, 0, 8, 2, 9, 8),   // add x8, x9, x8, lsl #2
+        br(8),
+        ret(),                                  // default
+        0x00000000u,                            // table
+    };
+    struct Case { const char* label; const std::vector<std::uint32_t>* words; bool dead_by_default; };
+    const Case cases[] = {
+        {"register target", &reg_target, true},
+        {"computed goto", &computed_goto, false},
+        {"switch table", &switch_table, false},
+    };
+    for (const auto knob : {0u, static_cast<std::uint32_t>(core::knob_no_br_flags_dead)}) {
+        core::set_p2_knobs_for_testing(knob);
+        for (const auto& c : cases) {
+            const bool dead = knob == 0 && c.dead_by_default;
+            if (!materializes_flags(translate_words(*c.words, false)))
+                testing::report_failure(__FILE__, __LINE__, std::string(c.label) + ": strict flags not materialized");
+            if (materializes_flags(translate_words(*c.words, true)) == dead)
+                testing::report_failure(__FILE__, __LINE__, std::string(c.label) + (knob ? ": nobrdeadflags" : ": default"));
+        }
+    }
+    core::set_p2_knobs_for_testing(~0u);
+}
+
+// ---- pins written before they are observed ---------------------------------------
+
+// x5 and x6 are hot in the loop (pinned) and written by MOVZ before anything
+// reads them or may fault: the region entry does not load them
+// (pins_dead_at_entry; TRANSMUTE_FX_CORE=nodeadpinloads loads every pin). The
+// result matches the reference either way; without the loads the code is smaller.
+FX_TEST(core_dead_pin_loads_skipped_at_entries) {
+    using namespace a64;
+    auto& r = runner();
+    const std::vector<std::uint32_t> prog = {
+        movw(true, 2, 0, 7, 5),                     // 0 movz x5, #7
+        movw(true, 2, 0, 100, 6),                   // 1 movz x6, #100
+        add_shift(true, false, false, 0, 5, 1, 5, 5),   // 2 L: add x5, x5, x5, lsl #1
+        add_imm(true, false, false, 5, 5, 3),       // 3 add x5, x5, #3
+        add_imm(true, true, true, 6, 6, 1),         // 4 subs x6, x6, #1
+        bcond(1, -3),                               // 5 b.ne L
+        add_imm(true, false, false, 7, 5, 1),       // 6 add x7, x5, #1
+    };
+    std::size_t sizes[2]{};
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_dead_pin_loads)}) {
+        core::set_p2_knobs_for_testing(knob);
+        sizes[knob ? 1 : 0] = translate_words(prog, true).code.size();
+        for (unsigned k = 0; k < 4; ++k) r.run(prog, r.context(77000 + k), "dead pin loads " + std::to_string(knob));
+    }
+    core::set_p2_knobs_for_testing(~0u);
+    FX_CHECK(sizes[0] < sizes[1]);
+}
+
+// ---- flags kept in EFLAGS around a clobbering instruction --------------------------
+
+// A flags producer, one or two instructions that must clobber EFLAGS but not
+// read or write NZCV (EOR/ORR/AND without S, shifts, bitfields, REV, ...),
+// then a reader (CSEL family, CCMP, ADC, B.cond): save_flags_around keeps
+// the flags in host form across the clobber (lahf/seto ... add al/sahf).
+// Differential against the reference, NZCV included, with and without it.
+FX_TEST(core_flags_saved_around_clobbers) {
+    using namespace a64;
+    auto& r = runner();
+    Rng rng(0x5a7ef1a9);
+    InstGen g(rng);
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_flag_save)}) {
+        core::set_p2_knobs_for_testing(knob);
+        int failures = 0;
+        for (unsigned i = 0; i < 400 && failures < 6; ++i) {
+            std::vector<std::uint32_t> w;
+            switch (rng.below(3)) {   // producer
+            case 0: w.push_back(add_shift(rng.chance(60), rng.chance(50), true, rng.below(3), g.src(), rng.below(8), g.src(), g.dest())); break;
+            case 1: w.push_back(add_imm(rng.chance(60), rng.chance(50), true, g.dest(), g.src_sp(), rng.below(4096))); break;
+            default: w.push_back(logic_shift(rng.chance(60), 3, rng.below(4), false, g.src(), rng.below(8), g.src(), g.dest())); break;
+            }
+            for (unsigned k = 0, n = 1 + rng.below(2); k < n; ++k) {
+                switch (rng.below(5)) {   // clobbers without touching NZCV
+                case 0: w.push_back(logic_shift(rng.chance(60), rng.below(3), rng.below(4), rng.chance(30), g.src(), rng.below(16), g.src(), g.dest())); break;
+                case 1: { auto x = g.logic_imm(); if (((x >> 29) & 3) == 3) x &= ~(1u << 29); w.push_back(x); break; }   // not ANDS
+                case 2: w.push_back(g.bitfield()); break;
+                case 3: w.push_back(g.dp1()); break;
+                default: w.push_back(g.dp2()); break;
+                }
+            }
+            switch (rng.below(4)) {   // reader
+            case 0: w.push_back(g.csel()); break;
+            case 1: w.push_back(g.ccmp()); break;
+            case 2: w.push_back(g.adc()); break;
+            default:
+                w.push_back(bcond(rng.below(14), 2));
+                w.push_back(add_imm(true, false, false, 3, 3, 1));
+                break;
+            }
+            const auto ctx = r.context(0x4242 + i);
+            if (!r.run(w, ctx, "flags saved " + std::to_string(knob) + hex_words(w))) ++failures;
+        }
+    }
+    // subs; eor; csel; ret: the flags stay in EFLAGS (no conversion to ctx->nzcv) unless noflagsave.
+    const std::vector<std::uint32_t> fixed = {
+        add_shift(true, true, true, 1, 10, 1, 15, 15),        // subs x15, x15, x10, lsr #1
+        logic_shift(true, 2, 0, false, 11, 0, 16, 17),        // eor x17, x16, x11
+        csel(true, false, 16, 6, 0, 17, 17),                  // csel x17, x17, x16, vs
+        ret(),
+    };
+    core::set_p2_knobs_for_testing(0);
+    FX_CHECK(!materializes_flags(translate_words(fixed, true)));
+    core::set_p2_knobs_for_testing(core::knob_no_flag_save);
+    FX_CHECK(materializes_flags(translate_words(fixed, true)));
+    core::set_p2_knobs_for_testing(~0u);
+}
+
+// ---- CCMP fused with its only reader -----------------------------------------------
+
+// CMP/CMN; CCMP/CCMN (any condition and immediate NZCV); up to two fillers (a
+// flag-free ADD, or an EOR that clobbers EFLAGS: the answer is parked); B.cond
+// or a CSEL-family reader; then, half of the time, a compare that makes NZCV dead after the
+// reader (the fusion's condition). Differential against the reference with
+// and without the fusion; the fused form is branchless (smaller code).
+FX_TEST(core_ccmp_fused_with_reader) {
+    using namespace a64;
+    auto& r = runner();
+    Rng rng(0xcc3f05e);
+    InstGen g(rng);
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_ccmp_fusion)}) {
+        core::set_p2_knobs_for_testing(knob);
+        int failures = 0;
+        for (unsigned i = 0; i < 600 && failures < 6; ++i) {
+            std::vector<std::uint32_t> w;
+            const bool sf = rng.chance(60);
+            if (rng.chance(70)) w.push_back(add_shift(sf, true, true, 0, g.src(), 0, g.src(), 31));   // cmp
+            else w.push_back(add_imm(sf, rng.chance(50), true, 31, g.src_sp(), rng.below(16)));       // cmp/cmn #imm
+            w.push_back(g.ccmp());
+            for (unsigned k = 0, n = rng.below(3); k < n; ++k) {   // fillers: flag-free ADD, or EOR (parks the answer)
+                if (rng.chance(50)) w.push_back(add_imm(true, false, false, g.dest(), g.src_sp(), rng.below(64)));
+                else w.push_back(logic_shift(true, 2, 0, false, g.src(), 0, g.src(), g.dest()));
+            }
+            if (rng.chance(50)) {
+                w.push_back(g.csel());
+            } else {
+                w.push_back(bcond(rng.below(14), 2));
+                w.push_back(add_imm(true, false, false, 3, 3, 1));
+            }
+            if (rng.chance(50)) w.push_back(add_shift(true, true, true, 0, 2, 0, 1, 31));   // cmp x1, x2: NZCV dead before
+            const auto ctx = r.context(0x7777 + i);
+            if (!r.run(w, ctx, "ccmp fusion " + std::to_string(knob) + hex_words(w))) ++failures;
+        }
+    }
+    const std::vector<std::uint32_t> fixed = {
+        add_imm(true, false, true, 31, 16, 1),                // cmn x16, #1
+        ccmp(false, true, true, 2, 4, 12, 1),                 // ccmp w1, #2, #4, gt
+        add_imm(true, false, false, 16, 17, 11),              // add x16, x17, #11 (between, flag-free)
+        csel(true, false, 16, 1, 0, 17, 16),                  // csel x16, x17, x16, ne
+        add_shift(true, true, true, 0, 8, 0, 0, 31),          // cmp x0, x8
+        ret(),
+    };
+    core::set_p2_knobs_for_testing(0);
+    const auto fused = translate_words(fixed, true).code.size();
+    core::set_p2_knobs_for_testing(core::knob_no_ccmp_fusion);
+    const auto branchy = translate_words(fixed, true).code.size();
+    core::set_p2_knobs_for_testing(~0u);
+    FX_CHECK(fused < branchy);
+}
+
+// ---- GPR results reuse the destination's cached host ------------------------------
+
+// Random straight-line and diamond code (data processing, loads, compares and
+// branches): differential with and without reusable_gpr, and with the
+// opt-in mergedirty (dirty values into merge points). A max(x8, 3)
+// diamond keeps x8 in one host on both arms, so the merge needs no reload.
+FX_TEST(core_gpr_dest_reuse) {
+    using namespace a64;
+    auto& r = runner();
+    Rng rng(0x6e05e);
+    InstGen g(rng);
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_gpr_reuse), static_cast<unsigned>(core::knob_merge_dirty),
+                                static_cast<unsigned>(core::knob_merge_dirty | core::knob_no_gpr_reuse)}) {
+        core::set_p2_knobs_for_testing(knob);
+        int failures = 0;
+        for (unsigned i = 0; i < 300 && failures < 6; ++i) {
+            std::vector<std::uint32_t> w;
+            for (unsigned k = 0, n = 3 + rng.below(6); k < n; ++k) {
+                switch (rng.below(7)) {
+                case 0: w.push_back(g.add_sub_imm()); break;
+                case 1: w.push_back(g.logic_shift()); break;
+                case 2: w.push_back(g.move_wide()); break;
+                case 3: w.push_back(g.csel()); break;
+                case 4: w.push_back(g.bitfield()); break;
+                case 5: w.push_back(g.load_store()); break;
+                default:
+                    w.push_back(add_shift(true, true, true, 0, g.src(), 0, g.src(), 31));   // cmp
+                    w.push_back(bcond(rng.below(14), 2));
+                    w.push_back(g.add_sub_imm());
+                    break;
+                }
+            }
+            const auto ctx = r.context(0x9191 + i);
+            if (!r.run(w, ctx, "gpr reuse " + std::to_string(knob) + hex_words(w))) ++failures;
+        }
+    }
+    const std::vector<std::uint32_t> diamond = {
+        add_imm(true, true, true, 31, 8, 3),        // cmp x8, #3
+        bcond(10, 2),                               // b.ge L
+        movw(true, 2, 0, 3, 8),                     // mov x8, #3
+        add_imm(true, false, false, 8, 8, 1),       // L: add x8, x8, #1
+        add_imm(true, false, false, 9, 8, 2),       // add x9, x8, #2
+        ret(),
+    };
+    core::set_p2_knobs_for_testing(0);
+    const auto reuse = translate_words(diamond, true).code.size();
+    core::set_p2_knobs_for_testing(core::knob_no_gpr_reuse);
+    const auto fresh = translate_words(diamond, true).code.size();
+    core::set_p2_knobs_for_testing(~0u);
+    FX_CHECK(reuse <= fresh);
+}
+
+// ---- BR/BLR targets already in rcx --------------------------------------------------
+
+// The target of BR/BLR computed into rcx by the register cache (add x9, x10,
+// #4) is used in place: no reload of x9 from its context slot after the exit's
+// stores (take_value). Behaviour: core_calls_returns_rsb.
+FX_TEST(core_indirect_target_not_reloaded) {
+    using namespace a64;
+    // mov rcx, qword ptr [r15 + x_disp(9)] (disp8 -56): 49 8b 4f c8
+    static constexpr std::uint8_t kReload[] = {0x49, 0x8b, 0x4f, 0xc8};
+    for (const auto branch : {br(9), blr(9)}) {
+        // x1-x4 take r8-r11 (dirty), so x9 lands in rcx, the indirect jump's register.
+        const std::vector<std::uint32_t> words = {add_imm(true, false, false, 1, 10, 1), add_imm(true, false, false, 2, 10, 2),
+                                                  add_imm(true, false, false, 3, 10, 3), add_imm(true, false, false, 4, 10, 5),
+                                                  add_imm(true, false, false, 9, 10, 4), branch};
+        const auto region = translate_words(words, true);
+        FX_CHECK(std::search(region.code.begin(), region.code.end(), std::begin(kReload), std::end(kReload)) == region.code.end());
+    }
+}
+
+// Regression (round-4 deep fuzz, seed 40027669 variant 0): a CCMP fused with a
+// later reader across an EXTR and an SMULH. park_bool held the scratch it
+// parked the answer with; when that was rax or rdx, SMULH's take() threw
+// "register in use". Translation must succeed and match the reference, with
+// and without the fusion.
+FX_TEST(core_ccmp_fusion_parks_without_holding_a_register) {
+    auto& r = runner();
+    const std::vector<std::uint32_t> prog = {
+        0x139d339bu, 0xba5bab6du, 0x94000007u, 0xf10007ffu, 0x8b8e349au, 0x38c407ebu, 0xd3407ec6u, 0xfa4c9221u, 0x1400000au,
+        0x31001c82u, 0xb81f263au, 0xb10472ffu, 0xfa59a0eeu, 0x93c389c0u, 0x9b4e7d34u, 0x9ba25560u, 0xda8305c0u, 0xd65f03c0u,
+    };
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_ccmp_fusion)}) {
+        core::set_p2_knobs_for_testing(knob);
+        for (const bool abi : {false, true}) (void)translate_words(prog, abi);
+        for (unsigned k = 0; k < 4; ++k) r.run(prog, r.context(40027669u + k), "ccmp fusion park " + std::to_string(knob));
+    }
+    core::set_p2_knobs_for_testing(~0u);
 }

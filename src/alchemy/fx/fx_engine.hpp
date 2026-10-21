@@ -115,6 +115,12 @@ public:
     // (sys_icache_invalidate): drops the translations of those bytes
     // (fx::flush_guest_code; invalidate_engine_code calls it).
     void invalidate_code(std::uint64_t address, std::uint64_t size);
+    // The calling thread opens or closes a JIT write window
+    // (pthread_jit_write_protect_np; fx::guest_jit_write_window).
+    void jit_write_window(bool open);
+    // [copy, copy + size) holds an exact copy of the code at source
+    // (fx::register_guest_code_copy).
+    void code_copy(std::uint64_t copy, std::uint64_t source, std::uint64_t size);
     // Guest malloc heap: host heap memory is guest memory (VA == host VA).
     std::optional<std::uint64_t> heap_allocate(std::uint64_t size, std::uint64_t alignment);
     void heap_release(std::uint64_t address);
@@ -179,6 +185,11 @@ public:
     // The synthetic call at `address` reads and writes no SIMD/FP register:
     // its entry copies only the integer state (engine_adapter.hpp).
     void set_guest_call_integer_only(std::uint64_t address);
+    // The synthetic call at `address` is libSystem's `symbol`; for the pure
+    // memory/string functions (memcpy, memmove, memset, bzero, bcopy, memcmp,
+    // strlen) its native entry runs them on the guest registers directly and
+    // takes the handler only when that faults (engine_adapter.hpp).
+    void set_guest_call_leaf(std::uint64_t address, std::string_view symbol);
 
     // Called by the fx SVC hook on the thread running this engine.
     void handle_svc(void* guest_context, std::uint32_t immediate);

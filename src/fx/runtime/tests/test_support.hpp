@@ -54,6 +54,7 @@ void set_activation_context(void* context);   // returned by guest_activation_co
 
 // ---- cache / abi stand-ins ----------------------------------------------------------------------
 extern std::atomic<int> g_cache_stores;
+extern std::atomic<int> g_cache_copy_stores;   // cache_store_copy calls
 extern std::atomic<int> g_cache_configures;
 extern CacheConfig g_cache_config;
 // cache_lookup stand-in: regions "stored" for a pc (nullptr factory removes).

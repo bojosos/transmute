@@ -120,6 +120,13 @@ inline constexpr SseOp kZext[3] = {op::pmovzxbw, op::pmovzxwd, op::pmovzxdq};
 //   notblderived - TBL computes its adjusted indices itself (tier 2 may
 //             otherwise precompute them after the index register's
 //             definitions: EmitContext::vec_derived)
+//   oldvarshift - 16-bit lanes of register shifts (SSHL, URSHL, SQSHL, ...)
+//             through the shift-by-1/2/4/8/16 blend chain instead of the
+//             AVX2 dword variable shifts
+//   oldstruct - LD3 (Q)/LD4/ST4 (Q) with every chunk in its own temp (8-10
+//             XMM registers) instead of 6-7
+//   oldpmull8 - PMULL/PMULL2 .8B through the compare-and-mask chain instead of
+//             PMULLW by single-bit multipliers
 enum NeonKnob : std::uint32_t {
     neon_no_fold = 1u,
     neon_no_slot = 2u,
@@ -129,6 +136,9 @@ enum NeonKnob : std::uint32_t {
     neon_no_mask_fusion = 32u,
     neon_mask_no_rcx = 64u, // Test override: exercise the flags-saving guard.
     neon_no_tbl_derived = 128u,
+    neon_old_var_shift = 256u,
+    neon_old_pmull8 = 512u,
+    neon_old_struct = 1024u,
 };
 std::uint32_t neon_knob_bits();
 // Test override of the knobs (-1 = TRANSMUTE_FX_NEON). Not thread-safe.

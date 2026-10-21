@@ -69,8 +69,11 @@ Non-obvious decisions in `emit_neon*` / `emit_vector_memory*`.
 - FPSR.QC (cumulative saturation) is not modelled; tests do not compare FPSR.
 - Register shifts (SSHL/USHL/SRSHL/URSHL/SQSHL/UQSHL/SQRSHL/UQRSHL) use the
   signed low byte of each count lane. AVX2: vpsllv/vpsrlv/vpsrav (S/D; D
-  arithmetic via xor-sign). Otherwise and for B/H: binary decomposition of the
-  clamped count (1, 2, 4, ... esize) with blends. Rounding right shifts use
+  arithmetic via xor-sign); H through the dword shifts, even lanes in the low
+  halves and odd lanes in the high halves (the other half's bits masked off
+  first), one PBLENDW (`var_shift`; USHL/SSHL H need no count clamping, as on
+  S). Otherwise and for B: binary decomposition of the clamped count (1, 2,
+  4, ... esize) with blends. Rounding right shifts use
   t = x >> (k-1); r = t - (t >> 1), which never overflows.
 - Saturating narrowing shifts round with (x >> n) + ((x >> (n-1)) & 1).
 - TBL/TBX: idx +sat 0x70 sets bit 7 for idx >= 16 (pshufb then zeroes); table
@@ -95,6 +98,17 @@ size != D, DUP general .1D, store forms of LDnR); the family declines those.
 `testing::Snippet`'s trampoline does not preserve xmm6-xmm15 (Win64
 callee-saved). Sequences using more than six XMM registers corrupt the C++
 caller; the NEON tests use their own prologue/epilogue that saves them.
+
+## Whole-region and end-to-end checks
+
+- `neon_region_random_differential` (emit_neon_region_tests.cpp): random
+  regions from every group `dispatch_data` decodes plus SIMD&FP loads/stores in
+  every addressing mode, loops and branches, tier 2 and plain, against the
+  interpreter; a failure is minimized (words replaced by NOPs).
+  `NEON_RANDOM_PROGRAMS=<n>` / `NEON_RANDOM_SEED` for deep runs (400k pass).
+- `tests/fx/bench/neon_kernels.c` (build.ps1 variant `neonk`, ARM64 PE, run
+  with transmute-fx): codec-style NEON kernels, each compared with a scalar
+  model of the same instructions in the file (CHECK lines), and timed (BENCH).
 
 ## Address folding (EmitContext::address)
 
@@ -141,7 +155,9 @@ caller; the NEON tests use their own prologue/epilogue that saves them.
 (no ADD/SUB folding into SIMD&FP accesses, old byte-store encoding),
 `noslot` (no slot broadcasts), `notbltemp` (TBL index temp as before),
 `oldshl` (USHL/SSHL as before the cost audit), `nozero64` (always zero
-64-bit vector results), `old` (all). `TRANSMUTE_FX_FP=noslot|oldimm|oldmask|
+64-bit vector results), `oldvarshift` (H-lane register shifts by the blend
+chain), `oldpmull8` (PMULL .8B by compare-and-mask instead of PMULLW by
+single-bit multipliers), `old` (all). `TRANSMUTE_FX_FP=noslot|oldimm|oldmask|
 oldcvt|old` likewise for the fp family. Tests flip them in-process with
 `neon_set_knobs_for_testing` / `fp_set_knobs_for_testing`.
 

@@ -1268,7 +1268,10 @@ const FamilyEmitter& fp_family() {
         if (b & fpx::fp_no_slot) n += "+noslot";
         if (b & fpx::fp_old_imm) n += "+oldimm";
         if (b & fpx::fp_old_mask) n += "+oldmask";
-        if (b & fpx::fp_old_cvt) n += "+oldcvt";
+        n += (b & fpx::fp_old_cvt) ? "+oldcvt" : "+cvt2";   // +cvt2: the imm8 INT_MIN check
+        // The core keeps V zero-above facts across labels (Plan::vzero_join; its
+        // knob novzjoin is in the layout bits): cached fp code must follow it.
+        n += "+vzj";
         return n;
     }();
     static const FamilyEmitter family{name.c_str(), &fp_emit, &fp_describe};

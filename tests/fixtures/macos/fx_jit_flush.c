@@ -11,7 +11,14 @@
  *     rewrites that code: it must leave the stale loop and run the new code;
  *  5. mprotect of translated JIT code to RX and RW: the guest's protection
  *     is what mach_vm_region reports, also after fx write-protected the
- *     page for SMC and after code on it was invalidated.
+ *     page for SMC and after code on it was invalidated;
+ *  6. V8's write windows: pthread_jit_write_protect_np(0), new code next to
+ *     translated code and a rewrite, sys_icache_invalidate, (1); a rewrite
+ *     never flushed is current once the window closes; a thread spinning in
+ *     code rewritten inside a window leaves it at the flush;
+ *  7. vm_remap (copy) of this program's own text over MAP_JIT memory, as V8
+ *     places its embedded builtins: the copy runs, and once rewritten (RW,
+ *     store, RX, flush) runs the new code.
  * No SDK headers. Prints "fx jit flush: ok" and returns 0, else returns the
  * failed step number. */
 typedef unsigned long size_t;
@@ -33,6 +40,9 @@ extern void sys_icache_invalidate(void*, size_t);
 typedef unsigned mach_port_t;
 extern mach_port_t mach_task_self_;
 extern int mach_vm_region_recurse(mach_port_t, unsigned long*, unsigned long*, unsigned*, int*, unsigned*);
+extern void pthread_jit_write_protect_np(int);
+extern int vm_remap(mach_port_t, unsigned long*, unsigned long, unsigned long, int, mach_port_t, unsigned long, int,
+                    int*, int*, unsigned);
 
 #define PAGE 16384ul
 #define PROT_READ 1
@@ -70,6 +80,9 @@ static volatile int spin_flag = 0;
 static volatile int spin_entered = 0;
 static volatile int spin_result = -1;
 static spin_function spin_code;
+
+/* In this program's text: the copy in step 7 runs it from elsewhere. */
+__attribute__((noinline)) static int text_function(void) { return 77; }
 
 static void* spinner(void* unused) {
     (void)unused;
@@ -209,6 +222,83 @@ int main(void) {
         sys_icache_invalidate(code, 8);
         if (f() != 32 || protection_at(code) != (PROT_READ | PROT_EXEC)) return 40;
         if (munmap(code, PAGE) != 0) return 41;
+    }
+
+    /* 6. Write windows, as V8 brackets every code write. */
+    {
+        char* code = mmap(0, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        if (code == MAP_FAILED) return 50;
+        function a = (function)(code + 0x100), b = (function)(code + 0x200), n = (function)(code + 0x400);
+        pthread_jit_write_protect_np(0);
+        put_code((volatile unsigned*)(code + 0x100), 51);
+        put_code((volatile unsigned*)(code + 0x200), 52);
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(code + 0x100, 0x108);
+        if (a() != 51 || b() != 52) return 51;   /* translated: the page is write-protected */
+        for (unsigned i = 0; i < 20; ++i) {
+            pthread_jit_write_protect_np(0);
+            put_code((volatile unsigned*)(code + 0x400), 60 + i);   /* new code next to a and b */
+            put_code((volatile unsigned*)(code + 0x200), 80 + i);   /* b rewritten */
+            sys_icache_invalidate(code + 0x400, 8);
+            sys_icache_invalidate(code + 0x200, 8);
+            pthread_jit_write_protect_np(1);
+            if (a() != 51 || b() != (int)(80 + i) || n() != (int)(60 + i)) return 52;
+        }
+        /* Never flushed: current once the window has closed (fx checks the
+         * code it deferred; Darwin would need the flush). */
+        pthread_jit_write_protect_np(0);
+        put_code((volatile unsigned*)(code + 0x100), 53);
+        pthread_jit_write_protect_np(1);
+        if (a() != 53 || b() != 99) return 53;
+        /* A thread spinning in code on the page leaves it at the flush. */
+        volatile unsigned* w = (volatile unsigned*)(code + 0x800);
+        w[0] = 0xb9400001u;   /* loop: ldr w1, [x0] */
+        w[1] = 0x34ffffe1u;   /*       cbz w1, loop */
+        w[2] = MOV_W0(1);
+        w[3] = RET;
+        sys_icache_invalidate(code + 0x800, 16);
+        spin_flag = 0;
+        spin_entered = 0;
+        spin_result = -1;
+        spin_code = (spin_function)(code + 0x800);
+        pthread_t thread;
+        if (pthread_create(&thread, 0, spinner, 0) != 0) return 54;
+        for (int i = 0; i < 1000 && !spin_entered; ++i) usleep(1000);
+        usleep(50000);
+        if (spin_result != -1) return 55;
+        pthread_jit_write_protect_np(0);
+        w[0] = MOV_W0(3);
+        w[1] = RET;
+        sys_icache_invalidate(code + 0x800, 8);
+        pthread_jit_write_protect_np(1);
+        for (int i = 0; i < 5000 && spin_result == -1; ++i) usleep(1000);
+        if (spin_result != 3) {
+            spin_flag = 1;
+            return 56;
+        }
+        pthread_join(thread, 0);
+        if (munmap(code, PAGE) != 0) return 57;
+    }
+
+    /* 7. A copy of this program's text (vm_remap, copy FALSE, over MAP_JIT memory). */
+    {
+        char* code = mmap(0, 2 * PAGE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        if (code == MAP_FAILED) return 60;
+        unsigned long source = (unsigned long)&text_function & ~(PAGE - 1);
+        unsigned long offset = (unsigned long)&text_function - source;
+        unsigned long target = (unsigned long)code;
+        int current = 0, maximum = 0;
+        if (vm_remap(mach_task_self_, &target, PAGE, 0, 0x4000 /* VM_FLAGS_OVERWRITE */, mach_task_self_, source, 0,
+                     &current, &maximum, 0) != 0 || target != (unsigned long)code)
+            return 61;
+        function copied = (function)(code + offset);
+        if (copied() != 77 || copied() != 77 || text_function() != 77) return 62;
+        if (mprotect(code, PAGE, PROT_READ | PROT_WRITE) != 0) return 63;
+        put_code((volatile unsigned*)(code + offset), 78);
+        if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) return 64;
+        sys_icache_invalidate(code + offset, 8);
+        if (copied() != 78 || text_function() != 77) return 65;
+        if (munmap(code, 2 * PAGE) != 0) return 66;
     }
 
     puts("fx jit flush: ok");

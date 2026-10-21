@@ -208,6 +208,9 @@ struct ExitInfo {
     std::int32_t original;       // rel32 to the unlinked tail
     std::uint64_t target_pc;
     bool linked;
+    // The exit's node in the link or pending list of target_pc (regions.cpp
+    // ExitRefs; an exit is in at most one), so removing it is O(1).
+    std::uint32_t ref_node = UINT32_MAX;
 };
 
 // A fixed array inside a region's metadata block (a region and all its
@@ -247,6 +250,10 @@ struct Region {
     // A higher tier replaced all its entries: unreachable but not dead (still
     // on its pages, for SMC); its chunk counts it as dead (reclaim evicts it).
     bool retired{};
+    // JIT translations of registered code: a hash of the guest bytes (guest
+    // ranges) at install, never 0; 0 = not hashed (cached and image regions).
+    // A JIT write window's pages are checked against it (regions.cpp).
+    std::uint64_t guest_hash{};
 };
 
 // The options every JIT translation uses (also the translation-cache key).
@@ -353,6 +360,10 @@ WriteFault smc_handle_write_fault(std::uint64_t address, std::uint64_t& changes)
 class LiveCodeSource final : public CodeSource {
 public:
     bool read(std::uint64_t address, std::uint32_t& word) const override;
+    // Guest code, or committed guest memory that is read-only to the guest
+    // (not writable, not a page fx write-protected over a writable guest
+    // protection). Recorded like code reads (reads(), verify_reads).
+    bool read_data(std::uint64_t address, std::uint32_t& word) const override;
     bool function_bounds(std::uint64_t address, std::uint64_t& begin, std::uint64_t& end) const override;
     // pc already has a translated (or host) entry: the new region stops there
     // and links to it instead of translating covered code again.
@@ -372,11 +383,18 @@ private:
     mutable std::uint64_t page_{~std::uint64_t{0}};
     mutable bool page_ok_{};
     mutable std::uint64_t code_lo_{}, code_hi_{};   // guest code range of the last read
+    mutable std::uint64_t data_page_{~std::uint64_t{0}};   // read_data's last page and verdict
+    mutable bool data_page_ok_{};
     mutable std::vector<std::pair<std::uint64_t, std::uint32_t>> reads_;
 };
 // Inside memory registered with register_guest_code_memory (not image
 // text). Lock-free.
 bool in_registered_code_memory(std::uint64_t address) noexcept;
+// register_guest_code_copy: if `address` is in a copy of guest code, sets
+// `delta` (copy - source) and returns true. Lock-free.
+bool guest_code_copy_delta(std::uint64_t address, std::int64_t& delta) noexcept;
+// Ends the copies overlapping [begin, end) (invalidate_guest_code).
+void drop_guest_code_copies(std::uint64_t begin, std::uint64_t end);
 // The disjoint ranges registered now (stats, tests). Lock-free.
 std::size_t registered_code_range_count() noexcept;
 // ARM64 .pdata lookup: bounds of the function containing `address`.
@@ -387,6 +405,10 @@ bool pdata_function_bounds(const GuestModule& module, std::uint64_t address,
 // Bumped by every invalidation of translated code (and so by every guest
 // protection change, which invalidates first).
 std::uint64_t invalidation_epoch() noexcept;
+// Bumped by explicit invalidations only (fx::invalidate_guest_code, which every
+// guest protection change, unmap and decommit reaches, and
+// guest_protection_lowered); SMC faults and code flushes leave it.
+std::uint64_t memory_access_epoch() noexcept;
 
 // The personality's demand-commit hook (set_demand_commit_hook): true when it
 // made the page at `address` accessible for `access` (0 read, 1 write,
@@ -547,6 +569,12 @@ struct Counters {
     std::atomic<std::uint64_t> reclaim_scan_failures{};
     std::atomic<std::uint64_t> reclaim_ticks{};
     std::atomic<std::uint64_t> reclaim_scan_ticks{};
+    std::atomic<std::uint64_t> jit_window_deferred{};
+    std::atomic<std::uint64_t> jit_window_pages_checked{};
+    std::atomic<std::uint64_t> jit_window_regions_kept{};
+    std::atomic<std::uint64_t> jit_window_regions_killed{};
+    std::atomic<std::uint64_t> copy_translations{};
+    std::atomic<std::uint64_t> copy_cache_hits{};
 };
 inline std::uint64_t ticks_now() noexcept { return host::ticks(); }
 extern Counters g_counters;

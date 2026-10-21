@@ -275,6 +275,15 @@ FX_TEST(bench_host_callback_round_trip) {
     ctx.x[2] = 0;
     std::printf("  bench host callback round trip (BL -> trampoline -> C++ -> RSB return): %.1f ns; "
                 "IXC pending: %.1f ns; divss + call: %.1f ns\n", ns[0], ns[1], ns[2]);
+    // The same call as a leaf (register_host_leaf): no adapter, no FP handoff.
+    register_host_leaf(callee, [](GuestContext& ctx) { ++ctx.x[1]; return true; }, [](GuestContext&, void*) {}, nullptr);
+    double leaf = 1e30;
+    for (int round = 0; round < 3; ++round)
+        leaf = std::min(leaf, best_ns(3, [&] {
+            ctx.x[0] = kCalls;
+            call_guest_prepared(ctx, pm);
+        }) / kCalls);
+    std::printf("  bench host leaf round trip (BL -> leaf entry -> C++ -> RSB return): %.1f ns\n", leaf);
     unregister_host_entry(callee);
     set_region_factory(pm, nullptr);
 }

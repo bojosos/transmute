@@ -18,6 +18,13 @@ public:
     virtual ~CodeSource() = default;
     // Reads the 32-bit word at `address`. False if it is not readable guest code.
     virtual bool read(std::uint64_t address, std::uint32_t& word) const = 0;
+    // Reads a 32-bit word of read-only guest data that region formation may
+    // consult (jump and label tables in __DATA_CONST, .rdata, or code). False
+    // if it is not readable or the guest may write it. Only speed may depend
+    // on such data: the switch dispatch compares the guest's computed target
+    // with every table entry it takes, so a table changed later is still
+    // exact. Default: guest code only (read).
+    virtual bool read_data(std::uint64_t address, std::uint32_t& word) const { return read(address, word); }
     // Bounds [begin, end) of the function containing `address` (e.g. .pdata),
     // if known. Regions do not cross function bounds when they are known.
     virtual bool function_bounds(std::uint64_t address, std::uint64_t& begin,

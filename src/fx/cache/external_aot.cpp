@@ -49,6 +49,7 @@
 #include "fx/host/sync.hpp"
 #include "fx/host/thread.hpp"
 #include "fx/host/time.hpp"
+#include "fx/host/vm.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -201,6 +202,24 @@ public:
         reads_.emplace_back(address, word);
         return true;
     }
+    // The module's code, or its read-only data (__DATA_CONST after fixups:
+    // jump and label tables), as the JIT's LiveCodeSource::read_data.
+    bool read_data(std::uint64_t address, std::uint32_t& word) const override {
+        if (read(address, word)) return true;
+        if ((address & 3) != 0 || address < m_.base || address - m_.base >= m_.size) return false;
+        const auto page = address & ~std::uint64_t{0xfff};
+        if (page != data_page_) {
+            namespace vm = host::vm;
+            data_page_ = page;
+            vm::RegionInfo info;
+            data_page_ok_ = vm::query(reinterpret_cast<const void*>(page), info) && info.committed() &&
+                            (info.protect & vm::kGuard) == 0 &&
+                            ((info.protect & 0xff) == vm::kReadOnly || (info.protect & 0xff) == vm::kExecuteRead);
+        }
+        if (!data_page_ok_ || !read_word(address, word)) return false;
+        reads_.emplace_back(address, word);
+        return true;
+    }
     bool function_bounds(std::uint64_t address, std::uint64_t& begin, std::uint64_t& end) const override {
         if (!bounds_ || m_.starts.empty() || address < m_.base) return false;
         const auto rva = static_cast<std::uint32_t>(address - m_.base);
@@ -225,6 +244,8 @@ public:
 private:
     const XModule& m_;
     bool bounds_;
+    mutable std::uint64_t data_page_{~std::uint64_t{0}};
+    mutable bool data_page_ok_{};
     mutable std::vector<std::pair<std::uint64_t, std::uint32_t>> reads_;
 };
 
@@ -410,12 +431,16 @@ void finish_static(State& s, XModule& m) {
     for (const auto& r : keep) refs.push_back({r->bytes.data(), static_cast<std::uint32_t>(r->bytes.size())});
     if (refs.empty() || m.stem.empty()) return;
     if (!write_main(m.stem, m.key, refs, true, nullptr, nullptr, L".fxa")) return;
-    s.cold_files.fetch_add(1, std::memory_order_relaxed);
     cache_load_cold_files();
     // Lookups now find these regions in the cold file.
-    Exclusive lock(m.pool_lock);
-    m.index.clear();
-    m.records.clear();
+    {
+        Exclusive lock(m.pool_lock);
+        m.index.clear();
+        m.records.clear();
+    }
+    // Counted once the cold file serves lookups (a test waiting for it then
+    // looked up a region from the pool, intermittently: no cold hit).
+    s.cold_files.fetch_add(1, std::memory_order_relaxed);
 }
 
 // lock held: a module whose static phase is due and not finished, or null.

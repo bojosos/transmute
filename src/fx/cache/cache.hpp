@@ -34,6 +34,17 @@ bool cache_lookup(std::uint64_t guest_pc, TranslatedRegion& region);
 // (asynchronously). Regions outside guest modules are ignored.
 void cache_store(const TranslatedRegion& region);
 
+// (additive) Exact copies of a module's code at another address (see
+// register_guest_code_copy). cache_lookup_copy: the cached region for
+// `source_pc` (in the module) relocated by `delta` to the copy; pinned
+// records (code embedding module addresses without fixups) are refused. The
+// guest bytes are verified at the source; the caller checks the copy's.
+// cache_store_copy: a region translated in the copy, stored for the module
+// at its source addresses (region relocated by -delta); ignored if its code
+// embeds an address in the copy without a fixup.
+bool cache_lookup_copy(std::uint64_t source_pc, std::int64_t delta, TranslatedRegion& region);
+void cache_store_copy(const TranslatedRegion& region, std::int64_t delta);
+
 // Process exit / explicit flush: write pending regions.
 void cache_flush();
 // Process exit, after guest DLL_PROCESS_DETACH (other threads gone): appends

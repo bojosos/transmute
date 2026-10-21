@@ -438,7 +438,24 @@ unsigned multiple(EmitContext& ctx, std::uint32_t w) {
     const Mem m = post ? ptr(base) : base_offset(ctx, rn, 0);
     auto reg = [&](unsigned i) { return (rt + i) & 31; };
 
-    if (!load) {
+    if (!load && structure == 4 && size < 3 && neon_on(neon_old_struct)) {
+        // ST4: each 16-byte output chunk is stored as soon as it is built, and
+        // the second operand of every unpack may stay in its context slot:
+        // 3 temps and at most 4 sources (5 XMM registers when the odd sources
+        // are in memory; 10 before), so it fits beside 10 pinned registers.
+        const Xmm x0 = in_reg(ctx, source(ctx, reg(0))), x2 = in_reg(ctx, source(ctx, reg(2)));
+        const Src x1 = source(ctx, reg(1)), x3 = source(ctx, reg(3));
+        const Xmm t0 = v.temp(), t1 = v.temp(), c = v.temp();
+        for (unsigned half = 0; half < (q ? 2u : 1u); ++half) {
+            v.op(half ? op::punpckhdq : op::punpckldq, t0, x0, x1);   // a b a b
+            v.op(half ? op::punpckhdq : op::punpckldq, t1, x2, x3);   // c d c d
+            for (unsigned k = 0; k < 2; ++k) {
+                v.op(k ? op::punpckhqdq : op::punpcklqdq, c, t0, t1);
+                if (size < 2) v.pshufb(c, c, kUngroup4[size]);
+                mv.store(16, offset(m, static_cast<std::int32_t>(16 * (2 * half + k))), c);
+            }
+        }
+    } else if (!load) {
         Xmm x[4];
         for (unsigned i = 0; i < regs; ++i) x[i] = ctx.read_vec(reg(i));
         if (structure == 1) {
@@ -478,6 +495,28 @@ unsigned multiple(EmitContext& ctx, std::uint32_t w) {
                     mv.store(16, offset(m, static_cast<std::int32_t>(16 * i)), c[i]);
                 }
             }
+        } else if (size < 3 && neon_on(neon_old_struct)) {
+            // ST3: each chunk is built and stored before the next, 2 temps
+            // beside the 3 sources (5 XMM registers; 7 before). Stores may be
+            // partially performed when a later chunk faults.
+            const unsigned nchunks = (total + 15) / 16, esize = 1u << size;
+            const Xmm c = v.temp(), t = v.temp();
+            for (unsigned k = 0; k < nchunks; ++k) {
+                bool first = true;
+                for (unsigned j = 0; j < 3; ++j) {
+                    bool any = false;
+                    const Const128 control = scatter_control(3, esize, reg_bytes, k, j, any);
+                    if (!any) continue;
+                    if (first) {
+                        v.pshufb(c, x[j], control);
+                        first = false;
+                    } else {
+                        v.pshufb(t, x[j], control);
+                        v.por(c, c, t);
+                    }
+                }
+                mv.store(std::min(16u, total - 16 * k), offset(m, static_cast<std::int32_t>(16 * k)), c);
+            }
         } else {   // ST3
             const unsigned nchunks = (total + 15) / 16;
             Xmm c[3] = {v.temp(), v.temp(), v.temp()};
@@ -513,6 +552,82 @@ unsigned multiple(EmitContext& ctx, std::uint32_t w) {
                 for (unsigned i = 0; i + 1 < regs; ++i)
                     mv.load(reg_bytes, d[i], offset(m, static_cast<std::int32_t>(i * reg_bytes)), Gp::none);
                 v.mov(d[regs - 1], t);
+            }
+        } else if (neon_on(neon_old_struct) && size < 3 && (structure == 4 || (structure == 3 && q))) {
+            // LD4 and LD3 (128-bit) in 6 XMM registers instead of 8-10: as for
+            // LD1, the last chunk is loaded first into a temp (the fault
+            // probe), then the first chunk (a faulting load writes nothing),
+            // then the ones in between, which can no longer fault, straight
+            // into the destinations; the shuffles then work in place.
+            const Xmm t = ctx.temp_vec(), u = ctx.temp_vec();
+            const Xmm w3 = structure == 3 ? ctx.temp_vec() : Xmm{};
+            const unsigned nchunks = total / 16;   // 4 (LD4 Q), 2 (LD4 D), 3 (LD3 Q)
+            mv.load(16, t, offset(m, static_cast<std::int32_t>(16 * (nchunks - 1))), Gp::none);
+            for (unsigned i = 0; i < regs; ++i) d[i] = ctx.write_vec(reg(i));
+            for (unsigned k = 0; k + 1 < nchunks; ++k)
+                mv.load(16, d[k], offset(m, static_cast<std::int32_t>(16 * k)), Gp::none);
+            if (structure == 4 && q) {
+                if (size < 2) {
+                    for (unsigned i = 0; i < 3; ++i) v.pshufb(d[i], d[i], kGroup4[size]);
+                    v.pshufb(d[3], t, kGroup4[size]);
+                } else {
+                    v.mov(d[3], t);
+                }
+                // In-place 4x4 transpose of dwords: d[k] = {in0[k], in1[k], in2[k], in3[k]}.
+                v.op(op::punpckldq, t, d[0], d[1]);      // a0 b0 a1 b1
+                v.op(op::punpckhdq, u, d[0], d[1]);      // a2 b2 a3 b3
+                v.op(op::punpckldq, d[0], d[2], d[3]);   // c0 d0 c1 d1
+                v.op(op::punpckhdq, d[1], d[2], d[3]);   // c2 d2 c3 d3
+                v.op(op::punpcklqdq, d[2], u, d[1]);
+                v.op(op::punpckhqdq, d[3], u, d[1]);
+                v.op(op::punpckhqdq, d[1], t, d[0]);
+                v.op(op::punpcklqdq, d[0], t, d[0]);
+            } else if (structure == 4) {   // 64-bit registers: chunks d[0] and t
+                if (size < 2) {
+                    v.pshufb(d[0], d[0], kGroup4[size]);
+                    v.pshufb(t, t, kGroup4[size]);
+                }
+                v.op(op::punpckhdq, u, d[0], t);
+                v.op(op::punpckldq, t, d[0], t);
+                v.movq(d[0], t);
+                v.psrldq(d[1], t, 8);
+                v.movq(d[2], u);
+                v.psrldq(d[3], u, 8);
+            } else {   // LD3 Q: chunks d[0], d[1], t; outputs 2, 1 (into u), then 0
+                const unsigned esize = 1u << size;
+                const Xmm chunk[3] = {d[0], d[1], t};
+                const auto build = [&](unsigned j, Xmm out, unsigned first_chunk) {
+                    bool first = true;
+                    for (unsigned c = first_chunk; c < 3; ++c) {
+                        bool any = false;
+                        const Const128 control = gather_control(3, esize, 16, j, c, any);
+                        if (!any) continue;
+                        if (first) {
+                            v.pshufb(out, chunk[c], control);
+                            first = false;
+                        } else {
+                            v.pshufb(w3, chunk[c], control);
+                            v.por(out, out, w3);
+                        }
+                    }
+                    return !first;
+                };
+                build(2, d[2], 0);
+                build(1, u, 0);
+                // Output 0: chunks 1 and 2 into w3's partner, then chunk 0 in place.
+                bool any1 = false, any2 = false;
+                const Const128 c01 = gather_control(3, esize, 16, 0, 1, any1);
+                const Const128 c02 = gather_control(3, esize, 16, 0, 2, any2);
+                const Const128 c00 = [&] { bool a0 = false; return gather_control(3, esize, 16, 0, 0, a0); }();
+                if (any1) v.pshufb(w3, d[1], c01);
+                v.mov(d[1], u);   // output 1 (chunk 1 consumed)
+                if (any2) {
+                    v.pshufb(u, t, c02);
+                    if (any1) v.por(w3, w3, u);
+                    else v.mov(w3, u);
+                }
+                v.pshufb(d[0], d[0], c00);
+                if (any1 || any2) v.por(d[0], d[0], w3);
             }
         } else {
             const unsigned nchunks = (total + 15) / 16;

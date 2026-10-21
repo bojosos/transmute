@@ -1,0 +1,40 @@
+<!doctype html>
+<!-- Project-authored: a 50-pixel box moved by requestAnimationFrame, plus a little canvas drawing, for the fx
+     perf suite's frame-rate check (web_visit.ps1 -Action fps; docs/FX_PERF.md). -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>fx perf rAF box</title>
+<style>
+  body { margin: 0; background: #202830; }
+  #box { position: absolute; width: 50px; height: 50px; background: #e0a030; left: 0; top: 40px; }
+  canvas { position: absolute; left: 0; top: 120px; }
+</style>
+</head>
+<body>
+<div id="box"></div>
+<canvas id="c" width="640" height="360"></canvas>
+<script>
+  const box = document.getElementById('box');
+  const ctx = document.getElementById('c').getContext('2d');
+  let x = 0, dir = 1, frame = 0;
+  function tick() {
+    x += 4 * dir;
+    if (x > 600 || x < 0) dir = -dir;
+    box.style.transform = 'translateX(' + x + 'px)';
+    ctx.fillStyle = '#304050';
+    ctx.fillRect(0, 0, 640, 360);
+    for (let i = 0; i < 24; i++) {
+      ctx.fillStyle = 'hsl(' + ((frame * 3 + i * 15) % 360) + ',70%,55%)';
+      const a = (frame + i * 10) * 0.05;
+      ctx.beginPath();
+      ctx.arc(320 + Math.cos(a) * (40 + i * 5), 180 + Math.sin(a) * (30 + i * 4), 10, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    frame++;
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>
+</body>
+</html>

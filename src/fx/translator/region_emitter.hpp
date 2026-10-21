@@ -135,7 +135,10 @@ public:
 private:
     // fp/neon (additive): forget which V registers are known zero above bit
     // 32/64. Called at labels, helper calls and exits.
-    void forget_vec_zero() { vzero32_ = vzero64_ = 0; }
+    void forget_vec_zero() {
+        vzero32_ = vzero64_ = 0;
+        vzwritten_ = ~0u;   // p3: as if every V register were written (vzero_record)
+    }
     using Gp = x64::Gp;
     using Mem = x64::Mem;
     using Cond = x64::Cond;
@@ -204,6 +207,10 @@ private:
     mutable std::uint8_t next_use_reload_[64]{};
     mutable std::uint8_t next_use_distance_[64]{};
     void take(Gp r);
+    // take(r) for an implicit use of guest value `v` in r (the target of BR,
+    // BLR): when r already caches v's guest, the value stays in r (stored
+    // first if dirty) instead of being evicted and reloaded from the context.
+    void take_value(Gp r, const Val& v);
     [[nodiscard]] bool is_free(Gp r) const { return (free_gpr_ >> x64::id(r)) & 1u; }
     x64::Xmm alloc_vec();
     void reset_scratch();
@@ -233,6 +240,13 @@ private:
     void keep_matching(const CacheSnapshot& e, std::uint32_t& keep_g, std::uint32_t& keep_v) const;
     void carried_dirty(std::int32_t index, std::uint32_t& keep_g, std::uint32_t& keep_v) const;
     [[nodiscard]] bool leaves_loop(std::int32_t index, std::int32_t target) const;
+    // A conditional branch whose internal successors each have it as their
+    // only predecessor (its fall-through continues the block; a taken target
+    // takes over the whole cache, dirty entries included) and whose exits
+    // spill their dirty snapshot: the dirty cache stays in registers across
+    // it instead of being stored first.
+    [[nodiscard]] bool dirty_crosses_branch(std::int32_t index) const;
+    [[nodiscard]] bool dirty_into_merge(std::int32_t target) const;
     void evict_gpr(unsigned h);   // drop host h's entry, storing it first if dirty
     void evict_vec(unsigned h);
     void cache_drop_host(RegCache& c, unsigned h);
@@ -333,7 +347,10 @@ private:
     void load_pins();
     // Region entries (start, entry stubs): evicted convention registers go to
     // the context, then the other pins are loaded (convention pins are live).
-    void entry_pins();
+    void entry_pins(std::int32_t index);   // at the entry of instruction `index`
+    // Pinned GPRs the straight-line code from entry `index` overwrites before
+    // anything can observe them (read, fault, exit, block end): not loaded there.
+    [[nodiscard]] std::uint32_t pins_dead_at_entry(std::int32_t index) const;
     // Dirty pins to the context, convention pins included (before helpers).
     void flush_pins(std::uint64_t dirty);
     // Exits (to translated code or the runtime's stubs): dirty pins except the
@@ -347,6 +364,9 @@ private:
 
     // ---- flags -----------------------------------------------------------------
     [[nodiscard]] bool keep_flags() const;
+    bool save_flags_around();
+    [[nodiscard]] std::int32_t ccmp_bool_reader() const;
+    [[nodiscard]] Gp reusable_gpr(unsigned index) const;
     void prepare_clobber();
     void materialize();
     void materialize_state(FlagsState state, bool save_rax);
@@ -608,6 +628,22 @@ private:
     // zero on the current straight-line path (see EmitContext::vec_zero_above).
     std::uint32_t vzero32_{};
     std::uint32_t vzero64_{};
+    // p3 (Plan::vzero_join): the facts survive labels. After every emitted
+    // instruction the facts are recorded with the V registers its block wrote
+    // so far (vzero_record). A block starts with the AND of its predecessors'
+    // facts (vzero_block_start): of those emitted earlier in this pass, or, in
+    // tier 2's pass 2, the fixpoint over all of them from pass 1's records
+    // (vzero_solve: loop-invariant values keep their facts across back
+    // edges). Region entries start with none, as does a block with an
+    // unrecorded predecessor (one inside a fused span).
+    void vzero_prepare();
+    void vzero_solve();
+    void vzero_record(std::int32_t last);
+    void vzero_block_start(std::int32_t index);
+    void vzero_finish();
+    std::uint32_t vzwritten_{};   // V registers written since the block start (or forgotten)
+    std::int32_t vzblock_{-1};    // the current block's leader (-1: region start)
+    bool vzsolved_{};             // pass 2: s_.vz_in32/64 hold the block starts' facts
     // Per-thread reusable storage (no per-region allocations).
     struct CacheSnapshot {
         RegCache gpr;
@@ -666,6 +702,12 @@ private:
         std::vector<EdgeRec> edge_recs;       // pass 1 (cleared by run)
         std::vector<CacheSnapshot> presets;   // pass 2 entry states (built between the passes)
         std::vector<std::int32_t> preset_of;  // leader -> presets index, -1
+        // p3: V zero-above facts after each instruction (this pass; pass 1's
+        // kept for pass 2), predecessor lists, entry blocks (vzero_*).
+        std::vector<std::uint32_t> vz32, vz64, vz1_32, vz1_64, vz_w, vz1_w, vz_in32, vz_in64;
+        std::vector<std::int32_t> vz_blk, vz1_blk;
+        std::vector<std::uint8_t> vz_rec, vz1_rec, vz_entry;
+        std::vector<std::int32_t> vz_pred_head, vz_pred_next, vz_pred_from;
     };
     // ---- cross-block register cache --------------------------------------------
     // Every leader has an entry state (s_.cache_slot -> s_.cache_snaps): the
@@ -696,6 +738,12 @@ private:
     void jump_edge(std::int32_t target, std::int32_t from, bool fall_through);
     bool carry_{true};
     bool carry_clean_{};   // carried entries are always clean (dirty ones stored before every branch)
+    std::int32_t bool_reader_{-1};   // e_ccmp fusion: this reader's condition() is NE
+    bool bool_in_slot_{};             // e_ccmp fusion: the answer is parked in the context (park_bool)
+    void park_bool();
+    bool flags_saved_{};   // save_flags_around: host flags saved in ah/al until end_instruction
+    bool branch_dirty_{};
+    bool merge_dirty_{};   // opt-in: dirty entries cross forward edges into merge points (dirty_into_merge)  // dirty entries cross branches into single-predecessor blocks (dirty_crosses_branch)
 
     // ---- tier 2: region-wide analyses (region_alloc.cpp) ------------------------
     // Liveness over the region's edges (s_.olive_in/out, s_.rlive_in; GPRs in

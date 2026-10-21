@@ -3,12 +3,17 @@
 // the RSB), indirect jumps, literal loads and interpreted instructions.
 // Translated execution is compared with the reference interpreter stepping
 // word by word (owner: translator core).
+// Deeper runs (integration gates): TRANSMUTE_FX_FUZZ_SCALE=<n> runs n times as
+// many programs per test, TRANSMUTE_FX_FUZZ_SEED=<s> starts at other seeds.
 #include "fx/testing/test.hpp"
 #include "fx/translator/core_test_encode.hpp"
 #include "fx/translator/core_test_gen.hpp"
 #include "fx/translator/core_test_machine.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -185,7 +190,14 @@ std::string hexdump(const std::vector<std::uint32_t>& w) {
     return s;
 }
 
+std::uint64_t env_number(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    return value && *value ? std::strtoull(value, nullptr, 10) : fallback;
+}
+
 void fuzz(std::uint64_t first, std::uint64_t count, unsigned variant) {
+    count *= std::max<std::uint64_t>(1, env_number("TRANSMUTE_FX_FUZZ_SCALE", 1));
+    first += env_number("TRANSMUTE_FX_FUZZ_SEED", 0) * 10'000'000;
     static DiffRunner r;
     const auto saved = r.machine.options;
     int failures = 0;
@@ -200,13 +212,21 @@ void fuzz(std::uint64_t first, std::uint64_t count, unsigned variant) {
         case 3: r.machine.options.interrupt_checks = false; break;
         default: break;
         }
-        if (!r.run(program.words, ctx, "fuzz seed " + std::to_string(seed))) {
+        bool ok = false;
+        try {
+            ok = r.run(program.words, ctx, "fuzz seed " + std::to_string(seed));
+        } catch (const std::exception& e) {   // a translator exception names its seed and program too
+            std::fprintf(stderr, "    fuzz seed %llu (variant %u): exception: %s\n", static_cast<unsigned long long>(seed),
+                         variant, e.what());
+        }
+        if (!ok) {
             ++failures;
             std::fprintf(stderr, "    program: %s\n", hexdump(program.words).c_str());
         }
     }
     r.machine.options = saved;
     r.machine.link = true;
+    FX_CHECK_EQ(failures, 0);   // mismatches also fail inside run(); exceptions only here
 }
 
 } // namespace
