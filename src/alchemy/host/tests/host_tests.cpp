@@ -820,7 +820,11 @@ void real_backend() {
         host::time::sleep_ns(20'000'000);
         require(stopped >= 4 && fired == stopped, "a cancelled periodic timer stops");
     }
-    require(host::time::continuous_ns() >= host::time::monotonic_ns(), "continuous time counts at least the unbiased time");
+    // The clocks differ only by the time the machine has slept, zero on a machine
+    // that never slept: read the unbiased one first, then the continuous one.
+    const auto unbiased = host::time::monotonic_ns();
+    const auto continuous = host::time::continuous_ns();
+    require(continuous >= unbiased, "continuous time counts at least the unbiased time");
     const auto tick = host::time::tick_ms();
     host::time::sleep_ns(20'000'000);
     require(static_cast<std::uint32_t>(host::time::tick_ms() - tick) >= 10, "tick_ms advances");

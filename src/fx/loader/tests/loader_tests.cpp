@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <set>
 #include <thread>
@@ -780,13 +781,22 @@ FX_TEST(search_path_directories) {
     FX_REQUIRE(lib);
     FX_CHECK(module_named(L"guest_leaf.dll") != nullptr);
     FX_CHECK_EQ(run_guest(proc(lib, "guest_answer")), 42u);
-    // Without it the dependency is missing: the load still succeeds.
-    fresh_loader();
-    loader_configure(config);
-    const std::uint64_t lib2 = guest_load_library(legacy_fixture(L"guest_library.dll"), 0);
-    FX_CHECK(lib2 != 0);
-    FX_CHECK(module_named(L"guest_leaf.dll") == nullptr);
-    FX_CHECK(has_diagnostic(LoaderDiagnostic::Kind::missing_dll, "guest_leaf.dll"));
+    // Without it the dependency is missing: the load still succeeds. The default
+    // search includes the current directory, which under ctest can be the fixture
+    // directory itself, so this case runs from the temporary directory.
+    {
+        const auto previous = std::filesystem::current_path();
+        std::filesystem::current_path(std::filesystem::temp_directory_path());
+        fresh_loader();
+        loader_configure(config);
+        const std::uint64_t lib2 = guest_load_library(legacy_fixture(L"guest_library.dll"), 0);
+        const bool leaf_missing = module_named(L"guest_leaf.dll") == nullptr;
+        const bool diagnosed = has_diagnostic(LoaderDiagnostic::Kind::missing_dll, "guest_leaf.dll");
+        std::filesystem::current_path(previous);
+        FX_CHECK(lib2 != 0);
+        FX_CHECK(leaf_missing);
+        FX_CHECK(diagnosed);
+    }
     // LOAD_WITH_ALTERED_SEARCH_PATH also searches the DLL's directory.
     fresh_loader();
     loader_configure(config);

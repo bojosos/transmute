@@ -326,12 +326,22 @@ DarwinServices::Impl::UnixAddress DarwinServices::Impl::unix_address(const trans
     result.guest.assign(bytes.begin(), end);
     if (result.guest.empty()) throw ServiceError{einval};
     auto host = translate_path(result.guest);
+    // Follow links to the placeholder they name, whose path names the socket
+    // file: symlink records, and the host symlinks symlink(2) makes where the
+    // host allows them (an administrator, or Developer Mode on Windows).
     for (int hops = 0; hops < 32; ++hops) {
-        const auto record = libsystem::symlink_record(host);
-        if (!record) break;
+        if (const auto record = libsystem::symlink_record(host)) {
+            if (hops == 31) throw ServiceError{62};   // ELOOP
+            host = record->front() == '/' ? translate_path(*record) : (host.parent_path() / std::filesystem::path(std::u8string(
+                reinterpret_cast<const char8_t*>(record->data()), record->size()))).lexically_normal();
+            continue;
+        }
+        std::error_code error;
+        if (!std::filesystem::is_symlink(host, error)) break;
+        const auto target = std::filesystem::read_symlink(host, error);
+        if (error) break;
         if (hops == 31) throw ServiceError{62};   // ELOOP
-        host = record->front() == '/' ? translate_path(*record) : (host.parent_path() / std::filesystem::path(std::u8string(
-            reinterpret_cast<const char8_t*>(record->data()), record->size()))).lexically_normal();
+        host = (target.is_absolute() ? target : host.parent_path() / target).lexically_normal();
     }
     result.host = host;
     if (connecting) {

@@ -7649,12 +7649,19 @@ bool ReferenceEngine::execute(std::uint32_t instruction) {
         }
         return false;
     }
+    // LDRSB/LDRSH (unsigned offset): opc<0> (bit 22) set sign-extends into W and
+    // clears the upper half, clear sign-extends into X. The W result is formed
+    // here, from the opc bit: built by MSVC 19.51 (Visual Studio 2026) on the CI
+    // runner, the earlier form of these two branches returned W results
+    // sign-extended to 64 bits, while the other LDRSB/LDRSH forms were right
+    // (test_reference_signed_narrow_loads).
     if (memory_class == 0x39c00000U || memory_class == 0x39800000U) {
         const auto address = reg(rn, true) + ((instruction >> 10) & 0xfffU);
-        const auto value = static_cast<std::int64_t>(
-            static_cast<std::int8_t>(read8(address)));
-        set_reg(rd, static_cast<std::uint64_t>(value),
-                memory_class == 0x39800000U);
+        const auto loaded = static_cast<std::int8_t>(read8(address));
+        const std::uint64_t value = (instruction & 0x00400000U) != 0
+            ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::int32_t>(loaded)))
+            : static_cast<std::uint64_t>(static_cast<std::int64_t>(loaded));
+        set_reg(rd, value, true);
         return false;
     }
     if (memory_class == 0x79c00000U || memory_class == 0x79800000U) {
@@ -7662,10 +7669,11 @@ bool ReferenceEngine::execute(std::uint32_t instruction) {
                              ((instruction >> 10) & 0xfffU) * 2U;
         const auto raw = static_cast<std::uint16_t>(read8(address)) |
                          static_cast<std::uint16_t>(read8(address + 1) << 8);
-        const auto value = static_cast<std::int64_t>(
-            static_cast<std::int16_t>(raw));
-        set_reg(rd, static_cast<std::uint64_t>(value),
-                memory_class == 0x79800000U);
+        const auto loaded = static_cast<std::int16_t>(raw);
+        const std::uint64_t value = (instruction & 0x00400000U) != 0
+            ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::int32_t>(loaded)))
+            : static_cast<std::uint64_t>(static_cast<std::int64_t>(loaded));
+        set_reg(rd, value, true);
         return false;
     }
     if (memory_class == 0xf9400000U || memory_class == 0xf9000000U ||

@@ -22,11 +22,16 @@ void test_guest_opengl_draw_pipeline() {
     expect(format != 0 && ::SetPixelFormat(host.dc, format, &descriptor), "draw test pixel format failed");
     host.context = ::wglCreateContext(host.dc);
     expect(host.context != nullptr && ::wglMakeCurrent(host.dc, host.context), "draw test context failed");
+    // Without a GPU driver Windows offers only its OpenGL 1.1 software renderer
+    // (no WGL_ARB_create_context, no core profile), so there is nothing to draw with.
+    const auto* renderer = reinterpret_cast<const char*>(::glGetString(GL_RENDERER));
+    const std::string on_renderer = std::string(" (renderer: ") + (renderer != nullptr ? renderer : "unknown") + ")";
     const auto create_context = reinterpret_cast<HGLRC(WINAPI*)(HDC, HGLRC, const int*)>(::wglGetProcAddress("wglCreateContextAttribsARB"));
-    expect(create_context != nullptr, "draw test requires Blender's modern WGL context path");
+    if (create_context == nullptr)
+        skip_test("no WGL_ARB_create_context, which Blender's modern WGL context path needs" + on_renderer);
     const int attributes[]{0x2091, 4, 0x2092, 3, 0x9126, 1, 0};
     const auto modern = create_context(host.dc, nullptr, attributes);
-    expect(modern != nullptr, "draw test could not create a core 4.3 context");
+    if (modern == nullptr) skip_test("the driver offers no OpenGL 4.3 core context" + on_renderer);
     ::wglMakeCurrent(nullptr, nullptr);
     ::wglDeleteContext(host.context);
     host.context = modern;

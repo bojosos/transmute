@@ -173,6 +173,7 @@ void test_shared_pair_vector_admission_alignment() {
 void test_shared_pair_vector_element_contention() {
     constexpr std::uint64_t data = 0x50d010000ULL;
     constexpr std::uint64_t iterations = 25'000;
+    OverlapCheck overlap("pair/SIMD contention workers");
     for (const auto form : shared_pair_vector_forms) {
         std::vector<std::uint32_t> words{form.load};
         if (form.vector) {
@@ -298,10 +299,9 @@ void test_shared_pair_vector_element_contention() {
         expect(before && parent.write_revision(data, 32) ==
                    *before + iterations * 2 * (form.pair ? 2U : 1U) &&
                    parent.try_read_contiguous(data, scalar_bytes) == second &&
-                   (form.bytes == 16
-                       ? parent.native_concurrency_stats().shared_read_leases == leases &&
-                           parent.native_concurrency_stats().peak_shared_read_leases == 0
-                       : parent.native_concurrency_stats().peak_shared_read_leases >= 2),
+                   (form.bytes != 16 ||
+                    (parent.native_concurrency_stats().shared_read_leases == leases &&
+                     parent.native_concurrency_stats().peak_shared_read_leases == 0)),
                "pair/SIMD contention after stack allocation lost history or admission: width=" +
                    std::to_string(form.bytes) + " pair=" + std::to_string(form.pair) +
                    " vector=" + std::to_string(form.vector) +
@@ -311,12 +311,17 @@ void test_shared_pair_vector_element_contention() {
                    " value=" + std::to_string(parent.try_read_contiguous(data, scalar_bytes).value_or(0)) +
                    " expected_value=" + std::to_string(second) +
                    " peak=" + std::to_string(parent.native_concurrency_stats().peak_shared_read_leases));
+        if (form.bytes != 16)
+            overlap.observe(parent.native_concurrency_stats().peak_shared_read_leases >= 2,
+                            "width " + std::to_string(form.bytes) + " pair " + std::to_string(form.pair) +
+                                " vector " + std::to_string(form.vector));
         if (form.bytes == 16)
             for (unsigned offset = 0; offset != form.bytes * (form.pair ? 2U : 1U);
                  offset += 8)
                 expect(parent.read64(data + offset) == second,
                        "exclusive Q contention lost the final pattern in a 64-bit lane");
     }
+    overlap.finish();
 }
 
 void test_shared_pair_vector_precise_faults() {

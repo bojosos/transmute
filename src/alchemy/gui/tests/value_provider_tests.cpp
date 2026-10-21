@@ -75,6 +75,10 @@ void electron(Fixture& f) {
         // dyld's functions are the module loader's (module_loader.cpp), not a provider's.
         const std::string_view symbol = item.symbol;
         if (symbol.starts_with("__dyld_") || symbol.starts_with("_dl") || symbol == "__NSGetExecutablePath" || symbol == "dyld_stub_binder") continue;
+#ifndef ALCHEMY_HAVE_VULKAN_HEADERS
+        // Metal's exports come from Metal on Vulkan; without the headers only the headless shell exists.
+        if (std::string_view(item.library) == "/System/Library/Frameworks/Metal.framework/Versions/A/Metal") continue;
+#endif
         if (f.process.resolve(item.library, item.symbol)) continue;
         if (missing++ < 100) names += std::string("\n  ") + item.library + " " + item.symbol;
     }

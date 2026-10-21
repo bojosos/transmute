@@ -142,11 +142,13 @@ void check_concurrent_native_regions(bool register_only) {
                "parallel native region observed torn writes or lost guest steps");
     }
     const auto concurrency = parent.native_concurrency_stats();
-    expect(concurrency.shared_read_leases != 0 &&
-               concurrency.peak_shared_read_leases >= 2,
-           "actual translated workers never held overlapping read-only native leases: leases=" +
-               std::to_string(concurrency.shared_read_leases) + " peak=" +
-               std::to_string(concurrency.peak_shared_read_leases));
+    expect(concurrency.shared_read_leases != 0,
+           "actual translated workers took no read-only native leases");
+    OverlapCheck overlap("translated read-only workers");
+    overlap.observe(concurrency.peak_shared_read_leases >= 2,
+                    "leases=" + std::to_string(concurrency.shared_read_leases) + " peak=" +
+                        std::to_string(concurrency.peak_shared_read_leases));
+    overlap.finish();
 }
 
 void test_concurrent_native_read_regions() {
@@ -347,14 +349,16 @@ void test_concurrent_native_scalar_stores() {
     expect(before && parent.write_revision(data, 64) ==
                *before + iterations * threads.size(),
            "parallel native journals lost or duplicated store revisions");
-    expect(concurrency.peak_shared_read_leases >= 2,
-           "actual native store workers never overlapped shared execution: leases=" +
-               std::to_string(concurrency.shared_read_leases) + " peak=" +
-               std::to_string(concurrency.peak_shared_read_leases));
+    OverlapCheck overlap("native store workers");
+    overlap.observe(concurrency.peak_shared_read_leases >= 2,
+                    "leases=" + std::to_string(concurrency.shared_read_leases) + " peak=" +
+                        std::to_string(concurrency.peak_shared_read_leases));
+    overlap.finish();
 }
 
 void test_concurrent_native_scalar_widths() {
     struct Form { unsigned bytes; std::uint32_t load; std::uint32_t store; };
+    OverlapCheck overlap("native scalar width workers");
     for (const auto form : {
              Form{1, 0x39400003U, 0x39000001U},
              Form{2, 0x79400003U, 0x79000001U},
@@ -427,10 +431,12 @@ void test_concurrent_native_scalar_widths() {
                        std::to_string(form.bytes));
         }
         expect(before && parent.write_revision(data, 8) == *before + iterations * 2 &&
-                   parent.try_read_contiguous(data, form.bytes) == second &&
-                   parent.native_concurrency_stats().peak_shared_read_leases >= 2,
-               "parallel scalar width execution lost stores, revisions or overlap");
+                   parent.try_read_contiguous(data, form.bytes) == second,
+               "parallel scalar width execution lost stores or revisions");
+        overlap.observe(parent.native_concurrency_stats().peak_shared_read_leases >= 2,
+                        "width " + std::to_string(form.bytes));
     }
+    overlap.finish();
 }
 
 void test_shared_native_scalar_alignment_retries() {
@@ -575,6 +581,7 @@ void test_shared_native_store_checked_fallbacks() {
 
 void test_shared_native_lse_contention() {
     using transmute::jit_detail::NativeLseOperation;
+    OverlapCheck overlap("translated LSE workers");
     for (const auto operation : {NativeLseOperation::add, NativeLseOperation::eor,
                                  NativeLseOperation::compare_swap}) {
         for (const auto width : {1U, 2U, 4U, 8U}) {
@@ -642,10 +649,11 @@ void test_shared_native_lse_contention() {
                        sum == expected_sum && before &&
                        parent.write_revision(data, width) == *before + total,
                    "shared guest LSE lost an update, old value, CAS outcome or journal revision");
-            expect(parent.native_concurrency_stats().peak_shared_read_leases >= 2,
-                   "actual translated LSE workers never overlapped shared execution");
+            overlap.observe(parent.native_concurrency_stats().peak_shared_read_leases >= 2,
+                            "width " + std::to_string(width));
         }
     }
+    overlap.finish();
 }
 
 void test_shared_native_lse_monitor_outcomes() {
@@ -747,7 +755,9 @@ void test_shared_native_lse_plain_store_interference() {
                "failed CAS observed a torn ordinary store or wrote its replacement");
     }
     expect(before && parent.write_revision(data, 8) == *before + iterations * 4 &&
-               parent.read64(data) <= 1 &&
-               parent.native_concurrency_stats().peak_shared_read_leases >= 2,
-           "ordinary-store/LSE interference lost shared execution or dirtied failed-CAS history");
+               parent.read64(data) <= 1,
+           "ordinary-store/LSE interference dirtied failed-CAS history");
+    OverlapCheck overlap("ordinary-store and LSE workers");
+    overlap.observe(parent.native_concurrency_stats().peak_shared_read_leases >= 2);
+    overlap.finish();
 }

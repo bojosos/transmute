@@ -288,6 +288,9 @@ void expect(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
 }
 
+using transmute::test_detail::OverlapCheck;
+using transmute::test_detail::skip_test;
+
 void expect_failure(const std::function<void()>& action, std::string_view message) {
     try {
         action();
@@ -2923,6 +2926,27 @@ void test_jit_register_offset_memory_access() {
            "JIT accepted reserved register-offset memory form");
 }
 
+// The reference engine's own unsigned-offset LDRSB/LDRSH results, W and X.
+void test_reference_signed_narrow_loads() {
+    constexpr std::uint64_t data = 0x500000000ULL;
+    struct Case { std::uint32_t opcode; std::uint64_t expected; const char* name; };
+    for (const auto& c : {Case{0x39c00148U, 0xffffff81ULL, "ldrsb w8,[x10]"},
+                          Case{0x39800148U, 0xffffffffffffff81ULL, "ldrsb x8,[x10]"},
+                          Case{0x79c00148U, 0xffff8081ULL, "ldrsh w8,[x10]"},
+                          Case{0x79800148U, 0xffffffffffff8081ULL, "ldrsh x8,[x10]"}}) {
+        auto image = transmute::PeImage::parse(executable({c.opcode, 0xd65f03c0U}));
+        transmute::ReferenceEngine engine(image);
+        engine.map_memory(data, 64);
+        engine.write64(data, 0x8877665544338081ULL);
+        engine.set_initial_register(8, UINT64_MAX);
+        engine.set_initial_register(10, data);
+        static_cast<void>(engine.run());
+        expect(engine.state().x[8] == c.expected,
+               std::string("reference ") + c.name + " gave " + std::to_string(engine.state().x[8]) +
+                   ", expected " + std::to_string(c.expected));
+    }
+}
+
 void test_jit_narrow_memory_access() {
     constexpr std::uint64_t data = 0x500000000ULL;
     constexpr std::uint64_t source_value = 0xfedcba987654ab81ULL;
@@ -2993,24 +3017,39 @@ void test_jit_narrow_memory_access() {
                         : size == 2 ? 0x887766557654ab81ULL
                                     : source_value)
                     : initial_memory;
-                expect(actual.instructions == expected.instructions &&
-                           optimized.state().x == reference.state().x &&
-                           optimized.state().sp == reference.state().sp &&
-                           optimized.state().pc == reference.state().pc &&
-                           optimized.state().nzcv == reference.state().nzcv &&
-                           optimized.state().x[8] == expected_register &&
-                           optimized.state().x[10] == expected_base &&
-                           optimized.state().x[12] == expected_register + 3 &&
-                           optimized.read64(target) == expected_memory &&
-                           optimized.jit_executed_instructions() == 3,
+                // Name every field that differs, so a failure on another machine says which.
+                std::string differences;
+                const auto hex = [](std::uint64_t value) {
+                    char text[17];
+                    std::snprintf(text, sizeof text, "%llx", static_cast<unsigned long long>(value));
+                    return std::string(text);
+                };
+                const auto differ = [&](bool equal, const char* field, std::uint64_t jit, std::uint64_t want) {
+                    if (!equal)
+                        differences += std::string(" ") + field + " jit=0x" + hex(jit) + " want=0x" + hex(want) + ";";
+                };
+                differ(actual.instructions == expected.instructions, "instructions",
+                       actual.instructions, expected.instructions);
+                for (unsigned index = 0; index != optimized.state().x.size(); ++index)
+                    differ(optimized.state().x[index] == reference.state().x[index],
+                           ("x" + std::to_string(index) + "(reference)").c_str(),
+                           optimized.state().x[index], reference.state().x[index]);
+                differ(optimized.state().sp == reference.state().sp, "sp", optimized.state().sp, reference.state().sp);
+                differ(optimized.state().pc == reference.state().pc, "pc", optimized.state().pc, reference.state().pc);
+                differ(optimized.state().nzcv == reference.state().nzcv, "nzcv",
+                       optimized.state().nzcv, reference.state().nzcv);
+                differ(optimized.state().x[8] == expected_register, "x8", optimized.state().x[8], expected_register);
+                differ(optimized.state().x[10] == expected_base, "x10", optimized.state().x[10], expected_base);
+                differ(optimized.state().x[12] == expected_register + 3, "x12",
+                       optimized.state().x[12], expected_register + 3);
+                differ(optimized.read64(target) == expected_memory, "memory",
+                       optimized.read64(target), expected_memory);
+                differ(optimized.jit_executed_instructions() == 3, "native instructions",
+                       optimized.jit_executed_instructions(), 3);
+                expect(differences.empty(),
                        "JIT integer memory addressing or sign extension differs from reference: size " +
                            std::to_string(size) + ", access " + std::to_string(access) +
-                           ", addressing " + std::to_string(addressing) +
-                           ", register " + std::to_string(optimized.state().x[8]) +
-                           ", expected " + std::to_string(expected_register) +
-                           ", base " + std::to_string(optimized.state().x[10]) +
-                           ", native instructions " +
-                           std::to_string(optimized.jit_executed_instructions()));
+                           ", addressing " + std::to_string(addressing) + ":" + differences);
                 for (unsigned byte = 0; byte != 64; ++byte) {
                     expect(static_cast<transmute::GuestMemory&>(optimized).read8(data + byte) ==
                                static_cast<transmute::GuestMemory&>(reference).read8(data + byte),
@@ -26151,6 +26190,7 @@ int main(int argc, char** argv) {
         RUN_TEST(test_jit_image_contiguous_access);
         RUN_TEST(test_jit_word_memory_access);
         RUN_TEST(test_jit_register_offset_memory_access);
+        RUN_TEST(test_reference_signed_narrow_loads);
         RUN_TEST(test_jit_narrow_memory_access);
         RUN_TEST(test_jit_integer_pair_memory_access);
         RUN_TEST(test_jit_pc_relative_addresses);

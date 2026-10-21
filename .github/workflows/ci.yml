@@ -43,7 +43,7 @@ jobs:
       ALCHEMY_GUI_NO_ACTIVATE: "1"
       ALCHEMY_GUI_NO_CRASH_DIALOG: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: |
