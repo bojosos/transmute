@@ -516,6 +516,10 @@ FX_TEST(core_raw_flags_at_exits) {
         FX_CHECK_EQ(contains(exit, kImul), knob != 0);
         FX_CHECK_EQ(contains(translate_words(reader_words, false), kRawCheck), knob == 0);
         FX_CHECK(!contains(translate_words({cmp, bcond(0, 2), nop(), nop()}, false), kRawCheck));   // writes first
+        // A clobber (EOR) between the CMP and a call that keeps NZCV live (exact
+        // flags): only the raw form, as at the exit.
+        const auto clobbered = translate_words({cmp, logic_shift(true, 2, 0, false, 5, 0, 4, 3), bl(64)}, false);
+        FX_CHECK_EQ(contains(clobbered, kImul), knob != 0);
         // Flags that only pass through to the exit (a leaf like eor; ret): no check.
         FX_CHECK(!contains(translate_words({logic_shift(true, 2, 0, false, 1, 1, 0, 0), ret()}, false), kRawCheck));
     }
@@ -533,6 +537,39 @@ FX_TEST(core_raw_flags_at_exits) {
             r.machine.options.max_instructions = len;
             for (unsigned k = 0; k < 4; ++k) r.run(prog, r.context(7300 + k), "raw flags " + std::to_string(len));
         }
+    }
+    r.machine.options = saved;
+    core::set_p2_knobs_for_testing(~0u);
+}
+
+// Exits into targets that write NZCV before reading it (target_flags_dead:
+// such an exit's flags are dead even under exact flags, and the flags the
+// target computes are what later code reads). Regions cut after one to three
+// instructions turn the B and the BL into exits; the result must match the
+// reference with and without TRANSMUTE_FX_CORE=nodeadtargets.
+FX_TEST(core_dead_target_exits) {
+    using namespace a64;
+    const auto cmp12 = add_shift(true, true, true, 0, 2, 0, 1, 31);   // cmp x1, x2
+    const auto cmp34 = add_shift(true, true, true, 0, 4, 0, 3, 31);   // cmp x3, x4
+    const auto csel = a64::csel(true, false, 6, 0, 0, 5, 7);          // csel x7, x5, x6, eq
+    const std::vector<std::vector<std::uint32_t>> progs = {
+        // cmp; b T; nop; T: cmp; csel
+        {cmp12, b(2), nop(), cmp34, csel},
+        // cmp; bl f; csel; b end; f: cmp; ret
+        {cmp12, bl(3), csel, b(3), cmp34, ret()},
+        // cmp; b.ne T; csel; T: cmp; csel (the fall-through reads, the target writes first)
+        {cmp12, bcond(1, 2), csel, cmp34, csel},
+    };
+    auto& r = runner();
+    const auto saved = r.machine.options;
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_dead_targets)}) {
+        core::set_p2_knobs_for_testing(knob);
+        for (std::size_t k = 0; k < progs.size(); ++k)
+            for (unsigned len = 1; len <= 3; ++len) {
+                r.machine.options.max_instructions = len;
+                for (unsigned c = 0; c < 3; ++c)
+                    r.run(progs[k], r.context(7400 + 16 * k + c), "dead target " + std::to_string(k) + " " + std::to_string(len));
+            }
     }
     r.machine.options = saved;
     core::set_p2_knobs_for_testing(~0u);

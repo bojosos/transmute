@@ -45,6 +45,8 @@ inline bool isel_on(std::uint32_t knob) { return (isel_knob_bits() & knob) == 0;
 //                   (e_ccmp: setcc/test fusion with B.cond and CSEL)
 //   nogprreuse    - a GPR result never reuses the host that cached the
 //                   destination's old value (reusable_gpr)
+//   nodeadtargets - a direct exit (B, B.cond, BL, region cut) keeps NZCV live
+//                   even when its target writes them first (target_flags_dead)
 //   noaliastarget - a BR/BLR/RET target that is a tier-2 copy alias is
 //                   resolved like any alias (stored when no register is
 //                   spare, then reloaded), not promoted to its host's entry
@@ -75,6 +77,7 @@ enum CodegenKnob : std::uint32_t {
     knob_no_alias_target = 128u,
     knob_no_raw_flags = 256u,
     knob_abi_flags = 512u,
+    knob_no_dead_targets = 1024u,
 };
 std::uint32_t codegen_p2_knob_bits();
 // Tests: use `bits` instead of the environment (~0u: the environment again).

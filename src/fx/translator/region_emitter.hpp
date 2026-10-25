@@ -380,6 +380,7 @@ private:
     // target writes NZCV before reading it.
     void emit_exit_flags(FlagsState state) { materialize_state(state, false, true); }
     [[nodiscard]] bool edge_raw(std::int32_t target) const;   // an edge into `target` may store the raw form
+    [[nodiscard]] bool flags_read_after() const;   // a successor of the current instruction reads NZCV first
     [[nodiscard]] FlagsLocation fault_flags() const;
     Cond host_condition(unsigned cond);
     [[nodiscard]] bool needs_edge_materialize(std::int32_t target) const;

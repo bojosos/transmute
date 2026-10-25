@@ -555,6 +555,17 @@ bool table_target(const CodeSource& code, const TableMatch& m, unsigned k, std::
 
 } // namespace
 
+// p1 replaces this with a straight-line scan of image code from target_pc
+// (the first NZCV write before any read, branch or exit means dead; the
+// scanned bytes become a dependency of the region). Until then every target
+// is assumed to read the flags.
+bool target_flags_dead(const CodeSource& code, std::uint64_t target_pc, Plan& plan) {
+    (void)code;
+    (void)target_pc;
+    (void)plan;
+    return false;
+}
+
 void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateOptions& options,
                 const PlanOverrides& overrides, Plan& plan) {
     thread_local PcSet visited;
@@ -1270,19 +1281,44 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
         }
         return false;
     };
+    // An exit to a known target that writes NZCV before reading it
+    // (target_flags_dead: p1's scan of image code) is flag-dead, also under
+    // exact flags. Each target is asked once (the loop revisits exits).
+    // TRANSMUTE_FX_CORE=nodeadtargets (core_isel.hpp) keeps every such exit live.
+    const bool dead_targets = (core::codegen_p2_knob_bits() & core::knob_no_dead_targets) == 0;
+    std::vector<std::pair<std::uint64_t, bool>> dead_memo;
+    const auto exit_live = [&](std::uint64_t target) {
+        if (!dead_targets) return true;
+        for (const auto& [pc, dead] : dead_memo)
+            if (pc == target) return !dead;
+        const bool dead = target_flags_dead(code, target, plan);
+        dead_memo.emplace_back(target, dead);
+        return !dead;
+    };
+    const auto direct = [](const PlanInst& pi) {
+        const auto k = pi.inst.kind;
+        return k == Kind::branch || k == Kind::branch_cond || k == Kind::compare_branch || k == Kind::test_branch;
+    };
+    // The out-of-region side of a jump, conditional branch or region cut.
+    const auto taken_exit = [&](const PlanInst& pi) {
+        return direct(pi) ? exit_live(static_cast<std::uint64_t>(pi.inst.imm)) : true;
+    };
+    const auto fall_exit = [&](const PlanInst& pi) { return exit_live(pi.pc + 4); };
     for (bool changed = true; changed; changed = changed && back_edges) {
         changed = false;
         for (std::int32_t i = n - 1; i >= 0; --i) {
             auto& pi = plan.insts[i];
             bool out = false;
             switch (pi.flow) {
-            case Flow::normal: out = pi.fall < 0 || plan.insts[pi.fall].flags_live_in; break;
-            case Flow::jump: out = pi.taken < 0 || plan.insts[pi.taken].flags_live_in; break;
+            case Flow::normal: out = pi.fall < 0 ? fall_exit(pi) : plan.insts[pi.fall].flags_live_in; break;
+            case Flow::jump: out = pi.taken < 0 ? taken_exit(pi) : plan.insts[pi.taken].flags_live_in; break;
             case Flow::cond:
-                out = pi.taken < 0 || pi.fall < 0 || plan.insts[pi.taken].flags_live_in ||
-                      plan.insts[pi.fall].flags_live_in;
+                out = (pi.taken < 0 ? taken_exit(pi) : plan.insts[pi.taken].flags_live_in) ||
+                      (pi.fall < 0 ? fall_exit(pi) : plan.insts[pi.fall].flags_live_in);
                 break;
-            case Flow::call: out = strict_flags; break;
+            case Flow::call:
+                out = strict_flags && (pi.inst.kind != Kind::branch_link || exit_live(static_cast<std::uint64_t>(pi.inst.imm)));
+                break;
             case Flow::indirect: out = strict_flags || (pi.inst.kind != Kind::ret && br_live(i)); break;
             default: out = true; break;
             }

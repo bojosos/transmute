@@ -722,7 +722,17 @@ void RegionEmitter::prepare_clobber() {
         return;
     }
     if (save_flags_around()) return;
-    materialize();
+    // Flags kept only for an exit (nothing in the region reads them before
+    // the next write; under exact flags, mostly the next call or return):
+    // the raw form, as at the exit itself.
+    materialize(!cur_reads_flags_ && !flags_read_after());
+}
+
+bool RegionEmitter::flags_read_after() const {
+    bool read = false;
+    if (index_ >= 0)
+        plan_.for_each_successor(index_, [&](std::int32_t t) { read = read || s_.flags_read[static_cast<std::size_t>(t)] != 0; });
+    return read;
 }
 
 // The flags outlive an instruction that must clobber EFLAGS (EOR/ORR/AND,
@@ -1619,8 +1629,11 @@ void RegionEmitter::begin_instruction(std::int32_t index) {
         bool_in_slot_ = false;
     }
     // NZCV dead at a BL/BLR/RET exit (TranslateOptions::abi_flags; strict
-    // flags keep them live): drop host flags instead of materializing them.
-    if (is_host(flags_) && !cur_->flags_live_in && (cur_->flow == Flow::call || cur_->flow == Flow::indirect))
+    // flags keep them live) or at a B out of the region to a target that
+    // writes them first (target_flags_dead): drop host flags instead of
+    // materializing them.
+    if (is_host(flags_) && !cur_->flags_live_in &&
+        (cur_->flow == Flow::call || cur_->flow == Flow::indirect || (cur_->flow == Flow::jump && cur_->taken < 0)))
         flags_ = FlagsState::ctx;
     cf_mark_ = a_.control_flow_count();
     in_instruction_ = true;

@@ -300,6 +300,12 @@ void set_overrides_for_testing(const PlanOverrides* overrides);
 const PlanOverrides& default_plan_overrides();
 
 // Builds the plan. Throws std::runtime_error if `guest_pc` cannot be read.
+// Exact flags across a direct exit: true when the code at target_pc writes
+// NZCV before reading it on every path (the exit's flags are dead), and then
+// records what it read as a dependency of `plan` (owner: p1, the target scan;
+// the flags liveness in build_plan asks it).
+bool target_flags_dead(const CodeSource& code, std::uint64_t target_pc, Plan& plan);
+
 void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateOptions& options,
                 const PlanOverrides& overrides, Plan& plan);
 
