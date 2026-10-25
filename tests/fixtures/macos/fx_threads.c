@@ -221,6 +221,16 @@ int main(int argc, char** argv) {
         pthread_join(thread, &result);
         return 42;
     }
+    if (same(mode, "wait")) {
+        /* A worker blocked in pthread_cond_wait, main in usleep for count / 5
+           seconds (ALCHEMY_HANG_DUMP prints both). */
+        pthread_t thread;
+        if (pthread_create(&thread, 0, waiter, 0)) return 50;
+        const unsigned ticks = argc > 2 ? number(argv[2]) : 40;
+        for (unsigned i = 0; i < ticks; ++i) usleep(200000);
+        puts("fx threads: wait done");
+        exit(0);
+    }
     if (same(mode, "trap")) __builtin_trap();
     if (same(mode, "abort")) abort();
     return 2;

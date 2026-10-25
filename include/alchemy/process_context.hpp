@@ -117,6 +117,16 @@ public:
     [[nodiscard]] std::shared_ptr<ThreadContext> current_thread();
     // Identities of the threads that have a context now (Mach task_threads).
     [[nodiscard]] std::vector<std::uint64_t> thread_identities() const;
+    // Diagnostics (ALCHEMY_HANG_DUMP): each thread with a context and the
+    // guest registers its engine holds. For a thread blocked in a provider
+    // call they are the call's (pc = the call's address, x30 = the caller).
+    struct ThreadSnapshot {
+        std::uint64_t identity{};
+        transmute::CpuState state{};
+    };
+    [[nodiscard]] std::vector<ThreadSnapshot> thread_snapshots() const;
+    // The provider export at `address` ("symbol (library)"), or "".
+    [[nodiscard]] std::string export_name(std::uint64_t address) const;
     [[nodiscard]] std::uint64_t allocate_guest(std::uint64_t size, std::uint64_t alignment = 16);
     void release_guest(std::uint64_t address);
     void set_errno(std::uint32_t value);

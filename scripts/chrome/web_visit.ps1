@@ -32,7 +32,7 @@
 #
 # Usage: web_visit.ps1 -Exe <build>\Release\alchemy-fx.exe -OutDir <scratch dir> -Url https://example.com/[,...]
 #          [-Name label,...] [-Action <action>,...] [-SwiftShader] [-Jit] [-Settle 5] [-LoadTimeout 120] [-Play 5]
-#          [-BenchmarkTimeout 7200] [-NoScreenshot] [-NetLog] [-Native <chrome.exe>] [-Extra @('--flag')]
+#          [-BenchmarkTimeout 7200] [-NoScreenshot] [-NetLog] [-Native <chrome.exe>] [-Extra @('--flag')] [-CdpTimeout 30]
 #          [-Env @{ NAME='value' }]
 # Output in -OutDir: results.json (one entry per URL plus the run's totals), stdout.txt, stderr.txt, cdp.txt,
 # cmdline.txt, memory.csv, network-allowed.txt, network-denied.txt, alchemy-lines.txt, shot-<n>.png, capture\
@@ -54,6 +54,7 @@ param(
     [int]$Play = 5,
     [int]$BenchmarkTimeout = 7200,
     [int]$SampleSeconds = 2,
+    [int]$CdpTimeout = 30,
     [int]$Width = 1280,
     [int]$Height = 900,
     [switch]$SwiftShader,
@@ -141,6 +142,10 @@ $env:ALCHEMY_NETWORK_LOG = '1'
 $env:ALCHEMY_TRACE_PROCESS = '1'   # one line per child: the memory breakdown names each process by its role
 $env:ALCHEMY_GUI_CLOAK = '1'; $env:ALCHEMY_GUI_NO_ACTIVATE = '1'; $env:ALCHEMY_GUI_NO_CRASH_DIALOG = '1'
 $env:ALCHEMY_CONTENTS_CAPTURE = $capture
+# A CDP call that gets no answer touches this file: every Alchemy process of the tree then prints its guest
+# threads (where each waits) to stderr (ALCHEMY_HANG_DUMP, src/alchemy/process.cpp).
+$hangTrigger = Join-Path $OutDir 'hang-dump.trigger'
+if (-not $Native) { $env:ALCHEMY_HANG_DUMP = $hangTrigger }
 $env:HOME = Join-Path $userDir 'home'
 foreach ($k in $Env.Keys) { Set-Item "Env:$k" $Env[$k] }
 $quoted = ($all | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
@@ -287,11 +292,17 @@ function Pump-Cdp([int]$Milliseconds) {
     }
 }
 # Sends a command and waits for its answer; throws on a protocol error or the deadline.
-function Invoke-Cdp([string]$Method, [hashtable]$Params = @{}, [string]$Session = '', [int]$TimeoutSeconds = 30) {
+function Invoke-Cdp([string]$Method, [hashtable]$Params = @{}, [string]$Session = '', [int]$TimeoutSeconds = $CdpTimeout) {
     $id = Send-Cdp $Method $Params $Session
     $deadline = [Diagnostics.Stopwatch]::StartNew()
     while (-not $script:responses.ContainsKey($id)) {
-        if ($deadline.Elapsed.TotalSeconds -gt $TimeoutSeconds) { throw "$Method had no answer within $TimeoutSeconds s" }
+        if ($deadline.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
+            if (-not $Native) {   # ALCHEMY_HANG_DUMP: the processes print where they wait, then the run goes on
+                Set-Content $hangTrigger (Get-Date -Format o)
+                Start-Sleep -Seconds 3
+            }
+            throw "$Method had no answer within $TimeoutSeconds s"
+        }
         if ($process.HasExited) { throw "Chrome exited ($($process.ExitCode)) during $Method" }
         if ($script:pipeEnded) { throw "the DevTools pipe ended during $Method" }
         Pump-Cdp 200
@@ -300,7 +311,7 @@ function Invoke-Cdp([string]$Method, [hashtable]$Params = @{}, [string]$Session 
     if ($answer.PSObject.Properties['error']) { throw "$Method failed: $($answer.error.message)" }
     $answer.result
 }
-function Evaluate([string]$Expression, [string]$Session, [int]$TimeoutSeconds = 30) {
+function Evaluate([string]$Expression, [string]$Session, [int]$TimeoutSeconds = $CdpTimeout) {
     $result = Invoke-Cdp 'Runtime.evaluate' @{ expression = $Expression; returnByValue = $true; awaitPromise = $true } $Session $TimeoutSeconds
     if ($result.PSObject.Properties['exceptionDetails']) { return "exception: $($result.exceptionDetails.text)" }
     if ($result.result.PSObject.Properties['value']) { return $result.result.value }
@@ -394,15 +405,15 @@ $benchmarks = @{
 }
 function Run-Benchmark([hashtable]$Bench, [string]$Session, [string]$TargetId, [string]$Label) {
     $wait = [Diagnostics.Stopwatch]::StartNew()
-    while ((Evaluate $Bench.ready $Session 60) -ne $true) {   # an exception answers a string: not ready
+    while ((Evaluate $Bench.ready $Session ([math]::Max(60, $CdpTimeout))) -ne $true) {   # an exception answers a string: not ready
         if ($wait.Elapsed.TotalSeconds -gt 600) { throw 'the benchmark page did not become ready within 600 s' }
         Start-Sleep -Seconds 2
     }
     $events.Clear()
-    $started = Evaluate $Bench.start $Session 60
+    $started = Evaluate $Bench.start $Session ([math]::Max(60, $CdpTimeout))
     if ($started -ne 'started') { throw "the benchmark did not start: $started" }
     if ($Bench.ContainsKey('progress')) {
-        $null = Evaluate "(() => { setInterval(() => { try { if (document.title !== '$doneTitle') document.title = '$progressPrefix' + ($($Bench.progress)); } catch (e) { } }, 2000); return true; })()" $Session 60
+        $null = Evaluate "(() => { setInterval(() => { try { if (document.title !== '$doneTitle') document.title = '$progressPrefix' + ($($Bench.progress)); } catch (e) { } }, 2000); return true; })()" $Session ([math]::Max(60, $CdpTimeout))
     }
     $progress = ''
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -532,7 +543,7 @@ try {
                 # A consent wall in front of the page: reject all optional cookies (never accept), then wait for the page.
                 $act = ($act -replace '^reject-consent\+?', ''); if (-not $act) { $act = 'none' }
                 $events.Clear()
-                $entry.consent = Evaluate $rejectScript $session 30
+                $entry.consent = Evaluate $rejectScript $session ([math]::Max(30, $CdpTimeout))
                 Step "[$label] consent: $($entry.consent)"
                 if ($entry.consent -like 'rejected*') {
                     $consentClock = [Diagnostics.Stopwatch]::StartNew(); $reloaded = $false
@@ -552,11 +563,11 @@ try {
                 $entry.benchmark_wall_s = $run.seconds
                 Step "[$label] $act`: $($run.result | ConvertTo-Json -Compress -Depth 4) in $($run.seconds) s"
             } elseif (-not ($entry.error -like 'renderer crashed*')) {
-                $raw = Evaluate $probe $session 30
+                $raw = Evaluate $probe $session ([math]::Max(30, $CdpTimeout))
                 if ($raw -and $raw -notlike 'exception:*') { $entry.page = $raw | ConvertFrom-Json } else { $entry.page = $raw }
-                if ($act -eq 'scroll') { $entry.action_result = Evaluate $scrollScript $session 60 }
+                if ($act -eq 'scroll') { $entry.action_result = Evaluate $scrollScript $session ([math]::Max(60, $CdpTimeout)) }
                 elseif ($act -eq 'html') {
-                    $markup = Evaluate 'document.documentElement.outerHTML' $session 60
+                    $markup = Evaluate 'document.documentElement.outerHTML' $session ([math]::Max(60, $CdpTimeout))
                     [IO.File]::WriteAllText((Join-Path $OutDir "page-$($index + 1).html"), [string]$markup)
                     $entry.action_result = "saved $(([string]$markup).Length) characters"
                 }

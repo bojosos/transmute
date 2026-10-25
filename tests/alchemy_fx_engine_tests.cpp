@@ -187,6 +187,27 @@ int main(int argc, char** argv) {
                    "worker exit() while main is CPU-bound", outcome, "expected prompt status 5");
         }
         {
+            // ALCHEMY_HANG_DUMP: touching the file makes the process print every
+            // guest thread (the provider call it waits in, its backtrace).
+            char directory[MAX_PATH]{};
+            GetTempPathA(MAX_PATH, directory);
+            const std::string trigger = std::string(directory) + "alchemy_hang_dump_" + std::to_string(GetCurrentProcessId());
+            DeleteFileA(trigger.c_str());
+            SetEnvironmentVariableA("ALCHEMY_HANG_DUMP", trigger.c_str());
+            std::thread toucher([&] {
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                if (FILE* file = std::fopen(trigger.c_str(), "w")) { std::fputs("dump", file); std::fclose(file); }
+            });
+            const auto outcome = run({fx, threads, "wait", "40"});
+            toucher.join();
+            SetEnvironmentVariableA("ALCHEMY_HANG_DUMP", nullptr);
+            DeleteFileA(trigger.c_str());
+            expect(outcome.status == 0 && contains(outcome.output, "alchemy: hang dump (pid ") &&
+                       contains(outcome.output, "in _pthread_cond_wait") && contains(outcome.output, "in _usleep") &&
+                       contains(outcome.output, "fx_threads+0x"),
+                   "ALCHEMY_HANG_DUMP prints the waiting threads", outcome, "expected a dump with both waits");
+        }
+        {
             const auto outcome = run({fx, threads, "fault"});
             expect(outcome.status == 139 && contains(outcome.output, "SIGSEGV") &&
                        contains(outcome.output, "write of 0x10") && contains(outcome.output, "fx_threads+0x"),

@@ -148,6 +148,24 @@ std::vector<std::uint64_t> ProcessContext::thread_identities() const {
     return identities;
 }
 
+std::vector<ProcessContext::ThreadSnapshot> ProcessContext::thread_snapshots() const {
+    std::lock_guard lock(mutex_);
+    std::vector<ThreadSnapshot> snapshots;
+    snapshots.reserve(threads_.size());
+    for (const auto& [engine, thread] : threads_) snapshots.push_back({thread->identity, engine->state()});
+    return snapshots;
+}
+
+std::string ProcessContext::export_name(std::uint64_t address) const {
+    std::lock_guard lock(mutex_);
+    for (const auto& [key, value] : exports_) {
+        if (value.address != address || value.kind != ExportKind::function) continue;
+        const auto split = key.find('\x1f');
+        return split == std::string::npos ? key : key.substr(split + 1) + " (" + key.substr(0, split) + ")";
+    }
+    return {};
+}
+
 void ProcessContext::release_thread(transmute::ReferenceEngine& engine) {
     std::shared_ptr<ThreadContext> retired;
     {

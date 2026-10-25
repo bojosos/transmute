@@ -68,6 +68,76 @@ void append_guest_backtrace(std::ostream& out, transmute::GuestMemory& memory,
     }
 }
 
+// ALCHEMY_HANG_DUMP=<host path>: every process of the tree watches that file
+// (once a second) and, each time it is created or touched, prints every guest
+// thread to stderr: the provider call it is in, its first arguments and its
+// guest backtrace. A harness touches it when the guest stops answering, so a
+// hang reports where each process waits (web_visit.ps1 does).
+class HangDump {
+public:
+    HangDump(ProcessContext& context, transmute::GuestMemory& memory) : context_(context), memory_(memory) {
+        const auto path = host::process::environment("ALCHEMY_HANG_DUMP");
+        if (!path || path->empty()) return;
+        trigger_ = utf8_path(*path);
+        last_ = stamp();
+        thread_ = std::thread([this] { watch(); });
+    }
+    HangDump(const HangDump&) = delete;
+    HangDump& operator=(const HangDump&) = delete;
+    ~HangDump() {
+        if (!thread_.joinable()) return;
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        thread_.join();
+    }
+
+private:
+    [[nodiscard]] std::filesystem::file_time_type stamp() const {
+        std::error_code error;
+        const auto time = std::filesystem::last_write_time(trigger_, error);
+        return error ? std::filesystem::file_time_type::min() : time;
+    }
+    void watch() {
+        std::unique_lock lock(mutex_);
+        while (!wake_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_; })) {
+            const auto now = stamp();
+            if (now == last_ || now == std::filesystem::file_time_type::min()) continue;
+            last_ = now;
+            try { dump(); } catch (...) {}
+        }
+    }
+    void dump() {
+        const auto threads = context_.thread_snapshots();
+        const auto images = context_.images();
+        std::ostringstream out;
+        out << "alchemy: hang dump (pid " << host::process::current_pid() << "): " << threads.size() << " guest thread(s)";
+        for (const auto& thread : threads) {
+            const auto& s = thread.state;
+            const auto name = context_.export_name(s.pc);
+            out << "\n thread 0x" << std::hex << thread.identity << ": "
+                << (name.empty() ? "pc " + describe_guest_address(images, s.pc) : "in " + name)
+                << " x0 0x" << s.x[0] << " x1 0x" << s.x[1] << " x2 0x" << s.x[2] << " x3 0x" << s.x[3];
+            try { append_guest_backtrace(out, memory_, images, s.x[30], s.x[29]); } catch (...) {}
+            out << std::dec;
+        }
+        out << '\n';
+        std::fputs(out.str().c_str(), stderr);
+        std::fflush(stderr);
+    }
+
+    ProcessContext& context_;
+    transmute::GuestMemory& memory_;
+    std::filesystem::path trigger_;
+    std::filesystem::file_time_type last_{};
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool stop_{};
+    std::thread thread_;
+};
+
 // ALCHEMY_GUI_NO_CRASH_DIALOG=1: a host crash (a fault in alchemy-fx, a GPU
 // driver or a system DLL that nothing handles) ends the process with a report
 // on stderr instead of the host's crash dialog (Windows Error Reporting), so
@@ -286,6 +356,7 @@ ProcessResult run_program(const std::filesystem::path& executable,
         return runtime.resolve(library, symbol);
     };
     DarwinProviders providers(context);
+    HangDump hang_dump(context, engine);   // ALCHEMY_HANG_DUMP (destroyed before the providers)
     auto& services = providers.services;
     auto& threads = providers.threads;
     auto& objc = providers.objc;

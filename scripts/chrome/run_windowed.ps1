@@ -110,6 +110,10 @@ $all = @('--runtime-dir', $RuntimeDir, '--root', $Root,
 
 $env:ALCHEMY_NETWORK = 'loopback'; $env:ALCHEMY_GUI_CLOAK = '1'; $env:ALCHEMY_GUI_NO_ACTIVATE = '1'; $env:ALCHEMY_GUI_NO_CRASH_DIALOG = '1'
 $env:ALCHEMY_CONTENTS_CAPTURE = $capture
+# A timeout touches this file first: every Alchemy process of the tree prints its guest threads to stderr
+# (ALCHEMY_HANG_DUMP, src/alchemy/process.cpp), so a hang shows where each waits.
+$hangTrigger = Join-Path $OutDir 'hang-dump.trigger'
+$env:ALCHEMY_HANG_DUMP = $hangTrigger
 $env:HOME = Join-Path $userDir 'home'
 foreach ($k in $Env.Keys) { Set-Item "Env:$k" $Env[$k] }
 $quoted = ($all | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
@@ -187,7 +191,11 @@ try {
     $poll = [Diagnostics.Stopwatch]::StartNew()
     $found = $null
     while (-not $found) {
-        if ($clock.Elapsed.TotalSeconds -gt $Timeout) { throw "no page target titled '$Title' within $Timeout s" }
+        if ($clock.Elapsed.TotalSeconds -gt $Timeout) {
+            Set-Content $hangTrigger (Get-Date -Format o)   # ALCHEMY_HANG_DUMP: where each process waits
+            Start-Sleep -Seconds 3
+            throw "no page target titled '$Title' within $Timeout s"
+        }
         if ($process.HasExited) { throw "Chrome exited ($($process.ExitCode)) before a page target was titled '$Title'" }
         if ($pipeEnded) { throw 'the DevTools pipe ended before the page target appeared' }
         if ($poll.Elapsed.TotalSeconds -gt 3) { $null = Send-Cdp 'Target.getTargets'; $poll.Restart() }
