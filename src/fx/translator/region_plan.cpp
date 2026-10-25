@@ -1252,7 +1252,10 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     // (Fields start false/0 from construction. Without back edges every
     // successor follows in layout, so one pass in the right direction is the
     // fixed point.)
-    const bool strict_flags = overrides.exact_flags || !options.abi_flags;
+    // TRANSMUTE_FX_CORE=abiflags (opt-in measurement knob, core_isel.hpp) turns
+    // the AAPCS64 model on without TranslateOptions.
+    const bool strict_flags = overrides.exact_flags ||
+                              !(options.abi_flags || (core::codegen_p2_knob_bits() & core::knob_abi_flags) != 0);
     // TRANSMUTE_FX_CORE=brdeadflags (opt-in, core_isel.hpp): a BR that does
     // not look intra-function is flag-dead too. Tail calls, veneers and
     // interpreter dispatch enter code that cannot assume incoming flags; a

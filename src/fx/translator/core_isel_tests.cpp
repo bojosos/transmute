@@ -488,6 +488,11 @@ FX_TEST(core_abi_flags_not_materialized_at_calls_and_returns) {
         if (materializes_flags(translate_words(c.words, true)) != c.live_with_abi)
             testing::report_failure(__FILE__, __LINE__, std::string(c.label) + ": abi flags");
     }
+    // TRANSMUTE_FX_CORE=abiflags: the same model without TranslateOptions::abi_flags.
+    core::set_p2_knobs_for_testing(core::knob_abi_flags);
+    for (const auto& c : cases)
+        if (materializes_flags(translate_words(c.words, false)) != c.live_with_abi)
+            testing::report_failure(__FILE__, __LINE__, std::string(c.label) + ": abiflags knob");
     core::set_p2_knobs_for_testing(~0u);
 }
 

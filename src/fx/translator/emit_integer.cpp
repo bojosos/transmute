@@ -132,6 +132,7 @@ std::uint32_t codegen_p2_knob_bits() {
             if (s.find("mergedirty") != std::string::npos) b |= knob_merge_dirty;
             if (s.find("noaliastarget") != std::string::npos) b |= knob_no_alias_target;
             if (s.find("norawflags") != std::string::npos) b |= knob_no_raw_flags;
+            if (s.find("abiflags") != std::string::npos) b |= knob_abi_flags;
         }
         return b;
     }();

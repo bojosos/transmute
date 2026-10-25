@@ -53,6 +53,10 @@ inline bool isel_on(std::uint32_t knob) { return (isel_knob_bits() & knob) == 0;
 //                   lahf/seto form the next reader converts
 //                   (materialize_state, normalize_entry_flags)
 // and opt-in ones (on when named):
+//   abiflags      - the AAPCS64 flags model (TranslateOptions::abi_flags,
+//                   off by default since exact NZCV): NZCV dead at BL/BLR/RET.
+//                   A measurement knob: wrong for hand-written assembly that
+//                   reads flags after a call to a local stub (dav1d)
 //   brdeadflags   - NZCV is dead at a BR that does not look intra-function
 //                   (no recognised table, no ADR/ADRP in its block), as at
 //                   BL/BLR/RET (abi_flags; region_plan.cpp flags liveness)
@@ -70,6 +74,7 @@ enum CodegenKnob : std::uint32_t {
     knob_merge_dirty = 64u,
     knob_no_alias_target = 128u,
     knob_no_raw_flags = 256u,
+    knob_abi_flags = 512u,
 };
 std::uint32_t codegen_p2_knob_bits();
 // Tests: use `bits` instead of the environment (~0u: the environment again).
