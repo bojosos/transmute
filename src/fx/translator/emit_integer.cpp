@@ -130,6 +130,7 @@ std::uint32_t codegen_p2_knob_bits() {
             if (s.find("noccmpfusion") != std::string::npos) b |= knob_no_ccmp_fusion;
             if (s.find("nogprreuse") != std::string::npos) b |= knob_no_gpr_reuse;
             if (s.find("mergedirty") != std::string::npos) b |= knob_merge_dirty;
+            if (s.find("noaliastarget") != std::string::npos) b |= knob_no_alias_target;
         }
         return b;
     }();

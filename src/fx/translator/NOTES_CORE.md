@@ -281,6 +281,11 @@ region tests: keep its API additive).
   block ends, families, interpreted instructions and anything writing Xd,
   Xn's owner (also in the next three words: core fusions consume them);
   eviction stores dirty aliases; fault maps list them.
+  A BR/BLR/RET target that is an alias first takes its host's entry over
+  (galias_promote; the owner becomes the alias): with no register spare the
+  resolve would store the target and the exit reload it into rcx (V8's
+  dispatch: `ldr x2, [table, idx]; mov x17, x2; br x17`).
+  `TRANSMUTE_FX_CORE=noaliastarget` restores that.
 - Derived vector values (t2noderived; TRANSMUTE_FX_NEON=notblderived):
   families ask for a pure transform of a vector register (FamilyFactWant::
   K::derived; TBL's adjusted indices). When every reaching definition is

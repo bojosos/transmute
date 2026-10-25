@@ -1808,7 +1808,15 @@ void RegionEmitter::emit_instruction(std::int32_t index) {
              ++j)
             resolve = (plan_.insts[static_cast<std::size_t>(j)].writes & touched) != 0 ||
                       plan_.insts[static_cast<std::size_t>(j)].flow != Flow::normal;
-        if (resolve) galias_resolve();
+        if (resolve) {
+            // An aliased BR/BLR/RET target takes its host's entry over first: with no
+            // spare register the resolve would store the alias and the exit reload it.
+            const auto k = pi.inst.kind;
+            if ((k == Kind::branch_reg || k == Kind::branch_link_reg || k == Kind::ret) && pi.inst.rn < 31 &&
+                galias_host_[pi.inst.rn] >= 0 && codegen_on(knob_no_alias_target))
+                galias_promote(pi.inst.rn);
+            galias_resolve();
+        }
     }
     if (pi.flow != Flow::normal) alias_forget_knowledge();
     if (slot_alias_count_ != 0 && (pi.may_fault || pi.conservative_writes || pi.flow != Flow::normal)) slot_aliases_all();

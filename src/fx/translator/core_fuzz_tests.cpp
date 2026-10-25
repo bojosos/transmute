@@ -3,6 +3,13 @@
 // the RSB), indirect jumps, literal loads and interpreted instructions.
 // Translated execution is compared with the reference interpreter stepping
 // word by word (owner: translator core).
+// ABI mode (core_fuzz_programs_abi_flags): TranslateOptions::abi_flags, so
+// NZCV is dead at BL/BLR and RET (and, with the opt-in brdeadflags, at a BR
+// that does not look intra-function). Its programs never read flags across
+// those: every call continuation, the function's first instruction and every
+// BR target write NZCV first, and half of the BRs sit in a block of their
+// own (adr; b next; next: br), which brdeadflags makes flag-dead. Odd seeds turn call inlining off, so BL and RET
+// are region exits (an inlined call keeps NZCV in the region).
 // Deeper runs (integration gates): TRANSMUTE_FX_FUZZ_SCALE=<n> runs n times as
 // many programs per test, TRANSMUTE_FX_FUZZ_SEED=<s> starts at other seeds.
 #include "fx/testing/test.hpp"
@@ -10,11 +17,13 @@
 #include "fx/translator/core_test_encode.hpp"
 #include "fx/translator/core_test_gen.hpp"
 #include "fx/translator/core_test_machine.hpp"
+#include "fx/translator/region_plan.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -60,7 +69,7 @@ struct Program {
     std::vector<std::uint32_t> words;
 };
 
-Program generate(std::uint64_t seed) {
+Program generate(std::uint64_t seed, bool abi = false) {
     Rng rng(seed);
     InstGen g(rng);
     Program p;
@@ -73,6 +82,8 @@ Program generate(std::uint64_t seed) {
     bool loop_used = false;
     std::size_t loop_begin = 0, loop_end = 0;   // [mov w12 .. closing branch]
 
+    std::vector<std::size_t> protect;     // ABI mode: the `b next` between an ADR and its BR
+    const auto flag_writer = [&] { return a64::add_shift(true, true, true, 0, g.src(), 0, g.src(), 31); };   // cmp
     const auto straight = [&](unsigned n) {
         for (unsigned i = 0; i < n; ++i) w.push_back(g.data_or_memory());
     };
@@ -129,6 +140,7 @@ Program generate(std::uint64_t seed) {
                 to_func.push_back(w.size() - 1);
                 w.push_back(a64::blr(9));
             }
+            if (abi) w.push_back(flag_writer());   // NZCV is undefined after the call returns
         } else if (choice < 90) {   // interpreted instructions
             switch (rng.below(3)) {
             case 0: w.push_back(a64::mrs_nzcv(rng.pick(kDest))); break;
@@ -139,6 +151,16 @@ Program generate(std::uint64_t seed) {
             static constexpr unsigned opcs[] = {0, 1, 2, 3};
             const auto off = -static_cast<std::int32_t>(1 + rng.below(1000));
             w.push_back(a64::ldr_literal(rng.pick(opcs), off, rng.pick(kDest)));
+        } else if (choice < 95 && abi) {   // forward indirect jump to a flags writer
+            w.push_back(a64::adr(false, 0, 10));
+            const auto adr_at = w.size() - 1;
+            if (rng.chance(50)) {   // the BR in a block of its own (flag-dead with brdeadflags)
+                w.push_back(a64::b(1));
+                protect.push_back(w.size() - 1);
+            }
+            w.push_back(a64::br(10));
+            patches.push_back({adr_at, w.size(), 5});
+            w.push_back(flag_writer());
         } else if (choice < 95) {   // forward indirect jump
             w.push_back(a64::adr(false, 0, 10));
             patches.push_back({w.size() - 1, w.size() + 1 + rng.below(4), 5});
@@ -159,6 +181,7 @@ Program generate(std::uint64_t seed) {
         w.push_back(a64::b(0));
         to_end.push_back(w.size() - 1);
         const auto func = w.size();
+        if (abi) w.push_back(flag_writer());   // NZCV is undefined on entry
         straight(rng.below(10));
         if (rng.chance(30)) {   // a conditional early return
             w.push_back(a64::cbz(true, false, 2, rng.pick(kSrc)));
@@ -171,9 +194,10 @@ Program generate(std::uint64_t seed) {
         }
     }
     for (const auto at : to_end) patches.push_back({at, w.size(), 3});
-    // Never land on a BR/BLR whose ADR was skipped.
+    // Never land on a BR/BLR (or the `b next` before it) whose ADR was skipped.
     const auto is_indirect = [&](std::size_t t) {
-        return t < w.size() && ((w[t] & 0xfffffc1fu) == 0xd61f0000u || (w[t] & 0xfffffc1fu) == 0xd63f0000u);
+        return t < w.size() && ((w[t] & 0xfffffc1fu) == 0xd61f0000u || (w[t] & 0xfffffc1fu) == 0xd63f0000u ||
+                                std::find(protect.begin(), protect.end(), t) != protect.end());
     };
     for (auto& patch : patches)
         while (patch.kind != 4 && is_indirect(patch.target)) ++patch.target;
@@ -196,6 +220,19 @@ std::uint64_t env_number(const char* name, std::uint64_t fallback) {
     return value && *value ? std::strtoull(value, nullptr, 10) : fallback;
 }
 
+// Call inlining off while alive (BL/BLR and RET become region exits).
+struct NoInline {
+    core::PlanOverrides o{};
+    NoInline() {
+        o = core::default_plan_overrides();
+        o.no_inline = true;
+        core::set_overrides_for_testing(&o);
+    }
+    ~NoInline() { core::set_overrides_for_testing(nullptr); }
+    NoInline(const NoInline&) = delete;
+    NoInline& operator=(const NoInline&) = delete;
+};
+
 void fuzz(std::uint64_t first, std::uint64_t count, unsigned variant) {
     count *= std::max<std::uint64_t>(1, env_number("TRANSMUTE_FX_FUZZ_SCALE", 1));
     first += env_number("TRANSMUTE_FX_FUZZ_SEED", 0) * 10'000'000;
@@ -203,7 +240,7 @@ void fuzz(std::uint64_t first, std::uint64_t count, unsigned variant) {
     const auto saved = r.machine.options;
     int failures = 0;
     for (std::uint64_t seed = first; seed < first + count && failures < 6; ++seed) {
-        const auto program = generate(seed);
+        const auto program = generate(seed, variant == 4);
         auto ctx = r.context(seed ^ 0xabcdef);
         r.machine.options = saved;
         r.machine.link = true;
@@ -211,8 +248,11 @@ void fuzz(std::uint64_t first, std::uint64_t count, unsigned variant) {
         case 1: r.machine.link = false; break;
         case 2: r.machine.options.max_instructions = 1 + static_cast<unsigned>(seed % 6); break;
         case 3: r.machine.options.interrupt_checks = false; break;
+        case 4: r.machine.options.abi_flags = true; break;
         default: break;
         }
+        std::optional<NoInline> no_inline;
+        if (variant == 4 && (seed & 1)) no_inline.emplace();
         bool ok = false;
         try {
             ok = r.run(program.words, ctx, "fuzz seed " + std::to_string(seed));
@@ -276,5 +316,79 @@ FX_TEST(core_flags_live_across_br_to_a_precomputed_target) {
     }
     r.report = true;
     core::set_p2_knobs_for_testing(~0u);
+    r.machine.options = saved;
+}
+
+FX_TEST(core_fuzz_programs_abi_flags) { fuzz(400000, 1500, 4); }
+
+// ABI mode, targeted: flags written before a call, a register-target BR and
+// a return are rewritten before any read (they are dead there), and a BR
+// whose block builds its target with ADR (a computed goto, intra-function)
+// keeps NZCV live: its target reads the flags the code before it set.
+FX_TEST(core_abi_flags_targeted) {
+    using namespace a64;
+    static DiffRunner r;
+    const auto saved = r.machine.options;
+    r.machine.options.abi_flags = true;
+    const auto cmp12 = add_shift(true, true, true, 0, 2, 0, 1, 31);   // cmp x1, x2
+    const auto cmp34 = add_shift(true, true, true, 0, 4, 0, 3, 31);   // cmp x3, x4
+    const auto csel = a64::csel(true, false, 6, 0, 0, 5, 7);          // csel x7, x5, x6, eq
+    const std::vector<std::vector<std::uint32_t>> progs = {
+        // cmp; bl f; cmp; csel; b end; f: cmp; csel; ret
+        {cmp12, bl(4), cmp34, csel, b(4), cmp34, csel, ret()},
+        // cmp; adr x10, T; b L; L: br x10; T: cmp; csel (flag-dead with brdeadflags)
+        {cmp12, adr(false, 12, 10), b(1), br(10), cmp34, csel},
+        // cmp; adr x10, T; br x10; T: csel (computed goto: NZCV stays live across it)
+        {cmp12, adr(false, 8, 10), br(10), csel},
+        // cmp; b.eq L; adr x10, T; br x10; L: nop; T: csel
+        {cmp12, bcond(0, 3), adr(false, 12, 10), br(10), nop(), csel},
+    };
+    for (const bool inlining : {true, false}) {
+        std::optional<NoInline> no_inline;
+        if (!inlining) no_inline.emplace();
+        for (std::size_t k = 0; k < progs.size(); ++k)
+            for (unsigned c = 0; c < 6; ++c)
+                r.run(progs[k], r.context(4100 + 16 * k + c), "abi targeted " + std::to_string(k) + (inlining ? "" : " noinline"));
+    }
+    // Not vacuous: flags read across a call that is a region exit (cmp; bl f;
+    // mrs x7, nzcv; b end; f: ret) are the dropped ones, so some contexts
+    // differ from the oracle.
+    NoInline no_inline;
+    r.report = false;
+    unsigned differ = 0;
+    for (unsigned c = 0; c < 16; ++c) differ += r.run({cmp12, bl(3), mrs_nzcv(7), b(2), ret()}, r.context(4200 + c), "abi stale") ? 0 : 1;
+    r.report = true;
+    FX_CHECK(differ > 0);
+    r.machine.options = saved;
+}
+
+// Regression (dav1d refmvs.S splat_mv_neon under checkasm): hand-written NEON
+// computes a jump-table target once at function entry and loops
+// `ldr; subs; add; br x3`, the targets ending in `b.gt 1b`. The BR's block
+// has no ADR (that is in the entry block, with the table offset added: an
+// unknown target), and its target reads the flags the
+// SUBS before the BR set: NZCV must stay live across this BR in ABI mode.
+FX_TEST(core_abi_flags_br_loop_reads_flags) {
+    using namespace a64;
+    static DiffRunner r;
+    const auto saved = r.machine.options;
+    r.machine.options.abi_flags = true;
+    const std::vector<std::uint32_t> prog = {
+        movw(false, 2, 0, 5, 12),                  // mov w12, #5
+        adr(false, 28, 3),                         // adr x3, T
+        bitfield(true, 2, 63, 63, 14, 13),         // lsr x13, x14, #63 (0: x14 is small; a table offset)
+        add_shift(true, false, false, 0, 13, 0, 3, 3),  // add x3, x3, x13
+        ldst_imm9(3, 1, 8, 1, 16, 1),              // L: ldr x1, [x16], #8
+        add_imm(false, true, true, 12, 12, 1),     // subs w12, w12, #1
+        add_shift(true, false, false, 0, 2, 0, 1, 1),   // add x1, x1, x2
+        br(3),                                     // br x3
+        add_shift(true, false, false, 0, 1, 0, 5, 5),   // T: add x5, x5, x1
+        bcond(12, -5),                             // b.gt L
+    };
+    for (const bool inlining : {true, false}) {
+        std::optional<NoInline> no_inline;
+        if (!inlining) no_inline.emplace();
+        for (unsigned c = 0; c < 4; ++c) r.run(prog, r.context(4300 + c), "dav1d br loop");
+    }
     r.machine.options = saved;
 }

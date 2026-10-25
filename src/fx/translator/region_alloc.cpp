@@ -457,6 +457,25 @@ void RegionEmitter::galias_drop_host(unsigned host) {
     fault_reopen();
 }
 
+// Alias g becomes its host's cache entry (dirty iff it was) and the entry's
+// guest an alias of it, so a later resolve keeps g in the register.
+void RegionEmitter::galias_promote(unsigned g) {
+    const auto h = static_cast<unsigned>(galias_host_[g]);
+    const auto owner = static_cast<unsigned>(gc_.guest[h]);
+    const bool alias_dirty = ((galias_dirty_ >> g) & 1u) != 0;
+    const bool owner_dirty = ((gc_.dirty >> h) & 1u) != 0;
+    galias_of_[h] = (galias_of_[h] & ~(1u << g)) | (1u << owner);
+    galias_host_[g] = -1;
+    galias_host_[owner] = static_cast<std::int8_t>(h);
+    galias_dirty_ = (galias_dirty_ & ~(1u << g)) | (owner_dirty ? 1u << owner : 0u);
+    gc_.host[owner] = -1;
+    gc_.host[g] = static_cast<std::int8_t>(h);
+    gc_.guest[h] = static_cast<std::int8_t>(g);
+    if (alias_dirty) gc_.dirty |= 1u << h;
+    else gc_.dirty &= ~(1u << h);
+    fault_reopen();
+}
+
 // Every alias becomes an entry of its own (a copy into a free cache register,
 // as the MOV would have made) or, with no register free, is stored if dirty.
 void RegionEmitter::galias_resolve() {

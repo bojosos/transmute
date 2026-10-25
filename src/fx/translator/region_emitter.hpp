@@ -320,6 +320,7 @@ private:
     bool galiasing_{};
     bool emit_gpr_copy(const PlanInst& pi);
     void galias_resolve();                           // every alias becomes an entry of its own or is stored
+    void galias_promote(unsigned g);                 // alias g owns its host's entry, the owner becomes the alias
     void galias_drop_host(unsigned host);            // store dirty aliases of host, forget them
     [[nodiscard]] std::uint32_t galias_touched() const;   // alias guests and the owners of their hosts
     [[nodiscard]] bool vec_read_soon(unsigned v) const;   // lookahead in the block

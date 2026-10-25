@@ -758,6 +758,41 @@ FX_TEST(core_indirect_target_not_reloaded) {
         const auto region = translate_words(words, true);
         FX_CHECK(std::search(region.code.begin(), region.code.end(), std::begin(kReload), std::end(kReload)) == region.code.end());
     }
+    // A target that is a tier-2 copy alias (ldr x2, [x21, x4, lsl #3]; mov x17,
+    // x2; br x17: V8's dispatch keeps the handler address in two registers)
+    // with no register spare: promoted to its host's entry, not stored and
+    // reloaded (galias_promote; fx perf lead's jitless profile). x3-x7 fill
+    // the other cache registers.
+    // mov rcx, qword ptr [r15 + x_disp(17)] (disp8 8): 49 8b 4f 08
+    static constexpr std::uint8_t kReload17[] = {0x49, 0x8b, 0x4f, 0x08};
+    core::PlanOverrides o = core::default_plan_overrides();
+    o.t2_no_alloc = true;   // x17 a cache entry, not a tier-2 pin
+    core::set_overrides_for_testing(&o);
+    for (const auto branch : {br(17), blr(17), ret(17)}) {
+        const std::vector<std::uint32_t> words = {movw(true, 2, 0, 1, 3), movw(true, 2, 0, 2, 4), movw(true, 2, 0, 3, 5),
+                                                  movw(true, 2, 0, 4, 6), movw(true, 2, 0, 5, 7), ldst_reg(3, 1, 4, 3, true, 21, 2),
+                                                  logic_shift(true, 1, 0, false, 2, 0, 31, 17), branch};
+        for (const unsigned knob : {static_cast<unsigned>(core::knob_no_alias_target), 0u}) {
+            core::set_p2_knobs_for_testing(knob);
+            const auto region = translate_words(words, true);
+            const bool reloads = std::search(region.code.begin(), region.code.end(), std::begin(kReload17), std::end(kReload17)) !=
+                                 region.code.end();
+            FX_CHECK_EQ(reloads, knob != 0);
+        }
+    }
+    // Behaviour: adr x2, T; mov x17, x2; x3-x7; br/blr x17; T: add x8, x17, #1.
+    auto& r = runner();
+    for (const auto branch : {br(17), blr(17)}) {
+        const std::vector<std::uint32_t> prog = {adr(false, 32, 2), logic_shift(true, 1, 0, false, 2, 0, 31, 17), movw(true, 2, 0, 1, 3),
+                                                 movw(true, 2, 0, 2, 4), movw(true, 2, 0, 3, 5), movw(true, 2, 0, 4, 6),
+                                                 movw(true, 2, 0, 5, 7), branch, add_imm(true, false, false, 8, 17, 1)};
+        for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_alias_target)}) {
+            core::set_p2_knobs_for_testing(knob);
+            for (unsigned k = 0; k < 3; ++k) r.run(prog, r.context(7100 + k), "alias target " + std::to_string(knob));
+        }
+    }
+    core::set_p2_knobs_for_testing(~0u);
+    core::set_overrides_for_testing(nullptr);
 }
 
 // Regression (round-4 deep fuzz, seed 40027669 variant 0): a CCMP fused with a
