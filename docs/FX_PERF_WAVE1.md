@@ -31,8 +31,10 @@ the app regression, the gates and the open follow-ups. `FX_PERF.md` keeps the su
 
 * **Flags:**
   * Dead host flags are no longer materialised at BL, BLR and RET.
-  * BR exits are flag-dead by default, except recognised intra-function tables. See "ABI assumptions" in
-    `FX_ENGINE.md`; `nobrdeadflags` and strict `exactflags` restore the old behaviour.
+  * BR exits were flag-dead by default, except recognised intra-function tables. **Reverted after landing:** the
+    rule broke hand-written NEON that keeps flags live across a `br` to a table target computed earlier (dav1d's
+    `splat_mv_neon` crashed under its checkasm). BR exits keep NZCV live again; `brdeadflags` is opt-in. See the
+    follow-ups.
   * Flags stay in EFLAGS around an instruction that clobbers them.
   * A CCMP fuses with its only reader (branchless).
 * **Registers:**
@@ -95,13 +97,14 @@ the app regression, the gates and the open follow-ups. `FX_PERF.md` keeps the su
 | … fp_float | 7.51 ns | 6.99 ns | 1.075x | 1.04–1.10 |
 
 * Every fxbench kernel's checksum matched the native x64 build of the same source on both sides.
+* r9 included the BR flag-dead default, which was reverted after landing; the jitless Chrome numbers lose that part.
 * The other 13 kernels were within noise, with mem_own at 0.965 and ptr_chase at 0.957. Both are layout, see the
   follow-ups.
 * Single-knob measurements, all from one binary (`window4`/`window5` in the wave's notes):
 
 | Knob | Effect |
 | --- | --- |
-| BR flag-dead | jitless JetStream richards 1.16x |
+| BR flag-dead (reverted after landing) | jitless JetStream richards 1.16x |
 | p1's label tables | interp_goto 1.57x |
 | p3's zero-above join | fp_float 1.105x |
 | p2's flag work | int_mix 1.22x |
@@ -165,5 +168,8 @@ Network denials were only the known ones: Chrome's `[2001:4860:4860::8888]:443` 
   them.
 * **Code density:** the jitless renderer's 90 % hot set was 17.7 MB of host code over 1,612 regions (5.3x expansion),
   so a smaller expansion pays everywhere.
-* **The differential fuzz runs strict flags,** so the BR flag-dead relaxation is covered by its unit test and the A/B,
-  not by the fuzz. An ABI-mode fuzz variant would need programs that don't read flags after BL, BLR, RET or BR.
+* **BR flags.** The flag-dead default was reverted: legal hand-written arm64 (dav1d, and the same pattern in ffmpeg and
+  libvpx) loops `subs …; br xT` and reads the flags in the target. Its 1.16x on jitless richards needs a sound form:
+  flags proven dead before the BR, or a cheaper materialisation (the raw host flags stored and converted only where
+  read). The differential fuzz runs strict flags, so it could not catch this. An ABI-mode variant, and dav1d's
+  checkasm as an extra NEON and flags check, are wave 2 items.
