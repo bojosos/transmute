@@ -244,6 +244,7 @@ FX_TEST(core_fuzz_programs_no_interrupt_checks) { fuzz(300000, 400, 3); }
 // treats such a BR as flag-dead breaks it. Runs with the production flags
 // model (abi_flags), unlike the fuzz above. With TRANSMUTE_FX_CORE=brdeadflags
 // (opt-in, unsound for this code) it diverges, which shows the test sees it.
+// The loop is closed by CBNZ, not by the flags, so the diverging run ends too.
 FX_TEST(core_flags_live_across_br_to_a_precomputed_target) {
     using namespace a64;
     const std::vector<std::uint32_t> prog = {
@@ -253,8 +254,9 @@ FX_TEST(core_flags_live_across_br_to_a_precomputed_target) {
         add_imm(false, true, true, 4, 4, 1),             // 3 subs w4, w4, #1
         br(3),                                           // 4 br x3 (flags live: the target reads them)
         brk(0x1),                                        // 5 (not reached)
-        add_imm(true, false, false, 5, 5, 1),            // 6 target: add x5, x5, #1
-        bcond(12, -5),                                   // 7 b.gt loop
+        bcond(13, 2),                                    // 6 target: b.le 8
+        add_imm(true, false, false, 5, 5, 1),            // 7 add x5, x5, #1
+        cbz(false, true, -6, 4),                         // 8 cbnz w4, loop
     };
     static DiffRunner r;
     const auto saved = r.machine.options;
@@ -267,7 +269,7 @@ FX_TEST(core_flags_live_across_br_to_a_precomputed_target) {
         const bool same = r.run(prog, ctx, dead_knob ? "brdeadflags" : "flags live across br");
         if (!dead_knob) {
             FX_CHECK(same);
-            FX_CHECK_EQ(r.actual.x[5], std::uint64_t{5});   // the target ran once per iteration
+            FX_CHECK_EQ(r.actual.x[5], std::uint64_t{4});   // gt on the first four iterations, le on the last
         } else {
             FX_CHECK(!same);   // the unsound knob is detected
         }
