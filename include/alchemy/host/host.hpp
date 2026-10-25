@@ -24,7 +24,7 @@
 //   src/alchemy/host/common/, above the backends.
 //
 // Areas (one header each): vm, sections, files, net, dns_sd, http, process,
-// ipc, sync, time, locale, icu, crypto, system, ui, audio, midi, gpu, plus
+// ipc, sync, time, locale, icu, crypto, system, ui, audio, midi, gpu, gl, plus
 // network_policy. An area's owner extends its header; add a function to
 // every backend (null included) in the same commit.
 
