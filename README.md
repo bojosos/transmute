@@ -56,5 +56,8 @@ absent. No application binaries are part of this repository.
 
 ## License
 
-MIT; see [LICENSE](LICENSE). Third-party components and the tools the build uses
-are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT; see [LICENSE](LICENSE). The exception is `external/m2v-capi/`, a C ABI over the
+metal2vulkan translator that builds a separate, optional DLL: it is LGPL-3.0-or-later (its
+own `COPYING.LESSER` and `COPYING`), and Alchemy only loads it at run time. Third-party
+components and the tools the build uses are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

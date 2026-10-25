@@ -10,6 +10,7 @@ guest runtimes ship with are in [runtime/THIRD_PARTY_NOTICES.md](runtime/THIRD_P
 | Component | License | Where | Notes |
 | --- | --- | --- | --- |
 | [tsl::robin_map](https://github.com/Tessil/robin-map) v1.4.1 | MIT | `third_party/robin-map/` | Four headers and `LICENSE`, unmodified, hashes in `PROVENANCE.md`. Compiled into the host executables (`ALCHEMY_ROBIN_MAP`). |
+| m2v-capi (project-authored) | **LGPL-3.0-or-later** | `external/m2v-capi/` | The C ABI over metal2vulkan, with its own `COPYING.LESSER` and `COPYING`. Not MIT, and not compiled into anything else: it builds a separate DLL ([below](#loaded-at-run-time-when-present-m2v_capidll-metal2vulkan)). |
 
 Nothing else is vendored. In particular:
 
@@ -62,37 +63,59 @@ never committed, and no part of them is copied into the repository.
 | Swift 6.2 Windows toolchain (swift.org) | Apache-2.0 WITH Swift-exception | Builds the guest Swift runtime and fixtures |
 | SPIRV-Tools `spirv-val`, glslang `glslangValidator` (Vulkan SDK) | Apache-2.0 (glslang: BSD-3-Clause and others) | Shader validation in tests |
 
-## Evaluated, not included: metal2vulkan
+## Loaded at run time when present: m2v_capi.dll (metal2vulkan)
 
-[steelbrain/metal2vulkan](https://github.com/steelbrain/metal2vulkan) is a Rust
-AIR-to-SPIR-V translator, and it was evaluated during Chrome stage 4
-([docs/ALCHEMY_CHROME_AUDIT.md](docs/ALCHEMY_CHROME_AUDIT.md)). The evaluation
-used its own build outside the repository. None of its code, headers, crates or
-build hooks are in this repository or its history.
+`-[MTLDevice newLibraryWithData:error:]` (precompiled Metal libraries; ANGLE's built-in shaders in
+Chrome) is translated by [metal2vulkan](https://github.com/steelbrain/metal2vulkan), a Rust
+AIR-to-SPIR-V translator. It is used only through `m2v_capi.dll`:
+* **What it is:** a separate DLL built from `external/m2v-capi/` by `scripts/m2v/build_capi.ps1` into
+  the git-ignored `artifacts/m2v-capi/`. Neither CI nor the default build builds it.
+* **How Alchemy uses it:** alchemy-fx loads it by name at run time (`ALCHEMY_M2V_CAPI`, or next to
+  the executable) through `host::gpu::air_translator_symbol`, and calls its C ABI
+  (`src/alchemy/darwin/metal/air_translator.cpp` declares those entry points itself).
+* **Without it:** `newLibraryWithData:` fails explicitly, as it did before.
 
-Its license is `GPL-2.0-or-later OR LGPL-3.0-or-later`, at the recipient's choice
-(files `LICENSE`, `LICENSE-GPL-2.0`, `LICENSE-GPL-3.0`, `LICENSE-LGPL-3.0`; read
-from the repository page on 2026-10-21). Using it would mean choosing the
-LGPL-3.0 option and meeting its terms:
+Alchemy never links it, and no metal2vulkan source, table or header is in the MIT tree. The wrapper
+(LGPL) calls metal2vulkan's public API. Alchemy's MIT code knows only the wrapper's C ABI and the
+plain-data JSON forms that ABI documents.
 
-* **Relinkable.** Users must be able to replace the library with a modified
-  version. The practical way is a separate dynamic library: a `cdylib` with a C
-  ABI, loaded by `alchemy-fx` like `libclang.dll`. Rust links crates statically
-  by default, so statically linking the crate into `alchemy-fx` would oblige us
-  to ship relinkable object files instead (LGPL-3.0 section 4(d)(0)).
-* **Notices.** Ship the GPL-3.0 and LGPL-3.0 texts with any binary distribution,
-  and state that the library is used and is LGPL licensed (4(a), 4(b)).
-* **Source.** Provide the library's corresponding source with the binary, or a
-  written offer for it, including any changes we make (GPL-3.0 section 6 via the
-  LGPL).
-* **Separation.** Keep its code out of the MIT-licensed tree. Do not copy or adapt
-  its source, tables or AIR knowledge into `src/`. Changes to the library itself
-  stay LGPL and go upstream or into a separate fork. A thin MIT wrapper that
-  calls its C ABI may stay MIT.
-* **Inventory.** List it and every crate it pulls in, with their licenses, in this
-  file, and pin the revision. Fetching it and the Rust toolchain is a download,
-  so it needs the user's approval.
+| Component | Version | License | Role |
+| --- | --- | --- | --- |
+| m2v-capi | 0.1.0 (`external/m2v-capi/`) | LGPL-3.0-or-later | the C ABI wrapper (project-authored) |
+| [metal2vulkan](https://github.com/steelbrain/metal2vulkan), metal2vulkan-air | 0.2.0 at `4d695b78aedb060402383bf1b57f51bb2901ccd8` (`development`) | GPL-2.0-or-later OR LGPL-3.0-or-later; used under **LGPL-3.0-or-later** | the translator |
+| [ash](https://github.com/ash-rs/ash) | 0.38.0+1.3.281 | MIT OR Apache-2.0 | Vulkan types, the device query |
+| [serde](https://github.com/serde-rs/serde), serde_core | 1.0.229 | MIT OR Apache-2.0 | serialization |
+| [serde_json](https://github.com/serde-rs/json) | 1.0.154 | MIT OR Apache-2.0 | JSON |
+| [sha2](https://github.com/RustCrypto/hashes) 0.11.1, digest 0.11.3, block-buffer 0.12.1, crypto-common 0.2.2, cpufeatures 0.3.1, [hybrid-array](https://github.com/RustCrypto/hybrid-array) 0.4.15 | as listed | MIT OR Apache-2.0 | content hashes |
+| [typenum](https://github.com/paholg/typenum) | 1.20.1 | MIT OR Apache-2.0 | (sha2) |
+| [cfg-if](https://github.com/rust-lang/cfg-if) | 1.0.5 | MIT OR Apache-2.0 | |
+| [libc](https://github.com/rust-lang/libc) | 0.2.191 | MIT OR Apache-2.0 | (ash) |
+| [itoa](https://github.com/dtolnay/itoa) | 1.0.18 | MIT OR Apache-2.0 | (serde_json) |
+| [zmij](https://github.com/dtolnay/zmij) | 1.0.23 | MIT | (serde_json) |
+| [memchr](https://github.com/BurntSushi/memchr) | 2.8.3 | Unlicense OR MIT | (serde_json) |
+| [serde_derive](https://github.com/serde-rs/serde), [syn](https://github.com/dtolnay/syn) 3.0.9, [quote](https://github.com/dtolnay/quote) 1.0.47, [proc-macro2](https://github.com/dtolnay/proc-macro2) 1.0.107 | 1.0.229 | MIT OR Apache-2.0 | build time only (procedural macros) |
+| [unicode-ident](https://github.com/dtolnay/unicode-ident) | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 | build time only |
 
-Translating AIR also touches the project's no-reverse-engineering policy (the
-audit above records the user's decision). Adopting metal2vulkan needs the user's
-decision on both points.
+`external/m2v-capi/Cargo.lock` pins every version. Raising the metal2vulkan revision, or any
+version, updates this table in the same change.
+
+**Distributing the DLL with Alchemy** means conveying a Combined Work under LGPL-3.0, section 4. Nobody
+distributes binaries today: the DLL is built locally. Before anyone does, these must hold:
+* **Replaceable (4(d)(1)).** The DLL is loaded at run time through a documented C ABI. Users can
+  rebuild it from source, with changes, and put theirs in its place, or point `ALCHEMY_M2V_CAPI` at it.
+  Keep it a separate DLL: never link metal2vulkan statically into alchemy-fx.
+* **Notices (4(a), 4(b)).** Ship `external/m2v-capi/COPYING.LESSER` and `COPYING` next to the DLL. State
+  that alchemy-fx uses m2v-capi and metal2vulkan and that both are under the LGPL, for example in
+  this file, shipped alongside.
+* **Source (GPL-3.0 section 6 through the LGPL).** Offer the DLL's Corresponding Source with it:
+  * this repository's `external/m2v-capi/` at the same commit;
+  * metal2vulkan at the pinned revision;
+  * every crate at its `Cargo.lock` version, which `cargo vendor` collects.
+
+  The surest form is to ship that source next to the binary, or a written offer for it. Pointing
+  only at upstream's GitHub relies on a third party keeping it available (section 6(d)).
+* **Changes to metal2vulkan** stay LGPL, in a fork or upstream. They are never copied into `src/`.
+
+Translating AIR touches the project's no-reverse-engineering policy. The user decided to adopt
+metal2vulkan as a separately built library (2026-10-25). The translator's own AIR knowledge is
+upstream's; Alchemy only calls its public API.

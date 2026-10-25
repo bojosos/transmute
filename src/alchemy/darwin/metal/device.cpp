@@ -349,6 +349,10 @@ void Device::initialize(const DeviceOptions& options) {
         dynamic_rendering_local_read = true;
     }
     features10 = enabled.features;
+    features11 = enabled11;
+    features11.pNext = nullptr;
+    fragment_shader_barycentric = barycentric && enabled_bary.fragmentShaderBarycentric;
+    primitive_topology_list_restart = list_restart && enabled_restart.primitiveTopologyListRestart;
     features12 = enabled12;
     features12.pNext = nullptr;
     features13 = enabled13;

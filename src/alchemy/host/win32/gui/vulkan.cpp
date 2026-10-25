@@ -22,6 +22,28 @@ Result<void*> vulkan_get_instance_proc_addr() {
     return entry;
 }
 
+Result<void*> air_translator_symbol(const char* name) {
+    static const HMODULE module = [] {
+        std::wstring path(32768, L'\0');
+        auto length = GetEnvironmentVariableW(L"ALCHEMY_M2V_CAPI", path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0 || length >= path.size()) {
+            length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+            if (length == 0 || length >= path.size()) return HMODULE{};
+            path.resize(length);
+            path.erase(path.find_last_of(L"\\/") + 1);
+            path += L"m2v_capi.dll";
+        } else {
+            path.resize(length);
+        }
+        // Its own directory and System32 only (it needs nothing else).
+        return LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }();
+    if (!module) return Error::not_found;
+    const auto entry = reinterpret_cast<void*>(GetProcAddress(module, name));
+    if (!entry) return Error::unsupported;
+    return entry;
+}
+
 #ifdef ALCHEMY_HAVE_VULKAN_HEADERS
 std::string_view vulkan_surface_extension() noexcept { return VK_KHR_WIN32_SURFACE_EXTENSION_NAME; }
 

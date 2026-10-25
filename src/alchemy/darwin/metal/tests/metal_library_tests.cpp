@@ -13,7 +13,11 @@
 //     them.
 #include "alchemy/gui/tests/fill_fixture.hpp"
 
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 
 namespace {
 using namespace fill_test;
@@ -166,8 +170,87 @@ kernel void reflected(device float* out [[buffer(2)]], texture2d<uint, access::r
     require(buffer && texture, "MTLBindingTypeBuffer out at 2 (read-write), MTLBindingTypeTexture counts at 1 (uint)");
 }
 
+// A precompiled library (newLibraryWithData:, ANGLE's built-in shaders) when
+// the AIR translator and a dumped metallib are present (ALCHEMY_M2V_CAPI,
+// ALCHEMY_M2V_TEST_LIBRARY; air_translator.hpp): its functions, function
+// constants, and render and compute pipeline states. Without them the call
+// fails explicitly, as Metal reports an unsupported library.
+void precompiled(Fixture& f) {
+    const auto d = device(f);
+    if (!d) { std::cout << "  no Metal device (no Vulkan 1.3 GPU): skipped\n"; return; }
+    const char* path = std::getenv("ALCHEMY_M2V_TEST_LIBRARY");
+    std::vector<std::uint8_t> bytes;
+    if (path && *path) {
+        std::ifstream file(path, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    if (bytes.empty()) {
+        // Any bytes: without a translator (or a library) the call fails.
+        bytes = {'M', 'T', 'L', 'B', 0, 0, 0, 0};
+    }
+    const auto source = f.block(bytes.size());
+    f.engine.write_bytes(source, bytes);
+    const auto data = f.call("/usr/lib/libSystem.B.dylib", "_dispatch_data_create", {source, bytes.size(), 0, 0});
+    const auto error = f.block(8);
+    const auto library = f.send(d, "newLibraryWithData:error:", {data, error});
+    const bool translator = std::getenv("ALCHEMY_M2V_CAPI") && *std::getenv("ALCHEMY_M2V_CAPI") &&
+                            std::filesystem::exists(std::getenv("ALCHEMY_M2V_CAPI"));
+    if (!translator || !path || !*path) {
+        const auto failure = f.engine.read64(error);
+        require(library == 0 && failure && f.cf.utf8(f.send(failure, "domain")) == "MTLLibraryErrorDomain",
+                "without the AIR translator and a library, newLibraryWithData: fails in MTLLibraryErrorDomain");
+        std::cout << "  no AIR translator or dumped library: only the failure checked\n";
+        return;
+    }
+    require(library != 0, "newLibraryWithData: through the AIR translator: " +
+                              (f.engine.read64(error) ? f.cf.utf8(f.send(f.engine.read64(error), "localizedDescription")) : std::string()));
+    require(f.cf.length(f.send(library, "functionNames")) == 40, "ANGLE's library has 40 functions");
+    const auto missing = f.send(library, "newFunctionWithName:", {f.cf.string("noSuchFunction")});
+    require(missing == 0, "an unknown function name gives nil");
+
+    // Function constants: MTLFunctionConstantValues by index.
+    const auto constants = make(f, "MTLFunctionConstantValues");
+    const auto value = f.block(4);
+    const auto set = [&](std::uint32_t bits, std::uint64_t type, std::uint64_t index) {
+        f.engine.write64(value, bits);
+        static_cast<void>(f.send(constants, "setConstantValue:type:atIndex:", {value, type, index}));
+    };
+    set(1, 33, 0);   // kNumColorOutputs: uint 1
+    set(0, 53, 1);   // kPremultiplyAlpha: bool
+    set(0, 53, 2);   // kUnmultiplyAlpha
+    set(0, 53, 3);   // kTransformLinearToSrgb
+    set(0, 29, 4);   // kSourceTextureType: int (2D)
+    const auto vertex = f.send(library, "newFunctionWithName:", {f.cf.string("blitVS")});
+    f.engine.write64(error, 0);
+    const auto fragment = f.send(library, "newFunctionWithName:constantValues:error:", {f.cf.string("blitFloatFS"), constants, error});
+    require(vertex != 0 && f.send(vertex, "functionType") == 1 && fragment != 0 && f.send(fragment, "functionType") == 2,
+            "blitVS (vertex) and blitFloatFS (fragment, specialized)");
+    require(f.cf.utf8(f.send(fragment, "name")) == "blitFloatFS", "a precompiled function's name");
+    const auto unspecialized = f.send(library, "newFunctionWithName:constantValues:error:",
+                                      {f.cf.string("convertIndexU16"), make(f, "MTLFunctionConstantValues"), error});
+    require(unspecialized == 0 && f.engine.read64(error) != 0, "a required function constant without a value is an error");
+
+    const auto descriptor = make(f, "MTLRenderPipelineDescriptor");
+    static_cast<void>(f.send(descriptor, "setVertexFunction:", {vertex}));
+    static_cast<void>(f.send(descriptor, "setFragmentFunction:", {fragment}));
+    const auto color = f.send(f.send(descriptor, "colorAttachments"), "objectAtIndexedSubscript:", {0});
+    static_cast<void>(f.send(color, "setPixelFormat:", {70}));   // RGBA8Unorm
+    f.engine.write64(error, 0);
+    const auto render = f.send(d, "newRenderPipelineStateWithDescriptor:error:", {descriptor, error});
+    require(render != 0, "a render pipeline state of precompiled functions: " +
+                             (f.engine.read64(error) ? f.cf.utf8(f.send(f.engine.read64(error), "localizedDescription")) : std::string()));
+
+    const auto kernel = f.send(library, "newFunctionWithName:", {f.cf.string("generate2DMipmaps")});
+    require(kernel != 0 && f.send(kernel, "functionType") == 3, "generate2DMipmaps (kernel)");
+    f.engine.write64(error, 0);
+    const auto compute = f.send(d, "newComputePipelineStateWithFunction:error:", {kernel, error});
+    require(compute != 0 && f.send(compute, "maxTotalThreadsPerThreadgroup") >= 32 && f.send(compute, "threadExecutionWidth") == 32,
+            "a compute pipeline state of a precompiled kernel answers its thread limits");
+}
+
 } // namespace
 
 int main() {
-    return run("metal libraries", {{"libraries and argument buffers", libraries}, {"reflection", reflection}});
+    return run("metal libraries", {{"libraries and argument buffers", libraries}, {"reflection", reflection},
+                                    {"precompiled libraries", precompiled}});
 }

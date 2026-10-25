@@ -2,6 +2,8 @@
 
 #include "alchemy/engine_adapter.hpp"
 
+#include "alchemy/darwin/metal/air_translator.hpp"
+#include "alchemy/darwin/metal/foreign_pipeline.hpp"
 #include "alchemy/darwin/metal/formats.hpp"
 #include "alchemy/darwin/metal/interop.hpp"
 #include "alchemy/host/time.hpp"
@@ -47,14 +49,39 @@ struct TextureState final : Held {
 struct SamplerObject final : Held { std::shared_ptr<Sampler> sampler; Address device{}; };
 struct DepthStencilObject final : Held { std::shared_ptr<DepthStencilState> state; Address device{}; };
 struct HeapState final : Held { std::shared_ptr<Heap> heap; Address device{}; };
-struct LibraryState final : Held { std::shared_ptr<ShaderLibrary> library; Address device{}; };
+// A library is MSL compiled by the MSL compiler (`library`), or a precompiled
+// metallib the AIR translator reads (`foreign`, newLibraryWithData:;
+// air_translator.hpp). Functions and pipelines follow their library's kind.
+struct LibraryState final : Held {
+    std::shared_ptr<ShaderLibrary> library;
+    std::shared_ptr<const air::Library> foreign;
+    Address device{};
+};
+// A function of a precompiled library: its name and stage, and the values of
+// its function constants in the translator's form (a json array of
+// {"index", "type", "bytes"}); `missing` names required constants without one.
+struct ForeignFunction {
+    std::shared_ptr<const air::Library> library;
+    std::string name, stage;   // "Kernel", "Vertex", "Fragment"
+    json::Value constants = json::Value::array();
+    std::vector<std::string> missing;
+};
 struct FunctionState final : Held {
     std::shared_ptr<ShaderFunction> function;
+    std::shared_ptr<const ForeignFunction> foreign;
     Address device{}, name{};
     bool specialized{};
 };
-struct RenderPipelineObject final : Held { std::shared_ptr<RenderPipeline> pipeline; Address device{}; };
-struct ComputePipelineObject final : Held { std::shared_ptr<ComputePipeline> pipeline; Address device{}; };
+struct RenderPipelineObject final : Held {
+    std::shared_ptr<RenderPipeline> pipeline;
+    std::shared_ptr<air::ForeignPipeline> foreign;
+    Address device{};
+};
+struct ComputePipelineObject final : Held {
+    std::shared_ptr<ComputePipeline> pipeline;
+    std::shared_ptr<air::ForeignPipeline> foreign;
+    Address device{};
+};
 struct QueueState final : Held { Address device{}; };
 struct CommandBufferState final : Held {
     std::shared_ptr<CommandBuffer> commands;
@@ -599,7 +626,9 @@ void install_render_encoder() {
         }), false, std::move(types));
     };
     method("setRenderPipelineState:", [](EncoderState& e, CpuState& s, GuestMemory&) {
-        e.commands->set_render_pipeline(state<RenderPipelineObject>(s.x[2], "MTLRenderPipelineState")->pipeline);
+        const auto pipeline = state<RenderPipelineObject>(s.x[2], "MTLRenderPipelineState");
+        if (pipeline->foreign) e.commands->set_render_pipeline(pipeline->foreign);
+        else e.commands->set_render_pipeline(pipeline->pipeline);
     }, "v@:@");
     const auto read_viewport = [](GuestMemory& m, Address pointer) {
         Viewport value;
@@ -721,7 +750,9 @@ void install_compute_encoder() {
     };
     r.method(cls, "dispatchType", on<EncoderState>(what, [](EncoderState& e, CpuState& s, GuestMemory&) { s.x[0] = e.dispatch_type; }), false, "Q@:");
     method("setComputePipelineState:", [](EncoderState& e, CpuState& s, GuestMemory&) {
-        e.commands->set_compute_pipeline(state<ComputePipelineObject>(s.x[2], "MTLComputePipelineState")->pipeline);
+        const auto pipeline = state<ComputePipelineObject>(s.x[2], "MTLComputePipelineState");
+        if (pipeline->foreign) e.commands->set_compute_pipeline(pipeline->foreign);
+        else e.commands->set_compute_pipeline(pipeline->pipeline);
     }, "v@:@");
     method("setThreadgroupMemoryLength:atIndex:", [](EncoderState& e, CpuState& s, GuestMemory&) {
         e.commands->set_threadgroup_memory(static_cast<std::uint32_t>(s.x[3]), static_cast<std::uint32_t>(s.x[2]));
@@ -1397,8 +1428,63 @@ msl::CompileOptions compile_options(Address options) {
     return result;
 }
 
+std::string hex_bytes(const std::vector<std::uint8_t>& bytes) {
+    static const char digits[] = "0123456789abcdef";
+    std::string out;
+    for (const auto byte : bytes) { out += digits[byte >> 4]; out += digits[byte & 15]; }
+    return out;
+}
+
+// A function of a precompiled library with MTLFunctionConstantValues (by
+// index or by name) as the translator takes them.
+std::shared_ptr<const ForeignFunction> foreign_function(const LibraryState& library, std::string_view name,
+                                                        const ConstantValues* values, std::string& error) {
+    const auto* info = library.foreign->function(name);
+    if (!info) { error = "Function " + std::string(name) + " was not found in the library"; return nullptr; }
+    auto function = std::make_shared<ForeignFunction>();
+    function->library = library.foreign;
+    function->name = std::string(name);
+    if (const auto* stage = (*info)["stage"].as_string()) function->stage = *stage;
+    for (const auto& constant : (*info)["constants"].items()) {
+        const auto* constant_name = constant["name"].as_string();
+        const auto index = constant["index"].as_u64();
+        const ConstantValue* value = nullptr;
+        if (values) {
+            if (index)
+                if (const auto found = values->by_index.find(static_cast<std::uint32_t>(*index)); found != values->by_index.end())
+                    value = &found->second;
+            if (!value && constant_name)
+                if (const auto found = values->by_name.find(*constant_name); found != values->by_name.end()) value = &found->second;
+        }
+        if (!value) {
+            if (constant["required"].as_bool().value_or(true)) function->missing.push_back(constant_name ? *constant_name : "?");
+            continue;
+        }
+        auto entry = json::Value::object();
+        if (index) entry.set("index", *index);
+        else entry.set("name", constant_name ? *constant_name : "");
+        entry.set("type", value->data_type);
+        entry.set("bytes", hex_bytes(value->bytes));
+        function->constants.push(std::move(entry));
+    }
+    if (values && !function->missing.empty()) {
+        error = "Function " + function->name + " requires function constant " + function->missing.front() + ", which has no value";
+        return nullptr;
+    }
+    return function;
+}
+
 Address new_function(LibraryState& library, Address device, std::string_view name, const ConstantValues* values,
                      std::string& error) {
+    if (library.foreign) {
+        auto foreign = foreign_function(library, name, values, error);
+        if (!foreign) return 0;
+        auto value = std::make_shared<FunctionState>();
+        value->foreign = std::move(foreign);
+        value->device = device;
+        value->specialized = values != nullptr;
+        return runtime().create(classes.function, std::move(value));
+    }
     const auto found = library.library->find(name);
     if (!found) { error = "Function " + std::string(name) + " was not found in the library"; return 0; }
     auto function = std::make_shared<ShaderFunction>(library.library->device, found);
@@ -1415,6 +1501,9 @@ Address new_function(LibraryState& library, Address device, std::string_view nam
 std::shared_ptr<ShaderFunction> pipeline_function(Address object, std::string_view role) {
     if (!object) return nullptr;
     const auto value = state<FunctionState>(object, "MTLFunction");
+    if (value->foreign)
+        throw std::runtime_error(std::string(role) + " " + value->foreign->name +
+                                 " is from a precompiled library; its pipeline's other functions must be too");
     if (!value->specialized)
         for (const auto& constant : value->function->reflection().function_constants)
             if (constant.required)
@@ -1430,7 +1519,12 @@ void install_library_and_function() {
     const auto library_what = "MTLLibrary";
     r.method(classes.library, "functionNames", on<LibraryState>(library_what, [&r](LibraryState& l, CpuState& s, GuestMemory&) {
         std::vector<Address> names;
-        for (const auto& function : l.library->functions) names.push_back(r.cf.string(function->name));
+        if (l.foreign) {
+            for (const auto& function : l.foreign->functions().items())
+                if (const auto* name = function["name"].as_string()) names.push_back(r.cf.string(*name));
+        } else {
+            for (const auto& function : l.library->functions) names.push_back(r.cf.string(function->name));
+        }
         const auto array = r.cf.array(names);
         for (const auto name : names) r.release(name);
         s.x[0] = r.autorelease(array);
@@ -1476,7 +1570,7 @@ void install_library_and_function() {
     const auto what = "MTLFunction";
     r.method(cls, "name", on<FunctionState>(what, [&r](FunctionState& f, CpuState& s, GuestMemory&) {
         std::lock_guard lock(f.mutex);
-        if (!f.name) f.name = r.cf.string(f.function->name());
+        if (!f.name) f.name = r.cf.string(f.foreign ? f.foreign->name : f.function->name());
         s.x[0] = f.name;
     }));
     r.method(cls, "dealloc", [&r, cls](CpuState& s, GuestMemory&) {
@@ -1488,11 +1582,15 @@ void install_library_and_function() {
     }, false, "v@:");
     r.method(cls, "functionType", on<FunctionState>(what, [](FunctionState& f, CpuState& s, GuestMemory&) {
         // MTLFunctionTypeVertex = 1, Fragment = 2, Kernel = 3.
-        s.x[0] = f.function->stage() == msl::Stage::vertex ? 1 : f.function->stage() == msl::Stage::fragment ? 2 : 3;
+        if (f.foreign) s.x[0] = f.foreign->stage == "Vertex" ? 1 : f.foreign->stage == "Fragment" ? 2 : 3;
+        else s.x[0] = f.function->stage() == msl::Stage::vertex ? 1 : f.function->stage() == msl::Stage::fragment ? 2 : 3;
     }), false, "Q@:");
     r.method(cls, "options", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "Q@:");
     r.method(cls, "patchType", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "Q@:");
     r.method(cls, "newArgumentEncoderWithBufferIndex:", on<FunctionState>(what, [&r](FunctionState& f, CpuState& s, GuestMemory&) {
+        if (f.foreign)
+            throw std::runtime_error("Alchemy Metal: argument encoders of precompiled-library functions are not implemented (" +
+                                     f.foreign->name + ")");
         const auto& reflection = f.function->reflection();
         // An argument buffer of samplers (Blender's SStruct): no
         // argument-table slot; its samplers fill one sampler array binding
@@ -1537,6 +1635,126 @@ void install_library_and_function() {
         encoder->device = f.device;
         s.x[0] = r.create(classes.argument_encoder, std::move(encoder));
     }), false, "@@:Q");
+}
+
+// The precompiled-library function of a pipeline descriptor's function
+// object, or null when it is an MSL function (or nil).
+std::shared_ptr<const ForeignFunction> foreign_of(Address function) {
+    if (!function) return nullptr;
+    return state<FunctionState>(function, "MTLFunction")->foreign;
+}
+
+// A translated pipeline's function, checked as pipeline_function checks an
+// MSL one: every required function constant has a value.
+const ForeignFunction& foreign_pipeline_function(const std::shared_ptr<const ForeignFunction>& function, std::string_view role) {
+    if (!function->missing.empty())
+        throw std::runtime_error(std::string(role) + " " + function->name + " uses function constant " + function->missing.front() +
+                                 " but was created without MTLFunctionConstantValues");
+    return *function;
+}
+
+std::shared_ptr<air::ForeignPipeline> foreign_pipeline(Address device, const std::shared_ptr<const air::Library>& library,
+                                                       const json::Value& descriptor) {
+    auto owner = device_of_object(device);
+    const auto& translator = air::TranslatorDevice::of(*owner);
+    auto compiled = std::make_shared<const air::Pipeline>(translator, *library, descriptor);
+    return std::make_shared<air::ForeignPipeline>(std::move(owner), std::move(compiled), library, descriptor);
+}
+
+// MTLRenderPipelineDescriptor of precompiled-library functions, compiled by
+// the translator (descriptor form: m2v_pipeline_compile).
+std::shared_ptr<air::ForeignPipeline> foreign_render_pipeline(Address device, Address descriptor) {
+    auto& r = runtime();
+    const auto vertex = foreign_of(descriptor_object(descriptor, "vertexFunction"));
+    const auto fragment_object = descriptor_object(descriptor, "fragmentFunction");
+    const auto fragment = foreign_of(fragment_object);
+    if (!vertex) throw std::runtime_error("vertexFunction is not from a precompiled library");
+    if (fragment_object && !fragment) throw std::runtime_error("fragmentFunction is not from a precompiled library");
+    if (fragment && fragment->library != vertex->library)
+        throw std::runtime_error("vertexFunction and fragmentFunction come from different precompiled libraries");
+    auto d = json::Value::object();
+    d.set("kind", "render");
+    d.set("vertex", foreign_pipeline_function(vertex, "vertexFunction").name);
+    d.set("vertex_constants", vertex->constants);
+    if (fragment) {
+        d.set("fragment", foreign_pipeline_function(fragment, "fragmentFunction").name);
+        d.set("fragment_constants", fragment->constants);
+    }
+    auto colors = json::Value::array();
+    if (const auto attachments = descriptor_child(descriptor, "colorAttachments"))
+        for (std::uint32_t index = 0; index < 8; ++index) {
+            const auto element = descriptor_element(attachments, index);
+            if (!element) continue;
+            const auto format = descriptor_u64(element, "pixelFormat");
+            if (!format) continue;
+            auto c = json::Value::object();
+            c.set("index", index);
+            c.set("format", format);
+            c.set("blending", descriptor_bool(element, "blendingEnabled"));
+            c.set("source_rgb", descriptor_u64(element, "sourceRGBBlendFactor"));
+            c.set("destination_rgb", descriptor_u64(element, "destinationRGBBlendFactor"));
+            c.set("rgb_operation", descriptor_u64(element, "rgbBlendOperation"));
+            c.set("source_alpha", descriptor_u64(element, "sourceAlphaBlendFactor"));
+            c.set("destination_alpha", descriptor_u64(element, "destinationAlphaBlendFactor"));
+            c.set("alpha_operation", descriptor_u64(element, "alphaBlendOperation"));
+            c.set("write_mask", descriptor_u64(element, "writeMask"));
+            colors.push(std::move(c));
+        }
+    d.set("color_attachments", std::move(colors));
+    if (const auto format = descriptor_u64(descriptor, "depthAttachmentPixelFormat")) d.set("depth_format", format);
+    if (const auto format = descriptor_u64(descriptor, "stencilAttachmentPixelFormat")) d.set("stencil_format", format);
+    d.set("raster_sample_count", std::max<std::uint64_t>(1, descriptor_u64(descriptor, "rasterSampleCount")));
+    d.set("alpha_to_coverage", descriptor_bool(descriptor, "alphaToCoverageEnabled"));
+    d.set("alpha_to_one", descriptor_bool(descriptor, "alphaToOneEnabled"));
+    d.set("rasterization_enabled", descriptor_bool(descriptor, "rasterizationEnabled"));
+    d.set("input_primitive_topology", descriptor_u64(descriptor, "inputPrimitiveTopology"));
+    if (descriptor_u64(descriptor, "maxVertexAmplificationCount") > 1) throw std::runtime_error("vertex amplification is not translated");
+    if (const auto vertex_descriptor = descriptor_child(descriptor, "vertexDescriptor")) {
+        const auto attributes = descriptor_child(vertex_descriptor, "attributes");
+        const auto layouts = descriptor_child(vertex_descriptor, "layouts");
+        auto attribute_map = json::Value::object(), layout_map = json::Value::object();
+        for (std::uint32_t index = 0; index < 31; ++index) {
+            if (const auto element = attributes ? descriptor_element(attributes, index) : 0) {
+                if (const auto format = descriptor_u64(element, "format")) {
+                    auto a = json::Value::object();
+                    a.set("format", air::metal_enum("VertexFormat", static_cast<std::uint32_t>(format)));
+                    a.set("offset", descriptor_u64(element, "offset"));
+                    a.set("buffer_index", descriptor_u64(element, "bufferIndex"));
+                    attribute_map.set(std::to_string(index), std::move(a));
+                }
+            }
+            if (const auto element = layouts ? descriptor_element(layouts, index) : 0) {
+                const auto stride = descriptor_u64(element, "stride");
+                if (!stride) continue;   // an unused layout
+                auto l = json::Value::object();
+                // MTLBufferLayoutStrideDynamic: the stride comes with each bind.
+                if (stride == ~std::uint64_t{0}) l.set("stride", nullptr);
+                else l.set("stride", stride);
+                l.set("step_function", air::metal_enum("VertexStepFunction", static_cast<std::uint32_t>(descriptor_u64(element, "stepFunction"))));
+                l.set("step_rate", descriptor_u64(element, "stepRate"));
+                layout_map.set(std::to_string(index), std::move(l));
+            }
+        }
+        if (attribute_map.size()) {
+            auto v = json::Value::object();
+            v.set("layouts", std::move(layout_map));
+            v.set("attributes", std::move(attribute_map));
+            d.set("vertex_descriptor", std::move(v));
+        }
+    }
+    static_cast<void>(r);
+    return foreign_pipeline(device, vertex->library, d);
+}
+
+std::shared_ptr<air::ForeignPipeline> foreign_compute_pipeline(Address device, Address function_object, std::uint32_t max_threads) {
+    const auto function = foreign_of(function_object);
+    if (!function) throw std::runtime_error("computeFunction is not from a precompiled library");
+    auto d = json::Value::object();
+    d.set("kind", "compute");
+    d.set("function", foreign_pipeline_function(function, "computeFunction").name);
+    d.set("constants", function->constants);
+    if (max_threads) d.set("max_total_threads_per_threadgroup", max_threads);
+    return foreign_pipeline(device, function->library, d);
 }
 
 std::shared_ptr<RenderPipeline> render_pipeline(Address device, Address descriptor) {
@@ -1630,12 +1848,24 @@ void install_pipeline_states() {
     install_device_getter(cls);
     const auto what = "MTLComputePipelineState";
     r.method(cls, "maxTotalThreadsPerThreadgroup", on<ComputePipelineObject>(what, [](ComputePipelineObject& p, CpuState& s, GuestMemory&) {
+        if (p.foreign) {
+            s.x[0] = p.foreign->pipeline->info()["metal_info"]["max_total_threads_per_threadgroup"].as_u64().value_or(32);
+            return;
+        }
         s.x[0] = p.pipeline->max_total_threads;
     }), false, "Q@:");
     r.method(cls, "threadExecutionWidth", on<ComputePipelineObject>(what, [](ComputePipelineObject& p, CpuState& s, GuestMemory&) {
+        if (p.foreign) {
+            s.x[0] = p.foreign->pipeline->info()["metal_info"]["thread_execution_width"].as_u64().value_or(32);
+            return;
+        }
         s.x[0] = p.pipeline->thread_execution_width;
     }), false, "Q@:");
     r.method(cls, "staticThreadgroupMemoryLength", on<ComputePipelineObject>(what, [](ComputePipelineObject& p, CpuState& s, GuestMemory&) {
+        if (p.foreign) {
+            s.x[0] = p.foreign->pipeline->info()["metal_info"]["static_threadgroup_memory_length"].as_u64().value_or(0);
+            return;
+        }
         s.x[0] = p.pipeline->static_threadgroup_memory;
     }), false, "Q@:");
     r.method(cls, "imageblockMemoryLengthForDimensions:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "Q@:{MTLSize=QQQ}");
@@ -2256,8 +2486,38 @@ void install_device() {
                 static_cast<void>(r.call("_free", {out}));
             }
         }
+        // With the AIR translator (air_translator.hpp) the library is read
+        // here and its pipelines compiled at pipeline-state creation.
+        std::string why;
+        if (data && air::available(&why)) {
+            try {
+                const auto out = r.call("_malloc", {16});
+                std::vector<std::uint8_t> bytes;
+                if (out) {
+                    const auto map = r.call("_dispatch_data_create_map", {data, out, out + 8});
+                    const auto buffer = m.read64(out), size = m.read64(out + 8);
+                    if (map && buffer && size) {
+                        bytes.resize(static_cast<std::size_t>(size));
+                        m.read_bytes(buffer, std::span(bytes.data(), bytes.size()));
+                    }
+                    if (map) static_cast<void>(r.call("_dispatch_release", {map}));
+                    static_cast<void>(r.call("_free", {out}));
+                }
+                auto value = std::make_shared<LibraryState>();
+                value->foreign = std::make_shared<const air::Library>(bytes);
+                value->device = s.x[0];
+                s.x[0] = r.create(classes.library, std::move(value));
+                return;
+            } catch (const air::TranslatorError& failure) {
+                // MTLLibraryErrorCompileFailure (3): the translator refused it.
+                r.set_error(m, error_out, "MTLLibraryErrorDomain", 3, std::string("Alchemy AIR translator: ") + failure.what());
+                s.x[0] = 0;
+                return;
+            }
+        }
         // MTLLibraryErrorUnsupported (1): metallib binaries are Apple GPU code.
-        r.set_error(m, error_out, "MTLLibraryErrorDomain", 1, "precompiled Metal libraries (metallib) are not translated");
+        r.set_error(m, error_out, "MTLLibraryErrorDomain", 1, "precompiled Metal libraries (metallib) are not translated" +
+                    (why.empty() ? std::string() : " (" + why + ")"));
         s.x[0] = 0;
     }, false, "@@:@^@");
     for (const auto selector : {"newLibraryWithURL:error:", "newLibraryWithFile:error:"})
@@ -2310,6 +2570,14 @@ void install_device() {
 
     const auto render = [&r](CpuState& s, GuestMemory& m, Address reflection_out, Address error_out) {
         try {
+            if (s.x[2] && foreign_of(descriptor_object(s.x[2], "vertexFunction"))) {
+                auto value = std::make_shared<RenderPipelineObject>();
+                value->foreign = foreign_render_pipeline(s.x[0], s.x[2]);
+                value->device = s.x[0];
+                if (reflection_out) m.write64(reflection_out, 0);   // no reflection for precompiled libraries
+                s.x[0] = r.create(classes.render_pipeline, std::move(value));
+                return;
+            }
             auto pipeline = render_pipeline(s.x[0], s.x[2]);
             if (reflection_out) m.write64(reflection_out, render_reflection(*pipeline));
             auto value = std::make_shared<RenderPipelineObject>();
@@ -2337,7 +2605,8 @@ void install_device() {
         Address failure{};
         try {
             auto value = std::make_shared<RenderPipelineObject>();
-            value->pipeline = render_pipeline(s.x[0], s.x[2]);
+            if (s.x[2] && foreign_of(descriptor_object(s.x[2], "vertexFunction"))) value->foreign = foreign_render_pipeline(s.x[0], s.x[2]);
+            else value->pipeline = render_pipeline(s.x[0], s.x[2]);
             value->device = s.x[0];
             pipeline = r.create(classes.render_pipeline, std::move(value));
         } catch (const VulkanError&) {
@@ -2353,6 +2622,14 @@ void install_device() {
     const auto compute = [&r](CpuState& s, GuestMemory& m, Address function, std::uint32_t max_threads, Address reflection_out,
                               Address error_out, const std::string& label) {
         try {
+            if (foreign_of(function)) {
+                auto value = std::make_shared<ComputePipelineObject>();
+                value->foreign = foreign_compute_pipeline(s.x[0], function, max_threads);
+                value->device = s.x[0];
+                if (reflection_out) m.write64(reflection_out, 0);   // no reflection for precompiled libraries
+                s.x[0] = r.create(classes.compute_pipeline, std::move(value));
+                return;
+            }
             auto pipeline = compute_pipeline(s.x[0], function, max_threads);
             pipeline->label = label;
             if (reflection_out) m.write64(reflection_out, compute_reflection(*pipeline));
@@ -2385,6 +2662,16 @@ void install_device() {
         const auto options = s.x[3];
         Address pipeline{}, reflection{}, failure{};
         try {
+            if (const auto function = descriptor_object(descriptor, "computeFunction"); foreign_of(function)) {
+                auto value = std::make_shared<ComputePipelineObject>();
+                value->foreign = foreign_compute_pipeline(s.x[0], function,
+                    static_cast<std::uint32_t>(descriptor_u64(descriptor, "maxTotalThreadsPerThreadgroup")));
+                value->device = s.x[0];
+                pipeline = r.create(classes.compute_pipeline, std::move(value));
+                r.invoke_block(block, {pipeline, 0, 0}, false);
+                r.release(pipeline);
+                return;
+            }
             auto value = compute_pipeline(s.x[0], descriptor_object(descriptor, "computeFunction"),
                                           static_cast<std::uint32_t>(descriptor_u64(descriptor, "maxTotalThreadsPerThreadgroup")));
             value->label = r.utf8(descriptor_object(descriptor, "label"));
@@ -2402,7 +2689,14 @@ void install_device() {
         const auto block = s.x[3];
         Address pipeline{}, failure{};
         try {
-            pipeline = new_compute_object(s.x[0], compute_pipeline(s.x[0], s.x[2], 0));
+            if (foreign_of(s.x[2])) {
+                auto value = std::make_shared<ComputePipelineObject>();
+                value->foreign = foreign_compute_pipeline(s.x[0], s.x[2], 0);
+                value->device = s.x[0];
+                pipeline = r.create(classes.compute_pipeline, std::move(value));
+            } else {
+                pipeline = new_compute_object(s.x[0], compute_pipeline(s.x[0], s.x[2], 0));
+            }
         } catch (const VulkanError&) {
             throw;
         } catch (const std::exception& error) {

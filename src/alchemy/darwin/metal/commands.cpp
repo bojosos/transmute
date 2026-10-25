@@ -864,6 +864,8 @@ void CommandBuffer::begin_render(const RenderPass& pass) {
 
     // Metal's encoder defaults.
     render_pipeline_.reset();
+    foreign_render_.reset();
+    native_state_lost_ = false;
     depth_stencil_.reset();
     bound_pipeline_ = VK_NULL_HANDLE;
     bound_layout_ = VK_NULL_HANDLE;
@@ -956,6 +958,7 @@ void CommandBuffer::begin_compute(bool concurrent, EncoderSamples samples) {
     concurrent_ = concurrent;
     dispatched_ = false;
     compute_pipeline_.reset();
+    foreign_compute_.reset();
     compute_stage_ = StageState{};
     threadgroup_memory_.clear();
     bound_pipeline_ = VK_NULL_HANDLE;
@@ -1042,6 +1045,7 @@ void CommandBuffer::set_bytes(Stage stage, std::uint32_t index, std::span<const 
     binding.address = memory.address;
     binding.vk_buffer = memory.buffer;
     binding.vk_offset = memory.offset;
+    binding.bytes_length = static_cast<std::uint32_t>(bytes.size());
     state.dirty = true;
 }
 
@@ -1075,6 +1079,7 @@ void CommandBuffer::set_render_pipeline(std::shared_ptr<RenderPipeline> pipeline
     perf::add(perf::mtl_set_pipeline);
     retain(pipeline);
     render_pipeline_ = std::move(pipeline);
+    foreign_render_.reset();
 }
 
 void CommandBuffer::set_viewports(std::span<const Viewport> viewports) {
@@ -1094,6 +1099,7 @@ void CommandBuffer::set_viewports(std::span<const Viewport> viewports) {
     }
     device->vk.vkCmdSetViewportWithCount(current_, static_cast<std::uint32_t>(values.size()), values.data());
     perf::add(perf::mtl_vk_state);
+    viewports_ = values;
     const auto count = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(values.size()));
     if (count != viewport_count_) {
         viewport_count_ = count;
@@ -1142,6 +1148,7 @@ void CommandBuffer::set_front_facing(std::uint32_t winding) {
 void CommandBuffer::set_depth_bias(float bias, float slope, float clamp) {
     require(EncoderKind::render, "setDepthBias:slopeScale:clamp:");
     const bool enabled = bias != 0 || slope != 0;
+    depth_bias_enabled_ = enabled;
     device->vk.vkCmdSetDepthBiasEnable(current_, enabled ? VK_TRUE : VK_FALSE);
     device->vk.vkCmdSetDepthBias(current_, bias, device->features10.depthBiasClamp ? clamp : 0.0F, slope);
     perf::add(perf::mtl_vk_state, 2);
@@ -1206,6 +1213,7 @@ void CommandBuffer::set_visibility_mode(std::uint32_t mode, std::uint64_t offset
 void CommandBuffer::flush_render(std::uint32_t primitive) {
     require(EncoderKind::render, "draw");
     if (!render_pipeline_) throw std::runtime_error("Metal draw without a render pipeline state");
+    if (native_state_lost_) restore_native_state();
     const auto command = current_;
     const auto pipeline = render_pipeline_->pipeline(primitive);
     if (trace_passes()) {
@@ -1276,6 +1284,16 @@ void CommandBuffer::flush_render(std::uint32_t primitive) {
 void CommandBuffer::draw(std::uint32_t primitive, std::uint32_t vertex_start, std::uint32_t vertex_count,
                          std::uint32_t instance_count, std::uint32_t base_instance) {
     if (!vertex_count || !instance_count) return;
+    if (foreign_render_) {
+        auto call = json::Value::object(), primitives = json::Value::object();
+        primitives.set("vertex_start", vertex_start);
+        primitives.set("vertex_count", vertex_count);
+        primitives.set("instance_count", instance_count);
+        primitives.set("base_instance", base_instance);
+        call.set("Primitives", std::move(primitives));
+        foreign_draw(primitive, call, nullptr);
+        return;
+    }
     flush_render(primitive);
     device->vk.vkCmdDraw(current_, vertex_count, instance_count, vertex_start, base_instance);
 }
@@ -1285,6 +1303,21 @@ void CommandBuffer::draw_indexed(std::uint32_t primitive, std::uint32_t index_co
     std::int32_t base_vertex, std::uint32_t base_instance) {
     if (!index_count || !instance_count) return;
     if (!index_buffer) throw std::runtime_error("Metal indexed draw without an index buffer");
+    if (foreign_render_) {
+        auto call = json::Value::object(), indexed = json::Value::object(), reference = json::Value::object();
+        indexed.set("index_type", index_type == 0 ? 0 : 1);   // VK_INDEX_TYPE_UINT16 / UINT32
+        reference.set("token", 1);
+        reference.set("length", static_cast<std::uint64_t>(index_buffer->length));
+        indexed.set("index_buffer", std::move(reference));
+        indexed.set("index_count", index_count);
+        indexed.set("index_offset", static_cast<std::uint64_t>(index_offset));
+        indexed.set("instance_count", instance_count);
+        indexed.set("base_vertex", base_vertex);
+        indexed.set("base_instance", base_instance);
+        call.set("Indexed", std::move(indexed));
+        foreign_draw(primitive, call, index_buffer);
+        return;
+    }
     flush_render(primitive);
     retain(index_buffer);
     device->vk.vkCmdBindIndexBuffer(current_, index_buffer->buffer, index_offset,
@@ -1294,6 +1327,7 @@ void CommandBuffer::draw_indexed(std::uint32_t primitive, std::uint32_t index_co
 
 void CommandBuffer::draw_indirect(std::uint32_t primitive, const std::shared_ptr<Buffer>& indirect, std::uint64_t offset) {
     if (!indirect) throw std::runtime_error("Metal indirect draw without an indirect buffer");
+    if (foreign_render_) throw std::runtime_error("Alchemy Metal: indirect draws of translated pipelines are not implemented");
     flush_render(primitive);
     retain(indirect);
     // MTLDrawPrimitivesIndirectArguments == VkDrawIndirectCommand.
@@ -1305,6 +1339,7 @@ void CommandBuffer::draw_indexed_indirect(std::uint32_t primitive, std::uint32_t
     const std::shared_ptr<Buffer>& index_buffer, std::uint64_t index_offset, const std::shared_ptr<Buffer>& indirect,
     std::uint64_t offset) {
     if (!indirect || !index_buffer) throw std::runtime_error("Metal indexed indirect draw without its buffers");
+    if (foreign_render_) throw std::runtime_error("Alchemy Metal: indirect draws of translated pipelines are not implemented");
     flush_render(primitive);
     retain(index_buffer);
     retain(indirect);
@@ -1346,6 +1381,7 @@ void CommandBuffer::set_compute_pipeline(std::shared_ptr<ComputePipeline> pipeli
     perf::add(perf::mtl_set_pipeline);
     retain(pipeline);
     compute_pipeline_ = std::move(pipeline);
+    foreign_compute_.reset();
 }
 
 void CommandBuffer::set_threadgroup_memory(std::uint32_t index, std::uint32_t length) {
@@ -1389,12 +1425,32 @@ void CommandBuffer::flush_compute(const std::array<std::uint32_t, 3>& threads, c
 
 void CommandBuffer::dispatch_threadgroups(const std::array<std::uint32_t, 3>& groups, const std::array<std::uint32_t, 3>& threads) {
     if (!groups[0] || !groups[1] || !groups[2]) return;
+    if (foreign_compute_) {
+        auto dispatch = json::Value::object(), body = json::Value::object();
+        auto g = json::Value::array(), t = json::Value::array();
+        for (int i = 0; i < 3; ++i) { g.push(groups[i]); t.push(threads[i]); }
+        body.set("groups", std::move(g));
+        body.set("threads_per_group", std::move(t));
+        dispatch.set("Threadgroups", std::move(body));
+        foreign_dispatch(dispatch);
+        return;
+    }
     flush_compute(threads, {groups[0] * threads[0], groups[1] * threads[1], groups[2] * threads[2]}, false);
     device->vk.vkCmdDispatch(current_, groups[0], groups[1], groups[2]);
 }
 
 void CommandBuffer::dispatch_threads(const std::array<std::uint32_t, 3>& grid, const std::array<std::uint32_t, 3>& threads) {
     if (!grid[0] || !grid[1] || !grid[2]) return;
+    if (foreign_compute_) {
+        auto dispatch = json::Value::object(), body = json::Value::object();
+        auto g = json::Value::array(), t = json::Value::array();
+        for (int i = 0; i < 3; ++i) { g.push(grid[i]); t.push(threads[i]); }
+        body.set("threads", std::move(g));
+        body.set("threads_per_group", std::move(t));
+        dispatch.set("Threads", std::move(body));
+        foreign_dispatch(dispatch);
+        return;
+    }
     const std::array<std::uint32_t, 3> groups{div_up(grid[0], threads[0]), div_up(grid[1], threads[1]), div_up(grid[2], threads[2])};
     const bool uniform = groups[0] * threads[0] == grid[0] && groups[1] * threads[1] == grid[1] && groups[2] * threads[2] == grid[2];
     if (!uniform && compute_pipeline_ && !compute_pipeline_->reads_grid) {
@@ -1413,6 +1469,7 @@ void CommandBuffer::dispatch_threads(const std::array<std::uint32_t, 3>& grid, c
 void CommandBuffer::dispatch_indirect(const std::shared_ptr<Buffer>& indirect, std::uint64_t offset,
                                       const std::array<std::uint32_t, 3>& threads) {
     if (!indirect) throw std::runtime_error("Metal indirect dispatch without an indirect buffer");
+    if (foreign_compute_) throw std::runtime_error("Alchemy Metal: indirect dispatches of translated pipelines are not implemented");
     // The grid lives in GPU memory: threads_per_grid is unknown here (0).
     flush_compute(threads, {0, 0, 0}, false);
     retain(indirect);
@@ -1736,6 +1793,9 @@ void CommandBuffer::release_resources() {
     chunks_.clear();
     retained_.clear();
     events_.clear();
+    for (const auto view : foreign_views_) device->vk.vkDestroyImageView(device->device, view, nullptr);
+    foreign_views_.clear();
+    foreign_view_cache_.clear();
     render_stages_ = {};
     compute_stage_ = {};
 }

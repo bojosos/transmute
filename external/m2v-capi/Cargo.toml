@@ -1,0 +1,31 @@
+# m2v-capi: a C ABI over metal2vulkan, built as a DLL that alchemy-fx loads at run time.
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+# This crate is licensed under the GNU Lesser General Public License, version 3 or later
+# (COPYING.LESSER, which incorporates COPYING). It is not part of the MIT-licensed tree around it:
+# see README.md and THIRD_PARTY_NOTICES.md at the repository root.
+
+[package]
+name = "m2v-capi"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+publish = false
+description = "C ABI over metal2vulkan (AIR to SPIR-V) for Alchemy's Metal-on-Vulkan provider"
+
+[lib]
+name = "m2v_capi"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned: THIRD_PARTY_NOTICES.md names this revision. Raise it deliberately, with the notices.
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "4d695b78aedb060402383bf1b57f51bb2901ccd8", features = ["serde", "ash"] }
+ash = { version = "=0.38.0", default-features = false, features = ["std"] }
+serde_json = "1"
+
+[profile.release]
+panic = "unwind"
+debug = "line-tables-only"
+
+# A standalone workspace: never part of another one.
+[workspace]

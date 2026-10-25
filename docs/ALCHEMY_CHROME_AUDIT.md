@@ -811,20 +811,36 @@ hardware GPU (below).
 
 * **Why the hardware GPU is out of reach:**
   * **ANGLE's Metal back end** loads its built-in shaders from a precompiled metallib, Apple's AIR (LLVM bitcode).
-    The load is `DisplayMtl.mm:1350`, through `-[MTLDevice newLibraryWithData:error:]`, which fails explicitly.
+    The load is `DisplayMtl.mm:1350`, through `-[MTLDevice newLibraryWithData:error:]`, which fails explicitly
+    unless the AIR translator DLL is present (below).
     Translating AIR means working out Apple's undocumented builtins, which is reverse engineering, and the user
     decided against it.
-  * **metal2vulkan,** a public LGPL AIR-to-SPIR-V translator, was evaluated as a library. It translates 8 of the 37
-    pipelines in ANGLE's library, and they pass spirv-val. The other 29 fail in its AIR front end:
-    * function constants (`Abi(BadValue) ... air.function_constants`), 17 pipelines;
-    * `air.center` on a vertex entry (`Abi(UnknownKey)`), 7 pipelines;
-    * texture intrinsics (`Intrinsic(SignatureMismatch)`), 9 pipelines.
+  * **metal2vulkan,** a public LGPL AIR-to-SPIR-V translator, was evaluated as a library. ANGLE's library is AIR 2.1.
+    * **First evaluation** (`720ef1c` and `a2c440b`, October 19–20): it translated 8 of the 37 pipelines in ANGLE's
+      library, and they passed spirv-val. The others failed in its AIR front end: function constants
+      (`air.function_constants`), `air.center` on a vertex entry, and texture intrinsics. That was
+      [steelbrain/metal2vulkan#9](https://github.com/steelbrain/metal2vulkan/issues/9).
+    * **Re-test** on its `development` branch at `4d695b7` (October 25, with AIR 2.1 support added for that issue):
+      **all 37 pipelines translate and pass spirv-val (vulkan1.2 and 1.4)**, given the function-constant values a
+      Metal runtime passes. A sweep over each constant's value range passed too. Nothing ran on a GPU yet.
 
-    That is [steelbrain/metal2vulkan#9](https://github.com/steelbrain/metal2vulkan/issues/9). The library was taken
+    The library was taken
     from a run-time dump of what Chrome passes to Metal (`ALCHEMY_MSL_DUMP`, `245dedd`). Nothing was cut out of
     Chrome's files.
-    * Nothing of metal2vulkan is in the repository. Its license (`GPL-2.0-or-later OR LGPL-3.0-or-later`) and
-      what adopting it would require are in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md#evaluated-not-included-metal2vulkan).
+    * **Adopted** (the user's decision, October 25) as a separately built LGPL library: `m2v_capi.dll`, a C ABI
+      over it in `external/m2v-capi/` (LGPL-3.0-or-later), built by `scripts/m2v/build_capi.ps1` and loaded at run
+      time by `src/alchemy/darwin/metal/air_translator.cpp`. Without the DLL, `newLibraryWithData:` fails as
+      before. Nothing of metal2vulkan's code is in the MIT tree. Its license, the pinned revision, the crates and
+      what distributing the DLL requires are in
+      [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md#loaded-at-run-time-when-present-m2v_capidll-metal2vulkan).
+      `alchemy_metal_air` creates real VkPipelines for all 37 of ANGLE's pipelines on this machine's GPU. It also
+      draws ANGLE's clear through the encoders (the right color at every pixel) and runs its 8-to-16-bit index
+      conversion (`commands_foreign.cpp`; the translator's binding plan per draw and dispatch).
+    * **In Chrome** (headless, `--single-process --in-process-gpu`, the DLL present): ANGLE-Metal initializes past
+      `DisplayMtl.mm:1350`. WebGL 1 and 2 contexts report "ANGLE Metal Renderer: Intel(R) Iris(R) Xe Graphics", and
+      a clear reads back exactly. Linking a WebGL program then loses the context. ANGLE's generated MSL calls
+      `as_type<T>()` unqualified inside templates, and `metal::get_num_samples()`, and the MSL compiler has
+      neither. That is the next blocker. WebGPU still gets no adapter.
   * **ANGLE's Vulkan back end on the host's Vulkan** isn't allowed. Chrome 155 on macOS accepts only ANGLE on Metal,
     or on SwiftShader with `--enable-unsafe-swiftshader`. Its message is `gl_factory.cc:110 ... not found in allowed
     implementations: [(gl=egl-angle,angle=metal)]`.
@@ -885,9 +901,9 @@ hardware GPU (below).
   * `network denied`: only `[2001:4860:4860::8888]:443` and `https://update.googleapis.com` (Chrome), QLab's
     accounts.figure53.com and the renderer's license server.
 * **Open, and follow-ups:**
-  * Hardware WebGL, Graphite and WebGPU wait on ANGLE-Metal's built-in library. That means metal2vulkan's front-end
-    gaps (#9), or a decision to translate AIR. A generic host-Vulkan provider would help other Mac Vulkan apps, but
-    not Chrome.
+  * Hardware WebGL: with the AIR translator DLL, ANGLE-Metal initializes and WebGL contexts come up (above).
+    WebGL programs then need the MSL compiler to accept ANGLE's generated MSL. Graphite and WebGPU (Dawn) still
+    get no adapter.
   * The On-Device Model Service's Dawn on Metal reaches our MSL compiler. Its remaining shader failures stay in that
     utility child.
   * Metal selectors no run reached: the indirect-command-buffer pair. Also not exercised: Chrome's own use of

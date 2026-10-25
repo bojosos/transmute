@@ -51,10 +51,10 @@ namespace alchemy::metal {
     X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)                 \
     X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkGetQueryPoolResults)                            \
     X(vkCmdPipelineBarrier2) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline)      \
-    X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdBindVertexBuffers)                     \
+    X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdBindVertexBuffers) X(vkCmdBindVertexBuffers2)                   \
     X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect)                  \
     X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) X(vkCmdDispatchIndirect)                          \
-    X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount) X(vkCmdSetCullMode)                   \
+    X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount) X(vkCmdSetCullMode) X(vkCmdSetViewport) X(vkCmdSetScissor)                 \
     X(vkCmdSetFrontFace) X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable)            \
     X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)               \
     X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp)             \

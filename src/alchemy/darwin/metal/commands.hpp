@@ -32,6 +32,7 @@
 // rule); status(), wait() and finalize are thread-safe.
 
 #include "alchemy/darwin/metal/device.hpp"
+#include "alchemy/darwin/metal/json.hpp"
 #include "alchemy/darwin/metal/pipeline.hpp"
 #include "alchemy/darwin/metal/resources.hpp"
 
@@ -39,6 +40,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -47,6 +49,8 @@
 #include <vector>
 
 namespace alchemy::metal {
+
+namespace air { class ForeignPipeline; }
 
 // MTLEvent / MTLSharedEvent: a timeline semaphore.
 class Event {
@@ -182,6 +186,12 @@ public:
 
     // Compute state.
     void set_compute_pipeline(std::shared_ptr<ComputePipeline> pipeline);
+    // Pipelines the AIR translator compiled (newLibraryWithData:,
+    // foreign_pipeline.hpp), bound in place of an MSL pipeline of the same
+    // kind: draws and dispatches then record the translator's binding plan
+    // for what is bound (commands_foreign.cpp).
+    void set_render_pipeline(std::shared_ptr<air::ForeignPipeline> pipeline);
+    void set_compute_pipeline(std::shared_ptr<air::ForeignPipeline> pipeline);
     void set_threadgroup_memory(std::uint32_t index, std::uint32_t length);
     void dispatch_threadgroups(const std::array<std::uint32_t, 3>& groups, const std::array<std::uint32_t, 3>& threads);
     void dispatch_threads(const std::array<std::uint32_t, 3>& grid, const std::array<std::uint32_t, 3>& threads);
@@ -236,6 +246,7 @@ private:
         std::shared_ptr<Buffer> buffer;
         VkDeviceAddress address{};    // buffer address + offset (or upload address for bytes)
         std::uint64_t offset{};
+        std::uint32_t bytes_length{}; // setBytes: the data's length (at vk_buffer + vk_offset)
         VkBuffer vk_buffer{};         // for vertex input
         VkDeviceSize vk_offset{};
     };
@@ -279,6 +290,20 @@ private:
     VkDescriptorSet allocate_set(VkDescriptorSetLayout layout);
     VkDescriptorSet write_set(StageState& state, const StageLayout& layout, const msl::Reflection* reflection);
     void flush_render(std::uint32_t primitive);
+    // Translated pipelines (commands_foreign.cpp): the BindState of what is
+    // bound, the plan's descriptor sets and push constants, and the draw or
+    // dispatch the translator's commands describe.
+    [[nodiscard]] json::Value foreign_state(bool render);
+    void foreign_bind(air::ForeignPipeline& pipeline, const json::Value& plan, const json::Value& state,
+                      const json::Value& ranges, VkPipelineBindPoint point);
+    void foreign_push(air::ForeignPipeline& pipeline, const json::Value& writes);
+    void foreign_draw(std::uint32_t primitive, const json::Value& draw, const std::shared_ptr<Buffer>& index_buffer);
+    void foreign_dispatch(const json::Value& dispatch);
+    VkImageView foreign_view(const std::shared_ptr<Texture>& texture, const json::Value& view);
+    // Restores the dynamic state a translated pipeline does not keep (the
+    // *_WITH_COUNT viewports and scissors, depth bias and bounds enables)
+    // before the next MSL pipeline's draw.
+    void restore_native_state();
     void flush_compute(const std::array<std::uint32_t, 3>& threads, const std::array<std::uint32_t, 3>& grid, bool non_uniform);
     void end_render();
     void require(EncoderKind kind, const char* operation) const;
@@ -311,11 +336,17 @@ private:
     // lets them differ (missing scissors cover the render target).
     std::uint32_t viewport_count_{1};
     std::vector<VkRect2D> scissors_;
+    std::vector<VkViewport> viewports_;   // as last set (a translated pipeline sets the first without a count)
+    bool depth_bias_enabled_{};
+    bool native_state_lost_{};            // a translated pipeline was bound since the native state was set
     void emit_scissors();
     VkRenderingAttachmentInfo depth_info_{}, stencil_info_{};
     VkExtent2D extent_{};
     std::uint32_t pass_layers_{1};
     std::shared_ptr<RenderPipeline> render_pipeline_;
+    std::shared_ptr<air::ForeignPipeline> foreign_render_, foreign_compute_;
+    std::vector<VkImageView> foreign_views_;   // destroyed with the command buffer's resources
+    std::map<std::string, VkImageView> foreign_view_cache_;
     VkPipeline bound_pipeline_{};
     VkPipelineLayout bound_layout_{};
     std::shared_ptr<DepthStencilState> depth_stencil_;

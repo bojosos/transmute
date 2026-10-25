@@ -46,6 +46,12 @@ struct PathElement {
 // (-7) when the instance lacks vulkan_surface_extension().
 [[nodiscard]] std::int32_t create_vulkan_surface(void* instance, void* get_instance_proc_addr, std::uintptr_t window,
                                                  std::uint64_t& surface);
+// An entry point of the AIR translator library, m2v_capi.dll (external/m2v-capi,
+// LGPL-3.0-or-later, built apart from Alchemy and never linked into it). The
+// library is loaded once, at the first call: the file ALCHEMY_M2V_CAPI names,
+// else m2v_capi.dll next to the running executable. Error::not_found: no such
+// library (or it does not load); Error::unsupported: it lacks the entry point.
+[[nodiscard]] Result<void*> air_translator_symbol(const char* name);
 
 // ---- image files (NSImage, NSBitmapImageRep, NSPasteboard) ----
 struct Pixels {

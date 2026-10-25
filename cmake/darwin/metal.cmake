@@ -18,7 +18,13 @@ if(ALCHEMY_VULKAN_INCLUDE)
         src/alchemy/darwin/metal/quartzcore_link.cpp
         src/alchemy/darwin/metal/surface_textures.cpp
         src/alchemy/darwin/metal/external_memory.cpp
-        src/alchemy/darwin/metal/shared_events.cpp)
+        src/alchemy/darwin/metal/shared_events.cpp
+        # newLibraryWithData: through the AIR translator DLL, when present
+        # (external/m2v-capi, LGPL, loaded at run time; THIRD_PARTY_NOTICES.md).
+        src/alchemy/darwin/metal/json.cpp
+        src/alchemy/darwin/metal/air_translator.cpp
+        src/alchemy/darwin/metal/foreign_pipeline.cpp
+        src/alchemy/darwin/metal/commands_foreign.cpp)
     list(APPEND ALCHEMY_GUI_INCLUDE_DIRECTORIES "${ALCHEMY_VULKAN_INCLUDE}")
     list(APPEND ALCHEMY_GUI_COMPILE_DEFINITIONS ALCHEMY_HAVE_VULKAN_HEADERS=1)
 else()
@@ -62,6 +68,29 @@ function(alchemy_gui_metal_tests)
     alchemy_gui_add_unit_test(alchemy_metal_vulkan src/alchemy/darwin/metal/tests/metal_vulkan_tests.cpp TIMEOUT 120)
     # 77: no Vulkan 1.3 device on this machine (reported, not a failure).
     set_tests_properties(alchemy_metal_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+    # A precompiled library through the AIR translator: every pipeline of a
+    # dumped metallib becomes real VkPipelines. 77 (skipped) without a GPU,
+    # without the translator DLL (scripts/m2v/build_capi.ps1) or without a
+    # dumped library (ALCHEMY_MSL_DUMP's metallib-*.metallib; never in git).
+    set(alchemy_m2v_capi_default "")
+    if(EXISTS "${PROJECT_SOURCE_DIR}/artifacts/m2v-capi/m2v_capi.dll")
+        set(alchemy_m2v_capi_default "${PROJECT_SOURCE_DIR}/artifacts/m2v-capi/m2v_capi.dll")
+    endif()
+    set(ALCHEMY_M2V_CAPI "${alchemy_m2v_capi_default}" CACHE FILEPATH
+        "m2v_capi.dll (scripts/m2v/build_capi.ps1) for the alchemy_metal_air test")
+    file(GLOB alchemy_m2v_dumped_libraries "${PROJECT_SOURCE_DIR}/artifacts/chrome-msl-corpus/*/metallib-*.metallib")
+    set(alchemy_m2v_test_library_default "")
+    if(alchemy_m2v_dumped_libraries)
+        list(GET alchemy_m2v_dumped_libraries 0 alchemy_m2v_test_library_default)
+    endif()
+    set(ALCHEMY_M2V_TEST_LIBRARY "${alchemy_m2v_test_library_default}" CACHE FILEPATH
+        "A dumped metallib (ANGLE's, from ALCHEMY_MSL_DUMP) for the alchemy_metal_air test")
+    alchemy_gui_add_unit_test(alchemy_metal_air src/alchemy/darwin/metal/tests/metal_air_tests.cpp TIMEOUT 300)
+    set_tests_properties(alchemy_metal_air PROPERTIES SKIP_RETURN_CODE 77
+        ENVIRONMENT "ALCHEMY_M2V_CAPI=${ALCHEMY_M2V_CAPI};ALCHEMY_M2V_TEST_LIBRARY=${ALCHEMY_M2V_TEST_LIBRARY}")
+    # alchemy_metal_libraries' precompiled-library case reads the same two.
+    set_tests_properties(alchemy_metal_libraries PROPERTIES
+        ENVIRONMENT "ALCHEMY_M2V_CAPI=${ALCHEMY_M2V_CAPI};ALCHEMY_M2V_TEST_LIBRARY=${ALCHEMY_M2V_TEST_LIBRARY}")
     if(ALCHEMY_GLSLANG_VALIDATOR)
         set(shader_dir "${CMAKE_CURRENT_BINARY_DIR}/alchemy_metal_shaders")
         file(MAKE_DIRECTORY "${shader_dir}")

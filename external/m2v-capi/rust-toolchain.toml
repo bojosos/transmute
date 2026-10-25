@@ -1,0 +1,3 @@
+# The toolchain metal2vulkan's pinned revision builds with (its own rust-toolchain.toml).
+[toolchain]
+channel = "1.98.1"

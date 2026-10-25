@@ -117,9 +117,14 @@ public:
     std::uint32_t api_version{};
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory_properties{};
+    VkPhysicalDeviceVulkan11Features features11{};
     VkPhysicalDeviceVulkan12Features features12{};
     VkPhysicalDeviceVulkan13Features features13{};
     VkPhysicalDeviceFeatures features10{};
+    // Extension feature members enabled at vkCreateDevice (with features10-13
+    // and device_extensions, what the AIR translator's device description
+    // records: air_translator.hpp).
+    bool fragment_shader_barycentric{}, primitive_topology_list_restart{};
     // VK_KHR_dynamic_rendering_local_read: Metal framebuffer fetch
     // ([[color(n)]] fragment inputs read as input attachments).
     bool dynamic_rendering_local_read{};
