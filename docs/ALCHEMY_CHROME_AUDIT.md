@@ -604,6 +604,17 @@ The user approved downloading dav1d's source for this.
   * With the default flags, the renderer crashes in dav1d (a write to 0).
   * YouTube's player still ended with "Something went wrong" in the `exactflags` run; not explained yet.
 
+* **YouTube on main `d7806f6e`** (software compositor, the same AV1 stream):
+
+  | Flags | Result |
+  | --- | --- |
+  | default | the renderer dies with `SIGBUS`, an out-of-bounds write in dav1d (`save_tmvs`'s loop runs on when its flags are lost at `blr`) |
+  | `TRANSMUTE_FX_CORE=exactflags` | **plays AV1**: 854x480, 1,103 frames in 18 s, 321 dropped; the frames are clean |
+
+  The earlier "Something went wrong" (an `exactflags` run) had no decoder error. YouTube's script dropped the
+  player after repeated `DEMUXER_UNDERFLOW`, following a consent rejection and reload on a machine at 100 % load.
+  It did not recur. Exact flags as the default (fx perf wave, integ `9caadb55`) is what main needs for AV1.
+
 ### Open, worst first
 
 1. **fx code arena exhaustion** (gap 1). It needs fx runtime design work, for which a follow-up is proposed:
