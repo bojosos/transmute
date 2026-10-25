@@ -1220,8 +1220,16 @@ std::vector<std::uint32_t> make_program(coretest::Rng& rng) {
             w.push_back(g.data());
         } else if (kind < 90) {
             w.push_back(g.memory());
-        } else if (kind < 94) {
+        } else if (kind < 92) {
             w.push_back(ta::mov16b(g.reg(), g.reg()));
+        } else if (kind < 95) {   // SMULL|SMLAL by element chains on one accumulator (fused in pairs)
+            const unsigned d = g.reg(), m = g.reg() & 15u, q = rng.below(2), len = 2 + rng.below(3);
+            for (unsigned t = 0; t < len; ++t) {
+                const unsigned index = rng.below(8);
+                const bool acc = t > 0 || rng.chance(50);
+                w.push_back((acc ? 0x0f402000u : 0x0f40a000u) | (q << 30) | (((index >> 1) & 1u) << 21) | ((index & 1u) << 20) |
+                            (m << 16) | ((index >> 2) << 11) | (g.reg() << 5) | d);
+            }
         } else if (i + 3 < n) {
             branches.push_back(w.size());
             w.push_back(mf::cbz_x(1 + rng.below(6), 2 + static_cast<int>(rng.below(3))));
