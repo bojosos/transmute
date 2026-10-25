@@ -470,6 +470,7 @@ void channels() {
 
 void null_backend() {
     require(host::name(host::Error::unsupported) == "unsupported", "error names");
+    require(host::icu::api() == nullptr, "the null host has no ICU");
     require(host::sync::create_event(true, false).error() == host::Error::unsupported, "null create_event fails");
     require(host::files::open("x", host::files::Access::read, host::files::Create::open_existing).error() == host::Error::unsupported,
         "null open fails");
@@ -803,7 +804,8 @@ void locale_area() {
 void icu_area() {
     namespace icu = host::icu;
     const auto* api = icu::api();
-    require(api != nullptr && api->version[0] >= 64, "the host has ICU 64 or later");
+    require(api != nullptr && api->version[0] >= icu::minimum_major_version, "the host has ICU 64 or later");
+    require(api->ubrk_getRuleStatus && api->utrans_transUChars && api->ucnv_fromUnicode, "every entry is resolved");
     icu::UErrorCode error = icu::zero_error;
     const auto converter = api->ucnv_open("macos-0_2-10.2", &error);
     require(converter && !icu::failure(error), "Mac Roman converter");

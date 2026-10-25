@@ -16,10 +16,14 @@
 // A Linux backend would load libicuuc/libicui18n and resolve the names with the
 // library's version suffix (ucnv_open_74).
 //
-// Each entry is resolved on its own, so an older ICU leaves the functions it
-// lacks null; a caller checks the entry it uses (or uses require()).
+// The table is all or nothing: api() is nullptr unless the host's ICU has
+// every listed function and is at least minimum_major_version, so callers
+// never meet a null entry and answer "unavailable" on an older host. The
+// loaded version is recorded in Api::version.
 // Signatures and constants are those of ICU's public C headers (ICU license).
 // Add a function by adding one X(...) line; the backend resolves it by name.
+// A function newer than minimum_major_version raises the minimum (say so in
+// the commit), so an older host loses ICU as a whole rather than one call.
 
 #include <cstdint>
 
@@ -41,6 +45,9 @@ using UConverterToUCallback = void (*)(const void* context, UConverterToUnicodeA
                                        std::int32_t length, std::int32_t reason, UErrorCode* error);
 using UConverterFromUCallback = void (*)(const void* context, UConverterFromUnicodeArgs* args, const UChar* units,
                                          std::int32_t length, UChar32 code_point, std::int32_t reason, UErrorCode* error);
+
+// ICU 64 is the system ICU of Windows 10 1903, the first Windows to ship one.
+inline constexpr std::uint8_t minimum_major_version = 64;
 
 // utypes.h
 inline constexpr UErrorCode zero_error = 0;
@@ -119,7 +126,7 @@ struct Api {
 #define ALCHEMY_HOST_ICU_ENTRY(name, result, parameters) result(*name) parameters = nullptr;
     ALCHEMY_HOST_ICU_FUNCTIONS(ALCHEMY_HOST_ICU_ENTRY)
 #undef ALCHEMY_HOST_ICU_ENTRY
-    std::uint8_t version[4]{};   // the loaded ICU's version (72.1.0.0)
+    std::uint8_t version[4]{};   // the loaded ICU's version (72.1.0.0 on Windows 11 24H2)
 };
 
 // The host's ICU, loaded on first use (thread-safe); nullptr when the host has none.
