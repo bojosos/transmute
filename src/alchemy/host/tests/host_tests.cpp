@@ -7,6 +7,7 @@
 #include "alchemy/host/host.hpp"
 #include "alchemy/host/ipc.hpp"
 #include "alchemy/host/http.hpp"
+#include "alchemy/host/icu.hpp"
 #include "alchemy/host/locale.hpp"
 #include "alchemy/host/net.hpp"
 #include "alchemy/host/process.hpp"
@@ -797,6 +798,48 @@ void locale_area() {
     if (const auto zone = locale::time_zone()) require(!zone->empty(), "system time zone");
 }
 
+// The host's ICU (win32: System32\icu.dll): converters, transliterators, break
+// iterators and case mapping, the calls CoreFoundation's strings use.
+void icu_area() {
+    namespace icu = host::icu;
+    const auto* api = icu::api();
+    require(api != nullptr && api->version[0] >= 64, "the host has ICU 64 or later");
+    icu::UErrorCode error = icu::zero_error;
+    const auto converter = api->ucnv_open("macos-0_2-10.2", &error);
+    require(converter && !icu::failure(error), "Mac Roman converter");
+    std::array<icu::UChar, 8> units{};
+    const char roman[] = "caf\x8e";
+    const auto length = api->ucnv_toUChars(converter, units.data(), static_cast<std::int32_t>(units.size()), roman, 4, &error);
+    require(!icu::failure(error) && length == 4 && units[3] == 0x00e9, "Mac Roman to UTF-16");
+    api->ucnv_close(converter);
+    error = icu::zero_error;
+    const auto* sjis = api->ucnv_getAlias("windows-932", 0, &error);
+    require(sjis && !icu::failure(error), "Windows code page aliases");
+    error = icu::zero_error;
+    const std::u16string id = u"Latin-ASCII";
+    const auto transliterator = api->utrans_openU(id.data(), static_cast<std::int32_t>(id.size()), icu::trans_forward, nullptr, 0, nullptr, &error);
+    require(transliterator && !icu::failure(error), "Latin-ASCII transliterator");
+    std::array<icu::UChar, 16> text{u'c', u'a', u'f', 0x00e9};
+    std::int32_t text_length = 4, limit = 4;
+    api->utrans_transUChars(transliterator, text.data(), &text_length, static_cast<std::int32_t>(text.size()), 0, &limit, &error);
+    require(!icu::failure(error) && text_length == 4 && text[3] == u'e', "transliteration");
+    api->utrans_close(transliterator);
+    error = icu::zero_error;
+    const std::u16string words = u"Hello big world";
+    const auto breaks = api->ubrk_open(icu::break_word, "en_US", words.data(), static_cast<std::int32_t>(words.size()), &error);
+    require(breaks && !icu::failure(error), "word break iterator");
+    require(api->ubrk_first(breaks) == 0 && api->ubrk_next(breaks) == 5 && api->ubrk_getRuleStatus(breaks) >= icu::word_number_limit &&
+                api->ubrk_getRuleStatus(breaks) < icu::word_letter_limit,
+        "word boundaries and rule status");
+    api->ubrk_close(breaks);
+    error = icu::zero_error;
+    std::array<icu::UChar, 8> folded{};
+    const std::u16string strasse = u"Stra\u00dfe";
+    const auto folded_length = api->u_strFoldCase(folded.data(), static_cast<std::int32_t>(folded.size()), strasse.data(),
+        static_cast<std::int32_t>(strasse.size()), icu::fold_case_default, &error);
+    require(!icu::failure(error) && folded_length == 7 && folded[4] == u's' && folded[5] == u's', "case folding");
+}
+
 void real_backend() {
     require(host::name(host::Error::would_block) == "would block", "error names");
     require(host::name(host::Error::network_reset) == "network reset" && host::name(host::Error::loop) == "too many symbolic links",
@@ -1148,6 +1191,7 @@ void real_backend() {
     require(!host::process::environment("ALCHEMY_HOST_TEST_SURELY_UNSET").has_value(), "unset environment variable");
 
     locale_area();
+    icu_area();
     http_area();
     crypto_area();
     certificate_area();
