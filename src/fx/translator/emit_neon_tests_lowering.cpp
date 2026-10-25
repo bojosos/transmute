@@ -136,6 +136,42 @@ FX_TEST(neon_lowering_register_shift_h_lanes) {
     print_stats("after register_shift_h_lanes");
 }
 
+FX_TEST(neon_lowering_register_shift_every_form_all_counts) {
+    unsigned words = 0;
+    for_both_lowerings([&] {
+        // SSHL/USHL, SQSHL/UQSHL, SRSHL/URSHL, SQRSHL/UQRSHL on every arrangement
+        // and the scalar forms: every count byte (-128..127) in some lane, garbage
+        // in the count's other bytes, boundary-biased values.
+        for (unsigned opc = 0x08; opc <= 0x0b; ++opc)
+            for (unsigned u = 0; u < 2; ++u)
+                for (unsigned size = 0; size < 4; ++size)
+                    for (unsigned form = 0; form < 3; ++form) {   // Q = 0, Q = 1, scalar
+                        if (size == 3 && form == 0) continue;     // .1D is reserved
+                        if (form == 2 && size != 3 && (opc & 1) == 0) continue;   // scalar B/H/S: saturating forms only
+                        const std::uint32_t base = form == 2 ? 0x5e200400u : form == 1 ? 0x4e200400u : 0x0e200400u;
+                        const unsigned lanes = form == 2 ? 1 : (form == 1 ? 16u : 8u) >> size;
+                        std::uint64_t state = base + (opc << 4) + (size << 1) + u;
+                        for (unsigned c0 = 0; c0 < 256; c0 += lanes) {
+                            static constexpr std::tuple<unsigned, unsigned, unsigned> kRegs[] = {{0, 1, 2}, {1, 1, 2}, {2, 1, 2}};
+                            {   // one register assignment per count group, rotating (keeps the test short)
+                                const auto [rd, rn, rm] = kRegs[(c0 / lanes) % 3];
+                                auto ctx = special_context(rnd(state), size);
+                                auto* bytes = reinterpret_cast<std::uint8_t*>(ctx.v[rm]);
+                                for (unsigned l = 0; l < 16u >> size; ++l)
+                                    bytes[l << size] = static_cast<std::uint8_t>(c0 + l % lanes);
+                                if (rnd(state) % 2) ctx.v[rn][1] = 0;
+                                const std::uint32_t w =
+                                    base | (u << 29) | (size << 22) | (rm << 16) | (opc << 11) | (rn << 5) | rd;
+                                if (!run_word(w, ctx, "register shift, every form")) return;
+                                ++words;
+                            }
+                        }
+                    }
+    });
+    std::printf("    %u words\n", words);
+    print_stats("after register_shift_every_form_all_counts");
+}
+
 FX_TEST(neon_lowering_pmull8) {
     unsigned words = 0;
     for_both_lowerings([&] {

@@ -1614,3 +1614,75 @@ FX_TEST(neon_region_structure_access_with_pins_no_retry) {
     std::printf("    translations that retried: %u (old lowering %u)\n", retried[0], retried[1]);
     FX_CHECK_EQ(retried[0], 0u);
 }
+
+// Vector pins the entry's first instructions overwrite before reading them
+// (MOVI here) are not loaded from the context (vpins_dead_at_entry; with
+// TRANSMUTE_FX_CORE=nodeadpinloads every pin is loaded). A faulting access
+// before the overwrite keeps every load: the fault state needs the values.
+namespace {
+unsigned count_vector_context_loads(const std::vector<std::uint8_t>& code, std::size_t hot) {
+    // movups xmm, [r15 + disp32]: (41|45) 0F 10, modrm mod=10 rm=111
+    unsigned n = 0;
+    for (std::size_t k = 0; k + 3 < hot && k + 3 < code.size(); ++k)
+        n += (code[k] == 0x41 || code[k] == 0x45) && code[k + 1] == 0x0f && code[k + 2] == 0x10 && (code[k + 3] & 0xc7) == 0x87;
+    return n;
+}
+} // namespace
+
+FX_TEST(neon_region_dead_vector_pin_loads_skipped) {
+    using namespace mf;
+    ensure_registered();
+    // v0-v2 are written by MOVI before anything reads them; v0-v9 are hot (pins).
+    std::vector<std::uint32_t> w{movi4s(0, 1), movi4s(1, 2), movi4s(2, 3), movz_x(0, 20)};
+    const auto body = w.size();
+    for (unsigned rep = 0; rep < 3; ++rep)
+        for (unsigned r = 0; r < 10; ++r) w.push_back(ta::add4s(r, r, (r + 1) % 10));
+    w.push_back(subs_x_imm(0, 0, 1));
+    w.push_back(b_cond(kNe, -static_cast<int>(w.size() - body)));
+    DiffRunner runner;
+    unsigned loads[2] = {};
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_dead_pin_loads)}) {
+        core::set_p2_knobs_for_testing(knob);
+        for (const int optimize : {1, 0}) {
+            runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+            for (unsigned k = 0; k < 3; ++k) {
+                if (!runner.run(w, runner.context(78000 + k), "dead vector pin loads " + std::to_string(knob))) {
+                    core::set_p2_knobs_for_testing(~0u);
+                    return;
+                }
+                FX_CHECK_EQ(runner.last.interprets, 0u);
+            }
+            if (optimize)
+                for (const auto& r : runner.machine.regions)
+                    loads[knob ? 1 : 0] += count_vector_context_loads(r.code, r.stats.hot_bytes ? r.stats.hot_bytes : r.code.size());
+        }
+    }
+    core::set_p2_knobs_for_testing(~0u);
+    runner.machine.options.optimize = -1;
+    std::printf("    vector context loads: %u, loading every pin %u\n", loads[0], loads[1]);
+    FX_CHECK(loads[0] < loads[1]);
+}
+
+FX_TEST(neon_region_dead_vector_pin_loads_fault_state) {
+    using namespace vf;
+    // ldr q3, [x9] faults first: v0-v2, overwritten later, must still hold
+    // their entry values in the fault state.
+    std::vector<std::uint32_t> w{ldst_uimm(4, true, 0, 9, 3), mf::movi4s(0, 1), mf::movi4s(1, 2), mf::movi4s(2, 3)};
+    for (unsigned rep = 0; rep < 3; ++rep)
+        for (unsigned r = 0; r < 10; ++r) w.push_back(ta::add4s(r, r, (r + 1) % 10));
+    w.push_back(movz(8, 7));
+    check_fault(w, 0, "fault before the dead vector pins' overwrite");
+}
+
+FX_TEST(neon_region_cfl_ac_shape) {
+    // The chroma-from-luma AC shape of AV1 decoders: a loop that sums with
+    // UADDLP, then the average by URSHL with a negative register count.
+    // x0 = 4; loop: ld1 {v0.8h, v1.8h}, [x16], #32; add v0.8h, v0.8h, v1.8h; shl v0.8h, v0.8h, #1;
+    // st1 {v0.8h}, [x17], #16; uaddlp v2.4s, v0.8h; add v24.4s, v24.4s, v2.4s; subs x0, x0, #1; b.ne loop
+    // then: movz w7, #5; neg w7, w7; dup v31.4s, w7; addv s0, v24.4s; urshl v4.2s, v0.2s, v31.2s;
+    // dup v4.8h, v4.h[0]; sub v5.8h, v1.8h, v4.8h
+    run_program({movz_x(0, 4), 0x4cdfa600u, 0x4e618400u, 0x4f115400u, 0x4c9f7620u, 0x6e602802u, 0x4ea28718u,
+                 subs_x_imm(0, 0, 1), b_cond(kNe, -7), 0x528000a7u, 0x4b0703e7u, 0x4e040cffu, 0x4eb1bb00u, 0x2ebf5404u,
+                 0x4e020484u, 0x6e648425u},
+                "cfl_ac_shape", 8);
+}

@@ -644,8 +644,38 @@ void RegionEmitter::entry_pins(std::int32_t index) {
     const auto dead = pins_dead_at_entry(index);
     for (unsigned g = 0; g < 32; ++g)
         if (pinned(g) && !global(g) && !((dead >> g) & 1u)) a_.mov(64, pin(g), gmem(g));
+    const auto vdead = vpins_dead_at_entry(index);
     for (unsigned v = 0; v < 32; ++v)
-        if (vpinned(v)) vmove(vpin(v), ptr(Gp::r15, v_disp(v)));
+        if (vpinned(v) && !((vdead >> v) & 1u)) vmove(vpin(v), ptr(Gp::r15, v_disp(v)));
+}
+
+// p3: vector pins that the code at entry `index` overwrites before reading
+// them, with no fault, exit, block end or loop header in between (a fault or
+// an exit there would take the unloaded pin for the register's value): their
+// entry loads are dead. Same scan and knob (nodeadpinloads) as the GPR pins;
+// family instructions count through their described vector reads and writes
+// (partial writes such as INS read the register too).
+std::uint32_t RegionEmitter::vpins_dead_at_entry(std::int32_t index) const {
+    if (!codegen_on(knob_no_dead_pin_loads) || index < 0) return 0;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    if (plan_.insts[static_cast<std::size_t>(index)].loop_header) return 0;   // its interrupt stub stores dirty pins
+    std::uint32_t want = plan_.vpinned & ~static_cast<std::uint32_t>(lent_ >> 32);
+    std::uint32_t dead = 0;
+    for (std::int32_t j = index; j < n && j < index + 16 && want != 0; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (j != index && pj.leader) break;
+        if ((pj.family < 0 && (pj.try_family || pj.inst.kind == Kind::unknown)) || pj.conservative_writes ||
+            pj.may_fault || pj.flow != Flow::normal || pj.inline_call || pj.inline_ret)
+            break;
+        // An ADD/SUB the next access may fold reports a fault there with its own state before it.
+        if ((pj.inst.kind == Kind::add_sub_imm || pj.inst.kind == Kind::add_sub_shift || pj.inst.kind == Kind::add_sub_ext) &&
+            j + 1 < n && plan_.insts[static_cast<std::size_t>(j) + 1].may_fault)
+            break;
+        want &= ~pj.vreads;
+        dead |= pj.vwrites & want;
+        want &= ~pj.vwrites;
+    }
+    return dead;
 }
 
 void RegionEmitter::exit_pins(std::uint64_t dirty, bool restore) {

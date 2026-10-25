@@ -352,6 +352,7 @@ private:
     // Pinned GPRs the straight-line code from entry `index` overwrites before
     // anything can observe them (read, fault, exit, block end): not loaded there.
     [[nodiscard]] std::uint32_t pins_dead_at_entry(std::int32_t index) const;
+    [[nodiscard]] std::uint32_t vpins_dead_at_entry(std::int32_t index) const;   // p3: vector pins
     // Dirty pins to the context, convention pins included (before helpers).
     void flush_pins(std::uint64_t dirty);
     // Exits (to translated code or the runtime's stubs): dirty pins except the
