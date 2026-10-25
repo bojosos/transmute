@@ -333,15 +333,13 @@ void RegionEmitter::patch_host_tables() {
 // other: another table. Every kTableShadowRetry of those, it becomes this
 // thread's table (the miss stub switches the shadow); else the inline lookup.
 void RegionEmitter::e_shadow_branch(const PlanInst& pi) {
-    take(Gp::rax);
-    take(Gp::rcx);
-    take(Gp::rdx);
-    take(Gp::r9);
-    materialize_state(flags_, false);   // clobbers rax only
+    // As e_indirect: a target the register cache holds is used in place (take_value).
+    take_value(Gp::rcx, val(pi.inst.rn));                                            // target
+    take_value(Gp::rdx, val(static_cast<unsigned>(pi.shadow_index)));                // index
+    take_value(Gp::r9, val(static_cast<unsigned>(pi.shadow_base)));                  // table
+    if (pi.shadow_index32) a_.mov(32, Gp::rdx, Gp::rdx);
+    materialize_state(flags_, false, true);   // a region exit: the raw form; clobbers rax only
     flags_ = FlagsState::ctx;
-    load(64, Gp::rcx, val(pi.inst.rn));                                                    // target
-    load(pi.shadow_index32 ? 32 : 64, Gp::rdx, val(static_cast<unsigned>(pi.shadow_index)));   // index
-    load(64, Gp::r9, val(static_cast<unsigned>(pi.shadow_base)));                          // table
     exit_pins(current_dirty());
     constexpr std::int32_t kHost = kTableShadowSlots * 8, kMiss = 2 * kTableShadowSlots * 8;
     const auto lookup = a_.new_label(), other = a_.new_label(), miss = a_.new_label();
