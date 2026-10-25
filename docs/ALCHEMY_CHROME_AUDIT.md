@@ -614,6 +614,13 @@ The user approved downloading dav1d's source for this.
   The earlier "Something went wrong" (an `exactflags` run) had no decoder error. YouTube's script dropped the
   player after repeated `DEMUXER_UNDERFLOW`, following a consent rejection and reload on a machine at 100 % load.
   It did not recur. Exact flags as the default (fx perf wave, integ `9caadb55`) is what main needs for AV1.
+* **Main `c4b587ad` (exact NZCV by default), no `TRANSMUTE_FX_CORE`:**
+  * dav1d's checkasm: all 1039 pass.
+  * `av1_webcodecs.html`: PASS, at the same 29.4 dB as native Chrome.
+  * YouTube AV1 with the consent overlay left alone: plays, 854x480, 1,801 frames in 20 s, 501 dropped.
+  * After "Reject all", YouTube showed "Something went wrong" once more, again with no media error: its script
+    destroyed the player after the consent reload. That is YouTube's flow on a slow, loaded machine, not decoding.
+    Not chased further; native Chrome could not be compared under the same load.
 
 ### Open, worst first
 
@@ -628,10 +635,9 @@ The user approved downloading dav1d's source for this.
      the GPU main thread.
    * That is fx code quality, not an Alchemy wait (Follow-up).
 3. **YouTube video** (gap 5):
-   * **AV1 under fx:** dav1d's `checkasm` (Follow-up 4) names three routines. `cfl_ac` (`2e589e64`) and
-     `splat_mv` (`c1a198ac`) are fixed on main. `save_tmvs` needs NZCV live across `blr` into dav1d's own stubs,
-     which is the fx flag model and is with the fx perf lead. With `TRANSMUTE_FX_CORE=exactflags`, all 1039
-     routines pass and Chrome decodes AV1.
+   * **AV1 under fx is fixed on main** (`c4b587ad`): `cfl_ac` (`2e589e64`), `splat_mv` (`c1a198ac`) and
+     `save_tmvs` (exact NZCV by default, fx perf round 13). dav1d's checkasm passes, and YouTube plays AV1
+     (Follow-up 4).
    * `IOSurfaceSetValue(NULL)` and planar IOSurfaces are fixed (`1f5705a`, Follow-up). With SwiftShader the video
      now plays through the VP9 fallback.
    * CoreVideo pixel buffers still cannot be created under Alchemy (`CVPixelBufferCreate` answers

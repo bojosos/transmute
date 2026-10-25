@@ -239,7 +239,14 @@ void AppKit::install_alert() {
             std::lock_guard lock(presenter_mutex);
             presenter = presenter_override;
         }
-        if (!presenter) presenter = [](const AlertRequest& value) { return run_task_dialog(value); };
+        if (!presenter) {
+            // Cloaked runs show no windows: the task dialog would be the one
+            // visible window (as NSSavePanel / NSOpenPanel, panels.cpp).
+            if (const auto cloak = host_environment("ALCHEMY_GUI_CLOAK"); !cloak.empty() && cloak != "0")
+                unsupported("-[NSAlert runModal] in a cloaked run (ALCHEMY_GUI_CLOAK: the alert would be visible; " +
+                            std::string(autodismiss_variable) + " answers it): " + one_line(request.message));
+            presenter = [](const AlertRequest& value) { return run_task_dialog(value); };
+        }
 
         // The modal session: the alert panel is key; the previous key window
         // gets key status back afterwards.

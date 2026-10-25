@@ -868,6 +868,31 @@ void alerts(Fixture& f) {
     require(out_of_range && malformed, "bad ALCHEMY_GUI_AUTODISMISS_ALERTS values were accepted");
     static_cast<void>(f.id(unattended, "release"));
     gui::appkit::set_alert_presenter_override({});
+
+    // A cloaked run (ALCHEMY_GUI_CLOAK) refuses the real dialog, which would be
+    // its one visible window; ALCHEMY_GUI_AUTODISMISS_ALERTS still answers.
+    {
+        const auto set_cloak = [](const char* value) {
+#ifdef _WIN32
+            _putenv_s("ALCHEMY_GUI_CLOAK", value);
+#else
+            if (*value) setenv("ALCHEMY_GUI_CLOAK", value, 1); else unsetenv("ALCHEMY_GUI_CLOAK");
+#endif
+        };
+        const char* before = std::getenv("ALCHEMY_GUI_CLOAK");
+        const std::string saved = before ? before : "";
+        const auto cloaked = make_alert(true);
+        set_cloak("1");
+        std::string why;
+        try { static_cast<void>(f.id(cloaked, "runModal")); } catch (const std::exception& error) { why = error.what(); }
+        set_env("0");
+        const auto answered = f.id(cloaked, "runModal");
+        set_env("");
+        set_cloak(saved.c_str());
+        require(why.find("cloaked run") != std::string::npos, "a cloaked run's NSAlert was not refused: " + why);
+        require(answered == 1000, "ALCHEMY_GUI_AUTODISMISS_ALERTS did not answer a cloaked run's alert");
+        static_cast<void>(f.id(cloaked, "release"));
+    }
     static_cast<void>(f.id(window, "close"));
     static_cast<void>(f.id(window, "release"));
 
