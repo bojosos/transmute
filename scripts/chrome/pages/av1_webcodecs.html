@@ -1,0 +1,107 @@
+<!doctype html>
+<!-- AV1 round trip in the page, no network: WebCodecs encodes a moving, colourful pattern to AV1 and decodes it
+     again with software decoding preferred (Chrome's dav1d), then compares each decoded frame with its source.
+     Key frames exercise the intra predictors, the others inter prediction and motion vector storage (dav1d's
+     splat_mv and save_tmvs: under fx's old flag model this page hangs). Chrome's AV1 encoder (libaom, realtime)
+     did not choose chroma-from-luma here, so CfL is not covered: dav1d's checkasm covers it. The verdict is in
+     the title: "Alchemy AV1: PASS ..." or "Alchemy AV1: FAIL <reason>"; native Chrome gives about 29 dB.
+     Run: run_windowed.ps1 -Url file:///<guest path>/av1_webcodecs.html -Title 'Alchemy AV1: *'
+          -TitleNot '*running*' -Pass 'Alchemy AV1: PASS*' -Jit -->
+<html>
+<head><meta charset="utf-8"><title>Alchemy AV1: running</title></head>
+<body>
+<h1 id="h">AV1 round trip (WebCodecs)</h1>
+<pre id="status">running</pre>
+<script>
+"use strict";
+const W = 320, H = 240, FRAMES = 12, CODEC = "av01.0.04M.08", MIN_PSNR = 26;
+const status = document.getElementById("status");
+const log = (text) => { status.textContent += "\n" + text; };
+
+function draw(ctx, i) {
+  // Texture whose colour is a linear function of its brightness, a different line per 32x32 tile: chroma is
+  // predictable from luma, so the encoder picks chroma-from-luma (CfL) for intra blocks. Then two moving boxes
+  // (inter prediction, motion vectors).
+  const image = ctx.createImageData(W, H), d = image.data;
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const t = ((x >> 5) * 7 + (y >> 5) * 3) % 6;
+      const v = 128 + 60 * Math.sin(x * 0.21 + y * 0.13) + 40 * Math.sin(x * 0.07 - y * 0.29 + t);
+      const p = (y * W + x) * 4, k = [0.9, -0.6, 0.4, -0.9, 0.7, -0.3][t];
+      d[p] = v;
+      d[p + 1] = 128 + (v - 128) * k;
+      d[p + 2] = 255 - v * (0.5 + 0.08 * t);
+      d[p + 3] = 255;
+    }
+  ctx.putImageData(image, 0, 0);
+  ctx.fillStyle = "#f0e010";
+  ctx.fillRect(10 + i * 9, 60 + i * 4, 70, 50);
+  ctx.fillStyle = "#1040f0";
+  ctx.fillRect(220 - i * 7, 140 - i * 3, 60, 60);
+}
+
+function psnr(a, b) {
+  let se = 0, n = 0;
+  for (let p = 0; p < a.length; p += 4)
+    for (let c = 0; c < 3; c++) { const d = a[p + c] - b[p + c]; se += d * d; n++; }
+  const mse = se / n;
+  return mse === 0 ? 99 : 10 * Math.log10(255 * 255 / mse);
+}
+
+async function run() {
+  if (!("VideoEncoder" in window) || !("VideoDecoder" in window)) throw new Error("no WebCodecs");
+  const encoderConfig = { codec: CODEC, width: W, height: H, bitrate: 2000000, framerate: 30 };
+  if (!(await VideoEncoder.isConfigSupported(encoderConfig)).supported) throw new Error("AV1 encoder unsupported");
+  const decoderConfig = { codec: CODEC, codedWidth: W, codedHeight: H, hardwareAcceleration: "prefer-software" };
+  if (!(await VideoDecoder.isConfigSupported(decoderConfig)).supported) throw new Error("AV1 decoder unsupported");
+
+  const source = new OffscreenCanvas(W, H), sctx = source.getContext("2d", { willReadFrequently: true });
+  const originals = [], chunks = [];
+  let encodeError = null;
+  const encoder = new VideoEncoder({ output: (chunk) => chunks.push(chunk), error: (e) => { encodeError = e; } });
+  encoder.configure(encoderConfig);
+  for (let i = 0; i < FRAMES; i++) {
+    draw(sctx, i);
+    originals.push(sctx.getImageData(0, 0, W, H).data);
+    const frame = new VideoFrame(source, { timestamp: i * 33333 });
+    encoder.encode(frame, { keyFrame: i % 4 === 0 });
+    frame.close();
+  }
+  await encoder.flush();
+  if (encodeError) throw new Error("encode: " + encodeError.message);
+  log(`encoded ${chunks.length} chunks (${chunks.filter((c) => c.type === "key").length} key), ` +
+      `${chunks.reduce((s, c) => s + c.byteLength, 0)} bytes`);
+
+  const target = new OffscreenCanvas(W, H), tctx = target.getContext("2d", { willReadFrequently: true });
+  const scores = [];
+  let decodeError = null;
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      tctx.drawImage(frame, 0, 0, W, H);
+      scores.push(psnr(originals[scores.length], tctx.getImageData(0, 0, W, H).data));
+      frame.close();
+    },
+    error: (e) => { decodeError = e; },
+  });
+  decoder.configure(decoderConfig);
+  for (const chunk of chunks) decoder.decode(chunk);
+  await decoder.flush();
+  if (decodeError) throw new Error("decode: " + decodeError.message);
+  log("psnr per frame: " + scores.map((s) => s.toFixed(1)).join(" "));
+  if (scores.length !== FRAMES) throw new Error(`decoded ${scores.length} of ${FRAMES} frames`);
+  const worst = Math.min(...scores);
+  if (worst < MIN_PSNR) throw new Error(`frame ${scores.indexOf(worst)} psnr ${worst.toFixed(1)} < ${MIN_PSNR}`);
+  return `frames ${FRAMES}, min psnr ${worst.toFixed(1)} dB`;
+}
+
+run().then((detail) => {
+  status.textContent = "PASS " + detail + status.textContent.replace(/^running/, "");
+  document.title = "Alchemy AV1: PASS " + detail;
+}, (error) => {
+  const reason = (error && error.message) || String(error);
+  status.textContent = "FAIL " + reason + status.textContent.replace(/^running/, "");
+  document.title = "Alchemy AV1: FAIL " + reason;
+}).finally(() => document.getElementById("h").setAttribute("data-js", "ran"));
+</script>
+</body>
+</html>
