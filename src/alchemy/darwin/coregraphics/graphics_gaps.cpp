@@ -12,8 +12,8 @@
 #include <vector>
 
 // Graphics-side gaps of the Qt WebEngine images: CoreGraphics, QuartzCore,
-// CoreText, OpenGL (CGL), IOSurface, CoreImage, Carbon and
-// ApplicationServices.
+// CoreText, IOSurface, CoreImage, Carbon and ApplicationServices. (OpenGL
+// and CGL are darwin/opengl/'s.)
 //
 // - CGEvent objects are real (type, location, flags, timestamp, integer
 //   fields; CGEventCreate(NULL) samples the mouse location) and round-trip
@@ -23,11 +23,6 @@
 //   available: creation returns NULL and the access checks answer "denied".
 // - PDF documents and contexts cannot be created (NULL); the private CGS
 //   window-server calls report kCGErrorInvalidConnection.
-// - CGL: no OpenGL renderer exists, so pixel formats and contexts cannot be
-//   created; the OpenGL calls (fixed-function matrices, and the shader,
-//   buffer, texture and framebuffer calls Syphon's GL server binds) behave
-//   as OpenGL calls with no current context (no effect, as support kit's GL
-//   entry points; creation answers 0).
 // - CATransform3D helpers, CoreText font collections, available tables,
 //   character sets and system-UI-font checks are real. Font variations are
 //   not modelled (NULL).
@@ -35,7 +30,6 @@ namespace alchemy::gui::fill {
 namespace {
 
 constexpr std::int32_t cg_illegal_argument = 1001, cg_invalid_connection = 1002;
-constexpr std::int32_t cgl_bad_pixel_format = 10002, cgl_bad_context = 10004, cgl_bad_display = 10006;
 
 struct CgEvent final : ObjectPayload {
     std::mutex mutex;
@@ -129,7 +123,6 @@ public:
     void install_core_graphics();
     void install_quartz_core();
     void install_core_text();
-    void install_opengl();
     void install_misc();
 };
 
@@ -662,60 +655,6 @@ void GraphicsGaps::install_core_text() {
     });
 }
 
-void GraphicsGaps::install_opengl() {
-    // No OpenGL renderer exists under Alchemy.
-    raw(opengl, "_CGLChoosePixelFormat", [](CpuState& s, GuestMemory& m) {
-        if (s.x[1]) m.write64(s.x[1], 0);
-        if (s.x[2]) m.write32(s.x[2], 0);
-        s.x[0] = cgl_bad_display;
-    });
-    failure(opengl, "_CGLCreateContext", cgl_bad_pixel_format, {2});
-    failure(opengl, "_CGLDescribePixelFormat", cgl_bad_pixel_format);
-    failure(opengl, "_CGLDestroyContext", cgl_bad_context);
-    raw(opengl, "_CGLReleaseContext", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLReleaseContext"); });
-    raw(opengl, "_CGLReleasePixelFormat", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLReleasePixelFormat"); });
-    raw(opengl, "_CGLRetainContext", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLRetainContext"); s.x[0] = 0; });
-    raw(opengl, "_CGLGetContextRetainCount", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLGetContextRetainCount"); s.x[0] = 0; });
-    constant(opengl, "_CGLGetCurrentContext", 0);
-    raw(opengl, "_CGLSetCurrentContext", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[0] ? cgl_bad_context : 0; });
-    for (const auto* name : {"_CGLGetParameter", "_CGLGetVirtualScreen", "_CGLSetVirtualScreen"}) failure(opengl, name, cgl_bad_context);
-    raw(opengl, "_CGLErrorString", [this](CpuState& s, GuestMemory&) {
-        static const std::map<std::int32_t, std::string_view> texts{
-            {0, "no error"}, {10000, "invalid pixel format attribute"}, {10001, "invalid renderer property"},
-            {10002, "invalid pixel format"}, {10003, "invalid renderer info"}, {10004, "invalid context"},
-            {10005, "invalid drawable"}, {10006, "invalid graphics device"}, {10007, "invalid context state"},
-            {10008, "invalid numerical value"}, {10009, "invalid share context"}, {10010, "invalid enumerant"},
-            {10011, "invalid offscreen drawable"}, {10012, "invalid fullscreen drawable"}, {10013, "invalid window"},
-            {10014, "invalid pointer"}, {10015, "invalid code module"}, {10016, "invalid memory allocation"},
-            {10017, "invalid CoreGraphics connection"}};
-        const auto found = texts.find(static_cast<std::int32_t>(s.x[0]));
-        const auto text = found == texts.end() ? std::string_view("unknown error") : found->second;
-        std::lock_guard lock(mutex);
-        static std::map<std::string_view, Address> cache;
-        auto& slot = cache[text];
-        if (!slot) slot = cstring(text);
-        s.x[0] = slot;
-    });
-    // CGLGetPixelFormat(ctx): no context can exist.
-    raw(opengl, "_CGLGetPixelFormat", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGLGetPixelFormat"); s.x[0] = 0; });
-    // OpenGL calls with no current context (none can be made current): no
-    // effect, output parameters untouched (glGetError answers
-    // GL_INVALID_OPERATION), object creation answers 0 (no object),
-    // attribute lookups -1 and framebuffer status 0 (an error), as GL does
-    // for a failed call.
-    for (const auto* name : {"_glLoadIdentity", "_glLoadMatrixf", "_glMatrixMode", "_glOrtho", "_glAttachShader", "_glBindBuffer",
-                             "_glBindFramebuffer", "_glBindRenderbuffer", "_glBindTexture", "_glBindVertexArray", "_glBlitFramebuffer",
-                             "_glBufferData", "_glCompileShader", "_glDeleteBuffers", "_glDeleteFramebuffers", "_glDeleteProgram",
-                             "_glDeleteRenderbuffers", "_glDeleteShader", "_glDeleteTextures", "_glDeleteVertexArrays", "_glDrawArrays",
-                             "_glEnableVertexAttribArray", "_glFlush", "_glFlushRenderAPPLE", "_glFramebufferRenderbuffer",
-                             "_glFramebufferTexture2D", "_glGenBuffers", "_glGenFramebuffers", "_glGenRenderbuffers", "_glGenTextures",
-                             "_glGenVertexArrays", "_glGetProgramiv", "_glGetShaderiv", "_glLinkProgram", "_glRenderbufferStorageMultisample",
-                             "_glShaderSource", "_glUseProgram", "_glVertexAttribPointer", "_glViewport"})
-        raw(opengl, name, [](CpuState&, GuestMemory&) {});
-    for (const auto* name : {"_glCreateProgram", "_glCreateShader", "_glCheckFramebufferStatus"}) constant(opengl, name, 0);
-    raw(opengl, "_glGetAttribLocation", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<std::uint32_t>(-1); });
-}
-
 void GraphicsGaps::install_misc() {
     // IOSurface (its Mach ports are QuartzCore's iosurface.cpp).
     string(iosurface, "_kIOSurfacePlaneBytesPerElement", "IOSurfacePlaneBytesPerElement");
@@ -763,7 +702,6 @@ void GraphicsGaps::install() {
     install_core_graphics();
     install_quartz_core();
     install_core_text();
-    install_opengl();
     install_misc();
 }
 
