@@ -565,6 +565,45 @@ installation now has a perf phase per provider and per GUI installer.
   means registering by name and building the handler on the first `resolve()`, which changes every provider's
   installer.
 
+### Follow-up 4 (2026-10-25): AV1 under fx, with dav1d's checkasm
+
+The user approved downloading dav1d's source for this.
+* **The downloads** (diagnosis only; neither is in the repo or under artifacts/):
+  * dav1d 1.5.4: https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz, 1,038,852 bytes,
+    SHA-256 `686616b7...a5c5` (as published), BSD-2-Clause.
+  * Its checkasm framework v1.2.0: https://code.videolan.org/videolan/checkasm/-/archive/v1.2.0/checkasm-v1.2.0.tar.gz,
+    202,810 bytes, SHA-256 `bfcbcd76...7616`, BSD-2-Clause.
+* **The build:** checkasm for arm64-apple-macos11, 8 bpc and baseline NEON (Alchemy reports no DotProd or I8MM),
+  with Visual Studio's clang 19 and ld64.lld. It uses `runtime/include` plus a few stand-in Darwin headers. The
+  recipe is in the notes folder (`dav1d-checkasm`).
+* **Results under alchemy-fx** (1039 routines, each compared with its C version):
+
+  | Binary | Wrong routines |
+  | --- | --- |
+  | `3ff181c` (before the fx perf wave) | `cfl_ac` (9 variants), `save_tmvs` |
+  | `fc30d43b` (main, perf wave 1) | the same, and `splat_mv` crashes (SIGSEGV) |
+  | `fc30d43b` + the RBIT fix | `save_tmvs`; `splat_mv` crashes |
+  | `fc30d43b` + the RBIT fix, `TRANSMUTE_FX_CORE=exactflags` | none |
+  | main `79654111` (the RBIT fix `2e589e64`, the BR revert `c1a198ac`) | `save_tmvs` |
+
+* **Three causes:**
+  * **`cfl_ac` (fixed, `2e589e64`):** fx turns RBIT feeding CLZ into one TZCNT, with one pending fusion slot. dav1d
+    computes ctz(width) + ctz(height) as `rbit w9; rbit w10; clz w9; clz w10`. The second RBIT took over the slot,
+    so the first CLZ counted the zeros of a register its RBIT never wrote. log2sz came out wrong and the DC became 0.
+    Test: `fx_translator_tests` `core_rbit_clz_interleaved`.
+  * **`splat_mv`:** the address of dav1d's jump table is computed once, then each loop iteration does
+    `subs ...; br x3`, and the target blocks end in `b.gt`. The perf wave treats flags as dead at a BR without an
+    ADR/ADRP in its block (`f01bb567`), so the loop count is lost. Fixed on main: `c1a198ac` reverts that default.
+  * **`save_tmvs`:** `cmp x9, x10; blr x11; b.ge 4f`, where `x11` is one of dav1d's local store stubs that keep
+    NZCV. fx's older ABI assumption treats flags as dead at BLR. `exactflags` fixes it. Open; it is the fx flag
+    model, which the fx perf wave owns. Its lead is measuring exactflags as the default, and p2 is building a
+    cheap exact path. dav1d's checkasm now runs in every fx integration gate.
+* **Chrome** (YouTube's AV1 stream, software compositor, `fc30d43b` + the RBIT fix):
+  * With `exactflags`, `Dav1dVideoDecoder` decodes 854x480 with no dav1d error. Before, it failed with error -22
+    and fell back to VP9.
+  * With the default flags, the renderer crashes in dav1d (a write to 0).
+  * YouTube's player still ended with "Something went wrong" in the `exactflags` run; not explained yet.
+
 ### Open, worst first
 
 1. **fx code arena exhaustion** (gap 1). It needs fx runtime design work, for which a follow-up is proposed:
@@ -578,8 +617,10 @@ installation now has a perf phase per provider and per GUI installer.
      the GPU main thread.
    * That is fx code quality, not an Alchemy wait (Follow-up).
 3. **YouTube video** (gap 5):
-   * **AV1 under fx:** dav1d returns EINVAL. dav1d's `checkasm` under alchemy-fx would name the miscompiled NEON
-     routine, but it needs the dav1d source downloaded.
+   * **AV1 under fx:** dav1d's `checkasm` (Follow-up 4) names three routines. `cfl_ac` (`2e589e64`) and
+     `splat_mv` (`c1a198ac`) are fixed on main. `save_tmvs` needs NZCV live across `blr` into dav1d's own stubs,
+     which is the fx flag model and is with the fx perf lead. With `TRANSMUTE_FX_CORE=exactflags`, all 1039
+     routines pass and Chrome decodes AV1.
    * `IOSurfaceSetValue(NULL)` and planar IOSurfaces are fixed (`1f5705a`, Follow-up). With SwiftShader the video
      now plays through the VP9 fallback.
    * CoreVideo pixel buffers still cannot be created under Alchemy (`CVPixelBufferCreate` answers
