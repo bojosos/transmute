@@ -57,16 +57,21 @@ JIT on miss, persistent cache for warm runs, optional AOT from `.pdata`.
 
 ### ABI assumptions
 
-- **NZCV across calls.** AAPCS64 leaves the condition flags undefined on entry
-  to and return from a public interface, and Windows ARM64 compilers never
-  pass flags through a call. The translator therefore treats NZCV as dead at
-  BL/BLR and RET exits (it is not materialized for them; a guest context
-  captured after a call or return may show a stale NZCV). Every other exit
-  (B to another region, BR, fall-through out of a region, traps, interpret
-  exits, interrupts at live points) keeps the strict model.
-  `TranslateOptions::abi_flags = false` (part of the cache options hash) or
-  `TRANSMUTE_FX_CORE=exactflags` (folded into the translator fingerprint)
-  restore strict flags; differential tests of random programs use it.
+- **NZCV across calls and branches: exact.** Every exit keeps NZCV live by
+  default (`TranslateOptions::abi_flags = false`, part of the cache options
+  hash). AAPCS64 leaves the flags undefined across a public interface, but
+  hand-written assembly calls its own local stubs and branches to tables it
+  computed earlier, and reads the flags afterwards:
+  - dav1d's NEON does `cmp x9, x10; blr x11; b.ge` (save_tmvs_neon);
+  - it also does `subs w4, w4, #1; br x3` to a target that branches on the
+    flags (splat_mv_neon).
+  ffmpeg and libvpx do the same.
+  `TranslateOptions::abi_flags = true` (and the measurement knob
+  `TRANSMUTE_FX_CORE=brdeadflags`, which extends the assumption to BR) treat
+  NZCV as dead at BL/BLR/RET. That is faster and only correct for programs
+  that follow AAPCS64 everywhere. Making exact flags cheap is the open work
+  (`FX_PERF.md`): lazy materialisation, and flags proven dead across known
+  translated targets.
 
 ## Stacks
 

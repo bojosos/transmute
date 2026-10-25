@@ -182,11 +182,13 @@ struct TranslateOptions {
     bool interrupt_checks = true;      // check ctx->interrupt_pending at back-edges
     bool profile = false;              // emit execution counters
     int tier = 0;
-    // NZCV is treated as dead at BL/BLR and RET (AAPCS64: undefined on entry
-    // to and return from a public interface), so it is not materialized for
-    // those exits. false = strict model (flags live at every exit), e.g. for
-    // differential tests of random, non-ABI-conforming programs.
-    bool abi_flags = true;
+    // true: NZCV is treated as dead at BL/BLR and RET (AAPCS64: undefined on
+    // entry to and return from a public interface), so it is not materialized
+    // for those exits. false (the default) = the strict model, flags live at
+    // every exit: hand-written assembly calls local, non-AAPCS stubs and reads
+    // the flags after the return (dav1d's save_tmvs_neon: cmp; blr; b.ge), so
+    // the ABI assumption is not sound for real programs.
+    bool abi_flags = false;
     // (additive) First-tier (JIT) region formation: at most
     // `lazy_max_instructions` are translated and, with `lazy_split_calls`,
     // BL/BLR continuations are not followed (a continuation becomes its own
