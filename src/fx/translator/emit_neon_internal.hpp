@@ -127,6 +127,16 @@ inline constexpr SseOp kZext[3] = {op::pmovzxbw, op::pmovzxwd, op::pmovzxdq};
 //             XMM registers) instead of 6-7
 //   oldpmull8 - PMULL/PMULL2 .8B through the compare-and-mask chain instead of
 //             PMULLW by single-bit multipliers
+//   oldmullelem - SMULL/SMLAL/SMLSL/SQDMULL by element on 16-bit lanes through
+//             PMULLW/PMULHW and an unpack instead of one PMADDWD
+//   nomullpair - SMULL|SMLAL + SMLAL by element pairs into one accumulator stay
+//             two instructions (not one PMADDWD of the interleaved sources)
+//   oldwidenhi - unsigned widening of a high half (UMULL2, UADDL2, USHLL2, ...)
+//             through PSHUFD + PMOVZX instead of one PUNPCKH with zero
+//   oldrshl - SRSHL/URSHL on 16-/32-bit lanes through the clamped generic
+//             register shift instead of the variable shifts' own saturation
+//   oldushl8 - USHL on byte lanes through the shift-by-1/2/4/8 blend chain
+//             instead of multiplying by a PSHUFB-selected power of two
 enum NeonKnob : std::uint32_t {
     neon_no_fold = 1u,
     neon_no_slot = 2u,
@@ -139,6 +149,11 @@ enum NeonKnob : std::uint32_t {
     neon_old_var_shift = 256u,
     neon_old_pmull8 = 512u,
     neon_old_struct = 1024u,
+    neon_old_mull_elem = 2048u,
+    neon_no_mull_pair = 4096u,
+    neon_old_widen_hi = 8192u,
+    neon_old_rshl = 16384u,
+    neon_old_ushl8 = 32768u,
 };
 std::uint32_t neon_knob_bits();
 // Test override of the knobs (-1 = TRANSMUTE_FX_NEON). Not thread-safe.
@@ -370,6 +385,8 @@ unsigned emit_extract(EmitContext& ctx, std::uint32_t w);
 unsigned emit_table(EmitContext& ctx, std::uint32_t w);
 unsigned emit_modified_immediate(EmitContext& ctx, std::uint32_t w);
 unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words);
+// SMULL|SMLAL + SMLAL by element (16-bit) into one accumulator: 2, else 0.
+unsigned emit_mull_pair(EmitContext& ctx, std::span<const std::uint32_t> words);
 
 // ---- shared building blocks (emit_neon_arith.cpp) ----
 enum class Narrow { truncate, sat_signed, sat_unsigned, sat_signed_to_unsigned };

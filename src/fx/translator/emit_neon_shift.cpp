@@ -460,6 +460,71 @@ void emit_register_shift(EmitContext& ctx, unsigned size, unsigned lanes, RegShi
         v.finish(d, q);
         return;
     }
+    if (v.avx2 && (size == 1 || size == 2) && !kind.saturating && kind.rounding && neon_on(neon_old_rshl)) {
+        // SRSHL/URSHL on 16-/32-bit lanes. A right shift by n = -s rounds as
+        // t - (t >> 1) with t = x >> (n - 1) = x >> ~s. The variable shifts give
+        // 0 or the sign fill for counts >= esize and for negative counts (they
+        // read as huge), and both round to 0: where s >= 0 the right part is 0,
+        // where s < 0 the left part is, so OR merges them (signed too).
+        const Xmm s = v.temp(), k = v.temp(), l = v.temp(), r = v.temp();
+        if (size == 2) {
+            v.pslld(s, m, 24);
+            v.psrad(s, s, 24);
+        } else {
+            v.psllw(s, m, 8);
+            v.psraw(s, s, 8);
+        }
+        v.not_(k, s);
+        if (size == 2) {
+            v.vex3(vop::vpsllvd, l, x, s);
+            v.vex3(kind.is_unsigned ? vop::vpsrlvd : vop::vpsravd, r, x, k);
+        } else {
+            const Xmm a = v.temp(), b = v.temp();
+            var_shift(v, 1, Dir::left, l, x, s, a, b);
+            var_shift(v, 1, kind.is_unsigned ? Dir::right_u : Dir::right_s, r, x, k, a, b);
+        }
+        if (kind.is_unsigned) v.srl(size, k, r, 1);
+        else v.sra(size, k, r, 1);
+        v.op(kSub[size], r, r, k);
+        const Xmm out = scalar ? v.temp() : d;
+        v.por(out, l, r);
+        if (scalar) v.keep_element0(size, d, out);
+        else v.finish(d, q);
+        return;
+    }
+    if (v.avx && size == 0 && kind.is_unsigned && !kind.saturating && !kind.rounding && neon_on(neon_old_ushl8)) {
+        // USHL on byte lanes by multiplication: k = min(s + 8, 16) (bytes,
+        // wrapping) picks a multiplier from kMul: 2^s for s = 0..7 (left: the
+        // product's low byte), 2^(8+s) for s = -7..-1 (right by -s: the
+        // product's high byte), 0 otherwise (|s| >= 8 shifts every bit out;
+        // k = 16 reads entry 0). Even bytes multiply as zero-extended words;
+        // odd bytes stay in the high byte: PMULLW by the low-byte multiplier
+        // gives the left result there, PMULHUW by the multiplier << 8 the right
+        // one. The count's sign selects per byte (VPBLENDVB reads only the sign
+        // bit, hence AVX).
+        static const Const128 kMul = bytes_const({0, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128});
+        static const Const128 kLowBytes = splat16(0x00ff), kHighBytes = splat16(0xff00);
+        const Xmm mul = v.temp(), xe = v.temp(), t = v.temp(), u = v.temp(), e = v.temp();
+        v.op(op::paddb, t, m, splat8(8));
+        v.op(op::pminub, t, t, splat8(16));
+        v.load_const(mul, kMul);
+        v.pshufb(mul, mul, t);
+        v.op(op::pand, xe, x, kLowBytes);
+        v.op(op::pand, t, mul, kLowBytes);
+        v.op(op::pmullw, t, xe, t, true);              // even bytes: left in the low byte, right in the high
+        v.psrlw(u, t, 8);
+        v.blendv(e, t, u, m);
+        v.op(op::pand, xe, x, kHighBytes);             // odd bytes in the high byte
+        v.psrlw(t, mul, 8);
+        v.op(op::pmullw, t, xe, t, true);              // left
+        v.op(op::pand, u, mul, kHighBytes);
+        v.op(op::pmulhuw, u, xe, u, true);             // right
+        v.blendv(t, t, u, m);
+        v.load_const(u, kHighBytes);
+        v.blendv(d, e, t, u);
+        v.finish(d, q);
+        return;
+    }
     // Fixed temp set: S count, N negative mask, K clamped count, L left
     // result, R right result, A/B shift scratch.
     const Xmm S = v.temp(), N = v.temp(), K = v.temp(), L = v.temp(), R = v.temp();

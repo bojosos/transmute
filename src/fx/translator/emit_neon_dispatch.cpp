@@ -178,6 +178,7 @@ unsigned emit_neon(EmitContext& ctx, std::span<const std::uint32_t> words) {
     auto& as = ctx.as();
     neon::begin_instruction_constants(as);
     unsigned consumed = neon::emit_mask_reduce(ctx, words);
+    if (consumed == 0) consumed = neon::emit_mull_pair(ctx, words);
     if (consumed == 0) consumed = neon::dispatch_data(ctx, words[0]);
     neon::flush_instruction_constants(as);
     // A64 zeroes the bits above a scalar or 64-bit vector result: tell the

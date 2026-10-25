@@ -352,6 +352,10 @@ void pairwise(V& v, unsigned size, bool q, Pairwise kind, Xmm d, Xmm n, Xmm m) {
 // Sign/zero extension of the low (high = false) or high half of x to 2x width.
 void widen(V& v, unsigned size, bool is_signed, bool high, Xmm d, Xmm x) {
     const SseOp ext = is_signed ? kSext[size] : kZext[size];
+    if (high && !is_signed && neon_on(neon_old_widen_hi)) {
+        v.op(kUnpackHi[size], d, x, splat32(0));   // interleaved with zeros: zero-extended
+        return;
+    }
     if (high) {
         v.pshufd(d, x, 0xee);
         v.un(ext, d, d);
@@ -392,15 +396,26 @@ void mull(V& v, unsigned size, bool is_signed, bool high, Xmm d, Xmm n, Xmm m) {
     }
 }
 
-// Signed saturating doubling widening multiply (H->S, S->D).
-void sqdmull(V& v, unsigned size, bool high, Xmm d, Xmm n, Xmm m) {
+// SMULL by element on 16-bit lanes: m holds the element in every word. The
+// low/high half of n zero-extended to dwords leaves PMADDWD's odd products 0,
+// so each dword is the exact product n[i] * e.
+void smull16_splat(V& v, bool high, Xmm d, Xmm n, Xmm m) {
+    const Xmm a = v.temp();
+    if (high) v.op(op::punpckhwd, a, n, splat32(0));
+    else v.un(kZext[1], a, n);
+    v.op(op::pmaddwd, d, a, m, true);
+}
+
+// Signed saturating doubling widening multiply (H->S, S->D). m_splat: m
+// holds one element in every lane (by element), so it needs no unpack.
+void sqdmull(V& v, unsigned size, bool high, Xmm d, Xmm n, Xmm m, bool m_splat = false) {
     const Xmm a = v.temp();
     const Xmm b = v.temp();
     if (size == 1) {
         const SseOp unpack = high ? op::punpckhwd : op::punpcklwd;
         v.op(unpack, a, n, n);
-        v.op(unpack, b, m, m);
-        v.op(op::pmaddwd, d, a, b, true);
+        if (!m_splat) v.op(unpack, b, m, m);
+        v.op(op::pmaddwd, d, a, m_splat ? m : b, true);
         v.op(op::pcmpeqd, a, d, splat32(0x80000000u));
         v.pxor(d, d, a);
         return;
@@ -1590,18 +1605,19 @@ unsigned emit_indexed(EmitContext& ctx, std::uint32_t w) {
         else v.op(kSub[size], d, dold, t);
         break;
     }
-    case 0xa: mull(v, size, !u, q, d, n, m); return 1;
-    case 0x2: case 0x6: {
-        const Xmm t = v.temp();
-        mull(v, size, !u, q, t, n, m);
+    case 0xa: case 0x2: case 0x6: {
+        const bool madd = !u && size == 1 && neon_on(neon_old_mull_elem);
+        const Xmm t = opc == 0xa ? d : v.temp();
+        if (madd) smull16_splat(v, q, t, n, m);
+        else mull(v, size, !u, q, t, n, m);
         if (opc == 0x2) v.op(kAdd[wide], d, dold, t, true);
-        else v.op(kSub[wide], d, dold, t);
+        else if (opc == 0x6) v.op(kSub[wide], d, dold, t);
         return 1;
     }
-    case 0xb: sqdmull(v, size, q, d, n, m); return 1;
+    case 0xb: sqdmull(v, size, q, d, n, m, neon_on(neon_old_mull_elem)); return 1;
     case 0x3: case 0x7: {
         const Xmm t = v.temp();
-        sqdmull(v, size, q, t, n, m);
+        sqdmull(v, size, q, t, n, m, neon_on(neon_old_mull_elem));
         sat_add_sub(v, wide, false, opc == 0x7, d, dold, t);
         return 1;
     }

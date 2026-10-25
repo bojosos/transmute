@@ -17,7 +17,9 @@ using namespace transmute::fx::neon_test;
 
 namespace {
 
-constexpr int kOld = neon::neon_no_zero64 | neon::neon_old_shl | neon::neon_old_var_shift | neon::neon_old_pmull8;
+constexpr int kOld = neon::neon_no_zero64 | neon::neon_old_shl | neon::neon_old_var_shift | neon::neon_old_pmull8 |
+                     neon::neon_old_mull_elem | neon::neon_old_widen_hi | neon::neon_old_rshl |
+                     neon::neon_old_ushl8;
 
 template <class F> void for_both_lowerings(F&& body) {
     for (const int bits : {0, kOld}) {
@@ -170,6 +172,67 @@ FX_TEST(neon_lowering_register_shift_every_form_all_counts) {
     });
     std::printf("    %u words\n", words);
     print_stats("after register_shift_every_form_all_counts");
+}
+
+FX_TEST(neon_lowering_long_multiply_by_element_h) {
+    unsigned words = 0;
+    for_both_lowerings([&] {
+        // [SU]MULL/[SU]MLAL/[SU]MLSL and SQDMULL/SQDMLAL/SQDMLSL by element from
+        // .4H/.8H: every index, the element register aliasing the source and
+        // the destination, boundary-biased values (0x8000 * 0x8000 included).
+        std::uint64_t state = 0xe1e;
+        for (const unsigned opc : {0x2u, 0x3u, 0x6u, 0x7u, 0xau, 0xbu})
+            for (unsigned u = 0; u < 2; ++u) {
+                if (u && (opc & 1)) continue;   // SQDMULL forms are signed only
+                for (unsigned q = 0; q < 2; ++q)
+                    for (unsigned index = 0; index < 8; ++index)
+                        for (const auto [rd, rn, rm] : {std::tuple{0u, 1u, 2u}, std::tuple{1u, 1u, 2u}, std::tuple{2u, 1u, 2u},
+                                                        std::tuple{3u, 2u, 2u}}) {
+                            const std::uint32_t w = 0x0f400000u | (q << 30) | (u << 29) | (((index >> 1) & 1u) << 21) |
+                                                    ((index & 1u) << 20) | (rm << 16) | (opc << 12) | ((index >> 2) << 11) |
+                                                    (rn << 5) | rd;
+                            for (unsigned s = 0; s < 4; ++s) {
+                                auto ctx = special_context(rnd(state), 1);
+                                if (s == 0) {   // the PMADDWD edge: every word 0x8000
+                                    ctx.v[rn][0] = ctx.v[rn][1] = ctx.v[rm][0] = ctx.v[rm][1] = 0x8000800080008000ull;
+                                }
+                                if (!run_word(w, ctx, "long multiply by element")) return;
+                                ++words;
+                            }
+                        }
+            }
+    });
+    std::printf("    %u words\n", words);
+    print_stats("after long_multiply_by_element_h");
+}
+
+FX_TEST(neon_lowering_unsigned_widen_high) {
+    unsigned words = 0;
+    for_both_lowerings([&] {
+        // The unsigned "2" forms widen the source's high half: UADDL2/UADDW2/
+        // USUBL2/USUBW2/UABAL2/UABDL2/UMLAL2/UMLSL2/UMULL2 for every size, and
+        // USHLL2 (UXTL2) with every shift; aliasing destination and sources.
+        std::uint64_t state = 0x71d3;
+        for (const unsigned opc : {0x0u, 0x1u, 0x2u, 0x3u, 0x5u, 0x7u, 0x8u, 0xau, 0xcu})
+            for (unsigned size = 0; size < 3; ++size)
+                for (const auto [rd, rn, rm] : {std::tuple{0u, 1u, 2u}, std::tuple{1u, 1u, 2u}, std::tuple{2u, 1u, 2u},
+                                                std::tuple{3u, 4u, 4u}})
+                    for (unsigned s = 0; s < 6; ++s) {
+                        const std::uint32_t w = 0x6e200000u | (size << 22) | (rm << 16) | (opc << 12) | (rn << 5) | rd;
+                        if (!run_word(w, special_context(rnd(state), size), "unsigned widen high")) return;
+                        ++words;
+                    }
+        for (unsigned size = 0; size < 3; ++size)
+            for (unsigned shift = 0; shift < (8u << size); ++shift)
+                for (const auto [rd, rn] : {std::pair{0u, 1u}, std::pair{1u, 1u}}) {
+                    const std::uint32_t immhb = (8u << size) | shift;
+                    const std::uint32_t w = 0x6f00a400u | (immhb << 16) | (rn << 5) | rd;
+                    if (!run_word(w, special_context(rnd(state), size), "ushll2")) return;
+                    ++words;
+                }
+    });
+    std::printf("    %u words\n", words);
+    print_stats("after unsigned_widen_high");
 }
 
 FX_TEST(neon_lowering_pmull8) {

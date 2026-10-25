@@ -1,4 +1,5 @@
-// SIMD mask reductions (owner: neon). Embree and similar code turns a vector
+// NEON fusions (owner: neon): SIMD mask reductions and long-multiply pairs.
+// Mask reductions: Embree and similar code turns a vector
 // compare into a lane bit mask with
 //   AND  Vd.16B, Vn.16B, Vm.16B      (Vm = {1,1,1,1})   or   USHR Vd.4S, Vn.4S, #31
 //   USHL Vd.4S, Vd.4S, Vs.4S         (Vs = {0,1,2,3})
@@ -329,6 +330,56 @@ unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words
     a.movd(dst, out);   // every source is consumed
     ctx.note_vec_zero_above(m.rd, 32);
     return m.extract ? 4u : 3u;
+}
+
+// Pairs of 16-bit long multiplies by element into one accumulator (8-tap
+// filters, IDCT rotations):
+//   SMULL|SMLAL Vd.4S, Va.4H, Vm.H[i]    (SMULL2/SMLAL2 from .8H: Q = 1)
+//   SMLAL       Vd.4S, Vb.4H, Vm.H[j]    (same Q)
+// Vd = [Vd +] Va*e_i + Vb*e_j: PUNPCK{L,H}WD interleaves Va and Vb, PSHUFB puts
+// (e_i, e_j) in every dword, and one PMADDWD sums both products. Exact mod 2^32
+// like the two accumulations: PMADDWD's one wrapping case (all four words
+// 0x8000) is 2^31, the wrapped sum. The second instruction must not read Vd
+// (Vb, Vm != Vd), which the first one wrote. TRANSMUTE_FX_NEON=nomullpair
+// keeps them separate.
+namespace {
+
+bool is_smull_smlal_h_elem(std::uint32_t w, bool accumulate) {
+    return (w & 0xbfc0f400u) == (accumulate ? 0x0f402000u : 0x0f40a000u);
+}
+
+} // namespace
+
+unsigned emit_mull_pair(EmitContext& ctx, std::span<const std::uint32_t> words) {
+    if (words.size() < 2 || !neon_on(neon_no_mull_pair)) return 0;
+    const auto w0 = words[0], w1 = words[1];
+    const bool acc = is_smull_smlal_h_elem(w0, true);
+    if (!acc && !is_smull_smlal_h_elem(w0, false)) return 0;
+    if (!is_smull_smlal_h_elem(w1, true)) return 0;
+    const auto rd = w0 & 31u, ra = (w0 >> 5) & 31u, rm = (w0 >> 16) & 15u;
+    const auto rb = (w1 >> 5) & 31u;
+    const bool q = bit(w0, 30);
+    if (bit(w1, 30) != q || (w1 & 31u) != rd || ((w1 >> 16) & 15u) != rm || rb == rd || rm == rd) return 0;
+    const auto index = [](std::uint32_t w) { return (bits(w, 11, 11) << 2) | (bits(w, 21, 21) << 1) | bits(w, 20, 20); };
+    const auto i = index(w0), j = index(w1);
+
+    V v(ctx);
+    const Xmm a = ctx.read_vec(ra);
+    const Xmm b = ctx.read_vec(rb);
+    const Xmm m = ctx.read_vec(rm);
+    const Xmm dold = acc ? ctx.read_vec(rd) : Xmm{};
+    const Xmm d = ctx.write_vec(rd);
+    const Xmm t = v.temp(), c = v.temp();
+    const auto ei = static_cast<std::uint8_t>(2 * i), ej = static_cast<std::uint8_t>(2 * j);
+    v.op(q ? op::punpckhwd : op::punpcklwd, t, a, b);
+    v.pshufb(c, m, splat32(ei | (ei + 1u) << 8 | static_cast<std::uint32_t>(ej) << 16 | (ej + 1u) << 24));
+    if (acc) {
+        v.op(op::pmaddwd, t, t, c, true);
+        v.op(op::paddd, d, dold, t, true);
+    } else {
+        v.op(op::pmaddwd, d, t, c, true);
+    }
+    return 2;
 }
 
 } // namespace transmute::fx::neon

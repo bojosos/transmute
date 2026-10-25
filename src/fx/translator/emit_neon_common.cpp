@@ -40,6 +40,11 @@ std::uint32_t env_knob_bits() {
             if (all || has("oldvarshift")) b |= neon_old_var_shift;
             if (all || has("oldpmull8")) b |= neon_old_pmull8;
             if (all || has("oldstruct")) b |= neon_old_struct;
+            if (all || has("oldmullelem")) b |= neon_old_mull_elem;
+            if (all || has("nomullpair")) b |= neon_no_mull_pair;
+            if (all || has("oldwidenhi")) b |= neon_old_widen_hi;
+            if (all || has("oldrshl")) b |= neon_old_rshl;
+            if (all || has("oldushl8")) b |= neon_old_ushl8;
         }
         return b;
     }();
@@ -69,6 +74,11 @@ const char* neon_knob_suffix() {
         n += (b & neon_old_var_shift) ? "+oldvarshift" : "+varshift16";
         n += (b & neon_old_pmull8) ? "+oldpmull8" : "+pmull8mul";
         n += (b & neon_old_struct) ? "+oldstruct" : "+struct6";
+        n += (b & neon_old_mull_elem) ? "+oldmullelem" : "+mullelemmadd";
+        n += (b & neon_no_mull_pair) ? "+nomullpair" : "+mullpair";
+        n += (b & neon_old_widen_hi) ? "+oldwidenhi" : "+widenhi";
+        n += (b & neon_old_rshl) ? "+oldrshl" : "+rshlvar";
+        n += (b & neon_old_ushl8) ? "+oldushl8" : "+ushl8mul";
         return n;
     }();
     return suffix.c_str();

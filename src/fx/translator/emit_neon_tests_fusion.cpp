@@ -2,7 +2,9 @@
 #include "fx/translator/emit_neon_test_util.hpp"
 
 #include <array>
+#include <cstdio>
 #include <stdexcept>
+#include <vector>
 
 using namespace transmute::fx;
 using namespace transmute::fx::neon_test;
@@ -155,4 +157,63 @@ FX_TEST(neon_fusion_movemask_all_lane_masks) {
                     if (!check_sequence(emit_neon, ctx, words, "and movemask lanes")) return;
                 }
             }
+}
+
+namespace {
+
+// SMULL (acc = false) / SMLAL Vd.4S, Vn.4H, Vm.H[index] (q: SMULL2/SMLAL2 from .8H).
+std::uint32_t smlal_elem(bool acc, bool q, unsigned d, unsigned n, unsigned m, unsigned index) {
+    return (acc ? 0x0f402000u : 0x0f40a000u) | (q ? 1u << 30 : 0u) | (((index >> 1) & 1u) << 21) | ((index & 1u) << 20) |
+           (m << 16) | ((index >> 2) << 11) | (n << 5) | d;
+}
+
+} // namespace
+
+FX_TEST(neon_fusion_mull_pair_consumes_only_safe_pairs) {
+    KnobGuard guard;
+    neon::neon_set_knobs_for_testing(0);
+    const std::uint32_t pair[] = {smlal_elem(false, false, 4, 1, 0, 0), smlal_elem(true, false, 4, 2, 0, 1)};
+    FX_CHECK_EQ(consumed(pair), 2u);
+    FX_CHECK_EQ(consumed(std::span(pair).first(1)), 1u);
+    const std::uint32_t acc_pair[] = {smlal_elem(true, true, 4, 4, 0, 7), smlal_elem(true, true, 4, 1, 0, 3)};
+    FX_CHECK_EQ(consumed(acc_pair), 2u);   // the first may read Vd
+    const std::uint32_t reads_vd[] = {pair[0], smlal_elem(true, false, 4, 4, 0, 1)};
+    FX_CHECK_EQ(consumed(reads_vd), 1u);   // the second reads the first's result
+    const std::uint32_t elem_vd[] = {smlal_elem(false, false, 4, 1, 4, 0), smlal_elem(true, false, 4, 2, 4, 1)};
+    FX_CHECK_EQ(consumed(elem_vd), 1u);
+    const std::uint32_t mixed_q[] = {pair[0], smlal_elem(true, true, 4, 2, 0, 1)};
+    FX_CHECK_EQ(consumed(mixed_q), 1u);
+    const std::uint32_t other_d[] = {pair[0], smlal_elem(true, false, 5, 2, 0, 1)};
+    FX_CHECK_EQ(consumed(other_d), 1u);
+    const std::uint32_t other_m[] = {pair[0], smlal_elem(true, false, 4, 2, 3, 1)};
+    FX_CHECK_EQ(consumed(other_m), 1u);
+    const std::uint32_t umlal[] = {pair[0], pair[1] | 1u << 29};
+    FX_CHECK_EQ(consumed(umlal), 1u);
+    neon::neon_set_knobs_for_testing(neon::neon_no_mull_pair);
+    FX_CHECK_EQ(consumed(pair), 1u);
+}
+
+FX_TEST(neon_fusion_mull_pair_matches_oracle) {
+    KnobGuard guard;
+    unsigned checked = 0;
+    for (const int knobs : {0, static_cast<int>(neon::neon_no_mull_pair | neon::neon_old_mull_elem)}) {
+        neon::neon_set_knobs_for_testing(knobs);
+        std::uint64_t state = 0x5a11;
+        for (unsigned k = 0; k < 400; ++k) {
+            // An 8-tap chain (SMULL then seven SMLAL, the dav1d vertical filter
+            // shape) with random registers, Q and element indexes; aliasing
+            // the accumulator with sources keeps some pairs separate.
+            const bool q = rnd(state) & 1;
+            const unsigned d = rnd(state) % 6, m = rnd(state) % 6;
+            std::vector<std::uint32_t> words;
+            for (unsigned tap = 0; tap < 8; ++tap)
+                words.push_back(smlal_elem(tap != 0, q, d, rnd(state) % 6, m, rnd(state) % 8));
+            auto ctx = special_context(rnd(state), 1);
+            if (k % 8 == 0)   // the PMADDWD wrap: every word 0x8000
+                for (unsigned r = 0; r < 6; ++r) ctx.v[r][0] = ctx.v[r][1] = 0x8000800080008000ull;
+            if (!check_sequence(emit_neon, ctx, words, "mull pair chain")) return;
+            ++checked;
+        }
+    }
+    std::printf("    %u chains\n", checked);
 }
