@@ -6,6 +6,7 @@
 // Deeper runs (integration gates): TRANSMUTE_FX_FUZZ_SCALE=<n> runs n times as
 // many programs per test, TRANSMUTE_FX_FUZZ_SEED=<s> starts at other seeds.
 #include "fx/testing/test.hpp"
+#include "fx/translator/core_isel.hpp"
 #include "fx/translator/core_test_encode.hpp"
 #include "fx/translator/core_test_gen.hpp"
 #include "fx/translator/core_test_machine.hpp"
@@ -235,3 +236,43 @@ FX_TEST(core_fuzz_programs) { fuzz(1, 3000, 0); }
 FX_TEST(core_fuzz_programs_unlinked) { fuzz(100000, 800, 1); }
 FX_TEST(core_fuzz_programs_small_regions) { fuzz(200000, 800, 2); }
 FX_TEST(core_fuzz_programs_no_interrupt_checks) { fuzz(300000, 400, 3); }
+
+// Hand-written arm64 keeps NZCV live across a BR: dav1d's NEON (refmvs.S
+// splat_mv_neon; ffmpeg and libvpx do the same) computes a jump-table target
+// once at function entry, then loops `subs ...; br xT` and the target reads
+// the flags (`b.gt loop`). The BR's block has no ADR/ADRP, so a heuristic that
+// treats such a BR as flag-dead breaks it. Runs with the production flags
+// model (abi_flags), unlike the fuzz above. With TRANSMUTE_FX_CORE=brdeadflags
+// (opt-in, unsound for this code) it diverges, which shows the test sees it.
+FX_TEST(core_flags_live_across_br_to_a_precomputed_target) {
+    using namespace a64;
+    const std::vector<std::uint32_t> prog = {
+        adr(false, 24, 3),                               // 0 adr x3, target (6): computed once, outside the loop
+        movw(false, 2, 0, 5, 4),                         // 1 movz w4, #5
+        add_shift(true, false, false, 0, 2, 0, 1, 1),    // 2 loop: add x1, x1, x2
+        add_imm(false, true, true, 4, 4, 1),             // 3 subs w4, w4, #1
+        br(3),                                           // 4 br x3 (flags live: the target reads them)
+        brk(0x1),                                        // 5 (not reached)
+        add_imm(true, false, false, 5, 5, 1),            // 6 target: add x5, x5, #1
+        bcond(12, -5),                                   // 7 b.gt loop
+    };
+    static DiffRunner r;
+    const auto saved = r.machine.options;
+    r.machine.options.abi_flags = true;   // the production model
+    for (const bool dead_knob : {false, true}) {
+        core::set_p2_knobs_for_testing(dead_knob ? core::knob_br_flags_dead : 0u);
+        r.report = !dead_knob;   // the knob run is expected to diverge
+        auto ctx = r.context(7);
+        ctx.x[1] = 0; ctx.x[2] = 3; ctx.x[5] = 0;
+        const bool same = r.run(prog, ctx, dead_knob ? "brdeadflags" : "flags live across br");
+        if (!dead_knob) {
+            FX_CHECK(same);
+            FX_CHECK_EQ(r.actual.x[5], std::uint64_t{5});   // the target ran once per iteration
+        } else {
+            FX_CHECK(!same);   // the unsound knob is detected
+        }
+    }
+    r.report = true;
+    core::set_p2_knobs_for_testing(~0u);
+    r.machine.options = saved;
+}
