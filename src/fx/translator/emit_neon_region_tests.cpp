@@ -1694,3 +1694,66 @@ FX_TEST(neon_region_cfl_ac_shape) {
                  0x4e020484u, 0x6e648425u},
                 "cfl_ac_shape", 8);
 }
+
+namespace {
+
+// Vector x indexed element words: MUL/MLA (size 1: H[index], size 2: S[index])
+// and SMULL/SMLAL (.4S from .4H/.8H by H[index]).
+std::uint32_t by_element(std::uint32_t base, bool q, unsigned size, unsigned rd, unsigned rn, unsigned rm, unsigned index) {
+    std::uint32_t w = base | (q ? 1u << 30 : 0u) | (size << 22) | (rn << 5) | rd;
+    if (size == 1) return w | ((index >> 2) << 11) | (((index >> 1) & 1u) << 21) | ((index & 1u) << 20) | (rm << 16);
+    return w | ((index >> 1) << 11) | ((index & 1u) << 21) | (rm << 16);
+}
+constexpr std::uint32_t kMulElem = 0x0f008000u, kMlaElem = 0x2f000000u, kSmullElem = 0x0f00a000u, kSmlalElem = 0x0f002000u;
+
+} // namespace
+
+// Tier 2: the filter register is loaded before the loop, so the by-element
+// multiplies in it read precomputed broadcasts (element_derived_kind) instead
+// of shuffling the element out each iteration: same results, smaller code.
+FX_TEST(neon_region_by_element_derived_broadcasts) {
+    using namespace vf;
+    ensure_registered();
+    std::vector<std::uint32_t> w{ldst_uimm(4, true, 0, 16, 0), movz_x(0, 6)};
+    const auto body = w.size();
+    w.push_back(ldst_uimm(4, true, 0, 17, 1));
+    w.push_back(ldst_uimm(4, true, 1, 17, 2));
+    w.push_back(by_element(kMulElem, true, 1, 3, 1, 0, 0));      // 8-tap shape: mul + mla by h[i]
+    for (unsigned i = 1; i < 8; ++i) w.push_back(by_element(kMlaElem, true, 1, 3, i & 1 ? 2 : 1, 0, i));
+    w.push_back(by_element(kSmullElem, false, 1, 4, 1, 0, 0));   // pairs (0, 1), (2, 3) and a single even h[4]
+    w.push_back(by_element(kSmlalElem, false, 1, 4, 2, 0, 1));
+    w.push_back(by_element(kSmullElem, true, 1, 5, 1, 0, 2));
+    w.push_back(by_element(kSmlalElem, true, 1, 5, 2, 0, 3));
+    w.push_back(by_element(kSmlalElem, false, 1, 4, 3, 0, 4));
+    w.push_back(by_element(kMulElem, true, 2, 6, 4, 0, 1));      // mul .4s by s[1]
+    w.push_back(by_element(kMlaElem, false, 1, 7, 3, 0, 6));     // mla .4h by h[6]
+    w.push_back(subs_x_imm(0, 0, 1));
+    w.push_back(b_cond(kNe, -static_cast<int>(w.size() - body)));
+    DiffRunner runner;
+    std::size_t shuffles[2] = {};
+    for (const int knobs : {0, static_cast<int>(neon::neon_no_elem_derived)}) {
+        neon::neon_set_knobs_for_testing(knobs);
+        for (const int optimize : {1, 0}) {
+            runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+            for (unsigned k = 0; k < 4; ++k) {
+                auto ctx = runner.context(79000 + k);
+                if (k == 0)
+                    for (unsigned r = 0; r < 8; ++r) ctx.v[r][0] = ctx.v[r][1] = 0x8000800080008000ull;
+                if (!runner.run(w, ctx, "by element derived " + std::to_string(knobs))) {
+                    neon::neon_set_knobs_for_testing(-1);
+                    return;
+                }
+                FX_CHECK_EQ(runner.last.interprets, 0u);
+            }
+            if (optimize)   // VPSHUFB: C4, map 0F38 (low 5 bits 2), pp = 66, opcode 00
+                for (const auto& r : runner.machine.regions)
+                    for (std::size_t k = 0; k + 3 < r.code.size(); ++k)
+                        shuffles[knobs ? 1 : 0] += r.code[k] == 0xc4 && (r.code[k + 1] & 0x1f) == 2 && (r.code[k + 2] & 3) == 1 &&
+                                                   r.code[k + 3] == 0;
+        }
+    }
+    neon::neon_set_knobs_for_testing(-1);
+    runner.machine.options.optimize = -1;
+    std::printf("    vpshufb: %zu, shuffling each element %zu\n", shuffles[0], shuffles[1]);
+    FX_CHECK(shuffles[0] < shuffles[1]);
+}

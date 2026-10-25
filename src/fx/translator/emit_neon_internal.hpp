@@ -137,6 +137,9 @@ inline constexpr SseOp kZext[3] = {op::pmovzxbw, op::pmovzxwd, op::pmovzxdq};
 //             register shift instead of the variable shifts' own saturation
 //   oldushl8 - USHL on byte lanes through the shift-by-1/2/4/8 blend chain
 //             instead of multiplying by a PSHUFB-selected power of two
+//   noelemderived - by-element multiplies shuffle their element out each time
+//             (tier 2 may otherwise precompute the broadcast after Vm's
+//             definitions: EmitContext::vec_derived)
 enum NeonKnob : std::uint32_t {
     neon_no_fold = 1u,
     neon_no_slot = 2u,
@@ -154,6 +157,7 @@ enum NeonKnob : std::uint32_t {
     neon_old_widen_hi = 8192u,
     neon_old_rshl = 16384u,
     neon_old_ushl8 = 32768u,
+    neon_no_elem_derived = 65536u,
 };
 std::uint32_t neon_knob_bits();
 // Test override of the knobs (-1 = TRANSMUTE_FX_NEON). Not thread-safe.
@@ -385,6 +389,9 @@ unsigned emit_extract(EmitContext& ctx, std::uint32_t w);
 unsigned emit_table(EmitContext& ctx, std::uint32_t w);
 unsigned emit_modified_immediate(EmitContext& ctx, std::uint32_t w);
 unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words);
+// Tier 2 derived-value kind of a by-element multiply's broadcast element, or 0
+// (emit_neon_fusion.cpp).
+unsigned element_derived_kind(std::uint32_t w);
 // SMULL|SMLAL + SMLAL by element (16-bit) into one accumulator: 2, else 0.
 unsigned emit_mull_pair(EmitContext& ctx, std::span<const std::uint32_t> words);
 

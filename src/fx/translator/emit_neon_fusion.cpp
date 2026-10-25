@@ -151,6 +151,63 @@ void lanes_equal(V& v, Xmm t, const Src& src, const Value& value) {
 
 } // namespace
 
+namespace {
+
+bool is_smull_smlal_h_elem(std::uint32_t w, bool accumulate) {
+    return (w & 0xbfc0f400u) == (accumulate ? 0x0f402000u : 0x0f40a000u);
+}
+
+unsigned h_element_index(std::uint32_t w) { return (bits(w, 11, 11) << 2) | (bits(w, 21, 21) << 1) | bits(w, 20, 20); }
+
+// SMULL|SMLAL + SMLAL by element into one accumulator (emit_mull_pair below).
+struct MullPair {
+    unsigned rd, ra, rb, rm, i, j;
+    bool q, acc;
+};
+
+bool match_mull_pair(std::span<const std::uint32_t> words, MullPair& p) {
+    if (words.size() < 2 || !neon_on(neon_no_mull_pair)) return false;
+    const auto w0 = words[0], w1 = words[1];
+    p.acc = is_smull_smlal_h_elem(w0, true);
+    if (!p.acc && !is_smull_smlal_h_elem(w0, false)) return false;
+    if (!is_smull_smlal_h_elem(w1, true)) return false;
+    p.rd = w0 & 31u;
+    p.ra = (w0 >> 5) & 31u;
+    p.rm = (w0 >> 16) & 15u;
+    p.rb = (w1 >> 5) & 31u;
+    p.q = bit(w0, 30);
+    p.i = h_element_index(w0);
+    p.j = h_element_index(w1);
+    return bit(w1, 30) == p.q && (w1 & 31u) == p.rd && ((w1 >> 16) & 15u) == p.rm && p.rb != p.rd && p.rm != p.rd;
+}
+
+} // namespace
+
+// Tier 2: by-element multiplies read their broadcast element precomputed after
+// Vm's definitions (EmitContext::vec_derived) instead of shuffling it out each
+// time (8-tap filters keep the taps in one register across the loop). Kinds:
+// 16 + i = halfword i in every lane (MUL/MLA/MLS .4H/.8H), 24 + k = word k in
+// every lane (MUL/MLA/MLS .2S/.4S; halfwords 2k, 2k+1 for SMULL/SMLAL/SMLSL by
+// an even element and the long-multiply pairs). TRANSMUTE_FX_NEON=noelemderived.
+unsigned element_derived_kind(std::uint32_t w) {
+    if ((w & 0x9f000400u) != 0x0f000000u || !neon_on(neon_no_elem_derived)) return 0;   // vector x indexed element
+    const bool u = bit(w, 29);
+    const unsigned size = bits(w, 23, 22), opc = bits(w, 15, 12);
+    const bool mul = (opc == 0x8 && !u) || ((opc == 0x0 || opc == 0x4) && u);
+    if (mul && size == 1) return 16 + h_element_index(w);
+    if (mul && size == 2) return 24 + ((bits(w, 11, 11) << 1) | bits(w, 21, 21));
+    const bool smull = !u && (opc == 0xa || opc == 0x2 || opc == 0x6) && size == 1;
+    if (smull && neon_on(neon_old_mull_elem) && (h_element_index(w) & 1u) == 0) return 24 + h_element_index(w) / 2;
+    return 0;
+}
+
+// The kind a long-multiply pair at words[0] reads (its elements a word apart), else 0.
+unsigned mull_pair_derived_kind(std::span<const std::uint32_t> words) {
+    MullPair p;
+    if (!neon_on(neon_no_elem_derived) || !match_mull_pair(words, p) || p.j != p.i + 1 || (p.i & 1u)) return 0;
+    return 24 + p.i / 2;
+}
+
 // TBL (not TBX) with `count` table registers: its adjusted indices, one per
 // table register (emit_neon_perm.cpp), may come precomputed (tier 2).
 bool tbl_word(std::uint32_t w, unsigned& rm, unsigned& count) {
@@ -165,6 +222,16 @@ unsigned mask_fact_want(std::span<const std::uint32_t> words, FamilyFactWant* ou
         for (unsigned k = 0; k < count; ++k)
             out[k] = {FamilyFactWant::K::derived, static_cast<std::uint8_t>(rm), {k, 0}};
         return count;
+    }
+    if (const unsigned kind = mull_pair_derived_kind(words)) {
+        out[0] = {FamilyFactWant::K::derived, static_cast<std::uint8_t>((words[0] >> 16) & 15u), {kind, 0}};
+        return 1;
+    }
+    if (const unsigned kind = element_derived_kind(words[0])) {
+        const unsigned size = bits(words[0], 23, 22);
+        out[0] = {FamilyFactWant::K::derived, static_cast<std::uint8_t>(bits(words[0], 19, 16) | (size == 2 ? bits(words[0], 20, 20) << 4 : 0u)),
+                  {kind, 0}};
+        return 1;
     }
     MaskIdiom m;
     if (!neon_on(neon_no_mask_fusion) || !match_mask_idiom(words, m)) return 0;
@@ -204,13 +271,18 @@ void mask_fact_check(EmitContext& ctx, Xmm reg, bool in_reg, const Mem& slot, co
 }
 
 // Derived value `kind` of TBL's index vector: idx - 16 * kind with bit 7
-// set where it lies outside [0, 16) (pshufb then zeroes the lane).
+// set where it lies outside [0, 16) (pshufb then zeroes the lane). Kinds 16+:
+// broadcast elements (element_derived_kind).
 void tbl_derive(EmitContext& ctx, Xmm src, unsigned kind, const Mem& out) {
     auto& as = ctx.as();
     begin_instruction_constants(as);
     V v(ctx);
     const Xmm t = ctx.temp_vec();
-    if (kind == 0) {
+    if (kind >= 24) {
+        v.pshufd(t, src, static_cast<std::uint8_t>((kind - 24) * 0x55));
+    } else if (kind >= 16) {
+        dup_element(v, 1, t, src, kind - 16);
+    } else if (kind == 0) {
         v.op(op::paddusb, t, src, splat8(0x70));
     } else {
         v.op(op::psubb, t, src, splat8(static_cast<std::uint8_t>(16 * kind)));
@@ -341,44 +413,33 @@ unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words
 // like the two accumulations: PMADDWD's one wrapping case (all four words
 // 0x8000) is 2^31, the wrapped sum. The second instruction must not read Vd
 // (Vb, Vm != Vd), which the first one wrote. TRANSMUTE_FX_NEON=nomullpair
-// keeps them separate.
-namespace {
-
-bool is_smull_smlal_h_elem(std::uint32_t w, bool accumulate) {
-    return (w & 0xbfc0f400u) == (accumulate ? 0x0f402000u : 0x0f40a000u);
-}
-
-} // namespace
-
+// keeps them separate. Elements a word apart (2k, 2k+1) may come precomputed
+// (element_derived_kind).
 unsigned emit_mull_pair(EmitContext& ctx, std::span<const std::uint32_t> words) {
-    if (words.size() < 2 || !neon_on(neon_no_mull_pair)) return 0;
-    const auto w0 = words[0], w1 = words[1];
-    const bool acc = is_smull_smlal_h_elem(w0, true);
-    if (!acc && !is_smull_smlal_h_elem(w0, false)) return 0;
-    if (!is_smull_smlal_h_elem(w1, true)) return 0;
-    const auto rd = w0 & 31u, ra = (w0 >> 5) & 31u, rm = (w0 >> 16) & 15u;
-    const auto rb = (w1 >> 5) & 31u;
-    const bool q = bit(w0, 30);
-    if (bit(w1, 30) != q || (w1 & 31u) != rd || ((w1 >> 16) & 15u) != rm || rb == rd || rm == rd) return 0;
-    const auto index = [](std::uint32_t w) { return (bits(w, 11, 11) << 2) | (bits(w, 21, 21) << 1) | bits(w, 20, 20); };
-    const auto i = index(w0), j = index(w1);
+    MullPair p;
+    if (!match_mull_pair(words, p)) return 0;
+    Mem slot{};
+    const unsigned kind = mull_pair_derived_kind(words);
+    const bool derived = kind && ctx.vec_derived(p.rm, kind, slot);
 
     V v(ctx);
-    const Xmm a = ctx.read_vec(ra);
-    const Xmm b = ctx.read_vec(rb);
-    const Xmm m = ctx.read_vec(rm);
-    const Xmm dold = acc ? ctx.read_vec(rd) : Xmm{};
-    const Xmm d = ctx.write_vec(rd);
-    const Xmm t = v.temp(), c = v.temp();
-    const auto ei = static_cast<std::uint8_t>(2 * i), ej = static_cast<std::uint8_t>(2 * j);
-    v.op(q ? op::punpckhwd : op::punpcklwd, t, a, b);
-    v.pshufb(c, m, splat32(ei | (ei + 1u) << 8 | static_cast<std::uint32_t>(ej) << 16 | (ej + 1u) << 24));
-    if (acc) {
-        v.op(op::pmaddwd, t, t, c, true);
-        v.op(op::paddd, d, dold, t, true);
+    const Xmm a = ctx.read_vec(p.ra);
+    const Xmm b = ctx.read_vec(p.rb);
+    const Xmm m = derived ? Xmm{} : ctx.read_vec(p.rm);
+    const Xmm dold = p.acc ? ctx.read_vec(p.rd) : Xmm{};
+    const Xmm d = ctx.write_vec(p.rd);
+    const Xmm t = v.temp();
+    v.op(p.q ? op::punpckhwd : op::punpcklwd, t, a, b);
+    const Xmm prod = p.acc ? t : d;
+    if (derived) {
+        v.op(op::pmaddwd, prod, t, slot);
     } else {
-        v.op(op::pmaddwd, d, t, c, true);
+        const Xmm c = v.temp();
+        const auto ei = static_cast<std::uint8_t>(2 * p.i), ej = static_cast<std::uint8_t>(2 * p.j);
+        v.pshufb(c, m, splat32(ei | (ei + 1u) << 8 | static_cast<std::uint32_t>(ej) << 16 | (ej + 1u) << 24));
+        v.op(op::pmaddwd, prod, t, c, true);
     }
+    if (p.acc) v.op(op::paddd, d, dold, t, true);
     return 2;
 }
 

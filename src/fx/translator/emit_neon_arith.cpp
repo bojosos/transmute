@@ -1573,6 +1573,33 @@ unsigned emit_indexed(EmitContext& ctx, std::uint32_t w) {
     const unsigned index = size == 1 ? (h << 2) | (l << 1) | mbit : (h << 1) | l;
     const unsigned rm = size == 1 ? bits(w, 19, 16) : bits(w, 20, 16);
 
+    // Tier 2: the broadcast element precomputed after Vm's definitions
+    // (element_derived_kind): the multiply reads it as a memory operand.
+    if (Mem slot{}; !dot_form && !rdm && element_derived_kind(w) != 0 && ctx.vec_derived(rm, element_derived_kind(w), slot)) {
+        V v(ctx);
+        const bool acc = opc == 0x0 || opc == 0x4 || opc == 0x2 || opc == 0x6;
+        const Xmm n = ctx.read_vec(rn);
+        const Xmm dold = acc ? (rd == rn ? n : ctx.read_vec(rd)) : Xmm{};
+        const Xmm d = ctx.write_vec(rd);
+        const Xmm t = v.temp();
+        const bool long_mul = opc == 0xa || opc == 0x2 || opc == 0x6;
+        if (long_mul) {   // SMULL/SMLAL/SMLSL by an even element: the word holds (e, e_next)
+            if (q) v.op(op::punpckhwd, t, n, splat32(0));
+            else v.un(kZext[1], t, n);
+        }
+        const SseOp mul_op = long_mul ? op::pmaddwd : size == 1 ? op::pmullw : op::pmulld;
+        const unsigned wsize = long_mul ? 2 : size;
+        if (!acc) {
+            v.op(mul_op, d, long_mul ? t : n, slot);
+        } else {
+            v.op(mul_op, t, long_mul ? t : n, slot);
+            if (opc == 0x0 || opc == 0x2) v.op(kAdd[wsize], d, dold, t, true);
+            else v.op(kSub[wsize], d, dold, t);
+        }
+        if (!long_mul) v.finish(d, q);
+        return 1;
+    }
+
     V v(ctx);
     const bool accumulates = opc == 0x0 || opc == 0x4 || opc == 0x2 || opc == 0x6 ||
                              opc == 0x3 || opc == 0x7 || dot_form || rdm;
