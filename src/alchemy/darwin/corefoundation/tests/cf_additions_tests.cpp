@@ -144,9 +144,9 @@ void test_guest_cf_extra(Fixture& f) {
 // cf_system.cpp: the system version dictionary, NSGetSizeAndAlignment and the CFBinaryHeap stops.
 void test_guest_cf_system(Fixture& f) {
     const auto cf = alchemy::core_foundation_library;
-    const auto key = f.engine.read64(f.symbol(cf, "_kCFSystemVersionProductVersionKey"));
+    const auto key = f.engine.read64(f.symbol(cf, "__kCFSystemVersionProductVersionKey"));
     require(f.cf.utf8(key) == "ProductVersion" &&
-            f.cf.utf8(f.engine.read64(f.symbol(cf, "_kCFSystemVersionBuildVersionKey"))) == "ProductBuildVersion", "kCFSystemVersion keys");
+            f.cf.utf8(f.engine.read64(f.symbol(cf, "__kCFSystemVersionBuildVersionKey"))) == "ProductBuildVersion", "kCFSystemVersion keys");
     const auto versions = f.call(cf, "__CFCopySystemVersionDictionary", {});
     require(f.cf.utf8(f.cf.dictionary_value(versions, key)) == "14.0" &&
             f.cf.utf8(f.cf.dictionary_value(versions, f.cf.string("ProductName"))) == "macOS", "_CFCopySystemVersionDictionary");

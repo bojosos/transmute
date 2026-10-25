@@ -20,10 +20,9 @@
 //   registrations that match the name and object (NULL matches any).
 // - CFArrayApplyFunction/ReplaceValues, CFBundleGetFunctionPointerForName
 //   (dlsym in the bundle's executable), CFBundleGetPackageInfo,
-//   CFStringCreateWithBytesNoCopy, CFStringFindWithOptions (exact search, or
-//   the host's NLS search for case/diacritic/width-insensitive options),
-//   CFStringGetFileSystemRepresentation (decomposed UTF-8, as HFS+/APFS
-//   names), CFUUIDGetConstantUUIDWithBytes.
+//   CFStringCreateWithBytesNoCopy, CFStringGetFileSystemRepresentation
+//   (decomposed UTF-8, as HFS+/APFS names), CFUUIDGetConstantUUIDWithBytes.
+//   CFStringFindWithOptions is with the other string calls (cf_strings.cpp).
 // - No hyphenation dictionaries exist; legacy resource maps never open;
 //   custom allocators cannot be created (CFAllocatorCreate returns NULL).
 namespace alchemy::gui::fill {
@@ -247,55 +246,6 @@ void CoreFoundationGaps::install_strings() {
             free(s.x[1]);
         }
         s.x[0] = result;
-    });
-    // Boolean CFStringFindWithOptions(string, stringToFind, CFRange range, CFStringCompareFlags options, CFRange *result)
-    raw(core_foundation, "_CFStringFindWithOptions", [this](CpuState& s, GuestMemory& m) {
-        const auto haystack = cf.units(s.x[0]);
-        const auto needle = cf.units(s.x[1]);
-        const auto location = static_cast<std::int64_t>(s.x[2]), length = static_cast<std::int64_t>(s.x[3]);
-        const auto options = static_cast<std::uint32_t>(s.x[4]);
-        const auto result_out = s.x[5];
-        if (location < 0 || length < 0 || static_cast<std::uint64_t>(location + length) > haystack.size())
-            throw std::runtime_error("Alchemy: CFStringFindWithOptions range out of bounds");
-        const bool backwards = options & 4, anchored = options & 8;
-        constexpr std::uint32_t case_insensitive = 1, nonliteral = 16, diacritic_insensitive = 128, width_insensitive = 256;
-        std::int64_t found_at = not_found, found_length = 0;
-        if (needle.empty() || static_cast<std::int64_t>(needle.size()) > length) {
-            found_at = not_found;
-        } else if (!(options & (case_insensitive | nonliteral | diacritic_insensitive | width_insensitive))) {
-            const auto begin = haystack.begin() + location, end = begin + length;
-            const auto matches = [&](std::int64_t at) {
-                return std::equal(needle.begin(), needle.end(), haystack.begin() + at);
-            };
-            const auto last = location + length - static_cast<std::int64_t>(needle.size());
-            if (anchored) {
-                const auto at = backwards ? last : location;
-                if (matches(at)) found_at = at;
-            } else if (backwards) {
-                for (auto at = last; at >= location; --at) if (matches(at)) { found_at = at; break; }
-            } else {
-                const auto hit = std::search(begin, end, needle.begin(), needle.end());
-                if (hit != end) found_at = location + (hit - haystack.begin() - location);
-            }
-            if (found_at != not_found) found_length = static_cast<std::int64_t>(needle.size());
-        } else {
-            namespace locale = host::locale;
-            std::uint32_t flags = 0;
-            if (options & case_insensitive) flags |= locale::ignore_case_linguistic;
-            if (options & diacritic_insensitive) flags |= locale::ignore_diacritics;
-            if (options & width_insensitive) flags |= locale::ignore_width;
-            const auto where = backwards ? (anchored ? locale::Search::suffix : locale::Search::last)
-                                         : (anchored ? locale::Search::prefix : locale::Search::first);
-            const auto match = locale::find("und",
-                std::u16string_view(reinterpret_cast<const char16_t*>(haystack.data() + location), static_cast<std::size_t>(length)),
-                std::u16string_view(reinterpret_cast<const char16_t*>(needle.data()), needle.size()), where, flags);
-            if (match) { found_at = location + static_cast<std::int64_t>(match->offset); found_length = static_cast<std::int64_t>(match->length); }
-            else if (match.error() == host::Error::unsupported)
-                throw std::runtime_error("Alchemy: CFStringFindWithOptions with linguistic options needs the host's linguistic search");
-        }
-        if (found_at == not_found) { s.x[0] = 0; return; }
-        if (result_out) { m.write64(result_out, static_cast<std::uint64_t>(found_at)); m.write64(result_out + 8, static_cast<std::uint64_t>(found_length)); }
-        s.x[0] = 1;
     });
     // File-system representation: decomposed (NFD) UTF-8, as HFS+/APFS store names.
     const auto file_system_bytes = [this](Address string) {

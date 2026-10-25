@@ -10,6 +10,7 @@ guest runtimes ship with are in [runtime/THIRD_PARTY_NOTICES.md](runtime/THIRD_P
 | Component | License | Where | Notes |
 | --- | --- | --- | --- |
 | [tsl::robin_map](https://github.com/Tessil/robin-map) v1.4.1 | MIT | `third_party/robin-map/` | Four headers and `LICENSE`, unmodified, hashes in `PROVENANCE.md`. Compiled into the host executables (`ALCHEMY_ROBIN_MAP`). |
+| [swift-corelibs-foundation](https://github.com/swiftlang/swift-corelibs-foundation) `swift-6.4.0-RELEASE` (CF-Lite) | Apache-2.0 WITH Swift Runtime Library Exception | `third_party/swift-corelibs-foundation/` (`LICENSE` and `PROVENANCE.md`) | Parts of CoreFoundation's encoding database and string rules, rewritten in C++ inside `src/alchemy/darwin/corefoundation/` (the files are listed in `PROVENANCE.md`). No upstream file is vendored apart from the license. |
 | m2v-capi (project-authored) | **LGPL-3.0-or-later** | `external/m2v-capi/` | The C ABI over metal2vulkan, with its own `COPYING.LESSER` and `COPYING`. Not MIT, and not compiled into anything else: it builds a separate DLL ([below](#loaded-at-run-time-when-present-m2v_capidll-metal2vulkan)). |
 
 Nothing else is vendored. In particular:
@@ -52,6 +53,7 @@ never committed, and no part of them is copied into the repository.
 | `clang-c` headers (LLVM 19.1.5) | Apache-2.0 WITH LLVM-exception | Build-time declarations for libclang |
 | Vulkan loader `vulkan-1.dll` | Apache-2.0 | Metal on Vulkan |
 | Vulkan-Headers (LunarG Vulkan SDK) | Apache-2.0 OR MIT | Build-time declarations |
+| ICU, the system copy of Windows 10 1903 and later (`System32\icu.dll`) | The ICU license (Unicode, Inc.) | `host::icu` (`include/alchemy/host/icu.hpp`): string encodings, transforms, case mapping and text breaks for CoreFoundation and Foundation. The host's copy is loaded; nothing from ICU is in the repository. |
 
 ## Tools used, not shipped
 

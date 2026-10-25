@@ -1,9 +1,12 @@
 #include "alchemy/darwin/headless_additions.hpp"
 #include "alchemy/darwin/headless_provider.hpp"
 
+#include "alchemy/darwin/corefoundation/cf_encodings.hpp"
 #include "alchemy/host/locale.hpp"
 
 #include <array>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -16,6 +19,9 @@
 // Moved from darwin/identities/installer_frameworks.cpp (an installer
 // binds them first); registered in both builds by install_darwin_frameworks.
 namespace alchemy::darwin_headless {
+
+void install_corefoundation_strings(ProcessContext& context, ObjcRuntime& objc, CoreFoundation& cf);   // cf_strings.cpp
+
 namespace {
 
 // CFString.h
@@ -28,6 +34,8 @@ constexpr std::uint32_t encoding_mac_roman = 0, encoding_latin1 = 0x201, encodin
 class StringsAndBundles final : public Provider {
 public:
     using Provider::Provider;
+    std::mutex names_mutex;
+    std::map<std::uint32_t, Address> encoding_names;
     static void default_allocator(Address allocator) {
         if (allocator) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
     }
@@ -36,12 +44,14 @@ public:
         function(core_foundation_library, "_CFStringGetSystemEncoding", [](CpuState& s, GuestMemory&) {
             s.x[0] = encoding_mac_roman;
         });
-        // The encodings the CoreFoundation provider converts.
+        // The encodings the CoreFoundation provider converts: the built-in ones, and
+        // those with a converter in the host's ICU (cf_encodings.cpp).
         function(core_foundation_library, "_CFStringIsEncodingAvailable", [](CpuState& s, GuestMemory&) {
             const auto encoding = static_cast<std::uint32_t>(s.x[0]);
             s.x[0] = encoding == encoding_ascii || encoding == encoding_utf8 || encoding == encoding_latin1 ||
                 encoding == encoding_utf16 || encoding == encoding_utf16be || encoding == encoding_utf16le ||
-                encoding == encoding_utf32 || encoding == encoding_utf32be || encoding == encoding_utf32le;
+                encoding == encoding_utf32 || encoding == encoding_utf32be || encoding == encoding_utf32le ||
+                cf_encodings::converts(encoding);
         });
         function(core_foundation_library, "_CFStringCreateMutableCopy", [this](CpuState& s, GuestMemory&) {
             if (!s.x[2]) throw std::runtime_error("Alchemy CoreFoundation: CFStringCreateMutableCopy of NULL");
@@ -84,17 +94,14 @@ public:
             }
             s.x[0] = result;
         });
+        // CFStringGetNameOfEncoding: CF's display names (a cached string, Get rule).
         function(core_foundation_library, "_CFStringGetNameOfEncoding", [this](CpuState& s, GuestMemory&) {
-            static constexpr std::pair<std::uint32_t, std::string_view> names[] = {
-                {encoding_mac_roman, "Western (Mac OS Roman)"}, {encoding_latin1, "Western (ISO Latin 1)"},
-                {encoding_ascii, "Western (ASCII)"}, {encoding_utf8, "Unicode (UTF-8)"},
-                {encoding_utf16, "Unicode (UTF-16)"}, {encoding_utf16be, "Unicode (UTF-16BE)"},
-                {encoding_utf16le, "Unicode (UTF-16LE)"}, {encoding_utf32, "Unicode (UTF-32)"},
-                {encoding_utf32be, "Unicode (UTF-32BE)"}, {encoding_utf32le, "Unicode (UTF-32LE)"}};
-            const auto wanted = static_cast<std::uint32_t>(s.x[0]);
-            s.x[0] = 0;
-            for (const auto& [encoding, name] : names)
-                if (encoding == wanted) { s.x[0] = constant_string(name); return; }
+            const auto encoding = static_cast<std::uint32_t>(s.x[0]);
+            std::lock_guard lock(names_mutex);
+            if (const auto found = encoding_names.find(encoding); found != encoding_names.end()) { s.x[0] = found->second; return; }
+            const auto name = cf_encodings::display_name(encoding);
+            s.x[0] = name ? constant_string(*name) : 0;
+            encoding_names.emplace(encoding, s.x[0]);
         });
         // CFBundle is toll-free bridged with the Foundation provider's NSBundle.
         function(core_foundation_library, "_CFBundleGetMainBundle", [this](CpuState& s, GuestMemory&) {
@@ -171,6 +178,7 @@ public:
 
 void install_corefoundation_strings_and_bundles(ProcessContext& context, ObjcRuntime& objc, CoreFoundation& cf) {
     std::make_shared<StringsAndBundles>(context, objc, cf)->install();
+    install_corefoundation_strings(context, objc, cf);
 }
 
 } // namespace alchemy::darwin_headless

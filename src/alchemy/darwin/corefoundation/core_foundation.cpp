@@ -1,4 +1,5 @@
 #include "alchemy/core_foundation.hpp"
+#include "alchemy/darwin/corefoundation/cf_encodings.hpp"
 #include "alchemy/host/files.hpp"
 #include "alchemy/host/locale.hpp"
 #include "alchemy/host/process.hpp"
@@ -102,6 +103,11 @@ constexpr std::uint32_t ascii = 0x600, utf8_encoding = 0x08000100, latin1 = 0x20
     utf16 = 0x100, utf16be = 0x10000100, utf16le = 0x14000100,
     utf32 = 0x0c000100, utf32be = 0x18000100, utf32le = 0x1c000100;
 bool is_utf32(std::uint32_t encoding) { return encoding == utf32 || encoding == utf32be || encoding == utf32le; }
+// A C string's encoding has 8-bit units: every encoding but UTF-16 and UTF-32
+// (the others beyond ASCII, Latin-1 and UTF-8 convert through ICU, cf_encodings.cpp).
+bool c_string_encoding(std::uint32_t encoding) {
+    return encoding != utf16 && encoding != utf16le && encoding != utf16be && !is_utf32(encoding);
+}
 [[noreturn]] void invalid(std::string_view why) { throw std::runtime_error("Alchemy CoreFoundation: " + std::string(why)); }
 struct EncodingError : std::runtime_error { explicit EncodingError(std::string_view why) : std::runtime_error("Alchemy CoreFoundation: " + std::string(why)) {} };
 [[noreturn]] void invalid_encoding(std::string_view why) { throw EncodingError(why); }
@@ -149,7 +155,12 @@ std::vector<std::uint16_t> decode(std::span<const std::uint8_t> input, std::uint
         return result;
     }
     if (encoding == latin1) { result.assign(input.begin(), input.end()); return result; }
-    if (encoding != ascii && encoding != utf8_encoding) invalid("unsupported string encoding");
+    if (encoding != ascii && encoding != utf8_encoding) {
+        // Every other encoding converts through the host's ICU (cf_encodings.cpp).
+        auto converted = cf_encodings::decode(input, encoding);
+        if (!converted) invalid_encoding("bytes not valid in the string encoding");
+        return std::move(*converted);
+    }
     result.reserve(input.size());
     for (std::size_t at = 0; at < input.size();) {
         const auto first = input[at++];
@@ -171,7 +182,10 @@ std::vector<std::uint16_t> decode(std::span<const std::uint8_t> input, std::uint
 struct Encoded { std::vector<std::uint8_t> bytes; std::uint64_t units{}; };
 Encoded encode(std::span<const std::uint16_t> input, std::uint32_t encoding, std::uint8_t loss,
     bool external, std::uint64_t maximum = UINT64_MAX) {
-    if (encoding != ascii && encoding != utf8_encoding && encoding != latin1 && encoding != utf16 && encoding != utf16le && encoding != utf16be && !is_utf32(encoding)) invalid("unsupported string encoding");
+    if (encoding != ascii && encoding != utf8_encoding && encoding != latin1 && encoding != utf16 && encoding != utf16le && encoding != utf16be && !is_utf32(encoding)) {
+        auto converted = cf_encodings::encode(input, encoding, loss, maximum);
+        return {std::move(converted.bytes), converted.units};
+    }
     Encoded result;
     if (external && is_utf32(encoding)) {
         if (maximum < 4) return result;
@@ -893,7 +907,7 @@ void CoreFoundation::Impl::install_all() {
     const auto release_callback = context.install_function("__alchemy_cf_callback_release", [this](auto& s, auto&) { object(s.x[1]); context.objects().release(s.x[1]); s.x[0] = 0; }, core_foundation_library);
     auto callback_record = [&](std::string name, bool key) { const auto address = context.allocate_guest(key ? 48 : 40); memory().write64(address, 0); memory().write64(address + 8, retain_callback); memory().write64(address + 16, release_callback); memory().write64(address + 24, callback("CFCopyDescription")); memory().write64(address + 32, callback("CFEqual")); if (key) memory().write64(address + 40, callback("CFHash")); context.install_export(core_foundation_library, "_" + name, {address, ExportKind::data}); return address; };
     array_callbacks = callback_record("kCFTypeArrayCallBacks", false); key_callbacks = callback_record("kCFTypeDictionaryKeyCallBacks", true); value_callbacks = callback_record("kCFTypeDictionaryValueCallBacks", false);
-    install("CFStringCreateWithCString", 3, [this](auto a) { allocator(a[0]); const auto encoding = static_cast<std::uint32_t>(a[2]); if (encoding != ascii && encoding != utf8_encoding && encoding != latin1) invalid("C strings require ASCII, Latin-1 or UTF-8 encoding"); bool terminated{}; const auto input = memory().read_string(a[1], 1, limit, &terminated); if (!terminated) invalid("unterminated C string"); try { return string(decode(input, encoding)); } catch (const EncodingError&) { return std::uint64_t{0}; } });
+    install("CFStringCreateWithCString", 3, [this](auto a) { allocator(a[0]); const auto encoding = static_cast<std::uint32_t>(a[2]); if (!c_string_encoding(encoding)) invalid("C strings cannot be in a UTF-16 or UTF-32 encoding"); bool terminated{}; const auto input = memory().read_string(a[1], 1, limit, &terminated); if (!terminated) invalid("unterminated C string"); try { return string(decode(input, encoding)); } catch (const EncodingError&) { return std::uint64_t{0}; } });
     install("CFStringCreateWithBytes", 5, [this](auto a) { allocator(a[0]); const auto input = bytes(memory(), a[1], a[2]); try { return string(decode(input, static_cast<std::uint32_t>(a[3]), static_cast<std::uint8_t>(a[4]) != 0)); } catch (const EncodingError&) { return std::uint64_t{0}; } });
     install("CFStringCreateWithCharacters", 3, [this](auto a) { allocator(a[0]); return string(decode(bytes(memory(), a[1], count(a[2]) * 2), utf16le)); });
     install("CFStringCreateCopy", 2, [this](auto a) { allocator(a[0]); return string(payload<StringPayload>(a[1], ObjectKind::string)->units); });
@@ -903,9 +917,9 @@ void CoreFoundation::Impl::install_all() {
     install("CFStringGetCharacters", 4, [this](auto a) { const auto p = payload<StringPayload>(a[0], ObjectKind::string); range(p->units.size(), a[1], a[2]); const auto converted = encode(std::span(p->units).subspan(static_cast<std::size_t>(a[1]), static_cast<std::size_t>(a[2])), utf16le, 0, false); memory().write_bytes(a[3], converted.bytes); return 0; });
     install("CFStringGetCharactersPtr", 1, [this](auto a) { return payload<StringPayload>(a[0], ObjectKind::string)->storage; });
     install("CFStringGetCStringPtr", 2, [this](auto a) { const auto p = payload<StringPayload>(a[0], ObjectKind::string); if (a[1] != utf8_encoding && a[1] != ascii) return std::uint64_t{0}; const auto out = encode(p->units, static_cast<std::uint32_t>(a[1]), 0, false); if (out.units != p->units.size()) return std::uint64_t{0}; std::lock_guard lock(p->mutex); if (!p->utf8_storage) { p->utf8_storage = context.allocate_guest(out.bytes.size() + 1); memory().write_bytes(p->utf8_storage, out.bytes); memory().write8(p->utf8_storage + out.bytes.size(), 0); } return p->utf8_storage; });
-    install("CFStringGetCString", 4, [this](auto a) { const auto p = payload<StringPayload>(a[0], ObjectKind::string); const auto encoding = static_cast<std::uint32_t>(a[3]); if (encoding != ascii && encoding != utf8_encoding && encoding != latin1) invalid("C strings require ASCII, Latin-1 or UTF-8 encoding"); if (!a[2] || a[2] > limit) return std::uint64_t{0}; const auto out = encode(p->units, encoding, 0, false, a[2] - 1); if (out.units != p->units.size()) return std::uint64_t{0}; memory().write_bytes(a[1], out.bytes); memory().write8(a[1] + out.bytes.size(), 0); return std::uint64_t{1}; });
+    install("CFStringGetCString", 4, [this](auto a) { const auto p = payload<StringPayload>(a[0], ObjectKind::string); const auto encoding = static_cast<std::uint32_t>(a[3]); if (!c_string_encoding(encoding)) invalid("C strings cannot be in a UTF-16 or UTF-32 encoding"); if (!a[2] || a[2] > limit) return std::uint64_t{0}; const auto out = encode(p->units, encoding, 0, false, a[2] - 1); if (out.units != p->units.size()) return std::uint64_t{0}; memory().write_bytes(a[1], out.bytes); memory().write8(a[1] + out.bytes.size(), 0); return std::uint64_t{1}; });
     install("CFStringGetBytes", 9, [this](auto a) { const auto p = payload<StringPayload>(a[0], ObjectKind::string); range(p->units.size(), a[1], a[2]); const auto out = encode(std::span(p->units).subspan(static_cast<std::size_t>(a[1]), static_cast<std::size_t>(a[2])), static_cast<std::uint32_t>(a[3]), static_cast<std::uint8_t>(a[4]), static_cast<std::uint8_t>(a[5]) != 0, a[6] ? count(a[7]) : UINT64_MAX); if (a[6]) memory().write_bytes(a[6], out.bytes); if (a[8]) memory().write64(a[8], out.bytes.size()); return out.units; });
-    install("CFStringGetMaximumSizeForEncoding", 2, [](auto a) { if (a[0] > INT64_MAX) return UINT64_MAX; std::uint64_t factor; switch (a[1]) { case ascii: case latin1: factor = 1; break; case utf8_encoding: factor = 3; break; case utf16: case utf16le: case utf16be: factor = 2; break; case utf32: case utf32le: case utf32be: factor = 4; break; default: invalid("unsupported string encoding"); } return a[0] > INT64_MAX / factor ? UINT64_MAX : a[0] * factor; });
+    install("CFStringGetMaximumSizeForEncoding", 2, [](auto a) { if (a[0] > INT64_MAX) return UINT64_MAX; std::uint64_t factor; switch (a[1]) { case ascii: case latin1: factor = 1; break; case utf8_encoding: factor = 3; break; case utf16: case utf16le: case utf16be: factor = 2; break; case utf32: case utf32le: case utf32be: factor = 4; break; default: factor = cf_encodings::max_bytes_per_unit(static_cast<std::uint32_t>(a[1])); if (!factor) invalid("unsupported string encoding"); } return a[0] > INT64_MAX / factor ? UINT64_MAX : a[0] * factor; });
     install("CFStringCompare", 3, [this](auto a) { const auto p = payload<StringPayload>(a[0], ObjectKind::string), q = payload<StringPayload>(a[1], ObjectKind::string); return static_cast<std::uint64_t>(static_cast<std::int64_t>(compare_strings(p->units, q->units, a[2]))); });
     // CFStringCompareWithOptions(string1, string2, CFRange rangeToCompare (of string1), options)
     install("CFStringCompareWithOptions", 5, [this](auto a) { const auto p = payload<StringPayload>(a[0], ObjectKind::string), q = payload<StringPayload>(a[1], ObjectKind::string); range(p->units.size(), a[2], a[3]); const std::vector<std::uint16_t> part(p->units.begin() + static_cast<std::ptrdiff_t>(a[2]), p->units.begin() + static_cast<std::ptrdiff_t>(a[2] + a[3])); return static_cast<std::uint64_t>(static_cast<std::int64_t>(compare_strings(part, q->units, a[4]))); });

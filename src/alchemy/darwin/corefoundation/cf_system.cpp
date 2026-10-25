@@ -96,12 +96,14 @@ void install_cf_system(Provider& p, CoreFoundation& cf) {
     auto& process = p.process();
     const std::string cf_library(core_foundation_library);
 
-    // SystemVersion.plist's keys and the dictionary of Alchemy's OS profile.
+    // SystemVersion.plist's keys and the dictionary of Alchemy's OS profile. The keys
+    // are SPI whose C names begin with an underscore (_kCFSystemVersionProductNameKey),
+    // so their Mach-O symbols have two.
     const std::array<std::pair<const char*, const char*>, 6> keys{{
-        {"_kCFSystemVersionProductNameKey", "ProductName"}, {"_kCFSystemVersionProductVersionKey", "ProductVersion"},
-        {"_kCFSystemVersionProductVersionExtraKey", "ProductVersionExtra"},
-        {"_kCFSystemVersionBuildVersionKey", "ProductBuildVersion"}, {"_kCFSystemVersionProductCopyrightKey", "ProductCopyright"},
-        {"_kCFSystemVersionProductUserVisibleVersionKey", "ProductUserVisibleVersion"}}};
+        {"__kCFSystemVersionProductNameKey", "ProductName"}, {"__kCFSystemVersionProductVersionKey", "ProductVersion"},
+        {"__kCFSystemVersionProductVersionExtraKey", "ProductVersionExtra"},
+        {"__kCFSystemVersionBuildVersionKey", "ProductBuildVersion"}, {"__kCFSystemVersionProductCopyrightKey", "ProductCopyright"},
+        {"__kCFSystemVersionProductUserVisibleVersionKey", "ProductUserVisibleVersion"}}};
     for (const auto& [name, value] : keys) {
         if (process.resolve(cf_library, name)) continue;
         const auto string = cf.string(value);

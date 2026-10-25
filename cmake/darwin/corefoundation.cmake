@@ -10,7 +10,8 @@
 # tests are in tests/.
 target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/corefoundation/object_store.cpp
-    src/alchemy/darwin/corefoundation/core_foundation.cpp)
+    src/alchemy/darwin/corefoundation/core_foundation.cpp
+    src/alchemy/darwin/corefoundation/cf_encodings.cpp)
 # Headless shells (darwin/foundation/headless_shells.hpp): alchemy.exe only; the
 # _fx twins in the GUI set below are empty, because there cf_preferences.cpp
 # and cf_locale.cpp own the names.
@@ -41,6 +42,28 @@ function(alchemy_darwin_corefoundation_tests)
     alchemy_gui_add_unit_test(alchemy_gui_corefoundation_additions src/alchemy/darwin/corefoundation/tests/cf_additions_tests.cpp TIMEOUT 120)
     # Chrome's CF additions (cf_string_clusters.cpp) over the full provider set.
     alchemy_gui_add_unit_test(alchemy_gui_corefoundation_string_clusters src/alchemy/darwin/corefoundation/tests/cf_string_clusters_tests.cpp TIMEOUT 180)
+    # CF strings (cf_strings.cpp) and the ICU encodings (cf_encodings.cpp) over the full provider set.
+    alchemy_gui_add_unit_test(alchemy_gui_corefoundation_strings src/alchemy/darwin/corefoundation/tests/cf_strings_tests.cpp TIMEOUT 180)
+    if(NOT ALCHEMY_GUI_FIXTURES_ENABLED)
+        return()
+    endif()
+    # A guest program for the results in x1 and d0 (CFRange lengths, doubles) and
+    # variadic CFStringAppendFormat, linked against its own CoreFoundation stub.
+    set(cf_install_name /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation)
+    alchemy_gui_object(cf_strings_fixture ../../../src/alchemy/darwin/corefoundation/tests/cf_strings_fixture.c)
+    alchemy_gui_object(cf_strings_link ../../../src/alchemy/darwin/corefoundation/tests/cf_strings_link.c)
+    add_custom_command(OUTPUT "${macos_dir}/cf_strings_link.dylib"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -dylib -install_name ${cf_install_name}
+            "${macos_dir}/cf_strings_link.o" -o "${macos_dir}/cf_strings_link.dylib"
+        DEPENDS "${macos_dir}/cf_strings_link.o" VERBATIM)
+    add_custom_command(OUTPUT "${macos_dir}/cf_strings_fixture"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main "${macos_dir}/cf_strings_fixture.o"
+            "${macos_dir}/cf_strings_link.dylib" "${macos_dir}/link_system.dylib" -o "${macos_dir}/cf_strings_fixture"
+        DEPENDS "${macos_dir}/cf_strings_fixture.o" "${macos_dir}/cf_strings_link.dylib" "${macos_dir}/link_system.dylib" VERBATIM)
+    add_custom_target(alchemy_gui_corefoundation_string_fixtures ALL DEPENDS "${macos_dir}/cf_strings_fixture")
+    add_dependencies(alchemy_gui_corefoundation_string_fixtures alchemy_personality_fixtures)
+    alchemy_gui_add_fixture_test(alchemy_gui_corefoundation_strings_fixture "${macos_dir}/cf_strings_fixture"
+        PROGRESS "Alchemy CF strings fixture: launched" COMPLETE "Alchemy CF strings fixture: complete")
 endfunction()
 alchemy_gui_register_tests(alchemy_darwin_corefoundation_tests)
 
@@ -52,4 +75,5 @@ alchemy_gui_add_framework_case(corefoundation_time_zones_and_uuids src/alchemy/d
 # Headless additions (both builds; darwin/headless_additions.hpp), moved from
 # darwin/identities/installer_frameworks.cpp:
 target_sources(alchemy_core PRIVATE
-    src/alchemy/darwin/corefoundation/strings_and_bundles.cpp)
+    src/alchemy/darwin/corefoundation/strings_and_bundles.cpp
+    src/alchemy/darwin/corefoundation/cf_strings.cpp)
