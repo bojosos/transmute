@@ -1218,6 +1218,7 @@ private:
     }
 
     std::uint32_t workgroup_size_id_{};
+    std::uint32_t raster_sample_count_id_{};   // get_num_samples()
     std::uint32_t workgroup_size() {
         if (!workgroup_size_id_) {
             const auto x = m_.spec_constant(t_u32(), reserved_spec_id::workgroup_size_x, {1});
@@ -2561,6 +2562,10 @@ private:
             return bind_ptr(v, {Space::workgroup, found->second, 0});
         }
         if (name == "__msl_fc_defined") return bind(v, function_constant_defined(static_cast<std::uint32_t>(const_int(ops[0]))));
+        if (name == "__msl_raster_sample_count") {
+            if (!raster_sample_count_id_) raster_sample_count_id_ = m_.spec_constant(t_u32(), reserved_spec_id::raster_sample_count, {1});
+            return bind(v, raster_sample_count_id_);
+        }
         if (name == "__msl_kernel_outside_grid") {
             const auto outside = kernel_outside_grid();
             if (v->type->is_int() && v->type->bits == 1) return bind(v, outside);

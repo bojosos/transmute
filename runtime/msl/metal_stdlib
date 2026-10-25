@@ -71,6 +71,10 @@
 #include "__msl/compute.h"
 #include "__msl/packed.h"
 #include "__msl/entry.h"
+// Apple's compiler takes as_type<T>() without the metal:: qualifier anywhere,
+// including inside templates written before any `using namespace metal`
+// (ANGLE's generated MSL does that).
+using metal::as_type;
 #endif
 
 #endif

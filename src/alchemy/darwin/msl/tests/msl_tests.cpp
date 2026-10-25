@@ -1077,6 +1077,16 @@ void test_reflection() {
         for (const std::uint32_t id : {3U, 4U, 6U}) require(ids.count(id) != 0, "ANGLE spec id " + std::to_string(id));
     }
     {
+        // ANGLE's program prelude: unqualified as_type<> in templates ahead of
+        // `using namespace metal`, and get_num_samples() as the reserved
+        // raster-sample-count specialization constant.
+        const auto r = compile_fixture("angle_helpers.metal");
+        const auto& f = function(r, "helpers_main");
+        require(f.reflection.writes_sample_mask, "ANGLE helpers: sample mask output");
+        require(spirv_spec_ids(f.spirv).count(msl::reserved_spec_id::raster_sample_count) != 0,
+                "get_num_samples() is the raster sample count specialization constant");
+    }
+    {
         const auto r = compile_fixture("tint_extras.metal");
         const auto& clip = function(r, "clip_vs");
         require(has_builtin(clip.reflection, Builtin::clip_distance) &&

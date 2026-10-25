@@ -69,8 +69,9 @@
 // VkSpecializationInfo data, other scalars their natural size).
 // Runtime sizes Vulkan needs at pipeline creation are specialization
 // constants with reserved ids (see reserved_spec_id): the kernel workgroup
-// size (threadsPerThreadgroup of the dispatch) and each [[threadgroup(n)]]
-// buffer's length (setThreadgroupMemoryLength:atIndex:, in bytes).
+// size (threadsPerThreadgroup of the dispatch), each [[threadgroup(n)]]
+// buffer's length (setThreadgroupMemoryLength:atIndex:, in bytes), and a
+// render pipeline's rasterSampleCount (get_num_samples()).
 //
 // ---- Threading and lifetime -----------------------------------------------------
 // compile, link and dump_source are thread-safe and reentrant (Metal compiles
@@ -122,6 +123,9 @@ inline constexpr std::uint32_t maximum_samplers = 16;
 namespace reserved_spec_id {
 inline constexpr std::uint32_t workgroup_size_x = 0x10000, workgroup_size_y = 0x10001, workgroup_size_z = 0x10002;
 inline constexpr std::uint32_t threadgroup_memory_base = 0x10010;   // + [[threadgroup(n)]] index: length in bytes
+// metal::get_num_samples(): the render pipeline's rasterSampleCount (uint,
+// default 1). Render pipelines specialize it in every stage.
+inline constexpr std::uint32_t raster_sample_count = 0x10003;
 // + [[function_constant(index)]] index: bool, true when the pipeline provides a
 // value for that constant (is_function_constant_defined). Default false.
 inline constexpr std::uint32_t function_constant_defined_base = 0x20000;

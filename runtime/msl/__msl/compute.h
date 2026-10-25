@@ -131,5 +131,7 @@ template<typename T, enable_if_t<!__is_packed<T>::value, int> = 0> inline T dfdx
 template<typename T, enable_if_t<!__is_packed<T>::value, int> = 0> inline T dfdy(T x) { return T(__msl_deriv(__SPV_DPdy, __raw(x))); }
 template<typename T, enable_if_t<!__is_packed<T>::value, int> = 0> inline T fwidth(T x) { return T(__msl_deriv(__SPV_Fwidth, __raw(x))); }
 inline void discard_fragment() { __msl_discard(); }
+// The render pipeline's rasterSampleCount (fragment functions).
+inline uint get_num_samples() { return __msl_raster_sample_count(); }
 
 } // namespace metal

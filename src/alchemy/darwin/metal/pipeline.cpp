@@ -424,6 +424,10 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted) {
     for (const auto& [id, bytes] : descriptor.vertex->constants) vertex_constants.add(id, bytes.data(), bytes.size());
     if (descriptor.fragment)
         for (const auto& [id, bytes] : descriptor.fragment->constants) fragment_constants.add(id, bytes.data(), bytes.size());
+    // metal::get_num_samples() in either stage.
+    const std::uint32_t samples = std::max(1U, descriptor.sample_count);
+    vertex_constants.add(msl::reserved_spec_id::raster_sample_count, &samples, 4);
+    fragment_constants.add(msl::reserved_spec_id::raster_sample_count, &samples, 4);
     VkPipelineShaderStageCreateInfo shader_stages[2]{};
     shader_stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     shader_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;

@@ -79,6 +79,9 @@ __local void* __msl_threadgroup_storage(uint id, ulong size, uint align) __attri
 __local void* __msl_threadgroup_param(uint index) __attribute__((const));
 // is_function_constant_defined(name) for [[function_constant(index)]].
 bool __msl_fc_defined(uint index) __attribute__((const));
+// get_num_samples(): the render pipeline's raster sample count (a
+// specialization constant, compiler.hpp reserved_spec_id::raster_sample_count).
+uint __msl_raster_sample_count() __attribute__((const));
 // Kernels: true for a thread outside a non-uniform dispatchThreads: grid
 // (kernel grid push constants, compiler.hpp); the wrapper returns at entry.
 bool __msl_kernel_outside_grid() __attribute__((const));

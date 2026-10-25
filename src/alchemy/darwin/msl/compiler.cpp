@@ -172,7 +172,7 @@ std::string compiler_version() {
     // and the front end's version are folded in automatically.
     static const std::string value = [] {
         std::ostringstream out;
-        out << "alchemy-msl 6 stdlib-" << std::hex << detail::stdlib_fingerprint();
+        out << "alchemy-msl 7 stdlib-" << std::hex << detail::stdlib_fingerprint();
         const auto& tools = toolchain();
         if (tools.available) out << ' ' << tools.version;
         return out.str();
