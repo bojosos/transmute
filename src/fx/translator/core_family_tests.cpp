@@ -498,6 +498,25 @@ FX_TEST(core_rbit_clz_fusion) {
     }
 }
 
+// Two RBIT/CLZ pairs interleaved, as dav1d's ctz(width) + ctz(height) in its
+// CfL AC functions (rbit w9, w5; rbit w10, w6; clz w9, w9; clz w10, w10): the
+// second RBIT must not take over the first one's pending fusion (the first
+// CLZ then counted the leading zeros of a register its RBIT never wrote).
+FX_TEST(core_rbit_clz_interleaved) {
+    auto& r = runner();
+    using namespace a64;
+    Rng rng(92);
+    int failures = 0;
+    for (unsigned k = 0; k < 1000 && failures < 6; ++k) {
+        const bool sf = rng.chance(50);
+        const unsigned xa = rng.pick(kDest), xb = rng.pick(kDest), na = rng.pick(kSrc), nb = rng.pick(kSrc);
+        std::vector<std::uint32_t> prog{dp1(sf, 0, na, xa), dp1(sf, 0, nb, xb), dp1(sf, 4, xa, xa), dp1(sf, 4, xb, xb)};
+        if (rng.chance(50)) std::swap(prog[2], prog[3]);
+        prog.push_back(add_shift(true, false, false, 0, xb, 0, xa, rng.pick(kDest)));
+        if (!r.run(prog, r.context(7500 + k), "rbit/clz interleaved " + std::to_string(k))) ++failures;
+    }
+}
+
 // Indirect branches look the target up inline (ctx->arena_base set by the
 // test machine): after the first miss per target, BLR/BR/RET-misses reach the
 // target region without a dispatcher round trip.

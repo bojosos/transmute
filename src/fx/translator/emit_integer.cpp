@@ -1284,7 +1284,10 @@ std::int32_t RegionEmitter::rbit_clz_target(const Inst& d) const {
 void RegionEmitter::e_dp1(const Inst& d) {
     const unsigned bits = d.sf ? 64 : 32;
     if (d.op == dp1_rbit) {
-        if (const auto j = rbit_clz_target(d); j >= 0) {
+        // One fusion at a time: a second RBIT before the first one's CLZ (two
+        // ctz idioms interleaved) is emitted plainly, or it would take over
+        // the pending CLZ and leave the first RBIT's register unwritten.
+        if (const auto j = tz_clz_ < 0 ? rbit_clz_target(d) : -1; j >= 0) {
             tz_clz_ = j;   // emitted by the CLZ as TZCNT of Xn
             tz_src_ = static_cast<std::uint8_t>(d.rn);
             return;
