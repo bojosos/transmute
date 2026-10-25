@@ -8,7 +8,9 @@
 // sharing a desktop with input tests) cannot cover or intercept anything on
 // the real desktop. Capture pixels through the present/backing-store capture
 // paths, never from the screen. Owner of this file: qt-vfb; hooked from
-// Win32WindowServer::create_window.
+// Win32WindowServer::create_window. A cloaked run also turns off window
+// ghosting (Win32WindowServer's initialisation): a hung guest's ghost window
+// is the shell's, not cloaked, and shows the window's last contents.
 
 #include <windows.h>
 

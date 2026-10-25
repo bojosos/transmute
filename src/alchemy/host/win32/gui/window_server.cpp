@@ -230,6 +230,10 @@ void Win32WindowServer::ensure_initialized() const {
     window_class.lpszClassName = window_class_name;
     window_class_ = RegisterClassExW(&window_class);
     if (window_class_ == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) fail_win32("RegisterClassEx");
+    // A cloaked run is not ghosted either: when a window stops pumping
+    // messages for about 5 s, the shell puts an uncloaked "(Not Responding)"
+    // copy of it, last contents included, on the real desktop.
+    if (gui_cloak_requested()) DisableProcessWindowsGhosting();
     // The hidden application window: clipboard owner and receiver of the
     // broadcasts that have no window (display and setting changes, session
     // end).
