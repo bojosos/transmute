@@ -557,7 +557,10 @@ FX_TEST(core_inline_indirect_lookup) {
 FX_TEST(core_inline_lookup_miss_pc) {
     auto& r = runner();
     using namespace a64;
-    for (const std::uint64_t target : {0x1000ull, 0x3ffffcull, 0x1002ull, 0x7fff00001234ull, 0x7fff00001233ull}) {
+    // Misaligned targets next to an installed entry (the program's own) miss too.
+    const std::uint64_t program = r.program_base();
+    for (const std::uint64_t target : {0x1000ull, 0x3ffffcull, 0x1002ull, 0x7fff00001234ull, 0x7fff00001233ull,
+                                       program + 2, program + 1, program + 3}) {
         for (const bool inline_lookup : {true, false}) {
             r.machine.inline_lookup = inline_lookup;
             r.machine.reset();

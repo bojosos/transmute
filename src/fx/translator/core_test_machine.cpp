@@ -19,6 +19,14 @@ namespace transmute::fx::coretest {
 using x64::Gp;
 using x64::ptr;
 
+namespace {
+
+constexpr std::uint64_t kLookupMask = (std::uint64_t{1} << kLookupIndexBits) - 1;
+constexpr std::size_t kLookupBytes = (kLookupMask + 1) * sizeof(std::uint64_t);
+std::size_t lookup_slot(std::uint64_t pc) { return static_cast<std::size_t>(((pc >> 2) ^ (pc >> kLookupTagShift)) & kLookupMask); }
+
+} // namespace
+
 bool BufferCode::read(std::uint64_t address, std::uint32_t& word) const {
     if (address < begin_ || address + 4 > end_ || (address & 3) != 0) return false;
     std::memcpy(&word, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), 4);
@@ -54,6 +62,8 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
     arena_ = static_cast<std::uint8_t*>(
         VirtualAlloc(nullptr, size_, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!arena_) throw std::runtime_error("TestMachine: cannot allocate code arena");
+    lookup_ = static_cast<std::uint64_t*>(VirtualAlloc(nullptr, kLookupBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!lookup_) throw std::runtime_error("TestMachine: cannot allocate the lookup table");
     helpers_[helper_interpret_one] = reinterpret_cast<const void*>(&helper_interpret);
 
     x64::Assembler a;
@@ -78,6 +88,14 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
     const auto indirect = a.size();
     store_globals();
     a.mov(32, ptr(Gp::r15, exit_reason), static_cast<std::int32_t>(ExitReason::lookup_miss));
+    a.jmp(ret_label);
+    // Table shadow miss (rcx = target, rdx = index), as the runtime's.
+    a.align(16);
+    const auto shadow_miss = a.size();
+    a.mov(64, ptr(Gp::r15, ctx_disp(offsetof(GuestContext, pc))), Gp::rcx);
+    a.mov(64, ptr(Gp::r15, exit_arg), Gp::rdx);
+    store_globals();
+    a.mov(32, ptr(Gp::r15, exit_reason), static_cast<std::int32_t>(ExitReason::table_shadow));
     a.jmp(ret_label);
     // enter(rcx = biased context, rdx = host code)
     a.align(16);
@@ -115,7 +133,6 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
     store_globals();
     a.jmp(ret_label);
     a.finalize();
-    lookup_.assign(kLookupSlots, 0);
     auto* stubs = allocate(a.size());
     if (stubs != arena_) throw std::logic_error("TestMachine: stubs must start the arena");
     std::memcpy(stubs, a.data(), a.size());
@@ -123,16 +140,20 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
     stub_link_ = stubs + link_stub;
     stub_indirect_ = stubs + indirect;
     stub_exit_ = stubs + dispatch_exit;
+    stub_shadow_miss_ = stubs + shadow_miss;
+    empty_shadow_ = make_shadow();
     stubs_end_ = used_;
 }
 
 TestMachine::~TestMachine() {
     if (arena_) VirtualFree(arena_, 0, MEM_RELEASE);
+    if (lookup_) VirtualFree(lookup_, 0, MEM_RELEASE);
 }
 
 void TestMachine::reset() {
+    for (const auto& e : entries_) lookup_[lookup_slot(e.first)] = 0;   // every installed slot has its entry
     entries_.clear();
-    std::fill(lookup_.begin(), lookup_.end(), 0);
+    shadows_.clear();
     regions.clear();
     used_ = stubs_end_;
 }
@@ -151,13 +172,26 @@ void TestMachine::prepare(GuestContext& ctx) const {
     ctx.stub_indirect_live = stub_indirect_;   // only translated code jumps there
     ctx.stub_host_return = nullptr;            // no host entries
     ctx.stub_dispatch_exit = stub_exit_;
-    // Inline indirect-branch lookups (same encoding as the runtime). Without
-    // them, a one-slot table whose tag no pc has: every lookup misses.
-    static const std::uint64_t never[1] = {0xffffffff00000000ULL};
-    ctx.lookup_table = inline_lookup ? lookup_.data() : never;
-    ctx.lookup_mask = inline_lookup ? kLookupSlots - 1 : 0;
+    // Inline indirect-branch lookups (same size and encoding as the runtime).
+    // Without them, an empty table: every lookup misses (a target below
+    // 4 MiB through the miss stub at arena offset 0).
+    static const auto* const never = static_cast<const std::uint64_t*>(
+        VirtualAlloc(nullptr, kLookupBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY));
+    ctx.lookup_table = inline_lookup ? lookup_ : never;
+    ctx.lookup_mask = kLookupMask;
     ctx.arena_base = arena_;
+    ctx.table_shadow_base = 0;
+    ctx.table_shadow = empty_shadow_.data() + 1;
+    ctx.table_shadow_retry = table_shadows ? 1u : ~0u;
     for (unsigned i = 0; i < kHelperSlots; ++i) ctx.helpers[i] = helpers_[i];
+}
+
+std::vector<std::uint64_t> TestMachine::make_shadow() const {
+    std::vector<std::uint64_t> s(1 + 3 * kTableShadowSlots, 0);
+    const auto miss = reinterpret_cast<std::uint64_t>(stub_shadow_miss_);
+    s[0] = miss;
+    std::fill(s.begin() + 1 + kTableShadowSlots, s.end(), miss);
+    return s;
 }
 
 const void* TestMachine::entry_for(std::uint64_t pc, const CodeSource& code) {
@@ -175,10 +209,16 @@ const void* TestMachine::install(TranslatedRegion region, bool replace) {
     std::memcpy(host, region.code.data(), region.code.size());
     // Fixups are identity in the JIT: the values are already absolute.
     for (const auto& e : region.entries) {
+        if (const auto it = entries_.find(e.guest_pc); replace && it != entries_.end()) {
+            // Shadow slots of the replaced entry miss again (the runtime scrubs them in lookup_remove).
+            const auto old = reinterpret_cast<std::uint64_t>(it->second);
+            for (auto& [base, s] : shadows_)
+                for (std::size_t i = 0; i < kTableShadowSlots; ++i)
+                    if (s[1 + kTableShadowSlots + i] == old) s[1 + kTableShadowSlots + i] = s[0];
+        }
         if (replace) entries_[e.guest_pc] = host + e.offset;
         else entries_.emplace(e.guest_pc, host + e.offset);
-        const auto slot = ((e.guest_pc >> 2) ^ (e.guest_pc >> kLookupTagShift)) & (kLookupSlots - 1);
-        lookup_[slot] = ((e.guest_pc >> kLookupTagShift) << 32) | static_cast<std::uint32_t>(host + e.offset - arena_);
+        lookup_[lookup_slot(e.guest_pc)] = ((e.guest_pc >> kLookupTagShift) << 32) | static_cast<std::uint32_t>(host + e.offset - arena_);
     }
     FlushInstructionCache(GetCurrentProcess(), host, region.code.size());
     regions.push_back(std::move(region));
@@ -221,6 +261,28 @@ RunResult TestMachine::run(GuestContext& ctx, const CodeSource& code, std::uint6
             break;
         }
         case ExitReason::lookup_miss: ++r.lookups; break;
+        case ExitReason::table_shadow: {
+            // As the runtime (table_shadow_miss): the shadow of the thread's
+            // table becomes its own, and the slot gets the target's entry.
+            ++r.shadow_misses;
+            auto& s = shadows_[ctx.table_shadow_base];
+            if (s.empty()) s = make_shadow();
+            ctx.table_shadow = s.data() + 1;
+            ctx.table_shadow_retry = kTableShadowRetry;
+            const auto index = ctx.exit_arg;
+            const auto before2 = regions.size();
+            const auto* host = index < kTableShadowSlots && ctx.pc != stop_pc ? entry_for(ctx.pc, code) : nullptr;
+            r.translations += static_cast<unsigned>(regions.size() - before2);
+            auto* pcs = s.data() + 1;
+            if (host && (pcs[index] == 0 || pcs[index] == ctx.pc)) {
+                pcs[kTableShadowSlots + index] = reinterpret_cast<std::uint64_t>(host);
+                if (pcs[index] == 0) {
+                    pcs[index] = ctx.pc;
+                    pcs[2 * kTableShadowSlots + index] = reinterpret_cast<std::uint64_t>(arena_);   // the lookup's miss
+                }
+            }
+            break;
+        }
         case ExitReason::interpret:
             ++r.interprets;
             try {

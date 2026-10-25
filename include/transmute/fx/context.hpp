@@ -55,6 +55,11 @@ enum class ExitReason : std::uint32_t {
     // = the loop header, state flushed. The runtime may retranslate the
     // region at exit_arg (optimized), then re-dispatches ctx->pc.
     tier_up_loop = 11,
+    // (additive, translator core) A table shadow slot missed (see
+    // GuestContext::table_shadow): ctx->pc = the BR's target, exit_arg = the
+    // table index, state flushed. The runtime fills the slot in the shadow of
+    // ctx->table_shadow_base, then re-dispatches ctx->pc.
+    table_shadow = 12,
 };
 
 // A return-stack-buffer entry pushed by translated BL/BLR. A RET whose target
@@ -138,6 +143,18 @@ struct alignas(64) GuestContext {
     // loads the convention registers, then jmp [r15 + rdx + rsb + 8].
     // nullptr: no convention (jump to the RSB entry directly).
     const void* stub_host_return;
+    // ---- appended (translator core: table shadows) -------------------------
+    // A BR whose target was loaded by `ldr xT, [xB, xI, lsl #3]` from a table
+    // the translator cannot read (a heap dispatch table, an interpreter's)
+    // first tries the runtime's shadow of the table at xB: kTableShadowSlots
+    // guest targets, then their host entries, then their miss stubs
+    // (fx/runtime/runtime.hpp), so the index finds the entry without hashing.
+    // This thread's shadow is that of the table at table_shadow_base; a BR on
+    // another table counts table_shadow_retry down and, at zero, stores its
+    // base there and takes the shadow's miss stub (at table_shadow[-1]).
+    std::uint64_t table_shadow_base;
+    const std::uint64_t* table_shadow;
+    std::uint32_t table_shadow_retry;
 };
 
 // Region exits may leave NZCV in the translator's raw form: the low 16 bits

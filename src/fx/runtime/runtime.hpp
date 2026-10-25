@@ -13,7 +13,7 @@ namespace transmute::fx {
 // ---- lookup table encoding --------------------------------------------------
 // Translated code may inline stub_indirect using this encoding:
 //   tag   = pc >> kLookupTagShift
-//   index = ((pc >> 2) ^ tag) & ctx->lookup_mask
+//   index = ((pc >> 2) ^ tag) & (2^kLookupIndexBits - 1)  (also ctx->lookup_mask)
 //   entry = ctx->lookup_table[index]                (one aligned 8-byte load)
 //   hit   = (pc & 3) == 0 && (entry >> 32) == tag   (compare the full 64-bit tag)
 //   host  = runtime_arena_base() + (std::uint32_t)entry
@@ -24,6 +24,19 @@ namespace transmute::fx {
 inline constexpr unsigned kLookupIndexBits = 20;
 inline constexpr unsigned kLookupTagShift = kLookupIndexBits + 2;
 const void* runtime_arena_base() noexcept;
+
+// ---- table shadows (GuestContext::table_shadow) ---------------------------------
+// A shadow is kTableShadowSlots guest pcs, then as many host entries, then as
+// many miss targets; the word before the pcs holds its miss stub. For a BR to
+// rcx = table[rdx] (rdx < kTableShadowSlots) on this thread's table:
+//   if (pc[rdx] == rcx) jmp host[rdx]; else jmp miss[rdx]
+// with the cross-region convention registers live and rcx, rdx kept. An empty
+// slot's miss target is the miss stub (fills the slot, ExitReason::table_shadow),
+// a filled slot's is a stub that takes the inline lookup's path for rcx. A slot's
+// pc never changes once set (its host entry may: stores host first, then pc),
+// so a reader that sees the pc sees a host entry that was valid for it.
+inline constexpr unsigned kTableShadowSlots = 1024;
+inline constexpr std::uint32_t kTableShadowRetry = 4096;   // BRs on other tables before a switch
 
 // ---- FP control mapping -------------------------------------------------------
 // Delegates to emit_fp.hpp (fp_mxcsr_for_state / fp_read_fpsr), the single

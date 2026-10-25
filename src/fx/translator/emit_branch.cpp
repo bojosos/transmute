@@ -18,8 +18,8 @@ using x64::ptr;
 // BR/BLR/RET-miss site has its own predicted `jmp`. Misses and misaligned
 // targets store ctx->pc and take stub_indirect_live. A hit on an empty slot
 // (a target below 4 MiB) lands in the miss stub at arena offset 0, which
-// stores rcx as ctx->pc itself. Contexts without an inline lookup (tests)
-// give a table whose slots never match. Clobbers rax, rdx, r9 and EFLAGS.
+// stores rcx as ctx->pc itself. The table has the runtime's fixed size
+// (ctx->lookup_mask is not read). Clobbers rax, rdx, r9 and EFLAGS.
 void RegionEmitter::emit_indirect_jump() {
     const auto stub = a_.new_label();
     a_.test(8, Gp::rcx, 3);
@@ -29,7 +29,7 @@ void RegionEmitter::emit_indirect_jump() {
     a_.mov(32, Gp::rdx, Gp::rcx);
     a_.shr(32, Gp::rdx, 2);
     a_.xor_(32, Gp::rdx, Gp::rax);
-    a_.alu(x64::Alu::and_, 32, Gp::rdx, ctx_mem(offsetof(GuestContext, lookup_mask)));
+    a_.and_(32, Gp::rdx, static_cast<std::int32_t>((1u << kLookupIndexBits) - 1));
     a_.mov(64, Gp::r9, ctx_mem(offsetof(GuestContext, lookup_table)));
     a_.mov(64, Gp::rdx, ptr(Gp::r9, Gp::rdx, 8));                      // entry = tag:offset
     a_.mov(64, Gp::r9, Gp::rdx);
@@ -320,6 +320,51 @@ void RegionEmitter::patch_host_tables() {
     }
 }
 
+// BR to xT = [xB + xI * 8] on a table the plan could not read (a heap
+// dispatch table): the runtime's shadow of the table maps the index to the
+// host entry of the target it holds (GuestContext::table_shadow,
+// fx/runtime/runtime.hpp). rcx = target, rdx = index, r9 = base:
+//   cmp rdx, kTableShadowSlots; jae lookup
+//   cmp r9, [table_shadow_base]; jne other
+//   mov rax, [table_shadow]
+//   cmp rcx, [rax + rdx*8]; jne miss
+//   jmp [rax + rdx*8 + host]           ; the slot holds this target
+// miss: jmp [rax + rdx*8 + miss]       ; empty: the runtime fills it; else the lookup
+// other: another table. Every kTableShadowRetry of those, it becomes this
+// thread's table (the miss stub switches the shadow); else the inline lookup.
+void RegionEmitter::e_shadow_branch(const PlanInst& pi) {
+    take(Gp::rax);
+    take(Gp::rcx);
+    take(Gp::rdx);
+    take(Gp::r9);
+    materialize_state(flags_, false);   // clobbers rax only
+    flags_ = FlagsState::ctx;
+    load(64, Gp::rcx, val(pi.inst.rn));                                                    // target
+    load(pi.shadow_index32 ? 32 : 64, Gp::rdx, val(static_cast<unsigned>(pi.shadow_index)));   // index
+    load(64, Gp::r9, val(static_cast<unsigned>(pi.shadow_base)));                          // table
+    exit_pins(current_dirty());
+    constexpr std::int32_t kHost = kTableShadowSlots * 8, kMiss = 2 * kTableShadowSlots * 8;
+    const auto lookup = a_.new_label(), other = a_.new_label(), miss = a_.new_label();
+    a_.cmp(64, Gp::rdx, static_cast<std::int32_t>(kTableShadowSlots));
+    a_.jcc(Cond::ae, lookup);
+    a_.cmp(64, Gp::r9, ctx_mem(offsetof(GuestContext, table_shadow_base)));
+    a_.jcc(Cond::ne, other);
+    a_.mov(64, Gp::rax, ctx_mem(offsetof(GuestContext, table_shadow)));
+    a_.cmp(64, Gp::rcx, ptr(Gp::rax, Gp::rdx, 8));
+    a_.jcc_short(Cond::ne, miss);
+    a_.jmp(ptr(Gp::rax, Gp::rdx, 8, kHost));
+    a_.bind(miss);
+    a_.jmp(ptr(Gp::rax, Gp::rdx, 8, kMiss));
+    a_.bind(other);
+    a_.alu(x64::Alu::sub, 32, ctx_mem(offsetof(GuestContext, table_shadow_retry)), 1);
+    a_.jcc(Cond::ne, lookup);
+    a_.mov(64, ctx_mem(offsetof(GuestContext, table_shadow_base)), Gp::r9);
+    a_.mov(64, Gp::rax, ctx_mem(offsetof(GuestContext, table_shadow)));
+    a_.jmp(ptr(Gp::rax, -8));   // the miss stub
+    a_.bind(lookup);
+    emit_indirect_jump();
+}
+
 void RegionEmitter::e_indirect(const PlanInst& pi) {
     const auto& d = pi.inst;
     if (pi.inline_ret) {   // RET X30 of an inlined callee: x30 == link_pc here
@@ -328,6 +373,10 @@ void RegionEmitter::e_indirect(const PlanInst& pi) {
     }
     if (pi.table >= 0) {
         e_table_branch(pi);
+        return;
+    }
+    if (pi.shadow_base >= 0) {
+        e_shadow_branch(pi);
         return;
     }
     // Plan::cold_layout: RET compares a pinned target register (x30's

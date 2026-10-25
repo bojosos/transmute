@@ -44,6 +44,7 @@ struct RunResult {
     unsigned interprets{};
     unsigned interrupts{};
     unsigned tier_ups{};
+    unsigned shadow_misses{};   // ExitReason::table_shadow
 };
 
 class TestMachine {
@@ -69,6 +70,7 @@ public:
 
     bool link = true;
     bool inline_lookup = true;   // false: ctx->lookup_table never matches (every indirect branch exits)
+    bool table_shadows = true;   // false: no table becomes a thread's (GuestContext::table_shadow)
     TranslateOptions options;
     std::vector<TranslatedRegion> regions;
     void set_helper(unsigned id, const void* fn) { helpers_[id] = fn; }
@@ -84,8 +86,14 @@ private:
     const void* stub_exit_{};
     const void* helpers_[kHelperSlots]{};
     std::unordered_map<std::uint64_t, const void*> entries_;
-    static constexpr std::uint64_t kLookupSlots = 4096;
-    std::vector<std::uint64_t> lookup_;
+    std::uint64_t* lookup_{};   // the runtime's size and encoding (fx/runtime/runtime.hpp)
+    // Table shadows as the runtime keeps them (fx/runtime/table_shadow.cpp):
+    // [miss stub] pcs hosts misses, by table base. Filled slots miss to the
+    // stub at arena offset 0 (the lookup's miss: ExitReason::lookup_miss).
+    const void* stub_shadow_miss_{};
+    std::vector<std::uint64_t> empty_shadow_;
+    std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> shadows_;
+    std::vector<std::uint64_t> make_shadow() const;
 };
 
 // Fresh context for tests: random_context(seed) with the stack pointer,

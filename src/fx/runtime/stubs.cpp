@@ -212,6 +212,22 @@ void generate_stubs() {
         a.jmp(indirect);
     }
 
+    // ---- table shadows (runtime.hpp): rcx = target, rdx = index ----------------
+    // miss: an empty slot (or another table's BR switching this thread's shadow).
+    a.align(16);
+    const auto shadow_miss_offset = a.size();
+    a.mov(64, ptr(Gp::r15, kPc), Gp::rcx);
+    a.mov(64, ptr(Gp::r15, kExitArg), Gp::rdx);
+    store_globals(a);
+    a.mov(32, ptr(Gp::r15, kExitReason), static_cast<std::int32_t>(ExitReason::table_shadow));
+    a.jmp(dispatch_exit);
+    // lookup: a slot that holds another target; rcx takes the lookup.
+    a.align(16);
+    const auto shadow_lookup_offset = a.size();
+    a.mov(64, ptr(Gp::r15, kPc), Gp::rcx);
+    store_globals(a);
+    a.jmp(indirect);
+
     // ---- link --------------------------------------------------------------
     a.align(16);
     const auto link_offset = a.size();
@@ -374,6 +390,8 @@ void generate_stubs() {
     g_stubs.dispatch_exit_live = base + exit_live_offset;
     g_stubs.host_return = globals ? base + host_return_offset : nullptr;
     g_stubs.link = base + link_offset;
+    g_stubs.table_shadow_miss = base + shadow_miss_offset;
+    g_stubs.table_shadow_lookup = base + shadow_lookup_offset;
     g_stubs.return_to_host = base + return_offset;
     g_stubs.rsb_redispatch = base + rsb_offset;
     g_stubs.interpret_pc = base + interpret_offset;

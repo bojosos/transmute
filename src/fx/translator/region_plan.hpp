@@ -70,6 +70,13 @@ struct PlanInst {
     // index into Plan::tables, else -1. The BR keeps Flow::indirect (its
     // fallback is an indirect exit); its table targets are internal edges.
     std::int32_t table{-1};
+    // A BR to xT loaded by `ldr xT, [xB, xI, lsl #3]` (or `uxtw #3`) from a
+    // table that is not a label table (GuestContext::table_shadow): xB and xI,
+    // unchanged up to the BR, else -1. The target is compared, so they only
+    // decide how fast the BR is.
+    std::int8_t shadow_base{-1};
+    std::int8_t shadow_index{-1};
+    bool shadow_index32{};            // uxtw #3: the index is wI
 };
 
 // A BR whose target comes from a jump table (MSVC ARM64 switch lowering):
@@ -268,6 +275,9 @@ struct PlanOverrides {
     bool align_loops{};
     bool align_hot{};                 // hotalign: tier-2 regions align loop headers of any size
     bool align32{};                   // align32: loop headers aligned to 32 bytes, not 16
+    // TRANSMUTE_FX_CORE=noshadows: BRs through heap tables take the inline
+    // lookup only (no table shadow, PlanInst::shadow_base).
+    bool no_shadows{};
 };
 
 struct FamilyTable {

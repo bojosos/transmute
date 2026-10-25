@@ -1025,6 +1025,14 @@ bool has_host_entry(std::uint64_t pc) {
     return entry && !entry->region;
 }
 
+bool with_map_entry(std::uint64_t pc, void (*fn)(const void* host, void* arg), void* arg) {
+    TimedShared lock(g.map);
+    const MapEntry* entry = g.entries.find(pc);
+    if (!entry) return false;
+    fn(entry->host, arg);
+    return true;
+}
+
 const void* find_entry(std::uint64_t pc) {
     if (const void* host = lookup_probe(pc)) return host;
     TimedShared lock(g.map);
@@ -2275,7 +2283,7 @@ void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void*
 // an ordinary Win64 call that keeps them (and the arena's generic unwind
 // entry covers it). It is installed without an adapter; the callback's own
 // entry, behind its adapter, is the fallback.
-//   lea rcx, [ctx]; mov rax, leaf; call rax; test al, al; jz fallback
+//   [mov [x31], sp's host]; lea rcx, [ctx]; mov rax, leaf; call rax; test al, al; jz fallback
 //   RSB top == x30 ? pop, jmp entry : pc = x30, jmp [stub_indirect_live]
 void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user) {
     using x64::Gp;
@@ -2284,9 +2292,9 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback call
     const auto field = [](std::size_t offset) { return ptr(Gp::r15, ctx_disp(offset)); };
     const std::int32_t rsb = ctx_disp(offsetof(GuestContext, rsb));
     const auto& conv = translator_register_convention();
-    if ((conv.guest_mask & 0xffu) != 0) {
-        // Argument registers live in convention hosts (TRANSMUTE_FX_GLOBALS): their
-        // context slots are stale where the leaf would read them. The callback alone.
+    if ((conv.guest_mask & 0x3ffu) != 0) {
+        // x0..x9 live in convention hosts (TRANSMUTE_FX_GLOBALS): their context
+        // slots are stale where the leaf would read them. The callback alone.
         rt::install_host_entry(guest_pc, host_callback_code(callback, user));
         return;
     }
@@ -2298,6 +2306,8 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback call
     const int lr_host = (conv.guest_mask >> 30) & 1u ? conv.host[30] : -1;
     x64::Assembler a(128);
     const x64::Label slow = a.new_label(), miss = a.new_label(), data = a.new_label();
+    if ((conv.guest_mask >> 31) & 1u)   // sp for the leaf (Darwin's stack probe)
+        a.mov(64, ptr(Gp::r15, x_disp(31)), x64::gp(static_cast<unsigned>(conv.host[31])));
     a.lea(64, Gp::rcx, ptr(Gp::r15, -kContextBias));
     a.mov_imm64(Gp::rax, reinterpret_cast<std::uint64_t>(leaf));
     a.call(Gp::rax);

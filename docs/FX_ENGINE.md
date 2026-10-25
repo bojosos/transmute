@@ -208,6 +208,21 @@ aliased, duplicated or cut: its written pages exist only in it.
     the instruction limit, so an interpreter loop is one region.
     `TRANSMUTE_FX_CORE=notables` disables it, `tableexits` keeps the table but
     makes every entry a direct exit; `TRANSMUTE_FX_TRACE_TABLES=1` prints BRs.
+  - Table shadows: a BR to `ldr xT, [xB, xI, lsl #3]` (or `uxtw #3`, also
+    through register copies: V8's `mov x17, xT; br x17`) from a
+    table that is not a label table (V8's Ignition dispatch table, in the
+    heap) checks the runtime's shadow of the table at xB
+    (`GuestContext::table_shadow`, fx/runtime/runtime.hpp, table_shadow.cpp):
+    `pc[xI] == xT` jumps to `host[xI]` (about seven instructions, one small
+    table instead of the 8 MiB lookup table), else to `miss[xI]`: an empty
+    slot exits (`ExitReason::table_shadow`) and the runtime fills it with the
+    target's entry, a slot holding another target takes the inline lookup.
+    Each thread has one shadow at a time (`table_shadow_base`); BRs on another
+    table take the inline lookup and switch the thread's shadow every
+    4096 of them. A slot's pc is set once (its host entry first), host
+    entries are scrubbed back to the miss stub when their entry dies
+    (`lookup_remove`), and the target is always compared, so the guest table
+    may change. `TRANSMUTE_FX_CORE=noshadows` disables them.
   - BL/BLR push the RSB entry `{return pc, lea of the continuation entry}`.
     RET compares x30 with the top entry and jumps directly on a hit.
   - Interpret: `mov [r15+pc],imm`; exit_reason = interpret;

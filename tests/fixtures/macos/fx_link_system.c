@@ -62,3 +62,4 @@ void* memset(void* d, int c, unsigned long n) { (void)c; (void)n; return d; }
 void bzero(void* d, unsigned long n) { (void)d; (void)n; }
 int memcmp(const void* x, const void* y, unsigned long n) { (void)x; (void)y; (void)n; return -777; }
 unsigned long strlen(const char* s) { (void)s; return 0; }
+void __chkstk_darwin(void) {}

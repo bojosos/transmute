@@ -10,6 +10,7 @@ fx_add_library(fx_runtime
     ${CMAKE_CURRENT_LIST_DIR}/runtime.cpp
     ${CMAKE_CURRENT_LIST_DIR}/shared_memory.cpp
     ${CMAKE_CURRENT_LIST_DIR}/stubs.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/table_shadow.cpp
     ${CMAKE_CURRENT_LIST_DIR}/threads.cpp
     ${CMAKE_CURRENT_LIST_DIR}/veh.cpp
 )

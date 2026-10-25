@@ -113,16 +113,16 @@ void register_host_entry(std::uint64_t guest_pc, const void* host_code);
 using HostCallback = void (*)(GuestContext& ctx, void* user);
 void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void* user);
 // A leaf in front of a host callback, for calls that only read and write
-// integer argument and result registers (x0..x7 in ctx) and guest memory:
-// `leaf(ctx)` is called straight from translated code, without the FP
-// handoff, and with the cross-region convention registers still in their
-// host registers (a Win64 callee keeps them) -- so their context slots,
-// ctx.pc, x30's slot and the FP state are not current, and the leaf must not
-// read them, change MXCSR, call guest code, raise or exit. If it returns
-// true, execution continues at x30 (the return address). If it returns
-// false it must have changed nothing, and the call runs `callback` exactly
-// as register_host_callback would. When the convention holds an argument
-// register (TRANSMUTE_FX_GLOBALS with one of x0..x7), the entry is the
+// integer argument and result registers (x0..x9 in ctx; sp in x[31], read
+// only) and guest memory: `leaf(ctx)` is called straight from translated
+// code, without the FP handoff, and with the cross-region convention
+// registers still in their host registers (a Win64 callee keeps them) -- so
+// their other context slots, ctx.pc, x30's slot and the FP state are not
+// current, and the leaf must not read them, change MXCSR, call guest code,
+// raise or exit. If it returns true, execution continues at x30 (the return
+// address). If it returns false it must have changed nothing, and the call
+// runs `callback` exactly as register_host_callback would. When the
+// convention holds one of x0..x9 (TRANSMUTE_FX_GLOBALS), the entry is the
 // callback alone.
 using HostLeaf = bool (*)(GuestContext& ctx);
 void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user);

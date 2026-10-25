@@ -8,6 +8,7 @@
 // translation still branches where the guest computes (the run-time target
 // check). LLVM's lowering (ldr{b,h,sw} [xT, xI, lsl #k] with the table
 // address set up before the loop) dispatches on the target: the same checks.
+#include "fx/runtime/runtime.hpp"   // kTableShadowSlots
 #include "fx/testing/harness.hpp"
 #include "fx/testing/test.hpp"
 #include "fx/translator/core_test_encode.hpp"
@@ -324,6 +325,65 @@ Switch make_label_switch(std::uint64_t seed, std::uint64_t program_base, bool bo
     return s;
 }
 
+// A dispatch table in memory (V8's Ignition: the table base is a long-lived
+// register, no ADR/ADRP in sight), so the BR is not a label table but goes
+// through the thread's table shadow (GuestContext::table_shadow).
+// x18 = the table (the caller sets it); offset: added to the index first
+// (indices past the shadow's slots); uxtw: the load extends wI; copy: the
+// target goes through another register (V8: `mov x17, xN; br x17`).
+// dispatch: add x14, x14, #step; and w14, w14, #15; add x15, x14, #offset
+//           ldr x9, [x18, x15, lsl #3] (or [x18, w15, uxtw #3]); br x9
+//           (copy: ldr x10, ...; mov x11, x10; mov x9, x11; br x9)
+Switch make_heap_switch(std::uint64_t seed, std::uint64_t program_base, unsigned cases, unsigned iterations,
+                        unsigned offset, bool uxtw, bool copy = false) {
+    using namespace a64;
+    Rng rng(seed);
+    InstGen g(rng);
+    Switch s;
+    auto& w = s.words;
+    w.push_back(movw(false, 2, 0, iterations, 12));
+    const auto dispatch = w.size();
+    w.push_back(add_imm(true, false, false, 14, 14, 1 + rng.below(5)));
+    w.push_back(logic_imm(false, 0, 0, 0, 3, 14, 14));                       // and w14, w14, #15
+    w.push_back(add_imm(true, false, false, 15, 14, offset));                // add x15, x14, #offset
+    w.push_back(ldst_reg(3, 1, 15, uxtw ? 2 : 3, true, 18, copy ? 10 : 9));   // ldr x9, [x18, x15, lsl #3]
+    if (copy) {
+        w.push_back(logic_shift(true, 1, 0, false, 10, 0, 31, 11));          // mov x11, x10
+        w.push_back(logic_shift(true, 1, 0, false, 11, 0, 31, 9));           // mov x9, x11
+    }
+    s.br = w.size();
+    w.push_back(br(9));
+    std::vector<std::size_t> to_tail;
+    for (unsigned k = 0; k < cases; ++k) {
+        s.case_at.push_back(w.size());
+        const unsigned n = 1 + rng.below(4);
+        for (unsigned j = 0; j < n; ++j) w.push_back(g.data_or_memory());
+        if (k + 1 == cases || rng.chance(75)) {
+            to_tail.push_back(w.size());
+            w.push_back(b(0));
+        }
+    }
+    const auto tail = w.size();
+    w.push_back(add_imm(false, true, true, 12, 12, 1));   // subs w12, w12, #1
+    w.push_back(bcond(1, static_cast<std::int32_t>(dispatch) - static_cast<std::int32_t>(w.size())));
+    const auto to_end = w.size();
+    w.push_back(b(0));
+    if (w.size() & 1) w.push_back(0);   // 8-byte aligned entries
+    s.table = w.size();
+    s.entries = offset + 16;
+    for (unsigned k = 0; k < s.entries; ++k) {
+        const auto target = program_base + 4 * s.case_at[k % cases];
+        w.push_back(static_cast<std::uint32_t>(target));
+        w.push_back(static_cast<std::uint32_t>(target >> 32));
+    }
+    const auto end = w.size();
+    for (const auto at : to_tail) w[at] = b(static_cast<std::int32_t>(tail) - static_cast<std::int32_t>(at));
+    w[to_end] = b(static_cast<std::int32_t>(end) - static_cast<std::int32_t>(to_end));
+    return s;
+}
+
+bool shadows_enabled() { return (core::codegen_layout_bits() & 32u) == 0; }
+
 const char* form_name(Form f) {
     switch (f) {
     case Form::ldrsw_base: return "ldrsw+base";
@@ -524,6 +584,95 @@ FX_TEST(table_dispatch_label_table_changed) {
         got.pc = stop;
         testing::compare_contexts(expect, got, "label table changed " + std::to_string(trial));
     }
+}
+
+// A BR through a dispatch table in memory takes the table shadow: the program
+// runs like the reference for every index form (lsl #3, uxtw #3, indices past
+// the shadow's slots), and on a second run every target is in the shadow
+// already (one miss: the first BR makes the shadow the thread's again).
+FX_TEST(table_dispatch_heap_table_shadow) {
+    auto& r = runner();
+    unsigned seed = 700;
+    for (const unsigned offset : {0u, 1000u, 2000u})
+        for (const bool uxtw : {false, true})
+            for (unsigned cases : {2u, 5u, 8u}) {
+                const bool copy = cases == 5;
+                const auto s = make_heap_switch(seed++, r.program_base(), cases, 40, offset, uxtw, copy);
+                auto start = r.context(1700 + seed);
+                start.x[18] = r.program_base() + 4 * s.table;
+                const std::string label = "heap table " + std::to_string(cases) + (uxtw ? " uxtw" : "") +
+                                          (copy ? " copy" : "") + " +" + std::to_string(offset);
+                FX_CHECK(r.run(s.words, start, label));
+                if (!shadows_enabled() || offset + 16 > kTableShadowSlots) continue;
+                FX_CHECK(r.last.shadow_misses >= 1u);
+                FX_CHECK_EQ(r.last.lookups, 0u);
+                // Again on the same translations and shadows.
+                const BufferCode code(r.code_base(), r.program_base() + (s.words.size() + 1) * 4);
+                r.reset_memory();
+                auto again = start;
+                again.pc = r.program_base();
+                const auto res = r.machine.run(again, code, kReturnToHostPc);
+                FX_CHECK(res.ok && res.reason == ExitReason::brk && res.arg == 0xdead);
+                FX_CHECK_EQ(res.shadow_misses, 1u);
+                FX_CHECK_EQ(res.lookups, 0u);
+                FX_CHECK_EQ(res.translations, 0u);
+                again.pc = r.expected.pc;
+                testing::compare_contexts(r.expected, again, label + " again");
+            }
+    for (unsigned k = 0; k < 60; ++k) {
+        Rng rng(93000 + k);
+        const auto s = make_heap_switch(93000 + k, r.program_base(), 1 + rng.below(8), 1 + rng.below(60),
+                                        rng.chance(80) ? 0u : 1020u, rng.chance(50), rng.chance(50));
+        auto start = r.context(94000 + k);
+        start.x[18] = r.program_base() + 4 * s.table;
+        FX_CHECK(r.run(s.words, start, "heap table fuzz " + std::to_string(k)));
+    }
+}
+
+// The table changed after its shadow was filled (entries rotated, one pointing
+// into the middle of a case), and a second table at another base: the BR still
+// goes where the guest's load points.
+FX_TEST(table_dispatch_heap_table_changed) {
+    auto& r = runner();
+    const auto s = make_heap_switch(4747, r.program_base(), 4, 1, 0, false);
+    const auto base = r.program_base();
+    auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(base));
+    // The program, brk, then a copy of its table (another base).
+    std::vector<std::uint32_t> words = s.words;
+    words.push_back(a64::brk(0xdead));
+    if (words.size() & 1) words.push_back(0);
+    const auto copy = words.size();
+    words.insert(words.end(), s.words.begin() + static_cast<std::ptrdiff_t>(s.table), s.words.end());
+    std::memcpy(program, words.data(), words.size() * 4);
+    const BufferCode code(r.code_base(), base + words.size() * 4);
+    r.machine.reset();
+    auto* table = reinterpret_cast<std::uint64_t*>(program + s.table);
+    const std::vector<std::uint64_t> entries(table, table + s.entries);
+    const auto run_one = [&](unsigned trial, std::uint64_t table_pc, const std::string& label) {
+        auto start = r.context(4800 + trial);
+        start.x[14] = trial;
+        start.x[12] = 1;
+        start.pc = base;
+        start.x[18] = table_pc;
+        auto expect = start;
+        r.reset_memory();
+        const auto end = base + s.words.size() * 4;
+        for (unsigned steps = 0; expect.pc != end && steps < 100000; ++steps) {
+            const auto word = *reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(expect.pc));
+            FX_REQUIRE(testing::oracle_step(expect, word));
+        }
+        r.reset_memory();
+        auto got = start;
+        const auto res = r.machine.run(got, code, kReturnToHostPc);
+        FX_CHECK(res.ok && res.reason == ExitReason::brk && res.arg == 0xdead);
+        got.pc = end;
+        testing::compare_contexts(expect, got, label + " " + std::to_string(trial));
+    };
+    for (unsigned trial = 0; trial < 16; ++trial) run_one(trial, base + 4 * s.table, "heap table");
+    for (unsigned k = 0; k < s.entries; ++k) table[k] = entries[(k + 1) % s.entries];
+    table[3] = base + 4 * (s.case_at[0] + 1);   // not a case
+    for (unsigned trial = 0; trial < 16; ++trial) run_one(trial, base + 4 * s.table, "heap table changed");
+    for (unsigned trial = 0; trial < 16; ++trial) run_one(trial, base + 4 * copy, "heap table copy");
 }
 
 // Random LLVM-form loops, as table_dispatch_differential.

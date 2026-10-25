@@ -444,7 +444,8 @@ void print_runtime_statistics() {
                  static_cast<unsigned long long>(cache.journal_bytes / 1024), static_cast<unsigned long long>(cache.merges));
     const auto stats = fx::runtime_stats();
     static constexpr const char* reasons[] = {"none", "link", "lookup_miss", "interpret", "svc", "brk",
-                                              "return_to_host", "interrupt", "raise", "redispatch"};
+                                              "return_to_host", "interrupt", "raise", "redispatch", "tier_up",
+                                              "tier_up_loop", "table_shadow"};
     std::fprintf(stderr,
                  "alchemy-fx stats: translations %llu (%llu guest instructions), translate %.3f s "
                  "(jit %.3f s, install %.3f s), interpreted %llu, threads %llu, arena %llu KiB (dead %llu KiB), "
@@ -1472,9 +1473,13 @@ std::uint64_t FxEngine::register_guest_call(GuestCallHandler handler) {
 // memcmp longer than the leaf's buffers -- declines (changing nothing), and
 // the call runs the handler from the start through host_callback, which
 // faults or fails exactly as before. A copy or fill that faulted part-way is
-// then redone; the call faults anyway.
+// then redone; the call faults anyway. ___chkstk_darwin (darwin/libsystem/
+// misc/support.cpp), called by every function with a large frame, returns at
+// once when the probed range is inside the thread's guest stack.
 namespace {
-enum Leaf : std::uint8_t { kLeafNone, kLeafMemcpy, kLeafBcopy, kLeafMemset, kLeafBzero, kLeafMemcmp, kLeafStrlen };
+enum Leaf : std::uint8_t {
+    kLeafNone, kLeafMemcpy, kLeafBcopy, kLeafMemset, kLeafBzero, kLeafMemcmp, kLeafStrlen, kLeafStackProbe
+};
 
 constexpr std::size_t kLeafCompareBytes = 256;
 constexpr std::size_t kLeafStringLimit = std::size_t{1} << 20;   // = services' string_limit
@@ -1493,9 +1498,26 @@ bool leaf_compare(std::uint64_t a, std::uint64_t b, std::uint64_t count, std::ui
     return true;
 }
 
+// ALCHEMY_FX_STACK_PROBE_LEAF=0: ___chkstk_darwin always runs its handler (A/B measurement).
+bool stack_probe_leaf() {
+    static const bool on = [] {
+        char value[8]{};
+        const auto length = fx::host::get_env("ALCHEMY_FX_STACK_PROBE_LEAF", value, sizeof(value));
+        return !(length == 1 && value[0] == '0');
+    }();
+    return on;
+}
+
 template <Leaf kind>
 bool leaf_call(fx::GuestContext& ctx) {
     auto& x = ctx.x;
+    if constexpr (kind == kLeafStackProbe) {
+        // ___chkstk_darwin probes [sp - w9, sp) and keeps every register. A
+        // range inside this thread's guest stack (committed from its limit up)
+        // needs no probe; anything else is the handler's (it checks the range).
+        const std::uint64_t size = static_cast<std::uint32_t>(x[9]), sp = x[31];
+        return size <= sp && sp <= ctx.guest_stack_base && sp - size >= ctx.guest_stack_limit;
+    }
     if constexpr (kind == kLeafMemcpy) {
         if (x[2] && !guarded_move(host(x[0]), host(x[1]), x[2])) return false;
     } else if constexpr (kind == kLeafBcopy) {
@@ -1527,6 +1549,7 @@ void FxEngine::set_guest_call_leaf(std::uint64_t address, std::string_view symbo
     else if (symbol == "_bzero") kind = kLeafBzero;
     else if (symbol == "_memcmp") kind = kLeafMemcmp;
     else if (symbol == "_strlen") kind = kLeafStrlen;
+    else if (symbol == "___chkstk_darwin" && stack_probe_leaf()) kind = kLeafStackProbe;
     shared_->leaf[(address - kGuestCallBase) / kGuestCallStride].store(kind, std::memory_order_relaxed);
 }
 
@@ -1549,6 +1572,7 @@ void FxEngine::install_native_entry(std::uint64_t pc) {
         case kLeafBzero: leaf = &leaf_call<kLeafBzero>; break;
         case kLeafMemcmp: leaf = &leaf_call<kLeafMemcmp>; break;
         case kLeafStrlen: leaf = &leaf_call<kLeafStrlen>; break;
+        case kLeafStackProbe: leaf = &leaf_call<kLeafStackProbe>; break;
         default: break;
         }
     }

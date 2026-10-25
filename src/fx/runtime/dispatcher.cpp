@@ -405,6 +405,12 @@ void run_guest(GuestContext& ctx) {
         case ExitReason::link:
             code = handle_link(ctx, arg);
             break;
+        case ExitReason::table_shadow: {   // fill the slot once the target has an entry
+            const auto target = ctx.pc;
+            code = code_for_pc(ctx);
+            table_shadow_miss(ctx, arg, target);
+            break;
+        }
         case ExitReason::lookup_miss:
         case ExitReason::redispatch:
             code = code_for_pc(ctx);

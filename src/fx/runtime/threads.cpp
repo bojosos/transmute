@@ -138,6 +138,7 @@ ThreadState* create_state(std::uint64_t stack_size, bool borrowed) {
     ctx->stub_host_return = g_stubs.host_return;
     ctx->stub_link = g_stubs.link;
     ctx->arena_base = arena_base();   // translated code inlines the stub_indirect lookup
+    table_shadow_init_context(*ctx);
     ts->ctx = ctx.release();
     {
         ExclusiveLock lock(g_registry);

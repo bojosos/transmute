@@ -463,6 +463,15 @@ void report_exit() {
         std::fprintf(r.out, "[alchemy perf] no frame was presented; totals:\n");
         for (unsigned c = 0; c < counter_count; ++c)
             if (counters[c]) std::fprintf(r.out, "[alchemy perf]   %s=%llu\n", counter_name(c), static_cast<unsigned long long>(counters[c]));
+        // Headless runs (renders, tests): the busiest synthetic calls of the whole run.
+        std::vector<std::size_t> order;
+        for (std::size_t i = 0; i < calls.size(); ++i)
+            if (calls[i]) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return calls[a] > calls[b]; });
+        std::fprintf(r.out, "[alchemy perf]   host calls by count, all threads (calls, main-thread calls):\n");
+        for (std::size_t k = 0; k < order.size() && k < 40; ++k)
+            std::fprintf(r.out, "[alchemy perf]     %12llu %12llu  %s\n", static_cast<unsigned long long>(calls[order[k]]),
+                         static_cast<unsigned long long>(calls_main[order[k]]), slot_name(order[k]).c_str());
     }
     std::fflush(r.out);
 }

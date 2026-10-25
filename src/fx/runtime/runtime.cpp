@@ -30,6 +30,7 @@ void initialize(const RuntimeOptions& options) {
     arena_initialize();
     lookup_initialize();
     generate_stubs();
+    table_shadow_initialize();
     threads_initialize();
     g_helpers[fx::helper_interpret_one] = reinterpret_cast<const void*>(&interpret_one_helper);
     g_helpers[fx::helper_check_interrupt] = reinterpret_cast<const void*>(&check_interrupt_helper);

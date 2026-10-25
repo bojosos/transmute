@@ -524,6 +524,7 @@ private:
     void e_trap(const PlanInst& pi);
     // ---- switch dispatch (Plan::tables; emit_branch.cpp) ----
     void e_table_branch(const PlanInst& pi);
+    void e_shadow_branch(const PlanInst& pi);   // BR on a table shadow (PlanInst::shadow_base)
     // Label for the multiway edge from the current (empty-cache, flags in
     // ctx) state into leader `target`: the block, a pending edge, or an edge
     // stub that loads the target's entry state (no inline edge code).

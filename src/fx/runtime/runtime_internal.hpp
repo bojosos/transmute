@@ -180,6 +180,11 @@ struct Stubs {
     const void* indirect_live{};
     const void* dispatch_exit_live{};
     const void* host_return{};
+    // Table shadows (runtime.hpp, table_shadow.cpp): rcx = target, rdx = index,
+    // convention registers live. miss exits with ExitReason::table_shadow;
+    // lookup takes the lookup for rcx.
+    const void* table_shadow_miss{};
+    const void* table_shadow_lookup{};
 };
 // The convention registers to/from GuestContext (r15 = biased context).
 void store_globals(x64::Assembler& a);
@@ -200,6 +205,20 @@ inline std::size_t lookup_index(std::uint64_t pc) noexcept {
 }
 void lookup_install(std::uint64_t pc, const void* host) noexcept;
 void lookup_remove(std::uint64_t pc, const void* host) noexcept;
+
+// ---- table shadows (GuestContext::table_shadow, runtime.hpp) ------------------------------
+void table_shadow_initialize();   // after generate_stubs
+void table_shadow_init_context(GuestContext& ctx) noexcept;
+// ExitReason::table_shadow, after ctx.pc's entry was found or made: makes the
+// shadow of ctx.table_shadow_base this thread's and fills slot `index` with
+// `target`'s host entry (with_map_entry), unless it holds another target.
+void table_shadow_miss(GuestContext& ctx, std::uint64_t index, std::uint64_t target);
+// Region map lock held exclusively (lookup_remove): slots holding `host` go
+// back to the miss stub (refilled on their next BR).
+void table_shadow_scrub(const void* host) noexcept;
+// Runs fn(host, arg) with pc's map entry under the shared map lock, so no
+// kill (exclusive) runs meanwhile. False if pc has none.
+bool with_map_entry(std::uint64_t pc, void (*fn)(const void* host, void* arg), void* arg);
 const void* lookup_probe(std::uint64_t pc) noexcept;
 
 // ---- regions / translation / linking -----------------------------------------------------

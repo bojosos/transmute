@@ -395,6 +395,45 @@ bool match_label_table(const Inst* insts, int lo, int ld, std::uint64_t br_pc, c
     return m.count <= kMaxTableEntries;   // 0: sized from the contents (build_plan)
 }
 
+// A BR on a table shadow (PlanInst::shadow_base): xN's last writer before the
+// BR is `ldr xN, [xB, xI, lsl #3]` (or `uxtw #3`), possibly through register
+// copies (`mov x17, xN; br x17`: V8's tail calls through its CFI scratch
+// register), with neither xB nor xI written after the load. Any table: a
+// label table takes the BR first (match_table), and the target is compared
+// either way. Returns nullptr, or why not (TRANSMUTE_FX_TRACE_TABLES).
+const char* match_shadow_load(std::uint64_t br_pc, unsigned rn, const CodeSource& code, std::int8_t& base,
+                              std::int8_t& index, bool& index32) {
+    if (rn >= 31 || br_pc < 4 * kTableScan) return "no register";
+    constexpr unsigned kMaxCopies = 2;
+    unsigned want = rn, copies = 0;
+    std::uint32_t written = 0;   // registers written between the load and the BR
+    for (unsigned back = 1; back <= kTableScan; ++back) {
+        Inst d;
+        if (!decode_at(code, br_pc - 4u * back, d) || is_branch(d)) return "no writer of the target in the block";
+        if (!writes_reg(d, want)) {
+            written |= usage(d).write;
+            continue;
+        }
+        written |= usage(d).write;
+        if (d.kind == Kind::logic_shift && d.op == 1 && d.sf && !d.invert && d.rn == 31 && d.amount == 0 &&
+            d.rd == want && d.rm != 31) {   // mov xT, xS: follow xS
+            if (++copies > kMaxCopies) return "more register copies than followed";
+            want = d.rm;
+            continue;
+        }
+        if (d.kind != Kind::load_store || d.mode != AddrMode::reg || d.mem != MemOp::load || d.rd != want)
+            return "the target's writer is not a register-offset load";
+        if (d.size != 3 || d.amount != 3 || (d.shift != 2 && d.shift != 3)) return "not an 8-byte load scaled by lsl/uxtw #3";
+        if (d.rn == 31 || d.rm == 31 || d.rn == d.rd || d.rm == d.rd) return "base or index is sp, zr or the load's target";
+        if (((written >> d.rn) & 1u) != 0 || ((written >> d.rm) & 1u) != 0) return "base or index written after the load";
+        base = static_cast<std::int8_t>(d.rn);
+        index = static_cast<std::int8_t>(d.rm);
+        index32 = d.shift == 2;
+        return nullptr;
+    }
+    return "no writer of the target within the scan";
+}
+
 bool match_table(std::uint64_t br_pc, unsigned rn, const CodeSource& code, TableMatch& m) {
     const auto no = [&](const char* why) {
         m.fail = why;
@@ -787,6 +826,14 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     };
     thread_local std::vector<FoundTable> found_tables;
     thread_local std::vector<std::uint64_t> found_pcs;
+    // BRs on table shadows (PlanInst::shadow_base), unless a table takes them.
+    struct FoundShadow {
+        std::uint64_t br_pc;
+        std::int8_t base, index;
+        bool index32;
+    };
+    thread_local std::vector<FoundShadow> found_shadows;
+    found_shadows.clear();
     found_tables.clear();
     found_pcs.clear();
     plan.tables.clear();
@@ -867,6 +914,17 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
             }
             break;
         case Flow::indirect:
+            if (pi.inst.kind == Kind::branch_reg && !overrides.no_shadows) {
+                FoundShadow s{pc, -1, -1, false};
+                const char* why = match_shadow_load(pc, pi.inst.rn, code, s.base, s.index, s.index32);
+                if (!why) found_shadows.push_back(s);
+                static const bool trace = std::getenv("TRANSMUTE_FX_TRACE_TABLES") != nullptr;
+                if (trace && !why)
+                    std::fprintf(stderr, "table: br %llx: table shadow candidate (x%d, x%d%s)\n",
+                                 static_cast<unsigned long long>(pc), s.base, s.index, s.index32 ? " uxtw" : "");
+                else if (trace)
+                    std::fprintf(stderr, "table: br %llx: no table shadow: %s\n", static_cast<unsigned long long>(pc), why);
+            }
             if (pi.inst.kind == Kind::branch_reg && !overrides.no_tables) {
                 TableMatch m{};
                 const bool matched = match_table(pc, pi.inst.rn, code, m);
@@ -1099,6 +1157,15 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
             plan.table_pcs.push_back(t);
             plan.table_targets.push_back((t & 3) == 0 ? find_index(t) : -1);
         }
+    }
+    for (const auto& fs : found_shadows) {
+        const auto br = find_index(fs.br_pc);
+        if (br < 0) continue;
+        auto& pi = plan.insts[static_cast<std::size_t>(br)];
+        if (pi.table >= 0) continue;
+        pi.shadow_base = fs.base;
+        pi.shadow_index = fs.index;
+        pi.shadow_index32 = fs.index32;
     }
 
     bool back_edges = false;   // dataflow below needs iteration only with back edges

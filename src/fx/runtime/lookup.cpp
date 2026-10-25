@@ -46,6 +46,7 @@ void lookup_install(std::uint64_t pc, const void* host) noexcept {
 }
 
 void lookup_remove(std::uint64_t pc, const void* host) noexcept {
+    table_shadow_scrub(host);   // every path that drops an entry comes here
     std::uint64_t value;
     if (!encode(pc, host, value)) return;
     auto s = slot(pc);

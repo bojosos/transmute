@@ -104,7 +104,7 @@ void print_runtime_stats_if_requested() {
     const auto st = runtime_stats();
     static const char* const reasons[] = {"none", "link", "lookup_miss", "interpret", "svc", "brk",
                                           "return_to_host", "interrupt", "raise", "redispatch", "tier_up",
-                                          "tier_up_loop"};
+                                          "tier_up_loop", "table_shadow"};
     std::fprintf(stderr, "transmute-fx stats: regions=%llu translations=%llu cache_hits=%llu links=%llu "
                  "interpreted=%llu smc_faults=%llu host_callbacks=%llu guest_exceptions=%llu "
                  "threads=%llu arena_used=%llu arena_committed=%llu reclaimed=%llu reclaim_passes=%llu "

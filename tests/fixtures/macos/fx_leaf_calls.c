@@ -11,7 +11,9 @@
  *  4 strlen for lengths 0..300
  *  5 registers: memcpy/memmove/memset/memcmp/strlen return in x0 with x1 = 0;
  *    bzero/bcopy leave x0 as it was, x1 = 0; callee-saved registers kept
- *  6 strlen of an unreadable address: -1 and errno EFAULT (the handler path) */
+ *  6 strlen of an unreadable address: -1 and errno EFAULT (the handler path)
+ *  7 ___chkstk_darwin (the stack probe of large frames, size in x9) keeps x0..x15,
+ *    x17, x19 and sp, for sizes up to 256 KiB */
 typedef unsigned long size_t;
 extern void* memcpy(void*, const void*, size_t);
 extern void* memmove(void*, const void*, size_t);
@@ -151,6 +153,40 @@ static int registers(void) {
     return 1;
 }
 
+extern void __chkstk_darwin(void);
+
+/* x9 = size; every other register the probe sees must come back unchanged. */
+static int probe(unsigned long size) {
+    register unsigned long x0 __asm__("x0") = 0x1000, x1 __asm__("x1") = 0x1001, x2 __asm__("x2") = 0x1002;
+    register unsigned long x3 __asm__("x3") = 0x1003, x4 __asm__("x4") = 0x1004, x5 __asm__("x5") = 0x1005;
+    register unsigned long x6 __asm__("x6") = 0x1006, x7 __asm__("x7") = 0x1007, x8 __asm__("x8") = 0x1008;
+    register unsigned long x9 __asm__("x9") = size, x10 __asm__("x10") = 0x100a, x11 __asm__("x11") = 0x100b;
+    register unsigned long x12 __asm__("x12") = 0x100c, x13 __asm__("x13") = 0x100d, x14 __asm__("x14") = 0x100e;
+    register unsigned long x15 __asm__("x15") = 0x100f, x17 __asm__("x17") = 0x1011;
+    register unsigned long x19 __asm__("x19") = 0x5eed1234abcdULL;
+    register void* x16 __asm__("x16") = (void*)__chkstk_darwin;
+    unsigned long sp_before, sp_after;
+    __asm__ volatile("mov %0, sp" : "=r"(sp_before));
+    __asm__ volatile("blr x16"
+                     : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7), "+r"(x8),
+                       "+r"(x9), "+r"(x10), "+r"(x11), "+r"(x12), "+r"(x13), "+r"(x14), "+r"(x15), "+r"(x17),
+                       "+r"(x19), "+r"(x16)
+                     :
+                     : "x30", "cc", "memory");
+    __asm__ volatile("mov %0, sp" : "=r"(sp_after));
+    return x0 == 0x1000 && x1 == 0x1001 && x2 == 0x1002 && x3 == 0x1003 && x4 == 0x1004 && x5 == 0x1005 &&
+           x6 == 0x1006 && x7 == 0x1007 && x8 == 0x1008 && x9 == size && x10 == 0x100a && x11 == 0x100b &&
+           x12 == 0x100c && x13 == 0x100d && x14 == 0x100e && x15 == 0x100f && x17 == 0x1011 &&
+           x19 == 0x5eed1234abcdULL && sp_after == sp_before;
+}
+
+static int probes(void) {
+    for (int rep = 0; rep < 3; ++rep)
+        for (unsigned long size = 16; size <= (256ul << 10); size *= 4)
+            if (!probe(size)) return 0;
+    return 1;
+}
+
 static int unreadable(void) {
     for (int rep = 0; rep < 3; ++rep) {
         *__error() = 0;
@@ -166,6 +202,7 @@ int main(void) {
     if (!lengths()) { puts("fx leaf calls: case 4 (strlen) failed"); return 4; }
     if (!registers()) { puts("fx leaf calls: case 5 (registers) failed"); return 5; }
     if (!unreadable()) { puts("fx leaf calls: case 6 (strlen of an unreadable address) failed"); return 6; }
+    if (!probes()) { puts("fx leaf calls: case 7 (stack probe) failed"); return 7; }
     puts("fx leaf calls: ok");
     return 0;
 }
