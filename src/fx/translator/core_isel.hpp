@@ -45,18 +45,17 @@ inline bool isel_on(std::uint32_t knob) { return (isel_knob_bits() & knob) == 0;
 //                   (e_ccmp: setcc/test fusion with B.cond and CSEL)
 //   nogprreuse    - a GPR result never reuses the host that cached the
 //                   destination's old value (reusable_gpr)
-//   nobrdeadflags - NZCV stays live at every BR. By default (abi_flags) it
-//                   is dead at a BR that does not look intra-function (no
-//                   recognised table, no ADR/ADRP in its block), as at
-//                   BL/BLR/RET (region_plan.cpp flags liveness)
 // and opt-in ones (on when named):
+//   brdeadflags   - NZCV is dead at a BR that does not look intra-function
+//                   (no recognised table, no ADR/ADRP in its block), as at
+//                   BL/BLR/RET (abi_flags; region_plan.cpp flags liveness)
 //   mergedirty    - dirty cached registers also cross forward jumps and
 //                   fall-throughs into merge points outside loops
 //                   (dirty_into_merge)
 // All are folded into the translator fingerprint (region_plan.cpp).
 enum CodegenKnob : std::uint32_t {
     knob_no_branch_dirty = 1u,
-    knob_no_br_flags_dead = 2u,
+    knob_br_flags_dead = 2u,
     knob_no_dead_pin_loads = 4u,
     knob_no_flag_save = 8u,
     knob_no_ccmp_fusion = 16u,

@@ -1185,12 +1185,12 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     // successor follows in layout, so one pass in the right direction is the
     // fixed point.)
     const bool strict_flags = overrides.exact_flags || !options.abi_flags;
-    // A BR that does not look intra-function is flag-dead too (abi_flags;
-    // TRANSMUTE_FX_CORE=nobrdeadflags keeps every BR live, core_isel.hpp). Tail calls, veneers and
+    // TRANSMUTE_FX_CORE=brdeadflags (opt-in, core_isel.hpp): a BR that does
+    // not look intra-function is flag-dead too. Tail calls, veneers and
     // interpreter dispatch enter code that cannot assume incoming flags; a
     // recognised switch table or an ADR/ADRP in the BR's block (clang switch
     // tables, computed gotos) keeps them live.
-    const bool br_flags_dead = !strict_flags && (core::codegen_p2_knob_bits() & core::knob_no_br_flags_dead) == 0;
+    const bool br_flags_dead = !strict_flags && (core::codegen_p2_knob_bits() & core::knob_br_flags_dead) != 0;
     const auto br_live = [&](std::int32_t i) {
         if (!br_flags_dead || plan.insts[i].table >= 0) return true;
         for (std::int32_t j = i; j >= 0; --j) {

@@ -102,14 +102,12 @@ region tests: keep its API additive).
 - Materialization (no pushfq): `[cmc] lahf; seto al; and eax,0xC101;
   imul eax,eax,0x10210000; and eax,0xF0000000; mov [nzcv],rax`.
 - NZCV is dead at BL/BLR/RET exits (abi_flags): host flags are dropped
-  there, not materialized (begin_instruction). Also at a BR that does not
-  look intra-function (no recognised table, no ADR/ADRP in its block): tail
-  calls, veneers and V8's bytecode dispatch, whose BR otherwise kept NZCV
+  there, not materialized (begin_instruction). Opt-in
+  `TRANSMUTE_FX_CORE=brdeadflags`: also at a BR that does not look
+  intra-function (no recognised table, no ADR/ADRP in its block): tail
+  calls, veneers and V8's bytecode dispatch, whose BR otherwise keeps NZCV
   live back through the handler (materializations at its loop headers and
-  merge points too). Measured: jitless JetStream richards 1.16x. A clang
-  switch table or computed goto builds its target from a PC-relative table
-  and keeps the strict model; `TRANSMUTE_FX_CORE=nobrdeadflags` keeps every
-  BR live, `exactflags` / abi_flags = false everything.
+  merge points too).
 - Flags that outlive an instruction that must clobber EFLAGS (EOR/ORR/AND,
   shifts without a flag-free form, REV, ...) and are read within three
   instructions stay in host form: `lahf; seto al` before it and

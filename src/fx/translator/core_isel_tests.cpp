@@ -465,10 +465,10 @@ FX_TEST(core_abi_flags_not_materialized_at_calls_and_returns) {
         {"cmp; bl", {cmp, bl(64)}, false},
         {"cmp; blr", {cmp, blr(9)}, false},
         {"cmp; ret", {cmp, ret()}, false},
-        {"cmp; br", {cmp, br(9)}, false},   // register-target BR: flag-dead too (core_br_flags_dead_knob)
+        {"cmp; br", {cmp, br(9)}, true},
         {"cmp; b.eq; bl", {cmp, bcond(0, 2), bl(64), ret()}, false},
     };
-    core::set_p2_knobs_for_testing(0);
+    core::set_p2_knobs_for_testing(0);   // BR keeps NZCV live by default (brdeadflags: core_br_flags_dead_knob)
     for (const auto& c : cases) {
         if (!materializes_flags(translate_words(c.words, false)))
             testing::report_failure(__FILE__, __LINE__, std::string(c.label) + ": strict flags not materialized");
@@ -508,10 +508,10 @@ FX_TEST(core_dirty_cache_crosses_branches_exact_at_faults) {
     }
 }
 
-// A BR to a register target (tail call, veneer, interpreter dispatch) is
-// flag-dead under abi_flags by default; a BR whose block builds its target
-// from an ADR/ADRP (a switch table, a computed goto) keeps NZCV live, strict
-// flags keep every BR live, and TRANSMUTE_FX_CORE=nobrdeadflags all BRs.
+// TRANSMUTE_FX_CORE=brdeadflags (opt-in): a BR to a register target (tail
+// call, veneer, interpreter dispatch) is flag-dead under abi_flags; a BR
+// whose block builds its target from an ADR/ADRP (a switch table, a computed
+// goto) keeps NZCV live, and strict flags keep every BR live.
 FX_TEST(core_br_flags_dead_knob) {
     using namespace a64;
     const auto cmp = add_shift(true, true, true, 0, 2, 0, 1, 31);   // cmp x1, x2
@@ -532,20 +532,20 @@ FX_TEST(core_br_flags_dead_knob) {
         ret(),                                  // default
         0x00000000u,                            // table
     };
-    struct Case { const char* label; const std::vector<std::uint32_t>* words; bool dead_by_default; };
+    struct Case { const char* label; const std::vector<std::uint32_t>* words; bool dead_with_knob; };
     const Case cases[] = {
         {"register target", &reg_target, true},
         {"computed goto", &computed_goto, false},
         {"switch table", &switch_table, false},
     };
-    for (const auto knob : {0u, static_cast<std::uint32_t>(core::knob_no_br_flags_dead)}) {
+    for (const auto knob : {0u, static_cast<std::uint32_t>(core::knob_br_flags_dead)}) {
         core::set_p2_knobs_for_testing(knob);
         for (const auto& c : cases) {
-            const bool dead = knob == 0 && c.dead_by_default;
+            const bool dead = knob != 0 && c.dead_with_knob;
             if (!materializes_flags(translate_words(*c.words, false)))
                 testing::report_failure(__FILE__, __LINE__, std::string(c.label) + ": strict flags not materialized");
             if (materializes_flags(translate_words(*c.words, true)) == dead)
-                testing::report_failure(__FILE__, __LINE__, std::string(c.label) + (knob ? ": nobrdeadflags" : ": default"));
+                testing::report_failure(__FILE__, __LINE__, std::string(c.label) + (knob ? ": knob on" : ": knob off"));
         }
     }
     core::set_p2_knobs_for_testing(~0u);

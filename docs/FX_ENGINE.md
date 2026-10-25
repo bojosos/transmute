@@ -61,13 +61,8 @@ JIT on miss, persistent cache for warm runs, optional AOT from `.pdata`.
   to and return from a public interface, and Windows ARM64 compilers never
   pass flags through a call. The translator therefore treats NZCV as dead at
   BL/BLR and RET exits (it is not materialized for them; a guest context
-  captured after a call or return may show a stale NZCV). The same holds at
-  a BR that does not look intra-function: a tail call, a veneer or an
-  interpreter's dispatch enters code that cannot assume incoming flags. A BR
-  through a recognised jump table, or with an ADR/ADRP in its block (clang
-  switch tables, computed gotos), keeps them live
-  (`TRANSMUTE_FX_CORE=nobrdeadflags` keeps every BR live). Every other exit
-  (B to another region, fall-through out of a region, traps, interpret
+  captured after a call or return may show a stale NZCV). Every other exit
+  (B to another region, BR, fall-through out of a region, traps, interpret
   exits, interrupts at live points) keeps the strict model.
   `TranslateOptions::abi_flags = false` (part of the cache options hash) or
   `TRANSMUTE_FX_CORE=exactflags` (folded into the translator fingerprint)

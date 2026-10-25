@@ -124,7 +124,7 @@ std::uint32_t codegen_p2_knob_bits() {
         if (const char* v = std::getenv("TRANSMUTE_FX_CORE")) {
             const std::string s(v);
             if (s.find("nobranchdirty") != std::string::npos) b |= knob_no_branch_dirty;
-            if (s.find("nobrdeadflags") != std::string::npos) b |= knob_no_br_flags_dead;
+            if (s.find("brdeadflags") != std::string::npos) b |= knob_br_flags_dead;
             if (s.find("nodeadpinloads") != std::string::npos) b |= knob_no_dead_pin_loads;
             if (s.find("noflagsave") != std::string::npos) b |= knob_no_flag_save;
             if (s.find("noccmpfusion") != std::string::npos) b |= knob_no_ccmp_fusion;
