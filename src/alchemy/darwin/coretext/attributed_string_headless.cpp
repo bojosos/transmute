@@ -82,7 +82,7 @@ void install_attributed_string_shell(ProcessContext& process, ObjcRuntime& objc,
     }, "@@:Q^{_NSRange=QQ}");
     self->method(a, "dealloc", [self](auto& state, auto&) {
         if (const auto value = self->state_of(state.x[0], false)) self->process.objects().release(std::exchange(value->string, 0));
-        static_cast<void>(self->call(objc_library, "_objc_destructInstance", {state.x[0]}));
+        static_cast<void>(self->call(objc_library, "_object_dispose", {state.x[0]}));   // as NSObject's dealloc
     }, "v@:");
 }
 

@@ -1647,8 +1647,17 @@ struct ObjcRuntime::Impl {
         function("_objc_autoreleasePoolPush", [this](auto& s, auto&) { Address token{}; { std::lock_guard lock(mutex); token = next_pool++; }
             process.current_thread()->autorelease_pools.push_back({token, {}}); s.x[0] = token; });
         function("_objc_autoreleasePoolPop", [this](auto& s, auto&) { drain(*process.current_thread(), s.x[0]); });
-        function("_objc_destructInstance", [this](auto& s, auto&) { if (s.x[0]) destruct(s.x[0]); });
-        function("_object_dispose", [this](auto& s, auto&) { if (s.x[0]) { destruct(s.x[0]); process.objects().dispose(s.x[0]); } s.x[0] = 0; });
+        // A dealloc that calls objc_destructInstance and returns without object_dispose keeps the
+        // memory (ObjectStore::note_destructed): freed by a later object_dispose.
+        function("_objc_destructInstance", [this](auto& s, auto&) {
+            if (s.x[0]) { destruct(s.x[0]); process.objects().note_destructed(s.x[0]); } });
+        function("_object_dispose", [this](auto& s, auto&) {
+            if (s.x[0]) {
+                // A destructed, kept object (a zombie) is only freed: its isa may name another class now.
+                if (!process.objects().destructed(s.x[0])) destruct(s.x[0]);
+                process.objects().dispose(s.x[0]);
+            }
+            s.x[0] = 0; });
         cleanup = function("___alchemy_objc_cleanup", [this](auto&, auto&) { cleanup_thread(*process.current_thread()); });
         function("_objc_initWeak", [this](auto& s, auto&) { s.x[0] = store_weak(s.x[0], s.x[1], true); });
         function("_objc_storeWeak", [this](auto& s, auto&) { s.x[0] = store_weak(s.x[0], s.x[1], false); });
@@ -1765,7 +1774,9 @@ struct ObjcRuntime::Impl {
         // +[NSObject initialize] does nothing; subclasses reach it through [super initialize].
         add_native(root, "initialize", [](auto&, auto&) {}, true, "v@:");
         add_native(root, "init", [](auto&, auto&) {}, false);
-        add_native(root, "dealloc", [this](auto& s, auto&) { destruct(s.x[0]); }, false, "v@:");
+        // As Apple's, the root dealloc disposes: the memory is freed (inside the destruction, once
+        // the dealloc returns).
+        add_native(root, "dealloc", [this](auto& s, auto&) { destruct(s.x[0]); process.objects().dispose(s.x[0]); }, false, "v@:");
         add_native(root, "self", [](auto&, auto&) {}, false);
         add_native(root, "self", [](auto&, auto&) {}, true);
         add_native(root, "class", [this](auto& s, auto&) { s.x[0] = object_class(s.x[0]); }, false, "#@:");

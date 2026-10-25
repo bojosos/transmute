@@ -27,6 +27,11 @@ struct ObjectRecord {
     bool heap_memory{}; // owned memory came from the engine heap (engine_heap_allocate)
     std::atomic<bool> destroying{false};
     std::atomic<bool> weakly_referenced{false}; // an Objective-C weak reference names this object
+    // The dealloc destructed the object (objc_destructInstance) and nothing disposed it
+    // (object_dispose, or the root -[NSObject dealloc], which disposes): the guest keeps the
+    // memory (Chrome's Objective-C zombies), so it is not freed then. A kept record stays
+    // `destructed` until object_dispose frees it.
+    std::atomic<bool> destructed{false}, disposed{false};
     // Forwarding records (adopt_forwarding): objects whose reference count
     // lives elsewhere (heap Blocks). retain/release run these instead of the
     // record's count; forward_release returns true when the object is gone.
@@ -66,6 +71,15 @@ public:
     [[nodiscard]] bool try_retain(std::uint64_t address);
     void release(std::uint64_t address);
     void dispose(std::uint64_t address);
+    // objc_destructInstance on an object being destroyed. When its dealloc does that and returns
+    // without object_dispose (or the root -[NSObject dealloc], which disposes), the record and
+    // its memory stay (references 0) until object_dispose frees them: whoever destructed it owns
+    // the memory, as with Apple's runtime, and no new object takes its address. Host deallocs
+    // that end an object without [super dealloc] call object_dispose, as Apple's runtime frees.
+    void note_destructed(std::uint64_t address);
+    // Whether a live record was destructed and kept (object_dispose then only frees it: its isa
+    // may already name another class, as a zombie's does).
+    [[nodiscard]] bool destructed(std::uint64_t address) const;
     void set_class(ObjectKind kind, std::uint64_t class_address);
     [[nodiscard]] std::size_t live_count(bool include_immortal = false) const;
     // Objective-C weak references (objc_storeWeak): marks a live object, false

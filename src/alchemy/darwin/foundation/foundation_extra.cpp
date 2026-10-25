@@ -448,7 +448,9 @@ struct Extra {
         record->payload = value;
         return value;
     }
-    void destruct(Address object) { static_cast<void>(call(objc_library, "_objc_destructInstance", {object})); }
+    // The end of a dealloc that does not send [super dealloc]: object_dispose (destructs, and the
+    // memory is freed after the dealloc), as NSObject's dealloc would.
+    void destruct(Address object) { static_cast<void>(call(objc_library, "_object_dispose", {object})); }
     Address singleton(Address cls) { return process.objects().create(std::max<Address>(16, call(objc_library, "_class_getInstanceSize", {cls})), cls, ObjectKind::instance, {}, {}, true); }
     Address constant_c_string(char type) {
         std::lock_guard lock(mutex);

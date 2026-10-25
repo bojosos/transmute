@@ -185,7 +185,29 @@ void ObjectStore::release(std::uint64_t address) {
     }
     try { if (record->destroy) record->destroy(address); }
     catch (...) { finish(record); throw; }
+    if (record->destructed && !record->disposed) {
+        // The dealloc destructed the object and kept its memory (objc_destructInstance without
+        // object_dispose): the address stays taken until object_dispose.
+        record->destroying = false;
+        return;
+    }
     finish(record);
+}
+
+bool ObjectStore::destructed(std::uint64_t address) const {
+    if (address == 0) return false;
+    auto& part = shard(address);
+    std::lock_guard lock(part.mutex);
+    const auto found = part.objects.find(address);
+    return found != part.objects.end() && found->second->destructed && !found->second->destroying;
+}
+
+void ObjectStore::note_destructed(std::uint64_t address) {
+    if (address == 0) return;
+    auto& part = shard(address);
+    std::lock_guard lock(part.mutex);
+    const auto found = part.objects.find(address);
+    if (found != part.objects.end() && found->second->destroying) found->second->destructed = true;
 }
 
 void ObjectStore::dispose(std::uint64_t address) {
@@ -197,7 +219,8 @@ void ObjectStore::dispose(std::uint64_t address) {
         const auto found = part.objects.find(address);
         if (found == part.objects.end()) throw std::runtime_error("dispose of an invalid compatibility object");
         record = found->second;
-        if (record->immortal || record->destroying) return;
+        if (record->immortal) return;
+        if (record->destroying) { record->disposed = true; return; }   // inside its dealloc: freed after it
         record->references = 0;
         record->destroying = true;
     }

@@ -843,10 +843,11 @@ hardware GPU (below).
     * **WebGL draws on the GPU** (headless, single-process). A WebGL2 probe gives exactly the expected pixels for
       an 8-bit-indexed draw, a sampled 2x2 RGB texture with mipmaps, and a framebuffer blit, with glError 0 and no
       context loss. WebGPU still gets no adapter.
-    * **Windowed, multi-process** (`run_windowed.ps1 -Gpu`, `webgl.html`): the GPU process stops with "invalid
-      or destroyed compatibility object" (isa 0). It happens while `MTLRenderPassDescriptor`s and their color
-      attachment descriptors are released, a descriptor lifetime bug that only shows once ANGLE-Metal runs
-      Chrome's compositor. Chrome relaunches the GPU process twice, then WebGL gets no context. Next blocker.
+    * **Windowed, multi-process** (`run_windowed.ps1 -Gpu`, `webgl.html`): passes. The GPU process used to stop
+      with "invalid or destroyed compatibility object" (isa 0). Chrome's Objective-C zombies replace
+      `-[NSObject dealloc]`: they destruct the object, keep its memory, and free it later with `object_dispose`.
+      The object store freed the memory at once, and a new object (an autoreleased `MTLRenderPassDescriptor`)
+      took its address. Kept memory now stays allocated until `object_dispose`.
   * **ANGLE's Vulkan back end on the host's Vulkan** isn't allowed. Chrome 155 on macOS accepts only ANGLE on Metal,
     or on SwiftShader with `--enable-unsafe-swiftshader`. Its message is `gl_factory.cc:110 ... not found in allowed
     implementations: [(gl=egl-angle,angle=metal)]`.
@@ -907,9 +908,8 @@ hardware GPU (below).
   * `network denied`: only `[2001:4860:4860::8888]:443` and `https://update.googleapis.com` (Chrome), QLab's
     accounts.figure53.com and the renderer's license server.
 * **Open, and follow-ups:**
-  * Hardware WebGL: with the AIR translator DLL, WebGL programs draw on the GPU in headless runs (above). Windowed
-    runs stop in the GPU process on a render-pass descriptor released twice. Graphite and WebGPU (Dawn) still
-    get no adapter.
+  * Hardware WebGL: with the AIR translator DLL, WebGL programs draw on the GPU, headless and windowed (above).
+    Graphite and WebGPU (Dawn) still get no adapter.
   * The On-Device Model Service's Dawn on Metal reaches our MSL compiler. Its remaining shader failures stay in that
     utility child.
   * Metal selectors no run reached: the indirect-command-buffer pair. Also not exercised: Chrome's own use of

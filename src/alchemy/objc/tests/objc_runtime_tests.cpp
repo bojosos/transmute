@@ -320,6 +320,63 @@ void test_dispatch_encoding(const char* object_path) {
 }
 } // namespace
 
+// A dealloc that destructs the object and keeps its memory, as Chrome's Objective-C zombies do
+// (objc_destructInstance, then object_dispose much later): until object_dispose no new object
+// takes the address, and object_dispose then frees it.
+void test_destructed_memory_kept() {
+    Fixture f;
+    const auto root = f.runtime.find_class("NSObject");
+    const auto keeper = f.runtime.register_native_class("ZombieKeeper", root, 16);
+    // The keeping dealloc is guest code (as Chrome's replacement -[NSObject dealloc] is):
+    // x0 = self; objc_destructInstance(self); return.
+    const auto destruct = f.export_address("_objc_destructInstance");
+    std::array<std::uint32_t, 10> keeping{
+        0xa9bf7bfd,   // stp x29, x30, [sp, #-16]!
+        0x910003fd,   // mov x29, sp
+        0x58000090,   // ldr x16, #16 (the literal below)
+        0xd63f0200,   // blr x16
+        0xa8c17bfd,   // ldp x29, x30, [sp], #16
+        0xd65f03c0,   // ret
+        static_cast<std::uint32_t>(destruct), static_cast<std::uint32_t>(destruct >> 32), 0, 0};
+    require(f.add_guest_method(keeper, "dealloc", f.code(keeping), "v@:"), "class_addMethod dealloc");
+    const auto object = f.runtime.allocate(keeper);
+    static_cast<void>(f.call("_objc_release", {object}));
+    require(f.process.objects().peek(object).has_value(), "a destructed, kept object is still allocated");
+    std::vector<Address> fresh;
+    for (int i = 0; i < 256; ++i) {
+        fresh.push_back(f.runtime.allocate(keeper));
+        require(fresh.back() != object, "a new object took the address of a destructed, kept one");
+    }
+    // Chrome turns a kept object into a zombie of its own class before freeing it much later.
+    const auto zombie = f.runtime.register_native_class("KeptZombie", root, 16);
+    static_cast<void>(f.call("_object_setClass", {object, zombie}));
+    static_cast<void>(f.call("_object_dispose", {object}));
+    require(!f.process.objects().peek(object).has_value(), "object_dispose freed the kept object");
+    // An ordinary object (NSObject's dealloc) is freed at its last release, as before.
+    const auto plain = f.runtime.register_native_class("PlainObject", root, 16);
+    const auto gone = f.runtime.allocate(plain);
+    static_cast<void>(f.call("_objc_release", {gone}));
+    require(!f.process.objects().peek(gone).has_value(), "an ordinary object is freed at its last release");
+    // A dealloc that ends with object_dispose instead of [super dealloc] (Foundation's host
+    // deallocs) is freed after it, as before.
+    const auto host = f.runtime.register_native_class("HostDisposing", root, 16);
+    static_cast<void>(f.runtime.add_native_method(host, "dealloc", [&f](auto& s, auto&) {
+        static_cast<void>(f.call("_object_dispose", {s.x[0]}));
+    }, false, "v@:"));
+    const auto hosted = f.runtime.allocate(host);
+    static_cast<void>(f.call("_objc_release", {hosted}));
+    require(!f.process.objects().peek(hosted).has_value(), "a dealloc ending in object_dispose frees the object");
+    // A dealloc that reaches the root -[NSObject dealloc] from a subclass's (a host class's
+    // dealloc sending [super dealloc]) is freed as well.
+    const auto derived = f.runtime.register_native_class("SuperCalling", root, 16);
+    static_cast<void>(f.runtime.add_native_method(derived, "dealloc", [&f, derived](auto& s, auto&) {
+        static_cast<void>(f.runtime.send_super(s.x[0], derived, f.runtime.selector("dealloc")));
+    }, false, "v@:"));
+    const auto through = f.runtime.allocate(derived);
+    static_cast<void>(f.call("_objc_release", {through}));
+    require(!f.process.objects().peek(through).has_value(), "a dealloc reaching NSObject's is freed");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc > 2 && std::string_view(argv[1]) == "--encoding") {
@@ -333,6 +390,7 @@ int main(int argc, char** argv) {
             test_send(cached);
         }
         if (!bench_only) test_concurrent_flush();
+        if (!bench_only) test_destructed_memory_kept();
         for (const bool cached : {true, false}) benchmark(cached);
         std::cout << "Alchemy GUI objc runtime tests passed\n";
         return 0;

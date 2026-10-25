@@ -224,7 +224,7 @@ struct FoundationBridge::Impl {
                 value->token = 0;
             }
             if (token) static_cast<void>(runtime_call("_objc_autoreleasePoolPop", {token}));
-            static_cast<void>(runtime_call("_objc_destructInstance", {state.x[0]}));
+            static_cast<void>(runtime_call("_object_dispose", {state.x[0]}));   // as NSObject's dealloc
         });
         for (const auto name : {"retain", "autorelease"}) method(cls, name, [](auto&, auto&) {
             throw std::runtime_error("Foundation NSAutoreleasePool cannot be retained or autoreleased");
