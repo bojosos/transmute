@@ -59,6 +59,7 @@ std::uint64_t translator_family_fingerprint() {
     if (const auto p2 = core::codegen_p2_knob_bits(); p2 != 0) {
         mix(0xfa);   // core_isel.hpp CodegenKnob (fx perf wave p2)
         mix(static_cast<unsigned char>(p2));
+        if (p2 >> 8) mix(static_cast<unsigned char>(p2 >> 8));
     }
     if (const auto t2 = core::codegen_tier2_bits(); t2 != 0) {
         mix(0xfb);   // tier-2 feature knobs

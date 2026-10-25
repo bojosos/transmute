@@ -69,9 +69,22 @@ JIT on miss, persistent cache for warm runs, optional AOT from `.pdata`.
   `TranslateOptions::abi_flags = true` (and the measurement knob
   `TRANSMUTE_FX_CORE=brdeadflags`, which extends the assumption to BR) treat
   NZCV as dead at BL/BLR/RET. That is faster and only correct for programs
-  that follow AAPCS64 everywhere. Making exact flags cheap is the open work
-  (`FX_PERF.md`): lazy materialisation, and flags proven dead across known
-  translated targets.
+  that follow AAPCS64 everywhere. Exact flags are kept cheap by the raw form below;
+  flags proven dead across known translated targets are open work
+  (`FX_PERF.md`).
+- **Flags at region exits (raw form).** An exit to other translated code
+  (B to another region, BL/BLR, BR, RET) with NZCV live stores only
+  `lahf; seto al` (the ARM carry already set up) into the low 16 bits of
+  `ctx->nzcv`; the ARM layout has a zero low half and AH bit 1 is always 1,
+  so the form tags itself. An entry whose code reads NZCV before writing it
+  converts the raw form (`cmp byte [nzcv + 1], 0` skips that when there is
+  none), and host code reads the field through `nzcv_value` /
+  `nzcv_normalize` (context.hpp): the dispatcher after every region, the
+  VEH, the one-instruction interpreter, synthetic calls (fx_engine's
+  load_state) and SEH contexts. Most targets write the flags before reading
+  them, and flags that only pass through a region (no read before the next
+  write) stay raw, so exact flags cost about three instructions per exit.
+  `TRANSMUTE_FX_CORE=norawflags` stores the ARM layout at exits.
 
 ## Stacks
 

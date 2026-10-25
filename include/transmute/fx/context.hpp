@@ -71,7 +71,8 @@ struct alignas(64) GuestContext {
     std::uint64_t x[32];          // x[0..30]; x[31] holds SP (never ZR).
     // ---- control state -----------------------------------------------------
     std::uint64_t pc;
-    std::uint64_t nzcv;           // ARM layout: N=bit31 Z=30 C=29 V=28. Valid when flushed.
+    std::uint64_t nzcv;           // ARM layout: N=bit31 Z=30 C=29 V=28. Valid when flushed
+                                  // (after translated code ran: nzcv_normalize).
     std::uint32_t fpcr;           // guest FPCR (mirrored into MXCSR while running)
     std::uint32_t fpsr;           // guest FPSR; cumulative flags also live in MXCSR (see docs)
     std::uint64_t tpidr_el0;
@@ -138,6 +139,19 @@ struct alignas(64) GuestContext {
     // nullptr: no convention (jump to the RSB entry directly).
     const void* stub_host_return;
 };
+
+// Region exits may leave NZCV in the translator's raw form: the low 16 bits
+// hold AX after lahf/seto (AH = SF ZF - AF - PF 1 CF with the ARM carry, AL
+// = OF), the rest is stale. The ARM layout has a zero low half, and AH bit 1
+// is always 1, so the form tags itself. Host code reads nzcv through
+// nzcv_value (or converts it in place first); the dispatcher converts it when
+// a region returns. Writers store the ARM layout (a zero low half).
+inline std::uint64_t nzcv_value(const GuestContext& c) noexcept {
+    const auto raw = c.nzcv & 0xffffu;
+    if (raw == 0) return c.nzcv;
+    return (((raw >> 15) & 1u) << 31) | (((raw >> 14) & 1u) << 30) | (((raw >> 8) & 1u) << 29) | ((raw & 1u) << 28);
+}
+inline void nzcv_normalize(GuestContext& c) noexcept { c.nzcv = nzcv_value(c); }
 
 // Displacement from r15 for a GuestContext byte offset.
 constexpr std::int32_t ctx_disp(std::size_t offset) noexcept {

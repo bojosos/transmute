@@ -188,6 +188,7 @@ const void* TestMachine::install(TranslatedRegion region, bool replace) {
 void TestMachine::enter(GuestContext& ctx, const void* host) const {
     using EnterFn = void (*)(void*, const void*);
     reinterpret_cast<EnterFn>(const_cast<void*>(enter_))(reinterpret_cast<char*>(&ctx) + kContextBias, host);
+    nzcv_normalize(ctx);   // as the runtime's dispatcher: a region exit's raw flags
 }
 
 RunResult TestMachine::run(GuestContext& ctx, const CodeSource& code, std::uint64_t stop_pc, unsigned max_dispatches) {

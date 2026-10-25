@@ -391,6 +391,7 @@ void run_guest(GuestContext& ctx) {
         const std::uint32_t entry_mxcsr = mxcsr_for_guest(ctx.fpcr, ctx.fpsr);
         ctx.fpsr &= ~kFpsrMxcsrMask;
         const auto mxcsr = g_stubs.enter(&ctx, code, entry_mxcsr);
+        nzcv_normalize(ctx);   // a region exit's raw flags (context.hpp)
         ctx.fpsr = fpsr_with_mxcsr_flags(ctx.fpsr, mxcsr);
         const auto reason = ctx.exit_reason;
         const auto arg = ctx.exit_arg;

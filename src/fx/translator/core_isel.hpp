@@ -49,6 +49,9 @@ inline bool isel_on(std::uint32_t knob) { return (isel_knob_bits() & knob) == 0;
 //                   resolved like any alias (stored when no register is
 //                   spare, then reloaded), not promoted to its host's entry
 //                   (galias_promote)
+//   norawflags    - region exits store NZCV in the ARM layout, not the raw
+//                   lahf/seto form the next reader converts
+//                   (materialize_state, normalize_entry_flags)
 // and opt-in ones (on when named):
 //   brdeadflags   - NZCV is dead at a BR that does not look intra-function
 //                   (no recognised table, no ADR/ADRP in its block), as at
@@ -66,6 +69,7 @@ enum CodegenKnob : std::uint32_t {
     knob_no_gpr_reuse = 32u,
     knob_merge_dirty = 64u,
     knob_no_alias_target = 128u,
+    knob_no_raw_flags = 256u,
 };
 std::uint32_t codegen_p2_knob_bits();
 // Tests: use `bits` instead of the environment (~0u: the environment again).

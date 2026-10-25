@@ -437,11 +437,24 @@ FX_TEST(isel_folded_access_faults_are_exact) {
 // ---- flags at call and return exits ---------------------------------------------
 
 namespace {
-// The EFLAGS -> NZCV conversion of a flags materialization: imul eax, eax, 0x10210000.
-bool materializes_flags(const TranslatedRegion& region) {
-    static constexpr std::uint8_t kImul[] = {0x69, 0xc0, 0x00, 0x00, 0x21, 0x10};
-    return std::search(region.code.begin(), region.code.end(), std::begin(kImul), std::end(kImul)) != region.code.end();
+bool contains(const TranslatedRegion& region, const std::vector<std::uint8_t>& bytes) {
+    return std::search(region.code.begin(), region.code.end(), bytes.begin(), bytes.end()) != region.code.end();
 }
+std::vector<std::uint8_t> with_disp32(std::vector<std::uint8_t> bytes, std::int32_t disp, std::vector<std::uint8_t> tail = {}) {
+    for (unsigned k = 0; k < 4; ++k) bytes.push_back(static_cast<std::uint8_t>(static_cast<std::uint32_t>(disp) >> (8 * k)));
+    bytes.insert(bytes.end(), tail.begin(), tail.end());
+    return bytes;
+}
+constexpr std::int32_t kNzcv = ctx_disp(offsetof(GuestContext, nzcv));
+// imul eax, eax, 0x10210000: the EFLAGS -> NZCV conversion.
+const std::vector<std::uint8_t> kImul = {0x69, 0xc0, 0x00, 0x00, 0x21, 0x10};
+// mov word ptr [r15 + nzcv], ax: an exit's raw flags.
+const std::vector<std::uint8_t> kRawStore = with_disp32({0x66, 0x41, 0x89, 0x87}, kNzcv);
+// cmp byte ptr [r15 + nzcv + 1], 0: an entry's raw-form check.
+const std::vector<std::uint8_t> kRawCheck = with_disp32({0x41, 0x80, 0xbf}, kNzcv + 1, {0x00});
+
+// A flags materialization, as the ARM layout or an exit's raw form.
+bool materializes_flags(const TranslatedRegion& region) { return contains(region, kImul) || contains(region, kRawStore); }
 
 TranslatedRegion translate_words(const std::vector<std::uint32_t>& words, bool abi_flags) {
     auto& r = runner();
@@ -475,6 +488,48 @@ FX_TEST(core_abi_flags_not_materialized_at_calls_and_returns) {
         if (materializes_flags(translate_words(c.words, true)) != c.live_with_abi)
             testing::report_failure(__FILE__, __LINE__, std::string(c.label) + ": abi flags");
     }
+    core::set_p2_knobs_for_testing(~0u);
+}
+
+// ---- raw flags at region exits ------------------------------------------------------
+
+// A direct exit with NZCV live stores the raw lahf/seto form (no conversion;
+// TRANSMUTE_FX_CORE=norawflags converts), and an entry whose code reads NZCV
+// first converts a raw form (cmp byte [nzcv + 1], 0); flags that only pass
+// through the region to an exit stay raw. Behaviour: regions cut
+// after one to three instructions pass the flags of a CMP through raw exits
+// to the B.cond / CSEL reading them.
+FX_TEST(core_raw_flags_at_exits) {
+    using namespace a64;
+    const auto cmp = add_shift(true, true, true, 0, 2, 0, 1, 31);   // cmp x1, x2
+    const std::vector<std::uint32_t> exit_words = {cmp, b(64)};        // b out of the code: a direct exit
+    const std::vector<std::uint32_t> reader_words = {bcond(0, 2), nop(), nop()};
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_raw_flags)}) {
+        core::set_p2_knobs_for_testing(knob);
+        const auto exit = translate_words(exit_words, false);
+        FX_CHECK_EQ(contains(exit, kRawStore), knob == 0);
+        FX_CHECK_EQ(contains(exit, kImul), knob != 0);
+        FX_CHECK_EQ(contains(translate_words(reader_words, false), kRawCheck), knob == 0);
+        FX_CHECK(!contains(translate_words({cmp, bcond(0, 2), nop(), nop()}, false), kRawCheck));   // writes first
+        // Flags that only pass through to the exit (a leaf like eor; ret): no check.
+        FX_CHECK(!contains(translate_words({logic_shift(true, 2, 0, false, 1, 1, 0, 0), ret()}, false), kRawCheck));
+    }
+    auto& r = runner();
+    const auto saved = r.machine.options;
+    const std::vector<std::uint32_t> prog = {cmp,
+                                             add_imm(true, false, false, 3, 10, 1),
+                                             csel(true, false, 6, 0, 0, 5, 7),   // csel x7, x5, x6, eq
+                                             bcond(11, 2),                        // b.lt
+                                             add_imm(true, false, false, 8, 10, 2),
+                                             adc(true, false, false, 4, 3, 9)};   // adc x9, x3, x4
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_raw_flags)}) {
+        core::set_p2_knobs_for_testing(knob);
+        for (unsigned len = 1; len <= 3; ++len) {
+            r.machine.options.max_instructions = len;
+            for (unsigned k = 0; k < 4; ++k) r.run(prog, r.context(7300 + k), "raw flags " + std::to_string(len));
+        }
+    }
+    r.machine.options = saved;
     core::set_p2_knobs_for_testing(~0u);
 }
 

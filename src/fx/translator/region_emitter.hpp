@@ -370,8 +370,16 @@ private:
     [[nodiscard]] std::int32_t ccmp_bool_reader() const;
     [[nodiscard]] Gp reusable_gpr(unsigned index) const;
     void prepare_clobber();
-    void materialize();
-    void materialize_state(FlagsState state, bool save_rax);
+    void materialize(bool raw = false);
+    // raw: a region exit's store, the raw form (lahf/seto in the low 16 bits
+    // of ctx->nzcv; normalize_entry_flags and nzcv_normalize convert it).
+    void materialize_state(FlagsState state, bool save_rax, bool raw = false);
+    void normalize_entry_flags(std::int32_t index);   // an entry reading NZCV: raw form -> ARM layout
+    // A region exit's flag store: one contiguous block that reads EFLAGS and
+    // writes only ctx->nzcv and rax, so a link may jump over it when the
+    // target writes NZCV before reading it.
+    void emit_exit_flags(FlagsState state) { materialize_state(state, false, true); }
+    [[nodiscard]] bool edge_raw(std::int32_t target) const;   // an edge into `target` may store the raw form
     [[nodiscard]] FlagsLocation fault_flags() const;
     Cond host_condition(unsigned cond);
     [[nodiscard]] bool needs_edge_materialize(std::int32_t target) const;
@@ -667,6 +675,9 @@ private:
         std::vector<std::int32_t> cache_slot;
         std::vector<CacheSnapshot> cache_snaps;
         std::vector<std::int32_t> loop_end;   // loop header -> last back-edge source (else -1)
+        // NZCV may be read inside the region before it is written (exits do
+        // not count: their next reader converts a raw form), per instruction.
+        std::vector<std::uint8_t> flags_read;
         std::vector<std::int32_t> loop_of;    // innermost loop header whose layout range holds the index (else -1)
         std::vector<std::int32_t> loop_slot;  // loop header -> loops index (computed on demand)
         std::vector<LoopInfo> loops;

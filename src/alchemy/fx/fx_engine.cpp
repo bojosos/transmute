@@ -303,7 +303,7 @@ void load_state(CpuState& state, const fx::GuestContext& ctx, bool vectors = tru
     state.sp = ctx.x[31];
     if (vectors)
         for (unsigned i = 0; i < 32; ++i) state.v[i] = {ctx.v[i][0], ctx.v[i][1]};
-    state.nzcv = static_cast<std::uint32_t>(ctx.nzcv);
+    state.nzcv = static_cast<std::uint32_t>(fx::nzcv_value(ctx));   // also a region exit's raw form
     state.fpcr = ctx.fpcr;
     state.fpsr = ctx.fpsr;
 }

@@ -24,7 +24,7 @@ constexpr std::uint32_t kNzcvMask = 0xf0000000u;
 void guest_to_arm64_context(const GuestContext& guest, Arm64Context& out, DWORD flags) {
     std::memset(&out, 0, sizeof(out));
     out.ContextFlags = flags;
-    out.Cpsr = static_cast<std::uint32_t>(guest.nzcv) & kNzcvMask;
+    out.Cpsr = static_cast<std::uint32_t>(nzcv_value(guest)) & kNzcvMask;   // also a region exit's raw form
     for (unsigned i = 0; i < 31; ++i) out.X[i] = guest.x[i];
     out.Sp = guest.x[31];
     out.Pc = guest.pc;

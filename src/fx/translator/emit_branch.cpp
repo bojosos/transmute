@@ -137,7 +137,7 @@ void RegionEmitter::e_call(const PlanInst& pi) {
     take(Gp::rax);
     take(Gp::rdx);
     take(Gp::r8);
-    materialize_state(flags_, false);
+    materialize_state(flags_, false, true);   // a region exit: the raw form (region_emitter.cpp)
     flags_ = FlagsState::ctx;
     // x30 = return pc. Plan::cold_layout: straight into x30's pin (the RSB
     // push stores it from there), else through rdx.
@@ -344,7 +344,7 @@ void RegionEmitter::e_indirect(const PlanInst& pi) {
     if (target == Gp::rcx) {
         take_value(Gp::rcx, val(d.rn));
     }
-    materialize_state(flags_, false);
+    materialize_state(flags_, false, true);   // a region exit: the raw form (region_emitter.cpp)
     flags_ = FlagsState::ctx;
     exit_pins(current_dirty());
     if (d.kind == Kind::ret) {

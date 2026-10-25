@@ -770,7 +770,7 @@ void RegionEmitter::park_bool() {
     flags_ = FlagsState::ctx;
 }
 
-void RegionEmitter::materialize() {
+void RegionEmitter::materialize(bool raw) {
     if (!is_host(flags_)) return;
     if (bool_reader_ >= 0) {
         park_bool();
@@ -784,7 +784,7 @@ void RegionEmitter::materialize() {
     }
     const bool save = !is_free(Gp::rax);
     if (!save) evict_gpr(x64::id(Gp::rax));   // rax is clobbered
-    materialize_state(flags_, save);
+    materialize_state(flags_, save, raw);
     flags_ = FlagsState::ctx;
 }
 
@@ -792,7 +792,15 @@ void RegionEmitter::materialize() {
 //   lahf: AH = SF ZF - AF - PF 1 CF; seto al
 //   eax & 0xC101 = SF<<15 | ZF<<14 | CF<<8 | OF
 //   * (1<<16 | 1<<21 | 1<<28) moves them to bits 31, 30, 29, 28 without carries.
-void RegionEmitter::materialize_state(FlagsState state, bool save_rax) {
+//
+// Region exits store only the first half (raw form, TRANSMUTE_FX_CORE=
+// norawflags: the full conversion): AX = AH:AL after lahf/seto with the ARM
+// carry, in the low 16 bits of ctx->nzcv (AH bit 1 is always 1, and the ARM
+// layout has a zero low half, so the form tags itself). The next reader
+// finishes the conversion: entries whose code reads NZCV
+// (normalize_entry_flags) and the runtime when the region returns
+// (nzcv_normalize). Most targets write the flags before they read any.
+void RegionEmitter::materialize_state(FlagsState state, bool save_rax, bool raw) {
     if (!is_host(state)) return;
     if (is_fcmp(state)) {
         materialize_fcmp(state == FlagsState::host_fcmp_swapped, save_rax);
@@ -802,11 +810,34 @@ void RegionEmitter::materialize_state(FlagsState state, bool save_rax) {
     if (state == FlagsState::host_sub) a_.cmc();
     a_.lahf();
     a_.setcc(Cond::o, Gp::rax);
+    if (raw && codegen_on(knob_no_raw_flags)) {
+        a_.mov(16, ptr(Gp::r15, kNzcvDisp), Gp::rax);
+        if (save_rax) a_.mov(64, Gp::rax, ptr(Gp::r15, spill_disp(kRaxSaveSlot)));
+        return;
+    }
     a_.and_(32, Gp::rax, 0xc101);
     a_.imul(32, Gp::rax, Gp::rax, 0x10210000);
     a_.and_(32, Gp::rax, static_cast<std::int32_t>(0xf0000000u));
     a_.mov(64, ptr(Gp::r15, kNzcvDisp), Gp::rax);
     if (save_rax) a_.mov(64, Gp::rax, ptr(Gp::r15, spill_disp(kRaxSaveSlot)));
+}
+
+// An entry whose code may read NZCV before writing it (s_.flags_read: flags
+// that only pass through to an exit stay raw) converts a raw form
+// (materialize_state) to the ARM layout: cmp byte [nzcv + 1], 0 (AH, never
+// 0 in the raw form); je over the second half of the conversion. Entries
+// expect the flushed state: rax and EFLAGS are free.
+void RegionEmitter::normalize_entry_flags(std::int32_t index) {
+    if (index < 0 || !s_.flags_read[static_cast<std::size_t>(index)] || !codegen_on(knob_no_raw_flags)) return;
+    const auto done = a_.new_label();
+    a_.cmp(8, ptr(Gp::r15, kNzcvDisp + 1), 0);
+    a_.jcc(Cond::e, done);
+    a_.movzx(32, Gp::rax, ptr(Gp::r15, kNzcvDisp), 16);
+    a_.and_(32, Gp::rax, 0xc101);
+    a_.imul(32, Gp::rax, Gp::rax, 0x10210000);
+    a_.and_(32, Gp::rax, static_cast<std::int32_t>(0xf0000000u));
+    a_.mov(64, ptr(Gp::r15, kNzcvDisp), Gp::rax);
+    a_.bind(done);
 }
 
 // Fused FCMP EFLAGS -> NZCV (GT 0010, LT 1000, EQ 0110, UN 0011) using only
@@ -922,6 +953,12 @@ Cond RegionEmitter::host_condition(unsigned cond) {
     return Cond::b;
 }
 
+// Flags live into `target` only on their way to an exit: the edge stores the
+// raw form (materialize_state), which nothing in the region reads.
+bool RegionEmitter::edge_raw(std::int32_t target) const {
+    return !s_.flags_read[static_cast<std::size_t>(target)] && codegen_on(knob_no_raw_flags);
+}
+
 bool RegionEmitter::needs_edge_materialize(std::int32_t target) const {
     const auto& t = plan_.insts[target];
     return is_host(flags_) && t.flags_live_in && !t.inherit_flags;
@@ -1032,7 +1069,7 @@ void RegionEmitter::mov_literal(Gp r, std::uint64_t value) {
 }
 
 void RegionEmitter::emit_direct_exit(std::uint64_t target, std::uint64_t dirty, FlagsState flags, bool restore) {
-    materialize_state(flags, false);
+    emit_exit_flags(flags);
     exit_pins(dirty, restore);
     a_.align_rel32_after(1);
     if (plan_.cold_layout && !cold_) {
@@ -1156,7 +1193,7 @@ void RegionEmitter::edge_inline(std::int32_t target) {
     if (t.inherit_flags) {
         inherited_[target] = flags_;
     } else if (needs_edge_materialize(target)) {
-        materialize();   // rax is never in a merge point's entry state
+        materialize(edge_raw(target));   // rax is never in a merge point's entry state
     }
     if (from != to) {
         lend_leave(from, to);
@@ -1644,6 +1681,7 @@ void RegionEmitter::start_block(std::int32_t index) {
             decide_entry(index, false);
         }
         a_.bind(entry_labels_[static_cast<std::size_t>(pi.entry_slot)]);
+        normalize_entry_flags(index);
         entry_pins(index);
         load_entry_state(index);
         s_.entry_inline[static_cast<std::size_t>(pi.entry_slot)] = 1;
@@ -1944,7 +1982,7 @@ void RegionEmitter::emit_stubs() {
                 const auto e = s_.cache_snaps[static_cast<std::size_t>(s_.cache_slot[static_cast<std::size_t>(s.target)])];
                 reconcile(e, false, dead_at(s.target));
             }
-            materialize_state(s.flags, false);   // rax is never in a merge point's entry state
+            materialize_state(s.flags, false, edge_raw(s.target));   // rax is never in a merge point's entry state
             lend_leave(s.lent, to);
             a_.jmp(label_of(s.target));
             break;
@@ -2012,6 +2050,7 @@ void RegionEmitter::emit_stubs() {
         if (s_.entry_inline[k]) continue;   // laid out in the body (start_block)
         a_.align(16);
         a_.bind(entry_labels_[k]);
+        normalize_entry_flags(plan_.entries[k].index);
         set_lent(lent_at(plan_.entries[k].index));
         entry_pins(plan_.entries[k].index);
         load_entry_state(plan_.entries[k].index);
@@ -2029,6 +2068,22 @@ void RegionEmitter::run() {
         plan_.for_each_successor(i, [&](std::int32_t t) {
             if (t <= i) s_.loop_end[static_cast<std::size_t>(t)] = std::max(s_.loop_end[static_cast<std::size_t>(t)], i);
         });
+    // Flags read before written inside the region (backward, to a fixed
+    // point): the plan's liveness without the exits.
+    s_.flags_read.assign(static_cast<std::size_t>(n), 0);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::int32_t i = n - 1; i >= 0; --i) {
+            const auto& pi = plan_.insts[static_cast<std::size_t>(i)];
+            bool out = false;
+            plan_.for_each_successor(i, [&](std::int32_t t) { out = out || s_.flags_read[static_cast<std::size_t>(t)] != 0; });
+            const std::uint8_t in = pi.reads_flags || (out && !pi.writes_flags);
+            if (in != s_.flags_read[static_cast<std::size_t>(i)]) {
+                s_.flags_read[static_cast<std::size_t>(i)] = in;
+                changed = true;
+            }
+        }
+    }
     // Innermost loop (layout range [header, last back-edge source]) of each instruction.
     s_.loop_of.assign(static_cast<std::size_t>(n), -1);
     s_.loop_slot.assign(static_cast<std::size_t>(n), -1);
@@ -2131,6 +2186,7 @@ void RegionEmitter::run() {
     }
     const auto start_index = plan_.entries[0].index;
     set_lent(lent_at(start_index));   // tier 2: the start block may lie in a loop that lends pins
+    normalize_entry_flags(start_index);
     entry_pins(start_index);
     jump_edge(start_index, -1, start_index == 0);   // from the empty cache (may load a loop's registers)
 

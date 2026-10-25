@@ -326,7 +326,7 @@ void context_to_cpu_state(const GuestContext& ctx, CpuState& state) {
     for (unsigned i = 0; i < 31; ++i) state.x[i] = ctx.x[i];
     state.sp = ctx.x[31];
     state.pc = ctx.pc;
-    state.nzcv = static_cast<std::uint32_t>(ctx.nzcv) & 0xf0000000u;
+    state.nzcv = static_cast<std::uint32_t>(nzcv_value(ctx)) & 0xf0000000u;   // also a region exit's raw form
     state.fpcr = ctx.fpcr;
     state.fpsr = ctx.fpsr;
     for (unsigned i = 0; i < 32; ++i) {

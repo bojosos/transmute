@@ -85,7 +85,7 @@ bool handle_translated_fault(const host::FaultRecord& fault, host::CpuContext& c
         else ctx.x[guest & 31] = host::gpr(c, static_cast<std::uint8_t>(reg));
     });
     switch (info.site.flags) {
-    case FlagsLocation::context: break;
+    case FlagsLocation::context: nzcv_normalize(ctx); break;   // a region exit's raw form (context.hpp)
     case FlagsLocation::host_register: ctx.nzcv = host::gpr(c, info.site.flags_register) & 0xf0000000u; break;
     default: ctx.nzcv = nzcv_from_eflags(host::eflags(c), info.site.flags); break;
     }
