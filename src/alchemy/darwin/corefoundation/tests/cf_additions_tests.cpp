@@ -141,7 +141,7 @@ void test_guest_cf_extra(Fixture& f) {
     static_cast<void>(system);
 }
 
-// cf_system.cpp: the system version dictionary, NSGetSizeAndAlignment and the CFBinaryHeap stops.
+// cf_system.cpp: the system version dictionary and NSGetSizeAndAlignment.
 void test_guest_cf_system(Fixture& f) {
     const auto cf = alchemy::core_foundation_library;
     const auto key = f.engine.read64(f.symbol(cf, "__kCFSystemVersionProductVersionKey"));
@@ -162,10 +162,6 @@ void test_guest_cf_system(Fixture& f) {
     require(layout("[3s]") == std::tuple{6ULL, 2ULL, 4ULL} && layout("^{Opaque}") == std::tuple{8ULL, 8ULL, 9ULL}, "array and pointer");
     require(layout("r*16@0:8") == std::tuple{8ULL, 8ULL, 4ULL} && layout("@\"NSString\"") == std::tuple{8ULL, 8ULL, 11ULL} &&
             layout("@?") == std::tuple{8ULL, 8ULL, 2ULL}, "qualifier, frame offset, class name, block");
-    bool stopped{};
-    try { static_cast<void>(f.call(cf, "_CFBinaryHeapCreate", {0, 0, 0, 0})); }
-    catch (const std::runtime_error& error) { stopped = std::string_view(error.what()).find("CFBinaryHeapCreate is unsupported") != std::string_view::npos; }
-    require(stopped, "CFBinaryHeapCreate stops explicitly");
 }
 
 void test_guest_preferences(Fixture& f) {

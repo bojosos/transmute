@@ -39,6 +39,21 @@
     external representations, CFShow, CFShowStr and CFLog.
   A guest NSString subclass is read and edited through its own
   NSString/NSMutableString methods, as CF dispatches to Objective-C.
+- **Collections** (alchemy-fx; cf_collections.cpp, cf_sets_notifications.cpp,
+  charset.cpp):
+  * CFBinaryHeap, ordered by its callbacks' compare function or by pointer;
+    kCFStringBinaryHeapCallBacks;
+  * CFBitVector, numbered from the high bit of the first byte as CF stores
+    it;
+  * CFTree, whose context infos are retained through the context
+    callbacks;
+  * CFBag with kCFTypeBagCallBacks, or NULL callbacks for pointer identity;
+  * the rest of CFSet: copy, membership, get, apply, replace, set, remove;
+  * CFArray: count, first and last index of a value, binary search and sort;
+  * CFDictionary: the count of a key or a value;
+  * CFCharacterSet: constructors from a range, a string or a bitmap,
+    inverted and copied sets, superset and plane tests, remove, intersect
+    and invert.
 - **Encodings:** UTF-8/16/32, ASCII and ISO Latin 1 convert in
   core_foundation.cpp. Every other encoding that the host's ICU has a
   converter for converts through ICU (cf_encodings.cpp): Mac OS Roman, the
@@ -53,7 +68,9 @@
   case mapping, transforms and character clusters. Phase 2 moves the rest
   behind the host `time` and `locale` areas.
 - **Unsupported, failing explicitly:**
-  * custom CFSet callbacks and custom allocators;
+  * custom CFSet and CFBag callbacks and custom allocators;
+  * kCFCopyStringDictionaryKeyCallBacks and kCFCopyStringSetCallBacks are not
+    exported (collections retain their keys, and these would copy them);
   * non-file URLs without the network provider;
   * managed preferences (none exist);
   * kCFStringEncodingNonLossyASCII and kCFStringEncodingNextStepLatin, which

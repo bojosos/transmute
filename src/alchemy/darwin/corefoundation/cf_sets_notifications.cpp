@@ -9,7 +9,8 @@
 
 // CoreFoundation gaps of the Qt WebEngine images (all real unless noted):
 // - CFSet with kCFTypeSetCallBacks is the NSSet/NSMutableSet bridge (the
-//   Foundation provider's native sets, membership by -isEqual: = CFEqual).
+//   Foundation provider's native sets, membership by -isEqual: = CFEqual):
+//   create, copy, count, membership, get, apply, add, replace, set, remove.
 //   Other callback structures are unsupported and stop explicitly.
 // - CFNotificationCenter: the local center is NSNotificationCenter's default
 //   center (observers are block observers that call the C callback). The
@@ -135,8 +136,71 @@ void CoreFoundationGaps::install_sets() {
         const auto values = cf.array_values(all);
         for (std::size_t index = 0; index < values.size(); ++index) m.write64(s.x[1] + index * 8, values[index]);
     });
-    // CFBag: no bag can be created (CFBagCreate is not provided); the type id is distinct.
-    constant(core_foundation, "_CFBagGetTypeID", static_cast<Address>(TypeId::cf_bag));
+    const auto require_set = [this](Address object, const char* function) {
+        if (!is_set(object)) throw std::runtime_error(std::string("Alchemy: ") + function + " of a non-CFSet object");
+    };
+    const auto require_mutable = [this](Address object, const char* function) {
+        if (!object || objc.object_class(object) != mutable_set_class)
+            throw std::runtime_error(std::string("Alchemy: ") + function + " on an immutable or non-CFSet object");
+    };
+    // CFSetCreateCopy(alloc, set) / CFSetCreateMutableCopy(alloc, capacity, set)
+    raw(core_foundation, "_CFSetCreateCopy", [this, require_set](CpuState& s, GuestMemory&) {
+        require_set(s.x[1], "CFSetCreateCopy");
+        s.x[0] = send(send(set_class, "alloc"), "initWithSet:", {s.x[1]});
+    });
+    raw(core_foundation, "_CFSetCreateMutableCopy", [this, require_set](CpuState& s, GuestMemory&) {
+        require_set(s.x[2], "CFSetCreateMutableCopy");
+        s.x[0] = send(send(mutable_set_class, "alloc"), "initWithSet:", {s.x[2]});
+    });
+    raw(core_foundation, "_CFSetGetCountOfValue", [this, require_set](CpuState& s, GuestMemory&) {
+        require_set(s.x[0], "CFSetGetCountOfValue");
+        s.x[0] = s.x[1] && send(s.x[0], "member:", {s.x[1]}) ? 1 : 0;
+    });
+    raw(core_foundation, "_CFSetContainsValue", [this, require_set](CpuState& s, GuestMemory&) {
+        require_set(s.x[0], "CFSetContainsValue");
+        s.x[0] = s.x[1] && send(s.x[0], "member:", {s.x[1]}) ? 1 : 0;
+    });
+    raw(core_foundation, "_CFSetGetValue", [this, require_set](CpuState& s, GuestMemory&) {
+        require_set(s.x[0], "CFSetGetValue");
+        s.x[0] = s.x[1] ? send(s.x[0], "member:", {s.x[1]}) : 0;
+    });
+    // Boolean CFSetGetValueIfPresent(set, candidate, const void **value)
+    raw(core_foundation, "_CFSetGetValueIfPresent", [this, require_set](CpuState& s, GuestMemory& m) {
+        require_set(s.x[0], "CFSetGetValueIfPresent");
+        const auto found = s.x[1] ? send(s.x[0], "member:", {s.x[1]}) : 0;
+        if (found && s.x[2]) m.write64(s.x[2], found);
+        s.x[0] = found != 0;
+    });
+    // void CFSetApplyFunction(set, CFSetApplierFunction applier(value, context), context)
+    raw(core_foundation, "_CFSetApplyFunction", [this, require_set](CpuState& s, GuestMemory&) {
+        require_set(s.x[0], "CFSetApplyFunction");
+        const auto values = cf.array_values(send(s.x[0], "allObjects"));
+        for (const auto value : values) {
+            const std::array<Address, 2> arguments{value, s.x[2]};
+            static_cast<void>(bridge->call_address(s.x[1], arguments));
+        }
+    });
+    // Replace: only a present value; Set: the value, present or not.
+    raw(core_foundation, "_CFSetReplaceValue", [this, require_mutable](CpuState& s, GuestMemory&) {
+        require_mutable(s.x[0], "CFSetReplaceValue");
+        const auto found = s.x[1] ? send(s.x[0], "member:", {s.x[1]}) : 0;
+        if (!found) return;
+        static_cast<void>(send(s.x[0], "removeObject:", {found}));
+        static_cast<void>(send(s.x[0], "addObject:", {s.x[1]}));
+    });
+    raw(core_foundation, "_CFSetSetValue", [this, require_mutable](CpuState& s, GuestMemory&) {
+        require_mutable(s.x[0], "CFSetSetValue");
+        if (const auto found = s.x[1] ? send(s.x[0], "member:", {s.x[1]}) : 0) static_cast<void>(send(s.x[0], "removeObject:", {found}));
+        static_cast<void>(send(s.x[0], "addObject:", {s.x[1]}));
+    });
+    raw(core_foundation, "_CFSetRemoveValue", [this, require_mutable](CpuState& s, GuestMemory&) {
+        require_mutable(s.x[0], "CFSetRemoveValue");
+        if (s.x[1]) static_cast<void>(send(s.x[0], "removeObject:", {s.x[1]}));
+    });
+    raw(core_foundation, "_CFSetRemoveAllValues", [this, require_mutable](CpuState& s, GuestMemory&) {
+        require_mutable(s.x[0], "CFSetRemoveAllValues");
+        static_cast<void>(send(s.x[0], "removeAllObjects"));
+    });
 }
 
 void CoreFoundationGaps::install_notification_centers() {

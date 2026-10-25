@@ -16,9 +16,8 @@
 //     the SystemVersion.plist dictionary of Alchemy's one OS profile
 //     (alchemy/darwin_version.hpp; no ProductVersionExtra, as on a release);
 //   - NSGetSizeAndAlignment (exported by CoreFoundation on arm64): size and
-//     alignment of one Objective-C type encoding, by the arm64 (LP64) ABI;
-//   - CFBinaryHeap: explicit stops. Only ReactiveObjC's RACTestScheduler
-//     uses a binary heap, and nothing implements the CF type yet.
+//     alignment of one Objective-C type encoding, by the arm64 (LP64) ABI.
+//   (CFBinaryHeap, which ReactiveObjC's RACTestScheduler uses, is cf_collections.cpp.)
 namespace alchemy::export_fill {
 
 // NSGetSizeAndAlignment's parser: the type at `encoding[at]`, with its leading
@@ -135,16 +134,6 @@ void install_cf_system(Provider& p, CoreFoundation& cf) {
         return s.x[0] + at;
     });
 
-    // CFBinaryHeap: explicit stops.
-    for (const auto* name : {"_CFBinaryHeapCreate", "_CFBinaryHeapAddValue", "_CFBinaryHeapGetMinimumIfPresent",
-                             "_CFBinaryHeapRemoveMinimumValue", "_CFBinaryHeapGetCount", "_CFBinaryHeapGetMinimum",
-                             "_CFBinaryHeapRemoveAllValues"}) {
-        if (process.resolve(cf_library, name)) continue;
-        p.function(cf_library, name, [name](CpuState&, GuestMemory&) -> std::uint64_t {
-            throw std::runtime_error(std::string("Alchemy: ") + (name + 1) + " is unsupported (no CFBinaryHeap type)");
-        });
-        mark_placeholder_export(process, cf_library, name);
-    }
 }
 
 } // namespace alchemy::export_fill

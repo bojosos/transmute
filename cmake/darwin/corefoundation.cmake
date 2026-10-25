@@ -23,6 +23,7 @@ list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES ${alchemy_corefoundation_headless_shel
 list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/corefoundation/cf_sets_notifications.cpp
     src/alchemy/darwin/corefoundation/charset.cpp
+    src/alchemy/darwin/corefoundation/cf_collections.cpp
     src/alchemy/darwin/corefoundation/cf_extra.cpp
     src/alchemy/darwin/corefoundation/cf_system.cpp
     src/alchemy/darwin/corefoundation/cf_plist.cpp
@@ -44,6 +45,9 @@ function(alchemy_darwin_corefoundation_tests)
     alchemy_gui_add_unit_test(alchemy_gui_corefoundation_string_clusters src/alchemy/darwin/corefoundation/tests/cf_string_clusters_tests.cpp TIMEOUT 180)
     # CF strings (cf_strings.cpp) and the ICU encodings (cf_encodings.cpp) over the full provider set.
     alchemy_gui_add_unit_test(alchemy_gui_corefoundation_strings src/alchemy/darwin/corefoundation/tests/cf_strings_tests.cpp TIMEOUT 180)
+    # CFBinaryHeap, CFBitVector, CFTree, CFBag, the CFSet/CFArray/CFDictionary additions and the
+    # CFCharacterSet constructors (cf_collections.cpp, cf_sets_notifications.cpp, charset.cpp).
+    alchemy_gui_add_unit_test(alchemy_gui_corefoundation_collections src/alchemy/darwin/corefoundation/tests/cf_collections_tests.cpp TIMEOUT 180)
     if(NOT ALCHEMY_GUI_FIXTURES_ENABLED)
         return()
     endif()

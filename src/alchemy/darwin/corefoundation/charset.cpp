@@ -201,6 +201,25 @@ public:
         }
         return bridge->data(bytes);
     }
+    // The ranges of a CFCharacterSetCreateBitmapRepresentation bitmap (bit c & 7 of byte c >> 3).
+    Ranges from_bitmap(Address data) {
+        const auto length = static_cast<std::size_t>(cf.invoke("CFDataGetLength", std::array<Address, 1>{data}));
+        std::vector<std::uint8_t> bytes(length);
+        if (length) memory().read_bytes(cf.invoke("CFDataGetBytePtr", std::array<Address, 1>{data}), bytes);
+        Ranges ranges;
+        const auto add_plane = [&](std::uint32_t plane, std::size_t offset) {
+            for (std::uint32_t c = 0; c < 0x10000; ++c) {
+                if (!((bytes[offset + (c >> 3)] >> (c & 7)) & 1)) continue;
+                const auto code = (plane << 16) | c;
+                if (!ranges.empty() && ranges.back().second + 1 == code) ranges.back().second = code;
+                else ranges.emplace_back(code, code);
+            }
+        };
+        if (bytes.size() >= 8192) add_plane(0, 0);
+        for (std::size_t at = 8192; at + 8193 <= bytes.size(); at += 8193)
+            if (bytes[at] >= 1 && bytes[at] <= 16) add_plane(bytes[at], at + 1);
+        return normalized(std::move(ranges));
+    }
     Ranges string_ranges(Address string) {
         Ranges ranges;
         for (const auto c : code_points(cf.units(string))) ranges.emplace_back(c, c);
@@ -238,6 +257,52 @@ void CharacterSets::install() {
         s.x[0] = contains(ranges_of(s.x[0]), static_cast<std::uint32_t>(s.x[1]));
     });
     raw(core_foundation, "_CFCharacterSetCreateBitmapRepresentation", [this](CpuState& s, GuestMemory&) { s.x[0] = bitmap(s.x[1]); });
+    constant(core_foundation, "_CFCharacterSetGetTypeID", static_cast<Address>(TypeId::character_set));
+    const auto range_ranges = [](Address location, Address length) -> Ranges {
+        if (!length) return {};
+        if (location > last_code_point || length - 1 > last_code_point - location) throw std::runtime_error("Alchemy: CFCharacterSet range outside Unicode");
+        return {{static_cast<std::uint32_t>(location), static_cast<std::uint32_t>(location + length - 1)}};
+    };
+    // CFCharacterSetCreateWithCharactersInRange(alloc, CFRange) / ...InString(alloc, string)
+    raw(core_foundation, "_CFCharacterSetCreateWithCharactersInRange", [this, range_ranges](CpuState& s, GuestMemory&) {
+        s.x[0] = make(range_ranges(s.x[1], s.x[2]), false);
+    });
+    raw(core_foundation, "_CFCharacterSetCreateWithCharactersInString", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = make(s.x[1] ? string_ranges(s.x[1]) : Ranges{}, false);
+    });
+    // CFCharacterSetCreateWithBitmapRepresentation(alloc, CFData): the BMP bitmap, then plane byte + bitmap pairs.
+    raw(core_foundation, "_CFCharacterSetCreateWithBitmapRepresentation", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = make(s.x[1] ? from_bitmap(s.x[1]) : Ranges{}, false);
+    });
+    raw(core_foundation, "_CFCharacterSetCreateInvertedSet", [this](CpuState& s, GuestMemory&) { s.x[0] = make(inverted(ranges_of(s.x[1])), false); });
+    raw(core_foundation, "_CFCharacterSetCreateCopy", [this](CpuState& s, GuestMemory&) { s.x[0] = make(ranges_of(s.x[1]), false); });
+    raw(core_foundation, "_CFCharacterSetCreateMutableCopy", [this](CpuState& s, GuestMemory&) { s.x[0] = make(ranges_of(s.x[1]), true); });
+    raw(core_foundation, "_CFCharacterSetIsCharacterMember", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = contains(ranges_of(s.x[0]), static_cast<std::uint16_t>(s.x[1]));
+    });
+    raw(core_foundation, "_CFCharacterSetIsSupersetOfSet", [this](CpuState& s, GuestMemory&) {
+        const auto mine = ranges_of(s.x[0]), other = ranges_of(s.x[1]);
+        s.x[0] = intersected(mine, other) == other;
+    });
+    raw(core_foundation, "_CFCharacterSetHasMemberInPlane", [this](CpuState& s, GuestMemory&) {
+        const auto plane = static_cast<std::uint32_t>(s.x[1]);
+        s.x[0] = plane <= 16 && !intersected(ranges_of(s.x[0]), {{plane << 16, (plane << 16) | 0xffff}}).empty();
+    });
+    raw(core_foundation, "_CFCharacterSetRemoveCharactersInRange", [this, range_ranges](CpuState& s, GuestMemory&) {
+        const auto removed = range_ranges(s.x[1], s.x[2]);
+        modify(s.x[0], [&](const Ranges& r) { return intersected(r, inverted(normalized(removed))); });
+    });
+    raw(core_foundation, "_CFCharacterSetRemoveCharactersInString", [this](CpuState& s, GuestMemory&) {
+        const auto removed = normalized(string_ranges(s.x[1]));
+        modify(s.x[0], [&](const Ranges& r) { return intersected(r, inverted(removed)); });
+    });
+    raw(core_foundation, "_CFCharacterSetIntersect", [this](CpuState& s, GuestMemory&) {
+        const auto other = ranges_of(s.x[1]);
+        modify(s.x[0], [&](const Ranges& r) { return intersected(r, other); });
+    });
+    raw(core_foundation, "_CFCharacterSetInvert", [this](CpuState& s, GuestMemory&) {
+        modify(s.x[0], [](const Ranges& r) { return inverted(r); });
+    });
 
     // ---- Foundation (NSCharacterSet / NSMutableCharacterSet) ----
     const std::array<std::pair<const char*, std::uint32_t>, 15> names{{
@@ -285,6 +350,12 @@ void CharacterSets::install() {
         method(set_class, selector, [this, ranges, cached](CpuState& s, GuestMemory&) {
             if (!*cached) *cached = make(ranges, false);   // kept for the process, as Foundation's shared sets
             s.x[0] = *cached;
+        }, true);
+    }
+    for (const auto target : {set_class, mutable_class}) {
+        const bool is_mutable = target == mutable_class;
+        method(target, "characterSetWithBitmapRepresentation:", [this, is_mutable](CpuState& s, GuestMemory&) {
+            s.x[0] = bridge->autorelease(make(s.x[2] ? from_bitmap(s.x[2]) : Ranges{}, is_mutable));
         }, true);
     }
     method(mutable_class, "new", [this](CpuState& s, GuestMemory&) { s.x[0] = make({}, true); }, true);
