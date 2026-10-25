@@ -40,6 +40,15 @@ public:
         (void)pc;
         return false;
     }
+    // True if `address` is in a mapped image's code, not in memory the guest
+    // registered for its own JIT: such code changes only with its image or by
+    // a write fx catches, which kill regions that list it in guest_ranges.
+    // Region formation may then let a region depend on code it does not
+    // translate (a call target's first instructions, Plan::dependency_ranges).
+    virtual bool image_code(std::uint64_t address) const {
+        (void)address;
+        return false;
+    }
 };
 
 enum class FixupKind : std::uint8_t {
@@ -64,14 +73,23 @@ struct CodeFixup {
 struct RegionEntry {
     std::uint64_t guest_pc;
     std::uint32_t offset;
+    // The entry's code writes NZCV before anything reads it or leaves the
+    // region (the plan's flags liveness): an exit linked here may skip its
+    // flag store (RegionExit::skip_rel32_offset).
+    bool flags_dead{};
 };
 
 // Unlinked direct branch: rel32 field at `rel32_offset` (4-byte aligned)
 // initially jumps to the region's own unlinked tail. The runtime may patch it
 // to the entry of the region translated for `target_pc`.
+// skip_rel32_offset (0: none): an exit whose flags are in host form stores
+// them between two patchable jmps: `jmp A` (this field) initially reaches the
+// store, then `jmp B` (rel32_offset). The runtime links A when the target's
+// entry is flags_dead (no store), else B.
 struct RegionExit {
     std::uint32_t rel32_offset;
     std::uint64_t target_pc;
+    std::uint32_t skip_rel32_offset{};
 };
 
 enum class FlagsLocation : std::uint8_t {

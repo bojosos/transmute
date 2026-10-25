@@ -176,6 +176,28 @@ aliased, duplicated or cut: its written pages exist only in it.
     rel32 to the target region's entry and records the initial rel32 at
     install (unlink restores it). In-line exits keep their tail in the
     region's cold section (below).
+  - Flag stores skipped at links (cache format 6): a direct exit whose flags
+    are still in EFLAGS stores its pins, then `jmp A` (a second patchable
+    rel32, `RegionExit::skip_rel32_offset`) to a cold `[raw flag store; jmp
+    rel32 B]`. An entry that writes NZCV before any read or live exit
+    (`RegionEntry::flags_dead`, the plan's exact liveness) gets exits linked
+    through A, past the store; other entries through B. Unlink restores both;
+    a replaced entry relinks with its own bit. Between such a jump and the
+    target's first flag write `ctx->nzcv` is stale: only an interrupt exit or
+    a fault in that span observes it (as under the ABI flags model).
+    `TRANSMUTE_FX_CORE=noflagskip` stores always. Calls and returns still
+    store (the RSB push and compare clobber EFLAGS).
+  - Dead targets at translation time: a direct B, B.cond, CBZ/TBZ or BL out
+    of the region, or a region cut, whose target is image code
+    (`CodeSource::image_code`, not the guest's JIT memory) that writes NZCV
+    within its first 16 straight-line core instructions before reading it or
+    leaving (`target_flags_dead`) counts as a flags-dead exit in the plan's
+    liveness: no store there, nor earlier stores made only for it (a loop
+    back edge before a call). The scanned words join the region's
+    guest_ranges (`Plan::dependency_ranges`), so a write there kills the
+    region. As with skip links, a fault or interrupt in the target before
+    its first flag write sees `ctx->nzcv` stale; program behaviour is
+    unchanged. `TRANSMUTE_FX_CORE=nodeadtargets` keeps every direct exit live.
   - **Code layout** (`TRANSMUTE_FX_CORE=oldlayout` restores the previous
     one; folded into the fingerprint): each region is its body, then a cold
     section (`TranslationStats::hot_bytes`, cache format 5): exit and

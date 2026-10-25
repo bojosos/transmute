@@ -161,7 +161,8 @@ private:
         // the pins and exits with `reason` (pc, `arg`).
         enum class K : std::uint8_t { direct_exit, edge, interrupt, entry, return_trampoline, entry_jump, tier_up,
                                       loop_tier_up, exit_tail, lookup, indirect_exit, reason_exit,
-                                      region_tier_up } k;   // region_tier_up: a loop's counter ran out (tier 2)
+                                      region_tier_up,   // region_tier_up: a loop's counter ran out (tier 2)
+                                      flags_exit } k;   // flags_exit: an exit's flag store and jmp B (skip_field: jmp A)
         x64::Label label;
         FlagsState flags;
         std::uint64_t dirty;   // pinned GPRs (low 32 bits) and vectors (high 32 bits)
@@ -176,6 +177,7 @@ private:
         // their hosts, so the exit must not reload them.
         bool boundary{};
         x64::Label field{};             // exit_tail
+        std::uint32_t skip_field{};     // flags_exit: its jmp A's rel32 offset
         // Tier 2: pins lent to the register cache where the stub's code
         // starts (exits reload lent convention registers; edge stubs go from
         // this to the target's lent set). 0 in the boundary state.
@@ -411,6 +413,7 @@ private:
     // persistent cache knows the 8 bytes are a constant, not an address.
     void mov_literal(Gp r, std::uint64_t value);
     void emit_direct_exit(std::uint64_t target, std::uint64_t dirty, FlagsState flags, bool restore = true);
+    void emit_exit_jump(std::uint64_t target, std::uint32_t skip_field);   // emit_direct_exit's jmp B and tail
     void emit_exit_with_reason(std::uint64_t pc, ExitReason reason, std::uint64_t arg, bool has_arg);
     void emit_interpret_exit(std::int32_t index);
     // Pins to the context (evicted convention registers back), then an exit

@@ -378,13 +378,14 @@ FX_TEST(cache_rejects_corrupt_truncated_and_mismatched_files) {
     bad[40] ^= 0x10;
     FX_CHECK_EQ(run_with(bad, &misses), 0u);
     // Version mismatch with a self-consistent header (e.g. older translator ABI).
-    for (int field = 0; field < 3; ++field) {
+    for (int field = 0; field < 4; ++field) {
         bad = good;
         fmt::FileHeader h;
         std::memcpy(&h, bad.data(), sizeof(h));
         if (field == 0) h.key.abi_version += 1;
         if (field == 1) h.key.format_version += 1;
         if (field == 2) h.key.cpu_features ^= 1;
+        if (field == 3) h.key.format_version = 5;   // a format 5 file: no flag-skip fields in its records
         h.header_checksum = fmt::header_checksum(h);
         std::memcpy(bad.data(), &h, sizeof(h));
         FX_CHECK_EQ(run_with(bad, &misses), 0u);

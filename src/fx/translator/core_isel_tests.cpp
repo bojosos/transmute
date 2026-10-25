@@ -575,6 +575,43 @@ FX_TEST(core_dead_target_exits) {
     core::set_p2_knobs_for_testing(~0u);
 }
 
+// The scan behind core_dead_target_exits (target_flags_dead): a B or BL out
+// of a region cut after two instructions, into image code that writes NZCV
+// first, stores no flags, and the region lists the scanned target words in
+// guest_ranges (a write there kills it). A target that reads first, or code
+// that is not image code (the guest's JIT memory), keeps the raw store.
+FX_TEST(core_dead_target_scan_codegen) {
+    using namespace a64;
+    const auto cmp12 = add_shift(true, true, true, 0, 2, 0, 1, 31);   // cmp x1, x2
+    const auto cmp34 = add_shift(true, true, true, 0, 4, 0, 3, 31);   // cmp x3, x4
+    const auto csel = a64::csel(true, false, 6, 0, 0, 5, 7);          // csel x7, x5, x6, eq
+    auto& r = runner();
+    const auto translate = [&](const std::vector<std::uint32_t>& words, bool image) {
+        auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
+        std::memcpy(program, words.data(), words.size() * 4);
+        BufferCode code(r.code_base(), r.program_base() + words.size() * 4);
+        code.image = image;
+        TranslateOptions options;
+        options.max_instructions = 2;
+        return translate_region(r.program_base(), code, options);
+    };
+    const auto lists = [&](const TranslatedRegion& region, std::uint64_t begin, std::uint64_t end) {
+        for (const auto& range : region.guest_ranges)
+            if (range.first == begin && range.second == end) return true;
+        return false;
+    };
+    const auto target = r.program_base() + 12;   // word 3
+    const bool on = core::codegen_on(core::knob_no_dead_targets);
+    for (const auto jump : {b(2), bl(2)}) {
+        const auto dead = translate({cmp12, jump, nop(), cmp34, csel}, true);
+        FX_CHECK_EQ(contains(dead, kRawStore), !on);
+        FX_CHECK_EQ(lists(dead, target, target + 4), on);
+        FX_CHECK(contains(translate({cmp12, jump, nop(), csel, cmp34}, true), kRawStore));     // reads first
+        FX_CHECK(contains(translate({cmp12, jump, nop(), nop(), csel}, true), kRawStore));     // reads after a nop
+        FX_CHECK(contains(translate({cmp12, jump, nop(), cmp34, csel}, false), kRawStore));    // not image code
+    }
+}
+
 // ---- dirty cache across branches into single-predecessor blocks ------------------
 
 // x1 and x2 are written (dirty in the register cache) before a CBZ/TBNZ whose

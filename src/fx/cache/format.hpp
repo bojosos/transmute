@@ -29,7 +29,9 @@ inline constexpr std::uint32_t kRecordMagic = 0x4752'5846u;             // "FXRG
 // 3: fault maps (FaultSite::map, TranslatedRegion::fault_maps/fault_map_regs).
 // 4: tiers (kRecordTier0, RecordHeader::tier_counter).
 // 5: code layout (RecordHeader::hot_bytes = TranslationStats::hot_bytes).
-inline constexpr std::uint32_t kFormatVersion = 5;
+// 6: flag stores skipped at links (DiskEntry::flags = RegionEntry::flags_dead,
+//    DiskExit::skip_rel32_offset = RegionExit::skip_rel32_offset).
+inline constexpr std::uint32_t kFormatVersion = 6;
 // RecordHeader::flags
 inline constexpr std::uint32_t kRecordPinned = 1;  // usable only with the module at pinned_base
 // A tier-0 (provisional, counted) region (TranslatedRegion::tier == 0). Lookups
@@ -110,8 +112,10 @@ static_assert(sizeof(RecordHeader) == 104);
 
 inline bool record_tier0(const RecordHeader& h) noexcept { return (h.flags & kRecordTier0) != 0; }
 
-struct DiskEntry { std::uint32_t rva; std::uint32_t offset; };
-struct DiskExit { std::uint32_t rel32_offset; std::uint32_t target_rva; };
+inline constexpr std::uint32_t kEntryFlagsDead = 1;   // DiskEntry::flags (format 6)
+struct DiskEntry { std::uint32_t rva; std::uint32_t offset; std::uint32_t flags; std::uint32_t reserved; };
+// skip_rel32_offset: 0, or a second patchable rel32 (format 6).
+struct DiskExit { std::uint32_t rel32_offset; std::uint32_t target_rva; std::uint32_t skip_rel32_offset; std::uint32_t reserved; };
 // kind 0 (guest_address_imm64): `rva` is module-relative and rebased on load.
 // kind 1 (literal_imm64): `rva` holds the constant itself, never rebased.
 struct DiskFixup { std::uint32_t offset; std::uint32_t kind; std::uint64_t rva; };
@@ -124,6 +128,7 @@ struct DiskFaultMap { std::uint32_t begin, count; };   // into the record's map 
 struct DiskPin { std::uint8_t guest, host, vector, pad; };
 struct DiskRange { std::uint32_t begin_rva, end_rva; };
 static_assert(sizeof(DiskFixup) == 16 && sizeof(DiskFault) == 16 && sizeof(DiskPin) == 4);
+static_assert(sizeof(DiskEntry) == 16 && sizeof(DiskExit) == 16);
 
 // Decoded (validated) view over a record in a mapped file or buffer.
 struct RecordView {

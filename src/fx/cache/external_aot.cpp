@@ -232,6 +232,7 @@ public:
     bool has_entry(std::uint64_t pc) const override {
         return m_.in_text(pc) && m_.test(static_cast<std::uint32_t>(pc - m_.base));
     }
+    bool image_code(std::uint64_t address) const override { return m_.in_text(address); }
     // Every word read still holds the value the translator saw.
     bool unchanged() const {
         for (const auto& [address, word] : reads_) {

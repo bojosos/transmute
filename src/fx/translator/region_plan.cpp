@@ -555,14 +555,26 @@ bool table_target(const CodeSource& code, const TableMatch& m, unsigned k, std::
 
 } // namespace
 
-// p1 replaces this with a straight-line scan of image code from target_pc
-// (the first NZCV write before any read, branch or exit means dead; the
-// scanned bytes become a dependency of the region). Until then every target
-// is assumed to read the flags.
+// A straight-line scan of the target's first kFlagScan core instructions, in
+// image code only (CodeSource::image_code): an NZCV write means dead; a read,
+// any control flow (branch, SVC, BRK, interpret), a non-core or undecodable
+// word, or the limit means live. The scanned words become a dependency of the
+// plan (Plan::dependency_ranges), so a write there kills the region. A fault
+// or interrupt before the write sees ctx->nzcv stale (docs/FX_ENGINE.md).
 bool target_flags_dead(const CodeSource& code, std::uint64_t target_pc, Plan& plan) {
-    (void)code;
-    (void)target_pc;
-    (void)plan;
+    constexpr unsigned kFlagScan = 16;
+    if ((target_pc & 3) != 0) return false;
+    for (unsigned k = 0; k < kFlagScan; ++k) {
+        const auto pc = target_pc + 4ull * k;
+        Inst d;
+        if (!code.image_code(pc) || !decode_at(code, pc, d) || d.kind == Kind::unknown || is_branch(d)) return false;
+        const auto u = usage(d);
+        if (u.reads_flags) return false;
+        if (u.writes_flags) {
+            plan.dependency_ranges.emplace_back(target_pc, pc + 4);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -587,6 +599,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     bool skipped_continuation = false;
     plan.start = guest_pc;
     plan.insts.clear();
+    plan.dependency_ranges.clear();
     plan.words.clear();
     plan.entries.clear();
     plan.interpret_count = 0;
@@ -624,6 +637,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     plan.inline_entries = !overrides.cold_entries;
     plan.align_loops = overrides.align_loops;
     plan.align_hot = overrides.align_hot;
+    plan.flag_skip = !overrides.no_flag_skip;
     plan.loop_alignment = overrides.align32 ? 32u : 16u;
     plan.carry_clean = !overrides.carry_dirty && !(plan.optimize && overrides.t2_carry);   // t2carry: dirty across loop edges
     stack.clear();

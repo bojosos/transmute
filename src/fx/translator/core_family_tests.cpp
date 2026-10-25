@@ -554,6 +554,39 @@ FX_TEST(core_inline_indirect_lookup) {
 // has tag 0, so an empty slot (0) "hits" and enters the miss stub at arena
 // offset 0, which stores the target itself; misaligned targets take the miss
 // path. Either way the exit names the target.
+// A direct exit with host-form flags (a CMP at the end of a one-instruction
+// region) stores them between two patchable jmps (RegionExit::
+// skip_rel32_offset). Linked to an entry that writes NZCV first, it skips the
+// store (a skip link); to one that reads it, it stores. Loops run on the
+// links and match the reference; TRANSMUTE_FX_CORE=noflagskip makes no skip
+// links.
+FX_TEST(core_flag_store_skipped_for_flags_dead_targets) {
+    auto& r = runner();
+    using namespace a64;
+    const auto saved = r.machine.options;
+    r.machine.options.max_instructions = 1;
+    const bool skip = (core::codegen_layout_bits() & 64u) == 0;
+    for (const bool dead : {true, false}) {
+        std::vector<std::uint32_t> prog = {movw(false, 2, 0, 12, 12),               // movz w12, #12
+                                           add_shift(true, true, true, 0, 2, 0, 1, 31)};   // loop: cmp x1, x2
+        if (dead) prog.push_back(add_shift(true, true, true, 0, 4, 0, 3, 31));  // cmp x3, x4 (writes first)
+        prog.push_back(csel(true, false, 6, 0, 0, 5, 7));                          // csel x7, x5, x6, eq
+        prog.push_back(add_shift(true, false, false, 0, 7, 0, 9, 9));             // add x9, x9, x7
+        prog.push_back(add_shift(true, false, false, 0, 1, 0, 2, 2));             // add x2, x2, x1
+        prog.push_back(add_imm(false, true, true, 12, 12, 1));                     // subs w12, w12, #1
+        prog.push_back(bcond(1, 1 - static_cast<std::int32_t>(prog.size())));     // b.ne loop
+        for (unsigned k = 0; k < 3; ++k) {
+            auto ctx = r.context(7500 + k);
+            ctx.x[2] = ctx.x[1] + (k == 0 ? 0 : 3);   // equal at least once
+            ctx.x[4] = ctx.x[3];
+            FX_CHECK(r.run(prog, ctx, dead ? "flags dead target" : "flags live target"));
+            if (dead) FX_CHECK_EQ(r.last.skip_links > 0, skip);
+            else FX_CHECK_EQ(r.last.skip_links, 0u);
+        }
+    }
+    r.machine.options = saved;
+}
+
 FX_TEST(core_inline_lookup_miss_pc) {
     auto& r = runner();
     using namespace a64;

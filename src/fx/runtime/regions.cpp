@@ -47,6 +47,7 @@ constexpr std::uint64_t kPage = 0x1000;
 struct MapEntry {
     const void* host;
     Region* region;          // nullptr: registered host entry
+    bool flags_dead = false; // RegionEntry::flags_dead: exits may link past their flag store
 };
 struct ExitRef {
     Region* region;
@@ -477,15 +478,19 @@ ExitInfo* find_exit(Region& r, std::uint32_t rel32_offset, std::uint32_t& index)
 void restore_exit(Region& r, ExitInfo& e) {
     auto* field = r.code + e.rel32_offset;
     *reinterpret_cast<volatile std::int32_t*>(field) = e.original;
+    if (e.skip_offset) *reinterpret_cast<volatile std::int32_t*>(r.code + e.skip_offset) = e.skip_original;
     e.linked = false;
 }
 
 // Map lock held exclusively. Invariant: an exit has a `pending` reference
 // exactly while its region is live and the exit is unlinked; a `links`
 // reference exactly while it is linked (always to the map entry of its target).
-void patch_link(Region& r, std::uint32_t index, const void* host) {
+// An exit with a flag store (skip_offset) links its jmp A past the store when
+// the target's entry writes NZCV first, else its jmp B after the store.
+void patch_link(Region& r, std::uint32_t index, const MapEntry& target) {
     auto& e = r.exits[index];
-    x64::Assembler::patch_rel32(r.code + e.rel32_offset, host);
+    const void* host = target.host;
+    x64::Assembler::patch_rel32(r.code + (e.skip_offset && target.flags_dead ? e.skip_offset : e.rel32_offset), host);
     e.linked = true;
     g.links.add(e.target_pc, {&r, index});
     count(g_counters.links);
@@ -505,11 +510,11 @@ void unlink_target(std::uint64_t pc) {
 }
 
 // Map lock held exclusively: links every pending exit of a live region that
-// targets `pc` to `host` (the entry just installed for pc).
-void link_pending(std::uint64_t pc, const void* host) {
+// targets `pc` to `entry` (the entry just installed for pc).
+void link_pending(std::uint64_t pc, const MapEntry& entry) {
     g.pending.take(pc, [&](const ExitRef& ref) {
         const auto& e = ref.region->exits[ref.index];
-        if (!ref.region->dead && !e.linked && e.target_pc == pc) patch_link(*ref.region, ref.index, host);
+        if (!ref.region->dead && !e.linked && e.target_pc == pc) patch_link(*ref.region, ref.index, entry);
     });
 }
 
@@ -745,8 +750,12 @@ bool region_is_valid(const TranslatedRegion& r, std::uint64_t pc) {
         if (e.offset >= r.code.size()) return false;
         has_pc |= e.guest_pc == pc;
     }
-    for (const auto& e : r.exits)
+    for (const auto& e : r.exits) {
         if ((e.rel32_offset & 3) != 0 || std::uint64_t{e.rel32_offset} + 4 > r.code.size()) return false;
+        if ((e.skip_rel32_offset & 3) != 0 || std::uint64_t{e.skip_rel32_offset} + 4 > r.code.size() ||
+            (e.skip_rel32_offset != 0 && e.skip_rel32_offset == e.rel32_offset))
+            return false;
+    }
     for (const auto& f : r.fixups)
         if (std::uint64_t{f.offset} + 8 > r.code.size()) return false;
     if (r.tier == 0 && r.tier_counter != 0 && std::uint64_t{r.tier_counter} + 4 > r.code.size()) return false;
@@ -902,6 +911,10 @@ const void* install(const TranslatedRegion& t, std::uint64_t pc, std::uint64_t e
         std::int32_t original;
         std::memcpy(&original, code + e.rel32_offset, 4);
         new (&region->exits[i]) ExitInfo{e.rel32_offset, original, e.target_pc, false};
+        if (e.skip_rel32_offset) {
+            region->exits[i].skip_offset = e.skip_rel32_offset;
+            std::memcpy(&region->exits[i].skip_original, code + e.skip_rel32_offset, 4);
+        }
     }
     std::sort(region->exits.begin(), region->exits.end(),
               [](const ExitInfo& a, const ExitInfo& b) { return a.rel32_offset < b.rel32_offset; });
@@ -937,20 +950,20 @@ const void* install(const TranslatedRegion& t, std::uint64_t pc, std::uint64_t e
     replaced.clear();
     for (const auto& e : r->entries) {
         const void* host = code + e.offset;
-        auto [entry, inserted] = g.entries.insert(e.guest_pc, MapEntry{host, r});
+        auto [entry, inserted] = g.entries.insert(e.guest_pc, MapEntry{host, r, e.flags_dead});
         if (!inserted && replaceable(*entry, r->tier)) {
             // A lower tier's entry: future entries come here. Exits linked to
             // the old entry are relinked (unlink, then link_pending below).
             replaced.push_back({e.guest_pc, entry->host, host, entry->region});
             lookup_remove(e.guest_pc, entry->host);
-            *entry = MapEntry{host, r};
+            *entry = MapEntry{host, r, e.flags_dead};
             unlink_target(e.guest_pc);
             inserted = true;
         }
         if (e.guest_pc == pc) result = entry->host;
         if (!inserted) continue;   // first translation of a pc keeps it (same or higher tier)
         lookup_install(e.guest_pc, host);
-        link_pending(e.guest_pc, host);
+        link_pending(e.guest_pc, *entry);
     }
     if (!replaced.empty()) {
         // RSB entries that would return into a replaced entry return into its
@@ -987,7 +1000,7 @@ const void* install(const TranslatedRegion& t, std::uint64_t pc, std::uint64_t e
     // Link exits whose targets already exist; the others link when their target is installed.
     for (std::uint32_t i = 0; i < r->exits.size(); ++i) {
         const std::uint64_t target = r->exits[i].target_pc;
-        if (const MapEntry* entry = g.entries.find(target)) patch_link(*r, i, entry->host);
+        if (const MapEntry* entry = g.entries.find(target)) patch_link(*r, i, *entry);
         else g.pending.add(target, {r, i});
     }
     count(g_counters.regions);
@@ -1983,7 +1996,7 @@ void link_exit(std::uint64_t field, std::uint64_t target_pc, const void* host) {
     const MapEntry* entry = g.entries.find(target_pc);
     if (!entry || entry->host != host) return;
     forget_pending(target_pc, r, index);   // an unlinked exit of a live region is pending
-    patch_link(*r, index, host);
+    patch_link(*r, index, *entry);
 }
 
 std::size_t exit_refs_for_tests(std::size_t* linked) {
@@ -2035,7 +2048,7 @@ void install_host_entry(std::uint64_t pc, const void* host) {
     }
     g.entries.insert(pc, MapEntry{host, nullptr});
     lookup_install(pc, host);
-    link_pending(pc, host);
+    link_pending(pc, MapEntry{host, nullptr});
 }
 
 bool remove_host_entry(std::uint64_t pc) {

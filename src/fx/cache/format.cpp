@@ -154,6 +154,7 @@ bool encode_record(const TranslatedRegion& region, std::uint64_t base, std::uint
         DiskEntry d{};
         if (!rel(e.guest_pc, d.rva) || e.offset >= code_size) return fail();
         d.offset = e.offset;
+        d.flags = e.flags_dead ? kEntryFlagsDead : 0;
         std::memcpy(record + pos, &d, sizeof(d));
         pos += sizeof(d);
     }
@@ -161,7 +162,9 @@ bool encode_record(const TranslatedRegion& region, std::uint64_t base, std::uint
         DiskExit d{};
         if (!rel(x.target_pc, d.target_rva)) return fail();
         if ((x.rel32_offset & 3) != 0 || static_cast<std::uint64_t>(x.rel32_offset) + 4 > code_size) return fail();
+        if ((x.skip_rel32_offset & 3) != 0 || static_cast<std::uint64_t>(x.skip_rel32_offset) + 4 > code_size) return fail();
         d.rel32_offset = x.rel32_offset;
+        d.skip_rel32_offset = x.skip_rel32_offset;
         std::memcpy(record + pos, &d, sizeof(d));
         pos += sizeof(d);
     }
@@ -340,10 +343,15 @@ bool decode_record(const std::uint8_t* data, std::size_t avail, bool verify_chec
     const std::uint32_t code = h->code_size;
     if (out.entries[0].rva != h->start_rva) return false;
     for (std::uint32_t i = 0; i < h->n_entries; ++i)
-        if (out.entries[i].offset >= code) return false;
-    for (std::uint32_t i = 0; i < h->n_exits; ++i)
-        if ((out.exits[i].rel32_offset & 3) != 0 || static_cast<std::uint64_t>(out.exits[i].rel32_offset) + 4 > code)
+        if (out.entries[i].offset >= code || (out.entries[i].flags & ~kEntryFlagsDead) != 0 || out.entries[i].reserved != 0)
             return false;
+    for (std::uint32_t i = 0; i < h->n_exits; ++i) {
+        const DiskExit& x = out.exits[i];
+        if ((x.rel32_offset & 3) != 0 || static_cast<std::uint64_t>(x.rel32_offset) + 4 > code) return false;
+        if ((x.skip_rel32_offset & 3) != 0 || static_cast<std::uint64_t>(x.skip_rel32_offset) + 4 > code || x.reserved != 0 ||
+            (x.skip_rel32_offset != 0 && x.skip_rel32_offset == x.rel32_offset))
+            return false;
+    }
     for (std::uint32_t i = 0; i < h->n_fixups; ++i)
         if (static_cast<std::uint64_t>(out.fixups[i].offset) + 8 > code || out.fixups[i].kind > 1) return false;
     if ((h->flags & ~(kRecordPinned | kRecordTier0)) != 0 || ((h->flags & kRecordPinned) != 0) != (h->pinned_base != 0))
@@ -373,10 +381,12 @@ void rebuild_region(const RecordView& record, std::uint64_t base, TranslatedRegi
     out.code.assign(record.code, record.code + h.code_size);
     out.entries.resize(h.n_entries);
     for (std::uint32_t i = 0; i < h.n_entries; ++i)
-        out.entries[i] = {base + record.entries[i].rva, record.entries[i].offset};
+        out.entries[i] = {base + record.entries[i].rva, record.entries[i].offset,
+                          (record.entries[i].flags & kEntryFlagsDead) != 0};
     out.exits.resize(h.n_exits);
     for (std::uint32_t i = 0; i < h.n_exits; ++i)
-        out.exits[i] = {record.exits[i].rel32_offset, base + record.exits[i].target_rva};
+        out.exits[i] = {record.exits[i].rel32_offset, base + record.exits[i].target_rva,
+                        record.exits[i].skip_rel32_offset};
     out.fixups.resize(h.n_fixups);
     for (std::uint32_t i = 0; i < h.n_fixups; ++i) {
         const DiskFixup& d = record.fixups[i];

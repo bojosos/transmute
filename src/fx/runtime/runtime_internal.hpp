@@ -227,6 +227,10 @@ struct ExitInfo {
     std::int32_t original;       // rel32 to the unlinked tail
     std::uint64_t target_pc;
     bool linked;
+    // RegionExit::skip_rel32_offset (0: none) and its initial rel32 (to the
+    // flag store). Linked to a flags-dead entry, it is the field patched.
+    std::uint32_t skip_offset = 0;
+    std::int32_t skip_original = 0;
     // The exit's node in the link or pending list of target_pc (regions.cpp
     // ExitRefs; an exit is in at most one), so removing it is O(1).
     std::uint32_t ref_node = UINT32_MAX;
@@ -387,6 +391,8 @@ public:
     // pc already has a translated (or host) entry: the new region stops there
     // and links to it instead of translating covered code again.
     bool has_entry(std::uint64_t pc) const override;
+    // A mapped module's text section, outside registered (JIT) code memory.
+    bool image_code(std::uint64_t address) const override;
     // Tier-1 translation: only host entries stop region growth. Hot code is
     // translated as one region even where earlier (smaller) regions provide
     // entries: stopping there would keep a loop split across regions.

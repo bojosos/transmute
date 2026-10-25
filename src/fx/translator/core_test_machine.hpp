@@ -25,7 +25,9 @@ public:
     bool read(std::uint64_t address, std::uint32_t& word) const override;
     bool function_bounds(std::uint64_t address, std::uint64_t& begin, std::uint64_t& end) const override;
     bool has_entry(std::uint64_t pc) const override;
+    bool image_code(std::uint64_t address) const override { return image && address >= begin_ && address < end_; }
     std::uint64_t fn_begin{}, fn_end{};   // optional bounds reported for every address
+    bool image = true;                    // image_code(): the buffer is image code (tests of JIT code: false)
     std::vector<std::uint64_t> covered;   // pcs reported by has_entry()
 
 private:
@@ -45,6 +47,7 @@ struct RunResult {
     unsigned interrupts{};
     unsigned tier_ups{};
     unsigned shadow_misses{};   // ExitReason::table_shadow
+    unsigned skip_links{};      // links past an exit's flag store (RegionExit::skip_rel32_offset)
 };
 
 class TestMachine {
@@ -86,6 +89,8 @@ private:
     const void* stub_exit_{};
     const void* helpers_[kHelperSlots]{};
     std::unordered_map<std::uint64_t, const void*> entries_;
+    std::unordered_map<std::uint64_t, bool> flags_dead_;   // RegionEntry::flags_dead by pc, as entries_
+    std::vector<std::uint8_t*> region_hosts_;               // regions[i]'s code in the arena
     std::uint64_t* lookup_{};   // the runtime's size and encoding (fx/runtime/runtime.hpp)
     // Table shadows as the runtime keeps them (fx/runtime/table_shadow.cpp):
     // [miss stub] pcs hosts misses, by table base. Filled slots miss to the

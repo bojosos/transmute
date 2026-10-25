@@ -85,10 +85,10 @@ TranslatedRegion make_region(std::uint64_t base, std::uint32_t rva, std::uint32_
     const std::size_t code_size = (64 + 16 * std::size_t{n} + (rng() % 64)) & ~std::size_t{7};
     r.code.resize(code_size);
     for (auto& b : r.code) b = static_cast<std::uint8_t>(rng());
-    r.entries.push_back({start, 0});
+    r.entries.push_back({start, 0, n % 2 == 0});
     for (std::uint32_t k = 1; k < 4 && k < n; ++k)
-        r.entries.push_back({start + 4ull * (k * n / 4), 16 * k});
-    r.exits.push_back({8, start + 4ull * n});
+        r.entries.push_back({start + 4ull * (k * n / 4), 16 * k, k == 2});
+    r.exits.push_back({8, start + 4ull * n, n % 2 == 0 ? 24u : 0u});   // format 6: a skip field (or none)
     r.exits.push_back({20, base + ((rva / 2) & ~3u)});
     const std::uint64_t values[] = {start + 4ull * (rng() % n), base + (rva & ~0xFFFu), start + 4ull * n};
     for (std::uint32_t k = 0; k < 3; ++k) {
@@ -115,9 +115,12 @@ bool regions_equal(const TranslatedRegion& a, const TranslatedRegion& b) {
         a.fixups.size() != b.fixups.size() || a.faults.size() != b.faults.size() || a.pins.size() != b.pins.size())
         return false;
     for (std::size_t i = 0; i < a.entries.size(); ++i)
-        if (a.entries[i].guest_pc != b.entries[i].guest_pc || a.entries[i].offset != b.entries[i].offset) return false;
+        if (a.entries[i].guest_pc != b.entries[i].guest_pc || a.entries[i].offset != b.entries[i].offset ||
+            a.entries[i].flags_dead != b.entries[i].flags_dead)
+            return false;
     for (std::size_t i = 0; i < a.exits.size(); ++i)
-        if (a.exits[i].rel32_offset != b.exits[i].rel32_offset || a.exits[i].target_pc != b.exits[i].target_pc)
+        if (a.exits[i].rel32_offset != b.exits[i].rel32_offset || a.exits[i].target_pc != b.exits[i].target_pc ||
+            a.exits[i].skip_rel32_offset != b.exits[i].skip_rel32_offset)
             return false;
     for (std::size_t i = 0; i < a.fixups.size(); ++i)
         if (a.fixups[i].offset != b.fixups[i].offset || a.fixups[i].kind != b.fixups[i].kind ||

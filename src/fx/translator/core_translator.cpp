@@ -52,7 +52,8 @@ namespace {
 // aligned to 16; codegen_layout_bits), hotalign (tier-2 regions align loop
 // headers of any size, not only small loops), align32 (loop headers aligned
 // to 32 bytes instead of 16), noshadows (a BR through a heap table takes
-// the inline lookup, no table shadow); nocache..norbit
+// the inline lookup, no table shadow), noflagskip (direct exits always store
+// host-form flags: no skip link to entries that write NZCV first); nocache..norbit
 // the code generation before the register cache. Folded into
 // translator_family_fingerprint(), so persistent
 // caches never mix code generated with different knobs.
@@ -122,6 +123,7 @@ const PlanOverrides& default_overrides() {
             d.align_hot = k("hotalign");
             d.align32 = k("align32");
             d.no_shadows = k("noshadows");
+            d.no_flag_skip = k("noflagskip");
         }
         if (const char* v = std::getenv("TRANSMUTE_FX_INLINE")) d.inline_max = static_cast<unsigned>(std::strtoul(v, nullptr, 10));
         return d;
@@ -149,7 +151,8 @@ std::uint32_t codegen_knob_bits() {
 std::uint32_t codegen_layout_bits() {
     const auto& o = default_overrides();
     return (o.cold_entries ? 1u : 0u) | (o.align_loops ? 2u : 0u) | (o.align_hot ? 4u : 0u) | (o.align32 ? 8u : 0u) |
-           (o.no_vzero_join ? 16u : 0u) | (o.no_shadows ? 32u : 0u);
+           (o.no_vzero_join ? 16u : 0u) | (o.no_shadows ? 32u : 0u) |
+           (o.no_flag_skip ? 64u : 0u);
 }
 
 unsigned codegen_inline_max() { return default_overrides().inline_max; }

@@ -1078,10 +1078,36 @@ void RegionEmitter::mov_literal(Gp r, std::uint64_t value) {
     out_.fixups.push_back({static_cast<std::uint32_t>(at), FixupKind::literal_imm64, value});
 }
 
+// Host-form flags (plan_.flag_skip): the pins are stored first, then
+// `jmp A` reaches the flag store and the exit's `jmp B` (in the cold section
+// with Plan::cold_layout, else right after A). Linked to an entry that writes
+// NZCV first, A jumps there and skips the store (RegionExit).
 void RegionEmitter::emit_direct_exit(std::uint64_t target, std::uint64_t dirty, FlagsState flags, bool restore) {
-    emit_exit_flags(flags);
+    const bool skip = plan_.flag_skip && is_host(flags);
+    if (!skip) emit_exit_flags(flags);
     exit_pins(dirty, restore);
     a_.align_rel32_after(1);
+    if (skip && plan_.cold_layout && !cold_) {
+        Stub s{Stub::K::flags_exit, a_.new_label(), flags, 0, target, -1};
+        s.skip_field = static_cast<std::uint32_t>(a_.jmp(s.label));
+        stubs_.push_back(s);
+        no_fall_at_ = a_.size();
+        return;
+    }
+    std::uint32_t skip_field = 0;
+    if (skip) {
+        const auto store = a_.new_label();
+        skip_field = static_cast<std::uint32_t>(a_.jmp(store));
+        a_.bind(store);
+        emit_exit_flags(flags);
+        a_.align_rel32_after(1);
+    }
+    emit_exit_jump(target, skip_field);
+}
+
+// The patchable jmp of a direct exit (4-byte aligned rel32) and its unlinked
+// tail; skip_field: the exit's jmp A (RegionExit::skip_rel32_offset).
+void RegionEmitter::emit_exit_jump(std::uint64_t target, std::uint32_t skip_field) {
     if (plan_.cold_layout && !cold_) {
         // In the body only the patchable jmp: its unlinked tail (dead once
         // linked) is cold. The runtime records the jmp's initial rel32 at
@@ -1090,7 +1116,7 @@ void RegionEmitter::emit_direct_exit(std::uint64_t target, std::uint64_t dirty, 
         s.field = a_.bound_label();   // the opcode; the rel32 field follows it
         const auto field_offset = static_cast<std::uint32_t>(a_.jmp(s.label));
         stubs_.push_back(s);
-        out_.exits.push_back({field_offset, target});
+        out_.exits.push_back({field_offset, target, skip_field});
         no_fall_at_ = a_.size();
         return;
     }
@@ -1102,7 +1128,7 @@ void RegionEmitter::emit_direct_exit(std::uint64_t target, std::uint64_t dirty, 
     a_.mov(64, ptr(Gp::r15, kPcDisp), Gp::rax);
     a_.lea(64, Gp::rax, x64::rip(field));
     a_.jmp(ctx_mem(offsetof(GuestContext, stub_link)));
-    out_.exits.push_back({field_offset, target});
+    out_.exits.push_back({field_offset, target, skip_field});
 }
 
 void RegionEmitter::emit_reason_exit(std::uint64_t dirty, std::uint64_t pc, ExitReason reason, std::uint64_t arg,
@@ -2037,6 +2063,11 @@ void RegionEmitter::emit_stubs() {
                    static_cast<std::int32_t>(std::max(1u, std::min(options_.tier_threshold, 0x7fffffffu))));
             emit_exit_with_reason(s.pc, ExitReason::tier_up, 0, false);
             break;
+        case Stub::K::flags_exit:   // jmp A of an in-line exit lands here: the flag store, then jmp B
+            emit_exit_flags(s.flags);
+            a_.align_rel32_after(1);
+            emit_exit_jump(s.pc, s.skip_field);
+            break;
         case Stub::K::exit_tail:   // unlinked tail of an in-line exit jmp (s.field: its opcode)
             fixup_imm64(Gp::rax, s.pc);
             a_.mov(64, ptr(Gp::r15, kPcDisp), Gp::rax);
@@ -2267,15 +2298,18 @@ void RegionEmitter::run() {
     }
 
     out_.entries.clear();
-    out_.entries.push_back({plan_.start, 0});
-    for (std::size_t k = 1; k < plan_.entries.size(); ++k)
-        out_.entries.push_back({plan_.insts[plan_.entries[k].index].pc,
-                                static_cast<std::uint32_t>(a_.offset_of(entry_labels_[k]))});
+    for (std::size_t k = 0; k < plan_.entries.size(); ++k) {
+        const auto& pi = plan_.insts[static_cast<std::size_t>(plan_.entries[k].index)];
+        out_.entries.push_back({k == 0 ? plan_.start : pi.pc,
+                                k == 0 ? 0u : static_cast<std::uint32_t>(a_.offset_of(entry_labels_[k])),
+                                !pi.flags_live_in});
+    }
     out_.guest_ranges.clear();
     for (const auto& pi : plan_.insts) {
         if (!out_.guest_ranges.empty() && out_.guest_ranges.back().second == pi.pc) out_.guest_ranges.back().second += 4;
         else out_.guest_ranges.emplace_back(pi.pc, pi.pc + 4);
     }
+    out_.guest_ranges.insert(out_.guest_ranges.end(), plan_.dependency_ranges.begin(), plan_.dependency_ranges.end());
     if (plan_.inlined_calls != 0) {
         // Inlined callee copies (SMC invalidation covers them): sorted, merged.
         auto& r = out_.guest_ranges;

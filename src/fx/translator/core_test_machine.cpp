@@ -153,6 +153,8 @@ TestMachine::~TestMachine() {
 void TestMachine::reset() {
     for (const auto& e : entries_) lookup_[lookup_slot(e.first)] = 0;   // every installed slot has its entry
     entries_.clear();
+    flags_dead_.clear();
+    region_hosts_.clear();
     shadows_.clear();
     regions.clear();
     used_ = stubs_end_;
@@ -218,10 +220,13 @@ const void* TestMachine::install(TranslatedRegion region, bool replace) {
         }
         if (replace) entries_[e.guest_pc] = host + e.offset;
         else entries_.emplace(e.guest_pc, host + e.offset);
+        if (replace) flags_dead_[e.guest_pc] = e.flags_dead;
+        else flags_dead_.emplace(e.guest_pc, e.flags_dead);
         lookup_[lookup_slot(e.guest_pc)] = ((e.guest_pc >> kLookupTagShift) << 32) | static_cast<std::uint32_t>(host + e.offset - arena_);
     }
     FlushInstructionCache(GetCurrentProcess(), host, region.code.size());
     regions.push_back(std::move(region));
+    region_hosts_.push_back(host);
     return host + regions.back().entries[0].offset;
 }
 
@@ -254,8 +259,22 @@ RunResult TestMachine::run(GuestContext& ctx, const CodeSource& code, std::uint6
             ++r.links;
             if (link && ctx.pc != stop_pc) {
                 const auto before2 = regions.size();
-                if (const auto* target = entry_for(ctx.pc, code))
-                    x64::Assembler::patch_rel32(reinterpret_cast<void*>(static_cast<std::uintptr_t>(ctx.exit_arg)), target);
+                if (const auto* target = entry_for(ctx.pc, code)) {
+                    // As the runtime (patch_link): an exit with a flag store links its
+                    // jmp A past the store when the target's entry writes NZCV first.
+                    auto* field = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(ctx.exit_arg));
+                    for (std::size_t i = 0; i < regions.size(); ++i) {
+                        auto* base = region_hosts_[i];
+                        if (field < base || field >= base + regions[i].code.size()) continue;
+                        for (const auto& e : regions[i].exits)
+                            if (base + e.rel32_offset == field && e.skip_rel32_offset && flags_dead_[ctx.pc]) {
+                                field = base + e.skip_rel32_offset;
+                                ++r.skip_links;
+                            }
+                        break;
+                    }
+                    x64::Assembler::patch_rel32(field, target);
+                }
                 r.translations += static_cast<unsigned>(regions.size() - before2);
             }
             break;

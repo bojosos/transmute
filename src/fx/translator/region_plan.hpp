@@ -119,6 +119,10 @@ struct Plan {
     std::vector<std::uint32_t> words; // insts[i].inst.word, contiguous for family lookahead
     std::vector<PlanUse> uses;        // insts[i] usage, contiguous (see PlanUse)
     std::vector<PlanEntry> entries;   // entries[0] is the region start
+    // Guest code the region depends on without translating it (a call or
+    // jump target's first instructions, target_flags_dead): appended to the
+    // region's guest_ranges, so a write there kills the region too.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> dependency_ranges;
     std::int8_t pin_host[32]{};       // host GPR id or -1
     std::uint32_t pinned{};           // guest register mask
     std::uint32_t pin_hosts{};        // host register mask used by pins
@@ -173,6 +177,7 @@ struct Plan {
     bool inline_entries{true};        // cold_layout: continuation entry stubs in line (not coldentries)
     bool align_loops{};               // cold_layout: every loop header aligned (loopalign)
     bool align_hot{};                 // cold_layout, tier 2: loop headers aligned whatever the loop's size (hotalign)
+    bool flag_skip{};                 // direct exits may skip their flag store (RegionExit::skip_rel32_offset)
     unsigned loop_alignment{16};      // bytes (align32: 32)
     unsigned interpret_count{};
     unsigned blocks{};
@@ -278,6 +283,9 @@ struct PlanOverrides {
     // TRANSMUTE_FX_CORE=noshadows: BRs through heap tables take the inline
     // lookup only (no table shadow, PlanInst::shadow_base).
     bool no_shadows{};
+    // TRANSMUTE_FX_CORE=noflagskip: direct exits always store host-form flags
+    // (no RegionExit::skip_rel32_offset).
+    bool no_flag_skip{};
 };
 
 struct FamilyTable {

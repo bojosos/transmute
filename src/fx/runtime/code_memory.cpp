@@ -240,6 +240,11 @@ bool LiveCodeSource::read(std::uint64_t address, std::uint32_t& word) const {
     return true;
 }
 
+bool LiveCodeSource::image_code(std::uint64_t address) const {
+    const auto* module = find_guest_module(address & ~std::uint64_t{0xfff});
+    return module && address >= module->text_begin && address < module->text_end && !in_registered_code_memory(address);
+}
+
 bool LiveCodeSource::read_data(std::uint64_t address, std::uint32_t& word) const {
     if (read(address, word)) return true;
     if ((address & 3) != 0) return false;

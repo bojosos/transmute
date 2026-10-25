@@ -70,6 +70,10 @@ public:
     }
 
     bool read(std::uint64_t address, std::uint32_t& word) const override { return read_from(executable_, address, word); }
+    bool image_code(std::uint64_t address) const override {
+        std::uint32_t word;
+        return read_from(executable_, address, word);
+    }
     bool read_data(std::uint64_t address, std::uint32_t& word) const override {
         return read_from(executable_, address, word) || read_from(read_only_, address, word);
     }
