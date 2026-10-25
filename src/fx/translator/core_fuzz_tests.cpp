@@ -392,3 +392,47 @@ FX_TEST(core_abi_flags_br_loop_reads_flags) {
     }
     r.machine.options = saved;
 }
+
+// Hand-written arm64 also keeps NZCV live across a BLR to a local stub that
+// does not touch the flags: dav1d's NEON (refmvs.S save_tmvs_neon) does
+// `cmp x9, x10; blr x11; b.ge 4f`, where x11 is one of its own store stubs.
+// The ABI flags model (abi_flags) treats NZCV as dead at BLR and its return,
+// so the flags the caller set before the call are lost; the default (exact
+// NZCV, abi_flags = false) must match. The ABI run is a known divergence: if
+// it starts to match, the test fails with "now matches": flip the expectation.
+// The loop is closed by CBNZ, not by the flags, so the diverging run ends too.
+FX_TEST(core_flags_live_across_blr_to_a_local_stub) {
+    using namespace a64;
+    const std::vector<std::uint32_t> prog = {
+        adr(false, 36, 11),                              // 0 adr x11, stub (9): computed once
+        movw(false, 2, 0, 5, 4),                         // 1 movz w4, #5
+        add_shift(true, false, false, 0, 2, 0, 1, 1),    // 2 loop: add x1, x1, x2
+        add_imm(false, true, true, 4, 4, 1),             // 3 subs w4, w4, #1
+        blr(11),                                         // 4 blr x11 (the stub keeps NZCV)
+        bcond(13, 2),                                    // 5 b.le 7: reads the subs flags after the return
+        add_imm(true, false, false, 6, 6, 1),            // 6 add x6, x6, #1
+        cbz(false, true, -5, 4),                         // 7 cbnz w4, loop
+        b(3),                                            // 8 b end (11)
+        add_imm(true, false, false, 5, 5, 1),            // 9 stub: add x5, x5, #1 (no flags)
+        ret(),                                           // 10 ret
+    };
+    static DiffRunner r;
+    const auto saved = r.machine.options;
+    for (const bool abi : {false, true}) {
+        r.machine.options.abi_flags = abi;
+        r.report = !abi;   // the ABI run is a known divergence (above)
+        auto ctx = r.context(8);
+        ctx.x[1] = 0; ctx.x[2] = 3; ctx.x[5] = 0; ctx.x[6] = 0;
+        const bool same = r.run(prog, ctx, abi ? "flags live across blr (abi_flags)" : "flags live across blr (exact)");
+        if (!abi) {
+            FX_CHECK(same);
+            FX_CHECK_EQ(r.actual.x[5], std::uint64_t{5});   // the stub ran once per iteration
+            FX_CHECK_EQ(r.actual.x[6], std::uint64_t{4});   // gt after the first four returns, le after the last
+        } else if (same) {
+            ::transmute::fx::testing::report_failure(__FILE__, __LINE__,
+                "core_flags_live_across_blr_to_a_local_stub now matches under abi_flags: flip the expectation");
+        }
+    }
+    r.report = true;
+    r.machine.options = saved;
+}
