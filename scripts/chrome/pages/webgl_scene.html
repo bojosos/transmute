@@ -1,0 +1,482 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy WebGL scene: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+td, th { padding: 2px 10px; text-align: left; vertical-align: top; }
+canvas { border: 1px solid #888; margin-right: 8px; }
+</style>
+</head>
+<body>
+<h1>Alchemy WebGL 2 scene</h1>
+<p>What a real 3D page (a three.js-style scene) asks of WebGL 2, written for Alchemy (no downloaded library or
+suite, no network). Each test renders, reads pixels or buffers back and compares them with what the math says.
+The verdict goes into <code>document.title</code> (<code>Alchemy WebGL scene: PASS</code> or
+<code>Alchemy WebGL scene: FAIL &lt;test&gt;</code>) and <code>body[data-verdict]</code>; each test is a row
+below. The last test animates 30 frames on screen before the verdict; <code>--dump-dom</code> waits for it (a
+chain of failing image loads holds the load event until the verdict is set, at most 90 s).</p>
+<pre id="renderer">renderer: pending</pre>
+<table>
+<thead><tr><th>test</th><th>result</th><th>detail</th></tr></thead>
+<tbody id="results"></tbody>
+</table>
+<p id="status">not run</p>
+<div id="canvases"></div>
+<script>
+"use strict";
+var finished = false, holdUntil = Date.now() + 90000;
+(function hold() {
+  if (finished || Date.now() > holdUntil) return;
+  var img = new Image();
+  img.onerror = img.onload = function () { img.remove(); hold(); };
+  img.src = "missing-" + Math.random() + ".png";
+  document.body.appendChild(img);
+})();
+
+var W = 64, H = 64, TOL = 3;
+var rows = document.getElementById("results");
+var failures = [];
+
+function row(name, ok, detail) {
+  var tr = document.createElement("tr");
+  [name, ok ? "pass" : "FAIL", detail || ""].forEach(function (text) {
+    var td = document.createElement("td"); td.textContent = text; tr.appendChild(td);
+  });
+  rows.appendChild(tr);
+  if (!ok) failures.push(name);
+}
+
+// One test's checks: GL errors after each step and pixels against expectations.
+function Check(gl, name) { this.gl = gl; this.name = name; this.problems = []; }
+Check.prototype.err = function (step) {
+  var e = this.gl.getError();
+  if (e) this.problems.push(step + ": glError 0x" + e.toString(16));
+};
+Check.prototype.pixelAt = function (x, y) {
+  var p = new Uint8Array(4);
+  this.gl.readPixels(x, y, 1, 1, this.gl.RGBA, this.gl.UNSIGNED_BYTE, p);
+  return [p[0], p[1], p[2], p[3]];
+};
+Check.prototype.pixel = function (x, y, want, step, tol) {
+  var got = this.pixelAt(x, y), t = tol === undefined ? TOL : tol;
+  for (var i = 0; i < 4; ++i)
+    if (Math.abs(got[i] - want[i]) > t) { this.problems.push(step + " (" + x + "," + y + ") = " + got + ", want " + want); return; }
+};
+Check.prototype.expect = function (cond, what) { if (!cond) this.problems.push(what); };
+Check.prototype.done = function (note) {
+  row(this.name, this.problems.length === 0, this.problems.concat(note ? [note] : []).join("; "));
+};
+
+function compile(gl, vs, fs, feedback) {
+  function shader(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, "#version 300 es\nprecision highp float;\nprecision highp int;\n" + src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error("compile: " + gl.getShaderInfoLog(s));
+    return s;
+  }
+  var p = gl.createProgram();
+  gl.attachShader(p, shader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fs));
+  if (feedback) gl.transformFeedbackVaryings(p, feedback, gl.INTERLEAVED_ATTRIBS);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("link: " + gl.getProgramInfoLog(p));
+  return p;
+}
+
+function arrayBuffer(gl, target, data) {
+  var b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, gl.STATIC_DRAW); return b;
+}
+
+// A VAO with one vec2/vec3 attribute at location 0 (and optionally more).
+function vao(gl, attributes) {
+  var v = gl.createVertexArray(); gl.bindVertexArray(v);
+  attributes.forEach(function (a) {
+    arrayBuffer(gl, gl.ARRAY_BUFFER, new Float32Array(a.data));
+    gl.enableVertexAttribArray(a.location);
+    gl.vertexAttribPointer(a.location, a.size, gl.FLOAT, false, 0, 0);
+  });
+  return v;
+}
+
+var FULLSCREEN = [-1, -1, 1, -1, -1, 1, 1, 1];   // a triangle strip over the viewport
+var PASS_VS = "layout(location=0) in vec2 p; out vec2 uv; void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }";
+
+// ---- the tests ---------------------------------------------------------------------------------
+
+// A cube in perspective, lit by a directional light, its matrices and light in a uniform block.
+function litCubeTest(gl) {
+  var c = new Check(gl, "uniform block, perspective lit cube, depth");
+  var p = compile(gl,
+    "layout(std140) uniform Scene { mat4 mvp; vec4 light; vec4 color; };\n" +
+    "layout(location=0) in vec3 pos; layout(location=1) in vec3 nrm; out vec3 n;\n" +
+    "void main() { n = nrm; gl_Position = mvp * vec4(pos, 1.0); }",
+    "layout(std140) uniform Scene { mat4 mvp; vec4 light; vec4 color; };\n" +
+    "in vec3 n; out vec4 o; void main() { o = vec4(color.rgb * max(dot(normalize(n), light.xyz), 0.0), 1.0); }");
+  // A unit cube's six faces (two triangles each) with face normals.
+  var pos = [], nrm = [];
+  var faces = [[0, 0, 1], [0, 0, -1], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]];
+  faces.forEach(function (f) {
+    var u = f[0] ? [0, 1, 0] : [1, 0, 0], v = [f[1] * u[2] - f[2] * u[1], f[2] * u[0] - f[0] * u[2], f[0] * u[1] - f[1] * u[0]];
+    var corners = [[-1, -1], [1, -1], [1, 1], [-1, -1], [1, 1], [-1, 1]];
+    corners.forEach(function (k) {
+      for (var i = 0; i < 3; ++i) { pos.push(0.5 * (f[i] + k[0] * u[i] + k[1] * v[i])); nrm.push(f[i]); }
+    });
+  });
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 3, data: pos }, { location: 1, size: 3, data: nrm }]));
+  // Perspective (fov 60, aspect 1, near 1, far 10) of the cube at z = -3: a column-major matrix.
+  var f = 1 / Math.tan(Math.PI / 6), nr = 1, fr = 10;
+  var mvp = new Float32Array([f, 0, 0, 0, 0, f, 0, 0, 0, 0, (fr + nr) / (nr - fr), -1, 0, 0, 3 * (fr + nr) / (fr - nr) + 2 * fr * nr / (nr - fr), 3]);
+  var block = new Float32Array(16 + 4 + 4);
+  block.set(mvp, 0);
+  block.set([0, 0, 1, 0], 16);          // light along +z: the front face is fully lit
+  block.set([1, 0.5, 0.25, 1], 20);     // material color
+  var ubo = arrayBuffer(gl, gl.UNIFORM_BUFFER, block);
+  gl.uniformBlockBinding(p, gl.getUniformBlockIndex(p, "Scene"), 0);
+  gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, ubo);
+  gl.useProgram(p);
+  gl.viewport(0, 0, W, H);
+  gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLES, 0, 36);
+  c.err("draw");
+  c.pixel(32, 32, [255, 128, 64, 255], "front face, fully lit");
+  c.pixel(2, 2, [0, 0, 0, 255], "background");
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+  c.done();
+}
+
+// 64 draw calls, each its own uniform color and offset: an 8x8 grid of quads.
+function manyDrawsTest(gl) {
+  var c = new Check(gl, "64 draw calls with uniform changes");
+  var p = compile(gl,
+    "layout(location=0) in vec2 p; uniform vec2 offset; void main() { gl_Position = vec4(p * 0.125 + offset, 0.0, 1.0); }",
+    "uniform vec4 color; out vec4 o; void main() { o = color; }");
+  gl.useProgram(p);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: FULLSCREEN }]));
+  var uOffset = gl.getUniformLocation(p, "offset"), uColor = gl.getUniformLocation(p, "color");
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  for (var i = 0; i < 8; ++i) for (var j = 0; j < 8; ++j) {
+    gl.uniform2f(uOffset, -0.875 + 0.25 * i, -0.875 + 0.25 * j);
+    gl.uniform4f(uColor, i / 7, j / 7, (i + j) % 2, 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  c.err("draws");
+  [[0, 0], [7, 0], [3, 5], [7, 7]].forEach(function (k) {
+    c.pixel(4 + 8 * k[0], 4 + 8 * k[1], [Math.round(255 * k[0] / 7), Math.round(255 * k[1] / 7), 255 * ((k[0] + k[1]) % 2), 255], "cell " + k);
+  });
+  c.done();
+}
+
+// A 64x64 black/white checkerboard, mipmapped: its smallest level is mid gray.
+function mipmapTest(gl) {
+  var c = new Check(gl, "generateMipmap, textureLod of the 1x1 level");
+  var data = new Uint8Array(64 * 64 * 4);
+  for (var y = 0; y < 64; ++y) for (var x = 0; x < 64; ++x) {
+    var v = (x + y) % 2 ? 255 : 0, i = (y * 64 + x) * 4;
+    data[i] = data[i + 1] = data[i + 2] = v; data[i + 3] = 255;
+  }
+  var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 64, 64, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  c.err("mipmaps");
+  var p = compile(gl, PASS_VS, "uniform sampler2D t; in vec2 uv; out vec4 o; void main() { o = textureLod(t, uv, 6.0); }");
+  gl.useProgram(p);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: FULLSCREEN }]));
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  c.err("draw");
+  c.pixel(32, 32, [128, 128, 128, 255], "level 6 (1x1) is the average", 4);
+  c.done();
+}
+
+// A cube map whose faces have distinct colors, sampled along each axis.
+function cubeMapTest(gl) {
+  var c = new Check(gl, "cube map faces");
+  var colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255], [255, 0, 255]];
+  var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_CUBE_MAP, t);
+  colors.forEach(function (col, face) {
+    var d = new Uint8Array(4 * 4 * 4);
+    for (var i = 0; i < 16; ++i) d.set([col[0], col[1], col[2], 255], i * 4);
+    gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, gl.RGBA8, 4, 4, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  });
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  // Six vertical stripes, one per direction +x, -x, +y, -y, +z, -z.
+  var p = compile(gl, PASS_VS,
+    "uniform samplerCube t; in vec2 uv; out vec4 o;\n" +
+    "void main() { int k = int(uv.x * 6.0); vec3 d = k == 0 ? vec3(1,0,0) : k == 1 ? vec3(-1,0,0) : k == 2 ? vec3(0,1,0) :\n" +
+    "  k == 3 ? vec3(0,-1,0) : k == 4 ? vec3(0,0,1) : vec3(0,0,-1); o = texture(t, d); }");
+  gl.useProgram(p);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: FULLSCREEN }]));
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  c.err("draw");
+  colors.forEach(function (col, k) { c.pixel(Math.floor((k + 0.5) * W / 6), 32, [col[0], col[1], col[2], 255], "face " + k); });
+  c.done();
+}
+
+// A 2D texture array and a 3D texture, one layer/slice each sampled.
+function arrayAnd3DTest(gl) {
+  var c = new Check(gl, "2D array and 3D textures");
+  function layered(target, depth) {
+    var t = gl.createTexture(); gl.bindTexture(target, t);
+    var d = new Uint8Array(2 * 2 * depth * 4);
+    for (var z = 0; z < depth; ++z) for (var i = 0; i < 4; ++i) d.set([z * 60, 255 - z * 60, 100, 255], (z * 4 + i) * 4);
+    gl.texImage3D(target, 0, gl.RGBA8, 2, 2, depth, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+    gl.texParameteri(target, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(target, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    return t;
+  }
+  gl.activeTexture(gl.TEXTURE0); layered(gl.TEXTURE_2D_ARRAY, 4);
+  gl.activeTexture(gl.TEXTURE1); layered(gl.TEXTURE_3D, 4);
+  gl.activeTexture(gl.TEXTURE0);
+  var p = compile(gl, PASS_VS,
+    "uniform mediump sampler2DArray a; uniform mediump sampler3D v; in vec2 uv; out vec4 o;\n" +
+    "void main() { o = uv.x < 0.5 ? texture(a, vec3(uv, 2.0)) : texture(v, vec3(uv, 0.375)); }");
+  gl.useProgram(p);
+  gl.uniform1i(gl.getUniformLocation(p, "a"), 0);
+  gl.uniform1i(gl.getUniformLocation(p, "v"), 1);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: FULLSCREEN }]));
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  c.err("draw");
+  c.pixel(16, 32, [120, 135, 100, 255], "array layer 2");
+  c.pixel(48, 32, [60, 195, 100, 255], "3D slice 1 (r = 0.375 of 4)");
+  c.done();
+}
+
+function target(gl, format, w, h) {
+  var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, format, w || W, h || H);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  return t;
+}
+
+// Two color attachments written at once (drawBuffers), each read back.
+function mrtTest(gl) {
+  var c = new Check(gl, "multiple render targets");
+  var a = target(gl, gl.RGBA8), b = target(gl, gl.RGBA8);
+  var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, a, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, b, 0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+  c.expect(gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE, "framebuffer incomplete");
+  var p = compile(gl, PASS_VS,
+    "in vec2 uv; layout(location=0) out vec4 o0; layout(location=1) out vec4 o1;\n" +
+    "void main() { o0 = vec4(1.0, 0.0, 0.5, 1.0); o1 = vec4(0.0, uv.x, 1.0, 1.0); }");
+  gl.useProgram(p);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: FULLSCREEN }]));
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  c.err("draw");
+  gl.readBuffer(gl.COLOR_ATTACHMENT0); c.pixel(10, 10, [255, 0, 128, 255], "attachment 0");
+  gl.readBuffer(gl.COLOR_ATTACHMENT1); c.pixel(48, 10, [0, Math.round(255 * 48.5 / 64), 255, 255], "attachment 1");
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  c.done();
+}
+
+// A triangle into a 4x multisampled renderbuffer, resolved by blitFramebuffer: the interior is exact and
+// pixels on its diagonal edge are partial (antialiased).
+function msaaTest(gl) {
+  var c = new Check(gl, "4x MSAA renderbuffer, resolve blit");
+  var rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+  gl.renderbufferStorageMultisample(gl.RENDERBUFFER, 4, gl.RGBA8, W, H);
+  var ms = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, ms);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, rb);
+  c.expect(gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE, "multisampled framebuffer incomplete");
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  var p = compile(gl, "layout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }",
+    "out vec4 o; void main() { o = vec4(1.0); }");
+  gl.useProgram(p);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: [-1, -1, 1, -1, -1, 1] }]));   // lower-left half
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  var resolved = target(gl, gl.RGBA8);
+  var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, resolved, 0);
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, ms);
+  gl.blitFramebuffer(0, 0, W, H, 0, 0, W, H, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+  c.err("resolve");
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fb);
+  c.pixel(8, 8, [255, 255, 255, 255], "interior");
+  c.pixel(56, 56, [0, 0, 0, 255], "outside");
+  var partial = 0;
+  for (var i = 0; i < W; ++i) { var v = c.pixelAt(i, W - 1 - i)[0]; if (v > 10 && v < 245) ++partial; }
+  c.expect(partial > W / 2, "edge pixels are not antialiased (" + partial + " partial of " + W + ")");
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  c.done();
+}
+
+// Stencil: a quad marks the left half; a full-screen draw only where the stencil is set.
+function stencilTest(gl) {
+  var c = new Check(gl, "stencil test");
+  var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target(gl, gl.RGBA8), 0);
+  var ds = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, ds);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH24_STENCIL8, W, H);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, ds);
+  c.expect(gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE, "framebuffer incomplete");
+  var p = compile(gl, "layout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }",
+    "uniform vec4 color; out vec4 o; void main() { o = color; }");
+  gl.useProgram(p);
+  var uColor = gl.getUniformLocation(p, "color");
+  gl.clearColor(0, 0, 0, 1); gl.clearStencil(0); gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+  gl.enable(gl.STENCIL_TEST);
+  gl.stencilFunc(gl.ALWAYS, 1, 0xff); gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
+  gl.colorMask(false, false, false, false);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: [-1, -1, 0, -1, -1, 1, 0, 1] }]));
+  gl.uniform4f(uColor, 0, 0, 0, 1); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.colorMask(true, true, true, true);
+  gl.stencilFunc(gl.EQUAL, 1, 0xff); gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: FULLSCREEN }]));
+  gl.uniform4f(uColor, 0, 1, 0, 1); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.disable(gl.STENCIL_TEST);
+  c.err("draws");
+  c.pixel(16, 32, [0, 255, 0, 255], "stencil set");
+  c.pixel(48, 32, [0, 0, 0, 255], "stencil clear");
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  c.done();
+}
+
+// Render-to-texture, then a post-process pass that samples it and inverts it, onto the canvas.
+function postProcessTest(gl) {
+  var c = new Check(gl, "render to texture, post-process pass");
+  var scene = target(gl, gl.RGBA8);
+  var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, scene, 0);
+  var gradient = compile(gl, PASS_VS, "in vec2 uv; out vec4 o; void main() { o = vec4(uv.x, uv.y, 0.25, 1.0); }");
+  gl.useProgram(gradient);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: FULLSCREEN }]));
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  var invert = compile(gl, PASS_VS, "uniform sampler2D t; in vec2 uv; out vec4 o; void main() { o = vec4(1.0 - texture(t, uv).rgb, 1.0); }");
+  gl.useProgram(invert);
+  gl.bindTexture(gl.TEXTURE_2D, scene);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  c.err("passes");
+  c.pixel(8, 40, [255 - Math.round(255 * 8.5 / 64), 255 - Math.round(255 * 40.5 / 64), 191, 255], "inverted gradient");
+  c.done();
+}
+
+// An unsigned-integer texture read with texelFetch, drawn with 32-bit indices, and gl_VertexID.
+function integerTest(gl) {
+  var c = new Check(gl, "uint texture texelFetch, 32-bit indices, gl_VertexID");
+  var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8UI, 2, 1, 0, gl.RGBA_INTEGER, gl.UNSIGNED_BYTE, new Uint8Array([10, 20, 30, 255, 200, 100, 50, 255]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  var p = compile(gl,
+    "const vec2 corners[4] = vec2[4](vec2(-1,-1), vec2(1,-1), vec2(-1,1), vec2(1,1)); out vec2 uv;\n" +
+    "void main() { vec2 q = corners[gl_VertexID]; uv = q * 0.5 + 0.5; gl_Position = vec4(q, 0.0, 1.0); }",
+    "uniform highp usampler2D t; in vec2 uv; out vec4 o;\n" +
+    "void main() { uvec4 v = texelFetch(t, ivec2(uv.x < 0.5 ? 0 : 1, 0), 0); o = vec4(v) / 255.0; }");
+  gl.useProgram(p);
+  gl.bindVertexArray(gl.createVertexArray());
+  arrayBuffer(gl, gl.ELEMENT_ARRAY_BUFFER, new Uint32Array([0, 1, 2, 2, 1, 3]));
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, 0);
+  c.err("draw");
+  c.pixel(16, 32, [10, 20, 30, 255], "texel 0");
+  c.pixel(48, 32, [200, 100, 50, 255], "texel 1");
+  c.done();
+}
+
+// Transform feedback: the vertex shader's outputs captured into a buffer and read back.
+function transformFeedbackTest(gl) {
+  var c = new Check(gl, "transform feedback");
+  var p = compile(gl, "layout(location=0) in float x; out float y; void main() { y = x * x + 1.0; gl_Position = vec4(0.0); }",
+    "out vec4 o; void main() { o = vec4(0.0); }", ["y"]);
+  gl.useProgram(p);
+  var v = gl.createVertexArray(); gl.bindVertexArray(v);
+  arrayBuffer(gl, gl.ARRAY_BUFFER, new Float32Array([0, 1, 2, 3, 4, 5, 6, 7]));
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 0, 0);
+  var out = gl.createBuffer(); gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, out);
+  gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER, 8 * 4, gl.STREAM_READ);
+  var tf = gl.createTransformFeedback(); gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf);
+  gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, out);
+  gl.enable(gl.RASTERIZER_DISCARD);
+  gl.beginTransformFeedback(gl.POINTS); gl.drawArrays(gl.POINTS, 0, 8); gl.endTransformFeedback();
+  gl.disable(gl.RASTERIZER_DISCARD);
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+  c.err("capture");
+  var got = new Float32Array(8);
+  gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, out);
+  gl.getBufferSubData(gl.TRANSFORM_FEEDBACK_BUFFER, 0, got);
+  c.err("read back");
+  for (var i = 0; i < 8; ++i) c.expect(got[i] === i * i + 1, "y[" + i + "] = " + got[i] + ", want " + (i * i + 1));
+  c.done();
+}
+
+// copyTexSubImage2D from the canvas, then the copy drawn back flipped left-right.
+function copyTexTest(gl) {
+  var c = new Check(gl, "copyTexSubImage2D");
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  var gradient = compile(gl, PASS_VS, "in vec2 uv; out vec4 o; void main() { o = vec4(uv.x, 0.5, 0.0, 1.0); }");
+  gl.useProgram(gradient);
+  gl.bindVertexArray(vao(gl, [{ location: 0, size: 2, data: FULLSCREEN }]));
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  var t = target(gl, gl.RGBA8);
+  gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, W, H);
+  c.err("copy");
+  var flip = compile(gl, PASS_VS, "uniform sampler2D t; in vec2 uv; out vec4 o; void main() { o = texture(t, vec2(1.0 - uv.x, uv.y)); }");
+  gl.useProgram(flip);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  c.err("draw");
+  c.pixel(4, 32, [Math.round(255 * 59.5 / 64), 128, 0, 255], "flipped copy");
+  c.done();
+}
+
+// ---- driver ------------------------------------------------------------------------------------
+
+function finish() {
+  var verdict = failures.length ? "FAIL " + failures[0] : "PASS";
+  document.getElementById("status").textContent = verdict + " (" + Math.round(performance.now()) + " ms after navigation)";
+  document.body.setAttribute("data-verdict", verdict);
+  document.title = "Alchemy WebGL scene: " + verdict;
+  finished = true;
+}
+
+// The animation: 30 frames with a changing clear color and a spinning triangle, then the last frame checked.
+function animate(gl) {
+  var c = new Check(gl, "30 animated frames");
+  var p = compile(gl,
+    "layout(location=0) in vec2 p; uniform float angle; void main() { float s = sin(angle), k = cos(angle);\n" +
+    "  gl_Position = vec4(mat2(k, s, -s, k) * p * 0.5, 0.0, 1.0); }",
+    "out vec4 o; void main() { o = vec4(1.0, 1.0, 0.0, 1.0); }");
+  var uAngle = gl.getUniformLocation(p, "angle");
+  var shape = vao(gl, [{ location: 0, size: 2, data: [-1, -1, 1, -1, 0, 1] }]);
+  var frame = 0, started = performance.now();
+  function step() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    gl.clearColor(frame / 29, 0, 1 - frame / 29, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(p); gl.bindVertexArray(shape);
+    gl.uniform1f(uAngle, frame * 0.1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (++frame < 30) { requestAnimationFrame(step); return; }
+    c.err("frames");
+    c.pixel(1, 1, [255, 0, 0, 255], "last frame's clear color");
+    c.pixel(32, 32, [255, 255, 0, 255], "triangle center");
+    c.done("30 frames in " + Math.round(performance.now() - started) + " ms");
+    finish();
+  }
+  requestAnimationFrame(step);
+}
+
+(function main() {
+  var canvas = document.createElement("canvas"); canvas.width = W; canvas.height = H;
+  document.getElementById("canvases").appendChild(canvas);
+  var gl = canvas.getContext("webgl2", { antialias: false, preserveDrawingBuffer: true, stencil: true });
+  if (!gl) { row("webgl2 context", false, "no context"); finish(); return; }
+  var info = gl.getExtension("WEBGL_debug_renderer_info");
+  document.getElementById("renderer").textContent = "renderer: " + (info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+  [litCubeTest, manyDrawsTest, mipmapTest, cubeMapTest, arrayAnd3DTest, mrtTest, msaaTest, stencilTest,
+   postProcessTest, integerTest, transformFeedbackTest, copyTexTest].forEach(function (test) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    try { test(gl); } catch (e) { row(test.name, false, "threw " + e.message); }
+  });
+  animate(gl);
+})();
+</script>
+</body>
+</html>

@@ -848,6 +848,19 @@ hardware GPU (below).
       `-[NSObject dealloc]`: they destruct the object, keep its memory, and free it later with `object_dispose`.
       The object store freed the memory at once, and a new object (an autoreleased `MTLRenderPassDescriptor`)
       took its address. Kept memory now stays allocated until `object_dispose`.
+    * **A three.js-style scene** (`scripts/chrome/pages/webgl_scene.html`, 13 self-checking WebGL 2 tests): a
+      perspective lit cube from a uniform block with depth and culling, 64 draws with uniform changes, mipmaps,
+      cube maps, 2D-array and 3D textures, multiple render targets, a 4x MSAA renderbuffer resolved by a blit,
+      stencil, a post-process pass, an integer texture with 32-bit indices and `gl_VertexID`, transform feedback,
+      `copyTexSubImage2D`, then 30 animated frames. It passes headless and windowed (cloaked, 0 visible windows),
+      exit 0. A desktop Chrome on D3D11 gives the same pixels. Headless, the 30 frames take about 26 s (a
+      functional run on a busy machine, not a measurement).
+    * **WebGPU stops before Dawn** (`webgpu.html`, `--enable-unsafe-webgpu`): the renderer's WebGPU command buffer
+      fails, `CommandBufferHelper::AllocateRingBuffer() failed`, so Blink logs "Failed to create WebGPU Context
+      Provider" and `requestAdapter()` answers null. Its 64 KiB ring buffer is shared memory that Chrome maps into
+      V8's sandbox with `vm_remap(VM_FLAGS_OVERWRITE, copy = FALSE)` over mmap'd pages, which Alchemy refuses
+      (`KERN_NOT_SUPPORTED`). That needs placeholder-backed mmap reservations in alchemy-fx (the reverted
+      `0cf0842`). The GPU process does enumerate Metal (`MTLCopyAllDevices`).
   * **ANGLE's Vulkan back end on the host's Vulkan** isn't allowed. Chrome 155 on macOS accepts only ANGLE on Metal,
     or on SwiftShader with `--enable-unsafe-swiftshader`. Its message is `gl_factory.cc:110 ... not found in allowed
     implementations: [(gl=egl-angle,angle=metal)]`.
@@ -909,7 +922,8 @@ hardware GPU (below).
     accounts.figure53.com and the renderer's license server.
 * **Open, and follow-ups:**
   * Hardware WebGL: with the AIR translator DLL, WebGL programs draw on the GPU, headless and windowed (above).
-    Graphite and WebGPU (Dawn) still get no adapter.
+    WebGPU needs `vm_remap` of shared memory over mmap'd pages (above). Whether Graphite runs on Dawn's Metal
+    back end hasn't been checked yet.
   * The On-Device Model Service's Dawn on Metal reaches our MSL compiler. Its remaining shader failures stay in that
     utility child.
   * Metal selectors no run reached: the indirect-command-buffer pair. Also not exercised: Chrome's own use of
