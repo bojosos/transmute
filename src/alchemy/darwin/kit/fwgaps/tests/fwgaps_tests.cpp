@@ -102,9 +102,10 @@ void graphics(Fixture& f) {
     static_cast<void>(f.regs(ca, "_CATransform3DMakeTranslation", registers));
     require(std::bit_cast<double>(f.engine.read64(out + 96)) == 1.5 && std::bit_cast<double>(f.engine.read64(out + 104)) == -2 &&
             std::bit_cast<double>(f.engine.read64(out + 112)) == 3 && std::bit_cast<double>(f.engine.read64(out)) == 1, "MakeTranslation");
-    // CGL: no renderer.
-    const auto pixel = f.block(8, 0xff), count = f.block(4, 0xff);
-    require(f.status(gl, "_CGLChoosePixelFormat", {f.block(8), pixel, count}) == 10006 && f.engine.read64(pixel) == 0 && f.engine.read32(count) == 0,
+    // CGL (darwin/opengl/): an off-screen renderer is never found.
+    const auto pixel = f.block(8, 0xff), count = f.block(4, 0xff), off_screen = f.block(8);
+    f.engine.write32(off_screen, 53);   // kCGLPFAOffScreen
+    require(f.status(gl, "_CGLChoosePixelFormat", {off_screen, pixel, count}) == 0 && f.engine.read64(pixel) == 0 && f.engine.read32(count) == 0,
             "CGLChoosePixelFormat");
     require(f.call(gl, "_CGLGetCurrentContext") == 0 && f.status(gl, "_CGLSetCurrentContext", {0}) == 0, "no current context");
     require(f.read_text(f.call(gl, "_CGLErrorString", {10004})) == "invalid context", "CGLErrorString");
