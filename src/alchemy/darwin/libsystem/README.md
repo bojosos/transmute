@@ -25,6 +25,14 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   and file mappings (SysV), and NT process information. Phase 2 moves them
   behind `include/alchemy/host/` (vm, sections, files, net, process, ipc,
   sync, time).
+* **stdio** (core): FILE objects over descriptors (`services.cpp`, `fs/files.cpp`), or over a
+  backend without one (`fs/memory_streams.cpp`: fmemopen, open_memstream, open_wmemstream,
+  funopen). Nothing is buffered: every write reaches the descriptor at once, so setvbuf,
+  setbuf, setbuffer and setlinebuf accept every mode and fpurge only drops a pushed-back byte.
+  fscanf/vfscanf/scanf/vscanf read the stream (`misc/native.cpp`), sscanf/vsscanf a string;
+  the wide forms (fwscanf, wscanf, swscanf and their va_list forms, wprintf/vwprintf/vfwprintf,
+  fputws, fgetws, putwc/putwchar/getwchar, fwide) work on ASCII formats; gets, ctermid and
+  vasprintf_l too.
 * **Core libc additions** (both builds, `misc/libc_extra.cpp`, installed last by
   `install_darwin_support`): string and wide-string helpers, `<search.h>`,
   stdlib (putenv, strtonum, reallocarray, getsubopt, heapsort/mergesort/radixsort,

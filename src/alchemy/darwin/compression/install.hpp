@@ -11,6 +11,8 @@ namespace alchemy::compression {
 // former gap-fill group. libcompression is installed with the QLab
 // data group (compression_provider.cpp).
 void install_zlib(gui::InstallContext& context);
+// Its gz* file interface (zlib_files.cpp; fill-only), installed by install_zlib.
+void install_zlib_files(ProcessContext& process);
 // libbz2's streaming decompressor (bzip2_stream.cpp; fill-only), the one bz2
 // streaming implementation. Installed first by fill::install_libsystem_leftovers
 // (libsystem/misc/leftovers.cpp).

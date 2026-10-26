@@ -7,6 +7,7 @@ namespace alchemy::compression {
 void install_zlib(gui::InstallContext& context) {
     export_fill::install_zlib(context.process);
     export_fill::install_zlib_stream(context.process);
+    install_zlib_files(context.process);
 }
 
 } // namespace alchemy::compression

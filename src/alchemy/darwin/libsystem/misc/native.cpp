@@ -149,10 +149,12 @@ void integer(transmute::GuestMemory& memory, std::uint64_t destination,
         memory.write8(destination + index, static_cast<std::uint8_t>(value >> (index * 8)));
 }
 
-std::uint64_t scan(ProcessContext& process, transmute::CpuState& state, transmute::GuestMemory& memory) {
-    const auto format = text(memory, state.x[1]);
-    Reader reader(process, state.x[0]);
-    auto arguments = state.sp;
+// fscanf over a stream: `arguments` addresses the pointer arguments (the variadic stack
+// area, or a va_list, which on Darwin arm64 points at the same 8-byte slots).
+std::uint64_t scan(ProcessContext& process, std::uint64_t stream, std::uint64_t format_address, std::uint64_t arguments,
+                   transmute::GuestMemory& memory) {
+    const auto format = text(memory, format_address);
+    Reader reader(process, stream);
     unsigned assigned{};
     bool converted{};
     const auto failed = [&] { return reader.ended && !converted ? std::uint64_t{UINT32_MAX} : assigned; };
@@ -183,9 +185,27 @@ std::uint64_t scan(ProcessContext& process, transmute::CpuState& state, transmut
         }
         if (at == format.size()) throw std::runtime_error("incomplete Darwin fscanf conversion");
         const auto conversion = format[at++];
-        if (std::string_view("%diuoxXfFeEgGaAcsn").find(conversion) == std::string_view::npos)
+        if (std::string_view("%diuoxXfFeEgGaAcsn[").find(conversion) == std::string_view::npos)
             throw std::runtime_error(std::string("unsupported Darwin fscanf conversion %") + conversion);
-        if (conversion != 'c' && conversion != 'n' && conversion != '%') reader.skip_space();
+        // Scan set: [chars], [^chars], ']' first taken literally, a-b ranges.
+        std::array<bool, 256> member{};
+        bool negate = false;
+        if (conversion == '[') {
+            negate = at < format.size() && format[at] == '^';
+            if (negate) ++at;
+            const auto set_begin = at;
+            for (; at < format.size() && (format[at] != ']' || at == set_begin); ++at) {
+                const auto first = static_cast<unsigned char>(format[at]);
+                if (at + 2 < format.size() && format[at + 1] == '-' && format[at + 2] != ']' &&
+                    static_cast<unsigned char>(format[at + 2]) >= first) {
+                    for (unsigned value = first; value <= static_cast<unsigned char>(format[at + 2]); ++value) member[value] = true;
+                    at += 2;
+                } else member[first] = true;
+            }
+            if (at == format.size()) throw std::runtime_error("incomplete Darwin fscanf scan set");
+            ++at;
+        }
+        if (conversion != 'c' && conversion != 'n' && conversion != '%' && conversion != '[') reader.skip_space();
         if (conversion == '%') {
             if (suppress || has_width || !length.empty()) throw std::runtime_error("unsupported Darwin fscanf percent modifiers");
             const auto current = reader.get();
@@ -198,21 +218,22 @@ std::uint64_t scan(ProcessContext& process, transmute::CpuState& state, transmut
             destination = memory.read64(arguments); arguments += 8;
         }
         if (conversion == 'n') { if (!suppress) integer(memory, destination, reader.consumed, length); continue; }
-        if (conversion == 's' || conversion == 'c') {
+        if (conversion == 's' || conversion == 'c' || conversion == '[') {
             if (!length.empty()) throw std::runtime_error("unsupported Darwin fscanf wide characters");
             if (conversion == 'c' && !has_width) width = 1;
             std::string value;
             while (value.size() < width) {
                 const auto current = reader.get();
-                if (current < 0 || (conversion == 's' && whitespace(current))) { reader.put(current); break; }
+                if (current < 0 || (conversion == 's' && whitespace(current)) ||
+                    (conversion == '[' && member[static_cast<unsigned char>(current)] == negate)) { reader.put(current); break; }
                 value += static_cast<char>(current);
             }
             if (value.empty() || (conversion == 'c' && value.size() != width)) return failed();
             if (!suppress) {
-                const auto bytes = value.size() + (conversion == 's' ? 1 : 0);
+                const auto bytes = value.size() + (conversion != 'c' ? 1 : 0);
                 if (!accessible(memory, destination, bytes, true)) throw NativeError{14};
                 memory.write_bytes(destination, {reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
-                if (conversion == 's') memory.write8(destination + value.size(), 0);
+                if (conversion != 'c') memory.write8(destination + value.size(), 0);
                 ++assigned;
             }
             converted = true; continue;
@@ -265,10 +286,23 @@ void install_darwin_native(ProcessContext& context) {
             memory.write64(state.x[2], next); state.x[0] = result;
         } catch (const NativeError& error) { context.set_errno(error.value); state.x[0] = 0; }
     }));
-    static_cast<void>(context.install_function("_fscanf", [&context](auto& state, auto& memory) {
-        try { state.x[0] = scan(context, state, memory); }
-        catch (const NativeError& error) { context.set_errno(error.value); state.x[0] = UINT32_MAX; }
-    }));
+    // fscanf(stream, format, ...) / vfscanf(stream, format, va_list) / scanf(format, ...) /
+    // vscanf(format, va_list): standard input is *__stdinp.
+    const auto standard_input = [&context](transmute::GuestMemory& memory) {
+        const auto cell = context.resolve(library, "___stdinp");
+        if (!cell) throw std::runtime_error("Darwin scanf requires __stdinp");
+        return memory.read64(cell->address);
+    };
+    for (const auto& [name, which] : std::array<std::pair<const char*, int>, 4>{{{"_fscanf", 0}, {"_vfscanf", 1}, {"_scanf", 2}, {"_vscanf", 3}}}) {
+        const int kind = which;
+        static_cast<void>(context.install_function(name, [&context, standard_input, kind](auto& state, auto& memory) {
+            try {
+                if (kind == 0) state.x[0] = scan(context, state.x[0], state.x[1], state.sp, memory);
+                else if (kind == 1) state.x[0] = scan(context, state.x[0], state.x[1], state.x[2], memory);
+                else state.x[0] = scan(context, standard_input(memory), state.x[0], kind == 2 ? state.sp : state.x[1], memory);
+            } catch (const NativeError& error) { context.set_errno(error.value); state.x[0] = UINT32_MAX; }
+        }));
+    }
     static_cast<void>(context.install_function("_backtrace", [&context](auto& state, auto& memory) {
         const auto count = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[1]));
         if (count <= 0) { state.x[0] = 0; return; }

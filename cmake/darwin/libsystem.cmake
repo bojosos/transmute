@@ -10,6 +10,7 @@ target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/libsystem/runtime.cpp
     src/alchemy/darwin/libsystem/services.cpp
     src/alchemy/darwin/libsystem/fs/files.cpp
+    src/alchemy/darwin/libsystem/fs/memory_streams.cpp
     src/alchemy/darwin/libsystem/fs/record_locks.cpp
     src/alchemy/darwin/libsystem/fs/symlink_records.cpp
     src/alchemy/darwin/libsystem/fs/terminal.cpp

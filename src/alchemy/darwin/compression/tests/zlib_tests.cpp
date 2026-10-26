@@ -334,6 +334,54 @@ void test_guest_zstream_libpng(Fixture& f) {
     static_cast<void>(f.call(libz, "_inflateEnd", {inflater}));
 }
 
+// The gz* file interface (zlib_files.cpp).
+void test_guest_gzfiles(Fixture& f) {
+    const auto file = std::filesystem::temp_directory_path() / "alchemy-gzfile-test.gz";
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    const auto path = f.text(alchemy::guest_path_string(file));
+    const auto writer = f.call(libz, "_gzopen", {path, f.text("wb9")});
+    require(writer != 0, "gzopen wb9");
+    require(f.call(libz, "_gzwrite", {writer, f.text("hello gz\n"), 9}) == 9, "gzwrite");
+    alchemy::CallRegs registers;
+    registers.x[0] = writer; registers.x[1] = f.text("%d-%s\n");
+    registers.push_variadic(Address{42});
+    registers.push_variadic(f.text("x"));
+    require(alchemy::engine_call_regs(f.engine, f.symbol(libz, "_gzprintf"), registers).x0 == 5, "gzprintf");
+    require(f.call(libz, "_gzputs", {writer, f.text("line3\n")}) == 6 && f.call(libz, "_gzputc", {writer, '!'}) == '!', "gzputs / gzputc");
+    require(f.call(libz, "_gztell", {writer}) == 21 && f.call(libz, "_gzclose", {writer}) == 0, "gzclose");
+    {
+        std::ifstream in(file, std::ios::binary);
+        const auto first = in.get(), second = in.get();
+        require(first == 0x1f && second == 0x8b, "the file is gzip");
+    }
+    const auto appender = f.call(libz, "_gzopen", {path, f.text("ab")});
+    require(f.call(libz, "_gzwrite", {appender, f.text("more"), 4}) == 4 && f.call(libz, "_gzclose", {appender}) == 0, "a second member");
+    const auto reader = f.call(libz, "_gzopen", {path, f.text("rb")});
+    require(reader != 0 && f.call(libz, "_gzdirect", {reader}) == 0, "gzopen rb, not direct");
+    const auto line = f.process.allocate_guest(64);
+    require(f.call(libz, "_gzgets", {reader, line, 64}) == line && f.read(line) == "hello gz\n", "gzgets");
+    require(f.call(libz, "_gzread", {reader, line, 3}) == 3 && f.read(line).substr(0, 3) == "42-", "gzread");
+    require(f.call(libz, "_gzgetc_", {reader}) == 'x' && f.call(libz, "_gzungetc", {'x', reader}) == 'x' && f.call(libz, "_gzgetc", {reader}) == 'x',
+            "gzgetc / gzungetc");
+    require(f.call(libz, "_gzseek", {reader, 0, 0}) == 0, "gzseek back to the start");
+    const auto all = f.process.allocate_guest(64);
+    f.engine.fill_bytes(all, 0, 64);
+    require(f.call(libz, "_gzread", {reader, all, 63}) == 25 && f.read(all) == "hello gz\n42-x\nline3\n!more", "both members");
+    require(f.call(libz, "_gzeof", {reader}) == 1, "gzeof");
+    const auto error = f.process.allocate_guest(4);
+    f.call(libz, "_gzerror", {reader, error});
+    require(f.engine.read32(error) == 0 && f.call(libz, "_gzclose", {reader}) == 0, "no error");
+    // A file that is not gzip reads through unchanged.
+    { std::ofstream out(file, std::ios::binary | std::ios::trunc); out << "plain text"; }
+    const auto plain = f.call(libz, "_gzopen", {path, f.text("r")});
+    f.engine.fill_bytes(all, 0, 64);
+    require(f.call(libz, "_gzdirect", {plain}) == 1 && f.call(libz, "_gzread", {plain, all, 63}) == 10 && f.read(all) == "plain text", "gzdirect");
+    f.call(libz, "_gzclose", {plain});
+    require(f.call(libz, "_gzopen", {path, f.text("q")}) == 0, "gzopen without r/w/a");
+    std::filesystem::remove(file, ignored);
+}
+
 } // namespace
 
 int main() {
@@ -345,6 +393,7 @@ int main() {
         stage("guest zlib"); test_guest_zlib(f);
         stage("guest z_stream"); test_guest_zstream(f);
         stage("guest z_stream libpng"); test_guest_zstream_libpng(f);
+        stage("guest gz files"); test_guest_gzfiles(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

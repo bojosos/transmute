@@ -1,6 +1,7 @@
 # Compression
 
-libz (`zlib_*.cpp`, over the project's DEFLATE codec), libcompression
+libz (`zlib_*.cpp`, over the project's DEFLATE codec, with the gz* file interface in
+`zlib_files.cpp`: gzip members read and written through the guest's descriptors), libcompression
 (`compression.cpp`, `compression_provider.cpp`: zlib and LZ4), bzip2
 decoding (`bzip2.cpp`) and xar archives (`xar.cpp`). All alchemy-fx (GUI).
 

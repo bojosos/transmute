@@ -19,7 +19,7 @@
 // Not provided (unresolved at bind): preset dictionaries
 // (inflateSetDictionary/deflateSetDictionary: a stream that needs one fails
 // with Z_NEED_DICT), deflateParams, deflateTune, inflateSync, inflateCopy,
-// deflateCopy, inflateBack and the gz* file interface.
+// deflateCopy and inflateBack. The gz* file interface is zlib_files.cpp.
 namespace alchemy::export_fill {
 namespace {
 

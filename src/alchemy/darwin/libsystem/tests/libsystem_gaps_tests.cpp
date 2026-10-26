@@ -512,6 +512,109 @@ void test_bsd_extra(Fixture& f) {
             f.symbol("/usr/lib/libSystem.B.dylib", "__DefaultRuneLocale"), "_CurrentRuneLocale is the C locale");
 }
 
+// Streams without descriptors and the scanf/wide stdio family (fs/memory_streams.cpp,
+// fs/files.cpp, misc/native.cpp).
+void test_memory_streams(Fixture& f) {
+    const auto sys = "/usr/lib/libSystem.B.dylib";
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto variadic = [&f, sys](std::string_view name, std::initializer_list<Address> fixed, std::initializer_list<Address> rest) {
+        alchemy::CallRegs registers;
+        std::size_t index = 0;
+        for (const auto value : fixed) registers.x[index++] = value;
+        for (const auto value : rest) registers.push_variadic(value);
+        return alchemy::engine_call_regs(f.engine, f.symbol(sys, name), registers).x0;
+    };
+    const auto wide = [&f](std::u32string_view text) {
+        const auto address = f.process.allocate_guest((text.size() + 1) * 4);
+        for (std::size_t index = 0; index <= text.size(); ++index)
+            f.engine.write32(address + index * 4, index < text.size() ? static_cast<std::uint32_t>(text[index]) : 0);
+        return address;
+    };
+    // fmemopen "w+": printf into the buffer, read it back.
+    const auto buffer = f.process.allocate_guest(32), line = f.process.allocate_guest(32);
+    f.engine.fill_bytes(buffer, 0x55, 32);
+    const auto memory = f.sys("_fmemopen", {buffer, 32, f.text("w+")});
+    require(memory != 0 && f.byte(buffer) == 0, "fmemopen w+ starts empty");
+    require(variadic("_fprintf", {memory, f.text("x=%d")}, {5}) == 3 && f.read(buffer) == "x=5", "fprintf into a fmemopen buffer");
+    require(f.sys("_fseek", {memory, 0, 2}) == 0 && f.sys("_ftell", {memory}) == 3, "SEEK_END is the contents' end");
+    f.sys("_rewind", {memory});
+    require(f.sys("_fgets", {line, 32, memory}) == line && f.read(line) == "x=5", "fgets reads it back");
+    require(f.sys("_fileno", {memory}) == static_cast<Address>(-1) && errno_value() == 9, "no descriptor");
+    require(f.sys("_setvbuf", {memory, 0, 1, 0}) == 0 && f.sys("_setlinebuf", {memory}) == 0 && f.sys("_fpurge", {memory}) == 0,
+            "buffering modes are accepted");
+    require(f.sys("_fclose", {memory}) == 0, "fclose");
+    // A full buffer: the write is short.
+    const auto small = f.process.allocate_guest(4);
+    const auto tight = f.sys("_fmemopen", {small, 4, f.text("w")});
+    require(f.sys("_fwrite", {f.text("abcdef"), 1, 6, tight}) == 4 && f.sys("_ferror", {tight}) == 1, "writes past the end are short");
+    f.sys("_fclose", {tight});
+    // fmemopen "r" with fscanf, and the va_list forms.
+    const auto input = f.text("12 abc rest");
+    const auto reader = f.sys("_fmemopen", {input, 11, f.text("r")});
+    const auto number = f.process.allocate_guest(8), word = f.process.allocate_guest(16), set = f.process.allocate_guest(16);
+    require(variadic("_fscanf", {reader, f.text("%d %s")}, {number, word}) == 2 && f.engine.read32(number) == 12 && f.read(word) == "abc",
+            "fscanf over a fmemopen stream");
+    const auto list = f.process.allocate_guest(16);
+    f.engine.write64(list, set);
+    require(f.sys("_vfscanf", {reader, f.text(" %[a-s]"), list}) == 1 && f.read(set) == "res", "vfscanf with a scan set");
+    f.sys("_fclose", {reader});
+    f.engine.write64(list, number); f.engine.write64(list + 8, word);
+    require(f.sys("_vsscanf", {f.text("7 eight"), f.text("%d %s"), list}) == 2 && f.engine.read32(number) == 7 && f.read(word) == "eight",
+            "vsscanf");
+    // open_memstream: *bufp/*sizep follow fflush and fclose.
+    const auto cells = f.process.allocate_guest(16);
+    const auto dynamic = f.sys("_open_memstream", {cells, cells + 8});
+    require(dynamic != 0, "open_memstream");
+    f.sys("_fputs", {f.text("hello"), dynamic});
+    require(f.sys("_fflush", {dynamic}) == 0 && f.engine.read64(cells + 8) == 5 && f.read(f.engine.read64(cells)) == "hello", "after fflush");
+    variadic("_fprintf", {dynamic, f.text("%d")}, {42});
+    require(f.sys("_fclose", {dynamic}) == 0 && f.engine.read64(cells + 8) == 7 && f.read(f.engine.read64(cells)) == "hello42", "after fclose");
+    f.sys("_free", {f.engine.read64(cells)});
+    // open_wmemstream: UTF-8 in, wchar_t out; wide printf and fputws.
+    const auto wide_stream = f.sys("_open_wmemstream", {cells, cells + 8});
+    f.sys("_fputs", {f.text("h\xc3\xa9"), wide_stream});
+    require(f.sys("_fwide", {wide_stream, 1}) == 1 && f.sys("_fwide", {wide_stream, static_cast<Address>(-1)}) == 1, "fwide sets the orientation once");
+    f.engine.write64(list, 9);
+    require(f.sys("_vfwprintf", {wide_stream, wide(U"n=%d"), list}) == 3, "vfwprintf counts wide characters");
+    f.sys("_fputws", {wide(U"!"), wide_stream});
+    f.sys("_fclose", {wide_stream});
+    const auto text = f.engine.read64(cells);
+    require(f.engine.read64(cells + 8) == 6 && f.engine.read32(text) == 'h' && f.engine.read32(text + 4) == 0xe9 &&
+            f.engine.read32(text + 8) == 'n' && f.engine.read32(text + 20) == '!' && f.engine.read32(text + 24) == 0, "open_wmemstream");
+    f.sys("_free", {text});
+    // funopen: the guest's functions with the cookie.
+    static std::string written;
+    static bool closed = false;
+    const auto writer = f.process.install_function("_gaps_funopen_write", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        require(s.x[0] == 0x1234, "the cookie reaches writefn");
+        for (std::uint64_t index = 0; index < static_cast<std::uint32_t>(s.x[2]); ++index) written.push_back(static_cast<char>(m.read8(s.x[1] + index)));
+        s.x[0] = static_cast<std::uint32_t>(s.x[2]);
+    });
+    const auto feeder = f.process.install_function("_gaps_funopen_read", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto count = std::min<std::uint64_t>(static_cast<std::uint32_t>(s.x[2]), 4);
+        for (std::uint64_t index = 0; index < count; ++index) m.write8(s.x[1] + index, 'Z');
+        s.x[0] = count;
+    });
+    const auto closer = f.process.install_function("_gaps_funopen_close", [](transmute::CpuState& s, transmute::GuestMemory&) { closed = true; s.x[0] = 0; });
+    const auto custom = f.sys("_funopen", {0x1234, 0, writer, 0, closer});
+    require(f.sys("_fwrite", {f.text("abc"), 1, 3, custom}) == 3 && written == "abc", "funopen writefn");
+    require(f.sys("_fseek", {custom, 0, 0}) == static_cast<Address>(-1) && errno_value() == 29, "no seekfn: ESPIPE");
+    require(f.sys("_fclose", {custom}) == 0 && closed, "closefn runs at fclose");
+    const auto source = f.sys("_funopen", {0, feeder, 0, 0, 0});
+    const auto bytes = f.process.allocate_guest(8);
+    require(f.sys("_fread", {bytes, 1, 6, source}) == 6 && f.byte(bytes) == 'Z' && f.byte(bytes + 5) == 'Z', "funopen readfn");
+    f.sys("_fclose", {source});
+    require(f.sys("_funopen", {0, 0, 0, 0, 0}) == 0 && errno_value() == 22, "funopen needs a read or write function");
+    require(f.read(f.sys("_ctermid", {0})) == "/dev/tty", "ctermid");
+    // tempnam: a name under TMPDIR from the prefix.
+    const auto temporary = alchemy::guest_path_string(std::filesystem::temp_directory_path());
+    f.sys("_setenv", {f.text("TMPDIR"), f.text(temporary), 1});
+    const auto name = f.sys("_tempnam", {0, f.text("abcdefg")});
+    require(name && f.read(name).starts_with(temporary) && f.read(name).find("/abcde") != std::string::npos, "tempnam");
+    f.sys("_free", {name});
+    f.sys("_unsetenv", {f.text("TMPDIR")});
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -878,6 +981,7 @@ int main() {
         stage("sigsuspend"); test_sigsuspend(f);
         stage("bsd extra"); test_bsd_extra(f);
         stage("netdb extra"); test_netdb_extra(f);
+        stage("memory streams"); test_memory_streams(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

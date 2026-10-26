@@ -21,6 +21,7 @@
 //   <stdlib.h>    psort, psort_r, psort_b (the qsort forms), sranddev, devname_r, getbsize,
 //                 rpmatch; arc4random_stir and arc4random_addrandom do nothing (arc4random
 //                 reads the host's random source on every call, there is no pool to stir)
+//   <stdio.h>     tempnam (over access and mktemp)
 //   <time.h>      timeoff, strptime_l (the "C" locale); ualarm is an explicit stop, as alarm
 //                 (no asynchronous SIGALRM)
 //   <unistd.h>    getpass; <readpassphrase.h> readpassphrase (echo off on a terminal)
@@ -278,6 +279,41 @@ void install_libsystem_bsd_extra(Provider& p) {
         if (first == 'n' || first == 'N') return 0;
         return static_cast<std::uint64_t>(-1);
     });
+
+    // char* tempnam(const char* dir, const char* prefix): a malloc'd name that does not exist yet,
+    // in the first writable directory of TMPDIR, dir, P_tmpdir ("/var/tmp/") and "/tmp", from up
+    // to five prefix characters ("tmp." without one) and mktemp's random ones.
+    p.libsystem("_tempnam", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto writable = [&p, &m](const std::string& directory) {
+            if (directory.empty()) return false;
+            const auto path = p.malloc(directory.size() + 1);
+            put_string(m, path, directory);
+            const auto result = static_cast<std::int32_t>(p.call(libsystem_library, "_access", {path, 2}));
+            static_cast<void>(p.call(libsystem_library, "_free", {path}));
+            return result == 0;
+        };
+        std::vector<std::string> candidates;
+        const auto name = p.malloc(7);
+        put_string(m, name, "TMPDIR");
+        if (const auto environment = p.call(libsystem_library, "_getenv", {name})) candidates.push_back(bounded_string(m, environment, 1024));
+        static_cast<void>(p.call(libsystem_library, "_free", {name}));
+        if (s.x[0]) candidates.push_back(bounded_string(m, s.x[0], 1024));
+        candidates.emplace_back("/var/tmp/");
+        candidates.emplace_back("/tmp");
+        std::string directory;
+        for (const auto& candidate : candidates) if (writable(candidate)) { directory = candidate; break; }
+        if (directory.empty()) throw Errno{enoent};
+        const auto prefix = s.x[1] ? bounded_string(m, s.x[1], 1024).substr(0, 5) : std::string("tmp.");
+        const auto path = directory + (directory.back() == '/' ? "" : "/") + prefix + "XXXXXX";
+        const auto result = p.malloc(path.size() + 1);
+        put_string(m, result, path);
+        if (!p.call(libsystem_library, "_mktemp", {result})) {
+            const auto error = p.guest_errno();
+            static_cast<void>(p.call(libsystem_library, "_free", {result}));
+            throw Errno{error ? error : eexist};
+        }
+        return result;
+    }, 0);
 
     // ---- <time.h> ----
     // time_t timeoff(struct tm*, long offset): tm read as the time `offset` seconds east of UTC.

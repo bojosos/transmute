@@ -385,8 +385,18 @@ void DarwinServices::Impl::install_extra() {
     });
     for (const auto& [alias, original] : std::array<std::pair<const char*, const char*>, 3>{{{"_fseeko", "_fseek"}, {"_ftello", "_ftell"}, {"_lstat$INODE64", "_lstat"}}})
         context.install_export(std::string(system_library), alias, *context.resolve(system_library, original));
-    install("_setbuf", [this](auto& s, auto&) { static_cast<void>(stream(s.x[0])); if (s.x[1]) throw std::runtime_error("Darwin setbuf buffering is unsupported"); return std::uint64_t{0}; });
-    install("_setvbuf", [this](auto& s, auto&) { static_cast<void>(stream(s.x[0])); if (s.x[2] != 2) throw ServiceError{enosys}; return std::uint64_t{0}; });
+    // Buffering modes. Every write reaches the descriptor (or backend) at once and nothing is
+    // read ahead, so a buffered mode (_IOFBF 0, _IOLBF 1) changes only when bytes arrive, never
+    // which; a caller's buffer is accepted and left unused.
+    install("_setvbuf", [this](auto& s, auto&) { static_cast<void>(stream(s.x[0])); if (s.x[2] > 2) throw ServiceError{einval}; return std::uint64_t{0}; });
+    install("_setbuf", [this](auto& s, auto&) { static_cast<void>(stream(s.x[0])); return std::uint64_t{0}; });
+    install("_setbuffer", [this](auto& s, auto&) { static_cast<void>(stream(s.x[0])); return std::uint64_t{0}; });
+    install("_setlinebuf", [this](auto& s, auto&) { static_cast<void>(stream(s.x[0])); return std::uint64_t{0}; });
+    // fpurge: drops the pushed-back character (nothing else is buffered).
+    install("_fpurge", [this](auto& s, auto&) {
+        static_cast<void>(stream(s.x[0]));
+        std::lock_guard lock(mutex); streams.at(s.x[0]).pushed = -1; return std::uint64_t{0};
+    });
     // isatty: fs/terminal.cpp (is_terminal).
     install("_isatty", [this](auto& s, auto&) {
         if (s.x[0] > INT32_MAX) throw ServiceError{ebadf};
@@ -412,8 +422,18 @@ void DarwinServices::Impl::install_extra() {
     }, UINT32_MAX);
     install("_ungetwc", [this](auto& s, auto&) { if (s.x[0] > 127) return static_cast<std::uint64_t>(UINT32_MAX); const auto value = stream(s.x[1]); if (value.pushed != -1) return static_cast<std::uint64_t>(UINT32_MAX); std::lock_guard lock(mutex); streams.at(s.x[1]).pushed = static_cast<int>(s.x[0]); streams.at(s.x[1]).eof = false; return s.x[0]; }, UINT32_MAX);
     context.install_export(std::string(system_library), "_fgetwc", *context.resolve(system_library, "_getwc"));
+    context.install_export(std::string(system_library), "_putwc", *context.resolve(system_library, "_fputwc"));
+    install("_putwchar", [this](auto& s, auto& m) { if (s.x[0] > 127) throw ServiceError{92}; const char character = static_cast<char>(s.x[0]); static_cast<void>(output_stream(m, standard_streams[1], std::string_view(&character, 1))); return s.x[0]; }, UINT32_MAX);
+    install("_getwchar", [this](auto&, auto&) {
+        const auto getwc = context.resolve(system_library, "_getwc");
+        const std::array<std::uint64_t, 1> arguments{standard_streams[0]};
+        return EngineAdapter(context.calling_engine()).call(getwc->address, arguments) & 0xffffffffULL;
+    }, UINT32_MAX);
     install("_snprintf_l", [this](auto& s, auto& m) { validate_locale(s.x[2]); const auto value = format(m, s.x[3], s.sp); if (s.x[1]) put_text(m, s.x[0], std::string_view(value.data(), static_cast<std::size_t>(std::min<std::uint64_t>(value.size(), s.x[1] - 1)))); return static_cast<std::uint64_t>(value.size()); }, UINT32_MAX);
     install("_asprintf_l", [this](auto& s, auto& m) { validate_locale(s.x[1]); const auto value = format(m, s.x[2], s.sp); const auto address = allocate(value.size() + 1); put_text(m, address, value); m.write64(s.x[0], address); return static_cast<std::uint64_t>(value.size()); }, UINT32_MAX);
+    install("_vasprintf_l", [this](auto& s, auto& m) { validate_locale(s.x[1]); const auto value = format(m, s.x[2], s.x[3]); const auto address = allocate(value.size() + 1); put_text(m, address, value); m.write64(s.x[0], address); return static_cast<std::uint64_t>(value.size()); }, UINT32_MAX);
+    // vsscanf(input, format, va_list): a Darwin va_list addresses the same 8-byte slots.
+    install("_vsscanf", [this](auto& s, auto& m) { return scan(m, s.x[0], s.x[1], s.x[2]); }, UINT32_MAX);
     // strerror_r: install_darwin_support (misc/support.cpp).
     for (const auto localized : {false, true}) install(localized ? "_sscanf_l" : "_sscanf", [this, localized](auto& s, auto& m) { if (localized) validate_locale(s.x[1]); return scan(m, s.x[0], s.x[localized ? 2 : 1], s.sp); }, UINT32_MAX);
     for (const auto localized : {false, true}) install(localized ? "_strftime_l" : "_strftime", [this, localized](auto& s, auto& m) {
@@ -501,18 +521,116 @@ void DarwinServices::Impl::install_extra() {
         static_cast<void>(output_stream(m, s.x[0], value));
         return static_cast<std::uint64_t>(value.size());
     }, UINT32_MAX);
-    install("_swscanf", [this, narrow_wide, check_wide_conversions](auto& s, auto& m) {
-        const auto input = narrow_wide(m, s.x[0], "swscanf"), specification = narrow_wide(m, s.x[1], "swscanf");
-        check_wide_conversions(specification, "swscanf");
-        const auto input_address = context.allocate_guest(input.size() + 1);
+    for (const auto va : {false, true})
+        install(va ? "_vswscanf" : "_swscanf", [this, narrow_wide, check_wide_conversions, va](auto& s, auto& m) {
+            const auto name = va ? "vswscanf" : "swscanf";
+            const auto input = narrow_wide(m, s.x[0], name), specification = narrow_wide(m, s.x[1], name);
+            check_wide_conversions(specification, name);
+            const auto input_address = context.allocate_guest(input.size() + 1);
+            const auto format_address = context.allocate_guest(specification.size() + 1);
+            try {
+                put_text(m, input_address, input); put_text(m, format_address, specification);
+                const auto result = scan(m, input_address, format_address, va ? s.x[2] : s.sp);
+                context.release_guest(input_address); context.release_guest(format_address);
+                return result;
+            } catch (...) { context.release_guest(input_address); context.release_guest(format_address); throw; }
+        }, UINT32_MAX);
+    // fwscanf / vfwscanf / wscanf / vwscanf: vfscanf (misc/native.cpp) with the narrowed format.
+    const auto wide_stream_scan = [this, narrow_wide, check_wide_conversions](auto& m, std::uint64_t file, std::uint64_t format_wide,
+                                                                               std::uint64_t arguments, const char* name) -> std::uint64_t {
+        const auto specification = narrow_wide(m, format_wide, name);
+        check_wide_conversions(specification, name);
+        const auto scanner = context.resolve(system_library, "_vfscanf");
+        if (!scanner) throw std::runtime_error("Darwin wide scanf requires vfscanf");
         const auto format_address = context.allocate_guest(specification.size() + 1);
         try {
-            put_text(m, input_address, input); put_text(m, format_address, specification);
-            const auto result = scan(m, input_address, format_address, s.sp);
-            context.release_guest(input_address); context.release_guest(format_address);
-            return result;
-        } catch (...) { context.release_guest(input_address); context.release_guest(format_address); throw; }
+            put_text(m, format_address, specification);
+            const std::array<std::uint64_t, 3> call_arguments{file, format_address, arguments};
+            const auto result = EngineAdapter(context.calling_engine()).call(scanner->address, call_arguments);
+            context.release_guest(format_address);
+            return result & 0xffffffffULL;
+        } catch (...) { context.release_guest(format_address); throw; }
+    };
+    install("_fwscanf", [wide_stream_scan](auto& s, auto& m) { return wide_stream_scan(m, s.x[0], s.x[1], s.sp, "fwscanf"); }, UINT32_MAX);
+    install("_vfwscanf", [wide_stream_scan](auto& s, auto& m) { return wide_stream_scan(m, s.x[0], s.x[1], s.x[2], "vfwscanf"); }, UINT32_MAX);
+    install("_wscanf", [this, wide_stream_scan](auto& s, auto& m) { return wide_stream_scan(m, standard_streams[0], s.x[0], s.sp, "wscanf"); }, UINT32_MAX);
+    install("_vwscanf", [this, wide_stream_scan](auto& s, auto& m) { return wide_stream_scan(m, standard_streams[0], s.x[0], s.x[1], "vwscanf"); }, UINT32_MAX);
+    // vfwprintf / wprintf / vwprintf: as fwprintf (UTF-8 on the stream); the count is in wide characters.
+    const auto wide_print = [this](auto& m, std::uint64_t file, std::uint64_t format_wide, std::uint64_t arguments) -> std::uint64_t {
+        const auto value = wide_format_text(m, format_wide, arguments);
+        static_cast<void>(output_stream(m, file, utf32_to_utf8(value)));
+        return static_cast<std::uint64_t>(value.size());
+    };
+    install("_vfwprintf", [wide_print](auto& s, auto& m) { return wide_print(m, s.x[0], s.x[1], s.x[2]); }, UINT32_MAX);
+    install("_wprintf", [this, wide_print](auto& s, auto& m) { return wide_print(m, standard_streams[1], s.x[0], s.sp); }, UINT32_MAX);
+    install("_vwprintf", [this, wide_print](auto& s, auto& m) { return wide_print(m, standard_streams[1], s.x[0], s.x[1]); }, UINT32_MAX);
+    // fputws(ws, stream): UTF-8, as fwprintf. fgetws(ws, n, stream): getwc's characters (ASCII in
+    // the C locale) up to a newline, which is kept.
+    install("_fputws", [this](auto& s, auto& m) {
+        std::u32string value;
+        for (std::uint64_t at = 0;; ++at) {
+            if (at == string_limit) throw ServiceError{einval};
+            const auto c = m.read32(add(s.x[0], at * 4));
+            if (!c) break;
+            value.push_back(static_cast<char32_t>(c));
+        }
+        static_cast<void>(output_stream(m, s.x[1], utf32_to_utf8(value)));
+        return std::uint64_t{0};
     }, UINT32_MAX);
+    install("_fgetws", [this](auto& s, auto& m) {
+        const auto count = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(s.x[1]));
+        if (count <= 0) throw ServiceError{einval};
+        const auto getwc = context.resolve(system_library, "_getwc");
+        if (!getwc) throw std::runtime_error("Darwin fgetws requires getwc");
+        std::uint64_t position = 0;
+        while (position + 1 < static_cast<std::uint64_t>(count)) {
+            const std::array<std::uint64_t, 1> arguments{s.x[2]};
+            const auto c = static_cast<std::uint32_t>(EngineAdapter(context.calling_engine()).call(getwc->address, arguments));
+            if (c == UINT32_MAX) break;
+            m.write32(add(s.x[0], position++ * 4), c);
+            if (c == '\n') break;
+        }
+        if (!position) return std::uint64_t{0};
+        m.write32(add(s.x[0], position * 4), 0);
+        return s.x[0];
+    }, 0);
+    // fwide(stream, mode): the orientation (negative bytes, positive wide); set once by a nonzero mode.
+    install("_fwide", [this](auto& s, auto&) {
+        static_cast<void>(stream(s.x[0]));
+        std::lock_guard lock(mutex);
+        auto& current = streams.at(s.x[0]);
+        const auto mode = static_cast<std::int32_t>(s.x[1]);
+        if (!current.orientation && mode) current.orientation = mode < 0 ? -1 : 1;
+        return static_cast<std::uint64_t>(static_cast<std::int64_t>(current.orientation)) & 0xffffffffULL;
+    });
+    // gets(buffer): a line from standard input, without its newline (the caller's buffer has no bound).
+    install("_gets", [this](auto& s, auto& m) {
+        const auto input = standard_streams[0];
+        const auto value = stream(input);
+        std::lock_guard stream_lock(*value.lock);
+        const auto byte = context.allocate_guest(1);
+        std::uint64_t position = 0;
+        bool newline = false;
+        try {
+            while (read_stream(m, input, byte, 1)) {
+                const auto c = m.read8(byte);
+                if (c == '\n') { newline = true; break; }
+                m.write8(add(s.x[0], position++), c);
+            }
+        } catch (...) { context.release_guest(byte); throw; }
+        context.release_guest(byte);
+        if (!position && !newline) return std::uint64_t{0};
+        m.write8(add(s.x[0], position), 0);
+        return s.x[0];
+    }, 0);
+    // ctermid(buffer): "/dev/tty", the controlling terminal's name (in buffer, or a static one).
+    const auto ctermid_buffer = std::make_shared<std::uint64_t>(0);
+    install("_ctermid", [this, ctermid_buffer](auto& s, auto& m) {
+        auto target = s.x[0];
+        if (!target) { std::lock_guard lock(mutex); if (!*ctermid_buffer) *ctermid_buffer = context.allocate_guest(16); target = *ctermid_buffer; }
+        put_text(m, target, "/dev/tty");
+        return target;
+    }, 0);
 }
 
 void DarwinServices::Impl::install_python_services() {
@@ -533,7 +651,7 @@ void DarwinServices::Impl::install_python_services() {
     install("_rewind", [this](auto& s, auto& m) {
         const auto value = stream(s.x[0]);
         std::lock_guard stream_lock(*value.lock);
-        static_cast<void>(seek(value.descriptor, 0, 0));
+        static_cast<void>(stream_seek(m, value, 0, 0));
         { std::lock_guard lock(mutex); auto& current = streams.at(s.x[0]); current.eof = false; current.error = false; current.pushed = -1; }
         m.write32(s.x[0] + 8, 0); m.write8(s.x[0] + 16, static_cast<std::uint8_t>(m.read8(s.x[0] + 16) & ~0x60U));
         return std::uint64_t{0};

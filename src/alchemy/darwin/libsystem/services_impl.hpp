@@ -1075,6 +1075,18 @@ inline std::uint64_t scan(transmute::GuestMemory& memory, std::uint64_t input_ad
 // The Darwin errno of a failed host socket call (net/sockets.cpp,
 // process/identity.cpp and process/process_model.cpp).
 inline std::uint32_t network_error(host::Error error) { return libsystem::darwin_socket_errno(error); }
+
+// A FILE not backed by a descriptor (fs/memory_streams.cpp: fmemopen, open_memstream,
+// open_wmemstream, funopen). Each call moves bytes at a guest address and returns the
+// count (short at the end), or throws ServiceError.
+struct StreamBackend {
+    virtual ~StreamBackend() = default;
+    virtual std::uint64_t read(transmute::GuestMemory& memory, std::uint64_t address, std::uint64_t size) = 0;
+    virtual std::uint64_t write(transmute::GuestMemory& memory, std::uint64_t address, std::uint64_t size) = 0;
+    virtual std::uint64_t seek(transmute::GuestMemory& memory, std::int64_t offset, int whence) = 0;
+    virtual void flush(transmute::GuestMemory&) {}
+    virtual std::uint64_t close(transmute::GuestMemory& memory) = 0;
+};
 } // namespace services_detail
 using namespace services_detail;
 void remove_unix_socket_file(const std::filesystem::path& host);   // net/sockets.cpp
@@ -1160,7 +1172,11 @@ public:
         std::map<std::pair<std::uint64_t, std::int16_t>, Watch> watches;
         std::uint64_t serial{};
     };
-    struct Stream { int descriptor{}; bool eof{}, error{}; int pushed{-1}; std::shared_ptr<std::recursive_mutex> lock{std::make_shared<std::recursive_mutex>()}; };
+    struct Stream {
+        int descriptor{}; bool eof{}, error{}; int pushed{-1}; std::shared_ptr<std::recursive_mutex> lock{std::make_shared<std::recursive_mutex>()};
+        std::shared_ptr<StreamBackend> backend;   // set: the stream has no descriptor (fileno is EBADF)
+        int orientation{};                        // fwide: < 0 bytes, > 0 wide, 0 not yet set
+    };
     struct Directory { std::vector<std::filesystem::directory_entry> entries; std::size_t at{}; std::uint64_t buffer{}; std::optional<int> descriptor; };
     // A guest mmap: a private copy, an engine reservation, or (MAP_SHARED) a
     // view of a host file section that every process mapping the file shares.
@@ -2171,7 +2187,15 @@ public:
         { std::lock_guard lock(mutex); auto& current = streams.at(stream_address);
           if (size && current.pushed != -1) { memory.write8(address, static_cast<std::uint8_t>(current.pushed)); current.pushed = -1; prefix = 1; } }
         try {
-            const auto count = read(memory, value.descriptor, address + prefix, size - prefix);
+            std::uint64_t count = 0;
+            if (value.backend) {
+                // A backend (a funopen read function) may return less than asked before its end.
+                while (count < size - prefix) {
+                    const auto got = value.backend->read(memory, address + prefix + count, size - prefix - count);
+                    if (!got) break;
+                    count += got;
+                }
+            } else count = read(memory, value.descriptor, address + prefix, size - prefix);
             if (count < size - prefix) {
                 std::lock_guard lock(mutex); streams.at(stream_address).eof = true;
                 memory.write8(stream_address + 16, static_cast<std::uint8_t>(memory.read8(stream_address + 16) | 0x20U));
@@ -2181,6 +2205,33 @@ public:
             std::lock_guard lock(mutex); streams.at(stream_address).error = true;
             memory.write8(stream_address + 16, static_cast<std::uint8_t>(memory.read8(stream_address + 16) | 0x40U)); throw;
         }
+    }
+    // Writes and seeks of a stream: its descriptor's, or its backend's.
+    std::uint64_t stream_write(transmute::GuestMemory& memory, const Stream& value, std::uint64_t address, std::uint64_t size) {
+        return value.backend ? value.backend->write(memory, address, size) : write(memory, value.descriptor, address, size);
+    }
+    std::uint64_t stream_seek(transmute::GuestMemory& memory, const Stream& value, std::uint64_t offset, int whence) {
+        if (whence < 0 || whence > 2) throw ServiceError{einval};
+        return value.backend ? value.backend->seek(memory, std::bit_cast<std::int64_t>(offset), whence) : seek(value.descriptor, offset, whence);
+    }
+    // A FILE over a backend (no descriptor: _file is -1).
+    std::uint64_t new_backend_stream(std::shared_ptr<StreamBackend> backend, bool readable, bool writable) {
+        const auto address = context.allocate_guest(152);
+        try {
+            auto& memory = static_cast<transmute::GuestMemory&>(context.calling_engine());
+            memory.fill_bytes(address, 0, 152);
+            memory.write64(address, address + 119);
+            memory.write8(address + 16, static_cast<std::uint8_t>(readable && writable ? 18 : (readable ? 6 : 10)));
+            memory.write8(address + 18, 0xff);
+            memory.write8(address + 19, 0xff);
+            memory.write64(address + 24, address + 119);
+            memory.write32(address + 32, 1);
+            Stream value;
+            value.descriptor = -1;
+            value.backend = std::move(backend);
+            std::lock_guard lock(mutex); streams.emplace(address, std::move(value));
+        } catch (...) { context.release_guest(address); throw; }
+        return address;
     }
     std::uint64_t new_stream(int descriptor) {
         // Public Darwin FILE prefix, independently populated. Zero counters
@@ -2219,7 +2270,21 @@ public:
     std::uint64_t output_stream(transmute::GuestMemory& memory, std::uint64_t address, std::string_view value) {
         const auto record = stream(address);
         std::lock_guard stream_lock(*record.lock);
-        try { return output_text(memory, record.descriptor, value); }
+        try {
+            if (!record.backend) return output_text(memory, record.descriptor, value);
+            const auto temporary = context.allocate_guest(std::max<std::size_t>(value.size(), 1));
+            try {
+                memory.write_bytes(temporary, std::span(reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+                std::uint64_t total = 0;
+                while (total < value.size()) {
+                    const auto count = record.backend->write(memory, temporary + total, value.size() - total);
+                    if (!count) throw ServiceError{eio};
+                    total += count;
+                }
+                context.release_guest(temporary);
+                return total;
+            } catch (...) { context.release_guest(temporary); throw; }
+        }
         catch (const ServiceError&) {
             std::lock_guard lock(mutex);
             const auto found = streams.find(address);
@@ -2365,6 +2430,7 @@ public:
     void install_all();
     void install_extra();
     void install_python_services();
+    void install_memory_streams();   // fs/memory_streams.cpp
     void install_process_identity();
     void install_file_services();
     void install_libsystem_files();

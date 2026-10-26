@@ -308,16 +308,30 @@ void DarwinServices::Impl::install_all() {
             (mode[0] != 'r' && !record->writable)) throw ServiceError{einval};
         return new_stream(static_cast<int>(s.x[0]));
     }, 0);
-    install("_fclose", [this](auto& s, auto&) {
+    install("_fclose", [this](auto& s, auto& m) {
         const auto value = stream(s.x[0]);
         std::lock_guard stream_lock(*value.lock);
+        if (value.backend) {
+            // The stream goes away even when its close function fails.
+            std::optional<ServiceError> failure;
+            std::uint64_t result = 0;
+            try { value.backend->flush(m); result = value.backend->close(m); } catch (const ServiceError& error) { failure = error; }
+            { std::lock_guard lock(mutex); streams.erase(s.x[0]); }
+            context.release_guest(s.x[0]);
+            if (failure) throw *failure;
+            return result;
+        }
         if (value.descriptor < 3) throw ServiceError{enosys};
         const auto result = close(value.descriptor);
         { std::lock_guard lock(mutex); streams.erase(s.x[0]); }
         context.release_guest(s.x[0]);
         return result;
     });
-    install("_fileno", [this](auto& s, auto&) { return static_cast<std::uint64_t>(stream(s.x[0]).descriptor); });
+    install("_fileno", [this](auto& s, auto&) {
+        const auto value = stream(s.x[0]);
+        if (value.backend) throw ServiceError{ebadf};
+        return static_cast<std::uint64_t>(value.descriptor);
+    });
     install("_fread", [this](auto& s, auto& m) {
         if (!s.x[1] || !s.x[2]) return std::uint64_t{0};
         if (s.x[2] > UINT64_MAX / s.x[1]) throw ServiceError{einval};
@@ -334,7 +348,7 @@ void DarwinServices::Impl::install_all() {
         std::uint64_t total = 0;
         try {
             while (total < s.x[1] * s.x[2]) {
-                const auto count = write(m, value.descriptor, add(s.x[0], total), s.x[1] * s.x[2] - total);
+                const auto count = stream_write(m, value, add(s.x[0], total), s.x[1] * s.x[2] - total);
                 if (!count) throw ServiceError{eio};
                 total += count;
             }
@@ -344,12 +358,20 @@ void DarwinServices::Impl::install_all() {
         }
         return total / s.x[1];
     }, 0);
-    install("_fflush", [this](auto& s, auto&) { if (s.x[0]) static_cast<void>(stream(s.x[0])); return std::uint64_t{0}; });
+    // Descriptor streams are unbuffered; a backend stream publishes its state (open_memstream's
+    // buffer and size). fflush(NULL) does that for every stream.
+    install("_fflush", [this](auto& s, auto& m) {
+        if (s.x[0]) { const auto value = stream(s.x[0]); if (value.backend) { std::lock_guard stream_lock(*value.lock); value.backend->flush(m); } return std::uint64_t{0}; }
+        std::vector<Stream> backends;
+        { std::lock_guard lock(mutex); for (const auto& entry : streams) if (entry.second.backend) backends.push_back(entry.second); }
+        for (const auto& value : backends) { std::lock_guard stream_lock(*value.lock); value.backend->flush(m); }
+        return std::uint64_t{0};
+    });
     install("_feof", [this](auto& s, auto&) { return static_cast<std::uint64_t>(stream(s.x[0]).eof); });
     install("_ferror", [this](auto& s, auto&) { return static_cast<std::uint64_t>(stream(s.x[0]).error); });
     install("_clearerr", [this](auto& s, auto& m) { static_cast<void>(stream(s.x[0])); std::lock_guard lock(mutex); streams.at(s.x[0]).eof = false; streams.at(s.x[0]).error = false; m.write8(s.x[0] + 16, static_cast<std::uint8_t>(m.read8(s.x[0] + 16) & ~0x60U)); return std::uint64_t{0}; });
-    install("_fseek", [this](auto& s, auto&) { const auto value = stream(s.x[0]); static_cast<void>(seek(value.descriptor, s.x[1], static_cast<int>(s.x[2]))); std::lock_guard lock(mutex); streams.at(s.x[0]).eof = false; return std::uint64_t{0}; });
-    install("_ftell", [this](auto& s, auto&) { return seek(stream(s.x[0]).descriptor, 0, 1); });
+    install("_fseek", [this](auto& s, auto& m) { const auto value = stream(s.x[0]); static_cast<void>(stream_seek(m, value, s.x[1], static_cast<int>(s.x[2]))); std::lock_guard lock(mutex); streams.at(s.x[0]).eof = false; streams.at(s.x[0]).pushed = -1; return std::uint64_t{0}; });
+    install("_ftell", [this](auto& s, auto& m) { return stream_seek(m, stream(s.x[0]), 0, 1); });
     install("_fgetc", [this](auto& s, auto& m) {
         const auto byte = context.allocate_guest(1);
         try { const auto count = read_stream(m, s.x[0], byte, 1);
@@ -422,8 +444,8 @@ void DarwinServices::Impl::install_all() {
     };
     install("_getdelim", [getdelim](auto& s, auto& m) { return getdelim(s, m, s.x[2], s.x[3]); });
     install("_getline", [getdelim](auto& s, auto& m) { return getdelim(s, m, '\n', s.x[2]); });
-    install("_fgetpos", [this](auto& s, auto& m) { m.write64(s.x[1], seek(stream(s.x[0]).descriptor, 0, 1)); return std::uint64_t{0}; });
-    install("_fsetpos", [this](auto& s, auto& m) { static_cast<void>(seek(stream(s.x[0]).descriptor, m.read64(s.x[1]), 0)); std::lock_guard lock(mutex); streams.at(s.x[0]).eof = false; return std::uint64_t{0}; });
+    install("_fgetpos", [this](auto& s, auto& m) { m.write64(s.x[1], stream_seek(m, stream(s.x[0]), 0, 1)); return std::uint64_t{0}; });
+    install("_fsetpos", [this](auto& s, auto& m) { static_cast<void>(stream_seek(m, stream(s.x[0]), m.read64(s.x[1]), 0)); std::lock_guard lock(mutex); streams.at(s.x[0]).eof = false; streams.at(s.x[0]).pushed = -1; return std::uint64_t{0}; });
     install("_puts", [this](auto& s, auto& m) { return output_stream(m, standard_streams[1], text(m, s.x[0]) + '\n'); }, UINT32_MAX);
     install("_putchar", [this](auto& s, auto& m) { const char byte = static_cast<char>(s.x[0]); static_cast<void>(output_stream(m, standard_streams[1], std::string_view(&byte, 1))); return s.x[0] & 255; }, UINT32_MAX);
     install("_printf", [this](auto& s, auto& m) { return output_stream(m, standard_streams[1], format(m, s.x[0], s.sp)); }, UINT32_MAX);
@@ -781,6 +803,7 @@ void DarwinServices::Impl::install_all() {
     });
     install_extra();
     install_python_services();
+    install_memory_streams();
     install_process_identity();
     install_file_services();
     install_network_services();

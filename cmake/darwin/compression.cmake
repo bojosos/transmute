@@ -15,6 +15,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/compression/zlib_codec.cpp
     src/alchemy/darwin/compression/zlib_provider.cpp
     src/alchemy/darwin/compression/zlib_stream.cpp
+    src/alchemy/darwin/compression/zlib_files.cpp
     src/alchemy/darwin/compression/compression.cpp
     src/alchemy/darwin/compression/bzip2.cpp
     src/alchemy/darwin/compression/bzip2_stream.cpp
