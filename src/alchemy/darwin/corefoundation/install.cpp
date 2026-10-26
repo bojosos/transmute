@@ -12,6 +12,7 @@ namespace alchemy::gui {
 namespace fill {
 void install_cf_collections(InstallContext& context);   // cf_collections.cpp
 void install_cf_urls(InstallContext& context);          // cf_urls.cpp
+void install_cf_plugins(InstallContext& context);       // cf_plugin.cpp
 } // namespace fill
 
 void install_corefoundation_additions(export_fill::Provider& provider, ObjcRuntime& objc, CoreFoundation& cf) {
@@ -28,6 +29,7 @@ void install_corefoundation_sets_and_charsets(InstallContext& context) {
     fill::install_character_sets(context);
     fill::install_cf_collections(context);
     fill::install_cf_urls(context);
+    fill::install_cf_plugins(context);
 }
 
 void install_corefoundation_string_clusters(values::Provider& frameworks) { frameworks.install_foundation(); }

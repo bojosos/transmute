@@ -7,5 +7,17 @@
     <string>AlchemyPlugin</string>
     <key>CFBundlePackageType</key>
     <string>BNDL</string>
+    <key>CFPlugInFactories</key>
+    <dict>
+        <key>0B1C2D3E-4F50-4612-8A34-56789ABCDEF0</key>
+        <string>plugin_factory</string>
+    </dict>
+    <key>CFPlugInTypes</key>
+    <dict>
+        <key>D5A67F41-5A5F-4F7A-9E0E-1A2B3C4D5E6F</key>
+        <array>
+            <string>0B1C2D3E-4F50-4612-8A34-56789ABCDEF0</string>
+        </array>
+    </dict>
 </dict>
 </plist>

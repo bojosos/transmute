@@ -26,6 +26,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/corefoundation/charset.cpp
     src/alchemy/darwin/corefoundation/cf_collections.cpp
     src/alchemy/darwin/corefoundation/cf_urls.cpp
+    src/alchemy/darwin/corefoundation/cf_plugin.cpp
     src/alchemy/darwin/corefoundation/cf_extra.cpp
     src/alchemy/darwin/corefoundation/cf_system.cpp
     src/alchemy/darwin/corefoundation/cf_preferences.cpp

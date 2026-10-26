@@ -5,3 +5,6 @@ F(CFStringCreateWithCString) F(CFStringGetCString) F(CFURLCreateWithFileSystemPa
 F(CFNumberGetValue) F(CFBundleCreate) F(CFBundleGetIdentifier) F(CFBundlePreflightExecutable) F(CFBundleIsExecutableLoaded)
 F(CFBundleLoadExecutable) F(CFBundleUnloadExecutable) F(CFBundleGetFunctionPointerForName) F(CFBundleGetDataPointerForName)
 F(CFBundleCopyExecutableArchitectures)
+F(CFGetTypeID) F(CFUUIDCreateFromString) F(CFUUIDGetUUIDBytes) F(CFPlugInCreate) F(CFPlugInGetBundle) F(CFBundleGetPlugIn)
+F(CFBundleGetTypeID) F(CFPlugInGetTypeID) F(CFPlugInFindFactoriesForPlugInType) F(CFPlugInInstanceCreate)
+F(CFPlugInRegisterFactoryFunction) F(CFPlugInRegisterPlugInType)

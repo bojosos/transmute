@@ -111,6 +111,7 @@ enum class TypeId : std::uint64_t {
     binary_heap, bit_vector, tree,   // darwin/corefoundation/cf_collections.cpp
     cv_pixel_buffer_pool, vt_pixel_transfer_session,   // darwin/media/
     read_stream, write_stream,       // darwin/foundation/streams.cpp
+    bundle,                          // darwin/corefoundation/cf_plugin.cpp (CFBundle, CFPlugIn)
     hid_device, hid_element, hid_value, da_disk, da_dissenter,   // darwin/iokit/, darwin/diskarbitration/
     run_loop, run_loop_source, run_loop_observer, run_loop_timer,   // darwin/runloop/
     vt_decompression_session,        // darwin/media/vt_decompression.cpp
