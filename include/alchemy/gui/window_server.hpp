@@ -54,6 +54,7 @@ namespace alchemy::gui {
 
 using WindowId = std::uint64_t;   // 0 = no window
 using CursorId = std::uint64_t;   // 0 = no cursor
+using StatusItemId = std::uint64_t;   // 0 = no status item
 using ScreenId = std::uint32_t;   // CGDirectDisplayID; 0 = none
 
 struct Point { double x{}, y{}; };
@@ -172,6 +173,9 @@ enum class Notification : std::uint32_t {
     drag_entered,
     drag_updated,
     drag_exited,
+    // An application event: a status item (create_status_item) was clicked;
+    // status_item, button_number (0 left, 1 right) and screen_location are set.
+    status_item_clicked,
 };
 
 namespace drag_operation {   // NSDragOperation
@@ -226,6 +230,7 @@ struct Event {
     bool visible{};                       // occlusion_changed
     std::vector<std::string> paths;       // files_dropped, drag_*: host paths, UTF-8 (AppKit maps them to guest paths)
     std::uint64_t drag_operations{};      // drag_*, files_dropped: drag_operation:: mask the source allows
+    StatusItemId status_item{};           // status_item_clicked
 };
 
 // Receives a window's events. Implemented by AppKit, one per window. All
@@ -337,6 +342,20 @@ public:
         static_cast<void>(window);
         if (excluded) throw std::runtime_error("Alchemy window server: excluding a window from screen capture is not supported");
     }
+    // ---- status items (NSStatusItem) ---------------------------------------
+    // An icon in the host's notification area showing `image` with
+    // `tool_tip` (UTF-8); clicks reach the application sink as
+    // Notification::status_item_clicked. Window servers without a
+    // notification area fail explicitly.
+    [[nodiscard]] virtual StatusItemId create_status_item(const Image& image, std::string_view tool_tip) {
+        static_cast<void>(image); static_cast<void>(tool_tip);
+        throw std::runtime_error("Alchemy window server: status items are not supported");
+    }
+    virtual void update_status_item(StatusItemId item, const Image& image, std::string_view tool_tip) {
+        static_cast<void>(item); static_cast<void>(image); static_cast<void>(tool_tip);
+        throw std::runtime_error("Alchemy window server: status items are not supported");
+    }
+    virtual void remove_status_item(StatusItemId item) { static_cast<void>(item); }
     virtual void set_accepts_mouse_moved(WindowId window, bool accepts) = 0;
     virtual void set_accepts_file_drops(WindowId window, bool accepts) = 0;
     virtual void invalidate(WindowId window, std::optional<Rect> content_rect = std::nullopt) = 0;   // queue an expose

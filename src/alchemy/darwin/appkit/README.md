@@ -63,6 +63,16 @@ until updates resume. There is no Services menu (item visibility is kept),
 NSShowAnimationEffect draws nothing and tells its delegate at once, and
 NSGetAlertPanel, NSCopyBits and NSGetWindowServerMemory stop explicitly.
 
+**Status items and sounds (`status_items.cpp`):** each visible NSStatusItem
+is an icon in the host's notification area (the window server's status
+items; cloaked runs keep them off the taskbar): the button's image (template
+images in the appearance's text color) or its title drawn as text, with the
+button's tool tip. A click opens the item's menu, or sends the button's
+action. Custom item views stop explicitly. NSSound plays through
+AVAudioPlayer (WAVE, AIFF, CAF): play, pause, resume, stop, volume, time,
+loops and the delegate; +soundNamed: finds named, bundled and
+/System/Library/Sounds sounds (the system sounds are not installed).
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

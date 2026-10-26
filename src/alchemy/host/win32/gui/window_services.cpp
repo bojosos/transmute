@@ -1,6 +1,7 @@
 #include "alchemy/host/win32/gui/window_server.hpp"
 
 #include "alchemy/host/win32/gui/clipboard_codec.hpp"
+#include "alchemy/host/win32/gui/cloak.hpp"
 
 #include <ole2.h>
 #include <shellapi.h>
@@ -72,6 +73,35 @@ void put_clipboard(UINT format, const void* data, std::size_t size) {
 }
 
 // ---- cursors --------------------------------------------------------------------
+
+HCURSOR make_cursor(const Image& image, Point hot_spot, double scale);
+// An icon (a status item's) of `image` at `size` pixels square.
+HICON make_icon(const Image& image, int size) {
+    Image scaled;
+    scaled.width = scaled.height = static_cast<std::uint32_t>(size);
+    scaled.rgba.assign(static_cast<std::size_t>(size) * size * 4, 0);
+    // Nearest-neighbour fit, keeping the aspect ratio, centred.
+    const double fit = std::min(static_cast<double>(size) / image.width, static_cast<double>(size) / image.height);
+    const auto w = std::max(1, static_cast<int>(image.width * fit)), h = std::max(1, static_cast<int>(image.height * fit));
+    const int x0 = (size - w) / 2, y0 = (size - h) / 2;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const auto sx = std::min<std::uint32_t>(image.width - 1, static_cast<std::uint32_t>(x / fit));
+            const auto sy = std::min<std::uint32_t>(image.height - 1, static_cast<std::uint32_t>(y / fit));
+            std::copy_n(image.rgba.data() + (static_cast<std::size_t>(sy) * image.width + sx) * 4, 4,
+                        scaled.rgba.data() + (static_cast<std::size_t>(y0 + y) * size + (x0 + x)) * 4);
+        }
+    const auto cursor = make_cursor(scaled, {0, 0}, 1.0);
+    ICONINFO info{};
+    if (!GetIconInfo(cursor, &info)) { DestroyCursor(cursor); fail_win32("GetIconInfo (status item)"); }
+    DestroyCursor(cursor);
+    info.fIcon = TRUE;
+    const auto icon = CreateIconIndirect(&info);
+    if (info.hbmColor) DeleteObject(info.hbmColor);
+    if (info.hbmMask) DeleteObject(info.hbmMask);
+    if (icon == nullptr) fail_win32("CreateIconIndirect (status item)");
+    return icon;
+}
 
 HCURSOR make_cursor(const Image& image, Point hot_spot, double scale) {
     const auto width = std::max<LONG>(1, std::lround(image.width * scale));
@@ -516,6 +546,93 @@ CursorId Win32WindowServer::system_cursor(SystemCursor cursor) {
     cursors_[id].system = handle;
     system_cursors_[cursor] = id;
     return id;
+}
+
+// ---- status items ----
+namespace {
+void check_status_image(const Image& image) {
+    if (image.width == 0 || image.height == 0 || image.width > 1024 || image.height > 1024 ||
+        image.rgba.size() != static_cast<std::size_t>(image.width) * image.height * 4)
+        fail("status item: invalid image");
+}
+void put_tool_tip(NOTIFYICONDATAW& data, std::string_view tool_tip) {
+    const auto wide = utf8_to_wide(tool_tip);
+    const auto count = std::min(wide.size(), std::size(data.szTip) - 1);
+    std::copy_n(wide.c_str(), count, data.szTip);
+    data.szTip[count] = 0;
+}
+} // namespace
+
+StatusItemId Win32WindowServer::create_status_item(const Image& image, std::string_view tool_tip) {
+    require_main_thread("create_status_item");
+    check_status_image(image);
+    const auto id = next_status_item_++;
+    auto& item = status_items_[id];
+    item.icon = make_icon(image, GetSystemMetrics(SM_CXSMICON) * 2);
+    // Cloaked runs keep their status items off the taskbar, as their windows off the screen.
+    if (gui_cloak_requested()) return id;
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = application_window_;
+    data.uID = static_cast<UINT>(id);
+    data.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
+    data.uCallbackMessage = status_item_callback;
+    data.hIcon = item.icon;
+    put_tool_tip(data, tool_tip);
+    if (!Shell_NotifyIconW(NIM_ADD, &data)) fail_win32("Shell_NotifyIcon (add)");
+    data.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &data);
+    item.shown = true;
+    return id;
+}
+
+void Win32WindowServer::update_status_item(StatusItemId id, const Image& image, std::string_view tool_tip) {
+    require_main_thread("update_status_item");
+    check_status_image(image);
+    const auto found = status_items_.find(id);
+    if (found == status_items_.end()) fail("update_status_item: unknown status item " + std::to_string(id));
+    const auto old = std::exchange(found->second.icon, make_icon(image, GetSystemMetrics(SM_CXSMICON) * 2));
+    if (found->second.shown) {
+        NOTIFYICONDATAW data{};
+        data.cbSize = sizeof(data);
+        data.hWnd = application_window_;
+        data.uID = static_cast<UINT>(id);
+        data.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        data.hIcon = found->second.icon;
+        put_tool_tip(data, tool_tip);
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+    if (old) DestroyIcon(old);
+}
+
+void Win32WindowServer::remove_status_item(StatusItemId id) {
+    require_main_thread("remove_status_item");
+    const auto found = status_items_.find(id);
+    if (found == status_items_.end()) return;
+    if (found->second.shown) {
+        NOTIFYICONDATAW data{};
+        data.cbSize = sizeof(data);
+        data.hWnd = application_window_;
+        data.uID = static_cast<UINT>(id);
+        Shell_NotifyIconW(NIM_DELETE, &data);
+    }
+    if (found->second.icon) DestroyIcon(found->second.icon);
+    status_items_.erase(found);
+}
+
+// NOTIFYICON_VERSION_4: the event in LOWORD(lparam), the icon in HIWORD(lparam).
+void Win32WindowServer::status_item_message(WPARAM, LPARAM lparam) {
+    const auto what = LOWORD(lparam);
+    if (what != NIN_SELECT && what != NIN_KEYSELECT && what != WM_CONTEXTMENU) return;
+    Event event;
+    event.kind = EventKind::notification;
+    event.notification = Notification::status_item_clicked;
+    event.status_item = HIWORD(lparam);
+    event.button_number = what == WM_CONTEXTMENU ? 1 : 0;
+    event.screen_location = mouse_location();
+    // The menu a status item opens must be able to take the foreground.
+    SetForegroundWindow(application_window_);
+    deliver_application(event);
 }
 
 CursorId Win32WindowServer::create_cursor(const Image& image, Point hot_spot) {

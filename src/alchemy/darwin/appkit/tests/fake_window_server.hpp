@@ -54,6 +54,9 @@ public:
     std::optional<Image> clipboard_picture;
     std::int64_t change_count{};
     int beeps{}, attention{}, discards{};
+    // Status items: their images and tool tips.
+    std::map<StatusItemId, std::pair<Image, std::string>> status_items;
+    StatusItemId next_status_item{1};
 
     Window& at(WindowId id) {
         const auto found = windows.find(id);
@@ -219,6 +222,26 @@ public:
     void zoom(WindowId id) override { at(id).zoomed = !at(id).zoomed; }
     void begin_window_drag(WindowId id) override { ++at(id).drags; }
     void set_capture_excluded(WindowId id, bool excluded) override { at(id).capture_excluded = excluded; }
+    StatusItemId create_status_item(const Image& image, std::string_view tool_tip) override {
+        const auto id = next_status_item++;
+        status_items[id] = {image, std::string(tool_tip)};
+        return id;
+    }
+    void update_status_item(StatusItemId id, const Image& image, std::string_view tool_tip) override {
+        status_items.at(id) = {image, std::string(tool_tip)};
+    }
+    void remove_status_item(StatusItemId id) override { status_items.erase(id); }
+    // A click on a status item (button 0 left, 1 right), delivered synchronously.
+    void click_status_item(StatusItemId id, std::int64_t button, Point screen_location) {
+        if (!application_sink) throw std::runtime_error("fake window server: no application sink");
+        Event event;
+        event.kind = EventKind::notification;
+        event.notification = Notification::status_item_clicked;
+        event.status_item = id;
+        event.button_number = button;
+        event.screen_location = screen_location;
+        application_sink->handle_event(event);
+    }
     void set_full_screen(WindowId id, bool full_screen) override {
         at(id).full_screen = full_screen;
         notify(id, full_screen ? Notification::entered_full_screen : Notification::exited_full_screen);

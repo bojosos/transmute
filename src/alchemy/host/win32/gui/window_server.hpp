@@ -107,6 +107,9 @@ struct CursorRecord {
     std::map<int, HCURSOR> scaled;   // per scale percentage
 };
 
+// The application window's message for status item (notification icon) events.
+inline constexpr UINT status_item_callback = WM_APP + 0x51;
+
 class Win32WindowServer final : public host::ui::WindowSystem {
 public:
     Win32WindowServer();
@@ -134,6 +137,9 @@ public:
     void set_full_screen(WindowId window, bool full_screen) override;
     void begin_window_drag(WindowId window) override;
     void set_capture_excluded(WindowId window, bool excluded) override;
+    StatusItemId create_status_item(const Image& image, std::string_view tool_tip) override;
+    void update_status_item(StatusItemId item, const Image& image, std::string_view tool_tip) override;
+    void remove_status_item(StatusItemId item) override;
     void set_accepts_mouse_moved(WindowId window, bool accepts) override;
     void set_accepts_file_drops(WindowId window, bool accepts) override;
     void invalidate(WindowId window, std::optional<Rect> content_rect) override;
@@ -362,6 +368,13 @@ private:
     bool clipping_{};            // a ClipCursor of ours is in effect
     std::int64_t pen_button_{};
     bool pen_in_contact_{};
+
+    // status items (window_services.cpp): notification-area icons of the
+    // application window; not added to the shell in cloaked runs.
+    struct StatusItemRecord { HICON icon{}; bool shown{}; };
+    std::map<StatusItemId, StatusItemRecord> status_items_;
+    StatusItemId next_status_item_{1};
+    void status_item_message(WPARAM wparam, LPARAM lparam);
 
     // cursors
     std::map<CursorId, CursorRecord> cursors_;

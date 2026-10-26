@@ -134,7 +134,7 @@ void Provider::install_appkit() {
     object_properties(visual_effect, {"maskImage"});
     method(visual_effect, "isEmphasized", [this](CpuState& s, GuestMemory&) { s.x[0] = stored_integer(s.x[0], "emphasized") != 0; }, false, "B@:");
     method(visual_effect, "interiorBackgroundStyle", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "q@:");   // NSBackgroundStyleNormal
-    static_cast<void>(cls(appkit, "NSStatusBarButton", "NSButton"));
+    // NSStatusBarButton: darwin/appkit/status_items.cpp.
     // The private frame views (NSThemeFrame, NSNextStepFrame, _NSThemeWidget)
     // are AppKit's own: darwin/appkit/frame_view.cpp.
     // _NSServiceEntry: a Services-menu entry (private). Chrome looks the class

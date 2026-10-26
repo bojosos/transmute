@@ -189,6 +189,15 @@ void Win32WindowServer::shutdown() noexcept {
         record->destroyed = true;
         if (record->hwnd) DestroyWindow(record->hwnd);
     }
+    for (const auto& [id, item] : status_items_) {
+        NOTIFYICONDATAW data{};
+        data.cbSize = sizeof(data);
+        data.hWnd = application_window_;
+        data.uID = static_cast<UINT>(id);
+        if (item.shown) Shell_NotifyIconW(NIM_DELETE, &data);
+        if (item.icon) DestroyIcon(item.icon);
+    }
+    status_items_.clear();
     if (application_window_) DestroyWindow(application_window_);
     application_window_ = nullptr;
     if (clipping_) ClipCursor(nullptr);
@@ -425,6 +434,9 @@ LRESULT Win32WindowServer::handle_application_message(HWND hwnd, UINT message, W
                 deliver_application(event);
             }
             break;
+        case status_item_callback:
+            status_item_message(wparam, lparam);
+            return 0;
         case WM_QUERYENDSESSION: {
             Event event;
             event.kind = EventKind::notification;

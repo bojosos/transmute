@@ -1,3 +1,4 @@
+#include "alchemy/darwin/appkit/status_items.hpp"
 #include "alchemy/darwin/appkit/appkit_internal.hpp"
 #include "alchemy/path.hpp"
 
@@ -697,6 +698,7 @@ void AppKit::handle_window_event(WindowId id, const Event& event) {
                 if (app) post(note::screen_parameters, app);   // the delegate observes it (setDelegate:)
                 break;
             case Notification::keyboard_layout_changed: post(note::keyboard_selection, 0); break;
+            case Notification::status_item_clicked: status_item_clicked(*this, event); break;
             default: break;
             }
             if (target) {

@@ -733,6 +733,81 @@ void c_functions(Fixture& f) {
     for (const auto value : {back, front}) static_cast<void>(f.id(value, "close"));
 }
 
+// Status items and sounds (the frameworks wave, U9).
+void status_items_and_sounds(Fixture& f) {
+    const auto bar = f.id(f.cls("NSStatusBar"), "systemStatusBar");
+    require(bar && bar == f.id(f.cls("NSStatusBar"), "systemStatusBar") && near(f.msg(bar, "thickness").d(0), 22), "the system status bar");
+    CallRegs length;
+    length.set_d(0, -1);   // NSVariableStatusItemLength
+    const auto item = f.msg(bar, "statusItemWithLength:", length).x0;
+    const auto button = f.id(item, "button");
+    require(item && button && f.id(button, "class") == f.cls("NSStatusBarButton") && f.server.status_items.size() == 1,
+            "a status item shows in the notification area");
+    const auto id = f.server.status_items.begin()->first;
+    static_cast<void>(f.id(button, "setTitle:", {f.str("Q")}));
+    {
+        const auto& [image, tip] = f.server.status_items.at(id);
+        bool drawn{};
+        for (std::size_t at = 3; at < image.rgba.size(); at += 4) drawn = drawn || image.rgba[at] != 0;
+        require(tip == "Q" && image.width == 32 && drawn, "a title-only item draws its title into the icon");
+    }
+    static_cast<void>(f.id(button, "setToolTip:", {f.str("Cues")}));
+    require(f.server.status_items.at(id).second == "Cues", "the tool tip");
+    // Clicks: the button's action (a left click; a right click only when the button sends on right-mouse-up).
+    const auto target_class = f.subclass("U9StatusTarget", "NSObject");
+    f.add(target_class, "clicked:", [](CpuState&, GuestMemory&) { journal.push_back("status clicked"); });
+    static_cast<void>(f.id(button, "setTarget:", {f.alloc_init("U9StatusTarget")}));
+    static_cast<void>(f.id(button, "setAction:", {f.objc.selector("clicked:")}));
+    static_cast<void>(f.id(f.app, "finishLaunching"));   // application events (status item clicks) reach AppKit from here on
+    journal.clear();
+    f.server.click_status_item(id, 1, {10, 10});
+    require(journal.empty(), "a right click does not send a left-click action");
+    f.server.click_status_item(id, 0, {10, 10});
+    require(logged("status clicked"), "a left click sends the button's action");
+    // Hidden, shown again, removed.
+    static_cast<void>(f.id(item, "setVisible:", {0}));
+    require(f.server.status_items.empty() && (f.id(item, "isVisible") & 0xff) == 0, "a hidden item leaves the notification area");
+    static_cast<void>(f.id(item, "setVisible:", {1}));
+    require(f.server.status_items.size() == 1 && f.server.status_items.begin()->second.second == "Cues", "shown again");
+    bool stopped{};
+    try { static_cast<void>(f.id(item, "setView:", {f.view({{0, 0}, {22, 22}})})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "custom status item views stop explicitly");
+    static_cast<void>(f.id(bar, "removeStatusItem:", {item}));
+    require(f.server.status_items.empty(), "a removed item leaves the notification area");
+
+    // NSSound over AVAudioPlayer: a tenth of a second of 8 kHz mono 16-bit PCM.
+    std::vector<std::uint8_t> wav;
+    const auto put32 = [&wav](std::uint32_t v) { for (int i = 0; i < 4; ++i) wav.push_back(static_cast<std::uint8_t>(v >> (8 * i))); };
+    const auto put16 = [&wav](std::uint16_t v) { wav.push_back(static_cast<std::uint8_t>(v)); wav.push_back(static_cast<std::uint8_t>(v >> 8)); };
+    const std::uint32_t samples = 800;
+    for (const char c : std::string("RIFF")) wav.push_back(static_cast<std::uint8_t>(c));
+    put32(36 + samples * 2);
+    for (const char c : std::string("WAVEfmt ")) wav.push_back(static_cast<std::uint8_t>(c));
+    put32(16); put16(1); put16(1); put32(8000); put32(16000); put16(2); put16(16);
+    for (const char c : std::string("data")) wav.push_back(static_cast<std::uint8_t>(c));
+    put32(samples * 2);
+    for (std::uint32_t i = 0; i < samples; ++i) put16(static_cast<std::uint16_t>((i % 20 < 10) ? 8000 : -8000));
+    const auto bytes = f.block(wav.size());
+    f.engine.write_bytes(bytes, wav);
+    const auto data = f.id(f.cls("NSData"), "dataWithBytes:length:", {bytes, wav.size()});
+    const auto sound = f.id(f.id(f.cls("NSSound"), "alloc"), "initWithData:", {data});
+    require(sound != 0 && std::abs(f.msg(sound, "duration").d(0) - 0.1) < 0.01, "a sound of WAVE data and its duration");
+    require((f.id(sound, "setName:", {f.str("u9 beep")}) & 0xff) == 1 && f.id(f.cls("NSSound"), "soundNamed:", {f.str("u9 beep")}) == sound,
+            "-setName: registers the sound for +soundNamed:");
+    require(f.id(f.cls("NSSound"), "soundNamed:", {f.str("Basso")}) == 0, "the system sounds are not installed");
+    static_cast<void>(f.id(sound, "setLoops:", {1}));
+    CallRegs volume;
+    volume.set_s(0, 0.5f);
+    static_cast<void>(f.msg(sound, "setVolume:", volume));
+    require((f.id(sound, "loops") & 0xff) == 1 && std::abs(f.msg(sound, "volume").s(0) - 0.5f) < 1e-6, "loops and volume");
+    // With an output device the sound plays until stopped; without one -play answers NO.
+    const bool played = (f.id(sound, "play") & 0xff) != 0;
+    require(((f.id(sound, "isPlaying") & 0xff) != 0) == played, "-isPlaying follows -play");
+    require(((f.id(sound, "stop") & 0xff) != 0) == played && (f.id(sound, "isPlaying") & 0xff) == 0, "-stop");
+    const auto junk = f.id(f.cls("NSData"), "dataWithBytes:length:", {bytes, 8});
+    require(f.id(f.id(f.cls("NSSound"), "alloc"), "initWithData:", {junk}) == 0, "data that is no sound gives nil");
+}
+
 } // namespace
 
 int main() {
@@ -745,7 +820,8 @@ int main() {
                  {"responders_and_cells", responders_and_cells}, {"views", views}, {"windows", windows}, {"menus", menus},
                  {"images_and_cursors", images_and_cursors}, {"alerts_and_panels", alerts_and_panels},
                  {"pasteboards_and_text", pasteboards_and_text}, {"containers_and_controllers", containers_and_controllers},
-                 {"toolbars_and_tabs", toolbars_and_tabs}, {"c_functions", c_functions}}) {
+                 {"toolbars_and_tabs", toolbars_and_tabs}, {"c_functions", c_functions},
+                 {"status_items_and_sounds", status_items_and_sounds}}) {
             std::cout << "[appkit api] " << name << std::endl;
             test(f);
         }
