@@ -1192,6 +1192,114 @@ void text_layout(Fixture& f) {
 
 }
 
+// ---- NSText / NSTextView actions, RTF, find (frameworks wave U11b) ------------------------------
+void text_actions(Fixture& f) {
+    const auto view = f.with_rect(f.id(f.cls("NSTextView"), "alloc"), "initWithFrame:", {{0, 0}, {300, 100}});
+    static_cast<void>(f.id(view, "setString:", {f.str("Hello world")}));
+    const auto storage = f.id(view, "textStorage");
+    const auto at = [&f, storage](std::string_view key, Address index) { return f.id(storage, "attribute:atIndex:effectiveRange:", {f.str(key), index, 0}); };
+    const auto number = [&f](Address value) { return value ? f.cf.number_value(value).value_or(0) : 0.0; };
+    // Paragraph alignment over the selected paragraph; the view follows its first paragraph.
+    static_cast<void>(f.id(view, "setSelectedRange:", {0, 5}));
+    static_cast<void>(f.id(view, "alignCenter:", {0}));
+    require(f.integer(at("NSParagraphStyle", 8), "alignment") == 1 && f.integer(view, "alignment") == 1, "-alignCenter: aligns the paragraph");
+    // Underline toggles; super- and subscript step the baseline level.
+    static_cast<void>(f.id(view, "underline:", {0}));
+    require(number(at("NSUnderline", 0)) == 1 && at("NSUnderline", 6) == 0, "-underline: underlines the selection");
+    static_cast<void>(f.id(view, "underline:", {0}));
+    require(at("NSUnderline", 0) == 0, "and takes it away again");
+    static_cast<void>(f.id(view, "superscript:", {0}));
+    require(number(at("NSSuperScript", 1)) == 1, "-superscript:");
+    static_cast<void>(f.id(view, "subscript:", {0}));
+    static_cast<void>(f.id(view, "subscript:", {0}));
+    require(number(at("NSSuperScript", 1)) == -1, "-subscript: below the baseline");
+    static_cast<void>(f.id(view, "unscript:", {0}));
+    require(at("NSSuperScript", 1) == 0, "-unscript:");
+    // -changeFont: and -changeColor: ask the sender.
+    const auto big = f.with_double(f.cls("NSFont"), "systemFontOfSize:", 20);
+    const auto red = f.id(f.cls("NSColor"), "redColor");
+    const auto sender_class = f.subclass("U11FontSender", "NSObject");
+    f.add(sender_class, "convertFont:", [big](CpuState& s, GuestMemory&) { s.x[0] = big; }, "@@:@");
+    f.add(sender_class, "color", [red](CpuState& s, GuestMemory&) { s.x[0] = red; }, "@@:");
+    f.add(sender_class, "tag", [](CpuState& s, GuestMemory&) { s.x[0] = 2; }, "q@:");
+    const auto sender = f.id(f.id(sender_class, "alloc"), "init");
+    static_cast<void>(f.id(view, "changeFont:", {sender}));
+    static_cast<void>(f.id(view, "changeColor:", {sender}));
+    require(f.send(at("NSFont", 0), "pointSize").d(0) == 20 && at("NSColor", 4) == red && f.send(at("NSFont", 6), "pointSize").d(0) != 20,
+            "-changeFont: and -changeColor: change the selection");
+    // With nothing selected the typing attributes change.
+    static_cast<void>(f.id(view, "setSelectedRange:", {11, 0}));
+    static_cast<void>(f.id(view, "underline:", {0}));
+    require(number(f.id(f.id(view, "typingAttributes"), "objectForKey:", {f.str("NSUnderline")})) == 1, "an empty selection changes the typing attributes");
+    // The font pasteboard carries the selection's character formatting.
+    static_cast<void>(f.id(view, "setSelectedRange:", {0, 5}));
+    static_cast<void>(f.id(view, "copyFont:", {0}));
+    static_cast<void>(f.id(view, "setSelectedRange:", {6, 5}));
+    static_cast<void>(f.id(view, "pasteFont:", {0}));
+    require(f.send(at("NSFont", 7), "pointSize").d(0) == 20 && at("NSColor", 7) != 0, "-copyFont: / -pasteFont:");
+    // RTF out and back in keeps the formatting.
+    const auto rtf_data = f.id(view, "RTFFromRange:", {0, 11});
+    const auto bytes = f.id(rtf_data, "bytes");
+    require(f.integer(rtf_data, "length") > 20 && f.engine.read8(bytes) == '{' && f.engine.read8(bytes + 1) == '\\', "-RTFFromRange: is RTF");
+    static_cast<void>(f.id(view, "replaceCharactersInRange:withRTF:", {0, 11, rtf_data}));
+    require(f.text(f.id(view, "string")) == "Hello world" && f.send(at("NSFont", 0), "pointSize").d(0) == 20 && at("NSColor", 0) != 0,
+            "-replaceCharactersInRange:withRTF: keeps the formatting");
+    // A delegate that refuses changes; -didChangeText tells it of the others.
+    std::vector<std::string> told;
+    const auto delegate_class = f.subclass("U11TextDelegate", "NSObject");
+    bool allow = false;
+    f.add(delegate_class, "textView:shouldChangeTextInRange:replacementString:", [&allow](CpuState& s, GuestMemory&) { s.x[0] = allow ? 1 : 0; }, "B@:@{_NSRange=QQ}@");
+    f.add(delegate_class, "textDidChange:", [&told](CpuState&, GuestMemory&) { told.push_back("changed"); });
+    const auto delegate = f.id(f.id(delegate_class, "alloc"), "init");
+    static_cast<void>(f.id(view, "setDelegate:", {delegate}));
+    static_cast<void>(f.id(view, "setSelectedRange:", {0, 5}));
+    static_cast<void>(f.id(view, "alignRight:", {0}));
+    require(f.integer(at("NSParagraphStyle", 0), "alignment") == 1 && told.empty(), "a refused change changes nothing");
+    allow = true;
+    static_cast<void>(f.id(view, "alignRight:", {0}));
+    require(f.integer(at("NSParagraphStyle", 0), "alignment") == 2 && told.size() == 1, "an allowed change ends with -didChangeText");
+    static_cast<void>(f.id(view, "setDelegate:", {0}));
+    // Find: the find pasteboard's string, next match and the search string.
+    const auto find_board = f.id(f.cls("NSPasteboard"), "pasteboardWithName:", {f.str("Apple CFPasteboard find")});
+    static_cast<void>(f.id(find_board, "clearContents"));
+    static_cast<void>(f.id(find_board, "setString:forType:", {f.str("WORLD"), f.str("public.utf8-plain-text")}));
+    static_cast<void>(f.id(view, "setSelectedRange:", {0, 0}));
+    static_cast<void>(f.id(view, "performFindPanelAction:", {sender}));
+    auto selection = f.send(view, "selectedRange");
+    require(selection.x0 == 6 && selection.x1 == 5, "the next match is selected (case-insensitive)");
+    const auto finder = f.id(f.id(f.cls("NSTextFinder"), "alloc"), "init");
+    static_cast<void>(f.id(finder, "setClient:", {view}));
+    require(!f.yes(finder, "validateAction:", {1}) && f.yes(finder, "validateAction:", {2}) && !f.yes(finder, "validateAction:", {4}),
+            "the find bar and replacing are not available, finding is");
+    static_cast<void>(f.id(view, "setSelectedRange:", {0, 5}));
+    static_cast<void>(f.id(finder, "performAction:", {7}));
+    require(f.text(f.id(find_board, "stringForType:", {f.str("public.utf8-plain-text")})) == "Hello", "-performAction: sets the search string");
+    bool stopped{};
+    try { static_cast<void>(f.id(finder, "performAction:", {1})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "showing the find bar stops explicitly");
+    // Pasteboard types, user-change ranges.
+    require(f.integer(f.id(view, "readablePasteboardTypes"), "count") == 2, "a rich text view reads RTF and plain text");
+    static_cast<void>(f.id(view, "setEditable:", {0}));
+    require(f.send(view, "rangeForUserTextChange").x0 == static_cast<Address>(INT64_MAX) && f.integer(f.id(view, "acceptableDragTypes"), "count") == 0,
+            "a read-only view takes no user changes or drops");
+    static_cast<void>(f.id(view, "setEditable:", {1}));
+    // Class methods.
+    const auto scroll = f.id(f.cls("NSTextView"), "scrollableTextView");
+    require(f.id(f.id(scroll, "documentView"), "class") == f.cls("NSTextView") && f.yes(f.id(f.cls("NSTextView"), "fieldEditor"), "isFieldEditor") &&
+                f.id(f.id(f.cls("NSTextView"), "textViewUsingTextLayoutManager:", {0}), "textLayoutManager") == 0,
+            "+scrollableTextView, +fieldEditor, a TextKit 1 view");
+    // Explicit stops.
+    for (const auto& [selector, argument] : {std::pair{"setLayoutOrientation:", Address{1}}, std::pair{"orderFrontTablePanel:", Address{0}},
+                                             std::pair{"showGuessPanel:", Address{0}}}) {
+        stopped = false;
+        try { static_cast<void>(f.id(view, selector, {argument})); } catch (const std::exception&) { stopped = true; }
+        require(stopped, std::string(selector) + " stops explicitly");
+    }
+    stopped = false;
+    try { static_cast<void>(f.id(f.cls("NSTextView"), "textViewUsingTextLayoutManager:", {1})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "TextKit 2 text views stop explicitly");
+}
+
 // ---- NSTextTab and paragraph styles -----------------------------------------------------------
 void text_tabs(Fixture& f) {
     const auto tab_class = f.cls("NSTextTab");
@@ -1703,6 +1811,7 @@ int main() {
         color_wells(f);
         text_system(f);
         text_layout(f);
+        text_actions(f);
         text_tabs(f);
         tables(f);
         collection_views(f);

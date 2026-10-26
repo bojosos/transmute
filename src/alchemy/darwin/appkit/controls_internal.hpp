@@ -155,6 +155,11 @@ struct TextState final : ObjectPayload {
     std::uint64_t checking_types{};
     std::int64_t inline_prediction{};
     bool syncing{};                                              // the storage and the view are being synchronized
+    // Settings and state of the text actions (controls/text_actions.cpp).
+    Address allowed_locales{};                                   // +1 -allowedInputSourceLocales
+    std::uint64_t selection_granularity{}, selection_affinity{};
+    std::int64_t writing_tools_behavior{}, spell_tag{-1};
+    bool accepts_glyph_info{}, allows_background_change{}, adaptive_colors{}, imports_graphics{}, uses_font_panel{true};
     bool aborting{};                                             // field editor: editing ends by cancellation (no action)
 };
 [[nodiscard]] inline std::shared_ptr<TextState> text_state(AppKit& kit, Address view) { return kit.extension<TextState>(view); }

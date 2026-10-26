@@ -1031,7 +1031,7 @@ void install_text_system(AppKit& kit) {
         s.x[0] = location;
         s.x[1] = length;
     }, "{_NSRange=QQ}@:{_NSRange=QQ}Q");
-    kit.method(tv, "selectionGranularity", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "Q@:");
+    kit.method(tv, "selectionGranularity", [k](CpuState& s, GuestMemory&) { s.x[0] = text_state(*k, s.x[0])->selection_granularity; }, "Q@:");
     // -insertLineBreak: puts a line separator (U+2028) in the text; in a
     // field editor it ends the line like Return.
     kit.method(tv, "insertLineBreak:", [k](CpuState& s, GuestMemory&) {
@@ -1147,6 +1147,8 @@ void install_text_system(AppKit& kit) {
         kit.method(panel, "panelConvertFont:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[2]; });
     }
     install_text_layout(kit);
+    install_text_actions(kit);
+    install_text_finder(kit);
 }
 
 } // namespace alchemy::gui::completion_kit::controls

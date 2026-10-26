@@ -589,6 +589,28 @@ void rtf_documents() {
         try { static_cast<void>(rtf::plain_text(std::vector<std::uint8_t>(input.begin(), input.end()))); } catch (const std::runtime_error&) { threw = true; }
         require(threw, std::string("malformed RTF rejected: ") + broken);
     }
+    // The formatting subset: fonts, sizes, bold, colours, alignment; and writing it back.
+    const auto runs = rtf::runs(bytes);
+    require(runs.size() >= 2 && runs[0].text == u"Title\n" && runs[0].format.bold && runs[0].format.size == 18 && runs[0].format.font == "Helvetica" &&
+                runs[0].format.alignment == 1 && !runs[1].format.bold && runs[1].format.alignment == 1,
+            "RTF runs keep the font, size, weight and alignment");
+    const std::string coloured = "{\\rtf1\\ansi{\\fonttbl\\f0 Times;}{\\colortbl;\\red255\\green0\\blue0;}\\f0\\fs24 plain \\cf1\\ul\\i red\\ulnone\\i0\\cf0  \\pard\\qr\\li720\\fi-360 right}";
+    const auto coloured_runs = rtf::runs(std::vector<std::uint8_t>(coloured.begin(), coloured.end()));
+    require(coloured_runs.size() == 4 && coloured_runs[1].text == u"red" && coloured_runs[1].format.color &&
+                (*coloured_runs[1].format.color)[0] == 1.0 && coloured_runs[1].format.underline && coloured_runs[1].format.italic &&
+                !coloured_runs[2].format.color && coloured_runs[3].format.alignment == 2 && coloured_runs[3].format.left_indent == 36 &&
+                coloured_runs[3].format.first_indent == -18 && coloured_runs[3].format.font == "Times",
+            "RTF colours, underline, italic, alignment and indents");
+    for (const auto* source : {&runs, &coloured_runs}) {
+        const auto written = rtf::write(*source);
+        const auto again = rtf::runs(std::vector<std::uint8_t>(written.begin(), written.end()));
+        std::u16string before, after;
+        for (const auto& run : *source) before += run.text;
+        for (const auto& run : again) after += run.text;
+        bool same = before == after && again.size() == source->size();
+        for (std::size_t i = 0; same && i < again.size(); ++i) same = again[i].format == (*source)[i].format && again[i].text == (*source)[i].text;
+        require(same, "RTF written and read back keeps the text and its formatting: " + written);
+    }
 }
 
 // QLab's license agreement (read only; skipped when absent): it parses and starts with its title.

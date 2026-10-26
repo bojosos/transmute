@@ -1,13 +1,17 @@
 #include "alchemy/darwin/appkit/rtf.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
 
-// RTF text extraction; see rtf.hpp.
+// RTF text extraction and the formatting subset of rtf.hpp.
 namespace alchemy::gui::rtf {
 namespace {
 
@@ -32,14 +36,22 @@ bool is_destination(std::string_view word) {
     return false;
 }
 
+enum class Table { none, fonts, colors };
 struct Group {
     bool skip{};
     int unicode_skip{1};   // \ucN: fallback characters after \uN
+    Table table{Table::none};
+    Format format;
 };
 
 class Reader {
 public:
     explicit Reader(std::span<const std::uint8_t> bytes) : data_(bytes) {}
+
+    std::vector<Run> runs() {
+        static_cast<void>(run());
+        return std::move(runs_);
+    }
 
     std::u16string run() {
         if (!looks_like_rtf(data_)) bad("not an RTF document");
@@ -70,8 +82,9 @@ public:
             if (c == '\\') { control(current, pending_skip); continue; }
             ++at_;
             if (c == '\r' || c == '\n') continue;
+            if (current.table != Table::none) { table_character(current, c); continue; }
             if (pending_skip > 0) { --pending_skip; continue; }
-            if (!current.skip) out_.push_back(from_cp1252(c));
+            if (!current.skip) put(current, from_cp1252(c));
         }
         if (!stack.empty()) bad("unterminated group");
         return std::move(out_);
@@ -80,7 +93,30 @@ public:
 private:
     void emit(Group& current, int& pending_skip, char16_t value) {
         if (pending_skip > 0) { --pending_skip; return; }
-        if (!current.skip) out_.push_back(value);
+        if (!current.skip) put(current, value);
+    }
+    void put(const Group& current, char16_t value) {
+        out_.push_back(value);
+        if (runs_.empty() || !(runs_.back().format == current.format)) runs_.push_back({{}, current.format});
+        runs_.back().text.push_back(value);
+    }
+    // The font and colour tables: "\fN name;" and "\redR\greenG\blueB;" entries (an empty first colour is automatic).
+    void table_character(Group& current, std::uint8_t c) {
+        if (c != ';') {
+            if (current.table == Table::fonts) font_name_.push_back(static_cast<char>(c));
+            return;
+        }
+        if (current.table == Table::fonts) {
+            auto name = font_name_;
+            while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+            while (!name.empty() && name.back() == ' ') name.pop_back();
+            fonts_[font_number_] = name;
+            font_name_.clear();
+        } else {
+            colors_.push_back(color_given_ ? std::optional<std::array<double, 3>>(color_) : std::nullopt);
+            color_ = {0, 0, 0};
+            color_given_ = false;
+        }
     }
 
     void control(Group& current, int& pending_skip) {
@@ -133,7 +169,50 @@ private:
             parameter = negative ? -value : value;
         }
         if (at_ < data_.size() && data_[at_] == ' ') ++at_;
+        if (word == "fonttbl") { current.skip = true; current.table = Table::fonts; return; }
+        if (word == "colortbl") { current.skip = true; current.table = Table::colors; return; }
+        if (current.table == Table::fonts) {
+            if (word == "f" && parameter) { font_number_ = *parameter; font_name_.clear(); }
+            return;
+        }
+        if (current.table == Table::colors) {
+            const auto component = std::clamp(static_cast<double>(parameter.value_or(0)) / 255.0, 0.0, 1.0);
+            if (word == "red") { color_[0] = component; color_given_ = true; }
+            if (word == "green") { color_[1] = component; color_given_ = true; }
+            if (word == "blue") { color_[2] = component; color_given_ = true; }
+            return;
+        }
         if (is_destination(word)) { current.skip = true; return; }
+        auto& f = current.format;
+        const bool on = !parameter || *parameter != 0;
+        if (word == "plain") {
+            Format plain;
+            plain.alignment = f.alignment;
+            plain.left_indent = f.left_indent;
+            plain.first_indent = f.first_indent;
+            plain.right_indent = f.right_indent;
+            f = plain;
+            return;
+        }
+        if (word == "pard") { f.alignment = 4; f.left_indent = f.first_indent = f.right_indent = 0; return; }
+        if (word == "f" && parameter) { const auto found = fonts_.find(*parameter); f.font = found == fonts_.end() ? std::string{} : found->second; return; }
+        if (word == "fs" && parameter) { f.size = static_cast<double>(*parameter) / 2; return; }
+        if (word == "b") { f.bold = on; return; }
+        if (word == "i") { f.italic = on; return; }
+        if (word == "ul") { f.underline = on; return; }
+        if (word == "ulnone") { f.underline = false; return; }
+        if (word == "cf") {
+            const auto index = static_cast<std::size_t>(std::max<long>(0, parameter.value_or(0)));
+            f.color = index < colors_.size() ? colors_[index] : std::nullopt;
+            return;
+        }
+        if (word == "ql") { f.alignment = 0; return; }
+        if (word == "qc") { f.alignment = 1; return; }
+        if (word == "qr") { f.alignment = 2; return; }
+        if (word == "qj") { f.alignment = 3; return; }
+        if (word == "li" && parameter) { f.left_indent = static_cast<double>(*parameter) / 20; return; }
+        if (word == "fi" && parameter) { f.first_indent = static_cast<double>(*parameter) / 20; return; }
+        if (word == "ri" && parameter) { f.right_indent = static_cast<double>(*parameter) / 20; return; }
         if (word == "ansicpg" && parameter && *parameter != 1252) bad("code page " + std::to_string(*parameter) + " is not supported");
         if (word == "mac" || word == "pc" || word == "pca") bad("\\" + word + " character sets are not supported");
         if (word == "par" || word == "line" || word == "sect" || word == "page") { emit(current, pending_skip, u'\n'); return; }
@@ -148,7 +227,7 @@ private:
         if (word == "uc" && parameter) { current.unicode_skip = static_cast<int>(*parameter); return; }
         if (word == "u" && parameter) {
             const auto value = *parameter < 0 ? *parameter + 65536 : *parameter;
-            if (pending_skip == 0 && !current.skip) out_.push_back(static_cast<char16_t>(value));
+            if (pending_skip == 0 && !current.skip) put(current, static_cast<char16_t>(value));
             pending_skip = current.unicode_skip;
             return;
         }
@@ -158,6 +237,13 @@ private:
     std::span<const std::uint8_t> data_;
     std::size_t at_{};
     std::u16string out_;
+    std::vector<Run> runs_;
+    std::map<long, std::string> fonts_;
+    long font_number_{};
+    std::string font_name_;
+    std::vector<std::optional<std::array<double, 3>>> colors_;
+    std::array<double, 3> color_{};
+    bool color_given_{};
 };
 
 } // namespace
@@ -167,5 +253,66 @@ bool looks_like_rtf(std::span<const std::uint8_t> bytes) {
 }
 
 std::u16string plain_text(std::span<const std::uint8_t> bytes) { return Reader(bytes).run(); }
+
+std::vector<Run> runs(std::span<const std::uint8_t> bytes) { return Reader(bytes).runs(); }
+
+std::string write(const std::vector<Run>& runs) {
+    std::vector<std::string> fonts{"Helvetica"};
+    std::vector<std::array<double, 3>> colors;
+    const auto font_index = [&](const std::string& name) {
+        const auto family = name.empty() ? std::string("Helvetica") : name;
+        for (std::size_t i = 0; i < fonts.size(); ++i) if (fonts[i] == family) return i;
+        fonts.push_back(family);
+        return fonts.size() - 1;
+    };
+    const auto color_index = [&](const std::optional<std::array<double, 3>>& color) -> std::size_t {
+        if (!color) return 0;
+        for (std::size_t i = 0; i < colors.size(); ++i) if (colors[i] == *color) return i + 1;
+        colors.push_back(*color);
+        return colors.size();
+    };
+    for (const auto& run : runs) { static_cast<void>(font_index(run.format.font)); static_cast<void>(color_index(run.format.color)); }
+    std::string out = "{\\rtf1\\ansi\\ansicpg1252\\uc1\\deff0\n{\\fonttbl";
+    for (std::size_t i = 0; i < fonts.size(); ++i) out += "\\f" + std::to_string(i) + "\\fnil " + fonts[i] + ";";
+    out += "}\n{\\colortbl;";
+    for (const auto& c : colors) {
+        char entry[64];
+        std::snprintf(entry, sizeof entry, "\\red%d\\green%d\\blue%d;", static_cast<int>(std::lround(c[0] * 255)),
+                      static_cast<int>(std::lround(c[1] * 255)), static_cast<int>(std::lround(c[2] * 255)));
+        out += entry;
+    }
+    out += "}\n";
+    const auto twips = [](double points) { return std::to_string(static_cast<long>(std::lround(points * 20))); };
+    bool paragraph_start = true;
+    std::optional<std::array<double, 4>> written;   // the paragraph properties last written (alignment, indents)
+    for (const auto& run : runs) {
+        const auto& f = run.format;
+        const std::array<double, 4> paragraph{static_cast<double>(f.alignment), f.left_indent, f.first_indent, f.right_indent};
+        if (written && *written != paragraph) paragraph_start = true;   // they change within the paragraph
+        out += "\\f" + std::to_string(font_index(f.font)) + "\\fs" + std::to_string(static_cast<long>(std::lround(f.size * 2)));
+        out += f.bold ? "\\b" : "\\b0";
+        out += f.italic ? "\\i" : "\\i0";
+        out += f.underline ? "\\ul" : "\\ulnone";
+        out += "\\cf" + std::to_string(color_index(f.color)) + " ";
+        for (const auto c : run.text) {
+            if (paragraph_start) {
+                static constexpr const char* aligned[] = {"\\ql", "\\qc", "\\qr", "\\qj", ""};
+                out += "\\pard";
+                out += aligned[std::clamp(f.alignment, 0, 4)];
+                out += "\\li" + twips(f.left_indent) + "\\fi" + twips(f.first_indent) + "\\ri" + twips(f.right_indent) + " ";
+                paragraph_start = false;
+                written = paragraph;
+            }
+            if (c == u'\n' || c == 0x2029) { out += "\\par\n"; paragraph_start = true; continue; }
+            if (c == 0x2028) { out += "\\line "; continue; }
+            if (c == u'\t') { out += "\\tab "; continue; }
+            if (c == u'\\' || c == u'{' || c == u'}') { out += '\\'; out += static_cast<char>(c); continue; }
+            if (c >= 0x20 && c < 0x80) { out += static_cast<char>(c); continue; }
+            out += "\\u" + std::to_string(static_cast<int>(static_cast<std::int16_t>(c))) + "?";
+        }
+    }
+    out += "}";
+    return out;
+}
 
 } // namespace alchemy::gui::rtf

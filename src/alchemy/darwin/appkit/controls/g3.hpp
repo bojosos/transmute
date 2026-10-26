@@ -79,6 +79,13 @@ void install_text_layout(AppKit& kit);
 // The manager's layout is made again on next use / dropped with the manager.
 void invalidate_text_layout(AppKit& kit, Address manager);
 void forget_text_layout(AppKit& kit, Address manager);
+// NSText's and NSTextView's actions and API (text_actions.cpp), NSTextFinder
+// and the find actions it shares with NSTextView, and the TextKit 2 stops
+// (text_finder.cpp); installed by install_text_system.
+void install_text_actions(AppKit& kit);
+void install_text_finder(AppKit& kit);
+[[nodiscard]] bool find_action_available(AppKit& kit, Address client, std::int64_t action);
+void perform_find_action(AppKit& kit, Address client, std::int64_t action);
 void install_tables(AppKit& kit);
 void install_collection_view(AppKit& kit);
 void install_rulers(AppKit& kit);

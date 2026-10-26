@@ -222,7 +222,7 @@ void AppKit::install_text() {
         {
             for (auto* slot : {&state->font, &state->text_color, &state->background_color, &state->typing_attributes,
                      &state->selected_attributes, &state->marked_attributes, &state->link_attributes, &state->default_paragraph,
-                     &state->insertion_color, &state->layout_manager, &state->storage})
+                     &state->insertion_color, &state->layout_manager, &state->storage, &state->allowed_locales})
                 release(std::exchange(*slot, 0));
             if (const auto container = std::exchange(state->container, 0)) {
                 if (const auto info = objc.find_host_state<ContainerState>(container)) info->text_view = 0;
