@@ -8,6 +8,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/coretext/install.cpp
     src/alchemy/darwin/coretext/fonts.cpp
     src/alchemy/darwin/coretext/font_exports.cpp
+    src/alchemy/darwin/coretext/glyph_names.cpp
     src/alchemy/darwin/coretext/attributed.cpp
     src/alchemy/darwin/coretext/typesetter.cpp)
 
@@ -33,6 +34,9 @@ function(alchemy_gui_coretext_tests)
     alchemy_gui_add_unit_test(alchemy_gui_coretext_unit src/alchemy/darwin/coretext/tests/coretext_tests.cpp TIMEOUT 180)
 endfunction()
 alchemy_gui_register_tests(alchemy_gui_coretext_tests)
+# Glyph names, the font manager's registrations and errors, font collections
+# and run base advances, on the framework-case fixture.
+alchemy_gui_add_framework_case(coretext_fonts src/alchemy/darwin/coretext/tests/coretext_fonts_tests.cpp)
 
 # Moved from darwin/identities/qt_imports.cpp: kCTFontLanguagesAttribute and
 # CTFontManagerCreateFontDescriptorFromData (the support kit).

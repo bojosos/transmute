@@ -852,6 +852,29 @@ void install_typesetter(Quartz& q) {
             quartz->write_double(at + 8, run.advances[index].height);
         }, 16);
     });
+    // (run, CFRange x1 x2, base advances x3, origins x4): a glyph's position is
+    // the run's first position, plus the advances before it, plus its origin.
+    fn("_CTRunGetBaseAdvancesAndOrigins", [quartz, run_state](CpuState& s, GuestMemory&) {
+        const auto& run = run_of(*run_state(s.x[0]));
+        const auto count = std::min(run.advances.size(), run.positions.size());
+        const auto [first, last] = sub_range(static_cast<std::int64_t>(s.x[1]), static_cast<std::int64_t>(s.x[2]), count);
+        Point pen = count ? run.positions.front() : Point{};
+        for (std::size_t index = 0; index < last; ++index) {
+            if (index >= first) {
+                const auto at = (index - first) * 16;
+                if (s.x[3]) {
+                    quartz->write_double(s.x[3] + at, run.advances[index].width);
+                    quartz->write_double(s.x[3] + at + 8, run.advances[index].height);
+                }
+                if (s.x[4]) {
+                    quartz->write_double(s.x[4] + at, run.positions[index].x - pen.x);
+                    quartz->write_double(s.x[4] + at + 8, run.positions[index].y - pen.y);
+                }
+            }
+            pen.x += run.advances[index].width;
+            pen.y += run.advances[index].height;
+        }
+    });
     fn("_CTRunGetStringIndices", [quartz, run_state, copy_out](CpuState& s, GuestMemory& m) {
         const auto& run = run_of(*run_state(s.x[0]));
         copy_out(s, run.indices.size(), [&](std::size_t index, Address at) { m.write64(at, static_cast<Address>(run.indices[index])); }, 8);
@@ -972,6 +995,10 @@ void install_typesetter(Quartz& q) {
         s.x[0] = static_cast<Address>(suggest_break(typesetter(s.x[0])->text, static_cast<std::int64_t>(s.x[1]), d(s, 0), false));
     });
     fn("_CTTypesetterSuggestClusterBreak", [typesetter, suggest_break](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<Address>(suggest_break(typesetter(s.x[0])->text, static_cast<std::int64_t>(s.x[1]), d(s, 0), true));
+    });
+    // The offset (d1) only moves tab stops, as for SuggestLineBreakWithOffset.
+    fn("_CTTypesetterSuggestClusterBreakWithOffset", [typesetter, suggest_break](CpuState& s, GuestMemory&) {
         s.x[0] = static_cast<Address>(suggest_break(typesetter(s.x[0])->text, static_cast<std::int64_t>(s.x[1]), d(s, 0), true));
     });
     const auto typeset_line = [quartz, typesetter, make_line](Address object, std::int64_t location, std::int64_t length) {

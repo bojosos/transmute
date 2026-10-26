@@ -2,7 +2,10 @@
 #include "alchemy/darwin/coregraphics/context.hpp"
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <numbers>
+#include <set>
 
 // CTFont / NSFont (one class, toll-free bridged), CTFontDescriptor /
 // NSFontDescriptor, CTFontManager, CGFont and a minimal NSFontManager.
@@ -12,6 +15,33 @@ namespace {
 struct DescriptorState final : ObjectPayload {
     Address attributes{};                     // +1 CFDictionary
 };
+
+// The font files registered by URL. Like the host's registered fonts they
+// stay for the life of the process.
+struct RegisteredFiles {
+    std::mutex mutex;
+    std::set<std::string> paths;
+};
+RegisteredFiles& registered_files() {
+    static RegisteredFiles files;
+    return files;
+}
+bool is_registered_file(const std::string& path) {
+    auto& files = registered_files();
+    std::lock_guard lock(files.mutex);
+    return files.paths.contains(path);
+}
+enum class Registration { added, already, unreadable, invalid };
+Registration register_file(Quartz& q, const std::string& path, std::string* error) {
+    auto& files = registered_files();
+    std::lock_guard lock(files.mutex);
+    if (files.paths.contains(path)) return Registration::already;
+    const auto bytes = path.empty() ? std::nullopt : q.read_file(path);
+    if (!bytes) return Registration::unreadable;
+    if (!register_font_file(*bytes, error)) return Registration::invalid;
+    files.paths.insert(path);
+    return Registration::added;
+}
 
 constexpr std::string_view descriptor_keys[] = {
     "kCTFontNameAttribute|NSFontNameAttribute", "kCTFontFamilyNameAttribute|NSFontFamilyAttribute",
@@ -175,7 +205,13 @@ void install_font_exports(Quartz& q) {
         const auto value = [&](std::string_view key) { return quartz->dictionary_get(attributes, key); };
         if (size <= 0) size = quartz->number(value("NSFontSizeAttribute")).value_or(12);
         std::optional<ResolvedFont> resolved;
-        if (const auto name = value("NSFontNameAttribute")) resolved = resolve_font(quartz->cf.utf8(name));
+        if (const auto name = value("NSFontNameAttribute")) {
+            resolved = resolve_font(quartz->cf.utf8(name));
+            // A font file's descriptor (CTFontManagerCreateFontDescriptorsFromURL): the file is registered now.
+            if (const auto url = value("NSCTFontFileURLAttribute"); !resolved && url &&
+                register_file(*quartz, quartz->cf.url_path(url), nullptr) != Registration::unreadable)
+                resolved = resolve_font(quartz->cf.utf8(name));
+        }
         if (!resolved)
             if (const auto family = value("NSFontFamilyAttribute")) resolved = resolve_font(quartz->cf.utf8(family));
         if (!resolved) resolved = resolve_font(".AppleSystemUIFont");
@@ -329,6 +365,16 @@ void install_font_exports(Quartz& q) {
     });
     fn("_CTFontCopyDefaultCascadeListForLanguages", [quartz](CpuState& s, GuestMemory&) { s.x[0] = quartz->cf.array({}); });
     fn("_CTFontGetStringEncoding", [](CpuState& s, GuestMemory&) { s.x[0] = 0x0100; });   // kCFStringEncodingUnicode
+    fn("_CTFontHasTable", [font](CpuState& s, GuestMemory&) {
+        return_bool(s, static_cast<bool>(font(s.x[0])->face->font.table(static_cast<std::uint32_t>(s.x[1]))));
+    });
+    fn("_CTFontGetGlyphWithName", [quartz, font](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[1] ? glyph_with_name(*font(s.x[0])->face, quartz->cf.utf8(s.x[1])) : 0;
+    });
+    fn("_CTFontCopyNameForGlyph", [quartz, font](CpuState& s, GuestMemory&) {
+        const auto name = glyph_name(*font(s.x[0])->face, static_cast<std::uint16_t>(s.x[1]));
+        s.x[0] = name ? quartz->cf.string(*name) : 0;
+    });
     fn("_CTFontCopyTable", [quartz, font](CpuState& s, GuestMemory&) {
         // (font, tag (FourCharCode), options)
         const auto state = font(s.x[0]);
@@ -547,48 +593,207 @@ void install_font_exports(Quartz& q) {
     fn("_CTFontDescriptorGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = 0x100; });
 
     // ---- CTFontManager ----
-    const auto register_url = [quartz](Address url, Address error_out) {
-        const auto path = url ? quartz->cf.url_path(url) : std::string();
-        const auto bytes = path.empty() ? std::nullopt : quartz->read_file(path);
-        std::string error = "the font file could not be read";
-        const bool ok = bytes && register_font_file(*bytes, &error);
-        if (!ok) {
-            diagnostic("CTFontManagerRegisterFontsForURL: " + path + ": " + error);
-            if (error_out) quartz->memory().write64(error_out, 0);
+    // kCTFontManagerError* codes.
+    constexpr std::int64_t file_not_found = 101, invalid_font_data = 104, already_registered = 105, asset_not_found = 107,
+                           not_registered = 201, in_use = 202, insufficient_info = 303;
+    // A CFError (+1, 0 when CFErrorCreate is missing) of kCTFontManagerErrorDomain about `url`.
+    const auto manager_error = [quartz](std::int64_t code, Address url, const std::string& description) -> Address {
+        const auto create = quartz->process.resolve(core_foundation_library, "_CFErrorCreate");
+        if (!create) return 0;
+        std::vector<std::pair<Address, Address>> pairs{{quartz->cf.string("NSLocalizedDescription"), quartz->cf.string(description)}};
+        if (url) {
+            const std::array<Address, 1> urls{url};
+            pairs.emplace_back(quartz->cf.string("CTFontManagerErrorFontURLs"), quartz->cf.array(urls));
         }
-        return ok;
+        const auto info = quartz->cf.dictionary(pairs);
+        for (const auto& [key, value] : pairs) { quartz->release(key); quartz->release(value); }
+        const auto domain = quartz->cf.string("com.apple.CoreText.CTFontManagerErrorDomain");
+        const auto error = quartz->call_guest(create->address, {0, domain, static_cast<Address>(code), info});
+        quartz->release(domain);
+        quartz->release(info);
+        return error;
     };
-    fn("_CTFontManagerRegisterFontsForURL", [register_url](CpuState& s, GuestMemory&) { return_bool(s, register_url(s.x[0], s.x[2])); });
-    fn("_CTFontManagerRegisterFontsForURLs", [quartz, register_url](CpuState& s, GuestMemory& m) {
-        bool all = true;
-        for (const auto url : s.x[0] ? quartz->cf.array_values(s.x[0]) : std::vector<Address>{}) all = register_url(url, 0) && all;
-        if (s.x[2]) m.write64(s.x[2], 0);
-        return_bool(s, all);
-    });
-    fn("_CTFontManagerRegisterFontURLs", [quartz, register_url](CpuState& s, GuestMemory& m) {
-        // (urls, scope, enabled, registrationHandler(errors, done) -> bool)
-        for (const auto url : s.x[0] ? quartz->cf.array_values(s.x[0]) : std::vector<Address>{}) static_cast<void>(register_url(url, 0));
-        if (const auto block = s.x[3]) {
-            const auto empty = quartz->cf.array({});
-            static_cast<void>(quartz->call_guest(m.read64(block + 16), {block, empty, 1}));
-            quartz->release(empty);
+    // The operations below answer nullopt on success, else the error (+1, may be 0).
+    using Outcome = std::optional<Address>;
+    const auto register_url = [quartz, manager_error](Address url) -> Outcome {
+        const auto path = url ? quartz->cf.url_path(url) : std::string();
+        std::string error = "unknown error";
+        switch (register_file(*quartz, path, &error)) {
+        case Registration::added: return std::nullopt;
+        case Registration::already: return manager_error(already_registered, url, "The font file is already registered: " + path);
+        case Registration::unreadable: return manager_error(file_not_found, url, "The font file could not be read: " + path);
+        case Registration::invalid: break;
         }
+        diagnostic("CTFontManagerRegisterFontsForURL: " + path + ": " + error);
+        return manager_error(invalid_font_data, url, "The font file could not be registered: " + path + ": " + error);
+    };
+    const auto unregister_url = [quartz, manager_error](Address url) -> Outcome {
+        const auto path = url ? quartz->cf.url_path(url) : std::string();
+        if (!is_registered_file(path)) return manager_error(not_registered, url, "The font file is not registered: " + path);
+        return manager_error(in_use, url, "CTFontManagerUnregisterFontsForURL: registered fonts stay for the life of the process: " + path);
+    };
+    // An error out-parameter (the caller releases what it gets).
+    const auto put_error = [quartz](Address out, const Outcome& outcome) {
+        const auto error = outcome.value_or(0);
+        if (out) quartz->memory().write64(out, error);
+        else quartz->release(error);
+    };
+    // `each` over an array's values: nullopt, or an array (+1) of the errors.
+    const auto for_each_value = [quartz](Address array, const std::function<Outcome(Address)>& each) -> Outcome {
+        std::vector<Address> errors;
+        bool failed{};
+        for (const auto value : array ? quartz->cf.array_values(array) : std::vector<Address>{})
+            if (const auto outcome = each(value)) {
+                failed = true;
+                if (*outcome) errors.push_back(*outcome);
+            }
+        if (!failed) return std::nullopt;
+        const auto list = quartz->cf.array(errors);
+        for (const auto error : errors) quartz->release(error);
+        return list;
+    };
+    // A registrationHandler(errors, done) -> bool block, called once with every error.
+    const auto report = [quartz](Address block, const Outcome& outcome) {
+        const auto errors = outcome.value_or(0);
+        if (!block) return quartz->release(errors);
+        const auto list = errors ? errors : quartz->cf.array({});
+        static_cast<void>(quartz->call_guest(quartz->memory().read64(block + 16), {block, list, 1}));
+        quartz->release(list);
+    };
+    fn("_CTFontManagerRegisterFontsForURL", [register_url, put_error](CpuState& s, GuestMemory&) {
+        // (url, scope, error*)
+        const auto outcome = register_url(s.x[0]);
+        put_error(s.x[2], outcome);
+        return_bool(s, !outcome);
     });
-    fn("_CTFontManagerRegisterGraphicsFont", [](CpuState& s, GuestMemory&) { return_bool(s, true); });   // CGFonts from data are usable directly
-    fn("_CTFontManagerUnregisterGraphicsFont", [](CpuState& s, GuestMemory&) { return_bool(s, true); });
-    fn("_CTFontManagerUnregisterFontsForURL", [](CpuState& s, GuestMemory&) { return_bool(s, true); });
+    fn("_CTFontManagerRegisterFontsForURLs", [register_url, for_each_value, put_error](CpuState& s, GuestMemory&) {
+        // (urls, scope, errors*)
+        const auto outcome = for_each_value(s.x[0], register_url);
+        put_error(s.x[2], outcome);
+        return_bool(s, !outcome);
+    });
+    fn("_CTFontManagerRegisterFontURLs", [register_url, for_each_value, report](CpuState& s, GuestMemory&) {
+        // (urls, scope, enabled, registrationHandler)
+        report(s.x[3], for_each_value(s.x[0], register_url));
+    });
+    fn("_CTFontManagerUnregisterFontsForURL", [unregister_url, put_error](CpuState& s, GuestMemory&) {
+        const auto outcome = unregister_url(s.x[0]);
+        put_error(s.x[2], outcome);
+        return_bool(s, !outcome);
+    });
+    fn("_CTFontManagerUnregisterFontURLs", [unregister_url, for_each_value, report](CpuState& s, GuestMemory&) {
+        // (urls, scope, registrationHandler)
+        report(s.x[2], for_each_value(s.x[0], unregister_url));
+    });
+    // A descriptor's font file (kCTFontURLAttribute).
+    const auto descriptor_file = [quartz, descriptor_attributes, manager_error](Address descriptor, const auto& operation) -> Outcome {
+        const auto url = quartz->dictionary_get(descriptor_attributes(descriptor), "NSCTFontFileURLAttribute");
+        if (!url) return manager_error(insufficient_info, 0, "The font descriptor names no font file");
+        return operation(url);
+    };
+    fn("_CTFontManagerRegisterFontDescriptors", [register_url, descriptor_file, for_each_value, report](CpuState& s, GuestMemory&) {
+        // (descriptors, scope, enabled, registrationHandler)
+        report(s.x[3], for_each_value(s.x[0], [&](Address descriptor) { return descriptor_file(descriptor, register_url); }));
+    });
+    fn("_CTFontManagerUnregisterFontDescriptors", [unregister_url, descriptor_file, for_each_value, report](CpuState& s, GuestMemory&) {
+        // (descriptors, scope, registrationHandler)
+        report(s.x[2], for_each_value(s.x[0], [&](Address descriptor) { return descriptor_file(descriptor, unregister_url); }));
+    });
+    fn("_CTFontManagerRegisterFontsWithAssetNames", [quartz, manager_error, for_each_value, report](CpuState& s, GuestMemory&) {
+        // (names, bundle, scope, enabled, registrationHandler): no font assets exist here.
+        report(s.x[4], for_each_value(s.x[0], [&](Address name) -> Outcome {
+            return manager_error(asset_not_found, 0, "No font asset named " + quartz->cf.utf8(name));
+        }));
+    });
+    // CGFonts made from data are registered when they are made (CGFontCreateWithDataProvider).
+    fn("_CTFontManagerRegisterGraphicsFont", [](CpuState& s, GuestMemory&) { return_bool(s, true); });
+    fn("_CTFontManagerUnregisterGraphicsFont", [manager_error, put_error](CpuState& s, GuestMemory&) {
+        put_error(s.x[1], manager_error(in_use, 0, "CTFontManagerUnregisterGraphicsFont: registered fonts stay for the life of the process"));
+        return_bool(s, false);
+    });
+    fn("_CTFontManagerGetScopeForURL", [quartz](CpuState& s, GuestMemory&) {
+        // kCTFontManagerScopeProcess for a file registered here, else kCTFontManagerScopeNone.
+        s.x[0] = s.x[0] && is_registered_file(quartz->cf.url_path(s.x[0])) ? 1 : 0;
+    });
+    fn("_CTFontManagerIsSupportedFont", [quartz](CpuState& s, GuestMemory&) {
+        const auto path = s.x[0] ? quartz->cf.url_path(s.x[0]) : std::string();
+        const auto bytes = path.empty() ? std::nullopt : quartz->read_file(path);
+        return_bool(s, bytes && static_cast<bool>(host::gpu::font_from_data(*bytes)));
+    });
     fn("_CTFontManagerCopyAvailableFontFamilyNames", [quartz](CpuState& s, GuestMemory&) {
         std::vector<Address> names;
         for (const auto& name : available_families()) names.push_back(quartz->cf.string(name));
         s.x[0] = quartz->cf.array(names);
         for (const auto name : names) quartz->release(name);
     });
-    fn("_CTFontManagerCreateFontDescriptorsFromURL", [quartz, make_descriptor](CpuState& s, GuestMemory&) {
+    fn("_CTFontManagerCopyAvailablePostScriptNames", [quartz](CpuState& s, GuestMemory&) {
+        std::vector<std::string> names;
+        for (const auto& family : available_families())
+            for (const auto& face : family_members(family))
+                if (!face->postscript.empty()) names.push_back(face->postscript);
+        std::sort(names.begin(), names.end());
+        names.erase(std::unique(names.begin(), names.end()), names.end());
+        std::vector<Address> values;
+        for (const auto& name : names) values.push_back(quartz->cf.string(name));
+        s.x[0] = quartz->cf.array(values);
+        for (const auto value : values) quartz->release(value);
+    });
+    // The descriptor of a font file's first face: its names and URL.
+    const auto file_descriptor = [quartz, make_descriptor](Address url, std::span<const std::uint8_t> bytes) -> Address {
+        const auto font = host::gpu::font_from_data(bytes);
+        if (!font) return 0;
+        const auto info = font->info();
+        if (!info) return 0;
+        std::vector<std::pair<Address, Address>> pairs{
+            {quartz->cf.string("NSFontNameAttribute"), quartz->cf.string(info->postscript)},
+            {quartz->cf.string("NSFontFamilyAttribute"), quartz->cf.string(info->family)},
+            {quartz->cf.string("NSFontFaceAttribute"), quartz->cf.string(info->style_name)},
+            {quartz->cf.string("NSCTFontFileURLAttribute"), quartz->retain(url)}};
+        const auto attributes = quartz->cf.dictionary(pairs);
+        for (const auto& [key, value] : pairs) { quartz->release(key); quartz->release(value); }
+        const auto descriptor = make_descriptor(attributes);
+        quartz->release(attributes);
+        return descriptor;
+    };
+    fn("_CTFontManagerCreateFontDescriptorsFromURL", [quartz, file_descriptor](CpuState& s, GuestMemory&) {
         const auto path = s.x[0] ? quartz->cf.url_path(s.x[0]) : std::string();
         const auto bytes = path.empty() ? std::nullopt : quartz->read_file(path);
-        if (!bytes || !register_font_file(*bytes, nullptr)) { s.x[0] = 0; return; }
-        s.x[0] = quartz->cf.array({});
-        static_cast<void>(make_descriptor);
+        const auto descriptor = bytes ? file_descriptor(s.x[0], *bytes) : 0;
+        if (!descriptor) { s.x[0] = 0; return; }
+        const std::array<Address, 1> values{descriptor};
+        s.x[0] = quartz->cf.array(values);
+        quartz->release(descriptor);
+    });
+    // The descriptors no installed or registered font matches.
+    fn("_CTFontManagerRequestFonts", [quartz, descriptor_attributes](CpuState& s, GuestMemory& m) {
+        // (descriptors, completionHandler(unresolvedFontDescriptors))
+        std::vector<Address> unresolved;
+        for (const auto descriptor : s.x[0] ? quartz->cf.array_values(s.x[0]) : std::vector<Address>{}) {
+            const auto attributes = descriptor_attributes(descriptor);
+            const auto name = quartz->dictionary_get(attributes, "NSFontNameAttribute");
+            const auto family = quartz->dictionary_get(attributes, "NSFontFamilyAttribute");
+            const auto named = name ? name : family;
+            if (!named || !resolve_font(quartz->cf.utf8(named))) unresolved.push_back(descriptor);
+        }
+        const auto list = quartz->cf.array(unresolved);
+        if (s.x[1]) static_cast<void>(quartz->call_guest(m.read64(s.x[1] + 16), {s.x[1], list}));
+        quartz->release(list);
+    });
+    // Auto-activation settings by bundle identifier, kept for this process (no
+    // font activates on demand here).
+    struct Activation {
+        std::mutex mutex;
+        std::map<std::string, std::int64_t> settings;
+    };
+    const auto activation = std::make_shared<Activation>();
+    fn("_CTFontManagerSetAutoActivationSetting", [quartz, activation](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(activation->mutex);
+        activation->settings[s.x[0] ? quartz->cf.utf8(s.x[0]) : std::string()] = static_cast<std::int64_t>(s.x[1]);
+    });
+    fn("_CTFontManagerGetAutoActivationSetting", [quartz, activation](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(activation->mutex);
+        const auto found = activation->settings.find(s.x[0] ? quartz->cf.utf8(s.x[0]) : std::string());
+        s.x[0] = found == activation->settings.end() ? 0 : static_cast<Address>(found->second);   // kCTFontManagerAutoActivationDefault
     });
 
     // ---- CGFont ----
@@ -647,8 +852,13 @@ void install_font_exports(Quartz& q) {
         }
         return_bool(s, true);
     });
-    q.function(cg, "_CGFontGetGlyphWithGlyphName", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });   // glyph names are not indexed
-    q.function(cg, "_CGFontCopyGlyphNameForGlyph", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    q.function(cg, "_CGFontGetGlyphWithGlyphName", [quartz, graphics](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[0] && s.x[1] ? glyph_with_name(*graphics(s.x[0])->face, quartz->cf.utf8(s.x[1])) : 0;
+    });
+    q.function(cg, "_CGFontCopyGlyphNameForGlyph", [quartz, graphics](CpuState& s, GuestMemory&) {
+        const auto name = s.x[0] ? glyph_name(*graphics(s.x[0])->face, static_cast<std::uint16_t>(s.x[1])) : std::nullopt;
+        s.x[0] = name ? quartz->cf.string(*name) : 0;
+    });
     q.function(cg, "_CGFontCopyTableForTag", [quartz, graphics](CpuState& s, GuestMemory&) {
         const auto state = graphics(s.x[0]);
         const auto table = state->face->font.table(static_cast<std::uint32_t>(s.x[1]));
@@ -765,7 +975,9 @@ void install_font_exports(Quartz& q) {
     });
     method(f, "set", [](CpuState&, GuestMemory&) {}, "v@:");            // AppKit text drawing passes fonts as attributes
     method(f, "setInContext:", [](CpuState&, GuestMemory&) {}, "v@:@");
-    method(f, "glyphWithName:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "I@:@");
+    method(f, "glyphWithName:", [quartz, font](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[2] ? glyph_with_name(*font(s.x[0])->face, quartz->cf.utf8(s.x[2])) : 0;
+    }, "I@:@");
 
     // NSFontDescriptor (the CTFontDescriptor class).
     const auto fd = ct.descriptor_class;

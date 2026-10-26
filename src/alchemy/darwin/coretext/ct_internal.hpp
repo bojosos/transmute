@@ -13,6 +13,10 @@
 
 namespace alchemy::gui::quartz2d {
 
+// The glyph names of a face's 'post' table, read on first use (glyph_names.cpp).
+struct GlyphNames;
+[[nodiscard]] std::shared_ptr<GlyphNames> make_glyph_names();
+
 // A host font face with the names and metrics CoreText reports.
 struct FontFace {
     host::gpu::Font font;
@@ -23,6 +27,7 @@ struct FontFace {
     int stretch{host::gpu::font_stretch::normal};
     FontMetrics metrics;
     bool monospace{}, symbol{}, color{};
+    std::shared_ptr<GlyphNames> glyph_names = make_glyph_names();
 };
 
 // CTFontSymbolicTraits
@@ -68,6 +73,10 @@ struct ResolvedFont {
 [[nodiscard]] std::vector<std::uint16_t> glyphs_for(const FontFace& face, std::span<const std::uint16_t> units);
 [[nodiscard]] std::vector<double> advances_for(const FontFace& face, double size, std::span<const std::uint16_t> glyphs);
 [[nodiscard]] std::vector<Rect> glyph_bounds(const FontFace& face, double size, std::span<const std::uint16_t> glyphs);
+// A glyph's 'post' table name (nullopt: the face names no glyphs, or not this one)
+// and the first glyph of a name (0: none) (glyph_names.cpp).
+[[nodiscard]] std::optional<std::string> glyph_name(const FontFace& face, std::uint16_t glyph);
+[[nodiscard]] std::uint16_t glyph_with_name(const FontFace& face, std::string_view name);
 // Registers a font file's faces for name lookup (CTFontManagerRegisterFontsForURL).
 bool register_font_file(std::span<const std::uint8_t> bytes, std::string* error);
 [[nodiscard]] std::vector<std::string> available_families();

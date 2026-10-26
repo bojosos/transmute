@@ -552,6 +552,50 @@ void GraphicsGaps::install_core_text() {
         if (!value) throw std::runtime_error("Alchemy: CTFontCollectionCreateMatchingFontDescriptors needs a CTFontCollection");
         s.x[0] = cf.copy(value->descriptors);
     });
+    // Collections of given descriptors, and copies with more.
+    const auto make_collection = [this](std::vector<Address> descriptors) {
+        auto value = std::make_shared<FontCollection>();
+        value->descriptors = cf.array(descriptors);
+        const auto object = objc.allocate(collection_class);
+        static_cast<void>(objc.host_state<FontCollection>(object, [&] { return value; }));
+        return object;
+    };
+    const auto collection_of = [this](Address object, const char* api) {
+        const auto value = object ? objc.find_host_state<FontCollection>(object) : nullptr;
+        if (!value) throw std::runtime_error(std::string("Alchemy: ") + api + " needs a CTFontCollection");
+        return value;
+    };
+    raw(core_text, "_CTFontCollectionCreateWithFontDescriptors", [this, make_collection](CpuState& s, GuestMemory&) {
+        // (descriptors, options)
+        s.x[0] = make_collection(s.x[0] ? cf.array_values(s.x[0]) : std::vector<Address>{});
+    });
+    raw(core_text, "_CTFontCollectionCreateCopyWithFontDescriptors", [this, make_collection, collection_of](CpuState& s, GuestMemory&) {
+        // (original, descriptors, options)
+        auto descriptors = cf.array_values(collection_of(s.x[0], "CTFontCollectionCreateCopyWithFontDescriptors")->descriptors);
+        for (const auto descriptor : s.x[1] ? cf.array_values(s.x[1]) : std::vector<Address>{}) descriptors.push_back(descriptor);
+        s.x[0] = make_collection(std::move(descriptors));
+    });
+    // (collection, sortCallback(first, second, refCon) -> CFComparisonResult, refCon)
+    raw(core_text, "_CTFontCollectionCreateMatchingFontDescriptorsSortedWithCallback", [this, collection_of](CpuState& s, GuestMemory&) {
+        auto descriptors = cf.array_values(collection_of(s.x[0], "CTFontCollectionCreateMatchingFontDescriptorsSortedWithCallback")->descriptors);
+        if (const auto callback = s.x[1]) {
+            const auto context = s.x[2];
+            std::stable_sort(descriptors.begin(), descriptors.end(), [this, callback, context](Address a, Address b) {
+                CallRegs registers{};
+                registers.x[0] = a;
+                registers.x[1] = b;
+                registers.x[2] = context;
+                return static_cast<std::int64_t>(EngineAdapter(process.calling_engine()).call_regs(callback, registers).x0) < 0;
+            });
+        }
+        s.x[0] = descriptors.empty() ? 0 : cf.array(descriptors);
+    });
+    // CFGetTypeID of a collection.
+    raw(core_text, "_CTFontCollectionGetTypeID", [this, make_collection](CpuState& s, GuestMemory&) {
+        const auto sample = make_collection({});
+        s.x[0] = call(core_foundation, "_CFGetTypeID", {sample});
+        release(sample);
+    });
     // CTFontCopyAvailableTables(font, options): the tags CTFontCopyTable finds
     // (an array of CTFontTableTag values, not CF objects).
     raw(core_text, "_CTFontCopyAvailableTables", [this](CpuState& s, GuestMemory& m) {
