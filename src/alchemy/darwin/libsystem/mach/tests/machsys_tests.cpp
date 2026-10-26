@@ -182,6 +182,11 @@ void libc(Fixture& f) {
             f.call(sys, "_pthread_mutexattr_getprotocol", {attribute, protocol}) == 0 && f.engine.read32(protocol) == 1,
             "PTHREAD_PRIO_INHERIT is a stored attribute");
     require(f.call(sys, "_pthread_mutexattr_setprotocol", {attribute, 3}) == 22, "unknown protocol");
+    require(f.call(sys, "_pthread_mutexattr_getpolicy_np", {attribute, protocol}) == 0 && f.engine.read32(protocol) == 3,
+            "first-fit is the default mutex policy");
+    require(f.call(sys, "_pthread_mutexattr_setpolicy_np", {attribute, 1}) == 0 &&
+            f.call(sys, "_pthread_mutexattr_getpolicy_np", {attribute, protocol}) == 0 && f.engine.read32(protocol) == 1 &&
+            f.call(sys, "_pthread_mutexattr_setpolicy_np", {attribute, 2}) == 22, "the policy is stored");
     require(f.memory().read8(f.symbol(sys, "_in6addr_loopback") + 15) == 1, "in6addr_loopback");
     // Groups.
     const auto own = f.call(sys, "_getgrgid", {f.call(sys, "_getgid")});

@@ -294,16 +294,40 @@ void install_libsystem_process(Provider& p) {
     }, 0);
 
     // pthread attributes and scheduling (error-number return convention).
-    // QoS classes and guard sizes are scheduling hints Alchemy's workers do not model.
+    // QoS classes and guard sizes are scheduling hints Alchemy's workers do not model; they are
+    // kept inside the zero-filled 64-byte pthread_attr_t (after misc/libsystem_misc.cpp's
+    // scheduling fields at 40..51) so the getters read them back: the QoS class at 52, its
+    // relative priority at 56, the guard size at 60 (16 KB pages plus one; 0 is the default page).
+    constexpr std::uint64_t attr_qos = 52, attr_relative = 56, attr_guard = 60;
+    constexpr std::uint64_t guard_page = 16384;
     p.libsystem("_pthread_attr_set_qos_class_np", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
         if (!s.x[0] || m.read64(s.x[0]) != pthread_attr_magic) return einval;
         const auto relative = static_cast<std::int32_t>(s.x[2]);
         if (std::find(std::begin(qos_classes), std::end(qos_classes), static_cast<std::uint32_t>(s.x[1])) == std::end(qos_classes) ||
             relative > 0 || relative < -15) return einval;
+        m.write32(s.x[0] + attr_qos, static_cast<std::uint32_t>(s.x[1]));
+        m.write32(s.x[0] + attr_relative, static_cast<std::uint32_t>(relative));
         return 0;
     });
+    // pthread_attr_get_qos_class_np(attr, qos_class_t*, int* relative): QOS_CLASS_UNSPECIFIED, 0 until set.
+    p.libsystem("_pthread_attr_get_qos_class_np", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[0] || m.read64(s.x[0]) != pthread_attr_magic) return einval;
+        if (s.x[1]) m.write32(s.x[1], m.read32(s.x[0] + attr_qos));
+        if (s.x[2]) m.write32(s.x[2], m.read32(s.x[0] + attr_relative));
+        return 0;
+    });
+    // The guard size rounds up to whole pages.
     p.libsystem("_pthread_attr_setguardsize", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
         if (!s.x[0] || m.read64(s.x[0]) != pthread_attr_magic) return einval;
+        const auto pages = (s.x[1] + guard_page - 1) / guard_page;
+        if (pages >= 0xffffffffULL) return einval;
+        m.write32(s.x[0] + attr_guard, static_cast<std::uint32_t>(pages + 1));
+        return 0;
+    });
+    p.libsystem("_pthread_attr_getguardsize", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[0] || !s.x[1] || m.read64(s.x[0]) != pthread_attr_magic) return einval;
+        const auto stored = m.read32(s.x[0] + attr_guard);
+        m.write64(s.x[1], stored ? (stored - 1ULL) * guard_page : guard_page);
         return 0;
     });
     p.libsystem("_pthread_getschedparam", [](CpuState& s, GuestMemory& m) -> std::uint64_t {

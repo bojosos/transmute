@@ -22,7 +22,7 @@
 //   unless the option string starts with '+' (or '-': non-options are
 //   returned as argument 1); a leading ':' reports a missing argument as ':'
 //   without a message. crashpad_handler parses its command line this way.
-// - getprogname/setprogname (over __progname), errc/warnc/verrc/vwarnc,
+// - getprogname/setprogname (over __progname),
 //   nan/nanf/fmaf/nearbyintf, __math_errhandling (MATH_ERREXCEPT: Darwin's
 //   libm does not set errno), ___mb_cur_max/___mb_cur_max_l and
 //   __maskrune_l (over the locale provider), tmpnam, _dirhelper (over
@@ -74,37 +74,20 @@ private:
         std::uint32_t first_nonopt{1}, last_nonopt{1};
         std::mutex mutex;
     } options_;
-    std::int64_t getopt(GuestMemory& m, std::uint32_t argc, Address argv, Address optstring, Address longopts, Address longindex, bool long_form);
+    std::int64_t getopt(GuestMemory& m, std::uint32_t argc, Address argv, Address optstring, Address longopts, Address longindex, bool long_form,
+                        bool long_only = false);
     void exchange(GuestMemory& m, Address argv, std::uint32_t optind);
     void option_error(GuestMemory& m, Address optstring, const std::string& message);
     std::string progname(GuestMemory& m);
 
     void install_getopt();
     void install_swap();
-    void report(GuestMemory& m, Address format, Address arguments, bool with_code, std::uint32_t code);
 };
 
 std::string Leftovers::progname(GuestMemory& m) {
     if (const auto cell = process.resolve(libsystem, "___progname"))
         if (const auto name = m.read64(cell->address)) return read_cstring(m, name, 1024);
     return "alchemy";
-}
-
-// "<progname>: <message>[: <strerror(code)>]\n" on standard error (err(3)).
-void Leftovers::report(GuestMemory& m, Address format, Address arguments, bool with_code, std::uint32_t code) {
-    std::string line = progname(m) + ": ";
-    if (format) {
-        const auto buffer = malloc(4096);
-        static_cast<void>(call(libsystem, "_vsnprintf", {buffer, 4096, format, arguments}));
-        line += read_cstring(m, buffer, 4096);
-        free(buffer);
-        if (with_code) line += ": ";
-    }
-    if (with_code) line += read_cstring(m, call(libsystem, "_strerror", {code}), 1024);
-    line += "\n";
-    const auto text = strdup(line);
-    static_cast<void>(call(libsystem, "_write", {2, text, line.size()}));
-    free(text);
 }
 
 void Leftovers::option_error(GuestMemory& m, Address optstring, const std::string& message) {
@@ -128,7 +111,7 @@ void Leftovers::exchange(GuestMemory& m, Address argv, std::uint32_t optind) {
 }
 
 std::int64_t Leftovers::getopt(GuestMemory& m, std::uint32_t argc, Address argv, Address optstring_address, Address longopts,
-                               Address longindex, bool long_form) {
+                               Address longindex, bool long_form, bool long_only) {
     auto& o = options_;
     std::lock_guard lock(o.mutex);
     const auto spec_text = read_cstring(m, optstring_address);
@@ -178,9 +161,26 @@ std::int64_t Leftovers::getopt(GuestMemory& m, std::uint32_t argc, Address argv,
             return finish(-1);
         }
         const auto text = arg(optind);
-        if (longopts && m.read8(text + 1) == '-') {
-            // --name[=value]
-            const auto body = read_cstring(m, text + 2);
+        // getopt_long_only: "-name" is a long option too. When its first letter is a short
+        // option, it is one only if a long option is named name (or, for longer names,
+        // starts with it); otherwise it is short options ("-v", "-vd").
+        const bool double_dash = m.read8(text + 1) == '-';
+        bool long_option = longopts && double_dash;
+        if (longopts && !double_dash && long_only) {
+            const auto body = read_cstring(m, text + 1);
+            const auto name = body.substr(0, body.find('='));
+            const bool short_too = !name.empty() && name[0] != ':' && spec.find(name[0]) != std::string_view::npos;
+            long_option = !short_too;
+            for (std::uint32_t index = 0; !long_option; ++index) {
+                const auto entry_name = m.read64(longopts + index * 32ULL);
+                if (!entry_name) break;
+                const auto candidate = read_cstring(m, entry_name);
+                long_option = candidate == name || (name.size() > 1 && candidate.starts_with(name));
+            }
+        }
+        if (long_option) {
+            // --name[=value] (or -name[=value] for getopt_long_only)
+            const auto body = read_cstring(m, text + (double_dash ? 2 : 1));
             const auto equals = body.find('=');
             const auto name = body.substr(0, equals);
             ++optind;
@@ -210,7 +210,7 @@ std::int64_t Leftovers::getopt(GuestMemory& m, std::uint32_t argc, Address argv,
                     option_error(m, optstring_address, "option `--" + full_name + "' doesn't allow an argument");
                     return finish('?');
                 }
-                m.write64(o.optarg, text + 2 + equals + 1);
+                m.write64(o.optarg, text + (double_dash ? 2 : 1) + equals + 1);
             } else if (has_arg == 1) {
                 if (optind >= argc) {
                     m.write32(o.optopt, flag ? 0 : static_cast<std::uint32_t>(value));
@@ -270,6 +270,9 @@ void Leftovers::install_getopt() {
     fn(libsystem, "_getopt_long", [this](CpuState& s, GuestMemory& m) {
         return static_cast<Address>(getopt(m, static_cast<std::uint32_t>(s.x[0]), s.x[1], s.x[2], s.x[3], s.x[4], true));
     });
+    fn(libsystem, "_getopt_long_only", [this](CpuState& s, GuestMemory& m) {
+        return static_cast<Address>(getopt(m, static_cast<std::uint32_t>(s.x[0]), s.x[1], s.x[2], s.x[3], s.x[4], true, true));
+    });
 }
 
 // libmacho's byte-swap helpers (mach-o/swap.h): every field of these
@@ -315,15 +318,6 @@ void Leftovers::install() {
         }
         return 0;
     });
-    // errc(status, code, fmt, ...) / verrc(status, code, fmt, va_list): never return (exit(status)).
-    const auto leave = [this](CpuState& s, Address code) {
-        s.x[0] = code;
-        s.x[30] = symbol(libsystem, "_exit");
-    };
-    raw(libsystem, "_errc", [this, leave](CpuState& s, GuestMemory& m) { report(m, s.x[2], s.sp, true, static_cast<std::uint32_t>(s.x[1])); leave(s, s.x[0]); });
-    raw(libsystem, "_verrc", [this, leave](CpuState& s, GuestMemory& m) { report(m, s.x[2], s.x[3], true, static_cast<std::uint32_t>(s.x[1])); leave(s, s.x[0]); });
-    raw(libsystem, "_warnc", [this](CpuState& s, GuestMemory& m) { report(m, s.x[1], s.sp, true, static_cast<std::uint32_t>(s.x[0])); });
-    raw(libsystem, "_vwarnc", [this](CpuState& s, GuestMemory& m) { report(m, s.x[1], s.x[2], true, static_cast<std::uint32_t>(s.x[0])); });
 
     // ---- math ----
     raw(libsystem, "_nan", [](CpuState& s, GuestMemory&) { return_real(s, std::numeric_limits<double>::quiet_NaN()); });

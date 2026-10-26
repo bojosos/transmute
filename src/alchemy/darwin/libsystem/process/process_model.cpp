@@ -1102,6 +1102,12 @@ void DarwinServices::Impl::install_process_services() {
                 const std::array<std::uint64_t, 1> arguments{signal};
                 static_cast<void>(EngineAdapter(context.calling_engine()).call(action.handler, arguments));
             }
+            {
+                std::lock_guard lock(mutex);
+                ++handled_signals;
+                last_handled_signal = static_cast<std::uint32_t>(signal);
+            }
+            signal_handled.notify_all();
             return 0;
         }
         if (signal_ignored_by_default(signal)) return 0;
@@ -1208,6 +1214,39 @@ void DarwinServices::Impl::install_process_services() {
     install("_raise", [deliver_self](auto& s, auto&) {
         if (s.x[0] == 0 || s.x[0] > 31) throw ServiceError{einval};
         return deliver_self(s.x[0]);
+    });
+    // sigsuspend(mask) / pause() / sigpause(signal): the thread's mask becomes `mask` (pause
+    // keeps it; sigpause unblocks `signal`) until a handler for a signal outside it has run
+    // (raise or kill from any thread of this process), then the old mask is back and the call
+    // fails with EINTR, as it always does. Alchemy delivers no asynchronous signals from
+    // outside the process (SIGCHLD, SIGALRM, terminal signals), so only those wake it.
+    const auto suspend = [this](std::optional<std::uint32_t> mask) -> std::uint64_t {
+        const auto identity = context.current_thread()->identity;
+        std::unique_lock lock(mutex);
+        auto& current = signal_masks[identity];
+        const auto previous = current;
+        const auto waiting = mask ? *mask & ~((1U << 8) | (1U << 16)) : previous;
+        current = waiting;
+        const auto seen = handled_signals;
+        while (true) {
+            if (handled_signals != seen && last_handled_signal && !(waiting & (1U << (last_handled_signal - 1)))) break;
+            if (context.requested_exit()) break;
+            signal_handled.wait_for(lock, std::chrono::milliseconds(50));
+        }
+        signal_masks[identity] = previous;
+        throw ServiceError{eintr_error};
+    };
+    for (const auto name : {"_sigsuspend", "_sigsuspend$NOCANCEL"})
+        install(name, [suspend](auto& s, auto& m) -> std::uint64_t {
+            validate(m, s.x[0], 4, false);
+            return suspend(m.read32(s.x[0]));
+        });
+    install("_pause", [suspend](auto&, auto&) -> std::uint64_t { return suspend(std::nullopt); });
+    install("_sigpause", [this, suspend](auto& s, auto&) -> std::uint64_t {
+        if (s.x[0] == 0 || s.x[0] > 31) throw ServiceError{einval};
+        std::uint32_t mask;
+        { std::lock_guard lock(mutex); mask = signal_masks[context.current_thread()->identity]; }
+        return suspend(mask & ~(1U << (s.x[0] - 1)));
     });
 
     // ---- libproc for this process and its children ----

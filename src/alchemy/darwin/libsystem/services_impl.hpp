@@ -1212,6 +1212,11 @@ public:
     struct SignalAction { std::uint64_t handler{}; std::uint32_t mask{}, flags{}; };
     std::array<SignalAction, 32> signal_actions{};
     std::map<std::uint64_t, std::uint32_t> signal_masks;
+    // Signals whose handler ran (process/process_model.cpp's delivery): sigsuspend
+    // and pause wait for the count to move. Guarded by `mutex`.
+    std::condition_variable signal_handled;
+    std::uint64_t handled_signals{};
+    std::uint32_t last_handled_signal{};
     std::map<std::uint64_t, std::array<std::uint64_t, 2>> resource_limits;
     std::uint64_t creation_mask{022};
 

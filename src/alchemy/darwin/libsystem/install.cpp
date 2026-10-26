@@ -19,6 +19,8 @@ void install_libsystem_gaps(gui::InstallContext& context) {
     export_fill::install_ncurses(p);
     export_fill::install_libpanel(p);
     export_fill::install_libsystem_threads_extra(p);
+    export_fill::install_libsystem_bsd_extra(p);
+    export_fill::install_libsystem_netdb_extra(p);
 }
 
 void install_libsystem_services(gui::InstallContext& context) {

@@ -52,6 +52,8 @@ list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES
 #     fill-only, installed last (gui::fill::install_libsystem_leftovers).
 #   misc/{stdlib_extra,ndbm}.cpp, net/rpc_nis.cpp: rand48 and crypt, ndbm(3), NIS and
 #     Sun RPC (unavailable); pieces of install_libsystem_gaps (fill-only).
+#   misc/bsd_extra.cpp, net/netdb_extra.cpp: BSD libc and netdb leftovers (the /etc
+#     databases); pieces of install_libsystem_gaps (fill-only).
 #   */libsystem_*.cpp: libSystem names a renderer plug-in's images import, fill-only
 #     (libsystem::install_libsystem_gaps and install_libsystem_services rows;
 #     shared kit src/alchemy/darwin/kit/export_fill/).
@@ -91,6 +93,8 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/libsystem/terminal/curses.cpp
     src/alchemy/darwin/libsystem/terminal/panel.cpp
     src/alchemy/darwin/libsystem/process/threads_extra.cpp
+    src/alchemy/darwin/libsystem/misc/bsd_extra.cpp
+    src/alchemy/darwin/libsystem/net/netdb_extra.cpp
     src/alchemy/darwin/libsystem/process/foundation_threads.cpp
     src/alchemy/darwin/libsystem/process/process_io.cpp
     src/alchemy/darwin/libsystem/misc/system_c.cpp

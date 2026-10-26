@@ -7,6 +7,7 @@
 #include "alchemy/host/network_policy.hpp"
 #include "alchemy/darwin/network/http.hpp"
 #include "alchemy/process_tree.hpp"
+#include "alchemy/path.hpp"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -17,6 +18,8 @@
 #include <condition_variable>
 #include <mutex>
 
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
 
@@ -254,6 +257,62 @@ void getopt_long(Fixture& f) {
     const auto spec3 = f.text(":c:");
     require(f.call(sys, "_getopt", {2, missing, spec3}) == ':', "leading ':' reports a missing argument");
     f.engine.write32(optind, 1);
+}
+
+// getopt_long_only: "-name" is a long option; a single letter that is a short option stays short.
+void getopt_long_only(Fixture& f) {
+    const auto optind = f.symbol(sys, "_optind"), optarg = f.symbol(sys, "_optarg");
+    const auto longopts = f.block(3 * 32);
+    const auto put = [&](unsigned index, std::string_view name, unsigned has_arg, unsigned value) {
+        f.engine.write64(longopts + index * 32, f.text(name));
+        f.engine.write32(longopts + index * 32 + 8, has_arg);
+        f.engine.write32(longopts + index * 32 + 24, value);
+    };
+    put(0, "verbose", 0, 'V'); put(1, "url", 1, 'u');
+    const auto argv = make_argv(f, {"tool", "-verbose", "-d", "x", "-url=http://y", "-v", "--url", "z", "-bogus"});
+    const auto spec = f.text("vd:");
+    f.engine.write32(optind, 1);
+    f.engine.write32(f.symbol(sys, "_opterr"), 0);
+    const auto next = [&] { return static_cast<std::int32_t>(f.call(sys, "_getopt_long_only", {9, argv, spec, longopts, 0})); };
+    require(next() == 'V', "-verbose is the long option");
+    require(next() == 'd' && f.read_text(f.engine.read64(optarg)) == "x", "-d stays a short option");
+    require(next() == 'u' && f.read_text(f.engine.read64(optarg)) == "http://y", "-url=value");
+    require(next() == 'v', "-v is the short option, not a prefix of --verbose");
+    require(next() == 'u' && f.read_text(f.engine.read64(optarg)) == "z", "--url value");
+    require(next() == '?', "-bogus is neither");
+    require(next() == -1, "end");
+    f.engine.write32(optind, 1);
+}
+
+// err_set_file: warn/err messages go to the stream; err_set_exit registers the exit hook.
+void err_hooks(Fixture& f) {
+    const auto file = std::filesystem::temp_directory_path() / "alchemy-err-set-file.txt";
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    const auto stream = f.call(sys, "_fopen", {f.text(alchemy::guest_path_string(file)), f.text("w")});
+    require(stream != 0, "fopen");
+    f.call(sys, "_err_set_file", {stream});
+    alchemy::CallRegs registers;
+    registers.x[0] = f.text("hello %d");
+    registers.push_variadic(std::uint64_t{5});
+    f.regs(sys, "_warnx", registers);
+    alchemy::CallRegs coded;
+    coded.x[0] = 2;
+    coded.x[1] = f.text("missing");
+    f.regs(sys, "_warnc", coded);
+    f.call(sys, "_err_set_file", {0});
+    require(f.call(sys, "_fclose", {stream}) == 0, "fclose");
+    std::ifstream in(file);
+    std::string first, second;
+    std::getline(in, first);
+    std::getline(in, second);
+    in.close();
+    std::filesystem::remove(file, ignored);
+    require(first.ends_with("hello 5"), "warnx wrote to the err_set_file stream: " + first);
+    require(second.ends_with("missing: No such file or directory"), "warnc names its code: " + second);
+    const auto hook = f.process.install_function("_err_test_exit_hook", [](transmute::CpuState&, transmute::GuestMemory&) {});
+    f.call(sys, "_err_set_exit", {hook});
+    f.call(sys, "_err_set_exit", {0});
 }
 
 void byte_swap(Fixture& f) {
@@ -1271,6 +1330,8 @@ int main(int argc, char** argv) {
         {"guest_default_zone", guest_default_zone},
         {"mstats", mstats},
         {"getopt_long", getopt_long},
+        {"getopt_long_only", getopt_long_only},
+        {"err_hooks", err_hooks},
         {"byte_swap", byte_swap},
         {"bz2_stream", bz2_stream},
         {"misc", misc},

@@ -23,7 +23,7 @@
 // mergesort, radixsort, quick_exit, a64l/l64a, mkostemp, mkdtemps), <time.h> (timelocal,
 // timespec_get, posix2time), <ctype.h> (digittoint, ishexnumber, isnumber, ...) and the BSD
 // and System V signal calls over sigaction/sigprocmask (sigset, sighold, sigblock,
-// siginterrupt, psignal, sys_siglist; not sigpause, which needs sigsuspend), dprintf, the
+// siginterrupt, psignal, sys_siglist; sigpause is process/process_model.cpp's), dprintf, the
 // _unlocked stdio forms, fdatasync, dirname_r/basename_r, mkpath_np, ftw/nftw and ether_ntoa/aton. Comparators and callbacks are guest functions, called
 // on the calling guest thread. The C locale is ASCII (as misc/locale.cpp's).
 namespace alchemy {

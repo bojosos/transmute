@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
+#include "alchemy/darwin_version.hpp"
 #include "alchemy/darwin/security/md4.hpp"
 
 #include <algorithm>
@@ -11,7 +12,8 @@
 #include <memory>
 #include <mutex>
 #include <random>
-
+#include <utility>
+#include <vector>
 
 // Pure runtime pieces of libSystem a renderer plug-in imports: OSAtomic (libkern), the
 // compiler-rt 128-bit integer and powi builtins libSystem re-exports, BSD
@@ -82,10 +84,15 @@ void result(CpuState& state, U128 value) { state.x[0] = value.low; state.x[1] = 
 void return_double(CpuState& state, double value) { state.v[0] = {std::bit_cast<std::uint64_t>(value), 0}; }
 void return_float(CpuState& state, float value) { state.v[0] = {std::bit_cast<std::uint32_t>(value), 0}; }
 
-// ---- BSD random(3): additive feedback generator x^31 + x^3 + 1 --------------
-struct Random {
-    std::mutex mutex;
-    std::array<std::int32_t, 31> table{};
+// ---- BSD random(3): additive feedback generators ---------------------------------
+// One generator per state array: the process's own (degree 31, x^31 + x^3 + 1) and each
+// array initstate set up, by its size: < 32 bytes the Park-Miller generator alone (type 0),
+// < 64 degree 7, < 128 degree 15, < 256 degree 31, else degree 63. setstate switches
+// between them; the arrays hold the type in their first word, the tables stay here.
+struct Generator {
+    std::uint32_t type{3};
+    std::size_t separation{3};
+    std::vector<std::int32_t> table = std::vector<std::int32_t>(31);
     std::size_t front{3}, rear{0};
     bool seeded{};
     static std::int32_t good_rand(std::int32_t x) {
@@ -96,25 +103,43 @@ struct Random {
         if (x < 0) x += 0x7fffffff;
         return x;
     }
-    std::int32_t next_locked() {
+    static Generator of_size(std::uint64_t bytes) {
+        Generator g;
+        const auto shape = [&g](std::uint32_t type, std::size_t degree, std::size_t separation) {
+            g.type = type; g.table.assign(degree, 0); g.separation = separation;
+        };
+        if (bytes < 32) shape(0, 1, 0);
+        else if (bytes < 64) shape(1, 7, 3);
+        else if (bytes < 128) shape(2, 15, 1);
+        else if (bytes < 256) shape(3, 31, 3);
+        else shape(4, 63, 1);
+        return g;
+    }
+    std::int32_t next() {
+        if (!seeded) seed(1);
+        if (type == 0) return table[0] = good_rand(table[0]) & 0x7fffffff;
         table[front] = static_cast<std::int32_t>(static_cast<std::uint32_t>(table[front]) + static_cast<std::uint32_t>(table[rear]));
         const auto value = static_cast<std::int32_t>((static_cast<std::uint32_t>(table[front]) >> 1) & 0x7fffffff);
         front = (front + 1) % table.size();
         rear = (rear + 1) % table.size();
         return value;
     }
-    void seed_locked(std::uint32_t seed) {
-        table[0] = static_cast<std::int32_t>(seed);
+    void seed(std::uint32_t value) {
+        table[0] = static_cast<std::int32_t>(value);
+        seeded = true;
+        if (type == 0) return;
         for (std::size_t index = 1; index < table.size(); ++index) table[index] = good_rand(table[index - 1]);
-        front = 3; rear = 0; seeded = true;
-        for (int index = 0; index < 310; ++index) static_cast<void>(next_locked());
+        front = separation; rear = 0;
+        for (std::size_t index = 0; index < 10 * table.size(); ++index) static_cast<void>(next());
     }
-    std::int32_t next() {
-        std::lock_guard lock(mutex);
-        if (!seeded) seed_locked(1);
-        return next_locked();
-    }
-    void seed(std::uint32_t value) { std::lock_guard lock(mutex); seed_locked(value); }
+};
+
+struct Random {
+    std::mutex mutex;
+    std::map<std::uint64_t, Generator> generators;   // state array -> its generator
+    std::uint64_t current{};                         // the state array in use
+    std::int32_t next() { std::lock_guard lock(mutex); return generators[current].next(); }
+    void seed(std::uint32_t value) { std::lock_guard lock(mutex); generators[current].seed(value); }
 };
 
 // ---- strptime ("C" locale) --------------------------------------------------
@@ -409,9 +434,325 @@ void install_libsystem_runtime(Provider& p) {
         return_float(s, reciprocal ? 1 / r : r);
     });
 
+    // ---- more compiler-rt builtins (x0:x1 and x2:x3 are 128-bit operands, little end first) ----
+    const auto ti_memory = [&p](const char* name, auto operation) {
+        if (provided(p.process(), libsystem_library, name)) return;
+        static_cast<void>(p.process().install_function(name, [operation](CpuState& s, GuestMemory& m) { operation(s, m); },
+                                                       std::string(libsystem_library)));
+    };
+    const auto shift_left = [](U128 a, unsigned count) -> U128 {
+        count &= 127;
+        if (count == 0) return a;
+        if (count >= 64) return {0, a.low << (count - 64)};
+        return {a.low << count, a.high << count | a.low >> (64 - count)};
+    };
+    const auto shift_right = [](U128 a, unsigned count, bool arithmetic) -> U128 {
+        count &= 127;
+        if (count == 0) return a;
+        const std::uint64_t fill = arithmetic && negative(a) ? ~0ULL : 0;
+        if (count >= 64) return {count == 64 ? a.high : (arithmetic ? static_cast<std::uint64_t>(static_cast<std::int64_t>(a.high) >> (count - 64)) : a.high >> (count - 64)), fill};
+        return {a.low >> count | a.high << (64 - count),
+                arithmetic ? static_cast<std::uint64_t>(static_cast<std::int64_t>(a.high) >> count) : a.high >> count};
+    };
+    const auto add = [](U128 a, U128 b) -> U128 { const auto low = a.low + b.low; return {low, a.high + b.high + (low < a.low ? 1 : 0)}; };
+    // The low 128 bits of the unsigned product a * b; *overflow: whether it needs more.
+    const auto multiply = [](U128 a, U128 b, bool* overflow) -> U128 {
+        const auto mul64 = [](std::uint64_t x, std::uint64_t y) -> U128 {
+            const std::uint64_t x0 = x & 0xffffffff, x1 = x >> 32, y0 = y & 0xffffffff, y1 = y >> 32;
+            const auto p00 = x0 * y0, p01 = x0 * y1, p10 = x1 * y0, p11 = x1 * y1;
+            const auto middle = (p00 >> 32) + (p01 & 0xffffffff) + (p10 & 0xffffffff);
+            return {(middle << 32) | (p00 & 0xffffffff), p11 + (p01 >> 32) + (p10 >> 32) + (middle >> 32)};
+        };
+        const auto product = mul64(a.low, b.low), cross1 = mul64(a.low, b.high), cross2 = mul64(a.high, b.low);
+        auto high = product.high;
+        bool carry = false;
+        high += cross1.low; carry = carry || high < cross1.low;
+        high += cross2.low; carry = carry || high < cross2.low;
+        if (overflow) *overflow = carry || (a.high && b.high) || cross1.high || cross2.high;
+        return {product.low, high};
+    };
+    ti("___multi3", [multiply](CpuState& s) { result(s, multiply(operand(s, 0), operand(s, 2), nullptr)); });
+    ti("___ashlti3", [shift_left](CpuState& s) { result(s, shift_left(operand(s, 0), static_cast<unsigned>(s.x[2]))); });
+    ti("___ashrti3", [shift_right](CpuState& s) { result(s, shift_right(operand(s, 0), static_cast<unsigned>(s.x[2]), true)); });
+    ti("___lshrti3", [shift_right](CpuState& s) { result(s, shift_right(operand(s, 0), static_cast<unsigned>(s.x[2]), false)); });
+    ti("___negti2", [](CpuState& s) { result(s, negate(operand(s, 0))); });
+    // __udivmodti4(a, b, rem*): the quotient; *rem (x4) the remainder.
+    ti_memory("___udivmodti4", [](CpuState& s, GuestMemory& m) {
+        const auto [q, r] = divide(operand(s, 0), operand(s, 2));
+        if (s.x[4]) { m.write64(s.x[4], r.low); m.write64(s.x[4] + 8, r.high); }
+        result(s, q);
+    });
+    // Integer bit counts on 128-bit values.
+    ti("___clzti2", [](CpuState& s) { const auto a = operand(s, 0); s.x[0] = a.high ? std::countl_zero(a.high) : 64 + std::countl_zero(a.low); });
+    ti("___ctzti2", [](CpuState& s) { const auto a = operand(s, 0); s.x[0] = a.low ? std::countr_zero(a.low) : 64 + std::countr_zero(a.high); });
+    ti("___popcountti2", [](CpuState& s) { const auto a = operand(s, 0); s.x[0] = std::popcount(a.low) + std::popcount(a.high); });
+    ti("___ffsti2", [](CpuState& s) {
+        const auto a = operand(s, 0);
+        s.x[0] = a.low ? std::countr_zero(a.low) + 1 : a.high ? 64 + std::countr_zero(a.high) + 1 : 0;
+    });
+    // __cmpti2 / __ucmpti2: 0 less, 1 equal, 2 greater.
+    ti("___cmpti2", [](CpuState& s) {
+        const auto a = operand(s, 0), b = operand(s, 2);
+        const auto ah = static_cast<std::int64_t>(a.high), bh = static_cast<std::int64_t>(b.high);
+        s.x[0] = ah < bh ? 0 : ah > bh ? 2 : a.low < b.low ? 0 : a.low > b.low ? 2 : 1;
+    });
+    ti("___ucmpti2", [](CpuState& s) {
+        const auto a = operand(s, 0), b = operand(s, 2);
+        s.x[0] = less(a, b) ? 0 : less(b, a) ? 2 : 1;
+    });
+    // 64-bit division and byte/bit helpers.
+    ti("___udivdi3", [](CpuState& s) {
+        if (!s.x[1]) throw std::runtime_error("Alchemy: 64-bit integer division by zero");
+        s.x[0] = s.x[0] / s.x[1];
+    });
+    ti("___divdi3", [](CpuState& s) {
+        if (!s.x[1]) throw std::runtime_error("Alchemy: 64-bit integer division by zero");
+        s.x[0] = static_cast<std::uint64_t>(static_cast<std::int64_t>(s.x[0]) / static_cast<std::int64_t>(s.x[1]));
+    });
+    ti("___bswapsi2", [](CpuState& s) {
+        const auto v = static_cast<std::uint32_t>(s.x[0]);
+        s.x[0] = (v >> 24) | ((v >> 8) & 0xff00) | ((v << 8) & 0xff0000) | (v << 24);
+    });
+    ti("___bswapdi2", [](CpuState& s) {
+        std::uint64_t v = s.x[0], swapped = 0;
+        for (int index = 0; index < 8; ++index) { swapped = (swapped << 8) | (v & 0xff); v >>= 8; }
+        s.x[0] = swapped;
+    });
+    ti("___paritysi2", [](CpuState& s) { s.x[0] = std::popcount(static_cast<std::uint32_t>(s.x[0])) & 1; });
+    // Overflow-checked arithmetic: the *o forms report overflow; the *v forms trap (compiler-rt aborts).
+    // __mulodi4(a, b, int* overflow) / __muloti4(a, b, int* overflow): the product; *overflow set when
+    // the signed result does not fit.
+    const auto signed_multiply = [multiply](U128 a, U128 b, bool& overflow) {
+        const bool flip = negative(a) != negative(b);
+        auto magnitude = multiply(negative(a) ? negate(a) : a, negative(b) ? negate(b) : b, &overflow);
+        const bool minimum = magnitude.high == 0x8000000000000000ULL && magnitude.low == 0;
+        if (negative(magnitude) && !(flip && minimum)) overflow = true;
+        return flip ? negate(magnitude) : magnitude;
+    };
+    ti_memory("___muloti4", [signed_multiply](CpuState& s, GuestMemory& m) {
+        bool overflow = false;
+        result(s, signed_multiply(operand(s, 0), operand(s, 2), overflow));
+        if (s.x[4]) m.write32(s.x[4], overflow ? 1 : 0);
+    });
+    ti_memory("___mulodi4", [signed_multiply](CpuState& s, GuestMemory& m) {
+        const auto widen = [](std::uint64_t value) { return U128{value, static_cast<std::int64_t>(value) < 0 ? ~0ULL : 0}; };
+        bool overflow = false;
+        const auto product = signed_multiply(widen(s.x[0]), widen(s.x[1]), overflow);
+        // The 64-bit result overflows when the 128-bit one is not its sign extension.
+        overflow = overflow || product.high != (static_cast<std::int64_t>(product.low) < 0 ? ~0ULL : 0);
+        s.x[0] = product.low;
+        if (s.x[2]) m.write32(s.x[2], overflow ? 1 : 0);
+    });
+    const auto signed_overflow = [](const char* what) { throw std::runtime_error(std::string("Alchemy: 128-bit integer overflow in ") + what); };
+    ti("___absvti2", [signed_overflow](CpuState& s) {
+        const auto a = operand(s, 0);
+        if (a.high == 0x8000000000000000ULL && a.low == 0) signed_overflow("__absvti2");
+        result(s, negative(a) ? negate(a) : a);
+    });
+    ti("___negvti2", [signed_overflow](CpuState& s) {
+        const auto a = operand(s, 0);
+        if (a.high == 0x8000000000000000ULL && a.low == 0) signed_overflow("__negvti2");
+        result(s, negate(a));
+    });
+    ti("___addvti3", [add, signed_overflow](CpuState& s) {
+        const auto a = operand(s, 0), b = operand(s, 2), sum = add(a, b);
+        if (negative(a) == negative(b) && negative(sum) != negative(a)) signed_overflow("__addvti3");
+        result(s, sum);
+    });
+    ti("___subvti3", [add, signed_overflow](CpuState& s) {
+        const auto a = operand(s, 0), b = operand(s, 2), difference = add(a, negate(b));
+        if (negative(a) != negative(b) && negative(difference) != negative(a)) signed_overflow("__subvti3");
+        result(s, difference);
+    });
+    ti("___mulvti3", [signed_multiply, signed_overflow](CpuState& s) {
+        bool overflow = false;
+        const auto product = signed_multiply(operand(s, 0), operand(s, 2), overflow);
+        if (overflow) signed_overflow("__mulvti3");
+        result(s, product);
+    });
+    // Float <-> 128-bit integer conversions (truncating toward zero; out of range saturates as compiler-rt does).
+    const auto to_u128 = [](double value) -> U128 {
+        if (!(value > 0)) return {};
+        if (value >= 0x1p128) return {~0ULL, ~0ULL};
+        if (value < 0x1p64) return {static_cast<std::uint64_t>(value), 0};
+        const auto high = static_cast<std::uint64_t>(value / 0x1p64);
+        return {static_cast<std::uint64_t>(value - static_cast<double>(high) * 0x1p64), high};
+    };
+    const auto to_i128 = [to_u128](double value) -> U128 {
+        if (std::isnan(value)) return {};
+        if (value >= 0x1p127) return {~0ULL, 0x7fffffffffffffffULL};
+        if (value <= -0x1p127) return {0, 0x8000000000000000ULL};
+        return value < 0 ? negate(to_u128(-value)) : to_u128(value);
+    };
+    ti("___fixdfti", [to_i128](CpuState& s) { result(s, to_i128(std::bit_cast<double>(s.v[0][0]))); });
+    ti("___fixsfti", [to_i128](CpuState& s) { result(s, to_i128(std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0])))); });
+    ti("___fixunsdfti", [to_u128](CpuState& s) { result(s, to_u128(std::bit_cast<double>(s.v[0][0]))); });
+    ti("___fixunssfti", [to_u128](CpuState& s) { result(s, to_u128(std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0])))); });
+    ti("___floattisf", [](CpuState& s) {
+        const auto a = operand(s, 0);
+        // Through double: 128-bit values round twice only when the double is exactly halfway, which a
+        // 53-bit mantissa cannot be for a float's 24.
+        return_float(s, static_cast<float>(negative(a) ? -to_double(negate(a)) : to_double(a)));
+    });
+    ti("___floatuntisf", [](CpuState& s) { return_float(s, static_cast<float>(to_double(operand(s, 0)))); });
+    // IEEE half precision (binary16): _Float16 in h0 (the low 16 bits of v0), or a uint16 in w0 (__gnu_*).
+    const auto half_to_float = [](std::uint16_t h) -> float {
+        const std::uint32_t sign = (h & 0x8000u) << 16, exponent = (h >> 10) & 0x1f, mantissa = h & 0x3ff;
+        if (exponent == 0x1f) return std::bit_cast<float>(sign | 0x7f800000u | (mantissa << 13));
+        if (exponent == 0) {
+            if (!mantissa) return std::bit_cast<float>(sign);
+            return (sign ? -1.0f : 1.0f) * std::ldexp(static_cast<float>(mantissa), -24);
+        }
+        return std::bit_cast<float>(sign | ((exponent + 112) << 23) | (mantissa << 13));
+    };
+    // double -> half, rounding to nearest even once.
+    const auto double_to_half = [](double value) -> std::uint16_t {
+        const auto bits = std::bit_cast<std::uint64_t>(value);
+        const std::uint16_t sign = static_cast<std::uint16_t>((bits >> 48) & 0x8000);
+        const double magnitude = std::fabs(value);
+        if (std::isnan(value)) return static_cast<std::uint16_t>(sign | 0x7e00);
+        if (magnitude >= 65520.0) return static_cast<std::uint16_t>(sign | 0x7c00);   // rounds to infinity
+        if (magnitude < 0x1p-14) {
+            // Subnormal: units of 2^-24, rounded to nearest even.
+            const double units = magnitude * 0x1p24;
+            auto whole = static_cast<std::uint32_t>(units);
+            const double rest = units - whole;
+            if (rest > 0.5 || (rest == 0.5 && (whole & 1))) ++whole;
+            return static_cast<std::uint16_t>(sign | whole);
+        }
+        int exponent{};
+        const double fraction = std::frexp(magnitude, &exponent);   // [0.5, 1)
+        const double units = (fraction * 2 - 1) * 1024;              // the 10 mantissa bits
+        auto whole = static_cast<std::uint32_t>(units);
+        const double rest = units - whole;
+        if (rest > 0.5 || (rest == 0.5 && (whole & 1))) ++whole;
+        std::uint32_t biased = static_cast<std::uint32_t>(exponent - 1 + 15);
+        if (whole == 1024) { whole = 0; ++biased; }
+        if (biased >= 31) return static_cast<std::uint16_t>(sign | 0x7c00);
+        return static_cast<std::uint16_t>(sign | (biased << 10) | whole);
+    };
+    ti("___extendhfsf2", [half_to_float](CpuState& s) { return_float(s, half_to_float(static_cast<std::uint16_t>(s.v[0][0]))); });
+    ti("___extendhfdf2", [half_to_float](CpuState& s) { return_double(s, half_to_float(static_cast<std::uint16_t>(s.v[0][0]))); });
+    ti("___truncsfhf2", [double_to_half](CpuState& s) {
+        s.v[0] = {double_to_half(std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0]))), 0};
+    });
+    ti("___truncdfhf2", [double_to_half](CpuState& s) { s.v[0] = {double_to_half(std::bit_cast<double>(s.v[0][0])), 0}; });
+    ti("___gnu_h2f_ieee", [half_to_float](CpuState& s) { return_float(s, half_to_float(static_cast<std::uint16_t>(s.x[0]))); });
+    ti("___gnu_f2h_ieee", [double_to_half](CpuState& s) { s.x[0] = double_to_half(std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0]))); });
+    // Complex multiplication and division (C Annex G: infinities and NaNs recovered), double in
+    // d0-d3 -> d0:d1, float in s0-s3 -> s0:s1.
+    const auto complex_multiply = [](double a, double b, double c, double d) -> std::pair<double, double> {
+        const double ac = a * c, bd = b * d, ad = a * d, bc = b * c;
+        double x = ac - bd, y = ad + bc;
+        if (std::isnan(x) && std::isnan(y)) {
+            bool recalc = false;
+            const auto box = [](double& value, bool infinite) { value = std::copysign(infinite ? 1.0 : 0.0, value); };
+            if (std::isinf(a) || std::isinf(b)) {
+                box(a, std::isinf(a)); box(b, std::isinf(b));
+                if (std::isnan(c)) c = std::copysign(0.0, c);
+                if (std::isnan(d)) d = std::copysign(0.0, d);
+                recalc = true;
+            }
+            if (std::isinf(c) || std::isinf(d)) {
+                box(c, std::isinf(c)); box(d, std::isinf(d));
+                if (std::isnan(a)) a = std::copysign(0.0, a);
+                if (std::isnan(b)) b = std::copysign(0.0, b);
+                recalc = true;
+            }
+            if (!recalc && (std::isinf(ac) || std::isinf(bd) || std::isinf(ad) || std::isinf(bc))) {
+                if (std::isnan(a)) a = std::copysign(0.0, a);
+                if (std::isnan(b)) b = std::copysign(0.0, b);
+                if (std::isnan(c)) c = std::copysign(0.0, c);
+                if (std::isnan(d)) d = std::copysign(0.0, d);
+                recalc = true;
+            }
+            if (recalc) {
+                x = INFINITY * (a * c - b * d);
+                y = INFINITY * (a * d + b * c);
+            }
+        }
+        return {x, y};
+    };
+    const auto complex_divide = [](double a, double b, double c, double d) -> std::pair<double, double> {
+        int scale = 0;
+        const double logb = std::logb(std::fmax(std::fabs(c), std::fabs(d)));
+        if (std::isfinite(logb)) { scale = -static_cast<int>(logb); c = std::scalbn(c, scale); d = std::scalbn(d, scale); }
+        const double denominator = c * c + d * d;
+        double x = std::scalbn((a * c + b * d) / denominator, scale), y = std::scalbn((b * c - a * d) / denominator, scale);
+        if (std::isnan(x) && std::isnan(y)) {
+            if (denominator == 0.0 && (!std::isnan(a) || !std::isnan(b))) {
+                x = std::copysign(INFINITY, c) * a;
+                y = std::copysign(INFINITY, c) * b;
+            } else if ((std::isinf(a) || std::isinf(b)) && std::isfinite(c) && std::isfinite(d)) {
+                a = std::copysign(std::isinf(a) ? 1.0 : 0.0, a);
+                b = std::copysign(std::isinf(b) ? 1.0 : 0.0, b);
+                x = INFINITY * (a * c + b * d);
+                y = INFINITY * (b * c - a * d);
+            } else if (std::isinf(logb) && logb > 0 && std::isfinite(a) && std::isfinite(b)) {
+                c = std::copysign(std::isinf(c) ? 1.0 : 0.0, c);
+                d = std::copysign(std::isinf(d) ? 1.0 : 0.0, d);
+                x = 0.0 * (a * c + b * d);
+                y = 0.0 * (b * c - a * d);
+            }
+        }
+        return {x, y};
+    };
+    const auto d = [](const CpuState& s, unsigned index) { return std::bit_cast<double>(s.v[index][0]); };
+    const auto f = [](const CpuState& s, unsigned index) { return static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(s.v[index][0]))); };
+    ti("___muldc3", [complex_multiply, d](CpuState& s) {
+        const auto [x, y] = complex_multiply(d(s, 0), d(s, 1), d(s, 2), d(s, 3));
+        s.v[0] = {std::bit_cast<std::uint64_t>(x), 0}; s.v[1] = {std::bit_cast<std::uint64_t>(y), 0};
+    });
+    ti("___divdc3", [complex_divide, d](CpuState& s) {
+        const auto [x, y] = complex_divide(d(s, 0), d(s, 1), d(s, 2), d(s, 3));
+        s.v[0] = {std::bit_cast<std::uint64_t>(x), 0}; s.v[1] = {std::bit_cast<std::uint64_t>(y), 0};
+    });
+    ti("___mulsc3", [complex_multiply, f](CpuState& s) {
+        const auto [x, y] = complex_multiply(f(s, 0), f(s, 1), f(s, 2), f(s, 3));
+        s.v[0] = {std::bit_cast<std::uint32_t>(static_cast<float>(x)), 0}; s.v[1] = {std::bit_cast<std::uint32_t>(static_cast<float>(y)), 0};
+    });
+    ti("___divsc3", [complex_divide, f](CpuState& s) {
+        const auto [x, y] = complex_divide(f(s, 0), f(s, 1), f(s, 2), f(s, 3));
+        s.v[0] = {std::bit_cast<std::uint32_t>(static_cast<float>(x)), 0}; s.v[1] = {std::bit_cast<std::uint32_t>(static_cast<float>(y)), 0};
+    });
+    // int32_t __isOSVersionAtLeast(major, minor, subminor): against the macOS version Alchemy reports.
+    ti("___isOSVersionAtLeast", [](CpuState& s) {
+        const std::array<std::int32_t, 3> wanted{static_cast<std::int32_t>(s.x[0]), static_cast<std::int32_t>(s.x[1]), static_cast<std::int32_t>(s.x[2])};
+        std::array<std::int32_t, 3> have{};
+        std::size_t index = 0;
+        for (const auto c : macos_product_version) {
+            if (c == '.') { if (++index == have.size()) break; continue; }
+            have[index] = have[index] * 10 + (c - '0');
+        }
+        s.x[0] = have >= wanted ? 1 : 0;
+    });
+    // void __enable_execute_stack(void*): guest stacks need no change for trampolines here.
+    ti("___enable_execute_stack", [](CpuState&) {});
+
     // BSD random(3).
     auto generator = std::make_shared<Random>();
+    generator->current = process.allocate_guest(128);   // the process's own state array (degree 31)
+    process.main_engine().fill_bytes(generator->current, 0, 128);
+    generator->generators[generator->current] = Generator::of_size(128);
     p.libsystem("_random", [generator](CpuState&, GuestMemory&) -> std::uint64_t { return static_cast<std::uint64_t>(generator->next()); });
+    // char* initstate(unsigned seed, char* state, size_t size): a generator for the array,
+    // seeded and made current; the previous array, or NULL (EINVAL) under 8 bytes.
+    p.libsystem("_initstate", [generator](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[1] || s.x[2] < 8) throw Errno{einval};
+        auto fresh = Generator::of_size(s.x[2]);
+        fresh.seed(static_cast<std::uint32_t>(s.x[0]));
+        m.write32(s.x[1], fresh.type);
+        std::lock_guard lock(generator->mutex);
+        generator->generators[s.x[1]] = std::move(fresh);
+        return std::exchange(generator->current, s.x[1]);
+    }, 0);
+    // char* setstate(const char* state): back to an array initstate set up (its generator
+    // continues where it stopped); the previous array, or NULL (EINVAL) for another one.
+    p.libsystem("_setstate", [generator](CpuState& s, GuestMemory&) -> std::uint64_t {
+        std::lock_guard lock(generator->mutex);
+        if (!generator->generators.contains(s.x[0])) throw Errno{einval};
+        return std::exchange(generator->current, s.x[0]);
+    }, 0);
     p.libsystem("_srandom", [generator](CpuState& s, GuestMemory&) -> std::uint64_t { generator->seed(static_cast<std::uint32_t>(s.x[0])); return 0; });
     p.libsystem("_srandomdev", [generator](CpuState&, GuestMemory&) -> std::uint64_t {
         std::random_device device;

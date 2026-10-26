@@ -1,6 +1,8 @@
 #include "alchemy/darwin/kit/completion/runtime/common.hpp"
 
+#include <atomic>
 #include <map>
+#include <memory>
 
 // libSystem interfaces QLab's images import (cut from the CoreFoundation
 // extras, darwin/corefoundation/cf_file_descriptors.cpp, which still installs
@@ -11,6 +13,10 @@
 //                              over the guest's stat/lstat/opendir (below)
 //   warn, warnx, vwarn, vwarnx, err, errx, verr, verrx  "<progname>: message[: strerror(errno)]"
 //                              on standard error (err* then exit with the status)
+//   warnc, vwarnc, errc, verrc the same with an explicit error code
+//   err_set_file, err_set_exit where the messages go (a FILE*; NULL is standard
+//                              error) and a function err* call with the status
+//                              before exiting
 namespace alchemy::gui::completion_kit {
 namespace {
 
@@ -333,8 +339,14 @@ void install_fts_err(Support& support) {
     });
 
     // ---- warn / err ----
-    // "<progname>: <message>[: <strerror(errno)>]\n" on standard error.
-    const auto report = [&support](Address format, Address arguments, bool with_errno, std::uint32_t code) {
+    // "<progname>: <message>[: <strerror(errno)>]\n" on standard error (or err_set_file's stream).
+    struct ErrHooks {
+        std::atomic<Address> file{}, exit_callback{};
+    };
+    const auto hooks = std::make_shared<ErrHooks>();
+    support.function(libsystem, "_err_set_file", [hooks](CpuState& s, GuestMemory&) { hooks->file = s.x[0]; });
+    support.function(libsystem, "_err_set_exit", [hooks](CpuState& s, GuestMemory&) { hooks->exit_callback = s.x[0]; });
+    const auto report = [&support, hooks](Address format, Address arguments, bool with_errno, std::uint32_t code) {
         std::string line;
         if (const auto progname = support.process.resolve(libsystem, "___progname")) {
             const auto name = support.memory().read64(progname->address);
@@ -349,17 +361,20 @@ void install_fts_err(Support& support) {
         if (with_errno) line += c_string(support.memory(), support.call(libsystem, "_strerror", {code}), 1024);
         line += "\n";
         GuestBlock text(support, line);
-        static_cast<void>(support.call(libsystem, "_write", {2, text, line.size()}));
+        if (const auto file = hooks->file.load()) static_cast<void>(support.call(libsystem, "_fputs", {text, file}));
+        else static_cast<void>(support.call(libsystem, "_write", {2, text, line.size()}));
     };
     // warn(fmt, ...) / vwarn(fmt, va_list) / err(status, fmt, ...) / verr(status, fmt, va_list)
     support.function(libsystem, "_warn", [&support, report](CpuState& s, GuestMemory&) { report(s.x[0], s.sp, true, guest_errno(support)); });
     support.function(libsystem, "_warnx", [report](CpuState& s, GuestMemory&) { report(s.x[0], s.sp, false, 0); });
     support.function(libsystem, "_vwarn", [&support, report](CpuState& s, GuestMemory&) { report(s.x[0], s.x[1], true, guest_errno(support)); });
     support.function(libsystem, "_vwarnx", [report](CpuState& s, GuestMemory&) { report(s.x[0], s.x[1], false, 0); });
-    const auto leave = [&support](CpuState& s, Address status) {
-        // err/errx never return: continue into exit(status).
+    const auto leave = [&support, hooks](CpuState& s, Address status) {
+        // err/errx never return: err_set_exit's function, then continue into exit(status).
         const auto exit_function = support.process.resolve(libsystem, "_exit");
         if (!exit_function) fail("err: exit is not provided");
+        if (const auto callback = hooks->exit_callback.load())
+            static_cast<void>(call_address(support, callback, {static_cast<std::uint32_t>(status)}));
         s.x[0] = status;
         s.x[30] = exit_function->address;
     };
@@ -367,6 +382,12 @@ void install_fts_err(Support& support) {
     support.function(libsystem, "_errx", [report, leave](CpuState& s, GuestMemory&) { report(s.x[1], s.sp, false, 0); leave(s, s.x[0]); });
     support.function(libsystem, "_verr", [&support, report, leave](CpuState& s, GuestMemory&) { report(s.x[1], s.x[2], true, guest_errno(support)); leave(s, s.x[0]); });
     support.function(libsystem, "_verrx", [report, leave](CpuState& s, GuestMemory&) { report(s.x[1], s.x[2], false, 0); leave(s, s.x[0]); });
+    // errc(status, code, fmt, ...) / verrc(status, code, fmt, va_list) / warnc(code, fmt, ...) / vwarnc(code, fmt, va_list)
+    const auto code = [](Address value) { return static_cast<std::uint32_t>(value); };
+    support.function(libsystem, "_errc", [report, leave, code](CpuState& s, GuestMemory&) { report(s.x[2], s.sp, true, code(s.x[1])); leave(s, s.x[0]); });
+    support.function(libsystem, "_verrc", [report, leave, code](CpuState& s, GuestMemory&) { report(s.x[2], s.x[3], true, code(s.x[1])); leave(s, s.x[0]); });
+    support.function(libsystem, "_warnc", [report, code](CpuState& s, GuestMemory&) { report(s.x[1], s.sp, true, code(s.x[0])); });
+    support.function(libsystem, "_vwarnc", [report, code](CpuState& s, GuestMemory&) { report(s.x[1], s.x[2], true, code(s.x[0])); });
 }
 
 } // namespace alchemy::gui::completion_kit

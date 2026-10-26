@@ -48,4 +48,6 @@ void install_ncurses(Provider& p);              // terminal/curses.cpp: curses o
 void install_libpanel(Provider& p);             // terminal/panel.cpp: libpanel over the curses windows
 void install_libsystem_xpc(Provider& p, ObjcRuntime& objc);   // misc/xpc_objects.cpp: XPC objects and connections
 void install_libsystem_threads_extra(Provider& p);   // process/threads_extra.cpp: QoS, stack attributes, ceilings
+void install_libsystem_bsd_extra(Provider& p);       // misc/bsd_extra.cpp: BSD libc leftovers (string, stdlib, pwcache, ...)
+void install_libsystem_netdb_extra(Provider& p);     // net/netdb_extra.cpp: netdb leftovers and the /etc databases
 } // namespace alchemy::export_fill

@@ -30,8 +30,7 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   stdlib (putenv, strtonum, reallocarray, getsubopt, heapsort/mergesort/radixsort,
   quick_exit, a64l/l64a, mkostemp(s), mkdtemps), time (timelocal,
   timespec_get; setting the clock is EPERM), ctype extensions, the BSD and
-  System V signal calls over sigaction/sigprocmask (not sigpause, which needs
-  sigsuspend), dprintf, the `_unlocked` stdio forms, dirname_r/basename_r,
+  System V signal calls over sigaction/sigprocmask, dprintf, the `_unlocked` stdio forms, dirname_r/basename_r,
   mkpath_np, ftw/nftw and ether_ntoa/aton.
 * **Thread and Mach extras** (GUI, `process/threads_extra.cpp`,
   `mach/machsys.cpp`): QoS queries, stack attributes (caller-provided stacks
@@ -77,6 +76,20 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
 * **More fill-only pieces** (alchemy-fx, `install_libsystem_gaps`): `misc/stdlib_extra.cpp` (the
   rand48 generators), `misc/ndbm.cpp` (ndbm(3) over an append-only record file `<name>.db`, in
   Alchemy's own format, through the guest's open/read/write) and `net/rpc_nis.cpp`.
+* **BSD leftovers** (alchemy-fx, `install_libsystem_gaps`): `misc/bsd_extra.cpp` (memrchr,
+  strchrnul, explicit_bzero, wcstoimax/wcstoumax, wctrans/towctrans, psort, sranddev, devname_r,
+  getbsize, rpmatch, timeoff, strptime_l, getpass/readpassphrase, the pwcache lookups
+  user_from_uid and friends, backtrace_symbols_fd, get/setiopolicy_np (kept, no host hint),
+  pthread_is_threaded_np, the `__stpcpy_chk` family, fmtcheck and the out-of-line ctype helpers)
+  and `net/netdb_extra.cpp` (gethostbyname2 and getipnodeby* over getaddrinfo, herror,
+  inet_net_ntop, the /etc/hosts, services, protocols, networks and ethers databases read from
+  the guest file system). random's initstate/setstate keep one generator per state array
+  (`misc/libsystem_runtime.cpp`, with the compiler-rt 128-bit, overflow, half-precision and
+  complex builtins); Blocks introspection is `misc/libsystem_extra.cpp`'s. sigsuspend, sigpause
+  and pause (`process/process_model.cpp`) wait until a handler has run for a signal raised in
+  this process; ualarm stops, as alarm does (no asynchronous SIGALRM). getopt_long_only is
+  `misc/leftovers.cpp`'s; err_set_file/err_set_exit and the whole err/warn family are
+  `misc/fts_err.cpp`'s.
 * **Unavailable services, answered with their own error codes:** NIS (`yp_get_default_domain`
   YPERR_NODOM, the map calls YPERR_YPBIND) and Sun RPC (`clnt_create` fails with
   RPC_PMAPFAILURE; the XDR codecs stop explicitly, since no client handle can exist). `crypt`,
@@ -85,7 +98,7 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   `proc_pidfdinfo` describes this process's vnode descriptors only. Another thread's registers
   (`thread_get_state`, `thread_set_state`, `thread_abort(_safely)`) are not reachable.
 * **Unsupported** (each fails explicitly): guest signal delivery to other
-  processes, real credentials (a virtual user 1000, or root with
+  processes and asynchronous signals (SIGALRM, SIGCHLD), real credentials (a virtual user 1000, or root with
   ALCHEMY_SUPERUSER=1), SysV shared memory, launchd services, sandboxing,
   terminfo.
 * **Tests:** `tests/`, `mach/tests/`, `vm/tests/`. The headless

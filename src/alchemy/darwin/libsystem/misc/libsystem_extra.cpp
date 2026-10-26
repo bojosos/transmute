@@ -585,6 +585,48 @@ void install_blocks(const std::shared_ptr<State>& state) {
     }
     install(state, "__Block_copy", [state](auto& s, auto& m) { return state->block_copy(m, s.x[0]); }, 0);
     install(state, "__Block_release", [state](auto& s, auto& m) { state->block_release(m, s.x[0]); return std::uint64_t{0}; });
+    // Block introspection. The descriptor is {reserved, size}, then copy/dispose with
+    // BLOCK_HAS_COPY_DISPOSE (1 << 25), then the signature and the layout with BLOCK_HAS_SIGNATURE
+    // (1 << 30); the layout is an extended layout with BLOCK_HAS_EXTENDED_LAYOUT (1 << 31).
+    static constexpr std::uint32_t has_signature = 1U << 30, extended_layout = 1U << 31;
+    const auto signature_slot = [](transmute::GuestMemory& m, std::uint64_t block) -> std::optional<std::uint64_t> {
+        if (!block || !accessible(m, block, 32, false)) return std::nullopt;
+        const auto flags = m.read32(block + 8);
+        if (!(flags & has_signature)) return std::nullopt;
+        return m.read64(block + 24) + 16 + ((flags & State::has_copy_dispose) ? 16 : 0);
+    };
+    install(state, "__Block_has_signature", [](auto& s, auto& m) -> std::uint64_t {
+        return s.x[0] && accessible(m, s.x[0], 32, false) && (m.read32(s.x[0] + 8) & has_signature) ? 1 : 0;
+    }, 0);
+    install(state, "__Block_signature", [signature_slot](auto& s, auto& m) -> std::uint64_t {
+        const auto slot = signature_slot(m, s.x[0]);
+        return slot ? m.read64(*slot) : 0;
+    }, 0);
+    // _Block_layout: the old (non-extended) layout; _Block_extended_layout: the extended one.
+    for (const bool extended : {false, true})
+        install(state, extended ? "__Block_extended_layout" : "__Block_layout", [signature_slot, extended](auto& s, auto& m) -> std::uint64_t {
+            const auto slot = signature_slot(m, s.x[0]);
+            if (!slot || ((m.read32(s.x[0] + 8) & extended_layout) != 0) != extended) return 0;
+            return m.read64(*slot + 8);
+        }, 0);
+    for (const auto* name : {"__Block_size", "_Block_size"})
+        install(state, name, [](auto& s, auto& m) -> std::uint64_t {
+            if (!s.x[0] || !accessible(m, s.x[0], 32, false)) throw std::runtime_error("Block_size received an invalid block");
+            return m.read64(m.read64(s.x[0] + 24) + 8);
+        }, 0);
+    // bool _Block_tryRetain(block): a heap block that is not being deallocated gains a reference.
+    install(state, "__Block_tryRetain", [state](auto& s, auto& m) -> std::uint64_t {
+        if (!s.x[0]) return 0;
+        std::lock_guard lock(state->block_mutex);
+        const auto flags = m.read32(s.x[0] + 8);
+        if ((flags & State::is_global) || !(flags & State::needs_free)) return 1;
+        if (flags & State::deallocating) return 0;
+        m.write32(s.x[0] + 8, State::increment(flags));
+        return 1;
+    }, 0);
+    // _Block_use_RR2(callbacks): object references in blocks already go through objc_retain and
+    // objc_release (retain_object/release_object), so the runtime's callbacks are not needed.
+    install(state, "__Block_use_RR2", [](auto&, auto&) -> std::uint64_t { return 0; });
     install(state, "__Block_object_assign", [state](auto& s, auto& m) {
         const auto destination = s.x[0], object = s.x[1];
         if (!accessible(m, destination, 8, true)) throw std::runtime_error("_Block_object_assign received an invalid destination");

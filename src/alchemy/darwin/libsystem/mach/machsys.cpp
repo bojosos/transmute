@@ -77,6 +77,7 @@ public:
     std::map<std::int64_t, std::uint64_t> guards;       // fd -> guard id
     std::map<Address, std::pair<Address, Address>> lines; // FILE* -> (buffer slot, capacity slot) for fgetln
     std::map<Address, std::uint32_t> mutex_protocols;   // pthread_mutexattr_t* -> PTHREAD_PRIO_*
+    std::map<Address, std::uint32_t> mutex_policies;    // pthread_mutexattr_t* -> PTHREAD_MUTEX_POLICY_*_NP
     std::mutex atomic_mutex;
 
     std::uint32_t task_self() {
@@ -743,9 +744,21 @@ void Machsys::install_libc() {
     });
     // pthread_mutexattr_setpolicy_np: both policies are scheduling hints;
     // Alchemy mutexes wake waiters in arrival order under either.
-    raw(libsystem, "_pthread_mutexattr_setpolicy_np", [](CpuState& s, GuestMemory&) {
+    // The policy is stored on the attribute (pthread_mutexattr_getpolicy_np
+    // reads it back; first-fit, 3, is the default).
+    raw(libsystem, "_pthread_mutexattr_setpolicy_np", [this](CpuState& s, GuestMemory&) {
         const auto policy = static_cast<std::uint32_t>(s.x[1]);
-        s.x[0] = s.x[0] && (policy == 1 || policy == 3) ? 0 : e_inval;
+        if (!s.x[0] || (policy != 1 && policy != 3)) { s.x[0] = e_inval; return; }
+        std::lock_guard lock(mutex);
+        mutex_policies[s.x[0]] = policy;
+        s.x[0] = 0;
+    });
+    raw(libsystem, "_pthread_mutexattr_getpolicy_np", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[0] || !s.x[1]) { s.x[0] = e_inval; return; }
+        std::lock_guard lock(mutex);
+        const auto found = mutex_policies.find(s.x[0]);
+        m.write32(s.x[1], found == mutex_policies.end() ? 3 : found->second);
+        s.x[0] = 0;
     });
     // PTHREAD_PRIO_NONE (0), _INHERIT (1) and _PROTECT (2) are stored on the
     // attribute (pthread_mutexattr_getprotocol reads them back). Alchemy

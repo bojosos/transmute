@@ -313,6 +313,242 @@ void test_guest_misc(Fixture& f) {
     }
 }
 
+// compiler-rt builtins (misc/libsystem_runtime.cpp): 128-bit operands in x0:x1 / x2:x3,
+// floating-point ones in v registers.
+void test_compiler_rt(Fixture& f) {
+    const auto call = [&f](std::string_view name, std::initializer_list<Address> x, std::initializer_list<alchemy::VectorRegister> v = {}) {
+        alchemy::CallRegs registers;
+        std::size_t index = 0;
+        for (const auto value : x) registers.x[index++] = value;
+        index = 0;
+        for (const auto value : v) registers.v[index++] = value;
+        return alchemy::engine_call_regs(f.engine, f.symbol("/usr/lib/libSystem.B.dylib", name), registers);
+    };
+    const auto pair = [](const alchemy::CallResult& r, Address low, Address high) { return r.x0 == low && r.x1 == high; };
+    require(pair(call("___multi3", {3, 1, 5, 0}), 15, 5), "__multi3");
+    require(pair(call("___multi3", {~0ULL, 0, ~0ULL, 0}), 1, 0xfffffffffffffffeULL), "__multi3 carries into the high word");
+    const auto remainder = f.process.allocate_guest(16);
+    require(pair(call("___udivmodti4", {1, 1, 2, 0, remainder}), 0x8000000000000000ULL, 0) && f.engine.read64(remainder) == 1 &&
+            f.engine.read64(remainder + 8) == 0, "__udivmodti4 quotient and remainder");
+    require(pair(call("___ashlti3", {1, 0, 64}), 0, 1), "__ashlti3");
+    require(pair(call("___ashrti3", {0, 0x8000000000000000ULL, 127}), ~0ULL, ~0ULL), "__ashrti3 keeps the sign");
+    require(pair(call("___lshrti3", {0, 0x8000000000000000ULL, 127}), 1, 0), "__lshrti3");
+    require(pair(call("___negti2", {1, 0}), ~0ULL, ~0ULL), "__negti2");
+    require(f.sys("___clzti2", {0, 1}) == 63 && f.sys("___ctzti2", {0, 1}) == 64 && f.sys("___popcountti2", {~0ULL, 1}) == 65,
+            "128-bit bit counts");
+    require(f.sys("___ffsti2", {0, 0}) == 0 && f.sys("___ffsti2", {0, 2}) == 66, "__ffsti2");
+    require(f.sys("___cmpti2", {~0ULL, ~0ULL, 1, 0}) == 0 && f.sys("___ucmpti2", {~0ULL, ~0ULL, 1, 0}) == 2 &&
+            f.sys("___cmpti2", {5, 0, 5, 0}) == 1, "__cmpti2 / __ucmpti2");
+    const auto overflow = f.process.allocate_guest(4);
+    f.sys("___mulodi4", {1ULL << 62, 4, overflow});
+    require(f.engine.read32(overflow) == 1, "__mulodi4 reports overflow");
+    require(f.sys("___mulodi4", {static_cast<Address>(-3), 7, overflow}) == static_cast<Address>(-21) && f.engine.read32(overflow) == 0,
+            "__mulodi4 without overflow");
+    require(pair(call("___muloti4", {1ULL << 63, 0, 2, 0, overflow}), 0, 1) && f.engine.read32(overflow) == 0, "__muloti4 2^64");
+    call("___muloti4", {0, 1ULL << 62, 4, 0, overflow});
+    require(f.engine.read32(overflow) == 1, "__muloti4 reports overflow");
+    require(f.sys("___divdi3", {static_cast<Address>(-7), 2}) == static_cast<Address>(-3) && f.sys("___udivdi3", {7, 2}) == 3, "__divdi3 / __udivdi3");
+    require(f.sys("___bswapsi2", {0x11223344}) == 0x44332211 && f.sys("___bswapdi2", {0x0102030405060708ULL}) == 0x0807060504030201ULL,
+            "byte swaps");
+    require(f.sys("___paritysi2", {7}) == 1 && f.sys("___paritysi2", {3}) == 0, "__paritysi2");
+    const auto real = [](double value) { return alchemy::VectorRegister{std::bit_cast<std::uint64_t>(value), 0}; };
+    const auto single = [](float value) { return alchemy::VectorRegister{std::bit_cast<std::uint32_t>(value), 0}; };
+    require(pair(call("___fixdfti", {}, {real(-2.5)}), 0xfffffffffffffffeULL, ~0ULL), "__fixdfti truncates");
+    require(pair(call("___fixunsdfti", {}, {real(std::ldexp(1.0, 70))}), 0, 64), "__fixunsdfti 2^70");
+    require(call("___floattisf", {0, 1}).s(0) == 18446744073709551616.0f, "__floattisf 2^64");
+    require(call("___extendhfsf2", {}, {{0x3c00, 0}}).s(0) == 1.0f && call("___gnu_h2f_ieee", {0xc000}).s(0) == -2.0f, "half to float");
+    require(call("___truncsfhf2", {}, {single(1.0f / 3.0f)}).v[0][0] == 0x3555 && call("___truncdfhf2", {}, {real(0.5)}).v[0][0] == 0x3800 &&
+            call("___gnu_f2h_ieee", {}, {single(-2.0f)}).x0 == 0xc000, "float to half");
+    const auto product = call("___muldc3", {}, {real(1), real(2), real(3), real(4)});
+    require(product.d(0) == -5.0 && product.d(1) == 10.0, "__muldc3");
+    const auto quotient = call("___divdc3", {}, {real(-5), real(10), real(3), real(4)});
+    require(std::fabs(quotient.d(0) - 1.0) < 1e-12 && std::fabs(quotient.d(1) - 2.0) < 1e-12, "__divdc3");
+    require(f.sys("___isOSVersionAtLeast", {11, 0, 0}) == 1 && f.sys("___isOSVersionAtLeast", {999, 0, 0}) == 0, "__isOSVersionAtLeast");
+}
+
+// Blocks introspection (misc/libsystem_extra.cpp).
+void test_blocks(Fixture& f) {
+    constexpr std::uint32_t has_signature = 1U << 30, extended = 1U << 31, is_global = 1U << 28;
+    const auto signature = f.text("v8@?0");
+    const auto descriptor = f.process.allocate_guest(32), block = f.process.allocate_guest(32);
+    f.engine.write64(descriptor, 0); f.engine.write64(descriptor + 8, 32);
+    f.engine.write64(descriptor + 16, signature); f.engine.write64(descriptor + 24, 0x1234);
+    f.engine.write64(block, 0); f.engine.write32(block + 8, has_signature); f.engine.write32(block + 12, 0);
+    f.engine.write64(block + 16, 0); f.engine.write64(block + 24, descriptor);
+    require(f.sys("__Block_has_signature", {block}) == 1 && f.sys("__Block_signature", {block}) == signature, "_Block_signature");
+    require(f.sys("__Block_size", {block}) == 32 && f.sys("_Block_size", {block}) == 32, "_Block_size");
+    require(f.sys("__Block_layout", {block}) == 0x1234 && f.sys("__Block_extended_layout", {block}) == 0, "the old layout");
+    f.engine.write32(block + 8, has_signature | extended);
+    require(f.sys("__Block_layout", {block}) == 0 && f.sys("__Block_extended_layout", {block}) == 0x1234, "the extended layout");
+    f.engine.write32(block + 8, 0);
+    require(f.sys("__Block_has_signature", {block}) == 0 && f.sys("__Block_signature", {block}) == 0, "no signature");
+    const auto copy = f.sys("__Block_copy", {block});
+    const auto references = f.engine.read32(copy + 8) & 0xfffe;
+    require(copy && copy != block && f.sys("__Block_tryRetain", {copy}) == 1 && (f.engine.read32(copy + 8) & 0xfffe) == references + 2,
+            "_Block_tryRetain adds a reference to a heap block");
+    f.sys("__Block_release", {copy});
+    f.sys("__Block_release", {copy});
+    f.engine.write32(block + 8, is_global);
+    require(f.sys("__Block_tryRetain", {block}) == 1 && f.engine.read32(block + 8) == is_global, "global blocks are not counted");
+    f.sys("__Block_use_RR2", {0});
+}
+
+// random(3) with initstate/setstate (misc/libsystem_runtime.cpp).
+void test_random_states(Fixture& f) {
+    f.sys("_srandom", {1});
+    require(f.sys("_random") == 1804289383, "srandom(1) gives the BSD/glibc sequence");
+    const auto big = f.process.allocate_guest(256), other = f.process.allocate_guest(256), tiny = f.process.allocate_guest(16);
+    const auto own = f.sys("_initstate", {9, big, 256});
+    require(own != 0, "initstate returns the previous array");
+    const auto first = f.sys("_random"), second = f.sys("_random");
+    require(f.sys("_initstate", {9, other, 256}) == big && f.sys("_random") == first && f.sys("_random") == second,
+            "the same seed and size repeat the sequence");
+    require(f.sys("_setstate", {big}) == other && f.sys("_random") != 0, "setstate switches back");
+    require(f.sys("_initstate", {5, tiny, 16}) == big && f.sys("_random") == 84035, "a 16-byte array is the Park-Miller generator");
+    require(f.sys("_setstate", {own}) == tiny, "back to the process's own array");
+    require(f.sys("_initstate", {1, tiny, 4}) == 0 && f.sys("_setstate", {f.process.allocate_guest(8)}) == 0, "bad arrays fail (EINVAL)");
+}
+
+// sigsuspend waits for a handler to run (process/process_model.cpp).
+void test_sigsuspend(Fixture& f) {
+    static std::atomic<int> handled{0};
+    static std::atomic<bool> woke{false};
+    static Fixture* fixture = &f;
+    const auto handler = f.process.install_function("_bsd_test_usr1", [](transmute::CpuState& s, transmute::GuestMemory&) { ++handled; s.x[0] = 0; });
+    const auto raiser = f.process.install_function("_bsd_test_raiser", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        const auto raise = fixture->symbol("/usr/lib/libSystem.B.dylib", "_raise");
+        const std::array<Address, 1> arguments{30};
+        for (int round = 0; round < 200 && !woke; ++round) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            static_cast<void>(alchemy::EngineAdapter(fixture->process.calling_engine()).call(raise, arguments));
+        }
+        s.x[0] = 0;
+    });
+    f.sys("_signal", {30, handler});
+    const auto thread = f.process.allocate_guest(8), mask = f.process.allocate_guest(4);
+    f.engine.write32(mask, 0);
+    require(f.sys("_pthread_create", {thread, 0, raiser, 0}) == 0, "pthread_create");
+    require(f.sys("_sigsuspend", {mask}) == UINT64_MAX && f.engine.read32(f.sys("___error")) == 4 && handled > 0,
+            "sigsuspend returns EINTR after the handler ran");
+    woke = true;
+    require(f.sys("_pthread_join", {f.engine.read64(thread), 0}) == 0, "pthread_join");
+    require(f.sys("_pthread_is_threaded_np") == 1, "the process has had a second thread");
+    f.sys("_signal", {30, 0});
+}
+
+// misc/bsd_extra.cpp.
+void test_bsd_extra(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto text = f.text("abcabc");
+    require(f.sys("_memrchr", {text, 'b', 6}) == text + 4 && f.sys("_memrchr", {text, 'z', 6}) == 0 && f.sys("_memrchr", {text, 'a', 0}) == 0, "memrchr");
+    require(f.sys("_strchrnul", {text, 'c'}) == text + 2 && f.sys("_strchrnul", {text, 'z'}) == text + 6, "strchrnul");
+    f.sys("_explicit_bzero", {text, 3});
+    require(f.byte(text) == 0 && f.byte(text + 2) == 0 && f.byte(text + 3) == 'a', "explicit_bzero");
+    const auto wide = f.process.allocate_guest(16);
+    for (const auto& [index, c] : std::array<std::pair<int, char32_t>, 4>{{{0, U'-'}, {1, U'4'}, {2, U'2'}, {3, 0}}})
+        f.engine.write32(wide + static_cast<Address>(index) * 4, static_cast<std::uint32_t>(c));
+    require(f.sys("_wcstoimax", {wide, 0, 10}) == static_cast<Address>(-42), "wcstoimax");
+    require(f.sys("_wctrans", {f.text("toupper")}) == 2 && f.sys("_towctrans", {'a', 2}) == 'A' && f.sys("_towctrans", {'Q', 1}) == 'q',
+            "wctrans / towctrans");
+    require(f.sys("_wctrans", {f.text("bogus")}) == 0 && errno_value() == 22, "an unknown mapping is EINVAL");
+    // psort: qsort's order.
+    const auto compare = f.process.install_function("_bsd_test_compare", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto a = static_cast<std::int32_t>(m.read32(s.x[0])), b = static_cast<std::int32_t>(m.read32(s.x[1]));
+        s.x[0] = static_cast<Address>(static_cast<std::int64_t>((a > b) - (a < b)));
+    });
+    const auto values = f.process.allocate_guest(20);
+    const std::array<std::int32_t, 5> unsorted{5, -1, 3, 3, 0};
+    for (std::size_t index = 0; index < unsorted.size(); ++index) f.engine.write32(values + index * 4, static_cast<std::uint32_t>(unsorted[index]));
+    f.sys("_psort", {values, 5, 4, compare});
+    for (std::size_t index = 0; index < 5; ++index)
+        require(static_cast<std::int32_t>(f.engine.read32(values + index * 4)) == std::array<std::int32_t, 5>{-1, 0, 3, 3, 5}[index], "psort");
+    f.sys("_sranddev");
+    f.sys("_arc4random_stir");
+    require(f.sys("_rpmatch", {f.text("yes")}) == 1 && f.sys("_rpmatch", {f.text("No")}) == 0 &&
+            f.sys("_rpmatch", {f.text("?")}) == static_cast<Address>(-1), "rpmatch");
+    // getbsize: 512 without BLOCKSIZE; "1k" is 1024 bytes, "1K-blocks".
+    const auto header_length = f.process.allocate_guest(4), block_size = f.process.allocate_guest(8);
+    f.sys("_unsetenv", {f.text("BLOCKSIZE")});
+    require(f.read(f.sys("_getbsize", {header_length, block_size})) == "512-blocks" && f.engine.read32(header_length) == 10 &&
+            f.engine.read64(block_size) == 512, "getbsize default");
+    f.sys("_setenv", {f.text("BLOCKSIZE"), f.text("1k"), 1});
+    require(f.read(f.sys("_getbsize", {header_length, block_size})) == "1K-blocks" && f.engine.read64(block_size) == 1024, "getbsize 1k");
+    f.sys("_unsetenv", {f.text("BLOCKSIZE")});
+    // timeoff: 1970-01-01 01:00:00 one hour east of UTC is the epoch.
+    const auto tm = f.process.allocate_guest(56);
+    f.engine.fill_bytes(tm, 0, 56);
+    f.engine.write32(tm + 8, 1); f.engine.write32(tm + 12, 1); f.engine.write32(tm + 20, 70);
+    require(f.sys("_timeoff", {tm, 3600}) == 0, "timeoff");
+    // pwcache.
+    require(f.read(f.sys("_user_from_uid", {424242, 0})) == "424242" && f.sys("_user_from_uid", {424242, 1}) == 0, "user_from_uid of an unknown id");
+    const auto id = f.process.allocate_guest(4);
+    require(f.sys("_uid_from_user", {f.text("no-such-user"), id}) == static_cast<Address>(-1), "uid_from_user of an unknown name");
+    // I/O policies.
+    require(f.sys("_getiopolicy_np", {0, 0}) == 0 && f.sys("_setiopolicy_np", {0, 0, 3}) == 0 && f.sys("_getiopolicy_np", {0, 0}) == 3,
+            "process I/O policy");
+    require(f.sys("_setiopolicy_np", {0, 1, 2}) == 0 && f.sys("_getiopolicy_np", {0, 1}) == 2 && f.sys("_getiopolicy_np", {0, 0}) == 3,
+            "thread I/O policy");
+    require(f.sys("_setiopolicy_np", {1, 0, 0}) == static_cast<Address>(-1) && errno_value() == 22, "an unknown type is EINVAL");
+    // Fortified copies.
+    const auto target = f.process.allocate_guest(8);
+    f.engine.fill_bytes(target, 0x55, 8);
+    require(f.sys("___stpcpy_chk", {target, f.text("abc"), 8}) == target + 3 && f.read(target) == "abc", "__stpcpy_chk");
+    f.engine.fill_bytes(target, 0x55, 8);
+    require(f.sys("___stpncpy_chk", {target, f.text("ab"), 5, 8}) == target + 2 && f.byte(target + 4) == 0 && f.byte(target + 5) == 0x55,
+            "__stpncpy_chk pads to n");
+    require(f.sys("___memccpy_chk", {target, f.text("hello"), 'l', 5, 8}) == target + 3, "__memccpy_chk stops after c");
+    // fmtcheck.
+    const auto suspect = f.text("%d items of %s"), fallback = f.text("%i things of %s, %f");
+    require(f.sys("_fmtcheck", {suspect, fallback}) == suspect, "fmtcheck accepts a compatible prefix");
+    const auto wrong = f.text("%s items");
+    const auto star = f.text("%*d"), plain = f.text("%d");
+    require(f.sys("_fmtcheck", {wrong, fallback}) == fallback && f.sys("_fmtcheck", {star, plain}) == plain, "fmtcheck rejects");
+    const auto longs = f.text("%lx");
+    require(f.sys("_fmtcheck", {longs, f.text("%ld")}) == longs, "fmtcheck: %lx matches %ld");
+    // ctype helpers.
+    require(f.sys("___istype", {'a', 0x100}) == 1 && f.sys("___istype", {'1', 0x100}) == 0 && f.sys("___isctype", {300, 0x100}) == 0 &&
+            f.sys("___tolower_l", {'A', 0}) == 'a' && f.sys("___toupper_l", {'z', 0}) == 'Z', "ctype helpers");
+    require(f.engine.read64(f.symbol("/usr/lib/libSystem.B.dylib", "__CurrentRuneLocale")) ==
+            f.symbol("/usr/lib/libSystem.B.dylib", "__DefaultRuneLocale"), "_CurrentRuneLocale is the C locale");
+}
+
+// net/netdb_extra.cpp.
+void test_netdb_extra(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto address = f.process.allocate_guest(16), out = f.process.allocate_guest(64);
+    f.engine.write_bytes(address, std::vector<std::uint8_t>{10, 1, 0x1f, 0});
+    const auto net = [&](Address family, Address bits, Address size = 64) { return f.sys("_inet_net_ntop", {family, address, bits, out, size}); };
+    require(net(2, 16) == out && f.read(out) == "10.1/16", "inet_net_ntop /16");
+    require(net(2, 20) == out && f.read(out) == "10.1.16/20", "inet_net_ntop /20 masks the partial octet");
+    require(net(2, 0) == out && f.read(out) == "0/0", "inet_net_ntop /0");
+    require(net(2, 33) == 0 && errno_value() == 22, "inet_net_ntop bits past 32");
+    require(net(2, 16, 4) == 0 && errno_value() == 40, "inet_net_ntop with a short buffer");
+    f.engine.write_bytes(address, std::vector<std::uint8_t>{0x20, 0x01, 0x0d, 0xb8, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
+    require(net(30, 32) == out && f.read(out) == "2001:db8::/32", "inet_net_ntop AF_INET6");
+    const auto ether = f.process.allocate_guest(8), host = f.process.allocate_guest(256);
+    require(f.sys("_ether_line", {f.text("00:1a:2B:3c:4d:5e  host-a # comment"), ether, host}) == 0 && f.read(host) == "host-a" &&
+            f.byte(ether + 1) == 0x1a && f.byte(ether + 2) == 0x2b && f.byte(ether + 5) == 0x5e, "ether_line");
+    require(f.sys("_ether_line", {f.text("zz:00 host"), ether, host}) == static_cast<Address>(-1), "ether_line rejects a bad address");
+    const auto v4 = f.sys("_gethostbyname2", {f.text("127.0.0.1"), 2});
+    require(v4 && f.engine.read32(v4 + 16) == 2 && f.engine.read32(v4 + 20) == 4 &&
+            f.engine.read32(f.engine.read64(f.engine.read64(v4 + 24))) == 0x0100007fU, "gethostbyname2 AF_INET");
+    const auto v6 = f.sys("_gethostbyname2", {f.text("::1"), 30});
+    require(v6 && f.engine.read32(v6 + 16) == 30 && f.engine.read32(v6 + 20) == 16 &&
+            f.byte(f.engine.read64(f.engine.read64(v6 + 24)) + 15) == 1, "gethostbyname2 AF_INET6");
+    require(f.sys("_gethostbyname2", {f.text("127.0.0.1"), 99}) == 0, "gethostbyname2 with another family");
+    const auto error = f.process.allocate_guest(4);
+    const auto mapped = f.sys("_getipnodebyname", {f.text("127.0.0.1"), 30, 0x800, error});
+    require(mapped && f.engine.read32(error) == 0 && f.engine.read32(mapped + 16) == 30 && f.engine.read32(mapped + 20) == 16, "getipnodebyname AI_V4MAPPED");
+    const auto bytes = f.engine.read64(f.engine.read64(mapped + 24));
+    require(f.byte(bytes + 10) == 0xff && f.byte(bytes + 11) == 0xff && f.byte(bytes + 12) == 127 && f.byte(bytes + 15) == 1, "::ffff:127.0.0.1");
+    f.sys("_freehostent", {mapped});
+    // The /etc databases: whatever the guest file system has (none here is fine).
+    f.sys("_setservent", {0});
+    for (int index = 0; index < 4 && f.sys("_getservent"); ++index) {}
+    f.sys("_endservent");
+    require(f.sys("_getnetbyname", {f.text("no-such-network")}) == 0, "getnetbyname of an unknown name");
+}
+
 void test_os_extras(Fixture& f) {
     // os_sync: a wait on a value that differs returns at once; a timeout expires; wakes without waiters are ENOENT.
     const auto word = f.process.allocate_guest(8);
@@ -453,6 +689,16 @@ void test_threads_extra(Fixture& f) {
             f.sys("_pthread_rwlockattr_getpshared", {rwattr, out}) == 0 && f.engine.read32(out) == 2, "rwlock attributes: process-private");
     require(f.sys("_pthread_rwlock_init", {rwlock, rwattr}) == 0 && f.sys("_pthread_rwlock_destroy", {rwlock}) == 0 &&
             f.sys("_pthread_rwlockattr_destroy", {rwattr}) == 0, "pthread_rwlock_init with attributes");
+    // QoS classes and guard sizes are kept on the attribute.
+    const auto qos = f.process.allocate_guest(8);
+    require(f.sys("_pthread_attr_get_qos_class_np", {attr, qos, qos + 4}) == 0 && f.engine.read32(qos) == 0 && f.engine.read32(qos + 4) == 0,
+            "no QoS class until one is set");
+    require(f.sys("_pthread_attr_set_qos_class_np", {attr, 0x19, static_cast<Address>(-3)}) == 0 &&
+            f.sys("_pthread_attr_get_qos_class_np", {attr, qos, qos + 4}) == 0 && f.engine.read32(qos) == 0x19 &&
+            static_cast<std::int32_t>(f.engine.read32(qos + 4)) == -3, "QoS class round trip");
+    require(f.sys("_pthread_attr_getguardsize", {attr, out}) == 0 && f.engine.read64(out) == 16384, "one guard page by default");
+    require(f.sys("_pthread_attr_setguardsize", {attr, 20000}) == 0 && f.sys("_pthread_attr_getguardsize", {attr, out}) == 0 &&
+            f.engine.read64(out) == 32768, "guard sizes round up to whole pages");
 }
 
 void test_app_imports(Fixture& f) {
@@ -626,6 +872,12 @@ int main() {
         stage("app imports"); test_app_imports(f);
         stage("threads extra"); test_threads_extra(f);
         stage("os extras"); test_os_extras(f);
+        stage("compiler-rt"); test_compiler_rt(f);
+        stage("blocks"); test_blocks(f);
+        stage("random states"); test_random_states(f);
+        stage("sigsuspend"); test_sigsuspend(f);
+        stage("bsd extra"); test_bsd_extra(f);
+        stage("netdb extra"); test_netdb_extra(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;
