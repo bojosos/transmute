@@ -1881,6 +1881,81 @@ void av_video(Fixture& f) {
     std::filesystem::remove_all(directory, ignored);
 }
 
+// AVPlayer: libvpx's VP9 WebM vector loads (status ready, size), shows its pictures on an
+// AVPlayerLayer and through an AVPlayerItemVideoOutput, plays to its end and pauses there, and
+// seeks; an MP3 item's audio reaches the output device.
+void av_player(Fixture& f) {
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_av_player";
+    std::filesystem::create_directories(directory);
+    const std::string third_party = ALCHEMY_THIRD_PARTY;
+    const auto webm = directory / "size-08x08.webm";
+    std::filesystem::copy_file(third_party + "/libvpx/test-vectors/vp90-2-02-size-08x08.webm", webm, std::filesystem::copy_options::overwrite_existing);
+    const auto mode = f.engine.read64(f.symbol(vt_cf, "_kCFRunLoopDefaultMode"));
+    const auto run = [&](double seconds) {
+        alchemy::CallRegs r;
+        r.x[0] = mode;
+        r.set_d(0, seconds);
+        r.x[1] = 0;
+        static_cast<void>(f.regs(vt_cf, "_CFRunLoopRunInMode", r));
+    };
+    const auto time_of = [&](Address object, const char* selector) {
+        const auto at = f.block(24);
+        alchemy::CallRegs r;
+        r.indirect_result = at;
+        static_cast<void>(f.objc.send(object, f.objc.selector(selector), r));
+        const auto timescale = static_cast<std::int32_t>(f.engine.read32(at + 8));
+        return timescale > 0 ? static_cast<double>(static_cast<std::int64_t>(f.engine.read64(at))) / timescale : -1.0;
+    };
+    const auto rate_of = [&](Address player) { return f.objc.send(player, f.objc.selector("rate"), {}).s(0); };
+
+    const auto player = f.send(f.cls("AVPlayer"), "playerWithURL:", {f.cf.file_url(alchemy::guest_path_string(webm), false)});
+    const auto item = f.send(player, "currentItem");
+    require(item && f.send(item, "status") == 0, "the item loads asynchronously");
+    const auto layer = f.send(f.cls("AVPlayerLayer"), "playerLayerWithPlayer:", {player});
+    const auto output = f.send(f.send(f.cls("AVPlayerItemVideoOutput"), "alloc"), "initWithPixelBufferAttributes:", {0});
+    f.send(item, "addOutput:", {output});
+    for (int i = 0; i < 40 && f.send(item, "status") == 0; ++i) run(0.05);
+    require(f.send(item, "status") == 1, "the item becomes ready to play");
+    const auto size = f.objc.send(item, f.objc.selector("presentationSize"), {});
+    require(size.d(0) == 8.0 && size.d(1) == 8.0, "presentationSize 8x8");
+    const auto duration = time_of(item, "duration");
+    require(duration > 0.1 && duration < 2.0, "the item's duration: " + std::to_string(duration));
+    require((f.send(layer, "isReadyForDisplay") & 0xff) == 1 && f.send(layer, "contents") != 0, "the first picture is on the layer");
+    const auto first_contents = f.send(layer, "contents");
+    const auto when = f.block(24);
+    write_time(f, when, 0, 1000);
+    require((f.send(output, "hasNewPixelBufferForItemTime:", {when}) & 0xff) == 1, "the output has a picture");
+    const auto image = f.send(output, "copyPixelBufferForItemTime:itemTimeForDisplay:", {when, 0});
+    require(image && f.call(cv, "_CVPixelBufferGetWidth", {image}) == 8 && (f.send(output, "hasNewPixelBufferForItemTime:", {when}) & 0xff) == 0,
+            "copyPixelBufferForItemTime hands it out once");
+    f.call(vt_cf, "_CFRelease", {image});
+    // Play to the end: the rate returns to 0 at the item's duration, with the last picture shown.
+    f.send(player, "play");
+    require(rate_of(player) == 1.0f && f.send(player, "timeControlStatus") == 2, "playing");
+    for (int i = 0; i < 60 && rate_of(player) != 0.0f; ++i) run(0.05);
+    require(rate_of(player) == 0.0f && std::fabs(time_of(player, "currentTime") - duration) < 1e-3, "the player pauses at the item's end");
+    require(f.send(layer, "contents") != first_contents, "the layer shows later pictures");
+    // Seeking back.
+    write_time(f, when, 100, 1000);
+    f.send(player, "seekToTime:", {when});
+    require(std::fabs(time_of(player, "currentTime") - 0.1) < 1e-3, "seekToTime:");
+
+    // An MP3 item's audio plays on the output device.
+    const auto mp3 = directory / "hecommon.mp3";
+    std::filesystem::copy_file(third_party + "/minimp3/vectors/l3-hecommon.bit", mp3, std::filesystem::copy_options::overwrite_existing);
+    const auto audio_player = f.send(f.cls("AVPlayer"), "playerWithURL:", {f.cf.file_url(alchemy::guest_path_string(mp3), false)});
+    const auto audio_item = f.send(audio_player, "currentItem");
+    for (int i = 0; i < 40 && f.send(audio_item, "status") == 0; ++i) run(0.05);
+    require(f.send(audio_item, "status") == 1, "the MP3 item is ready");
+    f.send(audio_player, "play");
+    run(0.05);
+    const auto sound = FakeStream::play_until_sound(512);
+    require(std::any_of(sound.begin(), sound.end(), [](float v) { return v != 0; }), "the MP3 is heard");
+    f.send(audio_player, "pause");
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 } // namespace
 
 int main() {
@@ -1903,6 +1978,7 @@ int main() {
         {"compressed_audio", compressed_audio},
         {"video_toolbox", video_toolbox},
         {"av_video", av_video},
+        {"av_player", av_player},
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},
         {"avaudio", avaudio},

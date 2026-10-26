@@ -28,8 +28,9 @@
 //   format descriptions of the stored samples (codec configuration records
 //   as extension atoms, magic cookies), sizes, frame rates and durations;
 //   the first audio track is readable decoded when a decoder exists, and
-//   video tracks are decodable for AV1, VP9 and VP8. Nothing is playable
-//   (there is no AVPlayer) and no metadata is read (commonMetadata is empty).
+//   video tracks are decodable for AV1, VP9 and VP8; assets with a readable
+//   track are playable (av_player.cpp). No metadata is read (commonMetadata
+//   is empty).
 //   Keys load synchronously; the completion handler runs on a global queue.
 // - AVAssetReader: audio-mix outputs and audio outputs with settings vend
 //   CMSampleBuffers of linear PCM in the requested settings (same sample
@@ -864,7 +865,8 @@ void install_av_foundation(Support& support) {
     }, "@@:i");
     for (const auto* name : {"commonMetadata", "metadata", "availableMetadataFormats", "availableChapterLocales", "chapterMetadataGroupsWithTitleLocale:containingItemsWithCommonKeys:"})
         support.method(asset, name, [av](CpuState& s, GuestMemory&) { s.x[0] = av->empty_array(); }, "@@:");
-    for (const auto* name : {"hasProtectedContent", "isPlayable", "isExportable", "isComposable", "isCompatibleWithSavedPhotosAlbum"})
+    support.method(asset, "isPlayable", [av](CpuState& s, GuestMemory&) { s.x[0] = av->load(s.x[0]).readable() ? 1 : 0; }, "B@:");   // av_player.cpp
+    for (const auto* name : {"hasProtectedContent", "isExportable", "isComposable", "isCompatibleWithSavedPhotosAlbum"})
         support.method(asset, name, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
     support.method(asset, "isReadable", [av](CpuState& s, GuestMemory&) { s.x[0] = av->load(s.x[0]).readable() ? 1 : 0; }, "B@:");
     support.method(asset, "providesPreciseDurationAndTiming", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
@@ -973,7 +975,7 @@ void install_av_foundation(Support& support) {
     for (const auto* name : {"isEnabled", "isSelfContained"})
         support.method(track, name, [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
     support.method(track, "isDecodable", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<TrackState>(s.x[0])->decodable ? 1 : 0; }, "B@:");
-    support.method(track, "isPlayable", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");   // there is no AVPlayer
+    support.method(track, "isPlayable", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<TrackState>(s.x[0])->decodable ? 1 : 0; }, "B@:");
     for (const auto* name : {"commonMetadata", "metadata", "availableMetadataFormats"})
         support.method(track, name, [av](CpuState& s, GuestMemory&) { s.x[0] = av->empty_array(); }, "@@:");
 
@@ -1577,6 +1579,7 @@ void install_av_foundation(Support& support) {
             support.method(generic, selector, [name](CpuState&, GuestMemory&) { cannot_exist(name); }, "v@:B");
         }
     }
+    install_av_player(support);
 }
 
 } // namespace alchemy::gui::completion_kit::media
