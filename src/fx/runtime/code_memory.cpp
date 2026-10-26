@@ -241,8 +241,10 @@ bool LiveCodeSource::read(std::uint64_t address, std::uint32_t& word) const {
 }
 
 bool LiveCodeSource::image_code(std::uint64_t address) const {
+    // A PE image or an external module (Mach-O): its text is image code even
+    // where the personality registered it as guest code memory (Alchemy does).
     const auto* module = find_guest_module(address & ~std::uint64_t{0xfff});
-    return module && address >= module->text_begin && address < module->text_end && !in_registered_code_memory(address);
+    return module && address >= module->text_begin && address < module->text_end;
 }
 
 bool LiveCodeSource::read_data(std::uint64_t address, std::uint32_t& word) const {

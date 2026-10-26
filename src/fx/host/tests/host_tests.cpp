@@ -446,6 +446,68 @@ FX_TEST(host_vm_heap) {
     FX_CHECK(vm::heap_free(heap, block));
 }
 
+// guarded_length (SSE2 blocks) and guarded_compare (8-byte chunks) next to an
+// inaccessible page: strings of every length 0..4096 ending at the page, with
+// and without their zero, at every `maximum` that matters; compares of every
+// size whose operands end at the page, equal or unequal at every position,
+// and one byte past it (the inaccessible byte must be read: a fault).
+FX_TEST(host_guarded_length_and_compare_at_page_edges) {
+    constexpr std::size_t kSpan = 2 * kPage;   // readable, then kPage inaccessible
+    auto* a_base = static_cast<std::uint8_t*>(vm::allocate(nullptr, kSpan + kPage, vm::kReadWrite));
+    auto* b_base = static_cast<std::uint8_t*>(vm::allocate(nullptr, kSpan + kPage, vm::kReadWrite));
+    FX_REQUIRE(a_base && b_base);
+    FX_REQUIRE(vm::protect(a_base + kSpan, kPage, vm::kNoAccess));
+    FX_REQUIRE(vm::protect(b_base + kSpan, kPage, vm::kNoAccess));
+    std::uint8_t* const a_end = a_base + kSpan;
+    std::uint8_t* const b_end = b_base + kSpan;
+    for (std::size_t i = 0; i < kSpan; ++i) a_base[i] = static_cast<std::uint8_t>(1 + i % 251);   // no zero
+    // Strings: `distance` readable bytes from the start to the inaccessible page.
+    for (std::size_t distance = 1; distance <= 4096; distance += (distance < 80 ? 1 : 7)) {
+        const std::uint8_t* start = a_end - distance;
+        FX_CHECK_EQ(host::guarded_length(start, 1, 1u << 20), -1);                    // runs into the page
+        FX_CHECK_EQ(host::guarded_length(start, 1, distance), static_cast<long long>(distance));   // stops at it
+        if (distance > 1) FX_CHECK_EQ(host::guarded_length(start, 1, distance - 1), static_cast<long long>(distance - 1));
+        FX_CHECK_EQ(host::guarded_length(start, 1, 0), 0);
+        for (const std::size_t zero : {std::size_t{0}, distance / 2, distance - 1}) {
+            a_end[-static_cast<std::ptrdiff_t>(distance) + static_cast<std::ptrdiff_t>(zero)] = 0;
+            FX_CHECK_EQ(host::guarded_length(start, 1, 1u << 20), static_cast<long long>(zero));
+            FX_CHECK_EQ(host::guarded_length(start, 1, zero), static_cast<long long>(zero));
+            if (zero > 0) FX_CHECK_EQ(host::guarded_length(start, 1, zero - 1), static_cast<long long>(zero - 1));
+            a_end[-static_cast<std::ptrdiff_t>(distance) + static_cast<std::ptrdiff_t>(zero)] =
+                static_cast<std::uint8_t>(1 + (kSpan - distance + zero) % 251);
+        }
+    }
+    // Compares: both operands end at their inaccessible page.
+    std::memcpy(b_base, a_base, kSpan);
+    for (std::size_t size = 0; size <= 4096; size += (size < 80 ? 1 : 13)) {
+        const std::uint8_t* x = a_end - size;
+        std::uint8_t* y = b_end - size;
+        long long result = 99;
+        FX_CHECK(host::guarded_compare(x, y, size, result));
+        FX_CHECK_EQ(result, 0);
+        if (size > 0) {
+            result = 99;
+            FX_CHECK(host::guarded_compare(x - 1, y - 1, size + 1, result));   // equal up to the page...
+            FX_CHECK_EQ(result, 0);
+            FX_CHECK(!host::guarded_compare(x + 1, y + 1, size, result));   // ...and one byte past it faults
+        }
+        for (const std::size_t at : {std::size_t{0}, size / 3, size / 2, size == 0 ? 0 : size - 1}) {
+            if (at >= size) continue;
+            const std::uint8_t keep = y[at];
+            y[at] = static_cast<std::uint8_t>(keep + 77);
+            result = 0;
+            FX_CHECK(host::guarded_compare(x, y, size, result));
+            FX_CHECK_EQ(result, static_cast<long long>(x[at]) - y[at]);
+            result = 0;
+            FX_CHECK(host::guarded_compare(y, x, size, result));
+            FX_CHECK_EQ(result, static_cast<long long>(y[at]) - x[at]);
+            y[at] = keep;
+        }
+    }
+    vm::release(a_base);
+    vm::release(b_base);
+}
+
 FX_TEST(host_guarded_access) {
     auto* reserved = static_cast<std::uint8_t*>(vm::reserve(nullptr, kGranule, vm::kReadWrite));
     std::uint32_t value = 99;

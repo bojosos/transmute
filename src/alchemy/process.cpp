@@ -113,13 +113,29 @@ private:
         const auto threads = context_.thread_snapshots();
         const auto images = context_.images();
         std::ostringstream out;
-        out << "alchemy: hang dump (pid " << host::process::current_pid() << "): " << threads.size() << " guest thread(s)";
+        // The process's role: Chrome's --type=..., else the program's name.
+        std::string role;
+        for (const auto& argument : context_.arguments)
+            if (argument.rfind("--type=", 0) == 0) { role = " " + argument; break; }
+        if (role.empty() && !context_.arguments.empty())
+            role = " " + std::filesystem::path(context_.arguments.front()).filename().string();
+        out << "alchemy: hang dump (pid " << host::process::current_pid() << ")" << role << ": " << threads.size()
+            << " guest thread(s)";
         for (const auto& thread : threads) {
             const auto& s = thread.state;
             const auto name = context_.export_name(s.pc);
             out << "\n thread 0x" << std::hex << thread.identity << ": "
                 << (name.empty() ? "pc " + describe_guest_address(images, s.pc) : "in " + name)
                 << " x0 0x" << s.x[0] << " x1 0x" << s.x[1] << " x2 0x" << s.x[2] << " x3 0x" << s.x[3];
+            // mach_msg: the ports of its header (remote +8, local +12, id +20) and
+            // which half it does (MACH_SEND_MSG 1, MACH_RCV_MSG 2).
+            if (name.rfind("_mach_msg ", 0) == 0 && s.x[0]) {
+                try {
+                    out << ((s.x[1] & 1) ? " send" : "") << ((s.x[1] & 2) ? " receive" : "") << " remote 0x"
+                        << memory_.read32(s.x[0] + 8) << " local 0x" << memory_.read32(s.x[0] + 12) << " id 0x"
+                        << memory_.read32(s.x[0] + 20);
+                } catch (...) {}
+            }
             try { append_guest_backtrace(out, memory_, images, s.x[30], s.x[29]); } catch (...) {}
             out << std::dec;
         }

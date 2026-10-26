@@ -106,6 +106,7 @@ void release_if_overlaps(std::uint64_t base, std::uint64_t size) noexcept {
 // Guest memory accesses that may fault (fx/host/guard.hpp: access
 // violations, in-page errors and guard pages fail; guarded_length is the
 // number of characters before the first zero, up to `maximum`, or -1).
+using fx::host::guarded_compare;
 using fx::host::guarded_fill;
 using fx::host::guarded_length;
 using fx::host::guarded_move;
@@ -1512,8 +1513,8 @@ std::uint64_t FxEngine::register_guest_call(GuestCallHandler handler) {
 // copies, handler chain or perf frame. They do exactly what their handlers
 // (darwin/libsystem/services.cpp) do when no guest byte faults, including
 // x1 = 0 (DarwinServices::Impl::install) and x0 untouched by bzero/bcopy.
-// Anything else -- a fault, a string longer than the handler's limit, a
-// memcmp longer than the leaf's buffers -- declines (changing nothing), and
+// Anything else -- a fault, a string longer than the handler's limit --
+// declines (changing nothing), and
 // the call runs the handler from the start through host_callback, which
 // faults or fails exactly as before. A copy or fill that faulted part-way is
 // then redone; the call faults anyway. ___chkstk_darwin (darwin/libsystem/
@@ -1524,22 +1525,7 @@ enum Leaf : std::uint8_t {
     kLeafNone, kLeafMemcpy, kLeafBcopy, kLeafMemset, kLeafBzero, kLeafMemcmp, kLeafStrlen, kLeafStackProbe
 };
 
-constexpr std::size_t kLeafCompareBytes = 256;
 constexpr std::size_t kLeafStringLimit = std::size_t{1} << 20;   // = services' string_limit
-
-bool leaf_compare(std::uint64_t a, std::uint64_t b, std::uint64_t count, std::uint64_t& result) {
-    if (count > kLeafCompareBytes) return false;
-    std::uint8_t x[kLeafCompareBytes], y[kLeafCompareBytes];
-    if (count && (!guarded_move(x, host(a), count) || !guarded_move(y, host(b), count))) return false;
-    result = 0;
-    if (std::memcmp(x, y, count) == 0) return true;
-    for (std::size_t i = 0; i < count; ++i)
-        if (x[i] != y[i]) {
-            result = static_cast<std::uint64_t>(static_cast<std::int64_t>(x[i]) - y[i]);
-            break;
-        }
-    return true;
-}
 
 // ALCHEMY_FX_STACK_PROBE_LEAF=0: ___chkstk_darwin always runs its handler (A/B measurement).
 bool stack_probe_leaf() {
@@ -1570,9 +1556,10 @@ bool leaf_call(fx::GuestContext& ctx) {
     } else if constexpr (kind == kLeafBzero) {
         if (x[1] && !guarded_fill(host(x[0]), 0, x[1])) return false;
     } else if constexpr (kind == kLeafMemcmp) {
-        std::uint64_t result = 0;
-        if (!leaf_compare(x[0], x[1], x[2], result)) return false;
-        x[0] = result;
+        // In place: up to the first difference (its 8-byte chunk), as a native memcmp reads.
+        long long result = 0;
+        if (x[2] && !guarded_compare(host(x[0]), host(x[1]), x[2], result)) return false;
+        x[0] = static_cast<std::uint64_t>(result);
     } else if constexpr (kind == kLeafStrlen) {
         const auto length = guarded_length(static_cast<const std::uint8_t*>(host(x[0])), 1, kLeafStringLimit);
         if (length < 0 || static_cast<std::size_t>(length) >= kLeafStringLimit) return false;

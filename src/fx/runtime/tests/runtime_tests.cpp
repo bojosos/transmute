@@ -129,6 +129,32 @@ FX_TEST(pdata_function_bounds_packed_and_xdata) {
     set_fake_module(nullptr);
 }
 
+// CodeSource::image_code for target_flags_dead: a module's text is image code
+// also when the personality registers it as guest code memory (Alchemy maps
+// Mach-O __TEXT that way); its data and other registered code memory (the
+// guest's JIT) are not.
+FX_TEST(live_code_source_image_code) {
+    init();
+    GuestModule module;
+    module.base = 0x0000'0556'0000'0000ULL;
+    module.size = 0x4000;
+    module.text_begin = module.base + 0x1000;
+    module.text_end = module.base + 0x3000;
+    set_fake_module(&module);
+    const std::uint64_t jit = 0x0000'0557'0000'0000ULL;
+    register_guest_code_memory(module.base, module.size);
+    register_guest_code_memory(jit, 0x2000);
+    rt::LiveCodeSource source;
+    FX_CHECK(source.image_code(module.text_begin));
+    FX_CHECK(source.image_code(module.text_end - 4));
+    FX_CHECK(!source.image_code(module.text_end));   // registered, but the module's data
+    FX_CHECK(!source.image_code(module.base));
+    FX_CHECK(!source.image_code(jit));               // registered code memory outside any module
+    unregister_guest_code_memory(module.base, module.size);
+    unregister_guest_code_memory(jit, 0x2000);
+    set_fake_module(nullptr);
+}
+
 FX_TEST(guest_code_ranges) {
     init();
     const std::uint64_t base = 0x0000'0555'0000'0000ULL;

@@ -39,6 +39,15 @@ bool inlining_enabled() {
 
 std::uint64_t inlined_now() { return core::core_counters().inlined_calls.load(); }
 
+// Optimized (eager tier-2) translations inline larger and local leaves
+// (PlanOverrides::kOptimizedInlineMax); lazy ones keep the tier-1 rules.
+bool wide_inlining() { return inlining_enabled() && (core::codegen_layout_bits() & 128u) == 0; }
+TranslateOptions lazy_options() {
+    TranslateOptions o;
+    o.lazy = true;
+    return o;
+}
+
 bool covers(const TranslatedRegion& r, std::uint64_t pc) {
     for (const auto& [b, e] : r.guest_ranges)
         if (pc >= b && pc < e) return true;
@@ -382,7 +391,7 @@ FX_TEST(inline_callee_selection) {
         program[prog.size()] = brk(0xdead);
         const BufferCode code(r.code_base(), base + (prog.size() + 1) * 4);
         const auto before = inlined_now();
-        const auto region = translate_region(base, code);
+        const auto region = translate_region(base, code, lazy_options());   // the tier-1 size rules
         const bool inlined = inlined_now() != before;
         if (inlined != (c.inlined && inlining_enabled())) std::fprintf(stderr, "    %s: inlined %d\n", c.label, inlined ? 1 : 0);
         FX_CHECK_EQ(inlined, c.inlined && inlining_enabled());
@@ -403,12 +412,67 @@ FX_TEST(inline_callee_selection) {
     code.fn_begin = base + 12;
     code.fn_end = base + 20;
     auto before = inlined_now();
-    (void)translate_region(base, code);
+    (void)translate_region(base, code, lazy_options());
     FX_CHECK_EQ(inlined_now() != before, inlining_enabled());
     code.fn_begin = base + 8;   // the target is not a function start
     before = inlined_now();
-    (void)translate_region(base, code);
+    (void)translate_region(base, code, lazy_options());
     FX_CHECK(inlined_now() == before);
+    before = inlined_now();
+    (void)translate_region(base, code);   // optimized: a local subroutine is inlined
+    FX_CHECK_EQ(inlined_now() != before, wide_inlining());
+}
+
+// A local assembly helper (dav1d's L(8tap_filter_8) shape: 40 instructions,
+// inside its function, no function start of its own) called per iteration of
+// a loop: optimized translations inline it, their guest ranges cover it, and
+// the program runs like the reference. The same helper is also called from
+// outside the loop and reached by a plain BR (with x30 set), so a body judged
+// closed when it is not would show.
+FX_TEST(inline_local_helper_called_from_loop) {
+    auto& r = runner();
+    using namespace a64;
+    const auto base = r.program_base();
+    std::vector<std::uint32_t> prog = {
+        movw(false, 2, 0, 9, 12),                                  // 0 movz w12, #9
+        bl(0),                                                     // 1 loop: bl helper
+        add_shift(true, false, false, 0, 0, 0, 9, 9),              // 2 add x9, x9, x0
+        add_imm(false, true, true, 12, 12, 1),                     // 3 subs w12, w12, #1
+        bcond(1, -3),                                              // 4 b.ne loop
+        bl(0),                                                     // 5 bl helper (outside the loop)
+        add_shift(true, false, false, 0, 0, 0, 10, 10),            // 6 add x10, x10, x0
+        adr(false, 12, 30),                                        // 7 adr x30, 10 (the BR's return)
+        adr(false, 0, 16),                                         // 8 adr x16, helper
+        br(16),                                                    // 9 br x16
+        b(0),                                                      // 10 b end
+    };
+    const auto helper = prog.size();
+    for (unsigned k = 0; k < 39; ++k)   // x0..x8 mixed, x0 written last
+        prog.push_back(k % 3 == 0 ? add_shift(true, false, false, 0, (k + 1) % 9, 0, k % 9, (k + 2) % 9)
+                       : k % 3 == 1 ? logic_shift(true, 2, 0, false, (k + 3) % 9, 1, (k + 1) % 9, k % 9)
+                                    : add_imm(true, false, false, (k + 4) % 9, (k + 4) % 9, k));
+    prog.push_back(ret());
+    const auto end = prog.size();
+    const auto rel = [](std::size_t from, std::size_t to) { return static_cast<std::int32_t>(to) - static_cast<std::int32_t>(from); };
+    prog[1] = bl(rel(1, helper));
+    prog[5] = bl(rel(5, helper));
+    prog[7] = adr(false, 4 * rel(7, 10), 30);
+    prog[8] = adr(false, 4 * rel(8, helper), 16);
+    prog[10] = b(rel(10, end));
+    auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(base));
+    std::memcpy(program, prog.data(), prog.size() * 4);
+    program[prog.size()] = brk(0xdead);
+    BufferCode code(r.code_base(), base + (prog.size() + 1) * 4);
+    code.fn_begin = base;   // one function: the helper is not a function start
+    code.fn_end = base + prog.size() * 4;
+    const auto before = inlined_now();
+    const auto region = translate_region(base, code);
+    FX_CHECK_EQ(inlined_now() != before, wide_inlining());
+    if (wide_inlining()) {   // the copy's guest bytes: a write to the helper kills the caller
+        FX_CHECK(covers(region, base + 4 * helper));
+        FX_CHECK(covers(region, base + 4 * (end - 1)));
+    }
+    for (unsigned k = 0; k < 4; ++k) FX_CHECK(r.run(prog, r.context(4300 + k), "local helper " + std::to_string(k)));
 }
 
 FX_TEST(inline_calls_differential) { inline_fuzz(1, 2500, 0); }

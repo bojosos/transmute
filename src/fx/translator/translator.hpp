@@ -40,9 +40,10 @@ public:
         (void)pc;
         return false;
     }
-    // True if `address` is in a mapped image's code, not in memory the guest
-    // registered for its own JIT: such code changes only with its image or by
-    // a write fx catches, which kill regions that list it in guest_ranges.
+    // True if `address` is in a guest module's code (an image's text section),
+    // not other code memory (the guest's JIT): such code changes only with its
+    // image or by a write fx catches, which kill regions that list it in
+    // guest_ranges.
     // Region formation may then let a region depend on code it does not
     // translate (a call target's first instructions, Plan::dependency_ranges).
     virtual bool image_code(std::uint64_t address) const {

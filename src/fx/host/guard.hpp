@@ -29,8 +29,14 @@ bool try_copy(void* destination, const void* source, std::size_t size) noexcept;
 bool guarded_move(void* destination, const void* source, std::size_t size) noexcept;
 bool guarded_fill(void* destination, int value, std::size_t size) noexcept;
 // Elements (`width` 1 or 2 bytes) before the first zero, up to `maximum`; -1
-// on a memory fault.
+// on a memory fault. Reads no page the bytes up to the zero (or `maximum`)
+// do not lie on (bytes it reads past them share their 16-byte block).
 long long guarded_length(const std::uint8_t* address, unsigned width, std::size_t maximum) noexcept;
+// memcmp under the memory-fault filter: `result` = a[i] - b[i] at the first
+// unequal byte (0 if none), as Darwin's memcmp returns it. Reads only the
+// bytes up to the first difference's 16-byte chunk, never outside [0, size).
+// False if it faulted (`result` unchanged).
+bool guarded_compare(const void* a, const void* b, std::size_t size, long long& result) noexcept;
 
 // inline (backend):
 //   template <typename F> bool call_guarded(F&& f, FaultRecord& fault) noexcept

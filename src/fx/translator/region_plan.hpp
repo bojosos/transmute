@@ -263,6 +263,13 @@ struct PlanOverrides {
     bool inline_hot{};                // TRANSMUTE_FX_CORE=inlinehot: lazy (tier-0) regions defer inlining to tier 1
     unsigned inline_max{kDefaultInlineMax};   // TRANSMUTE_FX_INLINE=<n>
     static constexpr unsigned kDefaultInlineMax = 24;
+    // Optimized (tier-2) translations of hot code inline larger leaves, up to
+    // kOptimizedInlineMax instructions, and local subroutines that start
+    // inside a function (assembly helpers such as dav1d's L(8tap_filter_8),
+    // called per row of a loop). TRANSMUTE_FX_CORE=noloopinline: the rules
+    // above everywhere.
+    static constexpr unsigned kOptimizedInlineMax = 64;
+    bool no_loop_inline{};
     // Switch dispatch: BR through a recognised jump table stays in the region
     // (Plan::tables). TRANSMUTE_FX_CORE=notables: every BR is an indirect exit.
     bool no_tables{};

@@ -203,6 +203,7 @@ int main(int argc, char** argv) {
             SetEnvironmentVariableA("ALCHEMY_HANG_DUMP", nullptr);
             DeleteFileA(trigger.c_str());
             expect(outcome.status == 0 && contains(outcome.output, "alchemy: hang dump (pid ") &&
+                       contains(outcome.output, ") fx_threads: ") &&
                        contains(outcome.output, "in _pthread_cond_wait") && contains(outcome.output, "in _usleep") &&
                        contains(outcome.output, "fx_threads+0x"),
                    "ALCHEMY_HANG_DUMP prints the waiting threads", outcome, "expected a dump with both waits");

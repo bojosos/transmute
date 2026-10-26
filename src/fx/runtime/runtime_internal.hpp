@@ -391,7 +391,7 @@ public:
     // pc already has a translated (or host) entry: the new region stops there
     // and links to it instead of translating covered code again.
     bool has_entry(std::uint64_t pc) const override;
-    // A mapped module's text section, outside registered (JIT) code memory.
+    // A guest module's text (PE or register_external_module), not other code memory.
     bool image_code(std::uint64_t address) const override;
     // Tier-1 translation: only host entries stop region growth. Hot code is
     // translated as one region even where earlier (smaller) regions provide

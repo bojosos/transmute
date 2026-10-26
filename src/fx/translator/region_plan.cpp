@@ -783,13 +783,18 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
             body_list.push_back({target, first, 0});
             return std::int32_t{-1};
         };
-        const unsigned limit = overrides.inline_max;
+        // Optimized translations (hot code): larger leaves, and local subroutines
+        // inside a function (PlanOverrides::kOptimizedInlineMax).
+        const bool wide = plan.optimize && !overrides.no_loop_inline;
+        const unsigned limit = wide ? std::max(overrides.inline_max, PlanOverrides::kOptimizedInlineMax) : overrides.inline_max;
         std::uint64_t lo = target, hi = target + 8ull * limit;
         if ((target & 3) != 0) return reject();
         {
             std::uint64_t b = 0, e = 0;
             if (code.function_bounds(target, b, e)) {
-                if (b != target || e <= b || e - b > 64ull * limit) return reject();   // not a function start / far too big
+                if (e <= b || target >= e) return reject();
+                if (b != target && !wide) return reject();                     // a local subroutine: optimized only
+                if (b == target && e - b > 64ull * limit) return reject();     // a function far too big
                 hi = e;
             }
         }
