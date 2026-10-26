@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 
 namespace {
 using namespace fill_test;
@@ -227,6 +228,67 @@ void appkit_contexts(Fixture& f) {
     f.send(format, "release");
 }
 
+// CAOpenGLLayer: a subclass's -drawInCGLContext:... draws into a drawable of bounds times
+// contentsScale, framebuffer 0 while it draws, and the frame becomes the layer's contents.
+void opengl_layer(Fixture& f) {
+    const auto subclass = f.objc.register_native_class("AlchemyTestOpenGLLayer", f.cls("CAOpenGLLayer"), 8);
+    struct Seen {
+        int frames{};
+        Address context{}, pixel_format{}, stamp{};
+        std::uint64_t host_time{};
+        double time{};
+        std::uint32_t binding{1};
+    };
+    auto seen = std::make_shared<Seen>();
+    static_cast<void>(f.objc.add_native_method(subclass, "drawInCGLContext:pixelFormat:forLayerTime:displayTime:",
+        [&f, seen, subclass](transmute::CpuState& s, transmute::GuestMemory&) {
+            ++seen->frames;
+            seen->context = s.x[2];
+            seen->pixel_format = s.x[3];
+            seen->stamp = s.x[4];
+            seen->host_time = s.x[4] ? f.engine.read64(s.x[4] + 16) : 0;   // the stamp lives for the call only
+            seen->time = std::bit_cast<double>(s.v[0][0]);
+            const auto binding = f.block(4);
+            f.call(gl, "_glGetIntegerv", {0x8CA6 /* GL_FRAMEBUFFER_BINDING */, binding});
+            seen->binding = f.engine.read32(binding);
+            call_floats(f, "_glClearColor", {0.0f, 1.0f, 0.0f, 1.0f});
+            f.call(gl, "_glClear", {gl_color_buffer_bit});
+            alchemy::CallRegs up{};
+            up.x[2] = s.x[2];
+            up.x[3] = s.x[3];
+            up.x[4] = s.x[4];
+            up.v[0] = {s.v[0][0], s.v[0][1]};
+            static_cast<void>(f.objc.send_super(s.x[0], subclass, f.objc.selector("drawInCGLContext:pixelFormat:forLayerTime:displayTime:"), up));
+        }, false, "v@:^v^vd^v"));
+    const auto layer = f.send(f.send(subclass, "alloc"), "init");
+    require(layer != 0, "a CAOpenGLLayer subclass");
+    alchemy::CallRegs bounds{};
+    bounds.set_d(2, 5);
+    bounds.set_d(3, 3);
+    static_cast<void>(f.objc.send(layer, "setBounds:", bounds));
+    alchemy::CallRegs scale{};
+    scale.set_d(0, 2);
+    static_cast<void>(f.objc.send(layer, "setContentsScale:", scale));
+    require(f.send(layer, "isAsynchronous") == 0, "not asynchronous by default");
+    f.send(layer, "display");
+    require(seen->frames == 1 && seen->context != 0 && seen->pixel_format != 0 && seen->stamp != 0 && seen->time > 0,
+            "-drawInCGLContext:pixelFormat:forLayerTime:displayTime: with the layer's context");
+    require(seen->binding == 0, "the drawable is framebuffer 0 while the layer draws");
+    require(seen->host_time != 0, "the display time's hostTime");
+    const auto surface = f.send(layer, "contents");
+    require(surface != 0 && f.call(iosurface, "_IOSurfaceGetWidth", {surface}) == 10 && f.call(iosurface, "_IOSurfaceGetHeight", {surface}) == 6,
+            "an IOSurface of the layer's size in pixels");
+    require(near(pixel(f, f.call(iosurface, "_IOSurfaceGetBaseAddress", {surface})), {0, 255, 0, 255}), "the drawn pixels (BGRA green)");
+    require(f.call(gl, "_CGLGetCurrentContext") == 0, "the previous context is current again");
+    // -setNeedsDisplay queues a display; -displayIfNeeded draws once.
+    f.send(layer, "setNeedsDisplay");
+    require(f.send(layer, "needsDisplay") == 1, "-needsDisplay");
+    f.send(layer, "displayIfNeeded");
+    f.send(layer, "displayIfNeeded");
+    require(seen->frames == 2 && f.send(layer, "needsDisplay") == 0, "-displayIfNeeded draws once");
+    f.send(layer, "release");
+}
+
 const Case opengl_case("opengl", [](Fixture& f) {
     require(alchemy::ProcessContext::is_provider_library(agl), "AGL identity");
     for (const auto* name : {"_CGLChoosePixelFormat", "_CGLTexImageIOSurface2D", "_glGenFramebuffersEXT", "_glBindVertexArrayAPPLE",
@@ -254,6 +316,7 @@ const Case opengl_case("opengl", [](Fixture& f) {
     core_profile(f);
     legacy_profile(f);
     appkit_contexts(f);
+    opengl_layer(f);
 });
 
 } // namespace

@@ -3,10 +3,13 @@
 #include "alchemy/call_regs.hpp"
 #include "alchemy/core_foundation.hpp"
 #include "alchemy/engine_adapter.hpp"
+#include "alchemy/gui/fill_provider.hpp"
+#include "alchemy/gui/runloop.hpp"
 #include "alchemy/objc_runtime.hpp"
 #include "alchemy/registration_audit.hpp"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <functional>
 #include <initializer_list>
@@ -17,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 // AppKit's OpenGL classes on CGL (cgl_contexts.cpp), as on macOS.
@@ -32,6 +36,12 @@
 // - NSOpenGLView makes its context on first use (+defaultPixelFormat unless given one), calls
 //   -prepareOpenGL once, and draws through -displayLayer: (AppKit's display of a view whose layer
 //   shows its own contents): the context is made current and -drawRect: runs, which flushes.
+// - CAOpenGLLayer gets its pixel format and context from its own -copyCGLPixelFormatForDisplayMask:
+//   and -copyCGLContextForPixelFormat: (subclasses override them), and draws into a drawable of
+//   its bounds times contentsScale in pixels: -display makes the context current with the
+//   drawable as framebuffer 0, asks -canDrawInCGLContext:..., runs -drawInCGLContext:... and
+//   shows the result as the layer's own contents. -setNeedsDisplay displays on the main thread's
+//   run loop; an asynchronous layer draws again every 1/60 s.
 // - Unavailable: full-screen and off-screen contexts (-setFullScreen, -setOffScreen:...) and
 //   -copyAttributesFromContext:withMask: stop with a message; -initWithData: answers nil.
 namespace alchemy::opengl {
@@ -57,7 +67,8 @@ constexpr std::uint64_t bgra = 0x42475241;   // 'BGRA'
 // A view drawable: the stand-in for framebuffer 0, and what shows it.
 struct Drawable {
     Address view{};                    // not retained (the view owns its context's drawable)
-    Address sublayer{};                // retained
+    Address sublayer{};                // the layer showing the drawable (retained when owns_layer)
+    bool owns_layer{true};             // a sublayer made for a view; a CAOpenGLLayer presents itself
     Address surface{};                 // retained IOSurface the sublayer shows
     bool shown{};                      // the sublayer has the surface as contents
     std::uint32_t framebuffer{}, color{}, depth{};
@@ -73,6 +84,15 @@ struct ContextState final : ObjectPayload {
     Address pixel_format{};            // NSOpenGLPixelFormat, retained
     std::unique_ptr<Drawable> drawable;
 };
+// CAOpenGLLayer, kept beside the layer (whose host state is QuartzCore's).
+struct LayerState {
+    ContextState gl;                   // the layer's context and drawable
+    Address pixel_format{};            // CGLPixelFormatObj from -copyCGLPixelFormatForDisplayMask:
+    bool asynchronous{};
+    bool needs_display{};
+    bool display_queued{};             // a -displayIfNeeded is queued on the main thread
+    bool frame_scheduled{};            // the asynchronous layer's next frame is queued
+};
 struct ViewState final : ObjectPayload {
     Address pixel_format{};            // retained
     Address context{};                 // retained
@@ -84,6 +104,7 @@ class NsOpenGl : public std::enable_shared_from_this<NsOpenGl> {
 public:
     explicit NsOpenGl(gui::InstallContext& context) : process_(context.process), objc_(context.objc), cf_(context.cf) {}
     void install();
+    void install_layer(Address layer_class);
 
 private:
     using Handler = std::function<void(CpuState&, GuestMemory&)>;
@@ -112,10 +133,18 @@ private:
     // Runs `work` with `cgl_context` current on this thread, restoring the previous context.
     template <class F> void with_current(Address cgl_context, F work);
     void attach(Address context, Address view);
+    // The framebuffer object of a drawable (its size, depth, stencil and samples set).
+    void build(ContextState& state, Drawable& d, std::int32_t depth, std::int32_t stencil);
+    // CAOpenGLLayer: its context and drawable (made or resized), then one frame.
+    void display_layer(Address layer);
     void detach(Address context);
+    void detach(ContextState& state);
     void resize(Drawable& drawable);
     std::pair<std::int32_t, std::int32_t> pixel_size(Address view);
     void flush(Address context);
+    void flush(ContextState& state);
+    // A layer's state (made on first use; `make` false: nullptr when there is none).
+    std::shared_ptr<LayerState> layer(Address object, bool make = true);
 
     ProcessContext& process_;
     ObjcRuntime& objc_;
@@ -123,7 +152,16 @@ private:
     Address pixel_format_class_{}, context_class_{}, view_class_{};
     std::mutex mutex_;
     std::map<Address, Address> by_cgl_;   // CGLContextObj -> NSOpenGLContext
+    std::map<Address, std::shared_ptr<LayerState>> layers_;   // CAOpenGLLayer -> its state
 };
+
+std::shared_ptr<LayerState> NsOpenGl::layer(Address object, bool make) {
+    std::lock_guard lock(mutex_);
+    const auto found = layers_.find(object);
+    if (found != layers_.end()) return found->second;
+    if (!make) return nullptr;
+    return layers_[object] = std::make_shared<LayerState>();
+}
 
 std::int32_t NsOpenGl::describe(Address pixel_format_cgl, std::uint32_t attribute) {
     const auto value = process_.allocate_guest(4, 4);
@@ -177,21 +215,9 @@ void NsOpenGl::resize(Drawable& d) {
     bind(gl_renderbuffer, 0);
 }
 
-void NsOpenGl::attach(Address context, Address view) {
-    const auto state = objc_.find_host_state<ContextState>(context);
-    if (!state || !state->cgl) return;
-    if (state->drawable && state->drawable->view == view) return;
-    detach(context);
-    auto d = std::make_unique<Drawable>();
-    d->view = view;
-    const auto pixel_format = call(opengl_library, "_CGLGetPixelFormat", {state->cgl});
-    const auto depth = describe(pixel_format, pfa_depth_size), stencil = describe(pixel_format, pfa_stencil_size);
-    d->samples = static_cast<std::uint32_t>(std::max(0, describe(pixel_format, pfa_samples)));
-    d->depth_stencil = stencil > 0;
-    d->depth_only = depth > 0 && stencil == 0;
-    std::tie(d->width, d->height) = pixel_size(view);
-    auto* host_context = cgl_host_context(state->cgl);
-    with_current(state->cgl, [&] {
+void NsOpenGl::build(ContextState& state, Drawable& d, std::int32_t depth, std::int32_t stencil) {
+    auto* host_context = cgl_host_context(state.cgl);
+    with_current(state.cgl, [&] {
         using Gen = void (*)(std::int32_t, std::uint32_t*);
         using BindFramebuffer = void (*)(std::uint32_t, std::uint32_t);
         using Attach = void (*)(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
@@ -208,29 +234,45 @@ void NsOpenGl::attach(Address context, Address view) {
             throw std::runtime_error("unsupported: Alchemy: an NSOpenGLContext drawable needs framebuffer objects, which the host driver lacks");
         std::int32_t bound{};
         get_integer(gl_framebuffer_binding, &bound);
-        gen_framebuffers(1, &d->framebuffer);
-        gen_renderbuffers(1, &d->color);
-        if (depth > 0 || stencil > 0) gen_renderbuffers(1, &d->depth);
-        if (d->samples > 1) {
-            gen_framebuffers(1, &d->resolve_framebuffer);
-            gen_renderbuffers(1, &d->resolve_color);
+        gen_framebuffers(1, &d.framebuffer);
+        gen_renderbuffers(1, &d.color);
+        if (depth > 0 || stencil > 0) gen_renderbuffers(1, &d.depth);
+        if (d.samples > 1) {
+            gen_framebuffers(1, &d.resolve_framebuffer);
+            gen_renderbuffers(1, &d.resolve_color);
         }
-        resize(*d);
-        bind_framebuffer(gl_framebuffer, d->framebuffer);
-        attach_renderbuffer(gl_framebuffer, gl_color_attachment0, gl_renderbuffer, d->color);
-        if (d->depth)
-            attach_renderbuffer(gl_framebuffer, d->depth_stencil ? gl_depth_stencil_attachment : gl_depth_attachment, gl_renderbuffer, d->depth);
-        if (d->resolve_framebuffer) {
-            bind_framebuffer(gl_framebuffer, d->resolve_framebuffer);
-            attach_renderbuffer(gl_framebuffer, gl_color_attachment0, gl_renderbuffer, d->resolve_color);
+        resize(d);
+        bind_framebuffer(gl_framebuffer, d.framebuffer);
+        attach_renderbuffer(gl_framebuffer, gl_color_attachment0, gl_renderbuffer, d.color);
+        if (d.depth)
+            attach_renderbuffer(gl_framebuffer, d.depth_stencil ? gl_depth_stencil_attachment : gl_depth_attachment, gl_renderbuffer, d.depth);
+        if (d.resolve_framebuffer) {
+            bind_framebuffer(gl_framebuffer, d.resolve_framebuffer);
+            attach_renderbuffer(gl_framebuffer, gl_color_attachment0, gl_renderbuffer, d.resolve_color);
         }
         // Framebuffer 0 was bound: the drawable is now framebuffer 0.
-        bind_framebuffer(gl_framebuffer, bound == 0 ? d->framebuffer : static_cast<std::uint32_t>(bound));
+        bind_framebuffer(gl_framebuffer, bound == 0 ? d.framebuffer : static_cast<std::uint32_t>(bound));
         // A context's first drawable sets its viewport and scissor box to the drawable's size.
-        if (viewport) viewport(0, 0, d->width, d->height);
-        if (scissor) scissor(0, 0, d->width, d->height);
+        if (viewport) viewport(0, 0, d.width, d.height);
+        if (scissor) scissor(0, 0, d.width, d.height);
     });
-    if (host_context) set_default_framebuffer(host_context, d->framebuffer);
+    if (host_context) set_default_framebuffer(host_context, d.framebuffer);
+}
+
+void NsOpenGl::attach(Address context, Address view) {
+    const auto state = objc_.find_host_state<ContextState>(context);
+    if (!state || !state->cgl) return;
+    if (state->drawable && state->drawable->view == view) return;
+    detach(context);
+    auto d = std::make_unique<Drawable>();
+    d->view = view;
+    const auto pixel_format = call(opengl_library, "_CGLGetPixelFormat", {state->cgl});
+    const auto depth = describe(pixel_format, pfa_depth_size), stencil = describe(pixel_format, pfa_stencil_size);
+    d->samples = static_cast<std::uint32_t>(std::max(0, describe(pixel_format, pfa_samples)));
+    d->depth_stencil = stencil > 0;
+    d->depth_only = depth > 0 && stencil == 0;
+    std::tie(d->width, d->height) = pixel_size(view);
+    build(*state, *d, depth, stencil);
     // The view shows the drawable through a sublayer of its layer.
     CallRegs yes{};
     yes.x[2] = 1;
@@ -250,12 +292,90 @@ void NsOpenGl::attach(Address context, Address view) {
     state->drawable = std::move(d);
 }
 
-void NsOpenGl::detach(Address context) {
-    const auto state = objc_.find_host_state<ContextState>(context);
-    if (!state || !state->drawable) return;
-    auto d = std::move(state->drawable);
-    auto* host_context = cgl_host_context(state->cgl);
+void NsOpenGl::display_layer(Address layer) {
+    const auto layer_state = this->layer(layer);
+    auto* state = &layer_state->gl;
+    layer_state->needs_display = false;
+    if (!state->cgl) {
+        CallRegs mask{};
+        mask.x[2] = 1;   // the main display's OpenGL display mask
+        layer_state->pixel_format = objc_.send(layer, "copyCGLPixelFormatForDisplayMask:", mask).x0;
+        if (!layer_state->pixel_format) return;
+        state->cgl = send1(layer, "copyCGLContextForPixelFormat:", layer_state->pixel_format);
+        if (!state->cgl) return;
+    }
+    // The drawable: the layer's bounds in pixels.
+    const auto bounds = objc_.send(layer, "bounds");
+    double scale = objc_.send(layer, "contentsScale").d(0);
+    if (!(scale > 0)) scale = 1;
+    const auto width = std::max(1, static_cast<std::int32_t>(std::lround(bounds.d(2) * scale)));
+    const auto height = std::max(1, static_cast<std::int32_t>(std::lround(bounds.d(3) * scale)));
+    if (!state->drawable) {
+        auto d = std::make_unique<Drawable>();
+        d->sublayer = layer;
+        d->owns_layer = false;
+        const auto pixel_format = call(opengl_library, "_CGLGetPixelFormat", {state->cgl});
+        const auto depth = describe(pixel_format, pfa_depth_size), stencil = describe(pixel_format, pfa_stencil_size);
+        d->samples = static_cast<std::uint32_t>(std::max(0, describe(pixel_format, pfa_samples)));
+        d->depth_stencil = stencil > 0;
+        d->depth_only = depth > 0 && stencil == 0;
+        d->width = width;
+        d->height = height;
+        build(*state, *d, depth, stencil);
+        state->drawable = std::move(d);
+    } else if (state->drawable->width != width || state->drawable->height != height) {
+        auto& d = *state->drawable;
+        d.width = width;
+        d.height = height;
+        with_current(state->cgl, [&] {
+            resize(d);
+            if (const auto viewport = gl_function<void (*)(std::int32_t, std::int32_t, std::int32_t, std::int32_t)>("glViewport"))
+                viewport(0, 0, width, height);
+        });
+    }
+    // One frame: the drawable is framebuffer 0 while the layer draws.
+    auto& memory = process_.calling_engine();
+    const auto now = gui::monotonic_seconds();
+    const auto stamp = process_.allocate_guest(80, 8);   // CVTimeStamp
+    memory.fill_bytes(stamp, 0, 80);
+    memory.write32(stamp + 4, 1'000'000'000);                              // videoTimeScale (nanoseconds)
+    memory.write64(stamp + 16, static_cast<std::uint64_t>(now * 1e9));   // hostTime
+    memory.write64(stamp + 24, std::bit_cast<std::uint64_t>(1.0));       // rateScalar
+    memory.write64(stamp + 64, 2 | 4);                                    // hostTime and rateScalar are valid
+    CallRegs frame{};
+    frame.x[2] = state->cgl;
+    frame.x[3] = layer_state->pixel_format;
+    frame.x[4] = stamp;
+    frame.set_d(0, now);
+    bool drawn = false;
     with_current(state->cgl, [&] {
+        if (const auto bind = gl_function<void (*)(std::uint32_t, std::uint32_t)>("glBindFramebuffer"))
+            bind(gl_framebuffer, state->drawable->framebuffer);
+        if ((objc_.send(layer, "canDrawInCGLContext:pixelFormat:forLayerTime:displayTime:", frame).x0 & 0xFF) == 0) return;
+        static_cast<void>(objc_.send(layer, "drawInCGLContext:pixelFormat:forLayerTime:displayTime:", frame));
+        drawn = true;
+    });
+    process_.release_guest(stamp);
+    if (drawn) flush(*state);
+    // An asynchronous layer draws its next frame in 1/60 s.
+    if (layer_state->asynchronous && !layer_state->frame_scheduled) {
+        layer_state->frame_scheduled = true;
+        CallRegs later{};
+        later.x[2] = objc_.selector("alchemyAsynchronousFrame");
+        later.set_d(0, 1.0 / 60);
+        static_cast<void>(objc_.send(layer, "performSelector:withObject:afterDelay:", later));
+    }
+}
+
+void NsOpenGl::detach(Address context) {
+    if (const auto state = objc_.find_host_state<ContextState>(context)) detach(*state);
+}
+
+void NsOpenGl::detach(ContextState& state) {
+    if (!state.drawable) return;
+    auto d = std::move(state.drawable);
+    auto* host_context = cgl_host_context(state.cgl);
+    with_current(state.cgl, [&] {
         using Delete = void (*)(std::int32_t, const std::uint32_t*);
         const auto delete_framebuffers = gl_function<Delete>("glDeleteFramebuffers");
         const auto delete_renderbuffers = gl_function<Delete>("glDeleteRenderbuffers");
@@ -269,7 +389,7 @@ void NsOpenGl::detach(Address context) {
         }
     });
     if (host_context) set_default_framebuffer(host_context, 0);
-    if (d->sublayer) {
+    if (d->sublayer && d->owns_layer) {
         static_cast<void>(send(d->sublayer, "removeFromSuperlayer"));
         static_cast<void>(send(d->sublayer, "release"));
     }
@@ -277,8 +397,11 @@ void NsOpenGl::detach(Address context) {
 }
 
 void NsOpenGl::flush(Address context) {
-    const auto state = objc_.find_host_state<ContextState>(context);
-    if (!state) return;
+    if (const auto state = objc_.find_host_state<ContextState>(context)) flush(*state);
+}
+
+void NsOpenGl::flush(ContextState& state_ref) {
+    auto* state = &state_ref;
     if (!state->drawable) {
         with_current(state->cgl, [] {
             if (const auto flush = gl_function<void (*)()>("glFlush")) flush();
@@ -642,8 +765,105 @@ void NsOpenGl::install() {
     }, false, "v@:");
 }
 
+void NsOpenGl::install_layer(Address layer_class) {
+    auto* self = this;
+    // CGLTypes.h: kCGLPFAColorSize, kCGLPFAAlphaSize, kCGLPFAAccelerated, kCGLPFADisplayMask.
+    constexpr std::uint32_t pfa_color_size = 8, pfa_alpha_size = 11, pfa_accelerated = 73, pfa_display_mask = 84;
+    method(layer_class, "copyCGLPixelFormatForDisplayMask:", [self](CpuState& s, GuestMemory& m) {
+        const std::array<std::uint32_t, 8> attributes{pfa_display_mask, static_cast<std::uint32_t>(s.x[2]), pfa_accelerated,
+                                                      pfa_color_size, 24, pfa_alpha_size, 8, 0};
+        const auto list = self->process_.allocate_guest(attributes.size() * 4 + 16, 8);
+        for (std::size_t i = 0; i < attributes.size(); ++i) m.write32(list + i * 4, attributes[i]);
+        const auto out = list + attributes.size() * 4;
+        m.fill_bytes(out, 0, 16);
+        const auto code = self->cgl("_CGLChoosePixelFormat", {list, out, out + 8});
+        s.x[0] = code == 0 ? m.read64(out) : 0;
+        self->process_.release_guest(list);
+    }, false, "^v@:I");
+    method(layer_class, "copyCGLContextForPixelFormat:", [self](CpuState& s, GuestMemory& m) {
+        const auto out = self->process_.allocate_guest(8, 8);
+        m.write64(out, 0);
+        const auto code = s.x[2] ? self->cgl("_CGLCreateContext", {s.x[2], 0, out}) : -1;
+        s.x[0] = code == 0 ? m.read64(out) : 0;
+        self->process_.release_guest(out);
+    }, false, "^v@:^v");
+    method(layer_class, "releaseCGLContext:", [self](CpuState& s, GuestMemory&) {
+        if (s.x[2]) static_cast<void>(self->call(opengl_library, "_CGLReleaseContext", {s.x[2]}));
+    }, false, "v@:^v");
+    method(layer_class, "releaseCGLPixelFormat:", [self](CpuState& s, GuestMemory&) {
+        if (s.x[2]) static_cast<void>(self->call(opengl_library, "_CGLReleasePixelFormat", {s.x[2]}));
+    }, false, "v@:^v");
+    method(layer_class, "canDrawInCGLContext:pixelFormat:forLayerTime:displayTime:", [](CpuState& s, GuestMemory&) { s.x[0] = 1; },
+           false, "B@:^v^vd^v");
+    // The default drawing flushes the context.
+    method(layer_class, "drawInCGLContext:pixelFormat:forLayerTime:displayTime:", [self](CpuState& s, GuestMemory&) {
+        if (!s.x[2]) return;
+        self->with_current(s.x[2], [] {
+            if (const auto flush = gl_function<void (*)()>("glFlush")) flush();
+        });
+    }, false, "v@:^v^vd^v");
+    method(layer_class, "isAsynchronous", [self](CpuState& s, GuestMemory&) {
+        const auto state = self->layer(s.x[0], false);
+        s.x[0] = state && state->asynchronous ? 1 : 0;
+    }, false, "B@:");
+    method(layer_class, "setAsynchronous:", [self](CpuState& s, GuestMemory&) {
+        const auto state = self->layer(s.x[0]);
+        const bool on = (s.x[2] & 0xFF) != 0;
+        const bool start = on && !state->asynchronous;
+        state->asynchronous = on;
+        if (start) static_cast<void>(self->send(s.x[0], "setNeedsDisplay"));
+    }, false, "v@:B");
+    method(layer_class, "alchemyAsynchronousFrame", [self](CpuState& s, GuestMemory&) {
+        const auto state = self->layer(s.x[0]);
+        state->frame_scheduled = false;
+        if (state->asynchronous) self->display_layer(s.x[0]);
+    }, false, "v@:");
+    method(layer_class, "display", [self](CpuState& s, GuestMemory&) { self->display_layer(s.x[0]); }, false, "v@:");
+    // As at a Core Animation commit, a layer that needs display displays on the main thread's run loop.
+    const auto needs_display = [self](CpuState& s, GuestMemory&) {
+        const auto state = self->layer(s.x[0]);
+        state->needs_display = true;
+        if (std::exchange(state->display_queued, true)) return;
+        CallRegs later{};
+        later.x[2] = self->objc_.selector("displayIfNeeded");
+        static_cast<void>(self->objc_.send(s.x[0], "performSelectorOnMainThread:withObject:waitUntilDone:", later));
+    };
+    method(layer_class, "setNeedsDisplay", needs_display, false, "v@:");
+    method(layer_class, "setNeedsDisplayInRect:", needs_display, false, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    method(layer_class, "needsDisplay", [self](CpuState& s, GuestMemory&) {
+        const auto state = self->layer(s.x[0], false);
+        s.x[0] = state && state->needs_display ? 1 : 0;
+    }, false, "B@:");
+    method(layer_class, "displayIfNeeded", [self](CpuState& s, GuestMemory&) {
+        const auto state = self->layer(s.x[0]);
+        state->display_queued = false;
+        if (state->needs_display) self->display_layer(s.x[0]);
+    }, false, "v@:");
+    method(layer_class, "dealloc", [self, layer_class](CpuState& s, GuestMemory&) {
+        const auto layer = s.x[0];
+        if (const auto layer_state = self->layer(layer, false)) {
+            self->detach(layer_state->gl);
+            if (layer_state->gl.cgl) static_cast<void>(self->send1(layer, "releaseCGLContext:", layer_state->gl.cgl));
+            if (layer_state->pixel_format) static_cast<void>(self->send1(layer, "releaseCGLPixelFormat:", layer_state->pixel_format));
+            std::lock_guard lock(self->mutex_);
+            self->layers_.erase(layer);
+        }
+        static_cast<void>(self->objc_.send_super(layer, layer_class, self->objc_.selector("dealloc")));
+    }, false, "v@:");
+}
+
 } // namespace
 
-void install_nsopengl(gui::InstallContext& context) { std::make_shared<NsOpenGl>(context)->install(); }
+void install_nsopengl(gui::InstallContext& context) {
+    const auto opengl = std::make_shared<NsOpenGl>(context);
+    opengl->install();
+    // CAOpenGLLayer is QuartzCore's; its drawing is OpenGL's.
+    if (const auto layer = context.objc.find_class("CALayer")) {
+        auto layer_class = context.objc.find_class("CAOpenGLLayer");
+        if (!layer_class) layer_class = context.objc.register_native_class("CAOpenGLLayer", layer, 8);
+        context.objc.publish_class("CAOpenGLLayer", layer_class, gui::fill::quartz_core);
+        opengl->install_layer(layer_class);
+    }
+}
 
 } // namespace alchemy::opengl

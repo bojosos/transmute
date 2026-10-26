@@ -6,7 +6,8 @@
 //   cgl_contexts.cpp  CGL: pixel formats, contexts, the current context, parameters, renderer
 //                     info, IOSurface textures
 //   nsopengl.cpp      AppKit's NSOpenGLPixelFormat, NSOpenGLContext and NSOpenGLView on CGL, with
-//                     view drawables (a framebuffer object shown through an IOSurface sublayer)
+//                     view drawables (a framebuffer object shown through an IOSurface sublayer),
+//                     and CAOpenGLLayer
 //   install.cpp       the installer row
 
 #include "alchemy/gui/install.hpp"

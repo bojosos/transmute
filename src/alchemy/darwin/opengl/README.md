@@ -30,6 +30,14 @@ OpenGL over Vulkan) are in the frameworks wave's notes, 2026-10-25.
       GL_BACK/GL_FRONT name its color attachment.
     * `-flushBuffer` reads the drawable back into an IOSurface shown as the contents of a sublayer of the
       view's layer, which the window compositor shows.
+  * **CAOpenGLLayer** (`nsopengl.cpp`; the class is created here, as QuartzCore's):
+    * its pixel format and context come from its own `-copyCGLPixelFormatForDisplayMask:` and
+      `-copyCGLContextForPixelFormat:`, which subclasses may override;
+    * `-display` draws one frame into a drawable of the bounds times `contentsScale` in pixels (framebuffer 0
+      while it draws): `-canDrawInCGLContext:...`, then `-drawInCGLContext:...` (by default a flush). The
+      frame becomes the layer's own contents as an IOSurface.
+    * `-setNeedsDisplay` displays on the main thread's run loop, and an asynchronous layer draws again every
+      1/60 s.
 * **Different from macOS:**
   * **`CGLTexImageIOSurface2D` copies** the surface's pixels into the texture when it is called, under
     a read lock. On macOS the texture aliases the surface.
@@ -47,7 +55,6 @@ OpenGL over Vulkan) are in the frameworks wave's notes, 2026-10-25.
   * An entry point the host driver lacks stops with its name.
   * NSOpenGLContext full-screen and off-screen drawables and `-copyAttributesFromContext:withMask:` stop
     with a message. `-[NSOpenGLPixelFormat initWithData:]` answers nil.
-  * CAOpenGLLayer is not provided yet.
 * **Host dependencies:** `host::gl` (contexts, entry points). The gl\* functions themselves are
   called directly: OpenGL is portable.
 * **Registration:**
