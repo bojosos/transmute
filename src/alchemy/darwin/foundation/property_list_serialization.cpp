@@ -68,6 +68,63 @@ public:
         method(plist, "propertyList:isValidForFormat:", [this](CpuState& s, GuestMemory&) {
             s.x[0] = call(core_foundation, "_CFPropertyListIsValid", {s.x[2], s.x[3]}) & 0xff;
         }, true, "B@:@Q");
+        const auto send = [this](Address receiver, std::string_view selector, std::initializer_list<Address> arguments) {
+            CallRegs registers{};
+            unsigned index = 2;
+            for (const auto argument : arguments) registers.x[index++] = argument;
+            return objc.send(receiver, selector, registers).x0;
+        };
+        // +writePropertyList:toStream:format:options:error: -> the bytes written (0 on error).
+        method(plist, "writePropertyList:toStream:format:options:error:", [this, send, autorelease_error](CpuState& s, GuestMemory& m) {
+            if (s.x[6]) m.write64(s.x[6], 0);
+            const auto data = call(core_foundation, "_CFPropertyListCreateData", {0, s.x[2], s.x[4], s.x[5], s.x[6]});
+            autorelease_error(m, s.x[6]);
+            if (!data) { s.x[0] = 0; return; }
+            const auto written = static_cast<std::int64_t>(send(s.x[3], "write:maxLength:",
+                {call(core_foundation, "_CFDataGetBytePtr", {data}), call(core_foundation, "_CFDataGetLength", {data})}));
+            release(data);
+            s.x[0] = written < 0 ? 0 : static_cast<Address>(written);
+        }, true, "q@:@@QQ^@");
+        // +propertyListWithStream:options:format:error: reads the open stream to its end.
+        method(plist, "propertyListWithStream:options:format:error:", [this, send, autorelease_error](CpuState& s, GuestMemory& m) {
+            const auto data = call(core_foundation, "_CFDataCreateMutable", {0, 0});
+            const auto buffer = malloc(65536);
+            for (;;) {
+                const auto count = static_cast<std::int64_t>(send(s.x[2], "read:maxLength:", {buffer, 65536}));
+                if (count <= 0) break;
+                static_cast<void>(call(core_foundation, "_CFDataAppendBytes", {data, buffer, static_cast<Address>(count)}));
+            }
+            free(buffer);
+            if (s.x[5]) m.write64(s.x[5], 0);
+            const auto result = call(core_foundation, "_CFPropertyListCreateWithData", {0, data, s.x[3], s.x[4], s.x[5]});
+            release(data);
+            autorelease_error(m, s.x[5]);
+            s.x[0] = bridge->autorelease(result);
+        }, true, "@@:@Q^Q^@");
+        // The older forms report a failure as a string (the error's description).
+        const auto description_of = [this, send](GuestMemory& m, Address error_slot, Address out) {
+            if (!out) return;
+            const auto error = m.read64(error_slot);
+            m.write64(out, error ? send(error, "localizedDescription", {}) : 0);
+        };
+        method(plist, "dataFromPropertyList:format:errorDescription:", [this, description_of](CpuState& s, GuestMemory& m) {
+            const auto error = malloc(8);
+            m.write64(error, 0);
+            const auto result = call(core_foundation, "_CFPropertyListCreateData", {0, s.x[2], s.x[3], 0, error});
+            if (const auto failure = m.read64(error)) { m.write64(error, bridge->autorelease(failure)); }
+            description_of(m, error, s.x[4]);
+            free(error);
+            s.x[0] = bridge->autorelease(result);
+        }, true, "@@:@Q^@");
+        method(plist, "propertyListFromData:mutabilityOption:format:errorDescription:", [this, description_of](CpuState& s, GuestMemory& m) {
+            const auto error = malloc(8);
+            m.write64(error, 0);
+            const auto result = call(core_foundation, "_CFPropertyListCreateWithData", {0, s.x[2], s.x[3], s.x[4], error});
+            if (const auto failure = m.read64(error)) { m.write64(error, bridge->autorelease(failure)); }
+            description_of(m, error, s.x[5]);
+            free(error);
+            s.x[0] = bridge->autorelease(result);
+        }, true, "@@:@Q^Q^@");
 
         // NSAssertionHandler: an assertion failure ends the process.
         const auto handler_class = cls(foundation, "NSAssertionHandler", "NSObject");

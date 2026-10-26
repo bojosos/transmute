@@ -9,7 +9,15 @@
 
 // Foundation's install entries (install.hpp), each the files of one old
 // aggregator position, in their old order.
-namespace alchemy::gui::completion_kit { void install_streams(Support& support); }   // streams.cpp
+namespace alchemy::gui::completion_kit {
+void install_streams(Support& support);          // streams.cpp
+void install_url_components(Support& support);   // url_components.cpp
+} // namespace alchemy::gui::completion_kit
+namespace alchemy::gui::completion_kit::data {
+void install_strings_more(Support& support);       // strings_more.cpp
+void install_collections_more(Support& support);   // collections_more.cpp
+void install_foundation_more(Support& support);    // foundation_more.cpp
+} // namespace alchemy::gui::completion_kit::data
 
 namespace alchemy::gui {
 
@@ -42,8 +50,10 @@ void install_foundation_data_classes(support_kit::Support& support) {
     completion_kit::data::install_class_objects(support);
     completion_kit::data::install_sorting(support);
     completion_kit::data::install_collections_extra(support);
+    completion_kit::data::install_collections_more(support);
     completion_kit::data::install_pointer_collections(support);
     completion_kit::data::install_strings(support);
+    completion_kit::data::install_strings_more(support);
     completion_kit::data::install_scanner(support);
     completion_kit::data::install_regex(support);
     completion_kit::data::install_predicates(support);
@@ -77,7 +87,9 @@ void install_foundation_kvc_collections_and_queues(support_kit::Support& support
 
 void install_foundation_files_and_bundles(support_kit::Support& support) {
     completion_kit::install_streams(support);
+    completion_kit::install_url_components(support);
     completion_kit::install_files(support);
+    completion_kit::data::install_foundation_more(support);
     completion_kit::install_bundles(support);
 }
 

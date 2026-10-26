@@ -152,6 +152,7 @@ struct Defaults : ObjectPayload {
     std::vector<std::string> suites;   // addSuiteNamed:
     Plist registration{Plist::Kind::dictionary};
     Plist arguments{Plist::Kind::dictionary};
+    std::map<std::string, Plist> volatile_domains;   // setVolatileDomain:forName: (not searched, as on macOS)
 };
 
 std::optional<double> numeric(const Plist& value) {
@@ -561,6 +562,68 @@ void install_cf_preferences(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) 
         static_cast<void>(Preferences::synchronize(domain));
         s.x[0] = 0;
     }, false, "v@:@");
+
+    // ---- volatile domains: NSArgumentDomain and NSRegistrationDomain, and those set by name ----
+    method("volatileDomainNames", [&process, &cf, state, autorelease](CpuState& s, GuestMemory&) {
+        const auto defaults = state(s.x[0]);
+        std::vector<std::uint64_t> names{cf.string("NSArgumentDomain"), cf.string("NSRegistrationDomain")};
+        for (const auto& [name, domain] : defaults->volatile_domains) names.push_back(cf.string(name));
+        const auto list = cf.array(names);
+        for (const auto name : names) process.objects().release(name);
+        s.x[0] = autorelease(list);
+    });
+    method("volatileDomainForName:", [&process, &cf, state, autorelease](CpuState& s, GuestMemory&) {
+        const auto defaults = state(s.x[0]);
+        const auto name = s.x[2] ? cf.utf8(s.x[2]) : std::string();
+        const Plist* domain = name == "NSArgumentDomain" ? &defaults->arguments : name == "NSRegistrationDomain" ? &defaults->registration : nullptr;
+        if (!domain) if (const auto found = defaults->volatile_domains.find(name); found != defaults->volatile_domains.end()) domain = &found->second;
+        s.x[0] = domain ? autorelease(plist_to_guest(process, cf, *domain)) : 0;
+    }, false, "@@:@");
+    method("setVolatileDomain:forName:", [&process, &cf, state](CpuState& s, GuestMemory&) {
+        const auto defaults = state(s.x[0]);
+        const auto name = s.x[3] ? cf.utf8(s.x[3]) : std::string();
+        if (name == "NSArgumentDomain" || name == "NSRegistrationDomain" || defaults->volatile_domains.contains(name))
+            throw std::runtime_error("Alchemy: NSInvalidArgumentException: a volatile domain named " + name + " already exists");
+        defaults->volatile_domains[name] = s.x[2] ? plist_from_guest(process, cf, s.x[2]) : Plist{Plist::Kind::dictionary};
+        s.x[0] = 0;
+    }, false, "v@:@@");
+    method("removeVolatileDomainForName:", [&cf, state](CpuState& s, GuestMemory&) {
+        const auto defaults = state(s.x[0]);
+        const auto name = s.x[2] ? cf.utf8(s.x[2]) : std::string();
+        if (name == "NSRegistrationDomain") defaults->registration = Plist{Plist::Kind::dictionary};
+        else if (name == "NSArgumentDomain") defaults->arguments = Plist{Plist::Kind::dictionary};
+        else defaults->volatile_domains.erase(name);
+        s.x[0] = 0;
+    }, false, "v@:@");
+    method("objectIsForcedForKey:inDomain:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:@@");   // no managed preferences
+    // URLs: stored as their absolute strings; a stored path ("/..." or "~/...") reads back as a file URL.
+    method("setURL:forKey:", [&objc](CpuState& s, GuestMemory&) {
+        CallRegs registers{};
+        if (s.x[2]) {
+            registers.x[2] = objc.send(s.x[2], "absoluteString", {}).x0;
+            registers.x[3] = s.x[3];
+            static_cast<void>(objc.send(s.x[0], "setObject:forKey:", registers));
+        } else {
+            registers.x[2] = s.x[3];
+            static_cast<void>(objc.send(s.x[0], "removeObjectForKey:", registers));
+        }
+        s.x[0] = 0;
+    }, false, "v@:@@");
+    method("URLForKey:", [&process, &objc, &cf, p, lookup](CpuState& s, GuestMemory&) {
+        const auto value = s.x[2] ? lookup(s.x[0], cf.utf8(s.x[2])) : std::nullopt;
+        s.x[0] = 0;
+        if (!value || value->kind != Plist::Kind::string) return;
+        auto text = value->text;
+        const bool path = text.starts_with('/') || text.starts_with("~/");
+        if (text.starts_with("~/")) {
+            const auto home = p.call("/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation", "_NSHomeDirectory", {});
+            if (home) text = cf.utf8(home) + text.substr(1);
+        }
+        CallRegs registers{};
+        registers.x[2] = cf.string(text);
+        s.x[0] = objc.send(objc.find_class("NSURL"), path ? "fileURLWithPath:" : "URLWithString:", registers).x0;
+        process.objects().release(registers.x[2]);
+    }, false, "@@:@");
 }
 
 } // namespace alchemy::export_fill

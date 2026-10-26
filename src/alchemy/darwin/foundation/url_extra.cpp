@@ -24,6 +24,13 @@
 //                                keys answer NO with NSFeatureUnsupportedError
 //                                (3328); non-file URLs NO with
 //                                NSFileWriteUnsupportedSchemeError (518).
+//   file URLs' empty components  host, port, user, password, query, fragment,
+//                                parameterString and baseURL are nil;
+//                                resourceSpecifier, dataRepresentation,
+//                                +fileURLWithPathComponents:, the ...relativeToURL:
+//                                constructors (resolved to absolute paths) and the
+//                                data-representation constructors; no resource
+//                                values are cached, so removing them does nothing.
 namespace alchemy::gui::completion_kit::data {
 namespace {
 
@@ -169,6 +176,76 @@ void install_url_extra(Support& support) {
             }
         return_bool(s, ok);
     }, "B@:@^@");
+
+    // ---- file URLs: no authority, query or fragment (the network URLs answer for themselves) ----
+    for (const auto* name : {"host", "port", "user", "password", "query", "fragment", "parameterString", "baseURL"})
+        fill_method(support, url, name, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:");
+    fill_method(support, url, "isFileReferenceURL", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // "file:///path" -> "///path": everything after the scheme's colon.
+    fill_method(support, url, "resourceSpecifier", [g](CpuState& s, GuestMemory&) {
+        const auto text = g->utf8(g->s.send_id(s.x[0], "absoluteString"));
+        const auto colon = text.find(':');
+        s.x[0] = g->auto_string(std::string_view(colon == std::string::npos ? text : text.substr(colon + 1)));
+    }, "@@:");
+    fill_method(support, url, "dataRepresentation", [g](CpuState& s, GuestMemory&) {
+        s.x[0] = g->s.send_id(g->s.send_id(s.x[0], "relativeString"), "dataUsingEncoding:", {4});   // NSUTF8StringEncoding
+    }, "@@:");
+    // Resource values are never cached, so there is nothing to remove.
+    fill_method(support, url, "removeAllCachedResourceValues", [](CpuState&, GuestMemory&) {}, "v@:");
+    fill_method(support, url, "removeCachedResourceValueForKey:", [](CpuState&, GuestMemory&) {}, "v@:@");
+    // +fileURLWithPathComponents: "/" then the components joined by "/".
+    fill_method(support, url, "fileURLWithPathComponents:", [g](CpuState& s, GuestMemory&) {
+        const auto parts = s.x[2] ? g->elements(s.x[2]) : std::vector<Address>{};
+        if (parts.empty()) { s.x[0] = 0; return; }
+        std::string path;
+        for (std::size_t index = 0; index < parts.size(); ++index) {
+            const auto part = g->utf8(parts[index]);
+            if (index && !path.ends_with('/')) path += '/';
+            path += part;
+        }
+        s.x[0] = g->s.send_id(s.x[0], "fileURLWithPath:", {g->auto_string(std::string_view(path))});
+    }, "@@:@", true);
+    // Relative paths against a base URL's path (Alchemy's file URLs are kept absolute).
+    const auto against = [g](Address path, Address base) {
+        auto text = g->utf8(path);
+        if (base && !text.starts_with('/')) text = g->utf8(g->s.send_id(base, "path")) + "/" + text;
+        return g->auto_string(std::string_view(text));
+    };
+    fill_method(support, url, "fileURLWithPath:relativeToURL:", [g, against](CpuState& s, GuestMemory&) {
+        s.x[0] = g->s.send_id(s.x[0], "fileURLWithPath:", {against(s.x[2], s.x[3])});
+    }, "@@:@@", true);
+    fill_method(support, url, "fileURLWithPath:isDirectory:relativeToURL:", [g, against](CpuState& s, GuestMemory&) {
+        s.x[0] = g->s.send_id(s.x[0], "fileURLWithPath:isDirectory:", {against(s.x[2], s.x[4]), s.x[3] & 0xff});
+    }, "@@:@B@", true);
+    fill_method(support, url, "initFileURLWithPath:relativeToURL:", [g, against](CpuState& s, GuestMemory&) {
+        const auto result = g->retain(g->s.send_id(g->s.objc.object_class(s.x[0]), "fileURLWithPath:", {against(s.x[2], s.x[3])}));
+        g->release(s.x[0]);
+        s.x[0] = result;
+    }, "@@:@@");
+    fill_method(support, url, "initFileURLWithPath:isDirectory:relativeToURL:", [g, against](CpuState& s, GuestMemory&) {
+        const auto result = g->retain(g->s.send_id(g->s.objc.object_class(s.x[0]), "fileURLWithPath:isDirectory:", {against(s.x[2], s.x[4]), s.x[3] & 0xff}));
+        g->release(s.x[0]);
+        s.x[0] = result;
+    }, "@@:@B@");
+    // Data representations: the URL string's UTF-8 bytes.
+    const auto from_data = [g](Address cls, Address data, Address base, bool absolute) -> Address {
+        if (!data) return 0;
+        const auto text = g->autorelease(g->s.send_id(g->s.send_id(g->s.objc.find_class("NSString"), "alloc"), "initWithData:encoding:", {data, 4}));
+        if (!text) return 0;
+        const auto result = base ? g->s.send_id(cls, "URLWithString:relativeToURL:", {text, base}) : g->s.send_id(cls, "URLWithString:", {text});
+        return result && absolute ? g->s.send_id(result, "absoluteURL") : result;
+    };
+    fill_method(support, url, "URLWithDataRepresentation:relativeToURL:", [from_data](CpuState& s, GuestMemory&) {
+        s.x[0] = from_data(s.x[0], s.x[2], s.x[3], false);
+    }, "@@:@@", true);
+    fill_method(support, url, "absoluteURLWithDataRepresentation:relativeToURL:", [from_data](CpuState& s, GuestMemory&) {
+        s.x[0] = from_data(s.x[0], s.x[2], s.x[3], true);
+    }, "@@:@@", true);
+    fill_method(support, url, "initWithDataRepresentation:relativeToURL:", [g, from_data](CpuState& s, GuestMemory&) {
+        const auto result = g->retain(from_data(g->s.objc.object_class(s.x[0]), s.x[2], s.x[3], false));
+        g->release(s.x[0]);
+        s.x[0] = result;
+    }, "@@:@@");
 }
 
 } // namespace alchemy::gui::completion_kit::data

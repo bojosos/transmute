@@ -45,6 +45,9 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/foundation/sorting.cpp
     src/alchemy/darwin/foundation/collections_extra.cpp
     src/alchemy/darwin/foundation/strings.cpp
+    src/alchemy/darwin/foundation/strings_more.cpp
+    src/alchemy/darwin/foundation/collections_more.cpp
+    src/alchemy/darwin/foundation/foundation_more.cpp
     src/alchemy/darwin/foundation/scanner.cpp
     src/alchemy/darwin/foundation/regex_provider.cpp
     src/alchemy/darwin/foundation/predicate_provider.cpp
@@ -67,6 +70,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/foundation/kvc_collections.cpp
     src/alchemy/darwin/foundation/notification_queue.cpp
     src/alchemy/darwin/foundation/streams.cpp
+    src/alchemy/darwin/foundation/url_components.cpp
     src/alchemy/darwin/foundation/files.cpp
     src/alchemy/darwin/foundation/bundles.cpp
     src/alchemy/darwin/foundation/sdef.cpp
@@ -94,6 +98,10 @@ function(alchemy_darwin_foundation_tests)
     alchemy_gui_add_unit_test(alchemy_gui_foundation_value_classes src/alchemy/darwin/foundation/tests/value_classes_tests.cpp TIMEOUT 120)
     # NSStream / CFStream (streams.cpp): data, memory, buffers, files, bound pairs, loopback sockets and events.
     alchemy_gui_add_unit_test(alchemy_gui_foundation_streams src/alchemy/darwin/foundation/tests/streams_tests.cpp TIMEOUT 120)
+    # NSURLComponents, the CFURL additions and NSURL's file-URL additions.
+    alchemy_gui_add_unit_test(alchemy_gui_foundation_urls src/alchemy/darwin/foundation/tests/urls_tests.cpp TIMEOUT 120)
+    # Core-class additions: strings_more, collections_more, foundation_more, plist streams, NSUserDefaults volatile domains.
+    alchemy_gui_add_unit_test(alchemy_gui_foundation_core_classes src/alchemy/darwin/foundation/tests/core_classes_tests.cpp TIMEOUT 120)
     if(NOT ALCHEMY_GUI_FIXTURES_ENABLED)
         return()
     endif()
