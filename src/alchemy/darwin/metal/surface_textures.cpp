@@ -33,10 +33,12 @@
 // the texture. The pages stay mapped while GPU work on them may run
 // (SurfacePages::keep), also after the IOSurface is freed.
 //
-// Supported: plane 0 of a chunky surface, MTLTextureType2D, one level, one
-// sample, one slice, a pixel format whose texel size is the surface's
-// bytesPerElement, width and height within the surface. Anything else
-// answers nil (Metal's failure value) and is reported once per reason.
+// Supported: plane 0 of a chunky surface or any plane of a planar one (video
+// frames: '420v' has an R8 luma and an RG8 chroma plane) whose elements are
+// single texels, MTLTextureType2D, one level, one sample, one slice, a pixel
+// format whose texel size is the plane's bytesPerElement, width and height
+// within the plane. Anything else answers nil (Metal's failure value) and is
+// reported once per reason.
 #if __has_include("alchemy/darwin/quartzcore/quartzcore_vulkan.hpp")
 #include "alchemy/darwin/quartzcore/quartzcore_vulkan.hpp"
 #define ALCHEMY_METAL_SURFACE_TEXTURES 1
@@ -162,10 +164,13 @@ void memory_barrier(const Device& device, VkCommandBuffer command, VkPipelineSta
 
 class SurfaceTexture final : public SurfaceBacking, public std::enable_shared_from_this<SurfaceTexture> {
 public:
+    // The texture's rows are the plane's: `offset` bytes into the pages, `row_bytes` apart.
     SurfaceTexture(std::shared_ptr<Device> owner, qc::SurfacePages surface, std::uint64_t surface_plane, VkImage target,
-                   std::uint32_t texel_bytes, std::uint32_t texture_width, std::uint32_t texture_height)
+                   std::uint32_t texel_bytes, std::uint32_t texture_width, std::uint32_t texture_height, std::uint64_t offset,
+                   std::uint64_t row_bytes)
         : device(std::move(owner)), pages(std::move(surface)), plane_(surface_plane), image(target), block_bytes(texel_bytes),
-          width(texture_width), height(texture_height), import(import_pages(device, pages)) {}
+          width(texture_width), height(texture_height), plane_offset(offset), plane_row_bytes(row_bytes),
+          import(import_pages(device, pages)) {}
 
     [[nodiscard]] std::uint64_t writes_submitted() const override { return qc::gpu_writes_submitted(pages); }
 
@@ -181,7 +186,7 @@ public:
                        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
         std::function<void()> work;
         if (import) {
-            const auto region = copy_region(pages.bytes_per_row);
+            const auto region = copy_region(plane_row_bytes, plane_offset);
             device->vk.vkCmdCopyBufferToImage(command, import->buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         } else {
             // The pages through host memory, as they are once the GPU writes
@@ -193,8 +198,9 @@ public:
             const auto row = static_cast<std::uint64_t>(width) * block_bytes;
             auto staging = Buffer::create(device, row * height, {StorageMode::shared, 1});
             for (std::uint32_t y = 0; y < height; ++y)
-                std::memcpy(staging->contents() + y * row, reinterpret_cast<const void*>(pages.base + y * pages.bytes_per_row), row);
-            const auto region = copy_region(row);
+                std::memcpy(staging->contents() + y * row,
+                            reinterpret_cast<const void*>(pages.base + plane_offset + y * plane_row_bytes), row);
+            const auto region = copy_region(row, 0);
             device->vk.vkCmdCopyBufferToImage(command, staging->buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
             work = [staging] {};
         }
@@ -215,18 +221,19 @@ public:
         std::shared_ptr<Buffer> staging;
         const auto row = static_cast<std::uint64_t>(width) * block_bytes;
         if (import) {
-            const auto region = copy_region(pages.bytes_per_row);
+            const auto region = copy_region(plane_row_bytes, plane_offset);
             device->vk.vkCmdCopyImageToBuffer(command, image, VK_IMAGE_LAYOUT_GENERAL, import->buffer, 1, &region);
         } else {
             staging = Buffer::create(device, row * height, {StorageMode::shared, 1});
-            const auto region = copy_region(row);
+            const auto region = copy_region(row, 0);
             device->vk.vkCmdCopyImageToBuffer(command, image, VK_IMAGE_LAYOUT_GENERAL, staging->buffer, 1, &region);
         }
         // The caller's host barrier (ALL_COMMANDS -> HOST) follows.
         return [self = shared_from_this(), ticket, staging, row] {
             if (staging)
                 for (std::uint32_t y = 0; y < self->height; ++y)
-                    std::memcpy(reinterpret_cast<void*>(self->pages.base + y * self->pages.bytes_per_row), staging->contents() + y * row, row);
+                    std::memcpy(reinterpret_cast<void*>(self->pages.base + self->plane_offset + y * self->plane_row_bytes),
+                                staging->contents() + y * row, row);
             // The image equals the pages again unless the CPU wrote them
             // meanwhile (the seed then moved twice: the next use uploads).
             const auto before = self->pages.seed();
@@ -244,12 +251,14 @@ public:
     const std::uint64_t plane_;
     const VkImage image;
     const std::uint32_t block_bytes, width, height;
+    const std::uint64_t plane_offset, plane_row_bytes;
     const std::shared_ptr<PagesBuffer> import;
     std::atomic<std::uint64_t> uploads{0}, downloads{0};
 
 private:
-    [[nodiscard]] VkBufferImageCopy copy_region(std::uint64_t row_bytes) const {
+    [[nodiscard]] VkBufferImageCopy copy_region(std::uint64_t row_bytes, std::uint64_t offset) const {
         VkBufferImageCopy region{};
+        region.bufferOffset = offset;
         region.bufferRowLength = static_cast<std::uint32_t>(row_bytes / block_bytes);
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.imageExtent = {width, height, 1};
@@ -265,7 +274,22 @@ Address new_surface_texture(Address device_object, Address descriptor, Address s
     if (!descriptor) { report_once("nil descriptor"); return 0; }
     const auto pages = qc::surface_pages(surface);
     if (!pages) { report_once("the argument is not an IOSurfaceRef of this provider"); return 0; }
-    if (plane != 0) { report_once("plane " + std::to_string(plane) + " of a chunky surface"); return 0; }
+    // The plane's geometry: the whole surface when it is chunky.
+    qc::SurfacePlane geometry{pages->width, pages->height, pages->bytes_per_element, 1, 1, 0, pages->bytes_per_row};
+    if (pages->planes.empty()) {
+        if (plane != 0) { report_once("plane " + std::to_string(plane) + " of a chunky surface"); return 0; }
+    } else {
+        if (plane >= pages->planes.size()) {
+            report_once("plane " + std::to_string(plane) + " of a surface with " + std::to_string(pages->planes.size()) + " planes");
+            return 0;
+        }
+        geometry = pages->planes[plane];
+        if (geometry.element_width != 1 || geometry.element_height != 1) {
+            report_once("plane " + std::to_string(plane) + " has " + std::to_string(geometry.element_width) + "x" +
+                        std::to_string(geometry.element_height) + "-pixel elements");
+            return 0;
+        }
+    }
     const auto type = descriptor_u64(descriptor, "textureType");
     const auto levels = descriptor_u64(descriptor, "mipmapLevelCount");
     const auto samples = descriptor_u64(descriptor, "sampleCount");
@@ -281,16 +305,18 @@ Address new_surface_texture(Address device_object, Address descriptor, Address s
         report_once("MTLPixelFormat " + std::to_string(format) + " is not a color format an IOSurface can back");
         return 0;
     }
-    if (info->block_bytes != pages->bytes_per_element || pages->bytes_per_row % info->block_bytes) {
+    if (info->block_bytes != geometry.bytes_per_element || geometry.bytes_per_row % info->block_bytes ||
+        geometry.offset % info->block_bytes) {
         report_once("MTLPixelFormat" + std::string(info->name) + " has " + std::to_string(info->block_bytes) +
-                    " bytes per texel; the surface has " + std::to_string(pages->bytes_per_element) + " per element");
+                    " bytes per texel; the surface's plane " + std::to_string(plane) + " has " +
+                    std::to_string(geometry.bytes_per_element) + " per element");
         return 0;
     }
     const auto width = static_cast<std::uint32_t>(std::max<std::uint64_t>(1, descriptor_u64(descriptor, "width")));
     const auto height = static_cast<std::uint32_t>(std::max<std::uint64_t>(1, descriptor_u64(descriptor, "height")));
-    if (width > pages->width || height > pages->height) {
-        report_once("the texture (" + std::to_string(width) + "x" + std::to_string(height) + ") is larger than the surface (" +
-                    std::to_string(pages->width) + "x" + std::to_string(pages->height) + ")");
+    if (width > geometry.width || height > geometry.height) {
+        report_once("the texture (" + std::to_string(width) + "x" + std::to_string(height) + ") is larger than the surface's plane " +
+                    std::to_string(plane) + " (" + std::to_string(geometry.width) + "x" + std::to_string(geometry.height) + ")");
         return 0;
     }
     // The texture itself is an ordinary one of the device (descriptor,
@@ -300,7 +326,8 @@ Address new_surface_texture(Address device_object, Address descriptor, Address s
     const auto object = r.objc.send(device_object, "newTextureWithDescriptor:", arguments).x0;
     const auto texture = texture_of(object);
     if (!texture) { r.release(object); return 0; }
-    texture->surface = std::make_shared<SurfaceTexture>(texture->device, *pages, plane, texture->image, info->block_bytes, width, height);
+    texture->surface = std::make_shared<SurfaceTexture>(texture->device, *pages, plane, texture->image, info->block_bytes, width, height,
+                                                        geometry.offset, geometry.bytes_per_row);
     // The texture retains its IOSurface (released in -dealloc).
     if (const auto held = r.objc.find_host_state<Held>(object)) held->keep(r.retain(surface));
     return object;

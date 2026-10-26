@@ -1,0 +1,328 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy GPU interop: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+td, th { padding: 2px 10px; text-align: left; vertical-align: top; }
+</style>
+</head>
+<body>
+<h1 id="h">Alchemy GPU interop</h1>
+<p>How real pages move pixels between the web platform's surfaces: images, accelerated 2D canvases, video,
+WebGL and WebGPU canvases, ImageBitmaps, VideoFrames and workers. Written for Alchemy (no network: images are made
+by a canvas, video by a canvas capture stream). Each test reads the result back and compares it with what it drew.
+The verdict goes into <code>document.title</code> (<code>Alchemy GPU interop: PASS</code> or
+<code>Alchemy GPU interop: FAIL &lt;test&gt;</code>) and <code>body[data-verdict]</code>; <code>--dump-dom</code> waits
+for it (at most 150 s).</p>
+<pre id="info">pending</pre>
+<table>
+<thead><tr><th>test</th><th>result</th><th>detail</th></tr></thead>
+<tbody id="results"></tbody>
+</table>
+<p id="status">not run</p>
+<div id="stage"></div>
+<script>
+"use strict";
+var finished = false, holdUntil = Date.now() + 150000;
+(function hold() {
+  if (finished || Date.now() > holdUntil) return;
+  var img = new Image();
+  img.onerror = img.onload = function () { img.remove(); hold(); };
+  img.src = "missing-" + Math.random() + ".png";
+  document.body.appendChild(img);
+})();
+
+var rows = document.getElementById("results"), failures = [], skips = 0;
+function row(name, ok, detail) {
+  var tr = document.createElement("tr");
+  var verdict = ok === null ? "skip" : ok ? "pass" : "FAIL";
+  tr.innerHTML = "<td></td><td></td><td></td>";
+  tr.children[0].textContent = name; tr.children[1].textContent = verdict; tr.children[2].textContent = detail || "";
+  tr.dataset.result = verdict;
+  rows.appendChild(tr);
+  console.log("[interop] " + verdict + " " + name + (detail ? ": " + detail : ""));
+  if (ok === false) failures.push(name);
+  if (ok === null) skips++;
+}
+function Skip(why) { this.why = why; }
+function within(promise, seconds, what) {
+  return Promise.race([promise, new Promise(function (_, reject) {
+    setTimeout(function () { reject(new Error(what + " did not settle within " + seconds + " s")); }, seconds * 1000);
+  })]);
+}
+function near(got, want, tol) {
+  for (var i = 0; i < want.length; i++) if (Math.abs(got[i] - want[i]) > tol) return false;
+  return true;
+}
+function check(what, got, want, tol) { return near(got, want, tol === undefined ? 3 : tol) ? "" : what + " = " + Array.from(got).join(",") + ", want " + want.join(","); }
+function join(list) { return list.filter(Boolean).join("; "); }
+
+// A small source picture: left half red, right half blue (16x16), as a 2D canvas.
+function sourceCanvas() {
+  var c = document.createElement("canvas"); c.width = 16; c.height = 16;
+  var g = c.getContext("2d");
+  g.fillStyle = "rgb(255, 0, 0)"; g.fillRect(0, 0, 8, 16);
+  g.fillStyle = "rgb(0, 0, 255)"; g.fillRect(8, 0, 8, 16);
+  return c;
+}
+function pixel2d(source, x, y) {
+  var c = document.createElement("canvas"); c.width = source.width; c.height = source.height;
+  var g = c.getContext("2d", { willReadFrequently: true });
+  g.drawImage(source, 0, 0);
+  return g.getImageData(x, y, 1, 1).data;
+}
+async function pngImage(canvas) {
+  var img = new Image();
+  var loaded = new Promise(function (r, reject) { img.onload = r; img.onerror = function () { reject(new Error("the PNG did not load")); }; });
+  img.src = canvas.toDataURL("image/png");
+  await within(loaded, 30, "img.onload");
+  return img;
+}
+
+// ---- WebGL helpers --------------------------------------------------------------------------------
+
+function glContext(options) {
+  var c = document.createElement("canvas"); c.width = 16; c.height = 16;
+  var gl = c.getContext("webgl2", Object.assign({ preserveDrawingBuffer: true }, options || {}));
+  if (!gl) throw new Error("no webgl2 context");
+  return gl;
+}
+// Draws a texture over the whole drawing buffer and returns pixel (x, y) of the result (GL y up).
+function glShowTexture(gl, source, setup) {
+  var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  if (setup) setup(gl);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  function sh(type, src) { var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+  var p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, "#version 300 es\nout vec2 uv; void main() { vec2 q = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);\n uv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5); gl_Position = vec4(q, 0.0, 1.0); }"));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, "#version 300 es\nprecision mediump float; uniform sampler2D t; in vec2 uv; out vec4 o; void main() { o = texture(t, uv); }"));
+  gl.linkProgram(p); gl.useProgram(p);
+  gl.viewport(0, 0, 16, 16); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  var e = gl.getError(); if (e) throw new Error("glError 0x" + e.toString(16));
+  return function (x, y) { var px = new Uint8Array(4); gl.readPixels(x, 15 - y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); return px; };
+}
+function glSourceCheck(read, what) {
+  return join([check(what + " left", read(3, 8), [255, 0, 0, 255]), check(what + " right", read(12, 8), [0, 0, 255, 255])]);
+}
+
+// ---- WebGPU helpers -------------------------------------------------------------------------------
+
+var gpu = null;
+async function getDevice() {
+  if (gpu) return gpu;
+  if (!("gpu" in navigator)) throw new Skip("navigator.gpu absent");
+  var adapter = await within(navigator.gpu.requestAdapter(), 60, "requestAdapter");
+  if (!adapter) throw new Skip("no adapter");
+  gpu = await within(adapter.requestDevice(), 60, "requestDevice");
+  return gpu;
+}
+async function gpuReadTexture(device, texture, w, h) {
+  var buf = device.createBuffer({ size: 256 * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture: texture }, { buffer: buf, bytesPerRow: 256, rowsPerImage: h }, [w, h, 1]);
+  device.queue.submit([enc.finish()]);
+  await within(buf.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var b = new Uint8Array(buf.getMappedRange().slice(0)); buf.unmap(); buf.destroy();
+  return function (x, y) { var o = y * 256 + x * 4; return [b[o], b[o + 1], b[o + 2], b[o + 3]]; };
+}
+async function gpuCopyExternal(source, w, h) {
+  var device = await getDevice();
+  var t = device.createTexture({ size: [w, h], format: "rgba8unorm",
+    usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT });
+  device.queue.copyExternalImageToTexture({ source: source }, { texture: t }, [w, h]);
+  return gpuReadTexture(device, t, w, h);
+}
+// A capture stream of a 2D canvas played by a <video>, resolved once it has decoded data.
+async function canvasVideo(canvas) {
+  var stream = canvas.captureStream(30);
+  var video = document.createElement("video"); video.muted = true; video.playsInline = true; video.width = 16; video.height = 16;
+  video.srcObject = stream;
+  document.getElementById("stage").appendChild(video);
+  var g = canvas.getContext("2d");
+  var keep = setInterval(function () { g.fillRect(16, 16, 0, 0); }, 30);   // invalidate the canvas so frames flow
+  try {
+    await within(video.play(), 30, "video.play");
+    // Decoded data, not a presented frame: a background page presents none.
+    await within(new Promise(function (r) {
+      (function poll() { if (video.readyState >= 2 && video.videoWidth > 0) r(); else setTimeout(poll, 50); })();
+    }), 30, "decoded video data");
+    await new Promise(function (r) { setTimeout(r, 200); });
+  } finally { clearInterval(keep); }
+  return video;
+}
+
+// ---- tests ----------------------------------------------------------------------------------------
+
+var TESTS = [
+  ["accelerated 2D canvas: fills, gradient, alpha, scaled drawImage, blur", async function () {
+    var c = document.createElement("canvas"); c.width = 256; c.height = 256;
+    var g = c.getContext("2d");
+    g.fillStyle = "rgb(10, 200, 30)"; g.fillRect(0, 0, 256, 256);
+    var grad = g.createLinearGradient(0, 0, 256, 0); grad.addColorStop(0, "black"); grad.addColorStop(1, "white");
+    g.fillStyle = grad; g.fillRect(0, 128, 256, 64);
+    g.globalAlpha = 0.5; g.fillStyle = "rgb(255, 0, 0)"; g.fillRect(0, 0, 64, 64); g.globalAlpha = 1;
+    g.imageSmoothingEnabled = false; g.drawImage(sourceCanvas(), 128, 0, 128, 128);
+    g.filter = "blur(4px)"; g.fillStyle = "rgb(0, 0, 0)"; g.fillRect(0, 200, 64, 56); g.filter = "none";
+    var r = c.getContext("2d").getImageData(0, 0, 256, 256).data;
+    function at(x, y) { var o = (y * 256 + x) * 4; return r.slice(o, o + 4); }
+    var mid = at(128, 160)[0];
+    return join([check("half-alpha red over green", at(32, 32), [133, 100, 15, 255], 3),
+      check("scaled drawImage, red half", at(150, 64), [255, 0, 0, 255]), check("scaled drawImage, blue half", at(240, 64), [0, 0, 255, 255]),
+      mid > 110 && mid < 146 ? "" : "gradient middle = " + mid,
+      check("blurred black, inside", at(32, 230), [0, 0, 0, 255], 12), at(64, 230)[1] > 40 && at(64, 230)[1] < 160 ? "" : "blur edge (64,230) = " + Array.from(at(64, 230))]);
+  }],
+  ["WebGL texImage2D from a 2D canvas", async function () {
+    return glSourceCheck(glShowTexture(glContext(), sourceCanvas()), "texture");
+  }],
+  ["WebGL texImage2D from an <img> (PNG)", async function () {
+    return glSourceCheck(glShowTexture(glContext(), await pngImage(sourceCanvas())), "texture");
+  }],
+  ["WebGL texImage2D from an ImageBitmap, flipped and premultiplied", async function () {
+    var c = sourceCanvas(), g = c.getContext("2d");
+    g.clearRect(0, 0, 16, 8); g.fillStyle = "rgba(0, 255, 0, 0.5)"; g.fillRect(0, 0, 16, 8);   // top half translucent green
+    // WebGL ignores its unpack flags for ImageBitmaps; the bitmap's own options flip and premultiply.
+    var bitmap = await within(createImageBitmap(c, { imageOrientation: "flipY", premultiplyAlpha: "premultiply" }), 30, "createImageBitmap");
+    var gl = glContext({ premultipliedAlpha: false });
+    var read = glShowTexture(gl, bitmap);
+    // The flip puts the translucent half at the bottom of the output, premultiplied (0.5 green).
+    return join([check("bottom (was top), premultiplied", read(3, 12), [0, 128, 0, 128], 4), check("top (was bottom), red", read(3, 3), [255, 0, 0, 255])]);
+  }],
+  ["WebGL texImage2D from a <video> (canvas capture stream)", async function () {
+    var c = document.createElement("canvas"); c.width = 16; c.height = 16;
+    var g = c.getContext("2d"); g.fillStyle = "rgb(0, 160, 0)"; g.fillRect(0, 0, 16, 16);
+    var video = await canvasVideo(c);
+    var read = glShowTexture(glContext(), video);
+    video.srcObject.getTracks().forEach(function (t) { t.stop(); });
+    return check("video frame", read(8, 8), [0, 160, 0, 255], 16);
+  }],
+  ["drawImage of an antialiased WebGL canvas into 2D", async function () {
+    var c = document.createElement("canvas"); c.width = 16; c.height = 16;
+    var gl = c.getContext("webgl2", { antialias: true, preserveDrawingBuffer: false });
+    gl.clearColor(1, 1, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.SCISSOR_TEST); gl.scissor(8, 0, 8, 16); gl.clearColor(0, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT); gl.disable(gl.SCISSOR_TEST);
+    return join([check("left (yellow)", pixel2d(c, 3, 8), [255, 255, 0, 255]), check("right (cyan)", pixel2d(c, 12, 8), [0, 255, 255, 255])]);
+  }],
+  ["WebGPU copyExternalImageToTexture from an <img>", async function () {
+    var read = await gpuCopyExternal(await pngImage(sourceCanvas()), 16, 16);
+    return join([check("left", read(3, 8), [255, 0, 0, 255]), check("right", read(12, 8), [0, 0, 255, 255])]);
+  }],
+  ["WebGPU copyExternalImageToTexture from a WebGL canvas", async function () {
+    var gl = glContext(); gl.clearColor(0.25, 0.5, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    var read = await gpuCopyExternal(gl.canvas, 16, 16);
+    return check("WebGL clear color", read(8, 8), [64, 128, 255, 255]);
+  }],
+  ["WebGPU copyExternalImageToTexture from a VideoFrame", async function () {
+    if (typeof VideoFrame === "undefined") throw new Skip("VideoFrame absent");
+    var frame = new VideoFrame(sourceCanvas(), { timestamp: 0 });
+    try {
+      var read = await gpuCopyExternal(frame, 16, 16);
+      return join([check("left", read(3, 8), [255, 0, 0, 255], 6), check("right", read(12, 8), [0, 0, 255, 255], 6)]);
+    } finally { frame.close(); }
+  }],
+  ["WebGPU importExternalTexture from a VideoFrame", async function () {
+    if (typeof VideoFrame === "undefined") throw new Skip("VideoFrame absent");
+    var device = await getDevice();
+    var frame = new VideoFrame(sourceCanvas(), { timestamp: 0 });
+    try {
+      var module = device.createShaderModule({ code: `
+        @group(0) @binding(0) var ext : texture_external;
+        @group(0) @binding(1) var smp : sampler;
+        struct VOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+        @vertex fn vs(@builtin(vertex_index) i : u32) -> VOut {
+          var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+          var o : VOut; o.pos = vec4<f32>(p[i], 0.0, 1.0); o.uv = vec2<f32>(p[i].x * 0.5 + 0.5, 0.5 - p[i].y * 0.5); return o;
+        }
+        @fragment fn fs(v : VOut) -> @location(0) vec4<f32> { return textureSampleBaseClampToEdge(ext, smp, v.uv); }` });
+      var pipeline = await within(device.createRenderPipelineAsync({ layout: "auto", vertex: { module: module, entryPoint: "vs" },
+        fragment: { module: module, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] } }), 60, "createRenderPipelineAsync");
+      var target = device.createTexture({ size: [16, 16], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      var group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: device.importExternalTexture({ source: frame }) }, { binding: 1, resource: device.createSampler() }] });
+      var enc = device.createCommandEncoder();
+      var pass = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }] });
+      pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
+      device.queue.submit([enc.finish()]);
+      var read = await gpuReadTexture(device, target, 16, 16);
+      return join([check("left", read(3, 8), [255, 0, 0, 255], 8), check("right", read(12, 8), [0, 0, 255, 255], 8)]);
+    } finally { frame.close(); }
+  }],
+  ["drawImage of a WebGPU canvas into 2D", async function () {
+    var device = await getDevice();
+    var c = document.createElement("canvas"); c.width = 16; c.height = 16;
+    var ctx = c.getContext("webgpu");
+    ctx.configure({ device: device, format: navigator.gpu.getPreferredCanvasFormat(), alphaMode: "opaque" });
+    var enc = device.createCommandEncoder();
+    enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: [1, 0, 1, 1], loadOp: "clear", storeOp: "store" }] }).end();
+    device.queue.submit([enc.finish()]);
+    return check("magenta clear", pixel2d(c, 8, 8), [255, 0, 255, 255]);
+  }],
+  ["WebGPU canvas, rgba16float, premultiplied alpha", async function () {
+    var device = await getDevice();
+    var c = document.createElement("canvas"); c.width = 16; c.height = 16;
+    var ctx = c.getContext("webgpu");
+    ctx.configure({ device: device, format: "rgba16float", alphaMode: "premultiplied" });
+    var enc = device.createCommandEncoder();
+    enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: [0.5, 0.25, 0, 0.5], loadOp: "clear", storeOp: "store" }] }).end();
+    device.queue.submit([enc.finish()]);
+    return check("unpremultiplied by 2D", pixel2d(c, 8, 8), [255, 128, 0, 128], 4);
+  }],
+  ["WebGL in a worker: OffscreenCanvas, transferToImageBitmap", async function () {
+    var code = "onmessage = function () { var c = new OffscreenCanvas(16, 16); var gl = c.getContext('webgl2');\n" +
+      "  if (!gl) { postMessage('no webgl2 in the worker'); return; }\n" +
+      "  gl.clearColor(0, 1, 0.5, 1); gl.clear(gl.COLOR_BUFFER_BIT); var b = c.transferToImageBitmap(); postMessage(b, [b]); };";
+    var worker = new Worker(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
+    try {
+      var reply = await within(new Promise(function (r, reject) { worker.onmessage = function (e) { r(e.data); }; worker.onerror = function (e) { reject(new Error(e.message)); }; worker.postMessage(0); }), 60, "the worker");
+      if (typeof reply === "string") return reply;
+      var shown = document.createElement("canvas"); shown.width = 16; shown.height = 16;
+      shown.getContext("bitmaprenderer").transferFromImageBitmap(reply);
+      return check("worker's clear color", pixel2d(shown, 8, 8), [0, 255, 128, 255]);
+    } finally { worker.terminate(); }
+  }],
+  ["WebGPU in a worker: compute", async function () {
+    var code = "onmessage = async function () { try { var a = await navigator.gpu.requestAdapter(); if (!a) { postMessage('no adapter in the worker'); return; }\n" +
+      "  var d = await a.requestDevice(); var m = d.createShaderModule({ code: '@group(0) @binding(0) var<storage, read_write> o : array<u32, 64>; @compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i : u32) { o[i] = i * 7u; }' });\n" +
+      "  var p = d.createComputePipeline({ layout: 'auto', compute: { module: m, entryPoint: 'main' } });\n" +
+      "  var o = d.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }), r = d.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });\n" +
+      "  var e = d.createCommandEncoder(), c = e.beginComputePass(); c.setPipeline(p); c.setBindGroup(0, d.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: o } }] })); c.dispatchWorkgroups(1); c.end();\n" +
+      "  e.copyBufferToBuffer(o, 0, r, 0, 256); d.queue.submit([e.finish()]); await r.mapAsync(GPUMapMode.READ); postMessage(Array.from(new Uint32Array(r.getMappedRange()))); }\n" +
+      "  catch (x) { postMessage('threw ' + x.message); } };";
+    var worker = new Worker(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
+    try {
+      var reply = await within(new Promise(function (r, reject) { worker.onmessage = function (e) { r(e.data); }; worker.onerror = function (e) { reject(new Error(e.message)); }; worker.postMessage(0); }), 90, "the worker");
+      if (typeof reply === "string") return reply;
+      for (var i = 0; i < 64; i++) if (reply[i] !== i * 7) return "o[" + i + "] = " + reply[i];
+      return "";
+    } finally { worker.terminate(); }
+  }],
+  ["createImageBitmap from a PNG Blob, into WebGPU", async function () {
+    var blob = await within(new Promise(function (r) { sourceCanvas().toBlob(r, "image/png"); }), 30, "toBlob");
+    var bitmap = await within(createImageBitmap(blob), 30, "createImageBitmap");
+    var read = await gpuCopyExternal(bitmap, 16, 16);
+    return join([check("left", read(3, 8), [255, 0, 0, 255]), check("right", read(12, 8), [0, 0, 255, 255])]);
+  }]
+];
+
+(async function main() {
+  var gl = document.createElement("canvas").getContext("webgl2"), dbg = gl && gl.getExtension("WEBGL_debug_renderer_info");
+  document.getElementById("info").textContent = "webgl2: " + (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl ? gl.getParameter(gl.RENDERER) : "none");
+  for (var i = 0; i < TESTS.length; i++) {
+    console.log("[interop] start " + TESTS[i][0]);
+    try { var r = await TESTS[i][1](); row(TESTS[i][0], !r, r); }
+    catch (e) { if (e instanceof Skip) row(TESTS[i][0], null, e.why); else row(TESTS[i][0], false, "threw " + e.message); }
+  }
+})().catch(function (e) { row("main", false, "threw " + e.message); }).finally(function () {
+  var verdict = failures.length ? "FAIL " + failures[0] : "PASS";
+  document.getElementById("status").textContent = verdict + (failures.length > 1 ? " (+" + (failures.length - 1) + " more: " + failures.slice(1).join(", ") + ")" : "") + "; " + skips + " skipped";
+  document.getElementById("h").setAttribute("data-js", "ran");
+  document.body.dataset.verdict = verdict;
+  document.title = "Alchemy GPU interop: " + verdict;
+  finished = true;
+});
+</script>
+</body>
+</html>

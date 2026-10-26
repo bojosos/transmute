@@ -830,6 +830,9 @@ std::optional<SurfacePages> surface_pages(std::uint64_t surface_object) {
     result.base = surface->base;
     result.bytes_per_row = surface->bytes_per_row;
     result.alloc_size = surface->alloc_size;
+    for (const auto& plane : surface->planes)
+        result.planes.push_back({plane.width, plane.height, plane.bytes_per_element, plane.element_width, plane.element_height,
+                                 plane.offset, plane.bytes_per_row});
     result.shared_memory = surface->vm;
     result.keep = std::move(keep);
     return result;

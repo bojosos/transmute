@@ -26,7 +26,11 @@
  *      commit, see surface_textures.cpp);
  *  10. the texture and its 1184x1069 surface released while four command
  *      buffers clearing it are in flight: they complete (the pages stay
- *      mapped until the GPU is done), and a new surface works after them.
+ *      mapped until the GPU is done), and a new surface works after them;
+ *  11. a planar '420v' surface (a video frame: an R8 luma plane and a
+ *      half-size RG8 chroma plane): CPU writes are seen through a texture
+ *      over each plane, a GPU clear of the chroma plane lands in its pages
+ *      and leaves the luma's alone, and plane 2 answers nil.
  * `metal_iosurface_fixture staged`: the same without step 9 (the test runs it
  *   with ALCHEMY_METAL_IOSURFACE_IMPORT=0).
  * `metal_iosurface_fixture cross`: the browser/GPU-process split. The parent
@@ -83,7 +87,9 @@ extern kern_return_t mach_timebase_info(timebase_t*);
 
 extern const void* kCFTypeDictionaryKeyCallBacks;
 extern const void* kCFTypeDictionaryValueCallBacks;
+extern const void* kCFTypeArrayCallBacks;
 extern CFTypeRef CFNumberCreate(CFTypeRef, long, const void*);
+extern CFTypeRef CFArrayCreate(CFTypeRef, const void**, long, const void*);
 extern CFTypeRef CFDictionaryCreate(CFTypeRef, const void**, const void**, long, const void*, const void*);
 extern CFTypeRef CFStringCreateWithCString(CFTypeRef, const char*, unsigned);
 extern CFTypeRef CFDataCreate(CFTypeRef, const unsigned char*, long);
@@ -92,6 +98,9 @@ extern long CFDataGetLength(CFTypeRef);
 extern void CFRelease(CFTypeRef);
 
 extern CFTypeRef kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfacePixelFormat;
+extern CFTypeRef kIOSurfacePlaneInfo, kIOSurfacePlaneWidth, kIOSurfacePlaneHeight, kIOSurfacePlaneBytesPerElement;
+extern void* IOSurfaceGetBaseAddressOfPlane(CFTypeRef, unsigned long);
+extern unsigned long IOSurfaceGetBytesPerRowOfPlane(CFTypeRef, unsigned long);
 extern CFTypeRef IOSurfaceCreate(CFTypeRef);
 extern mach_port_t IOSurfaceCreateMachPort(CFTypeRef);
 extern CFTypeRef IOSurfaceLookupFromMachPort(mach_port_t);
@@ -116,8 +125,11 @@ extern SEL sel_registerName(const char*);
 #define RCV_TIMEOUT 0x100
 #define COMPLEX 0x80000000u
 #define BGRA 0x42475241u
+#define NV12 0x34323076u   /* '420v' */
 #define LOCK_READ_ONLY 1u
 /* MTLPixelFormat, MTLTextureUsage, MTLLoadAction, MTLStoreAction (Metal headers' values). */
+#define R8_UNORM 10u
+#define RG8_UNORM 30u
 #define BGRA8_UNORM 80u
 #define RGBA16_FLOAT 115u
 #define USAGE_SHADER_READ 1u
@@ -153,6 +165,29 @@ static CFTypeRef make_surface(long width, long height) {
     CFTypeRef surface = IOSurfaceCreate(properties);
     CFRelease(properties);
     for (int index = 0; index < 4; ++index) CFRelease(values[index]);
+    return surface;
+}
+
+/* kIOSurfacePlaneInfo: a width x height luma plane (1 byte) and a half-size chroma plane (2 bytes), rows as
+ * IOSurface aligns them. */
+static CFTypeRef make_planar_surface(long width, long height) {
+    const long luma_bytes = 1, chroma_bytes = 2, half_width = width / 2, half_height = height / 2, format = (long)NV12;
+    const void* plane_keys[3] = {kIOSurfacePlaneWidth, kIOSurfacePlaneHeight, kIOSurfacePlaneBytesPerElement};
+    const void* luma_values[3] = {CFNumberCreate(0, 4, &width), CFNumberCreate(0, 4, &height), CFNumberCreate(0, 4, &luma_bytes)};
+    const void* chroma_values[3] = {CFNumberCreate(0, 4, &half_width), CFNumberCreate(0, 4, &half_height),
+                                    CFNumberCreate(0, 4, &chroma_bytes)};
+    const void* planes[2] = {
+        CFDictionaryCreate(0, plane_keys, luma_values, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks),
+        CFDictionaryCreate(0, plane_keys, chroma_values, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks)};
+    const void* keys[4] = {kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfacePixelFormat, kIOSurfacePlaneInfo};
+    const void* values[4] = {CFNumberCreate(0, 4, &width), CFNumberCreate(0, 4, &height), CFNumberCreate(0, 4, &format),
+                             CFArrayCreate(0, planes, 2, &kCFTypeArrayCallBacks)};
+    CFTypeRef properties = CFDictionaryCreate(0, keys, values, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFTypeRef surface = IOSurfaceCreate(properties);
+    CFRelease(properties);
+    for (int index = 0; index < 4; ++index) CFRelease(values[index]);
+    for (int index = 0; index < 2; ++index) CFRelease(planes[index]);
+    for (int index = 0; index < 3; ++index) { CFRelease(luma_values[index]); CFRelease(chroma_values[index]); }
     return surface;
 }
 
@@ -403,6 +438,44 @@ static int local(int staged) {
         if (!green) return 29;
         send0(fresh, "release");
         CFRelease(next);
+    }
+    /* 11. */
+    {
+        CFTypeRef planar = make_planar_surface(40, 20);
+        if (!planar) return 37;
+        const unsigned long luma_row = IOSurfaceGetBytesPerRowOfPlane(planar, 0), chroma_row = IOSurfaceGetBytesPerRowOfPlane(planar, 1);
+        IOSurfaceLock(planar, 0, 0);
+        unsigned char* luma = (unsigned char*)IOSurfaceGetBaseAddressOfPlane(planar, 0);
+        unsigned char* chroma = (unsigned char*)IOSurfaceGetBaseAddressOfPlane(planar, 1);
+        for (unsigned y = 0; y < 20; ++y)
+            for (unsigned x = 0; x < 40; ++x) luma[y * luma_row + x] = (unsigned char)(0x10 + y);
+        for (unsigned y = 0; y < 10; ++y)
+            for (unsigned x = 0; x < 20; ++x) {
+                chroma[y * chroma_row + 2 * x] = 0x80;
+                chroma[y * chroma_row + 2 * x + 1] = (unsigned char)(0x20 + x);
+            }
+        IOSurfaceUnlock(planar, 0, 0);
+        id luma_texture = surface_texture(device, R8_UNORM, 40, 20, planar, 0);
+        id chroma_texture = surface_texture(device, RG8_UNORM, 20, 10, planar, 1);
+        if (!luma_texture || !chroma_texture) return 38;
+        if (value0(chroma_texture, "iosurfacePlane") != 1) return 39;
+        if ((gpu_texel(device, queue, luma_texture, 3, 5) & 0xffu) != 0x15u) return 40;
+        if ((gpu_texel(device, queue, chroma_texture, 7, 4) & 0xffffu) != ((0x20u + 7) << 8 | 0x80u)) return 41;
+        if (!finish(clear(queue, chroma_texture, 0.25, 0.75, 0))) return 42;
+        IOSurfaceLock(planar, LOCK_READ_ONLY, 0);
+        int cleared = 1;
+        for (unsigned y = 0; y < 10; ++y)
+            for (unsigned x = 0; x < 20; ++x)
+                cleared &= chroma[y * chroma_row + 2 * x] == 0x40 && chroma[y * chroma_row + 2 * x + 1] == 0xbf;
+        const int luma_kept = luma[19 * luma_row + 39] == 0x10 + 19;
+        IOSurfaceUnlock(planar, LOCK_READ_ONLY, 0);
+        if (!cleared) return 43;
+        if (!luma_kept) return 44;
+        if (surface_texture(device, R8_UNORM, 40, 20, planar, 2)) return 45;
+        if (surface_texture(device, RG8_UNORM, 21, 10, planar, 1)) return 46;   /* larger than the chroma plane */
+        send0(chroma_texture, "release");
+        send0(luma_texture, "release");
+        CFRelease(planar);
     }
     send0(view, "release");
     send0(texture, "release");

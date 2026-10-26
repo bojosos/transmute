@@ -73,6 +73,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace alchemy::gui::quartzcore {
 
@@ -150,10 +151,16 @@ void unregister_metal_device(std::uint64_t mtl_device);
 // seed S with W GPU writes submitted (gpu_writes_submitted) needs no upload
 // while both are unchanged; another texture's submitted write changes W at
 // once, before its completion moves the seed.
+// One plane of a planar surface (kIOSurfacePlaneInfo), its rows at base + offset.
+struct SurfacePlane {
+    std::uint32_t width{}, height{}, bytes_per_element{}, element_width{1}, element_height{1};
+    std::uint64_t offset{}, bytes_per_row{};
+};
 struct SurfacePages {
     std::uint64_t surface{};   // the IOSurfaceRef (not retained here)
     std::uint32_t id{}, width{}, height{}, bytes_per_element{}, pixel_format{};
     std::uint64_t base{}, bytes_per_row{}, alloc_size{};
+    std::vector<SurfacePlane> planes;   // planar surfaces only (YCbCr video frames); empty for chunky ones
     bool shared_memory{};      // fx shared memory (vm_allocate'd), not private guest memory
     std::shared_ptr<void> keep;
     [[nodiscard]] std::uint32_t seed() const;

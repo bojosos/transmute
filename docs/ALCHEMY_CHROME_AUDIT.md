@@ -884,6 +884,20 @@ hardware GPU (below).
       * Depth clamp (`setDepthClipMode:`, used by WebGPU's `unclippedDepth` and `EXT_depth_clamp`) and line fill
         (`setTriangleFillMode:`, used by `WEBGL_polygon_mode`) used to be explicit stops. They are now pipeline
         variants, for MSL pipelines and translated ones alike.
+    * **Interop** (`scripts/chrome/pages/gpu_interop.html`): 15 tests of how pages move pixels between surfaces.
+      * Sources: an accelerated 2D canvas (gradients, alpha, scaled drawImage, blur), and WebGL textures from a
+        2D canvas, a PNG `<img>`, an ImageBitmap and a `<video>` playing a canvas capture stream.
+      * Cross-API copies: an antialiased WebGL canvas and a WebGPU canvas (rgba16float, premultiplied) drawn
+        into 2D, and `copyExternalImageToTexture` from an image, a WebGL canvas, a VideoFrame and a PNG Blob's
+        ImageBitmap.
+      * `importExternalTexture`, plus WebGL (OffscreenCanvas) and WebGPU in workers.
+      * All 15 pass headless and windowed, and desktop Chrome passes them too.
+      * The video test used to hang the GPU process. A video frame's IOSurface is planar ('420v': an R8 luma
+        plane and an RG8 chroma plane), and `newTextureWithDescriptor:iosurface:plane:` backed only plane 0 of
+        chunky surfaces. Any plane whose elements are single texels now backs a texture, with the plane's offset
+        and row pitch.
+      * Then the media path called `newlocale(LC_ALL_MASK, NULL, …)`, which read the NULL name. newlocale(3)
+        makes a NULL name the C locale, and it now is.
   * **ANGLE's Vulkan back end on the host's Vulkan** isn't allowed. Chrome 155 on macOS accepts only ANGLE on Metal,
     or on SwiftShader with `--enable-unsafe-swiftshader`. Its message is `gl_factory.cc:110 ... not found in allowed
     implementations: [(gl=egl-angle,angle=metal)]`.

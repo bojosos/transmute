@@ -540,6 +540,11 @@ void iosurface_planar(Fixture& f) {
     f.engine.write32(chroma + 896 * 239 + 852, 0x80407f3fU);   // the last chroma element pair
     require(f.engine.read32(base + 430080 + 896 * 239 + 852) == 0x80407f3fU, "chroma pixels inside the allocation");
     require(f.status(iosurface, "_IOSurfaceUnlock", {surface, 0, 0}) == 0, "unlock");
+    // surface_pages carries the planes (Metal backs a texture with one of them).
+    const auto pages = gui::quartzcore::surface_pages(surface);
+    require(pages && pages->planes.size() == 2 && pages->planes[1].offset == 430080 && pages->planes[1].bytes_per_row == 896 &&
+            pages->planes[1].width == 427 && pages->planes[1].height == 240 && pages->planes[1].bytes_per_element == 2 &&
+            pages->planes[0].bytes_per_element == 1, "surface_pages describes each plane");
     f.process.objects().release(surface);
     // A plane whose rows do not fit its bytes per row: NULL, as IOSurfaceCreate answers impossible surfaces.
     const std::array<Address, 1> narrow{plane(854, 480, 1, 512, 245760, 0)};

@@ -311,6 +311,9 @@ void locale_and_scanning() {
         "C character classes wrong");
     require(f.call("_newlocale", {63, f.string("unavailable.UTF-8"), 0}) == 0,
         "unsupported locale accepted");
+    // newlocale(3): a NULL name is the C locale (newlocale(LC_ALL_MASK, NULL, NULL)).
+    const auto unnamed = f.call("_newlocale", {63, 0, 0});
+    require(unnamed && f.call("___mb_cur_max_l", {unnamed}) == 1, "newlocale with a NULL name is not the C locale");
     const auto wide = f.context.allocate_guest(32), byte = f.string("A");
     require(f.call("_mbrtowc_l", {wide, byte, 1, 0, locale}) == 1 && f.engine.read32(wide) == 'A',
         "Darwin wchar conversion wrong");

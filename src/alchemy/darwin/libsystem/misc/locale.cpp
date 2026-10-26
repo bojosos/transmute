@@ -197,7 +197,8 @@ std::function<bool(std::uint64_t)> install_darwin_locale(ProcessContext& context
         // Darwin masks use one bit per category, starting at COLLATE bit zero.
         // They are independent of setlocale's category numbering.
         if (s.x[0] & ~63ULL) throw LocaleError{einval};
-        const auto name = string(m, s.x[1]);
+        // A NULL name is the C locale (newlocale(3)).
+        const auto name = s.x[1] ? string(m, s.x[1]) : std::string("C");
         if (name != "C" && name != "POSIX") throw LocaleError{enoent};
         state->check_locale(s.x[2]);
         return state->new_locale();

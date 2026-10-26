@@ -31,11 +31,17 @@ void* kIOSurfaceWidth;
 void* kIOSurfaceHeight;
 void* kIOSurfaceBytesPerElement;
 void* kIOSurfacePixelFormat;
+void* kIOSurfacePlaneInfo;
+void* kIOSurfacePlaneWidth;
+void* kIOSurfacePlaneHeight;
+void* kIOSurfacePlaneBytesPerElement;
 LINK_ONLY(IOSurfaceCreate)
 LINK_ONLY(IOSurfaceCreateMachPort)
 LINK_ONLY(IOSurfaceLookupFromMachPort)
 LINK_ONLY(IOSurfaceGetBaseAddress)
 LINK_ONLY(IOSurfaceGetBytesPerRow)
+LINK_ONLY(IOSurfaceGetBaseAddressOfPlane)
+LINK_ONLY(IOSurfaceGetBytesPerRowOfPlane)
 LINK_ONLY(IOSurfaceGetSeed)
 LINK_ONLY(IOSurfaceLock)
 LINK_ONLY(IOSurfaceUnlock)
