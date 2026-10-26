@@ -1757,3 +1757,448 @@ FX_TEST(neon_region_by_element_derived_broadcasts) {
     std::printf("    vpshufb: %zu, shuffling each element %zu\n", shuffles[0], shuffles[1]);
     FX_CHECK(shuffles[0] < shuffles[1]);
 }
+
+// ---- FP min/max against constants known at translation time (vec_fp_const) ------------------
+
+namespace {
+namespace fpc {
+
+constexpr std::uint32_t kConstRegs[] = {16, 17, 18, 19};
+
+// A constant into V`d` (128 bits known): FMOV S/D/vector immediates, MOVI/MVNI
+// with float-like patterns, MOVZ/MOVK + FMOV from W/X. Some are zero, denormal,
+// infinite or NaN (no fast path: the general lowering must remain). True if
+// bits 63:32 are zero (usable by scalar S min/max: the oracle's single-precision
+// forms read the 64-bit source, NOTES_FP.md).
+bool is_snan32(std::uint64_t v) { return (v & 0x7fc00000u) == 0x7f800000u && (v & 0x3fffffu) != 0; }
+bool is_snan64(std::uint64_t v) {
+    return (v & 0x7ff8000000000000ull) == 0x7ff0000000000000ull && (v & 0x7ffffffffffffull) != 0;
+}
+
+// `snan`: signalling NaN constants allowed; `dbl`: 64-bit element constants
+// (FMOV D, FMOV .2D, MOVZ/MOVK X + FMOV D), else 32-bit ones.
+bool materialize(std::vector<std::uint32_t>& w, coretest::Rng& rng, unsigned d, bool snan, bool dbl, bool scalar_only = false) {
+    static constexpr std::uint32_t kBits32[] = {
+        0x447a0000u, 0xc47a0000u, 0x3f800000u, 0xbf000000u, 0x00000000u, 0x80000000u, 0x00000001u,
+        0x007fffffu, 0x00800000u, 0x7f7fffffu, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7fa00000u, 0x3f7fbe77u,
+    };
+    static constexpr std::uint64_t kBits64[] = {
+        0x408f400000000000ull, 0xc08f400000000000ull, 0x3ff0000000000000ull, 0x0000000000000000ull,
+        0x8000000000000000ull, 0x0000000000000001ull, 0x0010000000000000ull, 0x7ff0000000000000ull,
+        0x7ff8000000000000ull, 0x7ff4000000000000ull, 0xbfe0000000000000ull,
+    };
+    static constexpr unsigned kForms32[] = {0, 2, 4, 5}, kForms64[] = {1, 3, 6};
+    switch (dbl ? kForms64[rng.below(3)] : scalar_only ? (rng.chance(50) ? 0u : 5u) : kForms32[rng.below(4)]) {
+    case 0: w.push_back(0x1e201000u | (rng.below(256) << 13) | d); return true;         // FMOV Sd, #imm
+    case 1: w.push_back(0x1e601000u | (rng.below(256) << 13) | d); break;               // FMOV Dd, #imm
+    case 2: {                                                                            // FMOV Vd.2S/4S, #imm
+        const unsigned imm = rng.below(256);
+        w.push_back(0x0f00f400u | (rng.below(2) << 30) | ((imm >> 5) << 16) | ((imm & 31u) << 5) | d);
+        break;
+    }
+    case 3: {                                                                            // FMOV Vd.2D, #imm
+        const unsigned imm = rng.below(256);
+        w.push_back(0x6f00f400u | ((imm >> 5) << 16) | ((imm & 31u) << 5) | d);
+        break;
+    }
+    case 4: {   // MOVI / MVNI Vd.4S, #imm8, LSL #24 (0.5f-like and negative patterns)
+        const unsigned imm = rng.below(256);
+        w.push_back(0x4f006400u | (rng.below(2) << 29) | ((imm >> 5) << 16) | ((imm & 31u) << 5) | d);
+        break;
+    }
+    case 5: {   // MOVZ W9 (+ MOVK) ; FMOV Sd, W9
+        auto v = kBits32[rng.below(static_cast<unsigned>(std::size(kBits32)))];
+        while (!snan && is_snan32(v)) v = kBits32[rng.below(static_cast<unsigned>(std::size(kBits32)))];
+        w.push_back(0x52a00000u | ((v >> 16) << 5) | 9u);               // movz w9, #hi, lsl 16
+        if (v & 0xffffu) w.push_back(0x72800000u | ((v & 0xffffu) << 5) | 9u);   // movk w9, #lo
+        w.push_back(0x1e270000u | (9u << 5) | d);
+        return true;
+    }
+    default: {   // MOVZ X9 (+ MOVK) ; FMOV Dd, X9
+        auto v = kBits64[rng.below(static_cast<unsigned>(std::size(kBits64)))];
+        while (!snan && is_snan64(v)) v = kBits64[rng.below(static_cast<unsigned>(std::size(kBits64)))];
+        w.push_back(0xd2e00000u | (static_cast<std::uint32_t>(v >> 48) << 5) | 9u);   // movz x9, #v[63:48], lsl 48
+        for (unsigned hw = 0; hw < 3; ++hw)
+            if (const auto part = static_cast<std::uint32_t>((v >> (16 * hw)) & 0xffffu))
+                w.push_back(0xf2800000u | (hw << 21) | (part << 5) | 9u);     // movk x9, #part, lsl 16*hw
+        w.push_back(0x9e670000u | (9u << 5) | d);
+        break;
+    }
+    }
+    return false;
+}
+
+// FMAX/FMIN/FMAXNM/FMINNM; shape 0 = S, 1 = D, 2 = .2S, 3 = .4S, 4 = .2D.
+std::uint32_t minmax(coretest::Rng& rng, unsigned shape, unsigned d, unsigned n, unsigned m) {
+    static constexpr std::uint32_t kScalar[] = {0x1e204800u, 0x1e205800u, 0x1e206800u, 0x1e207800u};
+    const unsigned op = rng.below(4);   // FMAX, FMIN, FMAXNM, FMINNM
+    switch (shape) {
+    case 0: return kScalar[op] | (m << 16) | (n << 5) | d;
+    case 1: return kScalar[op] | 0x00400000u | (m << 16) | (n << 5) | d;
+    default: {
+        const bool q = shape != 2, dbl = shape == 4;
+        const std::uint32_t base = (op & 2u) ? 0x0e20c400u : 0x0e20f400u;   // NM: 11000, else 11110
+        return base | (q ? 1u << 30 : 0u) | ((op & 1u) << 23) | (dbl ? 1u << 22 : 0u) | (m << 16) | (n << 5) | d;
+    }
+    }
+}
+
+// One element size per program (NaN payloads are host policy, so a 32-bit
+// NaN lane must not be reread as part of a double). Scalar S forms read only
+// registers whose bits 63:32 are zero (v0-v3, scalar constants) and write v0-v3
+// or v24-v31; the other forms never write v0-v3.
+std::vector<std::uint32_t> program(coretest::Rng& rng, bool snan) {
+    std::vector<std::uint32_t> w;
+    const bool dbl = rng.chance(40);
+    bool s_ok[4] = {};
+    for (unsigned k = 0; k < 4; ++k)
+        if (rng.chance(80)) s_ok[k] = materialize(w, rng, kConstRegs[k], snan, dbl);
+    const bool loop = rng.chance(50);
+    if (loop) w.push_back(movz_x(0, 3));
+    const auto body = w.size();
+    const unsigned n = 3 + rng.below(8);
+    for (unsigned i = 0; i < n; ++i) {
+        unsigned k = rng.below(4);
+        if (rng.chance(8)) {          // a constant register changes inside the loop: no longer constant
+            w.push_back(vz::fp3(vz::kFaddS | (dbl ? 0x00400000u : 0u), kConstRegs[k], kConstRegs[k], rng.below(4)));
+            s_ok[k] = true;
+            continue;
+        }
+        if (rng.chance(6)) {
+            // A different constant on this path; scalar in 32-bit loops (a back edge
+            // brings it to the scalar S forms read earlier in the body).
+            s_ok[k] = materialize(w, rng, kConstRegs[k], snan, dbl, loop);
+            continue;
+        }
+        static constexpr unsigned kShapes32[] = {0, 2, 3}, kShapes64[] = {1, 4};
+        unsigned shape = dbl ? kShapes64[rng.below(2)] : kShapes32[rng.below(3)];
+        if (shape == 0) {
+            unsigned tries = 0;
+            while (!s_ok[k] && tries++ < 4) k = (k + 1) % 4;
+            if (!s_ok[k]) shape = 3;
+        }
+        const unsigned c = kConstRegs[k];
+        unsigned x;
+        if (rng.chance(15)) {         // both operands constant (or the same register: a tie)
+            unsigned j = rng.below(4);
+            if (shape == 0 && !s_ok[j]) j = k;
+            x = kConstRegs[j];
+        } else {
+            x = shape == 0 ? rng.below(4) : rng.below(8);
+        }
+        const unsigned d = rng.chance(70) ? (shape == 0 ? rng.below(4) : 4 + rng.below(4)) : 24 + rng.below(8);
+        w.push_back(rng.chance(50) ? minmax(rng, shape, d, x, c) : minmax(rng, shape, d, c, x));
+    }
+    if (loop) {
+        w.push_back(subs_x_imm(0, 0, 1));
+        w.push_back(b_cond(kNe, -static_cast<int>(w.size() - body)));
+    }
+    return w;
+}
+
+// Inputs: per 32-bit lane (or 64-bit for some registers) a mix of specials:
+// +-0, denormals, infinities, quiet and signalling NaNs, normals, and the
+// constants' own values (exact ties).
+void inputs(GuestContext& ctx, coretest::Rng& rng, bool snan) {
+    static constexpr std::uint32_t k32[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x807fffffu, 0x7f800000u, 0xff800000u,
+                                            0x7fc00000u, 0xffc00001u, 0x7fa00000u, 0xff800001u, 0x3f800000u, 0xc2c80000u,
+                                            0x447a0000u, 0xc47a0000u, 0x4479ffffu, 0x3f000000u};
+    static constexpr std::uint64_t k64[] = {0, 0x8000000000000000ull, 1, 0x800fffffffffffffull, 0x7ff0000000000000ull,
+                                            0xfff0000000000000ull, 0x7ff8000000000000ull, 0x7ff4000000000000ull,
+                                            0x3ff0000000000000ull, 0x408f400000000000ull, 0xc08f400000000000ull};
+    // v0-v7 and the constant registers (v16-v19, used unmaterialized too).
+    for (unsigned r = 0; r < 20; r = r == 7 ? 16 : r + 1)
+        for (unsigned h = 0; h < 2; ++h) {
+            const auto pick32 = [&] {
+                std::uint64_t v = k32[rng.below(static_cast<unsigned>(std::size(k32)))];
+                while (!snan && is_snan32(v)) v = k32[rng.below(static_cast<unsigned>(std::size(k32)))];
+                return v;
+            };
+            if (rng.chance(40)) {
+                std::uint64_t v = k64[rng.below(static_cast<unsigned>(std::size(k64)))];
+                while (!snan && is_snan64(v)) v = k64[rng.below(static_cast<unsigned>(std::size(k64)))];
+                ctx.v[r][h] = v;
+            } else {
+                const std::uint64_t lo = pick32();
+                ctx.v[r][h] = lo | pick32() << 32;
+            }
+        }
+    for (unsigned r = 0; r < 4; ++r) ctx.v[r][0] &= 0xffffffffu;   // scalar S inputs: bits 63:32 zero
+}
+
+bool nan32(std::uint64_t v) { return (v & 0x7f800000u) == 0x7f800000u && (v & 0x7fffffu) != 0; }
+bool nan64(std::uint64_t v) { return (v & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (v & 0xfffffffffffffull) != 0; }
+
+// Vector registers equal up to NaN payloads (host policy): per 64-bit half
+// equal, or both NaN as doubles, or per 32-bit lane equal or both NaN.
+bool same_vectors(const GuestContext& a, const GuestContext& b) {
+    for (unsigned r = 0; r < 32; ++r)
+        for (unsigned h = 0; h < 2; ++h) {
+            const auto x = a.v[r][h], y = b.v[r][h];
+            if (x == y || (nan64(x) && nan64(y))) continue;
+            for (unsigned l = 0; l < 2; ++l) {
+                const auto xl = (x >> (32 * l)) & 0xffffffffu, yl = (y >> (32 * l)) & 0xffffffffu;
+                if (xl != yl && !(nan32(xl) && nan32(yl))) return false;
+            }
+        }
+    return true;
+}
+
+} // namespace fpc
+} // namespace
+
+constexpr int kNoConstMinmax = 16;   // the fp family's knob TRANSMUTE_FX_FP=noconstminmax (fp_no_const_minmax)
+
+FX_TEST(fp_region_minmax_const_random_differential) {
+    ensure_registered();
+    const char* env = std::getenv("FPC_RANDOM_PROGRAMS");
+    const unsigned programs = env ? static_cast<unsigned>(std::strtoul(env, nullptr, 10)) : 3000u;
+    coretest::Rng rng(20261026);
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    unsigned failures = 0;
+    std::size_t bytes[2] = {};
+    unsigned with_snan = 0;
+    // The constant forms must equal the general lowering (up to NaN payloads,
+    // signalling NaNs included: FMAXNM/FMINNM's documented sNaN gap is shared)
+    // and, in programs without signalling NaNs, the oracle. FZ stays off: the
+    // runner's translated side does not apply FPCR.FZ.
+    for (unsigned i = 0; i < programs && failures < 6; ++i) {
+        coretest::Rng prng(20261026u + 7919u * i);   // per program: reproducible by index
+        const bool snan = prng.chance(50);
+        with_snan += snan;
+        const auto words = fpc::program(prng, snan);
+        auto ctx = runner.context(830000 + i);
+        fpc::inputs(ctx, prng, snan);
+        for (const int optimize : {1, 0}) {
+            runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+            GuestContext result[2];
+            bool ran[2] = {};
+            for (const int knobs : {0, kNoConstMinmax}) {
+                const unsigned side = knobs ? 1 : 0;
+                fp_set_knobs_for_testing(knobs);
+                runner.report = false;
+                runner.last = {};
+                const bool equal = runner.run(words, ctx, "");
+                runner.report = true;
+                ran[side] = runner.last.ok && runner.expected.pc == runner.actual.pc;
+                result[side] = runner.actual;
+                if (optimize)
+                    for (const auto& r : runner.machine.regions) bytes[side] += r.code.size();
+                if (!snan && !(ran[side] && equal && fpc::same_vectors(runner.expected, runner.actual))) {
+                    runner.run(words, ctx, "fp min/max const vs oracle " + std::string(knobs ? "general" : "const") +
+                                               (optimize ? " opt" : " plain") + ta::hex(words));
+                    ++failures;
+                }
+            }
+            if (!ran[0] || !ran[1] || !fpc::same_vectors(result[0], result[1]) ||
+                std::memcmp(result[0].x, result[1].x, sizeof result[0].x) != 0) {
+                std::printf("  FAIL program %u: constant forms differ from the general lowering (%s):%s\n", i,
+                            optimize ? "opt" : "plain", ta::hex(words).c_str());
+                for (unsigned r = 0; r < 32; ++r)
+                    for (unsigned h = 0; h < 2; ++h)
+                        if (result[0].v[r][h] != result[1].v[r][h])
+                            std::printf("    v%u.%s const %016llx general %016llx\n", r, h ? "hi" : "lo",
+                                        static_cast<unsigned long long>(result[0].v[r][h]),
+                                        static_cast<unsigned long long>(result[1].v[r][h]));
+                FX_CHECK(false);
+                ++failures;
+            }
+        }
+    }
+    fp_set_knobs_for_testing(-1);
+    runner.machine.options.optimize = -1;
+    std::printf("    %u programs (%u with signalling NaNs); region bytes %zu with the constant forms, %zu without\n", programs,
+                with_snan, bytes[0], bytes[1]);
+    FX_CHECK(bytes[0] < bytes[1]);
+}
+
+namespace {
+
+// Three different, byte sources: [SU]ADDL/ADDW/SUBL/MULL/MLAL/MLSL (q: the "2" forms).
+std::uint32_t three_diff(std::uint32_t opc, bool u, bool q, unsigned d, unsigned n, unsigned m) {
+    return 0x0e200000u | (q ? 1u << 30 : 0u) | (u ? 1u << 29 : 0u) | (m << 16) | (opc << 12) | (n << 5) | d;
+}
+
+} // namespace
+
+// Tier 2: blend masks set before the loop are widened once after their
+// definitions (widen_derived_kind); the widening ops in the loop read the slots.
+FX_TEST(neon_region_widen_derived_masks) {
+    using namespace vf;
+    ensure_registered();
+    std::vector<std::uint32_t> w{0x4f01e500u,                       // movi v0.16b, #40
+                                 0x4f02e404u,                       // movi v4.16b, #64
+                                 0x6e208481u,                       // sub v1.16b, v4.16b, v0.16b
+                                 movz_x(0, 6)};
+    const auto body = w.size();
+    w.push_back(ldst_uimm(4, true, 0, 17, 2));
+    w.push_back(ldst_uimm(4, true, 1, 17, 3));
+    w.push_back(three_diff(0xc, true, false, 5, 0, 2));    // umull v5.8h, v0.8b, v2.8b (mask first)
+    w.push_back(three_diff(0x8, true, false, 5, 3, 1));    // umlal v5.8h, v3.8b, v1.8b (mask second)
+    w.push_back(three_diff(0xc, true, true, 6, 0, 2));     // umull2
+    w.push_back(three_diff(0x8, true, true, 6, 3, 1));     // umlal2
+    w.push_back(three_diff(0x0, true, false, 7, 2, 0));    // uaddl v7.8h, v2.8b, v0.8b
+    w.push_back(three_diff(0x2, true, true, 16, 0, 3));    // usubl2 v16.8h, v0.16b, v3.16b (mask first, not commutative)
+    w.push_back(three_diff(0x1, true, false, 17, 5, 1));   // uaddw v17.8h, v5.8h, v1.8b
+    w.push_back(three_diff(0xc, false, false, 18, 0, 3));  // smull v18.8h, v0.8b, v3.8b
+    w.push_back(three_diff(0xa, false, true, 19, 2, 1));   // smlsl2 v19.8h, v2.16b, v1.16b
+    w.push_back(subs_x_imm(0, 0, 1));
+    w.push_back(b_cond(kNe, -static_cast<int>(w.size() - body)));
+    DiffRunner runner;
+    std::size_t widenings[2] = {};
+    for (const int knobs : {0, static_cast<int>(neon::neon_no_widen_derived)}) {
+        neon::neon_set_knobs_for_testing(knobs);
+        for (const int optimize : {1, 0}) {
+            runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+            for (unsigned k = 0; k < 4; ++k) {
+                if (!runner.run(w, runner.context(79500 + k), "widen derived " + std::to_string(knobs))) {
+                    neon::neon_set_knobs_for_testing(-1);
+                    return;
+                }
+                FX_CHECK_EQ(runner.last.interprets, 0u);
+            }
+            if (optimize)   // VPMOVZXBW / VPMOVSXBW (C4, map 0F38, opcode 30 / 20) and VPUNPCKHBW (C5 .. 68)
+                for (const auto& r : runner.machine.regions)
+                    for (std::size_t k = 0; k + 3 < r.code.size(); ++k) {
+                        const auto* c = r.code.data() + k;
+                        widenings[knobs ? 1 : 0] += (c[0] == 0xc4 && (c[1] & 0x1f) == 2 && (c[3] == 0x30 || c[3] == 0x20)) ||
+                                                    (c[0] == 0xc5 && c[2] == 0x68);
+                    }
+        }
+    }
+    neon::neon_set_knobs_for_testing(-1);
+    runner.machine.options.optimize = -1;
+    std::printf("    widening instructions: %zu, widening each time %zu\n", widenings[0], widenings[1]);
+    FX_CHECK(widenings[0] < widenings[1]);
+}
+
+namespace {
+
+std::uint64_t fpc_expand(unsigned imm8, bool dbl) {   // A64 VFPExpandImm (FMOV immediates)
+    const std::uint64_t sign = (imm8 >> 7) & 1u, b6 = (imm8 >> 6) & 1u, low = (imm8 >> 4) & 3u, frac = imm8 & 15u;
+    if (dbl) return sign << 63 | ((b6 ^ 1u) << 10 | (b6 ? 0xffu : 0u) << 2 | low) << 52 | frac << 48;
+    return sign << 31 | ((b6 ^ 1u) << 7 | (b6 ? 0x1fu : 0u) << 2 | low) << 23 | frac << 19;
+}
+
+} // namespace
+
+// Bit-exactness of the constant forms against the oracle, NaNs included: x is
+// FADD(raw, -0.0), which keeps every number (and +-0) and quiets every NaN
+// (A64 and x64 alike), so x holds no signalling NaN (vec_fp_quiet) whatever
+// the raw input: quiet and signalling NaN payloads, +-0, denormals,
+// infinities, normals, and ties with the constant. The result register is
+// compared bit for bit, for every op, shape and side of the constant.
+FX_TEST(fp_region_minmax_const_bit_exact) {
+    ensure_registered();
+    static constexpr std::uint32_t kRaw32[] = {0x7fc00000u, 0xffc00001u, 0x7fd23456u, 0x7fa00000u, 0xff800001u, 0x7f8abcdeu,
+                                               0x00000000u, 0x80000000u, 0x00000001u, 0x807fffffu, 0x7f800000u, 0xff800000u,
+                                               0x3f800000u, 0xbf800000u, 0x447a0000u, 0xc47a0000u, 0x3f000000u, 0xbf000000u,
+                                               0x41f80000u, 0x447a0001u, 0x7f7fffffu, 0x00800000u};
+    static constexpr std::uint64_t kRaw64[] = {0x7ff8000000000000ull, 0xfff8000000000001ull, 0x7ffc123456789abcull,
+                                               0x7ff4000000000000ull, 0xfff0000000000001ull, 0x7ff0abcdef012345ull,
+                                               0, 0x8000000000000000ull, 1, 0x800fffffffffffffull, 0x7ff0000000000000ull,
+                                               0xfff0000000000000ull, 0x3ff0000000000000ull, 0xbfe0000000000000ull,
+                                               0x408f400000000000ull, 0xc08f400000000000ull, 0x403f000000000000ull,
+                                               0x3fe0000000000000ull, 0x0010000000000000ull};
+    // FMOV immediates usable as vector constants: 0.5, -0.5, 31.0, -1.0 (imm8).
+    static constexpr unsigned kImm8[] = {0x60, 0xe0, 0x3f, 0xf0};
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    runner.machine.options.optimize = 1;
+    coretest::Rng rng(20261027);
+    unsigned checked = 0, failures = 0;
+    std::size_t bytes[2] = {};
+    for (const unsigned shape : {0u, 1u, 2u, 3u, 4u}) {   // S, D, .2S, .4S, .2D
+        const bool dbl = shape == 1 || shape == 4, vector = shape >= 2;
+        for (unsigned op = 0; op < 4 && failures < 6; ++op)   // FMAX, FMIN, FMAXNM, FMINNM
+            for (const bool c_first : {false, true})
+                for (unsigned ci = 0; ci < 4 && failures < 6; ++ci) {
+                    std::vector<std::uint32_t> w;
+                    std::uint64_t cbits = 0;   // the constant's element (ties)
+                    if (vector) {
+                        cbits = fpc_expand(kImm8[ci], dbl);   // v16 = constant splat, v17 = -0.0 splat
+                        w.push_back((dbl ? 0x6f00f400u : 0x4f00f400u) | ((kImm8[ci] >> 5) << 16) | ((kImm8[ci] & 31u) << 5) | 16u);
+                        if (dbl) {
+                            w.push_back(0xd2f00009u);                  // movz x9, #0x8000, lsl 48
+                            w.push_back(0x4e080c00u | (9u << 5) | 17u);  // dup v17.2d, x9
+                        } else {
+                            w.push_back(0x4f046411u);                  // movi v17.4s, #0x80, lsl #24
+                        }
+                        w.push_back((dbl ? 0x4e60d400u : 0x4e20d400u) | (17u << 16) | (0u << 5) | 1u);   // fadd v1, v0, v17
+                    } else {        // scalar constants through W/X; s17/d17 = -0.0
+                        static constexpr std::uint32_t kC32[] = {0x447a0000u, 0xc47a0000u, 0x00800000u, 0x7f7fffffu};
+                        static constexpr std::uint64_t kC64[] = {0x408f400000000000ull, 0xc08f400000000000ull,
+                                                                 0x0010000000000000ull, 0x3fe0000000000000ull};
+                        if (dbl) {
+                            const auto v = kC64[ci];
+                            cbits = v;
+                            w.push_back(0xd2e00000u | (static_cast<std::uint32_t>(v >> 48) << 5) | 9u);
+                            for (unsigned hw = 0; hw < 3; ++hw)
+                                if (const auto part = static_cast<std::uint32_t>((v >> (16 * hw)) & 0xffffu))
+                                    w.push_back(0xf2800000u | (hw << 21) | (part << 5) | 9u);
+                            w.push_back(0x9e670000u | (9u << 5) | 16u);   // fmov d16, x9
+                            w.push_back(0xd2f00009u);                    // movz x9, #0x8000, lsl 48
+                            w.push_back(0x9e670000u | (9u << 5) | 17u);   // fmov d17, x9
+                        } else {
+                            const auto v = kC32[ci];
+                            cbits = v;
+                            w.push_back(0x52a00000u | ((v >> 16) << 5) | 9u);
+                            if (v & 0xffffu) w.push_back(0x72800000u | ((v & 0xffffu) << 5) | 9u);
+                            w.push_back(0x1e270000u | (9u << 5) | 16u);   // fmov s16, w9
+                            w.push_back(0x52b00009u);                    // movz w9, #0x8000, lsl 16
+                            w.push_back(0x1e270000u | (9u << 5) | 17u);   // fmov s17, w9
+                        }
+                        w.push_back((dbl ? 0x1e602800u : 0x1e202800u) | (17u << 16) | (0u << 5) | 1u);   // fadd s1/d1, s0/d0, s17/d17
+                    }
+                    std::uint32_t mm;
+                    const unsigned n = c_first ? 16 : 1, m = c_first ? 1 : 16;
+                    if (!vector) {
+                        static constexpr std::uint32_t kScalar[] = {0x1e204800u, 0x1e205800u, 0x1e206800u, 0x1e207800u};
+                        mm = kScalar[op] | (dbl ? 0x00400000u : 0u) | (m << 16) | (n << 5) | 2u;
+                    } else {
+                        const std::uint32_t base = (op & 2u) ? 0x0e20c400u : 0x0e20f400u;
+                        mm = base | (shape != 2 ? 1u << 30 : 0u) | ((op & 1u) << 23) | (dbl ? 1u << 22 : 0u) | (m << 16) | (n << 5) | 2u;
+                    }
+                    w.push_back(mm);
+                    for (unsigned trial = 0; trial < 24 && failures < 6; ++trial) {
+                        auto ctx = runner.context(840000 + trial);
+                        for (unsigned h = 0; h < 2; ++h) {
+                            if (dbl) {
+                                ctx.v[0][h] = kRaw64[rng.below(static_cast<unsigned>(std::size(kRaw64)))];
+                            } else {
+                                const std::uint64_t lo = kRaw32[rng.below(static_cast<unsigned>(std::size(kRaw32)))];
+                                ctx.v[0][h] = lo | static_cast<std::uint64_t>(kRaw32[rng.below(static_cast<unsigned>(std::size(kRaw32)))]) << 32;
+                            }
+                        }
+                        if (trial % 4 == 3) ctx.v[0][0] = (ctx.v[0][0] & ~(dbl ? ~0ull : 0xffffffffull)) | cbits;   // a tie
+                        if (!vector) ctx.v[0][0] &= dbl ? ~0ull : 0xffffffffull;   // scalar S inputs: bits 63:32 zero (oracle)
+                        runner.report = false;
+                        runner.last = {};
+                        runner.run(w, ctx, "");
+                        runner.report = true;
+                        ++checked;
+                        if (!(runner.last.ok && runner.expected.pc == runner.actual.pc && runner.expected.v[2][0] == runner.actual.v[2][0] &&
+                              runner.expected.v[2][1] == runner.actual.v[2][1])) {
+                            std::printf("  FAIL shape %u op %u c_first %d c %u: v0 %016llx %016llx: v2 expected %016llx %016llx got %016llx %016llx\n",
+                                        shape, op, c_first ? 1 : 0, ci, static_cast<unsigned long long>(ctx.v[0][1]),
+                                        static_cast<unsigned long long>(ctx.v[0][0]), static_cast<unsigned long long>(runner.expected.v[2][1]),
+                                        static_cast<unsigned long long>(runner.expected.v[2][0]),
+                                        static_cast<unsigned long long>(runner.actual.v[2][1]),
+                                        static_cast<unsigned long long>(runner.actual.v[2][0]));
+                            FX_CHECK(false);
+                            ++failures;
+                        }
+                    }
+                    for (const int knobs : {0, kNoConstMinmax}) {   // the constant form was used
+                        fp_set_knobs_for_testing(knobs);
+                        runner.run(w, runner.context(840000), "");
+                        for (const auto& r : runner.machine.regions) bytes[knobs ? 1 : 0] += r.code.size();
+                    }
+                    fp_set_knobs_for_testing(-1);
+                }
+    }
+    runner.machine.options.optimize = -1;
+    std::printf("    %u runs bit-exact; region bytes %zu with the constant forms, %zu without\n", checked, bytes[0], bytes[1]);
+    FX_CHECK(bytes[0] < bytes[1]);
+}

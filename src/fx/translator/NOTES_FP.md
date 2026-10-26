@@ -93,6 +93,25 @@ object so tests link without the core). Tests: `emit_fp_tests*.cpp`.
   **Gap:** FMAXNM/FMINNM treat a signalling NaN like a quiet NaN (A64 returns
   NaN for sNaN versus a number). Exactness would cost ~9 more instructions on
   the fmaxf/fminf path.
+* Against a constant (clamps), bit-exact: when one operand holds a value known
+  at translation time on every path (EmitContext::vec_fp_const: FMOV
+  immediates, MOVI/MVNI, FMOV S/D from a MOVZ/MOVK register) that is finite
+  and normal in every element, and the other operand x can hold no signalling
+  NaN (EmitContext::vec_fp_quiet: an FP arithmetic result, which A64 never
+  makes signalling, or a constant without one), FMAXNM/FMINNM are one max/min
+  with the constant second (a quiet NaN x yields it, as A64 does) and FMAX/FMIN
+  one max/min with x second (a quiet NaN x is returned unchanged, which equals
+  A64's quieted x with FPCR.DN = 0). RegionEmitter's forward dataflow tracks
+  both, joined across loop headers, with quiet bits per element size (32-bit
+  quiet lanes can read as a signalling double). A normal constant is never
+  zero, so there is no +-0 tie, and never denormal, so FZ changes nothing.
+  fxbench fp_float's clamps (8 + 7 instructions) become 1 + 1.
+  `TRANSMUTE_FX_FP=noconstminmax`. Tests: `fp_region_minmax_const_bit_exact`
+  (x = FADD(raw, -0.0) over quiet and signalling NaN payloads, +-0, denormals,
+  infinities and ties; every op, shape and constant side; the result compared
+  bit for bit with the oracle) and `fp_region_minmax_const_random_differential`
+  (random programs: the constant forms against the general lowering and, without
+  signalling NaNs, against the oracle).
 * FZ: x64 detects tininess after rounding, A64 before. With FZ = 1 a result in
   [min_normal * (1 - 2^-p), min_normal) is flushed by A64 but becomes
   min_normal on x64 (comparator tolerance `fz_tininess`). x64 sets UE|PE on an

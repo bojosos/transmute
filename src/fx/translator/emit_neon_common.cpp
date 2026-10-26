@@ -46,6 +46,7 @@ std::uint32_t env_knob_bits() {
             if (all || has("oldrshl")) b |= neon_old_rshl;
             if (all || has("oldushl8")) b |= neon_old_ushl8;
             if (all || has("noelemderived")) b |= neon_no_elem_derived;
+            if (all || has("nowidenderived")) b |= neon_no_widen_derived;
         }
         return b;
     }();
@@ -81,6 +82,7 @@ const char* neon_knob_suffix() {
         n += (b & neon_old_rshl) ? "+oldrshl" : "+rshlvar";
         n += (b & neon_old_ushl8) ? "+oldushl8" : "+ushl8mul";
         n += (b & neon_no_elem_derived) ? "+noelemderived" : "+elemderived";
+        n += (b & neon_no_widen_derived) ? "+nowidenderived" : "+widenderived";
         return n;
     }();
     return suffix.c_str();

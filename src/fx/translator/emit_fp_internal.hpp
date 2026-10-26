@@ -30,6 +30,9 @@ using x64::Xmm;
 //             of one pooled-constant load
 //   oldmask - FNMUL/FABD/FACGE/FACGT build their sign/magnitude masks in a
 //             register instead of using pooled memory operands
+//   noconstminmax - FMAX/FMIN/FMAXNM/FMINNM against a known finite normal
+//             constant (EmitContext::vec_fp_const) use the general lowering
+//             instead of one x64 min/max
 //   oldcvt  - UCVTF (vector, 32-bit lanes) with two converts and two adds
 //             instead of converts + one FMA; SCVTF/UCVTF S from a SIMD
 //             register through a GPR instead of in the vector domain
@@ -39,6 +42,7 @@ enum FpKnob : std::uint32_t {
     fp_old_imm = 2u,
     fp_old_mask = 4u,
     fp_old_cvt = 8u,
+    fp_no_const_minmax = 16u,
 };
 std::uint32_t fp_knob_bits();
 inline bool fp_on(std::uint32_t knob) { return (fp_knob_bits() & knob) == 0; }

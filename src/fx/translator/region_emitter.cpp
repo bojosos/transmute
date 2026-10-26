@@ -2146,6 +2146,7 @@ void RegionEmitter::run() {
     reset_scratch();
     forget_vec_zero();       // fp/neon
     vzero_prepare();         // p3: facts across labels
+    fpconst_done_ = false;   // p3: vec_fp_const, computed at its first query
     cache_on_ = plan_.reg_cache;
     bool_reader_ = -1;       // e_ccmp fusion
     bool_in_slot_ = false;
@@ -2586,6 +2587,254 @@ void RegionEmitter::vzero_finish() {
     s_.vz1_w = s_.vz_w;
     s_.vz1_blk = s_.vz_blk;
     s_.vz1_rec = s_.vz_rec;
+}
+
+// ---- p3: FP constants and signalling-NaN-free values in V registers ----------------------------
+
+namespace {
+
+std::uint64_t fp_expand_imm8(unsigned imm8, bool dbl) {   // A64 VFPExpandImm
+    const std::uint64_t sign = (imm8 >> 7) & 1u, b6 = (imm8 >> 6) & 1u, low = (imm8 >> 4) & 3u, frac = imm8 & 15u;
+    if (dbl) return sign << 63 | ((b6 ^ 1u) << 10 | (b6 ? 0xffu : 0u) << 2 | low) << 52 | frac << 48;
+    return sign << 31 | ((b6 ^ 1u) << 7 | (b6 ? 0x1fu : 0u) << 2 | low) << 23 | frac << 19;
+}
+
+// FMAX/FMIN/FMAXNM/FMINNM, scalar S/D and vector .2S/.4S/.2D: the readers of vec_fp_const.
+bool is_fp_minmax_word(std::uint32_t w) {
+    if ((w & 0xff200c00u) == 0x1e200800u && ((w >> 22) & 3u) < 2 && ((w >> 12) & 15u) >= 4 && ((w >> 12) & 15u) <= 7) return true;
+    return (w & 0xbf20fc00u) == 0x0e20c400u || (w & 0xbf20fc00u) == 0x0e20f400u;
+}
+
+// The quiet bits (FpConst::quiet) of a 128-bit value: bit 0 = no 32-bit
+// element is a signalling NaN, bit 1 = no 64-bit element is.
+std::uint8_t quiet_bits(std::uint64_t lo, std::uint64_t hi) {
+    const auto snan32 = [](std::uint64_t v) { return (v & 0x7fc00000u) == 0x7f800000u && (v & 0x3fffffu) != 0; };
+    const auto snan64 = [](std::uint64_t v) {
+        return (v & 0x7ff8000000000000ull) == 0x7ff0000000000000ull && (v & 0x7ffffffffffffull) != 0;
+    };
+    bool q32 = true;
+    for (const std::uint64_t word : {lo, hi})
+        for (unsigned k = 0; k < 2; ++k) q32 &= !snan32((word >> (32 * k)) & 0xffffffffu);
+    return static_cast<std::uint8_t>((q32 ? 1u : 0u) | (!snan64(lo) && !snan64(hi) ? 2u : 0u));
+}
+
+// An FP arithmetic result written to Vd (A64 never produces a signalling NaN,
+// FPCR.DN or not): its quiet bits, or 0 if `w` is not one. Scalar S results
+// are zero above bit 31 (also no 64-bit sNaN); scalar D and vector results
+// cover their element size. FMOV, FABS, FNEG, FCSEL, loads and moves copy a
+// signalling NaN and are not listed.
+std::uint8_t fp_arith_quiet(std::uint32_t w) {
+    const auto scalar = [](unsigned type) -> std::uint8_t { return type == 0 ? 3 : type == 1 ? 2 : 0; };
+    if ((w & 0xff200c00u) == 0x1e200800u && ((w >> 12) & 15u) <= 8) return scalar((w >> 22) & 3u);   // 2-source
+    if ((w & 0xff000000u) == 0x1f000000u) return scalar((w >> 22) & 3u);                              // FMADD...
+    if ((w & 0xff207c00u) == 0x1e204000u) {                                                           // 1-source
+        const unsigned opcode = (w >> 15) & 63u;
+        if (opcode == 3 || (opcode >= 8 && opcode <= 15)) return scalar((w >> 22) & 3u);   // FSQRT, FRINT*
+        if (opcode == 4) return 3;                                                         // FCVT Sd
+        if (opcode == 5) return 2;                                                         // FCVT Dd
+        return 0;
+    }
+    if ((w & 0x7f3e0000u) == 0x1e220000u) return scalar((w >> 22) & 3u);   // SCVTF/UCVTF from W/X: never NaN
+    // Vector three same (single/double; Q and sz free): FADD, FSUB, FMUL, FDIV,
+    // FMLA, FMLS, FMAX, FMIN, FMAXNM, FMINNM, FMULX, FABD.
+    static constexpr std::uint32_t kThreeSame[] = {0x0e20d400u, 0x0ea0d400u, 0x2e20dc00u, 0x2e20fc00u, 0x0e20cc00u, 0x0ea0cc00u,
+                                                   0x0e20f400u, 0x0ea0f400u, 0x0e20c400u, 0x0ea0c400u, 0x0e20dc00u, 0x2ea0d400u};
+    for (const auto v : kThreeSame)
+        if ((w & 0xbfa0fc00u) == v) return (w >> 22) & 1u ? 2 : 1;
+    // By element (single/double): FMLA, FMLS, FMUL.
+    if ((w & 0xbf80f400u) == 0x0f801000u || (w & 0xbf80f400u) == 0x0f805000u || (w & 0xbf80f400u) == 0x0f809000u)
+        return (w >> 22) & 1u ? 2 : 1;
+    return 0;
+}
+
+} // namespace
+
+// A forward dataflow over the plan: per V register a 128-bit constant, or an
+// unknown value with its quiet bits (no signalling NaN at 32- / 64-bit
+// elements), joined at block starts to a fixpoint (loop-invariant constants and
+// loop-carried arithmetic results keep their class across back edges).
+// Constants come from FMOV (scalar and vector immediate), the families'
+// constant definitions (FamilyFacts::def: MOVI/MVNI) and FMOV S/D from a W/X
+// register set by MOVZ/MOVN/MOVK earlier in the same block; quiet values from
+// FP arithmetic (fp_arith_quiet). Every other write, an interpreted or
+// conservatively described instruction, and region entries make registers
+// unknown and possibly signalling. Only what the FP min/max instructions read
+// is kept (s_.fpc_uses).
+void RegionEmitter::fpconst_compute() {
+    using FpConst = Scratch::FpConst;
+    constexpr FpConst kUnknown{2, 0, 0, 0};
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    s_.fpc_uses.clear();
+    s_.fpc_slot.assign(static_cast<std::size_t>(n), -1);
+    std::vector<std::int32_t> leaders;
+    for (std::int32_t i = 0; i < n; ++i)
+        if (i == 0 || plan_.insts[static_cast<std::size_t>(i)].leader) {
+            s_.fpc_slot[static_cast<std::size_t>(i)] = static_cast<std::int32_t>(leaders.size());
+            leaders.push_back(i);
+        }
+    s_.fpc_in.assign(leaders.size() * 32, FpConst{0, 3, 0, 0});
+    std::vector<std::uint8_t> entry(static_cast<std::size_t>(n), 0);
+    entry[0] = 1;
+    for (const auto& e : plan_.entries)
+        if (e.index >= 0 && e.index < n) entry[static_cast<std::size_t>(e.index)] = 1;
+    for (std::int32_t i = 0; i < n; ++i)
+        if (plan_.insts[static_cast<std::size_t>(i)].entry) entry[static_cast<std::size_t>(i)] = 1;
+    for (std::size_t k = 0; k < leaders.size(); ++k)
+        if (entry[static_cast<std::size_t>(leaders[k])])
+            for (unsigned r = 0; r < 32; ++r) s_.fpc_in[k * 32 + r] = kUnknown;
+    const auto table = registered_families();
+
+    struct Gpr {
+        bool known;
+        std::uint64_t value;
+    };
+    const auto transfer = [&](FpConst* st, Gpr* g, std::int32_t i) {
+        const auto& pi = plan_.insts[static_cast<std::size_t>(i)];
+        const std::uint32_t w = plan_.words[static_cast<std::size_t>(i)];
+        if (pi.flow == Flow::interpret || pi.conservative_writes || (pi.family < 0 && (pi.try_family || pi.inst.kind == Kind::unknown))) {
+            for (unsigned r = 0; r < 32; ++r) st[r] = kUnknown;
+            for (unsigned r = 0; r < 32; ++r) g[r].known = false;
+            return;
+        }
+        const unsigned rd = w & 31u;
+        bool defined = true;
+        FpConst c{1, 0, 0, 0};
+        if ((w & 0xff201fe0u) == 0x1e201000u && ((w >> 22) & 3u) < 2) {   // FMOV S/D, #imm
+            c.lo = fp_expand_imm8((w >> 13) & 0xffu, ((w >> 22) & 3u) == 1);
+        } else if ((w & 0xbff8fc00u) == 0x0f00f400u) {                      // FMOV Vd.2S/4S, #imm (op = 0)
+            const std::uint64_t v = fp_expand_imm8(((w >> 11) & 0xe0u) | ((w >> 5) & 31u), false);
+            c.lo = v | v << 32;
+            c.hi = (w >> 30) & 1u ? c.lo : 0;
+        } else if ((w & 0xfff8fc00u) == 0x6f00f400u) {                      // FMOV Vd.2D, #imm
+            c.lo = c.hi = fp_expand_imm8(((w >> 11) & 0xe0u) | ((w >> 5) & 31u), true);
+        } else if ((w & 0xfffffc00u) == 0x1e270000u || (w & 0xfffffc00u) == 0x9e670000u) {   // FMOV Sd, Wn / Dd, Xn
+            const unsigned rn = (w >> 5) & 31u;
+            const bool x = (w >> 31) & 1u;
+            const bool known = rn == 31 || g[rn].known;
+            const std::uint64_t v = rn == 31 ? 0 : g[rn].value;
+            if (known) c.lo = x ? v : (v & 0xffffffffu);
+            else c = kUnknown;
+        } else if (const std::uint8_t q = fp_arith_quiet(w); q != 0 && ((pi.vwrites >> rd) & 1u)) {
+            c = FpConst{2, q, 0, 0};
+        } else {
+            defined = false;
+            if ((pi.vwrites >> rd) & 1u) {
+                EmitContext::VecValue value{};
+                for (unsigned f = 0; f < table.count && !defined; ++f)
+                    if (const auto* ff = table.families[f].facts; ff && ff->def && ff->def(w, rd, value) == FamilyFactDef::constant) {
+                        defined = true;
+                        c.lo = value.lo;
+                        c.hi = value.hi;
+                    }
+            }
+        }
+        if (c.state == 1) c.quiet = quiet_bits(c.lo, c.hi);
+        if (defined) {
+            for (auto m = pi.vwrites & ~(1u << rd); m; m &= m - 1) st[std::countr_zero(m)] = kUnknown;
+            st[rd] = c;
+        } else {
+            for (auto m = pi.vwrites; m; m &= m - 1) st[std::countr_zero(m)] = kUnknown;
+        }
+        // W/X constants for FMOV from a general register: MOVZ/MOVN/MOVK.
+        const std::uint32_t mov = w & 0x7f800000u;
+        if (mov == 0x52800000u || mov == 0x12800000u || mov == 0x72800000u) {
+            const bool sf = (w >> 31) & 1u;
+            const unsigned shift = 16 * ((w >> 21) & 3u);
+            const std::uint64_t imm = static_cast<std::uint64_t>((w >> 5) & 0xffffu) << shift;
+            const std::uint64_t mask = sf ? ~0ull : 0xffffffffull;
+            for (auto m = pi.writes & ~(1u << rd); m; m &= m - 1) g[std::countr_zero(m)].known = false;
+            if (rd != 31) {
+                if (mov == 0x52800000u) g[rd] = Gpr{true, imm & mask};
+                else if (mov == 0x12800000u) g[rd] = Gpr{true, ~imm & mask};
+                else if (g[rd].known) g[rd].value = ((g[rd].value & ~(0xffffull << shift)) | imm) & mask;
+            }
+        } else {
+            for (auto m = pi.writes; m; m &= m - 1) g[std::countr_zero(m)].known = false;
+        }
+    };
+    const auto join = [](FpConst a, FpConst b) {
+        if (a.state == 0) return b;
+        if (b.state == 0) return a;
+        if (a.state == 1 && b.state == 1 && a.lo == b.lo && a.hi == b.hi) return a;
+        return FpConst{2, static_cast<std::uint8_t>(a.quiet & b.quiet), 0, 0};
+    };
+    // Walks every block; `record` keeps what the min/max readers see (final walk).
+    const auto walk = [&](bool record) {
+        bool changed = false;
+        FpConst st[32];
+        Gpr g[32];
+        for (std::size_t k = 0; k < leaders.size(); ++k) {
+            std::copy_n(&s_.fpc_in[k * 32], 32, st);
+            for (auto& x : g) x.known = false;
+            for (std::int32_t i = leaders[k]; i < n; ++i) {
+                if (i != leaders[k] && s_.fpc_slot[static_cast<std::size_t>(i)] >= 0) break;
+                if (record && is_fp_minmax_word(plan_.words[static_cast<std::size_t>(i)]))
+                    for (auto m = plan_.insts[static_cast<std::size_t>(i)].vreads; m; m &= m - 1) {
+                        const auto r = static_cast<unsigned>(std::countr_zero(m));
+                        if (st[r].state != 0 && (st[r].state == 1 || st[r].quiet != 0))
+                            s_.fpc_uses.push_back({i, static_cast<std::uint8_t>(r), st[r].state, st[r].quiet, st[r].lo, st[r].hi});
+                    }
+                transfer(st, g, i);
+                if (record) continue;
+                plan_.for_each_successor(i, [&](std::int32_t t) {
+                    if (t < 0 || t >= n || entry[static_cast<std::size_t>(t)]) return;
+                    const auto slot = s_.fpc_slot[static_cast<std::size_t>(t)];
+                    if (slot < 0) return;   // the next instruction of this block
+                    for (unsigned r = 0; r < 32; ++r) {
+                        auto& in = s_.fpc_in[static_cast<std::size_t>(slot) * 32 + r];
+                        const auto j = join(in, st[r]);
+                        if (j.state != in.state || j.quiet != in.quiet || j.lo != in.lo || j.hi != in.hi) {
+                            in = j;
+                            changed = true;
+                        }
+                    }
+                });
+            }
+        }
+        return changed;
+    };
+    for (unsigned round = 0; round < 64; ++round)
+        if (!walk(false)) {
+            walk(true);
+            return;
+        }
+    // No fixpoint within the bound: nothing is known (never wrong).
+}
+
+bool RegionEmitter::vec_fp_const(unsigned index, unsigned es, unsigned width, std::uint64_t& bits) {
+    if (!cur_ || (es != 32 && es != 64) || width < es || width > 128) return false;
+    if (!fpconst_done_) {
+        fpconst_compute();
+        fpconst_done_ = true;
+    }
+    const auto it = std::lower_bound(s_.fpc_uses.begin(), s_.fpc_uses.end(), index_,
+                                     [](const Scratch::FpConstUse& x, std::int32_t i) { return x.index < i; });
+    const Scratch::FpConstUse* u = nullptr;
+    for (auto x = it; x != s_.fpc_uses.end() && x->index == index_ && !u; ++x)
+        if (x->vec == index) u = &*x;
+    if (!u || u->state != 1) return false;
+    const auto element = [&](unsigned k) {
+        const unsigned bit = k * es;
+        const std::uint64_t word = bit < 64 ? u->lo : u->hi;
+        return es == 64 ? word : (word >> (bit % 64)) & 0xffffffffull;
+    };
+    for (unsigned k = 1; k < width / es; ++k)
+        if (element(k) != element(0)) return false;
+    bits = element(0);
+    return true;
+}
+
+bool RegionEmitter::vec_fp_quiet(unsigned index, unsigned es) {
+    if (!cur_ || (es != 32 && es != 64)) return false;
+    if (!fpconst_done_) {
+        fpconst_compute();
+        fpconst_done_ = true;
+    }
+    const auto it = std::lower_bound(s_.fpc_uses.begin(), s_.fpc_uses.end(), index_,
+                                     [](const Scratch::FpConstUse& x, std::int32_t i) { return x.index < i; });
+    for (auto x = it; x != s_.fpc_uses.end() && x->index == index_; ++x)
+        if (x->vec == index) return ((x->quiet >> (es == 64 ? 1 : 0)) & 1u) != 0;
+    return false;
 }
 
 void RegionEmitter::clobber_host_flags() { prepare_clobber(); }

@@ -201,6 +201,20 @@ unsigned element_derived_kind(std::uint32_t w) {
     return 0;
 }
 
+// Tier 2: widening ops on bytes (three different, size 0: [SU]ADDL/SUBL,
+// [SU]ADDW/SUBW, [SU]MULL/MLAL/MLSL, low or high halves) read a source widened
+// after its definitions (blend masks set once per row or block): kind 40 +
+// 2 * signed + high. `which`: 0 = Vn, 1 = Vm; 0 if that source is not widened.
+// TRANSMUTE_FX_NEON=nowidenderived.
+unsigned widen_derived_kind(std::uint32_t w, unsigned which) {
+    if ((w & 0x9f200c00u) != 0x0e200000u || bits(w, 23, 22) != 0 || !neon_on(neon_no_widen_derived)) return 0;
+    const unsigned opc = bits(w, 15, 12);
+    const bool both = opc == 0x0 || opc == 0x2 || opc == 0x8 || opc == 0xa || opc == 0xc;
+    const bool m_only = opc == 0x1 || opc == 0x3;
+    if (!(both || (m_only && which == 1))) return 0;
+    return 40 + (bit(w, 29) ? 0u : 2u) + (bit(w, 30) ? 1u : 0u);
+}
+
 // The kind a long-multiply pair at words[0] reads (its elements a word apart), else 0.
 unsigned mull_pair_derived_kind(std::span<const std::uint32_t> words) {
     MullPair p;
@@ -232,6 +246,13 @@ unsigned mask_fact_want(std::span<const std::uint32_t> words, FamilyFactWant* ou
         out[0] = {FamilyFactWant::K::derived, static_cast<std::uint8_t>(bits(words[0], 19, 16) | (size == 2 ? bits(words[0], 20, 20) << 4 : 0u)),
                   {kind, 0}};
         return 1;
+    }
+    if (const unsigned km = widen_derived_kind(words[0], 1)) {
+        unsigned count = 0;
+        out[count++] = {FamilyFactWant::K::derived, static_cast<std::uint8_t>(bits(words[0], 20, 16)), {km, 0}};
+        if (const unsigned kn = widen_derived_kind(words[0], 0))
+            out[count++] = {FamilyFactWant::K::derived, static_cast<std::uint8_t>(bits(words[0], 9, 5)), {kn, 0}};
+        return count;
     }
     MaskIdiom m;
     if (!neon_on(neon_no_mask_fusion) || !match_mask_idiom(words, m)) return 0;
@@ -272,13 +293,16 @@ void mask_fact_check(EmitContext& ctx, Xmm reg, bool in_reg, const Mem& slot, co
 
 // Derived value `kind` of TBL's index vector: idx - 16 * kind with bit 7
 // set where it lies outside [0, 16) (pshufb then zeroes the lane). Kinds 16+:
-// broadcast elements (element_derived_kind).
+// broadcast elements (element_derived_kind); 40+: widened bytes
+// (widen_derived_kind).
 void tbl_derive(EmitContext& ctx, Xmm src, unsigned kind, const Mem& out) {
     auto& as = ctx.as();
     begin_instruction_constants(as);
     V v(ctx);
     const Xmm t = ctx.temp_vec();
-    if (kind >= 24) {
+    if (kind >= 40) {
+        widen(v, 0, (kind & 2u) != 0, (kind & 1u) != 0, t, src);
+    } else if (kind >= 24) {
         v.pshufd(t, src, static_cast<std::uint8_t>((kind - 24) * 0x55));
     } else if (kind >= 16) {
         dup_element(v, 1, t, src, kind - 16);

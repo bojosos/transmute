@@ -327,6 +327,28 @@ public:
         (void)slot;
         return false;
     }
+
+    // ---- FP constants (additive, p3) ---------------------------------------------
+    // True if, at the start of this instruction, every `es`-bit element (32 or
+    // 64) in the low `width` bits of V`index` holds the same value known at
+    // translation time (`bits`): a constant materialized earlier in the region
+    // on every path. Default: unknown.
+    virtual bool vec_fp_const(unsigned index, unsigned es, unsigned width, std::uint64_t& bits) {
+        (void)index;
+        (void)es;
+        (void)width;
+        (void)bits;
+        return false;
+    }
+    // True if, at the start of this instruction, no `es`-bit element (32 or 64)
+    // of V`index` can be a signalling NaN on any path: it holds an FP
+    // arithmetic result (A64 never produces signalling NaNs) or a constant
+    // without one. Default: unknown.
+    virtual bool vec_fp_quiet(unsigned index, unsigned es) {
+        (void)index;
+        (void)es;
+        return false;
+    }
 };
 
 // Static register usage of one instruction, used for pinning decisions.

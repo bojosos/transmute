@@ -140,6 +140,9 @@ inline constexpr SseOp kZext[3] = {op::pmovzxbw, op::pmovzxwd, op::pmovzxdq};
 //   noelemderived - by-element multiplies shuffle their element out each time
 //             (tier 2 may otherwise precompute the broadcast after Vm's
 //             definitions: EmitContext::vec_derived)
+//   nowidenderived - widening ops on bytes widen their sources each time (tier 2
+//             may otherwise precompute the widened value after the source's
+//             definitions)
 enum NeonKnob : std::uint32_t {
     neon_no_fold = 1u,
     neon_no_slot = 2u,
@@ -158,6 +161,7 @@ enum NeonKnob : std::uint32_t {
     neon_old_rshl = 16384u,
     neon_old_ushl8 = 32768u,
     neon_no_elem_derived = 65536u,
+    neon_no_widen_derived = 131072u,
 };
 std::uint32_t neon_knob_bits();
 // Test override of the knobs (-1 = TRANSMUTE_FX_NEON). Not thread-safe.
@@ -392,6 +396,8 @@ unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words
 // Tier 2 derived-value kind of a by-element multiply's broadcast element, or 0
 // (emit_neon_fusion.cpp).
 unsigned element_derived_kind(std::uint32_t w);
+// Tier 2 derived-value kind of a byte-widening op's source `which` (0 = Vn, 1 = Vm), or 0.
+unsigned widen_derived_kind(std::uint32_t w, unsigned which);
 // SMULL|SMLAL + SMLAL by element (16-bit) into one accumulator: 2, else 0.
 unsigned emit_mull_pair(EmitContext& ctx, std::span<const std::uint32_t> words);
 

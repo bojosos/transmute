@@ -1174,6 +1174,56 @@ unsigned emit_three_different(EmitContext& ctx, std::uint32_t w) {
     }
 
     V v(ctx);
+    // Tier 2: byte sources widened after their definitions (widen_derived_kind):
+    // the op reads them from their slots instead of widening them again.
+    Mem sn{}, sm{};
+    const unsigned kn = widen_derived_kind(w, 0), km = widen_derived_kind(w, 1);
+    const bool dn = kn != 0 && v.avx && ctx.vec_derived(rn, kn, sn);
+    const bool dm = km != 0 && v.avx && ctx.vec_derived(rm, km, sm);
+    if (dn || dm) {
+        const bool w_form = opc == 0x1 || opc == 0x3;
+        const bool mul = opc == 0x8 || opc == 0xa || opc == 0xc;
+        const Xmm n = dn ? Xmm{} : ctx.read_vec(rn);
+        const Xmm m = dm ? Xmm{} : ctx.read_vec(rm);
+        const Xmm dold = opc == 0x8 || opc == 0xa ? ctx.read_vec(rd) : Xmm{};
+        const Xmm d = ctx.write_vec(rd);
+        // a (register) op b (register or slot); a and b are the widened sources
+        // in order, except that a commutative op takes a slot second.
+        Xmm a = n, b{};
+        Mem slot{};
+        bool b_mem = false;
+        if (w_form) {   // n is already wide
+            slot = sm;
+            b_mem = true;
+        } else if (dm) {
+            if (dn) {
+                a = v.temp();
+                ctx.as().movdqu(a, sn);
+            } else {
+                a = v.temp();
+                widen(v, 0, !u, high, a, n);
+            }
+            slot = sm;
+            b_mem = true;
+        } else if (opc != 0x2) {   // only n derived, commutative: m widened first
+            a = v.temp();
+            widen(v, 0, !u, high, a, m);
+            slot = sn;
+            b_mem = true;
+        } else {                   // SSUBL/USUBL with only n derived
+            a = v.temp();
+            ctx.as().movdqu(a, sn);
+            b = v.temp();
+            widen(v, 0, !u, high, b, m);
+        }
+        const SseOp o = mul ? op::pmullw : (opc == 0x2 || opc == 0x3) ? kSub[1] : kAdd[1];
+        const Xmm out = opc == 0x8 || opc == 0xa ? v.temp() : d;
+        if (b_mem) v.op(o, out, a, slot);
+        else v.op(o, out, a, b);
+        if (opc == 0x8) v.op(kAdd[1], d, dold, out, true);
+        else if (opc == 0xa) v.op(kSub[1], d, dold, out);
+        return 1;
+    }
     const bool accumulates = opc == 0x5 || opc == 0x8 || opc == 0x9 || opc == 0xa || opc == 0xb;
     const bool narrows = opc == 0x4 || opc == 0x6;
     const Xmm n = ctx.read_vec(rn);

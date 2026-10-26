@@ -232,6 +232,45 @@ void emit_minmax(FpEmit& e, K kind, Shape s, Xmm out, Xmm a, Xmm b, Xmm u, Xmm v
     }
 }
 
+// FMAX/FMIN/FMAXNM/FMINNM where one operand holds a constant known at
+// translation time (EmitContext::vec_fp_const) that is finite and normal in
+// every element, so never NaN, zero or denormal, and the other operand x can
+// hold no signalling NaN (EmitContext::vec_fp_quiet: an FP arithmetic result
+// or a constant): one x64 min/max, bit-exact for every x with FPCR.DN = 0.
+// x64 returns its second operand on NaN or equality, so FMAXNM/FMINNM put the
+// constant second (a quiet NaN x yields c, as A64 does) and FMAX/FMIN put x
+// second (a quiet NaN x is returned unchanged: A64 returns it quieted, which
+// is the same bits). A tie x == c has no +-0 case (c is non-zero) and returns
+// equal bits; a denormal x under FZ is flushed by both lowerings.
+// TRANSMUTE_FX_FP=noconstminmax.
+bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
+    const unsigned es = s.es;
+    const auto normal = [es](std::uint64_t v) {
+        const unsigned exp = es == 32 ? static_cast<unsigned>((v >> 23) & 0xffu) : static_cast<unsigned>((v >> 52) & 0x7ffu);
+        return exp != 0 && exp != (es == 32 ? 0xffu : 0x7ffu);
+    };
+    const unsigned span = s.scalar ? es : w;
+    const auto usable = [&](unsigned c_reg, unsigned x_reg) {
+        std::uint64_t c = 0;
+        return e.ctx.vec_fp_const(c_reg, es, span, c) && normal(c) && e.ctx.vec_fp_quiet(x_reg, es);
+    };
+    unsigned cr = in.rm, xr = in.rn;
+    if (!usable(in.rm, in.rn)) {
+        if (!usable(in.rn, in.rm)) return false;
+        cr = in.rn;
+        xr = in.rm;
+    }
+    const bool nm = in.k == K::fmaxnm || in.k == K::fminnm;
+    const bool is_max = in.k == K::fmax || in.k == K::fmaxnm;
+    const Xmm x = e.vec(xr), cv = e.vec(cr);
+    const unsigned first = nm ? xr : cr;   // a scalar result takes its upper lanes from here
+    const bool zero = s.scalar ? e.zero_above(first, w) : w == 128;
+    const Xmm d = e.dest(in.rd);
+    e.op(s.pick(is_max ? fops::max : fops::min), d, nm ? x : cv, nm ? cv : x);
+    if (!zero) e.zero_upper(d, w);
+    return true;
+}
+
 void emit_minmax_scratch(FpEmit& e, K kind, Shape s, Xmm out, Xmm a, Xmm b, Xmm u) {
     if (!e.avx()) throw std::logic_error("fp: emit_minmax_scratch needs AVX");
     kind = base_minmax(kind);
@@ -383,6 +422,7 @@ bool emit_arith(FpEmit& e, const Inst& in) {
         return true;
     }
     case K::fmax: case K::fmin: case K::fmaxnm: case K::fminnm: {
+        if (e.avx() && fp_on(fp_no_const_minmax) && emit_minmax_const(e, in, s, w)) return true;
         // Both operand orders are computed: both sources in registers.
         Xmm a = e.vec(in.rn), b = e.vec(in.rm);
         // Scalar results take their upper lanes from a (FMAX) or from a | b

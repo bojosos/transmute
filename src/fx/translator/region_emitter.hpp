@@ -131,6 +131,8 @@ public:
     VecFact vec_fact(unsigned index, const VecValue& value) override;
     bool vec_lane_masks(unsigned index) override;
     bool vec_derived(unsigned index, unsigned kind, x64::Mem& slot) override;   // tier 2
+    bool vec_fp_const(unsigned index, unsigned es, unsigned width, std::uint64_t& bits) override;   // p3
+    bool vec_fp_quiet(unsigned index, unsigned es) override;                                       // p3
 
 private:
     // fp/neon (additive): forget which V registers are known zero above bit
@@ -659,6 +661,10 @@ private:
     std::uint32_t vzwritten_{};   // V registers written since the block start (or forgotten)
     std::int32_t vzblock_{-1};    // the current block's leader (-1: region start)
     bool vzsolved_{};             // pass 2: s_.vz_in32/64 hold the block starts' facts
+    // p3: V registers holding constants known at translation time (vec_fp_const):
+    // a forward dataflow over the plan, computed at the first query of a region.
+    void fpconst_compute();
+    bool fpconst_done_{};
     // Per-thread reusable storage (no per-region allocations).
     struct CacheSnapshot {
         RegCache gpr;
@@ -726,6 +732,24 @@ private:
         std::vector<std::int32_t> vz_blk, vz1_blk;
         std::vector<std::uint8_t> vz_rec, vz1_rec, vz_entry;
         std::vector<std::int32_t> vz_pred_head, vz_pred_next, vz_pred_from;
+        // p3: vec_fp_const / vec_fp_quiet. A register's state: 0 = no path yet,
+        // 1 = constant (lo, hi), 2 = unknown value; quiet: bit 0 = no 32-bit
+        // element is a signalling NaN, bit 1 = no 64-bit element is (state 2).
+        struct FpConst {
+            std::uint8_t state;
+            std::uint8_t quiet;
+            std::uint64_t lo, hi;
+        };
+        struct FpConstUse {
+            std::int32_t index;
+            std::uint8_t vec;
+            std::uint8_t state;   // 1 = constant, 2 = unknown value
+            std::uint8_t quiet;   // as FpConst::quiet (computed from the value for constants)
+            std::uint64_t lo, hi;
+        };
+        std::vector<FpConst> fpc_in;              // 32 per leader slot (fpc_slot)
+        std::vector<std::int32_t> fpc_slot;       // instruction -> leader slot, -1
+        std::vector<FpConstUse> fpc_uses;         // constants read by FP min/max, by index
     };
     // ---- cross-block register cache --------------------------------------------
     // Every leader has an entry state (s_.cache_slot -> s_.cache_snaps): the
