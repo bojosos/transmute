@@ -437,6 +437,28 @@ void test_runtime_api() {
     require(list && f.engine.read32(count) == 2 && read(f.engine.read64(list)) == "T" && read(f.engine.read64(list + 24)) == "", "property_copyAttributeList");
     require(f.call("_class_replaceProperty", {cls, f.string("title"), attributes, 1}) == 1 &&
             read(f.call("_property_getAttributes", {f.call("_class_getProperty", {cls, f.string("title")})})) == "T@\"NSString\"", "class_replaceProperty");
+    // Protocols made at run time.
+    const auto proto = f.call("_objc_allocateProtocol", {f.string("AlchemyRuntimeProtocol")});
+    require(proto != 0 && f.call("_objc_allocateProtocol", {f.string("AlchemyRuntimeProtocol")}) == 0, "objc_allocateProtocol once per name");
+    require(f.call("_objc_getProtocol", {f.string("AlchemyRuntimeProtocol")}) == 0, "not visible before objc_registerProtocol");
+    f.call("_protocol_addMethodDescription", {proto, f.runtime.selector("ping:"), f.string("v@:@"), 1, 1});
+    f.call("_protocol_addProperty", {proto, f.string("title"), attributes, 2, 1, 1});
+    f.call("_objc_registerProtocol", {proto});
+    require(f.call("_objc_getProtocol", {f.string("AlchemyRuntimeProtocol")}) == proto, "objc_registerProtocol");
+    f.call("_protocol_addMethodDescription", {proto, f.runtime.selector("late"), f.string("v@:"), 1, 1});
+    require(f.call("_protocol_getMethodDescription", {proto, f.runtime.selector("ping:"), 1, 1}) == f.runtime.selector("ping:") &&
+            f.call("_protocol_getMethodDescription", {proto, f.runtime.selector("late"), 1, 1}) == 0, "a registered protocol is immutable");
+    const auto property_count = f.process.allocate_guest(4);
+    const auto properties = f.call("_protocol_copyPropertyList", {proto, property_count});
+    require(properties && f.engine.read32(property_count) == 1 && read(f.call("_property_getName", {f.engine.read64(properties)})) == "title",
+            "protocol_copyPropertyList");
+    require(f.call("_protocol_getProperty", {proto, f.string("title"), 1, 1}) == f.engine.read64(properties) &&
+            f.call("_protocol_copyPropertyList2", {proto, property_count, 0, 1}) == 0, "protocol_getProperty; no optional properties");
+    require(f.call("_class_addProtocol", {cls, proto}) == 1 && f.call("_class_conformsToProtocol", {cls, proto}) == 1, "a class adopts it");
+    require(f.call("_class_respondsToMethod", {cls, f.runtime.selector("class")}) == f.call("_class_respondsToSelector", {cls, f.runtime.selector("class")}),
+            "class_respondsToMethod");
+    const auto weak = f.process.allocate_guest(8);
+    require(f.call("_objc_initWeakOrNil", {weak, other}) == other && f.call("_objc_storeWeakOrNil", {weak, 0}) == 0, "the OrNil weak forms");
     // Selectors, class lists, outlined ARC calls.
     require(f.call("_sel_isMapped", {f.runtime.selector("sum:with:")}) == 1 && f.call("_sel_isMapped", {0x12345}) == 0, "sel_isMapped");
     const auto classes = f.call("_objc_copyClassList", {count});

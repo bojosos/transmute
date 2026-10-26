@@ -24,6 +24,7 @@
 //   getnetbyaddr  the flat files /etc/hosts, /etc/services, /etc/protocols and
 //       /etc/networks of the guest file system (none when a file is missing)
 //   ether_line, ether_ntohost, ether_hostton  over /etc/ethers
+//   inet6_opt_* and inet6_rth_* (RFC 3542 extension headers), inet6_option_space (RFC 2292)
 // Structure layouts follow <netdb.h>: hostent {h_name, h_aliases, int h_addrtype,
 // int h_length, h_addr_list} (32 bytes), servent {s_name, s_aliases, int s_port, s_proto}
 // (32), protoent {p_name, p_aliases, int p_proto} (24), netent {n_name, n_aliases,
@@ -506,6 +507,146 @@ void install_libsystem_netdb_extra(Provider& p) {
             return network == wanted;
         });
     }, 0);
+
+    // ---- IPv6 extension headers (RFC 3542 section 10 and 7) ----
+    // Options: a header {next header, length in 8-byte units minus 1}, then TLV options, aligned
+    // with Pad1 (a 0 byte) and PadN (type 1, length, zeros).
+    const auto pad = [](GuestMemory& m, std::uint64_t at, std::uint32_t count) {
+        if (count == 1) { m.write8(at, 0); return; }
+        if (count < 2) return;
+        m.write8(at, 1);
+        m.write8(at + 1, static_cast<std::uint8_t>(count - 2));
+        if (count > 2) m.fill_bytes(at + 2, 0, count - 2);
+    };
+    const auto signed_int = [](std::uint64_t value) { return static_cast<std::int32_t>(value); };
+    const auto result = [](std::int64_t value) { return static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::int32_t>(value))); };
+    // int inet6_opt_init(void* extbuf, socklen_t extlen): the header's 2 bytes.
+    p.libsystem("_inet6_opt_init", [result](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto length = static_cast<std::uint32_t>(s.x[1]);
+        if (s.x[0]) {
+            if (!length || length % 8) return result(-1);
+            m.write8(s.x[0] + 1, static_cast<std::uint8_t>(length / 8 - 1));
+        }
+        return 2;
+    });
+    // int inet6_opt_append(extbuf, extlen, offset, uint8_t type, socklen_t len, uint8_t align, void** databufp)
+    p.libsystem("_inet6_opt_append", [pad, signed_int, result](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto offset = signed_int(s.x[2]);
+        const auto type = static_cast<std::uint8_t>(s.x[3]);
+        const auto length = static_cast<std::uint32_t>(s.x[4]), align = static_cast<std::uint32_t>(s.x[5] & 0xff);
+        if (offset < 2 || type < 2 || length > 255 || (align != 1 && align != 2 && align != 4 && align != 8) || align > std::max(length, 1U))
+            return result(-1);
+        const auto padding = (align - (static_cast<std::uint32_t>(offset) + 2) % align) % align;
+        const auto end = static_cast<std::uint32_t>(offset) + padding + 2 + length;
+        if (s.x[0]) {
+            if (end > static_cast<std::uint32_t>(s.x[1])) return result(-1);
+            pad(m, s.x[0] + static_cast<std::uint32_t>(offset), padding);
+            const auto option = s.x[0] + static_cast<std::uint32_t>(offset) + padding;
+            m.write8(option, type);
+            m.write8(option + 1, static_cast<std::uint8_t>(length));
+            if (s.x[6]) m.write64(s.x[6], option + 2);
+        }
+        return end;
+    });
+    // int inet6_opt_finish(extbuf, extlen, offset): padded to a multiple of 8.
+    p.libsystem("_inet6_opt_finish", [pad, signed_int, result](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto offset = signed_int(s.x[2]);
+        if (offset < 2) return result(-1);
+        const auto end = (static_cast<std::uint32_t>(offset) + 7) & ~7U;
+        if (s.x[0]) {
+            if (end > static_cast<std::uint32_t>(s.x[1])) return result(-1);
+            pad(m, s.x[0] + static_cast<std::uint32_t>(offset), end - static_cast<std::uint32_t>(offset));
+        }
+        return end;
+    });
+    // int inet6_opt_set_val(void* databuf, int offset, void* val, socklen_t vallen) / inet6_opt_get_val
+    for (const bool get : {false, true})
+        p.libsystem(get ? "_inet6_opt_get_val" : "_inet6_opt_set_val", [signed_int, get](CpuState& s, GuestMemory& m) -> std::uint64_t {
+            const auto offset = signed_int(s.x[1]);
+            const auto length = static_cast<std::uint32_t>(s.x[3]);
+            if (length) {
+                if (get) m.copy_bytes(s.x[2], s.x[0] + static_cast<std::uint32_t>(offset), length);
+                else m.copy_bytes(s.x[0] + static_cast<std::uint32_t>(offset), s.x[2], length);
+            }
+            return static_cast<std::uint32_t>(offset + static_cast<std::int32_t>(length));
+        });
+    // inet6_opt_next(extbuf, extlen, offset, uint8_t* typep, socklen_t* lenp, void** databufp) and
+    // inet6_opt_find(extbuf, extlen, offset, uint8_t type, socklen_t* lenp, void** databufp): the next
+    // option (of that type) after offset (0: the first), skipping padding; -1 at the end.
+    for (const bool find : {false, true})
+        p.libsystem(find ? "_inet6_opt_find" : "_inet6_opt_next", [signed_int, result, find](CpuState& s, GuestMemory& m) -> std::uint64_t {
+            const auto size = static_cast<std::uint32_t>(s.x[1]);
+            auto at = static_cast<std::uint32_t>(std::max(signed_int(s.x[2]), 2));
+            if (!s.x[0] || signed_int(s.x[2]) < 0) return result(-1);
+            while (at < size) {
+                const auto type = m.read8(s.x[0] + at);
+                if (type == 0) { ++at; continue; }
+                if (at + 2 > size) return result(-1);
+                const auto length = m.read8(s.x[0] + at + 1);
+                if (at + 2 + length > size) return result(-1);
+                const auto data = s.x[0] + at + 2;
+                at += 2 + length;
+                if (type == 1 || (find && type != static_cast<std::uint8_t>(s.x[3]))) continue;
+                if (!find && s.x[3]) m.write8(s.x[3], type);
+                if (s.x[4]) m.write32(s.x[4], length);
+                if (s.x[5]) m.write64(s.x[5], data);
+                return at;
+            }
+            return result(-1);
+        });
+    // Type 0 routing headers: {next header, length (2 per address), type 0, segments left,
+    // reserved}, then the addresses.
+    p.libsystem("_inet6_rth_space", [](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto segments = static_cast<std::int32_t>(s.x[1]);
+        if (static_cast<std::int32_t>(s.x[0]) != 0 || segments < 0 || segments > 127) return 0;
+        return 8 + 16U * static_cast<std::uint32_t>(segments);
+    });
+    p.libsystem("_inet6_rth_init", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto segments = static_cast<std::int32_t>(s.x[3]);
+        if (static_cast<std::int32_t>(s.x[2]) != 0 || segments < 0 || segments > 127) return 0;
+        const auto space = 8 + 16U * static_cast<std::uint32_t>(segments);
+        if (!s.x[0] || static_cast<std::uint32_t>(s.x[1]) < space) return 0;
+        m.fill_bytes(s.x[0], 0, space);
+        m.write8(s.x[0] + 1, static_cast<std::uint8_t>(segments * 2));
+        return s.x[0];
+    }, 0);
+    // int inet6_rth_add(void* bp, const struct in6_addr*): the next address (segments left counts them).
+    p.libsystem("_inet6_rth_add", [result](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto count = m.read8(s.x[0] + 3), capacity = static_cast<std::uint8_t>(m.read8(s.x[0] + 1) / 2);
+        if (m.read8(s.x[0] + 2) != 0 || count >= capacity) return result(-1);
+        m.copy_bytes(s.x[0] + 8 + 16ULL * count, s.x[1], 16);
+        m.write8(s.x[0] + 3, static_cast<std::uint8_t>(count + 1));
+        return 0;
+    });
+    p.libsystem("_inet6_rth_segments", [result](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (m.read8(s.x[0] + 2) != 0) return result(-1);
+        return m.read8(s.x[0] + 1) / 2U;
+    });
+    p.libsystem("_inet6_rth_getaddr", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto index = static_cast<std::int32_t>(s.x[1]);
+        if (m.read8(s.x[0] + 2) != 0 || index < 0 || index >= m.read8(s.x[0] + 1) / 2) return 0;
+        return s.x[0] + 8 + 16ULL * static_cast<std::uint32_t>(index);
+    }, 0);
+    // int inet6_rth_reverse(const void* in, void* out): the addresses in reverse order, all left (in may be out).
+    p.libsystem("_inet6_rth_reverse", [result](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (m.read8(s.x[0] + 2) != 0) return result(-1);
+        const auto segments = m.read8(s.x[0] + 1) / 2U;
+        std::vector<std::uint8_t> addresses(16 * segments);
+        if (segments) m.read_bytes(s.x[0] + 8, addresses);
+        const auto header = std::array<std::uint8_t, 2>{m.read8(s.x[0]), m.read8(s.x[0] + 1)};
+        m.fill_bytes(s.x[1], 0, 8);
+        m.write8(s.x[1], header[0]); m.write8(s.x[1] + 1, header[1]);
+        m.write8(s.x[1] + 3, static_cast<std::uint8_t>(segments));
+        for (std::uint32_t index = 0; index < segments; ++index)
+            m.write_bytes(s.x[1] + 8 + 16ULL * index, std::span(addresses.data() + 16 * (segments - 1 - index), 16));
+        return 0;
+    });
+    // int inet6_option_space(int nbytes) (RFC 2292): a cmsghdr (12 bytes, 4-aligned on Darwin) and
+    // the option with its type and length bytes, padded to 8.
+    p.libsystem("_inet6_option_space", [](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto bytes = (static_cast<std::uint32_t>(s.x[0]) + 2 + 7) & ~7U;
+        return 12 + ((bytes + 3) & ~3U);
+    });
 
     // ---- /etc/ethers ----
     // int ether_line(const char* line, struct ether_addr* e, char* hostname): 0, or -1.

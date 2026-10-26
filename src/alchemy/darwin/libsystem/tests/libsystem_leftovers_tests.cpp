@@ -315,6 +315,19 @@ void err_hooks(Fixture& f) {
     f.call(sys, "_err_set_exit", {0});
 }
 
+// fgetwln: fgetln's line widened.
+void wide_lines(Fixture& f) {
+    const auto text = f.text("ab\ncd");
+    const auto stream = f.call(sys, "_fmemopen", {text, 5, f.text("r")});
+    const auto length = f.block(8);
+    const auto line = f.call(sys, "_fgetwln", {stream, length});
+    require(line && f.engine.read64(length) == 3 && f.engine.read32(line) == 'a' && f.engine.read32(line + 8) == '\n', "fgetwln");
+    const auto next = f.call(sys, "_fgetwln", {stream, length});
+    require(next && f.engine.read64(length) == 2 && f.engine.read32(next + 4) == 'd', "the last line has no newline");
+    require(f.call(sys, "_fgetwln", {stream, length}) == 0, "the end");
+    f.call(sys, "_fclose", {stream});
+}
+
 void byte_swap(Fixture& f) {
     const auto header = f.block(32);
     f.engine.write32(header, 0xfeedfacf);
@@ -1332,6 +1345,7 @@ int main(int argc, char** argv) {
         {"getopt_long", getopt_long},
         {"getopt_long_only", getopt_long_only},
         {"err_hooks", err_hooks},
+        {"wide_lines", wide_lines},
         {"byte_swap", byte_swap},
         {"bz2_stream", bz2_stream},
         {"misc", misc},

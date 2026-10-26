@@ -236,6 +236,8 @@ struct ObjcRuntime::Impl {
         std::vector<Address> protocols;
         // Required instance, required class, optional instance, optional class.
         std::array<std::vector<ObjcMethodInfo>, 4> methods;
+        // Declared (required) properties: instance, class.
+        std::array<std::vector<ObjcPropertyInfo>, 2> properties;
     };
     struct Image {
         std::vector<Address> classes;
@@ -277,6 +279,7 @@ struct ObjcRuntime::Impl {
     std::unordered_set<Address> property_records; // property_t entries of registered classes (objc_property_t)
     std::map<Address, std::shared_ptr<Protocol>> protocols;
     std::map<std::string, Address, std::less<>> protocol_names;
+    std::set<Address> constructing_protocols;   // objc_allocateProtocol'd, not yet registered
     string_hash_map<Address> type_strings;
     std::map<Address, Address> protocol_aliases; // Every known protocol_t, canonical ones included.
     Address protocol_class{}, mutation_handler{};
@@ -1863,6 +1866,18 @@ struct ObjcRuntime::Impl {
                     for (const auto address : found->second.classes) if (const auto value = cls(address); !value->metaclass && value->registered) names.push_back(value->name_address);
             }
             s.x[0] = copy_words(names, s.x[1], m); });
+        // Class* objc_copyClassesForImage(const char* image, unsigned* count): the image's registered classes.
+        function("_objc_copyClassesForImage", [this](auto& s, auto& m) {
+            const auto wanted = text(m, s.x[0]);
+            Address module{};
+            for (const auto& image : process.images()) if (image.name == wanted) { module = image.module_id; break; }
+            std::vector<Address> classes;
+            if (module) {
+                std::lock_guard lock(mutex);
+                if (const auto found = images.find(module); found != images.end())
+                    for (const auto address : found->second.classes) if (const auto value = cls(address); !value->metaclass && value->registered) classes.push_back(address);
+            }
+            s.x[0] = copy_words(classes, s.x[1], m); });
         // Class* objc_copyClassList(unsigned* count): every registered class, NULL-terminated.
         function("_objc_copyClassList", [this](auto& s, auto& m) {
             std::vector<Address> result;
@@ -2065,6 +2080,9 @@ struct ObjcRuntime::Impl {
             const auto result = method(meta, s.x[1]); s.x[0] = result ? result->descriptor : 0; });
         function("_class_getMethodImplementation", [this](auto& s, auto&) { s.x[0] = implementation_or_forward(s.x[0], s.x[1]); });
         function("_class_respondsToSelector", [this](auto& s, auto&) { s.x[0] = class_responds(s.x[0], s.x[1]); });
+        // The pre-2.0 names of the two above.
+        function("_class_respondsToMethod", [this](auto& s, auto&) { s.x[0] = class_responds(s.x[0], s.x[1]); });
+        function("_class_lookupMethod", [this](auto& s, auto&) { s.x[0] = implementation_or_forward(s.x[0], s.x[1]); });
         function("_method_getImplementation", [this](auto& s, auto& m) { std::lock_guard lock(mutex);
             if (!method_owners.contains(s.x[0])) throw std::runtime_error("invalid Objective-C Method");
             s.x[0] = m.read64(s.x[0] + 16); });
@@ -2177,6 +2195,9 @@ struct ObjcRuntime::Impl {
         cleanup = function("___alchemy_objc_cleanup", [this](auto&, auto&) { cleanup_thread(*process.current_thread()); });
         function("_objc_initWeak", [this](auto& s, auto&) { s.x[0] = store_weak(s.x[0], s.x[1], true); });
         function("_objc_storeWeak", [this](auto& s, auto&) { s.x[0] = store_weak(s.x[0], s.x[1], false); });
+        // The *OrNil forms store nil for an object that is being deallocated, which store_weak does already.
+        function("_objc_initWeakOrNil", [this](auto& s, auto&) { s.x[0] = store_weak(s.x[0], s.x[1], true); });
+        function("_objc_storeWeakOrNil", [this](auto& s, auto&) { s.x[0] = store_weak(s.x[0], s.x[1], false); });
         function("_objc_loadWeakRetained", [this](auto& s, auto&) { s.x[0] = load_weak_retained(s.x[0]); });
         function("_objc_loadWeak", [this](auto& s, auto&) { s.x[0] = autorelease(load_weak_retained(s.x[0])); });
         function("_objc_destroyWeak", [this](auto& s, auto&) { destroy_weak(s.x[0]); });
@@ -2293,6 +2314,98 @@ struct ObjcRuntime::Impl {
             if (count) values.push_back(0); // Two-word {NULL, NULL} terminator with copy_words' final word.
             s.x[0] = copy_words(values, 0, m);
             if (out) m.write32(out, static_cast<std::uint32_t>(count)); });
+        // Protocols made at run time: objc_allocateProtocol (NULL when the name is taken), then
+        // protocol_add{MethodDescription,Protocol,Property} while it is under construction, then
+        // objc_registerProtocol, after which it is immutable and objc_getProtocol finds it.
+        function("_objc_allocateProtocol", [this](auto& s, auto& m) {
+            const auto name = text(m, s.x[0]);
+            std::lock_guard lock(mutex);
+            if (protocol_names.contains(name)) { s.x[0] = 0; return; }
+            for (const auto address : constructing_protocols) if (protocols.at(address)->name == name) { s.x[0] = 0; return; }
+            const auto address = arena_allocate(104, 8);   // protocol_t
+            auto& memory = process.main_engine();
+            memory.fill_bytes(address, 0, 104);
+            auto value = std::make_shared<Protocol>();
+            value->address = address; value->name = name; value->name_address = string(name);
+            memory.write64(address, protocol_class);
+            memory.write64(address + 8, value->name_address);
+            memory.write32(address + 64, 104);
+            protocols.emplace(address, value);
+            add_protocol_alias(address, address);
+            constructing_protocols.insert(address);
+            s.x[0] = address; });
+        function("_objc_registerProtocol", [this](auto& s, auto&) {
+            std::lock_guard lock(mutex);
+            if (!s.x[0] || !constructing_protocols.erase(s.x[0])) return;   // registered already (objc4 only logs)
+            protocol_names.emplace(protocols.at(s.x[0])->name, s.x[0]); });
+        // The protocol under construction, or 0 (the additions are ignored otherwise, as objc4's).
+        const auto constructing = [this](Address value) -> Protocol* {
+            if (!value || !constructing_protocols.contains(value)) return nullptr;
+            return protocols.at(value).get();
+        };
+        // void protocol_addMethodDescription(Protocol*, SEL, const char* types, BOOL required, BOOL instance)
+        function("_protocol_addMethodDescription", [this, constructing](auto& s, auto& m) {
+            if (!s.x[1]) return;
+            const auto name = text(m, s.x[1]), types = s.x[2] ? text(m, s.x[2]) : std::string();
+            std::lock_guard lock(mutex);
+            if (auto* value = constructing(s.x[0]))
+                value->methods[(s.x[3] & 0xff ? 0U : 2U) + (s.x[4] & 0xff ? 0U : 1U)].push_back(ObjcMethodInfo{name, types, 0}); });
+        function("_protocol_addProtocol", [this, constructing](auto& s, auto&) {
+            std::lock_guard lock(mutex);
+            auto* value = constructing(s.x[0]);
+            if (!value || !s.x[1]) return;
+            const auto addition = canonical_protocol(s.x[1]);
+            if (std::find(value->protocols.begin(), value->protocols.end(), addition) == value->protocols.end()) value->protocols.push_back(addition); });
+        // void protocol_addProperty(Protocol*, const char* name, const objc_property_attribute_t*, unsigned count,
+        // BOOL required, BOOL instance): required properties only (optional ones are not kept, as objc4).
+        function("_protocol_addProperty", [this, constructing](auto& s, auto& m) {
+            if (!s.x[1] || !(s.x[4] & 0xff)) return;
+            const auto name = text(m, s.x[1]);
+            std::string attributes;
+            for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(s.x[3]); ++index) {
+                const auto entry = s.x[2] + 16ULL * index;
+                if (index) attributes += ',';
+                attributes += text(m, m.read64(entry));
+                if (const auto value = m.read64(entry + 8)) attributes += text(m, value);
+            }
+            std::lock_guard lock(mutex);
+            auto* value = constructing(s.x[0]);
+            if (!value) return;
+            auto& list = value->properties[s.x[5] & 0xff ? 0 : 1];
+            if (std::any_of(list.begin(), list.end(), [&](const ObjcPropertyInfo& entry) { return entry.name == name; })) return;
+            const auto record = arena_allocate(16, 8);
+            auto& memory = process.main_engine();
+            memory.write64(record, string(name)); memory.write64(record + 8, string(attributes));
+            property_records.insert(record);
+            list.push_back(ObjcPropertyInfo{name, attributes, record}); });
+        // objc_property_t* protocol_copyPropertyList(Protocol*, unsigned*) and
+        // protocol_copyPropertyList2(..., BOOL required, BOOL instance): the protocol's own
+        // properties (optional ones: none).
+        const auto property_list = [this](Address proto, bool required, bool instance) {
+            std::vector<Address> values;
+            if (!proto || !required) return values;
+            std::lock_guard lock(mutex);
+            for (const auto& property : protocol(proto)->properties[instance ? 0 : 1]) values.push_back(property.address);
+            return values;
+        };
+        function("_protocol_copyPropertyList", [this, property_list](auto& s, auto& m) { s.x[0] = copy_words(property_list(s.x[0], true, true), s.x[1], m); });
+        function("_protocol_copyPropertyList2", [this, property_list](auto& s, auto& m) {
+            s.x[0] = copy_words(property_list(s.x[0], s.x[2] & 0xff, s.x[3] & 0xff), s.x[1], m); });
+        // objc_property_t protocol_getProperty(Protocol*, const char* name, BOOL required, BOOL instance):
+        // the protocol's, then its inherited protocols'.
+        function("_protocol_getProperty", [this](auto& s, auto& m) {
+            if (!s.x[0] || !s.x[1] || !(s.x[2] & 0xff)) { s.x[0] = 0; return; }
+            const auto name = text(m, s.x[1]);
+            const auto instance = (s.x[3] & 0xff) != 0;
+            std::lock_guard lock(mutex);
+            std::vector<Address> pending{canonical_protocol(s.x[0])}; std::set<Address> visited;
+            while (!pending.empty()) {
+                const auto current = protocols.at(pending.front()); pending.erase(pending.begin());
+                if (!visited.insert(current->address).second) continue;
+                for (const auto& property : current->properties[instance ? 0 : 1]) if (property.name == name) { s.x[0] = property.address; return; }
+                pending.insert(pending.end(), current->protocols.begin(), current->protocols.end());
+            }
+            s.x[0] = 0; });
         const auto root = native_class("NSObject", 0, 8);
         add_native(root, "alloc", [this](auto& s, auto&) { s.x[0] = allocate(s.x[0]); }, true);
         add_native(root, "allocWithZone:", [this](auto& s, auto&) { if (s.x[2]) throw std::runtime_error("Objective-C custom allocation zones are unsupported"); s.x[0] = allocate(s.x[0]); }, true, "@@:^v");
@@ -2520,6 +2633,8 @@ void ObjcRuntime::prepare_images(std::span<const ImageRuntimeInfo> runtime_image
                 value->address = info.address; value->name = info.name; value->module = image.module_id;
                 value->name_address = impl_->string(info.demangled_name.empty() ? info.name : info.demangled_name);
                 value->methods = {info.instance_methods, info.class_methods, info.optional_instance_methods, info.optional_class_methods};
+                value->properties = {info.properties, info.class_properties};
+                for (const auto& list : value->properties) for (const auto& property : list) impl_->property_records.insert(property.address);
                 impl_->protocols.emplace(info.address, value); impl_->protocol_names.emplace(info.name, info.address);
                 impl_->add_protocol_alias(info.address, info.address);
                 transaction.protocols.push_back(info.address); defined.emplace_back(&info, info.address);

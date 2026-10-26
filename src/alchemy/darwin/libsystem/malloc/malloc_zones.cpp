@@ -9,6 +9,7 @@
 #include <new>
 #include <span>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -467,6 +468,124 @@ void install_malloc_zones(ProcessContext& context, HostHeap heap, std::uint64_t 
         m.write64(s.x[1] + 8, total[1]);
         m.write64(s.x[1] + 16, total[2]);
         m.write64(s.x[1] + 24, total[3]);
+        return std::uint64_t{0};
+    });
+    // Debugging aids. A guest zone answers through its malloc_introspection_t; the system zone (the
+    // host heap) is consistent by construction, logs nothing and has no discharge checking.
+    const auto introspection = [zones](std::uint64_t zone, std::uint64_t member) -> std::uint64_t {
+        if (!zone || zone == zones->system()) return 0;
+        const auto table = zones->slot(zone, zone_layout::introspect);
+        return table ? zones->slot(table, member) : 0;
+    };
+    const auto guest_call = [process](std::string_view name, std::initializer_list<std::uint64_t> arguments) -> std::uint64_t {
+        const auto found = process->resolve("/usr/lib/libSystem.B.dylib", name);
+        if (!found) return 0;
+        return process->calling_engine().invoke_callback(found->address, std::span(arguments.begin(), arguments.size()));
+    };
+    // Writes a line to standard error through the guest's write.
+    const auto report = [process, guest_call](const std::string& line) {
+        const auto text = process->allocate_guest(line.size() + 1);
+        std::vector<std::uint8_t> bytes(line.begin(), line.end());
+        process->calling_engine().write_bytes(text, bytes);
+        static_cast<void>(guest_call("_write", {2, text, line.size()}));
+        process->release_guest(text);
+    };
+    // boolean_t malloc_zone_check(zone): NULL checks every zone.
+    install("_malloc_zone_check", [zones, introspection](auto& s, auto&) {
+        const auto check = [&](std::uint64_t zone) {
+            const auto function = introspection(zone, zone_layout::introspection::check);
+            if (!function) return true;
+            const std::array<std::uint64_t, 1> arguments{zone};
+            return (zones->call(function, arguments) & 0xffffffffULL) != 0;
+        };
+        if (s.x[0]) return std::uint64_t{check(s.x[0]) ? 1U : 0U};
+        const auto list = zones->zones();
+        for (const auto zone : *list) if (!check(zone)) return std::uint64_t{0};
+        return std::uint64_t{1};
+    });
+    // void malloc_zone_print(zone, boolean_t verbose): the zone's own print, or the system zone's counts.
+    install("_malloc_zone_print", [zones, introspection, report](auto& s, auto&) {
+        const auto print = [&](std::uint64_t zone) {
+            if (const auto function = introspection(zone, zone_layout::introspection::print)) {
+                const std::array<std::uint64_t, 2> arguments{zone, s.x[1] & 0xffffffffULL};
+                static_cast<void>(zones->call(function, arguments));
+            } else if (zone == zones->system()) {
+                const auto value = zones->zone_statistics(zone);
+                report("DefaultMallocZone: " + std::to_string(value[0]) + " blocks in use, " + std::to_string(value[1]) +
+                       " bytes in use, " + std::to_string(value[2]) + " bytes at most\n");
+            }
+        };
+        if (s.x[0]) print(s.x[0]);
+        else { const auto list = zones->zones(); for (const auto zone : *list) print(zone); }
+        return std::uint64_t{0};
+    });
+    // void malloc_zone_log(zone, void* address)
+    install("_malloc_zone_log", [zones, introspection](auto& s, auto&) {
+        if (const auto function = introspection(s.x[0], zone_layout::introspection::log)) {
+            const std::array<std::uint64_t, 2> arguments{s.x[0], s.x[1]};
+            static_cast<void>(zones->call(function, arguments));
+        }
+        return std::uint64_t{0};
+    });
+    // boolean_t malloc_zone_enable_discharge_checking(zone); void ..._disable_...(zone);
+    // void malloc_zone_discharge(zone, void* memory)
+    install("_malloc_zone_enable_discharge_checking", [zones, introspection](auto& s, auto&) {
+        const auto function = introspection(s.x[0], zone_layout::introspection::enable_discharge_checking);
+        if (!function) return std::uint64_t{0};
+        const std::array<std::uint64_t, 1> arguments{s.x[0]};
+        return zones->call(function, arguments) & 0xffffffffULL;
+    });
+    for (const auto& [name, member] : std::array<std::pair<const char*, std::uint64_t>, 2>{{
+             {"_malloc_zone_disable_discharge_checking", zone_layout::introspection::disable_discharge_checking},
+             {"_malloc_zone_discharge", zone_layout::introspection::discharge}}}) {
+        const auto which = member;
+        install(name, [zones, introspection, which](auto& s, auto&) {
+            if (const auto function = introspection(s.x[0], which)) {
+                const std::array<std::uint64_t, 2> arguments{s.x[0], s.x[1]};
+                static_cast<void>(zones->call(function, arguments));
+            }
+            return std::uint64_t{0};
+        });
+    }
+    // boolean_t malloc_zone_claimed_address(zone, void* ptr): the zone's claimed_address (version 10),
+    // else whether the zone owns ptr.
+    install("_malloc_zone_claimed_address", [zones](auto& s, auto&) {
+        if (!s.x[0]) return std::uint64_t{0};
+        if (s.x[0] != zones->system() && zones->version(s.x[0]) >= 10)
+            if (const auto function = zones->slot(s.x[0], zone_layout::claimed_address)) {
+                const std::array<std::uint64_t, 2> arguments{s.x[0], s.x[1]};
+                return zones->call(function, arguments) & 0xffffffffULL;
+            }
+        return std::uint64_t{zones->owner(s.x[1]) == s.x[0] ? 1U : 0U};
+    });
+    // Purgeable memory is never purged here: making it nonpurgeable reports the contents kept (0).
+    install("_malloc_make_purgeable", [](auto&, auto&) { return std::uint64_t{0}; });
+    install("_malloc_make_nonpurgeable", [](auto&, auto&) { return std::uint64_t{0}; });
+    // Nano allocation (libmalloc's small-block zone) is not in use.
+    install("_malloc_engaged_nano", [](auto&, auto&) { return std::uint64_t{0}; });
+    // void malloc_printf(const char* format, ...): "<program>(<pid>) malloc: <message>" on standard error.
+    install("_malloc_printf", [process, guest_call, report](auto& s, auto& m) {
+        const auto cell = process->allocate_guest(8);
+        const auto length = static_cast<std::int32_t>(guest_call("_vasprintf", {cell, s.x[0], s.sp}));
+        const auto text = m.read64(cell);
+        process->release_guest(cell);
+        if (length < 0 || !text) return std::uint64_t{0};
+        const auto bytes = m.read_string(text, 1, static_cast<std::size_t>(length) + 1);
+        static_cast<void>(guest_call("_free", {text}));
+        std::string program = "malloc";
+        if (const auto name = guest_call("_getprogname", {})) { const auto value = m.read_string(name, 1, 1024); program.assign(value.begin(), value.end()); }
+        report(program + "(" + std::to_string(guest_call("_getpid", {})) + ") malloc: " + std::string(bytes.begin(), bytes.end()));
+        return std::uint64_t{0};
+    });
+    // void malloc_zone_print_ptr_info(void* ptr): the zone that owns ptr and the block's size.
+    install("_malloc_zone_print_ptr_info", [zones, report](auto& s, auto&) {
+        std::uint64_t size = 0;
+        const auto zone = zones->owner(s.x[0], &size);
+        std::ostringstream line;
+        line << "ptr 0x" << std::hex << s.x[0];
+        if (zone) line << " in zone 0x" << zone << std::dec << ", size " << size << "\n";
+        else line << " is not in any zone\n";
+        report(line.str());
         return std::uint64_t{0};
     });
     // struct mstats {bytes_total, chunks_used, bytes_used, chunks_free, bytes_free}, returned in memory (x8).

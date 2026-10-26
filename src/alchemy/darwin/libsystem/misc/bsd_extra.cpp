@@ -21,7 +21,8 @@
 //   <stdlib.h>    psort, psort_r, psort_b (the qsort forms), sranddev, devname_r, getbsize,
 //                 rpmatch; arc4random_stir and arc4random_addrandom do nothing (arc4random
 //                 reads the host's random source on every call, there is no pool to stir)
-//   <stdio.h>     tempnam (over access and mktemp)
+//   <stdio.h>     tempnam (over access and mktemp), fgetwln (over fgetln)
+//   <unistd.h>    getwd; mkfifoat, mknodat, mkpathat_np (relative to a directory descriptor)
 //   <time.h>      timeoff, strptime_l (the "C" locale); ualarm is an explicit stop, as alarm
 //                 (no asynchronous SIGALRM)
 //   <unistd.h>    getpass; <readpassphrase.h> readpassphrase (echo off on a terminal)
@@ -313,6 +314,86 @@ void install_libsystem_bsd_extra(Provider& p) {
             throw Errno{error ? error : eexist};
         }
         return result;
+    }, 0);
+
+    // char* getwd(char* buf): getcwd into buf (MAXPATHLEN, 1024); on failure the error text is there.
+    p.libsystem("_getwd", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (p.call(libsystem_library, "_getcwd", {s.x[0], 1024})) return s.x[0];
+        const auto error = p.guest_errno();
+        const auto text = bounded_string(m, p.call(libsystem_library, "_strerror", {error}), 1023);
+        put_string(m, s.x[0], text);
+        p.process().set_errno(error);
+        return 0;
+    }, 0);
+    // The *at forms that take a directory descriptor: the path joined to the directory's own
+    // (fcntl F_GETPATH) unless it is absolute or the descriptor is AT_FDCWD (-2).
+    const auto at_path = [p](GuestMemory& m, std::uint64_t descriptor, std::uint64_t path) -> std::uint64_t {
+        const auto text = bounded_string(m, path, 1024);
+        if (static_cast<std::int32_t>(descriptor) == -2 || (!text.empty() && text[0] == '/')) return 0;
+        const auto directory = p.malloc(1024);
+        CallRegs registers;
+        registers.x[0] = descriptor & 0xffffffffULL;
+        registers.x[1] = 50;   // F_GETPATH
+        registers.push_variadic(directory);
+        if (static_cast<std::int32_t>(p.call_regs(libsystem_library, "_fcntl", registers)) < 0) {
+            const auto error = p.guest_errno();
+            static_cast<void>(p.call(libsystem_library, "_free", {directory}));
+            throw Errno{error ? error : ebadf};
+        }
+        auto joined = bounded_string(m, directory, 1024);
+        static_cast<void>(p.call(libsystem_library, "_free", {directory}));
+        if (joined.empty() || joined.back() != '/') joined += '/';
+        joined += text;
+        const auto result = p.malloc(joined.size() + 1);
+        put_string(m, result, joined);
+        return result;   // the caller frees it
+    };
+    // int mkfifoat(int fd, const char* path, mode_t) / mknodat(int fd, const char* path, mode_t, dev_t) /
+    // int mkpathat_np(int fd, const char* path, mode_t): mkfifo, mknod and mkpath_np relative to fd.
+    for (const auto& [name, target] : std::array<std::pair<const char*, const char*>, 3>{{
+             {"_mkfifoat", "_mkfifo"}, {"_mknodat", "_mknod"}, {"_mkpathat_np", "_mkpath_np"}}}) {
+        const std::string function = target;
+        const bool status = function == "_mkpath_np";   // mkpath_np returns an error number
+        p.libsystem(name, [p, at_path, function, status](CpuState& s, GuestMemory& m) -> std::uint64_t {
+            std::uint64_t joined = 0;
+            try { joined = at_path(m, s.x[0], s.x[1]); }
+            catch (const Errno& error) { if (status) return error.value; throw; }
+            const auto result = p.call(libsystem_library, function, {joined ? joined : s.x[1], s.x[2], s.x[3]});
+            const auto error = p.guest_errno();
+            if (joined) static_cast<void>(p.call(libsystem_library, "_free", {joined}));
+            if (!status && static_cast<std::int32_t>(result) != 0) throw Errno{error};
+            return result & 0xffffffffULL;
+        });
+    }
+    // wchar_t* fgetwln(FILE*, size_t* len): fgetln's line widened (C locale), in a per-stream
+    // buffer valid until the next call on that stream; not terminated.
+    struct WideLines { std::mutex mutex; std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> buffers; };
+    auto wide_lines = std::make_shared<WideLines>();
+    p.libsystem("_fgetwln", [p, wide_lines](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto length_cell = p.malloc(8);
+        const auto line = p.call(libsystem_library, "_fgetln", {s.x[0], length_cell});
+        const auto length = m.read64(length_cell);
+        static_cast<void>(p.call(libsystem_library, "_free", {length_cell}));
+        if (!line) return 0;
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
+        if (length) m.read_bytes(line, bytes);
+        std::uint64_t buffer;
+        {
+            std::lock_guard lock(wide_lines->mutex);
+            auto& entry = wide_lines->buffers[s.x[0]];
+            if (entry.second < length) {
+                const auto grown = p.call(libsystem_library, "_realloc", {entry.first, std::max<std::uint64_t>(length, 64) * 4});
+                if (!grown) throw Errno{enomem};
+                entry = {grown, std::max<std::uint64_t>(length, 64)};
+            }
+            buffer = entry.first;
+        }
+        for (std::size_t index = 0; index < bytes.size(); ++index) {
+            if (bytes[index] > 127) throw Errno{92};   // EILSEQ: the C locale is ASCII
+            m.write32(buffer + index * 4, bytes[index]);
+        }
+        if (s.x[1]) m.write64(s.x[1], length);
+        return buffer;
     }, 0);
 
     // ---- <time.h> ----

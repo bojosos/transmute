@@ -2096,6 +2096,16 @@ void Dispatch::install_groups_and_sources() {
     install("_dispatch_source_get_data", [](auto& self, auto& s, auto&) {
         const auto value = self.source(s.x[0]); std::lock_guard lock(self.metadata); return value->data;
     });
+    // size_t dispatch_source_get_extended_data(source, dispatch_source_extended_data_t, size_t):
+    // {data, status} (status is 0: no source type here reports one), up to size bytes.
+    install("_dispatch_source_get_extended_data", [](auto& self, auto& s, auto& m) {
+        std::uint64_t data;
+        { const auto value = self.source(s.x[0]); std::lock_guard lock(self.metadata); data = value->data; }
+        const auto size = std::min<std::uint64_t>(s.x[2], 16);
+        const std::array<std::uint64_t, 2> fields{data, 0};
+        for (std::uint64_t at = 0; at < size; ++at) m.write8(s.x[1] + at, static_cast<std::uint8_t>(fields[at / 8] >> (8 * (at % 8))));
+        return size;
+    });
     install("_dispatch_source_get_handle", [](auto& self, auto& s, auto&) { return self.source(s.x[0])->handle; });
     install("_dispatch_source_get_mask", [](auto& self, auto& s, auto&) { return self.source(s.x[0])->mask; });
     install("_dispatch_source_merge_data", [](auto& self, auto& s, auto&) { self.merge(s.x[0], s.x[1]); return std::uint64_t{0}; });

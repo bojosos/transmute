@@ -91,7 +91,11 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   pthread_is_threaded_np, the `__stpcpy_chk` family, fmtcheck and the out-of-line ctype helpers)
   and `net/netdb_extra.cpp` (gethostbyname2 and getipnodeby* over getaddrinfo, herror,
   inet_net_ntop, the /etc/hosts, services, protocols, networks and ethers databases read from
-  the guest file system). random's initstate/setstate keep one generator per state array
+  the guest file system, the RFC 3542 inet6_opt_*/inet6_rth_* helpers). Also getwd, fgetwln,
+  mkfifoat/mknodat/mkpathat_np (relative to a directory descriptor), telldir/seekdir (core), and
+  the malloc zone diagnostics (malloc_zone_check/print/log/claimed_address, discharge checking,
+  malloc_printf; `malloc/malloc_zones.cpp`: a guest zone answers through its introspection
+  table, the system zone is consistent by construction). random's initstate/setstate keep one generator per state array
   (`misc/libsystem_runtime.cpp`, with the compiler-rt 128-bit, overflow, half-precision and
   complex builtins); Blocks introspection is `misc/libsystem_extra.cpp`'s. sigsuspend, sigpause
   and pause (`process/process_model.cpp`) wait until a handler has run for a signal raised in

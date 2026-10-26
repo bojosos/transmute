@@ -615,6 +615,75 @@ void test_memory_streams(Fixture& f) {
     f.sys("_unsetenv", {f.text("TMPDIR")});
 }
 
+// B10c: malloc zone diagnostics, telldir/seekdir, getwd, the *at forms, RFC 3542 extension headers.
+void test_bsd_more(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto zone = f.sys("_malloc_default_zone");
+    const auto block = f.sys("_malloc", {32});
+    require(f.sys("_malloc_zone_check", {zone}) == 1 && f.sys("_malloc_zone_check", {0}) == 1, "malloc_zone_check");
+    require(f.sys("_malloc_zone_claimed_address", {zone, block}) == 1 && f.sys("_malloc_zone_claimed_address", {zone, 0x1000}) == 0,
+            "malloc_zone_claimed_address");
+    require(f.sys("_malloc_make_nonpurgeable", {block}) == 0 && f.sys("_malloc_engaged_nano") == 0, "purgeable and nano");
+    f.sys("_free", {block});
+    // telldir/seekdir over a directory of three files.
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy-bsd-more";
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    std::filesystem::create_directories(directory);
+    for (const auto* name : {"a", "b", "c"}) std::ofstream(directory / name) << name;
+    const auto guest_directory = alchemy::guest_path_string(directory);
+    const auto handle = f.sys("_opendir", {f.text(guest_directory)});
+    require(handle != 0, "opendir");
+    const auto entry_name = [&f](Address entry) { return f.read(entry + 21); };   // struct dirent: d_name at 21
+    std::vector<std::string> names;
+    Address position = 0;
+    for (Address entry; (entry = f.sys("_readdir", {handle}));) {
+        names.push_back(entry_name(entry));
+        if (names.size() == 1) position = f.sys("_telldir", {handle});
+    }
+    f.sys("_seekdir", {handle, position});
+    const auto again = f.sys("_readdir", {handle});
+    require(names.size() >= 2 && again && entry_name(again) == names[1], "seekdir back to telldir's position");
+    f.sys("_closedir", {handle});
+    // getwd; mkpathat_np and mkfifoat relative to AT_FDCWD.
+    const auto cwd = f.process.allocate_guest(1024);
+    const auto expected = f.process.allocate_guest(1024);
+    require(f.sys("_getcwd", {expected, 1024}) == expected && f.sys("_getwd", {cwd}) == cwd && f.read(cwd) == f.read(expected), "getwd is getcwd");
+    const auto deep = guest_directory + "/x/y";
+    require(f.sys("_mkpathat_np", {static_cast<Address>(-2), f.text(deep), 0755}) == 0 &&
+            std::filesystem::is_directory(directory / "x" / "y"), "mkpathat_np");
+    require(f.sys("_mkfifoat", {static_cast<Address>(-2), f.text(guest_directory + "/fifo"), 0644}) == static_cast<Address>(-1) &&
+            errno_value() == 78, "mkfifoat is ENOSYS, as mkfifo");
+    std::filesystem::remove_all(directory, ignored);
+    // RFC 3542 destination options.
+    const auto buffer = f.process.allocate_guest(16), data = f.process.allocate_guest(8), type = f.process.allocate_guest(4),
+               length = f.process.allocate_guest(4), value = f.process.allocate_guest(4);
+    f.engine.fill_bytes(buffer, 0xee, 16);
+    f.engine.write32(value, 0x11223344);
+    require(f.sys("_inet6_opt_init", {buffer, 16}) == 2 && f.byte(buffer + 1) == 1, "inet6_opt_init");
+    require(f.sys("_inet6_opt_append", {buffer, 16, 2, 0xc2, 4, 4, data}) == 8 && f.engine.read64(data) == buffer + 4, "inet6_opt_append aligns the data");
+    require(f.sys("_inet6_opt_set_val", {f.engine.read64(data), 0, value, 4}) == 4, "inet6_opt_set_val");
+    require(f.sys("_inet6_opt_append", {buffer, 16, 8, 0x05, 1, 1, data}) == 11, "a second option");
+    require(f.sys("_inet6_opt_finish", {buffer, 16, 11}) == 16 && f.byte(buffer + 11) == 1 && f.byte(buffer + 12) == 3, "PadN to 16");
+    require(f.sys("_inet6_opt_next", {buffer, 16, 0, type, length, data}) == 8 && f.byte(type) == 0xc2 && f.engine.read32(length) == 4 &&
+            f.engine.read32(f.engine.read64(data)) == 0x11223344, "inet6_opt_next");
+    require(f.sys("_inet6_opt_next", {buffer, 16, 8, type, length, data}) == 11 && f.byte(type) == 0x05, "the second option");
+    require(f.sys("_inet6_opt_next", {buffer, 16, 11, type, length, data}) == 0xffffffffULL, "padding is skipped to the end");
+    require(f.sys("_inet6_opt_find", {buffer, 16, 0, 0x05, length, data}) == 11, "inet6_opt_find");
+    // Type 0 routing header with two addresses.
+    const auto routing = f.process.allocate_guest(40), reversed = f.process.allocate_guest(40), address = f.process.allocate_guest(16);
+    require(f.sys("_inet6_rth_space", {0, 2}) == 40 && f.sys("_inet6_rth_init", {routing, 40, 0, 2}) == routing, "inet6_rth_init");
+    for (std::uint8_t index = 1; index <= 2; ++index) {
+        f.engine.fill_bytes(address, index, 16);
+        require(f.sys("_inet6_rth_add", {routing, address}) == 0, "inet6_rth_add");
+    }
+    require(f.sys("_inet6_rth_add", {routing, address}) == 0xffffffffULL && f.sys("_inet6_rth_segments", {routing}) == 2 &&
+            f.sys("_inet6_rth_getaddr", {routing, 1}) == routing + 24, "a full routing header");
+    require(f.sys("_inet6_rth_reverse", {routing, reversed}) == 0 && f.byte(reversed + 8) == 2 && f.byte(reversed + 24) == 1 &&
+            f.byte(reversed + 3) == 2, "inet6_rth_reverse");
+    require(f.sys("_inet6_option_space", {4}) == 20, "inet6_option_space");
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -982,6 +1051,7 @@ int main() {
         stage("bsd extra"); test_bsd_extra(f);
         stage("netdb extra"); test_netdb_extra(f);
         stage("memory streams"); test_memory_streams(f);
+        stage("bsd more"); test_bsd_more(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

@@ -185,6 +185,11 @@ void test_signal_sources(Fixture& f) {
     f.libsystem("_raise", {usr1});
     f.libsystem("_raise", {usr1});
     eventually([] { return data == 2; }, "two deliveries reach the source");
+    const auto extended = f.process.allocate_guest(32);
+    f.process.calling_engine().fill_bytes(extended, 0xff, 32);
+    require(f.libsystem("_dispatch_source_get_extended_data", {source, extended, 32}) == 16 &&
+            f.process.calling_engine().read64(extended + 8) == 0 && f.process.calling_engine().read64(extended + 16) == ~0ULL,
+            "dispatch_source_get_extended_data: {data, status}, 16 bytes");
     f.libsystem("_dispatch_source_cancel", {source});
     f.libsystem("_dispatch_release", {source});
     f.libsystem("_dispatch_release", {queue});

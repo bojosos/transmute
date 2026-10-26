@@ -566,6 +566,9 @@ void DarwinServices::Impl::install_all() {
     }, 0);
     context.install_export(std::string(system_library), "_readdir$INODE64", *context.resolve(system_library, "_readdir"));
     install("_closedir", [this](auto& s, auto&) { std::uint64_t buffer; std::optional<int> descriptor; { std::lock_guard lock(mutex); const auto found = directories.find(s.x[0]); if (found == directories.end()) throw ServiceError{ebadf}; buffer = found->second.buffer; descriptor = found->second.descriptor; directories.erase(found); } if (descriptor) static_cast<void>(close(*descriptor)); context.release_guest(buffer); context.release_guest(s.x[0]); return std::uint64_t{0}; });
+    // long telldir(DIR*) / void seekdir(DIR*, long): the position among the directory's entries.
+    install("_telldir", [this](auto& s, auto&) { std::lock_guard lock(mutex); const auto found = directories.find(s.x[0]); if (found == directories.end()) throw ServiceError{ebadf}; return static_cast<std::uint64_t>(found->second.at); });
+    install("_seekdir", [this](auto& s, auto&) { std::lock_guard lock(mutex); const auto found = directories.find(s.x[0]); if (found == directories.end()) throw ServiceError{ebadf}; found->second.at = static_cast<std::size_t>(std::min<std::uint64_t>(s.x[1], found->second.entries.size())); return std::uint64_t{0}; });
     install("_rewinddir", [this](auto& s, auto&) { std::lock_guard lock(mutex); const auto found = directories.find(s.x[0]); if (found == directories.end()) throw ServiceError{ebadf}; found->second.at = 0; return std::uint64_t{0}; });
     // clock_gettime and clock_gettime_nsec_np: install_darwin_support (misc/support.cpp).
     install("_gettimeofday", [this](auto& s, auto& m) {
