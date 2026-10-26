@@ -1,6 +1,9 @@
 #include "alchemy/darwin/runloop/runloop_internal.hpp"
+#include "alchemy/gui/fill_provider.hpp"
 
+#include <array>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 
 // CFRunLoop C API: run loops, observers and version-0 sources (owner: A2).
@@ -385,6 +388,24 @@ void Provider::install_cf() {
         }
         static_cast<void>(objc.send_super(state.x[0], source_class, objc.selector("dealloc")));
     }, false, "v@:");
+}
+
+void Provider::install_type_ids() {
+    // CF type IDs for the run-loop types, from the provider-wide numbering (gui::fill::TypeId).
+    const std::array<std::pair<std::uint64_t, fill::TypeId>, 4> types{{
+        {cf_run_loop_class, fill::TypeId::run_loop}, {source_class, fill::TypeId::run_loop_source},
+        {observer_class, fill::TypeId::run_loop_observer}, {timer_class, fill::TypeId::run_loop_timer}}};
+    for (const auto& [name, id] : std::array<std::pair<const char*, fill::TypeId>, 4>{{
+             {"_CFRunLoopGetTypeID", fill::TypeId::run_loop}, {"_CFRunLoopSourceGetTypeID", fill::TypeId::run_loop_source},
+             {"_CFRunLoopObserverGetTypeID", fill::TypeId::run_loop_observer}, {"_CFRunLoopTimerGetTypeID", fill::TypeId::run_loop_timer}}})
+        static_cast<void>(process.install_function(name, [value = static_cast<std::uint64_t>(id)](transmute::CpuState& s, transmute::GuestMemory&) {
+            s.x[0] = value; }, core_foundation_library));
+    cf.extend("CFGetTypeID", "CFRunLoop types", [this, types](transmute::CpuState& s, transmute::GuestMemory&) -> std::optional<std::uint64_t> {
+        const auto view = s.x[0] ? process.objects().peek(s.x[0]) : std::nullopt;
+        if (!view) return std::nullopt;
+        for (const auto& [cls, id] : types) if (cls && view->class_address == cls) return static_cast<std::uint64_t>(id);
+        return std::nullopt;
+    });
 }
 
 } // namespace alchemy::gui::detail

@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <tuple>
 
 
 // A small read-only IOKit registry describing the host, replacing the empty
@@ -68,6 +69,8 @@ namespace {
 constexpr std::string_view iokit = "/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit";
 // <IOKit/IOKitKeys.h>, <IOKit/IOTypes.h>
 constexpr std::uint64_t kern_success = 0, kern_invalid_argument = 4;
+constexpr std::uint64_t io_return_no_device = 0xe00002c0, io_return_bad_argument = 0xe00002c2, io_return_unsupported = 0xe00002c7,
+    io_return_not_found = 0xe00002f0;
 constexpr std::uint64_t iterate_recursively = 1, iterate_parents = 2;
 constexpr std::uint32_t first_handle = 0x2c03;
 
@@ -89,6 +92,10 @@ struct Object {
     std::optional<std::size_t> entry;
     std::vector<std::size_t> items;   // iterator contents
     std::size_t position{};
+    // Iterators: the entry IOIteratorNext returned last, and the levels
+    // IORegistryIteratorEnterEntry left (their items and positions).
+    std::optional<std::size_t> current;
+    std::vector<std::pair<std::vector<std::size_t>, std::size_t>> levels;
 };
 
 class Registry {
@@ -152,8 +159,60 @@ public:
         const auto found = objects_.find(iterator);
         if (found == objects_.end() || found->second.entry) return std::nullopt;
         auto& value = found->second;
-        if (value.position >= value.items.size()) return std::nullopt;
-        return value.items[value.position++];
+        if (value.position >= value.items.size()) { value.current.reset(); return std::nullopt; }
+        value.current = value.items[value.position++];
+        return value.current;
+    }
+    // IORegistryIteratorEnterEntry: iterate the current entry's children next.
+    bool enter(std::uint32_t iterator) {
+        std::lock_guard lock(mutex_);
+        const auto found = objects_.find(iterator);
+        if (found == objects_.end() || found->second.entry || !found->second.current) return false;
+        auto& value = found->second;
+        value.levels.emplace_back(std::move(value.items), value.position);
+        value.items = entries_.at(*value.current).children;
+        value.position = 0;
+        value.current.reset();
+        return true;
+    }
+    // IORegistryIteratorExitEntry: back to the level EnterEntry left.
+    bool exit(std::uint32_t iterator) {
+        std::lock_guard lock(mutex_);
+        const auto found = objects_.find(iterator);
+        if (found == objects_.end() || found->second.entry || found->second.levels.empty()) return false;
+        auto& value = found->second;
+        std::tie(value.items, value.position) = std::move(value.levels.back());
+        value.levels.pop_back();
+        value.current.reset();
+        return true;
+    }
+    std::uint32_t references(std::uint32_t name) {
+        std::lock_guard lock(mutex_);
+        const auto found = objects_.find(name);
+        return found == objects_.end() ? 0 : found->second.references;
+    }
+    // The entry whose path below the root is `names` (an "@location" suffix is ignored).
+    std::optional<std::size_t> find_path(const std::vector<std::string>& names) const {
+        if (entries_.empty()) return std::nullopt;
+        std::size_t at = 0;
+        for (auto name : names) {
+            if (const auto location = name.find('@'); location != std::string::npos) name.resize(location);
+            const auto& children = entries_.at(at).children;
+            const auto next = std::find_if(children.begin(), children.end(), [&](std::size_t child) {
+                return entry_name(child) == name || entries_.at(child).classes.front() == name; });
+            if (next == children.end()) return std::nullopt;
+            at = *next;
+        }
+        return at;
+    }
+    // The superclass after `name` in any entry's class chain ("OSObject" above IORegistryEntry).
+    std::optional<std::string> superclass(std::string_view name) const {
+        if (name == "IORegistryEntry") return std::string("OSObject");
+        for (const auto& value : entries_) {
+            const auto found = std::find(value.classes.begin(), value.classes.end(), name);
+            if (found != value.classes.end() && found + 1 != value.classes.end()) return *(found + 1);
+        }
+        return std::nullopt;
     }
 
     void reset(std::uint32_t iterator) {
@@ -196,8 +255,12 @@ public:
     // IOServiceMatching semantics over a CFDictionary.
     std::vector<std::size_t> match(std::uint64_t dictionary) {
         std::vector<std::size_t> result;
+        for (std::size_t index = 0; index < entries_.size(); ++index) if (matches(index, dictionary)) result.push_back(index);
+        return result;
+    }
+    bool matches(std::size_t index, std::uint64_t dictionary) {
         const auto entries = cf_.dictionary_entries(dictionary);
-        for (std::size_t index = 0; index < entries_.size(); ++index) {
+        {
             bool ok = true;
             for (const auto& [key, value] : entries) {
                 const auto name = cf_.utf8(key);
@@ -216,9 +279,8 @@ public:
                 else throw std::runtime_error("Alchemy IOKit: unsupported matching key " + name);
                 if (!ok) break;
             }
-            if (ok) result.push_back(index);
+            return ok;
         }
-        return result;
     }
 
 private:
@@ -351,11 +413,24 @@ void install_iokit_registry(Provider& p, ObjcRuntime&, CoreFoundation& cf) {
         m.write32(s.x[2], registry->handle(std::nullopt, std::move(found)));
         s.x[0] = kern_success;
     });
-    // io_registry_entry_t IORegistryEntryFromPath(mach_port_t, const io_string_t path)
+    // io_registry_entry_t IORegistryEntryFromPath(mach_port_t, const io_string_t path): "IOService:/"
+    // (also "IODeviceTree:/") is the root; deeper paths name entries by their names.
     install("_IORegistryEntryFromPath", [ready](CpuState& s, GuestMemory& m) {
         const auto path = guest_string(m, s.x[1], 512);
         const auto registry = ready();
-        s.x[0] = (path == "IOService:/" || path == "IOService:" || path == "IODeviceTree:/") && registry->root() ? registry->handle(registry->root()) : 0;
+        s.x[0] = 0;
+        std::string rest;
+        if (path.starts_with("IOService:")) rest = path.substr(10);
+        else if (path == "IODeviceTree:/" || path == "IODeviceTree:") rest = "/";
+        else return;
+        std::vector<std::string> names;
+        for (std::size_t at = 0; at < rest.size();) {
+            const auto end = rest.find('/', at);
+            if (const auto part = rest.substr(at, end == std::string::npos ? std::string::npos : end - at); !part.empty()) names.push_back(part);
+            if (end == std::string::npos) break;
+            at = end + 1;
+        }
+        if (const auto found = registry->find_path(names)) s.x[0] = registry->handle(found);
     });
     install("_IOIteratorNext", [ready](CpuState& s, GuestMemory&) {
         const auto registry = ready();
@@ -456,6 +531,157 @@ void install_iokit_registry(Provider& p, ObjcRuntime&, CoreFoundation& cf) {
         const auto object = s.x[0] ? ready()->object(static_cast<std::uint32_t>(s.x[0])) : std::nullopt;
         s.x[0] = object && object->entry ? 0xe00002c7 : 0xe00002c2;
     });
+    // ---- registry traversal (the IOService plane; every entry is in it) ----
+    const auto entry_of = [ready](std::uint64_t handle) -> std::optional<std::size_t> {
+        const auto object = ready()->object(static_cast<std::uint32_t>(handle));
+        return object ? object->entry : std::nullopt;
+    };
+    const auto service_plane = [](GuestMemory& m, std::uint64_t plane) { return !plane || guest_string(m, plane, 128) == "IOService"; };
+    // io_registry_entry_t IORegistryGetRootEntry(mach_port_t)
+    install("_IORegistryGetRootEntry", [ready](CpuState& s, GuestMemory&) {
+        const auto registry = ready();
+        s.x[0] = registry->root() ? registry->handle(registry->root()) : 0;
+    });
+    // kern_return_t IORegistryEntryGet{Child,Parent}Iterator(entry, plane, io_iterator_t*)
+    for (const bool parents : {false, true})
+        install(parents ? "_IORegistryEntryGetParentIterator" : "_IORegistryEntryGetChildIterator",
+            [ready, entry_of, service_plane, parents](CpuState& s, GuestMemory& m) {
+                const auto entry = entry_of(s.x[0]);
+                if (!entry || !s.x[2] || !service_plane(m, s.x[1])) { s.x[0] = kern_invalid_argument; return; }
+                const auto registry = ready();
+                m.write32(s.x[2], registry->handle(std::nullopt, registry->walk(*entry, parents, false)));
+                s.x[0] = kern_success;
+            });
+    // kern_return_t IORegistryEntryGetChildEntry(entry, plane, io_registry_entry_t* child): the first child.
+    install("_IORegistryEntryGetChildEntry", [ready, entry_of](CpuState& s, GuestMemory& m) {
+        const auto entry = entry_of(s.x[0]);
+        if (!entry || !s.x[2]) { s.x[0] = kern_invalid_argument; return; }
+        const auto registry = ready();
+        const auto& children = registry->entry(*entry).children;
+        if (children.empty()) { m.write32(s.x[2], 0); s.x[0] = io_return_no_device; return; }
+        m.write32(s.x[2], registry->handle(children.front()));
+        s.x[0] = kern_success;
+    });
+    // kern_return_t IORegistryEntryGetPath(entry, plane, io_string_t path): "IOService:/name/name".
+    install("_IORegistryEntryGetPath", [ready, entry_of, service_plane](CpuState& s, GuestMemory& m) {
+        const auto entry = entry_of(s.x[0]);
+        if (!entry || !s.x[2] || !service_plane(m, s.x[1])) { s.x[0] = io_return_bad_argument; return; }
+        const auto registry = ready();
+        std::vector<std::string> names;
+        for (std::optional<std::size_t> at = *entry; at && registry->entry(*at).parent; at = registry->entry(*at).parent)
+            names.push_back(registry->entry_name(*at));
+        std::string path = "IOService:";
+        for (auto name = names.rbegin(); name != names.rend(); ++name) path += "/" + *name;
+        if (names.empty()) path += "/";
+        if (path.size() > 511) { s.x[0] = io_return_bad_argument; return; }
+        std::vector<std::uint8_t> bytes(path.begin(), path.end());
+        bytes.push_back(0);
+        m.write_bytes(s.x[2], bytes);
+        s.x[0] = kern_success;
+    });
+    // kern_return_t IORegistryEntryGetNameInPlane(entry, plane, io_name_t): as IORegistryEntryGetName.
+    install("_IORegistryEntryGetNameInPlane", [ready, entry_of](CpuState& s, GuestMemory& m) {
+        const auto entry = entry_of(s.x[0]);
+        if (!entry || !s.x[2]) { s.x[0] = kern_invalid_argument; return; }
+        auto name = ready()->entry_name(*entry);
+        if (name.size() > 127) name.resize(127);
+        std::vector<std::uint8_t> bytes(name.begin(), name.end());
+        bytes.push_back(0);
+        m.write_bytes(s.x[2], bytes);
+        s.x[0] = kern_success;
+    });
+    // kern_return_t IORegistryEntryGetLocationInPlane: no entry has a location (kIOReturnNotFound).
+    install("_IORegistryEntryGetLocationInPlane", [entry_of](CpuState& s, GuestMemory&) {
+        s.x[0] = entry_of(s.x[0]) ? io_return_not_found : kern_invalid_argument;
+    });
+    // boolean_t IORegistryEntryInPlane(entry, plane)
+    install("_IORegistryEntryInPlane", [entry_of](CpuState& s, GuestMemory& m) {
+        s.x[0] = entry_of(s.x[0]) && s.x[1] && guest_string(m, s.x[1], 128) == "IOService" ? 1 : 0;
+    });
+    // kern_return_t IORegistryCreateIterator(mach_port_t, plane, IOOptionBits, io_iterator_t*): the
+    // root, then (recursively) every entry; IORegistryIteratorEnterEntry/ExitEntry recurse by hand.
+    install("_IORegistryCreateIterator", [ready, service_plane](CpuState& s, GuestMemory& m) {
+        if (!s.x[3] || !service_plane(m, s.x[1])) { s.x[0] = kern_invalid_argument; return; }
+        const auto registry = ready();
+        std::vector<std::size_t> items;
+        if (const auto root = registry->root()) {
+            items.push_back(*root);
+            if (s.x[2] & iterate_recursively) for (const auto index : registry->walk(*root, false, true)) items.push_back(index);
+        }
+        m.write32(s.x[3], registry->handle(std::nullopt, std::move(items)));
+        s.x[0] = kern_success;
+    });
+    install("_IORegistryIteratorEnterEntry", [ready](CpuState& s, GuestMemory&) {
+        s.x[0] = ready()->enter(static_cast<std::uint32_t>(s.x[0])) ? kern_success : io_return_no_device;
+    });
+    install("_IORegistryIteratorExitEntry", [ready](CpuState& s, GuestMemory&) {
+        s.x[0] = ready()->exit(static_cast<std::uint32_t>(s.x[0])) ? kern_success : io_return_no_device;
+    });
+    install("_IOIteratorIsValid", [ready](CpuState& s, GuestMemory&) {
+        const auto object = ready()->object(static_cast<std::uint32_t>(s.x[0]));
+        s.x[0] = object && !object->entry ? 1 : 0;
+    });
+    // Properties are set through a service's driver, and no entry has one (kIOReturnUnsupported).
+    for (const auto* name : {"_IORegistryEntrySetCFProperty", "_IORegistryEntrySetCFProperties"})
+        install(name, [entry_of](CpuState& s, GuestMemory&) { s.x[0] = entry_of(s.x[0]) ? io_return_unsupported : kern_invalid_argument; });
+    // ---- object classes and reference counts ----
+    const auto class_name = [ready](std::uint64_t handle) -> std::optional<std::string> {
+        const auto registry = ready();
+        const auto object = registry->object(static_cast<std::uint32_t>(handle));
+        if (!object) return std::nullopt;
+        return object->entry ? registry->entry(*object->entry).classes.front() : std::string("IOIterator");
+    };
+    // kern_return_t IOObjectGetClass(object, io_name_t className)
+    install("_IOObjectGetClass", [class_name](CpuState& s, GuestMemory& m) {
+        const auto name = class_name(s.x[0]);
+        if (!name || !s.x[1]) { s.x[0] = kern_invalid_argument; return; }
+        std::vector<std::uint8_t> bytes(name->begin(), name->end());
+        bytes.push_back(0);
+        m.write_bytes(s.x[1], bytes);
+        s.x[0] = kern_success;
+    });
+    // CFStringRef IOObjectCopyClass(object) / IOObjectCopySuperclassForClass(CFStringRef)
+    install("_IOObjectCopyClass", [class_name, &cf](CpuState& s, GuestMemory&) {
+        const auto name = class_name(s.x[0]);
+        s.x[0] = name ? cf.string(*name) : 0;
+    });
+    install("_IOObjectCopySuperclassForClass", [ready, &cf](CpuState& s, GuestMemory&) {
+        const auto name = s.x[0] ? ready()->superclass(cf.utf8(s.x[0])) : std::nullopt;
+        s.x[0] = name ? cf.string(*name) : 0;
+    });
+    // uint32_t IOObjectGetRetainCount / GetUserRetainCount: the handle's references; the kernel holds one.
+    for (const auto* name : {"_IOObjectGetRetainCount", "_IOObjectGetUserRetainCount"})
+        install(name, [ready](CpuState& s, GuestMemory&) { s.x[0] = ready()->references(static_cast<std::uint32_t>(s.x[0])); });
+    install("_IOObjectGetKernelRetainCount", [ready](CpuState& s, GuestMemory&) { s.x[0] = ready()->object(static_cast<std::uint32_t>(s.x[0])) ? 1 : 0; });
+    // kern_return_t IOServiceMatchPropertyTable(service, CFDictionaryRef matching, boolean_t* matches)
+    install("_IOServiceMatchPropertyTable", [ready, entry_of](CpuState& s, GuestMemory& m) {
+        const auto entry = entry_of(s.x[0]);
+        if (!entry || !s.x[1] || !s.x[2]) { s.x[0] = kern_invalid_argument; return; }
+        m.write32(s.x[2], ready()->matches(*entry, s.x[1]) ? 1 : 0);
+        s.x[0] = kern_success;
+    });
+    // The registry never changes, so it is never busy: busy states are 0 and waits return at once.
+    install("_IOServiceGetBusyState", [entry_of](CpuState& s, GuestMemory& m) {
+        if (!entry_of(s.x[0]) || !s.x[1]) { s.x[0] = kern_invalid_argument; return; }
+        m.write32(s.x[1], 0);
+        s.x[0] = kern_success;
+    });
+    install("_IOKitGetBusyState", [](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) { s.x[0] = kern_invalid_argument; return; }
+        m.write32(s.x[1], 0);
+        s.x[0] = kern_success;
+    });
+    install("_IOServiceWaitQuiet", [entry_of](CpuState& s, GuestMemory&) { s.x[0] = entry_of(s.x[0]) ? kern_success : kern_invalid_argument; });
+    install("_IOKitWaitQuiet", [](CpuState& s, GuestMemory&) { s.x[0] = kern_success; });
+    // kern_return_t IOMainPort(mach_port_t bootstrap, mach_port_t* mainPort) (and IOMasterPort): the
+    // default main port, MACH_PORT_NULL, which every call here accepts.
+    for (const auto* name : {"_IOMainPort", "_IOMasterPort"})
+        install(name, [](CpuState& s, GuestMemory& m) {
+            if (!s.x[1]) { s.x[0] = kern_invalid_argument; return; }
+            m.write32(s.x[1], 0);
+            s.x[0] = kern_success;
+        });
+
     // Connections are never handed out, so every connect argument is invalid
     // (IOServiceClose: iokit.cpp, which also closes power root ports).
     for (const auto name : {"_IOConnectCallMethod", "_IOConnectCallStructMethod", "_IOConnectCallScalarMethod",

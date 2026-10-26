@@ -11,6 +11,7 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <optional>
 #include <mutex>
 #include <set>
 #include <string>
@@ -46,8 +47,8 @@
 //   assertions; IOPMCopyAssertionsByProcess lists this process's assertions
 //   (other processes' are not visible). IOObjectIsEqualTo compares handles.
 // - ForceFeedback: no force-feedback device exists (FFERR_NOINTERFACE).
-// - DiskArbitration: no Disk Arbitration daemon runs (sessions and disks
-//   cannot be created).
+// - DiskArbitration: the sessions, disks and requests are the DiskArbitration
+//   provider's (darwin/diskarbitration/sessions.cpp); this set adds two constants.
 namespace alchemy::gui::fill {
 namespace {
 
@@ -64,7 +65,9 @@ struct HidManager final : ObjectPayload {
     std::mutex mutex;
     Address matching{};              // retained
     std::array<std::pair<Address, Address>, 3> callbacks{};   // matching, removal, input value
-    bool open{};
+    bool open{}, cancelled{};
+    std::map<std::string, Address> properties;   // IOHIDManagerSetProperty (retained)
+    Address queue{}, cancel_handler{};            // retained queue, copied block
 };
 struct NotificationPort final : ObjectPayload {
     Address source{}, queue{};
@@ -125,7 +128,7 @@ public:
     Address manager_class{}, port_class{};
     std::mutex mutex;
     std::map<std::uint32_t, alchemy::host::system::PowerRequest> assertions;
-    struct AssertionInfo { std::string type, name; std::uint32_t level{}; };
+    struct AssertionInfo { std::string type, name; std::uint32_t level{}, references{1}; };
     std::map<std::uint32_t, AssertionInfo> assertion_info;
     std::uint32_t next_assertion{1};
     // IORegisterForSystemPower clients: notifier handle -> client.
@@ -244,19 +247,25 @@ public:
         }
     }
 
-    // An assertion of `type` (IOPMAssertionCreateWithName's types); 0 or an IOReturn (x0 image).
-    Address create_assertion(const std::string& type, std::uint32_t level, const std::string& name, Address out, GuestMemory& m) {
+    // The host request for an assertion of `type` (IOPMAssertionCreateWithName's types) at `level`;
+    // empty for a type it cannot hold. Level 0 (kIOPMAssertionLevelOff) holds nothing.
+    std::optional<alchemy::host::system::PowerRequest> power_request(const std::string& type, std::uint32_t level, const std::string& name) {
         bool display = false, system = false;
         if (type == "PreventUserIdleDisplaySleep" || type == "NoDisplaySleepAssertion") display = system = true;
         else if (type == "PreventUserIdleSystemSleep" || type == "NoIdleSleepAssertion" || type == "PreventSystemSleep") system = true;
-        else return status(io_return_unsupported);
-        // Level 0 (kIOPMAssertionLevelOff) holds nothing until it is raised.
+        else return std::nullopt;
         auto request = alchemy::host::system::PowerRequest::create(name, system && level != 0, display && level != 0);
+        if (!request) return std::nullopt;
+        return std::move(*request);
+    }
+    // An assertion of `type`; 0 or an IOReturn (x0 image).
+    Address create_assertion(const std::string& type, std::uint32_t level, const std::string& name, Address out, GuestMemory& m) {
+        auto request = power_request(type, level, name);
         if (!request) return status(io_return_unsupported);
         std::lock_guard lock(mutex);
         const auto id = next_assertion++;
         assertions[id] = std::move(*request);
-        assertion_info[id] = {type, name, level};
+        assertion_info[id] = {type, name, level, 1};
         m.write32(out, id);
         return 0;   // kIOReturnSuccess
     }
@@ -289,7 +298,13 @@ void IoKit::install_hid() {
     register_type(manager_class, TypeId::hid_manager);
     if (!has(iokit, "_IOHIDManagerCreate")) {
         static_cast<void>(objc.add_native_method(manager_class, "dealloc", [self = shared_from_this(), this](CpuState& s, GuestMemory&) {
-            if (const auto value = objc.find_host_state<HidManager>(s.x[0])) release(std::exchange(value->matching, 0));
+            if (const auto value = objc.find_host_state<HidManager>(s.x[0])) {
+                release(std::exchange(value->matching, 0));
+                for (const auto& [key, object] : value->properties) { static_cast<void>(key); release(object); }
+                value->properties.clear();
+                if (const auto queue = std::exchange(value->queue, 0)) static_cast<void>(call(libsystem, "_dispatch_release", {queue}));
+                if (const auto handler = std::exchange(value->cancel_handler, 0)) bridge->block_release(handler);
+            }
             static_cast<void>(objc.send_super(s.x[0], manager_class, objc.selector("dealloc")));
         }, false, "v@:"));
     }
@@ -351,6 +366,110 @@ void IoKit::install_hid() {
         if (s.x[4]) m.write32(s.x[4], 0);
         s.x[0] = status(s.x[0] ? io_return_unsupported : io_return_no_device);
     });
+    // TypeIDs of the HID object types (no device, element or value object can exist).
+    constant(iokit, "_IOHIDDeviceGetTypeID", static_cast<Address>(TypeId::hid_device));
+    constant(iokit, "_IOHIDElementGetTypeID", static_cast<Address>(TypeId::hid_element));
+    constant(iokit, "_IOHIDValueGetTypeID", static_cast<Address>(TypeId::hid_value));
+    // CFSetRef IOHIDManagerCopyDevices(manager): no device matches anything (NULL, as for an empty set).
+    raw(iokit, "_IOHIDManagerCopyDevices", [this](CpuState& s, GuestMemory&) { static_cast<void>(manager(s.x[0])); s.x[0] = 0; });
+    // IOHIDManagerSetDeviceMatching(manager, CFDictionaryRef matching): one dictionary, kept as the Multiple form.
+    raw(iokit, "_IOHIDManagerSetDeviceMatching", [this](CpuState& s, GuestMemory&) {
+        const auto value = manager(s.x[0]);
+        Address matching{};
+        if (s.x[1]) {
+            const auto list = cf.array(std::vector<Address>{s.x[1]});
+            matching = list;
+        }
+        Address previous{};
+        { std::lock_guard lock(value->mutex); previous = std::exchange(value->matching, matching); }
+        release(previous);
+    });
+    // Input-value matching and report callbacks: there are no values or reports to filter.
+    for (const auto* name : {"_IOHIDManagerSetInputValueMatching", "_IOHIDManagerSetInputValueMatchingMultiple",
+                             "_IOHIDManagerRegisterInputReportCallback", "_IOHIDManagerRegisterInputReportWithTimeStampCallback"})
+        raw(iokit, name, [this](CpuState& s, GuestMemory&) { static_cast<void>(manager(s.x[0])); });
+    // CFTypeRef IOHIDManagerGetProperty(manager, CFStringRef key) / Boolean IOHIDManagerSetProperty(manager, key, value)
+    raw(iokit, "_IOHIDManagerGetProperty", [this](CpuState& s, GuestMemory&) {
+        const auto value = manager(s.x[0]);
+        const auto key = s.x[1] ? cf.utf8(s.x[1]) : std::string();
+        std::lock_guard lock(value->mutex);
+        const auto found = value->properties.find(key);
+        s.x[0] = found == value->properties.end() ? 0 : found->second;
+    });
+    raw(iokit, "_IOHIDManagerSetProperty", [this](CpuState& s, GuestMemory&) {
+        const auto value = manager(s.x[0]);
+        if (!s.x[1]) { s.x[0] = 0; return; }
+        const auto key = cf.utf8(s.x[1]);
+        const auto kept = s.x[2] ? retain(s.x[2]) : 0;
+        Address previous{};
+        {
+            std::lock_guard lock(value->mutex);
+            auto& slot = value->properties[key];
+            previous = std::exchange(slot, kept);
+            if (!kept) value->properties.erase(key);
+        }
+        release(previous);
+        s.x[0] = 1;
+    });
+    // The dispatch-queue model (IOHIDManagerSetDispatchQueue, Activate, Cancel, SetCancelHandler):
+    // cancelling runs the cancel handler once on the manager's queue.
+    raw(iokit, "_IOHIDManagerSetDispatchQueue", [this](CpuState& s, GuestMemory&) {
+        const auto value = manager(s.x[0]);
+        if (s.x[1]) static_cast<void>(call(libsystem, "_dispatch_retain", {s.x[1]}));
+        Address previous{};
+        { std::lock_guard lock(value->mutex); previous = std::exchange(value->queue, s.x[1]); }
+        if (previous) static_cast<void>(call(libsystem, "_dispatch_release", {previous}));
+    });
+    raw(iokit, "_IOHIDManagerSetCancelHandler", [this](CpuState& s, GuestMemory&) {
+        const auto value = manager(s.x[0]);
+        const auto handler = s.x[1] ? bridge->block_copy(s.x[1]) : 0;
+        Address previous{};
+        { std::lock_guard lock(value->mutex); previous = std::exchange(value->cancel_handler, handler); }
+        if (previous) bridge->block_release(previous);
+    });
+    raw(iokit, "_IOHIDManagerActivate", [this](CpuState& s, GuestMemory&) {
+        const auto value = manager(s.x[0]);
+        std::lock_guard lock(value->mutex);
+        if (!value->queue) throw std::runtime_error("Alchemy: IOHIDManagerActivate before IOHIDManagerSetDispatchQueue");
+        value->open = true;
+    });
+    raw(iokit, "_IOHIDManagerCancel", [this](CpuState& s, GuestMemory&) {
+        const auto value = manager(s.x[0]);
+        Address queue{}, handler{};
+        {
+            std::lock_guard lock(value->mutex);
+            if (value->cancelled) return;
+            value->cancelled = true;
+            value->open = false;
+            queue = value->queue;
+            handler = std::exchange(value->cancel_handler, 0);
+        }
+        if (!handler) return;
+        if (!queue) { bridge->block_release(handler); return; }
+        bridge->dispatch_async(queue, [this, handler] { static_cast<void>(bridge->invoke_block(handler, {})); bridge->block_release(handler); });
+    });
+    // Devices, elements and values beyond the ones above: none can exist.
+    for (const auto* name : {"_IOHIDDeviceConformsTo", "_IOHIDDeviceSetProperty", "_IOHIDDeviceGetValue", "_IOHIDDeviceSetValue",
+                             "_IOHIDDeviceCopyValueMultiple", "_IOHIDDeviceSetValueMultiple", "_IOHIDDeviceGetValueWithCallback",
+                             "_IOHIDElementGetCookie", "_IOHIDElementGetName", "_IOHIDElementGetCollectionType", "_IOHIDElementGetChildren",
+                             "_IOHIDElementGetPhysicalMin", "_IOHIDElementGetPhysicalMax", "_IOHIDElementGetUnit", "_IOHIDElementGetUnitExponent",
+                             "_IOHIDElementGetReportCount", "_IOHIDElementIsArray", "_IOHIDElementIsRelative", "_IOHIDElementIsVirtual",
+                             "_IOHIDElementIsWrapping", "_IOHIDElementIsNonLinear", "_IOHIDElementHasPreferredState", "_IOHIDElementHasNullState",
+                             "_IOHIDElementGetProperty", "_IOHIDElementSetProperty", "_IOHIDValueGetTimeStamp", "_IOHIDValueGetScaledValue"}) {
+        const std::string what(name + 1);
+        raw(iokit, name, [what](CpuState& s, GuestMemory&) { impossible(s.x[0], what); s.x[0] = 0; });
+    }
+    for (const auto* name : {"_IOHIDDeviceRegisterInputValueCallback", "_IOHIDDeviceRegisterRemovalCallback", "_IOHIDDeviceSetInputValueMatching",
+                             "_IOHIDDeviceSetInputValueMatchingMultiple", "_IOHIDDeviceSetDispatchQueue", "_IOHIDDeviceActivate", "_IOHIDDeviceCancel",
+                             "_IOHIDDeviceSetCancelHandler"}) {
+        const std::string what(name + 1);
+        raw(iokit, name, [what](CpuState& s, GuestMemory&) { impossible(s.x[0], what); });
+    }
+    // IOHIDValueCreateWithIntegerValue / WithBytes(allocator, element, timeStamp, ...): values belong to elements.
+    for (const auto* name : {"_IOHIDValueCreateWithIntegerValue", "_IOHIDValueCreateWithBytes", "_IOHIDValueCreateWithBytesNoCopy"}) {
+        const std::string what(name + 1);
+        raw(iokit, name, [what](CpuState& s, GuestMemory&) { impossible(s.x[1], what); s.x[0] = 0; });
+    }
 }
 
 void IoKit::install_notifications() {
@@ -550,6 +669,10 @@ void IoKit::install_power() {
             std::lock_guard lock(mutex);
             const auto found = assertions.find(static_cast<std::uint32_t>(s.x[0]));
             if (found == assertions.end()) { s.x[0] = status(io_return_bad_argument); return; }
+            if (const auto info = assertion_info.find(found->first); info != assertion_info.end() && --info->second.references > 0) {
+                s.x[0] = io_return_success;   // IOPMAssertionRetain's references remain
+                return;
+            }
             request = std::move(found->second);
             assertions.erase(found);
             assertion_info.erase(static_cast<std::uint32_t>(s.x[0]));
@@ -660,6 +783,118 @@ void IoKit::install_power() {
         }
         s.x[0] = source;
     });
+    // IOReturn IOPMAssertionCreateWithProperties(CFDictionaryRef, IOPMAssertionID *): AssertType,
+    // AssertLevel (default on) and AssertName; a timeout fails explicitly, as for the Description form.
+    raw(iokit, "_IOPMAssertionCreateWithProperties", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[0] || !s.x[1]) { s.x[0] = status(io_return_bad_argument); return; }
+        const auto field = [&](const char* key) {
+            const auto name = cf.string(key);
+            const auto found = bridge->lookup(s.x[0], name);
+            release(name);
+            return found;
+        };
+        const auto type = field("AssertType");
+        if (!type) { s.x[0] = status(io_return_bad_argument); return; }
+        if (const auto timeout = field("TimeoutSeconds"); timeout && bridge->real(timeout).value_or(0) > 0)
+            throw std::runtime_error("unsupported: IOPMAssertionCreateWithProperties with a timeout");
+        const auto level = field("AssertLevel");
+        const auto name = field("AssertName");
+        s.x[0] = create_assertion(cf.utf8(type), level ? static_cast<std::uint32_t>(bridge->integer(level).value_or(255)) : 255,
+                                  name ? cf.utf8(name) : std::string("Alchemy"), s.x[1], m);
+    });
+    // IOReturn IOPMAssertionRetain / IOPMAssertionRelease (above): a count per assertion.
+    raw(iokit, "_IOPMAssertionRetain", [this](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(mutex);
+        const auto found = assertion_info.find(static_cast<std::uint32_t>(s.x[0]));
+        if (found == assertion_info.end()) { s.x[0] = status(io_return_bad_argument); return; }
+        ++found->second.references;
+        s.x[0] = io_return_success;
+    });
+    // IOReturn IOPMAssertionSetProperty(id, CFStringRef key, CFTypeRef value): AssertLevel takes or
+    // drops the host request, AssertName renames; other keys are not supported.
+    raw(iokit, "_IOPMAssertionSetProperty", [this](CpuState& s, GuestMemory&) {
+        const auto id = static_cast<std::uint32_t>(s.x[0]);
+        if (!s.x[1] || !s.x[2]) { s.x[0] = status(io_return_bad_argument); return; }
+        const auto key = cf.utf8(s.x[1]);
+        AssertionInfo info;
+        {
+            std::lock_guard lock(mutex);
+            const auto found = assertion_info.find(id);
+            if (found == assertion_info.end()) { s.x[0] = status(io_return_bad_argument); return; }
+            info = found->second;
+        }
+        if (key == "AssertName") info.name = cf.utf8(s.x[2]);
+        else if (key == "AssertLevel") info.level = static_cast<std::uint32_t>(bridge->integer(s.x[2]).value_or(0));
+        else { s.x[0] = status(io_return_unsupported); return; }
+        auto request = power_request(info.type, info.level, info.name);
+        if (!request) { s.x[0] = status(io_return_unsupported); return; }
+        alchemy::host::system::PowerRequest previous;
+        {
+            std::lock_guard lock(mutex);
+            if (!assertion_info.contains(id)) { s.x[0] = status(io_return_bad_argument); return; }
+            previous = std::exchange(assertions[id], std::move(*request));
+            assertion_info[id] = info;
+        }
+        previous.release();
+        s.x[0] = io_return_success;
+    });
+    // CFDictionaryRef IOPMAssertionCopyProperties(id): AssertType, AssertName, AssertLevel, AssertPID.
+    raw(iokit, "_IOPMAssertionCopyProperties", [this](CpuState& s, GuestMemory&) {
+        AssertionInfo info;
+        {
+            std::lock_guard lock(mutex);
+            const auto found = assertion_info.find(static_cast<std::uint32_t>(s.x[0]));
+            if (found == assertion_info.end()) { s.x[0] = 0; return; }
+            info = found->second;
+        }
+        const std::array<std::pair<const char*, Address>, 4> fields{{
+            {"AssertType", cf.string(info.type)}, {"AssertName", cf.string(info.name)}, {"AssertLevel", cf.integer(info.level, 4)},
+            {"AssertPID", cf.integer(static_cast<std::int64_t>(call(libsystem, "_getpid", {})), 4)}}};
+        std::vector<std::pair<Address, Address>> pairs;
+        std::vector<Address> owned;
+        for (const auto& [key, value] : fields) {
+            owned.push_back(cf.string(key));
+            owned.push_back(value);
+            pairs.emplace_back(owned[owned.size() - 2], value);
+        }
+        s.x[0] = cf.dictionary(pairs);
+        for (const auto object : owned) release(object);
+    });
+    // IOReturn IOPMCopyAssertionsStatus(CFDictionaryRef *): each assertion type -> 1 when one of this
+    // process's assertions of that type is on (other processes' are not visible), else 0.
+    raw(iokit, "_IOPMCopyAssertionsStatus", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[0]) { s.x[0] = status(io_return_bad_argument); return; }
+        std::map<std::string, std::int64_t> levels{{"PreventUserIdleSystemSleep", 0}, {"PreventUserIdleDisplaySleep", 0},
+                                                   {"PreventSystemSleep", 0}, {"NoIdleSleepAssertion", 0}, {"NoDisplaySleepAssertion", 0}};
+        {
+            std::lock_guard lock(mutex);
+            for (const auto& [id, info] : assertion_info) { static_cast<void>(id); if (info.level) levels[info.type] = 1; }
+        }
+        std::vector<std::pair<Address, Address>> pairs;
+        std::vector<Address> owned;
+        for (const auto& [type, level] : levels) {
+            owned.push_back(cf.string(type));
+            owned.push_back(cf.integer(level, 4));
+            pairs.emplace_back(owned[owned.size() - 2], owned.back());
+        }
+        m.write64(s.x[0], cf.dictionary(pairs));
+        for (const auto object : owned) release(object);
+        s.x[0] = io_return_success;
+    });
+    // CFTimeInterval IOPSGetTimeRemainingEstimate(void): kIOPSTimeRemainingUnlimited (-2) on external
+    // power or without a battery, the host's estimate on battery, else kIOPSTimeRemainingUnknown (-1).
+    raw(iokit, "_IOPSGetTimeRemainingEstimate", [](CpuState& s, GuestMemory&) {
+        double remaining = -2.0;
+        if (const auto power = alchemy::host::system::power_status(); power && power->battery && !power->external_power)
+            remaining = power->seconds_to_empty ? static_cast<double>(*power->seconds_to_empty) : -1.0;
+        return_real(s, remaining);
+    });
+    // CFStringRef IOPSGetProvidingPowerSourceType(snapshot): "AC Power" or "Battery Power" (not retained).
+    raw(iokit, "_IOPSGetProvidingPowerSourceType", [this](CpuState& s, GuestMemory&) {
+        const auto power = alchemy::host::system::power_status();
+        const bool battery = power && power->battery && !power->external_power;
+        s.x[0] = cf.constant_string(battery ? "Battery Power" : "AC Power");
+    });
 }
 
 void IoKit::install_force_feedback() {
@@ -686,10 +921,6 @@ void IoKit::install_disk_arbitration() {
         const auto array = cf.array(std::vector<Address>{cf.constant_string("DAVolumePath")});
         if (const auto record = process.objects().find(array)) record->immortal = true;
         value(disk_arbitration, "_kDADiskDescriptionWatchVolumePath", array);
-    }
-    for (const auto* name : {"_DADiskEject", "_DADiskUnmount"}) {
-        const std::string what(name + 1);
-        raw(disk_arbitration, name, [what](CpuState& s, GuestMemory&) { impossible(s.x[0], what); });
     }
 }
 

@@ -20,6 +20,8 @@ void Provider::install_service_management() {
     // no job is loaded (an empty array). Boolean SMLoginItemSetEnabled(id,
     // enabled): login items cannot be registered (false).
     raw(service_management, "_SMCopyAllJobDictionaries", [this](CpuState& s, GuestMemory&) { s.x[0] = cf.array({}); });
+    // CFDictionaryRef SMJobCopyDictionary(CFStringRef domain, CFStringRef label): no job is loaded (NULL).
+    raw(service_management, "_SMJobCopyDictionary", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     constant(service_management, "_SMLoginItemSetEnabled", 0);
 
     // SMAppService: the main app, login items (by bundle identifier), and launch agents and

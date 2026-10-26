@@ -216,6 +216,8 @@ struct Provider : std::enable_shared_from_this<Provider> {
 
     void install_cf();
     void install_foundation();
+    // CFRunLoopGetTypeID and the source/observer/timer forms, and CFGetTypeID of their objects (cf_runloop.cpp).
+    void install_type_ids();
 };
 
 // Guest double arguments and results (d registers).

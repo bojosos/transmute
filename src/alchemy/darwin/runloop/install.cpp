@@ -42,6 +42,7 @@ void install_runloop(InstallContext& context) {
     }
     provider->install_cf();
     provider->install_foundation();
+    provider->install_type_ids();
     context.process.set_main_thread_waker(provider->main->waker());
     std::lock_guard lock(detail::installed_mutex);
     detail::installed = std::move(provider);

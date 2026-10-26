@@ -8,8 +8,8 @@
 //   completion kit:gui::completion_kit::install_disk_arbitration (sessions.cpp)
 //   values kit:    values::Provider::install_disk_claims (claims.cpp, called by
 //                  darwin/coreservices/services.cpp in place)
-//   fill::install_devices (darwin/iokit/): the description keys, and "no
-//                  daemon" for the calls sessions.cpp does not provide
+//   fill::install_devices (darwin/iokit/): kDADiskDescriptionMatchVolumeMountable
+//                  and kDADiskDescriptionWatchVolumePath
 namespace alchemy::diskarbitration {
 
 // The identity (install.cpp).

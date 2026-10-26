@@ -4,6 +4,7 @@
 // power requests; power sources reflect the host; Bluetooth, controllers,
 // Wi-Fi, location and LocalAuthentication report "none"/"unsupported".
 #include "alchemy/gui/tests/fill_fixture.hpp"
+#include "alchemy/engine_adapter.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -153,6 +154,173 @@ void other_devices(Fixture& f) {
     require(static_cast<std::int64_t>(f.call(cf, "_CFErrorGetCode", {f.engine.read64(error)})) == -6, "LAErrorBiometryNotAvailable");
 }
 
+
+// A call from a host callback on a guest worker thread, through that thread's engine.
+Address here(Fixture& f, std::string_view library, std::string_view name, std::initializer_list<Address> arguments) {
+    return alchemy::EngineAdapter(f.process.calling_engine()).call(f.symbol(library, name), std::span(arguments.begin(), arguments.size()));
+}
+template <class Done> void wait_until(Done done, std::string_view what) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!done()) {
+        require(std::chrono::steady_clock::now() < until, what);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+// The registry's traversal API over the static tree.
+void registry_walk(Fixture& f) {
+    const auto root = static_cast<std::uint32_t>(f.call(iokit, "_IORegistryGetRootEntry", {0}));
+    require(root != 0, "IORegistryGetRootEntry");
+    const auto name = f.block(512);
+    require(f.status(iokit, "_IOObjectGetClass", {root, name}) == 0 && f.read_text(name) == "IOPlatformExpertDevice", "IOObjectGetClass");
+    require(f.cf.utf8(f.call(iokit, "_IOObjectCopySuperclassForClass", {f.cf.string("IOPlatformExpertDevice")})) == "IOService", "superclass");
+    require(f.status(iokit, "_IORegistryEntryGetPath", {root, f.text("IOService"), name}) == 0 && f.read_text(name) == "IOService:/", "root path");
+    // A child's path names it, and the path finds it again.
+    const auto child = f.block(4);
+    require(f.status(iokit, "_IORegistryEntryGetChildEntry", {root, f.text("IOService"), child}) == 0, "IORegistryEntryGetChildEntry");
+    const auto first = f.engine.read32(child);
+    require(f.status(iokit, "_IORegistryEntryGetPath", {first, f.text("IOService"), name}) == 0, "child path");
+    const auto path = f.read_text(name);
+    require(path.starts_with("IOService:/") && path.size() > 11, "child path text");
+    const auto again = static_cast<std::uint32_t>(f.call(iokit, "_IORegistryEntryFromPath", {0, f.text(path)}));
+    require(again != 0 && f.call(iokit, "_IOObjectIsEqualTo", {again, first}) == 0, "a path finds its entry (a new handle)");
+    const auto id_a = f.block(8), id_b = f.block(8);
+    require(f.status(iokit, "_IORegistryEntryGetRegistryEntryID", {again, id_a}) == 0 && f.status(iokit, "_IORegistryEntryGetRegistryEntryID", {first, id_b}) == 0 &&
+            f.engine.read64(id_a) == f.engine.read64(id_b), "the same entry");
+    // Child and parent iterators.
+    const auto iterator = f.block(4);
+    require(f.status(iokit, "_IORegistryEntryGetChildIterator", {root, f.text("IOService"), iterator}) == 0 &&
+            f.call(iokit, "_IOIteratorIsValid", {f.engine.read32(iterator)}) == 1, "child iterator");
+    std::size_t children = 0;
+    for (Address entry; (entry = f.call(iokit, "_IOIteratorNext", {f.engine.read32(iterator)})) != 0; ++children)
+        static_cast<void>(f.call(iokit, "_IOObjectRelease", {entry}));
+    require(children >= 1, "the root has children");
+    require(f.status(iokit, "_IORegistryEntryGetParentIterator", {first, f.text("IOService"), iterator}) == 0, "parent iterator");
+    const auto parent = static_cast<std::uint32_t>(f.call(iokit, "_IOIteratorNext", {f.engine.read32(iterator)}));
+    require(f.status(iokit, "_IOObjectGetClass", {parent, name}) == 0 && f.read_text(name) == "IOPlatformExpertDevice", "the parent is the root");
+    // IORegistryCreateIterator: the root, then EnterEntry walks its children, ExitEntry returns.
+    require(f.status(iokit, "_IORegistryCreateIterator", {0, f.text("IOService"), 0, iterator}) == 0, "IORegistryCreateIterator");
+    const auto walker = f.engine.read32(iterator);
+    require(f.call(iokit, "_IOIteratorNext", {walker}) != 0 && f.call(iokit, "_IOIteratorNext", {walker}) == 0, "only the root at the top level");
+    require(f.status(iokit, "_IORegistryIteratorEnterEntry", {walker}) == static_cast<std::int32_t>(0xe00002c0U), "nothing current to enter");
+    static_cast<void>(f.call(iokit, "_IOIteratorReset", {walker}));
+    static_cast<void>(f.call(iokit, "_IOIteratorNext", {walker}));
+    require(f.status(iokit, "_IORegistryIteratorEnterEntry", {walker}) == 0, "enter the root");
+    std::size_t entered = 0;
+    while (f.call(iokit, "_IOIteratorNext", {walker}) != 0) ++entered;
+    require(entered == children && f.status(iokit, "_IORegistryIteratorExitEntry", {walker}) == 0 &&
+            f.status(iokit, "_IORegistryIteratorExitEntry", {walker}) == static_cast<std::int32_t>(0xe00002c0U), "enter/exit");
+    // Matching one entry, busy state, the main port, setting properties.
+    const auto matches = f.block(4);
+    require(f.status(iokit, "_IOServiceMatchPropertyTable", {root, f.call(iokit, "_IOServiceMatching", {f.text("IOService")}), matches}) == 0 &&
+            f.engine.read32(matches) == 1, "IOServiceMatchPropertyTable");
+    const auto busy = f.block(4, 0xff);
+    require(f.status(iokit, "_IOServiceGetBusyState", {root, busy}) == 0 && f.engine.read32(busy) == 0 && f.status(iokit, "_IOKitWaitQuiet", {0, 0}) == 0, "never busy");
+    const auto port = f.block(4, 0xff);
+    require(f.status(iokit, "_IOMainPort", {0, port}) == 0 && f.engine.read32(port) == 0, "IOMainPort is MACH_PORT_NULL");
+    require(f.status(iokit, "_IORegistryEntrySetCFProperty", {root, f.cf.string("x"), f.cf.string("y")}) == static_cast<std::int32_t>(0xe00002c7U),
+            "properties cannot be set");
+    require(f.call(iokit, "_IOObjectGetRetainCount", {root}) == 1 && f.status(iokit, "_IOObjectRetain", {root}) == 0 &&
+            f.call(iokit, "_IOObjectGetRetainCount", {root}) == 2, "retain counts");
+}
+
+// HID managers beyond matching: properties, no devices, the dispatch-queue model.
+void hid_manager(Fixture& f) {
+    const auto manager = f.call(iokit, "_IOHIDManagerCreate", {0, 0});
+    require(f.call(iokit, "_IOHIDManagerCopyDevices", {manager}) == 0, "no devices");
+    static_cast<void>(f.call(iokit, "_IOHIDManagerSetDeviceMatching", {manager, f.cf.dictionary(std::vector<std::pair<Address, Address>>{})}));
+    const auto key = f.cf.string("AlchemyKey"), value = f.cf.string("v");
+    require(f.call(iokit, "_IOHIDManagerSetProperty", {manager, key, value}) == 1 && f.call(iokit, "_IOHIDManagerGetProperty", {manager, key}) == value,
+            "manager properties");
+    require(f.call(iokit, "_IOHIDDeviceGetTypeID") != f.call(iokit, "_IOHIDManagerGetTypeID"), "distinct HID type IDs");
+    static std::atomic<int> cancelled{};
+    const auto handler = f.process.install_function("__devices_test_hid_cancel", [](transmute::CpuState& s, transmute::GuestMemory&) { ++cancelled; s.x[0] = 0; },
+                                                    "devices.test");
+    const auto block = f.block(32);
+    f.engine.write64(block, f.symbol(sys_lib, "__NSConcreteGlobalBlock"));
+    f.engine.write32(block + 8, 1U << 28);
+    f.engine.write64(block + 16, handler);
+    const auto descriptor = f.block(16);
+    f.engine.write64(descriptor + 8, 32);
+    f.engine.write64(block + 24, descriptor);
+    const auto queue = f.call(sys_lib, "_dispatch_queue_create", {f.text("alchemy.test.hid"), 0});
+    static_cast<void>(f.call(iokit, "_IOHIDManagerSetDispatchQueue", {manager, queue}));
+    static_cast<void>(f.call(iokit, "_IOHIDManagerSetCancelHandler", {manager, block}));
+    static_cast<void>(f.call(iokit, "_IOHIDManagerActivate", {manager}));
+    static_cast<void>(f.call(iokit, "_IOHIDManagerCancel", {manager}));
+    wait_until([] { return cancelled.load() == 1; }, "the cancel handler runs on the manager's queue");
+    bool refused = false;
+    try { static_cast<void>(f.call(iokit, "_IOHIDElementGetCookie", {0x1234})); } catch (const std::exception&) { refused = true; }
+    require(refused, "HID elements cannot exist");
+}
+
+// Assertions from a properties dictionary, their properties, status and counts.
+void power_properties(Fixture& f) {
+    const std::vector<std::pair<Address, Address>> fields{{f.cf.string("AssertType"), f.cf.string("PreventUserIdleSystemSleep")},
+                                                          {f.cf.string("AssertName"), f.cf.string("alchemy properties")}};
+    const auto properties = f.cf.dictionary(fields);
+    const auto assertion = f.block(4);
+    require(f.status(iokit, "_IOPMAssertionCreateWithProperties", {properties, assertion}) == 0, "IOPMAssertionCreateWithProperties");
+    const auto id = f.engine.read32(assertion);
+    const auto copied = f.call(iokit, "_IOPMAssertionCopyProperties", {id});
+    require(f.cf.utf8(f.cf.dictionary_value(copied, f.cf.string("AssertName"))) == "alchemy properties", "IOPMAssertionCopyProperties");
+    const auto status_out = f.block(8);
+    require(f.status(iokit, "_IOPMCopyAssertionsStatus", {status_out}) == 0, "IOPMCopyAssertionsStatus");
+    const auto level = f.cf.dictionary_value(f.engine.read64(status_out), f.cf.string("PreventUserIdleSystemSleep"));
+    require(level && f.cf.equal(level, f.cf.integer(1)), "the type is held");
+    require(f.status(iokit, "_IOPMAssertionSetProperty", {id, f.cf.string("AssertLevel"), f.cf.integer(0)}) == 0, "level off");
+    require(f.status(iokit, "_IOPMCopyAssertionsStatus", {status_out}) == 0 &&
+            f.cf.equal(f.cf.dictionary_value(f.engine.read64(status_out), f.cf.string("PreventUserIdleSystemSleep")), f.cf.integer(0)), "no longer held");
+    require(f.status(iokit, "_IOPMAssertionRetain", {id}) == 0 && f.status(iokit, "_IOPMAssertionRelease", {id}) == 0 &&
+            f.call(iokit, "_IOPMAssertionCopyProperties", {id}) != 0, "a retained assertion survives one release");
+    require(f.status(iokit, "_IOPMAssertionRelease", {id}) == 0 && f.call(iokit, "_IOPMAssertionCopyProperties", {id}) == 0, "the last release ends it");
+    const auto type = f.cf.utf8(f.call(iokit, "_IOPSGetProvidingPowerSourceType", {0}));
+    require(type == "AC Power" || type == "Battery Power", "IOPSGetProvidingPowerSourceType");
+}
+
+// Disk Arbitration: scheduled sessions announce the volumes, then idle; requests are answered.
+std::atomic<int> appeared{}, idled{};
+std::atomic<std::uint32_t> unmount_status{};
+void disk_arbitration(Fixture& f) {
+    const auto on_appeared = f.process.install_function("__devices_test_da_appeared", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        if (s.x[0]) ++appeared;
+        s.x[0] = 0;
+    }, "devices.test");
+    const auto on_idle = f.process.install_function("__devices_test_da_idle", [](transmute::CpuState& s, transmute::GuestMemory&) { ++idled; s.x[0] = 0; },
+                                                    "devices.test");
+    static Fixture* fixture = &f;
+    const auto on_unmount = f.process.install_function("__devices_test_da_unmount", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        unmount_status = static_cast<std::uint32_t>(here(*fixture, da, "_DADissenterGetStatus", {s.x[1]}));
+        s.x[0] = 0;
+    }, "devices.test");
+    const auto session = f.call(da, "_DASessionCreate", {0});
+    require(f.call(cf, "_CFGetTypeID", {session}) == f.call(da, "_DASessionGetTypeID"), "CFGetTypeID of a session");
+    static_cast<void>(f.call(da, "_DARegisterDiskAppearedCallback", {session, f.engine.read64(f.symbol(da, "_kDADiskDescriptionMatchVolumeMountable")),
+                                                                     on_appeared, 0}));
+    static_cast<void>(f.call(da, "_DARegisterIdleCallback", {session, on_idle, 0}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    require(appeared == 0 && idled == 0, "nothing before the session is scheduled");
+    const auto queue = f.call(sys_lib, "_dispatch_queue_create", {f.text("alchemy.test.da"), 0});
+    static_cast<void>(f.call(da, "_DASessionSetDispatchQueue", {session, queue}));
+    wait_until([] { return idled.load() == 1; }, "the session idles after announcing the volumes");
+    require(appeared >= 1, "the root volume appears");
+    // A volume path gives its volume's disk (without an Alchemy root, "/" names the host drive's
+    // /Volumes/<letter>); disk1s1 is always the root volume.
+    const auto volume = f.call(da, "_DADiskCreateFromVolumePath", {0, session, f.cf.file_url("/", true)});
+    require(volume != 0 && f.read_text(f.call(da, "_DADiskGetBSDName", {volume})).starts_with("disk1s"), "a disk for a volume path");
+    const auto disk = f.call(da, "_DADiskCreateFromBSDName", {0, session, f.text("disk1s1")});
+    require(disk != 0, "disk1s1");
+    const auto description = f.call(da, "_DADiskCopyDescription", {disk});
+    require(f.cf.url_path(f.cf.dictionary_value(description, f.cf.string("DAVolumePath"))) == f.cf.url_path(f.cf.file_url("/", true)) &&
+            f.cf.utf8(f.cf.dictionary_value(description, f.cf.string("DAVolumeName"))) == "Macintosh HD", "disk1s1 is the root volume");
+    require(f.call(cf, "_CFGetTypeID", {disk}) == f.call(da, "_DADiskGetTypeID"), "CFGetTypeID of a disk");
+    require(f.status(da, "_DADiskSetOptions", {disk, 1, 1}) == 0 && f.call(da, "_DADiskGetOptions", {disk}) == 1, "disk options");
+    static_cast<void>(f.call(da, "_DADiskUnmount", {disk, 0, on_unmount, 0}));
+    wait_until([] { return unmount_status.load() != 0; }, "the unmount callback");
+    require(unmount_status == 0xf8da0008, "kDAReturnNotPermitted");
+    require(f.call(da, "_DADiskCreateFromIOMedia", {0, session, 0}) == 0, "no IOKit media");
+}
+
 } // namespace
 
 // IORegisterForSystemPower: real ports, host suspend/resume broadcasts
@@ -196,5 +364,7 @@ void system_power(Fixture& f) {
 }
 
 int main() {
-    return run("devices", {{"imports", imports}, {"hid", hid}, {"notifications", notifications}, {"power", power}, {"system power", system_power}, {"other devices", other_devices}});
+    return run("devices", {{"imports", imports}, {"hid", hid}, {"notifications", notifications}, {"power", power}, {"system power", system_power}, {"other devices", other_devices},
+                           {"registry walk", registry_walk}, {"hid manager", hid_manager}, {"power properties", power_properties},
+                           {"disk arbitration", disk_arbitration}});
 }

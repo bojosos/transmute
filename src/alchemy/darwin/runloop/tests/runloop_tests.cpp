@@ -436,6 +436,8 @@ void test_foundation_and_cf(Fixture& f) {
     require(current && current == f.send(run_loop_class, "mainRunLoop"), "currentRunLoop on the main thread");
     const auto cf_main = f.core("_CFRunLoopGetMain");
     require(cf_main == f.send(current, "getCFRunLoop") && cf_main == f.core("_CFRunLoopGetCurrent"), "CFRunLoop identity");
+    require(f.core("_CFGetTypeID", {cf_main}) == f.core("_CFRunLoopGetTypeID") && f.core("_CFRunLoopGetTypeID") != f.core("_CFRunLoopTimerGetTypeID") &&
+            f.core("_CFRunLoopSourceGetTypeID") != f.core("_CFRunLoopObserverGetTypeID"), "CFRunLoop type IDs");
     const auto default_mode = f.mode("kCFRunLoopDefaultMode"), common = f.mode("kCFRunLoopCommonModes");
     require(f.cf.utf8(default_mode) == "kCFRunLoopDefaultMode", "default mode constant");
     // NSEventTrackingRunLoopMode / NSModalPanelRunLoopMode are AppKit's
