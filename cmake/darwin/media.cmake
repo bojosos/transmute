@@ -7,6 +7,9 @@
 list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/install.cpp
     src/alchemy/darwin/media/coremedia.cpp
+    src/alchemy/darwin/media/core_video.cpp
+    src/alchemy/darwin/media/pixel_transfer.cpp
+    src/alchemy/darwin/media/pixel_convert.cpp
     src/alchemy/darwin/media/video.cpp
     src/alchemy/darwin/media/audio.cpp
     src/alchemy/darwin/media/misc.cpp
@@ -22,7 +25,16 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/coremidi.cpp
     src/alchemy/darwin/media/hal_core.cpp
     src/alchemy/darwin/media/hal_host.cpp
+    src/alchemy/darwin/media/hal_io.cpp
     src/alchemy/darwin/media/hal.cpp
+    src/alchemy/darwin/media/resampler.cpp
+    src/alchemy/darwin/media/audio_units.cpp
+    src/alchemy/darwin/media/audio_converter.cpp
+    src/alchemy/darwin/media/audio_queue.cpp
+    src/alchemy/darwin/media/audio_format.cpp
+    src/alchemy/darwin/media/avaudio_buffers.cpp
+    src/alchemy/darwin/media/avaudio_player.cpp
+    src/alchemy/darwin/media/avaudio_engine.cpp
     src/alchemy/darwin/media/music_core.cpp
     src/alchemy/darwin/media/music.cpp
     src/alchemy/darwin/media/audio_file_core.cpp
@@ -53,3 +65,12 @@ alchemy_gui_register_tests(alchemy_gui_media_tests)
 target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/media/pixel_buffers.cpp
     src/alchemy/darwin/media/audio_components.cpp)
+# CoreVideo pixel buffers are core_video.cpp's in alchemy-fx: pixel_buffers.cpp
+# (none can be created) is alchemy.exe's only, pixel_buffers_fx.cpp its twin.
+list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES src/alchemy/darwin/media/pixel_buffers.cpp)
+list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/media/pixel_buffers_fx.cpp)
+# AudioComponent and the AudioUnit calls are audio_units.cpp's in alchemy-fx:
+# audio_components.cpp (no component) is alchemy.exe's only, and
+# audio_components_fx.cpp its empty twin.
+list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES src/alchemy/darwin/media/audio_components.cpp)
+list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/media/audio_components_fx.cpp)

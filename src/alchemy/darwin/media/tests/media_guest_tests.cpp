@@ -11,10 +11,13 @@
 #include "alchemy/path.hpp"
 #include "alchemy/darwin/security/bridge.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <thread>
 #include <map>
 #include <mutex>
@@ -30,12 +33,56 @@ constexpr std::string_view cm = FRAMEWORK("CoreMedia"), cv = FRAMEWORK("CoreVide
 
 namespace midi = alchemy::gui::completion_kit::media::midi;
 
+// The output stream of the fake device: the test plays it by calling FakeStream::play.
+struct FakeStream final : alchemy::gui::completion_kit::media::hal::OutputStream {
+    explicit FakeStream(alchemy::gui::completion_kit::media::hal::Render render) : render(std::move(render)) {}
+    ~FakeStream() override {
+        std::lock_guard lock(mutex());
+        if (current() == this) current() = nullptr;
+    }
+    bool start() override { running = true; return true; }
+    void stop() override { running = false; }
+    alchemy::gui::completion_kit::media::hal::Render render;
+    std::atomic<bool> running{};
+    static std::mutex& mutex() { static std::mutex value; return value; }
+    static FakeStream*& current() { static FakeStream* value{}; return value; }
+    // Takes `frames` stereo frames from the device, once the device is running.
+    static std::vector<float> play(std::uint32_t frames) {
+        std::lock_guard lock(mutex());
+        std::vector<float> out(static_cast<std::size_t>(frames) * 2);
+        if (current() && current()->running) current()->render(out.data(), frames, 0);
+        return out;
+    }
+    // Takes `frames` once the device's I/O thread has had time to render ahead (play itself is
+    // instant: back to back, it would drain the FIFO faster than the I/O thread fills it).
+    static std::vector<float> play_paced(std::uint32_t frames) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        return play(frames);
+    }
+    // Plays until a frame is not silent (or 3 s pass); returns that buffer.
+    static std::vector<float> play_until_sound(std::uint32_t frames) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        for (;;) {
+            auto out = play(frames);
+            if (std::any_of(out.begin(), out.end(), [](float v) { return v != 0; }) || std::chrono::steady_clock::now() > deadline) return out;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+};
+
 struct FakeHal final : alchemy::gui::completion_kit::media::hal::Backend {
     alchemy::gui::completion_kit::media::hal::Snapshot snapshot() override {
         alchemy::gui::completion_kit::media::hal::Snapshot result;
         result.devices.push_back({"{render}", "Line Out", "", false, 2, 48000, 3, 2});
         result.default_output = "{render}";
         return result;
+    }
+    std::unique_ptr<alchemy::gui::completion_kit::media::hal::OutputStream> open_output(
+        const alchemy::gui::completion_kit::media::hal::Device&, alchemy::gui::completion_kit::media::hal::Render render) override {
+        auto stream = std::make_unique<FakeStream>(std::move(render));
+        std::lock_guard lock(FakeStream::mutex());
+        FakeStream::current() = stream.get();
+        return stream;
     }
 };
 
@@ -141,11 +188,118 @@ void core_video(Fixture& f) {
     require(f.call(cv, "_CVBufferRetain", {0}) == 0, "retain NULL");
     const auto out = f.block(8);
     require(f.status(cv, "_CVMetalTextureCacheCreate", {0, 0, 0, 0, out}) == -6661, "texture cache needs a device");
+    // A 32BGRA buffer in malloc'd memory: CF type, geometry, attachments.
+    require(f.status(cv, "_CVPixelBufferCreate", {0, 30, 20, 0x42475241, 0, out}) == 0, "CVPixelBufferCreate");
+    const auto bgra = f.engine.read64(out);
+    const auto cf_library = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+    require(f.call(cf_library, "_CFGetTypeID", {bgra}) == f.call(cv, "_CVPixelBufferGetTypeID"), "a CVPixelBuffer CF type");
+    require(f.call(cv, "_CVPixelBufferGetWidth", {bgra}) == 30 && f.call(cv, "_CVPixelBufferGetHeight", {bgra}) == 20 &&
+            f.call(cv, "_CVPixelBufferGetBytesPerRow", {bgra}) % 64 == 0 && f.call(cv, "_CVPixelBufferGetBytesPerRow", {bgra}) >= 120 &&
+            f.call(cv, "_CVPixelBufferGetBaseAddress", {bgra}) != 0 && f.call(cv, "_CVPixelBufferIsPlanar", {bgra}) == 0, "geometry");
+    require(f.status(cv, "_CVPixelBufferLockBaseAddress", {bgra, 0}) == 0 && f.status(cv, "_CVPixelBufferUnlockBaseAddress", {bgra, 0}) == 0, "lock");
+    const auto attachment_key = f.cf.string("CVImageBufferYCbCrMatrix"), attachment_value = f.cf.string("ITU_R_709_2");
+    f.call(cv, "_CVBufferSetAttachment", {bgra, attachment_key, attachment_value, 1});
+    const auto mode = f.block(4);
+    require(f.call(cv, "_CVBufferGetAttachment", {bgra, f.cf.string("CVImageBufferYCbCrMatrix"), mode}) == attachment_value && f.engine.read32(mode) == 1,
+            "attachment");
+    // A planar 420v buffer backed by an IOSurface.
+    const auto iosurface_key = f.cf.string("IOSurfaceProperties"), empty = f.cf.dictionary({});
+    const std::array<std::pair<Address, Address>, 1> surface_attributes{{{iosurface_key, empty}}};
+    require(f.status(cv, "_CVPixelBufferCreate", {0, 64, 48, 0x34323076, f.cf.dictionary(surface_attributes), out}) == 0, "420v");
+    const auto nv12 = f.engine.read64(out);
+    require(f.call(cv, "_CVPixelBufferGetIOSurface", {nv12}) != 0 && f.call(cv, "_CVPixelBufferGetPlaneCount", {nv12}) == 2 &&
+            f.call(cv, "_CVPixelBufferGetWidthOfPlane", {nv12, 1}) == 32 && f.call(cv, "_CVPixelBufferGetHeightOfPlane", {nv12, 1}) == 24 &&
+            f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {nv12, 1}) > f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {nv12, 0}),
+            "420v planes on an IOSurface");
+    f.call(cv, "_CVBufferPropagateAttachments", {bgra, nv12});
+    require(f.call(cv, "_CVBufferGetAttachment", {nv12, attachment_key, 0}) == attachment_value, "propagated attachment");
+    // Wrapped bytes: the release callback runs when the buffer goes.
+    static bool released = false;
+    const auto callback = f.process.install_function("_alchemy_test_pixels_released", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        released = s.x[0] == 0x99;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto pixels = f.block(16 * 16 * 4);
     alchemy::CallRegs bytes{};
-    bytes.x[1] = 16; bytes.x[2] = 16; bytes.x[3] = 0x42475241;
+    bytes.x[1] = 16; bytes.x[2] = 16; bytes.x[3] = 0x42475241; bytes.x[4] = pixels; bytes.x[5] = 64; bytes.x[6] = callback; bytes.x[7] = 0x99;
     bytes.push_stack(Address{0});
     bytes.push_stack(out);
-    require(static_cast<std::int32_t>(f.regs(cv, "_CVPixelBufferCreateWithBytes", bytes).x0) == -6663 && f.engine.read64(out) == 0, "no pixel buffers");
+    require(static_cast<std::int32_t>(f.regs(cv, "_CVPixelBufferCreateWithBytes", bytes).x0) == 0 &&
+            f.call(cv, "_CVPixelBufferGetBaseAddress", {f.engine.read64(out)}) == pixels, "wrapped bytes");
+    f.call(cv, "_CVPixelBufferRelease", {f.engine.read64(out)});
+    require(released, "the release callback ran");
+    require(f.status(cv, "_CVPixelBufferCreate", {0, 16, 16, 0x12345678, 0, out}) == -6680, "unknown pixel format");
+    // A pool: buffers of its attributes, with an allocation threshold.
+    const std::array<std::pair<Address, Address>, 3> pool_buffers{{
+        {f.cf.string("Width"), f.cf.integer(8)}, {f.cf.string("Height"), f.cf.integer(8)}, {f.cf.string("PixelFormatType"), f.cf.integer(0x42475241)}}};
+    require(f.status(cv, "_CVPixelBufferPoolCreate", {0, 0, f.cf.dictionary(pool_buffers), out}) == 0, "CVPixelBufferPoolCreate");
+    const auto pool = f.engine.read64(out);
+    const std::array<std::pair<Address, Address>, 1> aux_entries{{{f.cf.string("AllocationThreshold"), f.cf.integer(1)}}};
+    const auto aux = f.cf.dictionary(aux_entries);
+    require(f.status(cv, "_CVPixelBufferPoolCreatePixelBufferWithAuxAttributes", {0, pool, aux, out}) == 0 &&
+            f.call(cv, "_CVPixelBufferGetWidth", {f.engine.read64(out)}) == 8, "a pool buffer");
+    const auto first = f.engine.read64(out);
+    require(f.status(cv, "_CVPixelBufferPoolCreatePixelBufferWithAuxAttributes", {0, pool, aux, out}) == -6689, "allocation threshold");
+    f.call(cv, "_CVPixelBufferRelease", {first});
+    require(f.status(cv, "_CVPixelBufferPoolCreatePixelBufferWithAuxAttributes", {0, pool, aux, out}) == 0, "below the threshold again");
+    // VTPixelTransferSession: an orange 32BGRA buffer through 420v and back at half size.
+    const auto rows = f.call(cv, "_CVPixelBufferGetBytesPerRow", {bgra}), base = f.call(cv, "_CVPixelBufferGetBaseAddress", {bgra});
+    for (Address y = 0; y < 20; ++y)
+        for (Address x = 0; x < 30; ++x) f.engine.write32(base + y * rows + x * 4, 0xFF0080FF);   // bytes FF 80 00 FF: B G R A
+    const auto session_out = f.block(8);
+    require(f.status(vt, "_VTPixelTransferSessionCreate", {0, session_out}) == 0, "VTPixelTransferSessionCreate");
+    const auto session = f.engine.read64(session_out);
+    require(f.status(cv, "_CVPixelBufferCreate", {0, 30, 20, 0x34323076, 0, out}) == 0, "a 420v destination");
+    const auto yuv = f.engine.read64(out);
+    require(f.status(vt, "_VTPixelTransferSessionTransferImage", {session, bgra, yuv}) == 0, "BGRA to 420v");
+    require(f.status(cv, "_CVPixelBufferCreate", {0, 15, 10, 0x42475241, 0, out}) == 0, "a small BGRA destination");
+    const auto small = f.engine.read64(out);
+    require(f.status(vt, "_VTPixelTransferSessionTransferImage", {session, yuv, small}) == 0, "420v to BGRA, scaled");
+    const auto pixel = f.engine.read32(f.call(cv, "_CVPixelBufferGetBaseAddress", {small}) + f.call(cv, "_CVPixelBufferGetBytesPerRow", {small}) * 5 + 4 * 7);
+    const auto near = [](std::uint32_t value, int want) { return std::abs(static_cast<int>(value & 0xFF) - want) <= 3; };
+    require(near(pixel, 0xFF) && near(pixel >> 8, 0x80) && near(pixel >> 16, 0x00) && (pixel >> 24) == 0xFF,
+            "the color survives a Y'CbCr round trip: " + std::to_string(pixel));
+    require(f.status(vt, "_VTPixelTransferSessionTransferImage", {session, bgra, 0}) == -12902, "no destination");
+    // An image buffer as a format description and a sample buffer.
+    const auto description_out = f.block(8);
+    require(f.status(cm, "_CMVideoFormatDescriptionCreateForImageBuffer", {0, small, description_out}) == 0, "format description for an image buffer");
+    const auto description = f.engine.read64(description_out);
+    require(f.call(cm, "_CMVideoFormatDescriptionGetDimensions", {description}) == (15ULL | (10ULL << 32)) &&
+            f.call(cm, "_CMFormatDescriptionGetMediaSubType", {description}) == 0x42475241, "its size and pixel format");
+    const auto timing = f.block(72);
+    const auto sample_out = f.block(8);
+    require(f.status(cm, "_CMSampleBufferCreateForImageBuffer", {0, small, 1, 0, 0, description, timing, sample_out}) == 0 &&
+            f.call(cm, "_CMSampleBufferGetImageBuffer", {f.engine.read64(sample_out)}) == small, "a sample buffer over the image buffer");
+    // HEVC: a 1920x1088 SPS with a 4-line bottom conformance window is 1920x1080.
+    std::vector<std::uint8_t> sps{0x42, 0x01, 0x01, 0x01, 0x60, 0x01, 0x02, 0x03, 0x90, 0x01, 0x02, 0x03, 0x04, 0x05, 0x5d};
+    {
+        std::vector<bool> bits;
+        const auto ue = [&](std::uint32_t value) {
+            const auto code = value + 1;
+            int length = 0;
+            while ((code >> length) > 1) ++length;
+            for (int i = 0; i < length; ++i) bits.push_back(false);
+            for (int i = length; i >= 0; --i) bits.push_back(((code >> i) & 1) != 0);
+        };
+        ue(0); ue(1); ue(1920); ue(1088);
+        bits.push_back(true);   // conformance_window_flag
+        ue(0); ue(0); ue(0); ue(4);   // conf_win offsets in chroma units: 4 x 2 lines
+        bits.push_back(true);   // stop bit
+        while (bits.size() % 8) bits.push_back(false);
+        for (std::size_t i = 0; i < bits.size(); i += 8) {
+            std::uint8_t byte = 0;
+            for (std::size_t j = 0; j < 8; ++j) byte = static_cast<std::uint8_t>((byte << 1) | (bits[i + j] ? 1 : 0));
+            sps.push_back(byte);
+        }
+    }
+    const auto sps_bytes = f.block(sps.size()), sets = f.block(8), sizes = f.block(8);
+    f.engine.write_bytes(sps_bytes, sps);
+    f.engine.write64(sets, sps_bytes);
+    f.engine.write64(sizes, sps.size());
+    require(f.status(cm, "_CMVideoFormatDescriptionCreateFromHEVCParameterSets", {0, 1, sets, sizes, 4, 0, description_out}) == 0 &&
+            f.call(cm, "_CMVideoFormatDescriptionGetDimensions", {f.engine.read64(description_out)}) == (1920ULL | (1080ULL << 32)), "HEVC SPS size");
+    const auto count = f.block(8), header = f.block(4);
+    require(f.status(cm, "_CMVideoFormatDescriptionGetHEVCParameterSetAtIndex", {f.engine.read64(description_out), 0, 0, 0, count, header}) == 0 &&
+            f.engine.read64(count) == 1 && f.engine.read32(header) == 4, "HEVC parameter set count");
     require(static_cast<std::int32_t>(f.call(vt, "_VTDecompressionSessionDecodeFrameWithOutputHandler", {0, 0, 0, 0, 0})) == -12902, "no session");
     require(f.string_constant(av, "_AVMetadataCommonKeyTitle") == "title" && f.string_constant(av, "_AVSampleRateKey") == "AVSampleRateKey", "AV keys");
 }
@@ -323,10 +477,29 @@ void core_audio(Fixture& f) {
     set(hal::four("nsrt"), hal::scope_global);
     f.engine.write32(size, 4);
     require(f.status(ca, "_AudioObjectGetPropertyData", {device, address, 0, 0, size, data}) == hal::error::bad_size, "short scalar");
+    // An IOProc (a host function standing in for guest code) writes 0.25 into every sample of
+    // its output buffer; the device plays it.
+    const auto io_proc = f.process.install_function("_alchemy_test_io_proc", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto list = s.x[4];
+        const std::uint64_t buffer = m.read64(list + 16), bytes = m.read32(list + 12);
+        for (std::uint32_t i = 0; i < bytes / 4; ++i) m.write32(buffer + 4ULL * i, std::bit_cast<std::uint32_t>(0.25f));
+        require(m.read32(s.x[5] + 56) == 7 && s.x[6] == 0x77, "IOProc time stamp flags and client data");
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
     const auto proc_out = f.block(8);
-    require(f.status(ca, "_AudioDeviceCreateIOProcID", {device, 0x1000, 0, proc_out}) == hal::error::unsupported, "no device I/O");
-    require(f.status(ca, "_AudioDeviceCreateIOProcID", {77, 0x1000, 0, proc_out}) == hal::error::bad_device, "not a device");
+    require(f.status(ca, "_AudioDeviceCreateIOProcID", {77, io_proc, 0, proc_out}) == hal::error::bad_device, "not a device");
     require(f.status(ca, "_AudioDeviceGetCurrentTime", {device, data}) == hal::error::not_running, "not running");
+    require(f.status(ca, "_AudioDeviceCreateIOProcID", {device, io_proc, 0x77, proc_out}) == 0 && f.engine.read64(proc_out) != 0, "IOProc created");
+    const auto proc_id = f.engine.read64(proc_out);
+    require(f.status(ca, "_AudioDeviceStart", {device, proc_id}) == 0, "AudioDeviceStart");
+    const auto played = FakeStream::play_until_sound(256);
+    require(played[0] == 0.25f && played[1] == 0.25f, "the IOProc's samples play");
+    require(f.status(ca, "_AudioDeviceGetCurrentTime", {device, data}) == 0 && std::bit_cast<double>(f.engine.read64(data)) >= 256 &&
+            f.engine.read32(data + 56) == 7, "current time while running");
+    require(f.status(ca, "_AudioDeviceStop", {device, proc_id}) == 0, "AudioDeviceStop");
+    require(f.status(ca, "_AudioDeviceGetCurrentTime", {device, data}) == hal::error::not_running, "stopped");
+    require(f.status(ca, "_AudioDeviceDestroyIOProcID", {device, proc_id}) == 0, "IOProc destroyed");
+    require(f.status(ca, "_AudioDeviceDestroyIOProcID", {device, proc_id}) == hal::error::illegal_operation, "destroyed twice");
     set(hal::four("dOut"), hal::scope_global);
     require(f.status(ca, "_AudioObjectAddPropertyListener", {1, address, 0x1000, 0}) == 0, "listener");
     require(f.call(ca, "_AudioConvertHostTimeToNanos", {12345}) == 12345, "host time is nanoseconds");
@@ -337,6 +510,394 @@ std::vector<std::uint8_t> fixture_bytes(const char* name) {
     std::ifstream in(path, std::ios::binary);
     require(in.good(), "fixture missing: " + path.string());
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// The default output unit: a mono 16-bit 24 kHz client, resampled and copied to both channels
+// of the 48 kHz device.
+void output_units(Fixture& f) {
+    const auto description = f.block(20), component_out = f.block(8), unit_out = f.block(8), size = f.block(4), value = f.block(64);
+    f.engine.write32(description, 0x61756F75);        // 'auou'
+    f.engine.write32(description + 4, 0x64656620);    // 'def '
+    const auto component = f.call(au, "_AudioComponentFindNext", {0, description});
+    require(component != 0 && f.call(au, "_AudioComponentFindNext", {component, description}) == 0, "one default output component");
+    f.engine.write32(description + 4, 0);
+    require(f.call(au, "_AudioComponentCount", {description}) == 3, "three output units");
+    require(f.status(au, "_AudioComponentCopyName", {component, component_out}) == 0 && f.cf.utf8(f.engine.read64(component_out)) == "Apple: DefaultOutputUnit",
+            "component name");
+    require(f.status(au, "_AudioComponentInstanceNew", {component, unit_out}) == 0, "AudioComponentInstanceNew");
+    const auto unit = f.engine.read64(unit_out);
+    f.engine.write32(size, 4);
+    require(f.status(au, "_AudioUnitGetProperty", {unit, 2006, 1, 1, value, size}) == 0 && f.engine.read32(value) == 0, "no input I/O");
+    require(f.status(au, "_AudioUnitSetProperty", {unit, 2003, 1, 1, value, 4}) == -10865, "the default output has no EnableIO");
+    // kAudioUnitProperty_StreamFormat, input scope: 24 kHz mono signed 16-bit packed.
+    f.engine.write64(value, std::bit_cast<std::uint64_t>(24000.0));
+    f.engine.write32(value + 8, 0x6C70636D);   // 'lpcm'
+    f.engine.write32(value + 12, 4 | 8);       // signed integer, packed
+    f.engine.write32(value + 16, 2);
+    f.engine.write32(value + 20, 1);
+    f.engine.write32(value + 24, 2);
+    f.engine.write32(value + 28, 1);
+    f.engine.write32(value + 32, 16);
+    f.engine.write32(value + 36, 0);
+    require(f.status(au, "_AudioUnitSetProperty", {unit, 8, 1, 0, value, 40}) == 0, "client stream format");
+    // The render callback writes 8192 (0.25) into every sample.
+    const auto callback = f.process.install_function("_alchemy_test_render", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const std::uint64_t frames = static_cast<std::uint32_t>(s.x[4]), list = s.x[5];
+        require(m.read32(list) == 1 && m.read32(list + 12) == frames * 2, "one 16-bit mono buffer");
+        const auto buffer = m.read64(list + 16);
+        for (std::uint32_t i = 0; i < frames; ++i) {
+            m.write8(buffer + 2ULL * i, 0x00);
+            m.write8(buffer + 2ULL * i + 1, 0x20);
+        }
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    f.engine.write64(value, callback);
+    f.engine.write64(value + 8, 0);
+    require(f.status(au, "_AudioUnitSetProperty", {unit, 23, 0, 0, value, 16}) == 0, "render callback");
+    require(f.status(au, "_AudioOutputUnitStart", {unit}) == -10867, "uninitialized");
+    require(f.status(au, "_AudioUnitInitialize", {unit}) == 0 && f.status(au, "_AudioOutputUnitStart", {unit}) == 0, "started");
+    f.engine.write32(size, 4);
+    require(f.status(au, "_AudioUnitGetProperty", {unit, 2001, 0, 0, value, size}) == 0 && f.engine.read32(value) == 1, "IsRunning");
+    // Past the resampler's onset, a constant input plays as the same constant on both channels.
+    static_cast<void>(FakeStream::play_until_sound(256));
+    std::vector<float> steady;
+    for (int i = 0; i < 8; ++i) steady = FakeStream::play_paced(256);
+    require(std::fabs(steady[200] - 0.25f) < 0.01f && std::fabs(steady[201] - 0.25f) < 0.01f, "mono 24 kHz plays on both channels at 48 kHz");
+    // kHALOutputParam_Volume halves it.
+    alchemy::CallRegs volume{};
+    volume.x[0] = unit; volume.x[1] = 14;
+    volume.set_s(0, 0.5f);
+    require(f.regs(au, "_AudioUnitSetParameter", volume).x0 == 0, "volume");
+    for (int i = 0; i < 8; ++i) steady = FakeStream::play_paced(256);
+    require(std::fabs(steady[200] - 0.125f) < 0.01f, "volume applied");
+    require(f.status(au, "_AudioOutputUnitStop", {unit}) == 0 && f.status(au, "_AudioUnitUninitialize", {unit}) == 0, "stopped");
+    require(f.status(au, "_AudioComponentInstanceDispose", {unit}) == 0, "disposed");
+    // AUHAL: enabling input makes initialization fail (no input device).
+    f.engine.write32(description + 4, 0x6168616C);   // 'ahal'
+    const auto hal_component = f.call(au, "_AudioComponentFindNext", {0, description});
+    require(hal_component != 0 && f.status(au, "_AudioComponentInstanceNew", {hal_component, unit_out}) == 0, "AUHAL");
+    const auto hal_unit = f.engine.read64(unit_out);
+    f.engine.write32(value, 1);
+    require(f.status(au, "_AudioUnitSetProperty", {hal_unit, 2003, 1, 1, value, 4}) == 0 &&
+            f.status(au, "_AudioUnitInitialize", {hal_unit}) == -10875, "no input device");
+    require(f.status(au, "_AudioUnitRender", {hal_unit, 0, 0, 1, 64, value}) == -10876, "no input to pull");
+    require(f.status(au, "_AudioComponentInstanceDispose", {hal_unit}) == 0, "AUHAL disposed");
+}
+
+// AudioConverter: 16-bit stereo 44.1 kHz to float mono 48 kHz through the input procedure.
+void audio_converter(Fixture& f) {
+    const auto asbd = [&](double rate, std::uint32_t flags, std::uint32_t bytes, std::uint32_t channels, std::uint32_t bits) {
+        const auto at = f.block(40);
+        f.engine.write64(at, std::bit_cast<std::uint64_t>(rate));
+        f.engine.write32(at + 8, 0x6C70636D);   // 'lpcm'
+        f.engine.write32(at + 12, flags);
+        f.engine.write32(at + 16, bytes * channels);
+        f.engine.write32(at + 20, 1);
+        f.engine.write32(at + 24, bytes * channels);
+        f.engine.write32(at + 28, channels);
+        f.engine.write32(at + 32, bits);
+        return at;
+    };
+    const auto in = asbd(44100, 4 | 8, 2, 2, 16), out_format = asbd(48000, 1 | 8, 4, 1, 32);
+    const auto converter_out = f.block(8);
+    require(f.status(at, "_AudioConverterNew", {in, out_format, converter_out}) == 0, "AudioConverterNew");
+    const auto converter = f.engine.read64(converter_out);
+    // The input: 4410 frames of constant 16384 (0.5) in both channels, then the end.
+    static Address source{};
+    static std::uint32_t remaining{};
+    source = f.block(4410 * 4);
+    for (std::uint32_t i = 0; i < 4410 * 2; ++i) {
+        f.memory().write8(source + 2ULL * i, 0x00);
+        f.memory().write8(source + 2ULL * i + 1, 0x40);
+    }
+    remaining = 4410;
+    const auto input = f.process.install_function("_alchemy_test_converter_input", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto wanted = m.read32(s.x[1]);
+        const auto give = std::min(wanted, remaining);
+        const auto offset = (4410 - remaining) * 4ULL;
+        m.write32(s.x[1], give);
+        m.write32(s.x[2] + 8 + 4, give * 4);
+        m.write64(s.x[2] + 8 + 8, give ? source + offset : 0);
+        remaining -= give;
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto list = f.block(24), data = f.block(4800 * 4), packets = f.block(4);
+    f.engine.write32(list, 1);
+    f.engine.write32(list + 8, 1);
+    f.engine.write32(list + 12, 4800 * 4);
+    f.engine.write64(list + 16, data);
+    f.engine.write32(packets, 4800);
+    require(f.status(at, "_AudioConverterFillComplexBuffer", {converter, input, 0, packets, list, 0}) == 0, "FillComplexBuffer");
+    const auto made = f.engine.read32(packets);
+    require(made >= 4790 && made <= 4800, "about 4800 frames out of 4410 in: " + std::to_string(made));
+    require(std::fabs(std::bit_cast<float>(f.engine.read32(data + 4 * 2400)) - 0.5f) < 0.01f, "stereo 0.5 becomes mono 0.5");
+    const auto size = f.block(4), value = f.block(40);
+    f.engine.write32(size, 40);
+    require(f.status(at, "_AudioConverterGetProperty", {converter, 0x61636F64 /* 'acod' */, size, value}) == 0 &&
+            std::bit_cast<double>(f.engine.read64(value)) == 48000.0, "current output description");
+    require(f.status(at, "_AudioConverterDispose", {converter}) == 0, "AudioConverterDispose");
+    const auto aac = asbd(44100, 0, 0, 2, 0);
+    f.engine.write32(aac + 8, 0x61616320);   // 'aac '
+    require(static_cast<std::uint32_t>(f.status(at, "_AudioConverterNew", {aac, out_format, converter_out})) == 0x666D743F, "no AAC decoder");
+    // AudioFormatGetProperty: FormatInfo completes a description; layouts count their channels.
+    const auto partial = asbd(48000, 4 | 8, 0, 2, 24);
+    f.engine.write32(partial + 16, 0);
+    f.engine.write32(partial + 24, 0);
+    f.engine.write32(size, 40);
+    require(f.status(at, "_AudioFormatGetProperty", {0x666D7469 /* 'fmti' */, 40, partial, size, value}) == 0 &&
+            f.engine.read32(value + 24) == 6 && f.engine.read32(value + 20) == 1, "FormatInfo: 24-bit stereo frames are 6 bytes");
+    const auto layout_tag = f.block(4);
+    f.engine.write32(layout_tag, (121U << 16) | 6);   // kAudioChannelLayoutTag_MPEG_5_1_A
+    f.engine.write32(size, 0);
+    require(f.status(at, "_AudioFormatGetPropertyInfo", {0x636D706C /* 'cmpl' */, 4, layout_tag, size}) == 0 && f.engine.read32(size) == 12 + 6 * 20,
+            "ChannelLayoutForTag size");
+    const auto layout = f.block(12 + 6 * 20);
+    require(f.status(at, "_AudioFormatGetProperty", {0x636D706C, 4, layout_tag, size, layout}) == 0 && f.engine.read32(layout + 8) == 6 &&
+            f.engine.read32(layout + 12 + 3 * 20) == 4, "5.1 A has the LFE fourth");
+    f.engine.write32(size, 4);
+    require(f.status(at, "_AudioFormatGetProperty", {0x6E63686D /* 'nchm' */, 12 + 6 * 20, layout, size, value}) == 0 && f.engine.read32(value) == 6,
+            "NumberOfChannelsForLayout");
+}
+
+// AudioQueue output: float stereo 48 kHz buffers play on the fake device and come back to the callback.
+void audio_queue(Fixture& f) {
+    const auto format = f.block(40);
+    f.engine.write64(format, std::bit_cast<std::uint64_t>(48000.0));
+    f.engine.write32(format + 8, 0x6C70636D);
+    f.engine.write32(format + 12, 1 | 8);
+    f.engine.write32(format + 16, 8);
+    f.engine.write32(format + 20, 1);
+    f.engine.write32(format + 24, 8);
+    f.engine.write32(format + 28, 2);
+    f.engine.write32(format + 32, 32);
+    static std::atomic<int> returned{0};
+    const auto callback = f.process.install_function("_alchemy_test_queue_callback", [](transmute::CpuState&, transmute::GuestMemory&) { ++returned; },
+                                                     "/usr/lib/alchemy_test_io.dylib");
+    const auto queue_out = f.block(8), buffer_out = f.block(8);
+    require(f.status(at, "_AudioQueueNewOutput", {format, callback, 0, 0, 0, 0, queue_out}) == 0, "AudioQueueNewOutput");
+    const auto queue = f.engine.read64(queue_out);
+    require(f.status(at, "_AudioQueueAllocateBuffer", {queue, 512 * 8, buffer_out}) == 0, "AudioQueueAllocateBuffer");
+    const auto buffer = f.engine.read64(buffer_out);
+    const auto data = f.engine.read64(buffer + 8);
+    for (std::uint32_t i = 0; i < 512 * 2; ++i) f.engine.write32(data + 4ULL * i, std::bit_cast<std::uint32_t>(0.75f));
+    f.engine.write32(buffer + 16, 512 * 8);
+    require(f.status(at, "_AudioQueueEnqueueBuffer", {queue, buffer, 0, 0}) == 0, "AudioQueueEnqueueBuffer");
+    require(f.status(at, "_AudioQueueStart", {queue, 0}) == 0, "AudioQueueStart");
+    const auto played = FakeStream::play_until_sound(256);
+    require(played[0] == 0.75f && played[1] == 0.75f, "the queued buffer plays");
+    for (int i = 0; i < 4 && returned == 0; ++i) static_cast<void>(FakeStream::play_paced(256));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (returned == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(returned == 1, "the played buffer comes back to the callback");
+    require(f.status(at, "_AudioQueueStop", {queue, 1}) == 0 && f.status(at, "_AudioQueueDispose", {queue, 1}) == 0, "stopped and disposed");
+}
+
+// OpenAL over the fake device: a constant mono buffer at the listener plays centered (equal power).
+void openal(Fixture& f) {
+    constexpr std::string_view al = "/System/Library/Frameworks/OpenAL.framework/Versions/A/OpenAL";
+    const auto device = f.call(al, "_alcOpenDevice", {0});
+    require(device != 0, "alcOpenDevice");
+    const auto context = f.call(al, "_alcCreateContext", {device, 0});
+    require(context != 0 && f.call(al, "_alcMakeContextCurrent", {context}) == 1, "a current context");
+    const auto names = f.block(8);
+    f.call(al, "_alGenBuffers", {1, names});
+    f.call(al, "_alGenSources", {1, names + 4});
+    const auto buffer = f.engine.read32(names), source = f.engine.read32(names + 4);
+    const auto data = f.block(48000 * 2);
+    for (std::uint32_t i = 0; i < 48000; ++i) {
+        f.memory().write8(data + 2ULL * i, 0x00);
+        f.memory().write8(data + 2ULL * i + 1, 0x40);   // 16384: 0.5
+    }
+    f.call(al, "_alBufferData", {buffer, 0x1101 /* AL_FORMAT_MONO16 */, data, 48000 * 2, 48000});
+    require(f.call(al, "_alGetError") == 0, "alBufferData");
+    f.call(al, "_alSourcei", {source, 0x1009 /* AL_BUFFER */, buffer});
+    f.call(al, "_alSourcei", {source, 0x1007 /* AL_LOOPING */, 1});
+    f.call(al, "_alSourcePlay", {source});
+    const auto state = f.block(4);
+    f.call(al, "_alGetSourcei", {source, 0x1010, state});
+    require(f.engine.read32(state) == 0x1012, "AL_PLAYING");
+    const auto played = FakeStream::play_until_sound(256);
+    require(std::fabs(played[100] - 0.5f * 0.70710678f) < 0.01f && std::fabs(played[101] - played[100]) < 0.001f, "centered, equal power");
+    // Moved to the right of the listener (+x): the right channel is louder.
+    alchemy::CallRegs position{};
+    position.x[0] = source; position.x[1] = 0x1004;   // AL_POSITION
+    position.set_s(0, 1.0f); position.set_s(1, 0.0f); position.set_s(2, 0.0f);
+    static_cast<void>(f.regs(al, "_alSource3f", position));
+    std::vector<float> after;
+    for (int i = 0; i < 6; ++i) after = FakeStream::play_paced(256);
+    require(after[201] > after[200] * 4, "panned right");
+    f.call(al, "_alSourceStop", {source});
+    f.call(al, "_alGetSourcei", {source, 0x1010, state});
+    require(f.engine.read32(state) == 0x1014, "AL_STOPPED");
+    f.call(al, "_alDeleteSources", {1, names + 4});
+    f.call(al, "_alDeleteBuffers", {1, names});
+    require(f.call(al, "_alGetError") == 0, "no AL error");
+    f.call(al, "_alcMakeContextCurrent", {0});
+    f.call(al, "_alcDestroyContext", {context});
+    require(f.call(al, "_alcCloseDevice", {device}) == 1, "alcCloseDevice");
+}
+
+// A 16-bit WAVE file of `frames` frames of `channels` channels, sample(frame, channel).
+template <class Sample>
+std::filesystem::path write_wave(const std::filesystem::path& path, std::uint32_t rate, std::uint16_t channels, std::uint32_t frames, Sample sample) {
+    std::vector<std::uint8_t> file;
+    const auto le = [&](std::uint32_t value, int bytes) { for (int i = 0; i < bytes; ++i) file.push_back(static_cast<std::uint8_t>(value >> (8 * i))); };
+    const auto tag = [&](const char* text) { file.insert(file.end(), text, text + 4); };
+    const std::uint32_t bytes = frames * channels * 2;
+    tag("RIFF"); le(36 + bytes, 4); tag("WAVE");
+    tag("fmt "); le(16, 4); le(1, 2); le(channels, 2); le(rate, 4); le(rate * channels * 2, 4); le(channels * 2U, 2); le(16, 2);
+    tag("data"); le(bytes, 4);
+    for (std::uint32_t i = 0; i < frames; ++i)
+        for (std::uint16_t c = 0; c < channels; ++c) le(static_cast<std::uint16_t>(sample(i, c)), 2);
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+    return path;
+}
+
+// AVFAudio: AVAudioTime, AVAudioPCMBuffer, AVAudioFile, AVAudioEngine with a player node and a
+// tap on the main mixer, and AVAudioPlayer, over the fake device.
+void avaudio(Fixture& f) {
+    const auto b = alchemy::gui::security::bridge();
+    const auto real = [](const alchemy::CallResult& r) { return r.d(0); };
+    // AVAudioTime: a sample time extrapolated from an anchor with both times.
+    alchemy::CallRegs sample_time{};
+    sample_time.x[2] = 1000;
+    sample_time.set_d(0, 48000);
+    const auto time = f.objc.send(f.cls("AVAudioTime"), f.objc.selector("timeWithSampleTime:atRate:"), sample_time).x0;
+    require(time && f.send(time, "sampleTime") == 1000 && (f.send(time, "isHostTimeValid") & 0xff) == 0, "AVAudioTime sample time");
+    alchemy::CallRegs anchor_time{};
+    anchor_time.x[2] = 1'000'000'000;
+    anchor_time.x[3] = 0;
+    anchor_time.set_d(0, 48000);
+    const auto anchor = f.objc.send(f.cls("AVAudioTime"), f.objc.selector("timeWithHostTime:sampleTime:atRate:"), anchor_time).x0;
+    const auto full = f.send(time, "extrapolateTimeFromAnchor:", {anchor});
+    require(full && f.send(full, "hostTime") == 1'000'000'000 + 1000 * 1'000'000'000ULL / 48000, "extrapolated host time");
+
+    // AVAudioPCMBuffer: deinterleaved float32 stereo at 48 kHz.
+    alchemy::CallRegs standard{};
+    standard.x[2] = 2;
+    standard.set_d(0, 48000);
+    const auto format = f.objc.send(f.send(f.cls("AVAudioFormat"), "alloc"), f.objc.selector("initStandardFormatWithSampleRate:channels:"), standard).x0;
+    require(format != 0, "a standard format");
+    const auto buffer = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {format, 4800});
+    require(buffer && f.send(buffer, "frameCapacity") == 4800 && f.send(buffer, "frameLength") == 0 && f.send(buffer, "stride") == 1, "AVAudioPCMBuffer");
+    require(f.send(buffer, "int16ChannelData") == 0, "no int16 data in a float buffer");
+    const auto channels = f.send(buffer, "floatChannelData");
+    const auto left = f.engine.read64(channels), right = f.engine.read64(channels + 8);
+    for (std::uint32_t i = 0; i < 4800; ++i) {
+        f.engine.write32(left + 4ULL * i, std::bit_cast<std::uint32_t>(0.5f));
+        f.engine.write32(right + 4ULL * i, std::bit_cast<std::uint32_t>(-0.25f));
+    }
+    f.send(buffer, "setFrameLength:", {4800});
+    const auto list = f.send(buffer, "audioBufferList");
+    require(f.engine.read32(list) == 2 && f.engine.read32(list + 12) == 4800 * 4 && f.engine.read64(list + 32) == right, "the buffer list");
+
+    // AVAudioEngine: player -> main mixer -> output, a tap on the mixer.
+    const auto engine = f.send(f.send(f.cls("AVAudioEngine"), "alloc"), "init");
+    const auto player = f.send(f.send(f.cls("AVAudioPlayerNode"), "alloc"), "init");
+    f.send(engine, "attachNode:", {player});
+    const auto mixer = f.send(engine, "mainMixerNode");
+    require(mixer && f.send(mixer, "engine") == engine, "mainMixerNode");
+    f.send(engine, "connect:to:format:", {player, mixer, format});
+    require(f.send(player, "outputFormatForBus:", {0}) == format, "the connection format");
+    const auto hardware = f.send(f.send(engine, "outputNode"), "outputFormatForBus:", {0});
+    require(real(f.objc.send(hardware, f.objc.selector("sampleRate"))) == 48000, "the output node: the device's rate");
+    static std::atomic<int> completed{0}, tapped{0};
+    const auto done = b->make_block([](transmute::CpuState&, transmute::GuestMemory&) { ++completed; });
+    const auto tap = b->make_block([](transmute::CpuState& s, transmute::GuestMemory&) {
+        if (s.x[1] && s.x[2]) ++tapped;   // (AVAudioPCMBuffer *, AVAudioTime *)
+    });
+    alchemy::CallRegs tap_args{};
+    tap_args.x = {0, 0, 0, 1024, 0, tap, 0, 0};
+    static_cast<void>(f.objc.send(mixer, f.objc.selector("installTapOnBus:bufferSize:format:block:"), tap_args));
+    const auto error = f.block(8);
+    require((f.send(engine, "startAndReturnError:", {error}) & 0xff) == 1 && (f.send(engine, "isRunning") & 0xff) == 1, "the engine starts");
+    f.send(player, "scheduleBuffer:completionHandler:", {buffer, done});
+    f.send(player, "play");
+    require((f.send(player, "isPlaying") & 0xff) == 1, "the player plays");
+    const auto played = FakeStream::play_until_sound(256);
+    const auto first = static_cast<std::size_t>(std::find_if(played.begin(), played.end(), [](float v) { return v != 0; }) - played.begin()) & ~std::size_t{1};
+    require(first + 1 < played.size() && played[first] == 0.5f && played[first + 1] == -0.25f, "the buffer plays through the mixer");
+    for (int i = 0; i < 24; ++i) static_cast<void>(FakeStream::play_paced(256));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while ((completed == 0 || tapped == 0) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(completed == 1, "the completion handler runs once the buffer is consumed");
+    require(tapped >= 1, "the tap delivers buffers");
+    require(f.send(player, "lastRenderTime") != 0, "lastRenderTime while running");
+    // Volume applies in the mixer; a looping buffer keeps playing.
+    alchemy::CallRegs half{};
+    half.set_s(0, 0.5f);
+    static_cast<void>(f.objc.send(player, f.objc.selector("setVolume:"), half));
+    alchemy::CallRegs looping{};
+    looping.x = {0, 0, buffer, 0, 1 /* AVAudioPlayerNodeBufferLoops */, 0, 0, 0};
+    static_cast<void>(f.objc.send(player, f.objc.selector("scheduleBuffer:atTime:options:completionHandler:"), looping));
+    std::vector<float> quieter;
+    for (int i = 0; i < 40; ++i) quieter = FakeStream::play_paced(256);
+    require(quieter[0] == 0.25f && quieter[1] == -0.125f, "volume 0.5, still looping");
+    f.send(player, "stop");
+    require((f.send(player, "isPlaying") & 0xff) == 0, "stopped");
+    f.send(mixer, "removeTapOnBus:", {0});
+    f.send(engine, "stop");
+    require((f.send(engine, "isRunning") & 0xff) == 0, "the engine stops");
+    // The input node has no device behind it: an engine fed by it does not start.
+    const auto input = f.send(engine, "inputNode");
+    require(input && f.send(input, "outputFormatForBus:", {0}) == 0, "the input node has no format");
+
+    // AVAudioFile: a mono 16-bit file read as float32.
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_media_avaudio";
+    std::filesystem::create_directories(directory);
+    const auto path = write_wave(directory / "ramp.wav", 44100, 1, 1000, [](std::uint32_t i, std::uint16_t) { return static_cast<std::int16_t>(i * 32); });
+    const auto url = f.cf.file_url(alchemy::guest_path_string(path), false);
+    const auto file = f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForReading:error:", {url, error});
+    require(file && static_cast<std::int64_t>(f.send(file, "length")) == 1000, "AVAudioFile length");
+    const auto processing = f.send(file, "processingFormat");
+    require(f.send(processing, "channelCount") == 1 && f.send(processing, "commonFormat") == 1, "float32 processing format");
+    const auto file_buffer = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {processing, 512});
+    require((f.send(file, "readIntoBuffer:error:", {file_buffer, error}) & 0xff) == 1 && f.send(file_buffer, "frameLength") == 512, "read 512 frames");
+    const auto data = f.engine.read64(f.send(file_buffer, "floatChannelData"));
+    require(std::bit_cast<float>(f.engine.read32(data + 400)) == 3200.0f / 32768, "the samples, converted");
+    require(f.send(file, "framePosition") == 512, "framePosition");
+    require((f.send(file, "readIntoBuffer:error:", {file_buffer, error}) & 0xff) == 1 && f.send(file_buffer, "frameLength") == 488, "the rest");
+    require((f.send(file, "readIntoBuffer:error:", {file_buffer, error}) & 0xff) == 1 && f.send(file_buffer, "frameLength") == 0, "end of file");
+    f.engine.write64(error, 0);
+    require(f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForWriting:settings:error:", {url, 0, error}) == 0 && f.engine.read64(error) != 0,
+            "writing is not provided");
+
+    // AVAudioPlayer: a 1 s 44.1 kHz tone plays resampled to 48 kHz; currentTime advances; -stop.
+    const auto tone_path = write_wave(directory / "tone.wav", 44100, 1, 44100, [](std::uint32_t, std::uint16_t) { return static_cast<std::int16_t>(8192); });
+    const auto tone_url = f.cf.file_url(alchemy::guest_path_string(tone_path), false);
+    f.engine.write64(error, 0);
+    const auto audio_player = f.send(f.send(f.cls("AVAudioPlayer"), "alloc"), "initWithContentsOfURL:error:", {tone_url, error});
+    require(audio_player && f.send(audio_player, "numberOfChannels") == 1, "AVAudioPlayer");
+    require(std::fabs(real(f.objc.send(audio_player, f.objc.selector("duration"))) - 1.0) < 1e-9, "duration");
+    require((f.send(audio_player, "play") & 0xff) == 1, "play");
+    const auto heard = FakeStream::play_until_sound(256);
+    require(std::any_of(heard.begin(), heard.end(), [](float v) { return v > 0; }), "the player sounds");
+    require(real(f.objc.send(audio_player, f.objc.selector("currentTime"))) > 0, "currentTime advances");
+    f.send(audio_player, "stop");
+    require((f.send(audio_player, "isPlaying") & 0xff) == 0 && real(f.objc.send(audio_player, f.objc.selector("currentTime"))) > 0,
+            "stopped, keeping currentTime");
+    // The 1000-frame ramp plays to its end and stops by itself.
+    const auto short_player = f.send(f.send(f.cls("AVAudioPlayer"), "alloc"), "initWithContentsOfURL:error:", {url, error});
+    require(short_player && std::fabs(real(f.objc.send(short_player, f.objc.selector("duration"))) - 1000.0 / 44100) < 1e-9, "a short player");
+    require((f.send(short_player, "play") & 0xff) == 1, "play the short file");
+    for (int i = 0; i < 40 && (f.send(short_player, "isPlaying") & 0xff) == 1; ++i) static_cast<void>(FakeStream::play_paced(256));
+    require((f.send(short_player, "isPlaying") & 0xff) == 0, "it finishes");
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto from_data = f.send(f.send(f.cls("AVAudioPlayer"), "alloc"), "initWithData:error:", {b->data(bytes), error});
+    require(from_data && std::fabs(real(f.objc.send(from_data, f.objc.selector("duration"))) - 1000.0 / 44100) < 1e-9, "AVAudioPlayer from data");
+    f.send(audio_player, "release");
+    f.send(short_player, "release");
+    f.send(from_data, "release");
+    f.send(file_buffer, "release");
+    f.send(file, "release");
+    f.send(engine, "release");
+    f.send(player, "release");
+    f.send(buffer, "release");
+    f.send(format, "release");
+    in.close();
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
 }
 
 void music_sequence(Fixture& f) {
@@ -719,9 +1280,14 @@ int main() {
         {"vimage", vimage},
         {"core_midi", core_midi},
         {"core_audio", core_audio},
+        {"output_units", output_units},
+        {"audio_converter", audio_converter},
+        {"audio_queue", audio_queue},
+        {"openal", openal},
         {"music_sequence", music_sequence},
         {"audio_files", audio_files},
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},
+        {"avaudio", avaudio},
     });
 }

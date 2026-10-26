@@ -11,9 +11,8 @@
 //   CVBufferGetAttachment; pixel-format descriptions are real for the common
 //   formats; no compressed pixel format is available.
 // - CoreMedia: host-time conversion is real; CMSetAttachment is real for
-//   CVBuffers; multi-block CMBlockBuffers (CreateEmpty / AppendMemoryBlock)
-//   are unsupported (explicit stop); HEVC parameter sets are not parsed, so no
-//   HEVC format description can be created (kCMFormatDescriptionError_InvalidParameter).
+//   CVBuffers (multi-block CMBlockBuffers and HEVC parameter sets are
+//   coremedia.cpp's).
 // - AVFoundation: the capture-photo and sample-buffer renderer classes exist
 //   as plain classes (no device or renderer can be created).
 // - CoreAudio: aggregate devices cannot be created
@@ -188,10 +187,6 @@ void Provider::install_media() {
         }
         throw std::runtime_error("Alchemy: CMSetAttachment is unsupported for this attachment bearer (only CVBuffers)");
     });
-    unsupported(core_media, "_CMBlockBufferCreateEmpty", "multi-block CMBlockBuffers are not implemented");
-    unsupported(core_media, "_CMBlockBufferAppendMemoryBlock", "multi-block CMBlockBuffers are not implemented");
-    failure(core_media, "_CMVideoFormatDescriptionCreateFromHEVCParameterSets", fd_invalid_parameter, {6});
-    failure(core_media, "_CMVideoFormatDescriptionGetHEVCParameterSetAtIndex", fd_invalid_parameter, {2, 3, 4, 5});
 
     // ---------------------------------------------------------------- AVFoundation
     string(av_foundation, "_AVVideoCodecKey", "AVVideoCodecKey");

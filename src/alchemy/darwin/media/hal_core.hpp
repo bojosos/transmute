@@ -15,10 +15,13 @@
 // nothing to report). Default devices are Windows' console defaults and
 // cannot be changed from here; nominal sample rates are the endpoint's own
 // rate (shared mode cannot change it). The I/O buffer frame size is a
-// per-process setting kept as set. Device I/O (IOProcs) is not provided.
+// per-process setting kept as set. Output devices play through a Backend
+// output stream (hal_io.hpp runs the IOProcs); input devices have no I/O.
 
 #include <cstdint>
+#include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
@@ -55,10 +58,24 @@ struct Snapshot {
     std::string default_input, default_output;   // device UIDs (empty: none)
 };
 
+// Asks for `frames` interleaved float frames in the device's channels and rate; `queued` frames
+// are already ahead of them in the host. Called on a thread of the stream.
+using Render = std::function<void(float* samples, std::uint32_t frames, std::uint32_t queued)>;
+
+// A device's output stream: render runs between start and stop (stop waits for it).
+class OutputStream {
+public:
+    virtual ~OutputStream() = default;
+    virtual bool start() = 0;
+    virtual void stop() = 0;
+};
+
 class Backend {
 public:
     virtual ~Backend() = default;
     virtual Snapshot snapshot() = 0;
+    // An output stream on `device` (an output device of the snapshot), or nullptr.
+    virtual std::unique_ptr<OutputStream> open_output(const Device&, Render) { return nullptr; }
 };
 
 struct Address {

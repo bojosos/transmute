@@ -13,12 +13,9 @@
 // (object, event) registrations they are given. AUParameterSet sets the value
 // through AudioUnitSetParameter and AUParameterListenerNotify reads it through
 // AudioUnitGetParameter, as Apple's implementation does; their status is
-// returned unchanged. Under Alchemy no audio unit instance can exist
-// (AudioComponentFindNext finds no component), so those calls answer the
-// AudioUnit layer's badComponentInstance and no listener is ever called.
-// Property-change events register an AudioUnit property listener, which no
-// unit can accept either. Successful notifications (when audio units exist)
-// call the listeners on the notifying thread.
+// returned unchanged (the output units have one parameter, kHALOutputParam_Volume:
+// audio_units.cpp). Property-change events register an AudioUnit property
+// listener. Successful notifications call the listeners on the notifying thread.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 

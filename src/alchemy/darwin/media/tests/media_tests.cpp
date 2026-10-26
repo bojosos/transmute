@@ -160,7 +160,7 @@ void video(Fixture& f) {
     compress.push_stack(Address{0});
     compress.push_stack(session);
     require(static_cast<std::int32_t>(f.regs(vt, "_VTCompressionSessionCreate", compress).x0) == -12908 && f.engine.read64(session) == 0, "no encoder");
-    require(f.status(vt, "_VTPixelTransferSessionCreate", {0, out}) == -12905, "no pixel transfer");
+    require(f.status(vt, "_VTPixelTransferSessionCreate", {0, out}) == 0 && f.engine.read64(out) != 0, "a pixel transfer session");
     require(f.status(vt, "_VTSessionSetProperty", {0, 0, 0}) == -12902, "session calls");
     require(f.call(vt, "_VTIsHardwareDecodeSupported", {fourcc("avc1")}) == 0, "no hardware decode");
     // AVFoundation
@@ -176,12 +176,9 @@ void video(Fixture& f) {
     require(f.call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFErrorGetCode", {f.engine.read64(error)}) ==
             static_cast<Address>(-11814), "AVErrorDeviceNotConnected");
     // CoreVideo
-    require(f.status(cv, "_CVPixelBufferPoolCreate", {0, 0, 0, out}) == -6663 && f.engine.read64(out) == 0, "no pixel buffer pools");
+    require(f.status(cv, "_CVPixelBufferPoolCreate", {0, 0, 0, out}) == -6682 && f.engine.read64(out) == 0, "a pool needs its buffers' size");
     require(f.call(cv, "_CVPixelBufferGetWidth", {0}) == 0, "NULL width");
     require(f.status(cv, "_CVPixelBufferLockBaseAddress", {0, 0}) == -6661, "NULL lock");
-    bool refused = false;
-    try { static_cast<void>(f.call(cv, "_CVPixelBufferGetWidth", {0x1000})); } catch (const std::exception&) { refused = true; }
-    require(refused, "a pixel buffer that cannot exist stops explicitly");
 }
 
 void audio(Fixture& f) {

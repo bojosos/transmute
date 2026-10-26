@@ -9,6 +9,7 @@
 #include "alchemy/darwin/media/midi_host.hpp"
 #include "alchemy/darwin/media/music_core.hpp"
 #include "alchemy/darwin/media/audio_file_core.hpp"
+#include "alchemy/darwin/media/resampler.hpp"
 #include <filesystem>
 #include <fstream>
 
@@ -22,6 +23,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -510,8 +512,46 @@ void list_host_devices() {
     for (const auto& port : midi_backend->outputs()) std::cout << "midi out : " << port.name << (port.synthesizer ? " (synth)" : "") << "\n";
 }
 
+// The resampler: a 1 kHz sine from 44.1 kHz to 48 kHz keeps its amplitude and frequency, a
+// 15 kHz tone from 48 kHz to 22.05 kHz is removed (above the new Nyquist frequency), and equal
+// rates copy.
+void resampler_tests() {
+    const auto tone = [](double frequency, double rate) {
+        auto phase = std::make_shared<double>(0);
+        return [frequency, rate, phase](double* out, std::size_t frames) {
+            for (std::size_t i = 0; i < frames; ++i) {
+                out[i] = std::sin(2 * 3.14159265358979323846 * frequency * *phase / rate);
+                *phase += 1;
+            }
+        };
+    };
+    cm::Resampler up(44100, 48000, 1);
+    std::vector<double> out(4800);
+    const auto pull = tone(1000, 44100);
+    for (int block = 0; block < 4; ++block) up.render(out.data() + block * 1200, 1200, pull);
+    double peak = 0;
+    int crossings = 0;
+    for (std::size_t i = 600; i < out.size(); ++i) {
+        peak = std::max(peak, std::abs(out[i]));
+        if ((out[i - 1] < 0) != (out[i] < 0)) ++crossings;
+    }
+    require(std::abs(peak - 1) < 0.01, "1 kHz keeps its amplitude");
+    require(std::abs(crossings - 175) <= 2, "1 kHz keeps its frequency (4200 frames at 48 kHz: 175 zero crossings)");
+    cm::Resampler down(48000, 22050, 1);
+    std::vector<double> low(2205);
+    down.render(low.data(), low.size(), tone(15000, 48000));
+    double residue = 0;
+    for (std::size_t i = 200; i < low.size(); ++i) residue = std::max(residue, std::abs(low[i]));
+    require(residue < 0.01, "a tone above the new Nyquist frequency is removed");
+    cm::Resampler same_rate(48000, 48000, 2);
+    std::vector<double> copied(8);
+    same_rate.render(copied.data(), 4, [](double* in, std::size_t frames) { for (std::size_t i = 0; i < frames * 2; ++i) in[i] = static_cast<double>(i); });
+    require(copied[7] == 7, "equal rates copy");
+}
+
 int main() {
     try {
+        resampler_tests();
         if (std::getenv("ALCHEMY_MEDIA_LIST_HOST_DEVICES")) list_host_devices();
         cmtime_tests();
         splitter_tests();

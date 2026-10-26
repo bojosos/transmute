@@ -28,6 +28,10 @@ void install_core_media(InstallContext& context);
 void install_video_toolbox(InstallContext& context);
 void install_av_foundation(InstallContext& context);
 void install_core_video_gaps(InstallContext& context);
+// core_video.cpp: CVPixelBuffer, attachments and pools (before install_core_video_gaps).
+void install_core_video_pixel_buffers(InstallContext& context);
+// pixel_transfer.cpp: VTPixelTransferSession and the VTSession property calls (before install_video_toolbox).
+void install_pixel_transfer(InstallContext& context);
 void install_audio(InstallContext& context);
 void install_media_accessibility(InstallContext& context);
 void install_image_capture(InstallContext& context);

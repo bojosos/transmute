@@ -28,7 +28,8 @@
 //   with AVErrorDecoderNotFound (AVErrorOperationNotSupportedForAsset for an
 //   audio-only asset).
 // - AVAudioFormat and AVAudioChannelLayout are real value classes.
-// - Audio units: no component exists (AudioComponentFindNext finds none), so
+// - Audio units: the version 3 API exposes no component (the output units
+//   are version 2 AudioComponents only, audio_units.cpp), so
 //   AVAudioUnitComponentManager lists nothing, AVAudioUnit/AUAudioUnit
 //   instantiation fails with invalidComponentID and their instance methods
 //   (and AUGenericView's, which needs a unit) are unreachable: they stop
@@ -859,7 +860,7 @@ void install_av_foundation(Support& support) {
         s.x[0] = av->autorelease(dictionary);
     }, "@@:");
 
-    // ---- audio units: none exists --------------------------------------------------------------
+    // ---- audio units (version 3): none exists --------------------------------------------------------------
     const auto node = support.objc.find_class("AVAudioNode") ? support.objc.find_class("AVAudioNode") : support.declare_class("AVAudioNode", ns_object, av_foundation);
     static_cast<void>(node);
     const auto audio_unit = support.declare_class("AVAudioUnit", "AVAudioNode", av_foundation);
@@ -869,7 +870,7 @@ void install_av_foundation(Support& support) {
     av->bus_class = support.declare_class("AUAudioUnitBus", ns_object, audio_toolbox);
     const auto bus = av->bus_class;
     const auto no_component_error = [av]() {
-        return av->bridge->error("NSOSStatusErrorDomain", invalid_component_id, "No audio component matches the description (none exists under Alchemy)");
+        return av->bridge->error("NSOSStatusErrorDomain", invalid_component_id, "No audio unit matches the description (no version 3 audio unit exists under Alchemy)");
     };
     // +instantiateWithComponentDescription:options:completionHandler: (AudioComponentDescription by
     // reference in x2): the handler gets (nil, error).

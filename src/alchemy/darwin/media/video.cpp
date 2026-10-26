@@ -5,10 +5,10 @@
 
 // VideoToolbox, AVFoundation and the CoreVideo pixel-buffer gaps.
 //
-// - VideoToolbox: Alchemy has no video decoder, encoder or pixel-transfer
-//   implementation. Session creation fails with kVTCouldNotFindVideoDecoderErr,
-//   kVTCouldNotFindVideoEncoderErr or kVTPixelTransferNotSupportedErr; since no
-//   session can exist, session calls answer kVTInvalidSessionErr. Hardware
+// - VideoToolbox: Alchemy has no video decoder or encoder. Session creation
+//   fails with kVTCouldNotFindVideoDecoderErr or kVTCouldNotFindVideoEncoderErr;
+//   since no such session can exist, their calls answer kVTInvalidSessionErr.
+//   Pixel transfer sessions are real (pixel_transfer.cpp). Hardware
 //   decoding is reported unsupported; no supplemental decoder is available.
 // - AVFoundation: there are no capture devices. Device lists (and discovery
 //   sessions) are empty, default devices nil, authorization "restricted" and
@@ -19,13 +19,9 @@
 //   but can have no input, so no frame is ever delivered; video data outputs
 //   keep their delegate, queue and settings. AVSampleBufferDisplayLayer and
 //   the still-image output are class shells.
-// - CoreVideo: pixel buffers cannot be created under Alchemy
-//   (CVPixelBufferCreate answers kCVReturnUnsupported), so pools and IOSurface,
-//   planar-byte or wrapped-byte buffers fail the same way, and accessors of the
-//   buffers that cannot exist answer the documented values for NULL. Metal
-//   texture caches are real objects holding their device; since no image
-//   buffer exists, no texture is ever made from one. CVBufferRetain/Release
-//   retain and release any CF object; host time is mach_absolute_time's.
+// - CoreVideo: the dictionary keys, host time (mach_absolute_time's) and the
+//   Metal texture caches, real objects holding their device (no texture is made
+//   from an image buffer yet). Pixel buffers and pools are core_video.cpp's.
 namespace alchemy::gui::fill {
 namespace {
 
@@ -58,17 +54,33 @@ public:
 };
 
 struct TextureCache final : ObjectPayload { Address device{}; };
+struct MetalTexture final : ObjectPayload { Address texture{}, image{}; };
 
-// CVMetalTextureCache: a real cache object that holds its Metal device. Since
-// no CVImageBuffer can exist under Alchemy, no texture is ever created from
-// one and the cache stays empty (flushing has nothing to drop).
+// CVMetalTextureCache: a cache object that holds its Metal device. A texture
+// from an image buffer (a CVPixelBuffer) is an MTLTexture over the buffer's
+// IOSurface plane (-[MTLDevice newTextureWithDescriptor:iosurface:plane:]),
+// so it sees the buffer's pixels; a buffer without an IOSurface is copied into
+// a new texture when the texture is made. CVMetalTexture objects hold their
+// texture and image; nothing is cached between calls, so flushing has nothing
+// to drop.
 void Video::install_metal_texture_cache() {
-    const auto cache_class = objc.find_class("__AlchemyCVMetalTextureCache") ? objc.find_class("__AlchemyCVMetalTextureCache")
-        : objc.register_native_class("__AlchemyCVMetalTextureCache", objc.find_class("NSObject"), 8);
+    const auto native = [this](const char* name) {
+        const auto found = objc.find_class(name);
+        return found ? found : objc.register_native_class(name, objc.find_class("NSObject"), 8);
+    };
+    const auto cache_class = native("__AlchemyCVMetalTextureCache");
+    const auto texture_class = native("__AlchemyCVMetalTexture");
     if (!has(core_video, "_CVMetalTextureCacheCreate")) {
         static_cast<void>(objc.add_native_method(cache_class, "dealloc", [self = shared_from_this(), this, cache_class](CpuState& s, GuestMemory&) {
             if (const auto value = objc.find_host_state<TextureCache>(s.x[0])) release(std::exchange(value->device, 0));
             static_cast<void>(objc.send_super(s.x[0], cache_class, objc.selector("dealloc")));
+        }, false, "v@:"));
+        static_cast<void>(objc.add_native_method(texture_class, "dealloc", [self = shared_from_this(), this, texture_class](CpuState& s, GuestMemory&) {
+            if (const auto value = objc.find_host_state<MetalTexture>(s.x[0])) {
+                release(std::exchange(value->texture, 0));
+                release(std::exchange(value->image, 0));
+            }
+            static_cast<void>(objc.send_super(s.x[0], texture_class, objc.selector("dealloc")));
         }, false, "v@:"));
     }
     // CVMetalTextureCacheCreate(allocator, cacheAttributes, id<MTLDevice>, textureAttributes, CVMetalTextureCacheRef *out)
@@ -84,16 +96,82 @@ void Video::install_metal_texture_cache() {
     raw(core_video, "_CVMetalTextureCacheFlush", [this](CpuState& s, GuestMemory&) {
         if (s.x[0] && !objc.find_host_state<TextureCache>(s.x[0])) throw std::runtime_error("Alchemy: CVMetalTextureCacheFlush on an object that is not a texture cache");
     });
-    // CVMetalTextureCacheCreateTextureFromImage(allocator, cache, CVImageBufferRef image, attributes, pixelFormat,
-    //     width, height, planeIndex, [stack] CVMetalTextureRef *out): no image buffer can exist.
-    raw(core_video, "_CVMetalTextureCacheCreateTextureFromImage", [](CpuState& s, GuestMemory& m) {
+    // CVMetalTextureCacheCreateTextureFromImage(allocator, cache, CVImageBufferRef image, attributes, MTLPixelFormat,
+    //     width, height, planeIndex, [stack] CVMetalTextureRef *out)
+    raw(core_video, "_CVMetalTextureCacheCreateTextureFromImage", [this, texture_class](CpuState& s, GuestMemory& m) {
         const auto out = m.read64(s.sp);
         if (out) m.write64(out, 0);
-        impossible(s.x[2], "CVMetalTextureCacheCreateTextureFromImage");
-        s.x[0] = status(cv_invalid_argument);
+        const auto cache = s.x[1] ? objc.find_host_state<TextureCache>(s.x[1]) : nullptr;
+        const auto image = s.x[2];
+        if (!cache || !image || !out) { s.x[0] = status(cv_invalid_argument); return; }
+        if (call(core_foundation, "_CFGetTypeID", {image}) != call(core_video, "_CVPixelBufferGetTypeID", {})) {
+            s.x[0] = status(cv_invalid_argument);
+            return;
+        }
+        const auto format = s.x[4], width = s.x[5], height = s.x[6], plane = s.x[7];
+        const auto descriptor_class = objc.find_class("MTLTextureDescriptor");
+        if (!descriptor_class || !width || !height) { s.x[0] = status(cv_invalid_argument); return; }
+        CallRegs make{};
+        make.x[2] = format;
+        make.x[3] = width;
+        make.x[4] = height;
+        make.x[5] = 0;
+        const auto descriptor = objc.send(descriptor_class, "texture2DDescriptorWithPixelFormat:width:height:mipmapped:", make).x0;
+        if (!descriptor) { s.x[0] = status(cv_invalid_argument); return; }
+        CallRegs usage{};
+        usage.x[2] = 1 | 2 | 4;   // MTLTextureUsageShaderRead | ShaderWrite | RenderTarget
+        static_cast<void>(objc.send(descriptor, "setUsage:", usage));
+        Address texture{};
+        if (const auto surface = call(core_video, "_CVPixelBufferGetIOSurface", {image})) {
+            CallRegs r{};
+            r.x[2] = descriptor;
+            r.x[3] = surface;
+            r.x[4] = plane;
+            texture = objc.send(cache->device, "newTextureWithDescriptor:iosurface:plane:", r).x0;
+        } else {
+            // No IOSurface: a texture with a copy of the pixels.
+            CallRegs r{};
+            r.x[2] = descriptor;
+            texture = objc.send(cache->device, "newTextureWithDescriptor:", r).x0;
+            const bool planar = call(core_video, "_CVPixelBufferIsPlanar", {image}) != 0;
+            const auto base = planar ? call(core_video, "_CVPixelBufferGetBaseAddressOfPlane", {image, plane}) : call(core_video, "_CVPixelBufferGetBaseAddress", {image});
+            const auto row = planar ? call(core_video, "_CVPixelBufferGetBytesPerRowOfPlane", {image, plane}) : call(core_video, "_CVPixelBufferGetBytesPerRow", {image});
+            if (texture && base) {
+                // -replaceRegion:mipmapLevel:withBytes:bytesPerRow: (MTLRegion {origin xyz, size whd} by value: 48 bytes, by reference)
+                const auto region = process.allocate_guest(48, 8);
+                const std::array<std::uint64_t, 6> values{0, 0, 0, width, height, 1};
+                for (std::size_t i = 0; i < values.size(); ++i) m.write64(region + 8 * i, values[i]);
+                CallRegs replace{};
+                replace.x[2] = region;
+                replace.x[3] = 0;
+                replace.x[4] = base;
+                replace.x[5] = row;
+                static_cast<void>(objc.send(texture, "replaceRegion:mipmapLevel:withBytes:bytesPerRow:", replace));
+                process.release_guest(region);
+            }
+        }
+        if (!texture) { s.x[0] = status(cv_invalid_argument); return; }
+        const auto made = objc.allocate(texture_class);
+        const auto state = objc.host_state<MetalTexture>(made);
+        state->texture = texture;   // newTexture... is +1
+        state->image = retain(image);
+        m.write64(out, made);
+        s.x[0] = 0;
     });
-    // No CVMetalTexture can exist: NULL answers nil.
-    raw(core_video, "_CVMetalTextureGetTexture", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CVMetalTextureGetTexture"); s.x[0] = 0; });
+    raw(core_video, "_CVMetalTextureGetTexture", [this](CpuState& s, GuestMemory&) {
+        const auto state = s.x[0] ? objc.find_host_state<MetalTexture>(s.x[0]) : nullptr;
+        s.x[0] = state ? state->texture : 0;
+    });
+    constant(core_video, "_CVMetalTextureIsFlipped", 0);
+    // CVMetalTextureGetCleanTexCoords(texture, lowerLeft[2], lowerRight[2], upperRight[2], upperLeft[2]): the whole texture.
+    raw(core_video, "_CVMetalTextureGetCleanTexCoords", [](CpuState& s, GuestMemory& m) {
+        const std::array<std::array<float, 2>, 4> corners{{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
+        for (unsigned i = 0; i < 4; ++i)
+            if (s.x[1 + i]) {
+                m.write32(s.x[1 + i], std::bit_cast<std::uint32_t>(corners[i][0]));
+                m.write32(s.x[1 + i] + 4, std::bit_cast<std::uint32_t>(corners[i][1]));
+            }
+    });
 }
 
 void Video::install_video_toolbox() {
@@ -101,17 +179,12 @@ void Video::install_video_toolbox() {
     // VTCompressionSessionCreate(allocator, width, height, codec, encoderSpecification, sourceAttributes,
     //     compressedDataAllocator, outputCallback, [stack] refcon, compressionSessionOut)
     failure(video_toolbox, "_VTCompressionSessionCreate", vt_could_not_find_encoder, {9});
-    failure(video_toolbox, "_VTPixelTransferSessionCreate", vt_pixel_transfer_not_supported, {1});
+    // Pixel transfer sessions and the VTSession property calls are pixel_transfer.cpp's.
     for (const auto* name : {"_VTCompressionSessionCompleteFrames", "_VTCompressionSessionEncodeFrame", "_VTDecompressionSessionDecodeFrame",
                              "_VTDecompressionSessionDecodeFrameWithOutputHandler",
-                             "_VTDecompressionSessionWaitForAsynchronousFrames", "_VTPixelTransferSessionTransferImage",
-                             "_VTSessionCopyProperty", "_VTSessionSetProperty"})
+                             "_VTDecompressionSessionWaitForAsynchronousFrames"})
         raw(video_toolbox, name, [](CpuState& s, GuestMemory&) { s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter); });
-    raw(video_toolbox, "_VTSessionCopySupportedPropertyDictionary", [](CpuState& s, GuestMemory& m) {
-        if (s.x[1]) m.write64(s.x[1], 0);
-        s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter);
-    });
-    for (const auto* name : {"_VTCompressionSessionInvalidate", "_VTDecompressionSessionInvalidate", "_VTPixelTransferSessionInvalidate"}) {
+    for (const auto* name : {"_VTCompressionSessionInvalidate", "_VTDecompressionSessionInvalidate"}) {
         const std::string what(name + 1);
         raw(video_toolbox, name, [what](CpuState& s, GuestMemory&) { impossible(s.x[0], what); });
     }
@@ -367,17 +440,6 @@ void Video::install_core_video() {
              {"_kCVPixelBufferBytesPerRowAlignmentKey", "BytesPerRowAlignment"},
              {"_kCVImageBufferChromaLocationTopFieldKey", "CVImageBufferChromaLocationTopField"}}})
         string(core_video, symbol, value);
-    constant(core_video, "_CVPixelBufferGetTypeID", static_cast<Address>(TypeId::cv_pixel_buffer));
-    // Creation fails like CVPixelBufferCreate.
-    failure(core_video, "_CVPixelBufferCreateWithIOSurface", cv_unsupported, {3});
-    // CVPixelBufferCreateWithBytes(allocator, width, height, format, base, bytesPerRow, releaseCallback,
-    //     releaseRefCon, [stack] attributes, pixelBufferOut): the callback is not called (nothing was made).
-    failure(core_video, "_CVPixelBufferCreateWithBytes", cv_unsupported, {9});
-    // Retain/release of any CF object (NULL-safe); a pixel buffer itself cannot exist.
-    for (const auto* name : {"_CVBufferRetain", "_CVPixelBufferRetain"})
-        raw(core_video, name, [this](CpuState& s, GuestMemory&) { s.x[0] = retain(s.x[0]); });
-    raw(core_video, "_CVBufferRelease", [this](CpuState& s, GuestMemory&) { release(s.x[0]); });
-    raw(core_video, "_CVPixelBufferPoolRelease", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CVPixelBufferPoolRelease"); });
     // Host time: mach_absolute_time and its frequency from mach_timebase_info.
     raw(core_video, "_CVGetCurrentHostTime", [this](CpuState& s, GuestMemory&) { s.x[0] = call(libsystem, "_mach_absolute_time", {}); });
     raw(core_video, "_CVGetHostClockFrequency", [this](CpuState& s, GuestMemory& m) {
@@ -389,34 +451,6 @@ void Video::install_core_video() {
     });
     raw(core_video, "_CVGetHostClockMinimumTimeDelta", [](CpuState& s, GuestMemory&) { s.x[0] = 1; });
     install_metal_texture_cache();
-    // CVPixelBufferCreateWithPlanarBytes(15 arguments): pixelBufferOut is the 7th stack argument.
-    failure(core_video, "_CVPixelBufferCreateWithPlanarBytes", cv_unsupported, {14});
-    failure(core_video, "_CVPixelBufferPoolCreate", cv_unsupported, {3});
-    failure(core_video, "_CVPixelBufferPoolCreatePixelBuffer", cv_invalid_argument, {2});
-    failure(core_video, "_CVPixelBufferPoolCreatePixelBufferWithAuxAttributes", cv_invalid_argument, {3});
-    raw(core_video, "_CVPixelBufferPoolFlush", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CVPixelBufferPoolFlush"); });
-    // Accessors of pixel buffers (none can exist): the documented values for NULL.
-    for (const auto* name : {"_CVPixelBufferGetBaseAddress", "_CVPixelBufferGetBaseAddressOfPlane", "_CVPixelBufferGetBytesPerRow",
-                             "_CVPixelBufferGetBytesPerRowOfPlane", "_CVPixelBufferGetDataSize", "_CVPixelBufferGetHeight",
-                             "_CVPixelBufferGetHeightOfPlane", "_CVPixelBufferGetPixelFormatType", "_CVPixelBufferGetPlaneCount",
-                             "_CVPixelBufferGetWidth", "_CVPixelBufferGetWidthOfPlane", "_CVPixelBufferIsPlanar", "_CVBufferGetAttachment"}) {
-        const std::string what(name + 1);
-        raw(core_video, name, [what](CpuState& s, GuestMemory&) { impossible(s.x[0], what); s.x[0] = 0; });
-    }
-    for (const auto* name : {"_CVPixelBufferLockBaseAddress", "_CVPixelBufferUnlockBaseAddress"}) {
-        const std::string what(name + 1);
-        raw(core_video, name, [what](CpuState& s, GuestMemory&) { impossible(s.x[0], what); s.x[0] = status(cv_invalid_argument); });
-    }
-    raw(core_video, "_CVBufferSetAttachment", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CVBufferSetAttachment"); });
-    // CGRect / CGSize results (zero for NULL).
-    raw(core_video, "_CVImageBufferGetCleanRect", [](CpuState& s, GuestMemory&) {
-        impossible(s.x[0], "CVImageBufferGetCleanRect");
-        for (unsigned i = 0; i < 4; ++i) return_real(s, 0, i);
-    });
-    for (const auto* name : {"_CVImageBufferGetDisplaySize", "_CVImageBufferGetEncodedSize"}) {
-        const std::string what(name + 1);
-        raw(core_video, name, [what](CpuState& s, GuestMemory&) { impossible(s.x[0], what); return_real(s, 0, 0); return_real(s, 0, 1); });
-    }
 }
 
 } // namespace

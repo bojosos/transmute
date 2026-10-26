@@ -43,6 +43,45 @@ struct Bits {
 
 } // namespace
 
+// H.265 sequence parameter set (NAL type 33): the conformance-window-cropped picture size.
+std::optional<std::pair<std::int32_t, std::int32_t>> hevc_sps_dimensions(std::span<const std::uint8_t> nal) {
+    if (nal.size() < 4 || ((nal[0] >> 1) & 0x3f) != 33) return std::nullopt;
+    Bits b;
+    for (std::size_t i = 2, zeros = 0; i < nal.size(); ++i) {
+        if (zeros >= 2 && nal[i] == 3) { zeros = 0; continue; }
+        b.bytes.push_back(nal[i]);
+        zeros = nal[i] == 0 ? zeros + 1 : 0;
+    }
+    b.read(4);                               // sps_video_parameter_set_id
+    const auto sub_layers = b.read(3);       // sps_max_sub_layers_minus1
+    b.bit();                                 // sps_temporal_id_nesting_flag
+    // profile_tier_level(1, sub_layers): general profile space .. level (88 + 8 bits).
+    b.read(8); b.read(32); b.read(32); b.read(16); b.read(8);
+    std::vector<std::pair<bool, bool>> present;
+    for (std::uint32_t i = 0; i < sub_layers; ++i) {
+        const bool profile = b.bit(), level = b.bit();
+        present.emplace_back(profile, level);
+    }
+    if (sub_layers > 0)
+        for (std::uint32_t i = sub_layers; i < 8; ++i) b.read(2);
+    for (const auto& [profile, level] : present) {
+        if (profile) { b.read(32); b.read(32); b.read(24); }   // 88 bits
+        if (level) b.read(8);
+    }
+    b.ue();                                  // sps_seq_parameter_set_id
+    const auto chroma_format = b.ue();
+    if (chroma_format == 3) b.bit();         // separate_colour_plane_flag
+    const auto width = b.ue(), height = b.ue();
+    std::uint32_t left = 0, right = 0, top = 0, bottom = 0;
+    if (b.bit()) { left = b.ue(); right = b.ue(); top = b.ue(); bottom = b.ue(); }
+    if (b.failed || width == 0 || height == 0 || width > 16384 || height > 16384) return std::nullopt;
+    const std::uint32_t sub_width = chroma_format == 1 || chroma_format == 2 ? 2 : 1, sub_height = chroma_format == 1 ? 2 : 1;
+    const auto w = static_cast<std::int64_t>(width) - static_cast<std::int64_t>(sub_width) * (left + right);
+    const auto h = static_cast<std::int64_t>(height) - static_cast<std::int64_t>(sub_height) * (top + bottom);
+    if (w <= 0 || h <= 0) return std::nullopt;
+    return std::pair{static_cast<std::int32_t>(w), static_cast<std::int32_t>(h)};
+}
+
 std::optional<std::pair<std::int32_t, std::int32_t>> h264_sps_dimensions(std::span<const std::uint8_t> nal) {
     if (nal.size() < 4 || (nal[0] & 0x1f) != 7) return std::nullopt;
     Bits b;
@@ -111,12 +150,19 @@ constexpr std::int32_t fd_invalid_parameter = -12710;
 constexpr std::int32_t sb_required_parameter_missing = -12731;
 constexpr std::uint32_t cmtime_valid = 1, cmtime_positive_infinity = 4, cmtime_negative_infinity = 8, cmtime_indefinite = 16;
 
-struct BlockBuffer final : ObjectPayload {
-    std::mutex mutex;
+// A CMBlockBuffer: its data is the concatenation of its segments. A segment is a range of a
+// memory block (allocated when first needed, or the caller's), or of another buffer's memory
+// (a buffer reference, which keeps that buffer).
+struct Segment {
     Address memory{};
     bool owned{};             // freed with free() when the buffer is deallocated
-    std::uint64_t block_length{}, offset{}, data_length{};
-    Address parent{};         // retained block buffer whose memory this one refers to
+    std::uint64_t block_length{}, offset{}, length{};
+    Address parent{};         // retained block buffer whose memory this segment refers to
+};
+struct BlockBuffer final : ObjectPayload {
+    std::mutex mutex;
+    std::vector<Segment> segments;
+    std::uint64_t data_length{};
 };
 struct FormatDescription final : ObjectPayload {
     std::uint32_t media_type{}, subtype{};
@@ -174,23 +220,83 @@ public:
     static void write_cmtime(GuestMemory& m, Address out, const completion_kit::media::CMTime& time) {
         write_time(m, out, time.value, time.timescale, time.flags, time.epoch);
     }
+    void allocate_segment(Segment& segment) {
+        if (segment.memory || !segment.block_length) return;
+        segment.memory = malloc(segment.block_length);
+        segment.owned = true;
+    }
     void allocate_block(BlockBuffer& buffer) {
-        if (buffer.memory || !buffer.block_length) return;
-        buffer.memory = malloc(buffer.block_length);
-        buffer.owned = true;
+        for (auto& segment : buffer.segments) allocate_segment(segment);
+    }
+    // A memory-block segment (the checks of CMBlockBufferCreateWithMemoryBlock / AppendMemoryBlock).
+    std::optional<Segment> memory_segment(Address memory, std::uint64_t block_length, Address block_allocator, std::uint64_t offset,
+                                          std::uint64_t data_length, std::uint32_t flags, std::int32_t& error) {
+        if (offset > block_length || data_length > block_length - offset) { error = bb_bad_length; return std::nullopt; }
+        Segment segment;
+        segment.memory = memory;
+        segment.owned = memory && block_allocator != null_allocator;
+        segment.block_length = block_length;
+        segment.offset = offset;
+        segment.length = data_length;
+        if (flags & 1U) allocate_segment(segment);   // kCMBlockBufferAssureMemoryNowFlag
+        error = 0;
+        return segment;
     }
     Address create_block(Address memory, std::uint64_t block_length, Address block_allocator, std::uint64_t offset,
                          std::uint64_t data_length, std::uint32_t flags, std::int32_t& error) {
-        if (offset > block_length || data_length > block_length - offset) { error = bb_bad_length; return 0; }
+        const auto segment = memory_segment(memory, block_length, block_allocator, offset, data_length, flags, error);
+        if (!segment) return 0;
         auto value = std::make_shared<BlockBuffer>();
-        value->memory = memory;
-        value->owned = memory && block_allocator != null_allocator;
-        value->block_length = block_length;
-        value->offset = offset;
-        value->data_length = data_length;
-        if (flags & 1U) allocate_block(*value);   // kCMBlockBufferAssureMemoryNowFlag
-        error = 0;
+        value->segments.push_back(*segment);
+        value->data_length = segment->length;
         return make(block_class, value);
+    }
+    // Segments covering [offset, offset + length) of `source` (memory allocated), each keeping `owner`.
+    std::vector<Segment> reference(BlockBuffer& source, Address owner, std::uint64_t offset, std::uint64_t length) {
+        allocate_block(source);
+        std::vector<Segment> out;
+        std::uint64_t at = 0;
+        for (const auto& segment : source.segments) {
+            const auto end = at + segment.length;
+            if (length && offset < end && offset + length > at) {
+                const auto from = std::max(offset, at), to = std::min(offset + length, end);
+                Segment part;
+                part.memory = segment.memory;
+                part.block_length = segment.block_length;
+                part.offset = segment.offset + (from - at);
+                part.length = to - from;
+                part.parent = retain(owner);
+                out.push_back(part);
+            }
+            at = end;
+        }
+        return out;
+    }
+    // The segment holding byte `offset` (and the offset inside it); memory allocated.
+    std::pair<Segment*, std::uint64_t> locate(BlockBuffer& buffer, std::uint64_t offset) {
+        std::uint64_t at = 0;
+        for (auto& segment : buffer.segments) {
+            if (offset < at + segment.length) {
+                allocate_segment(segment);
+                return {&segment, offset - at};
+            }
+            at += segment.length;
+        }
+        return {nullptr, 0};
+    }
+    // Copies [offset, offset + bytes.size()) out of the buffer (or into it, with `write`).
+    void transfer(GuestMemory& m, BlockBuffer& buffer, std::uint64_t offset, std::span<std::uint8_t> bytes, bool write) {
+        std::size_t done = 0;
+        while (done < bytes.size()) {
+            const auto [segment, inner] = locate(buffer, offset + done);
+            if (!segment) throw std::runtime_error("Alchemy: CMBlockBuffer range outside the data");
+            const auto count = std::min<std::uint64_t>(segment->length - inner, bytes.size() - done);
+            const auto address = segment->memory + segment->offset + inner;
+            const auto part = bytes.subspan(done, static_cast<std::size_t>(count));
+            if (write) m.write_bytes(address, part);
+            else m.read_bytes(address, part);
+            done += static_cast<std::size_t>(count);
+        }
     }
     void install();
     void install_time();
@@ -285,19 +391,21 @@ void CoreMedia::install_block_buffers() {
     if (!has(core_media, "_CMBlockBufferCreateWithMemoryBlock")) {
         static_cast<void>(objc.add_native_method(block_class, "dealloc", [self = shared_from_this(), this](CpuState& s, GuestMemory&) {
             if (const auto value = objc.find_host_state<BlockBuffer>(s.x[0])) {
-                Address memory{};
-                Address parent{};
+                std::vector<Segment> segments;
                 {
                     std::lock_guard lock(value->mutex);
-                    if (value->owned) memory = std::exchange(value->memory, 0);
-                    parent = std::exchange(value->parent, 0);
+                    segments = std::move(value->segments);
+                    value->segments.clear();
                 }
-                free(memory);
-                release(parent);
+                for (const auto& segment : segments) {
+                    if (segment.owned) free(segment.memory);
+                    release(segment.parent);
+                }
             }
             static_cast<void>(objc.send_super(s.x[0], block_class, objc.selector("dealloc")));
         }, false, "v@:"));
     }
+    constant(core_media, "_CMBlockBufferGetTypeID", static_cast<Address>(TypeId::block_buffer));
     // OSStatus CMBlockBufferCreateWithMemoryBlock(structureAllocator, memoryBlock, blockLength,
     //     blockAllocator, customBlockSource, offsetToData, dataLength, flags, CMBlockBufferRef *out [stack])
     raw(core_media, "_CMBlockBufferCreateWithMemoryBlock", [this](CpuState& s, GuestMemory& m) {
@@ -310,34 +418,102 @@ void CoreMedia::install_block_buffers() {
         if (buffer) m.write64(out, buffer);
         s.x[0] = status(error);
     });
+    // CMBlockBufferCreateEmpty(structureAllocator, subBlockCapacity, flags, CMBlockBufferRef *out)
+    raw(core_media, "_CMBlockBufferCreateEmpty", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[3]) { s.x[0] = status(bb_bad_pointer); return; }
+        m.write64(s.x[3], make(block_class, std::make_shared<BlockBuffer>()));
+        s.x[0] = 0;
+    });
+    // CMBlockBufferAppendMemoryBlock(buffer, memoryBlock, blockLength, blockAllocator, customBlockSource,
+    //     offsetToData, dataLength, flags)
+    raw(core_media, "_CMBlockBufferAppendMemoryBlock", [this](CpuState& s, GuestMemory&) {
+        const auto value = state<BlockBuffer>(s.x[0], "CMBlockBuffer");
+        if (s.x[4]) { s.x[0] = status(bb_bad_custom_block_source); return; }
+        std::int32_t error{};
+        const auto segment = memory_segment(s.x[1], s.x[2], s.x[3], s.x[5], s.x[6], static_cast<std::uint32_t>(s.x[7]), error);
+        if (!segment) { s.x[0] = status(error); return; }
+        std::lock_guard lock(value->mutex);
+        value->segments.push_back(*segment);
+        value->data_length += segment->length;
+        s.x[0] = 0;
+    });
+    // CMBlockBufferAppendBufferReference(buffer, targetBuffer, offsetToData, dataLength (0: to the end), flags)
+    raw(core_media, "_CMBlockBufferAppendBufferReference", [this](CpuState& s, GuestMemory&) {
+        const auto value = state<BlockBuffer>(s.x[0], "CMBlockBuffer");
+        const auto target = state<BlockBuffer>(s.x[1], "CMBlockBuffer");
+        if (value == target) { s.x[0] = status(bb_bad_pointer); return; }
+        std::vector<Segment> parts;
+        {
+            std::lock_guard lock(target->mutex);
+            if (s.x[2] > target->data_length) { s.x[0] = status(bb_bad_offset); return; }
+            const auto length = s.x[3] ? s.x[3] : target->data_length - s.x[2];
+            if (length > target->data_length - s.x[2]) { s.x[0] = status(bb_bad_length); return; }
+            parts = reference(*target, s.x[1], s.x[2], length);
+        }
+        std::lock_guard lock(value->mutex);
+        for (const auto& part : parts) {
+            value->segments.push_back(part);
+            value->data_length += part.length;
+        }
+        s.x[0] = 0;
+    });
+    // CMBlockBufferCreateWithBufferReference(structureAllocator, targetBuffer, offsetToData, dataLength, flags, CMBlockBufferRef *out)
+    raw(core_media, "_CMBlockBufferCreateWithBufferReference", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[5]) { s.x[0] = status(bb_bad_pointer); return; }
+        m.write64(s.x[5], 0);
+        const auto target = state<BlockBuffer>(s.x[1], "CMBlockBuffer");
+        auto value = std::make_shared<BlockBuffer>();
+        {
+            std::lock_guard lock(target->mutex);
+            if (s.x[2] > target->data_length) { s.x[0] = status(bb_bad_offset); return; }
+            const auto length = s.x[3] ? s.x[3] : target->data_length - s.x[2];
+            if (length > target->data_length - s.x[2]) { s.x[0] = status(bb_bad_length); return; }
+            value->segments = reference(*target, s.x[1], s.x[2], length);
+            value->data_length = length;
+        }
+        m.write64(s.x[5], make(block_class, value));
+        s.x[0] = 0;
+    });
     raw(core_media, "_CMBlockBufferGetDataLength", [this](CpuState& s, GuestMemory&) {
         const auto value = state<BlockBuffer>(s.x[0], "CMBlockBuffer");
         std::lock_guard lock(value->mutex);
         s.x[0] = value->data_length;
     });
+    raw(core_media, "_CMBlockBufferIsEmpty", [this](CpuState& s, GuestMemory&) {
+        const auto value = state<BlockBuffer>(s.x[0], "CMBlockBuffer");
+        std::lock_guard lock(value->mutex);
+        s.x[0] = value->data_length == 0;
+    });
     raw(core_media, "_CMBlockBufferAssureBlockMemory", [this](CpuState& s, GuestMemory&) {
         const auto value = state<BlockBuffer>(s.x[0], "CMBlockBuffer");
         std::lock_guard lock(value->mutex);
         allocate_block(*value);
-        s.x[0] = value->memory || !value->block_length ? 0 : status(bb_block_allocation_failed);
+        const bool ok = std::all_of(value->segments.begin(), value->segments.end(), [](const Segment& g) { return g.memory || !g.block_length; });
+        s.x[0] = ok ? 0 : status(bb_block_allocation_failed);
     });
-    // CMBlockBufferGetDataPointer(buffer, offset, size_t *lengthAtOffset, size_t *totalLength, char **dataPointer)
+    // CMBlockBufferGetDataPointer(buffer, offset, size_t *lengthAtOffset, size_t *totalLength, char **dataPointer):
+    // lengthAtOffset is what is contiguous from the offset (the rest of its segment).
     raw(core_media, "_CMBlockBufferGetDataPointer", [this](CpuState& s, GuestMemory& m) {
         const auto value = state<BlockBuffer>(s.x[0], "CMBlockBuffer");
         std::lock_guard lock(value->mutex);
         const auto offset = s.x[1];
         if (offset > value->data_length || (offset == value->data_length && value->data_length)) { s.x[0] = status(bb_bad_offset); return; }
-        allocate_block(*value);
-        if (s.x[2]) m.write64(s.x[2], value->data_length - offset);
+        const auto [segment, inner] = locate(*value, offset);
+        if (s.x[2]) m.write64(s.x[2], segment ? segment->length - inner : 0);
         if (s.x[3]) m.write64(s.x[3], value->data_length);
-        if (s.x[4]) m.write64(s.x[4], value->memory ? value->memory + value->offset + offset : 0);
+        if (s.x[4]) m.write64(s.x[4], segment && segment->memory ? segment->memory + segment->offset + inner : 0);
         s.x[0] = 0;
     });
     raw(core_media, "_CMBlockBufferIsRangeContiguous", [this](CpuState& s, GuestMemory&) {
         const auto value = state<BlockBuffer>(s.x[0], "CMBlockBuffer");
         std::lock_guard lock(value->mutex);
-        const auto offset = s.x[1], length = s.x[2] ? s.x[2] : value->data_length - std::min(offset, value->data_length);
-        s.x[0] = offset <= value->data_length && length <= value->data_length - offset;   // one memory block
+        const auto offset = s.x[1];
+        if (offset > value->data_length) { s.x[0] = 0; return; }
+        const auto length = s.x[2] ? s.x[2] : value->data_length - offset;
+        if (length > value->data_length - offset) { s.x[0] = 0; return; }
+        if (!length) { s.x[0] = 1; return; }
+        const auto [segment, inner] = locate(*value, offset);
+        s.x[0] = segment && length <= segment->length - inner;
     });
     // CMBlockBufferReplaceDataBytes(sourceBytes, destinationBuffer, offsetIntoDestination, dataLength)
     raw(core_media, "_CMBlockBufferReplaceDataBytes", [this](CpuState& s, GuestMemory& m) {
@@ -345,9 +521,52 @@ void CoreMedia::install_block_buffers() {
         if (!s.x[0] && s.x[3]) { s.x[0] = status(bb_bad_pointer); return; }
         std::lock_guard lock(value->mutex);
         if (s.x[2] > value->data_length || s.x[3] > value->data_length - s.x[2]) { s.x[0] = status(bb_bad_length); return; }
-        allocate_block(*value);
         std::vector<std::uint8_t> bytes(static_cast<std::size_t>(s.x[3]));
-        if (!bytes.empty()) { m.read_bytes(s.x[0], bytes); m.write_bytes(value->memory + value->offset + s.x[2], bytes); }
+        if (!bytes.empty()) {
+            m.read_bytes(s.x[0], bytes);
+            transfer(m, *value, s.x[2], bytes, true);
+        }
+        s.x[0] = 0;
+    });
+    // CMBlockBufferCopyDataBytes(buffer, offsetToData, dataLength, void *destination)
+    raw(core_media, "_CMBlockBufferCopyDataBytes", [this](CpuState& s, GuestMemory& m) {
+        const auto value = state<BlockBuffer>(s.x[0], "CMBlockBuffer");
+        if (!s.x[3] && s.x[2]) { s.x[0] = status(bb_bad_pointer); return; }
+        std::lock_guard lock(value->mutex);
+        if (s.x[1] > value->data_length || s.x[2] > value->data_length - s.x[1]) { s.x[0] = status(bb_bad_length); return; }
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(s.x[2]));
+        if (!bytes.empty()) {
+            transfer(m, *value, s.x[1], bytes, false);
+            m.write_bytes(s.x[3], bytes);
+        }
+        s.x[0] = 0;
+    });
+    // CMBlockBufferAccessDataBytes(buffer, offset, length, void *temporaryBlock, char **returnedPointer): the
+    // data itself when contiguous, else a copy in the caller's temporary block.
+    raw(core_media, "_CMBlockBufferAccessDataBytes", [this](CpuState& s, GuestMemory& m) {
+        const auto value = state<BlockBuffer>(s.x[0], "CMBlockBuffer");
+        if (!s.x[4]) { s.x[0] = status(bb_bad_pointer); return; }
+        std::lock_guard lock(value->mutex);
+        if (s.x[1] > value->data_length || s.x[2] > value->data_length - s.x[1]) { s.x[0] = status(bb_bad_length); return; }
+        const auto [segment, inner] = locate(*value, s.x[1]);
+        if (segment && s.x[2] <= segment->length - inner) {
+            m.write64(s.x[4], segment->memory + segment->offset + inner);
+        } else {
+            if (!s.x[3]) { s.x[0] = status(bb_bad_pointer); return; }
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(s.x[2]));
+            transfer(m, *value, s.x[1], bytes, false);
+            if (!bytes.empty()) m.write_bytes(s.x[3], bytes);
+            m.write64(s.x[4], s.x[3]);
+        }
+        s.x[0] = 0;
+    });
+    // CMBlockBufferFillDataBytes(char fillByte, buffer, offsetIntoDestination, dataLength)
+    raw(core_media, "_CMBlockBufferFillDataBytes", [this](CpuState& s, GuestMemory& m) {
+        const auto value = state<BlockBuffer>(s.x[1], "CMBlockBuffer");
+        std::lock_guard lock(value->mutex);
+        if (s.x[2] > value->data_length || s.x[3] > value->data_length - s.x[2]) { s.x[0] = status(bb_bad_length); return; }
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(s.x[3]), static_cast<std::uint8_t>(s.x[0]));
+        if (!bytes.empty()) transfer(m, *value, s.x[2], bytes, true);
         s.x[0] = 0;
     });
     // CMBlockBufferCreateContiguous(structureAllocator, sourceBuffer, blockAllocator, customBlockSource,
@@ -365,9 +584,8 @@ void CoreMedia::install_block_buffers() {
             if (offset > source->data_length) { s.x[0] = status(bb_bad_offset); return; }
             const auto length = s.x[5] ? s.x[5] : source->data_length - offset;
             if (length > source->data_length - offset) { s.x[0] = status(bb_bad_length); return; }
-            allocate_block(*source);
             bytes.resize(static_cast<std::size_t>(length));
-            if (length) m.read_bytes(source->memory + source->offset + offset, bytes);
+            if (length) transfer(m, *source, offset, bytes, false);
         }
         const auto memory = bytes.empty() ? 0 : malloc(bytes.size());
         if (!bytes.empty()) m.write_bytes(memory, bytes);
@@ -439,10 +657,71 @@ void CoreMedia::install_format_descriptions() {
         m.write64(s.x[5], make(format_class, value));
         s.x[0] = 0;
     });
-    // No image buffer can exist.
-    raw(core_media, "_CMVideoFormatDescriptionCreateForImageBuffer", [](CpuState& s, GuestMemory& m) {
+    // CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator, count, sets, sizes, NALUnitHeaderLength,
+    //     extensions, CMFormatDescriptionRef *out): the size from the SPS (NAL type 33) among the sets.
+    raw(core_media, "_CMVideoFormatDescriptionCreateFromHEVCParameterSets", [this](CpuState& s, GuestMemory& m) {
+        const auto count = s.x[1];
+        const auto header = static_cast<std::int32_t>(s.x[4]);
+        if (s.x[6]) m.write64(s.x[6], 0);
+        if (!s.x[6] || count < 1 || count > 64 || !s.x[2] || !s.x[3] || (header != 1 && header != 2 && header != 4)) {
+            s.x[0] = status(fd_invalid_parameter);
+            return;
+        }
+        auto value = std::make_shared<FormatDescription>();
+        value->media_type = fourcc("vide");
+        value->subtype = fourcc("hvc1");
+        value->nal_header_length = header;
+        std::optional<std::pair<std::int32_t, std::int32_t>> dimensions;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const auto pointer = m.read64(s.x[2] + i * 8), size = m.read64(s.x[3] + i * 8);
+            if (!pointer || !size || size > (1 << 16)) { s.x[0] = status(fd_invalid_parameter); return; }
+            std::vector<std::uint8_t> set(static_cast<std::size_t>(size));
+            m.read_bytes(pointer, set);
+            if (!dimensions) dimensions = hevc_sps_dimensions(set);
+            value->parameter_sets.push_back(std::move(set));
+        }
+        if (!dimensions) { s.x[0] = status(fd_invalid_parameter); return; }
+        value->width = dimensions->first;
+        value->height = dimensions->second;
+        value->extensions = s.x[5] ? retain(s.x[5]) : 0;
+        for (const auto& set : value->parameter_sets) {
+            const auto copy = malloc(set.size());
+            m.write_bytes(copy, set);
+            value->parameter_set_copies.push_back(copy);
+        }
+        m.write64(s.x[6], make(format_class, value));
+        s.x[0] = 0;
+    });
+    // CMVideoFormatDescriptionCreateForImageBuffer(allocator, CVImageBufferRef, CMFormatDescriptionRef *out):
+    // the buffer's pixel format and size.
+    raw(core_media, "_CMVideoFormatDescriptionCreateForImageBuffer", [this](CpuState& s, GuestMemory& m) {
         if (s.x[2]) m.write64(s.x[2], 0);
-        s.x[0] = status(fd_invalid_parameter);
+        if (!s.x[1] || !s.x[2] || call(core_foundation, "_CFGetTypeID", {s.x[1]}) != call(core_video, "_CVPixelBufferGetTypeID", {})) {
+            s.x[0] = status(fd_invalid_parameter);
+            return;
+        }
+        auto value = std::make_shared<FormatDescription>();
+        value->media_type = fourcc("vide");
+        value->subtype = static_cast<std::uint32_t>(call(core_video, "_CVPixelBufferGetPixelFormatType", {s.x[1]}));
+        value->width = static_cast<std::int32_t>(call(core_video, "_CVPixelBufferGetWidth", {s.x[1]}));
+        value->height = static_cast<std::int32_t>(call(core_video, "_CVPixelBufferGetHeight", {s.x[1]}));
+        m.write64(s.x[2], make(format_class, value));
+        s.x[0] = 0;
+    });
+    // CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(desc, index, const uint8_t **set, size_t *size,
+    //     size_t *count, int *NALUnitHeaderLength)
+    raw(core_media, "_CMVideoFormatDescriptionGetHEVCParameterSetAtIndex", [this](CpuState& s, GuestMemory& m) {
+        const auto value = state<FormatDescription>(s.x[0], "CMFormatDescription");
+        if (value->parameter_sets.empty() || value->subtype != fourcc("hvc1")) { s.x[0] = status(fd_invalid_parameter); return; }
+        if (s.x[4]) m.write64(s.x[4], value->parameter_sets.size());
+        if (s.x[5]) m.write32(s.x[5], static_cast<std::uint32_t>(value->nal_header_length));
+        if (s.x[2] || s.x[3]) {
+            if (s.x[1] >= value->parameter_sets.size()) { s.x[0] = status(fd_invalid_parameter); return; }
+            const auto index = static_cast<std::size_t>(s.x[1]);
+            if (s.x[2]) m.write64(s.x[2], value->parameter_set_copies[index]);
+            if (s.x[3]) m.write64(s.x[3], value->parameter_sets[index].size());
+        }
+        s.x[0] = 0;
     });
     raw(core_media, "_CMFormatDescriptionGetExtension", [this](CpuState& s, GuestMemory&) {
         const auto value = state<FormatDescription>(s.x[0], "CMFormatDescription");
@@ -521,10 +800,25 @@ void CoreMedia::install_sample_buffers() {
         s.x[0] = status(create(m, s.x[1], s.x[2], static_cast<std::int64_t>(s.x[3]), s.x[4], s.x[5], s.x[6], s.x[7], m.read64(s.sp)));
     });
     // CMSampleBufferCreateForImageBuffer(allocator, imageBuffer, dataReady, callback, refcon, formatDescription,
-    //     sampleTiming, sampleBufferOut): no image buffer can exist.
-    raw(core_media, "_CMSampleBufferCreateForImageBuffer", [](CpuState& s, GuestMemory& m) {
-        if (s.x[7]) m.write64(s.x[7], 0);
-        s.x[0] = status(sb_required_parameter_missing);
+    //     const CMSampleTimingInfo *sampleTiming, CMSampleBufferRef *out): one sample, the image buffer.
+    const auto for_image = [this, create](GuestMemory& m, Address image, Address format, Address timing, Address out) -> std::int32_t {
+        if (!image || !format || !timing) {
+            if (out) m.write64(out, 0);
+            return sb_required_parameter_missing;
+        }
+        const auto result = create(m, 0, format, 1, 1, timing, 0, 0, out);
+        if (result) return result;
+        const auto value = state<SampleBuffer>(m.read64(out), "CMSampleBuffer");
+        std::lock_guard lock(value->mutex);
+        value->image = retain(image);
+        return 0;
+    };
+    raw(core_media, "_CMSampleBufferCreateForImageBuffer", [for_image](CpuState& s, GuestMemory& m) {
+        s.x[0] = status(for_image(m, s.x[1], s.x[5], s.x[6], s.x[7]));
+    });
+    // CMSampleBufferCreateReadyWithImageBuffer(allocator, imageBuffer, formatDescription, sampleTiming, out)
+    raw(core_media, "_CMSampleBufferCreateReadyWithImageBuffer", [for_image](CpuState& s, GuestMemory& m) {
+        s.x[0] = status(for_image(m, s.x[1], s.x[2], s.x[3], s.x[4]));
     });
     raw(core_media, "_CMSampleBufferGetDataBuffer", [this](CpuState& s, GuestMemory&) { s.x[0] = state<SampleBuffer>(s.x[0], "CMSampleBuffer")->data; });
     raw(core_media, "_CMSampleBufferGetFormatDescription", [this](CpuState& s, GuestMemory&) { s.x[0] = state<SampleBuffer>(s.x[0], "CMSampleBuffer")->format; });
@@ -724,13 +1018,9 @@ std::int32_t CoreMedia::subdivide(Address buffer, std::int64_t index, Address& o
             release(single->format);
             return -12742;   // kCMSampleBufferError_InvalidSampleData
         }
-        allocate_block(*source);
         auto part = std::make_shared<BlockBuffer>();
-        part->memory = source->memory;
-        part->offset = source->offset + offset;
-        part->block_length = source->block_length;
+        part->segments = reference(*source, data_buffer, offset, size);
         part->data_length = size;
-        part->parent = retain(data_buffer);
         single->data = make(block_class, part);
     }
     out = make(sample_class, single);
@@ -802,14 +1092,31 @@ void CoreMedia::install_sample_buffer_access() {
         if (!block_out) { s.x[0] = status(sb_required_parameter_missing); return; }
         if (s.x[3] < needed) { s.x[0] = status(-12737); return; }  // kCMSampleBufferError_ArrayTooSmall
         if (!data_buffer) { s.x[0] = status(-12733); return; }     // kCMSampleBufferError_BufferNotReady (no data)
-        const auto block = state<BlockBuffer>(data_buffer, "CMBlockBuffer");
+        auto block = state<BlockBuffer>(data_buffer, "CMBlockBuffer");
         Address base{};
         std::uint64_t length{};
+        bool contiguous{};
         {
             std::lock_guard lock(block->mutex);
-            allocate_block(*block);
-            base = block->memory + block->offset;
             length = block->data_length;
+            const auto [segment, inner] = locate(*block, 0);
+            contiguous = !length || (segment && segment->length - inner >= length);
+            if (segment) base = segment->memory + segment->offset + inner;
+        }
+        if (!contiguous) {
+            // The audio buffer list points into one block: a contiguous copy of the data.
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
+            {
+                std::lock_guard lock(block->mutex);
+                transfer(m, *block, 0, bytes, false);
+            }
+            const auto memory = malloc(bytes.size());
+            m.write_bytes(memory, bytes);
+            std::int32_t error{};
+            data_buffer = create_block(memory, bytes.size(), 0, 0, bytes.size(), 0, error);
+            if (!data_buffer) { free(memory); s.x[0] = status(error); return; }
+            base = memory;
+            m.write64(block_out, data_buffer);   // the caller's reference (+1, created)
         }
         if (length % buffers) { s.x[0] = status(-12742); return; }   // kCMSampleBufferError_InvalidSampleData
         m.write32(s.x[2], buffers);
@@ -821,7 +1128,7 @@ void CoreMedia::install_sample_buffer_access() {
             m.write32(entry + 4, static_cast<std::uint32_t>(each));
             m.write64(entry + 8, base + each * i);
         }
-        m.write64(block_out, retain(data_buffer));
+        if (contiguous) m.write64(block_out, retain(data_buffer));
         s.x[0] = 0;
     });
 }
