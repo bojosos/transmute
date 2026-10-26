@@ -113,6 +113,25 @@ function(alchemy_darwin_foundation_tests)
     add_dependencies(alchemy_gui_foundation_data_fixtures alchemy_gui_link_stubs)
     alchemy_gui_add_fixture_test(alchemy_gui_foundation_archive_fixture "${macos_dir}/qlab_archive_fixture"
         PROGRESS "Alchemy keyed archive fixture: launched" COMPLETE "Alchemy keyed archive fixture: complete")
+    # Foundation's exceptions and forwarding (exceptions.cpp, invocation.cpp): @catch of -raise and
+    # +raise:format:, and -forwardInvocation:. Throwing unwinds through the guest LLVM libc++abi and
+    # libunwind, which only a --runtime-dir supplies, so the fixture links them and runs with it; the
+    # runtime and class symbols the link stubs lack resolve by flat lookup.
+    if(EXISTS "${ALCHEMY_LLVM_RUNTIME_DIR}/libc++abi.dylib" AND EXISTS "${ALCHEMY_LLVM_RUNTIME_DIR}/libunwind.dylib")
+        alchemy_gui_object(foundation_exceptions_fixture ../../../src/alchemy/darwin/foundation/tests/exceptions_fixture.m
+            -fobjc-exceptions -fexceptions)
+        add_custom_command(OUTPUT "${macos_dir}/foundation_exceptions_fixture"
+            COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main -undefined dynamic_lookup -rpath @loader_path "-L${ALCHEMY_LLVM_RUNTIME_DIR}"
+                "${macos_dir}/foundation_exceptions_fixture.o" "${ALCHEMY_LLVM_RUNTIME_DIR}/libc++abi.dylib"
+                "${ALCHEMY_LLVM_RUNTIME_DIR}/libunwind.dylib" ${ALCHEMY_GUI_LINK_STUBS} -o "${macos_dir}/foundation_exceptions_fixture"
+            DEPENDS "${macos_dir}/foundation_exceptions_fixture.o" ${ALCHEMY_GUI_LINK_STUBS} VERBATIM)
+        add_custom_target(alchemy_gui_foundation_exceptions_fixtures ALL DEPENDS "${macos_dir}/foundation_exceptions_fixture")
+        add_dependencies(alchemy_gui_foundation_exceptions_fixtures alchemy_gui_link_stubs)
+        add_test(NAME alchemy_gui_foundation_exceptions_fixture
+            COMMAND alchemy-fx --runtime-dir "${ALCHEMY_LLVM_RUNTIME_DIR}" "${macos_dir}/foundation_exceptions_fixture")
+        set_tests_properties(alchemy_gui_foundation_exceptions_fixture PROPERTIES TIMEOUT 120
+            PASS_REGULAR_EXPRESSION "Alchemy Foundation exceptions fixture: 111 1")
+    endif()
 endfunction()
 alchemy_gui_register_tests(alchemy_darwin_foundation_tests)
 

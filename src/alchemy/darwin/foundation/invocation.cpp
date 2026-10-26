@@ -18,6 +18,16 @@
 // -retainArguments retains object arguments, copies blocks and C strings, and
 // keeps them until the invocation is deallocated or they are replaced.
 // Unsupported type encodings (bitfields, vectors) fail explicitly.
+//
+// Message forwarding: Foundation's forward handler (objc_setForwardHandler)
+// receives a message no method answers, after +resolveInstanceMethod: and
+// -forwardingTargetForSelector: declined. With a signature from
+// -methodSignatureForSelector: the message becomes an NSInvocation for
+// -forwardInvocation: (whose return value becomes the message's result);
+// without one, -doesNotRecognizeSelector:. NSObject's -forwardInvocation:
+// sends -doesNotRecognizeSelector:. An exception raised inside a guest
+// -forwardInvocation: cannot unwind through the handler's host frame and
+// stops as uncaught.
 namespace alchemy::gui::completion_kit {
 namespace {
 
@@ -247,6 +257,43 @@ struct Invocations {
         retain_all(*state, keep_target);
         return object;
     }
+
+    // The invocation's return value in the registers of the message being answered
+    // (a large result through the caller's x8, which the dispatcher leaves untouched).
+    void deliver(Address invocation, CpuState& s) {
+        const auto state = invocation_of(invocation);
+        std::lock_guard lock(state->mutex);
+        const auto& type = state->layout->signature.result;
+        const auto& out = state->result;
+        if (type.kind == inv::Kind::void_type) return;
+        if (state->layout->layout.indirect_result) { support.memory().write_bytes(s.x[8], out); return; }
+        if (type.kind == inv::Kind::integer) { s.x[0] = extend(type, load(out, 0, type.size)); return; }
+        if (type.kind == inv::Kind::floating) { s.v[0] = {load(out, 0, type.size), 0}; return; }
+        if (type.hfa_count) {
+            for (unsigned member = 0; member < type.hfa_count && member < 4; ++member) s.v[member] = {load(out, member * type.hfa_member, type.hfa_member), 0};
+            return;
+        }
+        s.x[0] = load(out, 0, 8);
+        s.x[1] = load(out, 8, 8);
+    }
+
+    // The forward handler: the original message registers in, the message's result out.
+    void forward(CpuState& s) {
+        const auto receiver = s.x[0], selector = s.x[1];
+        CallRegs query;
+        query.x[2] = selector;
+        const auto signature = support.objc.send(receiver, "methodSignatureForSelector:", query).x0;
+        if (!signature) {
+            static_cast<void>(support.objc.send(receiver, "doesNotRecognizeSelector:", query));
+            return;
+        }
+        const auto invocation = capture(signature, receiver, selector, s, true);
+        CallRegs forwarded;
+        forwarded.x[2] = invocation;
+        static_cast<void>(support.objc.send(receiver, "forwardInvocation:", forwarded));
+        deliver(invocation, s);
+        support.release(invocation);
+    }
 };
 
 std::shared_ptr<Invocations> invocations;
@@ -325,6 +372,18 @@ void install_invocations(Support& support) {
     support.method(root, "instanceMethodSignatureForSelector:", [self](CpuState& s, GuestMemory&) {
         s.x[0] = self->signature_for(s.x[0], s.x[2]);
     }, "@@::", true);
+
+    // ---- forwarding ----
+    for (const bool class_method : {false, true}) {
+        support.method(root, "forwardInvocation:", [self](CpuState& s, GuestMemory&) {
+            CallRegs query;
+            query.x[2] = s.x[2] ? self->support.send_id(s.x[2], "selector") : 0;
+            static_cast<void>(self->support.objc.send(s.x[0], "doesNotRecognizeSelector:", query));
+        }, "v@:@", class_method);
+    }
+    support.function(foundation_library, "__alchemy_foundation_forward", [self](CpuState& s, GuestMemory&) { self->forward(s); });
+    if (const auto handler = support.process.resolve(foundation_library, "__alchemy_foundation_forward"))
+        static_cast<void>(support.call(libobjc, "_objc_setForwardHandler", {handler->address, handler->address}));
 
     // ---- NSInvocation ----
     support.method(cls, "invocationWithMethodSignature:", [self](CpuState& s, GuestMemory&) {

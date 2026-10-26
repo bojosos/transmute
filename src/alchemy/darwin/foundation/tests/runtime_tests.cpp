@@ -248,13 +248,39 @@ void test_exceptions(Fixture& f) {
     require(f.text(f.send(exception, "name")) == "NSRangeException" && f.text(f.send(exception, "reason")) == "index 3 beyond bounds",
             "name and reason");
     require(f.send(exception, "callStackSymbols") == 0, "no call stack before raising");
+    // -raise throws (ObjcRuntime::throw_exception); raised from a host send, nothing can catch it,
+    // so it stops as uncaught with the name and reason.
     const auto message = failure_of([&] { f.send(exception, "raise"); });
-    require(message.find("NSRangeException: index 3 beyond bounds") != std::string::npos && message.starts_with("unsupported:"),
-            "-raise fails explicitly with the name and reason: " + message);
+    require(message.find("NSRangeException") != std::string::npos && message.find("index 3 beyond bounds") != std::string::npos,
+            "-raise from host code stops as uncaught with the name and reason: " + message);
     const auto constant = f.process.resolve(alchemy::core_foundation_library, "_NSInternalInconsistencyException");
     require(constant && f.text(f.engine.read64(constant->address)) == "NSInternalInconsistencyException", "exception name export");
     const auto ehtype = f.process.resolve(alchemy::core_foundation_library, "_OBJC_EHTYPE_$_NSException");
     require(ehtype && f.engine.read64(ehtype->address + 16) == f.cls("NSException"), "OBJC_EHTYPE_$_NSException names the class");
+}
+
+// Foundation's forward handler: an unanswered message becomes an NSInvocation for
+// -forwardInvocation: when -methodSignatureForSelector: names a signature.
+void test_forwarding(Fixture& f) {
+    const auto cls = f.objc.register_native_class("FWForwarder", f.cls("NSObject"), 16);
+    const auto doubled = f.objc.selector("doubled:");
+    f.support->method(cls, "methodSignatureForSelector:", [&f, doubled](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[2] == doubled ? f.send(f.cls("NSMethodSignature"), "signatureWithObjCTypes:", {f.c_string("q@:q")}) : 0;
+    }, "@@::");
+    f.support->method(cls, "forwardInvocation:", [&f](CpuState& s, GuestMemory&) {
+        const auto buffer = f.process.allocate_guest(8);
+        f.send(s.x[2], "getArgument:atIndex:", {buffer, 2});
+        f.engine.write64(buffer, f.engine.read64(buffer) * 2);
+        f.send(s.x[2], "setReturnValue:", {buffer});
+        f.process.release_guest(buffer);
+    }, "v@:@");
+    const auto forwarder = f.send(f.send(cls, "alloc"), "init");
+    require(f.send(forwarder, "doubled:", {21}) == 42, "a forwarded message returns -forwardInvocation:'s value");
+    const auto message = failure_of([&] { f.send(forwarder, "unanswered"); });
+    require(message.find("doesNotRecognizeSelector") != std::string::npos, "no signature: -doesNotRecognizeSelector: " + message);
+    const auto plain = f.send(f.send(f.cls("NSObject"), "alloc"), "init");
+    const auto default_message = failure_of([&] { f.send(plain, "unanswered"); });
+    require(default_message.find("unanswered") != std::string::npos, "NSObject: the message stops naming the selector " + default_message);
 }
 
 struct Recorder {
@@ -824,6 +850,7 @@ int main() {
         const auto target_class = make_target_class(fixture, recorder);
         test_exceptions(fixture);
         test_invocations(fixture, target_class, recorder);
+        test_forwarding(fixture);
         test_undo_manager(fixture, target_class, recorder);
         test_key_value_observing(fixture);
         test_notification_queue(fixture);

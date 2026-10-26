@@ -5,14 +5,14 @@
 
 // NSException (CoreFoundation) and the exception name constants.
 //
-// Exceptions are value objects here: name, reason, user info. Objective-C
-// exceptions cannot unwind guest frames under Alchemy, so -raise,
-// +raise:format: and +raise:format:arguments: stop the program with the
-// exception's name and reason (the error is the explicit unsupported failure;
-// @throw does the same through objc_exception_throw). Code that only creates,
-// inspects or logs exceptions works. -callStackReturnAddresses and
-// -callStackSymbols are nil until an exception is raised (as on macOS), which
-// never completes here.
+// Exceptions are value objects: name, reason, user info. -raise,
+// +raise:format: and +raise:format:arguments: throw the exception as
+// objc_exception_throw does (ObjcRuntime::throw_exception: the guest's
+// libc++abi unwinds to the matching @catch; an exception nothing catches
+// reaches objc_setUncaughtExceptionHandler's handler and stops with its name
+// and reason). Raised from a method host code invoked, an exception cannot
+// unwind the host frame and stops as uncaught. -callStackReturnAddresses and
+// -callStackSymbols are nil: the raise point's stack is not recorded.
 //
 // Exports: NSGenericException, NSRangeException, NSInvalidArgumentException,
 // NSInternalInconsistencyException, NSMallocException, NSObjectInaccessibleException,
@@ -91,7 +91,7 @@ void install_exceptions(Support& support) {
     support.method(cls, "name", [field](CpuState& s, GuestMemory&) { s.x[0] = field(s.x[0], &ExceptionState::name); }, "@@:");
     support.method(cls, "reason", [field](CpuState& s, GuestMemory&) { s.x[0] = field(s.x[0], &ExceptionState::reason); }, "@@:");
     support.method(cls, "userInfo", [field](CpuState& s, GuestMemory&) { s.x[0] = field(s.x[0], &ExceptionState::user_info); }, "@@:");
-    // Recorded when an exception is raised; raising never completes here.
+    // Not recorded (see the top of this file).
     support.method(cls, "callStackReturnAddresses", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:");
     support.method(cls, "callStackSymbols", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:");
     support.method(cls, "description", [&support, field](CpuState& s, GuestMemory&) {
@@ -99,27 +99,21 @@ void install_exceptions(Support& support) {
         s.x[0] = reason ? reason : string(support, "");
     }, "@@:");
     support.method(cls, "copyWithZone:", [&support](CpuState& s, GuestMemory&) { s.x[0] = support.retain(s.x[0]); }, "@@:^v");
-    const auto raised = [&support, field](Address object) {
-        const auto name = text(support, field(object, &ExceptionState::name));
-        const auto reason = text(support, field(object, &ExceptionState::reason));
-        unsupported("Objective-C exceptions are unsupported (unwinding is not implemented); raised: " + (name.empty() ? std::string("NSException") : name) +
-                    (reason.empty() ? std::string{} : ": " + reason));
-    };
-    support.method(cls, "raise", [raised](CpuState& s, GuestMemory&) { raised(s.x[0]); }, "v@:");
+    // The handler returns right after throw_exception; the guest then throws.
+    support.method(cls, "raise", [&support](CpuState& s, GuestMemory&) { support.objc.throw_exception(s, s.x[0]); }, "v@:");
     // +raise:format:, ...: the reason is formatted like +[NSString stringWithFormat:].
-    const auto raise_formatted = [&support, raised](Address receiver, Address name, Address format, Address arguments) {
+    const auto raise_formatted = [&support](CpuState& s, Address name, Address format, Address arguments) {
         const auto string_class = class_named(support, "NSString");
         const auto reason = support.send_id(support.send_id(string_class, "alloc"), "initWithFormat:arguments:", {format, arguments});
-        const auto exception = support.send_id(support.send_id(receiver, "alloc"), "initWithName:reason:userInfo:", {name, reason, 0});
+        const auto exception = support.send_id(support.send_id(s.x[0], "alloc"), "initWithName:reason:userInfo:", {name, reason, 0});
         support.release(reason);
-        static_cast<void>(autoreleased(support, exception));
-        raised(exception);
+        support.objc.throw_exception(s, autoreleased(support, exception));
     };
     support.method(cls, "raise:format:", [raise_formatted](CpuState& s, GuestMemory&) {
-        raise_formatted(s.x[0], s.x[2], s.x[3], s.sp);   // variadic arguments start at the stack pointer
+        raise_formatted(s, s.x[2], s.x[3], s.sp);   // variadic arguments start at the stack pointer
     }, "v@:@@", true);
     support.method(cls, "raise:format:arguments:", [raise_formatted](CpuState& s, GuestMemory&) {
-        raise_formatted(s.x[0], s.x[2], s.x[3], s.x[4]);
+        raise_formatted(s, s.x[2], s.x[3], s.x[4]);
     }, "v@:@@*", true);
 
     for (const auto* name : {"NSGenericException", "NSRangeException", "NSInvalidArgumentException", "NSInternalInconsistencyException",
