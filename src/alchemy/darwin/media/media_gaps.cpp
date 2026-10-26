@@ -1,6 +1,8 @@
 #include "alchemy/gui/value_provider.hpp"
 
 #include <array>
+#include <atomic>
+#include <cctype>
 #include <limits>
 
 // Media and graphics gaps of Chrome's framework:
@@ -10,14 +12,17 @@
 // - CoreVideo: buffer attachments are real over the media provider's
 //   CVBufferGetAttachment; pixel-format descriptions are real for the common
 //   formats; no compressed pixel format is available.
-// - CoreMedia: host-time conversion is real; CMSetAttachment is real for
-//   CVBuffers (multi-block CMBlockBuffers and HEVC parameter sets are
-//   coremedia.cpp's).
-// - AVFoundation: the capture-photo and sample-buffer renderer classes exist
-//   as plain classes (no device or renderer can be created).
-// - CoreAudio: aggregate devices cannot be created
-//   (kAudioHardwareUnsupportedOperationError); CATapDescription is a plain
-//   class. AudioToolbox: audio files cannot be written through callbacks.
+// - CoreMedia: host-time conversion is real (the CMAttachmentBearer calls,
+//   multi-block CMBlockBuffers and HEVC parameter sets are coremedia.cpp's).
+// - AVFoundation: AVCapturePhotoSettings is a real value class; an
+//   AVCapturePhotoOutput is never connected to a device (no capture device
+//   exists), so it offers no codec or pixel format and capturing raises, as
+//   documented for an output with no active video connection. (The
+//   sample-buffer renderers are av_sample_buffer.cpp's.)
+// - CoreAudio: aggregate devices and process taps cannot be created and
+//   devices cannot be ducked (kAudioHardwareUnsupportedOperationError);
+//   CATapDescription is a real value class. AudioToolbox: audio files cannot
+//   be written through callbacks.
 // - CoreMIDI 2.0 event lists are real; there are no MIDI endpoints, so input
 //   ports bind to the provider's block-based ports (which never receive) and
 //   sending fails with kMIDIObjectNotFound.
@@ -51,6 +56,7 @@ using fill::video_toolbox;
 constexpr std::int32_t fd_invalid_parameter = -12710;
 constexpr std::int32_t audio_unsupported_operation = static_cast<std::int32_t>(fourcc("unop"));
 constexpr std::int32_t audio_bad_device = static_cast<std::int32_t>(fourcc("!dev"));
+constexpr std::int32_t audio_bad_object = static_cast<std::int32_t>(fourcc("!obj"));
 constexpr std::int32_t cg_invalid_connection = 1002;
 
 struct PixelFormat {
@@ -78,6 +84,118 @@ constexpr std::array<PixelFormat, 11> pixel_formats{{
 
 struct Region final : ObjectPayload { std::array<double, 4> rect{}; };
 
+// BOOL properties declared with an is- getter (`getter=isName`): -isName, -setName:.
+void boolean_properties(Provider& p, Address target, std::initializer_list<std::pair<std::string_view, std::string_view>> names) {
+    for (const auto& [getter, property] : names) {
+        const std::string key(property);
+        auto setter = "set" + key + ":";
+        setter[3] = static_cast<char>(std::toupper(static_cast<unsigned char>(setter[3])));
+        p.method(target, getter, [&p, key](CpuState& s, GuestMemory&) { s.x[0] = p.stored_integer(s.x[0], key) != 0; }, false, "B@:");
+        p.method(target, setter, [&p, key](CpuState& s, GuestMemory&) { p.store_integer(s.x[0], key, (s.x[2] & 0xff) != 0); }, false, "v@:B");
+    }
+}
+
+// CATapDescription: which processes a process tap would capture, and how. Every initializer
+// gives the description a new UUID; no tap can be created from one (see
+// AudioHardwareCreateProcessTap).
+void install_tap_description(Provider& p) {
+    const auto tap = p.cls(core_audio, "CATapDescription", "NSObject");
+    p.object_properties(tap, {"name", "UUID", "processes", "deviceUID", "stream"});
+    p.integer_properties(tap, {"muteBehavior"});   // CATapMuteBehavior, CATapUnmuted (0) by default
+    boolean_properties(p, tap, {{"isPrivate", "privateTap"}, {"isMixdown", "mixdown"}, {"isMono", "mono"}, {"isExclusive", "exclusive"}});
+    p.method(tap, "init", [&p, tap](CpuState& s, GuestMemory&) {
+        const auto self = p.objc.send_super(s.x[0], tap, p.objc.selector("init")).x0;
+        if (self) {
+            const auto uuid = p.create(p.objc.find_class("NSUUID"));
+            p.store(self, "UUID", uuid);
+            p.release(uuid);
+        }
+        s.x[0] = self;
+    });
+    struct Shape { const char* selector; bool mono, mixdown, exclusive, device; };
+    for (const auto& shape : std::array<Shape, 6>{{
+             {"initStereoMixdownOfProcesses:", false, true, false, false},
+             {"initStereoGlobalTapButExcludeProcesses:", false, true, true, false},
+             {"initMonoMixdownOfProcesses:", true, true, false, false},
+             {"initMonoGlobalTapButExcludeProcesses:", true, true, true, false},
+             {"initWithProcesses:andDeviceUID:withStream:", false, false, false, true},
+             {"initExcludingProcesses:andDeviceUID:withStream:", false, false, true, true},
+         }}) {
+        p.method(tap, shape.selector, [&p, shape](CpuState& s, GuestMemory&) {
+            const auto self = p.objc.send(s.x[0], p.objc.selector("init")).x0;
+            if (self) {
+                p.store(self, "processes", s.x[2]);
+                p.store_integer(self, "mono", shape.mono);
+                p.store_integer(self, "mixdown", shape.mixdown);
+                p.store_integer(self, "exclusive", shape.exclusive);
+                if (shape.device) {
+                    // (NSArray *processes, NSString *deviceUID, NSInteger stream); the property is an NSNumber.
+                    p.store(self, "deviceUID", s.x[3]);
+                    const auto stream = p.cf.integer(static_cast<std::int64_t>(s.x[4]), 9);
+                    p.store(self, "stream", stream);
+                    p.release(stream);
+                }
+            }
+            s.x[0] = self;
+        }, false, shape.device ? "@@:@@q" : "@@:@");
+    }
+}
+
+// AVCapturePhotoSettings (a value class with a unique ID per instance) and AVCapturePhotoOutput,
+// which is never connected to a capture device.
+void install_capture_photo(Provider& p) {
+    const auto settings = p.cls(av_foundation, "AVCapturePhotoSettings", "NSObject");
+    p.integer_properties(settings, {"uniqueID", "flashMode", "photoQualityPrioritization", "rawPhotoPixelFormatType"});
+    p.object_properties(settings, {"format", "processedFileType", "previewPhotoFormat", "embeddedThumbnailPhotoFormat"});
+    boolean_properties(p, settings, {{"isHighResolutionPhotoEnabled", "highResolutionPhotoEnabled"},
+                                     {"isDepthDataDeliveryEnabled", "depthDataDeliveryEnabled"}});
+    constexpr std::int64_t quality_balanced = 2;   // AVCapturePhotoQualityPrioritizationBalanced
+    static std::atomic<std::int64_t> next_id{1};
+    p.method(settings, "init", [&p, settings](CpuState& s, GuestMemory&) {
+        const auto self = p.objc.send_super(s.x[0], settings, p.objc.selector("init")).x0;
+        if (self) {
+            p.store_integer(self, "uniqueID", next_id++);
+            p.store_integer(self, "photoQualityPrioritization", quality_balanced);
+        }
+        s.x[0] = self;
+    });
+    // +photoSettings, +photoSettingsWithFormat:(NSDictionary *), +photoSettingsFromPhotoSettings:
+    // (a copy with a new unique ID).
+    const auto made = [&p, settings](Address format) {
+        const auto value = p.create(settings);
+        if (format) p.store(value, "format", format);
+        return p.bridge->autorelease(value);
+    };
+    p.method(settings, "photoSettings", [made](CpuState& s, GuestMemory&) { s.x[0] = made(0); }, true);
+    p.method(settings, "photoSettingsWithFormat:", [made](CpuState& s, GuestMemory&) { s.x[0] = made(s.x[2]); }, true, "@@:@");
+    p.method(settings, "photoSettingsFromPhotoSettings:", [&p, made](CpuState& s, GuestMemory&) {
+        const auto source = s.x[2];
+        const auto value = made(source ? p.stored(source, "format") : 0);
+        if (source) {
+            for (const auto* key : {"flashMode", "photoQualityPrioritization", "rawPhotoPixelFormatType", "highResolutionPhotoEnabled", "depthDataDeliveryEnabled"})
+                p.store_integer(value, key, p.stored_integer(source, key));
+            for (const auto* key : {"processedFileType", "previewPhotoFormat", "embeddedThumbnailPhotoFormat"})
+                p.store(value, key, p.stored(source, key));
+        }
+        s.x[0] = value;
+    }, true, "@@:@");
+
+    if (!p.objc.find_class("AVCaptureOutput")) return;
+    const auto output = p.cls(av_foundation, "AVCapturePhotoOutput", "AVCaptureOutput");
+    // Formats are offered once an output is connected to a device's input; it never is.
+    for (const auto* name : {"availablePhotoCodecTypes", "availablePhotoPixelFormatTypes", "availablePhotoFileTypes",
+                             "availableRawPhotoPixelFormatTypes", "supportedFlashModes"})
+        p.method(output, name, [&p](CpuState& s, GuestMemory&) { s.x[0] = p.bridge->autorelease(p.cf.array({})); });
+    p.integer_properties(output, {"maxPhotoQualityPrioritization"});
+    boolean_properties(p, output, {{"isHighResolutionCaptureEnabled", "highResolutionCaptureEnabled"},
+                                   {"isLivePhotoCaptureSupported", "livePhotoCaptureSupported"},
+                                   {"isDepthDataDeliverySupported", "depthDataDeliverySupported"}});
+    p.method(output, "capturePhotoWithSettings:delegate:", [](CpuState&, GuestMemory&) {
+        throw std::runtime_error("Alchemy: NSInvalidArgumentException: -[AVCapturePhotoOutput capturePhotoWithSettings:delegate:] "
+                                 "needs an active and enabled video connection, and no capture device exists");
+    }, false, "v@:@@");
+}
+
 } // namespace
 
 void Provider::install_media() {
@@ -97,6 +215,11 @@ void Provider::install_media() {
         string(video_toolbox, std::string("_kVTProfileLevel_") + name, name);
     string(video_toolbox, "_kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder", "EnableHardwareAcceleratedVideoEncoder");
     string(video_toolbox, "_kVTVideoEncoderSpecification_EnableLowLatencyRateControl", "EnableLowLatencyRateControl");
+    // The encoder's per-frame quality metrics (CalculateMeanSquaredError); no encoder runs, so
+    // no sample carries them. (unverified: value = key name without its prefix)
+    string(video_toolbox, "_kVTSampleAttachmentKey_QualityMetrics", "QualityMetrics");
+    for (const auto* name : {"LumaMeanSquaredError", "ChromaBlueMeanSquaredError", "ChromaRedMeanSquaredError"})
+        string(video_toolbox, std::string("_kVTSampleAttachmentQualityMetricsKey_") + name, name);
 
     // ---------------------------------------------------------------- CoreVideo
     string(core_video, "_kCVImageBufferCleanApertureKey", "CVCleanAperture");
@@ -174,26 +297,24 @@ void Provider::install_media() {
         const long double nanoseconds = static_cast<long double>(value) * 1e9L / timescale;
         s.x[0] = static_cast<std::uint64_t>(nanoseconds * (denom ? denom : 1) / (numer ? numer : 1));
     });
-    // void CMSetAttachment(CMAttachmentBearerRef target, key, value, mode)
-    raw(core_media, "_CMSetAttachment", [this](CpuState& s, GuestMemory&) {
-        const auto pixel_buffer_type = call(core_video, "_CVPixelBufferGetTypeID", {});
-        if (s.x[0] && call(core_foundation, "_CFGetTypeID", {s.x[0]}) == pixel_buffer_type) {
-            static_cast<void>(call(core_video, "_CVBufferSetAttachment", {s.x[0], s.x[1], s.x[2], s.x[3]}));
-            return;
-        }
-        throw std::runtime_error("Alchemy: CMSetAttachment is unsupported for this attachment bearer (only CVBuffers)");
-    });
 
     // ---------------------------------------------------------------- AVFoundation
     string(av_foundation, "_AVVideoCodecKey", "AVVideoCodecKey");
     string(av_foundation, "_AVVideoCodecTypeJPEG", "jpeg");
-    if (objc.find_class("AVCaptureOutput")) static_cast<void>(cls(av_foundation, "AVCapturePhotoOutput", "AVCaptureOutput"));
-    static_cast<void>(cls(av_foundation, "AVCapturePhotoSettings", "NSObject"));   // the sample-buffer renderers are av_sample_buffer.cpp's
+    install_capture_photo(*this);
 
     // ---------------------------------------------------------------- CoreAudio, AudioToolbox
     failure(core_audio, "_AudioHardwareCreateAggregateDevice", audio_unsupported_operation);
     failure(core_audio, "_AudioHardwareDestroyAggregateDevice", audio_bad_device);
-    static_cast<void>(cls(core_audio, "CATapDescription", "NSObject"));
+    // OSStatus AudioDeviceDuck(AudioObjectID, Float32 duckedLevel, const AudioTimeStamp *startTime, Float32 rampDuration)
+    failure(core_audio, "_AudioDeviceDuck", audio_unsupported_operation);
+    // OSStatus AudioHardwareCreateProcessTap(CATapDescription *, AudioObjectID *outTapID): kAudioObjectUnknown.
+    raw(core_audio, "_AudioHardwareCreateProcessTap", [](CpuState& s, GuestMemory& m) {
+        if (s.x[1]) m.write32(s.x[1], 0);
+        s.x[0] = status(audio_unsupported_operation);
+    });
+    failure(core_audio, "_AudioHardwareDestroyProcessTap", audio_bad_object);   // no tap exists
+    install_tap_description(*this);
 
     // ---------------------------------------------------------------- GameController
     string(game_controller, "_GCControllerDidConnectNotification", "GCControllerDidConnectNotification");

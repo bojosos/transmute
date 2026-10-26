@@ -2,6 +2,7 @@
 
 #include "alchemy/darwin/media/cmtime.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
@@ -15,8 +16,9 @@
 // picture size read from the SPS, audio descriptions with their stream
 // description and channel layout), CMSampleBuffer (data buffer, format,
 // timing, sizes, per-sample attachment dictionaries, audio buffer lists,
-// per-sample iteration) and the documented constant keys. Image buffers (CVPixelBuffer) cannot exist under Alchemy, so
-// the image-buffer constructors report a missing required parameter.
+// per-sample iteration, image buffers), the CMAttachmentBearer calls (sample
+// buffers' buffer-level attachments here, CVBuffers' through CoreVideo) and the
+// documented constant keys.
 namespace alchemy::gui::fill {
 
 namespace {
@@ -182,6 +184,8 @@ struct SampleBuffer final : ObjectPayload {
     std::vector<std::uint8_t> timing;          // CMSampleTimingInfo entries (72 bytes each)
     std::vector<std::uint64_t> sizes;
     Address attachments{};                     // retained CFArray of mutable dictionaries
+    struct Attachment { Address key{}, value{}; std::uint32_t mode{}; };   // retained key and value
+    std::vector<Attachment> buffer_attachments;   // CMSetAttachment's (the CMAttachmentBearer calls)
 };
 
 class CoreMedia final : public Provider {
@@ -306,6 +310,7 @@ public:
     void install_keys();
     void install_audio_formats();
     void install_sample_buffer_access();
+    void install_attachments();
     std::int32_t subdivide(Address buffer, std::int64_t index, Address& out);
 };
 
@@ -769,6 +774,7 @@ void CoreMedia::install_sample_buffers() {
                 release(std::exchange(value->format, 0));
                 release(std::exchange(value->image, 0));
                 release(std::exchange(value->attachments, 0));
+                for (const auto& a : std::exchange(value->buffer_attachments, {})) { release(a.key); release(a.value); }
             }
             static_cast<void>(objc.send_super(s.x[0], sample_class, objc.selector("dealloc")));
         }, false, "v@:"));
@@ -843,9 +849,117 @@ void CoreMedia::install_sample_buffers() {
         }
         s.x[0] = value->attachments;
     });
-    // CMCopyDictionaryOfAttachments(allocator, target, mode): no buffer-level
-    // attachment can be set (CMSetAttachment is not provided), so there is none.
-    constant(core_media, "_CMCopyDictionaryOfAttachments", 0);
+}
+
+// The CMAttachmentBearer calls. A CMSampleBuffer keeps its buffer-level attachments here (the
+// per-sample ones are CMSampleBufferGetSampleAttachmentsArray's); a CVBuffer's are CoreVideo's,
+// reached through the CVBuffer calls with the same modes. Any other target stops the process.
+void CoreMedia::install_attachments() {
+    using Attachment = SampleBuffer::Attachment;
+    const auto sample = [this](Address target) { return objc.find_host_state<SampleBuffer>(target); };
+    const auto pixel_buffer = [this](Address target, const char* function) {
+        if (call(core_foundation, "_CFGetTypeID", {target}) == call(core_video, "_CVPixelBufferGetTypeID", {})) return true;
+        throw std::runtime_error(std::string("Alchemy: ") + function + ": the target is neither a CMSampleBuffer nor a CVBuffer");
+    };
+    // Removes the attachments `which` selects; releases them outside the lock.
+    const auto remove = [this](SampleBuffer& b, const auto& which) {
+        std::vector<Attachment> gone;
+        {
+            std::lock_guard lock(b.mutex);
+            const auto split = std::stable_partition(b.buffer_attachments.begin(), b.buffer_attachments.end(), [&](const Attachment& a) { return !which(a); });
+            gone.assign(split, b.buffer_attachments.end());
+            b.buffer_attachments.erase(split, b.buffer_attachments.end());
+        }
+        for (const auto& a : gone) { release(a.key); release(a.value); }
+    };
+    // void CMSetAttachment(target, key, value, attachmentMode)
+    const auto set = [this, sample, pixel_buffer](Address target, Address key, Address value, std::uint32_t mode) {
+        if (!target || !key) return;
+        const auto b = sample(target);
+        if (!b) {
+            if (pixel_buffer(target, "CMSetAttachment")) static_cast<void>(call(core_video, "_CVBufferSetAttachment", {target, key, value, mode}));
+            return;
+        }
+        const Attachment added{retain(key), retain(value), mode};
+        Attachment old{};
+        {
+            std::lock_guard lock(b->mutex);
+            const auto found = std::find_if(b->buffer_attachments.begin(), b->buffer_attachments.end(), [&](const Attachment& a) { return cf.equal(a.key, key); });
+            if (found != b->buffer_attachments.end()) old = std::exchange(*found, added);
+            else b->buffer_attachments.push_back(added);
+        }
+        release(old.key);
+        release(old.value);
+    };
+    raw(core_media, "_CMSetAttachment", [set](CpuState& s, GuestMemory&) {
+        set(s.x[0], s.x[1], s.x[2], static_cast<std::uint32_t>(s.x[3]));
+    });
+    // CFTypeRef CMGetAttachment(target, key, CMAttachmentMode *attachmentModeOut): +0, NULL when absent.
+    raw(core_media, "_CMGetAttachment", [this, sample, pixel_buffer](CpuState& s, GuestMemory& m) {
+        const auto target = s.x[0], key = s.x[1], mode_out = s.x[2];
+        s.x[0] = 0;
+        if (!target || !key) return;
+        const auto b = sample(target);
+        if (!b) {
+            if (pixel_buffer(target, "CMGetAttachment")) s.x[0] = call(core_video, "_CVBufferGetAttachment", {target, key, mode_out});
+            return;
+        }
+        std::lock_guard lock(b->mutex);
+        for (const auto& a : b->buffer_attachments)
+            if (cf.equal(a.key, key)) {
+                if (mode_out) m.write32(mode_out, a.mode);
+                s.x[0] = a.value;
+                return;
+            }
+    });
+    // void CMRemoveAttachment(target, key)
+    raw(core_media, "_CMRemoveAttachment", [this, sample, pixel_buffer, remove](CpuState& s, GuestMemory&) {
+        const auto target = s.x[0], key = s.x[1];
+        if (!target || !key) return;
+        if (const auto b = sample(target)) remove(*b, [&](const Attachment& a) { return cf.equal(a.key, key); });
+        else if (pixel_buffer(target, "CMRemoveAttachment")) static_cast<void>(call(core_video, "_CVBufferRemoveAttachment", {target, key}));
+    });
+    // void CMRemoveAllAttachments(target)
+    raw(core_media, "_CMRemoveAllAttachments", [this, sample, pixel_buffer, remove](CpuState& s, GuestMemory&) {
+        const auto target = s.x[0];
+        if (!target) return;
+        if (const auto b = sample(target)) remove(*b, [](const Attachment&) { return true; });
+        else if (pixel_buffer(target, "CMRemoveAllAttachments")) static_cast<void>(call(core_video, "_CVBufferRemoveAllAttachments", {target}));
+    });
+    // CFDictionaryRef CMCopyDictionaryOfAttachments(allocator, target, attachmentMode): +1, the
+    // attachments of that mode (an empty dictionary when there are none).
+    raw(core_media, "_CMCopyDictionaryOfAttachments", [this, sample, pixel_buffer](CpuState& s, GuestMemory&) {
+        const auto target = s.x[1];
+        const auto mode = static_cast<std::uint32_t>(s.x[2]);
+        s.x[0] = 0;
+        if (!target) return;
+        const auto b = sample(target);
+        if (!b) {
+            if (pixel_buffer(target, "CMCopyDictionaryOfAttachments")) s.x[0] = call(core_video, "_CVBufferCopyAttachments", {target, mode});
+            return;
+        }
+        std::vector<std::pair<Address, Address>> pairs;
+        {
+            std::lock_guard lock(b->mutex);
+            for (const auto& a : b->buffer_attachments)
+                if (a.mode == mode) pairs.emplace_back(a.key, a.value);
+        }
+        s.x[0] = cf.dictionary(pairs);
+    });
+    // void CMSetAttachments(target, CFDictionaryRef theAttachments, attachmentMode)
+    raw(core_media, "_CMSetAttachments", [this, set](CpuState& s, GuestMemory&) {
+        if (!s.x[0] || !s.x[1]) return;
+        for (const auto& [key, value] : cf.dictionary_entries(s.x[1])) set(s.x[0], key, value, static_cast<std::uint32_t>(s.x[2]));
+    });
+    // void CMPropagateAttachments(source, destination): the kCMAttachmentMode_ShouldPropagate ones.
+    raw(core_media, "_CMPropagateAttachments", [this, set](CpuState& s, GuestMemory&) {
+        const auto source = s.x[0], destination = s.x[1];
+        if (!source || !destination) return;
+        constexpr std::uint32_t should_propagate = 1;
+        const auto copied = call(core_media, "_CMCopyDictionaryOfAttachments", {0, source, should_propagate});
+        for (const auto& [key, value] : cf.dictionary_entries(copied)) set(destination, key, value, should_propagate);
+        release(copied);
+    });
 }
 
 void CoreMedia::install_keys() {
@@ -1142,6 +1256,7 @@ void CoreMedia::install() {
     install_keys();
     install_audio_formats();
     install_sample_buffer_access();
+    install_attachments();
 }
 
 } // namespace

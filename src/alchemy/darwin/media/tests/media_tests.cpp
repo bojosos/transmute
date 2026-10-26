@@ -7,7 +7,9 @@
 #include "alchemy/gui/tests/fill_fixture.hpp"
 #include "alchemy/darwin/media/media.hpp"
 
+#include <array>
 #include <cmath>
+#include <span>
 
 namespace {
 using namespace fill_test;
@@ -233,11 +235,69 @@ void accessibility(Fixture& f) {
     require(f.cls("ICCameraDevice") != 0, "ImageCaptureCore classes");
 }
 
+// The CMAttachmentBearer calls on a sample buffer and a CVPixelBuffer; the VideoToolbox
+// quality-metric keys; CoreAudio's ducking and process taps, which answer as unsupported;
+// CATapDescription and AVCapturePhotoSettings as value classes.
+void bearers_and_taps(Fixture& f) {
+    const auto sample_out = f.block(8);
+    alchemy::CallRegs make{};
+    make.push_stack(sample_out);
+    require(f.regs(cm, "_CMSampleBufferCreateReady", make).x0 == 0, "an empty sample buffer");
+    const auto sample = f.engine.read64(sample_out);
+    const auto key = f.cf.string("AlchemyKey"), other = f.cf.string("AlchemyOther");
+    const auto value = f.cf.string("value"), mode_out = f.block(4);
+    f.call(cm, "_CMSetAttachment", {sample, key, value, 1});
+    f.call(cm, "_CMSetAttachment", {sample, other, value, 0});
+    require(f.call(cm, "_CMGetAttachment", {sample, key, mode_out}) == value && f.engine.read32(mode_out) == 1, "CMGetAttachment and its mode");
+    require(f.cf.dictionary_entries(f.call(cm, "_CMCopyDictionaryOfAttachments", {0, sample, 1})).size() == 1 &&
+            f.cf.dictionary_entries(f.call(cm, "_CMCopyDictionaryOfAttachments", {0, sample, 0})).size() == 1, "one attachment of each mode");
+    // Only the propagating one reaches a pixel buffer, through CoreVideo.
+    const auto image_out = f.block(8);
+    require(f.status(cv, "_CVPixelBufferCreate", {0, 16, 16, fourcc("BGRA"), 0, image_out}) == 0, "a pixel buffer");
+    const auto image = f.engine.read64(image_out);
+    f.call(cm, "_CMPropagateAttachments", {sample, image});
+    require(f.call(cv, "_CVBufferGetAttachment", {image, key, 0}) == value && f.call(cm, "_CMGetAttachment", {image, other, 0}) == 0,
+            "CMPropagateAttachments copies the propagating attachments");
+    f.call(cm, "_CMRemoveAttachment", {image, key});
+    require(f.call(cm, "_CMGetAttachment", {image, key, 0}) == 0, "CMRemoveAttachment on a CVBuffer");
+    f.call(cm, "_CMRemoveAllAttachments", {sample});
+    require(f.cf.dictionary_entries(f.call(cm, "_CMCopyDictionaryOfAttachments", {0, sample, 1})).empty(), "CMRemoveAllAttachments");
+
+    require(f.string_constant(vt, "_kVTSampleAttachmentKey_QualityMetrics") == "QualityMetrics" &&
+            f.string_constant(vt, "_kVTSampleAttachmentQualityMetricsKey_LumaMeanSquaredError") == "LumaMeanSquaredError", "quality-metric keys");
+
+    const auto tap_id = f.block(4);
+    f.engine.write32(tap_id, 77);
+    require(static_cast<std::uint32_t>(f.status(ca, "_AudioDeviceDuck", {1})) == fourcc("unop"), "no ducking");
+    require(static_cast<std::uint32_t>(f.status(ca, "_AudioHardwareCreateProcessTap", {0, tap_id})) == fourcc("unop") && f.engine.read32(tap_id) == 0,
+            "no process tap");
+    require(static_cast<std::uint32_t>(f.status(ca, "_AudioHardwareDestroyProcessTap", {1})) == fourcc("!obj"), "no tap to destroy");
+    const std::array<std::uint64_t, 1> pids{f.cf.integer(42)};
+    const auto processes = f.cf.array(pids);
+    const auto tap = f.send(f.send(f.cls("CATapDescription"), "alloc"), "initMonoGlobalTapButExcludeProcesses:", {processes});
+    require(tap && f.send(tap, "processes") == processes && (f.send(tap, "isMono") & 0xff) && (f.send(tap, "isExclusive") & 0xff) &&
+            (f.send(tap, "isMixdown") & 0xff) && f.send(tap, "UUID") != 0, "a mono global tap description");
+    const auto device_tap = f.send(f.send(f.cls("CATapDescription"), "alloc"), "initWithProcesses:andDeviceUID:withStream:", {processes, f.cf.string("dev"), 2});
+    require(f.cf.number_value(f.send(device_tap, "stream")) == 2.0 && f.cf.utf8(f.send(device_tap, "deviceUID")) == "dev" &&
+            !(f.send(device_tap, "isMixdown") & 0xff) && f.send(device_tap, "UUID") != f.send(tap, "UUID"), "a device stream tap description");
+
+    const auto first = f.send(f.cls("AVCapturePhotoSettings"), "photoSettings");
+    const auto format = f.cf.dictionary(std::span<const std::pair<std::uint64_t, std::uint64_t>>{});
+    const auto second = f.send(f.cls("AVCapturePhotoSettings"), "photoSettingsWithFormat:", {format});
+    require(first && second && f.send(first, "uniqueID") != f.send(second, "uniqueID") && f.send(second, "format") == format &&
+            f.send(first, "photoQualityPrioritization") == 2, "photo settings");
+    const auto copy = f.send(f.cls("AVCapturePhotoSettings"), "photoSettingsFromPhotoSettings:", {second});
+    require(f.send(copy, "format") == format && f.send(copy, "uniqueID") != f.send(second, "uniqueID"), "photo settings copy");
+    if (const auto output_class = f.cls("AVCapturePhotoOutput"))
+        require(f.cf.length(f.send(f.send(f.send(output_class, "alloc"), "init"), "availablePhotoCodecTypes")) == 0, "an unconnected photo output");
+}
+
 } // namespace
 
 int main() {
     // The host's MIDI and audio devices stay out of these tests (deterministic lists).
     _putenv_s("ALCHEMY_MIDI_DEVICES", "none");
     _putenv_s("ALCHEMY_AUDIO_DEVICES", "none");
-    return run("media", {{"imports", imports}, {"core media", core_media}, {"video", video}, {"audio", audio}, {"accessibility", accessibility}});
+    return run("media", {{"imports", imports}, {"core media", core_media}, {"video", video}, {"audio", audio}, {"accessibility", accessibility},
+                         {"bearers and taps", bearers_and_taps}});
 }

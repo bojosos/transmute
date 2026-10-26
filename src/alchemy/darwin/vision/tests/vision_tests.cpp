@@ -1,5 +1,5 @@
-// Vision (src/alchemy/darwin/vision/): the identity, and the documented
-// "unavailable" answers.
+// Vision (src/alchemy/darwin/vision/): the identity, the documented
+// "unavailable" answers, and the requests as value objects.
 #include "alchemy/gui/tests/framework_case.hpp"
 
 namespace {
@@ -14,6 +14,9 @@ const Case vision_case("vision", [](Fixture& f) {
     const auto handler = f.send(f.send(f.cls("VNImageRequestHandler"), "alloc"), "initWithCGImage:options:", {0, 0});
     require(f.send(handler, "performRequests:error:", {f.cf.array({}), error}) == 0 && f.engine.read64(error), "Vision fails");
     require(f.string_constant(LIBRARY, "_VNErrorDomain") == "com.apple.Vision", "error domain");
+    const auto landmarks = f.send(f.send(f.cls("VNDetectFaceLandmarksRequest"), "alloc"), "init");
+    f.send(landmarks, "setConstellation:", {2});
+    require(f.send(landmarks, "constellation") == 2, "a face-landmarks request keeps its constellation");
 });
 
 #undef LIBRARY

@@ -48,7 +48,11 @@ void Provider::install() {
         s.x[0] = bridge->autorelease(cf.array({}));
     });
     method(barcodes, "supportedSymbologies", empty_array, true);
-    static_cast<void>(cls(vision, "VNDetectFaceLandmarksRequest", "VNImageBasedRequest"));
+    // Its constellation (VNRequestFaceLandmarksConstellation) and the faces to look at; performing
+    // it fails like every request.
+    const auto landmarks = cls(vision, "VNDetectFaceLandmarksRequest", "VNImageBasedRequest");
+    integer_properties(landmarks, {"constellation"});
+    object_properties(landmarks, {"inputFaceObservations"});
     const auto handler = cls(vision, "VNImageRequestHandler", "NSObject");
     object_properties(handler, {"image", "options"});
     for (const auto* selector : {"initWithCVPixelBuffer:options:", "initWithCGImage:options:", "initWithCIImage:options:",
