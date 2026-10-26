@@ -98,6 +98,16 @@ void test_system_functions(Fixture& f) {
     f.call(lib, "_OSAtomicEnqueue", {head, b, 8});
     require(f.call(lib, "_OSAtomicDequeue", {head, 8}) == b && f.call(lib, "_OSAtomicDequeue", {head, 8}) == a &&
             f.call(lib, "_OSAtomicDequeue", {head, 8}) == 0, "OSAtomicEnqueue/Dequeue is LIFO");
+    const auto wide = f.process.allocate_guest(8), fifo = f.process.allocate_guest(24);
+    f.engine.write64(wide, 41);
+    require(f.call(lib, "_OSAtomicIncrement64", {wide}) == 42 && f.call(lib, "_OSAtomicDecrement64Barrier", {wide}) == 41 &&
+            f.engine.read64(wide) == 41, "OSAtomicIncrement64/Decrement64");
+    f.engine.write64(fifo, 0);
+    f.engine.write64(fifo + 8, 0);
+    f.call(lib, "_OSAtomicFifoEnqueue", {fifo, a, 8});
+    f.call(lib, "_OSAtomicFifoEnqueue", {fifo, b, 8});
+    require(f.call(lib, "_OSAtomicFifoDequeue", {fifo, 8}) == a && f.call(lib, "_OSAtomicFifoDequeue", {fifo, 8}) == b &&
+            f.call(lib, "_OSAtomicFifoDequeue", {fifo, 8}) == 0, "OSAtomicFifoEnqueue/Dequeue is FIFO");
     // termios
     const auto termios = f.process.allocate_guest(72);
     for (Address at = 0; at < 72; at += 8) f.engine.write64(termios + at, ~Address{0});

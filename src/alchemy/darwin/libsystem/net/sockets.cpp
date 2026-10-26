@@ -1345,6 +1345,13 @@ void DarwinServices::Impl::install_network_services() {
         if (s.x[2]) put_text(m, s.x[2], query->value[0]); if (s.x[4]) put_text(m, s.x[4], query->value[1]); return std::uint64_t{0};
     }, 11);
     install("_sethostname", [](auto&, auto&) -> std::uint64_t { throw ServiceError{eperm}; });
+    // getdomainname(name, namelen): the NIS domain (kern.nisdomainname), which is never set
+    // here, so the name is empty; setting it needs root, as on Darwin.
+    install("_getdomainname", [](auto& s, auto& m) {
+        if (static_cast<std::int32_t>(s.x[1]) <= 0) throw ServiceError{einval};
+        validate(m, s.x[0], 1, true); m.write8(s.x[0], 0); return std::uint64_t{0};
+    });
+    install("_setdomainname", [](auto&, auto&) -> std::uint64_t { throw ServiceError{eperm}; });
     for (const auto host_error_text : {false, true}) install(host_error_text ? "_hstrerror" : "_gai_strerror", [this, host_error_text](auto& s, auto& m) {
         static constexpr std::array<std::string_view, 15> messages{"Success", "Address family not supported", "Temporary name resolution failure", "Invalid resolver flags", "Name resolution failure", "Unsupported address family", "Resolver out of memory", "No address data", "Name or service not known", "Service not supported", "Socket type not supported", "System resolver error", "Invalid resolver hints", "Unsupported protocol", "Resolver output too small"};
         static constexpr std::array<std::string_view, 5> hosts{"Success", "Unknown host", "Temporary resolver failure", "Unrecoverable resolver error", "No address data"};

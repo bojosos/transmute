@@ -621,5 +621,6 @@ void install_darwin_support(ProcessContext& context) {
     install(state, "_clock_gettime", [](auto& s, auto& m) { const auto value = nanoseconds(s.x[0]); validate(m, s.x[1], 16, true); m.write64(s.x[1], value / 1000000000); m.write64(s.x[1] + 8, value % 1000000000); return std::uint64_t{0}; });
     install(state, "_clock_gettime_nsec_np", [](auto& s, auto&) { return nanoseconds(s.x[0]); }, 0);
     install(state, "_clock_getres", [](auto& s, auto& m) { static_cast<void>(nanoseconds(s.x[0])); if (s.x[1]) { validate(m, s.x[1], 16, true); m.write64(s.x[1], 0); m.write64(s.x[1] + 8, 100); } return std::uint64_t{0}; });
+    install_darwin_libc_extra(context);
 }
 } // namespace alchemy

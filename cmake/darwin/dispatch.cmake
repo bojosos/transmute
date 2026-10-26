@@ -20,5 +20,8 @@ function(alchemy_gui_dispatch_tests)
     alchemy_gui_add_unit_test(alchemy_gui_dispatch_data src/alchemy/darwin/dispatch/tests/dispatch_data_tests.cpp TIMEOUT 120)
     # Dispatch objects as Objective-C objects (split from the QLab runtime tests).
     alchemy_gui_add_unit_test(alchemy_gui_dispatch_objects src/alchemy/darwin/dispatch/tests/dispatch_objects_tests.cpp TIMEOUT 120)
+    # Dispatch blocks, assertions, attributes, target queues, finalizers, workloops, signal
+    # sources and the I/O conveniences.
+    alchemy_gui_add_unit_test(alchemy_gui_dispatch_api src/alchemy/darwin/dispatch/tests/dispatch_api_tests.cpp TIMEOUT 120)
 endfunction()
 alchemy_gui_register_tests(alchemy_gui_dispatch_tests)

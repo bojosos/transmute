@@ -1,5 +1,9 @@
 #include "alchemy/darwin_numeric.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <string_view>
 #include <bit>
 #include <cerrno>
 #include <cfenv>
@@ -137,6 +141,159 @@ std::uint32_t exception_status(std::uint32_t flags) { return (flags & 31U) | ((f
 std::uint32_t exception_flags(std::uint32_t status) { return (status & 31U) | ((status & 128U) ? 32U : 0U); }
 } // namespace
 
+transmute::GuestCallHandler numeric_floating_handler(transmute::GuestCallHandler handler);
+namespace {
+
+// The rest of C99/POSIX libm and Darwin's extensions: rounding to integers (lround, llround,
+// lrint, llrint, nearbyint), fmax/fmin/fdim/fma, tgamma, lgamma_r, remquo, remainder, ilogb,
+// scalbln, nan, nexttoward (long double is binary64 on Apple arm64, so *l is double), the
+// Bessel functions, BSD's gamma/significand/drem/finite, __sinpi/__cospi/__tanpi and
+// __sincospi_stret, fegetexceptflag/fesetexceptflag, and the complex conj/cproj/creal/cimag.
+// Every name is installed only where no provider exports it yet (some float forms already exist).
+template<class R> void install_precision_extra(ProcessContext& context, const std::string& suffix) {
+    // Float and double forms other providers own (leftovers.cpp, machsys.cpp, libsystem_misc.cpp, support.cpp).
+    static const std::array<std::string_view, 7> owned_elsewhere{"_nearbyintf", "_fmaf", "_remainder", "_remainderf", "_ilogbf", "_nanf", "_nan"};
+    const auto missing = [&](const std::string& name) {
+        const auto symbol = "_" + name + suffix;
+        return std::find(owned_elsewhere.begin(), owned_elsewhere.end(), symbol) == owned_elsewhere.end() &&
+            !context.resolve("/usr/lib/libSystem.B.dylib", symbol);
+    };
+    const auto install = [&](const std::string& name, transmute::GuestCallHandler handler) {
+        if (missing(name)) static_cast<void>(context.install_function("_" + name + suffix, numeric_floating_handler(std::move(handler))));
+    };
+    const auto integer = [](std::int64_t value) { return static_cast<std::uint64_t>(value); };
+    // Rounding to long / long long: the current mode (lrint, llrint) or half away from zero (lround, llround).
+    install("lround", [integer](auto& s, auto&) { s.x[0] = integer(std::llround(argument<R>(s, 0))); });
+    install("llround", [integer](auto& s, auto&) { s.x[0] = integer(std::llround(argument<R>(s, 0))); });
+    install("lrint", [integer](auto& s, auto&) { s.x[0] = integer(std::llrint(argument<R>(s, 0))); });
+    install("llrint", [integer](auto& s, auto&) { s.x[0] = integer(std::llrint(argument<R>(s, 0))); });
+    install("nearbyint", [](auto& s, auto&) { result(s, std::nearbyint(argument<R>(s, 0))); });
+    install("fmax", [](auto& s, auto&) { result(s, std::fmax(argument<R>(s, 0), argument<R>(s, 1))); });
+    install("fmin", [](auto& s, auto&) { result(s, std::fmin(argument<R>(s, 0), argument<R>(s, 1))); });
+    install("fdim", [](auto& s, auto&) { result(s, std::fdim(argument<R>(s, 0), argument<R>(s, 1))); });
+    install("fma", [](auto& s, auto&) { result(s, std::fma(argument<R>(s, 0), argument<R>(s, 1), argument<R>(s, 2))); });
+    install("tgamma", [](auto& s, auto&) { result(s, std::tgamma(argument<R>(s, 0))); });
+    install("remainder", [](auto& s, auto&) { result(s, std::remainder(argument<R>(s, 0), argument<R>(s, 1))); });
+    // remquo(x, y, int* quo): the low bits of the quotient with its sign.
+    install("remquo", [](auto& s, auto& m) {
+        int quotient{};
+        const auto value = std::remquo(argument<R>(s, 0), argument<R>(s, 1), &quotient);
+        if (s.x[0]) m.write32(s.x[0], static_cast<std::uint32_t>(quotient));
+        result(s, value);
+    });
+    install("ilogb", [](auto& s, auto&) { s.x[0] = static_cast<std::uint32_t>(std::ilogb(argument<R>(s, 0))); });
+    install("scalbln", [](auto& s, auto&) { result(s, std::scalbln(argument<R>(s, 0), static_cast<long>(std::clamp<std::int64_t>(static_cast<std::int64_t>(s.x[0]), std::numeric_limits<long>::min(), std::numeric_limits<long>::max())))); });
+    install("nexttoward", [](auto& s, auto&) {
+        if constexpr (sizeof(R) == 4) result(s, static_cast<R>(std::nexttoward(argument<R>(s, 0), static_cast<long double>(argument<double>(s, 1)))));
+        else result(s, std::nextafter(argument<R>(s, 0), argument<R>(s, 1)));
+    });
+    // lgamma_r(x, int* signgamp): ln|Γ(x)| and Γ's sign (negative for x in (-2k-1, -2k)).
+    if (const auto name = "_lgamma" + suffix + "_r"; !context.resolve("/usr/lib/libSystem.B.dylib", name))
+        static_cast<void>(context.install_function(name, numeric_floating_handler([](auto& s, auto& m) {
+            const auto x = argument<R>(s, 0);
+            std::int32_t sign = 1;
+            if (x < R{} && std::floor(x) != x && static_cast<std::int64_t>(std::floor(x)) % 2 != 0) sign = -1;
+            if (s.x[0]) m.write32(s.x[0], static_cast<std::uint32_t>(sign));
+            result(s, std::lgamma(x));
+        })));
+    // nan(const char* tag): a quiet NaN (the tag's payload is not encoded).
+    install("nan", [](auto& s, auto&) { result(s, std::numeric_limits<R>::quiet_NaN()); });
+}
+
+template<class R> R sin_pi(R x) {
+    if (!std::isfinite(x)) return std::numeric_limits<R>::quiet_NaN();
+    const auto r = std::remainder(x, R{2});   // in [-1, 1]
+    if (r == R{} || std::fabs(r) == R{1}) return std::copysign(R{}, x);
+    if (std::fabs(r) == R{0.5}) return std::copysign(R{1}, r);
+    return static_cast<R>(std::sin(static_cast<long double>(r) * 3.14159265358979323846264338327950288L));
+}
+template<class R> R cos_pi(R x) {
+    if (!std::isfinite(x)) return std::numeric_limits<R>::quiet_NaN();
+    const auto r = std::fabs(std::remainder(x, R{2}));
+    if (r == R{0.5}) return R{};
+    if (r == R{}) return R{1};
+    if (r == R{1}) return R{-1};
+    return static_cast<R>(std::cos(static_cast<long double>(r) * 3.14159265358979323846264338327950288L));
+}
+
+void install_numeric_extra(ProcessContext& context) {
+    install_precision_extra<float>(context, "f"); install_precision_extra<double>(context, ""); install_precision_extra<double>(context, "l");
+    const auto missing = [&](std::string_view name) { return !context.resolve("/usr/lib/libSystem.B.dylib", name); };
+    const auto install = [&](std::string name, transmute::GuestCallHandler handler) {
+        if (missing(name)) static_cast<void>(context.install_function(std::move(name), numeric_floating_handler(std::move(handler))));
+    };
+    // Bessel functions of the first (j) and second (y) kind; y of x < 0 is NaN (invalid), of 0 is -inf.
+    const auto bessel_j = [](unsigned order, double x) {
+        const auto value = std::cyl_bessel_j(static_cast<double>(order), std::fabs(x));
+        return (x < 0 && (order & 1)) ? -value : value;
+    };
+    const auto bessel_y = [](unsigned order, double x) {
+        if (std::isnan(x) || x < 0) return std::numeric_limits<double>::quiet_NaN();
+        if (x == 0) return -std::numeric_limits<double>::infinity();
+        return std::cyl_neumann(static_cast<double>(order), x);
+    };
+    install("_j0", [bessel_j](auto& s, auto&) { result(s, bessel_j(0, argument<double>(s, 0))); });
+    install("_j1", [bessel_j](auto& s, auto&) { result(s, bessel_j(1, argument<double>(s, 0))); });
+    install("_jn", [bessel_j](auto& s, auto&) {
+        const auto order = static_cast<std::int32_t>(s.x[0]);
+        const auto value = bessel_j(static_cast<unsigned>(std::abs(order)), argument<double>(s, 0));
+        result(s, (order < 0 && (std::abs(order) & 1)) ? -value : value);
+    });
+    install("_y0", [bessel_y](auto& s, auto&) { result(s, bessel_y(0, argument<double>(s, 0))); });
+    install("_y1", [bessel_y](auto& s, auto&) { result(s, bessel_y(1, argument<double>(s, 0))); });
+    install("_yn", [bessel_y](auto& s, auto&) {
+        const auto order = static_cast<std::int32_t>(s.x[0]);
+        const auto value = bessel_y(static_cast<unsigned>(std::abs(order)), argument<double>(s, 0));
+        result(s, (order < 0 && (std::abs(order) & 1)) ? -value : value);
+    });
+    // BSD: gamma is lgamma, drem is remainder, significand(x) is x scaled into [1, 2), finite is isfinite.
+    install("_gamma", [](auto& s, auto&) { result(s, std::lgamma(argument<double>(s, 0))); });
+    install("_drem", [](auto& s, auto&) { result(s, std::remainder(argument<double>(s, 0), argument<double>(s, 1))); });
+    install("_significand", [](auto& s, auto&) {
+        const auto x = argument<double>(s, 0);
+        result(s, (x == 0 || !std::isfinite(x)) ? x : std::scalbn(x, -std::ilogb(x)));
+    });
+    install("_finite", [](auto& s, auto&) { s.x[0] = std::isfinite(argument<double>(s, 0)) ? 1 : 0; });
+    // sin(πx), cos(πx), tan(πx), exact at integers and half-integers.
+    install("___sinpi", [](auto& s, auto&) { result(s, sin_pi(argument<double>(s, 0))); });
+    install("___sinpif", [](auto& s, auto&) { result(s, sin_pi(argument<float>(s, 0))); });
+    install("___cospi", [](auto& s, auto&) { result(s, cos_pi(argument<double>(s, 0))); });
+    install("___cospif", [](auto& s, auto&) { result(s, cos_pi(argument<float>(s, 0))); });
+    install("___tanpi", [](auto& s, auto&) { const auto x = argument<double>(s, 0); result(s, sin_pi(x) / cos_pi(x)); });
+    install("___tanpif", [](auto& s, auto&) { const auto x = argument<float>(s, 0); result(s, sin_pi(x) / cos_pi(x)); });
+    install("___sincospi_stret", [](auto& s, auto&) { const auto x = argument<double>(s, 0); result(s, sin_pi(x)); result(s, cos_pi(x), 1); });
+    install("___sincospif_stret", [](auto& s, auto&) { const auto x = argument<float>(s, 0); result(s, sin_pi(x)); result(s, cos_pi(x), 1); });
+    if (missing("___fpclassifyl"))
+        if (const auto found = context.resolve("/usr/lib/libSystem.B.dylib", "___fpclassifyd"))
+            context.install_export("/usr/lib/libSystem.B.dylib", "___fpclassifyl", *found);
+    // fegetexceptflag(fexcept_t* flagp, int excepts) / fesetexceptflag(const fexcept_t*, int):
+    // fexcept_t (16 bits) holds Darwin's exception bits; setting them raises no trap.
+    if (missing("_fegetexceptflag"))
+        static_cast<void>(context.install_function("_fegetexceptflag", [](auto& s, auto& m) {
+            const auto flags = exception_flags(s.fpsr) & static_cast<std::uint32_t>(s.x[1]);
+            m.write8(s.x[0], static_cast<std::uint8_t>(flags)); m.write8(s.x[0] + 1, static_cast<std::uint8_t>(flags >> 8));
+            s.x[0] = 0;
+        }));
+    if (missing("_fesetexceptflag"))
+        static_cast<void>(context.install_function("_fesetexceptflag", [](auto& s, auto& m) {
+            const auto excepts = static_cast<std::uint32_t>(s.x[1]);
+            const auto flags = (static_cast<std::uint32_t>(m.read8(s.x[0])) | static_cast<std::uint32_t>(m.read8(s.x[0] + 1)) << 8) & excepts;
+            s.fpsr = (s.fpsr & ~exception_status(excepts)) | exception_status(flags);
+            s.x[0] = 0;
+        }));
+    // conj, cproj (an infinite part projects to (+inf, ±0)), creal, cimag.
+    install("_conj", [](auto& s, auto&) { complex_result(s, std::conj(complex_argument<double>(s))); });
+    install("_conjf", [](auto& s, auto&) { complex_result(s, std::conj(complex_argument<float>(s))); });
+    install("_cproj", [](auto& s, auto&) { complex_result(s, std::proj(complex_argument<double>(s))); });
+    install("_cprojf", [](auto& s, auto&) { complex_result(s, std::proj(complex_argument<float>(s))); });
+    install("_creal", [](auto& s, auto&) { result(s, complex_argument<double>(s).real()); });
+    install("_crealf", [](auto& s, auto&) { result(s, complex_argument<float>(s).real()); });
+    install("_cimag", [](auto& s, auto&) { result(s, complex_argument<double>(s).imag()); });
+    install("_cimagf", [](auto& s, auto&) { result(s, complex_argument<float>(s).imag()); });
+}
+
+} // namespace
+
 transmute::GuestCallHandler numeric_floating_handler(transmute::GuestCallHandler handler) {
     return [handler = std::move(handler)](auto& state, auto& memory) {
         std::uint32_t status{};
@@ -229,6 +386,7 @@ void install_darwin_numeric_math(ProcessContext& context) {
         }
         s.x[0] = quotient.low; s.x[1] = quotient.high;
     }));
+    install_numeric_extra(context);
 }
 
 } // namespace alchemy

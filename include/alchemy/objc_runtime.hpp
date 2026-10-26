@@ -96,6 +96,16 @@ public:
     // [super sel ...] from a method of `cls`; see lookup_super_imp.
     CallResult send_super(std::uint64_t receiver, std::uint64_t cls, std::uint64_t sel, CallRegs registers = {});
 
+    // Raises the Objective-C object `exception` from a host native method the guest called
+    // (-[NSException raise], say): when the handler returns, the guest throws as if the
+    // method's caller had called objc_exception_throw. `state` is the handler's register
+    // state; the handler must return right after this call. Called from a method that host
+    // code invoked, the exception cannot unwind the host frame and stops as uncaught.
+    void throw_exception(transmute::CpuState& state, std::uint64_t exception);
+    // A C++ runtime (libc++abi/libc++) function: a provider export, else the loaded guest
+    // LLVM runtime's (as dlsym finds it); 0 when neither has it.
+    [[nodiscard]] std::uint64_t cxx_runtime(std::string_view symbol);
+
     // Declares that host class `cls` adopts the Objective-C protocol named
     // `protocol` (for example CAMetalLayer and "CAMetalDrawable" providers,
     // MTLDevice objects and "MTLDevice"). conformsToProtocol: and

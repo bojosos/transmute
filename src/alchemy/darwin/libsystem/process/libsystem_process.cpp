@@ -79,6 +79,90 @@ void install_libsystem_process(Provider& p) {
         return count * 4;
     }, 0);
 
+    // int proc_listallpids(void* buffer, int size) and proc_listchildpids(pid, buffer, size): the
+    // number of pids (not bytes) written, or the number there are when buffer is NULL.
+    const auto list_pids = [](std::optional<std::uint32_t> parent, std::uint64_t buffer, std::uint64_t size, GuestMemory& m) -> std::uint64_t {
+        const auto processes = host::process::list();
+        if (!processes) throw Errno{eperm};
+        std::vector<std::uint32_t> pids;
+        for (const auto& entry : *processes) if (!parent || entry.parent == *parent) pids.push_back(entry.pid);
+        if (!buffer) return pids.size() + (parent ? 0 : 64);   // room for processes started meanwhile
+        const auto capacity = static_cast<std::uint64_t>(std::max<std::int64_t>(0, static_cast<std::int32_t>(size))) / 4;
+        const auto count = std::min<std::uint64_t>(capacity, pids.size());
+        for (std::uint64_t index = 0; index < count; ++index) m.write32(buffer + index * 4, pids[static_cast<std::size_t>(index)]);
+        return count;
+    };
+    p.libsystem("_proc_listallpids", [list_pids](CpuState& s, GuestMemory& m) { return list_pids(std::nullopt, s.x[0], s.x[1], m); });
+    p.libsystem("_proc_listchildpids", [list_pids](CpuState& s, GuestMemory& m) {
+        return list_pids(static_cast<std::uint32_t>(s.x[0]), s.x[1], s.x[2], m);
+    });
+
+    // int proc_pidfdinfo(pid, fd, flavor, buffer, size): this process's descriptors, flavors
+    // PROC_PIDFDVNODEINFO (1, struct vnode_fdinfo, 176 bytes) and PROC_PIDFDVNODEPATHINFO
+    // (2, struct vnode_fdinfowithpath, 1200 bytes): struct proc_fileinfo (24 bytes: fi_openflags,
+    // fi_status, fi_offset, fi_type, fi_guardflags), then vnode_info (vinfo_stat 136, vi_type,
+    // vi_pad, vi_fsid) and the path. Other processes' descriptors are not visible (EPERM); the
+    // socket, pipe, kqueue and other flavors are not offered. Returns the bytes written, 0 on error.
+    p.libsystem("_proc_pidfdinfo", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto pid = static_cast<std::uint32_t>(s.x[0]), flavor = static_cast<std::uint32_t>(s.x[2]);
+        const std::uint64_t fd = s.x[1];
+        const std::uint64_t buffer = s.x[3];
+        const auto size = static_cast<std::int32_t>(s.x[4]);
+        if (pid != static_cast<std::uint32_t>(p.call(libsystem_library, "_getpid", {}))) throw Errno{eperm};
+        if (flavor != 1 && flavor != 2) throw Errno{enotsup};
+        const std::uint64_t needed = flavor == 2 ? 1200 : 176;
+        if (!buffer || size < static_cast<std::int32_t>(needed)) throw Errno{enomem};
+        auto& process = p.process();
+        const auto info = process.allocate_guest(144), path = process.allocate_guest(1024);
+        const auto release = [&] { process.release_guest(info); process.release_guest(path); };
+        try {
+            if (static_cast<std::int32_t>(p.call(libsystem_library, "_fstat", {fd, info})) != 0) throw Errno{p.guest_errno()};
+            const auto mode = static_cast<std::uint16_t>(m.read8(info + 4) | m.read8(info + 5) << 8);
+            const auto type = mode & 0170000;
+            if (type == 0140000 || type == 0010000) throw Errno{ebadf};   // a socket or pipe is not a vnode
+            CallRegs flags{}; flags.x[0] = fd; flags.x[1] = 3;   // F_GETFL
+            const auto open_flags = p.call_regs(libsystem_library, "_fcntl", flags);
+            const auto offset = p.call(libsystem_library, "_lseek", {fd, 0, 1});   // SEEK_CUR
+            m.fill_bytes(buffer, 0, needed);
+            m.write32(buffer, static_cast<std::uint32_t>(open_flags) + 1);   // fi_openflags: FREAD/FWRITE are O_ACCMODE + 1
+            m.write64(buffer + 8, static_cast<std::int64_t>(offset) < 0 ? 0 : offset);
+            m.write32(buffer + 16, 1);   // fi_type DTYPE_VNODE
+            // vinfo_stat from struct stat (64-bit inodes): st_dev @0, st_mode @4, st_nlink @6,
+            // st_ino @8, st_uid @16, st_gid @20, st_rdev @24, times @32 (atime, mtime, ctime,
+            // birthtime timespecs), st_size @96, st_blocks @104, st_blksize @112, st_flags @116, st_gen @120.
+            const auto stat = buffer + 24;
+            m.write32(stat, m.read32(info));
+            m.write32(stat + 4, m.read32(info + 4));   // vst_mode, vst_nlink
+            m.write64(stat + 8, m.read64(info + 8));
+            m.write32(stat + 16, m.read32(info + 16)); m.write32(stat + 20, m.read32(info + 20));
+            for (unsigned index = 0; index < 8; ++index) m.write64(stat + 24 + index * 8, m.read64(info + 32 + index * 8));
+            m.write64(stat + 88, m.read64(info + 96)); m.write64(stat + 96, m.read64(info + 104));
+            m.write32(stat + 104, m.read32(info + 112)); m.write32(stat + 108, m.read32(info + 116));
+            m.write32(stat + 112, m.read32(info + 120)); m.write32(stat + 116, m.read32(info + 24));
+            // vi_type: VREG 1, VDIR 2, VBLK 3, VCHR 4, VLNK 5, VFIFO 7.
+            const std::uint32_t vnode_type = type == 0100000 ? 1 : type == 0040000 ? 2 : type == 0060000 ? 3 : type == 0020000 ? 4 : type == 0120000 ? 5 : 0;
+            m.write32(stat + 136, vnode_type);
+            if (flavor == 2) {
+                CallRegs query{}; query.x[0] = fd; query.x[1] = 50; query.push_variadic(path);   // F_GETPATH
+                if (static_cast<std::int32_t>(p.call_regs(libsystem_library, "_fcntl", query)) == 0) {
+                    const auto text = guest_string(m, path, 1024);
+                    put_string(m, buffer + 176, text);
+                }
+            }
+        } catch (...) { release(); throw; }
+        release();
+        return needed;
+    }, 0);
+
+    // int proc_signal_with_audittoken(audit_token_t*, int signal): kill(2) to the token's pid
+    // (val[5]); 0 or the errno value.
+    p.libsystem("_proc_signal_with_audittoken", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[0]) return einval;
+        const auto pid = m.read32(s.x[0] + 20);
+        if (static_cast<std::int32_t>(p.call(libsystem_library, "_kill", {pid, s.x[1]})) != 0) return p.guest_errno();
+        return 0;
+    });
+
     // kern_return_t host_statistics(host_t, host_flavor_t, host_info_t, mach_msg_type_number_t*)
     p.libsystem("_host_statistics", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
         const auto flavor = static_cast<std::uint32_t>(s.x[1]);

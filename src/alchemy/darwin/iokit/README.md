@@ -17,7 +17,10 @@ queries, and the GPU list of `darwin/metal/gpu_identity.hpp` (Vulkan
 physical devices; empty without Vulkan).
 
 **Unsupported:** HID devices and IOConnect calls never exist; their calls
-fail with IOKit's error codes.
+fail with IOKit's error codes. The HID event-system client
+(`IOHIDEventSystemClientCreate` and the service and event calls, which Electron
+reads thermal sensors with) is unavailable: no client is created, and the calls
+on a client, service or event answer empty for NULL and stop for anything else.
 
 ## Moved from darwin/identities/
 

@@ -1082,6 +1082,7 @@ void DarwinServices::Impl::install_process_services() {
     // the default action of a terminating signal ends the process.
     const auto deliver_self = [this](std::uint64_t signal) -> std::uint64_t {
         if (!signal) return 0;
+        if (context.signal_observed) context.signal_observed(static_cast<int>(signal));
         SignalAction action;
         { std::lock_guard lock(mutex); action = signal_table()[static_cast<std::size_t>(signal)]; }
         if (action.handler == 1 && signal != 9 && signal != 17) return 0;

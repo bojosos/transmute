@@ -337,6 +337,189 @@ void test_guest_services(Fixture& f) {
     }
 }
 
+// Names real apps import that were missing (VS Code's libSystem names, Blender's Python
+// stdlib modules): rand48, ndbm, NIS/RPC, inet_aton and friends, libproc, mount info,
+// copyfile states, multibyte, uuid v1, __clear_cache.
+void test_threads_extra(Fixture& f) {
+    require(f.sys("_qos_class_main") == 0x21, "qos_class_main is USER_INTERACTIVE");
+    const auto attr = f.process.allocate_guest(64), out = f.process.allocate_guest(16);
+    require(f.sys("_pthread_attr_init", {attr}) == 0, "pthread_attr_init");
+    require(f.sys("_pthread_attr_setstack", {attr, out, 0x10000}) == 45, "caller-provided stacks are ENOTSUP");
+    require(f.sys("_pthread_attr_getstack", {attr, out, out + 8}) == 0 && f.engine.read64(out) == 0 && f.engine.read64(out + 8) != 0,
+            "pthread_attr_getstack: no address, the default size");
+    require(f.sys("_pthread_setconcurrency", {4}) == 0 && f.sys("_pthread_getconcurrency") == 4, "the concurrency level is kept");
+    const auto mutexattr = f.process.allocate_guest(16);
+    require(f.sys("_pthread_mutexattr_setprioceiling", {mutexattr, 30}) == 0 && f.sys("_pthread_mutexattr_getprioceiling", {mutexattr, out}) == 0 &&
+            f.engine.read32(out) == 30, "priority ceilings are kept");
+    require(f.sys("_sem_init", {out, 0, 1}) == UINT64_MAX, "Darwin has no unnamed semaphores");
+    static Address jitted = 0;
+    const auto callback = f.process.install_function("_gaps_jit_callback", [](transmute::CpuState& s, transmute::GuestMemory&) { jitted = s.x[0]; s.x[0] = 7; });
+    require(f.sys("_pthread_jit_write_with_callback_np", {callback, 5}) == 7 && jitted == 5, "pthread_jit_write_with_callback_np runs the callback");
+    const auto rwattr = f.process.allocate_guest(16), rwlock = f.process.allocate_guest(200);
+    require(f.sys("_pthread_rwlockattr_init", {rwattr}) == 0 && f.sys("_pthread_rwlockattr_setpshared", {rwattr, 1}) == 45 &&
+            f.sys("_pthread_rwlockattr_getpshared", {rwattr, out}) == 0 && f.engine.read32(out) == 2, "rwlock attributes: process-private");
+    require(f.sys("_pthread_rwlock_init", {rwlock, rwattr}) == 0 && f.sys("_pthread_rwlock_destroy", {rwlock}) == 0 &&
+            f.sys("_pthread_rwlockattr_destroy", {rwattr}) == 0, "pthread_rwlock_init with attributes");
+}
+
+void test_app_imports(Fixture& f) {
+    // rand48: srand48(1) gives glibc's well-known first values.
+    f.sys("_srand48", {1});
+    require(f.sys("_lrand48") == 89400484 && f.sys("_lrand48") == 976015093 && f.sys("_lrand48") == 1792756325, "lrand48 after srand48(1)");
+    f.sys("_srand48", {1});
+    require(f.sys("_mrand48") == 178800969, "mrand48 after srand48(1)");
+    {
+        // nrand48 advances its own xsubi[3] and leaves the process generator alone.
+        const auto xsubi = f.process.allocate_guest(8);
+        f.engine.write32(xsubi, 0x0001330E); f.engine.write32(xsubi + 4, 0);   // {0x330E, 1, 0}: srand48(1)'s X
+        require(f.sys("_nrand48", {xsubi}) == 89400484 && f.sys("_nrand48", {xsubi}) == 976015093, "nrand48 with its own state");
+        f.sys("_srand48", {1});
+        require(f.sys("_lrand48") == 89400484, "the process generator is independent");
+        // seed48 returns the previous X and sets a new one.
+        const auto seed = f.process.allocate_guest(8);
+        f.engine.write32(seed, 0x0001330E); f.engine.write32(seed + 4, 0);
+        const auto previous = f.sys("_seed48", {seed});
+        require(previous && f.sys("_lrand48") == 89400484, "seed48");
+        require(f.sys("_crypt", {f.text("x"), f.text("ab")}) == 0, "crypt answers ENOSYS");
+    }
+    // ndbm: store, fetch, replace, insert-exists, delete, iterate, reopen.
+    {
+        const auto root = std::filesystem::temp_directory_path() / "alchemy-ndbm-test";
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+        std::filesystem::create_directories(root);
+        const auto name = f.text(alchemy::guest_path_string(root / "db"));
+        const auto open = [&](std::uint64_t flags) { return f.sys("_dbm_open", {name, flags, 0644}); };
+        auto db = open(0x202);   // O_RDWR | O_CREAT
+        require(db != 0, "dbm_open creates the database");
+        const auto key = f.text("alpha"), value = f.text("one"), other = f.text("second value");
+        require(f.sys("_dbm_store", {db, key, 5, value, 3, 0}) == 0, "dbm_store insert");
+        require(f.sys("_dbm_store", {db, key, 5, other, 12, 0}) == 1, "dbm_store DBM_INSERT keeps an existing key");
+        require(f.sys("_dbm_store", {db, key, 5, other, 12, 1}) == 0, "dbm_store DBM_REPLACE");
+        const auto beta = f.text("beta");
+        require(f.sys("_dbm_store", {db, beta, 4, value, 3, 1}) == 0, "second key");
+        const auto fetched = f.sys("_dbm_fetch", {db, key, 5});
+        require(fetched && guest_bytes(f, fetched, 12) == bytes("second value"), "dbm_fetch");
+        require(f.sys("_dbm_fetch", {db, f.text("gamma"), 5}) == 0, "dbm_fetch of a missing key");
+        const auto first = f.sys("_dbm_firstkey", {db});
+        require(first && guest_bytes(f, first, 5) == bytes("alpha"), "dbm_firstkey in byte order");
+        const auto second = f.sys("_dbm_nextkey", {db});
+        require(second && guest_bytes(f, second, 4) == bytes("beta") && f.sys("_dbm_nextkey", {db}) == 0, "dbm_nextkey");
+        require(f.sys("_dbm_delete", {db, beta, 4}) == 0 && f.sys("_dbm_delete", {db, beta, 4}) == UINT64_MAX, "dbm_delete");
+        require(f.sys("_dbm_error", {db}) == 0 && f.sys("_dbm_clearerr", {db}) == 0, "dbm_error");
+        f.sys("_dbm_close", {db});
+        db = open(0);   // O_RDONLY: the log is replayed
+        require(db != 0, "dbm_open reopens");
+        const auto again = f.sys("_dbm_fetch", {db, key, 5});
+        require(again && guest_bytes(f, again, 12) == bytes("second value") && f.sys("_dbm_fetch", {db, beta, 4}) == 0, "the database persists");
+        require(f.sys("_dbm_store", {db, beta, 4, value, 3, 1}) == UINT64_MAX, "a read-only database refuses stores");
+        f.sys("_dbm_close", {db});
+        { std::ofstream bad(root / "bad.db"); bad << "not a database"; }
+        require(f.sys("_dbm_open", {f.text(alchemy::guest_path_string(root / "bad")), 0, 0}) == 0, "a foreign file is refused (EFTYPE)");
+        std::filesystem::remove_all(root, ignored);
+    }
+    // NIS and Sun RPC are unavailable.
+    {
+        const auto domain = f.process.allocate_guest(8);
+        require(f.sys("_yp_get_default_domain", {domain}) == 12, "YPERR_NODOM");
+        require(f.sys("_yp_match", {0, 0, 0, 0, 0, 0}) == 10, "YPERR_YPBIND");
+        require(f.read(f.sys("_yperr_string", {12})) == "Local domain name not set", "yperr_string");
+        require(f.sys("_clnt_create", {f.text("localhost"), 100004, 2, f.text("udp")}) == 0, "clnt_create fails");
+        require(f.read(f.sys("_clnt_spcreateerror", {f.text("nis")})).starts_with("nis: RPC: Port mapper failure"), "clnt_spcreateerror");
+    }
+    // inet_aton and the classful helpers (network-order results).
+    {
+        const auto address = f.process.allocate_guest(4);
+        require(f.sys("_inet_aton", {f.text("127.0.0.1"), address}) == 1 && f.engine.read32(address) == 0x0100007fU, "inet_aton dotted quad");
+        require(f.sys("_inet_aton", {f.text("10.1"), address}) == 1 && f.engine.read32(address) == 0x0100000aU, "inet_aton a.b");
+        require(f.sys("_inet_aton", {f.text("0x7f.1"), address}) == 1 && f.engine.read32(address) == 0x0100007fU, "inet_aton hex part");
+        require(f.sys("_inet_aton", {f.text("256.1.1.1"), address}) == 0 && f.sys("_inet_aton", {f.text("1.2.3.4.5"), address}) == 0 &&
+                f.sys("_inet_aton", {f.text("1.2.3.x"), address}) == 0, "inet_aton rejects malformed addresses");
+        require(static_cast<std::uint32_t>(f.sys("_inet_network", {f.text("192.168.1")})) == 0xc0a801U, "inet_network");
+        require(static_cast<std::uint32_t>(f.sys("_inet_makeaddr", {10, 5})) == 0x0500000aU, "inet_makeaddr class A");
+        require(static_cast<std::uint32_t>(f.sys("_inet_netof", {0x0101a8c0U})) == 0xc0a801U &&
+                static_cast<std::uint32_t>(f.sys("_inet_lnaof", {0x0101a8c0U})) == 1, "inet_netof/inet_lnaof class C");
+    }
+    // libproc: pid lists count pids, fdinfo describes this process's vnodes.
+    {
+        const auto pid = f.sys("_getpid");
+        const auto total = static_cast<std::int32_t>(f.sys("_proc_listallpids", {0, 0}));
+        require(total > 0, "proc_listallpids counts");
+        const auto pids = f.process.allocate_guest(static_cast<std::uint64_t>(total) * 4);
+        const auto listed = static_cast<std::int32_t>(f.sys("_proc_listallpids", {pids, static_cast<std::uint64_t>(total) * 4}));
+        require(listed > 0 && listed <= total, "proc_listallpids lists");
+        const auto path = std::filesystem::temp_directory_path() / "alchemy-fdinfo.txt";
+        { std::ofstream file(path, std::ios::binary); file << "0123456789"; }
+        const auto fd = f.sys("_open", {f.text(alchemy::guest_path_string(path)), 0, 0});
+        require(static_cast<std::int32_t>(fd) >= 0, "open for fdinfo");
+        const auto info = f.process.allocate_guest(1200);
+        require(f.sys("_proc_pidfdinfo", {pid, fd, 2, info, 1200}) == 1200, "proc_pidfdinfo PROC_PIDFDVNODEPATHINFO");
+        require(f.engine.read32(info + 16) == 1 && f.engine.read32(info + 24 + 136) == 1 && f.engine.read64(info + 24 + 88) == 10, "vnode info");
+        require(f.read(info + 176) == alchemy::guest_path_string(path), "the descriptor's path");
+        require(f.sys("_proc_pidfdinfo", {pid, fd, 3, info, 1200}) == 0, "socket flavors are not offered");
+        require(f.sys("_proc_pidfdinfo", {pid, fd, 2, info, 100}) == 0, "a short buffer fails");
+        f.sys("_close", {fd});
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        const auto token = f.process.allocate_guest(32);
+        f.engine.fill_bytes(token, 0, 32); f.engine.write32(token + 20, static_cast<std::uint32_t>(pid));
+        require(f.sys("_proc_signal_with_audittoken", {token, 0}) == 0, "signal 0 to self");
+        require(f.sys("_proc_signal_with_audittoken", {0, 0}) == 22, "a NULL token is EINVAL");
+    }
+    // Mounted file systems: "/" first, every record a statfs.
+    {
+        const auto count = static_cast<std::int32_t>(f.sys("_getfsstat", {0, 0, 2}));
+        require(count >= 1, "getfsstat counts");
+        const auto buffer = f.process.allocate_guest(static_cast<std::uint64_t>(count) * 2168);
+        require(static_cast<std::int32_t>(f.sys("_getfsstat", {buffer, static_cast<std::uint64_t>(count) * 2168, 2})) == count, "getfsstat fills");
+        require(f.read(buffer + 88) == "/", "the first file system is mounted on /");
+        const auto out = f.process.allocate_guest(8);
+        require(static_cast<std::int32_t>(f.sys("_getmntinfo", {out, 2})) == count && f.read(f.engine.read64(out) + 88) == "/", "getmntinfo");
+        require(static_cast<std::int32_t>(f.sys("_getmntinfo_r_np", {out, 2})) == count, "getmntinfo_r_np");
+        f.sys("_free", {f.engine.read64(out)});
+    }
+    // copyfile states record what was copied.
+    {
+        const auto root = std::filesystem::temp_directory_path() / "alchemy-copyfile-state";
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+        std::filesystem::create_directories(root);
+        { std::ofstream file(root / "from.txt", std::ios::binary); file << "twelve bytes"; }
+        const auto state = f.sys("_copyfile_state_alloc");
+        require(state != 0, "copyfile_state_alloc");
+        const auto from = f.text(alchemy::guest_path_string(root / "from.txt")), to = f.text(alchemy::guest_path_string(root / "to.txt"));
+        require(f.sys("_copyfile", {from, to, state, 1 << 3}) == 0, "copyfile COPYFILE_DATA");
+        const auto value = f.process.allocate_guest(8);
+        require(f.sys("_copyfile_state_get", {state, 8, value}) == 0 && f.engine.read64(value) == 12, "COPYFILE_STATE_COPIED");
+        require(f.sys("_copyfile_state_get", {state, 2, value}) == 0 && f.read(f.engine.read64(value)) == alchemy::guest_path_string(root / "from.txt"),
+                "COPYFILE_STATE_SRC_FILENAME");
+        require(f.sys("_copyfile_state_get", {state, 10, value}) == 0 && f.byte(value) == 0, "nothing is cloned");
+        require(f.sys("_copyfile_state_set", {state, 7, 0x1234}) == 0 && f.sys("_copyfile_state_get", {state, 7, value}) == 0 &&
+                f.engine.read64(value) == 0x1234, "COPYFILE_STATE_STATUS_CTX round trip");
+        require(f.sys("_copyfile_state_get", {state, 99, value}) == UINT64_MAX, "an unknown flag is EINVAL");
+        require(f.sys("_copyfile_state_free", {state}) == 0, "copyfile_state_free");
+        std::filesystem::remove_all(root, ignored);
+    }
+    // getdomainname (no NIS domain), fchflags (as chflags), multibyte, uuid v1, __clear_cache.
+    {
+        const auto name = f.process.allocate_guest(64);
+        static_cast<transmute::GuestMemory&>(f.engine).write8(name, 'x');
+        require(f.sys("_getdomainname", {name, 64}) == 0 && f.byte(name) == 0, "getdomainname is empty");
+        require(f.sys("_fchflags", {0, 0}) == UINT64_MAX, "fchflags fails as chflags does");
+        const auto out = f.process.allocate_guest(8);
+        require(f.sys("_wctomb", {0, 'a'}) == 0 && f.sys("_wctomb", {out, 'a'}) == 1 && f.byte(out) == 'a', "wctomb");
+        require(f.sys("_wctomb", {out, 0x263a}) == UINT64_MAX, "wctomb outside the C locale");
+        require(f.sys("_mblen", {f.text("abc"), 3}) == 1 && f.sys("_mblen", {0, 0}) == 0, "mblen");
+        const auto first = f.process.allocate_guest(16), second = f.process.allocate_guest(16);
+        require(f.sys("_uuid_generate_time", {first}) == 0 && f.sys("_uuid_generate_time", {second}) == 0, "uuid_generate_time");
+        require((f.byte(first + 6) >> 4) == 1 && (f.byte(first + 8) & 0xc0) == 0x80, "version 1, RFC 4122 variant");
+        require(guest_bytes(f, first, 16) != guest_bytes(f, second, 16) && guest_bytes(f, first + 10, 6) == guest_bytes(f, second + 10, 6),
+                "time-ordered UUIDs share the node");
+        const auto code = f.process.allocate_guest(64);
+        require(f.sys("___clear_cache", {code, code + 64}) == 0, "__clear_cache");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -347,6 +530,8 @@ int main() {
         stage("guest libSystem"); test_guest_libsystem(f);
         stage("guest misc"); test_guest_misc(f);
         stage("guest services"); test_guest_services(f);
+        stage("app imports"); test_app_imports(f);
+        stage("threads extra"); test_threads_extra(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

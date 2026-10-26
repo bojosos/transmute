@@ -2,9 +2,11 @@
 
 #include "alchemy/darwin_dispatch.hpp"
 
+#include <algorithm>
 #include <array>
 #include <map>
 #include <sstream>
+#include <vector>
 
 // Dispatch objects as Objective-C objects (OS_OBJECT_USE_OBJC). On macOS a
 // dispatch_queue_t is an OS_dispatch_queue_* instance: ARC retains and
@@ -22,13 +24,19 @@
 // OS_dispatch_object > OS_dispatch_queue_attr / _group / _source /
 // _semaphore / _io.
 //
-// dispatch I/O channels (dispatch_io_create, _read, _write, _close,
-// _get_descriptor) are implemented here over the guest's read/write/pread/
-// pwrite on dispatch worker threads; handlers are submitted to their queue in
-// order with dispatch_sync_f, data is delivered as dispatch_data_t (copied),
-// and the cleanup handler runs on the channel's queue once the channel is
-// closed (or released) and no operation is pending. Descriptor ownership stays
-// with the caller, as documented.
+// dispatch I/O channels (dispatch_io_create, _create_with_path, _create_with_io,
+// _read, _write, _barrier, _close, _get_descriptor, _set_high_water,
+// _set_low_water, _set_interval) are implemented here over the guest's
+// read/write/pread/pwrite on dispatch worker threads; handlers are submitted to
+// their queue in order with dispatch_sync_f, data is delivered as
+// dispatch_data_t (copied, at most the high-water mark and, before the end, at
+// least the low-water mark at a time), and the cleanup handler runs on the
+// channel's queue once the channel is closed (or released) and no operation is
+// pending. Descriptor ownership stays with the caller, except for a path
+// channel's own descriptor, closed at cleanup. Deliveries are not paced by
+// dispatch_io_set_interval: data is handed over as it is read. dispatch_read and
+// dispatch_write are one-shot operations on a descriptor with a single handler
+// call.
 namespace alchemy::gui::completion_kit {
 namespace {
 
@@ -44,6 +52,10 @@ struct Channel {
     Address queue{}, cleanup{};   // retained queue, copied block (0 when none)
     std::uint64_t references{1}, pending{};
     bool closed{}, stopped{}, cleaned{};
+    bool owned{};                 // a path channel's descriptor, closed at cleanup
+    std::uint32_t open_error{};   // a path channel whose open failed: every operation and the cleanup report it
+    std::uint64_t high_water{UINT64_MAX}, low_water{}, interval{};
+    std::vector<Address> barriers;   // copied blocks waiting for pending operations to finish
 };
 
 struct Operation {
@@ -51,6 +63,7 @@ struct Operation {
     std::int64_t offset{};
     std::uint64_t length{};
     bool write{};
+    std::int32_t descriptor{-1};   // dispatch_read / dispatch_write: the descriptor (no channel)
 };
 
 struct Channels {
@@ -59,7 +72,7 @@ struct Channels {
     std::map<Address, Operation> operations;
     Address next{1};
     Address io_class{};
-    Address read_entry{}, deliver_entry{}, cleanup_entry{};
+    Address read_entry{}, deliver_entry{}, cleanup_entry{}, oneshot_entry{}, deliver_pair_entry{}, barrier_entry{};
 };
 
 // The pending handler call that deliver_entry runs on the target queue.
@@ -162,6 +175,8 @@ void install_dispatch_objects(Support& support) {
     // must not hold the mutex.
     const auto maybe_cleanup = [&support, channels, submit](Address object) {
         Address queue_object{}, block{};
+        std::uint32_t error{};
+        std::int32_t owned_descriptor{-1};
         {
             std::lock_guard lock(channels->mutex);
             const auto found = channels->objects.find(object);
@@ -171,7 +186,10 @@ void install_dispatch_objects(Support& support) {
             value.cleaned = true;
             queue_object = value.queue;
             block = std::exchange(value.cleanup, 0);
+            error = value.open_error;
+            if (value.owned && value.descriptor >= 0) owned_descriptor = std::exchange(value.descriptor, -1);
         }
+        if (owned_descriptor >= 0) static_cast<void>(support.call(libsystem, "_close", {static_cast<Address>(owned_descriptor)}));
         if (block) {
             // cleanup_handler(int error): 0 after an orderly close.
             auto delivery = std::make_shared<Delivery>();
@@ -180,7 +198,7 @@ void install_dispatch_objects(Support& support) {
             {
                 std::lock_guard lock(channels->mutex);
                 id = channels->next++;
-                channels->operations.emplace(id, Operation{object, queue_object, block, 0, 0, 0, false});
+                channels->operations.emplace(id, Operation{object, queue_object, block, 0, 0, error, false});
             }
             submit(queue_object, channels->cleanup_entry, id, false);
         }
@@ -239,7 +257,7 @@ void install_dispatch_objects(Support& support) {
             operation = found->second;
             channels->operations.erase(found);
         }
-        static_cast<void>(invoke_block(support, operation.handler, {0}));
+        static_cast<void>(invoke_block(support, operation.handler, {operation.length}));
         block_release(support, operation.handler);
         s.x[0] = 0;
     }, "alchemy.internal");
@@ -254,20 +272,27 @@ void install_dispatch_objects(Support& support) {
         m.write64(record + 24, error);
         submit(operation.queue, channels->deliver_entry, record, true);
     };
-    const auto finish = [&support, channels, maybe_cleanup, release_channel](const Operation& operation) {
+    const auto finish = [&support, channels, maybe_cleanup, release_channel, submit](const Operation& operation) {
         block_release(support, operation.handler);
         static_cast<void>(support.call(libsystem, "_dispatch_release", {operation.queue}));
+        std::vector<Address> barriers;
+        Address queue_object{};
         {
             std::lock_guard lock(channels->mutex);
-            if (const auto found = channels->objects.find(operation.channel); found != channels->objects.end()) --found->second.pending;
+            if (const auto found = channels->objects.find(operation.channel); found != channels->objects.end()) {
+                if (!--found->second.pending) barriers.swap(found->second.barriers);
+                queue_object = found->second.queue;
+            }
         }
+        for (const auto barrier : barriers) submit(queue_object, channels->barrier_entry, barrier, false);
         maybe_cleanup(operation.channel);
         release_channel(operation.channel);   // the reference the operation held
     };
     channels->read_entry = support.process.install_function("___alchemy_completion_dispatch_io_run", [&support, channels, deliver, finish](CpuState& s, GuestMemory& m) {
         Operation operation;
         std::int32_t descriptor{};
-        std::uint64_t type{};
+        std::uint64_t type{}, high_water{UINT64_MAX}, low_water{};
+        std::uint32_t open_error{};
         {
             std::lock_guard lock(channels->mutex);
             const auto found = channels->operations.find(s.x[0]);
@@ -277,18 +302,35 @@ void install_dispatch_objects(Support& support) {
             const auto& channel = channels->objects.at(operation.channel);
             descriptor = channel.descriptor;
             type = channel.type;
+            open_error = channel.open_error;
+            high_water = std::max<std::uint64_t>(1, channel.high_water);
+            low_water = channel.low_water;
         }
         const auto stopped = [&] {
             std::lock_guard lock(channels->mutex);
             return channels->objects.at(operation.channel).stopped;
         };
         std::uint32_t error{};
-        if (!operation.write) {
+        if (open_error) {
+            const auto empty = support.process.resolve(libsystem, "__dispatch_data_empty");
+            deliver(operation, true, operation.write ? operation.data : (empty ? empty->address : 0), open_error);
+            if (operation.write) static_cast<void>(support.call(libsystem, "_dispatch_release", {operation.data}));
+        } else if (!operation.write) {
             GuestBlock buffer(support, chunk, false);
             std::uint64_t consumed{};
+            // Data waiting for the low-water mark (a retained dispatch_data_t, 0 when none).
+            Address held{};
+            std::uint64_t held_size{};
+            const auto hand_over = [&](bool done, std::uint32_t code) {
+                const auto empty = support.process.resolve(libsystem, "__dispatch_data_empty");
+                deliver(operation, done, held ? held : (empty ? empty->address : 0), code);
+                if (held) static_cast<void>(support.call(libsystem, "_dispatch_release", {held}));
+                held = 0; held_size = 0;
+            };
             while (consumed < operation.length) {
                 if (stopped()) { error = error_canceled; break; }
-                const auto want = std::min<std::uint64_t>(chunk, operation.length - consumed);
+                const auto want = std::min({chunk, high_water - std::min(high_water, held_size), operation.length - consumed});
+                if (!want) { hand_over(false, 0); continue; }   // the high-water mark is reached
                 const auto count = static_cast<std::int64_t>(type == io_random
                     ? support.call(libsystem, "_pread", {static_cast<Address>(descriptor), buffer, want, static_cast<Address>(operation.offset + static_cast<std::int64_t>(consumed))})
                     : support.call(libsystem, "_read", {static_cast<Address>(descriptor), buffer, want}));
@@ -296,11 +338,16 @@ void install_dispatch_objects(Support& support) {
                 if (count == 0) break;   // end of file
                 consumed += static_cast<std::uint64_t>(count);
                 const auto data = support.call(libsystem, "_dispatch_data_create", {buffer, static_cast<Address>(count), 0, 0});
-                deliver(operation, false, data, 0);
-                static_cast<void>(support.call(libsystem, "_dispatch_release", {data}));
+                if (held) {
+                    const auto joined = support.call(libsystem, "_dispatch_data_create_concat", {held, data});
+                    static_cast<void>(support.call(libsystem, "_dispatch_release", {held}));
+                    static_cast<void>(support.call(libsystem, "_dispatch_release", {data}));
+                    held = joined;
+                } else held = data;
+                held_size += static_cast<std::uint64_t>(count);
+                if (held_size >= std::max<std::uint64_t>(low_water, 1)) hand_over(false, 0);
             }
-            const auto empty = support.process.resolve(libsystem, "__dispatch_data_empty");
-            deliver(operation, true, empty ? empty->address : 0, error);
+            hand_over(true, error);
         } else {
             GuestBlock pointer(support, 16);
             const auto map = support.call(libsystem, "_dispatch_data_create_map", {operation.data, pointer, pointer + 8});
@@ -382,6 +429,163 @@ void install_dispatch_objects(Support& support) {
         Operation operation{s.x[0], s.x[3], s.x[4], s.x[2], static_cast<std::int64_t>(s.x[1]), 0, true};
         if (!start(operation)) closed_error(s.x[3], s.x[4]);
     });
+    // dispatch_io_t dispatch_io_create_with_path(type, const char* path, int oflag, mode_t mode,
+    // dispatch_queue_t, void (^cleanup)(int)): the channel opens the path now and owns the
+    // descriptor; a failed open makes every operation and the cleanup report its errno.
+    support.function(libsystem, "_dispatch_io_create_with_path", [&support, channels](CpuState& s, GuestMemory& m) {
+        if (s.x[0] != io_stream && s.x[0] != io_random) { s.x[0] = 0; return; }
+        if (!s.x[4]) fail("dispatch_io_create_with_path with a NULL queue");
+        if (!s.x[1] || m.read8(s.x[1]) != '/') { s.x[0] = 0; return; }   // an absolute path is required
+        Channel channel;
+        channel.type = s.x[0];
+        CallRegs registers{};
+        registers.x[0] = s.x[1]; registers.x[1] = s.x[2];
+        registers.push_variadic(static_cast<std::uint64_t>(static_cast<std::uint16_t>(s.x[3])));
+        const auto descriptor = static_cast<std::int32_t>(support.call(libsystem, "_open", registers).x0);
+        if (descriptor < 0) channel.open_error = guest_errno(support);
+        else { channel.descriptor = descriptor; channel.owned = true; }
+        channel.queue = s.x[4];
+        static_cast<void>(support.call(libsystem, "_dispatch_retain", {channel.queue}));
+        channel.cleanup = block_copy(support, s.x[5]);
+        const auto object = support.process.allocate_guest(32, 16);
+        m.fill_bytes(object, 0, 32);
+        m.write64(object, channels->io_class);
+        { std::lock_guard lock(channels->mutex); channels->objects.emplace(object, channel); }
+        s.x[0] = object;
+    });
+    // dispatch_io_t dispatch_io_create_with_io(type, dispatch_io_t, queue, cleanup): a channel on
+    // the other channel's descriptor (owned by neither).
+    support.function(libsystem, "_dispatch_io_create_with_io", [&support, channels](CpuState& s, GuestMemory& m) {
+        if (s.x[0] != io_stream && s.x[0] != io_random) { s.x[0] = 0; return; }
+        if (!s.x[2]) fail("dispatch_io_create_with_io with a NULL queue");
+        Channel channel;
+        {
+            std::lock_guard lock(channels->mutex);
+            const auto found = channels->objects.find(s.x[1]);
+            if (found == channels->objects.end()) fail("dispatch_io_create_with_io of an unknown channel");
+            if (found->second.closed) { s.x[0] = 0; return; }
+            channel.descriptor = found->second.descriptor;
+            channel.open_error = found->second.open_error;
+        }
+        channel.type = s.x[0];
+        channel.queue = s.x[2];
+        static_cast<void>(support.call(libsystem, "_dispatch_retain", {channel.queue}));
+        channel.cleanup = block_copy(support, s.x[3]);
+        const auto object = support.process.allocate_guest(32, 16);
+        m.fill_bytes(object, 0, 32);
+        m.write64(object, channels->io_class);
+        { std::lock_guard lock(channels->mutex); channels->objects.emplace(object, channel); }
+        s.x[0] = object;
+    });
+    // void dispatch_io_barrier(dispatch_io_t, dispatch_block_t): runs once the operations
+    // enqueued before it finished (on the channel's queue).
+    channels->barrier_entry = support.process.install_function("___alchemy_completion_dispatch_io_barrier", [&support](CpuState& s, GuestMemory&) {
+        static_cast<void>(invoke_block(support, s.x[0], {}));
+        block_release(support, s.x[0]);
+        s.x[0] = 0;
+    }, "alchemy.internal");
+    support.function(libsystem, "_dispatch_io_barrier", [&support, channels, submit](CpuState& s, GuestMemory&) {
+        if (!s.x[1]) fail("dispatch_io_barrier with a NULL block");
+        const auto copy = block_copy(support, s.x[1]);
+        Address queue_object{};
+        {
+            std::lock_guard lock(channels->mutex);
+            const auto found = channels->objects.find(s.x[0]);
+            if (found == channels->objects.end()) fail("dispatch_io_barrier of an unknown channel");
+            if (found->second.pending) { found->second.barriers.push_back(copy); return; }
+            queue_object = found->second.queue;
+        }
+        submit(queue_object, channels->barrier_entry, copy, false);
+    });
+    // dispatch_io_set_high_water / _set_low_water(channel, size_t) and
+    // dispatch_io_set_interval(channel, uint64_t interval, flags).
+    for (const auto& [name, which] : std::array<std::pair<const char*, int>, 3>{{
+             {"_dispatch_io_set_high_water", 0}, {"_dispatch_io_set_low_water", 1}, {"_dispatch_io_set_interval", 2}}})
+        support.function(libsystem, name, [channels, which](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(channels->mutex);
+            const auto found = channels->objects.find(s.x[0]);
+            if (found == channels->objects.end()) fail("dispatch I/O setting of an unknown channel");
+            auto& value = found->second;
+            if (which == 0) { value.high_water = s.x[1] ? s.x[1] : 1; if (value.low_water > value.high_water) value.low_water = value.high_water; }
+            else if (which == 1) { value.low_water = s.x[1]; if (value.high_water < value.low_water) value.high_water = value.low_water; }
+            else value.interval = s.x[1];
+        });
+    // dispatch_read(fd, length, queue, ^(dispatch_data_t data, int error)) and
+    // dispatch_write(fd, data, queue, ^(dispatch_data_t remaining, int error)): one handler call
+    // once all the data is read (to SIZE_MAX: the end of file) or written, or on an error.
+    channels->deliver_pair_entry = support.process.install_function("___alchemy_completion_dispatch_io_deliver_pair", [&support](CpuState& s, GuestMemory& m) {
+        static_cast<void>(invoke_block(support, m.read64(s.x[0]), {m.read64(s.x[0] + 8), m.read64(s.x[0] + 16)}));
+        s.x[0] = 0;
+    }, "alchemy.internal");
+    channels->oneshot_entry = support.process.install_function("___alchemy_completion_dispatch_io_oneshot", [&support, channels, submit](CpuState& s, GuestMemory& m) {
+        Operation operation;
+        {
+            std::lock_guard lock(channels->mutex);
+            const auto found = channels->operations.find(s.x[0]);
+            if (found == channels->operations.end()) fail("dispatch_read/dispatch_write without its record");
+            operation = found->second;
+            channels->operations.erase(found);
+        }
+        const auto descriptor = static_cast<Address>(operation.descriptor);
+        std::uint32_t error{};
+        Address result{};
+        if (!operation.write) {
+            GuestBlock buffer(support, chunk, false);
+            std::uint64_t consumed{};
+            while (consumed < operation.length) {
+                const auto want = std::min<std::uint64_t>(chunk, operation.length - consumed);
+                const auto count = static_cast<std::int64_t>(support.call(libsystem, "_read", {descriptor, buffer, want}));
+                if (count < 0) { error = guest_errno(support); break; }
+                if (count == 0) break;
+                consumed += static_cast<std::uint64_t>(count);
+                const auto data = support.call(libsystem, "_dispatch_data_create", {buffer, static_cast<Address>(count), 0, 0});
+                if (result) {
+                    const auto joined = support.call(libsystem, "_dispatch_data_create_concat", {result, data});
+                    static_cast<void>(support.call(libsystem, "_dispatch_release", {result}));
+                    static_cast<void>(support.call(libsystem, "_dispatch_release", {data}));
+                    result = joined;
+                } else result = data;
+            }
+        } else {
+            GuestBlock pointer(support, 16);
+            const auto map = support.call(libsystem, "_dispatch_data_create_map", {operation.data, pointer, pointer + 8});
+            const auto bytes = m.read64(pointer), size = m.read64(pointer + 8);
+            std::uint64_t written{};
+            while (written < size) {
+                const auto count = static_cast<std::int64_t>(support.call(libsystem, "_write", {descriptor, bytes + written, size - written}));
+                if (count < 0) { error = guest_errno(support); break; }
+                written += static_cast<std::uint64_t>(count);
+            }
+            if (written < size) result = support.call(libsystem, "_dispatch_data_create_subrange", {operation.data, written, size - written});
+            static_cast<void>(support.call(libsystem, "_dispatch_release", {map}));
+            static_cast<void>(support.call(libsystem, "_dispatch_release", {operation.data}));
+        }
+        const auto empty = support.process.resolve(libsystem, "__dispatch_data_empty");
+        GuestBlock record(support, 24);
+        m.write64(record, operation.handler);
+        m.write64(record + 8, result ? result : (!operation.write && empty ? empty->address : 0));
+        m.write64(record + 16, error);
+        submit(operation.queue, channels->deliver_pair_entry, record, true);
+        if (result) static_cast<void>(support.call(libsystem, "_dispatch_release", {result}));
+        block_release(support, operation.handler);
+        static_cast<void>(support.call(libsystem, "_dispatch_release", {operation.queue}));
+        s.x[0] = 0;
+    }, "alchemy.internal");
+    for (const bool write : {false, true})
+        support.function(libsystem, write ? "_dispatch_write" : "_dispatch_read", [&support, channels, submit, global_queue, write](CpuState& s, GuestMemory&) {
+            if (!s.x[2] || !s.x[3] || (write && !s.x[1])) fail(write ? "dispatch_write with a NULL queue, data or handler" : "dispatch_read with a NULL queue or handler");
+            Operation operation;
+            operation.descriptor = static_cast<std::int32_t>(s.x[0]);
+            operation.write = write;
+            if (write) { operation.data = s.x[1]; static_cast<void>(support.call(libsystem, "_dispatch_retain", {operation.data})); }
+            else operation.length = s.x[1];
+            operation.queue = s.x[2];
+            static_cast<void>(support.call(libsystem, "_dispatch_retain", {operation.queue}));
+            operation.handler = block_copy(support, s.x[3]);
+            Address id{};
+            { std::lock_guard lock(channels->mutex); id = channels->next++; channels->operations.emplace(id, operation); }
+            submit(global_queue(), channels->oneshot_entry, id, false);
+        });
     // void dispatch_io_close(dispatch_io_t, dispatch_io_close_flags_t)
     support.function(libsystem, "_dispatch_io_close", [channels, maybe_cleanup](CpuState& s, GuestMemory&) {
         {

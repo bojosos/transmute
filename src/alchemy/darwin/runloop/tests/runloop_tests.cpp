@@ -415,8 +415,14 @@ void test_dispatch(Fixture& f) {
     { std::lock_guard lock(f.gate); require(merged[0] == 6 && merged[1] == 4, "data source merge values"); }
     static_cast<void>(f.system("_dispatch_source_cancel", {adder}));
     static_cast<void>(f.system("_dispatch_release", {adder}));
+    // Signal sources are supported; Mach receive sources need the Mach IPC layer, which this fixture does not install.
+    const auto signal = f.system("_dispatch_source_create", {f.symbol(libsystem, "__dispatch_source_type_signal"), 15, 0, serial});
+    require(signal != 0, "signal source");
+    static_cast<void>(f.system("_dispatch_activate", {signal}));
+    static_cast<void>(f.system("_dispatch_source_cancel", {signal}));
+    static_cast<void>(f.system("_dispatch_release", {signal}));
     bool unsupported{};
-    try { static_cast<void>(f.system("_dispatch_source_create", {f.symbol(libsystem, "__dispatch_source_type_signal"), 15, 0, serial})); }
+    try { static_cast<void>(f.system("_dispatch_source_create", {f.symbol(libsystem, "__dispatch_source_type_mach_recv"), 1, 0, serial})); }
     catch (const std::runtime_error& error) { unsupported = std::string(error.what()).find("unsupported") != std::string::npos; }
     require(unsupported, "unsupported source type did not fail explicitly");
     static_cast<void>(f.system("_dispatch_release", {serial}));

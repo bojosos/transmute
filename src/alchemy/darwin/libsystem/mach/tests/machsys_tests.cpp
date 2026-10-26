@@ -30,6 +30,28 @@ void mach(Fixture& f) {
             f.engine.read32(count) == 0, "thread_get_exception_ports reports none");
     require(f.status(sys, "_thread_set_exception_ports", {0, 0x3ffe, 1, 1, 6}) == 46, "thread_set_exception_ports");
     require(f.read_text(f.call(sys, "_mach_error_string", {46})) == "(os/kern) not supported", "mach_error_string");
+    static_cast<void>(f.call(sys, "_mach_error", {f.text("machsys test:"), 46}));   // a line on standard error
+    require(f.status(sys, "_thread_set_state", {0, 6, f.block(272), 68}) == 46 && f.status(sys, "_thread_abort_safely", {0}) == 46,
+            "another thread's registers are not reachable");
+    // vm_read_overwrite copies within this task.
+    const auto source = f.text("overwrite me"), target = f.block(16), copied = f.block(8);
+    require(f.status(sys, "_vm_read_overwrite", {self, source, 12, target, copied}) == 0 && f.read_text(target).substr(0, 12) == "overwrite me" &&
+            f.engine.read64(copied) == 12, "vm_read_overwrite");
+    require(f.status(sys, "_mach_vm_read_overwrite", {self + 1000, source, 12, target, copied}) == 4, "another task is KERN_INVALID_ARGUMENT");
+    // vm_write / mach_vm_copy within this task, vm_inherit, the page sizes and clocks.
+    const auto written = f.block(16), copy_target = f.block(16);
+    require(f.status(sys, "_vm_write", {self, written, source, 9}) == 0 && f.read_text(written).substr(0, 9) == "overwrite", "vm_write");
+    require(f.status(sys, "_mach_vm_copy", {self, source, 12, copy_target}) == 0 && f.read_text(copy_target).substr(0, 12) == "overwrite me", "mach_vm_copy");
+    require(f.status(sys, "_vm_inherit", {self, written, 16, 1}) == 0 && f.status(sys, "_mach_vm_inherit", {self, written, 16, 0}) == 46,
+            "vm_inherit: children get copies only");
+    require(f.memory().read64(f.symbol(sys, "_vm_kernel_page_size")) == 16384 && f.memory().read32(f.symbol(sys, "_vm_kernel_page_shift")) == 14,
+            "vm_kernel_page_size/shift");
+    const auto page = f.block(8), times = f.block(32);
+    require(f.status(sys, "_host_page_size", {f.call(sys, "_host_self"), page}) == 0 && f.memory().read64(page) == 16384, "host_page_size");
+    require(f.status(sys, "_mach_get_times", {times, times + 8, times + 16}) == 0 && f.memory().read64(times) != 0 &&
+            f.memory().read64(times + 16) > 0, "mach_get_times");
+    require(f.call(sys, "_mach_approximate_time") != 0, "mach_approximate_time");
+    require(f.status(sys, "_thread_create", {self, page}) == 46, "Mach threads without pthreads are not supported");
     require(f.call(sys, "_mig_get_reply_port") != 0, "mig_get_reply_port");
     require(f.memory().read8(f.symbol(sys, "_NDR_record") + 4) == 1, "NDR_record int_rep");
 }
@@ -167,6 +189,19 @@ void libc(Fixture& f) {
     const auto wheel = f.call(sys, "_getgrnam", {f.text("wheel")});
     require(wheel && f.engine.read32(wheel + 16) == 0, "getgrnam(wheel)");
     require(f.call(sys, "_getgrnam", {f.text("no-such-group")}) == 0, "unknown group");
+    // getgrent walks the user's group, then wheel; setgrent rewinds.
+    static_cast<void>(f.call(sys, "_setgrent"));
+    require(f.call(sys, "_getgrent") == own && f.call(sys, "_getgrent") == wheel && f.call(sys, "_getgrent") == 0, "getgrent");
+    static_cast<void>(f.call(sys, "_endgrent"));
+    require(f.call(sys, "_getgrent") == own && f.call(sys, "_setgroupent", {1}) == 1 && f.call(sys, "_getgrent") == own, "endgrent/setgroupent rewind");
+    // termios on a descriptor that is not a terminal.
+    const auto pipe = f.block(8);
+    require(f.status(sys, "_pipe", {pipe}) == 0, "pipe");
+    const auto reader = f.engine.read32(pipe);
+    require(f.status(sys, "_tcflow", {reader, 1}) == -1 && f.status(sys, "_tcsendbreak", {reader, 0}) == -1 &&
+            f.status(sys, "_tcgetsid", {reader}) == -1, "tcflow/tcsendbreak/tcgetsid need a terminal");
+    static_cast<void>(f.call(sys, "_close", {reader}));
+    static_cast<void>(f.call(sys, "_close", {f.engine.read32(pipe + 4)}));
     // Guarded descriptors.
     const auto guard = f.block(8);
     f.engine.write64(guard, 0xfeed);

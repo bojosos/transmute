@@ -1,7 +1,9 @@
 // Objective-C runtime on the fx engine (owner: A1): the guest method cache
 // gives the same results as the uncached dispatcher (ALCHEMY_OBJC_CACHE=0)
 // and is flushed by every method change; host->guest sends carry FP, stack
-// and HFA results; a micro-benchmark reports messages/sec and allocations/sec.
+// and HFA results; messages are resolved and forwarded as in objc4; the
+// runtime API beyond dispatch; a micro-benchmark reports messages/sec and
+// allocations/sec.
 //
 // Guest code is hand-assembled ARM64 (encodings from clang
 // --target=arm64-apple-macos11, listed next to each routine).
@@ -318,6 +320,133 @@ void test_dispatch_encoding(const char* object_path) {
     require(f.export_address("_objc_msgSendSuper2") == installed + 0x80 && f.export_address("_objc_msgSendSuper") == installed + 0x98,
         "dispatcher entry offsets differ from dispatch.S");
 }
+// Message forwarding: +resolveInstanceMethod: adds a method, -forwardingTargetForSelector:
+// redirects through objc_msgSend, the host send path and performSelector:, the forward
+// handler receives the original registers, and _objc_msgForward always forwards.
+void test_forwarding(bool cached) {
+    set_cache(cached);
+    Fixture f;
+    const auto root = f.runtime.find_class("NSObject");
+    const auto target_class = f.runtime.register_native_class("ForwardTarget", root, 8);
+    require(f.add_guest_method(target_class, "answer", f.code(return_27)), "target method");
+    const auto target = f.runtime.allocate(target_class);
+    // +resolveInstanceMethod: adds -dynamic the first time it is asked.
+    const auto resolving = f.runtime.register_native_class("ResolvingHost", root, 8);
+    static int resolved{};
+    resolved = 0;   // runs once per cache mode
+    static_cast<void>(f.runtime.add_native_method(resolving, "resolveInstanceMethod:", [&f, resolving](auto& s, auto&) {
+        s.x[0] = 0;
+        if (s.x[2] != f.runtime.selector("dynamic")) return;
+        ++resolved;
+        static_cast<void>(f.runtime.add_native_method(resolving, "dynamic", [](auto& inner, auto&) { inner.x[0] = 42; }, false, "q@:"));
+        s.x[0] = 1;
+    }, true, "B@::"));
+    const auto resolver_object = f.runtime.allocate(resolving);
+    for (int i = 0; i < 3; ++i) require(f.call("_objc_msgSend", {resolver_object, f.runtime.selector("dynamic")}) == 42, "resolved method");
+    require(resolved == 1, "+resolveInstanceMethod: is asked once, then the method exists");
+    // -forwardingTargetForSelector: names the target for -answer.
+    const auto proxy_class = f.runtime.register_native_class("ForwardingProxy", root, 8);
+    static_cast<void>(f.runtime.add_native_method(proxy_class, "forwardingTargetForSelector:", [&f, target](auto& s, auto&) {
+        s.x[0] = s.x[2] == f.runtime.selector("answer") ? target : 0;
+    }, false, "@@::"));
+    const auto proxy = f.runtime.allocate(proxy_class);
+    for (int i = 0; i < 3; ++i) require(f.call("_objc_msgSend", {proxy, f.runtime.selector("answer")}) == 27, "objc_msgSend forwards to the target");
+    require(f.runtime.send(proxy, "answer", {}).x0 == 27, "the host send path forwards");
+    require(f.call("_objc_msgSend", {proxy, f.runtime.selector("performSelector:"), f.runtime.selector("answer")}) == 27, "performSelector: forwards");
+    // Nothing forwards -unknown: the explicit stop.
+    bool stopped{};
+    try { static_cast<void>(f.call("_objc_msgSend", {proxy, f.runtime.selector("unknown:")})); }
+    catch (const std::runtime_error& error) { stopped = std::string(error.what()).find("-[ForwardingProxy unknown:]") != std::string::npos; }
+    require(stopped, "an unforwarded message stops explicitly");
+    // The forward handler sees the original receiver, selector and arguments.
+    static Address seen_receiver{}, seen_sel{};
+    const auto handler = f.process.install_function("__objc_test_forward_handler", [](auto& s, auto&) {
+        seen_receiver = s.x[0]; seen_sel = s.x[1]; s.x[0] = s.x[2] + 1000;
+    }, std::string(alchemy::objc_library));
+    static_cast<void>(f.call("_objc_setForwardHandler", {handler, 0}));
+    require(f.call("_objc_msgSend", {proxy, f.runtime.selector("unknown:"), 5}) == 1005 && seen_receiver == proxy &&
+            seen_sel == f.runtime.selector("unknown:"), "the forward handler gets the message");
+    // class_getMethodImplementation of a missing method is _objc_msgForward, which forwards
+    // even when called with a selector the receiver implements.
+    const auto message_forward = f.export_address("__objc_msgForward");
+    require(f.call("_class_getMethodImplementation", {proxy_class, f.runtime.selector("unknown:")}) == message_forward, "_objc_msgForward IMP");
+    require(f.call("_class_getMethodImplementation", {target_class, f.runtime.selector("answer")}) != message_forward, "an existing IMP");
+    require(f.call_at(message_forward, {target, f.runtime.selector("answer"), 7}) == 1007, "_objc_msgForward forwards an implemented message too");
+    require(f.call_at(message_forward, {proxy, f.runtime.selector("unknown:"), 8}) == 1008, "_objc_msgForward reaches the forward handler");
+    static_cast<void>(f.call("_objc_setForwardHandler", {0, 0}));
+    for (const auto object : {target, proxy, resolver_object}) f.call("_objc_release", {object});
+}
+
+// The runtime API beyond dispatch: versions, method type queries, ivars by Ivar and by name,
+// indexed ivars, object_copy, run-time properties, sel_isMapped, outlined ARC calls.
+void test_runtime_api() {
+    Fixture f;
+    static_cast<void>(f.process.install_function("_malloc", [&f](auto& s, auto&) { s.x[0] = f.process.allocate_guest(s.x[0] ? s.x[0] : 1); },
+        "/usr/lib/libSystem.B.dylib"));
+    const auto root = f.runtime.find_class("NSObject");
+    const auto cls = f.call("_objc_allocateClassPair", {root, f.string("ApiProbe"), 0});
+    require(cls != 0, "objc_allocateClassPair");
+    require(f.call("_class_addIvar", {cls, f.string("_value"), 8, 3, f.string("q")}) == 1 &&
+            f.call("_class_addIvar", {cls, f.string("_object"), 8, 3, f.string("@")}) == 1, "class_addIvar");
+    static_cast<void>(f.call("_objc_registerClassPair", {cls}));
+    require(f.call("_class_getVersion", {cls}) == 0, "class_getVersion before a set");
+    static_cast<void>(f.call("_class_setVersion", {cls, 7}));
+    require(f.call("_class_getVersion", {cls}) == 7, "class_setVersion");
+    // Method type encodings, with and without offsets.
+    require(f.add_guest_method(cls, "sum:with:", f.code(return_42), "q32@0:8q16q24"), "typed method");
+    const auto method = f.call("_class_getInstanceMethod", {cls, f.runtime.selector("sum:with:")});
+    require(f.call("_method_getNumberOfArguments", {method}) == 4, "method_getNumberOfArguments");
+    const auto read = [&f](Address address) { const auto bytes = f.engine.read_string(address, 1, 64); return std::string(bytes.begin(), bytes.end()); };
+    require(read(f.call("_method_copyReturnType", {method})) == "q" && read(f.call("_method_copyArgumentType", {method, 1})) == ":" &&
+            f.call("_method_copyArgumentType", {method, 4}) == 0, "method_copyReturnType/ArgumentType");
+    const auto buffer = f.process.allocate_guest(16);
+    static_cast<void>(f.call("_method_getArgumentType", {method, 0, buffer, 16}));
+    require(read(buffer) == "@", "method_getArgumentType");
+    require(f.add_guest_method(cls, "frame:", f.code(return_42), "{CGRect={CGPoint=dd}{CGSize=dd}}40@0:8^{CGRect={CGPoint=dd}{CGSize=dd}}16@\"NSString\"24@?32"),
+            "struct method");
+    const auto struct_method = f.call("_class_getInstanceMethod", {cls, f.runtime.selector("frame:")});
+    require(f.call("_method_getNumberOfArguments", {struct_method}) == 5 &&
+            read(f.call("_method_copyArgumentType", {struct_method, 3})) == "@\"NSString\"", "nested and quoted types");
+    // Instance variables.
+    const auto object = f.call("_class_createInstance", {cls, 32});
+    const auto value_ivar = f.call("_class_getInstanceVariable", {cls, f.string("_value")});
+    static_cast<void>(f.call("_object_setIvar", {object, value_ivar, 1234}));
+    require(f.call("_object_getIvar", {object, value_ivar}) == 1234, "object_setIvar/object_getIvar");
+    const auto out = f.process.allocate_guest(8);
+    require(f.call("_object_getInstanceVariable", {object, f.string("_value"), out}) == value_ivar && f.engine.read64(out) == 1234,
+            "object_getInstanceVariable");
+    const auto other = f.runtime.allocate(root);
+    require(f.call("_object_setInstanceVariableWithStrongDefault", {object, f.string("_object"), other}) != 0 &&
+            f.call("_objc_msgSend", {other, f.runtime.selector("retainCount")}) == 2, "a strong ivar retains");
+    const auto indexed = f.call("_object_getIndexedIvars", {object});
+    require(indexed > object && indexed - object == f.call("_class_getInstanceSize", {cls}), "object_getIndexedIvars");
+    const auto copy = f.call("_object_copy", {object, 0});
+    require(copy && copy != object && f.call("_object_getIvar", {copy, value_ivar}) == 1234, "object_copy");
+    // Properties added at run time.
+    const auto attributes = f.process.allocate_guest(32);
+    f.engine.write64(attributes, f.string("T")); f.engine.write64(attributes + 8, f.string("@\"NSString\""));
+    f.engine.write64(attributes + 16, f.string("N")); f.engine.write64(attributes + 24, f.string(""));
+    require(f.call("_class_addProperty", {cls, f.string("title"), attributes, 2}) == 1 &&
+            f.call("_class_addProperty", {cls, f.string("title"), attributes, 2}) == 0, "class_addProperty once");
+    const auto property = f.call("_class_getProperty", {cls, f.string("title")});
+    require(property && read(f.call("_property_getAttributes", {property})) == "T@\"NSString\",N", "property attributes");
+    require(read(f.call("_property_copyAttributeValue", {property, f.string("T")})) == "@\"NSString\"" &&
+            f.call("_property_copyAttributeValue", {property, f.string("R")}) == 0, "property_copyAttributeValue");
+    const auto count = f.process.allocate_guest(4);
+    const auto list = f.call("_property_copyAttributeList", {property, count});
+    require(list && f.engine.read32(count) == 2 && read(f.engine.read64(list)) == "T" && read(f.engine.read64(list + 24)) == "", "property_copyAttributeList");
+    require(f.call("_class_replaceProperty", {cls, f.string("title"), attributes, 1}) == 1 &&
+            read(f.call("_property_getAttributes", {f.call("_class_getProperty", {cls, f.string("title")})})) == "T@\"NSString\"", "class_replaceProperty");
+    // Selectors, class lists, outlined ARC calls.
+    require(f.call("_sel_isMapped", {f.runtime.selector("sum:with:")}) == 1 && f.call("_sel_isMapped", {0x12345}) == 0, "sel_isMapped");
+    const auto classes = f.call("_objc_copyClassList", {count});
+    require(classes && f.engine.read32(count) > 1, "objc_copyClassList");
+    require(f.call("_objc_retain_x1", {0, other}) == other && f.call("_objc_msgSend", {other, f.runtime.selector("retainCount")}) == 3, "objc_retain_x1");
+    static_cast<void>(f.call("_objc_release_x1", {0, other}));
+    require(f.call("_objc_msgSend", {other, f.runtime.selector("retainCount")}) == 2, "objc_release_x1");
+    require(f.call("_objc_unretainedObject", {other}) == other, "objc_unretainedObject is the identity");
+}
+
 } // namespace
 
 // A dealloc that destructs the object and keeps its memory, as Chrome's Objective-C zombies do
@@ -388,7 +517,9 @@ int main(int argc, char** argv) {
         if (!bench_only) for (const bool cached : {true, false}) {
             test_dispatch_and_flush(cached);
             test_send(cached);
+            test_forwarding(cached);
         }
+        if (!bench_only) test_runtime_api();
         if (!bench_only) test_concurrent_flush();
         if (!bench_only) test_destructed_memory_kept();
         for (const bool cached : {true, false}) benchmark(cached);

@@ -351,6 +351,9 @@ void misc(Fixture& f) {
     require(f.status(sys, "_csr_get_active_config", {config}) == 0 && f.engine.read32(config) == 0, "csr_get_active_config");
     require(f.status(sys, "___mac_syscall", {f.text("Sandbox"), 0, 0}) == -1, "__mac_syscall");
     require(f.call(sys, "_acl_get_link_np", {f.text("/tmp"), 0x100}) == 0, "acl_get_link_np: no ACL");
+    require(f.call(sys, "_acl_get_fd_np", {0, 0x100}) == 0 && f.call(sys, "_acl_get_file", {f.text("/tmp"), 0x100}) == 0, "no file carries an ACL");
+    require(f.status(sys, "_acl_valid", {0x1000}) == -1, "acl_valid: no acl_t exists");
+    require(f.status(sys, "_fsetattrlist", {0, f.block(24), f.block(16), 16, 0}) == -1, "fsetattrlist: no attribute lists");
     // QoS overrides are tokens.
     const auto override_token = f.call(sys, "_pthread_override_qos_class_start_np", {f.call(sys, "_pthread_self"), 0x19, 0});
     require(override_token != 0 && f.call(sys, "_pthread_override_qos_class_end_np", {override_token}) == 0, "QoS override");

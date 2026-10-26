@@ -284,11 +284,79 @@ void DarwinServices::Impl::install_extra() {
             throw ServiceError{file_failure(set.error())};
         return std::uint64_t{0};
     });
-    install("_copyfile_state_alloc", [this](auto&, auto&) { const auto address = context.allocate_guest(8); std::lock_guard lock(mutex); copy_states.insert(address); return address; }, 0);
-    install("_copyfile_state_free", [this](auto& s, auto&) { if (!s.x[0]) return std::uint64_t{0}; { std::lock_guard lock(mutex); if (!copy_states.erase(s.x[0])) throw ServiceError{einval}; } context.release_guest(s.x[0]); return std::uint64_t{0}; });
+    install("_copyfile_state_alloc", [this](auto&, auto&) { const auto address = context.allocate_guest(8); std::lock_guard lock(mutex); copy_states.emplace(address, CopyState{}); return address; }, 0);
+    install("_copyfile_state_free", [this](auto& s, auto&) {
+        if (!s.x[0]) return std::uint64_t{0};
+        CopyState state;
+        { std::lock_guard lock(mutex); const auto found = copy_states.find(s.x[0]); if (found == copy_states.end()) throw ServiceError{einval}; state = found->second; copy_states.erase(found); }
+        for (const auto name : {state.source_name, state.destination_name}) if (name) context.release_guest(name);
+        context.release_guest(s.x[0]);
+        return std::uint64_t{0};
+    });
+    // copyfile_state_get/_set(state, flag, value): COPYFILE_STATE_SRC_FD 1, SRC_FILENAME 2, DST_FD 3,
+    // DST_FILENAME 4, QUARANTINE 5, STATUS_CB 6, STATUS_CTX 7, COPIED 8, XATTRNAME 9, WAS_CLONED 10.
+    // Descriptors are passed by address, the other values directly; get writes through `value`.
+    // Alchemy copies with the host's copy calls, so no status callback is called and nothing is cloned.
+    install("_copyfile_state_get", [this](auto& s, auto& m) {
+        const auto out = s.x[2];
+        if (!out) throw ServiceError{einval};
+        std::lock_guard lock(mutex);
+        const auto found = copy_states.find(s.x[0]);
+        if (found == copy_states.end()) throw ServiceError{einval};
+        const auto& state = found->second;
+        switch (static_cast<std::uint32_t>(s.x[1])) {
+        case 1: validate(m, out, 4, true); m.write32(out, static_cast<std::uint32_t>(state.source_fd)); break;
+        case 3: validate(m, out, 4, true); m.write32(out, static_cast<std::uint32_t>(state.destination_fd)); break;
+        case 2: validate(m, out, 8, true); m.write64(out, state.source_name); break;
+        case 4: validate(m, out, 8, true); m.write64(out, state.destination_name); break;
+        case 5: validate(m, out, 8, true); m.write64(out, state.quarantine); break;
+        case 6: validate(m, out, 8, true); m.write64(out, state.status_callback); break;
+        case 7: validate(m, out, 8, true); m.write64(out, state.status_context); break;
+        case 8: validate(m, out, 8, true); m.write64(out, static_cast<std::uint64_t>(state.copied)); break;
+        case 9: validate(m, out, 8, true); m.write64(out, 0); break;   // no extended attribute is being copied
+        case 10: validate(m, out, 1, true); m.write8(out, state.cloned ? 1 : 0); break;
+        default: throw ServiceError{einval};
+        }
+        return std::uint64_t{0};
+    });
+    install("_copyfile_state_set", [this](auto& s, auto& m) {
+        const auto flag = static_cast<std::uint32_t>(s.x[1]);
+        const std::uint64_t value = s.x[2];
+        std::string name;
+        if (flag == 2 || flag == 4) name = text(m, value);
+        std::int32_t descriptor = -1;
+        if (flag == 1 || flag == 3) { validate(m, value, 4, false); descriptor = static_cast<std::int32_t>(m.read32(value)); }
+        std::lock_guard lock(mutex);
+        const auto found = copy_states.find(s.x[0]);
+        if (found == copy_states.end()) throw ServiceError{einval};
+        auto& state = found->second;
+        const auto keep = [&](std::uint64_t& slot) {
+            const auto address = context.allocate_guest(name.size() + 1);
+            put_text(m, address, name);
+            if (slot) context.release_guest(slot);
+            slot = address;
+        };
+        switch (flag) {
+        case 1: state.source_fd = descriptor; break;
+        case 3: state.destination_fd = descriptor; break;
+        case 2: keep(state.source_name); break;
+        case 4: keep(state.destination_name); break;
+        case 5: state.quarantine = value; break;
+        case 6: state.status_callback = value; break;
+        case 7: state.status_context = value; break;
+        default: throw ServiceError{einval};
+        }
+        return std::uint64_t{0};
+    });
     install("_fcopyfile", [this](auto& s, auto& m) {
         if (s.x[0] == s.x[1] || s.x[3] != 8) throw ServiceError{einval};
-        if (s.x[2]) { std::lock_guard lock(mutex); if (!copy_states.contains(s.x[2])) throw ServiceError{einval}; }
+        if (s.x[2]) {
+            std::lock_guard lock(mutex);
+            const auto found = copy_states.find(s.x[2]);
+            if (found == copy_states.end()) throw ServiceError{einval};
+            found->second.source_fd = static_cast<std::int32_t>(s.x[0]); found->second.destination_fd = static_cast<std::int32_t>(s.x[1]);
+            found->second.copied = 0; found->second.cloned = false;
+        }
         static_cast<void>(seek(static_cast<int>(s.x[0]), 0, 0)); static_cast<void>(seek(static_cast<int>(s.x[1]), 0, 0));
         const auto buffer = context.allocate_guest(65536);
         try {
@@ -299,6 +367,7 @@ void DarwinServices::Impl::install_extra() {
                 while (written < count) { const auto done = write(m, static_cast<int>(s.x[1]), buffer + written, count - written); if (!done) throw ServiceError{eio}; written += done; }
             }
             const auto length = seek(static_cast<int>(s.x[1]), 0, 1);
+            if (s.x[2]) { std::lock_guard lock(mutex); if (const auto found = copy_states.find(s.x[2]); found != copy_states.end()) found->second.copied = static_cast<std::int64_t>(length); }
             const auto record = file(static_cast<int>(s.x[1]));
             std::lock_guard lock(record->mutex);
             if (record->closed) throw ServiceError{ebadf};
@@ -810,6 +879,69 @@ void DarwinServices::Impl::install_libsystem_files() {
     install("_fstatfs", [this, statfs](auto& s, auto& m) { return statfs(m, file(static_cast<int>(s.x[0]))->path, s.x[1]); });
     for (const auto alias : {"_statfs$INODE64", "_fstatfs$INODE64"})
         context.install_export(std::string(system_library), alias, *context.resolve(system_library, std::string_view(alias).substr(0, std::string_view(alias).find('$'))));
+    // The mounted file systems: the host volume that holds "/" first, then every other host
+    // volume (each mounted on its /Volumes/<name> guest path). Volumes that statfs cannot
+    // read (an empty card reader) are left out, as an unmounted device is.
+    const auto mounted = [this] {
+        std::vector<std::filesystem::path> result{root};
+        if (const auto roots = host::files::volume_roots())
+            for (const auto& value : *roots) {
+                const auto volume_root = utf8_path(value);
+                if (volume_root.root_path() != root.root_path()) result.push_back(volume_root);
+            }
+        return result;
+    };
+    // Fills `count` statfs records at `output`; returns how many were written.
+    const auto fill_mounts = [this, statfs, mounted](transmute::GuestMemory& m, std::uint64_t output, std::uint64_t count) {
+        std::uint64_t written = 0;
+        for (const auto& volume_root : mounted()) {
+            if (written == count) break;
+            try { statfs(m, volume_root, output + written * 2168); ++written; }
+            catch (const ServiceError&) {}
+        }
+        return written;
+    };
+    const auto mount_count = [this, statfs, mounted](transmute::GuestMemory& m) {
+        const auto scratch = context.allocate_guest(2168);
+        std::uint64_t count = 0;
+        for (const auto& volume_root : mounted()) {
+            try { statfs(m, volume_root, scratch); ++count; } catch (const ServiceError&) {}
+        }
+        context.release_guest(scratch);
+        return count;
+    };
+    // int getfsstat(struct statfs* buf, int bufsize, int mode): NULL counts the file systems.
+    install("_getfsstat", [fill_mounts, mount_count](auto& s, auto& m) {
+        const auto size = static_cast<std::int32_t>(s.x[1]);
+        if (!s.x[0]) return mount_count(m);
+        if (size < 0) throw ServiceError{einval};
+        return fill_mounts(m, s.x[0], static_cast<std::uint64_t>(size) / 2168);
+    });
+    // int getmntinfo(struct statfs** mntbufp, int flags): one buffer per process, replaced by the
+    // next call (as Darwin's, which callers must not free); getmntinfo_r_np's is the caller's to free.
+    const auto mount_buffer = std::make_shared<std::pair<std::uint64_t, std::uint64_t>>();   // address, capacity in records
+    const auto mount_info = [this, fill_mounts, mount_count](transmute::GuestMemory& m, std::uint64_t out, bool owned,
+                                                              std::shared_ptr<std::pair<std::uint64_t, std::uint64_t>> shared) {
+        validate(m, out, 8, true);
+        const auto count = mount_count(m);
+        std::uint64_t buffer{};
+        if (owned) {
+            buffer = allocate(std::max<std::uint64_t>(count, 1) * 2168);   // the caller free()s it
+        } else {
+            std::lock_guard lock(mutex);
+            if (shared->second < count) {
+                if (shared->first) context.release_guest(shared->first);
+                shared->first = context.allocate_guest(std::max<std::uint64_t>(count, 1) * 2168);
+                shared->second = std::max<std::uint64_t>(count, 1);
+            }
+            buffer = shared->first;
+        }
+        const auto written = fill_mounts(m, buffer, count);
+        m.write64(out, buffer);
+        return written;
+    };
+    install("_getmntinfo", [mount_info, mount_buffer](auto& s, auto& m) { return mount_info(m, s.x[0], false, mount_buffer); }, 0);
+    install("_getmntinfo_r_np", [mount_info](auto& s, auto& m) { return mount_info(m, s.x[0], true, {}); }, 0);
 
     // Times are nanoseconds since the Unix epoch; empty keeps the existing value.
     const auto set_times = [](const std::filesystem::path& name, std::optional<std::int64_t> access, std::optional<std::int64_t> modified) {
@@ -881,6 +1013,26 @@ void DarwinServices::Impl::install_libsystem_files() {
         if (s.x[2]) { std::lock_guard lock(mutex); if (!copy_states.contains(s.x[2])) throw ServiceError{einval}; }
         if (!s.x[0] || !s.x[1]) throw ServiceError{einval}; // descriptor-only forms use fcopyfile
         const auto from = filesystem_path(m, s.x[0]), to = filesystem_path(m, s.x[1]);
+        if (s.x[2]) {
+            // The state names the paths and counts the bytes copied (copyfile_state_get).
+            const auto source = text(m, s.x[0]), destination = text(m, s.x[1]);
+            std::lock_guard lock(mutex);
+            auto& state = copy_states.at(s.x[2]);
+            for (auto [slot, value] : {std::pair{&state.source_name, &source}, std::pair{&state.destination_name, &destination}}) {
+                const auto address = context.allocate_guest(value->size() + 1);
+                put_text(m, address, *value);
+                if (*slot) context.release_guest(*slot);
+                *slot = address;
+            }
+            state.copied = 0; state.cloned = false;
+        }
+        const auto count_copied = [&] {
+            if (!s.x[2]) return;
+            std::error_code size_error;
+            const auto size = std::filesystem::is_regular_file(to, size_error) ? std::filesystem::file_size(to, size_error) : 0;
+            std::lock_guard lock(mutex);
+            if (const auto found = copy_states.find(s.x[2]); found != copy_states.end() && !size_error) found->second.copied = static_cast<std::int64_t>(size);
+        };
         if (flags & check) throw ServiceError{45};
         if (flags & clone_force) throw ServiceError{45};   // no copy-on-write clones on the host
         std::error_code error;
@@ -894,6 +1046,7 @@ void DarwinServices::Impl::install_libsystem_files() {
             std::filesystem::copy(from, to, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, error);
         } else if (flags & data) {
             std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, error);
+            if (!error) count_copied();
         } else if (std::filesystem::exists(to, error)) {
             // Metadata only: carry the modification time.
             const auto time = std::filesystem::last_write_time(from, error);

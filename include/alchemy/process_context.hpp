@@ -206,6 +206,9 @@ public:
     std::function<bool(std::uint64_t)> adopt_object;
     std::function<void(std::span<const ImageRuntimeInfo>)> prepare_images;
     std::function<void(std::span<const std::uint64_t>)> rollback_images;
+    // A signal delivered to this process (libSystem's kill/raise to itself), before its action
+    // runs, whether that action is a handler, SIG_IGN or the default: dispatch signal sources.
+    std::function<void(int)> signal_observed;
     // Called once the main executable's segments are mapped at their fixed
     // addresses (before its dependencies load): work that may allocate host
     // memory on other threads starts here, never before.

@@ -12,10 +12,15 @@ void install_libsystem_gaps(gui::InstallContext& context) {
     export_fill::install_libsystem_process(p);
     export_fill::install_libsystem_runtime(p);
     export_fill::install_libsystem_misc(p);
+    export_fill::install_libsystem_stdlib(p);
+    export_fill::install_libsystem_ndbm(p);
+    export_fill::install_libsystem_rpc_nis(p);
+    export_fill::install_libsystem_threads_extra(p);
 }
 
 void install_libsystem_services(gui::InstallContext& context) {
     export_fill::Provider p(context.process);
+    export_fill::install_libsystem_xpc(p, context.objc);
     export_fill::install_libsystem_services(p, context.objc);
 }
 

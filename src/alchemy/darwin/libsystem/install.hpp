@@ -4,6 +4,8 @@
 #include "alchemy/darwin/kit/completion/completion_kit.hpp"
 #include "alchemy/darwin/kit/completion/runtime/common.hpp"
 
+namespace alchemy::export_fill { class Provider; }
+
 // libSystem's rows of the GUI installer table (src/alchemy/gui/install.cpp;
 // alchemy-fx only). The core (DarwinServices and what it installs, mach_vm,
 // native, numeric, threads) is installed by alchemy::DarwinProviders.
@@ -13,8 +15,8 @@ namespace alchemy::libsystem {
 // (net/, process/ and misc/libsystem_*.cpp; fill-only), at the position of
 // the former gap-fill group.
 void install_libsystem_gaps(gui::InstallContext& context);
-// ptrace, xpc dates, __getdirentries64, fsctl, mach_vm_region
-// (misc/libsystem_services.cpp; fill-only), later in that position.
+// ptrace, __getdirentries64, fsctl, mach_vm_region (misc/libsystem_services.cpp)
+// and the XPC C API (misc/xpc_objects.cpp); fill-only, later in that position.
 void install_libsystem_services(gui::InstallContext& context);
 // In-process and cross-process Mach IPC (mach/mach_exports.cpp) and notify(3)
 // (mach/notify.cpp), before the fill-only set (the former install_chrome_support).
@@ -35,3 +37,12 @@ using gui::completion_kit::install_os_log_store;      // misc/oslog_store.cpp
 using gui::completion_kit::install_xpc;               // misc/xpc.cpp
 
 } // namespace alchemy::libsystem
+
+// Pieces of install_libsystem_gaps (fill-only, shared kit src/alchemy/darwin/kit/export_fill/).
+namespace alchemy::export_fill {
+void install_libsystem_stdlib(Provider& p);     // misc/stdlib_extra.cpp: rand48, crypt
+void install_libsystem_ndbm(Provider& p);       // misc/ndbm.cpp: ndbm(3)
+void install_libsystem_rpc_nis(Provider& p);    // net/rpc_nis.cpp: NIS and Sun RPC (unavailable)
+void install_libsystem_xpc(Provider& p, ObjcRuntime& objc);   // misc/xpc_objects.cpp: XPC objects and connections
+void install_libsystem_threads_extra(Provider& p);   // process/threads_extra.cpp: QoS, stack attributes, ceilings
+} // namespace alchemy::export_fill

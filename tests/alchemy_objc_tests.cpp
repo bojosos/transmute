@@ -167,9 +167,9 @@ void test_dynamic_registration() {
         "deallocation did not clear weak references");
     f.call("_objc_destroyWeak", {weak}); f.call("_objc_destroyWeak", {weak + 8});
     bool unsupported{}; try { f.call("_objc_exception_throw", {0}); } catch (const std::runtime_error& error) {
-        unsupported = std::string_view(error.what()).find("exceptions are unsupported") != std::string_view::npos;
+        unsupported = std::string_view(error.what()).find("Objective-C exceptions need libc++abi") != std::string_view::npos;
     }
-    require(unsupported, "Objective-C exception use did not produce a specific diagnostic");
+    require(unsupported, "an Objective-C throw without the LLVM runtime did not produce a specific diagnostic");
 }
 void test_protected_transaction_rollback() {
     Fixture f; constexpr Address data = 0x300000000ULL;

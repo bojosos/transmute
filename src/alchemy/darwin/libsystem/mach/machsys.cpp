@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <optional>
 #include <mutex>
@@ -119,6 +120,7 @@ public:
 
     // struct group {char *gr_name; char *gr_passwd; gid_t gr_gid; char **gr_mem;}
     std::map<std::uint32_t, Address> groups;
+    std::size_t group_cursor{};   // getgrent position in the two-entry database
     Address group(std::optional<std::uint32_t> gid, const std::string& name) {
         auto& m = memory();
         const auto user_gid = static_cast<std::uint32_t>(call(libsystem, "_getgid", {}));
@@ -196,6 +198,17 @@ void Machsys::install_mach() {
         if (!slot) slot = cstring(text);
         s.x[0] = slot;
     });
+    // mach_error(str, error): "<str> <mach_error_string(error)> (<hex error>)" on standard error.
+    raw(libsystem, "_mach_error", [this](CpuState& s, GuestMemory& m) {
+        const auto prefix = s.x[0] ? read_cstring(m, s.x[0]) : std::string();
+        const auto text = read_cstring(m, call(libsystem, "_mach_error_string", {s.x[1]}));
+        char code[16];
+        std::snprintf(code, sizeof code, "%x", static_cast<std::uint32_t>(s.x[1]));
+        const auto line = prefix + " " + text + " (" + code + ")\n";
+        const auto buffer = strdup(line);
+        static_cast<void>(call(libsystem, "_write", {2, buffer, line.size()}));
+        free(buffer);
+    });
 
     // Tasks: only the calling task is known.
     raw(libsystem, "_task_self_trap", [this](CpuState& s, GuestMemory&) { s.x[0] = task_self(); });
@@ -227,6 +240,14 @@ void Machsys::install_mach() {
         if (s.x[3]) m.write32(s.x[3], 0);
         s.x[0] = kern_not_supported;
     });
+    // Another guest thread's registers are not reachable (as thread_get_state):
+    // thread_set_state, thread_abort(_safely) and thread_get_register_pointer_values.
+    for (const auto* name : {"_thread_set_state", "_thread_abort", "_thread_abort_safely"})
+        failure(libsystem, name, kern_not_supported);
+    raw(libsystem, "_thread_get_register_pointer_values", [](CpuState& s, GuestMemory& m) {
+        if (s.x[2]) m.write64(s.x[2], 0);
+        s.x[0] = kern_not_supported;
+    });
     // thread_switch(port, option, time_ms): SWITCH_OPTION_DEPRESS/WAIT block
     // for `time` milliseconds, SWITCH_OPTION_NONE yields.
     raw(libsystem, "_thread_switch", [](CpuState& s, GuestMemory&) {
@@ -237,9 +258,12 @@ void Machsys::install_mach() {
         s.x[0] = kern_success;
     });
 
-    // VM: the mach_vm_* names share the vm_* implementations (identical ABI on arm64).
-    for (const auto& [alias, target] : std::array<std::pair<const char*, const char*>, 3>{{
-             {"_mach_vm_map", "_vm_map"}, {"_mach_vm_remap", "_vm_remap"}, {"_vm_region_64", "_mach_vm_region"}}}) {
+    // VM: the mach_vm_* and vm_* names share implementations (identical ABI on arm64, where
+    // vm_address_t and vm_size_t are 64-bit).
+    for (const auto& [alias, target] : std::array<std::pair<const char*, const char*>, 7>{{
+             {"_mach_vm_map", "_vm_map"}, {"_mach_vm_remap", "_vm_remap"}, {"_vm_region_64", "_mach_vm_region"},
+             {"_mach_vm_allocate", "_vm_allocate"}, {"_mach_vm_deallocate", "_vm_deallocate"}, {"_mach_vm_protect", "_vm_protect"},
+             {"_vm_region", "_mach_vm_region"}}}) {
         if (has(libsystem, alias)) continue;
         if (const auto found = process.resolve(libsystem, target))
             process.install_export(std::string(libsystem), alias, {found->address, ExportKind::function});
@@ -259,6 +283,95 @@ void Machsys::install_mach() {
         m.write64(s.x[3], copy);
         m.write32(s.x[4], static_cast<std::uint32_t>(size));
         s.x[0] = kern_success;
+    });
+    // (mach_)vm_read_overwrite(task, address, size, data, *outsize): a copy into the caller's
+    // buffer; this task only, KERN_INVALID_ADDRESS when the source is not readable.
+    for (const auto* name : {"_vm_read_overwrite", "_mach_vm_read_overwrite"})
+        raw(libsystem, name, [this](CpuState& s, GuestMemory& m) {
+            if (static_cast<std::uint32_t>(s.x[0]) != task_self()) { s.x[0] = kern_invalid_argument; return; }
+            const auto source = s.x[1], size = s.x[2], target = s.x[3];
+            if ((size && !target) || size > 0xffffffffULL) { s.x[0] = kern_invalid_argument; return; }
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+            try { if (size) m.read_bytes(source, bytes); } catch (const std::exception&) { s.x[0] = kern_invalid_address; return; }
+            try { if (size) m.write_bytes(target, bytes); } catch (const std::exception&) { s.x[0] = kern_invalid_address; return; }
+            if (s.x[4]) m.write64(s.x[4], size);
+            s.x[0] = kern_success;
+        });
+    // vm_read is mach_vm_read (registered just above).
+    if (const auto found = process.resolve(libsystem, "_mach_vm_read"); found && !has(libsystem, "_vm_read"))
+        process.install_export(std::string(libsystem), "_vm_read", {found->address, ExportKind::function});
+    // (mach_)vm_write(task, address, data, count) and (mach_)vm_copy(task, source, size, dest):
+    // copies within this task; KERN_INVALID_ADDRESS when a range is not accessible.
+    for (const auto* name : {"_vm_write", "_mach_vm_write"})
+        raw(libsystem, name, [this](CpuState& s, GuestMemory& m) {
+            if (static_cast<std::uint32_t>(s.x[0]) != task_self()) { s.x[0] = kern_invalid_argument; return; }
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(static_cast<std::uint32_t>(s.x[3])));
+            try { if (!bytes.empty()) { m.read_bytes(s.x[2], bytes); m.write_bytes(s.x[1], bytes); } }
+            catch (const std::exception&) { s.x[0] = kern_invalid_address; return; }
+            s.x[0] = kern_success;
+        });
+    for (const auto* name : {"_vm_copy", "_mach_vm_copy"})
+        raw(libsystem, name, [this](CpuState& s, GuestMemory& m) {
+            if (static_cast<std::uint32_t>(s.x[0]) != task_self() || s.x[2] > 0xffffffffULL) { s.x[0] = kern_invalid_argument; return; }
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(s.x[2]));
+            try { if (!bytes.empty()) { m.read_bytes(s.x[1], bytes); m.write_bytes(s.x[3], bytes); } }
+            catch (const std::exception&) { s.x[0] = kern_invalid_address; return; }
+            s.x[0] = kern_success;
+        });
+    // (mach_)vm_inherit(task, address, size, inheritance): fork children get copies of this
+    // task's memory (VM_INHERIT_COPY 1); sharing (0) or omitting (2) a range is not supported.
+    for (const auto* name : {"_vm_inherit", "_mach_vm_inherit"})
+        raw(libsystem, name, [this](CpuState& s, GuestMemory&) {
+            if (static_cast<std::uint32_t>(s.x[0]) != task_self()) { s.x[0] = kern_invalid_argument; return; }
+            const auto inheritance = static_cast<std::uint32_t>(s.x[3]);
+            s.x[0] = inheritance == 1 ? kern_success : inheritance <= 2 ? kern_not_supported : kern_invalid_argument;
+        });
+    // (mach_)vm_msync(task, address, size, flags): msync(2) of the range (VM_SYNC_ASYNCHRONOUS
+    // 0x1 -> MS_ASYNC, else MS_SYNC; VM_SYNC_INVALIDATE 0x4 -> MS_INVALIDATE).
+    for (const auto* name : {"_vm_msync", "_mach_vm_msync"})
+        raw(libsystem, name, [this](CpuState& s, GuestMemory&) {
+            if (static_cast<std::uint32_t>(s.x[0]) != task_self()) { s.x[0] = kern_invalid_argument; return; }
+            const auto flags = static_cast<std::uint32_t>(s.x[3]);
+            const std::uint64_t mode = ((flags & 1) ? 0x1 : 0x10) | ((flags & 4) ? 0x2 : 0);
+            const auto page = s.x[1] & ~0x3fffULL, size = s.x[2] + (s.x[1] - page);
+            s.x[0] = static_cast<std::int32_t>(call(libsystem, "_msync", {page, size, mode})) == 0 ? kern_success : kern_invalid_address;
+        });
+    // vm_kernel_page_size / _mask / _shift: the kernel's pages are 16 KiB too.
+    {
+        const std::array<std::uint8_t, 8> size{0, 0x40, 0, 0, 0, 0, 0, 0}, mask{0xff, 0x3f, 0, 0, 0, 0, 0, 0};
+        const std::array<std::uint8_t, 4> shift{14, 0, 0, 0};
+        data(libsystem, "_vm_kernel_page_size", size, 8);
+        data(libsystem, "_vm_kernel_page_mask", mask, 8);
+        data(libsystem, "_vm_kernel_page_shift", shift, 4);
+    }
+    // host_page_size(host, vm_size_t*): 16 KiB.
+    raw(libsystem, "_host_page_size", [](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) { s.x[0] = kern_invalid_argument; return; }
+        m.write64(s.x[1], 16384); s.x[0] = kern_success;
+    });
+    // host_self is mach_host_self; the privileged host port needs root (MACH_PORT_NULL).
+    if (const auto found = process.resolve(libsystem, "_mach_host_self"); found && !has(libsystem, "_host_self"))
+        process.install_export(std::string(libsystem), "_host_self", {found->address, ExportKind::function});
+    raw(libsystem, "_host_priv_self", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    // mach_approximate_time / mach_continuous_approximate_time are the exact clocks here.
+    for (const auto& [alias, target] : std::array<std::pair<const char*, const char*>, 2>{{
+             {"_mach_approximate_time", "_mach_absolute_time"}, {"_mach_continuous_approximate_time", "_mach_continuous_time"}}})
+        if (const auto found = process.resolve(libsystem, target); found && !has(libsystem, alias))
+            process.install_export(std::string(libsystem), alias, {found->address, ExportKind::function});
+    // kern_return_t mach_get_times(uint64_t* absolute, uint64_t* continuous, struct timespec* now)
+    raw(libsystem, "_mach_get_times", [this](CpuState& s, GuestMemory& m) {
+        if (s.x[0]) m.write64(s.x[0], call(libsystem, "_mach_absolute_time", {}));
+        if (s.x[1]) m.write64(s.x[1], call(libsystem, "_mach_continuous_time", {}));
+        if (s.x[2]) static_cast<void>(call(libsystem, "_clock_gettime", {0, s.x[2]}));
+        s.x[0] = kern_success;
+    });
+    // Mach threads without pthreads, and ending another thread, are not supported.
+    for (const auto* name : {"_thread_create", "_thread_create_running", "_thread_terminate"})
+        failure(libsystem, name, kern_not_supported);
+    // semaphore_wait_signal(wait, signal): signals one semaphore, then waits on the other.
+    raw(libsystem, "_semaphore_wait_signal", [this](CpuState& s, GuestMemory&) {
+        const auto signaled = call(libsystem, "_semaphore_signal", {s.x[1]});
+        s.x[0] = signaled != kern_success ? signaled : call(libsystem, "_semaphore_wait", {s.x[0]});
     });
     // vm_page_mask / vm_page_shift: arm64 Darwin pages are 16 KiB (vm_page_size).
     const std::array<std::uint8_t, 8> mask{0xff, 0x3f, 0, 0, 0, 0, 0, 0};
@@ -451,6 +564,25 @@ void Machsys::install_libc() {
         set_errno(queue == 1 || queue == 3 ? e_notsup : e_inval);
         s.x[0] = status(-1);
     });
+    // tcflow(fd, action): TCOOFF 1, TCOON 2, TCIOFF 3, TCION 4. The console has no flow
+    // control to suspend or restart, so a valid action is not supported.
+    raw(libsystem, "_tcflow", [this](CpuState& s, GuestMemory&) {
+        if (call(libsystem, "_isatty", {s.x[0]}) == 0) { set_errno(e_notty); s.x[0] = status(-1); return; }
+        const auto action = static_cast<std::uint32_t>(s.x[1]);
+        set_errno(action >= 1 && action <= 4 ? e_notsup : e_inval);
+        s.x[0] = status(-1);
+    });
+    // tcsendbreak(fd, duration): a console is not a serial line; there is no break to send.
+    raw(libsystem, "_tcsendbreak", [this](CpuState& s, GuestMemory&) {
+        if (call(libsystem, "_isatty", {s.x[0]}) == 0) { set_errno(e_notty); s.x[0] = status(-1); return; }
+        set_errno(e_notsup);
+        s.x[0] = status(-1);
+    });
+    // tcgetsid(fd): the session of the terminal, which is this process's controlling terminal.
+    raw(libsystem, "_tcgetsid", [this](CpuState& s, GuestMemory&) {
+        if (call(libsystem, "_isatty", {s.x[0]}) == 0) { set_errno(e_notty); s.x[0] = status(-1); return; }
+        s.x[0] = call(libsystem, "_getsid", {0});
+    });
     // creat(path, mode) = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode) (mode is variadic).
     raw(libsystem, "_creat", [this](CpuState& s, GuestMemory&) {
         CallRegs registers{};
@@ -488,6 +620,16 @@ void Machsys::install_libc() {
     // Groups: the user's own primary group (named after the user) and wheel.
     raw(libsystem, "_getgrgid", [this](CpuState& s, GuestMemory&) { s.x[0] = group(static_cast<std::uint32_t>(s.x[0]), {}); });
     raw(libsystem, "_getgrnam", [this](CpuState& s, GuestMemory& m) { s.x[0] = group(std::nullopt, read_cstring(m, s.x[0])); });
+    // getgrent/setgrent/endgrent walk the same database: the user's group, then wheel.
+    raw(libsystem, "_getgrent", [this](CpuState& s, GuestMemory&) {
+        std::size_t index;
+        { std::lock_guard lock(mutex); index = group_cursor; if (index < 2) ++group_cursor; }
+        s.x[0] = index == 0 ? group(static_cast<std::uint32_t>(call(libsystem, "_getgid", {})), {}) : index == 1 ? group(0, {}) : 0;
+    });
+    raw(libsystem, "_setgrent", [this](CpuState&, GuestMemory&) { std::lock_guard lock(mutex); group_cursor = 0; });
+    raw(libsystem, "_endgrent", [this](CpuState&, GuestMemory&) { std::lock_guard lock(mutex); group_cursor = 0; });
+    // int setgroupent(int stayopen): rewinds as setgrent; 1 (the database is always open).
+    raw(libsystem, "_setgroupent", [this](CpuState& s, GuestMemory&) { { std::lock_guard lock(mutex); group_cursor = 0; } s.x[0] = 1; });
     // getpeereid(fd, uid*, gid*): every Alchemy process runs as the same user.
     raw(libsystem, "_getpeereid", [this](CpuState& s, GuestMemory& m) {
         const auto info = process.allocate_guest(144);

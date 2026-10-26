@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -301,7 +302,9 @@ struct ObjcRuntime::Impl {
     struct Arena { std::mutex mutex; Address cursor{}, end{}; } arena;
     static constexpr std::uint64_t arena_chunk = 64 * 1024;
     Address sel_retain{}, sel_release{}, sel_autorelease{}, sel_dealloc{}, sel_initialize{}, sel_alloc{}, sel_init{},
-        sel_construct{}, sel_destruct{};
+        sel_construct{}, sel_destruct{}, sel_resolve_instance{}, sel_resolve_class{}, sel_forwarding_target{};
+    Address forward_handler{};   // objc_setForwardHandler
+    Address message_forward{};   // _objc_msgForward: the dispatcher's slow path in mode 3
     std::mutex payload_mutex; // host_state creation
     // Weak references: location -> object and object -> locations (weak_mutex).
     std::mutex weak_mutex;
@@ -685,12 +688,19 @@ struct ObjcRuntime::Impl {
         }
         return value->address;
     }
-    Address ivar_descriptor(const ObjcIvarInfo& value) {
+    // The Ivar of `owner`'s instance variable: one descriptor per class and name, so lookups
+    // compare equal. Caller holds mutex.
+    std::map<std::pair<Address, std::string>, Address> ivar_descriptors;
+    Address ivar_descriptor(Address owner, const ObjcIvarInfo& value) {
+        auto& slot = ivar_descriptors[{owner, value.name}];
+        if (slot) { ivar_records.insert_or_assign(slot, value); return slot; }
         const auto address = arena_allocate(32);
         auto& memory = process.main_engine();
         memory.write64(address, value.offset_address); memory.write64(address + 8, string(value.name));
         memory.write64(address + 16, string(value.types)); memory.write32(address + 24, value.alignment); memory.write32(address + 28, value.size);
-        ivar_records.emplace(address, value); return address;
+        ivar_records.emplace(address, value);
+        slot = address;
+        return address;
     }
     Address add_native(Address address, std::string name, transmute::GuestCallHandler handler, bool class_method, std::string types = "@@:") {
         if (!handler) throw std::runtime_error("Objective-C native method has no handler");
@@ -732,7 +742,13 @@ struct ObjcRuntime::Impl {
             value.initialize_changed.notify_all(); throw;
         }
     }
-    Address lookup(Address receiver, Address sel, unsigned super_mode, const transmute::GuestMemory& memory, Address caller = 0) {
+    // super_mode: 0 objc_msgSend, 1 objc_msgSendSuper2, 2 objc_msgSendSuper, 3 _objc_msgForward.
+    Address lookup(Address receiver, Address sel, unsigned super_mode, const transmute::GuestMemory& memory, Address caller = 0,
+                   Address* forwarded = nullptr) {
+        if (super_mode == 3) {
+            if (!receiver) return nil;
+            return forward(receiver, object_class(receiver), 0, sel, memory, forwarded, true);
+        }
         Address start{};
         if (super_mode) {
             const auto original = receiver;
@@ -744,12 +760,15 @@ struct ObjcRuntime::Impl {
                 if (!start && receiver) throw std::runtime_error("Objective-C super message from a root class");
             }
         }
-        return resolve(receiver, start, sel, memory, caller);
+        return resolve(receiver, start, sel, memory, caller, super_mode ? nullptr : forwarded);
     }
     // objc_msgSend's method resolution: +initialize, then the method found
     // from `start` (0: the receiver's class) up the superclass chain. Fills
     // the start class's cache once the receiver's class is initialized.
-    Address resolve(Address receiver, Address start, Address sel, const transmute::GuestMemory& memory, Address caller) {
+    // `forwarded`, when the caller can replace the receiver (objc_msgSend's slow path and the
+    // host send path), receives the -forwardingTargetForSelector: target the IMP belongs to.
+    Address resolve(Address receiver, Address start, Address sel, const transmute::GuestMemory& memory, Address caller,
+                    Address* forwarded = nullptr) {
         if (!receiver) return nil;
         const auto actual = object_class(receiver);
         auto* initialize_class = class_table.find(receiver);
@@ -757,13 +776,12 @@ struct ObjcRuntime::Impl {
         if (!initialize_class->initialized.load(std::memory_order_acquire)) initialize(initialize_class->address);
         const auto from = start ? start : actual;
         if (const auto imp = cache_probe(from, sel)) { perf::add(perf::objc_slow_cached); return imp; }
-        std::lock_guard lock(mutex);
+        std::unique_lock lock(mutex);
         const auto entry = method(from, sel);
         if (trace_filter().enabled) trace(receiver, actual, sel, entry, memory, caller);
         if (!entry) {
-            if (probe_messages.load(std::memory_order_relaxed)) return probe_missing(receiver, actual, sel, memory);
-            throw std::runtime_error("unsupported Objective-C message " + message_name(receiver, actual, sel, memory) +
-                " (message forwarding is unsupported)");
+            lock.unlock();
+            return forward(receiver, actual, start, sel, memory, forwarded, false);
         }
         // The dispatcher probes the class named by the receiver's isa word.
         if (cache_enabled && initialize_class->initialized.load(std::memory_order_acquire) &&
@@ -772,6 +790,63 @@ struct ObjcRuntime::Impl {
             perf::add(perf::objc_slow_filled);
         }
         return entry->implementation;
+    }
+    // Message forwarding for a message no method answers, in objc4's order:
+    // +resolveInstanceMethod: (+resolveClassMethod: for a class receiver) may add the method;
+    // -forwardingTargetForSelector: may name another receiver (where the caller can replace
+    // it, and not for super sends); then the forward handler objc_setForwardHandler installed
+    // (Foundation's -forwardInvocation: path) receives the original message registers. With
+    // none of these, the message stops explicitly. `skip_resolve`: _objc_msgForward, which
+    // forwards without resolving.
+    Address forward(Address receiver, Address actual, Address start, Address sel, const transmute::GuestMemory& memory,
+                    Address* forwarded, bool skip_resolve) {
+        thread_local unsigned depth = 0;
+        struct Depth { Depth() { ++depth; } ~Depth() { --depth; } } nested;
+        if (depth > 32) throw std::runtime_error("Objective-C message forwarding does not end: " + message_name(receiver, actual, sel, memory));
+        const bool class_receiver = [&] { const auto* value = class_table.find(receiver); return value && !value->protocol_marker; }();
+        const auto resolver = class_receiver ? sel_resolve_class : sel_resolve_instance;
+        if (!skip_resolve && sel != sel_resolve_class && sel != sel_resolve_instance && sel != sel_forwarding_target) {
+            CallRegs query{};
+            query.x[2] = sel;
+            if (send_message(class_receiver ? receiver : actual, 0, resolver, query).x0 & 0xff)
+                if (const auto entry = method(start ? start : actual, sel)) return entry->implementation;
+        }
+        if (forwarded && !start && sel != sel_forwarding_target && sel != sel_resolve_class && sel != sel_resolve_instance) {
+            CallRegs query{};
+            query.x[2] = sel;
+            const auto target = send_message(receiver, 0, sel_forwarding_target, query).x0;
+            if (target && target != receiver) {
+                *forwarded = target;
+                return resolve(target, 0, sel, memory, 0, forwarded);
+            }
+        }
+        Address handler{};
+        { std::lock_guard lock(mutex); handler = forward_handler; }
+        if (handler) return handler;
+        if (probe_messages.load(std::memory_order_relaxed)) return probe_missing(receiver, actual, sel, memory);
+        if (skip_resolve)
+            throw std::runtime_error("unsupported Objective-C message forwarding (_objc_msgForward) of " +
+                (sel ? text(memory, sel) : std::string("a null selector")) + " to " + message_name(receiver, actual, sel, memory) +
+                " (nothing forwards it)");
+        throw std::runtime_error("unsupported Objective-C message " + message_name(receiver, actual, sel, memory) +
+            " (no method, and nothing resolves or forwards it)");
+    }
+    // class_getMethodImplementation's answer: the method's IMP after resolution, else
+    // _objc_msgForward (which forwards when called).
+    Address implementation_or_forward(Address cls_address, Address sel) {
+        if (!cls_address || !sel) return 0;
+        if (const auto entry = method(cls_address, sel)) return entry->implementation;
+        bool meta{};
+        { std::lock_guard lock(mutex); meta = cls(cls_address)->metaclass; }
+        // A metaclass's instances are classes: +resolveClassMethod: goes to the class itself,
+        // which a metaclass record does not name here, so only instance methods resolve.
+        if (!meta) {
+            CallRegs query{};
+            query.x[2] = sel;
+            if (send_message(cls_address, 0, sel_resolve_instance, query).x0 & 0xff)
+                if (const auto entry = method(cls_address, sel)) return entry->implementation;
+        }
+        return message_forward;
     }
     // Probe mode: log the missing message once and answer with the nil IMP
     // (zero x0/x1/v0-v3). Never cached, so a method added later still wins.
@@ -932,8 +1007,9 @@ struct ObjcRuntime::Impl {
     }
     CallResult send_message(Address receiver, Address start, Address sel, CallRegs registers) {
         if (!receiver) { CallResult zero{}; zero.complete = true; return zero; }
-        const auto imp = resolve(receiver, start, sel, process.calling_engine(), 0);
-        registers.x[0] = receiver; registers.x[1] = sel;
+        Address forwarded{};
+        const auto imp = resolve(receiver, start, sel, process.calling_engine(), 0, start ? nullptr : &forwarded);
+        registers.x[0] = forwarded ? forwarded : receiver; registers.x[1] = sel;
         return call_imp(imp, registers);
     }
     // `extra`: class_createInstance's indexed bytes after the instance
@@ -1326,16 +1402,13 @@ struct ObjcRuntime::Impl {
             { std::lock_guard lock(mutex); if (s.x[0]) for (const auto& [sel, entry] : cls(s.x[0])->methods) values.push_back(entry.descriptor); }
             s.x[0] = copy_words(values, s.x[1], m);
         });
-        // The forwarding entry point: an IMP that starts message forwarding.
-        // Alchemy's dispatch never forwards (an unknown selector stops), so a
-        // call here stops with the selector's name.
-        function("__objc_msgForward", [this](auto& s, auto& m) {
-            throw std::runtime_error("unsupported Objective-C message forwarding (_objc_msgForward) of " +
-                                     (s.x[1] ? text(m, s.x[1]) : std::string("a null selector")));
-        });
+        // _objc_msgForward: an IMP that forwards the message it is called with (forward()).
+        process.install_export(objc_library, "__objc_msgForward", {message_forward, ExportKind::function});
+        // void objc_setForwardHandler(void* fwd, void* fwd_stret): fwd_stret has no use on arm64.
+        function("_objc_setForwardHandler", [this](auto& s, auto&) { std::lock_guard lock(mutex); forward_handler = s.x[0]; });
         function("_class_copyIvarList", [this](auto& s, auto& m) {
             std::vector<Address> values;
-            { std::lock_guard lock(mutex); if (s.x[0]) for (const auto& ivar : cls(s.x[0])->ivars) values.push_back(ivar_descriptor(ivar)); }
+            { std::lock_guard lock(mutex); if (s.x[0]) for (const auto& ivar : cls(s.x[0])->ivars) values.push_back(ivar_descriptor(s.x[0], ivar)); }
             s.x[0] = copy_words(values, s.x[1], m);
         });
         function("_objc_constructInstance", [this](auto& s, auto& m) {
@@ -1381,6 +1454,215 @@ struct ObjcRuntime::Impl {
             class_record(address).block = block;
         }
     }
+    // Runtime API state: class_setVersion's versions, layouts set before registration, and the
+    // guest copies of image names class_getImageName returns (runtime lock).
+    std::map<Address, std::int32_t> class_versions;
+    std::map<std::pair<Address, bool>, Address> ivar_layouts;
+    std::map<Address, Address> image_names;
+    Address image_name(Address module) {
+        {
+            std::lock_guard lock(mutex);
+            if (const auto found = image_names.find(module); found != image_names.end()) return found->second;
+        }
+        for (const auto& image : process.images())
+            if (image.module_id == module) {
+                const auto address = string(image.name);
+                std::lock_guard lock(mutex);
+                return image_names.emplace(module, address).first->second;
+            }
+        return 0;
+    }
+    // A malloc'd block the guest frees (method_copyReturnType, property_copyAttributeList).
+    Address malloc_block(std::uint64_t size) {
+        const auto allocator = process.resolve(system_library, "_malloc");
+        if (!allocator) throw std::runtime_error("Objective-C copies require the libSystem allocator");
+        const std::array<Address, 1> bytes{std::max<std::uint64_t>(size, 1)};
+        const auto result = process.calling_engine().invoke_callback(allocator->address, bytes);
+        if (!result) throw std::runtime_error("Objective-C copy allocation failed");
+        return result;
+    }
+    Address malloc_text(transmute::GuestMemory& memory, const std::string& value) {
+        const auto result = malloc_block(value.size() + 1);
+        if (!value.empty()) memory.write_bytes(result, std::span(reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+        memory.write8(result + value.size(), 0);
+        return result;
+    }
+    // An Objective-C type encoding split into its types (return type first), each without
+    // its frame offset: "v24@0:8@16" is {"v", "@", ":", "@"}.
+    static std::vector<std::string> split_types(std::string_view encoding) {
+        std::vector<std::string> result;
+        std::size_t at = 0;
+        const auto skip_digits = [&] { if (at < encoding.size() && encoding[at] == '-') ++at; while (at < encoding.size() && std::isdigit(static_cast<unsigned char>(encoding[at]))) ++at; };
+        std::function<void()> one = [&] {
+            while (at < encoding.size() && std::string_view("rnNoORVA+j|!").find(encoding[at]) != std::string_view::npos) ++at;
+            if (at >= encoding.size()) return;
+            const auto c = encoding[at++];
+            if (c == '^') { one(); return; }
+            if (c == 'b') { skip_digits(); return; }
+            if (c == '[') { skip_digits(); one(); if (at < encoding.size() && encoding[at] == ']') ++at; return; }
+            if (c == '{' || c == '(') {
+                const auto close = c == '{' ? '}' : ')';
+                for (int depth = 1; at < encoding.size() && depth;) {
+                    const auto current = encoding[at++];
+                    if (current == c) ++depth; else if (current == close) --depth;
+                    else if (current == '"') while (at < encoding.size() && encoding[at++] != '"') {}
+                }
+                return;
+            }
+            if (c == '@') {
+                if (at < encoding.size() && encoding[at] == '"') { ++at; while (at < encoding.size() && encoding[at++] != '"') {} }
+                else if (at < encoding.size() && encoding[at] == '?') {
+                    ++at;
+                    if (at < encoding.size() && encoding[at] == '<')
+                        for (int depth = 1; ++at < encoding.size() && depth;) { if (encoding[at] == '<') ++depth; else if (encoding[at] == '>') --depth; }
+                }
+            }
+        };
+        while (at < encoding.size()) {
+            const auto begin = at;
+            one();
+            if (at == begin) break;
+            result.emplace_back(encoding.substr(begin, at - begin));
+            skip_digits();
+        }
+        return result;
+    }
+    // A property attribute string into {name, value} pairs: the first character of each
+    // comma-separated attribute is its name (T, &, N, V, ...); a quoted class name keeps its commas.
+    static std::vector<std::pair<std::string, std::string>> split_attributes(const std::string& value) {
+        std::vector<std::pair<std::string, std::string>> result;
+        std::size_t at = 0;
+        while (at < value.size()) {
+            std::size_t end = at;
+            for (bool quoted = false; end < value.size() && (quoted || value[end] != ','); ++end) if (value[end] == '"') quoted = !quoted;
+            if (end > at) result.emplace_back(value.substr(at, 1), value.substr(at + 1, end - at - 1));
+            at = end + 1;
+        }
+        return result;
+    }
+    // Objective-C exceptions (install_exceptions): the exported type-info vtable's object
+    // pointer, the stub that returns into libc++abi, the payload destructor and the terminate
+    // handler; objc_setUncaughtExceptionHandler's handler.
+    Address ehtype_vptr{}, throw_stub{}, exception_destructor{}, terminate_handler{}, previous_terminate{};
+    Address uncaught_handler{}, exception_preprocessor{};
+    std::atomic<bool> terminate_installed{false};
+    // A libc++abi function, or 0 before it is loaded: a provider export, else the loaded guest
+    // LLVM runtime's, found as dlsym(RTLD_DEFAULT) finds it (provider resolution sees provider
+    // exports only). Found addresses are kept.
+    std::mutex cxx_mutex;
+    std::unordered_map<std::string, Address> cxx_found;
+    Address cxx_runtime(std::string_view name) {
+        for (const auto library : {std::string_view("/usr/lib/libc++abi.dylib"), std::string_view("/usr/lib/libc++.1.dylib"),
+                                   std::string_view(system_library)})
+            if (const auto found = process.resolve(library, name)) return found->address;
+        {
+            std::lock_guard lock(cxx_mutex);
+            if (const auto found = cxx_found.find(std::string(name)); found != cxx_found.end()) return found->second;
+        }
+        const auto dlsym = process.resolve(system_library, "_dlsym");
+        if (!dlsym || name.size() < 2 || name.front() != '_') return 0;
+        const auto symbol = std::string(name.substr(1));
+        auto& engine = process.calling_engine();
+        auto& memory = static_cast<transmute::GuestMemory&>(engine);
+        const auto text_address = process.allocate_guest(symbol.size() + 1);
+        memory.write_bytes(text_address, std::span(reinterpret_cast<const std::uint8_t*>(symbol.data()), symbol.size()));
+        memory.write8(text_address + symbol.size(), 0);
+        const std::array<Address, 2> args{static_cast<Address>(-2), text_address};   // RTLD_DEFAULT
+        const auto address = EngineAdapter(engine).call(dlsym->address, args);
+        process.release_guest(text_address);
+        if (address) { std::lock_guard lock(cxx_mutex); cxx_found.emplace(std::string(name), address); }
+        return address;
+    }
+    // Ends the current provider call by entering `target` as if its caller had called it:
+    // the stub restores the caller's return address from x17 and branches to x16, so the
+    // unwinder sees the guest caller, not this provider.
+    void redirect_to(transmute::CpuState& s, Address target) {
+        s.x[16] = target; s.x[17] = s.x[30]; s.x[30] = throw_stub;
+    }
+    template <class Function> void install_exceptions(const Function& function) {
+        // _objc_ehtype_vtable: offset-to-top, type_info, the two destructors, libc++abi's
+        // __shim_type_info noop1 and noop2, then can_catch (virtual slot 4); the rest pad
+        // __class_type_info's search slots, which these types never reach.
+        const auto noop = function("___alchemy_objc_ehtype_noop", [](auto&, auto&) {});
+        // bool can_catch(const __shim_type_info* catch_type, const __shim_type_info* thrown, void*& adjusted)
+        const auto can_catch = function("___alchemy_objc_ehtype_can_catch", [this](auto& s, auto& m) {
+            const auto catch_type = s.x[0], thrown = s.x[1], adjusted = s.x[2];
+            s.x[0] = 0;
+            if (!thrown || !adjusted || m.read64(thrown) != ehtype_vptr) return;   // a C++ exception
+            const auto object = m.read64(m.read64(adjusted));
+            if (const auto handler_class = m.read64(catch_type + 16)) {   // NULL: OBJC_EHTYPE_id
+                if (!object) return;
+                bool kind = false;
+                for (auto address = object_class(object); address && !kind; address = class_record(address).super) kind = address == handler_class;
+                if (!kind) return;
+            }
+            m.write64(adjusted, object);   // __cxa_begin_catch hands the object to the @catch
+            s.x[0] = 1;
+        });
+        const std::array<Address, 10> slots{0, 0, noop, noop, noop, noop, can_catch, noop, noop, noop};
+        auto& memory = process.main_engine();
+        const auto vtable = arena_allocate(slots.size() * 8, 16);
+        for (std::size_t index = 0; index < slots.size(); ++index) memory.write64(vtable + index * 8, slots[index]);
+        process.install_export(objc_library, "_objc_ehtype_vtable", {vtable, ExportKind::data});
+        ehtype_vptr = vtable + 16;
+        const auto id_type = arena_allocate(24, 8);
+        memory.write64(id_type, ehtype_vptr); memory.write64(id_type + 8, string("id")); memory.write64(id_type + 16, 0);
+        process.install_export(objc_library, "_OBJC_EHTYPE_id", {id_type, ExportKind::data});
+        // The payload destructor releases the thrown object (retained by objc_exception_throw).
+        exception_destructor = function("___alchemy_objc_exception_destructor", [this](auto& s, auto& m) { release(m.read64(s.x[0])); });
+        terminate_handler = function("___alchemy_objc_terminate_handler", [this](auto& s, auto& m) { terminate(s, m); });
+        // mov x30, x17; br x16
+        throw_stub = process.allocate_guest(16);
+        memory.write32(throw_stub, 0xaa1103fe); memory.write32(throw_stub + 4, 0xd61f0200);
+        memory.set_memory_access(throw_stub, true, false, true);
+    }
+    // objc_exception_throw: {object, type info} in a libc++abi exception, then __cxa_throw.
+    void throw_exception(transmute::CpuState& s, transmute::GuestMemory& m, Address object) {
+        const auto allocate_exception = cxx_runtime("___cxa_allocate_exception"), cxa_throw = cxx_runtime("___cxa_throw");
+        if (!allocate_exception || !cxa_throw)
+            throw std::runtime_error("Objective-C exceptions need libc++abi (no LLVM runtime loaded); thrown: " + exception_text(object, m));
+        install_terminate_handler();
+        // objc_setExceptionPreprocessor's function sees the object first and returns the one thrown.
+        Address preprocessor{};
+        { std::lock_guard lock(mutex); preprocessor = exception_preprocessor; }
+        if (preprocessor) { const std::array<Address, 1> argument{object}; object = process.calling_engine().invoke_callback(preprocessor, argument); }
+        object = retain(object);
+        const std::array<Address, 1> size{32};
+        const auto payload = process.calling_engine().invoke_callback(allocate_exception, size);
+        if (!payload) { release(object); throw std::runtime_error("Objective-C exception allocation failed"); }
+        Address name{}, object_type{};
+        if (object) { object_type = object_class(object); std::lock_guard lock(mutex); name = cls(object_type)->name_address; }
+        m.write64(payload, object);
+        m.write64(payload + 8, ehtype_vptr); m.write64(payload + 16, name); m.write64(payload + 24, object_type);
+        s.x[0] = payload; s.x[1] = payload + 8; s.x[2] = exception_destructor;
+        redirect_to(s, cxa_throw);
+    }
+    // std::set_terminate(handler) once, as objc4 does, so an uncaught Objective-C exception
+    // reaches the uncaught-exception handler and stops with its name and reason.
+    void install_terminate_handler() {
+        if (terminate_installed.exchange(true)) return;
+        if (const auto set_terminate = cxx_runtime("__ZSt13set_terminatePFvvE")) {
+            const std::array<Address, 1> args{terminate_handler};
+            previous_terminate = process.calling_engine().invoke_callback(set_terminate, args);
+        }
+    }
+    [[noreturn]] void terminate(transmute::CpuState&, transmute::GuestMemory& m) {
+        Address object{};
+        bool objc = false;
+        if (const auto type_of = cxx_runtime("___cxa_current_exception_type")) {
+            const std::array<Address, 0> none{};
+            const auto type = process.calling_engine().invoke_callback(type_of, none);
+            if (type && m.read64(type) == ehtype_vptr) { objc = true; object = m.read64(type - 8); }
+        }
+        if (objc) {
+            Address handler{};
+            { std::lock_guard lock(mutex); handler = uncaught_handler; }
+            if (handler) { const std::array<Address, 1> args{object}; static_cast<void>(process.calling_engine().invoke_callback(handler, args)); }
+            throw std::runtime_error("uncaught Objective-C exception: " + exception_text(object, m));
+        }
+        if (previous_terminate) { const std::array<Address, 0> none{}; static_cast<void>(process.calling_engine().invoke_callback(previous_terminate, none)); }
+        throw std::runtime_error("the program terminated (std::terminate)");
+    }
     void install() {
         const auto function = [this](std::string name, transmute::GuestCallHandler handler) {
             return process.install_function(std::move(name), std::move(handler), objc_library);
@@ -1388,6 +1670,8 @@ struct ObjcRuntime::Impl {
         sel_retain = selector("retain"); sel_release = selector("release"); sel_autorelease = selector("autorelease");
         sel_dealloc = selector("dealloc"); sel_initialize = selector("initialize"); sel_alloc = selector("alloc");
         sel_init = selector("init"); sel_construct = selector(".cxx_construct"); sel_destruct = selector(".cxx_destruct");
+        sel_resolve_instance = selector("resolveInstanceMethod:"); sel_resolve_class = selector("resolveClassMethod:");
+        sel_forwarding_target = selector("forwardingTargetForSelector:");
         protocol_marker->protocol_marker = true;
         nil = process.allocate_guest(32);
         for (std::size_t i = 0; i < nil_code.size(); ++i) process.main_engine().write32(nil + 4 * i, nil_code[i]);
@@ -1408,9 +1692,27 @@ struct ObjcRuntime::Impl {
                 } catch (const std::exception&) {}
             }
             if (!dump_path.empty() && !dumped_first.exchange(true)) write_dump();
-            state.x[0] = lookup(state.x[0], state.x[1], static_cast<unsigned>(state.x[2]), memory, caller);
+            Address forwarded{};
+            const auto mode = static_cast<unsigned>(state.x[2]);
+            state.x[0] = lookup(state.x[0], state.x[1], mode, memory, caller, &forwarded);
+            // The slow path restores x0 and x15 from its frame (x0 at sp, x15 at sp + 208): a
+            // forwarding target replaces the receiver, and _objc_msgForward's mode 3 must not
+            // take the super sends' objc_super load.
+            if (forwarded) memory.write64(state.sp, forwarded);
+            if (mode == 3) memory.write64(state.sp + 208, 0);
         });
         send = install_dispatcher(helper); send_super2 = send + dispatcher_super2; send_super = send + dispatcher_super;
+        {
+            constexpr std::size_t slow_path = 43;
+            static_assert(dispatcher[slow_path] == 0xd10383ff && dispatcher.size() == 72);   // sub sp, sp, #224 ... br x16
+            const auto words = dispatcher.size() - slow_path;
+            message_forward = process.allocate_guest(4 + words * 4 + 8, 16);
+            auto& code = process.main_engine();
+            code.write32(message_forward, 0xd280006f);   // mov x15, #3
+            for (std::size_t index = 0; index < words; ++index) code.write32(message_forward + 4 + index * 4, dispatcher[slow_path + index]);
+            code.write64(message_forward + 4 + words * 4, helper);
+            code.set_memory_access(message_forward, true, false, true);
+        }
         Address exported_send = send, exported_super2 = send_super2, exported_super = send_super;
         if (perf::enabled()) {
             const auto counter = process.allocate_guest(16);
@@ -1499,7 +1801,7 @@ struct ObjcRuntime::Impl {
         function("_class_getInstanceVariable", [this](auto& s, auto& m) {
             const auto name = text(m, s.x[1]); std::lock_guard lock(mutex); auto address = s.x[0]; s.x[0] = 0;
             while (address) { const auto value = cls(address);
-                for (const auto& ivar : value->ivars) if (ivar.name == name) { s.x[0] = ivar_descriptor(ivar); return; }
+                for (const auto& ivar : value->ivars) if (ivar.name == name) { s.x[0] = ivar_descriptor(address, ivar); return; }
                 address = value->super;
             }
         });
@@ -1530,6 +1832,221 @@ struct ObjcRuntime::Impl {
             if (!property_records.contains(s.x[0])) throw std::runtime_error("invalid Objective-C property"); s.x[0] = m.read64(s.x[0]); });
         function("_property_getAttributes", [this](auto& s, auto& m) { std::lock_guard lock(mutex);
             if (!property_records.contains(s.x[0])) throw std::runtime_error("invalid Objective-C property"); s.x[0] = m.read64(s.x[0] + 8); });
+        // ---- runtime API (objc/runtime.h) beyond the dispatch core ----
+        // int class_getVersion(Class) / void class_setVersion(Class, int): 0 until set.
+        function("_class_getVersion", [this](auto& s, auto&) {
+            std::lock_guard lock(mutex); const auto found = class_versions.find(s.x[0]);
+            s.x[0] = found == class_versions.end() ? 0 : static_cast<std::uint32_t>(found->second); });
+        function("_class_setVersion", [this](auto& s, auto&) {
+            std::lock_guard lock(mutex); if (s.x[0]) class_versions[s.x[0]] = static_cast<std::int32_t>(s.x[1]); });
+        // const char* class_getImageName(Class): the image that defines the class; NULL for
+        // classes made at run time (and Alchemy's own provider classes).
+        function("_class_getImageName", [this](auto& s, auto&) {
+            Address module{};
+            { std::lock_guard lock(mutex); module = s.x[0] ? cls(s.x[0])->module : 0; }
+            s.x[0] = module ? image_name(module) : 0; });
+        // const char** objc_copyImageNames(unsigned* count): the images with Objective-C metadata.
+        function("_objc_copyImageNames", [this](auto& s, auto& m) {
+            std::vector<Address> modules, names;
+            { std::lock_guard lock(mutex); for (const auto& [module, image] : images) { static_cast<void>(image); modules.push_back(module); } }
+            for (const auto module : modules) if (const auto name = image_name(module)) names.push_back(name);
+            s.x[0] = copy_words(names, s.x[0], m); });
+        // const char** objc_copyClassNamesForImage(const char* image, unsigned* count)
+        function("_objc_copyClassNamesForImage", [this](auto& s, auto& m) {
+            const auto wanted = text(m, s.x[0]);
+            Address module{};
+            for (const auto& image : process.images()) if (image.name == wanted) { module = image.module_id; break; }
+            std::vector<Address> names;
+            if (module) {
+                std::lock_guard lock(mutex);
+                if (const auto found = images.find(module); found != images.end())
+                    for (const auto address : found->second.classes) if (const auto value = cls(address); !value->metaclass && value->registered) names.push_back(value->name_address);
+            }
+            s.x[0] = copy_words(names, s.x[1], m); });
+        // Class* objc_copyClassList(unsigned* count): every registered class, NULL-terminated.
+        function("_objc_copyClassList", [this](auto& s, auto& m) {
+            std::vector<Address> result;
+            { std::lock_guard lock(mutex); for (const auto& [name, address] : names) { static_cast<void>(name); if (cls(address)->registered) result.push_back(address); } }
+            s.x[0] = copy_words(result, s.x[0], m); });
+        // id* class_createInstances(Class, size_t extra, id* results, unsigned count): count made.
+        function("_class_createInstances", [this](auto& s, auto& m) {
+            const auto count = static_cast<std::uint32_t>(s.x[3]);
+            std::uint32_t made = 0;
+            if (s.x[0] && s.x[2]) for (; made < count; ++made) m.write64(s.x[2] + 8ULL * made, allocate(s.x[0], s.x[1]));
+            s.x[0] = made; });
+        // Method signatures: the type encoding's return type and arguments (self and _cmd included).
+        const auto method_types = [this](transmute::GuestMemory& m, Address method_address) {
+            Address types{};
+            { std::lock_guard lock(mutex); if (!method_owners.contains(method_address)) throw std::runtime_error("invalid Objective-C Method"); }
+            types = m.read64(method_address + 8);
+            return types ? split_types(text(m, types)) : std::vector<std::string>{};
+        };
+        function("_method_getNumberOfArguments", [method_types](auto& s, auto& m) {
+            const auto parts = method_types(m, s.x[0]); s.x[0] = parts.empty() ? 0 : parts.size() - 1; });
+        // char* method_copyReturnType(Method) / method_copyArgumentType(Method, index): malloc'd, or NULL.
+        function("_method_copyReturnType", [this, method_types](auto& s, auto& m) {
+            const auto parts = method_types(m, s.x[0]); s.x[0] = malloc_text(m, parts.empty() ? std::string("?") : parts[0]); });
+        function("_method_copyArgumentType", [this, method_types](auto& s, auto& m) {
+            const auto parts = method_types(m, s.x[0]); const auto index = static_cast<std::uint32_t>(s.x[1]);
+            s.x[0] = index + 1 < parts.size() ? malloc_text(m, parts[index + 1]) : 0; });
+        // void method_getReturnType(Method, char* dst, size_t) / method_getArgumentType(Method, index, dst, size):
+        // strncpy semantics, an empty string when the argument does not exist.
+        const auto copy_type = [](transmute::GuestMemory& m, Address out, std::uint64_t size, const std::string& value) {
+            if (!out || !size) return;
+            const auto count = std::min<std::uint64_t>(size, value.size());
+            if (count) m.write_bytes(out, std::span(reinterpret_cast<const std::uint8_t*>(value.data()), static_cast<std::size_t>(count)));
+            if (count < size) m.fill_bytes(out + count, 0, size - count);
+        };
+        function("_method_getReturnType", [method_types, copy_type](auto& s, auto& m) {
+            const auto parts = method_types(m, s.x[0]); copy_type(m, s.x[1], s.x[2], parts.empty() ? std::string() : parts[0]); });
+        function("_method_getArgumentType", [method_types, copy_type](auto& s, auto& m) {
+            const auto parts = method_types(m, s.x[0]); const auto index = static_cast<std::uint32_t>(s.x[1]);
+            copy_type(m, s.x[2], s.x[3], index + 1 < parts.size() ? parts[index + 1] : std::string()); });
+        // struct objc_method_description* method_getDescription(Method): the Method's {SEL, types} words.
+        function("_method_getDescription", [this](auto& s, auto&) {
+            std::lock_guard lock(mutex); if (!method_owners.contains(s.x[0])) throw std::runtime_error("invalid Objective-C Method"); });
+        // Instance variables by Ivar: object_getIvar reads the word; object_setIvar stores it
+        // unretained (no ivar layout is kept), object_setIvarWithStrongDefault as a strong ivar.
+        const auto ivar_offset = [this](Address ivar) {
+            std::lock_guard lock(mutex);
+            const auto found = ivar_records.find(ivar);
+            if (found == ivar_records.end()) throw std::runtime_error("invalid Objective-C Ivar");
+            return static_cast<Address>(found->second.offset);
+        };
+        function("_object_getIvar", [ivar_offset](auto& s, auto& m) { s.x[0] = s.x[0] && s.x[1] ? m.read64(s.x[0] + ivar_offset(s.x[1])) : 0; });
+        function("_object_setIvar", [ivar_offset](auto& s, auto& m) { if (s.x[0] && s.x[1]) m.write64(s.x[0] + ivar_offset(s.x[1]), s.x[2]); });
+        function("_object_setIvarWithStrongDefault", [this, ivar_offset](auto& s, auto& m) {
+            if (!s.x[0] || !s.x[1]) return;
+            const auto slot = s.x[0] + ivar_offset(s.x[1]);
+            const auto previous = m.read64(slot);
+            if (previous == s.x[2]) return;
+            m.write64(slot, retain(s.x[2]));
+            release(previous); });
+        // Ivar object_getInstanceVariable(id, const char* name, void** out) / object_setInstanceVariable(id, name, void* value)
+        const auto named_ivar = [this](transmute::GuestMemory& m, Address object, Address name_address) -> std::pair<Address, Address> {
+            if (!object || !name_address) return {0, 0};
+            const auto name = text(m, name_address);
+            std::lock_guard lock(mutex);
+            for (auto address = object_class(object); address; address = cls(address)->super)
+                for (const auto& ivar : cls(address)->ivars) if (ivar.name == name) return {ivar_descriptor(address, ivar), ivar.offset};
+            return {0, 0};
+        };
+        function("_object_getInstanceVariable", [named_ivar](auto& s, auto& m) {
+            const auto [ivar, offset] = named_ivar(m, s.x[0], s.x[1]);
+            if (s.x[2]) m.write64(s.x[2], ivar ? m.read64(s.x[0] + offset) : 0);
+            s.x[0] = ivar; });
+        for (const bool strong : {false, true})
+            function(strong ? "_object_setInstanceVariableWithStrongDefault" : "_object_setInstanceVariable", [this, named_ivar, strong](auto& s, auto& m) {
+                const auto [ivar, offset] = named_ivar(m, s.x[0], s.x[1]);
+                if (ivar) {
+                    const auto slot = s.x[0] + offset, previous = m.read64(slot);
+                    if (!strong) m.write64(slot, s.x[2]);
+                    else if (previous != s.x[2]) { m.write64(slot, retain(s.x[2])); release(previous); }
+                }
+                s.x[0] = ivar; });
+        // id object_copy(id, size_t extra): a new instance with the object's bytes (a shallow copy).
+        function("_object_copy", [this](auto& s, auto& m) {
+            if (!s.x[0]) return;
+            const auto address = object_class(s.x[0]);
+            std::uint32_t size{};
+            { std::lock_guard lock(mutex); size = cls(address)->size; }
+            const auto copy = allocate(address, s.x[1]);
+            if (size > 8) {
+                std::vector<std::uint8_t> bytes(size - 8);
+                m.read_bytes(s.x[0] + 8, bytes);
+                m.write_bytes(copy + 8, bytes);
+            }
+            s.x[0] = copy; });
+        // void* object_getIndexedIvars(id): the extra bytes after the instance (class_createInstance).
+        function("_object_getIndexedIvars", [this](auto& s, auto&) {
+            if (!s.x[0]) return;
+            std::lock_guard lock(mutex); s.x[0] += cls(object_class(s.x[0]))->size; });
+        // Class variables are the metaclass's instance variables.
+        function("_class_getClassVariable", [this](auto& s, auto& m) {
+            const auto name = s.x[0] && s.x[1] ? text(m, s.x[1]) : std::string();
+            std::lock_guard lock(mutex); auto address = s.x[0] ? cls(s.x[0])->meta : 0; s.x[0] = 0;
+            for (; address && !name.empty(); address = cls(address)->super)
+                for (const auto& ivar : cls(address)->ivars) if (ivar.name == name) { s.x[0] = ivar_descriptor(address, ivar); return; }
+        });
+        // Ivar layouts: Alchemy keeps none (NULL, as for a class without layout information);
+        // a layout set before registration is kept and reported back.
+        for (const bool weak : {false, true}) {
+            function(weak ? "_class_getWeakIvarLayout" : "_class_getIvarLayout", [this, weak](auto& s, auto&) {
+                std::lock_guard lock(mutex); const auto found = ivar_layouts.find({s.x[0], weak});
+                s.x[0] = found == ivar_layouts.end() ? 0 : found->second; });
+            function(weak ? "_class_setWeakIvarLayout" : "_class_setIvarLayout", [this, weak](auto& s, auto&) {
+                std::lock_guard lock(mutex); if (s.x[0] && !cls(s.x[0])->registered) ivar_layouts[{s.x[0], weak}] = s.x[1]; });
+        }
+        // BOOL sel_isMapped(SEL)
+        function("_sel_isMapped", [this](auto& s, auto&) { std::lock_guard lock(mutex); s.x[0] = s.x[0] && selector_addresses.contains(s.x[0]); });
+        // Declared properties added at run time: class_addProperty (fails when the class already
+        // declares the name) and class_replaceProperty (adds or replaces). The attribute string is
+        // the attributes joined by commas, each its name then its value (T@"NSString",&,N,V_name).
+        for (const bool replace : {false, true})
+            function(replace ? "_class_replaceProperty" : "_class_addProperty", [this, replace](auto& s, auto& m) {
+                if (!s.x[0] || !s.x[1]) { s.x[0] = 0; return; }
+                const auto name = text(m, s.x[1]);
+                std::string attributes;
+                for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(s.x[3]); ++index) {
+                    const auto entry = s.x[2] + 16ULL * index;
+                    if (index) attributes += ',';
+                    attributes += text(m, m.read64(entry));
+                    if (const auto value = m.read64(entry + 8)) attributes += text(m, value);
+                }
+                std::lock_guard lock(mutex);
+                auto& list = cls(s.x[0])->properties;
+                const auto existing = std::find_if(list.begin(), list.end(), [&](const ObjcPropertyInfo& entry) { return entry.name == name; });
+                if (existing != list.end() && !replace) { s.x[0] = 0; return; }
+                const auto record = arena_allocate(16, 8);
+                auto& memory = process.main_engine();
+                memory.write64(record, string(name)); memory.write64(record + 8, string(attributes));
+                property_records.insert(record);
+                if (existing != list.end()) *existing = ObjcPropertyInfo{name, attributes, record};
+                else list.push_back(ObjcPropertyInfo{name, attributes, record});
+                s.x[0] = 1; });
+        // objc_property_attribute_t* property_copyAttributeList(objc_property_t, unsigned* count):
+        // one malloc'd block, the {name, value} pairs followed by their strings.
+        function("_property_copyAttributeList", [this](auto& s, auto& m) {
+            Address attributes{};
+            { std::lock_guard lock(mutex); if (!property_records.contains(s.x[0])) throw std::runtime_error("invalid Objective-C property"); }
+            attributes = m.read64(s.x[0] + 8);
+            const auto parts = split_attributes(attributes ? text(m, attributes) : std::string());
+            if (s.x[1]) m.write32(s.x[1], static_cast<std::uint32_t>(parts.size()));
+            if (parts.empty()) { s.x[0] = 0; return; }
+            std::uint64_t size = (parts.size() + 1) * 16;
+            for (const auto& [key, value] : parts) size += key.size() + value.size() + 2;
+            const auto block = malloc_block(size);
+            auto cursor = block + (parts.size() + 1) * 16;
+            for (std::size_t index = 0; index < parts.size(); ++index) {
+                for (const auto* piece : {&parts[index].first, &parts[index].second}) {
+                    m.write64(block + index * 16 + (piece == &parts[index].first ? 0 : 8), cursor);
+                    if (!piece->empty()) m.write_bytes(cursor, std::span(reinterpret_cast<const std::uint8_t*>(piece->data()), piece->size()));
+                    m.write8(cursor + piece->size(), 0);
+                    cursor += piece->size() + 1;
+                }
+            }
+            m.write64(block + parts.size() * 16, 0); m.write64(block + parts.size() * 16 + 8, 0);
+            s.x[0] = block; });
+        // char* property_copyAttributeValue(objc_property_t, const char* name): malloc'd, or NULL.
+        function("_property_copyAttributeValue", [this](auto& s, auto& m) {
+            Address attributes{};
+            { std::lock_guard lock(mutex); if (!property_records.contains(s.x[0])) throw std::runtime_error("invalid Objective-C property"); }
+            attributes = m.read64(s.x[0] + 8);
+            const auto wanted = text(m, s.x[1]);
+            s.x[0] = 0;
+            for (const auto& [key, value] : split_attributes(attributes ? text(m, attributes) : std::string()))
+                if (key == wanted) { s.x[0] = malloc_text(m, value); return; }
+        });
+        // id objc_retainedObject(objc_objectptr_t) and friends: ARC's bridging casts, identities.
+        for (const auto name : {"_objc_retainedObject", "_objc_unretainedObject", "_objc_unretainedPointer"})
+            function(name, [](auto&, auto&) {});
+        // arm64 outlined ARC calls (deployment targets of macOS 14 and later): objc_retain_xN /
+        // objc_release_xN retain or release the object in xN, as objc_retain/objc_release of x0.
+        for (const unsigned reg : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U, 11U, 12U, 13U, 14U, 15U,
+                                   19U, 20U, 21U, 22U, 23U, 24U, 25U, 26U, 27U, 28U}) {
+            function("_objc_retain_x" + std::to_string(reg), [this, reg](auto& s, auto&) { s.x[0] = retain(s.x[reg]); });
+            function("_objc_release_x" + std::to_string(reg), [this, reg](auto& s, auto&) { release(s.x[reg]); });
+        }
         function("_class_addIvar", [this](auto& s, auto& m) {
             const auto name = text(m, s.x[1]), types = text(m, s.x[4]); std::lock_guard lock(mutex); const auto value = cls(s.x[0]);
             if (value->registered || value->metaclass) { s.x[0] = 0; return; }
@@ -1546,8 +2063,7 @@ struct ObjcRuntime::Impl {
         function("_class_getInstanceMethod", [this](auto& s, auto&) { const auto result = method(s.x[0], s.x[1]); s.x[0] = result ? result->descriptor : 0; });
         function("_class_getClassMethod", [this](auto& s, auto&) { Address meta{}; { std::lock_guard lock(mutex); meta = s.x[0] ? cls(s.x[0])->meta : 0; }
             const auto result = method(meta, s.x[1]); s.x[0] = result ? result->descriptor : 0; });
-        function("_class_getMethodImplementation", [this](auto& s, auto& m) { const auto result = method(s.x[0], s.x[1]);
-            if (!result) throw std::runtime_error("unsupported Objective-C forwarding for " + text(m, s.x[1])); s.x[0] = result->implementation; });
+        function("_class_getMethodImplementation", [this](auto& s, auto&) { s.x[0] = implementation_or_forward(s.x[0], s.x[1]); });
         function("_class_respondsToSelector", [this](auto& s, auto&) { s.x[0] = class_responds(s.x[0], s.x[1]); });
         function("_method_getImplementation", [this](auto& s, auto& m) { std::lock_guard lock(mutex);
             if (!method_owners.contains(s.x[0])) throw std::runtime_error("invalid Objective-C Method");
@@ -1669,29 +2185,39 @@ struct ObjcRuntime::Impl {
             try { static_cast<void>(store_weak(s.x[0], object, true)); } catch (...) { release(object); throw; }
             release(object); });
         function("_objc_moveWeak", [this](auto& s, auto&) { move_weak(s.x[0], s.x[1]); });
-        // Objective-C exceptions cannot unwind guest frames here: @throw (and
-        // -[NSException raise]) stops with the exception's name and reason.
-        function("_objc_exception_throw", [this](auto& s, auto& m) {
-            throw std::runtime_error("Objective-C exceptions are unsupported (no unwinding); thrown: " + exception_text(s.x[0], m));
+        // Objective-C exceptions are C++ ABI exceptions (as in objc4): thrown with the guest
+        // libc++abi's __cxa_throw and unwound by its libunwind through guest frames. The
+        // payload is {id object; objc_typeinfo {vtable, class name, class}}; the type info's
+        // vtable is _objc_ehtype_vtable + 16, whose can_catch matches an @catch clause's type
+        // info (clang's OBJC_EHTYPE_$_<class>, or OBJC_EHTYPE_id) by class. An exception that
+        // would unwind through a provider's native frame, or that nothing catches, ends in the
+        // terminate handler below: the uncaught-exception handler, then an explicit stop with
+        // the exception's name and reason.
+        install_exceptions(function);
+        function("_objc_exception_throw", [this](auto& s, auto& m) { throw_exception(s, m, s.x[0]); });
+        function("_objc_exception_rethrow", [this](auto& s, auto&) {
+            const auto rethrow = cxx_runtime("___cxa_rethrow");
+            if (!rethrow) throw std::runtime_error("Objective-C exception handling needs libc++abi's __cxa_rethrow");
+            redirect_to(s, rethrow);
         });
-        // The catch side forwards to libc++abi, as in objc4: with no
-        // Objective-C exception ever thrown, only C++ exceptions reach an
-        // @catch (...) or @finally, and those are C++ catches.
+        // The catch side is libc++abi's, as in objc4: __cxa_begin_catch returns the adjusted
+        // pointer can_catch stored, which for an Objective-C exception is the object.
         for (const auto& [name, target] : std::initializer_list<std::pair<const char*, const char*>>{
-                 {"_objc_begin_catch", "___cxa_begin_catch"}, {"_objc_end_catch", "___cxa_end_catch"},
-                 {"_objc_exception_rethrow", "___cxa_rethrow"}})
+                 {"_objc_begin_catch", "___cxa_begin_catch"}, {"_objc_end_catch", "___cxa_end_catch"}})
             function(name, [this, target](auto& s, auto&) {
-                std::optional<RuntimeExport> found;
-                for (const auto library : {std::string_view("/usr/lib/libc++abi.dylib"), std::string_view("/usr/lib/libc++.1.dylib"),
-                                           std::string_view("/usr/lib/libSystem.B.dylib")})
-                    if ((found = process.resolve(library, target))) break;
+                const auto found = cxx_runtime(target);
                 if (!found) throw std::runtime_error(std::string("Objective-C exception handling needs libc++abi's ") + (target + 1));
                 const std::array<Address, 1> args{s.x[0]};
-                s.x[0] = process.calling_engine().invoke_callback(found->address, args);
+                s.x[0] = process.calling_engine().invoke_callback(found, args);
             });
-        // objc_terminate: the uncaught-exception path of C++/Objective-C
-        // exception handling; it never returns (std::terminate).
-        function("_objc_terminate", [](auto&, auto&) { throw std::runtime_error("objc_terminate: the program terminated (uncaught exception)"); });
+        // objc_uncaught_exception_handler objc_setUncaughtExceptionHandler(handler): the previous one.
+        function("_objc_setUncaughtExceptionHandler", [this](auto& s, auto&) {
+            std::lock_guard lock(mutex); s.x[0] = std::exchange(uncaught_handler, s.x[0]); });
+        // objc_exception_preprocessor objc_setExceptionPreprocessor(fn): the previous one.
+        function("_objc_setExceptionPreprocessor", [this](auto& s, auto&) {
+            std::lock_guard lock(mutex); s.x[0] = std::exchange(exception_preprocessor, s.x[0]); });
+        // objc_terminate: the uncaught-exception path; it never returns.
+        function("_objc_terminate", [this](auto& s, auto& m) { terminate(s, m); });
         // objc_copyStruct(dest, src, size, atomic, hasStrong): the accessor
         // copy of a nonatomic or atomic struct property. Atomic copies are
         // serialized by one lock, as libobjc's striped property locks do per
@@ -1802,18 +2328,26 @@ struct ObjcRuntime::Impl {
         add_native(root, "conformsToProtocol:", [this](auto& s, auto&) { s.x[0] = conforms(object_class(s.x[0]), s.x[2]); }, false, "B@:@");
         add_native(root, "conformsToProtocol:", [this](auto& s, auto&) { s.x[0] = conforms(s.x[0], s.x[2]); }, true, "B@:@");
         // The rest of libobjc's NSObject: messaging and introspection helpers.
-        const auto message_imp = [this](Address receiver, Address sel) {
-            if (!sel) throw std::runtime_error("Objective-C performSelector: received a null selector");
-            return resolve(receiver, 0, sel, process.calling_engine(), 0);
+        // performSelector: sends the message, so a -forwardingTargetForSelector: target receives it.
+        const auto perform = [this](auto& s, std::initializer_list<Address> arguments) {
+            if (!s.x[2]) throw std::runtime_error("Objective-C performSelector: received a null selector");
+            Address forwarded{};
+            const auto imp = resolve(s.x[0], 0, s.x[2], process.calling_engine(), 0, &forwarded);
+            CallRegs registers{};
+            registers.x[0] = forwarded ? forwarded : s.x[0]; registers.x[1] = s.x[2];
+            std::size_t index = 2;
+            for (const auto value : arguments) registers.x[index++] = value;
+            s.x[0] = call_imp(imp, registers).x0;
         };
         for (const bool class_method : {false, true}) {
-            add_native(root, "performSelector:", [this, message_imp](auto& s, auto&) {
-                s.x[0] = invoke_imp(message_imp(s.x[0], s.x[2]), {s.x[0], s.x[2]}); }, class_method, "@@::");
-            add_native(root, "performSelector:withObject:", [this, message_imp](auto& s, auto&) {
-                s.x[0] = invoke_imp(message_imp(s.x[0], s.x[2]), {s.x[0], s.x[2], s.x[3]}); }, class_method, "@@::@");
-            add_native(root, "performSelector:withObject:withObject:", [this, message_imp](auto& s, auto&) {
-                s.x[0] = invoke_imp(message_imp(s.x[0], s.x[2]), {s.x[0], s.x[2], s.x[3], s.x[4]}); }, class_method, "@@::@@");
-            add_native(root, "methodForSelector:", [message_imp](auto& s, auto&) { s.x[0] = message_imp(s.x[0], s.x[2]); }, class_method, "^?@::");
+            add_native(root, "performSelector:", [perform](auto& s, auto&) { perform(s, {}); }, class_method, "@@::");
+            add_native(root, "performSelector:withObject:", [perform](auto& s, auto&) { perform(s, {s.x[3]}); }, class_method, "@@::@");
+            add_native(root, "performSelector:withObject:withObject:", [perform](auto& s, auto&) { perform(s, {s.x[3], s.x[4]}); }, class_method, "@@::@@");
+            // methodForSelector: is class_getMethodImplementation of the receiver's class
+            // (_objc_msgForward for a message no method answers).
+            add_native(root, "methodForSelector:", [this](auto& s, auto&) {
+                if (!s.x[2]) throw std::runtime_error("Objective-C methodForSelector: received a null selector");
+                s.x[0] = implementation_or_forward(object_class(s.x[0]), s.x[2]); }, class_method, "^?@::");
             add_native(root, "isMemberOfClass:", [this](auto& s, auto&) { s.x[0] = object_class(s.x[0]) == s.x[2]; }, class_method, "B@:#");
             add_native(root, "isProxy", [](auto& s, auto&) { s.x[0] = 0; }, class_method, "B@:");
             add_native(root, "zone", [](auto& s, auto&) { s.x[0] = 0; }, class_method, "^v@:");
@@ -1823,9 +2357,8 @@ struct ObjcRuntime::Impl {
             add_native(root, "forwardingTargetForSelector:", [](auto& s, auto&) { s.x[0] = 0; }, class_method, "@@::");
         }
         add_native(root, "superclass", [this](auto& s, auto&) { s.x[0] = class_record(object_class(s.x[0])).super; }, false, "#@:");
-        add_native(root, "instanceMethodForSelector:", [this](auto& s, auto& m) {
-            s.x[0] = s.x[2] ? class_imp(s.x[0], s.x[2]) : 0;
-            if (!s.x[0]) throw std::runtime_error("unsupported Objective-C forwarding for " + (s.x[2] ? text(m, s.x[2]) : std::string("a null selector")));
+        add_native(root, "instanceMethodForSelector:", [this](auto& s, auto&) {
+            s.x[0] = implementation_or_forward(s.x[0], s.x[2]);
         }, true, "^?@::");
         add_native(root, "isSubclassOfClass:", [this](auto& s, auto&) { auto address = s.x[0]; const auto target = s.x[2]; s.x[0] = 0;
             for (std::uint32_t depth = 0; address && depth <= 4096; ++depth) { if (address == target) { s.x[0] = 1; break; } address = class_record(address).super; } }, true, "B@:#");
@@ -1923,6 +2456,10 @@ bool ObjcRuntime::responds(Address receiver, Address sel) const {
     if (!receiver) return false;
     return impl_->class_responds(impl_->object_class(receiver), sel);
 }
+void ObjcRuntime::throw_exception(transmute::CpuState& state, Address exception) {
+    impl_->throw_exception(state, impl_->process.calling_engine(), exception);
+}
+std::uint64_t ObjcRuntime::cxx_runtime(std::string_view symbol) { return impl_->cxx_runtime(symbol); }
 CallResult ObjcRuntime::send(Address receiver, Address sel, CallRegs registers) {
     return impl_->send_message(receiver, 0, sel, std::move(registers));
 }

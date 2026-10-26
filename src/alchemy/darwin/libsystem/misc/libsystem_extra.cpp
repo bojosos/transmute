@@ -826,6 +826,45 @@ void install_identity(const std::shared_ptr<State>& state) {
             m.write_bytes(s.x[0], bytes);
             return std::uint64_t{0};
         });
+    // uuid_generate_time: an RFC 4122 version 1 UUID. The timestamp counts 100 ns intervals since
+    // 1582-10-15 and never repeats within the process; the node is random with the multicast bit
+    // set (no hardware address is exposed), the clock sequence random per process.
+    {
+        struct TimeState { std::mutex mutex; std::uint64_t last{}; std::uint16_t sequence{}; std::array<std::uint8_t, 6> node{}; bool ready{}; };
+        const auto time_state = std::make_shared<TimeState>();
+        install(state, "_uuid_generate_time", [time_state](auto& s, auto& m) {
+            validate(m, s.x[0], 16, true);
+            std::uint64_t stamp{};
+            std::uint16_t sequence{};
+            std::array<std::uint8_t, 6> node{};
+            {
+                std::lock_guard lock(time_state->mutex);
+                if (!time_state->ready) {
+                    std::random_device source;
+                    for (auto& byte : time_state->node) byte = static_cast<std::uint8_t>(source());
+                    time_state->node[0] |= 0x01;
+                    time_state->sequence = static_cast<std::uint16_t>(source() & 0x3fff);
+                    time_state->ready = true;
+                }
+                constexpr std::uint64_t gregorian_offset = 0x01B21DD213814000ULL;   // 1582-10-15 to 1970-01-01, in 100 ns
+                stamp = static_cast<std::uint64_t>(host::time::realtime_ns()) / 100 + gregorian_offset;
+                if (stamp <= time_state->last) stamp = time_state->last + 1;
+                time_state->last = stamp;
+                sequence = time_state->sequence; node = time_state->node;
+            }
+            std::array<std::uint8_t, 16> bytes{};
+            const auto low = static_cast<std::uint32_t>(stamp);
+            const auto middle = static_cast<std::uint16_t>(stamp >> 32);
+            const auto high = static_cast<std::uint16_t>(((stamp >> 48) & 0x0fff) | 0x1000);
+            for (unsigned index = 0; index < 4; ++index) bytes[index] = static_cast<std::uint8_t>(low >> (24 - 8 * index));
+            bytes[4] = static_cast<std::uint8_t>(middle >> 8); bytes[5] = static_cast<std::uint8_t>(middle);
+            bytes[6] = static_cast<std::uint8_t>(high >> 8); bytes[7] = static_cast<std::uint8_t>(high);
+            bytes[8] = static_cast<std::uint8_t>(((sequence >> 8) & 0x3f) | 0x80); bytes[9] = static_cast<std::uint8_t>(sequence);
+            std::copy(node.begin(), node.end(), bytes.begin() + 10);
+            m.write_bytes(s.x[0], bytes);
+            return std::uint64_t{0};
+        });
+    }
     install(state, "_uuid_clear", [](auto& s, auto& m) { validate(m, s.x[0], 16, true); m.fill_bytes(s.x[0], 0, 16); return std::uint64_t{0}; });
     install(state, "_uuid_copy", [](auto& s, auto& m) { validate(m, s.x[0], 16, true); validate(m, s.x[1], 16, false); m.copy_bytes(s.x[0], s.x[1], 16); return std::uint64_t{0}; });
     install(state, "_uuid_is_null", [](auto& s, auto& m) {
@@ -920,6 +959,11 @@ void install_identity(const std::shared_ptr<State>& state) {
         return std::uint64_t{0};
     });
     install(state, "_sys_dcache_flush", [](auto&, auto&) { return std::uint64_t{0}; });
+    // __clear_cache(begin, end): compiler-rt's instruction-cache flush over [begin, end).
+    install(state, "___clear_cache", [state](auto& s, auto&) {
+        if (s.x[1] > s.x[0]) static_cast<void>(invalidate_engine_code(state->context.calling_engine(), s.x[0], s.x[1] - s.x[0]));
+        return std::uint64_t{0};
+    });
     install(state, "_mincore", [](auto& s, auto& m) {
         if (s.x[0] % page_size) throw ExtraError{einval};
         const auto pages = (s.x[1] + page_size - 1) / page_size;

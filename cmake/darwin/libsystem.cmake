@@ -16,6 +16,7 @@ target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/libsystem/malloc/malloc_zones.cpp
     src/alchemy/darwin/libsystem/misc/locale.cpp
     src/alchemy/darwin/libsystem/misc/support.cpp
+    src/alchemy/darwin/libsystem/misc/libc_extra.cpp
     src/alchemy/darwin/libsystem/misc/native.cpp
     src/alchemy/darwin/libsystem/misc/numeric.cpp
     src/alchemy/darwin/libsystem/misc/numeric_math.cpp
@@ -49,6 +50,8 @@ list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES
 #     libc leftovers for strict mode, fill-only (gui::fill::install_machsys).
 #   misc/leftovers.cpp: libSystem, libbsm and libbz2 leftovers (first imported by Chrome),
 #     fill-only, installed last (gui::fill::install_libsystem_leftovers).
+#   misc/{stdlib_extra,ndbm}.cpp, net/rpc_nis.cpp: rand48 and crypt, ndbm(3), NIS and
+#     Sun RPC (unavailable); pieces of install_libsystem_gaps (fill-only).
 #   */libsystem_*.cpp: libSystem names a renderer plug-in's images import, fill-only
 #     (libsystem::install_libsystem_gaps and install_libsystem_services rows;
 #     shared kit src/alchemy/darwin/kit/export_fill/).
@@ -80,6 +83,11 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/libsystem/misc/libsystem_runtime.cpp
     src/alchemy/darwin/libsystem/misc/libsystem_misc.cpp
     src/alchemy/darwin/libsystem/misc/libsystem_services.cpp
+    src/alchemy/darwin/libsystem/misc/xpc_objects.cpp
+    src/alchemy/darwin/libsystem/misc/stdlib_extra.cpp
+    src/alchemy/darwin/libsystem/misc/ndbm.cpp
+    src/alchemy/darwin/libsystem/net/rpc_nis.cpp
+    src/alchemy/darwin/libsystem/process/threads_extra.cpp
     src/alchemy/darwin/libsystem/process/foundation_threads.cpp
     src/alchemy/darwin/libsystem/process/process_io.cpp
     src/alchemy/darwin/libsystem/misc/system_c.cpp
@@ -112,6 +120,12 @@ function(alchemy_gui_libsystem_tests)
     # fixture src/alchemy/darwin/kit/export_fill/tests/export_fill_test_kit.hpp).
     alchemy_gui_add_unit_test(alchemy_gui_libsystem_gaps
         src/alchemy/darwin/libsystem/tests/libsystem_gaps_tests.cpp TIMEOUT 120)
+    # misc/libc_extra.cpp: string, wide, search.h, stdlib, time, ctype, signal and path helpers.
+    alchemy_gui_add_unit_test(alchemy_gui_libc_extra
+        src/alchemy/darwin/libsystem/tests/libc_extra_tests.cpp TIMEOUT 120)
+    # misc/xpc_objects.cpp: XPC objects, and connections whose service is not there.
+    alchemy_gui_add_unit_test(alchemy_gui_xpc
+        src/alchemy/darwin/libsystem/tests/xpc_tests.cpp TIMEOUT 120)
     # The pieces first written for QLab (split from the QLab runtime tests;
     # shared fixture src/alchemy/darwin/kit/completion/runtime/tests/runtime_test_kit.hpp).
     alchemy_gui_add_unit_test(alchemy_gui_libsystem_foundation

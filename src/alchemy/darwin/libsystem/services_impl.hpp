@@ -1193,7 +1193,15 @@ public:
         catch (const DarwinVmError& error) { throw ServiceError{error.value}; }
     }
     std::atomic<std::size_t> section_mappings{};   // MAP_SHARED views in `mappings` (fast path of shared_location)
-    std::set<std::uint64_t> copy_states;
+    // copyfile_state_t (copyfile(3)): what copyfile_state_get/_set report and set.
+    struct CopyState {
+        std::int32_t source_fd{-1}, destination_fd{-1};
+        std::uint64_t source_name{}, destination_name{};   // guest strings this state owns
+        std::uint64_t status_callback{}, status_context{}, quarantine{};
+        std::int64_t copied{};
+        bool cloned{};
+    };
+    std::map<std::uint64_t, CopyState> copy_states;
     std::map<std::string, std::uint64_t> environment_strings;
     std::uint64_t environment_cell{};
     std::function<bool(std::uint64_t)> check_locale;

@@ -928,8 +928,28 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             if (value->waiters != 0) { s.x[0] = ebusy; return; }
             std::lock_guard lock(self.metadata); self.conditions.erase(address); m.write64(address, 0); s.x[0] = 0;
         });
+        // pthread_rwlockattr_t: a marker word and the process-shared setting. Locks are
+        // process-private; PTHREAD_PROCESS_SHARED (1) is not supported (ENOTSUP).
+        static constexpr std::uint64_t rwlock_attribute_marker = 0x52574c4b41545452ULL;   // "RTTAKLWR"
+        add("_pthread_rwlockattr_init", [](auto&, auto& s, auto& m) {
+            if (!accessible(m, s.x[0], 16)) { s.x[0] = einval; return; }
+            m.write64(s.x[0], rwlock_attribute_marker); m.write64(s.x[0] + 8, 2); s.x[0] = 0;   // PTHREAD_PROCESS_PRIVATE
+        });
+        add("_pthread_rwlockattr_destroy", [](auto&, auto& s, auto& m) {
+            if (!accessible(m, s.x[0], 16) || m.read64(s.x[0]) != rwlock_attribute_marker) { s.x[0] = einval; return; }
+            m.write64(s.x[0], 0); s.x[0] = 0;
+        });
+        add("_pthread_rwlockattr_setpshared", [](auto&, auto& s, auto& m) {
+            if (!accessible(m, s.x[0], 16) || m.read64(s.x[0]) != rwlock_attribute_marker || (s.x[1] != 1 && s.x[1] != 2)) { s.x[0] = einval; return; }
+            if (s.x[1] == 1) { s.x[0] = 45; return; }
+            m.write64(s.x[0] + 8, s.x[1]); s.x[0] = 0;
+        });
+        add("_pthread_rwlockattr_getpshared", [](auto&, auto& s, auto& m) {
+            if (!accessible(m, s.x[0], 16) || m.read64(s.x[0]) != rwlock_attribute_marker || !accessible(m, s.x[1], 4)) { s.x[0] = einval; return; }
+            m.write32(s.x[1], static_cast<std::uint32_t>(m.read64(s.x[0] + 8))); s.x[0] = 0;
+        });
         add("_pthread_rwlock_init", [](auto& self, auto& s, auto& m) {
-            if (s.x[1] != 0) throw std::runtime_error("unsupported Darwin rwlock attributes");
+            if (s.x[1] && (!accessible(m, s.x[1], 16) || m.read64(s.x[1]) != rwlock_attribute_marker)) { s.x[0] = einval; return; }
             if (!self.object(self.rwlocks, m, s.x[0], rwlock_size)) { s.x[0] = einval; return; }
             m.write64(s.x[0], 0x2da8b3b4); s.x[0] = 0;
         });

@@ -51,10 +51,9 @@ std::string version(std::uint32_t value) {
     return std::to_string(value >> 16) + '.' + std::to_string((value >> 8) & 255) + '.' + std::to_string(value & 255);
 }
 
-// Weak references, objc_retainBlock and @synchronized are runtime-supported.
-std::string_view deferred_object_api(std::string_view symbol) {
-    // Only throwing is deferred: the catch side forwards to libc++abi.
-    if (symbol == "_objc_exception_throw") return "Objective-C exceptions";
+// Weak references, objc_retainBlock, @synchronized and Objective-C exceptions (thrown and
+// caught through the guest libc++abi) are runtime-supported: nothing is deferred.
+std::string_view deferred_object_api(std::string_view) {
     return {};
 }
 

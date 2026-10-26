@@ -122,13 +122,20 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         std::condition_variable changed;
         // dispatch_queue_set_specific: key -> {context, destructor}.
         std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> specifics;
+        // dispatch_set_target_queue onto a private queue (retained): this queue's work runs as
+        // work items of the target, so the target's serialization applies to it.
+        std::uint64_t target{};
+        bool inactive{};          // created from an initially-inactive attribute until dispatch_activate
+        std::uint32_t qos{};      // the attribute's QoS class (QOS_CLASS_UNSPECIFIED 0)
     };
+    // dispatch_queue_attr_t: the two shared attributes and the variants made from them.
+    struct Attribute { Kind kind{Kind::serial}; bool inactive{}; std::uint32_t qos{}; std::uint64_t frequency{}; };
     struct Group {
         std::uint64_t address{}, count{}, references{1};
         std::vector<std::pair<std::uint64_t, Work>> notifications;   // target queue (retained), work
         bool released{};
     };
-    enum class SourceType { timer, data_add, data_or, data_replace, mach_recv, mach_send, memory_pressure, proc, read, write, vnode, unsupported };
+    enum class SourceType { timer, data_add, data_or, data_replace, mach_recv, mach_send, memory_pressure, proc, read, write, vnode, signal, unsupported };
     struct Handler { std::uint64_t function{}, block{}; explicit operator bool() const { return function || block; } };
     struct Source {
         std::uint64_t address{}, handle{}, mask{}, queue{}, context{};
@@ -165,6 +172,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     }
     // Queue-specific destructors of released queues, run outside `metadata`.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pending_destructors;
+    std::vector<std::uint64_t> pending_target_releases;   // targets of retired queues, released outside `metadata`
     std::map<std::uint64_t, std::shared_ptr<Semaphore>> semaphores;
     std::map<std::uint64_t, std::shared_ptr<Queue>> queues;
     std::map<std::uint64_t, std::shared_ptr<Group>> groups;
@@ -172,6 +180,17 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     std::map<std::uint64_t, std::pair<SourceType, std::string>> source_types;
     std::condition_variable group_changed;
     std::map<std::uint64_t, std::uint64_t> draining; // thread identity -> queue being drained
+    std::map<std::uint64_t, Attribute> attributes;     // dispatch_queue_attr_t -> what it describes
+    std::map<std::uint64_t, std::uint64_t> finalizers; // dispatch_set_finalizer_f: object -> function
+    // dispatch_block_create's blocks (the block object -> its state).
+    struct BlockState {
+        std::uint64_t original{}, flags{};
+        bool invoked{}, finished{}, cancelled{};
+        std::condition_variable changed;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;   // queue (retained), block (copied)
+    };
+    std::map<std::uint64_t, std::shared_ptr<BlockState>> dispatch_blocks;
+    std::uint64_t block_invoke{}, block_dispose{}, block_descriptor{};
     std::array<std::uint64_t, 3> global{};
     std::uint64_t main_queue{}, concurrent_attribute{}, serial_attribute{};
     std::uint64_t worker_entry{}, timer_entry{};
@@ -322,8 +341,10 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     }
     void run_destructors() {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> pending;
-        { std::lock_guard lock(metadata); pending.swap(pending_destructors); }
+        std::vector<std::uint64_t> targets;
+        { std::lock_guard lock(metadata); pending.swap(pending_destructors); targets.swap(pending_target_releases); }
         for (const auto& [context, destructor] : pending) static_cast<void>(call_address(destructor, {context}));
+        for (const auto target : targets) reference(target, false);
     }
 
     std::shared_ptr<Semaphore> lookup(std::uint64_t address) {
@@ -344,7 +365,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     }
 
     void reference(std::uint64_t address, bool retain) {
-        bool destroy{};
+        bool destroy{}, queue_object{};
         std::shared_ptr<Source> disposed;
         {
             std::lock_guard lock(metadata);
@@ -361,17 +382,16 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
                         value.released = true; retire(address, value);
                     }
                 }
-                return;
-            }
-            if (const auto group = groups.find(address); group != groups.end()) {
+                if (!value.released) return;
+                queue_object = true;   // the last reference: its finalizer runs below, outside the lock
+            } else if (const auto group = groups.find(address); group != groups.end()) {
                 auto& value = *group->second;
                 if (retain) {
                     if (value.references == UINT64_MAX) throw std::runtime_error("dispatch reference count overflow");
                     ++value.references;
                 } else if (--value.references == 0) { value.released = true; retire_group(value); }
                 return;
-            }
-            if (const auto source = sources.find(address); source != sources.end()) {
+            } else if (const auto source = sources.find(address); source != sources.end()) {
                 auto& value = *source->second;
                 if (retain) {
                     if (value.references == UINT64_MAX) throw std::runtime_error("dispatch reference count overflow");
@@ -383,6 +403,10 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
                     // stops and no further handlers are submitted.
                     value.disposed = value.canceled = true; ++value.generation;
                     disposed = source->second;
+                    if (const auto finalizer = finalizers.find(address); finalizer != finalizers.end()) {
+                        pending_destructors.emplace_back(value.context, finalizer->second);
+                        finalizers.erase(finalizer);
+                    }
                     sources.erase(source);
                 }
                 if (!disposed) return;
@@ -403,6 +427,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
             }
         }
         run_destructors();
+        if (queue_object) return;
         if (disposed) {
             // Handlers that are not queued are released now; a queued cancel
             // handler releases them itself after it ran.
@@ -566,9 +591,12 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     }
 
     // ---- queues -------------------------------------------------------------
-    std::uint64_t new_queue(Kind kind, std::string_view label, bool immortal) {
+    std::uint64_t new_queue(Kind kind, std::string_view label, bool immortal, const Attribute& attribute = {}) {
         auto queue = std::make_shared<Queue>();
         queue->kind = kind; queue->immortal = immortal;
+        queue->qos = attribute.qos;
+        // An initially-inactive queue holds its work until dispatch_activate.
+        if (attribute.inactive) { queue->inactive = true; queue->suspended = 1; }
         const auto address = marked_object(queue_marker, queue_class(*queue), 128);
         try {
             transmute::GuestMemory& engine = process.calling_engine();
@@ -602,6 +630,11 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
             if (entry.second) pending_destructors.push_back(entry);
         }
         value.specifics.clear();
+        if (const auto finalizer = finalizers.find(address); finalizer != finalizers.end()) {
+            pending_destructors.emplace_back(value.context, finalizer->second);
+            finalizers.erase(finalizer);
+        }
+        if (value.target) pending_target_releases.push_back(value.target);
         const auto label = value.label;
         queues.erase(address);
         process.release_guest(label);
@@ -651,6 +684,21 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         return count;
     }
     void activate(std::uint64_t address, unsigned count) {
+        if (!count) return;
+        std::uint64_t target{};
+        {
+            std::lock_guard lock(metadata);
+            if (const auto found = queues.find(address); found != queues.end()) target = found->second->target;
+        }
+        if (target) {
+            // The queue drains as work items of its target (dispatch_set_target_queue).
+            for (unsigned index = 0; index < count; ++index) {
+                Work work;
+                work.action = [self = shared_from_this(), address] { self->drain(address); };
+                async(target, std::move(work));
+            }
+            return;
+        }
         for (unsigned index = 0; index < count; ++index) {
             bool started{};
             try { started = start_task([self = shared_from_this(), address] { self->drain(address); self->run_destructors(); }); }
@@ -701,7 +749,14 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         { std::lock_guard lock(metadata); const auto found = queues.find(address);
           if (found == queues.end()) throw std::runtime_error("dispatch worker lost its queue"); value = found->second; }
         const auto self = identity();
-        const auto leave = [&] { --value->active; draining.erase(self); retire(address, *value); value->changed.notify_all(); };
+        // A queue drained as a work item of its target keeps the target's mark afterwards.
+        std::optional<std::uint64_t> enclosing;
+        { std::lock_guard lock(metadata); if (const auto found = draining.find(self); found != draining.end()) enclosing = found->second; }
+        const auto leave = [&] {
+            --value->active;
+            if (enclosing) draining[self] = *enclosing; else draining.erase(self);
+            retire(address, *value); value->changed.notify_all();
+        };
         const bool concurrent = value->kind == Kind::concurrent;
         for (;;) {
             Work work;
@@ -748,6 +803,22 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     void sync(std::uint64_t address, Work work, bool barrier = false) {
         const auto value = queue(address);
         const auto self = identity();
+        bool targeted{};
+        { std::lock_guard lock(metadata); targeted = value->target != 0; }
+        if (targeted) {
+            // The work must run inside the target hierarchy: queue it and wait.
+            if (on_queue(address)) throw std::runtime_error("dispatch_sync onto a queue the current thread already runs deadlocks");
+            work.done = std::make_shared<bool>(false);
+            work.barrier = barrier;
+            const auto done = work.done;
+            async(address, std::move(work));
+            std::unique_lock lock(metadata);
+            while (!*done) {
+                value->changed.wait_for(lock, poll_period);
+                if (exiting()) { lock.unlock(); stop("dispatch_sync"); }
+            }
+            return;
+        }
         if (value->kind == Kind::concurrent && value->immortal) { Entered entered(*this, address); execute(work); return; }
         if (value->kind == Kind::concurrent) { concurrent_sync(address, value, std::move(work), barrier); return; }
         if (value->kind == Kind::main) {
@@ -906,15 +977,25 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     }
     void activate_object(std::uint64_t address) {
         std::shared_ptr<Source> source;
+        unsigned start{};
+        std::uint64_t queue_address{};
         {
             std::lock_guard lock(metadata);
             if (const auto entry = sources.find(address); entry != sources.end()) {
                 source = entry->second;
                 if (!source->inactive) return;
                 source->inactive = false;
-            } else if (queues.contains(address)) return; // Queues here are created active.
+            } else if (const auto queue_entry = queues.find(address); queue_entry != queues.end()) {
+                auto& value = *queue_entry->second;
+                if (!value.inactive) return;
+                value.inactive = false;
+                --value.suspended;
+                start = wanted(value);
+                queue_address = address;
+            }
             else throw std::runtime_error("dispatch_activate of an object that cannot be activated");
         }
+        if (queue_address) { activate(queue_address, start); return; }
         source_ready(source);
     }
     std::uint64_t* context_slot(std::uint64_t address) {
@@ -942,10 +1023,26 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
             return;
         }
         if (const auto found = queues.find(address); found != queues.end() && !found->second->released) {
-            // A global target only sets a QoS (a host scheduling hint here);
-            // queue hierarchies are not modelled.
-            if (global_target && !found->second->immortal) return;
-            throw std::runtime_error("unsupported dispatch_set_target_queue: queue hierarchies are not implemented");
+            auto& value = *found->second;
+            if (value.immortal) throw std::runtime_error("dispatch_set_target_queue of a global or main queue");
+            // A global target only sets a QoS (a host scheduling hint here): the queue runs on
+            // the worker pool. A private target (or the main queue) is retained, and this
+            // queue's work runs as work items of it.
+            std::uint64_t selected{};
+            if (!global_target) {
+                const auto target_queue = queues.find(target);
+                if (target_queue == queues.end() || target_queue->second->released) throw std::runtime_error("invalid dispatch target queue");
+                for (auto current = target; current;) {
+                    if (current == address) throw std::runtime_error("dispatch_set_target_queue would make a cycle of queues");
+                    const auto next = queues.find(current);
+                    current = next == queues.end() ? 0 : next->second->target;
+                }
+                selected = target;
+                if (!target_queue->second->immortal) ++target_queue->second->references;
+            }
+            const auto previous = std::exchange(value.target, selected);
+            if (previous) pending_target_releases.push_back(previous);
+            return;
         }
         throw std::runtime_error("dispatch_set_target_queue of an object without a target");
     }
@@ -1106,6 +1203,9 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
             const auto state = process.child_exited ? process.child_exited(static_cast<std::uint32_t>(handle)) : std::nullopt;
             known_child = state.has_value();
             canceled_at_creation = !known_child && handle != static_cast<std::uint64_t>(call("_getpid", {}));
+        } else if (kind == SourceType::signal) {
+            // A signal number; no mask.
+            if (!handle || handle >= 32 || mask) return 0;
         } else if (handle) return 0; // Timer and data sources take no handle.
         if (!target) target = global[1];
         static_cast<void>(queue(target));
@@ -1538,10 +1638,144 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         default: return 0;
         }
     }
-    Kind attribute_kind(std::uint64_t attribute) const {
-        if (!attribute || attribute == serial_attribute) return Kind::serial;
-        if (attribute == concurrent_attribute) return Kind::concurrent;
-        throw std::runtime_error("unsupported Darwin dispatch queue attribute");
+    Attribute attribute_of(std::uint64_t address) {
+        if (!address) return {};
+        std::lock_guard lock(metadata);
+        const auto found = attributes.find(address);
+        if (found == attributes.end()) throw std::runtime_error("unsupported Darwin dispatch queue attribute");
+        return found->second;
+    }
+    Kind attribute_kind(std::uint64_t attribute) { return attribute_of(attribute).kind; }
+    // The attribute object for `value`: the shared serial or concurrent one when it adds nothing,
+    // else one made once per combination (attributes are never released).
+    std::uint64_t attribute_for(const Attribute& value) {
+        if (!value.inactive && !value.qos && !value.frequency)
+            return value.kind == Kind::concurrent ? concurrent_attribute : serial_attribute;
+        std::lock_guard lock(metadata);
+        for (const auto& [address, existing] : attributes)
+            if (existing.kind == value.kind && existing.inactive == value.inactive && existing.qos == value.qos && existing.frequency == value.frequency)
+                return address;
+        const auto address = process.allocate_guest(64);
+        process.calling_engine().fill_bytes(address, 0, 64);
+        process.calling_engine().write64(address, isa(ObjectClass::attribute, 0));
+        attributes.emplace(address, value);
+        return address;
+    }
+    // The queue and its private targets, nearest first.
+    std::vector<std::uint64_t> hierarchy(std::uint64_t address) {
+        std::vector<std::uint64_t> chain;
+        std::lock_guard lock(metadata);
+        while (address && chain.size() < 64) {
+            chain.push_back(address);
+            const auto found = queues.find(address);
+            address = found == queues.end() ? 0 : found->second->target;
+        }
+        return chain;
+    }
+    // Whether the calling thread runs work of `address` (or of a queue that targets it).
+    bool on_queue(std::uint64_t address) {
+        for (auto current = current_queue(); current;) {
+            for (const auto queue_address : hierarchy(current)) if (queue_address == address) return true;
+            break;
+        }
+        return false;
+    }
+
+    // ---- dispatch blocks (dispatch_block_create) ---------------------------------
+    // A dispatch block is a heap block {isa, flags, reserved, invoke, descriptor} whose invoke
+    // runs the copied original once per call, then marks the block finished: dispatch_block_wait
+    // returns, dispatch_block_notify's blocks are submitted. A cancelled block returns at once
+    // when invoked. Its descriptor's dispose releases the original and pending notifications.
+    static constexpr std::uint64_t block_flags_mask = 0x3f;   // BARRIER ... ENFORCE_QOS_CLASS
+    std::uint64_t create_block(std::uint64_t flags, std::uint64_t block) {
+        if (!block || (flags & ~block_flags_mask)) return 0;
+        auto state = std::make_shared<BlockState>();
+        state->flags = flags;
+        state->original = call("__Block_copy", {block});
+        auto& memory = process.calling_engine();
+        const auto wrapper = process.allocate_guest(32, 16);
+        memory.write64(wrapper, symbol("__NSConcreteMallocBlock"));
+        memory.write32(wrapper + 8, (1U << 24) | (1U << 25) | 2);   // BLOCK_NEEDS_FREE | BLOCK_HAS_COPY_DISPOSE, one reference
+        memory.write32(wrapper + 12, 0);
+        memory.write64(wrapper + 16, block_invoke);
+        memory.write64(wrapper + 24, block_descriptor);
+        std::lock_guard lock(metadata);
+        dispatch_blocks.emplace(wrapper, std::move(state));
+        return wrapper;
+    }
+    std::shared_ptr<BlockState> block_state(std::uint64_t block) {
+        std::lock_guard lock(metadata);
+        const auto found = dispatch_blocks.find(block);
+        if (found == dispatch_blocks.end()) throw std::runtime_error("dispatch block function on a block dispatch_block_create did not make");
+        return found->second;
+    }
+    bool barrier_block(std::uint64_t block) {
+        std::lock_guard lock(metadata);
+        const auto found = dispatch_blocks.find(block);
+        return found != dispatch_blocks.end() && (found->second->flags & 1);
+    }
+    void invoke_block(std::uint64_t block) {
+        const auto state = block_state(block);
+        bool cancelled{};
+        { std::lock_guard lock(metadata); cancelled = state->cancelled; state->invoked = true; }
+        if (!cancelled) static_cast<void>(call_address(process.calling_engine().read64(state->original + 16), {state->original}));
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
+        {
+            std::lock_guard lock(metadata);
+            state->finished = true;
+            notifications.swap(state->notifications);
+        }
+        state->changed.notify_all();
+        for (const auto& [target, notification] : notifications) {
+            Work work;
+            work.function = process.calling_engine().read64(notification + 16);
+            work.context = work.block = notification;   // the copy notify made
+            async(target, std::move(work));
+            reference(target, false);
+        }
+    }
+    void dispose_block(std::uint64_t block) {
+        std::shared_ptr<BlockState> state;
+        {
+            std::lock_guard lock(metadata);
+            const auto found = dispatch_blocks.find(block);
+            if (found == dispatch_blocks.end()) return;
+            state = found->second;
+            dispatch_blocks.erase(found);
+        }
+        static_cast<void>(call("__Block_release", {state->original}));
+        for (const auto& [target, notification] : state->notifications) {
+            static_cast<void>(call("__Block_release", {notification}));
+            reference(target, false);
+        }
+    }
+    // 0 when the block finished (or was attempted after cancellation) by `timeout`, else 1.
+    std::uint64_t wait_block(std::uint64_t block, std::uint64_t timeout) {
+        const auto state = block_state(block);
+        std::unique_lock lock(metadata);
+        while (!state->finished) {
+            const auto left = remaining(timeout);
+            if (!left) return 1;
+            state->changed.wait_for(lock, std::min<std::chrono::nanoseconds>(std::chrono::nanoseconds(std::min<std::uint64_t>(left, INT64_MAX)), poll_period));
+            if (exiting()) { lock.unlock(); stop("dispatch_block_wait"); }
+        }
+        return 0;
+    }
+    void notify_block(std::uint64_t block, std::uint64_t target, std::uint64_t notification) {
+        const auto state = block_state(block);
+        if (!notification) throw std::runtime_error("dispatch_block_notify received a null block");
+        static_cast<void>(queue(target));
+        const auto copy = call("__Block_copy", {notification});
+        reference(target, true);
+        {
+            std::lock_guard lock(metadata);
+            if (!state->finished) { state->notifications.emplace_back(target, copy); return; }
+        }
+        Work work;
+        work.function = process.calling_engine().read64(copy + 16);
+        work.context = work.block = copy;
+        async(target, std::move(work));
+        reference(target, false);
     }
 
     template<class Function> void install(std::string name, Function function) {
@@ -1564,6 +1798,8 @@ void Dispatch::install_queues() {
         process.calling_engine().fill_bytes(attribute, 0, 64);
         process.calling_engine().write64(attribute, isa(ObjectClass::attribute, 0));
     }
+    attributes[concurrent_attribute] = Attribute{Kind::concurrent};
+    attributes[serial_attribute] = Attribute{Kind::serial};
     process.install_export(std::string(system_library), "__dispatch_main_q", {main_queue, ExportKind::data});
     process.install_export(std::string(system_library), "__dispatch_queue_attr_concurrent", {concurrent_attribute, ExportKind::data});
     const auto owned = shared_from_this();
@@ -1579,12 +1815,94 @@ void Dispatch::install_queues() {
     install("_dispatch_queue_create", [](auto& self, auto& s, auto& m) {
         std::string label;
         if (s.x[0]) { const auto bytes = m.read_string(s.x[0], 1, 4096); label.assign(bytes.begin(), bytes.end()); }
-        return self.new_queue(self.attribute_kind(s.x[1]), label, false);
+        const auto attribute = self.attribute_of(s.x[1]);
+        return self.new_queue(attribute.kind, label, false, attribute);
     });
+    // Attributes: QoS is a scheduling hint for host threads (dispatch_queue_get_qos_class reports
+    // it); the autorelease frequency is kept (Alchemy's work items each run in a pool anyway); an
+    // initially-inactive queue holds its work until dispatch_activate.
     install("_dispatch_queue_attr_make_with_qos_class", [](auto& self, auto& s, auto&) {
-        // QoS is a scheduling hint for host threads; the attribute keeps its kind.
-        return self.attribute_kind(s.x[0]) == Kind::concurrent ? self.concurrent_attribute : self.serial_attribute;
+        auto attribute = self.attribute_of(s.x[0]);
+        attribute.qos = static_cast<std::uint32_t>(s.x[1]);
+        return self.attribute_for(attribute);
     });
+    install("_dispatch_queue_attr_make_initially_inactive", [](auto& self, auto& s, auto&) {
+        auto attribute = self.attribute_of(s.x[0]);
+        attribute.inactive = true;
+        return self.attribute_for(attribute);
+    });
+    install("_dispatch_queue_attr_make_with_autorelease_frequency", [](auto& self, auto& s, auto&) {
+        auto attribute = self.attribute_of(s.x[0]);
+        if (s.x[1] > 2) return std::uint64_t{0};   // INHERIT 0, WORK_ITEM 1, NEVER 2
+        attribute.frequency = s.x[1];
+        return self.attribute_for(attribute);
+    });
+    // dispatch_queue_t dispatch_get_current_queue(void) (deprecated): the queue whose work runs
+    // here, else the default-priority global queue.
+    install("_dispatch_get_current_queue", [](auto& self, auto&, auto&) {
+        const auto current = self.current_queue();
+        return current ? current : self.global[1];
+    });
+    // dispatch_qos_class_t dispatch_queue_get_qos_class(queue, int* relative_priority)
+    install("_dispatch_queue_get_qos_class", [](auto& self, auto& s, auto& m) {
+        std::uint64_t qos{};
+        if (s.x[0] == self.main_queue) qos = 0x21;
+        else if (s.x[0] == self.global[0]) qos = 0x19;
+        else if (s.x[0] == self.global[1]) qos = 0x15;
+        else if (s.x[0] == self.global[2]) qos = 0x11;
+        else { const auto value = self.queue(s.x[0]); std::lock_guard lock(self.metadata); qos = value->qos; }
+        if (s.x[1]) m.write32(s.x[1], 0);
+        return qos;
+    });
+    // QoS floors and overrides are scheduling hints: accepted for queues and sources.
+    for (const auto name : {"_dispatch_set_qos_class_floor", "_dispatch_set_qos_class", "_dispatch_set_qos_class_fallback"})
+        install(name, [](auto& self, auto& s, auto&) {
+            std::lock_guard lock(self.metadata);
+            if (!self.queues.contains(s.x[0]) && !self.sources.contains(s.x[0])) throw std::runtime_error("dispatch QoS of an object without one");
+            return std::uint64_t{0};
+        });
+    // Workloops run their work one item at a time, in submission order (QoS is not modelled):
+    // a serial queue.
+    install("_dispatch_workloop_create", [](auto& self, auto& s, auto& m) {
+        std::string label;
+        if (s.x[0]) { const auto bytes = m.read_string(s.x[0], 1, 4096); label.assign(bytes.begin(), bytes.end()); }
+        return self.new_queue(Kind::serial, label, false);
+    });
+    install("_dispatch_workloop_create_inactive", [](auto& self, auto& s, auto& m) {
+        std::string label;
+        if (s.x[0]) { const auto bytes = m.read_string(s.x[0], 1, 4096); label.assign(bytes.begin(), bytes.end()); }
+        Attribute attribute;
+        attribute.inactive = true;
+        return self.new_queue(Kind::serial, label, false, attribute);
+    });
+    // Autorelease frequency and os_workgroup membership are scheduling properties here.
+    for (const auto name : {"_dispatch_workloop_set_autorelease_frequency", "_dispatch_workloop_set_os_workgroup"})
+        install(name, [](auto& self, auto& s, auto&) { static_cast<void>(self.queue(s.x[0])); return std::uint64_t{0}; });
+    // dispatch_assert_queue / _barrier / _not (and the $V2 entry points): a failed assertion
+    // stops, as libdispatch crashes.
+    const auto assertion = [](auto& self, std::uint64_t address, std::string_view what) {
+        const auto value = self.queue(address);
+        const auto label = self.process.calling_engine().read_string(value->label, 1, 256);
+        throw std::runtime_error("BUG IN CLIENT OF LIBDISPATCH: " + std::string(what) + " [" + std::string(label.begin(), label.end()) + "]");
+    };
+    for (const auto name : {"_dispatch_assert_queue", "_dispatch_assert_queue$V2"})
+        install(name, [assertion](auto& self, auto& s, auto&) {
+            if (!self.on_queue(s.x[0])) assertion(self, s.x[0], "Block was expected to execute on queue");
+            return std::uint64_t{0};
+        });
+    install("_dispatch_assert_queue_barrier", [assertion](auto& self, auto& s, auto&) {
+        if (!self.on_queue(s.x[0])) assertion(self, s.x[0], "Block was expected to execute on queue");
+        const auto value = self.queue(s.x[0]);
+        bool exclusive{};
+        { std::lock_guard lock(self.metadata); exclusive = value->kind != Kind::concurrent || value->barrier_running || value->running <= 1; }
+        if (!exclusive) assertion(self, s.x[0], "Block was expected to act as a barrier on queue");
+        return std::uint64_t{0};
+    });
+    for (const auto name : {"_dispatch_assert_queue_not", "_dispatch_assert_queue_not$V2"})
+        install(name, [assertion](auto& self, auto& s, auto&) {
+            if (self.on_queue(s.x[0])) assertion(self, s.x[0], "Block was expected not to execute on queue");
+            return std::uint64_t{0};
+        });
     install("_dispatch_queue_get_label", [](auto& self, auto& s, auto&) {
         auto address = s.x[0];
         if (!address) {
@@ -1596,7 +1914,11 @@ void Dispatch::install_queues() {
         }
         return self.queue(address)->label;
     });
-    install("_dispatch_async", [](auto& self, auto& s, auto&) { self.async(s.x[0], self.block_work(s.x[1])); return std::uint64_t{0}; });
+    install("_dispatch_async", [](auto& self, auto& s, auto&) {
+        auto work = self.block_work(s.x[1]);
+        work.barrier = self.barrier_block(s.x[1]);
+        self.async(s.x[0], std::move(work)); return std::uint64_t{0};
+    });
     install("_dispatch_async_f", [](auto& self, auto& s, auto&) {
         self.async(s.x[0], function_work(s.x[1], s.x[2], "dispatch_async_f")); return std::uint64_t{0};
     });
@@ -1612,6 +1934,16 @@ void Dispatch::install_queues() {
         self.async(s.x[0], std::move(work)); return std::uint64_t{0};
     });
     install("_dispatch_barrier_sync", [](auto& self, auto& s, auto&) { self.sync(s.x[0], self.block_work(s.x[1]), true); return std::uint64_t{0}; });
+    // dispatch_async_and_wait(_f) and the barrier forms: submit and wait for the work, which
+    // runs as dispatch_sync runs it (Alchemy does not move it to the queue's own thread).
+    install("_dispatch_async_and_wait", [](auto& self, auto& s, auto&) { self.sync(s.x[0], self.block_work(s.x[1])); return std::uint64_t{0}; });
+    install("_dispatch_async_and_wait_f", [](auto& self, auto& s, auto&) {
+        self.sync(s.x[0], function_work(s.x[1], s.x[2], "dispatch_async_and_wait_f")); return std::uint64_t{0};
+    });
+    install("_dispatch_barrier_async_and_wait", [](auto& self, auto& s, auto&) { self.sync(s.x[0], self.block_work(s.x[1]), true); return std::uint64_t{0}; });
+    install("_dispatch_barrier_async_and_wait_f", [](auto& self, auto& s, auto&) {
+        self.sync(s.x[0], function_work(s.x[1], s.x[2], "dispatch_barrier_async_and_wait_f"), true); return std::uint64_t{0};
+    });
     install("_dispatch_barrier_sync_f", [](auto& self, auto& s, auto&) {
         self.sync(s.x[0], function_work(s.x[1], s.x[2], "dispatch_barrier_sync_f"), true); return std::uint64_t{0};
     });
@@ -1628,16 +1960,25 @@ void Dispatch::install_queues() {
         std::lock_guard lock(self.metadata); *self.context_slot(s.x[0]) = s.x[1]; return std::uint64_t{0};
     });
     install("_dispatch_get_context", [](auto& self, auto& s, auto&) { std::lock_guard lock(self.metadata); return *self.context_slot(s.x[0]); });
-    install("_dispatch_set_finalizer_f", [](auto&, auto& s, auto&) {
-        if (s.x[1]) throw std::runtime_error("unsupported dispatch_set_finalizer_f: dispatch object finalizers are not implemented");
+    // dispatch_set_finalizer_f(object, finalizer): called with the object's context once the
+    // object's last reference is released (queues and sources).
+    install("_dispatch_set_finalizer_f", [](auto& self, auto& s, auto&) {
+        std::lock_guard lock(self.metadata);
+        if (!self.queues.contains(s.x[0]) && !self.sources.contains(s.x[0])) throw std::runtime_error("dispatch_set_finalizer_f of an object without a context");
+        if (s.x[1]) self.finalizers[s.x[0]] = s.x[1]; else self.finalizers.erase(s.x[0]);
         return std::uint64_t{0};
     });
     install("_dispatch_queue_set_specific", [](auto& self, auto& s, auto&) {
         self.set_specific(s.x[0], s.x[1], s.x[2], s.x[3]); return std::uint64_t{0};
     });
     install("_dispatch_queue_get_specific", [](auto& self, auto& s, auto&) { return self.get_specific(s.x[0], s.x[1]); });
-    install("_dispatch_get_specific", [](auto& self, auto& s, auto&) { return self.get_specific(self.current_queue(), s.x[0]); });
-    install("_dispatch_set_target_queue", [](auto& self, auto& s, auto&) { self.set_target(s.x[0], s.x[1]); return std::uint64_t{0}; });
+    // dispatch_get_specific: the current queue's value, else its targets', nearest first.
+    install("_dispatch_get_specific", [](auto& self, auto& s, auto&) {
+        for (const auto address : self.hierarchy(self.current_queue()))
+            if (const auto value = self.get_specific(address, s.x[0])) return value;
+        return std::uint64_t{0};
+    });
+    install("_dispatch_set_target_queue", [](auto& self, auto& s, auto&) { self.set_target(s.x[0], s.x[1]); self.run_destructors(); return std::uint64_t{0}; });
     // CoreFoundation's run loop drains the main queue through this SPI.
     install("__dispatch_main_queue_callback_4CF", [](auto& self, auto&, auto&) { static_cast<void>(self.drain_main()); return std::uint64_t{0}; });
     static_cast<void>(process.install_function("_dispatch_main", [owned](auto& state, auto&) {
@@ -1652,6 +1993,37 @@ void Dispatch::install_queues() {
             if (value->items.empty()) value->changed.wait_for(lock, poll_period);
         }
     }));
+    block_invoke = process.install_function("__alchemy_dispatch_block_invoke", [owned](auto& state, auto&) {
+        owned->invoke_block(state.x[0]); state.x[0] = 0;
+    }, "alchemy.internal");
+    const auto block_copy_helper = process.install_function("__alchemy_dispatch_block_copy", [](auto&, auto&) {}, "alchemy.internal");
+    const auto block_dispose_helper = process.install_function("__alchemy_dispatch_block_dispose", [owned](auto& state, auto&) {
+        owned->dispose_block(state.x[0]);
+    }, "alchemy.internal");
+    block_descriptor = process.allocate_guest(32);
+    process.calling_engine().write64(block_descriptor, 0);
+    process.calling_engine().write64(block_descriptor + 8, 32);
+    process.calling_engine().write64(block_descriptor + 16, block_copy_helper);
+    process.calling_engine().write64(block_descriptor + 24, block_dispose_helper);
+    // dispatch_block_t dispatch_block_create(flags, block) and _with_qos_class(flags, qos,
+    // relative_priority, block): QoS is a scheduling hint; DISPATCH_BLOCK_BARRIER makes
+    // dispatch_async of the block a barrier.
+    install("_dispatch_block_create", [](auto& self, auto& s, auto&) { return self.create_block(s.x[0], s.x[1]); });
+    install("_dispatch_block_create_with_qos_class", [](auto& self, auto& s, auto&) { return self.create_block(s.x[0], s.x[3]); });
+    // void dispatch_block_perform(flags, block): runs the block now, as a block made with flags.
+    install("_dispatch_block_perform", [](auto& self, auto& s, auto&) {
+        if (!s.x[1]) throw std::runtime_error("dispatch_block_perform received a null block");
+        static_cast<void>(self.call_address(self.process.calling_engine().read64(s.x[1] + 16), {s.x[1]}));
+        return std::uint64_t{0};
+    });
+    install("_dispatch_block_wait", [](auto& self, auto& s, auto&) { return self.wait_block(s.x[0], s.x[1]); });
+    install("_dispatch_block_notify", [](auto& self, auto& s, auto&) { self.notify_block(s.x[0], s.x[1], s.x[2]); return std::uint64_t{0}; });
+    install("_dispatch_block_cancel", [](auto& self, auto& s, auto&) {
+        const auto state = self.block_state(s.x[0]); std::lock_guard lock(self.metadata); state->cancelled = true; return std::uint64_t{0};
+    });
+    install("_dispatch_block_testcancel", [](auto& self, auto& s, auto&) {
+        const auto state = self.block_state(s.x[0]); std::lock_guard lock(self.metadata); return std::uint64_t{state->cancelled ? 1U : 0U};
+    });
     install_groups_and_sources();
 }
 
@@ -1680,7 +2052,7 @@ void Dispatch::install_groups_and_sources() {
     const std::array<std::pair<const char*, SourceType>, 12> types{{
         {"timer", SourceType::timer}, {"data_add", SourceType::data_add}, {"data_or", SourceType::data_or},
         {"data_replace", SourceType::data_replace}, {"read", SourceType::read}, {"write", SourceType::write},
-        {"proc", SourceType::proc}, {"signal", SourceType::unsupported}, {"vnode", SourceType::vnode},
+        {"proc", SourceType::proc}, {"signal", SourceType::signal}, {"vnode", SourceType::vnode},
         {"mach_send", SourceType::mach_send}, {"mach_recv", SourceType::mach_recv},
         {"memorypressure", SourceType::memory_pressure}}};
     for (const auto& [name, kind] : types) {
@@ -1694,6 +2066,23 @@ void Dispatch::install_groups_and_sources() {
         process.install_export(std::string(system_library), "__dispatch_source_type_" + std::string(name), {address, ExportKind::data});
     }
     install("_dispatch_source_create", [](auto& self, auto& s, auto&) { return self.new_source(s.x[0], s.x[1], s.x[2], s.x[3]); });
+    // DISPATCH_SOURCE_TYPE_SIGNAL: each delivery of the signal adds one to the source's data,
+    // as on Darwin also when the signal's action is SIG_IGN.
+    process.signal_observed = [weak = std::weak_ptr<Dispatch>(shared_from_this())](int signal) {
+        const auto self = weak.lock();
+        if (!self) return;
+        std::vector<std::shared_ptr<Source>> ready;
+        {
+            std::lock_guard lock(self->metadata);
+            for (const auto& [address, value] : self->sources) {
+                static_cast<void>(address);
+                if (value->type != SourceType::signal || value->handle != static_cast<std::uint64_t>(signal) || value->canceled) continue;
+                ++value->pending;
+                ready.push_back(value);
+            }
+        }
+        for (const auto& value : ready) self->source_ready(value);
+    };
     install("_dispatch_source_set_event_handler", [](auto& self, auto& s, auto&) { self.set_handler(s.x[0], &Source::event, 0, s.x[1]); return std::uint64_t{0}; });
     install("_dispatch_source_set_event_handler_f", [](auto& self, auto& s, auto&) { self.set_handler(s.x[0], &Source::event, s.x[1], 0); return std::uint64_t{0}; });
     install("_dispatch_source_set_cancel_handler", [](auto& self, auto& s, auto&) { self.set_handler(s.x[0], &Source::cancel, 0, s.x[1]); return std::uint64_t{0}; });

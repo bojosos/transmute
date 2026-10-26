@@ -3,17 +3,26 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <vector>
 
 // libSystem networking pieces a renderer plug-in's ZeroMQ/HTTP clients import: interface
 // enumeration (getifaddrs over GetAdaptersAddresses), pselect, connectx,
-// getprotobynumber, inet_net_pton and in6addr_any. Structure layouts follow
+// getprotobynumber, inet_net_pton and in6addr_any; disconnectx and the classic
+// inet_aton/inet_network/inet_makeaddr/inet_lnaof/inet_netof. Structure layouts follow
 // the Darwin headers (<ifaddrs.h>, <net/if_dl.h>, <net/if_var.h>,
 // <netinet/in.h>, <sys/socket.h>, <netdb.h>).
 namespace alchemy::export_fill {
+namespace {
+constexpr std::uint32_t byte_swap32(std::uint32_t value) {
+    return (value >> 24) | ((value >> 8) & 0xff00U) | ((value << 8) & 0xff0000U) | (value << 24);
+}
+} // namespace
 
 std::vector<Interface> host_interfaces() {
     std::vector<Interface> result;
@@ -307,6 +316,93 @@ void install_libsystem_net(Provider& p) {
             if (length_out) m.write64(length_out, static_cast<std::uint64_t>(written));
         }
         return 0;
+    });
+
+    // int disconnectx(int, sae_associd_t, sae_connid_t): ends the connection connectx made (its
+    // connection id is 1); SAE_ASSOCID_ANY/ALL and SAE_CONNID_ANY/ALL name it too.
+    p.libsystem("_disconnectx", [p](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto association = static_cast<std::uint32_t>(s.x[1]), connection = static_cast<std::uint32_t>(s.x[2]);
+        if ((association != 0 && association != UINT32_MAX) || (connection > 1 && connection != UINT32_MAX)) throw Errno{einval};
+        if (static_cast<std::int32_t>(p.call(libsystem_library, "_shutdown", {s.x[0], 2})) < 0) throw Errno{p.guest_errno()};
+        return 0;
+    });
+
+    // The BSD numbers-and-dots forms: a, a.b (8.24 bits), a.b.c (8.8.16), a.b.c.d; each part
+    // decimal, octal (leading 0) or hex (0x). Trailing white space ends the address.
+    const auto parts = [](const std::string& text) -> std::optional<std::vector<std::uint64_t>> {
+        std::vector<std::uint64_t> values;
+        std::size_t at = 0;
+        for (;;) {
+            if (at >= text.size() || !std::isdigit(static_cast<unsigned char>(text[at]))) return std::nullopt;
+            unsigned base = 10;
+            if (text[at] == '0') {
+                base = 8; ++at;
+                if (at < text.size() && (text[at] == 'x' || text[at] == 'X')) { base = 16; ++at; }
+            }
+            std::uint64_t value = 0;
+            while (at < text.size()) {
+                const auto c = static_cast<unsigned char>(text[at]);
+                unsigned digit;
+                if (std::isdigit(c) && c - '0' < base) digit = c - '0';
+                else if (base == 16 && std::isxdigit(c)) digit = static_cast<unsigned>(std::tolower(c) - 'a' + 10);
+                else break;
+                value = value * base + digit;
+                if (value > UINT32_MAX) return std::nullopt;
+                ++at;
+            }
+            values.push_back(value);
+            if (at < text.size() && text[at] == '.') {
+                if (values.size() == 4) return std::nullopt;
+                ++at;
+                continue;
+            }
+            break;
+        }
+        if (at < text.size() && !std::isspace(static_cast<unsigned char>(text[at]))) return std::nullopt;
+        return values;
+    };
+    // int inet_aton(const char*, struct in_addr*): 1 and the address (network order), or 0.
+    p.libsystem("_inet_aton", [parts](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto values = parts(guest_string(m, s.x[0], 256));
+        if (!values) return 0;
+        const auto& v = *values;
+        std::uint64_t address{};
+        if (v.size() == 1) address = v[0];
+        else if (v.size() == 2) { if (v[0] > 255 || v[1] > 0xffffff) return 0; address = v[0] << 24 | v[1]; }
+        else if (v.size() == 3) { if (v[0] > 255 || v[1] > 255 || v[2] > 0xffff) return 0; address = v[0] << 24 | v[1] << 16 | v[2]; }
+        else { for (const auto part : v) if (part > 255) return 0; address = v[0] << 24 | v[1] << 16 | v[2] << 8 | v[3]; }
+        if (s.x[1]) m.write32(s.x[1], byte_swap32(static_cast<std::uint32_t>(address)));
+        return 1;
+    }, 0);
+    // in_addr_t inet_network(const char*): each part one byte, in host order; INADDR_NONE on error.
+    p.libsystem("_inet_network", [parts](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto values = parts(guest_string(m, s.x[0], 256));
+        if (!values) return UINT32_MAX;
+        std::uint64_t address{};
+        for (const auto part : *values) { if (part > 255) return UINT32_MAX; address = address << 8 | part; }
+        return address;
+    }, UINT32_MAX);
+    // The classful helpers: struct in_addr is a 32-bit value in network order.
+    p.libsystem("_inet_makeaddr", [](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto net = static_cast<std::uint32_t>(s.x[0]), host = static_cast<std::uint32_t>(s.x[1]);
+        std::uint32_t address;
+        if (net < 128) address = net << 24 | (host & 0x00ffffffU);
+        else if (net < 65536) address = net << 16 | (host & 0xffffU);
+        else if (net < 16777216) address = net << 8 | (host & 0xffU);
+        else address = net | host;
+        return byte_swap32(address);
+    });
+    p.libsystem("_inet_lnaof", [](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto address = byte_swap32(static_cast<std::uint32_t>(s.x[0]));
+        if (!(address & 0x80000000U)) return address & 0x00ffffffU;
+        if ((address & 0xc0000000U) == 0x80000000U) return address & 0xffffU;
+        return address & 0xffU;
+    });
+    p.libsystem("_inet_netof", [](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto address = byte_swap32(static_cast<std::uint32_t>(s.x[0]));
+        if (!(address & 0x80000000U)) return address >> 24;
+        if ((address & 0xc0000000U) == 0x80000000U) return address >> 16;
+        return address >> 8;
     });
 
     // struct protoent* getprotobynumber(int): the entries of Darwin's /etc/protocols.

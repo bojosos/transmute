@@ -88,13 +88,19 @@ The subsequent [dependency follow-up](ALCHEMY_PYTHON_FOLLOWUP.md) adds a bounded
 
 This is a value bridge, not an implementation of arbitrary Foundation private
 classes or layouts. Bare `NSNumber` initialization requires a typed numeric
-initializer. Unknown selectors report an unsupported forwarding diagnostic.
+initializer. Unknown selectors are resolved and forwarded as in objc4
+(`+resolveInstanceMethod:`, `-forwardingTargetForSelector:`, then the
+`objc_setForwardHandler` handler); a message nothing answers reports an
+unsupported-message diagnostic.
 No formatting method forwards guest arguments to a Windows formatter.
 
 ## Explicit boundaries
 
-Declared Objective-C protocols, weak references, Blocks, Objective-C exception
-handling, forwarding, tagged pointers, Swift/GC/preoptimized metadata, arm64e,
+(Later work added declared protocols, weak references, Blocks, message
+forwarding and Objective-C exceptions: `@throw`/`@catch` are C++ ABI exceptions
+thrown and unwound by the guest LLVM libc++abi and libunwind through guest
+frames; an exception that reaches a provider's native frame or nothing catches
+stops with its name and reason.) Originally deferred: tagged pointers, Swift/GC/preoptimized metadata, arm64e,
 copy properties, custom allocation zones, and full Foundation are deferred.
 Unsupported metadata fails before guest constructors. Known deferred helper
 functions produce specific diagnostics when invoked; doctor marks their

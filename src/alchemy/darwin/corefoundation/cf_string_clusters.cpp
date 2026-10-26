@@ -22,8 +22,8 @@
 //   published under CFNetwork, where GoogleUpdater binds them.
 // - libobjc: imp_implementationWithBlock builds a real trampoline (guest code
 //   that moves self into the block's first argument and jumps to its invoke);
-//   objc_setExceptionPreprocessor records the preprocessor (Alchemy raises no
-//   Objective-C exceptions); objc_copyCppObjectAtomic copies under a lock.
+//   objc_copyCppObjectAtomic copies under a lock. (objc_setExceptionPreprocessor
+//   is the Objective-C runtime's, objc_runtime.cpp.)
 namespace alchemy::gui::values {
 namespace {
 
@@ -339,11 +339,6 @@ void Provider::install_foundation() {
         }
         bridge->block_release(block);
         s.x[0] = 1;
-    });
-    auto preprocessor = std::make_shared<Address>(0);
-    raw(libobjc, "_objc_setExceptionPreprocessor", [this, preprocessor](CpuState& s, GuestMemory&) {
-        std::lock_guard lock(mutex);
-        s.x[0] = std::exchange(*preprocessor, s.x[0]);
     });
     // void objc_copyCppObjectAtomic(void *dest, const void *src, void (*copyHelper)(void *dest, const void *source))
     auto stripes = std::make_shared<std::array<std::mutex, 16>>();

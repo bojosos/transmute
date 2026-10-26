@@ -37,6 +37,27 @@ function(alchemy_gui_objc_tests)
             DEPENDS "${macos_dir}/${name}.o" "${macos_dir}/link_system.dylib" "${macos_dir}/link_objc.dylib" VERBATIM)
         list(APPEND objc_programs "${macos_dir}/${name}")
     endforeach()
+    # Objective-C exceptions throw and unwind through the guest LLVM libc++abi and libunwind,
+    # which only a --runtime-dir supplies, so this fixture links them and runs with it.
+    if(EXISTS "${ALCHEMY_LLVM_RUNTIME_DIR}/libc++abi.dylib" AND EXISTS "${ALCHEMY_LLVM_RUNTIME_DIR}/libunwind.dylib")
+        add_custom_command(OUTPUT "${macos_dir}/objc_exceptions.o"
+            COMMAND "${ALCHEMY_CLANG}" --target=arm64-apple-macos11
+                -march=armv8-a -mcpu=generic -nostdinc -fno-builtin
+                -fno-stack-protector -Werror -O1 -fobjc-exceptions -fexceptions
+                -isystem "${personality_resource_dir}/include"
+                -I "${PROJECT_SOURCE_DIR}/runtime/include" -I "${PROJECT_SOURCE_DIR}/tests/fixtures/macos" -c
+                "${objc_fixture_dir}/objc_exceptions.m" -o "${macos_dir}/objc_exceptions.o"
+            DEPENDS "${objc_fixture_dir}/objc_exceptions.m" "${PROJECT_SOURCE_DIR}/tests/fixtures/macos/alchemy_objc_fixture.h" VERBATIM)
+        add_custom_command(OUTPUT "${macos_dir}/objc_exceptions"
+            COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main -undefined dynamic_lookup -rpath @loader_path "-L${ALCHEMY_LLVM_RUNTIME_DIR}"
+                "${macos_dir}/objc_exceptions.o" "${ALCHEMY_LLVM_RUNTIME_DIR}/libc++abi.dylib" "${ALCHEMY_LLVM_RUNTIME_DIR}/libunwind.dylib"
+                "${macos_dir}/link_system.dylib" "${macos_dir}/link_objc.dylib" -o "${macos_dir}/objc_exceptions"
+            DEPENDS "${macos_dir}/objc_exceptions.o" "${macos_dir}/link_system.dylib" "${macos_dir}/link_objc.dylib" VERBATIM)
+        list(APPEND objc_programs "${macos_dir}/objc_exceptions")
+        add_test(NAME alchemy_gui_objc_exceptions COMMAND alchemy-fx --runtime-dir "${ALCHEMY_LLVM_RUNTIME_DIR}" "${macos_dir}/objc_exceptions")
+        set_tests_properties(alchemy_gui_objc_exceptions PROPERTIES TIMEOUT 120
+            PASS_REGULAR_EXPRESSION "Objective-C exceptions: 1111 3")
+    endif()
     # The hand-encoded dispatcher in objc_runtime.cpp must equal dispatch.S.
     add_custom_command(OUTPUT "${macos_dir}/objc_dispatch.o"
         COMMAND "${ALCHEMY_CLANG}" --target=arm64-apple-macos11 -c "${PROJECT_SOURCE_DIR}/runtime/objc/dispatch.S"

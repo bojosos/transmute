@@ -33,6 +33,13 @@ void hid(Fixture& f) {
     bool refused = false;
     try { static_cast<void>(f.call(iokit, "_IOHIDElementGetUsage", {0x1234})); } catch (const std::exception&) { refused = true; }
     require(refused, "HID elements cannot exist");
+    // The HID event-system client is unavailable: no client, services or events.
+    require(f.call(iokit, "_IOHIDEventSystemClientCreate", {0}) == 0, "no HID event-system client");
+    require(f.call(iokit, "_IOHIDEventSystemClientCopyServices", {0}) == 0 && f.call(iokit, "_IOHIDServiceClientCopyEvent", {0, 15, 0, 0}) == 0,
+            "NULL client and service answer empty");
+    refused = false;
+    try { static_cast<void>(f.call(iokit, "_IOHIDServiceClientCopyProperty", {0x1234, 0})); } catch (const std::exception&) { refused = true; }
+    require(refused, "HID event-system services cannot exist");
     const auto plugin = f.block(8, 0xff);
     require(f.status(iokit, "_IOCreatePlugInInterfaceForService", {0, 0, 0, plugin, f.block(4)}) == static_cast<std::int32_t>(0xe00002c0U) &&
             f.engine.read64(plugin) == 0, "no plug-in interfaces");

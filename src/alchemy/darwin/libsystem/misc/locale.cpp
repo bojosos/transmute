@@ -288,6 +288,10 @@ std::function<bool(std::uint64_t)> install_darwin_locale(ProcessContext& context
             return static_cast<std::uint64_t>(value != 0);
         });
         install(context, localized ? "_mbtowc_l" : "_mbtowc", [state, localized](auto& s, auto& m) { if (localized) state->check_locale(s.x[3]); if (!s.x[1]) return std::uint64_t{0}; if (!s.x[2]) throw LocaleError{eilseq}; const auto value = m.read8(s.x[1]); if (value > 127) throw LocaleError{eilseq}; if (s.x[0]) m.write32(s.x[0], value); return static_cast<std::uint64_t>(value != 0); });
+        // wctomb(s, wc) and mblen(s, n): the stateless forms (the C locale's ASCII encoding has no
+        // shift state, so a NULL s answers 0).
+        install(context, localized ? "_wctomb_l" : "_wctomb", [state, localized](auto& s, auto& m) { if (localized) state->check_locale(s.x[2]); if (!s.x[0]) return std::uint64_t{0}; if (static_cast<std::uint32_t>(s.x[1]) > 127) throw LocaleError{eilseq}; m.write8(s.x[0], static_cast<std::uint8_t>(s.x[1])); return std::uint64_t{1}; });
+        install(context, localized ? "_mblen_l" : "_mblen", [state, localized](auto& s, auto& m) { if (localized) state->check_locale(s.x[2]); if (!s.x[0]) return std::uint64_t{0}; if (!s.x[1]) throw LocaleError{eilseq}; const auto value = m.read8(s.x[0]); if (value > 127) throw LocaleError{eilseq}; return static_cast<std::uint64_t>(value != 0); });
         install(context, localized ? "_wcrtomb_l" : "_wcrtomb", [state, localized](auto& s, auto& m) { if (localized) state->check_locale(s.x[3]); if (!s.x[0]) { if (s.x[2]) m.fill_bytes(s.x[2], 0, 128); return std::uint64_t{1}; } if (s.x[1] > 127) throw LocaleError{eilseq}; m.write8(s.x[0], static_cast<std::uint8_t>(s.x[1])); if (s.x[2]) m.fill_bytes(s.x[2], 0, 128); return std::uint64_t{1}; });
         for (const auto bounded : {false, true}) {
             install(context, std::string(bounded ? "_mbsnrtowcs" : "_mbsrtowcs") + (localized ? "_l" : ""), [state, localized, bounded](auto& s, auto& m) {

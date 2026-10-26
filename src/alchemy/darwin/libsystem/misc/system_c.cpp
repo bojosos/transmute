@@ -8,6 +8,7 @@
 // C interfaces of libSystem, CoreFoundation, Foundation and ServiceManagement
 // that QLab and its frameworks import (QLab group G2):
 //   OSAtomicIncrement32/Decrement32(Barrier), OSAtomicTestAndSet/ClearBarrier,
+//   OSAtomicIncrement64/Decrement64(Barrier), OSAtomicFifoEnqueue/Dequeue,
 //   OSAtomicEnqueue/Dequeue, OSSpinLockLock/Unlock/Try: atomic on guest memory
 //   with respect to each other (one host lock serializes them; the emulated
 //   threads are host threads).
@@ -152,6 +153,34 @@ void install_system_functions(Support& support) {
             m.write32(s.x[0], static_cast<std::uint32_t>(value));
             s.x[0] = static_cast<Address>(static_cast<std::uint32_t>(value));
         });
+    for (const auto& [name, delta] : std::array<std::pair<const char*, std::int64_t>, 4>{{
+             {"_OSAtomicIncrement64", 1}, {"_OSAtomicIncrement64Barrier", 1}, {"_OSAtomicDecrement64", -1}, {"_OSAtomicDecrement64Barrier", -1}}})
+        support.function(libsystem, name, [self, delta = delta](CpuState& s, GuestMemory& m) {
+            std::lock_guard lock(self->atomic_mutex);
+            const auto value = static_cast<std::int64_t>(m.read64(s.x[0])) + delta;
+            m.write64(s.x[0], static_cast<std::uint64_t>(value));
+            s.x[0] = static_cast<Address>(value);
+        });
+    // OSFifoQueueHead { void* opaque1 (head); void* opaque2 (tail); int opaque3; }: a FIFO linked
+    // through `offset`.
+    support.function(libsystem, "_OSAtomicFifoEnqueue", [self](CpuState& s, GuestMemory& m) {
+        std::lock_guard lock(self->atomic_mutex);
+        const auto head = s.x[0], item = s.x[1], offset = s.x[2];
+        m.write64(item + offset, 0);
+        if (const auto tail = m.read64(head + 8)) m.write64(tail + offset, item); else m.write64(head, item);
+        m.write64(head + 8, item);
+    });
+    support.function(libsystem, "_OSAtomicFifoDequeue", [self](CpuState& s, GuestMemory& m) {
+        std::lock_guard lock(self->atomic_mutex);
+        const auto head = s.x[0], offset = s.x[1];
+        const auto item = m.read64(head);
+        if (item) {
+            const auto next = m.read64(item + offset);
+            m.write64(head, next);
+            if (!next) m.write64(head + 8, 0);
+        }
+        s.x[0] = item;
+    });
     for (const auto& [name, set] : std::array<std::pair<const char*, bool>, 4>{{
              {"_OSAtomicTestAndSetBarrier", true}, {"_OSAtomicTestAndSet", true}, {"_OSAtomicTestAndClearBarrier", false}, {"_OSAtomicTestAndClear", false}}})
         support.function(libsystem, name, [self, set = set](CpuState& s, GuestMemory& m) {

@@ -19,8 +19,6 @@
 // token library import beyond the ones in the other export-fill files:
 //   ptrace            PT_DENY_ATTACH succeeds (no Darwin debugger can attach to
 //                     an Alchemy process); every other request is ENOTSUP.
-//   xpc_date_create_from_current / xpc_date_create / xpc_date_get_value:
-//                     XPC date objects (class OS_xpc_date).
 //   __getdirentries64 directory entries of an open directory descriptor in the
 //                     kernel's struct direntry layout.
 //   fsctl             ENOTTY: no file-system control requests exist.
@@ -31,12 +29,6 @@ namespace alchemy::export_fill {
 namespace {
 
 constexpr std::uint64_t kern_success = 0, kern_invalid_address = 1, kern_invalid_argument = 4;
-
-struct XpcDate : ObjectPayload { std::int64_t nanoseconds{}; };
-
-std::int64_t unix_nanoseconds() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-}
 
 std::uint64_t name_inode(const std::string& directory, const std::string& name) {
     std::uint64_t hash = 1469598103934665603ULL;               // FNV-1a over "<dir>/<name>"
@@ -50,7 +42,7 @@ struct DirectoryStream { std::string path; std::vector<std::pair<std::string, st
 
 } // namespace
 
-void install_libsystem_services(Provider& p, ObjcRuntime& objc) {
+void install_libsystem_services(Provider& p, ObjcRuntime&) {
     auto& process = p.process();
 
     // int ptrace(int request, pid_t, caddr_t, int)
@@ -65,40 +57,6 @@ void install_libsystem_services(Provider& p, ObjcRuntime& objc) {
         if (!std::filesystem::exists(process.map_guest_path(guest_string(m, s.x[0], 1024)), error)) throw Errno{enoent};
         throw Errno{enotty};
     });
-
-    // XPC connections and dictionaries: explicit stops. No launchd exists, so
-    // no Mach service can be looked up, and nothing here builds XPC messages
-    // yet. (Squirrel.framework imports them for its ShipIt installer, which
-    // only runs to apply an update.)
-    for (const auto* name : {"_xpc_connection_create_mach_service", "_xpc_connection_set_event_handler",
-                             "_xpc_connection_resume", "_xpc_connection_send_message", "_xpc_connection_send_barrier",
-                             "_xpc_dictionary_create"}) {
-        if (process.resolve(libsystem_library, name)) continue;   // a real or placeholder owner exists
-        p.libsystem(name, [name](CpuState&, GuestMemory&) -> std::uint64_t {
-            throw std::runtime_error(std::string("Alchemy: ") + (name + 1) + " is unsupported (no launchd: XPC services cannot be reached)");
-        });
-        mark_placeholder_export(process, libsystem_library, name);
-    }
-
-    // XPC dates.
-    auto date_class = objc.find_class("OS_xpc_date");
-    if (!date_class) date_class = objc.register_native_class("OS_xpc_date", objc.find_class("NSObject"), 16);
-    const auto make_date = [&process, date_class](std::int64_t value) {
-        auto payload = std::make_shared<XpcDate>();
-        payload->nanoseconds = value;
-        return process.objects().create(16, date_class, ObjectKind::instance, std::move(payload));
-    };
-    p.libsystem("_xpc_date_create_from_current", [make_date](CpuState&, GuestMemory&) -> std::uint64_t {
-        return make_date(unix_nanoseconds());
-    }, 0);
-    p.libsystem("_xpc_date_create", [make_date](CpuState& s, GuestMemory&) -> std::uint64_t {
-        return make_date(static_cast<std::int64_t>(s.x[0]));
-    }, 0);
-    p.libsystem("_xpc_date_get_value", [&process](CpuState& s, GuestMemory&) -> std::uint64_t {
-        const auto record = s.x[0] ? process.objects().find(s.x[0]) : nullptr;
-        const auto value = record ? std::dynamic_pointer_cast<XpcDate>(record->payload) : nullptr;
-        return value ? static_cast<std::uint64_t>(value->nanoseconds) : 0;
-    }, 0);
 
     // ssize_t __getdirentries64(int fd, char* buffer, size_t size, off_t* basep):
     // struct direntry {u64 d_ino; u64 d_seekoff; u16 d_reclen; u16 d_namlen;

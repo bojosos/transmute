@@ -357,13 +357,19 @@ void Leftovers::install() {
         const auto length = call(libsystem, "_confstr", {65536 + s.x[0], s.x[1], s.x[2]});
         return length && length <= s.x[2] ? s.x[1] : 0;
     });
-    fn(libsystem, "_getattrlist", [this](CpuState&, GuestMemory&) { set_errno(enotsup); return minus_one; });
+    // Attribute lists (getattrlist(2) family): no volume here offers them, as a file system
+    // without attribute-list support answers.
+    for (const auto name : {"_getattrlist", "_fgetattrlist", "_getattrlistat", "_setattrlist", "_fsetattrlist", "_setattrlistat"})
+        fn(libsystem, name, [this](CpuState&, GuestMemory&) { set_errno(enotsup); return minus_one; });
     fn(libsystem, "_posix_spawn_file_actions_addchdir", [this](CpuState& s, GuestMemory&) {
         return call(libsystem, "_posix_spawn_file_actions_addchdir_np", {s.x[0], s.x[1]});
     });
 
     // ---- ACLs: no file carries one ----
-    fn(libsystem, "_acl_get_link_np", [this](CpuState&, GuestMemory&) -> Address { set_errno(enoent); return 0; });
+    for (const auto name : {"_acl_get_link_np", "_acl_get_file", "_acl_get_fd", "_acl_get_fd_np"})
+        fn(libsystem, name, [this](CpuState&, GuestMemory&) -> Address { set_errno(enoent); return 0; });
+    // acl_valid(acl): no acl_t is ever handed out, so none is valid.
+    fn(libsystem, "_acl_valid", [this](CpuState&, GuestMemory&) { set_errno(einval); return minus_one; });
     fn(libsystem, "_acl_free", [this](CpuState& s, GuestMemory&) -> Address {
         if (!s.x[0]) { set_errno(einval); return minus_one; }
         free(s.x[0]);   // text from acl_to_text is malloc'd; no acl_t is ever handed out
