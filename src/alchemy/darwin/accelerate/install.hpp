@@ -14,7 +14,9 @@ void install_accelerate_bnns(gui::InstallContext& context);
 
 namespace alchemy::gui::fill {
 
-// vDSP kernels, BLAS/LAPACK and vImage conversions (vdsp.cpp; fill-only).
+// vDSP kernels, BLAS/LAPACK and vImage conversions (vdsp.cpp; fill-only). It also installs:
 void install_accelerate(InstallContext& context);
+void install_vdsp_vectors(InstallContext& context);   // vdsp_vectors.cpp: the wider vDSP API, float and double
+void install_vforce(InstallContext& context);         // vforce.cpp: vForce
 
 } // namespace alchemy::gui::fill

@@ -222,7 +222,145 @@ void sample_out(const Pcm& f, std::uint8_t* p, double value) {
     write_raw(p, f.container, f.big_endian, raw);
 }
 
+void be_put(std::vector<std::uint8_t>& out, std::uint64_t value, int bytes) {
+    for (int i = bytes - 1; i >= 0; --i) out.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+}
+void le_put(std::vector<std::uint8_t>& out, std::uint64_t value, int bytes) {
+    for (int i = 0; i < bytes; ++i) out.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+}
+void tag(std::vector<std::uint8_t>& out, std::uint32_t id) { be_put(out, id, 4); }
+
+// IEEE 754 80-bit extended of a positive rate.
+void put_extended(std::vector<std::uint8_t>& out, double value) {
+    int exponent = 0;
+    const double fraction = std::frexp(value, &exponent);   // value = fraction * 2^exponent, fraction in [0.5, 1)
+    const auto mantissa = static_cast<std::uint64_t>(std::ldexp(fraction, 64));
+    be_put(out, static_cast<std::uint64_t>(exponent - 1 + 16383), 2);
+    be_put(out, mantissa, 8);
+}
+
+// Integer samples narrower than their container: WAVE and AIFF store them left-justified (aligned high).
+bool justified(const Pcm& f) { return f.is_float || f.bits == f.container * 8 || f.aligned_high; }
+
+std::int32_t wave_header(const Pcm& f, std::uint64_t data_bytes, std::vector<std::uint8_t>& out, std::string& why) {
+    const bool sample_ok = f.is_float ? (f.bits == 32 || f.bits == 64) : (f.container >= 1 && f.container <= 4 && (f.container == 1) != f.is_signed);
+    if (f.big_endian || f.non_interleaved || !sample_ok || !justified(f)) {
+        why = "WAVE holds little-endian interleaved samples: unsigned 8-bit, signed 16-32-bit or float";
+        return error::unsupported_data_format;
+    }
+    const bool extensible = f.channels > 2 || f.bits != f.container * 8;
+    const std::uint32_t fmt_bytes = extensible ? 40 : 16;
+    if (data_bytes > 0xffffffffULL - 64) { why = "WAVE data over 4 GB"; return error::unsupported_data_format; }
+    const std::uint16_t format_tag = f.is_float ? 3 : 1;
+    tag(out, four("RIFF"));
+    le_put(out, 4 + (8 + fmt_bytes) + (8 + data_bytes) + (data_bytes & 1), 4);
+    tag(out, four("WAVE"));
+    tag(out, four("fmt "));
+    le_put(out, fmt_bytes, 4);
+    le_put(out, extensible ? 0xfffe : format_tag, 2);
+    le_put(out, f.channels, 2);
+    le_put(out, static_cast<std::uint32_t>(std::llround(f.rate)), 4);
+    le_put(out, static_cast<std::uint64_t>(std::llround(f.rate)) * f.frame_bytes(), 4);
+    le_put(out, f.frame_bytes(), 2);
+    le_put(out, f.container * 8, 2);
+    if (extensible) {
+        le_put(out, 22, 2);         // cbSize
+        le_put(out, f.bits, 2);     // wValidBitsPerSample
+        le_put(out, f.channels == 1 ? 0x4 : f.channels == 2 ? 0x3 : 0, 4);   // dwChannelMask (unassigned beyond stereo)
+        // The subformat GUID: the format tag in KSDATAFORMAT_SUBTYPE_PCM's template.
+        constexpr std::array<std::uint8_t, 14> rest{0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71};
+        le_put(out, format_tag, 2);
+        out.insert(out.end(), rest.begin(), rest.end());
+    }
+    tag(out, four("data"));
+    le_put(out, data_bytes, 4);
+    return 0;
+}
+
+std::int32_t aiff_header(std::uint32_t type, const Pcm& f, std::uint64_t data_bytes, std::vector<std::uint8_t>& out, std::string& why) {
+    std::uint32_t compression = four("NONE");
+    if (f.non_interleaved || !justified(f)) { why = "AIFF holds interleaved samples"; return error::unsupported_data_format; }
+    if (f.is_float) compression = f.big_endian ? (f.bits == 32 ? four("fl32") : four("fl64")) : 0;
+    else if (!f.is_signed) compression = 0;
+    else if (!f.big_endian) compression = f.bits == 16 && f.container == 2 ? four("sowt") : 0;
+    if (!compression || (type == four("AIFF") && compression != four("NONE"))) {
+        why = type == four("AIFF") ? "AIFF holds big-endian signed integers (AIFC also float and 16-bit little-endian)"
+                                   : "AIFC holds big-endian signed integers or floats, or 16-bit little-endian";
+        return error::unsupported_data_format;
+    }
+    const bool aifc = type == four("AIFC");
+    const std::uint32_t comm_bytes = aifc ? 18 + 4 + 2 : 18;   // AIFC: the compression type and an empty name
+    const std::uint64_t frames = f.frame_bytes() ? data_bytes / f.frame_bytes() : 0;
+    const std::uint64_t form = 4 + (aifc ? 12 : 0) + (8 + comm_bytes) + (8 + 8 + data_bytes) + (data_bytes & 1);
+    if (form > 0xffffffffULL || frames > 0xffffffffULL) { why = "AIFF data over 4 GB"; return error::unsupported_data_format; }
+    tag(out, four("FORM"));
+    be_put(out, form, 4);
+    tag(out, type);
+    if (aifc) {
+        tag(out, four("FVER"));
+        be_put(out, 4, 4);
+        be_put(out, 0xA2805140, 4);   // AIFC version 1
+    }
+    tag(out, four("COMM"));
+    be_put(out, comm_bytes, 4);
+    be_put(out, f.channels, 2);
+    be_put(out, frames, 4);
+    be_put(out, f.bits, 2);
+    put_extended(out, f.rate);
+    if (aifc) {
+        tag(out, compression);
+        be_put(out, 0, 2);            // an empty Pascal string, padded to even
+    }
+    tag(out, four("SSND"));
+    be_put(out, 8 + data_bytes, 4);
+    be_put(out, 0, 4);                // offset
+    be_put(out, 0, 4);                // block size
+    return 0;
+}
+
+std::int32_t caf_header(const Pcm& f, std::uint64_t data_bytes, std::span<const std::uint8_t> layout, std::vector<std::uint8_t>& out, std::string& why) {
+    if (f.non_interleaved || (!f.is_float && (!f.is_signed || f.aligned_high))) {
+        why = "CAF holds interleaved signed integer or float samples";
+        return error::unsupported_data_format;
+    }
+    tag(out, four("caff"));
+    be_put(out, 1, 2);
+    be_put(out, 0, 2);
+    tag(out, four("desc"));
+    be_put(out, 32, 8);
+    be_put(out, std::bit_cast<std::uint64_t>(f.rate), 8);
+    tag(out, four("lpcm"));
+    be_put(out, (f.is_float ? 1U : 0U) | (f.big_endian ? 0U : 2U), 4);   // kCAFLinearPCMFormatFlagIsFloat / IsLittleEndian
+    be_put(out, f.frame_bytes(), 4);
+    be_put(out, 1, 4);
+    be_put(out, f.channels, 4);
+    be_put(out, f.bits, 4);
+    if (layout.size() >= 12 && layout.size() % 4 == 0) {
+        // The channel layout, every 32-bit field (tags, labels, flags, coordinates) big-endian.
+        tag(out, four("chan"));
+        be_put(out, layout.size(), 8);
+        for (std::size_t i = 0; i < layout.size(); i += 4) be_put(out, le32(layout.data() + i), 4);
+    }
+    tag(out, four("data"));
+    be_put(out, 4 + data_bytes, 8);
+    be_put(out, 0, 4);                // mEditCount
+    return 0;
+}
+
 } // namespace
+
+std::int32_t write_header(std::uint32_t type, const Pcm& format, std::uint64_t data_bytes, std::span<const std::uint8_t> layout,
+                          std::vector<std::uint8_t>& out, std::string& why) {
+    out.clear();
+    switch (type) {
+    case four("WAVE"): return wave_header(format, data_bytes, out, why);
+    case four("AIFF"): case four("AIFC"): return aiff_header(type, format, data_bytes, out, why);
+    case four("caff"): return caf_header(format, data_bytes, layout, out, why);
+    default:
+        why = "Alchemy writes WAVE, AIFF, AIFC and CAF files";
+        return error::unsupported_file_type;
+    }
+}
 
 std::uint32_t Pcm::flags() const {
     std::uint32_t value = 0;

@@ -5,6 +5,7 @@
 // AudioFile/ExtAudioFile, AU listeners) and the AVFoundation classes.
 #include "alchemy/gui/tests/fill_fixture.hpp"
 #include "alchemy/darwin/media/media_support.hpp"
+#include "alchemy/darwin/media/audio_file_core.hpp"
 #include "alchemy/darwin/media/midi_core.hpp"
 #include "alchemy/darwin/media/hal_core.hpp"
 
@@ -15,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -438,6 +440,54 @@ void core_midi(Fixture& f) {
         require(FakeMidi::sent().size() == 2 && FakeMidi::sent()[1].size() == 4, "SysEx reached the backend");
     }
     require(f.status(midi_lib, "_MIDIFlushOutput", {0}) == 0, "flush all");
+
+    // MIDI 2.0 event lists: sent as MIDI 1.0 to the hardware, delivered in each receiver's protocol.
+    const auto events = f.block(512), words = f.block(16);
+    const auto add = [&](Address list, Address current, std::initializer_list<std::uint32_t> values) {
+        std::uint32_t i = 0;
+        for (const auto value : values) f.engine.write32(words + 4ULL * i++, value);
+        return f.call(midi_lib, "_MIDIEventListAdd", {list, 512, current, 0, values.size(), words});
+    };
+    auto current = f.call(midi_lib, "_MIDIEventListInit", {events, 2});   // kMIDIProtocol_2_0
+    require(current == events + 8 && add(events, current, {0x40903c00, 0xffff0000}) == current, "MIDIEventListInit / Add");
+    require(f.status(midi_lib, "_MIDISendEventList", {f.engine.read32(port_out), destination, events}) == 0, "MIDISendEventList");
+    {
+        std::lock_guard lock(FakeMidi::mutex());
+        require(FakeMidi::sent().size() == 3 && FakeMidi::sent()[2] == std::vector<std::uint8_t>({0x90, 60, 127}), "a MIDI 2.0 note on as MIDI 1.0");
+    }
+    static std::atomic<int> received{0};
+    static std::atomic<std::uint32_t> protocol{0}, first{0}, second{0};
+    const auto b = alchemy::gui::security::bridge();
+    const auto receive = b->make_block([](transmute::CpuState& s, transmute::GuestMemory& m) {
+        protocol = m.read32(s.x[1]);
+        if (m.read32(s.x[1] + 4) && m.read32(s.x[1] + 16) >= 2) {
+            first = m.read32(s.x[1] + 20);
+            second = m.read32(s.x[1] + 24);
+        }
+        ++received;
+    });
+    const auto virtual_out = f.block(4);
+    require(f.status(midi_lib, "_MIDIDestinationCreateWithProtocol", {client, name, 2, virtual_out, receive}) == 0, "MIDIDestinationCreateWithProtocol");
+    f.memory().write8(bytes, 0x91); f.memory().write8(bytes + 1, 64); f.memory().write8(bytes + 2, 100);
+    const auto again = f.call(midi_lib, "_MIDIPacketListInit", {list});
+    require(f.call(midi_lib, "_MIDIPacketListAdd", {list, 256, again, 0, 3, bytes}) != 0, "a MIDI 1.0 note on");
+    require(f.status(midi_lib, "_MIDISend", {f.engine.read32(port_out), f.engine.read32(virtual_out), list}) == 0, "MIDISend to the virtual destination");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (received == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(received == 1 && protocol == 2 && first == 0x40914000 && second == 0xc9240000U, "delivered as a MIDI 2.0 event list");
+    // An input port with the 1.0 protocol hears a virtual source's event list.
+    const auto source_again = f.block(4), input_out = f.block(4);
+    require(f.status(midi_lib, "_MIDISourceCreateWithProtocol", {client, name, 1, source_again}) == 0, "MIDISourceCreateWithProtocol");
+    require(f.status(midi_lib, "_MIDIInputPortCreateWithProtocol", {client, name, 1, input_out, receive}) == 0 &&
+            f.status(midi_lib, "_MIDIPortConnectSource", {f.engine.read32(input_out), f.engine.read32(source_again), 0}) == 0, "an input port");
+    current = f.call(midi_lib, "_MIDIEventListInit", {events, 1});
+    require(add(events, current, {0x20b30740}) != 0 && f.status(midi_lib, "_MIDIReceivedEventList", {f.engine.read32(source_again), events}) == 0,
+            "MIDIReceivedEventList");
+    while (received == 1 && std::chrono::steady_clock::now() < deadline + std::chrono::seconds(3)) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(received == 2 && protocol == 1, "delivered as a MIDI 1.0 event list");
+    require(f.status(midi_lib, "_MIDIPortDispose", {f.engine.read32(input_out)}) == 0 &&
+            f.status(midi_lib, "_MIDIEndpointDispose", {f.engine.read32(source_again)}) == 0 &&
+            f.status(midi_lib, "_MIDIEndpointDispose", {f.engine.read32(virtual_out)}) == 0, "event-list endpoints disposed");
     require(f.status(midi_lib, "_MIDIEndpointDispose", {f.engine.read32(source_out)}) == 0 && f.call(midi_lib, "_MIDIGetNumberOfSources") == 1, "dispose");
     require(f.status(midi_lib, "_MIDIPortDispose", {f.engine.read32(port_out)}) == 0 && f.status(midi_lib, "_MIDIClientDispose", {client}) == 0, "dispose port and client");
 }
@@ -860,7 +910,28 @@ void avaudio(Fixture& f) {
     require((f.send(file, "readIntoBuffer:error:", {file_buffer, error}) & 0xff) == 1 && f.send(file_buffer, "frameLength") == 0, "end of file");
     f.engine.write64(error, 0);
     require(f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForWriting:settings:error:", {url, 0, error}) == 0 && f.engine.read64(error) != 0,
-            "writing is not provided");
+            "writing needs settings");
+    // Writing a CAF: 16-bit stereo at 48 kHz from the float buffer above, read back.
+    {
+        std::vector<std::pair<Address, Address>> entries{
+            {f.cf.string("AVSampleRateKey"), f.cf.integer(48000, 3)}, {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(2, 3)},
+            {f.cf.string("AVLinearPCMBitDepthKey"), f.cf.integer(16, 3)}, {f.cf.string("AVLinearPCMIsFloatKey"), f.cf.boolean(false)}};
+        const auto out_url = f.cf.file_url(alchemy::guest_path_string(directory / "written.caf"), false);
+        const auto writer = f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForWriting:settings:error:", {out_url, f.cf.dictionary(entries), error});
+        require(writer != 0 && f.send(f.send(writer, "fileFormat"), "channelCount") == 2, "AVAudioFile for writing");
+        require((f.send(writer, "writeFromBuffer:error:", {buffer, error}) & 0xff) == 1 && f.send(writer, "length") == 4800, "writeFromBuffer:");
+        f.send(writer, "close");
+        const auto reader = f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForReading:error:", {out_url, error});
+        require(reader && f.send(reader, "length") == 4800, "the written file reads back");
+        const auto back = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {f.send(reader, "processingFormat"), 4800});
+        require((f.send(reader, "readIntoBuffer:error:", {back, error}) & 0xff) == 1 && f.send(back, "frameLength") == 4800, "read 4800 frames");
+        const auto planes = f.send(back, "floatChannelData");
+        require(std::bit_cast<float>(f.engine.read32(f.engine.read64(planes) + 400)) == 0.5f &&
+                std::bit_cast<float>(f.engine.read32(f.engine.read64(planes + 8) + 400)) == -0.25f, "the written samples");
+        f.send(back, "release");
+        f.send(reader, "release");
+        f.send(writer, "release");
+    }
 
     // AVAudioPlayer: a 1 s 44.1 kHz tone plays resampled to 48 kHz; currentTime advances; -stop.
     const auto tone_path = write_wave(directory / "tone.wav", 44100, 1, 44100, [](std::uint32_t, std::uint16_t) { return static_cast<std::int16_t>(8192); });
@@ -1018,7 +1089,10 @@ void audio_files(Fixture& f) {
             f.engine.read32(value + 8) == 0x6c70636d, "data format");   // 'dfmt'
     f.engine.write32(size, 4);
     require(f.status(at, "_AudioFileGetProperty", {file, 0x64666d74, size, value}) == static_cast<std::int32_t>(0x2173697a), "'!siz'");
-    require(f.status(at, "_AudioFileOpenURL", {url, 3, 0, out}) == static_cast<std::int32_t>(0x6F703F3F), "writing is not provided");
+    // A canonical WAVE header is the one Alchemy writes: the file opens for writing too.
+    const auto writable_out = f.block(8);
+    require(f.status(at, "_AudioFileOpenURL", {url, 3, 0, writable_out}) == 0 && f.status(at, "_AudioFileClose", {f.engine.read64(writable_out)}) == 0,
+            "a canonical WAVE opens for writing");
     require(f.status(at, "_ExtAudioFileWrapAudioFileID", {file, 0, out}) == 0, "ExtAudioFileWrapAudioFileID");
     const auto ext = f.engine.read64(out);
     f.engine.write32(size, 8);
@@ -1054,6 +1128,150 @@ void audio_files(Fixture& f) {
     require(f.status(at, "_ExtAudioFileRead", {ext, frames, list}) == 0 && f.engine.read32(frames) == 0, "end of file: 0 frames");
     require(f.status(at, "_ExtAudioFileDispose", {ext}) == 0 && f.status(at, "_AudioFileClose", {file}) == 0, "dispose and close");
     require(f.status(at, "_ExtAudioFileOpenURL", {f.cf.file_url(alchemy::guest_path_string(directory / "missing.wav"), false), out}) == -43, "missing file");
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
+// A linear PCM AudioStreamBasicDescription at `at`.
+void write_asbd(Fixture& f, Address at, double rate, std::uint32_t flags, std::uint32_t bytes_per_frame, std::uint32_t channels, std::uint32_t bits) {
+    f.engine.write64(at, std::bit_cast<std::uint64_t>(rate));
+    f.engine.write32(at + 8, 0x6c70636d);   // 'lpcm'
+    f.engine.write32(at + 12, flags);
+    f.engine.write32(at + 16, bytes_per_frame);
+    f.engine.write32(at + 20, 1);
+    f.engine.write32(at + 24, bytes_per_frame);
+    f.engine.write32(at + 28, channels);
+    f.engine.write32(at + 32, bits);
+    f.engine.write32(at + 36, 0);
+}
+
+// Writing: AudioFileCreateWithURL + WritePackets (WAVE, AIFF), ExtAudioFileCreateWithURL + Write with
+// a client format (CAF), the callback forms over memory, and the formats a container cannot hold.
+void audio_file_writing(Fixture& f) {
+    namespace af = alchemy::gui::completion_kit::media::audio_file;
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_media_writing";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto url_of = [&](const char* name) { return f.cf.file_url(alchemy::guest_path_string(directory / name), false); };
+    const auto asbd = f.block(40), out = f.block(8), count = f.block(4), size = f.block(4), value = f.block(64);
+    // WAVE, 16-bit stereo: 100 frames of (i, -i).
+    write_asbd(f, asbd, 44100, 4 | 8, 4, 2, 16);   // signed integer, packed
+    require(f.status(at, "_AudioFileCreateWithURL", {url_of("out.wav"), 0x57415645, asbd, 1, out}) == 0, "AudioFileCreateWithURL WAVE");
+    auto file = f.engine.read64(out);
+    const auto frames = f.block(400);
+    for (std::uint32_t i = 0; i < 100; ++i) {
+        f.engine.write32(frames + 4ULL * i, (static_cast<std::uint32_t>(static_cast<std::uint16_t>(-static_cast<std::int16_t>(i * 100))) << 16) | (i * 100));
+    }
+    f.engine.write32(count, 100);
+    require(f.status(at, "_AudioFileWritePackets", {file, 0, 400, 0, 0, count, frames}) == 0 && f.engine.read32(count) == 100, "AudioFileWritePackets");
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x70636e74, size, value}) == 0 && f.engine.read64(value) == 100, "packet count while writing");
+    require(f.status(at, "_AudioFileClose", {file}) == 0, "AudioFileClose");
+    {
+        std::ifstream in(directory / "out.wav", std::ios::binary);
+        const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        require(bytes.size() == 44 + 400 && std::memcmp(bytes.data(), "RIFF", 4) == 0 && bytes[4] == 36 + 400 - 256 && bytes[5] == 1 &&
+                bytes[40] == 0x90 && bytes[41] == 1 && bytes[48] == 100 && bytes[50] == 0x9c && bytes[51] == 0xff, "the WAVE bytes on disk");
+    }
+    require(f.status(at, "_AudioFileOpenURL", {url_of("out.wav"), 1, 0, out}) == 0, "the WAVE reads back");
+    file = f.engine.read64(out);
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x70636e74, size, value}) == 0 && f.engine.read64(value) == 100, "100 packets");
+    require(f.status(at, "_AudioFileClose", {file}) == 0, "closed");
+    require(f.status(at, "_AudioFileCreateWithURL", {url_of("out.wav"), 0x57415645, asbd, 0, out}) == static_cast<std::int32_t>(0x70726d3f),
+            "an existing file is not replaced without kAudioFileFlags_EraseFile");
+    // AIFF holds big-endian integers only; AIFC also floats; MP3 is no container Alchemy writes.
+    require(f.status(at, "_AudioFileCreateWithURL", {url_of("le.aif"), 0x41494646, asbd, 1, out}) == static_cast<std::int32_t>(0x666d743f),
+            "AIFF refuses little-endian samples");
+    require(f.status(at, "_AudioFileCreateWithURL", {url_of("x.mp3"), 0x4d504733, asbd, 1, out}) == static_cast<std::int32_t>(0x7479703f),
+            "no MP3 writer");
+    write_asbd(f, asbd, 48000, 1 | 2 | 8, 4, 1, 32);   // float, big-endian, packed
+    require(f.status(at, "_AudioFileCreateWithURL", {url_of("f.aifc"), 0x41494643, asbd, 1, out}) == 0, "AIFC float32");
+    file = f.engine.read64(out);
+    f.engine.write32(count, 4);
+    require(f.status(at, "_AudioFileWriteBytes", {file, 0, 0, count, frames}) == 0 && f.status(at, "_AudioFileClose", {file}) == 0, "AudioFileWriteBytes");
+    require(f.status(at, "_AudioFileOpenURL", {url_of("f.aifc"), 1, 0, out}) == 0, "the AIFC reads back");
+    file = f.engine.read64(out);
+    f.engine.write32(size, 40);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x64666d74, size, value}) == 0 && (f.engine.read32(value + 12) & 1) &&
+                std::bit_cast<double>(f.engine.read64(value)) == 48000.0, "AIFC data format");
+    require(f.status(at, "_AudioFileClose", {file}) == 0, "closed AIFC");
+
+    // ExtAudioFile: a CAF of 16-bit mono written from float32 client frames, read back as float32.
+    write_asbd(f, asbd, 22050, 4 | 8, 2, 1, 16);
+    require(f.status(at, "_ExtAudioFileCreateWithURL", {url_of("out.caf"), 0x63616666, asbd, 0, 1, out}) == 0, "ExtAudioFileCreateWithURL CAF");
+    auto ext = f.engine.read64(out);
+    const auto client = f.block(40);
+    write_asbd(f, client, 22050, 1 | 8, 4, 1, 32);   // float, packed
+    require(f.status(at, "_ExtAudioFileSetProperty", {ext, 0x63666d74, 40, client}) == 0, "client format");
+    const auto samples = f.block(64 * 4), list = f.block(24);
+    for (int i = 0; i < 64; ++i) f.engine.write32(samples + 4ULL * i, std::bit_cast<std::uint32_t>(i % 2 ? 0.5f : -0.25f));
+    f.engine.write32(list, 1);
+    f.engine.write32(list + 8, 1);
+    f.engine.write32(list + 12, 64 * 4);
+    f.engine.write64(list + 16, samples);
+    require(f.status(at, "_ExtAudioFileWrite", {ext, 64, list}) == 0 && f.status(at, "_ExtAudioFileWriteAsync", {ext, 0, 0}) == 0, "ExtAudioFileWrite");
+    require(f.status(at, "_ExtAudioFileDispose", {ext}) == 0, "ExtAudioFileDispose");
+    require(f.status(at, "_ExtAudioFileOpenURL", {url_of("out.caf"), out}) == 0, "the CAF reads back");
+    ext = f.engine.read64(out);
+    require(f.status(at, "_ExtAudioFileSetProperty", {ext, 0x63666d74, 40, client}) == 0, "client format for reading");
+    f.engine.fill_bytes(samples, 0, 64 * 4);
+    f.engine.write32(list + 12, 64 * 4);
+    f.engine.write32(count, 64);
+    require(f.status(at, "_ExtAudioFileRead", {ext, count, list}) == 0 && f.engine.read32(count) == 64, "64 frames");
+    require(std::bit_cast<float>(f.engine.read32(samples)) == -0.25f && std::bit_cast<float>(f.engine.read32(samples + 4)) == 0.5f,
+            "the samples, through 16 bits");
+    require(f.status(at, "_ExtAudioFileDispose", {ext}) == 0, "disposed");
+
+    // The callback forms over memory: InitializeWithCallbacks writes, OpenWithCallbacks reads.
+    static std::vector<std::uint8_t> memory;
+    memory.clear();
+    const auto read_proc = f.process.install_function("_alchemy_test_af_read", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto position = static_cast<std::size_t>(s.x[1]), wanted = static_cast<std::size_t>(s.x[2]);
+        const auto n = position >= memory.size() ? 0 : std::min(wanted, memory.size() - position);
+        if (n) m.write_bytes(s.x[3], std::span<const std::uint8_t>(memory.data() + position, n));
+        m.write32(s.x[4], static_cast<std::uint32_t>(n));
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto write_proc = f.process.install_function("_alchemy_test_af_write", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto position = static_cast<std::size_t>(s.x[1]), n = static_cast<std::size_t>(s.x[2]);
+        if (memory.size() < position + n) memory.resize(position + n);
+        m.read_bytes(s.x[3], std::span<std::uint8_t>(memory.data() + position, n));
+        m.write32(s.x[4], static_cast<std::uint32_t>(n));
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto size_proc = f.process.install_function("_alchemy_test_af_size", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        s.x[0] = memory.size();
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto set_size_proc = f.process.install_function("_alchemy_test_af_set_size", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        memory.resize(static_cast<std::size_t>(s.x[1]));
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    write_asbd(f, asbd, 8000, 4 | 8, 2, 1, 16);
+    alchemy::CallRegs initialize{};
+    initialize.x = {0x1234, read_proc, write_proc, size_proc, set_size_proc, 0x57415645, asbd, 0};
+    initialize.push_stack(out);
+    require(static_cast<std::int32_t>(f.regs(at, "_AudioFileInitializeWithCallbacks", initialize).x0) == 0, "AudioFileInitializeWithCallbacks");
+    file = f.engine.read64(out);
+    f.engine.write32(count, 50);
+    require(f.status(at, "_AudioFileWritePackets", {file, 0, 100, 0, 0, count, frames}) == 0 && f.status(at, "_AudioFileClose", {file}) == 0,
+            "written through the callbacks");
+    af::Container container;
+    std::string why;
+    const auto parsed = af::parse([](std::uint64_t offset, std::span<std::uint8_t> to) -> std::size_t {
+        if (offset >= memory.size()) return 0;
+        const auto n = std::min<std::size_t>(to.size(), memory.size() - static_cast<std::size_t>(offset));
+        std::memcpy(to.data(), memory.data() + offset, n);
+        return n;
+    }, memory.size(), container, why);
+    require(parsed == 0 && container.data_bytes == 100 && container.format.rate == 8000 && memory.size() == 44 + 100, "the memory holds a WAVE: " + why);
+    require(f.status(at, "_AudioFileOpenWithCallbacks", {0x1234, read_proc, 0, size_proc, 0, 0, out}) == 0, "AudioFileOpenWithCallbacks");
+    file = f.engine.read64(out);
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x70636e74, size, value}) == 0 && f.engine.read64(value) == 50, "50 packets through the callbacks");
+    f.engine.write32(count, 40);
+    require(f.status(at, "_AudioFileWriteBytes", {file, 0, 0, count, frames}) == static_cast<std::int32_t>(0x70726d3f), "opened read-only");
+    require(f.status(at, "_AudioFileClose", {file}) == 0, "closed");
     std::error_code ignored;
     std::filesystem::remove_all(directory, ignored);
 }
@@ -1286,6 +1504,7 @@ int main() {
         {"openal", openal},
         {"music_sequence", music_sequence},
         {"audio_files", audio_files},
+        {"audio_file_writing", audio_file_writing},
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},
         {"avaudio", avaudio},

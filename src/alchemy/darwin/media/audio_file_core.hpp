@@ -1,7 +1,8 @@
 #pragma once
 
 // AudioFile / ExtAudioFile core (host-only, QLab gap group G5): the linear
-// PCM audio files Alchemy reads, and conversion between linear PCM formats.
+// PCM audio files Alchemy reads and writes, and conversion between linear PCM
+// formats.
 //
 // Containers: WAVE (PCM, IEEE float and WAVE_FORMAT_EXTENSIBLE with either
 // subformat; RF64 is not read), AIFF and AIFC ('NONE', 'sowt', 'twos',
@@ -71,6 +72,13 @@ using ReadAt = std::function<std::size_t(std::uint64_t offset, std::span<std::ui
 // Parses a file's header; an OSStatus (error::unsupported_file_type for an
 // unknown container, error::unsupported_data_format for compressed data).
 std::int32_t parse(const ReadAt& read, std::uint64_t file_size, Container& out, std::string& why);
+
+// The header of a file of `type` ('WAVE', 'AIFF', 'AIFC', 'caff') holding `data_bytes` bytes of
+// `format`; the data follows it. CAF files also get `layout` (an AudioChannelLayout, host byte
+// order) when given. An OSStatus: error::unsupported_file_type for other containers,
+// error::unsupported_data_format for samples the container cannot hold. parse() reads the result.
+std::int32_t write_header(std::uint32_t type, const Pcm& format, std::uint64_t data_bytes, std::span<const std::uint8_t> layout,
+                          std::vector<std::uint8_t>& out, std::string& why);
 
 // Interleaved samples in [-1, 1] from `frames` frames of `bytes` (one buffer per
 // channel when non-interleaved: `buffers` holds them in order).

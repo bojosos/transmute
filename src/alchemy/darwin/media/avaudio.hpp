@@ -43,11 +43,13 @@ struct PcmBuffer final : ObjectPayload {
     [[nodiscard]] std::uint64_t plane_bytes() const { return static_cast<std::uint64_t>(capacity) * pcm.frame_bytes(); }
 };
 
-// AVAudioFile's host state (reading only).
+// AVAudioFile's host state: a file open for reading (`audio`), or one being written (`writer`).
 struct AudioFileState final : ObjectPayload {
     Address url{};                     // retained NSURL
     GuestAudio audio;
     bool open{};
+    Address writer{};                  // ExtAudioFileRef of a file opened for writing
+    std::uint64_t written{};           // frames written
     Address file_format{}, processing_format{};   // retained AVAudioFormats
     audio_file::Pcm processing;
     std::uint64_t position{};

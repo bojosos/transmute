@@ -21,6 +21,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
 list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/cmtime.cpp
     src/alchemy/darwin/media/midi_core.cpp
+    src/alchemy/darwin/media/midi_ump.cpp
     src/alchemy/darwin/media/midi_host.cpp
     src/alchemy/darwin/media/coremidi.cpp
     src/alchemy/darwin/media/hal_core.cpp

@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -20,8 +22,11 @@
 // - AVAudioFile for reading the files AudioFile reads (linear PCM WAVE, AIFF/AIFC, CAF:
 //   audio_file_core.hpp), converted to its processing format (by default float32
 //   deinterleaved at the file's rate and channels) as it is read into buffers.
-// - Unavailable, as documented: writing files (-initForWriting:...) answers nil with an error
-//   (no audio file writer under Alchemy), as do compressed files (no decoder).
+// - AVAudioFile for writing (WAVE, AIFF/AIFC or CAF by the URL's extension; linear PCM settings)
+//   through ExtAudioFile (audio_file.cpp): buffers of the processing format are converted to the
+//   file's format as they are written.
+// - Unavailable, as documented: compressed files and settings (no decoder or encoder) answer nil
+//   with an error.
 namespace alchemy::gui::completion_kit::media::avaudio {
 
 namespace af = audio_file;
@@ -80,10 +85,29 @@ void free_buffer(Support& support, PcmBuffer& b) {
 
 std::shared_ptr<TimeState> time_state(Support& support, Address time) { return time ? support.objc.find_host_state<TimeState>(time) : nullptr; }
 
+constexpr std::string_view audio_toolbox = "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox";
+
 void close_file(Support& support, AudioFileState& f) {
+    if (f.writer) static_cast<void>(support.call(audio_toolbox, "_ExtAudioFileDispose", {std::exchange(f.writer, 0)}));
     if (!f.open) return;
     close_guest_audio(support, f.audio);
     f.open = false;
+}
+
+// The PCM format a common format names (interleaved or not), at `rate` and `channels`.
+af::Pcm common_pcm(std::uint64_t common, double rate, std::uint32_t channels, bool interleaved) {
+    af::Pcm pcm;
+    pcm.rate = rate;
+    pcm.channels = channels;
+    pcm.non_interleaved = !interleaved;
+    pcm.is_signed = true;
+    switch (common) {
+    case 1: pcm.is_float = true; pcm.bits = 32; pcm.container = 4; break;
+    case 2: pcm.is_float = true; pcm.bits = 64; pcm.container = 8; break;
+    case 3: pcm.bits = 16; pcm.container = 2; break;
+    default: pcm.bits = 32; pcm.container = 4; break;
+    }
+    return pcm;
 }
 
 } // namespace
@@ -442,19 +466,78 @@ void install_avaudio_buffers(Support& support) {
     support.method(file, "initForReading:commonFormat:interleaved:error:", [open_file](CpuState& s, GuestMemory&) {
         open_file(s, s.x[2], s.x[3], (s.x[4] & 0xff) != 0, s.x[5]);
     }, "@@:@QB^@");
-    // Writing: no audio file writer exists.
-    for (const auto& [selector, error_at] : std::initializer_list<std::pair<const char*, unsigned>>{
-             {"initForWriting:settings:error:", 4}, {"initForWriting:settings:commonFormat:interleaved:error:", 6}}) {
-        const auto out = error_at;
-        support.method(file, selector, [sp, out](CpuState& s, GuestMemory&) {
-            store_status(s.x[out], af::error::operation_not_supported, "AVAudioFile writing is not provided under Alchemy");
-            release(*sp, s.x[0]);
+    // Writing: the file's format from the settings, its type from the URL's extension.
+    const auto open_for_writing = [sp](CpuState& s, Address url, Address settings, std::uint64_t common, bool interleaved, Address error_out) {
+        const auto self = s.x[0];
+        const auto fail_with = [&](std::int32_t status, std::string_view text) {
+            store_status(error_out, status, text);
+            release(*sp, self);
             s.x[0] = 0;
-        }, "@@:@@^@");
-    }
+        };
+        const auto b = bridge();
+        const auto setting = [&](std::string_view key) -> std::optional<double> {
+            if (!settings) return std::nullopt;
+            const auto name = sp->cf.string(key);
+            const auto value = b->lookup(settings, name);
+            sp->release(name);
+            return value ? b->real(value) : std::nullopt;
+        };
+        const auto scheme = url ? sp->send_id(url, "scheme") : 0;
+        if (!url || !scheme || sp->cf.utf8(scheme) != "file") return fail_with(af::error::file_not_found, "AVAudioFile writes file URLs only");
+        if (common < 1 || common > 4) return fail_with(param_error, "AVAudioFile: not a common PCM format");
+        auto extension = sp->cf.utf8(sp->send_id(url, "pathExtension"));
+        for (auto& c : extension) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const std::uint32_t type = extension == "wav" || extension == "wave" ? af::four("WAVE")
+                                 : extension == "aif" || extension == "aiff" ? af::four("AIFF")
+                                 : extension == "aifc" ? af::four("AIFC")
+                                 : extension == "caf" ? af::four("caff") : 0;
+        if (!type) return fail_with(af::error::unsupported_file_type, "AVAudioFile writes .wav, .aif, .aifc and .caf files");
+        if (setting("AVFormatIDKey").value_or(af::four("lpcm")) != af::four("lpcm"))
+            return fail_with(af::error::unsupported_data_format, "AVAudioFile writes linear PCM (no audio encoder exists under Alchemy)");
+        const auto rate = setting("AVSampleRateKey"), channels = setting("AVNumberOfChannelsKey");
+        if (!rate || !(*rate > 0) || !channels || *channels < 1 || *channels > 64) return fail_with(param_error, "AVAudioFile settings need a sample rate and channels");
+        af::Pcm pcm;
+        pcm.rate = *rate;
+        pcm.channels = static_cast<std::uint32_t>(*channels);
+        pcm.is_float = setting("AVLinearPCMIsFloatKey").value_or(0) != 0;
+        pcm.bits = static_cast<std::uint32_t>(setting("AVLinearPCMBitDepthKey").value_or(pcm.is_float ? 32 : 16));
+        pcm.container = (pcm.bits + 7) / 8;
+        pcm.big_endian = setting("AVLinearPCMIsBigEndianKey").value_or(type == af::four("AIFF") || type == af::four("AIFC")) != 0;
+        pcm.is_signed = pcm.is_float || !(type == af::four("WAVE") && pcm.bits == 8);   // 8-bit WAVE is unsigned
+        pcm.aligned_high = !pcm.is_float && pcm.bits < pcm.container * 8 && type != af::four("caff");
+        auto& m = sp->memory();
+        const auto asbd = sp->process.allocate_guest(48, 8);
+        const auto out = asbd + 40;
+        m.write_bytes(asbd, af::asbd_from_pcm(pcm));
+        m.write64(out, 0);
+        // ExtAudioFileCreateWithURL(url, type, &format, NULL, kAudioFileFlags_EraseFile, &out)
+        auto status = static_cast<std::int32_t>(sp->call(audio_toolbox, "_ExtAudioFileCreateWithURL", {url, type, asbd, 0, 1, out}));
+        const auto writer = m.read64(out);
+        const auto processing = common_pcm(common, pcm.rate, pcm.channels, interleaved);
+        if (!status) {
+            // The client format: the processing format (kExtAudioFileProperty_ClientDataFormat).
+            m.write_bytes(asbd, af::asbd_from_pcm(processing));
+            status = static_cast<std::int32_t>(sp->call(audio_toolbox, "_ExtAudioFileSetProperty", {writer, af::four("cfmt"), 40, asbd}));
+            if (status) static_cast<void>(sp->call(audio_toolbox, "_ExtAudioFileDispose", {writer}));
+        }
+        sp->process.release_guest(asbd);
+        if (status) return fail_with(status, "AVAudioFile could not create the file in that format");
+        auto f = sp->objc.host_state<AudioFileState>(self);
+        f->url = sp->send_id(url, "retain");
+        f->writer = writer;
+        f->processing = processing;
+        f->file_format = make_format(*sp, pcm);
+        f->processing_format = make_format(*sp, processing);
+    };
+    support.method(file, "initForWriting:settings:error:", [open_for_writing](CpuState& s, GuestMemory&) {
+        open_for_writing(s, s.x[2], s.x[3], 1, false, s.x[4]);
+    }, "@@:@@^@");
+    support.method(file, "initForWriting:settings:commonFormat:interleaved:error:", [open_for_writing](CpuState& s, GuestMemory&) {
+        open_for_writing(s, s.x[2], s.x[3], s.x[4], (s.x[5] & 0xff) != 0, s.x[6]);
+    }, "@@:@@QB^@");
     const auto file_state = [sp](Address self) {
         const auto f = sp->objc.find_host_state<AudioFileState>(self);
-        if (!f) unsupported("an AVAudioFile that was not opened for reading");
+        if (!f) unsupported("an AVAudioFile that was not opened for reading or writing");
         return f;
     };
     support.method(file, "dealloc", [sp, file](CpuState& s, GuestMemory&) {
@@ -467,14 +550,41 @@ void install_avaudio_buffers(Support& support) {
     support.method(file, "url", [file_state](CpuState& s, GuestMemory&) { s.x[0] = file_state(s.x[0])->url; }, "@@:");
     support.method(file, "fileFormat", [file_state](CpuState& s, GuestMemory&) { s.x[0] = file_state(s.x[0])->file_format; }, "@@:");
     support.method(file, "processingFormat", [file_state](CpuState& s, GuestMemory&) { s.x[0] = file_state(s.x[0])->processing_format; }, "@@:");
-    support.method(file, "length", [file_state](CpuState& s, GuestMemory&) { s.x[0] = file_state(s.x[0])->audio.frames(); }, "q@:");
-    support.method(file, "framePosition", [file_state](CpuState& s, GuestMemory&) { s.x[0] = file_state(s.x[0])->position; }, "q@:");
+    support.method(file, "length", [file_state](CpuState& s, GuestMemory&) {
+        const auto f = file_state(s.x[0]);
+        s.x[0] = f->writer ? f->written : f->audio.frames();
+    }, "q@:");
+    support.method(file, "framePosition", [file_state](CpuState& s, GuestMemory&) {
+        const auto f = file_state(s.x[0]);
+        s.x[0] = f->writer ? f->written : f->position;
+    }, "q@:");
     support.method(file, "setFramePosition:", [file_state](CpuState& s, GuestMemory&) {
         const auto f = file_state(s.x[0]);
         const auto wanted = static_cast<std::int64_t>(s.x[2]);
         f->position = std::min<std::uint64_t>(static_cast<std::uint64_t>(std::max<std::int64_t>(wanted, 0)), f->audio.frames());
     }, "v@:q");
-    support.method(file, "isOpen", [file_state](CpuState& s, GuestMemory&) { s.x[0] = file_state(s.x[0])->open ? 1 : 0; }, "B@:");
+    support.method(file, "isOpen", [file_state](CpuState& s, GuestMemory&) {
+        const auto f = file_state(s.x[0]);
+        s.x[0] = f->open || f->writer ? 1 : 0;
+    }, "B@:");
+    // -writeFromBuffer:error: (buffer x2, error x3): the buffer's frames at the end, in the file's format.
+    support.method(file, "writeFromBuffer:error:", [sp, file_state](CpuState& s, GuestMemory&) {
+        const auto f = file_state(s.x[0]);
+        const auto b = s.x[2] ? sp->objc.find_host_state<PcmBuffer>(s.x[2]) : nullptr;
+        if (!f->writer || !b || format_asbd(*sp, b->format) != af::asbd_from_pcm(f->processing)) {
+            store_status(s.x[3], param_error, !f->writer ? "The AVAudioFile is not open for writing" : "The buffer's format is not the file's processing format");
+            s.x[0] = 0;
+            return;
+        }
+        const auto status = static_cast<std::int32_t>(sp->call(audio_toolbox, "_ExtAudioFileWrite", {f->writer, b->length, b->list}));
+        if (status) {
+            store_status(s.x[3], status, "The audio file could not be written");
+            s.x[0] = 0;
+            return;
+        }
+        f->written += b->length;
+        s.x[0] = 1;
+    }, "B@:@^@");
     support.method(file, "close", [sp, file_state](CpuState& s, GuestMemory&) { close_file(*sp, *file_state(s.x[0])); }, "v@:");
     // Reads up to `count` frames at the position into `buffer` (of the processing format).
     const auto read = [sp, file_state](CpuState& s, Address buffer, std::uint64_t count, Address error_out) {

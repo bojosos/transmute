@@ -1,5 +1,6 @@
 #include "alchemy/darwin/media/media_support.hpp"
 #include "alchemy/darwin/media/midi_core.hpp"
+#include "alchemy/darwin/media/midi_ump.hpp"
 #include "alchemy/darwin/media/midi_host.hpp"
 #include "alchemy/darwin/media/coremidi.hpp"
 
@@ -16,10 +17,14 @@
 // CoreMIDI over the MIDI core (midi_core.hpp): clients, ports, connections,
 // virtual sources and destinations, devices/entities/endpoints from Windows
 // MIDI, typed properties, scheduled sends, SysEx requests and the packet-list
-// helpers. Read procs run on one CoreMIDI guest thread (a completion thread,
-// "com.apple.coremidi.client"); notify procs run on the main queue when the
-// client was created on the main thread (the run loop CoreMIDI uses), on the
+// helpers. Read procs and blocks run on one CoreMIDI guest thread (a completion
+// thread, "com.apple.coremidi.client"); notify procs run on the main queue when
+// the client was created on the main thread (the run loop CoreMIDI uses), on the
 // CoreMIDI thread otherwise.
+// MIDI 2.0 event lists (MIDIEventList of Universal MIDI Packets) are translated
+// to and from MIDI 1.0 at the API (midi_ump.hpp): the MIDI core and the host's
+// ports carry MIDI 1.0 bytes. Receive blocks get event lists in the protocol
+// their port or destination asked for.
 namespace alchemy::gui::completion_kit::media {
 
 namespace {
@@ -46,7 +51,9 @@ std::unique_ptr<midi::Backend> make_backend() {
     return midi::make_host_backend();
 }
 
-struct Proc { Address function{}, refcon{}; };
+// How a port or destination receives: a read proc (MIDIPacketList, refCon), a read block
+// (MIDIPacketList) or a receive block (MIDIEventList in `protocol`). Blocks are _Block_copy'd.
+struct Proc { Address function{}, refcon{}, block{}; bool event_list{}; std::uint32_t protocol{}; };
 struct Client { Address notify{}, refcon{}; bool main_thread{}; };
 
 struct Midi {
@@ -113,12 +120,22 @@ struct Midi {
                 if (found == read_procs.end()) return;   // disposed meanwhile
                 proc = found->second;
             }
-            if (!proc.function) return;
+            const auto connection = delivery.kind == midi::Delivery::Kind::input_port ? delivery.connection_refcon : 0;
+            if (proc.event_list && proc.block) {
+                const auto list = event_list(delivery.packets, proc.protocol);
+                static_cast<void>(bridge->invoke_block(proc.block, {list, connection}));
+                support.process.release_guest(list);
+                return;
+            }
+            if (!proc.function && !proc.block) return;
             std::uint64_t size{};
             const auto list = packet_list(delivery.packets, size);
-            const std::array<Address, 3> arguments{list, proc.refcon,
-                delivery.kind == midi::Delivery::Kind::input_port ? delivery.connection_refcon : 0};
-            static_cast<void>(bridge->call_address(proc.function, arguments));
+            if (proc.block) {
+                static_cast<void>(bridge->invoke_block(proc.block, {list, connection}));
+            } else {
+                const std::array<Address, 3> arguments{list, proc.refcon, connection};
+                static_cast<void>(bridge->call_address(proc.function, arguments));
+            }
             support.process.release_guest(list);
         });
     }
@@ -169,6 +186,57 @@ struct Midi {
         };
         if (client.main_thread) bridge->dispatch_async(bridge->main_queue(), std::move(work));
         else if (worker) worker->post(std::move(work));
+    }
+
+    // A guest MIDIEventList of `packets` translated to `protocol` (#pragma pack(4): {MIDIProtocolID
+    // protocol; UInt32 numPackets; MIDIEventPacket packet[]}, MIDIEventPacket {MIDITimeStamp
+    // timeStamp; UInt32 wordCount; UInt32 words[]}, the next packet right after the words; at most
+    // 64 words a packet).
+    Address event_list(const std::vector<midi::Packet>& packets, std::uint32_t protocol) {
+        std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>> parts;
+        for (const auto& packet : packets) {
+            const auto words = midi::ump::from_bytes(packet.data, protocol);
+            std::vector<std::uint32_t> current;
+            for (std::size_t i = 0; i < words.size();) {
+                const auto n = std::min(midi::ump::word_count(words[i]), words.size() - i);
+                if (current.size() + n > 64) parts.emplace_back(packet.time, std::exchange(current, {}));
+                current.insert(current.end(), words.begin() + static_cast<std::ptrdiff_t>(i), words.begin() + static_cast<std::ptrdiff_t>(i + n));
+                i += n;
+            }
+            if (!current.empty()) parts.emplace_back(packet.time, std::move(current));
+        }
+        std::uint64_t size = 8;
+        for (const auto& [time, words] : parts) size += 12 + 4 * words.size();
+        const auto list = support.process.allocate_guest(size, 8);
+        auto& m = support.memory();
+        m.write32(list, protocol);
+        m.write32(list + 4, static_cast<std::uint32_t>(parts.size()));
+        auto at = list + 8;
+        for (const auto& [time, words] : parts) {
+            m.write64(at, time);
+            m.write32(at + 8, static_cast<std::uint32_t>(words.size()));
+            for (std::size_t i = 0; i < words.size(); ++i) m.write32(at + 12 + 4 * i, words[i]);
+            at += 12 + 4 * words.size();
+        }
+        return list;
+    }
+    // A guest MIDIEventList as MIDI 1.0 packets.
+    std::vector<midi::Packet> read_event_list(GuestMemory& m, Address list) {
+        std::vector<midi::Packet> packets;
+        if (!list) return packets;
+        const auto count = m.read32(list + 4);
+        auto at = list + 8;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            midi::Packet packet;
+            packet.time = m.read64(at);
+            const auto words = std::min<std::uint32_t>(m.read32(at + 8), 64);
+            std::vector<std::uint32_t> data(words);
+            for (std::uint32_t k = 0; k < words; ++k) data[k] = m.read32(at + 12 + 4ULL * k);
+            packet.data = midi::ump::to_bytes(data);
+            if (!packet.data.empty()) packets.push_back(std::move(packet));
+            at += 12 + 4ULL * words;
+        }
+        return packets;
     }
 
     std::vector<midi::Packet> read_packet_list(GuestMemory& m, Address list) {
@@ -279,6 +347,26 @@ void install_core_midi(Support& support) {
         }
         status(s, result);
     });
+    // MIDIInputPortCreateWithBlock(client, portName, MIDIPortRef *outPort, MIDIReadBlock): MIDIPacketLists.
+    // MIDIInputPortCreateWithProtocol(client, portName, MIDIProtocolID, MIDIPortRef *outPort, MIDIReceiveBlock):
+    // MIDIEventLists in that protocol.
+    const auto input_port = [state, text](CpuState& s, GuestMemory& m, Address name, Address out, Address block, bool event_list, std::uint32_t protocol) {
+        if (!out || !block) return status(s, midi::error::param);
+        if (event_list && protocol != midi::ump::protocol_1_0 && protocol != midi::ump::protocol_2_0) return status(s, midi::error::param);
+        midi::ObjectRef port{};
+        const auto result = state->core().create_port(static_cast<midi::ObjectRef>(s.x[0]), text(name), true, port);
+        if (!result) {
+            { std::lock_guard lock(state->mutex); state->read_procs[port] = {0, 0, state->bridge->block_copy(block), event_list, protocol}; }
+            m.write32(out, port);
+        }
+        status(s, result);
+    };
+    support.function(core_midi, "_MIDIInputPortCreateWithBlock", [input_port](CpuState& s, GuestMemory& m) {
+        input_port(s, m, s.x[1], s.x[2], s.x[3], false, 0);
+    });
+    support.function(core_midi, "_MIDIInputPortCreateWithProtocol", [input_port](CpuState& s, GuestMemory& m) {
+        input_port(s, m, s.x[1], s.x[3], s.x[4], true, static_cast<std::uint32_t>(s.x[2]));
+    });
     support.function(core_midi, "_MIDIOutputPortCreate", [state, text](CpuState& s, GuestMemory& m) {
         if (!s.x[2]) return status(s, midi::error::param);
         midi::ObjectRef port{};
@@ -286,10 +374,22 @@ void install_core_midi(Support& support) {
         if (!result) m.write32(s.x[2], port);
         status(s, result);
     });
-    support.function(core_midi, "_MIDIPortDispose", [state](CpuState& s, GuestMemory&) {
+    // The receiving side of a disposed port or endpoint goes (its block released).
+    const auto forget = [state](midi::ObjectRef object) {
+        Address block{};
+        {
+            std::lock_guard lock(state->mutex);
+            const auto found = state->read_procs.find(object);
+            if (found == state->read_procs.end()) return;
+            block = found->second.block;
+            state->read_procs.erase(found);
+        }
+        if (block) state->bridge->block_release(block);
+    };
+    support.function(core_midi, "_MIDIPortDispose", [state, forget](CpuState& s, GuestMemory&) {
         const auto port = static_cast<midi::ObjectRef>(s.x[0]);
         const auto result = state->core().dispose_port(port);
-        if (!result) { std::lock_guard lock(state->mutex); state->read_procs.erase(port); }
+        if (!result) forget(port);
         status(s, result);
     });
     support.function(core_midi, "_MIDIPortConnectSource", [state](CpuState& s, GuestMemory&) {
@@ -320,10 +420,39 @@ void install_core_midi(Support& support) {
         }
         status(s, result);
     });
-    support.function(core_midi, "_MIDIEndpointDispose", [state](CpuState& s, GuestMemory&) {
+    // MIDIDestinationCreateWithBlock(client, name, MIDIEndpointRef *outDest, MIDIReadBlock)
+    // MIDIDestinationCreateWithProtocol(client, name, MIDIProtocolID, MIDIEndpointRef *outDest, MIDIReceiveBlock)
+    const auto destination = [state, text](CpuState& s, GuestMemory& m, Address name, Address out, Address block, bool event_list, std::uint32_t protocol) {
+        if (!out || !block) return status(s, midi::error::param);
+        if (event_list && protocol != midi::ump::protocol_1_0 && protocol != midi::ump::protocol_2_0) return status(s, midi::error::param);
+        midi::ObjectRef endpoint{};
+        const auto result = state->core().create_virtual(static_cast<midi::ObjectRef>(s.x[0]), text(name), false, endpoint);
+        if (!result) {
+            { std::lock_guard lock(state->mutex); state->read_procs[endpoint] = {0, 0, state->bridge->block_copy(block), event_list, protocol}; }
+            m.write32(out, endpoint);
+        }
+        status(s, result);
+    };
+    support.function(core_midi, "_MIDIDestinationCreateWithBlock", [destination](CpuState& s, GuestMemory& m) {
+        destination(s, m, s.x[1], s.x[2], s.x[3], false, 0);
+    });
+    support.function(core_midi, "_MIDIDestinationCreateWithProtocol", [destination](CpuState& s, GuestMemory& m) {
+        destination(s, m, s.x[1], s.x[3], s.x[4], true, static_cast<std::uint32_t>(s.x[2]));
+    });
+    // MIDISourceCreateWithProtocol(client, name, MIDIProtocolID, MIDIEndpointRef *outSrc)
+    support.function(core_midi, "_MIDISourceCreateWithProtocol", [state, text](CpuState& s, GuestMemory& m) {
+        if (!s.x[3]) return status(s, midi::error::param);
+        const auto protocol = static_cast<std::uint32_t>(s.x[2]);
+        if (protocol != midi::ump::protocol_1_0 && protocol != midi::ump::protocol_2_0) return status(s, midi::error::param);
+        midi::ObjectRef endpoint{};
+        const auto result = state->core().create_virtual(static_cast<midi::ObjectRef>(s.x[0]), text(s.x[1]), true, endpoint);
+        if (!result) m.write32(s.x[3], endpoint);
+        status(s, result);
+    });
+    support.function(core_midi, "_MIDIEndpointDispose", [state, forget](CpuState& s, GuestMemory&) {
         const auto endpoint = static_cast<midi::ObjectRef>(s.x[0]);
         const auto result = state->core().dispose_endpoint(endpoint);
-        if (!result) { std::lock_guard lock(state->mutex); state->read_procs.erase(endpoint); }
+        if (!result) forget(endpoint);
         status(s, result);
     });
 
@@ -458,6 +587,16 @@ void install_core_midi(Support& support) {
         if (!s.x[2]) return status(s, midi::error::param);
         status(s, state->core().send(static_cast<midi::ObjectRef>(s.x[0]), static_cast<midi::ObjectRef>(s.x[1]), state->read_packet_list(m, s.x[2])));
     });
+    // MIDISendEventList(port, dest, const MIDIEventList *), MIDIReceivedEventList(src, const MIDIEventList *):
+    // the event list's messages as MIDI 1.0.
+    support.function(core_midi, "_MIDISendEventList", [state](CpuState& s, GuestMemory& m) {
+        if (!s.x[2]) return status(s, midi::error::param);
+        status(s, state->core().send(static_cast<midi::ObjectRef>(s.x[0]), static_cast<midi::ObjectRef>(s.x[1]), state->read_event_list(m, s.x[2])));
+    });
+    support.function(core_midi, "_MIDIReceivedEventList", [state](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) return status(s, midi::error::param);
+        status(s, state->core().received(static_cast<midi::ObjectRef>(s.x[0]), state->read_event_list(m, s.x[1])));
+    });
     // MIDIReceived(MIDIEndpointRef src, const MIDIPacketList *pktlist): a virtual source's output.
     support.function(core_midi, "_MIDIReceived", [state](CpuState& s, GuestMemory& m) {
         if (!s.x[1]) return status(s, midi::error::param);
@@ -504,6 +643,36 @@ void install_core_midi(Support& support) {
     support.function(core_midi, "_MIDIPacketListInit", [](CpuState& s, GuestMemory& m) {
         m.write32(s.x[0], 0);
         s.x[0] = s.x[0] + 4;
+    });
+    // MIDIEventPacket *MIDIEventListInit(MIDIEventList *, MIDIProtocolID)
+    support.function(core_midi, "_MIDIEventListInit", [](CpuState& s, GuestMemory& m) {
+        m.write32(s.x[0], static_cast<std::uint32_t>(s.x[1]));
+        m.write32(s.x[0] + 4, 0);
+        s.x[0] = s.x[0] + 8;
+    });
+    // MIDIEventPacket *MIDIEventListAdd(list, ByteCount listSize, MIDIEventPacket *cur, MIDITimeStamp time,
+    //     ByteCount wordCount, const UInt32 *words): appended to `cur` when the time is the same and it fits.
+    support.function(core_midi, "_MIDIEventListAdd", [](CpuState& s, GuestMemory& m) {
+        const auto list = s.x[0], size = s.x[1], current = s.x[2], time = s.x[3], count = s.x[4], words = s.x[5];
+        if (!list || !current) { s.x[0] = 0; return; }
+        const auto packets = m.read32(list + 4);
+        const auto end = list + size;
+        if (packets && m.read64(current) == time) {
+            const auto used = m.read32(current + 8);
+            if (used + count <= 64 && current + 12 + (used + count) * 4 <= end) {
+                for (std::uint64_t i = 0; i < count; ++i) m.write32(current + 12 + (used + i) * 4, m.read32(words + i * 4));
+                m.write32(current + 8, static_cast<std::uint32_t>(used + count));
+                s.x[0] = current;
+                return;
+            }
+        }
+        const auto packet = packets ? current + 12 + m.read32(current + 8) * 4ULL : current;
+        if (count > 64 || packet + 12 + count * 4 > end) { s.x[0] = 0; return; }   // no room
+        m.write64(packet, time);
+        m.write32(packet + 8, static_cast<std::uint32_t>(count));
+        for (std::uint64_t i = 0; i < count; ++i) m.write32(packet + 12 + i * 4, m.read32(words + i * 4));
+        m.write32(list + 4, packets + 1);
+        s.x[0] = packet;
     });
     // MIDIPacket *MIDIPacketListAdd(list, listSize, curPacket, time, nData, data)
     support.function(core_midi, "_MIDIPacketListAdd", [](CpuState& s, GuestMemory& m) {

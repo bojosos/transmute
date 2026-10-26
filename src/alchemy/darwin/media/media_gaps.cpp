@@ -39,7 +39,6 @@ using fill::core_audio;
 using fill::core_foundation;
 using fill::core_graphics;
 using fill::core_media;
-using fill::core_midi;
 using fill::core_text;
 using fill::core_video;
 using fill::fourcc;
@@ -52,9 +51,6 @@ using fill::video_toolbox;
 constexpr std::int32_t fd_invalid_parameter = -12710;
 constexpr std::int32_t audio_unsupported_operation = static_cast<std::int32_t>(fourcc("unop"));
 constexpr std::int32_t audio_bad_device = static_cast<std::int32_t>(fourcc("!dev"));
-constexpr std::int32_t audio_file_operation_not_supported = 0x6F703F3F;   // 'op??'
-constexpr std::int32_t audio_file_not_open = -38;
-constexpr std::int32_t midi_object_not_found = -10842;
 constexpr std::int32_t cg_invalid_connection = 1002;
 
 struct PixelFormat {
@@ -199,51 +195,6 @@ void Provider::install_media() {
     failure(core_audio, "_AudioHardwareCreateAggregateDevice", audio_unsupported_operation);
     failure(core_audio, "_AudioHardwareDestroyAggregateDevice", audio_bad_device);
     static_cast<void>(cls(core_audio, "CATapDescription", "NSObject"));
-    failure(audio_toolbox, "_AudioFileInitializeWithCallbacks", audio_file_operation_not_supported, {6});
-    failure(audio_toolbox, "_AudioFileWritePackets", audio_file_not_open);
-
-    // ---------------------------------------------------------------- CoreMIDI 2.0 event lists
-    // MIDIEventList (4-byte packed): {MIDIProtocolID protocol; UInt32 numPackets;
-    // MIDIEventPacket packet[]}; MIDIEventPacket: {MIDITimeStamp timeStamp;
-    // UInt32 wordCount; UInt32 words[64]}.
-    raw(core_midi, "_MIDIEventListInit", [](CpuState& s, GuestMemory& m) {
-        m.write32(s.x[0], static_cast<std::uint32_t>(s.x[1]));
-        m.write32(s.x[0] + 4, 0);
-        s.x[0] = s.x[0] + 8;
-    });
-    // MIDIEventPacket *MIDIEventListAdd(list, ByteCount listSize, MIDIEventPacket *cur,
-    //     MIDITimeStamp time, ByteCount wordCount, const UInt32 *words)
-    raw(core_midi, "_MIDIEventListAdd", [](CpuState& s, GuestMemory& m) {
-        const auto list = s.x[0], size = s.x[1], current = s.x[2], time = s.x[3], count = s.x[4], words = s.x[5];
-        const auto packets = m.read32(list + 4);
-        const auto end = list + size;
-        Address packet = current;
-        if (packets && m.read64(current) == time) {
-            const auto used = m.read32(current + 8);
-            if (used + count <= 64 && current + 12 + (used + count) * 4 <= end) {
-                for (std::uint64_t i = 0; i < count; ++i) m.write32(current + 12 + (used + i) * 4, m.read32(words + i * 4));
-                m.write32(current + 8, static_cast<std::uint32_t>(used + count));
-                s.x[0] = current;
-                return;
-            }
-        }
-        if (packets) packet = current + 12 + m.read32(current + 8) * 4ULL;
-        if (count > 64 || packet + 12 + count * 4 > end) { s.x[0] = 0; return; }   // no room
-        m.write64(packet, time);
-        m.write32(packet + 8, static_cast<std::uint32_t>(count));
-        for (std::uint64_t i = 0; i < count; ++i) m.write32(packet + 12 + i * 4, m.read32(words + i * 4));
-        m.write32(list + 4, packets + 1);
-        s.x[0] = packet;
-    });
-    // MIDIInputPortCreateWithProtocol(client, name, protocol, MIDIPortRef *out, MIDIReceiveBlock)
-    raw(core_midi, "_MIDIInputPortCreateWithProtocol", [this](CpuState& s, GuestMemory&) {
-        if (has(core_midi, "_MIDIInputPortCreateWithBlock")) {
-            s.x[0] = call(core_midi, "_MIDIInputPortCreateWithBlock", {s.x[0], s.x[1], s.x[3], s.x[4]});
-            return;
-        }
-        throw std::runtime_error("Alchemy: MIDIInputPortCreateWithProtocol is unsupported (no block-based MIDI input ports)");
-    });
-    failure(core_midi, "_MIDISendEventList", midi_object_not_found);   // no destination endpoint exists
 
     // ---------------------------------------------------------------- GameController
     string(game_controller, "_GCControllerDidConnectNotification", "GCControllerDidConnectNotification");

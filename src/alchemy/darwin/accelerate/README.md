@@ -8,6 +8,23 @@
   BLAS/LAPACK entries `cblas_dgemm` and `dgesv_`, and vImage's 8-bit
   Y'CbCr <-> ARGB conversions (`vdsp.cpp`), computed in double precision on
   the host.
+* **Real, the wider vDSP API (`vdsp_vectors.cpp`), float and double (`D`):**
+  * vector arithmetic (vdiv, vmax/vmin, vmaxmg/vminmg, vma, vam, vmsa, vabs, vneg, vsq, vssq,
+    vfill, vgen, vrvrs);
+  * scalar forms (vsdiv, svdiv, vsmsa, vlim, vthr, vthres, vthrsc);
+  * reductions (sve, svemg, meanv, meanmgv, measqv, minv, minmgv, dotpr, and the index forms
+    maxvi, minvi, maxmgvi, minmgvi);
+  * integer and precision conversions (vflt*, vfix*, vfixr*, vfixu*, vspdp, vdpsp) and vdbcon;
+  * Hann, Hamming and Blackman windows; mmul and mtrans;
+  * split-complex arithmetic (zvadd, zvsub, zvmags, zvabs, zvphas, zvconj, zvmov);
+  * complex and real FFTs (fft_zip/zop/zrop) and the DFT interface (`DFT_zop`/`zrop` for lengths
+    f·2ⁿ, f ∈ {1, 3, 5, 15});
+  * cascaded biquads and desamp.
+
+  vdsp.cpp's own kernels keep their names; this file adds the rest.
+* **Real, vForce (`vforce.cpp`):** element-wise sqrt, rsqrt, rec, exponentials and logarithms,
+  rounding, the trigonometric and hyperbolic functions and their inverses, pow/pows, atan2, div,
+  fmod, remainder, copysign, nextafter, sincos and cosisin, in float and double.
 * **Real, LAPACK decomposition drivers (`lapack.cpp`, both builds):** `?gesdd` (SVD by one-sided
   Jacobi), `?syevd`/`?heevd` (symmetric and Hermitian eigen by cyclic Jacobi), `?geev` (general eigen:
   Hessenberg reduction and shifted QR to complex Schur form, real pairs packed as LAPACK does),

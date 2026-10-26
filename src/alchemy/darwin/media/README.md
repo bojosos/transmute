@@ -23,14 +23,29 @@ with any linear PCM input format, channel maps, sample-rate conversion
 `ALCHEMY_AUDIO_OUTPUT=device` plays to the device in a cloaked run.
 
 **AVFAudio (real, `avaudio_*.cpp`):** AVAudioTime, AVAudioPCMBuffer (guest memory in any
-linear PCM layout) and AVAudioFile for reading (the files AudioFile reads, converted to the
-processing format). AVAudioPlayer decodes its file or data and plays it on the default output with
+linear PCM layout) and AVAudioFile for reading and writing (the files AudioFile reads and writes,
+converted to and from the processing format). AVAudioPlayer decodes its file or data and plays it on the default output with
 volume, fades, pan, rate, loops, seeking, `playAtTime:` and metering. AVAudioEngine renders its
 graph on the default output: output, mixer and player nodes (buffers, files, segments, loop and
 interrupt options, completion handlers), volume and pan into mixers, node and player times, and
-taps. Unavailable: writing files (nil with an error), input (no device: an engine fed by the input
+taps. Unavailable: compressed files (nil with an error), input (no device: an engine fed by the input
 node fails to start), manual rendering (NO with an error), scheduling at a time and taps at a rate
 other than the engine's (explicit stops).
+
+**Audio files (real, `audio_file.cpp`):** AudioFile and ExtAudioFile read and write linear PCM
+WAVE, AIFF, AIFC and CAF, by URL or through the client's callbacks
+(`AudioFileOpenWithCallbacks`, `AudioFileInitializeWithCallbacks`). Writes go into the data, and
+the header's sizes follow at `AudioFileOptimize` and `AudioFileClose`. ExtAudioFile converts
+from and to any linear PCM client format at the file's rate. An existing file opens for writing
+when its header is the one Alchemy writes (a canonical WAVE, or an Alchemy-written file); others,
+and formats a container cannot hold, answer with the AudioFile errors.
+
+**CoreMIDI 2.0 event lists (real, `coremidi.cpp`, `midi_ump.cpp`):** `MIDIEventListInit`/`Add`,
+`MIDISendEventList`, `MIDIReceivedEventList`, and ports and endpoints with a protocol or a block
+(`MIDIInputPortCreateWithProtocol`/`WithBlock`, `MIDIDestinationCreateWithProtocol`/`WithBlock`,
+`MIDISourceCreateWithProtocol`). Universal MIDI Packets are translated to MIDI 1.0 at the API, and
+receive blocks get event lists in their protocol. MIDI 2.0-only messages (per-note and
+registered/assignable controllers, 128-bit data) have no MIDI 1.0 form and are dropped.
 
 **Unavailable, as documented (audio):** input devices and AUHAL input
 (`kAudioUnitErr_FailedInitialization`, `kAudioUnitErr_NoConnection`), version 3 audio

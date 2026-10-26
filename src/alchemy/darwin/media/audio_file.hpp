@@ -18,8 +18,9 @@ struct GuestAudio {
     [[nodiscard]] std::uint64_t frames() const { return container.data_bytes / container.format.frame_bytes(); }
 };
 
-// Opens and parses `path`: an OSStatus (fnfErr, kAudioFilePermissionsError, the parser's errors).
-std::int32_t open_guest_audio(Support& support, const std::string& path, GuestAudio& out);
+// Opens and parses `path` (for reading, or reading and writing): an OSStatus (fnfErr,
+// kAudioFilePermissionsError, the parser's errors).
+std::int32_t open_guest_audio(Support& support, const std::string& path, GuestAudio& out, bool read_write = false);
 // pread through the guest; the byte count read.
 std::size_t read_guest(Support& support, std::int64_t fd, std::uint64_t offset, std::span<std::uint8_t> out);
 void close_guest_audio(Support& support, GuestAudio& audio);

@@ -4,6 +4,7 @@
 // message splitter).
 #include "alchemy/darwin/media/cmtime.hpp"
 #include "alchemy/darwin/media/midi_core.hpp"
+#include "alchemy/darwin/media/midi_ump.hpp"
 #include "alchemy/darwin/media/hal_core.hpp"
 #include "alchemy/darwin/media/hal_host.hpp"
 #include "alchemy/darwin/media/midi_host.hpp"
@@ -549,6 +550,72 @@ void resampler_tests() {
     require(copied[7] == 7, "equal rates copy");
 }
 
+
+// Universal MIDI Packets <-> MIDI 1.0 bytes.
+void ump_tests() {
+    namespace ump = midi::ump;
+    require(ump::scale(127, 7, 16) == 0xffff && ump::scale(64, 7, 16) == 0x8000 && ump::scale(0, 7, 16) == 0, "7 to 16 bits");
+    require(ump::scale(127, 7, 32) == 0xffffffffU && ump::scale(0x2000, 14, 32) == 0x80000000U && ump::scale(0xffffffffU, 32, 7) == 127, "scaling");
+    // Protocol 1.0: channel voice as type 2, real time as type 1, SysEx as 7-bit data packets.
+    const std::vector<std::uint8_t> bytes{0x90, 60, 100, 0xf8, 0xb3, 7, 64, 0xf0, 1, 2, 3, 4, 5, 6, 7, 0xf7, 0xc1, 5};
+    const auto words = ump::from_bytes(bytes, ump::protocol_1_0);
+    require(words.size() == 1 + 1 + 1 + 4 + 1 && words[0] == 0x20903c64 && words[1] == 0x10f80000 && words[2] == 0x20b30740 &&
+            words[3] == 0x30160102 && words[4] == 0x03040506 && words[5] == 0x30310700 && words[7] == 0x20c10500, "MIDI 1.0 packets");
+    require(ump::to_bytes(words) == bytes, "and back");
+    // Protocol 2.0: MIDI 2.0 channel voice; a note on of velocity 0 is a note off.
+    const std::vector<std::uint8_t> voice{0x91, 60, 127, 0x91, 60, 0, 0xe0, 0, 0x40};
+    const auto two = ump::from_bytes(voice, ump::protocol_2_0);
+    require(two.size() == 6 && two[0] == 0x40913c00 && two[1] == 0xffff0000U && two[2] == 0x40813c00 && two[3] == 0x80000000U &&
+            two[4] == 0x40e00000 && two[5] == 0x80000000U, "MIDI 2.0 packets");
+    require(ump::to_bytes(two) == std::vector<std::uint8_t>{0x91, 60, 127, 0x81, 60, 64, 0xe0, 0, 0x40}, "MIDI 2.0 down to 1.0");
+    // A program change with its bank: bank select, then the program; per-note messages are dropped.
+    const std::vector<std::uint32_t> program{0x40c20001, 0x05000302, 0x40020000, 0x12345678};
+    require(ump::to_bytes(program) == std::vector<std::uint8_t>{0xb2, 0, 3, 0xb2, 32, 2, 0xc2, 5}, "bank and program");
+    require(ump::word_count(0x50000000) == 4 && ump::word_count(0x40000000) == 2 && ump::word_count(0x20000000) == 1, "word counts");
+}
+
+// Every container Alchemy writes reads back with its format.
+void audio_file_writing_tests() {
+    namespace af = cm::audio_file;
+    struct Case { std::uint32_t type; af::Pcm pcm; };
+    std::vector<Case> cases;
+    af::Pcm s16; s16.rate = 44100; s16.channels = 2; s16.bits = 16; s16.container = 2;
+    cases.push_back({af::four("WAVE"), s16});
+    af::Pcm f32 = s16; f32.is_float = true; f32.bits = 32; f32.container = 4; f32.channels = 6;
+    cases.push_back({af::four("WAVE"), f32});
+    af::Pcm be24 = s16; be24.big_endian = true; be24.bits = 24; be24.container = 3;
+    cases.push_back({af::four("AIFF"), be24});
+    af::Pcm bef = f32; bef.big_endian = true; bef.channels = 1;
+    cases.push_back({af::four("AIFC"), bef});
+    af::Pcm sowt = s16;
+    cases.push_back({af::four("AIFC"), sowt});
+    cases.push_back({af::four("caff"), f32});
+    for (const auto& c : cases) {
+        std::vector<std::uint8_t> file;
+        std::string why;
+        require(af::write_header(c.type, c.pcm, 4 * c.pcm.frame_bytes(), {}, file, why) == 0, "write_header: " + why);
+        const auto header = file.size();
+        file.resize(header + 4 * c.pcm.frame_bytes());
+        af::Container container;
+        const auto read = [&file](std::uint64_t offset, std::span<std::uint8_t> out) -> std::size_t {
+            if (offset >= file.size()) return 0;
+            const auto n = std::min<std::size_t>(out.size(), file.size() - static_cast<std::size_t>(offset));
+            std::memcpy(out.data(), file.data() + offset, n);
+            return n;
+        };
+        require(af::parse(read, file.size(), container, why) == 0, "parse: " + why);
+        const auto& f = container.format;
+        require(container.file_type == c.type && container.data_offset == header && container.data_bytes == 4 * c.pcm.frame_bytes() &&
+                f.rate == c.pcm.rate && f.channels == c.pcm.channels && f.bits == c.pcm.bits && f.is_float == c.pcm.is_float &&
+                f.big_endian == c.pcm.big_endian, "a written header reads back");
+    }
+    af::Pcm le32 = s16; le32.bits = 32; le32.container = 4;
+    std::vector<std::uint8_t> out;
+    std::string why;
+    require(af::write_header(af::four("AIFF"), le32, 0, {}, out, why) == af::error::unsupported_data_format, "AIFF holds big-endian only");
+    require(af::write_header(af::four("MPG3"), s16, 0, {}, out, why) == af::error::unsupported_file_type, "no MP3 container");
+}
+
 int main() {
     try {
         resampler_tests();
@@ -559,6 +626,8 @@ int main() {
         hal_tests();
         music_tests();
         audio_file_tests();
+        audio_file_writing_tests();
+        ump_tests();
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;
