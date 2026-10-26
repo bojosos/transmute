@@ -1622,6 +1622,7 @@ void compressed_audio(Fixture& f) {
 struct DecodedImage { Address image; std::int64_t pts; std::uint32_t flags; std::int32_t status; };
 Fixture* vt_fixture{};
 constexpr std::string_view vt_cf = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+constexpr std::string_view vt_cg = "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics";
 std::vector<DecodedImage>& vt_images() { static std::vector<DecodedImage> value; return value; }
 
 std::string md5_hex(const std::vector<std::uint8_t>& data) {
@@ -1794,6 +1795,92 @@ void video_toolbox(Fixture& f) {
     }
 }
 
+// AVFoundation over container files: libvpx's VP9 WebM vector as an AVURLAsset (its video track),
+// read as stored samples and as decoded 420v pictures (against the vector's per-frame MD5s), and
+// an image from AVAssetImageGenerator; an MP3 file's audio track read as its stored packets.
+void av_video(Fixture& f) {
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_av_video";
+    std::filesystem::create_directories(directory);
+    const std::string third_party = ALCHEMY_THIRD_PARTY;
+    const auto webm = directory / "size-08x08.webm";
+    std::filesystem::copy_file(third_party + "/libvpx/test-vectors/vp90-2-02-size-08x08.webm", webm, std::filesystem::copy_options::overwrite_existing);
+    std::vector<std::string> expected;
+    {
+        std::ifstream in(third_party + "/libvpx/test-vectors/vp90-2-02-size-08x08.webm.md5");
+        for (std::string line; std::getline(in, line);) if (line.size() >= 32) expected.push_back(line.substr(0, 32));
+    }
+    const auto url = f.cf.file_url(alchemy::guest_path_string(webm), false);
+    const auto asset = f.send(f.cls("AVURLAsset"), "URLAssetWithURL:options:", {url, 0});
+    const auto tracks = f.send(asset, "tracks");
+    require(f.cf.length(tracks) == 1, "the WebM asset has one track");
+    const auto track = f.cf.element(tracks, 0);
+    require(f.cf.utf8(f.send(track, "mediaType")) == "vide" && (f.send(track, "isDecodable") & 0xff) == 1, "a decodable video track");
+    require(f.cf.length(f.send(asset, "tracksWithMediaType:", {f.cf.string("vide")})) == 1 &&
+            f.cf.length(f.send(asset, "tracksWithMediaType:", {f.cf.string("soun")})) == 0, "tracksWithMediaType:");
+    const auto size = f.objc.send(track, f.objc.selector("naturalSize"), {});
+    require(std::bit_cast<double>(size.v[0][0]) == 8.0 && std::bit_cast<double>(size.v[1][0]) == 8.0, "naturalSize 8x8");
+    const auto description = f.cf.element(f.send(track, "formatDescriptions"), 0);
+    require(f.call(cm, "_CMFormatDescriptionGetMediaSubType", {description}) == 0x76703039, "the description is VP9");   // 'vp09'
+    // Stored samples: every frame, each a CMSampleBuffer with data.
+    const auto read = [&](Address settings) {
+        const auto error = f.block(8);
+        f.engine.write64(error, 0);
+        const auto reader = f.send(f.cls("AVAssetReader"), "assetReaderWithAsset:error:", {asset, error});
+        require(reader != 0, "an AVAssetReader of the WebM asset");
+        const auto output = f.send(f.cls("AVAssetReaderTrackOutput"), "assetReaderTrackOutputWithTrack:outputSettings:", {track, settings});
+        f.send(reader, "addOutput:", {output});
+        require((f.send(reader, "startReading") & 0xff) == 1, "startReading");
+        std::vector<Address> buffers;
+        while (const auto buffer = f.send(output, "copyNextSampleBuffer")) buffers.push_back(buffer);
+        require(f.send(reader, "status") == 2, "the reader completes");
+        return buffers;
+    };
+    const auto stored = read(0);
+    require(stored.size() == expected.size(), "a stored sample per frame: " + std::to_string(stored.size()));
+    for (const auto buffer : stored) {
+        const auto block = f.call(cm, "_CMSampleBufferGetDataBuffer", {buffer});
+        require(block && f.call(cm, "_CMBlockBufferGetDataLength", {block}) > 0 && f.call(cm, "_CMSampleBufferGetFormatDescription", {buffer}) == description,
+                "stored samples carry their bytes and the track's description");
+        f.call(vt_cf, "_CFRelease", {buffer});
+    }
+    // Decoded pictures in 420v, per-frame MD5s as the vector lists them.
+    const auto key = f.cf.string("PixelFormatType"), value = f.cf.integer(0x34323076);   // '420v'
+    const std::array<std::pair<Address, Address>, 1> entries{{{key, value}}};
+    const auto pictures = read(f.cf.dictionary(entries));
+    require(pictures.size() == expected.size(), "a picture per frame: " + std::to_string(pictures.size()));
+    for (std::size_t i = 0; i < pictures.size(); ++i) {
+        const auto image = f.call(cm, "_CMSampleBufferGetImageBuffer", {pictures[i]});
+        require(image && md5_hex(i420_of(f, image)) == expected[i], "decoded frame " + std::to_string(i + 1) + " MD5");
+        f.call(vt_cf, "_CFRelease", {pictures[i]});
+    }
+    // An image of the first frame.
+    const auto generator = f.send(f.cls("AVAssetImageGenerator"), "assetImageGeneratorWithAsset:", {asset});
+    const auto when = f.block(24), actual = f.block(24), error = f.block(8);
+    write_time(f, when, 0, 1000);
+    f.engine.write64(error, 0);
+    const auto image = f.send(generator, "copyCGImageAtTime:actualTime:error:", {when, actual, error});
+    require(image && f.call(vt_cg, "_CGImageGetWidth", {image}) == 8 && f.call(vt_cg, "_CGImageGetHeight", {image}) == 8 &&
+            f.engine.read64(error) == 0, "AVAssetImageGenerator makes an 8x8 image");
+    f.call(vt_cg, "_CGImageRelease", {image});
+
+    // An MP3 asset: one audio track, whose stored packets keep their MPEG description.
+    const auto mp3 = directory / "hecommon.mp3";
+    std::filesystem::copy_file(third_party + "/minimp3/vectors/l3-hecommon.bit", mp3, std::filesystem::copy_options::overwrite_existing);
+    const auto audio_asset = f.send(f.cls("AVURLAsset"), "URLAssetWithURL:options:", {f.cf.file_url(alchemy::guest_path_string(mp3), false), 0});
+    const auto audio_tracks = f.send(audio_asset, "tracksWithMediaType:", {f.cf.string("soun")});
+    require(f.cf.length(audio_tracks) == 1, "the MP3 asset has an audio track");
+    const auto reader = f.send(f.cls("AVAssetReader"), "assetReaderWithAsset:error:", {audio_asset, 0});
+    const auto output = f.send(f.cls("AVAssetReaderTrackOutput"), "assetReaderTrackOutputWithTrack:outputSettings:", {f.cf.element(audio_tracks, 0), 0});
+    f.send(reader, "addOutput:", {output});
+    require((f.send(reader, "startReading") & 0xff) == 1, "startReading the MP3");
+    const auto packet = f.send(output, "copyNextSampleBuffer");
+    const auto asbd = packet ? f.call(cm, "_CMAudioFormatDescriptionGetStreamBasicDescription", {f.call(cm, "_CMSampleBufferGetFormatDescription", {packet})}) : 0;
+    require(asbd && f.engine.read32(asbd + 8) == 0x2e6d7033, "stored MP3 packets are '.mp3'");
+    f.call(vt_cf, "_CFRelease", {packet});
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 } // namespace
 
 int main() {
@@ -1815,6 +1902,7 @@ int main() {
         {"audio_file_writing", audio_file_writing},
         {"compressed_audio", compressed_audio},
         {"video_toolbox", video_toolbox},
+        {"av_video", av_video},
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},
         {"avaudio", avaudio},

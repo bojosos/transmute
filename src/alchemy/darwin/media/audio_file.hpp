@@ -36,6 +36,10 @@ std::int32_t open_guest_audio(Support& support, const std::string& path, GuestAu
 std::int32_t open_audio_stream(GuestAudio& audio, audio_file::ReadAt read, std::int32_t pcm_status, std::string& why);
 // pread through the guest; the byte count read.
 std::size_t read_guest(Support& support, std::int64_t fd, std::uint64_t offset, std::span<std::uint8_t> out);
+// open(2) for reading through the guest: the descriptor and the file's size, or -1 with an
+// OSStatus (fnfErr, kAudioFilePermissionsError) in `status`. close_guest_fd closes it.
+std::int64_t open_guest_read(Support& support, const std::string& path, std::uint64_t& size, std::int32_t& status);
+void close_guest_fd(Support& support, std::int64_t fd);
 void close_guest_audio(Support& support, GuestAudio& audio);
 // Frames [start, start + count) of the audio as interleaved samples in [-1, 1] (the container
 // format's channels) appended to `out`; PCM is read through `read` (the file's bytes). The frames

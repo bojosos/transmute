@@ -1,4 +1,7 @@
 #include "alchemy/darwin/media/audio_file.hpp"
+#include "alchemy/darwin/media/media_codecs.hpp"
+#include "alchemy/darwin/media/media_container.hpp"
+#include "alchemy/darwin/media/pixel_convert.hpp"
 
 #include "alchemy/darwin/security/bridge.hpp"
 
@@ -7,6 +10,8 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <deque>
+#include <limits>
 #include <map>
 #include <mutex>
 
@@ -17,17 +22,27 @@
 // - AVURLAsset/AVAsset: file URLs whose audio Alchemy can read (linear PCM
 //   WAVE, AIFF/AIFC, CAF: audio_file_core.hpp; MP3, FLAC, Ogg Opus and MP4
 //   or Matroska audio in those codecs, decoded: audio_file.hpp) have one
-//   audio track with its duration, time range and CMAudioFormatDescription
-//   (of the decoded audio); other media (video, AAC, ALAC) has no track, an
-//   invalid duration and AVKeyValueStatusFailed. Nothing is playable (there is no AVPlayer) and no
-//   metadata is read (commonMetadata is empty). Keys load synchronously; the
-//   completion handler runs on a global queue.
-// - AVAssetReader with track and audio-mix outputs vends CMSampleBuffers of
-//   linear PCM in the requested settings (same sample rate; see
-//   audio_file_core.hpp for the conversions), honouring the time range.
-// - AVAssetImageGenerator: no video decoder exists, so every request fails
-//   with AVErrorDecoderNotFound (AVErrorOperationNotSupportedForAsset for an
-//   audio-only asset).
+//   audio track with its duration, time range and CMAudioFormatDescription.
+//   Container files (MP4, MOV, Matroska/WebM, Ogg, MP3, FLAC:
+//   media_container.hpp) have all their video and audio tracks, with
+//   format descriptions of the stored samples (codec configuration records
+//   as extension atoms, magic cookies), sizes, frame rates and durations;
+//   the first audio track is readable decoded when a decoder exists, and
+//   video tracks are decodable for AV1, VP9 and VP8. Nothing is playable
+//   (there is no AVPlayer) and no metadata is read (commonMetadata is empty).
+//   Keys load synchronously; the completion handler runs on a global queue.
+// - AVAssetReader: audio-mix outputs and audio outputs with settings vend
+//   CMSampleBuffers of linear PCM in the requested settings (same sample
+//   rate; see audio_file_core.hpp for the conversions); outputs of video
+//   tracks, and of stored audio without settings, vend the stored samples
+//   as they are (NotSync on non-sync video samples), or with settings
+//   decoded pictures (a VTDecompressionSession with the settings as its
+//   destination attributes, from the sync sample before the time range).
+// - AVAssetImageGenerator decodes the first decodable video track through a
+//   reader: the picture at or before the time (the sync sample before it
+//   with the default unbounded tolerances), scaled to the maximum size;
+//   AVErrorDecoderNotFound for other video, and
+//   AVErrorOperationNotSupportedForAsset for audio-only assets.
 // - AVAudioFormat and AVAudioChannelLayout are real value classes.
 // - Audio units: the version 3 API exposes no component (the output units
 //   are version 2 AudioComponents only, audio_units.cpp), so
@@ -42,6 +57,10 @@ constexpr std::string_view av_foundation = "/System/Library/Frameworks/AVFoundat
 constexpr std::string_view audio_toolbox = "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox";
 constexpr std::string_view core_audio_kit = "/System/Library/Frameworks/CoreAudioKit.framework/Versions/A/CoreAudioKit";
 constexpr std::string_view core_media = "/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia";
+constexpr std::string_view video_toolbox = "/System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox";
+constexpr std::string_view core_foundation = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+constexpr std::string_view core_graphics = "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics";
+constexpr std::string_view core_video = "/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo";
 constexpr std::string_view libsystem = "/usr/lib/libSystem.B.dylib";
 
 // AVError codes (AVFoundationErrorDomain).
@@ -70,15 +89,21 @@ constexpr Time time_positive_infinity{0, 0, 1 | 4, 0};
 struct AssetState final : ObjectPayload {
     Address url{};                     // retained
     bool loaded{};
-    std::int32_t status{};             // the open/parse OSStatus
-    audio_file::Container container;
-    Address track{};                   // retained AVAssetTrack (readable audio)
-    [[nodiscard]] bool readable() const { return loaded && status == 0; }
+    std::int32_t status{};             // the audio's open/parse OSStatus
+    audio_file::Container container;   // the readable audio (PCM, or decoded)
+    Address track{};                   // the readable audio track (one of `tracks`)
+    std::vector<Address> tracks;       // retained AVAssetTracks
+    std::shared_ptr<container::Movie> movie;   // container files (MP4, MOV, WebM, Ogg, MP3, FLAC)
+    [[nodiscard]] bool readable() const { return loaded && !tracks.empty(); }
+    [[nodiscard]] bool audio_readable() const { return loaded && status == 0; }
     [[nodiscard]] std::uint64_t frames() const { return container.data_bytes / container.format.frame_bytes(); }
 };
 struct TrackState final : ObjectPayload {
     Address asset{};                   // not retained (the asset owns the track)
-    Address format_description{};      // retained CMAudioFormatDescription
+    Address format_description{};      // retained CMAudio/CMVideoFormatDescription
+    std::int32_t id{1};
+    bool video{}, decodable{true}, readable_audio{};
+    std::size_t index{};               // in the asset's movie (container files)
 };
 struct ReaderState final : ObjectPayload {
     Address asset{};                   // retained
@@ -99,6 +124,19 @@ struct OutputState final : ObjectPayload {
     std::uint64_t position{}, end{};
     Address format_description{};      // retained, for `client`
     bool finished{};
+    // Container samples (video, and stored audio without settings): samples [next, last) of the
+    // track, as they are (no session) or decoded by a VTDecompressionSession into pixel buffers,
+    // those before `from` (track ticks) dropped.
+    bool samples{};
+    std::int64_t fd{-1};
+    std::shared_ptr<container::Movie> movie;
+    std::size_t track_index{}, next{}, last{};
+    std::int64_t from{};
+    Address track_format{};            // the track's description (not retained)
+    Address session{};                 // VTDecompressionSession (+1) or 0
+    bool drained{};
+    struct Picture { Address image{}; std::array<std::uint8_t, 24> pts{}, duration{}; };
+    std::deque<Picture> pictures;      // decoded, retained images
 };
 struct GeneratorState final : ObjectPayload {
     Address asset{};
@@ -184,47 +222,162 @@ struct Av {
         return value ? support.cf.number_value(value) : std::nullopt;
     }
 
-    // Opens and parses the asset's file once; makes its audio track.
+    // Opens and parses the asset's file once; makes its tracks: the one audio track of a linear PCM
+    // file, or every video and audio track of a container file (the first audio track readable
+    // when its codec has a decoder).
     AssetState& load(Address asset) {
         auto s = state<AssetState>(asset);
         if (s->loaded) return *s;
         s->loaded = true;
         const auto scheme = s->url ? support.send_id(s->url, "scheme") : 0;
         if (!s->url || !scheme || support.cf.utf8(scheme) != "file") { s->status = audio_file::error::unsupported_file_type; return *s; }
+        const auto path = support.cf.url_path(s->url);
         GuestAudio audio;
-        s->status = open_guest_audio(support, support.cf.url_path(s->url), audio);
-        if (s->status) return *s;
-        close_guest_audio(support, audio);
-        s->container = audio.container;
-        // The track and its CMAudioFormatDescription.
-        const auto track = alloc_init(track_class);
-        auto t = state<TrackState>(track);
-        t->asset = asset;
-        t->format_description = make_format_description(audio_file::asbd_from_pcm(s->container.format),
-                                                        audio_file::layout_for_mask(s->container.channel_mask, s->container.format.channels));
-        s->track = track;
+        s->status = open_guest_audio(support, path, audio);
+        std::vector<std::uint8_t> stream_asbd, cookie;
+        if (!s->status) {
+            s->container = audio.container;
+            if (audio.stream) {
+                stream_asbd = audio.stream->asbd();
+                cookie = audio.stream->magic_cookie();
+            }
+            close_guest_audio(support, audio);
+        }
+        if (!s->status && !audio.stream) {
+            // Linear PCM: one audio track and its CMAudioFormatDescription.
+            const auto track = alloc_init(track_class);
+            auto t = state<TrackState>(track);
+            t->asset = asset;
+            t->readable_audio = true;
+            t->format_description = make_format_description(audio_file::asbd_from_pcm(s->container.format),
+                                                            audio_file::layout_for_mask(s->container.channel_mask, s->container.format.channels));
+            s->track = track;
+            s->tracks.push_back(track);
+            return *s;
+        }
+        // A container: its tracks.
+        std::uint64_t size{};
+        std::int32_t opened{};
+        const auto fd = open_guest_read(support, path, size, opened);
+        if (fd < 0) return *s;
+        auto movie = std::make_shared<container::Movie>();
+        std::string why;
+        const bool parsed = container::parse([this, fd](std::uint64_t offset, std::span<std::uint8_t> out) { return read_guest(support, fd, offset, out); },
+                                             size, *movie, why);
+        close_guest_fd(support, fd);
+        if (!parsed) return *s;
+        s->movie = movie;
+        bool first_audio = true;
+        for (std::size_t i = 0; i < movie->tracks.size(); ++i) {
+            const auto& mt = movie->tracks[i];
+            if (mt.kind == container::Track::Kind::other) continue;
+            const auto track = alloc_init(track_class);
+            auto t = state<TrackState>(track);
+            t->asset = asset;
+            t->index = i;
+            t->id = mt.id ? static_cast<std::int32_t>(mt.id) : static_cast<std::int32_t>(i + 1);
+            if (mt.kind == container::Track::Kind::video) {
+                t->video = true;
+                t->decodable = codecs::video_decoder_available(mt.codec);
+                t->format_description = make_video_description(mt);
+            } else {
+                t->readable_audio = first_audio && !s->status;
+                t->decodable = t->readable_audio;
+                t->format_description = t->readable_audio ? make_format_description(stream_asbd, {}, cookie)
+                                                          : make_format_description(compressed_asbd(mt), {}, mt.config);
+                if (t->readable_audio) s->track = track;
+                first_audio = false;
+            }
+            s->tracks.push_back(track);
+        }
         return *s;
     }
-    Address make_format_description(const std::vector<std::uint8_t>& asbd, const std::vector<std::uint8_t>& layout) {
-        const auto asbd_at = support.process.allocate_guest(40, 8);
-        support.memory().write_bytes(asbd_at, asbd);
-        Address layout_at{};
-        if (!layout.empty()) { layout_at = support.process.allocate_guest(layout.size(), 8); support.memory().write_bytes(layout_at, layout); }
+    // An AudioStreamBasicDescription of a stored audio track Alchemy cannot decode (AAC, ALAC, ...).
+    static std::vector<std::uint8_t> compressed_asbd(const container::Track& t) {
+        std::vector<std::uint8_t> out(40, 0);
+        const double rate = t.sample_rate;
+        std::memcpy(out.data(), &rate, 8);
+        std::uint32_t format = t.codec == container::fourcc("mp4a") ? audio_file::four("aac ") : t.codec;
+        std::memcpy(out.data() + 8, &format, 4);
+        std::memcpy(out.data() + 28, &t.channels, 4);
+        return out;
+    }
+    // A CMVideoFormatDescription of a stored video track, with its codec configuration record as a
+    // sample-description extension atom (avcC, hvcC, av1C, vpcC).
+    Address make_video_description(const container::Track& t) {
+        Address extensions{};
+        const char* atom = t.codec == container::fourcc("avc1") ? "avcC" : t.codec == container::fourcc("hvc1") ? "hvcC"
+            : t.codec == container::fourcc("av01") ? "av1C" : t.codec == container::fourcc("vp09") ? "vpcC" : nullptr;
+        // Matroska stores VP9's CodecPrivate in its own form, not a vpcC record.
+        const bool record = atom && !t.config.empty() && !(t.codec == container::fourcc("vp09") && t.codec_name.starts_with("V_"));
+        if (record) {
+            const auto key = support.cf.string(atom), data = bridge->data(t.config);
+            const std::array<std::pair<Address, Address>, 1> atoms{{{key, data}}};
+            const auto inner = support.cf.dictionary(atoms);
+            const auto outer_key = support.cf.string("SampleDescriptionExtensionAtoms");
+            const std::array<std::pair<Address, Address>, 1> outer{{{outer_key, inner}}};
+            extensions = support.cf.dictionary(outer);
+            for (const auto object : {key, data, inner, outer_key}) support.release(object);
+        }
         const auto out = support.process.allocate_guest(8, 8);
         support.memory().write64(out, 0);
-        const auto result = support.call(core_media, "_CMAudioFormatDescriptionCreate", {0, asbd_at, layout.size(), layout_at, 0, 0, 0, out});
+        const auto result = support.call(core_media, "_CMVideoFormatDescriptionCreate", {0, t.codec, t.width, t.height, extensions, out});
+        const auto description = support.memory().read64(out);
+        support.process.release_guest(out);
+        if (extensions) support.release(extensions);
+        if (static_cast<std::int32_t>(result)) fail("CMVideoFormatDescriptionCreate failed for an asset's video track");
+        return description;
+    }
+    Address make_format_description(const std::vector<std::uint8_t>& asbd, const std::vector<std::uint8_t>& layout,
+                                    const std::vector<std::uint8_t>& cookie = {}) {
+        const auto asbd_at = support.process.allocate_guest(40, 8);
+        support.memory().write_bytes(asbd_at, asbd);
+        Address layout_at{}, cookie_at{};
+        if (!layout.empty()) { layout_at = support.process.allocate_guest(layout.size(), 8); support.memory().write_bytes(layout_at, layout); }
+        if (!cookie.empty()) { cookie_at = support.process.allocate_guest(cookie.size(), 8); support.memory().write_bytes(cookie_at, cookie); }
+        const auto out = support.process.allocate_guest(8, 8);
+        support.memory().write64(out, 0);
+        const auto result = support.call(core_media, "_CMAudioFormatDescriptionCreate",
+                                         {0, asbd_at, layout.size(), layout_at, cookie.size(), cookie_at, 0, out});
         const auto description = support.memory().read64(out);
         support.process.release_guest(out);
         support.process.release_guest(asbd_at);
         if (layout_at) support.process.release_guest(layout_at);
+        if (cookie_at) support.process.release_guest(cookie_at);
         if (static_cast<std::int32_t>(result)) fail("CMAudioFormatDescriptionCreate failed for an asset's format");
         return description;
     }
+    // The asset's duration: of its decoded audio for audio files (priming and padding removed),
+    // else the container's.
     Time duration_of(const AssetState& s) {
         if (!s.readable()) return time_invalid;
+        const bool has_video = std::any_of(s.tracks.begin(), s.tracks.end(), [this](Address t) { return state<TrackState>(t)->video; });
+        if (s.movie && (has_video || !s.audio_readable())) {
+            std::int64_t value = s.movie->duration;
+            std::int32_t timescale = static_cast<std::int32_t>(s.movie->timescale);
+            if (!value || timescale <= 0) {
+                // The longest track.
+                double seconds = 0;
+                for (const auto& t : s.movie->tracks)
+                    if (t.timescale) seconds = std::max(seconds, static_cast<double>(t.duration) / t.timescale);
+                value = std::llround(seconds * 600);
+                timescale = 600;
+            }
+            return {value, timescale, 1, 0};
+        }
         const auto rate = s.container.format.rate;
         if (rate == std::floor(rate) && rate > 0 && rate <= 0x7fffffff) return {static_cast<std::int64_t>(s.frames()), static_cast<std::int32_t>(rate), 1, 0};
         return {static_cast<std::int64_t>(std::llround(static_cast<double>(s.frames()) / rate * 1e6)), 1000000, 1 | 2, 0};
+    }
+    // A container track's time range in its own timescale.
+    std::pair<Time, Time> track_range(const AssetState& asset, const TrackState& t) {
+        if (!asset.movie || t.readable_audio) {
+            const auto duration = duration_of(asset);
+            return {{0, duration.timescale, 1, 0}, duration};
+        }
+        const auto& mt = asset.movie->tracks[t.index];
+        const auto scale = static_cast<std::int32_t>(mt.timescale ? mt.timescale : 1);
+        return {{0, scale, 1, 0}, {mt.duration, scale, 1, 0}};
     }
 
     // ---- asset reader --------------------------------------------------------------
@@ -237,6 +390,312 @@ struct Av {
     void close_output(OutputState& o) {
         close_guest_audio(support, o.file);
         if (o.format_description) { support.release(o.format_description); o.format_description = 0; }
+        close_guest_fd(support, std::exchange(o.fd, -1));
+        if (o.session) {
+            static_cast<void>(support.call(video_toolbox, "_VTDecompressionSessionInvalidate", {o.session}));
+            support.release(std::exchange(o.session, 0));
+        }
+        for (const auto& p : std::exchange(o.pictures, {})) support.release(p.image);
+    }
+
+    // ---- stored samples (container files) ----------------------------------------------
+    // A +1 CMSampleBuffer of the track's stored sample `index`: its bytes, timing and size, the
+    // track's format description, and kCMSampleAttachmentKey_NotSync on video samples that are
+    // not sync samples.
+    Address sample_buffer(OutputState& o, std::size_t index) {
+        const auto& mt = o.movie->tracks[o.track_index];
+        const auto& sample = mt.samples[index];
+        const auto fd = o.fd;
+        const auto bytes = container::read_sample([this, fd](std::uint64_t offset, std::span<std::uint8_t> out) { return read_guest(support, fd, offset, out); },
+                                                  mt, sample);
+        if (bytes.empty()) return 0;
+        auto& m = support.memory();
+        const auto block_out = support.process.allocate_guest(8, 8);
+        CallRegs create{};
+        create.x[2] = bytes.size();
+        create.x[6] = bytes.size();
+        create.x[7] = 1;   // kCMBlockBufferAssureMemoryNowFlag
+        create.push_stack(block_out);
+        if (static_cast<std::int32_t>(support.call(core_media, "_CMBlockBufferCreateWithMemoryBlock", create).x0)) fail("CMBlockBufferCreateWithMemoryBlock failed");
+        const auto block = m.read64(block_out);
+        const auto staging = support.process.allocate_guest(bytes.size(), 16);
+        m.write_bytes(staging, bytes);
+        static_cast<void>(support.call(core_media, "_CMBlockBufferReplaceDataBytes", {staging, block, 0, bytes.size()}));
+        support.process.release_guest(staging);
+        const auto timescale = static_cast<std::int32_t>(mt.timescale ? mt.timescale : 1);
+        const auto timing = support.process.allocate_guest(72 + 8, 8);
+        write_time(m, timing, {sample.duration, timescale, 1, 0});
+        write_time(m, timing + 24, {sample.pts, timescale, 1, 0});
+        write_time(m, timing + 48, {sample.dts, timescale, 1, 0});
+        m.write64(timing + 72, bytes.size());
+        const auto sample_out = support.process.allocate_guest(8, 8);
+        CallRegs ready{};
+        ready.x[1] = block; ready.x[2] = o.track_format; ready.x[3] = 1; ready.x[4] = 1; ready.x[5] = timing; ready.x[6] = 1; ready.x[7] = timing + 72;
+        ready.push_stack(sample_out);
+        const auto result = static_cast<std::int32_t>(support.call(core_media, "_CMSampleBufferCreateReady", ready).x0);
+        const auto buffer = m.read64(sample_out);
+        support.release(block);
+        support.process.release_guest(timing);
+        support.process.release_guest(sample_out);
+        support.process.release_guest(block_out);
+        if (result) fail("CMSampleBufferCreateReady failed");
+        if (mt.kind == container::Track::Kind::video && !sample.keyframe) {
+            const auto attachments = support.call(core_media, "_CMSampleBufferGetSampleAttachmentsArray", {buffer, 1});
+            const auto first = attachments ? support.cf.element(attachments, 0) : 0;
+            if (first) {
+                const auto key = support.cf.string("NotSync");
+                static_cast<void>(support.call(core_foundation, "_CFDictionarySetValue", {first, key, support.cf.boolean(true)}));
+                support.release(key);
+            }
+        }
+        return buffer;
+    }
+    // copyNextSampleBuffer for stored samples: as they are, or decoded pictures (in presentation
+    // order, those before the time range dropped) in CMSampleBuffers with their image buffers.
+    Address next_sample(Address output) {
+        auto o = state<OutputState>(output);
+        if (o->finished || !o->reader) return 0;
+        const auto finish = [&] {
+            o->finished = true;
+            close_output(*o);
+            finish_reader_if_done(o->reader);
+            return Address{0};
+        };
+        if (!o->session) {
+            while (o->next < o->last)
+                if (const auto buffer = sample_buffer(*o, o->next++)) return buffer;
+            return finish();
+        }
+        auto& m = support.memory();
+        for (;;) {
+            while (!o->pictures.empty()) {
+                const auto picture = o->pictures.front();
+                o->pictures.pop_front();
+                std::int64_t pts{};
+                std::memcpy(&pts, picture.pts.data(), 8);
+                if (pts < o->from) { support.release(picture.image); continue; }
+                const auto out = support.process.allocate_guest(8 + 72, 8);
+                m.write64(out, 0);
+                static_cast<void>(support.call(core_media, "_CMVideoFormatDescriptionCreateForImageBuffer", {0, picture.image, out}));
+                const auto format = m.read64(out);
+                const auto timing = out + 8;
+                m.write_bytes(timing, picture.duration);
+                m.write_bytes(timing + 24, picture.pts);
+                write_time(m, timing + 48, time_invalid);
+                m.write64(out, 0);
+                const auto result = static_cast<std::int32_t>(support.call(core_media, "_CMSampleBufferCreateReadyWithImageBuffer", {0, picture.image, format, timing, out}));
+                const auto buffer = m.read64(out);
+                support.process.release_guest(out);
+                support.release(format);
+                support.release(picture.image);
+                if (result) fail("CMSampleBufferCreateReadyWithImageBuffer failed");
+                return buffer;
+            }
+            if (o->next < o->last) {
+                const auto sample = sample_buffer(*o, o->next++);
+                if (!sample) continue;
+                const auto info = support.process.allocate_guest(8, 8);
+                static_cast<void>(support.call(video_toolbox, "_VTDecompressionSessionDecodeFrame", {o->session, sample, 0, 0, info}));
+                support.process.release_guest(info);
+                support.release(sample);
+            } else if (!o->drained) {
+                o->drained = true;
+                static_cast<void>(support.call(video_toolbox, "_VTDecompressionSessionFinishDelayedFrames", {o->session}));
+            } else {
+                return finish();
+            }
+        }
+    }
+    // startReading for a stored-sample output: the samples of the time range (video from the sync
+    // sample before it), and a decompression session when the output has settings.
+    std::int32_t start_samples(Address output, const AssetState& asset, const TrackState& t, const Time& start, const Time& duration) {
+        auto o = state<OutputState>(output);
+        std::uint64_t size{};
+        std::int32_t status{};
+        o->fd = open_guest_read(support, support.cf.url_path(asset.url), size, status);
+        if (o->fd < 0) return status;
+        o->samples = true;
+        o->movie = asset.movie;
+        o->track_index = t.index;
+        o->track_format = t.format_description;
+        o->drained = false;
+        const auto& mt = asset.movie->tracks[t.index];
+        const auto ticks = [&](const Time& time, std::int64_t fallback) -> std::int64_t {
+            if ((time.flags & 4) || !(time.flags & 1) || time.timescale <= 0) return fallback;
+            return static_cast<std::int64_t>(std::llround(static_cast<double>(time.value) / time.timescale * mt.timescale));
+        };
+        const auto from = std::max<std::int64_t>(0, ticks(start, 0));
+        const auto end = (duration.flags & 4) ? std::numeric_limits<std::int64_t>::max() : from + ticks(duration, std::numeric_limits<std::int64_t>::max() - from);
+        o->from = from;
+        std::size_t first = 0;
+        while (first < mt.samples.size() && mt.samples[first].pts + mt.samples[first].duration <= from) ++first;
+        if (t.video)
+            while (first > 0 && first < mt.samples.size() && !mt.samples[first].keyframe) --first;
+        std::size_t last = first;
+        while (last < mt.samples.size() && (mt.samples[last].pts < end || (t.video && mt.samples[last].dts < end))) ++last;
+        o->next = first;
+        o->last = last;
+        if (!o->settings) return 0;
+        // Decoded pictures through a session whose destination attributes are the output's settings.
+        auto& m = support.memory();
+        const auto record = support.process.allocate_guest(16 + 8, 8);
+        m.write64(record, picture_callback);
+        m.write64(record + 8, output);
+        m.write64(record + 16, 0);
+        const auto result = static_cast<std::int32_t>(support.call(video_toolbox, "_VTDecompressionSessionCreate",
+                                                                   {0, t.format_description, 0, o->settings, record, record + 16}));
+        o->session = m.read64(record + 16);
+        support.process.release_guest(record);
+        return result;
+    }
+    Address picture_callback{};        // the VTDecompressionOutputCallback of decoding outputs
+
+    // ---- image generation -------------------------------------------------------------
+    // copyCGImageAtTime's work: the picture of the asset's first decodable video track at or
+    // before `requested` (the sync sample before it when the tolerance before is unbounded), as a
+    // +1 CGImage within the generator's maximum size. 0 with an AVError code in `code`.
+    Address generate_image(const GeneratorState& g, const Time& requested, Time& actual, std::int64_t& code, std::string& why) {
+        const auto& asset = load(g.asset);
+        Address video{};
+        for (const auto t : asset.tracks)
+            if (state<TrackState>(t)->video && state<TrackState>(t)->decodable) { video = t; break; }
+        if (!video) {
+            const bool any_video = std::any_of(asset.tracks.begin(), asset.tracks.end(), [this](Address t) { return state<TrackState>(t)->video; });
+            code = any_video ? av_error_decoder_not_found : av_error_operation_not_supported_for_asset;
+            why = any_video ? "No decoder exists under Alchemy for the video track's format" : "The asset has no video track";
+            return 0;
+        }
+        const auto& mt = asset.movie->tracks[state<TrackState>(video)->index];
+        const double seconds = (requested.flags & 1) && requested.timescale > 0 ? static_cast<double>(requested.value) / requested.timescale : 0;
+        const auto target = static_cast<std::int64_t>(std::llround(std::max(0.0, seconds) * mt.timescale));
+        // The sync sample at or before the target: decoding starts there.
+        std::size_t key = 0;
+        for (std::size_t i = 0; i < mt.samples.size() && mt.samples[i].pts <= target; ++i)
+            if (mt.samples[i].keyframe) key = i;
+        if (mt.samples.empty()) { code = av_error_unknown; why = "The video track has no samples"; return 0; }
+        const bool to_sync = (g.before.flags & 4) && (g.after.flags & 4);
+        // A reader of BGRA pictures from that sample.
+        auto& m = support.memory();
+        const auto error_out = support.process.allocate_guest(8 + 48, 8);
+        m.write64(error_out, 0);
+        CallRegs make{};
+        make.x[2] = g.asset;
+        make.x[3] = error_out;
+        const auto reader = support.send(support.send_id(reader_class, "alloc"), "initWithAsset:error:", make).x0;
+        const auto key_name = support.cf.string("PixelFormatType"), bgra = support.cf.integer(audio_file::four("BGRA"));
+        const std::array<std::pair<Address, Address>, 1> entries{{{key_name, bgra}}};
+        const auto settings = support.cf.dictionary(entries);
+        support.release(key_name);
+        support.release(bgra);
+        CallRegs make_output{};
+        make_output.x[2] = video;
+        make_output.x[3] = settings;
+        const auto output = support.send(support.send_id(track_output_class, "alloc"), "initWithTrack:outputSettings:", make_output).x0;
+        support.release(settings);
+        Address best{};
+        Time best_time = time_invalid;
+        if (reader && output) {
+            CallRegs add{};
+            add.x[2] = output;
+            static_cast<void>(support.send(reader, "addOutput:", add));
+            const auto range = error_out + 8;
+            write_time(m, range, {mt.samples[key].pts, static_cast<std::int32_t>(mt.timescale), 1, 0});
+            write_time(m, range + 24, time_positive_infinity);
+            CallRegs set_range{};
+            set_range.x[2] = range;
+            static_cast<void>(support.send(reader, "setTimeRange:", set_range));
+            if (support.send_id(reader, "startReading") & 0xff) {
+                for (;;) {
+                    const auto sample = support.send_id(output, "copyNextSampleBuffer");
+                    if (!sample) break;
+                    const auto time_at = error_out + 8;
+                    CallRegs get_time{};
+                    get_time.x[0] = sample;
+                    get_time.indirect_result = time_at;
+                    static_cast<void>(support.call(core_media, "_CMSampleBufferGetPresentationTimeStamp", get_time));
+                    const auto pts = read_time(m, time_at);
+                    const auto ticks = pts.timescale > 0 ? static_cast<std::int64_t>(std::llround(static_cast<double>(pts.value) / pts.timescale * mt.timescale)) : 0;
+                    const bool usable = !best || ticks <= target;
+                    if (usable) {
+                        if (best) support.release(best);
+                        best = retain(support.call(core_media, "_CMSampleBufferGetImageBuffer", {sample}));
+                        best_time = pts;
+                    }
+                    support.release(sample);
+                    if (to_sync || ticks >= target) break;
+                }
+                static_cast<void>(support.send_id(reader, "cancelReading"));
+            }
+        }
+        if (output) support.release(output);
+        if (reader) support.release(reader);
+        support.process.release_guest(error_out);
+        if (!best) {
+            code = av_error_decoder_not_found;
+            why = "The video track's pictures could not be decoded";
+            return 0;
+        }
+        actual = best_time;
+        const auto image = cg_image(best, g.maximum_width, g.maximum_height);
+        support.release(best);
+        if (!image) { code = av_error_unknown; why = "The picture could not be made into an image"; }
+        return image;
+    }
+    // A +1 CGImage of a BGRA pixel buffer, scaled down (aspect kept) to fit a maximum size when one is set.
+    Address cg_image(Address buffer, double maximum_width, double maximum_height) {
+        namespace px = pixels;
+        auto& m = support.memory();
+        static_cast<void>(support.call(core_video, "_CVPixelBufferLockBaseAddress", {buffer, 1}));
+        const auto width = static_cast<std::uint32_t>(support.call(core_video, "_CVPixelBufferGetWidth", {buffer}));
+        const auto height = static_cast<std::uint32_t>(support.call(core_video, "_CVPixelBufferGetHeight", {buffer}));
+        const auto row = support.call(core_video, "_CVPixelBufferGetBytesPerRow", {buffer});
+        const auto base = support.call(core_video, "_CVPixelBufferGetBaseAddress", {buffer});
+        std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * 4 * height);
+        for (std::uint32_t y = 0; y < height && base; ++y)
+            m.read_bytes(base + y * row, std::span(pixels.data() + static_cast<std::size_t>(y) * width * 4, static_cast<std::size_t>(width) * 4));
+        static_cast<void>(support.call(core_video, "_CVPixelBufferUnlockBaseAddress", {buffer, 1}));
+        if (!base || !width || !height) return 0;
+        auto out_width = width, out_height = height;
+        if (maximum_width > 0 && maximum_height > 0 && (width > maximum_width || height > maximum_height)) {
+            const double scale = std::min(maximum_width / width, maximum_height / height);
+            out_width = std::max(1U, static_cast<std::uint32_t>(std::lround(width * scale)));
+            out_height = std::max(1U, static_cast<std::uint32_t>(std::lround(height * scale)));
+            px::Image in;
+            in.format = audio_file::four("BGRA");
+            in.width = width;
+            in.height = height;
+            in.planes = {{pixels.data(), static_cast<std::uint64_t>(width) * 4}};
+            const auto scaled = px::scale(px::to_rgba(in), width, height, out_width, out_height);
+            std::vector<std::uint8_t> smaller(static_cast<std::size_t>(out_width) * 4 * out_height);
+            px::Image out = in;
+            out.width = out_width;
+            out.height = out_height;
+            out.planes = {{smaller.data(), static_cast<std::uint64_t>(out_width) * 4}};
+            px::from_rgba(scaled, out);
+            pixels.swap(smaller);
+        }
+        const auto data = bridge->data(pixels);
+        const auto provider = support.call(core_graphics, "_CGDataProviderCreateWithCFData", {data});
+        support.release(data);
+        const auto space = support.call(core_graphics, "_CGColorSpaceCreateDeviceRGB", {});
+        // CGImageCreate(width, height, bitsPerComponent, bitsPerPixel, bytesPerRow, space, bitmapInfo, provider,
+        //     [stack] decode, shouldInterpolate, intent): BGRA in memory, alpha ignored.
+        CallRegs create{};
+        create.x[0] = out_width;
+        create.x[1] = out_height;
+        create.x[2] = 8;
+        create.x[3] = 32;
+        create.x[4] = static_cast<std::uint64_t>(out_width) * 4;
+        create.x[5] = space;
+        create.x[6] = (2U << 12) | 6;   // kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst
+        create.x[7] = provider;
+        create.push_stack(std::uint64_t{0});
+        create.push_stack(std::uint8_t{0});
+        create.push_stack(std::int32_t{0});
+        const auto image = support.call(core_graphics, "_CGImageCreate", create).x0;
+        static_cast<void>(support.call(core_graphics, "_CGColorSpaceRelease", {space}));
+        static_cast<void>(support.call(core_graphics, "_CGDataProviderRelease", {provider}));
+        return image;
     }
     // The client format of an output from its settings (nil: the track's format, or float32 for a mix).
     bool client_format(OutputState& o, const AssetState& asset) {
@@ -339,6 +798,17 @@ void install_av_foundation(Support& support) {
     auto av = std::make_shared<Av>(support);
     auto* sp = &support;
     const auto ns_object = "NSObject";
+    // The VTDecompressionOutputCallback of decoding reader outputs (refcon: the output): the
+    // pictures, retained, with their times.
+    av->picture_callback = support.process.install_function("__AlchemyAVAssetReaderOutputPicture", [av](CpuState& s, GuestMemory& m) {
+        const auto o = s.x[0] ? av->support.objc.find_host_state<OutputState>(s.x[0]) : nullptr;
+        if (!o || !s.x[4]) return;
+        OutputState::Picture picture;
+        picture.image = av->retain(s.x[4]);
+        m.read_bytes(s.x[5], picture.pts);
+        m.read_bytes(s.x[6], picture.duration);
+        o->pictures.push_back(picture);
+    }, std::string(av_foundation));
 
     // ---- AVAsset / AVURLAsset ---------------------------------------------------------
     av->asset_class = support.declare_class("AVAsset", ns_object, av_foundation);
@@ -367,24 +837,30 @@ void install_av_foundation(Support& support) {
     support.method(asset, "dealloc", [av, asset](CpuState& s, GuestMemory&) {
         if (const auto st = av->support.objc.find_host_state<AssetState>(s.x[0])) {
             av->release(std::exchange(st->url, 0));
-            av->release(std::exchange(st->track, 0));
+            st->track = 0;
+            for (const auto t : std::exchange(st->tracks, {})) av->release(t);
         }
         static_cast<void>(av->support.objc.send_super(s.x[0], asset, av->support.objc.selector("dealloc")));
     }, "v@:");
     // CMTime -duration (x8).
     support.method(asset, "duration", [av](CpuState& s, GuestMemory& m) { write_time(m, s.x[8], av->duration_of(av->load(s.x[0]))); }, "{?=qiIq}@:");
     support.method(asset, "tracks", [av](CpuState& s, GuestMemory&) {
-        const auto& st = av->load(s.x[0]);
-        s.x[0] = st.track ? av->autorelease(av->bridge->array({st.track})) : av->empty_array();
+        s.x[0] = av->autorelease(av->bridge->array(av->load(s.x[0]).tracks));
     }, "@@:");
     support.method(asset, "tracksWithMediaType:", [av](CpuState& s, GuestMemory&) {
         const auto& st = av->load(s.x[0]);
-        const bool audio = s.x[2] && av->support.cf.utf8(s.x[2]) == "soun";
-        s.x[0] = st.track && audio ? av->autorelease(av->bridge->array({st.track})) : av->empty_array();
+        const auto type = s.x[2] ? av->support.cf.utf8(s.x[2]) : std::string();
+        std::vector<Address> kept;
+        for (const auto t : st.tracks)
+            if ((type == "vide" && av->state<TrackState>(t)->video) || (type == "soun" && !av->state<TrackState>(t)->video)) kept.push_back(t);
+        s.x[0] = av->autorelease(av->bridge->array(kept));
     }, "@@:@");
     support.method(asset, "trackWithTrackID:", [av](CpuState& s, GuestMemory&) {
         const auto& st = av->load(s.x[0]);
-        s.x[0] = st.track && static_cast<std::int32_t>(s.x[2]) == 1 ? st.track : 0;
+        Address found{};
+        for (const auto t : st.tracks)
+            if (av->state<TrackState>(t)->id == static_cast<std::int32_t>(s.x[2])) found = t;
+        s.x[0] = found;
     }, "@@:i");
     for (const auto* name : {"commonMetadata", "metadata", "availableMetadataFormats", "availableChapterLocales", "chapterMetadataGroupsWithTitleLocale:containingItemsWithCommonKeys:"})
         support.method(asset, name, [av](CpuState& s, GuestMemory&) { s.x[0] = av->empty_array(); }, "@@:");
@@ -398,7 +874,7 @@ void install_av_foundation(Support& support) {
     support.method(asset, "statusOfValueForKey:error:", [av](CpuState& s, GuestMemory&) {
         const auto& st = av->load(s.x[0]);
         if (st.readable()) { s.x[0] = 2; return; }
-        av->store_error(s.x[3], av_error_file_format_not_recognized, "The media cannot be read under Alchemy (only linear PCM WAVE, AIFF and CAF files are)");
+        av->store_error(s.x[3], av_error_file_format_not_recognized, "The media cannot be read under Alchemy (no container or audio format it reads)");
         s.x[0] = 3;
     }, "q@:@^@");
     // -loadValuesAsynchronouslyForKeys:completionHandler: loads now; the handler runs on a global queue.
@@ -415,38 +891,88 @@ void install_av_foundation(Support& support) {
     }, "v@:@@?");
     support.method(asset, "cancelLoading", [](CpuState&, GuestMemory&) {}, "v@:");   // loading never runs in the background
 
-    // AVAssetTrack: the one audio track of a readable asset.
+    // AVAssetTrack: the audio track of a linear PCM file, or a container's video and audio tracks.
     support.method(track, "dealloc", [av, track](CpuState& s, GuestMemory&) {
         if (const auto st = av->support.objc.find_host_state<TrackState>(s.x[0])) av->support.release(std::exchange(st->format_description, 0));
         static_cast<void>(av->support.objc.send_super(s.x[0], track, av->support.objc.selector("dealloc")));
     }, "v@:");
     support.method(track, "asset", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<TrackState>(s.x[0])->asset; }, "@@:");
-    support.method(track, "mediaType", [av](CpuState& s, GuestMemory&) { s.x[0] = av->string("soun"); }, "@@:");
-    support.method(track, "trackID", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "i@:");
+    support.method(track, "mediaType", [av](CpuState& s, GuestMemory&) { s.x[0] = av->string(av->state<TrackState>(s.x[0])->video ? "vide" : "soun"); }, "@@:");
+    support.method(track, "trackID", [av](CpuState& s, GuestMemory&) { s.x[0] = static_cast<std::uint32_t>(av->state<TrackState>(s.x[0])->id); }, "i@:");
     support.method(track, "formatDescriptions", [av](CpuState& s, GuestMemory&) {
         s.x[0] = av->autorelease(av->bridge->array({av->state<TrackState>(s.x[0])->format_description}));
     }, "@@:");
-    // CMTimeRange -timeRange (x8): from zero for the asset's duration.
+    // The container track behind a track (null for linear PCM files).
+    const auto stored = [av](Address t) -> const container::Track* {
+        const auto ts = av->state<TrackState>(t);
+        const auto& asset = av->load(ts->asset);
+        return asset.movie ? &asset.movie->tracks[ts->index] : nullptr;
+    };
+    // CMTimeRange -timeRange (x8): from zero for the track's duration.
     support.method(track, "timeRange", [av](CpuState& s, GuestMemory& m) {
-        const auto owner = av->state<TrackState>(s.x[0])->asset;
-        const auto duration = av->duration_of(av->load(owner));
-        write_time(m, s.x[8], {0, duration.timescale, 1, 0});
+        const auto ts = av->state<TrackState>(s.x[0]);
+        const auto [start, duration] = av->track_range(av->load(ts->asset), *ts);
+        write_time(m, s.x[8], start);
         write_time(m, s.x[8] + 24, duration);
     }, "{?={?=qiIq}{?=qiIq}}@:");
     support.method(track, "naturalTimeScale", [av](CpuState& s, GuestMemory&) {
-        s.x[0] = static_cast<std::uint32_t>(av->duration_of(av->load(av->state<TrackState>(s.x[0])->asset)).timescale);
+        const auto ts = av->state<TrackState>(s.x[0]);
+        s.x[0] = static_cast<std::uint32_t>(av->track_range(av->load(ts->asset), *ts).second.timescale);
     }, "i@:");
-    support.method(track, "estimatedDataRate", [av](CpuState& s, GuestMemory&) {
-        const auto& st = av->load(av->state<TrackState>(s.x[0])->asset);
-        s.v[0] = {std::bit_cast<std::uint32_t>(static_cast<float>(st.container.format.rate * st.container.format.frame_bytes() * 8)), 0};
+    // Bits per second: of the stored samples, or of linear PCM.
+    support.method(track, "estimatedDataRate", [av, stored](CpuState& s, GuestMemory&) {
+        double rate = 0;
+        if (const auto* mt = stored(s.x[0])) {
+            std::uint64_t bytes = 0;
+            for (const auto& sample : mt->samples) bytes += sample.size;
+            const double seconds = mt->timescale && mt->duration ? static_cast<double>(mt->duration) / mt->timescale : 0;
+            rate = seconds > 0 ? static_cast<double>(bytes) * 8 / seconds : 0;
+        } else {
+            const auto& st = av->load(av->state<TrackState>(s.x[0])->asset);
+            rate = st.container.format.rate * st.container.format.frame_bytes() * 8;
+        }
+        s.v[0] = {std::bit_cast<std::uint32_t>(static_cast<float>(rate)), 0};
     }, "f@:");
-    support.method(track, "totalSampleDataLength", [av](CpuState& s, GuestMemory&) {
+    support.method(track, "totalSampleDataLength", [av, stored](CpuState& s, GuestMemory&) {
+        if (const auto* mt = stored(s.x[0])) {
+            std::uint64_t bytes = 0;
+            for (const auto& sample : mt->samples) bytes += sample.size;
+            s.x[0] = bytes;
+            return;
+        }
         s.x[0] = av->load(av->state<TrackState>(s.x[0])->asset).container.data_bytes;
     }, "q@:");
-    support.method(track, "nominalFrameRate", [](CpuState& s, GuestMemory&) { s.v[0] = {0, 0}; }, "f@:");
-    support.method(track, "naturalSize", [](CpuState& s, GuestMemory&) { s.v[0] = {0, 0}; s.v[1] = {0, 0}; }, "{CGSize=dd}@:");
-    for (const auto* name : {"isEnabled", "isDecodable", "isSelfContained"})
+    // Frames per second of a video track (its samples over its duration).
+    support.method(track, "nominalFrameRate", [av, stored](CpuState& s, GuestMemory&) {
+        float rate = 0;
+        if (const auto* mt = stored(s.x[0]); mt && av->state<TrackState>(s.x[0])->video && mt->duration > 0 && mt->timescale)
+            rate = static_cast<float>(static_cast<double>(mt->samples.size()) * mt->timescale / static_cast<double>(mt->duration));
+        s.v[0] = {std::bit_cast<std::uint32_t>(rate), 0};
+    }, "f@:");
+    // CMTime -minFrameDuration (x8): a video track's shortest sample duration.
+    support.method(track, "minFrameDuration", [av, stored](CpuState& s, GuestMemory& m) {
+        Time value = time_invalid;
+        if (const auto* mt = stored(s.x[0]); mt && av->state<TrackState>(s.x[0])->video && !mt->samples.empty()) {
+            std::uint32_t shortest = std::numeric_limits<std::uint32_t>::max();
+            for (const auto& sample : mt->samples) if (sample.duration) shortest = std::min(shortest, sample.duration);
+            if (shortest != std::numeric_limits<std::uint32_t>::max()) value = {shortest, static_cast<std::int32_t>(mt->timescale), 1, 0};
+        }
+        write_time(m, s.x[8], value);
+    }, "{?=qiIq}@:");
+    support.method(track, "naturalSize", [av, stored](CpuState& s, GuestMemory&) {
+        double width = 0, height = 0;
+        if (const auto* mt = stored(s.x[0]); mt && av->state<TrackState>(s.x[0])->video) { width = mt->width; height = mt->height; }
+        s.v[0] = {std::bit_cast<std::uint64_t>(width), 0};
+        s.v[1] = {std::bit_cast<std::uint64_t>(height), 0};
+    }, "{CGSize=dd}@:");
+    // CGAffineTransform -preferredTransform (48 bytes, x8): identity (no track matrix is applied).
+    support.method(track, "preferredTransform", [](CpuState& s, GuestMemory& m) {
+        const std::array<double, 6> identity{1, 0, 0, 1, 0, 0};
+        for (std::size_t i = 0; i < identity.size(); ++i) m.write64(s.x[8] + 8 * i, std::bit_cast<std::uint64_t>(identity[i]));
+    }, "{CGAffineTransform=dddddd}@:");
+    for (const auto* name : {"isEnabled", "isSelfContained"})
         support.method(track, name, [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
+    support.method(track, "isDecodable", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<TrackState>(s.x[0])->decodable ? 1 : 0; }, "B@:");
     support.method(track, "isPlayable", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");   // there is no AVPlayer
     for (const auto* name : {"commonMetadata", "metadata", "availableMetadataFormats"})
         support.method(track, name, [av](CpuState& s, GuestMemory&) { s.x[0] = av->empty_array(); }, "@@:");
@@ -467,7 +993,7 @@ void install_av_foundation(Support& support) {
     support.method(reader, "initWithAsset:error:", [av](CpuState& s, GuestMemory&) {
         if (!s.x[2]) unsupported("-[AVAssetReader initWithAsset:error:] with a nil asset");
         if (!av->load(s.x[2]).readable()) {
-            av->store_error(s.x[3], av_error_file_format_not_recognized, "Cannot Open (Alchemy reads only linear PCM WAVE, AIFF and CAF media)");
+            av->store_error(s.x[3], av_error_file_format_not_recognized, "Cannot Open (no track of the media can be read under Alchemy)");
             av->release(s.x[0]);
             s.x[0] = 0;
             return;
@@ -532,15 +1058,29 @@ void install_av_foundation(Support& support) {
         };
         const auto first = frame_at(r->start);
         const auto last = (r->duration.flags & 4) ? frames : std::min<std::uint64_t>(frames, first + frame_at(r->duration));
+        const auto failed = [&](Address error) {
+            r->status = 3;   // AVAssetReaderStatusFailed
+            r->error = error;
+            s.x[0] = 0;
+        };
         for (const auto o : r->outputs) {
             auto os = av->state<OutputState>(o);
-            av->client_format(*os, asset);
-            if (const auto result = open_guest_audio(av->support, av->support.cf.url_path(av->state<AssetState>(r->asset)->url), os->file)) {
-                r->status = 3;   // AVAssetReaderStatusFailed
-                r->error = av->bridge->os_status_error(result, "The media file could not be opened again for reading");
-                s.x[0] = 0;
-                return;
+            const auto& t = *av->state<TrackState>(os->tracks.front());
+            // Video, and stored audio read as it is (no settings) or that has no decoder: samples.
+            if (t.video || !t.readable_audio || (asset.movie && !os->settings && !os->mix)) {
+                if (os->settings && !t.decodable)
+                    return failed(av->bridge->error("AVFoundationErrorDomain", av_error_decoder_not_found,
+                                                    "No decoder exists under Alchemy for the track's format"));
+                if (!t.video && os->settings)
+                    return failed(av->bridge->error("AVFoundationErrorDomain", av_error_decoder_not_found, "The audio track's format has no decoder"));
+                if (const auto result = av->start_samples(o, asset, t, r->start, r->duration))
+                    return failed(av->bridge->os_status_error(result, "The media could not be read"));
+                os->finished = false;
+                continue;
             }
+            av->client_format(*os, asset);
+            if (const auto result = open_guest_audio(av->support, av->support.cf.url_path(av->state<AssetState>(r->asset)->url), os->file))
+                return failed(av->bridge->os_status_error(result, "The media file could not be opened again for reading"));
             os->position = first;
             os->end = last;
             os->finished = false;
@@ -570,9 +1110,13 @@ void install_av_foundation(Support& support) {
         const auto o = av->state<OutputState>(s.x[0]);
         if (!o->reader || av->state<ReaderState>(o->reader)->status == 0)
             fail("-[AVAssetReaderOutput copyNextSampleBuffer] before -[AVAssetReader startReading] (NSInternalInconsistencyException)");
-        s.x[0] = av->next_buffer(s.x[0]);
+        s.x[0] = o->samples ? av->next_sample(s.x[0]) : av->next_buffer(s.x[0]);
     }, "^{opaqueCMSampleBuffer=}@:");
-    support.method(output, "mediaType", [av](CpuState& s, GuestMemory&) { s.x[0] = av->string("soun"); }, "@@:");
+    support.method(output, "mediaType", [av](CpuState& s, GuestMemory&) {
+        const auto o = av->state<OutputState>(s.x[0]);
+        const bool video = !o->tracks.empty() && av->state<TrackState>(o->tracks.front())->video;
+        s.x[0] = av->string(video ? "vide" : "soun");
+    }, "@@:");
     support.method(output, "alwaysCopiesSampleData", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<OutputState>(s.x[0])->always_copies; }, "B@:");
     support.method(output, "setAlwaysCopiesSampleData:", [av](CpuState& s, GuestMemory&) { av->state<OutputState>(s.x[0])->always_copies = (s.x[2] & 0xff) != 0; }, "v@:B");
     support.method(output, "supportsRandomAccess", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
@@ -646,16 +1190,79 @@ void install_av_foundation(Support& support) {
     }, "v@:{CGSize=dd}");
     support.method(generator, "setRequestedTimeToleranceBefore:", [av](CpuState& s, GuestMemory& m) { av->state<GeneratorState>(s.x[0])->before = read_time(m, s.x[2]); }, "v@:{?=qiIq}");
     support.method(generator, "setRequestedTimeToleranceAfter:", [av](CpuState& s, GuestMemory& m) { av->state<GeneratorState>(s.x[0])->after = read_time(m, s.x[2]); }, "v@:{?=qiIq}");
-    // -copyCGImageAtTime:actualTime:error: (CMTime by reference in x2): no video decoder exists.
+    // -copyCGImageAtTime:actualTime:error: (CMTime by reference in x2): a +1 CGImage, decoded now.
     support.method(generator, "copyCGImageAtTime:actualTime:error:", [av](CpuState& s, GuestMemory& m) {
         const auto st = av->state<GeneratorState>(s.x[0]);
         if (s.x[3]) write_time(m, s.x[3], time_invalid);
-        const bool audio_only = st->asset && av->load(st->asset).readable();
-        if (audio_only) av->store_error(s.x[4], av_error_operation_not_supported_for_asset, "The asset has no video track");
-        else av->store_error(s.x[4], av_error_decoder_not_found, "No video decoder exists under Alchemy");
-        s.x[0] = 0;
+        Time actual = time_invalid;
+        std::int64_t code{};
+        std::string why;
+        const auto image = st->asset ? av->generate_image(*st, read_time(m, s.x[2]), actual, code, why) : 0;
+        if (!image) av->store_error(s.x[4], code ? code : av_error_unknown, why.empty() ? "The generator has no asset" : why);
+        else if (s.x[3]) write_time(m, s.x[3], actual);
+        s.x[0] = image;
     }, "^{CGImage=}@:{?=qiIq}^{?=qiIq}^@");
-    support.method(generator, "cancelAllCGImageGeneration", [](CpuState&, GuestMemory&) {}, "v@:");   // nothing is ever generating
+    // -generateCGImagesAsynchronouslyForTimes:completionHandler: (NSValues of CMTimes): each image in
+    // turn on a global queue, to handler(CMTime requested, CGImageRef, CMTime actual, result, NSError *)
+    // with the CMTimes by reference. AVAssetImageGeneratorSucceeded 0, Failed 1.
+    support.method(generator, "generateCGImagesAsynchronouslyForTimes:completionHandler:", [av](CpuState& s, GuestMemory& m) {
+        if (!s.x[3]) return;
+        const auto self = av->retain(s.x[0]);
+        std::vector<Time> times;
+        for (const auto value : s.x[2] ? av->support.cf.array_values(s.x[2]) : std::vector<Address>{}) {
+            const auto at = av->support.process.allocate_guest(24, 8);
+            CallRegs r{};
+            r.x[2] = at;
+            static_cast<void>(av->support.send(value, "getValue:", r));
+            times.push_back(read_time(m, at));
+            av->support.process.release_guest(at);
+        }
+        const auto block = av->bridge->block_copy(s.x[3]);
+        const auto queue = av->support.call(libsystem, "_dispatch_get_global_queue", {0, 0});
+        av->bridge->dispatch_async(queue, [av, self, block, times] {
+            auto& memory = av->support.memory();
+            for (const auto& requested : times) {
+                Time actual = time_invalid;
+                std::int64_t code{};
+                std::string why;
+                const auto image = av->generate_image(*av->state<GeneratorState>(self), requested, actual, code, why);
+                const auto error = image ? 0 : av->bridge->error("AVFoundationErrorDomain", code ? code : av_error_unknown, why);
+                const auto times_at = av->support.process.allocate_guest(48, 8);
+                write_time(memory, times_at, requested);
+                write_time(memory, times_at + 24, actual);
+                static_cast<void>(av->bridge->invoke_block(block, {times_at, image, times_at + 24, image ? 0U : 1U, error}));
+                av->support.process.release_guest(times_at);
+                if (image) av->support.release(image);
+                if (error) av->support.release(error);
+            }
+            av->bridge->block_release(block);
+            av->release(self);
+        });
+    }, "v@:@@?");
+    // -generateCGImageAsynchronouslyForTime:completionHandler: handler(CGImageRef, CMTime actual, NSError *).
+    support.method(generator, "generateCGImageAsynchronouslyForTime:completionHandler:", [av](CpuState& s, GuestMemory& m) {
+        if (!s.x[3]) return;
+        const auto self = av->retain(s.x[0]);
+        const auto requested = read_time(m, s.x[2]);
+        const auto block = av->bridge->block_copy(s.x[3]);
+        const auto queue = av->support.call(libsystem, "_dispatch_get_global_queue", {0, 0});
+        av->bridge->dispatch_async(queue, [av, self, block, requested] {
+            Time actual = time_invalid;
+            std::int64_t code{};
+            std::string why;
+            const auto image = av->generate_image(*av->state<GeneratorState>(self), requested, actual, code, why);
+            const auto error = image ? 0 : av->bridge->error("AVFoundationErrorDomain", code ? code : av_error_unknown, why);
+            const auto at = av->support.process.allocate_guest(24, 8);
+            write_time(av->support.memory(), at, actual);
+            static_cast<void>(av->bridge->invoke_block(block, {image, at, error}));
+            av->support.process.release_guest(at);
+            if (image) av->support.release(image);
+            if (error) av->support.release(error);
+            av->bridge->block_release(block);
+            av->release(self);
+        });
+    }, "v@:{?=qiIq}@?");
+    support.method(generator, "cancelAllCGImageGeneration", [](CpuState&, GuestMemory&) {}, "v@:");   // requests already run in order
 
     // ---- AVMetadataItem ---------------------------------------------------------------------
     av->metadata_class = support.declare_class("AVMetadataItem", ns_object, av_foundation);

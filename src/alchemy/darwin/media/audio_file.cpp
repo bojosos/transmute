@@ -502,6 +502,22 @@ std::int32_t open_audio_stream(GuestAudio& audio, ReadAt read, std::int32_t pcm_
     return 0;
 }
 
+std::int64_t open_guest_read(Support& support, const std::string& path, std::uint64_t& size, std::int32_t& status) {
+    const auto fd = open_guest(support, path, 0, status);
+    size = 0;
+    if (fd < 0) {
+        if (status != permissions_error) status = error::file_not_found;
+        return -1;
+    }
+    const auto end = static_cast<std::int64_t>(support.call(libsystem, "_lseek", {static_cast<Address>(fd), 0, 2}));
+    size = end > 0 ? static_cast<std::uint64_t>(end) : 0;
+    return fd;
+}
+
+void close_guest_fd(Support& support, std::int64_t fd) {
+    if (fd >= 0) static_cast<void>(support.call(libsystem, "_close", {static_cast<Address>(fd)}));
+}
+
 void close_guest_audio(Support& support, GuestAudio& audio) {
     if (audio.fd >= 0) static_cast<void>(support.call(libsystem, "_close", {static_cast<Address>(std::exchange(audio.fd, -1))}));
 }
