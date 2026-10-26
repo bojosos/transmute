@@ -77,6 +77,8 @@ Address decode_reference(AppKit& kit, const std::shared_ptr<NibLoad>& load, cons
     return instantiate(kit, load, static_cast<std::uint32_t>(value->integer), coder);
 }
 
+// A color's components; NSCustomColorSpace (the color's NSColorSpace object)
+// is not read: the components are taken in the NSColorSpace model below.
 drawing::Color color_from(AppKit& kit, const nib::Archive& archive, std::uint32_t index) {
     const auto space = archive.find(index, "NSColorSpace");
     const auto space_id = space ? space->integer : 1;
@@ -200,6 +202,8 @@ Address make_value(AppKit& kit, const std::shared_ptr<NibLoad>& load, std::uint3
         if (const auto* size = archive.find(index, "NSSize")) spec.size = size->is_real() ? size->real : static_cast<double>(size->integer);
         const auto lower = [&] { std::string s; for (const auto c : spec.name) s += static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return s; }();
         spec.bold = lower.find("bold") != std::string::npos;
+        // Not read: NSfFlags, NSHasWidth, NSFontUsesAppearanceFontSize and
+        // NSTextStyleDescriptor (a text style's descriptor, design-time).
         return kit.retain(kit.font_object(spec));
     }
     if (name == "NSAppearance") {
@@ -255,7 +259,11 @@ Address make_value(AppKit& kit, const std::shared_ptr<NibLoad>& load, std::uint3
     }
     if (name == "NSButtonImageSource" || name == "NSNibTouchBar" || name == "NSFontDescriptor" || name == "NSValue") {
         // Values AppKit draws without: button image sources (decoded with
-        // their button cell), Touch Bars, design-time values.
+        // their button cell), Touch Bars, design-time values: NSValue is
+        // the IBDesignSize of an NSCustomResource (NS.special 2 with an
+        // NS.sizeval string), NSFontDescriptor an NSFont's
+        // NSTextStyleDescriptor (NSFontDescriptorAttributes,
+        // NSFontDescriptorOptions); the font is its NSName at NSSize.
         return 0;
     }
     handled = false;
@@ -498,7 +506,8 @@ void establish_connector(AppKit& kit, const std::shared_ptr<NibLoad>& load, cons
     }
     if (name == "NSNibBindingConnector") {
         // Cocoa bindings: -bind:toObject:withKeyPath:options: (Foundation's
-        // key-value binding provider implements it).
+        // key-value binding provider implements it). NSPreviousConnector
+        // (Interface Builder's connector order) is not read.
         const auto source = object("NSSource");
         const auto destination = object("NSDestination");
         const auto binding = text_at("NSBinding");
@@ -957,8 +966,42 @@ void AppKit::install_nib_coding() {
         s.x[0] = self;
         const auto a = access(s.x[2]);
         if (const auto made = a.object("NSCell")) static_cast<void>(send_id(self, "setCell:", {made}));
-        if (const auto target = control_cell(*this, self); target && a.value("NSEnabled"))
-            cell_state(*this, target)->enabled = a.flag("NSEnabled", true);
+        if (const auto target = control_cell(*this, self)) {
+            const auto cs = cell_state(*this, target);
+            if (a.value("NSEnabled")) cs->enabled = a.flag("NSEnabled", true);
+            // Interface Builder repeats the cell's settings on the control.
+            if (a.value("NSControlSendActionMask")) cs->send_action_mask = static_cast<std::uint64_t>(a.integer("NSControlSendActionMask"));
+            if (a.value("NSControlLineBreakMode")) cs->line_break = a.integer("NSControlLineBreakMode");
+            if (a.value("NSControlRefusesFirstResponder")) cs->refuses_first_responder = a.flag("NSControlRefusesFirstResponder");
+            if (a.value("NSControlUsesSingleLineMode")) cs->single_line = a.flag("NSControlUsesSingleLineMode");
+            if (a.value("NSControlWritingDirection")) cs->writing_direction = a.integer("NSControlWritingDirection");
+        } else {
+            // Controls without a cell (NSTableView, NSScroller) keep target and action themselves.
+            const auto state = extension<ControlState>(self);
+            if (const auto target = a.object("NSControlTarget")) state->target = target;
+            if (const auto action_name = a.string("NSControlAction")) state->action = sel(*action_name);
+            if (a.value("NSControlRefusesFirstResponder")) state->refuses_first_responder = a.flag("NSControlRefusesFirstResponder");
+        }
+        // Not read: NSControlContinuous (archived as the complement of the
+        // cell's continuous flag, NSCellFlags 0x40000, which is read),
+        // NSControlTextAlignment (the cell's NSCellFlags2 alignment),
+        // NSAllowsLogicalLayoutDirection (left and right are not swapped
+        // in right-to-left layouts), NSControlAllowsExpansionToolTips (no
+        // expansion tool tips), NSStepperMinValue, NSStepperMaxValue,
+        // NSStepperIncrement, NSStepperWraps and NSStepperAutorepeat (an
+        // NSStepper archives them as zeros; its NSStepperCell's NSMinValue,
+        // NSMaxValue, NSIncrement, NSValueWraps and NSAutorepeat are read),
+        // IBNSShadowedSymbolConfiguration and NSControlContents (SF Symbol
+        // configurations and NSSwitch's design-time state).
+        // NSImageView's NSImageViewPlaceholderPrecedence is not read (no placeholder images).
+        if (is_kind(self, text_field)) {
+            if (const auto target = control_cell(*this, self); target && a.value("NSPreferredMaxLayoutWidth"))
+                cell_state(*this, target)->preferred_max_width = a.real("NSPreferredMaxLayoutWidth");
+            // Not read: NSControlAutosetMaxLayoutWidth (the width is not set
+            // automatically), NSAllowsWritingTools and
+            // NSTextFieldAllowsWritingToolsAffordance (no Writing Tools),
+            // NSTextFieldAlignmentRectInsetsVersion (alignment rects are frames).
+        }
     });
     // NSCell: contents, font and the packed flags.
     method(cell, "initWithCoder:", [this, access](CpuState& s, GuestMemory&) {
@@ -978,6 +1021,7 @@ void AppKit::install_nib_coding() {
         state->enabled = (flags & 0x20000000) == 0;
         state->highlighted = (flags & 0x40000000) != 0;
         state->state = (flags & 0x80000000) ? state_on : state_off;
+        state->continuous = (flags & 0x40000) != 0;
         state->allows_mixed = (flags2 & 0x1000000) != 0;
         state->alignment = static_cast<std::int64_t>((flags2 >> 26) & 7);
         state->control_size = a.integer("NSControlSize2", a.integer("NSControlSize"));
@@ -1022,6 +1066,18 @@ void AppKit::install_nib_coding() {
         if (const auto alternate = a.object("NSAlternateContents")) release(std::exchange(state->alternate_title, cf.copy(alternate)));
         if (const auto key = a.object("NSKeyEquivalent")) release(std::exchange(state->key_equivalent, cf.copy(key)));
         state->key_modifier_mask = static_cast<std::uint64_t>(a.integer("NSKeyEquivModMask"));
+        // NSAuxButtonType is the button type; the highlight and state
+        // masks follow it as -setButtonType: sets them.
+        if (a.value("NSAuxButtonType")) static_cast<void>(send_id(self, "setButtonType:", {static_cast<Address>(a.integer("NSAuxButtonType"))}));
+        if (const auto alternate = a.archive().object_at(a.current(), "NSAlternateImage");
+            alternate && a.archive().class_name(*alternate) != "NSButtonImageSource")
+            if (const auto picture = a.object("NSAlternateImage")) assign(state->alternate_image, picture);
+        // Milliseconds in the archive.
+        if (a.value("NSPeriodicDelay")) state->periodic_delay = a.real("NSPeriodicDelay") / 1000;
+        if (a.value("NSPeriodicInterval")) state->periodic_interval = a.real("NSPeriodicInterval") / 1000;
+        // Not read: NSButtonFlags2 (its bezel and key-equivalent bits repeat
+        // NSBezelStyle and NSKeyEquivModMask), NSAccessibilityOverriddenAttributes
+        // (no assistive-technology host).
         if (state->button_type == button_type::switch_ || state->button_type == button_type::radio) state->alignment = 4;
         else if (state->alignment == 4) state->alignment = 2;
     });
@@ -1032,6 +1088,8 @@ void AppKit::install_nib_coding() {
         const auto a = access(s.x[2]);
         const auto state = cell_state(*this, self);
         state->draws_background = a.flag("NSDrawsBackground", false);
+        // Not read: NSAutomaticTextCompletionDisabled (no text completion),
+        // NSCellIdentifier (a cell-based column's design-time identifier).
         if (!state->contents) state->contents = string("");
     });
     // NSPopUpButtonCell: its menu and selection.
@@ -1047,6 +1105,24 @@ void AppKit::install_nib_coding() {
             for (std::size_t i = 0; i < list.size(); ++i) if (list[i] == chosen) state->selected_item = static_cast<std::int64_t>(i);
         }
         if (a.value("NSSelectedIndex")) state->selected_item = a.integer("NSSelectedIndex");
+        if (a.value("NSPreferredEdge")) state->preferred_edge = static_cast<std::uint64_t>(a.integer("NSPreferredEdge"));
+        if (a.value("NSArrowPosition")) state->arrow_position = static_cast<std::uint64_t>(a.integer("NSArrowPosition"));
+        if (a.value("NSAltersState")) state->alters_state = a.flag("NSAltersState");
+        if (a.value("NSUsesItemFromMenu")) state->uses_item_from_menu = a.flag("NSUsesItemFromMenu");
+        // Not read: NSMenuItemRespectAlignment (item titles are not aligned to the cell's text).
+    });
+    // NSImageCell: alignment, scaling and frame style.
+    method(image_cell, "initWithCoder:", [this, access, super_init](CpuState& s, GuestMemory&) {
+        const auto self = super_init(s.x[0], image_cell, s.x[2]);
+        s.x[0] = self;
+        const auto a = access(s.x[2]);
+        const auto state = cell_state(*this, self);
+        state->kind = CellState::Kind::image;
+        if (a.value("NSAlign")) state->image_alignment = static_cast<std::uint64_t>(a.integer("NSAlign"));
+        if (a.value("NSScale")) state->image_scaling = a.integer("NSScale");
+        if (a.value("NSStyle")) state->image_frame = a.integer("NSStyle") != 0;
+        // Not read: NSImageAnimation (animated images show their first frame),
+        // NSContentTintColor (the cell's tint, kept on NSImageView).
     });
     // NSSliderCell / NSStepperCell: the numeric range and value.
     method(slider_cell, "initWithCoder:", [this, access, super_init](CpuState& s, GuestMemory&) {
@@ -1090,6 +1166,7 @@ void AppKit::install_nib_coding() {
         state->uses_data_source = a.flag("NSUsesDataSource");
         state->completes = a.flag("NSCompletes");
         state->has_vertical_scroller = a.flag("NSHasVerticalScroller", true);
+        // Not read: NSAutomaticTextCompletionStored (no text completion).
         if (const auto source = a.object("NSDataSource")) state->data_source = source;
         if (const auto list = a.object("NSPopUpListData"))
             for (const auto value : items(list)) if (value) state->combo_items.push_back(retain(value));
@@ -1102,6 +1179,8 @@ void AppKit::install_nib_coding() {
         if (const auto list = a.object("NSMenuItems"))
             for (const auto item : items(list)) if (item) static_cast<void>(send_id(self, "addItem:", {item}));
         if (a.value("NSNoAutoenable")) static_cast<void>(send_id(self, "setAutoenablesItems:", {a.flag("NSNoAutoenable") ? 0u : 1u}));
+        if (a.value("NSMenuExcludeMarkColumn"))
+            static_cast<void>(send_id(self, "setShowsStateColumn:", {a.flag("NSMenuExcludeMarkColumn") ? 0u : 1u}));
     });
     method(menu_item, "initWithCoder:", [this, access](CpuState& s, GuestMemory&) {
         const auto a = access(s.x[2]);
@@ -1123,6 +1202,19 @@ void AppKit::install_nib_coding() {
         if (a.flag("NSIsHidden")) static_cast<void>(send_id(self, "setHidden:", {1}));
         if (const auto target = a.object("NSTarget")) static_cast<void>(send_id(self, "setTarget:", {target}));
         if (const auto submenu = a.object("NSSubmenu")) static_cast<void>(send_id(self, "setSubmenu:", {submenu}));
+        // The identifier and state images are the value kit's NSMenuItem
+        // properties (darwin/appkit/menus.cpp), installed in every alchemy-fx process.
+        for (const auto& [key, setter] : {std::pair{"NSMenuItemIdentifier", "setIdentifier:"}, std::pair{"NSOnImage", "setOnStateImage:"},
+                                          std::pair{"NSMixedImage", "setMixedStateImage:"}})
+            if (const auto value = a.object(key)) {
+                CallRegs registers;
+                registers.x[2] = value;
+                static_cast<void>(send_optional(self, setter, registers));
+            }
+        // Not read: NSMnemonicLoc (no mnemonics), NSHiddenInRepresentation
+        // (no alternate representations), NSAllowsKeyEquivalentLocalization
+        // and NSAllowsKeyEquivalentMirroring (key equivalents are not
+        // localized or mirrored).
     });
     // NSProgressIndicator.
     method(progress_indicator, "initWithCoder:", [this, access, super_init](CpuState& s, GuestMemory&) {
@@ -1136,6 +1228,7 @@ void AppKit::install_nib_coding() {
         state->min_value = a.real("NSMinValue", 0);
         state->max_value = a.real("NSMaxValue", 100);
         state->value = a.real("NSProgressIndicatorDoubleValue", a.real("NSValue", state->min_value));
+        // Not read: NSViewContentFilters (Core Image content filters are not applied).
     });
     // NSBox.
     method(box, "initWithCoder:", [this, access, super_init](CpuState& s, GuestMemory&) {
@@ -1152,6 +1245,10 @@ void AppKit::install_nib_coding() {
         if (const auto fill_color = a.object("NSFillColor2")) assign(state->fill_color, fill_color);
         if (const auto border_color = a.object("NSBorderColor2")) assign(state->border_color, border_color);
         if (a.value("NSCornerRadius2")) state->corner_radius = a.real("NSCornerRadius2", 5);
+        state->box_transparent = a.flag("NSTransparent");
+        if (const auto offsets = a.string("NSOffsets"))   // "{width, height}"
+            if (const auto n = nib::parse_numbers(*offsets); n && n->size() == 2) state->box_margins = {(*n)[0], (*n)[1]};
+        // Not read: IBNSBoxIsUsingDocumentContentView (Interface Builder's editing state).
     });
 }
 

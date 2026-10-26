@@ -39,6 +39,19 @@ delegate with an NSCocoaErrorDomain error), and Finder tags in save panels
 so -[NSToolbarItem isVisible] is NO; restorable state is encoded and restored
 on request but not kept between launches.
 
+**Nib keys:** the decoders read the keys Interface Builder archives for the
+controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
+decoder names the keys it leaves out and why (design-time values, features
+not modelled such as Writing Tools or text completion). The control-level
+copies of cell settings are applied to the cell; NSControlContinuous and
+NSStepper's range keys are not (archived as the complement of the cell's
+flag, and as zeros). Kept but without effect: table styles and automatic
+row heights, pop-up arrow positions, button periodic delays (buttons do not
+repeat while held), scroll-view magnification bounds (documents draw at
+magnification 1; another magnification stops explicitly).
+NSUserDefaultsController applies changes immediately even when a nib says
+NSAppliesImmediately NO (deferred application is not modelled).
+
 ## Moved from darwin/identities/
 
 * `constants_and_shells.cpp`: pasteboard, document and notification constants, NSBitsPerPixelFromDepth, NSStatusBar/NSStackView shells (the support kit).

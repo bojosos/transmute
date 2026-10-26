@@ -174,6 +174,8 @@ void install_search_field(AppKit& kit) {
         const Decoder in{*k, s.x[2]};
         const auto state = search_of(*k, self);
         if (const auto button = in.object("NSSearchButtonCell")) k->assign(state->search_button, button);
+        // Not read: NSSearchFieldFlags (the sending and recents options are
+        // separate keys), NSAutomaticTextCompletionStored (no text completion).
         if (const auto button = in.object("NSCancelButtonCell")) k->assign(state->cancel_button, button);
         make_buttons(self);
         state->maximum_recents = in.integer("NSMaximumRecents", state->maximum_recents);

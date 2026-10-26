@@ -330,6 +330,10 @@ void AppKit::install_user_defaults_controller() {
             return;
         }
         const auto self = objc.send_super(s.x[0], udc, sel("init")).x0;
+        // Not read: NSDeclaredKeys (Interface Builder's list of bound keys) and
+        // NSAppliesImmediately: changes apply immediately even when the archive
+        // says NO, since deferred application (-hasUnappliedChanges, -save:,
+        // -revert:) is not modelled.
         s.x[0] = self ? initialize(self, 0, 0) : 0;
     }, "@@:@");
     method(udc, "defaults", [state_of](CpuState& s, GuestMemory&) { s.x[0] = state_of(s.x[0])->defaults; });

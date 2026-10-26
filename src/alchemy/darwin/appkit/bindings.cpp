@@ -502,6 +502,8 @@ void install_bindings(Support& support) {
         flag("NSSelectsInsertedObjects", state->selects_inserted);
         flag("NSClearsFilterPredicateOnInsertion", state->clears_filter);
         flag("NSAutomaticallyRearrangesObjects", state->rearranges);
+        // Not read: NSDeclaredKeys (Interface Builder's list of bound keys),
+        // NSFilterRestrictsInsertion (inserted objects always pass the filter predicate).
         if (has("NSObjectClassName")) {
             const auto name = self->support.send_id(coder, "decodeObjectForKey:", {string(self->support, "NSObjectClassName")});
             if (name) state->object_class = self->support.call(foundation_library, "_NSClassFromString", {name});

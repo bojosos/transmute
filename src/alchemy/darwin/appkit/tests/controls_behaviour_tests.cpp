@@ -20,6 +20,7 @@
 #include "alchemy/darwin/foundation/date_format.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <functional>
 #include <iostream>
@@ -631,9 +632,186 @@ void nib_decoding(Fixture& f) {
     b.real(tab, "NSLocation", 56);
     n.objects.push_back(tab);
     n.outlet(tab, "tab");
+    // Keys real applications archive (the frameworks wave, U4).
+    // A push-on-push-off button: NSAuxButtonType, periodic delay and interval
+    // (milliseconds), and the control's copies of the cell settings.
+    const auto toggle = b.view("NSButton", n.content, "{{300, 10}, {80, 24}}");
+    const auto toggle_cell = b.declare("NSButtonCell");
+    b.ref(toggle, "NSCell", toggle_cell);
+    b.boolean(toggle, "NSEnabled", true);
+    b.integer(toggle, "NSControlSendActionMask", 2);
+    b.integer(toggle, "NSControlLineBreakMode", 4);
+    b.boolean(toggle, "NSControlRefusesFirstResponder", true);
+    b.boolean(toggle, "NSControlContinuous", true);   // the complement of the cell's flag
+    b.integer(toggle_cell, "NSCellFlags", 0x04000000);
+    b.ref(toggle_cell, "NSContents", b.string("Toggle"));
+    b.integer(toggle_cell, "NSAuxButtonType", 1);
+    b.integer(toggle_cell, "NSPeriodicDelay", 300);
+    b.integer(toggle_cell, "NSPeriodicInterval", 50);
+    b.ref(toggle_cell, "NSControlView", toggle);
+    n.subviews.push_back(toggle);
+    n.outlet(toggle, "toggle");
+    // A continuous stepper (NSCellFlags 0x40000); the control's range keys are zeros.
+    const auto stepper = b.view("NSStepper", n.content, "{{390, 10}, {19, 28}}");
+    const auto stepper_cell = b.declare("NSStepperCell");
+    b.ref(stepper, "NSCell", stepper_cell);
+    b.boolean(stepper, "NSControlContinuous", false);
+    b.real(stepper, "NSStepperMaxValue", 0);
+    b.integer(stepper_cell, "NSCellFlags", 0x04040000);
+    b.real(stepper_cell, "NSMaxValue", 10);
+    b.ref(stepper_cell, "NSControlView", stepper);
+    n.subviews.push_back(stepper);
+    n.outlet(stepper, "stepper");
+    // A pop-up button that leaves item states alone.
+    const auto popup = b.view("NSPopUpButton", n.content, "{{300, 40}, {120, 26}}");
+    const auto popup_cell = b.declare("NSPopUpButtonCell");
+    b.ref(popup, "NSCell", popup_cell);
+    b.integer(popup_cell, "NSCellFlags", 0x04000000);
+    b.boolean(popup_cell, "NSAltersState", false);
+    b.boolean(popup_cell, "NSUsesItemFromMenu", false);
+    b.integer(popup_cell, "NSArrowPosition", 1);
+    b.integer(popup_cell, "NSPreferredEdge", 3);
+    b.ref(popup_cell, "NSControlView", popup);
+    n.subviews.push_back(popup);
+    n.outlet(popup, "popup");
+    // An image view aligned right, scaled to fill.
+    const auto image_view = b.view("NSImageView", n.content, "{{300, 70}, {48, 48}}");
+    const auto image_cell = b.declare("NSImageCell");
+    b.ref(image_view, "NSCell", image_cell);
+    b.integer(image_cell, "NSCellFlags", 0x08000000);
+    b.integer(image_cell, "NSAlign", 8);
+    b.integer(image_cell, "NSScale", 1);
+    b.integer(image_cell, "NSStyle", 0);
+    b.ref(image_cell, "NSControlView", image_view);
+    n.subviews.push_back(image_view);
+    n.outlet(image_view, "imageView");
+    // A transparent box with its content margins.
+    const auto box = b.view("NSBox", n.content, "{{360, 70}, {100, 60}}");
+    b.boolean(box, "NSTransparent", true);
+    b.ref(box, "NSOffsets", b.string("{3, 4}"));
+    n.subviews.push_back(box);
+    n.outlet(box, "box");
+    // A text field's preferred layout width.
+    const auto field = b.view("NSTextField", n.content, "{{300, 130}, {120, 22}}");
+    const auto field_cell = b.declare("NSTextFieldCell");
+    b.ref(field, "NSCell", field_cell);
+    b.real(field, "NSPreferredMaxLayoutWidth", 250);
+    b.integer(field_cell, "NSCellFlags", 0x04000000);
+    b.ref(field_cell, "NSContents", b.string("Label"));
+    b.ref(field_cell, "NSControlView", field);
+    n.subviews.push_back(field);
+    n.outlet(field, "field");
+    // A table: grid, style, row heights, type-select, highlight style, the
+    // control's action, and a column with a header tool tip from before NSResizingMask.
+    const auto table = b.view("NSTableView", n.content, "{{300, 160}, {150, 80}}");
+    const auto column = b.declare("NSTableColumn");
+    b.ref(column, "NSIdentifier", b.string("name"));
+    b.ref(column, "NSHeaderToolTip", b.string("The cue name"));
+    b.boolean(column, "NSIsResizeable", false);
+    b.ref(table, "NSTableColumns", b.array("NSMutableArray", {column}));
+    const auto grid = b.declare("NSColor");
+    b.integer(grid, "NSColorSpace", 1);
+    {
+        nib::Value rgb;
+        rgb.type = nib::ValueType::data;
+        const std::string components = "1 0 0";
+        rgb.data.assign(components.begin(), components.end());
+        rgb.data.push_back(0);
+        b.put(grid, "NSRGB", rgb);
+    }
+    b.ref(table, "NSGridColor", grid);
+    b.integer(table, "NSGridStyleMask", 2);
+    b.integer(table, "NSTableViewStyle", 4);
+    b.boolean(table, "NSTableViewUseARH", true);
+    b.boolean(table, "NSAllowsTypeSelect", false);
+    b.integer(table, "NSTableViewSelectionHighlightStyle", -1);
+    b.ref(table, "NSControlAction", b.string("tableClicked:"));
+    n.subviews.push_back(table);
+    n.outlet(table, "table");
+    n.objects.push_back(column);
+    n.outlet(column, "column");
+    // A scroll view's content insets and magnification bounds, a scroller's value.
+    const auto scroll = b.view("NSScrollView", n.content, "{{10, 200}, {120, 80}}");
+    b.ref(scroll, "NSContentInsets", b.string("{1, 2, 3, 4}"));
+    b.real(scroll, "NSMaxMagnification", 8);
+    b.real(scroll, "NSMagnification", 1);
+    n.subviews.push_back(scroll);
+    n.outlet(scroll, "scroll");
+    const auto bar = b.view("NSScroller", n.content, "{{140, 200}, {15, 80}}");
+    b.real(bar, "NSCurValue", 0.5);
+    b.real(bar, "NSPercent", 0.25);
+    n.subviews.push_back(bar);
+    n.outlet(bar, "scroller");
+    // A menu without a state column, an item with an identifier.
+    const auto menu = b.declare("NSMenu");
+    const auto item = b.declare("NSMenuItem");
+    b.ref(menu, "NSTitle", b.string("Actions"));
+    b.boolean(menu, "NSMenuExcludeMarkColumn", true);
+    b.ref(item, "NSTitle", b.string("Start"));
+    b.ref(item, "NSMenuItemIdentifier", b.string("Start"));
+    b.ref(menu, "NSMenuItems", b.array("NSMutableArray", {item}));
+    n.objects.push_back(menu);
+    n.outlet(menu, "menu");
     const auto bytes = n.encode();
-    auto outlets = std::vector<std::string>{"segments", "path", "search", "picker", "text", "collection", "combo", "pan", "tab"};
+    auto outlets = std::vector<std::string>{"segments", "path", "search", "picker", "text", "collection", "combo", "pan", "tab", "toggle", "stepper", "popup", "imageView",
+                                             "box", "field", "table", "column", "scroll", "scroller", "menu"};
     const auto made = load_controls_nib(f, bytes, outlets);
+    // Keys real applications archive (U4).
+    const auto toggle_control = made.at("toggle");
+    const auto toggle_button_cell = f.id(toggle_control, "cell");
+    require(f.id(toggle_button_cell, "_buttonType") == 1 && f.id(toggle_button_cell, "showsStateBy") == 12 &&
+                f.integer(toggle_button_cell, "lineBreakMode") == 4 && !f.yes(toggle_button_cell, "isContinuous") &&
+                !f.yes(toggle_control, "acceptsFirstResponder"),
+            "decoded button type and control settings");
+    {
+        const auto delay = f.process.allocate_guest(8);
+        static_cast<void>(f.id(toggle_button_cell, "getPeriodicDelay:interval:", {delay, delay + 4}));
+        const auto as_float = [&](Address at) { return std::bit_cast<float>(static_cast<std::uint32_t>(f.engine.read64(at) & 0xffffffff)); };
+        require(std::abs(as_float(delay) - 0.3f) < 1e-6 && std::abs(as_float(delay + 4) - 0.05f) < 1e-6, "decoded periodic delay and interval");
+    }
+    require(f.yes(f.id(made.at("stepper"), "cell"), "isContinuous") && f.send(made.at("stepper"), "maxValue").d(0) == 10,
+            "decoded continuous stepper (the cell's range)");
+    const auto popup_control = f.id(made.at("popup"), "cell");
+    require(!f.yes(popup_control, "altersStateOfSelectedItem") && !f.yes(popup_control, "usesItemFromMenu") &&
+                f.integer(popup_control, "arrowPosition") == 1 && f.integer(popup_control, "preferredEdge") == 3,
+            "decoded pop-up settings");
+    require(f.integer(made.at("imageView"), "imageAlignment") == 8 && f.integer(made.at("imageView"), "imageScaling") == 1, "decoded image cell");
+    {
+        const auto margins = f.send(made.at("box"), "contentViewMargins");
+        require(f.yes(made.at("box"), "isTransparent") && margins.d(0) == 3 && margins.d(1) == 4, "decoded transparent box and margins");
+    }
+    require(f.send(made.at("field"), "preferredMaxLayoutWidth").d(0) == 250, "decoded preferred layout width");
+    const auto table_view = made.at("table");
+    require(f.integer(table_view, "gridStyleMask") == 2 && f.integer(table_view, "style") == 4 && f.yes(table_view, "usesAutomaticRowHeights") &&
+                !f.yes(table_view, "allowsTypeSelect") && f.integer(table_view, "selectionHighlightStyle") == -1 &&
+                f.id(table_view, "action") == f.objc.selector("tableClicked:"),
+            "decoded table settings");
+    {
+        const auto rgba = f.process.allocate_guest(32);
+        static_cast<void>(f.id(f.id(table_view, "gridColor"), "getRed:green:blue:alpha:", {rgba, rgba + 8, rgba + 16, rgba + 24}));
+        require(std::bit_cast<double>(f.engine.read64(rgba)) > 0.99 && std::bit_cast<double>(f.engine.read64(rgba + 8)) < 0.01, "decoded grid color");
+    }
+    require(f.text(f.id(made.at("column"), "headerToolTip")) == "The cue name" && f.integer(made.at("column"), "resizingMask") == 0,
+            "decoded column tool tip and NSIsResizeable");
+    {
+        const auto insets = f.send(made.at("scroll"), "contentInsets");
+        require(insets.d(0) == 1 && insets.d(1) == 2 && insets.d(2) == 3 && insets.d(3) == 4 && f.send(made.at("scroll"), "maxMagnification").d(0) == 8,
+                "decoded content insets and magnification bounds");
+    }
+    require(f.send(made.at("scroller"), "doubleValue").d(0) == 0.5 && f.send(made.at("scroller"), "knobProportion").d(0) == 0.25, "decoded scroller");
+    require(!f.yes(made.at("menu"), "showsStateColumn"), "decoded menu without a state column");
+    // A pop-up that alters item states marks the selected item on and the previous one off.
+    {
+        const auto chooser = f.with_rect(f.id(f.cls("NSPopUpButton"), "alloc"), "initWithFrame:", {{0, 0}, {120, 26}});
+        for (const auto* title : {"One", "Two", "Three"}) static_cast<void>(f.id(chooser, "addItemWithTitle:", {f.str(title)}));
+        static_cast<void>(f.id(chooser, "selectItemAtIndex:", {1}));
+        static_cast<void>(f.id(chooser, "selectItemAtIndex:", {2}));
+        const auto state_of = [&](Address index) { return f.integer(f.id(chooser, "itemAtIndex:", {index}), "state"); };
+        require(state_of(1) == 0 && state_of(2) == 1, "a pop-up alters the selected item's state");
+        static_cast<void>(f.id(f.id(chooser, "cell"), "setAltersStateOfSelectedItem:", {0}));
+        static_cast<void>(f.id(chooser, "selectItemAtIndex:", {0}));
+        require(state_of(0) == 0 && state_of(2) == 1, "without -altersStateOfSelectedItem item states stay");
+    }
     // Search field.
     const auto search_field = made.at("search");
     require(f.id(f.id(search_field, "cell"), "class") == f.cls("NSSearchFieldCell") && f.integer(search_field, "maximumRecents") == 255 &&

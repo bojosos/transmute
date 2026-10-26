@@ -75,7 +75,7 @@ void Provider::install_menus() {
         s.x[0] = bridge->autorelease(item);
     }, true);
     extend("NSMenuItem", "isSectionHeader", [this](CpuState& s, GuestMemory&) { s.x[0] = stored_integer(s.x[0], "sectionHeader") != 0; }, false, "B@:");
-    for (const auto* name : {"subtitle", "badge", "onStateImage", "offStateImage", "mixedStateImage"}) object_property("NSMenuItem", name);
+    for (const auto* name : {"subtitle", "badge", "onStateImage", "offStateImage", "mixedStateImage", "identifier"}) object_property("NSMenuItem", name);
     integer_property("NSMenuItem", "allowsKeyEquivalentWhenHidden", "setAllowsKeyEquivalentWhenHidden:", 0, "B");
     integer_property("NSMenuItem", "allowsAutomaticKeyEquivalentLocalization", "setAllowsAutomaticKeyEquivalentLocalization:", 1, "B");
     integer_property("NSMenuItem", "allowsAutomaticKeyEquivalentMirroring", "setAllowsAutomaticKeyEquivalentMirroring:", 1, "B");

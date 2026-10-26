@@ -82,6 +82,14 @@ struct CellState final : ObjectPayload {
     Address content_tint{};                   // +1 -contentTintColor (NSButton / NSImageView)
     Address bezel_color{}, sound{};           // +1 NSButtonCell -bezelColor, -sound (played on a click)
     bool image_hugs_title{};
+    // NSButtonCell -getPeriodicDelay:interval: (seconds), NSImageCell
+    // -imageAlignment (NSImageAlignment), NSPopUpButtonCell -arrowPosition /
+    // -altersStateOfSelectedItem / -usesItemFromMenu, NSTextFieldCell
+    // -preferredMaxLayoutWidth.
+    double periodic_delay{0.4}, periodic_interval{0.075};
+    std::uint64_t image_alignment{}, arrow_position{2};
+    bool alters_state{true}, uses_item_from_menu{true};
+    double preferred_max_width{};
     // State of cell subclasses defined outside this directory (the QLab
     // controls of src/alchemy/darwin/kit/completion/controls/): one object carries one
     // payload, so subclasses extend the cell this way (as ViewState::extension).
@@ -109,6 +117,8 @@ struct ControlState : ObjectPayload {
     std::int64_t box_type{}, border_type{3}, title_position{2};
     Address fill_color{}, border_color{};     // +1
     double corner_radius{5}, border_width{1};   // custom boxes (NSBoxCustom)
+    bool box_transparent{};                   // -[NSBox isTransparent]: draws nothing
+    Size box_margins{5, 5};                   // -[NSBox contentViewMargins]
     // NSStepper / NSSlider
     double increment{1};
     bool value_wraps{}, autorepeat{true};

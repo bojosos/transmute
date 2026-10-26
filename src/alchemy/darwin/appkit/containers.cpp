@@ -1,4 +1,5 @@
 #include "alchemy/darwin/appkit/controls_internal.hpp"
+#include "alchemy/darwin/appkit/nib_archive.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -24,6 +25,9 @@ struct ScrollState final : ObjectPayload {
     bool has_vertical{}, has_horizontal{}, autohides{true}, draws_background{true};
     std::int64_t border_type{};
     double line_scroll{10}, page_scroll{10};
+    // Magnification bounds; the document is drawn at magnification 1 only.
+    double min_magnification{0.25}, max_magnification{4};
+    bool allows_magnification{};
     // Rulers (NSRulerView, kit/completion/controls/ruler.cpp): +1, subviews while shown.
     Address horizontal_ruler{}, vertical_ruler{};
     bool has_horizontal_ruler{}, has_vertical_ruler{}, rulers_visible{};
@@ -61,6 +65,7 @@ struct ColumnState final : ObjectPayload {
     double width{100}, min_width{10}, max_width{1e6};
     std::uint64_t resizing_mask{3};
     bool hidden{}, editable{true};
+    Address header_tool_tip{}, sort_prototype{};       // +1
 };
 struct TableState final : ControlState {
     std::vector<Address> columns;                         // +1 NSTableColumns
@@ -71,6 +76,12 @@ struct TableState final : ControlState {
     double row_height{17};
     Size spacing{3, 2};
     bool alternating{}, multiple{}, empty_selection{true}, column_selection{}, row_height_set{};
+    // Kept settings: the grid colour is drawn; the rest are answered back
+    // (row heights are not computed from cell views, there is no type-select
+    // and group rows do not float).
+    Address grid_color{};                                 // +1 (nil: +[NSColor gridColor])
+    std::int64_t table_style{}, feedback_style{};
+    bool automatic_row_heights{}, type_select{true}, floats_group_rows{true};
     // View-based cells: [row][column] -> view (+1, subviews of the table).
     std::map<std::pair<std::int64_t, std::size_t>, Address> cell_views;
     std::map<std::string, std::vector<Address>> reuse;    // +1 by identifier
@@ -1230,7 +1241,8 @@ void AppKit::install_tables(Address header_cell_class) {
     method(tc, "init", [this](CpuState& s, GuestMemory&) { s.x[0] = send_id(s.x[0], "initWithIdentifier:", {auto_string("")}); });
     method(tc, "dealloc", [this](CpuState& s, GuestMemory&) {
         if (const auto state = objc.find_host_state<ColumnState>(s.x[0]))
-            for (auto* slot : {&state->identifier, &state->header_cell, &state->data_cell}) release(std::exchange(*slot, 0));
+            for (auto* slot : {&state->identifier, &state->header_cell, &state->data_cell, &state->header_tool_tip, &state->sort_prototype})
+                release(std::exchange(*slot, 0));
         static_cast<void>(objc.send_super(s.x[0], table_column, sel("dealloc")));
     }, "v@:");
     method(tc, "identifier", [column_of](CpuState& s, GuestMemory&) { s.x[0] = column_of(s.x[0])->identifier; });
@@ -1267,8 +1279,14 @@ void AppKit::install_tables(Address header_cell_class) {
     method(tc, "setEditable:", [column_of](CpuState& s, GuestMemory&) { column_of(s.x[0])->editable = bool_arg(s, 2); }, "v@:B");
     method(tc, "resizingMask", [column_of](CpuState& s, GuestMemory&) { s.x[0] = column_of(s.x[0])->resizing_mask; }, "Q@:");
     method(tc, "setResizingMask:", [column_of](CpuState& s, GuestMemory&) { column_of(s.x[0])->resizing_mask = s.x[2]; }, "v@:Q");
-    method(tc, "setHeaderToolTip:", [](CpuState&, GuestMemory&) {}, "v@:@");
-    method(tc, "setSortDescriptorPrototype:", [](CpuState&, GuestMemory&) {}, "v@:@");
+    method(tc, "headerToolTip", [column_of](CpuState& s, GuestMemory&) { s.x[0] = column_of(s.x[0])->header_tool_tip; });
+    method(tc, "setHeaderToolTip:", [this, column_of](CpuState& s, GuestMemory&) {
+        release(std::exchange(column_of(s.x[0])->header_tool_tip, s.x[2] ? cf.copy(s.x[2]) : 0));
+    }, "v@:@");
+    method(tc, "sortDescriptorPrototype", [column_of](CpuState& s, GuestMemory&) { s.x[0] = column_of(s.x[0])->sort_prototype; });
+    method(tc, "setSortDescriptorPrototype:", [this, column_of](CpuState& s, GuestMemory&) {
+        release(std::exchange(column_of(s.x[0])->sort_prototype, s.x[2] ? send(s.x[2], "copy").x0 : 0));
+    }, "v@:@");
     method(tc, "sizeToFit", [](CpuState&, GuestMemory&) {}, "v@:");
 
     // NSTableCellView.
@@ -1386,6 +1404,7 @@ void AppKit::install_tables(Address header_cell_class) {
                 for (const auto column : std::exchange(typed->columns, {})) release(column);
                 release(std::exchange(typed->header_view, 0));
                 release(std::exchange(typed->corner_view, 0));
+                release(std::exchange(typed->grid_color, 0));
                 for (auto& [key, value] : std::exchange(typed->cell_views, {})) release(value);
                 for (auto& [row, value] : std::exchange(typed->row_views, {})) release(value);
                 for (auto& [key, list] : std::exchange(typed->reuse, {})) for (const auto value : list) release(value);
@@ -1481,18 +1500,27 @@ void AppKit::install_tables(Address header_cell_class) {
     table_integer("gridStyleMask", "setGridStyleMask:", &TableState::grid_style);
     table_integer("selectionHighlightStyle", "setSelectionHighlightStyle:", &TableState::highlight_style);
     table_integer("columnAutoresizingStyle", "setColumnAutoresizingStyle:", &TableState::autoresizing_style);
-    for (const auto* name : {"setAllowsColumnReordering:", "setAllowsColumnResizing:", "setAllowsTypeSelect:", "setFloatsGroupRows:",
-             "setUsesAutomaticRowHeights:", "setVerticalMotionCanBeginDrag:", "setAutosaveTableColumns:"})
+    for (const auto* name : {"setAllowsColumnReordering:", "setAllowsColumnResizing:", "setVerticalMotionCanBeginDrag:", "setAutosaveTableColumns:"})
         method(tv, name, [](CpuState&, GuestMemory&) {}, "v@:B");
-    for (const auto* name : {"setStyle:", "setRowSizeStyle:", "setDraggingDestinationFeedbackStyle:"})
-        method(tv, name, [](CpuState&, GuestMemory&) {}, "v@:q");
+    method(tv, "setRowSizeStyle:", [](CpuState&, GuestMemory&) {}, "v@:q");
+    table_bool("allowsTypeSelect", "setAllowsTypeSelect:", &TableState::type_select);
+    table_bool("floatsGroupRows", "setFloatsGroupRows:", &TableState::floats_group_rows);
+    table_bool("usesAutomaticRowHeights", "setUsesAutomaticRowHeights:", &TableState::automatic_row_heights);
+    table_integer("style", "setStyle:", &TableState::table_style);
+    table_integer("draggingDestinationFeedbackStyle", "setDraggingDestinationFeedbackStyle:", &TableState::feedback_style);
     method(tv, "setAutosaveName:", [](CpuState&, GuestMemory&) {}, "v@:@");
     method(tv, "setSortDescriptors:", [](CpuState&, GuestMemory&) {}, "v@:@");
     method(tv, "sortDescriptors", [this](CpuState& s, GuestMemory&) { s.x[0] = auto_array({}); });
     method(tv, "registerForDraggedTypes:", [](CpuState&, GuestMemory&) {}, "v@:@");
     method(tv, "setDraggingSourceOperationMask:forLocal:", [](CpuState&, GuestMemory&) {}, "v@:QB");
-    method(tv, "gridColor", [this](CpuState& s, GuestMemory&) { s.x[0] = send(color, "gridColor").x0; });
-    method(tv, "setGridColor:", [](CpuState&, GuestMemory&) {}, "v@:@");
+    method(tv, "gridColor", [this, table_of](CpuState& s, GuestMemory&) {
+        const auto chosen = table_of(s.x[0])->grid_color;
+        s.x[0] = chosen ? chosen : send(color, "gridColor").x0;
+    });
+    method(tv, "setGridColor:", [this, table_of](CpuState& s, GuestMemory&) {
+        assign(table_of(s.x[0])->grid_color, s.x[2]);
+        invalidate_view(s.x[0]);
+    }, "v@:@");
     method(tv, "backgroundColor", [this](CpuState& s, GuestMemory&) { s.x[0] = send(color, "controlBackgroundColor").x0; });
     method(tv, "setBackgroundColor:", [](CpuState&, GuestMemory&) {}, "v@:@");
 
@@ -1931,7 +1959,8 @@ void AppKit::install_tables(Address header_cell_class) {
                     canvas.fill_rect(row_rect, focused ? th.selection : th.unfocused_selection);
                 else if (state->alternating && row % 2 == 1)
                     canvas.fill_rect(row_rect, th.alternate_row);
-                if (state->grid_style & 2) canvas.fill_rect({{bounds.origin.x, y + h - 1}, {bounds.size.width, 1}}, th.grid);
+                if (state->grid_style & 2)
+                    canvas.fill_rect({{bounds.origin.x, y + h - 1}, {bounds.size.width, 1}}, state->grid_color ? color_value(state->grid_color, th.grid) : th.grid);
                 if (!view_based) {
                     for (std::size_t c = 0; c < state->columns.size(); ++c) {
                         const auto column = state->columns[c];
@@ -1969,7 +1998,7 @@ void AppKit::install_tables(Address header_cell_class) {
                 const auto info = column_of(column);
                 if (info->hidden) continue;
                 x += info->width + state->spacing.width;
-                canvas.fill_rect({{x - 1, bounds.origin.y}, {1, bounds.size.height}}, th.grid);
+                canvas.fill_rect({{x - 1, bounds.origin.y}, {1, bounds.size.height}}, state->grid_color ? color_value(state->grid_color, th.grid) : th.grid);
             }
         }
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
@@ -2220,6 +2249,15 @@ void AppKit::install_container_coding() {
             };
             if (bytes.size() == 16) { state->line_scroll = amount(0); state->page_scroll = amount(2); }
         }
+        // NSContentInsets: "{top, left, bottom, right}".
+        if (const auto insets = object_for(coder, "NSContentInsets"))
+            if (const auto n = nib::parse_numbers(cf.utf8(insets)); n && n->size() == 4)
+                state->content_insets = {(*n)[0], (*n)[1], (*n)[2], (*n)[3]};
+        if (contains(coder, "NSMinMagnification")) state->min_magnification = real_for(coder, "NSMinMagnification");
+        if (contains(coder, "NSMaxMagnification")) state->max_magnification = real_for(coder, "NSMaxMagnification");
+        if (contains(coder, "NSMagnification") && real_for(coder, "NSMagnification") != 1)
+            unsupported("an archived NSScrollView with NSMagnification " + std::to_string(real_for(coder, "NSMagnification")) +
+                        " (documents are drawn at magnification 1)");
         static_cast<void>(send(self, "tile"));
     }, "@@:@");
 
@@ -2233,6 +2271,20 @@ void AppKit::install_container_coding() {
             state->document = document;
         }
         if (const auto color_value = object_for(s.x[2], "NSBGColor")) assign(state->background_color, color_value);
+        // Not read: NSBounds (the scroll position follows the document view
+        // and the scroll view's tile), NScvFlags and
+        // NSAutomaticallyAdjustsContentInsets (content insets are not adjusted
+        // for title bars).
+    }, "@@:@");
+
+    // NSScroller: its value and knob size (the scroll view sets them again when it tiles).
+    method(scroller, "initWithCoder:", [=, this](CpuState& s, GuestMemory&) {
+        const auto self = super_init(s.x[0], scroller, s.x[2]);
+        s.x[0] = self;
+        if (!self) return;
+        const auto state = extension<ControlState>(self);
+        if (contains(s.x[2], "NSCurValue")) state->value = std::clamp(real_for(s.x[2], "NSCurValue"), 0.0, 1.0);
+        if (contains(s.x[2], "NSPercent")) state->knob_proportion = std::clamp(real_for(s.x[2], "NSPercent"), 0.0, 1.0);
     }, "@@:@");
 
     method(table_view, "initWithCoder:", [=, this](CpuState& s, GuestMemory&) {
@@ -2275,7 +2327,23 @@ void AppKit::install_container_coding() {
         if (is_kind(self, outline_view)) {
             if (const auto column = object_for(coder, "NSOutlineViewOutlineTableColumnKey")) state->outline_column = column;
             if (contains(coder, "NSOutlineViewIndentationPerLevelKey")) state->indentation = real_for(coder, "NSOutlineViewIndentationPerLevelKey");
+            // Not read: NSOutlineViewAutoresizesOutlineColumnKey,
+            // NSOutlineViewIndentationMarkerFollowsCellKey and
+            // NSOutineViewStronglyReferencesItems (the outline column is not
+            // resized to fit, the disclosure marker sits at the indentation,
+            // items are held as the data source returns them).
         }
+        if (contains(coder, "NSGridStyleMask")) state->grid_style = integer_for(coder, "NSGridStyleMask");
+        if (const auto grid = object_for(coder, "NSGridColor")) assign(state->grid_color, grid);
+        if (contains(coder, "NSTableViewStyle")) state->table_style = integer_for(coder, "NSTableViewStyle");
+        if (contains(coder, "NSTableViewUseARH")) state->automatic_row_heights = integer_for(coder, "NSTableViewUseARH") != 0;
+        if (contains(coder, "NSTableViewSelectionHighlightStyle")) state->highlight_style = integer_for(coder, "NSTableViewSelectionHighlightStyle");
+        if (contains(coder, "NSTableViewDraggingDestinationStyle")) state->feedback_style = integer_for(coder, "NSTableViewDraggingDestinationStyle");
+        if (contains(coder, "NSAllowsTypeSelect")) state->type_select = integer_for(coder, "NSAllowsTypeSelect") != 0;
+        if (contains(coder, "NSTableViewShouldFloatGroupRows")) state->floats_group_rows = integer_for(coder, "NSTableViewShouldFloatGroupRows") != 0;
+        // Not read: NSTableViewGroupRowStyle (group rows draw as rows),
+        // NSDraggingSourceMaskForLocal / NSDraggingSourceMaskForNonLocal (drag
+        // operations come from the data source).
     }, "@@:@");
 
     method(table_column, "initWithCoder:", [=, this](CpuState& s, GuestMemory&) {
@@ -2293,6 +2361,12 @@ void AppKit::install_container_coding() {
         if (const auto header = object_for(coder, "NSHeaderCell")) assign(state->header_cell, header);
         if (const auto data = object_for(coder, "NSDataCell")) assign(state->data_cell, data);
         if (const auto table = object_for(coder, "NSTableView")) state->table = table;
+        if (const auto tip = object_for(coder, "NSHeaderToolTip")) release(std::exchange(state->header_tool_tip, cf.copy(tip)));
+        if (const auto prototype = object_for(coder, "NSSortDescriptorPrototype"))
+            release(std::exchange(state->sort_prototype, send(prototype, "copy").x0));
+        // Archives older than NSResizingMask: NSIsResizeable.
+        if (!contains(coder, "NSResizingMask") && contains(coder, "NSIsResizeable"))
+            state->resizing_mask = integer_for(coder, "NSIsResizeable") != 0 ? 3 : 0;
     }, "@@:@");
 
     method(table_header_view, "initWithCoder:", [=, this](CpuState& s, GuestMemory&) {
@@ -2636,6 +2710,22 @@ void install_container_additions(AppKit& kit) {
             tile(s.x[0]);
         }, "v@:{NSEdgeInsets=dddd}");
     }
+    // Magnification: the bounds and the flag are kept; documents are drawn
+    // at magnification 1, so another magnification stops explicitly.
+    kit.method(sv, "magnification", [](CpuState& s, GuestMemory&) { set_d(s, 0, 1); }, "d@:");
+    for (const auto* name : {"setMagnification:", "setMagnification:centeredAtPoint:"})
+        kit.method(sv, name, [name](CpuState& s, GuestMemory&) {
+            if (d(s, 0) != 1) unsupported(std::string("-[NSScrollView ") + name + "] other than 1 (documents are drawn at magnification 1)");
+        }, std::string(name).find(':') == std::string(name).size() - 1 ? "v@:d" : "v@:d{CGPoint=dd}");
+    kit.method(sv, "magnifyToFitRect:", [](CpuState&, GuestMemory&) {
+        unsupported("-[NSScrollView magnifyToFitRect:] (documents are drawn at magnification 1)");
+    }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    kit.method(sv, "minMagnification", [scroll_of](CpuState& s, GuestMemory&) { set_d(s, 0, scroll_of(s.x[0])->min_magnification); }, "d@:");
+    kit.method(sv, "setMinMagnification:", [scroll_of](CpuState& s, GuestMemory&) { scroll_of(s.x[0])->min_magnification = d(s, 0); }, "v@:d");
+    kit.method(sv, "maxMagnification", [scroll_of](CpuState& s, GuestMemory&) { set_d(s, 0, scroll_of(s.x[0])->max_magnification); }, "d@:");
+    kit.method(sv, "setMaxMagnification:", [scroll_of](CpuState& s, GuestMemory&) { scroll_of(s.x[0])->max_magnification = d(s, 0); }, "v@:d");
+    kit.method(sv, "allowsMagnification", [scroll_of](CpuState& s, GuestMemory&) { return_bool(s, scroll_of(s.x[0])->allows_magnification); }, "B@:");
+    kit.method(sv, "setAllowsMagnification:", [scroll_of](CpuState& s, GuestMemory&) { scroll_of(s.x[0])->allows_magnification = bool_arg(s, 2); }, "v@:B");
     kit.method(sv, "addFloatingSubview:forAxis:", [k, scroll_of](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto state = scroll_of(self);

@@ -637,6 +637,7 @@ void install_text_system(AppKit& kit) {
         s.x[0] = self;
         const Decoder in{*k, s.x[2]};
         const auto state = container_of(*k, self);
+        // NSTextLayoutManager (a TextKit 2 layout manager) is not read: the text is laid out by TextKit 1.
         const auto flags = static_cast<std::uint64_t>(in.integer("NSTCFlags", 1));
         state->tracks_width = (flags & 1) != 0;
         state->tracks_height = (flags & 2) != 0;
@@ -690,6 +691,9 @@ void install_text_system(AppKit& kit) {
         s.x[0] = self;
         const Decoder in{*k, s.x[2]};
         const auto state = k->objc.host_state<SharedData>(self);
+        // Not read: NSAutomaticTextCompletionDisabled (no text completion),
+        // NSPreferredTextFinderStyle and NSTextFinder (no find bar),
+        // NSTextHighlightAttributes and NSWritingToolsFlags (no Writing Tools).
         state->has_flags = in.has("NSFlags");
         state->flags = static_cast<std::uint64_t>(in.integer("NSFlags", 0));
         state->more_flags = static_cast<std::uint64_t>(in.integer("NSMoreFlags", 0));

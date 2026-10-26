@@ -719,6 +719,17 @@ void AppKit::install_buttons() {
         release(std::exchange(cs(s.x[0])->alternate_title, s.x[2] ? cf.copy(s.x[2]) : 0));
     }, "v@:@");
     method(b, "alternateImage", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->alternate_image; });
+    // Kept for continuous buttons' callers (buttons do not repeat while held).
+    method(b, "getPeriodicDelay:interval:", [this, cs](CpuState& s, GuestMemory& m) {
+        const auto state = cs(s.x[0]);
+        if (s.x[2]) m.write32(s.x[2], std::bit_cast<std::uint32_t>(static_cast<float>(state->periodic_delay)));
+        if (s.x[3]) m.write32(s.x[3], std::bit_cast<std::uint32_t>(static_cast<float>(state->periodic_interval)));
+        static_cast<void>(this);
+    }, "v@:^f^f");
+    method(b, "setPeriodicDelay:interval:", [cs](CpuState& s, GuestMemory&) {
+        cs(s.x[0])->periodic_delay = std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0]));
+        cs(s.x[0])->periodic_interval = std::bit_cast<float>(static_cast<std::uint32_t>(s.v[1][0]));
+    }, "v@:ff");
     method(b, "setAlternateImage:", [this, cs](CpuState& s, GuestMemory&) { assign(cs(s.x[0])->alternate_image, s.x[2]); }, "v@:@");
     method(b, "attributedTitle", [this, cs](CpuState& s, GuestMemory&) {
         if (const auto stored = cs(s.x[0])->attributed_title) { s.x[0] = stored; return; }
@@ -1213,6 +1224,7 @@ void AppKit::install_text_fields() {
             for (unsigned i = 0; i < 8; ++i) registers.v[i] = s.v[i];
             const auto result = send(target, name, registers);
             s.x[0] = result.x0; s.x[1] = result.x1;
+            for (unsigned i = 0; i < 4; ++i) s.v[i] = result.v[i];   // floating-point results (-preferredMaxLayoutWidth)
             if (redisplay) invalidate_view(self);
         }, std::move(types));
     };
@@ -1226,10 +1238,10 @@ void AppKit::install_text_fields() {
              {"preferredMaxLayoutWidth", "d@:", false}, {"setPreferredMaxLayoutWidth:", "v@:d", true}}) {
         forward_to_cell(name, types, redisplay);
     }
-    method(text_field_cell, "preferredMaxLayoutWidth", [](CpuState& s, GuestMemory&) { set_d(s, 0, 0); }, "d@:");
+    method(text_field_cell, "preferredMaxLayoutWidth", [cs](CpuState& s, GuestMemory&) { set_d(s, 0, cs(s.x[0])->preferred_max_width); }, "d@:");
     method(text_field_cell, "sendsActionOnEndEditing", [cs](CpuState& s, GuestMemory&) { return_bool(s, cs(s.x[0])->sends_action_on_end_editing); }, "B@:");
     method(text_field_cell, "setSendsActionOnEndEditing:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->sends_action_on_end_editing = bool_arg(s, 2); }, "v@:B");
-    method(text_field_cell, "setPreferredMaxLayoutWidth:", [](CpuState&, GuestMemory&) {}, "v@:d");
+    method(text_field_cell, "setPreferredMaxLayoutWidth:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->preferred_max_width = std::max(0.0, d(s, 0)); }, "v@:d");
     method(f, "placeholderAttributedString", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     method(f, "setPlaceholderAttributedString:", [this](CpuState& s, GuestMemory&) {
         static_cast<void>(send_id(s.x[0], "setPlaceholderString:", {s.x[2] ? send(s.x[2], "string").x0 : 0}));
@@ -1329,9 +1341,10 @@ void AppKit::install_simple_views() {
     const auto cs = [this](Address value) { return cell_state(*this, value); };
     // NSImageCell / NSImageView.
     method(image_cell, "init", [this](CpuState& s, GuestMemory&) { s.x[0] = send_id(s.x[0], "initImageCell:", {0}); });
-    method(image_cell, "imageAlignment", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "Q@:");   // NSImageAlignCenter
-    method(image_cell, "setImageAlignment:", [](CpuState& s, GuestMemory&) {
-        if (s.x[2] != 0) unsupported("NSImageCell image alignment other than centred");
+    method(image_cell, "imageAlignment", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->image_alignment; }, "Q@:");
+    method(image_cell, "setImageAlignment:", [this, cs](CpuState& s, GuestMemory&) {
+        cs(s.x[0])->image_alignment = s.x[2];
+        if (const auto view = cs(s.x[0])->control_view) invalidate_view(view);
     }, "v@:Q");
     method(image_cell, "imageFrameStyle", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->image_frame ? 1 : 0; }, "Q@:");
     method(image_cell, "setImageFrameStyle:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->image_frame = s.x[2] != 0; }, "v@:Q");
@@ -1352,7 +1365,23 @@ void AppKit::install_simple_views() {
         const auto fit = std::min(frame.size.width / picture.width, frame.size.height / picture.height);
         if (scaling == 1) size = frame.size;
         else if (scaling == 3 || (scaling == 0 && fit < 1)) size = {picture.width * fit, picture.height * fit};
-        const Rect target{{frame.origin.x + (frame.size.width - size.width) / 2, frame.origin.y + (frame.size.height - size.height) / 2}, size};
+        // NSImageAlignment: center 0, top 1, top-left 2, top-right 3, left 4,
+        // bottom 5, bottom-left 6, bottom-right 7, right 8 (the view is flipped
+        // or not: top is the larger y unless the control view is flipped).
+        double fx = 0.5, fy = 0.5;
+        switch (state->image_alignment) {
+        case 1: fy = 1; break;
+        case 2: fx = 0; fy = 1; break;
+        case 3: fx = 1; fy = 1; break;
+        case 4: fx = 0; break;
+        case 5: fy = 0; break;
+        case 6: fx = 0; fy = 0; break;
+        case 7: fx = 1; fy = 0; break;
+        case 8: fx = 1; break;
+        default: break;
+        }
+        if (s.x[2] && send_bool(s.x[2], "isFlipped")) fy = 1 - fy;
+        const Rect target{{frame.origin.x + (frame.size.width - size.width) * fx, frame.origin.y + (frame.size.height - size.height) * fy}, size};
         draw_cell_image(*this, *state, state->image, target, state->enabled ? 1 : 0.5);
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}@");
     for (const auto& [name, types] : std::initializer_list<std::pair<const char*, const char*>>{
@@ -1497,7 +1526,8 @@ void AppKit::install_simple_views() {
         if (!state->content_view) return;
         const auto bounds = view_bounds(*view_state(self));
         const bool titled = state->title_position != 0 && state->box_title && !string16(state->box_title).empty();
-        Rect frame = state->box_type == 2 ? Rect{} : inset(bounds, state->border_type == 0 ? 0 : 5, state->border_type == 0 ? 0 : 5);
+        const auto margins = state->border_type == 0 ? Size{} : state->box_margins;
+        Rect frame = state->box_type == 2 ? Rect{} : inset(bounds, margins.width, margins.height);
         if (titled) frame.size.height = std::max(0.0, frame.size.height - 16);
         CallRegs registers;
         put_rect(registers, 0, frame);
@@ -1552,16 +1582,21 @@ void AppKit::install_simple_views() {
     method(x, "borderWidth", [bx](CpuState& s, GuestMemory&) { set_d(s, 0, bx(s.x[0])->border_width); }, "d@:");
     method(x, "setBorderWidth:", [this, bx](CpuState& s, GuestMemory&) { bx(s.x[0])->border_width = std::max(0.0, d(s, 0)); invalidate_view(s.x[0]); }, "v@:d");
     method(x, "setCornerRadius:", [this, bx](CpuState& s, GuestMemory&) { bx(s.x[0])->corner_radius = d(s, 0); invalidate_view(s.x[0]); }, "v@:d");
-    method(x, "isTransparent", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // A transparent box draws nothing (its content view still draws).
+    method(x, "isTransparent", [bx](CpuState& s, GuestMemory&) { return_bool(s, bx(s.x[0])->box_transparent); }, "B@:");
     method(x, "setTransparent:", [this, bx](CpuState& s, GuestMemory&) {
-        if (bool_arg(s, 2)) { bx(s.x[0])->box_type = 4; bx(s.x[0])->border_type = 0; }
+        bx(s.x[0])->box_transparent = bool_arg(s, 2);
         invalidate_view(s.x[0]);
     }, "v@:B");
-    method(x, "setContentViewMargins:", [](CpuState&, GuestMemory&) {}, "v@:{CGSize=dd}");
-    method(x, "contentViewMargins", [](CpuState& s, GuestMemory&) { return_size(s, {5, 5}); }, "{CGSize=dd}@:");
-    method(x, "setFrameFromContentFrame:", [this](CpuState& s, GuestMemory&) {
+    method(x, "setContentViewMargins:", [bx, layout_box](CpuState& s, GuestMemory&) {
+        bx(s.x[0])->box_margins = size_arg(s);
+        layout_box(s.x[0]);
+    }, "v@:{CGSize=dd}");
+    method(x, "contentViewMargins", [bx](CpuState& s, GuestMemory&) { return_size(s, bx(s.x[0])->box_margins); }, "{CGSize=dd}@:");
+    method(x, "setFrameFromContentFrame:", [this, bx](CpuState& s, GuestMemory&) {
+        const auto margins = bx(s.x[0])->box_margins;
         CallRegs registers;
-        put_rect(registers, 0, inset(rect_arg(s), -5, -5));
+        put_rect(registers, 0, inset(rect_arg(s), -margins.width, -margins.height));
         static_cast<void>(send(s.x[0], "setFrame:", registers));
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
     method(x, "sizeToFit", [](CpuState&, GuestMemory&) {}, "v@:");
@@ -1569,6 +1604,7 @@ void AppKit::install_simple_views() {
     method(x, "drawRect:", [this, bx](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto state = bx(self);
+        if (state->box_transparent) return;
         const auto bounds = view_bounds(*view_state(self));
         const auto& th = theme_for(self);
         auto& canvas = require_canvas("NSBox drawing");
@@ -1745,15 +1781,31 @@ void AppKit::install_popups() {
         const auto list = items_of(s.x[0]);
         s.x[0] = index >= 0 && index < static_cast<std::int64_t>(list.size()) ? list[static_cast<std::size_t>(index)] : 0;
     });
-    method(pc, "selectItemAtIndex:", [cs, items_of](CpuState& s, GuestMemory&) {
+    // With -altersStateOfSelectedItem (the default) a pop-up (not a
+    // pull-down) puts the selected item in the on state and the previous one off.
+    method(pc, "selectItemAtIndex:", [this, cs, items_of](CpuState& s, GuestMemory&) {
+        const auto state = cs(s.x[0]);
+        const auto list = items_of(s.x[0]);
         const auto index = static_cast<std::int64_t>(s.x[2]);
-        const auto count = static_cast<std::int64_t>(items_of(s.x[0]).size());
-        cs(s.x[0])->selected_item = index >= 0 && index < count ? index : -1;
-        if (const auto view = cs(s.x[0])->control_view) static_cast<void>(view);
+        const auto count = static_cast<std::int64_t>(list.size());
+        const auto previous = state->selected_item;
+        state->selected_item = index >= 0 && index < count ? index : -1;
+        if (state->alters_state && !state->pulls_down && previous != state->selected_item) {
+            if (previous >= 0 && previous < count) static_cast<void>(send_id(list[static_cast<std::size_t>(previous)], "setState:", {static_cast<Address>(state_off)}));
+            if (state->selected_item >= 0) static_cast<void>(send_id(list[static_cast<std::size_t>(state->selected_item)], "setState:", {static_cast<Address>(state_on)}));
+        }
     }, "v@:q");
+    method(pc, "altersStateOfSelectedItem", [cs](CpuState& s, GuestMemory&) { return_bool(s, cs(s.x[0])->alters_state); }, "B@:");
+    method(pc, "setAltersStateOfSelectedItem:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->alters_state = bool_arg(s, 2); }, "v@:B");
+    method(pc, "usesItemFromMenu", [cs](CpuState& s, GuestMemory&) { return_bool(s, cs(s.x[0])->uses_item_from_menu); }, "B@:");
+    method(pc, "setUsesItemFromMenu:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->uses_item_from_menu = bool_arg(s, 2); }, "v@:B");
+    // NSPopUpArrowPosition (no arrow 0, center 1, bottom 2): kept; the arrow is always drawn.
+    method(pc, "arrowPosition", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->arrow_position; }, "Q@:");
+    method(pc, "setArrowPosition:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->arrow_position = s.x[2]; }, "v@:Q");
     method(pc, "title", [this, cs, items_of](CpuState& s, GuestMemory&) {
         const auto state = cs(s.x[0]);
         const auto list = items_of(s.x[0]);
+        if (state->pulls_down && !state->uses_item_from_menu && state->title) { s.x[0] = state->title; return; }
         const auto index = state->pulls_down ? 0 : state->selected_item;
         if (index >= 0 && index < static_cast<std::int64_t>(list.size())) { s.x[0] = send(list[static_cast<std::size_t>(index)], "title").x0; return; }
         s.x[0] = auto_string("");
