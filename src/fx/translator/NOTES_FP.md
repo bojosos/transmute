@@ -89,10 +89,25 @@ object so tests link without the core). Tests: `emit_fp_tests*.cpp`.
   flushing. FMAX = (t1 & t2) | unord(a, b) (5), FMIN = t1 | t2 (3), FMAXNM =
   (t1 | nan(b)) & (t2 | nan(a)) (7), FMINNM = (t1 & ~(nan(b) & ~nan(a))) |
   (t2 & ~nan(a)) (8; in NaN lanes t1 = b and t2 = a). t1 is computed last, so
-  the destination may alias a source without a copy (AVX; not FMINNM).
-  **Gap:** FMAXNM/FMINNM treat a signalling NaN like a quiet NaN (A64 returns
-  NaN for sNaN versus a number). Exactness would cost ~9 more instructions on
-  the fmaxf/fminf path.
+  the destination may alias a source without a copy (AVX; not FMINNM). This
+  lowering (`TRANSMUTE_FX_FP=oldminmax`) treats NaN payloads as host policy and
+  a signalling NaN like a quiet one in FMAXNM/FMINNM.
+* NaN-exact (default, AVX; every form: three same, pairwise, across lanes):
+  the numeric result (t1 & t2 for max, t1 | t2 for min) is exact in every lane
+  without a NaN; one unordered compare and MOVD/MOVQ/MOVMSKPS into RCX, then
+  JRCXZ over the fixup (no host flags written: guest NZCV in EFLAGS survives;
+  without a free RCX a flag-saving compare). The fixup gives NaN lanes A64's
+  FPProcessNaNs result with FPCR.DN = 0: a signalling first operand, else a
+  signalling second, quieted; else the first NaN (FMAX/FMIN) or the number of a
+  lone quiet NaN pair / the first of two quiet NaNs (NM; a number through
+  max(x, x) so FZ flushes it). With sa/sb signalling, na/nb NaN: a wins where
+  sa | (~sb & na) (FMAX/FMIN), sa | (~sb & nb) (NM). Fast path 6 instructions
+  (7 when Vd is a source), fixup ~18 on NaN lanes only; pairwise and
+  across-lanes forms use A64's operand order (op(n0, n1), Reduce) and may take
+  5 vector temps (`FpEmit::allow_vec_temps`). Tests:
+  `fp_special_pairs_minmax_bit_exact`, `fp_special_pairwise_across_minmax_bit_exact`
+  (every special pair, sNaN included, every rounding mode with and without FZ,
+  bit for bit), `fp_region_minmax_nan_keeps_flags` (a live compare across).
 * Against a constant (clamps), bit-exact: when one operand holds a value known
   at translation time on every path (EmitContext::vec_fp_const: FMOV
   immediates, MOVI/MVNI, FMOV S/D from a MOVZ/MOVK register) that is finite
@@ -188,9 +203,10 @@ object so tests link without the core). Tests: `emit_fp_tests*.cpp`.
 
 ## Reference interpreter issues found (for integration)
 
-* Scalar single-precision FMAX/FMIN/FMAXNM/FMINNM do not mask the 64-bit
-  source to 32 bits: bits 63:32 leak into the result and the +-0 rule fails
-  when they are non-zero. Tests use sanitized inputs (`ref_scalar_minmax`).
+* (Fixed with the NaN-exact min/max: `floating_minmax_bits` masks single
+  precision sources to 32 bits.) Scalar single-precision FMAX/FMIN/FMAXNM/FMINNM
+  did not mask the 64-bit source: bits 63:32 leaked into the result and broke
+  the +-0 rule. `ref_scalar_minmax` still sanitizes (harmless now).
 * Missing: FMULX (all forms), vector FMAXP/FMINP/FMAXNMP/FMINNMP, scalar
   register FCMEQ/FCMGE/FCMGT, FRECPX, FCVTXN, FJCVTZS, FMOV Xd,Vn.D[1] /
   Vd.D[1],Xn, FMOV H<->W/X, FP16 arithmetic (scalar FP16 is decoded as double).

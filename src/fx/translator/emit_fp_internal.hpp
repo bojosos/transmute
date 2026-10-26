@@ -33,6 +33,8 @@ using x64::Xmm;
 //   noconstminmax - FMAX/FMIN/FMAXNM/FMINNM against a known finite normal
 //             constant (EmitContext::vec_fp_const) use the general lowering
 //             instead of one x64 min/max
+//   oldminmax - FMAX/FMIN/FMAXNM/FMINNM NaN results as host policy (OR/AND of
+//             both operand orders) instead of bit-exact FPProcessNaNs lanes
 //   oldcvt  - UCVTF (vector, 32-bit lanes) with two converts and two adds
 //             instead of converts + one FMA; SCVTF/UCVTF S from a SIMD
 //             register through a GPR instead of in the vector domain
@@ -43,6 +45,7 @@ enum FpKnob : std::uint32_t {
     fp_old_mask = 4u,
     fp_old_cvt = 8u,
     fp_no_const_minmax = 16u,
+    fp_old_minmax = 32u,
 };
 std::uint32_t fp_knob_bits();
 inline bool fp_on(std::uint32_t knob) { return (fp_knob_bits() & knob) == 0; }
@@ -195,6 +198,9 @@ public:
     [[nodiscard]] unsigned dest_guest() const { return dest_guest_; }
     Gp gpr(unsigned index, bool sp = false);
     Xmm tmp();
+    // One instruction may take `n` vector temps instead of kMaxVecTemps (the
+    // NaN-exact pairwise / across-lanes min/max: rare, a vector retry at worst).
+    void allow_vec_temps(unsigned n) { vec_budget_ = n; }
     Gp gtmp();
     Xmm dest(unsigned index);          // write_vec (memoized)
     // Scratch GPR reserved for materializing constants (allocated on first
@@ -298,6 +304,7 @@ private:
     unsigned dest_guest_ = 0;
     Xmm dest_host_{};
     unsigned temps_ = 0;
+    unsigned vec_budget_ = 0;   // 0: kMaxVecTemps
     unsigned gtemps_ = 0;
     bool have_const_gpr_ = false;
     Gp const_gpr_{};

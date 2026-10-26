@@ -148,7 +148,7 @@ Gp FpEmit::gpr(unsigned index, bool sp) {
 }
 
 Xmm FpEmit::tmp() {
-    if (++temps_ > kMaxVecTemps) throw std::logic_error("fp: vector temp budget exceeded");
+    if (++temps_ > (vec_budget_ ? vec_budget_ : kMaxVecTemps)) throw std::logic_error("fp: vector temp budget exceeded");
     return ctx.temp_vec();
 }
 
@@ -1246,6 +1246,7 @@ std::uint32_t env_knob_bits() {
             if (all || has("oldmask")) b |= fp_old_mask;
             if (all || has("oldcvt")) b |= fp_old_cvt;
             if (all || has("noconstminmax")) b |= fp_no_const_minmax;
+            if (all || has("oldminmax")) b |= fp_old_minmax;
         }
         return b;
     }();
@@ -1271,6 +1272,7 @@ const FamilyEmitter& fp_family() {
         if (b & fpx::fp_old_mask) n += "+oldmask";
         n += (b & fpx::fp_old_cvt) ? "+oldcvt" : "+cvt2";   // +cvt2: the imm8 INT_MIN check
         n += (b & fpx::fp_no_const_minmax) ? "+noconstminmax" : "+constmm";
+        n += (b & fpx::fp_old_minmax) ? "+oldminmax" : "+minmaxnan";
         // The core keeps V zero-above facts across labels (Plan::vzero_join; its
         // knob novzjoin is in the layout bits): cached fp code must follow it.
         n += "+vzj";

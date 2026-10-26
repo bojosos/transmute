@@ -271,6 +271,107 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     return true;
 }
 
+// FMAX/FMIN/FMAXNM/FMINNM bit-exact with FPCR.DN = 0, NaNs included (AVX).
+// The numeric result (both operand orders, AND for max: +0 wins, OR for min:
+// -0 wins) is exact in every lane without a NaN. One unordered compare finds
+// NaN lanes; only then (JRCXZ over the fixup: no host flags, or a flag-saving
+// compare when RCX is not free) each NaN lane takes A64's FPProcessNaNs
+// result: a signalling first operand, else a signalling second, quieted; else
+// for FMAX/FMIN the first NaN, for FMAXNM/FMINNM the operand that is not a
+// lone quiet NaN (the number), or the first when both are quiet NaNs. With
+// sa/sb = signalling, na/nb = NaN: a wins where sa | (~sb & na) (FMAX/FMIN),
+// sa | (~sb & nb) (NM); the winner is quieted only if it is a NaN.
+// TRANSMUTE_FX_FP=oldminmax keeps the earlier lowering (NaN payloads as host
+// policy).
+struct MinMaxGuard {
+    Gp reg;
+    bool jrcxz;
+};
+
+// The NaN-lane test's GPR: RCX (JRCXZ leaves the host flags alone), else any
+// temp after a flag save (clobber_host_flags). Before the first label.
+MinMaxGuard minmax_guard(FpEmit& e) {
+    const Gp rcx = e.ctx.temp_gpr_prefer(Gp::rcx);
+    if (rcx != Gp::none) return {rcx, true};
+    e.ctx.clobber_host_flags();
+    return {e.gtmp(), false};
+}
+
+// T = op(a, b) (base kind), bit-exact. T, t0, t1, t2 are distinct and differ
+// from a and b; a and b are unchanged. Only vector ops and the guard's
+// MOVD/MOVMSKPS between the label and its target (no host flags written).
+// `width`: the bits that matter (scalar: the element; vector: 64 or 128).
+void minmax_exact_core(FpEmit& e, K kind, Shape s, unsigned width, Xmm T, Xmm a, Xmm b, Xmm t0, Xmm t1, Xmm t2,
+                       const MinMaxGuard& guard) {
+    const bool nm = kind == K::fmaxnm || kind == K::fminnm;
+    const bool is_max = kind == K::fmax || kind == K::fmaxnm;
+    const bool dbl = s.dbl();
+    const SseOp mm = s.pick(is_max ? fops::max : fops::min), cmp = s.pick(fops::cmp);
+    const SseOp and_ = s.pick(fops::and_), or_ = s.pick(fops::or_), andn = s.pick(fops::andn);
+    const auto numeric = [&](Xmm out, Xmm scratch) {
+        e.op(mm, out, a, b);
+        e.op(mm, scratch, b, a);
+        e.op(is_max ? and_ : or_, out, out, scratch);
+    };
+    numeric(T, t1);
+    e.op_i(cmp, t0, a, b, pred_unord);
+    if (s.scalar) {
+        if (dbl) e.movq(guard.reg, t0);
+        else e.movd(guard.reg, t0);
+    } else if (width == 64) {
+        e.movq(guard.reg, t0);
+    } else {
+        e.as.movmskps(guard.reg, t0);
+    }
+    const auto done = e.as.new_label();
+    if (guard.jrcxz) {
+        e.as.jrcxz_short(done);
+    } else {
+        e.as.test(64, guard.reg, guard.reg);   // MOVQ: lane 1 is in bits 63:32
+        e.as.jcc_short(x64::Cond::e, done);
+    }
+    const std::uint8_t shift = dbl ? 12 : 9;   // the quiet bit to the sign position
+    const Mem quiet = e.ksplat(s.es, dbl ? 0x0008000000000000ull : 0x00400000ull);
+    const auto shl = [&](Xmm dst, Xmm src) {
+        if (dbl) e.psllq(dst, src, shift);
+        else e.pslld(dst, src, shift);
+    };
+    e.op_i(cmp, t0, a, a, pred_unord);   // na
+    e.op_i(cmp, t1, b, b, pred_unord);   // nb
+    shl(t2, b);
+    e.op(andn, t2, t2, t1);              // sb (sign bit)
+    e.op(andn, t2, t2, nm ? t1 : t0);    // ~sb & nb (NM) / ~sb & na
+    shl(T, a);                           // T is a temp of the fixup until the end
+    e.op(andn, T, T, t0);                // sa
+    e.op(or_, t2, t2, T);                // a wins
+    e.op(and_, T, t0, Opnd::at(quiet));
+    e.op(or_, T, T, a);                  // a, quieted if NaN
+    e.op(or_, t0, t0, t1);               // NaN lanes
+    e.op(and_, t1, t1, Opnd::at(quiet));
+    e.op(or_, t1, t1, b);                // b, quieted if NaN
+    e.blend(dbl, t1, t1, T, t2, t2);     // the NaN lanes' result
+    // NM can return the number of a lone quiet NaN pair: with FZ (MXCSR.DAZ)
+    // A64 flushes it, which max(x, x) does too (a NaN comes back unchanged).
+    if (nm) e.op(s.pick(fops::max), t1, t1, t1);
+    numeric(T, t2);
+    e.blend(dbl, T, T, t1, t0, t0);
+    e.as.bind(done);
+}
+
+void emit_minmax_exact(FpEmit& e, const Inst& in, Shape s, unsigned w) {
+    const Xmm a = e.vec(in.rn), b = e.vec(in.rm);
+    const bool zero = s.scalar ? e.zero_above(in.rn, w) && e.zero_above(in.rm, w) : w == 128;
+    // Every register before the first label: the guard GPR, the temps, Vd.
+    const auto guard = minmax_guard(e);
+    const Xmm t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
+    const Xmm d = e.dest(in.rd);
+    const bool alias = d == a || d == b;   // a and b must survive until the fixup
+    const Xmm T = alias ? e.tmp() : d;
+    minmax_exact_core(e, in.k, s, w, T, a, b, t0, t1, t2, guard);
+    if (alias) e.mov(d, T);
+    if (!zero) e.zero_upper(d, w);
+}
+
 void emit_minmax_scratch(FpEmit& e, K kind, Shape s, Xmm out, Xmm a, Xmm b, Xmm u) {
     if (!e.avx()) throw std::logic_error("fp: emit_minmax_scratch needs AVX");
     kind = base_minmax(kind);
@@ -423,6 +524,10 @@ bool emit_arith(FpEmit& e, const Inst& in) {
     }
     case K::fmax: case K::fmin: case K::fmaxnm: case K::fminnm: {
         if (e.avx() && fp_on(fp_no_const_minmax) && emit_minmax_const(e, in, s, w)) return true;
+        if (e.avx() && fp_on(fp_old_minmax)) {
+            emit_minmax_exact(e, in, s, w);
+            return true;
+        }
         // Both operand orders are computed: both sources in registers.
         Xmm a = e.vec(in.rn), b = e.vec(in.rm);
         // Scalar results take their upper lanes from a (FMAX) or from a | b
@@ -537,6 +642,43 @@ bool emit_arith(FpEmit& e, const Inst& in) {
         return true;
     }
     case K::faddp: case K::fmaxp: case K::fminp: case K::fmaxnmp: case K::fminnmp: {
+        if (in.k != K::faddp && e.avx() && fp_on(fp_old_minmax)) {
+            // NaN-exact: op(n0, n1) / op(even lanes, odd lanes) in A64's operand order.
+            e.allow_vec_temps(5);
+            const K kind = base_minmax(in.k);
+            if (s.scalar) {
+                const Xmm n = e.vec(in.rn);
+                const auto guard = minmax_guard(e);
+                const Xmm o = e.tmp(), t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
+                const Xmm d = e.dest(in.rd);
+                const Xmm T = d == n ? e.tmp() : d;
+                if (dbl) e.psrldq(o, n, 8);
+                else e.op_i(op::insertps, o, n, n, 0x4e);
+                minmax_exact_core(e, kind, s, w, T, n, o, t0, t1, t2, guard);
+                if (T != d) e.mov(d, T);
+                e.zero_upper(d, w);
+                return true;
+            }
+            const Xmm a = e.vec(in.rn), b = e.vec(in.rm);
+            const Xmm ev = e.tmp(), od = e.tmp();
+            if (dbl) {
+                e.op(op::unpcklpd, ev, a, b);
+                e.op(op::unpckhpd, od, a, b);
+            } else if (s.q) {
+                e.op_i(op::shufps, ev, a, b, 0x88);
+                e.op_i(op::shufps, od, a, b, 0xdd);
+            } else {
+                e.op(op::unpcklpd, od, a, b);   // [a0 a1 b0 b1]
+                e.op_i(op::shufps, ev, od, od, 0x88);
+                e.op_i(op::shufps, od, od, od, 0xdd);
+            }
+            const auto guard = minmax_guard(e);
+            const Xmm t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
+            const Xmm d = e.dest(in.rd);
+            minmax_exact_core(e, kind, s, w, d, ev, od, t0, t1, t2, guard);
+            e.zero_upper(d, w);
+            return true;
+        }
         if (s.scalar) {
             // o = {n[1], 0...}: as the first source it gives a zero upper
             // part (op(n1, n0) equals op(n0, n1) up to the NaN payload).
@@ -604,6 +746,25 @@ bool emit_arith(FpEmit& e, const Inst& in) {
     }
     case K::fmaxv: case K::fminv: case K::fmaxnmv: case K::fminnmv: {
         // Reduce(op, Vn.4S) = op(op(n0, n1), op(n2, n3)).
+        if (e.avx() && fp_on(fp_old_minmax)) {   // NaN-exact, A64's operand order
+            e.allow_vec_temps(5);
+            const K kind = base_minmax(in.k);
+            const Xmm n = e.vec(in.rn);
+            const auto guard = minmax_guard(e);
+            const Xmm o = e.tmp(), r = e.tmp(), t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
+            const Xmm d = e.dest(in.rd);
+            e.un(op::movshdup, o, n);
+            Shape packed = s;
+            packed.scalar = false;
+            packed.q = true;
+            minmax_exact_core(e, kind, packed, 128, r, n, o, t0, t1, t2, guard);   // r0, r2
+            e.op_i(op::insertps, o, r, r, 0x8e);                                   // {r[2], 0, 0, 0}
+            Shape scalar = s;
+            scalar.scalar = true;
+            minmax_exact_core(e, kind, scalar, 32, d, r, o, t0, t1, t2, guard);
+            e.zero_upper(d, 32);
+            return true;
+        }
         const Xmm n = e.vec(in.rn);
         const Xmm o = e.tmp(), r = e.tmp();
         const auto t = minmax_temps(e, in.k);

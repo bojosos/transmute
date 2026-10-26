@@ -69,7 +69,9 @@ function(fx_add_test name)
     fx_component_options(${name})
     target_link_libraries(${name} PRIVATE ${FX_TEST_LIBS} fx_testing)
     add_test(NAME ${name} COMMAND ${name})
-    set_tests_properties(${name} PROPERTIES TIMEOUT 300)
+    # The property overrides ctest --timeout, so it has to cover a loaded machine and deep fuzzing
+    # (TRANSMUTE_FX_FUZZ_SCALE): fx_emit_fp_tests took 258 s at the default scale under -j4 load.
+    set_tests_properties(${name} PROPERTIES TIMEOUT 900)
 endfunction()
 
 set(FX_COMPONENT_FILES

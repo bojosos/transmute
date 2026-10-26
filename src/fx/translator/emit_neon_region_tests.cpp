@@ -2202,3 +2202,43 @@ FX_TEST(fp_region_minmax_const_bit_exact) {
     std::printf("    %u runs bit-exact; region bytes %zu with the constant forms, %zu without\n", checked, bytes[0], bytes[1]);
     FX_CHECK(bytes[0] < bytes[1]);
 }
+
+// The NaN-exact min/max fixup runs between a compare and its B.cond: the guest
+// flags (kept in host EFLAGS) must survive it, and the NaN lanes must match the
+// oracle bit for bit (FPProcessNaNs).
+FX_TEST(fp_region_minmax_nan_keeps_flags) {
+    ensure_registered();
+    // cmp x0, x1; fmin s2, s0, s1; fminnm d6, d4, d5; fmax v7.4s, v0.4s, v1.4s;
+    // b.ne +3; movz x3, #1; movz x4, #2; movz x5, #3
+    const std::vector<std::uint32_t> w{0xeb01001fu, 0x1e215802u, 0x1e657886u, 0x4e21f407u,
+                                       b_cond(kNe, 3), movz_x(3, 1), movz_x(4, 2), movz_x(5, 3)};
+    static constexpr std::uint64_t kLanes[] = {0x7fc000007fa00001ull, 0xffc00001ff812345ull, 0x3f800000bf800000ull,
+                                               0x7ff4000000000001ull, 0x7ff8000000000000ull, 0x8000000000000000ull};
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    unsigned runs = 0;
+    for (const int optimize : {1, 0}) {
+        runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+        for (unsigned k = 0; k < 36; ++k) {
+            auto ctx = runner.context(85000 + k);
+            ctx.x[0] = k & 1;
+            ctx.x[1] = (k >> 1) & 1;   // equal or not: both branch directions
+            for (const unsigned r : {0u, 1u, 4u, 5u})
+                for (unsigned h = 0; h < 2; ++h) ctx.v[r][h] = kLanes[(k + r * 3 + h) % std::size(kLanes)];
+            runner.report = false;
+            runner.last = {};
+            const bool equal = runner.run(w, ctx, "");
+            runner.report = true;
+            const bool same = equal && runner.last.ok && runner.expected.pc == runner.actual.pc &&
+                              std::memcmp(runner.expected.v, runner.actual.v, sizeof runner.expected.v) == 0;
+            if (!same) {
+                runner.run(w, ctx, "min/max NaN fixup between cmp and b.ne");
+                runner.machine.options.optimize = -1;
+                return;
+            }
+            ++runs;
+        }
+    }
+    runner.machine.options.optimize = -1;
+    std::printf("    %u runs bit-exact, flags intact\n", runs);
+}

@@ -189,6 +189,10 @@ std::uint64_t floating_minmax_bits(std::uint64_t lhs, std::uint64_t rhs,
         }
         return bits;
     };
+    if (!is_double) {   // single precision: only the low 32 bits are the operand
+        lhs &= 0xffffffffULL;
+        rhs &= 0xffffffffULL;
+    }
     lhs = flush_input(lhs);
     rhs = flush_input(rhs);
     const bool left_nan = nan(lhs);

@@ -3,6 +3,8 @@
 #include "fx/translator/emit_fp_tests.hpp"
 
 #include <cstdio>
+#include <string>
+#include <tuple>
 #include <vector>
 
 using namespace transmute::fx;
@@ -233,4 +235,123 @@ FX_TEST(fp_special_conversions_from_gpr) {
         for (unsigned u = 0; u < 2; ++u) n += check_batch(enc::s2(u, es == 64 ? 1 : 0, 0x1d, 0, 1), ctxs, fp_opt(es), "scvtf/ucvtf simd");
     }
     std::printf("    from gpr: %u contexts\n", n);
+}
+
+namespace {
+
+// Min/max do not round: of the FPCR modes only FZ changes them (the bit-exact
+// tests keep FPCR = 0 and FZ, a quarter of the contexts).
+constexpr std::uint32_t kMinMaxFpcr[] = {0u, 1u << 24};
+std::vector<GuestContext> rounding_free(std::vector<GuestContext> ctxs) {
+    std::erase_if(ctxs, [](const GuestContext& c) { return c.fpcr != 0u && c.fpcr != (1u << 24); });
+    return ctxs;
+}
+
+// Vd equal to a source checks register handling more than new values: every
+// other context (keeps the suite inside its ctest timeout).
+std::vector<GuestContext> every_other(const std::vector<GuestContext>& ctxs) {
+    std::vector<GuestContext> out;
+    for (std::size_t i = 0; i < ctxs.size(); i += 2) out.push_back(ctxs[i]);
+    return out;
+}
+
+} // namespace
+
+// FMAX/FMIN/FMAXNM/FMINNM NaN results bit for bit (FPCR.DN = 0): every pair of
+// specials (quiet and signalling NaN payloads, +-0, denormals, infinities,
+// normals) in every lane, scalar S/D and vector .2S/.4S/.2D, Vd distinct from
+// and equal to each source, with and without FZ, both register
+// contexts. The reference interpreter follows FPProcessNaNs.
+FX_TEST(fp_special_pairs_minmax_bit_exact) {
+    unsigned total = 0;
+    for (unsigned es : {32u, 64u}) {
+        const unsigned sz = es == 64 ? 1 : 0;
+        for (unsigned op = 0; op < 4; ++op) {   // FMAX, FMIN, FMAXNM, FMINNM
+            const unsigned a = op & 1u, opc = (op & 2u) ? 0x18 : 0x1e;
+            const char* name = op == 0 ? "fmax" : op == 1 ? "fmin" : op == 2 ? "fmaxnm" : "fminnm";
+            for (const auto [rd, rn, rm] : {std::tuple{3u, 1u, 2u}, std::tuple{1u, 1u, 2u}, std::tuple{2u, 1u, 2u}}) {
+                for (unsigned q = es == 64 ? 1 : 0; q < 2; ++q) {
+                    const auto all = rounding_free(pair_contexts(es, 1, 2, true, (q ? 128 : 64) / es));
+                    const auto ctxs = rd == 3 ? all : every_other(all);
+                    const std::uint32_t word = enc::v3(q, 0, (a << 1) | sz, opc, rd, rn, rm);
+                    const unsigned n = check_batch(word, ctxs, exact_opt(), std::string(name) + " vector exact");
+                    FX_CHECK(n == ctxs.size());
+                    total += n;
+                }
+                const auto all = rounding_free(pair_contexts(es, 1, 2, true, 1));
+                const auto ctxs = rd == 3 ? all : every_other(all);
+                const unsigned scalar_op = op == 0 ? 4 : op == 1 ? 5 : op == 2 ? 6 : 7;
+                const unsigned n = check_batch(enc::fp2(scalar_op, sz, rd, rn, rm), ctxs, exact_opt(), std::string(name) + " scalar exact");
+                FX_CHECK(n == ctxs.size());
+                total += n;
+            }
+        }
+    }
+    std::printf("    %u contexts bit-exact\n", total);
+}
+
+// FMAXP/FMINP/FMAXNMP/FMINNMP (vector and scalar) and FMAXV/FMINV/FMAXNMV/
+// FMINNMV NaN results bit for bit (FPCR.DN = 0): A64's operand order
+// op(n0, n1) / Reduce = op(op(n0, n1), op(n2, n3)), quiet and signalling NaN
+// payloads, +-0, denormals, infinities, with and without FZ.
+FX_TEST(fp_special_pairwise_across_minmax_bit_exact) {
+    unsigned total = 0;
+    for (unsigned op = 0; op < 4; ++op) {   // MAX, MIN, MAXNM, MINNM
+        const unsigned a = op & 1u, nm = op >> 1;
+        const char* name = op == 0 ? "max" : op == 1 ? "min" : op == 2 ? "maxnm" : "minnm";
+        for (unsigned es : {32u, 64u}) {
+            const unsigned sz = es == 64 ? 1 : 0;
+            // Vector pairwise, Vd distinct from and equal to a source.
+            for (const auto [rd, rn, rm] : {std::tuple{3u, 1u, 2u}, std::tuple{1u, 1u, 2u}, std::tuple{2u, 1u, 2u}})
+                for (unsigned q = es == 64 ? 1 : 0; q < 2; ++q) {
+                    const auto all = rounding_free(pair_contexts(es, 1, 2, true, (q ? 128 : 64) / es));
+                    const auto ctxs = rd == 3 ? all : every_other(all);
+                    const std::uint32_t word = enc::v3(q, 1, (a << 1) | sz, nm ? 0x18 : 0x1e, rd, rn, rm);
+                    const unsigned n = check_batch(word, ctxs, exact_opt(), std::string("fp") + name + "p vector exact");
+                    FX_CHECK(n == ctxs.size());
+                    total += n;
+                }
+            // Scalar pairwise: the pair in lanes 0 and 1 of Vn (Vd distinct and equal).
+            const auto list = special_list(es, true);
+            Rng rng(es * 7 + op);
+            std::vector<GuestContext> ctxs;
+            for (const auto fpcr : kMinMaxFpcr)
+                for (const auto x : list)
+                    for (const auto y : list) {
+                        GuestContext c = testing::random_context(rng.next());
+                        fill_vectors(c, rng, es, true);
+                        c.fpcr = fpcr;
+                        set_lane(c, 1, es, 0, x);
+                        set_lane(c, 1, es, 1, y);
+                        ctxs.push_back(c);
+                    }
+            for (const unsigned rd : {3u, 1u}) {
+                const std::uint32_t word = 0x7e300800u | (a << 23) | (sz << 22) | ((nm ? 0x0cu : 0x0fu) << 12) | (1u << 5) | rd;
+                const auto some = rd == 3 ? ctxs : every_other(ctxs);
+                const unsigned n = check_batch(word, some, exact_opt(), std::string("fp") + name + "p scalar exact");
+                FX_CHECK(n == some.size());
+                total += n;
+            }
+        }
+        // Across lanes (.4S): random quadruples of specials, Vd distinct and equal.
+        const auto list = special_list(32, true);
+        Rng rng(4099 + op);
+        std::vector<GuestContext> ctxs;
+        for (const auto fpcr : kMinMaxFpcr)
+            for (unsigned k = 0; k < 400; ++k) {
+                GuestContext c = testing::random_context(rng.next());
+                fill_vectors(c, rng, 32, true);
+                c.fpcr = fpcr;
+                for (unsigned l = 0; l < 4; ++l) set_lane(c, 1, 32, l, list[rng.next() % list.size()]);
+                ctxs.push_back(c);
+            }
+        for (const unsigned rd : {3u, 1u}) {
+            const std::uint32_t word = 0x6e300800u | (a << 23) | ((nm ? 0x0cu : 0x0fu) << 12) | (1u << 5) | rd;
+            const auto some = rd == 3 ? ctxs : every_other(ctxs);
+            const unsigned n = check_batch(word, some, exact_opt(), std::string("fp") + name + "v exact");
+            FX_CHECK(n == some.size());
+            total += n;
+        }
+    }
+    std::printf("    %u contexts bit-exact\n", total);
 }

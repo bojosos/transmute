@@ -74,7 +74,8 @@ const Hot kHot[] = {
     {"fmov d0, d1", enc::fp1(0, 1, 0, 1), 1},
     {"fneg v0.4s, v1.4s", enc::v2(1, 1, 2, 0x0f, 0, 1), 1},
     {"fabs d0, d1", enc::fp1(1, 1, 0, 1), 1},
-    {"fmax v2.4s, v0.4s, v1.4s", enc::v3(1, 0, 0, 0x1e, 2, 0, 1), 5},
+    // NaN-exact min/max: numeric 3 + unordered test, MOVMSKPS, JRCXZ (the fixup runs on NaN lanes only).
+    {"fmax v2.4s, v0.4s, v1.4s", enc::v3(1, 0, 0, 0x1e, 2, 0, 1), 7},
     {"fmaxnm v2.4s, v0.4s, v1.4s", enc::v3(1, 0, 0, 0x18, 2, 0, 1), 7},
     {"fminnm d2, d0, d1", enc::fp2(7, 1, 2, 0, 1), 9, 8},
     {"fsqrt v0.4s, v1.4s", enc::v2(1, 1, 2, 0x1f, 0, 1), 1},
