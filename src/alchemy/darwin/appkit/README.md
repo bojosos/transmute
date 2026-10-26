@@ -98,6 +98,21 @@ content-list thicknesses are not published, so they are unspecified;
 archived split view controllers and items, and accessory view controllers,
 stop explicitly.
 
+**Text layout (`controls/text_layout.cpp`):** NSLayoutManager lays its
+storage out with CoreText's framesetter (shaping, fallback, bidi, line
+breaking and paragraph styles are CoreText's), container by container:
+glyphs in character order (control and null glyphs for characters without
+one), line fragments, used rectangles, the extra line fragment, point and
+range queries, the line fragment and enclosing rectangle enumerations,
+and drawing of glyphs, backgrounds and underlines into the current
+context. NSTextView itself still draws in its storage's first attributes
+(text.cpp), so the manager's geometry is for the storage's real
+attributes. Exclusion paths, custom typesetters (the typesetter-facing
+setters) and text blocks stop explicitly. NSTextStorage's attribute runs,
+paragraphs, words and characters are immutable snapshots. NSTextList
+formats its markers (the bullet characters are chosen here; the
+documentation names only the keywords).
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

@@ -1034,6 +1034,164 @@ void text_system(Fixture& f) {
     }
 }
 
+// ---- NSLayoutManager over CoreText and the TextKit long tail (frameworks wave U11) ------------
+void text_layout(Fixture& f) {
+    const auto rect_of = [](const CallResult& r) { return gui::Rect{{r.d(0), r.d(1)}, {r.d(2), r.d(3)}}; };
+    const auto glyph_query = [&f](Address manager, std::string_view selector, std::uint64_t index, Address range = 0) {
+        CallRegs r;
+        r.x[2] = index;
+        r.x[3] = range;
+        r.x[4] = 0;
+        return f.send(manager, selector, r);
+    };
+    // A storage in two fonts, laid out by a manager in one container without a view.
+    const auto storage = f.id(f.id(f.cls("NSTextStorage"), "alloc"), "initWithString:", {f.str("Hello world\nSecond line")});
+    const auto small = f.with_double(f.cls("NSFont"), "systemFontOfSize:", 12), large = f.with_double(f.cls("NSFont"), "systemFontOfSize:", 24);
+    static_cast<void>(f.id(storage, "addAttribute:value:range:", {f.str("NSFont"), small, 0, 12}));
+    static_cast<void>(f.id(storage, "addAttribute:value:range:", {f.str("NSFont"), large, 12, 11}));
+    const auto manager = f.id(f.id(f.cls("NSLayoutManager"), "alloc"), "init");
+    CallRegs size;
+    gui::appkit::put_size(size, 0, {200, 1e7});
+    const auto container = f.send(f.id(f.cls("NSTextContainer"), "alloc"), "initWithSize:", size).x0;
+    static_cast<void>(f.id(manager, "addTextContainer:", {container}));
+    static_cast<void>(f.id(storage, "addLayoutManager:", {manager}));
+    require(f.integer(manager, "numberOfGlyphs") == 23, "a glyph per character: " + std::to_string(f.integer(manager, "numberOfGlyphs")));
+    require(static_cast<std::uint32_t>(f.integer(manager, "glyphAtIndex:", {11})) == 0x00FFFFFF && f.integer(manager, "glyphAtIndex:", {0}) != 0,
+            "the line separator is a control glyph, letters are glyphs");
+    require(f.integer(manager, "characterIndexForGlyphAtIndex:", {5}) == 5 && f.integer(manager, "glyphIndexForCharacterAtIndex:", {12}) == 12,
+            "glyph <-> character");
+    const auto range = f.process.allocate_guest(16);
+    const auto first = rect_of(glyph_query(manager, "lineFragmentRectForGlyphAtIndex:effectiveRange:", 0, range));
+    require(first.origin.y == 0 && first.size.width == 200 && f.engine.read64(range) == 0 && f.engine.read64(range + 8) == 12,
+            "the first line fragment spans the container and holds 'Hello world\\n'");
+    const auto second = rect_of(glyph_query(manager, "lineFragmentRectForGlyphAtIndex:effectiveRange:", 12, range));
+    const auto second_start = f.engine.read64(range);
+    const auto first_used = rect_of(glyph_query(manager, "lineFragmentUsedRectForGlyphAtIndex:effectiveRange:", 0, 0));
+    const auto second_used = rect_of(glyph_query(manager, "lineFragmentUsedRectForGlyphAtIndex:effectiveRange:", 12, 0));
+    require(second.origin.y >= first.origin.y + first.size.height - 0.01 && second_used.size.height > first_used.size.height && second_start == 12,
+            "the second line, in the larger font, is below and taller: first used h " + std::to_string(first_used.size.height) + " fragment h " +
+                std::to_string(first.size.height) + ", second y " + std::to_string(second.origin.y) + " used h " + std::to_string(second_used.size.height));
+    const auto used = rect_of(f.send(manager, "usedRectForTextContainer:", [&] { CallRegs r; r.x[2] = container; return r; }()));
+    require(used.size.width > 20 && used.size.width < 200 && std::abs(used.size.height - (second.origin.y + second.size.height)) < 0.01,
+            "the used rectangle is the text's");
+    const auto location = f.send(manager, "locationForGlyphAtIndex:", [] { CallRegs r; r.x[2] = 1; return r; }());
+    require(location.d(0) > 5 && location.d(1) > 0, "a glyph's location is after the padding and the first letter, on the baseline");
+    const auto word = rect_of(f.send(manager, "boundingRectForGlyphRange:inTextContainer:", [&] { CallRegs r; r.x[2] = 6; r.x[3] = 5; r.x[4] = container; return r; }()));
+    require(word.origin.x > location.d(0) && word.size.width > 10 && word.origin.y == 0, "the bounding rectangle of 'world'");
+    CallRegs point;
+    point.set_d(0, word.origin.x + 1);
+    point.set_d(1, 5);
+    point.x[2] = container;
+    require(f.send(manager, "glyphIndexForPoint:inTextContainer:", point).x0 == 6, "the glyph under a point");
+    point.x[3] = 0;
+    require(f.send(manager, "characterIndexForPoint:inTextContainer:fractionOfDistanceBetweenInsertionPoints:", point).x0 == 6, "the character under a point");
+    require(rect_of(f.send(manager, "extraLineFragmentRect")).size.height == 0, "no extra line fragment after text");
+    static_cast<void>(f.id(storage, "replaceCharactersInRange:withString:", {23, 0, f.str("\n")}));
+    const auto extra = rect_of(f.send(manager, "extraLineFragmentRect"));
+    require(extra.size.height > 0 && std::abs(extra.origin.y - (second.origin.y + second.size.height)) < 0.5 && f.id(manager, "extraLineFragmentTextContainer") == container,
+            "text ending in a newline has an extra line fragment below: y " + std::to_string(extra.origin.y) + " h " + std::to_string(extra.size.height) +
+                " second bottom " + std::to_string(second.origin.y + second.size.height) + " glyphs " + std::to_string(f.integer(manager, "numberOfGlyphs")) +
+                " unlaid " + std::to_string(f.integer(manager, "firstUnlaidCharacterIndex")));
+    // Glyph arrays.
+    const auto glyphs = f.process.allocate_guest(64), characters = f.process.allocate_guest(128);
+    CallRegs get;
+    get.x[2] = 10; get.x[3] = 4; get.x[4] = glyphs; get.x[5] = 0; get.x[6] = characters; get.x[7] = 0;
+    require(f.send(manager, "getGlyphsInRange:glyphs:properties:characterIndexes:bidiLevels:", get).x0 == 4 && f.engine.read64(characters + 8) == 11 &&
+                f.engine.read64(characters + 16) == 12,
+            "-getGlyphsInRange:... characters");
+    // Wrapping, enumeration and the line limit.
+    static_cast<void>(f.send(container, "setSize:", [] { CallRegs r; gui::appkit::put_size(r, 0, {50, 1e7}); return r; }()));
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> fragments;
+    const auto each_line = f.block("u11_lines", [&f, &fragments](CpuState& s, GuestMemory&) { fragments.emplace_back(s.x[2], s.x[3]); static_cast<void>(f); });
+    static_cast<void>(f.id(manager, "enumerateLineFragmentsForGlyphRange:usingBlock:", {0, 24, each_line}));
+    require(fragments.size() >= 4 && fragments.front().first == 0, "a narrow container wraps the text into more lines");
+    static_cast<void>(f.id(container, "setMaximumNumberOfLines:", {1}));
+    require(f.integer(manager, "firstUnlaidCharacterIndex") < 12 && f.integer(container, "maximumNumberOfLines") == 1, "a line limit leaves text unlaid");
+    static_cast<void>(f.id(container, "setMaximumNumberOfLines:", {0}));
+    // A second container takes the text the first cannot hold.
+    static_cast<void>(f.send(container, "setSize:", [&] { CallRegs r; gui::appkit::put_size(r, 0, {200, first.size.height}); return r; }()));
+    const auto overflow = f.send(f.id(f.cls("NSTextContainer"), "alloc"), "initWithSize:", size).x0;
+    static_cast<void>(f.id(manager, "addTextContainer:", {overflow}));
+    const auto second_range = f.send(manager, "glyphRangeForTextContainer:", [&] { CallRegs r; r.x[2] = overflow; return r; }());
+    require(second_range.x0 == 12 && f.id(manager, "textContainerForGlyphAtIndex:effectiveRange:", {13, 0}) == overflow,
+            "the second container continues the text");
+    // Containers and the explicit stops.
+    point.set_d(0, 10);
+    point.set_d(1, 1);
+    require((f.send(container, "containsPoint:", point).x0 & 0xff) != 0, "a point inside the container");
+    bool stopped{};
+    try { static_cast<void>(f.id(manager, "setTypesetter:", {0})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "custom typesetters stop explicitly");
+    static_cast<void>(f.id(container, "setExclusionPaths:", {f.cf.array(std::vector<Address>{f.str("not a path")})}));
+    stopped = false;
+    try { static_cast<void>(f.integer(manager, "numberOfGlyphs")); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "exclusion paths stop explicitly");
+    static_cast<void>(f.id(container, "setExclusionPaths:", {0}));
+
+    // Drawing: a view that draws the glyphs through the manager.
+    const auto drawn = f.id(f.id(f.cls("NSTextStorage"), "alloc"), "initWithString:", {f.str("MMMM")});
+    static_cast<void>(f.id(drawn, "addAttribute:value:range:", {f.str("NSFont"), large, 0, 4}));
+    const auto painter = f.id(f.id(f.cls("NSLayoutManager"), "alloc"), "init");
+    const auto box = f.send(f.id(f.cls("NSTextContainer"), "alloc"), "initWithSize:", size).x0;
+    static_cast<void>(f.id(painter, "addTextContainer:", {box}));
+    static_cast<void>(f.id(drawn, "addLayoutManager:", {painter}));
+    const auto canvas_class = f.subclass("U11GlyphView", "NSView");
+    f.add(canvas_class, "isFlipped", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
+    f.add(canvas_class, "drawRect:", [&f, painter](CpuState&, GuestMemory&) {
+        CallRegs r;
+        r.x[2] = 0;
+        r.x[3] = 4;
+        r.set_d(0, 10);
+        r.set_d(1, 10);
+        static_cast<void>(f.send(painter, "drawGlyphsForGlyphRange:atPoint:", r));
+    }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    const auto window = f.make_window({{100, 100}, {200, 80}});
+    const auto canvas = f.with_rect(f.id(canvas_class, "alloc"), "initWithFrame:", {{0, 0}, {200, 80}});
+    static_cast<void>(f.id(window, "setContentView:", {canvas}));
+    f.show(window);
+    // Pixels are y up: the flipped view's text 10 points below the top is at y 40..70.
+    require(inked(f, window, {{12, 40}, {60, 30}}) > 20 && inked(f, window, {{120, 2}, {60, 25}}) == 0,
+            "the glyphs are drawn at the container origin");
+    static_cast<void>(f.id(window, "close"));
+
+    // NSTextStorage's views of its text and its font / colour.
+    const auto text = f.id(f.id(f.cls("NSTextStorage"), "alloc"), "initWithString:", {f.str("one two\nthree")});
+    static_cast<void>(f.id(text, "addAttribute:value:range:", {f.str("NSFont"), large, 4, 3}));
+    require(f.integer(f.id(text, "paragraphs"), "count") == 2 && f.integer(f.id(text, "words"), "count") == 3 &&
+                f.integer(f.id(text, "attributeRuns"), "count") == 3 && f.integer(f.id(text, "characters"), "count") == 13,
+            "paragraphs, words, attribute runs and characters");
+    require(f.text(f.id(f.id(f.id(text, "words"), "objectAtIndex:", {1}), "string")) == "two", "the second word");
+    static_cast<void>(f.id(text, "setFont:", {small}));
+    const auto red = f.id(f.cls("NSColor"), "redColor");
+    static_cast<void>(f.id(text, "setForegroundColor:", {red}));
+    require(f.id(text, "font") == small && f.id(text, "foregroundColor") == red && f.integer(f.id(text, "attributeRuns"), "count") == 1,
+            "-setFont: and -setForegroundColor: cover the text");
+
+    // Paragraph style additions and text lists.
+    const auto list = f.id(f.id(f.cls("NSTextList"), "alloc"), "initWithMarkerFormat:options:", {f.str("{decimal}."), 0});
+    require(f.text(f.id(list, "markerForItemNumber:", {3})) == "3." && f.yes(list, "isOrdered") && f.integer(list, "startingItemNumber") == 1,
+            "a decimal list");
+    const auto roman = f.id(f.id(f.cls("NSTextList"), "alloc"), "initWithMarkerFormat:options:startingItemNumber:", {f.str("({upper-roman})"), 0, 4});
+    const auto alpha = f.id(f.id(f.cls("NSTextList"), "alloc"), "initWithMarkerFormat:options:", {f.str("{lower-alpha}"), 0});
+    const auto disc = f.id(f.id(f.cls("NSTextList"), "alloc"), "initWithMarkerFormat:options:", {f.str("{disc}"), 0});
+    require(f.text(f.id(roman, "markerForItemNumber:", {14})) == "(XIV)" && f.integer(roman, "startingItemNumber") == 4 &&
+                f.text(f.id(alpha, "markerForItemNumber:", {28})) == "ab" && f.text(f.id(disc, "markerForItemNumber:", {1})) == "\xE2\x80\xA2" &&
+                !f.yes(disc, "isOrdered"),
+            "roman, alphabetic and bullet markers");
+    const auto paragraph = f.id(f.id(f.cls("NSMutableParagraphStyle"), "alloc"), "init");
+    static_cast<void>(f.id(paragraph, "setHeaderLevel:", {2}));
+    static_cast<void>(f.id(paragraph, "setTextLists:", {f.cf.array(std::vector<Address>{list})}));
+    static_cast<void>(f.id(paragraph, "setUsesDefaultHyphenation:", {1}));
+    const auto copy = f.id(paragraph, "copy");
+    require(f.integer(copy, "headerLevel") == 2 && f.integer(f.id(copy, "textLists"), "count") == 1 && f.yes(copy, "usesDefaultHyphenation") &&
+                std::abs(f.send(paragraph, "tighteningFactorForTruncation").s(0) - 0.05f) < 1e-6 && f.integer(f.id(copy, "textBlocks"), "count") == 0,
+            "header level, text lists and hyphenation travel with a copy");
+    stopped = false;
+    try { static_cast<void>(f.id(paragraph, "setTextBlocks:", {f.cf.array(std::vector<Address>{list})})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "text blocks stop explicitly");
+
+}
+
 // ---- NSTextTab and paragraph styles -----------------------------------------------------------
 void text_tabs(Fixture& f) {
     const auto tab_class = f.cls("NSTextTab");
@@ -1544,6 +1702,7 @@ int main() {
         date_pickers(f);
         color_wells(f);
         text_system(f);
+        text_layout(f);
         text_tabs(f);
         tables(f);
         collection_views(f);

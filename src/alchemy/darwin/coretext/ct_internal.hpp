@@ -101,6 +101,12 @@ struct ParagraphStyle {
     std::int32_t writing_direction{-1};       // natural
     float hyphenation_factor{};               // NSParagraphStyle (kept; lines are not hyphenated)
     bool allows_tightening{};                 // -allowsDefaultTighteningForTruncation (kept)
+    // NSParagraphStyle only, kept: -headerLevel, -lineBreakStrategy,
+    // -tighteningFactorForTruncation (AppKit's default 0.05), -usesDefaultHyphenation.
+    std::int64_t header_level{};
+    std::uint64_t line_break_strategy{};
+    float tightening_factor{0.05f};
+    bool uses_default_hyphenation{};
 };
 // CTParagraphStyleRef and NSParagraphStyle / NSMutableParagraphStyle.
 struct ParagraphState final : ObjectPayload {
@@ -109,6 +115,7 @@ struct ParagraphState final : ObjectPayload {
     // the style has AppKit's default stops (12 left tabs, 28 points apart).
     std::vector<Address> tabs;
     bool tabs_set{};
+    std::vector<Address> lists;               // +1 NSTextLists (-textLists; list markers are the text's own)
 };
 
 // ---- attributed strings (attributed.cpp) --------------------------------------------------

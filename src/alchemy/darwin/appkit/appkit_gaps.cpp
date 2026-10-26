@@ -176,6 +176,53 @@ void Provider::install_appkit() {
         std::lock_guard lock(values->mutex);
         for (unsigned i = 0; i < 4; ++i) values->reals["bounds" + std::to_string(i)] = std::bit_cast<double>(s.v[i][0]);
     }, false, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    real_properties(attachment, {"lineLayoutPadding"});
+    // -allowsTextAttachmentView is YES until set (text attachment views are kept, not shown).
+    method(attachment, "allowsTextAttachmentView", [this](CpuState& s, GuestMemory&) { s.x[0] = stored_integer(s.x[0], "noAttachmentView") ? 0 : 1; }, false, "B@:");
+    method(attachment, "setAllowsTextAttachmentView:", [this](CpuState& s, GuestMemory&) { store_integer(s.x[0], "noAttachmentView", (s.x[2] & 0xff) ? 0 : 1); },
+           false, "v@:B");
+    // The image: the one set, else one read from the contents or the file wrapper's data.
+    const auto attachment_image = [this](Address self) -> Address {
+        if (const auto image = stored(self, "image")) return image;
+        Address data = stored(self, "contents");
+        if (!data) if (const auto wrapper = stored(self, "fileWrapper")) data = objc.send(wrapper, objc.selector("regularFileContents")).x0;
+        if (!data) return 0;
+        const auto image_class = objc.find_class("NSImage");
+        const auto made = objc.send(objc.send(image_class, objc.selector("alloc")).x0, objc.selector("initWithData:"), [&] { CallRegs r; r.x[2] = data; return r; }()).x0;
+        return made ? objc.send(made, objc.selector("autorelease")).x0 : 0;
+    };
+    method(attachment, "imageForBounds:textContainer:characterIndex:", [attachment_image](CpuState& s, GuestMemory&) { s.x[0] = attachment_image(s.x[0]); }, false,
+           "@@:{CGRect={CGPoint=dd}{CGSize=dd}}@Q");
+    // The bounds set, else the image's size at the baseline (CGRectZero without an image).
+    method(attachment, "attachmentBoundsForTextContainer:proposedLineFragment:glyphPosition:characterIndex:", [this, attachment_image](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto bounds = objc.send(self, objc.selector("bounds"));
+        if (bounds.d(2) != 0 || bounds.d(3) != 0) {
+            for (unsigned i = 0; i < 4; ++i) s.v[i] = {std::bit_cast<std::uint64_t>(bounds.d(i)), 0};
+            return;
+        }
+        double width = 0, height = 0;
+        if (const auto image = attachment_image(self)) {
+            const auto size = objc.send(image, objc.selector("size"));
+            width = size.d(0);
+            height = size.d(1);
+        }
+        for (unsigned i = 0; i < 4; ++i) s.v[i] = {std::bit_cast<std::uint64_t>(i == 2 ? width : i == 3 ? height : 0.0), 0};
+    }, false, "{CGRect={CGPoint=dd}{CGSize=dd}}@:@{CGRect={CGPoint=dd}{CGSize=dd}}{CGPoint=dd}Q");
+    method(attachment, "textAttachmentWithImage:", [this, attachment](CpuState& s, GuestMemory&) {
+        const auto made = create(s.x[0] ? s.x[0] : attachment);
+        store(made, "image", s.x[2]);
+        s.x[0] = objc.send(made, objc.selector("autorelease")).x0;
+    }, true, "@@:@");
+    // Text attachment view providers by file type (kept: attachment views are not shown).
+    static std::map<std::string, Address> view_providers;
+    method(attachment, "registerTextAttachmentViewProviderClass:forFileType:", [this](CpuState& s, GuestMemory&) {
+        if (s.x[3]) view_providers[cf.utf8(s.x[3])] = s.x[2];
+    }, true, "v@:#@");
+    method(attachment, "textAttachmentViewProviderClassForFileType:", [this](CpuState& s, GuestMemory&) {
+        const auto found = s.x[2] ? view_providers.find(cf.utf8(s.x[2])) : view_providers.end();
+        s.x[0] = found == view_providers.end() ? 0 : found->second;
+    }, true, "#@:@");
     // +[NSAttributedString attributedStringWithAttachment:]: U+FFFC carrying
     // the attachment under NSAttachmentAttributeName ("NSAttachment").
     if (const auto attributed = objc.find_class("NSAttributedString"); attributed && !objc.responds(attributed, objc.selector("attributedStringWithAttachment:"))) {

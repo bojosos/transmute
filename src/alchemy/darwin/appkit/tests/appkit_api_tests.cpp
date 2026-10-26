@@ -489,6 +489,18 @@ void containers_and_controllers(Fixture& f) {
     static_cast<void>(f.with_rect(attachment, "setBounds:", {{0, -2}, {16, 16}}));
     const auto bounds = f.rect(f.msg(attachment, "bounds"));
     require(near(bounds.origin.y, -2) && near(bounds.size.width, 16), "text attachment bounds");
+    // Attachment bounds for layout: the bounds set, else an image's size (frameworks wave U11).
+    CallRegs bounds_query;
+    const auto set_bounds = f.msg(attachment, "attachmentBoundsForTextContainer:proposedLineFragment:glyphPosition:characterIndex:", bounds_query);
+    CallRegs image_size;
+    image_size.set_d(0, 16);
+    image_size.set_d(1, 12);
+    const auto image = f.msg(f.id(f.cls("NSImage"), "alloc"), "initWithSize:", image_size).x0;
+    const auto pictured = f.id(f.cls("NSTextAttachment"), "textAttachmentWithImage:", {image});
+    const auto image_bounds = f.msg(pictured, "attachmentBoundsForTextContainer:proposedLineFragment:glyphPosition:characterIndex:", bounds_query);
+    require(near(set_bounds.d(1), -2) && f.id(pictured, "image") == image && near(image_bounds.d(2), 16) && near(image_bounds.d(3), 12) &&
+                (f.id(pictured, "allowsTextAttachmentView") & 0xff) == 1 && f.id(pictured, "imageForBounds:textContainer:characterIndex:", {0, 0}) == image,
+            "attachment bounds and image for layout");
     const auto spell = f.cls("NSSpellChecker");
     const auto tag = f.id(spell, "uniqueSpellDocumentTag");
     require(f.id(spell, "uniqueSpellDocumentTag") == tag + 1, "+uniqueSpellDocumentTag counts");

@@ -203,7 +203,13 @@ void set_tabs(Quartz& q, Address paragraph, std::vector<Address> tabs) {
 }
 void copy_tabs(Quartz& q, Address from, Address to) {
     const auto source = q.find<ParagraphState>(from);
-    if (!source || !source->tabs_set) return;
+    if (!source) return;
+    // The text lists travel with the tabs.
+    if (const auto target = q.find<ParagraphState>(to); target && target != source) {
+        for (const auto list : source->lists) q.retain(list);
+        for (const auto list : std::exchange(target->lists, source->lists)) q.release(list);
+    }
+    if (!source->tabs_set) return;
     set_tabs(q, to, source->tabs);
 }
 
@@ -878,8 +884,10 @@ void install_attributed_strings(Quartz& q) {
     }, "@@:^v");
     for (const auto cls : {ps, coretext_state.paragraph_class})
         method(cls, "dealloc", [quartz, cls](CpuState& s, GuestMemory&) {
-            if (const auto state = quartz->find<ParagraphState>(s.x[0]))
+            if (const auto state = quartz->find<ParagraphState>(s.x[0])) {
                 for (const auto tab : std::exchange(state->tabs, {})) quartz->release(tab);
+                for (const auto list : std::exchange(state->lists, {})) quartz->release(list);
+            }
             static_cast<void>(quartz->objc.send_super(s.x[0], cls, quartz->objc.selector("dealloc")));
         }, "v@:");
     // Archived paragraph styles (keyed archives; nibs make them values).
@@ -964,8 +972,23 @@ void install_attributed_strings(Quartz& q) {
                            a_style.minimum_line_height == b_style.minimum_line_height &&
                            a_style.maximum_line_height == b_style.maximum_line_height &&
                            a_style.line_height_multiple == b_style.line_height_multiple &&
-                           a_style.paragraph_spacing_before == b_style.paragraph_spacing_before);
+                           a_style.paragraph_spacing_before == b_style.paragraph_spacing_before &&
+                           a_style.header_level == b_style.header_level && a_style.line_break_strategy == b_style.line_break_strategy &&
+                           paragraph_state(s.x[0])->lists.size() == other->lists.size());
     }, "B@:@");
+    method(ps, "headerLevel", [paragraph_state](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(paragraph_state(s.x[0])->style.header_level); }, "q@:");
+    method(ps, "lineBreakStrategy", [paragraph_state](CpuState& s, GuestMemory&) { s.x[0] = paragraph_state(s.x[0])->style.line_break_strategy; }, "Q@:");
+    method(ps, "tighteningFactorForTruncation", [paragraph_state](CpuState& s, GuestMemory&) {
+        set_float(s, 0, paragraph_state(s.x[0])->style.tightening_factor);
+    }, "f@:");
+    method(ps, "usesDefaultHyphenation", [paragraph_state](CpuState& s, GuestMemory&) {
+        return_bool(s, paragraph_state(s.x[0])->style.uses_default_hyphenation);
+    }, "B@:");
+    method(ps, "textLists", [quartz, paragraph_state](CpuState& s, GuestMemory&) {
+        s.x[0] = quartz->autorelease(quartz->cf.array(paragraph_state(s.x[0])->lists));
+    });
+    // Text blocks (tables) are not laid out, so none can be set.
+    method(ps, "textBlocks", [quartz](CpuState& s, GuestMemory&) { s.x[0] = quartz->autorelease(quartz->cf.array({})); });
     method(mps, "setAlignment:", [paragraph_state](CpuState& s, GuestMemory&) { paragraph_state(s.x[0])->style.alignment = ns_to_ct(static_cast<std::int64_t>(s.x[2])); }, "v@:q");
     method(mps, "setLineBreakMode:", [paragraph_state](CpuState& s, GuestMemory&) { paragraph_state(s.x[0])->style.line_break = static_cast<std::int32_t>(s.x[2]); }, "v@:Q");
     method(mps, "setBaseWritingDirection:", [paragraph_state](CpuState& s, GuestMemory&) {
@@ -978,6 +1001,7 @@ void install_attributed_strings(Quartz& q) {
         } else {
             const auto state = paragraph_state(s.x[0]);
             for (const auto tab : std::exchange(state->tabs, {})) quartz->release(tab);
+            for (const auto list : std::exchange(state->lists, {})) quartz->release(list);
             state->tabs_set = false;
         }
     }, "v@:@");
@@ -1005,6 +1029,24 @@ void install_attributed_strings(Quartz& q) {
     method(mps, "setAllowsDefaultTighteningForTruncation:", [paragraph_state](CpuState& s, GuestMemory&) {
         paragraph_state(s.x[0])->style.allows_tightening = bool_arg(s, 2);
     }, "v@:B");
+    method(mps, "setHeaderLevel:", [paragraph_state](CpuState& s, GuestMemory&) {
+        paragraph_state(s.x[0])->style.header_level = std::clamp<std::int64_t>(static_cast<std::int64_t>(s.x[2]), 0, 6);
+    }, "v@:q");
+    method(mps, "setLineBreakStrategy:", [paragraph_state](CpuState& s, GuestMemory&) { paragraph_state(s.x[0])->style.line_break_strategy = s.x[2]; }, "v@:Q");
+    method(mps, "setTighteningFactorForTruncation:", [paragraph_state](CpuState& s, GuestMemory&) {
+        paragraph_state(s.x[0])->style.tightening_factor = float_arg(s, 0);
+    }, "v@:f");
+    method(mps, "setUsesDefaultHyphenation:", [paragraph_state](CpuState& s, GuestMemory&) {
+        paragraph_state(s.x[0])->style.uses_default_hyphenation = bool_arg(s, 2);
+    }, "v@:B");
+    method(mps, "setTextLists:", [quartz, paragraph_state](CpuState& s, GuestMemory&) {
+        const auto lists = s.x[2] ? quartz->cf.array_values(s.x[2]) : std::vector<Address>{};
+        for (const auto list : lists) quartz->retain(list);
+        for (const auto list : std::exchange(paragraph_state(s.x[0])->lists, lists)) quartz->release(list);
+    }, "v@:@");
+    method(mps, "setTextBlocks:", [quartz](CpuState& s, GuestMemory&) {
+        if (s.x[2] && !quartz->cf.array_values(s.x[2]).empty()) unsupported("-[NSMutableParagraphStyle setTextBlocks:] (text blocks and tables are not laid out)");
+    }, "v@:@");
 
     install_text_tabs(q);
 }

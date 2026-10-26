@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <tuple>
 
 // The TextKit 1 objects behind NSTextView (the inspectors' notes and the
 // workspace's text views) and NSTextView's attribute, selection and typing
@@ -39,6 +40,7 @@ constexpr std::uint64_t edited_attributes = 1, edited_characters = 2;
 struct StorageInfo {
     std::vector<Address> layout_managers;    // +1
     Address delegate{};                      // not retained
+    Address observer{};                      // -textStorageObserver (not retained)
     std::uint64_t mask{};
     std::size_t location{}, length{};        // the edited range (in the new text)
     std::int64_t delta{};
@@ -438,6 +440,100 @@ void install_text_system(AppKit& kit) {
         note_edit(kit2, self, edited_attributes, s.x[3], s.x[4], 0);
     });
 
+    // Scripting views of the text: arrays of immutable attributed substrings
+    // (snapshots; AppKit's are live sub-storages, so an edit through one of
+    // them fails here instead of reaching the storage).
+    const auto substrings = [k](Address self, const std::vector<std::pair<std::size_t, std::size_t>>& ranges) {
+        std::vector<Address> values;
+        for (const auto& [location, length] : ranges) {
+            CallRegs registers;
+            registers.x[2] = location;
+            registers.x[3] = length;
+            values.push_back(k->send(self, "attributedSubstringFromRange:", registers).x0);
+        }
+        return k->auto_array(values);
+    };
+    kit.method(st, "attributeRuns", [k, substrings](CpuState& s, GuestMemory& m) {
+        const auto total = length_of(*k, s.x[0]);
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        const auto effective = k->process.allocate_guest(16, 8);
+        for (std::size_t at = 0; at < total;) {
+            CallRegs registers;
+            registers.x[2] = at;
+            registers.x[3] = effective;
+            static_cast<void>(k->send(s.x[0], "attributesAtIndex:effectiveRange:", registers));
+            const auto end = std::clamp<std::size_t>(m.read64(effective) + m.read64(effective + 8), at + 1, total);
+            ranges.emplace_back(at, end - at);
+            at = end;
+        }
+        k->process.release_guest(effective);
+        s.x[0] = substrings(s.x[0], ranges);
+    });
+    kit.method(st, "paragraphs", [k, substrings](CpuState& s, GuestMemory&) {
+        const auto text = k->string16(k->send_id(s.x[0], "string"));
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        std::size_t start = 0;
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            const auto c = text[i];
+            if (c != u'\n' && c != u'\r' && c != 0x2029 && c != 0x2028 && c != 0x85) continue;
+            if (c == u'\r' && i + 1 < text.size() && text[i + 1] == u'\n') ++i;
+            ranges.emplace_back(start, i + 1 - start);
+            start = i + 1;
+        }
+        if (start < text.size()) ranges.emplace_back(start, text.size() - start);
+        s.x[0] = substrings(s.x[0], ranges);
+    });
+    kit.method(st, "words", [k, substrings](CpuState& s, GuestMemory&) {
+        const auto text = k->string16(k->send_id(s.x[0], "string"));
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        for (std::size_t i = 0; i < text.size();) {
+            if (!word_unit(text[i])) { ++i; continue; }
+            const auto start = i;
+            while (i < text.size() && word_unit(text[i])) ++i;
+            ranges.emplace_back(start, i - start);
+        }
+        s.x[0] = substrings(s.x[0], ranges);
+    });
+    kit.method(st, "characters", [k, substrings](CpuState& s, GuestMemory&) {
+        const auto string = k->send_id(s.x[0], "string");
+        const auto total = length_of(*k, s.x[0]);
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        for (std::size_t at = 0; at < total;) {
+            CallRegs registers;
+            registers.x[2] = at;
+            const auto range = k->send(string, "rangeOfComposedCharacterSequenceAtIndex:", registers);
+            const auto end = std::clamp<std::size_t>(range.x0 + range.x1, at + 1, total);
+            ranges.emplace_back(at, end - at);
+            at = end;
+        }
+        s.x[0] = substrings(s.x[0], ranges);
+    });
+    // The attribute of the first character; setting it covers the whole text.
+    for (const auto& [getter, setter, key] : {std::tuple{"font", "setFont:", "NSFont"}, std::tuple{"foregroundColor", "setForegroundColor:", "NSColor"}}) {
+        const std::string name = key;
+        kit.method(st, getter, [k, name](CpuState& s, GuestMemory&) {
+            if (length_of(*k, s.x[0]) == 0) { s.x[0] = 0; return; }
+            CallRegs registers;
+            registers.x[2] = k->auto_string(name);
+            registers.x[3] = 0;
+            registers.x[4] = 0;
+            s.x[0] = k->send(s.x[0], "attribute:atIndex:effectiveRange:", registers).x0;
+        });
+        kit.method(st, setter, [k, name](CpuState& s, GuestMemory&) {
+            const auto total = length_of(*k, s.x[0]);
+            if (total == 0) return;
+            if (s.x[2]) static_cast<void>(k->send_id(s.x[0], "addAttribute:value:range:", {k->auto_string(name), s.x[2], 0, total}));
+            else static_cast<void>(k->send_id(s.x[0], "removeAttribute:range:", {k->auto_string(name), 0, total}));
+        }, "v@:@");
+    }
+    // Attributes are fixed as they are set (-fixesAttributesLazily is NO).
+    kit.method(st, "ensureAttributesAreFixedInRange:", [](CpuState&, GuestMemory&) {}, "v@:{_NSRange=QQ}");
+    kit.method(st, "invalidateAttributesInRange:", [k](CpuState& s, GuestMemory&) {
+        if (k->responds(s.x[0], "fixAttributesInRange:")) static_cast<void>(k->send_id(s.x[0], "fixAttributesInRange:", {s.x[2], s.x[3]}));
+    }, "v@:{_NSRange=QQ}");
+    kit.method(st, "textStorageObserver", [](CpuState& s, GuestMemory&) { s.x[0] = storages()[s.x[0]].observer; });
+    kit.method(st, "setTextStorageObserver:", [](CpuState& s, GuestMemory&) { storages()[s.x[0]].observer = s.x[2]; }, "v@:@");
+
     // ---- NSLayoutManager ----
     const auto lm = manager_class;
     kit.method(lm, "init", [k, lm](CpuState& s, GuestMemory&) {
@@ -464,12 +560,14 @@ void install_text_system(AppKit& kit) {
             }
             for (auto& run : std::exchange(state->temporary, {})) k->release(run.attributes);
         }
+        forget_text_layout(*k, s.x[0]);
         static_cast<void>(k->objc.send_super(s.x[0], lm, k->sel("dealloc")));
     }, "v@:");
     kit.method(lm, "textStorage", [k](CpuState& s, GuestMemory&) { s.x[0] = layout_of(*k, s.x[0])->storage; });
     kit.method(lm, "setTextStorage:", [k](CpuState& s, GuestMemory&) {
         const auto state = layout_of(*k, s.x[0]);
         state->storage = s.x[2];
+        ++state->generation;
         for (auto& run : std::exchange(state->temporary, {})) k->release(run.attributes);
         for (const auto container : state->containers)
             if (const auto view = container_of(*k, container)->text_view) {
@@ -513,6 +611,7 @@ void install_text_system(AppKit& kit) {
     for (const auto* name : {"textContainerChangedGeometry:", "textContainerChangedTextView:"})
         kit.method(lm, name, [k](CpuState& s, GuestMemory&) {
             if (!s.x[2]) return;
+            ++layout_of(*k, s.x[0])->generation;
             if (const auto view = container_of(*k, s.x[2])->text_view) {
                 k->invalidate_view(view);
                 const auto state = text_state(*k, view);
@@ -532,30 +631,13 @@ void install_text_system(AppKit& kit) {
         kit.method(lm, getter, [k, member](CpuState& s, GuestMemory&) { return_bool(s, (*layout_of(*k, s.x[0])).*member); }, "B@:");
         kit.method(lm, setter, [k, member](CpuState& s, GuestMemory&) { (*layout_of(*k, s.x[0])).*member = bool_arg(s, 2); }, "v@:B");
     };
-    // Layout is always complete here (the view lays its text out whole), so
+    // Layout is always complete here (the text is laid out whole), so
     // non-contiguous layout is allowed but never in effect.
     flag("allowsNonContiguousLayout", "setAllowsNonContiguousLayout:", &LayoutManagerState::non_contiguous);
     kit.method(lm, "hasNonContiguousLayout", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
     flag("backgroundLayoutEnabled", "setBackgroundLayoutEnabled:", &LayoutManagerState::background_layout);
     flag("showsInvisibleCharacters", "setShowsInvisibleCharacters:", &LayoutManagerState::shows_invisibles);
     flag("showsControlCharacters", "setShowsControlCharacters:", &LayoutManagerState::shows_control_characters);
-    // Glyphs are characters one to one (the drawing layer shapes text itself).
-    kit.method(lm, "numberOfGlyphs", [k](CpuState& s, GuestMemory&) { s.x[0] = length_of(*k, layout_of(*k, s.x[0])->storage); }, "Q@:");
-    for (const auto* name : {"glyphRangeForCharacterRange:actualCharacterRange:", "characterRangeForGlyphRange:actualGlyphRange:"})
-        kit.method(lm, name, [k](CpuState& s, GuestMemory& m) {
-            const auto total = length_of(*k, layout_of(*k, s.x[0])->storage);
-            const auto location = std::min<std::size_t>(s.x[2], total);
-            const auto length = std::min<std::size_t>(s.x[3], total - location);
-            if (s.x[4]) { m.write64(s.x[4], location); m.write64(s.x[4] + 8, length); }
-            s.x[0] = location;
-            s.x[1] = length;
-        }, "{_NSRange=QQ}@:{_NSRange=QQ}^{_NSRange=QQ}");
-    kit.method(lm, "glyphRangeForTextContainer:", [k](CpuState& s, GuestMemory&) {
-        const auto state = layout_of(*k, s.x[0]);
-        const bool first = !state->containers.empty() && state->containers.front() == s.x[2];
-        s.x[0] = 0;
-        s.x[1] = first ? length_of(*k, state->storage) : 0;
-    }, "{_NSRange=QQ}@:@");
     for (const auto* name : {"ensureLayoutForTextContainer:", "ensureLayoutForCharacterRange:", "ensureLayoutForGlyphRange:",
              "invalidateDisplayForCharacterRange:", "invalidateDisplayForGlyphRange:"}) {
         const std::string selector = name;
@@ -565,25 +647,14 @@ void install_text_system(AppKit& kit) {
         }, selector.ends_with("Container:") ? "v@:@" : "v@:{_NSRange=QQ}");
     }
     kit.method(lm, "invalidateLayoutForCharacterRange:actualCharacterRange:", [k](CpuState& s, GuestMemory& m) {
+        ++layout_of(*k, s.x[0])->generation;
         if (s.x[4]) { m.write64(s.x[4], s.x[2]); m.write64(s.x[4] + 8, s.x[3]); }
         for (const auto container : layout_of(*k, s.x[0])->containers)
             if (const auto view = container_of(*k, container)->text_view) k->invalidate_view(view);
     }, "v@:{_NSRange=QQ}^{_NSRange=QQ}");
-    // The text's used area in a container: the view's line layout.
-    kit.method(lm, "usedRectForTextContainer:", [k](CpuState& s, GuestMemory&) {
-        const auto view = s.x[2] ? container_of(*k, s.x[2])->text_view : 0;
-        if (!view) { return_rect(s, {}); return; }
-        const auto state = text_state(*k, view);
-        TextStyle style;
-        style.font = k->font_spec(state->font);
-        if (!state->font) style.font.size = 12;
-        const auto bounds = AppKit::view_bounds(*k->view_state(view));
-        const auto padding = container_of(*k, s.x[2])->padding;
-        const auto size = k->measure_string(state->value, style, std::max(0.0, bounds.size.width - 2 * state->inset.width - 2 * padding));
-        return_rect(s, {{0, 0}, {size.width + 2 * padding, size.height}});
-    }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:@");
     kit.method(lm, "processEditingForTextStorage:edited:range:changeInLength:invalidatedRange:", [k](CpuState& s, GuestMemory&) {
         const auto state = layout_of(*k, s.x[0]);
+        ++state->generation;
         if (s.x[3] & edited_characters) follow_edit(*k, *state, s.x[4], s.x[5], static_cast<std::int64_t>(s.x[6]));
         for (const auto container : state->containers)
             if (const auto view = container_of(*k, container)->text_view) sync_view(*k, view);
@@ -1075,6 +1146,7 @@ void install_text_system(AppKit& kit) {
         // With no panel UI there is never a pending panel change: the font is unchanged.
         kit.method(panel, "panelConvertFont:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[2]; });
     }
+    install_text_layout(kit);
 }
 
 } // namespace alchemy::gui::completion_kit::controls

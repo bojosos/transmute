@@ -168,6 +168,8 @@ struct ContainerState final : ObjectPayload {
     Address text_view{};                                         // not retained
     Address layout_manager{};                                    // not retained
     bool tracks_width{true}, tracks_height{};
+    std::int64_t maximum_lines{};                                // -maximumNumberOfLines (0: no limit)
+    Address exclusion_paths{};                                   // +1 NSArray of NSBezierPath (-exclusionPaths)
 };
 
 // NSLayoutManager (TextKit 1): the storage it lays out and the containers
@@ -180,7 +182,12 @@ struct LayoutManagerState final : ObjectPayload {
     struct Run { std::size_t length{}; Address attributes{}; };   // attributes +1 (0: none)
     std::vector<Run> temporary;              // lengths add up to the storage length
     bool non_contiguous{}, background_layout{true}, shows_invisibles{}, shows_control_characters{};
+    bool limits_suspicious{true};            // -limitsLayoutForSuspiciousContents (kept)
     std::uint64_t flags{};                   // archived NSLMFlags
+    std::int64_t typesetter_behavior{-1};    // NSTypesetterLatestBehavior (kept: the layout is CoreText's)
+    // Bumped by every edit and invalidation; the glyph and line layout
+    // (controls/text_layout.cpp) is made again when it changed.
+    std::uint64_t generation{};
 };
 
 // The process's AppKit provider: set by AppKit::install_controls, read by the

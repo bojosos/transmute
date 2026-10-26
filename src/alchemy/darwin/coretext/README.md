@@ -24,6 +24,11 @@ first face; making a font from one registers the file. There are no
 downloadable font assets (kCTFontManagerErrorAssetNotFound), and
 auto-activation settings are kept per process only.
 
+**Paragraph styles:** NSParagraphStyle's header level, line break strategy,
+tightening factor (0.05 by default), default hyphenation and text lists are
+kept and copied; lines are not hyphenated or tightened. Text blocks (tables)
+are not laid out, so setting any stops explicitly.
+
 **Not registered:** CTRunDelegate and CTGlyphInfo (the host's line layout
 has no inline objects or glyph substitutions), CTRubyAnnotation, font
 features (CTFontCopyFeatures, CTFontDescriptorCreateCopyWithFeature) and

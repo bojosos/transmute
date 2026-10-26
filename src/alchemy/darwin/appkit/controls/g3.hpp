@@ -73,6 +73,12 @@ void install_search_field(AppKit& kit);
 void install_date_picker(AppKit& kit);
 void install_color_well(AppKit& kit);
 void install_text_system(AppKit& kit);
+// NSLayoutManager's glyphs and line fragments laid out by CoreText, and the
+// NSTextContainer additions (text_layout.cpp; installed by install_text_system).
+void install_text_layout(AppKit& kit);
+// The manager's layout is made again on next use / dropped with the manager.
+void invalidate_text_layout(AppKit& kit, Address manager);
+void forget_text_layout(AppKit& kit, Address manager);
 void install_tables(AppKit& kit);
 void install_collection_view(AppKit& kit);
 void install_rulers(AppKit& kit);
