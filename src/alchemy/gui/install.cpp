@@ -15,6 +15,7 @@
 #include "alchemy/darwin/localauthenticationembeddedui/install.hpp"
 #include "alchemy/darwin/mediaplayer/install.hpp"
 #include "alchemy/darwin/opengl/install.hpp"
+#include "alchemy/darwin/openal/openal.hpp"
 #include "alchemy/darwin/safariservices/install.hpp"
 #include "alchemy/darwin/usernotifications/install.hpp"
 #include "alchemy/darwin/vision/install.hpp"
@@ -53,6 +54,7 @@ constexpr Installer installers[] = {
     {"install_quartzcore", gui::install_quartzcore},
     {"install_metal_gui", gui::install_metal_gui},
     {"install_opengl", opengl::install_opengl},      // OpenGL.framework over host::gl (darwin/opengl/)
+    {"install_openal_gui", openal::install_openal_gui}, // OpenAL over the default output device (darwin/openal/)
     {"install_system_configuration", gui::install_system_configuration},
     {"install_quartz2d", gui::install_quartz2d},
     {"install_security", gui::install_security},           // Security, then GSS (darwin/security/install.cpp)
