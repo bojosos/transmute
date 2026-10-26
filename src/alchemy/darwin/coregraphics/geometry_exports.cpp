@@ -170,6 +170,26 @@ void Quartz::install_geometry() {
         result(s, value.inverse().value_or(value));
     });
     function(cg, "_CGAffineTransformIsIdentity", [this](CpuState& s, GuestMemory&) { return_bool(s, read_affine(s.x[0]).is_identity()); });
+    // CGAffineTransformComponents {CGSize scale; CGFloat horizontalShear;
+    // CGFloat rotation; CGVector translation} (48 bytes, by reference both
+    // ways): the transform is scale, then horizontal shear, then rotation,
+    // then translation. A mirrored transform has a negative vertical scale.
+    function(cg, "_CGAffineTransformMakeWithComponents", [result](CpuState& s, GuestMemory& m) {
+        std::array<double, 6> c{};
+        for (unsigned i = 0; i < 6; ++i) c[i] = std::bit_cast<double>(m.read64(s.x[0] + i * 8));
+        const double sx = c[0], sy = c[1], shear = c[2], cosine = std::cos(c[3]), sine = std::sin(c[3]);
+        // Rows: [sx 0; sy*shear sy] times [cos sin; -sin cos].
+        result(s, {sx * cosine, sx * sine, sy * shear * cosine - sy * sine, sy * shear * sine + sy * cosine, c[4], c[5]});
+    });
+    function(cg, "_CGAffineTransformDecompose", [this](CpuState& s, GuestMemory& m) {
+        const auto t = read_affine(s.x[0]);
+        double sx = std::hypot(t.a, t.b), rotation = sx > 0 ? std::atan2(t.b, t.a) : 0.0;
+        const double cosine = std::cos(rotation), sine = std::sin(rotation);
+        const double sy = -t.c * sine + t.d * cosine;
+        const double shear = sy != 0 ? (t.c * cosine + t.d * sine) / sy : 0.0;
+        const std::array<double, 6> c{sx, sy, shear, rotation, t.tx, t.ty};
+        for (unsigned i = 0; i < 6; ++i) m.write64(s.x[8] + i * 8, std::bit_cast<std::uint64_t>(c[i]));
+    });
     function(cg, "_CGAffineTransformEqualToTransform", [this](CpuState& s, GuestMemory&) {
         return_bool(s, read_affine(s.x[0]) == read_affine(s.x[1]));
     });

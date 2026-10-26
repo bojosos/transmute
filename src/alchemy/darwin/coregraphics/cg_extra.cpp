@@ -10,7 +10,8 @@
 //                      whose run-loop source (CFMachPortCreateRunLoopSource)
 //                      never fires: synthesized events are not observed by
 //                      taps. Enabling a tap fails explicitly.
-//   CGEventCreateMouseEvent / CGEventPost: unsupported (no synthetic input).
+//   CGEventPost: unsupported (no system-wide synthetic input; events are made
+//   in graphics_gaps.cpp, and CGEventPostToPid reaches this process).
 namespace alchemy::gui::support_kit {
 namespace {
 
@@ -67,9 +68,6 @@ void install_cg_extra(Support& support) {
             s->process.release_guest(context);
         }
         c.x[0] = s->retain(tap->source);
-    });
-    support.fill_function(cg, "_CGEventCreateMouseEvent", [](CpuState&, GuestMemory&) {
-        unsupported("CGEventCreateMouseEvent (synthetic input events)");
     });
     support.fill_function(cg, "_CGEventPost", [](CpuState&, GuestMemory&) { unsupported("CGEventPost (synthetic input events)"); });
 }

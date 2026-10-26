@@ -238,6 +238,28 @@ void Quartz::install_displays() {
         static_cast<void>(mode_of(s.x[0]));
         release(s.x[0]);
     });
+    // The current mode is valid, safe and the default (IOGraphicsTypes'
+    // kDisplayModeValidFlag | SafeFlag | DefaultFlag), and usable for the desktop.
+    function(cg, "_CGDisplayModeGetIOFlags", [mode_of](CpuState& s, GuestMemory&) { s.x[0] = mode_of(s.x[0]) ? 0x7 : 0; });
+    function(cg, "_CGDisplayModeGetIODisplayModeID", [mode_of](CpuState& s, GuestMemory&) { s.x[0] = mode_of(s.x[0]) ? 1 : 0; });
+    function(cg, "_CGDisplayModeIsUsableForDesktopGUI", [mode_of](CpuState& s, GuestMemory&) { s.x[0] = mode_of(s.x[0]) ? 1 : 0; });
+    function(cg, "_CGDisplayModeGetTypeID", [this, current_mode](CpuState& s, GuestMemory&) {
+        const auto list = screens();
+        const auto* main = main_screen(list);
+        const auto probe = main ? current_mode(main->id) : 0;
+        s.x[0] = probe ? cf.invoke("CFGetTypeID", std::array<Address, 1>{probe}) : 0;
+        release(probe);
+    });
+    // Displays are never mirrored: each is its own primary display.
+    function(cg, "_CGDisplayPrimaryDisplay", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<std::uint32_t>(s.x[0]); });
+    // Capturing displays (exclusive use for full-screen drawing) is not
+    // available: the window server shares every display. Nothing is ever
+    // captured, so releasing succeeds.
+    constexpr std::int32_t cg_cannot_complete = 1004;
+    for (const auto* name : {"_CGDisplayCapture", "_CGDisplayCaptureWithOptions", "_CGCaptureAllDisplays", "_CGCaptureAllDisplaysWithOptions"})
+        function(cg, name, [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<std::uint32_t>(cg_cannot_complete); });
+    for (const auto* name : {"_CGDisplayRelease", "_CGReleaseAllDisplays"})
+        function(cg, name, [](CpuState& s, GuestMemory&) { s.x[0] = cg_success; });
     // CGDisplaySetDisplayMode(display, mode, options): only the current mode exists.
     function(cg, "_CGDisplaySetDisplayMode", [mode_of](CpuState& s, GuestMemory&) {
         const auto list = screens();

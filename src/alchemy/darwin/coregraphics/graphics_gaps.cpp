@@ -3,10 +3,12 @@
 #include "alchemy/gui/cg_event_record.hpp"
 #include "alchemy/host/ui.hpp"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 // Graphics-side gaps of the Qt WebEngine images: CoreGraphics, QuartzCore,
@@ -41,6 +43,16 @@ struct CgEvent final : ObjectPayload {
     double x{}, y{};
     std::uint64_t flags{}, timestamp{};
     std::map<std::uint32_t, std::int64_t> fields;
+    std::map<std::uint32_t, double> doubles;   // fields set as doubles (CGEventSetDoubleValueField)
+    std::u16string unicode;                    // CGEventKeyboardSetUnicodeString
+};
+// CGEventSourceRef: its state ID and the settings events made with it take.
+struct CgEventSource final : ObjectPayload {
+    std::mutex mutex;
+    std::int32_t state_id{};
+    std::uint32_t keyboard_type{40};           // kCGAnyInputEventType's ANSI keyboard (unverified)
+    double pixels_per_line{10}, suppression_interval{0.25};
+    std::int64_t user_data{};
 };
 
 struct FontCollection final : ObjectPayload { Address descriptors{}; };
@@ -48,7 +60,7 @@ struct FontCollection final : ObjectPayload { Address descriptors{}; };
 class GraphicsGaps final : public Provider {
 public:
     using Provider::Provider;
-    Address event_class{}, collection_class{};
+    Address event_class{}, collection_class{}, source_class{};
     std::mutex mutex;
     std::uint32_t secure_input{};
 
@@ -65,6 +77,37 @@ public:
         const auto object = objc.allocate(event_class);
         static_cast<void>(objc.host_state<CgEvent>(object, [&] { return value; }));
         return object;
+    }
+    std::shared_ptr<CgEventSource> source(Address object) {
+        return object ? objc.find_host_state<CgEventSource>(object) : nullptr;
+    }
+    // A new event of `type` at the mouse location now; a source gives its
+    // state ID and user data.
+    std::shared_ptr<CgEvent> new_event(Address source_object, std::uint32_t type) {
+        auto value = std::make_shared<CgEvent>();
+        value->type = type;
+        const auto [x, y] = mouse_location();
+        value->x = x;
+        value->y = y;
+        value->timestamp = call(libsystem, "_mach_absolute_time", {});
+        if (const auto origin = source(source_object)) {
+            std::lock_guard lock(origin->mutex);
+            value->fields[cg_event_source_state_id] = origin->state_id;
+            if (origin->user_data) value->fields[cg_event_source_user_data] = origin->user_data;
+        }
+        return value;
+    }
+    static constexpr std::uint32_t cg_event_source_user_data = 42, cg_event_source_state_id = 45, cg_event_target_pid = 40;
+    // The main display's height in points (CGEventGetUnflippedLocation).
+    double main_display_height() {
+        try {
+            const auto screen_type = objc.find_class("NSScreen");
+            const auto screens = screen_type ? objc.send(screen_type, "screens").x0 : 0;
+            if (!screens || cf.length(screens) == 0) return 0;
+            return objc.send(cf.element(screens, 0), "frame").d(3);
+        } catch (const std::exception&) {
+            return 0;
+        }
     }
     // The mouse location in global display coordinates (top-left origin).
     std::pair<double, double> mouse_location() {
@@ -111,8 +154,231 @@ void GraphicsGaps::install_core_graphics() {
     raw(core_graphics, "_CGEventGetIntegerValueField", [this](CpuState& s, GuestMemory&) {
         const auto value = event(s.x[0]);
         std::lock_guard lock(value->mutex);
-        const auto found = value->fields.find(static_cast<std::uint32_t>(s.x[1]));
-        s.x[0] = found == value->fields.end() ? 0 : static_cast<std::uint64_t>(found->second);
+        const auto key = static_cast<std::uint32_t>(s.x[1]);
+        if (const auto found = value->fields.find(key); found != value->fields.end()) { s.x[0] = static_cast<std::uint64_t>(found->second); return; }
+        const auto as_double = value->doubles.find(key);
+        s.x[0] = as_double == value->doubles.end() ? 0 : static_cast<std::uint64_t>(static_cast<std::int64_t>(as_double->second));
+    });
+    // ---- events made by the application (frameworks wave U6) ----
+    // CGEventCreateKeyboardEvent(source, virtualKey, keyDown).
+    raw(core_graphics, "_CGEventCreateKeyboardEvent", [this](CpuState& s, GuestMemory&) {
+        auto value = new_event(s.x[0], (s.x[2] & 0xff) ? 10u : 11u);   // kCGEventKeyDown / KeyUp
+        value->fields[cg_event::field::keyboard_keycode] = static_cast<std::uint16_t>(s.x[1]);
+        if (const auto origin = source(s.x[0])) {
+            std::lock_guard lock(origin->mutex);
+            value->fields[cg_event::field::keyboard_type] = origin->keyboard_type;
+        }
+        s.x[0] = make_event(std::move(value));
+    });
+    // CGEventCreateMouseEvent(source, type, location, button).
+    raw(core_graphics, "_CGEventCreateMouseEvent", [this](CpuState& s, GuestMemory&) {
+        auto value = new_event(s.x[0], static_cast<std::uint32_t>(s.x[1]));
+        value->x = real(s, 0);
+        value->y = real(s, 1);
+        value->fields[cg_event::field::mouse_button_number] = static_cast<std::int64_t>(static_cast<std::uint32_t>(s.x[2]));
+        value->fields[cg_event::field::mouse_click_state] = 1;
+        s.x[0] = make_event(std::move(value));
+    });
+    // CGEventCreateScrollWheelEvent2(source, units, wheelCount, wheel1, wheel2, wheel3):
+    // line units set the line deltas, pixel units the point deltas of a
+    // continuous scroll. The variadic CGEventCreateScrollWheelEvent passes
+    // the extra wheels on the stack (Apple arm64).
+    const auto scroll = [this](CpuState& s, std::array<std::int32_t, 3> wheels) {
+        auto value = new_event(s.x[0], 22);   // kCGEventScrollWheel
+        const bool pixels = static_cast<std::uint32_t>(s.x[1]) == 0;   // kCGScrollEventUnitPixel
+        const auto count = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(s.x[2]), 1, 3);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto delta = wheels[i];
+            if (pixels) value->fields[cg_event::field::scroll_point_delta_axis1 + i] = delta;
+            else value->fields[cg_event::field::scroll_delta_axis1 + i] = delta;
+        }
+        if (pixels) value->fields[cg_event::field::scroll_is_continuous] = 1;
+        return make_event(std::move(value));
+    };
+    raw(core_graphics, "_CGEventCreateScrollWheelEvent2", [scroll](CpuState& s, GuestMemory&) {
+        s.x[0] = scroll(s, {static_cast<std::int32_t>(s.x[3]), static_cast<std::int32_t>(s.x[4]), static_cast<std::int32_t>(s.x[5])});
+    });
+    raw(core_graphics, "_CGEventCreateScrollWheelEvent", [scroll](CpuState& s, GuestMemory& m) {
+        // (source, units, wheelCount, wheel1, ...): wheel1 in w3; the variadic rest in 8-byte stack slots.
+        const auto count = static_cast<std::uint32_t>(s.x[2]);
+        const auto second = count > 1 ? static_cast<std::int32_t>(m.read64(s.sp)) : 0;
+        const auto third = count > 2 ? static_cast<std::int32_t>(m.read64(s.sp + 8)) : 0;
+        s.x[0] = scroll(s, {static_cast<std::int32_t>(s.x[3]), second, third});
+    });
+    raw(core_graphics, "_CGEventCreateCopy", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[0]) { s.x[0] = 0; return; }
+        const auto original = event(s.x[0]);
+        auto copy = std::make_shared<CgEvent>();
+        {
+            std::lock_guard lock(original->mutex);
+            copy->type = original->type;
+            copy->x = original->x;
+            copy->y = original->y;
+            copy->flags = original->flags;
+            copy->timestamp = original->timestamp;
+            copy->fields = original->fields;
+            copy->doubles = original->doubles;
+            copy->unicode = original->unicode;
+        }
+        s.x[0] = make_event(std::move(copy));
+    });
+    raw(core_graphics, "_CGEventGetTypeID", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFGetTypeID", {make_event(std::make_shared<CgEvent>())});
+    });
+    raw(core_graphics, "_CGEventGetType", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]); std::lock_guard lock(value->mutex); s.x[0] = value->type;
+    });
+    raw(core_graphics, "_CGEventSetType", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]); std::lock_guard lock(value->mutex); value->type = static_cast<std::uint32_t>(s.x[1]);
+    });
+    raw(core_graphics, "_CGEventSetLocation", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]); std::lock_guard lock(value->mutex); value->x = real(s, 0); value->y = real(s, 1);
+    });
+    // The location with the origin at the main display's bottom-left.
+    raw(core_graphics, "_CGEventGetUnflippedLocation", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]);
+        double x{}, y{};
+        { std::lock_guard lock(value->mutex); x = value->x; y = value->y; }
+        return_real(s, x, 0);
+        return_real(s, main_display_height() - y, 1);
+    });
+    raw(core_graphics, "_CGEventGetFlags", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]); std::lock_guard lock(value->mutex); s.x[0] = value->flags;
+    });
+    raw(core_graphics, "_CGEventSetFlags", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]); std::lock_guard lock(value->mutex); value->flags = s.x[1];
+    });
+    raw(core_graphics, "_CGEventGetTimestamp", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]); std::lock_guard lock(value->mutex); s.x[0] = value->timestamp;
+    });
+    raw(core_graphics, "_CGEventSetTimestamp", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]); std::lock_guard lock(value->mutex); value->timestamp = s.x[1];
+    });
+    raw(core_graphics, "_CGEventSetIntegerValueField", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]);
+        std::lock_guard lock(value->mutex);
+        const auto key = static_cast<std::uint32_t>(s.x[1]);
+        value->doubles.erase(key);
+        value->fields[key] = static_cast<std::int64_t>(s.x[2]);
+    });
+    raw(core_graphics, "_CGEventGetDoubleValueField", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]);
+        std::lock_guard lock(value->mutex);
+        const auto key = static_cast<std::uint32_t>(s.x[1]);
+        if (const auto found = value->doubles.find(key); found != value->doubles.end()) { return_real(s, found->second); return; }
+        const auto as_integer = value->fields.find(key);
+        return_real(s, as_integer == value->fields.end() ? 0.0 : static_cast<double>(as_integer->second));
+    });
+    raw(core_graphics, "_CGEventSetDoubleValueField", [this](CpuState& s, GuestMemory&) {
+        const auto value = event(s.x[0]);
+        std::lock_guard lock(value->mutex);
+        const auto key = static_cast<std::uint32_t>(s.x[1]);
+        value->fields.erase(key);
+        value->doubles[key] = real(s, 0);
+    });
+    // The characters a keyboard event carries (UTF-16 units).
+    raw(core_graphics, "_CGEventKeyboardSetUnicodeString", [this](CpuState& s, GuestMemory& m) {
+        const auto value = event(s.x[0]);
+        std::u16string text(static_cast<std::size_t>(s.x[1]), u'\0');
+        for (std::size_t i = 0; i < text.size(); ++i) text[i] = static_cast<char16_t>(m.read8(s.x[2] + i * 2) | (m.read8(s.x[2] + i * 2 + 1) << 8));
+        std::lock_guard lock(value->mutex);
+        value->unicode = std::move(text);
+    });
+    raw(core_graphics, "_CGEventKeyboardGetUnicodeString", [this](CpuState& s, GuestMemory& m) {
+        const auto value = event(s.x[0]);
+        std::u16string text;
+        { std::lock_guard lock(value->mutex); text = value->unicode; }
+        const auto room = static_cast<std::size_t>(s.x[1]);
+        if (s.x[2]) m.write64(s.x[2], text.size());   // UniCharCount* actualStringLength
+        for (std::size_t i = 0; i < std::min(room, text.size()) && s.x[3]; ++i) {
+            m.write8(s.x[3] + i * 2, static_cast<std::uint8_t>(text[i]));
+            m.write8(s.x[3] + i * 2 + 1, static_cast<std::uint8_t>(text[i] >> 8));
+        }
+    });
+    // Posting to this process delivers the event to the application's queue
+    // as an NSEvent; other processes cannot be reached.
+    const auto post_here = [this](Address event_object) {
+        const auto ns_event = objc.find_class("NSEvent");
+        const auto app_class = objc.find_class("NSApplication");
+        if (!ns_event || !app_class) throw std::runtime_error("Alchemy: posting a CGEvent needs AppKit");
+        CallRegs make{};
+        make.x[2] = event_object;
+        const auto converted = objc.send(ns_event, "eventWithCGEvent:", make).x0;
+        const auto app = objc.send(app_class, "sharedApplication").x0;
+        CallRegs post{};
+        post.x[2] = converted;
+        post.x[3] = 0;
+        if (converted && app) static_cast<void>(objc.send(app, "postEvent:atStart:", post));
+    };
+    raw(core_graphics, "_CGEventPostToPid", [this, post_here](CpuState& s, GuestMemory&) {
+        const auto pid = static_cast<std::int32_t>(s.x[0]);
+        if (pid != static_cast<std::int32_t>(call(libsystem, "_getpid", {})))
+            throw std::runtime_error("Alchemy: CGEventPostToPid to another process is unsupported (no system event delivery)");
+        post_here(s.x[1]);
+    });
+    // CGEventPostToPSN(ProcessSerialNumber*, event): the current process
+    // ({0, kCurrentProcess = 2}) only.
+    raw(core_graphics, "_CGEventPostToPSN", [post_here](CpuState& s, GuestMemory& m) {
+        if (!s.x[0] || m.read32(s.x[0]) != 0 || m.read32(s.x[0] + 4) != 2)
+            throw std::runtime_error("Alchemy: CGEventPostToPSN to another process is unsupported (no system event delivery)");
+        post_here(s.x[1]);
+    });
+    // ---- event sources ----
+    source_class = objc.find_class("__AlchemyCGEventSource");
+    if (!source_class) source_class = objc.register_native_class("__AlchemyCGEventSource", objc.find_class("NSObject"), 8);
+    raw(core_graphics, "_CGEventSourceCreate", [this](CpuState& s, GuestMemory&) {
+        auto value = std::make_shared<CgEventSource>();
+        value->state_id = static_cast<std::int32_t>(s.x[0]);
+        const auto object = objc.allocate(source_class);
+        static_cast<void>(objc.host_state<CgEventSource>(object, [&] { return value; }));
+        s.x[0] = object;
+    });
+    const auto with_source = [this](Address object) {
+        const auto value = source(object);
+        if (!value) throw std::runtime_error("Alchemy: the object is not a CGEventSource");
+        return value;
+    };
+    raw(core_graphics, "_CGEventSourceGetSourceStateID", [with_source](CpuState& s, GuestMemory&) {
+        const auto value = with_source(s.x[0]); std::lock_guard lock(value->mutex); s.x[0] = static_cast<std::uint32_t>(value->state_id);
+    });
+    raw(core_graphics, "_CGEventSourceGetKeyboardType", [with_source](CpuState& s, GuestMemory&) {
+        const auto value = with_source(s.x[0]); std::lock_guard lock(value->mutex); s.x[0] = value->keyboard_type;
+    });
+    raw(core_graphics, "_CGEventSourceSetKeyboardType", [with_source](CpuState& s, GuestMemory&) {
+        const auto value = with_source(s.x[0]); std::lock_guard lock(value->mutex); value->keyboard_type = static_cast<std::uint32_t>(s.x[1]);
+    });
+    raw(core_graphics, "_CGEventSourceGetPixelsPerLine", [with_source](CpuState& s, GuestMemory&) {
+        const auto value = with_source(s.x[0]); std::lock_guard lock(value->mutex); return_real(s, value->pixels_per_line);
+    });
+    raw(core_graphics, "_CGEventSourceSetPixelsPerLine", [with_source](CpuState& s, GuestMemory&) {
+        const auto value = with_source(s.x[0]); std::lock_guard lock(value->mutex); value->pixels_per_line = real(s, 0);
+    });
+    raw(core_graphics, "_CGEventSourceGetLocalEventsSuppressionInterval", [with_source](CpuState& s, GuestMemory&) {
+        const auto value = with_source(s.x[0]); std::lock_guard lock(value->mutex); return_real(s, value->suppression_interval);
+    });
+    raw(core_graphics, "_CGEventSourceSetLocalEventsSuppressionInterval", [with_source](CpuState& s, GuestMemory&) {
+        const auto value = with_source(s.x[0]); std::lock_guard lock(value->mutex); value->suppression_interval = real(s, 0);
+    });
+    raw(core_graphics, "_CGEventSourceGetUserData", [with_source](CpuState& s, GuestMemory&) {
+        const auto value = with_source(s.x[0]); std::lock_guard lock(value->mutex); s.x[0] = static_cast<std::uint64_t>(value->user_data);
+    });
+    raw(core_graphics, "_CGEventSourceSetUserData", [with_source](CpuState& s, GuestMemory&) {
+        const auto value = with_source(s.x[0]); std::lock_guard lock(value->mutex); value->user_data = static_cast<std::int64_t>(s.x[1]);
+    });
+    raw(core_graphics, "_CGEventSourceGetTypeID", [this](CpuState& s, GuestMemory&) {
+        const auto probe = objc.allocate(source_class);
+        static_cast<void>(objc.host_state<CgEventSource>(probe));
+        s.x[0] = call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFGetTypeID", {probe});
+    });
+    // The pointer buttons and modifier keys held now (the window server's view).
+    raw(core_graphics, "_CGEventSourceButtonState", [this](CpuState& s, GuestMemory&) {
+        const auto ns_event = objc.find_class("NSEvent");
+        const auto pressed = ns_event ? objc.send(ns_event, "pressedMouseButtons").x0 : 0;
+        s.x[0] = (pressed >> (static_cast<std::uint32_t>(s.x[1]) & 63)) & 1;
+    });
+    raw(core_graphics, "_CGEventSourceFlagsState", [this](CpuState& s, GuestMemory&) {
+        const auto ns_event = objc.find_class("NSEvent");
+        s.x[0] = ns_event ? objc.send(ns_event, "modifierFlags").x0 : 0;
     });
     // CGEventCreateData / CGEventCreateFromData: Alchemy's own serialization
     // (alchemy/gui/cg_event_record.hpp; AppKit's NSEvent bridging uses it).

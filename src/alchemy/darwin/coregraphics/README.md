@@ -23,6 +23,16 @@ explicit failures of drawing and image codecs. `coregraphics_fx.cpp` is its empt
 image frames for ImageIO (WIC), fonts for glyph drawing; the window
 server's screens; `host::ui` (input idle time, keyboard kind).
 
+**Events (`graphics_gaps.cpp`):** CGEvent creation (keyboard, mouse,
+scroll), copies, every field getter and setter, flags, timestamps and
+Unicode strings, and CGEventSource state and user data are real. Posting
+reaches only this process (CGEventPostToPid / PostToPSN for its own pid go
+to `-[NSApplication postEvent:atStart:]`); other targets fail explicitly.
+
+**Displays:** display modes report their IOKit flags; capturing displays
+returns kCGErrorCannotComplete (the window server shares every display) and
+releasing succeeds.
+
 **Unsupported:** JPEG 2000 images (ImageIO reports them as undecodable).
 
 **Display modes:** each display reports one mode, its current one (the host

@@ -96,3 +96,7 @@ target_sources(alchemy_core PRIVATE
 # from darwin/identities/frameworks.cpp:
 target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/coregraphics/no_displays.cpp)
+
+# CGEvent creation, fields and event sources, on the framework-case fixture
+# (graphics_gaps.cpp).
+alchemy_gui_add_framework_case(coregraphics_events src/alchemy/darwin/coregraphics/tests/cg_events_tests.cpp)
