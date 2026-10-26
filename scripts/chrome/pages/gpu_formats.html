@@ -1,0 +1,474 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy GPU formats: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+td, th { padding: 2px 10px; text-align: left; vertical-align: top; }
+</style>
+</head>
+<body>
+<h1 id="h">Alchemy GPU formats</h1>
+<p>Every core WebGPU texture format and every WebGL 2 sized internal format, each through the paths a page uses:
+upload, copy back (WebGPU), sampling with texel fetches compared with a CPU decode of the uploaded bytes, and, where
+the format allows it, clearing it as a render target and storing to it from a compute shader. 4x4 textures, every
+texel checked. Written for Alchemy (no network). The verdict goes into <code>document.title</code>
+(<code>Alchemy GPU formats: PASS</code> or <code>Alchemy GPU formats: FAIL &lt;test&gt;</code>) and
+<code>body[data-verdict]</code>; <code>--dump-dom</code> waits for it (at most 150 s).</p>
+<pre id="info">pending</pre>
+<table>
+<thead><tr><th>test</th><th>result</th><th>detail</th></tr></thead>
+<tbody id="results"></tbody>
+</table>
+<p id="status">not run</p>
+<script>
+"use strict";
+var finished = false, holdUntil = Date.now() + 150000;
+(function hold() {
+  if (finished || Date.now() > holdUntil) return;
+  var img = new Image();
+  img.onerror = img.onload = function () { img.remove(); hold(); };
+  img.src = "missing-" + Math.random() + ".png";
+  document.body.appendChild(img);
+})();
+
+var rows = document.getElementById("results"), failures = [], skips = 0, passes = 0;
+function row(name, ok, detail) {
+  var tr = document.createElement("tr");
+  var verdict = ok === null ? "skip" : ok ? "pass" : "FAIL";
+  tr.innerHTML = "<td></td><td></td><td></td>";
+  tr.children[0].textContent = name; tr.children[1].textContent = verdict; tr.children[2].textContent = detail || "";
+  tr.dataset.result = verdict;
+  rows.appendChild(tr);
+  console.log("[formats] " + verdict + " " + name + (detail ? ": " + detail : ""));
+  if (ok === false) failures.push(name);
+  else if (ok === null) skips++;
+  else passes++;
+}
+function within(promise, seconds, what) {
+  return Promise.race([promise, new Promise(function (_, reject) {
+    setTimeout(function () { reject(new Error(what + " did not settle within " + seconds + " s")); }, seconds * 1000);
+  })]);
+}
+
+// ---- encodings ------------------------------------------------------------------------------------
+
+var N = 16;   // 4x4 texels
+function halfBits(v) {   // exact for the values used (multiples of 1/8 in [-8, 8))
+  var f = new Float32Array([v]), u = new Uint32Array(f.buffer)[0];
+  var sign = (u >>> 16) & 0x8000, e = ((u >>> 23) & 0xff) - 127 + 15, m = (u >>> 13) & 0x3ff;
+  if (v === 0) return sign;
+  return sign | (e << 10) | m;
+}
+function halfValue(h) {
+  var s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+  if (e === 0) return s * Math.pow(2, -14) * (m / 1024);
+  if (e === 31) return m ? NaN : s * Infinity;
+  return s * Math.pow(2, e - 15) * (1 + m / 1024);
+}
+function srgbToLinear(c) { return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+function uf(bits, mantissaBits) {
+  var e = bits >> mantissaBits, m = bits & ((1 << mantissaBits) - 1), scale = 1 << mantissaBits;
+  return e === 0 ? Math.pow(2, -14) * (m / scale) : Math.pow(2, e - 15) * (1 + m / scale);
+}
+function byteAt(i, j) { return (i * 37 + j * 101 + 13) & 0xff; }
+// A value for float formats, exact in f16 and in the small float formats when positive: multiples of 1/4.
+function floatAt(i, c, positive) { var v = ((i * 5 + c * 3) % 32) * 0.25; return positive ? v : v - 4; }
+
+// ---- WebGPU ---------------------------------------------------------------------------------------
+
+// enc: how texel bytes are made and decoded; s: the sampled type (f, u, i); r: renderable; st: storage.
+var GPU_FORMATS = [
+  ["r8unorm", 1, 1, "u8n", "f", 1, 0], ["r8snorm", 1, 1, "s8n", "f", 0, 0], ["r8uint", 1, 1, "u8", "u", 1, 0], ["r8sint", 1, 1, "s8", "i", 1, 0],
+  ["r16uint", 2, 1, "u16", "u", 1, 0], ["r16sint", 2, 1, "s16", "i", 1, 0], ["r16float", 2, 1, "f16", "f", 1, 0],
+  ["rg8unorm", 2, 2, "u8n", "f", 1, 0], ["rg8snorm", 2, 2, "s8n", "f", 0, 0], ["rg8uint", 2, 2, "u8", "u", 1, 0], ["rg8sint", 2, 2, "s8", "i", 1, 0],
+  ["r32uint", 4, 1, "u32", "u", 1, 1], ["r32sint", 4, 1, "s32", "i", 1, 1], ["r32float", 4, 1, "f32", "f", 1, 1],
+  ["rg16uint", 4, 2, "u16", "u", 1, 0], ["rg16sint", 4, 2, "s16", "i", 1, 0], ["rg16float", 4, 2, "f16", "f", 1, 0],
+  ["rgba8unorm", 4, 4, "u8n", "f", 1, 1], ["rgba8unorm-srgb", 4, 4, "srgb", "f", 1, 0], ["rgba8snorm", 4, 4, "s8n", "f", 0, 1],
+  ["rgba8uint", 4, 4, "u8", "u", 1, 1], ["rgba8sint", 4, 4, "s8", "i", 1, 1],
+  ["bgra8unorm", 4, 4, "bgra", "f", 1, 0], ["bgra8unorm-srgb", 4, 4, "bgra-srgb", "f", 1, 0],
+  ["rgb9e5ufloat", 4, 3, "rgb9e5", "f", 0, 0], ["rgb10a2uint", 4, 4, "rgb10a2ui", "u", 1, 0], ["rgb10a2unorm", 4, 4, "rgb10a2", "f", 1, 0],
+  ["rg11b10ufloat", 4, 3, "rg11b10", "f", 0, 0],
+  ["rg32uint", 8, 2, "u32", "u", 1, 1], ["rg32sint", 8, 2, "s32", "i", 1, 1], ["rg32float", 8, 2, "f32", "f", 1, 1],
+  ["rgba16uint", 8, 4, "u16", "u", 1, 1], ["rgba16sint", 8, 4, "s16", "i", 1, 1], ["rgba16float", 8, 4, "f16", "f", 1, 1],
+  ["rgba32uint", 16, 4, "u32", "u", 1, 1], ["rgba32sint", 16, 4, "s32", "i", 1, 1], ["rgba32float", 16, 4, "f32", "f", 1, 1]
+];
+
+function texelBytes(spec, i) {
+  var bytes = new Uint8Array(spec[1]), view = new DataView(bytes.buffer), enc = spec[3], c;
+  if (enc === "f16") for (c = 0; c < spec[2]; c++) view.setUint16(c * 2, halfBits(floatAt(i, c)), true);
+  else if (enc === "f32") for (c = 0; c < spec[2]; c++) view.setFloat32(c * 4, floatAt(i, c), true);
+  else if (enc === "rg11b10") {
+    var r = ((1 + (i * 3) % 29) << 6) | ((i * 5) & 63), g = ((1 + (i * 7 + 4) % 29) << 6) | ((i * 11) & 63), b = ((1 + (i * 13 + 9) % 29) << 5) | ((i * 3) & 31);
+    view.setUint32(0, (r | (g << 11) | (b << 22)) >>> 0, true);
+  } else for (c = 0; c < spec[1]; c++) bytes[c] = byteAt(i, c);
+  return bytes;
+}
+function decode(spec, bytes) {
+  var view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength), enc = spec[3], n = spec[2], out = [0, 0, 0, 1], c, w;
+  switch (enc) {
+    case "u8n": for (c = 0; c < n; c++) out[c] = bytes[c] / 255; break;
+    case "s8n": for (c = 0; c < n; c++) out[c] = Math.max(view.getInt8(c) / 127, -1); break;
+    case "u8": for (c = 0; c < n; c++) out[c] = bytes[c]; break;
+    case "s8": for (c = 0; c < n; c++) out[c] = view.getInt8(c); break;
+    case "u16": for (c = 0; c < n; c++) out[c] = view.getUint16(c * 2, true); break;
+    case "s16": for (c = 0; c < n; c++) out[c] = view.getInt16(c * 2, true); break;
+    case "u32": for (c = 0; c < n; c++) out[c] = view.getUint32(c * 4, true); break;
+    case "s32": for (c = 0; c < n; c++) out[c] = view.getInt32(c * 4, true); break;
+    case "f16": for (c = 0; c < n; c++) out[c] = halfValue(view.getUint16(c * 2, true)); break;
+    case "f32": for (c = 0; c < n; c++) out[c] = view.getFloat32(c * 4, true); break;
+    case "srgb": out = [srgbToLinear(bytes[0] / 255), srgbToLinear(bytes[1] / 255), srgbToLinear(bytes[2] / 255), bytes[3] / 255]; break;
+    case "bgra": out = [bytes[2] / 255, bytes[1] / 255, bytes[0] / 255, bytes[3] / 255]; break;
+    case "bgra-srgb": out = [srgbToLinear(bytes[2] / 255), srgbToLinear(bytes[1] / 255), srgbToLinear(bytes[0] / 255), bytes[3] / 255]; break;
+    case "rgb10a2": w = view.getUint32(0, true); out = [(w & 1023) / 1023, ((w >>> 10) & 1023) / 1023, ((w >>> 20) & 1023) / 1023, (w >>> 30) / 3]; break;
+    case "rgb10a2ui": w = view.getUint32(0, true); out = [w & 1023, (w >>> 10) & 1023, (w >>> 20) & 1023, w >>> 30]; break;
+    case "rg11b10": w = view.getUint32(0, true); out = [uf(w & 0x7ff, 6), uf((w >>> 11) & 0x7ff, 6), uf(w >>> 22, 5), 1]; break;
+    case "rgb9e5": w = view.getUint32(0, true); var s = Math.pow(2, (w >>> 27) - 24); out = [(w & 511) * s, ((w >>> 9) & 511) * s, ((w >>> 18) & 511) * s, 1]; break;
+  }
+  return out;
+}
+function tolerance(enc) { return enc === "srgb" || enc === "bgra-srgb" ? 3e-3 : enc === "u8n" || enc === "s8n" || enc === "bgra" || enc === "rgb10a2" ? 1e-3 : 0; }
+function compareTexels(got, want, tol, what) {
+  for (var i = 0; i < N; i++) for (var c = 0; c < 4; c++) {
+    var g = got[i * 4 + c], w = want[i][c];
+    if (!(Math.abs(g - w) <= tol * Math.max(1, Math.abs(w)))) return what + ": texel " + i + " = " + Array.from(got.slice(i * 4, i * 4 + 4)).map(function (v) { return +v.toPrecision(6); }) + ", want " + want[i].map(function (v) { return +v.toPrecision(6); });
+  }
+  return "";
+}
+
+var device = null;
+async function gpuRead(texture, bytesPerTexel, aspect) {
+  var buf = device.createBuffer({ size: 256 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture: texture, aspect: aspect || "all" }, { buffer: buf, bytesPerRow: 256, rowsPerImage: 4 }, [4, 4, 1]);
+  device.queue.submit([enc.finish()]);
+  await within(buf.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var all = new Uint8Array(buf.getMappedRange().slice(0)); buf.unmap(); buf.destroy();
+  var packed = new Uint8Array(N * bytesPerTexel);
+  for (var y = 0; y < 4; y++) packed.set(all.subarray(y * 256, y * 256 + 4 * bytesPerTexel), y * 4 * bytesPerTexel);
+  return packed;
+}
+var loaders = {};
+function loader(kind, depth) {
+  var key = depth ? "depth" : kind;
+  if (loaders[key]) return loaders[key];
+  var t = depth ? "texture_depth_2d" : "texture_2d<" + { f: "f32", u: "u32", i: "i32" }[kind] + ">";
+  var v = depth ? "vec4<f32>" : "vec4<" + { f: "f32", u: "u32", i: "i32" }[kind] + ">";
+  var load = depth ? "vec4<f32>(textureLoad(t, vec2<i32>(id.xy), 0), 0.0, 0.0, 1.0)" : "textureLoad(t, vec2<i32>(id.xy), 0)";
+  var module = device.createShaderModule({ code: "@group(0) @binding(0) var t : " + t + ";\n@group(0) @binding(1) var<storage, read_write> o : array<" + v + ", 16>;\n" +
+    "@compute @workgroup_size(4, 4) fn main(@builtin(local_invocation_id) id : vec3<u32>) { o[id.y * 4u + id.x] = " + load + "; }" });
+  loaders[key] = device.createComputePipeline({ layout: "auto", compute: { module: module, entryPoint: "main" } });
+  return loaders[key];
+}
+// Every texel of `view` through textureLoad, as a typed array of 64 components.
+async function gpuSample(view, kind, depth) {
+  var pipeline = loader(kind, depth);
+  var out = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  var read = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder(), c = enc.beginComputePass();
+  c.setPipeline(pipeline);
+  c.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: view }, { binding: 1, resource: { buffer: out } }] }));
+  c.dispatchWorkgroups(1); c.end();
+  enc.copyBufferToBuffer(out, 0, read, 0, 256);
+  device.queue.submit([enc.finish()]);
+  await within(read.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var buffer = read.getMappedRange().slice(0); read.unmap(); read.destroy(); out.destroy();
+  return kind === "u" ? new Uint32Array(buffer) : kind === "i" ? new Int32Array(buffer) : new Float32Array(buffer);
+}
+async function scoped(name, body) {
+  device.pushErrorScope("validation");
+  var problem = "";
+  try { problem = await body(); } catch (e) { problem = "threw " + e.message; }
+  var error = await within(device.popErrorScope(), 20, "popErrorScope");
+  if (error) problem = (problem ? problem + "; " : "") + "validation: " + error.message;
+  row(name, !problem, problem);
+}
+
+// The value a render-target clear or a storage write puts in each channel, per sampled kind.
+function writtenValue(spec) {
+  if (spec[4] === "u") return [7, 200, 3, 1];
+  if (spec[4] === "i") return [-7, 100, -3, 1];
+  return spec[3] === "s8n" ? [-0.5, 0.25, 0.5, 1] : [0.25, 0.5, 0.75, 1];
+}
+function expectWritten(spec) {
+  var v = writtenValue(spec), out = [0, 0, 0, 1];
+  for (var c = 0; c < spec[2]; c++) out[c] = v[c];
+  if (spec[3] === "rgb10a2ui") out[3] = 1;
+  var want = []; for (var i = 0; i < N; i++) want.push(out);
+  return want;
+}
+function writeTolerance(spec) { return spec[4] !== "f" ? 0 : spec[3] === "f16" || spec[3] === "f32" ? 0 : spec[3] === "rgb10a2" ? 2e-3 : 4e-3; }
+
+async function runWebGPU() {
+  if (!("gpu" in navigator)) { row("webgpu", null, "navigator.gpu absent"); return; }
+  var adapter = await within(navigator.gpu.requestAdapter(), 60, "requestAdapter");
+  if (!adapter) { row("webgpu: adapter", false, "requestAdapter() returned null"); return; }
+  var features = ["rg11b10ufloat-renderable", "bgra8unorm-storage", "depth32float-stencil8"].filter(function (f) { return adapter.features.has(f); });
+  device = await within(adapter.requestDevice({ requiredFeatures: features }), 60, "requestDevice");
+  if (features.indexOf("rg11b10ufloat-renderable") >= 0) GPU_FORMATS.forEach(function (f) { if (f[0] === "rg11b10ufloat") f[5] = 1; });
+  if (features.indexOf("bgra8unorm-storage") >= 0) GPU_FORMATS.forEach(function (f) { if (f[0] === "bgra8unorm") f[6] = 1; });
+  document.getElementById("info").textContent = "webgpu: " + adapter.info.vendor + " " + adapter.info.architecture + "; features " + features.join(" ");
+
+  for (var k = 0; k < GPU_FORMATS.length; k++) {
+    var spec = GPU_FORMATS[k];
+    // Upload, copy back, sample.
+    await scoped("webgpu " + spec[0] + ": upload, copy back, sample", async function () {
+      var t = device.createTexture({ size: [4, 4], format: spec[0], usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING });
+      var data = new Uint8Array(N * spec[1]), want = [];
+      for (var i = 0; i < N; i++) { var b = texelBytes(spec, i); data.set(b, i * spec[1]); want.push(decode(spec, b)); }
+      device.queue.writeTexture({ texture: t }, data, { bytesPerRow: 4 * spec[1], rowsPerImage: 4 }, [4, 4, 1]);
+      var back = await gpuRead(t, spec[1]);
+      for (var j = 0; j < data.length; j++) if (back[j] !== data[j]) { t.destroy(); return "copy back: byte " + j + " = " + back[j] + ", want " + data[j]; }
+      var got = await gpuSample(t.createView(), spec[4]);
+      t.destroy();
+      return compareTexels(got, want, tolerance(spec[3]), "textureLoad");
+    });
+    if (spec[5]) await scoped("webgpu " + spec[0] + ": render target clear", async function () {
+      var t = device.createTexture({ size: [4, 4], format: spec[0], usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+      var enc = device.createCommandEncoder();
+      enc.beginRenderPass({ colorAttachments: [{ view: t.createView(), clearValue: writtenValue(spec), loadOp: "clear", storeOp: "store" }] }).end();
+      device.queue.submit([enc.finish()]);
+      var got = await gpuSample(t.createView(), spec[4]);
+      t.destroy();
+      return compareTexels(got, expectWritten(spec), writeTolerance(spec), "after the clear");
+    });
+    if (spec[6]) await scoped("webgpu " + spec[0] + ": storage write", async function () {
+      var t = device.createTexture({ size: [4, 4], format: spec[0], usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
+      var type = { f: "f32", u: "u32", i: "i32" }[spec[4]], v = writtenValue(spec);
+      var module = device.createShaderModule({ code: "@group(0) @binding(0) var o : texture_storage_2d<" + spec[0] + ", write>;\n" +
+        "@compute @workgroup_size(4, 4) fn main(@builtin(local_invocation_id) id : vec3<u32>) { textureStore(o, vec2<i32>(id.xy), vec4<" + type + ">(" +
+        v.map(function (x) { return type === "f32" ? x.toFixed(4) : type === "u32" ? x + "u" : "" + x; }).map(function (x) { return type === "f32" ? x : type + "(" + x + ")"; }).join(", ") + ")); }" });
+      var pipeline = device.createComputePipeline({ layout: "auto", compute: { module: module, entryPoint: "main" } });
+      var enc = device.createCommandEncoder(), c = enc.beginComputePass();
+      c.setPipeline(pipeline);
+      c.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: t.createView() }] }));
+      c.dispatchWorkgroups(1); c.end();
+      device.queue.submit([enc.finish()]);
+      var got = await gpuSample(t.createView(), spec[4]);
+      t.destroy();
+      return compareTexels(got, expectWritten(spec), writeTolerance(spec), "after textureStore");
+    });
+  }
+
+  // Depth and stencil: cleared in a pass, the depth sampled, the stencil aspect copied back and sampled.
+  var depths = [["depth16unorm", 2e-5], ["depth24plus", 1e-5], ["depth24plus-stencil8", 1e-5], ["depth32float", 0]];
+  if (features.indexOf("depth32float-stencil8") >= 0) depths.push(["depth32float-stencil8", 0]);
+  for (var d = 0; d < depths.length; d++) {
+    var name = depths[d][0], tol = depths[d][1];
+    await scoped("webgpu " + name + ": depth clear, sampled", async function () {
+      var t = device.createTexture({ size: [4, 4], format: name, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
+      var stencil = name.indexOf("stencil") >= 0;
+      var attachment = { view: t.createView(), depthClearValue: 0.375, depthLoadOp: "clear", depthStoreOp: "store" };
+      if (stencil) { attachment.stencilClearValue = 0x5a; attachment.stencilLoadOp = "clear"; attachment.stencilStoreOp = "store"; }
+      var enc = device.createCommandEncoder(); enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: attachment }).end();
+      device.queue.submit([enc.finish()]);
+      var got = await gpuSample(t.createView({ aspect: "depth-only" }), "f", true);
+      var want = []; for (var i = 0; i < N; i++) want.push([0.375, 0, 0, 1]);
+      var problem = compareTexels(got, want, tol, "depth");
+      if (!problem && stencil) {
+        var s = await gpuSample(t.createView({ aspect: "stencil-only" }), "u");
+        for (var j = 0; j < N; j++) if (s[j * 4] !== 0x5a) { problem = "stencil texel " + j + " = " + s[j * 4] + ", want 90"; break; }
+        if (!problem) {   // the stencil aspect is copyable from every stencil format
+          var bytes = await gpuRead(t, 1, "stencil-only");
+          for (var b = 0; b < N; b++) if (bytes[b] !== 0x5a) { problem = "stencil copy byte " + b + " = " + bytes[b]; break; }
+        }
+      }
+      t.destroy();
+      return problem;
+    });
+  }
+  await scoped("webgpu stencil8: clear, copy back, sample", async function () {
+    var t = device.createTexture({ size: [4, 4], format: "stencil8", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
+    var enc = device.createCommandEncoder();
+    enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: t.createView(), stencilClearValue: 0xa5, stencilLoadOp: "clear", stencilStoreOp: "store" } }).end();
+    device.queue.submit([enc.finish()]);
+    var bytes = await gpuRead(t, 1, "stencil-only");
+    for (var b = 0; b < N; b++) if (bytes[b] !== 0xa5) return "copy byte " + b + " = " + bytes[b] + ", want 165";
+    var s = await gpuSample(t.createView(), "u");
+    for (var j = 0; j < N; j++) if (s[j * 4] !== 0xa5) return "sampled texel " + j + " = " + s[j * 4] + ", want 165";
+    t.destroy();
+    return "";
+  });
+}
+
+// ---- WebGL 2 --------------------------------------------------------------------------------------
+
+function glFormats(gl) {
+  var G = gl;
+  // name, internal format, format, type, components, sampled kind, data maker (texel i -> array of components), decode
+  function bytesOf(n, signed) { return function (i) { var a = []; for (var c = 0; c < n; c++) { var b = byteAt(i, c); a.push(signed ? (b << 24 >> 24) : b); } return a; }; }
+  function intsOf(n, bits, signed) { return function (i) { var a = []; for (var c = 0; c < n; c++) { var v = (byteAt(i, c) * 131 + byteAt(i, c + 1) * 7919 + 1) % Math.pow(2, Math.min(bits, 31)); a.push(signed ? v - Math.pow(2, Math.min(bits, 31) - 1) : v); } return a; }; }
+  function floatsOf(n, positive) { return function (i) { var a = []; for (var c = 0; c < n; c++) a.push(floatAt(i, c, positive)); return a; }; }
+  function norm(v) { return v.map(function (x) { return x / 255; }); }
+  function snorm(v) { return v.map(function (x) { return Math.max(x / 127, -1); }); }
+  function same(v) { return v; }
+  function srgb(v) { return v.map(function (x, c) { return c < 3 ? srgbToLinear(x / 255) : x / 255; }); }
+  function packed1010102(i) { var r = byteAt(i, 0) * 4 + 1, g = byteAt(i, 1) * 3, b = byteAt(i, 2) * 2 + 3, a = i & 3; return [((a << 30) | (b << 20) | (g << 10) | r) >>> 0]; }
+  var list = [
+    ["R8", G.R8, G.RED, G.UNSIGNED_BYTE, 1, "f", bytesOf(1), norm, 2e-3], ["R8_SNORM", G.R8_SNORM, G.RED, G.BYTE, 1, "f", bytesOf(1, 1), snorm, 2e-3],
+    ["RG8", G.RG8, G.RG, G.UNSIGNED_BYTE, 2, "f", bytesOf(2), norm, 2e-3], ["RG8_SNORM", G.RG8_SNORM, G.RG, G.BYTE, 2, "f", bytesOf(2, 1), snorm, 2e-3],
+    ["RGB8", G.RGB8, G.RGB, G.UNSIGNED_BYTE, 3, "f", bytesOf(3), norm, 2e-3], ["RGB8_SNORM", G.RGB8_SNORM, G.RGB, G.BYTE, 3, "f", bytesOf(3, 1), snorm, 2e-3],
+    ["SRGB8", G.SRGB8, G.RGB, G.UNSIGNED_BYTE, 3, "f", bytesOf(3), srgb, 3e-3], ["RGB565", G.RGB565, G.RGB, G.UNSIGNED_BYTE, 3, "f", bytesOf(3), norm, 0.07],
+    ["RGBA8", G.RGBA8, G.RGBA, G.UNSIGNED_BYTE, 4, "f", bytesOf(4), norm, 2e-3], ["RGBA8_SNORM", G.RGBA8_SNORM, G.RGBA, G.BYTE, 4, "f", bytesOf(4, 1), snorm, 2e-3],
+    ["SRGB8_ALPHA8", G.SRGB8_ALPHA8, G.RGBA, G.UNSIGNED_BYTE, 4, "f", bytesOf(4), srgb, 3e-3],
+    ["RGB5_A1", G.RGB5_A1, G.RGBA, G.UNSIGNED_BYTE, 4, "f", function (i) { var v = bytesOf(4)(i); v[3] = i & 1 ? 255 : 0; return v; }, norm, 0.07],
+    ["RGBA4", G.RGBA4, G.RGBA, G.UNSIGNED_BYTE, 4, "f", bytesOf(4), norm, 0.07],
+    ["RGB10_A2", G.RGB10_A2, G.RGBA, G.UNSIGNED_INT_2_10_10_10_REV, 1, "f", packed1010102, function (v) { var w = v[0]; return [(w & 1023) / 1023, ((w >>> 10) & 1023) / 1023, ((w >>> 20) & 1023) / 1023, (w >>> 30) / 3]; }, 1e-3, 4],
+    ["RGB10_A2UI", G.RGB10_A2UI, G.RGBA_INTEGER, G.UNSIGNED_INT_2_10_10_10_REV, 1, "u", packed1010102, function (v) { var w = v[0]; return [w & 1023, (w >>> 10) & 1023, (w >>> 20) & 1023, w >>> 30]; }, 0, 4],
+    ["R16F", G.R16F, G.RED, G.FLOAT, 1, "f", floatsOf(1), same, 0], ["RG16F", G.RG16F, G.RG, G.FLOAT, 2, "f", floatsOf(2), same, 0],
+    ["RGB16F", G.RGB16F, G.RGB, G.FLOAT, 3, "f", floatsOf(3), same, 0], ["RGBA16F", G.RGBA16F, G.RGBA, G.FLOAT, 4, "f", floatsOf(4), same, 0],
+    ["R32F", G.R32F, G.RED, G.FLOAT, 1, "f", floatsOf(1), same, 0], ["RG32F", G.RG32F, G.RG, G.FLOAT, 2, "f", floatsOf(2), same, 0],
+    ["RGB32F", G.RGB32F, G.RGB, G.FLOAT, 3, "f", floatsOf(3), same, 0], ["RGBA32F", G.RGBA32F, G.RGBA, G.FLOAT, 4, "f", floatsOf(4), same, 0],
+    ["R11F_G11F_B10F", G.R11F_G11F_B10F, G.RGB, G.FLOAT, 3, "f", floatsOf(3, 1), same, 0], ["RGB9_E5", G.RGB9_E5, G.RGB, G.FLOAT, 3, "f", floatsOf(3, 1), same, 0],
+    ["R8UI", G.R8UI, G.RED_INTEGER, G.UNSIGNED_BYTE, 1, "u", bytesOf(1), same, 0], ["R8I", G.R8I, G.RED_INTEGER, G.BYTE, 1, "i", bytesOf(1, 1), same, 0],
+    ["RG8UI", G.RG8UI, G.RG_INTEGER, G.UNSIGNED_BYTE, 2, "u", bytesOf(2), same, 0], ["RG8I", G.RG8I, G.RG_INTEGER, G.BYTE, 2, "i", bytesOf(2, 1), same, 0],
+    ["RGB8UI", G.RGB8UI, G.RGB_INTEGER, G.UNSIGNED_BYTE, 3, "u", bytesOf(3), same, 0], ["RGB8I", G.RGB8I, G.RGB_INTEGER, G.BYTE, 3, "i", bytesOf(3, 1), same, 0],
+    ["RGBA8UI", G.RGBA8UI, G.RGBA_INTEGER, G.UNSIGNED_BYTE, 4, "u", bytesOf(4), same, 0], ["RGBA8I", G.RGBA8I, G.RGBA_INTEGER, G.BYTE, 4, "i", bytesOf(4, 1), same, 0],
+    ["R16UI", G.R16UI, G.RED_INTEGER, G.UNSIGNED_SHORT, 1, "u", intsOf(1, 16), same, 0], ["R16I", G.R16I, G.RED_INTEGER, G.SHORT, 1, "i", intsOf(1, 16, 1), same, 0],
+    ["RG16UI", G.RG16UI, G.RG_INTEGER, G.UNSIGNED_SHORT, 2, "u", intsOf(2, 16), same, 0], ["RG16I", G.RG16I, G.RG_INTEGER, G.SHORT, 2, "i", intsOf(2, 16, 1), same, 0],
+    ["RGB16UI", G.RGB16UI, G.RGB_INTEGER, G.UNSIGNED_SHORT, 3, "u", intsOf(3, 16), same, 0], ["RGB16I", G.RGB16I, G.RGB_INTEGER, G.SHORT, 3, "i", intsOf(3, 16, 1), same, 0],
+    ["RGBA16UI", G.RGBA16UI, G.RGBA_INTEGER, G.UNSIGNED_SHORT, 4, "u", intsOf(4, 16), same, 0], ["RGBA16I", G.RGBA16I, G.RGBA_INTEGER, G.SHORT, 4, "i", intsOf(4, 16, 1), same, 0],
+    ["R32UI", G.R32UI, G.RED_INTEGER, G.UNSIGNED_INT, 1, "u", intsOf(1, 32), same, 0], ["R32I", G.R32I, G.RED_INTEGER, G.INT, 1, "i", intsOf(1, 32, 1), same, 0],
+    ["RG32UI", G.RG32UI, G.RG_INTEGER, G.UNSIGNED_INT, 2, "u", intsOf(2, 32), same, 0], ["RG32I", G.RG32I, G.RG_INTEGER, G.INT, 2, "i", intsOf(2, 32, 1), same, 0],
+    ["RGB32UI", G.RGB32UI, G.RGB_INTEGER, G.UNSIGNED_INT, 3, "u", intsOf(3, 32), same, 0], ["RGB32I", G.RGB32I, G.RGB_INTEGER, G.INT, 3, "i", intsOf(3, 32, 1), same, 0],
+    ["RGBA32UI", G.RGBA32UI, G.RGBA_INTEGER, G.UNSIGNED_INT, 4, "u", intsOf(4, 32), same, 0], ["RGBA32I", G.RGBA32I, G.RGBA_INTEGER, G.INT, 4, "i", intsOf(4, 32, 1), same, 0],
+    ["DEPTH_COMPONENT16", G.DEPTH_COMPONENT16, G.DEPTH_COMPONENT, G.UNSIGNED_SHORT, 1, "d", function (i) { return [i * 4000 + 5]; }, function (v) { return [v[0] / 65535]; }, 1e-4],
+    ["DEPTH_COMPONENT24", G.DEPTH_COMPONENT24, G.DEPTH_COMPONENT, G.UNSIGNED_INT, 1, "d", function (i) { return [(i * 260000000 + 12345) >>> 0]; }, function (v) { return [v[0] / 4294967295]; }, 1e-6],
+    ["DEPTH_COMPONENT32F", G.DEPTH_COMPONENT32F, G.DEPTH_COMPONENT, G.FLOAT, 1, "d", function (i) { return [i / 16]; }, same, 0],
+    ["DEPTH24_STENCIL8", G.DEPTH24_STENCIL8, G.DEPTH_STENCIL, G.UNSIGNED_INT_24_8, 1, "d", function (i) { return [(((i * 1000003) & 0xffffff) << 8 | 7) >>> 0]; }, function (v) { return [(v[0] >>> 8) / 16777215]; }, 1e-6]
+  ];
+  return list;
+}
+// Color-renderable formats (the float ones with EXT_color_buffer_float), cleared and then sampled.
+var GL_RENDERABLE = ["R8", "RG8", "RGBA8", "SRGB8_ALPHA8", "RGB565", "RGB5_A1", "RGBA4", "RGB10_A2", "RGB10_A2UI",
+  "R8UI", "R8I", "RG8UI", "RG8I", "RGBA8UI", "RGBA8I", "R16UI", "R16I", "RG16UI", "RG16I", "RGBA16UI", "RGBA16I",
+  "R32UI", "R32I", "RG32UI", "RG32I", "RGBA32UI", "RGBA32I", "R16F", "RG16F", "RGBA16F", "R32F", "RG32F", "RGBA32F", "R11F_G11F_B10F"];
+
+function glSetup() {
+  var c = document.createElement("canvas"); c.width = 4; c.height = 4;
+  var gl = c.getContext("webgl2");
+  if (!gl) return null;
+  gl.getExtension("EXT_color_buffer_float");
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  var programs = {};
+  function program(kind) {
+    if (programs[kind]) return programs[kind];
+    function sh(type, src) { var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+    var sampler = { f: "sampler2D", d: "sampler2D", u: "usampler2D", i: "isampler2D" }[kind], out = { f: "vec4", d: "vec4", u: "uvec4", i: "ivec4" }[kind];
+    var p = gl.createProgram();
+    gl.attachShader(p, sh(gl.VERTEX_SHADER, "#version 300 es\nvoid main() { gl_Position = vec4(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0, 0.0, 1.0); }"));
+    gl.attachShader(p, sh(gl.FRAGMENT_SHADER, "#version 300 es\nprecision highp float; precision highp int; uniform highp " + sampler + " t; out highp " + out + " o;\nvoid main() { o = texelFetch(t, ivec2(gl_FragCoord.xy), 0); }"));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    programs[kind] = p;
+    return p;
+  }
+  var targets = {};
+  function target(kind) {
+    var k = kind === "d" ? "f" : kind;
+    if (targets[k]) return targets[k];
+    var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, { f: gl.RGBA32F, u: gl.RGBA32UI, i: gl.RGBA32I }[k], 4, 4);
+    var f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    targets[k] = f;
+    return f;
+  }
+  // Every texel of `texture` through texelFetch, as 64 components.
+  function sample(texture, kind) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target(kind));
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error("the 32-bit sampling target is incomplete");
+    gl.viewport(0, 0, 4, 4);
+    gl.useProgram(program(kind));
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    var out;
+    if (kind === "u") { out = new Uint32Array(64); gl.readPixels(0, 0, 4, 4, gl.RGBA_INTEGER, gl.UNSIGNED_INT, out); }
+    else if (kind === "i") { out = new Int32Array(64); gl.readPixels(0, 0, 4, 4, gl.RGBA_INTEGER, gl.INT, out); }
+    else { out = new Float32Array(64); gl.readPixels(0, 0, 4, 4, gl.RGBA, gl.FLOAT, out); }
+    return out;
+  }
+  return { gl: gl, sample: sample };
+}
+
+function runWebGL() {
+  var s = glSetup();
+  if (!s) { row("webgl2", false, "no context"); return; }
+  var gl = s.gl, info = gl.getExtension("WEBGL_debug_renderer_info");
+  document.getElementById("info").textContent += "\nwebgl2: " + (info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+  var formats = glFormats(gl), byName = {};
+  formats.forEach(function (f) { byName[f[0]] = f; });
+  formats.forEach(function (f) {
+    var name = "webgl2 " + f[0] + ": upload, sample";
+    try {
+      var perTexel = f[9] || 0, data = [], want = [];
+      for (var i = 0; i < N; i++) {
+        var v = f[6](i); data = data.concat(v);
+        var d = f[7](v), w = [0, 0, 0, 1];
+        for (var c = 0; c < d.length; c++) w[c] = d[c];
+        want.push(f[5] === "d" ? [w[0], NaN, NaN, NaN] : w);
+      }
+      var typed = { 5121: Uint8Array, 5120: Int8Array, 5123: Uint16Array, 5122: Int16Array, 5125: Uint32Array, 5124: Int32Array, 5126: Float32Array,
+        33640: Uint32Array, 34042: Uint32Array }[f[3]];
+      var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, f[1], 4, 4);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 4, 4, f[2], f[3], new typed(data));
+      var e = gl.getError(); if (e) throw new Error("upload: glError 0x" + e.toString(16));
+      var got = s.sample(t, f[5]);
+      e = gl.getError(); if (e) throw new Error("sample: glError 0x" + e.toString(16));
+      var problem = "";
+      for (var k = 0; k < N && !problem; k++) for (var c2 = 0; c2 < 4; c2++) {
+        var g = got[k * 4 + c2], ww = want[k][c2];
+        if (isNaN(ww)) continue;
+        if (!(Math.abs(g - ww) <= f[8] * Math.max(1, Math.abs(ww)))) { problem = "texel " + k + " = " + Array.from(got.slice(k * 4, k * 4 + 4)).map(function (x) { return +x.toPrecision(6); }) + ", want " + want[k].map(function (x) { return +x.toPrecision(6); }); break; }
+      }
+      gl.deleteTexture(t);
+      row(name, !problem, problem);
+    } catch (x) { row(name, false, x.message); while (gl.getError()) {} }
+  });
+  var floatTargets = !!gl.getExtension("EXT_color_buffer_float");
+  GL_RENDERABLE.forEach(function (n) {
+    var f = byName[n], name = "webgl2 " + n + ": render target clear";
+    if (!floatTargets && /F/.test(n.replace("SRGB8_ALPHA8", ""))) { row(name, null, "EXT_color_buffer_float absent"); return; }
+    try {
+      var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, f[1], 4, 4);
+      var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error("framebuffer incomplete");
+      var value = f[5] === "u" ? [7, 200, 3, 1] : f[5] === "i" ? [-7, 100, -3, 1] : [0.25, 0.5, 0.75, 1];
+      if (f[5] === "u") gl.clearBufferuiv(gl.COLOR, 0, new Uint32Array(value));
+      else if (f[5] === "i") gl.clearBufferiv(gl.COLOR, 0, new Int32Array(value));
+      else gl.clearBufferfv(gl.COLOR, 0, new Float32Array(value));
+      var e = gl.getError(); if (e) throw new Error("clear: glError 0x" + e.toString(16));
+      var got = s.sample(t, f[5]), comps = f[0].indexOf("RGB10_A2") === 0 ? 4 : f[4];
+      var want = [0, 0, 0, 1]; for (var c = 0; c < comps; c++) want[c] = value[c];
+      var tol = f[5] !== "f" ? 0 : /16F|32F/.test(n) ? 0 : n === "R11F_G11F_B10F" ? 0 : /565|5_A1|RGBA4/.test(n) ? 0.07 : 4e-3;
+      var problem = "";
+      for (var k = 0; k < N && !problem; k++) for (var c3 = 0; c3 < 4; c3++)
+        if (!(Math.abs(got[k * 4 + c3] - want[c3]) <= tol)) { problem = "texel " + k + " = " + Array.from(got.slice(k * 4, k * 4 + 4)) + ", want " + want; break; }
+      gl.deleteFramebuffer(fb); gl.deleteTexture(t);
+      row(name, !problem, problem);
+    } catch (x) { row(name, false, x.message); while (gl.getError()) {} }
+  });
+}
+
+(async function main() {
+  document.getElementById("info").textContent = "";
+  try { await runWebGPU(); } catch (e) { row("webgpu: main", false, "threw " + e.message); }
+  try { runWebGL(); } catch (e) { row("webgl2: main", false, "threw " + e.message); }
+})().finally(function () {
+  var verdict = failures.length ? "FAIL " + failures[0] : "PASS";
+  document.getElementById("status").textContent = verdict + "; " + passes + " passed, " + failures.length + " failed" +
+    (failures.length ? " (" + failures.join(", ") + ")" : "") + ", " + skips + " skipped";
+  document.getElementById("h").setAttribute("data-js", "ran");
+  document.body.dataset.verdict = verdict;
+  document.title = "Alchemy GPU formats: " + verdict;
+  finished = true;
+});
+</script>
+</body>
+</html>

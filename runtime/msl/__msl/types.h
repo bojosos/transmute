@@ -511,6 +511,16 @@ template<> struct numeric_limits<half> {
     static constexpr half infinity() { return (half)__builtin_inff(); }
     static constexpr half quiet_NaN() { return (half)__builtin_nanf(""); }
 };
+// Vectors: the element type's limits in every lane (ANGLE's float-to-int
+// conversion clamps against numeric_limits<int2>::min() and max()).
+template<typename T, int N> struct numeric_limits<vec<T, N>> : numeric_limits<T> {
+    static vec<T, N> min() { return vec<T, N>(numeric_limits<T>::min()); }
+    static vec<T, N> lowest() { return vec<T, N>(numeric_limits<T>::lowest()); }
+    static vec<T, N> max() { return vec<T, N>(numeric_limits<T>::max()); }
+    static vec<T, N> epsilon() { return vec<T, N>(numeric_limits<T>::epsilon()); }
+    static vec<T, N> infinity() { return vec<T, N>(numeric_limits<T>::infinity()); }
+    static vec<T, N> quiet_NaN() { return vec<T, N>(numeric_limits<T>::quiet_NaN()); }
+};
 
 } // namespace metal
 

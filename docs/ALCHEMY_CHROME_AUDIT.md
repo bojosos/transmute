@@ -898,6 +898,16 @@ hardware GPU (below).
         and row pitch.
       * Then the media path called `newlocale(LC_ALL_MASK, NULL, …)`, which read the NULL name. newlocale(3)
         makes a NULL name the C locale, and it now is.
+    * **Formats** (`scripts/chrome/pages/gpu_formats.html`): 180 checks, every core WebGPU texture format and
+      every WebGL 2 sized internal format.
+      * WebGPU formats are uploaded, copied back byte for byte, sampled every texel against a CPU decode, cleared
+        as render targets and written from compute where the format allows. Depth and stencil formats are
+        cleared, sampled and their stencil aspect copied back.
+      * WebGL 2 formats are uploaded and sampled with `texelFetch`, and the color-renderable ones are cleared.
+      * All pass headless and windowed, as in headless Edge on the same machine.
+      * WebGL's first `texelFetch(t, ivec2(gl_FragCoord.xy), 0)` used to lose the context. ANGLE's
+        float-to-int helper clamps against `metal::numeric_limits<int2>`, and the MSL library had scalar limits
+        only. Vectors now get their element type's limits in every lane.
   * **ANGLE's Vulkan back end on the host's Vulkan** isn't allowed. Chrome 155 on macOS accepts only ANGLE on Metal,
     or on SwiftShader with `--enable-unsafe-swiftshader`. Its message is `gl_factory.cc:110 ... not found in allowed
     implementations: [(gl=egl-angle,angle=metal)]`.
