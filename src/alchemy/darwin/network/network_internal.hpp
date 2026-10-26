@@ -129,8 +129,9 @@ namespace url_error {
 inline constexpr std::int64_t unknown = -1, cancelled = -999, bad_url = -1000, timed_out = -1001, unsupported_url = -1002,
     cannot_find_host = -1003, cannot_connect = -1004, connection_lost = -1005, too_many_redirects = -1007,
     resource_unavailable = -1008, not_connected = -1009, bad_server_response = -1011, user_cancelled_authentication = -1012,
-    user_authentication_required = -1013, cannot_decode_content = -1016, secure_connection_failed = -1200,
-    certificate_untrusted = -1202, client_certificate_required = -1206, cannot_create_file = -3000, cannot_write_file = -3003;
+    user_authentication_required = -1013, cannot_decode_content = -1016, request_body_stream_exhausted = -1021,
+    secure_connection_failed = -1200, certificate_untrusted = -1202, client_certificate_required = -1206,
+    cannot_create_file = -3000, cannot_write_file = -3003;
 } // namespace url_error
 
 // Network.framework connections, listeners, endpoints, parameters and browsing (nw_connections.cpp).

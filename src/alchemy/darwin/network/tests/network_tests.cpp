@@ -4,7 +4,10 @@
 // trust rejection without a delegate (no request bytes reach the server),
 // trust override through the server-trust challenge, redirects, uploads,
 // downloads, delegate streaming, HTTP Basic authentication challenges and
-// cancellation. When the network is reachable, a real HTTPS request to
+// cancellation; HTTPBodyStream uploads, NSURLCredentialStorage (credentials kept
+// from challenges, default credentials for challenges the delegate leaves to
+// default handling), background configurations, and connectionProxyDictionary
+// through an in-test loopback HTTP proxy. When the network is reachable, a real HTTPS request to
 // https://example.com is evaluated against the Windows root store.
 // CFSocket: accept, data, write and end-of-stream callbacks through the
 // run loop against host Winsock peers. Bonjour: dns_sd and NSNetService over
@@ -20,6 +23,7 @@
 #include "alchemy/foundation_bridge.hpp"
 #include "alchemy/gui/install.hpp"
 #include "alchemy/gui/runloop.hpp"
+#include "alchemy/host/network_policy.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -168,6 +172,10 @@ private:
                 if (headers["authorization"] == "Basic " + sec::base64_encode(Bytes{'a', 'r', 't', 'i', 's', 't', ':', 's', 'e', 'c', 'r', 'e', 't'}))
                     payload = "authorized";
                 else { status = 401; reason = "Unauthorized"; extra = "WWW-Authenticate: Basic realm=\"alchemy\"\r\n"; payload = "denied"; }
+            } else if (path == "/auth-stored") {
+                if (headers["authorization"] == "Basic " + sec::base64_encode(Bytes{'k', 'e', 'e', 'p', 'e', 'r', ':', 'v', 'a', 'u', 'l', 't'}))
+                    payload = "stored ok";
+                else { status = 401; reason = "Unauthorized"; extra = "WWW-Authenticate: Basic realm=\"stored\"\r\n"; payload = "denied"; }
             } else if (path == "/slow") {
                 for (int index = 0; index < 60 && !stop_; ++index) std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 payload = "slow";
@@ -890,6 +898,215 @@ void test_sessions(Fixture& f, Harness& h, HttpsServer& server) {
     require(server.error().empty(), "server error: " + server.error());
 }
 
+// A plain HTTP forward proxy on loopback: every request gets "via proxy"; the request lines are kept.
+class LoopbackProxy {
+public:
+    LoopbackProxy() {
+        listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        require(bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 && listen(listener_, 8) == 0, "proxy listen failed");
+        int size = sizeof(address);
+        getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &size);
+        port_ = ntohs(address.sin_port);
+        thread_ = std::thread([this] {
+            while (!stop_) {
+                fd_set set;
+                FD_ZERO(&set);
+                FD_SET(listener_, &set);
+                timeval timeout{0, 50'000};
+                if (select(0, &set, nullptr, nullptr, &timeout) <= 0) continue;
+                const auto client = accept(listener_, nullptr, nullptr);
+                if (client == INVALID_SOCKET) continue;
+                std::string data;
+                char buffer[4096];
+                while (data.find("\r\n\r\n") == std::string::npos) {
+                    const auto got = recv(client, buffer, sizeof(buffer), 0);
+                    if (got <= 0) break;
+                    data.append(buffer, static_cast<std::size_t>(got));
+                }
+                { std::lock_guard lock(mutex_); lines_.push_back(data.substr(0, data.find("\r\n"))); }
+                const std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nvia proxy";
+                send(client, response.data(), static_cast<int>(response.size()), 0);
+                shutdown(client, SD_SEND);
+                closesocket(client);
+            }
+        });
+    }
+    ~LoopbackProxy() { stop_ = true; if (thread_.joinable()) thread_.join(); closesocket(listener_); }
+    [[nodiscard]] std::uint16_t port() const { return port_; }
+    std::vector<std::string> lines() { std::lock_guard lock(mutex_); return lines_; }
+
+private:
+    SOCKET listener_{};
+    std::uint16_t port_{};
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+    std::mutex mutex_;
+    std::vector<std::string> lines_;
+};
+
+// HTTPBodyStream uploads, NSURLCredentialStorage, background configurations and connectionProxyDictionary.
+void test_session_extras(Fixture& f, Harness& h, HttpsServer& server) {
+    const auto b = sec::bridge();
+    const auto text_of = [&] { std::lock_guard lock(h.record.mutex); return std::string(h.record.data.begin(), h.record.data.end()); };
+    const auto fails = [&](auto action) {
+        try { action(); } catch (const std::exception&) { return true; }
+        return false;
+    };
+    const auto delegate = h.delegate();
+    const auto session = h.session(delegate);
+
+    // 1. HTTPBodyStream: the stream is opened, read to its end (here 5 bytes per read) and closed, and its bytes
+    //    are the body; a stream that reports an error fails the task; a body replaces the stream. (This fixture
+    //    has no Foundation streams, so the stream is a guest-visible class with the NSInputStream calls used.)
+    struct StreamState { std::mutex mutex; std::string data; std::size_t at{}; bool opened{}, closed{}, broken{}; } source;
+    static Address stream_class = 0;
+    static StreamState* current = nullptr;
+    current = &source;
+    if (!stream_class) {
+        stream_class = f.objc.register_native_class("AlchemyTestBodyStream", f.cls("NSObject"), 8);
+        static_cast<void>(f.objc.add_native_method(stream_class, "open", [](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(current->mutex); current->opened = true; s.x[0] = 0; }, false, "v@:"));
+        static_cast<void>(f.objc.add_native_method(stream_class, "close", [](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(current->mutex); current->closed = true; s.x[0] = 0; }, false, "v@:"));
+        static_cast<void>(f.objc.add_native_method(stream_class, "read:maxLength:", [](CpuState& s, GuestMemory& m) {
+            std::lock_guard lock(current->mutex);
+            if (current->broken) { s.x[0] = static_cast<Address>(-1); return; }
+            const auto count = std::min<std::size_t>({5, static_cast<std::size_t>(s.x[3]), current->data.size() - current->at});
+            m.write_bytes(s.x[2], std::span(reinterpret_cast<const std::uint8_t*>(current->data.data() + current->at), count));
+            current->at += count;
+            s.x[0] = count;
+        }, false, "q@:^CQ"));
+    }
+    const auto request = f.send(f.cls("NSMutableURLRequest"), "requestWithURL:", {f.url(server.base() + "/echo")});
+    static_cast<void>(f.send(request, "setHTTPMethod:", {f.string("POST")}));
+    const std::string streamed = "a body read from an NSInputStream";
+    source.data = streamed;
+    const auto stream = f.send(f.send(stream_class, "alloc"), "init");
+    static_cast<void>(f.send(request, "setHTTPBodyStream:", {stream}));
+    require(f.send(request, "HTTPBodyStream") == stream && f.send(request, "HTTPBody") == 0, "HTTPBodyStream replaces HTTPBody");
+    h.record.reset();
+    static_cast<void>(f.send(f.send(session, "dataTaskWithRequest:completionHandler:", {request, h.completion}), "resume"));
+    h.wait("HTTPBodyStream upload");
+    require(h.record.error == 0 && text_of() == streamed, "the streamed body was echoed: " + text_of());
+    { std::lock_guard lock(source.mutex); require(source.opened && source.closed && source.at == streamed.size(), "the stream was opened, read and closed"); }
+    {
+        std::lock_guard lock(source.mutex);
+        source.broken = true;
+        source.opened = source.closed = false;
+    }
+    h.record.reset();
+    static_cast<void>(f.send(f.send(session, "dataTaskWithRequest:completionHandler:", {request, h.completion}), "resume"));
+    h.wait("a broken HTTPBodyStream");
+    require(h.record.error == net::url_error::request_body_stream_exhausted, "a stream error fails the task: " + std::to_string(h.record.error));
+    static_cast<void>(f.send(request, "setHTTPBody:", {b->data(Bytes{'x'})}));
+    require(f.send(request, "HTTPBodyStream") == 0, "HTTPBody replaces HTTPBodyStream");
+
+    // 2. Credential storage: ephemeral sessions have a private one, default configurations the shared one.
+    const auto shared_storage = f.send(f.cls("NSURLCredentialStorage"), "sharedCredentialStorage");
+    const auto storage = f.send(f.send(session, "configuration"), "URLCredentialStorage");
+    require(shared_storage != 0 && storage != 0 && storage != shared_storage, "an ephemeral session's private credential storage");
+    require(f.send(f.send(f.cls("NSURLSessionConfiguration"), "defaultSessionConfiguration"), "URLCredentialStorage") == shared_storage,
+            "the default configuration's credential storage is the shared one");
+    const auto space_for = [&](std::string_view realm) {
+        alchemy::CallRegs registers;
+        registers.x[2] = f.string("localhost");
+        registers.x[3] = server.port();
+        registers.x[4] = f.string("https");
+        registers.x[5] = f.string(realm);
+        registers.x[6] = f.string("NSURLAuthenticationMethodHTTPBasic");
+        return f.objc.send(f.send(f.cls("NSURLProtectionSpace"), "alloc"), "initWithHost:port:protocol:realm:authenticationMethod:", registers).x0;
+    };
+    const auto alchemy_space = space_for("alchemy"), stored_space = space_for("stored");
+    require(f.send(alchemy_space, "isEqual:", {space_for("alchemy")}) == 1 && f.send(alchemy_space, "isEqual:", {stored_space}) == 0,
+            "protection space equality");
+    // The delegate answers realm "alchemy" with a session credential: the storage keeps it as the space's default.
+    h.record.reset();
+    static_cast<void>(f.send(f.send(session, "dataTaskWithURL:completionHandler:", {f.url(server.base() + "/auth"), h.completion}), "resume"));
+    h.wait("authentication");
+    require(h.record.status == 200 && text_of() == "authorized", "Basic authentication");
+    const auto kept = f.send(storage, "credentialsForProtectionSpace:", {alchemy_space});
+    require(kept != 0 && f.text(f.send(f.send(kept, "objectForKey:", {f.string("artist")}), "password")) == "secret", "the given credential was kept");
+    require(f.text(f.send(f.send(storage, "defaultCredentialForProtectionSpace:", {alchemy_space}), "user")) == "artist", "and became the default");
+    require(f.send(shared_storage, "credentialsForProtectionSpace:", {alchemy_space}) == 0, "the shared storage is untouched");
+    // Realm "stored" is left to default handling: 401 without a default credential, 200 with one.
+    h.record.reset();
+    static_cast<void>(f.send(f.send(session, "dataTaskWithURL:completionHandler:", {f.url(server.base() + "/auth-stored"), h.completion}), "resume"));
+    h.wait("authentication without a stored credential");
+    require(h.record.status == 401 && text_of() == "denied", "no default credential: the 401 response is delivered");
+    alchemy::CallRegs keeper;
+    keeper.x[2] = f.string("keeper"); keeper.x[3] = f.string("vault"); keeper.x[4] = 1;
+    const auto keeper_credential = f.objc.send(f.cls("NSURLCredential"), "credentialWithUser:password:persistence:", keeper).x0;
+    static_cast<void>(f.send(storage, "setDefaultCredential:forProtectionSpace:", {keeper_credential, stored_space}));
+    require(f.send(f.send(storage, "allCredentials"), "count") == 2, "allCredentials has both spaces");
+    h.record.reset();
+    static_cast<void>(f.send(f.send(session, "dataTaskWithURL:completionHandler:", {f.url(server.base() + "/auth-stored"), h.completion}), "resume"));
+    h.wait("authentication with the stored default credential");
+    require(h.record.status == 200 && text_of() == "stored ok", "the default credential answers the challenge: " + text_of());
+    static_cast<void>(f.send(storage, "removeCredential:forProtectionSpace:", {keeper_credential, stored_space}));
+    require(f.send(storage, "defaultCredentialForProtectionSpace:", {stored_space}) == 0 &&
+                f.send(storage, "credentialsForProtectionSpace:", {stored_space}) == 0, "removeCredential:forProtectionSpace:");
+    // A credential that persists for no time is not kept.
+    keeper.x[4] = 0;
+    const auto passing = f.objc.send(f.cls("NSURLCredential"), "credentialWithUser:password:persistence:", keeper).x0;
+    static_cast<void>(f.send(storage, "setCredential:forProtectionSpace:", {passing, stored_space}));
+    require(f.send(storage, "credentialsForProtectionSpace:", {stored_space}) == 0, "NSURLCredentialPersistenceNone is not stored");
+    static_cast<void>(f.send(session, "invalidateAndCancel"));
+
+    // 3. Background configurations: delegate-driven tasks run; completion handlers fail as on macOS.
+    const auto background = f.send(f.cls("NSURLSessionConfiguration"), "backgroundSessionConfigurationWithIdentifier:", {f.string("com.alchemy.test.bg")});
+    require(f.text(f.send(background, "identifier")) == "com.alchemy.test.bg", "the background identifier");
+    require(f.send(background, "URLCredentialStorage") == shared_storage, "a background configuration shares the credential storage");
+    const auto background_session = f.send(f.cls("NSURLSession"), "sessionWithConfiguration:delegate:delegateQueue:", {background, h.delegate(), 0});
+    require(fails([&] { f.send(background_session, "dataTaskWithURL:completionHandler:", {f.url(server.base() + "/hello"), h.completion}); }),
+            "a completion handler in a background session fails explicitly");
+    h.record.reset();
+    static_cast<void>(f.send(f.send(background_session, "dataTaskWithURL:", {f.url(server.base() + "/hello")}), "resume"));
+    h.wait("background delegate task");
+    require(h.record.error == 0 && text_of() == "hello world", "a background session's delegate task");
+    static_cast<void>(f.send(background_session, "invalidateAndCancel"));
+
+    // 4. connectionProxyDictionary: an HTTP proxy (on loopback, so allowed under ALCHEMY_NETWORK=loopback) carries
+    //    http:// requests; the exception list bypasses it; an empty dictionary means direct; PAC fails explicitly.
+    LoopbackProxy proxy;
+    const auto proxied_session = [&](std::vector<std::pair<Address, Address>> entries) {
+        const auto configuration = f.send(f.cls("NSURLSessionConfiguration"), "ephemeralSessionConfiguration");
+        static_cast<void>(f.send(configuration, "setConnectionProxyDictionary:", {b->dictionary(entries)}));
+        return f.send(f.cls("NSURLSession"), "sessionWithConfiguration:delegate:delegateQueue:", {configuration, h.delegate(), 0});
+    };
+    const std::vector<std::pair<Address, Address>> http_proxy{
+        {f.string("HTTPEnable"), b->number(1)}, {f.string("HTTPProxy"), f.string("127.0.0.1")}, {f.string("HTTPPort"), b->number(proxy.port())}};
+    const auto via = proxied_session(http_proxy);
+    h.record.reset();
+    static_cast<void>(f.send(f.send(via, "dataTaskWithURL:completionHandler:", {f.url("http://proxied.localhost/through"), h.completion}), "resume"));
+    h.wait("a request through the proxy");
+    require(h.record.status == 200 && text_of() == "via proxy", "the proxy answered: " + text_of() + " error " + std::to_string(h.record.error));
+    const auto lines = proxy.lines();
+    require(!lines.empty() && lines.back() == "GET http://proxied.localhost/through HTTP/1.1", "the proxy saw the absolute URI: " +
+            (lines.empty() ? std::string("(none)") : lines.back()));
+    static_cast<void>(f.send(via, "invalidateAndCancel"));
+    auto bypassing = http_proxy;
+    bypassing.emplace_back(f.string("ExceptionsList"), b->array({f.string("bypassed.localhost")}));
+    const auto around = proxied_session(bypassing);
+    h.record.reset();
+    static_cast<void>(f.send(f.send(around, "dataTaskWithURL:completionHandler:", {f.url("http://bypassed.localhost/direct"), h.completion}), "resume"));
+    h.wait("a request on the exception list");
+    require(proxy.lines().size() == lines.size(), "the exception list bypasses the proxy");
+    static_cast<void>(f.send(around, "invalidateAndCancel"));
+    const auto direct = proxied_session({});
+    h.record.reset();
+    static_cast<void>(f.send(f.send(direct, "dataTaskWithURL:completionHandler:", {f.url(server.base() + "/hello"), h.completion}), "resume"));
+    h.wait("an empty proxy dictionary");
+    require(h.record.error == 0 && text_of() == "hello world" && proxy.lines().size() == lines.size(), "an empty dictionary connects directly");
+    static_cast<void>(f.send(direct, "invalidateAndCancel"));
+    require(fails([&] { proxied_session({{f.string("ProxyAutoConfigEnable"), b->number(1)}}); }), "proxy auto-configuration fails explicitly");
+    require(fails([&] { proxied_session({{f.string("SOCKSEnable"), b->number(1)}}); }), "SOCKS proxies fail explicitly");
+    require(server.error().empty(), "server error: " + server.error());
+    std::cout << "URL loading: HTTPBodyStream, credential storage, background configurations and proxies\n";
+}
+
 void test_internet(Fixture& f, Harness& h) {
     h.record.reset();
     const auto shared = f.send(f.cls("NSURLSession"), "sharedSession");
@@ -1219,12 +1436,15 @@ int main() {
         test_proxy_auto_configuration(fixture);
         test_system_configuration(fixture);
         test_resolver(fixture, sec::host_environment("ALCHEMY_TEST_OFFLINE").empty());
-        test_bonjour(fixture);
+        // DNS-SD multicast leaves the machine: refused by design under ALCHEMY_NETWORK=loopback.
+        if (alchemy::network_policy::loopback_only()) std::cout << "Bonjour: skipped (ALCHEMY_NETWORK=loopback)\n";
+        else test_bonjour(fixture);
         Harness harness(fixture);   // registers the delegate class once
         const auto identity = sec::SelfSignedIdentity::create("localhost", {"localhost"});
         {
             HttpsServer server(identity->context());
             test_sessions(fixture, harness, server);
+            test_session_extras(fixture, harness, server);
         }
         if (sec::host_environment("ALCHEMY_TEST_OFFLINE").empty()) test_internet(fixture, harness);
         std::cout << "Alchemy network tests passed\n";

@@ -24,10 +24,22 @@
 // delegate implements it, the NSURLAuthenticationMethodServerTrust
 // challenge.
 //
-// Not provided (explicit failures): background sessions, stream / WebSocket
-// tasks, custom NSURLProtocol classes, HTTPBodyStream uploads, client
-// certificate credentials, response dispositions other than allow / cancel,
-// and resume data. Cookies: NSHTTPCookieStorage's jar (cookies.cpp) sets
+// HTTPBodyStream uploads read the stream to its end before the request is
+// sent. NSURLCredentialStorage keeps credentials and default credentials per
+// protection space in memory (the shared storage for default and background
+// sessions, a private one for ephemeral sessions); an authentication
+// challenge the delegate does not handle (or answers with default handling)
+// uses the space's default credential, and a credential the delegate gives
+// with session or permanent persistence becomes that default. Background
+// configurations behave like default ones (the process is never suspended
+// here) but, as on macOS, their tasks take no completion handlers.
+// connectionProxyDictionary's HTTP and HTTPS proxies and exception list are
+// used (an empty dictionary means no proxy).
+//
+// Not provided (explicit failures): stream / WebSocket tasks, custom
+// NSURLProtocol classes, proxy auto-configuration and SOCKS entries in
+// connectionProxyDictionary, client certificate credentials, response
+// dispositions other than allow / cancel, and resume data. Cookies: NSHTTPCookieStorage's jar (cookies.cpp) sets
 // Cookie headers and stores Set-Cookie on every hop; default sessions share
 // it, ephemeral ones keep their own; nothing is persisted.
 namespace alchemy::gui::network {
@@ -54,6 +66,7 @@ struct RequestState final : ObjectPayload {
     std::string method{"GET"};
     Headers headers;
     std::optional<Bytes> body;
+    Address body_stream{};        // +1 NSInputStream (HTTPBodyStream)
     double timeout{60};
     std::uint64_t cache_policy{}, service_type{};
     bool cookies{true}, cellular{true}, pipelining{}, expensive{true}, constrained{true};
@@ -74,7 +87,7 @@ struct Properties {
     std::map<std::string, std::uint64_t> integers;
     std::map<std::string, double> reals;
 };
-struct ConfigurationState final : ObjectPayload { Properties properties; bool ephemeral{}; };
+struct ConfigurationState final : ObjectPayload { Properties properties; bool ephemeral{}, background{}; };
 
 struct Decision {
     std::mutex mutex;
@@ -118,7 +131,8 @@ struct SessionState final : ObjectPayload {
     Address dispatch{};           // its dispatch queue
     Address description{};        // +1
     std::shared_ptr<HttpClient> client;
-    bool shared{}, invalidated{}, finishing{}, ephemeral{}, self_retained{};
+    bool shared{}, invalidated{}, finishing{}, ephemeral{}, self_retained{}, background{};
+    std::optional<ProxyConfiguration> proxy;   // connectionProxyDictionary (nullopt: the system settings)
     std::set<Address> tasks;      // +1 while not completed
     std::uint64_t next_identifier{1};
     double request_timeout{60}, resource_timeout{604800};
@@ -145,6 +159,16 @@ struct CredentialState final : ObjectPayload {
     bool has_password{};
     std::uint64_t persistence{};
 };
+// NSURLCredentialStorage: per protection space, the credentials by user (+1) and the default user.
+struct StorageState final : ObjectPayload {
+    struct Entry {
+        Address space{};          // +1
+        std::map<std::string, Address> credentials;
+        std::string default_user;
+    };
+    std::mutex mutex;
+    std::map<std::tuple<std::string, std::int64_t, std::string, std::string, std::string, bool>, Entry> spaces;
+};
 
 // ---- the provider ----------------------------------------------------------------------------------
 
@@ -154,8 +178,10 @@ struct Loading : std::enable_shared_from_this<Loading> {
     std::shared_ptr<Security> sec;
     Address request_class{}, mutable_request_class{}, response_class{}, http_response_class{}, configuration_class{};
     Address session_class{}, task_class{}, data_task_class{}, upload_task_class{}, download_task_class{};
-    Address challenge_class{}, space_class{}, credential_class{}, cookie_storage_class{};
+    Address challenge_class{}, space_class{}, credential_class{}, cookie_storage_class{}, credential_storage_class{};
     Address shared_session{}, shared_cookie_storage{};
+    Address shared_credential_storage{};      // immortal
+    std::mutex storage_mutex;                 // shared_credential_storage (taken under `mutex` by sharedSession)
     std::uint64_t cookie_policy{2};           // NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain
     std::map<std::string, Address, std::less<>> constants;
     std::mutex mutex;
@@ -263,6 +289,7 @@ struct Loading : std::enable_shared_from_this<Loading> {
             state->url = b->retain(from->url);
             state->main_document = b->retain(from->main_document);
             state->method = from->method; state->headers = from->headers; state->body = from->body;
+            state->body_stream = b->retain(from->body_stream);
             state->timeout = from->timeout; state->cache_policy = from->cache_policy; state->service_type = from->service_type;
             state->cookies = from->cookies; state->cellular = from->cellular; state->pipelining = from->pipelining;
             state->expensive = from->expensive; state->constrained = from->constrained;
@@ -376,6 +403,181 @@ struct Loading : std::enable_shared_from_this<Loading> {
     }
 
     // ---- challenges ---------------------------------------------------------------------------------------
+    // The bytes of an NSInputStream read to its end (nullopt when it reports an error).
+    std::optional<Bytes> drain(Address stream) {
+        static_cast<void>(b->objc.send(stream, "open"));
+        Bytes bytes;
+        const auto buffer = b->call("/usr/lib/libSystem.B.dylib", "_malloc", {64 * 1024});
+        bool failed{};
+        for (;;) {
+            CallRegs registers;
+            registers.x[2] = buffer;
+            registers.x[3] = 64 * 1024;
+            const auto count = static_cast<std::int64_t>(b->objc.send(stream, "read:maxLength:", registers).x0);
+            if (count < 0) { failed = true; break; }
+            if (count == 0) break;
+            const auto at = bytes.size();
+            bytes.resize(at + static_cast<std::size_t>(count));
+            b->memory().read_bytes(buffer, std::span(bytes.data() + at, static_cast<std::size_t>(count)));
+        }
+        static_cast<void>(b->call("/usr/lib/libSystem.B.dylib", "_free", {buffer}));
+        static_cast<void>(b->objc.send(stream, "close"));
+        if (failed) return std::nullopt;
+        return bytes;
+    }
+    // ---- credential storage ----
+    using SpaceKey = std::tuple<std::string, std::int64_t, std::string, std::string, std::string, bool>;
+    static SpaceKey key_of(const SpaceState& space) {
+        return {space.host, space.port, space.protocol, space.realm, space.method, space.proxy};
+    }
+    // The session configuration's URLCredentialStorage (object, state); none when it was set to nil.
+    std::pair<Address, std::shared_ptr<StorageState>> storage_for(const std::shared_ptr<SessionState>& session) {
+        Address configured{};
+        {
+            std::lock_guard lock(session->mutex);
+            if (session->configuration)
+                if (const auto config = b->objc.find_host_state<ConfigurationState>(session->configuration)) {
+                    std::lock_guard config_lock(config->properties.mutex);
+                    if (const auto found = config->properties.objects.find("URLCredentialStorage"); found != config->properties.objects.end())
+                        configured = found->second;
+                }
+        }
+        if (!configured) return {};
+        return {configured, b->objc.find_host_state<StorageState>(configured)};
+    }
+    // A new credential storage (+1); the shared one is immortal.
+    Address make_storage(bool immortal = false) {
+        const auto object = immortal ? b->process.objects().create(16, credential_storage_class, ObjectKind::instance, {}, {}, true)
+                                     : b->objc.allocate(credential_storage_class);
+        static_cast<void>(b->objc.host_state<StorageState>(object, [] { return std::make_shared<StorageState>(); }));
+        return object;
+    }
+    Address shared_storage() {
+        std::lock_guard lock(storage_mutex);
+        if (!shared_credential_storage) shared_credential_storage = make_storage(true);
+        return shared_credential_storage;
+    }
+    // Removes `credential` (by user) from `space`; posts the change notification when something was removed.
+    void remove_credential(const std::shared_ptr<StorageState>& storage, Address storage_object, Address credential, Address space) {
+        const auto value = space ? b->objc.find_host_state<SpaceState>(space) : nullptr;
+        const auto user_state = credential ? b->objc.find_host_state<CredentialState>(credential) : nullptr;
+        if (!storage || !value || !user_state) return;
+        std::vector<Address> released;
+        {
+            std::lock_guard lock(storage->mutex);
+            const auto entry = storage->spaces.find(key_of(*value));
+            if (entry == storage->spaces.end()) return;
+            const auto found = entry->second.credentials.find(user_state->user);
+            if (found == entry->second.credentials.end()) return;
+            released.push_back(found->second);
+            entry->second.credentials.erase(found);
+            if (entry->second.default_user == user_state->user) entry->second.default_user.clear();
+            if (entry->second.credentials.empty()) { released.push_back(entry->second.space); storage->spaces.erase(entry); }
+        }
+        b->release_all(released);
+        post_storage_changed(storage_object);
+    }
+    // credentialsForProtectionSpace: (+1 dictionary user -> credential, 0 when there are none).
+    Address credentials_of(const std::shared_ptr<StorageState>& storage, Address space) {
+        const auto value = space ? b->objc.find_host_state<SpaceState>(space) : nullptr;
+        if (!storage || !value) return 0;
+        std::vector<std::pair<Address, Address>> entries;
+        {
+            std::lock_guard lock(storage->mutex);
+            const auto entry = storage->spaces.find(key_of(*value));
+            if (entry == storage->spaces.end() || entry->second.credentials.empty()) return 0;
+            for (const auto& [user, credential] : entry->second.credentials) entries.emplace_back(b->string(user), credential);
+        }
+        const auto result = b->dictionary(entries);
+        for (const auto& [key, unused] : entries) b->release(key);
+        return result;
+    }
+    // The default credential object of `space` (not retained; 0 when there is none).
+    Address default_object(const std::shared_ptr<StorageState>& storage, Address space) {
+        const auto value = space ? b->objc.find_host_state<SpaceState>(space) : nullptr;
+        if (!storage || !value) return 0;
+        std::lock_guard lock(storage->mutex);
+        const auto entry = storage->spaces.find(key_of(*value));
+        if (entry == storage->spaces.end() || entry->second.default_user.empty()) return 0;
+        const auto found = entry->second.credentials.find(entry->second.default_user);
+        return found == entry->second.credentials.end() ? 0 : found->second;
+    }
+    // The default credential of the challenge's space as user and password.
+    std::optional<std::pair<std::string, std::string>> default_credential(const std::shared_ptr<StorageState>& storage, Address space) {
+        const auto credential = default_object(storage, space);
+        const auto state = credential ? b->objc.find_host_state<CredentialState>(credential) : nullptr;
+        if (!state || !state->has_password) return std::nullopt;
+        return std::make_pair(state->user, state->password);
+    }
+    // Stores `credential` for `space` (and as its default when `make_default`); posts the change notification.
+    void store_credential(const std::shared_ptr<StorageState>& storage, Address storage_object, Address credential, Address space, bool make_default) {
+        const auto value = space ? b->objc.find_host_state<SpaceState>(space) : nullptr;
+        const auto user_state = credential ? b->objc.find_host_state<CredentialState>(credential) : nullptr;
+        if (!storage || !value || !user_state || user_state->trust) return;
+        std::vector<Address> released;
+        {
+            std::lock_guard lock(storage->mutex);
+            auto& entry = storage->spaces[key_of(*value)];
+            if (!entry.space) entry.space = b->retain(space);
+            auto& slot = entry.credentials[user_state->user];
+            if (slot != credential) { if (slot) released.push_back(slot); slot = b->retain(credential); }
+            if (make_default) entry.default_user = user_state->user;
+        }
+        b->release_all(released);
+        post_storage_changed(storage_object);
+    }
+    void post_storage_changed(Address storage_object) {
+        const auto center_class = b->objc.find_class("NSNotificationCenter");
+        if (!center_class || !storage_object) return;
+        const auto center = b->objc.send(center_class, "defaultCenter").x0;
+        CallRegs registers;
+        registers.x[2] = constant("NSURLCredentialStorageChangedNotification");
+        registers.x[3] = storage_object;
+        static_cast<void>(b->objc.send(center, "postNotificationName:object:", registers));
+    }
+    // connectionProxyDictionary as a proxy configuration (nullopt: the system proxy settings).
+    std::optional<ProxyConfiguration> proxies_from(Address dictionary) {
+        if (!dictionary) return std::nullopt;
+        ProxyConfiguration proxy;
+        const auto entries = b->cf.dictionary_entries(dictionary);
+        const auto value = [&](std::string_view key) -> Address {
+            for (const auto& [name, item] : entries) if (b->maybe_text(name) == key) return item;
+            return 0;
+        };
+        const auto integer = [&](std::string_view key) -> std::int64_t {
+            const auto item = value(key);
+            return item ? b->integer(item).value_or(0) : 0;
+        };
+        const auto text = [&](std::string_view key) {
+            const auto item = value(key);
+            return item ? b->maybe_text(item).value_or(std::string{}) : std::string{};
+        };
+        if (integer("ProxyAutoConfigEnable") || integer("ProxyAutoDiscoveryEnable"))
+            security::unsupported("NSURLSessionConfiguration connectionProxyDictionary proxy auto-configuration");
+        if (integer("SOCKSEnable")) security::unsupported("NSURLSessionConfiguration connectionProxyDictionary SOCKS proxies");
+        std::string list;
+        for (const auto& [scheme, prefix] : std::initializer_list<std::pair<const char*, const char*>>{{"http", "HTTP"}, {"https", "HTTPS"}}) {
+            const std::string p = prefix;
+            if (!integer(p + "Enable")) continue;
+            const auto host = text(p + "Proxy");
+            if (host.empty()) continue;
+            const auto port = integer(p + "Port");
+            if (!list.empty()) list += ";";
+            list += std::string(scheme) + "=" + host + (port ? ":" + std::to_string(port) : std::string{});
+        }
+        if (!list.empty()) {
+            proxy.kind = ProxyConfiguration::Kind::named;
+            proxy.proxy = list;
+            if (const auto exceptions = value("ExceptionsList"); exceptions && b->is_array(exceptions)) {
+                for (const auto item : b->cf.array_values(exceptions))
+                    if (const auto host = b->maybe_text(item)) {
+                        if (!proxy.bypass.empty()) proxy.bypass += ";";
+                        proxy.bypass += *host;
+                    }
+            }
+        }
+        return proxy;   // Kind::none: direct connections
+    }
     Address make_space(const std::string& host, std::int64_t port, const std::string& protocol, const std::string& realm,
                        const std::string& method, Address trust, bool proxy) {
         const auto object = b->objc.allocate(space_class);
@@ -582,7 +784,10 @@ std::shared_ptr<HttpClient> Loading::client_for(const std::shared_ptr<SessionSta
     }
     const auto agent = default_user_agent();
     std::shared_ptr<HttpClient> client;
-    if (session->ephemeral) client = HttpClient::create(agent, system_proxy());
+    std::optional<ProxyConfiguration> proxy;
+    { std::lock_guard lock(session->mutex); proxy = session->proxy; }
+    if (proxy) client = HttpClient::create(agent, *proxy);
+    else if (session->ephemeral) client = HttpClient::create(agent, system_proxy());
     else {
         std::lock_guard lock(mutex);
         if (!default_client) default_client = HttpClient::create(agent, system_proxy());
@@ -598,6 +803,8 @@ Address Loading::create_task(Address session_object, TaskKind kind, Address requ
     {
         std::lock_guard lock(session->mutex);
         if (session->invalidated || session->finishing) security::fail("task created on an invalidated NSURLSession");
+        if (session->background && completion)
+            security::fail("NSGenericException: Completion handler blocks are not supported in background sessions. Use a delegate instead.");
     }
     if (!request || !b->objc.find_host_state<RequestState>(request)) security::fail("NSURLSession task without an NSURLRequest");
     const auto cls = kind == TaskKind::download ? download_task_class : kind == TaskKind::upload ? upload_task_class : data_task_class;
@@ -639,6 +846,7 @@ void Loading::run(Address task) {
     struct Holder { Bridge& b; Address& object; ~Holder() { b.release(object); } } hold_current{*b, current};
     HttpRequest request;
     std::shared_ptr<CookieJar> jar;
+    Address body_stream{};
     {
         const auto source = require<RequestState>(current, "NSURLRequest");
         std::lock_guard lock(source->mutex);
@@ -650,6 +858,7 @@ void Loading::run(Address task) {
         request.headers = session->additional;
         for (const auto& [name, value] : source->headers) set_header(request.headers, name, value, false);
         request.body = source->body.value_or(Bytes{});
+        body_stream = b->retain(source->body_stream);
         request.timeout = source->timeout == 60 ? session->request_timeout : source->timeout;
         request.cookies = source->cookies && session->cookies && cookie_policy != 1;   // NSHTTPCookieAcceptPolicyNever
         if (!session->cookie_jar) session->cookie_jar = session->ephemeral ? std::make_shared<CookieJar>() : shared_cookie_jar();
@@ -657,6 +866,13 @@ void Loading::run(Address task) {
     }
     // The request's own Cookie header wins; otherwise the jar's cookies for each hop's URL.
     const bool own_cookie_header = header_value(request.headers, "Cookie").has_value();
+    if (body_stream) {
+        // HTTPBodyStream: read to the end (on this worker) and send as the body.
+        const auto drained = drain(body_stream);
+        b->release(body_stream);
+        if (!drained) { fail_task(url_error::request_body_stream_exhausted, "the HTTPBodyStream could not be read"); return; }
+        request.body = *drained;
+    }
     if (state->upload) request.body = *state->upload;
     if (request.url.scheme != "http" && request.url.scheme != "https") { fail_task(url_error::unsupported_url, "unsupported URL"); return; }
     if (request.url.host.empty()) { fail_task(url_error::bad_url, "unsupported URL"); return; }
@@ -708,17 +924,27 @@ void Loading::run(Address task) {
                 const auto space = make_space(request.url.host_name(), request.url.effective_port(), request.url.scheme, challenge->realm,
                                               method, 0, challenge->target == AuthTarget::proxy);
                 const auto object = make_challenge(space, auth_attempts, failure);
-                b->release_all({space, failure});
+                b->release(failure);
+                struct Release { Bridge& b; Address object; ~Release() { b.release(object); } } keep_space{*b, space};
                 const auto answer = ask_challenge(session, session_object, task, object, false, transfer);
                 b->release(object);
-                if (!answer) break;
-                const auto [disposition, credential] = *answer;
-                struct Drop { Bridge& b; Address object; ~Drop() { b.release(object); } } drop{*b, credential};
-                if (disposition == 2) { fail_task(url_error::cancelled, "cancelled"); return; }
-                if (disposition != 0 || !credential) break;
-                const auto value = b->objc.find_host_state<CredentialState>(credential);
-                if (!value || !value->has_password) break;
-                credentials = std::make_pair(value->user, value->password);
+                const auto [storage_object, storage] = storage_for(session);
+                // No answer, or NSURLSessionAuthChallengePerformDefaultHandling: the space's default credential, once.
+                if (!answer || answer->first == 1) {
+                    if (answer) b->release(answer->second);
+                    if (auth_attempts == 0) credentials = default_credential(storage, space);
+                    if (!credentials) break;
+                } else {
+                    const auto [disposition, credential] = *answer;
+                    struct Drop { Bridge& b; Address object; ~Drop() { b.release(object); } } drop{*b, credential};
+                    if (disposition == 2) { fail_task(url_error::cancelled, "cancelled"); return; }
+                    if (disposition != 0 || !credential) break;
+                    const auto value = b->objc.find_host_state<CredentialState>(credential);
+                    if (!value || !value->has_password) break;
+                    credentials = std::make_pair(value->user, value->password);
+                    // Session, permanent and synchronizable persistence keep the credential as the space's default.
+                    if (value->persistence != 0) store_credential(storage, storage_object, credential, space, true);
+                }
             }
             ++auth_attempts;
             if (!exchange->set_credentials(challenge->target, challenge->schemes[0], credentials->first, credentials->second)) break;
@@ -961,6 +1187,7 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
     self->space_class = define("NSURLProtectionSpace", object);
     self->credential_class = define("NSURLCredential", object);
     self->cookie_storage_class = define("NSHTTPCookieStorage", object);
+    self->credential_storage_class = define("NSURLCredentialStorage", object);
 
     // Constants.
     const std::pair<const char*, const char*> strings[] = {
@@ -979,7 +1206,9 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
         {"NSURLAuthenticationMethodServerTrust", "NSURLAuthenticationMethodServerTrust"},
         {"NSURLProtectionSpaceHTTP", "http"}, {"NSURLProtectionSpaceHTTPS", "https"}, {"NSURLProtectionSpaceFTP", "ftp"},
         {"NSURLProtectionSpaceHTTPProxy", "http"}, {"NSURLProtectionSpaceHTTPSProxy", "https"},
-        {"NSURLProtectionSpaceFTPProxy", "ftp"}, {"NSURLProtectionSpaceSOCKSProxy", "SOCKS"}};
+        {"NSURLProtectionSpaceFTPProxy", "ftp"}, {"NSURLProtectionSpaceSOCKSProxy", "SOCKS"},
+        {"NSURLCredentialStorageChangedNotification", "NSURLCredentialStorageChangedNotification"},
+        {"NSURLCredentialStorageRemoveSynchronizableCredentials", "NSURLCredentialStorageRemoveSynchronizableCredentials"}};
     for (const auto& [name, value] : strings) self->export_string(name, value);
     b.export_value(foundation, "_NSURLSessionTransferSizeUnknown", static_cast<std::uint64_t>(-1));
     for (const auto& [name, value] : {std::pair{"_NSURLSessionTaskPriorityDefault", 0.5f}, std::pair{"_NSURLSessionTaskPriorityLow", 0.0f},
@@ -1004,6 +1233,7 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
         if (const auto state = self->b->objc.find_host_state<RequestState>(s.x[0])) {
             self->b->release(std::exchange(state->url, 0));
             self->b->release(std::exchange(state->main_document, 0));
+            self->b->release(std::exchange(state->body_stream, 0));
         }
         static_cast<void>(self->b->objc.send_super(s.x[0], rq, self->b->objc.selector("dealloc")));
     }, false, "v@:");
@@ -1033,7 +1263,11 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
         { std::lock_guard lock(r->mutex); body = r->body; }
         s.x[0] = body ? self->b->autorelease(self->b->data(*body)) : 0;
     });
-    b.method(rq, "HTTPBodyStream", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    b.method(rq, "HTTPBodyStream", [request](CpuState& s, GuestMemory&) {
+        const auto r = request(s.x[0]);
+        std::lock_guard lock(r->mutex);
+        s.x[0] = r->body_stream;
+    });
     b.method(rq, "timeoutInterval", [request](CpuState& s, GuestMemory&) { return_double(s, request(s.x[0])->timeout); }, false, "d@:");
     b.method(rq, "cachePolicy", [request](CpuState& s, GuestMemory&) { s.x[0] = request(s.x[0])->cache_policy; }, false, "Q@:");
     b.method(rq, "networkServiceType", [request](CpuState& s, GuestMemory&) { s.x[0] = request(s.x[0])->service_type; }, false, "Q@:");
@@ -1103,11 +1337,24 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
         const auto r = request(s.x[0]);
         std::optional<Bytes> body;
         if (s.x[2]) body = self->b->bytes(s.x[2]);
-        std::lock_guard lock(r->mutex);
-        r->body = std::move(body);
+        Address stream{};
+        {
+            std::lock_guard lock(r->mutex);
+            r->body = std::move(body);
+            stream = std::exchange(r->body_stream, 0);   // a body replaces the stream
+        }
+        self->b->release(stream);
     }, false, "v@:@");
-    b.method(mrq, "setHTTPBodyStream:", [](CpuState& s, GuestMemory&) {
-        if (s.x[2]) security::unsupported("NSURLRequest HTTPBodyStream uploads");
+    b.method(mrq, "setHTTPBodyStream:", [self, request](CpuState& s, GuestMemory&) {
+        const auto r = request(s.x[0]);
+        const auto stream = self->b->retain(s.x[2]);
+        Address previous{};
+        {
+            std::lock_guard lock(r->mutex);
+            previous = std::exchange(r->body_stream, stream);
+            if (stream) r->body.reset();   // a stream replaces the body
+        }
+        self->b->release(previous);
     }, false, "v@:@");
     b.method(mrq, "setTimeoutInterval:", [request](CpuState& s, GuestMemory&) {
         const auto r = request(s.x[0]);
@@ -1206,6 +1453,8 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
         auto state = std::make_shared<ConfigurationState>();
         state->ephemeral = ephemeral;
         auto& p = state->properties;
+        // Ephemeral sessions keep credentials in a private storage; the others share sharedCredentialStorage.
+        p.objects["URLCredentialStorage"] = ephemeral ? self->make_storage() : self->b->retain(self->shared_storage());
         p.reals["timeoutIntervalForRequest"] = 60;
         p.reals["timeoutIntervalForResource"] = 604800;
         p.integers["HTTPShouldSetCookies"] = 1;
@@ -1225,8 +1474,21 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
     b.method(cfg, "ephemeralSessionConfiguration", [self, make_configuration](CpuState& s, GuestMemory&) {
         s.x[0] = self->b->autorelease(make_configuration(true));
     }, true);
+    // Background configurations: the process is never suspended here, so their sessions run like default ones, except
+    // that (as on macOS) tasks take no completion handlers.
     for (const auto* name : {"backgroundSessionConfigurationWithIdentifier:", "backgroundSessionConfiguration:"})
-        b.method(cfg, name, [](CpuState&, GuestMemory&) { security::unsupported("background NSURLSession configurations"); }, true);
+        b.method(cfg, name, [self, make_configuration, configuration](CpuState& s, GuestMemory&) {
+            if (!s.x[2]) security::fail("NSInvalidArgumentException: a background NSURLSessionConfiguration needs an identifier");
+            const auto object = make_configuration(false);
+            const auto state = configuration(object);
+            state->background = true;
+            {
+                std::lock_guard lock(state->properties.mutex);
+                state->properties.objects["identifier"] = self->b->objc.send(s.x[2], "copy").x0;
+                state->properties.integers["sessionSendsLaunchEvents"] = 1;
+            }
+            s.x[0] = self->b->autorelease(object);
+        }, true);
     b.method(cfg, "dealloc", [self, cfg](CpuState& s, GuestMemory&) {
         if (const auto state = self->b->objc.find_host_state<ConfigurationState>(s.x[0])) {
             std::vector<Address> objects;
@@ -1242,6 +1504,7 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
         {
             std::lock_guard lock(from->properties.mutex);
             state->ephemeral = from->ephemeral;
+            state->background = from->background;
             state->properties.integers = from->properties.integers;
             state->properties.reals = from->properties.reals;
             for (const auto& [name, value] : from->properties.objects) state->properties.objects[name] = self->b->retain(value);
@@ -1331,9 +1594,9 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
             state->cookies = cs->properties.integers["HTTPShouldSetCookies"] != 0;
             if (const auto found = cs->properties.objects.find("HTTPAdditionalHeaders"); found != cs->properties.objects.end())
                 state->additional = self->headers_from(found->second);
-            if (const auto found = cs->properties.objects.find("connectionProxyDictionary"); found != cs->properties.objects.end() && found->second &&
-                self->b->cf.length(found->second) > 0)
-                security::unsupported("NSURLSessionConfiguration connectionProxyDictionary (the system proxy settings are used)");
+            state->background = cs->background;
+            if (const auto found = cs->properties.objects.find("connectionProxyDictionary"); found != cs->properties.objects.end() && found->second)
+                state->proxy = self->proxies_from(found->second);
         }
         state->delegate = self->b->retain(delegate);
         state->delegate_queue = queue ? self->b->retain(queue) : make_serial_operation_queue(*self->b, "NSURLSession delegate queue");
@@ -1636,6 +1899,16 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
             v->method == "NSURLAuthenticationMethodNegotiate" || v->method == "NSURLAuthenticationMethodServerTrust";
     }, false, "B@:");
     b.method(sp, "distinguishedNames", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    b.method(sp, "isEqual:", [self](CpuState& s, GuestMemory&) {
+        const auto left = self->b->objc.find_host_state<SpaceState>(s.x[0]);
+        const auto right = s.x[2] ? self->b->objc.find_host_state<SpaceState>(s.x[2]) : nullptr;
+        s.x[0] = s.x[0] == s.x[2] || (left && right && Loading::key_of(*left) == Loading::key_of(*right));
+    }, false, "B@:@");
+    b.method(sp, "hash", [space](CpuState& s, GuestMemory&) {
+        const auto v = space(s.x[0]);
+        s.x[0] = std::hash<std::string>{}(v->host) ^ (static_cast<Address>(v->port) << 1) ^ std::hash<std::string>{}(v->realm);
+    }, false, "Q@:");
+    b.method(sp, "copyWithZone:", [self](CpuState& s, GuestMemory&) { s.x[0] = self->b->retain(s.x[0]); }, false, "@@:^v");
 
     const auto credential = [self](Address object) { return self->require<CredentialState>(object, "NSURLCredential"); };
     const auto trust_credential = [self](Address object, Address trust) {
@@ -1685,6 +1958,81 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
     b.method(cr, "identity", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     b.method(cr, "certificates", [self](CpuState& s, GuestMemory&) { s.x[0] = self->b->autorelease(self->b->array({})); });
     b.method(cr, "copyWithZone:", [self](CpuState& s, GuestMemory&) { s.x[0] = self->b->retain(s.x[0]); }, false, "@@:^v");
+
+    // ---- NSURLCredentialStorage ---------------------------------------------------------------------------------
+    const auto st = self->credential_storage_class;
+    const auto storage = [self](Address object) { return self->require<StorageState>(object, "NSURLCredentialStorage"); };
+    b.method(st, "sharedCredentialStorage", [self](CpuState& s, GuestMemory&) { s.x[0] = self->shared_storage(); }, true);
+    b.method(st, "init", [self](CpuState& s, GuestMemory&) {
+        static_cast<void>(self->b->objc.host_state<StorageState>(s.x[0], [] { return std::make_shared<StorageState>(); }));
+    });
+    b.method(st, "dealloc", [self, st](CpuState& s, GuestMemory&) {
+        if (const auto state = self->b->objc.find_host_state<StorageState>(s.x[0])) {
+            std::vector<Address> objects;
+            {
+                std::lock_guard lock(state->mutex);
+                for (auto& [key, entry] : state->spaces) {
+                    objects.push_back(entry.space);
+                    for (auto& [user, credential] : entry.credentials) objects.push_back(credential);
+                }
+                state->spaces.clear();
+            }
+            self->b->release_all(objects);
+        }
+        static_cast<void>(self->b->objc.send_super(s.x[0], st, self->b->objc.selector("dealloc")));
+    }, false, "v@:");
+    b.method(st, "credentialsForProtectionSpace:", [self, storage](CpuState& s, GuestMemory&) {
+        s.x[0] = self->b->autorelease(self->credentials_of(storage(s.x[0]), s.x[2]));
+    });
+    b.method(st, "allCredentials", [self, storage](CpuState& s, GuestMemory&) {
+        const auto state = storage(s.x[0]);
+        std::vector<Address> spaces;
+        { std::lock_guard lock(state->mutex); for (const auto& [key, entry] : state->spaces) spaces.push_back(self->b->retain(entry.space)); }
+        std::vector<std::pair<Address, Address>> entries;
+        for (const auto space_object : spaces)
+            if (const auto credentials = self->credentials_of(state, space_object)) entries.emplace_back(space_object, credentials);
+        const auto result = self->b->dictionary(entries);
+        for (const auto& [key, value] : entries) self->b->release(value);
+        self->b->release_all(spaces);
+        s.x[0] = self->b->autorelease(result);
+    });
+    const auto set_credential = [self, storage](Address object, Address credential, Address space_object, bool make_default) {
+        const auto value = credential ? self->b->objc.find_host_state<CredentialState>(credential) : nullptr;
+        // Credentials that persist for no time are not kept (NSURLCredentialPersistenceNone).
+        if (!value || value->persistence == 0) return;
+        self->store_credential(storage(object), object, credential, space_object, make_default);
+    };
+    b.method(st, "setCredential:forProtectionSpace:", [set_credential](CpuState& s, GuestMemory&) {
+        set_credential(s.x[0], s.x[2], s.x[3], false);
+    }, false, "v@:@@");
+    b.method(st, "setCredential:forProtectionSpace:task:", [set_credential](CpuState& s, GuestMemory&) {
+        set_credential(s.x[0], s.x[2], s.x[3], false);
+    }, false, "v@:@@@");
+    b.method(st, "setDefaultCredential:forProtectionSpace:", [set_credential](CpuState& s, GuestMemory&) {
+        set_credential(s.x[0], s.x[2], s.x[3], true);
+    }, false, "v@:@@");
+    b.method(st, "setDefaultCredential:forProtectionSpace:task:", [set_credential](CpuState& s, GuestMemory&) {
+        set_credential(s.x[0], s.x[2], s.x[3], true);
+    }, false, "v@:@@@");
+    for (const auto* name : {"removeCredential:forProtectionSpace:", "removeCredential:forProtectionSpace:options:",
+                             "removeCredential:forProtectionSpace:options:task:"})
+        b.method(st, name, [self, storage](CpuState& s, GuestMemory&) {
+            self->remove_credential(storage(s.x[0]), s.x[0], s.x[2], s.x[3]);
+        }, false, "v@:@@");
+    b.method(st, "defaultCredentialForProtectionSpace:", [self, storage](CpuState& s, GuestMemory&) {
+        s.x[0] = self->default_object(storage(s.x[0]), s.x[2]);
+    });
+    // The task variants answer through the completion handler at once.
+    b.method(st, "getCredentialsForProtectionSpace:task:completionHandler:", [self, storage](CpuState& s, GuestMemory&) {
+        const auto credentials = self->credentials_of(storage(s.x[0]), s.x[2]);
+        if (s.x[4]) static_cast<void>(self->b->invoke_block(s.x[4], {credentials}));
+        self->b->release(credentials);
+    }, false, "v@:@@@?");
+    b.method(st, "getDefaultCredentialForProtectionSpace:task:completionHandler:", [self, storage](CpuState& s, GuestMemory&) {
+        const auto credential = self->b->retain(self->default_object(storage(s.x[0]), s.x[2]));
+        if (s.x[4]) static_cast<void>(self->b->invoke_block(s.x[4], {credential}));
+        self->b->release(credential);
+    }, false, "v@:@@@?");
 
     // ---- NSHTTPCookieStorage (the shared object and its accept policy) -----------------------------------------------
     b.method(self->cookie_storage_class, "sharedHTTPCookieStorage", [self](CpuState& s, GuestMemory&) {

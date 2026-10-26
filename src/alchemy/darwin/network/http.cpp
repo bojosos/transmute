@@ -16,6 +16,31 @@ std::uint32_t milliseconds(double seconds) {
     return static_cast<std::uint32_t>(seconds * 1000);
 }
 
+// Whether every entry of a proxy list ("[scheme=][scheme://]host[:port]", separated by ';' or spaces) names a
+// loopback host.
+bool loopback_proxies(std::string_view list) {
+    bool any = false;
+    std::size_t at = 0;
+    while (at < list.size()) {
+        const auto end = std::min(list.find_first_of("; ", at), list.size());
+        auto entry = list.substr(at, end - at);
+        at = end + 1;
+        if (entry.empty()) continue;
+        if (const auto equals = entry.find('='); equals != std::string_view::npos) entry.remove_prefix(equals + 1);
+        if (const auto scheme = entry.find("://"); scheme != std::string_view::npos) entry.remove_prefix(scheme + 3);
+        std::string_view host = entry;
+        if (entry.starts_with('[')) {
+            const auto close = entry.find(']');
+            host = close == std::string_view::npos ? entry : entry.substr(1, close - 1);
+        } else if (const auto colon = entry.rfind(':'); colon != std::string_view::npos) {
+            host = entry.substr(0, colon);
+        }
+        if (!network_policy::loopback_host(host)) return false;
+        any = true;
+    }
+    return any;
+}
+
 std::string endpoint_text(const sysconfig::ProxyEndpoint& endpoint) {
     return endpoint.host + (endpoint.port ? ":" + std::to_string(*endpoint.port) : std::string{});
 }
@@ -51,7 +76,8 @@ std::shared_ptr<HttpClient> HttpClient::create(const std::string& user_agent, co
                   : proxy.kind == ProxyConfiguration::Kind::automatic ? Kind::automatic : Kind::none;
     settings.list = proxy.proxy;
     settings.bypass = proxy.bypass;
-    if (network_policy::loopback_only()) settings.kind = Kind::none;   // a proxy would leave the machine
+    // Loopback: a proxy would leave the machine, unless every proxy in the list is on this machine itself.
+    if (network_policy::loopback_only() && !(settings.kind == Kind::named && loopback_proxies(settings.list))) settings.kind = Kind::none;
     auto session = host::http::Session::open(user_agent, settings);
     if (!session) security::fail("the host HTTP stack could not open a session (" + std::string(host::name(session.error())) + ")");
     std::shared_ptr<HttpClient> client(new HttpClient());
