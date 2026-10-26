@@ -28,11 +28,11 @@ const Case coregraphics_events_case("coregraphics_events", [](Fixture& f) {
     static_cast<void>(f.call(cg, "_CGEventSetTimestamp", {key, 1234}));
     require(f.call(cg, "_CGEventGetTimestamp", {key}) == 1234, "timestamp");
     const auto units = f.block(8);
-    f.engine.write8(units, 'h'); f.engine.write8(units + 2, 'i');
+    f.engine.write64(units, 'h' | (std::uint64_t{'i'} << 16));   // UTF-16 "hi"
     static_cast<void>(f.call(cg, "_CGEventKeyboardSetUnicodeString", {key, 2, units}));
     const auto length = f.block(8), back = f.block(8);
     static_cast<void>(f.call(cg, "_CGEventKeyboardGetUnicodeString", {key, 4, length, back}));
-    require(f.engine.read64(length) == 2 && f.engine.read8(back) == 'h' && f.engine.read8(back + 2) == 'i', "the event's characters");
+    require(f.engine.read64(length) == 2 && (f.engine.read64(back) & 0xffffffff) == ('h' | (std::uint64_t{'i'} << 16)), "the event's characters");
 
     // Double fields, copies, a mouse event and a scroll event.
     alchemy::CallRegs set{};
@@ -59,7 +59,7 @@ const Case coregraphics_events_case("coregraphics_events", [](Fixture& f) {
     require(f.call(cg, "_CGEventGetTypeID") != 0 && f.call(cg, "_CGEventSourceGetTypeID") != 0, "type IDs");
 
     // CGAffineTransformComponents round trip (48-byte structs by reference both ways).
-    const auto components = f.block(48), transform = f.block(48), back = f.block(48);
+    const auto components = f.block(48), transform = f.block(48), decomposed = f.block(48);
     const double values[6] = {2, 3, 0.5, 0.3, 10, 20};
     for (unsigned i = 0; i < 6; ++i) f.engine.write64(components + i * 8, std::bit_cast<std::uint64_t>(values[i]));
     alchemy::CallRegs make{};
@@ -68,10 +68,10 @@ const Case coregraphics_events_case("coregraphics_events", [](Fixture& f) {
     static_cast<void>(f.regs(cg, "_CGAffineTransformMakeWithComponents", make));
     alchemy::CallRegs decompose{};
     decompose.x[0] = transform;
-    decompose.indirect_result = back;
+    decompose.indirect_result = decomposed;
     static_cast<void>(f.regs(cg, "_CGAffineTransformDecompose", decompose));
     for (unsigned i = 0; i < 6; ++i)
-        require(std::abs(std::bit_cast<double>(f.engine.read64(back + i * 8)) - values[i]) < 1e-9, "transform components round trip");
+        require(std::abs(std::bit_cast<double>(f.engine.read64(decomposed + i * 8)) - values[i]) < 1e-9, "transform components round trip");
     // Display capture is not available; releasing succeeds.
     require(static_cast<std::int32_t>(f.call(cg, "_CGDisplayCapture", {1})) == 1004 && f.call(cg, "_CGDisplayRelease", {1}) == 0 &&
                 static_cast<std::int32_t>(f.call(cg, "_CGCaptureAllDisplays")) == 1004, "display capture is refused");

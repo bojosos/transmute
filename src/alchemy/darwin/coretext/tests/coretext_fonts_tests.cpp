@@ -31,7 +31,7 @@ Address block(Fixture& f, transmute::GuestCallHandler handler) {
     return literal;
 }
 
-std::uint16_t unit(Fixture& f, Address at) { return static_cast<std::uint16_t>(f.engine.read8(at) | (f.engine.read8(at + 1) << 8)); }
+std::uint16_t unit(Fixture& f, Address at) { return static_cast<std::uint16_t>(f.engine.read64(at) & 0xffff); }
 double real(Fixture& f, Address at) { return std::bit_cast<double>(f.engine.read64(at)); }
 std::string text(Fixture& f, Address string) { return string ? f.cf.utf8(string) : std::string("(null)"); }
 
@@ -53,8 +53,7 @@ const Case coretext_fonts_case("coretext_fonts", [](Fixture& f) {
     // ---- glyph names: Helvetica's stand-in is a TrueType face with a format 2.0 'post' table ----
     const auto font = font_named(f, "Helvetica", 12);
     const auto characters = f.block(8), glyphs = f.block(8);
-    f.engine.write8(characters, 'A');
-    f.engine.write8(characters + 2, ' ');
+    f.engine.write64(characters, 'A' | (std::uint64_t{' '} << 16));   // UTF-16 "A "
     require((f.call(ct, "_CTFontGetGlyphsForCharacters", {font, characters, glyphs, 2}) & 0xff) == 1, "glyphs for A and space");
     const auto a = unit(f, glyphs), space = unit(f, glyphs + 2);
     require(text(f, f.call(ct, "_CTFontCopyNameForGlyph", {font, a})) == "A" && text(f, f.call(ct, "_CTFontCopyNameForGlyph", {font, space})) == "space",
