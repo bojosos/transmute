@@ -494,7 +494,6 @@ void GraphicsGaps::install_quartz_core() {
         method(context_class, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true);
     static_cast<void>(cls(quartz_core, "CAEDRMetadata", "NSObject"));
     static_cast<void>(cls(quartz_core, "CALayerHost", "CALayer"));
-    static_cast<void>(cls(quartz_core, "CAOpenGLLayer", "CALayer"));
     static_cast<void>(cls(quartz_core, "CATransformLayer", "CALayer"));
 }
 
