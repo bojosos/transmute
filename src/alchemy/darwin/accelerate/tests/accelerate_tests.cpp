@@ -1,5 +1,5 @@
 // Accelerate (src/alchemy/darwin/accelerate/): the vDSP kernels and packed real FFT
-// (vdsp.cpp), the wider vDSP API (vdsp_vectors.cpp) and vForce (vforce.cpp), and BNNS, where no
+// (vdsp.cpp), the wider vDSP API (vdsp_vectors.cpp), vForce (vforce.cpp) and vImage (vimage.cpp), and BNNS, where no
 // filter can be created (bnns.cpp).
 #include "alchemy/gui/tests/framework_case.hpp"
 
@@ -33,6 +33,77 @@ Address count(Fixture& f, std::int32_t n) {
     return address;
 }
 bool near(double a, double b, double tolerance = 1e-5) { return std::fabs(a - b) <= tolerance; }
+
+
+// A vImage_Buffer over `bytes` guest bytes per row.
+Address image_buffer(Fixture& f, Address data, std::uint64_t height, std::uint64_t width, std::uint64_t row_bytes) {
+    const auto b = f.block(32);
+    f.engine.write64(b, data);
+    f.engine.write64(b + 8, height);
+    f.engine.write64(b + 16, width);
+    f.engine.write64(b + 24, row_bytes);
+    return b;
+}
+std::int64_t verror(Address value) { return static_cast<std::int64_t>(value); }
+
+// vImage (vimage.cpp): buffers, conversions, geometry, convolution, histograms.
+void vimage(Fixture& f) {
+    const auto made = f.block(32);
+    require(verror(f.call(vdsp, "_vImageBuffer_Init", {made, 2, 3, 32, 0})) == 0 && f.engine.read64(made) != 0 && f.engine.read64(made + 24) == 16,
+            "vImageBuffer_Init: rows of 16 bytes");
+    const auto color = f.block(4);
+    f.engine.write32(color, 0x1e140aff);   // A 255, R 10, G 20, B 30
+    require(verror(f.call(vdsp, "_vImageBufferFill_ARGB8888", {made, color, 0})) == 0 && f.engine.read32(f.engine.read64(made) + 16 + 8) == 0x1e140aff,
+            "vImageBufferFill_ARGB8888");
+    const auto reversed = f.block(32), map = f.block(4);
+    f.engine.write32(map, 0x00010203);   // {3, 2, 1, 0}
+    const auto out = image_buffer(f, reversed, 2, 3, 16);
+    require(verror(f.call(vdsp, "_vImagePermuteChannels_ARGB8888", {made, out, map, 0})) == 0 && f.engine.read32(reversed) == 0xff0a141e,
+            "vImagePermuteChannels_ARGB8888");
+    // Premultiplying (A 128, R 200, G 100, B 0).
+    const auto pixel = f.block(4), premultiplied = f.block(4);
+    f.engine.write32(pixel, 0x0064c880);
+    require(verror(f.call(vdsp, "_vImagePremultiplyData_ARGB8888", {image_buffer(f, pixel, 1, 1, 4), image_buffer(f, premultiplied, 1, 1, 4), 0})) == 0 &&
+                f.engine.read32(premultiplied) == 0x00326480, "premultiplied: 100, 50, 0");
+    // Planar8: a 3x3 image, 90 in the middle.
+    const auto planar = f.block(9), blurred = f.block(9), histogram = f.block(256 * 8);
+    f.memory().write8(planar + 4, 90);
+    const auto src = image_buffer(f, planar, 3, 3, 3), dst = image_buffer(f, blurred, 3, 3, 3);
+    alchemy::CallRegs box{};
+    box.x = {src, dst, 0, 0, 0, 3, 3, 0};
+    box.push_stack(std::uint32_t{8});   // kvImageEdgeExtend
+    require(verror(f.regs(vdsp, "_vImageBoxConvolve_Planar8", box).x0) == 0 && f.memory().read8(blurred + 4) == 10 && f.memory().read8(blurred) == 10,
+            "box blur with extended edges");
+    alchemy::CallRegs no_edge = box;
+    no_edge.stack.clear();
+    no_edge.push_stack(std::uint32_t{0});
+    require(verror(f.regs(vdsp, "_vImageBoxConvolve_Planar8", no_edge).x0) == -21768, "an edge style is required");
+    require(verror(f.call(vdsp, "_vImageHistogramCalculation_Planar8", {src, histogram, 0})) == 0 && f.engine.read64(histogram) == 8 &&
+                f.engine.read64(histogram + 90 * 8) == 1, "histogram");
+    // Geometry: a 3x2 Planar8 image rotated a quarter turn clockwise, and reflected.
+    const auto wide = f.block(6), tall = f.block(6), mirror = f.block(6);
+    for (int i = 0; i < 6; ++i) f.memory().write8(wide + i, static_cast<std::uint8_t>(i + 1));   // rows 1 2 3 / 4 5 6
+    require(verror(f.call(vdsp, "_vImageRotate90_Planar8", {image_buffer(f, wide, 2, 3, 3), image_buffer(f, tall, 3, 2, 2), 3, 0, 0})) == 0 &&
+                f.memory().read8(tall) == 4 && f.memory().read8(tall + 1) == 1 && f.memory().read8(tall + 5) == 3, "clockwise: rows 4 1 / 5 2 / 6 3");
+    require(verror(f.call(vdsp, "_vImageHorizontalReflect_Planar8", {image_buffer(f, wide, 2, 3, 3), image_buffer(f, mirror, 2, 3, 3), 0})) == 0 &&
+                f.memory().read8(mirror) == 3 && f.memory().read8(mirror + 5) == 4, "horizontal reflection");
+    // Scaling a flat 4x4 image to 2x2 keeps its value.
+    const auto flat = f.block(16, 100), small = f.block(4);
+    require(verror(f.call(vdsp, "_vImageScale_Planar8", {image_buffer(f, flat, 4, 4, 4), image_buffer(f, small, 2, 2, 2), 0, 0})) == 0 &&
+                f.memory().read8(small) == 100 && f.memory().read8(small + 3) == 100, "Lanczos scaling");
+    // Planar8 <-> PlanarF over [0, 1].
+    const auto floats_out = f.block(16), bytes_back = f.block(4), ramp = f.block(4);
+    f.engine.write32(ramp, 0xff7f0000);   // 0, 0, 127, 255
+    alchemy::CallRegs range{};
+    range.x[0] = image_buffer(f, ramp, 1, 4, 4);
+    range.x[1] = image_buffer(f, floats_out, 1, 4, 16);
+    range.set_s(0, 1.0f);
+    range.set_s(1, 0.0f);
+    require(verror(f.regs(vdsp, "_vImageConvert_Planar8toPlanarF", range).x0) == 0 && read_float(f, floats_out, 3) == 1.0f, "Planar8 to PlanarF");
+    range.x[0] = range.x[1];
+    range.x[1] = image_buffer(f, bytes_back, 1, 4, 4);
+    require(verror(f.regs(vdsp, "_vImageConvert_PlanarFtoPlanar8", range).x0) == 0 && f.engine.read32(bytes_back) == 0xff7f0000, "and back");
+}
 
 // The wider vDSP API (vdsp_vectors.cpp) and vForce (vforce.cpp).
 void vectors(Fixture& f) {
@@ -161,6 +232,7 @@ const Case accelerate_case("accelerate", [](Fixture& f) {
     require(f.call(vdsp, "_BNNSFilterApply", {0, descriptors, descriptors + 512}) == UINT64_MAX, "BNNSFilterApply fails");
     static_cast<void>(f.call(vdsp, "_BNNSFilterDestroy", {0}));
     vectors(f);
+    vimage(f);
 });
 
 } // namespace

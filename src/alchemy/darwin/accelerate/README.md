@@ -25,6 +25,17 @@
 * **Real, vForce (`vforce.cpp`):** element-wise sqrt, rsqrt, rec, exponentials and logarithms,
   rounding, the trigonometric and hyperbolic functions and their inverses, pow/pows, atan2, div,
   fmod, remainder, copysign, nextafter, sincos and cosisin, in float and double.
+* **Real, vImage (`vimage.cpp`), beyond vdsp.cpp's Y'CbCr conversions:**
+  * buffers (`vImageBuffer_Init` through the guest's malloc, `vImageCopyBuffer`, fills, channel
+    overwrites);
+  * Planar8/PlanarF, ARGB8888/Planar8, RGB888, RGB565 and channel-permute conversions;
+  * premultiplying and unpremultiplying (ARGB and RGBA);
+  * reflections, 90-degree rotations and Lanczos scaling of ARGB8888, Planar8, PlanarF (and
+    ARGBFFFF scaling);
+  * box, tent and general convolutions with the four edge styles;
+  * histograms.
+
+  Temporary buffers aren't used: a temp-size query answers 0.
 * **Real, LAPACK decomposition drivers (`lapack.cpp`, both builds):** `?gesdd` (SVD by one-sided
   Jacobi), `?syevd`/`?heevd` (symmetric and Hermitian eigen by cyclic Jacobi), `?geev` (general eigen:
   Hessenberg reduction and shifted QR to complex Schur form, real pairs packed as LAPACK does),

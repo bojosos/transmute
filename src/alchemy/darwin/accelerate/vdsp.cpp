@@ -629,6 +629,7 @@ void install_accelerate(InstallContext& context) {
     std::make_shared<Accelerate>(context)->install();
     install_vdsp_vectors(context);   // after the kernels above, which keep their names
     install_vforce(context);
+    install_vimage(context);
 }
 
 } // namespace alchemy::gui::fill

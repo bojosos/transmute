@@ -18,5 +18,6 @@ namespace alchemy::gui::fill {
 void install_accelerate(InstallContext& context);
 void install_vdsp_vectors(InstallContext& context);   // vdsp_vectors.cpp: the wider vDSP API, float and double
 void install_vforce(InstallContext& context);         // vforce.cpp: vForce
+void install_vimage(InstallContext& context);         // vimage.cpp: vImage buffers, conversions, geometry, convolution
 
 } // namespace alchemy::gui::fill
