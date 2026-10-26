@@ -3,7 +3,8 @@
 // AVFAudio's buffers, files, players and engine (media group-internal):
 //   avaudio_buffers.cpp  AVAudioTime, AVAudioPCMBuffer, AVAudioFile, and the helpers below
 //   avaudio_player.cpp   AVAudioPlayer
-//   avaudio_engine.cpp   AVAudioEngine and its nodes (output, input, mixer, player)
+//   avaudio_engine.cpp   AVAudioEngine and its nodes (output, input, mixer, player, source, sink)
+//   avaudio_converter.cpp AVAudioConverter, AVAudioCompressedBuffer
 // AVAudioFormat and AVAudioChannelLayout are avfoundation.cpp's; the helpers here use them through
 // their messages. The classes are published under AVFAudio and AVFoundation (which re-exports it).
 
@@ -23,6 +24,7 @@ inline constexpr std::string_view av_foundation = "/System/Library/Frameworks/AV
 inline constexpr std::string_view avf_audio = "/System/Library/Frameworks/AVFAudio.framework/Versions/A/AVFAudio";
 
 void install_avaudio_buffers(Support& support);
+void install_avaudio_converter(Support& support);   // called by install_avaudio_buffers
 void install_avaudio_player(Support& support);
 void install_avaudio_engine(Support& support);
 

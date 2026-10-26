@@ -976,6 +976,187 @@ void avaudio(Fixture& f) {
     std::filesystem::remove_all(directory, ignored);
 }
 
+// AVAudioConverter (PCM layouts and channels, sample rates through the input block, MP3 packets in
+// an AVAudioCompressedBuffer), AVAudioSourceNode and AVAudioSinkNode, and manual rendering (offline,
+// the realtime block, the input node's block).
+void avaudio_conversion(Fixture& f) {
+    const auto b = alchemy::gui::security::bridge();
+    const auto format_of = [&](std::uint64_t common, double rate, std::uint32_t channels, bool interleaved) {
+        alchemy::CallRegs r{};
+        r.x[2] = common; r.x[3] = channels; r.x[4] = interleaved;
+        r.set_d(0, rate);
+        return f.objc.send(f.send(f.cls("AVAudioFormat"), "alloc"), f.objc.selector("initWithCommonFormat:sampleRate:channels:interleaved:"), r).x0;
+    };
+    const auto pcm_buffer = [&](Address format, std::uint32_t capacity) {
+        return f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {format, capacity});
+    };
+    const auto float_at = [&](Address channel_data, std::uint32_t channel, std::uint32_t frame) {
+        return std::bit_cast<float>(f.engine.read32(f.engine.read64(channel_data + 8ULL * channel) + 4ULL * frame));
+    };
+
+    // Float32 stereo (0.5, -0.25) into int16 mono: the first channel, or both averaged with downmix.
+    const auto stereo = format_of(1, 48000, 2, false), mono16 = format_of(3, 48000, 1, true);
+    const auto source = pcm_buffer(stereo, 256), target = pcm_buffer(mono16, 256);
+    for (std::uint32_t i = 0; i < 256; ++i) {
+        f.engine.write32(f.engine.read64(f.send(source, "floatChannelData")) + 4ULL * i, std::bit_cast<std::uint32_t>(0.5f));
+        f.engine.write32(f.engine.read64(f.send(source, "floatChannelData") + 8) + 4ULL * i, std::bit_cast<std::uint32_t>(-0.25f));
+    }
+    f.send(source, "setFrameLength:", {256});
+    const auto converter = f.send(f.send(f.cls("AVAudioConverter"), "alloc"), "initFromFormat:toFormat:", {stereo, mono16});
+    require(converter && f.send(converter, "outputFormat") == mono16, "an AVAudioConverter");
+    const auto error = f.block(8);
+    require((f.send(converter, "convertToBuffer:fromBuffer:error:", {target, source, error}) & 0xff) == 1 && f.send(target, "frameLength") == 256,
+            "PCM to PCM");
+    const auto first_sample = [&] { return static_cast<std::int16_t>(f.engine.read32(f.engine.read64(f.send(target, "int16ChannelData"))) & 0xffff); };
+    require(std::abs(first_sample() - 16384) <= 1, "the first channel: " + std::to_string(first_sample()));
+    f.send(converter, "setDownmix:", {1});
+    f.send(converter, "convertToBuffer:fromBuffer:error:", {target, source, error});
+    require(std::abs(first_sample() - 4096) <= 1, "downmixed: " + std::to_string(first_sample()));
+
+    // 44.1 kHz to 48 kHz through the input block: 4410 frames of 0.5 become about 4800.
+    const auto in441 = format_of(1, 44100, 1, false), out48 = format_of(1, 48000, 1, false);
+    const auto resampling = f.send(f.send(f.cls("AVAudioConverter"), "alloc"), "initFromFormat:toFormat:", {in441, out48});
+    const auto input = pcm_buffer(in441, 4410);
+    for (std::uint32_t i = 0; i < 4410; ++i) f.engine.write32(f.engine.read64(f.send(input, "floatChannelData")) + 4ULL * i, std::bit_cast<std::uint32_t>(0.5f));
+    f.send(input, "setFrameLength:", {4410});
+    static std::atomic<int> given{0};
+    given = 0;
+    const auto feed = b->make_block([input](transmute::CpuState& s, transmute::GuestMemory& m) {
+        // AVAudioBuffer * (^)(AVAudioPacketCount, AVAudioConverterInputStatus *)
+        if (given++ == 0) { m.write64(s.x[2], 0); s.x[0] = input; return; }
+        m.write64(s.x[2], 2);   // EndOfStream
+        s.x[0] = 0;
+    });
+    const auto output = pcm_buffer(out48, 1024);
+    std::uint64_t total = 0;
+    float middle = 0;
+    for (int round = 0; round < 16; ++round) {
+        const auto status = f.send(resampling, "convertToBuffer:error:withInputFromBlock:", {output, error, feed});
+        require(status <= 2, "the conversion succeeds: " + std::to_string(status));
+        const auto frames = f.send(output, "frameLength");
+        if (total < 2400 && total + frames > 2400) middle = float_at(f.send(output, "floatChannelData"), 0, static_cast<std::uint32_t>(2400 - total));
+        total += frames;
+        if (status == 2) break;
+    }
+    require(total >= 4798 && total <= 4802 && std::fabs(middle - 0.5f) < 0.01f, "resampled: " + std::to_string(total) + " frames, " + std::to_string(middle));
+
+    // MP3 packets from the file through an AVAudioCompressedBuffer, decoded like the reference.
+    const std::string vectors = std::string(ALCHEMY_THIRD_PARTY) + "/minimp3/vectors/";
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_converter";
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "hecommon.mp3";
+    std::filesystem::copy_file(vectors + "l3-hecommon.bit", path, std::filesystem::copy_options::overwrite_existing);
+    std::vector<std::int16_t> reference;
+    {
+        std::ifstream in(vectors + "l3-hecommon.pcm", std::ios::binary);
+        std::vector<char> bytes((std::istreambuf_iterator<char>(in)), {});
+        reference.resize(bytes.size() / 2);
+        std::memcpy(reference.data(), bytes.data(), reference.size() * 2);
+    }
+    const auto out = f.block(8), size = f.block(4), asbd = f.block(40);
+    require(f.status(at, "_AudioFileOpenURL", {f.cf.file_url(alchemy::guest_path_string(path), false), 1, 0, out}) == 0, "the MP3 file opens");
+    const auto file = f.engine.read64(out);
+    f.engine.write32(size, 40);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x64666d74, size, asbd}) == 0, "its data format");
+    const auto mp3 = f.send(f.send(f.cls("AVAudioFormat"), "alloc"), "initWithStreamDescription:", {asbd});
+    const auto channels = f.engine.read32(asbd + 28);
+    const auto rate = std::bit_cast<double>(f.engine.read64(asbd));
+    const auto pcm = format_of(1, rate, channels, true);
+    const auto decoding = f.send(f.send(f.cls("AVAudioConverter"), "alloc"), "initFromFormat:toFormat:", {mp3, pcm});
+    require(decoding != 0, "an MP3 decoding converter");
+    const auto packets = f.send(f.send(f.cls("AVAudioCompressedBuffer"), "alloc"), "initWithFormat:packetCapacity:maximumPacketSize:", {mp3, 8, 1500});
+    require(packets && f.send(packets, "packetDescriptions") != 0 && f.send(packets, "byteCapacity") == 8 * 1500, "an AVAudioCompressedBuffer");
+    const auto room = f.block(4), count = f.block(4);
+    f.engine.write32(room, 8 * 1500);
+    f.engine.write32(count, 8);
+    require(f.status(at, "_AudioFileReadPacketData", {file, 0, room, f.send(packets, "packetDescriptions"), 0, count, f.send(packets, "data")}) == 0,
+            "eight packets");
+    f.send(packets, "setPacketCount:", {f.engine.read32(count)});
+    f.send(packets, "setByteLength:", {f.engine.read32(room)});
+    static std::atomic<int> packet_calls{0};
+    packet_calls = 0;
+    const auto feed_packets = b->make_block([packets](transmute::CpuState& s, transmute::GuestMemory& m) {
+        if (packet_calls++ == 0) { m.write64(s.x[2], 0); s.x[0] = packets; return; }
+        m.write64(s.x[2], 2);
+        s.x[0] = 0;
+    });
+    const auto decoded = pcm_buffer(pcm, 8 * 1152);
+    require(f.send(decoding, "convertToBuffer:error:withInputFromBlock:", {decoded, error, feed_packets}) == 0 &&
+            f.send(decoded, "frameLength") == 8 * 1152, "eight MPEG frames decode");
+    const auto samples = f.engine.read64(f.send(decoded, "floatChannelData"));
+    bool same = true;
+    for (std::size_t i = 0; i < 8 * 1152 * channels && i < reference.size(); ++i)
+        same = same && std::fabs(std::bit_cast<float>(f.engine.read32(samples + 4 * i)) * 32768.0f - reference[i]) <= 2.0f;
+    require(same, "the decoded frames match the reference");
+    static_cast<void>(f.call(at, "_AudioFileClose", {file}));
+
+    // Offline manual rendering: a mono source node of 0.25 into the main mixer, an input block of
+    // 0.5 through the input node, and a sink node fed by a second source.
+    const auto engine = f.send(f.send(f.cls("AVAudioEngine"), "alloc"), "init");
+    const auto stereo48 = format_of(1, 48000, 2, false), mono48 = format_of(1, 48000, 1, false);
+    alchemy::CallRegs manual{};
+    manual.x = {0, 0, 0, stereo48, 4096, error, 0, 0};   // offline
+    require((f.objc.send(engine, f.objc.selector("enableManualRenderingMode:format:maximumFrameCount:error:"), manual).x0 & 0xff) == 1 &&
+            (f.send(engine, "isInManualRenderingMode") & 0xff) == 1 && f.send(engine, "manualRenderingMaximumFrameCount") == 4096, "manual rendering");
+    const auto constant = [&](float value) {
+        // OSStatus (^)(BOOL *isSilence, const AudioTimeStamp *, AVAudioFrameCount, AudioBufferList *)
+        return b->make_block([value](transmute::CpuState& s, transmute::GuestMemory& m) {
+            const auto frames = static_cast<std::uint32_t>(s.x[3]);
+            const auto list = s.x[4];
+            for (std::uint32_t i = 0; i < m.read32(list); ++i) {
+                const auto data = m.read64(list + 8 + 16ULL * i + 8);
+                for (std::uint32_t frame = 0; frame < frames; ++frame) m.write32(data + 4ULL * frame, std::bit_cast<std::uint32_t>(value));
+            }
+            s.x[0] = 0;
+        });
+    };
+    const auto tone = f.send(f.send(f.cls("AVAudioSourceNode"), "alloc"), "initWithFormat:renderBlock:", {mono48, constant(0.25f)});
+    const auto feeder = f.send(f.send(f.cls("AVAudioSourceNode"), "alloc"), "initWithRenderBlock:", {constant(0.125f)});
+    static std::atomic<std::uint64_t> sunk{0};
+    static std::atomic<std::uint32_t> sunk_bits{0};
+    sunk = 0;
+    const auto sink = f.send(f.send(f.cls("AVAudioSinkNode"), "alloc"), "initWithReceiverBlock:", {b->make_block([](transmute::CpuState& s, transmute::GuestMemory& m) {
+        // OSStatus (^)(const AudioTimeStamp *, AVAudioFrameCount, const AudioBufferList *)
+        sunk += s.x[2];
+        sunk_bits = m.read32(m.read64(s.x[3] + 16));
+        s.x[0] = 0;
+    })});
+    require(tone && feeder && sink, "source and sink nodes");
+    const auto mixer = f.send(engine, "mainMixerNode");
+    for (const auto node : {tone, feeder, sink}) f.send(engine, "attachNode:", {node});
+    f.send(engine, "connect:to:format:", {tone, mixer, 0});
+    f.send(engine, "connect:to:format:", {feeder, sink, mono48});
+    const auto input_node = f.send(engine, "inputNode");
+    const auto input_data = f.block(4 * 4096), input_list = f.block(24);
+    for (std::uint32_t i = 0; i < 4096; ++i) f.engine.write32(input_data + 4ULL * i, std::bit_cast<std::uint32_t>(0.5f));
+    f.engine.write32(input_list, 1);
+    f.engine.write32(input_list + 8, 1);
+    f.engine.write32(input_list + 12, 4 * 4096);
+    f.engine.write64(input_list + 16, input_data);
+    const auto give_input = b->make_block([input_list](transmute::CpuState& s, transmute::GuestMemory&) { s.x[0] = input_list; });
+    require((f.send(input_node, "setManualRenderingInputPCMFormat:inputBlock:", {mono48, give_input}) & 0xff) == 1, "the manual input");
+    f.send(engine, "connect:to:format:", {input_node, mixer, mono48});
+    require((f.send(engine, "startAndReturnError:", {error}) & 0xff) == 1, "the engine starts with no device");
+    const auto rendered = pcm_buffer(stereo48, 4096);
+    alchemy::CallRegs offline{};
+    offline.x = {0, 0, 1024, rendered, error, 0, 0, 0};
+    const auto status = f.objc.send(engine, f.objc.selector("renderOffline:toBuffer:error:"), offline).x0;
+    const auto data = f.send(rendered, "floatChannelData");
+    require(status == 0 && f.send(rendered, "frameLength") == 1024 && std::fabs(float_at(data, 0, 100) - 0.75f) < 1e-5f &&
+            std::fabs(float_at(data, 1, 1000) - 0.75f) < 1e-5f, "the source and the input mix: " + std::to_string(float_at(data, 0, 100)));
+    require(sunk == 1024 && std::bit_cast<float>(sunk_bits.load()) == 0.125f, "the sink receives its input");
+    require(f.send(engine, "manualRenderingSampleTime") == 1024, "the manual sample time");
+    // The realtime-style block renders into an AudioBufferList of the manual format.
+    const auto block = f.send(engine, "manualRenderingBlock");
+    const auto os_status = f.block(4);
+    f.send(rendered, "setFrameLength:", {512});
+    require(block && b->invoke_block(block, {512, f.send(rendered, "mutableAudioBufferList"), os_status}) == 0 && f.engine.read32(os_status) == 0 &&
+            std::fabs(float_at(data, 1, 10) - 0.75f) < 1e-5f, "manualRenderingBlock");
+    f.send(engine, "stop");
+    f.send(engine, "disableManualRenderingMode");
+    require((f.send(engine, "isInManualRenderingMode") & 0xff) == 0, "manual rendering off");
+}
+
 void music_sequence(Fixture& f) {
     const auto out = f.block(8);
     require(f.status(at, "_NewMusicSequence", {out}) == 0, "NewMusicSequence");
@@ -2129,5 +2310,6 @@ int main() {
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},
         {"avaudio", avaudio},
+        {"avaudio_conversion", avaudio_conversion},
     });
 }

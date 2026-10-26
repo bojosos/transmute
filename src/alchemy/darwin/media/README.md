@@ -27,10 +27,15 @@ linear PCM layout) and AVAudioFile for reading and writing (the files AudioFile 
 converted to and from the processing format). AVAudioPlayer decodes its file or data and plays it on the default output with
 volume, fades, pan, rate, loops, seeking, `playAtTime:` and metering. AVAudioEngine renders its
 graph on the default output: output, mixer and player nodes (buffers, files, segments, loop and
-interrupt options, completion handlers), volume and pan into mixers, node and player times, and
-taps. Unavailable: compressed files (nil with an error), input (no device: an engine fed by the input
-node fails to start), manual rendering (NO with an error), scheduling at a time and taps at a rate
-other than the engine's (explicit stops).
+interrupt options, completion handlers), source nodes (render blocks, resampled from their format's
+rate) and sink nodes (receiver blocks), volume and pan into mixers, node and player times, and
+taps. Manual rendering (offline and the realtime block) renders the same graph with no device, the
+input node then taking its audio from its manual input block. AVAudioConverter converts PCM
+between layouts, channel counts (channel maps, downmix) and rates, and decodes the compressed
+formats that have a decoder (MPEG audio, Opus, FLAC) from AVAudioCompressedBuffers. Unavailable:
+compressed files (nil with an error), compressed output (no encoder: the converter is nil), input
+(no device: an engine fed by the input node fails to start outside manual rendering), scheduling
+at a time and taps at a rate other than the engine's (explicit stops).
 
 **Audio files (real, `audio_file.cpp`):** AudioFile and ExtAudioFile read and write linear PCM
 WAVE, AIFF, AIFC and CAF, by URL or through the client's callbacks

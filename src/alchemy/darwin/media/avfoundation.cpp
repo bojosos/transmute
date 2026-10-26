@@ -153,6 +153,7 @@ struct FormatState final : ObjectPayload {
     Address layout{};                  // retained AVAudioChannelLayout or 0
     Address guest_asbd{};
     Address format_description{};      // retained, made on demand
+    Address magic_cookie{};            // retained NSData or 0
 };
 struct BusState final : ObjectPayload { Address format{}, name{}; bool enabled{true}; std::uint32_t maximum_channels{}; bool allocate{true}; };
 
@@ -1412,6 +1413,7 @@ void install_av_foundation(Support& support) {
         if (const auto st = av->support.objc.find_host_state<FormatState>(s.x[0])) {
             av->release(std::exchange(st->layout, 0));
             av->support.release(std::exchange(st->format_description, 0));
+            av->release(std::exchange(st->magic_cookie, 0));
             if (st->guest_asbd) av->support.process.release_guest(std::exchange(st->guest_asbd, 0));
         }
         static_cast<void>(av->support.objc.send_super(s.x[0], format, av->support.objc.selector("dealloc")));
@@ -1430,7 +1432,12 @@ void install_av_foundation(Support& support) {
     }, "B@:");
     support.method(format, "streamDescription", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<FormatState>(s.x[0])->guest_asbd; }, "^{AudioStreamBasicDescription=dIIIIIIII}@:");
     support.method(format, "channelLayout", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<FormatState>(s.x[0])->layout; }, "@@:");
-    support.method(format, "magicCookie", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:");
+    support.method(format, "magicCookie", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<FormatState>(s.x[0])->magic_cookie; }, "@@:");
+    support.method(format, "setMagicCookie:", [av](CpuState& s, GuestMemory&) {
+        auto st = av->state<FormatState>(s.x[0]);
+        const auto copy = s.x[2] ? av->support.send_id(s.x[2], "copy") : 0;
+        av->release(std::exchange(st->magic_cookie, copy));
+    }, "v@:@");
     support.method(format, "formatDescription", [av](CpuState& s, GuestMemory&) {
         auto st = av->state<FormatState>(s.x[0]);
         if (!st->format_description)

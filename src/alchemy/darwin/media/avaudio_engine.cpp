@@ -34,10 +34,17 @@
 //   stopped or reset. playAtTime: starts at an AVAudioTime's host time; node and player times
 //   convert between the engine's frames and the player's.
 // - Taps (installTapOnBus:...) deliver buffers of the node's output on the callback thread.
+// - AVAudioSourceNode: its render block fills an AudioBufferList of its format (the connection's
+//   without one) on the rendering thread, resampled to the engine's rate. AVAudioSinkNode: its
+//   receiver block gets what its input renders, once per render cycle after the output's.
+// - Manual rendering: offline (-renderOffline:toBuffer:error:) or realtime (manualRenderingBlock)
+//   in the format given, with no device; the input node then takes its audio from the block given
+//   to -setManualRenderingInputPCMFormat:inputBlock:.
+// - Render and receiver blocks, and the input block, run under the engines' lock: one that calls
+//   back into the engine or its nodes waits forever (Apple's documentation forbids such calls).
 // - Unavailable, as documented: there is no input device, so -startAndReturnError: fails with an
-//   error while the input node feeds the graph, and the input node's formats are nil. Manual
-//   rendering is not offered (-enableManualRenderingMode:... answers NO with an error). Without an
-//   output device -startAndReturnError: fails with an error. A tap on a player whose format's rate
+//   error while the input node feeds the graph outside manual rendering, and the input node's
+//   formats are nil there. Without an output device -startAndReturnError: fails with an error. A tap on a player whose format's rate
 //   is not the engine's stops with a message.
 namespace alchemy::gui::completion_kit::media::avaudio {
 namespace {
@@ -45,11 +52,91 @@ namespace {
 namespace af = audio_file;
 
 constexpr std::int32_t no_device = static_cast<std::int32_t>(0x21646576);   // '!dev' (kAudioHardwareBadDeviceError)
-constexpr std::int32_t unsupported_operation = static_cast<std::int32_t>(0x756E6F70);   // 'unop'
 // AVAudioPlayerNodeBufferOptions
 constexpr std::uint64_t option_loops = 1, option_interrupts = 2, option_interrupts_at_loop = 4;
 
-enum class Kind { output, input, mixer, player, other };
+enum class Kind { output, input, mixer, player, source, sink, other };
+// AVAudioEngineManualRenderingStatus and AVAudioEngineManualRenderingError
+constexpr std::int64_t manual_error = -1, manual_success = 0, manual_insufficient_input = 1;
+constexpr std::int32_t manual_invalid_mode = -80800, manual_initialized = -80801, manual_not_running = -80802;
+constexpr std::uint32_t timestamp_sample_host_valid = 3;   // kAudioTimeStampSampleHostTimeValid
+
+// Interleaved samples in `pcm` from the AudioBufferList at `list` (missing or short buffers: silence).
+std::vector<double> read_list(Support& support, const af::Pcm& pcm, Address list, std::uint32_t frames) {
+    auto& m = support.memory();
+    const auto planes = pcm.non_interleaved ? pcm.channels : 1;
+    const auto bytes = static_cast<std::size_t>(frames) * pcm.frame_bytes();
+    std::vector<std::vector<std::uint8_t>> storage(planes, std::vector<std::uint8_t>(bytes));
+    const auto count = list ? m.read32(list) : 0;
+    for (std::uint32_t i = 0; i < planes && i < count; ++i) {
+        const auto at = list + 8 + 16ULL * i;
+        const auto size = std::min<std::size_t>(m.read32(at + 4), bytes);
+        if (const auto data = m.read64(at + 8); data && size) m.read_bytes(data, std::span(storage[i]).first(size));
+    }
+    std::vector<std::span<const std::uint8_t>> spans(storage.begin(), storage.end());
+    return af::decode(pcm, spans, frames);
+}
+
+// Writes interleaved samples (in `channels`) into the AudioBufferList at `list`, in `pcm`, and sets
+// its byte sizes.
+void write_list(Support& support, const af::Pcm& pcm, Address list, std::span<const double> interleaved, std::uint32_t channels, std::uint32_t frames) {
+    auto& m = support.memory();
+    const auto planes = pcm.non_interleaved ? pcm.channels : 1;
+    const auto bytes = static_cast<std::size_t>(frames) * pcm.frame_bytes();
+    std::vector<std::vector<std::uint8_t>> storage(planes, std::vector<std::uint8_t>(bytes));
+    std::vector<std::span<std::uint8_t>> spans(storage.begin(), storage.end());
+    af::encode(pcm, interleaved, channels, frames, spans);
+    const auto count = m.read32(list);
+    for (std::uint32_t i = 0; i < planes && i < count; ++i) {
+        const auto at = list + 8 + 16ULL * i;
+        if (const auto data = m.read64(at + 8)) m.write_bytes(data, storage[i]);
+        m.write32(at + 4, static_cast<std::uint32_t>(bytes));
+    }
+}
+
+// Guest scratch for a block's buffers: an AudioBufferList over planes in `pcm`, and an
+// AudioTimeStamp and a BOOL beside it.
+struct GuestList {
+    Support& support;
+    af::Pcm pcm;
+    std::uint32_t capacity{};
+    Address list{}, data{}, stamp{};
+    GuestList(Support& owner, const af::Pcm& format) : support(owner), pcm(format) { stamp = support.process.allocate_guest(72, 8); }
+    GuestList(const GuestList&) = delete;
+    GuestList& operator=(const GuestList&) = delete;
+    ~GuestList() {
+        for (auto* at : {&list, &data, &stamp})
+            if (*at) support.process.release_guest(std::exchange(*at, 0));
+    }
+    [[nodiscard]] std::uint32_t planes() const { return pcm.non_interleaved ? pcm.channels : 1; }
+    [[nodiscard]] std::uint64_t plane_bytes() const { return static_cast<std::uint64_t>(capacity) * pcm.frame_bytes(); }
+    // Points the list at `frames` zeroed frames (the planes grow as needed); the time stamp at
+    // `sample_time` now.
+    void prepare(std::uint32_t frames, double sample_time) {
+        auto& m = support.memory();
+        if (frames > capacity) {
+            for (auto* at : {&list, &data})
+                if (*at) support.process.release_guest(std::exchange(*at, 0));
+            capacity = std::max(frames, 512U);
+            data = support.process.allocate_guest(std::max<std::uint64_t>(plane_bytes() * planes(), 16), 16);
+            list = support.process.allocate_guest(8 + 16ULL * planes(), 8);
+        }
+        m.fill_bytes(data, 0, plane_bytes() * planes());
+        m.write32(list, planes());
+        m.write32(list + 4, 0);
+        for (std::uint32_t i = 0; i < planes(); ++i) {
+            const auto at = list + 8 + 16ULL * i;
+            m.write32(at, pcm.non_interleaved ? 1 : pcm.channels);
+            m.write32(at + 4, static_cast<std::uint32_t>(static_cast<std::uint64_t>(frames) * pcm.frame_bytes()));
+            m.write64(at + 8, data + i * plane_bytes());
+        }
+        m.fill_bytes(stamp, 0, 72);
+        m.write64(stamp, std::bit_cast<std::uint64_t>(sample_time));
+        m.write64(stamp + 8, host_time_now());
+        m.write64(stamp + 16, std::bit_cast<std::uint64_t>(1.0));
+        m.write32(stamp + 56, timestamp_sample_host_valid);
+    }
+};
 
 struct Scheduled {
     std::vector<float> samples;        // interleaved
@@ -104,6 +191,10 @@ struct Node final : ObjectPayload {
     double resampler_rate{};
     std::uint32_t resampler_channels{};
     std::optional<Tap> tap;
+    // Source and sink nodes.
+    Address block{};                   // _Block_copy'd render or receiver block
+    Address source_format{};           // retained; 0: the connection's
+    std::unique_ptr<GuestList> scratch;
 };
 
 struct EngineState final : ObjectPayload {
@@ -114,6 +205,15 @@ struct EngineState final : ObjectPayload {
     std::shared_ptr<CompletionThread> thread;
     std::thread::id callback_thread;   // the thread's id, once a callback ran
     double sample_time{};              // frames rendered since the first start
+    // Manual rendering.
+    bool manual{};
+    std::int64_t manual_mode{};        // AVAudioEngineManualRenderingMode
+    Address manual_format{};           // retained
+    af::Pcm manual_pcm;
+    std::uint32_t manual_maximum{};
+    Address manual_block{};            // the manualRenderingBlock (made once)
+    Address input_format{}, input_block{};   // retained / _Block_copy'd (the input node's audio)
+    af::Pcm input_pcm;
 };
 
 // Work to hand the callback thread after a render.
@@ -155,12 +255,23 @@ private:
     std::vector<double> pull(Address node, std::uint32_t frames, std::uint32_t channels, double rate, double sample_time, unsigned depth,
                              std::vector<Callback>& callbacks, std::vector<TapDelivery>& taps);
     void render_player(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate, std::vector<Callback>& callbacks);
+    void render_source(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate, double sample_time);
+    void render_input(Node& n, double* out, std::uint32_t frames, std::uint32_t channels);
+    // One render cycle: the output node's frames, then the sink nodes' deliveries.
+    std::vector<double> cycle(EngineState& e, std::uint32_t frames, std::uint32_t channels, double rate,
+                              std::vector<Callback>& callbacks, std::vector<TapDelivery>& taps);
     void render(Address engine, float* mix, std::uint32_t frames, std::uint32_t channels, double rate);
+    // A manual render of `frames` frames into an AudioBufferList of the manual format.
+    std::int64_t render_manual(Address engine, std::uint32_t frames, Address list, Address error_out);
+    // The rate the engine renders at (the device's, or the manual format's); 0 with no clock.
+    double clock_rate(const EngineState& e) const { return e.manual ? e.manual_pcm.rate : e.io ? e.io->rate() : 0.0; }
+    void set_manual(Address engine, bool manual);
 
     Support& support_;
     std::shared_ptr<security::Bridge> bridge_;
     std::mutex mutex_;                 // every engine and node
-    Address output_class_{}, input_class_{}, mixer_class_{}, player_class_{};
+    Address output_class_{}, input_class_{}, mixer_class_{}, player_class_{}, source_class_{}, sink_class_{};
+    bool input_short_{};               // the manual input block gave no audio this cycle (the lock is held)
 };
 
 // Adds `frames` frames of `source` (in `source_channels`) into `mix` (in `channels`).
@@ -185,6 +296,7 @@ Address Engines::make_node(Address cls, Kind kind) {
 }
 
 std::pair<double, std::uint32_t> Engines::device_format(EngineState& e) {
+    if (e.manual) return {e.manual_pcm.rate, e.manual_pcm.channels};
     if (!e.io) e.io = hal_device_io(hal_default_output());
     if (e.io) return {e.io->rate(), std::max(1U, e.io->channels())};
     return {44100.0, 2};
@@ -272,7 +384,7 @@ void Engines::connect(Address engine_object, Address source, Address destination
     if (s->engine != engine_object || d->engine != engine_object)
         unsupported("-[AVAudioEngine connect:to:...] with a node not attached to the engine (an exception on macOS)");
     if (from_bus != 0) unsupported("-[AVAudioEngine connect:to:...] from an output bus other than 0 (Alchemy nodes have one output)");
-    if (s->kind == Kind::output) unsupported("-[AVAudioEngine connect:to:...] from the output node");
+    if (s->kind == Kind::output || s->kind == Kind::sink) unsupported("-[AVAudioEngine connect:to:...] from a node with no output (the output node, a sink node)");
     // A nil format: the source's output format (a player's default is 44.1 kHz stereo).
     Address chosen = format;
     if (!chosen) chosen = output_format(source);
@@ -303,6 +415,8 @@ void Engines::connect(Address engine_object, Address source, Address destination
         std::uint32_t bus = 0;
         if (to_bus) bus = *to_bus;
         else if (d->kind == Kind::mixer) while (d->inputs.contains(bus)) ++bus;
+        if (d->kind == Kind::player || d->kind == Kind::source || d->kind == Kind::input)
+            unsupported("-[AVAudioEngine connect:to:...] to a node with no input (a player, source or input node)");
         if (d->kind != Kind::mixer && bus != 0) unsupported("-[AVAudioEngine connect:to:...] to an input bus other than 0 of a node that is not a mixer");
         if (const auto f = d->input_formats.find(bus); f != d->input_formats.end()) released.push_back(f->second);
         d->inputs[bus] = source;
@@ -363,6 +477,11 @@ bool Engines::start(Address engine_object, Address error_out) {
     {
         std::lock_guard lock(mutex_);
         if (e->running) return true;
+        if (e->manual) {
+            if (!e->thread) e->thread = start_completion_thread(support_.process, "com.apple.avfaudio.engine.callbacks");
+            e->running = true;
+            return true;
+        }
         if (e->input)
             for (const auto other : e->attached)
                 if (const auto o = support_.objc.find_host_state<Node>(other))
@@ -480,6 +599,12 @@ std::vector<double> Engines::pull(Address node_object, std::uint32_t frames, std
     case Kind::player:
         render_player(*n, out.data(), frames, channels, rate, callbacks);
         break;
+    case Kind::source:
+        render_source(*n, out.data(), frames, channels, rate, sample_time);
+        break;
+    case Kind::input:
+        render_input(*n, out.data(), frames, channels);
+        break;
     case Kind::mixer:
     case Kind::output:
         for (const auto& [bus, source] : n->inputs) {
@@ -511,6 +636,29 @@ std::vector<double> Engines::pull(Address node_object, std::uint32_t frames, std
     return out;
 }
 
+std::vector<double> Engines::cycle(EngineState& e, std::uint32_t frames, std::uint32_t channels, double rate,
+                                   std::vector<Callback>& callbacks, std::vector<TapDelivery>& taps) {
+    input_short_ = false;
+    auto out = pull(e.output, frames, channels, rate, e.sample_time, 0, callbacks, taps);
+    for (const auto object : e.attached) {
+        const auto n = support_.objc.find_host_state<Node>(object);
+        if (!n || n->kind != Kind::sink || !n->block || !n->inputs.contains(0)) continue;
+        const auto source_channels = n->input_channels.contains(0) ? n->input_channels.at(0) : channels;
+        const auto data = pull(n->inputs.at(0), frames, source_channels, rate, e.sample_time, 1, callbacks, taps);
+        const auto format = n->input_formats.contains(0) ? format_pcm(support_, n->input_formats.at(0)) : std::nullopt;
+        if (!format) continue;
+        if (!n->scratch || n->scratch->pcm.channels != format->channels || n->scratch->pcm.frame_bytes() != format->frame_bytes() ||
+            n->scratch->pcm.non_interleaved != format->non_interleaved || n->scratch->pcm.is_float != format->is_float)
+            n->scratch = std::make_unique<GuestList>(support_, *format);
+        n->scratch->prepare(frames, e.sample_time);
+        write_list(support_, n->scratch->pcm, n->scratch->list, data, source_channels, frames);
+        // OSStatus (^)(const AudioTimeStamp *timestamp, AVAudioFrameCount frameCount, const AudioBufferList *inputData)
+        static_cast<void>(bridge_->invoke_block(n->block, {n->scratch->stamp, frames, n->scratch->list}));
+    }
+    e.sample_time += frames;
+    return out;
+}
+
 void Engines::render(Address engine_object, float* mix, std::uint32_t frames, std::uint32_t channels, double rate) {
     std::vector<Callback> callbacks;
     std::vector<TapDelivery> taps;
@@ -518,12 +666,118 @@ void Engines::render(Address engine_object, float* mix, std::uint32_t frames, st
     {
         std::lock_guard lock(mutex_);
         e = support_.objc.find_host_state<EngineState>(engine_object);
-        if (!e || !e->running || !e->output) return;
-        const auto out = pull(e->output, frames, channels, rate, e->sample_time, 0, callbacks, taps);
+        if (!e || !e->running || !e->output || e->manual) return;
+        const auto out = cycle(*e, frames, channels, rate, callbacks, taps);
         for (std::size_t i = 0; i < out.size(); ++i) mix[i] += static_cast<float>(out[i]);
-        e->sample_time += frames;
     }
     post(e, std::move(callbacks), std::move(taps));
+}
+
+std::int64_t Engines::render_manual(Address engine_object, std::uint32_t frames, Address list, Address error_out) {
+    const auto fail_with = [&](std::int32_t status, std::string_view text) {
+        if (error_out) support_.memory().write32(error_out, static_cast<std::uint32_t>(status));
+        static_cast<void>(text);
+        return manual_error;
+    };
+    std::vector<Callback> callbacks;
+    std::vector<TapDelivery> taps;
+    std::shared_ptr<EngineState> e;
+    bool short_input{};
+    {
+        std::lock_guard lock(mutex_);
+        e = support_.objc.find_host_state<EngineState>(engine_object);
+        if (!e || !e->manual) return fail_with(manual_invalid_mode, "not in manual rendering mode");
+        if (!e->running || !e->output) return fail_with(manual_not_running, "the engine is not running");
+        if (frames > e->manual_maximum) return fail_with(-50, "more frames than the maximum frame count");
+        const auto channels = e->manual_pcm.channels;
+        const auto out = cycle(*e, frames, channels, e->manual_pcm.rate, callbacks, taps);
+        write_list(support_, e->manual_pcm, list, out, channels, frames);
+        short_input = input_short_;
+    }
+    post(e, std::move(callbacks), std::move(taps));
+    if (error_out) support_.memory().write32(error_out, 0);
+    return short_input ? manual_insufficient_input : manual_success;
+}
+
+void Engines::render_source(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate, double sample_time) {
+    std::fill(out, out + static_cast<std::size_t>(frames) * channels, 0.0);
+    if (!n.block) return;
+    const auto format = format_pcm(support_, n.source_format ? n.source_format : n.output_format);
+    if (!format) return;
+    if (!n.scratch || n.scratch->pcm.rate != format->rate || n.scratch->pcm.channels != format->channels ||
+        n.scratch->pcm.frame_bytes() != format->frame_bytes() || n.scratch->pcm.non_interleaved != format->non_interleaved ||
+        n.scratch->pcm.is_float != format->is_float)
+        n.scratch = std::make_unique<GuestList>(support_, *format);
+    auto& scratch = *n.scratch;
+    // The block renders in its format's channels and rate; the resampler maps them to the engine's.
+    const auto block_channels = format->channels;
+    double block_time = sample_time * format->rate / rate;
+    const auto call = [&](double* into, std::size_t count) {
+        for (std::size_t done = 0; done < count;) {
+            const auto chunk = static_cast<std::uint32_t>(std::min<std::size_t>(count - done, 4096));
+            scratch.prepare(chunk, block_time);
+            const auto silence = support_.process.allocate_guest(8, 8);
+            support_.memory().write64(silence, 0);
+            // OSStatus (^)(BOOL *isSilence, const AudioTimeStamp *timestamp, AVAudioFrameCount frameCount, AudioBufferList *outputData)
+            const auto status = static_cast<std::int32_t>(bridge_->invoke_block(n.block, {silence, scratch.stamp, chunk, scratch.list}));
+            const bool silent = (support_.memory().read8(silence) != 0) || status != 0;
+            support_.process.release_guest(silence);
+            const auto samples = silent ? std::vector<double>(static_cast<std::size_t>(chunk) * block_channels, 0.0)
+                                        : read_list(support_, scratch.pcm, scratch.list, chunk);
+            for (std::size_t f = 0; f < chunk; ++f)
+                for (std::uint32_t c = 0; c < channels; ++c)
+                    into[(done + f) * channels + c] = block_channels == 1 ? samples[f] : c < block_channels ? samples[f * block_channels + c] : 0.0;
+            done += chunk;
+            block_time += chunk;
+        }
+    };
+    if (format->rate == rate) return call(out, frames);
+    if (!n.resampler || n.resampler_rate != format->rate || n.resampler_channels != channels) {
+        n.resampler = std::make_unique<Resampler>(format->rate, rate, channels);
+        n.resampler_rate = format->rate;
+        n.resampler_channels = channels;
+    }
+    n.resampler->render(out, frames, call);
+}
+
+void Engines::render_input(Node& n, double* out, std::uint32_t frames, std::uint32_t channels) {
+    std::fill(out, out + static_cast<std::size_t>(frames) * channels, 0.0);
+    const auto e = n.engine ? support_.objc.find_host_state<EngineState>(n.engine) : nullptr;
+    if (!e || !e->manual || !e->input_block) return;
+    // const AudioBufferList * (^)(AVAudioFrameCount inNumberOfFrames): nil when there is no input now.
+    const auto list = bridge_->invoke_block(e->input_block, {frames});
+    if (!list) { input_short_ = true; return; }
+    const auto samples = read_list(support_, e->input_pcm, list, frames);
+    const auto in_channels = e->input_pcm.channels;
+    for (std::uint32_t f = 0; f < frames; ++f)
+        for (std::uint32_t c = 0; c < channels; ++c)
+            out[static_cast<std::size_t>(f) * channels + c] = in_channels == 1 ? samples[f] : c < in_channels ? samples[static_cast<std::size_t>(f) * in_channels + c] : 0.0;
+}
+
+void Engines::set_manual(Address engine_object, bool manual) {
+    auto e = engine(engine_object);
+    {
+        std::lock_guard lock(mutex_);
+        e->manual = manual;
+    }
+    // The output and main mixer render in the new format.
+    const auto [rate, channels] = device_format(*e);
+    std::vector<Address> released;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto object : {e->output, e->mixer}) {
+            const auto n = object ? support_.objc.find_host_state<Node>(object) : nullptr;
+            if (!n) continue;
+            released.push_back(std::exchange(n->output_format, standard_format(support_, rate, channels)));
+        }
+        if (const auto o = e->output ? support_.objc.find_host_state<Node>(e->output) : nullptr)
+            for (auto& [bus, source] : o->inputs)
+                if (source == e->mixer) {
+                    o->input_channels[bus] = channels;
+                    released.push_back(std::exchange(o->input_formats[bus], support_.retain(o->output_format)));
+                }
+    }
+    for (const auto object : released) support_.release(object);
 }
 
 void Engines::stop_player(Address node_object, bool clear) {
@@ -598,6 +852,8 @@ void Engines::install() {
     input_class_ = declare(support, "AVAudioInputNode", "AVAudioIONode");
     mixer_class_ = declare(support, "AVAudioMixerNode", "AVAudioNode");
     player_class_ = declare(support, "AVAudioPlayerNode", "AVAudioNode");
+    source_class_ = declare(support, "AVAudioSourceNode", "AVAudioNode");
+    sink_class_ = declare(support, "AVAudioSinkNode", "AVAudioNode");
     const auto engine_class = declare(support, "AVAudioEngine", "NSObject");
     static_cast<void>(io_class);
     for (const auto library : {avf_audio, av_foundation})
@@ -623,6 +879,9 @@ void Engines::install() {
             n->input_formats.clear();
             n->output_format = 0;
             n->tap.reset();   // the tap's block and format go with its last delivery
+            released.push_back(std::exchange(n->source_format, 0));
+            if (n->block) self->bridge_->block_release(std::exchange(n->block, 0));
+            n->scratch.reset();
             for (const auto object : released) sp->release(object);
         }
         static_cast<void>(sp->objc.send_super(s.x[0], node_class, sp->objc.selector("dealloc")));
@@ -635,15 +894,20 @@ void Engines::install() {
     support.method(node_class, "numberOfInputs", [self](CpuState& s, GuestMemory&) {
         const auto n = self->node(s.x[0]);
         std::lock_guard lock(self->mutex_);
-        s.x[0] = n->kind == Kind::mixer ? (n->inputs.empty() ? 1 : n->inputs.rbegin()->first + 2) : n->kind == Kind::output ? 1 : 0;
+        s.x[0] = n->kind == Kind::mixer ? (n->inputs.empty() ? 1 : n->inputs.rbegin()->first + 2) : n->kind == Kind::output || n->kind == Kind::sink ? 1 : 0;
     }, "Q@:");
     support.method(node_class, "numberOfOutputs", [self](CpuState& s, GuestMemory&) {
-        s.x[0] = self->node(s.x[0])->kind == Kind::output ? 0 : 1;
+        const auto kind = self->node(s.x[0])->kind;
+        s.x[0] = kind == Kind::output || kind == Kind::sink ? 0 : 1;
     }, "Q@:");
-    support.method(node_class, "outputFormatForBus:", [self](CpuState& s, GuestMemory&) {
+    support.method(node_class, "outputFormatForBus:", [self, sp](CpuState& s, GuestMemory&) {
         const auto n = self->node(s.x[0]);
-        if (n->kind == Kind::input) { s.x[0] = 0; return; }   // no input device
         std::lock_guard lock(self->mutex_);
+        if (n->kind == Kind::input) {   // no input device: the manual rendering input's format, if any
+            const auto e = n->engine ? sp->objc.find_host_state<EngineState>(n->engine) : nullptr;
+            s.x[0] = s.x[2] == 0 && e && e->manual ? e->input_format : 0;
+            return;
+        }
         s.x[0] = s.x[2] == 0 ? n->output_format : 0;
         if (!s.x[0] && s.x[2] == 0 && n->kind == Kind::player) {
             n->output_format = standard_format(self->support_, 44100, 2);
@@ -654,7 +918,7 @@ void Engines::install() {
         const auto n = self->node(s.x[0]);
         std::lock_guard lock(self->mutex_);
         const auto bus = static_cast<std::uint32_t>(s.x[2]);
-        if (n->kind == Kind::input || n->kind == Kind::player) { s.x[0] = 0; return; }
+        if (n->kind == Kind::input || n->kind == Kind::player || n->kind == Kind::source) { s.x[0] = 0; return; }
         if (const auto f = n->input_formats.find(bus); f != n->input_formats.end()) { s.x[0] = f->second; return; }
         s.x[0] = n->output_format;   // an unconnected bus: the node's own format
     }, "@@:Q");
@@ -672,9 +936,9 @@ void Engines::install() {
         {
             std::lock_guard lock(self->mutex_);
             const auto e = n->engine ? sp->objc.find_host_state<EngineState>(n->engine) : nullptr;
-            if (!e || !e->running || !e->io) { s.x[0] = 0; return; }
+            if (!e || !e->running || !self->clock_rate(*e)) { s.x[0] = 0; return; }
             sample = e->sample_time;
-            rate = e->io->rate();
+            rate = self->clock_rate(*e);
         }
         s.x[0] = sp->send_id(make_time(*sp, host_time_now(), sample, rate), "autorelease");
     }, "@@:");
@@ -712,7 +976,7 @@ void Engines::install() {
         // The tap goes here, unlocked (its block and format with it, unless a delivery is in flight).
     }, "v@:Q");
     // AVAudioMixing (players, mixers, the input node): applied by the destination mixer.
-    for (const auto cls : {player_class_, mixer_class_, input_class_}) {
+    for (const auto cls : {player_class_, mixer_class_, input_class_, source_class_}) {
         for (const auto& [getter, setter, field, low, high] : std::initializer_list<std::tuple<const char*, const char*, float Node::*, float, float>>{
                  {"volume", "setVolume:", &Node::volume, 0.0f, 1.0f}, {"pan", "setPan:", &Node::pan, -1.0f, 1.0f}}) {
             const auto member = field;
@@ -819,10 +1083,10 @@ void Engines::install() {
         n->played_frames = 0;
         n->start_node_sample = e->sample_time;
         n->delay_frames = 0;
-        if (const auto t = when ? sp->objc.find_host_state<TimeState>(when) : nullptr; t && t->host_valid && e->io) {
+        if (const auto t = when ? sp->objc.find_host_state<TimeState>(when) : nullptr; t && t->host_valid && self->clock_rate(*e)) {
             const auto now = host_time_now();
-            if (t->host > now) n->delay_frames = static_cast<std::uint64_t>(static_cast<double>(t->host - now) / 1e9 * e->io->rate());
-        } else if (t && t->sample_valid && e->io) {
+            if (t->host > now) n->delay_frames = static_cast<std::uint64_t>(static_cast<double>(t->host - now) / 1e9 * self->clock_rate(*e));
+        } else if (t && t->sample_valid && self->clock_rate(*e)) {
             if (t->sample > e->sample_time) n->delay_frames = static_cast<std::uint64_t>(t->sample - e->sample_time);
         }
         n->start_node_sample += static_cast<double>(n->delay_frames);
@@ -849,8 +1113,8 @@ void Engines::install() {
         {
             std::lock_guard lock(self->mutex_);
             const auto e = n->engine ? sp->objc.find_host_state<EngineState>(n->engine) : nullptr;
-            if (!t || !t->sample_valid || !n->playing || !e || !e->io) { s.x[0] = 0; return; }
-            const double engine_rate = e->io->rate();
+            if (!t || !t->sample_valid || !n->playing || !e || !self->clock_rate(*e)) { s.x[0] = 0; return; }
+            const double engine_rate = self->clock_rate(*e);
             rate = n->resampler_rate > 0 ? n->resampler_rate : engine_rate;
             sample = (t->sample - n->start_node_sample) * rate / engine_rate;
         }
@@ -863,8 +1127,8 @@ void Engines::install() {
         {
             std::lock_guard lock(self->mutex_);
             const auto e = n->engine ? sp->objc.find_host_state<EngineState>(n->engine) : nullptr;
-            if (!t || !t->sample_valid || !n->playing || !e || !e->io) { s.x[0] = 0; return; }
-            engine_rate = e->io->rate();
+            if (!t || !t->sample_valid || !n->playing || !e || !self->clock_rate(*e)) { s.x[0] = 0; return; }
+            engine_rate = self->clock_rate(*e);
             const double rate = n->resampler_rate > 0 ? n->resampler_rate : engine_rate;
             sample = n->start_node_sample + t->sample * engine_rate / rate;
         }
@@ -882,7 +1146,9 @@ void Engines::install() {
                 attached = e->attached;
             }
             for (const auto object : attached) self->detach(s.x[0], object);
-            for (auto* object : {&e->output, &e->mixer, &e->input}) sp->release(std::exchange(*object, 0));
+            for (auto* object : {&e->output, &e->mixer, &e->input, &e->manual_format, &e->input_format}) sp->release(std::exchange(*object, 0));
+            if (e->input_block) self->bridge_->block_release(std::exchange(e->input_block, 0));
+            if (e->manual_block) self->bridge_->forget_block(std::exchange(e->manual_block, 0));
             std::shared_ptr<CompletionThread> thread;
             bool own_thread{};
             {
@@ -956,13 +1222,149 @@ void Engines::install() {
         std::lock_guard lock(self->mutex_);
         s.x[0] = e->running ? 1 : 0;
     }, "B@:");
-    support.method(engine_object, "isInManualRenderingMode", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // ---- manual rendering ------------------------------------------------------------------------
+    const auto manual_state = [self](Address object) {
+        const auto e = self->engine(object);
+        return e;
+    };
+    support.method(engine_object, "isInManualRenderingMode", [self, manual_state](CpuState& s, GuestMemory&) {
+        const auto e = manual_state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = e->manual ? 1 : 0;
+    }, "B@:");
     // -enableManualRenderingMode:format:maximumFrameCount:error: (mode x2, format x3, count x4, error x5)
-    support.method(engine_object, "enableManualRenderingMode:format:maximumFrameCount:error:", [self](CpuState& s, GuestMemory&) {
-        if (s.x[5]) self->bridge_->store_error(s.x[5], self->bridge_->os_status_error(unsupported_operation, "AVAudioEngine manual rendering is not provided under Alchemy"), true);
-        s.x[0] = 0;
+    support.method(engine_object, "enableManualRenderingMode:format:maximumFrameCount:error:", [self, sp, manual_state](CpuState& s, GuestMemory&) {
+        const auto e = manual_state(s.x[0]);
+        const auto fail_with = [&](std::int32_t status, std::string_view text) {
+            if (s.x[5]) self->bridge_->store_error(s.x[5], self->bridge_->os_status_error(status, text), true);
+            s.x[0] = 0;
+        };
+        const auto pcm = s.x[3] ? format_pcm(*sp, s.x[3]) : std::nullopt;
+        const auto mode = static_cast<std::int64_t>(s.x[2]);
+        if (!pcm || (mode != 0 && mode != 1) || s.x[4] == 0) return fail_with(manual_invalid_mode, "AVAudioEngine: manual rendering needs a PCM format, a mode and a frame count");
+        {
+            std::lock_guard lock(self->mutex_);
+            if (e->running) return fail_with(manual_initialized, "AVAudioEngine: stop the engine before changing its rendering mode");
+            sp->release(std::exchange(e->manual_format, sp->retain(s.x[3])));
+            e->manual_pcm = *pcm;
+            e->manual_mode = mode;
+            e->manual_maximum = static_cast<std::uint32_t>(s.x[4]);
+        }
+        self->set_manual(s.x[0], true);
+        s.x[0] = 1;
     }, "B@:q@I^@");
-    support.method(engine_object, "disableManualRenderingMode", [](CpuState&, GuestMemory&) {}, "v@:");
+    support.method(engine_object, "disableManualRenderingMode", [self, manual_state](CpuState& s, GuestMemory&) {
+        const auto e = manual_state(s.x[0]);
+        {
+            std::lock_guard lock(self->mutex_);
+            if (!e->manual) return;
+            e->running = false;
+        }
+        self->set_manual(s.x[0], false);
+    }, "v@:");
+    support.method(engine_object, "manualRenderingMode", [self, manual_state](CpuState& s, GuestMemory&) {
+        const auto e = manual_state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = static_cast<std::uint64_t>(e->manual_mode);
+    }, "q@:");
+    support.method(engine_object, "manualRenderingFormat", [self, manual_state](CpuState& s, GuestMemory&) {
+        const auto e = manual_state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = e->manual ? e->manual_format : 0;
+    }, "@@:");
+    support.method(engine_object, "manualRenderingMaximumFrameCount", [self, manual_state](CpuState& s, GuestMemory&) {
+        const auto e = manual_state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = e->manual ? e->manual_maximum : 0;
+    }, "I@:");
+    support.method(engine_object, "manualRenderingSampleTime", [self, manual_state](CpuState& s, GuestMemory&) {
+        const auto e = manual_state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = static_cast<std::uint64_t>(static_cast<std::int64_t>(e->sample_time));
+    }, "q@:");
+    // -renderOffline:(AVAudioFrameCount)numberOfFrames toBuffer:(AVAudioPCMBuffer *)buffer error:(NSError **)
+    support.method(engine_object, "renderOffline:toBuffer:error:", [self, sp, manual_state](CpuState& s, GuestMemory&) {
+        const auto e = manual_state(s.x[0]);
+        const auto frames = static_cast<std::uint32_t>(s.x[2]);
+        const auto buffer = s.x[3] ? sp->objc.find_host_state<PcmBuffer>(s.x[3]) : nullptr;
+        const auto fail_with = [&](std::int32_t status, std::string_view text) {
+            if (s.x[4]) self->bridge_->store_error(s.x[4], self->bridge_->os_status_error(status, text), true);
+            s.x[0] = static_cast<std::uint64_t>(manual_error);
+        };
+        bool offline{};
+        {
+            std::lock_guard lock(self->mutex_);
+            offline = e->manual && e->manual_mode == 0;
+        }
+        if (!offline) return fail_with(manual_invalid_mode, "AVAudioEngine: -renderOffline:toBuffer:error: needs offline manual rendering");
+        if (!buffer || frames > buffer->capacity) return fail_with(-50, "AVAudioEngine: the buffer cannot hold the frames asked for");
+        const auto status_cell = sp->process.allocate_guest(8, 8);
+        sp->memory().write32(status_cell, 0);
+        const auto status = self->render_manual(s.x[0], frames, buffer->list, status_cell);
+        const auto os_status = static_cast<std::int32_t>(sp->memory().read32(status_cell));
+        sp->process.release_guest(status_cell);
+        if (status == manual_error) return fail_with(os_status, "AVAudioEngine: the engine could not render");
+        sp->send(s.x[3], "setFrameLength:", [frames] { CallRegs r{}; r.x[2] = frames; return r; }());
+        s.x[0] = static_cast<std::uint64_t>(status);
+    }, "q@:I@^@");
+    // manualRenderingBlock: AVAudioEngineManualRenderingStatus (^)(AVAudioFrameCount numberOfFrames,
+    //     AudioBufferList *outBuffer, OSStatus *outError), for realtime and offline modes alike.
+    support.method(engine_object, "manualRenderingBlock", [self, manual_state](CpuState& s, GuestMemory&) {
+        const auto engine_object = s.x[0];
+        const auto e = manual_state(engine_object);
+        std::lock_guard lock(self->mutex_);
+        if (!e->manual) { s.x[0] = 0; return; }
+        if (!e->manual_block)
+            e->manual_block = self->bridge_->make_block([self, engine_object](CpuState& b, GuestMemory&) {
+                b.x[0] = static_cast<std::uint64_t>(self->render_manual(engine_object, static_cast<std::uint32_t>(b.x[1]), b.x[2], b.x[3]));
+            });
+        s.x[0] = e->manual_block;
+    }, "@?@:");
+    // -[AVAudioInputNode setManualRenderingInputPCMFormat:inputBlock:] (format x2, block x3)
+    support.method(input_class_, "setManualRenderingInputPCMFormat:inputBlock:", [self, sp](CpuState& s, GuestMemory&) {
+        const auto n = self->node(s.x[0]);
+        const auto pcm = s.x[2] ? format_pcm(*sp, s.x[2]) : std::nullopt;
+        const auto e = n->engine ? sp->objc.find_host_state<EngineState>(n->engine) : nullptr;
+        if (!pcm || !e) { s.x[0] = 0; return; }
+        Address old_block{}, old_format{};
+        {
+            std::lock_guard lock(self->mutex_);
+            if (!e->manual) { s.x[0] = 0; return; }
+            old_format = std::exchange(e->input_format, sp->retain(s.x[2]));
+            old_block = std::exchange(e->input_block, s.x[3] ? self->bridge_->block_copy(s.x[3]) : 0);
+            e->input_pcm = *pcm;
+            sp->release(std::exchange(n->output_format, sp->retain(s.x[2])));
+        }
+        sp->release(old_format);
+        if (old_block) self->bridge_->block_release(old_block);
+        s.x[0] = 1;
+    }, "B@:@@?");
+
+    // ---- AVAudioSourceNode and AVAudioSinkNode ---------------------------------------------------
+    // -initWithRenderBlock:, -initWithFormat:renderBlock: and -initWithReceiverBlock:
+    const auto init_with_block = [sp, self](CpuState& s, Address cls, Kind kind, Address format, Address block) {
+        const auto object = sp->objc.send_super(s.x[0], cls, sp->objc.selector("init")).x0;
+        if (!object || !block || (format && !format_pcm(*sp, format))) {
+            sp->release(object);
+            s.x[0] = 0;
+            return;
+        }
+        const auto n = sp->objc.host_state<Node>(object);
+        n->kind = kind;
+        n->block = self->bridge_->block_copy(block);
+        n->source_format = sp->retain(format);
+        if (format) n->output_format = sp->retain(format);
+        s.x[0] = object;
+    };
+    support.method(source_class_, "initWithRenderBlock:", [init_with_block, cls = source_class_](CpuState& s, GuestMemory&) {
+        init_with_block(s, cls, Kind::source, 0, s.x[2]);
+    }, "@@:@?");
+    support.method(source_class_, "initWithFormat:renderBlock:", [init_with_block, cls = source_class_](CpuState& s, GuestMemory&) {
+        init_with_block(s, cls, Kind::source, s.x[2], s.x[3]);
+    }, "@@:@@?");
+    support.method(sink_class_, "initWithReceiverBlock:", [init_with_block, cls = sink_class_](CpuState& s, GuestMemory&) {
+        init_with_block(s, cls, Kind::sink, 0, s.x[2]);
+    }, "@@:@?");
 }
 
 } // namespace
