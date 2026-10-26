@@ -142,10 +142,29 @@ void lapack(bool jit) {
     const auto nonpositive = f.array<double>({1,2,2,1});
     static_cast<void>(f.call("_dpotrf$NEWLAPACK", {f.character('U'),n,nonpositive,lda,info})); require(f.engine.read32(info) == 2, "indefinite Cholesky accepted");
     static_cast<void>(f.call("_dgetrf$NEWLAPACK", {f.integer(-1),n,0,lda,pivots,info})); require(static_cast<std::int32_t>(f.engine.read32(info)) == -1, "LAPACK invalid argument status");
-    bool rejected{};
-    try { static_cast<void>(f.call("_dgesdd$NEWLAPACK")); }
-    catch (const std::runtime_error& error) { rejected = std::string_view(error.what()).find("decomposition") != std::string_view::npos; }
-    require(rejected && !alchemy::deferred_numeric_api("_dgesdd$NEWLAPACK").empty(), "unsupported driver is not explicit");
+    // The decomposition drivers (darwin/accelerate/lapack.cpp).
+    const auto two = f.integer(2), one = f.integer(1), work = f.allocation(512), iwork = f.allocation(64), lwork = f.integer(64);
+    const auto sv = f.allocation(16), u = f.allocation(32), vt = f.allocation(32);
+    const auto diagonal = f.array<double>({3, 0, 0, 4});
+    static_cast<void>(f.call("_dgesdd$NEWLAPACK", {f.character('A'), two, two, diagonal, two, sv, u, two}, {},
+                             {{0, vt}, {8, two}, {16, work}, {24, lwork}, {32, iwork}, {40, info}}));
+    require(f.engine.read32(info) == 0, "dgesdd INFO"); close(f.get_real<double>(sv), 4); close(f.get_real<double>(sv + 8), 3);
+    const auto symmetric = f.array<double>({2, 1, 1, 2}), w = f.allocation(16);
+    static_cast<void>(f.call("_dsyevd$NEWLAPACK", {f.character('V'), f.character('U'), two, symmetric, two, w, work, lwork}, {},
+                             {{0, iwork}, {8, f.integer(64)}, {16, info}}));
+    require(f.engine.read32(info) == 0, "dsyevd INFO"); close(f.get_real<double>(w), 1); close(f.get_real<double>(w + 8), 3);
+    close(std::abs(f.get_real<double>(symmetric)), std::sqrt(0.5));
+    const auto rotation = f.array<double>({0, 1, -1, 0}), wr = f.allocation(16), wi = f.allocation(16), vr = f.allocation(32);
+    static_cast<void>(f.call("_dgeev$NEWLAPACK", {f.character('N'), f.character('V'), two, rotation, two, wr, wi, 0}, {},
+                             {{0, two}, {8, vr}, {16, two}, {24, work}, {32, lwork}, {40, info}}));
+    require(f.engine.read32(info) == 0, "dgeev INFO"); close(f.get_real<double>(wr), 0); close(f.get_real<double>(wi), 1); close(f.get_real<double>(wi + 8), -1);
+    const auto column = f.array<double>({3, 4}), tau = f.allocation(8);
+    static_cast<void>(f.call("_dgeqrf$NEWLAPACK", {two, one, column, two, tau, work, lwork, info}));
+    require(f.engine.read32(info) == 0, "dgeqrf INFO"); close(f.get_real<double>(column), -5);
+    static_cast<void>(f.call("_dorgqr$NEWLAPACK", {two, one, one, column, two, tau, work, lwork}, {}, {{0, info}}));
+    require(f.engine.read32(info) == 0, "dorgqr INFO"); close(f.get_real<double>(column), -0.6); close(f.get_real<double>(column + 8), -0.8);
+    require(alchemy::deferred_numeric_api("_dgesdd$NEWLAPACK").empty() && !alchemy::deferred_numeric_api("_dgesdd$NEWLAPACK$ILP64").empty(),
+            "only the ILP64 interface is deferred");
 }
 void helpers(bool jit) {
     Fixture f(jit);

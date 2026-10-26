@@ -1,4 +1,5 @@
 #include "alchemy/darwin_numeric.hpp"
+#include "alchemy/darwin/accelerate/lapack.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -501,15 +502,9 @@ template<class T> void install_type(ProcessContext& context, char precision) {
     install(std::string(1, precision) + "gesv", gesv<T>); install(std::string(1, precision) + "potrf", potrf<T>);
     install(std::string(1, precision) + "gelsd", gelsd<T>);
 }
-constexpr std::string_view deferred[] = {"_cgesdd$NEWLAPACK", "_cheevd$NEWLAPACK",
-    "_dgeev$NEWLAPACK", "_dgeqrf$NEWLAPACK", "_dgesdd$NEWLAPACK", "_dorgqr$NEWLAPACK", "_dsyevd$NEWLAPACK",
-    "_sgeev$NEWLAPACK", "_sgesdd$NEWLAPACK", "_ssyevd$NEWLAPACK",
-    "_zgeev$NEWLAPACK", "_zgeqrf$NEWLAPACK", "_zgesdd$NEWLAPACK", "_zheevd$NEWLAPACK", "_zungqr$NEWLAPACK"};
 } // namespace
 
 std::string_view deferred_numeric_api(std::string_view symbol) {
-    for (const auto name : deferred) if (name == symbol)
-        return "LAPACK decomposition driver is outside Alchemy's BLAS/LU/Cholesky/least-squares numeric profile";
     if (symbol.find("$ILP64") != std::string_view::npos) return "Accelerate ILP64 integer ABI is unsupported; numeric replacements implement LP64";
     return {};
 }
@@ -518,8 +513,8 @@ void install_darwin_numeric_math(ProcessContext& context);
 void install_darwin_numeric(ProcessContext& context) {
     install_type<float>(context, 's'); install_type<double>(context, 'd');
     install_type<std::complex<float>>(context, 'c'); install_type<std::complex<double>>(context, 'z');
-    for (const auto symbol : deferred) static_cast<void>(context.install_function(std::string(symbol),
-        [name = std::string(symbol)](auto&, auto&) { fail(name + ": " + std::string(deferred_numeric_api(name))); }, std::string(accelerate)));
+    // The LAPACK decomposition drivers are Accelerate's (darwin/accelerate/lapack.cpp).
+    accelerate::install_accelerate_lapack(context, numeric_floating_handler);
     install_darwin_numeric_math(context);
 }
 
