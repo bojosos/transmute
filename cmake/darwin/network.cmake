@@ -33,6 +33,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/network/net_service.cpp
     src/alchemy/darwin/network/install.cpp
     src/alchemy/darwin/network/network_framework.cpp
+    src/alchemy/darwin/network/nw_connections.cpp
     src/alchemy/darwin/network/cfsocket_fx.cpp)
 # Headless shell (darwin/foundation/headless_shells.hpp): alchemy.exe's CFSocket
 # placeholders; in alchemy-fx socket.cpp owns CFSocket (cfsocket_fx.cpp is empty).

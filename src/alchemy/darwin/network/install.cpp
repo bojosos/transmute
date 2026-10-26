@@ -28,6 +28,7 @@ void install_network(InstallContext& context) {
     network::install_resolver(urls->b);
     network::install_dns_sd(urls->b);
     network::install_net_services(urls->b);
+    network::install_network_connections(urls->b);
 }
 
 void install_network_framework(values::Provider& frameworks) { frameworks.install_network(); }

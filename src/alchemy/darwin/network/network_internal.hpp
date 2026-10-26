@@ -133,4 +133,7 @@ inline constexpr std::int64_t unknown = -1, cancelled = -999, bad_url = -1000, t
     certificate_untrusted = -1202, client_certificate_required = -1206, cannot_create_file = -3000, cannot_write_file = -3003;
 } // namespace url_error
 
+// Network.framework connections, listeners, endpoints, parameters and browsing (nw_connections.cpp).
+void install_network_connections(std::shared_ptr<security::Bridge> bridge);
+
 } // namespace alchemy::gui::network
