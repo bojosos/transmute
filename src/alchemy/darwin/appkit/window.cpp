@@ -602,6 +602,15 @@ Size AppKit::will_resize(WindowId id, Size proposed) {
     const auto target = window_for_id(id);
     if (!target) return proposed;
     const auto state = window_state(target);
+    // The aspect ratio keeps the width the user chose and derives the height.
+    if (const auto ratio = state->content_aspect_ratio; ratio.width > 0 && ratio.height > 0) {
+        proposed.height = proposed.width * ratio.height / ratio.width;
+    } else if (const auto frame_ratio = state->aspect_ratio; frame_ratio.width > 0 && frame_ratio.height > 0) {
+        auto& server = require_window_server("-[NSWindow aspectRatio]");
+        const auto frame = server.frame_for_content({{0, 0}, proposed}, state->style).size;
+        const double chrome = frame.height - proposed.height;
+        proposed.height = std::max(0.0, frame.width * frame_ratio.height / frame_ratio.width - chrome);
+    }
     if (!state->delegate || !responds(state->delegate, "windowWillResize:toSize:")) return proposed;
     auto& server = require_window_server("windowWillResize:toSize:");
     // The delegate works in frame sizes; the window server in content sizes.
@@ -1470,6 +1479,139 @@ bool AppKit::set_frame_from_string(Address target, std::string_view text) {
     registers.x[2] = 1;   // display
     static_cast<void>(send(target, "setFrame:display:", registers));
     return true;
+}
+
+namespace {
+// The screen a window is on (its server window's), else the main screen; nullopt without screens.
+std::optional<ScreenInfo> window_screen_info(AppKit& kit, Address target) {
+    auto& server = require_window_server("NSWindow screen geometry");
+    const auto list = server.screens();
+    if (list.empty()) return std::nullopt;
+    const auto state = kit.window_state(target);
+    const auto id = state->id ? server.window_screen(state->id) : 0;
+    for (const auto& info : list) if (info.id == id) return info;
+    return list.front();
+}
+} // namespace
+
+void AppKit::install_window_geometry() {
+    const auto w = window;
+    // Frame constraints: the top edge stays on the screen's visible frame and
+    // a frame taller than it is shortened to fit.
+    method(w, "constrainFrameRect:toScreen:", [this](CpuState& s, GuestMemory&) {
+        auto frame = rect_arg(s);
+        Rect visible;
+        if (const auto screen_object = s.x[2]) {
+            visible = result_rect(send(screen_object, "visibleFrame"));
+        } else if (const auto info = window_screen_info(*this, s.x[0])) {
+            visible = info->visible_frame;
+        } else {
+            return_rect(s, frame);
+            return;
+        }
+        const double top = visible.origin.y + visible.size.height;
+        if (frame.size.height > visible.size.height) {
+            frame.origin.y += frame.size.height - visible.size.height;
+            frame.size.height = visible.size.height;
+        }
+        if (frame.origin.y + frame.size.height > top) frame.origin.y = top - frame.size.height;
+        return_rect(s, frame);
+    }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:{CGRect={CGPoint=dd}{CGSize=dd}}@");
+    // Cascading: the window's top-left goes to the point ({0, 0}: where it
+    // is), kept on the visible frame, and the next window's point is one
+    // titlebar height to the right and down.
+    method(w, "cascadeTopLeftFromPoint:", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto frame = result_rect(send(self, "frame"));
+        const auto content = content_rect(self);
+        const double step = std::max(frame.size.height - content.size.height, 16.0);
+        auto point = point_arg(s);
+        if (point.x == 0 && point.y == 0) point = {frame.origin.x, frame.origin.y + frame.size.height};
+        if (const auto info = window_screen_info(*this, self)) {
+            const auto& visible = info->visible_frame;
+            const double top = visible.origin.y + visible.size.height, right = visible.origin.x + visible.size.width;
+            if (point.y > top) point.y = top;
+            if (point.x < visible.origin.x) point.x = visible.origin.x;
+            // A window that would leave the visible frame starts again at its top-left corner.
+            if (point.y - frame.size.height < visible.origin.y || point.x + frame.size.width > right)
+                point = {visible.origin.x, top};
+        }
+        CallRegs registers;
+        put_point(registers, 0, point);
+        static_cast<void>(send(self, "setFrameTopLeftPoint:", registers));
+        return_point(s, {point.x + step, point.y - step});
+    }, "{CGPoint=dd}@:{CGPoint=dd}");
+    // Pixel alignment in screen points at the window's backing scale.
+    method(w, "backingAlignedRect:options:", [this](CpuState& s, GuestMemory&) {
+        return_rect(s, backing_aligned(rect_arg(s), backing_scale(s.x[0]), s.x[2]));
+    }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:{CGRect={CGPoint=dd}{CGSize=dd}}Q");
+    // The time a -setFrame:display:animate: to `frame` takes: the
+    // NSWindowResizeTime default (0.2 s) per 150 points of height change.
+    method(w, "animationResizeTime:", [this](CpuState& s, GuestMemory&) {
+        const auto current = result_rect(send(s.x[0], "frame"));
+        const auto wanted = rect_arg(s);
+        double per_step = 0.2;
+        if (const auto defaults_class = objc.find_class("NSUserDefaults")) {
+            const auto defaults = send(defaults_class, "standardUserDefaults").x0;
+            const auto key = auto_string("NSWindowResizeTime");
+            if (defaults && send_id(defaults, "objectForKey:", {key})) {
+                CallRegs registers;
+                registers.x[2] = key;
+                per_step = send(defaults, "doubleForKey:", registers).d(0);
+            }
+        }
+        set_d(s, 0, per_step * std::abs(wanted.size.height - current.size.height) / 150.0);
+    }, "d@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    // Aspect ratios (enforced by will_resize while the user resizes).
+    method(w, "aspectRatio", [this](CpuState& s, GuestMemory&) { return_size(s, window_state(s.x[0])->aspect_ratio); }, "{CGSize=dd}@:");
+    method(w, "setAspectRatio:", [this](CpuState& s, GuestMemory&) {
+        const auto state = window_state(s.x[0]);
+        state->aspect_ratio = size_arg(s);
+        state->content_aspect_ratio = {};
+    }, "v@:{CGSize=dd}");
+    method(w, "contentAspectRatio", [this](CpuState& s, GuestMemory&) { return_size(s, window_state(s.x[0])->content_aspect_ratio); }, "{CGSize=dd}@:");
+    method(w, "setContentAspectRatio:", [this](CpuState& s, GuestMemory&) {
+        const auto state = window_state(s.x[0]);
+        state->content_aspect_ratio = size_arg(s);
+        state->aspect_ratio = {};
+    }, "v@:{CGSize=dd}");
+    method(w, "canHide", [this](CpuState& s, GuestMemory&) { return_bool(s, window_state(s.x[0])->can_hide); }, "B@:");
+    method(w, "setCanHide:", [this](CpuState& s, GuestMemory&) { window_state(s.x[0])->can_hide = bool_arg(s, 2); }, "v@:B");
+    method(w, "toolbarStyle", [this](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(window_state(s.x[0])->toolbar_style); }, "q@:");
+    method(w, "setToolbarStyle:", [this](CpuState& s, GuestMemory&) { window_state(s.x[0])->toolbar_style = static_cast<std::int64_t>(s.x[2]); }, "v@:q");
+    // The window's place among the application's visible windows (0 front).
+    method(w, "orderedIndex", [this](CpuState& s, GuestMemory&) {
+        std::vector<Address> order;
+        { std::lock_guard lock(mutex); order = window_order; }
+        std::int64_t index = 0;
+        for (const auto target : order) {
+            if (target == s.x[0]) { s.x[0] = static_cast<Address>(index); return; }
+            if (window_state(target)->visible) ++index;
+        }
+        s.x[0] = static_cast<Address>(-1);
+    }, "q@:");
+    method(w, "setOrderedIndex:", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto wanted = static_cast<std::int64_t>(s.x[2]);
+        std::vector<Address> visible;
+        {
+            std::lock_guard lock(mutex);
+            for (const auto target : window_order)
+                if (target != self && window_state(target)->visible) visible.push_back(target);
+        }
+        if (wanted <= 0 || visible.empty()) { order_window(self, order_above, 0); return; }
+        const auto below = visible[std::min<std::size_t>(static_cast<std::size_t>(wanted), visible.size()) - 1];
+        order_window(self, order_below, window_state(below)->id);
+    }, "v@:q");
+    // The event queue is the application's.
+    method(w, "currentEvent", [this](CpuState& s, GuestMemory&) { s.x[0] = app ? send(app, "currentEvent").x0 : 0; });
+    method(w, "postEvent:atStart:", [this](CpuState& s, GuestMemory&) {
+        if (!app) fail("-[NSWindow postEvent:atStart:] before NSApplication exists");
+        static_cast<void>(send_id(app, "postEvent:atStart:", {s.x[2], s.x[3] & 0xff}));
+    }, "v@:@B");
+    method(w, "discardEventsMatchingMask:beforeEvent:", [this](CpuState& s, GuestMemory&) {
+        if (app) static_cast<void>(send_id(app, "discardEventsMatchingMask:beforeEvent:", {s.x[2], s.x[3]}));
+    }, "v@:Q@");
 }
 
 void AppKit::autosave_frame(Address target) {

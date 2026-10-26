@@ -269,10 +269,12 @@ void Provider::install_spelling() {
         std::lock_guard lock(state->mutex);
         state->identifies_languages = (s.x[2] & 0xff) != 0;
     }, false, "v@:B");
-    extend("NSSpellChecker", "uniqueSpellDocumentTag", [state](CpuState& s, GuestMemory&) {
-        std::lock_guard lock(state->mutex);
-        s.x[0] = static_cast<Address>(state->next_tag++);
-    }, false, "q@:");
+    // +uniqueSpellDocumentTag is the public form; the instance one answers the same counter.
+    for (const bool class_level : {true, false})
+        extend("NSSpellChecker", "uniqueSpellDocumentTag", [state](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(state->mutex);
+            s.x[0] = static_cast<Address>(state->next_tag++);
+        }, class_level, "q@:");
     extend("NSSpellChecker", "closeSpellDocumentWithTag:", [state](CpuState& s, GuestMemory&) {
         std::lock_guard lock(state->mutex);
         state->ignored.erase(static_cast<std::int64_t>(s.x[2]));

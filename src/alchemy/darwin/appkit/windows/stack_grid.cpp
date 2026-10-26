@@ -244,6 +244,24 @@ void remove_track(Address grid_view, bool row, std::size_t index) {
     invalidate_layout(grid_view, true);
 }
 
+// A row or column moves to `to`, its cells with it.
+void move_track(Address grid_view, bool row, std::size_t from, std::size_t to) {
+    const auto g = grid(grid_view);
+    auto& list = row ? g->rows : g->columns;
+    if (from >= list.size() || to >= list.size())
+        completion_kit::fail("NSGridView: no " + std::string(row ? "row" : "column") + " " + std::to_string(std::max(from, to)));
+    if (from == to) return;
+    const auto move = [from, to](auto& values) {
+        auto value = values[from];
+        values.erase(values.begin() + static_cast<std::ptrdiff_t>(from));
+        values.insert(values.begin() + static_cast<std::ptrdiff_t>(to), value);
+    };
+    move(list);
+    if (row) move(g->cells);
+    else for (auto& line : g->cells) move(line);
+    invalidate_layout(grid_view, true);
+}
+
 std::pair<std::size_t, std::size_t> cell_position(const GridState& g, Address cell_object) {
     for (std::size_t i = 0; i < g.cells.size(); ++i)
         for (std::size_t j = 0; j < g.cells[i].size(); ++j)
@@ -612,6 +630,12 @@ void install_stack_and_grid(Support& support) {
     }, "@@:q@");
     k.method(g, "removeRowAtIndex:", [](CpuState& c, GuestMemory&) { remove_track(c.x[0], true, static_cast<std::size_t>(c.x[2])); }, "v@:q");
     k.method(g, "removeColumnAtIndex:", [](CpuState& c, GuestMemory&) { remove_track(c.x[0], false, static_cast<std::size_t>(c.x[2])); }, "v@:q");
+    k.method(g, "moveRowAtIndex:toIndex:", [](CpuState& c, GuestMemory&) {
+        move_track(c.x[0], true, static_cast<std::size_t>(c.x[2]), static_cast<std::size_t>(c.x[3]));
+    }, "v@:qq");
+    k.method(g, "moveColumnAtIndex:toIndex:", [](CpuState& c, GuestMemory&) {
+        move_track(c.x[0], false, static_cast<std::size_t>(c.x[2]), static_cast<std::size_t>(c.x[3]));
+    }, "v@:qq");
     k.method(g, "rowSpacing", [](CpuState& c, GuestMemory&) { set_d(c, 0, grid(c.x[0])->row_spacing); }, "d@:");
     k.method(g, "setRowSpacing:", [changed](CpuState& c, GuestMemory&) { grid(c.x[0])->row_spacing = d(c, 0); changed(c.x[0]); }, "v@:d");
     k.method(g, "columnSpacing", [](CpuState& c, GuestMemory&) { set_d(c, 0, grid(c.x[0])->column_spacing); }, "d@:");

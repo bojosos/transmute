@@ -94,6 +94,8 @@ void AppKit::install_alert() {
         if (const auto state = objc.find_host_state<AlertState>(s.x[0])) {
             release(std::exchange(state->accessory, 0));
             release(std::exchange(state->suppression_button, 0));
+            release(std::exchange(state->icon, 0));
+            for (const auto made : std::exchange(state->button_objects, {})) release(made);
         }
         static_cast<void>(objc.send_super(s.x[0], alert, sel("dealloc")));
     }, "v@:");
@@ -106,13 +108,31 @@ void AppKit::install_alert() {
         if (s.x[2] > alert_critical) fail("-[NSAlert setAlertStyle:] with an unknown style " + std::to_string(s.x[2]));
         alert_of(s.x[0])->style = s.x[2];
     }, "v@:Q");
-    // NSButton is not provided: the button exists as its title, and the
-    // method answers nil (messages to the button are no-ops on nil, as for
-    // any absent object; there is no stand-in button).
+    // Each button is an NSButton tagged with its response
+    // (NSAlertFirstButtonReturn + index); the first answers Return and a
+    // "Cancel" button Escape. The task dialog shows the buttons' titles.
     method(al, "addButtonWithTitle:", [this, alert_of](CpuState& s, GuestMemory&) {
-        alert_of(s.x[0])->buttons.push_back(text(s.x[2]));
-        s.x[0] = 0;
+        const auto state = alert_of(s.x[0]);
+        const auto index = state->button_objects.size();
+        const auto made = send(button, "alloc").x0;
+        CallRegs frame;
+        put_rect(frame, 0, {{0, 0}, {82, 32}});
+        const auto value = send(made, "initWithFrame:", frame).x0;
+        static_cast<void>(send_id(value, "setTitle:", {s.x[2]}));
+        static_cast<void>(send_id(value, "setTag:", {static_cast<Address>(first_button + index)}));
+        const auto title = text(s.x[2]);
+        if (index == 0) static_cast<void>(send_id(value, "setKeyEquivalent:", {auto_string("\r")}));
+        else if (title == "Cancel") static_cast<void>(send_id(value, "setKeyEquivalent:", {auto_string("\x1b")}));
+        state->buttons.push_back(title);
+        state->button_objects.push_back(value);
+        s.x[0] = value;
     });
+    method(al, "buttons", [this, alert_of](CpuState& s, GuestMemory&) { s.x[0] = auto_array(alert_of(s.x[0])->button_objects); });
+    method(al, "icon", [this, alert_of](CpuState& s, GuestMemory&) {
+        const auto value = alert_of(s.x[0])->icon;
+        s.x[0] = value ? value : send_id(image, "imageNamed:", {auto_string("NSApplicationIcon")});
+    });
+    method(al, "setIcon:", [this, alert_of](CpuState& s, GuestMemory&) { assign(alert_of(s.x[0])->icon, s.x[2]); }, "v@:@");
     method(al, "accessoryView", [alert_of](CpuState& s, GuestMemory&) { s.x[0] = alert_of(s.x[0])->accessory; });
     method(al, "setAccessoryView:", [this, alert_of](CpuState& s, GuestMemory&) { assign(alert_of(s.x[0])->accessory, s.x[2]); }, "v@:@");
     // The help button needs a help anchor or delegate; Windows has neither.
@@ -150,40 +170,55 @@ void AppKit::install_alert() {
         state->message = text(send(error, "localizedDescription").x0);
         if (const auto suggestion = send(error, "localizedRecoverySuggestion").x0) state->informative = text(suggestion);
         if (const auto options = send(error, "localizedRecoveryOptions").x0)
-            for (const auto option : items(options)) state->buttons.push_back(text(option));
+            for (const auto option : items(options)) static_cast<void>(send_id(made, "addButtonWithTitle:", {option}));
         state->style = alert_warning;
         s.x[0] = made;
     });
     // A sheet on `window`: the alert is shown (application-modal task dialog
-    // owned by the window) once the current event finishes, then the
-    // completion handler gets the response, as an asynchronous sheet does.
-    method(al, "beginSheetModalForWindow:completionHandler:", [this](CpuState& s, GuestMemory&) {
-        const auto self = retain(s.x[0]);
-        const auto handler = s.x[3] ? guest_call(libsystem_library, "__Block_copy", {s.x[3]}) : 0;
+    // owned by the window) once the current event finishes, then `done`
+    // gets the response, as an asynchronous sheet does. `cleanup` runs once
+    // either way.
+    const auto run_as_sheet = [this](Address alert_object, std::string_view operation, std::function<void(Address)> done,
+                                     std::function<void()> cleanup) {
         auto* loop = run_loop_or_null();
-        if (!loop) fail("-[NSAlert beginSheetModalForWindow:completionHandler:] needs the main run loop");
+        if (!loop) { cleanup(); fail(std::string(operation) + " needs the main run loop"); }
+        const auto self = retain(alert_object);
         auto source = std::make_shared<SourceId>();
-        *source = loop->add_source(common_modes, [this, self, handler, source, loop] {
+        *source = loop->add_source(common_modes, [this, self, source, loop, done = std::move(done), cleanup = std::move(cleanup)] {
             loop->remove_source(*source);
-            Address response{};
             try {
-                response = send(self, "runModal").x0;
+                const auto response = send(self, "runModal").x0;
+                release(self);
+                done(response);
             } catch (...) {
                 release(self);
-                if (handler) static_cast<void>(guest_call(libsystem_library, "__Block_release", {handler}));
+                cleanup();
                 throw;
             }
-            release(self);
-            if (handler) {
-                try { static_cast<void>(invoke_block(handler, {response})); } catch (...) {
-                    static_cast<void>(guest_call(libsystem_library, "__Block_release", {handler}));
-                    throw;
-                }
-                static_cast<void>(guest_call(libsystem_library, "__Block_release", {handler}));
-            }
+            cleanup();
         });
         loop->signal_source(*source);
+    };
+    method(al, "beginSheetModalForWindow:completionHandler:", [this, run_as_sheet](CpuState& s, GuestMemory&) {
+        const auto handler = s.x[3] ? guest_call(libsystem_library, "__Block_copy", {s.x[3]}) : 0;
+        run_as_sheet(s.x[0], "-[NSAlert beginSheetModalForWindow:completionHandler:]",
+            [this, handler](Address response) { if (handler) static_cast<void>(invoke_block(handler, {response})); },
+            [this, handler] { if (handler) static_cast<void>(guest_call(libsystem_library, "__Block_release", {handler})); });
     }, "v@:@@?");
+    // The delegate form: -alertDidEnd:returnCode:contextInfo: (any selector
+    // of that shape) goes to the delegate with the alert and the response.
+    method(al, "beginSheetModalForWindow:modalDelegate:didEndSelector:contextInfo:", [this, run_as_sheet](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], delegate = s.x[3], selector = s.x[4], context = s.x[5];
+        run_as_sheet(self, "-[NSAlert beginSheetModalForWindow:modalDelegate:didEndSelector:contextInfo:]",
+            [this, self, delegate, selector, context](Address response) {
+                if (!delegate || !selector) return;
+                CallRegs registers;
+                registers.x[2] = self;
+                registers.x[3] = response;
+                registers.x[4] = context;
+                static_cast<void>(objc.send(delegate, selector, registers));
+            }, [] {});
+    }, "v@:@@:^v");
 
     method(al, "runModal", [this, alert_of](CpuState& s, GuestMemory&) {
         const auto state = alert_of(s.x[0]);
@@ -191,6 +226,8 @@ void AppKit::install_alert() {
         request.message = state->message;
         request.informative = state->informative;
         request.buttons = state->buttons;
+        for (std::size_t index = 0; index < state->button_objects.size() && index < request.buttons.size(); ++index)
+            request.buttons[index] = text(send(state->button_objects[index], "title").x0);
         if (request.buttons.empty()) request.buttons.emplace_back("OK");   // AppKit adds "OK"
         request.style = state->style;
         bool suppressed{};

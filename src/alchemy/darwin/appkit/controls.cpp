@@ -208,7 +208,7 @@ void AppKit::install_controls() {
             for (auto* slot : {&state->contents, &state->title, &state->alternate_title, &state->image, &state->alternate_image,
                      &state->key_equivalent, &state->placeholder, &state->font, &state->background_color, &state->text_color,
                      &state->represented, &state->formatter, &state->menu, &state->attributed_title, &state->title_color,
-                     &state->content_tint})
+                     &state->content_tint, &state->bezel_color, &state->sound})
                 release(std::exchange(*slot, 0));
         if (const auto state = objc.find_host_state<CellState>(s.x[0]))
             for (const auto item : std::exchange(state->combo_items, {})) release(item);
@@ -220,7 +220,7 @@ void AppKit::install_controls() {
         auto to = std::make_shared<CellState>(*from);
         for (auto* slot : {&to->contents, &to->title, &to->alternate_title, &to->image, &to->alternate_image, &to->key_equivalent,
                  &to->placeholder, &to->font, &to->background_color, &to->text_color, &to->represented, &to->formatter, &to->menu,
-                 &to->attributed_title, &to->title_color, &to->content_tint})
+                 &to->attributed_title, &to->title_color, &to->content_tint, &to->bezel_color, &to->sound})
             *slot = retain(*slot);
         for (auto& item : to->combo_items) item = retain(item);
         // Subclass state is the subclass's to copy (its -copyWithZone: after super's).
@@ -295,6 +295,8 @@ void AppKit::install_controls() {
     flag("usesSingleLineMode", "setUsesSingleLineMode:", &CellState::single_line);
     flag("truncatesLastVisibleLine", "setTruncatesLastVisibleLine:", &CellState::truncates_last_line);
     flag("showsFirstResponder", "setShowsFirstResponder:", &CellState::shows_first_responder);
+    flag("allowsUndo", "setAllowsUndo:", &CellState::allows_undo);
+    flag("refusesFirstResponder", "setRefusesFirstResponder:", &CellState::refuses_first_responder);
     const auto integer = [this, cs, changed](const char* getter, const char* setter, std::int64_t CellState::*member) {
         method(cell, getter, [cs, member](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>((*cs(s.x[0])).*member); }, "q@:");
         method(cell, setter, [cs, changed, member](CpuState& s, GuestMemory&) {
@@ -303,6 +305,16 @@ void AppKit::install_controls() {
         }, "v@:q");
     };
     integer("tag", "setTag:", &CellState::tag);
+    integer("baseWritingDirection", "setBaseWritingDirection:", &CellState::writing_direction);
+    integer("userInterfaceLayoutDirection", "setUserInterfaceLayoutDirection:", &CellState::layout_direction);
+    integer("backgroundStyle", "setBackgroundStyle:", &CellState::background_style);
+    // The style the cell's interior draws with is the one it was given.
+    method(c, "interiorBackgroundStyle", [cs](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(cs(s.x[0])->background_style); }, "q@:");
+    // -compare: orders cells by their string values.
+    method(c, "compare:", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[2] || !is_kind(s.x[2], cell)) fail("-[NSCell compare:] with an object that is not a cell");
+        s.x[0] = send_id(send(s.x[0], "stringValue").x0, "compare:", {send(s.x[2], "stringValue").x0});
+    }, "q@:@");
     method(c, "alignment", [cs](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(alignment_to_guest(cs(s.x[0])->alignment)); }, "q@:");
     method(c, "setAlignment:", [cs, changed](CpuState& s, GuestMemory&) {
         cs(s.x[0])->alignment = alignment_from_guest(static_cast<std::int64_t>(s.x[2]));
@@ -354,6 +366,8 @@ void AppKit::install_controls() {
     object("placeholderString", "setPlaceholderString:", &CellState::placeholder, true);
     object("backgroundColor", "setBackgroundColor:", &CellState::background_color, false);
     object("textColor", "setTextColor:", &CellState::text_color, false);
+    // The cell's contextual menu (NSPopUpButtonCell keeps its items in the same slot).
+    object("menu", "setMenu:", &CellState::menu, false);
     method(c, "title", [this, cs](CpuState& s, GuestMemory&) {
         const auto state = cs(s.x[0]);
         s.x[0] = state->title ? state->title : auto_string(drawing::utf8(cell_text(*this, s.x[0])));
@@ -375,7 +389,7 @@ void AppKit::install_controls() {
     }, "q@:Q");
     method(c, "acceptsFirstResponder", [cs](CpuState& s, GuestMemory&) {
         const auto state = cs(s.x[0]);
-        return_bool(s, state->enabled && (state->editable || state->selectable));
+        return_bool(s, state->enabled && !state->refuses_first_responder && (state->editable || state->selectable));
     }, "B@:");
     method(c, "keyEquivalent", [this, cs](CpuState& s, GuestMemory&) {
         const auto key = cs(s.x[0])->key_equivalent;
@@ -520,9 +534,15 @@ void AppKit::install_controls() {
              {"setControlSize:", "v@:Q"}, {"setContinuous:", "v@:B"}, {"setUsesSingleLineMode:", "v@:B"},
              {"setFormatter:", "v@:@"}, {"setHighlighted:", "v@:B"}})
         forward_cell(name, types, true);
-    // NSWritingDirectionNatural, not the cell's.
-    method(k, "baseWritingDirection", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(-1); }, "q@:");
-    method(k, "setBaseWritingDirection:", [](CpuState&, GuestMemory&) {}, "v@:q");
+    // The cell's writing direction; NSWritingDirectionNatural without a cell.
+    method(k, "baseWritingDirection", [this, ctl](CpuState& s, GuestMemory&) {
+        const auto c2 = ctl(s.x[0])->cell;
+        s.x[0] = c2 ? send(c2, "baseWritingDirection").x0 : static_cast<Address>(-1);
+    }, "q@:");
+    method(k, "setBaseWritingDirection:", [this, ctl](CpuState& s, GuestMemory&) {
+        if (const auto c2 = ctl(s.x[0])->cell) static_cast<void>(send_id(c2, "setBaseWritingDirection:", {s.x[2]}));
+        invalidate_view(s.x[0]);
+    }, "v@:q");
     method(k, "target", [ctl, cs](CpuState& s, GuestMemory&) {
         const auto state = ctl(s.x[0]);
         s.x[0] = state->cell ? cs(state->cell)->target : state->target;
@@ -549,6 +569,23 @@ void AppKit::install_controls() {
         s.x[0] = c2 ? send_id(c2, "sendActionOn:", {s.x[2]}) : 0;
     }, "q@:Q");
     method(k, "sendAction:to:", [this](CpuState& s, GuestMemory&) { return_bool(s, s.x[2] && send_action(s.x[2], s.x[3], s.x[0])); }, "B@::@");
+    // The field editor asks its control before editing starts or ends; the
+    // control asks its delegate (-control:textShould{Begin,End}Editing:),
+    // and agrees when the delegate does not answer.
+    for (const auto* name : {"Begin", "End"}) {
+        const std::string phase = name;
+        method(k, "textShould" + phase + "Editing:", [this, phase](CpuState& s, GuestMemory&) {
+            const auto self = s.x[0];
+            const auto delegate = responds(self, "delegate") ? send(self, "delegate").x0 : 0;
+            const auto ask = "control:textShould" + phase + "Editing:";
+            s.x[0] = delegate && responds(delegate, ask) ? send_id(delegate, ask, {self, s.x[2]}) & 0xff : 1;
+        }, "B@:@");
+    }
+    // The tag of the selected cell (-1 without one).
+    method(k, "selectedTag", [this](CpuState& s, GuestMemory&) {
+        const auto selected = send(s.x[0], "selectedCell").x0;
+        s.x[0] = selected ? send(selected, "tag").x0 : static_cast<Address>(-1);
+    }, "q@:");
     method(k, "refusesFirstResponder", [ctl](CpuState& s, GuestMemory&) { return_bool(s, ctl(s.x[0])->refuses_first_responder); }, "B@:");
     method(k, "setRefusesFirstResponder:", [ctl](CpuState& s, GuestMemory&) { ctl(s.x[0])->refuses_first_responder = bool_arg(s, 2); }, "v@:B");
     method(k, "acceptsFirstResponder", [this, ctl](CpuState& s, GuestMemory&) {
@@ -977,6 +1014,35 @@ void AppKit::install_buttons() {
             if (const auto target = control_cell(*this, s.x[0])) static_cast<void>(send_id(target, "setContentTintColor:", {s.x[2]}));
         }, "v@:@");
     }
+    // The bezel colour, the image hugging the title, and the click sound,
+    // kept by the cell; the button forwards them.
+    method(button_cell, "bezelColor", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->bezel_color; });
+    method(button_cell, "setBezelColor:", [this, cs](CpuState& s, GuestMemory&) {
+        assign(cs(s.x[0])->bezel_color, s.x[2]);
+        if (const auto owner = cs(s.x[0])->control_view) invalidate_view(owner);
+    }, "v@:@");
+    method(button_cell, "imageHugsTitle", [cs](CpuState& s, GuestMemory&) { return_bool(s, cs(s.x[0])->image_hugs_title); }, "B@:");
+    method(button_cell, "setImageHugsTitle:", [this, cs](CpuState& s, GuestMemory&) {
+        cs(s.x[0])->image_hugs_title = bool_arg(s, 2);
+        if (const auto owner = cs(s.x[0])->control_view) invalidate_view(owner);
+    }, "v@:B");
+    method(button_cell, "sound", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->sound; });
+    method(button_cell, "setSound:", [this, cs](CpuState& s, GuestMemory&) { assign(cs(s.x[0])->sound, s.x[2]); }, "v@:@");
+    for (const auto& [name, types] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"bezelColor", "@@:"}, {"imageHugsTitle", "B@:"}, {"sound", "@@:"}}) {
+        const std::string getter = name;
+        method(n, getter, [this, getter](CpuState& s, GuestMemory&) {
+            const auto target = control_cell(*this, s.x[0]);
+            s.x[0] = target ? send(target, getter).x0 : 0;
+        }, types);
+    }
+    for (const auto& [name, types] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"setBezelColor:", "v@:@"}, {"setImageHugsTitle:", "v@:B"}, {"setSound:", "v@:@"}}) {
+        const std::string setter = name;
+        method(n, setter, [this, setter](CpuState& s, GuestMemory&) {
+            if (const auto target = control_cell(*this, s.x[0])) static_cast<void>(send_id(target, setter, {s.x[2]}));
+        }, types);
+    }
     method(button_cell, "setShowsBorderOnlyWhileMouseInside:", [](CpuState&, GuestMemory&) {}, "v@:B");
     method(n, "setShowsBorderOnlyWhileMouseInside:", [](CpuState&, GuestMemory&) {}, "v@:B");
     method(n, "highlight:", [this](CpuState& s, GuestMemory&) {
@@ -998,6 +1064,17 @@ void AppKit::install_buttons() {
             s.x[0] = autorelease(made);
         });
     }
+    // The image beside the title (leading); image-only buttons are controls/small.cpp's.
+    class_method(n, "buttonWithTitle:image:target:action:", [this](CpuState& s, GuestMemory&) {
+        const auto made = send(send(s.x[0], "alloc").x0, "initWithFrame:", [] { CallRegs r; put_rect(r, 0, {{0, 0}, {80, 32}}); return r; }()).x0;
+        static_cast<void>(send_id(made, "setTitle:", {s.x[2]}));
+        static_cast<void>(send_id(made, "setImage:", {s.x[3]}));
+        static_cast<void>(send_id(made, "setImagePosition:", {7}));   // NSImageLeading
+        static_cast<void>(send_id(made, "setTarget:", {s.x[4]}));
+        static_cast<void>(send_id(made, "setAction:", {s.x[5]}));
+        static_cast<void>(send(made, "sizeToFit"));
+        s.x[0] = autorelease(made);
+    });
     // A completed click toggles the state (by button type), turns sibling
     // radio buttons with the same action off, then sends the action.
     method(n, "_alchemyClicked", [this](CpuState& s, GuestMemory&) {
@@ -1020,6 +1097,7 @@ void AppKit::install_buttons() {
                     static_cast<void>(send_id(sibling, "setState:", {static_cast<Address>(state_off)}));
                 }
         }
+        if (state->sound) static_cast<void>(send_optional(state->sound, "play"));
         static_cast<void>(send_id(self, "sendAction:to:", {state->action, state->target}));
     }, "v@:");
     // Key equivalents (the default button's Return, Escape for Cancel).
@@ -1067,7 +1145,7 @@ void AppKit::install_text_fields() {
     });
     method(t, "acceptsFirstResponder", [cs](CpuState& s, GuestMemory&) {
         const auto state = cs(s.x[0]);
-        return_bool(s, state->enabled && (state->editable || state->selectable));
+        return_bool(s, state->enabled && !state->refuses_first_responder && (state->editable || state->selectable));
     }, "B@:");
     method(t, "bezelStyle", [cs](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(cs(s.x[0])->frame_style_bezel ? 1 : 0); }, "Q@:");
     method(t, "setBezelStyle:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->frame_style_bezel = s.x[2] == 1; }, "v@:Q");
@@ -1218,8 +1296,6 @@ void AppKit::install_text_fields() {
         if (!extension<ControlState>(s.x[0])->editor) static_cast<void>(send_id(owner, "makeFirstResponder:", {s.x[0]}));
         if (const auto editor = extension<ControlState>(s.x[0])->editor) static_cast<void>(send_id(editor, "selectAll:", {0}));
     }, "v@:@");
-    method(f, "textShouldBeginEditing:", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:@");
-    method(f, "textShouldEndEditing:", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:@");
     method(f, "textDidBeginEditing:", [this](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         post("NSControlTextDidBeginEditingNotification", self, extension<ControlState>(self)->delegate, "controlTextDidBeginEditing:");
@@ -1473,6 +1549,8 @@ void AppKit::install_simple_views() {
     method(x, "borderColor", [bx](CpuState& s, GuestMemory&) { s.x[0] = bx(s.x[0])->border_color; });
     method(x, "setBorderColor:", [this, bx](CpuState& s, GuestMemory&) { assign(bx(s.x[0])->border_color, s.x[2]); invalidate_view(s.x[0]); }, "v@:@");
     method(x, "cornerRadius", [bx](CpuState& s, GuestMemory&) { set_d(s, 0, bx(s.x[0])->corner_radius); }, "d@:");
+    method(x, "borderWidth", [bx](CpuState& s, GuestMemory&) { set_d(s, 0, bx(s.x[0])->border_width); }, "d@:");
+    method(x, "setBorderWidth:", [this, bx](CpuState& s, GuestMemory&) { bx(s.x[0])->border_width = std::max(0.0, d(s, 0)); invalidate_view(s.x[0]); }, "v@:d");
     method(x, "setCornerRadius:", [this, bx](CpuState& s, GuestMemory&) { bx(s.x[0])->corner_radius = d(s, 0); invalidate_view(s.x[0]); }, "v@:d");
     method(x, "isTransparent", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
     method(x, "setTransparent:", [this, bx](CpuState& s, GuestMemory&) {
@@ -1524,6 +1602,21 @@ void AppKit::install_simple_views() {
             canvas.fill_path(path, fill);
             return;
         }
+        if (state->box_type == 4) {
+            // A custom box: its fill, then its border at the border width.
+            drawing::Path path;
+            path.add_rounded_rect(frame, radius, radius);
+            canvas.fill_path(path, fill);
+            if (const auto width = state->border_width; width > 0) {
+                const auto half = width / 2;
+                const Rect edge{{frame.origin.x + half, frame.origin.y + half},
+                                {std::max(0.0, frame.size.width - width), std::max(0.0, frame.size.height - width)}};
+                drawing::Path outline;
+                outline.add_rounded_rect(edge, std::max(0.0, radius - half), std::max(0.0, radius - half));
+                canvas.stroke_path(outline, border, width);
+            }
+            return;
+        }
         draw_bezel(*this, frame, radius, fill, border);
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
 
@@ -1568,6 +1661,24 @@ void AppKit::install_simple_views() {
 }
 
 // ---- NSPopUpButtonCell / NSPopUpButton and popup menus -----------------------------------------
+// The rows of a popup menu window: item index per y range (flipped view coordinates).
+namespace {
+struct MenuRow { std::int64_t index; double top, bottom; bool enabled; };
+std::vector<MenuRow> menu_rows(AppKit& kit, Address target_menu) {
+    std::vector<MenuRow> rows;
+    double y = 5;
+    const auto list = kit.objc.host_state<MenuState>(target_menu)->items;
+    for (std::size_t i = 0; i < list.size(); ++i) {
+        const auto entry = kit.objc.host_state<MenuItemState>(list[i]);
+        if (entry->hidden) continue;
+        if (entry->separator) { y += 11; continue; }
+        rows.push_back({static_cast<std::int64_t>(i), y, y + 22, entry->enabled});
+        y += 22;
+    }
+    return rows;
+}
+} // namespace
+
 void AppKit::install_popups() {
     const auto cs = [this](Address value) { return cell_state(*this, value); };
     const auto pc = popup_button_cell;
@@ -1617,6 +1728,15 @@ void AppKit::install_popups() {
         const auto sender = state->control_view ? state->control_view : self;
         static_cast<void>(send_action(state->action, state->target, sender));
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}@");
+    method(pc, "itemArray", [this, items_of](CpuState& s, GuestMemory&) { s.x[0] = auto_array(items_of(s.x[0])); });
+    method(pc, "numberOfItems", [items_of](CpuState& s, GuestMemory&) { s.x[0] = items_of(s.x[0]).size(); }, "q@:");
+    method(pc, "preferredEdge", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->preferred_edge; }, "Q@:");
+    method(pc, "setPreferredEdge:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->preferred_edge = s.x[2]; }, "v@:Q");
+    // Item enabling and the state column are the menu's.
+    method(pc, "autoenablesItems", [this, menu_of](CpuState& s, GuestMemory&) { s.x[0] = send(menu_of(s.x[0]), "autoenablesItems").x0; }, "B@:");
+    method(pc, "setAutoenablesItems:", [this, menu_of](CpuState& s, GuestMemory&) {
+        static_cast<void>(send_id(menu_of(s.x[0]), "setAutoenablesItems:", {s.x[2] & 0xff}));
+    }, "v@:B");
     method(pc, "pullsDown", [cs](CpuState& s, GuestMemory&) { return_bool(s, cs(s.x[0])->pulls_down); }, "B@:");
     method(pc, "setPullsDown:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->pulls_down = bool_arg(s, 2); }, "v@:B");
     method(pc, "indexOfSelectedItem", [cs](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(cs(s.x[0])->selected_item); }, "q@:");
@@ -1805,10 +1925,15 @@ void AppKit::install_popups() {
         static_cast<void>(send_id(s.x[0], "selectItemWithTitle:", {s.x[2]}));
     }, "v@:@");
     method(p, "synchronizeTitleAndSelectedItem", [this](CpuState& s, GuestMemory&) { invalidate_view(s.x[0]); }, "v@:");
-    method(p, "autoenablesItems", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
-    method(p, "setAutoenablesItems:", [](CpuState&, GuestMemory&) {}, "v@:B");
-    method(p, "setPreferredEdge:", [](CpuState&, GuestMemory&) {}, "v@:Q");
-    method(p, "preferredEdge", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "Q@:");
+    for (const auto& [name, types] : std::initializer_list<std::pair<const char*, const char*>>{{"autoenablesItems", "B@:"}, {"preferredEdge", "Q@:"}})
+        method(p, name, [this, pcell, name](CpuState& s, GuestMemory&) { s.x[0] = send(pcell(s.x[0]), name).x0; }, types);
+    for (const auto& [name, types] : std::initializer_list<std::pair<const char*, const char*>>{{"setAutoenablesItems:", "v@:B"}, {"setPreferredEdge:", "v@:Q"}})
+        method(p, name, [this, pcell, name](CpuState& s, GuestMemory&) { static_cast<void>(send_id(pcell(s.x[0]), name, {s.x[2]})); }, types);
+    method(p, "showsStateColumn", [this, popup_menu](CpuState& s, GuestMemory&) { s.x[0] = send(popup_menu(s.x[0]), "showsStateColumn").x0; }, "B@:");
+    method(p, "setShowsStateColumn:", [this, popup_menu](CpuState& s, GuestMemory&) {
+        static_cast<void>(send_id(popup_menu(s.x[0]), "setShowsStateColumn:", {s.x[2] & 0xff}));
+        invalidate_view(s.x[0]);
+    }, "v@:B");
     // A click pops the menu up over the button; choosing an item selects it
     // and sends the item's action, then the button's.
     method(p, "mouseDown:", [this, pcell, popup_menu](CpuState& s, GuestMemory&) {
@@ -1857,6 +1982,21 @@ void AppKit::install_popups() {
         const auto entry = objc.host_state<MenuItemState>(item);
         if (entry->action) static_cast<void>(send_action(entry->action, entry->target, item));
     }, "v@:@@@");
+    // The size of the menu as its popup window shows it: the widest title
+    // (and the minimum width), 22-point rows and 11-point separators.
+    method(menu, "size", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto state = objc.host_state<MenuState>(self);
+        const auto rows = menu_rows(*this, self);
+        TextStyle style;
+        style.font.size = 13;
+        double widest = state->minimum_width;
+        for (const auto item : state->items) {
+            const auto entry = objc.host_state<MenuItemState>(item);
+            if (!entry->hidden && !entry->separator) widest = std::max(widest, drawing::text_width(style.font, string16(entry->title)) + 44);
+        }
+        return_size(s, rows.empty() ? Size{widest, 0} : Size{std::ceil(widest), std::ceil(rows.back().bottom + 5)});
+    }, "{CGSize=dd}@:");
 
     // The popup menu window's view: draws the items of `tracking_menu`.
     method(menu_view, "isFlipped", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
@@ -1896,23 +2036,6 @@ void AppKit::install_popups() {
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
 }
 
-// The rows of a popup menu window: item index per y range (flipped view coordinates).
-namespace {
-struct MenuRow { std::int64_t index; double top, bottom; bool enabled; };
-std::vector<MenuRow> menu_rows(AppKit& kit, Address target_menu) {
-    std::vector<MenuRow> rows;
-    double y = 5;
-    const auto list = kit.objc.host_state<MenuState>(target_menu)->items;
-    for (std::size_t i = 0; i < list.size(); ++i) {
-        const auto entry = kit.objc.host_state<MenuItemState>(list[i]);
-        if (entry->hidden) continue;
-        if (entry->separator) { y += 11; continue; }
-        rows.push_back({static_cast<std::int64_t>(i), y, y + 22, entry->enabled});
-        y += 22;
-    }
-    return rows;
-}
-} // namespace
 
 std::int64_t AppKit::popup_menu_tracking(Address target_menu, Address anchor_view, Rect anchor, std::int64_t initial) {
     if (!target_menu) return -1;

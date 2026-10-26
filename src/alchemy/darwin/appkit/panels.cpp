@@ -111,16 +111,18 @@ struct ToolbarState final : ObjectPayload {
     bool visible{true}, customizable{}, autosaves{}, baseline_separator{true};
 };
 struct ToolbarItemState final : ObjectPayload {
-    Address identifier{}, label{}, palette_label{}, tool_tip{}, image{}, view{}, menu_form{};   // +1
+    Address identifier{}, label{}, palette_label{}, tool_tip{}, image{}, view{}, menu_form{}, title{};   // +1
     Address target{}, action{}, toolbar{};
-    std::int64_t tag{}, visibility_priority{};
+    std::int64_t tag{}, visibility_priority{}, style{};   // style: NSToolbarItemStyle
+    bool hidden{};
     Size min_size, max_size;
     bool enabled{true}, autovalidates{true}, bordered{};
 };
 struct SavePanelState final : ObjectPayload {
     Address directory{}, name{}, title{}, message{}, prompt{}, allowed_types{}, accessory{}, delegate{};   // +1 except delegate
-    Address name_label{}, content_types{};    // +1
+    Address name_label{}, content_types{}, tag_names{};   // +1
     std::vector<Address> results;             // +1 NSURLs chosen by the last run
+    bool can_select_hidden_extension{}, shows_tag_field{true}, running{};
     bool can_create_directories{true}, shows_hidden{}, extension_hidden{true}, can_choose_files{true}, can_choose_directories{};
     bool multiple{}, resolves_aliases{true}, treats_packages_as_directories{}, allows_other_types{};
 };
@@ -350,7 +352,8 @@ void AppKit::install_panels() {
     });
     method(toolbar_item, "dealloc", [this](CpuState& s, GuestMemory&) {
         if (const auto state = objc.find_host_state<ToolbarItemState>(s.x[0]))
-            for (auto* slot : {&state->identifier, &state->label, &state->palette_label, &state->tool_tip, &state->image, &state->view, &state->menu_form})
+            for (auto* slot : {&state->identifier, &state->label, &state->palette_label, &state->tool_tip, &state->image, &state->view,
+                     &state->menu_form, &state->title})
                 release(std::exchange(*slot, 0));
         static_cast<void>(objc.send_super(s.x[0], toolbar_item, sel("dealloc")));
     }, "v@:");
@@ -370,6 +373,13 @@ void AppKit::install_panels() {
     item_object("image", "setImage:", &ToolbarItemState::image, false);
     item_object("view", "setView:", &ToolbarItemState::view, false);
     item_object("menuFormRepresentation", "setMenuFormRepresentation:", &ToolbarItemState::menu_form, false);
+    item_object("title", "setTitle:", &ToolbarItemState::title, true);
+    method(toolbar_item, "isHidden", [ti](CpuState& s, GuestMemory&) { return_bool(s, ti(s.x[0])->hidden); }, "B@:");
+    method(toolbar_item, "setHidden:", [ti](CpuState& s, GuestMemory&) { ti(s.x[0])->hidden = bool_arg(s, 2); }, "v@:B");
+    method(toolbar_item, "style", [ti](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(ti(s.x[0])->style); }, "q@:");
+    method(toolbar_item, "setStyle:", [ti](CpuState& s, GuestMemory&) { ti(s.x[0])->style = static_cast<std::int64_t>(s.x[2]); }, "v@:q");
+    // Window toolbars are not shown, so no item is visible in one.
+    method(toolbar_item, "isVisible", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
     method(toolbar_item, "target", [ti](CpuState& s, GuestMemory&) { s.x[0] = ti(s.x[0])->target; });
     method(toolbar_item, "setTarget:", [ti](CpuState& s, GuestMemory&) { ti(s.x[0])->target = s.x[2]; }, "v@:@");
     method(toolbar_item, "action", [ti](CpuState& s, GuestMemory&) { s.x[0] = ti(s.x[0])->action; }, ":@:");
@@ -417,7 +427,7 @@ void AppKit::install_panels() {
             const auto state = found->second;
             panel_states.erase(found);
             for (auto* slot : {&state->directory, &state->name, &state->title, &state->message, &state->prompt,
-                     &state->allowed_types, &state->accessory, &state->name_label, &state->content_types})
+                     &state->allowed_types, &state->accessory, &state->name_label, &state->content_types, &state->tag_names})
                 release(std::exchange(*slot, 0));
             for (const auto url : std::exchange(state->results, {})) release(url);
         }
@@ -451,6 +461,9 @@ void AppKit::install_panels() {
     panel_object("prompt", "setPrompt:", &SavePanelState::prompt, true);
     panel_object("allowedFileTypes", "setAllowedFileTypes:", &SavePanelState::allowed_types, false);
     panel_object("accessoryView", "setAccessoryView:", &SavePanelState::accessory, false);
+    // Finder tags: the Windows file dialog has no tag field, so the tags are
+    // the ones the application set (none were entered).
+    panel_object("tagNames", "setTagNames:", &SavePanelState::tag_names, true);
     method(save_panel, "delegate", [sp](CpuState& s, GuestMemory&) { s.x[0] = sp(s.x[0])->delegate; });
     method(save_panel, "setDelegate:", [sp](CpuState& s, GuestMemory&) { sp(s.x[0])->delegate = s.x[2]; }, "v@:@");
     const auto panel_flag = [this, sp](Address cls, const char* getter, const char* setter, bool SavePanelState::*member) {
@@ -462,6 +475,17 @@ void AppKit::install_panels() {
     panel_flag(save_panel, "isExtensionHidden", "setExtensionHidden:", &SavePanelState::extension_hidden);
     panel_flag(save_panel, "treatsFilePackagesAsDirectories", "setTreatsFilePackagesAsDirectories:", &SavePanelState::treats_packages_as_directories);
     panel_flag(save_panel, "allowsOtherFileTypes", "setAllowsOtherFileTypes:", &SavePanelState::allows_other_types);
+    panel_flag(save_panel, "canSelectHiddenExtension", "setCanSelectHiddenExtension:", &SavePanelState::can_select_hidden_extension);
+    panel_flag(save_panel, "showsTagField", "setShowsTagField:", &SavePanelState::shows_tag_field);
+    // -ok: / -cancel: end a running panel; the Windows dialog cannot be
+    // ended from the application, and a panel that is not running has
+    // nothing to end.
+    for (const auto* name : {"ok:", "cancel:"}) {
+        const std::string selector = name;
+        method(save_panel, selector, [sp, selector](CpuState& s, GuestMemory&) {
+            if (sp(s.x[0])->running) unsupported("-[NSSavePanel " + selector + "] while the Windows file dialog is open");
+        }, "v@:@");
+    }
     panel_flag(open_panel, "canChooseFiles", "setCanChooseFiles:", &SavePanelState::can_choose_files);
     panel_flag(open_panel, "canChooseDirectories", "setCanChooseDirectories:", &SavePanelState::can_choose_directories);
     panel_flag(open_panel, "allowsMultipleSelection", "setAllowsMultipleSelection:", &SavePanelState::multiple);
@@ -481,6 +505,11 @@ void AppKit::install_panels() {
     method(save_panel, "runModal", [this, sp](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto state = sp(self);
+        struct Running {
+            SavePanelState& state;
+            explicit Running(SavePanelState& value) : state(value) { state.running = true; }
+            ~Running() { state.running = false; }
+        } running(*state);
         FileDialogRequest request;
         request.save = !is_kind(self, open_panel);
         request.title = text(state->title);

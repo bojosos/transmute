@@ -41,6 +41,7 @@ struct ClipState final : ObjectPayload {
 struct TabState final : ObjectPayload {
     std::vector<Address> items;                           // +1 NSTabViewItems
     std::int64_t selected{-1}, type{0};
+    std::uint64_t control_size{};                         // NSControlSize (regular)
     Address delegate{}, font{};                           // font +1
     bool draws_background{true};
 };
@@ -93,6 +94,7 @@ struct RowViewState final : ObjectPayload {
     std::int64_t row{-1};
     Address background_color{};                           // +1
     std::int64_t highlight_style{};                       // NSTableViewSelectionHighlightStyle
+    std::int64_t feedback_style{};                        // NSTableViewDraggingDestinationFeedbackStyle (regular)
     bool selected{}, emphasized{true}, group_row{}, floating{}, target_for_drop{};
 };
 struct IndexSetState final : ObjectPayload { std::set<std::uint64_t> values; };
@@ -919,6 +921,22 @@ void AppKit::install_tabs_and_splits() {
         invalidate_view(s.x[0]);
     }, "v@:@");
     method(tv, "tabViewItems", [this, tab_of](CpuState& s, GuestMemory&) { s.x[0] = auto_array(tab_of(s.x[0])->items); });
+    // Replaces every item (the first new one is selected, as on insertion).
+    method(tv, "setTabViewItems:", [this, tab_of](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto wanted = items(s.x[2]);
+        for (const auto value : wanted) static_cast<void>(retain(value));   // they may be the current items
+        for (const auto old : std::vector<Address>(tab_of(self)->items)) static_cast<void>(send_id(self, "removeTabViewItem:", {old}));
+        for (const auto value : wanted) {
+            static_cast<void>(send_id(self, "addTabViewItem:", {value}));
+            release(value);
+        }
+    }, "v@:@");
+    method(tv, "controlSize", [tab_of](CpuState& s, GuestMemory&) { s.x[0] = tab_of(s.x[0])->control_size; }, "Q@:");
+    method(tv, "setControlSize:", [this, tab_of](CpuState& s, GuestMemory&) {
+        tab_of(s.x[0])->control_size = s.x[2];
+        invalidate_view(s.x[0]);
+    }, "v@:Q");
     method(tv, "numberOfTabViewItems", [tab_of](CpuState& s, GuestMemory&) { s.x[0] = tab_of(s.x[0])->items.size(); }, "q@:");
     method(tv, "tabViewItemAtIndex:", [tab_of](CpuState& s, GuestMemory&) {
         const auto& list = tab_of(s.x[0])->items;
@@ -965,7 +983,6 @@ void AppKit::install_tabs_and_splits() {
     method(tv, "setFont:", [this, tab_of](CpuState& s, GuestMemory&) { assign(tab_of(s.x[0])->font, s.x[2]); invalidate_view(s.x[0]); }, "v@:@");
     method(tv, "drawsBackground", [tab_of](CpuState& s, GuestMemory&) { return_bool(s, tab_of(s.x[0])->draws_background); }, "B@:");
     method(tv, "setDrawsBackground:", [tab_of](CpuState& s, GuestMemory&) { tab_of(s.x[0])->draws_background = bool_arg(s, 2); }, "v@:B");
-    method(tv, "setControlSize:", [](CpuState&, GuestMemory&) {}, "v@:Q");
     method(tv, "setAllowsTruncatedLabels:", [](CpuState&, GuestMemory&) {}, "v@:B");
     method(tv, "minimumSize", [](CpuState& s, GuestMemory&) { return_size(s, {40, 40}); }, "{CGSize=dd}@:");
     method(tv, "_alchemyLayoutTab", [this, tab_of, item_of](CpuState& s, GuestMemory&) {
@@ -1037,6 +1054,25 @@ void AppKit::install_tabs_and_splits() {
     method(sp, "arrangedSubviews", [this](CpuState& s, GuestMemory&) { s.x[0] = auto_array(view_state(s.x[0])->subviews); });
     method(sp, "addArrangedSubview:", [this](CpuState& s, GuestMemory&) {
         static_cast<void>(send_id(s.x[0], "addSubview:", {s.x[2]}));
+        static_cast<void>(send(s.x[0], "adjustSubviews"));
+    }, "v@:@");
+    // Every subview is arranged (arrangesAllSubviews), so arranging is
+    // ordering the subviews.
+    method(sp, "insertArrangedSubview:atIndex:", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], child = s.x[2];
+        const auto& panes = view_state(self)->subviews;
+        if (s.x[3] > panes.size()) fail("-[NSSplitView insertArrangedSubview:atIndex:] index beyond the arranged subviews (NSRangeException)");
+        if (s.x[3] == panes.size()) {
+            static_cast<void>(send_id(self, "addSubview:", {child}));
+        } else {
+            constexpr Address below = static_cast<Address>(-1);   // NSWindowBelow
+            static_cast<void>(send_id(self, "addSubview:positioned:relativeTo:", {child, below, panes[s.x[3]]}));
+        }
+        static_cast<void>(send(self, "adjustSubviews"));
+    }, "v@:@q");
+    method(sp, "removeArrangedSubview:", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[2] || view_state(s.x[2])->superview != s.x[0]) return;
+        static_cast<void>(send(s.x[2], "removeFromSuperview"));
         static_cast<void>(send(s.x[0], "adjustSubviews"));
     }, "v@:@");
     method(sp, "setAutosaveName:", [this, split_of](CpuState& s, GuestMemory&) { assign(split_of(s.x[0])->autosave_name, s.x[2]); }, "v@:@");
@@ -1268,6 +1304,31 @@ void AppKit::install_tables(Address header_cell_class) {
     });
     method(hv, "setTableView:", [this](CpuState& s, GuestMemory&) { extension<HeaderState>(s.x[0])->table = s.x[2]; }, "v@:@");
     method(hv, "isFlipped", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
+    // Header geometry follows the table's columns and its horizontal scroll.
+    const auto header_scroll = [this](Address table) {
+        const auto clip = view_state(table)->superview;
+        return clip && is_kind(clip, clip_view) ? view_bounds(*view_state(clip)).origin.x : 0.0;
+    };
+    method(hv, "columnAtPoint:", [this, header_scroll](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto table = send(self, "tableView").x0;
+        if (!table) { s.x[0] = static_cast<Address>(-1); return; }
+        const auto point = point_arg(s);
+        const auto bounds = view_bounds(*view_state(self));
+        CallRegs registers;
+        put_point(registers, 0, {point.x - bounds.origin.x + header_scroll(table), 0});
+        s.x[0] = send(table, "columnAtPoint:", registers).x0;
+    }, "q@:{CGPoint=dd}");
+    method(hv, "headerRectOfColumn:", [this, header_scroll](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto table = send(self, "tableView").x0;
+        const auto bounds = view_bounds(*view_state(self));
+        if (!table) { return_rect(s, {}); return; }
+        CallRegs registers;
+        registers.x[2] = s.x[2];
+        const auto column = result_rect(send(table, "rectOfColumn:", registers));
+        return_rect(s, {{column.origin.x - header_scroll(table) + bounds.origin.x, bounds.origin.y}, {column.size.width, bounds.size.height}});
+    }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:q");
     method(hv, "drawRect:", [this, table_of, column_of](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto table = send(self, "tableView").x0;
@@ -2273,6 +2334,11 @@ void install_container_additions(AppKit& kit) {
     row_flag("isFloating", "setFloating:", &RowViewState::floating);
     row_flag("isTargetForDropOperation", "setTargetForDropOperation:", &RowViewState::target_for_drop);
     kit.method(rv, "selectionHighlightStyle", [row_of](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(row_of(s.x[0])->highlight_style); }, "q@:");
+    kit.method(rv, "draggingDestinationFeedbackStyle", [row_of](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(row_of(s.x[0])->feedback_style); }, "q@:");
+    kit.method(rv, "setDraggingDestinationFeedbackStyle:", [k, row_of](CpuState& s, GuestMemory&) {
+        row_of(s.x[0])->feedback_style = static_cast<std::int64_t>(s.x[2]);
+        k->invalidate_view(s.x[0]);
+    }, "v@:q");
     kit.method(rv, "setSelectionHighlightStyle:", [k, row_of](CpuState& s, GuestMemory&) {
         row_of(s.x[0])->highlight_style = static_cast<std::int64_t>(s.x[2]);
         k->invalidate_view(s.x[0]);

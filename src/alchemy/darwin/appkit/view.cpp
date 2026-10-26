@@ -53,6 +53,53 @@ bool printable(std::string_view text) {
 }
 } // namespace
 
+Rect backing_aligned(Rect rect, double scale, std::uint64_t options) {
+    if (!(scale > 0)) scale = 1;
+    const bool flipped = (options >> 63) & 1;
+    // One axis: bits 0/8/16 the minimum edge, 2/10/18 the maximum edge and
+    // 4/12/20 the size (inward / outward / nearest), plus `axis` (0 x, 1 y).
+    const auto align = [&](double origin, double length, unsigned axis, double& out_origin, double& out_length) {
+        const auto mode = [&](unsigned base) {
+            int found = 0, count = 0;
+            for (int kind = 0; kind < 3; ++kind)
+                if ((options >> (base + axis + 8 * kind)) & 1) { found = kind + 1; ++count; }
+            if (count > 1) fail("-backingAlignedRect:options: names one edge or size more than once");
+            return found;   // 0 none, 1 inward, 2 outward, 3 nearest
+        };
+        const int min_mode = mode(0), max_mode = mode(2), size_mode = mode(4);
+        if ((min_mode != 0) + (max_mode != 0) + (size_mode != 0) != 2)
+            fail("-backingAlignedRect:options: needs exactly two of the minimum edge, the maximum edge and the size per axis");
+        // Halves round up, or down along a flipped y axis.
+        const bool half_down = flipped && axis == 1;
+        const auto nearest = [half_down](double v) { return half_down ? std::ceil(v - 0.5) : std::floor(v + 0.5); };
+        const auto edge = [&](double v, int how, bool minimum) {
+            v *= scale;
+            if (how == 3) return nearest(v) / scale;
+            const bool up = (how == 1) == minimum;   // an inward minimum or an outward maximum rounds up
+            return (up ? std::ceil(v) : std::floor(v)) / scale;
+        };
+        const auto size = [&](double v, int how) {
+            v *= scale;
+            if (how == 3) return std::max(0.0, nearest(v)) / scale;
+            return std::max(0.0, how == 1 ? std::floor(v) : std::ceil(v)) / scale;
+        };
+        if (min_mode && max_mode) {
+            out_origin = edge(origin, min_mode, true);
+            out_length = std::max(0.0, edge(origin + length, max_mode, false) - out_origin);
+        } else if (min_mode) {
+            out_origin = edge(origin, min_mode, true);
+            out_length = size(length, size_mode);
+        } else {
+            out_length = size(length, size_mode);
+            out_origin = edge(origin + length, max_mode, false) - out_length;
+        }
+    };
+    Rect result;
+    align(rect.origin.x, rect.size.width, 0, result.origin.x, result.size.width);
+    align(rect.origin.y, rect.size.height, 1, result.origin.y, result.size.height);
+    return result;
+}
+
 std::vector<Address> AppKit::all_views(Address root) {
     std::vector<Address> result;
     if (!root) return result;
@@ -526,12 +573,31 @@ void AppKit::install_view() {
     method(v, "acceptsFirstMouse:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:@");
     method(v, "isHidden", [this](CpuState& s, GuestMemory&) { return_bool(s, view_state(s.x[0])->hidden); }, "B@:");
     method(v, "setHidden:", [this](CpuState& s, GuestMemory&) {
-        const auto state = view_state(s.x[0]);
+        const auto self = s.x[0];
+        const auto state = view_state(self);
         const bool hidden = bool_arg(s, 2);
         if (state->hidden == hidden) return;
         state->hidden = hidden;
         if (!hidden) state->needs_display = true;
+        // -viewDidHide / -viewDidUnhide go to the view and to the descendants
+        // whose visibility changed with it (not those hidden themselves),
+        // unless an ancestor still hides them.
+        bool ancestor_hidden{};
+        for (auto current = state->superview; current && !ancestor_hidden; current = view_state(current)->superview)
+            ancestor_hidden = view_state(current)->hidden;
+        if (ancestor_hidden) return;
+        const char* selector = hidden ? "viewDidHide" : "viewDidUnhide";
+        std::vector<Address> pending{self};
+        while (!pending.empty()) {
+            const auto current = pending.back();
+            pending.pop_back();
+            static_cast<void>(send(current, selector));
+            for (const auto child : view_state(current)->subviews)
+                if (!view_state(child)->hidden) pending.push_back(child);
+        }
     }, "v@:B");
+    method(v, "viewDidHide", [](CpuState&, GuestMemory&) {}, "v@:");
+    method(v, "viewDidUnhide", [](CpuState&, GuestMemory&) {}, "v@:");
     method(v, "isHiddenOrHasHiddenAncestor", [this](CpuState& s, GuestMemory&) {
         bool hidden{};
         for (auto current = s.x[0]; current && !hidden; current = view_state(current)->superview) hidden = view_state(current)->hidden;
@@ -545,7 +611,67 @@ void AppKit::install_view() {
     // not produce; the value is kept for the getter.
     method(v, "allowedTouchTypes", [this](CpuState& s, GuestMemory&) { s.x[0] = view_state(s.x[0])->allowed_touch_types; }, "Q@:");
     method(v, "setAllowedTouchTypes:", [this](CpuState& s, GuestMemory&) { view_state(s.x[0])->allowed_touch_types = s.x[2]; }, "v@:Q");
-    method(v, "userInterfaceLayoutDirection", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "q@:");
+    method(v, "userInterfaceLayoutDirection", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<Address>(view_state(s.x[0])->layout_direction);
+    }, "q@:");
+    method(v, "setUserInterfaceLayoutDirection:", [this](CpuState& s, GuestMemory&) {
+        view_state(s.x[0])->layout_direction = static_cast<std::int64_t>(s.x[2]);
+        invalidate_view(s.x[0]);
+    }, "v@:q");
+    // Vibrancy needs a visual effect view behind; plain views do not ask for it.
+    method(v, "allowsVibrancy", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // A view that is not a scroll view has nothing to reflect.
+    method(v, "reflectScrolledClipView:", [](CpuState&, GuestMemory&) {}, "v@:@");
+    // NSAnimatablePropertyContainer: the view's own animation for a key,
+    // else its class's default.
+    method(v, "animationForKey:", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], key = s.x[2];
+        const auto own = key ? send_id(send(self, "animations").x0, "objectForKey:", {key}) : 0;
+        s.x[0] = own ? own : send_id(send(self, "class").x0, "defaultAnimationForKey:", {key});
+    });
+    // The safe area: the part of the view not under the titlebar of a
+    // window whose content view extends below it (full-size content view).
+    // Insets are {top, left, bottom, right}.
+    const auto safe_insets = [this](Address self) {
+        std::array<double, 4> insets{};
+        const auto state = view_state(self);
+        const auto owner = state->window;
+        if (!owner) return insets;
+        constexpr std::uint64_t full_size_content = 1ULL << 15;
+        if (!(window_state(owner)->style & full_size_content)) return insets;
+        const auto band = titlebar_height(owner);
+        if (band <= 0) return insets;
+        const auto content = content_rect(owner);
+        const double band_bottom = content.size.height - band;   // window base coordinates
+        const auto rect = view_rect_in_window(self, view_bounds(*state));
+        const double overlap =
+            std::min(rect.origin.y + rect.size.height, content.size.height) - std::max(rect.origin.y, band_bottom);
+        if (overlap > 0) insets[0] = overlap;
+        return insets;
+    };
+    method(v, "safeAreaInsets", [safe_insets](CpuState& s, GuestMemory&) {
+        const auto insets = safe_insets(s.x[0]);
+        for (unsigned i = 0; i < 4; ++i) set_d(s, i, insets[i]);
+    }, "{NSEdgeInsets=dddd}@:");
+    method(v, "safeAreaRect", [this, safe_insets](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto insets = safe_insets(self);
+        auto rect = view_bounds(*view_state(self));
+        const bool flipped = send_bool(self, "isFlipped");
+        rect.origin.x += insets[1];
+        rect.size.width = std::max(0.0, rect.size.width - insets[1] - insets[3]);
+        rect.origin.y += flipped ? insets[0] : insets[2];
+        rect.size.height = std::max(0.0, rect.size.height - insets[0] - insets[2]);
+        return_rect(s, rect);
+    }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:");
+    // Pixel alignment in the window's backing store.
+    method(v, "backingAlignedRect:options:", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto owner = view_state(self)->window;
+        const double scale = owner ? backing_scale(owner) : 1.0;
+        const auto in_window = view_rect_in_window(self, rect_arg(s));
+        return_rect(s, window_rect_in_view(self, backing_aligned(in_window, scale, s.x[2])));
+    }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:{CGRect={CGPoint=dd}{CGSize=dd}}Q");
     // OpenGL surfaces are not provided (the GPU path is Metal); the request
     // for a full-resolution surface is kept for the getter.
     method(v, "wantsBestResolutionOpenGLSurface", [this](CpuState& s, GuestMemory&) { return_bool(s, view_state(s.x[0])->best_resolution_gl); }, "B@:");

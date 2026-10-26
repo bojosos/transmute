@@ -685,6 +685,62 @@ void AppKit::install_text() {
         if (state->field_editor) std::replace_if(value.begin(), value.end(), [](char16_t c) { return c == u'\n' || c == u'\r'; }, u' ');
         replace(self, state->selection, state->selection_length, value);
     });
+    // -delete: removes the selection without touching the pasteboard.
+    command("delete:", [ts, replace](Address self) {
+        const auto state = ts(self);
+        if (state->editable && state->selection_length) replace(self, state->selection, state->selection_length, u"");
+    });
+    // A paragraph break is a newline here (the field editor ends editing, as for Return).
+    command("insertParagraphSeparator:", [this](Address self) { static_cast<void>(send_id(self, "insertNewline:", {self})); });
+    // A tab character even in the field editor.
+    command("insertTabIgnoringFieldEditor:", [ts, replace](Address self) {
+        const auto state = ts(self);
+        if (state->editable) replace(self, state->selection, state->selection_length, u"\t");
+    });
+    command("noop:", [](Address) {});
+    method(t, "baseWritingDirection", [ts](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(ts(s.x[0])->writing_direction); }, "q@:");
+    method(t, "setBaseWritingDirection:", [this, ts](CpuState& s, GuestMemory&) {
+        ts(s.x[0])->writing_direction = static_cast<std::int64_t>(s.x[2]);
+        invalidate_view(s.x[0]);
+    }, "v@:q");
+    // The menu toggles of the text view's settings flip the kept values.
+    for (const auto* base : {"ContinuousSpellChecking", "GrammarChecking", "AutomaticQuoteSubstitution", "AutomaticDashSubstitution",
+             "AutomaticLinkDetection", "AutomaticDataDetection", "AutomaticTextReplacement", "AutomaticSpellingCorrection",
+             "AutomaticTextCompletion", "SmartInsertDelete"}) {
+        const std::string name = base;
+        method(text_view, "toggle" + name + ":", [this, name](CpuState& s, GuestMemory&) {
+            const bool on = send_bool(s.x[0], "is" + name + "Enabled");
+            static_cast<void>(send_id(s.x[0], "set" + name + "Enabled:", {on ? 0u : 1u}));
+        }, "v@:@");
+    }
+    // Services pasteboards: the selection as plain text.
+    const auto plain_types = [this](Address board_types) {
+        for (const auto type : items(board_types)) {
+            const auto name = text(type);
+            if (name == "public.utf8-plain-text" || name == "NSStringPboardType" || name == "public.plain-text") return true;
+        }
+        return false;
+    };
+    method(text_view, "writeSelectionToPasteboard:types:", [this, ts, plain_types](CpuState& s, GuestMemory&) {
+        const auto state = ts(s.x[0]);
+        if (!s.x[2] || !state->selection_length || state->secure || !plain_types(s.x[3])) { s.x[0] = 0; return; }
+        const auto selected = drawing::utf8(std::u16string_view(state->value).substr(state->selection, state->selection_length));
+        static_cast<void>(send_id(s.x[2], "declareTypes:owner:", {auto_array({auto_string("public.utf8-plain-text")}), 0}));
+        s.x[0] = send_id(s.x[2], "setString:forType:", {auto_string(selected), auto_string("public.utf8-plain-text")}) & 0xff;
+    }, "B@:@@");
+    method(text_view, "writeSelectionToPasteboard:type:", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = send_id(s.x[0], "writeSelectionToPasteboard:types:", {s.x[2], s.x[3] ? auto_array({s.x[3]}) : auto_array({})}) & 0xff;
+    }, "B@:@@");
+    method(text_view, "readSelectionFromPasteboard:", [this, ts, replace](CpuState& s, GuestMemory&) {
+        const auto state = ts(s.x[0]);
+        const auto value = s.x[2] && state->editable ? send_id(s.x[2], "stringForType:", {auto_string("public.utf8-plain-text")}) : 0;
+        if (!value) { s.x[0] = 0; return; }
+        replace(s.x[0], state->selection, state->selection_length, drawing::utf16(text(value)));
+        s.x[0] = 1;
+    }, "B@:@");
+    method(text_view, "readSelectionFromPasteboard:type:", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = send_id(s.x[0], "readSelectionFromPasteboard:", {s.x[2]}) & 0xff;
+    }, "B@:@@");
 
     // ---- mouse: caret placement and drag selection ----
     method(t, "mouseDown:", [this, ts, move_to](CpuState& s, GuestMemory&) {

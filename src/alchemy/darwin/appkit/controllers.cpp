@@ -28,7 +28,7 @@ void AppKit::install_controllers() {
     const auto cs = [this](Address value) { return objc.host_state<ControllerState>(value); };
     const auto release_all = [this](ControllerState& state) {
         for (auto* slot : {&state.window, &state.view, &state.nib_name, &state.nib_bundle, &state.title, &state.represented,
-                 &state.autosave_name})
+                 &state.autosave_name, &state.identifier, &state.content_view_controller})
             release(std::exchange(*slot, 0));
         for (const auto child : std::exchange(state.children, {})) release(child);
         for (const auto object : std::exchange(state.top_level, {})) release(object);
@@ -91,6 +91,8 @@ void AppKit::install_controllers() {
         if (s.x[2]) {
             window_state(s.x[2])->window_controller = self;
             if (!send(s.x[2], "nextResponder").x0) static_cast<void>(send_id(s.x[2], "setNextResponder:", {self}));
+            if (const auto pending = state->content_view_controller)
+                static_cast<void>(send_id(s.x[2], "setContentViewController:", {pending}));
         }
     }, "v@:@");
     // -window loads the nib (-windowWillLoad, -loadWindow, -windowDidLoad).
@@ -150,7 +152,19 @@ void AppKit::install_controllers() {
         const auto title = send_id(s.x[0], "windowTitleForDocumentDisplayName:", {name});
         if (title) send_id(state->window, "setTitle:", {title});
     }, "v@:");
-    method(wc, "contentViewController", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    // The content view controller is the window's (kept until the window exists).
+    method(wc, "contentViewController", [this, cs](CpuState& s, GuestMemory&) {
+        const auto state = cs(s.x[0]);
+        s.x[0] = state->window ? send(state->window, "contentViewController").x0 : state->content_view_controller;
+    });
+    method(wc, "setContentViewController:", [this, cs](CpuState& s, GuestMemory&) {
+        const auto state = cs(s.x[0]);
+        assign(state->content_view_controller, s.x[2]);
+        if (state->window) static_cast<void>(send_id(state->window, "setContentViewController:", {s.x[2]}));
+    }, "v@:@");
+    method(wc, "setDocumentEdited:", [this, cs](CpuState& s, GuestMemory&) {
+        if (const auto target = cs(s.x[0])->window) static_cast<void>(send_id(target, "setDocumentEdited:", {s.x[2] & 0xff}));
+    }, "v@:B");
     method(wc, "dismissController:", [this](CpuState& s, GuestMemory&) { static_cast<void>(send(s.x[0], "close")); }, "v@:@");
 
     // ---- NSViewController ----
@@ -204,6 +218,11 @@ void AppKit::install_controllers() {
         method(vc, name, [](CpuState&, GuestMemory&) {}, "v@:");   // override points
     method(vc, "representedObject", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->represented; });
     method(vc, "setRepresentedObject:", [this, cs](CpuState& s, GuestMemory&) { assign(cs(s.x[0])->represented, s.x[2]); }, "v@:@");
+    // NSUserInterfaceItemIdentification.
+    method(vc, "identifier", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->identifier; });
+    method(vc, "setIdentifier:", [this, cs](CpuState& s, GuestMemory&) {
+        release(std::exchange(cs(s.x[0])->identifier, s.x[2] ? cf.copy(s.x[2]) : 0));
+    }, "v@:@");
     method(vc, "title", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->title; });
     method(vc, "setTitle:", [this, cs](CpuState& s, GuestMemory&) {
         release(std::exchange(cs(s.x[0])->title, s.x[2] ? cf.copy(s.x[2]) : 0));

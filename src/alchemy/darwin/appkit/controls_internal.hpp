@@ -51,6 +51,7 @@ struct CellState final : ObjectPayload {
     std::int64_t tag{}, state{}, alignment{4}, line_break{}, control_size{}, image_position{}, image_scaling{};
     std::int64_t bezel_style{bezel_style::rounded}, button_type{button_type::momentary_push_in}, focus_ring_type{};
     std::int64_t selected_item{-1};           // NSPopUpButtonCell
+    std::uint64_t preferred_edge{1};          // NSPopUpButtonCell -preferredEdge (NSRectEdge)
     std::uint64_t key_modifier_mask{};
     std::uint64_t send_action_mask{4};        // NSEventMaskLeftMouseUp
     bool enabled{true}, highlighted{}, bordered{}, bezeled{}, editable{}, selectable{}, scrollable{}, wraps{};
@@ -75,7 +76,12 @@ struct CellState final : ObjectPayload {
     // AppKit's pair for the type, the setters override it.
     std::uint64_t highlights_by{6}, shows_state_by{};
     bool sends_action_on_end_editing{};
+    // NSWritingDirection (-1 natural), NSUserInterfaceLayoutDirection, NSBackgroundStyle.
+    std::int64_t writing_direction{-1}, layout_direction{}, background_style{};
+    bool allows_undo{true}, refuses_first_responder{};
     Address content_tint{};                   // +1 -contentTintColor (NSButton / NSImageView)
+    Address bezel_color{}, sound{};           // +1 NSButtonCell -bezelColor, -sound (played on a click)
+    bool image_hugs_title{};
     // State of cell subclasses defined outside this directory (the QLab
     // controls of src/alchemy/darwin/kit/completion/controls/): one object carries one
     // payload, so subclasses extend the cell this way (as ViewState::extension).
@@ -102,7 +108,7 @@ struct ControlState : ObjectPayload {
     Address content_view{};                   // NSBox content view (a subview)
     std::int64_t box_type{}, border_type{3}, title_position{2};
     Address fill_color{}, border_color{};     // +1
-    double corner_radius{5};
+    double corner_radius{5}, border_width{1};   // custom boxes (NSBoxCustom)
     // NSStepper / NSSlider
     double increment{1};
     bool value_wraps{}, autorepeat{true};
@@ -125,6 +131,7 @@ struct TextState final : ObjectPayload {
     Size min_size{0, 0}, max_size{1e7, 1e7};
     double scroll_x{};                                           // field editor: horizontal scroll
     std::int64_t alignment{4};
+    std::int64_t writing_direction{-1};                          // NSWritingDirection (-1 natural)
     bool editable{true}, selectable{true}, rich_text{true}, field_editor{}, draws_background{true};
     bool horizontally_resizable{}, vertically_resizable{true}, secure{};
     Address container{};                                         // +1 NSTextContainer (made on demand)

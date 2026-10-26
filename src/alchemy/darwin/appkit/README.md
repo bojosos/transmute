@@ -27,6 +27,17 @@ Spell Checking API.
 **Unsupported (explicit failures):** for example NSCollectionView sections
 other than 0, horizontal NSCollectionViewFlowLayout scrolling, planar
 NSBitmapImageRep data, and NSWindow frame autosave without NSUserDefaults.
+Also -[NSSavePanel ok:] / -cancel: while the Windows file dialog is open,
+-[NSImageRep CGImageForProposedRect:context:hints:] of a representation that
+is not a bitmap, and +[NSColor colorWithColorSpace:components:count:] in
+colour spaces other than gray, RGB and CMYK.
+
+**Unavailable, as documented:** remote notifications (no Apple Push
+Notification service: -registerForRemoteNotifications fails through the
+delegate with an NSCocoaErrorDomain error), and Finder tags in save panels
+(-tagNames are the ones the application set). Window toolbars are not shown,
+so -[NSToolbarItem isVisible] is NO; restorable state is encoded and restored
+on request but not kept between launches.
 
 ## Moved from darwin/identities/
 

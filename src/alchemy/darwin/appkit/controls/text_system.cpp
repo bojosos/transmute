@@ -1039,6 +1039,22 @@ void install_text_system(AppKit& kit) {
             k->assign(selected_font, s.x[2]);
             selected_multiple = bool_arg(s, 3);
         }, "v@:@B");
+        // The action font changes send: -changeFont: to the target (nil: the
+        // first responder), while the manager is enabled. The delegate is weak.
+        static Address target{}, delegate{};
+        static Address action = k->sel("changeFont:");
+        static bool enabled = true;
+        kit.method(fm, "target", [](CpuState& s, GuestMemory&) { s.x[0] = target; });
+        kit.method(fm, "setTarget:", [](CpuState& s, GuestMemory&) { target = s.x[2]; }, "v@:@");
+        kit.method(fm, "action", [](CpuState& s, GuestMemory&) { s.x[0] = action; }, ":@:");
+        kit.method(fm, "setAction:", [](CpuState& s, GuestMemory&) { action = s.x[2]; }, "v@::");
+        kit.method(fm, "delegate", [](CpuState& s, GuestMemory&) { s.x[0] = delegate; });
+        kit.method(fm, "setDelegate:", [](CpuState& s, GuestMemory&) { delegate = s.x[2]; }, "v@:@");
+        kit.method(fm, "isEnabled", [](CpuState& s, GuestMemory&) { s.x[0] = enabled; }, "B@:");
+        kit.method(fm, "setEnabled:", [](CpuState& s, GuestMemory&) { enabled = bool_arg(s, 2); }, "v@:B");
+        kit.method(fm, "sendAction", [k](CpuState& s, GuestMemory&) {
+            return_bool(s, enabled && action && k->send_action(action, target, s.x[0]));
+        }, "B@:");
         // The font panel: an existing one is answered (none is ever made:
         // the panel UI is not provided), creating one fails explicitly.
         kit.method(fm, "fontPanel:", [k](CpuState& s, GuestMemory&) {

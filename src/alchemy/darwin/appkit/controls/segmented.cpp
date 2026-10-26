@@ -473,6 +473,8 @@ void install_segmented(AppKit& kit) {
              {"setSegmentDistribution:", "v@:q", true}, {"selectedSegmentBezelColor", "@@:", false},
              {"setSelectedSegmentBezelColor:", "v@:@", true}})
         forward_to_cell(kit, n, name, types, redraw);
+    // The selected segment by its NSControl name.
+    kit.method(n, "indexOfSelectedItem", [k](CpuState& s, GuestMemory&) { s.x[0] = k->send(s.x[0], "selectedSegment").x0; }, "q@:");
     // Accept the first click in an inactive window, as AppKit's segmented control does.
     kit.method(n, "acceptsFirstMouse:", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:@");
     // Segment-level clicks: highlight the pressed segment while the pointer

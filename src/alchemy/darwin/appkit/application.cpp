@@ -554,7 +554,7 @@ void AppKit::install_application() {
         { std::lock_guard lock(mutex); targets = window_order; }
         for (const auto target : targets) {
             const auto info = window_state(target);
-            if (!info->visible) continue;
+            if (!info->visible || !info->can_hide) continue;
             info->hidden_by_application = true;
             static_cast<void>(send_id(target, "orderOut:", {0}));
         }
@@ -623,22 +623,81 @@ void AppKit::install_application() {
         for (const auto target : targets) static_cast<void>(send_optional(target, "update"));
     }, "v@:");
     method(a, "setWindowsNeedUpdate:", [](CpuState&, GuestMemory&) {}, "v@:B");
-    method(a, "orderFrontStandardAboutPanel:", [this](CpuState&, GuestMemory&) {
-        // The standard About panel: the bundle's name and version.
+    // The standard About panel: the application's name, version, copyright
+    // and credits, from the options (NSAboutPanelOption* keys) else the
+    // main bundle, shown as an alert with the application icon.
+    const auto about_panel = [this](Address options) {
         const auto bundle = send(objc.find_class("NSBundle"), "mainBundle").x0;
         const auto info = bundle ? send(bundle, "infoDictionary").x0 : 0;
-        const auto lookup = [&](std::string_view key) {
-            return info ? text(send_id(info, "objectForKey:", {auto_string(key)})) : std::string{};
+        const auto option = [&](std::string_view key) { return options ? send_id(options, "objectForKey:", {auto_string(key)}) : 0; };
+        const auto lookup = [&](std::string_view option_key, std::string_view bundle_key) {
+            if (const auto value = option(option_key)) {
+                // Credits are an attributed string.
+                return text(responds(value, "string") ? send(value, "string").x0 : value);
+            }
+            return info && !bundle_key.empty() ? text(send_id(info, "objectForKey:", {auto_string(bundle_key)})) : std::string{};
         };
-        auto name = lookup("CFBundleName");
+        auto name = lookup("ApplicationName", "CFBundleName");
         if (name.empty()) name = "Application";
-        const auto version = lookup("CFBundleShortVersionString");
+        const auto version = lookup("ApplicationVersion", "CFBundleShortVersionString");
+        const auto build = lookup("Version", "CFBundleVersion");
+        const auto copyright = lookup("Copyright", "NSHumanReadableCopyright");
+        const auto credits = lookup("Credits", "");
+        std::string details;
+        if (!version.empty()) details = "Version " + version + (!build.empty() && build != version ? " (" + build + ")" : "");
+        for (const auto* part : {&copyright, &credits})
+            if (!part->empty()) details += (details.empty() ? "" : "\n") + *part;
         const auto panel = alloc_init(alert);
         static_cast<void>(send_id(panel, "setMessageText:", {auto_string(name)}));
-        static_cast<void>(send_id(panel, "setInformativeText:", {auto_string(version.empty() ? "" : "Version " + version)}));
-        static_cast<void>(send(panel, "runModal"));
+        static_cast<void>(send_id(panel, "setInformativeText:", {auto_string(details)}));
+        if (const auto icon = option("ApplicationIcon")) static_cast<void>(send_id(panel, "setIcon:", {icon}));
+        try { static_cast<void>(send(panel, "runModal")); } catch (...) { release(panel); throw; }
         release(panel);
+    };
+    method(a, "orderFrontStandardAboutPanel:", [about_panel](CpuState&, GuestMemory&) { about_panel(0); }, "v@:@");
+    method(a, "orderFrontStandardAboutPanelWithOptions:", [about_panel](CpuState& s, GuestMemory&) { about_panel(s.x[2]); }, "v@:@");
+    // Sheets end through the window they are attached to.
+    method(a, "endSheet:returnCode:", [this](CpuState& s, GuestMemory&) {
+        const auto sheet = s.x[2];
+        if (!sheet || !is_kind(sheet, window)) fail("-[NSApplication endSheet:returnCode:] needs a sheet window");
+        if (const auto parent = window_state(sheet)->sheet_parent)
+            static_cast<void>(send_id(parent, "endSheet:returnCode:", {sheet, s.x[3]}));
+    }, "v@:@q");
+    method(a, "endSheet:", [this](CpuState& s, GuestMemory&) {
+        constexpr std::int64_t modal_response_stop = -1000;   // NSModalResponseStop
+        static_cast<void>(send_id(s.x[0], "endSheet:returnCode:", {s.x[2], static_cast<Address>(modal_response_stop)}));
     }, "v@:@");
+    // Every window of the application in front of other applications' windows, keeping their order.
+    method(a, "arrangeInFront:", [this](CpuState&, GuestMemory&) {
+        std::vector<Address> targets;
+        { std::lock_guard lock(mutex); targets = window_order; }
+        for (auto it = targets.rbegin(); it != targets.rend(); ++it)
+            if (window_state(*it)->visible) static_cast<void>(send_id(*it, "orderFront:", {0}));
+    }, "v@:@");
+    // Remote notifications need Apple's push service, which is not
+    // available: registering fails through the delegate, asynchronously.
+    method(a, "registerForRemoteNotifications", [this](CpuState&, GuestMemory&) {
+        const auto deliver = [this] {
+            const auto delegate = app_state()->delegate;
+            if (!delegate || !responds(delegate, "application:didFailToRegisterForRemoteNotificationsWithError:")) return;
+            const auto error_class = objc.find_class("NSError");
+            const auto description = auto_string("Remote notifications are not available (no Apple Push Notification service)");
+            const auto key = auto_string("NSLocalizedDescription");
+            const std::vector<std::pair<Address, Address>> entries{{key, description}};
+            const auto user_info = autorelease(cf.dictionary(entries));
+            constexpr Address cocoa_feature_unsupported = 3000;
+            const auto error = send_id(error_class, "errorWithDomain:code:userInfo:",
+                                       {auto_string("NSCocoaErrorDomain"), cocoa_feature_unsupported, user_info});
+            static_cast<void>(send_id(delegate, "application:didFailToRegisterForRemoteNotificationsWithError:", {app, error}));
+        };
+        auto* loop = run_loop_or_null();
+        if (!loop) { deliver(); return; }
+        auto source = std::make_shared<SourceId>();
+        *source = loop->add_source(common_modes, [source, loop, deliver] { loop->remove_source(*source); deliver(); });
+        loop->signal_source(*source);
+    }, "v@:");
+    method(a, "unregisterForRemoteNotifications", [](CpuState&, GuestMemory&) {}, "v@:");
+    method(a, "isRegisteredForRemoteNotifications", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
 }
 
 } // namespace alchemy::gui::appkit

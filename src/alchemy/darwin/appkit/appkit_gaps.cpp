@@ -162,6 +162,20 @@ void Provider::install_appkit() {
         store(s.x[0], "fileType", s.x[3]);
     });
     method(attachment, "initWithFileWrapper:", [this](CpuState& s, GuestMemory&) { store(s.x[0], "fileWrapper", s.x[2]); });
+    // The attachment's layout bounds (CGRectZero: the image's size at the baseline).
+    method(attachment, "bounds", [this](CpuState& s, GuestMemory&) {
+        const auto values = properties(s.x[0]);
+        std::lock_guard lock(values->mutex);
+        for (unsigned i = 0; i < 4; ++i) {
+            const auto found = values->reals.find("bounds" + std::to_string(i));
+            s.v[i] = {std::bit_cast<std::uint64_t>(found == values->reals.end() ? 0.0 : found->second), 0};
+        }
+    }, false, "{CGRect={CGPoint=dd}{CGSize=dd}}@:");
+    method(attachment, "setBounds:", [this](CpuState& s, GuestMemory&) {
+        const auto values = properties(s.x[0]);
+        std::lock_guard lock(values->mutex);
+        for (unsigned i = 0; i < 4; ++i) values->reals["bounds" + std::to_string(i)] = std::bit_cast<double>(s.v[i][0]);
+    }, false, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
     // +[NSAttributedString attributedStringWithAttachment:]: U+FFFC carrying
     // the attachment under NSAttachmentAttributeName ("NSAttachment").
     if (const auto attributed = objc.find_class("NSAttributedString"); attributed && !objc.responds(attributed, objc.selector("attributedStringWithAttachment:"))) {
@@ -327,12 +341,33 @@ void Provider::install_appkit() {
         if (!cf.dictionary_value(colors, s.x[3])) static_cast<void>(cf.invoke("CFArrayAppendValue", std::array<Address, 2>{keys, s.x[3]}));
         static_cast<void>(cf.invoke("CFDictionarySetValue", std::array<Address, 3>{colors, s.x[3], s.x[2]}));
     }, false, "v@:@@");
+    // A key that is already in the list moves to the index.
+    method(color_list, "insertColor:key:atIndex:", [this](CpuState& s, GuestMemory&) {
+        const auto colors = stored(s.x[0], "colors"), keys = stored(s.x[0], "keys");
+        if (!colors || !keys || !s.x[3]) return;
+        CallRegs same{};
+        same.x[2] = s.x[3];
+        const auto existing = cf.length(keys);
+        for (std::uint64_t i = 0; i < existing; ++i) {
+            const auto key = cf.element(keys, i);
+            if (key != s.x[3] && !(objc.send(key, "isEqual:", same).x0 & 0xff)) continue;
+            static_cast<void>(cf.invoke("CFArrayRemoveValueAtIndex", std::array<Address, 2>{keys, i}));
+            break;
+        }
+        const auto index = std::min<std::uint64_t>(s.x[4], cf.length(keys));
+        static_cast<void>(cf.invoke("CFArrayInsertValueAtIndex", std::array<Address, 3>{keys, index, s.x[3]}));
+        static_cast<void>(cf.invoke("CFDictionarySetValue", std::array<Address, 3>{colors, s.x[3], s.x[2]}));
+    }, false, "v@:@@Q");
 
     // NSResponder's touchBar (NSTouchBarProvider): kept, never shown. A nil
     // bar is made on first access through -makeTouchBar (nil by default),
     // as AppKit does.
     if (objc.find_class("NSResponder")) {
         track_dealloc("NSResponder");
+        // The contextual menu of a responder (NSApplication and
+        // NSPopUpButton answer their own).
+        extend("NSResponder", "menu", [this](CpuState& s, GuestMemory&) { s.x[0] = stored(s.x[0], "menu"); });
+        extend("NSResponder", "setMenu:", [this](CpuState& s, GuestMemory&) { store(s.x[0], "menu", s.x[2]); }, false, "v@:@");
         extend("NSResponder", "makeTouchBar", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
         extend("NSResponder", "touchBar", [this](CpuState& s, GuestMemory&) {
             const auto self = s.x[0];

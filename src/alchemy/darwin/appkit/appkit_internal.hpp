@@ -244,6 +244,11 @@ struct WindowState final : ResponderState {
     // waiting for the run loop.
     bool server_hidden{}, occlusion_posted{}, occlusion_pending{};
     Address frame_view{};   // +1 the frame view, the content view's superview (frame_view.cpp)
+    // -aspectRatio (frame) and -contentAspectRatio ({0, 0}: none; the content
+    // ratio wins), enforced while the user resizes (will_resize).
+    Size aspect_ratio{}, content_aspect_ratio{};
+    bool can_hide{true};                      // -[NSApplication hide:] leaves the window when NO
+    std::int64_t toolbar_style{};             // NSWindowToolbarStyle (kept; window toolbars are not shown)
 };
 
 struct CursorRect { Rect rect; Address cursor{}; };   // view (bounds) coordinates; cursor +1
@@ -285,6 +290,7 @@ struct ViewState final : ResponderState {
     Address accessibility_overrides{};        // +1 NSMutableDictionary (-accessibilitySetOverrideValue:forAttribute:)
     std::map<std::int64_t, Address> tracking_rects;   // tag -> NSTrackingArea (held by tracking_areas)
     bool draws_concurrently{};
+    std::int64_t layout_direction{};          // NSUserInterfaceLayoutDirection (0 left to right)
     // State of AppKit subclasses (controls, scroll views, text views...):
     // one object carries one payload, so subclasses extend the view this way.
     std::shared_ptr<ObjectPayload> extension;
@@ -302,6 +308,7 @@ struct ApplicationState final : ResponderState {
 struct ControllerState final : ResponderState {
     Address window{}, view{};                 // +1
     Address nib_name{}, nib_bundle{}, title{}, represented{}, autosave_name{};   // +1
+    Address identifier{}, content_view_controller{};   // +1
     Address owner{}, document{}, parent{};    // not retained
     std::vector<Address> children;            // +1 child view controllers
     std::vector<Address> top_level;           // +1 top-level objects of the loaded nib
@@ -369,12 +376,16 @@ struct BitmapState final : ObjectPayload {
     Address data{};                           // guest pixels (owned when `owns`)
     Address color_space_name{};               // +1
     Size size;                                // points
+    std::optional<bool> opaque;               // -setOpaque: (unset: opaque when there is no alpha)
 };
 struct ImageState final : ObjectPayload {
     Size size;
     std::vector<Address> representations;     // +1
     Address name{};                           // +1
     bool template_image{};
+    Address background_color{}, accessibility_description{};   // +1
+    std::array<double, 4> cap_insets{};       // NSEdgeInsets: top, left, bottom, right
+    std::int64_t resizing_mode{};             // NSImageResizingModeTile (0) or Stretch (1)
 };
 struct ColorState final : ObjectPayload { double red{}, green{}, blue{}, alpha{1}; bool white{}; };
 struct ColorSpaceState final : ObjectPayload { std::string name; std::int64_t model{1}; };   // NSColorSpaceModelRGB
@@ -392,8 +403,10 @@ struct BezierState final : ObjectPayload {
 struct AlertState final : ObjectPayload {
     std::string message, informative;
     std::vector<std::string> buttons;
+    std::vector<Address> button_objects;      // +1 the NSButtons of -buttons (their titles win at -runModal)
     std::uint64_t style{};
     Address accessory{};                      // +1
+    Address icon{};                           // +1 (nil: the application icon)
     Address suppression_button{};             // +1 (made on demand)
     bool shows_help{}, shows_suppression{};
 };
@@ -584,6 +597,7 @@ struct AppKit : std::enable_shared_from_this<AppKit> {
     void install_application();
     void install_window();
     void install_window_autosave();
+    void install_window_geometry();           // window.cpp: constraints, cascading, alignment, aspect ratios, ordering
     std::string saved_frame_string(Address window_object);                  // AppKit's frame string
     bool set_frame_from_string(Address window_object, std::string_view text);
     void autosave_frame(Address window_object);                             // when it has an autosave name
@@ -982,6 +996,11 @@ struct AppKit : std::enable_shared_from_this<AppKit> {
     std::string system_appearance_name();
     std::string host_path(std::string_view guest);
 };
+
+// -backingAlignedRect:options: (view.cpp): `rect` in points aligned to the
+// pixel grid of `scale` per NSAlignmentOptions (per axis exactly two of the
+// minimum edge, the maximum edge and the size; inward, outward or nearest).
+[[nodiscard]] Rect backing_aligned(Rect rect, double scale, std::uint64_t options);
 
 // A window's caption for the window server: title and subtitle (window.cpp).
 [[nodiscard]] std::string caption(AppKit& kit, const WindowState& state);

@@ -270,6 +270,28 @@ void AppKit::install_responder() {
         const auto next = send(s.x[0], "nextResponder").x0;
         s.x[0] = next ? send(next, "undoManager").x0 : 0;
     });
+    // Services: a responder that cannot handle the types asks the next one.
+    method(r, "validRequestorForSendType:returnType:", [this](CpuState& s, GuestMemory&) {
+        const auto next = send(s.x[0], "nextResponder").x0;
+        s.x[0] = next ? send_id(next, "validRequestorForSendType:returnType:", {s.x[2], s.x[3]}) : 0;
+    }, "@@:@@");
+    // Restorable state: the values at +restorableStateKeyPaths, encoded under
+    // their key paths. Alchemy keeps no restoration archive between launches,
+    // so -invalidateRestorableState has nothing to schedule.
+    class_method(r, "restorableStateKeyPaths", [this](CpuState& s, GuestMemory&) { s.x[0] = auto_array({}); });
+    method(r, "encodeRestorableStateWithCoder:", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], coder = s.x[2];
+        for (const auto path : items(send(send(self, "class").x0, "restorableStateKeyPaths").x0))
+            static_cast<void>(send_id(coder, "encodeObject:forKey:", {send_id(self, "valueForKeyPath:", {path}), path}));
+    }, "v@:@");
+    method(r, "restoreStateWithCoder:", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], coder = s.x[2];
+        for (const auto path : items(send(send(self, "class").x0, "restorableStateKeyPaths").x0)) {
+            if (!send_bool(coder, "containsValueForKey:", {path})) continue;
+            static_cast<void>(send_id(self, "setValue:forKeyPath:", {send_id(coder, "decodeObjectForKey:", {path}), path}));
+        }
+    }, "v@:@");
+    method(r, "invalidateRestorableState", [](CpuState&, GuestMemory&) {}, "v@:");
 }
 
 void AppKit::install() {
@@ -363,6 +385,7 @@ void AppKit::install() {
     install_application();
     install_window();
     install_window_autosave();
+    install_window_geometry();
     install_view();
     install_event();
     install_resources();

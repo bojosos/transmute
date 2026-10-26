@@ -102,6 +102,12 @@ void AppKitGaps::install_running_application() {
         const auto info = send(objc, objc.find_class("NSProcessInfo"), "processInfo");
         s.x[0] = info ? send(objc, info, "processName") : 0;
     });
+    // The application's icon (the running application is this process).
+    method(running, "icon", [this](CpuState& s, GuestMemory&) {
+        const auto image_class = objc.find_class("NSImage");
+        const auto name = bridge->autorelease(cf.string("NSApplicationIcon"));
+        s.x[0] = image_class ? send(objc, image_class, "imageNamed:", {name}) : 0;
+    });
     method(running, "bundleURL", [this](CpuState& s, GuestMemory&) {
         const auto bundle = call(core_foundation, "_CFBundleGetMainBundle", {});
         s.x[0] = bundle ? bridge->autorelease(call(core_foundation, "_CFBundleCopyBundleURL", {bundle})) : 0;

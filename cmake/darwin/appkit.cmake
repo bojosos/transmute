@@ -130,6 +130,9 @@ function(alchemy_gui_appkit_tests)
         src/alchemy/darwin/appkit/tests/windows_appkit_tests.cpp)
     # AppKit string drawing with arm64 NSTextAlignment values (pixels, fake window server).
     alchemy_gui_add_unit_test(alchemy_gui_appkit_text_alignment src/alchemy/darwin/appkit/tests/text_alignment_tests.cpp)
+    # The public API added for the selectors real applications send, over
+    # every provider (run_program's order) and the fake window server.
+    alchemy_gui_add_unit_test(alchemy_gui_appkit_api src/alchemy/darwin/appkit/tests/appkit_api_tests.cpp TIMEOUT 180)
     if(NOT ALCHEMY_GUI_FIXTURES_ENABLED)
         return()
     endif()

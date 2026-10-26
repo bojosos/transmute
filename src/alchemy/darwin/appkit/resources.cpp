@@ -546,6 +546,36 @@ void AppKit::install_resources() {
         const auto wanted = text(s.x[2]);
         s.x[0] = static_cast<Address>(index_where(s.x[0], [&](Address item) { return text(item_of(item)->title) == wanted; }));
     }, "q@:@");
+    method(mn, "indexOfItemWithRepresentedObject:", [this, item_of, index_where](CpuState& s, GuestMemory&) {
+        const auto wanted = s.x[2];
+        s.x[0] = static_cast<Address>(index_where(s.x[0], [&](Address item) {
+            const auto value = item_of(item)->represented_object;
+            return value == wanted || (value && wanted && send_bool(value, "isEqual:", {wanted}));
+        }));
+    }, "q@:@");
+    // A NULL action matches any item of the target.
+    method(mn, "indexOfItemWithTarget:andAction:", [item_of, index_where](CpuState& s, GuestMemory&) {
+        const auto target = s.x[2], action = s.x[3];
+        s.x[0] = static_cast<Address>(index_where(s.x[0], [&](Address item) {
+            const auto entry = item_of(item);
+            return entry->target == target && (!action || entry->action == action);
+        }));
+    }, "q@:@:");
+    // Sends the item's action as a click would, between the will/did send notifications.
+    method(mn, "performActionForItemAtIndex:", [this, menu_of, item_of](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto& list = menu_of(self)->items;
+        if (s.x[2] >= list.size()) fail("-[NSMenu performActionForItemAtIndex:] index beyond the items (NSRangeException)");
+        const auto item = list[s.x[2]];
+        const auto entry = item_of(item);
+        const auto key = string("MenuItem");
+        const std::vector<std::pair<Address, Address>> entries{{key, item}};
+        const auto info = autorelease(cf.dictionary(entries));
+        release(key);
+        post("NSMenuWillSendActionNotification", self, 0, {}, info);
+        if (entry->action) static_cast<void>(send_action(entry->action, entry->target, item));
+        post("NSMenuDidSendActionNotification", self, 0, {}, info);
+    }, "v@:q");
     // NSCopying: a menu of the receiver's class with the same title, flags,
     // font and (weak) delegate, holding a copy of every item (-copyWithZone:
     // of each, so their submenus are copied too). The copy has no supermenu.
@@ -624,6 +654,22 @@ void AppKit::install_resources() {
     }, "v@:@");
     method(mi, "hasSubmenu", [item_of](CpuState& s, GuestMemory&) { return_bool(s, item_of(s.x[0])->submenu != 0); }, "B@:");
     method(mi, "menu", [item_of](CpuState& s, GuestMemory&) { s.x[0] = item_of(s.x[0])->menu; });
+    // The menu that holds the item (not retained); the menu sets it on insertion.
+    method(mi, "setMenu:", [item_of](CpuState& s, GuestMemory&) { item_of(s.x[0])->menu = s.x[2]; }, "v@:@");
+    // The item whose submenu holds this one.
+    method(mi, "parentItem", [this, item_of](CpuState& s, GuestMemory&) {
+        const auto holder = item_of(s.x[0])->menu;
+        s.x[0] = 0;
+        const auto super_menu = holder ? objc.host_state<MenuState>(holder)->supermenu : 0;
+        if (!super_menu) return;
+        for (const auto candidate : objc.host_state<MenuState>(super_menu)->items)
+            if (item_of(candidate)->submenu == holder) { s.x[0] = candidate; return; }
+    });
+    method(mi, "isHiddenOrHasHiddenAncestor", [this, item_of](CpuState& s, GuestMemory&) {
+        bool hidden{};
+        for (auto item = s.x[0]; item && !hidden; item = send(item, "parentItem").x0) hidden = item_of(item)->hidden;
+        return_bool(s, hidden);
+    }, "B@:");
     method(mi, "isSeparatorItem", [item_of](CpuState& s, GuestMemory&) { return_bool(s, item_of(s.x[0])->separator); }, "B@:");
     method(mi, "isEnabled", [item_of](CpuState& s, GuestMemory&) { return_bool(s, item_of(s.x[0])->enabled); }, "B@:");
     method(mi, "setEnabled:", [item_of](CpuState& s, GuestMemory&) { item_of(s.x[0])->enabled = bool_arg(s, 2); }, "v@:B");
@@ -722,6 +768,26 @@ void AppKit::install_resources() {
         ++state->change_count;
         s.x[0] = static_cast<Address>(change_count(s.x[0]));
     }, "q@:");
+    // A fresh start of the contents (the options only restrict where they
+    // may go: the current host is the only one).
+    method(pb, "prepareForNewContentsWithOptions:", [this](CpuState& s, GuestMemory&) { s.x[0] = send(s.x[0], "clearContents").x0; }, "q@:Q");
+    // The contents go away with the pasteboard's resources.
+    method(pb, "releaseGlobally", [this, board](CpuState& s, GuestMemory&) {
+        if (!board(s.x[0])->general) static_cast<void>(send(s.x[0], "clearContents"));
+    }, "v@:");
+    // Windows lets every application read the clipboard without asking:
+    // NSPasteboardAccessBehaviorAlwaysAllow.
+    method(pb, "accessBehavior", [](CpuState& s, GuestMemory&) { s.x[0] = 2; }, "q@:");
+    // Data providers: each type is declared, and the provider writes its
+    // data at once (-pasteboard:provideDataForType:), which is what a
+    // reader would get from it.
+    method(pb, "setDataProvider:forTypes:", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], provider = s.x[2], types = s.x[3];
+        if (!provider || !responds(provider, "pasteboard:provideDataForType:")) fail("-[NSPasteboard setDataProvider:forTypes:] without a data provider");
+        static_cast<void>(send_id(self, "addTypes:owner:", {types, 0}));
+        for (const auto type : items(types)) static_cast<void>(send_id(provider, "pasteboard:provideDataForType:", {self, type}));
+        s.x[0] = 1;
+    }, "B@:@@");
     method(pb, "declareTypes:owner:", [this, board, change_count](CpuState& s, GuestMemory&) {
         const auto state = board(s.x[0]);
         state->declared.clear(); state->strings.clear();
@@ -881,9 +947,101 @@ void AppKit::install_resources() {
              {"dragLinkCursor", SystemCursor::drag_link}, {"dragCopyCursor", SystemCursor::drag_copy},
              {"contextualMenuCursor", SystemCursor::contextual_menu},
              {"IBeamCursorForVerticalLayout", SystemCursor::ibeam_vertical},
-             {"busyButClickableCursor", SystemCursor::wait}}) {
+             {"busyButClickableCursor", SystemCursor::wait},
+             // Column and row resizing use the horizontal and vertical resize shapes.
+             {"columnResizeCursor", SystemCursor::resize_left_right}, {"rowResizeCursor", SystemCursor::resize_up_down}}) {
         const auto value = kind;
         class_method(cu, name, [this, value](CpuState& s, GuestMemory&) { s.x[0] = make_cursor(value); });
+    }
+    // Cursors Windows has no system shape for, drawn once as image cursors
+    // (24 x 24, black on white): `key` names each beside the SystemCursor
+    // values in system_cursors.
+    const auto drawn_cursor = [this](int key, const std::function<void(const std::function<void(int, int, std::uint8_t)>&)>& draw,
+                                     Point hot_spot) {
+        {
+            std::lock_guard lock(mutex);
+            if (const auto found = system_cursors.find(key); found != system_cursors.end()) return found->second;
+        }
+        constexpr std::uint32_t size = 24;
+        Image pixels{size, size, std::vector<std::uint8_t>(size * size * 4, 0)};
+        draw([&](int x, int y, std::uint8_t value) {
+            if (x < 0 || y < 0 || x >= static_cast<int>(size) || y >= static_cast<int>(size)) return;
+            auto* p = &pixels.rgba[(static_cast<std::size_t>(y) * size + static_cast<std::size_t>(x)) * 4];
+            p[0] = p[1] = p[2] = value;
+            p[3] = 255;
+        });
+        const auto picture = image_from_pixels(pixels);
+        CallRegs registers;
+        registers.x[2] = picture;
+        put_point(registers, 0, hot_spot);
+        const auto value = send(send(cursor, "alloc").x0, "initWithImage:hotSpot:", registers).x0;
+        release(picture);
+        if (const auto record = process.objects().find(value)) record->immortal = true;
+        std::lock_guard lock(mutex);
+        return system_cursors.emplace(key, value).first->second;
+    };
+    // A double-headed diagonal arrow: from top-left to bottom-right, or
+    // mirrored from top-right to bottom-left.
+    const auto diagonal_cursor = [drawn_cursor](bool falling) {
+        return drawn_cursor(falling ? -3 : -4, [falling](const std::function<void(int, int, std::uint8_t)>& plot) {
+            const auto mirror = [falling](int x) { return falling ? x : 23 - x; };
+            for (const std::uint8_t value : {std::uint8_t{255}, std::uint8_t{0}}) {
+                const int grow = value == 255 ? 1 : 0;   // a white outline under the black arrow
+                for (int i = 4 - grow; i <= 19 + grow; ++i)
+                    for (int w = -grow; w <= 1 + grow; ++w) plot(mirror(i + w), i, value);
+                for (int i = 0; i <= 5 + grow; ++i)
+                    for (int w = -grow; w <= grow; ++w) {
+                        plot(mirror(3 + i + w), 3, value); plot(mirror(3 + w), 3 + i, value);       // the top-left head
+                        plot(mirror(20 - i + w), 20, value); plot(mirror(20 + w), 20 - i, value);   // the bottom-right head
+                    }
+            }
+        }, {11.5, 11.5});
+    };
+    // +frameResizeCursorFromPosition:inDirections: (NSCursorFrameResizePosition
+    // top 1, left 2, bottom 4, right 8; NSCursorFrameResizeDirections inward 1,
+    // outward 2): edges get the arrow of the direction, corners the diagonal shape.
+    class_method(cu, "frameResizeCursorFromPosition:inDirections:", [this, diagonal_cursor](CpuState& s, GuestMemory&) {
+        constexpr std::uint64_t top = 1, left = 2, bottom = 4, right = 8, inward = 1, outward = 2;
+        const auto position = s.x[2], directions = s.x[3] & (inward | outward);
+        const bool vertical_edge = (position & (top | bottom)) != 0, horizontal_edge = (position & (left | right)) != 0;
+        if (vertical_edge && horizontal_edge) {
+            s.x[0] = diagonal_cursor(((position & top) != 0) == ((position & left) != 0));
+            return;
+        }
+        SystemCursor kind{};
+        if (vertical_edge) {
+            const bool grows_up = (position & top) != 0;   // outward from the top edge is up
+            kind = directions == outward ? (grows_up ? SystemCursor::resize_up : SystemCursor::resize_down)
+                 : directions == inward ? (grows_up ? SystemCursor::resize_down : SystemCursor::resize_up)
+                                        : SystemCursor::resize_up_down;
+        } else if (horizontal_edge) {
+            const bool grows_left = (position & left) != 0;
+            kind = directions == outward ? (grows_left ? SystemCursor::resize_left : SystemCursor::resize_right)
+                 : directions == inward ? (grows_left ? SystemCursor::resize_right : SystemCursor::resize_left)
+                                        : SystemCursor::resize_left_right;
+        } else {
+            fail("+[NSCursor frameResizeCursorFromPosition:inDirections:] with no edge");
+        }
+        s.x[0] = make_cursor(kind);
+    });
+    // Zoom in / out: a magnifying glass with a plus or a minus.
+    for (const bool zoom_in : {true, false}) {
+        class_method(cu, zoom_in ? "zoomInCursor" : "zoomOutCursor", [drawn_cursor, zoom_in](CpuState& s, GuestMemory&) {
+            constexpr double cx = 9.5, cy = 9.5;
+            s.x[0] = drawn_cursor(zoom_in ? -1 : -2, [zoom_in](const std::function<void(int, int, std::uint8_t)>& plot) {
+                for (int y = 0; y < 24; ++y)
+                    for (int x = 0; x < 24; ++x) {
+                        const double r = std::hypot(x + 0.5 - cx, y + 0.5 - cy);
+                        if (r <= 8.5) plot(x, y, r >= 6.0 ? 0 : 255);                    // the ring over a white lens
+                        const double along = (x + y + 1 - 2 * cx) / 2.0, across = std::abs(x - y) / 1.4142;
+                        if (along > 6.5 && along < 13.0 && across <= 1.8) plot(x, y, 0);  // the handle
+                    }
+                for (int i = 6; i <= 13; ++i) {
+                    plot(i, 9, 0); plot(i, 10, 0);                                    // minus
+                    if (zoom_in) { plot(9, i, 0); plot(10, i, 0); }                   // plus
+                }
+            }, {cx, cy});
+        });
     }
     const auto custom = [this](Address self, Address picture, Point hot_spot) {
         const auto state = objc.host_state<CursorState>(self);
@@ -982,6 +1140,28 @@ void AppKit::install_resources() {
     }, "B@:@");
     method(im, "isTemplate", [image_of](CpuState& s, GuestMemory&) { return_bool(s, image_of(s.x[0])->template_image); }, "B@:");
     method(im, "setTemplate:", [image_of](CpuState& s, GuestMemory&) { image_of(s.x[0])->template_image = bool_arg(s, 2); }, "v@:B");
+    // The colour drawn behind the representations (clear by default).
+    method(im, "backgroundColor", [this, image_of](CpuState& s, GuestMemory&) {
+        const auto value = image_of(s.x[0])->background_color;
+        s.x[0] = value ? value : send(color, "clearColor").x0;
+    });
+    method(im, "setBackgroundColor:", [this, image_of](CpuState& s, GuestMemory&) { assign(image_of(s.x[0])->background_color, s.x[2]); }, "v@:@");
+    method(im, "accessibilityDescription", [image_of](CpuState& s, GuestMemory&) { s.x[0] = image_of(s.x[0])->accessibility_description; });
+    method(im, "setAccessibilityDescription:", [this, image_of](CpuState& s, GuestMemory&) {
+        release(std::exchange(image_of(s.x[0])->accessibility_description, s.x[2] ? cf.copy(s.x[2]) : 0));
+    }, "v@:@");
+    // Cap insets and the resizing mode (how the middle stretches when the
+    // image is drawn larger).
+    method(im, "capInsets", [image_of](CpuState& s, GuestMemory&) {
+        const auto insets = image_of(s.x[0])->cap_insets;
+        for (unsigned i = 0; i < 4; ++i) set_d(s, i, insets[i]);
+    }, "{NSEdgeInsets=dddd}@:");
+    method(im, "setCapInsets:", [image_of](CpuState& s, GuestMemory&) {
+        auto& insets = image_of(s.x[0])->cap_insets;
+        for (unsigned i = 0; i < 4; ++i) insets[i] = d(s, i);
+    }, "v@:{NSEdgeInsets=dddd}");
+    method(im, "resizingMode", [image_of](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(image_of(s.x[0])->resizing_mode); }, "q@:");
+    method(im, "setResizingMode:", [image_of](CpuState& s, GuestMemory&) { image_of(s.x[0])->resizing_mode = static_cast<std::int64_t>(s.x[2]); }, "v@:q");
     // Named images: the system name NSApplicationIcon (nibs archive the
     // application icon as an NSCustomResource) is the main bundle's icon,
     // kept once made (make_application_icon). Image catalogs and other
@@ -1044,6 +1224,10 @@ void AppKit::install_resources() {
         auto to = std::make_shared<ImageState>();
         to->size = from->size;
         to->template_image = from->template_image;
+        to->background_color = retain(from->background_color);
+        to->accessibility_description = retain(from->accessibility_description);
+        to->cap_insets = from->cap_insets;
+        to->resizing_mode = from->resizing_mode;
         const auto originals = from->representations;
         for (const auto rep : originals)
             to->representations.push_back(objc.responds(rep, sel("copyWithZone:")) ? send_id(rep, "copyWithZone:", {s.x[2]}) : retain(rep));
@@ -1054,6 +1238,8 @@ void AppKit::install_resources() {
         if (const auto state = objc.find_host_state<ImageState>(s.x[0])) {
             for (const auto rep : std::exchange(state->representations, {})) release(rep);
             release(std::exchange(state->name, 0));
+            release(std::exchange(state->background_color, 0));
+            release(std::exchange(state->accessibility_description, 0));
         }
         static_cast<void>(objc.send_super(s.x[0], image, sel("dealloc")));
     }, "v@:");
@@ -1071,6 +1257,24 @@ void AppKit::install_resources() {
         const auto name = rep_of(s.x[0])->color_space_name;
         s.x[0] = name ? name : auto_string("NSDeviceRGBColorSpace");
     });
+    method(ir, "setColorSpaceName:", [this, rep_of](CpuState& s, GuestMemory&) {
+        release(std::exchange(rep_of(s.x[0])->color_space_name, s.x[2] ? cf.copy(s.x[2]) : 0));
+    }, "v@:@");
+    method(ir, "isOpaque", [rep_of](CpuState& s, GuestMemory&) {
+        const auto state = rep_of(s.x[0]);
+        return_bool(s, state->opaque.value_or(!state->has_alpha));
+    }, "B@:");
+    method(ir, "setOpaque:", [rep_of](CpuState& s, GuestMemory&) { rep_of(s.x[0])->opaque = bool_arg(s, 2); }, "v@:B");
+    method(ir, "setAlpha:", [rep_of](CpuState& s, GuestMemory&) { rep_of(s.x[0])->has_alpha = bool_arg(s, 2); }, "v@:B");
+    method(ir, "setPixelsWide:", [rep_of](CpuState& s, GuestMemory&) { rep_of(s.x[0])->width = static_cast<std::int64_t>(s.x[2]); }, "v@:q");
+    method(ir, "setPixelsHigh:", [rep_of](CpuState& s, GuestMemory&) { rep_of(s.x[0])->height = static_cast<std::int64_t>(s.x[2]); }, "v@:q");
+    method(ir, "setBitsPerSample:", [rep_of](CpuState& s, GuestMemory&) { rep_of(s.x[0])->bits_per_sample = static_cast<std::int64_t>(s.x[2]); }, "v@:q");
+    // A bitmap representation is its own CGImage.
+    method(ir, "CGImageForProposedRect:context:hints:", [this](CpuState& s, GuestMemory&) {
+        if (!responds(s.x[0], "CGImage"))
+            unsupported("-[NSImageRep CGImageForProposedRect:context:hints:] of a representation that is not a bitmap");
+        s.x[0] = send(s.x[0], "CGImage").x0;
+    }, "^{CGImage=}@:^{CGRect={CGPoint=dd}{CGSize=dd}}@@");
     const auto init_bitmap = [this, rep_of](CpuState& s, GuestMemory& m, bool with_format) {
         const auto state = rep_of(s.x[0]);
         if (state->data) fail("NSBitmapImageRep initialized twice");
@@ -1122,6 +1326,37 @@ void AppKit::install_resources() {
     }, "q@:");
     method(br, "samplesPerPixel", [rep_of](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(rep_of(s.x[0])->samples_per_pixel); }, "q@:");
     method(br, "isPlanar", [rep_of](CpuState& s, GuestMemory&) { return_bool(s, rep_of(s.x[0])->planar); }, "B@:");
+    // Raw samples of one pixel (top-left origin), one NSUInteger each.
+    const auto sample_at = [this, rep_of](Address self, Address x, Address y, std::string_view what) {
+        const auto state = rep_of(self);
+        if (state->planar && state->samples_per_pixel > 1) unsupported("planar NSBitmapImageRep data");
+        if (state->bits_per_sample != 8 && state->bits_per_sample != 16)
+            unsupported(std::string(what) + " with " + std::to_string(state->bits_per_sample) + "-bit samples");
+        if (static_cast<std::int64_t>(x) < 0 || static_cast<std::int64_t>(x) >= state->width || static_cast<std::int64_t>(y) < 0 ||
+            static_cast<std::int64_t>(y) >= state->height)
+            fail(std::string(what) + " outside the bitmap");
+        return state->data + y * static_cast<Address>(state->bytes_per_row) + x * static_cast<Address>(state->bits_per_pixel / 8);
+    };
+    method(br, "getPixel:atX:y:", [rep_of, sample_at](CpuState& s, GuestMemory& m) {
+        const auto state = rep_of(s.x[0]);
+        const auto at = sample_at(s.x[0], s.x[3], s.x[4], "-[NSBitmapImageRep getPixel:atX:y:]");
+        const auto width = static_cast<Address>(state->bits_per_sample / 8);
+        for (std::int64_t i = 0; i < state->samples_per_pixel; ++i)
+            m.write64(s.x[2] + 8 * i, width == 1 ? m.read8(at + i) : m.read8(at + 2 * i) | (m.read8(at + 2 * i + 1) << 8));
+    }, "v@:^Qqq");
+    method(br, "setPixel:atX:y:", [rep_of, sample_at](CpuState& s, GuestMemory& m) {
+        const auto state = rep_of(s.x[0]);
+        const auto at = sample_at(s.x[0], s.x[3], s.x[4], "-[NSBitmapImageRep setPixel:atX:y:]");
+        const auto width = static_cast<Address>(state->bits_per_sample / 8);
+        for (std::int64_t i = 0; i < state->samples_per_pixel; ++i) {
+            const auto value = m.read64(s.x[2] + 8 * i);
+            if (width == 1) m.write8(at + i, static_cast<std::uint8_t>(value));
+            else {
+                m.write8(at + 2 * i, static_cast<std::uint8_t>(value));
+                m.write8(at + 2 * i + 1, static_cast<std::uint8_t>(value >> 8));
+            }
+        }
+    }, "v@:^Qqq");
     method(br, "numberOfPlanes", [rep_of](CpuState& s, GuestMemory&) {
         const auto state = rep_of(s.x[0]);
         s.x[0] = state->planar ? static_cast<Address>(state->samples_per_pixel) : 1;
@@ -1198,13 +1433,45 @@ void AppKit::install_resources() {
              {"darkGrayColor", {1.0 / 3, 1.0 / 3, 1.0 / 3, 1}}, {"yellowColor", {1, 1, 0, 1}}, {"cyanColor", {0, 1, 1, 1}},
              {"magentaColor", {1, 0, 1, 1}}, {"orangeColor", {1, 0.5, 0, 1}}, {"brownColor", {0.6, 0.4, 0.2, 1}},
              {"purpleColor", {0.5, 0, 0.5, 1}},
-             {"controlAccentColor", {0, 0.48, 1, 1}}, {"selectedTextBackgroundColor", {0.7, 0.84, 1, 1}}}) {
+             {"controlAccentColor", {0, 0.48, 1, 1}}, {"selectedTextBackgroundColor", {0.7, 0.84, 1, 1}},
+             // The Touch Bar scrubber's background: its dark tone, without the texture.
+             {"scrubberTexturedBackgroundColor", {0.18, 0.18, 0.18, 1}}}) {
         const auto value = rgba;
         const std::string key = name;
         class_method(co, name, [this, value, key](CpuState& s, GuestMemory&) {
             s.x[0] = shared_color(key, [&] { return color_object(value[0], value[1], value[2], value[3]); });
         });
     }
+    // Components in a colour space by its model (NSColorSpaceModel gray 0,
+    // RGB 1, CMYK 2), the last component being alpha when present.
+    class_method(co, "colorWithColorSpace:components:count:", [this](CpuState& s, GuestMemory& m) {
+        const auto space = s.x[2], components = s.x[3];
+        const auto count = static_cast<std::int64_t>(s.x[4]);
+        if (!space || !components || count <= 0) fail("+[NSColor colorWithColorSpace:components:count:] without components");
+        const auto model = static_cast<std::int64_t>(send(space, "colorSpaceModel").x0);
+        std::vector<double> c(static_cast<std::size_t>(count));
+        for (std::int64_t i = 0; i < count; ++i) c[static_cast<std::size_t>(i)] = std::bit_cast<double>(m.read64(components + 8 * i));
+        const auto alpha = [&](std::int64_t index) { return count > index ? c[static_cast<std::size_t>(index)] : 1.0; };
+        switch (model) {
+        case 0:
+            s.x[0] = color_object(c[0], c[0], c[0], alpha(1));
+            objc.host_state<ColorState>(s.x[0])->white = true;
+            break;
+        case 1:
+            if (count < 3) fail("+[NSColor colorWithColorSpace:components:count:] needs three RGB components");
+            s.x[0] = color_object(c[0], c[1], c[2], alpha(3));
+            break;
+        case 2: {
+            if (count < 4) fail("+[NSColor colorWithColorSpace:components:count:] needs four CMYK components");
+            const double k = 1 - c[3];
+            s.x[0] = color_object((1 - c[0]) * k, (1 - c[1]) * k, (1 - c[2]) * k, alpha(4));
+            break;
+        }
+        default: unsupported("+[NSColor colorWithColorSpace:components:count:] in colour space model " + std::to_string(model));
+        }
+    }, "@@:@^dq");
+    // NSBlueControlTint: the accent colour is blue.
+    class_method(co, "currentControlTint", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "Q@:");
     method(co, "colorWithAlphaComponent:", [this, color_of](CpuState& s, GuestMemory&) {
         const auto state = color_of(s.x[0]);
         s.x[0] = color_object(state->red, state->green, state->blue, d(s, 0));
