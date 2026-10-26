@@ -285,6 +285,8 @@ struct ViewState final : ResponderState {
     std::vector<Address> gesture_recognizers; // +1 (controls_more.cpp)
     // Auto Layout (kit/completion/windows/auto_layout.cpp).
     std::vector<Address> constraints;         // +1 the NSLayoutConstraints this view holds (-constraints)
+    std::vector<Address> layout_guides;       // +1 NSLayoutGuides it owns (-layoutGuides and the system guides)
+    std::array<double, 4> additional_safe_area{};   // -additionalSafeAreaInsets {top, left, bottom, right}
     bool translates_autoresizing{true};       // -translatesAutoresizingMaskIntoConstraints
     std::array<float, 2> hugging{250, 250}, compression{750, 750};   // by NSLayoutConstraintOrientation
     bool needs_layout{}, needs_update_constraints{true};
@@ -302,6 +304,17 @@ struct ViewState final : ResponderState {
     // State of AppKit subclasses (controls, scroll views, text views...):
     // one object carries one payload, so subclasses extend the view this way.
     std::shared_ptr<ObjectPayload> extension;
+};
+
+// NSLayoutGuide (kit/completion/windows/auto_layout.cpp). System guides
+// (a view's safe area and layout margins, a window's content layout) sit
+// inside their owner by insets; custom guides are placed by constraints.
+struct GuideState final : ObjectPayload {
+    enum class Kind { custom, safe_area, margins, content_layout };
+    Kind kind{Kind::custom};
+    Address owner{};                          // the owning view (not retained: the view holds its guides)
+    Address identifier{};                     // +1
+    Rect frame;                               // a custom guide's solved frame, in the owner's coordinates
 };
 
 struct ApplicationState final : ResponderState {

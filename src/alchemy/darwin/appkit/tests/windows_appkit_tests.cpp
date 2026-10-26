@@ -741,6 +741,206 @@ std::vector<Address> Fixture::foundation_items(Address array) {
     return values;
 }
 
+// Layout guides, safe areas and the window's content layout guide (the frameworks wave, U10).
+void layout_guides_and_safe_areas(Fixture& f) {
+    const auto window = f.make_window({{100, 100}, {400, 300}});
+    const auto content = f.id(window, "contentView");
+    const auto guide = f.id(f.id(f.cls("NSLayoutGuide"), "alloc"), "init");
+    static_cast<void>(f.id(guide, "setIdentifier:", {f.str("u10 guide")}));
+    static_cast<void>(f.id(content, "addLayoutGuide:", {guide}));
+    require(f.id(guide, "owningView") == content && f.foundation_items(f.id(content, "layoutGuides")) == std::vector<Address>{guide} &&
+                f.text(f.id(guide, "identifier")) == "u10 guide",
+            "a custom guide belongs to its view");
+    f.anchor_constraint(guide, "leadingAnchor", "constraintEqualTo", content, "leadingAnchor", 10);
+    f.anchor_constraint(guide, "trailingAnchor", "constraintEqualTo", content, "trailingAnchor", -10);
+    f.anchor_constraint(guide, "topAnchor", "constraintEqualTo", content, "topAnchor", 20);
+    f.size_constraint(guide, "heightAnchor", "constraintEqualTo", 100);
+    const auto v = f.view({{0, 0}, {10, 10}});
+    static_cast<void>(f.id(v, "setTranslatesAutoresizingMaskIntoConstraints:", {0}));
+    static_cast<void>(f.id(content, "addSubview:", {v}));
+    f.anchor_constraint(v, "leadingAnchor", "constraintEqualTo", guide, "leadingAnchor", 0);
+    f.anchor_constraint(v, "trailingAnchor", "constraintEqualTo", guide, "centerXAnchor", 0);
+    f.anchor_constraint(v, "topAnchor", "constraintEqualTo", guide, "bottomAnchor", 5);
+    f.anchor_constraint(v, "heightAnchor", "constraintEqualTo", guide, "heightAnchor", 0);
+    static_cast<void>(f.id(window, "layoutIfNeeded"));
+    const auto guide_frame = gui::appkit::result_rect(f.send(guide, "frame"));
+    require(std::abs(guide_frame.origin.x - 10) < 0.01 && std::abs(guide_frame.origin.y - 180) < 0.01 &&
+                std::abs(guide_frame.size.width - 380) < 0.01 && std::abs(guide_frame.size.height - 100) < 0.01,
+            "the guide's solved frame in its owner's coordinates");
+    expect_frame(f, v, {{10, 75}, {190, 100}}, "a view placed against the guide");
+    require(f.foundation_items(f.id(guide, "constraintsAffectingLayoutForOrientation:", {0})).size() == 4 &&
+                f.foundation_items(f.id(guide, "constraintsAffectingLayoutForOrientation:", {1})).size() == 4,
+            "the constraints that refer to the guide, by axis");
+    bool stopped{};
+    try { static_cast<void>(f.id(guide, "hasAmbiguousLayout")); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "layout ambiguity stops explicitly");
+    static_cast<void>(f.id(content, "removeLayoutGuide:", {guide}));
+    require(f.id(guide, "owningView") == 0 && f.foundation_items(f.id(content, "layoutGuides")).empty() &&
+                f.objc.find_host_state<gui::appkit::ViewState>(content)->constraints.empty(),
+            "removing the guide drops the constraints that refer to it");
+    bool refused{};
+    try { f.anchor_constraint(guide, "leadingAnchor", "constraintEqualTo", content, "leadingAnchor", 0); } catch (const std::exception&) { refused = true; }
+    require(refused, "a guide without an owning view cannot be constrained");
+    static_cast<void>(f.id(window, "close"));
+
+    // A full-size content view: the safe area starts below the title bar.
+    CallRegs init;
+    gui::appkit::put_rect(init, 0, {{100, 100}, {400, 300}});
+    init.x[2] = gui::style::titled | gui::style::closable | gui::style::resizable | gui::style::full_size_content_view;
+    init.x[3] = 2;
+    const auto full = f.send(f.id(f.cls("NSWindow"), "alloc"), "initWithContentRect:styleMask:backing:defer:", init).x0;
+    static_cast<void>(f.id(full, "setReleasedWhenClosed:", {0}));
+    const auto top_content = f.id(full, "contentView");
+    const auto layout_rect = gui::appkit::result_rect(f.send(full, "contentLayoutRect"));
+    const double band = 300 - layout_rect.size.height;
+    const auto insets = [&f](Address view) {
+        const auto r = f.send(view, "safeAreaInsets");
+        return std::array<double, 4>{r.d(0), r.d(1), r.d(2), r.d(3)};
+    };
+    require(band > 0 && insets(top_content) == std::array<double, 4>{band, 0, 0, 0}, "the content view's safe area is below the title bar");
+    const auto child = f.view({{0, 0}, {400, 300}});
+    static_cast<void>(f.id(top_content, "addSubview:", {child}));
+    CallRegs extra;
+    for (unsigned i = 0; i < 4; ++i) extra.set_d(i, std::array<double, 4>{10, 5, 0, 0}[i]);
+    static_cast<void>(f.send(top_content, "setAdditionalSafeAreaInsets:", extra));
+    require(insets(top_content) == std::array<double, 4>{band + 10, 5, 0, 0} && insets(child) == std::array<double, 4>{band + 10, 5, 0, 0} &&
+                f.send(top_content, "additionalSafeAreaInsets").d(0) == 10,
+            "additional insets narrow the view's safe area and its subviews'");
+    const auto safe = f.id(top_content, "safeAreaLayoutGuide"), margins = f.id(top_content, "layoutMarginsGuide");
+    require(safe && safe == f.id(top_content, "safeAreaLayoutGuide") && margins && safe != margins &&
+                f.foundation_items(f.id(top_content, "layoutGuides")).empty(),
+            "the system guides are made once and are not custom guides");
+    const auto in_safe = f.view({{0, 0}, {10, 10}}), in_margins = f.view({{0, 0}, {10, 10}});
+    for (const auto [view, guide_object] : {std::pair{in_safe, safe}, std::pair{in_margins, margins}}) {
+        static_cast<void>(f.id(view, "setTranslatesAutoresizingMaskIntoConstraints:", {0}));
+        static_cast<void>(f.id(top_content, "addSubview:", {view}));
+        for (const auto* edge : {"leadingAnchor", "trailingAnchor", "topAnchor", "bottomAnchor"})
+            f.anchor_constraint(view, edge, "constraintEqualTo", guide_object, edge, 0);
+    }
+    static_cast<void>(f.id(full, "layoutIfNeeded"));
+    expect_frame(f, in_safe, {{5, 0}, {395, 300 - band - 10}}, "a view pinned to the safe area guide");
+    expect_frame(f, in_margins, {{25, 20}, {355, 300 - band - 10 - 40}}, "a view pinned to the layout margins guide");
+    // The window's content layout guide is its content layout rectangle.
+    const auto content_guide = f.id(full, "contentLayoutGuide");
+    const auto content_frame = gui::appkit::result_rect(f.send(content_guide, "frame"));
+    require(content_guide && f.id(content_guide, "owningView") == top_content && std::abs(content_frame.size.height - layout_rect.size.height) < 0.01 &&
+                std::abs(content_frame.size.width - 400) < 0.01 && std::abs(content_frame.origin.y) < 0.01,
+            "the window's content layout guide");
+    // Insets that change move the views in the next pass.
+    for (unsigned i = 0; i < 4; ++i) extra.set_d(i, 0);
+    static_cast<void>(f.send(top_content, "setAdditionalSafeAreaInsets:", extra));
+    static_cast<void>(f.id(full, "layoutIfNeeded"));
+    expect_frame(f, in_safe, {{0, 0}, {400, 300 - band}}, "the safe area guide follows the insets");
+    static_cast<void>(f.id(full, "close"));
+}
+
+// NSSplitView holding priorities and NSSplitViewController / NSSplitViewItem (the frameworks wave, U10).
+void split_views_and_controllers(Fixture& f) {
+    // A plain split view: the lowest holding priority takes a resize.
+    const auto split = f.view({{0, 0}, {300, 100}}, "NSSplitView");
+    static_cast<void>(f.id(split, "setVertical:", {1}));
+    const auto one = f.view({{0, 0}, {100, 100}}), two = f.view({{0, 0}, {100, 100}});
+    for (const auto pane : {one, two}) static_cast<void>(f.id(split, "addArrangedSubview:", {pane}));
+    const double divider = f.send(split, "dividerThickness").d(0);
+    CallRegs position;
+    position.set_d(0, 100);
+    position.x[2] = 0;
+    static_cast<void>(f.send(split, "setPosition:ofDividerAtIndex:", position));
+    CallRegs holding;
+    holding.set_s(0, 260.0f);
+    holding.x[2] = 0;
+    static_cast<void>(f.send(split, "setHoldingPriority:forSubviewAtIndex:", holding));
+    require(std::abs(f.send(split, "holdingPriorityForSubviewAtIndex:", [] { CallRegs r; r.x[2] = 0; return r; }()).s(0) - 260) < 1e-6 &&
+                std::abs(f.send(split, "holdingPriorityForSubviewAtIndex:", [] { CallRegs r; r.x[2] = 1; return r; }()).s(0) - 250) < 1e-6,
+            "holding priorities by subview index");
+    CallRegs grow;
+    gui::appkit::put_size(grow, 0, {400, 100});
+    static_cast<void>(f.send(split, "setFrameSize:", grow));
+    require(std::abs(f.frame(one).size.width - 100) < 0.01 && std::abs(f.frame(two).size.width - (300 - divider)) < 0.01,
+            "the higher holding priority keeps its size");
+
+    // A split view controller with a sidebar, a content pane and a collapsed inspector.
+    const auto pane_class = f.subclass("U10PaneController", "NSViewController");
+    f.add(pane_class, "loadView", [&f](CpuState& s, GuestMemory&) {
+        journal.push_back("loaded");
+        static_cast<void>(f.id(s.x[0], "setView:", {f.view({{0, 0}, {50, 50}})}));
+    }, "v@:");
+    const auto vc1 = f.id(f.id(pane_class, "alloc"), "init"), vc2 = f.id(f.id(pane_class, "alloc"), "init"), vc3 = f.id(f.id(pane_class, "alloc"), "init");
+    const auto item_class = f.cls("NSSplitViewItem");
+    const auto sidebar = f.id(item_class, "sidebarWithViewController:", {vc1});
+    const auto main_item = f.id(item_class, "splitViewItemWithViewController:", {vc2});
+    const auto inspector = f.id(item_class, "inspectorWithViewController:", {vc3});
+    require((f.id(sidebar, "canCollapse") & 0xff) && (f.id(sidebar, "isSpringLoaded") & 0xff) && f.id(sidebar, "behavior") == 1 &&
+                std::abs(f.send(sidebar, "preferredThicknessFraction").d(0) - 0.15) < 1e-9 && std::abs(f.send(sidebar, "holdingPriority").s(0) - 250) < 1e-6,
+            "sidebar defaults");
+    require(f.id(inspector, "behavior") == 3 && f.send(inspector, "minimumThickness").d(0) == 270 && f.send(inspector, "maximumThickness").d(0) == 270 &&
+                f.id(main_item, "behavior") == 0 && (f.id(main_item, "canCollapse") & 0xff) == 0 && f.send(main_item, "preferredThicknessFraction").d(0) < 0,
+            "inspector and plain item defaults");
+    static_cast<void>(f.id(inspector, "setCollapsed:", {1}));
+    const auto svc = f.id(f.id(f.cls("NSSplitViewController"), "alloc"), "init");
+    for (const auto item : {sidebar, main_item, inspector}) static_cast<void>(f.id(svc, "addSplitViewItem:", {item}));
+    const auto split_view = f.id(svc, "splitView");
+    static_cast<void>(f.id(split_view, "setVertical:", {1}));
+    require(f.id(split_view, "delegate") == svc && f.foundation_items(f.id(svc, "childViewControllers")).size() == 3 &&
+                f.id(svc, "splitViewItemForViewController:", {vc1}) == sidebar,
+            "the controller delegates its split view and holds the items' view controllers");
+    journal.clear();
+    const auto window = f.make_window({{100, 100}, {800, 500}});
+    static_cast<void>(f.id(window, "setContentView:", {f.id(svc, "view")}));
+    require(f.id(svc, "view") == split_view && journal.size() == 2 && (f.id(vc3, "isViewLoaded") & 0xff) == 0 &&
+                f.foundation_items(f.id(split_view, "arrangedSubviews")).size() == 2,
+            "views load lazily: the collapsed inspector's view is not loaded");
+    const auto width = [&f](Address vc) { return f.frame(f.id(vc, "view")).size.width; };
+    const double gap = f.send(split_view, "dividerThickness").d(0);
+    require(std::abs(f.frame(split_view).size.width - 800) < 0.01 && std::abs(width(vc1) - 120) < 0.01 &&
+                std::abs(width(vc2) - (800 - gap - 120)) < 0.01,
+            "the sidebar takes its preferred fraction, the content the rest");
+    CallRegs priority;
+    priority.set_s(0, 260.0f);
+    static_cast<void>(f.send(sidebar, "setHoldingPriority:", priority));
+    f.set_size(window, {1000, 500});
+    require(std::abs(width(vc1) - 120) < 0.01 && std::abs(width(vc2) - (1000 - gap - 120)) < 0.01, "a resize goes to the lowest holding priority");
+    static_cast<void>(f.id(svc, "toggleSidebar:", {0}));
+    require((f.id(sidebar, "isCollapsed") & 0xff) && width(vc1) == 0 && (f.id(f.id(vc1, "view"), "isHidden") & 0xff) &&
+                std::abs(width(vc2) - (1000 - gap)) < 0.01,
+            "-toggleSidebar: collapses the sidebar; the content takes its space");
+    static_cast<void>(f.id(svc, "toggleSidebar:", {0}));
+    require((f.id(sidebar, "isCollapsed") & 0xff) == 0 && std::abs(width(vc1) - 120) < 0.01 && std::abs(width(vc2) - (1000 - gap - 120)) < 0.01,
+            "and expands it to its former thickness");
+    static_cast<void>(f.id(f.id(inspector, "animator"), "setCollapsed:", {0}));
+    require(journal.size() == 3 && f.foundation_items(f.id(split_view, "arrangedSubviews")).size() == 3 &&
+                std::abs(width(vc3) - 270) < 0.01 && std::abs(width(vc2) - (1000 - 2 * gap - 120 - 270)) < 0.01,
+            "the inspector's view loads when it expands, at its fixed thickness");
+    CallRegs limit;
+    limit.x[2] = split_view;
+    limit.set_d(0, 0);
+    limit.x[3] = 1;
+    require(std::abs(f.send(svc, "splitView:constrainMinCoordinate:ofSubviewAt:", limit).d(0) - (1000 - gap - 270)) < 0.01,
+            "a divider keeps the inspector within its thickness");
+    CallRegs menu_item;
+    menu_item.x[2] = f.str("Toggle Sidebar");
+    menu_item.x[3] = f.objc.selector("toggleSidebar:");
+    menu_item.x[4] = f.str("");
+    const auto toggle = f.send(f.id(f.cls("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:", menu_item).x0;
+    require((f.id(svc, "validateUserInterfaceItem:", {toggle}) & 0xff) != 0, "the sidebar toggle validates");
+    // Sidebars collapse below the inline threshold and expand above it.
+    CallRegs threshold;
+    threshold.set_d(0, 200);
+    static_cast<void>(f.send(svc, "setMinimumThicknessForInlineSidebars:", threshold));
+    require((f.id(sidebar, "isCollapsed") & 0xff) != 0, "a sidebar thinner than the inline threshold collapses");
+    threshold.set_d(0, 100);
+    static_cast<void>(f.send(svc, "setMinimumThicknessForInlineSidebars:", threshold));
+    require((f.id(sidebar, "isCollapsed") & 0xff) == 0 && std::abs(width(vc1) - 120) < 0.01, "and expands when it fits again");
+    static_cast<void>(f.id(svc, "removeSplitViewItem:", {main_item}));
+    require(f.foundation_items(f.id(svc, "splitViewItems")).size() == 2 && f.id(vc2, "parentViewController") == 0 &&
+                f.foundation_items(f.id(split_view, "arrangedSubviews")).size() == 2,
+            "removing an item removes its pane and child view controller");
+    bool stopped{};
+    try { static_cast<void>(f.id(sidebar, "addTopAlignedAccessoryViewController:", {vc2})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "accessory view controllers stop explicitly");
+    static_cast<void>(f.id(window, "close"));
+}
+
 void auto_layout_tests() {
     Fixture f;
     anchors_and_window_pass(f);
@@ -756,6 +956,8 @@ void auto_layout_tests() {
     workspace_and_dragging(f);
     popovers(f);
     drag_sessions(f);
+    layout_guides_and_safe_areas(f);
+    split_views_and_controllers(f);
 }
 
 } // namespace windows_appkit_tests

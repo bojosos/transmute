@@ -1,3 +1,4 @@
+#include "alchemy/darwin/appkit/split_view_controller.hpp"
 #include "alchemy/darwin/appkit/status_items.hpp"
 #include "alchemy/darwin/appkit/c_functions.hpp"
 #include "alchemy/darwin/appkit/appkit_internal.hpp"
@@ -406,6 +407,7 @@ void AppKit::install() {
     install_status_items(*this);  // NSStatusBar, NSStatusItem, NSSound (status_items.cpp)
     install_hitoolbox();
     install_controllers();
+    install_split_view_controller(*this);   // after the view controllers: NSSplitViewController, NSSplitViewItem (split_view_controller.cpp)
     install_documents();
     install_user_defaults_controller();
     install_nib();

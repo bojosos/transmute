@@ -73,6 +73,31 @@ AVAudioPlayer (WAVE, AIFF, CAF): play, pause, resume, stop, volume, time,
 loops and the delegate; +soundNamed: finds named, bundled and
 /System/Library/Sounds sounds (the system sounds are not installed).
 
+**Layout guides and safe areas (`windows/auto_layout.cpp`):** NSLayoutGuide
+is a constraint item like a view: a custom guide owned by a view gets its
+frame from the solution, and removing it drops the constraints that refer
+to it. A view's safe area is the part below a full-size content view's
+title bar, within its superview's safe area, less the additional insets of
+the view and its superviews; -safeAreaLayoutGuide, -layoutMarginsGuide (20
+points inside the safe area, the standard spacing to a superview's edge)
+and NSWindow's -contentLayoutGuide follow their insets in every layout
+pass. -constraintsAffectingLayoutForOrientation: lists the NSLayoutConstraints
+on that axis (not the engine's own content-size and autoresizing ones);
+-hasAmbiguousLayout and -exerciseAmbiguityInLayout stop explicitly (the
+solver always settles on one solution).
+
+**Split views (`containers.cpp`, `split_view_controller.cpp`):** a resized
+NSSplitView gives the change to the panes of the lowest holding priority;
+divider drags ask the delegate for their limits. NSSplitViewController's
+view is its split view, which it delegates; items' views load lazily and
+take their preferred fraction (sidebars 0.15, content lists 0.28 / 0.33),
+within their minimum and maximum thickness (inspectors 270). Collapsing
+and the sidebar / inspector toggles apply at once; sidebars collapse below
+the inline threshold and expand above it. The standard sidebar and
+content-list thicknesses are not published, so they are unspecified;
+archived split view controllers and items, and accessory view controllers,
+stop explicitly.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

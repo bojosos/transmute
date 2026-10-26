@@ -58,6 +58,8 @@ struct SplitState final : ObjectPayload {
     std::int64_t divider_style{1};                        // NSSplitViewDividerStyleThick
     Address delegate{};
     Address autosave_name{};                              // +1
+    std::vector<float> holding;                           // by subview index (NSLayoutPriorityDefaultLow when absent)
+    bool spring_loaded{};
 };
 struct ColumnState final : ObjectPayload {
     Address identifier{}, header_cell{}, data_cell{};     // +1
@@ -1120,16 +1122,81 @@ void AppKit::install_tabs_and_splits() {
         }
         invalidate_view(self);
     }, "v@:");
-    method(sp, "resizeSubviewsWithOldSize:", [this, split_of](CpuState& s, GuestMemory&) {
-        if (const auto delegate = split_of(s.x[0])->delegate; delegate && responds(delegate, "splitView:resizeSubviewsWithOldSize:")) {
+    // Holding priorities (by subview index): when the split view resizes,
+    // the change goes to the panes of the lowest priority (in proportion to
+    // their sizes), then to the next priority once those reach zero.
+    method(sp, "holdingPriorityForSubviewAtIndex:", [split_of](CpuState& s, GuestMemory&) {
+        const auto& list = split_of(s.x[0])->holding;
+        set_f(s, 0, s.x[2] < list.size() ? list[s.x[2]] : 250.0f);
+    }, "f@:q");
+    method(sp, "setHoldingPriority:forSubviewAtIndex:", [split_of](CpuState& s, GuestMemory&) {
+        auto& list = split_of(s.x[0])->holding;
+        if (s.x[2] >= list.size()) list.resize(s.x[2] + 1, 250.0f);
+        list[s.x[2]] = f(s, 0);
+    }, "v@:fq");
+    method(sp, "resizeSubviewsWithOldSize:", [this, split_of, thickness](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        if (const auto delegate = split_of(self)->delegate; delegate && responds(delegate, "splitView:resizeSubviewsWithOldSize:")) {
             CallRegs registers;
-            registers.x[2] = s.x[0];
+            registers.x[2] = self;
             put_size(registers, 0, size_arg(s));
             static_cast<void>(send(delegate, "splitView:resizeSubviewsWithOldSize:", registers));
             return;
         }
-        static_cast<void>(send(s.x[0], "adjustSubviews"));
+        const auto panes = view_state(self)->subviews;
+        const auto state = split_of(self);
+        const auto vertical = state->vertical;
+        std::vector<double> sizes;
+        double current{};
+        for (const auto pane : panes) {
+            sizes.push_back(vertical ? view_state(pane)->frame.size.width : view_state(pane)->frame.size.height);
+            current += sizes.back();
+        }
+        if (panes.empty() || !(current > 0)) { static_cast<void>(send(self, "adjustSubviews")); return; }
+        const auto bounds = view_bounds(*view_state(self));
+        double change = (vertical ? bounds.size.width : bounds.size.height) - thickness(self) * static_cast<double>(panes.size() - 1) - current;
+        std::vector<float> levels;
+        for (std::size_t i = 0; i < panes.size(); ++i) levels.push_back(i < state->holding.size() ? state->holding[i] : 250.0f);
+        std::vector<float> order = levels;
+        std::sort(order.begin(), order.end());
+        order.erase(std::unique(order.begin(), order.end()), order.end());
+        for (const auto level : order) {
+            if (std::abs(change) < 1e-9) break;
+            double group{};
+            for (std::size_t i = 0; i < panes.size(); ++i) if (levels[i] == level) group += sizes[i];
+            if (!(group > 0)) continue;   // collapsed panes stay collapsed
+            double used{};
+            for (std::size_t i = 0; i < panes.size(); ++i) {
+                if (levels[i] != level) continue;
+                const auto next = std::max(0.0, sizes[i] + change * sizes[i] / group);
+                used += next - sizes[i];
+                sizes[i] = next;
+            }
+            change -= used;
+        }
+        double offset = vertical ? bounds.origin.x : bounds.origin.y;
+        for (std::size_t i = 0; i < panes.size(); ++i) {
+            const Rect frame = vertical ? Rect{{offset, bounds.origin.y}, {sizes[i], bounds.size.height}}
+                                        : Rect{{bounds.origin.x, offset}, {bounds.size.width, sizes[i]}};
+            CallRegs registers;
+            put_rect(registers, 0, frame);
+            static_cast<void>(send(panes[i], "setFrame:", registers));
+            offset += sizes[i] + thickness(self);
+        }
+        invalidate_view(self);
     }, "v@:{CGSize=dd}");
+    method(sp, "arrangesAllSubviews", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
+    method(sp, "isSpringLoaded", [split_of](CpuState& s, GuestMemory&) { return_bool(s, split_of(s.x[0])->spring_loaded); }, "B@:");
+    method(sp, "setSpringLoaded:", [split_of](CpuState& s, GuestMemory&) { split_of(s.x[0])->spring_loaded = bool_arg(s, 2); }, "v@:B");
+    // The color dividers are drawn in (-drawDividerInRect:).
+    method(sp, "dividerColor", [this, split_of](CpuState& s, GuestMemory&) {
+        const auto color_class = objc.find_class("NSColor");
+        if (split_of(s.x[0])->divider_style == 2) { s.x[0] = send(color_class, "separatorColor").x0; return; }
+        CallRegs registers;
+        registers.set_d(0, theme_for(s.x[0]).dark ? 0.15 : 0.9);
+        registers.set_d(1, 1.0);
+        s.x[0] = send(color_class, "colorWithWhite:alpha:", registers).x0;
+    });
     method(sp, "setPosition:ofDividerAtIndex:", [this, split_of, thickness](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto panes = view_state(self)->subviews;
@@ -1192,7 +1259,7 @@ void AppKit::install_tabs_and_splits() {
             static_cast<void>(send(s.x[0], "drawDividerInRect:", registers));
         }
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
-    method(sp, "mouseDown:", [this, split_of, divider_rects](CpuState& s, GuestMemory&) {
+    method(sp, "mouseDown:", [this, split_of, divider_rects, thickness](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto start = event_location_in(*this, self, s.x[2]);
         const auto rects = divider_rects(self);
@@ -1200,8 +1267,26 @@ void AppKit::install_tabs_and_splits() {
             if (!rect_contains(inset(rects[i], -2, -2), start)) continue;
             const auto vertical = split_of(self)->vertical;
             static_cast<void>(track_mouse(*this, self, s.x[2], [](bool) {}, [&](Point at) {
+                // The delegate's limits on the divider (-splitView:constrainMinCoordinate:ofSubviewAt: and the like).
+                auto position = vertical ? at.x : at.y;
+                if (const auto delegate = split_of(self)->delegate) {
+                    const auto panes = view_state(self)->subviews;
+                    const auto first = view_state(panes[i])->frame, second = view_state(panes[i + 1])->frame;
+                    const auto ask = [&](const char* selector, double proposed) {
+                        if (!responds(delegate, selector)) return proposed;
+                        CallRegs told;
+                        told.x[2] = self;
+                        told.set_d(0, proposed);
+                        told.x[3] = i;
+                        return send(delegate, selector, told).d(0);
+                    };
+                    const auto low = ask("splitView:constrainMinCoordinate:ofSubviewAt:", vertical ? first.origin.x : first.origin.y);
+                    const auto high = ask("splitView:constrainMaxCoordinate:ofSubviewAt:",
+                                          (vertical ? second.origin.x + second.size.width : second.origin.y + second.size.height) - thickness(self));
+                    position = ask("splitView:constrainSplitPosition:ofSubviewAt:", std::max(low, std::min(position, high)));
+                }
                 CallRegs registers;
-                registers.set_d(0, vertical ? at.x : at.y);
+                registers.set_d(0, position);
                 registers.x[2] = i;
                 static_cast<void>(send(self, "setPosition:ofDividerAtIndex:", registers));
                 if (const auto delegate = split_of(self)->delegate) {

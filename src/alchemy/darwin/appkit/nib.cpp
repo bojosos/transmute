@@ -954,9 +954,16 @@ void AppKit::install_nib_coding() {
             static_cast<void>(send_id(self, "registerForDraggedTypes:", {list}));
         }
         // Interface Builder archives its layout-margins and safe-area guides
-        // as nil; a guide object would be an NSLayoutGuide constraints refer to.
-        for (const auto* key : {"IBNSLayoutMarginsGuide", "IBNSSafeAreaLayoutGuide"})
-            if (a.object(key)) unsupported(std::string("an archived view with an ") + key + " layout guide");
+        // as nil unless constraints refer to them; an archived guide becomes
+        // the view's system guide of that kind.
+        for (const auto& [key, kind] : {std::pair{"IBNSLayoutMarginsGuide", GuideState::Kind::margins},
+                                        std::pair{"IBNSSafeAreaLayoutGuide", GuideState::Kind::safe_area}})
+            if (const auto guide = a.object(key)) {
+                const auto info = objc.find_host_state<GuideState>(guide);
+                if (!info) unsupported(std::string("an archived view's ") + key + " that is not an NSLayoutGuide");
+                info->kind = kind;
+                static_cast<void>(send_id(self, "addLayoutGuide:", {guide}));
+            }
         // Not read: NSNextResponder and NSSuperview (the responder chain and
         // the superview follow -addSubview:), NSNibTouchBar (no Touch Bar).
     }, "v@:@");

@@ -10,13 +10,19 @@
 // API (constraints held by views, translatesAutoresizingMaskIntoConstraints,
 // intrinsic content size with hugging and compression resistance,
 // -updateConstraints / -layout / -layoutSubtreeIfNeeded / -fittingSize,
-// baselines) and the layout engine over layout_solver.cpp.
+// baselines), NSLayoutGuide with the view's layout guides, safe area and
+// layout margins and the window's content layout guide, and the layout
+// engine over layout_solver.cpp.
 //
 // The engine. Every window has one, built over its content view's tree:
 //   * the views that take part are the items of the active constraints held
 //     by views of the tree, the views with
 //     translatesAutoresizingMaskIntoConstraints == NO, the views a stack or
 //     grid view arranges, and all their superviews up to the content view;
+//   * layout guides the constraints refer to are items too, inside their
+//     owning views: custom guides are placed by the solution (-[NSView
+//     layout] keeps their frames), system guides sit inside their owner's
+//     frame by their insets, refreshed in every pass;
 //   * views that keep translatesAutoresizingMaskIntoConstraints follow their
 //     superview by their autoresizing mask (layout_geometry add_autoresizing,
 //     AppKit's NSAutoresizingMaskLayoutConstraint), from their frame at the
@@ -65,8 +71,12 @@ using appkit::size_arg;
 
 struct Node {
     L::Box box;                                        // the alignment rectangle
-    Address superview{};
-    bool root{}, driven{}, flipped{};
+    Address superview{};                               // a layout guide's: its owning view
+    bool root{}, driven{}, flipped{}, guide{};
+    // System layout guides: the insets within the owner's frame the guide's
+    // constraints were made from (NaN: none yet).
+    std::array<double, 4> guide_insets{std::nan(""), std::nan(""), std::nan(""), std::nan("")};
+    L::Ids guide_ids;
     // -alignmentRectInsets (top, left, bottom, right) of views without
     // subviews in the layout; others use their frames.
     std::array<double, 4> insets{};
@@ -130,6 +140,18 @@ std::shared_ptr<ConstraintState> constraint_state(Address constraint) {
 
 bool is_view(Address object) { return object && kit().is_kind(object, kit().view); }
 
+std::shared_ptr<appkit::GuideState> guide_state(Address item) { return item ? kit().objc.find_host_state<appkit::GuideState>(item) : nullptr; }
+bool is_guide(Address item) { return guide_state(item) != nullptr; }
+// The view an item lays out in (a layout guide's owning view) and its parent in the layout tree.
+Address view_of(Address item) {
+    if (const auto guide = guide_state(item)) return guide->owner;
+    return item;
+}
+Address parent_of(Address item) {
+    if (const auto guide = guide_state(item)) return guide->owner;
+    return kit().view_state(item)->superview;
+}
+
 std::string class_name(Address object) {
     if (!object) return "nil";
     return kit().text(kit().send_id(kit().send_id(object, "class"), "description"));
@@ -174,19 +196,20 @@ Engine* window_engine(Address window, bool create) {
     return engine.get();
 }
 
-// The superview chain of `view` (itself first).
-std::vector<Address> ancestors(Address view) {
+// The superview chain of an item (itself first; a layout guide, then its owning view).
+std::vector<Address> ancestors(Address item) {
     std::vector<Address> chain;
-    for (auto current = view; current; current = kit().view_state(current)->superview) chain.push_back(current);
+    for (auto current = item; current; current = parent_of(current)) chain.push_back(current);
     return chain;
 }
 
+// The closest view that contains both items.
 Address common_ancestor(Address a, Address b) {
-    if (!b) return a;
+    if (!b) return view_of(a);
     const auto chain = ancestors(a);
     const std::set<Address> lookup(chain.begin(), chain.end());
-    for (auto current = b; current; current = kit().view_state(current)->superview)
-        if (lookup.contains(current)) return current;
+    for (auto current = b; current; current = parent_of(current))
+        if (lookup.contains(current)) return view_of(current);
     return 0;
 }
 
@@ -230,6 +253,7 @@ void add_pin(Engine& e, Address view, Node& node) {
 
 void refresh_intrinsic(Engine& e, Address view, Node& node) {
     auto& k = kit();
+    if (node.guide) return;
     const auto state = k.view_state(view);
     const auto metric = intrinsic_size(view);
     if (metric.width == node.intrinsic.width && metric.height == node.intrinsic.height && state->hugging == node.hug &&
@@ -251,6 +275,65 @@ void refresh_intrinsic(Engine& e, Address view, Node& node) {
         std::fprintf(stderr, "[alchemy] Unable to simultaneously satisfy constraints: the required content size of %s (%g x %g) is broken\n",
                      class_name(view).c_str(), metric.width, metric.height);
     }
+}
+
+// The insets {top, left, bottom, right} of a system layout guide within its
+// owner's frame: the safe area (-safeAreaInsets), the layout margins (the
+// standard spacing to a superview's edge, 20 points, inside the safe area)
+// and a window's content layout rectangle (-contentLayoutRect, for the
+// guide on its content view).
+std::array<double, 4> system_guide_insets(const appkit::GuideState& guide) {
+    auto& k = kit();
+    using Kind = appkit::GuideState::Kind;
+    std::array<double, 4> insets{};
+    if (!guide.owner || guide.kind == Kind::custom) return insets;
+    if (guide.kind == Kind::content_layout) {
+        const auto window = k.view_state(guide.owner)->window;
+        if (!window) return insets;
+        const auto rect = result_rect(k.send(window, "contentLayoutRect"));
+        const auto size = k.view_state(guide.owner)->frame.size;
+        return {std::max(0.0, size.height - rect.origin.y - rect.size.height), std::max(0.0, rect.origin.x), std::max(0.0, rect.origin.y),
+                std::max(0.0, size.width - rect.origin.x - rect.size.width)};
+    }
+    const auto safe = k.send(guide.owner, "safeAreaInsets");
+    for (unsigned i = 0; i < 4; ++i) insets[i] = safe.d(i) + (guide.kind == Kind::margins ? 20 : 0);
+    return insets;
+}
+
+// System guides: required constraints that put each guide inside its
+// owner's frame by its insets, made again when the insets changed (the
+// window's title bar, the owner's place in the window). With `apply` false
+// it only tells whether any changed.
+bool refresh_guides(Engine& e, bool apply) {
+    bool changed = false;
+    for (const auto item : e.order) {
+        auto& node = e.nodes.at(item);
+        if (!node.guide) continue;
+        const auto guide = guide_state(item);
+        if (!guide || guide->kind == appkit::GuideState::Kind::custom) continue;
+        const auto insets = system_guide_insets(*guide);
+        if (insets == node.guide_insets) continue;
+        changed = true;
+        if (!apply) continue;
+        node.guide_insets = insets;
+        for (const auto id : std::exchange(node.guide_ids, {})) e.solver.remove_constraint(id);
+        const auto& owner = e.nodes.at(node.superview);
+        // The owner's box is its alignment rectangle, inside its frame by its insets.
+        const auto [owner_top, owner_left, owner_bottom, owner_right] = owner.insets;
+        const auto [top, left, bottom, right] = insets;
+        try {
+            L::add(e.solver, node.guide_ids, node.box.x, L::Relation::equal, L::Expression(owner.box.x).plus(left - owner_left), L::required);
+            L::add(e.solver, node.guide_ids, node.box.y, L::Relation::equal, L::Expression(owner.box.y).plus(top - owner_top), L::required);
+            L::add(e.solver, node.guide_ids, node.box.width, L::Relation::equal,
+                   L::Expression(owner.box.width).plus(owner_left + owner_right - left - right), L::required);
+            L::add(e.solver, node.guide_ids, node.box.height, L::Relation::equal,
+                   L::Expression(owner.box.height).plus(owner_top + owner_bottom - top - bottom), L::required);
+        } catch (const L::UnsatisfiableConstraint&) {
+            std::fprintf(stderr, "[alchemy] Unable to simultaneously satisfy constraints: the system layout guide of %s is broken\n",
+                         class_name(guide->owner).c_str());
+        }
+    }
+    return changed;
 }
 
 void report_broken(Engine& e, Address constraint) {
@@ -327,7 +410,7 @@ void update_islands(Engine& e) {
                 if (!cs || !cs->active) continue;
                 has_layout = true;
                 for (const auto item : {cs->first, cs->second})
-                    for (auto x = item; x && x != v && is_view(x); x = k.view_state(x)->superview) referenced.insert(x);
+                    for (auto x = view_of(item); x && x != v && is_view(x); x = k.view_state(x)->superview) referenced.insert(x);
             }
             if (const auto contributor = contributor_of(v)) {
                 has_layout = true;
@@ -401,6 +484,10 @@ void rebuild(Engine& e) {
         }
     }
     const std::set<Address> tree(views.begin(), views.end());
+    // The layout guides of the tree's views are items too (positioned by the solution).
+    std::set<Address> items = tree;
+    for (const auto v : views)
+        for (const auto guide : k.view_state(v)->layout_guides) items.insert(guide);
     std::set<Address> part, driven;
     std::vector<Address> constraints;
     std::vector<std::pair<Address, const LayoutContributor*>> containers;
@@ -410,10 +497,13 @@ void rebuild(Engine& e) {
         for (const auto c : state->constraints) {
             const auto cs = k.objc.find_host_state<ConstraintState>(c);
             if (!cs || !cs->active) continue;
-            if (!tree.contains(cs->first) || (cs->second && !tree.contains(cs->second))) continue;
+            if (!items.contains(cs->first) || (cs->second && !items.contains(cs->second))) continue;
             constraints.push_back(c);
-            part.insert(cs->first);
-            if (cs->second) part.insert(cs->second);
+            for (const auto item : {cs->first, cs->second}) {
+                if (!item) continue;
+                part.insert(item);
+                if (!tree.contains(item)) driven.insert(item);
+            }
         }
         for (const auto& contributor : m.contributors)
             if (k.is_kind(v, contributor.cls)) {
@@ -425,33 +515,38 @@ void rebuild(Engine& e) {
             }
     }
     if (part.empty() && e.mode != Engine::Mode::fitting) return;
-    // Every superview up to the root takes part too.
+    // Every superview up to the root takes part too (a guide's owning view first).
     for (const auto v : std::vector<Address>(part.begin(), part.end()))
-        for (auto current = k.view_state(v)->superview; current && tree.contains(current); current = k.view_state(current)->superview)
+        for (auto current = parent_of(v); current && tree.contains(current); current = k.view_state(current)->superview)
             if (!part.insert(current).second) break;
     part.insert(e.root);
     driven.erase(e.root);
-    for (const auto v : views)
+    for (const auto v : views) {
         if (part.contains(v)) e.order.push_back(v);
+        for (const auto guide : k.view_state(v)->layout_guides)
+            if (part.contains(guide)) e.order.push_back(guide);
+    }
     for (const auto v : e.order) {
         Node node;
-        node.box = L::make_box(e.solver, "view");
+        node.guide = !tree.contains(v);
+        node.box = L::make_box(e.solver, node.guide ? "guide" : "view");
         node.root = v == e.root;
-        node.superview = node.root ? 0 : k.view_state(v)->superview;
+        node.superview = node.root ? 0 : parent_of(v);
         node.driven = driven.contains(v);
-        node.flipped = flipped(v);
+        node.flipped = !node.guide && flipped(v);
         e.nodes.emplace(v, std::move(node));
     }
     // Alignment insets of the leaves.
     std::set<Address> parents;
-    for (const auto v : e.order) if (v != e.root) parents.insert(k.view_state(v)->superview);
+    for (const auto v : e.order)
+        if (v != e.root && !e.nodes.at(v).guide) parents.insert(k.view_state(v)->superview);
     for (const auto v : e.order) {
-        if (v == e.root || parents.contains(v)) continue;
+        if (v == e.root || parents.contains(v) || e.nodes.at(v).guide) continue;
         const auto insets = k.send(v, "alignmentRectInsets");
         e.nodes.at(v).insets = {insets.d(0), insets.d(1), insets.d(2), insets.d(3)};
     }
     for (const auto v : e.order) {
-        if (driven.contains(v)) e.parents_of_driven.insert(k.view_state(v)->superview);
+        if (driven.contains(v)) e.parents_of_driven.insert(e.nodes.at(v).superview);
     }
     const auto& root_box = e.nodes.at(e.root).box;
     L::add(e.solver, e.root_ids, root_box.x, L::Relation::equal, 0, L::required);
@@ -633,6 +728,7 @@ void run_own_pass(Engine& e) {
     for (int round = 0; round < 4; ++round) {
         place_root(e);
         for (const auto v : e.order) refresh_intrinsic(e, v, e.nodes.at(v));
+        static_cast<void>(refresh_guides(e, true));
         e.solver.update_variables();
         if (e.mode == Engine::Mode::fitting) return;
         if (e.mode == Engine::Mode::window && e.window) {
@@ -654,7 +750,9 @@ void run_own_pass(Engine& e) {
             }
         }
         layout_sweep(&e, e.root);
-        if (!repin(e)) break;
+        // Moved views can change the system guides' insets (the safe area under the title bar).
+        const bool repinned = repin(e);
+        if (!repinned && !refresh_guides(e, false)) break;
     }
 }
 
@@ -692,6 +790,17 @@ void apply_subview_frames(Address view) {
         } catch (...) { --module().applying; throw; }
         --module().applying;
     }
+    // The receiver's layout guides keep their solved frames (in its coordinates;
+    // its alignment rectangle starts inside its frame by its insets).
+    for (const auto guide : k.view_state(view)->layout_guides) {
+        const auto found = e->nodes.find(guide);
+        if (found == e->nodes.end()) continue;
+        auto frame = L::frame_from_box(L::box_value(e->solver, found->second.box), parent_box, parent.flipped, scale);
+        const auto [top, left, bottom, right] = parent.insets;
+        frame.x += left;
+        frame.y += parent.flipped ? top : bottom;
+        if (const auto state = guide_state(guide)) state->frame = {{frame.x, frame.y}, {frame.width, frame.height}};
+    }
 }
 
 void layout_window(Address window) {
@@ -705,9 +814,10 @@ void layout_window(Address window) {
     // size changed (a label's new text) needs a pass.
     const std::function<bool(Engine&)> changed = [&](Engine& engine) {
         bool any = false;
-        if (engine.valid && engine.engaged)
+        if (engine.valid && engine.engaged && refresh_guides(engine, false)) { engine.pending = true; any = true; }
+        if (engine.valid && engine.engaged && !engine.pending)
             for (const auto& [v, node] : engine.nodes) {
-                if (!k.view_state(v)->needs_display) continue;
+                if (node.guide || !k.view_state(v)->needs_display) continue;
                 const auto metric = intrinsic_size(v);
                 if (metric.width != node.intrinsic.width || metric.height != node.intrinsic.height) { engine.pending = true; any = true; break; }
             }
@@ -790,7 +900,9 @@ void constraint_changed(Address constraint) {
 void drop_crossing_constraints(Address view, Address parent) {
     auto& k = kit();
     const auto removed_list = k.all_views(view);
-    const std::set<Address> removed(removed_list.begin(), removed_list.end());
+    std::set<Address> removed(removed_list.begin(), removed_list.end());
+    for (const auto v : removed_list)
+        for (const auto guide : k.view_state(v)->layout_guides) removed.insert(guide);
     for (auto current = parent; current; current = k.view_state(current)->superview) {
         const auto list = k.view_state(current)->constraints;
         for (const auto c : list) {
@@ -817,6 +929,82 @@ std::shared_ptr<AnchorState> anchor_state(Address anchor) {
     const auto state = kit().objc.find_host_state<AnchorState>(anchor);
     if (!state) completion_kit::fail("an NSLayoutAnchor argument is not an anchor");
     return state;
+}
+
+// ---- layout guides ------------------------------------------------------------------------
+// -[NSView addLayoutGuide:] (from another owner too) and -removeLayoutGuide:
+// (the constraints that refer to the guide go, as for a removed view).
+void add_guide(Address view, Address guide) {
+    auto& k = kit();
+    const auto state = guide_state(guide);
+    if (!state) completion_kit::fail("-[NSView addLayoutGuide:] with a " + class_name(guide));
+    if (state->owner == view) return;
+    const auto keep = k.retain(guide);
+    if (state->owner) static_cast<void>(k.send_id(state->owner, "removeLayoutGuide:", {guide}));
+    state->owner = view;
+    k.view_state(view)->layout_guides.push_back(keep);
+    invalidate_layout(view, true);
+}
+
+void remove_guide(Address view, Address guide) {
+    auto& k = kit();
+    const auto state = guide_state(guide);
+    if (!state || state->owner != view) return;
+    for (auto current = view; current; current = k.view_state(current)->superview) {
+        const auto list = k.view_state(current)->constraints;
+        for (const auto c : list) {
+            const auto cs = k.objc.find_host_state<ConstraintState>(c);
+            if (cs && (cs->first == guide || cs->second == guide)) unhold(c);
+        }
+    }
+    auto& guides = k.view_state(view)->layout_guides;
+    guides.erase(std::remove(guides.begin(), guides.end(), guide), guides.end());
+    state->owner = 0;
+    invalidate_layout(view, true);
+    k.release(guide);
+}
+
+// A view's system guide of `kind` (made on first use; the window's content
+// layout guide lives on its content view).
+Address system_guide(Address view, appkit::GuideState::Kind kind) {
+    auto& k = kit();
+    for (const auto guide : k.view_state(view)->layout_guides)
+        if (const auto state = guide_state(guide); state && state->kind == kind) return guide;
+    const auto guide = k.alloc_init(k.objc.find_class("NSLayoutGuide"));
+    guide_state(guide)->kind = kind;
+    add_guide(view, guide);
+    k.release(guide);
+    return guide;
+}
+
+// -[NSLayoutGuide frame]: a system guide's from its owner's bounds now, a custom guide's as last solved.
+Rect guide_frame(Address guide) {
+    auto& k = kit();
+    const auto state = guide_state(guide);
+    if (!state->owner || state->kind == appkit::GuideState::Kind::custom) return state->frame;
+    const auto [top, left, bottom, right] = system_guide_insets(*state);
+    const auto owner = k.view_state(state->owner);
+    const auto bounds = AppKit::view_bounds(*owner);
+    const bool upside_down = flipped(state->owner);
+    return {{bounds.origin.x + left, bounds.origin.y + (upside_down ? top : bottom)},
+            {std::max(0.0, bounds.size.width - left - right), std::max(0.0, bounds.size.height - top - bottom)}};
+}
+
+// -constraintsAffectingLayoutForOrientation:: the active NSLayoutConstraints
+// that refer to the item on that axis (not the engine's own content-size or
+// autoresizing constraints, which are not NSLayoutConstraint objects here).
+std::vector<Address> constraints_affecting(Address item, std::uint64_t orientation) {
+    auto& k = kit();
+    if (orientation > 1) completion_kit::fail("NSLayoutConstraintOrientation " + std::to_string(orientation));
+    std::vector<Address> found;
+    for (auto current = view_of(item); current; current = k.view_state(current)->superview)
+        for (const auto c : k.view_state(current)->constraints) {
+            const auto cs = k.objc.find_host_state<ConstraintState>(c);
+            if (!cs || !cs->active) continue;
+            const auto on_axis = [orientation](std::int64_t a) { return L::attribute_is_horizontal(a) == (orientation == 0); };
+            if ((cs->first == item && on_axis(cs->first_attribute)) || (cs->second == item && on_axis(cs->second_attribute))) found.push_back(c);
+        }
+    return found;
 }
 
 Address constraint_with_anchors(Address first, std::int64_t relation, Address second, double multiplier, double constant) {
@@ -874,9 +1062,14 @@ void set_active(Address constraint, bool active) {
     const auto cs = constraint_state(constraint);
     if (cs->active == active && (!active || cs->holder)) return;
     if (!active) { unhold(constraint); return; }
-    for (const auto item : {cs->first, cs->second})
-        if (item && !is_view(item))
-            completion_kit::unsupported("activating an NSLayoutConstraint whose item is a " + class_name(item) + " (layout guides)");
+    for (const auto item : {cs->first, cs->second}) {
+        if (!item || is_view(item)) continue;
+        const auto guide = guide_state(item);
+        if (!guide) completion_kit::unsupported("activating an NSLayoutConstraint whose item is a " + class_name(item));
+        if (!guide->owner)
+            completion_kit::fail("Unable to activate constraint " + describe(constraint) +
+                                 " because its layout guide has no owning view (-[NSView addLayoutGuide:])");
+    }
     const auto holder = common_ancestor(cs->first, cs->second);
     if (!holder)
         completion_kit::fail("Unable to activate constraint " + describe(constraint) +
@@ -1190,7 +1383,101 @@ void install_auto_layout(Support& support) {
     for (const auto* name : {"lastBaselineOffsetFromBottom", "baselineOffsetFromBottom"})
         k.method(k.control, name, [control_baseline](CpuState& s, GuestMemory&) { set_d(s, 0, control_baseline(s.x[0], false)); }, "d@:");
 
+    // ---- NSLayoutGuide ----
+    const auto g = k.declare_class("NSLayoutGuide", "NSObject");
+    k.method(g, "init", [g](CpuState& s, GuestMemory&) {
+        auto& kk = kit();
+        const auto self = kk.objc.send_super(s.x[0], g, kk.sel("init")).x0;
+        if (self) static_cast<void>(kk.objc.host_state<appkit::GuideState>(self));
+        s.x[0] = self;
+    });
+    // Interface Builder archives a view's guides with the view (NSView's
+    // decoder adopts them), so the guide itself needs no keys.
+    k.method(g, "initWithCoder:", [](CpuState& s, GuestMemory&) { s.x[0] = kit().send(s.x[0], "init").x0; });
+    k.method(g, "dealloc", [g](CpuState& s, GuestMemory&) {
+        auto& kk = kit();
+        if (const auto state = guide_state(s.x[0])) kk.release(std::exchange(state->identifier, 0));
+        static_cast<void>(kk.objc.send_super(s.x[0], g, kk.sel("dealloc")));
+    }, "v@:");
+    const auto guide_of = [](Address guide) {
+        const auto state = guide_state(guide);
+        if (!state) completion_kit::fail("an NSLayoutGuide that was not initialized");
+        return state;
+    };
+    k.method(g, "owningView", [guide_of](CpuState& s, GuestMemory&) { s.x[0] = guide_of(s.x[0])->owner; });
+    k.method(g, "setOwningView:", [guide_of](CpuState& s, GuestMemory&) {
+        const auto owner = guide_of(s.x[0])->owner;
+        if (s.x[2]) add_guide(s.x[2], s.x[0]);
+        else if (owner) remove_guide(owner, s.x[0]);
+    }, "v@:@");
+    k.method(g, "frame", [guide_of](CpuState& s, GuestMemory&) {
+        static_cast<void>(guide_of(s.x[0]));
+        return_rect(s, guide_frame(s.x[0]));
+    }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:");
+    k.method(g, "identifier", [guide_of](CpuState& s, GuestMemory&) {
+        const auto value = guide_of(s.x[0])->identifier;
+        s.x[0] = value ? value : kit().auto_string("");
+    });
+    k.method(g, "setIdentifier:", [guide_of](CpuState& s, GuestMemory&) {
+        auto& kk = kit();
+        kk.release(std::exchange(guide_of(s.x[0])->identifier, s.x[2] ? kk.cf.copy(s.x[2]) : 0));
+    }, "v@:@");
+    for (const auto& [name, value] : std::initializer_list<std::pair<const char*, std::int64_t>>{
+             {"leftAnchor", attribute::left}, {"rightAnchor", attribute::right}, {"topAnchor", attribute::top},
+             {"bottomAnchor", attribute::bottom}, {"leadingAnchor", attribute::leading}, {"trailingAnchor", attribute::trailing},
+             {"widthAnchor", attribute::width}, {"heightAnchor", attribute::height}, {"centerXAnchor", attribute::center_x},
+             {"centerYAnchor", attribute::center_y}}) {
+        const auto attribute_value = value;
+        k.method(g, name, [attribute_value, guide_of](CpuState& s, GuestMemory&) {
+            static_cast<void>(guide_of(s.x[0]));
+            s.x[0] = make_anchor(s.x[0], attribute_value);
+        });
+    }
+    // Ambiguity is not detected: the solver always settles on one solution.
+    for (const auto cls : {g, v})
+        for (const auto* name : {"hasAmbiguousLayout", "exerciseAmbiguityInLayout"}) {
+            const std::string selector = name;
+            k.method(cls, name, [selector](CpuState& s, GuestMemory&) {
+                completion_kit::unsupported("-[" + class_name(s.x[0]) + " " + selector + "] (layout ambiguity is not detected)");
+            });
+        }
+    for (const auto cls : {g, v})
+        k.method(cls, "constraintsAffectingLayoutForOrientation:", [](CpuState& s, GuestMemory&) {
+            s.x[0] = kit().auto_array(constraints_affecting(s.x[0], s.x[2]));
+        }, "@@:q");
+
+    // ---- NSView layout guides and the safe area ----
+    k.method(v, "layoutGuides", [](CpuState& s, GuestMemory&) {
+        std::vector<Address> custom;
+        for (const auto guide : kit().view_state(s.x[0])->layout_guides)
+            if (const auto state = guide_state(guide); state && state->kind == appkit::GuideState::Kind::custom) custom.push_back(guide);
+        s.x[0] = kit().auto_array(custom);
+    });
+    k.method(v, "addLayoutGuide:", [](CpuState& s, GuestMemory&) {
+        if (!s.x[2]) completion_kit::fail("-[NSView addLayoutGuide:] with nil");
+        add_guide(s.x[0], s.x[2]);
+    }, "v@:@");
+    k.method(v, "removeLayoutGuide:", [](CpuState& s, GuestMemory&) { remove_guide(s.x[0], s.x[2]); }, "v@:@");
+    k.method(v, "safeAreaLayoutGuide", [](CpuState& s, GuestMemory&) { s.x[0] = system_guide(s.x[0], appkit::GuideState::Kind::safe_area); });
+    k.method(v, "layoutMarginsGuide", [](CpuState& s, GuestMemory&) { s.x[0] = system_guide(s.x[0], appkit::GuideState::Kind::margins); });
+    k.method(v, "additionalSafeAreaInsets", [](CpuState& s, GuestMemory&) {
+        const auto& insets = kit().view_state(s.x[0])->additional_safe_area;
+        for (unsigned i = 0; i < 4; ++i) set_d(s, i, insets[i]);
+    }, "{NSEdgeInsets=dddd}@:");
+    k.method(v, "setAdditionalSafeAreaInsets:", [](CpuState& s, GuestMemory&) {
+        const auto state = kit().view_state(s.x[0]);
+        const std::array<double, 4> insets{d(s, 0), d(s, 1), d(s, 2), d(s, 3)};
+        if (insets == state->additional_safe_area) return;
+        state->additional_safe_area = insets;
+        state->needs_layout = true;
+        invalidate_layout(s.x[0], false);
+    }, "v@:{NSEdgeInsets=dddd}");
+
     // ---- NSWindow ----
+    k.method(k.window, "contentLayoutGuide", [](CpuState& s, GuestMemory&) {
+        const auto content = kit().window_state(s.x[0])->content_view;
+        s.x[0] = content ? system_guide(content, appkit::GuideState::Kind::content_layout) : 0;
+    });
     k.method(k.window, "layoutIfNeeded", [](CpuState& s, GuestMemory&) {
         if (auto* e = window_engine(s.x[0], true)) e->pending = true;
         layout_window(s.x[0]);

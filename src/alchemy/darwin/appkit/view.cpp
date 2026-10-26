@@ -422,6 +422,10 @@ void AppKit::install_view() {
             release(std::exchange(state->appearance, 0));
             release(std::exchange(state->accessibility_overrides, 0));
             for (const auto constraint : std::exchange(state->constraints, {})) release(constraint);
+            for (const auto guide : std::exchange(state->layout_guides, {})) {
+                if (const auto info = objc.find_host_state<GuideState>(guide)) info->owner = 0;
+                release(guide);
+            }
             // The context does not retain its client and may outlive the view
             // (the active input context is retained).
             if (const auto context = std::exchange(state->input_context, 0)) {
@@ -633,24 +637,37 @@ void AppKit::install_view() {
         s.x[0] = own ? own : send_id(send(self, "class").x0, "defaultAnimationForKey:", {key});
     });
     // The safe area: the part of the view not under the titlebar of a
-    // window whose content view extends below it (full-size content view).
-    // Insets are {top, left, bottom, right}.
+    // window whose content view extends below it (full-size content view),
+    // within its superview's safe area, less the additional insets
+    // (-additionalSafeAreaInsets) of the view and its superviews. Insets
+    // are {top, left, bottom, right}; a view without a window has its own
+    // additional insets.
     const auto safe_insets = [this](Address self) {
-        std::array<double, 4> insets{};
         const auto state = view_state(self);
         const auto owner = state->window;
-        if (!owner) return insets;
-        constexpr std::uint64_t full_size_content = 1ULL << 15;
-        if (!(window_state(owner)->style & full_size_content)) return insets;
-        const auto band = titlebar_height(owner);
-        if (band <= 0) return insets;
+        if (!owner) return state->additional_safe_area;
+        // The safe rectangle in window base coordinates (y up), from the outermost superview down.
         const auto content = content_rect(owner);
-        const double band_bottom = content.size.height - band;   // window base coordinates
+        Rect safe{{0, 0}, content.size};
+        constexpr std::uint64_t full_size_content = 1ULL << 15;
+        if (window_state(owner)->style & full_size_content) safe.size.height = std::max(0.0, safe.size.height - std::max(0.0, titlebar_height(owner)));
+        std::vector<Address> chain;
+        for (auto current = self; current; current = view_state(current)->superview) chain.push_back(current);
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            const auto rect = view_rect_in_window(*it, view_bounds(*view_state(*it)));
+            const auto& extra = view_state(*it)->additional_safe_area;
+            const double left = std::max(safe.origin.x, rect.origin.x) + extra[1];
+            const double bottom = std::max(safe.origin.y, rect.origin.y) + extra[2];
+            const double right = std::min(safe.origin.x + safe.size.width, rect.origin.x + rect.size.width) - extra[3];
+            const double top = std::min(safe.origin.y + safe.size.height, rect.origin.y + rect.size.height) - extra[0];
+            safe = {{left, bottom}, {std::max(0.0, right - left), std::max(0.0, top - bottom)}};
+        }
         const auto rect = view_rect_in_window(self, view_bounds(*state));
-        const double overlap =
-            std::min(rect.origin.y + rect.size.height, content.size.height) - std::max(rect.origin.y, band_bottom);
-        if (overlap > 0) insets[0] = overlap;
-        return insets;
+        return std::array<double, 4>{
+            std::clamp(rect.origin.y + rect.size.height - (safe.origin.y + safe.size.height), 0.0, rect.size.height),
+            std::clamp(safe.origin.x - rect.origin.x, 0.0, rect.size.width),
+            std::clamp(safe.origin.y - rect.origin.y, 0.0, rect.size.height),
+            std::clamp(rect.origin.x + rect.size.width - (safe.origin.x + safe.size.width), 0.0, rect.size.width)};
     };
     method(v, "safeAreaInsets", [safe_insets](CpuState& s, GuestMemory&) {
         const auto insets = safe_insets(s.x[0]);
