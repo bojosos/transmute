@@ -97,6 +97,24 @@ bool coalesce_placeholders(void* address, std::size_t size) noexcept {
     return VirtualFree(address, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != FALSE;
 }
 
+void* reserve_placeholder_above(std::uint64_t lowest, std::size_t size) noexcept {
+    MEM_ADDRESS_REQUIREMENTS requirements{};
+    requirements.LowestStartingAddress = reinterpret_cast<void*>(lowest);
+    MEM_EXTENDED_PARAMETER parameter{};
+    parameter.Type = MemExtendedParameterAddressRequirements;
+    parameter.Pointer = &requirements;
+    return VirtualAlloc2(nullptr, nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &parameter, 1);
+}
+
+bool replace_placeholder_reserved(void* address, std::size_t size) noexcept {
+    return VirtualAlloc2(nullptr, address, size, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0) ==
+           address;
+}
+
+bool release_to_placeholder(void* address, std::size_t size) noexcept {
+    return VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
+}
+
 Section create_section(std::uint64_t size) noexcept {
     return CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_READ | FILE_MAP_WRITE, PAGE_READWRITE, SEC_COMMIT,
                               size, nullptr, nullptr, 0);

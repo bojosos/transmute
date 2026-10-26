@@ -44,7 +44,6 @@ extern kern_return_t vm_remap(mach_port_t, vm_address_t*, vm_size_t, vm_address_
 #define ANON (MAP_PRIVATE | MAP_ANON)
 #define VM_FLAGS_OVERWRITE 0x4000
 #define VM_INHERIT_NONE 2
-#define KERN_NOT_SUPPORTED 46
 
 typedef int (*function)(void);
 
@@ -205,10 +204,11 @@ int main(void) {
     if (mprotect((void*)target, PAGE, RWX) != 0) return 45;
     put_code((volatile unsigned*)target, 78);
     if (((function)target)() != 78) return 46;
-    /* Copy-on-write remaps are refused explicitly. */
+    /* A copy-on-write remap (copy = TRUE) is a copy as of the remap. */
     target = (vm_address_t)(code + 2 * MiB);
-    if (vm_remap(task, &target, PAGE, 0, VM_FLAGS_OVERWRITE, task, source, 1, &current, &maximum, VM_INHERIT_NONE) !=
-        KERN_NOT_SUPPORTED) return 47;
+    if (vm_remap(task, &target, PAGE, 0, VM_FLAGS_OVERWRITE, task, source, 1, &current, &maximum, VM_INHERIT_NONE) != 0 ||
+        target != (vm_address_t)(code + 2 * MiB) || current != (PROT_READ | PROT_EXEC) ||
+        ((volatile unsigned*)target)[0] != ((volatile unsigned*)source)[0] || ((function)target)() != 77) return 47;
     if (munmap(code, 32 * MiB) != 0) return 48;
 
     puts("fx vm lazy: ok");

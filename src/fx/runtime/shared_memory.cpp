@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -75,6 +76,13 @@ struct State {
     std::map<std::uint64_t, View> views;               // by base
     std::map<std::uint64_t, Piece> placeholders;       // by begin
     std::map<std::uint64_t, std::uint64_t> reservations;   // base -> size
+    // Reservations made by reserve_guest_space(_above): their owner (the
+    // personality's Darwin mmap space) releases them; fx never does, even when
+    // they are all placeholder.
+    std::set<std::uint64_t> owned;
+    // Parts of owned reservations made ordinary reserved private memory
+    // (provide_guest_space), by begin; the owner commits and protects them.
+    std::map<std::uint64_t, Piece> privates;
 };
 
 State& S() {
@@ -200,7 +208,7 @@ void coalesce(State& s, std::uint64_t begin) {
         s.placeholders.emplace(first, Piece{last, reservation});
     }
     const auto r = s.reservations.find(reservation);
-    if (r != s.reservations.end() && first == r->first && last == r->first + r->second) {
+    if (r != s.reservations.end() && first == r->first && last == r->first + r->second && !s.owned.count(r->first)) {
         if (vm::release(host(first))) {
             s.placeholders.erase(first);
             s.reservations.erase(r);
@@ -248,6 +256,33 @@ void check_range(std::uint64_t base, std::uint64_t size) {
 }
 
 } // namespace
+
+// ---- guest space (owned reservations) ---------------------------------------------------
+// Replaces every placeholder piece inside [begin, end) (split at both ends)
+// by reserved private memory. Views and private pieces there stay.
+bool make_private(State& s, std::uint64_t begin, std::uint64_t end) {
+    split_at(s, begin);
+    split_at(s, end);
+    for (auto it = s.placeholders.lower_bound(begin); it != s.placeholders.end() && it->first < end;) {
+        const std::uint64_t piece_begin = it->first;
+        const Piece piece = it->second;
+        if (!vm::replace_placeholder_reserved(host(piece_begin), static_cast<std::size_t>(piece.end - piece_begin)))
+            return false;
+        it = s.placeholders.erase(it);
+        s.privates.emplace(piece_begin, piece);
+    }
+    return true;
+}
+
+bool committed_in(std::uint64_t begin, std::uint64_t end) {
+    for (std::uint64_t at = begin; at < end;) {
+        vm::RegionInfo info;
+        if (!vm::query(host(at), info)) return true;
+        if (info.committed()) return true;
+        at = std::min(end, info.base + info.size);
+    }
+    return false;
+}
 
 void shared_memory_aliases(std::uint64_t page, std::vector<std::uint64_t>& out) {
     State& s = S();
@@ -597,6 +632,102 @@ bool is_shared_guest_memory(std::uint64_t address) noexcept {
     if (it == s.views.begin()) return false;
     --it;
     return address - it->first < it->second.size;
+}
+
+namespace {
+// [begin, end) inside one owned reservation: its base, or 0.
+std::uint64_t owned_reservation(rt::State& s, std::uint64_t begin, std::uint64_t end) {
+    const std::uint64_t base = rt::reservation_of(s, begin);
+    if (!base || !s.owned.count(base) || end - base > s.reservations.at(base)) return 0;
+    return base;
+}
+} // namespace
+
+bool reserve_guest_space(std::uint64_t base, std::uint64_t size) {
+    if (!size || (base & (rt::kGranule - 1)) || (size & (rt::kGranule - 1)) || base + size < base) return false;
+    rt::ensure_initialized();
+    rt::State& s = rt::S();
+    rt::Exclusive lock(s.lock);
+    for (std::uint64_t g = base; g < base + size; g += rt::kGranule)
+        if (rt::reservation_of(s, g)) return false;
+    void* got = rt::vm::reserve_placeholder(rt::host(base), static_cast<std::size_t>(size));
+    if (reinterpret_cast<std::uint64_t>(got) != base) {
+        if (got) rt::vm::release(got);
+        return false;
+    }
+    s.reservations.emplace(base, size);
+    s.owned.insert(base);
+    s.placeholders.emplace(base, rt::Piece{base + size, base});
+    return true;
+}
+
+std::uint64_t reserve_guest_space_above(std::uint64_t lowest, std::uint64_t size) {
+    if (!size || (size & (rt::kGranule - 1))) return 0;
+    rt::ensure_initialized();
+    rt::State& s = rt::S();
+    rt::Exclusive lock(s.lock);
+    void* got = rt::vm::reserve_placeholder_above(lowest, static_cast<std::size_t>(size));
+    if (!got) return 0;
+    const auto base = reinterpret_cast<std::uint64_t>(got);
+    s.reservations.emplace(base, size);
+    s.owned.insert(base);
+    s.placeholders.emplace(base, rt::Piece{base + size, base});
+    return base;
+}
+
+bool provide_guest_space(std::uint64_t begin, std::uint64_t end) {
+    if (end <= begin) return true;
+    begin &= ~(rt::kGranule - 1);
+    end = (end + rt::kGranule - 1) & ~(rt::kGranule - 1);
+    rt::State& s = rt::S();
+    rt::Exclusive lock(s.lock);
+    if (!owned_reservation(s, begin, end)) return false;
+    return rt::make_private(s, begin, end);
+}
+
+bool reclaim_guest_space(std::uint64_t begin, std::uint64_t end) {
+    if (end <= begin || (begin & (rt::kPage - 1)) || (end & (rt::kPage - 1))) return false;
+    rt::State& s = rt::S();
+    rt::Exclusive lock(s.lock);
+    if (!owned_reservation(s, begin, end)) return false;
+    // The private pieces overlapping the range: none may hold a committed page.
+    std::vector<std::pair<std::uint64_t, rt::Piece>> pieces;
+    auto it = s.privates.upper_bound(begin);
+    if (it != s.privates.begin()) --it;
+    for (; it != s.privates.end() && it->first < end; ++it)
+        if (it->second.end > begin) pieces.emplace_back(it->first, it->second);
+    for (const auto& [b, piece] : pieces)
+        if (rt::committed_in(b, piece.end)) return false;
+    for (const auto& [b, piece] : pieces) {
+        if (!rt::vm::release_to_placeholder(rt::host(b), static_cast<std::size_t>(piece.end - b)))
+            rt::fail("cannot turn reserved memory back into a placeholder", b);
+        s.privates.erase(b);
+        s.placeholders.emplace(b, piece);
+        // The parts outside the range stay the owner's private memory.
+        if (b < begin && !rt::make_private(s, b, begin)) rt::fail("cannot reserve memory again", b);
+        if (piece.end > end && !rt::make_private(s, end, piece.end)) rt::fail("cannot reserve memory again", end);
+    }
+    return true;
+}
+
+bool release_guest_space(std::uint64_t base, std::uint64_t size) {
+    rt::State& s = rt::S();
+    rt::Exclusive lock(s.lock);
+    const auto r = s.reservations.find(base);
+    if (r == s.reservations.end() || r->second != size || !s.owned.count(base)) return false;
+    const std::uint64_t end = base + size;
+    if (auto v = s.views.lower_bound(base); v != s.views.end() && v->first < end) return false;   // views still mapped
+    for (auto it = s.privates.lower_bound(base); it != s.privates.end() && it->first < end;) {
+        rt::vm::release(rt::host(it->first));
+        it = s.privates.erase(it);
+    }
+    for (auto it = s.placeholders.lower_bound(base); it != s.placeholders.end() && it->first < end;) {
+        rt::vm::release(rt::host(it->first));
+        it = s.placeholders.erase(it);
+    }
+    s.owned.erase(base);
+    s.reservations.erase(r);
+    return true;
 }
 
 } // namespace transmute::fx

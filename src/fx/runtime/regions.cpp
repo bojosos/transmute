@@ -775,6 +775,8 @@ bool region_is_valid(const TranslatedRegion& r, std::uint64_t pc) {
 //   TRANSMUTE_FX_TIER_SPLIT=1                  first tier stops at call continuations
 //   TRANSMUTE_FX_TIER_WINDOW=<fwd>[,<back>]    bytes; synthetic bounds for code
 //                                              without .pdata (8192,2048; 0 = none)
+//   TRANSMUTE_FX_JIT_CODE_BUDGET=<instructions>  first-tier budget and window for
+//   TRANSMUTE_FX_JIT_CODE_WINDOW=<fwd>[,<back>]  registered (JIT) code (as above)
 // TRANSMUTE_FX_CORE=notier disables tier-0 formation (translator knob, folded
 // into the cache key).
 struct TierConfig {
@@ -783,6 +785,12 @@ struct TierConfig {
     bool split = false;
     std::uint32_t window_forward = 8192;
     std::uint32_t window_backward = 2048;
+    // First tier of registered (non-image) code, e.g. V8's JIT code: much of
+    // it runs a few times and is freed (TRANSMUTE_FX_JIT_CODE_BUDGET,
+    // TRANSMUTE_FX_JIT_CODE_WINDOW=<fwd>[,<back>]; default: as above).
+    unsigned jit_budget = 4096;
+    std::uint32_t jit_window_forward = 8192;
+    std::uint32_t jit_window_backward = 2048;
 };
 const TierConfig& tier_config() {
     static const TierConfig c = [] {
@@ -799,6 +807,18 @@ const TierConfig& tier_config() {
             t.window_backward = end && *end == ',' ? static_cast<std::uint32_t>(std::min<unsigned long>(
                                                          std::strtoul(end + 1, nullptr, 0), 1u << 24))
                                                    : t.window_forward / 4;
+        }
+        t.jit_budget = t.budget;
+        t.jit_window_forward = t.window_forward;
+        t.jit_window_backward = t.window_backward;
+        if (host::get_env("TRANSMUTE_FX_JIT_CODE_BUDGET", value, sizeof(value)) > 0)
+            t.jit_budget = static_cast<unsigned>(std::clamp<unsigned long>(std::strtoul(value, nullptr, 10), 16, 4096));
+        if (host::get_env("TRANSMUTE_FX_JIT_CODE_WINDOW", value, sizeof(value)) > 0) {
+            char* end = nullptr;
+            t.jit_window_forward = static_cast<std::uint32_t>(std::min<unsigned long>(std::strtoul(value, &end, 0), 1u << 24));
+            t.jit_window_backward = end && *end == ',' ? static_cast<std::uint32_t>(std::min<unsigned long>(
+                                                             std::strtoul(end + 1, nullptr, 0), 1u << 24))
+                                                       : t.jit_window_forward / 4;
         }
         return t;
     }();
@@ -1022,6 +1042,20 @@ TranslateOptions jit_translate_options() noexcept {
     return topts;
 }
 
+namespace {
+// The first-tier options for `pc`: registered (non-image) code gets its own
+// budget and window (TierConfig::jit_*). Formation only: not in the cache key.
+TranslateOptions first_tier_options(std::uint64_t pc) {
+    TranslateOptions topts = jit_translate_options();
+    if (in_registered_code_memory(pc)) {
+        topts.lazy_max_instructions = tier_config().jit_budget;
+        topts.window_forward = tier_config().jit_window_forward;
+        topts.window_backward = tier_config().jit_window_backward;
+    }
+    return topts;
+}
+} // namespace
+
 std::uint64_t invalidation_epoch() noexcept { return g.epoch.load(std::memory_order_acquire); }
 
 namespace {
@@ -1194,7 +1228,7 @@ void store_translation(const TranslatedRegion& region, bool copy, std::int64_t d
 const void* translate_and_install(std::uint64_t pc) {
     TickScope total{g_counters.translate_ticks};
     std::lock_guard serialize(g.translate);
-    const TranslateOptions topts = jit_translate_options();
+    const TranslateOptions topts = first_tier_options(pc);
     const bool cache = options().enable_translation_cache;
     bool try_cache = cache;
     unsigned cache_attempts = 0;

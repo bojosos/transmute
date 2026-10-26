@@ -264,6 +264,31 @@ void unmap_shared_guest_memory(std::uint64_t base, std::uint64_t size);
 void unmap_shared_guest_range(std::uint64_t base, std::uint64_t size);
 bool is_shared_guest_memory(std::uint64_t address) noexcept;
 
+// (additive) Guest address space that fx holds as placeholders for a caller
+// (the personality's Darwin mmap reservations), so that shared memory can
+// later be mapped into parts of it (alias_guest_memory: Darwin vm_remap over
+// mmap'd pages) while the rest is in use. Ranges are 64 KiB aligned unless
+// said otherwise.
+//   reserve_guest_space(_above): reserves [base, base + size) (above `lowest`:
+//     wherever the host finds room; the base or 0) as one placeholder the
+//     caller owns: fx never releases it.
+//   provide_guest_space: makes the placeholder parts of [begin, end) (rounded
+//     out to 64 KiB) ordinary reserved private memory the caller may commit,
+//     protect and decommit. Views and parts already provided stay.
+//   reclaim_guest_space: [begin, end) (4 KiB aligned) back to placeholder,
+//     ready for alias_guest_memory. Every private part overlapping it must
+//     hold no committed page (false, nothing changed, otherwise); the parts of
+//     those pieces outside the range stay private.
+//   release_guest_space: releases a whole reservation made by
+//     reserve_guest_space(_above) (false while a view is still mapped in it).
+// Each returns false on failure (the range not inside one such reservation,
+// the host refusing).
+bool reserve_guest_space(std::uint64_t base, std::uint64_t size);
+std::uint64_t reserve_guest_space_above(std::uint64_t lowest, std::uint64_t size);
+bool provide_guest_space(std::uint64_t begin, std::uint64_t end);
+bool reclaim_guest_space(std::uint64_t begin, std::uint64_t end);
+bool release_guest_space(std::uint64_t base, std::uint64_t size);
+
 // Guest-executable memory outside PE images (guest VirtualAlloc/VirtualProtect
 // with PAGE_EXECUTE*). Host protection stays non-executable.
 void register_guest_code_memory(std::uint64_t base, std::uint64_t size);

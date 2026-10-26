@@ -394,6 +394,48 @@ FX_TEST(host_vm_placeholders_and_sections) {
     vm::close_section(copy);
 }
 
+// Placeholder space handed out as private memory and taken back: the guest's
+// mmap reservations (commit inside a replaced piece) with a section view
+// later placed into an untouched part, and a piece turned back into a
+// placeholder for a view. Pieces at page granularity too (a remap target
+// need not be 64 KiB aligned).
+FX_TEST(host_vm_placeholder_private_pieces) {
+    auto* base = static_cast<std::uint8_t*>(vm::reserve_placeholder_above(std::uint64_t{1} << 36, 4 * kGranule));
+    FX_CHECK(base != nullptr);
+    FX_CHECK(reinterpret_cast<std::uint64_t>(base) >= (std::uint64_t{1} << 36));
+    FX_CHECK(vm::split_placeholder(base, kGranule));            // [0, 1) | [1, 4)
+    FX_CHECK(vm::split_placeholder(base + kGranule, kPage));    // [1, 1 + page) | ...
+    FX_CHECK(vm::replace_placeholder_reserved(base, kGranule));
+    FX_CHECK(vm::replace_placeholder_reserved(base + kGranule, kPage));   // page granular
+    FX_CHECK(vm::commit(base + kPage, kPage, vm::kReadWrite) == base + kPage);
+    base[kPage + 8] = 0x42;
+    FX_CHECK(vm::commit(base + kGranule, kPage, vm::kReadWrite) == base + kGranule);
+    base[kGranule] = 0x43;
+    vm::RegionInfo info;
+    FX_CHECK(vm::query(base + kPage, info));
+    FX_CHECK(info.committed() && info.type == vm::Type::private_memory);
+    // The untouched rest takes a section view.
+    vm::Section section = vm::create_section(kGranule);
+    FX_CHECK(section != nullptr);
+    std::uint8_t* rest = base + kGranule + kPage;
+    FX_CHECK(vm::split_placeholder(rest, kGranule));
+    FX_CHECK(vm::map_view_into_placeholder(section, rest, 0, kGranule, vm::kReadWrite) == rest);
+    rest[3] = 7;
+    FX_CHECK(vm::unmap_view_to_placeholder(rest));
+    // A private piece goes back to a placeholder (its pages discarded), then a view takes it.
+    FX_CHECK(vm::release_to_placeholder(base + kGranule, kPage));
+    FX_CHECK(vm::query(base + kGranule, info));
+    FX_CHECK(info.state == vm::State::reserved);
+    FX_CHECK(vm::map_view_into_placeholder(section, base + kGranule, 0, kPage, vm::kReadWrite) == base + kGranule);
+    FX_CHECK_EQ(base[kGranule + 3], 7);   // the section's byte, not the discarded page's
+    FX_CHECK_EQ(base[kPage + 8], 0x42);   // the other piece kept its page
+    FX_CHECK(vm::unmap_view_to_placeholder(base + kGranule));
+    FX_CHECK(vm::release_to_placeholder(base, kGranule));
+    FX_CHECK(vm::coalesce_placeholders(base, 4 * kGranule));
+    FX_CHECK(vm::release(base));
+    vm::close_section(section);
+}
+
 FX_TEST(host_vm_heap) {
     vm::Heap heap = vm::create_heap();
     FX_CHECK(heap != nullptr);

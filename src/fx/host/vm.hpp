@@ -94,6 +94,16 @@ void* reserve_placeholder(void* address, std::size_t size) noexcept;
 bool split_placeholder(void* address, std::size_t size) noexcept;
 // Joins adjacent placeholders covering exactly [address, address + size).
 bool coalesce_placeholders(void* address, std::size_t size) noexcept;
+// A placeholder at or above `lowest`, wherever the host finds room
+// (allocation-granularity aligned); nullptr if there is none.
+void* reserve_placeholder_above(std::uint64_t lowest, std::size_t size) noexcept;
+// Replaces the placeholder [address, address + size) (exactly one) by ordinary
+// reserved private memory, which commit/protect/decommit then work on.
+bool replace_placeholder_reserved(void* address, std::size_t size) noexcept;
+// Turns the private reservation [address, address + size) made by
+// replace_placeholder_reserved (exactly that one, all of it) back into a
+// placeholder; committed pages are discarded.
+bool release_to_placeholder(void* address, std::size_t size) noexcept;
 // A pagefile-backed read-write section of `size` bytes (committed, zero).
 Section create_section(std::uint64_t size) noexcept;
 // Another handle to `section` (a duplicate keeps it alive); nullptr on failure.

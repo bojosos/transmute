@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,13 @@ public:
     // stay this space's (munmap, mprotect). False when it does not own the
     // whole page-aligned range.
     bool replace_with_copy(std::uint64_t address, std::span<const std::uint8_t> bytes, std::uint64_t protection);
+    // Mach vm_remap(VM_FLAGS_OVERWRITE, copy = FALSE) of shared memory over
+    // pages this space owns: `alias` maps the shared memory there (the engine
+    // takes the pages out of their reservation as munmap would) while no other
+    // mmap can change the range (the space's lock is held). The pages stay
+    // this space's (munmap, mprotect, MAP_FIXED). False, with `alias` not
+    // called, when the space does not own the whole page-aligned range.
+    bool replace_with_alias(std::uint64_t address, std::uint64_t length, const std::function<void()>& alias);
 
 private:
     [[nodiscard]] bool owns(std::uint64_t begin, std::uint64_t end) const;   // mutex held

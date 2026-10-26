@@ -263,16 +263,24 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
         if (begin == end) return success;
         if (end - begin > allocation_limit) return resource_shortage;
         std::lock_guard lock(metadata);
-        // This profile releases Mach-owned pages. Loader, heap, file mappings
-        // and worker stacks retain their own lifetime managers.
+        // Mach-owned pages, and mmap'd ones (Darwin's vm_deallocate releases
+        // those too: munmap). Loader, heap, file mappings and worker stacks
+        // retain their own lifetime managers.
+        auto* space = darwin_vm_space(process);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> mmapped;   // runs of mmap'd pages
         for (auto address = begin; address < end; address += page_size) {
-            if (!pages.contains(address)) return process.calling_engine().query_region(address)
-                ? not_supported : invalid_address;
+            if (pages.contains(address)) continue;
+            if (!space || !space->intersects(address, page_size))
+                return process.calling_engine().query_region(address) ? not_supported : invalid_address;
+            if (!mmapped.empty() && mmapped.back().second == address) mmapped.back().second += page_size;
+            else mmapped.emplace_back(address, address + page_size);
         }
         for (auto address = begin; address < end; address += page_size) {
+            if (!pages.contains(address)) continue;
             process.calling_engine().unmap_memory(address);
             pages.erase(address);
         }
+        for (const auto& [from, to] : mmapped) space->unmap(from, to - from);
         forget_purgeable(begin, end);
         return success;
     }
@@ -408,14 +416,38 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
         if (begin == end) return success;
         if (end - begin > allocation_limit) return resource_shortage;
         std::lock_guard lock(metadata);
+        // Mach-owned pages, and mmap'd ones (Darwin's vm_protect covers those
+        // too: mach_vm_map of a memory entry over mmap'd pages sets the
+        // maximum of what vm_remap put there, Chrome's GPU ring buffer in V8's
+        // sandbox among it).
+        auto* space = darwin_vm_space(process);
         for (auto address = begin; address < end; address += page_size) {
             const auto found = pages.find(address);
-            if (found == pages.end()) return process.calling_engine().query_region(address)
-                ? not_supported : invalid_address;
+            if (found == pages.end()) {
+                if (!space || !space->intersects(address, page_size))
+                    return process.calling_engine().query_region(address) ? not_supported : invalid_address;
+                continue;
+            }
             if ((permissions & ~found->second.maximum) != 0) return protection_failure;
         }
         for (auto address = begin; address < end; address += page_size) {
-            auto& page = pages.at(address);
+            const auto found = pages.find(address);
+            if (found == pages.end()) {
+                // mmap'd pages keep no maximum: setting one lowers the current
+                // protection to it, as on Darwin, but a later mprotect above it
+                // is not refused.
+                auto current = permissions;
+                if (maximum) {
+                    const auto region = process.calling_engine().query_region(address);
+                    const unsigned now = (region && region->readable ? read : 0U) | (region && region->writable ? write : 0U) |
+                                         (region && region->executable ? execute : 0U);
+                    if ((now & ~permissions) == 0) continue;
+                    current = now & permissions;
+                }
+                if (!space->protect(address, page_size, current)) return not_supported;
+                continue;
+            }
+            auto& page = found->second;
             const auto current = maximum ? page.current & permissions : permissions;
             process.calling_engine().set_memory_access(address, (current & read) != 0,
                 (current & write) != 0, (current & execute) != 0);
@@ -439,7 +471,7 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
             return not_supported;
         };
         if (state.x[3] != 0) return refuse("alignment masks are unsupported");
-        if (static_cast<std::uint32_t>(state.x[7]) != 0) return refuse("copy-on-write remaps (copy = TRUE) are unsupported");
+        const bool copy = static_cast<std::uint32_t>(state.x[7]) != 0;
         // vm_remap's final three fixed arguments use Apple's ARM64 stack ABI.
         if (!accessible(memory, state.sp, 20, false)) return invalid_address;
         const auto current_output = memory.read64(state.sp);
@@ -486,6 +518,7 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
         // a real alias, the same pages at both addresses, keeping the source's
         // protections. Backing lives until both are deallocated.
         auto& engine = process.calling_engine();
+        if (copy) return remap_copy(state, memory, begin, extent, flags, mach_target, executable, current_output, maximum_output, refuse);
         if (mach_target && engine_is_shared_memory(engine, begin, extent)) {
             std::uint64_t target = memory.read64(state.x[1]);
             if (flags & anywhere) {
@@ -507,6 +540,30 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
                     memory.write64(state.x[1], target);
                     next_address = target + extent + page_size;
                 }
+                memory.write32(current_output, permissions.current);
+                memory.write32(maximum_output, permissions.maximum);
+                return success;
+            }
+        }
+        // Shared memory over mmap'd pages (Chrome maps shared memory into V8's
+        // sandbox this way, a GPU command buffer's ring buffer among it): a real
+        // alias takes their place. The pages stay mmap's (munmap, mprotect).
+        if (!mach_target && (flags & overwrite) != 0 && engine_is_shared_memory(engine, begin, extent)) {
+            const auto target = memory.read64(state.x[1]);
+            const auto source_page = pages.find(begin);
+            const Page permissions = source_page != pages.end() ? source_page->second : Page{};
+            bool aliased = false;
+            std::string why = "the engine has no shared-memory aliases";
+            auto* space = darwin_vm_space(process);
+            if (space && space->replace_with_alias(target, extent, [&] {
+                    try {
+                        aliased = engine_alias_memory(engine, target, begin, extent, (permissions.current & read) != 0,
+                                                      (permissions.current & write) != 0, (permissions.current & execute) != 0);
+                    } catch (const std::runtime_error& error) {
+                        why = error.what();
+                    }
+                })) {
+                if (!aliased) return refuse(("the alias could not take the mmap'd pages: " + why).c_str());
                 memory.write32(current_output, permissions.current);
                 memory.write32(maximum_output, permissions.maximum);
                 return success;
@@ -550,8 +607,77 @@ struct MachVm : std::enable_shared_from_this<MachVm> {
             memory.write32(maximum_output, current);
             return success;
         }
-        if (!mach_target) return refuse("only immutable memory can be remapped over mmap'd memory");
+        if (!mach_target) return refuse("only immutable or shared memory can be remapped over mmap'd memory");
         EngineAdapter::require("shared guest-memory alias mapping with destination subrange overwrite for Mach vm_remap");
+    }
+
+    // vm_remap(copy = TRUE): the target gets a copy-on-write copy of the
+    // source, which the guest cannot tell from a copy made now. Mach pages at
+    // the target (anywhere, a free fixed range, or Mach pages it overwrites),
+    // or mmap'd pages it overwrites (they stay mmap's). The protections are
+    // the source's. metadata held.
+    template <typename Refuse>
+    std::uint32_t remap_copy(transmute::CpuState& state, transmute::GuestMemory& memory, std::uint64_t begin,
+                             std::uint64_t extent, unsigned flags, bool mach_target, bool executable,
+                             std::uint64_t current_output, std::uint64_t maximum_output, const Refuse& refuse) {
+        auto& engine = process.calling_engine();
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(extent));
+        memory.read_bytes(begin, bytes);
+        const auto source_page = pages.find(begin);
+        Page permissions{};
+        if (source_page != pages.end()) {
+            permissions = source_page->second;
+        } else {
+            const auto region = memory.query_region(begin);
+            permissions.current = (region && region->readable ? read : 0U) | (region && region->writable ? write : 0U) |
+                                  (executable ? execute : 0U);
+        }
+        std::uint64_t target = memory.read64(state.x[1]);
+        if ((flags & overwrite) != 0 && !mach_target) {
+            auto* space = darwin_vm_space(process);
+            bool replaced = false;
+            try {
+                replaced = space && space->replace_with_copy(target, bytes, permissions.current);
+            } catch (const DarwinVmError&) {
+                return resource_shortage;
+            }
+            if (!replaced) return refuse("the overwritten range is neither Mach VM pages nor mmap'd memory");
+        } else {
+            if (flags & anywhere) {
+                target = next_address;
+                while (!engine.is_range_available(target, extent)) {
+                    if (target > UINT64_MAX - extent - page_size) return no_space;
+                    target += extent + page_size;
+                }
+            } else if (flags & overwrite) {
+                for (auto at = target; at < target + extent; at += page_size) {
+                    engine.unmap_memory(at);
+                    pages.erase(at);
+                }
+                forget_purgeable(target, target + extent);
+            }
+            if (engine_map_shared_memory(engine, target, extent, page_size)) {
+                for (auto at = target; at < target + extent; at += page_size) pages[at] = permissions;
+            } else {
+                for (auto at = target; at < target + extent; at += page_size) {
+                    engine.map_memory(at, static_cast<std::size_t>(page_size));
+                    engine.set_memory_access(at, true, true, false);
+                    pages[at] = permissions;
+                }
+            }
+            memory.write_bytes(target, bytes);
+            for (auto at = target; at < target + extent; at += page_size)
+                engine.set_memory_access(at, (permissions.current & read) != 0, (permissions.current & write) != 0,
+                                         (permissions.current & execute) != 0);
+            if (flags & anywhere) {
+                memory.write64(state.x[1], target);
+                next_address = target + extent + page_size;
+            }
+        }
+        if (executable) engine_code_copy(engine, target, begin, extent);
+        memory.write32(current_output, permissions.current);
+        memory.write32(maximum_output, permissions.maximum);
+        return success;
     }
 
     void install() {

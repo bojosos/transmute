@@ -229,6 +229,14 @@ bool DarwinVmSpace::replace_with_copy(std::uint64_t address, std::span<const std
     return true;
 }
 
+bool DarwinVmSpace::replace_with_alias(std::uint64_t address, std::uint64_t length, const std::function<void()>& alias) {
+    if (!enabled() || !length || address % page || length % page || address > UINT64_MAX - length) return false;
+    std::lock_guard lock(mutex_);
+    if (!owns(address, address + length)) return false;
+    alias();
+    return true;
+}
+
 bool DarwinVmSpace::advise(std::uint64_t address, std::uint64_t length, std::uint64_t advice) {
     if (!length || address > UINT64_MAX - length) return false;
     const auto begin = address & ~(page - 1);

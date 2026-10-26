@@ -111,8 +111,6 @@ void remap_capability_and_guards() {
     f.remap_outputs(data + 8, data + 12);
     require(f.call("_vm_remap", {0, data, page_size, 0, 0x4000, f.task, source, 0}) == 16,
             "remap accepted an invalid target task");
-    require(f.call("_vm_remap", {f.task, data, page_size, 0, 0x4000, f.task, source, 1}) == 46,
-            "copy-on-write remap was silently substituted");
     f.remap_outputs(0, data + 12);
     require(f.call("_vm_remap", {f.task, data, page_size, 0, 0x4000, f.task, source, 0}) == 1,
             "remap accepted an invalid protection output");
@@ -128,6 +126,27 @@ void remap_capability_and_guards() {
             f.engine.read32(data + 8) == 0x11223344 && f.engine.read32(data + 12) == 0x55667788 &&
             f.engine.query_region(destination + page_size)->writable,
             "blocked remap modified output values or destination mappings");
+}
+
+// copy = TRUE: the target gets the source's bytes as of the remap (what a
+// copy-on-write mapping shows) and the source's protection; later stores on
+// either side stay on that side.
+void remap_copy_on_write() {
+    Fixture f;
+    const auto source = f.allocate(page_size);
+    const auto destination = f.allocate(page_size);
+    f.engine.write64(source + 16, 0xc0ffee);
+    f.engine.write64(data, destination);
+    f.remap_outputs(data + 8, data + 12);
+    require(f.call("_vm_remap", {f.task, data, page_size, 0, 0x4000, f.task, source, 1}) == 0,
+            "copy-on-write remap over Mach pages failed");
+    require(f.engine.read64(data) == destination && f.engine.read64(destination + 16) == 0xc0ffee,
+            "the copy does not hold the source's bytes");
+    require((f.engine.read32(data + 8) & 3) == 3, "the copy did not keep the source's protection");
+    f.engine.write64(source + 16, 1);
+    f.engine.write64(destination + 24, 2);
+    require(f.engine.read64(destination + 16) == 0xc0ffee && f.engine.read64(source + 24) == 0,
+            "the copy and its source share pages");
 }
 
 void remap_immutable_source() {
@@ -279,6 +298,7 @@ int main() {
     try {
         allocations_and_protections();
         remap_capability_and_guards();
+        remap_copy_on_write();
         remap_immutable_source();
         remap_over_foreign_memory();
         concurrent_allocations();

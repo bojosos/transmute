@@ -507,9 +507,32 @@ struct FxEngine::Shared {
     }
     // Our host reservations by base. A releasable one (made for a
     // Darwin mmap reservation) is freed once no guest region is left in it.
-    struct Allocation { std::uint64_t extent{}; bool releasable{}; };
+    // A guest-space one (fx placeholders, made private where provided) is made
+    // of several host allocations: test addresses with ours(), not by their
+    // allocation base.
+    struct Allocation { std::uint64_t extent{}; bool releasable{}; bool guest_space{}; };
     std::map<std::uint64_t, Allocation> allocations;
     GranuleSet granules;                         // reserved 64 KiB granules (index runs)
+    [[nodiscard]] bool ours(std::uint64_t address) const { return granules.contains(address / kGranule); }
+    // [begin, end) lies inside one guest-space reservation.
+    [[nodiscard]] bool in_guest_space(std::uint64_t begin, std::uint64_t end) const {
+        auto it = allocations.upper_bound(begin);
+        if (it == allocations.begin()) return false;
+        --it;
+        return it->second.guest_space && end <= it->first + it->second.extent;
+    }
+    // Makes the guest-space parts of [begin, end) private reserved memory
+    // (commit and protect need it); false when the host refuses.
+    bool make_private(std::uint64_t begin, std::uint64_t end) {
+        auto it = allocations.upper_bound(begin);
+        if (it != allocations.begin()) --it;
+        for (; it != allocations.end() && it->first < end; ++it) {
+            if (!it->second.guest_space || it->first + it->second.extent <= begin) continue;
+            if (!fx::provide_guest_space(std::max(begin, it->first), std::min(end, it->first + it->second.extent)))
+                return false;
+        }
+        return true;
+    }
 
     // ---- demand commit --------------------------------------------------------
     // Ranges of Darwin reservations the guest made accessible without their
@@ -529,6 +552,18 @@ struct FxEngine::Shared {
     const bool lazy_commit = [] {
         char value[8]{};
         const auto length = fx::host::get_env("ALCHEMY_FX_LAZY_COMMIT", value, sizeof(value));
+        return !(length == 1 && value[0] == '0');
+    }();
+    // Large Darwin mmap reservations (reserve_at, reserve_anywhere, at least
+    // kLazyCommitMinimum: V8's sandbox and cage, allocator pools) are fx guest
+    // space (process.hpp: reserve_guest_space): placeholders made private where
+    // the guest makes them accessible, so shared memory can be aliased into
+    // the untouched rest (vm_remap over mmap'd pages). Smaller ones stay plain
+    // host reservations (one system call each). ALCHEMY_FX_GUEST_SPACE=0 makes
+    // every one plain (no such aliases).
+    const bool guest_space = [] {
+        char value[8]{};
+        const auto length = fx::host::get_env("ALCHEMY_FX_GUEST_SPACE", value, sizeof(value));
         return !(length == 1 && value[0] == '0');
     }();
 
@@ -763,6 +798,7 @@ struct FxEngine::Shared {
     // with `protection`: on first touch when `lazy`, else committed now
     // (std::bad_alloc when the host cannot commit it).
     void provide(std::uint64_t begin, std::uint64_t end, vm::Protection protection, bool lazy) {
+        if (!make_private(begin, end)) throw std::bad_alloc();
         if (lazy) {
             std::unique_lock commit_guard(commit_lock);
             set_pending(begin, end, protection);
@@ -906,28 +942,36 @@ struct FxEngine::Shared {
             vm::RegionInfo info;
             if (!vm::query(host(address), info)) return false;
             const auto region_end = info.base + info.size;
-            if (info.state != vm::State::free && !allocations.count(info.allocation_base)) return false;
+            if (info.state != vm::State::free && !ours(address)) return false;
             address = region_end;
         }
         return true;
     }
-    void reserve_granules(std::uint64_t begin, std::uint64_t end, bool releasable = false) {
+    [[nodiscard]] bool guest_space_for(std::uint64_t size) const { return guest_space && size >= kLazyCommitMinimum; }
+    void reserve_granules(std::uint64_t begin, std::uint64_t end, bool releasable = false, bool space_wanted = false) {
         load_range::release_if_overlaps(begin, end - begin);
         auto granule = align_down(begin, kGranule) / kGranule;
         const auto last = align_up(end, kGranule) / kGranule;
         while (granule < last) {
             if (granules.contains(granule)) { granule = std::min(last, granules.run_end(granule)); continue; }
             const auto run_end = granules.next(granule, last);
-            void* reserved = vm::reserve(host(granule * kGranule), static_cast<std::size_t>((run_end - granule) * kGranule),
-                                         vm::kNoAccess);
+            const bool space = releasable && space_wanted;
+            void* reserved = nullptr;
+            if (space) {
+                if (fx::reserve_guest_space(granule * kGranule, (run_end - granule) * kGranule))
+                    reserved = host(granule * kGranule);
+            } else {
+                reserved = vm::reserve(host(granule * kGranule), static_cast<std::size_t>((run_end - granule) * kGranule),
+                                       vm::kNoAccess);
+            }
             if (reinterpret_cast<std::uint64_t>(reserved) != granule * kGranule) {
-                if (reserved) vm::release(reserved);
+                if (reserved && !space) vm::release(reserved);
                 std::ostringstream message;
                 message << "alchemy-fx: host address range 0x" << std::hex << granule * kGranule << "-0x"
                         << run_end * kGranule << " is not available";
                 throw std::runtime_error(message.str());
             }
-            allocations[granule * kGranule] = Allocation{(run_end - granule) * kGranule, releasable};
+            allocations[granule * kGranule] = Allocation{(run_end - granule) * kGranule, releasable, space};
             granules.insert(granule, run_end);
             granule = run_end;
         }
@@ -936,9 +980,7 @@ struct FxEngine::Shared {
     // munmap range may span host memory that is not the guest's).
     void decommit_ours(std::uint64_t begin, std::uint64_t end) {
         for_each_committed_piece(begin, end, [this](std::uint64_t address, std::uint64_t size) {
-            vm::RegionInfo info;
-            if (vm::query(host(address), info) && allocations.count(info.allocation_base))
-                vm::decommit(host(address), static_cast<std::size_t>(size));
+            if (ours(address)) vm::decommit(host(address), static_cast<std::size_t>(size));
         });
     }
     // Frees the releasable reservations overlapping [begin, end) that no
@@ -955,7 +997,8 @@ struct FxEngine::Shared {
             }
             invalidate_committed(base, base + allocation.extent);
             forget_pending(base, base + allocation.extent);
-            vm::release(host(base));
+            if (allocation.guest_space) fx::release_guest_space(base, allocation.extent);
+            else vm::release(host(base));
             granules.erase(base / kGranule, (base + allocation.extent) / kGranule);
             it = allocations.erase(it);
         }
@@ -1018,7 +1061,7 @@ struct FxEngine::Shared {
         const auto end = align_up(base + size, kPage);
         if (overlaps(base, size) || !host_free(base, size)) return false;
         try {
-            reserve_granules(base, end, true);
+            reserve_granules(base, end, true, guest_space_for(end - base));
         } catch (const std::runtime_error&) {
             return false;   // another host thread took part of it
         }
@@ -1768,15 +1811,43 @@ void FxEngine::alias_memory(std::uint64_t destination, std::uint64_t source, std
         pieces.emplace_back(destination + (at - source), end - at);
         at = end;
     }
-    // Destination: free, or whole shared regions it replaces (VM_FLAGS_OVERWRITE).
+    // Destination: free, whole shared regions it replaces (VM_FLAGS_OVERWRITE),
+    // or pages of guest space (a Darwin mmap reservation, e.g. V8's sandbox)
+    // that it takes out of their regions, as munmap would.
+    const auto end = destination + size;
+    const bool space = shared_->in_guest_space(destination, end);
+    bool carve = false;
     std::vector<std::uint64_t> replaced;
-    for (auto it = shared_->regions.lower_bound(destination); it != shared_->regions.end() && it->first < destination + size; ++it) {
-        if (!it->second.shared || it->second.copy_on_write || it->first + it->second.size > destination + size)
-            throw std::runtime_error("alchemy-fx: alias destination overlaps private guest memory");
-        replaced.push_back(it->first);
+    for (auto it = shared_->regions.lower_bound(destination); it != shared_->regions.end() && it->first < end; ++it) {
+        const auto& region = it->second;
+        if (region.shared && !region.copy_on_write && it->first + region.size <= end) {
+            replaced.push_back(it->first);
+            continue;
+        }
+        if (space && region.lazy && !region.shared) {
+            carve = true;
+            continue;
+        }
+        throw std::runtime_error("alchemy-fx: alias destination overlaps private guest memory");
     }
-    if (const auto* before = shared_->find(destination); before && before->base < destination)
-        throw std::runtime_error("alchemy-fx: alias destination splits a guest region");
+    if (const auto* before = shared_->find(destination); before && before->base < destination) {
+        if (!space || !before->lazy || before->shared)
+            throw std::runtime_error("alchemy-fx: alias destination splits a guest region");
+        carve = true;
+    }
+    if (carve) {
+        // Code, pending commits, committed pages and region records of the
+        // range go (shared views there are cut too), then fx takes the range
+        // back as placeholder for the alias. A reservation left without regions
+        // is released by unmap_range; the alias then gets fresh address space.
+        shared_->unmap_range(destination, end);
+        replaced.clear();
+        if (shared_->ours(destination)) {
+            std::unique_lock commit_guard(shared_->commit_lock);
+            if (!fx::reclaim_guest_space(destination, end))
+                throw std::runtime_error("alchemy-fx: alias destination keeps committed guest pages");
+        }
+    }
     fx::alias_guest_memory(destination, source, size, protection(readable, writable));
     for (const auto base : replaced) {
         if (shared_->regions[base].executable) fx::unregister_guest_code_memory(base, shared_->regions[base].size);
@@ -2043,10 +2114,12 @@ std::uint64_t FxEngine::reserve_anywhere(std::uint64_t size, std::uint64_t align
     std::unique_lock lock(shared_->memory_lock);
     // Above __PAGEZERO: Darwin never hands out the low 4 GiB, and Swift uses
     // pointers below it as enum payloads.
-    auto* reserved = vm::reserve_above(kLowLimit, static_cast<std::size_t>(extent));
+    const bool space = shared_->guest_space_for(extent);
+    void* reserved = space ? host(fx::reserve_guest_space_above(kLowLimit, extent))
+                           : vm::reserve_above(kLowLimit, static_cast<std::size_t>(extent));
     if (!reserved) throw std::bad_alloc();
     const auto base = reinterpret_cast<std::uint64_t>(reserved);
-    shared_->allocations[base] = Shared::Allocation{extent, true};
+    shared_->allocations[base] = Shared::Allocation{extent, true, space};
     shared_->granules.insert(base / kGranule, (base + extent) / kGranule);
     if (readable || writable) {
         const auto end = base + align_up(size, kPage);
@@ -2307,7 +2380,7 @@ void FxEngine::discard_range(std::uint64_t address, std::uint64_t size) {
     for_each_committed_piece(begin, end, [this](std::uint64_t piece, std::uint64_t length) {
         vm::RegionInfo info;
         if (!vm::query(host(piece), info) || info.type != vm::Type::private_memory ||
-            !shared_->allocations.count(info.allocation_base))
+            !shared_->ours(piece))
             return;
         // Pages of translated code would come back as zeros under their translations.
         fx::invalidate_guest_code(piece, length);
