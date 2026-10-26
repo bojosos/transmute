@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
+#include "alchemy/engine_adapter.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/host/system.hpp"
 #include "alchemy/host/vm.hpp"
@@ -6,6 +7,7 @@
 #include "alchemy/path.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -53,7 +55,7 @@ std::string base_name(std::string path) {
 // ---- os_activity -------------------------------------------------------------
 // os_activity objects (os_log objects are misc/oslog.cpp's): reference-counted
 // handles with no tracing consumer.
-struct OsObject { std::uint32_t references{1}; std::string category; };
+struct OsObject { std::uint32_t references{1}; std::string category; std::uint64_t id{}, parent{}; };
 
 class OsObjects {
 public:
@@ -81,6 +83,12 @@ public:
         }
         process_.release_guest(address);
         return true;
+    }
+    std::optional<OsObject> find(std::uint64_t address) {
+        std::lock_guard lock(mutex_);
+        const auto found = objects_.find(address);
+        if (found == objects_.end()) return std::nullopt;
+        return found->second;
     }
 
 private:
@@ -402,19 +410,276 @@ void install_libsystem_misc(Provider& p) {
     // os_retain/os_release hand other os objects (these activities) to the
     // internal retain/release below.
     auto objects = std::make_shared<OsObjects>(process);
-    // os_activity_t _os_activity_create(void* dso, const char* description, os_activity_t parent, flags)
-    p.libsystem("__os_activity_create", [objects](CpuState& s, GuestMemory& m) -> std::uint64_t {
+    // Activities have identifiers (and their parent's) and nest: each thread keeps a stack of the
+    // active ones (os_activity_scope_enter/leave, _os_activity_initiate, os_activity_apply).
+    // OS_ACTIVITY_CURRENT (&_os_activity_current) is the calling thread's innermost activity and
+    // OS_ACTIVITY_NONE (&_os_activity_none) none. Nothing consumes them (there is no tracing).
+    struct Active {
+        std::mutex mutex;
+        std::map<std::uint64_t, std::vector<std::uint64_t>> threads;   // thread identity -> activity addresses
+        std::uint64_t next_id{1};
+    };
+    const auto active = std::make_shared<Active>();
+    const auto current_cell = p.data(libsystem_library, "__os_activity_current", 16);
+    const auto none_cell = p.data(libsystem_library, "__os_activity_none", 16);
+    const auto thread = [&process] { const auto value = process.current_thread(); return value ? value->identity : std::uint64_t{0}; };
+    // The activity an os_activity_t names (0: none).
+    const auto resolve = [active, thread, current_cell, none_cell](std::uint64_t activity) -> std::uint64_t {
+        if (activity == none_cell) return 0;
+        if (activity != current_cell) return activity;
+        std::lock_guard lock(active->mutex);
+        const auto found = active->threads.find(thread());
+        return found == active->threads.end() || found->second.empty() ? 0 : found->second.back();
+    };
+    const auto identifier = [objects](std::uint64_t activity) -> std::uint64_t {
+        const auto found = activity ? objects->find(activity) : std::nullopt;
+        return found ? found->id : 0;
+    };
+    const auto create = [objects, active, resolve, identifier](std::string description, std::uint64_t parent) {
         OsObject value;
-        if (s.x[1]) value.category = guest_string(m, s.x[1], 1024);
+        value.category = std::move(description);
+        value.parent = identifier(resolve(parent));
+        { std::lock_guard lock(active->mutex); value.id = active->next_id++; }
         return objects->create(std::move(value));
+    };
+    const auto enter = [active, thread](std::uint64_t activity) {
+        std::lock_guard lock(active->mutex);
+        auto& stack = active->threads[thread()];
+        stack.push_back(activity);
+        return stack.size();
+    };
+    const auto leave = [active, thread](std::size_t depth) {
+        std::lock_guard lock(active->mutex);
+        auto& stack = active->threads[thread()];
+        if (depth && stack.size() >= depth) stack.resize(depth - 1);
+    };
+    const auto run_block = [&process](std::uint64_t block) {
+        const std::array<std::uint64_t, 1> arguments{block};
+        static_cast<void>(EngineAdapter(process.calling_engine()).call(process.calling_engine().read64(block + 16), arguments));
+    };
+    // os_activity_t _os_activity_create(void* dso, const char* description, os_activity_t parent, flags)
+    p.libsystem("__os_activity_create", [create](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        return create(s.x[1] ? guest_string(m, s.x[1], 1024) : std::string(), s.x[2]);
     }, 0);
-    // void os_activity_scope_enter(os_activity_t, struct os_activity_scope_state_s*)
-    // Activities have no tracing consumer; the scope state is recorded as empty.
-    p.libsystem("_os_activity_scope_enter", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
-        if (s.x[1]) { m.write64(s.x[1], 0); m.write64(s.x[1] + 8, 0); }
+    // void os_activity_scope_enter(os_activity_t, struct os_activity_scope_state_s* state): the state
+    // remembers the activity and the depth it entered at.
+    p.libsystem("_os_activity_scope_enter", [resolve, enter](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto activity = resolve(s.x[0]);
+        const auto depth = enter(activity);
+        if (s.x[1]) { m.write64(s.x[1], activity); m.write64(s.x[1] + 8, depth); }
         return 0;
     });
-    p.libsystem("_os_activity_scope_leave", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; });
+    p.libsystem("_os_activity_scope_leave", [leave](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (s.x[0]) leave(static_cast<std::size_t>(m.read64(s.x[0] + 8)));
+        return 0;
+    });
+    // _os_activity_initiate(dso, description, flags, block) / _f(dso, description, flags, context, function):
+    // the work runs synchronously inside a new activity.
+    p.libsystem("__os_activity_initiate", [objects, create, enter, leave, run_block](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto activity = create(s.x[1] ? guest_string(m, s.x[1], 1024) : std::string(), 0);
+        const auto depth = enter(activity);
+        try { run_block(s.x[3]); } catch (...) { leave(depth); static_cast<void>(objects->release(activity)); throw; }
+        leave(depth);
+        static_cast<void>(objects->release(activity));
+        return 0;
+    });
+    p.libsystem("__os_activity_initiate_f", [&process, objects, create, enter, leave](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto activity = create(s.x[1] ? guest_string(m, s.x[1], 1024) : std::string(), 0);
+        const auto depth = enter(activity);
+        const std::array<std::uint64_t, 1> arguments{s.x[3]};
+        try { static_cast<void>(EngineAdapter(process.calling_engine()).call(s.x[4], arguments)); }
+        catch (...) { leave(depth); static_cast<void>(objects->release(activity)); throw; }
+        leave(depth);
+        static_cast<void>(objects->release(activity));
+        return 0;
+    });
+    // os_activity_apply(activity, block) / os_activity_apply_f(activity, context, function)
+    p.libsystem("_os_activity_apply", [resolve, enter, leave, run_block](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto depth = enter(resolve(s.x[0]));
+        try { run_block(s.x[1]); } catch (...) { leave(depth); throw; }
+        leave(depth);
+        return 0;
+    });
+    p.libsystem("_os_activity_apply_f", [&process, resolve, enter, leave](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto depth = enter(resolve(s.x[0]));
+        const std::array<std::uint64_t, 1> arguments{s.x[1]};
+        try { static_cast<void>(EngineAdapter(process.calling_engine()).call(s.x[2], arguments)); } catch (...) { leave(depth); throw; }
+        leave(depth);
+        return 0;
+    });
+    // os_activity_id_t os_activity_get_identifier(os_activity_t, os_activity_id_t* parent_id)
+    p.libsystem("_os_activity_get_identifier", [objects, resolve](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto activity = resolve(s.x[0]);
+        const auto found = activity ? objects->find(activity) : std::nullopt;
+        if (s.x[1]) m.write64(s.x[1], found ? found->parent : 0);
+        return found ? found->id : 0;
+    }, 0);
+    // unsigned os_activity_get_active(os_activity_id_t* entries, unsigned* count): the calling
+    // thread's active activities, outermost first, up to *count; *count becomes their number.
+    p.libsystem("_os_activity_get_active", [active, thread, identifier](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        std::vector<std::uint64_t> stack;
+        {
+            std::lock_guard lock(active->mutex);
+            if (const auto found = active->threads.find(thread()); found != active->threads.end()) stack = found->second;
+        }
+        const auto room = s.x[1] ? m.read32(s.x[1]) : 0;
+        for (std::size_t index = 0; index < stack.size() && index < room && s.x[0]; ++index) m.write64(s.x[0] + index * 8, identifier(stack[index]));
+        if (s.x[1]) m.write32(s.x[1], static_cast<std::uint32_t>(stack.size()));
+        return stack.size();
+    }, 0);
+    // _os_activity_label_useraction(const char*): labels the user action an activity belongs to; with
+    // no tracing consumer there is nothing to label.
+    p.libsystem("__os_activity_label_useraction", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; });
+
+    // ---- os_workgroup (<os/workgroup.h>) ----
+    // Workgroups are os objects (os_retain/os_release, the activities' store). Threads join and
+    // leave with a token (one workgroup per thread at a time: EALREADY); a cancelled workgroup
+    // refuses joins (EINVAL) and testcancel reports it. Intervals (OS_CLOCK_MACH_ABSOLUTE_TIME only)
+    // track start/finish. The working arena is kept with each joined thread's index. The scheduler
+    // gets no hint from membership (Windows has no thread workgroups), so joining only records it.
+    struct Group { std::uint64_t port{}; bool cancelled{}; };   // shared by workgroups made from one port
+    struct Workgroup {
+        std::shared_ptr<Group> group;
+        bool interval{}, running{};
+        std::uint64_t arena{}, arena_destructor{};
+        std::uint32_t max_workers{};
+        std::map<std::uint64_t, std::uint32_t> members;   // thread identity -> working-arena index
+    };
+    struct Workgroups { std::mutex mutex; std::map<std::uint64_t, Workgroup> values; std::map<std::uint64_t, std::shared_ptr<Group>> ports; };
+    const auto workgroups = std::make_shared<Workgroups>();
+    constexpr std::uint32_t join_token_signature = 0x4a4f494e;   // the token's signature word ("JOIN")
+    const auto make_workgroup = [objects, workgroups](std::string name, std::shared_ptr<Group> group, bool interval) {
+        OsObject value;
+        value.category = std::move(name);
+        const auto address = objects->create(std::move(value));
+        std::lock_guard lock(workgroups->mutex);
+        workgroups->values[address] = Workgroup{group ? std::move(group) : std::make_shared<Group>(), interval};
+        return address;
+    };
+    const auto with = [workgroups](std::uint64_t address, auto action) -> std::uint64_t {
+        std::lock_guard lock(workgroups->mutex);
+        const auto found = workgroups->values.find(address);
+        if (found == workgroups->values.end()) throw std::runtime_error("Alchemy: an os_workgroup call on an object that is not a workgroup");
+        return action(found->second);
+    };
+    // os_workgroup_t os_workgroup_create_with_port(const char* name, mach_port_t) / _copy_port(wg, mach_port_t*)
+    p.libsystem("_os_workgroup_create_with_port", [make_workgroup, workgroups](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        std::shared_ptr<Group> group;
+        {
+            std::lock_guard lock(workgroups->mutex);
+            if (const auto found = workgroups->ports.find(static_cast<std::uint32_t>(s.x[1])); found != workgroups->ports.end()) group = found->second;
+        }
+        if (!group) throw Errno{einval};   // not a port os_workgroup_copy_port gave out
+        return make_workgroup(s.x[0] ? guest_string(m, s.x[0], 256) : std::string(), group, false);
+    }, 0);
+    p.libsystem("_os_workgroup_copy_port", [p, with, workgroups](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[1]) return einval;
+        auto port = with(s.x[0], [](Workgroup& w) { return w.group->port; });
+        if (!port) {
+            // A receive right names the workgroup across copy_port/create_with_port.
+            const auto task = m.read32(p.process().resolve(libsystem_library, "_mach_task_self_")->address);
+            const auto slot = p.malloc(4);
+            m.write32(slot, 0);
+            const auto result = p.call(libsystem_library, "_mach_port_allocate", {task, 1, slot});
+            port = m.read32(slot);
+            static_cast<void>(p.call(libsystem_library, "_free", {slot}));
+            if (result != 0 || !port) return einval;
+            std::lock_guard lock(workgroups->mutex);
+            auto& group = workgroups->values.at(s.x[0]).group;
+            if (group->port) port = group->port; else { group->port = port; workgroups->ports[port] = group; }
+        }
+        m.write32(s.x[1], static_cast<std::uint32_t>(port));
+        return 0;
+    });
+    // os_workgroup_t os_workgroup_create_with_workgroup(const char* name, os_workgroup_t wg): the same group.
+    p.libsystem("_os_workgroup_create_with_workgroup", [make_workgroup, with](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        std::shared_ptr<Group> shared;
+        bool interval{};
+        static_cast<void>(with(s.x[1], [&](Workgroup& w) { shared = w.group; interval = w.interval; return std::uint64_t{0}; }));
+        return make_workgroup(s.x[0] ? guest_string(m, s.x[0], 256) : std::string(), shared, interval);
+    }, 0);
+    // os_workgroup_interval_t os_workgroup_interval_create(const char* name, os_clockid_t, os_workgroup_attr_t)
+    p.libsystem("_os_workgroup_interval_create", [make_workgroup](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (static_cast<std::uint32_t>(s.x[1]) != 32) throw Errno{einval};   // OS_CLOCK_MACH_ABSOLUTE_TIME
+        return make_workgroup(s.x[0] ? guest_string(m, s.x[0], 256) : std::string(), nullptr, true);
+    }, 0);
+    // int os_workgroup_join(os_workgroup_t, os_workgroup_join_token_t) / void os_workgroup_leave(wg, token)
+    p.libsystem("_os_workgroup_join", [with, workgroups, thread](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[1]) return einval;
+        const auto self = thread();
+        {
+            std::lock_guard lock(workgroups->mutex);
+            for (const auto& [address, value] : workgroups->values) if (value.members.contains(self)) return 37;   // EALREADY
+        }
+        const auto result = with(s.x[0], [self](Workgroup& w) -> std::uint64_t {
+            if (w.group->cancelled) return einval;
+            w.members.emplace(self, static_cast<std::uint32_t>(w.members.size()));
+            return 0;
+        });
+        if (result) return result;
+        m.fill_bytes(s.x[1], 0, 40);   // struct os_workgroup_join_token_opaque_s
+        m.write32(s.x[1], join_token_signature);
+        m.write64(s.x[1] + 8, s.x[0]);
+        m.write64(s.x[1] + 16, self);
+        return 0;
+    });
+    p.libsystem("_os_workgroup_leave", [with, thread](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[1] || m.read32(s.x[1]) != join_token_signature || m.read64(s.x[1] + 8) != s.x[0] || m.read64(s.x[1] + 16) != thread())
+            throw std::runtime_error("Alchemy: os_workgroup_leave with a token this thread did not get from os_workgroup_join on that workgroup");
+        static_cast<void>(with(s.x[0], [&](Workgroup& w) { w.members.erase(thread()); return std::uint64_t{0}; }));
+        m.write32(s.x[1], 0);
+        return 0;
+    });
+    p.libsystem("_os_workgroup_cancel", [with](CpuState& s, GuestMemory&) -> std::uint64_t {
+        return with(s.x[0], [](Workgroup& w) { w.group->cancelled = true; return std::uint64_t{0}; });
+    });
+    p.libsystem("_os_workgroup_testcancel", [with](CpuState& s, GuestMemory&) -> std::uint64_t {
+        return with(s.x[0], [](Workgroup& w) -> std::uint64_t { return w.group->cancelled ? 1 : 0; });
+    }, 0);
+    // int os_workgroup_set_working_arena(wg, void* arena, uint32_t max_workers, destructor) /
+    // void* os_workgroup_get_working_arena(wg, os_workgroup_index* index_out)
+    p.libsystem("_os_workgroup_set_working_arena", [p, with](CpuState& s, GuestMemory&) -> std::uint64_t {
+        std::uint64_t previous{}, destructor{};
+        const auto result = with(s.x[0], [&](Workgroup& w) -> std::uint64_t {
+            if (!w.members.empty()) return 16;   // EBUSY: threads have joined
+            previous = std::exchange(w.arena, s.x[1]);
+            destructor = std::exchange(w.arena_destructor, s.x[3]);
+            w.max_workers = static_cast<std::uint32_t>(s.x[2]);
+            return 0;
+        });
+        if (!result && previous && destructor) {
+            const std::array<std::uint64_t, 1> arguments{previous};
+            static_cast<void>(EngineAdapter(p.process().calling_engine()).call(destructor, arguments));
+        }
+        return result;
+    });
+    p.libsystem("_os_workgroup_get_working_arena", [with, thread](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        return with(s.x[0], [&](Workgroup& w) -> std::uint64_t {
+            const auto found = w.members.find(thread());
+            if (s.x[1]) m.write32(s.x[1], found == w.members.end() ? 0 : found->second);
+            return w.arena;
+        });
+    }, 0);
+    // int os_workgroup_max_parallel_threads(wg, os_workgroup_mpt_attr_t): the online processors.
+    p.libsystem("_os_workgroup_max_parallel_threads", [p, with](CpuState& s, GuestMemory&) -> std::uint64_t {
+        static_cast<void>(with(s.x[0], [](Workgroup&) { return std::uint64_t{0}; }));
+        return p.call(libsystem_library, "_sysconf", {58});   // _SC_NPROCESSORS_ONLN
+    });
+    // int os_workgroup_interval_start(wg, uint64_t start, uint64_t deadline, data) / _finish(wg, data)
+    p.libsystem("_os_workgroup_interval_start", [with](CpuState& s, GuestMemory&) -> std::uint64_t {
+        return with(s.x[0], [&](Workgroup& w) -> std::uint64_t {
+            if (!w.interval || w.running || w.group->cancelled || s.x[2] < s.x[1]) return einval;
+            w.running = true;
+            return 0;
+        });
+    });
+    p.libsystem("_os_workgroup_interval_finish", [with](CpuState& s, GuestMemory&) -> std::uint64_t {
+        return with(s.x[0], [](Workgroup& w) -> std::uint64_t {
+            if (!w.interval || !w.running) return einval;
+            w.running = false;
+            return 0;
+        });
+    });
     // os_retain / os_release of the activities above (internal names; the
     // libSystem exports are misc/oslog.cpp's, which call these).
     static_cast<void>(process.install_function("__alchemy_os_activity_retain", [objects](CpuState& s, GuestMemory&) {

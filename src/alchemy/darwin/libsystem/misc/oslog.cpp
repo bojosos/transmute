@@ -116,11 +116,14 @@ void install_os_log(Support& support) {
         s.x[0] = image ? make(guest_text(m, s.x[1], 1024), guest_text(m, s.x[2], 1024), false)
                        : make(guest_text(m, s.x[0], 1024), guest_text(m, s.x[1], 1024), false);
     });
+    // OS_LOG_DISABLED (&_os_log_disabled): a log on which no type is enabled and nothing is recorded.
+    const auto disabled = make("", "", true);
+    support.process.install_export(std::string(libsystem), "__os_log_disabled", {disabled, ExportKind::data});
     // Darwin's default configuration records default (0x00), error (0x10)
     // and fault (0x11) messages; info (0x01) and debug (0x02) are off.
-    support.function(libsystem, "_os_log_type_enabled", [](CpuState& s, GuestMemory&) {
+    support.function(libsystem, "_os_log_type_enabled", [disabled](CpuState& s, GuestMemory&) {
         const auto type = static_cast<std::uint8_t>(s.x[1]);
-        s.x[0] = type == 0x00 || type == 0x10 || type == 0x11;
+        s.x[0] = s.x[0] != disabled && (type == 0x00 || type == 0x10 || type == 0x11);
     });
     // Records one message (and echoes it with ALCHEMY_OS_LOG=1).
     const auto record = [&support, logs](Address dso, Address log, std::uint8_t type, std::string format, std::string message) {
@@ -145,9 +148,10 @@ void install_os_log(Support& support) {
         }
         logs::record(std::move(entry));
     };
-    // void _os_log_impl(void* dso, os_log_t, os_log_type_t, const char* format, uint8_t* buffer, uint32_t size)
-    support.function(libsystem, "__os_log_impl", [&support, record](CpuState& s, GuestMemory& m) {
-        if (!s.x[3]) return;
+    // void _os_log_impl(void* dso, os_log_t, os_log_type_t, const char* format, uint8_t* buffer, uint32_t size),
+    // and the older per-type entry points with the same arguments.
+    const auto log_impl = [&support, record, disabled](CpuState& s, GuestMemory& m) {
+        if (!s.x[3] || s.x[1] == disabled) return;
         auto format = guest_text(m, s.x[3]);
         std::vector<std::uint8_t> buffer(static_cast<std::size_t>(std::min<std::uint64_t>(static_cast<std::uint32_t>(s.x[5]), 65536)));
         if (s.x[4] && !buffer.empty()) m.read_bytes(s.x[4], buffer);
@@ -158,6 +162,31 @@ void install_os_log(Support& support) {
                 return description ? support.cf.utf8(description) : std::string("(null)");
             });
         record(s.x[0], s.x[1], static_cast<std::uint8_t>(s.x[2]), std::move(format), std::move(message));
+    };
+    for (const auto* name : {"__os_log_impl", "__os_log_error_impl", "__os_log_fault_impl", "__os_log_debug_impl"})
+        support.function(libsystem, name, log_impl);
+    // void os_log_with_args(os_log_t, os_log_type_t, const char* format, va_list, void* return_address):
+    // the arguments are a va_list, which Foundation's formatter composes.
+    support.function(libsystem, "_os_log_with_args", [&support, record, disabled](CpuState& s, GuestMemory& m) {
+        if (!s.x[2] || s.x[0] == disabled) return;
+        const auto format = guest_text(m, s.x[2]);
+        std::string plain;
+        for (std::size_t i = 0; i < format.size(); ++i) {
+            plain.push_back(format[i]);
+            if (format[i] == '%' && i + 1 < format.size() && format[i + 1] == '{') {
+                const auto close = format.find('}', i + 1);
+                if (close != std::string::npos) i = close;
+            }
+        }
+        const auto format_object = support.cf.string(plain);
+        const auto text = support.send_id(support.send_id(support.objc.find_class("NSString"), "alloc"), "initWithFormat:arguments:", {format_object, s.x[3]});
+        support.release(format_object);
+        auto message = text ? support.cf.utf8(text) : plain;
+        support.release(text);
+        Address dso{};
+        for (const auto& image : support.process.images())
+            if (s.x[4] >= image.begin && s.x[4] < image.end) { dso = image.header; break; }
+        record(dso, s.x[0], static_cast<std::uint8_t>(s.x[1]), format, std::move(message));
     });
     // void _os_log_internal(void* dso, os_log_t, os_log_type_t, const char* format, ...): the
     // arguments are C variadic arguments; Foundation's formatter composes them.

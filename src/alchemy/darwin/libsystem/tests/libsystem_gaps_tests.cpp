@@ -2,6 +2,10 @@
 // pure helpers and the guest-visible exports (split from the export-fill tests).
 #include "alchemy/darwin/kit/export_fill/tests/export_fill_test_kit.hpp"
 
+#include <array>
+#include <atomic>
+#include <thread>
+
 namespace {
 
 void test_pure() {
@@ -276,6 +280,95 @@ void test_guest_misc(Fixture& f) {
         static_cast<void>(f.engine.invoke_callback(release, argument));
         static_cast<void>(f.engine.invoke_callback(release, argument));
     }
+    // Activities nest per thread: identifiers, parents, OS_ACTIVITY_CURRENT and the active list.
+    {
+        const auto current = f.symbol("/usr/lib/libSystem.B.dylib", "__os_activity_current");
+        const auto outer = f.sys("__os_activity_create", {0, f.text("outer"), 0, 0});
+        const auto outer_state = f.process.allocate_guest(16), inner_state = f.process.allocate_guest(16);
+        f.sys("_os_activity_scope_enter", {outer, outer_state});
+        const auto inner = f.sys("__os_activity_create", {0, f.text("inner"), current, 0});
+        f.sys("_os_activity_scope_enter", {inner, inner_state});
+        const auto parent = f.process.allocate_guest(8);
+        const auto inner_id = f.sys("_os_activity_get_identifier", {inner, parent});
+        const auto outer_id = f.sys("_os_activity_get_identifier", {outer, 0});
+        require(inner_id && outer_id && inner_id != outer_id && f.engine.read64(parent) == outer_id, "an activity's parent is the current one");
+        require(f.sys("_os_activity_get_identifier", {current, 0}) == inner_id, "OS_ACTIVITY_CURRENT is the innermost");
+        const auto ids = f.process.allocate_guest(16), count = f.process.allocate_guest(4);
+        f.engine.write32(count, 2);
+        require(f.sys("_os_activity_get_active", {ids, count}) == 2 && f.engine.read64(ids) == outer_id && f.engine.read64(ids + 8) == inner_id,
+                "os_activity_get_active, outermost first");
+        f.sys("_os_activity_scope_leave", {inner_state});
+        f.sys("_os_activity_scope_leave", {outer_state});
+        require(f.sys("_os_activity_get_identifier", {current, 0}) == 0, "no activity after leaving");
+        require(f.sys("_os_activity_get_identifier", {f.symbol("/usr/lib/libSystem.B.dylib", "__os_activity_none"), 0}) == 0, "OS_ACTIVITY_NONE");
+        // _os_activity_initiate_f runs the function inside a new activity.
+        static Address seen{};
+        static Fixture* fixture = &f;
+        const auto function = f.process.install_function("_gaps_activity_function", [](transmute::CpuState& s, transmute::GuestMemory&) {
+            seen = fixture->sys("_os_activity_get_identifier", {fixture->symbol("/usr/lib/libSystem.B.dylib", "__os_activity_current"), 0});
+            s.x[0] = 0;
+        });
+        f.sys("__os_activity_initiate_f", {0, f.text("initiated"), 0, 0, function});
+        require(seen != 0 && seen != outer_id && seen != inner_id, "initiate runs inside a new activity");
+    }
+}
+
+void test_os_extras(Fixture& f) {
+    // os_sync: a wait on a value that differs returns at once; a timeout expires; wakes without waiters are ENOENT.
+    const auto word = f.process.allocate_guest(8);
+    f.engine.write32(word, 7);
+    require(f.sys("_os_sync_wait_on_address", {word, 6, 4, 0}) == 0, "a different value does not wait");
+    require(f.sys("_os_sync_wait_on_address", {word, 7, 3, 0}) == UINT64_MAX, "size 3 is EINVAL");
+    require(f.sys("_os_sync_wait_on_address_with_timeout", {word, 7, 4, 0, 32, 1000000}) == UINT64_MAX, "the timeout expires");
+    require(f.sys("_os_sync_wait_on_address_with_timeout", {word, 7, 4, 0, 1, 1000000}) == UINT64_MAX, "only the mach clock");
+    require(f.sys("_os_sync_wake_by_address_any", {word, 4, 0}) == UINT64_MAX, "no waiter: ENOENT");
+    // A waiter on another guest thread is woken.
+    static std::atomic<int> woke{0};
+    static Fixture* fixture = &f;
+    static Address shared_word{};
+    shared_word = word;
+    const auto waiter = f.process.install_function("_gaps_os_sync_waiter", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        // On this guest thread's engine (the fixture's calls run on the main engine).
+        const std::array<std::uint64_t, 4> arguments{shared_word, 7, 4, 0};
+        const auto result = alchemy::EngineAdapter(fixture->process.calling_engine())
+                                .call(fixture->symbol("/usr/lib/libSystem.B.dylib", "_os_sync_wait_on_address"), arguments);
+        if (result != UINT64_MAX) ++woke;
+        s.x[0] = 0;
+    });
+    const auto thread = f.process.allocate_guest(8);
+    require(f.sys("_pthread_create", {thread, 0, waiter, 0}) == 0, "pthread_create");
+    std::uint64_t woken = UINT64_MAX;
+    for (int attempt = 0; attempt < 500 && woken == UINT64_MAX; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        woken = f.sys("_os_sync_wake_by_address_all", {word, 4, 0});
+    }
+    require(woken == 0, "the waiter was woken");
+    require(f.sys("_pthread_join", {f.engine.read64(thread), 0}) == 0 && woke == 1, "the wait returned");
+    // Workgroups: join/leave, cancel, intervals, the working arena.
+    const auto group = f.sys("_os_workgroup_interval_create", {f.text("render"), 32, 0});
+    require(group != 0 && f.sys("_os_workgroup_interval_create", {f.text("bad"), 1, 0}) == 0, "os_workgroup_interval_create");
+    const auto token = f.process.allocate_guest(40), other = f.process.allocate_guest(40);
+    require(f.sys("_os_workgroup_join", {group, token}) == 0, "join");
+    require(f.sys("_os_workgroup_join", {group, other}) == 37, "one workgroup per thread (EALREADY)");
+    require(f.sys("_os_workgroup_set_working_arena", {group, 0x1000, 4, 0}) == 16, "no arena change while joined (EBUSY)");
+    f.sys("_os_workgroup_leave", {group, token});
+    require(f.sys("_os_workgroup_set_working_arena", {group, 0x1000, 4, 0}) == 0, "set_working_arena");
+    require(f.sys("_os_workgroup_join", {group, token}) == 0, "join again");
+    const auto index = f.process.allocate_guest(4);
+    require(f.sys("_os_workgroup_get_working_arena", {group, index}) == 0x1000 && f.engine.read32(index) == 0, "get_working_arena");
+    require(f.sys("_os_workgroup_interval_start", {group, 10, 20, 0}) == 0 && f.sys("_os_workgroup_interval_start", {group, 10, 20, 0}) == 22,
+            "an interval starts once");
+    require(f.sys("_os_workgroup_interval_finish", {group, 0}) == 0 && f.sys("_os_workgroup_interval_finish", {group, 0}) == 22, "finish");
+    f.sys("_os_workgroup_leave", {group, token});
+    // (copy_port / create_with_port need Mach IPC: mach_tests.)
+    const auto twin = f.sys("_os_workgroup_create_with_workgroup", {f.text("twin"), group});
+    require(twin != 0, "create_with_workgroup");
+    f.sys("_os_workgroup_cancel", {group});
+    require(f.sys("_os_workgroup_testcancel", {twin}) == 1 && f.sys("_os_workgroup_join", {twin, token}) == 22, "cancelling cancels the group");
+    require(static_cast<std::int64_t>(f.sys("_os_workgroup_max_parallel_threads", {group, 0})) >= 1, "max_parallel_threads");
+    // dnsinfo: no configuration snapshot; configd's notify key.
+    require(f.sys("_dns_configuration_copy") == 0, "dns_configuration_copy is NULL without configd");
+    require(f.read(f.sys("_dns_configuration_notify_key")) == "com.apple.system.SystemConfiguration.dns_configuration", "dns_configuration_notify_key");
 }
 
 void test_guest_services(Fixture& f) {
@@ -532,6 +625,7 @@ int main() {
         stage("guest services"); test_guest_services(f);
         stage("app imports"); test_app_imports(f);
         stage("threads extra"); test_threads_extra(f);
+        stage("os extras"); test_os_extras(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

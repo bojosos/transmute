@@ -243,9 +243,16 @@ void terminfo(Fixture& f) {
     require(f.status(ncurses, "_del_curterm", {0}) == -1, "del_curterm(NULL)");
 }
 
+void signposts(Fixture& f) {
+    const auto first = f.call(sys, "_os_signpost_id_generate", {0}), second = f.call(sys, "_os_signpost_id_generate", {0});
+    require(first && second && first != second && first != UINT64_MAX, "os_signpost_id_generate");
+    require(f.call(sys, "_os_signpost_id_make_with_pointer", {0, 0x1234}) == 0x1234, "os_signpost_id_make_with_pointer");
+    require(f.call(sys, "_os_signpost_id_make_with_pointer", {0, 0}) == UINT64_MAX, "a NULL pointer is OS_SIGNPOST_ID_INVALID");
+}
+
 } // namespace
 
 int main() {
     return run("machsys", {{"imports", imports}, {"mach", mach}, {"tasks", tasks}, {"jit", jit}, {"vm", vm}, {"bsm", bsm}, {"launchd", launchd}, {"sandbox", sandbox}, {"libc", libc},
-                           {"os_unfair_lock", unfair_lock}, {"terminfo", terminfo}});
+                           {"os_unfair_lock", unfair_lock}, {"terminfo", terminfo}, {"signposts", signposts}});
 }

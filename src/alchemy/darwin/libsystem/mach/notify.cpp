@@ -10,8 +10,9 @@
 #include <vector>
 
 // libnotify (<notify.h>) inside one process: names, tokens, posts and the
-// four delivery kinds (check, dispatch block, Mach port over the in-process
-// namespace, file descriptor), plus per-name state. There is no notifyd, so
+// five delivery kinds (check, dispatch block, Mach port over the in-process
+// namespace, file descriptor, signal), per-name state, and suspending a
+// token's delivery (posts meanwhile coalesce into one on resume). There is no notifyd, so
 // posts from other processes (and the system's own names, such as the
 // thermal pressure level) are never delivered; their state stays 0.
 // Independently written from the public notify(3) documentation.
@@ -33,7 +34,7 @@ class NotifyProvider final : public Provider {
 public:
     using Provider::Provider;
 
-    enum class Kind { check, dispatch, mach_port, file };
+    enum class Kind { check, dispatch, mach_port, file, signal };
     struct Registration {
         std::string name;
         Kind kind{};
@@ -42,6 +43,8 @@ public:
         Right port;                        // mach_port: a send right to the caller's port
         std::int32_t write_fd{-1};         // file: the pipe's write end
         std::int32_t read_fd{-1};
+        std::int32_t signal{};             // signal: the signal raised in this process
+        bool suspended{}, pending{};       // notify_suspend: posts wait (coalesced) for notify_resume
     };
     std::shared_ptr<MachIpc> ipc;
     std::mutex mutex;
@@ -72,11 +75,18 @@ public:
             for (auto& [token, registration] : tokens) {
                 if (registration.name != name) continue;
                 registration.posted = true;
-                if (registration.kind != Kind::check) targets.emplace_back(token, registration);
+                if (registration.kind == Kind::check) continue;
+                if (registration.suspended) { registration.pending = true; continue; }
+                targets.emplace_back(token, registration);
             }
         }
-        for (const auto& [token, registration] : targets) {
+        for (const auto& [token, registration] : targets) deliver(token, registration);
+        return status_ok;
+    }
+    void deliver(std::int32_t token, const Registration& registration) {
+        {
             switch (registration.kind) {
+            case Kind::signal: static_cast<void>(call(libsystem, "_kill", {call(libsystem, "_getpid", {}), static_cast<std::uint32_t>(registration.signal)})); break;
             case Kind::dispatch: deliver_dispatch(registration.queue, registration.block, token); break;
             case Kind::mach_port: static_cast<void>(ipc->post(registration.port, token)); break;   // a full queue drops it, as notifyd does
             case Kind::file: {
@@ -91,7 +101,6 @@ public:
             default: break;
             }
         }
-        return status_ok;
     }
 
     void install();
@@ -176,6 +185,41 @@ void NotifyProvider::install() {
         m.write32(s.x[3], static_cast<std::uint32_t>(add(std::move(registration))));
         s.x[0] = status_ok;
     }));
+    // notify_register_signal(name, int sig, int *token): each post raises sig in this process.
+    raw(libsystem, "_notify_register_signal", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[0] || !s.x[2]) { s.x[0] = status_null_input; return; }
+        const auto signal = static_cast<std::int32_t>(s.x[1]);
+        if (signal <= 0 || signal >= 32) { s.x[0] = status_invalid_request; return; }
+        Registration registration{read_cstring(m, s.x[0]), Kind::signal};
+        registration.posted = false;
+        registration.signal = signal;
+        m.write32(s.x[2], static_cast<std::uint32_t>(add(std::move(registration))));
+        s.x[0] = status_ok;
+    });
+    // notify_suspend(token) / notify_resume(token): while suspended, posts are held; resuming
+    // delivers them once (coalesced), as notifyd does.
+    raw(libsystem, "_notify_suspend", [this](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(mutex);
+        const auto found = tokens.find(static_cast<std::int32_t>(s.x[0]));
+        if (found == tokens.end()) { s.x[0] = status_invalid_token; return; }
+        found->second.suspended = true;
+        s.x[0] = status_ok;
+    });
+    raw(libsystem, "_notify_resume", [this](CpuState& s, GuestMemory&) {
+        const auto token = static_cast<std::int32_t>(s.x[0]);
+        Registration registration;
+        bool deliver_now{};
+        {
+            std::lock_guard lock(mutex);
+            const auto found = tokens.find(token);
+            if (found == tokens.end()) { s.x[0] = status_invalid_token; return; }
+            found->second.suspended = false;
+            deliver_now = std::exchange(found->second.pending, false);
+            if (deliver_now) registration = found->second;
+        }
+        if (deliver_now) deliver(token, registration);
+        s.x[0] = status_ok;
+    });
     // notify_check(token, int *check): posted since the last check (true on the first call).
     raw(libsystem, "_notify_check", [this](CpuState& s, GuestMemory& m) {
         std::lock_guard lock(mutex);

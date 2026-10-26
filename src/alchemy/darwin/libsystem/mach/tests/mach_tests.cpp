@@ -1020,6 +1020,49 @@ void exports_notify(Fixture& f) {
     static_cast<void>(f.call(sys, "_close", {f.engine.read32(fd)}));
 }
 
+// notify_suspend holds a token's posts and notify_resume delivers them once; signal registrations.
+std::atomic<int> suspended_events{0};
+void exports_notify_suspend(Fixture& f) {
+    const auto name = f.text("org.alchemy.test.notify.suspend");
+    const auto invoke = f.process.install_function("_alchemy_test_notify_suspend_block",
+        [](transmute::CpuState&, transmute::GuestMemory&) { ++suspended_events; });
+    const auto descriptor = f.block(16);
+    f.engine.write64(descriptor + 8, 32);
+    const auto block = f.block(32);
+    f.engine.write64(block, f.symbol(sys, "__NSConcreteGlobalBlock"));
+    f.engine.write32(block + 8, 1U << 28);   // BLOCK_IS_GLOBAL
+    f.engine.write64(block + 16, invoke);
+    f.engine.write64(block + 24, descriptor);
+    const auto queue = f.call(sys, "_dispatch_get_global_queue", {0, 0});
+    const auto token = f.block(4);
+    require(f.status(sys, "_notify_register_dispatch", {name, token, queue, block}) == 0, "notify_register_dispatch");
+    const auto value = f.engine.read32(token);
+    require(f.status(sys, "_notify_suspend", {value}) == 0, "notify_suspend");
+    require(f.status(sys, "_notify_post", {name}) == 0 && f.status(sys, "_notify_post", {name}) == 0, "two posts");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    require(suspended_events == 0, "nothing is delivered while suspended");
+    require(f.status(sys, "_notify_resume", {value}) == 0, "notify_resume");
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!suspended_events && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    require(suspended_events == 1, "the held posts arrive once");
+    require(f.status(sys, "_notify_suspend", {0x7fffffff}) == 2, "an unknown token");
+    require(f.status(sys, "_notify_cancel", {value}) == 0, "notify_cancel");
+    // Signal registrations: a valid signal gives a token; 0 is an invalid request.
+    const auto signal_token = f.block(4);
+    require(f.status(sys, "_notify_register_signal", {name, 0, signal_token}) == 6, "signal 0 is refused");
+    require(f.status(sys, "_notify_register_signal", {name, 30, signal_token}) == 0 &&
+            f.call(sys, "_notify_is_valid_token", {f.engine.read32(signal_token)}) == 1, "notify_register_signal");
+    require(f.status(sys, "_notify_cancel", {f.engine.read32(signal_token)}) == 0, "cancel the signal registration");
+    // A workgroup's port names it: a workgroup made from the port shares its cancellation.
+    const auto group = f.call(sys, "_os_workgroup_interval_create", {f.text("render"), 32, 0});
+    const auto port = f.block(4);
+    require(group && f.status(sys, "_os_workgroup_copy_port", {group, port}) == 0 && f.engine.read32(port) != 0, "os_workgroup_copy_port");
+    const auto twin = f.call(sys, "_os_workgroup_create_with_port", {f.text("twin"), f.engine.read32(port)});
+    require(twin != 0 && f.call(sys, "_os_workgroup_create_with_port", {f.text("none"), 0x7777}) == 0, "os_workgroup_create_with_port");
+    f.call(sys, "_os_workgroup_cancel", {group});
+    require(f.call(sys, "_os_workgroup_testcancel", {twin}) == 1, "the port's workgroups are one group");
+}
 
 // A fresh guest directory under $TMPDIR.
 std::string temporary_directory(Fixture& f) {
@@ -1278,6 +1321,7 @@ int main(int argc, char** argv) {
         {"exports_dispatch_sources", exports_dispatch_sources},
         {"exports_memory_pressure_and_proc", exports_memory_pressure_and_proc},
         {"exports_notify", exports_notify},
+        {"exports_notify_suspend", exports_notify_suspend},
         {"exports_vnode", exports_vnode},
         {"exports_dispatch_file_sources", exports_dispatch_file_sources},
     });

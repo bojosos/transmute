@@ -329,6 +329,50 @@ void install_libsystem_process(Provider& p) {
         const auto micros = nanos == 0 ? 0 : std::min<std::uint64_t>((nanos + 999) / 1000, UINT32_MAX);
         return p.call(libsystem_library, "___ulock_wait", {s.x[0], s.x[1], s.x[2], micros});
     });
+
+    // os_sync (<os/os_sync_wait_on_address.h>): waits on a 4- or 8-byte value, over the ulock
+    // calls (UL_COMPARE_AND_WAIT 1, UL_COMPARE_AND_WAIT64 5, ULF_WAKE_ALL 0x100; shared file memory
+    // is matched across processes by the ulock itself). Waits return the number of waiters left,
+    // or -1 with errno (ETIMEDOUT, EINVAL); wakes return 0, or -1 with ENOENT when none waited.
+    const auto operation = [](std::uint64_t size) -> std::optional<std::uint64_t> {
+        if (size == 4) return 1;
+        if (size == 8) return 5;
+        return std::nullopt;
+    };
+    // int os_sync_wait_on_address(void* addr, uint64_t value, size_t size, os_sync_wait_on_address_flags_t)
+    p.libsystem("_os_sync_wait_on_address", [p, operation](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto op = operation(s.x[2]);
+        if (!op || !s.x[0] || (s.x[3] & ~1ULL)) throw Errno{einval};
+        return p.call(libsystem_library, "___ulock_wait", {*op, s.x[0], s.x[1], 0});
+    });
+    // ..._with_timeout(addr, value, size, flags, os_clockid_t clock, uint64_t timeout_ns) and
+    // ..._with_deadline(addr, value, size, flags, clock, uint64_t deadline): the clock is
+    // OS_CLOCK_MACH_ABSOLUTE_TIME (32), whose units are nanoseconds here (mach_timebase_info 1/1).
+    for (const auto* name : {"_os_sync_wait_on_address_with_timeout", "_os_sync_wait_on_address_with_deadline"})
+        p.libsystem(name, [p, operation, deadline = std::string_view(name).ends_with("deadline")](CpuState& s, GuestMemory&) -> std::uint64_t {
+            const auto op = operation(s.x[2]);
+            if (!op || !s.x[0] || (s.x[3] & ~1ULL) || s.x[4] != 32) throw Errno{einval};
+            std::uint64_t nanos = s.x[5];
+            if (deadline) {
+                const auto now = p.call(libsystem_library, "_mach_absolute_time", {});
+                nanos = s.x[5] > now ? s.x[5] - now : 0;
+            }
+            if (nanos == 0) {
+                // No time to wait: a value that already differs returns at once, else it times out.
+                const auto current = s.x[2] == 4 ? static_cast<std::uint64_t>(p.process().calling_engine().read32(s.x[0]))
+                                                 : p.process().calling_engine().read64(s.x[0]);
+                if (current != (s.x[2] == 4 ? static_cast<std::uint32_t>(s.x[1]) : s.x[1])) return 0;
+                throw Errno{60};   // ETIMEDOUT
+            }
+            return p.call(libsystem_library, "___ulock_wait2", {*op, s.x[0], s.x[1], nanos, 0});
+        });
+    // int os_sync_wake_by_address_any / _all(void* addr, size_t size, os_sync_wake_by_address_flags_t)
+    for (const auto* name : {"_os_sync_wake_by_address_any", "_os_sync_wake_by_address_all"})
+        p.libsystem(name, [p, operation, all = std::string_view(name).ends_with("all")](CpuState& s, GuestMemory&) -> std::uint64_t {
+            const auto op = operation(s.x[1]);
+            if (!op || !s.x[0] || (s.x[2] & ~1ULL)) throw Errno{einval};
+            return p.call(libsystem_library, "___ulock_wake", {*op | (all ? 0x100 : 0), s.x[0], 0});
+        });
 }
 
 } // namespace alchemy::export_fill

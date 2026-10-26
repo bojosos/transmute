@@ -7,6 +7,7 @@
 #include "alchemy/host/system.hpp"
 
 #include <array>
+#include <atomic>
 #include <set>
 #include <chrono>
 #include <cmath>
@@ -842,6 +843,15 @@ void Machsys::install_private() {
     // (which the os_signpost macros only reach when enabled) has nothing to record.
     constant(libsystem, "_os_signpost_enabled", 0);
     raw(libsystem, "__os_signpost_emit_with_name_impl", [](CpuState&, GuestMemory&) {});
+    // os_signpost_id_t os_signpost_id_generate(os_log_t): unique per process, never
+    // OS_SIGNPOST_ID_NULL (0) or OS_SIGNPOST_ID_INVALID (~0); _make_with_pointer: the pointer's value.
+    {
+        auto next = std::make_shared<std::atomic<std::uint64_t>>(1);
+        raw(libsystem, "_os_signpost_id_generate", [next](CpuState& s, GuestMemory&) { s.x[0] = next->fetch_add(1); });
+        raw(libsystem, "_os_signpost_id_make_with_pointer", [](CpuState& s, GuestMemory&) {
+            s.x[0] = s.x[1] == 0 || s.x[1] == UINT64_MAX ? UINT64_MAX : s.x[1];
+        });
+    }
     // abort_report_np(fmt, ...): prints the formatted message and aborts.
     raw(libsystem, "_abort_report_np", [this](CpuState& s, GuestMemory& m) {
         const auto buffer = process.allocate_guest(2048);

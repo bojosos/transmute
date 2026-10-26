@@ -47,6 +47,17 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   service does not exist: resumed, they deliver `XPC_ERROR_CONNECTION_INVALID`;
   replies are that error; `xpc_main` stops. Activities never run.
   NSXPCConnection is `misc/xpc.cpp`'s.
+* **os extras** (GUI): activities with identifiers that nest per thread
+  (`OS_ACTIVITY_CURRENT`, initiate, apply, get_active) and workgroups
+  (join/leave tokens, cancel, intervals, the working arena, ports through
+  Mach IPC) in `misc/libsystem_misc.cpp`; the os_sync address waits over the
+  ulock calls (`process/libsystem_process.cpp`); signpost identifiers
+  (`mach/machsys.cpp`); `_os_log_disabled`, the per-type `_os_log_*_impl`
+  entry points and `os_log_with_args` (`misc/oslog.cpp`); notify signal
+  registrations and suspend/resume (`mach/notify.cpp`); dnsinfo
+  (`net/libsystem_net.cpp`: no configd, so `dns_configuration_copy` is
+  NULL; configd's notify key). Workgroup membership gives the scheduler no
+  hint (Windows has no thread workgroups).
 * **Terminal libraries** (GUI, `terminal/`): libedit's readline API
   (`readline.cpp`: the callback interface reading rl_instream's descriptor
   in whatever mode the terminal is in, GNU readline history and history

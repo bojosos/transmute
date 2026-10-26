@@ -180,6 +180,10 @@ void test_system_functions(Fixture& f) {
     const auto entry = f.send(enumerator, "nextObject");
     require(entry && f.text(f.send(entry, "composedMessage")) == "cue 5 failed" && f.send(entry, "level") == 4 &&
             f.text(f.send(entry, "subsystem")) == "com.figure53.qlab.test", "OSLogStore enumerates this process's entries");
+    // OS_LOG_DISABLED: no type is enabled on it; the per-type entry points log like _os_log_impl.
+    const auto disabled = f.symbol(lib, "__os_log_disabled");
+    require(f.call(lib, "_os_log_type_enabled", {disabled, 0x10}) == 0 && f.call(lib, "_os_log_type_enabled", {log, 0x10}) == 1, "OS_LOG_DISABLED");
+    f.call(lib, "__os_log_error_impl", {0, log, 0x10, f.c_string("cue %d failed"), buffer, bytes.size()});
 }
 
 void test_xpc(Fixture& f) {

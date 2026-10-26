@@ -234,6 +234,20 @@ std::vector<std::uint8_t> serialize_ifaddrs(const std::vector<Interface>& interf
 }
 
 void install_libsystem_net(Provider& p) {
+    // dnsinfo (dns_configuration_copy/free/notify_key): no configd runs, so no DNS configuration
+    // snapshot exists; dns_configuration_copy answers NULL (its failure result) and resolvers use
+    // /etc/resolv.conf. The notify key is configd's, so watchers can register for it (it is never posted).
+    {
+        static constexpr std::string_view key = "com.apple.system.SystemConfiguration.dns_configuration";
+        const auto text = p.process().allocate_guest(key.size() + 1);
+        put_string(p.process().main_engine(), text, key);
+        p.libsystem("_dns_configuration_notify_key", [text](CpuState&, GuestMemory&) -> std::uint64_t { return text; }, 0);
+        p.libsystem("_dns_configuration_copy", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; }, 0);
+        p.libsystem("_dns_configuration_free", [](CpuState& s, GuestMemory&) -> std::uint64_t {
+            if (s.x[0]) throw std::runtime_error("Alchemy: dns_configuration_free of a configuration dns_configuration_copy never returns");
+            return 0;
+        });
+    }
     auto& process = p.process();
     // const struct in6_addr in6addr_any = IN6ADDR_ANY_INIT (all zero).
     static_cast<void>(p.data(libsystem_library, "_in6addr_any", 16));
