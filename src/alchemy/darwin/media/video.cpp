@@ -5,11 +5,12 @@
 
 // VideoToolbox, AVFoundation and the CoreVideo pixel-buffer gaps.
 //
-// - VideoToolbox: Alchemy has no video decoder or encoder. Session creation
-//   fails with kVTCouldNotFindVideoDecoderErr or kVTCouldNotFindVideoEncoderErr;
-//   since no such session can exist, their calls answer kVTInvalidSessionErr.
-//   Pixel transfer sessions are real (pixel_transfer.cpp). Hardware
-//   decoding is reported unsupported; no supplemental decoder is available.
+// - VideoToolbox: Alchemy has no video encoder. Compression session creation
+//   fails with kVTCouldNotFindVideoEncoderErr; since no such session can exist,
+//   its calls answer kVTInvalidSessionErr. Decompression sessions (AV1, VP9,
+//   VP8) are vt_decompression.cpp's and pixel transfer sessions
+//   pixel_transfer.cpp's. Hardware decoding is reported unsupported; no
+//   supplemental decoder is available.
 // - AVFoundation: there are no capture devices. Device lists (and discovery
 //   sessions) are empty, default devices nil, authorization "restricted" and
 //   access requests are answered NO; capture inputs fail with
@@ -26,7 +27,7 @@ namespace alchemy::gui::fill {
 namespace {
 
 constexpr std::int32_t vt_parameter = -12902, vt_invalid_session = -12903, vt_pixel_transfer_not_supported = -12905,
-    vt_could_not_find_decoder = -12906, vt_could_not_find_encoder = -12908;
+    vt_could_not_find_encoder = -12908;
 constexpr std::int32_t cv_invalid_argument = -6661, cv_unsupported = -6663;
 
 void impossible(std::uint64_t object, std::string_view what) {
@@ -175,25 +176,15 @@ void Video::install_metal_texture_cache() {
 }
 
 void Video::install_video_toolbox() {
-    failure(video_toolbox, "_VTDecompressionSessionCreate", vt_could_not_find_decoder, {5});
     // VTCompressionSessionCreate(allocator, width, height, codec, encoderSpecification, sourceAttributes,
     //     compressedDataAllocator, outputCallback, [stack] refcon, compressionSessionOut)
     failure(video_toolbox, "_VTCompressionSessionCreate", vt_could_not_find_encoder, {9});
-    // Pixel transfer sessions and the VTSession property calls are pixel_transfer.cpp's.
-    for (const auto* name : {"_VTCompressionSessionCompleteFrames", "_VTCompressionSessionEncodeFrame", "_VTDecompressionSessionDecodeFrame",
-                             "_VTDecompressionSessionDecodeFrameWithOutputHandler",
-                             "_VTDecompressionSessionWaitForAsynchronousFrames"})
+    // Pixel transfer sessions and the VTSession property calls are pixel_transfer.cpp's, decompression
+    // sessions vt_decompression.cpp's.
+    for (const auto* name : {"_VTCompressionSessionCompleteFrames", "_VTCompressionSessionEncodeFrame"})
         raw(video_toolbox, name, [](CpuState& s, GuestMemory&) { s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter); });
-    for (const auto* name : {"_VTCompressionSessionInvalidate", "_VTDecompressionSessionInvalidate"}) {
-        const std::string what(name + 1);
-        raw(video_toolbox, name, [what](CpuState& s, GuestMemory&) { impossible(s.x[0], what); });
-    }
+    raw(video_toolbox, "_VTCompressionSessionInvalidate", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "VTCompressionSessionInvalidate"); });
     constant(video_toolbox, "_VTIsHardwareDecodeSupported", 0);
-    // No decompression session can exist, so none accepts a format description.
-    raw(video_toolbox, "_VTDecompressionSessionCanAcceptFormatDescription", [](CpuState& s, GuestMemory&) {
-        impossible(s.x[0], "VTDecompressionSessionCanAcceptFormatDescription");
-        s.x[0] = 0;
-    });
     raw(video_toolbox, "_VTRegisterSupplementalVideoDecoderIfAvailable", [](CpuState&, GuestMemory&) {});   // none is available
     for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 16>{{
              {"_kVTCompressionPropertyKey_AllowFrameReordering", "AllowFrameReordering"},

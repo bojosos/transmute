@@ -1,5 +1,6 @@
 #include "alchemy/darwin/media/media.hpp"
 #include "alchemy/darwin/media/pixel_convert.hpp"
+#include "alchemy/darwin/media/vt_session.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,8 +19,9 @@
 // written with kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, else the destination's own
 // attachment, else the source's matrix, and gets that attachment. Other formats answer
 // kVTPixelTransferNotSupportedErr. VTSessionSetProperty / CopyProperty / SetProperties /
-// CopySupportedPropertyDictionary work on transfer sessions; any other object is not a session
-// (kVTInvalidSessionErr), as no decompression or compression session exists.
+// CopySupportedPropertyDictionary work on transfer and decompression sessions (vt_session.hpp,
+// each with its own keys); any other object is not a session (kVTInvalidSessionErr), as no
+// compression session exists.
 namespace alchemy::gui::fill {
 namespace {
 
@@ -28,15 +30,15 @@ namespace px = completion_kit::media::pixels;
 constexpr std::int32_t vt_property_not_supported = -12900, vt_parameter = -12902, vt_invalid_session = -12903,
     vt_pixel_transfer_not_supported = -12905;
 
-struct TransferSession final : ObjectPayload {
-    std::mutex mutex;
-    std::map<std::string, Address> properties;   // retained values
-    bool invalid{};
-};
+using TransferSession = VTSessionState;
 
 constexpr std::array<const char*, 9> property_keys{"ScalingMode", "DestinationCleanAperture", "DestinationPixelAspectRatio", "DownsamplingMode",
                                                    "DestinationColorPrimaries", "DestinationTransferFunction", "DestinationICCProfile",
                                                    "DestinationYCbCrMatrix", "RealTime"};
+// Decompression sessions (vt_decompression.cpp): the kVTDecompressionPropertyKey_* strings.
+constexpr std::array<const char*, 10> decompression_keys{"RealTime", "ThreadCount", "MaximizePowerEfficiency", "OutputPoolRequestedMinimumBufferCount",
+                                                         "PixelTransferProperties", "ReducedResolutionDecode", "FieldMode", "DeinterlaceMode",
+                                                         "PropagatePerFrameHDRDisplayMetadata", "UsingHardwareAcceleratedVideoDecoder"};
 
 class PixelTransfer final : public Provider {
 public:
@@ -207,20 +209,27 @@ void PixelTransfer::install() {
     });
     raw(video_toolbox, "_VTPixelTransferSessionTransferImage", [this](CpuState& s, GuestMemory&) {
         const auto value = session(s.x[0]);
-        if (!value || value->invalid) { s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter); return; }
+        if (!value || value->invalid || value->kind != TransferSession::Kind::pixel_transfer) {
+            s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter);
+            return;
+        }
         s.x[0] = status(transfer(*value, s.x[1], s.x[2]));
     });
     raw(video_toolbox, "_VTPixelTransferSessionInvalidate", [this](CpuState& s, GuestMemory&) {
-        if (const auto value = session(s.x[0])) value->invalid = true;
+        if (const auto value = session(s.x[0]); value && value->kind == TransferSession::Kind::pixel_transfer) value->invalid = true;
     });
-    const auto known = [](const std::string& name) { return std::find(property_keys.begin(), property_keys.end(), name) != property_keys.end(); };
-    // VTSessionSetProperty(session, key, value)
+    const auto known = [](const TransferSession& session, const std::string& name) {
+        const auto keys = vt_session_keys(session.kind);
+        return std::find(keys.begin(), keys.end(), name) != keys.end();
+    };
+    // VTSessionSetProperty(session, key, value): a decompression session's read-only
+    // UsingHardwareAcceleratedVideoDecoder is not set.
     raw(video_toolbox, "_VTSessionSetProperty", [this, known](CpuState& s, GuestMemory&) {
         const auto value = session(s.x[0]);
         if (!value) { s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter); return; }
         if (!s.x[1]) { s.x[0] = status(vt_parameter); return; }
         const auto name = cf.utf8(s.x[1]);
-        if (!known(name)) { s.x[0] = status(vt_property_not_supported); return; }
+        if (!known(*value, name) || name == "UsingHardwareAcceleratedVideoDecoder") { s.x[0] = status(vt_property_not_supported); return; }
         const auto retained = retain(s.x[2]);
         Address old{};
         {
@@ -236,13 +245,14 @@ void PixelTransfer::install() {
         if (!value) { s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter); return; }
         if (!s.x[1] || !s.x[3]) { s.x[0] = status(vt_parameter); return; }
         const auto name = cf.utf8(s.x[1]);
-        if (!known(name)) { s.x[0] = status(vt_property_not_supported); return; }
+        if (!known(*value, name)) { s.x[0] = status(vt_property_not_supported); return; }
         Address found{};
         {
             std::lock_guard lock(value->mutex);
             if (const auto it = value->properties.find(name); it != value->properties.end()) found = it->second;
         }
         if (!found && name == "ScalingMode") found = cf.string("Normal");
+        else if (name == "UsingHardwareAcceleratedVideoDecoder") found = retain(cf.boolean(false));   // software decoders
         else found = retain(found);
         m.write64(s.x[3], found);
         s.x[0] = 0;
@@ -261,10 +271,11 @@ void PixelTransfer::install() {
     // VTSessionCopySupportedPropertyDictionary(session, CFDictionaryRef *out): each key with an empty description.
     raw(video_toolbox, "_VTSessionCopySupportedPropertyDictionary", [this](CpuState& s, GuestMemory& m) {
         if (s.x[1]) m.write64(s.x[1], 0);
-        if (!session(s.x[0])) { s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter); return; }
+        const auto value = session(s.x[0]);
+        if (!value) { s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter); return; }
         if (!s.x[1]) { s.x[0] = status(vt_parameter); return; }
         std::vector<std::pair<Address, Address>> entries;
-        for (const auto* key : property_keys) entries.emplace_back(cf.string(key), cf.dictionary({}));
+        for (const auto* key : vt_session_keys(value->kind)) entries.emplace_back(cf.string(key), cf.dictionary({}));
         m.write64(s.x[1], cf.dictionary(entries));
         for (const auto& [k, v] : entries) { release(k); release(v); }
         s.x[0] = 0;
@@ -272,6 +283,11 @@ void PixelTransfer::install() {
 }
 
 } // namespace
+
+std::span<const char* const> vt_session_keys(VTSessionState::Kind kind) {
+    if (kind == VTSessionState::Kind::decompression) return decompression_keys;
+    return property_keys;
+}
 
 void install_pixel_transfer(InstallContext& context) { std::make_shared<PixelTransfer>(context)->install(); }
 

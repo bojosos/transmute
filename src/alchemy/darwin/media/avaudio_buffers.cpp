@@ -220,10 +220,9 @@ std::int32_t decode_file(Support& support, const GuestAudio& audio, Decoded& out
     constexpr std::uint64_t chunk = 65536;
     for (std::uint64_t done = 0; done < count;) {
         const auto frames = std::min(chunk, count - done);
-        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(frames * format.frame_bytes()));
-        const auto got = read_guest(support, audio.fd, audio.container.data_offset + (start + done) * format.frame_bytes(), bytes) / format.frame_bytes();
+        std::vector<double> samples;
+        const auto got = read_audio_frames(support, audio, start + done, static_cast<std::size_t>(frames), samples);
         if (!got) break;
-        const auto samples = af::decode(format, {std::span<const std::uint8_t>(bytes.data(), got * format.frame_bytes())}, got);
         append_floats(out.samples, samples);
         done += got;
     }
@@ -239,7 +238,21 @@ std::int32_t decode_bytes(std::span<const std::uint8_t> bytes, Decoded& out) {
         std::memcpy(to.data(), bytes.data() + offset, n);
         return n;
     };
-    if (const auto status = af::parse(read, bytes.size(), container, why)) return status;
+    if (const auto status = af::parse(read, bytes.size(), container, why)) {
+        if (status != af::error::unsupported_file_type && status != af::error::unsupported_data_format) return status;
+        // Compressed data: decoded through its stream.
+        GuestAudio audio;
+        audio.size = bytes.size();
+        if (const auto result = open_audio_stream(audio, read, status, why)) return result;
+        if (audio.frames() * audio.container.format.channels > max_decoded_samples) return af::error::unspecified;
+        std::vector<double> samples;
+        read_audio_frames(audio, read, 0, static_cast<std::size_t>(audio.frames()), samples);
+        out.channels = audio.container.format.channels;
+        out.rate = audio.container.format.rate;
+        out.samples.clear();
+        append_floats(out.samples, samples);
+        return 0;
+    }
     const auto& format = container.format;
     const auto available = container.data_offset < bytes.size() ? bytes.size() - container.data_offset : 0;
     const auto frames = std::min<std::uint64_t>(container.data_bytes, available) / format.frame_bytes();
@@ -435,7 +448,7 @@ void install_avaudio_buffers(Support& support) {
         GuestAudio audio;
         if (const auto status = open_guest_audio(*sp, sp->cf.url_path(url), audio))
             return fail_with(status, status == af::error::unsupported_data_format
-                                         ? "The file's audio is compressed (no audio decoder exists under Alchemy)"
+                                         ? "The file's audio format has no decoder under Alchemy"
                                          : "The audio file could not be opened");
         auto f = sp->objc.host_state<AudioFileState>(self);
         f->url = sp->send_id(url, "retain");
@@ -597,9 +610,8 @@ void install_avaudio_buffers(Support& support) {
         }
         const auto& source = f->audio.container.format;
         const auto frames = std::min<std::uint64_t>({count, b->capacity, f->audio.frames() - std::min(f->position, f->audio.frames())});
-        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(frames * source.frame_bytes()));
-        const auto got = frames ? read_guest(*sp, f->audio.fd, f->audio.container.data_offset + f->position * source.frame_bytes(), bytes) / source.frame_bytes() : 0;
-        const auto samples = af::decode(source, {std::span<const std::uint8_t>(bytes.data(), got * source.frame_bytes())}, got);
+        std::vector<double> samples;
+        const auto got = frames ? read_audio_frames(*sp, f->audio, f->position, static_cast<std::size_t>(frames), samples) : 0;
         fill_buffer(*sp, *b, samples, source.channels, static_cast<std::uint32_t>(got));
         f->position += got;
         s.x[0] = 1;

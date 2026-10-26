@@ -11,6 +11,8 @@
 
 #include "alchemy/path.hpp"
 #include "alchemy/darwin/security/bridge.hpp"
+#include "alchemy/host/crypto.hpp"
+#include "alchemy/darwin/media/media_container.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -21,6 +23,9 @@
 #include <fstream>
 #include <iterator>
 #include <thread>
+#include <span>
+#include <tuple>
+#include <sstream>
 #include <map>
 #include <mutex>
 
@@ -1486,6 +1491,309 @@ void vimage(Fixture& f) {
             "field keys; no decompression session");
 }
 
+// Compressed audio through the guest-facing APIs: minimp3's layer III conformance vector
+// (third_party/minimp3/vectors) as an .mp3 file. AudioFile describes and reads its packets,
+// ExtAudioFile and AudioConverter decode them, compared with the vector's reference output.
+void compressed_audio(Fixture& f) {
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_compressed";
+    std::filesystem::create_directories(directory);
+    const std::string vectors = std::string(ALCHEMY_THIRD_PARTY) + "/minimp3/vectors/";
+    const auto path = directory / "hecommon.mp3";
+    std::filesystem::copy_file(vectors + "l3-hecommon.bit", path, std::filesystem::copy_options::overwrite_existing);
+    std::vector<std::int16_t> reference;
+    {
+        std::ifstream in(vectors + "l3-hecommon.pcm", std::ios::binary);
+        std::vector<char> bytes((std::istreambuf_iterator<char>(in)), {});
+        reference.resize(bytes.size() / 2);
+        std::memcpy(reference.data(), bytes.data(), reference.size() * 2);
+    }
+    const auto url = f.cf.file_url(alchemy::guest_path_string(path), false);
+    const auto out = f.block(8), size = f.block(4), value = f.block(64);
+    require(f.status(at, "_AudioFileOpenURL", {url, 1, 0, out}) == 0, "AudioFileOpenURL on an MP3 file");
+    const auto file = f.engine.read64(out);
+    f.engine.write32(size, 4);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x66666d74, size, value}) == 0 && f.engine.read32(value) == 0x4d504733, "file type 'MPG3'");
+    f.engine.write32(size, 40);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x64666d74, size, value}) == 0 && f.engine.read32(value + 8) == 0x2e6d7033 &&
+            f.engine.read32(value + 20) == 1152, "data format '.mp3', 1152 frames per packet");
+    const auto rate = std::bit_cast<double>(f.engine.read64(value));
+    const auto channels = f.engine.read32(value + 28);
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x70636e74, size, value}) == 0, "packet count");   // 'pcnt'
+    const auto packet_count = f.engine.read64(value);
+    // The reference may be up to two frames shorter than the stream (minimp3's own test allows it).
+    require(packet_count * 1152 * channels >= reference.size() && packet_count * 1152 * channels <= reference.size() + 2 * 1152 * channels,
+            "every frame is a packet: " + std::to_string(packet_count));
+    f.engine.write32(size, 16);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x706e666f, size, value}) == 0 && f.engine.read64(value) == packet_count * 1152 &&
+            f.engine.read32(value + 8) == 0, "packet table: no priming");   // 'pnfo'
+    require(f.status(at, "_AudioFileReadBytes", {file, 0, 0, size, value}) == static_cast<std::int32_t>(0x6f703f3f), "ReadBytes is for PCM");
+    // The packets with their descriptions: one MPEG frame each.
+    const auto room = f.block(4), count = f.block(4), descriptions = f.block(16 * 64), packets = f.block(64 * 1500);
+    f.engine.write32(room, 64 * 1500);
+    f.engine.write32(count, static_cast<std::uint32_t>(packet_count));
+    require(f.status(at, "_AudioFileReadPacketData", {file, 0, room, descriptions, 0, count, packets}) == 0 &&
+            f.engine.read32(count) == packet_count, "ReadPacketData returns every packet");
+    const auto first_size = f.engine.read32(descriptions + 12);
+    require(f.engine.read64(descriptions) == 0 && f.engine.read64(descriptions + 16) == first_size && f.memory().read8(packets) == 0xff,
+            "packet descriptions are contiguous in the buffer");
+
+    // ExtAudioFile: float32 interleaved at the file's rate, compared with the reference.
+    require(f.status(at, "_ExtAudioFileWrapAudioFileID", {file, 0, out}) == 0, "ExtAudioFileWrapAudioFileID on an MP3 file");
+    const auto ext = f.engine.read64(out);
+    const auto client = f.block(40);
+    f.engine.write64(client, std::bit_cast<std::uint64_t>(rate));
+    f.engine.write32(client + 8, 0x6c70636d);
+    f.engine.write32(client + 12, 1 | 8);
+    f.engine.write32(client + 16, 4 * channels); f.engine.write32(client + 20, 1); f.engine.write32(client + 24, 4 * channels);
+    f.engine.write32(client + 28, channels); f.engine.write32(client + 32, 32);
+    require(f.status(at, "_ExtAudioFileSetProperty", {ext, 0x63666d74, 40, client}) == 0, "float client format");
+    const auto total = static_cast<std::uint32_t>(packet_count * 1152);
+    const auto data = f.block(4ULL * total * channels), list = f.block(24), frames = f.block(4);
+    f.engine.write32(list, 1);
+    f.engine.write32(list + 8, channels); f.engine.write32(list + 12, 4 * total * channels); f.engine.write64(list + 16, data);
+    f.engine.write32(frames, total);
+    require(f.status(at, "_ExtAudioFileRead", {ext, frames, list}) == 0 && f.engine.read32(frames) == total, "ExtAudioFileRead decodes the file");
+    const auto close_to_reference = [&](Address samples, std::size_t n, std::size_t from) {
+        for (std::size_t i = 0; i < n; ++i)
+            if (std::fabs(std::bit_cast<float>(f.engine.read32(samples + 4 * i)) * 32768.0f - reference[from + i]) > 2.0f) return false;
+        return true;
+    };
+    require(close_to_reference(data, reference.size(), 0), "decoded MP3 matches the reference output");
+    require(f.status(at, "_ExtAudioFileSeek", {ext, 10000}) == 0, "seek");
+    f.engine.write32(frames, 500);
+    f.engine.write32(list + 12, 4 * 500 * channels);
+    require(f.status(at, "_ExtAudioFileRead", {ext, frames, list}) == 0 && f.engine.read32(frames) == 500 &&
+            close_to_reference(data, 500ULL * channels, 10000ULL * channels), "a read after a seek is sample-accurate");
+    require(f.status(at, "_ExtAudioFileDispose", {ext}) == 0, "ExtAudioFileDispose");
+
+    // AudioConverter: the packets in (with descriptions), float out.
+    const auto mp3 = f.block(40), pcm = f.block(40), converter_out = f.block(8);
+    f.engine.write64(mp3, std::bit_cast<std::uint64_t>(rate));
+    f.engine.write32(mp3 + 8, 0x2e6d7033);
+    f.engine.write32(mp3 + 20, 1152);
+    f.engine.write32(mp3 + 28, channels);
+    for (std::uint32_t i = 0; i < 10; ++i) f.engine.write32(pcm + 8 + 4 * i, f.engine.read32(client + 8 + 4 * i));
+    f.engine.write64(pcm, std::bit_cast<std::uint64_t>(rate));
+    require(f.status(at, "_AudioConverterNew", {mp3, pcm, converter_out}) == 0, "AudioConverterNew from MP3");
+    const auto converter = f.engine.read64(converter_out);
+    static Address feed_packets{}, feed_descriptions{}, feed_one{};
+    static std::uint32_t feed_next{}, feed_total{};
+    feed_packets = packets;
+    feed_descriptions = descriptions;
+    feed_one = f.block(16);
+    feed_next = 0;
+    feed_total = static_cast<std::uint32_t>(packet_count);
+    // One packet per call, from the buffer ReadPacketData filled, with its own description.
+    const auto input = f.process.install_function("_alchemy_test_mp3_input", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        if (feed_next >= feed_total) {
+            m.write32(s.x[1], 0);
+            s.x[0] = 0;
+            return;
+        }
+        const auto entry = feed_descriptions + 16ULL * feed_next++;
+        const auto bytes = m.read32(entry + 12);
+        m.write32(s.x[1], 1);
+        m.write32(s.x[2] + 8 + 4, bytes);
+        m.write64(s.x[2] + 8 + 8, feed_packets + m.read64(entry));
+        m.write64(feed_one, 0);
+        m.write32(feed_one + 8, 0);
+        m.write32(feed_one + 12, bytes);
+        if (s.x[3]) m.write64(s.x[3], feed_one);
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    f.engine.write32(frames, total);
+    f.engine.write32(list + 12, 4 * total * channels);
+    require(f.status(at, "_AudioConverterFillComplexBuffer", {converter, input, 0, frames, list, 0}) == 0 && f.engine.read32(frames) == total,
+            "FillComplexBuffer decodes every packet: " + std::to_string(f.engine.read32(frames)));
+    require(close_to_reference(data, reference.size(), 0), "AudioConverter output matches the reference output");
+    require(f.status(at, "_AudioConverterDispose", {converter}) == 0 && f.status(at, "_AudioFileClose", {file}) == 0, "dispose and close");
+
+    // AVAudioFile: an MP3 opens, with its length in frames.
+    const auto av_file = f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForReading:error:", {url, 0});
+    require(av_file && static_cast<std::uint32_t>(f.send(av_file, "length")) == total, "AVAudioFile reads MP3 lengths");
+    f.send(av_file, "release");
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
+// VTDecompressionSession: libvpx's VP9 test vector (through our WebM parser) and libaom's AV1 test
+// vectors decoded into CVPixelBuffers, compared with the projects' per-frame MD5s; H.264 has no decoder.
+struct DecodedImage { Address image; std::int64_t pts; std::uint32_t flags; std::int32_t status; };
+Fixture* vt_fixture{};
+constexpr std::string_view vt_cf = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+std::vector<DecodedImage>& vt_images() { static std::vector<DecodedImage> value; return value; }
+
+std::string md5_hex(const std::vector<std::uint8_t>& data) {
+    const auto digest = alchemy::host::crypto::hash(alchemy::host::crypto::Digest::md5, std::as_bytes(std::span(data)));
+    require(static_cast<bool>(digest), "MD5");
+    std::string out;
+    for (const auto b : *digest) { const char* d = "0123456789abcdef"; out += d[b >> 4]; out += d[b & 15]; }
+    return out;
+}
+
+// The picture's planes as the projects' tools hash them (I420: luma, then Cb, then Cr rows; 16-bit
+// little-endian samples, low-aligned, above 8 bits) from a 420v/420f or x420 buffer.
+std::vector<std::uint8_t> i420_of(Fixture& f, Address image) {
+    require(f.call(cv, "_CVPixelBufferLockBaseAddress", {image, 1}) == 0, "lock");
+    const auto format = static_cast<std::uint32_t>(f.call(cv, "_CVPixelBufferGetPixelFormatType", {image}));
+    const bool ten = format == 0x78343230;   // 'x420'
+    const auto width = f.call(cv, "_CVPixelBufferGetWidth", {image}), height = f.call(cv, "_CVPixelBufferGetHeight", {image});
+    std::vector<std::uint8_t> out;
+    const auto bytes = ten ? 2 : 1;
+    const auto luma = f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {image, 0}), luma_row = f.call(cv, "_CVPixelBufferGetBytesPerRowOfPlane", {image, 0});
+    const auto put = [&](std::uint32_t value) {
+        if (ten) { value >>= 6; out.push_back(static_cast<std::uint8_t>(value)); out.push_back(static_cast<std::uint8_t>(value >> 8)); }
+        else out.push_back(static_cast<std::uint8_t>(value));
+    };
+    const auto read = [&](Address at) { return ten ? std::uint32_t(f.memory().read8(at) | (f.memory().read8(at + 1) << 8)) : std::uint32_t(f.memory().read8(at)); };
+    for (Address y = 0; y < height; ++y)
+        for (Address x = 0; x < width; ++x) put(read(luma + y * luma_row + x * bytes));
+    const auto chroma = f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {image, 1}), chroma_row = f.call(cv, "_CVPixelBufferGetBytesPerRowOfPlane", {image, 1});
+    const auto cw = (width + 1) / 2, ch = (height + 1) / 2;
+    for (int component = 0; component < 2; ++component)
+        for (Address y = 0; y < ch; ++y)
+            for (Address x = 0; x < cw; ++x) put(read(chroma + y * chroma_row + (2 * x + component) * bytes));
+    f.call(cv, "_CVPixelBufferUnlockBaseAddress", {image, 1});
+    return out;
+}
+
+void video_toolbox(Fixture& f) {
+    namespace mc = alchemy::gui::completion_kit::media::container;
+    vt_fixture = &f;
+    const auto callback = f.process.install_function("_alchemy_test_vt_output", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        // (refcon, sourceFrameRefCon, status, infoFlags, imageBuffer, CMTime *pts, CMTime *duration)
+        if (s.x[4]) static_cast<void>(vt_fixture->call(vt_cf, "_CFRetain", {s.x[4]}));
+        vt_images().push_back({s.x[4], static_cast<std::int64_t>(m.read64(s.x[5])), static_cast<std::uint32_t>(s.x[3]),
+                               static_cast<std::int32_t>(s.x[2])});
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto record = f.block(16);
+    f.engine.write64(record, callback);
+    f.engine.write64(record + 8, 0x1234);
+    // Decodes `packets` (bytes, pts in 1/1000 s) of `codec` at width x height; the images that came out.
+    const auto decode = [&](std::uint32_t codec, std::int32_t width, std::int32_t height, const std::vector<std::pair<std::vector<std::uint8_t>, std::int64_t>>& packets,
+                            Address attributes) {
+        const auto format_out = f.block(8), session_out = f.block(8);
+        require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, codec, static_cast<Address>(width), static_cast<Address>(height), 0, format_out}) == 0,
+                "CMVideoFormatDescriptionCreate");
+        const auto format = f.engine.read64(format_out);
+        require(f.status(vt, "_VTDecompressionSessionCreate", {0, format, 0, attributes, record, session_out}) == 0, "VTDecompressionSessionCreate");
+        const auto session = f.engine.read64(session_out);
+        require(f.call(vt, "_VTDecompressionSessionCanAcceptFormatDescription", {session, format}) == 1, "the session accepts its format");
+        vt_images().clear();
+        for (const auto& [bytes, pts] : packets) {
+            const auto block_out = f.block(8), sample_out = f.block(8), timing = f.block(72);
+            alchemy::CallRegs block{};
+            block.x[2] = bytes.size(); block.x[6] = bytes.size(); block.x[7] = 1;
+            block.push_stack(block_out);
+            require(f.regs(cm, "_CMBlockBufferCreateWithMemoryBlock", block).x0 == 0, "block buffer");
+            const auto data = f.block(bytes.size());
+            f.memory().write_bytes(data, bytes);
+            require(f.status(cm, "_CMBlockBufferReplaceDataBytes", {data, f.engine.read64(block_out), 0, bytes.size()}) == 0, "fill the block");
+            write_time(f, timing, 33, 1000);
+            write_time(f, timing + 24, pts, 1000);
+            write_time(f, timing + 48, 0, 0, 0);
+            alchemy::CallRegs create{};
+            create.x[1] = f.engine.read64(block_out); create.x[2] = format; create.x[3] = 1; create.x[4] = 1; create.x[5] = timing;
+            create.push_stack(sample_out);
+            require(f.regs(cm, "_CMSampleBufferCreateReady", create).x0 == 0, "sample buffer");
+            const auto info = f.block(4);
+            require(f.status(vt, "_VTDecompressionSessionDecodeFrame", {session, f.engine.read64(sample_out), 0, 0, info}) == 0, "DecodeFrame");
+            f.call(vt_cf, "_CFRelease", {f.engine.read64(sample_out)});
+            f.call(vt_cf, "_CFRelease", {f.engine.read64(block_out)});
+        }
+        require(f.status(vt, "_VTDecompressionSessionFinishDelayedFrames", {session}) == 0 &&
+                f.status(vt, "_VTDecompressionSessionWaitForAsynchronousFrames", {session}) == 0, "finish");
+        f.call(vt, "_VTDecompressionSessionInvalidate", {session});
+        require(f.status(vt, "_VTDecompressionSessionDecodeFrame", {session, 0, 0, 0, 0}) == -12903, "an invalidated session");
+        f.call(vt_cf, "_CFRelease", {session});
+        f.call(vt_cf, "_CFRelease", {format});
+        std::vector<DecodedImage> images;
+        for (const auto& image : vt_images()) if (image.image) images.push_back(image);
+        return images;
+    };
+    const std::string third_party = ALCHEMY_THIRD_PARTY;
+    const auto load = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        require(in.good(), "cannot open " + path);
+        return std::vector<std::uint8_t>((std::istreambuf_iterator<char>(in)), {});
+    };
+
+    // VP9 in WebM: one image per frame, each matching the vector's per-frame MD5.
+    {
+        const auto file = load(third_party + "/libvpx/test-vectors/vp90-2-02-size-08x08.webm");
+        mc::Movie movie;
+        std::string why;
+        const mc::ReadAt read = [&file](std::uint64_t offset, std::span<std::uint8_t> out) -> std::size_t {
+            if (offset >= file.size()) return 0;
+            const auto n = std::min<std::size_t>(out.size(), file.size() - offset);
+            std::memcpy(out.data(), file.data() + offset, n);
+            return n;
+        };
+        require(mc::parse(read, file.size(), movie, why), "the WebM parses: " + why);
+        const auto& track = movie.tracks.at(0);
+        std::vector<std::pair<std::vector<std::uint8_t>, std::int64_t>> packets;
+        for (const auto& sample : track.samples) packets.emplace_back(mc::read_sample(read, track, sample), sample.pts);
+        const auto images = decode(0x76703039 /* 'vp09' */, 8, 8, packets, 0);
+        std::istringstream lines(std::string(reinterpret_cast<const char*>(load(third_party + "/libvpx/test-vectors/vp90-2-02-size-08x08.webm.md5").data()),
+                                             load(third_party + "/libvpx/test-vectors/vp90-2-02-size-08x08.webm.md5").size()));
+        std::vector<std::string> expected;
+        for (std::string line; std::getline(lines, line);) if (line.size() >= 32) expected.push_back(line.substr(0, 32));
+        require(images.size() == expected.size(), "VP9: one image per frame: " + std::to_string(images.size()));
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            require(f.call(cv, "_CVPixelBufferGetPixelFormatType", {images[i].image}) == 0x34323076, "VP9 pictures are 420v");   // '420v'
+            require(md5_hex(i420_of(f, images[i].image)) == expected[i], "VP9 frame " + std::to_string(i + 1) + " MD5");
+            require(images[i].pts == packets[i].second, "VP9 presentation times come back");
+            f.call(vt_cf, "_CFRelease", {images[i].image});
+        }
+    }
+    // AV1, 8 and 10 bits: libaom's test vectors against their per-frame MD5s.
+    const auto ivf_packets = [](const std::vector<std::uint8_t>& file) {
+        std::vector<std::pair<std::vector<std::uint8_t>, std::int64_t>> packets;
+        for (std::size_t at = 32; at + 12 <= file.size();) {
+            const std::uint32_t size = file[at] | (file[at + 1] << 8) | (file[at + 2] << 16) | (std::uint32_t(file[at + 3]) << 24);
+            packets.emplace_back(std::vector<std::uint8_t>(file.begin() + std::ptrdiff_t(at + 12), file.begin() + std::ptrdiff_t(at + 12 + size)),
+                                 static_cast<std::int64_t>(packets.size()));
+            at += 12 + size;
+        }
+        return packets;
+    };
+    for (const auto& [name, ten] : {std::pair{"av1-1-b8-01-size-16x16.ivf", false}, std::pair{"av1-1-b10-00-quantizer-00.ivf", true}}) {
+        const auto file = load(third_party + "/libaom/test-vectors/" + name);
+        const auto width = static_cast<std::int32_t>(file[12] | (file[13] << 8)), height = static_cast<std::int32_t>(file[14] | (file[15] << 8));
+        const auto images = decode(0x61763031 /* 'av01' */, width, height, ivf_packets(file), 0);
+        const auto listing = load(third_party + "/libaom/test-vectors/" + name + ".md5");
+        std::istringstream lines(std::string(reinterpret_cast<const char*>(listing.data()), listing.size()));
+        std::vector<std::string> expected;
+        for (std::string line; std::getline(lines, line);) if (line.size() >= 32) expected.push_back(line.substr(0, 32));
+        require(!images.empty() && images.size() == expected.size(), std::string(name) + ": one image per frame: " + std::to_string(images.size()));
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            require(f.call(cv, "_CVPixelBufferGetPixelFormatType", {images[i].image}) == (ten ? 0x78343230U : 0x34323076U), std::string(name) + " pixel format");
+            require(md5_hex(i420_of(f, images[i].image)) == expected[i], std::string(name) + ": frame " + std::to_string(i + 1) + " MD5");
+            f.call(vt_cf, "_CFRelease", {images[i].image});
+        }
+    }
+    // A BGRA destination: the pictures come out in it.
+    {
+        const auto file = load(third_party + "/libaom/test-vectors/av1-1-b8-01-size-16x16.ivf");
+        const auto packets = ivf_packets(file);
+        const auto key = f.cf.string("PixelFormatType"), value = f.cf.integer(0x42475241);   // 'BGRA'
+        const std::array<std::pair<Address, Address>, 1> entries{{{key, value}}};
+        const auto attributes = f.cf.dictionary(entries);
+        const auto images = decode(0x61763031, 16, 16, {packets.front()}, attributes);
+        require(images.size() == 1 && f.call(cv, "_CVPixelBufferGetPixelFormatType", {images[0].image}) == 0x42475241 &&
+                f.call(cv, "_CVPixelBufferGetWidth", {images[0].image}) == 16, "a 16x16 BGRA picture");
+        f.call(vt_cf, "_CFRelease", {images[0].image});
+    }
+    // H.264 has no decoder (until the patent question is decided).
+    {
+        const auto format_out = f.block(8), session_out = f.block(8);
+        require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, 0x61766331 /* 'avc1' */, 64, 64, 0, format_out}) == 0, "an H.264 description");
+        require(f.status(vt, "_VTDecompressionSessionCreate", {0, f.engine.read64(format_out), 0, 0, record, session_out}) == -12906 &&
+                f.engine.read64(session_out) == 0, "kVTCouldNotFindVideoDecoderErr for H.264");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1505,6 +1813,8 @@ int main() {
         {"music_sequence", music_sequence},
         {"audio_files", audio_files},
         {"audio_file_writing", audio_file_writing},
+        {"compressed_audio", compressed_audio},
+        {"video_toolbox", video_toolbox},
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},
         {"avaudio", avaudio},

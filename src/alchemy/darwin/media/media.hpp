@@ -32,6 +32,8 @@ void install_core_video_gaps(InstallContext& context);
 void install_core_video_pixel_buffers(InstallContext& context);
 // pixel_transfer.cpp: VTPixelTransferSession and the VTSession property calls (before install_video_toolbox).
 void install_pixel_transfer(InstallContext& context);
+// vt_decompression.cpp: VTDecompressionSession for AV1, VP9 and VP8 (before install_video_toolbox).
+void install_vt_decompression(InstallContext& context);
 void install_audio(InstallContext& context);
 void install_media_accessibility(InstallContext& context);
 void install_image_capture(InstallContext& context);

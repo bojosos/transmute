@@ -18,7 +18,8 @@
 // mono to every channel. Volume (with fades), pan, rate (with enableRate), loops, seeking,
 // playAtTime: on the deviceCurrentTime clock and metering are applied; the delegate's
 // -audioPlayerDidFinishPlaying:successfully: runs on the main queue. Without an output device
-// -prepareToPlay and -play answer NO. Compressed files fail to load (no decoder exists).
+// -prepareToPlay and -play answer NO. Compressed files decode through audio_stream.hpp (MP3,
+// FLAC, Opus); other compressed formats fail to load.
 namespace alchemy::gui::completion_kit::media::avaudio {
 namespace {
 
@@ -70,7 +71,7 @@ void Players::load(CpuState& s, Decoded decoded, std::int32_t status, Address ur
     if (status || decoded.channels == 0 || !(decoded.rate > 0)) {
         if (error_out)
             bridge_->store_error(error_out, bridge_->os_status_error(status ? status : af::error::invalid_file,
-                status == af::error::unsupported_data_format ? "The audio is compressed (no audio decoder exists under Alchemy)" : "The audio could not be read"), true);
+                status == af::error::unsupported_data_format ? "The audio format has no decoder under Alchemy" : "The audio could not be read"), true);
         static_cast<void>(support_.send_id(s.x[0], "release"));
         s.x[0] = 0;
         return;

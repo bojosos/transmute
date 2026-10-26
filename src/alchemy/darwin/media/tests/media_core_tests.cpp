@@ -5,6 +5,7 @@
 #include "alchemy/darwin/media/cmtime.hpp"
 #include "alchemy/darwin/media/midi_core.hpp"
 #include "alchemy/darwin/media/midi_ump.hpp"
+#include "alchemy/darwin/media/media_container.hpp"
 #include "alchemy/darwin/media/hal_core.hpp"
 #include "alchemy/darwin/media/hal_host.hpp"
 #include "alchemy/darwin/media/midi_host.hpp"
@@ -616,6 +617,286 @@ void audio_file_writing_tests() {
     require(af::write_header(af::four("MPG3"), s16, 0, {}, out, why) == af::error::unsupported_file_type, "no MP3 container");
 }
 
+// ---- containers: files built by small muxers here, parsed back -------------------------------------
+namespace mc = cm::container;
+using Bytes = std::vector<std::uint8_t>;
+void put(Bytes& out, std::uint64_t value, int bytes) { for (int i = bytes - 1; i >= 0; --i) out.push_back(static_cast<std::uint8_t>(value >> (8 * i))); }
+void put_le(Bytes& out, std::uint64_t value, int bytes) { for (int i = 0; i < bytes; ++i) out.push_back(static_cast<std::uint8_t>(value >> (8 * i))); }
+void append(Bytes& out, const Bytes& more) { out.insert(out.end(), more.begin(), more.end()); }
+Bytes box(const char* type, const Bytes& payload) {
+    Bytes out;
+    put(out, 8 + payload.size(), 4);
+    out.insert(out.end(), type, type + 4);
+    append(out, payload);
+    return out;
+}
+Bytes full(int version, std::uint32_t flags, const Bytes& rest) { Bytes out; put(out, static_cast<std::uint64_t>(version), 1); put(out, flags, 3); append(out, rest); return out; }
+mc::ReadAt reader(const Bytes& file) {
+    return [&file](std::uint64_t offset, std::span<std::uint8_t> out) -> std::size_t {
+        if (offset >= file.size()) return 0;
+        const auto n = std::min<std::size_t>(out.size(), file.size() - static_cast<std::size_t>(offset));
+        std::memcpy(out.data(), file.data() + offset, n);
+        return n;
+    };
+}
+
+// A video track (av01, 3 samples, the second not a sync sample) and an Opus track (2 samples).
+Bytes iso_file(bool fragmented) {
+    const auto visual = [] {
+        Bytes e(6, 0); put(e, 1, 2);            // reserved, data_reference_index
+        append(e, Bytes(16, 0));                 // pre_defined/reserved
+        put(e, 320, 2); put(e, 240, 2);          // width, height
+        put(e, 0x00480000, 4); put(e, 0x00480000, 4); put(e, 0, 4); put(e, 1, 2);
+        append(e, Bytes(32, 0)); put(e, 24, 2); put(e, 0xffff, 2);
+        append(e, box("av1C", Bytes{0x81, 0x00, 0x0c, 0x00}));
+        return box("av01", e);
+    }();
+    const auto audio = [] {
+        Bytes e(6, 0); put(e, 1, 2);
+        append(e, Bytes(8, 0)); put(e, 2, 2); put(e, 16, 2); put(e, 0, 4); put(e, 48000ULL << 16, 4);
+        Bytes dops{0x00, 0x02}; put(dops, 312, 2); put(dops, 48000, 4); put(dops, 0, 2); put(dops, 0, 1);
+        append(e, box("dOps", dops));
+        return box("Opus", e);
+    }();
+    const auto trak = [&](std::uint32_t id, const char* handler, const Bytes& entry, std::uint32_t timescale, std::vector<std::uint32_t> sizes,
+                          std::uint32_t delta, std::uint32_t chunk_offset, bool sync_table) {
+        Bytes tkhd(8, 0); put(tkhd, id, 4); append(tkhd, Bytes(68, 0));
+        Bytes mdhd(8, 0); put(mdhd, timescale, 4); put(mdhd, 0, 4); put(mdhd, 0, 4);
+        Bytes hdlr(4, 0); hdlr.insert(hdlr.end(), handler, handler + 4); append(hdlr, Bytes(13, 0));
+        Bytes stsd; put(stsd, 1, 4); append(stsd, entry);
+        Bytes stts, stsc, stsz, stco, stss;
+        const auto n = static_cast<std::uint32_t>(fragmented ? 0 : sizes.size());
+        put(stts, n ? 1 : 0, 4); if (n) { put(stts, n, 4); put(stts, delta, 4); }
+        put(stsc, n ? 1 : 0, 4); if (n) { put(stsc, 1, 4); put(stsc, n, 4); put(stsc, 1, 4); }
+        put(stsz, 0, 4); put(stsz, n, 4); for (std::uint32_t i = 0; i < n; ++i) put(stsz, sizes[i], 4);
+        put(stco, n ? 1 : 0, 4); if (n) put(stco, chunk_offset, 4);
+        put(stss, 2, 4); put(stss, 1, 4); put(stss, 3, 4);
+        Bytes stbl;
+        append(stbl, box("stsd", full(0, 0, stsd))); append(stbl, box("stts", full(0, 0, stts))); append(stbl, box("stsc", full(0, 0, stsc)));
+        append(stbl, box("stsz", full(0, 0, stsz))); append(stbl, box("stco", full(0, 0, stco)));
+        if (sync_table && !fragmented) append(stbl, box("stss", full(0, 0, stss)));
+        Bytes elst; put(elst, 1, 4); put(elst, 0, 4); put(elst, id == 2 ? 312 : 0, 4); put(elst, 0x10000, 4);
+        Bytes trak_payload = box("tkhd", full(0, 3, tkhd));
+        append(trak_payload, box("edts", box("elst", full(0, 0, elst))));
+        Bytes mdia = box("mdhd", full(0, 0, mdhd));
+        append(mdia, box("hdlr", full(0, 0, hdlr)));
+        append(mdia, box("minf", box("stbl", stbl)));
+        append(trak_payload, box("mdia", mdia));
+        return box("trak", trak_payload);
+    };
+    Bytes brand{'i', 's', 'o', 'm'}; put(brand, 0, 4);
+    Bytes file = box("ftyp", brand);
+    // mdat first: video samples of 10, 20, 30 bytes, then audio of 5 and 7.
+    Bytes data;
+    for (int i = 0; i < 60; ++i) data.push_back(static_cast<std::uint8_t>(i));
+    for (int i = 0; i < 12; ++i) data.push_back(static_cast<std::uint8_t>(0x80 + i));
+    const auto mdat_payload_offset = static_cast<std::uint32_t>(file.size() + 8);
+    append(file, box("mdat", data));
+    Bytes mvhd(8, 0); put(mvhd, 1000, 4); put(mvhd, 100, 4); append(mvhd, Bytes(80, 0));
+    Bytes moov = box("mvhd", full(0, 0, mvhd));
+    append(moov, trak(1, "vide", visual, 90000, {10, 20, 30}, 3000, mdat_payload_offset, true));
+    append(moov, trak(2, "soun", audio, 48000, {5, 7}, 960, mdat_payload_offset + 60, false));
+    if (fragmented) {
+        Bytes mvex;
+        for (std::uint32_t id : {1U, 2U}) {
+            Bytes trex; put(trex, id, 4); put(trex, 1, 4); put(trex, id == 1 ? 3000 : 960, 4); put(trex, 0, 4); put(trex, 0x10000, 4);
+            append(mvex, box("trex", full(0, 0, trex)));
+        }
+        append(moov, box("mvex", mvex));
+    }
+    append(file, box("moov", moov));
+    if (fragmented) {
+        // One moof: the video samples (the first a sync sample through first-sample-flags), then audio, both
+        // with data offsets from the moof's start back into the mdat above.
+        const auto moof_offset = static_cast<std::int64_t>(file.size());
+        const auto traf = [&](std::uint32_t id, std::vector<std::uint32_t> sizes, std::int64_t data_start, bool first_flags) {
+            Bytes tfhd; put(tfhd, id, 4);
+            Bytes tfdt; put(tfdt, id == 1 ? 6000 : 0, 4);
+            Bytes trun; put(trun, sizes.size(), 4); put(trun, static_cast<std::uint32_t>(data_start - moof_offset), 4);
+            if (first_flags) put(trun, 0, 4);
+            for (const auto size : sizes) put(trun, size, 4);
+            Bytes t = box("tfhd", full(0, 0x20000, tfhd));
+            append(t, box("tfdt", full(0, 0, tfdt)));
+            append(t, box("trun", full(0, 0x1 | 0x200 | (first_flags ? 0x4 : 0), trun)));
+            return box("traf", t);
+        };
+        Bytes moof = box("mfhd", full(0, 0, Bytes{0, 0, 0, 1}));
+        append(moof, traf(1, {10, 20, 30}, mdat_payload_offset, true));
+        append(moof, traf(2, {5, 7}, mdat_payload_offset + 60, false));
+        append(file, box("moof", moof));
+    }
+    return file;
+}
+
+// An EBML element with an 8-byte size (or the unknown size).
+Bytes ebml(std::uint32_t id, const Bytes& payload, bool unknown = false) {
+    Bytes out;
+    bool started = false;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        const auto b = static_cast<std::uint8_t>(id >> shift);
+        if (!started && !b) continue;
+        started = true;
+        out.push_back(b);
+    }
+    if (unknown) out.push_back(0xff);
+    else { out.push_back(0x01); put(out, payload.size(), 7); }
+    append(out, payload);
+    return out;
+}
+Bytes ebml_uint(std::uint32_t id, std::uint64_t value) { Bytes v; put(v, value, 4); return ebml(id, v); }
+
+Bytes webm_file() {
+    Bytes header = ebml(0x1A45DFA3, ebml(0x4282, Bytes{'w', 'e', 'b', 'm'}));
+    Bytes info_payload = ebml_uint(0x2AD7B1, 1000000);
+    Bytes duration; put(duration, std::bit_cast<std::uint32_t>(80.0f), 4);
+    append(info_payload, ebml(0x4489, duration));
+    Bytes info = ebml(0x1549A966, info_payload);
+    Bytes opus_head{'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 2}; put_le(opus_head, 312, 2); put_le(opus_head, 48000, 4); put_le(opus_head, 0, 2); opus_head.push_back(0);
+    Bytes video_entry = ebml_uint(0xD7, 1);
+    append(video_entry, ebml_uint(0x83, 1));
+    append(video_entry, ebml(0x86, Bytes{'V', '_', 'V', 'P', '9'}));
+    Bytes video = ebml_uint(0xB0, 64); append(video, ebml_uint(0xBA, 48));
+    append(video_entry, ebml(0xE0, video));
+    Bytes audio_entry = ebml_uint(0xD7, 2);
+    append(audio_entry, ebml_uint(0x83, 2));
+    append(audio_entry, ebml(0x86, Bytes{'A', '_', 'O', 'P', 'U', 'S'}));
+    append(audio_entry, ebml(0x63A2, opus_head));
+    append(audio_entry, ebml_uint(0x23E383, 20000000));   // 20 ms frames
+    Bytes audio = ebml_uint(0x9F, 2);
+    Bytes rate; put(rate, std::bit_cast<std::uint64_t>(48000.0), 8);
+    append(audio, ebml(0xB5, rate));
+    append(audio_entry, ebml(0xE1, audio));
+    Bytes entries = ebml(0xAE, video_entry); append(entries, ebml(0xAE, audio_entry));
+    Bytes tracks = ebml(0x1654AE6B, entries);
+    // A cluster of unknown size: a video keyframe at 0, an audio block of three Xiph-laced frames
+    // (3, 4, 5 bytes) at 0, a video frame at 40 in a BlockGroup with a reference.
+    Bytes cluster = ebml_uint(0xE7, 0);
+    append(cluster, ebml(0xA3, Bytes{0x81, 0x00, 0x00, 0x80, 'K', 'E', 'Y'}));
+    Bytes laced{0x82, 0x00, 0x00, 0x02, 0x02, 3, 4};
+    for (int i = 0; i < 12; ++i) laced.push_back(static_cast<std::uint8_t>(i));
+    append(cluster, ebml(0xA3, laced));
+    Bytes group = ebml(0xA1, Bytes{0x81, 0x00, 0x28, 0x00, 'P'});
+    append(group, ebml(0xFB, Bytes{0xd8}));
+    append(cluster, ebml(0xA0, group));
+    Bytes segment = info; append(segment, tracks); append(segment, ebml(0x1F43B675, cluster, true));
+    append(header, ebml(0x18538067, segment, true));
+    return header;
+}
+
+Bytes ogg_page(std::uint32_t serial, std::uint32_t sequence, std::uint8_t type, std::int64_t granule, const std::vector<Bytes>& packets, bool last_continues = false) {
+    Bytes lacing, body;
+    for (std::size_t i = 0; i < packets.size(); ++i) {
+        auto n = packets[i].size();
+        while (n >= 255) { lacing.push_back(255); n -= 255; }
+        if (!(last_continues && i + 1 == packets.size())) lacing.push_back(static_cast<std::uint8_t>(n));
+        append(body, packets[i]);
+    }
+    Bytes page{'O', 'g', 'g', 'S', 0, type};
+    put_le(page, static_cast<std::uint64_t>(granule), 8); put_le(page, serial, 4); put_le(page, sequence, 4); put_le(page, 0, 4);
+    page.push_back(static_cast<std::uint8_t>(lacing.size()));
+    append(page, lacing); append(page, body);
+    return page;
+}
+
+std::uint8_t header_crc8(const Bytes& b) {
+    std::uint8_t c = 0;
+    for (const auto x : b) { c ^= x; for (int i = 0; i < 8; ++i) c = static_cast<std::uint8_t>((c & 0x80) ? (c << 1) ^ 7 : c << 1); }
+    return c;
+}
+
+void container_tests() {
+    for (const bool fragmented : {false, true}) {
+        const auto file = iso_file(fragmented);
+        mc::Movie movie;
+        std::string why;
+        require(mc::parse(reader(file), file.size(), movie, why), "MP4 parses: " + why);
+        require(movie.brand == mc::fourcc("isom") && movie.tracks.size() == 2, "two MP4 tracks");
+        const auto& v = movie.tracks[0];
+        require(v.kind == mc::Track::Kind::video && v.codec == mc::fourcc("av01") && v.width == 320 && v.height == 240 && v.timescale == 90000 &&
+                v.config.size() == 4, "the AV1 track");
+        require(v.samples.size() == 3 && v.samples[1].size == 20 && v.samples[2].dts == (fragmented ? 12000 : 6000) && v.samples[0].keyframe &&
+                v.samples[1].keyframe == false, "video samples");
+        require(mc::read_sample(reader(file), v, v.samples[1])[0] == 10, "the second video sample's bytes");
+        const auto& a = movie.tracks[1];
+        require(a.codec == mc::fourcc("opus") && a.channels == 2 && a.sample_rate == 48000 && a.priming == 312 && a.samples.size() == 2 &&
+                a.samples[1].size == 7 && mc::read_sample(reader(file), a, a.samples[0])[0] == 0x80, "the Opus track");
+    }
+    {
+        const auto file = webm_file();
+        mc::Movie movie;
+        std::string why;
+        require(mc::parse(reader(file), file.size(), movie, why), "WebM parses: " + why);
+        require(movie.brand == mc::fourcc("webm") && movie.timescale == 1000 && movie.tracks.size() == 2, "two WebM tracks");
+        const auto& v = movie.tracks[0];
+        require(v.codec == mc::fourcc("vp09") && v.width == 64 && v.height == 48 && v.samples.size() == 2 && v.samples[0].keyframe &&
+                !v.samples[1].keyframe && v.samples[1].pts == 40, "the VP9 track");
+        require(mc::read_sample(reader(file), v, v.samples[0]) == Bytes{'K', 'E', 'Y'}, "the keyframe bytes");
+        const auto& a = movie.tracks[1];
+        require(a.codec == mc::fourcc("opus") && a.priming == 312 && a.samples.size() == 3 && a.samples[0].size == 3 && a.samples[2].size == 5 &&
+                a.samples[1].pts == 20 && mc::read_sample(reader(file), a, a.samples[2])[0] == 7, "Xiph-laced Opus frames");
+    }
+    {
+        // Ogg Opus: the header packets, then a 300-byte packet that spans two pages and a 1-byte packet.
+        Bytes head{'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 1}; put_le(head, 120, 2); put_le(head, 48000, 4); put_le(head, 0, 2); head.push_back(0);
+        Bytes tags{'O', 'p', 'u', 's', 'T', 'a', 'g', 's', 0, 0, 0, 0, 0, 0, 0, 0};
+        Bytes big(300, 0xfc);   // TOC 0xfc: CELT 20 ms, one frame
+        Bytes first_half(big.begin(), big.begin() + 255), second_half(big.begin() + 255, big.end());
+        Bytes file = ogg_page(7, 0, 2, 0, {head});
+        append(file, ogg_page(7, 1, 0, 0, {tags}));
+        append(file, ogg_page(7, 2, 0, -1, {first_half}, true));
+        append(file, ogg_page(7, 3, 1, 1920, {second_half, Bytes{0xfc}}));
+        mc::Movie movie;
+        std::string why;
+        require(mc::parse(reader(file), file.size(), movie, why), "Ogg parses: " + why);
+        const auto& t = movie.tracks.at(0);
+        require(t.codec == mc::fourcc("opus") && t.priming == 120 && t.samples.size() == 2 && t.samples[0].size == 300 && t.samples[0].pieces == 2 &&
+                t.samples[0].duration == 960 && t.samples[1].pts == 960, "Ogg Opus packets");
+        require(mc::read_sample(reader(file), t, t.samples[0]) == big, "a packet across pages reads whole");
+    }
+    {
+        // FLAC: STREAMINFO (44.1 kHz, stereo, 16 bits, 8192 samples), two fixed-block-size frames of 4096.
+        Bytes file{'f', 'L', 'a', 'C', 0x80, 0, 0, 34};
+        Bytes info{0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0};
+        info.push_back(0x0a); info.push_back(0xc4); info.push_back(0x42); info.push_back(0xf0);
+        put(info, 8192, 4); append(info, Bytes(16, 0));
+        append(file, info);
+        for (std::uint8_t number = 0; number < 2; ++number) {
+            Bytes frame{0xff, 0xf8, 0xc9, 0x18, number};   // block 4096 (code 12), 44.1 kHz, stereo, 16 bits, frame number
+            frame.push_back(header_crc8(frame));
+            append(frame, Bytes(20, 0x55));
+            append(file, frame);
+        }
+        mc::Movie movie;
+        std::string why;
+        require(mc::parse(reader(file), file.size(), movie, why), "FLAC parses: " + why);
+        const auto& t = movie.tracks.at(0);
+        require(t.codec == mc::fourcc("flac") && t.sample_rate == 44100 && t.channels == 2 && t.bits == 16 && t.duration == 8192 &&
+                t.samples.size() == 2 && t.samples[1].pts == 4096 && t.samples[0].size == 26 && t.config.size() == 38, "FLAC frames");
+    }
+    {
+        // MP3: 128 kb/s, 44.1 kHz stereo frames of 417 bytes; the first an Info/LAME frame (delay 576, padding 1000).
+        const auto frame = [](bool padding) {
+            Bytes f{0xff, 0xfb, static_cast<std::uint8_t>(0x90 | (padding ? 2 : 0)), 0x00};
+            f.resize(padding ? 418 : 417, 0);
+            return f;
+        };
+        Bytes file{'I', 'D', '3', 3, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5};
+        auto info = frame(false);
+        std::memcpy(info.data() + 36, "Info", 4);
+        info[43] = 0x0f;   // frames, bytes, TOC, quality
+        const std::size_t tag = 36 + 8 + 4 + 4 + 100 + 4;
+        info[tag + 21] = 0x24; info[tag + 22] = 0x03; info[tag + 23] = 0xe8;   // delay 576, padding 1000
+        append(file, info);
+        for (int i = 0; i < 4; ++i) append(file, frame(i == 1));
+        mc::Movie movie;
+        std::string why;
+        require(mc::parse(reader(file), file.size(), movie, why), "MP3 parses: " + why);
+        const auto& t = movie.tracks.at(0);
+        require(t.codec == mc::fourcc(".mp3") && t.sample_rate == 44100 && t.channels == 2 && t.samples.size() == 4 && t.samples[1].size == 418 &&
+                t.priming == 576 + 529 && t.duration == 4 * 1152 - 576 - 529 - 1000, "MP3 frames and the LAME delay");
+    }
+}
+
 int main() {
     try {
         resampler_tests();
@@ -628,6 +909,7 @@ int main() {
         audio_file_tests();
         audio_file_writing_tests();
         ump_tests();
+        container_tests();
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

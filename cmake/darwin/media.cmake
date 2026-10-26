@@ -22,6 +22,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/cmtime.cpp
     src/alchemy/darwin/media/midi_core.cpp
     src/alchemy/darwin/media/midi_ump.cpp
+    src/alchemy/darwin/media/media_container.cpp
     src/alchemy/darwin/media/midi_host.cpp
     src/alchemy/darwin/media/coremidi.cpp
     src/alchemy/darwin/media/hal_core.cpp
@@ -58,6 +59,8 @@ function(alchemy_gui_media_tests)
     alchemy_gui_add_unit_test(alchemy_gui_media_unit src/alchemy/darwin/media/tests/media_core_tests.cpp)
     # Their guest-facing exports through the strict-mode provider fixture.
     alchemy_gui_add_unit_test(alchemy_gui_media_guest src/alchemy/darwin/media/tests/media_guest_tests.cpp TIMEOUT 180)
+    # compressed_audio reads minimp3's conformance vectors.
+    target_compile_definitions(alchemy_gui_media_guest PRIVATE ALCHEMY_THIRD_PARTY="${PROJECT_SOURCE_DIR}/third_party")
 endfunction()
 alchemy_gui_register_tests(alchemy_gui_media_tests)
 

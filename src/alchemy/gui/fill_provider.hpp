@@ -113,6 +113,7 @@ enum class TypeId : std::uint64_t {
     read_stream, write_stream,       // darwin/foundation/streams.cpp
     hid_device, hid_element, hid_value, da_disk, da_dissenter,   // darwin/iokit/, darwin/diskarbitration/
     run_loop, run_loop_source, run_loop_observer, run_loop_timer,   // darwin/runloop/
+    vt_decompression_session,        // darwin/media/vt_decompression.cpp
 };
 
 inline std::int64_t sign32(std::uint64_t value) { return static_cast<std::int32_t>(static_cast<std::uint32_t>(value)); }

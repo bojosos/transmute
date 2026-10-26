@@ -18,6 +18,11 @@
 // - Reading: any of those files. ExtAudioFile converts to any linear PCM client format with the
 //   file's sample rate (kAudioConverterErr_FormatNotSupported otherwise); it has no AudioConverter
 //   object to expose.
+// - Compressed files with a decoder (audio_stream.hpp: MP3, FLAC, Ogg Opus, MP4 and Matroska audio
+//   in those codecs) open read-only: AudioFile describes and reads their packets (data format,
+//   packet counts and sizes, magic cookie, packet table, ReadPacketData with descriptions;
+//   ReadBytes answers kAudioFileOperationNotSupportedError), and ExtAudioFile reads them decoded.
+//   Other compressed data (AAC, ALAC, ...) answers kAudioFileUnsupportedDataFormatError.
 // - Writing: AudioFileCreateWithURL and InitializeWithCallbacks make files in the format given,
 //   which the container must hold (kAudioFileUnsupportedDataFormatError otherwise); bytes and
 //   packets go into the data, and the header's sizes are brought up to date by AudioFileOptimize
@@ -221,7 +226,50 @@ struct AudioFiles {
         std::memcpy(out.data(), &value, sizeof(T));
         return out;
     }
+    // A compressed file's properties: its packets, as the container holds them.
+    std::int32_t stream_property(const File& f, std::uint32_t id, Value& out) {
+        const auto& st = *f.audio.stream;
+        const auto seconds = static_cast<double>(st.frames()) / st.rate();
+        std::uint64_t bytes = 0;
+        for (const auto& sample : st.track().samples) bytes += sample.size;
+        switch (id) {
+        case four("ffmt"): out.bytes = raw(st.file_type()); return 0;
+        case four("dfmt"): out.bytes = st.asbd(); return 0;
+        case four("bcnt"): out.bytes = raw(bytes); return 0;
+        case four("pcnt"): out.bytes = raw(static_cast<std::uint64_t>(st.packet_count())); return 0;
+        case four("psze"): case four("pkub"): out.bytes = raw(st.maximum_packet_bytes()); return 0;
+        case four("doff"): out.bytes = raw(static_cast<std::int64_t>(st.track().samples.front().offset)); return 0;
+        case four("optm"): out.bytes = raw(std::uint32_t{1}); return 0;
+        case four("edur"): out.bytes = raw(seconds); return 0;
+        case four("brat"): out.bytes = raw(static_cast<std::uint32_t>(seconds > 0 ? std::llround(static_cast<double>(bytes) * 8 / seconds) : 0)); return 0;
+        case four("pnfo"): {   // kAudioFilePropertyPacketTableInfo {SInt64 valid; SInt32 priming; SInt32 remainder}
+            out.bytes = raw(static_cast<std::int64_t>(st.frames()));
+            const auto tail = raw(static_cast<std::int32_t>(st.priming()));
+            const auto end = raw(static_cast<std::int32_t>(st.remainder()));
+            out.bytes.insert(out.bytes.end(), tail.begin(), tail.end());
+            out.bytes.insert(out.bytes.end(), end.begin(), end.end());
+            return 0;
+        }
+        case four("mgic"):     // kAudioFilePropertyMagicCookieData
+            if (st.magic_cookie().empty()) return error::unsupported_property;
+            out.bytes = st.magic_cookie();
+            return 0;
+        case four("cmap"):
+            out.bytes = layout_for_mask(0, st.channels());
+            return out.bytes.empty() ? error::unsupported_property : 0;
+        case four("flst"): {
+            out.bytes = st.asbd();
+            const auto tag = raw(0xffff0000U | st.channels());
+            out.bytes.insert(out.bytes.end(), tag.begin(), tag.end());
+            out.bytes.resize(48);
+            return 0;
+        }
+        case four("info"): out.bytes.assign(8, 0); out.object = true; return 0;
+        default: return error::unsupported_property;
+        }
+    }
     std::int32_t file_property(const File& f, std::uint32_t id, Value& out) {
+        if (f.audio.stream) return stream_property(f, id, out);
         const auto& c = f.container();
         switch (id) {
         case four("ffmt"): out.bytes = raw(c.file_type); return 0;                                   // kAudioFilePropertyFileFormat
@@ -263,7 +311,7 @@ struct AudioFiles {
         const auto* f = file(e.file);
         if (!f) return error::param;
         switch (id) {
-        case four("ffmt"): out.bytes = asbd_from_pcm(f->container().format); return 0;              // FileDataFormat
+        case four("ffmt"): out.bytes = f->audio.stream ? f->audio.stream->asbd() : asbd_from_pcm(f->container().format); return 0;   // FileDataFormat
         case four("cfmt"): out.bytes = asbd_from_pcm(e.client); out.writable = true; return 0;      // ClientDataFormat
         case four("fclo"):                                                                           // FileChannelLayout
             out.bytes = !f->layout.empty() ? f->layout : layout_for_mask(f->container().channel_mask, f->container().format.channels);
@@ -274,7 +322,9 @@ struct AudioFiles {
             return out.bytes.empty() ? ext_invalid_property : 0;
         case four("#frm"): out.bytes = raw(static_cast<std::int64_t>(f->frames())); return 0;       // FileLengthFrames
         case four("afil"): out.bytes = raw(e.file); return 0;                                       // AudioFile
-        case four("fmps"): out.bytes = raw(f->container().format.frame_bytes()); return 0;          // FileMaxPacketSize
+        case four("fmps"):                                                                           // FileMaxPacketSize
+            out.bytes = raw(f->audio.stream ? f->audio.stream->maximum_packet_bytes() : f->container().format.frame_bytes());
+            return 0;
         case four("cmps"): out.bytes = raw(e.client.frame_bytes()); return 0;                       // ClientMaxPacketSize
         case four("iobs"): out.bytes = raw(e.io_buffer_bytes); out.writable = true; return 0;       // IOBufferSizeBytes
         default: return ext_invalid_property;   // AudioConverter, packet table, ...: there is no converter object
@@ -318,14 +368,13 @@ struct AudioFiles {
         const auto total = f->frames();
         frames = e.position >= total ? 0 : std::min<std::uint64_t>(frames, total - e.position);
         const auto& source = f->container().format;
+        const ReadAt bytes_at = [this, f](std::uint64_t offset, std::span<std::uint8_t> out) { return read_at(*f, offset, out); };
         std::uint64_t done = 0;
         while (done < frames) {
             const auto count = std::min<std::uint64_t>(frames - done, 16384);
-            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(count * source.frame_bytes()));
-            const auto got = read_at(*f, f->container().data_offset + (e.position + done) * source.frame_bytes(), bytes);
-            const auto whole = got / source.frame_bytes();
+            std::vector<double> samples;
+            const auto whole = read_audio_frames(f->audio, bytes_at, e.position + done, static_cast<std::size_t>(count), samples);
             if (!whole) break;   // the file ended early (truncated data chunk)
-            const auto samples = decode(source, {std::span<const std::uint8_t>(bytes.data(), whole * source.frame_bytes())}, whole);
             std::vector<std::vector<std::uint8_t>> out(buffer_count, std::vector<std::uint8_t>(whole * e.client.frame_bytes()));
             std::vector<std::span<std::uint8_t>> spans;
             for (auto& buffer : out) spans.emplace_back(buffer);
@@ -421,8 +470,12 @@ std::int32_t open_guest_audio(Support& support, const std::string& path, GuestAu
     const auto end = static_cast<std::int64_t>(support.call(libsystem, "_lseek", {static_cast<Address>(fd), 0, 2}));
     audio.size = end > 0 ? static_cast<std::uint64_t>(end) : 0;
     std::string why;
-    result = parse([&support, fd](std::uint64_t offset, std::span<std::uint8_t> bytes) { return read_guest(support, fd, offset, bytes); },
-                   audio.size, audio.container, why);
+    const ReadAt read = [&support, fd](std::uint64_t offset, std::span<std::uint8_t> bytes) { return read_guest(support, fd, offset, bytes); };
+    result = parse(read, audio.size, audio.container, why);
+    if (result == error::unsupported_file_type || result == error::unsupported_data_format) {
+        if (read_write) result = error::operation_not_supported;   // compressed files are read-only
+        else result = open_audio_stream(audio, read, result, why);
+    }
     if (result) {
         static_cast<void>(support.call(libsystem, "_close", {static_cast<Address>(fd)}));
         return result;
@@ -431,8 +484,51 @@ std::int32_t open_guest_audio(Support& support, const std::string& path, GuestAu
     return 0;
 }
 
+std::int32_t open_audio_stream(GuestAudio& audio, ReadAt read, std::int32_t pcm_status, std::string& why) {
+    std::int32_t result{};
+    auto stream = audio_stream::Stream::open(std::move(read), audio.size, result, why);
+    if (!stream) return pcm_status == error::unsupported_data_format ? pcm_status : result;
+    Container c;
+    c.file_type = stream->file_type();
+    c.format.rate = stream->rate();
+    c.format.channels = stream->channels();
+    c.format.is_float = true;
+    c.format.bits = 32;
+    c.format.container = 4;
+    c.data_offset = 0;
+    c.data_bytes = stream->frames() * c.format.frame_bytes();
+    audio.container = c;
+    audio.stream = std::move(stream);
+    return 0;
+}
+
 void close_guest_audio(Support& support, GuestAudio& audio) {
     if (audio.fd >= 0) static_cast<void>(support.call(libsystem, "_close", {static_cast<Address>(std::exchange(audio.fd, -1))}));
+}
+
+std::size_t read_audio_frames(const GuestAudio& audio, const ReadAt& read, std::uint64_t start, std::size_t count, std::vector<double>& out) {
+    const auto total = audio.frames();
+    if (start >= total) return 0;
+    count = static_cast<std::size_t>(std::min<std::uint64_t>(count, total - start));
+    if (audio.stream) {
+        std::vector<float> decoded;
+        const auto got = audio.stream->read(start, count, decoded);
+        out.insert(out.end(), decoded.begin(), decoded.end());
+        return got;
+    }
+    const auto& format = audio.container.format;
+    std::vector<std::uint8_t> bytes(count * format.frame_bytes());
+    const auto got = read(audio.container.data_offset + start * format.frame_bytes(), bytes) / format.frame_bytes();
+    if (!got) return 0;
+    const auto samples = decode(format, {std::span<const std::uint8_t>(bytes.data(), got * format.frame_bytes())}, got);
+    out.insert(out.end(), samples.begin(), samples.end());
+    return got;
+}
+
+std::size_t read_audio_frames(Support& support, const GuestAudio& audio, std::uint64_t start, std::size_t count, std::vector<double>& out) {
+    const auto fd = audio.fd;
+    return read_audio_frames(audio, [&support, fd](std::uint64_t offset, std::span<std::uint8_t> bytes) { return read_guest(support, fd, offset, bytes); },
+                             start, count, out);
 }
 
 void install_audio_file(Support& support) {
@@ -492,10 +588,17 @@ void install_audio_file(Support& support) {
         file.set_size_proc = s.x[4];
         file.audio.size = state->size_of(file);
         std::string why;
-        const auto result = parse([&state, &file](std::uint64_t offset, std::span<std::uint8_t> bytes) { return state->read_at(file, offset, bytes); },
-                                  file.audio.size, file.audio.container, why);
+        auto result = parse([&state, &file](std::uint64_t offset, std::span<std::uint8_t> bytes) { return state->read_at(file, offset, bytes); },
+                            file.audio.size, file.audio.container, why);
+        if (result == error::unsupported_file_type || result == error::unsupported_data_format) {
+            // A compressed file: its stream reads through a copy of the callbacks.
+            auto* files = state.get();
+            result = open_audio_stream(file.audio, [files, callbacks = file](std::uint64_t offset, std::span<std::uint8_t> bytes) {
+                return files->read_at(callbacks, offset, bytes);
+            }, result, why);
+        }
         if (result) return status(s, result);
-        if (file.write_proc) static_cast<void>(state->make_writable(file));   // read-only unless its header can be rewritten
+        if (file.write_proc && !file.audio.stream) static_cast<void>(state->make_writable(file));   // read-only unless its header can be rewritten
         m.write64(s.x[6], state->adopt(std::move(file)));
         status(s, 0);
     });
@@ -596,6 +699,7 @@ void install_audio_file(Support& support) {
         const auto start = static_cast<std::int64_t>(s.x[2]);
         if (start < 0) return status(s, error::invalid_packet_offset);
         const auto wanted = m.read32(s.x[3]);
+        if (f->audio.stream) return status(s, error::operation_not_supported);   // compressed packets are read with ReadPacketData
         const auto& c = f->container();
         const auto available = static_cast<std::uint64_t>(start) >= c.data_bytes ? 0 : c.data_bytes - static_cast<std::uint64_t>(start);
         std::vector<std::uint8_t> bytes(static_cast<std::size_t>(std::min<std::uint64_t>(wanted, available)));
@@ -612,6 +716,31 @@ void install_audio_file(Support& support) {
         if (!f || !s.x[2] || !s.x[5] || !s.x[6]) return status(s, error::param);
         const auto packet = static_cast<std::int64_t>(s.x[4]);
         if (packet < 0) return status(s, error::invalid_packet_offset);
+        if (f->audio.stream) {
+            // Compressed packets: as many whole ones as fit, with their descriptions
+            // (AudioStreamPacketDescription {SInt64 start; UInt32 variableFrames; UInt32 bytes}).
+            const auto& st = *f->audio.stream;
+            const auto room = m.read32(s.x[2]);
+            const auto wanted = m.read32(s.x[5]);
+            std::vector<std::uint8_t> bytes;
+            std::uint32_t count = 0;
+            for (auto p = static_cast<std::uint64_t>(packet); count < wanted && p < st.packet_count(); ++p, ++count) {
+                const auto data = st.packet(static_cast<std::size_t>(p));
+                if (data.empty() || bytes.size() + data.size() > room) break;
+                if (s.x[3]) {
+                    const auto entry = s.x[3] + 16ULL * count;
+                    const auto frames = static_cast<std::uint32_t>(st.packet_start(static_cast<std::size_t>(p) + 1) - st.packet_start(static_cast<std::size_t>(p)));
+                    m.write64(entry, bytes.size());
+                    m.write32(entry + 8, frames == st.frames_per_packet() ? 0 : frames);
+                    m.write32(entry + 12, static_cast<std::uint32_t>(data.size()));
+                }
+                bytes.insert(bytes.end(), data.begin(), data.end());
+            }
+            if (!bytes.empty()) m.write_bytes(s.x[6], bytes);
+            m.write32(s.x[2], static_cast<std::uint32_t>(bytes.size()));
+            m.write32(s.x[5], count);
+            return status(s, count ? 0 : error::end_of_file);
+        }
         const auto frame_bytes = f->container().format.frame_bytes();
         auto count = std::min<std::uint64_t>(m.read32(s.x[5]), m.read32(s.x[2]) / frame_bytes);
         const auto total = f->frames();

@@ -1,0 +1,13 @@
+src/cdef_apply_tmpl.c
+src/cdef_tmpl.c
+src/fg_apply_tmpl.c
+src/filmgrain_tmpl.c
+src/ipred_prepare_tmpl.c
+src/ipred_tmpl.c
+src/itx_tmpl.c
+src/lf_apply_tmpl.c
+src/loopfilter_tmpl.c
+src/looprestoration_tmpl.c
+src/lr_apply_tmpl.c
+src/mc_tmpl.c
+src/recon_tmpl.c

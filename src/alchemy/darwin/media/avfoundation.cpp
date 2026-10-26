@@ -14,11 +14,12 @@
 // and CoreAudioKit's AUGenericView (QLab gap group G5). The capture classes
 // are src/alchemy/darwin/media/video.cpp's.
 //
-// - AVURLAsset/AVAsset: file URLs whose content Alchemy can read (linear PCM
-//   WAVE, AIFF/AIFC, CAF: audio_file_core.hpp) have one audio track with its
-//   duration, time range and CMAudioFormatDescription; other media (video,
-//   compressed audio) has no track, an invalid duration and
-//   AVKeyValueStatusFailed. Nothing is playable (there is no AVPlayer) and no
+// - AVURLAsset/AVAsset: file URLs whose audio Alchemy can read (linear PCM
+//   WAVE, AIFF/AIFC, CAF: audio_file_core.hpp; MP3, FLAC, Ogg Opus and MP4
+//   or Matroska audio in those codecs, decoded: audio_file.hpp) have one
+//   audio track with its duration, time range and CMAudioFormatDescription
+//   (of the decoded audio); other media (video, AAC, ALAC) has no track, an
+//   invalid duration and AVKeyValueStatusFailed. Nothing is playable (there is no AVPlayer) and no
 //   metadata is read (commonMetadata is empty). Keys load synchronously; the
 //   completion handler runs on a global queue.
 // - AVAssetReader with track and audio-mix outputs vends CMSampleBuffers of
@@ -247,7 +248,7 @@ struct Av {
         }
         const auto format_id = setting(o.settings, "AVFormatIDKey");
         if (!format_id || static_cast<std::uint32_t>(*format_id) != audio_file::four("lpcm"))
-            unsupported("AVAssetReader output settings other than linear PCM (no audio encoder or decoder exists)");
+            unsupported("AVAssetReader output settings other than linear PCM (no audio encoder exists)");
         if (const auto rate = setting(o.settings, "AVSampleRateKey")) f.rate = *rate;
         if (const auto channels = setting(o.settings, "AVNumberOfChannelsKey")) f.channels = static_cast<std::uint32_t>(*channels);
         if (const auto bits = setting(o.settings, "AVLinearPCMBitDepthKey")) { f.bits = static_cast<std::uint32_t>(*bits); f.container = (f.bits + 7) / 8; }
@@ -278,15 +279,14 @@ struct Av {
             return 0;
         }
         const auto& source = asset.container.format;
-        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(frames * source.frame_bytes()));
-        const auto got = read_guest(support, o->file.fd, asset.container.data_offset + o->position * source.frame_bytes(), bytes) / source.frame_bytes();
+        std::vector<double> samples;
+        const auto got = read_audio_frames(support, o->file, o->position, static_cast<std::size_t>(frames), samples);
         if (!got) {   // the file ended early
             o->finished = true;
             close_output(*o);
             finish_reader_if_done(o->reader);
             return 0;
         }
-        const auto samples = audio_file::decode(source, {std::span<const std::uint8_t>(bytes.data(), got * source.frame_bytes())}, got);
         const auto plane = got * o->client.frame_bytes();
         const std::uint32_t planes = o->client.non_interleaved ? o->client.channels : 1;
         std::vector<std::uint8_t> data(static_cast<std::size_t>(plane * planes));

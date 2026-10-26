@@ -1,5 +1,7 @@
 #include "alchemy/darwin/media/media_support.hpp"
 #include "alchemy/darwin/media/audio_file_core.hpp"
+#include "alchemy/darwin/media/media_codecs.hpp"
+#include "alchemy/darwin/media/media_container.hpp"
 #include "alchemy/darwin/media/resampler.hpp"
 
 #include "alchemy/engine_adapter.hpp"
@@ -24,12 +26,17 @@
 // error, whose status it returns once nothing more comes out). AudioConverterConvertBuffer and
 // AudioConverterConvertComplexBuffer convert between equal sample rates
 // (kAudioConverterErr_InvalidInputSize otherwise, as the API documents for rate changes).
-// Compressed formats have no codec: AudioConverterNew answers
-// kAudioConverterErr_FormatNotSupported.
+// Decoding: MPEG audio ('.mp1', '.mp2', '.mp3'), Opus and FLAC input converts to any of those PCM
+// outputs (media_codecs.hpp). The input procedure hands over packets, with their descriptions
+// (without them, one packet, or MPEG frames found by their headers); the magic cookie
+// (kAudioConverterDecompressionMagicCookie) configures Opus and FLAC, and a FLAC stream without
+// one is described by the input format. Other compressed formats (AAC, ALAC, ...) and every
+// encoder answer kAudioConverterErr_FormatNotSupported from AudioConverterNew.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
 namespace af = audio_file;
+namespace mc = container;
 
 constexpr std::string_view audio_toolbox = "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox";
 constexpr std::uint32_t four(const char (&code)[5]) { return af::four(code); }
@@ -54,8 +61,48 @@ struct Converter {
     std::uint32_t quality{0x60}, complexity{four("norm")}, prime_method{2};
     std::uint64_t scratch{};                  // guest memory for the input procedure
     std::size_t scratch_size{};
+    // Decoding: the input's format ID (0 for PCM input; `in` is then the decoded float format),
+    // its description, the magic cookie, and the decoder (made at the first conversion).
+    std::uint32_t codec{};
+    double codec_rate{};
+    std::uint32_t codec_channels{}, codec_flags{}, codec_frames_per_packet{};
+    std::vector<std::uint8_t> cookie;
+    std::unique_ptr<codecs::AudioDecoder> decoder;
     std::mutex mutex;
 };
+
+bool decodable(std::uint32_t format_id) {
+    return format_id == four(".mp1") || format_id == four(".mp2") || format_id == four(".mp3") || format_id == four("opus") ||
+           format_id == four("flac");
+}
+
+// The decoder's configuration: the cookie, or for FLAC without one a STREAMINFO from the format.
+std::vector<std::uint8_t> decoder_config(const Converter& c) {
+    if (!c.cookie.empty() || c.codec != four("flac")) return c.cookie;
+    const std::uint32_t bits = c.codec_flags == 2 ? 20 : c.codec_flags == 3 ? 24 : c.codec_flags == 4 ? 32 : 16;
+    const std::uint32_t block = c.codec_frames_per_packet ? std::min<std::uint32_t>(c.codec_frames_per_packet, 65535) : 4096;
+    const auto rate = static_cast<std::uint32_t>(c.codec_rate);
+    std::vector<std::uint8_t> info{0, 0, 0, 34, 0, 16, static_cast<std::uint8_t>(block >> 8), static_cast<std::uint8_t>(block), 0, 0, 0, 0, 0, 0};
+    info.push_back(static_cast<std::uint8_t>(rate >> 12));
+    info.push_back(static_cast<std::uint8_t>(rate >> 4));
+    info.push_back(static_cast<std::uint8_t>(((rate & 15) << 4) | (((c.codec_channels - 1) & 7) << 1) | (((bits - 1) >> 4) & 1)));
+    info.push_back(static_cast<std::uint8_t>(((bits - 1) & 15) << 4));
+    info.resize(4 + 34, 0);
+    return info;
+}
+
+// Makes the decoder if there is none: its rate and channels become the input's.
+std::int32_t ensure_decoder(Converter& c) {
+    if (!c.codec || c.decoder) return 0;
+    std::string why;
+    const auto config = decoder_config(c);
+    c.decoder = codecs::make_audio_decoder(c.codec == four(".mp1") || c.codec == four(".mp2") ? four(".mp3") : c.codec, c.codec_rate,
+                                           c.codec_channels, config, why);
+    if (!c.decoder) return error::format_not_supported;
+    c.in.rate = c.decoder->rate;
+    c.in.channels = c.decoder->channels;
+    return 0;
+}
 
 // The input frame `frame` (interleaved doubles in `in` channels) mapped to the output channels.
 void map_channels(const Converter& c, const double* frame, double* out) {
@@ -137,6 +184,8 @@ private:
     }
     // Pulls up to `frames` input frames through the input procedure into c.pending.
     void pull_input(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::size_t frames);
+    // The same for compressed input: packets, decoded.
+    void pull_packets(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::size_t frames);
     std::int32_t fill(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets, std::uint64_t list);
     std::int32_t get_property(Converter& c, std::uint32_t id, std::vector<std::uint8_t>& out, bool& writable);
     std::int32_t set_property(Converter& c, std::uint32_t id, std::span<const std::uint8_t> data);
@@ -146,7 +195,79 @@ private:
     std::map<std::uint64_t, std::shared_ptr<Converter>> converters_;
 };
 
+void Converters::pull_packets(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::size_t frames) {
+    auto& m = support_.process.calling_engine();
+    const auto size = 16 + 8 + 16ULL;
+    if (c.scratch_size < size) {
+        if (c.scratch) support_.process.release_guest(c.scratch);
+        c.scratch = support_.process.allocate_guest(size, 16);
+        c.scratch_size = size;
+    }
+    const std::size_t per_packet = c.codec_frames_per_packet ? c.codec_frames_per_packet : 1152;
+    std::size_t got_total = 0;
+    while (got_total < frames && !c.ended) {
+        const auto packets = c.scratch, descriptions = c.scratch + 8, list = c.scratch + 16;
+        const auto asked = static_cast<std::uint32_t>(std::max<std::size_t>(1, (frames - got_total + per_packet - 1) / per_packet));
+        m.write32(packets, asked);
+        m.write64(descriptions, 0);
+        m.write32(list, 1);
+        m.write32(list + 8, c.codec_channels);
+        m.write32(list + 12, 0);
+        m.write64(list + 16, 0);
+        const auto status = static_cast<std::int32_t>(call(proc, {handle, packets, list, descriptions, user_data}));
+        const auto got = std::min(m.read32(packets), asked);
+        const auto data = m.read64(list + 16);
+        const auto bytes = m.read32(list + 12);
+        const auto table = m.read64(descriptions);
+        std::vector<std::uint8_t> buffer(bytes);
+        if (bytes && data) m.read_bytes(data, buffer);
+        // The packets: by their descriptions, else the whole buffer for one, else MPEG frames.
+        std::vector<std::span<const std::uint8_t>> pieces;
+        if (got && table) {
+            for (std::uint32_t i = 0; i < got; ++i) {
+                const auto start = m.read64(table + 16ULL * i);
+                const auto length = m.read32(table + 16ULL * i + 12);
+                if (start + length > buffer.size()) break;
+                pieces.emplace_back(buffer.data() + start, length);
+            }
+        } else if (got == 1) {
+            pieces.emplace_back(buffer);
+        } else if (got && (c.codec == four(".mp1") || c.codec == four(".mp2") || c.codec == four(".mp3"))) {
+            for (std::size_t at = 0; at + 4 <= buffer.size() && pieces.size() < got;) {
+                const auto frame = mc::mpeg_frame(buffer.data() + at);
+                if (!frame.bytes || at + frame.bytes > buffer.size()) break;
+                pieces.emplace_back(buffer.data() + at, frame.bytes);
+                at += frame.bytes;
+            }
+        } else if (got) {
+            c.ended = true;
+            c.end_status = error::param;   // several packets of a variable format need descriptions
+            break;
+        }
+        std::vector<float> decoded;
+        std::vector<double> mapped(c.out.channels), frame(c.in.channels);
+        for (const auto piece : pieces) {
+            decoded.clear();
+            std::string why;
+            if (!c.decoder->decode(piece, decoded, why)) continue;   // a damaged packet is skipped
+            const auto count = decoded.size() / c.in.channels;
+            for (std::size_t f = 0; f < count; ++f) {
+                for (std::uint32_t ch = 0; ch < c.in.channels; ++ch) frame[ch] = decoded[f * c.in.channels + ch];
+                map_channels(c, frame.data(), mapped.data());
+                c.pending.insert(c.pending.end(), mapped.begin(), mapped.end());
+            }
+            c.input_frames += count;
+            got_total += count;
+        }
+        if (status || !got) {
+            c.ended = true;
+            c.end_status = status;
+        }
+    }
+}
+
 void Converters::pull_input(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::size_t frames) {
+    if (c.codec) return pull_packets(c, handle, proc, user_data, frames);
     auto& m = support_.process.calling_engine();
     const auto buffers = c.in.non_interleaved ? c.in.channels : 1U;
     // [UInt32 packets][pad][AudioStreamPacketDescription *][AudioBufferList]
@@ -205,6 +326,7 @@ std::int32_t Converters::fill(Converter& c, std::uint64_t handle, std::uint64_t 
     for (std::uint32_t b = 0; b < buffers; ++b)
         room = std::min<std::size_t>(room, m.read32(list + 8 + 16ULL * b + 4) / c.out.frame_bytes());
     if (!room) return error::invalid_output_size;
+    if (const auto result = ensure_decoder(c)) return result;
     if (!c.resampler) c.resampler = std::make_unique<Resampler>(c.in.rate, c.out.rate, c.out.channels);
     // Output frames the input received so far can make, once the input ended.
     const auto limit = [&] {
@@ -243,7 +365,21 @@ std::int32_t Converters::get_property(Converter& c, std::uint32_t id, std::vecto
     switch (id) {
     case four("acid"): out = c.in_asbd; return 0;
     case four("acod"): out = c.out_asbd; return 0;
-    case four("xips"): u32(c.in.frame_bytes() * (c.in.non_interleaved ? c.in.channels : 1)); return 0;
+    case four("dmgc"):   // kAudioConverterDecompressionMagicCookie
+        if (!c.codec) return error::property_not_supported;
+        out = c.cookie;
+        writable = true;
+        return 0;
+    case four("xips"):
+        if (c.codec) {
+            // The largest packet: an MPEG frame (free format at 640 kb/s), six Opus frames, or a
+            // FLAC block stored verbatim.
+            const auto block = c.codec_frames_per_packet ? c.codec_frames_per_packet : 65535U;
+            u32(c.codec == four("opus") ? 6 * 1275 + 7 : c.codec == four("flac") ? block * c.codec_channels * 4 + 64 : 2881);
+            return 0;
+        }
+        u32(c.in.frame_bytes() * (c.in.non_interleaved ? c.in.channels : 1));
+        return 0;
     case four("xops"): u32(c.out.frame_bytes() * (c.out.non_interleaved ? c.out.channels : 1)); return 0;
     case four("srcq"): u32(c.quality); writable = true; return 0;
     case four("srca"): u32(c.complexity); writable = true; return 0;
@@ -271,12 +407,20 @@ std::int32_t Converters::set_property(Converter& c, std::uint32_t id, std::span<
     case four("srca"): if (data.size() < 4) return error::bad_property_size; c.complexity = value; return 0;
     case four("prmm"): if (data.size() < 4) return error::bad_property_size; c.prime_method = value; return 0;
     case four("prim"): return 0;
+    case four("dmgc"):
+        if (!c.codec) return error::property_not_supported;
+        c.cookie.assign(data.begin(), data.end());
+        c.decoder.reset();   // made again, from the cookie, at the next conversion
+        c.resampler.reset();
+        c.pending.clear();
+        return 0;
     case four("chmp"):
         if (data.size() % 4) return error::bad_property_size;
         c.channel_map.resize(data.size() / 4);
         for (std::size_t i = 0; i < c.channel_map.size(); ++i) std::memcpy(&c.channel_map[i], data.data() + 4 * i, 4);
         return 0;
     case four("acid"): case four("acod"): {
+        if (c.codec && id == four("acid")) return error::property_not_supported;   // a decoder keeps its input format
         std::string why;
         const auto format = af::pcm_from_asbd(data, why);
         if (!format) return error::format_not_supported;
@@ -300,10 +444,32 @@ void Converters::install() {
         m.read_bytes(in_asbd, in);
         m.read_bytes(out_asbd, outf);
         std::string why;
-        const auto from = af::pcm_from_asbd(in, why), to = af::pcm_from_asbd(outf, why);
-        if (!from || !to) return error::format_not_supported;
+        std::uint32_t in_id{};
+        std::memcpy(&in_id, in.data() + 8, 4);
         auto made = std::make_shared<Converter>();
-        made->in = *from;
+        const auto to = af::pcm_from_asbd(outf, why);
+        if (!to) return error::format_not_supported;
+        if (in_id != four("lpcm")) {
+            // Compressed input: decoded to float, then converted like PCM.
+            if (!decodable(in_id)) return error::format_not_supported;
+            double rate{};
+            std::memcpy(&rate, in.data(), 8);
+            std::memcpy(&made->codec_flags, in.data() + 12, 4);
+            std::memcpy(&made->codec_frames_per_packet, in.data() + 20, 4);
+            std::memcpy(&made->codec_channels, in.data() + 28, 4);
+            if (!(rate > 0) || made->codec_channels == 0 || made->codec_channels > 8) return error::format_not_supported;
+            made->codec = in_id;
+            made->codec_rate = rate;
+            made->in.rate = in_id == four("opus") ? 48000 : rate;
+            made->in.channels = made->codec_channels;
+            made->in.is_float = true;
+            made->in.bits = 32;
+            made->in.container = 4;
+        } else {
+            const auto from = af::pcm_from_asbd(in, why);
+            if (!from) return error::format_not_supported;
+            made->in = *from;
+        }
         made->out = *to;
         made->in_asbd = in;
         made->out_asbd = outf;
@@ -342,6 +508,7 @@ void Converters::install() {
         std::lock_guard lock(c->mutex);
         c->resampler.reset();
         c->pending.clear();
+        if (c->decoder) c->decoder->reset();
         c->input_frames = c->output_frames = 0;
         c->ended = false;
         c->end_status = 0;
@@ -402,7 +569,8 @@ void Converters::install() {
         if (!c) return status(s, error::param);
         if (!s.x[2] || !s.x[3]) return status(s, error::param);
         std::lock_guard lock(c->mutex);
-        if (c->in.rate != c->out.rate) return status(s, error::invalid_input_size);
+        // Packets need AudioConverterFillComplexBuffer, as rate changes do.
+        if (c->codec || c->in.rate != c->out.rate) return status(s, error::invalid_input_size);
         const auto frames = static_cast<std::uint32_t>(s.x[1]);
         std::int32_t result = 0;
         const auto samples = self->decode_list(m, c->in, s.x[2], frames, result);
@@ -418,7 +586,7 @@ void Converters::install() {
         if (!c) return status(s, error::param);
         if (!s.x[2] || !s.x[3] || !s.x[4]) return status(s, error::param);
         std::lock_guard lock(c->mutex);
-        if (c->in.rate != c->out.rate || c->in.non_interleaved || c->out.non_interleaved) return status(s, error::invalid_input_size);
+        if (c->codec || c->in.rate != c->out.rate || c->in.non_interleaved || c->out.non_interleaved) return status(s, error::invalid_input_size);
         const auto in_bytes = static_cast<std::uint32_t>(s.x[1]);
         if (in_bytes % c->in.frame_bytes()) return status(s, error::invalid_input_size);
         const auto frames = in_bytes / c->in.frame_bytes();

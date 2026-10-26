@@ -1,0 +1,121 @@
+# dav1d (vendored)
+
+| Field | Value |
+| --- | --- |
+| Project | dav1d, the VideoLAN AV1 decoder |
+| Upstream | <https://code.videolan.org/videolan/dav1d> |
+| Tag | `1.5.4` (release tarball) |
+| Commit | `54706fc6bc0cdecab7e9593974a4039cc038fca7` |
+| Archive | <https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz>, SHA-256 `686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5` (1,038,852 bytes; matches VideoLAN's `.sha256`) |
+| License | BSD-2-Clause (`COPYING`, copied verbatim, with `THANKS.md`) |
+| Files | The C sources of `src/meson.build`'s `libdav1d_sources` and `libdav1d_tmpl_sources` (no assembly or architecture-specific files), `src/win32/thread.c` (the Windows thread layer meson adds), `include/compat/msvc/stdatomic.h`, and the headers they include, byte-identical to the archive above (`.gitattributes` keeps them out of end-of-line conversion) |
+| Modifications | none |
+
+Use: AV1 decoding for `src/alchemy/darwin/media/media_codecs.cpp`, built by `cmake/darwin/media_codecs.cmake` as the static libraries `alchemy_dav1d`, `alchemy_dav1d_8` and `alchemy_dav1d_16`, single-threaded.
+
+## Build lists (`config/`, not upstream files)
+
+`config/sources.txt` and `config/tmpl_sources.txt` copy those two meson lists; the template sources are compiled once with `BITDEPTH=8` and once with `BITDEPTH=16`, as meson does. `config.h` and `vcs_version.h` are written into the build tree by `cmake/darwin/media_codecs.cmake` (no assembly, every `ARCH_*` 0, 8 and 16 bits per component, logging off).
+
+To update: download the new release from the upstream above, check its published hash, copy the same set of files with the vendoring rules above, and update this file, the hashes and `THIRD_PARTY_NOTICES.md`.
+
+SHA-256 of the vendored files:
+
+```
+dd92c3c2247c5651606fc23a5e2d6a1ebc5ace9a3e49cbde0e12f05ad1cb1ee5  COPYING
+82a263143bc882a628922140cc57671fd4d9f52130f46fe2ec84da9485e0a6ed  THANKS.md
+2c7509071ef671f50fb71301ee7f75330ede644e6309c80127edf6547fed79ae  include/common/attributes.h
+f8b65130312ab0e3bd992e5a26a36af97e08c7b2cf1483ff06116c29349634ee  include/common/bitdepth.h
+c57cc0b5176a85d428afd91b88c1b4af31d47093750eb8a2447bf8d34efb3a65  include/common/dump.h
+a627556807fd5fe2cd4a893cafaf73cb92d97b7bb807ef8d862f871431fae481  include/common/frame.h
+14870a37287dd9758c4c2e80ba8d80f1942d0e454f686d050492d8e733fbffd5  include/common/intops.h
+5fd418f79f1f97208cca0b25d5231570e5f46732474a48970249710fce90143b  include/common/validate.h
+ea432d173d85546b732867f4ae40a34b71087fbc0d354970c3beadd9a3d5993c  include/compat/msvc/stdatomic.h
+ad1524155895b430df57b1b418564995999af8c1712fadd3b9708c3672413937  include/dav1d/common.h
+283e79ba35c3f90083d68f729a82a3d3625945c0776de5e87b4c081f0296a529  include/dav1d/data.h
+dbc211a0f5480d8c38877dc18380fbd7cd6bb8375ac49a599e0c6e5f5e3ae15e  include/dav1d/dav1d.h
+3349f02ca7ebc5a09d9a623f83b820769903f86313638a9277b930cdd8071fe8  include/dav1d/headers.h
+66680595e5c6686395073ce55a5dc123369daa7d2f2a0c6df9a13ce8cfb57e17  include/dav1d/picture.h
+ee63fe5d8bba3a84ed9e57360ea593dbd81c7e9b731e2e02ca2724f813b89fdd  include/dav1d/version.h
+0798bd9d927604648c75d14c34658b458cd54ee85aaef17695875d97bb1ae29a  src/cdef.h
+102a7e5fcb45d1e6bc40ff78482b3a7183da6003b1333b767091f0468cfe663a  src/cdef_apply.h
+ab485983a776086a2e5427fe79315ed8393e5cd06dbb4b154673376dcc1e4a72  src/cdef_apply_tmpl.c
+28c0d5f8a5d60d4822483211f9e61e57af4a7d053ef5dea7484415e01d193bdd  src/cdef_tmpl.c
+a8e91970a39b1a0985cacba1f10ed7f7ad2e347275f80c078e227c26b667ef5d  src/cdf.c
+90780bcb5fda2d675225de971e502c800be2895b5629ca428e3ddafa239e5c31  src/cdf.h
+20193d4ed61e05106bcbdc2fed64fe7435ea3bf7108fcd5433a375716b13af9f  src/cpu.c
+6008dac757c9f6c61181da03747630e0a8a50b6dcfbe0656526d0c7540b05dca  src/cpu.h
+a0e143b39b10bf4fb31c850caa541473d5656fbea6d555616d57f57882fa3da3  src/ctx.c
+99a395a44b63a5fc676d5180221a468c5ba05853e2d350ca4812f55785a064a3  src/ctx.h
+031cb6cecfdbedb557a89ef9ecfbb75c1185360a7895389275f3aef970e0301a  src/data.c
+b55d78f2f76eee184ac27d5378857a294ca11491112739678c4dd1787c06ee75  src/data.h
+3ff801271cb7d810da3863c3f96ec3ad190f2e482df4fc69d2034831472761ac  src/decode.c
+c40154cc0d82c7d5ccdc812d1eaac927dfd13b4bf6e844427367653be54dba68  src/decode.h
+99515aa3c0c9a2451f95ba442c43fd8ffb08c113bab40b2cfba414460f64b149  src/dequant_tables.c
+8356f7ef81a707df67f561201069fe1590f132a5d1df41d99e970ef571332c5c  src/dequant_tables.h
+236980030d5ebddb59bd669a2070940638f738782efa3895015376df58e7fe15  src/env.h
+7529fe5e8ece675c15861f5ce4755bc430bde8409cba9acc84b837adec7de4d3  src/fg_apply.h
+b3359366a32e8ec895f519dfe9a6170e3b8c8574da56a32eb9db84a5deb79a68  src/fg_apply_tmpl.c
+b496bd95464433e70919a5b68a707f7ead1f0a45768dd81b73eea0afd6e5b28a  src/filmgrain.h
+c86e3f21d9e07736b505330087ce9576a1c7b86cab3731e8cd52c97d7ff3703a  src/filmgrain_tmpl.c
+a451cc1afc981fb350bc7dc5f4c606e75c671ada3d2341a71612d54bf1dfc353  src/getbits.c
+82c13c3f9d54cf7b71ec02aae2b169f29a540c763f99c0532183a357cf6fc5a3  src/getbits.h
+f4eebbbf726f974a14b79f93f31553cfbacdcf676b0c84103e79937cb25bd3ee  src/internal.h
+51277e3071ec406a661ae7e6e225385ba1a0e8bd80c24ca90a124a7769984427  src/intra_edge.c
+e2108bbd9f3bbbb17b283deddb0dd32df18152a748ea4a40b22d850608f5e43c  src/intra_edge.h
+9e849cd113e3b7758aa51e158d4f1faf5bc23fcee8bb376cce9ae6c96a3c1267  src/ipred.h
+cf539bd5b59f08d4eff10d9a79499b000ee2ead8d9b57e04d95988c202f0bdb0  src/ipred_prepare.h
+c82de03f25e95f9051e30326edb3f7be31e7ab4223715edf090544a649cace10  src/ipred_prepare_tmpl.c
+0dd3847bb7304f414a337048a4db6583b5da3a5e59ecf49d71cec2f079150c54  src/ipred_tmpl.c
+466f3d9052d2a4a48789251670c7ce3b7e4713c3c8c4e3e9ef3d19ec9a68e266  src/itx.h
+4ed8496ace29ed539a20687e7c404a26a991765606e2318ba1de5888c195f1d2  src/itx_1d.c
+2c2addda6c21c862d2f039412ecba79565109dad6ac25c6667764dbf31f76642  src/itx_1d.h
+de70eab32717e13de6d2baa9a0210972ad6264783a9cb5aca7252b4f0720a327  src/itx_tmpl.c
+098f40ddfcdc452338bbbb292d8fd21cac2a5bac9553597f100a998d8ade1260  src/levels.h
+9c9c97b42953337f8a35b4dd55dda5565c6118625ae332ff2ec1497ed6ebe3c5  src/lf_apply.h
+0d996d9c824c3821ef970b963449adcebd97d18c92679f25c9133198070c2f4e  src/lf_apply_tmpl.c
+565f97b504c1dfc898254593b218f80c14c8664789f262bfd53766be177ea1ac  src/lf_mask.c
+a478dc5f0d4efe97b708db8ef382df276f8bd4c0ee9898faaf5758162e6cbb67  src/lf_mask.h
+0f3cf72a63e9bf8393ab47553c98d4631f6350f90c54e560019ce065d71f8608  src/lib.c
+f3a5a9c6bc82feffdcb620b5b6135b6d52b0e3a9e7748fb023c9b59ea5a0d7ea  src/log.c
+6ea103ec16cb901eaea578f0ea8674d2422bc440cea0d496886307667098e44d  src/log.h
+672afc531846468fb73a6a76b10294b1835c4ef576186c4c0922c9f8c3e94983  src/loopfilter.h
+986f1ecf8511d71b98651b34dc4070fa7fdbe6611c79aaff883996145d72c56a  src/loopfilter_tmpl.c
+3ecea476f7fab2e02fdd274ec342369596cc1c366454cb6dbffd00fa2fa71549  src/looprestoration.h
+153dc1f16869f05f6b9317b57a25c22c204f8593082d70aef5f1d7762d793cf6  src/looprestoration_tmpl.c
+c108b79d705e2238df9e67847d69e8828bfbb2927a058cbafc90362785650de4  src/lr_apply.h
+84463ce17200ca8acc34e3752757c1a417b918731cbc817a4507498f7e8ebeea  src/lr_apply_tmpl.c
+5d8dee8b2b3ee563a82ee0b5ee5ed7c5cb201c362a590d3c01f5a4376bab5498  src/mc.h
+cbd892542db6e4e0ddf27eb7eaa29fc8cfbd5c2418bebc640415b293897fb7a4  src/mc_tmpl.c
+6b2824cea459be669aeaa9279cd855161e70388bfb084980649c9ef7a824f800  src/mem.c
+f4b9be308b6a310af5bd28330589343a5fcf29848140d5bae38a6f71d7366174  src/mem.h
+75b414dde710ce98b10aae347247ce27f12082c67b95da3303041e0ccd85ae28  src/msac.c
+f547c86af82a1b1d671d7e6a30f3fe11ad741abab88e15cbc8f557cb66b2b878  src/msac.h
+965692214aa625e43a14d739081cdc5959abfb0e918d38b81e1116d166114587  src/obu.c
+a68b53a4441437c83eb2ace6672f8ffe1fe4c42220ec25f302a4c98cfdfccdde  src/obu.h
+69750f4eb2a4cfb009da64bf7af276b8823588eab2ee4f3a09b85a7c3dc1d126  src/pal.c
+ee65510a5547b1479fca59aa44699e6c7d46191440648155108db83caca2da81  src/pal.h
+b836ed741934c4cf5244d2aaf5a5325efd73ee95eaf6ee1f03cb6717151967bd  src/picture.c
+f1c1780c41970b8d80139f1ded52aee62584f3aff145b0edae9023032d5d5b03  src/picture.h
+3401e6d07323d78f5f7e0e3e43c7ba0674e5b404618562cce14ef250ddbe7c08  src/qm.c
+72fe6e0cdb8d112d4c8c9875ab55f8f598a383f725e6c835ab8bf4c95fe97e67  src/qm.h
+3d99fec0f2c325198f222aa8d5ec0fb3948dc3c9a8fc77545b1780b69ef5c496  src/recon.h
+c398aca47e59eaba6959a3ca1c8ec04358c94f19663efc73068e6ddaaf07b9bf  src/recon_tmpl.c
+daf137a54bd095205db3a7616e743a0e8ce3506aac5ab78f211f5e3c7a5aeaaf  src/ref.c
+c03e37fba41510c3c24a5b0158f5597378e05493ba7068e1d8d9c5eca1d36f18  src/ref.h
+47730d594f25dee43719d463bb6ba1b2c2d888bdda59f2f5b5cd6ea9ce6b639a  src/refmvs.c
+ddd369c34cddc6ff9e3c895426e1b98f874e6659340c9185f124865c2f76c2bb  src/refmvs.h
+d50d8de18935bb26df64e4ffa78ac516b8ceb7d6bb96c7273a9297ac841a8e6c  src/scan.c
+d0aed3e04003938986ed13e7e094b37f864a743073e936379f607e5d1e3f885c  src/scan.h
+b23b731c5fa283ca6769058bd63e578bd09634b89a6111391943debba27d4730  src/tables.c
+5658e6859189d92a7c5340069606d729552c7b6347cd6f6246372b264e9ff418  src/tables.h
+0ee270700612aee5310be50e2216d07bbf1acc9c0c242f07da17e345cf132b32  src/thread.h
+80c92870d6f7bc0ff05a7f423632dab24dcf3c11321143286ac8061597c46ca9  src/thread_data.h
+562f68abacdd92246e1b1cb66f9a7edb9f0a2ac6136257d1d8b7ed2763b8d744  src/thread_task.c
+df3fcc3b8b8b4597333c6dbcc6c7a3a6f9a42319bd5536e1a37c3bb0b78b979f  src/thread_task.h
+db7eab1ea1dc6836ed9a29693ec64d581f8330ccf36eed00d6f6bffd0f4be2d4  src/warpmv.c
+747e98bf8eb8d6de1cd1550cca1c4ed0c511385cdfc6d7710b4f4c1e7b8c363d  src/warpmv.h
+b39451deb7f1b8939f3a9ec9c62463e9991a8172ce789266966543f4c13064f4  src/wedge.c
+1c7686535aa4e088c36a9c940b9642d099037ecf198f83e755be45c1715f6593  src/wedge.h
+641d516dbc50bbffb6153a9098728b725da32f124c9c0cf5d120bc4e6892a2a7  src/win32/thread.c
+```
