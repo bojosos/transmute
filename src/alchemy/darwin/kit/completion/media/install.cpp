@@ -1,3 +1,4 @@
+#include "alchemy/darwin/media/avaudio.hpp"
 #include "alchemy/darwin/media/media_support.hpp"
 
 // QLab gap group G5 (media): AVFoundation, AudioToolbox (MusicPlayer/ExtAudioFile/AU listeners), AudioUnit, CoreMIDI, CoreMedia, CoreVideo, Accelerate.
@@ -17,10 +18,18 @@ void install_group_media(Support& support) {
     ProcessContext::add_provider_library("/System/Library/Frameworks/AudioVideoBridging.framework/Versions/A/AudioVideoBridging");
     media::install_core_midi(support);
     media::install_hal(support);
+    media::install_audio_units(support);
+    media::install_audio_converter(support);
+    media::install_audio_queue(support);
+    media::install_audio_format(support);
     media::install_music(support);
     media::install_audio_file(support);
     media::install_au_listeners(support);
     media::install_av_foundation(support);
+    // AVFAudio's buffers, files, player and engine use AVAudioFormat (install_av_foundation).
+    media::avaudio::install_avaudio_buffers(support);
+    media::avaudio::install_avaudio_player(support);
+    media::avaudio::install_avaudio_engine(support);
 }
 
 } // namespace alchemy::gui::completion_kit
