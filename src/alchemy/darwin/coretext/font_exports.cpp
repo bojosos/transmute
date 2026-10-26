@@ -205,13 +205,19 @@ void install_font_exports(Quartz& q) {
         const auto value = [&](std::string_view key) { return quartz->dictionary_get(attributes, key); };
         if (size <= 0) size = quartz->number(value("NSFontSizeAttribute")).value_or(12);
         std::optional<ResolvedFont> resolved;
-        if (const auto name = value("NSFontNameAttribute")) {
-            resolved = resolve_font(quartz->cf.utf8(name));
-            // A font file's descriptor (CTFontManagerCreateFontDescriptorsFromURL): the file is registered now.
-            if (const auto url = value("NSCTFontFileURLAttribute"); !resolved && url &&
-                register_file(*quartz, quartz->cf.url_path(url), nullptr) != Registration::unreadable)
-                resolved = resolve_font(quartz->cf.utf8(name));
+        // A font file's descriptor (CTFontManagerCreateFontDescriptorsFromURL): that
+        // file's first face, even when an installed font has the same name; the
+        // file is registered now.
+        if (const auto url = value("NSCTFontFileURLAttribute")) {
+            const auto path = quartz->cf.url_path(url);
+            const auto bytes = register_file(*quartz, path, nullptr) == Registration::unreadable ? std::nullopt : quartz->read_file(path);
+            if (const auto file_font = bytes ? host::gpu::font_from_data(*bytes) : host::Result<host::gpu::Font>(host::Error::not_found)) {
+                auto face = face_from(*file_font, host::gpu::registered_fonts());
+                resolved = ResolvedFont{face, face->postscript, face->family, face->full_name};
+            }
         }
+        if (!resolved)
+            if (const auto name = value("NSFontNameAttribute")) resolved = resolve_font(quartz->cf.utf8(name));
         if (!resolved)
             if (const auto family = value("NSFontFamilyAttribute")) resolved = resolve_font(quartz->cf.utf8(family));
         if (!resolved) resolved = resolve_font(".AppleSystemUIFont");

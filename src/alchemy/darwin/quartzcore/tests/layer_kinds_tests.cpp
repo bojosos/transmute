@@ -213,7 +213,7 @@ void replicas_geometry_scrolling(Fixture& f) {
 
     // Geometry between layers.
     const auto root = f.make("CALayer");
-    f.reals(root, "setBounds:", {0, 0, 200, 200});
+    f.reals(root, "setFrame:", {0, 0, 200, 200});   // hitTest: points are in the superlayer's space
     const auto child = f.make("CALayer");
     f.reals(child, "setFrame:", {50, 60, 20, 20});
     static_cast<void>(f.id(root, "addSublayer:", {child}));

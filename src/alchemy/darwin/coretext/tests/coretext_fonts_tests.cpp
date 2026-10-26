@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 
 namespace {
 using namespace fill_test;
@@ -35,6 +37,49 @@ std::uint16_t unit(Fixture& f, Address at) { return static_cast<std::uint16_t>(f
 double real(Fixture& f, Address at) { return std::bit_cast<double>(f.engine.read64(at)); }
 std::string text(Fixture& f, Address string) { return string ? f.cf.utf8(string) : std::string("(null)"); }
 
+// The 'post' table's version (0x00020000: glyph names; 0x00030000: none), or 0.
+std::uint32_t post_version(Fixture& f, Address font) {
+    const auto table = f.call(ct, "_CTFontCopyTable", {font, 0x706f7374, 0});
+    if (!table || f.call(core_foundation, "_CFDataGetLength", {table}) < 4) return 0;
+    const auto word = f.engine.read64(f.call(core_foundation, "_CFDataGetBytePtr", {table}));
+    return static_cast<std::uint32_t>(((word & 0xff) << 24) | ((word & 0xff00) << 8) | ((word >> 8) & 0xff00) | ((word >> 24) & 0xff));
+}
+// A copy of a TrueType file whose 'post' table is rewritten to format 2.0: glyph 3
+// "space" and glyph 36 "A" (standard Macintosh names), glyph 5 "custom.five", the
+// rest ".notdef". The new table is appended; checksums are not updated.
+void write_named_copy(const std::filesystem::path& from, const std::filesystem::path& to) {
+    std::ifstream in(from, std::ios::binary);
+    std::vector<std::uint8_t> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto be16 = [&](std::size_t at) { return (std::uint32_t{d.at(at)} << 8) | d.at(at + 1); };
+    const auto be32 = [&](std::size_t at) { return (be16(at) << 16) | be16(at + 2); };
+    const auto put16 = [](std::vector<std::uint8_t>& v, std::size_t at, std::uint32_t x) {
+        v.at(at) = static_cast<std::uint8_t>(x >> 8);
+        v.at(at + 1) = static_cast<std::uint8_t>(x);
+    };
+    const auto put32 = [&](std::vector<std::uint8_t>& v, std::size_t at, std::uint32_t x) { put16(v, at, x >> 16); put16(v, at + 2, x & 0xffff); };
+    std::size_t post_entry{}, glyphs{};
+    for (std::size_t i = 0, n = be16(4); i < n; ++i) {
+        const auto entry = 12 + 16 * i;
+        if (be32(entry) == 0x706f7374) post_entry = entry;                    // 'post'
+        if (be32(entry) == 0x6d617870) glyphs = be16(be32(entry + 8) + 4);   // 'maxp' numGlyphs
+    }
+    require(post_entry && glyphs > 36, "the font has post and maxp tables");
+    const auto offset = be32(post_entry + 8);
+    std::vector<std::uint8_t> post(d.begin() + offset, d.begin() + offset + 32);
+    put32(post, 0, 0x00020000);
+    post.resize(34 + 2 * glyphs);
+    put16(post, 32, static_cast<std::uint32_t>(glyphs));
+    for (std::size_t g = 0; g < glyphs; ++g) put16(post, 34 + 2 * g, g == 3 ? 3 : g == 36 ? 36 : g == 5 ? 258 : 0);
+    const std::string custom = "custom.five";
+    post.push_back(static_cast<std::uint8_t>(custom.size()));
+    post.insert(post.end(), custom.begin(), custom.end());
+    while (d.size() % 4) d.push_back(0);
+    put32(d, post_entry + 8, static_cast<std::uint32_t>(d.size()));
+    put32(d, post_entry + 12, static_cast<std::uint32_t>(post.size()));
+    d.insert(d.end(), post.begin(), post.end());
+    while (d.size() % 4) d.push_back(0);
+    std::ofstream(to, std::ios::binary).write(reinterpret_cast<const char*>(d.data()), static_cast<std::streamsize>(d.size()));
+}
 Address font_named(Fixture& f, std::string_view name, double size) {
     alchemy::CallRegs registers{};
     registers.x[0] = f.cf.string(name);
@@ -50,30 +95,42 @@ Address descriptor_named(Fixture& f, std::string_view name) {
 Address array(Fixture& f, std::vector<Address> values) { return f.cf.array(values); }
 
 const Case coretext_fonts_case("coretext_fonts", [](Fixture& f) {
-    // ---- glyph names: Helvetica's stand-in is a TrueType face with a format 2.0 'post' table ----
-    const auto font = font_named(f, "Helvetica", 12);
-    const auto characters = f.block(8), glyphs = f.block(8);
-    f.engine.write64(characters, 'A' | (std::uint64_t{' '} << 16));   // UTF-16 "A "
-    require((f.call(ct, "_CTFontGetGlyphsForCharacters", {font, characters, glyphs, 2}) & 0xff) == 1, "glyphs for A and space");
-    const auto a = unit(f, glyphs), space = unit(f, glyphs + 2);
-    require(text(f, f.call(ct, "_CTFontCopyNameForGlyph", {font, a})) == "A" && text(f, f.call(ct, "_CTFontCopyNameForGlyph", {font, space})) == "space",
-            "glyph names from the post table");
-    require(f.call(ct, "_CTFontGetGlyphWithName", {font, f.cf.string("A")}) == a &&
-                f.call(ct, "_CTFontGetGlyphWithName", {font, f.cf.string("no.such.glyph")}) == 0, "glyphs by name");
-    require((f.send(font, "glyphWithName:", {f.cf.string("space")}) & 0xffff) == space, "-[NSFont glyphWithName:]");
-    const auto graphics = f.call(ct, "_CTFontCopyGraphicsFont", {font, 0});
-    require(f.call(cg, "_CGFontGetGlyphWithGlyphName", {graphics, f.cf.string("A")}) == a &&
-                text(f, f.call(cg, "_CGFontCopyGlyphNameForGlyph", {graphics, a})) == "A", "CGFont glyph names");
-    require((f.call(ct, "_CTFontHasTable", {font, 0x706f7374}) & 0xff) == 1 && (f.call(ct, "_CTFontHasTable", {font, 0x7a7a7a7a}) & 0xff) == 0,
-            "CTFontHasTable");
-
-    // ---- the font manager: a copy of a system font file ----
+    // ---- glyph names: Windows' faces carry 'post' format 3.0 (no names), so a copy of
+    // Arial gets a format 2.0 table, made from its descriptor (the file's own face) ----
     const std::filesystem::path system_font = "C:/Windows/Fonts/arial.ttf";
     require(std::filesystem::exists(system_font), "the test needs C:/Windows/Fonts/arial.ttf");
     const auto directory = std::filesystem::temp_directory_path() / "alchemy_coretext_fonts";
     std::error_code ignored;
     std::filesystem::remove_all(directory, ignored);
     std::filesystem::create_directories(directory);
+    write_named_copy(system_font, directory / "named.ttf");
+    const auto named = f.call(ct, "_CTFontManagerCreateFontDescriptorsFromURL", {f.cf.file_url(alchemy::guest_path_string(directory / "named.ttf"), false)});
+    require(named && f.cf.array_values(named).size() == 1, "a descriptor of the named copy");
+    alchemy::CallRegs create{};
+    create.x[0] = f.cf.array_values(named)[0];
+    create.set_d(0, 12);
+    const auto font = f.regs(ct, "_CTFontCreateWithFontDescriptor", create).x0;
+    require(post_version(f, font) == 0x00020000, "the font is the file's face, not the installed Arial");
+    const auto characters = f.block(8), glyphs = f.block(8);
+    f.engine.write64(characters, 'A' | (std::uint64_t{' '} << 16));   // UTF-16 "A "
+    require((f.call(ct, "_CTFontGetGlyphsForCharacters", {font, characters, glyphs, 2}) & 0xff) == 1, "glyphs for A and space");
+    const auto a = unit(f, glyphs), space = unit(f, glyphs + 2);
+    require(a == 36 && space == 3, "Arial's glyphs for A and space");
+    require(text(f, f.call(ct, "_CTFontCopyNameForGlyph", {font, a})) == "A" && text(f, f.call(ct, "_CTFontCopyNameForGlyph", {font, space})) == "space" &&
+                text(f, f.call(ct, "_CTFontCopyNameForGlyph", {font, 5})) == "custom.five", "glyph names from the post table");
+    require(f.call(ct, "_CTFontGetGlyphWithName", {font, f.cf.string("A")}) == a && f.call(ct, "_CTFontGetGlyphWithName", {font, f.cf.string("custom.five")}) == 5 &&
+                f.call(ct, "_CTFontGetGlyphWithName", {font, f.cf.string("no.such.glyph")}) == 0, "glyphs by name");
+    require((f.send(font, "glyphWithName:", {f.cf.string("space")}) & 0xffff) == space, "-[NSFont glyphWithName:]");
+    const auto graphics = f.call(ct, "_CTFontCopyGraphicsFont", {font, 0});
+    require(f.call(cg, "_CGFontGetGlyphWithGlyphName", {graphics, f.cf.string("A")}) == a &&
+                text(f, f.call(cg, "_CGFontCopyGlyphNameForGlyph", {graphics, 5})) == "custom.five", "CGFont glyph names");
+    // An installed face with a format 3.0 'post' table names no glyphs.
+    const auto installed = font_named(f, "Helvetica", 12);
+    if (post_version(f, installed) == 0x00030000) require(f.call(ct, "_CTFontCopyNameForGlyph", {installed, 3}) == 0, "a face without glyph names");
+    require((f.call(ct, "_CTFontHasTable", {font, 0x706f7374}) & 0xff) == 1 && (f.call(ct, "_CTFontHasTable", {font, 0x7a7a7a7a}) & 0xff) == 0,
+            "CTFontHasTable");
+
+    // ---- the font manager: a copy of a system font file ----
     std::filesystem::copy_file(system_font, directory / "copy.ttf");
     std::ofstream(directory / "not-a-font.txt") << "plain text";
     const auto url = f.cf.file_url(alchemy::guest_path_string(directory / "copy.ttf"), false);
