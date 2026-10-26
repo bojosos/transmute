@@ -9,6 +9,8 @@
 
 // Foundation's install entries (install.hpp), each the files of one old
 // aggregator position, in their old order.
+namespace alchemy::gui::completion_kit { void install_streams(Support& support); }   // streams.cpp
+
 namespace alchemy::gui {
 
 void install_foundation_associated_objects(support_kit::Support& support) { support_kit::install_objc_associations(support); }
@@ -74,6 +76,7 @@ void install_foundation_kvc_collections_and_queues(support_kit::Support& support
 }
 
 void install_foundation_files_and_bundles(support_kit::Support& support) {
+    completion_kit::install_streams(support);
     completion_kit::install_files(support);
     completion_kit::install_bundles(support);
 }

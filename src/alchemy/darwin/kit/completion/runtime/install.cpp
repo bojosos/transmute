@@ -18,7 +18,8 @@
 //   bindings.cpp          Cocoa bindings, NSObjectController, NSArrayController, _NSManagedProxy
 //   kvc_collections.cpp   -mutableArrayValueForKey: proxies
 //   notification_queue.cpp NSNotificationQueue, NSProcessInfo automatic termination
-//   process_io.cpp        NSFileHandle, NSPipe, NSTask, NSStream/NSInputStream
+//   process_io.cpp        NSFileHandle, NSPipe, NSTask
+//   streams.cpp           NSStream, NSInputStream, NSOutputStream and CFStream (darwin/foundation/)
 //   files.cpp             NSFileManager additions, NSDirectoryEnumerator
 //   bundles.cpp           NSBundle additions, CFBundleCopyInfoDictionaryInDirectory
 //   system_c.cpp          libSystem/CoreFoundation/Foundation/ServiceManagement C interfaces (OSAtomic, asl, termios, CFMessagePort, ...)

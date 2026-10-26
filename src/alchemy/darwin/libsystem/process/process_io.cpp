@@ -2,7 +2,7 @@
 
 #include <map>
 
-// NSFileHandle, NSPipe, NSTask and NSInputStream (Foundation) over the guest
+// NSFileHandle, NSPipe and NSTask (Foundation) over the guest
 // libSystem's descriptors and processes (docs/ALCHEMY_PROCESS.md): every
 // operation is the libSystem call a Darwin Foundation would make, so files,
 // pipes, /dev/null and child processes behave as the emulated libSystem
@@ -31,8 +31,7 @@
 // -waitUntilExit runs the current run loop until the task exits.
 // -terminate/-interrupt/-suspend/-resume send SIGTERM/SIGINT/SIGSTOP/SIGCONT.
 //
-// NSInputStream: file and data streams opened, read and closed
-// synchronously; scheduling a stream on a run loop fails explicitly.
+// NSStream, NSInputStream and NSOutputStream are Foundation's (darwin/foundation/streams.cpp).
 namespace alchemy::gui::completion_kit {
 namespace {
 
@@ -60,21 +59,10 @@ struct TaskState final : ObjectPayload {
     bool launched{}, running{};
 };
 
-struct StreamState final : ObjectPayload {
-    std::mutex mutex;
-    std::int32_t descriptor{-1};
-    std::string path;
-    std::vector<std::uint8_t> data;   // data streams
-    std::size_t offset{};
-    std::uint64_t status{};           // NSStreamStatus: 0 not open, 2 open, 5 at end, 6 closed, 7 error
-    Address error{};                  // +1
-    bool file{};
-};
-
 struct Io {
     explicit Io(Support& value) : support(value) {}
     Support& support;
-    Address handle_class{}, pipe_class{}, task_class{}, stream_class{}, input_stream_class{};
+    Address handle_class{}, pipe_class{}, task_class{};
     Address main_entry{}, worker_entry{};
     std::mutex mutex;
     std::map<Address, std::function<void()>> work;   // dispatch_async_f contexts
@@ -362,13 +350,6 @@ struct Io {
             });
         });
         return 0;
-    }
-
-    // ---- NSInputStream ----
-    std::shared_ptr<StreamState> stream_of(Address object) {
-        auto state = support.objc.find_host_state<StreamState>(object);
-        if (!state) fail("NSInputStream is not initialized");
-        return state;
     }
 };
 
@@ -784,93 +765,6 @@ void install_process_io(Support& support) {
             block_release(self->support, std::exchange(state->termination_handler, 0));
         }
         static_cast<void>(self->support.objc.send_super(s.x[0], task, self->support.objc.selector("dealloc")));
-    }, "v@:");
-
-    // ---- NSStream / NSInputStream ----
-    const auto stream = self->stream_class = support.objc.find_class("NSStream") ? support.objc.find_class("NSStream")
-                                                                                : support.declare_class("NSStream", "NSObject", foundation_library);
-    const auto input = self->input_stream_class = support.declare_class("NSInputStream", "NSStream", foundation_library);
-    support.method(input, "initWithFileAtPath:", [self](CpuState& s, GuestMemory&) {
-        const auto state = self->support.objc.host_state<StreamState>(s.x[0]);
-        state->file = true;
-        state->path = text(self->support, s.x[2]);
-    }, "@@:@");
-    support.method(input, "initWithURL:", [self](CpuState& s, GuestMemory&) {
-        const auto state = self->support.objc.host_state<StreamState>(s.x[0]);
-        state->file = true;
-        state->path = s.x[2] ? self->support.cf.url_path(s.x[2]) : std::string{};
-    }, "@@:@");
-    support.method(input, "initWithData:", [self](CpuState& s, GuestMemory&) {
-        const auto state = self->support.objc.host_state<StreamState>(s.x[0]);
-        state->data = s.x[2] ? self->bytes_of(s.x[2]) : std::vector<std::uint8_t>{};
-    }, "@@:@");
-    for (const auto& [name, init] : std::array<std::pair<const char*, const char*>, 3>{{
-             {"inputStreamWithFileAtPath:", "initWithFileAtPath:"}, {"inputStreamWithURL:", "initWithURL:"}, {"inputStreamWithData:", "initWithData:"}}})
-        support.method(input, name, [self, init = std::string(init)](CpuState& s, GuestMemory&) {
-            s.x[0] = autoreleased(self->support, self->support.send_id(self->support.send_id(s.x[0], "alloc"), init, {s.x[2]}));
-        }, "@@:@", true);
-    support.method(stream, "open", [self](CpuState& s, GuestMemory&) {
-        const auto state = self->stream_of(s.x[0]);
-        std::lock_guard lock(state->mutex);
-        if (state->status != 0) return;
-        if (state->file) {
-            const auto fd = self->open_path(state->path, o_rdonly);
-            if (fd < 0) {
-                state->status = 7;
-                state->error = objc_retain(self->support, self->posix_error(guest_errno(self->support)));
-                return;
-            }
-            state->descriptor = fd;
-        }
-        state->status = 2;
-    }, "v@:");
-    support.method(stream, "close", [self](CpuState& s, GuestMemory&) {
-        const auto state = self->stream_of(s.x[0]);
-        std::lock_guard lock(state->mutex);
-        if (state->descriptor >= 0) static_cast<void>(self->sys("_close", {static_cast<Address>(state->descriptor)}));
-        state->descriptor = -1;
-        state->status = 6;
-    }, "v@:");
-    support.method(stream, "streamStatus", [self](CpuState& s, GuestMemory&) { s.x[0] = self->stream_of(s.x[0])->status; }, "Q@:");
-    support.method(stream, "streamError", [self](CpuState& s, GuestMemory&) { s.x[0] = self->stream_of(s.x[0])->error; }, "@@:");
-    support.method(stream, "propertyForKey:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:@");   // no stream properties are kept
-    support.method(stream, "scheduleInRunLoop:forMode:", [](CpuState&, GuestMemory&) {
-        unsupported("-[NSStream scheduleInRunLoop:forMode:] (run-loop stream events)");
-    }, "v@:@@");
-    support.method(stream, "removeFromRunLoop:forMode:", [](CpuState&, GuestMemory&) {}, "v@:@@");
-    support.method(input, "read:maxLength:", [self](CpuState& s, GuestMemory& m) {
-        const auto state = self->stream_of(s.x[0]);
-        std::lock_guard lock(state->mutex);
-        if (state->status != 2) { s.x[0] = static_cast<Address>(-1); return; }
-        if (!state->file) {
-            const auto count = std::min<std::size_t>(s.x[3], state->data.size() - state->offset);
-            if (count) m.write_bytes(s.x[2], std::span(state->data.data() + state->offset, count));
-            state->offset += count;
-            if (state->offset == state->data.size()) state->status = 5;
-            s.x[0] = count;
-            return;
-        }
-        const auto count = self->sys("_read", {static_cast<Address>(state->descriptor), s.x[2], s.x[3]});
-        if (count < 0) {
-            state->status = 7;
-            state->error = objc_retain(self->support, self->posix_error(guest_errno(self->support)));
-        } else if (count == 0) {
-            state->status = 5;
-        }
-        s.x[0] = static_cast<Address>(count);
-    }, "q@:^CQ");
-    support.method(input, "hasBytesAvailable", [self](CpuState& s, GuestMemory&) {
-        const auto state = self->stream_of(s.x[0]);
-        std::lock_guard lock(state->mutex);
-        s.x[0] = state->status == 2;
-    }, "B@:");
-    support.method(input, "getBuffer:length:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:^*^Q");   // no internal buffer is exposed
-    support.method(input, "dealloc", [self, input](CpuState& s, GuestMemory&) {
-        if (const auto state = self->support.objc.find_host_state<StreamState>(s.x[0])) {
-            if (state->descriptor >= 0) static_cast<void>(self->sys("_close", {static_cast<Address>(state->descriptor)}));
-            objc_release(self->support, std::exchange(state->error, 0));
-        }
-        static_cast<void>(self->support.objc.send_super(s.x[0], input, self->support.objc.selector("dealloc")));
     }, "v@:");
 }
 

@@ -54,7 +54,7 @@ void install_foundation_archive_classes(support_kit::Support& support);         
 void install_foundation_exceptions(support_kit::Support& support);               // exceptions.cpp
 void install_foundation_invocations_undo_kvo(support_kit::Support& support);     // invocation.cpp, undo.cpp, kvo.cpp
 void install_foundation_kvc_collections_and_queues(support_kit::Support& support);  // kvc_collections.cpp, notification_queue.cpp
-void install_foundation_files_and_bundles(support_kit::Support& support);        // files.cpp, bundles.cpp
+void install_foundation_files_and_bundles(support_kit::Support& support);        // streams.cpp, files.cpp, bundles.cpp
 void install_foundation_scripting(support_kit::Support& support);                // scripting.cpp
 void install_foundation_property_list_serialization(InstallContext& context);  // property_list_serialization.cpp
 

@@ -199,6 +199,7 @@ void install_cf_extras(Support& support) {
     for (const auto* name : {"NSCache", "NSInputStream", "NSInvocation", "NSTimer"}) {
         const auto cls = support.objc.find_class(name);
         if (!cls) continue;   // a process without that Foundation class (unit fixtures)
+        if (support.process.resolve(core_foundation, std::string("_OBJC_CLASS_$_") + name)) continue;   // already published (streams.cpp)
         support.objc.publish_class(name, cls, core_foundation);
     }
     for (const auto library : {std::string_view(core_foundation), std::string_view(foundation_library)})

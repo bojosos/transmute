@@ -66,6 +66,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/foundation/kvo.cpp
     src/alchemy/darwin/foundation/kvc_collections.cpp
     src/alchemy/darwin/foundation/notification_queue.cpp
+    src/alchemy/darwin/foundation/streams.cpp
     src/alchemy/darwin/foundation/files.cpp
     src/alchemy/darwin/foundation/bundles.cpp
     src/alchemy/darwin/foundation/sdef.cpp
@@ -91,6 +92,8 @@ function(alchemy_darwin_foundation_tests)
     alchemy_gui_add_unit_test(alchemy_gui_foundation_gaps src/alchemy/darwin/foundation/tests/foundation_gaps_tests.cpp TIMEOUT 180)
     # Value classes (NSTimeZone, NSUUID, ...) over the export-fill fixture.
     alchemy_gui_add_unit_test(alchemy_gui_foundation_value_classes src/alchemy/darwin/foundation/tests/value_classes_tests.cpp TIMEOUT 120)
+    # NSStream / CFStream (streams.cpp): data, memory, buffers, files, bound pairs, loopback sockets and events.
+    alchemy_gui_add_unit_test(alchemy_gui_foundation_streams src/alchemy/darwin/foundation/tests/streams_tests.cpp TIMEOUT 120)
     if(NOT ALCHEMY_GUI_FIXTURES_ENABLED)
         return()
     endif()

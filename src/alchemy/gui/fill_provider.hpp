@@ -110,6 +110,7 @@ enum class TypeId : std::uint64_t {
     display_stream, cv_pixel_buffer, mach_port, notification_center, pm_object, da_session,
     binary_heap, bit_vector, tree,   // darwin/corefoundation/cf_collections.cpp
     cv_pixel_buffer_pool, vt_pixel_transfer_session,   // darwin/media/
+    read_stream, write_stream,       // darwin/foundation/streams.cpp
 };
 
 inline std::int64_t sign32(std::uint64_t value) { return static_cast<std::int32_t>(static_cast<std::uint32_t>(value)); }

@@ -30,6 +30,8 @@
 #include <string>
 #include <vector>
 
+namespace alchemy::gui::completion_kit { void install_streams(Support& support); }   // streams.cpp
+
 namespace {
 
 using Address = std::uint64_t;
@@ -178,6 +180,7 @@ struct Fixture {
         completion_kit::install_notification_queue(*support);
         completion_kit::install_value_transformers(*support);
         completion_kit::install_process_io(*support);
+        completion_kit::install_streams(*support);      // NSInputStream, NSOutputStream
         completion_kit::install_files(*support);
         completion_kit::install_bundles(*support);
         completion_kit::install_os_log(*support);
