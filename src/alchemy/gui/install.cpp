@@ -20,6 +20,7 @@
 #include "alchemy/darwin/screencapturekit/install.hpp"
 #include "alchemy/darwin/skylight/install.hpp"
 #include "alchemy/darwin/quicklookui/install.hpp"
+#include "alchemy/darwin/quicklookthumbnailing/install.hpp"
 #include "alchemy/darwin/storekit/install.hpp"
 #include "alchemy/darwin/coredata/install.hpp"
 #include "alchemy/darwin/corefoundation/install.hpp"
@@ -108,6 +109,7 @@ constexpr Installer installers[] = {
     {"install_screencapturekit", screencapturekit::install_screencapturekit},
     {"install_skylight", skylight::install_skylight},
     {"install_quicklookui", quicklookui::install_quicklookui},
+    {"install_quicklookthumbnailing", quicklookthumbnailing::install_quicklookthumbnailing},
     {"install_storekit", storekit::install_storekit},
     {"install_coredata", coredata::install_coredata},
     {"install_values_kit", gui::values::install_values_kit}, // value-class frameworks (after the fill-only set)
