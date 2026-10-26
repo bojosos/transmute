@@ -1030,13 +1030,15 @@ private:
     }
 
     // ---- dominance repair ----------------------------------------------------------------
+    // A tail-duplicated copy is demoted as its original (clone_of): every copy
+    // stores into the one Function variable the lowering keys by the original.
     std::set<Value*> find_demotions() {
         analyse();
         std::set<Value*> demoted;
         auto check = [&](Value* def, BasicBlock* use_block) {
             if (!def || def->kind != Value::Kind::instruction || !def->parent) return;
             if (def->parent == use_block) return;
-            if (!dominates(def->parent, use_block)) demoted.insert(def);
+            if (!dominates(def->parent, use_block)) demoted.insert(original(def));
         };
         for (auto* block : rpo_) {
             for (auto* v : block->instructions) {

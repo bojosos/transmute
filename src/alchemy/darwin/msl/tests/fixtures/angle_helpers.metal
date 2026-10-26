@@ -4,7 +4,9 @@
 // metal` (Apple's compiler takes as_type unqualified), the sample count
 // its alpha-to-coverage emulation reads with metal::get_num_samples(), and
 // float-to-int conversions clamped against numeric_limits of a vector type
-// (texelFetch(t, ivec2(gl_FragCoord.xy), 0)).
+// (texelFetch(t, ivec2(gl_FragCoord.xy), 0)), and a GLSL sampler array: an
+// array<sampler, N> [[sampler(k)]] parameter (slots k .. k + N - 1) whose
+// elements ANGLE stores by address in its texture environments.
 #include <metal_stdlib>
 
 #define ANGLE_ALWAYS_INLINE __attribute__((always_inline))
@@ -57,4 +59,17 @@ fragment FragmentOut helpers_main(constant Uniforms& u [[buffer(0)]], float4 pos
     const uint covered = uint(metal::saturate(u.alpha) * float(samples) + 0.5f);
     out.mask = samples == 1 ? 1u : ((1u << covered) - 1u);
     return out;
+}
+
+struct TextureEnv { thread metal::texture2d<float>* texture; thread metal::sampler* sampler; };
+
+fragment float4 sampler_arrays_main(metal::array<metal::texture2d<float>, 2> textures [[texture(0)]],
+                                    metal::array<metal::sampler, 2> samplers [[sampler(1)]], float4 position [[position]])
+{
+    metal::array<TextureEnv, 2> envs;
+    envs[0].texture = &textures[0];
+    envs[0].sampler = &samplers[0];
+    envs[1].texture = &textures[1];
+    envs[1].sampler = &samplers[1];
+    return envs[0].texture->sample(*envs[0].sampler, position.xy) + envs[1].texture->sample(*envs[1].sampler, position.yx);
 }

@@ -33,6 +33,20 @@ const char* const punctuators[] = {">>=", "<<=", "...", "->*", "::", "->", "++",
 bool ident_start(char c) { return std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$'; }
 bool ident_char(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$'; }
 
+// N of a [[sampler]] parameter spelled (metal::)array<(metal::)sampler, N>; 0 for a single sampler.
+std::uint32_t sampler_array_length(std::string_view spelling) {
+    std::string text;
+    for (const auto c : spelling)
+        if (!std::isspace(static_cast<unsigned char>(c))) text += c;
+    std::size_t at;
+    while ((at = text.find("metal::")) != std::string::npos) text.erase(at, 7);
+    if (text.rfind("array<sampler,", 0) != 0 || text.back() != '>') return 0;
+    std::uint32_t count = 0;
+    const auto digits = std::string_view(text).substr(14, text.size() - 15);
+    std::from_chars(digits.data(), digits.data() + digits.size(), count);
+    return count;
+}
+
 // `files`: the file names of the GNU line markers, as written between the
 // quotes ("<stdin>" until the first marker).
 std::vector<Token> tokenize(std::string_view s, std::vector<std::string>& files) {
@@ -1569,8 +1583,23 @@ private:
                     InterfaceSampler sampler;
                     sampler.name = name;
                     sampler.index = attribute.args.empty() ? 0 : evaluate_integer(attribute.args[0]).value_or(~0u);
-                    if (sampler.index >= maximum_samplers) {
+                    // array<sampler, N> [[sampler(k)]] takes slots k .. k + N - 1 (ANGLE's GLSL sampler
+                    // arrays): each element is the sampler of its slot, reflected as N samplers.
+                    const auto count = sampler_array_length(type);
+                    if (sampler.index >= maximum_samplers || sampler.index + std::max(count, 1U) > maximum_samplers) {
                         error(attribute.line, "sampler index out of range");
+                        continue;
+                    }
+                    if (count) {
+                        body << "    " << type << ' ' << var << ";\n";
+                        for (std::uint32_t element = 0; element < count; ++element) {
+                            body << "    " << var << '[' << element << "] = metal::__msl_sampler(" << sampler.index + element << "u);\n";
+                            InterfaceSampler slot;
+                            slot.name = name + '[' + std::to_string(element) + ']';
+                            slot.index = sampler.index + element;
+                            entry.samplers.push_back(std::move(slot));
+                        }
+                        args.push_back(var);
                         continue;
                     }
                     body << "    metal::sampler " << var << " = metal::__msl_sampler(" << sampler.index << "u);\n";

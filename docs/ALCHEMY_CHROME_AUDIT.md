@@ -908,6 +908,22 @@ hardware GPU (below).
       * WebGL's first `texelFetch(t, ivec2(gl_FragCoord.xy), 0)` used to lose the context. ANGLE's
         float-to-int helper clamps against `metal::numeric_limits<int2>`, and the MSL library had scalar limits
         only. Vectors now get their element type's limits in every lane.
+    * **Shading languages** (`scripts/chrome/pages/gpu_shaders.html`): 66 tests in two halves.
+      * GLSL ES 3.00 through ANGLE: built-in functions, integer and bit semantics, packing, matrices including
+        inverse, structs and arrays, `switch` fallthrough and loops, parameter qualifiers, derivatives, the
+        fragment and vertex built-ins (the last-vertex provoking convention, point coordinates), std140 uniform
+        blocks, and texture functions with sampler arrays.
+      * WGSL through Tint: the same families, plus `modf`/`frexp` structs, bit counting and bit-field functions,
+        pack/unpack, bitcasts, pointers, `loop`/`continuing`, override and const expressions, atomics,
+        `workgroupUniformLoad`, texture queries and gathers in compute, subgroups, f16, and the stage built-ins.
+      * Each result is compared with the same computation in JavaScript. All pass headless and windowed, as in
+        headless Edge.
+      * Two compiler gaps fixed. First, a GLSL sampler array arrives as `array<sampler, N> [[sampler(k)]]`, and
+        the entry wrapper passed a single sampler; each element is now the sampler of its slot. Second, Tint's
+        `continuing` blocks plus clang's folding of a counted loop made the structurizer duplicate a block whose
+        copied value no longer dominated its use. The copy was recorded for demotion under its own name, while
+        the lowering looks demotions up by the original ("value %64.tail14 used before its definition"). A copy
+        is now demoted as its original.
   * **ANGLE's Vulkan back end on the host's Vulkan** isn't allowed. Chrome 155 on macOS accepts only ANGLE on Metal,
     or on SwiftShader with `--enable-unsafe-swiftshader`. Its message is `gl_factory.cc:110 ... not found in allowed
     implementations: [(gl=egl-angle,angle=metal)]`.

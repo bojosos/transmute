@@ -1085,6 +1085,13 @@ void test_reflection() {
         require(f.reflection.writes_sample_mask, "ANGLE helpers: sample mask output");
         require(spirv_spec_ids(f.spirv).count(msl::reserved_spec_id::raster_sample_count) != 0,
                 "get_num_samples() is the raster sample count specialization constant");
+        // array<sampler, 2> [[sampler(1)]]: the samplers of slots 1 and 2, both used.
+        const auto& arrays = function(r, "sampler_arrays_main").reflection;
+        require(arrays.samplers.size() == 2 && arrays.samplers[0].index == 1 && arrays.samplers[1].index == 2 &&
+                    arrays.samplers[0].used && arrays.samplers[1].used,
+                "ANGLE sampler arrays: one sampler per slot");
+        require(arrays.textures.size() == 1 && arrays.textures[0].array_length == 2, "ANGLE texture arrays");
+        validate_spirv(function(r, "sampler_arrays_main").spirv, "angle_helpers.sampler_arrays_main");
     }
     {
         const auto r = compile_fixture("tint_extras.metal");

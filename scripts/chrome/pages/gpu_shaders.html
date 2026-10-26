@@ -1,0 +1,464 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy GPU shaders: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+td, th { padding: 2px 10px; text-align: left; vertical-align: top; }
+</style>
+</head>
+<body>
+<h1 id="h">Alchemy GPU shaders</h1>
+<p>The shading languages real pages write, one feature group per test: GLSL ES 3.00 through WebGL 2 (which ANGLE
+translates to Metal Shading Language) and WGSL through WebGPU (which Tint translates). Built-in functions,
+integer and bit semantics, packing, matrices, control flow, structs, arrays, pointers, atomics, texture functions
+and stage built-ins. Each test computes 16 vec4 results on the GPU (a 4x4 float render target or a storage buffer)
+and compares them with the same computation in JavaScript. Written for Alchemy (no network). The verdict goes into
+<code>document.title</code> (<code>Alchemy GPU shaders: PASS</code> or <code>Alchemy GPU shaders: FAIL &lt;test&gt;</code>)
+and <code>body[data-verdict]</code>; <code>--dump-dom</code> waits for it (at most 150 s).</p>
+<pre id="info">pending</pre>
+<table>
+<thead><tr><th>test</th><th>result</th><th>detail</th></tr></thead>
+<tbody id="results"></tbody>
+</table>
+<p id="status">not run</p>
+<script>
+"use strict";
+var finished = false, holdUntil = Date.now() + 150000;
+(function hold() {
+  if (finished || Date.now() > holdUntil) return;
+  var img = new Image();
+  img.onerror = img.onload = function () { img.remove(); hold(); };
+  img.src = "missing-" + Math.random() + ".png";
+  document.body.appendChild(img);
+})();
+
+var rows = document.getElementById("results"), failures = [], skips = 0, passes = 0;
+function row(name, ok, detail) {
+  var tr = document.createElement("tr");
+  var verdict = ok === null ? "skip" : ok ? "pass" : "FAIL";
+  tr.innerHTML = "<td></td><td></td><td></td>";
+  tr.children[0].textContent = name; tr.children[1].textContent = verdict; tr.children[2].textContent = detail || "";
+  tr.dataset.result = verdict;
+  rows.appendChild(tr);
+  console.log("[shaders] " + verdict + " " + name + (detail ? ": " + detail : ""));
+  if (ok === false) failures.push(name);
+  else if (ok === null) skips++;
+  else passes++;
+}
+function within(promise, seconds, what) {
+  return Promise.race([promise, new Promise(function (_, reject) {
+    setTimeout(function () { reject(new Error(what + " did not settle within " + seconds + " s")); }, seconds * 1000);
+  })]);
+}
+
+// ---- JavaScript references ----------------------------------------------------------------------
+
+var f32 = Math.fround;
+var F = new Float32Array(1), U = new Uint32Array(F.buffer), I = new Int32Array(F.buffer);
+function floatBits(x) { F[0] = x; return U[0]; }
+function bitsFloat(u) { U[0] = u >>> 0; return F[0]; }
+function halfBits(v) {   // exact for the multiples of 1/2 used here
+  if (v === 0) return Object.is(v, -0) ? 0x8000 : 0;
+  var u = floatBits(v), sign = (u >>> 16) & 0x8000, e = ((u >>> 23) & 0xff) - 127 + 15, m = (u >>> 13) & 0x3ff;
+  return sign | (e << 10) | m;
+}
+function roundEven(x) { var r = Math.round(x); return Math.abs(x % 1) === 0.5 && r % 2 !== 0 ? r - 1 : r; }
+function popcount(u) { var n = 0; for (u >>>= 0; u; u >>>= 1) n += u & 1; return n; }
+function clz(u) { return Math.clz32(u); }
+function ctz(u) { u >>>= 0; if (!u) return 32; var n = 0; while (!(u & 1)) { u >>>= 1; n++; } return n; }
+function reverse(u) { var r = 0; for (var k = 0; k < 32; k++) { r = (r << 1) | (u & 1); u >>>= 1; } return r >>> 0; }
+function frexp(x) { if (x === 0) return [0, 0]; var e = Math.floor(Math.log2(Math.abs(x))) + 1, f = x / Math.pow(2, e); if (Math.abs(f) >= 1) { f /= 2; e++; } if (Math.abs(f) < 0.5) { f *= 2; e--; } return [f, e]; }
+function smoothstep(a, b, x) { var t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); }
+
+function compare(got, js, tol, kind) {
+  for (var i = 0; i < 16; i++) {
+    var want = js(i);
+    for (var c = 0; c < 4; c++) {
+      var g = got[i * 4 + c], w = want[c];
+      if (w === null || w === undefined) continue;
+      var ok = kind === "f" ? (isNaN(w) ? isNaN(g) : Math.abs(g - w) <= tol * Math.max(1, Math.abs(w))) : g === (kind === "u" ? w >>> 0 : w | 0);
+      if (!ok) return "invocation " + i + " = " + Array.from(got.slice(i * 4, i * 4 + 4)).map(function (v) { return kind === "f" ? +v.toPrecision(7) : v; }) +
+        ", want " + want.map(function (v) { return v === null ? "-" : kind === "f" ? +(+v).toPrecision(7) : kind === "u" ? v >>> 0 : v | 0; });
+    }
+  }
+  return "";
+}
+
+// ==== GLSL ES 3.00 =================================================================================
+
+var GL_VS = "#version 300 es\nvoid main() { gl_Position = vec4(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0, 0.0, 1.0); }";
+var GL_VS_CW = "#version 300 es\nvoid main() { gl_Position = vec4(gl_VertexID == 2 ? 3.0 : -1.0, gl_VertexID == 1 ? 3.0 : -1.0, 0.0, 1.0); }";
+function glFs(body) {
+  return "#version 300 es\nprecision highp float;\nprecision highp int;\n" + body +
+    "\nout vec4 o;\nvoid main() { int i = int(gl_FragCoord.y) * 4 + int(gl_FragCoord.x); float x = float(i); o = run(i, x); }";
+}
+// name, fragment body defining vec4 run(int i, float x), js(i) -> 4 values, tolerance, options
+var GL_TESTS = [
+  ["trigonometry", "vec4 run(int i, float x) { return vec4(sin(x * 0.5), cos(x * 0.5), tan(x * 0.1), atan(x - 7.5, 3.0)); }",
+    function (i) { return [Math.sin(i * 0.5), Math.cos(i * 0.5), Math.tan(i * 0.1), Math.atan2(i - 7.5, 3)]; }, 2e-3],
+  ["inverse trigonometry, degrees", "vec4 run(int i, float x) { return vec4(asin(x / 16.0 - 0.45), acos(x / 16.0 - 0.45), atan(x / 4.0 - 2.0), degrees(x * 0.1)); }",
+    function (i) { return [Math.asin(i / 16 - 0.45), Math.acos(i / 16 - 0.45), Math.atan(i / 4 - 2), i * 0.1 * 180 / Math.PI]; }, 2e-3],
+  ["exponentials", "vec4 run(int i, float x) { return vec4(pow(1.5, x * 0.25), exp(x * 0.2 - 1.0), log(x + 1.0), sqrt(x)); }",
+    function (i) { return [Math.pow(1.5, i * 0.25), Math.exp(i * 0.2 - 1), Math.log(i + 1), Math.sqrt(i)]; }, 2e-3],
+  ["exp2, log2, inversesqrt, sinh", "vec4 run(int i, float x) { return vec4(exp2(x * 0.5 - 2.0), log2(x + 1.0), inversesqrt(x + 1.0), sinh(x * 0.2 - 1.5)); }",
+    function (i) { return [Math.pow(2, i * 0.5 - 2), Math.log2(i + 1), 1 / Math.sqrt(i + 1), Math.sinh(i * 0.2 - 1.5)]; }, 2e-3],
+  ["cosh, tanh, asinh, acosh", "vec4 run(int i, float x) { return vec4(cosh(x * 0.2 - 1.5), tanh(x * 0.3 - 2.0), asinh(x - 8.0), acosh(x + 1.0)); }",
+    function (i) { return [Math.cosh(i * 0.2 - 1.5), Math.tanh(i * 0.3 - 2), Math.asinh(i - 8), Math.acosh(i + 1)]; }, 2e-3],
+  ["atanh, abs, sign, floor", "vec4 run(int i, float x) { return vec4(atanh(x / 17.0 - 0.4), abs(x - 7.5), sign(x - 7.0), floor((x + 0.25) * 0.7 - 3.0)); }",
+    function (i) { return [Math.atanh(i / 17 - 0.4), Math.abs(i - 7.5), Math.sign(i - 7), Math.floor((i + 0.25) * 0.7 - 3)]; }, 2e-3],
+  ["ceil, fract, mod, trunc", "vec4 run(int i, float x) { return vec4(ceil((x + 0.25) * 0.7 - 3.0), fract(x * 0.37 + 0.1), mod(x * 1.3 + 0.1, 2.5), trunc((x + 0.25) * 0.7 - 3.0)); }",
+    function (i) { var m = i * 1.3 + 0.1; return [Math.ceil((i + 0.25) * 0.7 - 3), (i * 0.37 + 0.1) % 1, m - 2.5 * Math.floor(m / 2.5), Math.trunc((i + 0.25) * 0.7 - 3)]; }, 1e-4],
+  ["roundEven, modf, round", "vec4 run(int i, float x) { float ip; float fr = modf(x * 1.25 + 0.3, ip); return vec4(roundEven(x + 0.5), fr, ip, round(x * 0.6 + 0.2)); }",
+    function (i) { var v = i * 1.25 + 0.3; return [roundEven(i + 0.5), v - Math.floor(v), Math.floor(v), Math.round(i * 0.6 + 0.2)]; }, 1e-4],
+  ["clamp, mix, step, smoothstep", "vec4 run(int i, float x) { return vec4(clamp(x - 5.0, 0.0, 6.0), mix(2.0, 10.0, x / 15.0), step(7.5, x), smoothstep(2.0, 12.0, x)); }",
+    function (i) { return [Math.min(Math.max(i - 5, 0), 6), 2 + 8 * i / 15, i >= 7.5 ? 1 : 0, smoothstep(2, 12, i)]; }, 1e-4],
+  ["float bit casts", "vec4 run(int i, float x) { int b = floatBitsToInt(x * 0.25 + 1.0); return vec4(float(b >> 16), float(b & 0xffff), intBitsToFloat(b), uintBitsToFloat(floatBitsToUint(-x))); }",
+    function (i) { var b = floatBits(f32(i * 0.25 + 1)); return [b >> 16, b & 0xffff, i * 0.25 + 1, -i]; }, 0],
+  ["isnan, isinf", "vec4 run(int i, float x) { return vec4(float(isnan(intBitsToFloat(0x7fc00000 + i))), float(isinf(intBitsToFloat(0x7f800000 | (i << 31)))), float(isnan(x)), float(isinf(x))); }",
+    function (i) { return [1, 1, 0, 0]; }, 0],
+  ["integer division, abs, sign", "vec4 run(int i, float x) { int a = i * 7 - 40; return vec4(float((a + 64) / 3), float(abs(a) % 5), float(abs(a)), float(sign(a))); }",
+    function (i) { var a = i * 7 - 40; return [Math.trunc((a + 64) / 3), Math.abs(a) % 5, Math.abs(a), Math.sign(a)]; }, 0],
+  ["unsigned wrapping and bitwise", "vec4 run(int i, float x) { uint u = uint(i) * 2654435761u; return vec4(float(u >> 16), float(u & 0xffffu), float((u ^ 0x5a5au) & 0xffu), float(~uint(i) >> 28)); }",
+    function (i) { var u = Math.imul(i, 2654435761 | 0) >>> 0; return [u >>> 16, u & 0xffff, (u ^ 0x5a5a) & 0xff, (~i >>> 0) >>> 28]; }, 0],
+  ["signed shifts, min, clamp", "vec4 run(int i, float x) { int v = i - 8; return vec4(float(v << 2), float(v >> 1), float(min(v, 2)), float(clamp(v, -3, 4))); }",
+    function (i) { var v = i - 8; return [v << 2, v >> 1, Math.min(v, 2), Math.min(Math.max(v, -3), 4)]; }, 0],
+  ["vector relational functions", "vec4 run(int i, float x) { bvec4 lt = lessThan(vec4(x, 4.0, 8.0, 12.0), vec4(6.0)); return vec4(float(any(lt)), float(all(lt)), float(lt.x), float(equal(ivec2(i, 3), ivec2(5, 3)).x) + float(not(lt).w)); }",
+    function (i) { return [1, 0, i < 6 ? 1 : 0, (i === 5 ? 1 : 0) + 1]; }, 0],
+  ["mat2: multiply, determinant, transpose", "vec4 run(int i, float x) { mat2 m = mat2(1.0, 2.0, 3.0, x); vec2 v = m * vec2(1.0, 1.0); return vec4(v, determinant(m), transpose(m)[0][1]); }",
+    function (i) { return [4, 2 + i, i - 6, 3]; }, 1e-5],
+  ["mat3 inverse, outerProduct, matrixCompMult", "vec4 run(int i, float x) { mat3 m = mat3(2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 1.0, 0.0, x + 1.0); mat3 n = inverse(m);\n" +
+    "mat3x2 o = outerProduct(vec2(1.0, x), vec3(2.0, 3.0, 4.0)); mat2 c = matrixCompMult(mat2(1.0, 2.0, 3.0, 4.0), mat2(x, 1.0, 1.0, 1.0)); return vec4(n[2][0], n[1][1], o[2][1], c[0][0]); }",
+    function (i) { return [-1 / (2 * (i + 1)), 1 / 3, 4 * i, i]; }, 1e-4],
+  ["mat4 inverse", "vec4 run(int i, float x) { mat4 m = mat4(2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, x, 1.0, 2.0, 1.0); mat4 n = inverse(m); return vec4(n[3].xyz, n[0][0]); }",
+    function (i) { return [-i / 2, -0.5, -1, 0.5]; }, 1e-4],
+  ["non-square matrices", "vec4 run(int i, float x) { mat2x3 a = mat2x3(1.0, 2.0, 3.0, 4.0, 5.0, x); vec3 r = a * vec2(1.0, 2.0); vec2 s = transpose(a) * vec3(1.0); return vec4(r.z, r.x, s.x, s.y); }",
+    function (i) { return [3 + 2 * i, 9, 6, 9 + i]; }, 1e-5],
+  ["structs and arrays, dynamic indexing", "struct S { float a; int b[3]; };\nvec4 run(int i, float x) { S s[4]; for (int k = 0; k < 4; k++) { s[k].a = float(k) * 1.5; for (int j = 0; j < 3; j++) s[k].b[j] = k * 10 + j; }\n" +
+    "int k = i % 4; return vec4(s[k].a, float(s[k].b[i % 3]), float(s.length()), float(s[k].b.length())); }",
+    function (i) { var k = i % 4; return [k * 1.5, k * 10 + i % 3, 4, 3]; }, 0],
+  ["switch fallthrough, loops, break and continue", "vec4 run(int i, float x) { int r = 0; switch (i % 5) { case 0: r = 1; case 1: r += 10; break; case 2: r = 3; break; default: r = 7; }\n" +
+    "int sum = 0; for (int j = 0; j < 16; j++) { if (j % 3 == 0) continue; if (j > i) break; sum += j; }\n" +
+    "int halvings = 0; int v = i; do { v /= 2; halvings++; } while (v > 0);\nint w = 0; while (w * w < i) w++;\nreturn vec4(float(r), float(sum), float(halvings), float(w)); }",
+    function (i) { var r = [11, 10, 3, 7, 7][i % 5], sum = 0; for (var j = 0; j < 16; j++) { if (j % 3 === 0) continue; if (j > i) break; sum += j; }
+      var h = 0, v = i; do { v = Math.trunc(v / 2); h++; } while (v > 0); var w = 0; while (w * w < i) w++; return [r, sum, h, w]; }, 0],
+  ["in, out and inout parameters", "void f(in float a, out float b, inout float c) { b = a * 2.0; c += a; a = 100.0; }\nvec4 run(int i, float x) { float b; float c = 1.0; float a = x; f(a, b, c); return vec4(a, b, c, b + c); }",
+    function (i) { return [i, 2 * i, 1 + i, 1 + 3 * i]; }, 0],
+  ["half and unorm packing", "vec4 run(int i, float x) { uint p = packHalf2x16(vec2(x * 0.5, -x)); vec2 u = unpackHalf2x16(p); uint q = packUnorm2x16(vec2(x / 15.0, 0.25));\n" +
+    "return vec4(float(p & 0xffffu), float(p >> 16u), u.y, float(q & 0xffffu) + float(q >> 16u) * 65536.0); }",
+    function (i) { return [halfBits(i * 0.5), halfBits(-i), -i, f32(i * 4369 + 16384 * 65536)]; }, 0],
+  ["snorm packing and unpacking", "vec4 run(int i, float x) { uint p = packSnorm2x16(vec2(x / 16.0 - 0.45, -1.0)); vec2 u = unpackSnorm2x16(p); vec2 n = unpackUnorm2x16(0x8000u | (uint(i) << 16));\n" +
+    "return vec4(float(p & 0xffffu), u.x, n.x, n.y); }",
+    function (i) { var s = Math.round((i / 16 - 0.45) * 32767); return [s & 0xffff, Math.max(s / 32767, -1), 32768 / 65535, i / 65535]; }, 1e-5],
+  ["derivatives", "vec4 run(int i, float x) { return vec4(dFdx(gl_FragCoord.x), dFdy(gl_FragCoord.y), fwidth(gl_FragCoord.x * 3.0 + gl_FragCoord.y), dFdx(float(i % 4) * 2.0)); }",
+    function (i) { return [1, 1, 4, 2]; }, 1e-5],
+  ["gl_FragCoord", "vec4 run(int i, float x) { return vec4(fract(gl_FragCoord.xy), gl_FragCoord.z, gl_FragCoord.w); }",
+    function (i) { return [0.5, 0.5, 0.5, 1]; }, 1e-5],
+  ["gl_FrontFacing, counter-clockwise", "vec4 run(int i, float x) { return vec4(float(gl_FrontFacing), 0.0, 0.0, 1.0); }", function (i) { return [1, 0, 0, 1]; }, 0],
+  ["gl_FrontFacing, clockwise", "vec4 run(int i, float x) { return vec4(float(gl_FrontFacing), 0.0, 0.0, 1.0); }", function (i) { return [0, 0, 0, 1]; }, 0, { vs: GL_VS_CW }],
+  ["flat varyings take the last vertex; gl_VertexID, gl_InstanceID", "flat in ivec2 ids;\nvec4 run(int i, float x) { return vec4(float(ids.x), float(ids.y), 0.0, 1.0); }",
+    function (i) { return [2, 0, 0, 1]; }, 0,
+    { vs: "#version 300 es\nflat out ivec2 ids;\nvoid main() { ids = ivec2(gl_VertexID, gl_InstanceID); gl_Position = vec4(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0, 0.0, 1.0); }" }],
+  ["points: gl_PointSize, gl_PointCoord", "vec4 run(int i, float x) { return vec4(gl_PointCoord, 0.0, 1.0); }", function (i) { return [0.5, 0.5, 0, 1]; }, 1e-5,
+    { vs: "#version 300 es\nvoid main() { gl_PointSize = 1.0; gl_Position = vec4((float(gl_VertexID % 4) + 0.5) / 2.0 - 1.0, (float(gl_VertexID / 4) + 0.5) / 2.0 - 1.0, 0.0, 1.0); }",
+      draw: function (gl) { gl.drawArrays(gl.POINTS, 0, 16); } }],
+  ["discard", "vec4 run(int i, float x) { if ((i & 1) == 1) discard; return vec4(x, 1.0, 2.0, 3.0); }",
+    function (i) { return i & 1 ? [-1, -1, -1, -1] : [i, 1, 2, 3]; }, 0],
+  ["uniform block, std140", "layout(std140) uniform Block { mat3 m; vec3 a[2]; float f; ivec2 iv; };\nvec4 run(int i, float x) { return vec4(m[1][2], a[1].y, f, float(iv.y)); }",
+    function (i) { return [6, 11, 0.5, -9]; }, 0,
+    { setup: function (gl, program) {
+      var data = new ArrayBuffer(96), fl = new Float32Array(data), in32 = new Int32Array(data);
+      for (var c = 0; c < 3; c++) for (var r = 0; r < 3; r++) fl[c * 4 + r] = c * 3 + r + 1;   // m[1][2] = 6
+      fl[12] = 7; fl[13] = 8; fl[14] = 9; fl[16] = 10; fl[17] = 11; fl[18] = 12;               // a[0], a[1]
+      fl[20] = 0.5; in32[22] = 4; in32[23] = -9;
+      var b = gl.createBuffer(); gl.bindBuffer(gl.UNIFORM_BUFFER, b); gl.bufferData(gl.UNIFORM_BUFFER, data, gl.STATIC_DRAW);
+      gl.uniformBlockBinding(program, gl.getUniformBlockIndex(program, "Block"), 0);
+      gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, b);
+    } }],
+  ["texture functions: size, LOD, offsets, gradients, projection, sampler arrays",
+    "uniform highp sampler2D ts[2];\nvec4 run(int i, float x) { vec2 c00 = vec2(0.125); return vec4(\n" +
+    "  float(textureSize(ts[0], 0).x * 10 + textureSize(ts[0], 1).x) + texelFetchOffset(ts[0], ivec2(1, 1), 0, ivec2(1, 0)).r * 255.0 * 100.0,\n" +
+    "  textureLod(ts[0], vec2(0.5), 1.0).g * 255.0 + textureOffset(ts[0], c00, ivec2(2, 1)).r * 255.0 * 1000.0,\n" +
+    "  textureGrad(ts[0], vec2(0.3), vec2(0.5, 0.0), vec2(0.0, 0.5)).b * 255.0 + textureProj(ts[0], vec3(c00 * 2.0, 2.0)).g * 255.0 * 1000.0,\n" +
+    "  texture(ts[1], vec2(0.5)).r * 255.0); }",
+    function (i) { return [42 + 120 * 100, 150 + 120 * 1000, 200 + 0, 33]; }, 2e-5,
+    { setup: function (gl, program) {
+      var t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texStorage2D(gl.TEXTURE_2D, 2, gl.RGBA8, 4, 4);
+      var l0 = new Uint8Array(64), l1 = new Uint8Array(16);
+      for (var y = 0; y < 4; y++) for (var xx = 0; xx < 4; xx++) l0.set([xx * 60, y * 60, 7, 255], (y * 4 + xx) * 4);
+      for (var k = 0; k < 4; k++) l1.set([100, 150, 200, 255], k * 4);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 4, 4, gl.RGBA, gl.UNSIGNED_BYTE, l0);
+      gl.texSubImage2D(gl.TEXTURE_2D, 1, 0, 0, 2, 2, gl.RGBA, gl.UNSIGNED_BYTE, l1);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST_MIPMAP_NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      var t1 = gl.createTexture(); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, t1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([33, 0, 0, 255]));
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.uniform1iv(gl.getUniformLocation(program, "ts"), [0, 1]);
+      gl.activeTexture(gl.TEXTURE0);
+    } }],
+  ["loops over vector arrays with dynamic bounds", "vec4 run(int i, float x) { vec3 pts[4] = vec3[4](vec3(1.0, 0.0, 0.0), vec3(0.0, 2.0, 0.0), vec3(0.0, 0.0, 3.0), vec3(1.0, 1.0, 1.0));\n" +
+    "vec3 acc = vec3(0.0); for (int k = 0; k < i % 4 + 1; k++) acc += pts[k]; return vec4(acc, float(pts.length())); }",
+    function (i) { var p = [[1, 0, 0], [0, 2, 0], [0, 0, 3], [1, 1, 1]], a = [0, 0, 0]; for (var k = 0; k < i % 4 + 1; k++) for (var c = 0; c < 3; c++) a[c] += p[k][c]; return a.concat([4]); }, 0]
+];
+
+function runGL() {
+  var canvas = document.createElement("canvas"); canvas.width = 4; canvas.height = 4;
+  var gl = canvas.getContext("webgl2");
+  if (!gl) { row("webgl2", false, "no context"); return; }
+  if (!gl.getExtension("EXT_color_buffer_float")) { row("webgl2", null, "EXT_color_buffer_float absent"); return; }
+  var dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  document.getElementById("info").textContent += "\nwebgl2: " + (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+  var target = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, target); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, 4, 4);
+  var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target, 0);
+  function sh(type, src) { var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error("compile: " + gl.getShaderInfoLog(s)); return s; }
+  GL_TESTS.forEach(function (t) {
+    var name = "glsl: " + t[0], options = t[4] || {};
+    try {
+      var p = gl.createProgram();
+      gl.attachShader(p, sh(gl.VERTEX_SHADER, options.vs || GL_VS)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, glFs(t[1])));
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("link: " + gl.getProgramInfoLog(p));
+      gl.useProgram(p);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.viewport(0, 0, 4, 4);
+      gl.clearBufferfv(gl.COLOR, 0, new Float32Array([-1, -1, -1, -1]));
+      if (options.setup) options.setup(gl, p);
+      if (options.draw) options.draw(gl); else gl.drawArrays(gl.TRIANGLES, 0, 3);
+      var out = new Float32Array(64); gl.readPixels(0, 0, 4, 4, gl.RGBA, gl.FLOAT, out);
+      var e = gl.getError(); if (e) throw new Error("glError 0x" + e.toString(16));
+      if (gl.isContextLost()) throw new Error("context lost");
+      var problem = compare(out, t[2], t[3], "f");
+      row(name, !problem, problem);
+      gl.deleteProgram(p);
+    } catch (x) { row(name, false, x.message); while (gl.getError()) {} }
+  });
+}
+
+// ==== WGSL =========================================================================================
+
+var device = null, features = [];
+// name, declarations + fn run(i: u32) -> vec4<T>, js, tolerance, kind (f, u, i), options { feature, extra: bytes | [bytes], constants }
+var WGSL_TESTS = [
+  ["trigonometry", "fn run(i : u32) -> vec4<f32> { let x = f32(i); return vec4<f32>(sin(x * 0.5), cos(x * 0.5), tan(x * 0.1), atan2(x - 7.5, 3.0)); }",
+    function (i) { return [Math.sin(i * 0.5), Math.cos(i * 0.5), Math.tan(i * 0.1), Math.atan2(i - 7.5, 3)]; }, 2e-3, "f"],
+  ["inverse trigonometry, hyperbolics", "fn run(i : u32) -> vec4<f32> { let x = f32(i); return vec4<f32>(asin(x / 16.0 - 0.45), acos(x / 16.0 - 0.45), sinh(x * 0.2 - 1.5), tanh(x * 0.3 - 2.0)); }",
+    function (i) { return [Math.asin(i / 16 - 0.45), Math.acos(i / 16 - 0.45), Math.sinh(i * 0.2 - 1.5), Math.tanh(i * 0.3 - 2)]; }, 2e-3, "f"],
+  ["exponentials", "fn run(i : u32) -> vec4<f32> { let x = f32(i); return vec4<f32>(pow(1.5, x * 0.25), exp(x * 0.2 - 1.0), log2(x + 1.0), inverseSqrt(x + 1.0)); }",
+    function (i) { return [Math.pow(1.5, i * 0.25), Math.exp(i * 0.2 - 1), Math.log2(i + 1), 1 / Math.sqrt(i + 1)]; }, 2e-3, "f"],
+  ["fma, mix, smoothstep, saturate", "fn run(i : u32) -> vec4<f32> { let x = f32(i); return vec4<f32>(fma(x, 1.5, -2.0), mix(2.0, 10.0, x / 15.0), smoothstep(2.0, 12.0, x), saturate(x / 8.0 - 0.5)); }",
+    function (i) { return [i * 1.5 - 2, 2 + 8 * i / 15, smoothstep(2, 12, i), Math.min(Math.max(i / 8 - 0.5, 0), 1)]; }, 1e-4, "f"],
+  ["rounding: floor, ceil, round, trunc", "fn run(i : u32) -> vec4<f32> { let x = f32(i); let v = (x + 0.25) * 0.7 - 3.0; return vec4<f32>(floor(v), ceil(v), round(x + 0.5), trunc(v)); }",
+    function (i) { var v = (i + 0.25) * 0.7 - 3; return [Math.floor(v), Math.ceil(v), roundEven(i + 0.5), Math.trunc(v)]; }, 0, "f"],
+  ["modf and frexp", "fn run(i : u32) -> vec4<f32> { let x = f32(i); let m = modf(x * 1.25 + 0.3 - 5.0); let f = frexp(x * 3.0 + 1.0); return vec4<f32>(m.fract, m.whole, f.fract, f32(f.exp)); }",
+    function (i) { var v = f32(i * 1.25 + 0.3 - 5), w = Math.trunc(v), fr = frexp(i * 3 + 1); return [v - w, w, fr[0], fr[1]]; }, 1e-5, "f"],
+  ["ldexp, sign, abs, clamp", "fn run(i : u32) -> vec4<f32> { let x = f32(i); return vec4<f32>(ldexp(1.5, i32(i) - 4), sign(x - 7.0), abs(x - 7.5), clamp(x, 3.0, 9.0)); }",
+    function (i) { return [1.5 * Math.pow(2, i - 4), Math.sign(i - 7), Math.abs(i - 7.5), Math.min(Math.max(i, 3), 9)]; }, 0, "f"],
+  ["dot, cross, length, distance", "fn run(i : u32) -> vec4<f32> { let x = f32(i); return vec4<f32>(dot(vec3<f32>(x, 1.0, 2.0), vec3<f32>(1.0, x, 3.0)), cross(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, x, 1.0)).z, length(vec2<f32>(x, 3.0)), distance(vec2<f32>(x, 0.0), vec2<f32>(1.0, 1.0))); }",
+    function (i) { return [2 * i + 6, i, Math.hypot(i, 3), Math.hypot(i - 1, 1)]; }, 1e-4, "f"],
+  ["reflect, refract, faceForward, normalize", "fn run(i : u32) -> vec4<f32> { let x = f32(i); let r = reflect(vec2<f32>(1.0, -1.0), normalize(vec2<f32>(0.0, 2.0)));\n" +
+    "let t = refract(vec3<f32>(0.6, -0.8, 0.0), vec3<f32>(0.0, 1.0, 0.0), x / 16.0 + 0.5); let f = faceForward(vec2<f32>(0.0, 1.0), vec2<f32>(x - 7.5, 1.0), vec2<f32>(0.0, 1.0)); return vec4<f32>(r.y, t.x, t.y, f.y); }",
+    function (i) { var eta = i / 16 + 0.5, d = -0.8, k = 1 - eta * eta * (1 - d * d), tx = 0, ty = 0;
+      if (k >= 0) { tx = eta * 0.6; ty = eta * -0.8 - (eta * d + Math.sqrt(k)); } return [1, tx, ty, -1]; }, 1e-4, "f"],
+  ["signed division and remainder", "fn run(i : u32) -> vec4<i32> { let a = i32(i) * 7 - 40; return vec4<i32>(a / 3, a % 5, a / -4, -a % 3); }",
+    function (i) { var a = i * 7 - 40; return [Math.trunc(a / 3), a % 5, Math.trunc(a / -4), -a % 3]; }, 0, "i"],
+  ["bit counting and reversal", "fn run(i : u32) -> vec4<u32> { let u = i * 2654435761u; return vec4<u32>(countOneBits(u), countLeadingZeros(u), countTrailingZeros(u), reverseBits(u)); }",
+    function (i) { var u = Math.imul(i, 2654435761 | 0) >>> 0; return [popcount(u), clz(u), ctz(u), reverse(u)]; }, 0, "u"],
+  ["firstLeadingBit, firstTrailingBit", "fn run(i : u32) -> vec4<u32> { let s = i32(i) - 8; return vec4<u32>(bitcast<u32>(firstLeadingBit(s)), firstLeadingBit(i << 3u), firstTrailingBit(i << 3u), bitcast<u32>(firstLeadingBit(-1 - i32(i)))); }",
+    function (i) { var s = i - 8; function fl(v) { if (v === 0 || v === -1) return -1; if (v < 0) v = ~v; return 31 - Math.clz32(v); }
+      var u = (i << 3) >>> 0; return [fl(s) >>> 0, u ? 31 - Math.clz32(u) : 0xffffffff, u ? ctz(u) : 0xffffffff, fl(-1 - i) >>> 0]; }, 0, "u"],
+  ["extractBits, insertBits", "fn run(i : u32) -> vec4<u32> { return vec4<u32>(extractBits(0xdeadbeefu, i, 8u), bitcast<u32>(extractBits(bitcast<i32>(0xdeadbeefu), i, 5u)), insertBits(0u, 5u, i, 3u), insertBits(0xffffffffu, 0u, i, 4u)); }",
+    function (i) { var v = 0xdeadbeef, e8 = (v >>> i) & 0xff, e5 = (v >>> i) & 0x1f; if (e5 & 0x10) e5 = (e5 | ~0x1f) >>> 0;
+      var cnt3 = Math.min(3, 32 - i), m3 = cnt3 >= 32 ? 0xffffffff : ((1 << cnt3) - 1) << i, cnt4 = Math.min(4, 32 - i), m4 = ((1 << cnt4) - 1) << i;
+      return [e8, e5, ((5 << i) & m3) >>> 0, (0xffffffff & ~m4) >>> 0]; }, 0, "u"],
+  ["shifts", "fn run(i : u32) -> vec4<u32> { let s = -1000; return vec4<u32>(0x12345678u << ((i + 20u) % 32u), 0x87654321u >> i, bitcast<u32>(s >> i), bitcast<u32>(i32(i) << 28u)); }",
+    function (i) { return [(0x12345678 << ((i + 20) % 32)) >>> 0, 0x87654321 >>> i, (-1000 >> i) >>> 0, (i << 28) >>> 0]; }, 0, "u"],
+  ["wrapping arithmetic", "fn run(i : u32) -> vec4<u32> { let m = 2147483647; return vec4<u32>(0xffffffffu + i, bitcast<u32>(m + i32(i)), i * 0x9e3779b9u, bitcast<u32>(-2147483647 - 1 - i32(i))); }",
+    function (i) { return [(0xffffffff + i) >>> 0, (2147483647 + i) >>> 0, Math.imul(i, 0x9e3779b9 | 0) >>> 0, (-2147483648 - i) >>> 0]; }, 0, "u"],
+  ["pack 4x8 and 2x16", "fn run(i : u32) -> vec4<u32> { let x = f32(i); return vec4<u32>(pack4x8unorm(vec4<f32>(x / 15.0, 0.5, 1.0, 0.0)), pack4x8snorm(vec4<f32>(x / 16.0 - 0.45, -1.0, 0.5, 0.0)),\n" +
+    "pack2x16unorm(vec2<f32>(x / 15.0, 0.25)), pack2x16float(vec2<f32>(x * 0.5, -x))); }",
+    function (i) { function sn(v) { return Math.floor(0.5 + 127 * Math.min(1, Math.max(-1, v))) & 0xff; }
+      return [(17 * i) | (128 << 8) | (255 << 16), sn(i / 16 - 0.45) | (sn(-1) << 8) | (sn(0.5) << 16), i * 4369 + 16384 * 65536, (halfBits(i * 0.5) | (halfBits(-i) << 16)) >>> 0]; }, 0, "u"],
+  ["unpacking", "fn run(i : u32) -> vec4<f32> { return vec4<f32>(unpack4x8unorm(0x80ff00u + i).y, unpack4x8snorm(0x81000000u + i).w, unpack2x16float(0x3c00u | (i << 26u)).x, unpack2x16snorm(0x7fffu + (i << 16u)).y); }",
+    function (i) { return [255 / 255, Math.max(-127 / 127, -1), 1, Math.max(((i << 16 >> 16) / 32767), -1)]; }, 1e-5, "f"],
+  ["bitcast", "fn run(i : u32) -> vec4<u32> { let x = f32(i); return vec4<u32>(bitcast<u32>(bitcast<f32>(0x40490fdbu) * 2.0), bitcast<u32>(x * 0.5), bitcast<vec2<u32>>(vec2<f32>(x, -x)).y, bitcast<u32>(bitcast<i32>(0xffffffffu) + 2)); }",
+    function (i) { return [floatBits(f32(bitsFloat(0x40490fdb) * 2)), floatBits(i * 0.5), floatBits(-i), 1]; }, 0, "u"],
+  ["matrices", "fn run(i : u32) -> vec4<f32> { let x = f32(i); let m = mat2x2<f32>(1.0, 2.0, 3.0, x); let v = m * vec2<f32>(1.0, 1.0); let a = mat2x3<f32>(1.0, 2.0, 3.0, 4.0, 5.0, x);\n" +
+    "return vec4<f32>(v.y, determinant(m), transpose(m)[0][1], (a * vec2<f32>(1.0, 2.0)).z); }",
+    function (i) { return [2 + i, i - 6, 3, 3 + 2 * i]; }, 1e-5, "f"],
+  ["structs, arrays and private globals", "struct S { a : f32, b : array<i32, 3> }\nvar<private> table : array<vec2<f32>, 4> = array<vec2<f32>, 4>(vec2<f32>(1.0, 2.0), vec2<f32>(3.0, 4.0), vec2<f32>(5.0, 6.0), vec2<f32>(7.0, 8.0));\n" +
+    "fn run(i : u32) -> vec4<f32> { var s : array<S, 4>; for (var k = 0u; k < 4u; k++) { s[k].a = f32(k) * 1.5; for (var j = 0u; j < 3u; j++) { s[k].b[j] = i32(k * 10u + j); } }\n" +
+    "let k = i % 4u; return vec4<f32>(s[k].a, f32(s[k].b[i % 3u]), table[3u - k].y, f32(arrayLength(&extra))); }",
+    function (i) { var k = i % 4; return [k * 1.5, k * 10 + i % 3, [8, 6, 4, 2][k], 37]; }, 0, "f", { extra: 37 * 4, decl: "@group(0) @binding(1) var<storage, read_write> extra : array<u32>;" }],
+  ["runtime-sized arrays in a struct", "struct Data { count : u32, values : array<f32> }\n@group(0) @binding(1) var<storage, read_write> data : Data;\n" +
+    "fn run(i : u32) -> vec4<f32> { data.values[i] = f32(i) * 2.0; storageBarrier(); return vec4<f32>(f32(arrayLength(&data.values)), data.values[15u - i], f32(data.count), 0.0); }",
+    function (i) { return [17, (15 - i) * 2, 0, 0]; }, 0, "f", { extra: 18 * 4 }],
+  ["pointers", "fn bump(p : ptr<function, f32>, k : f32) { *p += k; }\nfn swap(a : ptr<function, vec2<f32>>) { *a = (*a).yx; }\n" +
+    "fn run(i : u32) -> vec4<f32> { let x = f32(i); var acc = 1.0; bump(&acc, x); var v = vec2<f32>(1.0, x); swap(&v); var arr = array<f32, 4>(10.0, 20.0, 30.0, 40.0); bump(&arr[i % 4u], x);\n" +
+    "return vec4<f32>(acc, v.x, arr[i % 4u], arr[(i + 1u) % 4u]); }",
+    function (i) { var arr = [10, 20, 30, 40]; return [1 + i, i, arr[i % 4] + i, arr[(i + 1) % 4]]; }, 0, "f"],
+  ["switch, loop with continuing, for, while", "fn run(i : u32) -> vec4<f32> { var r = 0.0; switch (i % 5u) { case 0u, 1u: { r = 1.0; } case 4u, default: { r = 7.0; } case 2u: { r = 3.0; } }\n" +
+    "var j = 0u; var sum = 0u; loop { if (j % 3u == 0u) { continue; } sum += j; continuing { j++; break if j > i; } }\n" +
+    "var odd = 0u; for (var k = 0u; k < 16u; k++) { if (k % 2u == 0u) { continue; } if (k > i) { break; } odd += k; }\n" +
+    "var w = 0u; while (w * w < i) { w++; } return vec4<f32>(r, f32(sum), f32(odd), f32(w)); }",
+    function (i) { var r = [1, 1, 3, 7, 7][i % 5], sum = 0; for (var j = 0; j <= i; j++) if (j % 3) sum += j; var odd = 0; for (var k = 0; k < 16; k++) { if (k % 2 === 0) continue; if (k > i) break; odd += k; }
+      var w = 0; while (w * w < i) w++; return [r, sum, odd, w]; }, 0, "f"],
+  ["override constants", "override scale : f32 = 1.0;\noverride flag : bool = false;\noverride count : u32 = 2u;\n" +
+    "fn run(i : u32) -> vec4<f32> { return vec4<f32>(scale * f32(i), select(0.0, 1.0, flag), f32(count), scale + 1.0); }",
+    function (i) { return [2.5 * i, 1, 9, 3.5]; }, 0, "f", { constants: { scale: 2.5, flag: 1, count: 9 } }],
+  ["const expressions", "const k = vec3<f32>(1.0, 2.0, 3.0) * 2.0;\nconst n = countOneBits(0xffu);\nconst arr = array<f32, n>(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0);\n" +
+    "fn run(i : u32) -> vec4<f32> { return vec4<f32>(k.y, f32(n), arr[i % n], k.z); }",
+    function (i) { return [4, 8, i % 8 + 1, 6]; }, 0, "f"],
+  ["atomics, storage and workgroup", "@group(0) @binding(1) var<storage, read_write> a : array<atomic<u32>, 4>;\nvar<workgroup> w : atomic<u32>;\n" +
+    "fn run(i : u32) -> vec4<u32> { atomicAdd(&a[0], i); atomicMax(&a[1], i * 3u); atomicMin(&a[2], 100u - i); atomicOr(&w, 1u << i); atomicXor(&a[3], 1u << i);\n" +
+    "storageBarrier(); workgroupBarrier(); return vec4<u32>(atomicLoad(&a[0]), atomicLoad(&a[1]), atomicLoad(&a[2]) + atomicLoad(&w) * 1000u, atomicLoad(&a[3])); }",
+    function (i) { return [120, 45, 85 + 0xffff * 1000, 0xffff]; }, 0, "u", { extra: 16, init: [0, 0, 1000, 0] }],
+  ["workgroupUniformLoad", "var<workgroup> v : u32;\nfn run(i : u32) -> vec4<u32> { if (i == 3u) { v = 77u; } let u = workgroupUniformLoad(&v); return vec4<u32>(u, u * 2u, i, 0u); }",
+    function (i) { return [77, 154, i, 0]; }, 0, "u"],
+  ["texture queries, loads, gathers and comparisons in compute",
+    "@group(0) @binding(1) var arr : texture_2d_array<f32>;\n@group(0) @binding(2) var mip : texture_2d<f32>;\n@group(0) @binding(3) var smp : sampler;\n@group(0) @binding(4) var dep : texture_depth_2d;\n@group(0) @binding(5) var cmp : sampler_comparison;\n" +
+    "fn run(i : u32) -> vec4<f32> { let d = textureDimensions(mip, 1u); let g = textureGather(1, mip, smp, vec2<f32>(0.5, 0.5));\n" +
+    "return vec4<f32>(textureLoad(arr, vec2<u32>(1u, 0u), 1u, 0).r * 255.0 + f32(textureNumLayers(arr)) * 1000.0, f32(d.x * 10u) + f32(textureNumLevels(mip)) * 100.0,\n" +
+    "  textureSampleLevel(mip, smp, vec2<f32>(0.5), 1.0).b * 255.0 + (g.x + g.y + g.z + g.w) * 255.0 * 1000.0, textureSampleCompareLevel(dep, cmp, vec2<f32>(0.5), 0.6) + textureSampleCompareLevel(dep, cmp, vec2<f32>(0.5), 0.2) * 10.0); }",
+    function (i) { return [77 + 2000, 20 + 300, 200 + (60 + 60 + 120 + 120) * 1000, 10]; }, 1e-6, "f", { textures: true }],
+  ["subgroups", "enable subgroups;\nfn run2(i : u32, sg : u32, n : u32) -> vec4<u32> { let ex = subgroupExclusiveAdd(1u); let sh = subgroupShuffleXor(i, 1u); let all = subgroupAll(true);\n" +
+    "  let none = subgroupAny(false); let mx = subgroupMax(sg);\n" +
+    "  return vec4<u32>(select(0u, 1u, ex == sg), select(0u, 1u, n < 2u || sh == (i ^ 1u)), select(0u, 1u, all && !none), select(0u, 1u, mx == n - 1u || mx == 15u)); }",
+    function (i) { return [1, 1, 1, 1]; }, 0, "u", { feature: "subgroups", subgroupMain: true }],
+  ["f16 arithmetic", "enable f16;\nfn run(i : u32) -> vec4<f32> { let h = f16(i) * 0.5h + 0.25h; return vec4<f32>(f32(h), f32(sqrt(h)), f32(h * h), f32(max(h, 3.0h))); }",
+    function (i) { var h = i * 0.5 + 0.25; return [h, Math.sqrt(h), h * h, Math.max(h, 3)]; }, 1e-3, "f", { feature: "shader-f16" }]
+];
+
+async function gpuCompute(t) {
+  var options = t[5] || {}, kind = t[4];
+  var type = { f: "vec4<f32>", u: "vec4<u32>", i: "vec4<i32>" }[kind];
+  var code = (options.decl || "") + "\n" + t[1] + "\n@group(0) @binding(0) var<storage, read_write> o : array<" + type + ", 16>;\n";
+  if (options.subgroupMain) code += "@compute @workgroup_size(16) fn main(@builtin(local_invocation_index) i : u32, @builtin(subgroup_invocation_id) sg : u32, @builtin(subgroup_size) n : u32) { o[i] = run2(i, sg, n); }";
+  else code += "@compute @workgroup_size(16) fn main(@builtin(local_invocation_index) i : u32) { o[i] = run(i); }";
+  if (options.subgroupMain || /enable/.test(t[1])) code = t[1].split("\n")[0] + "\n" + code.replace(t[1].split("\n")[0], "");
+  var module = device.createShaderModule({ code: code });
+  var info = await module.getCompilationInfo();
+  var errors = info.messages.filter(function (m) { return m.type === "error"; });
+  if (errors.length) throw new Error("WGSL: " + errors.map(function (m) { return m.lineNum + ":" + m.linePos + " " + m.message; }).join("; "));
+  var descriptor = { layout: "auto", compute: { module: module, entryPoint: "main" } };
+  if (options.constants) descriptor.compute.constants = options.constants;
+  var pipeline = await within(device.createComputePipelineAsync(descriptor), 60, "createComputePipelineAsync");
+  var out = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  var entries = [{ binding: 0, resource: { buffer: out } }];
+  if (options.extra) {
+    var extra = device.createBuffer({ size: options.extra, usage: GPUBufferUsage.STORAGE, mappedAtCreation: true });
+    if (options.init) new Uint32Array(extra.getMappedRange()).set(options.init);
+    extra.unmap();
+    entries.push({ binding: 1, resource: { buffer: extra } });
+  }
+  if (options.textures) {
+    var arr = device.createTexture({ size: [2, 2, 2], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    var layers = new Uint8Array(32); layers.fill(0); layers.set([77, 0, 0, 255], 16 + 4);   // layer 1, texel (1, 0)
+    device.queue.writeTexture({ texture: arr }, layers, { bytesPerRow: 8, rowsPerImage: 2 }, [2, 2, 2]);
+    var mip = device.createTexture({ size: [4, 4], mipLevelCount: 3, format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    var l0 = new Uint8Array(64);
+    for (var y = 0; y < 4; y++) for (var x = 0; x < 4; x++) l0.set([x * 60, y * 60, 7, 255], (y * 4 + x) * 4);
+    device.queue.writeTexture({ texture: mip }, l0, { bytesPerRow: 16 }, [4, 4]);
+    device.queue.writeTexture({ texture: mip, mipLevel: 1 }, new Uint8Array([100, 150, 200, 255, 100, 150, 200, 255, 100, 150, 200, 255, 100, 150, 200, 255]), { bytesPerRow: 8 }, [2, 2]);
+    var dep = device.createTexture({ size: [2, 2], format: "depth32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT });
+    var enc0 = device.createCommandEncoder();
+    enc0.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: dep.createView(), depthClearValue: 0.5, depthLoadOp: "clear", depthStoreOp: "store" } }).end();
+    device.queue.submit([enc0.finish()]);
+    entries.push({ binding: 1, resource: arr.createView({ dimension: "2d-array" }) }, { binding: 2, resource: mip.createView() },
+      { binding: 3, resource: device.createSampler({ minFilter: "nearest", magFilter: "nearest", mipmapFilter: "nearest" }) },
+      { binding: 4, resource: dep.createView() }, { binding: 5, resource: device.createSampler({ compare: "less" }) });
+  }
+  var read = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder(), c = enc.beginComputePass();
+  c.setPipeline(pipeline);
+  c.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: entries }));
+  c.dispatchWorkgroups(1); c.end();
+  enc.copyBufferToBuffer(out, 0, read, 0, 256);
+  device.queue.submit([enc.finish()]);
+  await within(read.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var buffer = read.getMappedRange().slice(0); read.unmap();
+  return kind === "u" ? new Uint32Array(buffer) : kind === "i" ? new Int32Array(buffer) : new Float32Array(buffer);
+}
+
+// Fragment and vertex built-ins, rendered into a 4x4 rgba32float target.
+var WGSL_RENDER_TESTS = [
+  ["fragment built-ins: derivatives, position, front_facing",
+    "@fragment fn fs(@builtin(position) p : vec4<f32>, @builtin(front_facing) front : bool) -> @location(0) vec4<f32> {\n" +
+    "  return vec4<f32>(dpdx(p.x) + dpdyFine(p.y) * 10.0, fwidth(p.x * 3.0 + p.y), fract(p.x) + p.z * 10.0, select(0.0, 1.0, front)); }",
+    function (i) { return [11, 4, 0.5, 1]; }],
+  ["flat interpolation takes the first vertex; vertex_index, instance_index",
+    "struct V { @builtin(position) pos : vec4<f32>, @location(0) @interpolate(flat) ids : vec2<u32> };\n" +
+    "@vertex fn vs2(@builtin(vertex_index) v : u32, @builtin(instance_index) n : u32) -> V { var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));\n" +
+    "  var o : V; o.pos = vec4<f32>(p[v], 0.0, 1.0); o.ids = vec2<u32>(v, n); return o; }\n" +
+    "@fragment fn fs(o : V) -> @location(0) vec4<f32> { return vec4<f32>(f32(o.ids.x), f32(o.ids.y), 0.0, 1.0); }",
+    function (i) { return [0, 3, 0, 1]; }, { vertex: "vs2", firstInstance: 3 }]
+];
+var FULLSCREEN_VS = "@vertex fn vs(@builtin(vertex_index) v : u32) -> @builtin(position) vec4<f32> { var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)); return vec4<f32>(p[v], 0.0, 1.0); }\n";
+
+async function gpuRender(t) {
+  var options = t[3] || {};
+  var module = device.createShaderModule({ code: FULLSCREEN_VS + t[1] });
+  var info = await module.getCompilationInfo();
+  var errors = info.messages.filter(function (m) { return m.type === "error"; });
+  if (errors.length) throw new Error("WGSL: " + errors.map(function (m) { return m.lineNum + ":" + m.linePos + " " + m.message; }).join("; "));
+  var pipeline = await within(device.createRenderPipelineAsync({ layout: "auto", vertex: { module: module, entryPoint: options.vertex || "vs" },
+    fragment: { module: module, entryPoint: "fs", targets: [{ format: "rgba32float" }] } }), 60, "createRenderPipelineAsync");
+  var target = device.createTexture({ size: [4, 4], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  var read = device.createBuffer({ size: 256 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder();
+  var pass = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), clearValue: [-1, -1, -1, -1], loadOp: "clear", storeOp: "store" }] });
+  pass.setPipeline(pipeline); pass.draw(3, 1, 0, options.firstInstance || 0); pass.end();
+  enc.copyTextureToBuffer({ texture: target }, { buffer: read, bytesPerRow: 256, rowsPerImage: 4 }, [4, 4, 1]);
+  device.queue.submit([enc.finish()]);
+  await within(read.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var all = new Float32Array(read.getMappedRange().slice(0)); read.unmap();
+  var out = new Float32Array(64);
+  for (var y = 0; y < 4; y++) out.set(all.subarray(y * 64, y * 64 + 16), y * 16);
+  return out;
+}
+
+async function runWGSL() {
+  if (!("gpu" in navigator)) { row("wgsl", null, "navigator.gpu absent"); return; }
+  var adapter = await within(navigator.gpu.requestAdapter(), 60, "requestAdapter");
+  if (!adapter) { row("wgsl: adapter", false, "requestAdapter() returned null"); return; }
+  features = ["subgroups", "shader-f16"].filter(function (f) { return adapter.features.has(f); });
+  device = await within(adapter.requestDevice({ requiredFeatures: features }), 60, "requestDevice");
+  document.getElementById("info").textContent = "webgpu: " + adapter.info.vendor + " " + adapter.info.architecture + "; features " + features.join(" ");
+  for (var k = 0; k < WGSL_TESTS.length; k++) {
+    var t = WGSL_TESTS[k], options = t[5] || {}, name = "wgsl: " + t[0];
+    if (options.feature && features.indexOf(options.feature) < 0) { row(name, null, options.feature + " not exposed"); continue; }
+    device.pushErrorScope("validation");
+    var problem = "";
+    try { problem = compare(await gpuCompute(t), t[2], t[3], t[4]); } catch (e) { problem = e.message; }
+    var error = await within(device.popErrorScope(), 20, "popErrorScope");
+    if (error) problem = (problem ? problem + "; " : "") + "validation: " + error.message;
+    row(name, !problem, problem);
+  }
+  for (var r = 0; r < WGSL_RENDER_TESTS.length; r++) {
+    var rt = WGSL_RENDER_TESTS[r], rname = "wgsl: " + rt[0];
+    device.pushErrorScope("validation");
+    var rproblem = "";
+    try { rproblem = compare(await gpuRender(rt), rt[2], 1e-5, "f"); } catch (e) { rproblem = e.message; }
+    var rerror = await within(device.popErrorScope(), 20, "popErrorScope");
+    if (rerror) rproblem = (rproblem ? rproblem + "; " : "") + "validation: " + rerror.message;
+    row(rname, !rproblem, rproblem);
+  }
+}
+
+(async function main() {
+  document.getElementById("info").textContent = "";
+  try { await runWGSL(); } catch (e) { row("wgsl: main", false, "threw " + e.message); }
+  try { runGL(); } catch (e) { row("glsl: main", false, "threw " + e.message); }
+})().finally(function () {
+  var verdict = failures.length ? "FAIL " + failures[0] : "PASS";
+  document.getElementById("status").textContent = verdict + "; " + passes + " passed, " + failures.length + " failed" +
+    (failures.length ? " (" + failures.join(", ") + ")" : "") + ", " + skips + " skipped";
+  document.getElementById("h").setAttribute("data-js", "ran");
+  document.body.dataset.verdict = verdict;
+  document.title = "Alchemy GPU shaders: " + verdict;
+  finished = true;
+});
+</script>
+</body>
+</html>
