@@ -1,6 +1,6 @@
 // Accelerate (src/alchemy/darwin/accelerate/): the vDSP kernels and packed real FFT
-// (vdsp.cpp), the wider vDSP API (vdsp_vectors.cpp), vForce (vforce.cpp) and vImage (vimage.cpp), and BNNS, where no
-// filter can be created (bnns.cpp).
+// (vdsp.cpp), the wider vDSP API (vdsp_vectors.cpp), vForce (vforce.cpp), vImage (vimage.cpp), BLAS
+// (blas.cpp), and BNNS, where no filter can be created (bnns.cpp).
 #include "alchemy/gui/tests/framework_case.hpp"
 
 #include <bit>
@@ -178,6 +178,191 @@ void vectors(Fixture& f) {
     require(read_double(f, sines, 0) == 0 && near(read_double(f, sines, 1), 1) && read_double(f, cosines, 0) == 1, "vvsincos");
 }
 
+// vImage's added conversions, compositing, matrix multiply, morphology, rotation and scaling.
+void vimage_more(Fixture& f) {
+    // BGRA8888toRGB888: (B 1, G 2, R 3, A 4) -> (3, 2, 1).
+    const auto bgra = f.block(4), rgb = f.block(4);
+    f.engine.write32(bgra, 0x04030201);
+    require(verror(f.call(vdsp, "_vImageConvert_BGRA8888toRGB888", {image_buffer(f, bgra, 1, 1, 4), image_buffer(f, rgb, 1, 1, 3), 0})) == 0 &&
+                f.memory().read8(rgb) == 3 && f.memory().read8(rgb + 2) == 1, "vImageConvert_BGRA8888toRGB888");
+    // Flattening a transparent ARGB pixel over white gives white.
+    const auto clear = f.block(4), white = f.block(4), flat = f.block(4);
+    f.engine.write32(clear, 0x33221100);   // A 0 (the first byte)
+    f.engine.write32(white, 0xffffffff);
+    require(verror(f.call(vdsp, "_vImageFlatten_ARGB8888ToRGB888", {image_buffer(f, clear, 1, 1, 4), image_buffer(f, flat, 1, 1, 3), white, 0, 0})) == 0 &&
+                f.memory().read8(flat) == 255 && f.memory().read8(flat + 2) == 255, "vImageFlatten_ARGB8888ToRGB888");
+    // MatrixMultiply: identity x 256 over a divisor of 256 keeps the pixel.
+    const auto matrix = f.block(32), multiplied = f.block(4), pixel = f.block(4);
+    for (unsigned i = 0; i < 4; ++i) { f.memory().write8(matrix + 2 * (i * 4 + i), 0); f.memory().write8(matrix + 2 * (i * 4 + i) + 1, 1); }
+    f.engine.write32(pixel, 0x80402010);
+    require(verror(f.call(vdsp, "_vImageMatrixMultiply_ARGB8888", {image_buffer(f, pixel, 1, 1, 4), image_buffer(f, multiplied, 1, 1, 4), matrix, 256, 0, 0, 0})) == 0 &&
+                f.engine.read32(multiplied) == 0x80402010, "vImageMatrixMultiply_ARGB8888");
+    // Max_Planar8 3x3 over a 3x3 image with 90 in the middle: everywhere 90.
+    const auto planar = f.block(9), maximum = f.block(9);
+    f.memory().write8(planar + 4, 90);
+    require(verror(f.call(vdsp, "_vImageMax_Planar8", {image_buffer(f, planar, 3, 3, 3), image_buffer(f, maximum, 3, 3, 3), 0, 0, 0, 3, 3, 0})) == 0 &&
+                f.memory().read8(maximum) == 90 && f.memory().read8(maximum + 8) == 90, "vImageMax_Planar8");
+    // Rotate_ARGB8888 by pi swaps the two pixels of a 2x1 image.
+    const auto pair = f.block(8), turned = f.block(8), background = f.block(4);
+    f.engine.write32(pair, 0xff0000ff);
+    f.engine.write32(pair + 4, 0xff00ff00);
+    alchemy::CallRegs rotate{};
+    rotate.x = {image_buffer(f, pair, 1, 2, 8), image_buffer(f, turned, 1, 2, 8), 0, background, 0};
+    rotate.set_s(0, 3.14159265f);
+    require(verror(f.regs(vdsp, "_vImageRotate_ARGB8888", rotate).x0) == 0 && f.engine.read32(turned) == 0xff00ff00 && f.engine.read32(turned + 4) == 0xff0000ff,
+            "vImageRotate_ARGB8888 by pi");
+    // Scale_Planar16U 1x1 -> 2x2 keeps the value; Planar16F 1.0 converts to 1.0f.
+    const auto sixteen = f.block(2), scaled = f.block(8);
+    f.memory().write8(sixteen, 0x34);
+    f.memory().write8(sixteen + 1, 0x12);
+    require(verror(f.call(vdsp, "_vImageScale_Planar16U", {image_buffer(f, sixteen, 1, 1, 2), image_buffer(f, scaled, 2, 2, 4), 0, 0})) == 0 &&
+                (f.engine.read32(scaled + 4) & 0xffff) == 0x1234, "vImageScale_Planar16U");
+    const auto half = f.block(2), single = f.block(4);
+    f.memory().write8(half, 0x00);
+    f.memory().write8(half + 1, 0x3c);
+    require(verror(f.call(vdsp, "_vImageConvert_Planar16FtoPlanarF", {image_buffer(f, half, 1, 1, 2), image_buffer(f, single, 1, 1, 4), 0})) == 0 &&
+                read_float(f, single) == 1.0f, "vImageConvert_Planar16FtoPlanarF");
+}
+
+// vdsp_more.cpp and the DCT: compound arithmetic, clipping counts, sorting, gathering, split
+// complex division, the 2-D FFT, filters and integrals.
+void vdsp_more(Fixture& f) {
+    // vasm: (A + B) * c.
+    const auto a = floats(f, {1, 2, 3}), b = floats(f, {3, 2, 1}), c = floats(f, {2}), out = floats(f, {0, 0, 0});
+    static_cast<void>(f.call(vdsp, "_vDSP_vasm", {a, 1, b, 1, c, out, 1, 3}));
+    require(read_float(f, out, 0) == 8 && read_float(f, out, 2) == 8, "vDSP_vasm");
+    // vclipc into [1.5, 2.5]: one below, one above.
+    const auto low = floats(f, {1.5f}), high = floats(f, {2.5f}), below = f.block(8), above = f.block(8);
+    alchemy::CallRegs clip{};
+    clip.x = {a, 1, low, high, out, 1, 3, below};
+    clip.push_stack(above);
+    static_cast<void>(f.regs(vdsp, "_vDSP_vclipc", clip));
+    require(read_float(f, out, 0) == 1.5f && read_float(f, out, 2) == 2.5f && f.engine.read64(below) == 1 && f.engine.read64(above) == 1, "vDSP_vclipc");
+    // vsort descending; vgathr with 1-based indices.
+    const auto sortable = doubles(f, {2, 9, 4});
+    static_cast<void>(f.call(vdsp, "_vDSP_vsortD", {sortable, 3, static_cast<std::uint64_t>(-1)}));
+    require(read_double(f, sortable, 0) == 9 && read_double(f, sortable, 2) == 2, "vDSP_vsortD descending");
+    const auto indices = f.block(16);
+    f.engine.write64(indices, 3);
+    f.engine.write64(indices + 8, 1);
+    static_cast<void>(f.call(vdsp, "_vDSP_vgathr", {a, indices, 1, out, 1, 2}));
+    require(read_float(f, out, 0) == 3 && read_float(f, out, 1) == 1, "vDSP_vgathr");
+    // zvdiv (B first): (4 + 2i) / (1 + i) = 3 - i.
+    const auto split = [&](float re, float im) {
+        const auto s = f.block(16);
+        f.engine.write64(s, floats(f, {re}));
+        f.engine.write64(s + 8, floats(f, {im}));
+        return s;
+    };
+    const auto zb = split(1, 1), za = split(4, 2), zc = split(0, 0);
+    static_cast<void>(f.call(vdsp, "_vDSP_zvdiv", {zb, 1, za, 1, zc, 1, 1}));
+    require(near(read_float(f, f.engine.read64(zc)), 3) && near(read_float(f, f.engine.read64(zc + 8)), -1), "vDSP_zvdiv");
+    // fft2d_zip of a 2x2 grid of ones: 4 at DC, zeros elsewhere.
+    const auto grid = f.block(16);
+    f.engine.write64(grid, floats(f, {1, 1, 1, 1}));
+    f.engine.write64(grid + 8, floats(f, {0, 0, 0, 0}));
+    const auto setup = f.call(vdsp, "_vDSP_create_fftsetup", {2, 0});
+    static_cast<void>(f.call(vdsp, "_vDSP_fft2d_zip", {setup, grid, 1, 0, 1, 1, 1}));
+    const auto re = f.engine.read64(grid);
+    require(read_float(f, re, 0) == 4 && read_float(f, re, 1) == 0 && read_float(f, re, 3) == 0, "vDSP_fft2d_zip");
+    static_cast<void>(f.call(vdsp, "_vDSP_destroy_fftsetup", {setup}));
+    // DCT-II of (1, 1, ..., 1) (16): 16 at k = 0, zero elsewhere.
+    const auto dct = f.call(vdsp, "_vDSP_DCT_CreateSetup", {0, 16, 2});
+    const auto ones = f.block(64), spectrum = f.block(64);
+    for (int i = 0; i < 16; ++i) f.engine.write32(ones + 4ULL * i, std::bit_cast<std::uint32_t>(1.0f));
+    static_cast<void>(f.call(vdsp, "_vDSP_DCT_Execute", {dct, ones, spectrum}));
+    require(dct && near(read_float(f, spectrum, 0), 16) && near(read_float(f, spectrum, 5), 0, 1e-4), "vDSP_DCT_Execute type II");
+    static_cast<void>(f.call(vdsp, "_vDSP_DFT_DestroySetup", {dct}));
+    // f3x3 of a 3x3 image with a centre-only filter of 2: the centre doubles, the border is zero.
+    const auto image = floats(f, {1, 2, 3, 4, 5, 6, 7, 8, 9}), kernel = floats(f, {0, 0, 0, 0, 2, 0, 0, 0, 0}), filtered = f.block(36);
+    static_cast<void>(f.call(vdsp, "_vDSP_f3x3", {image, 3, 3, kernel, filtered}));
+    require(read_float(f, filtered, 4) == 10 && read_float(f, filtered, 0) == 0, "vDSP_f3x3");
+    // vtrapz of (0, 1, 2) with step 1: 0, 0.5, 2.
+    const auto ramp = floats(f, {0, 1, 2}), step = floats(f, {1});
+    static_cast<void>(f.call(vdsp, "_vDSP_vtrapz", {ramp, 1, step, out, 1, 3}));
+    require(read_float(f, out, 1) == 0.5f && read_float(f, out, 2) == 2, "vDSP_vtrapz");
+    // deq22 (float) as a pass-through: B = (1, 0, 0, 0, 0).
+    const auto signal = floats(f, {0, 0, 5, 6}), coefficients = floats(f, {1, 0, 0, 0, 0}), filtered2 = floats(f, {0, 0, 0, 0});
+    static_cast<void>(f.call(vdsp, "_vDSP_deq22", {signal, 1, coefficients, filtered2, 1, 2}));
+    require(read_float(f, filtered2, 2) == 5 && read_float(f, filtered2, 3) == 6, "vDSP_deq22");
+}
+
+// BLAS: CBLAS in both storage orders and the four precisions (stack arguments packed as on Apple
+// arm64), the Fortran and `$NEWLAPACK` names, and the legacy LAPACK aliases.
+void blas(Fixture& f) {
+    constexpr std::uint64_t row = 101, col = 102, no = 111, trans = 112, upper = 121, lower = 122, non_unit = 131, left = 141;
+    // sgemm, row-major: [1 2 3; 4 5 6] x [1 2; 3 4; 5 6] = [22 28; 49 64], C = 2 A B + 1 C (C was ones).
+    const auto a = floats(f, {1, 2, 3, 4, 5, 6}), b = floats(f, {1, 2, 3, 4, 5, 6}), c = floats(f, {1, 1, 1, 1});
+    alchemy::CallRegs gemm{};
+    gemm.x = {row, no, no, 2, 2, 3, a, 3};
+    gemm.set_s(0, 2.0f);
+    gemm.set_s(1, 1.0f);
+    gemm.push_stack(b); gemm.push_stack(std::int32_t{2}); gemm.push_stack(c); gemm.push_stack(std::int32_t{2});
+    static_cast<void>(f.regs(vdsp, "_cblas_sgemm", gemm));
+    require(read_float(f, c, 0) == 45 && read_float(f, c, 1) == 57 && read_float(f, c, 2) == 99 && read_float(f, c, 3) == 129, "cblas_sgemm");
+    // dgemv, column-major, transposed: A = [1 3; 2 4] stored by columns, y = A^T x for x = (1, 1).
+    const auto ad = doubles(f, {1, 2, 3, 4}), x = doubles(f, {1, 1}), y = doubles(f, {0, 0});
+    alchemy::CallRegs gemv{};
+    gemv.x = {col, trans, 2, 2, ad, 2, x, 1};
+    gemv.set_d(0, 1.0);
+    gemv.set_d(1, 0.0);
+    gemv.push_stack(y); gemv.push_stack(std::int32_t{1});
+    static_cast<void>(f.regs(vdsp, "_cblas_dgemv", gemv));
+    require(read_double(f, y, 0) == 3 && read_double(f, y, 1) == 7, "cblas_dgemv transposed");
+    // zgemm 1x1: (1 + 2i)(3 - i) = 5 + 5i, alpha 1, beta 0.
+    const auto za = doubles(f, {1, 2}), zb = doubles(f, {3, -1}), zc = doubles(f, {9, 9}), one = doubles(f, {1, 0}), zero = doubles(f, {0, 0});
+    alchemy::CallRegs zgemm{};
+    zgemm.x = {col, no, no, 1, 1, 1, one, za};
+    zgemm.push_stack(std::int32_t{1}); zgemm.push_stack(zb); zgemm.push_stack(std::int32_t{1});
+    zgemm.push_stack(zero); zgemm.push_stack(zc); zgemm.push_stack(std::int32_t{1});
+    static_cast<void>(f.regs(vdsp, "_cblas_zgemm", zgemm));
+    require(read_double(f, zc, 0) == 5 && read_double(f, zc, 1) == 5, "cblas_zgemm");
+    // dtrsm: lower [2 0; 1 1] X = [2 4; 3 5] (column-major) gives X = [1 2; 2 3].
+    const auto tri = doubles(f, {2, 1, 0, 1}), rhs = doubles(f, {2, 3, 4, 5});
+    alchemy::CallRegs trsm{};
+    trsm.x = {col, left, lower, no, non_unit, 2, 2, tri};
+    trsm.set_d(0, 1.0);
+    trsm.push_stack(std::int32_t{2}); trsm.push_stack(rhs); trsm.push_stack(std::int32_t{2});
+    static_cast<void>(f.regs(vdsp, "_cblas_dtrsm", trsm));
+    require(read_double(f, rhs, 0) == 1 && read_double(f, rhs, 1) == 2 && read_double(f, rhs, 2) == 2 && read_double(f, rhs, 3) == 3, "cblas_dtrsm");
+    // dsyrk upper: C = A A^T for A = [1 2] (1x2) is 5 in the one-element triangle.
+    const auto sa = doubles(f, {1, 2}), sc = doubles(f, {0});
+    alchemy::CallRegs syrk{};
+    syrk.x = {row, upper, no, 1, 2, sa, 2, sc};
+    syrk.set_d(0, 1.0);
+    syrk.set_d(1, 0.0);
+    syrk.push_stack(std::int32_t{1});
+    static_cast<void>(f.regs(vdsp, "_cblas_dsyrk", syrk));
+    require(read_double(f, sc) == 5, "cblas_dsyrk");
+    // Level 1: snrm2 (a float result), isamax (0-based), daxpy with a negative increment.
+    const auto v = floats(f, {3, -4, 1});
+    alchemy::CallRegs nrm2{};
+    nrm2.x = {2, v, 1};
+    require(near(f.regs(vdsp, "_cblas_snrm2", nrm2).s(0), 5.0), "cblas_snrm2");
+    require(f.call(vdsp, "_cblas_isamax", {3, v, 1}) == 1, "cblas_isamax");
+    const auto px = doubles(f, {1, 2}), py = doubles(f, {10, 20});
+    alchemy::CallRegs axpy{};
+    axpy.x = {2, px, static_cast<std::uint64_t>(-1), py, 1};
+    axpy.set_d(0, 1.0);
+    static_cast<void>(f.regs(vdsp, "_cblas_daxpy", axpy));
+    require(read_double(f, py, 0) == 12 && read_double(f, py, 1) == 21, "cblas_daxpy backwards");
+    // Fortran: sgemm_ by reference, column-major 1x1x1; ddot$NEWLAPACK; isamax$NEWLAPACK (1-based).
+    const auto ta = f.block(1), fa = floats(f, {3}), fb = floats(f, {4}), fc = floats(f, {0}), falpha = floats(f, {1}), fbeta = floats(f, {0});
+    f.memory().write8(ta, 'N');
+    alchemy::CallRegs fortran{};
+    fortran.x = {ta, ta, count(f, 1), count(f, 1), count(f, 1), falpha, fa, count(f, 1)};
+    fortran.push_stack(fb); fortran.push_stack(count(f, 1)); fortran.push_stack(fbeta); fortran.push_stack(fc); fortran.push_stack(count(f, 1));
+    static_cast<void>(f.regs(vdsp, "_sgemm_", fortran));
+    require(read_float(f, fc) == 12, "sgemm_");
+    alchemy::CallRegs ddot{};
+    ddot.x = {count(f, 2), px, count(f, 1), px, count(f, 1)};
+    require(f.regs(vdsp, "_ddot$NEWLAPACK", ddot).d(0) == 5, "ddot$NEWLAPACK");
+    require(f.call(vdsp, "_isamax$NEWLAPACK", {count(f, 3), v, count(f, 1)}) == 2, "isamax$NEWLAPACK is 1-based");
+    // The legacy LAPACK names are the `$NEWLAPACK` drivers.
+    require(f.symbol(vdsp, "_sgetrf_") == f.symbol(vdsp, "_sgetrf$NEWLAPACK") && f.symbol(vdsp, "_zgesdd_") == f.symbol(vdsp, "_zgesdd$NEWLAPACK"),
+            "legacy LAPACK aliases");
+}
+
 const Case accelerate_case("accelerate", [](Fixture& f) {
     const auto a = floats(f, {1, 2, 3, 4}), b = floats(f, {10, 20, 30, 40}), c = f.block(16);
     static_cast<void>(f.call(vdsp, "_vDSP_vadd", {a, 1, b, 1, c, 1, 4}));
@@ -233,6 +418,9 @@ const Case accelerate_case("accelerate", [](Fixture& f) {
     static_cast<void>(f.call(vdsp, "_BNNSFilterDestroy", {0}));
     vectors(f);
     vimage(f);
+    blas(f);
+    vdsp_more(f);
+    vimage_more(f);
 });
 
 } // namespace

@@ -33,9 +33,23 @@
   * reflections, 90-degree rotations and Lanczos scaling of ARGB8888, Planar8, PlanarF (and
     ARGBFFFF scaling);
   * box, tent and general convolutions with the four edge styles;
-  * histograms.
+  * histograms;
+  * more conversions (RGB888 with RGBA/BGRA and planes, ARGB1555, 16U, half floats, ARGBFFFF planes,
+    channel extraction), flattening and premultiplied blending, the ARGB8888 matrix multiply, table
+    look-ups, equalization, Max/Min, rotation by any angle and affine warps (bilinear), and scaling
+    of the 16-bit, CbCr8 and half-float formats.
 
   Temporary buffers aren't used: a temp-size query answers 0.
+* **Real, more vDSP (`vdsp_more.cpp`), float and double:** compound arithmetic (vasm, vsbm, vaam,
+  vmma, vintb, vpythg, ...), applied ramps, clipping with counts, running sums and integrals,
+  normalize, zero crossings, sorting and gathering, polynomials and table interpolation, polar and
+  rectangular forms, deq22, conv (D), 2-D image filters, the remaining split-complex operations,
+  2-D complex FFTs; DCT types II-IV (`vdsp_vectors.cpp`).
+* **Real, BLAS (`blas.cpp`):** CBLAS levels 1-3 in s/d/c/z (row- or column-major), the Fortran
+  subroutines (`?gemm_`, `?gemv_`, `?axpy_`, `?scal_`, `?copy_`, `?swap_`, `?trsm_`, `?syrk_`, `?ger_`)
+  and their `$NEWLAPACK` names with ?dot, ?nrm2, ?asum, i?amax, and the legacy LAPACK names
+  (`?gesv_`, `?getrf_`, `?gesdd_`, ...) as the `$NEWLAPACK` drivers. The original interface's REAL
+  functions (`sdot_` and the like) are not offered.
 * **Real, LAPACK decomposition drivers (`lapack.cpp`, both builds):** `?gesdd` (SVD by one-sided
   Jacobi), `?syevd`/`?heevd` (symmetric and Hermitian eigen by cyclic Jacobi), `?geev` (general eigen:
   Hessenberg reduction and shifted QR to complex Schur form, real pairs packed as LAPACK does),

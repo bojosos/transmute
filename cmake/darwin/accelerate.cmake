@@ -5,6 +5,8 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/accelerate/vdsp_vectors.cpp
     src/alchemy/darwin/accelerate/vforce.cpp
     src/alchemy/darwin/accelerate/vimage.cpp
+    src/alchemy/darwin/accelerate/blas.cpp
+    src/alchemy/darwin/accelerate/vdsp_more.cpp
     src/alchemy/darwin/accelerate/bnns.cpp)
 alchemy_gui_add_framework_case(accelerate src/alchemy/darwin/accelerate/tests/accelerate_tests.cpp)
 

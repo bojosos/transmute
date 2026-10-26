@@ -630,6 +630,8 @@ void install_accelerate(InstallContext& context) {
     install_vdsp_vectors(context);   // after the kernels above, which keep their names
     install_vforce(context);
     install_vimage(context);
+    install_blas(context);
+    install_vdsp_more(context);
 }
 
 } // namespace alchemy::gui::fill

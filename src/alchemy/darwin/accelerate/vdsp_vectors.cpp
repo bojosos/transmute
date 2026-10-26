@@ -32,7 +32,8 @@
 // - FFTs: create/destroy_fftsetup (D, radix 2), fft_zip/zop (complex, in or out of place; forward
 //   unnormalized, inverse unnormalized), fft_zrip/zrop (D; packed real, results 2x the DFT as vDSP
 //   documents); the DFT interface (DFT_zop/zrop_CreateSetup(D), DFT_Execute(D), DFT_DestroySetup(D))
-//   for lengths f * 2^n, f in {1, 3, 5, 15} (computed as plain DFTs where not radix 2).
+//   for lengths f * 2^n, f in {1, 3, 5, 15} (computed as plain DFTs where not radix 2); DCT_CreateSetup
+//   and DCT_Execute (types II, III and IV, unnormalized, computed directly).
 // - Biquads: biquad_CreateSetup(D), biquad(D) (sections in cascade, direct form II transposed,
 //   the delay array 2 * sections + 2 long as documented), biquad_DestroySetup(D); desamp (D).
 // Lengths over 2^26 stop explicitly.
@@ -118,7 +119,7 @@ template <class T> void dft(std::vector<std::complex<T>>& a, bool inverse) {
 
 // FFT setups: the largest log2 length; DFT setups: the length, direction and kind.
 struct FftSetup { std::uint64_t log2n{}; };
-struct DftSetup { std::uint64_t length{}; bool inverse{}; bool real{}; };
+struct DftSetup { std::uint64_t length{}; bool inverse{}; bool real{}; std::int32_t dct{}; };   // dct: vDSP_DCT_Type, 0 for a DFT
 struct Biquad { std::vector<double> coefficients; std::uint64_t sections{}; };   // b0 b1 b2 a1 a2 per section
 
 class Vectors final : public Provider {
@@ -559,7 +560,7 @@ void Vectors::install_fft() {
         });
     kernel(std::string("_vDSP_DFT_Execute") + (is_double ? "D" : ""), [this, real_fft](CpuState& s, GuestMemory& m) {
         const auto setup = handle<DftSetup>(s.x[0]);
-        if (!setup) throw std::runtime_error("unsupported: Alchemy vDSP: DFT_Execute with an unknown setup");
+        if (!setup || setup->dct) throw std::runtime_error("unsupported: Alchemy vDSP: DFT_Execute with an unknown setup (or a DCT's)");
         const auto n = static_cast<std::size_t>(setup->length);
         const auto count = setup->real ? n / 2 : n;
         const auto re = load<T>(m, s.x[1], 1, count), im = load<T>(m, s.x[2], 1, count);
@@ -591,6 +592,39 @@ void Vectors::install_fft() {
         store<T>(m, s.x[4], 1, out_im);
     });
     kernel(std::string("_vDSP_DFT_DestroySetup") + (is_double ? "D" : ""), [this](CpuState& s, GuestMemory&) { if (s.x[0]) drop(s.x[0]); });
+    if constexpr (!is_double) {
+        // DCT_CreateSetup(previous, vDSP_Length length, vDSP_DCT_Type (2: II, 3: III, 4: IV)), the
+        // lengths of the DFTs; DCT_Execute(setup, const float *input, float *output), unnormalized:
+        //   II:  Y[k] = sum x[n] cos(pi/N (n + 1/2) k)
+        //   III: Y[k] = x[0]/2 + sum_{n >= 1} x[n] cos(pi/N n (k + 1/2))
+        //   IV:  Y[k] = sum x[n] cos(pi/N (n + 1/2)(k + 1/2))
+        // computed directly in double. DFT_DestroySetup destroys it.
+        kernel("_vDSP_DCT_CreateSetup", [this](CpuState& s, GuestMemory&) {
+            auto length = s.x[1];
+            while (length && !(length & 1)) length >>= 1;
+            const auto type = static_cast<std::int32_t>(s.x[2]);
+            const bool valid = s.x[1] >= 2 && (length == 1 || length == 3 || length == 5 || length == 15) && s.x[1] <= (1U << 16) && type >= 2 && type <= 4;
+            s.x[0] = valid ? make_handle(std::make_shared<DftSetup>(DftSetup{s.x[1], false, true, type})) : 0;
+        });
+        kernel("_vDSP_DCT_Execute", [this](CpuState& s, GuestMemory& m) {
+            const auto setup = handle<DftSetup>(s.x[0]);
+            if (!setup || !setup->dct) throw std::runtime_error("unsupported: Alchemy vDSP: DCT_Execute with an unknown setup");
+            const auto n = static_cast<std::size_t>(setup->length);
+            const auto x = load<float>(m, s.x[1], 1, n);
+            std::vector<float> y(n);
+            const double step = std::numbers::pi / static_cast<double>(n);
+            for (std::size_t k = 0; k < n; ++k) {
+                double sum = setup->dct == 3 ? x[0] / 2.0 : 0.0;
+                for (std::size_t i = setup->dct == 3 ? 1 : 0; i < n; ++i) {
+                    const double a = static_cast<double>(i), b = static_cast<double>(k);
+                    const double angle = setup->dct == 2 ? step * (a + 0.5) * b : setup->dct == 3 ? step * a * (b + 0.5) : step * (a + 0.5) * (b + 0.5);
+                    sum += x[i] * std::cos(angle);
+                }
+                y[k] = static_cast<float>(sum);
+            }
+            store<float>(m, s.x[2], 1, y);
+        });
+    }
     // Biquads: biquad_CreateSetup(D) (const double *coefficients, vDSP_Length sections): five per section,
     // b0 b1 b2 a1 a2; biquad(D) (setup, T *delay, X, IX, Y, IY, N); biquad_DestroySetup(D).
     kernel(std::string("_vDSP_biquad_CreateSetup") + (is_double ? "D" : ""), [this](CpuState& s, GuestMemory& m) {
