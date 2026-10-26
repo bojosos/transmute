@@ -117,6 +117,8 @@ public:
     [[nodiscard]] std::shared_ptr<ThreadContext> current_thread();
     // Identities of the threads that have a context now (Mach task_threads).
     [[nodiscard]] std::vector<std::uint64_t> thread_identities() const;
+    // How many threads have had a context so far (ended ones included).
+    [[nodiscard]] std::uint64_t threads_seen() const;
     // Diagnostics (ALCHEMY_HANG_DUMP): each thread with a context and the
     // guest registers its engine holds. For a thread blocked in a provider
     // call they are the call's (pc = the call's address, x30 = the caller).

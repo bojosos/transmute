@@ -139,6 +139,11 @@ void ProcessContext::at_teardown(std::function<void()> hook) {
     teardown_.push_back(std::move(hook));
 }
 
+std::uint64_t ProcessContext::threads_seen() const {
+    std::lock_guard lock(mutex_);
+    return next_thread_ - 1;
+}
+
 std::vector<std::uint64_t> ProcessContext::thread_identities() const {
     std::lock_guard lock(mutex_);
     std::vector<std::uint64_t> identities;

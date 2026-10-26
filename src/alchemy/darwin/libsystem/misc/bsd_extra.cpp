@@ -550,11 +550,10 @@ void install_libsystem_bsd_extra(Provider& p) {
         return 0;
     });
 
-    // int pthread_is_threaded_np(void): nonzero once the process has had a second thread.
-    auto threaded = std::make_shared<std::atomic<bool>>(false);
-    p.libsystem("_pthread_is_threaded_np", [&process, threaded](CpuState&, GuestMemory&) -> std::uint64_t {
-        if (!*threaded && process.thread_identities().size() > 1) *threaded = true;
-        return *threaded ? 1 : 0;
+    // int pthread_is_threaded_np(void): nonzero once the process has had a second thread (also one
+    // that has ended).
+    p.libsystem("_pthread_is_threaded_np", [&process](CpuState&, GuestMemory&) -> std::uint64_t {
+        return process.threads_seen() > 1 ? 1 : 0;
     });
 
     // ---- fortified string functions ----
