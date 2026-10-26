@@ -1540,8 +1540,11 @@ struct Extra {
         return bundle->info;
     }
     // ---- localizations ----
+    // A bundle without a path (the main bundle of a process with no guest executable) has no localizations
+    // and no resources.
     std::vector<std::string> localizations(const BundleState& bundle) {
         std::vector<std::string> names;
+        if (bundle.path.empty()) return names;
         std::error_code error;
         for (std::filesystem::directory_iterator entry(host_path(resources(bundle)), error), end; !error && entry != end; entry.increment(error)) {
             const auto name = entry->path().filename().u8string();
@@ -1620,6 +1623,7 @@ struct Extra {
     std::optional<std::string> resource_path(Address object, Address name, Address type, Address directory,
                                              const std::optional<std::string>& localization = std::nullopt) {
         const auto bundle = bundle_of(object);
+        if (bundle->path.empty()) return std::nullopt;
         const auto base = resources(*bundle);
         const auto sub = directory ? text(directory) : std::string{};
         std::string file = name ? text(name) : std::string{};
@@ -1642,6 +1646,7 @@ struct Extra {
     // localization directory that exists, in name order.
     std::vector<std::string> resource_paths(Address object, const std::string& extension, Address directory, const std::optional<std::string>& localization) {
         const auto bundle = bundle_of(object);
+        if (bundle->path.empty()) return {};
         const auto base = resources(*bundle);
         const auto sub = directory ? text(directory) : std::string{};
         std::vector<std::string> folders;

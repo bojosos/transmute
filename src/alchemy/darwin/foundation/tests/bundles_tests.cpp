@@ -150,6 +150,17 @@ void localization(Fixture& f) {
     fs::remove_all(root);
 }
 
+// This process has no guest executable: the main bundle has no path, and so no resources or localizations.
+void pathless_main_bundle(Fixture& f) {
+    const auto main = f.send(f.cls("NSBundle"), "mainBundle");
+    require(main != 0, "+mainBundle");
+    if (!text(f, f.send(main, "bundlePath")).empty()) return;   // a fixture with an executable: nothing to check
+    require(f.send(main, "pathForResource:ofType:", {str(f, "Basso"), str(f, "aiff")}) == 0, "no resource");
+    require(f.cf.length(f.send(main, "localizations")) == 0, "no localizations");
+    require(f.cf.length(f.send(main, "pathsForResourcesOfType:inDirectory:", {str(f, "png"), 0})) == 0, "no resource list");
+    require(text(f, f.send(main, "localizedStringForKey:value:table:", {str(f, "key"), 0, 0})) == "key", "the key as its own string");
+}
+
 void binary_info(Fixture& f) {
     const auto root = scratch();
     alchemy::export_fill::Plist info;
@@ -166,5 +177,6 @@ void binary_info(Fixture& f) {
 } // namespace
 
 int main() {
-    return run("foundation bundles", {{"OpenStep property lists", openstep}, {"localizations and strings", localization}, {"binary Info.plist", binary_info}});
+    return run("foundation bundles", {{"OpenStep property lists", openstep}, {"localizations and strings", localization}, {"binary Info.plist", binary_info},
+                                        {"a main bundle without a path", pathless_main_bundle}});
 }
