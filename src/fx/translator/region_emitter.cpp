@@ -1310,21 +1310,41 @@ void RegionEmitter::cond_branch(Cond c, std::int32_t taken, std::uint64_t taken_
 
 void RegionEmitter::rsb_push(std::uint64_t return_pc, std::int32_t continuation, Gp ret_reg) {
     (void)return_pc;
-    // ret_reg = return pc on entry. Clobbers rax, r8, rdx and EFLAGS.
+    // ret_reg = return pc on entry. Clobbers rax, r8, rdx (and r9 with
+    // rsbcall), not EFLAGS (movzx/lea/byte store: a BL's host-form flags reach
+    // its exit), except the oldrsb sequence.
+    static_assert(kRsbEntries == 256, "rsb_top wraps in its low byte");
     const auto host = continuation >= 0
                           ? entry_labels_[static_cast<std::size_t>(plan_.insts[continuation].entry_slot)]
                           : add_stub(Stub::K::return_trampoline, FlagsState::ctx, 0, return_pc, -1);
     const auto top = ctx_mem(offsetof(GuestContext, rsb_top));
     const auto rsb = ctx_disp(offsetof(GuestContext, rsb));
-    a_.mov(32, Gp::rax, top);
+    switch (plan_.rsb_push) {
+    case Plan::RsbPush::call:   // the shared stub: rdx = guest return pc, r8 = host continuation
+        if (ret_reg != Gp::rdx) a_.mov(64, Gp::rdx, ret_reg);
+        a_.lea(64, Gp::r8, x64::rip(host));
+        a_.call(ptr(Gp::r15, helper_disp(helper_rsb_push)));
+        return;
+    case Plan::RsbPush::old_masked:
+        a_.mov(32, Gp::rax, top);
+        a_.lea(32, Gp::r8, ptr(Gp::rax, 1));
+        a_.and_(32, Gp::r8, static_cast<std::int32_t>(kRsbEntries - 1));
+        a_.mov(32, top, Gp::r8);
+        a_.and_(32, Gp::rax, static_cast<std::int32_t>(kRsbEntries - 1));
+        a_.shl(32, Gp::rax, 4);
+        a_.mov(64, ptr(Gp::r15, Gp::rax, 1, rsb), ret_reg);
+        a_.lea(64, Gp::rdx, x64::rip(host));
+        a_.mov(64, ptr(Gp::r15, Gp::rax, 1, rsb + 8), Gp::rdx);
+        return;
+    case Plan::RsbPush::inline_flag_free: break;
+    }
+    a_.movzx(32, Gp::rax, top, 8);
     a_.lea(32, Gp::r8, ptr(Gp::rax, 1));
-    a_.and_(32, Gp::r8, static_cast<std::int32_t>(kRsbEntries - 1));
-    a_.mov(32, top, Gp::r8);
-    a_.and_(32, Gp::rax, static_cast<std::int32_t>(kRsbEntries - 1));
-    a_.shl(32, Gp::rax, 4);
-    a_.mov(64, ptr(Gp::r15, Gp::rax, 1, rsb), ret_reg);
+    a_.mov(8, top, Gp::r8);                                // rsb_top + 1, modulo 256
+    a_.lea(32, Gp::rax, ptr(Gp::rax, Gp::rax, 1));         // index * 2: entries are 16 bytes (scale 8)
+    a_.mov(64, ptr(Gp::r15, Gp::rax, 8, rsb), ret_reg);
     a_.lea(64, Gp::rdx, x64::rip(host));
-    a_.mov(64, ptr(Gp::r15, Gp::rax, 1, rsb + 8), Gp::rdx);
+    a_.mov(64, ptr(Gp::r15, Gp::rax, 8, rsb + 8), Gp::rdx);
 }
 
 // ---- cross-block register cache --------------------------------------------------------

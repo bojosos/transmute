@@ -228,6 +228,23 @@ void generate_stubs() {
     store_globals(a);
     a.jmp(indirect);
 
+    // ---- rsb_push (helper_rsb_push): rdx = guest return pc, r8 = host continuation --
+    // Entered by call from translated code (TRANSMUTE_FX_CORE=rsbcall); keeps
+    // EFLAGS, clobbers rax and r9, as the in-line push (region_emitter.cpp).
+    a.align(16);
+    const auto rsb_push_offset = a.size();
+    {
+        const auto top = ptr(Gp::r15, ctx_disp(offsetof(GuestContext, rsb_top)));
+        const auto rsb = ctx_disp(offsetof(GuestContext, rsb));
+        a.movzx(32, Gp::rax, top, 8);
+        a.lea(32, Gp::r9, ptr(Gp::rax, 1));
+        a.mov(8, top, Gp::r9);
+        a.lea(32, Gp::rax, ptr(Gp::rax, Gp::rax, 1));
+        a.mov(64, ptr(Gp::r15, Gp::rax, 8, rsb), Gp::rdx);
+        a.mov(64, ptr(Gp::r15, Gp::rax, 8, rsb + 8), Gp::r8);
+        a.ret();
+    }
+
     // ---- link --------------------------------------------------------------
     a.align(16);
     const auto link_offset = a.size();
@@ -390,6 +407,7 @@ void generate_stubs() {
     g_stubs.dispatch_exit_live = base + exit_live_offset;
     g_stubs.host_return = globals ? base + host_return_offset : nullptr;
     g_stubs.link = base + link_offset;
+    g_stubs.rsb_push = base + rsb_push_offset;
     g_stubs.table_shadow_miss = base + shadow_miss_offset;
     g_stubs.table_shadow_lookup = base + shadow_lookup_offset;
     g_stubs.return_to_host = base + return_offset;

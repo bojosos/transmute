@@ -34,6 +34,7 @@ void initialize(const RuntimeOptions& options) {
     threads_initialize();
     g_helpers[fx::helper_interpret_one] = reinterpret_cast<const void*>(&interpret_one_helper);
     g_helpers[fx::helper_check_interrupt] = reinterpret_cast<const void*>(&check_interrupt_helper);
+    g_helpers[fx::helper_rsb_push] = g_stubs.rsb_push;
     install_host_entry(kReturnToHostPc, g_stubs.return_to_host);
     veh_initialize();
     preload_initialize();

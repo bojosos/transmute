@@ -134,6 +134,7 @@ public:
     GuestContext expected{}, actual{};
     unsigned oracle_steps{};
     bool compare_memory = true;
+    bool image_code = true;   // the program's BufferCode::image (false: like the guest's JIT memory)
     bool report = true;
     // Fails the run if a translated region embeds a guest code address
     // (an 8-byte window in [code_base, code_base + kCodeBytes)) outside its

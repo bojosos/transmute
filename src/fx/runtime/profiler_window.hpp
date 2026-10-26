@@ -15,7 +15,7 @@
 namespace transmute::fx::rt {
 
 // TRANSMUTE_FX_SAMPLE=<file|1>[,<interval_us>][,main][,stacks][,bg]
-//                     [,delay=<seconds>][,duration=<seconds>][,paused]
+//                     [,delay=<seconds>][,duration=<seconds>][,paused][,regions=<n>]
 struct SampleWindow {
     std::wstring path;          // "1" = %TEMP%\fx-profile-<pid>.txt (resolved by the profiler)
     unsigned interval_us = 1000;
@@ -25,6 +25,7 @@ struct SampleWindow {
     double delay_seconds = 0;     // sampling starts this long after runtime_initialize
     double duration_seconds = 0;  // and stops this long after it started (0 = until exit)
     bool paused = false;          // start with sampling off (fx::profiler_set_enabled turns it on)
+    unsigned dump_regions = 24;   // hottest regions whose host code is dumped (<report>.r<N>.bin), 1..4096
 };
 
 // False for an empty value or "0" (profiler off). Unknown flags are ignored.
@@ -48,6 +49,8 @@ inline bool parse_sample_setting(std::wstring_view text, SampleWindow& out) {
         else if (item == L"paused") out.paused = true;
         else if (item.rfind(L"delay=", 0) == 0) out.delay_seconds = seconds(6);
         else if (item.rfind(L"duration=", 0) == 0) out.duration_seconds = seconds(9);
+        else if (item.rfind(L"regions=", 0) == 0)
+            out.dump_regions = std::clamp(static_cast<unsigned>(std::wcstoul(item.c_str() + 8, nullptr, 10)), 1u, 4096u);
         else if (!item.empty() && item[0] >= L'0' && item[0] <= L'9')
             out.interval_us = std::max(100u, static_cast<unsigned>(std::wcstoul(item.c_str(), nullptr, 10)));
     }

@@ -54,7 +54,9 @@ namespace {
 // to 32 bytes instead of 16), noshadows (a BR through a heap table takes
 // the inline lookup, no table shadow), noflagskip (direct exits always store
 // host-form flags: no skip link to entries that write NZCV first), noloopinline
-// (optimized translations inline with the tier-1 rules); nocache..norbit
+// (optimized translations inline with the tier-1 rules), rsbcall (BL/BLR push
+// the RSB through the shared helper_rsb_push stub), oldrsb (the masked RSB
+// push, flags stored before it); nocache..norbit
 // the code generation before the register cache. Folded into
 // translator_family_fingerprint(), so persistent
 // caches never mix code generated with different knobs.
@@ -126,6 +128,8 @@ const PlanOverrides& default_overrides() {
             d.no_shadows = k("noshadows");
             d.no_flag_skip = k("noflagskip");
             d.no_loop_inline = k("noloopinline");
+            d.rsb_call = k("rsbcall");
+            d.old_rsb = k("oldrsb");
         }
         if (const char* v = std::getenv("TRANSMUTE_FX_INLINE")) d.inline_max = static_cast<unsigned>(std::strtoul(v, nullptr, 10));
         return d;
@@ -154,7 +158,8 @@ std::uint32_t codegen_layout_bits() {
     const auto& o = default_overrides();
     return (o.cold_entries ? 1u : 0u) | (o.align_loops ? 2u : 0u) | (o.align_hot ? 4u : 0u) | (o.align32 ? 8u : 0u) |
            (o.no_vzero_join ? 16u : 0u) | (o.no_shadows ? 32u : 0u) |
-           (o.no_flag_skip ? 64u : 0u) | (o.no_loop_inline ? 128u : 0u);
+           (o.no_flag_skip ? 64u : 0u) | (o.no_loop_inline ? 128u : 0u) |
+           (o.rsb_call ? 256u : 0u) | (o.old_rsb ? 512u : 0u);
 }
 
 unsigned codegen_inline_max() { return default_overrides().inline_max; }

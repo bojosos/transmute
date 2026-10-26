@@ -587,6 +587,116 @@ FX_TEST(core_flag_store_skipped_for_flags_dead_targets) {
     r.machine.options = saved;
 }
 
+// The RSB (256 entries, pushed and popped without touching EFLAGS) under
+// recursion deeper than it: the deepest returns miss and take the lookup,
+// and every depth runs like the reference.
+FX_TEST(core_rsb_wraps_in_deep_recursion) {
+    auto& r = runner();
+    using namespace a64;
+    for (const unsigned depth : {1u, 255u, 256u, 257u, 600u}) {
+        const std::vector<std::uint32_t> prog = {
+            movw(false, 2, 0, depth, 0),                  // 0 movz w0, #depth
+            bl(2),                                        // 1 bl f
+            b(9),                                         // 2 b end
+            cbz(false, false, 7, 0),                      // 3 f: cbz w0, leaf
+            ldst_pair(2, 3, false, -2, 30, 31, 29),       // 4 stp x29, x30, [sp, #-16]!
+            add_imm(false, true, false, 0, 0, 1),         // 5 sub w0, w0, #1
+            bl(-3),                                       // 6 bl f
+            add_imm(true, false, false, 9, 9, 1),         // 7 add x9, x9, #1
+            ldst_pair(2, 1, true, 2, 30, 31, 29),         // 8 ldp x29, x30, [sp], #16
+            ret(),                                        // 9 ret
+            ret(),                                        // 10 leaf: ret
+        };
+        FX_CHECK(r.run(prog, r.context(7600 + depth), "recursion " + std::to_string(depth), 100000));
+    }
+}
+
+// A BL keeps host-form flags through the RSB push to its exit: into a callee
+// that reads NZCV first they are stored (the exit's jmp B), into one that
+// writes it first a link skips the store (jmp A; target_flags_dead does not
+// apply to code that is not image code). Loops run on the links like the
+// reference, with regions cut after one to three instructions (some link
+// skips there) and whole (the leaf is inlined).
+FX_TEST(core_bl_keeps_host_flags_to_its_exit) {
+    auto& r = runner();
+    using namespace a64;
+    const auto cmp12 = add_shift(true, true, true, 0, 2, 0, 1, 31);   // cmp x1, x2
+    const auto cmp34 = add_shift(true, true, true, 0, 4, 0, 3, 31);   // cmp x3, x4
+    const auto csel = a64::csel(true, false, 6, 0, 0, 5, 7);          // csel x7, x5, x6, eq
+    const auto saved = r.machine.options;
+    r.image_code = false;
+    const bool skip = (core::codegen_layout_bits() & 64u) == 0;
+    for (const bool reads : {true, false}) {
+        std::vector<std::uint32_t> prog = {movw(false, 2, 0, 6, 12),                       // 0 movz w12, #6
+                                           cmp12,                                            // 1 loop: cmp x1, x2
+                                           bl(7),                                            // 2 bl f
+                                           add_shift(true, false, false, 0, 7, 0, 9, 9),     // 3 add x9, x9, x7
+                                           add_imm(true, false, false, 1, 1, 1),             // 4 add x1, x1, #1
+                                           add_imm(false, true, true, 12, 12, 1),            // 5 subs w12, w12, #1
+                                           bcond(1, -5),                                     // 6 b.ne loop
+                                           b(0)};                                            // 7 b end
+        if (!reads) prog.push_back(cmp34);                                                   // 9 f: (cmp x3, x4)
+        prog.push_back(csel);
+        prog.push_back(ret());
+        prog[7] = b(static_cast<std::int32_t>(prog.size()) - 7);
+        prog[2] = bl(8 - 2);
+        bool skipped = false;
+        for (const unsigned len : {1u, 2u, 3u, 4096u}) {
+            r.machine.options.max_instructions = len;
+            for (unsigned k = 0; k < 3; ++k) {
+                auto ctx = r.context(7700 + 16 * len + k);
+                ctx.x[2] = ctx.x[1] + 2 * k;   // equal on some iterations
+                ctx.x[4] = ctx.x[3];
+                FX_CHECK(r.run(prog, ctx, std::string(reads ? "bl flags read " : "bl flags written ") + std::to_string(len)));
+                if (len < 4096) skipped |= r.last.skip_links > 0;
+            }
+        }
+        if (!reads) FX_CHECK_EQ(skipped, skip);
+    }
+    r.image_code = true;
+    r.machine.options = saved;
+}
+
+// Host bytes of a BL for the three RSB pushes (Plan::RsbPush): a call out of
+// the buffer (not inlinable; a call ends the region) against a NOP, hot
+// bytes (TranslationStats::hot_bytes) and all. rsbcall (the shared stub) is
+// the smallest, the old masked push the largest. Every mode runs a
+// recursion like the reference.
+FX_TEST(core_rsb_push_bytes_per_bl) {
+    auto& r = runner();
+    using namespace a64;
+    const auto translate = [&](const std::vector<std::uint32_t>& words, bool hot) {
+        auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
+        std::memcpy(program, words.data(), words.size() * 4);
+        const BufferCode code(r.code_base(), r.program_base() + words.size() * 4);
+        const auto region = translate_region(r.program_base(), code);
+        return static_cast<long long>(hot ? region.stats.hot_bytes : region.code.size());
+    };
+    const std::vector<std::uint32_t> calls = {bl(0x100000), ret()};   // 4 MiB ahead: not readable, so not inlined
+    const std::vector<std::uint32_t> nops = {nop(), ret()};
+    long long bytes[3]{};
+    const char* names[3] = {"inline (movzx)", "rsbcall", "oldrsb"};
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        core::PlanOverrides o = core::default_plan_overrides();
+        o.rsb_call = mode == 1;
+        o.old_rsb = mode == 2;
+        core::set_overrides_for_testing(&o);
+        bytes[mode] = translate(calls, true) - translate(nops, true);
+        std::printf("  host bytes per BL, %s: %lld hot, %lld in all\n", names[mode], bytes[mode],
+                    translate(calls, false) - translate(nops, false));
+        for (const unsigned depth : {3u, 300u}) {
+            const std::vector<std::uint32_t> prog = {
+                movw(false, 2, 0, depth, 0), bl(2), b(9), cbz(false, false, 7, 0),
+                ldst_pair(2, 3, false, -2, 30, 31, 29), add_imm(false, true, false, 0, 0, 1), bl(-3),
+                add_imm(true, false, false, 9, 9, 1), ldst_pair(2, 1, true, 2, 30, 31, 29), ret(), ret()};
+            FX_CHECK(r.run(prog, r.context(7900 + depth), std::string(names[mode]) + " recursion", 100000));
+        }
+        core::set_overrides_for_testing(nullptr);
+    }
+    FX_CHECK(bytes[1] < bytes[0]);
+    FX_CHECK(bytes[0] < bytes[2]);
+}
+
 FX_TEST(core_inline_lookup_miss_pc) {
     auto& r = runner();
     using namespace a64;

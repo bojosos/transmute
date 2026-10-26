@@ -53,8 +53,8 @@ std::uint64_t translator_family_fingerprint() {
             if ((conv.guest_mask >> g) & 1u) mix(static_cast<unsigned char>(conv.host[g]));
     }
     if (const auto layout = core::codegen_layout_bits(); layout != 0) {
-        mix(0xfc);   // code layout knobs
-        mix(static_cast<unsigned char>(layout));
+        mix(0xfc);   // code layout knobs (all 32 bits)
+        for (unsigned b = 0; b < 32; b += 8) mix(static_cast<unsigned char>(layout >> b));
     }
     if (const auto p2 = core::codegen_p2_knob_bits(); p2 != 0) {
         mix(0xfa);   // core_isel.hpp CodegenKnob (fx perf wave p2)
@@ -638,6 +638,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     plan.align_loops = overrides.align_loops;
     plan.align_hot = overrides.align_hot;
     plan.flag_skip = !overrides.no_flag_skip;
+    plan.rsb_push = overrides.old_rsb ? Plan::RsbPush::old_masked : overrides.rsb_call ? Plan::RsbPush::call : Plan::RsbPush::inline_flag_free;
     plan.loop_alignment = overrides.align32 ? 32u : 16u;
     plan.carry_clean = !overrides.carry_dirty && !(plan.optimize && overrides.t2_carry);   // t2carry: dirty across loop edges
     stack.clear();

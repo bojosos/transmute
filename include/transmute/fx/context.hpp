@@ -14,7 +14,9 @@
 namespace transmute::fx {
 
 inline constexpr std::int32_t kContextBias = 128;
-inline constexpr unsigned kRsbEntries = 32;      // power of two
+// 256: translated code reads rsb_top's low byte (movzx) and wraps it with byte
+// arithmetic, without touching EFLAGS; other users mask with kRsbEntries - 1.
+inline constexpr unsigned kRsbEntries = 256;
 inline constexpr unsigned kSpillSlots = 64;
 inline constexpr unsigned kHelperSlots = 128;
 
@@ -102,7 +104,7 @@ struct alignas(64) GuestContext {
         std::uint8_t release_pending;
     };
     // ---- return stack buffer -----------------------------------------------
-    std::uint32_t rsb_top;        // index of the next push, modulo kRsbEntries
+    std::uint32_t rsb_top;        // index of the next push, modulo kRsbEntries (its low byte)
     std::uint32_t rsb_pad;
     alignas(16) RsbEntry rsb[kRsbEntries];
     // ---- runtime linkage (written by the runtime, read by translated code) -
@@ -199,6 +201,10 @@ enum HelperId : unsigned {
     // core translator / runtime: 0..15
     helper_interpret_one = 0,     // void(GuestContext*): run the instruction at ctx->pc
     helper_check_interrupt = 1,
+    // Not a Win64 function: an RSB push without touching EFLAGS, entered by
+    // `call [r15 + helper_disp]` with rdx = the guest return pc and r8 = the
+    // host continuation; clobbers rax and r9 (TRANSMUTE_FX_CORE=rsbcall).
+    helper_rsb_push = 2,
     // fp / simd: 16..47
     helper_fp_first = 16,
     // atomics / system registers: 48..63

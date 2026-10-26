@@ -544,7 +544,9 @@ the guest noticeably. Flags: `main` samples only the loader's main thread
 stack of each non-translated sample (a memcpy while suspended), unwinds the
 copy after resuming and adds inclusive, first-non-system-frame, innermost
 runtime-frame and folded-stack reports; `bg` also samples the runtime's
-preloader threads.
+preloader threads; `regions=<n>` dumps the host code of the <n> hottest
+regions instead of 24 (flat profiles of large libraries, e.g. SwiftShader's
+LLVM, need a few hundred to cover their long tail).
 
 Measurement window: `delay=<seconds>` starts sampling that long after
 `runtime_initialize` (leave out startup), `duration=<seconds>` stops it that

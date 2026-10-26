@@ -89,6 +89,20 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
     store_globals();
     a.mov(32, ptr(Gp::r15, exit_reason), static_cast<std::int32_t>(ExitReason::lookup_miss));
     a.jmp(ret_label);
+    // helper_rsb_push, as the runtime's (rdx = guest return pc, r8 = host continuation).
+    a.align(16);
+    const auto rsb_push = a.size();
+    {
+        const auto top = ptr(Gp::r15, ctx_disp(offsetof(GuestContext, rsb_top)));
+        const auto rsb = ctx_disp(offsetof(GuestContext, rsb));
+        a.movzx(32, Gp::rax, top, 8);
+        a.lea(32, Gp::r9, ptr(Gp::rax, 1));
+        a.mov(8, top, Gp::r9);
+        a.lea(32, Gp::rax, ptr(Gp::rax, Gp::rax, 1));
+        a.mov(64, ptr(Gp::r15, Gp::rax, 8, rsb), Gp::rdx);
+        a.mov(64, ptr(Gp::r15, Gp::rax, 8, rsb + 8), Gp::r8);
+        a.ret();
+    }
     // Table shadow miss (rcx = target, rdx = index), as the runtime's.
     a.align(16);
     const auto shadow_miss = a.size();
@@ -141,6 +155,7 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
     stub_indirect_ = stubs + indirect;
     stub_exit_ = stubs + dispatch_exit;
     stub_shadow_miss_ = stubs + shadow_miss;
+    helpers_[helper_rsb_push] = stubs + rsb_push;
     empty_shadow_ = make_shadow();
     stubs_end_ = used_;
 }
@@ -414,7 +429,8 @@ bool DiffRunner::run_translated(const std::vector<std::uint32_t>& words, const G
     auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(program_base()));
     std::memcpy(program, words.data(), words.size() * 4);
     program[words.size()] = 0xd4200000u | (0xdeadu << 5);
-    const BufferCode code(code_, code_ + kProgramOffset + (words.size() + 1) * 4);
+    BufferCode code(code_, code_ + kProgramOffset + (words.size() + 1) * 4);
+    code.image = image_code;
     reset_memory();
     actual = initial;
     actual.pc = program_base();
@@ -429,7 +445,8 @@ bool DiffRunner::run(const std::vector<std::uint32_t>& words, const GuestContext
     std::memcpy(program, words.data(), words.size() * 4);
     program[words.size()] = 0xd4200000u | (0xdeadu << 5);   // brk #0xdead
     const auto stop = program_base() + words.size() * 4;
-    const BufferCode code(code_, code_ + kProgramOffset + (words.size() + 1) * 4);
+    BufferCode code(code_, code_ + kProgramOffset + (words.size() + 1) * 4);
+    code.image = image_code;
 
     // Oracle.
     reset_memory();

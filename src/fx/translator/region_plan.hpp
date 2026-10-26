@@ -178,6 +178,11 @@ struct Plan {
     bool align_loops{};               // cold_layout: every loop header aligned (loopalign)
     bool align_hot{};                 // cold_layout, tier 2: loop headers aligned whatever the loop's size (hotalign)
     bool flag_skip{};                 // direct exits may skip their flag store (RegionExit::skip_rel32_offset)
+    // How BL/BLR push the RSB entry (rsb_push): in line without touching
+    // EFLAGS (default), through the shared helper_rsb_push stub (rsbcall:
+    // smaller), or the masked sequence before that (oldrsb; the flags are
+    // stored before it).
+    enum class RsbPush : std::uint8_t { inline_flag_free, call, old_masked } rsb_push{};
     unsigned loop_alignment{16};      // bytes (align32: 32)
     unsigned interpret_count{};
     unsigned blocks{};
@@ -270,6 +275,8 @@ struct PlanOverrides {
     // above everywhere.
     static constexpr unsigned kOptimizedInlineMax = 64;
     bool no_loop_inline{};
+    bool rsb_call{};                  // TRANSMUTE_FX_CORE=rsbcall (Plan::RsbPush::call)
+    bool old_rsb{};                   // TRANSMUTE_FX_CORE=oldrsb (Plan::RsbPush::old_masked)
     // Switch dispatch: BR through a recognised jump table stays in the region
     // (Plan::tables). TRANSMUTE_FX_CORE=notables: every BR is an indirect exit.
     bool no_tables{};

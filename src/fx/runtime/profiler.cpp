@@ -1,6 +1,6 @@
 // Sampling profiler:
 //   TRANSMUTE_FX_SAMPLE=<file|1>[,<interval_us>][,main][,stacks][,bg]
-//                       [,delay=<seconds>][,duration=<seconds>][,paused]
+//                       [,delay=<seconds>][,duration=<seconds>][,paused][,regions=<n>]
 //
 // Flags: `main` samples only the thread that initialized the runtime (the
 // loader's main thread), also before it first runs guest code. `stacks`
@@ -14,6 +14,8 @@
 // runtime_initialize (e.g. after startup), `duration=<s>` stops it <s>
 // seconds after it started (the report is written then and keeps that
 // window), `paused` starts with sampling off. Seconds may be fractional.
+// `regions=<n>` dumps the host code of the <n> hottest regions (default 24)
+// for flat profiles whose long tail matters (large JIT-compiled libraries).
 // fx::profiler_set_enabled / fx::profiler_reset (process.hpp) open and
 // close windows at run time (an explicit enable cancels a pending delay).
 //
@@ -241,7 +243,7 @@ void dump_regions(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ho
     if (!index) return;
     unsigned shown = 0;
     for (const auto& [code, n] : hot) {
-        if (++shown > 24) break;
+        if (++shown > p.window.dump_regions) break;
         const RegionSample& r = p.region_info[code];
         ReportFile bin(p.path + L".r" + std::to_wstring(shown) + L".bin", L"wb");
         if (bin.f) {

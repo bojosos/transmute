@@ -185,6 +185,7 @@ struct Stubs {
     // lookup takes the lookup for rcx.
     const void* table_shadow_miss{};
     const void* table_shadow_lookup{};
+    const void* rsb_push{};          // helper_rsb_push (context.hpp): not a Win64 function
 };
 // The convention registers to/from GuestContext (r15 = biased context).
 void store_globals(x64::Assembler& a);

@@ -399,7 +399,26 @@ void print_invalidation_statistics(const fx::RuntimeStats& stats, const char* wh
 std::shared_ptr<FxEngine::Shared> make_shared_space();
 void print_memory_statistics(const FxEngine::Shared& shared, const char* when);
 
-// ALCHEMY_FX_STATS_PERIOD=<seconds>: the invalidation and memory lines every period on
+// The persistent translation cache (Mach-O images are keyed by LC_UUID,
+// register_image). `when` (" (pid N, T s)") marks the periodic lines.
+void print_cache_statistics(const char* when) {
+    const auto cache = fx::cache_stats();
+    std::fprintf(stderr,
+                 "alchemy-fx cache%s: modules %llu (with cache %llu, rejected files %llu), lookups %llu, hits %llu "
+                 "(cold %llu), stores %llu (ignored %llu, unrelocatable %llu), rejected records %llu, guest mismatches %llu, "
+                 "pinned mismatches %llu, journal %llu KiB, merges %llu\n",
+                 when ? when : "",
+                 static_cast<unsigned long long>(cache.modules_loaded), static_cast<unsigned long long>(cache.modules_with_cache),
+                 static_cast<unsigned long long>(cache.files_rejected), static_cast<unsigned long long>(cache.lookups),
+                 static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.cold_hits),
+                 static_cast<unsigned long long>(cache.stores), static_cast<unsigned long long>(cache.stores_ignored),
+                 static_cast<unsigned long long>(cache.stores_unrelocatable),
+                 static_cast<unsigned long long>(cache.records_rejected), static_cast<unsigned long long>(cache.guest_mismatches),
+                 static_cast<unsigned long long>(cache.pinned_mismatches),
+                 static_cast<unsigned long long>(cache.journal_bytes / 1024), static_cast<unsigned long long>(cache.merges));
+}
+
+// ALCHEMY_FX_STATS_PERIOD=<seconds>: the invalidation, memory and cache lines every period on
 // stderr. Processes that are terminated (Chrome's renderers at browser exit)
 // never print their statistics at exit.
 void start_periodic_statistics() {
@@ -417,6 +436,7 @@ void start_periodic_statistics() {
                               fx::host::process_age_ms() / 1000.0);
                 print_invalidation_statistics(fx::runtime_stats(), when);
                 print_memory_statistics(*make_shared_space(), when);
+                print_cache_statistics(when);
             }
         }).detach();
     });
@@ -429,20 +449,7 @@ void print_runtime_statistics() {
     if ((fx::host::get_env("ALCHEMY_FX_STATS", value, sizeof(value)) == 0 || value[0] == '0') &&
         !alchemy::perf::enabled())
         return;
-    // Translation cache (Mach-O images are keyed by LC_UUID, register_image).
-    const auto cache = fx::cache_stats();
-    std::fprintf(stderr,
-                 "alchemy-fx cache: modules %llu (with cache %llu, rejected files %llu), lookups %llu, hits %llu "
-                 "(cold %llu), stores %llu (ignored %llu, unrelocatable %llu), rejected records %llu, guest mismatches %llu, "
-                 "pinned mismatches %llu, journal %llu KiB, merges %llu\n",
-                 static_cast<unsigned long long>(cache.modules_loaded), static_cast<unsigned long long>(cache.modules_with_cache),
-                 static_cast<unsigned long long>(cache.files_rejected), static_cast<unsigned long long>(cache.lookups),
-                 static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.cold_hits),
-                 static_cast<unsigned long long>(cache.stores), static_cast<unsigned long long>(cache.stores_ignored),
-                 static_cast<unsigned long long>(cache.stores_unrelocatable),
-                 static_cast<unsigned long long>(cache.records_rejected), static_cast<unsigned long long>(cache.guest_mismatches),
-                 static_cast<unsigned long long>(cache.pinned_mismatches),
-                 static_cast<unsigned long long>(cache.journal_bytes / 1024), static_cast<unsigned long long>(cache.merges));
+    print_cache_statistics(nullptr);
     const auto stats = fx::runtime_stats();
     static constexpr const char* reasons[] = {"none", "link", "lookup_miss", "interpret", "svc", "brk",
                                               "return_to_host", "interrupt", "raise", "redispatch", "tier_up",

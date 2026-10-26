@@ -76,6 +76,12 @@ FX_TEST(profiler_sample_setting_syntax) {
     FX_REQUIRE(rt::parse_sample_setting(L"p.txt,50,paused", w));
     FX_CHECK_EQ(w.interval_us, 100u);    // clamped
     FX_CHECK(w.paused);
+    FX_CHECK_EQ(w.dump_regions, 24u);
+    FX_REQUIRE(rt::parse_sample_setting(L"p.txt,regions=300", w));
+    FX_CHECK_EQ(w.dump_regions, 300u);
+    FX_CHECK_EQ(w.interval_us, 1000u);   // not taken for an interval
+    FX_REQUIRE(rt::parse_sample_setting(L"p.txt,regions=0", w));
+    FX_CHECK_EQ(w.dump_regions, 1u);     // clamped
 }
 
 FX_TEST(profiler_report_replacement_is_atomic) {

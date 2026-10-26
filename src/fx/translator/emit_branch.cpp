@@ -137,8 +137,15 @@ void RegionEmitter::e_call(const PlanInst& pi) {
     take(Gp::rax);
     take(Gp::rdx);
     take(Gp::r8);
-    materialize_state(flags_, false, true);   // a region exit: the raw form (region_emitter.cpp)
-    flags_ = FlagsState::ctx;
+    if (plan_.rsb_push == Plan::RsbPush::call) take(Gp::r9);   // the stub's scratch
+    // A BL keeps host-form flags through the (flag-free) RSB push: its direct
+    // exit stores them, past which a link to a flags-dead entry jumps
+    // (emit_direct_exit). A BLR stores them here: the lookup clobbers EFLAGS.
+    const bool keep_flags = !indirect && plan_.flag_skip && is_host(flags_) && plan_.rsb_push != Plan::RsbPush::old_masked;
+    if (!keep_flags) {
+        materialize_state(flags_, false, true);   // a region exit: the raw form (region_emitter.cpp)
+        flags_ = FlagsState::ctx;
+    }
     // x30 = return pc. Plan::cold_layout: straight into x30's pin (the RSB
     // push stores it from there), else through rdx.
     Gp ret_reg = Gp::rdx;
@@ -159,7 +166,9 @@ void RegionEmitter::e_call(const PlanInst& pi) {
         return;
     }
     // Calls always leave the region: the callee is translated as its own region.
-    emit_direct_exit(static_cast<std::uint64_t>(d.imm), 0, FlagsState::ctx, false);
+    const auto exit_flags = flags_;
+    flags_ = FlagsState::ctx;
+    emit_direct_exit(static_cast<std::uint64_t>(d.imm), 0, exit_flags, false);
 }
 
 // ---- switch dispatch --------------------------------------------------------------
@@ -403,16 +412,14 @@ void RegionEmitter::e_indirect(const PlanInst& pi) {
         const auto miss = cold ? add_stub(Stub::K::lookup, FlagsState::ctx, 0, 0,
                                           target == Gp::rcx ? -1 : static_cast<std::int32_t>(x64::id(target)))
                                : a_.new_label();
-        a_.mov(32, Gp::rax, top);
-        a_.lea(32, Gp::rax, ptr(Gp::rax, -1));
-        a_.and_(32, Gp::rax, static_cast<std::int32_t>(kRsbEntries - 1));
-        a_.mov(32, Gp::rdx, Gp::rax);
-        a_.shl(32, Gp::rdx, 4);
-        a_.cmp(64, target, ptr(Gp::r15, Gp::rdx, 1, rsb));
+        a_.movzx(32, Gp::rax, top, 8);
+        a_.alu(x64::Alu::sub, 8, Gp::rax, 1);                  // rsb_top - 1, modulo 256 (kRsbEntries)
+        a_.lea(32, Gp::rdx, ptr(Gp::rax, Gp::rax, 1));         // index * 2: entries are 16 bytes (scale 8)
+        a_.cmp(64, target, ptr(Gp::r15, Gp::rdx, 8, rsb));
         if (cold) a_.jcc(Cond::ne, miss);
         else a_.jcc_short(Cond::ne, miss);
-        a_.mov(32, top, Gp::rax);
-        a_.jmp(ptr(Gp::r15, Gp::rdx, 1, rsb + 8));
+        a_.mov(8, top, Gp::rax);
+        a_.jmp(ptr(Gp::r15, Gp::rdx, 8, rsb + 8));
         if (cold) return;
         a_.bind(miss);
     }
