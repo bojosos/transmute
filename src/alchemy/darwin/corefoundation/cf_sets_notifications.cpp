@@ -338,6 +338,7 @@ void CoreFoundationGaps::install_strings() {
     // NS* names CoreFoundation exports.
     string(core_foundation, "_NSCalendarIdentifierGregorian", "gregorian");
     string(core_foundation, "_NSSystemTimeZoneDidChangeNotification", "NSSystemTimeZoneDidChangeNotification");
+    string(core_foundation, "_kCFTimeZoneSystemTimeZoneDidChangeNotification", "NSSystemTimeZoneDidChangeNotification");
     string(core_foundation, "_NSURLQuarantinePropertiesKey", "NSURLQuarantinePropertiesKey");
 }
 

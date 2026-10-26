@@ -1,8 +1,12 @@
 #include "alchemy/darwin/kit/completion/data/providers.hpp"
+#include "alchemy/darwin/kit/completion/runtime/common.hpp"
 #include "alchemy/darwin/foundation/calendar.hpp"
 #include "alchemy/darwin/foundation/date_format.hpp"
+#include "alchemy/host/locale.hpp"
 
 #include <cmath>
+#include <cstring>
+#include <tuple>
 
 // NSCalendar (Gregorian and ISO 8601 identifiers) and NSDateComponents over
 // the calendar core (calendar.cpp), with time-zone offsets from the
@@ -11,6 +15,11 @@
 // unknown ones give nil. NSCalendarWrapComponents is not provided.
 // NSDate additions: +dateWithTimeInterval:sinceDate:, +now,
 // -descriptionWithLocale: (NSDate and NSNumber).
+// CFCalendar over the same objects (a CFCalendarRef is an NSCalendar):
+// identifiers, locale, time zone, week rules, unit ranges and ordinality,
+// time ranges, and composing, decomposing, adding and differencing with
+// component descriptions. The CFGregorianDate calls (CFDate.h) on the same
+// core, with a NULL time zone as GMT.
 namespace alchemy::gui::completion_kit::data {
 namespace {
 
@@ -49,8 +58,20 @@ struct Calendars {
         st->identifier = identifier;
         st->zone = g.retain(s.send_id(zone_class, "defaultTimeZone"));
         st->locale = g.retain(s.send_id(s.objc.find_class("NSLocale"), "currentLocale"));
-        st->rules = identifier == "iso8601" ? calendar::Rules{2, 4} : calendar::Rules{1, 1};
+        st->rules = identifier == "iso8601" ? calendar::Rules{2, 4} : locale_rules(st->locale);
         return true;
+    }
+    // A Gregorian calendar's week rules come from its locale (Monday first in de_DE, say), as Foundation's do.
+    calendar::Rules locale_rules(Address locale) {
+        std::string name = locale ? g.utf8(s.send_id(locale, "localeIdentifier")) : std::string("en_US");
+        if (const auto at = name.find('@'); at != std::string::npos) name.resize(at);
+        for (auto& c : name) if (c == '_') c = '-';
+        calendar::Rules rules;
+        if (const auto first = alchemy::host::locale::number(name, alchemy::host::locale::Number::first_weekday); first && *first >= 1 && *first <= 7)
+            rules.first_weekday = static_cast<int>(*first);
+        if (const auto minimum = alchemy::host::locale::number(name, alchemy::host::locale::Number::minimum_days_in_first_week); minimum && *minimum >= 1 && *minimum <= 7)
+            rules.minimum_days = static_cast<int>(*minimum);
+        return rules;
     }
     calendar::Offset offset(Address zone) {
         return [this, zone](double reference) -> std::int64_t {
@@ -377,6 +398,297 @@ void install_calendars(Support& support) {
             }
             s.x[0] = cal->g.auto_string(text);
         }, "@@:@");
+    // ---- CFCalendar: a CFCalendarRef is an NSCalendar (toll-free bridged) ----
+    // Component descriptions name one unit per character, as CFCalendar documents:
+    // G era, y year, M month, d day, H hour, m minute, s second, E weekday,
+    // F weekday ordinal, Q quarter, w week of year, W week of month, Y year for week of year.
+    constexpr std::string_view cf_library = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+    constexpr Address cf_not_found = static_cast<Address>(-1);
+    const auto unit_of = [](char code) -> calendar::Unit {
+        switch (code) {
+        case 'G': return calendar::era;
+        case 'y': return calendar::year;
+        case 'M': return calendar::month;
+        case 'd': return calendar::day;
+        case 'H': return calendar::hour;
+        case 'm': return calendar::minute;
+        case 's': return calendar::second;
+        case 'E': return calendar::weekday;
+        case 'F': return calendar::weekday_ordinal;
+        case 'Q': return calendar::quarter;
+        case 'w': return calendar::week_of_year;
+        case 'W': return calendar::week_of_month;
+        case 'Y': return calendar::year_for_week_of_year;
+        default: fail(std::string("CFCalendar: unknown component character '") + code + "'");
+        }
+    };
+    const auto description = [](GuestMemory& m, Address text) {
+        if (!text) fail("CFCalendar: NULL component description");
+        return rt::c_string(m, text, 64);
+    };
+    const auto real = [](const CpuState& s, unsigned index) { return std::bit_cast<double>(s.v[index][0]); };
+    const auto put_real = [](CpuState& s, double value) { s.v[0] = {std::bit_cast<std::uint64_t>(value), 0}; };
+    support.function(cf_library, "_CFCalendarCopyCurrent", [cal](CpuState& s, GuestMemory&) {
+        s.x[0] = cal->g.retain(cal->s.send_id(cal->calendar_class, "currentCalendar"));
+    });
+    // CFCalendarRef CFCalendarCreateWithIdentifier(CFAllocatorRef, CFStringRef identifier): NULL for an unknown identifier.
+    support.function(cf_library, "_CFCalendarCreateWithIdentifier", [cal](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[1] ? cal->s.send_id(cal->s.send_id(cal->calendar_class, "alloc"), "initWithCalendarIdentifier:", {s.x[1]}) : 0;
+    });
+    support.function(cf_library, "_CFCalendarGetIdentifier", [cal](CpuState& s, GuestMemory&) {
+        s.x[0] = cal->s.cf.constant_string(cal->state(s.x[0])->identifier);
+    });
+    support.function(cf_library, "_CFCalendarCopyLocale", [cal](CpuState& s, GuestMemory&) { s.x[0] = cal->g.retain(cal->state(s.x[0])->locale); });
+    support.function(cf_library, "_CFCalendarSetLocale", [cal](CpuState& s, GuestMemory&) { static_cast<void>(cal->s.send_id(s.x[0], "setLocale:", {s.x[1]})); });
+    support.function(cf_library, "_CFCalendarCopyTimeZone", [cal](CpuState& s, GuestMemory&) { s.x[0] = cal->g.retain(cal->state(s.x[0])->zone); });
+    support.function(cf_library, "_CFCalendarSetTimeZone", [cal](CpuState& s, GuestMemory&) { static_cast<void>(cal->s.send_id(s.x[0], "setTimeZone:", {s.x[1]})); });
+    support.function(cf_library, "_CFCalendarGetFirstWeekday", [cal](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<Address>(cal->state(s.x[0])->rules.first_weekday);
+    });
+    support.function(cf_library, "_CFCalendarSetFirstWeekday", [cal](CpuState& s, GuestMemory&) {
+        static_cast<void>(cal->s.send_id(s.x[0], "setFirstWeekday:", {s.x[1]}));
+    });
+    support.function(cf_library, "_CFCalendarGetMinimumDaysInFirstWeek", [cal](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<Address>(cal->state(s.x[0])->rules.minimum_days);
+    });
+    support.function(cf_library, "_CFCalendarSetMinimumDaysInFirstWeek", [cal](CpuState& s, GuestMemory&) {
+        static_cast<void>(cal->s.send_id(s.x[0], "setMinimumDaysInFirstWeek:", {s.x[1]}));
+    });
+    // The Gregorian limits of a unit (CFRange in x0/x1); kCFNotFound for era and the year units.
+    const auto limits = [](std::uint64_t unit, bool maximum) -> std::pair<Address, Address> {
+        switch (unit) {
+        case calendar::month: return {1, 12};
+        case calendar::day: return {1, maximum ? 31u : 28u};
+        case calendar::hour: return {0, 24};
+        case calendar::minute: return {0, 60};
+        case calendar::second: return {0, 60};
+        case calendar::weekday: return {1, 7};
+        case calendar::weekday_ordinal: return {1, maximum ? 5u : 4u};
+        case calendar::quarter: return {1, 4};
+        case calendar::week_of_year: return {1, maximum ? 53u : 52u};
+        case calendar::week_of_month: return {1, maximum ? 6u : 4u};
+        default: return {cf_not_found, cf_not_found};
+        }
+    };
+    support.function(cf_library, "_CFCalendarGetMinimumRangeOfUnit", [limits](CpuState& s, GuestMemory&) {
+        std::tie(s.x[0], s.x[1]) = limits(s.x[1], false);
+    });
+    support.function(cf_library, "_CFCalendarGetMaximumRangeOfUnit", [limits](CpuState& s, GuestMemory&) {
+        std::tie(s.x[0], s.x[1]) = limits(s.x[1], true);
+    });
+    // CFRange CFCalendarGetRangeOfUnit(CFCalendarRef, smallerUnit, biggerUnit, CFAbsoluteTime at)
+    support.function(cf_library, "_CFCalendarGetRangeOfUnit", [cal, real](CpuState& s, GuestMemory&) {
+        const auto st = cal->state(s.x[0]);
+        const auto r = calendar::range(static_cast<calendar::Unit>(s.x[1]), static_cast<calendar::Unit>(s.x[2]), real(s, 0), cal->offset(st->zone), st->rules);
+        s.x[0] = r ? static_cast<Address>(r->first) : cf_not_found;
+        s.x[1] = r ? static_cast<Address>(r->second) : cf_not_found;
+    });
+    support.function(cf_library, "_CFCalendarGetOrdinalityOfUnit", [cal, real](CpuState& s, GuestMemory&) {
+        const auto st = cal->state(s.x[0]);
+        const auto r = calendar::ordinality(static_cast<calendar::Unit>(s.x[1]), static_cast<calendar::Unit>(s.x[2]), real(s, 0), cal->offset(st->zone), st->rules);
+        s.x[0] = r ? static_cast<Address>(*r) : cf_not_found;
+    });
+    // Boolean CFCalendarGetTimeRangeOfUnit(CFCalendarRef, unit, CFAbsoluteTime at, CFAbsoluteTime* startp, CFTimeInterval* tip):
+    // the unit's start containing `at` and its length (the next one's start minus it).
+    support.function(cf_library, "_CFCalendarGetTimeRangeOfUnit", [cal, real](CpuState& s, GuestMemory& m) {
+        const auto st = cal->state(s.x[0]);
+        const auto at = real(s, 0);
+        const auto offset = cal->offset(st->zone);
+        std::uint64_t keep{};
+        Components step;
+        switch (s.x[1]) {
+        case calendar::era: s.x[0] = 0; return;
+        case calendar::year: keep = calendar::era | calendar::year; step.year = 1; break;
+        case calendar::quarter: case calendar::month: keep = calendar::era | calendar::year | calendar::month; step.month = s.x[1] == calendar::quarter ? 3 : 1; break;
+        case calendar::day: case calendar::weekday: keep = calendar::era | calendar::year | calendar::month | calendar::day; step.day = 1; break;
+        case calendar::hour: keep = calendar::era | calendar::year | calendar::month | calendar::day | calendar::hour; step.hour = 1; break;
+        case calendar::minute: keep = calendar::era | calendar::year | calendar::month | calendar::day | calendar::hour | calendar::minute; step.minute = 1; break;
+        case calendar::second: {
+            const auto start = std::floor(at);
+            if (s.x[2]) m.write64(s.x[2], std::bit_cast<std::uint64_t>(start));
+            if (s.x[3]) m.write64(s.x[3], std::bit_cast<std::uint64_t>(1.0));
+            s.x[0] = 1;
+            return;
+        }
+        case calendar::week_of_year: case calendar::week_of_month: {
+            // The week starts on the calendar's first weekday.
+            const auto day = calendar::start_of_day(at, offset);
+            const auto weekday = calendar::split(day, calendar::weekday, offset, st->rules).weekday;
+            Components back;
+            back.day = -((weekday - st->rules.first_weekday + 7) % 7);
+            const auto start = calendar::add(day, back, offset);
+            Components week;
+            week.day = 7;
+            if (s.x[2]) m.write64(s.x[2], std::bit_cast<std::uint64_t>(start));
+            if (s.x[3]) m.write64(s.x[3], std::bit_cast<std::uint64_t>(calendar::add(start, week, offset) - start));
+            s.x[0] = 1;
+            return;
+        }
+        default: s.x[0] = 0; return;
+        }
+        auto c = calendar::split(at, keep, offset, st->rules);
+        if (s.x[1] == calendar::quarter) c.month = (c.month - 1) / 3 * 3 + 1;
+        const auto start = calendar::combine(c, offset, st->rules);
+        if (s.x[2]) m.write64(s.x[2], std::bit_cast<std::uint64_t>(start));
+        if (s.x[3]) m.write64(s.x[3], std::bit_cast<std::uint64_t>(calendar::add(start, step, offset) - start));
+        s.x[0] = 1;
+    });
+    // Boolean CFCalendarComposeAbsoluteTime(CFCalendarRef, CFAbsoluteTime* at, const char* componentDesc, ...):
+    // one int per character, in the variadic stack slots.
+    support.function(cf_library, "_CFCalendarComposeAbsoluteTime", [cal, unit_of, description](CpuState& s, GuestMemory& m) {
+        const auto st = cal->state(s.x[0]);
+        const auto text = description(m, s.x[2]);
+        Components c;
+        for (std::size_t index = 0; index < text.size(); ++index)
+            c.set(unit_of(text[index]), static_cast<std::int32_t>(static_cast<std::uint32_t>(m.read64(s.sp + index * 8))));
+        if (!s.x[1]) fail("CFCalendarComposeAbsoluteTime: NULL result");
+        m.write64(s.x[1], std::bit_cast<std::uint64_t>(calendar::combine(c, cal->offset(st->zone), st->rules)));
+        s.x[0] = 1;
+    });
+    // Boolean CFCalendarDecomposeAbsoluteTime(CFCalendarRef, CFAbsoluteTime at, const char* componentDesc, ...): int* results.
+    support.function(cf_library, "_CFCalendarDecomposeAbsoluteTime", [cal, unit_of, description, real](CpuState& s, GuestMemory& m) {
+        const auto st = cal->state(s.x[0]);
+        const auto text = description(m, s.x[1]);
+        std::uint64_t units{};
+        for (const auto code : text) units |= unit_of(code);
+        const auto c = calendar::split(real(s, 0), units, cal->offset(st->zone), st->rules);
+        for (std::size_t index = 0; index < text.size(); ++index)
+            if (const auto out = m.read64(s.sp + index * 8)) m.write32(out, static_cast<std::uint32_t>(static_cast<std::int32_t>(c.get(unit_of(text[index])))));
+        s.x[0] = 1;
+    });
+    // Boolean CFCalendarAddComponents(CFCalendarRef, CFAbsoluteTime* at, CFOptionFlags options, const char* componentDesc, ...)
+    support.function(cf_library, "_CFCalendarAddComponents", [cal, unit_of, description](CpuState& s, GuestMemory& m) {
+        if (s.x[2] & wrap_components) unsupported("CFCalendarAddComponents with kCFCalendarComponentsWrap");
+        const auto st = cal->state(s.x[0]);
+        const auto text = description(m, s.x[3]);
+        Components delta;
+        for (std::size_t index = 0; index < text.size(); ++index)
+            delta.set(unit_of(text[index]), static_cast<std::int32_t>(static_cast<std::uint32_t>(m.read64(s.sp + index * 8))));
+        if (!s.x[1]) fail("CFCalendarAddComponents: NULL time");
+        const auto at = std::bit_cast<double>(m.read64(s.x[1]));
+        m.write64(s.x[1], std::bit_cast<std::uint64_t>(calendar::add(at, delta, cal->offset(st->zone))));
+        s.x[0] = 1;
+    });
+    // Boolean CFCalendarGetComponentDifference(CFCalendarRef, CFAbsoluteTime start, CFAbsoluteTime result, CFOptionFlags options,
+    // const char* componentDesc, ...): int* results.
+    support.function(cf_library, "_CFCalendarGetComponentDifference", [cal, unit_of, description, real](CpuState& s, GuestMemory& m) {
+        if (s.x[1] & wrap_components) unsupported("CFCalendarGetComponentDifference with kCFCalendarComponentsWrap");
+        const auto st = cal->state(s.x[0]);
+        const auto text = description(m, s.x[2]);
+        std::uint64_t units{};
+        for (const auto code : text) units |= unit_of(code);
+        const auto c = calendar::difference(real(s, 0), real(s, 1), units, cal->offset(st->zone), st->rules);
+        for (std::size_t index = 0; index < text.size(); ++index)
+            if (const auto out = m.read64(s.sp + index * 8)) m.write32(out, static_cast<std::uint32_t>(static_cast<std::int32_t>(c.get(unit_of(text[index])))));
+        s.x[0] = 1;
+    });
+
+    // ---- CFGregorianDate (CFDate.h; deprecated, still exported) ----
+    // struct CFGregorianDate { SInt32 year; SInt8 month, day, hour, minute; double second; }: 16 bytes in x0/x1.
+    // struct CFGregorianUnits { SInt32 years, months, days, hours, minutes; double seconds; }: 32 bytes, by reference.
+    // A NULL time zone is GMT.
+    const auto gmt_offset = [cal](Address zone) { return zone ? cal->offset(zone) : calendar::Offset([](double) -> std::int64_t { return 0; }); };
+    const auto gregorian_rules = calendar::Rules{1, 1};
+    struct Gregorian { std::int32_t year{}; std::int8_t month{}, day{}, hour{}, minute{}; double second{}; };
+    const auto unpack = [](Address low, Address high) {
+        Gregorian g;
+        g.year = static_cast<std::int32_t>(low & 0xffffffff);
+        g.month = static_cast<std::int8_t>(low >> 32);
+        g.day = static_cast<std::int8_t>(low >> 40);
+        g.hour = static_cast<std::int8_t>(low >> 48);
+        g.minute = static_cast<std::int8_t>(low >> 56);
+        g.second = std::bit_cast<double>(high);
+        return g;
+    };
+    support.function(cf_library, "_CFAbsoluteTimeGetGregorianDate", [gmt_offset, gregorian_rules, real](CpuState& s, GuestMemory&) {
+        const auto at = real(s, 0);
+        const auto offset = gmt_offset(s.x[0]);
+        const auto c = calendar::split(at, calendar::year | calendar::month | calendar::day | calendar::hour | calendar::minute, offset, gregorian_rules);
+        Components minute_start = c;
+        minute_start.era = calendar::undefined;
+        const auto whole = calendar::combine(minute_start, offset, gregorian_rules);
+        s.x[0] = (static_cast<Address>(static_cast<std::uint32_t>(c.year))) | (static_cast<Address>(static_cast<std::uint8_t>(c.month)) << 32) |
+                 (static_cast<Address>(static_cast<std::uint8_t>(c.day)) << 40) | (static_cast<Address>(static_cast<std::uint8_t>(c.hour)) << 48) |
+                 (static_cast<Address>(static_cast<std::uint8_t>(c.minute)) << 56);
+        s.x[1] = std::bit_cast<std::uint64_t>(at - whole);
+    });
+    support.function(cf_library, "_CFGregorianDateGetAbsoluteTime", [gmt_offset, gregorian_rules, unpack, put_real](CpuState& s, GuestMemory&) {
+        const auto g = unpack(s.x[0], s.x[1]);
+        Components c;
+        c.year = g.year;
+        c.month = g.month;
+        c.day = g.day;
+        c.hour = g.hour;
+        c.minute = g.minute;
+        c.second = 0;
+        put_real(s, calendar::combine(c, gmt_offset(s.x[2]), gregorian_rules) + g.second);
+    });
+    // Boolean CFGregorianDateIsValid(CFGregorianDate, CFOptionFlags unitFlags): kCFGregorianUnitsYears 1 ... Seconds 1 << 5.
+    support.function(cf_library, "_CFGregorianDateIsValid", [unpack](CpuState& s, GuestMemory&) {
+        const auto g = unpack(s.x[0], s.x[1]);
+        const auto flags = s.x[2];
+        bool valid = true;
+        if (flags & 2) valid = valid && g.month >= 1 && g.month <= 12;
+        if (flags & 4) valid = valid && g.day >= 1 && (g.month < 1 || g.month > 12 || g.day <= calendar::days_in_month(g.year, g.month));
+        if (flags & 8) valid = valid && g.hour >= 0 && g.hour < 24;
+        if (flags & 16) valid = valid && g.minute >= 0 && g.minute < 60;
+        if (flags & 32) valid = valid && g.second >= 0 && g.second < 60;
+        s.x[0] = valid ? 1 : 0;
+    });
+    // SInt32 CFAbsoluteTimeGetDayOfWeek(CFAbsoluteTime, CFTimeZoneRef): 1 Monday ... 7 Sunday.
+    support.function(cf_library, "_CFAbsoluteTimeGetDayOfWeek", [gmt_offset, gregorian_rules, real](CpuState& s, GuestMemory&) {
+        const auto weekday = calendar::split(real(s, 0), calendar::weekday, gmt_offset(s.x[0]), gregorian_rules).weekday;   // 1 Sunday
+        s.x[0] = static_cast<Address>((weekday + 5) % 7 + 1);
+    });
+    support.function(cf_library, "_CFAbsoluteTimeGetDayOfYear", [gmt_offset, gregorian_rules, real](CpuState& s, GuestMemory&) {
+        const auto r = calendar::ordinality(calendar::day, calendar::year, real(s, 0), gmt_offset(s.x[0]), gregorian_rules);
+        s.x[0] = static_cast<Address>(r.value_or(0));
+    });
+    // The ISO 8601 week number (weeks start on Monday; the first week has four days of the year).
+    support.function(cf_library, "_CFAbsoluteTimeGetWeekOfYear", [gmt_offset, real](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<Address>(calendar::split(real(s, 0), calendar::week_of_year, gmt_offset(s.x[0]), calendar::Rules{2, 4}).week_of_year);
+    });
+    // CFAbsoluteTime CFAbsoluteTimeAddGregorianUnits(CFAbsoluteTime, CFTimeZoneRef, CFGregorianUnits)
+    support.function(cf_library, "_CFAbsoluteTimeAddGregorianUnits", [gmt_offset, real, put_real](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) fail("CFAbsoluteTimeAddGregorianUnits: NULL units");
+        Components delta;
+        delta.year = static_cast<std::int32_t>(m.read32(s.x[1]));
+        delta.month = static_cast<std::int32_t>(m.read32(s.x[1] + 4));
+        delta.day = static_cast<std::int32_t>(m.read32(s.x[1] + 8));
+        delta.hour = static_cast<std::int32_t>(m.read32(s.x[1] + 12));
+        delta.minute = static_cast<std::int32_t>(m.read32(s.x[1] + 16));
+        const auto seconds = std::bit_cast<double>(m.read64(s.x[1] + 24));
+        put_real(s, calendar::add(real(s, 0), delta, gmt_offset(s.x[0])) + seconds);
+    });
+    // CFGregorianUnits CFAbsoluteTimeGetDifferenceAsGregorianUnits(CFAbsoluteTime at1, CFAbsoluteTime at2, CFTimeZoneRef, CFOptionFlags):
+    // at1 - at2 in the flagged units, through x8.
+    support.function(cf_library, "_CFAbsoluteTimeGetDifferenceAsGregorianUnits", [gmt_offset, gregorian_rules, real](CpuState& s, GuestMemory& m) {
+        const auto flags = s.x[1];
+        std::uint64_t units{};
+        if (flags & 1) units |= calendar::year;
+        if (flags & 2) units |= calendar::month;
+        if (flags & 4) units |= calendar::day;
+        if (flags & 8) units |= calendar::hour;
+        if (flags & 16) units |= calendar::minute;
+        const auto from = real(s, 1), to = real(s, 0);
+        const auto offset = gmt_offset(s.x[0]);
+        const auto c = units ? calendar::difference(from, to, units, offset, gregorian_rules) : Components{};
+        const auto value = [&](calendar::Unit unit) { return (units & unit) ? static_cast<std::uint32_t>(static_cast<std::int32_t>(c.get(unit))) : 0u; };
+        std::uint8_t out[32]{};
+        const std::uint32_t fields[5] = {value(calendar::year), value(calendar::month), value(calendar::day), value(calendar::hour), value(calendar::minute)};
+        std::memcpy(out, fields, sizeof(fields));
+        double seconds = 0;
+        if (flags & 32) {
+            Components whole;
+            for (const auto unit : {calendar::year, calendar::month, calendar::day, calendar::hour, calendar::minute})
+                if (units & unit) whole.set(unit, c.get(unit));
+            seconds = to - calendar::add(from, whole, offset);
+        }
+        std::memcpy(out + 24, &seconds, 8);
+        if (!s.x[8]) fail("CFAbsoluteTimeGetDifferenceAsGregorianUnits: no result location");
+        m.write_bytes(s.x[8], out);
+    });
+
 }
 
 } // namespace alchemy::gui::completion_kit::data

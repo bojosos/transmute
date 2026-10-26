@@ -23,9 +23,13 @@
 // Foundation value classes a renderer plug-in's Qt and tools import:
 //   NSTimeZone   over the host IANA time-zone database (std::chrono tzdb):
 //                system/default/named/fixed-offset zones, offsets, daylight
-//                saving, abbreviations, next transition, known names.
-//                CFTimeZone objects (frameworks.cpp) are instances of the
-//                private subclass __NSTimeZone, as on Darwin.
+//                saving, abbreviations, next transition, known names, the
+//                abbreviation dictionary (CF-Lite's defaults).
+//                CFTimeZone objects are instances of the private subclass
+//                __NSTimeZone, as on Darwin, and the CFTimeZone calls
+//                (create by name, abbreviation or offset, offsets, daylight
+//                saving, transitions, names, defaults) send NSTimeZone's
+//                methods. CFTimeZoneGetData and TZif data stop explicitly.
 //   NSUUID       random and parsed UUIDs, bytes and strings.
 //   NSValue      boxed bytes with an Objective-C type encoding, pointers,
 //                non-retained objects, NSRange/NSPoint/NSSize/NSRect.
@@ -143,10 +147,6 @@ void install_foundation_classes(Provider& p, ObjcRuntime& objc, CoreFoundation& 
         const auto name = s.x[2] ? cf.utf8(s.x[2]) : std::string{};
         s.x[0] = !name.empty() && resolve_zone(name) ? autorelease(make_time_zone(process, cf, objc, name)) : 0;
     }, true, "@@:@");
-    add(zone_class, "timeZoneWithAbbreviation:", [&process, &cf, &objc, autorelease](CpuState& s, GuestMemory&) {
-        const auto name = s.x[2] ? cf.utf8(s.x[2]) : std::string{};
-        s.x[0] = name == "GMT" || name == "UTC" ? autorelease(make_time_zone(process, cf, objc, name)) : 0;
-    }, true, "@@:@");
     add(zone_class, "timeZoneForSecondsFromGMT:", [&process, &cf, &objc, autorelease](CpuState& s, GuestMemory&) {
         const auto offset = static_cast<std::int64_t>(s.x[2]);
         if (offset < -18 * 3600 || offset > 18 * 3600) { s.x[0] = 0; return; }
@@ -228,6 +228,153 @@ void install_foundation_classes(Provider& p, ObjcRuntime& objc, CoreFoundation& 
         s.x[0] = std::hash<std::string>{}(zone_of(s.x[0]).first->identifier);
     }, false, "Q@:");
     add(zone_class, "copyWithZone:", [&process](CpuState& s, GuestMemory&) { s.x[0] = process.objects().retain(s.x[0]); });
+
+    // ---- abbreviations ----
+    // The default abbreviation dictionary is CF-Lite's (swift-corelibs-foundation CFTimeZone.c,
+    // Apache-2.0, third_party/swift-corelibs-foundation); +setAbbreviationDictionary: and
+    // CFTimeZoneSetAbbreviationDictionary replace it for the process.
+    static constexpr std::pair<const char*, const char*> default_abbreviations[] = {
+        {"ADT", "America/Halifax"}, {"AKDT", "America/Juneau"}, {"AKST", "America/Juneau"}, {"ART", "America/Argentina/Buenos_Aires"},
+        {"AST", "America/Halifax"}, {"BDT", "Asia/Dhaka"}, {"BRST", "America/Sao_Paulo"}, {"BRT", "America/Sao_Paulo"},
+        {"BST", "Europe/London"}, {"CAT", "Africa/Harare"}, {"CDT", "America/Chicago"}, {"CEST", "Europe/Paris"},
+        {"CET", "Europe/Paris"}, {"CLST", "America/Santiago"}, {"CLT", "America/Santiago"}, {"COT", "America/Bogota"},
+        {"CST", "America/Chicago"}, {"EAT", "Africa/Addis_Ababa"}, {"EDT", "America/New_York"}, {"EEST", "Europe/Istanbul"},
+        {"EET", "Europe/Istanbul"}, {"EST", "America/New_York"}, {"GMT", "GMT"}, {"GST", "Asia/Dubai"},
+        {"HKT", "Asia/Hong_Kong"}, {"HST", "Pacific/Honolulu"}, {"ICT", "Asia/Bangkok"}, {"IRST", "Asia/Tehran"},
+        {"IST", "Asia/Calcutta"}, {"JST", "Asia/Tokyo"}, {"KST", "Asia/Seoul"}, {"MDT", "America/Denver"},
+        {"MSD", "Europe/Moscow"}, {"MSK", "Europe/Moscow"}, {"MST", "America/Denver"}, {"NZDT", "Pacific/Auckland"},
+        {"NZST", "Pacific/Auckland"}, {"PDT", "America/Los_Angeles"}, {"PET", "America/Lima"}, {"PHT", "Asia/Manila"},
+        {"PKT", "Asia/Karachi"}, {"PST", "America/Los_Angeles"}, {"SGT", "Asia/Singapore"}, {"UTC", "UTC"},
+        {"WAT", "Africa/Lagos"}, {"WEST", "Europe/Lisbon"}, {"WET", "Europe/Lisbon"}, {"WIT", "Asia/Jakarta"},
+    };
+    auto abbreviations = std::make_shared<std::pair<std::mutex, std::uint64_t>>();   // the dictionary (+1), made on first use
+    const auto abbreviation_dictionary = [&process, &cf, abbreviations]() {   // +1
+        std::lock_guard lock(abbreviations->first);
+        if (!abbreviations->second) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> entries;
+            for (const auto& [key, value] : default_abbreviations) entries.emplace_back(cf.string(key), cf.string(value));
+            abbreviations->second = cf.dictionary(entries);
+            for (const auto& [key, value] : entries) { process.objects().release(key); process.objects().release(value); }
+        }
+        return process.objects().retain(abbreviations->second);
+    };
+    const auto set_abbreviation_dictionary = [&process, abbreviations](std::uint64_t dictionary) {
+        if (!dictionary) return;
+        std::lock_guard lock(abbreviations->first);
+        if (abbreviations->second) process.objects().release(abbreviations->second);
+        abbreviations->second = process.objects().retain(dictionary);
+    };
+    add(zone_class, "abbreviationDictionary", [abbreviation_dictionary, autorelease, zone_class](CpuState& s, GuestMemory&) {
+        s.x[0] = autorelease(abbreviation_dictionary());
+    }, true);
+    add(zone_class, "setAbbreviationDictionary:", [set_abbreviation_dictionary](CpuState& s, GuestMemory&) { set_abbreviation_dictionary(s.x[2]); },
+        true, "v@:@");
+    // The zone an abbreviation names (nil when the dictionary has none).
+    const auto zone_for_abbreviation = [&process, &cf, &objc, abbreviation_dictionary](std::uint64_t abbreviation) -> std::uint64_t {   // +1
+        if (!abbreviation) return 0;
+        const auto dictionary = abbreviation_dictionary();
+        std::uint64_t name{};
+        for (const auto& [key, value] : cf.dictionary_entries(dictionary))
+            if (cf.utf8(key) == cf.utf8(abbreviation)) name = value;
+        const auto identifier = name ? cf.utf8(name) : std::string{};
+        process.objects().release(dictionary);
+        return !identifier.empty() && resolve_zone(identifier) ? make_time_zone(process, cf, objc, identifier) : 0;
+    };
+
+    // ---- CFTimeZone: a CFTimeZoneRef is an NSTimeZone (toll-free bridged) ----
+    const auto time_real = [](const CpuState& s, unsigned index) { return std::bit_cast<double>(s.v[index][0]); };
+    const auto send = [&objc](std::uint64_t receiver, const char* selector, std::initializer_list<std::uint64_t> arguments = {}) {
+        CallRegs registers;
+        std::size_t index = 2;
+        for (const auto value : arguments) registers.x[index++] = value;
+        return objc.send(receiver, selector, registers);
+    };
+    const auto with_date = [&process, &cf](double at, auto&& use) {
+        const auto date = cf.date(at);
+        const auto result = use(date);
+        process.objects().release(date);
+        return result;
+    };
+    const auto named = [&process, &cf, &objc, zone_for_abbreviation](std::uint64_t name, bool try_abbreviation) -> std::uint64_t {   // +1
+        // With tryAbbrev the abbreviation dictionary comes first, as in CF (CFTimeZone.c).
+        if (try_abbreviation)
+            if (const auto zone = zone_for_abbreviation(name)) return zone;
+        const auto text = name ? cf.utf8(name) : std::string{};
+        return !text.empty() && resolve_zone(text) ? make_time_zone(process, cf, objc, text) : 0;
+    };
+    const auto no_allocator = [](std::uint64_t allocator) {
+        if (allocator) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+    };
+    // CFTimeZoneRef CFTimeZoneCreateWithName(CFAllocatorRef, CFStringRef name, Boolean tryAbbrev)
+    p.function(core_foundation_library, "_CFTimeZoneCreateWithName", [named, no_allocator](CpuState& s, GuestMemory&) -> std::uint64_t {
+        no_allocator(s.x[0]);
+        return named(s.x[1], (s.x[2] & 0xff) != 0);
+    });
+    // CFTimeZoneRef CFTimeZoneCreate(CFAllocatorRef, CFStringRef name, CFDataRef data): TZif data is not read.
+    p.function(core_foundation_library, "_CFTimeZoneCreate", [named, no_allocator](CpuState& s, GuestMemory&) -> std::uint64_t {
+        no_allocator(s.x[0]);
+        if (s.x[2]) throw std::runtime_error("unsupported: CFTimeZoneCreate with TZif data (zones come from the host time-zone database by name)");
+        return named(s.x[1], false);
+    });
+    // CFTimeZoneRef CFTimeZoneCreateWithTimeIntervalFromGMT(CFAllocatorRef, CFTimeInterval ti): NULL beyond Â±18 hours.
+    p.function(core_foundation_library, "_CFTimeZoneCreateWithTimeIntervalFromGMT", [&process, send, time_real, no_allocator, zone_class](CpuState& s, GuestMemory&) -> std::uint64_t {
+        no_allocator(s.x[0]);
+        const auto zone = send(zone_class, "timeZoneForSecondsFromGMT:", {static_cast<std::uint64_t>(static_cast<std::int64_t>(time_real(s, 0)))}).x0;
+        return zone ? process.objects().retain(zone) : 0;
+    });
+    p.function(core_foundation_library, "_CFTimeZoneGetSecondsFromGMT", [send, time_real, with_date](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto seconds = with_date(time_real(s, 0), [&](std::uint64_t date) { return static_cast<std::int64_t>(send(s.x[0], "secondsFromGMTForDate:", {date}).x0); });
+        s.v[0] = {std::bit_cast<std::uint64_t>(static_cast<double>(seconds)), 0};
+        return 0;
+    });
+    p.function(core_foundation_library, "_CFTimeZoneCopyAbbreviation", [&process, send, time_real, with_date](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto text = with_date(time_real(s, 0), [&](std::uint64_t date) { return send(s.x[0], "abbreviationForDate:", {date}).x0; });
+        return text ? process.objects().retain(text) : 0;
+    });
+    p.function(core_foundation_library, "_CFTimeZoneIsDaylightSavingTime", [send, time_real, with_date](CpuState& s, GuestMemory&) -> std::uint64_t {
+        return with_date(time_real(s, 0), [&](std::uint64_t date) { return send(s.x[0], "isDaylightSavingTimeForDate:", {date}).x0 & 0xff; });
+    });
+    p.function(core_foundation_library, "_CFTimeZoneGetDaylightSavingTimeOffset", [send, time_real, with_date](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto offset = with_date(time_real(s, 0), [&](std::uint64_t date) { return send(s.x[0], "daylightSavingTimeOffsetForDate:", {date}).v[0][0]; });
+        s.v[0] = {offset, 0};
+        return 0;
+    });
+    // CFAbsoluteTime CFTimeZoneGetNextDaylightSavingTimeTransition(CFTimeZoneRef, CFAbsoluteTime at): 0.0 when none.
+    p.function(core_foundation_library, "_CFTimeZoneGetNextDaylightSavingTimeTransition", [&cf, send, time_real, with_date](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto next = with_date(time_real(s, 0), [&](std::uint64_t date) { return send(s.x[0], "nextDaylightSavingTimeTransitionAfterDate:", {date}).x0; });
+        s.v[0] = {std::bit_cast<std::uint64_t>(next ? cf.date_time(next) : 0.0), 0};
+        return 0;
+    });
+    // CFStringRef CFTimeZoneCopyLocalizedName(CFTimeZoneRef, CFTimeZoneNameStyle, CFLocaleRef)
+    p.function(core_foundation_library, "_CFTimeZoneCopyLocalizedName", [&process, send](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto text = send(s.x[0], "localizedName:locale:", {s.x[1], s.x[2]}).x0;
+        return text ? process.objects().retain(text) : 0;
+    });
+    p.function(core_foundation_library, "_CFTimeZoneCopyKnownNames", [&process, send, zone_class](CpuState&, GuestMemory&) -> std::uint64_t {
+        return process.objects().retain(send(zone_class, "knownTimeZoneNames").x0);
+    });
+    p.function(core_foundation_library, "_CFTimeZoneCopyAbbreviationDictionary", [abbreviation_dictionary](CpuState&, GuestMemory&) -> std::uint64_t {
+        return abbreviation_dictionary();
+    });
+    p.function(core_foundation_library, "_CFTimeZoneSetAbbreviationDictionary", [set_abbreviation_dictionary](CpuState& s, GuestMemory&) -> std::uint64_t {
+        set_abbreviation_dictionary(s.x[0]);
+        return 0;
+    });
+    p.function(core_foundation_library, "_CFTimeZoneSetDefault", [send, zone_class](CpuState& s, GuestMemory&) -> std::uint64_t {
+        static_cast<void>(send(zone_class, "setDefaultTimeZone:", {s.x[0]}));
+        return 0;
+    });
+    p.function(core_foundation_library, "_CFTimeZoneResetSystem", [send, zone_class](CpuState&, GuestMemory&) -> std::uint64_t {
+        static_cast<void>(send(zone_class, "resetSystemTimeZone"));
+        return 0;
+    });
+    // CFDataRef CFTimeZoneGetData(CFTimeZoneRef): the zone's TZif bytes, which the host database does not expose.
+    p.function(core_foundation_library, "_CFTimeZoneGetData", [](CpuState&, GuestMemory&) -> std::uint64_t {
+        throw std::runtime_error("unsupported: CFTimeZoneGetData (the host time-zone database has no TZif data)");
+    });
+    add(zone_class, "timeZoneWithAbbreviation:", [zone_for_abbreviation, autorelease](CpuState& s, GuestMemory&) {
+        s.x[0] = autorelease(zone_for_abbreviation(s.x[2]));
+    }, true, "@@:@");
 
     // ---- NSUUID ----
     auto uuid_class = objc.find_class("NSUUID");

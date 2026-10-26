@@ -18,10 +18,10 @@
 #include <vector>
 
 // Locale-dependent CoreFoundation formatting Qt Core's system locale uses:
-// CFCalendar (current Gregorian calendar, first weekday, minimum days in the
-// first week), CFLocaleCopyDisplayNameForPropertyValue, CFDateFormatter
+// CFLocaleCopyDisplayNameForPropertyValue, CFDateFormatter
 // (style patterns, symbol properties, formatting a CFDate) and
-// CFNumberFormatter (styles, properties, formatting numbers).
+// CFNumberFormatter (styles, properties, formatting numbers). CFCalendar is
+// NSCalendar (foundation/calendar_provider.cpp).
 //
 // The locale data comes from the host (host::locale) for the CFLocale's
 // identifier (en_US -> "en-US"): month and day names, AM/PM, date and time
@@ -256,7 +256,6 @@ struct NumberFormatter : ObjectPayload {
     std::string currency_symbol;   // kCFNumberFormatterCurrencySymbol override
 };
 
-struct Calendar : ObjectPayload { LocaleData data; };
 
 std::string style_pattern(const LocaleData& data, std::int64_t date_style, std::int64_t time_style) {
     std::string date, time;
@@ -326,7 +325,6 @@ void install_cf_locale(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     };
     const auto date_formatter_class = native_class("__NSCFDateFormatter");
     const auto number_formatter_class = native_class("__NSCFNumberFormatter");
-    const auto calendar_class = native_class("__NSCFCalendar");
     const auto no_allocator = [](std::uint64_t allocator) {
         if (allocator) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
     };
@@ -343,33 +341,6 @@ void install_cf_locale(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         for (const auto item : items) process.objects().release(item);
         return array;
     };
-
-    // ---- CFCalendar ----
-    // CFCalendarRef CFCalendarCopyCurrent(void): Gregorian, current locale.
-    function("_CFCalendarCopyCurrent", [&process, &cf, calendar_class](CpuState& s, GuestMemory&) {
-        auto value = std::make_shared<Calendar>();
-        value->data = load_locale(locale_identifier(cf, 0));
-        s.x[0] = process.objects().create(16, calendar_class, ObjectKind::instance, std::move(value));
-    });
-    // CFCalendarRef CFCalendarCreateWithIdentifier(alloc, CFStringRef identifier)
-    function("_CFCalendarCreateWithIdentifier", [&process, &cf, calendar_class, no_allocator](CpuState& s, GuestMemory&) {
-        no_allocator(s.x[0]);
-        if (!s.x[1] || cf.utf8(s.x[1]) != "gregorian") throw std::runtime_error("Alchemy CFCalendar: only the Gregorian calendar is supported");
-        auto value = std::make_shared<Calendar>();
-        value->data = load_locale(locale_identifier(cf, 0));
-        s.x[0] = process.objects().create(16, calendar_class, ObjectKind::instance, std::move(value));
-    });
-    const auto gregorian = cf.constant_string("gregorian");
-    function("_CFCalendarGetIdentifier", [gregorian, payload](CpuState& s, GuestMemory&) {
-        static_cast<void>(payload.template operator()<Calendar>(s.x[0], "CFCalendar"));
-        s.x[0] = gregorian;
-    });
-    function("_CFCalendarGetFirstWeekday", [payload](CpuState& s, GuestMemory&) {
-        s.x[0] = payload.template operator()<Calendar>(s.x[0], "CFCalendar")->data.first_weekday;
-    });
-    function("_CFCalendarGetMinimumDaysInFirstWeek", [payload](CpuState& s, GuestMemory&) {
-        s.x[0] = payload.template operator()<Calendar>(s.x[0], "CFCalendar")->data.minimum_days;
-    });
 
     // ---- Locale lists ----
     // The host's locales stand in for ICU's: the available identifiers ("de", "de_DE", "zh_Hans") and

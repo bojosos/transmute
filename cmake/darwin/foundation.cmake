@@ -132,6 +132,23 @@ function(alchemy_darwin_foundation_tests)
         set_tests_properties(alchemy_gui_foundation_exceptions_fixture PROPERTIES TIMEOUT 120
             PASS_REGULAR_EXPRESSION "Alchemy Foundation exceptions fixture: 111 1")
     endif()
+    # CFTimeZone, CFCalendar and CFGregorianDate (value_classes.cpp, calendar_provider.cpp): their doubles,
+    # CFRange and struct results, and variadic component descriptions, linked against a CoreFoundation stub.
+    set(cf_install_name /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation)
+    alchemy_gui_object(cf_time_fixture ../../../src/alchemy/darwin/foundation/tests/cf_time_fixture.c)
+    alchemy_gui_object(cf_time_link ../../../src/alchemy/darwin/foundation/tests/cf_time_link.c)
+    add_custom_command(OUTPUT "${macos_dir}/cf_time_link.dylib"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -dylib -install_name ${cf_install_name}
+            "${macos_dir}/cf_time_link.o" -o "${macos_dir}/cf_time_link.dylib"
+        DEPENDS "${macos_dir}/cf_time_link.o" VERBATIM)
+    add_custom_command(OUTPUT "${macos_dir}/cf_time_fixture"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main "${macos_dir}/cf_time_fixture.o"
+            "${macos_dir}/cf_time_link.dylib" "${macos_dir}/link_system.dylib" -o "${macos_dir}/cf_time_fixture"
+        DEPENDS "${macos_dir}/cf_time_fixture.o" "${macos_dir}/cf_time_link.dylib" "${macos_dir}/link_system.dylib" VERBATIM)
+    add_custom_target(alchemy_gui_foundation_time_fixtures ALL DEPENDS "${macos_dir}/cf_time_fixture")
+    add_dependencies(alchemy_gui_foundation_time_fixtures alchemy_personality_fixtures)
+    alchemy_gui_add_fixture_test(alchemy_gui_foundation_cf_time_fixture "${macos_dir}/cf_time_fixture"
+        PROGRESS "Alchemy CF time fixture: launched" COMPLETE "Alchemy CF time fixture: complete")
 endfunction()
 alchemy_gui_register_tests(alchemy_darwin_foundation_tests)
 

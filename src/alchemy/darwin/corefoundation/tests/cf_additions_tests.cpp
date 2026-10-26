@@ -256,10 +256,7 @@ void test_guest_locale(Fixture& f) {
     require(f.cf.utf8(f.call(cf, "_CFNumberFormatterCreateStringWithValue", {0, currency, 6, value})) == "EUR 1,234.50", "currency style");
     const auto percent = f.call(cf, "_CFNumberFormatterCreate", {0, us, 3});
     require(f.cf.utf8(f.call(cf, "_CFNumberFormatterCreateStringWithNumber", {0, percent, f.cf.real(0.25)})) == "25%", "percent style");
-    // Calendar and display names.
-    const auto calendar = f.call(cf, "_CFCalendarCopyCurrent");
-    const auto weekday = f.call(cf, "_CFCalendarGetFirstWeekday", {calendar});
-    require(weekday >= 1 && weekday <= 7, "first weekday");
+    // Display names (CFCalendar is NSCalendar now: foundation/tests/cf_time_fixture.c).
     const auto german = f.call(cf, "_CFLocaleCopyDisplayNameForPropertyValue", {us, key("_kCFLocaleIdentifier"), f.cf.string("de_DE")});
     require(german && f.cf.utf8(german) == "German (Germany)", "display name of de_DE in English");
     // Locale lists (from the host's locales).
