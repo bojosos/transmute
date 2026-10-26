@@ -26,9 +26,16 @@
 //   Chrome's CALayerTreeCoordinator gives top-left texture rectangles to
 //   sublayers of a geometryFlipped layer)*; outside the image the edge
 //   pixels repeat; an empty rectangle draws nothing.
-//   masksToBounds clips contents and sublayers to the bounds. Hidden layers
-//   draw nothing; opacity multiplies down the tree (per layer, not as a
-//   group). Pixels are premultiplied BGRA composited source-over; opaque
+//   masksToBounds clips contents and sublayers to the bounds, rounded by
+//   cornerRadius at the maskedCorners. The background is the rounded
+//   bounds; the border (borderWidth, borderColor) is drawn inside the
+//   rounded bounds above the contents and the sublayers; the shadow (the
+//   shadowPath's coverage, else the rounded bounds of a layer with a
+//   background, else the contents' alpha) is drawn first, offset by
+//   shadowOffset and blurred by shadowRadius, and is not clipped by the
+//   layer's own masksToBounds. Edges are antialiased by coverage. Hidden
+//   layers draw nothing; opacity multiplies down the tree (per layer, not as
+//   a group). Pixels are premultiplied BGRA composited source-over; opaque
 //   images and colours replace.
 // - Only axis-aligned transforms (scale and translation, including flips)
 //   are drawn; a layer whose accumulated transform rotates or shears is
@@ -40,6 +47,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -72,6 +80,25 @@ struct Image {
     bool opaque{};   // every alpha is 255 (copied without blending)
 };
 
+// kCALayerMinXMinYCorner 1, MaxXMinY 2, MinXMaxY 4, MaxXMaxY 8 (the layer's own axes).
+inline constexpr std::uint32_t all_corners = 15;
+
+// An alpha mask in layer space: `pixels` (one byte each, first row at the
+// layer's max y) cover `rect` of the layer's bounds space.
+struct Mask {
+    std::uint32_t width{}, height{};
+    Rect rect;
+    std::shared_ptr<const std::vector<std::uint8_t>> pixels;
+};
+
+struct Shadow {
+    std::array<float, 4> color{0, 0, 0, 1};   // straight RGBA
+    float opacity{};
+    Size offset{0, -3};                       // layer points
+    double radius{3};                         // blur radius, layer points
+    std::optional<Mask> path;                 // the shadowPath's coverage
+};
+
 struct Layer {
     Rect bounds;
     Point position, anchor{0.5, 0.5};
@@ -84,6 +111,15 @@ struct Layer {
     Gravity gravity{Gravity::resize};
     Rect contents_rect{{0, 0}, {1, 1}};   // unit coordinates (see the model above)
     std::uint64_t contents_object{};   // the guest contents object (callers resolve it to `contents`)
+    // Pixels the snapshot made for the layer itself (CAShapeLayer, CATextLayer):
+    // `contents` points into them.
+    std::shared_ptr<const std::vector<std::uint8_t>> owned_contents;
+    std::optional<Rect> contents_frame;   // owned contents cover this rect of the bounds space (gravity ignored)
+    double corner_radius{};
+    std::uint32_t masked_corners{all_corners};
+    double border_width{};
+    std::optional<std::array<float, 4>> border;   // straight RGBA
+    std::optional<Shadow> shadow;                 // opacity > 0
     std::vector<Layer> sublayers;
 };
 

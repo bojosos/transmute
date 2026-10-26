@@ -43,8 +43,23 @@ presentation.
 **Unsupported (explicit failures):** for example planar IOSurfaces,
 CoreImage kernels, and some CIImage source pixel formats. Layer composition
 draws axis-aligned transforms only (rotating or shearing layers are skipped
-and reported once), with nearest-neighbour sampling; masks, corner radii,
-borders, shadows and filters are not drawn.
+and reported once), with nearest-neighbour sampling; masks (the `mask`
+layer), filters and conic gradients are not drawn (conic reported once).
+
+**Layer appearance and kinds (drawn):** background colours with corner
+radii (per corner, `maskedCorners`), borders, shadows (opacity, offset,
+radius as a box blur, `shadowPath`), rounded `masksToBounds` clipping and
+`contentsRect`/gravity frames. Layers that draw get a backing store:
+`-display` asks the delegate's `-displayLayer:`, else `-drawInContext:`
+(the delegate's `-drawLayer:inContext:`) into a bitmap context at the
+layer's scale. CAShapeLayer fills and strokes its path (with
+`strokeStart`/`strokeEnd`), CATextLayer draws strings and attributed
+strings through CoreText, CAGradientLayer draws axial and radial
+gradients, CAReplicatorLayer draws its copies with the instance transform
+and alpha offset (colour offsets and `instanceColor` are kept, not drawn). Hit testing, `containsPoint:`, the `convert*` methods,
+CAScrollLayer scrolling, CAConstraint / CAConstraintLayoutManager layout,
+`renderInContext:` and the CAMediaTiming time conversions are real.
+CATiledLayer draws as one tile.
 
 ## Moved from darwin/identities/
 

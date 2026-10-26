@@ -272,6 +272,74 @@ void contents_rect() {
     std::cout << "contents rect ok\n";
 }
 
+// Rounded backgrounds, borders inside the rounded bounds, rounded clipping
+// of sublayers, shadows and contents frames (frameworks wave U2).
+void corners_borders_shadows() {
+    // A 20 x 20 red box with 8-point corners and a 2-point blue border at (10, 10).
+    auto root = layer({{0, 0}, {40, 40}}, {0, 0});
+    auto box = layer({{0, 0}, {20, 20}}, {10, 10});
+    box.background = rgba(red);
+    box.corner_radius = 8;
+    box.border_width = 2;
+    box.border = rgba(blue);
+    root.sublayers.push_back(box);
+    Canvas canvas(40, 40);
+    auto target = canvas.target();
+    t::compose(root, {{{0, 0}, {40, 40}}, 40, 1}, target, {});
+    canvas.expect(10, 10, clear, "the rounded corner is left out");
+    canvas.expect(20, 20, red, "the inside is the background");
+    canvas.expect(20, 10, blue, "the border along the top edge");
+    canvas.expect(20, 29, blue, "the border along the bottom edge");
+    canvas.expect(13, 20, red, "inside the border");
+
+    // Only the bottom-left corner of the layer (kCALayerMinXMinYCorner) rounded.
+    box.masked_corners = 1;
+    box.border.reset();
+    root.sublayers = {box};
+    Canvas one(40, 40);
+    auto one_target = one.target();
+    t::compose(root, {{{0, 0}, {40, 40}}, 40, 1}, one_target, {});
+    one.expect(10, 29, clear, "min-x min-y is the visual bottom-left of an unflipped layer");
+    one.expect(10, 10, red, "the other corners stay square");
+
+    // masksToBounds with a corner radius clips the sublayers to the rounded bounds.
+    auto clip = layer({{0, 0}, {20, 20}}, {10, 10});
+    clip.masks_to_bounds = true;
+    clip.corner_radius = 8;
+    auto fill = layer({{0, 0}, {20, 20}}, {0, 0});
+    fill.background = rgba(green);
+    clip.sublayers.push_back(fill);
+    root.sublayers = {clip};
+    Canvas clipped(40, 40);
+    auto clipped_target = clipped.target();
+    t::compose(root, {{{0, 0}, {40, 40}}, 40, 1}, clipped_target, {});
+    clipped.expect(10, 10, clear, "the sublayer is clipped at the rounded corner");
+    clipped.expect(20, 20, green, "and shown inside");
+
+    // A crisp shadow (no blur) offset right and down.
+    auto lit = layer({{0, 0}, {10, 10}}, {5, 25});
+    lit.background = rgba(red);
+    lit.shadow = t::Shadow{{0, 0, 0, 1}, 1.0F, {5, -5}, 0, std::nullopt};
+    root.sublayers = {lit};
+    Canvas shadowed(40, 40);
+    auto shadowed_target = shadowed.target();
+    t::compose(root, {{{0, 0}, {40, 40}}, 40, 1}, shadowed_target, {});
+    shadowed.expect(7, 7, red, "the layer over its shadow");
+    shadowed.expect(17, 17, {0, 0, 0, 255}, "the shadow right of and below the layer");
+    shadowed.expect(30, 30, clear, "nothing beyond the shadow");
+
+    // Owned contents drawn at their frame, beyond the bounds.
+    const Picture picture(4, 4, green, green);
+    auto shape = layer({{0, 0}, {10, 10}}, {10, 10});
+    shape.contents = picture.image(false);
+    shape.contents_frame = Rect{{-5, -5}, {20, 20}};
+    root.sublayers = {shape};
+    Canvas framed(40, 40);
+    auto framed_target = framed.target();
+    t::compose(root, {{{0, 0}, {40, 40}}, 40, 1}, framed_target, {});
+    framed.expect(6, 33, green, "contents outside the bounds at their frame");
+}
+
 int main() {
     try {
         chrome_tree_shows_the_surface_top_left();
@@ -281,6 +349,7 @@ int main() {
         hidden_opacity_clipping_and_order();
         clip_and_unsupported_transforms();
         contents_rect();
+        corners_borders_shadows();
     } catch (const std::exception& error) {
         std::cerr << "layer tree test failed: " << error.what() << "\n";
         return 1;

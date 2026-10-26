@@ -217,10 +217,6 @@ void install_appkit_extra(Support& support) {
     stored("CALayer", "magnificationFilter", "setMagnificationFilter:", false, 0, "@@:", "v@:@");
     stored("CALayer", "compositingFilter", "setCompositingFilter:", false, 0, "@@:", "v@:@");
     stored("CALayer", "actions", "setActions:", false, 0, "@@:", "v@:@");
-    stored("CALayer", "cornerRadius", "setCornerRadius:", true, 0, "d@:", "v@:d");
-    stored("CALayer", "borderWidth", "setBorderWidth:", true, 0, "d@:", "v@:d");
-    stored("CALayer", "borderColor", "setBorderColor:", false, 0, "^v@:", "v@:^v");
-    stored("CALayer", "shadowOpacity", "setShadowOpacity:", true, 0, "f@:", "v@:f");
     add("NSWindow", "setResizeIncrements:", [](CpuState&, GuestMemory&) {}, "v@:{CGSize=dd}");
     add("NSWindow", "invalidateShadow", [](CpuState&, GuestMemory&) {}, "v@:");
     // Tool tips, sheets and content border thickness are QLab's NSView /

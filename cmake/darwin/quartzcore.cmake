@@ -39,6 +39,11 @@ function(alchemy_gui_quartzcore_tests)
     # CALayer tree composition on host pixels (layer_tree.hpp, no guest).
     alchemy_gui_add_unit_test(alchemy_gui_quartzcore_layer_tree
         src/alchemy/darwin/quartzcore/tests/layer_tree_tests.cpp)
+    # Layer kinds and geometry over the Objective-C runtime: appearance, backing
+    # stores, shape/text/gradient pixels, replicators, hit testing, scrolling and
+    # constraints (the frameworks wave, U2).
+    alchemy_gui_add_unit_test(alchemy_gui_quartzcore_layer_kinds
+        src/alchemy/darwin/quartzcore/tests/layer_kinds_tests.cpp TIMEOUT 120)
     # Layer trees with IOSurface contents composited into AppKit windows on
     # commit, IOSurface seeds and Mach ports, CVDisplayLink cadence (every
     # provider, the in-memory window server).

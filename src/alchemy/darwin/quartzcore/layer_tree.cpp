@@ -42,6 +42,58 @@ void blend(std::uint8_t* dst, const std::uint8_t* src, unsigned alpha) {
     }
 }
 
+// A rounded rectangle in target pixels: per target corner (top-left,
+// top-right, bottom-left, bottom-right) the x and y radii.
+struct Rounding {
+    Box box{};
+    std::array<double, 4> rx{}, ry{};
+    [[nodiscard]] bool any() const {
+        for (unsigned i = 0; i < 4; ++i) if (rx[i] > 0 && ry[i] > 0) return true;
+        return false;
+    }
+    // The part of pixel (x, y) the shape covers, 0..1.
+    [[nodiscard]] double coverage(long x, long y) const {
+        const double cover_x = std::clamp(std::min(static_cast<double>(x) + 1, box.x1) - std::max(static_cast<double>(x), box.x0), 0.0, 1.0);
+        const double cover_y = std::clamp(std::min(static_cast<double>(y) + 1, box.y1) - std::max(static_cast<double>(y), box.y0), 0.0, 1.0);
+        double cover = cover_x * cover_y;
+        if (cover <= 0) return 0;
+        const double px = static_cast<double>(x) + 0.5, py = static_cast<double>(y) + 0.5;
+        const bool left = px < (box.x0 + box.x1) / 2, top = py < (box.y0 + box.y1) / 2;
+        const unsigned corner = (top ? 0 : 2) + (left ? 0 : 1);
+        const double a = rx[corner], b = ry[corner];
+        if (a <= 0 || b <= 0) return cover;
+        const double cx = left ? box.x0 + a : box.x1 - a, cy = top ? box.y0 + b : box.y1 - b;
+        if ((left ? px >= cx : px <= cx) || (top ? py >= cy : py <= cy)) return cover;
+        const double dx = (px - cx) / a, dy = (py - cy) / b;
+        const double outside = (std::sqrt(dx * dx + dy * dy) - 1.0) * std::min(a, b);   // about the pixel distance
+        return std::min(cover, std::clamp(0.5 - outside, 0.0, 1.0));
+    }
+    [[nodiscard]] Rounding inset(double dx, double dy) const {
+        Rounding out = *this;
+        out.box = {box.x0 + dx, box.y0 + dy, box.x1 - dx, box.y1 - dy};
+        for (unsigned i = 0; i < 4; ++i) { out.rx[i] = std::max(0.0, rx[i] - dx); out.ry[i] = std::max(0.0, ry[i] - dy); }
+        return out;
+    }
+};
+
+Rounding rounding_of(const Layer& value, const Affine& m, const Box& box) {
+    Rounding out{box, {}, {}};
+    if (!(value.corner_radius > 0)) return out;
+    const double half_w = (box.x1 - box.x0) / 2, half_h = (box.y1 - box.y0) / 2;
+    const double rx = std::min(value.corner_radius * std::abs(m.a), half_w), ry = std::min(value.corner_radius * std::abs(m.d), half_h);
+    // The layer's corners (kCALayerMinXMinYCorner ...) in target order: the
+    // left edge is min x unless x is mirrored, the top edge min y where the
+    // layer's space is flipped (m.d > 0).
+    const bool left_is_min_x = m.a > 0, top_is_min_y = m.d > 0;
+    for (unsigned corner = 0; corner < 4; ++corner) {
+        const bool top = corner < 2, left = corner % 2 == 0;
+        const bool min_x = left == left_is_min_x, min_y = top == top_is_min_y;
+        const std::uint32_t bit = (min_x ? 1U : 2U) << (min_y ? 0 : 2);
+        if (value.masked_corners & bit) { out.rx[corner] = rx; out.ry[corner] = ry; }
+    }
+    return out;
+}
+
 class Composer {
 public:
     Composer(Target& target, Stats& stats) : target_(target), stats_(stats) {}
@@ -53,14 +105,28 @@ public:
         if (std::abs(m.b) > epsilon || std::abs(m.c) > epsilon) { ++stats_.unsupported_transforms; return; }
         const auto box = map_box(m, value.bounds);
         const auto bounds_pixels = pixels_of(box);
+        const auto round = rounding_of(value, m, box);
         const auto own_clip = value.masks_to_bounds ? clip.intersect(bounds_pixels) : clip;
+        const bool has_contents = self && value.contents && value.contents->bgra && value.contents->width && value.contents->height;
         if (self) {
             ++stats_.layers_drawn;
-            if (value.background && (*value.background)[3] > 0) fill(bounds_pixels.intersect(clip), *value.background, alpha);
-            if (value.contents && value.contents->bgra && value.contents->width && value.contents->height)
-                image(value, m, box, own_clip, alpha);
+            if (value.shadow) shadow(value, m, box, round, clip, alpha);
+            if (value.background && (*value.background)[3] > 0) {
+                if (round.any()) fill_shape(bounds_pixels.intersect(clip), *value.background, alpha, round);
+                else fill(bounds_pixels.intersect(clip), *value.background, alpha);
+            }
         }
-        if (value.sublayers.empty() || own_clip.empty()) return;
+        // Rounded clipping: what the contents and sublayers draw outside the
+        // rounded bounds is taken back afterwards.
+        std::vector<std::uint8_t> saved;
+        if (value.masks_to_bounds && round.any() && !own_clip.empty() && (has_contents || !value.sublayers.empty())) save(own_clip, saved);
+        if (has_contents) image(value, m, box, own_clip, alpha);
+        if (!value.sublayers.empty() && !own_clip.empty()) sublayers(value, m, own_clip, alpha);
+        if (!saved.empty()) restore_outside(own_clip, saved, round);
+        if (self && value.border && value.border_width > 0 && (*value.border)[3] > 0) border(value, m, round, clip, alpha);
+    }
+
+    void sublayers(const Layer& value, const Affine& m, PixelRect own_clip, float alpha) {
         // The sublayers' space -> this layer's bounds space: the flip, then
         // sublayerTransform about the anchor point.
         const auto& b = value.bounds;
@@ -76,6 +142,127 @@ public:
         for (const auto& child : value.sublayers) order.push_back(&child);
         std::stable_sort(order.begin(), order.end(), [](const Layer* l, const Layer* r) { return l->z_position < r->z_position; });
         for (const auto* child : order) layer(*child, inner.after(local_to_parent(*child)), own_clip, alpha, true);
+    }
+
+    void save(PixelRect area, std::vector<std::uint8_t>& saved) {
+        const auto width = static_cast<std::size_t>(area.x1 - area.x0) * 4;
+        saved.resize(width * static_cast<std::size_t>(area.y1 - area.y0));
+        for (long y = area.y0; y < area.y1; ++y)
+            std::memcpy(saved.data() + static_cast<std::size_t>(y - area.y0) * width, at(area.x0, y), width);
+    }
+    // Pixels partly or wholly outside `shape` go back towards what was there
+    // before, by the part outside.
+    void restore_outside(PixelRect area, const std::vector<std::uint8_t>& saved, const Rounding& shape) {
+        const auto width = static_cast<std::size_t>(area.x1 - area.x0) * 4;
+        for (long y = area.y0; y < area.y1; ++y) {
+            const auto* before = saved.data() + static_cast<std::size_t>(y - area.y0) * width;
+            auto* row = at(area.x0, y);
+            for (long x = area.x0; x < area.x1; ++x, row += 4, before += 4) {
+                const double c = shape.coverage(x, y);
+                if (c >= 1) continue;
+                for (int i = 0; i < 4; ++i)
+                    row[i] = static_cast<std::uint8_t>(std::lround(before[i] * (1 - c) + row[i] * c));
+            }
+        }
+    }
+    // A colour over the pixels of `shape` by coverage.
+    void fill_shape(PixelRect area, const std::array<float, 4>& rgba, float alpha, const Rounding& shape, const Rounding* hole = nullptr) {
+        if (area.empty()) return;
+        for (long y = area.y0; y < area.y1; ++y) {
+            auto* row = at(area.x0, y);
+            for (long x = area.x0; x < area.x1; ++x, row += 4) {
+                double c = shape.coverage(x, y);
+                if (hole) c = std::max(0.0, c - hole->coverage(x, y));
+                if (c <= 0) continue;
+                const double a = std::clamp(static_cast<double>(rgba[3]) * alpha * c, 0.0, 1.0);
+                const std::uint8_t pixel[4] = {channel(rgba[2] * a), channel(rgba[1] * a), channel(rgba[0] * a), channel(a)};
+                blend(row, pixel, 255);
+            }
+        }
+    }
+    // The border lies inside the rounded bounds.
+    void border(const Layer& value, const Affine& m, const Rounding& round, PixelRect clip, float alpha) {
+        const double wx = value.border_width * std::abs(m.a), wy = value.border_width * std::abs(m.d);
+        const auto inner = round.inset(wx, wy);
+        fill_shape(pixels_of(round.box).intersect(clip), *value.border, alpha, round, &inner);
+    }
+
+    // The shadow: the shape's coverage offset and blurred (three box blurs
+    // approximating a Gaussian of half the radius), in the shadow colour.
+    void shadow(const Layer& value, const Affine& m, const Box& box, const Rounding& round, PixelRect clip, float alpha) {
+        const auto& s = *value.shadow;
+        const double strength = std::clamp(static_cast<double>(s.color[3]) * s.opacity * alpha, 0.0, 1.0);
+        if (strength <= 0) return;
+        const bool from_path = s.path && s.path->pixels && s.path->width && s.path->height;
+        const bool from_background = !from_path && value.background && (*value.background)[3] > 0;
+        const bool from_contents = !from_path && !from_background && value.contents && value.contents->bgra;
+        if (!from_path && !from_background && !from_contents) return;
+        const double dx = m.a * s.offset.width, dy = m.d * s.offset.height;
+        const double scale = std::max(std::abs(m.a), std::abs(m.d));
+        const long reach = std::max(0L, std::lround(s.radius * scale / 2));   // box half-width per pass
+        Box shape_box = from_path ? map_box(m, s.path->rect)
+                        : from_contents ? (value.contents_frame ? map_box(m, *value.contents_frame) : place(value, m, box)) : box;
+        const PixelRect area = PixelRect{static_cast<long>(std::floor(shape_box.x0 + dx)) - 3 * reach - 1,
+                                         static_cast<long>(std::floor(shape_box.y0 + dy)) - 3 * reach - 1,
+                                         static_cast<long>(std::ceil(shape_box.x1 + dx)) + 3 * reach + 1,
+                                         static_cast<long>(std::ceil(shape_box.y1 + dy)) + 3 * reach + 1}.intersect(clip);
+        if (area.empty()) return;
+        // The blur reads beyond the visible area: work on the area grown by the blur's reach.
+        const PixelRect work{area.x0 - 3 * reach, area.y0 - 3 * reach, area.x1 + 3 * reach, area.y1 + 3 * reach};
+        const long w = work.x1 - work.x0, h = work.y1 - work.y0;
+        std::vector<float> mask(static_cast<std::size_t>(w * h));
+        const auto shape_at = [&](long x, long y) -> double {   // coverage of the unshifted shape at target pixel (x, y)
+            if (from_background) return round.coverage(x, y);
+            const double px = static_cast<double>(x) + 0.5, py = static_cast<double>(y) + 0.5;
+            if (from_path) {
+                const auto& mk = *s.path;
+                const double lx = (px - m.tx) / m.a, ly = (py - m.ty) / m.d;   // layer space
+                const double u = (lx - mk.rect.origin.x) / mk.rect.size.width;
+                const double v = (mk.rect.origin.y + mk.rect.size.height - ly) / mk.rect.size.height;   // first row at max y
+                if (u < 0 || v < 0 || u >= 1 || v >= 1) return 0;
+                const auto col = static_cast<std::size_t>(u * mk.width), line = static_cast<std::size_t>(v * mk.height);
+                return (*mk.pixels)[line * mk.width + col] / 255.0;
+            }
+            const auto& image = *value.contents;
+            const double u = (px - shape_box.x0) / (shape_box.x1 - shape_box.x0), v = (py - shape_box.y0) / (shape_box.y1 - shape_box.y0);
+            if (u < 0 || v < 0 || u >= 1 || v >= 1) return 0;
+            const auto col = std::min<std::size_t>(static_cast<std::size_t>(u * image.width), image.width - 1);
+            const auto line = std::min<std::size_t>(static_cast<std::size_t>(v * image.height), image.height - 1);
+            return image.bgra[line * image.stride + col * 4 + 3] / 255.0;
+        };
+        const long sx = std::lround(dx), sy = std::lround(dy);
+        for (long y = 0; y < h; ++y)
+            for (long x = 0; x < w; ++x) mask[static_cast<std::size_t>(y * w + x)] = static_cast<float>(shape_at(work.x0 + x - sx, work.y0 + y - sy));
+        if (reach > 0) blur(mask, w, h, reach);
+        for (long y = area.y0; y < area.y1; ++y) {
+            auto* row = at(area.x0, y);
+            for (long x = area.x0; x < area.x1; ++x, row += 4) {
+                const double a = strength * mask[static_cast<std::size_t>((y - work.y0) * w + (x - work.x0))];
+                if (a <= 0) continue;
+                const std::uint8_t pixel[4] = {channel(s.color[2] * a), channel(s.color[1] * a), channel(s.color[0] * a), channel(a)};
+                blend(row, pixel, 255);
+            }
+        }
+    }
+    static void blur(std::vector<float>& values, long w, long h, long reach) {
+        std::vector<float> line(static_cast<std::size_t>(std::max(w, h)));
+        const auto pass = [&](long count, long length, auto index) {
+            for (long n = 0; n < count; ++n) {
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    double sum = 0;
+                    for (long i = -reach; i <= reach; ++i) sum += i >= 0 && i < length ? values[index(n, i)] : 0;
+                    for (long i = 0; i < length; ++i) {
+                        line[static_cast<std::size_t>(i)] = static_cast<float>(sum / static_cast<double>(2 * reach + 1));
+                        const long out = i - reach, in = i + reach + 1;
+                        if (out >= 0) sum -= values[index(n, out)];
+                        if (in < length) sum += values[index(n, in)];
+                    }
+                    for (long i = 0; i < length; ++i) values[index(n, i)] = line[static_cast<std::size_t>(i)];
+                }
+            }
+        };
+        pass(h, w, [w](long row, long i) { return static_cast<std::size_t>(row * w + i); });
+        pass(w, h, [w](long column, long i) { return static_cast<std::size_t>(i * w + column); });
     }
 
     static Affine local_to_parent(const Layer& value) {
@@ -164,11 +351,11 @@ private:
         if (!(source.width > 0) || !(source.height > 0) || !std::isfinite(source.x) || !std::isfinite(source.y) ||
             !std::isfinite(source.width) || !std::isfinite(source.height))
             return;   // an empty (or invalid) contentsRect draws nothing
+        const auto destination = value.contents_frame ? map_box(m, *value.contents_frame) : place(value, m, box);
         if (!source.whole) {
-            sub_image(image, source, place(value, m, box), clip, alpha);
+            sub_image(image, source, destination, clip, alpha);
             return;
         }
-        const auto destination = place(value, m, box);
         const auto pixels = pixels_of(destination);
         const auto area = pixels.intersect(clip);
         if (area.empty()) return;

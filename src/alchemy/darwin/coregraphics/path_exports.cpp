@@ -1,9 +1,74 @@
 #include "alchemy/darwin/coregraphics/surface.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 // CGPath / CGMutablePath functions.
 namespace alchemy::gui::quartz2d {
+
+std::uint64_t trimmed_path(std::uint64_t path, double start, double end) {
+    const ProviderScope scope;
+    auto* q = provider();
+    if (!q) fail("Quartz provider is not installed");
+    const auto info = path ? q->objc.find_host_state<PathInfo>(path) : nullptr;
+    if (!info) fail("trimmed_path: the object is not a CGPath");
+    // Open polylines per subpath; a close adds the closing segment.
+    std::vector<std::vector<Point>> lines;
+    Point current{}, first{};
+    const auto line_to = [&](Point p) {
+        if (lines.empty()) lines.push_back({current});
+        lines.back().push_back(p);
+        current = p;
+    };
+    for (const auto& element : info->data.elements) {
+        switch (element.op) {
+        case PathOp::move: lines.push_back({element.points[0]}); current = first = element.points[0]; break;
+        case PathOp::line: line_to(element.points[0]); break;
+        case PathOp::quad: {
+            const auto a = current, c = element.points[0], b = element.points[1];
+            for (int i = 1; i <= 16; ++i) {
+                const double t = i / 16.0, u = 1 - t;
+                line_to({u * u * a.x + 2 * u * t * c.x + t * t * b.x, u * u * a.y + 2 * u * t * c.y + t * t * b.y});
+            }
+            break;
+        }
+        case PathOp::cubic: {
+            const auto a = current, c1 = element.points[0], c2 = element.points[1], b = element.points[2];
+            for (int i = 1; i <= 24; ++i) {
+                const double t = i / 24.0, u = 1 - t;
+                line_to({u * u * u * a.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * b.x,
+                         u * u * u * a.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * b.y});
+            }
+            break;
+        }
+        case PathOp::close: if (!lines.empty()) line_to(first); break;
+        }
+    }
+    double total = 0;
+    for (const auto& line : lines)
+        for (std::size_t i = 1; i < line.size(); ++i) total += std::hypot(line[i].x - line[i - 1].x, line[i].y - line[i - 1].y);
+    const double from = std::clamp(std::min(start, end), 0.0, 1.0) * total, to = std::clamp(std::max(start, end), 0.0, 1.0) * total;
+    PathData out;
+    double walked = 0;
+    for (const auto& line : lines) {
+        bool drawing = false;
+        for (std::size_t i = 1; i < line.size(); ++i) {
+            const auto a = line[i - 1], b = line[i];
+            const double length = std::hypot(b.x - a.x, b.y - a.y);
+            const double s0 = std::max(from, walked), s1 = std::min(to, walked + length);
+            if (length > 0 && s1 > s0) {
+                const auto at = [&](double s) { const double f = (s - walked) / length; return Point{a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f}; };
+                if (!drawing || s0 > walked) out.move_to(at(s0));
+                out.line_to(at(s1));
+                drawing = s1 >= walked + length;
+            } else {
+                drawing = false;
+            }
+            walked += length;
+        }
+    }
+    return q->make_path(std::move(out), false);
+}
 Address Quartz::make_path(PathData data, bool mutable_path) {
     auto info = std::make_shared<PathInfo>();
     info->data = std::move(data);

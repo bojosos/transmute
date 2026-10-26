@@ -53,6 +53,11 @@ namespace alchemy::gui::quartz2d {
 // (window base points); std::nullopt draws everything.
 void render_view_hierarchy(std::uint64_t view, std::uint64_t context, std::optional<Rect> dirty = std::nullopt);
 
+// +1 CGPath of the part of `path` from the fraction `start` to `end` of its
+// length (CAShapeLayer strokeStart / strokeEnd; curves measured flattened),
+// as open polylines in the path's order.
+[[nodiscard]] std::uint64_t trimmed_path(std::uint64_t path, double start, double end);
+
 // The CGContextRef of +[NSGraphicsContext currentContext] on this thread (0: none).
 [[nodiscard]] std::uint64_t current_cg_context();
 
