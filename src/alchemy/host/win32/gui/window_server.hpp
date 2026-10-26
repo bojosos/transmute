@@ -132,6 +132,8 @@ public:
     void miniaturize(WindowId window, bool miniaturized) override;
     void zoom(WindowId window) override;
     void set_full_screen(WindowId window, bool full_screen) override;
+    void begin_window_drag(WindowId window) override;
+    void set_capture_excluded(WindowId window, bool excluded) override;
     void set_accepts_mouse_moved(WindowId window, bool accepts) override;
     void set_accepts_file_drops(WindowId window, bool accepts) override;
     void invalidate(WindowId window, std::optional<Rect> content_rect) override;

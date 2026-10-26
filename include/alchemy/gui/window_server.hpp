@@ -323,6 +323,20 @@ public:
     virtual void miniaturize(WindowId window, bool miniaturized) = 0;
     virtual void zoom(WindowId window) = 0;
     virtual void set_full_screen(WindowId window, bool full_screen) = 0;
+    // -[NSWindow performWindowDragWithEvent:]: the user moves `window` with
+    // the mouse button that is down, as dragging its title bar does; returns
+    // when the button is released. Window servers without it fail explicitly.
+    virtual void begin_window_drag(WindowId window) {
+        static_cast<void>(window);
+        throw std::runtime_error("Alchemy window server: moving a window with the mouse is not supported");
+    }
+    // -[NSWindow setSharingType:]: NSWindowSharingNone (`shared` false) keeps
+    // the window's contents out of screen capture. Window servers without
+    // capture exclusion fail explicitly when asked for it.
+    virtual void set_capture_excluded(WindowId window, bool excluded) {
+        static_cast<void>(window);
+        if (excluded) throw std::runtime_error("Alchemy window server: excluding a window from screen capture is not supported");
+    }
     virtual void set_accepts_mouse_moved(WindowId window, bool accepts) = 0;
     virtual void set_accepts_file_drops(WindowId window, bool accepts) = 0;
     virtual void invalidate(WindowId window, std::optional<Rect> content_rect = std::nullopt) = 0;   // queue an expose

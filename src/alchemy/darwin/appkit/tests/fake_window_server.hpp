@@ -32,6 +32,8 @@ public:
         std::string title;
         Size minimum, maximum;
         bool visible{}, accepts_mouse_moved{}, accepts_drops{}, text_input{}, full_screen{}, zoomed{};
+        bool capture_excluded{};
+        int drags{};                          // begin_window_drag calls
     };
 
     std::map<WindowId, Window> windows;
@@ -215,6 +217,8 @@ public:
         notify(id, miniaturized ? Notification::miniaturized : Notification::deminiaturized);
     }
     void zoom(WindowId id) override { at(id).zoomed = !at(id).zoomed; }
+    void begin_window_drag(WindowId id) override { ++at(id).drags; }
+    void set_capture_excluded(WindowId id, bool excluded) override { at(id).capture_excluded = excluded; }
     void set_full_screen(WindowId id, bool full_screen) override {
         at(id).full_screen = full_screen;
         notify(id, full_screen ? Notification::entered_full_screen : Notification::exited_full_screen);

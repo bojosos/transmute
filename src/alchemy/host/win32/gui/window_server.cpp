@@ -1407,6 +1407,31 @@ void Win32WindowServer::miniaturize(WindowId window, bool miniaturized) {
     rethrow_pending();
 }
 
+// -[NSWindow performWindowDragWithEvent:]: Win32's modal move loop of a
+// title-bar drag (SC_MOVE with HTCAPTION), from the button that is down;
+// WM_ENTERSIZEMOVE keeps the guest's timers alive inside it (modal_tick).
+void Win32WindowServer::begin_window_drag(WindowId window) {
+    require_main_thread("begin_window_drag");
+    const auto target = record(window, "begin_window_drag");
+    trace("begin_window_drag %llu", static_cast<unsigned long long>(window));
+    if (target->full_screen) fail("begin_window_drag: the window is in full screen");
+    ReleaseCapture();
+    SendMessageW(target->hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
+}
+
+// -[NSWindow setSharingType:NSWindowSharingNone]: the window is left out of
+// screen capture (Windows 10 2004 and later).
+void Win32WindowServer::set_capture_excluded(WindowId window, bool excluded) {
+    require_main_thread("set_capture_excluded");
+    const auto target = record(window, "set_capture_excluded");
+#ifndef WDA_EXCLUDEFROMCAPTURE
+    constexpr DWORD exclude_from_capture = 0x00000011;
+#else
+    constexpr DWORD exclude_from_capture = WDA_EXCLUDEFROMCAPTURE;
+#endif
+    if (!SetWindowDisplayAffinity(target->hwnd, excluded ? exclude_from_capture : WDA_NONE)) fail_win32("SetWindowDisplayAffinity");
+}
+
 void Win32WindowServer::zoom(WindowId window) {
     require_main_thread("zoom");
     const ThreadDpiScope dpi_scope;   // physical pixels whatever the caller's DPI awareness
