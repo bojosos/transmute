@@ -1,0 +1,638 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy GPU breadth: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+td, th { padding: 2px 10px; text-align: left; vertical-align: top; }
+</style>
+</head>
+<body>
+<h1 id="h">Alchemy GPU breadth</h1>
+<p>The optional and less common parts of WebGPU and WebGL 2 that real pages use, one self-checking test each,
+written for Alchemy (no network). WebGPU's optional features and WebGL's extensions that the browser does not
+expose are <code>skip</code> rows, not failures. The verdict goes into <code>document.title</code>
+(<code>Alchemy GPU breadth: PASS</code> or <code>Alchemy GPU breadth: FAIL &lt;test&gt;</code>) and
+<code>body[data-verdict]</code>; <code>--dump-dom</code> waits for it (at most 150 s).</p>
+<pre id="info">pending</pre>
+<table>
+<thead><tr><th>test</th><th>result</th><th>detail</th></tr></thead>
+<tbody id="results"></tbody>
+</table>
+<p id="status">not run</p>
+<script>
+"use strict";
+var finished = false, holdUntil = Date.now() + 150000;
+(function hold() {
+  if (finished || Date.now() > holdUntil) return;
+  var img = new Image();
+  img.onerror = img.onload = function () { img.remove(); hold(); };
+  img.src = "missing-" + Math.random() + ".png";
+  document.body.appendChild(img);
+})();
+
+var rows = document.getElementById("results"), failures = [], skips = 0;
+function row(name, ok, detail) {
+  var tr = document.createElement("tr");
+  var verdict = ok === null ? "skip" : ok ? "pass" : "FAIL";
+  tr.innerHTML = "<td></td><td></td><td></td>";
+  tr.children[0].textContent = name; tr.children[1].textContent = verdict; tr.children[2].textContent = detail || "";
+  tr.dataset.result = verdict;
+  rows.appendChild(tr);
+  if (ok === false) failures.push(name);
+  if (ok === null) skips++;
+}
+function Skip(why) { this.why = why; }
+function within(promise, seconds, what) {
+  return Promise.race([promise, new Promise(function (_, reject) {
+    setTimeout(function () { reject(new Error(what + " did not settle within " + seconds + " s")); }, seconds * 1000);
+  })]);
+}
+function near(got, want, tol) {
+  for (var i = 0; i < want.length; i++) if (Math.abs(got[i] - want[i]) > tol) return false;
+  return true;
+}
+function show(v) { return Array.prototype.join.call(v, ","); }
+
+// ==== WebGPU ======================================================================================
+
+var gpu = { device: null, features: [] };
+var W = 16, H = 16;
+
+async function gpuStep(name, feature, body) {
+  if (!gpu.device) { row("webgpu: " + name, null, "no device"); return; }
+  if (feature && gpu.features.indexOf(feature) < 0) { row("webgpu: " + name, null, "feature " + feature + " not exposed"); return; }
+  var device = gpu.device;
+  device.pushErrorScope("validation");
+  device.pushErrorScope("internal");
+  var problems = [], skipped = null;
+  try { var r = await body(device); if (r) problems.push(r); }
+  catch (e) { if (e instanceof Skip) skipped = e.why; else problems.push("threw " + e.message); }
+  try {
+    var internal = await within(device.popErrorScope(), 20, "popErrorScope");
+    if (internal) problems.push("internal: " + internal.message);
+    var val = await within(device.popErrorScope(), 20, "popErrorScope");
+    if (val) problems.push("validation: " + val.message);
+  } catch (e) { problems.push(e.message); }
+  if (skipped !== null && !problems.length) { row("webgpu: " + name, null, skipped); return; }
+  row("webgpu: " + name, problems.length === 0, problems.join("; "));
+}
+function gpuTarget(device, format, extra) {
+  return device.createTexture({ size: [W, H], format: format || "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | (extra || 0) });
+}
+async function gpuRead(device, texture, bytesPerTexel, width, height, aspect) {
+  width = width || W; height = height || H;
+  var buf = device.createBuffer({ size: 256 * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture: texture, aspect: aspect || "all" }, { buffer: buf, bytesPerRow: 256, rowsPerImage: height }, [width, height, 1]);
+  device.queue.submit([enc.finish()]);
+  await within(buf.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var copy = buf.getMappedRange().slice(0);
+  buf.unmap(); buf.destroy();
+  return copy;
+}
+function rgbaAt(bytes, x, y) { var u = new Uint8Array(bytes), o = y * 256 + x * 4; return [u[o], u[o + 1], u[o + 2], u[o + 3]]; }
+function expectRgba(bytes, points) {
+  var problems = [];
+  points.forEach(function (p) { var got = rgbaAt(bytes, p[0], p[1]); if (!near(got, p[2], 3)) problems.push(p[3] + " (" + p[0] + "," + p[1] + ") = " + got + ", want " + p[2]); });
+  return problems.join("; ");
+}
+async function pipe(device, code, o) {
+  var m = device.createShaderModule({ code: code });
+  var d = { layout: "auto", vertex: { module: m, entryPoint: "vs", buffers: o.buffers || [] }, primitive: o.primitive || { topology: "triangle-list" } };
+  if (o.targets !== null) d.fragment = { module: m, entryPoint: "fs", targets: o.targets || [{ format: "rgba8unorm" }] };
+  if (o.depthStencil) d.depthStencil = o.depthStencil;
+  return within(device.createRenderPipelineAsync(d), 60, "createRenderPipelineAsync");
+}
+async function comp(device, code) {
+  var m = device.createShaderModule({ code: code });
+  return within(device.createComputePipelineAsync({ layout: "auto", compute: { module: m, entryPoint: "main" } }), 60, "createComputePipelineAsync");
+}
+function bind(device, pipeline, resources) {
+  return device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: resources.map(function (r, i) { return { binding: i, resource: r }; }) });
+}
+function colorPass(enc, view, clear) {
+  return enc.beginRenderPass({ colorAttachments: [{ view: view, clearValue: clear || [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }] });
+}
+var FS_TRI = `
+struct VOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i : u32) -> VOut {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var o : VOut; o.pos = vec4<f32>(p[i], 0.0, 1.0); o.uv = vec2<f32>(p[i].x * 0.5 + 0.5, 0.5 - p[i].y * 0.5); return o;
+}`;
+async function storageOut(device, pipeline, bytes, extra) {
+  var out = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  var read = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder(), c = enc.beginComputePass();
+  c.setPipeline(pipeline); c.setBindGroup(0, bind(device, pipeline, [{ buffer: out }].concat(extra || []))); c.dispatchWorkgroups(1); c.end();
+  enc.copyBufferToBuffer(out, 0, read, 0, bytes);
+  device.queue.submit([enc.finish()]);
+  await within(read.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var copy = read.getMappedRange().slice(0); read.unmap();
+  return copy;
+}
+
+var GPU_TESTS = [
+  // unclippedDepth: a triangle beyond the far plane is drawn, its depth clamped to 1.
+  ["depth clamp (unclippedDepth)", "depth-clip-control", async function (device) {
+    var p = await pipe(device, `
+      @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
+        var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+        return vec4<f32>(p[i], 1.5, 1.0);
+      }
+      @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }`,
+      { primitive: { topology: "triangle-list", unclippedDepth: true }, depthStencil: { format: "depth32float", depthWriteEnabled: true, depthCompare: "always" } });
+    var color = gpuTarget(device), depth = device.createTexture({ size: [W, H], format: "depth32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    var enc = device.createCommandEncoder();
+    var pass = enc.beginRenderPass({ colorAttachments: [{ view: color.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
+      depthStencilAttachment: { view: depth.createView(), depthClearValue: 0, depthLoadOp: "clear", depthStoreOp: "store" } });
+    pass.setPipeline(p); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    var problems = expectRgba(await gpuRead(device, color), [[8, 8, [0, 255, 0, 255], "drawn beyond the far plane"]]);
+    var d = new Float32Array(await gpuRead(device, depth, 4, W, H, "depth-only"));
+    if (d[8 * 64 + 8] !== 1) problems += (problems ? "; " : "") + "depth = " + d[8 * 64 + 8] + ", want 1 (clamped)";
+    return problems;
+  }],
+  // Timestamps written around a compute pass and resolved (values only compared with each other).
+  ["timestamp queries", "timestamp-query", async function (device) {
+    var set = device.createQuerySet({ type: "timestamp", count: 2 });
+    var resolved = device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    var read = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    var p = await comp(device, `@group(0) @binding(0) var<storage, read_write> d : array<u32>;
+      @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id : vec3<u32>) { d[id.x] = id.x * 3u; }`);
+    var data = device.createBuffer({ size: 64 * 64 * 4, usage: GPUBufferUsage.STORAGE });
+    var enc = device.createCommandEncoder();
+    var c = enc.beginComputePass({ timestampWrites: { querySet: set, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } });
+    c.setPipeline(p); c.setBindGroup(0, bind(device, p, [{ buffer: data }])); c.dispatchWorkgroups(64); c.end();
+    enc.resolveQuerySet(set, 0, 2, resolved, 0);
+    enc.copyBufferToBuffer(resolved, 0, read, 0, 16);
+    device.queue.submit([enc.finish()]);
+    await within(read.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+    var t = new BigUint64Array(read.getMappedRange().slice(0)); read.unmap();
+    return t[1] >= t[0] && t[1] > 0n ? "" : "timestamps " + t[0] + ", " + t[1];
+  }],
+  ["rg11b10ufloat render target", "rg11b10ufloat-renderable", async function (device) {
+    var p = await pipe(device, FS_TRI + `@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(2.5, 0.25, 0.75, 1.0); }`, { targets: [{ format: "rg11b10ufloat" }] });
+    var t = gpuTarget(device, "rg11b10ufloat");
+    var enc = device.createCommandEncoder(), pass = colorPass(enc, t.createView()); pass.setPipeline(p); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    var v = new Uint32Array(await gpuRead(device, t))[0];
+    // Unpack r (6e5m), g (6e5m), b (5e5m); the values are exact in these formats.
+    function uf(bits, mantissa) { var e = bits >> mantissa, m = bits & ((1 << mantissa) - 1); return e ? Math.pow(2, e - 15) * (1 + m / (1 << mantissa)) : Math.pow(2, -14) * m / (1 << mantissa); }
+    var got = [uf(v & 0x7ff, 6), uf((v >> 11) & 0x7ff, 6), uf(v >>> 22, 5)];
+    return near(got, [2.5, 0.25, 0.75], 1e-6) ? "" : "texel = " + got;
+  }],
+  ["float32 filtering", "float32-filterable", async function (device) {
+    var tex = device.createTexture({ size: [2, 1], format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    device.queue.writeTexture({ texture: tex }, new Float32Array([0, 1]), { bytesPerRow: 8 }, [2, 1]);
+    var p = await pipe(device, FS_TRI + `@group(0) @binding(0) var t : texture_2d<f32>; @group(0) @binding(1) var s : sampler;
+      @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(textureSampleLevel(t, s, vec2<f32>(0.5, 0.5), 0.0).r, 0.0, 0.0, 1.0); }`, {});
+    var out = gpuTarget(device), enc = device.createCommandEncoder(), pass = colorPass(enc, out.createView());
+    pass.setPipeline(p); pass.setBindGroup(0, bind(device, p, [tex.createView(), device.createSampler({ magFilter: "linear", minFilter: "linear" })])); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, out), [[8, 8, [128, 0, 0, 255], "halfway between 0 and 1"]]);
+  }],
+  ["f16 in shaders", "shader-f16", async function (device) {
+    var p = await comp(device, `enable f16;
+      @group(0) @binding(0) var<storage, read_write> o : array<f32, 8>;
+      @compute @workgroup_size(8) fn main(@builtin(local_invocation_index) i : u32) { let h = f16(i) * 0.5h + 0.25h; o[i] = f32(h * h); }`);
+    var o = new Float32Array(await storageOut(device, p, 32));
+    for (var i = 0; i < 8; i++) { var h = i * 0.5 + 0.25; if (Math.abs(o[i] - h * h) > 1e-2) return "o[" + i + "] = " + o[i] + ", want " + h * h; }
+    return "";
+  }],
+  ["dual-source blending", "dual-source-blending", async function (device) {
+    var p = await pipe(device, `enable dual_source_blending;` + FS_TRI + `
+      struct Out { @location(0) @blend_src(0) c : vec4<f32>, @location(0) @blend_src(1) f : vec4<f32> };
+      @fragment fn fs() -> Out { var o : Out; o.c = vec4<f32>(1.0, 0.0, 0.0, 1.0); o.f = vec4<f32>(0.0, 0.5, 1.0, 1.0); return o; }`,
+      { targets: [{ format: "rgba8unorm", blend: { color: { srcFactor: "one", dstFactor: "src1" }, alpha: { srcFactor: "one", dstFactor: "zero" } } }] });
+    var out = gpuTarget(device), enc = device.createCommandEncoder(), pass = colorPass(enc, out.createView(), [0.5, 1, 1, 1]);
+    pass.setPipeline(p); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    // c + dst * src1 = (1 + 0.5*0, 0 + 1*0.5, 0 + 1*1)
+    return expectRgba(await gpuRead(device, out), [[8, 8, [255, 128, 255, 255], "c + dst * src1"]]);
+  }],
+  ["clip distances", "clip-distances", async function (device) {
+    var p = await pipe(device, `enable clip_distances;
+      struct VOut { @builtin(position) pos : vec4<f32>, @builtin(clip_distances) clip : array<f32, 1> };
+      @vertex fn vs(@builtin(vertex_index) i : u32) -> VOut {
+        var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+        var o : VOut; o.pos = vec4<f32>(p[i], 0.0, 1.0); o.clip[0] = -p[i].x; return o;
+      }
+      @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 1.0, 0.0, 1.0); }`, {});
+    var out = gpuTarget(device), enc = device.createCommandEncoder(), pass = colorPass(enc, out.createView());
+    pass.setPipeline(p); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, out), [[3, 8, [255, 255, 0, 255], "x < 0 kept"], [12, 8, [0, 0, 0, 255], "x > 0 clipped"]]);
+  }],
+  ["depth32float-stencil8", "depth32float-stencil8", async function (device) {
+    var p = await pipe(device, FS_TRI + `@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }`,
+      { depthStencil: { format: "depth32float-stencil8", depthWriteEnabled: false, depthCompare: "always",
+        stencilFront: { compare: "equal", passOp: "keep" }, stencilBack: { compare: "equal", passOp: "keep" } } });
+    var ds = device.createTexture({ size: [W, H], format: "depth32float-stencil8", usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    var out = gpuTarget(device), enc = device.createCommandEncoder();
+    var pass = enc.beginRenderPass({ colorAttachments: [{ view: out.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
+      depthStencilAttachment: { view: ds.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store", stencilClearValue: 7, stencilLoadOp: "clear", stencilStoreOp: "store" } });
+    pass.setPipeline(p); pass.setStencilReference(7); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, out), [[8, 8, [255, 0, 255, 255], "stencil 7 == 7"]]);
+  }],
+  ["bgra8unorm storage texture", "bgra8unorm-storage", async function (device) {
+    var t = device.createTexture({ size: [W, H], format: "bgra8unorm", usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC });
+    var p = await comp(device, `@group(0) @binding(0) var o : texture_storage_2d<bgra8unorm, write>;
+      @compute @workgroup_size(4, 4) fn main(@builtin(global_invocation_id) id : vec3<u32>) { textureStore(o, vec2<i32>(id.xy), vec4<f32>(1.0, 0.5, 0.0, 1.0)); }`);
+    var enc = device.createCommandEncoder(), c = enc.beginComputePass();
+    c.setPipeline(p); c.setBindGroup(0, bind(device, p, [t.createView()])); c.dispatchWorkgroups(4, 4); c.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, t), [[5, 5, [0, 128, 255, 255], "stored (bgra bytes)"]]);
+  }],
+  ["drawIndirect firstInstance", "indirect-first-instance", async function (device) {
+    var args = device.createBuffer({ size: 16, usage: GPUBufferUsage.INDIRECT, mappedAtCreation: true });
+    new Uint32Array(args.getMappedRange()).set([3, 1, 0, 2]); args.unmap();
+    var p = await pipe(device, `struct VOut { @builtin(position) pos : vec4<f32>, @location(0) @interpolate(flat) inst : u32 };
+      @vertex fn vs(@builtin(vertex_index) i : u32, @builtin(instance_index) inst : u32) -> VOut {
+        var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+        var o : VOut; o.pos = vec4<f32>(p[i], 0.0, 1.0); o.inst = inst; return o;
+      }
+      @fragment fn fs(v : VOut) -> @location(0) vec4<f32> { return vec4<f32>(f32(v.inst) / 4.0, 0.0, 0.0, 1.0); }`, {});
+    var out = gpuTarget(device), enc = device.createCommandEncoder(), pass = colorPass(enc, out.createView());
+    pass.setPipeline(p); pass.drawIndirect(args, 0); pass.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, out), [[8, 8, [128, 0, 0, 255], "instance_index = firstInstance 2"]]);
+  }],
+  ["BC1 compressed texture", "texture-compression-bc", async function (device) {
+    var t = device.createTexture({ size: [4, 4], format: "bc1-rgba-unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    // One block: color0 = color1 = pure red (RGB565 0xF800), all indices 0.
+    device.queue.writeTexture({ texture: t }, new Uint8Array([0x00, 0xf8, 0x00, 0xf8, 0, 0, 0, 0]), { bytesPerRow: 8 }, [4, 4]);
+    var p = await pipe(device, FS_TRI + `@group(0) @binding(0) var t : texture_2d<f32>;
+      @fragment fn fs(v : VOut) -> @location(0) vec4<f32> { return textureLoad(t, vec2<i32>(1, 2), 0); }`, {});
+    var out = gpuTarget(device), enc = device.createCommandEncoder(), pass = colorPass(enc, out.createView());
+    pass.setPipeline(p); pass.setBindGroup(0, bind(device, p, [t.createView()])); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, out), [[8, 8, [255, 0, 0, 255], "decoded block"]]);
+  }],
+  ["subgroups", "subgroups", async function (device) {
+    var p = await comp(device, `enable subgroups;
+      @group(0) @binding(0) var<storage, read_write> o : array<u32, 64>;
+      @compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i : u32, @builtin(subgroup_size) n : u32) {
+        o[i] = select(0u, 1u, subgroupAdd(1u) == n) + select(0u, 2u, subgroupBroadcastFirst(i) == (i / n) * n);
+      }`);
+    var o = new Uint32Array(await storageOut(device, p, 256));
+    for (var i = 0; i < 64; i++) if (o[i] !== 3) return "o[" + i + "] = " + o[i] + " (1: subgroupAdd, 2: broadcastFirst)";
+    return "";
+  }],
+  // Core: a depth texture copied to a buffer.
+  ["copy depth32float to buffer", null, async function (device) {
+    var depth = device.createTexture({ size: [W, H], format: "depth32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    var enc = device.createCommandEncoder();
+    enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: depth.createView(), depthClearValue: 0.375, depthLoadOp: "clear", depthStoreOp: "store" } }).end();
+    device.queue.submit([enc.finish()]);
+    var d = new Float32Array(await gpuRead(device, depth, 4, W, H, "depth-only"));
+    return d[3 * 64 + 5] === 0.375 ? "" : "depth = " + d[3 * 64 + 5];
+  }],
+  // Core: an rgba8unorm texture viewed as rgba8unorm-srgb (viewFormats) and rendered through the sRGB view.
+  ["sRGB view of a linear texture", null, async function (device) {
+    var t = device.createTexture({ size: [W, H], format: "rgba8unorm", viewFormats: ["rgba8unorm-srgb"], usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    var p = await pipe(device, FS_TRI + `@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.2140, 0.5, 1.0, 1.0); }`, { targets: [{ format: "rgba8unorm-srgb" }] });
+    var enc = device.createCommandEncoder(), pass = colorPass(enc, t.createView({ format: "rgba8unorm-srgb" }));
+    pass.setPipeline(p); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, t), [[8, 8, [128, 188, 255, 255], "linear 0.214 / 0.5 stored as sRGB"]]);
+  }],
+  // Core: rendering into one slice of a 3D texture, then reading that slice.
+  ["render into a 3D texture slice", null, async function (device) {
+    var t = device.createTexture({ size: [W, H, 4], dimension: "3d", format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    var p = await pipe(device, FS_TRI + `@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }`, {});
+    var enc = device.createCommandEncoder();
+    var pass = enc.beginRenderPass({ colorAttachments: [{ view: t.createView(), depthSlice: 2, clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }] });
+    pass.setPipeline(p); pass.draw(3); pass.end();
+    var buf = device.createBuffer({ size: 256 * H, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyTextureToBuffer({ texture: t, origin: [0, 0, 2] }, { buffer: buf, bytesPerRow: 256, rowsPerImage: H }, [W, H, 1]);
+    device.queue.submit([enc.finish()]);
+    await within(buf.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+    var bytes = buf.getMappedRange().slice(0); buf.unmap();
+    return expectRgba(bytes, [[8, 8, [0, 0, 255, 255], "slice 2"]]);
+  }],
+  // Core: a read-only depth attachment sampled in the same pass.
+  ["read-only depth attachment, sampled", null, async function (device) {
+    var depth = device.createTexture({ size: [W, H], format: "depth32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    var enc = device.createCommandEncoder();
+    enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: depth.createView(), depthClearValue: 0.25, depthLoadOp: "clear", depthStoreOp: "store" } }).end();
+    var p = await pipe(device, FS_TRI + `@group(0) @binding(0) var d : texture_depth_2d;
+      @fragment fn fs(v : VOut) -> @location(0) vec4<f32> { return vec4<f32>(textureLoad(d, vec2<i32>(v.pos.xy), 0), 0.0, 0.0, 1.0); }`,
+      { depthStencil: { format: "depth32float", depthWriteEnabled: false, depthCompare: "less-equal" } });
+    var out = gpuTarget(device);
+    var pass = enc.beginRenderPass({ colorAttachments: [{ view: out.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
+      depthStencilAttachment: { view: depth.createView(), depthReadOnly: true } });
+    pass.setPipeline(p); pass.setBindGroup(0, bind(device, p, [depth.createView()])); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, out), [[8, 8, [64, 0, 0, 255], "sampled depth 0.25"]]);
+  }],
+  // Core: a strip with primitive restart (0xffff) draws two separate triangles.
+  ["triangle strip with primitive restart", null, async function (device) {
+    var p = await pipe(device, `@vertex fn vs(@location(0) p : vec2<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(p, 0.0, 1.0); }
+      @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }`,
+      { buffers: [{ arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }] }], primitive: { topology: "triangle-strip", stripIndexFormat: "uint16" } });
+    var vb = device.createBuffer({ size: 48, usage: GPUBufferUsage.VERTEX, mappedAtCreation: true });
+    // Left triangle (bottom left corner) and right triangle (top right corner).
+    new Float32Array(vb.getMappedRange()).set([-1, -1, -0.1, -1, -1, -0.1, 1, 1, 0.1, 1, 1, 0.1]); vb.unmap();
+    var ib = device.createBuffer({ size: 16, usage: GPUBufferUsage.INDEX, mappedAtCreation: true });
+    new Uint16Array(ib.getMappedRange()).set([0, 1, 2, 0xffff, 3, 4, 5, 0]); ib.unmap();
+    var out = gpuTarget(device), enc = device.createCommandEncoder(), pass = colorPass(enc, out.createView());
+    pass.setPipeline(p); pass.setVertexBuffer(0, vb); pass.setIndexBuffer(ib, "uint16"); pass.drawIndexed(7); pass.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, out), [[1, 14, [255, 255, 255, 255], "first triangle"], [14, 1, [255, 255, 255, 255], "second triangle"],
+      [8, 8, [0, 0, 0, 255], "no triangle across the restart"]]);
+  }],
+  // Core: lines and points.
+  ["line-list and point-list", null, async function (device) {
+    var code = `@vertex fn vs(@location(0) p : vec2<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(p, 0.0, 1.0); }
+      @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }`;
+    var layout = [{ arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }] }];
+    var lines = await pipe(device, code, { buffers: layout, primitive: { topology: "line-list" } });
+    var points = await pipe(device, code, { buffers: layout, primitive: { topology: "point-list" } });
+    var vb = device.createBuffer({ size: 24, usage: GPUBufferUsage.VERTEX, mappedAtCreation: true });
+    // A horizontal line through row 8 (y = -1/16) and a point at pixel (12, 3).
+    new Float32Array(vb.getMappedRange()).set([-1, -0.0625, 1, -0.0625, 0.5625, 0.5625]); vb.unmap();
+    var out = gpuTarget(device), enc = device.createCommandEncoder(), pass = colorPass(enc, out.createView());
+    pass.setVertexBuffer(0, vb);
+    pass.setPipeline(lines); pass.draw(2);
+    pass.setPipeline(points); pass.draw(1, 1, 2);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    return expectRgba(await gpuRead(device, out), [[4, 8, [0, 255, 0, 255], "line"], [12, 3, [0, 255, 0, 255], "point"], [4, 4, [0, 0, 0, 255], "background"]]);
+  }]
+];
+
+async function runWebGPU() {
+  if (!("gpu" in navigator)) { row("webgpu", null, "navigator.gpu absent"); return; }
+  var adapter = await within(navigator.gpu.requestAdapter(), 120, "requestAdapter");
+  if (!adapter) { row("webgpu: adapter", false, "requestAdapter() returned null"); return; }
+  var wanted = ["depth-clip-control", "timestamp-query", "rg11b10ufloat-renderable", "float32-filterable", "shader-f16", "dual-source-blending",
+    "clip-distances", "depth32float-stencil8", "bgra8unorm-storage", "indirect-first-instance", "texture-compression-bc", "subgroups"];
+  var have = wanted.filter(function (f) { return adapter.features.has(f); });
+  gpu.device = await within(adapter.requestDevice({ requiredFeatures: have }), 60, "requestDevice");
+  gpu.features = have;
+  var lost = null, uncaptured = [];
+  gpu.device.lost.then(function (i) { lost = i.reason + ": " + i.message; });
+  gpu.device.addEventListener("uncapturederror", function (e) { uncaptured.push(e.error.message); });
+  document.getElementById("info").textContent = "webgpu: " + (adapter.info.vendor + " " + adapter.info.architecture) + "; features " + have.join(" ");
+  for (var i = 0; i < GPU_TESTS.length; i++) await gpuStep(GPU_TESTS[i][0], GPU_TESTS[i][1], GPU_TESTS[i][2]);
+  if (lost) row("webgpu: device.lost", false, lost);
+  if (uncaptured.length) row("webgpu: uncapturederror", false, uncaptured.slice(0, 3).join("; "));
+}
+
+// ==== WebGL 2 =====================================================================================
+
+function glProgram(gl, vs, fs) {
+  function sh(type, src) {
+    var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error("compile: " + gl.getShaderInfoLog(s));
+    return s;
+  }
+  var p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("link: " + gl.getProgramInfoLog(p));
+  gl.useProgram(p);
+  return p;
+}
+var GL_FULL = "#version 300 es\nvoid main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0); gl_Position = vec4(p, 0.0, 1.0); }";
+function glPixel(gl, x, y) { var p = new Uint8Array(4); gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p); return [p[0], p[1], p[2], p[3]]; }
+function glExpect(gl, points) {
+  var problems = [];
+  points.forEach(function (q) { var got = glPixel(gl, q[0], q[1]); if (!near(got, q[2], 3)) problems.push(q[3] + " (" + q[0] + "," + q[1] + ") = " + got + ", want " + q[2]); });
+  var e = gl.getError(); if (e) problems.push("glError 0x" + e.toString(16));
+  return problems.join("; ");
+}
+function glFramebuffer(gl, format) {
+  var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.texStorage2D(gl.TEXTURE_2D, 1, format || gl.RGBA8, W, H);
+  var f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return t;
+}
+function frames(n) { return new Promise(function (resolve) { (function tick(k) { if (!k) resolve(); else setTimeout(function () { tick(k - 1); }, 16); })(n); }); }
+
+var GL_TESTS = [
+  // ANY_SAMPLES_PASSED around a drawn triangle and around a fully depth-rejected one; results polled.
+  ["occlusion queries", null, async function (gl) {
+    glFramebuffer(gl);
+    var rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, W, H);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+    glProgram(gl, GL_FULL, "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }");
+    gl.enable(gl.DEPTH_TEST); gl.clearDepth(1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    var seen = gl.createQuery(), hidden = gl.createQuery();
+    gl.beginQuery(gl.ANY_SAMPLES_PASSED, seen); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.endQuery(gl.ANY_SAMPLES_PASSED);
+    gl.depthFunc(gl.NEVER);
+    gl.beginQuery(gl.ANY_SAMPLES_PASSED_CONSERVATIVE, hidden); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.endQuery(gl.ANY_SAMPLES_PASSED_CONSERVATIVE);
+    gl.depthFunc(gl.LESS); gl.disable(gl.DEPTH_TEST);
+    gl.flush();
+    for (var k = 0; k < 300 && !gl.getQueryParameter(hidden, gl.QUERY_RESULT_AVAILABLE); k++) await frames(1);
+    if (!gl.getQueryParameter(hidden, gl.QUERY_RESULT_AVAILABLE)) return "results never became available";
+    var a = gl.getQueryParameter(seen, gl.QUERY_RESULT), b = gl.getQueryParameter(hidden, gl.QUERY_RESULT);
+    return (a ? "" : "the drawn triangle reported no samples; ") + (b ? "the rejected triangle reported samples" : "");
+  }],
+  ["depth clamp (EXT_depth_clamp)", "EXT_depth_clamp", async function (gl, ext) {
+    glFramebuffer(gl);
+    var rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, W, H);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+    glProgram(gl, "#version 300 es\nvoid main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0); gl_Position = vec4(p, 1.5, 1.0); }",
+      "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(0.0, 1.0, 0.0, 1.0); }");
+    gl.enable(ext.DEPTH_CLAMP_EXT); gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.ALWAYS);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disable(ext.DEPTH_CLAMP_EXT); gl.disable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+    return glExpect(gl, [[8, 8, [0, 255, 0, 255], "drawn beyond the far plane"]]);
+  }],
+  ["polygon mode lines (WEBGL_polygon_mode)", "WEBGL_polygon_mode", async function (gl, ext) {
+    glFramebuffer(gl);
+    glProgram(gl, "#version 300 es\nvoid main() { vec2 p[3] = vec2[3](vec2(-0.75, -0.6875), vec2(0.75, -0.6875), vec2(0.0, 0.75)); gl_Position = vec4(p[gl_VertexID], 0.0, 1.0); }",
+      "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }");
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    ext.polygonModeWEBGL(gl.FRONT_AND_BACK, ext.LINE_WEBGL);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    ext.polygonModeWEBGL(gl.FRONT_AND_BACK, ext.FILL_WEBGL);
+    var bottom = 0; for (var x = 3; x < 13; x++) if (glPixel(gl, x, 2)[0] > 128) bottom++;
+    var problems = glExpect(gl, [[8, 7, [0, 0, 0, 255], "the interior stays empty"]]);
+    return problems + (bottom < 6 ? (problems ? "; " : "") + "bottom edge has " + bottom + " lit pixels" : "");
+  }],
+  ["clip distances (WEBGL_clip_cull_distance)", "WEBGL_clip_cull_distance", async function (gl) {
+    glFramebuffer(gl);
+    glProgram(gl, "#version 300 es\n#extension GL_ANGLE_clip_cull_distance : require\nvoid main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);\n  gl_Position = vec4(p, 0.0, 1.0); gl_ClipDistance[0] = -p.x; }",
+      "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0, 1.0, 0.0, 1.0); }");
+    gl.enable(0x3000);   // GL_CLIP_DISTANCE0
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disable(0x3000);
+    return glExpect(gl, [[3, 8, [255, 255, 0, 255], "x < 0 kept"], [12, 8, [0, 0, 0, 255], "x > 0 clipped"]]);
+  }],
+  ["per-attachment blending (OES_draw_buffers_indexed)", "OES_draw_buffers_indexed", async function (gl, ext) {
+    var a = glFramebuffer(gl), b = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, b); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, W, H);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, b, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    glProgram(gl, GL_FULL, "#version 300 es\nprecision mediump float; layout(location=0) out vec4 o0; layout(location=1) out vec4 o1;\nvoid main() { o0 = vec4(0.0, 1.0, 0.0, 0.5); o1 = vec4(0.0, 1.0, 0.0, 0.5); }");
+    gl.clearColor(1, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    ext.enableiOES(gl.BLEND, 0); ext.blendFunciOES(0, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    ext.disableiOES(gl.BLEND, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    ext.disableiOES(gl.BLEND, 0);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0); var p0 = glExpect(gl, [[8, 8, [128, 128, 0, 191], "attachment 0 blended"]]);
+    gl.readBuffer(gl.COLOR_ATTACHMENT1); var p1 = glExpect(gl, [[8, 8, [0, 255, 0, 128], "attachment 1 not blended"]]);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]); gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    return [p0, p1].filter(Boolean).join("; ");
+  }],
+  ["provoking vertex first (WEBGL_provoking_vertex)", "WEBGL_provoking_vertex", async function (gl, ext) {
+    glFramebuffer(gl);
+    glProgram(gl, "#version 300 es\nflat out vec4 c; void main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);\n  c = gl_VertexID == 0 ? vec4(1.0, 0.0, 0.0, 1.0) : vec4(0.0, 0.0, 1.0, 1.0); gl_Position = vec4(p, 0.0, 1.0); }",
+      "#version 300 es\nprecision mediump float; flat in vec4 c; out vec4 o; void main() { o = c; }");
+    ext.provokingVertexWEBGL(ext.FIRST_VERTEX_CONVENTION_WEBGL);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    ext.provokingVertexWEBGL(ext.LAST_VERTEX_CONVENTION_WEBGL);
+    return glExpect(gl, [[8, 8, [255, 0, 0, 255], "the first vertex's flat color"]]);
+  }],
+  ["R11F_G11F_B10F and RGBA16F render targets", "EXT_color_buffer_float", async function (gl) {
+    var problems = [];
+    [[gl.R11F_G11F_B10F, "R11F_G11F_B10F"], [gl.RGBA16F, "RGBA16F"]].forEach(function (f) {
+      glFramebuffer(gl, f[0]);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { problems.push(f[1] + " incomplete"); return; }
+      glProgram(gl, GL_FULL, "#version 300 es\nprecision highp float; out vec4 o; void main() { o = vec4(2.5, 0.25, 0.75, 1.0); }");
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      var px = new Float32Array(4); gl.readPixels(8, 8, 1, 1, gl.RGBA, gl.FLOAT, px);
+      if (!near(px, [2.5, 0.25, 0.75], 1e-2)) problems.push(f[1] + " = " + show(px));
+    });
+    var e = gl.getError(); if (e) problems.push("glError 0x" + e.toString(16));
+    return problems.join("; ");
+  }],
+  ["sRGB framebuffer", null, async function (gl) {
+    glFramebuffer(gl, gl.SRGB8_ALPHA8);
+    glProgram(gl, GL_FULL, "#version 300 es\nprecision highp float; out vec4 o; void main() { o = vec4(0.2140, 0.5, 1.0, 1.0); }");
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    return glExpect(gl, [[8, 8, [128, 188, 255, 255], "linear values stored as sRGB"]]);
+  }],
+  ["RGBA32I target, clearBufferiv", null, async function (gl) {
+    glFramebuffer(gl, gl.RGBA32I);
+    gl.clearBufferiv(gl.COLOR, 0, new Int32Array([-7, 100000, 3, -1]));
+    var px = new Int32Array(4); gl.readPixels(5, 5, 1, 1, gl.RGBA_INTEGER, gl.INT, px);
+    var e = gl.getError();
+    return (show(px) === "-7,100000,3,-1" ? "" : "texel = " + show(px)) + (e ? " glError 0x" + e.toString(16) : "");
+  }],
+  ["readPixels into a pixel buffer object", null, async function (gl) {
+    glFramebuffer(gl);
+    gl.clearColor(0.25, 0.5, 0.75, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    var pbo = gl.createBuffer(); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo); gl.bufferData(gl.PIXEL_PACK_BUFFER, W * H * 4, gl.STREAM_READ);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    var sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); gl.flush();
+    for (var k = 0; k < 300 && gl.clientWaitSync(sync, 0, 0) === gl.TIMEOUT_EXPIRED; k++) await frames(1);
+    var out = new Uint8Array(W * H * 4); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, out);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    var e = gl.getError();
+    return (near(out.slice(4 * 37, 4 * 38), [64, 128, 191, 255], 2) ? "" : "pixel 37 = " + show(out.slice(4 * 37, 4 * 38))) + (e ? " glError 0x" + e.toString(16) : "");
+  }],
+  ["scaled blitFramebuffer, LINEAR", null, async function (gl) {
+    var src = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, src); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 2, 1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 2, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255, 255, 255, 255, 255]));
+    var read = gl.createFramebuffer(); gl.bindFramebuffer(gl.READ_FRAMEBUFFER, read); gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, src, 0);
+    var dst = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, dst); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, W, H);
+    var draw = gl.createFramebuffer(); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, draw); gl.framebufferTexture2D(gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, dst, 0);
+    gl.blitFramebuffer(0, 0, 2, 1, 0, 0, W, H, gl.COLOR_BUFFER_BIT, gl.LINEAR);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, draw);
+    var mid = glPixel(gl, 8, 8)[0], left = glPixel(gl, 0, 8)[0], right = glPixel(gl, 15, 8)[0];
+    var e = gl.getError();
+    return (left < 10 && right > 245 && mid > 60 && mid < 195 ? "" : "left " + left + " mid " + mid + " right " + right + " (want a ramp)") + (e ? " glError 0x" + e.toString(16) : "");
+  }],
+  ["sampler2DShadow with a sampler object", null, async function (gl) {
+    var depth = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, depth); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.DEPTH_COMPONENT32F, W, H);
+    var df = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, df); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
+    gl.clearDepth(0.5); gl.clear(gl.DEPTH_BUFFER_BIT); gl.clearDepth(1);
+    glFramebuffer(gl);
+    var s = gl.createSampler();
+    gl.samplerParameteri(s, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE); gl.samplerParameteri(s, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+    gl.samplerParameteri(s, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.samplerParameteri(s, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, depth); gl.bindSampler(0, s);
+    glProgram(gl, GL_FULL, "#version 300 es\nprecision highp float; uniform highp sampler2DShadow d; out vec4 o;\nvoid main() { float r = gl_FragCoord.x < 8.0 ? 0.4 : 0.6; float lit = texture(d, vec3(gl_FragCoord.xy / 16.0, r)); o = vec4(lit, lit, lit, 1.0); }");
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindSampler(0, null);
+    return glExpect(gl, [[3, 8, [255, 255, 255, 255], "0.4 <= 0.5: lit"], [12, 8, [0, 0, 0, 255], "0.6 > 0.5: shadowed"]]);
+  }],
+  ["render to a 2D array layer, sample it", null, async function (gl) {
+    var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D_ARRAY, t); gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, W, H, 3);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    var f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, t, 0, 2);
+    gl.clearColor(0, 0.5, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    glFramebuffer(gl);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, t);
+    glProgram(gl, GL_FULL, "#version 300 es\nprecision highp float; uniform highp sampler2DArray a; out vec4 o; void main() { o = texture(a, vec3(0.5, 0.5, 2.0)); }");
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    return glExpect(gl, [[8, 8, [0, 128, 255, 255], "layer 2's clear"]]);
+  }],
+  ["instanced draw, divisor 2, base instance", "WEBGL_draw_instanced_base_vertex_base_instance", async function (gl, ext) {
+    glFramebuffer(gl);
+    glProgram(gl, "#version 300 es\nlayout(location=0) in float shade; out float s;\nvoid main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0); s = shade; gl_Position = vec4(p, 0.0, 1.0); }",
+      "#version 300 es\nprecision mediump float; in float s; out vec4 o; void main() { o = vec4(s, 0.0, 0.0, 1.0); }");
+    var vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    var b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0.1, 0.2, 0.3, 0.5, 0.75]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(0, 2);
+    // Instances 0 and 1 from base instance 3 read element 3 + i / 2 = 3 (0.5) with divisor 2.
+    ext.drawArraysInstancedBaseInstanceWEBGL(gl.TRIANGLES, 0, 3, 2, 3);
+    gl.bindVertexArray(null);
+    return glExpect(gl, [[8, 8, [128, 0, 0, 255], "element 3 + i / 2 = 3"]]);
+  }],
+  ["BC1 compressed texture (WEBGL_compressed_texture_s3tc)", "WEBGL_compressed_texture_s3tc", async function (gl, ext) {
+    var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.compressedTexImage2D(gl.TEXTURE_2D, 0, ext.COMPRESSED_RGB_S3TC_DXT1_EXT, 4, 4, 0, new Uint8Array([0x00, 0xf8, 0x00, 0xf8, 0, 0, 0, 0]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    glFramebuffer(gl);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, t);
+    glProgram(gl, GL_FULL, "#version 300 es\nprecision highp float; uniform sampler2D t; out vec4 o; void main() { o = texture(t, vec2(0.5)); }");
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    return glExpect(gl, [[8, 8, [255, 0, 0, 255], "decoded block"]]);
+  }],
+  ["anisotropic filtering (EXT_texture_filter_anisotropic)", "EXT_texture_filter_anisotropic", async function (gl, ext) {
+    var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(16).fill(200));
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameterf(gl.TEXTURE_2D, ext.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(16, gl.getParameter(ext.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+    glFramebuffer(gl);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, t);
+    glProgram(gl, GL_FULL, "#version 300 es\nprecision highp float; uniform sampler2D t; out vec4 o; void main() { o = texture(t, gl_FragCoord.xy * vec2(0.5, 0.01)); }");
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    return glExpect(gl, [[8, 8, [200, 200, 200, 200], "uniform texture through an anisotropic sampler"]]);
+  }]
+];
+
+async function runWebGL() {
+  var canvas = document.createElement("canvas"); canvas.width = W; canvas.height = H;
+  var gl = canvas.getContext("webgl2", { antialias: false, preserveDrawingBuffer: true });
+  if (!gl) { row("webgl2", false, "no context"); return; }
+  var info = gl.getExtension("WEBGL_debug_renderer_info");
+  document.getElementById("info").textContent += "\nwebgl2: " + (info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+  for (var i = 0; i < GL_TESTS.length; i++) {
+    var name = "webgl2: " + GL_TESTS[i][0], ext = null;
+    if (GL_TESTS[i][1]) {
+      ext = gl.getExtension(GL_TESTS[i][1]);
+      if (!ext) { row(name, null, GL_TESTS[i][1] + " not exposed"); continue; }
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, W, H); gl.useProgram(null);
+    gl.clearColor(0, 0, 0, 1);
+    try { var r = await GL_TESTS[i][2](gl, ext); row(name, !r, r); }
+    catch (e) { row(name, false, "threw " + e.message); }
+    while (gl.getError()) {}
+    if (gl.isContextLost()) { row("webgl2: context", false, "lost after " + GL_TESTS[i][0]); return; }
+  }
+}
+
+(async function main() {
+  document.getElementById("info").textContent = "";
+  try { await runWebGPU(); } catch (e) { row("webgpu: main", false, "threw " + e.message); }
+  try { await runWebGL(); } catch (e) { row("webgl2: main", false, "threw " + e.message); }
+})().finally(function () {
+  var verdict = failures.length ? "FAIL " + failures[0] : "PASS";
+  document.getElementById("status").textContent = verdict + (failures.length > 1 ? " (+" + (failures.length - 1) + " more: " + failures.slice(1).join(", ") + ")" : "") +
+    "; " + skips + " skipped";
+  document.getElementById("h").setAttribute("data-js", "ran");
+  document.body.dataset.verdict = verdict;
+  document.title = "Alchemy GPU breadth: " + verdict;
+  finished = true;
+});
+</script>
+</body>
+</html>

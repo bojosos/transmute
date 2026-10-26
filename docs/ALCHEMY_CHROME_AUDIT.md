@@ -870,6 +870,20 @@ hardware GPU (below).
       buffer, which used to be an explicit stop. Results are now copied into the buffer on the GPU at the end of
       the pass, so a resolve blit later in the same command buffer reads them; that is also a fix for shared
       buffers, which completion used to fill.
+    * **Breadth** (`scripts/chrome/pages/gpu_breadth.html`): 34 tests of the less common parts real pages use.
+      * WebGPU exposes all 12 optional features this machine supports: depth-clip-control, timestamp-query,
+        rg11b10ufloat-renderable, float32-filterable, shader-f16, dual-source-blending, clip-distances,
+        depth32float-stencil8, bgra8unorm-storage, indirect-first-instance, texture-compression-bc and subgroups.
+        The page uses each once, plus depth copies, sRGB views, 3D slices, read-only depth, primitive restart,
+        lines and points.
+      * WebGL 2 gets occlusion queries and the depth clamp, polygon mode, clip distance, indexed draw buffers,
+        provoking vertex, float color buffer, S3TC and anisotropy extensions. It also gets sRGB and integer
+        targets, PBO reads, scaled blits, shadow samplers and array layers.
+      * 33 pass and 1 is skipped: ANGLE doesn't expose `WEBGL_draw_instanced_base_vertex_base_instance` on Metal,
+        and desktop Chrome skips it too. The page passes headless and windowed.
+      * Depth clamp (`setDepthClipMode:`, used by WebGPU's `unclippedDepth` and `EXT_depth_clamp`) and line fill
+        (`setTriangleFillMode:`, used by `WEBGL_polygon_mode`) used to be explicit stops. They are now pipeline
+        variants, for MSL pipelines and translated ones alike.
   * **ANGLE's Vulkan back end on the host's Vulkan** isn't allowed. Chrome 155 on macOS accepts only ANGLE on Metal,
     or on SwiftShader with `--enable-unsafe-swiftshader`. Its message is `gl_factory.cc:110 ... not found in allowed
     implementations: [(gl=egl-angle,angle=metal)]`.

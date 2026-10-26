@@ -1,5 +1,6 @@
 // Vulkan objects for translated pipelines (foreign_pipeline.hpp).
 #include "alchemy/darwin/metal/foreign_pipeline.hpp"
+#include "alchemy/darwin/metal/pipeline.hpp"
 
 #include "alchemy/perf.hpp"
 
@@ -273,21 +274,22 @@ VkPipeline ForeignPipeline::create_compute(const json::Value& region) {
     return result;
 }
 
-VkPipeline ForeignPipeline::render(const json::Value& specialization, VkPrimitiveTopology topology) {
+VkPipeline ForeignPipeline::render(const json::Value& specialization, VkPrimitiveTopology topology, std::uint32_t raster) {
     if (pipeline->compute()) throw std::runtime_error("translated pipeline is not a render pipeline");
-    // One VkPipeline per topology class: the topology itself is dynamic state.
+    // One VkPipeline per topology class and raster variant: the topology itself is dynamic state.
     const int topology_class = topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0
                                : topology <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ? 1
                                                                               : 2;
-    std::string key = specialization.dump() + '|' + std::to_string(topology_class);
+    if (topology_class != 2) raster &= ~raster_variant::fill_lines;
+    std::string key = specialization.dump() + '|' + std::to_string(topology_class) + '|' + std::to_string(raster);
     std::lock_guard lock(mutex_);
     if (const auto found = pipelines_.find(key); found != pipelines_.end()) return found->second;
-    auto created = create_render(specialization, topology);
+    auto created = create_render(specialization, topology, raster);
     pipelines_.emplace(std::move(key), created);
     return created;
 }
 
-VkPipeline ForeignPipeline::create_render(const json::Value& specialization_key, VkPrimitiveTopology topology) {
+VkPipeline ForeignPipeline::create_render(const json::Value& specialization_key, VkPrimitiveTopology topology, std::uint32_t raster_bits) {
     auto& d = *device;
     const auto& info = pipeline->info();
     const auto& g = info["graphics"];
@@ -344,7 +346,8 @@ VkPipeline ForeignPipeline::create_render(const json::Value& specialization_key,
     viewport.scissorCount = dynamic(VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT) ? 0 : 1;
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     raster.rasterizerDiscardEnable = g["rasterizer_discard"].as_bool().value_or(false);
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.polygonMode = raster_bits & raster_variant::fill_lines ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+    raster.depthClampEnable = (raster_bits & raster_variant::depth_clamp) != 0;
     raster.cullMode = VK_CULL_MODE_NONE;
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     // Metal's depth bias applies to every pipeline: enabled, its values dynamic.

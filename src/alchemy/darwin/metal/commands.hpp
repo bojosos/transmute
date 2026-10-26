@@ -169,6 +169,8 @@ public:
     void set_scissors(std::span<const Scissor> scissors);
     void set_cull_mode(std::uint32_t mode);           // MTLCullMode
     void set_front_facing(std::uint32_t winding);     // MTLWinding
+    void set_depth_clip_mode(std::uint32_t mode);     // MTLDepthClipMode (a pipeline variant)
+    void set_triangle_fill_mode(std::uint32_t mode);  // MTLTriangleFillMode (a pipeline variant)
     void set_depth_bias(float bias, float slope, float clamp);
     void set_stencil_reference(std::uint32_t front, std::uint32_t back);
     void set_blend_color(float red, float green, float blue, float alpha);
@@ -340,6 +342,7 @@ private:
     std::vector<VkViewport> viewports_;   // as last set (a translated pipeline sets the first without a count)
     bool depth_bias_enabled_{};
     bool native_state_lost_{};            // a translated pipeline was bound since the native state was set
+    std::uint32_t raster_variant_{};      // raster_variant bits of the encoder's depth clip and fill modes
     void emit_scissors();
     VkRenderingAttachmentInfo depth_info_{}, stencil_info_{};
     VkExtent2D extent_{};

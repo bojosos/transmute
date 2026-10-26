@@ -398,7 +398,7 @@ void CommandBuffer::foreign_draw(std::uint32_t primitive, const json::Value& dra
     perf::add(perf::mtl_draws);
     auto& pipeline = *planned.pipeline;
     const auto topology = primitive_topology(primitive);
-    const auto vk_pipeline = pipeline.render(commands["specialization"], topology);
+    const auto vk_pipeline = pipeline.render(commands["specialization"], topology, raster_variant_);
     const auto command = current_;
     device->vk.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline);
     bound_pipeline_ = vk_pipeline;

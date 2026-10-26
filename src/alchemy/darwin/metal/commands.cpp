@@ -757,6 +757,7 @@ void CommandBuffer::begin_render(const RenderPass& pass) {
     write_samples(pass.samples.start, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
     end_samples_ = pass.samples.end;
     pass_ = pass;
+    raster_variant_ = 0;
     for (const auto& color : pass.colors) { prepare_texture(color.texture); prepare_texture(color.resolve_texture); }
     prepare_texture(pass.depth.texture);
     prepare_texture(pass.depth.resolve_texture);
@@ -1159,6 +1160,22 @@ void CommandBuffer::set_cull_mode(std::uint32_t mode) {
     perf::add(perf::mtl_vk_state);
 }
 
+void CommandBuffer::set_depth_clip_mode(std::uint32_t mode) {
+    require(EncoderKind::render, "setDepthClipMode:");
+    if (mode > 1) throw std::runtime_error("invalid MTLDepthClipMode " + std::to_string(mode));
+    if (mode && !device->features10.depthClamp)
+        throw std::runtime_error("MTLDepthClipModeClamp needs Vulkan's depthClamp, which " + device->profile().name + " lacks");
+    raster_variant_ = mode ? raster_variant_ | raster_variant::depth_clamp : raster_variant_ & ~raster_variant::depth_clamp;
+}
+
+void CommandBuffer::set_triangle_fill_mode(std::uint32_t mode) {
+    require(EncoderKind::render, "setTriangleFillMode:");
+    if (mode > 1) throw std::runtime_error("invalid MTLTriangleFillMode " + std::to_string(mode));
+    if (mode && !device->features10.fillModeNonSolid)
+        throw std::runtime_error("MTLTriangleFillModeLines needs Vulkan's fillModeNonSolid, which " + device->profile().name + " lacks");
+    raster_variant_ = mode ? raster_variant_ | raster_variant::fill_lines : raster_variant_ & ~raster_variant::fill_lines;
+}
+
 void CommandBuffer::set_front_facing(std::uint32_t winding) {
     require(EncoderKind::render, "setFrontFacingWinding:");
     // Both APIs define winding in window coordinates as seen on screen; the
@@ -1237,7 +1254,7 @@ void CommandBuffer::flush_render(std::uint32_t primitive) {
     if (!render_pipeline_) throw std::runtime_error("Metal draw without a render pipeline state");
     if (native_state_lost_) restore_native_state();
     const auto command = current_;
-    const auto pipeline = render_pipeline_->pipeline(primitive);
+    const auto pipeline = render_pipeline_->pipeline(primitive, raster_variant_);
     if (trace_passes()) {
         const DepthStencilState defaults{};
         const auto& ds = depth_stencil_ ? *depth_stencil_ : defaults;

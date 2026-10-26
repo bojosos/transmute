@@ -59,12 +59,13 @@ public:
     [[nodiscard]] VkPipeline compute(const json::Value& region);
     // The render VkPipeline for a draw's specialization (DrawCommands'
     // "specialization", null for the stages' defaults) and topology.
-    [[nodiscard]] VkPipeline render(const json::Value& specialization, VkPrimitiveTopology topology);
+    // `raster`: raster_variant bits (pipeline.hpp) of the encoder's depth clip and fill modes.
+    [[nodiscard]] VkPipeline render(const json::Value& specialization, VkPrimitiveTopology topology, std::uint32_t raster = 0);
 
 private:
     void release();
     VkPipeline create_compute(const json::Value& region);
-    VkPipeline create_render(const json::Value& specialization, VkPrimitiveTopology topology);
+    VkPipeline create_render(const json::Value& specialization, VkPrimitiveTopology topology, std::uint32_t raster);
 
     std::vector<VkDescriptorSetLayout> set_layouts_;
     std::vector<VkSampler> immutable_samplers_;

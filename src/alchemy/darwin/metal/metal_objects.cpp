@@ -662,11 +662,11 @@ void install_render_encoder() {
         e.commands->set_front_facing(static_cast<std::uint32_t>(s.x[2]));
     }, "v@:Q");
     method("setCullMode:", [](EncoderState& e, CpuState& s, GuestMemory&) { e.commands->set_cull_mode(static_cast<std::uint32_t>(s.x[2])); }, "v@:Q");
-    method("setTriangleFillMode:", [](EncoderState&, CpuState& s, GuestMemory&) {
-        if (s.x[2] != 0) throw std::runtime_error("Alchemy Metal: MTLTriangleFillModeLines is not translated");
+    method("setTriangleFillMode:", [](EncoderState& e, CpuState& s, GuestMemory&) {
+        e.commands->set_triangle_fill_mode(static_cast<std::uint32_t>(s.x[2]));
     }, "v@:Q");
-    method("setDepthClipMode:", [](EncoderState&, CpuState& s, GuestMemory&) {
-        if (s.x[2] != 0) throw std::runtime_error("Alchemy Metal: MTLDepthClipModeClamp is not translated");
+    method("setDepthClipMode:", [](EncoderState& e, CpuState& s, GuestMemory&) {
+        e.commands->set_depth_clip_mode(static_cast<std::uint32_t>(s.x[2]));
     }, "v@:Q");
     method("setDepthBias:slopeScale:clamp:", [](EncoderState& e, CpuState& s, GuestMemory&) {
         e.commands->set_depth_bias(single(s, 0), single(s, 1), single(s, 2));

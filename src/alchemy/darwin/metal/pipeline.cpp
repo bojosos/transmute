@@ -384,8 +384,8 @@ std::shared_ptr<RenderPipeline> RenderPipeline::create(std::shared_ptr<Device> d
         if (used) result->vertex_bindings.push_back(index);
     }
     // Pipelines with a declared topology class compile now, like Metal.
-    if (descriptor.topology_class) static_cast<void>(result->build(descriptor.topology_class));
-    else static_cast<void>(result->build(3));
+    if (descriptor.topology_class) static_cast<void>(result->build(descriptor.topology_class, 0));
+    else static_cast<void>(result->build(3, 0));
     return result;
 }
 
@@ -403,22 +403,23 @@ RenderPipeline::~RenderPipeline() {
     });
 }
 
-VkPipeline RenderPipeline::pipeline(std::uint32_t primitive_type) {
+VkPipeline RenderPipeline::pipeline(std::uint32_t primitive_type, std::uint32_t raster) {
     const auto wanted = descriptor.topology_class ? descriptor.topology_class : topology_class(primitive_type);
     if (descriptor.topology_class && descriptor.topology_class != topology_class(primitive_type))
         throw std::runtime_error("draw primitive type does not match the pipeline's inputPrimitiveTopology");
+    if (wanted != 3) raster &= ~raster_variant::fill_lines;
     std::lock_guard lock(mutex_);
-    if (pipelines_[wanted]) return pipelines_[wanted];
-    return build_locked(wanted);
+    if (const auto found = pipelines_[wanted + 4 * raster]) return found;
+    return build_locked(wanted, raster);
 }
 
-VkPipeline RenderPipeline::build(std::uint32_t wanted) {
+VkPipeline RenderPipeline::build(std::uint32_t wanted, std::uint32_t raster) {
     std::lock_guard lock(mutex_);
-    if (pipelines_[wanted]) return pipelines_[wanted];
-    return build_locked(wanted);
+    if (const auto found = pipelines_[wanted + 4 * raster]) return found;
+    return build_locked(wanted, raster);
 }
 
-VkPipeline RenderPipeline::build_locked(std::uint32_t wanted) {
+VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t raster) {
     auto& d = *device;
     Specialization vertex_constants, fragment_constants;
     for (const auto& [id, bytes] : descriptor.vertex->constants) vertex_constants.add(id, bytes.data(), bytes.size());
@@ -497,10 +498,11 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted) {
     assembly.topology = wanted == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
                       : wanted == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.rasterizerDiscardEnable = descriptor.rasterization ? VK_FALSE : VK_TRUE;
-    raster.lineWidth = 1.0F;
+    VkPipelineRasterizationStateCreateInfo rasterization{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rasterization.polygonMode = raster & raster_variant::fill_lines ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+    rasterization.depthClampEnable = (raster & raster_variant::depth_clamp) != 0;
+    rasterization.rasterizerDiscardEnable = descriptor.rasterization ? VK_FALSE : VK_TRUE;
+    rasterization.lineWidth = 1.0F;
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = static_cast<VkSampleCountFlagBits>(std::max(1U, descriptor.sample_count));
     multisample.alphaToCoverageEnable = descriptor.alpha_to_coverage;
@@ -566,7 +568,7 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted) {
     info.pVertexInputState = &vertex_input;
     info.pInputAssemblyState = &assembly;
     info.pViewportState = &viewport;
-    info.pRasterizationState = &raster;
+    info.pRasterizationState = &rasterization;
     info.pMultisampleState = &multisample;
     info.pDepthStencilState = &depth;
     info.pColorBlendState = &blend_state;
@@ -579,7 +581,7 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted) {
     }
     perf::phase("first VkPipeline created");
     d.set_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(result), descriptor.label);
-    pipelines_[wanted] = result;
+    pipelines_[wanted + 4 * raster] = result;
     note_pipeline_created(d);
     return result;
 }

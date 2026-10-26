@@ -874,12 +874,55 @@ std::shared_ptr<metal::Buffer> draw_top_half(const std::shared_ptr<metal::Device
     return readback;
 }
 
+std::shared_ptr<metal::Texture> render_target(const std::shared_ptr<metal::Device>& device);
+std::string format_pixel(const std::array<std::uint8_t, 4>& p);
+
+// setTriangleFillMode:Lines and setDepthClipMode:Clamp (pipeline variants):
+// the top-half triangle drawn as lines leaves its interior clear and lights
+// its edges; drawn with depth clamp (z = 0, inside the range) it fills as usual.
+void test_raster_variants(const std::shared_ptr<metal::Device>& device) {
+    metal::RenderPipelineDescriptor descriptor;
+    descriptor.vertex = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(vertex_function()));
+    descriptor.fragment = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(fragment_function(false)));
+    descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+    descriptor.attributes[0] = metal::VertexAttribute{29, 0, 0};
+    descriptor.layouts[0] = metal::VertexLayout{8, 1, 1};
+    descriptor.label = "raster variants";
+    auto pipeline = metal::RenderPipeline::create(device, descriptor);
+    metal::TextureDescriptor target_descriptor;
+    target_descriptor.pixel_format = metal::pixel_format::rgba8_unorm;
+    target_descriptor.width = target_descriptor.height = 64;
+    target_descriptor.usage = metal::texture_usage::render_target;
+    target_descriptor.options = {metal::StorageMode::private_};
+    const float tint[] = {1, 1, 1, 1};
+    const auto run = [&](std::uint32_t fill, std::uint32_t clip) {
+        metal::RenderPass pass;
+        pass.colors[0].texture = metal::Texture::create(device, target_descriptor);
+        pass.colors[0].load_action = 2;
+        pass.colors[0].store_action = 1;
+        pass.colors[0].clear_color = {0, 0, 1, 1};
+        return draw_top_half(device, pass, {pipeline}, [&](metal::CommandBuffer& commands, std::size_t) {
+            commands.set_triangle_fill_mode(fill);
+            commands.set_depth_clip_mode(clip);
+            commands.set_bytes(metal::Stage::fragment, 0, {reinterpret_cast<const std::uint8_t*>(tint), sizeof(tint)});
+        });
+    };
+    const std::array<std::uint8_t, 4> red{255, 0, 0, 255}, blue{0, 0, 255, 255};
+    const auto lines = run(1, 0);
+    std::uint32_t lit{};
+    for (std::uint32_t x = 0; x < 64; ++x) lit += pixel(lines->contents(), 256, x, 16) == red;
+    expect(pixel(lines->contents(), 256, 32, 8) == blue, "line fill leaves the triangle's interior clear: " +
+           format_pixel(pixel(lines->contents(), 256, 32, 8)));
+    expect(lit >= 2 && lit <= 6, "line fill lights the two side edges on row 16 (" + std::to_string(lit) + " pixels)");
+    const auto clamped = run(0, 1);
+    expect(pixel(clamped->contents(), 256, 32, 8) == red, "the depth-clamp variant fills the triangle: " +
+           format_pixel(pixel(clamped->contents(), 256, 32, 8)));
+}
+
 // setSamplerState:lodMinClamp:lodMaxClamp:atIndex: (ANGLE's per-texture
 // base/max level): the binding's sampler gets the given LOD range. A
 // two-level texture magnified over the triangle samples level 0 unless the
 // clamp's minimum forces level 1.
-std::shared_ptr<metal::Texture> render_target(const std::shared_ptr<metal::Device>& device);
-std::string format_pixel(const std::array<std::uint8_t, 4>& p);
 void test_sampler_lod_clamp(const std::shared_ptr<metal::Device>& device) {
     metal::SamplerDescriptor mipmapped;   // nearest, mip filter nearest
     mipmapped.mip_filter = 1;
@@ -1090,6 +1133,7 @@ int main() {
         test_render(device, false);
         test_render(device, true);
         test_render(device, true, true);
+        test_raster_variants(device);
         test_visibility_results(device, metal::StorageMode::private_);
         test_visibility_results(device, metal::StorageMode::shared);
         test_sampler_lod_clamp(device);

@@ -110,6 +110,14 @@ struct RenderPipelineDescriptor {
 [[nodiscard]] VkPrimitiveTopology primitive_topology(std::uint32_t primitive_type);
 [[nodiscard]] std::uint32_t topology_class(std::uint32_t primitive_type);
 
+// Render-encoder state that Vulkan bakes into the pipeline: each combination
+// is a pipeline variant. Line fill applies to triangles only.
+namespace raster_variant {
+inline constexpr std::uint32_t depth_clamp = 1;   // MTLDepthClipModeClamp
+inline constexpr std::uint32_t fill_lines = 2;    // MTLTriangleFillModeLines
+inline constexpr std::uint32_t count = 4;
+}
+
 // Descriptor set layout of one stage built from its reflection, with the
 // immutable samplers of its constexpr samplers.
 struct StageLayout {
@@ -140,8 +148,9 @@ public:
     RenderPipelineDescriptor descriptor;
     std::array<StageLayout, 2> stages{};          // vertex (set 0), fragment (set 1)
     VkPipelineLayout layout{};
-    // The VkPipeline for an MTLPrimitiveType (created on first use).
-    [[nodiscard]] VkPipeline pipeline(std::uint32_t primitive_type);
+    // The VkPipeline for an MTLPrimitiveType and raster_variant bits (created
+    // on first use).
+    [[nodiscard]] VkPipeline pipeline(std::uint32_t primitive_type, std::uint32_t raster = 0);
     // Vertex buffer indices the vertex input state reads (binding = index).
     std::vector<std::uint32_t> vertex_bindings;
     // Reflection of the linked stages (varying locations agree).
@@ -151,10 +160,10 @@ public:
     }
 private:
     explicit RenderPipeline(std::shared_ptr<Device> owner) : device(std::move(owner)) {}
-    VkPipeline build(std::uint32_t topology_class);
-    VkPipeline build_locked(std::uint32_t topology_class);
+    VkPipeline build(std::uint32_t topology_class, std::uint32_t raster);
+    VkPipeline build_locked(std::uint32_t topology_class, std::uint32_t raster);
     std::mutex mutex_;
-    std::array<VkPipeline, 4> pipelines_{};      // by topology class
+    std::array<VkPipeline, 4 * raster_variant::count> pipelines_{};   // by topology class + 4 * raster
     msl::Function linked_vertex_, linked_fragment_;
     VkShaderModule vertex_module_{}, fragment_module_{};
 };
