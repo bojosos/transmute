@@ -4,6 +4,7 @@
 // clang constant-literal classes). Objects are CoreFoundation objects or
 // native Objective-C instances with host payloads; nothing forwards to Apple code.
 #include "alchemy/foundation_bridge.hpp"
+#include "alchemy/darwin/corefoundation/cf_plist.hpp"
 #include "alchemy/darwin/foundation/headless_shells.hpp"
 #include "alchemy/host/locale.hpp"
 #include "alchemy/host/system.hpp"
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -120,77 +122,28 @@ std::string delete_extension(std::string_view path) {
     auto trimmed = trim_slashes(std::string(path));
     return extension.empty() ? trimmed : trimmed.substr(0, trimmed.size() - extension.size() - 1);
 }
-// XML property lists (Apple PropertyList-1.0 DTD), the Info.plist format.
-struct PlistParser {
-    std::string_view text;
-    std::size_t at{};
-    void space() { while (at < text.size() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\r' || text[at] == '\n')) ++at; }
-    void skip_markup() {
-        for (;;) {
-            space();
-            if (text.substr(at).starts_with("<?")) { const auto end = text.find("?>", at); if (end == std::string_view::npos) fail("unterminated plist declaration"); at = end + 2; }
-            else if (text.substr(at).starts_with("<!--")) { const auto end = text.find("-->", at); if (end == std::string_view::npos) fail("unterminated plist comment"); at = end + 3; }
-            else if (text.substr(at).starts_with("<!")) { const auto end = text.find('>', at); if (end == std::string_view::npos) fail("unterminated plist doctype"); at = end + 1; }
-            else return;
-        }
-    }
-    struct Tag { std::string name; bool closing{}, empty{}; };
-    Tag tag() {
-        skip_markup();
-        if (at >= text.size() || text[at] != '<') fail("malformed plist element");
-        const auto end = text.find('>', at);
-        if (end == std::string_view::npos) fail("unterminated plist element");
-        auto body = text.substr(at + 1, end - at - 1); at = end + 1;
-        Tag result;
-        if (body.starts_with('/')) { result.closing = true; body.remove_prefix(1); }
-        if (body.ends_with('/')) { result.empty = true; body.remove_suffix(1); }
-        result.name = std::string(body.substr(0, body.find_first_of(" \t\r\n")));
-        return result;
-    }
-    std::string content(std::string_view name) {
-        const auto close = "</" + std::string(name) + ">";
-        const auto end = text.find(close, at);
-        if (end == std::string_view::npos) fail("unterminated plist " + std::string(name));
-        const auto raw = text.substr(at, end - at); at = end + close.size();
-        std::string result;
-        for (std::size_t index = 0; index < raw.size(); ++index) {
-            if (raw[index] != '&') { result += raw[index]; continue; }
-            const auto semicolon = raw.find(';', index);
-            if (semicolon == std::string_view::npos) fail("malformed plist entity");
-            const auto entity = raw.substr(index + 1, semicolon - index - 1); index = semicolon;
-            if (entity == "lt") result += '<'; else if (entity == "gt") result += '>'; else if (entity == "amp") result += '&';
-            else if (entity == "quot") result += '"'; else if (entity == "apos") result += '\'';
-            else if (entity.starts_with('#')) {
-                const bool hex = entity.size() > 1 && (entity[1] == 'x' || entity[1] == 'X');
-                std::uint32_t scalar{};
-                for (const auto c : entity.substr(hex ? 2 : 1)) {
-                    const auto digit = c >= '0' && c <= '9' ? c - '0' : hex && c >= 'a' && c <= 'f' ? c - 'a' + 10 : hex && c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-                    if (digit < 0 || scalar > 0x10ffff) fail("malformed plist character reference");
-                    scalar = scalar * (hex ? 16 : 10) + static_cast<std::uint32_t>(digit);
-                }
-                if (scalar > 0x10ffff || (scalar >= 0xd800 && scalar <= 0xdfff)) fail("invalid plist character reference");
-                if (scalar < 0x80) result += static_cast<char>(scalar);
-                else if (scalar < 0x800) { result += static_cast<char>(0xc0 | scalar >> 6); result += static_cast<char>(0x80 | (scalar & 0x3f)); }
-                else if (scalar < 0x10000) { result += static_cast<char>(0xe0 | scalar >> 12); result += static_cast<char>(0x80 | ((scalar >> 6) & 0x3f)); result += static_cast<char>(0x80 | (scalar & 0x3f)); }
-                else { result += static_cast<char>(0xf0 | scalar >> 18); result += static_cast<char>(0x80 | ((scalar >> 12) & 0x3f)); result += static_cast<char>(0x80 | ((scalar >> 6) & 0x3f)); result += static_cast<char>(0x80 | (scalar & 0x3f)); }
-            } else fail("unsupported plist entity");
-        }
-        return result;
-    }
-};
 
 struct SetState final : ObjectPayload { std::mutex mutex; std::vector<Address> values; std::uint64_t mutations{}; bool mutable_set{}; };
 // NSEnumerator over a snapshot of a collection (the values are retained).
 struct EnumeratorState final : ObjectPayload { std::mutex mutex; std::vector<Address> values; std::size_t next{}; };
 struct NotificationState final : ObjectPayload { Address name{}, object{}, user_info{}; };
-struct BundleState final : ObjectPayload { std::string path, executable; bool application{}; Address info{}; std::mutex mutex; };
+struct BundleState final : ObjectPayload {
+    std::string path, executable;
+    bool application{};
+    Address info{};                            // +1
+    Address handle{};                          // dlopen(3) handle of the loaded executable
+    std::map<std::string, Address> tables;     // "<localization>/<table>" -> strings dictionary (+1, or 0)
+    std::optional<std::vector<std::string>> preferred;
+    std::mutex mutex;
+};
 struct Observer { Address observer{}, selector{}, name{}, object{}; };
 
 struct Extra {
     ProcessContext& process;
     ObjcRuntime& objc;
     CoreFoundation& cf;
-    std::mutex mutex, main_bundle_mutex;
+    std::mutex mutex, main_bundle_mutex, bundles_mutex;
+    std::map<std::string, Address> bundles;   // bundle path -> the process's NSBundle (kept)
     Address root{}, string_class{}, number_class{}, array_class{}, dictionary_class{}, data_class{};
     Address mutable_array{}, mutable_dictionary{}, mutable_data{}, set_class{}, mutable_set{}, url_class{}, date_class{};
     Address locale_class{}, bundle_class{}, file_manager{}, notification_center{}, notification_class{}, run_loop_class{};
@@ -1521,57 +1474,30 @@ struct Extra {
     }
 
     // NSBundle: the main bundle is the .app enclosing Contents/MacOS/<executable>,
-    // else the executable's directory; Info.plist is read from the bundle.
-    Address plist_value(PlistParser& parser, const PlistParser::Tag& tag) {
-        if (tag.closing) fail("unexpected plist close tag");
-        if (tag.name == "string") return make_string(tag.empty ? std::string{} : parser.content("string"));
-        if (tag.name == "true" || tag.name == "false") { if (!tag.empty) parser.content(tag.name); return cf.boolean(tag.name == "true"); }
-        if (tag.name == "integer") { const auto value = parser.content("integer"); return number(std::strtoll(value.c_str(), nullptr, 10)); }
-        if (tag.name == "real") { const auto value = parser.content("real"); return cf.real(std::strtod(value.c_str(), nullptr)); }
-        if (tag.name == "date") return make_string(parser.content("date")); // Kept as its ISO 8601 text.
-        if (tag.name == "data") {
-            const auto encoded = parser.content("data"); std::vector<std::uint8_t> bytes; std::uint32_t buffer{}; int bits{};
-            for (const auto c : encoded) {
-                const auto value = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 : c >= '0' && c <= '9' ? c - '0' + 52 : c == '+' ? 62 : c == '/' ? 63 : -1;
-                if (value < 0) continue;
-                buffer = (buffer << 6) | static_cast<std::uint32_t>(value); bits += 6;
-                if (bits >= 8) { bits -= 8; bytes.push_back(static_cast<std::uint8_t>(buffer >> bits)); }
-            }
-            const auto storage = process.allocate_guest(std::max<std::size_t>(bytes.size(), 1));
-            try { memory().write_bytes(storage, bytes); const auto value = cf.invoke("CFDataCreate", std::array<Address, 3>{0, storage, bytes.size()}); process.release_guest(storage); return value; }
-            catch (...) { process.release_guest(storage); throw; }
-        }
-        const bool is_array = tag.name == "array";
-        if (!is_array && tag.name != "dict") fail("unsupported plist element " + tag.name);
-        std::vector<Address> owned; std::vector<std::pair<Address, Address>> entries;
-        try {
-            if (!tag.empty) for (;;) {
-                auto next = parser.tag();
-                if (next.closing) { if (next.name != tag.name) fail("mismatched plist close tag"); break; }
-                if (is_array) { owned.push_back(plist_value(parser, next)); continue; }
-                if (next.name != "key") fail("plist dictionary entry without a key");
-                const auto key = make_string(next.empty ? std::string{} : parser.content("key")); owned.push_back(key);
-                const auto value = plist_value(parser, parser.tag()); owned.push_back(value);
-                entries.emplace_back(key, value);
-            }
-            const auto result = is_array ? cf.array(owned) : cf.dictionary(entries);
-            for (const auto value : owned) process.objects().release(value);
-            return result;
-        } catch (...) { for (const auto value : owned) process.objects().release(value); throw; }
-    }
+    // else the executable's directory; Info.plist is read from the bundle (XML,
+    // binary or OpenStep, through export_fill::plist_parse). A bundle object is
+    // kept per path for the process lifetime (+bundleWithPath: and -initWithPath:
+    // give the same object for the same path, as Foundation's do).
+    //
+    // Localizations are the bundle's <name>.lproj directories. The preferred
+    // ones match the user's languages (CFLocaleCopyPreferredLanguages) against
+    // them: the full identifier, then the language alone, then the legacy names
+    // (English, French, German, ...); with no match the development region
+    // (CFBundleDevelopmentRegion, else en) when the bundle has it, else the first
+    // localization. Resources are searched in the unlocalized directory first,
+    // then the preferred localization, the development region and Base.lproj;
+    // -localizedStringForKey:value:table: reads <table>.strings (Localizable by
+    // default) from the first of those that has it.
     Address read_plist(const std::filesystem::path& host) {
         std::error_code error;
         if (!std::filesystem::is_regular_file(host, error)) return 0;
         const auto size = std::filesystem::file_size(host, error);
         if (error || size > (16U << 20)) return 0;
-        std::string content(static_cast<std::size_t>(size), '\0');
+        std::vector<std::uint8_t> content(static_cast<std::size_t>(size));
         std::ifstream file(host, std::ios::binary);
-        if (!file.read(content.data(), static_cast<std::streamsize>(content.size()))) return 0;
-        if (content.starts_with("bplist")) fail("binary property lists are unsupported");
-        PlistParser parser{content};
-        const auto root_tag = parser.tag();
-        if (root_tag.name != "plist" || root_tag.closing) fail("Info.plist has no plist root");
-        return plist_value(parser, parser.tag());
+        if (!file.read(reinterpret_cast<char*>(content.data()), static_cast<std::streamsize>(content.size()))) return 0;
+        const auto parsed = export_fill::plist_parse(content);
+        return parsed ? export_fill::plist_to_guest(process, cf, *parsed) : 0;   // +1
     }
     Address make_bundle(const std::string& path, const std::string& executable) {
         const auto object = objc.allocate(bundle_class);
@@ -1582,6 +1508,13 @@ struct Extra {
             bundle->application = std::filesystem::is_directory(host_path(bundle->path + "/Contents"), error);
         } catch (...) { release(object); throw; }
         return object;
+    }
+    // The process's bundle for `path` (+0), made on first use.
+    Address cached_bundle(const std::string& path) {
+        const auto key = trim_slashes(path);
+        std::lock_guard lock(bundles_mutex);
+        if (const auto found = bundles.find(key); found != bundles.end()) return found->second;
+        return bundles[key] = make_bundle(key, {});
     }
     std::shared_ptr<BundleState> bundle_of(Address object) { return state_of<BundleState>(object); }
     std::string contents(const BundleState& bundle) { return bundle.application ? bundle.path + "/Contents" : bundle.path; }
@@ -1601,9 +1534,237 @@ struct Extra {
         std::lock_guard lock(bundle->mutex);
         if (!bundle->info) {
             const auto plist = read_plist(host_path(bundle->application ? contents(*bundle) + "/Info.plist" : resources(*bundle) + "/Info.plist"));
-            bundle->info = plist ? plist : cf.dictionary({});
+            bundle->info = plist && cf.kind(plist) == ObjectKind::dictionary ? plist : cf.dictionary({});
+            if (plist && bundle->info != plist) process.objects().release(plist);
         }
         return bundle->info;
+    }
+    // ---- localizations ----
+    std::vector<std::string> localizations(const BundleState& bundle) {
+        std::vector<std::string> names;
+        std::error_code error;
+        for (std::filesystem::directory_iterator entry(host_path(resources(bundle)), error), end; !error && entry != end; entry.increment(error)) {
+            const auto name = entry->path().filename().u8string();
+            const std::string text(reinterpret_cast<const char*>(name.data()), name.size());
+            if (text.size() > 6 && text.ends_with(".lproj") && entry->is_directory(error)) names.push_back(text.substr(0, text.size() - 6));
+        }
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+    std::string development(Address object) {
+        const auto region = cf.dictionary_value(info(object), make_constant("kCFBundleDevelopmentRegionKey"));
+        return region && cf.kind(region) == ObjectKind::string ? cf.utf8(region) : std::string("en");
+    }
+    static std::string language_of(std::string_view identifier) {
+        static constexpr std::pair<const char*, const char*> legacy[] = {
+            {"English", "en"}, {"French", "fr"}, {"German", "de"}, {"Italian", "it"}, {"Japanese", "ja"}, {"Spanish", "es"}, {"Dutch", "nl"},
+        };
+        for (const auto& [name, code] : legacy) if (identifier == name) return code;
+        std::string value(identifier);
+        for (auto& c : value) if (c == '_') c = '-';
+        return value;
+    }
+    // The localizations of `available` to use for `preferences` (most preferred first; at most one, as Foundation answers).
+    static std::vector<std::string> preferred_from(const std::vector<std::string>& available, const std::vector<std::string>& preferences,
+                                                   std::string_view development_region) {
+        for (const auto& wanted : preferences) {
+            const auto want = language_of(wanted);
+            const auto want_language = want.substr(0, want.find('-'));
+            for (const auto& name : available) if (language_of(name) == want) return {name};
+            for (const auto& name : available) {
+                const auto have = language_of(name);
+                if (have.substr(0, have.find('-')) == want_language) return {name};
+            }
+        }
+        for (const auto& name : available) if (language_of(name) == language_of(development_region)) return {name};
+        if (!available.empty()) return {available.front()};
+        return {};
+    }
+    std::vector<std::string> user_languages() {
+        std::vector<std::string> languages;
+        const auto list = cf.invoke("CFLocaleCopyPreferredLanguages", std::span<const Address>{});
+        if (list) {
+            for (const auto value : cf.array_values(list)) languages.push_back(cf.utf8(value));
+            process.objects().release(list);
+        }
+        return languages;
+    }
+    std::vector<std::string> strings_of(Address array) {
+        std::vector<std::string> values;
+        if (array) for (const auto value : cf.array_values(array)) if (cf.kind(value) == ObjectKind::string) values.push_back(cf.utf8(value));
+        return values;
+    }
+    std::vector<std::string> preferred(Address object) {
+        const auto bundle = bundle_of(object);
+        {
+            std::lock_guard lock(bundle->mutex);
+            if (bundle->preferred) return *bundle->preferred;
+        }
+        auto value = preferred_from(localizations(*bundle), user_languages(), development(object));
+        std::lock_guard lock(bundle->mutex);
+        bundle->preferred = value;
+        return value;
+    }
+    // The <name>.lproj directories to search, in order (a given localization first, else the preferred ones), then
+    // the development region and Base.
+    std::vector<std::string> lproj_order(Address object, const std::optional<std::string>& localization) {
+        std::vector<std::string> order;
+        const auto add = [&order](std::string name) { if (std::find(order.begin(), order.end(), name) == order.end()) order.push_back(std::move(name)); };
+        if (localization) add(*localization);
+        else for (auto& name : preferred(object)) add(name);
+        add(development(object));
+        if (development(object) == "en") add("English");
+        add("Base");
+        return order;
+    }
+    std::optional<std::string> resource_path(Address object, Address name, Address type, Address directory,
+                                             const std::optional<std::string>& localization = std::nullopt) {
+        const auto bundle = bundle_of(object);
+        const auto base = resources(*bundle);
+        const auto sub = directory ? text(directory) : std::string{};
+        std::string file = name ? text(name) : std::string{};
+        if (type && !text(type).empty()) { auto extension = text(type); if (extension.starts_with('.')) extension.erase(0, 1); file += "." + extension; }
+        if (file.empty()) return std::nullopt;
+        std::vector<std::string> folders;
+        if (!localization) folders.push_back(sub.empty() ? base : append_component(base, sub));
+        for (const auto& lproj : lproj_order(object, localization)) {
+            const auto folder = append_component(base, lproj + ".lproj");
+            folders.push_back(sub.empty() ? folder : append_component(folder, sub));
+        }
+        std::error_code error;
+        for (const auto& folder : folders) {
+            const auto candidate = append_component(folder, file);
+            if (std::filesystem::exists(host_path(candidate), error)) return candidate;
+        }
+        return std::nullopt;
+    }
+    // The paths of the files with `extension` (any, when empty) in the unlocalized directory and the first
+    // localization directory that exists, in name order.
+    std::vector<std::string> resource_paths(Address object, const std::string& extension, Address directory, const std::optional<std::string>& localization) {
+        const auto bundle = bundle_of(object);
+        const auto base = resources(*bundle);
+        const auto sub = directory ? text(directory) : std::string{};
+        std::vector<std::string> folders;
+        if (!localization) folders.push_back(sub.empty() ? base : append_component(base, sub));
+        std::error_code error;
+        for (const auto& lproj : lproj_order(object, localization)) {
+            const auto folder = append_component(base, lproj + ".lproj");
+            if (!std::filesystem::is_directory(host_path(folder), error)) continue;
+            folders.push_back(sub.empty() ? folder : append_component(folder, sub));
+            break;
+        }
+        auto wanted = extension;
+        if (wanted.starts_with('.')) wanted.erase(0, 1);
+        std::vector<std::string> paths;
+        for (const auto& folder : folders) {
+            std::vector<std::string> names;
+            for (std::filesystem::directory_iterator entry(host_path(folder), error), end; !error && entry != end; entry.increment(error)) {
+                const auto name8 = entry->path().filename().u8string();
+                const std::string name(reinterpret_cast<const char*>(name8.data()), name8.size());
+                if (name.ends_with(".lproj")) continue;
+                const auto dot = name.rfind('.');
+                if (!wanted.empty() && (dot == std::string::npos || name.substr(dot + 1) != wanted)) continue;
+                names.push_back(name);
+            }
+            std::sort(names.begin(), names.end());
+            for (const auto& name : names) paths.push_back(append_component(folder, name));
+        }
+        return paths;
+    }
+    // The strings table (+0, cached), or 0 when no localization has it.
+    Address strings_table(Address object, const std::string& table, const std::optional<std::string>& localization = std::nullopt) {
+        const auto bundle = bundle_of(object);
+        const auto key = (localization ? *localization : std::string{}) + "/" + table;
+        {
+            std::lock_guard lock(bundle->mutex);
+            if (const auto found = bundle->tables.find(key); found != bundle->tables.end()) return found->second;
+        }
+        const auto name = cf.string(table), type = cf.string("strings");
+        const auto path = resource_path(object, name, type, 0, localization);
+        process.objects().release(name);
+        process.objects().release(type);
+        Address dictionary = path ? read_plist(host_path(*path)) : 0;
+        if (dictionary && cf.kind(dictionary) != ObjectKind::dictionary) { process.objects().release(dictionary); dictionary = 0; }
+        std::lock_guard lock(bundle->mutex);
+        const auto [entry, added] = bundle->tables.emplace(key, dictionary);
+        if (!added && dictionary) process.objects().release(dictionary);
+        return entry->second;
+    }
+    // -localizedStringForKey:value:table: (+0): the table's value, else `value` when it is not empty, else the key.
+    Address localized_string(Address object, Address key, Address value, Address table_name) {
+        if (!key) return value ? value : auto_string("");
+        const auto table = table_name && cf.length(table_name) ? text(table_name) : std::string("Localizable");
+        if (const auto dictionary = strings_table(object, table))
+            if (const auto found = cf.dictionary_value(dictionary, key); found && cf.kind(found) == ObjectKind::string) return found;
+        return value && cf.length(value) ? value : key;
+    }
+    // ---- the executable ----
+    std::string executable_path(Address object) {
+        const auto bundle = bundle_of(object);
+        if (!bundle->executable.empty()) return bundle->executable;
+        const auto name = cf.dictionary_value(info(object), make_constant("kCFBundleExecutableKey"));
+        if (!name) return {};
+        const auto path = bundle->application ? contents(*bundle) + "/MacOS/" + text(name) : append_component(bundle->path, text(name));
+        std::error_code error;
+        return std::filesystem::is_regular_file(host_path(path), error) ? path : std::string{};
+    }
+    // dlopen(3) of the executable, once (RTLD_LAZY | RTLD_GLOBAL, as CFBundleLoadExecutable). false, with dlerror's
+    // text in `why`, when it cannot be loaded.
+    bool load_executable(Address object, std::string* why = nullptr) {
+        if (object == main_bundle) return true;
+        const auto bundle = bundle_of(object);
+        {
+            std::lock_guard lock(bundle->mutex);
+            if (bundle->handle) return true;
+        }
+        const auto path = executable_path(object);
+        if (path.empty()) { if (why) *why = "the bundle has no executable"; return false; }
+        const auto text_path = process.allocate_guest(path.size() + 1, 1);
+        memory().write_bytes(text_path, std::span(reinterpret_cast<const std::uint8_t*>(path.c_str()), path.size() + 1));
+        const auto handle = call("/usr/lib/libSystem.B.dylib", "_dlopen", {text_path, 1 | 8});
+        process.release_guest(text_path);
+        if (!handle) {
+            if (why) {
+                const auto message = call("/usr/lib/libSystem.B.dylib", "_dlerror", {});
+                *why = message ? c_text(message) : std::string("dlopen failed");
+            }
+            return false;
+        }
+        std::lock_guard lock(bundle->mutex);
+        if (bundle->handle) static_cast<void>(call("/usr/lib/libSystem.B.dylib", "_dlclose", {handle}));
+        else bundle->handle = handle;
+        return true;
+    }
+    bool executable_loaded(Address object) {
+        if (object == main_bundle) return true;
+        const auto bundle = bundle_of(object);
+        std::lock_guard lock(bundle->mutex);
+        return bundle->handle != 0;
+    }
+    bool unload_executable(Address object) {
+        if (object == main_bundle) return false;
+        const auto bundle = bundle_of(object);
+        Address handle{};
+        { std::lock_guard lock(bundle->mutex); handle = std::exchange(bundle->handle, 0); }
+        if (!handle) return true;
+        return call("/usr/lib/libSystem.B.dylib", "_dlclose", {handle}) == 0;
+    }
+    // NSError (+0) in NSCocoaErrorDomain when the class exists (alchemy-fx), else 0.
+    Address cocoa_error(std::int64_t code, const std::string& description) {
+        const auto error_class = objc.find_class("NSError");
+        if (!error_class) return 0;
+        const auto key = make_string("NSDebugDescription"), value = make_string(description);
+        const std::array<std::pair<Address, Address>, 1> entries{{{key, value}}};
+        const auto user_info = cf.dictionary(entries);
+        process.objects().release(key);
+        process.objects().release(value);
+        CallRegs registers;
+        registers.x[2] = auto_string("NSCocoaErrorDomain");
+        registers.x[3] = static_cast<Address>(code);
+        registers.x[4] = user_info;
+        const auto error = objc.send(error_class, "errorWithDomain:code:userInfo:", registers).x0;
+        process.objects().release(user_info);
+        return error;
     }
     void install_bundles() {
         bundle_class = define("NSBundle", root);
@@ -1616,6 +1777,8 @@ struct Extra {
                 const auto contents_dir = delete_last_component(directory);
                 if (last_component(directory) == "MacOS" && last_component(contents_dir) == "Contents") directory = delete_last_component(contents_dir);
                 main_bundle = make_bundle(directory, executable); // Owned for the process lifetime.
+                std::lock_guard bundles_lock(bundles_mutex);
+                bundles.emplace(trim_slashes(directory), main_bundle);
             }
             state.x[0] = main_bundle;
         }, true);
@@ -1623,16 +1786,19 @@ struct Extra {
             std::error_code error;
             const auto path = text(state.x[2]);
             if (!std::filesystem::is_directory(host_path(path), error)) { state.x[0] = 0; return; }
-            state.x[0] = autorelease(make_bundle(path, {}));
+            state.x[0] = cached_bundle(path);
         }, true);
         method(b, "initWithPath:", [this](auto& state, auto&) {
             std::error_code error; const auto path = text(state.x[2]);
             if (!std::filesystem::is_directory(host_path(path), error)) { replace(state, 0); return; }
-            auto bundle = attach<BundleState>(state.x[0]); bundle->path = trim_slashes(path);
-            bundle->application = std::filesystem::is_directory(host_path(bundle->path + "/Contents"), error);
+            replace(state, retain(cached_bundle(path)));
         });
         method(b, "dealloc", [this](auto& state, auto&) {
-            if (const auto bundle = state_of<BundleState>(state.x[0], false)) process.objects().release(std::exchange(bundle->info, 0));
+            if (const auto bundle = state_of<BundleState>(state.x[0], false)) {
+                process.objects().release(std::exchange(bundle->info, 0));
+                for (auto& [key, table] : bundle->tables) if (table) process.objects().release(table);
+                bundle->tables.clear();
+            }
             destruct(state.x[0]);
         }, false, "v@:");
         const auto path_method = [this](const char* name, auto compute, bool as_url) {
@@ -1648,45 +1814,106 @@ struct Extra {
             path_method(as_url ? "resourceURL" : "resourcePath", [this](const BundleState& bundle) -> std::optional<std::string> { return resources(bundle); }, as_url);
             path_method(as_url ? "builtInPlugInsURL" : "builtInPlugInsPath", [this](const BundleState& bundle) -> std::optional<std::string> { return contents(bundle) + "/PlugIns"; }, as_url);
             path_method(as_url ? "privateFrameworksURL" : "privateFrameworksPath", [this](const BundleState& bundle) -> std::optional<std::string> { return contents(bundle) + "/Frameworks"; }, as_url);
+            path_method(as_url ? "sharedFrameworksURL" : "sharedFrameworksPath", [this](const BundleState& bundle) -> std::optional<std::string> { return contents(bundle) + "/SharedFrameworks"; }, as_url);
             path_method(as_url ? "sharedSupportURL" : "sharedSupportPath", [this](const BundleState& bundle) -> std::optional<std::string> { return contents(bundle) + "/SharedSupport"; }, as_url);
         }
+        // The Mac App Store receipt's location (Contents/_MASReceipt/receipt), whether or not one exists.
+        method(b, "appStoreReceiptURL", [this](auto& state, auto&) {
+            state.x[0] = autorelease(cf.file_url(contents(*bundle_of(state.x[0])) + "/_MASReceipt/receipt", false));
+        });
         method(b, "executablePath", [this](auto& state, auto&) {
-            const auto bundle = bundle_of(state.x[0]);
-            if (!bundle->executable.empty()) { state.x[0] = auto_string(bundle->executable); return; }
-            const auto name = cf.dictionary_value(info(state.x[0]), make_constant("kCFBundleExecutableKey"));
-            state.x[0] = name && bundle->application ? auto_string(contents(*bundle) + "/MacOS/" + text(name)) : 0;
+            const auto path = executable_path(state.x[0]);
+            state.x[0] = path.empty() ? 0 : auto_string(path);
+        });
+        method(b, "executableURL", [this](auto& state, auto&) {
+            const auto path = executable_path(state.x[0]);
+            state.x[0] = path.empty() ? 0 : autorelease(cf.file_url(path, false));
         });
         method(b, "infoDictionary", [this](auto& state, auto&) { state.x[0] = info(state.x[0]); });
-        method(b, "localizedInfoDictionary", [this](auto& state, auto&) { state.x[0] = info(state.x[0]); });
-        method(b, "objectForInfoDictionaryKey:", [this](auto& state, auto&) { state.x[0] = state.x[2] ? cf.dictionary_value(info(state.x[0]), state.x[2]) : 0; });
-        method(b, "bundleIdentifier", [this](auto& state, auto&) { state.x[0] = cf.dictionary_value(info(state.x[0]), make_constant("kCFBundleIdentifierKey")); });
-        const auto resource = [this](Address object, Address name, Address type, Address directory) -> std::optional<std::string> {
-            const auto bundle = bundle_of(object);
-            auto path = resources(*bundle);
-            if (directory) path = append_component(path, text(directory));
-            std::string file = name ? text(name) : std::string{};
-            if (type && !text(type).empty()) { auto extension = text(type); if (extension.starts_with('.')) extension.erase(0, 1); file += "." + extension; }
-            if (file.empty()) return std::nullopt;
-            // Non-localized resources first, then the development language's
-            // localization (en/English) and Base.lproj, as NSBundle searches.
-            for (const auto* localization : {"", "en.lproj", "English.lproj", "Base.lproj"}) {
-                const auto folder = *localization ? append_component(path, localization) : path;
-                const auto candidate = append_component(folder, file);
-                std::error_code error;
-                if (std::filesystem::exists(host_path(candidate), error)) return candidate;
+        // The Info.plist with the preferred localization's InfoPlist.strings over it.
+        method(b, "localizedInfoDictionary", [this](auto& state, auto&) {
+            const auto base = info(state.x[0]);
+            const auto overrides = strings_table(state.x[0], "InfoPlist");
+            if (!overrides) { state.x[0] = base; return; }
+            auto entries = cf.dictionary_entries(base);
+            for (const auto& [key, value] : cf.dictionary_entries(overrides)) {
+                const auto found = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) { return cf.equal(entry.first, key); });
+                if (found != entries.end()) found->second = value; else entries.emplace_back(key, value);
             }
-            return std::nullopt;
-        };
-        method(b, "pathForResource:ofType:", [this, resource](auto& state, auto&) { const auto path = resource(state.x[0], state.x[2], state.x[3], 0); state.x[0] = path ? auto_string(*path) : 0; });
-        method(b, "pathForResource:ofType:inDirectory:", [this, resource](auto& state, auto&) { const auto path = resource(state.x[0], state.x[2], state.x[3], state.x[4]); state.x[0] = path ? auto_string(*path) : 0; });
-        method(b, "URLForResource:withExtension:", [this, resource](auto& state, auto&) { const auto path = resource(state.x[0], state.x[2], state.x[3], 0); state.x[0] = path ? autorelease(url_for(*path, std::nullopt)) : 0; });
-        method(b, "localizedStringForKey:value:table:", [this](auto& state, auto&) {
-            // No .strings tables are loaded: the development-language value (or key) is the answer.
-            const auto value = state.x[3] && cf.length(state.x[3]) ? state.x[3] : state.x[2];
-            state.x[0] = value ? autorelease(retain(value)) : auto_string("");
+            state.x[0] = autorelease(cf.dictionary(entries));
         });
-        method(b, "load", [](auto& state, auto&) { state.x[0] = 1; }, false, "B@:");
-        method(b, "isLoaded", [](auto& state, auto&) { state.x[0] = 1; }, false, "B@:");
+        method(b, "objectForInfoDictionaryKey:", [this](auto& state, auto&) {
+            if (!state.x[2]) { state.x[0] = 0; return; }
+            const auto overrides = strings_table(state.x[0], "InfoPlist");
+            const auto localized = overrides ? cf.dictionary_value(overrides, state.x[2]) : 0;
+            state.x[0] = localized ? localized : cf.dictionary_value(info(state.x[0]), state.x[2]);
+        });
+        method(b, "bundleIdentifier", [this](auto& state, auto&) { state.x[0] = cf.dictionary_value(info(state.x[0]), make_constant("kCFBundleIdentifierKey")); });
+        // ---- localizations ----
+        method(b, "localizations", [this](auto& state, auto&) { state.x[0] = autorelease(string_array(localizations(*bundle_of(state.x[0])))); });
+        method(b, "developmentLocalization", [this](auto& state, auto&) { state.x[0] = auto_string(development(state.x[0])); });
+        method(b, "preferredLocalizations", [this](auto& state, auto&) { state.x[0] = autorelease(string_array(preferred(state.x[0]))); });
+        method(b, "preferredLocalizationsFromArray:", [this](auto& state, auto&) {
+            state.x[0] = autorelease(string_array(preferred_from(strings_of(state.x[2]), user_languages(), "en")));
+        }, true, "@@:@");
+        method(b, "preferredLocalizationsFromArray:forPreferences:", [this](auto& state, auto&) {
+            const auto preferences = state.x[3] ? strings_of(state.x[3]) : user_languages();
+            state.x[0] = autorelease(string_array(preferred_from(strings_of(state.x[2]), preferences, "en")));
+        }, true, "@@:@@");
+        // ---- resources ----
+        method(b, "pathForResource:ofType:", [this](auto& state, auto&) { const auto path = resource_path(state.x[0], state.x[2], state.x[3], 0); state.x[0] = path ? auto_string(*path) : 0; });
+        method(b, "pathForResource:ofType:inDirectory:", [this](auto& state, auto&) { const auto path = resource_path(state.x[0], state.x[2], state.x[3], state.x[4]); state.x[0] = path ? auto_string(*path) : 0; });
+        method(b, "URLForResource:withExtension:", [this](auto& state, auto&) { const auto path = resource_path(state.x[0], state.x[2], state.x[3], 0); state.x[0] = path ? autorelease(url_for(*path, std::nullopt)) : 0; });
+        method(b, "URLForResource:withExtension:subdirectory:", [this](auto& state, auto&) {
+            const auto path = resource_path(state.x[0], state.x[2], state.x[3], state.x[4]);
+            state.x[0] = path ? autorelease(url_for(*path, std::nullopt)) : 0;
+        });
+        method(b, "URLForResource:withExtension:subdirectory:localization:", [this](auto& state, auto&) {
+            const auto localization = state.x[5] ? std::optional<std::string>(text(state.x[5])) : std::nullopt;
+            const auto path = resource_path(state.x[0], state.x[2], state.x[3], state.x[4], localization);
+            state.x[0] = path ? autorelease(url_for(*path, std::nullopt)) : 0;
+        });
+        // +pathForResource:ofType:inDirectory: names a bundle directory, not a bundle.
+        method(b, "pathForResource:ofType:inDirectory:", [this](auto& state, auto&) {
+            std::error_code error;
+            const auto directory = state.x[4] ? text(state.x[4]) : std::string{};
+            if (directory.empty() || !std::filesystem::is_directory(host_path(directory), error)) { state.x[0] = 0; return; }
+            const auto path = resource_path(cached_bundle(directory), state.x[2], state.x[3], 0);
+            state.x[0] = path ? auto_string(*path) : 0;
+        }, true, "@@:@@@");
+        method(b, "pathsForResourcesOfType:inDirectory:", [this](auto& state, auto&) {
+            std::vector<Address> items;
+            for (const auto& path : resource_paths(state.x[0], state.x[2] ? text(state.x[2]) : std::string{}, state.x[3], std::nullopt)) items.push_back(cf.string(path));
+            state.x[0] = autorelease(cf.array(items));
+            for (const auto item : items) process.objects().release(item);
+        });
+        method(b, "URLsForResourcesWithExtension:subdirectory:", [this](auto& state, auto&) {
+            std::vector<Address> items;
+            for (const auto& path : resource_paths(state.x[0], state.x[2] ? text(state.x[2]) : std::string{}, state.x[3], std::nullopt)) items.push_back(url_for(path, std::nullopt));
+            state.x[0] = autorelease(cf.array(items));
+            for (const auto item : items) process.objects().release(item);
+        });
+        // Private, for CFBundleGetLocalInfoDictionary and +allBundles (bundles.cpp, cf_extra.cpp).
+        method(b, "_alchemyLocalInfoDictionary", [this](auto& state, auto&) { state.x[0] = strings_table(state.x[0], "InfoPlist"); });
+        method(b, "_alchemyKnownBundles", [this](auto& state, auto&) {
+            std::vector<Address> values;
+            { std::lock_guard lock(bundles_mutex); for (const auto& [path, bundle] : bundles) values.push_back(bundle); }
+            state.x[0] = autorelease(cf.array(values));
+        }, true);
+        method(b, "localizedStringForKey:value:table:", [this](auto& state, auto&) {
+            state.x[0] = localized_string(state.x[0], state.x[2], state.x[3], state.x[4]);
+        });
+        // ---- the executable ----
+        method(b, "load", [this](auto& state, auto&) { state.x[0] = load_executable(state.x[0]) ? 1 : 0; }, false, "B@:");
+        method(b, "isLoaded", [this](auto& state, auto&) { state.x[0] = executable_loaded(state.x[0]) ? 1 : 0; }, false, "B@:");
+        method(b, "unload", [this](auto& state, auto&) { state.x[0] = unload_executable(state.x[0]) ? 1 : 0; }, false, "B@:");
+        // -loadAndReturnError: NSFileNoSuchFileError (4) without an executable, NSExecutableLoadError (3587) when dlopen fails.
+        method(b, "loadAndReturnError:", [this](auto& state, auto& memory) {
+            std::string why;
+            const auto loaded = load_executable(state.x[0], &why);
+            if (!loaded && state.x[2]) memory.write64(state.x[2], cocoa_error(executable_path(state.x[0]).empty() ? 4 : 3587, why));
+            state.x[0] = loaded ? 1 : 0;
+        }, false, "B@:^@");
     }
 
     // NSNotificationCenter: in-process, synchronous delivery; observers are not retained.

@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -74,7 +75,16 @@ std::string format_date(double absolute) {
 }
 std::optional<double> parse_date(std::string_view text) {
     int year{}, month{}, day{}, hour{}, minute{}, second{};
-    if (std::sscanf(std::string(text).c_str(), "%d-%d-%dT%d:%d:%dZ", &year, &month, &day, &hour, &minute, &second) != 6) return std::nullopt;
+    {   // "%d-%d-%dT%d:%d:%dZ"
+        const char* at = text.data();
+        const char* end = text.data() + text.size();
+        const std::pair<int*, char> fields[] = {{&year, '-'}, {&month, '-'}, {&day, 'T'}, {&hour, ':'}, {&minute, ':'}, {&second, 'Z'}};
+        for (const auto& [field, separator] : fields) {
+            const auto [next, problem] = std::from_chars(at, end, *field);
+            if (problem != std::errc{} || next == end || *next != separator) return std::nullopt;
+            at = next + 1;
+        }
+    }
     if (month < 1 || month > 12 || day < 1 || day > 31) return std::nullopt;
     const auto days = days_from_civil(year, static_cast<unsigned>(month), static_cast<unsigned>(day));
     return static_cast<double>(days * 86400 + hour * 3600 + minute * 60 + second) - unix_to_absolute;
@@ -568,6 +578,244 @@ private:
     std::size_t current_{};
 };
 
+// ---- OpenStep (old-style) property lists, read only ----
+// The text format of .strings files and old Info.plists: strings (quoted with
+// C escapes, \Uxxxx UTF-16 units and \ooo octal, or unquoted [A-Za-z0-9_$+/:.-]),
+// dictionaries { key = value; }, arrays ( a, b ), data <hex>, and /* */ and //
+// comments. A text whose top level is not one value is read as a strings file:
+// "key" = "value"; pairs without the braces, as CF reads it. The bytes are UTF-8,
+// or UTF-16 with a byte-order mark.
+struct OpenStepError {};
+
+class OpenStepReader {
+public:
+    explicit OpenStepReader(std::string text) : text_(std::move(text)) {}
+
+    Plist top() {
+        skip();
+        if (at_end()) return dictionary();   // an empty strings file
+        const auto start = position_;
+        try {
+            auto value = this->value(0);
+            skip();
+            if (at_end()) return value;
+        } catch (const OpenStepError&) {
+        }
+        position_ = start;   // a strings file: dictionary entries to the end
+        auto result = dictionary();
+        entries(result, 0, false);
+        return result;
+    }
+
+private:
+    std::string text_;
+    std::size_t position_{};
+
+    static Plist dictionary() { Plist value; value.kind = Plist::Kind::dictionary; return value; }
+    bool at_end() const { return position_ >= text_.size(); }
+    char peek() const { return at_end() ? '\0' : text_[position_]; }
+    [[noreturn]] static void fail() { throw OpenStepError{}; }
+    void expect(char c) {
+        skip();
+        if (peek() != c) fail();
+        ++position_;
+    }
+    void skip() {
+        while (!at_end()) {
+            const auto c = text_[position_];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') { ++position_; continue; }
+            if (c == '/' && position_ + 1 < text_.size() && text_[position_ + 1] == '/') {
+                while (!at_end() && text_[position_] != '\n') ++position_;
+                continue;
+            }
+            if (c == '/' && position_ + 1 < text_.size() && text_[position_ + 1] == '*') {
+                const auto end = text_.find("*/", position_ + 2);
+                if (end == std::string::npos) fail();
+                position_ = end + 2;
+                continue;
+            }
+            break;
+        }
+    }
+    static bool unquoted(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '+' ||
+               c == '/' || c == ':' || c == '.' || c == '-';
+    }
+    static void append_utf8(std::string& out, char32_t code) {
+        if (code < 0x80) out += static_cast<char>(code);
+        else if (code < 0x800) { out += static_cast<char>(0xc0 | (code >> 6)); out += static_cast<char>(0x80 | (code & 0x3f)); }
+        else if (code < 0x10000) {
+            out += static_cast<char>(0xe0 | (code >> 12)); out += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
+            out += static_cast<char>(0x80 | (code & 0x3f));
+        } else {
+            out += static_cast<char>(0xf0 | (code >> 18)); out += static_cast<char>(0x80 | ((code >> 12) & 0x3f));
+            out += static_cast<char>(0x80 | ((code >> 6) & 0x3f)); out += static_cast<char>(0x80 | (code & 0x3f));
+        }
+    }
+    std::string string() {
+        skip();
+        std::string out;
+        if (peek() != '"' && peek() != '\'') {
+            while (!at_end() && unquoted(peek())) out += text_[position_++];
+            if (out.empty()) fail();
+            return out;
+        }
+        const char quote = text_[position_++];
+        char16_t pending_high{};
+        while (true) {
+            if (at_end()) fail();
+            const char c = text_[position_++];
+            if (c == quote) break;
+            if (c != '\\') {
+                if (pending_high) { append_utf8(out, 0xfffd); pending_high = 0; }
+                out += c;
+                continue;
+            }
+            if (at_end()) fail();
+            const char e = text_[position_++];
+            char32_t code{};
+            switch (e) {
+            case 'a': code = '\a'; break;
+            case 'b': code = '\b'; break;
+            case 'f': code = '\f'; break;
+            case 'n': code = '\n'; break;
+            case 'r': code = '\r'; break;
+            case 't': code = '\t'; break;
+            case 'v': code = '\v'; break;
+            case 'U': case 'u': {
+                char32_t unit{};
+                for (int digit = 0; digit < 4; ++digit) {
+                    if (at_end() || !std::isxdigit(static_cast<unsigned char>(peek()))) fail();
+                    const char h = text_[position_++];
+                    unit = unit * 16 + static_cast<char32_t>(h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
+                }
+                if (unit >= 0xd800 && unit < 0xdc00) { pending_high = static_cast<char16_t>(unit); continue; }
+                if (unit >= 0xdc00 && unit < 0xe000 && pending_high) {
+                    append_utf8(out, 0x10000 + ((static_cast<char32_t>(pending_high) - 0xd800) << 10) + (unit - 0xdc00));
+                    pending_high = 0;
+                    continue;
+                }
+                code = unit;
+                break;
+            }
+            default:
+                if (e >= '0' && e <= '7') {
+                    code = static_cast<char32_t>(e - '0');
+                    for (int digit = 1; digit < 3 && !at_end() && peek() >= '0' && peek() <= '7'; ++digit)
+                        code = code * 8 + static_cast<char32_t>(text_[position_++] - '0');
+                } else code = static_cast<unsigned char>(e);   // \" \' \\ and any other character as itself
+            }
+            if (pending_high) { append_utf8(out, 0xfffd); pending_high = 0; }
+            append_utf8(out, code);
+        }
+        if (pending_high) append_utf8(out, 0xfffd);
+        return out;
+    }
+    // Dictionary entries up to `close` ('}'), or to the end of the text when braceless.
+    void entries(Plist& result, int depth, bool braced) {
+        while (true) {
+            skip();
+            if (braced && peek() == '}') { ++position_; return; }
+            if (!braced && at_end()) return;
+            auto key = string();
+            skip();
+            Plist item;
+            if (peek() == '=') {
+                ++position_;
+                item = value(depth + 1);
+            } else {   // "key"; is "key" = "key";
+                item.kind = Plist::Kind::string;
+                item.text = key;
+            }
+            expect(';');
+            result.set(std::move(key), std::move(item));
+        }
+    }
+    Plist value(int depth) {
+        if (depth > 256) fail();
+        skip();
+        const char c = peek();
+        if (c == '{') {
+            ++position_;
+            auto result = dictionary();
+            entries(result, depth, true);
+            return result;
+        }
+        if (c == '(') {
+            ++position_;
+            Plist result;
+            result.kind = Plist::Kind::array;
+            skip();
+            if (peek() == ')') { ++position_; return result; }
+            while (true) {
+                result.items.push_back(value(depth + 1));
+                skip();
+                if (peek() == ',') {
+                    ++position_;
+                    skip();
+                    if (peek() == ')') { ++position_; return result; }
+                    continue;
+                }
+                if (peek() == ')') { ++position_; return result; }
+                fail();
+            }
+        }
+        if (c == '<') {
+            ++position_;
+            Plist result;
+            result.kind = Plist::Kind::data;
+            int pending = -1;
+            while (true) {
+                skip();
+                if (at_end()) fail();
+                const char h = text_[position_++];
+                if (h == '>') break;
+                if (!std::isxdigit(static_cast<unsigned char>(h))) fail();
+                const int digit = h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10;
+                if (pending < 0) pending = digit;
+                else { result.bytes.push_back(static_cast<std::uint8_t>(pending * 16 + digit)); pending = -1; }
+            }
+            if (pending >= 0) fail();
+            return result;
+        }
+        Plist result;
+        result.kind = Plist::Kind::string;
+        result.text = string();
+        return result;
+    }
+};
+
+// The text of OpenStep bytes as UTF-8: UTF-16 with a byte-order mark, else UTF-8 (a UTF-8 mark is dropped).
+std::optional<std::string> openstep_text(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() >= 2 && ((bytes[0] == 0xff && bytes[1] == 0xfe) || (bytes[0] == 0xfe && bytes[1] == 0xff))) {
+        const bool little = bytes[0] == 0xff;
+        std::string out;
+        char16_t high{};
+        for (std::size_t at = 2; at + 1 < bytes.size(); at += 2) {
+            const char16_t unit = little ? static_cast<char16_t>(bytes[at] | (bytes[at + 1] << 8)) : static_cast<char16_t>((bytes[at] << 8) | bytes[at + 1]);
+            char32_t code = unit;
+            if (unit >= 0xd800 && unit < 0xdc00) { high = unit; continue; }
+            if (unit >= 0xdc00 && unit < 0xe000) {
+                if (!high) return std::nullopt;
+                code = 0x10000 + ((static_cast<char32_t>(high) - 0xd800) << 10) + (unit - 0xdc00);
+                high = 0;
+            } else if (high) return std::nullopt;
+            if (code < 0x80) out += static_cast<char>(code);
+            else if (code < 0x800) { out += static_cast<char>(0xc0 | (code >> 6)); out += static_cast<char>(0x80 | (code & 0x3f)); }
+            else if (code < 0x10000) {
+                out += static_cast<char>(0xe0 | (code >> 12)); out += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
+                out += static_cast<char>(0x80 | (code & 0x3f));
+            } else {
+                out += static_cast<char>(0xf0 | (code >> 18)); out += static_cast<char>(0x80 | ((code >> 12) & 0x3f));
+                out += static_cast<char>(0x80 | ((code >> 6) & 0x3f)); out += static_cast<char>(0x80 | (code & 0x3f));
+            }
+        }
+        return out;
+    }
+    std::size_t start = bytes.size() >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf ? 3 : 0;
+    return std::string(reinterpret_cast<const char*>(bytes.data()) + start, bytes.size() - start);
+}
+
 } // namespace
 
 std::string plist_to_xml(const Plist& value) {
@@ -589,6 +837,19 @@ std::optional<Plist> plist_parse(std::span<const std::uint8_t> bytes, std::uint6
             if (format) *format = plist_binary_format;
             return value;
         }
+        // XML starts with "<?", "<!" or "<plist" after any whitespace; other text is OpenStep.
+        std::size_t first = 0;
+        if (bytes.size() >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf) first = 3;
+        while (first < bytes.size() && (bytes[first] == ' ' || bytes[first] == '\t' || bytes[first] == '\r' || bytes[first] == '\n')) ++first;
+        const bool utf16 = bytes.size() >= 2 && ((bytes[0] == 0xff && bytes[1] == 0xfe) || (bytes[0] == 0xfe && bytes[1] == 0xff));
+        const bool xml = !utf16 && first + 1 < bytes.size() && bytes[first] == '<' && (bytes[first + 1] == '?' || bytes[first + 1] == '!' || bytes[first + 1] == 'p');
+        if (!xml) {
+            const auto text = openstep_text(bytes);
+            if (!text) return std::nullopt;
+            auto value = OpenStepReader(*text).top();
+            if (format) *format = plist_openstep_format;
+            return value;
+        }
         XmlReader reader(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
         auto root = reader.tag();
         if (root.name != "plist" || root.closing) return std::nullopt;
@@ -598,6 +859,8 @@ std::optional<Plist> plist_parse(std::span<const std::uint8_t> bytes, std::uint6
     } catch (const XmlError&) {
         return std::nullopt;
     } catch (const BinaryError&) {
+        return std::nullopt;
+    } catch (const OpenStepError&) {
         return std::nullopt;
     }
 }

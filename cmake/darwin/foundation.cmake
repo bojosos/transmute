@@ -100,6 +100,8 @@ function(alchemy_darwin_foundation_tests)
     alchemy_gui_add_unit_test(alchemy_gui_foundation_streams src/alchemy/darwin/foundation/tests/streams_tests.cpp TIMEOUT 120)
     # NSURLComponents, the CFURL additions and NSURL's file-URL additions.
     alchemy_gui_add_unit_test(alchemy_gui_foundation_urls src/alchemy/darwin/foundation/tests/urls_tests.cpp TIMEOUT 120)
+    # NSBundle localizations, .strings tables, localized resources, binary and OpenStep property lists, CFBundle.
+    alchemy_gui_add_unit_test(alchemy_gui_foundation_bundles src/alchemy/darwin/foundation/tests/bundles_tests.cpp TIMEOUT 120)
     # Core-class additions: strings_more, collections_more, foundation_more, plist streams, NSUserDefaults volatile domains.
     alchemy_gui_add_unit_test(alchemy_gui_foundation_core_classes src/alchemy/darwin/foundation/tests/core_classes_tests.cpp TIMEOUT 120)
     if(NOT ALCHEMY_GUI_FIXTURES_ENABLED)
@@ -149,6 +151,35 @@ function(alchemy_darwin_foundation_tests)
     add_dependencies(alchemy_gui_foundation_time_fixtures alchemy_personality_fixtures)
     alchemy_gui_add_fixture_test(alchemy_gui_foundation_cf_time_fixture "${macos_dir}/cf_time_fixture"
         PROGRESS "Alchemy CF time fixture: launched" COMPLETE "Alchemy CF time fixture: complete")
+    # Loading a bundle's executable: AlchemyPlugin.bundle (an MH_BUNDLE with a function and a data symbol) is
+    # preflighted, loaded, used and unloaded through CFBundle by a guest program given its guest path.
+    set(plugin_bundle "${macos_dir}/AlchemyPlugin.bundle")
+    alchemy_gui_object(bundle_plugin ../../../src/alchemy/darwin/foundation/tests/bundle_plugin.c)
+    alchemy_gui_object(bundle_fixture ../../../src/alchemy/darwin/foundation/tests/bundle_fixture.c)
+    alchemy_gui_object(bundle_link ../../../src/alchemy/darwin/foundation/tests/bundle_link.c)
+    add_custom_command(OUTPUT "${plugin_bundle}/Contents/MacOS/AlchemyPlugin" "${plugin_bundle}/Contents/Info.plist"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${plugin_bundle}/Contents/MacOS"
+        COMMAND "${CMAKE_COMMAND}" -E copy "${PROJECT_SOURCE_DIR}/src/alchemy/darwin/foundation/tests/bundle_plugin_info.plist"
+            "${plugin_bundle}/Contents/Info.plist"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -bundle "${macos_dir}/bundle_plugin.o" -o "${plugin_bundle}/Contents/MacOS/AlchemyPlugin"
+        DEPENDS "${macos_dir}/bundle_plugin.o" "${PROJECT_SOURCE_DIR}/src/alchemy/darwin/foundation/tests/bundle_plugin_info.plist" VERBATIM)
+    add_custom_command(OUTPUT "${macos_dir}/bundle_link.dylib"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -dylib -install_name ${cf_install_name}
+            "${macos_dir}/bundle_link.o" -o "${macos_dir}/bundle_link.dylib"
+        DEPENDS "${macos_dir}/bundle_link.o" VERBATIM)
+    add_custom_command(OUTPUT "${macos_dir}/bundle_fixture"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main "${macos_dir}/bundle_fixture.o"
+            "${macos_dir}/bundle_link.dylib" "${macos_dir}/link_system.dylib" -o "${macos_dir}/bundle_fixture"
+        DEPENDS "${macos_dir}/bundle_fixture.o" "${macos_dir}/bundle_link.dylib" "${macos_dir}/link_system.dylib" VERBATIM)
+    add_custom_target(alchemy_gui_foundation_bundle_fixtures ALL
+        DEPENDS "${macos_dir}/bundle_fixture" "${plugin_bundle}/Contents/MacOS/AlchemyPlugin" "${plugin_bundle}/Contents/Info.plist")
+    add_dependencies(alchemy_gui_foundation_bundle_fixtures alchemy_personality_fixtures)
+    string(SUBSTRING "${plugin_bundle}" 0 1 plugin_drive)
+    string(TOUPPER "${plugin_drive}" plugin_drive)
+    string(SUBSTRING "${plugin_bundle}" 2 -1 plugin_rest)
+    alchemy_gui_add_fixture_test(alchemy_gui_foundation_bundle_fixture "${macos_dir}/bundle_fixture"
+        PROGRESS "Alchemy bundle fixture: launched" COMPLETE "Alchemy bundle fixture: complete"
+        ARGS "/Volumes/${plugin_drive}${plugin_rest}")
 endfunction()
 alchemy_gui_register_tests(alchemy_darwin_foundation_tests)
 

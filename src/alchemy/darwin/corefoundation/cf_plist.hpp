@@ -2,7 +2,8 @@
 
 // Property lists for the export-fill providers: a host model
 // with XML (DTD "-//Apple//DTD PLIST 1.0//EN") and binary ("bplist00")
-// encodings, and conversion to and from guest CoreFoundation objects.
+// encodings, OpenStep text read only (.strings files), and conversion to and
+// from guest CoreFoundation objects.
 
 #include "alchemy/core_foundation.hpp"
 #include "alchemy/process_context.hpp"
@@ -36,13 +37,13 @@ struct Plist {
     bool erase(std::string_view key);
 };
 
-// kCFPropertyListXMLFormat_v1_0 / kCFPropertyListBinaryFormat_v1_0.
-inline constexpr std::uint64_t plist_xml_format = 100, plist_binary_format = 200;
+// kCFPropertyListOpenStepFormat (read only) / kCFPropertyListXMLFormat_v1_0 / kCFPropertyListBinaryFormat_v1_0.
+inline constexpr std::uint64_t plist_openstep_format = 1, plist_xml_format = 100, plist_binary_format = 200;
 
 [[nodiscard]] std::string plist_to_xml(const Plist& value);
 [[nodiscard]] std::vector<std::uint8_t> plist_to_binary(const Plist& value);
-// Parses either encoding; std::nullopt for malformed input. `format` receives
-// plist_xml_format or plist_binary_format.
+// Parses any of the three (OpenStep text includes the braceless strings-file
+// form); std::nullopt for malformed input. `format` receives the format read.
 [[nodiscard]] std::optional<Plist> plist_parse(std::span<const std::uint8_t> bytes, std::uint64_t* format = nullptr);
 
 // Guest objects. from_guest fails (runtime_error) for objects that are not

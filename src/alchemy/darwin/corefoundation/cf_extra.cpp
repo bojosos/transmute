@@ -271,6 +271,165 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         std::error_code error;
         s.x[0] = cf.file_url(guest, std::filesystem::is_directory(host_path(process, guest), error));
     });
+    // ---- the rest of CFBundle over NSBundle (localizations, resources, the executable) ----
+    const auto bundle_for_url = [&process, &cf, bundle_class, send](std::uint64_t url) -> std::uint64_t {   // +0
+        if (!url) return 0;
+        const auto path = cf.string(cf.url_path(url));
+        const auto bundle = send(bundle_class(), "bundleWithPath:", {path});
+        process.objects().release(path);
+        return bundle;
+    };
+    // CFArrayRef CFBundleGetAllBundles(void): the bundles the process knows (kept until the next call).
+    auto all_bundles = std::make_shared<std::pair<std::mutex, std::uint64_t>>();
+    function(cf_library, "_CFBundleGetAllBundles", [&process, &cf, bundle_class, send, all_bundles](CpuState& s, GuestMemory&) {
+        std::vector<std::uint64_t> values;
+        for (const auto* selector : {"allBundles", "allFrameworks"})
+            if (const auto list = send(bundle_class(), selector))
+                for (const auto bundle : cf.array_values(list)) values.push_back(bundle);
+        const auto array = cf.array(values);
+        std::lock_guard lock(all_bundles->first);
+        if (all_bundles->second) process.objects().release(all_bundles->second);
+        all_bundles->second = array;
+        s.x[0] = array;
+    });
+    // CFArrayRef CFBundleCreateBundlesFromDirectory(alloc, CFURLRef directoryURL, CFStringRef bundleType):
+    // the bundles directly inside the directory whose extension is bundleType (any extension when NULL).
+    function(cf_library, "_CFBundleCreateBundlesFromDirectory", [&process, &cf, bundle_class, send](CpuState& s, GuestMemory&) {
+        if (s.x[0]) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+        std::vector<std::uint64_t> values;
+        const auto directory = s.x[1] ? cf.url_path(s.x[1]) : std::string{};
+        const auto type = s.x[2] ? cf.utf8(s.x[2]) : std::string{};
+        std::error_code error;
+        if (!directory.empty())
+            for (std::filesystem::directory_iterator entry(host_path(process, directory), error), end; !error && entry != end; entry.increment(error)) {
+                if (!entry->is_directory(error)) continue;
+                const auto name8 = entry->path().filename().u8string();
+                const std::string name(reinterpret_cast<const char*>(name8.data()), name8.size());
+                const auto dot = name.rfind('.');
+                if (dot == std::string::npos || dot == 0 || (!type.empty() && name.substr(dot + 1) != type)) continue;
+                const auto path = cf.string(directory + "/" + name);
+                if (const auto bundle = send(bundle_class(), "bundleWithPath:", {path})) values.push_back(bundle);
+                process.objects().release(path);
+            }
+        s.x[0] = cf.array(values);
+    });
+    function(cf_library, "_CFBundleCopySharedFrameworksURL", [send, retained](CpuState& s, GuestMemory&) { s.x[0] = retained(send(s.x[0], "sharedFrameworksURL")); });
+    function(cf_library, "_CFBundleCopySharedSupportURL", [send, retained](CpuState& s, GuestMemory&) { s.x[0] = retained(send(s.x[0], "sharedSupportURL")); });
+    // CFURLRef CFBundleCopyAuxiliaryExecutableURL(CFBundleRef, CFStringRef executableName)
+    function(cf_library, "_CFBundleCopyAuxiliaryExecutableURL", [send, retained](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[1] ? retained(send(s.x[0], "URLForAuxiliaryExecutable:", {s.x[1]})) : 0;
+    });
+    // CFArrayRef CFBundleCopyResourceURLsOfType(CFBundleRef, CFStringRef resourceType, CFStringRef subDirName)
+    function(cf_library, "_CFBundleCopyResourceURLsOfType", [send, retained](CpuState& s, GuestMemory&) {
+        s.x[0] = retained(send(s.x[0], "URLsForResourcesWithExtension:subdirectory:", {s.x[1], s.x[2]}));
+    });
+    // CFURLRef CFBundleCopyResourceURLForLocalization(CFBundleRef, name, type, subDir, CFStringRef localizationName)
+    function(cf_library, "_CFBundleCopyResourceURLForLocalization", [send, retained](CpuState& s, GuestMemory&) {
+        s.x[0] = retained(send(s.x[0], "URLForResource:withExtension:subdirectory:localization:", {s.x[1], s.x[2], s.x[3], s.x[4]}));
+    });
+    // CFURLRef CFBundleCopyResourceURLInDirectory(CFURLRef bundleURL, name, type, subDir)
+    function(cf_library, "_CFBundleCopyResourceURLInDirectory", [send, retained, bundle_for_url](CpuState& s, GuestMemory&) {
+        const auto bundle = bundle_for_url(s.x[0]);
+        s.x[0] = bundle ? retained(send(bundle, "URLForResource:withExtension:subdirectory:", {s.x[1], s.x[2], s.x[3]})) : 0;
+    });
+    // CFArrayRef CFBundleCopyResourceURLsOfTypeInDirectory(CFURLRef bundleURL, type, subDir)
+    function(cf_library, "_CFBundleCopyResourceURLsOfTypeInDirectory", [send, retained, bundle_for_url](CpuState& s, GuestMemory&) {
+        const auto bundle = bundle_for_url(s.x[0]);
+        s.x[0] = bundle ? retained(send(bundle, "URLsForResourcesWithExtension:subdirectory:", {s.x[1], s.x[2]})) : 0;
+    });
+    // CFStringRef CFBundleCopyLocalizedString(CFBundleRef, CFStringRef key, CFStringRef value, CFStringRef tableName)
+    function(cf_library, "_CFBundleCopyLocalizedString", [send, retained](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[0] ? retained(send(s.x[0], "localizedStringForKey:value:table:", {s.x[1], s.x[2], s.x[3]})) : 0;
+    });
+    function(cf_library, "_CFBundleCopyBundleLocalizations", [send, retained](CpuState& s, GuestMemory&) { s.x[0] = retained(send(s.x[0], "localizations")); });
+    // CFArrayRef CFBundleCopyPreferredLocalizationsFromArray(CFArrayRef locArray)
+    function(cf_library, "_CFBundleCopyPreferredLocalizationsFromArray", [bundle_class, send, retained](CpuState& s, GuestMemory&) {
+        s.x[0] = retained(send(bundle_class(), "preferredLocalizationsFromArray:", {s.x[0]}));
+    });
+    // CFArrayRef CFBundleCopyLocalizationsForPreferences(CFArrayRef locArray, CFArrayRef prefArray)
+    function(cf_library, "_CFBundleCopyLocalizationsForPreferences", [bundle_class, send, retained](CpuState& s, GuestMemory&) {
+        s.x[0] = retained(send(bundle_class(), "preferredLocalizationsFromArray:forPreferences:", {s.x[0], s.x[1]}));
+    });
+    // CFStringRef CFBundleGetDevelopmentRegion(CFBundleRef): the Info.plist's value (not retained).
+    const auto english = cf.constant_string("en");
+    function(cf_library, "_CFBundleGetDevelopmentRegion", [&cf, send, english](CpuState& s, GuestMemory&) {
+        const auto region = s.x[0] ? send(s.x[0], "objectForInfoDictionaryKey:", {cf.constant_string("CFBundleDevelopmentRegion")}) : 0;
+        s.x[0] = region ? region : english;
+    });
+    // CFDictionaryRef CFBundleGetLocalInfoDictionary(CFBundleRef): the preferred localization's InfoPlist.strings.
+    function(cf_library, "_CFBundleGetLocalInfoDictionary", [send](CpuState& s, GuestMemory&) { s.x[0] = s.x[0] ? send(s.x[0], "_alchemyLocalInfoDictionary") : 0; });
+    function(cf_library, "_CFBundleIsExecutableLoaded", [send](CpuState& s, GuestMemory&) { s.x[0] = s.x[0] ? send(s.x[0], "isLoaded") & 0xff : 0; });
+    function(cf_library, "_CFBundleLoadExecutable", [send](CpuState& s, GuestMemory&) { s.x[0] = s.x[0] ? send(s.x[0], "load") & 0xff : 0; });
+    // Boolean CFBundleLoadExecutableAndReturnError(CFBundleRef, CFErrorRef*): the NSError is the CFError (+1 to the caller).
+    function(cf_library, "_CFBundleLoadExecutableAndReturnError", [&process, send](CpuState& s, GuestMemory& m) {
+        if (s.x[1]) m.write64(s.x[1], 0);
+        const auto slot = process.allocate_guest(8);
+        m.write64(slot, 0);
+        const auto loaded = s.x[0] ? send(s.x[0], "loadAndReturnError:", {slot}) & 0xff : 0;
+        const auto error = m.read64(slot);
+        process.release_guest(slot);
+        if (!loaded && error && s.x[1]) m.write64(s.x[1], process.objects().retain(error));
+        s.x[0] = loaded;
+    });
+    function(cf_library, "_CFBundlePreflightExecutable", [&process, send](CpuState& s, GuestMemory& m) {
+        if (s.x[1]) m.write64(s.x[1], 0);
+        const auto slot = process.allocate_guest(8);
+        m.write64(slot, 0);
+        const auto ready = s.x[0] ? send(s.x[0], "preflightAndReturnError:", {slot}) & 0xff : 0;
+        const auto error = m.read64(slot);
+        process.release_guest(slot);
+        if (!ready && error && s.x[1]) m.write64(s.x[1], process.objects().retain(error));
+        s.x[0] = ready;
+    });
+    function(cf_library, "_CFBundleUnloadExecutable", [send](CpuState& s, GuestMemory&) { if (s.x[0]) static_cast<void>(send(s.x[0], "unload")); s.x[0] = 0; });
+    function(cf_library, "_CFBundleCopyExecutableArchitectures", [send, retained](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[0] ? retained(send(s.x[0], "executableArchitectures")) : 0;
+    });
+    // Symbols of the bundle's executable (loaded on demand): dlsym(3) through a RTLD_NOLOAD handle; the main
+    // bundle's are the process's (dlopen(NULL)).
+    const auto symbol_of = [&process, &cf, bundle_class, send](std::uint64_t bundle, std::uint64_t name) -> std::uint64_t {
+        if (!bundle || !name) return 0;
+        constexpr std::string_view libsystem = "/usr/lib/libSystem.B.dylib";
+        const auto call = [&process](std::string_view library, std::string_view symbol, std::initializer_list<std::uint64_t> arguments) -> std::uint64_t {
+            const auto found = process.resolve(library, symbol);
+            if (!found) throw std::runtime_error("Alchemy CFBundle: missing " + std::string(symbol));
+            return process.calling_engine().invoke_callback(found->address, std::span(arguments.begin(), arguments.size()));
+        };
+        const auto c_string = [&process](std::string_view text) {
+            const auto address = process.allocate_guest(text.size() + 1, 1);
+            transmute::GuestMemory& memory = process.calling_engine();
+            memory.write_bytes(address, std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+            memory.write8(address + text.size(), 0);
+            return address;
+        };
+        std::uint64_t handle{};
+        if (bundle == send(bundle_class(), "mainBundle")) handle = call(libsystem, "_dlopen", {0, 1});
+        else {
+            if (!(send(bundle, "load") & 0xff)) return 0;
+            const auto path = send(bundle, "executablePath");
+            if (!path) return 0;
+            const auto text = c_string(cf.utf8(path));
+            handle = call(libsystem, "_dlopen", {text, 1 | 0x10});   // RTLD_LAZY | RTLD_NOLOAD: the loaded image
+            process.release_guest(text);
+        }
+        if (!handle) return 0;
+        const auto symbol = c_string(cf.utf8(name));
+        const auto address = call(libsystem, "_dlsym", {handle, symbol});
+        process.release_guest(symbol);
+        static_cast<void>(call(libsystem, "_dlclose", {handle}));
+        return address;
+    };
+    // void* CFBundleGetDataPointerForName(CFBundleRef, CFStringRef symbolName)
+    function(cf_library, "_CFBundleGetDataPointerForName", [symbol_of](CpuState& s, GuestMemory&) { s.x[0] = symbol_of(s.x[0], s.x[1]); });
+    // void CFBundleGetFunctionPointersForNames / GetDataPointersForNames(CFBundleRef, CFArrayRef names, void* pointers[])
+    for (const auto* name : {"_CFBundleGetFunctionPointersForNames", "_CFBundleGetDataPointersForNames"})
+        function(cf_library, name, [&cf, symbol_of](CpuState& s, GuestMemory& m) {
+            if (s.x[1] && s.x[2]) {
+                const auto names = cf.array_values(s.x[1]);
+                for (std::size_t index = 0; index < names.size(); ++index) m.write64(s.x[2] + index * 8, symbol_of(s.x[0], names[index]));
+            }
+            s.x[0] = 0;
+        });
     // CFDictionaryRef CFBundleCopyInfoDictionaryForURL(CFURLRef): the Info.plist of the bundle at the URL.
     function(cf_library, "_CFBundleCopyInfoDictionaryForURL", [&process, &objc, &cf, bundle_class, send, retained](CpuState& s, GuestMemory&) {
         if (!s.x[0]) { s.x[0] = 0; return; }

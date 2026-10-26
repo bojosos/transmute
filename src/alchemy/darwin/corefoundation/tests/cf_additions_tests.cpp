@@ -115,6 +115,9 @@ void test_guest_cf_extra(Fixture& f) {
                     "<key>CFBundlePackageType</key><string>APPL</string></dict></plist>\n";
             std::ofstream resource(root / "Contents" / "Resources" / "sub" / "data.json", std::ios::binary);
             resource << "{}";
+            // CFBundleCopyExecutableURL finds an executable that exists.
+            std::filesystem::create_directories(root / "Contents" / "MacOS");
+            std::ofstream(root / "Contents" / "MacOS" / "tool", std::ios::binary) << "tool";
         }
         const auto url = f.cf.file_url(alchemy::guest_path_string(root), true);
         const auto bundle = f.call(cf, "_CFBundleCreate", {0, url});

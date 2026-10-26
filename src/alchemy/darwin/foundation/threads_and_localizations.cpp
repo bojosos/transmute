@@ -7,9 +7,9 @@
 #include <mutex>
 
 // Foundation: NSFileTypeForHFSTypeCode, NSThread main-thread queries (one
-// NSThread object per host thread), NSBundle localizations (the development
-// localization only), and the NSMutableString and NSUserNotification(Center)
-// class shells. -executableURL is value_classes.cpp's.
+// NSThread object per host thread), +[NSBundle bundleForClass:], and the
+// NSMutableString and NSUserNotification(Center) class shells. NSBundle's
+// localizations are foundation_extra.cpp's, -executableURL value_classes.cpp's.
 // Qt 6.5's bind-time surface first needed them (moved from
 // darwin/identities/qt_imports.cpp); installed by the support kit
 // (kit/support/install.cpp) at the old position, only when missing.
@@ -76,24 +76,8 @@ void install_foundation_threads_and_localizations(Support& support) {
         }, "v@:@");
     }
 
-    // ---- NSBundle localizations (-executableURL is darwin/foundation/value_classes.cpp's) ----
+    // ---- NSBundle (localizations are foundation_extra.cpp's; -executableURL is value_classes.cpp's) ----
     if (const auto bundle = support.objc.find_class("NSBundle")) {
-        // Localizations: bundles carry the development localization only ("en").
-        const auto english = [s] {
-            const auto text = s->cf.string("en");
-            const std::array<Address, 1> values{text};
-            const auto array = s->cf.array(values);
-            s->release(text);
-            return s->send(array, "autorelease").x0;
-        };
-        for (const auto* name : {"localizations", "preferredLocalizations"})
-            support.method(bundle, name, [english](CpuState& c, GuestMemory&) { c.x[0] = english(); }, "@@:");
-        support.method(bundle, "developmentLocalization", [s](CpuState& c, GuestMemory&) {
-            c.x[0] = s->send(s->cf.string("en"), "autorelease").x0;
-        }, "@@:");
-        support.method(bundle, "preferredLocalizationsFromArray:", [s, english](CpuState& c, GuestMemory&) {
-            c.x[0] = c.x[2] && s->cf.length(c.x[2]) ? s->send(s->cf.array(std::array<Address, 1>{s->cf.element(c.x[2], 0)}), "autorelease").x0 : english();
-        }, "@@:@", true);
         // +bundleForClass: answers the main bundle (images are not bundles of
         // their own here; Qt only reads identifiers and paths from it).
         if (!support.objc.responds(bundle, support.objc.selector("bundleForClass:")))

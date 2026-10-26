@@ -11,7 +11,8 @@
 target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/corefoundation/object_store.cpp
     src/alchemy/darwin/corefoundation/core_foundation.cpp
-    src/alchemy/darwin/corefoundation/cf_encodings.cpp)
+    src/alchemy/darwin/corefoundation/cf_encodings.cpp
+    src/alchemy/darwin/corefoundation/cf_plist.cpp)   # also the headless NSBundle's Info.plist and .strings
 # Headless shells (darwin/foundation/headless_shells.hpp): alchemy.exe only; the
 # _fx twins in the GUI set below are empty, because there cf_preferences.cpp
 # and cf_locale.cpp own the names.
@@ -27,7 +28,6 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/corefoundation/cf_urls.cpp
     src/alchemy/darwin/corefoundation/cf_extra.cpp
     src/alchemy/darwin/corefoundation/cf_system.cpp
-    src/alchemy/darwin/corefoundation/cf_plist.cpp
     src/alchemy/darwin/corefoundation/cf_preferences.cpp
     src/alchemy/darwin/corefoundation/cf_locale.cpp
     src/alchemy/darwin/corefoundation/cf_file_descriptors.cpp

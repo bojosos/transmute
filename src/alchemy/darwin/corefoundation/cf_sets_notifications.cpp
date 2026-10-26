@@ -378,23 +378,10 @@ void CoreFoundationGaps::install_misc() {
         static_cast<void>(call(core_foundation, "_CFBundleGetPackageInfoInDirectory", {url, s.x[1], s.x[2]}));
         release(url);
     });
-    // CFBundleGetFunctionPointerForName(bundle, name): dlsym in the bundle's executable (loading it if needed).
+    // CFBundleGetFunctionPointerForName(bundle, name): dlsym in the bundle's executable, loading it if needed
+    // (the same lookup as CFBundleGetDataPointerForName, cf_extra.cpp).
     raw(core_foundation, "_CFBundleGetFunctionPointerForName", [this](CpuState& s, GuestMemory&) {
-        if (!s.x[0] || !s.x[1]) { s.x[0] = 0; return; }
-        const auto name = cf.utf8(s.x[1]);
-        Address handle{};
-        if (s.x[0] == call(core_foundation, "_CFBundleGetMainBundle", {})) {
-            handle = call(libsystem, "_dlopen", {0, 1});
-        } else {
-            const auto url = call(core_foundation, "_CFBundleCopyExecutableURL", {s.x[0]});
-            if (!url) { s.x[0] = 0; return; }
-            const auto path = cf.url_path(url);
-            release(url);
-            const auto text = cstring(path);
-            handle = call(libsystem, "_dlopen", {text, 1});
-        }
-        if (!handle) { s.x[0] = 0; return; }
-        s.x[0] = call(libsystem, "_dlsym", {handle, cstring(name)});
+        s.x[0] = s.x[0] && s.x[1] ? call(core_foundation, "_CFBundleGetDataPointerForName", {s.x[0], s.x[1]}) : 0;
     });
     // CFMachPort: the only Mach-port objects are CGEvent taps (support kit);
     // invalidating one disables it.
