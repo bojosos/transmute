@@ -273,10 +273,14 @@ void AppKit::display_window(Address target, bool force) {
     const auto content = state->content_view;
     if (!content) { state->needs_display = false; return; }
     if (draw_depth) return;   // -display from inside -drawRect: draws nothing new
+    // The content view's tree, then the top strip's (toolbar, tab bar: window_tabs.cpp).
+    std::vector<Address> roots{content};
+    for (const auto strip_view : top_strip_views(target)) roots.push_back(strip_view);
     if (!window_uses_backing(target)) {
         bool pending = force || std::exchange(state->needs_display, false);
-        for (const auto value : all_views(content)) pending = pending || view_state(value)->needs_display;
-        if (pending) display_view(content);
+        for (const auto root : roots)
+            for (const auto value : all_views(root)) pending = pending || view_state(value)->needs_display;
+        if (pending) for (const auto root : roots) display_view(root);
         return;
     }
     if (!state->id || !state->visible || state->closed) return;   // dirty state waits for the window to show
@@ -284,7 +288,8 @@ void AppKit::display_window(Address target, bool force) {
     const Rect whole{{0, 0}, backing->points};
     auto dirty = state->dirty;
     if (force || state->needs_display) dirty = whole;
-    for (const auto value : all_views(content)) {
+    for (const auto root : roots)
+    for (const auto value : all_views(root)) {
         const auto info = view_state(value);
         if (!info->needs_display) continue;
         const auto area = rect_is_empty(info->dirty) ? view_bounds(*info) : info->dirty;
@@ -344,7 +349,7 @@ void AppKit::display_window(Address target, bool force) {
         const auto children = info->subviews;
         for (const auto child : children) draw_tree(child, visible);
     };
-    draw_tree(content, dirty);
+    for (const auto root : roots) draw_tree(root, dirty);
     present_window(target, dirty);
 }
 

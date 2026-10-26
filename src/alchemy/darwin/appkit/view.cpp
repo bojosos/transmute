@@ -267,6 +267,9 @@ Address AppKit::hit_test(Address target, Point location) {
     if (!content) return 0;
     CallRegs registers;
     put_point(registers, 0, location);   // the content view's superview space is the window base
+    // The top strip (toolbar, tab bar) lies above the content view, in the same space.
+    for (const auto strip_view : top_strip_views(target))
+        if (const auto hit = send(strip_view, "hitTest:", registers).x0) return hit;
     return send(content, "hitTest:", registers).x0;
 }
 

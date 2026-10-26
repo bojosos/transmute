@@ -399,6 +399,7 @@ void AppKit::install() {
     install_containers();
     install_container_coding();
     install_panels();
+    install_window_tabs();   // NSWindow toolbars and tabs (after NSToolbar)
     install_hitoolbox();
     install_controllers();
     install_documents();

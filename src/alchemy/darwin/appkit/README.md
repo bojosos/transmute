@@ -35,9 +35,22 @@ colour spaces other than gray, RGB and CMYK.
 **Unavailable, as documented:** remote notifications (no Apple Push
 Notification service: -registerForRemoteNotifications fails through the
 delegate with an NSCocoaErrorDomain error), and Finder tags in save panels
-(-tagNames are the ones the application set). Window toolbars are not shown,
-so -[NSToolbarItem isVisible] is NO; restorable state is encoded and restored
-on request but not kept between launches.
+(-tagNames are the ones the application set); restorable state is encoded
+and restored on request but not kept between launches.
+
+**Toolbars and tabs (`window_tabs.cpp`):** a window's toolbar with items
+and its tab bar show in a strip between the title bar and the content view
+(the window grows below its top edge; empty, title-bar styling toolbars take
+no space). Toolbar items are clicked, validated by -update and laid out by
+kind; the size mode, style and centred items are kept, not drawn, and a
+toolbar with items over a full-size content view stops explicitly. Window
+tabs are real NSWindowTabGroups: tabs share a frame, the selected one is on
+screen, the tab bar selects and closes tabs and offers -newWindowForTab:;
+preferred tabbing joins windows with the same identifier, automatic tabbing
+does not (Windows has no tab preference), and the tab overview and the
+toolbar customization palette stop explicitly. -performWindowDragWithEvent:
+runs the window server's move loop; NSWindowSharingNone keeps a window out
+of screen capture.
 
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each

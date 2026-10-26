@@ -285,6 +285,7 @@ void AppKit::install_panels() {
         const std::pair<Address, Address> entry{auto_string("item"), item};
         const auto user_info = cf.dictionary(std::span(&entry, 1));
         post("NSToolbarWillAddItemNotification", self, state->delegate, "toolbarWillAddItem:", autorelease(user_info));
+        toolbar_changed(self);
     }, "v@:@q");
     method(toolbar, "removeItemAtIndex:", [this, tb, ti](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
@@ -297,11 +298,12 @@ void AppKit::install_panels() {
         const auto user_info = cf.dictionary(std::span(&entry, 1));
         post("NSToolbarDidRemoveItemNotification", self, state->delegate, "toolbarDidRemoveItem:", autorelease(user_info));
         release(item);
+        toolbar_changed(self);
     }, "v@:q");
     method(toolbar, "isVisible", [tb](CpuState& s, GuestMemory&) { return_bool(s, tb(s.x[0])->visible); }, "B@:");
-    method(toolbar, "setVisible:", [tb](CpuState& s, GuestMemory&) { tb(s.x[0])->visible = bool_arg(s, 2); }, "v@:B");
+    method(toolbar, "setVisible:", [this, tb](CpuState& s, GuestMemory&) { tb(s.x[0])->visible = bool_arg(s, 2); toolbar_changed(s.x[0]); }, "v@:B");
     method(toolbar, "displayMode", [tb](CpuState& s, GuestMemory&) { s.x[0] = tb(s.x[0])->display_mode; }, "Q@:");
-    method(toolbar, "setDisplayMode:", [tb](CpuState& s, GuestMemory&) { tb(s.x[0])->display_mode = s.x[2]; }, "v@:Q");
+    method(toolbar, "setDisplayMode:", [this, tb](CpuState& s, GuestMemory&) { tb(s.x[0])->display_mode = s.x[2]; toolbar_changed(s.x[0]); }, "v@:Q");
     method(toolbar, "sizeMode", [tb](CpuState& s, GuestMemory&) { s.x[0] = tb(s.x[0])->size_mode; }, "Q@:");
     method(toolbar, "setSizeMode:", [tb](CpuState& s, GuestMemory&) { tb(s.x[0])->size_mode = s.x[2]; }, "v@:Q");
     method(toolbar, "allowsUserCustomization", [tb](CpuState& s, GuestMemory&) { return_bool(s, tb(s.x[0])->customizable); }, "B@:");
@@ -378,8 +380,23 @@ void AppKit::install_panels() {
     method(toolbar_item, "setHidden:", [ti](CpuState& s, GuestMemory&) { ti(s.x[0])->hidden = bool_arg(s, 2); }, "v@:B");
     method(toolbar_item, "style", [ti](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(ti(s.x[0])->style); }, "q@:");
     method(toolbar_item, "setStyle:", [ti](CpuState& s, GuestMemory&) { ti(s.x[0])->style = static_cast<std::int64_t>(s.x[2]); }, "v@:q");
-    // Window toolbars are not shown, so no item is visible in one.
-    method(toolbar_item, "isVisible", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // An item is visible in a window whose toolbar shows (window_tabs.cpp).
+    method(toolbar_item, "isVisible", [this, ti](CpuState& s, GuestMemory&) {
+        const auto state = ti(s.x[0]);
+        bool shown{};
+        if (state->toolbar && !state->hidden) {
+            std::vector<Address> windows_now;
+            {
+                std::lock_guard lock(mutex);
+                windows_now = window_order;
+            }
+            for (const auto value : windows_now) {
+                const auto info = window_state(value);
+                if (info->toolbar == state->toolbar && info->visible && info->toolbar_view && !view_state(info->toolbar_view)->hidden) shown = true;
+            }
+        }
+        return_bool(s, shown);
+    }, "B@:");
     method(toolbar_item, "target", [ti](CpuState& s, GuestMemory&) { s.x[0] = ti(s.x[0])->target; });
     method(toolbar_item, "setTarget:", [ti](CpuState& s, GuestMemory&) { ti(s.x[0])->target = s.x[2]; }, "v@:@");
     method(toolbar_item, "action", [ti](CpuState& s, GuestMemory&) { s.x[0] = ti(s.x[0])->action; }, ":@:");
@@ -404,12 +421,7 @@ void AppKit::install_panels() {
         const auto receiver = target_for_action(state->action, state->target);
         if (receiver && responds(receiver, "validateToolbarItem:")) state->enabled = send_bool(receiver, "validateToolbarItem:", {s.x[0]});
     }, "v@:");
-    // Windows do not show toolbars (no toolbar area above the content).
-    method(window, "toolbar", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
-    method(window, "setToolbar:", [](CpuState& s, GuestMemory&) {
-        if (s.x[2]) unsupported("-[NSWindow setToolbar:] (window toolbars are not shown)");
-    }, "v@:@");
-    method(window, "toggleToolbarShown:", [](CpuState&, GuestMemory&) { unsupported("-[NSWindow toggleToolbarShown:] (window toolbars)"); }, "v@:@");
+    // NSWindow's toolbar methods: window_tabs.cpp.
 
     // ---- NSSavePanel / NSOpenPanel ----
     save_panel = declare_class("NSSavePanel", "NSPanel");

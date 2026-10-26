@@ -78,7 +78,7 @@ Address AppKit::window_for_id(WindowId id) {
 }
 Rect AppKit::content_rect(Address target) {
     const auto state = window_state(target);
-    if (state->id) if (const auto server = window_server_or_null()) return server->content_rect(state->id);
+    if (state->id) if (const auto server = window_server_or_null()) return from_server_content(target, server->content_rect(state->id));
     return state->last_content;
 }
 double AppKit::backing_scale(Address target) {
@@ -145,12 +145,14 @@ void AppKit::window_order_front(Address target, bool make_key) {
     }
     if (make_key && send_bool(target, "canBecomeKeyWindow")) set_key_window(target, true);
     schedule_occlusion_update(target);
+    tab_window_ordered_in(target);
 }
 
 void AppKit::order_window(Address target, std::int64_t place, WindowId relative) {
     const auto state = window_state(target);
     if (place == order_out) {
         if (!state->id || !state->visible) return;
+        tab_window_leaving(target);
         {
             const OrderingScope ordering(ordering_window, target);
             require_window_server("-[NSWindow orderOut:]").show(state->id, ShowCommand::order_out);
@@ -187,6 +189,7 @@ void AppKit::order_window(Address target, std::int64_t place, WindowId relative)
             if (info->visible && info->id) server.order_relative(info->id, state->id, true);
         }
     schedule_occlusion_update(target);
+    tab_window_ordered_in(target);
 }
 
 bool AppKit::occlusion_visible(const WindowState& state) const {
@@ -245,8 +248,8 @@ static void apply_content(AppKit& kit, Address target, Rect content) {
     const auto state = kit.window_state(target);
     if (!state->id) { state->last_content = content; return; }
     auto& server = require_window_server("NSWindow frame change");
-    server.set_content_rect(state->id, content);
-    kit.window_did_resize(target, state, server.content_rect(state->id));
+    server.set_content_rect(state->id, kit.to_server_content(target, content));
+    kit.window_did_resize(target, state, kit.from_server_content(target, server.content_rect(state->id)));
 }
 
 void AppKit::close_window(Address target) {
@@ -256,6 +259,7 @@ void AppKit::close_window(Address target) {
     // released when closed.
     const auto keep = retain(target);
     post(note::window_will_close, target);
+    tab_window_leaving(target);
     state->closed = true;
     set_key_window(target, false);
     if (state->id) if (const auto server = window_server_or_null()) {
@@ -602,24 +606,26 @@ Size AppKit::will_resize(WindowId id, Size proposed) {
     const auto target = window_for_id(id);
     if (!target) return proposed;
     const auto state = window_state(target);
+    const auto strip = state->strip;
+    proposed.height = std::max(0.0, proposed.height - strip);
     // The aspect ratio keeps the width the user chose and derives the height.
     if (const auto ratio = state->content_aspect_ratio; ratio.width > 0 && ratio.height > 0) {
         proposed.height = proposed.width * ratio.height / ratio.width;
     } else if (const auto frame_ratio = state->aspect_ratio; frame_ratio.width > 0 && frame_ratio.height > 0) {
         auto& server = require_window_server("-[NSWindow aspectRatio]");
-        const auto frame = server.frame_for_content({{0, 0}, proposed}, state->style).size;
+        const auto frame = server.frame_for_content({{0, 0}, {proposed.width, proposed.height + strip}}, state->style).size;
         const double chrome = frame.height - proposed.height;
         proposed.height = std::max(0.0, frame.width * frame_ratio.height / frame_ratio.width - chrome);
     }
-    if (!state->delegate || !responds(state->delegate, "windowWillResize:toSize:")) return proposed;
+    if (!state->delegate || !responds(state->delegate, "windowWillResize:toSize:")) return {proposed.width, proposed.height + strip};
     auto& server = require_window_server("windowWillResize:toSize:");
     // The delegate works in frame sizes; the window server in content sizes.
-    const auto frame = server.frame_for_content({{0, 0}, proposed}, state->style);
+    const auto frame = server.frame_for_content({{0, 0}, {proposed.width, proposed.height + strip}}, state->style);
     CallRegs registers;
     registers.x[2] = target;
     put_size(registers, 0, frame.size);
     const auto answer = result_size(send(state->delegate, "windowWillResize:toSize:", registers));
-    return server.content_for_frame({{0, 0}, answer}, state->style).size;
+    return server.content_for_frame({{0, 0}, answer}, state->style).size;   // the server's content size (with the strip)
 }
 
 std::optional<Rect> AppKit::caret_rect(WindowId id) {
@@ -697,7 +703,7 @@ void AppKit::handle_window_event(WindowId id, const Event& event) {
                 const auto state = window_state(target);
                 switch (event.notification) {
                 case Notification::close_requested: static_cast<void>(send_id(target, "performClose:", {0})); break;
-                case Notification::resized: case Notification::moved: window_did_resize(target, state, event.rect); break;
+                case Notification::resized: case Notification::moved: window_did_resize(target, state, from_server_content(target, event.rect)); break;
                 case Notification::expose: {
                     post(note::window_did_expose, target);
                     const auto content = state->content_view;
@@ -891,6 +897,7 @@ void AppKit::install_window() {
                 set_view_window(content, 0);
                 release(content);
             }
+            release_window_tabs(*state);
             if (const auto frame_view = std::exchange(state->frame_view, 0)) { set_view_window(frame_view, 0); release(frame_view); }
             for (auto* slot : {&state->title, &state->represented_filename, &state->background_color, &state->appearance,
                      &state->autosave_name, &state->subtitle, &state->identifier, &state->content_view_controller})
@@ -945,6 +952,9 @@ void AppKit::install_window() {
         const auto copy = s.x[2] ? cf.copy(s.x[2]) : string("");
         release(std::exchange(state->title, copy));
         if (state->id) require_window_server("-[NSWindow setTitle:]").set_title(state->id, caption(*this, *state));
+        if (state->tab_group)
+            for (const auto member : send_id(state->tab_group, "windows") ? cf.array_values(send_id(state->tab_group, "windows")) : std::vector<Address>{})
+                if (const auto bar = window_state(member)->tab_bar_view) invalidate_view(bar);
     }, "v@:@");
     method(w, "representedFilename", [this](CpuState& s, GuestMemory&) {
         const auto value = window_state(s.x[0])->represented_filename;
@@ -972,18 +982,18 @@ void AppKit::install_window() {
     }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:");
     method(w, "setFrame:display:", [this](CpuState& s, GuestMemory&) {
         const auto state = window_state(s.x[0]);
-        apply_content(*this, s.x[0], require_window_server("-[NSWindow setFrame:display:]").content_for_frame(rect_arg(s), state->style));
+        apply_content(*this, s.x[0], from_server_content(s.x[0], require_window_server("-[NSWindow setFrame:display:]").content_for_frame(rect_arg(s), state->style)));
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}B");
     method(w, "setFrame:display:animate:", [this](CpuState& s, GuestMemory&) {
         const auto state = window_state(s.x[0]);
-        apply_content(*this, s.x[0], require_window_server("-[NSWindow setFrame:display:animate:]").content_for_frame(rect_arg(s), state->style));
+        apply_content(*this, s.x[0], from_server_content(s.x[0], require_window_server("-[NSWindow setFrame:display:animate:]").content_for_frame(rect_arg(s), state->style)));
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}BB");
     method(w, "setFrameOrigin:", [this](CpuState& s, GuestMemory&) {
         const auto state = window_state(s.x[0]);
         auto& server = require_window_server("-[NSWindow setFrameOrigin:]");
         auto frame = state->id ? server.frame_rect(state->id) : state->last_content;
         frame.origin = point_arg(s);
-        apply_content(*this, s.x[0], server.content_for_frame(frame, state->style));
+        apply_content(*this, s.x[0], from_server_content(s.x[0], server.content_for_frame(frame, state->style)));
     }, "v@:{CGPoint=dd}");
     method(w, "setFrameTopLeftPoint:", [this](CpuState& s, GuestMemory&) {
         const auto state = window_state(s.x[0]);
@@ -991,7 +1001,7 @@ void AppKit::install_window() {
         auto frame = state->id ? server.frame_rect(state->id) : state->last_content;
         const auto point = point_arg(s);
         frame.origin = {point.x, point.y - frame.size.height};
-        apply_content(*this, s.x[0], server.content_for_frame(frame, state->style));
+        apply_content(*this, s.x[0], from_server_content(s.x[0], server.content_for_frame(frame, state->style)));
     }, "v@:{CGPoint=dd}");
     method(w, "setContentSize:", [this](CpuState& s, GuestMemory&) {
         // The top-left corner stays in place.
@@ -1010,13 +1020,13 @@ void AppKit::install_window() {
         const auto frame = server.frame_rect(state->id);
         Rect centered{{area.origin.x + (area.size.width - frame.size.width) / 2,
                        area.origin.y + (area.size.height - frame.size.height) * 2 / 3}, frame.size};
-        apply_content(*this, s.x[0], server.content_for_frame(centered, state->style));
+        apply_content(*this, s.x[0], from_server_content(s.x[0], server.content_for_frame(centered, state->style)));
     }, "v@:");
     method(w, "contentRectForFrameRect:", [this](CpuState& s, GuestMemory&) {
-        return_rect(s, require_window_server("-[NSWindow contentRectForFrameRect:]").content_for_frame(rect_arg(s), window_state(s.x[0])->style));
+        return_rect(s, from_server_content(s.x[0], require_window_server("-[NSWindow contentRectForFrameRect:]").content_for_frame(rect_arg(s), window_state(s.x[0])->style)));
     }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:{CGRect={CGPoint=dd}{CGSize=dd}}");
     method(w, "frameRectForContentRect:", [this](CpuState& s, GuestMemory&) {
-        return_rect(s, require_window_server("-[NSWindow frameRectForContentRect:]").frame_for_content(rect_arg(s), window_state(s.x[0])->style));
+        return_rect(s, require_window_server("-[NSWindow frameRectForContentRect:]").frame_for_content(to_server_content(s.x[0], rect_arg(s)), window_state(s.x[0])->style));
     }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:{CGRect={CGPoint=dd}{CGSize=dd}}");
     class_method(w, "contentRectForFrameRect:styleMask:", [](CpuState& s, GuestMemory&) {
         return_rect(s, require_window_server("+[NSWindow contentRectForFrameRect:styleMask:]").content_for_frame(rect_arg(s), s.x[2]));
@@ -1299,13 +1309,15 @@ void AppKit::install_window() {
         const auto state = window_state(self);
         if (!state->id) return;
         const auto maximum = state->max_content.width > 0 ? state->max_content : Size{unlimited_size, unlimited_size};
-        require_window_server("NSWindow size limits").set_content_limits(state->id, state->min_content, maximum);
+        const auto strip = state->strip;
+        require_window_server("NSWindow size limits").set_content_limits(state->id, {state->min_content.width, state->min_content.height + strip},
+                                                                         {maximum.width, maximum.height + strip});
     };
     const auto frame_to_content = [this](Address self, Size size) {
-        return require_window_server("NSWindow size limits").content_for_frame({{0, 0}, size}, window_state(self)->style).size;
+        return from_server_content(self, require_window_server("NSWindow size limits").content_for_frame({{0, 0}, size}, window_state(self)->style)).size;
     };
     const auto content_to_frame = [this](Address self, Size size) {
-        return require_window_server("NSWindow size limits").frame_for_content({{0, 0}, size}, window_state(self)->style).size;
+        return require_window_server("NSWindow size limits").frame_for_content(to_server_content(self, {{0, 0}, size}), window_state(self)->style).size;
     };
     method(w, "setContentMinSize:", [this, limits](CpuState& s, GuestMemory&) { window_state(s.x[0])->min_content = size_arg(s); limits(s.x[0]); }, "v@:{CGSize=dd}");
     method(w, "setContentMaxSize:", [this, limits](CpuState& s, GuestMemory&) { window_state(s.x[0])->max_content = size_arg(s); limits(s.x[0]); }, "v@:{CGSize=dd}");
@@ -1363,6 +1375,11 @@ void AppKit::install_window() {
     method(w, "viewsNeedDisplay", [this](CpuState& s, GuestMemory&) { return_bool(s, window_state(s.x[0])->needs_display); }, "B@:");
     method(w, "setViewsNeedDisplay:", [this](CpuState& s, GuestMemory&) { window_state(s.x[0])->needs_display = bool_arg(s, 2); }, "v@:B");
     method(w, "update", [this](CpuState& s, GuestMemory&) {
+        const auto state = window_state(s.x[0]);
+        if (state->toolbar_view && !view_state(state->toolbar_view)->hidden) {
+            static_cast<void>(send(state->toolbar, "validateVisibleItems"));
+            invalidate_view(state->toolbar_view);
+        }
         post(note::window_did_update, s.x[0]);
     }, "v@:");
 

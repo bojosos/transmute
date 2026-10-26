@@ -143,8 +143,9 @@ void AppKit::layout_frame_view(Address target) {
     const auto content = content_rect(target).size;
     const auto titlebar = titlebar_height(target);
     const bool full_size = (state->style & style::full_size_content_view) != 0;
-    const Size size{content.width, content.height + (full_size ? 0 : titlebar)};
+    const Size size{content.width, content.height + state->strip + (full_size ? 0 : titlebar)};
     view_state(frame)->frame = {{0, 0}, size};
+    layout_top_strip(target);
     const auto info = find_extension<FrameViewState>(frame);
     if (!info || !info->buttons[0]) return;
     std::int64_t direction = 0;

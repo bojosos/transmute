@@ -248,7 +248,15 @@ struct WindowState final : ResponderState {
     // ratio wins), enforced while the user resizes (will_resize).
     Size aspect_ratio{}, content_aspect_ratio{};
     bool can_hide{true};                      // -[NSApplication hide:] leaves the window when NO
-    std::int64_t toolbar_style{};             // NSWindowToolbarStyle (kept; window toolbars are not shown)
+    std::int64_t toolbar_style{};             // NSWindowToolbarStyle (kept; the toolbar draws one style)
+    // Toolbars and tabs (window_tabs.cpp): the toolbar (+1); the views of the
+    // top strip between the title bar and the content view (frame-view
+    // subviews, held by the frame view) and the strip's height; the tab
+    // group (+1, shared by its windows), the window's NSWindowTab (+1) and
+    // tabbing identifier (+1). -sharingType (NSWindowSharingType).
+    Address toolbar{}, toolbar_view{}, tab_bar_view{}, tab_group{}, tab{}, tabbing_identifier{};
+    double strip{};
+    std::uint64_t sharing_type{1};
 };
 
 struct CursorRect { Rect rect; Address cursor{}; };   // view (bounds) coordinates; cursor +1
@@ -877,6 +885,21 @@ struct AppKit : std::enable_shared_from_this<AppKit> {
     // ---- the frame view (chrome-s2 w1, frame_view.cpp) ----
     Address frame_view_class_root{};          // NSFrameView
     void install_frame_views();
+    // Window toolbars and tabs (window_tabs.cpp). The window server's content
+    // rect is the AppKit content rect plus the top strip (toolbar, tab bar).
+    void install_window_tabs();
+    [[nodiscard]] Rect to_server_content(Address window, Rect content);
+    [[nodiscard]] Rect from_server_content(Address window, Rect content);
+    void update_top_strip(Address window);    // after the toolbar or the tab bar changed
+    void layout_top_strip(Address window);    // frame-view layout (frame_view.cpp)
+    [[nodiscard]] std::vector<Address> top_strip_views(Address window);
+    // Tabs follow ordering: a tabbed window ordered in becomes its group's
+    // selected window; one ordered out or closed leaves its group.
+    void tab_window_ordered_in(Address window);
+    void tab_window_leaving(Address window);
+    void release_window_tabs(WindowState& state);
+    void toolbar_changed(Address toolbar);   // items, visibility or display mode (panels.cpp)
+    bool switching_tabs{};
     // Creates the frame view (+frameViewClassForStyleMask:), or replaces it
     // when the class for the window's style changed, and lays it out.
     void update_frame_view(Address window);

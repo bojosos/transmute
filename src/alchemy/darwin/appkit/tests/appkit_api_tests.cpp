@@ -498,6 +498,127 @@ void containers_and_controllers(Fixture& f) {
                 (f.id(toolbar_item, "isVisible") & 0xff) == 0, "toolbar item title and visibility");
 }
 
+// Window toolbars and tabs (the frameworks wave, U3).
+void toolbars_and_tabs(Fixture& f) {
+    const auto kit = appkit::instance();
+    const auto pump = [&f] {
+        static_cast<void>(f.server.dispatch_messages());   // the queued events reach AppKit's queue
+        while (const auto event = f.id(f.app, "nextEventMatchingMask:untilDate:inMode:dequeue:", {~0ULL, 0, 0, 1}))
+            static_cast<void>(f.id(f.app, "sendEvent:", {event}));
+    };
+    const auto click = [&f, pump](Address window_object, gui::Point location) {
+        gui::Event down;
+        down.type = gui::event_type::left_mouse_down;
+        down.window = f.id(window_object, "windowNumber");
+        down.location = location;
+        down.click_count = 1;
+        down.pressed_buttons = 1;
+        f.server.queue(down);
+        auto up = down;
+        up.type = gui::event_type::left_mouse_up;
+        up.pressed_buttons = 0;
+        f.server.queue(up);
+        pump();
+    };
+    const auto target = f.window({{100, 100}, {300, 200}});
+    static_cast<void>(f.id(target, "makeKeyAndOrderFront:", {0}));
+    const auto number = kit->window_state(target)->id;
+    const auto content_height = [&f](Address window_object) { return f.rect(f.msg(f.id(window_object, "contentView"), "frame")).size.height; };
+    const auto before = f.rect(f.msg(target, "frame"));
+    const auto top = [](gui::Rect r) { return r.origin.y + r.size.height; };
+
+    // An empty toolbar (title-bar styling) takes no space.
+    const auto styling = f.id(f.id(f.cls("NSToolbar"), "alloc"), "initWithIdentifier:", {f.str("styling")});
+    static_cast<void>(f.id(target, "setToolbar:", {styling}));
+    require(f.id(target, "toolbar") == styling && near(f.rect(f.msg(target, "frame")).size.height, before.size.height), "an empty toolbar takes no space");
+
+    // A delegate's default items: the content keeps its size; the frame grows
+    // by the toolbar row below its top edge.
+    const auto delegate_class = f.subclass("U3ToolbarDelegate", "NSObject");
+    f.add(delegate_class, "toolbarDefaultItemIdentifiers:", [&f](CpuState& s, GuestMemory&) {
+        s.x[0] = f.array({f.str("NSToolbarFlexibleSpaceItem"), f.str("go")});
+    }, "@@:@");
+    f.add(delegate_class, "toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:", [&f](CpuState& s, GuestMemory&) {
+        const auto item = f.id(f.id(f.cls("NSToolbarItem"), "alloc"), "initWithItemIdentifier:", {s.x[3]});
+        static_cast<void>(f.id(item, "setLabel:", {f.str("Go")}));
+        static_cast<void>(f.id(item, "setTarget:", {s.x[0]}));
+        static_cast<void>(f.id(item, "setAction:", {f.objc.selector("go:")}));
+        s.x[0] = f.id(item, "autorelease");
+    }, "@@:@@B");
+    f.add(delegate_class, "go:", [](CpuState&, GuestMemory&) { journal.push_back("toolbar go"); });
+    const auto delegate = f.alloc_init("U3ToolbarDelegate");
+    const auto toolbar = f.id(f.id(f.cls("NSToolbar"), "alloc"), "initWithIdentifier:", {f.str("main")});
+    static_cast<void>(f.id(toolbar, "setDelegate:", {delegate}));
+    static_cast<void>(f.id(target, "setToolbar:", {toolbar}));
+    const auto items = f.id(toolbar, "items");
+    require(f.id(items, "count") == 2, "the toolbar gets its delegate's default items");
+    const auto with = f.rect(f.msg(target, "frame"));
+    require(near(content_height(target), 200) && near(with.size.height, before.size.height + 48) && near(top(with), top(before)),
+            "the toolbar row grows the frame below its top edge");
+    require(near(f.server.at(number).content.size.height, 248), "the window server's content holds the toolbar row");
+    require((f.id(f.id(items, "objectAtIndex:", {1}), "isVisible") & 0xff) == 1, "items of a shown toolbar are visible");
+    {
+        CallRegs registers;
+        appkit::put_rect(registers, 0, with);
+        require(near(f.rect(f.msg(target, "contentRectForFrameRect:", registers)).size.height, 200), "-contentRectForFrameRect: leaves the toolbar out");
+    }
+    // The item sits at the right end (after the flexible space), in the row above the content.
+    journal.clear();
+    click(target, {300 - 8 - 16, 200 + 24});
+    require(logged("toolbar go"), "a click on the toolbar item sends its action");
+    static_cast<void>(f.id(target, "toggleToolbarShown:", {0}));
+    require(near(f.rect(f.msg(target, "frame")).size.height, before.size.height) && near(content_height(target), 200), "a hidden toolbar gives its row back");
+    static_cast<void>(f.id(target, "toggleToolbarShown:", {0}));
+    require(near(f.rect(f.msg(target, "frame")).size.height, before.size.height + 48), "shown again");
+
+    // Tabs: the added window shows in the group's frame, the other is ordered out.
+    const auto second = f.window({{400, 400}, {250, 150}});
+    static_cast<void>(f.id(target, "addTabbedWindow:ordered:", {second, 1}));
+    const auto group = f.id(target, "tabGroup");
+    require(group && f.id(second, "tabGroup") == group && f.id(f.id(target, "tabbedWindows"), "count") == 2, "a tab group of two");
+    require((f.id(second, "isVisible") & 0xff) == 1 && (f.id(target, "isVisible") & 0xff) == 0 && f.id(group, "selectedWindow") == second,
+            "the added tab is selected and the other is ordered out");
+    require(near(top(f.rect(f.msg(second, "frame"))), top(f.rect(f.msg(target, "frame")))) &&
+                near(f.rect(f.msg(second, "frame")).size.width, f.rect(f.msg(target, "frame")).size.width),
+            "tabs share the frame");
+    require((f.id(group, "isTabBarVisible") & 0xff) == 1 &&
+                near(content_height(second), f.server.at(kit->window_state(second)->id).content.size.height - 28),
+            "the tab bar takes a row above the content");
+    static_cast<void>(f.id(second, "selectPreviousTab:", {0}));
+    require((f.id(target, "isVisible") & 0xff) == 1 && (f.id(second, "isVisible") & 0xff) == 0, "-selectPreviousTab: shows the other tab");
+    // Closing the selected tab selects its neighbour; a group of one has no tab bar.
+    static_cast<void>(f.id(target, "close"));
+    require((f.id(second, "isVisible") & 0xff) == 1 && f.id(second, "tabbedWindows") == 0, "closing a tab shows its neighbour");
+    require(near(content_height(second), f.server.at(kit->window_state(second)->id).content.size.height), "no tab bar with one tab");
+    // -mergeAllWindows: gathers the visible windows with the same identifier; -moveTabToNewWindow: separates one.
+    const auto third = f.window({{50, 50}, {200, 120}});
+    static_cast<void>(f.id(third, "makeKeyAndOrderFront:", {0}));
+    for (const auto value : {second, third}) static_cast<void>(f.id(value, "setTabbingIdentifier:", {f.str("documents")}));
+    static_cast<void>(f.id(second, "mergeAllWindows:", {0}));
+    require(f.id(f.id(third, "tabbedWindows"), "count") == 2, "-mergeAllWindows:");
+    static_cast<void>(f.id(third, "moveTabToNewWindow:", {0}));
+    require(f.id(third, "tabbedWindows") == 0 && (f.id(third, "isVisible") & 0xff) == 1, "-moveTabToNewWindow:");
+    // NSWindowTabbingModePreferred joins a visible window with the same identifier.
+    const auto fourth = f.window({{60, 60}, {200, 120}});
+    static_cast<void>(f.id(fourth, "setTabbingIdentifier:", {f.str("documents")}));
+    static_cast<void>(f.id(fourth, "setTabbingMode:", {1}));
+    static_cast<void>(f.id(fourth, "makeKeyAndOrderFront:", {0}));
+    require(f.id(f.id(fourth, "tabbedWindows"), "count") == 2, "a preferred-tabbing window joins a tab group");
+    static_cast<void>(f.id(f.id(fourth, "tab"), "setTitle:", {f.str("Fourth")}));
+    require(f.text(f.id(f.id(fourth, "tab"), "title")) == "Fourth", "the window tab's title");
+    bool stopped{};
+    try { static_cast<void>(f.id(fourth, "toggleTabOverview:", {0})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "the tab overview stops explicitly");
+
+    // Dragging goes to the window server's move loop; NSWindowSharingNone leaves capture.
+    const auto fourth_id = kit->window_state(fourth)->id;
+    static_cast<void>(f.id(fourth, "performWindowDragWithEvent:", {0}));
+    static_cast<void>(f.id(fourth, "setSharingType:", {0}));
+    require(f.server.at(fourth_id).drags == 1 && f.server.at(fourth_id).capture_excluded && f.id(fourth, "sharingType") == 0,
+            "window drag and sharing type");
+    for (const auto value : {second, third, fourth}) static_cast<void>(f.id(value, "close"));
+}
+
 } // namespace
 
 int main() {
@@ -509,7 +630,8 @@ int main() {
         for (const auto& [name, test] : std::initializer_list<std::pair<const char*, void (*)(Fixture&)>>{
                  {"responders_and_cells", responders_and_cells}, {"views", views}, {"windows", windows}, {"menus", menus},
                  {"images_and_cursors", images_and_cursors}, {"alerts_and_panels", alerts_and_panels},
-                 {"pasteboards_and_text", pasteboards_and_text}, {"containers_and_controllers", containers_and_controllers}}) {
+                 {"pasteboards_and_text", pasteboards_and_text}, {"containers_and_controllers", containers_and_controllers},
+                 {"toolbars_and_tabs", toolbars_and_tabs}}) {
             std::cout << "[appkit api] " << name << std::endl;
             test(f);
         }
