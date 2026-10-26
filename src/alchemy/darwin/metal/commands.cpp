@@ -763,8 +763,6 @@ void CommandBuffer::begin_render(const RenderPass& pass) {
     prepare_texture(pass.stencil.texture);
     if (pass.visibility) {
         retain(pass.visibility);
-        if (!pass.visibility->contents())
-            throw std::runtime_error("Metal visibility result buffers in private storage are not translated");
         query_capacity_ = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(pass.visibility->length / 8 * 2, 64, 65536));
         VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         info.queryType = VK_QUERY_TYPE_OCCLUSION;
@@ -915,27 +913,51 @@ void CommandBuffer::end_render() {
         indirect_traces_.clear();
     }
     if (queries_ && query_count_) {
-        // Results land in upload memory; completion sums them per offset into
-        // the visibility buffer (Metal accumulates every draw of a pass that
-        // used the same offset).
-        const auto results = upload(8ULL * query_count_, 8);
+        // Metal writes an offset's result when the pass ends, so later commands
+        // of the same command buffer (a blit that resolves the queries, as
+        // Dawn's) read it: an offset that one query used gets its result copied
+        // on the GPU, in private and shared storage alike. Metal accumulates
+        // every draw of a pass that used the same offset; those sums are made
+        // at completion, which only shared storage allows.
+        const auto& visibility = pass_.visibility;
+        std::map<std::uint64_t, std::vector<std::uint32_t>> by_offset;
+        for (std::uint32_t index = 0; index < query_count_; ++index) by_offset[query_offsets_[index]].push_back(index);
         barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
-                VK_ACCESS_2_TRANSFER_READ_BIT);
-        device->vk.vkCmdCopyQueryPoolResults(command, queries_, 0, query_count_, results.buffer, results.offset, 8,
-                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        auto visibility = pass_.visibility;
-        auto offsets = query_offsets_;
-        const auto pointer = results.pointer;
-        on_complete([visibility, offsets, pointer] {
-            std::map<std::uint64_t, std::uint64_t> sums;
-            for (std::size_t index = 0; index < offsets.size(); ++index) {
-                std::uint64_t value{};
-                std::memcpy(&value, pointer + 8 * index, 8);
-                sums[offsets[index]] += value;
+                VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>> summed;
+        for (auto& [offset, indices] : by_offset) {
+            if (offset % 8 || offset + 8 > visibility->length)
+                throw std::runtime_error("Metal visibility result offset " + std::to_string(offset) +
+                                         " not 8-byte aligned or past the visibilityResultBuffer");
+            if (indices.size() == 1) {
+                device->vk.vkCmdCopyQueryPoolResults(command, queries_, indices.front(), 1, visibility->buffer, offset, 8,
+                                                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                continue;
             }
-            for (const auto& [offset, value] : sums)
-                if (offset + 8 <= visibility->length) std::memcpy(visibility->contents() + offset, &value, 8);
-        });
+            if (!visibility->contents())
+                throw std::runtime_error("Metal visibility results summed over several queries at one offset need a "
+                                         "shared visibilityResultBuffer (private storage is not translated)");
+            summed.emplace_back(offset, std::move(indices));
+        }
+        if (!summed.empty()) {
+            const auto results = upload(8ULL * query_count_, 8);
+            device->vk.vkCmdCopyQueryPoolResults(command, queries_, 0, query_count_, results.buffer, results.offset, 8,
+                                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            const auto pointer = results.pointer;
+            on_complete([visibility, summed = std::move(summed), pointer] {
+                for (const auto& [offset, indices] : summed) {
+                    std::uint64_t sum{};
+                    for (const auto index : indices) {
+                        std::uint64_t value{};
+                        std::memcpy(&value, pointer + 8ULL * index, 8);
+                        sum += value;
+                    }
+                    std::memcpy(visibility->contents() + offset, &sum, 8);
+                }
+            });
+        }
+        barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
     }
     if (queries_) {
         const auto pool = queries_;

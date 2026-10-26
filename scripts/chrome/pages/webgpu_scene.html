@@ -1,0 +1,690 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Alchemy WebGPU scene: running</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+td, th { padding: 2px 10px; text-align: left; vertical-align: top; }
+canvas { border: 1px solid #888; }
+</style>
+</head>
+<body>
+<h1 id="h">Alchemy WebGPU scene</h1>
+<p>What a real WebGPU page (the classic samples: lit cubes, compute particles, GPU-driven draws, shadow maps)
+asks of WebGPU, written for Alchemy (no downloaded library or suite, no network). Each test renders or computes,
+reads the result back and compares it with what the math says, inside validation and out-of-memory error scopes
+and under a time limit. The last test animates a spinning, depth-tested cube on the canvas for 30 frames. The
+verdict goes into <code>document.title</code> (<code>Alchemy WebGPU scene: PASS</code> or
+<code>Alchemy WebGPU scene: FAIL &lt;test&gt;</code>) and <code>body[data-verdict]</code>; each test is a row below.
+<code>--dump-dom</code> waits for it: a chain of failing image loads holds the load event until the verdict is set
+(at most 120 s).</p>
+<pre id="adapter">adapter: pending</pre>
+<table>
+<thead><tr><th>test</th><th>result</th><th>detail</th></tr></thead>
+<tbody id="results"></tbody>
+</table>
+<p id="status">not run</p>
+<canvas id="canvas" width="64" height="64"></canvas>
+<script>
+"use strict";
+var finished = false, holdUntil = Date.now() + 120000;
+(function hold() {
+  if (finished || Date.now() > holdUntil) return;
+  var img = new Image();
+  img.onerror = img.onload = function () { img.remove(); hold(); };
+  img.src = "missing-" + Math.random() + ".png";
+  document.body.appendChild(img);
+})();
+
+var rows = document.getElementById("results");
+var failures = [];
+function row(name, ok, detail) {
+  var tr = document.createElement("tr");
+  var verdict = ok === null ? "skip" : ok ? "pass" : "FAIL";
+  tr.innerHTML = "<td></td><td></td><td></td>";
+  tr.children[0].textContent = name;
+  tr.children[1].textContent = verdict;
+  tr.children[2].textContent = detail || "";
+  tr.id = "t-" + name.replace(/[^a-z0-9]+/gi, "-");
+  tr.dataset.result = verdict;
+  rows.appendChild(tr);
+  if (ok === false) failures.push(name);
+}
+function within(promise, seconds, what) {
+  return Promise.race([promise, new Promise(function (_, reject) {
+    setTimeout(function () { reject(new Error(what + " did not settle within " + seconds + " s")); }, seconds * 1000);
+  })]);
+}
+// One test inside error scopes; the body returns "" or its problems, or { problems, note }.
+async function step(device, name, body) {
+  device.pushErrorScope("validation");
+  device.pushErrorScope("out-of-memory");
+  var problems = [], note = "";
+  try {
+    var result = await body(device);
+    if (result && typeof result === "object") { note = result.note || ""; result = result.problems; }
+    if (result) problems.push(result);
+  } catch (e) { problems.push("threw " + e.message); }
+  try {
+    var oom = await within(device.popErrorScope(), 20, "popErrorScope");
+    if (oom) problems.push("out-of-memory: " + oom.message);
+    var val = await within(device.popErrorScope(), 20, "popErrorScope");
+    if (val) problems.push("validation: " + val.message);
+  } catch (e) { problems.push(e.message); }
+  row(name, problems.length === 0, problems.concat(note ? [note] : []).join("; "));
+}
+
+// ---- helpers ----------------------------------------------------------------------------------
+
+var W = 64, H = 64;
+
+// Copies a texture (one mip level) into a mappable buffer with 256-byte rows and returns the bytes.
+async function readBack(device, texture, width, height, mipLevel) {
+  var buf = device.createBuffer({ size: 256 * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture: texture, mipLevel: mipLevel || 0 }, { buffer: buf, bytesPerRow: 256, rowsPerImage: height }, [width, height, 1]);
+  device.queue.submit([enc.finish()]);
+  await within(buf.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var bytes = new Uint8Array(buf.getMappedRange().slice(0));
+  buf.unmap(); buf.destroy();
+  return bytes;
+}
+async function readBuffer(device, source, size) {
+  var buf = device.createBuffer({ size: size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  var enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(source, 0, buf, 0, size);
+  device.queue.submit([enc.finish()]);
+  await within(buf.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+  var copy = buf.getMappedRange().slice(0);
+  buf.unmap(); buf.destroy();
+  return copy;
+}
+function pixelAt(bytes, x, y, bgra) {
+  var o = y * 256 + x * 4;
+  return bgra ? [bytes[o + 2], bytes[o + 1], bytes[o], bytes[o + 3]] : [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
+}
+// points: [x, y, [r, g, b, a], what]; y counts rows from the top (WebGPU's framebuffer y grows downwards).
+function checkPixels(bytes, points, bgra, tol) {
+  var problems = [];
+  points.forEach(function (p) {
+    var got = pixelAt(bytes, p[0], p[1], bgra);
+    for (var i = 0; i < 4; i++)
+      if (Math.abs(got[i] - p[2][i]) > (tol === undefined ? 3 : tol)) { problems.push(p[3] + " (" + p[0] + "," + p[1] + ") = " + got.join(",") + ", want " + p[2].join(",")); return; }
+  });
+  return problems.join("; ");
+}
+function target(device, format, extra) {
+  return device.createTexture({ size: [W, H], format: format || "rgba8unorm",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | (extra || 0) });
+}
+function bufferWith(device, usage, data) {
+  var b = device.createBuffer({ size: Math.max(4, Math.ceil(data.byteLength / 4) * 4), usage: usage, mappedAtCreation: true });
+  new data.constructor(b.getMappedRange()).set(data);
+  b.unmap();
+  return b;
+}
+function renderPipeline(device, code, options) {
+  var module = device.createShaderModule({ code: code });
+  var descriptor = {
+    layout: options.layout || "auto",
+    vertex: { module: module, entryPoint: "vs", buffers: options.buffers || [] },
+    primitive: options.primitive || { topology: "triangle-list" }
+  };
+  if (options.targets !== null) descriptor.fragment = { module: module, entryPoint: "fs", targets: options.targets || [{ format: "rgba8unorm" }] };
+  if (options.depthStencil) descriptor.depthStencil = options.depthStencil;
+  if (options.multisample) descriptor.multisample = options.multisample;
+  return within(device.createRenderPipelineAsync(descriptor), 60, "createRenderPipelineAsync");
+}
+function computePipeline(device, code) {
+  var module = device.createShaderModule({ code: code });
+  return within(device.createComputePipelineAsync({ layout: "auto", compute: { module: module, entryPoint: "main" } }), 60, "createComputePipelineAsync");
+}
+function pass(enc, view, extra) {
+  var d = { colorAttachments: [{ view: view, clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }] };
+  for (var k in extra || {}) d[k] = extra[k];
+  return enc.beginRenderPass(d);
+}
+
+// Column-major 4x4 matrices; the projection maps depth to 0..1, as WebGPU's clip space does.
+function perspective(fovy, aspect, near, far) {
+  var f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return [f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, far * nf, -1, 0, 0, far * near * nf, 0];
+}
+function multiply(a, b) {
+  var out = new Array(16);
+  for (var c = 0; c < 4; c++) for (var r = 0; r < 4; r++) {
+    var s = 0;
+    for (var k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+    out[c * 4 + r] = s;
+  }
+  return out;
+}
+function translation(x, y, z) { return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]; }
+function rotationY(t) { var c = Math.cos(t), s = Math.sin(t); return [c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]; }
+function rotationX(t) { var c = Math.cos(t), s = Math.sin(t); return [1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]; }
+
+// A unit cube's 36 vertices, interleaved position and face normal, wound counter-clockwise from outside.
+function cubeVertices() {
+  var out = [];
+  [[0, 0, 1], [0, 0, -1], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]].forEach(function (f) {
+    var u = f[0] ? [0, 1, 0] : [1, 0, 0];
+    var v = [f[1] * u[2] - f[2] * u[1], f[2] * u[0] - f[0] * u[2], f[0] * u[1] - f[1] * u[0]];
+    [[-1, -1], [1, -1], [1, 1], [-1, -1], [1, 1], [-1, 1]].forEach(function (k) {
+      for (var i = 0; i < 3; i++) out.push(0.5 * (f[i] + k[0] * u[i] + k[1] * v[i]));
+      out.push(f[0], f[1], f[2]);
+    });
+  });
+  return new Float32Array(out);
+}
+var VERTEX_LAYOUT = [{ arrayStride: 24, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }, { shaderLocation: 1, offset: 12, format: "float32x3" }] }];
+
+var LIT_WGSL = `
+struct Scene { mvp : mat4x4<f32>, model : mat4x4<f32>, light : vec4<f32>, color : vec4<f32> };
+@group(0) @binding(0) var<uniform> s : Scene;
+struct VOut { @builtin(position) pos : vec4<f32>, @location(0) n : vec3<f32> };
+@vertex fn vs(@location(0) p : vec3<f32>, @location(1) n : vec3<f32>) -> VOut {
+  var o : VOut;
+  o.pos = s.mvp * vec4<f32>(p, 1.0);
+  o.n = (s.model * vec4<f32>(n, 0.0)).xyz;
+  return o;
+}
+@fragment fn fs(v : VOut) -> @location(0) vec4<f32> {
+  return vec4<f32>(s.color.rgb * max(dot(normalize(v.n), s.light.xyz), 0.0), 1.0);
+}`;
+function sceneUniforms(device, model, view, color) {
+  var data = new Float32Array(40);
+  data.set(multiply(perspective(Math.PI / 3, 1, 1, 10), multiply(view, model)), 0);
+  data.set(model, 16);
+  data.set([0, 0, 1, 0], 32);                 // light along +z, towards the camera
+  data.set(color, 36);
+  return bufferWith(device, GPUBufferUsage.UNIFORM, data);
+}
+var DEPTH = { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" };
+
+// A fullscreen triangle; the fragment shader gets uv (0,0 top left) and the pixel position.
+var FULLSCREEN_VS = `
+struct VOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i : u32) -> VOut {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var o : VOut;
+  o.pos = vec4<f32>(p[i], 0.0, 1.0);
+  o.uv = vec2<f32>(p[i].x * 0.5 + 0.5, 0.5 - p[i].y * 0.5);
+  return o;
+}`;
+
+// ---- the tests --------------------------------------------------------------------------------
+
+// A perspective cube lit from the camera, then a far red wall drawn after it: depth keeps the cube in front.
+async function litCubeTest(device) {
+  var color = target(device), depth = device.createTexture({ size: [W, H], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT });
+  var pipeline = await renderPipeline(device, LIT_WGSL, { buffers: VERTEX_LAYOUT, depthStencil: DEPTH, primitive: { topology: "triangle-list", cullMode: "back" } });
+  var cube = bufferWith(device, GPUBufferUsage.VERTEX, cubeVertices());
+  var wall = bufferWith(device, GPUBufferUsage.VERTEX, new Float32Array([
+    -20, -20, 0, 0, 0, 1, 20, -20, 0, 0, 0, 1, 20, 20, 0, 0, 0, 1, -20, -20, 0, 0, 0, 1, 20, 20, 0, 0, 0, 1, -20, 20, 0, 0, 0, 1]));
+  var identity = translation(0, 0, 0);
+  var cubeGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: sceneUniforms(device, identity, translation(0, 0, -3), [1, 0.5, 0.25, 1]) } }] });
+  var wallGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: sceneUniforms(device, identity, translation(0, 0, -6), [1, 0, 0, 1]) } }] });
+  var enc = device.createCommandEncoder();
+  var p = pass(enc, color.createView(), { depthStencilAttachment: { view: depth.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" } });
+  p.setPipeline(pipeline);
+  p.setBindGroup(0, cubeGroup); p.setVertexBuffer(0, cube); p.draw(36);
+  p.setBindGroup(0, wallGroup); p.setVertexBuffer(0, wall); p.draw(6);
+  p.end();
+  device.queue.submit([enc.finish()]);
+  return checkPixels(await readBack(device, color, W, H), [
+    [32, 32, [255, 128, 64, 255], "cube's front face, fully lit"], [2, 2, [255, 0, 0, 255], "wall behind the cube"]]);
+}
+
+// Four quads from one uniform buffer at dynamic offsets (256 bytes apart), one per quadrant.
+async function dynamicOffsetsTest(device) {
+  var layout = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform", hasDynamicOffset: true } }] });
+  var pipeline = await renderPipeline(device, `
+    struct Quad { color : vec4<f32>, offset : vec4<f32> };
+    @group(0) @binding(0) var<uniform> q : Quad;
+    @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
+      var c = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0));
+      return vec4<f32>(c[i] * 0.5 + q.offset.xy, 0.0, 1.0);
+    }
+    @fragment fn fs() -> @location(0) vec4<f32> { return q.color; }`,
+    { layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }) });
+  var quads = [[[1, 0, 0, 1], [-0.5, 0.5]], [[0, 1, 0, 1], [0.5, 0.5]], [[0, 0, 1, 1], [-0.5, -0.5]], [[1, 1, 0, 1], [0.5, -0.5]]];
+  var data = new Float32Array(4 * 64);
+  quads.forEach(function (q, i) { data.set(q[0], i * 64); data.set([q[1][0], q[1][1], 0, 0], i * 64 + 4); });
+  var uniforms = bufferWith(device, GPUBufferUsage.UNIFORM, data);
+  var group = device.createBindGroup({ layout: layout, entries: [{ binding: 0, resource: { buffer: uniforms, size: 32 } }] });
+  var color = target(device), enc = device.createCommandEncoder(), p = pass(enc, color.createView());
+  p.setPipeline(pipeline);
+  for (var i = 0; i < 4; i++) { p.setBindGroup(0, group, [i * 256]); p.draw(6); }
+  p.end();
+  device.queue.submit([enc.finish()]);
+  return checkPixels(await readBack(device, color, W, H), [
+    [16, 16, [255, 0, 0, 255], "top left"], [48, 16, [0, 255, 0, 255], "top right"],
+    [16, 48, [0, 0, 255, 255], "bottom left"], [48, 48, [255, 255, 0, 255], "bottom right"]]);
+}
+
+// Mipmaps generated the way samples do: each level rendered from the one above with a linear sampler.
+// A 64x64 black/white checkerboard averages to mid gray in its 1x1 level 6.
+async function mipmapTest(device) {
+  var levels = 7, tex = device.createTexture({ size: [64, 64], format: "rgba8unorm", mipLevelCount: levels,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC });
+  var data = new Uint8Array(64 * 64 * 4);
+  for (var y = 0; y < 64; y++) for (var x = 0; x < 64; x++) {
+    var v = (x + y) % 2 ? 255 : 0, o = (y * 64 + x) * 4;
+    data[o] = data[o + 1] = data[o + 2] = v; data[o + 3] = 255;
+  }
+  device.queue.writeTexture({ texture: tex }, data, { bytesPerRow: 256, rowsPerImage: 64 }, [64, 64, 1]);
+  var pipeline = await renderPipeline(device, FULLSCREEN_VS + `
+    @group(0) @binding(0) var src : texture_2d<f32>;
+    @group(0) @binding(1) var smp : sampler;
+    @fragment fn fs(v : VOut) -> @location(0) vec4<f32> { return textureSampleLevel(src, smp, v.uv, 0.0); }`, {});
+  var sampler = device.createSampler({ minFilter: "linear", magFilter: "linear" });
+  var enc = device.createCommandEncoder();
+  for (var level = 1; level < levels; level++) {
+    var group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: tex.createView({ baseMipLevel: level - 1, mipLevelCount: 1 }) }, { binding: 1, resource: sampler }] });
+    var p = pass(enc, tex.createView({ baseMipLevel: level, mipLevelCount: 1 }));
+    p.setPipeline(pipeline); p.setBindGroup(0, group); p.draw(3); p.end();
+  }
+  device.queue.submit([enc.finish()]);
+  var problems = checkPixels(await readBack(device, tex, 1, 1, 6), [[0, 0, [128, 128, 128, 255], "level 6 (1x1)"]], false, 2);
+  var level3 = checkPixels(await readBack(device, tex, 8, 8, 3), [[0, 0, [128, 128, 128, 255], "level 3"], [7, 7, [128, 128, 128, 255], "level 3"]], false, 2);
+  return [problems, level3].filter(Boolean).join("; ");
+}
+
+// A triangle into a 4x multisampled target resolved in the pass: exact inside, partial on the diagonal edge.
+async function msaaTest(device) {
+  var ms = device.createTexture({ size: [W, H], format: "rgba8unorm", sampleCount: 4, usage: GPUTextureUsage.RENDER_ATTACHMENT });
+  var resolved = target(device);
+  var pipeline = await renderPipeline(device, `
+    @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
+      var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0));
+      return vec4<f32>(p[i], 0.0, 1.0);
+    }
+    @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }`, { multisample: { count: 4 } });
+  var enc = device.createCommandEncoder();
+  var p = enc.beginRenderPass({ colorAttachments: [{ view: ms.createView(), resolveTarget: resolved.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "discard" }] });
+  p.setPipeline(pipeline); p.draw(3); p.end();
+  device.queue.submit([enc.finish()]);
+  var bytes = await readBack(device, resolved, W, H);
+  // The lower-left half is covered; the edge runs through pixel (i, i) from the top left to the bottom right.
+  var problems = checkPixels(bytes, [[8, 56, [255, 255, 255, 255], "interior"], [56, 8, [0, 0, 0, 255], "outside"]]);
+  var partial = 0;
+  for (var i = 0; i < W; i++) { var v = pixelAt(bytes, i, i)[0]; if (v > 10 && v < 245) partial++; }
+  if (partial < W / 2) problems += (problems ? "; " : "") + "edge pixels are not antialiased (" + partial + " partial of " + W + ")";
+  return problems;
+}
+
+// Particles in two storage buffers, ping-ponged for 10 steps of pos += vel * 0.5 (exact in f32).
+async function particlesTest(device) {
+  var n = 4096, steps = 10;
+  var pipeline = await computePipeline(device, `
+    struct Particle { pos : vec2<f32>, vel : vec2<f32> };
+    @group(0) @binding(0) var<storage, read> src : array<Particle>;
+    @group(0) @binding(1) var<storage, read_write> dst : array<Particle>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+      let i = id.x;
+      if (i >= arrayLength(&src)) { return; }
+      var p = src[i];
+      p.pos = p.pos + p.vel * 0.5;
+      dst[i] = p;
+    }`);
+  var init = new Float32Array(n * 4);
+  for (var i = 0; i < n; i++) init.set([i % 64, Math.floor(i / 64), (i % 7) - 3, (i % 5) - 2], i * 4);
+  var usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+  var buffers = [bufferWith(device, usage, init), device.createBuffer({ size: init.byteLength, usage: usage })];
+  var groups = [0, 1].map(function (k) {
+    return device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: buffers[k] } }, { binding: 1, resource: { buffer: buffers[1 - k] } }] });
+  });
+  var enc = device.createCommandEncoder();
+  for (var s = 0; s < steps; s++) {
+    var c = enc.beginComputePass();
+    c.setPipeline(pipeline); c.setBindGroup(0, groups[s % 2]); c.dispatchWorkgroups(n / 64); c.end();
+  }
+  device.queue.submit([enc.finish()]);
+  var out = new Float32Array(await readBuffer(device, buffers[steps % 2], init.byteLength));
+  for (var j = 0; j < n; j++) {
+    var want = [init[j * 4] + init[j * 4 + 2] * 5, init[j * 4 + 1] + init[j * 4 + 3] * 5];
+    if (out[j * 4] !== want[0] || out[j * 4 + 1] !== want[1]) return "particle " + j + " at " + out[j * 4] + "," + out[j * 4 + 1] + ", want " + want;
+  }
+  return "";
+}
+
+// Atomics (a 16-bin histogram) and workgroup memory (a tree reduction per workgroup) with barriers.
+async function atomicsTest(device) {
+  var n = 4096;
+  var pipeline = await computePipeline(device, `
+    @group(0) @binding(0) var<storage, read_write> bins : array<atomic<u32>, 16>;
+    @group(0) @binding(1) var<storage, read_write> sums : array<u32>;
+    var<workgroup> partial : array<u32, 64>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid : vec3<u32>,
+                                         @builtin(local_invocation_index) lid : u32,
+                                         @builtin(workgroup_id) wid : vec3<u32>) {
+      atomicAdd(&bins[gid.x % 16u], 1u);
+      partial[lid] = gid.x;
+      workgroupBarrier();
+      for (var stride = 32u; stride > 0u; stride = stride / 2u) {
+        if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+        workgroupBarrier();
+      }
+      if (lid == 0u) { sums[wid.x] = partial[0]; }
+    }`);
+  var usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC;
+  var bins = device.createBuffer({ size: 64, usage: usage }), sums = device.createBuffer({ size: (n / 64) * 4, usage: usage });
+  var group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bins } }, { binding: 1, resource: { buffer: sums } }] });
+  var enc = device.createCommandEncoder(), c = enc.beginComputePass();
+  c.setPipeline(pipeline); c.setBindGroup(0, group); c.dispatchWorkgroups(n / 64); c.end();
+  device.queue.submit([enc.finish()]);
+  var b = new Uint32Array(await readBuffer(device, bins, 64)), s = new Uint32Array(await readBuffer(device, sums, (n / 64) * 4));
+  for (var i = 0; i < 16; i++) if (b[i] !== n / 16) return "bin " + i + " = " + b[i] + ", want " + n / 16;
+  for (var w = 0; w < n / 64; w++) {
+    var want = 64 * 64 * w + 63 * 32;          // sum of 64w .. 64w + 63
+    if (s[w] !== want) return "workgroup " + w + " sum = " + s[w] + ", want " + want;
+  }
+  return "";
+}
+
+// GPU-driven drawing: a compute pass writes drawIndirect's arguments (3 vertices, 2 instances); each
+// instance fills one half of the target.
+async function indirectTest(device) {
+  var args = device.createBuffer({ size: 16, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE });
+  var writer = await computePipeline(device, `
+    @group(0) @binding(0) var<storage, read_write> args : array<u32, 4>;
+    @compute @workgroup_size(1) fn main() { args[0] = 3u; args[1] = 2u; args[2] = 0u; args[3] = 0u; }`);
+  var pipeline = await renderPipeline(device, `
+    struct VOut { @builtin(position) pos : vec4<f32>, @location(0) @interpolate(flat) inst : u32 };
+    @vertex fn vs(@builtin(vertex_index) i : u32, @builtin(instance_index) inst : u32) -> VOut {
+      var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+      var o : VOut;
+      o.pos = vec4<f32>(p[i], 0.0, 1.0);
+      o.inst = inst;
+      return o;
+    }
+    @fragment fn fs(v : VOut) -> @location(0) vec4<f32> {
+      let left = v.pos.x < 32.0;
+      if ((v.inst == 0u) != left) { discard; }
+      if (left) { return vec4<f32>(0.0, 1.0, 1.0, 1.0); }
+      return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    }`, {});
+  var color = target(device), enc = device.createCommandEncoder();
+  var c = enc.beginComputePass();
+  c.setPipeline(writer);
+  c.setBindGroup(0, device.createBindGroup({ layout: writer.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: args } }] }));
+  c.dispatchWorkgroups(1); c.end();
+  var p = pass(enc, color.createView());
+  p.setPipeline(pipeline); p.drawIndirect(args, 0); p.end();
+  device.queue.submit([enc.finish()]);
+  return checkPixels(await readBack(device, color, W, H), [[8, 32, [0, 255, 255, 255], "instance 0, left"], [56, 32, [255, 0, 255, 255], "instance 1, right"]]);
+}
+
+// A render bundle (recorded once) executed in a pass, then a draw after it in the same pass.
+async function bundleTest(device) {
+  var pipeline = await renderPipeline(device, FULLSCREEN_VS + `
+    @fragment fn fs(v : VOut) -> @location(0) vec4<f32> { return vec4<f32>(v.uv.x, 0.0, 0.5, 1.0); }`, {});
+  var bundleEncoder = device.createRenderBundleEncoder({ colorFormats: ["rgba8unorm"] });
+  bundleEncoder.setPipeline(pipeline); bundleEncoder.draw(3);
+  var bundle = bundleEncoder.finish();
+  var color = target(device), enc = device.createCommandEncoder(), p = pass(enc, color.createView());
+  p.executeBundles([bundle]); p.end();
+  device.queue.submit([enc.finish()]);
+  return checkPixels(await readBack(device, color, W, H), [[8, 8, [Math.round(255 * 8.5 / 64), 0, 128, 255], "bundle's gradient"],
+    [56, 50, [Math.round(255 * 56.5 / 64), 0, 128, 255], "bundle's gradient"]]);
+}
+
+// A compute shader writes a storage texture; a render pass samples it with textureLoad.
+async function storageTextureTest(device) {
+  var tex = device.createTexture({ size: [W, H], format: "rgba8unorm", usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
+  var writer = await computePipeline(device, `
+    @group(0) @binding(0) var out : texture_storage_2d<rgba8unorm, write>;
+    @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+      textureStore(out, vec2<i32>(id.xy), vec4<f32>(f32(id.x) * 4.0 / 255.0, f32(id.y) * 4.0 / 255.0, 0.5, 1.0));
+    }`);
+  var reader = await renderPipeline(device, FULLSCREEN_VS + `
+    @group(0) @binding(0) var src : texture_2d<f32>;
+    @fragment fn fs(v : VOut) -> @location(0) vec4<f32> { return textureLoad(src, vec2<i32>(v.pos.xy), 0).bgra; }`, {});
+  var color = target(device), enc = device.createCommandEncoder(), c = enc.beginComputePass();
+  c.setPipeline(writer);
+  c.setBindGroup(0, device.createBindGroup({ layout: writer.getBindGroupLayout(0), entries: [{ binding: 0, resource: tex.createView() }] }));
+  c.dispatchWorkgroups(W / 8, H / 8); c.end();
+  var p = pass(enc, color.createView());
+  p.setPipeline(reader);
+  p.setBindGroup(0, device.createBindGroup({ layout: reader.getBindGroupLayout(0), entries: [{ binding: 0, resource: tex.createView() }] }));
+  p.draw(3); p.end();
+  device.queue.submit([enc.finish()]);
+  return checkPixels(await readBack(device, color, W, H), [[10, 20, [128, 80, 40, 255], "texel (10,20), swizzled"], [60, 3, [128, 12, 240, 255], "texel (60,3), swizzled"]]);
+}
+
+// A cube map with a color per face, sampled along each axis (six vertical stripes).
+async function cubeMapTest(device) {
+  var colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255], [255, 0, 255]];
+  var tex = device.createTexture({ size: [4, 4, 6], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  colors.forEach(function (col, face) {
+    var d = new Uint8Array(4 * 4 * 4);
+    for (var i = 0; i < 16; i++) d.set([col[0], col[1], col[2], 255], i * 4);
+    device.queue.writeTexture({ texture: tex, origin: [0, 0, face] }, d, { bytesPerRow: 16, rowsPerImage: 4 }, [4, 4, 1]);
+  });
+  var pipeline = await renderPipeline(device, FULLSCREEN_VS + `
+    @group(0) @binding(0) var cube : texture_cube<f32>;
+    @group(0) @binding(1) var smp : sampler;
+    @fragment fn fs(v : VOut) -> @location(0) vec4<f32> {
+      var dirs = array<vec3<f32>, 6>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0),
+                                     vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0));
+      return textureSample(cube, smp, dirs[min(u32(v.uv.x * 6.0), 5u)]);
+    }`, {});
+  var color = target(device), enc = device.createCommandEncoder(), p = pass(enc, color.createView());
+  p.setPipeline(pipeline);
+  p.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: tex.createView({ dimension: "cube" }) }, { binding: 1, resource: device.createSampler() }] }));
+  p.draw(3); p.end();
+  device.queue.submit([enc.finish()]);
+  return checkPixels(await readBack(device, color, W, H), colors.map(function (col, k) {
+    return [Math.floor((k + 0.5) * W / 6), 32, [col[0], col[1], col[2], 255], "face " + k];
+  }));
+}
+
+// Shadow-map style depth comparison: a depth texture cleared to 0.5, sampled with a comparison sampler
+// against 0.4 (left, lit) and 0.6 (right, shadowed).
+async function shadowCompareTest(device) {
+  var depth = device.createTexture({ size: [W, H], format: "depth32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+  var pipeline = await renderPipeline(device, FULLSCREEN_VS + `
+    @group(0) @binding(0) var shadow : texture_depth_2d;
+    @group(0) @binding(1) var cmp : sampler_comparison;
+    @fragment fn fs(v : VOut) -> @location(0) vec4<f32> {
+      let against = select(0.6, 0.4, v.uv.x < 0.5);
+      let lit = textureSampleCompare(shadow, cmp, v.uv, against);
+      return vec4<f32>(lit, lit, lit, 1.0);
+    }`, {});
+  var enc = device.createCommandEncoder();
+  enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: depth.createView(), depthClearValue: 0.5, depthLoadOp: "clear", depthStoreOp: "store" } }).end();
+  var color = target(device), p = pass(enc, color.createView());
+  p.setPipeline(pipeline);
+  p.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: depth.createView() }, { binding: 1, resource: device.createSampler({ compare: "less" }) }] }));
+  p.draw(3); p.end();
+  device.queue.submit([enc.finish()]);
+  return checkPixels(await readBack(device, color, W, H), [[10, 32, [255, 255, 255, 255], "0.4 < 0.5: lit"], [54, 32, [0, 0, 0, 255], "0.6 > 0.5: shadowed"]]);
+}
+
+// Stencil masking and alpha blending: a stencil-only quad marks the left half; a half-transparent green
+// fullscreen draw lands only there, blended over the red clear.
+async function stencilBlendTest(device) {
+  var ds = device.createTexture({ size: [W, H], format: "depth24plus-stencil8", usage: GPUTextureUsage.RENDER_ATTACHMENT });
+  var code = `
+    @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
+      var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+      return vec4<f32>(p[i], 0.0, 1.0);
+    }
+    @group(0) @binding(0) var<uniform> clip : vec4<f32>;
+    @fragment fn fs(@builtin(position) pos : vec4<f32>) -> @location(0) vec4<f32> {
+      if (pos.x > clip.x) { discard; }
+      return vec4<f32>(0.0, 1.0, 0.0, 0.5);
+    }`;
+  var stencilFace = function (compare, passOp) { return { compare: compare, passOp: passOp, failOp: "keep", depthFailOp: "keep" }; };
+  var marker = await renderPipeline(device, code, { targets: [{ format: "rgba8unorm", writeMask: 0 }],
+    depthStencil: { format: "depth24plus-stencil8", depthWriteEnabled: false, depthCompare: "always",
+      stencilFront: stencilFace("always", "replace"), stencilBack: stencilFace("always", "replace") } });
+  var painter = await renderPipeline(device, code, {
+    targets: [{ format: "rgba8unorm", blend: { color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" }, alpha: { srcFactor: "one", dstFactor: "zero" } } }],
+    depthStencil: { format: "depth24plus-stencil8", depthWriteEnabled: false, depthCompare: "always",
+      stencilFront: stencilFace("equal", "keep"), stencilBack: stencilFace("equal", "keep") } });
+  var group = function (pipeline, x) {
+    return device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: bufferWith(device, GPUBufferUsage.UNIFORM, new Float32Array([x, 0, 0, 0])) } }] });
+  };
+  var color = target(device), enc = device.createCommandEncoder();
+  var p = enc.beginRenderPass({ colorAttachments: [{ view: color.createView(), clearValue: [1, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
+    depthStencilAttachment: { view: ds.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "discard", stencilClearValue: 0, stencilLoadOp: "clear", stencilStoreOp: "discard" } });
+  p.setStencilReference(1);
+  p.setPipeline(marker); p.setBindGroup(0, group(marker, 32)); p.draw(3);
+  p.setPipeline(painter); p.setBindGroup(0, group(painter, 1000)); p.draw(3);
+  p.end();
+  device.queue.submit([enc.finish()]);
+  return checkPixels(await readBack(device, color, W, H), [[10, 32, [128, 128, 0, 128], "stencil set: green blended over red"], [54, 32, [255, 0, 0, 255], "stencil clear: red"]]);
+}
+
+// Occlusion queries: a near quad over the left half, then a far fullscreen draw (visible on the right) and a
+// far left-half draw (hidden), each in its own query.
+async function occlusionTest(device) {
+  var depth = device.createTexture({ size: [W, H], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT });
+  var pipeline = await renderPipeline(device, `
+    struct Quad { rect : vec4<f32>, z : vec4<f32> };
+    @group(0) @binding(0) var<uniform> q : Quad;
+    @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
+      var c = array<vec2<f32>, 6>(vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0));
+      return vec4<f32>(mix(q.rect.xy, q.rect.zw, c[i]), q.z.x, 1.0);
+    }
+    @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }`, { depthStencil: DEPTH });
+  var quad = function (x0, y0, x1, y1, z) {
+    return device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: bufferWith(device, GPUBufferUsage.UNIFORM, new Float32Array([x0, y0, x1, y1, z, 0, 0, 0])) } }] });
+  };
+  var queries = device.createQuerySet({ type: "occlusion", count: 2 });
+  var resolved = device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+  var color = target(device), enc = device.createCommandEncoder();
+  var p = pass(enc, color.createView(), { occlusionQuerySet: queries,
+    depthStencilAttachment: { view: depth.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" } });
+  p.setPipeline(pipeline);
+  p.setBindGroup(0, quad(-1, -1, 0, 1, 0.2)); p.draw(6);
+  p.beginOcclusionQuery(0); p.setBindGroup(0, quad(-1, -1, 1, 1, 0.5)); p.draw(6); p.endOcclusionQuery();
+  p.beginOcclusionQuery(1); p.setBindGroup(0, quad(-1, -1, 0, 1, 0.5)); p.draw(6); p.endOcclusionQuery();
+  p.end();
+  enc.resolveQuerySet(queries, 0, 2, resolved, 0);
+  device.queue.submit([enc.finish()]);
+  var r = new BigUint64Array(await readBuffer(device, resolved, 16));
+  var problems = [];
+  if (r[0] === 0n) problems.push("the visible draw counted no samples");
+  if (r[1] !== 0n) problems.push("the hidden draw counted " + r[1] + " samples");
+  return problems.join("; ");
+}
+
+// Texture upload from an image, as samples load theirs: a 2D canvas through createImageBitmap and
+// copyExternalImageToTexture.
+async function externalImageTest(device) {
+  var c2d = document.createElement("canvas"); c2d.width = 4; c2d.height = 4;
+  var g = c2d.getContext("2d");
+  g.fillStyle = "rgb(255, 0, 0)"; g.fillRect(0, 0, 2, 4);
+  g.fillStyle = "rgb(0, 0, 255)"; g.fillRect(2, 0, 2, 4);
+  var bitmap = await within(createImageBitmap(c2d), 30, "createImageBitmap");
+  var tex = device.createTexture({ size: [4, 4], format: "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT });
+  device.queue.copyExternalImageToTexture({ source: bitmap }, { texture: tex }, [4, 4]);
+  return checkPixels(await readBack(device, tex, 4, 4), [[0, 0, [255, 0, 0, 255], "left"], [3, 3, [0, 0, 255, 255], "right"]]);
+}
+
+// The canvas: a lit cube spinning on two axes for 30 frames with depth, a changing clear color; the last
+// frame is copied out before it is presented.
+function animate(device) {
+  return new Promise(function (resolve) {
+    (async function () {
+      var canvas = document.getElementById("canvas");
+      var ctx = canvas.getContext("webgpu");
+      if (!ctx) { resolve("canvas.getContext('webgpu') returned null"); return; }
+      var format = navigator.gpu.getPreferredCanvasFormat();
+      ctx.configure({ device: device, format: format, alphaMode: "opaque", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      var pipeline = await renderPipeline(device, LIT_WGSL, { buffers: VERTEX_LAYOUT, depthStencil: DEPTH,
+        targets: [{ format: format }], primitive: { topology: "triangle-list", cullMode: "back" } });
+      var depth = device.createTexture({ size: [W, H], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT });
+      var cube = bufferWith(device, GPUBufferUsage.VERTEX, cubeVertices());
+      var uniforms = device.createBuffer({ size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      var group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniforms } }] });
+      var readback = device.createBuffer({ size: 256 * H, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      var frame = 0, frames = 30, started = performance.now();
+      async function draw() {
+        var model = multiply(rotationY(frame * 0.2), rotationX(frame * 0.13));
+        var data = new Float32Array(40);
+        data.set(multiply(perspective(Math.PI / 3, 1, 1, 10), multiply(translation(0, 0, -3), model)), 0);
+        data.set(model, 16); data.set([0, 0, 1, 0], 32); data.set([1, 0.5, 0.25, 1], 36);
+        device.queue.writeBuffer(uniforms, 0, data);
+        var texture = ctx.getCurrentTexture(), last = frame === frames - 1;
+        var enc = device.createCommandEncoder();
+        var p = enc.beginRenderPass({ colorAttachments: [{ view: texture.createView(), clearValue: [frame / (frames - 1), 0, 1 - frame / (frames - 1), 1], loadOp: "clear", storeOp: "store" }],
+          depthStencilAttachment: { view: depth.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" } });
+        p.setPipeline(pipeline); p.setBindGroup(0, group); p.setVertexBuffer(0, cube); p.draw(36); p.end();
+        if (last) enc.copyTextureToBuffer({ texture: texture }, { buffer: readback, bytesPerRow: 256, rowsPerImage: H }, [W, H, 1]);
+        device.queue.submit([enc.finish()]);
+        if (!last) { frame++; requestAnimationFrame(function () { draw().catch(function (e) { resolve("threw " + e.message); }); }); return; }
+        await within(readback.mapAsync(GPUMapMode.READ), 30, "mapAsync");
+        var bytes = new Uint8Array(readback.getMappedRange().slice(0));
+        readback.unmap();
+        var bgra = format === "bgra8unorm";
+        var problems = checkPixels(bytes, [[1, 1, [255, 0, 0, 255], "the last frame's clear color"]], bgra);
+        // The face nearest the camera covers the center; its normal is at least 1/sqrt(3) along the light.
+        var center = pixelAt(bytes, 32, 32, bgra);
+        if (!(center[1] >= 70 && center[1] <= 130 && center[0] >= 140 && center[2] < 70)) problems += (problems ? "; " : "") + "center (32,32) = " + center.join(",") + ", not the lit cube";
+        resolve({ problems: problems, note: "30 frames in " + Math.round(performance.now() - started) + " ms" });
+      }
+      requestAnimationFrame(function () { draw().catch(function (e) { resolve("threw " + e.message); }); });
+    })().catch(function (e) { resolve("threw " + e.message); });
+  });
+}
+
+// ---- driver -----------------------------------------------------------------------------------
+
+(async function main() {
+  if (!("gpu" in navigator)) { row("navigator.gpu", false, "absent (isSecureContext=" + window.isSecureContext + ")"); return; }
+  var adapter = null;
+  try { adapter = await within(navigator.gpu.requestAdapter(), 120, "requestAdapter"); }
+  catch (e) { row("adapter", false, e.message); return; }
+  if (!adapter) { row("adapter", false, "requestAdapter() returned null"); return; }
+  var info = adapter.info || {};
+  document.getElementById("adapter").textContent = "adapter: vendor=" + info.vendor + " architecture=" + info.architecture +
+    " description=" + info.description + " isFallbackAdapter=" + info.isFallbackAdapter;
+  var device = null;
+  try { device = await within(adapter.requestDevice(), 60, "requestDevice"); }
+  catch (e) { row("device", false, e.message); return; }
+  if (!device) { row("device", false, "null device"); return; }
+  var uncaptured = [], lost = null;
+  device.addEventListener("uncapturederror", function (e) { uncaptured.push(e.error.message); });
+  device.lost.then(function (i) { lost = i.reason + ": " + i.message; });
+  var tests = [
+    ["perspective lit cube, depth, culling", litCubeTest],
+    ["dynamic uniform offsets", dynamicOffsetsTest],
+    ["mipmaps generated by render passes", mipmapTest],
+    ["4x MSAA with resolve target", msaaTest],
+    ["compute particles, ping-pong storage", particlesTest],
+    ["atomics and workgroup memory", atomicsTest],
+    ["GPU-written drawIndirect", indirectTest],
+    ["render bundle", bundleTest],
+    ["storage texture, textureLoad", storageTextureTest],
+    ["cube map", cubeMapTest],
+    ["shadow comparison sampler", shadowCompareTest],
+    ["stencil mask, alpha blending", stencilBlendTest],
+    ["occlusion queries", occlusionTest],
+    ["copyExternalImageToTexture", externalImageTest]];
+  for (var i = 0; i < tests.length; i++) await step(device, tests[i][0], tests[i][1]);
+  await step(device, "30 animated canvas frames", animate);
+  if (lost) row("device.lost", false, lost);
+  if (uncaptured.length) row("uncapturederror", false, uncaptured.slice(0, 3).join("; "));
+})().catch(function (e) { row("main", false, "threw " + e.message); }).finally(function () {
+  var verdict = failures.length ? "FAIL " + failures[0] : "PASS";
+  document.getElementById("status").textContent = verdict +
+    (failures.length > 1 ? " (+" + (failures.length - 1) + " more: " + failures.slice(1).join(", ") + ")" : "") +
+    " (" + Math.round(performance.now()) + " ms after navigation)";
+  document.getElementById("h").setAttribute("data-js", "ran");
+  document.body.dataset.verdict = verdict;
+  document.title = "Alchemy WebGPU scene: " + verdict;
+  finished = true;
+});
+</script>
+</body>
+</html>

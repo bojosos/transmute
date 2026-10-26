@@ -769,6 +769,63 @@ void test_render(const std::shared_ptr<metal::Device>& device, bool sampled, boo
     expect(outside == blue && corner == blue, kind + "clear color outside the triangle: " + line);
 }
 
+// Occlusion queries through a visibility result buffer in `storage` (Dawn's is
+// private): counting mode at offset 0 around the top-half triangle, at offset 8
+// around no draw. A blit in the same command buffer reads the results, as
+// Dawn's query resolve does, so they are in the buffer when the pass ends.
+void test_visibility_results(const std::shared_ptr<metal::Device>& device, metal::StorageMode storage) {
+    metal::RenderPipelineDescriptor descriptor;
+    descriptor.vertex = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(vertex_function()));
+    descriptor.fragment = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(fragment_function(false)));
+    descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+    descriptor.attributes[0] = metal::VertexAttribute{29, 0, 0};
+    descriptor.layouts[0] = metal::VertexLayout{8, 1, 1};
+    descriptor.label = "visibility";
+    auto pipeline = metal::RenderPipeline::create(device, descriptor);
+    metal::TextureDescriptor target_descriptor;
+    target_descriptor.pixel_format = metal::pixel_format::rgba8_unorm;
+    target_descriptor.width = target_descriptor.height = 64;
+    target_descriptor.usage = metal::texture_usage::render_target;
+    target_descriptor.options = {metal::StorageMode::private_};
+
+    const float positions[] = {-1, 1, 1, 1, 0, 0};
+    auto vertices = shared_buffer(device, sizeof(positions));
+    std::memcpy(vertices->contents(), positions, sizeof(positions));
+    const float colors[] = {1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1};
+    const float tint[] = {1, 1, 1, 1};
+    auto visibility = metal::Buffer::create(device, 16, {storage, 0});
+    auto readback = shared_buffer(device, 16);
+    std::memset(readback->contents(), 0xab, 16);
+
+    metal::RenderPass pass;
+    pass.colors[0].texture = metal::Texture::create(device, target_descriptor);
+    pass.colors[0].load_action = 2;
+    pass.colors[0].store_action = 1;
+    pass.visibility = visibility;
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_render(pass);
+    commands->set_render_pipeline(pipeline);
+    commands->set_buffer(metal::Stage::vertex, 0, vertices, 0);
+    commands->set_bytes(metal::Stage::vertex, 1, {reinterpret_cast<const std::uint8_t*>(colors), sizeof(colors)});
+    commands->set_bytes(metal::Stage::fragment, 0, {reinterpret_cast<const std::uint8_t*>(tint), sizeof(tint)});
+    commands->set_visibility_mode(2, 0);   // MTLVisibilityResultModeCounting
+    commands->draw(3, 0, 3, 1, 0);
+    commands->set_visibility_mode(2, 8);
+    commands->set_visibility_mode(0, 8);   // disabled
+    commands->end_encoding();
+    commands->begin_blit();
+    commands->copy_buffer(visibility, 0, readback, 0, 16);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "visibility command buffer completes");
+    std::uint64_t results[2]{};
+    std::memcpy(results, readback->contents(), sizeof(results));
+    const std::string kind = storage == metal::StorageMode::private_ ? "private" : "shared";
+    expect(results[0] > 0 && results[0] != 0xababababababababULL,
+           kind + " visibility buffer: the triangle's query passed samples (" + std::to_string(results[0]) + ")");
+    expect(results[1] == 0, kind + " visibility buffer: the query around no draw is 0 (" + std::to_string(results[1]) + ")");
+}
+
 // A fragment function of `code` with a float4 color input and float4 color
 // outputs 0..outputs-1, as the MSL compiler reflects it.
 msl::Function plain_fragment(const std::uint32_t* code, std::size_t bytes, std::uint32_t outputs) {
@@ -1033,6 +1090,8 @@ int main() {
         test_render(device, false);
         test_render(device, true);
         test_render(device, true, true);
+        test_visibility_results(device, metal::StorageMode::private_);
+        test_visibility_results(device, metal::StorageMode::shared);
         test_sampler_lod_clamp(device);
         test_framebuffer_fetch(device);
         test_argument_buffer_samplers(device);

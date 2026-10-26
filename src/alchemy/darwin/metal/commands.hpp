@@ -16,15 +16,16 @@
 //   blit    -> transfer commands with a transfer barrier between commands.
 // Every encoder starts with a full memory barrier, which gives Metal's
 // default hazard tracking between encoders (and between command buffers).
-// setBytes data, argument tables and visibility-query results live in
-// per-command-buffer upload memory recycled when the GPU is done.
+// setBytes data and argument tables live in per-command-buffer upload memory
+// recycled when the GPU is done. Visibility-query results are copied into the
+// visibility result buffer on the GPU when the render pass ends.
 // encodeSignalEvent:/encodeWaitForEvent: split the recording into batches of
 // one vkQueueSubmit2 with timeline semaphore signals/waits between them.
 //
 // Completion: commit() submits on the device queue (Device::submit) and
 // schedules finalize() for when the timeline passes the submission's value:
-// finalize recycles memory, writes visibility results and drops retained
-// references. It runs on whichever thread observes completion first
+// finalize recycles memory, writes summed visibility results (several
+// queries at one offset, shared storage) and drops retained references. It runs on whichever thread observes completion first
 // (status(), wait(), Device::collect()). Guest-visible handlers are the
 // Objective-C layer's business.
 //

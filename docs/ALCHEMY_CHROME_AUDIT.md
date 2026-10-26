@@ -855,12 +855,21 @@ hardware GPU (below).
       `copyTexSubImage2D`, then 30 animated frames. It passes headless and windowed (cloaked, 0 visible windows),
       exit 0. A desktop Chrome on D3D11 gives the same pixels. Headless, the 30 frames take about 26 s (a
       functional run on a busy machine, not a measurement).
-    * **WebGPU stops before Dawn** (`webgpu.html`, `--enable-unsafe-webgpu`): the renderer's WebGPU command buffer
-      fails, `CommandBufferHelper::AllocateRingBuffer() failed`, so Blink logs "Failed to create WebGPU Context
-      Provider" and `requestAdapter()` answers null. Its 64 KiB ring buffer is shared memory that Chrome maps into
-      V8's sandbox with `vm_remap(VM_FLAGS_OVERWRITE, copy = FALSE)` over mmap'd pages, which Alchemy refuses
-      (`KERN_NOT_SUPPORTED`). That needs placeholder-backed mmap reservations in alchemy-fx (the reverted
-      `0cf0842`). The GPU process does enumerate Metal (`MTLCopyAllDevices`).
+    * **WebGPU on Dawn's Metal back end** (`--enable-unsafe-webgpu`; the AIR translator DLL is needed here too,
+      or ANGLE-Metal fails and the single-process run traps). WebGPU used to stop before Dawn: the renderer maps
+      its WebGPU command buffer's ring buffer into V8's sandbox with `vm_remap(VM_FLAGS_OVERWRITE, copy = FALSE)`
+      over mmap'd pages, which Alchemy refused. alchemy-fx now has placeholder-backed guest reservations
+      (`b83d56e4`), and `requestAdapter()` gives the hardware adapter (intel, gen-12lp, not the fallback).
+      `webgpu.html` passes, and so does `scripts/chrome/pages/webgpu_scene.html`: 15 self-checking tests in the
+      classic samples' style. They cover a lit perspective cube with depth and culling, dynamic uniform offsets,
+      mipmaps rendered level by level, 4x MSAA with a resolve target, ping-pong compute particles, atomics and
+      workgroup reductions, a GPU-written `drawIndirect`, render bundles, storage textures, cube maps, a shadow
+      comparison sampler, stencil with alpha blending, occlusion queries, `copyExternalImageToTexture`, and 30
+      animated canvas frames. It passes headless and windowed (cloaked, 0 visible windows), exit 0, and a desktop
+      Chrome on D3D12 passes the same checks. Dawn keeps occlusion results in a private-storage visibility
+      buffer, which used to be an explicit stop. Results are now copied into the buffer on the GPU at the end of
+      the pass, so a resolve blit later in the same command buffer reads them; that is also a fix for shared
+      buffers, which completion used to fill.
   * **ANGLE's Vulkan back end on the host's Vulkan** isn't allowed. Chrome 155 on macOS accepts only ANGLE on Metal,
     or on SwiftShader with `--enable-unsafe-swiftshader`. Its message is `gl_factory.cc:110 ... not found in allowed
     implementations: [(gl=egl-angle,angle=metal)]`.
@@ -922,7 +931,7 @@ hardware GPU (below).
     accounts.figure53.com and the renderer's license server.
 * **Open, and follow-ups:**
   * Hardware WebGL: with the AIR translator DLL, WebGL programs draw on the GPU, headless and windowed (above).
-    WebGPU needs `vm_remap` of shared memory over mmap'd pages (above). Whether Graphite runs on Dawn's Metal
+    WebGPU runs on Dawn's Metal back end, headless and windowed (above). Whether Graphite runs on Dawn's Metal
     back end hasn't been checked yet.
   * The On-Device Model Service's Dawn on Metal reaches our MSL compiler. Its remaining shader failures stay in that
     utility child.
