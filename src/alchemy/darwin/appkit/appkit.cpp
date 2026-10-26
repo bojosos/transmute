@@ -1,3 +1,4 @@
+#include "alchemy/darwin/appkit/c_functions.hpp"
 #include "alchemy/darwin/appkit/appkit_internal.hpp"
 #include "alchemy/registration_audit.hpp"
 
@@ -400,6 +401,7 @@ void AppKit::install() {
     install_container_coding();
     install_panels();
     install_window_tabs();   // NSWindow toolbars and tabs (after NSToolbar)
+    install_c_functions(*this);   // NSDrawTiledRects, NSRunAlertPanel, NSWindowList, ... (c_functions.cpp)
     install_hitoolbox();
     install_controllers();
     install_documents();

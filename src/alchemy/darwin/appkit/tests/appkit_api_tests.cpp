@@ -6,6 +6,7 @@
 // container views and controllers. Native classes stand in for guest
 // subclasses, so calls go through ObjcRuntime::send.
 #include "alchemy/darwin/appkit/appkit_internal.hpp"
+#include "alchemy/darwin/appkit/c_functions.hpp"
 #include "alchemy/darwin/appkit/tests/fake_window_server.hpp"
 #include "alchemy/darwin/coregraphics/quartz2d.hpp"
 #include "alchemy/gui/tests/fill_fixture.hpp"
@@ -619,6 +620,119 @@ void toolbars_and_tabs(Fixture& f) {
     for (const auto value : {second, third, fourth}) static_cast<void>(f.id(value, "close"));
 }
 
+// AppKit's C functions (the frameworks wave, U8).
+void c_functions(Fixture& f) {
+    constexpr std::string_view ak = "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit";
+    // Windows on screen, front to back.
+    const auto back = f.window({{100, 100}, {200, 100}});
+    const auto front = f.window({{150, 150}, {200, 100}});
+    static_cast<void>(f.id(back, "makeKeyAndOrderFront:", {0}));
+    static_cast<void>(f.id(front, "makeKeyAndOrderFront:", {0}));
+    const auto count = f.block(8), list = f.block(64);
+    static_cast<void>(f.call(ak, "_NSCountWindows", {count}));
+    const auto on_screen = f.engine.read64(count);
+    static_cast<void>(f.call(ak, "_NSWindowList", {on_screen, list}));
+    require(on_screen >= 2 && f.engine.read64(list) == f.id(front, "windowNumber"), "NSCountWindows / NSWindowList, front first");
+    // Depths.
+    const auto exact = f.block(8);
+    require(f.call(ak, "_NSBestDepth", {f.str("NSCalibratedRGBColorSpace"), 8, 24, 0, exact}) == 0x208 && (f.engine.read64(exact) & 0xff) == 1,
+            "NSBestDepth");
+    require(f.call(ak, "_NSBitsPerSampleFromDepth", {0x210}) == 16 && f.call(ak, "_NSPlanarFromDepth", {0x208}) == 0 &&
+                f.text(f.call(ak, "_NSColorSpaceFromDepth", {0x208})) == "NSCalibratedRGBColorSpace" &&
+                f.call(ak, "_NSNumberOfColorComponents", {f.str("NSDeviceCMYKColorSpace")}) == 4,
+            "depth accessors");
+    const auto depths = f.call(ak, "_NSAvailableWindowDepths");
+    require(depths && (f.engine.read64(depths) & 0xffffffff) == 0x208, "NSAvailableWindowDepths");
+    // Typed pasteboard types.
+    const auto typed = f.call(ak, "_NSCreateFilenamePboardType", {f.str("txt")});
+    require(f.text(typed) == "NSTypedFilenamesPboardType:txt" && f.text(f.call(ak, "_NSGetFileType", {typed})) == "txt" &&
+                f.call(ak, "_NSGetFileType", {f.str("public.utf8-plain-text")}) == 0,
+            "typed pasteboard types");
+    require(f.call(ak, "_NSInterfaceStyleForKey", {0, 0}) == 3 && f.call(ak, "_NSTouchTypeMaskFromType", {1}) == 2, "interface style and touch mask");
+    // NSRunAlertPanel: the format with its variadic arguments; the default button answers NSAlertDefaultReturn.
+    appkit::AlertRequest seen;
+    appkit::set_alert_presenter_override([&seen](const appkit::AlertRequest& request) { seen = request; return std::size_t{0}; });
+    CallRegs panel;
+    panel.x[0] = f.str("Title");
+    panel.x[1] = f.str("%d items");
+    panel.x[2] = f.str("Keep");
+    panel.x[3] = f.str("Discard");
+    panel.x[4] = 0;
+    panel.push_variadic(std::int64_t{42});
+    require(static_cast<std::int64_t>(f.regs(ak, "_NSRunAlertPanel", panel).x0) == 1 && seen.message == "Title" && seen.informative == "42 items" &&
+                seen.buttons == std::vector<std::string>{"Keep", "Discard"},
+            "NSRunAlertPanel");
+    appkit::set_alert_presenter_override([](const appkit::AlertRequest&) { return std::size_t{1}; });
+    panel.x[1] = f.str("plain");
+    panel.stack.clear();
+    require(static_cast<std::int64_t>(f.regs(ak, "_NSRunCriticalAlertPanel", panel).x0) == 0, "the alternate button answers NSAlertAlternateReturn");
+    appkit::set_alert_presenter_override({});
+    // Drawing into a bitmap: a gray bezel's middle is light gray; the tiled rects answer what is left.
+    const auto rep = [&f] {
+        CallRegs init;
+        init.x[2] = 0;
+        init.x[3] = 16;
+        init.x[4] = 16;
+        init.x[5] = 8;
+        init.x[6] = 4;
+        init.x[7] = 1;
+        init.push_stack(std::uint8_t{0});
+        init.push_stack(f.str("NSDeviceRGBColorSpace"));
+        init.push_stack(std::int64_t{64});
+        init.push_stack(std::int64_t{32});
+        return f.msg(f.id(f.cls("NSBitmapImageRep"), "alloc"),
+                     "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:",
+                     init).x0;
+    }();
+    const auto context = f.id(f.cls("NSGraphicsContext"), "graphicsContextWithBitmapImageRep:", {rep});
+    require(context != 0, "a bitmap graphics context");
+    static_cast<void>(f.id(f.cls("NSGraphicsContext"), "saveGraphicsState", {}));
+    static_cast<void>(f.id(f.cls("NSGraphicsContext"), "setCurrentContext:", {context}));
+    CallRegs bezel;
+    appkit::put_rect(bezel, 0, {{0, 0}, {16, 16}});
+    appkit::put_rect(bezel, 4, {{0, 0}, {16, 16}});
+    static_cast<void>(f.regs(ak, "_NSDrawGrayBezel", bezel));
+    CallRegs at;
+    at.set_d(0, 8.5);
+    at.set_d(1, 8.5);
+    const auto middle = f.regs(ak, "_NSReadPixel", at).x0;
+    require(middle != 0, "NSReadPixel answers a color");
+    const auto rgba = f.block(32);
+    static_cast<void>(f.id(middle, "getRed:green:blue:alpha:", {rgba, rgba + 8, rgba + 16, rgba + 24}));
+    const auto red = std::bit_cast<double>(f.engine.read64(rgba));
+    require(std::abs(red - 2.0 / 3) < 0.05, "the gray bezel's middle is light gray: " + std::to_string(red));
+    const auto sides = f.block(16), grays = f.block(16);
+    f.engine.write64(sides, 0);   // NSMinXEdge
+    f.engine.write64(sides + 8, 3);   // NSMaxYEdge
+    f.engine.write64(grays, std::bit_cast<std::uint64_t>(0.0));
+    f.engine.write64(grays + 8, std::bit_cast<std::uint64_t>(1.0));
+    CallRegs tiles = bezel;
+    tiles.x[0] = sides;
+    tiles.x[1] = grays;
+    tiles.x[2] = 2;
+    const auto left = f.regs(ak, "_NSDrawTiledRects", tiles);
+    require(near(left.d(0), 1) && near(left.d(2), 15) && near(left.d(3), 15), "NSDrawTiledRects answers the remaining rect");
+    static_cast<void>(f.id(f.cls("NSGraphicsContext"), "restoreGraphicsState", {}));
+    // NSShowAnimationEffect tells the delegate at once.
+    const auto delegate_class = f.subclass("U8AnimationDelegate", "NSObject");
+    f.add(delegate_class, "effectEnded:", [](CpuState& s, GuestMemory&) { journal.push_back("effect " + std::to_string(s.x[2])); }, "v@:^v");
+    CallRegs effect;
+    effect.x[0] = 0;
+    effect.x[1] = f.alloc_init("U8AnimationDelegate");
+    effect.x[2] = f.objc.selector("effectEnded:");
+    effect.x[3] = 7;
+    static_cast<void>(f.regs(ak, "_NSShowAnimationEffect", effect));
+    require(logged("effect 7"), "NSShowAnimationEffect calls the delegate");
+    // Screen updates nest.
+    static_cast<void>(f.call(ak, "_NSDisableScreenUpdates"));
+    static_cast<void>(f.call(ak, "_NSDisableScreenUpdates"));
+    static_cast<void>(f.call(ak, "_NSEnableScreenUpdates"));
+    require(appkit::screen_updates_disabled(), "screen updates stay disabled until the last enable");
+    static_cast<void>(f.call(ak, "_NSEnableScreenUpdates"));
+    require(!appkit::screen_updates_disabled(), "screen updates resume");
+    for (const auto value : {back, front}) static_cast<void>(f.id(value, "close"));
+}
+
 } // namespace
 
 int main() {
@@ -631,7 +745,7 @@ int main() {
                  {"responders_and_cells", responders_and_cells}, {"views", views}, {"windows", windows}, {"menus", menus},
                  {"images_and_cursors", images_and_cursors}, {"alerts_and_panels", alerts_and_panels},
                  {"pasteboards_and_text", pasteboards_and_text}, {"containers_and_controllers", containers_and_controllers},
-                 {"toolbars_and_tabs", toolbars_and_tabs}}) {
+                 {"toolbars_and_tabs", toolbars_and_tabs}, {"c_functions", c_functions}}) {
             std::cout << "[appkit api] " << name << std::endl;
             test(f);
         }

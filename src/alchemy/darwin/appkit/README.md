@@ -52,6 +52,17 @@ toolbar customization palette stop explicitly. -performWindowDragWithEvent:
 runs the window server's move loop; NSWindowSharingNone keeps a window out
 of screen capture.
 
+**C functions (`c_functions.cpp`):** rectangle lists, tiled rectangles and
+the classic bezels (gray edge sequences around a filled middle), nine-part
+images, dotted frames, highlights, NSDrawBitmap and NSReadPixel draw and read
+through the current context; NSCountWindows / NSWindowList list the
+application's windows front to back; the depth helpers use AppKit's
+NSWindowDepth encoding; NSRunAlertPanel and its forms run an NSAlert,
+NSBeginAlertSheet a sheet; NSDisableScreenUpdates holds window presentation
+until updates resume. There is no Services menu (item visibility is kept),
+NSShowAnimationEffect draws nothing and tells its delegate at once, and
+NSGetAlertPanel, NSCopyBits and NSGetWindowServerMemory stop explicitly.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

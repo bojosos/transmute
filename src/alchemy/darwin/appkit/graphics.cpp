@@ -1,3 +1,4 @@
+#include "alchemy/darwin/appkit/c_functions.hpp"
 #include "alchemy/darwin/appkit/appkit_internal.hpp"
 #include "alchemy/darwin/appkit/controls_internal.hpp"
 #include "alchemy/gui/layer_contents.hpp"   // layer-backed views with -updateLayer (qt-vfb)
@@ -237,6 +238,7 @@ void AppKit::release_backing(WindowState& state) {
 }
 
 void AppKit::present_window(Address target, Rect window_rect) {
+    if (screen_updates_disabled()) return;   // presented again when updates resume (c_functions.cpp)
     const auto state = window_state(target);
     const auto backing = state->backing;
     const auto server = window_server_or_null();

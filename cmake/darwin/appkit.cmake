@@ -8,6 +8,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/appkit/window.cpp
     src/alchemy/darwin/appkit/frame_view.cpp
     src/alchemy/darwin/appkit/window_tabs.cpp
+    src/alchemy/darwin/appkit/c_functions.cpp
     src/alchemy/darwin/appkit/view.cpp
     src/alchemy/darwin/appkit/event.cpp
     src/alchemy/darwin/appkit/resources.cpp
