@@ -188,8 +188,7 @@ void Provider::install_media() {
     string(av_foundation, "_AVVideoCodecKey", "AVVideoCodecKey");
     string(av_foundation, "_AVVideoCodecTypeJPEG", "jpeg");
     if (objc.find_class("AVCaptureOutput")) static_cast<void>(cls(av_foundation, "AVCapturePhotoOutput", "AVCaptureOutput"));
-    for (const auto* name : {"AVCapturePhotoSettings", "AVSampleBufferAudioRenderer", "AVSampleBufferRenderSynchronizer"})
-        static_cast<void>(cls(av_foundation, name, "NSObject"));
+    static_cast<void>(cls(av_foundation, "AVCapturePhotoSettings", "NSObject"));   // the sample-buffer renderers are av_sample_buffer.cpp's
 
     // ---------------------------------------------------------------- CoreAudio, AudioToolbox
     failure(core_audio, "_AudioHardwareCreateAggregateDevice", audio_unsupported_operation);

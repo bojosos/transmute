@@ -18,8 +18,8 @@
 //   ranges, which cannot exist, stop with an explicit message. Capture
 //   sessions are real (configuration nesting, preset, outputs, running state)
 //   but can have no input, so no frame is ever delivered; video data outputs
-//   keep their delegate, queue and settings. AVSampleBufferDisplayLayer and
-//   the still-image output are class shells.
+//   keep their delegate, queue and settings. The still-image output is a
+//   class shell; AVSampleBufferDisplayLayer is av_sample_buffer.cpp's.
 // - CoreVideo: the dictionary keys, host time (mach_absolute_time's) and the
 //   Metal texture caches, real objects holding their device (no texture is made
 //   from an image buffer yet). Pixel buffers and pools are core_video.cpp's.
@@ -388,7 +388,6 @@ void Video::install_av_foundation() {
         }
         static_cast<void>(objc.send_super(s.x[0], data_output, objc.selector("dealloc")));
     }, false, "v@:");
-    static_cast<void>(cls(av_foundation, "AVSampleBufferDisplayLayer", "CALayer"));
 }
 
 void Video::install_core_video() {

@@ -1956,6 +1956,152 @@ void av_player(Fixture& f) {
     std::filesystem::remove_all(directory, ignored);
 }
 
+// The sample-buffer renderers the way Chromium's CoreAnimation layer tree drives them: a 420v
+// IOSurface CVPixelBuffer in a CMSampleBufferCreateForImageBuffer buffer marked DisplayImmediately,
+// enqueued on an AVSampleBufferDisplayLayer, becomes its BGRA IOSurface contents; on a
+// synchronizer, pictures wait for their time and linear PCM plays on the output device; a format
+// with no decoder fails the layer.
+void sample_buffer_renderers(Fixture& f) {
+    const auto surface_lib = std::string_view("/System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface");
+    const auto mode = f.engine.read64(f.symbol(vt_cf, "_kCFRunLoopDefaultMode"));
+    const auto run = [&](double seconds) {
+        alchemy::CallRegs r;
+        r.x[0] = mode;
+        r.set_d(0, seconds);
+        static_cast<void>(f.regs(vt_cf, "_CFRunLoopRunInMode", r));
+    };
+    const auto true_value = f.engine.read64(f.symbol(vt_cf, "_kCFBooleanTrue"));
+    // A 16x16 picture in `format` with IOSurface backing: 420v of one colour, or BGRA.
+    const auto picture = [&](std::uint32_t format) {
+        const auto format_key = f.cf.string("PixelFormatType"), surface_key = f.cf.string("IOSurfaceProperties");
+        const auto value = f.cf.integer(format), empty = f.cf.dictionary(std::span<const std::pair<std::uint64_t, std::uint64_t>>{});
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> entries{{{format_key, value}, {surface_key, empty}}};
+        const auto out = f.block(8);
+        require(f.status(cv, "_CVPixelBufferCreate", {0, 16, 16, format, f.cf.dictionary(entries), out}) == 0, "a 16x16 IOSurface picture");
+        const auto image = f.engine.read64(out);
+        f.call(cv, "_CVPixelBufferLockBaseAddress", {image, 0});
+        if (format == 0x34323076) {   // '420v': Y' 81, Cb 90, Cr 240 (BT.601 red)
+            const auto y = f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {image, 0}), y_row = f.call(cv, "_CVPixelBufferGetBytesPerRowOfPlane", {image, 0});
+            const auto c = f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {image, 1}), c_row = f.call(cv, "_CVPixelBufferGetBytesPerRowOfPlane", {image, 1});
+            for (Address row = 0; row < 16; ++row)
+                for (Address x = 0; x < 16; ++x) f.memory().write8(y + row * y_row + x, 81);
+            for (Address row = 0; row < 8; ++row)
+                for (Address x = 0; x < 8; ++x) { f.memory().write8(c + row * c_row + 2 * x, 90); f.memory().write8(c + row * c_row + 2 * x + 1, 240); }
+        } else {
+            const auto base = f.call(cv, "_CVPixelBufferGetBaseAddress", {image}), row_bytes = f.call(cv, "_CVPixelBufferGetBytesPerRow", {image});
+            for (Address row = 0; row < 16; ++row)
+                for (Address x = 0; x < 16; ++x) f.engine.write32(base + row * row_bytes + 4 * x, 0xff00ff00);   // green
+        }
+        f.call(cv, "_CVPixelBufferUnlockBaseAddress", {image, 0});
+        return image;
+    };
+    // A CMSampleBuffer of `image` at `seconds`, optionally marked to display immediately.
+    const auto sample_of = [&](Address image, double seconds, bool immediately) {
+        const auto format_out = f.block(8), sample_out = f.block(8), timing = f.block(72);
+        require(f.status(cm, "_CMVideoFormatDescriptionCreateForImageBuffer", {0, image, format_out}) == 0, "a description of the picture");
+        write_time(f, timing, 1, 30);
+        write_time(f, timing + 24, static_cast<std::int64_t>(seconds * 1000), 1000);
+        write_time(f, timing + 48, 0, 0, 0);
+        require(f.status(cm, "_CMSampleBufferCreateForImageBuffer", {0, image, 1, 0, 0, f.engine.read64(format_out), timing, sample_out}) == 0,
+                "CMSampleBufferCreateForImageBuffer");
+        const auto sample = f.engine.read64(sample_out);
+        if (immediately) {
+            const auto attachments = f.call(cm, "_CMSampleBufferGetSampleAttachmentsArray", {sample, 1});
+            f.call(vt_cf, "_CFDictionarySetValue", {f.cf.element(attachments, 0), f.cf.string("DisplayImmediately"), true_value});
+        }
+        return sample;
+    };
+    // The layer's contents as an IOSurface: its first pixel (B, G, R, A in memory).
+    const auto first_pixel = [&](Address layer) -> std::uint32_t {
+        const auto surface = f.send(layer, "contents");
+        if (!surface) return 0;
+        f.call(surface_lib, "_IOSurfaceLock", {surface, 1, 0});
+        const auto value = f.engine.read32(f.call(surface_lib, "_IOSurfaceGetBaseAddress", {surface}));
+        f.call(surface_lib, "_IOSurfaceUnlock", {surface, 1, 0});
+        return value;
+    };
+
+    // Chromium's path: 420v, display immediately, no synchronizer.
+    const auto layer = f.send(f.send(f.cls("AVSampleBufferDisplayLayer"), "alloc"), "init");
+    require(layer && f.send(layer, "status") == 0 && (f.send(layer, "isReadyForMoreMediaData") & 0xff) == 1, "a new display layer wants pictures");
+    f.send(layer, "enqueueSampleBuffer:", {sample_of(picture(0x34323076), 0, true)});
+    const auto red = first_pixel(layer);
+    require(f.send(layer, "status") == 1 && (red & 0xff) < 8 && ((red >> 8) & 0xff) < 8 && ((red >> 16) & 0xff) > 240,
+            "the 420v picture shows as BGRA red: " + std::to_string(red));
+    f.send(layer, "flushAndRemoveImage");
+    require(f.send(layer, "contents") == 0, "flushAndRemoveImage clears the layer");
+
+    // On a synchronizer: a picture for 0.2 s waits for the clock; LPCM audio plays from the clock's time.
+    const auto sync = f.send(f.send(f.cls("AVSampleBufferRenderSynchronizer"), "alloc"), "init");
+    const auto audio = f.send(f.send(f.cls("AVSampleBufferAudioRenderer"), "alloc"), "init");
+    f.send(sync, "addRenderer:", {layer});
+    f.send(sync, "addRenderer:", {audio});
+    require(f.cf.length(f.send(sync, "renderers")) == 2, "two renderers");
+    f.send(layer, "enqueueSampleBuffer:", {sample_of(picture(0x42475241), 0.2, false)});
+    require(f.send(layer, "contents") == 0, "a picture for later waits while the clock stands");
+    // A tenth of a second of 48 kHz stereo float at 0.5.
+    const auto asbd = f.block(40);
+    f.engine.write64(asbd, std::bit_cast<std::uint64_t>(48000.0));
+    f.engine.write32(asbd + 8, 0x6c70636d);
+    f.engine.write32(asbd + 12, 1 | 8);
+    f.engine.write32(asbd + 16, 8); f.engine.write32(asbd + 20, 1); f.engine.write32(asbd + 24, 8);
+    f.engine.write32(asbd + 28, 2); f.engine.write32(asbd + 32, 32);
+    const auto format_out = f.block(8);
+    require(f.status(cm, "_CMAudioFormatDescriptionCreate", {0, asbd, 0, 0, 0, 0, 0, format_out}) == 0, "an LPCM description");
+    const auto block_out = f.block(8);
+    alchemy::CallRegs block{};
+    block.x[2] = 4800 * 8; block.x[6] = 4800 * 8; block.x[7] = 1;
+    block.push_stack(block_out);
+    require(f.regs(cm, "_CMBlockBufferCreateWithMemoryBlock", block).x0 == 0, "an audio block");
+    const auto pcm = f.block(4800 * 8);
+    for (int i = 0; i < 4800 * 2; ++i) f.engine.write32(pcm + 4ULL * i, std::bit_cast<std::uint32_t>(0.5f));
+    require(f.status(cm, "_CMBlockBufferReplaceDataBytes", {pcm, f.engine.read64(block_out), 0, 4800 * 8}) == 0, "audio bytes");
+    const auto timing = f.block(72), audio_out = f.block(8);
+    write_time(f, timing, 1, 48000);
+    write_time(f, timing + 24, 0, 48000);
+    write_time(f, timing + 48, 0, 0, 0);
+    alchemy::CallRegs ready{};
+    ready.x[1] = f.engine.read64(block_out); ready.x[2] = f.engine.read64(format_out); ready.x[3] = 4800; ready.x[4] = 1; ready.x[5] = timing;
+    ready.push_stack(audio_out);
+    require(f.regs(cm, "_CMSampleBufferCreateReady", ready).x0 == 0, "an LPCM sample buffer");
+    f.send(audio, "enqueueSampleBuffer:", {f.engine.read64(audio_out)});
+    require(f.send(audio, "status") == 1, "the audio renderer takes linear PCM");
+    const auto zero = f.block(24);
+    write_time(f, zero, 0, 1000);
+    alchemy::CallRegs start{};
+    start.set_s(0, 1.0f);
+    start.x[2] = zero;
+    static_cast<void>(f.objc.send(sync, f.objc.selector("setRate:time:"), start));
+    const auto sound = FakeStream::play_until_sound(512);
+    require(std::any_of(sound.begin(), sound.end(), [](float v) { return std::fabs(v - 0.5f) < 0.05f; }), "the PCM is heard at the synchronizer's rate");
+    for (int i = 0; i < 40 && !f.send(layer, "contents"); ++i) run(0.02);
+    const auto green = first_pixel(layer);
+    require(((green >> 8) & 0xff) == 0xff && (green & 0xff) == 0, "the picture shows at its time: " + std::to_string(green));
+    const auto now = f.block(24);
+    alchemy::CallRegs get{};
+    get.indirect_result = now;
+    static_cast<void>(f.objc.send(sync, f.objc.selector("currentTime"), get));
+    require(static_cast<double>(static_cast<std::int64_t>(f.engine.read64(now))) / f.engine.read32(now + 8) >= 0.2, "the synchronizer's clock runs");
+    alchemy::CallRegs stop{};
+    stop.set_s(0, 0.0f);
+    static_cast<void>(f.objc.send(sync, f.objc.selector("setRate:"), stop));
+
+    // Samples with no decoder (H.264 here) fail the layer.
+    const auto failing = f.send(f.send(f.cls("AVSampleBufferDisplayLayer"), "alloc"), "init");
+    const auto avc = f.block(8), avc_block = f.block(8), avc_sample = f.block(8);
+    require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, 0x61766331, 16, 16, 0, avc}) == 0, "an H.264 description");
+    alchemy::CallRegs small{};
+    small.x[2] = 16; small.x[6] = 16; small.x[7] = 1;
+    small.push_stack(avc_block);
+    require(f.regs(cm, "_CMBlockBufferCreateWithMemoryBlock", small).x0 == 0, "an H.264 block");
+    alchemy::CallRegs make{};
+    make.x[1] = f.engine.read64(avc_block); make.x[2] = f.engine.read64(avc); make.x[3] = 1;
+    make.push_stack(avc_sample);
+    require(f.regs(cm, "_CMSampleBufferCreateReady", make).x0 == 0, "an H.264 sample");
+    f.send(failing, "enqueueSampleBuffer:", {f.engine.read64(avc_sample)});
+    require(f.send(failing, "status") == 2 && f.send(failing, "error") != 0, "no H.264 decoder: the layer fails with an error");
+}
+
 } // namespace
 
 int main() {
@@ -1979,6 +2125,7 @@ int main() {
         {"video_toolbox", video_toolbox},
         {"av_video", av_video},
         {"av_player", av_player},
+        {"sample_buffer_renderers", sample_buffer_renderers},
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},
         {"avaudio", avaudio},

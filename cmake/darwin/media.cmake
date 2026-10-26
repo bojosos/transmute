@@ -44,6 +44,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/au_listeners.cpp
     src/alchemy/darwin/media/avfoundation.cpp
     src/alchemy/darwin/media/av_player.cpp
+    src/alchemy/darwin/media/av_sample_buffer.cpp
     src/alchemy/darwin/media/caclock.cpp)
 
 # Headless shell (src/alchemy/darwin/shells.hpp): alchemy.exe's answers for

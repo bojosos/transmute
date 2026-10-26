@@ -35,6 +35,8 @@ void install_au_listeners(Support& support);
 void install_av_foundation(Support& support);
 // av_player.cpp: AVPlayer, AVPlayerItem, AVPlayerItemVideoOutput, AVPlayerLayer (from install_av_foundation).
 void install_av_player(Support& support);
+// av_sample_buffer.cpp: AVSampleBufferDisplayLayer, AVSampleBufferAudioRenderer, AVSampleBufferRenderSynchronizer.
+void install_av_sample_buffer_renderers(Support& support);
 
 // Host time (mach_absolute_time: nanoseconds of unbiased interrupt time).
 std::uint64_t host_time_now();

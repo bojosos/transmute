@@ -1580,6 +1580,7 @@ void install_av_foundation(Support& support) {
         }
     }
     install_av_player(support);
+    install_av_sample_buffer_renderers(support);
 }
 
 } // namespace alchemy::gui::completion_kit::media
