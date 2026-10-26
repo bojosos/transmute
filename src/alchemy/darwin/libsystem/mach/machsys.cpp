@@ -7,6 +7,7 @@
 #include "alchemy/host/system.hpp"
 
 #include <array>
+#include <set>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -41,8 +42,8 @@
 // - Power metrics (libpmsample, libpmenergy): pm_sample_task fails with
 //   KERN_NOT_SUPPORTED; pm_energy_impact has no failure value and stops
 //   the process if called.
-// - terminfo (libncurses): no terminfo database exists, so setupterm fails
-//   and no terminal is ever current (install_terminfo).
+// - terminfo (libncurses): no database; the xterm family has a built-in
+//   xterm-256color entry and other names are not found (install_terminfo).
 namespace alchemy::gui::fill {
 namespace {
 
@@ -863,31 +864,113 @@ void Machsys::install_private() {
     install_terminfo();
 }
 
-// libncurses terminfo (a shader compiler, through LLVM's terminal colour
-// probe). Alchemy ships no terminfo database, so no terminal is ever set up:
-// setupterm returns ERR with *errret = -1 ("the terminfo database could not
-// be found"), cur_term stays NULL, tigetnum answers CANCELLED_NUMERIC (-2)
-// and del_curterm has nothing to delete (ERR). set_curterm swaps the
-// cur_term pointer as documented and returns the previous one.
+// libncurses terminfo (a shader compiler's terminal colours through LLVM's probe; Python's
+// curses.setupterm). Alchemy ships no terminfo database: the xterm family (xterm*, screen*,
+// tmux*, rxvt*, vt100/vt220, ansi, linux) is described by a built-in xterm-256color entry
+// (8 colours unless the name ends in 256color), which the curses screens (terminal/curses.cpp)
+// also use. Other names are not found: setupterm returns ERR with *errret = 0. tigetflag,
+// tigetnum and tigetstr answer from the current terminal: -1/-2/(char*)-1 for a capability of
+// another type (or with no terminal), and 0/-1/NULL for one the entry does not have.
 void Machsys::install_terminfo() {
     constexpr std::int32_t err = -1;
+    struct Terminfo {
+        std::mutex mutex;
+        Address current{};                       // TERMINAL* (cur_term)
+        std::map<Address, int> terminals;        // TERMINAL* -> its colours
+        std::map<std::string, Address> strings;  // capability -> guest string
+    };
+    const auto state = std::make_shared<Terminfo>();
     const auto cur_term = data(libncurses, "_cur_term", std::array<std::uint8_t, 8>{}, 8);
-    raw(libncurses, "_setupterm", [](CpuState& s, GuestMemory& m) {
-        if (s.x[2]) m.write32(s.x[2], static_cast<std::uint32_t>(-1));
-        s.x[0] = status(err);
+    for (const auto& [name, value] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"clear", "\x1b[H\x1b[2J"}, {"cup", "\x1b[%i%p1%d;%p2%dH"}, {"home", "\x1b[H"}, {"el", "\x1b[K"}, {"ed", "\x1b[J"},
+             {"cuu1", "\x1b[A"}, {"cud1", "\n"}, {"cuf1", "\x1b[C"}, {"cub1", "\b"}, {"cr", "\r"}, {"bel", "\a"},
+             {"bold", "\x1b[1m"}, {"dim", "\x1b[2m"}, {"smul", "\x1b[4m"}, {"rmul", "\x1b[24m"}, {"blink", "\x1b[5m"},
+             {"rev", "\x1b[7m"}, {"smso", "\x1b[7m"}, {"rmso", "\x1b[27m"}, {"invis", "\x1b[8m"}, {"sgr0", "\x1b[m"},
+             {"setaf", "\x1b[38;5;%p1%dm"}, {"setab", "\x1b[48;5;%p1%dm"}, {"op", "\x1b[39;49m"},
+             {"smcup", "\x1b[?1049h"}, {"rmcup", "\x1b[?1049l"}, {"civis", "\x1b[?25l"}, {"cnorm", "\x1b[?25h"},
+             {"smkx", "\x1b[?1h\x1b="}, {"rmkx", "\x1b[?1l\x1b>"},
+             {"kcuu1", "\x1bOA"}, {"kcud1", "\x1bOB"}, {"kcuf1", "\x1bOC"}, {"kcub1", "\x1bOD"}, {"khome", "\x1bOH"},
+             {"kend", "\x1bOF"}, {"kbs", "\x7f"}, {"kdch1", "\x1b[3~"}, {"kich1", "\x1b[2~"}, {"knp", "\x1b[6~"}, {"kpp", "\x1b[5~"},
+             {"kf1", "\x1bOP"}, {"kf2", "\x1bOQ"}, {"kf3", "\x1bOR"}, {"kf4", "\x1bOS"}, {"kf5", "\x1b[15~"}, {"kf6", "\x1b[17~"},
+             {"kf7", "\x1b[18~"}, {"kf8", "\x1b[19~"}, {"kf9", "\x1b[20~"}, {"kf10", "\x1b[21~"}, {"kf11", "\x1b[23~"}, {"kf12", "\x1b[24~"}}) {
+        const std::string text(value);
+        const auto address = process.allocate_guest(text.size() + 1);
+        memory().write_bytes(address, std::vector<std::uint8_t>(text.begin(), text.end()));
+        memory().write8(address + text.size(), 0);
+        state->strings.emplace(name, address);
+    }
+    static const std::set<std::string> flags_on{"am", "bce", "km", "mir", "msgr", "xenl", "npc"};
+    static const std::set<std::string> flags_off{"bw", "hc", "hs", "os", "eo", "gn", "hz", "in", "da", "db", "mc5i", "xon"};
+    static const std::set<std::string> numbers{"cols", "lines", "colors", "pairs", "it", "lm", "ncv"};
+    const auto known = [](const std::string& name) {
+        for (const auto* prefix : {"xterm", "screen", "tmux", "rxvt", "vt100", "vt220"}) if (name.starts_with(prefix)) return true;
+        return name == "ansi" || name == "linux";
+    };
+    // int setupterm(const char* term, int fd, int* errret): term NULL is $TERM.
+    raw(libncurses, "_setupterm", [this, state, cur_term, known](CpuState& s, GuestMemory& m) {
+        std::string name;
+        if (s.x[0]) name = read_cstring(m, s.x[0], 256);
+        else if (const auto value = call(libsystem, "_getenv", {cstring("TERM")})) name = read_cstring(m, value, 256);
+        if (!known(name)) {
+            if (s.x[2]) m.write32(s.x[2], 0);   // the terminal was not found
+            s.x[0] = status(err);
+            return;
+        }
+        const auto terminal = process.allocate_guest(64);
+        m.fill_bytes(terminal, 0, 64);
+        {
+            std::lock_guard lock(state->mutex);
+            state->terminals[terminal] = name.ends_with("256color") ? 256 : 8;
+            state->current = terminal;
+        }
+        m.write64(cur_term, terminal);
+        if (s.x[2]) m.write32(s.x[2], 1);
+        s.x[0] = 0;
     });
-    raw(libncurses, "_set_curterm", [cur_term](CpuState& s, GuestMemory& m) {
+    raw(libncurses, "_set_curterm", [state, cur_term](CpuState& s, GuestMemory& m) {
         const auto previous = m.read64(cur_term);
         m.write64(cur_term, s.x[0]);
+        { std::lock_guard lock(state->mutex); state->current = s.x[0]; }
         s.x[0] = previous;
     });
-    raw(libncurses, "_del_curterm", [cur_term](CpuState& s, GuestMemory& m) {
-        if (s.x[0] && m.read64(cur_term) == s.x[0]) m.write64(cur_term, 0);
-        s.x[0] = status(err);
+    raw(libncurses, "_del_curterm", [this, state, cur_term](CpuState& s, GuestMemory& m) {
+        bool found{};
+        {
+            std::lock_guard lock(state->mutex);
+            found = state->terminals.erase(s.x[0]) != 0;
+            if (found && state->current == s.x[0]) state->current = 0;
+        }
+        if (!found) { s.x[0] = status(err); return; }
+        if (m.read64(cur_term) == s.x[0]) m.write64(cur_term, 0);
+        process.release_guest(s.x[0]);
+        s.x[0] = 0;
     });
-    constant(libncurses, "_tigetnum", status(-2));
-    constant(libncurses, "_tigetflag", status(-1));   // not a boolean capability: no terminal
-    constant(libncurses, "_tigetstr", static_cast<Address>(-1));   // (char *)-1: no terminal
+    // The current terminal's colours, or nullopt without one.
+    const auto colors = [state, cur_term](GuestMemory& m) -> std::optional<int> {
+        std::lock_guard lock(state->mutex);
+        const auto found = state->terminals.find(m.read64(cur_term));
+        if (found == state->terminals.end()) return std::nullopt;
+        return found->second;
+    };
+    raw(libncurses, "_tigetflag", [this, colors](CpuState& s, GuestMemory& m) {
+        const auto name = read_cstring(m, s.x[0], 64);
+        if (!colors(m) || (!flags_on.contains(name) && !flags_off.contains(name))) { s.x[0] = status(-1); return; }
+        s.x[0] = flags_on.contains(name) ? 1 : 0;
+    });
+    raw(libncurses, "_tigetnum", [this, colors](CpuState& s, GuestMemory& m) {
+        const auto name = read_cstring(m, s.x[0], 64);
+        const auto count = colors(m);
+        if (!count || !numbers.contains(name)) { s.x[0] = status(-2); return; }
+        const std::map<std::string, int> values{{"cols", 80}, {"lines", 24}, {"colors", *count}, {"pairs", *count == 256 ? 256 : 64}, {"it", 8}, {"lm", 0}, {"ncv", 0}};
+        s.x[0] = status(values.at(name));
+    });
+    raw(libncurses, "_tigetstr", [this, state, colors](CpuState& s, GuestMemory& m) {
+        const auto name = read_cstring(m, s.x[0], 64);
+        if (!colors(m)) { s.x[0] = static_cast<Address>(-1); return; }
+        const auto found = state->strings.find(name);
+        if (found != state->strings.end()) { s.x[0] = found->second; return; }
+        s.x[0] = flags_on.contains(name) || flags_off.contains(name) || numbers.contains(name) ? static_cast<Address>(-1) : 0;
+    });
 }
 
 void Machsys::install() {

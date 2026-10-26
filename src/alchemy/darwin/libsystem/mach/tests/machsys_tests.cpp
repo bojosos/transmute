@@ -228,12 +228,18 @@ void unfair_lock(Fixture& f) {
 }
 
 void terminfo(Fixture& f) {
-    // No terminfo database: setupterm fails with *errret = -1, nothing is current.
+    // No database: an unknown terminal is not found (*errret = 0) and nothing is current.
     const auto errret = f.block(4, 0x55);
-    require(f.status(ncurses, "_setupterm", {f.text("xterm-256color"), 1, errret}) == -1 && static_cast<std::int32_t>(f.engine.read32(errret)) == -1,
-            "setupterm reports no database");
+    require(f.status(ncurses, "_setupterm", {f.text("no-such-terminal"), 1, errret}) == -1 && f.engine.read32(errret) == 0,
+            "an unknown terminal is not found");
     require(static_cast<std::int32_t>(f.call(ncurses, "_tigetnum", {f.text("colors")})) == -2, "tigetnum without a terminal");
-    require(f.call(ncurses, "_set_curterm", {0x1000}) == 0 && f.call(ncurses, "_set_curterm", {0}) == 0x1000, "set_curterm swaps cur_term");
+    // The built-in xterm entry.
+    require(f.status(ncurses, "_setupterm", {f.text("xterm"), 1, errret}) == 0 && f.engine.read32(errret) == 1, "setupterm xterm");
+    require(f.call(ncurses, "_tigetnum", {f.text("colors")}) == 8, "xterm has 8 colours");
+    const auto terminal = f.engine.read64(f.symbol(ncurses, "_cur_term"));
+    require(terminal != 0, "cur_term is set");
+    require(f.call(ncurses, "_set_curterm", {0}) == terminal && f.call(ncurses, "_set_curterm", {terminal}) == 0, "set_curterm swaps cur_term");
+    require(f.status(ncurses, "_del_curterm", {terminal}) == 0 && f.engine.read64(f.symbol(ncurses, "_cur_term")) == 0, "del_curterm");
     require(f.status(ncurses, "_del_curterm", {0}) == -1, "del_curterm(NULL)");
 }
 

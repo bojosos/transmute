@@ -47,6 +47,17 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   service does not exist: resumed, they deliver `XPC_ERROR_CONNECTION_INVALID`;
   replies are that error; `xpc_main` stops. Activities never run.
   NSXPCConnection is `misc/xpc.cpp`'s.
+* **Terminal libraries** (GUI, `terminal/`): libedit's readline API
+  (`readline.cpp`: the callback interface reading rl_instream's descriptor
+  in whatever mode the terminal is in, GNU readline history and history
+  files, completion through rl_attempted_completion_function on Tab, kept
+  bindings), curses (`curses.cpp`: windows, subwindows sharing cells, pads,
+  colours and attributes, written to an xterm-compatible terminal as escape
+  sequences; termios modes, keypad and SGR mouse decoding, KEY_RESIZE) and
+  libpanel (`panel.cpp`). terminfo (`mach/machsys.cpp`) has no database but
+  a built-in xterm-256color entry for the xterm family. initscr needs a
+  terminal whose attributes can be read (a pseudo-terminal); the host
+  console's cannot, so it stops there.
 * **libm** (`misc/numeric_math.cpp`) also has lround/llround/lrint/llrint,
   nearbyint, fmax/fmin/fdim/fma, tgamma, lgamma_r, remquo, ilogb, scalbln,
   the Bessel functions (j0..yn), gamma/drem/significand/finite,

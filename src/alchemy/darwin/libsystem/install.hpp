@@ -43,6 +43,9 @@ namespace alchemy::export_fill {
 void install_libsystem_stdlib(Provider& p);     // misc/stdlib_extra.cpp: rand48, crypt
 void install_libsystem_ndbm(Provider& p);       // misc/ndbm.cpp: ndbm(3)
 void install_libsystem_rpc_nis(Provider& p);    // net/rpc_nis.cpp: NIS and Sun RPC (unavailable)
+void install_libedit_readline(Provider& p);     // terminal/readline.cpp: libedit's readline API
+void install_ncurses(Provider& p);              // terminal/curses.cpp: curses over an xterm-compatible terminal
+void install_libpanel(Provider& p);             // terminal/panel.cpp: libpanel over the curses windows
 void install_libsystem_xpc(Provider& p, ObjcRuntime& objc);   // misc/xpc_objects.cpp: XPC objects and connections
 void install_libsystem_threads_extra(Provider& p);   // process/threads_extra.cpp: QoS, stack attributes, ceilings
 } // namespace alchemy::export_fill

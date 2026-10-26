@@ -87,6 +87,9 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/libsystem/misc/stdlib_extra.cpp
     src/alchemy/darwin/libsystem/misc/ndbm.cpp
     src/alchemy/darwin/libsystem/net/rpc_nis.cpp
+    src/alchemy/darwin/libsystem/terminal/readline.cpp
+    src/alchemy/darwin/libsystem/terminal/curses.cpp
+    src/alchemy/darwin/libsystem/terminal/panel.cpp
     src/alchemy/darwin/libsystem/process/threads_extra.cpp
     src/alchemy/darwin/libsystem/process/foundation_threads.cpp
     src/alchemy/darwin/libsystem/process/process_io.cpp
@@ -126,6 +129,9 @@ function(alchemy_gui_libsystem_tests)
     # misc/xpc_objects.cpp: XPC objects, and connections whose service is not there.
     alchemy_gui_add_unit_test(alchemy_gui_xpc
         src/alchemy/darwin/libsystem/tests/xpc_tests.cpp TIMEOUT 120)
+    # terminal/: libedit readline, curses and panels over a pseudo-terminal.
+    alchemy_gui_add_unit_test(alchemy_gui_terminal
+        src/alchemy/darwin/libsystem/tests/terminal_tests.cpp TIMEOUT 120)
     # The pieces first written for QLab (split from the QLab runtime tests;
     # shared fixture src/alchemy/darwin/kit/completion/runtime/tests/runtime_test_kit.hpp).
     alchemy_gui_add_unit_test(alchemy_gui_libsystem_foundation
