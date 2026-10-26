@@ -1378,7 +1378,9 @@ void panels_and_models(Fixture& f) {
     static_cast<void>(f.id(toolbar, "removeItemAtIndex:", {1}));
     require(f.id(f.id(toolbar, "items"), "count") == 1, "-removeItemAtIndex:");
     const auto window = f.make_window({{0, 0}, {100, 100}});
-    require(throws([&] { static_cast<void>(f.id(window, "setToolbar:", {toolbar})); }), "window toolbars must fail explicitly");
+    // A window shows its toolbar above the content, which keeps its size.
+    static_cast<void>(f.id(window, "setToolbar:", {toolbar}));
+    require(f.id(window, "toolbar") == toolbar && f.send(f.id(window, "contentView"), "frame").d(3) == 100, "a window toolbar keeps the content size");
     static_cast<void>(f.id(window, "setToolbar:", {0}));
 
     // NSSavePanel / NSOpenPanel: configuration, no dialog.
