@@ -38,7 +38,7 @@
 # cmdline.txt, memory.csv, network-allowed.txt, network-denied.txt, alchemy-lines.txt, shot-<n>.png, capture\
 # (PNG files: never commit them), netlog.json with -NetLog. Exit code 0 when the browser exited 0.
 param(
-    [Parameter(Mandatory)][string]$Exe,
+    [string]$Exe = '',   # alchemy-fx.exe; not needed with -Native
     [Parameter(Mandatory)][string]$OutDir,
     [Parameter(Mandatory)][string[]]$Url,
     [string[]]$Name = @(),
@@ -84,6 +84,7 @@ function Get-GuestPath([string]$HostPath) {
     '/Volumes/' + $full.Substring(0, 1).ToUpperInvariant() + ($full.Substring(2) -replace '\\', '/')
 }
 
+if (-not $Native -and -not $Exe) { throw 'pass -Exe (alchemy-fx.exe) or -Native (a Windows chrome.exe)' }
 $Root = [IO.Path]::GetFullPath($Root)
 if (-not $Native -and -not (Test-Path (Join-Path $Root '.alchemy-root'))) { throw "not an Alchemy root: $Root (pass -Root; a worktree has no artifacts)" }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -497,7 +498,9 @@ try {
     while (-not $page) {
         if ($clock.Elapsed.TotalSeconds -gt $StartTimeout) { throw "no page target within $StartTimeout s" }
         if ($process.HasExited) { throw "Chrome exited ($($process.ExitCode)) before its page target appeared" }
-        $targets = Invoke-Cdp 'Target.getTargets'
+        # A browser still starting answers late (a native Chrome on a fresh profile: well over 10 s under
+        # load), so this first request may take the rest of -StartTimeout, not just -CdpTimeout.
+        $targets = Invoke-Cdp 'Target.getTargets' @{} '' ([math]::Max($CdpTimeout, [int]($StartTimeout - $clock.Elapsed.TotalSeconds)))
         $page = @($targets.targetInfos | Where-Object { $_.type -eq 'page' }) | Select-Object -First 1
         if (-not $page) { Pump-Cdp 1000 }
     }
