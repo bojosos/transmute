@@ -391,6 +391,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             worker->host = std::thread([owned, worker] {
                 std::uint64_t instructions = 0;
                 try {
+                    const GuestStopScope stoppable;   // caught below
                     instructions = worker->engine->run().instructions;
                     worker->result = worker->context->exit_value.value_or(worker->engine->state().x[0]);
                     owned->cleanup(*worker->context);
@@ -1217,6 +1218,14 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         process.cleanup_thread = [owned](auto& thread) { owned->cleanup(thread); };
     }
 };
+
+namespace {
+thread_local bool stop_handled = false;
+} // namespace
+
+bool guest_stop_handled() noexcept { return stop_handled; }
+GuestStopScope::GuestStopScope() noexcept : previous(stop_handled) { stop_handled = true; }
+GuestStopScope::~GuestStopScope() { stop_handled = previous; }
 
 bool guest_worker_must_stop(ProcessContext& context) {
     auto& engine = context.calling_engine();
