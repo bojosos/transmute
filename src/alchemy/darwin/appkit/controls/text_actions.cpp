@@ -743,6 +743,70 @@ void install_text_actions(AppKit& kit) {
         put_rect(frame, 0, {});
         s.x[0] = k->autorelease(k->send(k->send(s.x[0], "alloc").x0, "initWithFrame:", frame).x0);
     }, "@@:B");
+
+    // ---- NSTextField / NSTextFieldCell: kept settings (the field's are its cell's) ----
+    const auto field_class = kit.text_field, cell_class = kit.text_field_cell;
+    const auto cell_of = [k](Address value) {
+        const auto target = k->is_kind(value, k->text_field_cell) ? value : control_cell(*k, value);
+        if (!target) fail("an NSTextField without a cell");
+        return cell_state(*k, target);
+    };
+    const auto cell_flag = [&kit, cell_of](Address cls, const char* getter, const char* setter, bool CellState::*member) {
+        kit.method(cls, getter, [cell_of, member](CpuState& s, GuestMemory&) { return_bool(s, (*cell_of(s.x[0])).*member); }, "B@:");
+        kit.method(cls, setter, [cell_of, member](CpuState& s, GuestMemory&) { (*cell_of(s.x[0])).*member = bool_arg(s, 2); }, "v@:B");
+    };
+    cell_flag(field_class, "allowsDefaultTighteningForTruncation", "setAllowsDefaultTighteningForTruncation:", &CellState::allows_tightening);
+    cell_flag(field_class, "allowsWritingTools", "setAllowsWritingTools:", &CellState::allows_writing_tools);
+    cell_flag(field_class, "allowsCharacterPickerTouchBarItem", "setAllowsCharacterPickerTouchBarItem:", &CellState::character_picker);
+    kit.method(field_class, "lineBreakStrategy", [cell_of](CpuState& s, GuestMemory&) { s.x[0] = cell_of(s.x[0])->line_break_strategy; }, "Q@:");
+    kit.method(field_class, "setLineBreakStrategy:", [cell_of](CpuState& s, GuestMemory&) { cell_of(s.x[0])->line_break_strategy = s.x[2]; }, "v@:Q");
+    kit.method(field_class, "contentType", [cell_of](CpuState& s, GuestMemory&) { s.x[0] = cell_of(s.x[0])->content_type; });
+    kit.method(field_class, "setContentType:", [k, cell_of](CpuState& s, GuestMemory&) {
+        const auto state = cell_of(s.x[0]);
+        k->release(std::exchange(state->content_type, s.x[2] ? k->send(s.x[2], "copy").x0 : 0));
+    }, "v@:@");
+    kit.method(cell_class, "allowedInputSourceLocales", [cell_of](CpuState& s, GuestMemory&) { s.x[0] = cell_of(s.x[0])->allowed_locales; });
+    kit.method(cell_class, "setAllowedInputSourceLocales:", [k, cell_of](CpuState& s, GuestMemory&) {
+        const auto state = cell_of(s.x[0]);
+        k->release(std::exchange(state->allowed_locales, s.x[2] ? k->send(s.x[2], "copy").x0 : 0));
+    }, "v@:@");
+    // The attributed placeholder, kept with its string (which the cell draws).
+    kit.method(cell_class, "placeholderAttributedString", [cell_of](CpuState& s, GuestMemory&) { s.x[0] = cell_of(s.x[0])->placeholder_attributed; });
+    kit.method(cell_class, "setPlaceholderAttributedString:", [k, cell_of](CpuState& s, GuestMemory&) {
+        const auto state = cell_of(s.x[0]);
+        k->release(std::exchange(state->placeholder_attributed, s.x[2] ? k->send(s.x[2], "copy").x0 : 0));
+        static_cast<void>(k->send_id(s.x[0], "setPlaceholderString:", {s.x[2] ? k->send_id(s.x[2], "string") : 0}));
+    }, "v@:@");
+    // The field editor takes the cell's font, colour, alignment and background.
+    kit.method(cell_class, "setUpFieldEditorAttributes:", [k](CpuState& s, GuestMemory&) {
+        const auto cell = s.x[0], editor = s.x[2];
+        if (!editor) { s.x[0] = 0; return; }
+        if (const auto font = k->send_id(cell, "font")) static_cast<void>(k->send_id(editor, "setFont:", {font}));
+        if (const auto color = k->send_id(cell, "textColor")) static_cast<void>(k->send_id(editor, "setTextColor:", {color}));
+        static_cast<void>(k->send_id(editor, "setAlignment:", {k->send_id(cell, "alignment")}));
+        const bool draws = k->send_bool(cell, "drawsBackground");
+        static_cast<void>(k->send_id(editor, "setDrawsBackground:", {draws ? 1u : 0u}));
+        if (draws) if (const auto color = k->send_id(cell, "backgroundColor")) static_cast<void>(k->send_id(editor, "setBackgroundColor:", {color}));
+        s.x[0] = editor;
+    });
+
+    // ---- NSTextInputContext ----
+    const auto context_class = kit.objc.find_class("NSTextInputContext");
+    kit.method(context_class, "dealloc", [k, context_class](CpuState& s, GuestMemory&) {
+        if (const auto state = k->objc.find_host_state<TextInputState>(s.x[0])) k->release(std::exchange(state->allowed_locales, 0));
+        static_cast<void>(k->objc.send_super(s.x[0], context_class, k->sel("dealloc")));
+    }, "v@:");
+    kit.method(context_class, "allowedInputSourceLocales", [k](CpuState& s, GuestMemory&) { s.x[0] = k->objc.host_state<TextInputState>(s.x[0])->allowed_locales; });
+    kit.method(context_class, "setAllowedInputSourceLocales:", [k](CpuState& s, GuestMemory&) {
+        const auto state = k->objc.host_state<TextInputState>(s.x[0]);
+        k->release(std::exchange(state->allowed_locales, s.x[2] ? k->send(s.x[2], "copy").x0 : 0));
+    }, "v@:@");
+    // The one keyboard input source is the host's current layout: selecting it changes nothing, other ids are not available sources.
+    kit.method(context_class, "setSelectedKeyboardInputSource:", [](CpuState&, GuestMemory&) {}, "v@:@");
+    kit.class_method(context_class, "localizedNameForInputSource:", [k](CpuState& s, GuestMemory&) {
+        const auto layout = require_window_server("+[NSTextInputContext localizedNameForInputSource:]").keyboard_layout();
+        s.x[0] = s.x[2] && k->text(s.x[2]) == layout.identifier ? k->auto_string(layout.localized_name.empty() ? layout.identifier : layout.localized_name) : 0;
+    });
 }
 
 } // namespace alchemy::gui::completion_kit::controls

@@ -1240,7 +1240,7 @@ void text_actions(Fixture& f) {
     // RTF out and back in keeps the formatting.
     const auto rtf_data = f.id(view, "RTFFromRange:", {0, 11});
     const auto bytes = f.id(rtf_data, "bytes");
-    require(f.integer(rtf_data, "length") > 20 && f.engine.read8(bytes) == '{' && f.engine.read8(bytes + 1) == '\\', "-RTFFromRange: is RTF");
+    require(f.integer(rtf_data, "length") > 20 && static_cast<GuestMemory&>(f.engine).read8(bytes) == '{' && static_cast<GuestMemory&>(f.engine).read8(bytes + 1) == '\\', "-RTFFromRange: is RTF");
     static_cast<void>(f.id(view, "replaceCharactersInRange:withRTF:", {0, 11, rtf_data}));
     require(f.text(f.id(view, "string")) == "Hello world" && f.send(at("NSFont", 0), "pointSize").d(0) == 20 && at("NSColor", 0) != 0,
             "-replaceCharactersInRange:withRTF: keeps the formatting");
@@ -1298,6 +1298,126 @@ void text_actions(Fixture& f) {
     stopped = false;
     try { static_cast<void>(f.id(f.cls("NSTextView"), "textViewUsingTextLayoutManager:", {1})); } catch (const std::exception&) { stopped = true; }
     require(stopped, "TextKit 2 text views stop explicitly");
+}
+
+// ---- Fonts, the font manager, text fields (frameworks wave U11c) --------------------------------
+void fonts_and_fields(Fixture& f) {
+    const auto font = f.with_double(f.cls("NSFont"), "systemFontOfSize:", 20);
+    // A glyph of the font: the layout of "A".
+    const auto storage = f.id(f.id(f.cls("NSTextStorage"), "alloc"), "initWithString:", {f.str("A")});
+    static_cast<void>(f.id(storage, "addAttribute:value:range:", {f.str("NSFont"), font, 0, 1}));
+    const auto manager = f.id(f.id(f.cls("NSLayoutManager"), "alloc"), "init");
+    CallRegs size;
+    gui::appkit::put_size(size, 0, {200, 100});
+    static_cast<void>(f.id(manager, "addTextContainer:", {f.send(f.id(f.cls("NSTextContainer"), "alloc"), "initWithSize:", size).x0}));
+    static_cast<void>(f.id(storage, "addLayoutManager:", {manager}));
+    const auto glyph = f.integer(manager, "CGGlyphAtIndex:", {0}) & 0xffff;
+    require(glyph != 0, "a glyph for A");
+    const auto advance = f.send(font, "advancementForCGGlyph:", [glyph] { CallRegs r; r.x[2] = static_cast<Address>(glyph); return r; }()).d(0);
+    const auto glyphs = f.process.allocate_guest(8), advances = f.process.allocate_guest(16);
+    static_cast<GuestMemory&>(f.engine).write8(glyphs, static_cast<std::uint8_t>(glyph & 0xff));
+    static_cast<GuestMemory&>(f.engine).write8(glyphs + 1, static_cast<std::uint8_t>(glyph >> 8));
+    static_cast<void>(f.id(font, "getAdvancements:forCGGlyphs:count:", {advances, glyphs, 1}));
+    const auto bounds = f.send(font, "boundingRectForCGGlyph:", [glyph] { CallRegs r; r.x[2] = static_cast<Address>(glyph); return r; }());
+    require(advance > 5 && std::bit_cast<double>(f.engine.read64(advances)) == advance && bounds.d(3) > 5, "CGGlyph advances and bounds");
+    // The covered character set needs Foundation's NSCharacterSet (this fixture has none: an explicit stop).
+    if (f.objc.find_class("NSCharacterSet")) {
+        const auto covered = f.id(font, "coveredCharacterSet");
+        require(covered && f.yes(covered, "characterIsMember:", {u'A'}), "the covered character set");
+    } else {
+        bool missing{};
+        try { static_cast<void>(f.id(font, "coveredCharacterSet")); } catch (const std::exception&) { missing = true; }
+        require(missing, "the covered character set stops without NSCharacterSet");
+    }
+    const auto matrix = f.id(font, "matrix");
+    require(std::bit_cast<double>(f.engine.read64(matrix)) == 20 && std::bit_cast<double>(f.engine.read64(matrix + 24)) == 20 &&
+                std::bit_cast<double>(f.engine.read64(matrix + 8)) == 0,
+            "the font matrix holds the size");
+    const auto values = f.process.allocate_guest(48);
+    for (std::size_t i = 0; i < 6; ++i) f.engine.write64(values + i * 8, std::bit_cast<std::uint64_t>(i == 0 || i == 3 ? 30.0 : 0.0));
+    const auto name = f.id(font, "fontName");
+    const auto scaled = f.id(f.cls("NSFont"), "fontWithName:matrix:", {name, values});
+    const auto identity = f.id(f.cls("NSFont"), "fontWithName:matrix:", {name, f.process.resolve("/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit", "_NSFontIdentityMatrix")->address});
+    require(f.send(scaled, "pointSize").d(0) == 30 && f.send(identity, "pointSize").d(0) == 12, "+fontWithName:matrix:");
+    static_cast<void>(f.id(f.cls("NSFont"), "setUserFont:", {font}));
+    require(f.send(f.with_double(f.cls("NSFont"), "userFontOfSize:", 15), "pointSize").d(0) == 15 &&
+                f.text(f.id(f.with_double(f.cls("NSFont"), "userFontOfSize:", 0), "familyName")) == f.text(f.id(font, "familyName")),
+            "+setUserFont:");
+    static_cast<void>(f.id(f.cls("NSFont"), "setUserFont:", {0}));
+    bool stopped{};
+    try {
+        CallRegs r;
+        r.set_d(0, 12); r.set_d(1, 0); r.set_d(2, 0.2);
+        static_cast<void>(f.send(f.cls("NSFont"), "systemFontOfSize:weight:width:", r));
+    } catch (const std::exception&) { stopped = true; }
+    require(stopped, "system font widths stop explicitly");
+
+    // Font descriptors.
+    const auto descriptor = f.id(font, "fontDescriptor");
+    const auto by_family = f.id(descriptor, "fontDescriptorWithFamily:", {f.id(font, "familyName")});
+    const auto from_family = f.send(f.cls("NSFont"), "fontWithDescriptor:size:", [by_family] { CallRegs r; r.x[2] = by_family; r.set_d(0, 14); return r; }()).x0;
+    require(f.text(f.id(from_family, "familyName")) == f.text(f.id(font, "familyName")) && f.send(from_family, "pointSize").d(0) == 14,
+            "a descriptor by family");
+    const auto keys = f.id(f.cls("NSSet"), "setWithObject:", {f.str("NSFontFamilyAttribute")});
+    require(f.integer(f.id(by_family, "matchingFontDescriptorsWithMandatoryKeys:", {keys}), "count") >= 1 &&
+                f.id(by_family, "matchingFontDescriptorWithMandatoryKeys:", {keys}) != 0 && !f.yes(descriptor, "requiresFontAssetRequest"),
+            "matching descriptors");
+    require(f.id(descriptor, "fontDescriptorWithDesign:", {f.str("NSCTFontUIFontDesignRounded")}) == 0 &&
+                f.id(descriptor, "fontDescriptorWithDesign:", {f.str("NSCTFontUIFontDesignMonospaced")}) != 0 && f.id(descriptor, "matrix") == 0,
+            "system designs");
+
+    // The font manager: Font menu actions convert the target's fonts.
+    const auto fonts = f.id(f.cls("NSFontManager"), "sharedFontManager");
+    const auto small = f.with_double(f.cls("NSFont"), "systemFontOfSize:", 12);
+    Address converted{};
+    const auto target_class = f.subclass("U11FontTarget", "NSObject");
+    f.add(target_class, "changeFont:", [&f, &converted, small](CpuState& s, GuestMemory&) { converted = f.id(s.x[2], "convertFont:", {small}); });
+    const auto target = f.id(f.id(target_class, "alloc"), "init");
+    static_cast<void>(f.id(fonts, "setTarget:", {target}));
+    const auto sender_class = f.subclass("U11TagSender", "NSObject");
+    Address tag_value = 3;
+    f.add(sender_class, "tag", [&tag_value](CpuState& s, GuestMemory&) { s.x[0] = tag_value; }, "q@:");
+    const auto sender = f.id(f.id(sender_class, "alloc"), "init");
+    static_cast<void>(f.id(fonts, "modifyFont:", {sender}));
+    require(converted && f.send(converted, "pointSize").d(0) == 13 && f.integer(fonts, "currentFontAction") == 3, "Bigger converts to the next size");
+    tag_value = 2;
+    static_cast<void>(f.id(fonts, "addFontTrait:", {sender}));
+    require(converted && (f.integer(fonts, "traitsOfFont:", {converted}) & 2) != 0 && f.yes(fonts, "fontNamed:hasTraits:", {f.id(converted, "fontName"), 2}),
+            "Bold converts to the bold face");
+    const auto attributes = f.cf.dictionary(std::vector<std::pair<Address, Address>>{{f.str("NSFont"), small}});
+    require((f.integer(fonts, "traitsOfFont:", {f.id(f.id(fonts, "convertAttributes:", {attributes}), "objectForKey:", {f.str("NSFont")})}) & 2) != 0,
+            "-convertAttributes: converts the font");
+    static_cast<void>(f.id(fonts, "setTarget:", {0}));
+    require(f.text(f.id(fonts, "localizedNameForFamily:face:", {f.str("Helvetica"), f.str("Bold")})) == "Helvetica Bold" &&
+                f.integer(f.id(fonts, "collectionNames"), "count") == 0,
+            "family names and collections");
+    const auto menu = f.id(fonts, "fontMenu:", {1});
+    require(menu && f.id(fonts, "fontMenu:", {0}) == menu && f.integer(menu, "numberOfItems") == 7, "the Font menu");
+    stopped = false;
+    try { static_cast<void>(f.id(fonts, "orderFrontFontPanel:", {0})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "the font panel stops explicitly");
+
+    // Text fields and their cells.
+    const auto field = f.with_rect(f.id(f.cls("NSTextField"), "alloc"), "initWithFrame:", {{0, 0}, {100, 22}});
+    static_cast<void>(f.id(field, "setAllowsDefaultTighteningForTruncation:", {1}));
+    static_cast<void>(f.id(field, "setContentType:", {f.str("username")}));
+    static_cast<void>(f.id(field, "setLineBreakStrategy:", {1}));
+    const auto placeholder = f.id(f.id(f.cls("NSAttributedString"), "alloc"), "initWithString:", {f.str("Name")});
+    static_cast<void>(f.id(field, "setPlaceholderAttributedString:", {placeholder}));
+    require(f.yes(field, "allowsDefaultTighteningForTruncation") && f.text(f.id(field, "contentType")) == "username" && f.integer(field, "lineBreakStrategy") == 1 &&
+                f.text(f.id(field, "placeholderString")) == "Name" && f.text(f.id(f.id(field, "placeholderAttributedString"), "string")) == "Name" &&
+                f.yes(field, "allowsWritingTools"),
+            "text field settings and the attributed placeholder");
+    const auto editor = f.with_rect(f.id(f.cls("NSTextView"), "alloc"), "initWithFrame:", {{0, 0}, {100, 22}});
+    static_cast<void>(f.id(f.id(field, "cell"), "setFont:", {font}));
+    require(f.id(f.id(field, "cell"), "setUpFieldEditorAttributes:", {editor}) == editor && f.send(f.id(editor, "font"), "pointSize").d(0) == 20,
+            "-setUpFieldEditorAttributes:");
+    // Input sources: the one current layout.
+    const auto context = f.id(f.id(f.cls("NSTextInputContext"), "alloc"), "initWithClient:", {editor});
+    const auto source = f.id(context, "selectedKeyboardInputSource");
+    require(f.id(f.cls("NSTextInputContext"), "localizedNameForInputSource:", {source}) != 0 &&
+                f.id(f.cls("NSTextInputContext"), "localizedNameForInputSource:", {f.str("com.example.none")}) == 0,
+            "the current input source's name");
 }
 
 // ---- NSTextTab and paragraph styles -----------------------------------------------------------
@@ -1812,6 +1932,7 @@ int main() {
         text_system(f);
         text_layout(f);
         text_actions(f);
+        fonts_and_fields(f);
         text_tabs(f);
         tables(f);
         collection_views(f);

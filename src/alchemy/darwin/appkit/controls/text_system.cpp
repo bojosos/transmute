@@ -1141,10 +1141,179 @@ void install_text_system(AppKit& kit) {
             if (!panel_class) unsupported("-[NSFontManager fontPanel:YES] (no NSFontPanel)");
             s.x[0] = k->send(panel_class, "sharedFontPanel").x0;
         }, "@@:B");
+        // Font changes from the Font menu (NSFontAction): the manager remembers
+        // the change and sends its action; the responder's -changeFont: asks
+        // -convertFont: to apply that change to each of its fonts.
+        static std::uint64_t current_action{}, current_trait{};   // NSNoFontChangeAction
+        const auto record = [k](Address manager, std::uint64_t action, std::uint64_t trait) {
+            current_action = action;
+            current_trait = trait;
+            static_cast<void>(k->send(manager, "sendAction"));
+        };
+        const auto tag_of = [k](Address sender) { return sender ? static_cast<std::uint64_t>(k->send_id(sender, "tag")) : 0; };
+        kit.method(fm, "currentFontAction", [](CpuState& s, GuestMemory&) { s.x[0] = current_action; }, "Q@:");
+        kit.method(fm, "addFontTrait:", [record, tag_of](CpuState& s, GuestMemory&) { record(s.x[0], 2, tag_of(s.x[2])); }, "v@:@");      // NSAddTraitFontAction
+        kit.method(fm, "removeFontTrait:", [record, tag_of](CpuState& s, GuestMemory&) { record(s.x[0], 7, tag_of(s.x[2])); }, "v@:@");   // NSRemoveTraitFontAction
+        // The sender's tag is the action: size up 3, size down 4, heavier 5, lighter 6.
+        kit.method(fm, "modifyFont:", [record, tag_of](CpuState& s, GuestMemory&) {
+            const auto tag = tag_of(s.x[2]);
+            record(s.x[0], tag >= 3 && tag <= 6 ? tag : 0, 0);
+        }, "v@:@");
+        kit.method(fm, "modifyFontViaPanel:", [record](CpuState& s, GuestMemory&) { record(s.x[0], 1, 0); }, "v@:@");   // NSViaPanelFontAction
+        // A face (or PostScript name) of the font's family, and the next heavier or lighter member with the same slant.
+        const auto family_rows = [k](Address manager, Address font) {
+            std::vector<std::vector<Address>> rows;
+            const auto list = k->send_id(manager, "availableMembersOfFontFamily:", {k->send_id(font, "familyName")});
+            for (const auto row : k->items(list)) rows.push_back(k->items(row));
+            return rows;
+        };
+        const auto sized = [k](Address name, Address font) {
+            CallRegs r;
+            r.x[2] = name;
+            r.set_d(0, k->send(font, "pointSize").d(0));
+            return k->send(k->objc.find_class("NSFont"), "fontWithName:size:", r).x0;
+        };
+        const auto lower = [](std::string text) {
+            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return text;
+        };
+        kit.method(fm, "convertFont:toFace:", [k, family_rows, sized, lower](CpuState& s, GuestMemory&) {
+            const auto font = s.x[2];
+            const auto face = s.x[3] ? lower(k->text(s.x[3])) : std::string{};
+            for (const auto& row : family_rows(s.x[0], font))
+                if (row.size() >= 2 && (lower(k->text(row[1])) == face || lower(k->text(row[0])) == face))
+                    if (const auto made = sized(row[0], font)) { s.x[0] = made; return; }
+            s.x[0] = font;
+        }, "@@:@@");
+        kit.method(fm, "convertWeight:ofFont:", [k, family_rows, sized](CpuState& s, GuestMemory&) {
+            const bool up = bool_arg(s, 2);
+            const auto font = s.x[3];
+            const auto manager = s.x[0];
+            const auto weight = static_cast<std::int64_t>(k->send_id(manager, "weightOfFont:", {font}));
+            const auto italic = k->send_id(manager, "traitsOfFont:", {font}) & 1;
+            Address best{};
+            std::int64_t best_weight = up ? 16 : -1;
+            for (const auto& row : family_rows(manager, font)) {
+                if (row.size() < 4) continue;
+                const auto w = static_cast<std::int64_t>(k->cf.number_value(row[2]).value_or(0));
+                const auto t = static_cast<std::uint64_t>(k->cf.number_value(row[3]).value_or(0));
+                if ((t & 1) != italic) continue;
+                if (up ? (w > weight && w < best_weight) : (w < weight && w > best_weight)) { best = row[0]; best_weight = w; }
+            }
+            const auto made = best ? sized(best, font) : 0;
+            s.x[0] = made ? made : font;
+        }, "@@:B@");
+        kit.method(fm, "convertFont:", [k](CpuState& s, GuestMemory&) {
+            const auto manager = s.x[0], font = s.x[2];
+            if (!font) return;
+            const auto size = k->send(font, "pointSize").d(0);
+            const auto resize = [&](double to) {
+                CallRegs r;
+                r.x[2] = font;
+                r.set_d(0, std::max(1.0, to));
+                return k->send(manager, "convertFont:toSize:", r).x0;
+            };
+            switch (current_action) {
+            case 2: s.x[0] = k->send_id(manager, "convertFont:toHaveTrait:", {font, current_trait}); return;
+            case 7: s.x[0] = k->send_id(manager, "convertFont:toNotHaveTrait:", {font, current_trait}); return;
+            case 3: s.x[0] = resize(size + 1); return;
+            case 4: s.x[0] = resize(size - 1); return;
+            case 5: s.x[0] = k->send_id(manager, "convertWeight:ofFont:", {1, font}); return;
+            case 6: s.x[0] = k->send_id(manager, "convertWeight:ofFont:", {0, font}); return;
+            case 1:
+                if (const auto panel = k->send_id(manager, "fontPanel:", {0})) { s.x[0] = k->send_id(panel, "panelConvertFont:", {font}); return; }
+                s.x[0] = font;
+                return;
+            default: s.x[0] = font;
+            }
+        }, "@@:@");
+        // The attributes with their font converted.
+        kit.method(fm, "convertAttributes:", [k](CpuState& s, GuestMemory&) {
+            const auto attributes = s.x[2];
+            if (!attributes) { s.x[0] = 0; return; }
+            const auto font = dictionary_get(*k, attributes, "NSFont");
+            if (!font) { s.x[0] = attributes; return; }
+            auto entries = k->cf.dictionary_entries(attributes);
+            for (auto& [key, value] : entries)
+                if (k->text(key) == "NSFont") value = k->send_id(s.x[0], "convertFont:", {font});
+            s.x[0] = k->autorelease(k->cf.dictionary(entries));
+        });
+        // NSFontTraitMask tests: bold 2 / unbold 4, italic 1 / unitalic 0x1000000, fixed pitch 0x400.
+        const auto has_traits = [](std::uint64_t traits, std::uint64_t mask) {
+            if ((mask & 2) && !(traits & 2)) return false;
+            if ((mask & 4) && (traits & 2)) return false;
+            if ((mask & 1) && !(traits & 1)) return false;
+            if ((mask & 0x1000000) && (traits & 1)) return false;
+            if ((mask & 0x400) && !(traits & 0x400)) return false;
+            return true;
+        };
+        kit.method(fm, "availableFontNamesWithTraits:", [k, has_traits](CpuState& s, GuestMemory&) {
+            std::vector<Address> names;
+            for (const auto family : k->items(k->send_id(s.x[0], "availableFontFamilies")))
+                for (const auto row : k->items(k->send_id(s.x[0], "availableMembersOfFontFamily:", {family}))) {
+                    const auto values = k->items(row);
+                    if (values.size() >= 4 && has_traits(static_cast<std::uint64_t>(k->cf.number_value(values[3]).value_or(0)), s.x[2])) names.push_back(values[0]);
+                }
+            s.x[0] = k->auto_array(names);
+        }, "@@:Q");
+        kit.method(fm, "fontNamed:hasTraits:", [k, has_traits](CpuState& s, GuestMemory&) {
+            CallRegs r;
+            r.x[2] = s.x[2];
+            r.set_d(0, 12);
+            const auto font = s.x[2] ? k->send(k->objc.find_class("NSFont"), "fontWithName:size:", r).x0 : 0;
+            return_bool(s, font && has_traits(k->send_id(s.x[0], "traitsOfFont:", {font}), s.x[3]));
+        }, "B@:@Q");
+        kit.method(fm, "localizedNameForFamily:face:", [k](CpuState& s, GuestMemory&) {
+            const auto family = s.x[2] ? k->text(s.x[2]) : std::string{};
+            s.x[0] = k->auto_string(s.x[3] ? family + " " + k->text(s.x[3]) : family);
+        });
+        // No font collections exist.
+        kit.method(fm, "collectionNames", [k](CpuState& s, GuestMemory&) { s.x[0] = k->auto_array({}); });
+        kit.method(fm, "fontDescriptorsInCollection:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+        // The Font menu: Show Fonts, Bold, Italic, Underline, Bigger, Smaller (made on request, or the one set).
+        static Address font_menu{};   // +1
+        kit.method(fm, "setFontMenu:", [k](CpuState& s, GuestMemory&) { k->assign(font_menu, s.x[2]); }, "v@:@");
+        kit.method(fm, "fontMenu:", [k](CpuState& s, GuestMemory&) {
+            if (!font_menu && bool_arg(s, 2)) {
+                font_menu = k->send_id(k->send(k->objc.find_class("NSMenu"), "alloc").x0, "initWithTitle:", {k->auto_string("Font")});
+                const auto add = [&](const char* title, const char* action, const char* key, std::uint64_t tag, bool to_manager) {
+                    if (!title) { static_cast<void>(k->send_id(font_menu, "addItem:", {k->send_id(k->objc.find_class("NSMenuItem"), "separatorItem")})); return; }
+                    const auto item = k->send_id(font_menu, "addItemWithTitle:action:keyEquivalent:", {k->auto_string(title), k->sel(action), k->auto_string(key)});
+                    if (to_manager) static_cast<void>(k->send_id(item, "setTarget:", {s.x[0]}));
+                    static_cast<void>(k->send_id(item, "setTag:", {tag}));
+                };
+                add("Show Fonts", "orderFrontFontPanel:", "t", 0, true);
+                add("Bold", "addFontTrait:", "b", 2, true);
+                add("Italic", "addFontTrait:", "i", 1, true);
+                add("Underline", "underline:", "u", 0, false);
+                add(nullptr, nullptr, nullptr, 0, false);
+                add("Bigger", "modifyFont:", "+", 3, true);
+                add("Smaller", "modifyFont:", "-", 4, true);
+            }
+            s.x[0] = font_menu;
+        }, "@@:B");
+        for (const auto* name : {"orderFrontFontPanel:", "orderFrontStylesPanel:"}) {
+            const std::string selector = name;
+            kit.method(fm, selector, [selector](CpuState&, GuestMemory&) { unsupported("-[NSFontManager " + selector + "] (no font panel UI is provided)"); }, "v@:@");
+        }
+        static Address panel_factory{};
+        kit.class_method(fm, "setFontPanelFactory:", [](CpuState& s, GuestMemory&) { panel_factory = s.x[2]; }, "v@:#");   // kept: no panel is made
     }
     if (const auto panel = kit.objc.find_class("NSFontPanel")) {
         // With no panel UI there is never a pending panel change: the font is unchanged.
         kit.method(panel, "panelConvertFont:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[2]; });
+        // Settings of a panel that is never shown (kept for the getters).
+        static Address accessory{}, panel_font{};   // +1
+        static bool panel_enabled = true, panel_multiple{};
+        kit.method(panel, "accessoryView", [](CpuState& s, GuestMemory&) { s.x[0] = accessory; });
+        kit.method(panel, "setAccessoryView:", [k](CpuState& s, GuestMemory&) { k->assign(accessory, s.x[2]); }, "v@:@");
+        kit.method(panel, "isEnabled", [](CpuState& s, GuestMemory&) { return_bool(s, panel_enabled); }, "B@:");
+        kit.method(panel, "setEnabled:", [](CpuState& s, GuestMemory&) { panel_enabled = bool_arg(s, 2); }, "v@:B");
+        kit.method(panel, "setPanelFont:isMultiple:", [k](CpuState& s, GuestMemory&) {
+            k->assign(panel_font, s.x[2]);
+            panel_multiple = bool_arg(s, 3);
+        }, "v@:@B");
+        kit.method(panel, "reloadDefaultFontFamilies", [](CpuState&, GuestMemory&) {}, "v@:");   // the families are read when shown, and it never is
     }
     install_text_layout(kit);
     install_text_actions(kit);

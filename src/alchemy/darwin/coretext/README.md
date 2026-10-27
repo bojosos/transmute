@@ -29,6 +29,14 @@ tightening factor (0.05 by default), default hyphenation and text lists are
 kept and copied; lines are not hyphenated or tightened. Text blocks (tables)
 are not laid out, so setting any stops explicitly.
 
+**NSFont and NSFontDescriptor:** CGGlyph advances and bounds, the covered
+character set (the Basic Multilingual Plane), the matrix with the size in it
+(+fontWithName:matrix:, -textTransform; NSFontIdentityMatrix is 12 points),
+the user fonts set for the process, descriptors by family, face, matrix
+and added attributes, matching by mandatory keys, the default and
+monospaced system designs (serif and rounded are nil, as for an unavailable
+design). System font widths other than standard stop explicitly.
+
 **Not registered:** CTRunDelegate and CTGlyphInfo (the host's line layout
 has no inline objects or glyph substitutions), CTRubyAnnotation, font
 features (CTFontCopyFeatures, CTFontDescriptorCreateCopyWithFeature) and

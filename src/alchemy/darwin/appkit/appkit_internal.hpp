@@ -432,7 +432,11 @@ struct AlertState final : ObjectPayload {
     bool shows_help{}, shows_suppression{};
 };
 struct ScreenState final : ObjectPayload { ScreenInfo info; };
-struct TextInputState final : ObjectPayload { Address client{}; bool active{}; };
+struct TextInputState final : ObjectPayload {
+    Address client{};
+    bool active{};
+    Address allowed_locales{};                // +1 -allowedInputSourceLocales (controls/text_actions.cpp)
+};
 struct TrackingAreaState final : ObjectPayload {
     Rect rect;
     std::uint64_t options{};

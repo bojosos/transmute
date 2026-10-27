@@ -504,6 +504,14 @@ void containers_and_controllers(Fixture& f) {
     const auto spell = f.cls("NSSpellChecker");
     const auto tag = f.id(spell, "uniqueSpellDocumentTag");
     require(f.id(spell, "uniqueSpellDocumentTag") == tag + 1, "+uniqueSpellDocumentTag counts");
+    // No grammar results or text replacements (frameworks wave U11c).
+    const auto checker = f.id(spell, "sharedSpellChecker");
+    CallRegs grammar;
+    grammar.x[2] = f.str("they is here");
+    grammar.x[7] = 0;
+    require(f.msg(checker, "checkGrammarOfString:startingAt:language:wrap:inSpellDocumentWithTag:details:", grammar).x0 == static_cast<Address>(INT64_MAX) &&
+                f.id(f.id(checker, "userReplacementsDictionary"), "count") == 0,
+            "grammar and replacements are not available");
     const auto toolbar_item = f.id(f.id(f.cls("NSToolbarItem"), "alloc"), "initWithItemIdentifier:", {f.str("item")});
     static_cast<void>(f.id(toolbar_item, "setTitle:", {f.str("Go")}));
     static_cast<void>(f.id(toolbar_item, "setHidden:", {1}));

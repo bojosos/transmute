@@ -195,6 +195,8 @@ struct Coretext {
     Address empty_attributes{};               // immortal empty CFDictionary
     Address default_paragraph{};              // immortal +[NSParagraphStyle defaultParagraphStyle]
     Address font_manager{};                   // immortal +[NSFontManager sharedFontManager]
+    Address font_manager_factory{};           // +[NSFontManager setFontManagerFactory:] (a class)
+    Address user_font{}, user_fixed_pitch_font{};   // +1 +[NSFont setUserFont:] / setUserFixedPitchFont:
 };
 [[nodiscard]] Coretext& coretext();
 

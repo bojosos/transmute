@@ -57,6 +57,10 @@ struct CellState final : ObjectPayload {
     bool enabled{true}, highlighted{}, bordered{}, bezeled{}, editable{}, selectable{}, scrollable{}, wraps{};
     bool continuous{}, allows_mixed{}, transparent{}, draws_background{}, secure{}, pulls_down{}, single_line{};
     bool truncates_last_line{}, shows_first_responder{}, frame_style_bezel{}, image_frame{};
+    // NSTextField / NSTextFieldCell settings (controls/text_actions.cpp).
+    Address placeholder_attributed{}, allowed_locales{}, content_type{};   // +1
+    std::uint64_t line_break_strategy{};
+    bool allows_tightening{}, allows_writing_tools{true}, character_picker{true};
     // Widths the cell's leading / trailing controls take from its text area
     // (the NSComboBox button, the NSSearchField buttons); the field editor
     // is placed between them.

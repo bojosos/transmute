@@ -901,8 +901,14 @@ void install_font_exports(Quartz& q) {
     class_method(f, "systemFontOfSize:weight:", [system_weighted](CpuState& s, GuestMemory&) { s.x[0] = system_weighted(d(s, 0), d(s, 1), false); }, "@@:dd");
     class_method(f, "monospacedSystemFontOfSize:weight:", [system_weighted](CpuState& s, GuestMemory&) { s.x[0] = system_weighted(d(s, 0), d(s, 1), true); }, "@@:dd");
     class_method(f, "monospacedDigitSystemFontOfSize:weight:", [system_weighted](CpuState& s, GuestMemory&) { s.x[0] = system_weighted(d(s, 0), d(s, 1), false); }, "@@:dd");
-    class_method(f, "userFontOfSize:", [ui](CpuState& s, GuestMemory&) { s.x[0] = ui(0, d(s, 0)); }, "@@:d");
-    class_method(f, "userFixedPitchFontOfSize:", [ui](CpuState& s, GuestMemory&) { s.x[0] = ui(1, d(s, 0)); }, "@@:d");
+    // The user's fonts: the ones set (+setUserFont:), else the system's choice.
+    const auto user = [quartz, ui](Address chosen, std::int64_t type, double size) {
+        const auto st = chosen ? quartz->find<FontState>(chosen) : nullptr;
+        if (!st) return ui(type, size);
+        return quartz->autorelease(make_font(*quartz, {st->face, st->postscript, st->family, st->display}, size > 0 ? size : st->size, st->matrix));
+    };
+    class_method(f, "userFontOfSize:", [user](CpuState& s, GuestMemory&) { s.x[0] = user(coretext().user_font, 0, d(s, 0)); }, "@@:d");
+    class_method(f, "userFixedPitchFontOfSize:", [user](CpuState& s, GuestMemory&) { s.x[0] = user(coretext().user_fixed_pitch_font, 1, d(s, 0)); }, "@@:d");
     for (const auto& [name, type] : std::initializer_list<std::pair<const char*, std::int64_t>>{
              {"labelFontOfSize:", 10}, {"messageFontOfSize:", 23}, {"menuFontOfSize:", 12}, {"menuBarFontOfSize:", 11},
              {"titleBarFontOfSize:", 15}, {"paletteFontOfSize:", 24}, {"toolTipsFontOfSize:", 25}, {"controlContentFontOfSize:", 26}}) {
@@ -984,6 +990,129 @@ void install_font_exports(Quartz& q) {
     method(f, "glyphWithName:", [quartz, font](CpuState& s, GuestMemory&) {
         s.x[0] = s.x[2] ? glyph_with_name(*font(s.x[0])->face, quartz->cf.utf8(s.x[2])) : 0;
     }, "I@:@");
+    // CGGlyph metrics (single and arrays: NSSize / NSRect out, CGGlyph in).
+    method(f, "advancementForCGGlyph:", [font](CpuState& s, GuestMemory&) {
+        const auto st = font(s.x[0]);
+        const std::array<std::uint16_t, 1> glyph{static_cast<std::uint16_t>(s.x[2])};
+        return_size(s, {advances_for(*st->face, st->size, glyph)[0], 0});
+    }, "{CGSize=dd}@:S");
+    method(f, "boundingRectForCGGlyph:", [font](CpuState& s, GuestMemory&) {
+        const auto st = font(s.x[0]);
+        const std::array<std::uint16_t, 1> glyph{static_cast<std::uint16_t>(s.x[2])};
+        return_rect(s, glyph_bounds(*st->face, st->size, glyph)[0]);
+    }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:S");
+    method(f, "getAdvancements:forCGGlyphs:count:", [quartz, font](CpuState& s, GuestMemory&) {
+        const auto st = font(s.x[0]);
+        const auto glyphs = quartz->read_units(s.x[3], static_cast<std::size_t>(std::min<Address>(s.x[4], 1 << 20)));
+        const auto advances = advances_for(*st->face, st->size, glyphs);
+        for (std::size_t i = 0; s.x[2] && i < advances.size(); ++i) {
+            quartz->write_double(s.x[2] + i * 16, advances[i]);
+            quartz->write_double(s.x[2] + i * 16 + 8, 0);
+        }
+    }, "v@:^{CGSize=dd}^SQ");
+    method(f, "getBoundingRects:forCGGlyphs:count:", [quartz, font](CpuState& s, GuestMemory&) {
+        const auto st = font(s.x[0]);
+        const auto glyphs = quartz->read_units(s.x[3], static_cast<std::size_t>(std::min<Address>(s.x[4], 1 << 20)));
+        const auto rects = glyph_bounds(*st->face, st->size, glyphs);
+        for (std::size_t i = 0; s.x[2] && i < rects.size(); ++i)
+            for (const auto& [offset, value] : {std::pair{0, rects[i].origin.x}, std::pair{8, rects[i].origin.y}, std::pair{16, rects[i].size.width},
+                                                std::pair{24, rects[i].size.height}})
+                quartz->write_double(s.x[2] + i * 32 + offset, value);
+    }, "v@:^{CGRect={CGPoint=dd}{CGSize=dd}}^SQ");
+    // The Basic Multilingual Plane characters the font has glyphs for.
+    method(f, "coveredCharacterSet", [quartz, font](CpuState& s, GuestMemory&) {
+        const auto st = font(s.x[0]);
+        std::vector<std::uint16_t> units;
+        for (std::uint32_t c = 0x20; c <= 0xFFFD; ++c)
+            if (c < 0xD800 || c > 0xDFFF) units.push_back(static_cast<std::uint16_t>(c));
+        const auto glyphs = glyphs_for(*st->face, units);
+        std::vector<std::uint16_t> covered;
+        for (std::size_t i = 0; i < units.size(); ++i) if (glyphs[i] != 0) covered.push_back(units[i]);
+        const auto string = quartz->cf.string_utf16(covered);
+        const auto set_class = quartz->objc.find_class("NSCharacterSet");
+        if (!set_class) unsupported("-[NSFont coveredCharacterSet] (no NSCharacterSet)");
+        s.x[0] = quartz->send_id(set_class, "characterSetWithCharactersInString:", {string});
+        quartz->release(string);
+    });
+    // The font matrix with the size in it: {a, b, c, d, tx, ty} times the point size (translation as is).
+    const auto ns_matrix = [](const FontState& st) {
+        return std::array<double, 6>{st.matrix.a * st.size, st.matrix.b * st.size, st.matrix.c * st.size, st.matrix.d * st.size, st.matrix.tx, st.matrix.ty};
+    };
+    method(f, "matrix", [quartz, font, ns_matrix](CpuState& s, GuestMemory&) {
+        // AppKit answers a pointer owned by the font: kept per font here.
+        static std::map<Address, Address> matrices;
+        static std::mutex mutex;
+        std::lock_guard lock(mutex);
+        auto& slot = matrices[s.x[0]];
+        if (!slot) slot = quartz->process.allocate_guest(48, 8);
+        const auto values = ns_matrix(*font(s.x[0]));
+        for (std::size_t i = 0; i < values.size(); ++i) quartz->write_double(slot + i * 8, values[i]);
+        s.x[0] = slot;
+    }, "^d@:");
+    method(f, "textTransform", [quartz, font, ns_matrix](CpuState& s, GuestMemory&) {
+        const auto transform_class = quartz->objc.find_class("NSAffineTransform");
+        if (!transform_class) unsupported("-[NSFont textTransform] (no NSAffineTransform)");
+        const auto transform = quartz->send_id(transform_class, "transform");
+        const auto values = ns_matrix(*font(s.x[0]));
+        const auto buffer = quartz->process.allocate_guest(48, 8);
+        for (std::size_t i = 0; i < values.size(); ++i) quartz->write_double(buffer + i * 8, values[i]);
+        static_cast<void>(quartz->send_id(transform, "setTransformStruct:", {buffer}));
+        quartz->process.release_guest(buffer);
+        s.x[0] = transform;
+    });
+    // A font from a matrix with the size in it (NSFontIdentityMatrix: 12 points); the size is the vertical scale.
+    const auto font_from_matrix = [quartz](std::optional<ResolvedFont> resolved, std::array<double, 6> m) -> Address {
+        if (!resolved) return 0;
+        const bool identity = m == std::array<double, 6>{1, 0, 0, 1, 0, 0};
+        const double size = identity ? 12 : std::hypot(m[2], m[3]);
+        if (!(size > 0)) return 0;
+        const Affine matrix = identity ? Affine{} : Affine{m[0] / size, m[1] / size, m[2] / size, m[3] / size, m[4], m[5]};
+        return quartz->autorelease(make_font(*quartz, *resolved, size, matrix));
+    };
+    if (!q.process.resolve(appkit_library, "_NSFontIdentityMatrix"))
+        for (const auto library : {appkit_library, cocoa_library}) {
+            const auto slot = q.process.allocate_guest(48, 8);
+            for (std::size_t i = 0; i < 6; ++i) quartz->write_double(slot + i * 8, i == 0 || i == 3 ? 1.0 : 0.0);
+            q.process.install_export(std::string(library), "_NSFontIdentityMatrix", {slot, ExportKind::data});
+        }
+    class_method(f, "fontWithName:matrix:", [quartz, font_from_matrix](CpuState& s, GuestMemory&) {
+        std::array<double, 6> m{1, 0, 0, 1, 0, 0};
+        if (s.x[3]) for (std::size_t i = 0; i < 6; ++i) m[i] = quartz->read_double(s.x[3] + i * 8);
+        s.x[0] = font_from_matrix(s.x[2] ? resolve_font(quartz->cf.utf8(s.x[2])) : std::nullopt, m);
+    }, "@@:@^d");
+    class_method(f, "fontWithDescriptor:textTransform:", [quartz, descriptor_attributes, from_attributes](CpuState& s, GuestMemory&) {
+        const auto created = from_attributes(descriptor_attributes(s.x[2]), 0, {});
+        if (!created || !s.x[3]) { s.x[0] = created ? quartz->autorelease(created) : 0; return; }
+        const auto st = quartz->find<FontState>(created);
+        const auto buffer = quartz->process.allocate_guest(48, 8);
+        CallRegs query;
+        query.x[8] = buffer;
+        static_cast<void>(quartz->objc.send(s.x[3], quartz->objc.selector("transformStruct"), query));
+        std::array<double, 6> m{};
+        for (std::size_t i = 0; i < 6; ++i) m[i] = quartz->read_double(buffer + i * 8);
+        quartz->process.release_guest(buffer);
+        const double size = std::hypot(m[2], m[3]);
+        s.x[0] = size > 0 ? quartz->autorelease(make_font(*quartz, {st->face, st->postscript, st->family, st->display}, size,
+                                                          Affine{m[0] / size, m[1] / size, m[2] / size, m[3] / size, m[4], m[5]}))
+                          : 0;
+        quartz->release(created);
+    }, "@@:@@");
+    // The user's fonts (the application's choice for this process; the user font sizes keep the default when 0).
+    class_method(f, "setUserFont:", [quartz](CpuState& s, GuestMemory&) {
+        auto& slot = coretext().user_font;
+        const auto old = std::exchange(slot, quartz->retain(s.x[2]));
+        quartz->release(old);
+    }, "v@:@");
+    class_method(f, "setUserFixedPitchFont:", [quartz](CpuState& s, GuestMemory&) {
+        auto& slot = coretext().user_fixed_pitch_font;
+        const auto old = std::exchange(slot, quartz->retain(s.x[2]));
+        quartz->release(old);
+    }, "v@:@");
+    // Width variants of the system font (condensed, expanded) are not provided.
+    class_method(f, "systemFontOfSize:weight:width:", [system_weighted](CpuState& s, GuestMemory&) {
+        if (d(s, 2) != 0) unsupported("+[NSFont systemFontOfSize:weight:width:] with a width other than standard (no system font width variants)");
+        s.x[0] = system_weighted(d(s, 0), d(s, 1), false);
+    }, "@@:ddd");
 
     // NSFontDescriptor (the CTFontDescriptor class).
     const auto fd = ct.descriptor_class;
@@ -1044,17 +1173,149 @@ void install_font_exports(Quartz& q) {
         quartz->release(combined);
     }, "@@:d");
     method(fd, "copyWithZone:", [quartz](CpuState& s, GuestMemory&) { s.x[0] = quartz->retain(s.x[0]); }, "@@:^v");
+    // Derived descriptors: attributes added or replaced (and the ones they supersede dropped).
+    const auto derived = [quartz, descriptor_attributes, make_descriptor](Address descriptor, std::vector<std::pair<std::string, Address>> set,
+                                                                          std::vector<std::string> drop) {
+        std::vector<std::pair<Address, Address>> entries;
+        for (const auto& [key, value] : quartz->cf.dictionary_entries(descriptor_attributes(descriptor))) {
+            const auto name = quartz->cf.utf8(key);
+            bool replaced = std::find(drop.begin(), drop.end(), name) != drop.end();
+            for (const auto& change : set) replaced = replaced || change.first == name;
+            if (!replaced) entries.emplace_back(key, value);
+        }
+        std::vector<Address> keys;
+        for (const auto& [key, value] : set) {
+            if (!value) continue;
+            keys.push_back(quartz->cf.string(key));
+            entries.emplace_back(keys.back(), value);
+        }
+        const auto dictionary = quartz->cf.dictionary(entries);
+        for (const auto key : keys) quartz->release(key);
+        const auto made = quartz->autorelease(make_descriptor(dictionary));
+        quartz->release(dictionary);
+        return made;
+    };
+    method(fd, "fontDescriptorByAddingAttributes:", [quartz, derived](CpuState& s, GuestMemory&) {
+        std::vector<std::pair<std::string, Address>> set;
+        if (s.x[2]) for (const auto& [key, value] : quartz->cf.dictionary_entries(s.x[2])) set.emplace_back(quartz->cf.utf8(key), value);
+        s.x[0] = derived(s.x[0], set, {});
+    });
+    method(fd, "fontDescriptorWithFamily:", [derived](CpuState& s, GuestMemory&) {
+        s.x[0] = derived(s.x[0], {{"NSFontFamilyAttribute", s.x[2]}}, {"NSFontNameAttribute", "NSFontFaceAttribute"});
+    });
+    // A face of the descriptor's family: the member whose face name matches gives the font name.
+    method(fd, "fontDescriptorWithFace:", [quartz, derived, descriptor_attributes](CpuState& s, GuestMemory&) {
+        const auto attributes = descriptor_attributes(s.x[0]);
+        // The host family of the descriptor's family (an Apple name maps to a host font) or of its font name.
+        std::string family;
+        const auto named = quartz->dictionary_get(attributes, "NSFontFamilyAttribute") ? quartz->dictionary_get(attributes, "NSFontFamilyAttribute")
+                                                                                         : quartz->dictionary_get(attributes, "NSFontNameAttribute");
+        if (named)
+            if (const auto resolved = resolve_font(quartz->cf.utf8(named))) family = resolved->face->family;
+        const auto face = s.x[2] ? quartz->cf.utf8(s.x[2]) : std::string{};
+        Address postscript{};
+        for (const auto& member : family.empty() ? std::vector<std::shared_ptr<FontFace>>{} : family_members(family)) {
+            std::string a = member->style_name, b = face;
+            std::transform(a.begin(), a.end(), a.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::transform(b.begin(), b.end(), b.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (a == b) { postscript = quartz->autorelease(quartz->cf.string(member->postscript)); break; }
+        }
+        s.x[0] = derived(s.x[0], {{"NSFontFaceAttribute", s.x[2]}, {"NSFontNameAttribute", postscript}}, postscript ? std::vector<std::string>{} : std::vector<std::string>{"NSFontNameAttribute"});
+    });
+    method(fd, "fontDescriptorWithMatrix:", [derived](CpuState& s, GuestMemory&) { s.x[0] = derived(s.x[0], {{"NSFontMatrixAttribute", s.x[2]}}, {}); });
+    method(fd, "matrix", [quartz, descriptor_attributes](CpuState& s, GuestMemory&) {
+        s.x[0] = quartz->dictionary_get(descriptor_attributes(s.x[0]), "NSFontMatrixAttribute");
+    });
+    class_method(fd, "fontDescriptorWithName:matrix:", [quartz, make_descriptor](CpuState& s, GuestMemory&) {
+        const auto name_key = quartz->cf.string("NSFontNameAttribute"), matrix_key = quartz->cf.string("NSFontMatrixAttribute");
+        std::vector<std::pair<Address, Address>> pairs{{name_key, s.x[2]}};
+        if (s.x[3]) pairs.emplace_back(matrix_key, s.x[3]);
+        const auto dictionary = quartz->cf.dictionary(pairs);
+        quartz->release(name_key);
+        quartz->release(matrix_key);
+        s.x[0] = quartz->autorelease(make_descriptor(dictionary));
+        quartz->release(dictionary);
+    }, "@@:@@");
+    // System designs: the default and monospaced system fonts exist; serif and rounded ones do not (nil, as documented for an unavailable design).
+    method(fd, "fontDescriptorWithDesign:", [quartz, derived](CpuState& s, GuestMemory&) {
+        const auto design = s.x[2] ? quartz->cf.utf8(s.x[2]) : std::string{};
+        if (design == "NSCTFontUIFontDesignDefault") return;   // the descriptor itself
+        if (design == "NSCTFontUIFontDesignMonospaced") {
+            s.x[0] = derived(s.x[0], {{"NSFontNameAttribute", quartz->autorelease(quartz->cf.string(".AppleSystemUIFontMonospaced"))}}, {"NSFontFamilyAttribute"});
+            return;
+        }
+        s.x[0] = 0;
+    });
+    for (const auto& [key, value] : {std::pair{"_NSFontDescriptorSystemDesignDefault", "NSCTFontUIFontDesignDefault"},
+                                     std::pair{"_NSFontDescriptorSystemDesignSerif", "NSCTFontUIFontDesignSerif"},
+                                     std::pair{"_NSFontDescriptorSystemDesignMonospaced", "NSCTFontUIFontDesignMonospaced"},
+                                     std::pair{"_NSFontDescriptorSystemDesignRounded", "NSCTFontUIFontDesignRounded"}})
+        if (!q.process.resolve(appkit_library, key)) q.string_constant(appkit_library, key, value);
+    // Matching: the fonts the attributes resolve to (the family's members when a family is given) whose
+    // attributes agree with this descriptor's on the mandatory keys (name, family, face).
+    const auto matching = [quartz, descriptor_attributes, font_descriptor](Address descriptor, Address keys) {
+        const auto attributes = descriptor_attributes(descriptor);
+        std::vector<std::string> mandatory;
+        if (keys) for (const auto key : quartz->cf.array_values(quartz->send_id(keys, "allObjects"))) mandatory.push_back(quartz->cf.utf8(key));
+        // Names compare as the host faces they resolve to (Apple names map to host fonts).
+        const auto host_face = [](const std::string& name) {
+            const auto resolved = resolve_font(name);
+            return resolved ? resolved->face : nullptr;
+        };
+        std::vector<std::shared_ptr<FontFace>> candidates;
+        if (const auto value = quartz->dictionary_get(attributes, "NSFontFamilyAttribute")) {
+            if (const auto face = host_face(quartz->cf.utf8(value))) candidates = family_members(face->family);
+        } else if (const auto name = quartz->dictionary_get(attributes, "NSFontNameAttribute")) {
+            if (const auto face = host_face(quartz->cf.utf8(name))) candidates.push_back(face);
+        }
+        std::vector<Address> found;
+        for (const auto& face : candidates) {
+            const auto agrees = [&](const std::string& key) {
+                const auto wanted = quartz->dictionary_get(attributes, key);
+                if (!wanted) return true;
+                const auto text = quartz->cf.utf8(wanted);
+                const auto wanted_face = key == "NSFontFaceAttribute" ? nullptr : host_face(text);
+                if (key == "NSFontNameAttribute") return wanted_face && wanted_face->postscript == face->postscript;
+                if (key == "NSFontFamilyAttribute") return wanted_face && wanted_face->family == face->family;
+                if (key == "NSFontFaceAttribute") return text == face->style_name;
+                return true;
+            };
+            if (!std::all_of(mandatory.begin(), mandatory.end(), agrees)) continue;
+            FontState state;
+            state.face = face;
+            state.size = quartz->number(quartz->dictionary_get(attributes, "NSFontSizeAttribute")).value_or(12);
+            state.postscript = face->postscript;
+            state.family = face->family;
+            state.display = face->full_name;
+            found.push_back(quartz->autorelease(font_descriptor(state)));
+        }
+        return found;
+    };
+    method(fd, "matchingFontDescriptorsWithMandatoryKeys:", [quartz, matching](CpuState& s, GuestMemory&) {
+        s.x[0] = quartz->autorelease(quartz->cf.array(matching(s.x[0], s.x[2])));
+    });
+    method(fd, "matchingFontDescriptorWithMandatoryKeys:", [matching](CpuState& s, GuestMemory&) {
+        const auto found = matching(s.x[0], s.x[2]);
+        s.x[0] = found.empty() ? 0 : found.front();
+    });
+    // Fonts are local: no downloadable font assets.
+    method(fd, "requiresFontAssetRequest", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
 
     // NSFontManager: trait conversion and font lists.
     const auto fm = q.declare_class("NSFontManager", "NSObject", appkit_library);
     class_method(fm, "sharedFontManager", [quartz, fm](CpuState& s, GuestMemory&) {
         auto& manager = coretext().font_manager;
         if (!manager) {
-            manager = quartz->objc.allocate(fm);
+            // A factory class set before first use makes the shared manager.
+            const auto cls = coretext().font_manager_factory ? coretext().font_manager_factory : fm;
+            manager = quartz->send_id(quartz->objc.allocate(cls), "init");
             if (const auto record = quartz->process.objects().find(manager)) record->immortal = true;
         }
         s.x[0] = manager;
     });
+    class_method(fm, "setFontManagerFactory:", [](CpuState& s, GuestMemory&) {
+        if (!coretext().font_manager) coretext().font_manager_factory = s.x[2];   // only before the shared manager exists, as in AppKit
+    }, "v@:#");
     // NSFontTraitMask: italic 1, bold 2, unbold 4, nonstandard 8, narrow 0x10,
     // expanded 0x20, condensed 0x40, smallcaps 0x80, poster 0x100,
     // compressed 0x200, fixed pitch 0x400, unitalic 0x1000000.

@@ -113,6 +113,22 @@ paragraphs, words and characters are immutable snapshots. NSTextList
 formats its markers (the bullet characters are chosen here; the
 documentation names only the keywords).
 
+**Text actions (`controls/text_actions.cpp`, `controls/text_finder.cpp`):**
+NSText's and NSTextView's attribute actions (alignment, font and colour
+changes, underline, super- and subscript, outline, the font and ruler
+pasteboards) change a rich view's selection through its storage (its
+typing attributes with nothing selected, a plain view's whole text), ask
+-shouldChangeTextInRange:... and end with -didChangeText. RTF goes through
+rtf.cpp's subset (fonts, sizes, bold, italic, underline, colour, alignment,
+indents) both ways; flattened RTFD stops, -writeRTFDToFile: writes a TXT.rtf
+directory. Find (NSTextFinder and the find panel actions) searches the find
+pasteboard's string; the find bar and the replace actions stop explicitly.
+NSFontManager's Font menu actions record the change and -convertFont:
+applies it (traits, sizes, weights); the font panel, TextKit 2, vertical
+layout and the link / list / table panels stop explicitly. NSTextField
+and NSTextInputContext keep their newer settings; the one keyboard input
+source is the host's layout.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

@@ -36,8 +36,9 @@
 //   is from memory, unverified); the host's own dictionary is not touched.
 // - Not available, said so: completions (an empty list), text candidates
 //   (the completion handler gets an empty list), the Spelling and Grammar and
-//   Substitutions panels (nil: no such panel exists here), grammar results,
-//   orthographies (nil). Correction indicators are never shown: dismissing a
+//   Substitutions panels (nil: no such panel exists here), grammar results
+//   (-checkGrammarOfString:... finds none), text replacements (an empty
+//   -userReplacementsDictionary), orthographies (nil). Correction indicators are never shown: dismissing a
 //   view's indicator calls its completion handler with nil (not accepted);
 //   nothing prevents autocorrection and no autospace is added or removed.
 // - The automatic substitution switches (+isAutomaticTextReplacementEnabled
@@ -475,6 +476,16 @@ void Provider::install_spelling() {
     extend("NSSpellChecker", "accessoryView", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     extend("NSSpellChecker", "updateSpellingPanelWithMisspelledWord:", [](CpuState&, GuestMemory&) {}, false, "v@:@");
     extend("NSSpellChecker", "updatePanels", [](CpuState&, GuestMemory&) {}, false, "v@:");
+    // Grammar results are not available (above): no grammar problem is found, with no details.
+    extend("NSSpellChecker", "checkGrammarOfString:startingAt:language:wrap:inSpellDocumentWithTag:details:", [](CpuState& s, GuestMemory& m) {
+        if (s.x[7]) m.write64(s.x[7], 0);
+        s.x[0] = static_cast<std::uint64_t>(INT64_MAX);   // NSNotFound
+        s.x[1] = 0;
+    }, false, "{_NSRange=QQ}@:@q@Bq^@");
+    // The host's text replacements are not read: there are none.
+    extend("NSSpellChecker", "userReplacementsDictionary", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = bridge->autorelease(cf.dictionary(std::vector<std::pair<std::uint64_t, std::uint64_t>>{}));
+    });
     // +isAutomatic...Enabled: the global domain's NSAutomatic...Enabled, YES when unset.
     for (const auto& [selector, key] : std::initializer_list<std::pair<const char*, const char*>>{
              {"isAutomaticTextReplacementEnabled", "NSAutomaticTextReplacementEnabled"},

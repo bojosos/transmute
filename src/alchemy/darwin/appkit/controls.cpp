@@ -208,7 +208,8 @@ void AppKit::install_controls() {
             for (auto* slot : {&state->contents, &state->title, &state->alternate_title, &state->image, &state->alternate_image,
                      &state->key_equivalent, &state->placeholder, &state->font, &state->background_color, &state->text_color,
                      &state->represented, &state->formatter, &state->menu, &state->attributed_title, &state->title_color,
-                     &state->content_tint, &state->bezel_color, &state->sound})
+                     &state->content_tint, &state->bezel_color, &state->sound, &state->placeholder_attributed, &state->allowed_locales,
+                     &state->content_type})
                 release(std::exchange(*slot, 0));
         if (const auto state = objc.find_host_state<CellState>(s.x[0]))
             for (const auto item : std::exchange(state->combo_items, {})) release(item);
@@ -1242,9 +1243,13 @@ void AppKit::install_text_fields() {
     method(text_field_cell, "sendsActionOnEndEditing", [cs](CpuState& s, GuestMemory&) { return_bool(s, cs(s.x[0])->sends_action_on_end_editing); }, "B@:");
     method(text_field_cell, "setSendsActionOnEndEditing:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->sends_action_on_end_editing = bool_arg(s, 2); }, "v@:B");
     method(text_field_cell, "setPreferredMaxLayoutWidth:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->preferred_max_width = std::max(0.0, d(s, 0)); }, "v@:d");
-    method(f, "placeholderAttributedString", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    // The cell's (controls/text_actions.cpp keeps it with the plain placeholder).
+    method(f, "placeholderAttributedString", [this](CpuState& s, GuestMemory&) {
+        const auto target = control_cell(*this, s.x[0]);
+        s.x[0] = target ? send_id(target, "placeholderAttributedString") : 0;
+    });
     method(f, "setPlaceholderAttributedString:", [this](CpuState& s, GuestMemory&) {
-        static_cast<void>(send_id(s.x[0], "setPlaceholderString:", {s.x[2] ? send(s.x[2], "string").x0 : 0}));
+        if (const auto target = control_cell(*this, s.x[0])) static_cast<void>(send_id(target, "setPlaceholderAttributedString:", {s.x[2]}));
     }, "v@:@");
     method(f, "delegate", [this](CpuState& s, GuestMemory&) { s.x[0] = extension<ControlState>(s.x[0])->delegate; });
     method(f, "setDelegate:", [this](CpuState& s, GuestMemory&) { extension<ControlState>(s.x[0])->delegate = s.x[2]; }, "v@:@");
