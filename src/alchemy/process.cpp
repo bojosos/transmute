@@ -16,6 +16,7 @@
 #include "alchemy/perf.hpp"
 #include "alchemy/process_context.hpp"
 #include "alchemy/host/debug.hpp"
+#include "alchemy/host/files.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/registration_audit.hpp"
 
@@ -32,6 +33,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <set>
@@ -124,7 +126,9 @@ private:
         for (const auto& thread : threads) {
             const auto& s = thread.state;
             const auto name = context_.export_name(s.pc);
-            out << "\n thread 0x" << std::hex << thread.identity << ": "
+            out << "\n thread 0x" << std::hex << thread.identity;
+            if (thread.host_thread) out << " (host " << std::dec << thread.host_thread << std::hex << ")";
+            out << ": "
                 << (name.empty() ? "pc " + describe_guest_address(images, s.pc) : "in " + name)
                 << " x0 0x" << s.x[0] << " x1 0x" << s.x[1] << " x2 0x" << s.x[2] << " x3 0x" << s.x[3];
             // mach_msg: the ports of its header (remote +8, local +12, id +20) and
@@ -139,9 +143,22 @@ private:
             try { append_guest_backtrace(out, memory_, images, s.x[30], s.x[29]); } catch (...) {}
             out << std::dec;
         }
-        out << '\n';
-        std::fputs(out.str().c_str(), stderr);
-        std::fflush(stderr);
+        out << '\n' << context_.hang_dump_sections();
+        // One write, so the dumps of several processes sharing stderr do not interleave.
+        const auto text = out.str();
+        static_cast<void>(host::files::write(host::process::standard_handle(host::process::Standard::error),
+                                             std::as_bytes(std::span(text.data(), text.size()))));
+        // The host stacks (where a provider call waits) go to hang-dump-<pid>.txt
+        // next to the trigger, after the guest dump: walking them suspends each
+        // thread in turn. Offsets symbolize with the build's pdb (llvm-symbolizer).
+        std::ofstream file(trigger_.parent_path() / ("hang-dump-" + std::to_string(host::process::current_pid()) + ".txt"),
+                           std::ios::app);
+        file << text;
+        for (const auto& stack : host::debug::other_thread_stacks()) {
+            file << " host thread " << stack.thread << " (cpu " << stack.cpu_ms << " ms):\n";
+            for (std::size_t depth = 0; depth < stack.frames.size(); ++depth)
+                file << "  host #" << depth << ' ' << host::debug::describe_address(stack.frames[depth]) << '\n';
+        }
     }
 
     ProcessContext& context_;
@@ -464,6 +481,16 @@ ProcessResult run_program(const std::filesystem::path& executable,
         engine.state().x[0], engine.state().x[1], engine.state().x[2], engine.state().x[3]};
     context.startup_argc = startup[0];
     context.startup_argv = startup[1];
+    // Diagnostic: ALCHEMY_DEBUG_START_DELAY=<ms>[,<text>] holds the process for <ms> before its
+    // initializers and main (only processes with an argument containing <text>): a slow start
+    // (a cold translation cache, a loaded machine) on demand, at any machine load.
+    if (const auto delay = host::process::environment("ALCHEMY_DEBUG_START_DELAY"); delay && !delay->empty()) {
+        const auto comma = delay->find(',');
+        const auto filter = comma == std::string::npos ? std::string() : delay->substr(comma + 1);
+        const bool selected = filter.empty() || std::any_of(context.arguments.begin(), context.arguments.end(),
+                                                            [&](const std::string& argument) { return argument.find(filter) != std::string::npos; });
+        if (selected) std::this_thread::sleep_for(std::chrono::milliseconds(std::strtoull(delay->c_str(), nullptr, 10)));
+    }
     try {
         loader.initialize(startup);
         perf::phase("initializers done: guest main starts");

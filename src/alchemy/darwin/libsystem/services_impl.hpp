@@ -28,6 +28,7 @@
 #include "alchemy/record_locks.hpp"
 #include "alchemy/darwin_process.hpp"
 #include "alchemy/darwin_support.hpp"
+#include "alchemy/darwin_threads.hpp"
 #include "alchemy/darwin_vm_space.hpp"
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/mach_port_events.hpp"
@@ -1885,7 +1886,7 @@ public:
         // waits. Neither descriptor metadata nor guest memory is leased here.
         for (;;) {
             if (record->closed || !owner->aliases) throw ServiceError{ebadf};
-            if (context.requested_exit()) throw ServiceError{89};
+            if (process_exiting(context)) throw ServiceError{89};
             if (owner->mode == kind) return 0;
             if (owner->mode) owner->unlock();
             const auto locked = host::files::lock(owner->handle, 0, 1, kind == 2);

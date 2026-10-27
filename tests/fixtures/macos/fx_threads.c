@@ -18,6 +18,13 @@ extern void* dispatch_semaphore_create(long);
 extern long dispatch_semaphore_wait(void*, unsigned long long);
 extern int puts(const char*);
 extern int usleep(unsigned);
+struct kevent64_s { unsigned long ident; short filter; unsigned short flags; unsigned fflags; long data; unsigned long udata; unsigned long ext[2]; };
+extern int kqueue(void);
+extern int kevent64(int, const struct kevent64_s*, int, struct kevent64_s*, int, unsigned, const void*);
+struct pollfd { int fd; short events; short revents; };
+extern int poll(struct pollfd*, unsigned, int);
+extern int pipe(int[2]);
+extern void _exit(int) __attribute__((noreturn));
 extern void exit(int) __attribute__((noreturn));
 extern void abort(void) __attribute__((noreturn));
 
@@ -147,6 +154,34 @@ static void* semaphore_waiter(void* argument) {
     return 0;
 }
 
+/* Waits that check their result like Chrome's message pump (a failed kevent64
+   is fatal there): exit() must end them without returning an error. */
+static void* kevent_waiter(void* argument) {
+    struct kevent64_s event;
+    const int queue = kqueue();
+    (void)argument;
+    __atomic_fetch_add((int*)&started, 1, __ATOMIC_SEQ_CST);
+    if (queue < 0 || kevent64(queue, 0, 0, &event, 1, 0, 0) < 0) { puts("fx threads: kevent64 failed during exit"); abort(); }
+    return 0;
+}
+
+static void* poll_waiter(void* argument) {
+    int ends[2];
+    struct pollfd wait;
+    (void)argument;
+    if (pipe(ends)) abort();
+    wait.fd = ends[0]; wait.events = 1; wait.revents = 0;
+    __atomic_fetch_add((int*)&started, 1, __ATOMIC_SEQ_CST);
+    if (poll(&wait, 1, -1) < 0) { puts("fx threads: poll failed during exit"); abort(); }
+    return 0;
+}
+
+static void* sleeper(void* argument) {
+    (void)argument;
+    __atomic_fetch_add((int*)&started, 1, __ATOMIC_SEQ_CST);
+    for (;;) if (usleep(100000) < 0) { puts("fx threads: usleep failed during exit"); abort(); }
+}
+
 static void* exiter(void* argument) {
     while (started < (int)(unsigned long)argument) usleep(1000);
     usleep(20000);
@@ -230,6 +265,17 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < ticks; ++i) usleep(200000);
         puts("fx threads: wait done");
         exit(0);
+    }
+    if (same(mode, "exit-wakes")) {
+        /* Workers blocked in kevent64, poll and usleep while main exits. */
+        pthread_t thread;
+        if (pthread_create(&thread, 0, kevent_waiter, 0)) return 60;
+        if (pthread_create(&thread, 0, poll_waiter, 0)) return 61;
+        if (pthread_create(&thread, 0, sleeper, 0)) return 62;
+        while (started < 3) usleep(1000);
+        usleep(50000);
+        puts("fx threads: exit with waiting workers");
+        _exit(0);   /* as Chrome's TerminateCurrentProcessImmediately */
     }
     if (same(mode, "trap")) __builtin_trap();
     if (same(mode, "abort")) abort();

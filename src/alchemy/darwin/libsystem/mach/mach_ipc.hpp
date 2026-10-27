@@ -148,6 +148,7 @@ struct Message {
     Right reply;
     std::vector<Descriptor> descriptors;
     std::uint64_t stamp{};
+    std::chrono::steady_clock::time_point queued{};   // when it was queued here (diagnostics)
     bool kernel{};                     // sent by the kernel (notifications)
     std::optional<std::array<std::uint32_t, 8>> audit;   // the sending task's audit token (another process)
 };
@@ -292,6 +293,10 @@ public:
     std::optional<Event> poll(transmute::GuestMemory& memory, std::uint32_t name, std::uint32_t fflags, std::uint64_t ext0,
                               std::uint64_t ext1) override;
     bool newer(std::uint32_t name, std::uint64_t stamp) override;
+    // Diagnostics (hang dumps): the receive rights of this space whose oldest
+    // queued message has waited longer than `older_than` (name, queue length,
+    // age, message id, port sets). Never blocks for long on the space lock.
+    [[nodiscard]] std::string describe_stale_queues(std::chrono::milliseconds older_than);
     bool dead_name(std::uint32_t name) override;
     std::uint64_t epoch() override;
     void wait(std::uint64_t seen, std::chrono::steady_clock::duration limit) override;

@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
+#include "alchemy/darwin_threads.hpp"
 #include "alchemy/host/sync.hpp"
 
 #include <map>
@@ -151,7 +152,7 @@ void install_libsystem_ipc(Provider& p) {
             const auto taken = host::sync::wait_any(semaphores, 20'000'000);
             if (taken) return 0;
             if (taken.error() != host::Error::timed_out) throw Errno{einval};
-            if (process.requested_exit()) throw Errno{eintr};
+            if (process_exiting(process)) throw Errno{eintr};
         }
     });
     // semget, semctl and semop: libsystem_sysv.cpp (unavailable there too when

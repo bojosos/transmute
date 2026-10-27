@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -112,6 +113,9 @@ std::shared_ptr<ThreadContext> ProcessContext::thread(transmute::ReferenceEngine
         std::lock_guard lock(mutex_);
         const auto found = threads_.find(&engine);
         if (found != threads_.end()) {
+            // A context made for another thread (pthread_create) learns its host thread here.
+            if (!found->second->host_thread && &engine == &calling_engine())
+                found->second->host_thread = host::process::current_thread_id();
             cache = {this, &engine, generation, found->second};
             return found->second;
         }
@@ -120,6 +124,7 @@ std::shared_ptr<ThreadContext> ProcessContext::thread(transmute::ReferenceEngine
     auto result = std::make_shared<ThreadContext>();
     result->engine = &engine;
     result->errno_address = errno_address;
+    if (&engine == &calling_engine()) result->host_thread = host::process::current_thread_id();
     bool inserted = false;
     {
         std::lock_guard lock(mutex_);
@@ -137,6 +142,24 @@ std::shared_ptr<ThreadContext> ProcessContext::current_thread() { return thread(
 void ProcessContext::at_teardown(std::function<void()> hook) {
     std::lock_guard lock(mutex_);
     teardown_.push_back(std::move(hook));
+}
+
+void ProcessContext::at_hang_dump(std::function<std::string()> section) {
+    std::lock_guard lock(mutex_);
+    hang_dump_sections_.push_back(std::move(section));
+}
+
+std::string ProcessContext::hang_dump_sections() const {
+    std::vector<std::function<std::string()>> sections;
+    {
+        std::lock_guard lock(mutex_);
+        sections = hang_dump_sections_;
+    }
+    std::string out;
+    for (const auto& section : sections) {
+        try { out += section(); } catch (...) {}
+    }
+    return out;
 }
 
 std::uint64_t ProcessContext::threads_seen() const {
@@ -157,7 +180,7 @@ std::vector<ProcessContext::ThreadSnapshot> ProcessContext::thread_snapshots() c
     std::lock_guard lock(mutex_);
     std::vector<ThreadSnapshot> snapshots;
     snapshots.reserve(threads_.size());
-    for (const auto& [engine, thread] : threads_) snapshots.push_back({thread->identity, engine->state()});
+    for (const auto& [engine, thread] : threads_) snapshots.push_back({thread->identity, thread->host_thread, engine->state()});
     return snapshots;
 }
 
@@ -258,7 +281,8 @@ OutputResult ProcessContext::output(unsigned descriptor, std::span<const std::ui
 namespace {
 // ALCHEMY_TRACE_CALLS=<comma-separated symbol prefixes, or *; -prefix excludes>: diagnostic log
 // of provider calls (process id and thread hash, symbol, x0..x3 on entry, x0 on return)
-// to stderr. ALCHEMY_TRACE_CALLS_FILTER=<text> limits it to the Alchemy
+// to stderr (ALCHEMY_TRACE_CALLS_ERRORS=1: only the calls that return non-zero).
+// ALCHEMY_TRACE_CALLS_FILTER=<text> limits it to the Alchemy
 // processes whose host command line contains <text> (for example
 // "--alchemy-child-spec": guest children only).
 const std::vector<std::string>& traced_call_prefixes() {
@@ -330,8 +354,14 @@ std::uint64_t ProcessContext::install_function(std::string symbol,
                 if (terminated && !bytes.empty() && std::all_of(bytes.begin(), bytes.end(), [](auto c) { return c >= 0x20 && c < 0x7f; }))
                     text += " \"" + std::string(bytes.begin(), bytes.end()) + "\"";
             } catch (...) {}
-            std::fprintf(stderr, "%s\n", text.c_str());
+            // ALCHEMY_TRACE_CALLS_ERRORS=1: only the calls that return non-zero (both lines then).
+            static const bool errors_only = [] { const auto value = host::process::environment("ALCHEMY_TRACE_CALLS_ERRORS"); return value && value->starts_with("1"); }();
+            if (!errors_only) std::fprintf(stderr, "%s\n", text.c_str());
             inner(state, memory);
+            if (errors_only) {
+                if (static_cast<std::uint32_t>(state.x[0]) == 0) return;
+                std::fprintf(stderr, "%s\n", text.c_str());
+            }
             // A failure result (-1 as int or pointer) shows the guest errno.
             if (static_cast<std::uint32_t>(state.x[0]) == UINT32_MAX) {
                 std::uint32_t error{};
@@ -515,8 +545,22 @@ void ProcessContext::run_finalizers(std::optional<std::uint64_t> dso) {
 }
 
 void ProcessContext::request_exit(std::uint32_t status) {
-    std::lock_guard lock(mutex_);
-    if (!exit_) exit_ = status;
+    {
+        std::lock_guard lock(mutex_);
+        if (exit_) return;
+        exit_ = status;
+    }
+    // ALCHEMY_TRACE_PROCESS=1: the process ends itself (a process that is
+    // killed or crashes says nothing here).
+    static const bool trace = [] { const auto value = host::process::environment("ALCHEMY_TRACE_PROCESS"); return value && value->starts_with("1"); }();
+    if (trace) {
+        const auto started = host::process::start_time().value_or(0);   // Unix nanoseconds
+        const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        std::fprintf(stderr, "[alchemy process] %llu: exits with status %u after %.1f s\n",
+                     static_cast<unsigned long long>(host::process::current_pid()), status,
+                     started && now > started ? static_cast<double>(now - started) / 1e9 : 0.0);
+    }
 }
 
 std::optional<std::uint32_t> ProcessContext::requested_exit() const {

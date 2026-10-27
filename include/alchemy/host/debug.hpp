@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace alchemy::host::debug {
 
@@ -33,6 +34,17 @@ void on_fatal_fault(void (*report)(const Fault& fault));
 // Up to frames.size() return addresses of the calling thread's host stack,
 // innermost first, skipping `skip` frames above the caller. Returns the count.
 [[nodiscard]] std::size_t capture_stack(std::span<std::uintptr_t> frames, unsigned skip = 0) noexcept;
+
+// Diagnostics (hang dumps): the host stack of every other thread of this
+// process, innermost first, up to `depth` frames each. Each thread is
+// suspended only while it is walked, and nothing is allocated meanwhile. A
+// walk ends at code without unwind data (guest code the engine generated).
+struct ThreadStack {
+    std::uint64_t thread{};               // host thread id (host::process::current_thread_id)
+    std::uint64_t cpu_ms{};               // CPU time so far (user + kernel): a spinning thread's grows between dumps
+    std::vector<std::uintptr_t> frames;
+};
+[[nodiscard]] std::vector<ThreadStack> other_thread_stacks(std::size_t depth = 40);
 
 // "0x<address> <module>+0x<offset>", or "0x<address> (no module)".
 [[nodiscard]] std::string describe_address(std::uintptr_t address);

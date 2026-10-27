@@ -951,7 +951,7 @@ void DarwinServices::Impl::install_file_services() {
         for (;;) {
             const auto remaining = deadline - std::chrono::steady_clock::now();
             if (remaining <= std::chrono::steady_clock::duration::zero()) return std::uint64_t{0};
-            if (context.requested_exit()) throw ServiceError{89};
+            if (process_exiting(context)) throw ServiceError{89};
             precise_sleep_for(std::min(remaining,
                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(10))));
         }

@@ -28,13 +28,17 @@ constexpr std::uint32_t frame_limit = 256U * 1024 * 1024;
 
 std::string channel_name(std::uint32_t pid) { return "alchemy-mach-" + std::to_string(pid); }
 
-// Exactly `size` bytes in one direction; false on any failure or end of channel.
-bool transfer(host::Handle channel, bool writing, void* data, std::size_t size) {
+// Exactly `size` bytes in one direction; false on any failure or end of
+// channel, with the reason in `why` when given.
+bool transfer(host::Handle channel, bool writing, void* data, std::size_t size, std::string* why = nullptr) {
     auto* cursor = static_cast<std::byte*>(data);
     while (size) {
         const auto done = writing ? host::ipc::write(channel, std::span<const std::byte>(cursor, size))
                                   : host::ipc::read(channel, std::span<std::byte>(cursor, size));
-        if (!done || *done == 0) return false;
+        if (!done || *done == 0) {
+            if (why) *why = std::string(writing ? "write: " : "read: ") + std::string(done ? std::string_view("end of channel") : host::name(done.error()));
+            return false;
+        }
         cursor += *done;
         size -= *done;
     }
@@ -58,16 +62,19 @@ std::vector<std::uint8_t> encode(std::uint32_t type, std::uint32_t sender, std::
     return bytes;
 }
 
-bool read_frame(host::Handle pipe, Header& header, std::vector<std::uint8_t>& payload) {
+bool read_frame(host::Handle pipe, Header& header, std::vector<std::uint8_t>& payload, std::string* why = nullptr) {
     std::uint8_t raw[20];
-    if (!transfer(pipe, false, raw, sizeof(raw))) return false;
+    if (!transfer(pipe, false, raw, sizeof(raw), why)) return false;
     std::memcpy(&header.type, raw, 4);
     std::memcpy(&header.sender, raw + 4, 4);
     std::memcpy(&header.request, raw + 8, 8);
     std::memcpy(&header.size, raw + 16, 4);
-    if (header.size > frame_limit) return false;
+    if (header.size > frame_limit) {
+        if (why) *why = "a frame of " + std::to_string(header.size) + " bytes";
+        return false;
+    }
     payload.resize(header.size);
-    return header.size == 0 || transfer(pipe, false, payload.data(), header.size);
+    return header.size == 0 || transfer(pipe, false, payload.data(), header.size, why);
 }
 
 class PipeTransport final : public Transport, public std::enable_shared_from_this<PipeTransport> {
@@ -122,6 +129,9 @@ public:
         }
         auto result = std::move(connection->pending[id]);
         connection->pending.erase(id);
+        if (!result && !connection->closed)
+            std::cerr << "alchemy: Mach transport (pid " << self_ << "): request " << type << " to pid " << pid << " had no answer in "
+                      << timeout.count() << " ms" << std::endl;
         return result;
     }
 
@@ -221,7 +231,11 @@ private:
             if (connected) std::thread([self = shared_from_this(), pipe] { self->serve(pipe); }).detach();
             else host::close(pipe);
             const auto next = host::ipc::listen(channel_name(self_), false);
-            if (!next) return;
+            if (!next) {
+                std::cerr << "alchemy: Mach transport (pid " << self_ << "): stopped accepting connections (" << host::name(next.error())
+                          << ")" << std::endl;
+                return;
+            }
             pipe = *next;
         }
     }
@@ -230,7 +244,8 @@ private:
     void serve(host::Handle pipe) {
         Header header;
         std::vector<std::uint8_t> payload;
-        while (read_frame(pipe, header, payload)) {
+        std::string why;
+        while (read_frame(pipe, header, payload, &why)) {
             const auto handler = handler_.lock();
             if (!handler || stopped_) break;
             Reader reader{payload};
@@ -238,7 +253,7 @@ private:
                 if (header.request) {
                     auto answer = handler->request(header.sender, header.type, reader);
                     auto bytes = encode(response, self_, header.request, answer);
-                    if (!transfer(pipe, true, bytes.data(), bytes.size())) break;
+                    if (!transfer(pipe, true, bytes.data(), bytes.size(), &why)) break;
                 } else {
                     handler->frame(header.sender, header.type, reader);
                 }
@@ -246,6 +261,10 @@ private:
                 std::cerr << "alchemy: Mach transport: frame " << header.type << " from " << header.sender << ": " << error.what() << std::endl;
             }
         }
+        // A peer that ends closes its end: only other failures are news.
+        if (!why.empty() && why.find("end of channel") == std::string::npos && !stopped_)
+            std::cerr << "alchemy: Mach transport (pid " << self_ << "): a connection from pid " << header.sender << " failed (" << why << ")"
+                      << std::endl;
         host::close(pipe);
     }
 
@@ -256,7 +275,18 @@ private:
             if (const auto found = connections_.find(pid); found != connections_.end()) return found->second->closed ? nullptr : found->second;
         }
         const auto connected = host::ipc::connect(channel_name(pid));
-        if (!connected) return nullptr;
+        if (!connected) {
+            // Said once per peer: what was to go there is lost.
+            bool first{};
+            {
+                std::lock_guard lock(mutex_);
+                first = unreachable_.insert(pid).second;
+            }
+            if (first)
+                std::cerr << "alchemy: Mach transport (pid " << self_ << "): cannot connect to pid " << pid << " ("
+                          << host::name(connected.error()) << ")" << std::endl;
+            return nullptr;
+        }
         const auto pipe = *connected;
         auto connection = std::make_shared<Connection>();
         connection->pid = pid;
@@ -281,16 +311,18 @@ private:
             auto bytes = std::move(connection->outbox.front());
             connection->outbox.pop_front();
             lock.unlock();
-            const bool ok = transfer(connection->pipe, true, bytes.data(), bytes.size());
+            std::string why;
+            const bool ok = transfer(connection->pipe, true, bytes.data(), bytes.size(), &why);
             lock.lock();
-            if (!ok) { lock.unlock(); close(*connection); return; }
+            if (!ok) { lock.unlock(); close(*connection, why); return; }
         }
     }
 
     void read_loop(const std::shared_ptr<Connection>& connection) {
         Header header;
         std::vector<std::uint8_t> payload;
-        while (read_frame(connection->pipe, header, payload)) {
+        std::string why;
+        while (read_frame(connection->pipe, header, payload, &why)) {
             if (header.type != response) continue;
             std::lock_guard lock(connection->gate);
             if (const auto found = connection->pending.find(header.request); found != connection->pending.end()) {
@@ -298,16 +330,21 @@ private:
                 connection->changed.notify_all();
             }
         }
-        close(*connection);
+        close(*connection, why);
     }
 
-    void close(Connection& connection) {
+    // `why`: a failure on a live peer's connection (said once per connection;
+    // what was queued for it is lost). Empty: closed on purpose.
+    void close(Connection& connection, const std::string& why = {}) {
         {
             std::lock_guard lock(connection.gate);
             if (connection.closed) return;
             connection.closed = true;
             connection.changed.notify_all();
         }
+        if (!why.empty() && !stopped_)
+            std::cerr << "alchemy: Mach transport (pid " << self_ << "): the connection to pid " << connection.pid << " ended (" << why
+                      << ")" << std::endl;
         host::ipc::cancel(connection.pipe);
         // The handle stays open until both loops are done with it; the
         // process ends or the connection is dropped from the table.
@@ -323,6 +360,8 @@ private:
             }
         }
         if (connection) close(*connection);
+        static const bool trace = [] { const auto value = host::process::environment("ALCHEMY_TRACE_PROCESS"); return value && value->starts_with("1"); }();
+        if (trace) std::cerr << "[alchemy process] " << self_ << ": peer " << pid << " ended (its ports are dead here)" << std::endl;
         if (const auto handler = handler_.lock()) handler->peer_died(pid);
     }
 
@@ -331,6 +370,7 @@ private:
     std::mutex mutex_;
     std::map<std::uint32_t, std::shared_ptr<Connection>> connections_;
     std::set<std::uint32_t> watched_;
+    std::set<std::uint32_t> unreachable_;   // peers a connection failed to (reported once)
     std::vector<std::uint64_t> exit_watches_;   // process_tree watches
     std::atomic<std::uint64_t> next_request_{1};
     host::Handle listening_pipe_;

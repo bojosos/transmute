@@ -734,6 +734,11 @@ void MachProvider::install() {
     };
     ipc = std::make_shared<MachIpc>(std::move(guest));
     set_mach_port_events(process, ipc);
+    // Hang dumps list messages that wait unreceived (a lost wakeup shows here).
+    process.at_hang_dump([weak_ipc = std::weak_ptr<MachIpc>(ipc)]() -> std::string {
+        const auto space = weak_ipc.lock();
+        return space ? space->describe_stale_queues(std::chrono::seconds(2)) : std::string();
+    });
     foreign_ports = std::make_shared<ForeignPorts>(ipc);
     set_mach_kernel_objects(process, foreign_ports);
     // Across processes: the bootstrap broker is the root Alchemy process of

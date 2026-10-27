@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -177,6 +179,21 @@ int main(int argc, char** argv) {
                    "expected prompt status 7 without diagnostics");
         }
         {
+            // _exit() ends workers blocked in kevent64, poll and usleep without
+            // their calls returning an error (Chrome's message pump CHECKs
+            // kevent64's result: ECANCELED there was a SIGTRAP at shutdown).
+            // Whether a woken worker's guest code runs before the process is
+            // gone is a race, so the traced calls show it: a wait that returns
+            // at exit prints its result (errno 89 = ECANCELED).
+            SetEnvironmentVariableA("ALCHEMY_TRACE_CALLS", "_kevent64,_poll,_usleep");
+            const auto outcome = run({fx, threads, "exit-wakes"});
+            SetEnvironmentVariableA("ALCHEMY_TRACE_CALLS", nullptr);
+            expect(outcome.status == 0 && outcome.seconds < 20 && contains(outcome.output, "exit with waiting workers") &&
+                       contains(outcome.output, "_kevent64(") && !contains(outcome.output, "(errno 89)") &&
+                       !contains(outcome.output, "failed during exit"),
+                   "_exit() with kevent64, poll and usleep waiters", outcome, "expected status 0 and no wait failing at exit");
+        }
+        {
             const auto outcome = run({fx, threads, "return-busy"});
             expect(outcome.status == 9 && outcome.seconds < 20 && !contains(outcome.output, "alchemy:"),
                    "return from main with busy workers", outcome, "expected prompt status 9");
@@ -202,8 +219,19 @@ int main(int argc, char** argv) {
             toucher.join();
             SetEnvironmentVariableA("ALCHEMY_HANG_DUMP", nullptr);
             DeleteFileA(trigger.c_str());
+            // The host stacks go to hang-dump-<pid>.txt next to the trigger.
+            std::string host_stacks;
+            if (const auto at = outcome.output.find("alchemy: hang dump (pid "); at != std::string::npos) {
+                const auto pid = std::strtoul(outcome.output.c_str() + at + 24, nullptr, 10);
+                const std::string file = std::string(directory) + "hang-dump-" + std::to_string(pid) + ".txt";
+                if (std::ifstream in{file}) host_stacks.assign(std::istreambuf_iterator<char>(in), {});
+                DeleteFileA(file.c_str());
+            }
             expect(outcome.status == 0 && contains(outcome.output, "alchemy: hang dump (pid ") &&
-                       contains(outcome.output, ") fx_threads: ") &&
+                       contains(outcome.output, ") fx_threads: ") && contains(outcome.output, " (host ") &&
+                       contains(outcome.output, " receive right(s) with ") &&
+                       contains(host_stacks, " host thread ") && contains(host_stacks, "host #0 ") &&
+                       contains(host_stacks, "alchemy-fx.exe+0x") &&
                        contains(outcome.output, "in _pthread_cond_wait") && contains(outcome.output, "in _usleep") &&
                        contains(outcome.output, "fx_threads+0x"),
                    "ALCHEMY_HANG_DUMP prints the waiting threads", outcome, "expected a dump with both waits");

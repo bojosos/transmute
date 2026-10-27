@@ -1,12 +1,14 @@
 #include "alchemy/darwin/libsystem/mach/mach_ipc.hpp"
 
 #include "alchemy/engine_adapter.hpp"
+#include "alchemy/host/process.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 
 // The space and message transfer of mach_ipc.hpp. Every public operation
@@ -157,6 +159,7 @@ std::size_t MachIpc::live_names() {
 
 void MachIpc::enqueue(const std::shared_ptr<Port>& port, std::shared_ptr<Message> message) {
     message->stamp = ++stamp_;
+    message->queued = std::chrono::steady_clock::now();
     port->queue.push_back(std::move(message));
     touch();
 }
@@ -328,6 +331,15 @@ void MachIpc::destroy_receive(const std::shared_ptr<Port>& port) {
 // died): queued messages are destroyed, every name for it becomes a dead name
 // (with dead-name notifications), and processes holding rights to it learn it.
 void MachIpc::kill_port(std::shared_ptr<Port> port) {
+    // ALCHEMY_TRACE_PROCESS=1: ports that die while other processes know them.
+    static const bool trace = [] { const auto value = host::process::environment("ALCHEMY_TRACE_PROCESS"); return value && value->starts_with("1"); }();
+    if (trace && port->active && (port->host || !port->holders.empty() || !port->once_holders.empty())) {
+        std::string told;
+        for (const auto& [pid, units] : port->holders) told += " " + std::to_string(pid);
+        for (const auto& [pid, units] : port->once_holders) told += " " + std::to_string(pid) + "(once)";
+        std::fprintf(stderr, "[alchemy mach] %u: port %u:%llu %s%s\n", self_, port->key.pid, static_cast<unsigned long long>(port->key.id),
+                     port->host ? "of another process dies here" : "dies; holders:", told.c_str());
+    }
     port->active = false;
     leave_sets(*port);
     if (port->nsrequest) release(*std::exchange(port->nsrequest, std::nullopt));
@@ -1695,6 +1707,36 @@ std::uint64_t MachIpc::newest(Name name) {
 bool MachIpc::newer(std::uint32_t name, std::uint64_t stamp) {
     std::lock_guard lock(mutex_);
     return newest(name) > stamp;
+}
+
+std::string MachIpc::describe_stale_queues(std::chrono::milliseconds older_than) {
+    Lock lock(mutex_, std::defer_lock);
+    for (int attempt = 0; attempt < 200 && !lock.try_lock(); ++attempt) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!lock.owns_lock()) return " mach: the port space stayed locked for 2 s\n";
+    const auto now = std::chrono::steady_clock::now();
+    std::string out;
+    std::size_t ports = 0, queued = 0;
+    for (const auto& [name, entry] : entries_) {
+        if (!entry.receive || !entry.port || entry.port->queue.empty()) continue;
+        ++ports;
+        queued += entry.port->queue.size();
+        const auto& front = *entry.port->queue.front();
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - front.queued);
+        if (age < older_than) continue;
+        char line[160];
+        std::snprintf(line, sizeof(line), " mach: port 0x%x holds %zu message(s), the oldest (id 0x%x%s) for %lld ms", name,
+                      entry.port->queue.size(), get32(front.bytes, 20), front.kernel ? ", a notification" : "",
+                      static_cast<long long>(age.count()));
+        out += line;
+        for (const auto* set : entry.port->sets) {
+            std::snprintf(line, sizeof(line), "; in set 0x%x", set->name);
+            out += line;
+        }
+        out += '\n';
+    }
+    char summary[96];
+    std::snprintf(summary, sizeof(summary), " mach: %zu receive right(s) with %zu queued message(s)\n", ports, queued);
+    return summary + out;
 }
 
 bool MachIpc::dead_name(std::uint32_t name) {

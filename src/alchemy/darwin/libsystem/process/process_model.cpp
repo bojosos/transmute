@@ -222,7 +222,7 @@ std::uint64_t DarwinServices::Impl::pipe_read(transmute::GuestMemory& memory, co
             }
         }
         if (record->pipe_status->load() & 4) throw ServiceError{eagain_error};
-        if (context.requested_exit()) throw ServiceError{89};
+        if (process_exiting(context)) throw ServiceError{89};
         if (delay.count()) std::this_thread::sleep_for(delay); else std::this_thread::yield();
         delay = std::min<std::chrono::microseconds>(delay * 2 + std::chrono::microseconds(100), std::chrono::milliseconds(10));
     }
@@ -350,7 +350,15 @@ std::optional<std::optional<std::uint32_t>> DarwinServices::Impl::child_status(s
     if (found == children.end()) return std::nullopt;
     const auto& child = found->second;
     if (child.pseudo_status) return std::optional<std::uint32_t>(*child.pseudo_status);
-    if (const auto code = ended_child(child.process)) return std::optional<std::uint32_t>(darwin_wait_status(*code));
+    if (const auto code = ended_child(child.process)) {
+        // ALCHEMY_TRACE_PROCESS=1: each child's end, once, with its host exit code.
+        static const bool trace = [] { const auto value = host::process::environment("ALCHEMY_TRACE_PROCESS"); return value && value->starts_with("1"); }();
+        static std::set<std::uint32_t> reported;
+        if (trace && reported.insert(pid).second)
+            std::cerr << "[alchemy process] " << process_id() << ": child " << pid << " ended (host exit code 0x" << std::hex << *code << std::dec
+                      << ")" << std::endl;
+        return std::optional<std::uint32_t>(darwin_wait_status(*code));
+    }
     if (child.kill_certain) return std::optional<std::uint32_t>(child.killed_by & 0x7f);
     return std::optional<std::uint32_t>{};
 }
@@ -1030,7 +1038,7 @@ void DarwinServices::Impl::install_process_services() {
                 if (!any) throw ServiceError{echild};
             }
             if (options & 1) return {0, 0};   // WNOHANG
-            if (context.requested_exit()) throw ServiceError{eintr_error};
+            if (process_exiting(context)) throw ServiceError{eintr_error};
             if (pending.size() > host::sync::max_wait_handles) pending.resize(host::sync::max_wait_handles);
             if (pending.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
             else static_cast<void>(host::sync::wait_any(pending, 50'000'000));

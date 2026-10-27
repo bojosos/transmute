@@ -69,6 +69,7 @@ struct AutoreleasePool { std::uint64_t token{}; std::vector<std::uint64_t> objec
 
 struct ThreadContext {
     std::uint64_t identity{};
+    std::uint64_t host_thread{};   // the host thread id, when its own thread made the context (diagnostics)
     transmute::ReferenceEngine* engine{};
     std::uint64_t errno_address{};
     std::uint64_t dlerror_address{};
@@ -124,6 +125,7 @@ public:
     // call they are the call's (pc = the call's address, x30 = the caller).
     struct ThreadSnapshot {
         std::uint64_t identity{};
+        std::uint64_t host_thread{};   // 0: not known
         transmute::CpuState state{};
     };
     [[nodiscard]] std::vector<ThreadSnapshot> thread_snapshots() const;
@@ -175,6 +177,10 @@ public:
     // handlers until process exit), so it releases engine state here, never
     // in its destructor.
     void at_teardown(std::function<void()> hook);
+    // Diagnostics (ALCHEMY_HANG_DUMP): sections that subsystems add to every
+    // hang dump (called on the dump's own thread, without guest calls).
+    void at_hang_dump(std::function<std::string()> section);
+    [[nodiscard]] std::string hang_dump_sections() const;
     void run_finalizers(std::optional<std::uint64_t> dso = {});
     void request_exit(std::uint32_t status);
     [[nodiscard]] std::optional<std::uint32_t> requested_exit() const;
@@ -283,6 +289,7 @@ private:
     mutable std::mutex waker_mutex_;
     std::shared_ptr<const std::function<void()>> main_waker_;
     std::vector<std::function<void()>> teardown_;
+    std::vector<std::function<std::string()>> hang_dump_sections_;
 };
 
 } // namespace alchemy

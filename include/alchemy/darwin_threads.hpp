@@ -14,6 +14,15 @@ struct GuestThreadStop {};
 // True when the calling engine is a worker and the process is exiting; such a
 // worker should throw GuestThreadStop instead of returning to guest code.
 [[nodiscard]] bool guest_worker_must_stop(ProcessContext& context);
+// For a blocking libSystem call that polls for process exit: true when the
+// process is exiting, but a worker never sees it: it stops here
+// (GuestThreadStop), as on Darwin, where exit ends every other thread without
+// returning from its call. An error such as ECANCELED or EINTR instead reaches
+// code that checks it (Chrome's message pump CHECKs kevent64's result).
+inline bool process_exiting(ProcessContext& context) {
+    if (guest_worker_must_stop(context)) throw GuestThreadStop{};
+    return context.requested_exit().has_value();
+}
 
 // Darwin ABI adapters over Transmute's existing shared-address-space workers.
 class DarwinThreads {

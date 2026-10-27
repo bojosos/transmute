@@ -139,7 +139,7 @@ std::shared_ptr<NetworkQuery<Value>> query_network(ProcessContext& context, std:
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     std::unique_lock lock(query->mutex);
     while (!query->complete) {
-        if (context.requested_exit()) throw ServiceError{89};
+        if (process_exiting(context)) throw ServiceError{89};
         if (std::chrono::steady_clock::now() >= deadline) return {};
         query->condition.wait_for(lock, std::chrono::milliseconds(10));
     }
@@ -380,7 +380,7 @@ std::pair<std::shared_ptr<NetworkSocket>, std::shared_ptr<NetworkSocket>> Darwin
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     for (;;) {
-        if (context.requested_exit()) throw ServiceError{89};
+        if (process_exiting(context)) throw ServiceError{89};
         auto connection = net::accept(listener->handle);
         if (connection) {
             auto accepted = std::make_shared<NetworkSocket>(); accepted->session = network_session; accepted->type = 1;
@@ -679,7 +679,7 @@ std::uint64_t DarwinServices::Impl::network_poll(transmute::CpuState& state, tra
         }
     }
     for (;;) {
-        if (context.requested_exit()) throw ServiceError{89};
+        if (process_exiting(context)) throw ServiceError{89};
         std::uint64_t count = 0;
         for (auto& wait : waits) {
             if (wait.descriptor < 0) wait.ready = 0;
@@ -826,7 +826,7 @@ void DarwinServices::Impl::install_network_services() {
         if (error != 35 && error != 36 && error != 37) throw ServiceError{error};
         if (socket->status_flags & 4) throw ServiceError{error == 37 ? 37U : 36U};
         for (;;) {
-            if (record->closed) throw ServiceError{ebadf}; if (context.requested_exit()) throw ServiceError{89};
+            if (record->closed) throw ServiceError{ebadf}; if (process_exiting(context)) throw ServiceError{89};
             if (network_ready(record, 4) & (4 | 8 | 16)) {
                 std::lock_guard lock(socket->gate); if (record->closed) throw ServiceError{ebadf};
                 const auto ended = net::pending_error(socket->handle);
@@ -839,7 +839,7 @@ void DarwinServices::Impl::install_network_services() {
     install("_accept", [this](auto& s, auto& m) {
         const auto record = network_file(static_cast<int>(s.x[0])); validate_network_output(m, s.x[1], s.x[2]);
         for (;;) {
-            if (record->closed) throw ServiceError{ebadf}; if (context.requested_exit()) throw ServiceError{89};
+            if (record->closed) throw ServiceError{ebadf}; if (process_exiting(context)) throw ServiceError{89};
             auto accepted = std::make_shared<NetworkSocket>(); net::Address peer;
             accepted->session = network_session; accepted->domain = record->socket->domain; accepted->type = 1;
             accepted->unix_local = record->socket->unix_local;   // AF_UNIX: the listener's path; the peer is unnamed
@@ -1030,7 +1030,7 @@ void DarwinServices::Impl::install_network_services() {
         }
         if (produced || !capacity) return produced;
         for (;;) {
-            if (queue_record->closed) throw ServiceError{ebadf}; if (context.requested_exit()) throw ServiceError{89};
+            if (queue_record->closed) throw ServiceError{ebadf}; if (process_exiting(context)) throw ServiceError{89};
             const auto epoch = mach ? mach->epoch() : 0;
             std::vector<NetworkQueue::Watch> watches;
             { std::lock_guard lock(queue->gate); for (const auto& [key, watch] : queue->watches) { static_cast<void>(key); if (watch.enabled) watches.push_back(watch); } }

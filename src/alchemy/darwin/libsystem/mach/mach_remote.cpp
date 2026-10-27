@@ -300,7 +300,12 @@ void MachIpc::transmit(std::shared_ptr<Message> message, const std::shared_ptr<P
             frame.blob(descriptor.data);
         }
     }
-    static_cast<void>(transport_->post(host, frame_message, std::move(frame.bytes)));
+    if (!transport_->post(host, frame_message, std::move(frame.bytes))) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::cerr << "alchemy: Mach IPC (pid " << self_ << "): a message to a port of pid " << host << " was lost (no connection to it)"
+                      << std::endl;
+    }
     // The destination right is used up (after the frame, so a release never
     // overtakes the message).
     {
@@ -527,6 +532,9 @@ Transport::Payload MachIpc::request(std::uint32_t from, std::uint32_t type, Read
         specials_changed_.wait_for(lock, std::chrono::seconds(5), [&] {
             return specials_.contains(from) || std::chrono::steady_clock::now() - last_spawn_ > std::chrono::seconds(10);
         });
+        if (!specials_.contains(from))
+            std::cerr << "alchemy: Mach bootstrap (pid " << self_ << "): pid " << from
+                      << " asked for its special ports before its spawn registered them: it gets none" << std::endl;
         auto entries = std::move(specials_[from]);
         specials_.erase(from);
         answer.u32(static_cast<std::uint32_t>(entries.size()));
@@ -732,7 +740,11 @@ std::vector<std::pair<std::uint32_t, Right>> MachIpc::inherited_special_ports(st
     std::vector<std::pair<std::uint32_t, Right>> result;
     if (!transport_ || !parent || parent == self_) return result;
     const auto answer = transport_->call(parent, request_specials, {}, rpc_timeout);
-    if (!answer) return result;
+    if (!answer) {
+        std::cerr << "alchemy: Mach bootstrap (pid " << self_ << "): the parent (pid " << parent
+                  << ") did not answer for the special ports: this process has none" << std::endl;
+        return result;
+    }
     Reader reader{*answer};
     const auto count = reader.u32();
     Lock lock(mutex_);

@@ -622,6 +622,31 @@ The user approved downloading dav1d's source for this.
     destroyed the player after the consent reload. That is YouTube's flow on a slow, loaded machine, not decoding.
     Not chased further; native Chrome could not be compared under the same load.
 
+### Follow-up 5 (2026-10-26/27): stalls on slow starts, and a shutdown crash
+
+**Fixed: Chrome processes died with `SIGTRAP` while exiting.** When a process exits, Alchemy woke workers
+blocked in `kevent` (and `poll`, `usleep`, socket connect, pipe reads, `flock`, DNS) with `ECANCELED`, and those
+in semaphores and `waitpid` with `EINTR`. Darwin never returns those: `exit` ends the other threads. Chrome's
+message pump CHECKs `kevent64`'s result (`message_pump_kqueue.cc:441 Check failed: kevent64: Operation canceled
+(89)`). Every 4-core warm `webgl.html` run showed 1 to 7 such FATALs, mostly in child processes. One in five ended
+the browser with status 133 after `Browser.close`. Now a worker blocked at exit stops quietly
+(`process_exiting()`, `darwin_threads.hpp`), as pthread and Mach waits already did. The same runs then show none.
+Test: `fx_threads exit-wakes`. Chrome's own "Teardown watchdog expired" (exit 2 about 13 s after `Browser.close`)
+is a separate thing: a slow browser teardown, before the process exits. The fix only removes the `SIGTRAP` that
+sometimes followed it.
+
+**Open: on a slow start, Chrome's startup navigation can be lost.** This was the AV1 gate's hang. It reproduces
+with a cold fx cache, on a loaded machine, or with Chrome restricted to 2 to 4 cores. The page target keeps the
+file URL, while the document stays `about:blank | complete`. A `Page.navigate` to a `data:` URL, or to the same
+URL, commits within seconds, so the browser, renderer and loaders all work. Chrome's startup trace has no
+`NavigationRequest` for the URL at all. These are consequences, not causes: the mid-run "Selected adapter …
+Metal" line (Chrome's on-device model service starting about 3 minutes in) and "Network service crashed". Ruled
+out: the Mach transport (every connection that ends is a peer exiting), bootstrap and RPC timeouts, lost
+wakeups in pthread and ulock waits, a 20 s start delay on child processes, and the browser losing track of
+its children. `run_windowed` now probes a page that never got its title (process list, URL and state, and
+whether new navigations commit). Hang dumps carry host stacks, per-thread CPU and stale Mach queues;
+`ALCHEMY_TRACE_PROCESS` logs exits, peer ends and port deaths.
+
 ### Open, worst first
 
 1. **fx code arena exhaustion** (gap 1). It needs fx runtime design work, for which a follow-up is proposed:

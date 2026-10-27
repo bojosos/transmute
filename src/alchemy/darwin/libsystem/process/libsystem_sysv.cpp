@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
+#include "alchemy/darwin_threads.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/host/sections.hpp"
 #include "alchemy/host/sync.hpp"
@@ -238,7 +239,7 @@ void install_libsystem_sysv(Provider& p) {
                     counted = true;
                 }
             }
-            if (process.requested_exit()) throw Errno{eintr};
+            if (process_exiting(process)) throw Errno{eintr};
             std::this_thread::sleep_for(delay);
             delay = std::min(delay * 2, std::chrono::milliseconds(10));
         }

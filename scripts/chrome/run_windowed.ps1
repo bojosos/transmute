@@ -138,9 +138,11 @@ $pending = New-Object Collections.Generic.List[byte]
 $buffer = New-Object byte[] 65536
 $readTask = $null
 $nextId = 0
-function Send-Cdp([string]$Method, [hashtable]$Params = @{}) {
+function Send-Cdp([string]$Method, [hashtable]$Params = @{}, [string]$Session = '') {
     $script:nextId++
-    $json = (@{ id = $script:nextId; method = $Method; params = $Params } | ConvertTo-Json -Compress -Depth 8)
+    $message = @{ id = $script:nextId; method = $Method; params = $Params }
+    if ($Session) { $message.sessionId = $Session }
+    $json = ($message | ConvertTo-Json -Compress -Depth 8)
     Add-Content $cdpLog "-> $json"
     $bytes = $encoding.GetBytes($json + [char]0)
     $toChrome.Write($bytes, 0, $bytes.Length)
@@ -167,6 +169,45 @@ function Receive-Cdp([int]$Milliseconds) {
     }
     return , $messages
 }
+# The answer to request $Id, or $null after $Milliseconds.
+function Wait-Cdp([int]$Id, [int]$Milliseconds) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($clock.ElapsedMilliseconds -lt $Milliseconds -and -not $script:pipeEnded) {
+        foreach ($message in (Receive-Cdp 500)) { if ($message.PSObject.Properties['id'] -and $message.id -eq $Id) { return $message } }
+    }
+    return $null
+}
+# A page that never got its title: where its document is (attached for one evaluation). "no answer"
+# means the renderer (or the browser) does not answer at all.
+function Probe-Page($Info) {
+    # The processes the browser believes in, and which of them still run.
+    $processes = Wait-Cdp (Send-Cdp 'SystemInfo.getProcessInfo') 15000
+    if ($processes -and $processes.PSObject.Properties['result']) {
+        $listed = @($processes.result.processInfo | ForEach-Object {
+            $alive = if (Get-Process -Id $_.id -ErrorAction SilentlyContinue) { '' } else { ' GONE' }
+            "$($_.type) $($_.id)$alive" })
+        Step "page probe: browser's processes: $($listed -join ', ')"
+    }
+    if (-not $Info) { Step 'page probe: no page target'; return }
+    $attached = Wait-Cdp (Send-Cdp 'Target.attachToTarget' @{ targetId = $Info.targetId; flatten = $true }) 15000
+    if (-not $attached -or -not $attached.PSObject.Properties['result']) { Step "page probe: attach had no answer (target url $($Info.url))"; return }
+    $session = $attached.result.sessionId
+    $value = Wait-Cdp (Send-Cdp 'Runtime.evaluate' @{ expression = 'location.href + " | " + document.readyState + " | " + document.title'; returnByValue = $true } $session) 15000
+    if ($value -and $value.PSObject.Properties['result'] -and $value.result.PSObject.Properties['result']) { Step "page probe: $($value.result.result.value)" }
+    else { Step "page probe: Runtime.evaluate had no answer in 15 s (target url $($Info.url))"; return }
+    # Do navigations still commit? A data: URL (no loader) and the page's own URL again, 30 s each.
+    foreach ($url in @('data:text/html,<title>probe</title>', $Info.url)) {
+        $null = Wait-Cdp (Send-Cdp 'Page.navigate' @{ url = $url } $session) 15000
+        $clock = [Diagnostics.Stopwatch]::StartNew(); $where = ''
+        while ($clock.Elapsed.TotalSeconds -lt 30) {
+            $now = Wait-Cdp (Send-Cdp 'Runtime.evaluate' @{ expression = 'location.href'; returnByValue = $true } $session) 5000
+            if ($now -and $now.PSObject.Properties['result'] -and $now.result.PSObject.Properties['result']) { $where = $now.result.result.value }
+            if ($where -eq $url) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        Step ("page probe: navigate {0} -> {1} after {2:N1} s" -f $(if ($url.Length -gt 40) { '...' + $url.Substring($url.Length - 30) } else { $url }), $where, $clock.Elapsed.TotalSeconds)
+    }
+}
 $pipeEnded = $false
 
 function Get-CaptureFrames {
@@ -189,11 +230,11 @@ try {
     Step 'DevTools pipes connected (fd 3 and 4)'
     $null = Send-Cdp 'Target.setDiscoverTargets' @{ discover = $true }
     $poll = [Diagnostics.Stopwatch]::StartNew()
-    $found = $null
+    $found = $null; $lastPage = $null
     while (-not $found) {
         if ($clock.Elapsed.TotalSeconds -gt $Timeout) {
             Set-Content $hangTrigger (Get-Date -Format o)   # ALCHEMY_HANG_DUMP: where each process waits
-            Start-Sleep -Seconds 3
+            Probe-Page $lastPage
             throw "no page target titled '$Title' within $Timeout s"
         }
         if ($process.HasExited) { throw "Chrome exited ($($process.ExitCode)) before a page target was titled '$Title'" }
@@ -204,6 +245,7 @@ try {
             if ($message.PSObject.Properties['params'] -and $message.params -and $message.params.PSObject.Properties['targetInfo']) { $infos += $message.params.targetInfo }
             if ($message.PSObject.Properties['result'] -and $message.result -and $message.result.PSObject.Properties['targetInfos']) { $infos += $message.result.targetInfos }
             foreach ($info in $infos) {
+                if ($info.type -eq 'page' -and $info.url -notlike 'chrome*' -and $info.url -notlike 'devtools*') { $lastPage = $info }
                 if ($info.type -eq 'page' -and $info.title -like $Title -and -not ($TitleNot -and $info.title -like $TitleNot)) { $found = $info }
             }
         }
