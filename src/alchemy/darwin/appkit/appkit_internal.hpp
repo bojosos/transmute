@@ -266,6 +266,9 @@ struct ViewState final : ResponderState {
     // the scale is kept across frame size changes, as in AppKit.
     Point bounds_origin;
     Size bounds_scale{1, 1};
+    // Rotations in degrees, counterclockwise: the frame about its origin (in
+    // the superview's coordinates), the bounds about the bounds origin.
+    double frame_rotation{}, bounds_rotation{};
     std::vector<CursorRect> cursor_rects;
     Address window{}, superview{};
     Address next_key_view{}, previous_key_view{};   // weak (the key view loop)
@@ -333,6 +336,13 @@ struct ControllerState final : ResponderState {
     Address owner{}, document{}, parent{};    // not retained
     std::vector<Address> children;            // +1 child view controllers
     std::vector<Address> top_level;           // +1 top-level objects of the loaded nib
+    // NSViewController presentation: the controllers this one presented
+    // (+1), the one that presented it, and how it is shown (its sheet or
+    // modal window, popover or animator, +1; the modal session).
+    std::vector<Address> presented;
+    Address presenting{}, source_item_view{};   // not retained
+    enum class Presentation { none, sheet, modal_window, popover, animator } presentation{Presentation::none};
+    Address presentation_object{}, modal_session{};
     Size preferred_content_size;
     bool should_cascade{true}, loading{}, should_close_document{};
 };

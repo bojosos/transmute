@@ -90,6 +90,10 @@ struct TableState final : ControlState {
     std::map<std::string, Address> registered_nibs;      // +1 NSNib by identifier (registerNib:forIdentifier:)
     // Row views (view-based tables): one per row, the row's cell views inside (+1).
     std::map<std::int64_t, Address> row_views;
+    // In-place editing (-editColumn:row:withEvent:select:): the edited cell and,
+    // in a view-based table, the cell view's text field doing the editing.
+    std::int64_t edited_row{-1}, edited_column{-1};
+    Address edited_field{};                               // not retained (a subview of a cell view)
     // Drag and drop targets (-setDropRow:dropOperation:, -setDropItem:dropChildIndex:).
     std::int64_t drop_row{-1}, drop_operation{}, drop_child{-1};
     Address drop_item{};
@@ -1965,7 +1969,125 @@ void AppKit::install_tables(Address header_cell_class) {
         static_cast<void>(send(s.x[0], "scrollRectToVisible:", visible));
     }, "v@:q");
     method(tv, "scrollColumnToVisible:", [](CpuState&, GuestMemory&) {}, "v@:q");
-    method(tv, "editColumn:row:withEvent:select:", [](CpuState&, GuestMemory&) { unsupported("-[NSTableView editColumn:row:withEvent:select:] (in-place cell editing)"); }, "v@:qq@B");
+    // In-place editing. A view-based table edits with the cell view's text
+    // field; a cell-based one puts the window's field editor over the cell,
+    // with the table as the editor's client: the edited text goes to the data
+    // source (-tableView:setObjectValue:forTableColumn:row:, the outline
+    // view's ...byItem:) when editing ends, unless it was cancelled (Escape).
+    method(tv, "editColumn:row:withEvent:select:", [this, table_of](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto state = table_of(self);
+        const auto column = static_cast<std::int64_t>(s.x[2]), row = static_cast<std::int64_t>(s.x[3]);
+        if (row < 0 || row >= state->rows || column < 0 || column >= static_cast<std::int64_t>(state->columns.size()))
+            fail("-[NSTableView editColumn:row:withEvent:select:] cell (" + std::to_string(column) + ", " + std::to_string(row) +
+                 ") outside the table (NSInternalInconsistencyException)");
+        const bool select = bool_arg(s, 5);
+        const auto owner = view_state(self)->window;
+        if (!owner) return;
+        if (extension<ControlState>(self)->editor) end_field_editing(self, false);
+        static_cast<void>(send_id(self, "scrollRowToVisible:", {static_cast<Address>(row)}));
+        if (send_bool(self, "_alchemyViewBased")) {
+            const auto cell_view = send_id(self, "viewAtColumn:row:makeIfNecessary:", {static_cast<Address>(column), static_cast<Address>(row), 1});
+            Address field = cell_view && is_kind(cell_view, text_field) ? cell_view : 0;
+            if (!field && cell_view && responds(cell_view, "textField")) field = send_id(cell_view, "textField");
+            if (!field && cell_view)
+                for (const auto child : all_views(cell_view))
+                    if (is_kind(child, text_field) && send_bool(child, "isEditable")) { field = child; break; }
+            if (!field) return;   // nothing in the cell view edits text
+            state->edited_row = row;
+            state->edited_column = column;
+            state->edited_field = field;
+            static_cast<void>(send_id(owner, "makeFirstResponder:", {field}));
+            if (select) static_cast<void>(send_id(field, "selectText:", {self}));
+            return;
+        }
+        const auto table_column = state->columns[static_cast<std::size_t>(column)];
+        const auto data_cell = send_id(table_column, "dataCellForRow:", {static_cast<Address>(row)});
+        if (!data_cell) return;
+        static_cast<void>(send_id(data_cell, "setObjectValue:", {send_id(self, "_alchemyObjectValue:row:", {table_column, static_cast<Address>(row)})}));
+        const auto editor = field_editor_for(owner);
+        const auto editing = text_state(*this, editor);
+        if (editing->client && editing->client != self) end_field_editing(editing->client, false);
+        const auto cell_info = cell_state(*this, data_cell);
+        editing->value = string16(send(data_cell, "stringValue").x0);
+        editing->selection = select ? 0 : editing->value.size();
+        editing->selection_length = select ? editing->value.size() : 0;
+        editing->anchor = editing->selection;
+        editing->marked.reset();
+        editing->client = self;
+        editing->delegate = self;
+        editing->editable = editing->selectable = true;
+        editing->secure = false;
+        editing->alignment = cell_info->alignment;
+        editing->scroll_x = 0;
+        editing->draws_background = true;
+        assign(editing->font, cell_info->font);
+        assign(editing->text_color, cell_info->text_color);
+        CallRegs cell;
+        cell.x[2] = static_cast<Address>(column);
+        cell.x[3] = static_cast<Address>(row);
+        CallRegs frame;
+        put_rect(frame, 0, result_rect(send(self, "frameOfCellAtColumn:row:", cell)));
+        static_cast<void>(send(editor, "setFrame:", frame));
+        extension<ControlState>(self)->editor = editor;
+        state->edited_row = row;
+        state->edited_column = column;
+        state->edited_field = 0;
+        static_cast<void>(send_id(self, "addSubview:", {editor}));
+        window_state(owner)->first_responder = editor;
+        invalidate_view(self);
+        static_cast<void>(send_id(self, "textDidBeginEditing:", {notification("NSTextDidBeginEditingNotification", editor)}));
+    }, "v@:qq@B");
+    // The cell being edited (-1 when none): a cell-based table's while its field editor is up, a view-based
+    // one's while the cell view's text field is editing.
+    const auto editing_now = [this, table_of](Address table) {
+        const auto state = table_of(table);
+        const auto field = state->edited_field;
+        const bool live = field ? extension<ControlState>(field)->editor != 0 : extension<ControlState>(table)->editor != 0;
+        if (!live) state->edited_row = state->edited_column = -1;
+        return state;
+    };
+    method(tv, "editedColumn", [editing_now](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(editing_now(s.x[0])->edited_column); }, "q@:");
+    method(tv, "editedRow", [editing_now](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(editing_now(s.x[0])->edited_row); }, "q@:");
+    // The table answers its field editor as an NSControl does, telling its delegate.
+    method(tv, "textShouldBeginEditing:", [this, table_of](CpuState& s, GuestMemory&) {
+        const auto delegate = table_of(s.x[0])->table_delegate;
+        return_bool(s, !delegate || !responds(delegate, "control:textShouldBeginEditing:") ||
+                           send_bool(delegate, "control:textShouldBeginEditing:", {s.x[0], s.x[2]}));
+    }, "B@:@");
+    method(tv, "textShouldEndEditing:", [this, table_of](CpuState& s, GuestMemory&) {
+        const auto delegate = table_of(s.x[0])->table_delegate;
+        return_bool(s, !delegate || !responds(delegate, "control:textShouldEndEditing:") ||
+                           send_bool(delegate, "control:textShouldEndEditing:", {s.x[0], s.x[2]}));
+    }, "B@:@");
+    method(tv, "textDidBeginEditing:", [this, table_of](CpuState& s, GuestMemory&) {
+        post("NSControlTextDidBeginEditingNotification", s.x[0], table_of(s.x[0])->table_delegate, "controlTextDidBeginEditing:");
+    }, "v@:@");
+    method(tv, "textDidChange:", [this, table_of](CpuState& s, GuestMemory&) {
+        post("NSControlTextDidChangeNotification", s.x[0], table_of(s.x[0])->table_delegate, "controlTextDidChange:");
+    }, "v@:@");
+    // Editing ended (Return, Tab, a click elsewhere, Escape): the text goes to the data source unless cancelled.
+    method(tv, "textDidEndEditing:", [this, table_of](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto state = table_of(self);
+        const auto editor = s.x[2] ? send_id(s.x[2], "object") : 0;
+        const bool cancelled = editor && is_kind(editor, text_view) && text_state(*this, editor)->aborting;
+        const auto row = std::exchange(state->edited_row, -1), column = std::exchange(state->edited_column, -1);
+        state->edited_field = 0;
+        if (!cancelled && editor && row >= 0 && column >= 0 && column < static_cast<std::int64_t>(state->columns.size()) && state->data_source) {
+            const auto value = send_id(editor, "string");
+            const auto table_column = state->columns[static_cast<std::size_t>(column)];
+            if (is_kind(self, outline_view)) {
+                if (responds(state->data_source, "outlineView:setObjectValue:forTableColumn:byItem:"))
+                    static_cast<void>(send_id(state->data_source, "outlineView:setObjectValue:forTableColumn:byItem:",
+                                              {self, value, table_column, send_id(self, "itemAtRow:", {static_cast<Address>(row)})}));
+            } else if (responds(state->data_source, "tableView:setObjectValue:forTableColumn:row:")) {
+                static_cast<void>(send_id(state->data_source, "tableView:setObjectValue:forTableColumn:row:", {self, value, table_column, static_cast<Address>(row)}));
+            }
+        }
+        invalidate_view(self);
+        post("NSControlTextDidEndEditingNotification", self, state->table_delegate, "controlTextDidEndEditing:");
+    }, "v@:@");
     // Clicks select rows (Command toggles, Shift extends) and send the action;
     // a double click sends the double action.
     method(tv, "mouseDown:", [this, table_of, selection_changed](CpuState& s, GuestMemory&) {
@@ -2005,8 +2127,23 @@ void AppKit::install_tables(Address header_cell_class) {
         }
         if (state->selection != before) selection_changed(self);
         const auto clicks = event_state(s.x[2])->event.click_count;
-        if (clicks >= 2 && state->double_action) static_cast<void>(send_action(state->double_action, state->target, self));
-        else if (state->action) static_cast<void>(send_action(state->action, state->target, self));
+        if (clicks >= 2 && state->double_action) { static_cast<void>(send_action(state->double_action, state->target, self)); return; }
+        // Without a double action, a double click edits an editable cell of a cell-based table.
+        if (clicks >= 2 && row >= 0 && column >= 0 && column < static_cast<std::int64_t>(state->columns.size()) && !send_bool(self, "_alchemyViewBased")) {
+            const auto table_column = state->columns[static_cast<std::size_t>(column)];
+            bool editable = send_bool(table_column, "isEditable");
+            if (editable && state->table_delegate) {
+                const bool outline = is_kind(self, outline_view);
+                const char* ask = outline ? "outlineView:shouldEditTableColumn:item:" : "tableView:shouldEditTableColumn:row:";
+                if (responds(state->table_delegate, ask))
+                    editable = send_bool(state->table_delegate, ask, {self, table_column, outline ? send_id(self, "itemAtRow:", {static_cast<Address>(row)}) : static_cast<Address>(row)});
+            }
+            if (editable) {
+                static_cast<void>(send_id(self, "editColumn:row:withEvent:select:", {static_cast<Address>(column), static_cast<Address>(row), s.x[2], 1}));
+                return;
+            }
+        }
+        if (state->action) static_cast<void>(send_action(state->action, state->target, self));
     }, "v@:@");
     method(tv, "keyDown:", [this](CpuState& s, GuestMemory&) {
         static_cast<void>(send_id(s.x[0], "interpretKeyEvents:", {auto_array({s.x[2]})}));
@@ -2565,8 +2702,6 @@ void install_container_additions(AppKit& kit) {
     const auto tv = kit.table_view;
     // No in-place cell editing is provided (-editColumn:row:withEvent:select:
     // fails), so no cell is ever being edited.
-    kit.method(tv, "editedColumn", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(-1); }, "q@:");
-    kit.method(tv, "editedRow", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(-1); }, "q@:");
     kit.method(tv, "enumerateAvailableRowViewsUsingBlock:", [k, table_of](CpuState& s, GuestMemory&) {
         if (!s.x[2]) return;
         for (const auto& [row, row_view] : std::map<std::int64_t, Address>(table_of(s.x[0])->row_views))

@@ -129,6 +129,19 @@ layout and the link / list / table panels stop explicitly. NSTextField
 and NSTextInputContext keep their newer settings; the one keyboard input
 source is the host's layout.
 
+**Presentation, table editing, rotation:** NSViewController presents as a
+sheet (a window attached to the presenter's), a modal window (a modal
+session: input goes to it alone, the call does not block), a popover
+(NSPopover) or through an animator object, and dismisses the same way;
+child transitions swap views at once. NSTableView edits a cell in place:
+the cell view's text field in a view-based table, the window's field editor
+over the cell in a cell-based one (a double click edits an editable column
+without a double action); the text reaches the data source unless Escape
+cancelled it. Views rotate (-setFrameRotation:, -setFrameCenterRotation:,
+-setBoundsRotation:, -rotateByAngle:): drawing, coordinate conversion and hit
+testing follow, rotated bounds report their bounding rectangle, and clipping
+is to that rectangle; rotating a layer-backed view stops explicitly.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

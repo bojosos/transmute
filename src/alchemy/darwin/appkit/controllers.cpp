@@ -32,6 +32,8 @@ void AppKit::install_controllers() {
             release(std::exchange(*slot, 0));
         for (const auto child : std::exchange(state.children, {})) release(child);
         for (const auto object : std::exchange(state.top_level, {})) release(object);
+        for (const auto controller : std::exchange(state.presented, {})) release(controller);
+        release(std::exchange(state.presentation_object, 0));
     };
     // Loads nib `name` from `bundle` with `owner` as File's Owner, keeping
     // its top-level objects in the controller.
@@ -265,16 +267,180 @@ void AppKit::install_controllers() {
         if (s.x[2] >= list.size()) fail("-[NSViewController removeChildViewControllerAtIndex:] out of range");
         static_cast<void>(send(list[s.x[2]], "removeFromParentViewController"));
     }, "v@:q");
-    method(vc, "dismissController:", [this](CpuState& s, GuestMemory&) {
+    // A presented controller is dismissed by its presenter; any other closes its view's window.
+    method(vc, "dismissController:", [this, cs](CpuState& s, GuestMemory&) {
+        if (const auto presenter = cs(s.x[0])->presenting) {
+            static_cast<void>(send_id(presenter, "dismissViewController:", {s.x[0]}));
+            return;
+        }
         const auto target = send(s.x[0], "view").x0;
         const auto owner = target ? view_state(target)->window : 0;
         if (owner) static_cast<void>(send(owner, "close"));
     }, "v@:@");
-    for (const auto* name : {"presentViewControllerAsSheet:", "presentViewControllerAsModalWindow:",
-             "presentViewController:asPopoverRelativeToRect:ofView:preferredEdge:behavior:"})
-        method(vc, name, [selector = std::string(name)](CpuState&, GuestMemory&) {
-            unsupported("-[NSViewController " + selector + "] (view controller presentation)");
-        });
+
+    // ---- presentation ----
+    // Sheets and modal windows show the controller's view as a window's
+    // content (its preferred content size, else the view's size); a modal
+    // window runs a modal session (input goes to it alone) without blocking
+    // the caller; popovers are NSPopovers; an animator object presents and
+    // dismisses through its own -animatePresentationOfViewController:... calls.
+    const auto window_for = [this, cs](Address presented, std::uint64_t style) {
+        const auto content = send(presented, "view").x0;
+        if (!content) fail("presenting a view controller without a view");
+        auto size = cs(presented)->preferred_content_size;
+        if (!(size.width > 0 && size.height > 0)) size = view_state(content)->frame.size;
+        CallRegs init;
+        put_rect(init, 0, {{0, 0}, size});
+        init.x[2] = style;
+        init.x[3] = 2;   // NSBackingStoreBuffered
+        init.x[4] = 0;
+        const auto made = send(send(window, "alloc").x0, "initWithContentRect:styleMask:backing:defer:", init).x0;
+        static_cast<void>(send_id(made, "setReleasedWhenClosed:", {0}));
+        if (responds(made, "setContentViewController:")) static_cast<void>(send_id(made, "setContentViewController:", {presented}));
+        else static_cast<void>(send_id(made, "setContentView:", {content}));
+        if (const auto title = send_id(presented, "title")) static_cast<void>(send_id(made, "setTitle:", {title}));
+        return made;   // +1
+    };
+    const auto record = [this, cs](Address presenter, Address presented, ControllerState::Presentation how, Address object, Address session) {
+        if (const auto previous = cs(presented)->presenting; previous && previous != presenter)
+            fail("-[NSViewController present...] a view controller that is already presented");
+        cs(presenter)->presented.push_back(retain(presented));
+        const auto state = cs(presented);
+        state->presenting = presenter;
+        state->presentation = how;
+        release(std::exchange(state->presentation_object, object));
+        state->modal_session = session;
+    };
+    method(vc, "presentViewControllerAsSheet:", [this, window_for, record](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], presented = s.x[2];
+        const auto parent_view = send(self, "view").x0;
+        const auto parent = parent_view ? view_state(parent_view)->window : 0;
+        if (!parent) fail("-[NSViewController presentViewControllerAsSheet:] from a view controller whose view is in no window");
+        const auto sheet = window_for(presented, 1);   // titled
+        record(self, presented, ControllerState::Presentation::sheet, sheet, 0);
+        static_cast<void>(send_id(parent, "beginSheet:completionHandler:", {sheet, 0}));
+    }, "v@:@");
+    method(vc, "presentViewControllerAsModalWindow:", [this, window_for, record](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], presented = s.x[2];
+        const auto modal = window_for(presented, 1 | 2);   // titled, closable
+        const auto session = send_id(send_id(application, "sharedApplication"), "beginModalSessionForWindow:", {modal});
+        record(self, presented, ControllerState::Presentation::modal_window, modal, session);
+    }, "v@:@");
+    // (viewController, positioningRect d0-d3, ofView, preferredEdge, behavior)
+    method(vc, "presentViewController:asPopoverRelativeToRect:ofView:preferredEdge:behavior:", [this, record](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], presented = s.x[2];
+        const auto popover_class = objc.find_class("NSPopover");
+        if (!popover_class) unsupported("-[NSViewController presentViewController:asPopoverRelativeToRect:...] (no NSPopover)");
+        const auto popover = alloc_init(popover_class);
+        static_cast<void>(send_id(popover, "setContentViewController:", {presented}));
+        static_cast<void>(send_id(popover, "setBehavior:", {s.x[5]}));
+        record(self, presented, ControllerState::Presentation::popover, popover, 0);
+        CallRegs show;
+        put_rect(show, 0, rect_arg(s));
+        show.x[2] = s.x[3];
+        show.x[3] = s.x[4];
+        static_cast<void>(send(popover, "showRelativeToRect:ofView:preferredEdge:", show));
+    }, "v@:@{CGRect={CGPoint=dd}{CGSize=dd}}@QQ");
+    method(vc, "presentViewController:animator:", [this, record](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], presented = s.x[2], animator = s.x[3];
+        if (!animator) fail("-[NSViewController presentViewController:animator:] without an animator");
+        record(self, presented, ControllerState::Presentation::animator, retain(animator), 0);
+        static_cast<void>(send_id(animator, "animatePresentationOfViewController:fromViewController:", {presented, self}));
+    }, "v@:@@");
+    method(vc, "dismissViewController:", [this, cs](CpuState& s, GuestMemory&) {
+        auto presenter = s.x[0];
+        const auto presented = s.x[2];
+        if (!presented) return;
+        if (cs(presented)->presenting) presenter = cs(presented)->presenting;
+        auto& list = cs(presenter)->presented;
+        const auto found = std::find(list.begin(), list.end(), presented);
+        if (found == list.end()) return;   // not presented (or dismissed already)
+        list.erase(found);
+        const auto state = cs(presented);
+        const auto object = std::exchange(state->presentation_object, 0);
+        const auto how = std::exchange(state->presentation, ControllerState::Presentation::none);
+        const auto session = std::exchange(state->modal_session, 0);
+        state->presenting = 0;
+        switch (how) {
+        case ControllerState::Presentation::sheet:
+            if (const auto parent = send_id(object, "sheetParent")) static_cast<void>(send_id(parent, "endSheet:", {object}));
+            static_cast<void>(send_id(object, "orderOut:", {0}));
+            break;
+        case ControllerState::Presentation::modal_window:
+            if (session) static_cast<void>(send_id(send_id(application, "sharedApplication"), "endModalSession:", {session}));
+            static_cast<void>(send_id(object, "orderOut:", {0}));
+            break;
+        case ControllerState::Presentation::popover:
+            static_cast<void>(send_id(object, "close"));
+            break;
+        case ControllerState::Presentation::animator:
+            static_cast<void>(send_id(object, "animateDismissalOfViewController:fromViewController:", {presented, presenter}));
+            break;
+        case ControllerState::Presentation::none: break;
+        }
+        release(object);
+        release(presented);
+    }, "v@:@");
+    method(vc, "presentedViewControllers", [this, cs](CpuState& s, GuestMemory&) {
+        const auto& list = cs(s.x[0])->presented;
+        s.x[0] = list.empty() ? 0 : auto_array(list);
+    });
+    method(vc, "presentingViewController", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->presenting; });
+    // A presented controller's new preferred content size resizes its sheet, window or popover.
+    method(vc, "preferredContentSizeDidChangeForViewController:", [this, cs](CpuState& s, GuestMemory&) {
+        const auto presented = s.x[2];
+        if (!presented || cs(presented)->presenting != s.x[0]) return;
+        const auto state = cs(presented);
+        const auto size = state->preferred_content_size;
+        if (!(size.width > 0 && size.height > 0) || !state->presentation_object) return;
+        CallRegs r;
+        put_size(r, 0, size);
+        // The popover's and the windows' -setContentSize: alike; an animator's presentation is the animator's business.
+        if (state->presentation != ControllerState::Presentation::animator) static_cast<void>(send(state->presentation_object, "setContentSize:", r));
+    }, "v@:@");
+
+    // ---- the rest of NSViewController ----
+    method(vc, "loadViewIfNeeded", [this, cs](CpuState& s, GuestMemory&) {
+        if (!cs(s.x[0])->view) static_cast<void>(send(s.x[0], "view"));
+    }, "v@:");
+    // NSEditor: no bindings editors are registered with a controller, so there is nothing to commit or discard.
+    method(vc, "commitEditing", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
+    method(vc, "discardEditing", [](CpuState&, GuestMemory&) {}, "v@:");
+    // The view's smallest size under its constraints (-fittingSize); no maximum beyond the screen's.
+    method(vc, "preferredMinimumSize", [this, cs](CpuState& s, GuestMemory&) {
+        const auto view = cs(s.x[0])->view;
+        return_size(s, view ? result_size(send(view, "fittingSize")) : Size{});
+    }, "{CGSize=dd}@:");
+    method(vc, "preferredMaximumSize", [](CpuState& s, GuestMemory&) { return_size(s, {1e7, 1e7}); }, "{CGSize=dd}@:");
+    method(vc, "setChildViewControllers:", [this, cs](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto wanted = s.x[2] ? items(s.x[2]) : std::vector<Address>{};
+        for (const auto child : wanted) static_cast<void>(retain(child));
+        for (const auto child : std::vector<Address>(cs(self)->children)) static_cast<void>(send(child, "removeFromParentViewController"));
+        for (const auto child : wanted) {
+            static_cast<void>(send_id(self, "addChildViewController:", {child}));
+            release(child);
+        }
+    }, "v@:@");
+    method(vc, "sourceItemView", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->source_item_view; });
+    method(vc, "setSourceItemView:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->source_item_view = s.x[2]; }, "v@:@");
+    // Controllers are not loaded from storyboards here (NSStoryboard is not provided).
+    method(vc, "storyboard", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    // Swaps one child's view for another's in place (the transition options' animations are not run: the change applies at once).
+    method(vc, "transitionFromViewController:toViewController:options:completionHandler:", [this, cs](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], from = s.x[2], to = s.x[3], completion = s.x[5];
+        const auto& children = cs(self)->children;
+        if (std::find(children.begin(), children.end(), from) == children.end() || std::find(children.begin(), children.end(), to) == children.end())
+            fail("-[NSViewController transitionFromViewController:toViewController:...] between controllers that are not both its children");
+        const auto old_view = send(from, "view").x0, new_view = send(to, "view").x0;
+        if (const auto parent = old_view ? view_state(old_view)->superview : 0) {
+            CallRegs frame;
+            put_rect(frame, 0, view_state(old_view)->frame);
+            static_cast<void>(send(new_view, "setFrame:", frame));
+            static_cast<void>(send_id(parent, "replaceSubview:with:", {old_view, new_view}));
+        }
+        if (completion) static_cast<void>(invoke_block(completion, {}));
+    }, "v@:@@Q@?");
 }
 
 

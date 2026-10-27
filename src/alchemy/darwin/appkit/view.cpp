@@ -178,18 +178,36 @@ void AppKit::update_layer_hosts(Address root) {
 }
 
 // Bounds: a view's own coordinates are its frame space translated by the
-// bounds origin and scaled by frame.size / bounds.size.
+// bounds origin, scaled by frame.size / bounds.size and rotated by the bounds
+// rotation (about the bounds origin).
+namespace {
+Point rotated(Point p, double degrees) {
+    if (degrees == 0) return p;
+    const double radians = degrees * 3.14159265358979323846 / 180, c = std::cos(radians), s = std::sin(radians);
+    return {p.x * c - p.y * s, p.x * s + p.y * c};
+}
+} // namespace
 Point AppKit::bounds_to_frame(const ViewState& state, Point point) {
-    return {(point.x - state.bounds_origin.x) * state.bounds_scale.width,
-            (point.y - state.bounds_origin.y) * state.bounds_scale.height};
+    return rotated({(point.x - state.bounds_origin.x) * state.bounds_scale.width,
+                    (point.y - state.bounds_origin.y) * state.bounds_scale.height}, state.bounds_rotation);
 }
 Point AppKit::frame_to_bounds(const ViewState& state, Point point) {
+    point = rotated(point, -state.bounds_rotation);
     return {point.x / state.bounds_scale.width + state.bounds_origin.x,
             point.y / state.bounds_scale.height + state.bounds_origin.y};
 }
+// A rotated bounds coordinate system's bounds rectangle encloses the frame.
 Rect AppKit::view_bounds(const ViewState& state) {
-    return {state.bounds_origin,
-            {state.frame.size.width / state.bounds_scale.width, state.frame.size.height / state.bounds_scale.height}};
+    if (state.bounds_rotation == 0)
+        return {state.bounds_origin,
+                {state.frame.size.width / state.bounds_scale.width, state.frame.size.height / state.bounds_scale.height}};
+    double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+    for (const auto corner : {Point{0, 0}, Point{state.frame.size.width, 0}, Point{0, state.frame.size.height},
+                              Point{state.frame.size.width, state.frame.size.height}}) {
+        const auto p = frame_to_bounds(state, corner);
+        x0 = std::min(x0, p.x); y0 = std::min(y0, p.y); x1 = std::max(x1, p.x); y1 = std::max(y1, p.y);
+    }
+    return {{x0, y0}, {x1 - x0, y1 - y0}};
 }
 
 // View coordinates <-> window base coordinates through the superview chain.
@@ -205,6 +223,7 @@ Point AppKit::view_to_window(Address value, Point point) {
         const auto state = view_state(current);
         point = bounds_to_frame(*state, point);
         if (flipped_against_superview(current)) point.y = state->frame.size.height - point.y;
+        point = rotated(point, state->frame_rotation);   // about the frame origin, in the superview's coordinates
         point.x += state->frame.origin.x;
         point.y += state->frame.origin.y;
         current = state->superview;
@@ -218,6 +237,7 @@ Point AppKit::window_to_view(Address value, Point point) {
         const auto state = view_state(*it);
         point.x -= state->frame.origin.x;
         point.y -= state->frame.origin.y;
+        point = rotated(point, -state->frame_rotation);
         if (flipped_against_superview(*it)) point.y = state->frame.size.height - point.y;
         point = frame_to_bounds(*state, point);
     }
@@ -572,10 +592,54 @@ void AppKit::install_view() {
     }, "v@:{CGSize=dd}");
     method(v, "postsBoundsChangedNotifications", [this](CpuState& s, GuestMemory&) { return_bool(s, view_state(s.x[0])->posts_bounds_changes); }, "B@:");
     method(v, "setPostsBoundsChangedNotifications:", [this](CpuState& s, GuestMemory&) { view_state(s.x[0])->posts_bounds_changes = bool_arg(s, 2); }, "v@:B");
-    for (const auto* name : {"setBoundsRotation:", "rotateByAngle:", "setFrameRotation:"})
-        method(v, name, [name](CpuState&, GuestMemory&) { unsupported("-[NSView " + std::string(name) + "] (rotated views)"); }, "v@:d");
-    method(v, "boundsRotation", [](CpuState& s, GuestMemory&) { set_d(s, 0, 0); }, "d@:");
-    method(v, "frameRotation", [](CpuState& s, GuestMemory&) { set_d(s, 0, 0); }, "d@:");
+    // Rotation. The frame rotates about its origin (or, through
+    // -setFrameCenterRotation:, about its centre: the origin moves to keep the
+    // centre in place); the bounds about the bounds origin. Drawing, the
+    // conversions and hit testing follow; a layer-backed view's layer does not
+    // rotate with it, so rotating one stops explicitly.
+    const auto rotation_changed = [this](Address self) {
+        const auto state = view_state(self);
+        if (state->layer) unsupported("-[NSView set...Rotation:] of a layer-backed view (its layer is not rotated)");
+        state->needs_display = true;
+        if (state->superview) invalidate_view(state->superview);
+        else invalidate_view(self);
+    };
+    method(v, "frameRotation", [this](CpuState& s, GuestMemory&) { set_d(s, 0, view_state(s.x[0])->frame_rotation); }, "d@:");
+    method(v, "setFrameRotation:", [this, rotation_changed](CpuState& s, GuestMemory&) {
+        view_state(s.x[0])->frame_rotation = d(s, 0);
+        rotation_changed(s.x[0]);
+    }, "v@:d");
+    method(v, "frameCenterRotation", [this](CpuState& s, GuestMemory&) { set_d(s, 0, view_state(s.x[0])->frame_rotation); }, "d@:");
+    method(v, "setFrameCenterRotation:", [this, rotation_changed](CpuState& s, GuestMemory&) {
+        const auto state = view_state(s.x[0]);
+        const Point half{state->frame.size.width / 2, state->frame.size.height / 2};
+        const auto before = rotated(half, state->frame_rotation);
+        const Point centre{state->frame.origin.x + before.x, state->frame.origin.y + before.y};
+        state->frame_rotation = d(s, 0);
+        const auto after = rotated(half, state->frame_rotation);
+        state->frame.origin = {centre.x - after.x, centre.y - after.y};
+        rotation_changed(s.x[0]);
+    }, "v@:d");
+    method(v, "boundsRotation", [this](CpuState& s, GuestMemory&) { set_d(s, 0, view_state(s.x[0])->bounds_rotation); }, "d@:");
+    method(v, "setBoundsRotation:", [this, rotation_changed](CpuState& s, GuestMemory&) {
+        view_state(s.x[0])->bounds_rotation = d(s, 0);
+        rotation_changed(s.x[0]);
+    }, "v@:d");
+    method(v, "rotateByAngle:", [this, rotation_changed](CpuState& s, GuestMemory&) {
+        view_state(s.x[0])->bounds_rotation += d(s, 0);
+        rotation_changed(s.x[0]);
+    }, "v@:d");
+    // Whether the view or a superview is rotated (or, for the second, scaled) from the window's base coordinates.
+    const auto from_base = [this](Address self, bool scaled_too) {
+        for (auto current = self; current; current = view_state(current)->superview) {
+            const auto state = view_state(current);
+            if (state->frame_rotation != 0 || state->bounds_rotation != 0) return true;
+            if (scaled_too && (state->bounds_scale.width != 1 || state->bounds_scale.height != 1)) return true;
+        }
+        return false;
+    };
+    method(v, "isRotatedFromBase", [from_base](CpuState& s, GuestMemory&) { return_bool(s, from_base(s.x[0], false)); }, "B@:");
+    method(v, "isRotatedOrScaledFromBase", [from_base](CpuState& s, GuestMemory&) { return_bool(s, from_base(s.x[0], true)); }, "B@:");
     method(v, "isFlipped", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
     method(v, "acceptsFirstMouse:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:@");
     method(v, "isHidden", [this](CpuState& s, GuestMemory&) { return_bool(s, view_state(s.x[0])->hidden); }, "B@:");
@@ -836,8 +900,9 @@ void AppKit::install_view() {
         s.x[0] = 0;
         if (send_bool(self, "isHidden")) return;
         const auto frame = result_rect(send(self, "frame"));
-        if (!rect_contains(frame, point)) return;
-        point = {point.x - frame.origin.x, point.y - frame.origin.y};
+        // In the frame's own (unrotated) space: a rotated frame contains the points of its rotated rectangle.
+        point = rotated({point.x - frame.origin.x, point.y - frame.origin.y}, -view_state(self)->frame_rotation);
+        if (!rect_contains({{0, 0}, frame.size}, point)) return;
         if (flipped_against_superview(self)) point.y = frame.size.height - point.y;
         point = frame_to_bounds(*view_state(self), point);
         const auto children = view_state(self)->subviews;

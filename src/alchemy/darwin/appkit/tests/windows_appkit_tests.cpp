@@ -941,6 +941,131 @@ void split_views_and_controllers(Fixture& f) {
     static_cast<void>(f.id(window, "close"));
 }
 
+// View controller presentation, in-place table editing and rotated views (the frameworks wave, U12).
+void presentation_editing_rotation(Fixture& f) {
+    const auto window = f.make_window({{100, 100}, {400, 300}});
+    static_cast<void>(f.id(window, "makeKeyAndOrderFront:", {0}));
+    const auto controller_of = [&f](gui::Size size) {
+        const auto made = f.id(f.id(f.cls("NSViewController"), "alloc"), "init");
+        static_cast<void>(f.id(made, "setView:", {f.view({{0, 0}, size})}));
+        return made;
+    };
+    const auto presenter = controller_of({400, 300});
+    static_cast<void>(f.id(window, "setContentView:", {f.id(presenter, "view")}));
+    // A sheet: the presented controller's view in a window attached to the presenter's.
+    const auto sheet_controller = controller_of({200, 120});
+    static_cast<void>(f.id(presenter, "presentViewControllerAsSheet:", {sheet_controller}));
+    const auto sheet = f.id(f.id(sheet_controller, "view"), "window");
+    require(sheet && f.id(window, "attachedSheet") == sheet && f.id(sheet_controller, "presentingViewController") == presenter &&
+                f.foundation_items(f.id(presenter, "presentedViewControllers")) == std::vector<Address>{sheet_controller},
+            "a sheet presentation");
+    static_cast<void>(f.id(sheet_controller, "dismissController:", {0}));
+    require(f.id(window, "attachedSheet") == 0 && f.id(presenter, "presentedViewControllers") == 0 && f.id(sheet_controller, "presentingViewController") == 0,
+            "-dismissController: ends the sheet");
+    // A modal window: a modal session, not blocking.
+    const auto modal_controller = controller_of({160, 90});
+    static_cast<void>(f.id(presenter, "presentViewControllerAsModalWindow:", {modal_controller}));
+    const auto modal = f.id(f.id(modal_controller, "view"), "window");
+    require(modal && f.id(f.app, "modalWindow") == modal, "a modal window presentation runs a modal session");
+    static_cast<void>(f.id(presenter, "dismissViewController:", {modal_controller}));
+    require(f.id(f.app, "modalWindow") == 0 && !(f.id(modal, "isVisible") & 0xff), "dismissing ends the session");
+    // A popover.
+    const auto popover_controller = controller_of({120, 80});
+    CallRegs relative;
+    relative.x[2] = popover_controller;
+    gui::appkit::put_rect(relative, 0, {{10, 10}, {20, 20}});
+    relative.x[3] = f.id(presenter, "view");
+    relative.x[4] = 1;   // NSRectEdgeMaxY
+    relative.x[5] = 1;   // NSPopoverBehaviorTransient
+    static_cast<void>(f.send(presenter, "presentViewController:asPopoverRelativeToRect:ofView:preferredEdge:behavior:", relative));
+    require(f.id(popover_controller, "presentingViewController") == presenter && f.id(f.id(popover_controller, "view"), "window") != 0,
+            "a popover presentation shows the view");
+    static_cast<void>(f.id(presenter, "dismissViewController:", {popover_controller}));
+    require(f.id(popover_controller, "presentingViewController") == 0, "dismissing the popover");
+    // An animator does the presenting.
+    std::vector<std::string> told;
+    const auto animator_class = f.subclass("U12Animator", "NSObject");
+    f.add(animator_class, "animatePresentationOfViewController:fromViewController:", [&told](CpuState&, GuestMemory&) { told.push_back("present"); }, "v@:@@");
+    f.add(animator_class, "animateDismissalOfViewController:fromViewController:", [&told](CpuState&, GuestMemory&) { told.push_back("dismiss"); }, "v@:@@");
+    const auto animator = f.id(f.id(animator_class, "alloc"), "init");
+    const auto animated = controller_of({50, 50});
+    static_cast<void>(f.id(presenter, "presentViewController:animator:", {animated, animator}));
+    static_cast<void>(f.id(presenter, "dismissViewController:", {animated}));
+    require(told == std::vector<std::string>{"present", "dismiss"}, "an animator presents and dismisses");
+    // Child transitions swap the views in place.
+    const auto first = controller_of({100, 100}), second = controller_of({30, 30});
+    static_cast<void>(f.id(presenter, "addChildViewController:", {first}));
+    static_cast<void>(f.id(presenter, "addChildViewController:", {second}));
+    static_cast<void>(f.id(f.id(presenter, "view"), "addSubview:", {f.id(first, "view")}));
+    static_cast<void>(f.id(presenter, "transitionFromViewController:toViewController:options:completionHandler:", {first, second, 0, 0}));
+    require(f.id(f.id(second, "view"), "superview") == f.id(presenter, "view") && f.id(f.id(first, "view"), "superview") == 0 &&
+                f.frame(f.id(second, "view")).size.width == 100,
+            "a child transition swaps the views");
+
+    // In-place editing of a cell-based table: the data source gets the edited text; Escape cancels.
+    std::vector<std::string> values{"alpha", "beta"};
+    const auto source_class = f.subclass("U12TableSource", "NSObject");
+    f.add(source_class, "numberOfRowsInTableView:", [&values](CpuState& s, GuestMemory&) { s.x[0] = values.size(); }, "q@:@");
+    f.add(source_class, "tableView:objectValueForTableColumn:row:", [&f, &values](CpuState& s, GuestMemory&) { s.x[0] = f.str(values.at(s.x[4])); }, "@@:@@q");
+    f.add(source_class, "tableView:setObjectValue:forTableColumn:row:", [&f, &values](CpuState& s, GuestMemory&) { values.at(s.x[5]) = f.text(s.x[3]); }, "v@:@@@q");
+    const auto source = f.id(f.id(source_class, "alloc"), "init");
+    const auto table = f.view({{0, 0}, {300, 200}}, "NSTableView");
+    const auto column = f.id(f.id(f.cls("NSTableColumn"), "alloc"), "initWithIdentifier:", {f.str("name")});
+    static_cast<void>(f.id(table, "addTableColumn:", {column}));
+    static_cast<void>(f.id(table, "setDataSource:", {source}));
+    static_cast<void>(f.id(f.id(presenter, "view"), "addSubview:", {table}));
+    static_cast<void>(f.id(table, "reloadData"));
+    static_cast<void>(f.id(table, "editColumn:row:withEvent:select:", {0, 1, 0, 1}));
+    const auto editor = f.id(window, "firstResponder");
+    require(f.id(table, "editedRow") == 1 && f.id(table, "editedColumn") == 0 && f.text(f.id(editor, "string")) == "beta",
+            "editing a cell puts its text in the field editor");
+    static_cast<void>(f.id(editor, "insertText:", {f.str("gamma")}));
+    static_cast<void>(f.id(editor, "insertNewline:", {0}));
+    require(values[1] == "gamma" && static_cast<std::int64_t>(f.id(table, "editedRow")) == -1, "Return commits the text to the data source");
+    static_cast<void>(f.id(table, "editColumn:row:withEvent:select:", {0, 0, 0, 1}));
+    const auto again = f.id(window, "firstResponder");
+    static_cast<void>(f.id(again, "insertText:", {f.str("zzz")}));
+    static_cast<void>(f.id(again, "cancelOperation:", {0}));
+    require(values[0] == "alpha" && static_cast<std::int64_t>(f.id(table, "editedRow")) == -1, "Escape cancels the edit");
+    static_cast<void>(f.id(table, "removeFromSuperview"));
+
+    // Rotated views: conversions, hit testing, the centre rotation.
+    const auto host = f.view({{0, 0}, {400, 300}});
+    const auto turned = f.view({{100, 100}, {80, 40}});
+    static_cast<void>(f.id(host, "addSubview:", {turned}));
+    CallRegs ninety;
+    ninety.set_d(0, 90);
+    static_cast<void>(f.send(turned, "setFrameRotation:", ninety));
+    CallRegs convert;
+    convert.set_d(0, 10);
+    convert.set_d(1, 0);
+    convert.x[2] = host;
+    const auto converted = f.send(turned, "convertPoint:toView:", convert);
+    require(std::abs(converted.d(0) - 100) < 1e-6 && std::abs(converted.d(1) - 110) < 1e-6 && f.send(turned, "frameRotation").d(0) == 90 &&
+                (f.id(turned, "isRotatedFromBase") & 0xff) == 1 && (f.id(host, "isRotatedFromBase") & 0xff) == 0,
+            "a frame rotated by 90 degrees turns its x axis upward");
+    CallRegs inside;
+    inside.set_d(0, 90);
+    inside.set_d(1, 150);
+    CallRegs outside;
+    outside.set_d(0, 150);
+    outside.set_d(1, 110);
+    require(f.send(host, "hitTest:", inside).x0 == turned && f.send(host, "hitTest:", outside).x0 == host, "hit testing follows the rotated frame");
+    const auto spun = f.view({{0, 0}, {100, 50}});
+    static_cast<void>(f.id(host, "addSubview:", {spun}));
+    CallRegs half_turn;
+    half_turn.set_d(0, 180);
+    static_cast<void>(f.send(spun, "setFrameCenterRotation:", half_turn));
+    const auto spun_frame = f.frame(spun);
+    require(std::abs(spun_frame.origin.x - 100) < 1e-6 && std::abs(spun_frame.origin.y - 50) < 1e-6 && f.send(spun, "frameCenterRotation").d(0) == 180,
+            "-setFrameCenterRotation: keeps the centre");
+    CallRegs scaled;
+    gui::appkit::put_size(scaled, 0, {2, 2});
+    static_cast<void>(f.send(host, "scaleUnitSquareToSize:", scaled));
+    require((f.id(host, "isRotatedOrScaledFromBase") & 0xff) == 1 && (f.id(host, "isRotatedFromBase") & 0xff) == 0, "scaled but not rotated");
+    static_cast<void>(f.id(window, "close"));
+}
+
 void auto_layout_tests() {
     Fixture f;
     anchors_and_window_pass(f);
@@ -958,6 +1083,7 @@ void auto_layout_tests() {
     drag_sessions(f);
     layout_guides_and_safe_areas(f);
     split_views_and_controllers(f);
+    presentation_editing_rotation(f);
 }
 
 } // namespace windows_appkit_tests
