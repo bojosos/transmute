@@ -9,12 +9,19 @@
 // default handling), background configurations, and connectionProxyDictionary
 // through an in-test loopback HTTP proxy; NSURLCache (fresh responses served
 // from the cache, ETag revalidation, no-store, cache policies, the delegate's
-// willCacheResponse:). When the network is reachable, a real HTTPS request to
+// willCacheResponse:); NSURLProtocol subclasses (a custom scheme loaded on the
+// worker and from another thread, failure, a redirect into HTTPS, caching,
+// registerClass: for the shared session, request properties); stream tasks
+// (a loopback echo server, TLS through startSecureConnection) and WebSocket
+// tasks against an in-test server (messages, fragments, ping, both closes),
+// and the WebSocket framing. When the
+// network is reachable, a real HTTPS request to
 // https://example.com is evaluated against the Windows root store.
 // CFSocket: accept, data, write and end-of-stream callbacks through the
 // run loop against host Winsock peers. Bonjour: dns_sd and NSNetService over
 // the Windows DNS-SD client (see test_bonjour).
 #include "http.hpp"
+#include "websocket.hpp"
 #include "mdns.hpp"
 #include "tls.hpp"
 
@@ -317,7 +324,7 @@ struct Harness {
         completion = f.block(f.process.install_function("test_completion", [this, b](CpuState& s, GuestMemory&) {
             std::lock_guard lock(record.mutex);
             if (s.x[1]) record.data = b->bytes(s.x[1]);
-            if (s.x[2]) record.status = static_cast<std::int64_t>(f.objc.send(s.x[2], "statusCode").x0);
+            if (s.x[2] && f.objc.responds(s.x[2], f.objc.selector("statusCode"))) record.status = static_cast<std::int64_t>(f.objc.send(s.x[2], "statusCode").x0);
             if (s.x[3]) record.error = static_cast<std::int64_t>(f.objc.send(s.x[3], "code").x0);
             record.done = true;
             s.x[0] = 0;
@@ -376,7 +383,7 @@ struct Harness {
             {
                 std::lock_guard lock(record.mutex);
                 ++record.responses;
-                record.status = static_cast<std::int64_t>(f.objc.send(s.x[4], "statusCode").x0);
+                if (f.objc.responds(s.x[4], f.objc.selector("statusCode"))) record.status = static_cast<std::int64_t>(f.objc.send(s.x[4], "statusCode").x0);
             }
             // NSURLSessionResponseAllow; the handler takes one argument, so x2
             // is junk the caller left behind (a guest leaves anything there).
@@ -1002,6 +1009,457 @@ void test_url_cache(Fixture& f, Harness& h, HttpsServer& server) {
     std::cout << "URL cache: storage, freshness, revalidation, policies and willCacheResponse:\n";
 }
 
+// A loopback TCP server: `serve` runs for each accepted connection on its own thread.
+class LoopbackServer {
+public:
+    explicit LoopbackServer(std::function<void(SOCKET)> serve) : serve_(std::move(serve)) {
+        listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        require(bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 && listen(listener_, 8) == 0, "listen failed");
+        int size = sizeof(address);
+        getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &size);
+        port_ = ntohs(address.sin_port);
+        thread_ = std::thread([this] {
+            while (!stop_) {
+                fd_set set;
+                FD_ZERO(&set);
+                FD_SET(listener_, &set);
+                timeval timeout{0, 50'000};
+                if (select(0, &set, nullptr, nullptr, &timeout) <= 0) continue;
+                const auto client = accept(listener_, nullptr, nullptr);
+                if (client == INVALID_SOCKET) continue;
+                connections_.emplace_back([this, client] { serve_(client); closesocket(client); });
+            }
+        });
+    }
+    ~LoopbackServer() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+        for (auto& connection : connections_) if (connection.joinable()) connection.join();
+        closesocket(listener_);
+    }
+    [[nodiscard]] std::uint16_t port() const { return port_; }
+
+private:
+    std::function<void(SOCKET)> serve_;
+    SOCKET listener_{};
+    std::uint16_t port_{};
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+    std::vector<std::thread> connections_;
+};
+
+void send_all(SOCKET client, const net::websocket::Bytes& bytes) {
+    std::size_t sent = 0;
+    while (sent < bytes.size()) {
+        const auto count = send(client, reinterpret_cast<const char*>(bytes.data() + sent), static_cast<int>(bytes.size() - sent), 0);
+        if (count <= 0) return;
+        sent += static_cast<std::size_t>(count);
+    }
+}
+
+// The WebSocket framing on its own.
+void test_websocket_framing() {
+    namespace ws = net::websocket;
+    require(ws::accept_for("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "the RFC 6455 accept sample");
+    for (const std::size_t size : {std::size_t{0}, std::size_t{125}, std::size_t{126}, std::size_t{65535}, std::size_t{65536}}) {
+        ws::Frame frame;
+        frame.opcode = ws::Opcode::binary;
+        frame.payload.resize(size);
+        for (std::size_t index = 0; index < size; ++index) frame.payload[index] = static_cast<std::uint8_t>(index * 7);
+        const auto bytes = ws::encode(frame, std::array<std::uint8_t, 4>{1, 2, 3, 4});
+        ws::Decoder decoder;
+        decoder.feed(bytes.data(), bytes.size() / 2);
+        require(!decoder.next(1 << 20) || size == 0, "half a frame is not a frame");
+        decoder.feed(bytes.data() + bytes.size() / 2, bytes.size() - bytes.size() / 2);
+        auto decoded = decoder.next(1 << 20);
+        if (size == 0 && !decoded) decoded = decoder.next(1 << 20);
+        require(decoded && decoded->masked && decoded->fin && decoded->payload == frame.payload, "a masked frame round-trips: " + std::to_string(size));
+    }
+    const ws::Bytes reserved{0xc1, 0x00};
+    ws::Decoder decoder;
+    decoder.feed(reserved.data(), reserved.size());
+    bool threw = false;
+    try { static_cast<void>(decoder.next(100)); } catch (const ws::ProtocolError& error) { threw = error.code == 1002; }
+    require(threw, "reserved bits are a protocol error");
+    const auto big = ws::encode({true, ws::Opcode::text, false, ws::Bytes(200, 'x')}, std::nullopt);
+    ws::Decoder limited;
+    limited.feed(big.data(), big.size());
+    threw = false;
+    try { static_cast<void>(limited.next(100)); } catch (const ws::ProtocolError& error) { threw = error.code == 1009; }
+    require(threw, "a frame over the limit is 1009");
+}
+
+// NSURLSessionStreamTask and NSURLSessionWebSocketTask.
+void test_socket_tasks(Fixture& f, Harness& h, HttpsServer& https) {
+    namespace ws = net::websocket;
+    const auto b = sec::bridge();
+    struct Results {
+        std::mutex mutex;
+        std::vector<std::string> reads, messages;
+        std::vector<bool> eofs;
+        int writes{}, write_errors{}, pongs{}, receive_errors{};
+    } results;
+    static Results* live = nullptr;
+    live = &results;
+    static Address read_block = 0, write_block = 0, receive_block = 0, pong_block = 0;
+    if (!read_block) {
+        // (data, atEOF, error)
+        read_block = f.block(f.process.install_function("test_stream_read", [&f](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(live->mutex);
+            const auto bytes = s.x[1] ? sec::bridge()->bytes(s.x[1]) : Bytes{};
+            live->reads.emplace_back(s.x[3] ? "error " + std::to_string(f.objc.send(s.x[3], "code").x0) : std::string(bytes.begin(), bytes.end()));
+            live->eofs.push_back((s.x[2] & 0xff) != 0);
+            s.x[0] = 0;
+        }, "alchemy.test"));
+        // (error)
+        write_block = f.block(f.process.install_function("test_stream_write", [](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(live->mutex);
+            ++(s.x[1] ? live->write_errors : live->writes);
+            s.x[0] = 0;
+        }, "alchemy.test"));
+        // (message, error)
+        receive_block = f.block(f.process.install_function("test_ws_receive", [&f](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(live->mutex);
+            if (s.x[2]) { ++live->receive_errors; s.x[0] = 0; return; }
+            const auto type = f.objc.send(s.x[1], "type").x0;
+            if (type == 1) live->messages.push_back("text:" + f.cf.utf8(f.objc.send(s.x[1], "string").x0));
+            else {
+                const auto bytes = sec::bridge()->bytes(f.objc.send(s.x[1], "data").x0);
+                live->messages.push_back("data:" + std::string(bytes.begin(), bytes.end()));
+            }
+            s.x[0] = 0;
+        }, "alchemy.test"));
+        pong_block = f.block(f.process.install_function("test_ws_pong", [](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(live->mutex);
+            if (!s.x[1]) ++live->pongs;
+            s.x[0] = 0;
+        }, "alchemy.test"));
+    }
+    const auto count_of = [&](auto member) { std::lock_guard lock(results.mutex); return member(results); };
+    const auto session = h.session(h.delegate());
+
+    std::cout << "[network] 1. A stream task to an echo server: write, read back, clo" << std::endl;
+    // 1. A stream task to an echo server: write, read back, closeWrite, the end of the stream, completion.
+    LoopbackServer echo([](SOCKET client) {
+        char buffer[4096];
+        for (;;) {
+            const auto got = recv(client, buffer, sizeof(buffer), 0);
+            if (got <= 0) break;
+            send(client, buffer, got, 0);
+        }
+        shutdown(client, SD_SEND);
+    });
+    alchemy::CallRegs target;
+    target.x[2] = f.string("127.0.0.1"); target.x[3] = echo.port();
+    const auto stream = f.objc.send(session, "streamTaskWithHostName:port:", target).x0;
+    require(stream != 0 && f.objc.send(stream, "isKindOfClass:", alchemy::CallRegs{{0, 0, f.cls("NSURLSessionStreamTask")}}).x0 == 1, "a stream task");
+    h.record.reset();
+    static_cast<void>(f.send(stream, "resume"));
+    const auto write = [&](Address task, const std::string& text) {
+        alchemy::CallRegs registers;
+        registers.x[2] = b->data(Bytes(text.begin(), text.end())); registers.x[3] = write_block; registers.set_d(0, 10);
+        static_cast<void>(f.objc.send(task, "writeData:timeout:completionHandler:", registers));
+    };
+    const auto read = [&](Address task, std::uint64_t minimum, std::uint64_t maximum) {
+        alchemy::CallRegs registers;
+        registers.x[2] = minimum; registers.x[3] = maximum; registers.x[4] = read_block; registers.set_d(0, 10);
+        static_cast<void>(f.objc.send(task, "readDataOfMinLength:maxLength:timeout:completionHandler:", registers));
+    };
+    write(stream, "stream one");
+    read(stream, 10, 64);
+    eventually([&] { return count_of([](Results& r) { return r.reads.size(); }) == 1; }, "the stream read");
+    require(count_of([](Results& r) { return r.reads[0]; }) == "stream one" && count_of([](Results& r) { return r.writes; }) == 1, "echoed: " +
+            count_of([](Results& r) { return r.reads[0]; }));
+    // maximumLength splits what arrived; the rest waits for the next read.
+    write(stream, "abcdefgh");
+    read(stream, 4, 4);
+    read(stream, 4, 4);
+    eventually([&] { return count_of([](Results& r) { return r.reads.size(); }) == 3; }, "split reads");
+    require(count_of([](Results& r) { return r.reads[1] + "|" + r.reads[2]; }) == "abcd|efgh", "reads bounded by maxLength");
+    static_cast<void>(f.send(stream, "closeWrite"));
+    read(stream, 1, 64);
+    eventually([&] { return count_of([](Results& r) { return r.reads.size(); }) == 4; }, "the end of the stream");
+    require(count_of([](Results& r) { return r.eofs[3] && r.reads[3].empty(); }), "atEOF after the server's close");
+    h.wait("the stream task completes");
+    require(h.record.error == 0, "a stream task closed on both sides completes without an error: " + std::to_string(h.record.error));
+
+    std::cout << "[network] 2. TLS on a stream task (startSecureConnection before res" << std::endl;
+    // 2. TLS on a stream task (startSecureConnection before resume), against the HTTPS server; trust through the delegate.
+    alchemy::CallRegs secure_target;
+    secure_target.x[2] = f.string("localhost"); secure_target.x[3] = https.port();
+    const auto secure = f.objc.send(session, "streamTaskWithHostName:port:", secure_target).x0;
+    static_cast<void>(f.send(secure, "startSecureConnection"));
+    h.record.reset();
+    static_cast<void>(f.send(secure, "resume"));
+    write(secure, "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    std::string reply;
+    for (int round = 0; round < 8 && reply.find("hello world") == std::string::npos; ++round) {
+        const auto before = count_of([](Results& r) { return r.reads.size(); });
+        read(secure, 1, 4096);
+        eventually([&] { return count_of([](Results& r) { return r.reads.size(); }) > before; }, "a TLS stream read");
+        reply += count_of([](Results& r) { return r.reads.back(); });
+    }
+    require(reply.find("HTTP/1.1 200 OK") == 0 && reply.find("hello world") != std::string::npos, "an HTTPS request over a TLS stream task: " + reply);
+    static_cast<void>(f.send(secure, "cancel"));
+    h.wait("the TLS stream task is cancelled");
+    require(h.record.error == net::url_error::cancelled, "cancel completes a stream task with NSURLErrorCancelled");
+
+    std::cout << "[network] 3. WebSockets against an in-test server: it echoes, fragm" << std::endl;
+    // 3. WebSockets against an in-test server: it echoes, fragments "fragment", answers pings, closes on "close-me"
+    //    with 4000 "bye", and answers a client close.
+    std::atomic<int> server_closes{0};
+    LoopbackServer server([&server_closes](SOCKET client) {
+        std::string head;
+        char buffer[4096];
+        while (head.find("\r\n\r\n") == std::string::npos) {
+            const auto got = recv(client, buffer, sizeof(buffer), 0);
+            if (got <= 0) return;
+            head.append(buffer, static_cast<std::size_t>(got));
+        }
+        std::string key, protocols;
+        for (std::size_t at = 0; at < head.size();) {
+            auto next = head.find("\r\n", at);
+            if (next == std::string::npos) break;
+            const auto line = head.substr(at, next - at);
+            const auto lower = sec::lower(line);
+            if (lower.starts_with("sec-websocket-key:")) key = line.substr(line.find(':') + 2);
+            if (lower.starts_with("sec-websocket-protocol:")) protocols = line.substr(line.find(':') + 2);
+            at = next + 2;
+        }
+        std::string response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
+            ws::accept_for(key) + "\r\n";
+        if (protocols.find("chat") != std::string::npos) response += "Sec-WebSocket-Protocol: chat\r\n";
+        response += "\r\n";
+        send(client, response.data(), static_cast<int>(response.size()), 0);
+        ws::Decoder decoder;
+        const auto rest = head.substr(head.find("\r\n\r\n") + 4);
+        decoder.feed(reinterpret_cast<const std::uint8_t*>(rest.data()), rest.size());
+        for (;;) {
+            auto frame = decoder.next(1 << 20);
+            if (!frame) {
+                const auto got = recv(client, buffer, sizeof(buffer), 0);
+                if (got <= 0) return;
+                decoder.feed(reinterpret_cast<const std::uint8_t*>(buffer), static_cast<std::size_t>(got));
+                continue;
+            }
+            if (!frame->masked) return;   // client frames are masked
+            if (frame->opcode == ws::Opcode::ping) {
+                send_all(client, ws::encode({true, ws::Opcode::pong, false, frame->payload}, std::nullopt));
+            } else if (frame->opcode == ws::Opcode::close) {
+                ++server_closes;
+                send_all(client, ws::encode({true, ws::Opcode::close, false, frame->payload}, std::nullopt));
+                return;
+            } else if (std::string(frame->payload.begin(), frame->payload.end()) == "fragment") {
+                send_all(client, ws::encode({false, ws::Opcode::text, false, {'f', 'r'}}, std::nullopt));
+                send_all(client, ws::encode({true, ws::Opcode::continuation, false, {'a', 'g'}}, std::nullopt));
+            } else if (std::string(frame->payload.begin(), frame->payload.end()) == "close-me") {
+                send_all(client, ws::encode({true, ws::Opcode::close, false, ws::close_payload(4000, "bye")}, std::nullopt));
+                // the client's answering close, then the end
+                for (int round = 0; round < 50; ++round) {
+                    auto answer = decoder.next(1 << 20);
+                    if (answer && answer->opcode == ws::Opcode::close) break;
+                    const auto got = recv(client, buffer, sizeof(buffer), 0);
+                    if (got <= 0) break;
+                    decoder.feed(reinterpret_cast<const std::uint8_t*>(buffer), static_cast<std::size_t>(got));
+                }
+                return;
+            } else {
+                send_all(client, ws::encode({true, frame->opcode, false, frame->payload}, std::nullopt));
+            }
+        }
+    });
+    const auto ws_url = "ws://127.0.0.1:" + std::to_string(server.port()) + "/chat";
+    const auto socket_task = f.send(session, "webSocketTaskWithURL:protocols:", {f.url(ws_url), b->array({f.string("chat"), f.string("other")})});
+    require(f.send(socket_task, "maximumMessageSize") == 1024 * 1024, "the default maximumMessageSize");
+    h.record.reset();
+    static_cast<void>(f.send(socket_task, "resume"));
+    const auto message = [&](bool text, const std::string& value) {
+        const auto object = f.send(f.cls("NSURLSessionWebSocketMessage"), "alloc");
+        return text ? f.send(object, "initWithString:", {f.string(value)}) : f.send(object, "initWithData:", {b->data(Bytes(value.begin(), value.end()))});
+    };
+    const auto send_message = [&](bool text, const std::string& value) {
+        static_cast<void>(f.send(socket_task, "sendMessage:completionHandler:", {message(text, value), write_block}));
+    };
+    const auto receive = [&] { static_cast<void>(f.send(socket_task, "receiveMessageWithCompletionHandler:", {receive_block})); };
+    const auto messages = [&] { return count_of([](Results& r) { return r.messages.size(); }); };
+    send_message(true, "hello");
+    receive();
+    eventually([&] { return messages() == 1; }, "a text message echoed");
+    send_message(false, "bytes");
+    receive();
+    eventually([&] { return messages() == 2; }, "a data message echoed");
+    send_message(true, "fragment");
+    receive();
+    eventually([&] { return messages() == 3; }, "a fragmented message");
+    require(count_of([](Results& r) { return r.messages[0] + "," + r.messages[1] + "," + r.messages[2]; }) == "text:hello,data:bytes,text:frag",
+            "WebSocket messages: " + count_of([](Results& r) { return r.messages[0] + "," + r.messages[1] + "," + r.messages[2]; }));
+    static_cast<void>(f.send(socket_task, "sendPingWithPongReceiveHandler:", {pong_block}));
+    eventually([&] { return count_of([](Results& r) { return r.pongs; }) == 1; }, "the pong");
+    const auto response = f.send(socket_task, "response");
+    require(response && f.send(response, "statusCode") == 101, "the handshake response");
+    alchemy::CallRegs close;
+    close.x[2] = 1000; close.x[3] = b->data(Bytes{'d', 'o', 'n', 'e'});
+    static_cast<void>(f.objc.send(socket_task, "cancelWithCloseCode:reason:", close));
+    h.wait("the WebSocket closes");
+    require(h.record.error == 0 && server_closes == 1 && f.send(socket_task, "closeCode") == 1000, "a client close: error " +
+            std::to_string(h.record.error));
+
+    std::cout << "[network] 4. The server closes: a pending receive fails; closeCode " << std::endl;
+    // 4. The server closes: a pending receive fails; closeCode and closeReason are the server's.
+    const auto closing = f.send(session, "webSocketTaskWithURL:", {f.url(ws_url)});
+    h.record.reset();
+    static_cast<void>(f.send(closing, "resume"));
+    static_cast<void>(f.send(closing, "sendMessage:completionHandler:", {message(true, "close-me"), write_block}));
+    static_cast<void>(f.send(closing, "receiveMessageWithCompletionHandler:", {receive_block}));
+    h.wait("the server's close");
+    eventually([&] { return count_of([](Results& r) { return r.receive_errors; }) == 1; }, "the pending receive fails");
+    const auto reason = f.send(closing, "closeReason");
+    require(f.send(closing, "closeCode") == 4000 && reason && f.cf.length(reason) == 3, "the server's close code and reason");
+    static_cast<void>(f.send(session, "invalidateAndCancel"));
+    std::cout << "Stream tasks (echo, TLS) and WebSocket tasks (messages, fragments, ping, closes)\n";
+}
+
+// NSURLProtocol: a guest-visible subclass for alchemy-test: URLs, by path.
+void test_url_protocols(Fixture& f, Harness& h, HttpsServer& server) {
+    const auto b = sec::bridge();
+    const auto text_of = [&] { std::lock_guard lock(h.record.mutex); return std::string(h.record.data.begin(), h.record.data.end()); };
+    struct Counts { std::atomic<int> started{}, stopped{}; } counts;
+    static Counts* live = nullptr;
+    static Address test_class = 0;
+    static std::string redirect_target;
+    live = &counts;
+    redirect_target = server.base() + "/hello";
+    // Class objects in CF collections (protocolClasses), as Foundation's class_objects.cpp provides in apps.
+    f.cf.set_foreign_adopter([&f](std::uint64_t address) {
+        if (!address || !(f.call(alchemy::objc_library, "_object_isClass", {address}) & 0xff)) return false;
+        f.process.objects().adopt(address, 40, f.engine.read64(address), alchemy::ObjectKind::instance, nullptr, true);
+        return true;
+    });
+    const auto path_of = [&f](Address request) { return f.text(f.send(f.send(request, "URL"), "path")); };
+    if (!test_class) {
+        test_class = f.objc.register_native_class("AlchemyTestURLProtocol", f.cls("NSURLProtocol"), 16);
+        static_cast<void>(f.objc.add_native_method(test_class, "canInitWithRequest:", [&f](CpuState& s, GuestMemory&) {
+            const auto url = s.x[2] ? f.objc.send(s.x[2], "URL").x0 : 0;
+            s.x[0] = url && f.cf.utf8(f.objc.send(url, "scheme").x0) == "alchemy-test";
+        }, true, "B@:@"));
+        static_cast<void>(f.objc.add_native_method(test_class, "stopLoading", [](CpuState& s, GuestMemory&) {
+            ++live->stopped; s.x[0] = 0; }, false, "v@:"));
+        static_cast<void>(f.objc.add_native_method(test_class, "startLoading", [&f, path_of](CpuState& s, GuestMemory&) {
+            ++live->started;
+            const auto bridge = sec::bridge();
+            const auto self = s.x[0];
+            const auto client = f.objc.send(self, "client").x0;
+            const auto request = f.objc.send(self, "request").x0;
+            const auto path = path_of(request);
+            const auto respond = [&f, bridge, self, client, request](const std::string& body, std::uint64_t policy) {
+                alchemy::CallRegs fields;
+                fields.x[2] = f.objc.send(request, "URL").x0; fields.x[3] = f.cf.string("text/plain");
+                fields.x[4] = body.size(); fields.x[5] = 0;
+                const auto response = f.objc.send(f.objc.send(f.cls("NSURLResponse"), "alloc").x0,
+                                                  "initWithURL:MIMEType:expectedContentLength:textEncodingName:", fields).x0;
+                alchemy::CallRegs registers;
+                registers.x[2] = self; registers.x[3] = response; registers.x[4] = policy;
+                static_cast<void>(f.objc.send(client, "URLProtocol:didReceiveResponse:cacheStoragePolicy:", registers));
+                bridge->release(response);
+                for (std::size_t at = 0; at < body.size(); at += 5) {   // in 5-byte pieces
+                    const auto piece = bridge->data(Bytes(body.begin() + static_cast<std::ptrdiff_t>(at),
+                                                          body.begin() + static_cast<std::ptrdiff_t>(std::min(body.size(), at + 5))));
+                    alchemy::CallRegs data;
+                    data.x[2] = self; data.x[3] = piece;
+                    static_cast<void>(f.objc.send(client, "URLProtocol:didLoadData:", data));
+                    bridge->release(piece);
+                }
+                alchemy::CallRegs done;
+                done.x[2] = self;
+                static_cast<void>(f.objc.send(client, "URLProtocolDidFinishLoading:", done));
+            };
+            if (path == "/hello") {
+                respond("protocol hello", 2);
+            } else if (path == "/cache") {
+                respond("protocol cached", 0);
+            } else if (path == "/async") {
+                bridge->retain(self);
+                bridge->dispatch_async(bridge->call(sec::libsystem_library, "_dispatch_get_global_queue", {0, 0}), [respond, bridge, self] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    respond("from another thread", 2);
+                    bridge->release(self);
+                });
+            } else if (path == "/fail") {
+                const auto error = bridge->error("AlchemyTest", 42, "the test protocol failed");
+                alchemy::CallRegs registers;
+                registers.x[2] = self; registers.x[3] = error;
+                static_cast<void>(f.objc.send(client, "URLProtocol:didFailWithError:", registers));
+                bridge->release(error);
+            } else if (path == "/redirect") {
+                const auto target = f.objc.send(f.cls("NSURLRequest"), "requestWithURL:", alchemy::CallRegs{{0, 0, f.objc.send(f.cls("NSURL"),
+                    "URLWithString:", alchemy::CallRegs{{0, 0, f.cf.string(redirect_target)}}).x0}}).x0;
+                alchemy::CallRegs registers;
+                registers.x[2] = self; registers.x[3] = target; registers.x[4] = 0;
+                static_cast<void>(f.objc.send(client, "URLProtocol:wasRedirectedToRequest:redirectResponse:", registers));
+            }
+            s.x[0] = 0;
+        }, false, "v@:"));
+    }
+
+    // The base class and request properties.
+    require(f.send(f.cls("NSURLProtocol"), "canInitWithRequest:", {f.send(f.cls("NSURLRequest"), "requestWithURL:", {f.url("alchemy-test://x/hello")})}) == 0,
+            "NSURLProtocol takes no request itself");
+    const auto marked = f.send(f.cls("NSMutableURLRequest"), "requestWithURL:", {f.url("https://example.com/")});
+    static_cast<void>(f.send(f.cls("NSURLProtocol"), "setProperty:forKey:inRequest:", {f.string("yes"), f.string("AlchemySeen"), marked}));
+    require(f.text(f.send(f.cls("NSURLProtocol"), "propertyForKey:inRequest:", {f.string("AlchemySeen"), f.send(marked, "copy")})) == "yes",
+            "a request property travels with copies");
+    static_cast<void>(f.send(f.cls("NSURLProtocol"), "removePropertyForKey:inRequest:", {f.string("AlchemySeen"), marked}));
+    require(f.send(f.cls("NSURLProtocol"), "propertyForKey:inRequest:", {f.string("AlchemySeen"), marked}) == 0, "removePropertyForKey:inRequest:");
+
+    std::cout << "[network] A session with the class in protocolClasses." << std::endl;
+    // A session with the class in protocolClasses.
+    const auto configuration = f.send(f.cls("NSURLSessionConfiguration"), "ephemeralSessionConfiguration");
+    static_cast<void>(f.send(configuration, "setProtocolClasses:", {b->array({test_class})}));
+    const auto session = f.send(f.cls("NSURLSession"), "sessionWithConfiguration:delegate:delegateQueue:", {configuration, h.delegate(), 0});
+    const auto fetch = [&](Address in, const std::string& url, bool with_completion = true) {
+        h.record.reset();
+        const auto task = with_completion ? f.send(in, "dataTaskWithURL:completionHandler:", {f.url(url), h.completion})
+                                          : f.send(in, "dataTaskWithURL:", {f.url(url)});
+        static_cast<void>(f.send(task, "resume"));
+        h.wait(url);
+        return text_of();
+    };
+    require(fetch(session, "alchemy-test://x/hello") == "protocol hello" && h.record.error == 0, "a protocol's load: " + text_of());
+    eventually([&] { return counts.stopped.load() == 1; }, "stopLoading after the load");
+    require(counts.started == 1 && counts.stopped == 1, "startLoading and stopLoading once each");
+    require(fetch(session, "alchemy-test://x/hello", false) == "protocol hello" && h.record.responses == 1, "a delegate-driven protocol load");
+    require(fetch(session, "alchemy-test://x/async") == "from another thread", "client calls from another thread");
+    static_cast<void>(fetch(session, "alchemy-test://x/fail"));
+    require(h.record.error == 42 && text_of().empty(), "the protocol's error reaches the task");
+    // A redirect out of the custom scheme continues on the HTTP stack.
+    require(fetch(session, "alchemy-test://x/redirect") == "hello world" && h.record.status == 200, "a protocol redirect into HTTPS: " + text_of());
+    // The storage policy decides caching (NSURLCacheStorageAllowed here, NotAllowed for /hello).
+    const auto cache = f.send(configuration, "URLCache");
+    static_cast<void>(fetch(session, "alchemy-test://x/cache"));
+    const auto cached_request = f.send(f.cls("NSURLRequest"), "requestWithURL:", {f.url("alchemy-test://x/cache")});
+    const auto session_cache = f.send(f.send(session, "configuration"), "URLCache");
+    require(cache != 0 && session_cache != 0 && f.send(session_cache, "cachedResponseForRequest:", {cached_request}) != 0, "the protocol's response was cached");
+    require(f.send(session_cache, "cachedResponseForRequest:", {f.send(f.cls("NSURLRequest"), "requestWithURL:", {f.url("alchemy-test://x/hello")})}) == 0,
+            "NSURLCacheStorageNotAllowed was not cached");
+    static_cast<void>(f.send(session, "invalidateAndCancel"));
+
+    std::cout << "[network] The shared session uses +registerClass: (latest first); w" << std::endl;
+    // The shared session uses +registerClass: (latest first); without it the scheme is unsupported.
+    const auto shared = f.send(f.cls("NSURLSession"), "sharedSession");
+    static_cast<void>(fetch(shared, "alchemy-test://x/hello"));
+    require(h.record.error == net::url_error::unsupported_url, "no registered class: unsupported URL " + std::to_string(h.record.error));
+    require(f.send(f.cls("NSURLProtocol"), "registerClass:", {test_class}) == 1, "registerClass:");
+    require(fetch(shared, "alchemy-test://x/hello") == "protocol hello", "the shared session uses registered classes");
+    static_cast<void>(f.send(f.cls("NSURLProtocol"), "unregisterClass:", {test_class}));
+    static_cast<void>(fetch(shared, "alchemy-test://x/hello"));
+    require(h.record.error == net::url_error::unsupported_url, "unregisterClass:");
+    require(f.send(f.cls("NSURLProtocol"), "registerClass:", {f.cls("NSObject")}) == 0, "only NSURLProtocol subclasses register");
+    std::cout << "NSURLProtocol: custom scheme loads, threads, failure, redirect, caching and registration\n";
+}
+
 // A plain HTTP forward proxy on loopback: every request gets "via proxy"; the request lines are kept.
 class LoopbackProxy {
 public:
@@ -1529,10 +1987,12 @@ void test_bonjour(Fixture& f) {
 
 int main() {
     try {
+        std::cout << std::unitbuf;
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
         Fixture fixture;
         test_urls(fixture);
+        test_websocket_framing();
         test_operation_queue(fixture);
         test_http_message(fixture);
         test_unsent_exchange();
@@ -1550,6 +2010,8 @@ int main() {
             test_sessions(fixture, harness, server);
             test_session_extras(fixture, harness, server);
             test_url_cache(fixture, harness, server);
+            test_url_protocols(fixture, harness, server);
+            test_socket_tasks(fixture, harness, server);
         }
         if (sec::host_environment("ALCHEMY_TEST_OFFLINE").empty()) test_internet(fixture, harness);
         std::cout << "Alchemy network tests passed\n";

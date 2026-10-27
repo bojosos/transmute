@@ -15,9 +15,8 @@
 //   a dictionary {"_CFURLString": absolute string, "_CFURLStringType": 15}
 //   that round-trips (the layout follows CoreFoundation's; unverified).
 // - Foundation: NSURLQueryItem and NSUserActivity are real value classes
-//   (there is no Handoff, so becoming current publishes nothing);
-//   NSURLProtocol is a real, subclassable class whose registrations are
-//   recorded but not consulted by Alchemy's NSURLSession (WinHTTP).
+//   (there is no Handoff, so becoming current publishes nothing).
+//   (NSURLProtocol is the network provider's: darwin/network/loading.cpp.)
 // - CFNetwork: the URL loading classes of the network provider are also
 //   published under CFNetwork, where GoogleUpdater binds them.
 // - libobjc: imp_implementationWithBlock builds a real trampoline (guest code
@@ -244,28 +243,6 @@ void Provider::install_foundation() {
         store(s.x[0], "userInfo", merged);
         release(merged);
     }, false, "v@:@");
-    const auto url_protocol = cls(foundation, "NSURLProtocol", "NSObject");
-    object_properties(url_protocol, {"request", "cachedResponse", "client"});
-    method(url_protocol, "initWithRequest:cachedResponse:client:", [this](CpuState& s, GuestMemory&) {
-        store(s.x[0], "request", s.x[2]);
-        store(s.x[0], "cachedResponse", s.x[3]);
-        store(s.x[0], "client", s.x[4]);
-    });
-    auto protocols = std::make_shared<std::vector<Address>>();
-    method(url_protocol, "registerClass:", [this, protocols](CpuState& s, GuestMemory&) {
-        std::lock_guard lock(mutex);
-        if (s.x[2] && std::find(protocols->begin(), protocols->end(), s.x[2]) == protocols->end()) protocols->insert(protocols->begin(), s.x[2]);
-        s.x[0] = s.x[2] != 0;
-    }, true, "B@:#");
-    method(url_protocol, "unregisterClass:", [this, protocols](CpuState& s, GuestMemory&) {
-        std::lock_guard lock(mutex);
-        std::erase(*protocols, s.x[2]);
-    }, true, "v@:#");
-    for (const auto* selector : {"canInitWithRequest:", "canInitWithTask:"})
-        method(url_protocol, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true, "B@:@");
-    method(url_protocol, "canonicalRequestForRequest:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[2]; }, true);
-    method(url_protocol, "requestIsCacheEquivalent:toRequest:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[2] == s.x[3]; }, true, "B@:@@");
-
     // ---------------------------------------------------------------- CFNetwork
     // Foundation classes that newer SDKs link from the framework that now
     // holds them: URL loading from CFNetwork, NSMethodSignature from

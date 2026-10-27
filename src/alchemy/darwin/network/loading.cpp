@@ -1,15 +1,21 @@
 #include "alchemy/darwin/network/http.hpp"
 #include "alchemy/darwin/network/cookies.hpp"
+#include "alchemy/darwin/network/websocket.hpp"
+#include "alchemy/darwin/security/tls.hpp"
+#include "alchemy/host/crypto.hpp"
 
 #include "alchemy/darwin_threads.hpp"
 #include "alchemy/host/files.hpp"
 #include "alchemy/path.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -48,9 +54,34 @@
 // responses (200, 203, 300, 301, 410 without no-store) go through the
 // delegate's willCacheResponse: and -storeCachedResponse:forRequest:.
 // Download tasks are not cached.
+// NSURLProtocol: a session consults its configuration's protocolClasses (the
+// shared session: the classes given to +registerClass:, latest first) with
+// +canInitWithTask:; the first that accepts loads the request, any scheme:
+// +canonicalRequestForRequest:, -initWithRequest:cachedResponse:client:,
+// then -startLoading on the task's worker thread, whose run loop runs while
+// the protocol works. The client's calls (response with its cache storage
+// policy, data, finish, failure, redirect, cachedResponseIsValid:) reach the
+// delegate or completion handler like an HTTP load; -stopLoading follows on
+// the same thread. Request properties (+propertyForKey:inRequest: and the
+// setters) travel with request copies.
 //
-// Not provided (explicit failures): stream / WebSocket tasks, custom
-// NSURLProtocol classes, proxy auto-configuration and SOCKS entries in
+// Stream and WebSocket tasks run over guest TCP sockets (so the network
+// policy applies; proxies are not used) with the host TLS client for TLS and
+// wss:, whose server trust goes through the session's challenge as for HTTPS.
+// NSURLSessionStreamTask: reads (minimum / maximum / timeout) and writes in
+// order, closeRead / closeWrite (readClosed / writeClosed delegate calls),
+// startSecureConnection (after the queued reads and writes). The task
+// completes when cancelled, on a connection failure, or once both sides are
+// closed. NSURLSessionWebSocketTask (RFC 6455, websocket.cpp): the opening
+// handshake with the request's headers and protocols (the response is the
+// task's NSHTTPURLResponse), text and binary messages up to
+// maximumMessageSize, fragmented messages, ping / pong, the close handshake
+// (cancelWithCloseCode:reason:, a server's close: didCloseWithCode:reason:,
+// closeCode, closeReason).
+//
+// Not provided (explicit failures): stream tasks to an NSNetService,
+// captureStreams, stopSecureConnection, authentication
+// challenges sent by NSURLProtocol classes, proxy auto-configuration and SOCKS entries in
 // connectionProxyDictionary, client certificate credentials, response
 // dispositions other than allow / cancel, and resume data. Cookies: NSHTTPCookieStorage's jar (cookies.cpp) sets
 // Cookie headers and stores Set-Cookie on every hop; default sessions share
@@ -80,6 +111,7 @@ struct RequestState final : ObjectPayload {
     Headers headers;
     std::optional<Bytes> body;
     Address body_stream{};        // +1 NSInputStream (HTTPBodyStream)
+    std::map<std::string, Address> properties;   // +1 values (NSURLProtocol request properties)
     double timeout{60};
     std::uint64_t cache_policy{}, service_type{};
     bool cookies{true}, cellular{true}, pipelining{}, expensive{true}, constrained{true};
@@ -110,14 +142,249 @@ struct Decision {
     Address object{};             // +1 (credential / request), released by the waiter
 };
 
+// A guest TCP connection (the guest's sockets, so the network policy applies) with an optional host TLS client
+// session. One thread reads while another writes; close() from any guest thread ends both.
+class Channel {
+public:
+    explicit Channel(std::shared_ptr<Bridge> bridge) : b(std::move(bridge)) {}
+
+    // Resolves `host` and connects (on a guest worker): 0, or the errno.
+    std::int64_t connect(const std::string& host, std::uint16_t port) {
+        const auto host_text = c_string(host), port_text = c_string(std::to_string(port));
+        const auto hints = sys("_calloc", {1, 48}), result = sys("_calloc", {1, 8});
+        b->memory().write32(hints + 8, 1);   // SOCK_STREAM
+        std::int64_t code = 65;              // EHOSTUNREACH
+        std::int64_t socket = -1;
+        if (sys("_getaddrinfo", {host_text, port_text, hints, result}) == 0) {
+            const auto list = b->memory().read64(result);
+            code = 61;                       // ECONNREFUSED
+            for (auto info = list; info; info = b->memory().read64(info + 40)) {
+                const auto family = b->memory().read32(info + 4), socktype = b->memory().read32(info + 8),
+                           protocol = b->memory().read32(info + 12), length = b->memory().read32(info + 16);
+                socket = static_cast<std::int32_t>(sys("_socket", {family, socktype, protocol}));
+                if (socket < 0) { code = guest_errno(); continue; }
+                if (static_cast<std::int32_t>(sys("_connect", {static_cast<Address>(socket), b->memory().read64(info + 32), length})) == 0) {
+                    code = 0;
+                    break;
+                }
+                code = guest_errno();
+                static_cast<void>(sys("_close", {static_cast<Address>(socket)}));
+                socket = -1;
+            }
+            static_cast<void>(sys("_freeaddrinfo", {list}));
+        }
+        for (const auto block : {host_text, port_text, hints, result}) static_cast<void>(sys("_free", {block}));
+        if (code == 0) {
+            std::lock_guard lock(mutex);
+            if (closing) { static_cast<void>(sys("_close", {static_cast<Address>(socket)})); return 89; }   // ECANCELED
+            fd = static_cast<std::int32_t>(socket);
+        }
+        return code;
+    }
+    // The TLS client handshake (SNI and the certificate name: `peer`); false with `error` set.
+    bool start_tls(const std::string& peer, std::string& error) {
+        std::lock_guard lock(tls_mutex);
+        try {
+            security::TlsOptions options;
+            options.peer_name = peer;
+            tls = std::make_unique<security::TlsSession>(options);
+        } catch (const std::exception& failure) {
+            error = failure.what();
+            return false;
+        }
+        if (tls->handshake(raw_reader(), raw_writer()) != security::TlsSession::Status::ok) {
+            error = tls->error().empty() ? "the TLS handshake failed" : tls->error();
+            return false;
+        }
+        return true;
+    }
+    [[nodiscard]] std::vector<security::CertificatePtr> peer_certificates() {
+        std::lock_guard lock(tls_mutex);
+        return tls ? tls->peer_certificates() : std::vector<security::CertificatePtr>{};
+    }
+    // Up to `size` bytes within `timeout` seconds (<= 0: no limit): the count, 0 at the end of the stream, -1 on a
+    // failure or after close(), -2 on a timeout.
+    std::int64_t read(std::uint8_t* out, std::size_t size, double timeout) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout > 0 ? timeout : 1e9);
+        for (;;) {
+            bool buffered = false;
+            {
+                std::lock_guard lock(tls_mutex);
+                buffered = tls && tls->buffered() > 0;
+            }
+            if (!buffered) {
+                const auto ready = readable(50);
+                if (ready < 0) return -1;
+                if (ready == 0) {
+                    if (std::chrono::steady_clock::now() >= until) return -2;
+                    continue;
+                }
+            }
+            std::lock_guard lock(tls_mutex);
+            if (!tls) return raw_read(out, size);
+            // TLS reads never wait on the socket while holding the session (a writer would wait behind them): records
+            // that carry no data (a TLS 1.3 session ticket) leave the read would_block, and this waits again.
+            std::size_t got{};
+            const auto status = tls->read(nonblocking_reader(), raw_writer(), out, size, got);
+            if (got) return static_cast<std::int64_t>(got);
+            using Status = security::TlsSession::Status;
+            if (status == Status::would_block || status == Status::ok) {
+                if (std::chrono::steady_clock::now() >= until) return -2;
+                continue;
+            }
+            return status == Status::closed || tls->close_notified() ? 0 : -1;
+        }
+    }
+    bool write(const std::uint8_t* data, std::size_t size) {
+        std::lock_guard lock(tls_mutex);
+        if (!tls) return raw_write(data, size);
+        std::size_t accepted{};
+        return tls->write(raw_writer(), data, size, accepted) == security::TlsSession::Status::ok && accepted == size;
+    }
+    void shutdown_write() {
+        const auto socket = current();
+        if (socket < 0) return;
+        {
+            std::lock_guard lock(tls_mutex);
+            if (tls) static_cast<void>(tls->shutdown(raw_writer()));
+        }
+        static_cast<void>(sys("_shutdown", {static_cast<Address>(socket), 1}));   // SHUT_WR
+    }
+    // Ends the connection; pending reads and writes fail. Any guest thread; idempotent.
+    void close() {
+        std::int32_t socket;
+        {
+            std::lock_guard lock(mutex);
+            closing = true;
+            socket = std::exchange(fd, -1);
+        }
+        if (socket < 0) return;
+        static_cast<void>(sys("_shutdown", {static_cast<Address>(socket), 2}));   // SHUT_RDWR
+        static_cast<void>(sys("_close", {static_cast<Address>(socket)}));
+    }
+    [[nodiscard]] bool open() { return current() >= 0; }
+
+private:
+    Address sys(std::string_view name, std::initializer_list<Address> arguments) { return b->call(security::libsystem_library, name, arguments); }
+    std::int64_t guest_errno() {
+        const auto location = sys("___error", {});
+        return location ? static_cast<std::int32_t>(b->memory().read32(location)) : 22;
+    }
+    Address c_string(std::string_view text) {
+        const auto address = sys("_malloc", {text.size() + 1});
+        b->memory().write_bytes(address, std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+        b->memory().write8(address + text.size(), 0);
+        return address;
+    }
+    std::int32_t current() { std::lock_guard lock(mutex); return fd; }
+    // poll(POLLIN) for `milliseconds`: 1 readable (or at its end), 0 not yet, -1 closed.
+    int readable(int milliseconds) {
+        const auto socket = current();
+        if (socket < 0) return -1;
+        const auto poll = sys("_calloc", {1, 8});
+        b->memory().write32(poll, static_cast<std::uint32_t>(socket));
+        b->memory().write32(poll + 4, 1);   // events POLLIN, revents 0
+        const auto count = static_cast<std::int32_t>(sys("_poll", {poll, 1, static_cast<Address>(milliseconds)}));
+        const auto events = b->memory().read32(poll + 4) >> 16;   // revents
+        static_cast<void>(sys("_free", {poll}));
+        if (count < 0) return current() < 0 ? -1 : 0;
+        if (count == 0) return 0;
+        return (events & 0x20) && !(events & 1) ? -1 : 1;   // POLLNVAL alone: closed
+    }
+    std::int64_t raw_read(std::uint8_t* out, std::size_t size) {
+        const auto socket = current();
+        if (socket < 0) return -1;
+        const auto buffer = sys("_malloc", {size});
+        const auto got = static_cast<std::int64_t>(sys("_recv", {static_cast<Address>(socket), buffer, size, 0}));
+        if (got > 0) b->memory().read_bytes(buffer, std::span(out, static_cast<std::size_t>(got)));
+        static_cast<void>(sys("_free", {buffer}));
+        return got < 0 ? -1 : got;
+    }
+    bool raw_write(const std::uint8_t* data, std::size_t size) {
+        const auto socket = current();
+        if (socket < 0) return false;
+        const auto buffer = sys("_malloc", {std::max<std::size_t>(size, 1)});
+        b->memory().write_bytes(buffer, std::span(data, size));
+        std::size_t sent = 0;
+        while (sent < size) {
+            const auto count = static_cast<std::int64_t>(sys("_send", {static_cast<Address>(socket), buffer + sent, size - sent, 0}));
+            if (count <= 0) break;
+            sent += static_cast<std::size_t>(count);
+        }
+        static_cast<void>(sys("_free", {buffer}));
+        return sent == size;
+    }
+    security::TlsRead raw_reader() {
+        return [this](std::uint8_t* buffer, std::size_t size) {
+            const auto got = raw_read(buffer, size);
+            if (got < 0) return security::IoResult{security::IoResult::Kind::error, 0};
+            return security::IoResult{got == 0 ? security::IoResult::Kind::closed : security::IoResult::Kind::ok, static_cast<std::size_t>(got)};
+        };
+    }
+    // A reader that never waits: would_block unless the socket has bytes (or its end) now.
+    security::TlsRead nonblocking_reader() {
+        return [this](std::uint8_t* buffer, std::size_t size) {
+            const auto ready = readable(0);
+            if (ready < 0) return security::IoResult{security::IoResult::Kind::error, 0};
+            if (ready == 0) return security::IoResult{security::IoResult::Kind::would_block, 0};
+            const auto got = raw_read(buffer, size);
+            if (got < 0) return security::IoResult{security::IoResult::Kind::error, 0};
+            return security::IoResult{got == 0 ? security::IoResult::Kind::closed : security::IoResult::Kind::ok, static_cast<std::size_t>(got)};
+        };
+    }
+    security::TlsWrite raw_writer() {
+        return [this](const std::uint8_t* data, std::size_t size) {
+            if (!raw_write(data, size)) return security::IoResult{security::IoResult::Kind::error, 0};
+            return security::IoResult{security::IoResult::Kind::ok, size};
+        };
+    }
+
+    std::shared_ptr<Bridge> b;
+    std::mutex mutex;              // fd, closing
+    std::int32_t fd{-1};
+    bool closing{};
+    std::mutex tls_mutex;          // tls (and so one TLS operation at a time)
+    std::unique_ptr<security::TlsSession> tls;
+};
+
 struct Transfer {
     std::mutex mutex;
     std::condition_variable cv;
     bool cancelled{}, suspended{};
     std::shared_ptr<HttpExchange> exchange;
+    std::shared_ptr<Channel> channel;   // stream and WebSocket tasks
 };
 
-enum class TaskKind { data, upload, download };
+// A stream or WebSocket task's queues (Loading::run_stream / run_web_socket).
+struct SocketTask {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool open{}, done{};
+    Address failure{};                 // +1 the error that ended the connection
+    // Stream tasks.
+    std::string host;
+    std::uint16_t port{};
+    struct Read { std::uint64_t minimum{}, maximum{}; double timeout{}; Address block{}; };   // block: a copy
+    struct Write { enum class Kind { data, close_write, secure } kind{Kind::data}; Bytes data; double timeout{}; Address block{}; };
+    std::deque<Read> reads;
+    std::deque<Write> writes;
+    Bytes unread;                      // received beyond a read's maximum
+    bool eof{}, read_closed{}, write_closed{}, reading{}, securing{}, secure_first{};
+    // WebSocket tasks.
+    std::vector<std::string> protocols;
+    std::string chosen;
+    std::uint64_t maximum_message{1024 * 1024};
+    struct Outgoing { websocket::Opcode opcode{}; Bytes payload; Address block{}; bool ping{}; };   // block: a copy
+    std::deque<Outgoing> outgoing;
+    std::deque<Address> receivers;     // copies of receive handlers
+    std::deque<std::pair<bool, Bytes>> messages;   // (text, bytes) received and not yet asked for
+    std::deque<Address> pong_handlers; // copies, in ping order
+    std::int64_t close_code{};         // NSURLSessionWebSocketCloseCodeInvalid until closed
+    Bytes close_reason;
+    bool close_sent{}, close_received{};
+};
+
+enum class TaskKind { data, upload, download, stream, web_socket };
 enum class TaskStatus : std::int64_t { running = 0, suspended = 1, canceling = 2, completed = 3 };
 
 struct SessionState;
@@ -134,6 +401,7 @@ struct TaskState final : ObjectPayload {
     double priority{0.5};
     std::optional<Bytes> upload;
     std::shared_ptr<Transfer> transfer = std::make_shared<Transfer>();
+    std::shared_ptr<SocketTask> socket;   // stream and WebSocket tasks
 };
 
 struct SessionState final : ObjectPayload {
@@ -183,6 +451,28 @@ struct StorageState final : ObjectPayload {
     std::map<std::tuple<std::string, std::int64_t, std::string, std::string, std::string, bool>, Entry> spaces;
 };
 
+// Calls an NSURLProtocol makes on its client, consumed in order by the task's worker (Loading::run_protocol).
+struct ProtocolFeed {
+    struct Event {
+        enum class Kind { response, data, finished, failed, redirected, cached } kind{};
+        Address object{}, extra{};   // +1: the response, error, cached response or new request (+ the redirect response)
+        Bytes data;
+        std::uint64_t policy{};      // a response's NSURLCacheStoragePolicy
+    };
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Event> events;
+    Address run_loop{};              // the worker's CFRunLoop, woken for each event
+    bool closed{};                   // the load is over: later calls are dropped
+};
+struct ClientState final : ObjectPayload { std::shared_ptr<ProtocolFeed> feed; };
+// NSURLSessionWebSocketMessage: NSURLSessionWebSocketMessageTypeData (0) or String (1).
+struct MessageState final : ObjectPayload { std::uint64_t type{}; Address value{}; };   // +1 copy
+struct ProtocolState final : ObjectPayload {
+    Address request{}, cached{}, client{};   // +1
+    Address task{};                           // not retained (the task outlives its load)
+};
+
 // ---- the provider ----------------------------------------------------------------------------------
 
 struct Loading : std::enable_shared_from_this<Loading> {
@@ -194,6 +484,10 @@ struct Loading : std::enable_shared_from_this<Loading> {
     Address challenge_class{}, space_class{}, credential_class{}, cookie_storage_class{}, credential_storage_class{};
     Address shared_session{}, shared_cookie_storage{};
     Address shared_credential_storage{};      // immortal
+    Address protocol_class{}, protocol_client_class{};
+    Address stream_task_class{}, web_socket_task_class{}, web_socket_message_class{};
+    std::vector<Address> registered_protocols;   // +registerClass:, oldest first (not retained: classes are permanent)
+    std::mutex protocols_mutex;
     std::mutex storage_mutex;                 // shared_credential_storage (taken under `mutex` by sharedSession)
     std::uint64_t cookie_policy{2};           // NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain
     std::map<std::string, Address, std::less<>> constants;
@@ -303,6 +597,7 @@ struct Loading : std::enable_shared_from_this<Loading> {
             state->main_document = b->retain(from->main_document);
             state->method = from->method; state->headers = from->headers; state->body = from->body;
             state->body_stream = b->retain(from->body_stream);
+            for (const auto& [key, value] : from->properties) state->properties[key] = b->retain(value);
             state->timeout = from->timeout; state->cache_policy = from->cache_policy; state->service_type = from->service_type;
             state->cookies = from->cookies; state->cellular = from->cellular; state->pipelining = from->pipelining;
             state->expensive = from->expensive; state->constrained = from->constrained;
@@ -691,12 +986,12 @@ struct Loading : std::enable_shared_from_this<Loading> {
     // Offers the response to the delegate (URLSession:dataTask:willCacheResponse:completionHandler:) and stores
     // what it answers with -storeCachedResponse:forRequest:.
     void store_in_cache(const std::shared_ptr<SessionState>& session, Address session_object, Address task, const std::shared_ptr<TaskState>& state,
-                        Address cache, Address request, Address response, const Bytes& data) {
+                        Address cache, Address request, Address response, const Bytes& data, std::uint64_t storage_policy = 0) {
         const auto cls = b->objc.find_class("NSCachedURLResponse");
         if (!cls) return;
         const auto data_object = b->data(data);
         CallRegs registers;
-        registers.x[2] = response; registers.x[3] = data_object; registers.x[4] = 0; registers.x[5] = 0;   // NSURLCacheStorageAllowed
+        registers.x[2] = response; registers.x[3] = data_object; registers.x[4] = 0; registers.x[5] = storage_policy;
         auto proposed = b->objc.send(b->objc.send(cls, "alloc").x0, "initWithResponse:data:userInfo:storagePolicy:", registers).x0;
         b->release(data_object);
         const auto delegate = delegate_of(session);
@@ -885,8 +1180,115 @@ struct Loading : std::enable_shared_from_this<Loading> {
         if (self_retained) b->release(session_object);   // the reference the delegate cycle held
     }
 
+    // ---- NSURLProtocol ----------------------------------------------------------------------------------------
+    // The protocol class that takes the task's current request, or 0.
+    Address protocol_for(const std::shared_ptr<SessionState>& session, Address task) {
+        std::vector<Address> classes;
+        if (session->shared) {
+            std::lock_guard lock(protocols_mutex);
+            classes.assign(registered_protocols.rbegin(), registered_protocols.rend());
+        } else {
+            Address list{};
+            {
+                std::lock_guard lock(session->mutex);
+                const auto config = session->configuration ? b->objc.find_host_state<ConfigurationState>(session->configuration) : nullptr;
+                if (config) {
+                    std::lock_guard config_lock(config->properties.mutex);
+                    if (const auto found = config->properties.objects.find("protocolClasses"); found != config->properties.objects.end()) list = found->second;
+                }
+            }
+            if (list && b->is_array(list)) classes = b->cf.array_values(list);
+        }
+        for (const auto cls : classes) {
+            CallRegs registers;
+            registers.x[2] = task;
+            if (b->objc.send(cls, "canInitWithTask:", registers).x0 & 0xff) return cls;
+        }
+        return 0;
+    }
+    // Posts a client call to the load's worker (dropped once the load is over).
+    void post(const std::shared_ptr<ProtocolFeed>& feed, ProtocolFeed::Event event) {
+        Address loop{};
+        {
+            std::lock_guard lock(feed->mutex);
+            if (feed->closed) { b->release_all({event.object, event.extra}); return; }
+            feed->events.push_back(std::move(event));
+            loop = feed->run_loop;
+        }
+        feed->cv.notify_all();
+        if (loop) static_cast<void>(b->call(core_foundation_library, "_CFRunLoopWakeUp", {loop}));
+    }
+    // The next client call: runs this thread's run loop (protocols schedule their work on it) until one arrives.
+    // nullopt when the task was cancelled.
+    std::optional<ProtocolFeed::Event> next_event(const std::shared_ptr<ProtocolFeed>& feed, const std::shared_ptr<Transfer>& transfer) {
+        const auto run_in_mode = b->symbol(core_foundation_library, "_CFRunLoopRunInMode");
+        const auto mode = b->constant(core_foundation_library, "_kCFRunLoopDefaultMode");
+        for (;;) {
+            {
+                std::lock_guard lock(feed->mutex);
+                if (!feed->events.empty()) {
+                    auto event = std::move(feed->events.front());
+                    feed->events.pop_front();
+                    return event;
+                }
+            }
+            { std::lock_guard lock(transfer->mutex); if (transfer->cancelled) return std::nullopt; }
+            if (guest_worker_must_stop(b->process) || engine_stop_requested(b->process.calling_engine())) stop_now(b->process);
+            CallRegs registers;
+            registers.x[0] = mode;
+            registers.set_d(0, 0.05);
+            registers.x[1] = 1;   // return after a source is handled
+            const auto result = EngineAdapter(b->process.calling_engine()).call_regs(run_in_mode, registers);
+            if (static_cast<std::int32_t>(result.x0) == 1) {   // kCFRunLoopRunFinished: nothing to run, so wait here
+                std::unique_lock lock(feed->mutex);
+                feed->cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return !feed->events.empty(); });
+            }
+        }
+    }
+    bool run_protocol(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session, Address protocol_class);
+
     // ---- the transfer ------------------------------------------------------------------------------------------
+    // +1 NSURLErrorDomain error for the task's current URL.
+    Address task_error(const std::shared_ptr<TaskState>& state, std::int64_t code, const std::string& description, Address trust = 0, Address underlying = 0) {
+        Address url{};
+        {
+            std::lock_guard lock(state->mutex);
+            if (state->current) url = b->retain(require<RequestState>(state->current, "NSURLRequest")->url);
+        }
+        const auto error = url_error(code, description, url, trust, underlying);
+        b->release(url);
+        return error;
+    }
+    // A body source: up to `size` bytes into `out`, 0 at the end; on failure it sets `error` (+1) and returns 0.
+    using Reader = std::function<std::size_t(std::uint8_t* out, std::size_t size, Address& error)>;
+    void respond(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session, Address response,
+                 std::int64_t expected, const Reader& read, const std::function<void(const Bytes&)>& keep);
     void run(Address task);
+    // ---- stream and WebSocket tasks -----------------------------------------------------------------------
+    Address posix_error(std::int64_t code, const std::string& description) {   // +1
+        return b->error("NSPOSIXErrorDomain", code, description);
+    }
+    // Runs `work` on the session's delegate queue with the block, then releases the block and `owned`.
+    void complete_block(const std::shared_ptr<SessionState>& session, Address block, std::function<void(Address)> work, std::vector<Address> owned = {}) {
+        if (!block) { b->release_all(owned); return; }
+        deliver(session, [this, block, work = std::move(work), owned] {
+            work(block);
+            b->block_release(block);
+            b->release_all(owned);
+        });
+    }
+    // Ends a socket task once: closes the channel, answers every queued operation with `error` (or the end of the
+    // stream), and completes the task with `error` (+1, moved in; 0 for a normal end).
+    void end_socket_task(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session, Address error);
+    void run_stream(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session);
+    void stream_writer(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session);
+    void run_web_socket(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session);
+    void web_socket_writer(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session);
+    // Connects (and for TLS, handshakes and checks the server trust). Null with the task ended on a failure.
+    std::shared_ptr<Channel> open_channel(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session,
+                                          const std::string& host, std::uint16_t port, bool tls);
+    bool secure_channel(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session,
+                        const std::shared_ptr<Channel>& channel, const std::string& host, std::uint16_t port);
     std::shared_ptr<HttpClient> client_for(const std::shared_ptr<SessionState>& session);
     std::string default_user_agent();
     Address create_task(Address session_object, TaskKind kind, Address request, Address completion, std::optional<Bytes> upload);
@@ -951,15 +1353,17 @@ Address Loading::create_task(Address session_object, TaskKind kind, Address requ
         if (session->background && completion)
             security::fail("NSGenericException: Completion handler blocks are not supported in background sessions. Use a delegate instead.");
     }
-    if (!request || !b->objc.find_host_state<RequestState>(request)) security::fail("NSURLSession task without an NSURLRequest");
-    const auto cls = kind == TaskKind::download ? download_task_class : kind == TaskKind::upload ? upload_task_class : data_task_class;
+    if (kind != TaskKind::stream && (!request || !b->objc.find_host_state<RequestState>(request))) security::fail("NSURLSession task without an NSURLRequest");
+    const auto cls = kind == TaskKind::download ? download_task_class : kind == TaskKind::upload ? upload_task_class
+        : kind == TaskKind::stream ? stream_task_class : kind == TaskKind::web_socket ? web_socket_task_class : data_task_class;
     const auto task = b->objc.allocate(cls);
     auto state = std::make_shared<TaskState>();
     state->session_state = session;
     state->session = b->retain(session_object);
     state->kind = kind;
-    state->original = copy_request(request, request_class);
+    state->original = request ? copy_request(request, request_class) : 0;
     state->current = b->retain(state->original);
+    if (kind == TaskKind::stream || kind == TaskKind::web_socket) state->socket = std::make_shared<SocketTask>();
     state->completion = b->block_copy(completion);
     state->upload = std::move(upload);
     if (state->upload) state->expected_send = static_cast<std::int64_t>(state->upload->size());
@@ -978,12 +1382,19 @@ void Loading::run(Address task) {
     const auto session_object = state->session;
     const auto transfer = state->transfer;
     const auto fail_task = [&](std::int64_t code, const std::string& description, Address trust = 0, Address underlying = 0) {
-        Address url;
-        { std::lock_guard lock(state->mutex); url = b->retain(require<RequestState>(state->current, "NSURLRequest")->url); }
-        const auto error = url_error(code, description, url, trust, underlying);
-        b->release(url);
-        finish(session, session_object, task, state, error, {}, {});
+        finish(session, session_object, task, state, task_error(state, code, description, trust, underlying), {}, {});
     };
+
+    if (state->kind == TaskKind::stream) { run_stream(task, state, session); return; }
+    if (state->kind == TaskKind::web_socket) { run_web_socket(task, state, session); return; }
+
+    // Custom NSURLProtocol classes first, for any scheme; a protocol's redirect is loaded the same way.
+    for (int hops = 0;; ++hops) {
+        const auto protocol_class = protocol_for(session, task);
+        if (!protocol_class) break;
+        if (hops > 16) { fail_task(url_error::too_many_redirects, "too many redirects"); return; }
+        if (!run_protocol(task, state, session, protocol_class)) return;
+    }
 
     // Snapshot of the current request.
     Address current;
@@ -1240,6 +1651,34 @@ void Loading::run(Address task) {
         b->release(response_url);
     }
     const bool store = !from_cache && cache_request && cacheable(head);
+    std::size_t served = 0;   // of cached_body
+    const Reader read = [&](std::uint8_t* out, std::size_t size, Address& error) -> std::size_t {
+        if (cached_body) {
+            const auto count = std::min(size, cached_body->size() - served);
+            std::copy_n(cached_body->begin() + static_cast<std::ptrdiff_t>(served), count, out);
+            served += count;
+            return count;
+        }
+        std::optional<HttpFailure> failure;
+        const auto count = exchange->read(out, size, failure);
+        if (failure) error = task_error(state, failure->code, failure->description);
+        return failure ? 0 : count;
+    };
+    const Address cache_object = cache;
+    std::function<void(const Bytes&)> keep;
+    if (store) keep = [&, cache_object](const Bytes& data) { store_in_cache(session, session_object, task, state, cache_object, current, response, data); };
+    respond(task, state, session, response, expected, read, keep);
+}
+
+// Hands `response` (+1) to the task and delivers it and the body `read` yields to the delegate or the completion
+// handler, then completes the task. `keep` (when set) receives the whole body, for the URL cache, before the completion.
+void Loading::respond(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session, Address response,
+                      std::int64_t expected, const Reader& read, const std::function<void(const Bytes&)>& keep) {
+    const auto session_object = state->session;
+    const auto transfer = state->transfer;
+    const auto fail_task = [&](std::int64_t code, const std::string& description) {
+        finish(session, session_object, task, state, task_error(state, code, description), {}, {});
+    };
     Bytes kept;   // the body for the cache
     {
         std::lock_guard lock(state->mutex);
@@ -1292,7 +1731,6 @@ void Loading::run(Address task) {
     const bool progress = state->kind == TaskKind::download && !state->completion &&
         responds(delegate, "URLSession:downloadTask:didWriteData:totalBytesWritten:totalBytesExpectedToWrite:");
     std::vector<std::uint8_t> buffer(64 * 1024);
-    std::size_t served = 0;   // of cached_body
     for (;;) {
         {
             std::unique_lock lock(transfer->mutex);
@@ -1306,25 +1744,18 @@ void Loading::run(Address task) {
                 return;
             }
         }
-        std::optional<HttpFailure> failure;
-        std::size_t count;
-        if (cached_body) {
-            count = std::min(buffer.size(), cached_body->size() - served);
-            std::copy_n(cached_body->begin() + static_cast<std::ptrdiff_t>(served), count, buffer.begin());
-            served += count;
-        } else {
-            count = exchange->read(buffer.data(), buffer.size(), failure);
-        }
-        if (failure) {
+        Address error{};
+        const auto count = read(buffer.data(), buffer.size(), error);
+        if (error) {
             output.close();
             std::error_code ignored;
             if (!file.empty()) std::filesystem::remove(file, ignored);
-            fail_task(failure->code, failure->description);
+            finish(session, session_object, task, state, error, {}, {});
             return;
         }
         if (count == 0) break;
         state->received += static_cast<std::int64_t>(count);
-        if (store) kept.insert(kept.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(count));
+        if (keep) kept.insert(kept.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(count));
         if (state->kind == TaskKind::download) {
             output.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(count));
             if (!output) { fail_task(url_error::cannot_write_file, "cannot write the download file"); return; }
@@ -1355,8 +1786,737 @@ void Loading::run(Address task) {
         std::lock_guard lock(transfer->mutex);
         transfer->exchange.reset();
     }
-    if (store) store_in_cache(session, session_object, task, state, cache, current, response, kept);
+    if (keep) keep(kept);
     finish(session, session_object, task, state, 0, std::move(body), file);
+}
+
+// ---- stream and WebSocket tasks ------------------------------------------------------------------------------
+
+void Loading::end_socket_task(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session, Address error) {
+    const auto socket = state->socket;
+    std::deque<SocketTask::Read> reads;
+    std::deque<SocketTask::Write> writes;
+    std::deque<SocketTask::Outgoing> outgoing;
+    std::deque<Address> receivers, pongs;
+    {
+        std::lock_guard lock(socket->mutex);
+        if (socket->done) { b->release(error); return; }
+        socket->done = true;
+        reads.swap(socket->reads);
+        writes.swap(socket->writes);
+        outgoing.swap(socket->outgoing);
+        receivers.swap(socket->receivers);
+        pongs.swap(socket->pong_handlers);
+    }
+    socket->cv.notify_all();
+    std::shared_ptr<Channel> channel;
+    { std::lock_guard lock(state->transfer->mutex); channel = state->transfer->channel; }
+    if (channel) channel->close();
+    // Queued operations: the error, or (no error) the end of the stream / not connected.
+    const auto operation_error = [&] { return error ? b->retain(error) : posix_error(57, "Socket is not connected"); };
+    for (const auto& read : reads) {
+        const auto value = error ? b->retain(error) : 0;
+        complete_block(session, read.block, [this, value](Address block) { static_cast<void>(b->invoke_block(block, {0, 1, value})); }, {value});
+    }
+    for (const auto& write : writes) {
+        const auto value = operation_error();
+        complete_block(session, write.block, [this, value](Address block) { static_cast<void>(b->invoke_block(block, {value})); }, {value});
+    }
+    for (const auto& message : outgoing) {
+        const auto value = operation_error();
+        complete_block(session, message.block, [this, value](Address block) { static_cast<void>(b->invoke_block(block, {value})); }, {value});
+    }
+    for (const auto handler : receivers) {
+        const auto value = operation_error();
+        complete_block(session, handler, [this, value](Address block) { static_cast<void>(b->invoke_block(block, {0, value})); }, {value});
+    }
+    for (const auto handler : pongs) {
+        const auto value = operation_error();
+        complete_block(session, handler, [this, value](Address block) { static_cast<void>(b->invoke_block(block, {value})); }, {value});
+    }
+    finish(session, state->session, task, state, error, {}, {});
+}
+
+std::shared_ptr<Channel> Loading::open_channel(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session,
+                                               const std::string& host, std::uint16_t port, bool tls) {
+    auto channel = std::make_shared<Channel>(b);
+    {
+        std::lock_guard lock(state->transfer->mutex);
+        if (state->transfer->cancelled) { end_socket_task(task, state, session, task_error(state, url_error::cancelled, "cancelled")); return nullptr; }
+        state->transfer->channel = channel;
+    }
+    const auto code = channel->connect(host, port);
+    if (code != 0) {
+        bool cancelled;
+        { std::lock_guard lock(state->transfer->mutex); cancelled = state->transfer->cancelled; }
+        end_socket_task(task, state, session, cancelled ? task_error(state, url_error::cancelled, "cancelled")
+                                                        : task_error(state, code == 65 || code == 8 ? url_error::cannot_find_host : url_error::cannot_connect,
+                                                                     "Could not connect to the server.", 0, posix_error(code, "connect failed")));
+        return nullptr;
+    }
+    if (tls && !secure_channel(task, state, session, channel, host, port)) return nullptr;
+    return channel;
+}
+
+bool Loading::secure_channel(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session,
+                             const std::shared_ptr<Channel>& channel, const std::string& host, std::uint16_t port) {
+    std::string failure;
+    if (!channel->start_tls(host, failure)) {
+        end_socket_task(task, state, session, task_error(state, url_error::secure_connection_failed, "An SSL error has occurred: " + failure));
+        return false;
+    }
+    UrlParts url;
+    url.scheme = "https";
+    url.has_authority = true;
+    url.host = host;
+    url.port = port;
+    const auto chain = channel->peer_certificates();
+    std::optional<TrustOutcome> rejected;
+    if (chain.empty() || !server_trust(session, state->session, task, url, chain, state->transfer, rejected)) {
+        const auto trust = chain.empty() ? 0 : sec->make_trust(chain, {{TrustPolicy::Kind::ssl, true, host, 0}});
+        const auto underlying = rejected ? b->os_status_error(rejected->status, rejected->description) : 0;
+        end_socket_task(task, state, session, task_error(state, url_error::certificate_untrusted,
+                                                          "The certificate for this server is invalid.", trust, underlying));
+        b->release_all({trust, underlying});
+        return false;
+    }
+    return true;
+}
+
+void Loading::run_stream(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session) {
+    const auto socket = state->socket;
+    std::string host;
+    std::uint16_t port;
+    bool secure_first;
+    { std::lock_guard lock(socket->mutex); host = socket->host; port = socket->port; secure_first = socket->secure_first; }
+    const auto channel = open_channel(task, state, session, host, port, secure_first);
+    if (!channel) return;
+    { std::lock_guard lock(socket->mutex); socket->open = true; }
+    socket->cv.notify_all();
+    b->retain(task);
+    b->dispatch_async(b->call(security::libsystem_library, "_dispatch_get_global_queue", {0, 0}), [this, task, state, session] {
+        stream_writer(task, state, session);
+        b->release(task);
+    });
+    // The reader: queued reads in order.
+    const auto delegate = delegate_of(session);
+    bool told_closed = false;
+    for (;;) {
+        SocketTask::Read read;
+        {
+            std::unique_lock lock(socket->mutex);
+            if (!wait(lock, socket->cv, [&] { return socket->done || (!socket->reads.empty() && !socket->securing); }, state->transfer)) {
+                lock.unlock();
+                end_socket_task(task, state, session, task_error(state, url_error::cancelled, "cancelled"));
+                return;
+            }
+            if (socket->done) return;
+            read = socket->reads.front();
+            socket->reads.pop_front();
+            socket->reading = true;
+        }
+        Bytes data;
+        Address error{};
+        bool at_end = false, fatal = false;
+        {
+            std::lock_guard lock(socket->mutex);
+            const auto take = std::min<std::size_t>(socket->unread.size(), read.maximum);
+            data.assign(socket->unread.begin(), socket->unread.begin() + static_cast<std::ptrdiff_t>(take));
+            socket->unread.erase(socket->unread.begin(), socket->unread.begin() + static_cast<std::ptrdiff_t>(take));
+            at_end = socket->eof || socket->read_closed;
+        }
+        std::vector<std::uint8_t> buffer(64 * 1024);
+        while (!at_end && (data.size() < std::max<std::uint64_t>(read.minimum, 1)) && data.size() < read.maximum) {
+            const auto got = channel->read(buffer.data(), buffer.size(), read.timeout);
+            if (got == -2) { error = task_error(state, url_error::timed_out, "The request timed out."); break; }
+            if (got < 0) {
+                bool cancelled;
+                { std::lock_guard lock(state->transfer->mutex); cancelled = state->transfer->cancelled; }
+                error = cancelled ? task_error(state, url_error::cancelled, "cancelled")
+                                  : task_error(state, url_error::connection_lost, "The network connection was lost.");
+                at_end = fatal = true;
+                break;
+            }
+            if (got == 0) { at_end = true; break; }
+            const auto room = static_cast<std::size_t>(read.maximum - data.size());
+            const auto keep = std::min<std::size_t>(room, static_cast<std::size_t>(got));
+            data.insert(data.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(keep));
+            if (keep < static_cast<std::size_t>(got)) {
+                std::lock_guard lock(socket->mutex);
+                socket->unread.insert(socket->unread.end(), buffer.begin() + static_cast<std::ptrdiff_t>(keep), buffer.begin() + got);
+            }
+        }
+        bool closed_both;
+        {
+            std::lock_guard lock(socket->mutex);
+            socket->reading = false;
+            if (at_end && !error) socket->eof = true;
+            closed_both = socket->eof && socket->write_closed && socket->writes.empty();
+        }
+        socket->cv.notify_all();
+        const auto data_object = data.empty() ? 0 : b->data(data);
+        const bool end = at_end && data.empty();
+        const auto task_failure = fatal ? b->retain(error) : 0;   // before the delivery releases `error`
+        complete_block(session, read.block, [this, data_object, end, error](Address block) {
+            static_cast<void>(b->invoke_block(block, {data_object, Address{end ? 1u : 0u}, error}));
+        }, {data_object, error});
+        if (at_end && !told_closed && !error) {
+            told_closed = true;
+            if (responds(delegate, "URLSession:readClosedForStreamTask:")) {
+                const auto session_object = state->session;
+                b->retain(task);
+                deliver(session, [this, delegate, session_object, task] {
+                    CallRegs registers;
+                    registers.x[2] = session_object; registers.x[3] = task;
+                    static_cast<void>(b->objc.send(delegate, "URLSession:readClosedForStreamTask:", registers));
+                    b->release(task);
+                });
+            }
+        }
+        if (task_failure) { end_socket_task(task, state, session, task_failure); return; }
+        if (closed_both) { end_socket_task(task, state, session, 0); return; }
+    }
+}
+
+void Loading::stream_writer(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session) {
+    const auto socket = state->socket;
+    std::shared_ptr<Channel> channel;
+    { std::lock_guard lock(state->transfer->mutex); channel = state->transfer->channel; }
+    const auto delegate = delegate_of(session);
+    for (;;) {
+        SocketTask::Write write;
+        {
+            std::unique_lock lock(socket->mutex);
+            if (!wait(lock, socket->cv, [&] { return socket->done || !socket->writes.empty(); }, state->transfer)) return;   // the reader ends it
+            if (socket->done) return;
+            write = std::move(socket->writes.front());
+            socket->writes.pop_front();
+        }
+        using Kind = SocketTask::Write::Kind;
+        if (write.kind == Kind::secure) {
+            // After the reads queued before it: no read may run during the handshake.
+            {
+                std::unique_lock lock(socket->mutex);
+                socket->securing = true;
+                if (!wait(lock, socket->cv, [&] { return socket->done || (socket->reads.empty() && !socket->reading); }, state->transfer)) return;
+                if (socket->done) return;
+            }
+            std::string host;
+            std::uint16_t port;
+            { std::lock_guard lock(socket->mutex); host = socket->host; port = socket->port; }
+            if (!secure_channel(task, state, session, channel, host, port)) return;
+            { std::lock_guard lock(socket->mutex); socket->securing = false; }
+            socket->cv.notify_all();
+            continue;
+        }
+        if (write.kind == Kind::close_write) {
+            channel->shutdown_write();
+            bool closed_both;
+            {
+                std::lock_guard lock(socket->mutex);
+                socket->write_closed = true;
+                closed_both = socket->eof && socket->writes.empty();
+            }
+            socket->cv.notify_all();
+            if (responds(delegate, "URLSession:writeClosedForStreamTask:")) {
+                const auto session_object = state->session;
+                b->retain(task);
+                deliver(session, [this, delegate, session_object, task] {
+                    CallRegs registers;
+                    registers.x[2] = session_object; registers.x[3] = task;
+                    static_cast<void>(b->objc.send(delegate, "URLSession:writeClosedForStreamTask:", registers));
+                    b->release(task);
+                });
+            }
+            if (closed_both) { end_socket_task(task, state, session, 0); return; }
+            continue;
+        }
+        const bool sent = channel->write(write.data.data(), write.data.size());
+        if (sent) state->sent += static_cast<std::int64_t>(write.data.size());
+        const auto error = sent ? 0 : task_error(state, url_error::connection_lost, "The network connection was lost.");
+        complete_block(session, write.block, [this, error](Address block) { static_cast<void>(b->invoke_block(block, {error})); }, {error});
+        if (!sent) { channel->close(); return; }   // the reader sees the closed channel and ends the task
+    }
+}
+
+void Loading::run_web_socket(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session) {
+    const auto socket = state->socket;
+    const auto session_object = state->session;
+    // The URL and the opening handshake request.
+    UrlParts url;
+    Headers headers;
+    double timeout;
+    {
+        const auto request = require<RequestState>(state->current, "NSURLRequest");
+        std::lock_guard lock(request->mutex);
+        const auto parts = request->url ? urls->parts(request->url) : std::nullopt;
+        if (!parts) { end_socket_task(task, state, session, task_error(state, url_error::bad_url, "unsupported URL")); return; }
+        url = *parts;
+        std::lock_guard session_lock(session->mutex);
+        headers = session->additional;
+        for (const auto& [name, value] : request->headers) set_header(headers, name, value, false);
+        timeout = request->timeout == 60 ? session->request_timeout : request->timeout;
+    }
+    const bool tls = url.scheme == "wss" || url.scheme == "https";
+    if (!tls && url.scheme != "ws" && url.scheme != "http") {
+        end_socket_task(task, state, session, task_error(state, url_error::unsupported_url, "unsupported URL"));
+        return;
+    }
+    const auto port = static_cast<std::uint16_t>(url.port.value_or(tls ? 443 : 80));
+    const auto host = url.host_name();
+    const auto channel = open_channel(task, state, session, host, port, tls);
+    if (!channel) return;
+
+    std::array<std::byte, 16> nonce{};
+    if (!host::crypto::random(nonce)) {
+        end_socket_task(task, state, session, task_error(state, url_error::unknown, "no random numbers for the WebSocket key"));
+        return;
+    }
+    const auto key = security::base64_encode(std::span(reinterpret_cast<const std::uint8_t*>(nonce.data()), nonce.size()));
+    std::string handshake = "GET " + url.path_and_query() + " HTTP/1.1\r\nHost: " + url.host +
+        (url.port ? ":" + std::to_string(*url.port) : std::string{}) +
+        "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n";
+    std::vector<std::string> protocols;
+    { std::lock_guard lock(socket->mutex); protocols = socket->protocols; }
+    if (!protocols.empty()) {
+        std::string list;
+        for (const auto& name : protocols) list += (list.empty() ? "" : ", ") + name;
+        handshake += "Sec-WebSocket-Protocol: " + list + "\r\n";
+    }
+    for (const auto& [name, value] : headers) {
+        if (security::iequals(name, "Host") || security::iequals(name, "Upgrade") || security::iequals(name, "Connection") ||
+            security::iequals(name, "Sec-WebSocket-Key") || security::iequals(name, "Sec-WebSocket-Version")) continue;
+        handshake += name + ": " + value + "\r\n";
+    }
+    handshake += "\r\n";
+    if (!channel->write(reinterpret_cast<const std::uint8_t*>(handshake.data()), handshake.size())) {
+        end_socket_task(task, state, session, task_error(state, url_error::connection_lost, "The network connection was lost."));
+        return;
+    }
+    // The response head.
+    std::string head_text;
+    std::vector<std::uint8_t> buffer(16 * 1024);
+    websocket::Decoder decoder;
+    for (;;) {
+        const auto end = head_text.find("\r\n\r\n");
+        if (end != std::string::npos) {
+            const auto rest = head_text.substr(end + 4);
+            decoder.feed(reinterpret_cast<const std::uint8_t*>(rest.data()), rest.size());
+            head_text.resize(end);
+            break;
+        }
+        if (head_text.size() > 64 * 1024) {
+            end_socket_task(task, state, session, task_error(state, url_error::bad_server_response, "The WebSocket handshake response is too large."));
+            return;
+        }
+        const auto got = channel->read(buffer.data(), buffer.size(), timeout);
+        if (got <= 0) {
+            bool cancelled;
+            { std::lock_guard lock(state->transfer->mutex); cancelled = state->transfer->cancelled; }
+            end_socket_task(task, state, session, cancelled ? task_error(state, url_error::cancelled, "cancelled")
+                : got == -2 ? task_error(state, url_error::timed_out, "The request timed out.")
+                            : task_error(state, url_error::bad_server_response, "The server closed the connection during the WebSocket handshake."));
+            return;
+        }
+        head_text.append(reinterpret_cast<const char*>(buffer.data()), static_cast<std::size_t>(got));
+    }
+    HttpResponseHead head;
+    {
+        std::size_t at = 0;
+        const auto line_end = head_text.find("\r\n");
+        const auto status_line = head_text.substr(0, line_end);
+        head.version = status_line.substr(0, status_line.find(' '));
+        const auto space = status_line.find(' ');
+        if (space != std::string::npos) {
+            int status{};
+            const auto text = status_line.substr(space + 1, 3);
+            static_cast<void>(std::from_chars(text.data(), text.data() + text.size(), status));
+            head.status = status;
+        }
+        at = line_end == std::string::npos ? head_text.size() : line_end + 2;
+        while (at < head_text.size()) {
+            auto next = head_text.find("\r\n", at);
+            if (next == std::string::npos) next = head_text.size();
+            const auto line = head_text.substr(at, next - at);
+            if (const auto colon = line.find(':'); colon != std::string::npos) {
+                auto value = line.substr(colon + 1);
+                while (!value.empty() && value.front() == ' ') value.erase(value.begin());
+                head.headers.emplace_back(line.substr(0, colon), value);
+            }
+            at = next + 2;
+        }
+    }
+    {
+        const auto response = make_response(b->objc.find_host_state<RequestState>(state->current)->url, &head, "", -1, "");
+        std::lock_guard lock(state->mutex);
+        b->release(std::exchange(state->response, response));
+    }
+    const auto upgrade = header_value(head.headers, "Upgrade"), connection = header_value(head.headers, "Connection"),
+               accept = header_value(head.headers, "Sec-WebSocket-Accept");
+    const auto lower = [](std::string text) { for (auto& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return text; };
+    if (head.status != 101 || !upgrade || lower(*upgrade) != "websocket" || !connection || lower(*connection).find("upgrade") == std::string::npos ||
+        !accept || *accept != websocket::accept_for(key)) {
+        end_socket_task(task, state, session, task_error(state, url_error::bad_server_response, "There was a bad response from the server."));
+        return;
+    }
+    std::string chosen;
+    if (const auto protocol = header_value(head.headers, "Sec-WebSocket-Protocol")) chosen = *protocol;
+    {
+        std::lock_guard lock(socket->mutex);
+        socket->open = true;
+        socket->chosen = chosen;
+    }
+    socket->cv.notify_all();
+    const auto delegate = delegate_of(session);
+    if (responds(delegate, "URLSession:webSocketTask:didOpenWithProtocol:")) {
+        b->retain(task);
+        deliver(session, [this, delegate, session_object, task, chosen] {
+            const auto protocol = chosen.empty() ? 0 : b->string(chosen);
+            CallRegs registers;
+            registers.x[2] = session_object; registers.x[3] = task; registers.x[4] = protocol;
+            static_cast<void>(b->objc.send(delegate, "URLSession:webSocketTask:didOpenWithProtocol:", registers));
+            b->release_all({protocol, task});
+        });
+    }
+    b->retain(task);
+    b->dispatch_async(b->call(security::libsystem_library, "_dispatch_get_global_queue", {0, 0}), [this, task, state, session] {
+        web_socket_writer(task, state, session);
+        b->release(task);
+    });
+
+    // The reader: frames into messages, control frames answered.
+    const auto deliver_messages = [&] {
+        for (;;) {
+            Address handler{};
+            std::pair<bool, Bytes> message;
+            {
+                std::lock_guard lock(socket->mutex);
+                if (socket->receivers.empty() || socket->messages.empty()) return;
+                handler = socket->receivers.front();
+                socket->receivers.pop_front();
+                message = std::move(socket->messages.front());
+                socket->messages.pop_front();
+            }
+            auto value = std::make_shared<MessageState>();
+            value->type = message.first ? 1 : 0;
+            value->value = message.first ? b->string(std::string(message.second.begin(), message.second.end())) : b->data(message.second);
+            const auto object = b->objc.allocate(web_socket_message_class);
+            static_cast<void>(b->objc.host_state<MessageState>(object, [&] { return value; }));
+            complete_block(session, handler, [this, object](Address block) { static_cast<void>(b->invoke_block(block, {object, 0})); }, {object});
+        }
+    };
+    const auto send_close = [&](std::uint16_t code, std::string_view reason) {
+        {
+            std::lock_guard lock(socket->mutex);
+            if (socket->close_sent) return;
+            socket->close_sent = true;
+            socket->outgoing.push_back({websocket::Opcode::close, websocket::close_payload(code, reason), 0, false});
+        }
+        socket->cv.notify_all();
+    };
+    std::optional<websocket::Opcode> partial_kind;
+    Bytes partial;
+    std::uint64_t maximum;
+    { std::lock_guard lock(socket->mutex); maximum = socket->maximum_message; }
+    for (;;) {
+        std::optional<websocket::Frame> frame;
+        try {
+            frame = decoder.next(maximum);
+        } catch (const websocket::ProtocolError& failure) {
+            send_close(failure.code, failure.what());
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));   // let the close frame go out
+            end_socket_task(task, state, session, posix_error(failure.code == 1009 ? 40 : 100, failure.what()));   // EMSGSIZE / EPROTO
+            return;
+        }
+        if (!frame) {
+            const auto got = channel->read(buffer.data(), buffer.size(), 0);
+            if (got <= 0) {
+                bool cancelled, clean;
+                { std::lock_guard lock(state->transfer->mutex); cancelled = state->transfer->cancelled; }
+                { std::lock_guard lock(socket->mutex); clean = socket->close_sent && socket->close_received; }
+                if (clean) { end_socket_task(task, state, session, 0); return; }
+                end_socket_task(task, state, session, cancelled ? task_error(state, url_error::cancelled, "cancelled")
+                                                                : posix_error(57, "Socket is not connected"));
+                return;
+            }
+            decoder.feed(buffer.data(), static_cast<std::size_t>(got));
+            continue;
+        }
+        using Opcode = websocket::Opcode;
+        switch (frame->opcode) {
+        case Opcode::text:
+        case Opcode::binary:
+        case Opcode::continuation: {
+            if (frame->opcode != Opcode::continuation) {
+                if (partial_kind) { send_close(1002, "an unfinished fragmented message"); break; }
+                partial_kind = frame->opcode;
+                partial.clear();
+            } else if (!partial_kind) {
+                send_close(1002, "a continuation without a message");
+                break;
+            }
+            partial.insert(partial.end(), frame->payload.begin(), frame->payload.end());
+            if (partial.size() > maximum) {
+                send_close(1009, "message too big");
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                end_socket_task(task, state, session, posix_error(40, "Message too long"));
+                return;
+            }
+            if (frame->fin) {
+                state->received += static_cast<std::int64_t>(partial.size());
+                {
+                    std::lock_guard lock(socket->mutex);
+                    socket->messages.emplace_back(*partial_kind == Opcode::text, std::move(partial));
+                }
+                partial_kind.reset();
+                partial.clear();
+                deliver_messages();
+            }
+            break;
+        }
+        case Opcode::ping: {
+            {
+                std::lock_guard lock(socket->mutex);
+                if (!socket->close_sent) socket->outgoing.push_front({Opcode::pong, frame->payload, 0, false});
+            }
+            socket->cv.notify_all();
+            break;
+        }
+        case Opcode::pong: {
+            Address handler{};
+            {
+                std::lock_guard lock(socket->mutex);
+                if (!socket->pong_handlers.empty()) { handler = socket->pong_handlers.front(); socket->pong_handlers.pop_front(); }
+            }
+            complete_block(session, handler, [this](Address block) { static_cast<void>(b->invoke_block(block, {0})); });
+            break;
+        }
+        case Opcode::close: {
+            std::uint16_t code = 1005;   // no status received
+            Bytes reason;
+            if (frame->payload.size() >= 2) {
+                code = static_cast<std::uint16_t>((frame->payload[0] << 8) | frame->payload[1]);
+                reason.assign(frame->payload.begin() + 2, frame->payload.end());
+            }
+            bool initiated_here;
+            {
+                std::lock_guard lock(socket->mutex);
+                socket->close_received = true;
+                initiated_here = socket->close_sent;
+                if (!initiated_here) { socket->close_code = code; socket->close_reason = reason; }
+            }
+            if (!initiated_here) send_close(code == 1005 ? 1000 : code, {});
+            if (responds(delegate, "URLSession:webSocketTask:didCloseWithCode:reason:")) {
+                b->retain(task);
+                deliver(session, [this, delegate, session_object, task, code, reason] {
+                    const auto reason_object = reason.empty() ? 0 : b->data(reason);
+                    CallRegs registers;
+                    registers.x[2] = session_object; registers.x[3] = task; registers.x[4] = code; registers.x[5] = reason_object;
+                    static_cast<void>(b->objc.send(delegate, "URLSession:webSocketTask:didCloseWithCode:reason:", registers));
+                    b->release_all({reason_object, task});
+                });
+            }
+            // The writer sends our close; then the connection ends.
+            {
+                std::unique_lock lock(socket->mutex);
+                static_cast<void>(wait(lock, socket->cv, [&] { return socket->done || socket->outgoing.empty(); }, nullptr));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            end_socket_task(task, state, session, 0);
+            return;
+        }
+        }
+    }
+}
+
+void Loading::web_socket_writer(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session) {
+    const auto socket = state->socket;
+    std::shared_ptr<Channel> channel;
+    { std::lock_guard lock(state->transfer->mutex); channel = state->transfer->channel; }
+    for (;;) {
+        SocketTask::Outgoing message;
+        {
+            std::unique_lock lock(socket->mutex);
+            if (!wait(lock, socket->cv, [&] { return socket->done || !socket->outgoing.empty(); }, state->transfer)) return;
+            if (socket->done) return;
+            message = std::move(socket->outgoing.front());
+            socket->outgoing.pop_front();
+            if (message.ping) socket->pong_handlers.push_back(std::exchange(message.block, 0));
+        }
+        socket->cv.notify_all();
+        std::array<std::uint8_t, 4> mask{};
+        static_cast<void>(host::crypto::random(std::as_writable_bytes(std::span(mask))));
+        websocket::Frame frame;
+        frame.opcode = message.opcode;
+        frame.payload = std::move(message.payload);
+        const auto bytes = websocket::encode(frame, mask);
+        const bool sent = channel->write(bytes.data(), bytes.size());
+        if (sent && (message.opcode == websocket::Opcode::text || message.opcode == websocket::Opcode::binary))
+            state->sent += static_cast<std::int64_t>(frame.payload.size());
+        const auto error = sent ? 0 : posix_error(57, "Socket is not connected");
+        complete_block(session, message.block, [this, error](Address block) { static_cast<void>(b->invoke_block(block, {error})); }, {error});
+        socket->cv.notify_all();
+        if (!sent) { channel->close(); return; }
+    }
+}
+
+// Loads the task's current request with `protocol_class`. True when the protocol redirected the task (state->current is
+// the new request, for the caller to load); false when the task has completed.
+bool Loading::run_protocol(Address task, const std::shared_ptr<TaskState>& state, const std::shared_ptr<SessionState>& session,
+                           Address protocol_class) {
+    const auto session_object = state->session;
+    const auto transfer = state->transfer;
+    const auto fail_task = [&](std::int64_t code, const std::string& description) {
+        finish(session, session_object, task, state, task_error(state, code, description), {}, {});
+        return false;
+    };
+    struct Holder { Bridge& b; Address& object; ~Holder() { b.release(object); } };
+    Address current;
+    { std::lock_guard lock(state->mutex); current = b->retain(state->current); }
+    Holder hold_current{*b, current};
+    CallRegs canonical;
+    canonical.x[2] = current;
+    Address request = b->retain(b->objc.send(protocol_class, "canonicalRequestForRequest:", canonical).x0);
+    if (!request) request = b->retain(current);
+    Holder hold_request{*b, request};
+    // The cached response the protocol may use (as the cache policy allows).
+    const auto [cache, configured_policy] = cache_for(session);
+    const auto source = require<RequestState>(request, "NSURLRequest");
+    std::uint64_t policy;
+    std::string method;
+    { std::lock_guard lock(source->mutex); policy = source->cache_policy ? source->cache_policy : configured_policy; method = source->method; }
+    Address cached{};
+    Holder hold_cached{*b, cached};
+    if (cache && policy != 1 && policy != 4) {
+        CallRegs registers;
+        registers.x[2] = request;
+        cached = b->retain(b->objc.send(cache, "cachedResponseForRequest:", registers).x0);
+    }
+
+    // The client and the protocol.
+    auto feed = std::make_shared<ProtocolFeed>();
+    feed->run_loop = b->call(core_foundation_library, "_CFRunLoopGetCurrent", {});
+    const auto client = b->objc.allocate(protocol_client_class);
+    static_cast<void>(b->objc.host_state<ClientState>(client, [&] { auto value = std::make_shared<ClientState>(); value->feed = feed; return value; }));
+    CallRegs init;
+    init.x[2] = request; init.x[3] = cached; init.x[4] = client;
+    Address protocol = b->objc.send(b->objc.send(protocol_class, "alloc").x0, "initWithRequest:cachedResponse:client:", init).x0;
+    b->release(client);   // the protocol holds it
+    Holder hold_protocol{*b, protocol};
+    // Over: later client calls are dropped, queued ones released.
+    struct Close {
+        Bridge& b;
+        std::shared_ptr<ProtocolFeed> feed;
+        ~Close() {
+            std::deque<ProtocolFeed::Event> left;
+            { std::lock_guard lock(feed->mutex); feed->closed = true; left.swap(feed->events); }
+            for (auto& event : left) b.release_all({event.object, event.extra});
+        }
+    } close{*b, feed};
+    if (!protocol) return fail_task(url_error::unknown, "the NSURLProtocol did not initialize");
+    if (const auto value = b->objc.find_host_state<ProtocolState>(protocol)) value->task = task;
+    static_cast<void>(b->objc.send(protocol, "startLoading"));
+    bool stopped = false;
+    const auto stop = [&] { if (!stopped) { stopped = true; static_cast<void>(b->objc.send(protocol, "stopLoading")); } };
+
+    auto event = next_event(feed, transfer);
+    if (!event) { stop(); return fail_task(url_error::cancelled, "cancelled"); }
+    using Kind = ProtocolFeed::Event::Kind;
+    switch (event->kind) {
+    case Kind::failed:
+        stop();
+        finish(session, session_object, task, state, event->object, {}, {});   // the protocol's error, moved in
+        b->release(event->extra);
+        return false;
+    case Kind::finished:
+    case Kind::data:
+        stop();
+        return fail_task(url_error::bad_server_response, "the NSURLProtocol finished or sent data before a response");
+    case Kind::redirected: {
+        // As an HTTP redirect: the delegate may change or refuse the new request.
+        stop();
+        const auto new_request = event->object, redirect_response = event->extra;   // +1
+        Address follow = new_request;
+        const auto delegate = delegate_of(session);
+        if (!state->completion && responds(delegate, "URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:")) {
+            auto decision = std::make_shared<Decision>();
+            const auto block = decision_block(decision, Handler::object);
+            b->retain(redirect_response);
+            deliver(session, [this, delegate, session_object, task, redirect_response, new_request, block] {
+                CallRegs registers;
+                registers.x[2] = session_object; registers.x[3] = task; registers.x[4] = redirect_response;
+                registers.x[5] = new_request; registers.x[6] = block;
+                static_cast<void>(b->objc.send(delegate, "URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:", registers));
+                b->release(redirect_response);
+            });
+            if (!await(decision, transfer)) { b->release_all({new_request, redirect_response}); return fail_task(url_error::cancelled, "cancelled"); }
+            b->release(new_request);
+            follow = decision->object;   // +1 or 0
+        }
+        if (!follow) {
+            // Refused: the redirect response is the response (without a body).
+            respond(task, state, session, redirect_response, 0, [](std::uint8_t*, std::size_t, Address&) { return std::size_t{0}; }, {});
+            return false;
+        }
+        b->release(redirect_response);
+        { std::lock_guard lock(state->mutex); b->release(std::exchange(state->current, follow)); }
+        return true;
+    }
+    case Kind::cached: {
+        // URLProtocol:cachedResponseIsValid: the cached response and its data.
+        stop();
+        const auto value = event->object;   // +1 NSCachedURLResponse
+        const auto response = b->retain(b->objc.send(value, "response").x0);
+        const auto body = b->bytes(b->objc.send(value, "data").x0);
+        b->release(value);
+        std::size_t served = 0;
+        respond(task, state, session, response, static_cast<std::int64_t>(body.size()), [&](std::uint8_t* out, std::size_t size, Address&) {
+            const auto count = std::min(size, body.size() - served);
+            std::copy_n(body.begin() + static_cast<std::ptrdiff_t>(served), count, out);
+            served += count;
+            return count;
+        }, {});
+        return false;
+    }
+    case Kind::response:
+        break;
+    }
+
+    // The response, then data until the protocol finishes or fails.
+    const auto response = event->object;   // +1, handed to respond()
+    const auto storage_policy = event->policy;
+    std::int64_t expected = -1;
+    if (const auto value = b->objc.find_host_state<ResponseState>(response)) expected = value->expected;
+    Bytes chunk;
+    std::size_t offset = 0;
+    bool ended = false;
+    const Reader read = [&](std::uint8_t* out, std::size_t size, Address& error) -> std::size_t {
+        while (offset >= chunk.size()) {
+            if (ended) return 0;
+            auto next = next_event(feed, transfer);
+            if (!next) { error = task_error(state, url_error::cancelled, "cancelled"); ended = true; return 0; }
+            switch (next->kind) {
+            case Kind::data: chunk = std::move(next->data); offset = 0; break;
+            case Kind::finished: ended = true; break;
+            case Kind::failed: error = next->object; b->release(next->extra); ended = true; return 0;
+            default: b->release_all({next->object, next->extra}); break;   // a second response or a late redirect: ignored, as Foundation
+            }
+        }
+        const auto count = std::min(size, chunk.size() - offset);
+        std::copy_n(chunk.begin() + static_cast<std::ptrdiff_t>(offset), count, out);
+        offset += count;
+        return count;
+    };
+    const bool store = cache && storage_policy != 2 && method == "GET" && state->kind == TaskKind::data;   // NSURLCacheStorageNotAllowed
+    const Address cache_object = cache;
+    std::function<void(const Bytes&)> keep;
+    if (store)
+        keep = [&, cache_object](const Bytes& data) {
+            store_in_cache(session, session_object, task, state, cache_object, request, response, data, storage_policy);
+        };
+    respond(task, state, session, response, expected, read, keep);
+    stop();
+    return false;
 }
 
 } // namespace
@@ -1386,6 +2546,11 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
     self->credential_class = define("NSURLCredential", object);
     self->cookie_storage_class = define("NSHTTPCookieStorage", object);
     self->credential_storage_class = define("NSURLCredentialStorage", object);
+    self->protocol_class = define("NSURLProtocol", object);
+    self->stream_task_class = define("NSURLSessionStreamTask", self->task_class);
+    self->web_socket_task_class = define("NSURLSessionWebSocketTask", self->task_class);
+    self->web_socket_message_class = define("NSURLSessionWebSocketMessage", object);
+    self->protocol_client_class = define("AlchemyURLProtocolClient", object);
 
     // Constants.
     const std::pair<const char*, const char*> strings[] = {
@@ -1432,6 +2597,10 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
             self->b->release(std::exchange(state->url, 0));
             self->b->release(std::exchange(state->main_document, 0));
             self->b->release(std::exchange(state->body_stream, 0));
+            std::vector<Address> values;
+            for (auto& [key, value] : state->properties) values.push_back(value);
+            state->properties.clear();
+            self->b->release_all(values);
         }
         static_cast<void>(self->b->objc.send_super(s.x[0], rq, self->b->objc.selector("dealloc")));
     }, false, "v@:");
@@ -1725,7 +2894,6 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
             s.x[0] = found == state->properties.objects.end() ? 0 : found->second;
         });
         b.method(cfg, setter_name(name), [self, configuration, key](CpuState& s, GuestMemory&) {
-            if (key == "protocolClasses" && s.x[2] && self->b->cf.length(s.x[2]) > 0) security::unsupported("custom NSURLProtocol classes");
             const auto state = configuration(s.x[0]);
             const auto value = s.x[2] ? self->b->retain(s.x[2]) : 0;
             std::lock_guard lock(state->properties.mutex);
@@ -1889,14 +3057,18 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
     const auto cancel_task = [self](Address task) {
         const auto state = self->require<TaskState>(task, "NSURLSessionTask");
         std::shared_ptr<HttpExchange> exchange;
+        std::shared_ptr<Channel> channel;
         bool started;
         {
             std::lock_guard lock(state->transfer->mutex);
             if (state->transfer->cancelled) return;
             state->transfer->cancelled = true;
             exchange = state->transfer->exchange;
+            channel = state->transfer->channel;
         }
         state->transfer->cv.notify_all();
+        if (state->socket) state->socket->cv.notify_all();
+        if (channel) channel->close();
         { std::lock_guard lock(state->mutex); started = state->started; }
         if (state->status.load() == static_cast<std::int64_t>(TaskStatus::completed)) return;
         state->status = static_cast<std::int64_t>(TaskStatus::canceling);
@@ -1910,11 +3082,8 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
                 if (!session->tasks.insert(task).second) return;
             }
             self->b->retain(task);
-            Address url;
-            { std::lock_guard lock(state->mutex); url = self->b->retain(self->require<RequestState>(state->current, "NSURLRequest")->url); }
-            const auto error = self->url_error(url_error::cancelled, "cancelled", url);
-            self->b->release(url);
-            self->finish(session, state->session, task, state, error, {}, {});
+            if (state->socket) { std::lock_guard lock(state->socket->mutex); state->socket->done = true; }
+            self->finish(session, state->session, task, state, self->task_error(state, url_error::cancelled, "cancelled"), {}, {});
         }
     };
     b.method(ss, "invalidateAndCancel", [self, session, cancel_task](CpuState& s, GuestMemory&) {
@@ -2158,6 +3327,384 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
     b.method(cr, "identity", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     b.method(cr, "certificates", [self](CpuState& s, GuestMemory&) { s.x[0] = self->b->autorelease(self->b->array({})); });
     b.method(cr, "copyWithZone:", [self](CpuState& s, GuestMemory&) { s.x[0] = self->b->retain(s.x[0]); }, false, "@@:^v");
+
+    // ---- stream and WebSocket tasks -----------------------------------------------------------------------------
+    const auto socket_of = [self](Address task) {
+        const auto state = self->require<TaskState>(task, "NSURLSessionTask");
+        if (!state->socket) security::fail("not a stream or WebSocket task");
+        return state;
+    };
+    b.method(ss, "streamTaskWithHostName:port:", [self](CpuState& s, GuestMemory&) {
+        const auto host = s.x[2] ? self->b->maybe_text(s.x[2]) : std::nullopt;
+        if (!host || host->empty() || s.x[3] == 0 || s.x[3] > 65535) security::fail("NSInvalidArgumentException: streamTaskWithHostName:port: needs a host and a port");
+        const auto task = self->create_task(s.x[0], TaskKind::stream, 0, 0, std::nullopt);
+        const auto state = self->require<TaskState>(task, "NSURLSessionTask");
+        state->socket->host = *host;
+        state->socket->port = static_cast<std::uint16_t>(s.x[3]);
+        s.x[0] = self->b->autorelease(task);
+    }, false, "@@:@q");
+    b.method(ss, "streamTaskWithNetService:", [](CpuState&, GuestMemory&) { security::unsupported("NSURLSessionStreamTask to an NSNetService"); });
+    const auto web_socket_task = [self](Address session_object, Address request, Address protocols) {
+        const auto task = self->create_task(session_object, TaskKind::web_socket, request, 0, std::nullopt);
+        const auto state = self->require<TaskState>(task, "NSURLSessionTask");
+        if (protocols && self->b->is_array(protocols))
+            for (const auto item : self->b->cf.array_values(protocols))
+                if (const auto name = self->b->maybe_text(item)) state->socket->protocols.push_back(*name);
+        return self->b->autorelease(task);
+    };
+    b.method(ss, "webSocketTaskWithURL:", [self, web_socket_task](CpuState& s, GuestMemory&) {
+        const auto request = self->make_request(self->request_class, s.x[2], 0, 60);
+        s.x[0] = web_socket_task(s.x[0], request, 0);
+        self->b->release(request);
+    });
+    b.method(ss, "webSocketTaskWithURL:protocols:", [self, web_socket_task](CpuState& s, GuestMemory&) {
+        const auto request = self->make_request(self->request_class, s.x[2], 0, 60);
+        s.x[0] = web_socket_task(s.x[0], request, s.x[3]);
+        self->b->release(request);
+    }, false, "@@:@@");
+    b.method(ss, "webSocketTaskWithRequest:", [web_socket_task](CpuState& s, GuestMemory&) { s.x[0] = web_socket_task(s.x[0], s.x[2], 0); });
+
+    const auto st_class = self->stream_task_class, ws = self->web_socket_task_class;
+    b.method(st_class, "readDataOfMinLength:maxLength:timeout:completionHandler:", [self, socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        if (!s.x[4]) security::fail("NSInvalidArgumentException: readDataOfMinLength:maxLength:timeout:completionHandler: needs a handler");
+        if (s.x[3] == 0 || s.x[2] > s.x[3]) security::fail("NSInvalidArgumentException: readDataOfMinLength: over maxLength:");
+        SocketTask::Read read{s.x[2], s.x[3], d_arg(s, 0), self->b->block_copy(s.x[4])};
+        bool done;
+        { std::lock_guard lock(state->socket->mutex); done = state->socket->done; if (!done) state->socket->reads.push_back(read); }
+        state->socket->cv.notify_all();
+        if (done) {
+            const auto session = state->session_state.lock();
+            const auto error = self->posix_error(57, "Socket is not connected");
+            if (session) self->complete_block(session, read.block, [self, error](Address block) { static_cast<void>(self->b->invoke_block(block, {0, 1, error})); }, {error});
+        }
+    }, false, "v@:QQd@?");
+    b.method(st_class, "writeData:timeout:completionHandler:", [self, socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        if (!s.x[2] || !s.x[3]) security::fail("NSInvalidArgumentException: writeData:timeout:completionHandler: needs data and a handler");
+        SocketTask::Write write{SocketTask::Write::Kind::data, self->b->bytes(s.x[2]), d_arg(s, 0), self->b->block_copy(s.x[3])};
+        bool refused;
+        { std::lock_guard lock(state->socket->mutex); refused = state->socket->done || state->socket->write_closed; if (!refused) state->socket->writes.push_back(write); }
+        state->socket->cv.notify_all();
+        if (refused) {
+            const auto session = state->session_state.lock();
+            const auto error = self->posix_error(57, "Socket is not connected");
+            if (session) self->complete_block(session, write.block, [self, error](Address block) { static_cast<void>(self->b->invoke_block(block, {error})); }, {error});
+        }
+    }, false, "v@:@d@?");
+    b.method(st_class, "closeWrite", [socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        { std::lock_guard lock(state->socket->mutex); state->socket->writes.push_back({SocketTask::Write::Kind::close_write, {}, 0, 0}); }
+        state->socket->cv.notify_all();
+    }, false, "v@:");
+    b.method(st_class, "closeRead", [socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        { std::lock_guard lock(state->socket->mutex); state->socket->read_closed = true; }
+        state->socket->cv.notify_all();
+    }, false, "v@:");
+    b.method(st_class, "startSecureConnection", [socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        {
+            std::lock_guard lock(state->socket->mutex);
+            if (!state->socket->open && state->socket->writes.empty() && state->socket->reads.empty()) state->socket->secure_first = true;
+            else state->socket->writes.push_back({SocketTask::Write::Kind::secure, {}, 0, 0});
+        }
+        state->socket->cv.notify_all();
+    }, false, "v@:");
+    b.method(st_class, "stopSecureConnection", [](CpuState&, GuestMemory&) { security::unsupported("-[NSURLSessionStreamTask stopSecureConnection]"); }, false, "v@:");
+    b.method(st_class, "captureStreams", [](CpuState&, GuestMemory&) { security::unsupported("-[NSURLSessionStreamTask captureStreams]"); }, false, "v@:");
+
+    // WebSocket messages.
+    const auto wm = self->web_socket_message_class;
+    const auto message_state = [self](Address object) { return self->require<MessageState>(object, "NSURLSessionWebSocketMessage"); };
+    b.method(wm, "initWithData:", [self](CpuState& s, GuestMemory&) {
+        if (!s.x[2]) security::fail("NSInvalidArgumentException: -[NSURLSessionWebSocketMessage initWithData:] needs data");
+        auto state = std::make_shared<MessageState>();
+        state->type = 0;
+        state->value = self->b->objc.send(s.x[2], "copy").x0;
+        static_cast<void>(self->b->objc.host_state<MessageState>(s.x[0], [&] { return state; }));
+    });
+    b.method(wm, "initWithString:", [self](CpuState& s, GuestMemory&) {
+        if (!s.x[2]) security::fail("NSInvalidArgumentException: -[NSURLSessionWebSocketMessage initWithString:] needs a string");
+        auto state = std::make_shared<MessageState>();
+        state->type = 1;
+        state->value = self->b->objc.send(s.x[2], "copy").x0;
+        static_cast<void>(self->b->objc.host_state<MessageState>(s.x[0], [&] { return state; }));
+    });
+    b.method(wm, "type", [message_state](CpuState& s, GuestMemory&) { s.x[0] = message_state(s.x[0])->type; }, false, "q@:");
+    b.method(wm, "data", [message_state](CpuState& s, GuestMemory&) { const auto v = message_state(s.x[0]); s.x[0] = v->type == 0 ? v->value : 0; });
+    b.method(wm, "string", [message_state](CpuState& s, GuestMemory&) { const auto v = message_state(s.x[0]); s.x[0] = v->type == 1 ? v->value : 0; });
+    b.method(wm, "dealloc", [self, wm](CpuState& s, GuestMemory&) {
+        if (const auto state = self->b->objc.find_host_state<MessageState>(s.x[0])) self->b->release(std::exchange(state->value, 0));
+        static_cast<void>(self->b->objc.send_super(s.x[0], wm, self->b->objc.selector("dealloc")));
+    }, false, "v@:");
+
+    // WebSocket tasks.
+    const auto queue_outgoing = [self](const std::shared_ptr<TaskState>& state, SocketTask::Outgoing outgoing) {
+        bool refused;
+        {
+            std::lock_guard lock(state->socket->mutex);
+            refused = state->socket->done || state->socket->close_sent;
+            if (!refused) state->socket->outgoing.push_back(outgoing);
+        }
+        state->socket->cv.notify_all();
+        if (refused) {
+            const auto session = state->session_state.lock();
+            const auto error = self->posix_error(57, "Socket is not connected");
+            if (session) self->complete_block(session, outgoing.block, [self, error](Address block) { static_cast<void>(self->b->invoke_block(block, {error})); }, {error});
+        }
+    };
+    b.method(ws, "sendMessage:completionHandler:", [self, socket_of, message_state, queue_outgoing](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        const auto message = message_state(s.x[2]);
+        SocketTask::Outgoing outgoing;
+        if (message->type == 1) {
+            const auto text = self->b->text(message->value);
+            outgoing.opcode = websocket::Opcode::text;
+            outgoing.payload.assign(text.begin(), text.end());
+        } else {
+            outgoing.opcode = websocket::Opcode::binary;
+            outgoing.payload = self->b->bytes(message->value);
+        }
+        outgoing.block = s.x[3] ? self->b->block_copy(s.x[3]) : 0;
+        queue_outgoing(state, std::move(outgoing));
+    }, false, "v@:@@?");
+    b.method(ws, "sendPingWithPongReceiveHandler:", [self, socket_of, queue_outgoing](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        queue_outgoing(state, {websocket::Opcode::ping, {}, s.x[2] ? self->b->block_copy(s.x[2]) : 0, true});
+    }, false, "v@:@?");
+    b.method(ws, "receiveMessageWithCompletionHandler:", [self, socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        if (!s.x[2]) security::fail("NSInvalidArgumentException: receiveMessageWithCompletionHandler: needs a handler");
+        const auto handler = self->b->block_copy(s.x[2]);
+        Address message_handler{};
+        std::pair<bool, Bytes> message;
+        bool done;
+        {
+            std::lock_guard lock(state->socket->mutex);
+            done = state->socket->done;
+            if (!done) {
+                if (!state->socket->messages.empty()) {
+                    message = std::move(state->socket->messages.front());
+                    state->socket->messages.pop_front();
+                    message_handler = handler;
+                } else {
+                    state->socket->receivers.push_back(handler);
+                }
+            }
+        }
+        const auto session = state->session_state.lock();
+        if (!session) return;
+        if (done) {
+            const auto error = self->posix_error(57, "Socket is not connected");
+            self->complete_block(session, handler, [self, error](Address block) { static_cast<void>(self->b->invoke_block(block, {0, error})); }, {error});
+        } else if (message_handler) {
+            auto value = std::make_shared<MessageState>();
+            value->type = message.first ? 1 : 0;
+            value->value = message.first ? self->b->string(std::string(message.second.begin(), message.second.end())) : self->b->data(message.second);
+            const auto object = self->b->objc.allocate(self->web_socket_message_class);
+            static_cast<void>(self->b->objc.host_state<MessageState>(object, [&] { return value; }));
+            self->complete_block(session, message_handler, [self, object](Address block) { static_cast<void>(self->b->invoke_block(block, {object, 0})); }, {object});
+        }
+    }, false, "v@:@?");
+    b.method(ws, "cancelWithCloseCode:reason:", [self, socket_of, cancel_task](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        const auto code = static_cast<std::uint16_t>(s.x[2]);
+        const auto reason = s.x[3] ? self->b->bytes(s.x[3]) : Bytes{};
+        bool open;
+        {
+            std::lock_guard lock(state->socket->mutex);
+            open = state->socket->open && !state->socket->done && !state->socket->close_sent;
+            state->socket->close_code = code;
+            state->socket->close_reason = reason;
+            if (open) {
+                state->socket->close_sent = true;
+                state->socket->outgoing.push_back({websocket::Opcode::close,
+                    websocket::close_payload(code, std::string_view(reinterpret_cast<const char*>(reason.data()), reason.size())), 0, false});
+            }
+        }
+        state->socket->cv.notify_all();
+        if (!open) { cancel_task(s.x[0]); return; }
+        // The server's close ends the task; if it does not answer within 5 s, the connection is cut.
+        const auto task = self->b->retain(s.x[0]);
+        self->b->dispatch_async(self->b->call(security::libsystem_library, "_dispatch_get_global_queue", {0, 0}), [self, task, state] {
+            {
+                std::unique_lock lock(state->socket->mutex);
+                state->socket->cv.wait_for(lock, std::chrono::seconds(5), [&] { return state->socket->done; });
+            }
+            std::shared_ptr<Channel> channel;
+            { std::lock_guard lock(state->transfer->mutex); channel = state->transfer->channel; }
+            bool done;
+            { std::lock_guard lock(state->socket->mutex); done = state->socket->done; state->socket->close_received = true; }
+            if (!done && channel) channel->close();   // the reader ends the task (a clean close)
+            self->b->release(task);
+        });
+    }, false, "v@:q@");
+    b.method(ws, "maximumMessageSize", [socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        std::lock_guard lock(state->socket->mutex);
+        s.x[0] = state->socket->maximum_message;
+    }, false, "q@:");
+    b.method(ws, "setMaximumMessageSize:", [socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        std::lock_guard lock(state->socket->mutex);
+        if (state->socket->open) security::fail("NSInternalInconsistencyException: maximumMessageSize is set before the task resumes");
+        state->socket->maximum_message = s.x[2];
+    }, false, "v@:q");
+    b.method(ws, "closeCode", [socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        std::lock_guard lock(state->socket->mutex);
+        s.x[0] = static_cast<Address>(state->socket->close_code);
+    }, false, "q@:");
+    b.method(ws, "closeReason", [self, socket_of](CpuState& s, GuestMemory&) {
+        const auto state = socket_of(s.x[0]);
+        Bytes reason;
+        { std::lock_guard lock(state->socket->mutex); reason = state->socket->close_reason; }
+        s.x[0] = reason.empty() ? 0 : self->b->autorelease(self->b->data(reason));
+    });
+
+    // ---- NSURLProtocol ----------------------------------------------------------------------------------------
+    const auto pr = self->protocol_class, pc = self->protocol_client_class;
+    const auto protocol_state = [self](Address object) { return self->require<ProtocolState>(object, "NSURLProtocol"); };
+    b.method(pr, "registerClass:", [self](CpuState& s, GuestMemory&) {
+        CallRegs registers;
+        registers.x[2] = self->protocol_class;
+        if (!s.x[2] || !(self->b->objc.send(s.x[2], "isSubclassOfClass:", registers).x0 & 0xff)) { s.x[0] = 0; return; }
+        std::lock_guard lock(self->protocols_mutex);
+        if (std::find(self->registered_protocols.begin(), self->registered_protocols.end(), s.x[2]) == self->registered_protocols.end())
+            self->registered_protocols.push_back(s.x[2]);
+        s.x[0] = 1;
+    }, true, "B@:#");
+    b.method(pr, "unregisterClass:", [self](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(self->protocols_mutex);
+        std::erase(self->registered_protocols, s.x[2]);
+    }, true, "v@:#");
+    b.method(pr, "canInitWithRequest:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true, "B@:@");
+    b.method(pr, "canInitWithTask:", [self](CpuState& s, GuestMemory&) {
+        CallRegs registers;
+        registers.x[2] = s.x[2] ? self->b->objc.send(s.x[2], "currentRequest").x0 : 0;
+        s.x[0] = self->b->objc.send(s.x[0], "canInitWithRequest:", registers).x0 & 0xff;
+    }, true, "B@:@");
+    b.method(pr, "canonicalRequestForRequest:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[2]; }, true);
+    b.method(pr, "requestIsCacheEquivalent:toRequest:", [self](CpuState& s, GuestMemory&) {
+        const auto key = [self](Address request) -> std::optional<std::pair<std::string, std::string>> {
+            const auto value = request ? self->b->objc.find_host_state<RequestState>(request) : nullptr;
+            if (!value) return std::nullopt;
+            std::lock_guard lock(value->mutex);
+            const auto text = value->url ? self->b->maybe_text(self->b->objc.send(value->url, "absoluteString").x0) : std::nullopt;
+            return std::make_pair(text.value_or(""), value->method);
+        };
+        const auto left = key(s.x[2]), right = key(s.x[3]);
+        s.x[0] = left && right && *left == *right;
+    }, true, "B@:@@");
+    const auto property_name = [self](Address key) {
+        const auto text = key ? self->b->maybe_text(key) : std::nullopt;
+        if (!text) security::fail("NSInvalidArgumentException: NSURLProtocol request properties need an NSString key");
+        return *text;
+    };
+    b.method(pr, "propertyForKey:inRequest:", [self, property_name](CpuState& s, GuestMemory&) {
+        const auto value = self->require<RequestState>(s.x[3], "NSURLRequest");
+        const auto name = property_name(s.x[2]);
+        std::lock_guard lock(value->mutex);
+        const auto found = value->properties.find(name);
+        s.x[0] = found == value->properties.end() ? 0 : found->second;
+    }, true, "@@:@@");
+    b.method(pr, "setProperty:forKey:inRequest:", [self, property_name](CpuState& s, GuestMemory&) {
+        if (!self->is_mutable_request(s.x[4])) security::fail("NSInvalidArgumentException: +[NSURLProtocol setProperty:forKey:inRequest:] needs an NSMutableURLRequest");
+        const auto value = self->require<RequestState>(s.x[4], "NSURLRequest");
+        const auto name = property_name(s.x[3]);
+        const auto object = s.x[2] ? self->b->objc.send(s.x[2], "copy").x0 : 0;
+        Address previous{};
+        {
+            std::lock_guard lock(value->mutex);
+            auto& slot = value->properties[name];
+            previous = std::exchange(slot, object);
+            if (!object) value->properties.erase(name);
+        }
+        self->b->release(previous);
+    }, true, "v@:@@@");
+    b.method(pr, "removePropertyForKey:inRequest:", [self, property_name](CpuState& s, GuestMemory&) {
+        if (!self->is_mutable_request(s.x[3])) security::fail("NSInvalidArgumentException: +[NSURLProtocol removePropertyForKey:inRequest:] needs an NSMutableURLRequest");
+        const auto value = self->require<RequestState>(s.x[3], "NSURLRequest");
+        const auto name = property_name(s.x[2]);
+        Address previous{};
+        {
+            std::lock_guard lock(value->mutex);
+            if (const auto found = value->properties.find(name); found != value->properties.end()) {
+                previous = found->second;
+                value->properties.erase(found);
+            }
+        }
+        self->b->release(previous);
+    }, true, "v@:@@");
+    const auto init_protocol = [self](Address object, Address request, Address cached, Address client, Address task) {
+        auto state = std::make_shared<ProtocolState>();
+        state->request = self->b->objc.send(request, "copy").x0;
+        state->cached = self->b->retain(cached);
+        state->client = self->b->retain(client);
+        state->task = task;
+        static_cast<void>(self->b->objc.host_state<ProtocolState>(object, [&] { return state; }));
+    };
+    b.method(pr, "initWithRequest:cachedResponse:client:", [init_protocol](CpuState& s, GuestMemory&) {
+        if (!s.x[2]) security::fail("NSInvalidArgumentException: -[NSURLProtocol initWithRequest:cachedResponse:client:] needs a request");
+        init_protocol(s.x[0], s.x[2], s.x[3], s.x[4], 0);
+    }, false, "@@:@@@");
+    b.method(pr, "initWithTask:cachedResponse:client:", [self](CpuState& s, GuestMemory&) {
+        const auto task = s.x[2];
+        CallRegs registers;
+        registers.x[2] = task ? self->b->objc.send(task, "currentRequest").x0 : 0;
+        registers.x[3] = s.x[3]; registers.x[4] = s.x[4];
+        const auto object = self->b->objc.send(s.x[0], "initWithRequest:cachedResponse:client:", registers).x0;
+        if (const auto state = object ? self->b->objc.find_host_state<ProtocolState>(object) : nullptr) state->task = task;
+        s.x[0] = object;
+    }, false, "@@:@@@");
+    b.method(pr, "dealloc", [self, pr](CpuState& s, GuestMemory&) {
+        if (const auto state = self->b->objc.find_host_state<ProtocolState>(s.x[0]))
+            self->b->release_all({std::exchange(state->request, 0), std::exchange(state->cached, 0), std::exchange(state->client, 0)});
+        static_cast<void>(self->b->objc.send_super(s.x[0], pr, self->b->objc.selector("dealloc")));
+    }, false, "v@:");
+    b.method(pr, "request", [protocol_state](CpuState& s, GuestMemory&) { s.x[0] = protocol_state(s.x[0])->request; });
+    b.method(pr, "cachedResponse", [protocol_state](CpuState& s, GuestMemory&) { s.x[0] = protocol_state(s.x[0])->cached; });
+    b.method(pr, "client", [protocol_state](CpuState& s, GuestMemory&) { s.x[0] = protocol_state(s.x[0])->client; });
+    b.method(pr, "task", [protocol_state](CpuState& s, GuestMemory&) { s.x[0] = protocol_state(s.x[0])->task; });
+    b.method(pr, "startLoading", [](CpuState&, GuestMemory&) {
+        security::fail("NSInternalInconsistencyException: an NSURLProtocol subclass must override -startLoading");
+    }, false, "v@:");
+    b.method(pr, "stopLoading", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "v@:");
+
+    // The client (NSURLProtocolClient): each call becomes an event for the load's worker.
+    const auto feed_of = [self](Address client) {
+        const auto state = self->require<ClientState>(client, "NSURLProtocolClient");
+        return state->feed;
+    };
+    using Kind = ProtocolFeed::Event::Kind;
+    b.method(pc, "URLProtocol:didReceiveResponse:cacheStoragePolicy:", [self, feed_of](CpuState& s, GuestMemory&) {
+        if (!s.x[3]) security::fail("NSInvalidArgumentException: URLProtocol:didReceiveResponse:cacheStoragePolicy: needs a response");
+        self->post(feed_of(s.x[0]), {Kind::response, self->b->retain(s.x[3]), 0, {}, s.x[4]});
+    }, false, "v@:@@Q");
+    b.method(pc, "URLProtocol:didLoadData:", [self, feed_of](CpuState& s, GuestMemory&) {
+        self->post(feed_of(s.x[0]), {Kind::data, 0, 0, s.x[3] ? self->b->bytes(s.x[3]) : Bytes{}, 0});
+    }, false, "v@:@@");
+    b.method(pc, "URLProtocolDidFinishLoading:", [self, feed_of](CpuState& s, GuestMemory&) {
+        self->post(feed_of(s.x[0]), {Kind::finished, 0, 0, {}, 0});
+    }, false, "v@:@");
+    b.method(pc, "URLProtocol:didFailWithError:", [self, feed_of](CpuState& s, GuestMemory&) {
+        const auto error = s.x[3] ? self->b->retain(s.x[3]) : self->url_error(url_error::unknown, "the NSURLProtocol failed", 0);
+        self->post(feed_of(s.x[0]), {Kind::failed, error, 0, {}, 0});
+    }, false, "v@:@@");
+    b.method(pc, "URLProtocol:wasRedirectedToRequest:redirectResponse:", [self, feed_of](CpuState& s, GuestMemory&) {
+        if (!s.x[3]) security::fail("NSInvalidArgumentException: URLProtocol:wasRedirectedToRequest:redirectResponse: needs a request");
+        const auto request = self->copy_request(s.x[3], self->mutable_request_class);
+        self->post(feed_of(s.x[0]), {Kind::redirected, request, self->b->retain(s.x[4]), {}, 0});
+    }, false, "v@:@@@");
+    b.method(pc, "URLProtocol:cachedResponseIsValid:", [self, feed_of](CpuState& s, GuestMemory&) {
+        if (!s.x[3]) security::fail("NSInvalidArgumentException: URLProtocol:cachedResponseIsValid: needs a cached response");
+        self->post(feed_of(s.x[0]), {Kind::cached, self->b->retain(s.x[3]), 0, {}, 0});
+    }, false, "v@:@@");
+    b.method(pc, "URLProtocol:didReceiveAuthenticationChallenge:", [](CpuState&, GuestMemory&) {
+        security::unsupported("authentication challenges from NSURLProtocol classes");
+    }, false, "v@:@@");
+    b.method(pc, "URLProtocol:didCancelAuthenticationChallenge:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "v@:@@");
 
     // ---- NSURLCredentialStorage ---------------------------------------------------------------------------------
     const auto st = self->credential_storage_class;
