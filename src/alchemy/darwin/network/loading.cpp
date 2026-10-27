@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -35,6 +37,17 @@
 // here) but, as on macOS, their tasks take no completion handlers.
 // connectionProxyDictionary's HTTP and HTTPS proxies and exception list are
 // used (an empty dictionary means no proxy).
+// The URL cache (url_cache.cpp): a configuration's URLCache is the shared
+// cache (default and background) or a private memory cache (ephemeral). GET
+// data tasks look up -cachedResponseForRequest: by the request's cache policy
+// (else the configuration's requestCachePolicy): a fresh response (RFC 9111:
+// Cache-Control max-age / no-cache, Expires, Age, the Last-Modified
+// heuristic) is served from the cache, a stale one is revalidated with
+// If-None-Match / If-Modified-Since (304 serves the cached one), and
+// ReturnCacheDataElseLoad / DontLoad use any cached response. Cacheable
+// responses (200, 203, 300, 301, 410 without no-store) go through the
+// delegate's willCacheResponse: and -storeCachedResponse:forRequest:.
+// Download tasks are not cached.
 //
 // Not provided (explicit failures): stream / WebSocket tasks, custom
 // NSURLProtocol classes, proxy auto-configuration and SOCKS entries in
@@ -402,7 +415,7 @@ struct Loading : std::enable_shared_from_this<Loading> {
         return wait(lock, decision->cv, [&] { return decision->ready; }, transfer);
     }
 
-    // ---- challenges ---------------------------------------------------------------------------------------
+    // ---- request bodies -----------------------------------------------------------------------------------
     // The bytes of an NSInputStream read to its end (nullopt when it reports an error).
     std::optional<Bytes> drain(Address stream) {
         static_cast<void>(b->objc.send(stream, "open"));
@@ -425,7 +438,7 @@ struct Loading : std::enable_shared_from_this<Loading> {
         if (failed) return std::nullopt;
         return bytes;
     }
-    // ---- credential storage ----
+    // ---- credential storage ---------------------------------------------------------------------------------
     using SpaceKey = std::tuple<std::string, std::int64_t, std::string, std::string, std::string, bool>;
     static SpaceKey key_of(const SpaceState& space) {
         return {space.host, space.port, space.protocol, space.realm, space.method, space.proxy};
@@ -578,6 +591,138 @@ struct Loading : std::enable_shared_from_this<Loading> {
         }
         return proxy;   // Kind::none: direct connections
     }
+    // ---- the URL cache --------------------------------------------------------------------------------------
+    // +1 new NSURLCache (0 when url_cache.cpp is not installed).
+    Address new_cache(std::uint64_t memory, std::uint64_t disk) {
+        const auto cls = b->objc.find_class("NSURLCache");
+        if (!cls) return 0;
+        CallRegs registers;
+        registers.x[2] = memory; registers.x[3] = disk; registers.x[4] = 0;
+        return b->objc.send(b->objc.send(cls, "alloc").x0, "initWithMemoryCapacity:diskCapacity:diskPath:", registers).x0;
+    }
+    Address shared_cache() {
+        const auto cls = b->objc.find_class("NSURLCache");
+        return cls ? b->objc.send(cls, "sharedURLCache").x0 : 0;
+    }
+    // The session configuration's URLCache (not retained; 0 when set to nil) and requestCachePolicy.
+    std::pair<Address, std::uint64_t> cache_for(const std::shared_ptr<SessionState>& session) {
+        std::lock_guard lock(session->mutex);
+        const auto config = session->configuration ? b->objc.find_host_state<ConfigurationState>(session->configuration) : nullptr;
+        if (!config) return {};
+        std::lock_guard config_lock(config->properties.mutex);
+        const auto found = config->properties.objects.find("URLCache");
+        const auto policy = config->properties.integers.find("requestCachePolicy");
+        return {found == config->properties.objects.end() ? 0 : found->second,
+                policy == config->properties.integers.end() ? 0 : policy->second};
+    }
+    // A Cache-Control directive: "" when present without a value, its (unquoted) value, or nullopt.
+    // `Pragma: no-cache` counts as Cache-Control's no-cache.
+    static std::optional<std::string> directive(const Headers& headers, std::string_view name) {
+        const auto trim = [](std::string_view text) {
+            while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
+            while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.remove_suffix(1);
+            return text;
+        };
+        for (const auto& [key, value] : headers) {
+            if (!security::iequals(key, "Cache-Control") && !(name == "no-cache" && security::iequals(key, "Pragma"))) continue;
+            std::string_view rest = value;
+            while (!rest.empty()) {
+                const auto end = std::min(rest.find(','), rest.size());
+                const auto item = trim(rest.substr(0, end));
+                rest.remove_prefix(std::min(end + 1, rest.size()));
+                const auto equals = item.find('=');
+                if (!security::iequals(trim(item.substr(0, std::min(equals, item.size()))), name)) continue;
+                if (equals == std::string_view::npos) return std::string{};
+                auto argument = trim(item.substr(equals + 1));
+                if (argument.size() >= 2 && argument.front() == '"' && argument.back() == '"') argument = argument.substr(1, argument.size() - 2);
+                return std::string(argument);
+            }
+        }
+        return std::nullopt;
+    }
+    static std::optional<double> seconds_of(const std::optional<std::string>& text) {
+        if (!text || text->empty()) return std::nullopt;
+        double value{};
+        const auto [end, error] = std::from_chars(text->data(), text->data() + text->size(), value);
+        if (error != std::errc{} || value < 0) return std::nullopt;
+        return value;
+    }
+    // Whether a cached response may be used without revalidation (RFC 9111 freshness, as a private cache).
+    bool fresh(Address cached) {
+        const auto response = b->objc.send(cached, "response").x0;
+        const auto value = response ? b->objc.find_host_state<ResponseState>(response) : nullptr;
+        if (!value || !value->http) return false;
+        const auto& headers = value->headers;
+        if (directive(headers, "no-cache") || directive(headers, "no-store")) return false;
+        auto stored = cached_response_time(*b, cached);
+        if (std::isnan(stored)) stored = unix_now();
+        const auto age = std::max(0.0, unix_now() - stored) + seconds_of(header_value(headers, "Age")).value_or(0);
+        if (const auto max_age = directive(headers, "max-age")) {
+            const auto lifetime = seconds_of(max_age);
+            return lifetime && age < *lifetime;
+        }
+        const auto date_header = header_value(headers, "Date");
+        const auto date = date_header ? parse_cookie_date(*date_header).value_or(stored) : stored;
+        if (const auto expires = header_value(headers, "Expires")) {
+            const auto until = parse_cookie_date(*expires);   // an invalid Expires is in the past
+            return until && age < *until - date;
+        }
+        if (const auto modified_header = header_value(headers, "Last-Modified"))
+            if (const auto modified = parse_cookie_date(*modified_header); modified && date > *modified) return age < 0.1 * (date - *modified);
+        return false;
+    }
+    // Adds the cached response's validators (ETag, Last-Modified) as conditional headers; false when it has none.
+    bool add_validators(Address cached, Headers& headers) {
+        const auto response = b->objc.send(cached, "response").x0;
+        const auto value = response ? b->objc.find_host_state<ResponseState>(response) : nullptr;
+        if (!value || !value->http) return false;
+        if (header_value(headers, "If-None-Match") || header_value(headers, "If-Modified-Since")) return false;   // the request's own
+        bool any = false;
+        if (const auto tag = header_value(value->headers, "ETag")) { headers.emplace_back("If-None-Match", *tag); any = true; }
+        if (const auto modified = header_value(value->headers, "Last-Modified")) { headers.emplace_back("If-Modified-Since", *modified); any = true; }
+        return any;
+    }
+    static bool cacheable(const HttpResponseHead& head) {
+        if (head.status != 200 && head.status != 203 && head.status != 300 && head.status != 301 && head.status != 410) return false;
+        if (directive(head.headers, "no-store")) return false;
+        const auto vary = header_value(head.headers, "Vary");
+        return !(vary && vary->find('*') != std::string::npos);
+    }
+    // Offers the response to the delegate (URLSession:dataTask:willCacheResponse:completionHandler:) and stores
+    // what it answers with -storeCachedResponse:forRequest:.
+    void store_in_cache(const std::shared_ptr<SessionState>& session, Address session_object, Address task, const std::shared_ptr<TaskState>& state,
+                        Address cache, Address request, Address response, const Bytes& data) {
+        const auto cls = b->objc.find_class("NSCachedURLResponse");
+        if (!cls) return;
+        const auto data_object = b->data(data);
+        CallRegs registers;
+        registers.x[2] = response; registers.x[3] = data_object; registers.x[4] = 0; registers.x[5] = 0;   // NSURLCacheStorageAllowed
+        auto proposed = b->objc.send(b->objc.send(cls, "alloc").x0, "initWithResponse:data:userInfo:storagePolicy:", registers).x0;
+        b->release(data_object);
+        const auto delegate = delegate_of(session);
+        if (!state->completion && responds(delegate, "URLSession:dataTask:willCacheResponse:completionHandler:")) {
+            auto decision = std::make_shared<Decision>();
+            const auto block = decision_block(decision, Handler::object);
+            b->retain(proposed);
+            deliver(session, [this, delegate, session_object, task, proposed, block] {
+                CallRegs arguments;
+                arguments.x[2] = session_object; arguments.x[3] = task; arguments.x[4] = proposed; arguments.x[5] = block;
+                static_cast<void>(b->objc.send(delegate, "URLSession:dataTask:willCacheResponse:completionHandler:", arguments));
+                b->release(proposed);
+            });
+            const bool answered = await(decision, state->transfer);
+            b->release(proposed);
+            proposed = answered ? decision->object : 0;   // +1 or 0 (nil: not cached)
+            if (!answered) b->release(decision->object);
+        }
+        if (!proposed) return;
+        CallRegs store;
+        store.x[2] = proposed; store.x[3] = request;
+        static_cast<void>(b->objc.send(cache, "storeCachedResponse:forRequest:", store));
+        b->release(proposed);
+    }
+
+    // ---- challenges ---------------------------------------------------------------------------------------
     Address make_space(const std::string& host, std::int64_t port, const std::string& protocol, const std::string& realm,
                        const std::string& method, Address trust, bool proxy) {
         const auto object = b->objc.allocate(space_class);
@@ -879,13 +1024,39 @@ void Loading::run(Address task) {
     if (!header_value(request.headers, "Accept")) request.headers.emplace_back("Accept", "*/*");
     if (!header_value(request.headers, "Accept-Language")) request.headers.emplace_back("Accept-Language", "en-US,en;q=0.9");
 
+    // The URL cache, for GET data tasks: by the request's cache policy, else the configuration's.
+    const auto [cache, configured_policy] = cache_for(session);
+    std::uint64_t policy;
+    {
+        const auto source = require<RequestState>(current, "NSURLRequest");
+        std::lock_guard lock(source->mutex);
+        policy = source->cache_policy ? source->cache_policy : configured_policy;
+    }
+    const bool cache_request = cache && state->kind == TaskKind::data && request.method == "GET" && !directive(request.headers, "no-store");
+    Address cached{};   // +1 NSCachedURLResponse
+    Holder hold_cached{*b, cached};
+    // NSURLRequestReloadIgnoringLocalCacheData (1) and ReloadIgnoringLocalAndRemoteCacheData (4) skip the lookup.
+    if (cache_request && policy != 1 && policy != 4) {
+        CallRegs registers;
+        registers.x[2] = current;
+        cached = b->retain(b->objc.send(cache, "cachedResponseForRequest:", registers).x0);
+    }
+    if (policy == 3 && !cached) { fail_task(url_error::resource_unavailable, "the resource is not in the URL cache"); return; }   // ReturnCacheDataDontLoad
+    bool from_cache = false, conditional = false;
+    if (cached) {
+        // ReturnCacheDataElseLoad (2) and DontLoad (3) take any cached response; the protocol policy (0) a fresh one;
+        // otherwise (0 stale, 5 ReloadRevalidatingCacheData) the server revalidates it.
+        if (policy == 2 || policy == 3 || (policy == 0 && fresh(cached))) from_cache = true;
+        else conditional = add_validators(cached, request.headers);
+    }
+
     const auto client = client_for(session);
     std::optional<TrustOutcome> rejected;
     std::vector<security::CertificatePtr> rejected_chain;
     int redirects = 0, auth_attempts = 0;
     std::shared_ptr<HttpExchange> exchange;
     HttpResponseHead head;
-    for (;;) {
+    while (!from_cache) {
         rejected.reset();
         if (request.cookies && !own_cookie_header) {
             std::erase_if(request.headers, [](const auto& header) { return security::iequals(header.first, "Cookie"); });
@@ -964,6 +1135,7 @@ void Loading::run(Address task) {
         }
         head = std::get<HttpResponseHead>(result);
         state->sent = static_cast<std::int64_t>(exchange->bytes_sent());
+        if (conditional && head.status == 304) { from_cache = true; break; }   // not modified: the cached response
         // Set-Cookie into the jar (every hop, as Foundation stores them during redirects).
         if (request.cookies) {
             std::vector<std::string> set_cookies;
@@ -979,6 +1151,12 @@ void Loading::run(Address task) {
             if (!target) break;
             HttpRequest next = request;
             next.url = *target;
+            if (conditional) {   // the validators were for the cached response of the first URL
+                std::erase_if(next.headers, [](const auto& header) {
+                    return security::iequals(header.first, "If-None-Match") || security::iequals(header.first, "If-Modified-Since");
+                });
+                conditional = false;
+            }
             next.url.fragment.reset();
             if (head.status == 303 || ((head.status == 301 || head.status == 302) && request.method == "POST")) {
                 if (next.method != "HEAD") next.method = "GET";
@@ -1041,18 +1219,28 @@ void Loading::run(Address task) {
         break;
     }
 
-    // The response.
-    std::string mime, encoding;
-    content_type(head.headers, mime, encoding);
+    // The response: the cached one, or the exchange's.
+    Address response{};
     std::int64_t expected = -1;
-    if (const auto length = header_value(head.headers, "Content-Length"); length && !header_value(head.headers, "Content-Encoding")) {
-        try { expected = std::stoll(*length); } catch (...) {}
+    std::optional<Bytes> cached_body;
+    if (from_cache) {
+        response = b->retain(b->objc.send(cached, "response").x0);
+        cached_body = b->bytes(b->objc.send(cached, "data").x0);
+        expected = static_cast<std::int64_t>(cached_body->size());
+    } else {
+        std::string mime, encoding;
+        content_type(head.headers, mime, encoding);
+        if (const auto length = header_value(head.headers, "Content-Length"); length && !header_value(head.headers, "Content-Encoding")) {
+            try { expected = std::stoll(*length); } catch (...) {}
+        }
+        if (mime.empty()) mime = "application/octet-stream";
+        Address response_url;
+        { std::lock_guard lock(state->mutex); response_url = b->retain(require<RequestState>(state->current, "NSURLRequest")->url); }
+        response = make_response(response_url, &head, mime, expected, encoding);
+        b->release(response_url);
     }
-    if (mime.empty()) mime = "application/octet-stream";
-    Address response_url;
-    { std::lock_guard lock(state->mutex); response_url = b->retain(require<RequestState>(state->current, "NSURLRequest")->url); }
-    const auto response = make_response(response_url, &head, mime, expected, encoding);
-    b->release(response_url);
+    const bool store = !from_cache && cache_request && cacheable(head);
+    Bytes kept;   // the body for the cache
     {
         std::lock_guard lock(state->mutex);
         b->release(std::exchange(state->response, response));
@@ -1104,6 +1292,7 @@ void Loading::run(Address task) {
     const bool progress = state->kind == TaskKind::download && !state->completion &&
         responds(delegate, "URLSession:downloadTask:didWriteData:totalBytesWritten:totalBytesExpectedToWrite:");
     std::vector<std::uint8_t> buffer(64 * 1024);
+    std::size_t served = 0;   // of cached_body
     for (;;) {
         {
             std::unique_lock lock(transfer->mutex);
@@ -1118,7 +1307,14 @@ void Loading::run(Address task) {
             }
         }
         std::optional<HttpFailure> failure;
-        const auto count = exchange->read(buffer.data(), buffer.size(), failure);
+        std::size_t count;
+        if (cached_body) {
+            count = std::min(buffer.size(), cached_body->size() - served);
+            std::copy_n(cached_body->begin() + static_cast<std::ptrdiff_t>(served), count, buffer.begin());
+            served += count;
+        } else {
+            count = exchange->read(buffer.data(), buffer.size(), failure);
+        }
         if (failure) {
             output.close();
             std::error_code ignored;
@@ -1128,6 +1324,7 @@ void Loading::run(Address task) {
         }
         if (count == 0) break;
         state->received += static_cast<std::int64_t>(count);
+        if (store) kept.insert(kept.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(count));
         if (state->kind == TaskKind::download) {
             output.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(count));
             if (!output) { fail_task(url_error::cannot_write_file, "cannot write the download file"); return; }
@@ -1158,6 +1355,7 @@ void Loading::run(Address task) {
         std::lock_guard lock(transfer->mutex);
         transfer->exchange.reset();
     }
+    if (store) store_in_cache(session, session_object, task, state, cache, current, response, kept);
     finish(session, session_object, task, state, 0, std::move(body), file);
 }
 
@@ -1455,6 +1653,8 @@ void install_url_loading(const std::shared_ptr<Urls>& urls) {
         auto& p = state->properties;
         // Ephemeral sessions keep credentials in a private storage; the others share sharedCredentialStorage.
         p.objects["URLCredentialStorage"] = ephemeral ? self->make_storage() : self->b->retain(self->shared_storage());
+        // Ephemeral sessions cache in a private memory cache; the others share sharedURLCache.
+        p.objects["URLCache"] = ephemeral ? self->new_cache(4 * 1024 * 1024, 0) : self->b->retain(self->shared_cache());
         p.reals["timeoutIntervalForRequest"] = 60;
         p.reals["timeoutIntervalForResource"] = 604800;
         p.integers["HTTPShouldSetCookies"] = 1;

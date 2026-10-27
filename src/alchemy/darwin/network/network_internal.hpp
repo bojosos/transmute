@@ -84,6 +84,10 @@ void install_operation_queues(Bridge& b);
 // ---- URL loading (loading.cpp) / CFNetwork (cfnetwork.cpp) ------------------------------------
 void install_url_loading(const std::shared_ptr<Urls>& urls);
 void install_cfnetwork(const std::shared_ptr<Urls>& urls);
+// NSURLCache and NSCachedURLResponse (url_cache.cpp).
+void install_url_cache(const std::shared_ptr<Bridge>& b);
+// When an NSCachedURLResponse made by url_cache.cpp was created (Unix seconds; NaN for other objects).
+[[nodiscard]] double cached_response_time(Bridge& b, Address cached);
 // NSHTTPCookie and NSHTTPCookieStorage cookie access over cookies.cpp (cookie_classes.cpp).
 void install_cookies(const std::shared_ptr<Urls>& urls);
 // CFNetworkExecuteProxyAutoConfigurationURL over WinHTTP autoproxy (pac.cpp).

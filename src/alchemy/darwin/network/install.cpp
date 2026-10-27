@@ -20,6 +20,7 @@ void install_network(InstallContext& context) {
     network::install_urls(*urls);
     network::install_operation_queues(*urls->b);
     network::install_url_loading(urls);
+    network::install_url_cache(urls->b);
     network::install_cookies(urls);
     network::install_cfnetwork(urls);
     network::install_pac(urls);

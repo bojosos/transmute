@@ -23,6 +23,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/network/loading.cpp
     src/alchemy/darwin/network/cookies.cpp
     src/alchemy/darwin/network/cookie_classes.cpp
+    src/alchemy/darwin/network/url_cache.cpp
     src/alchemy/darwin/network/cfnetwork.cpp
     src/alchemy/darwin/network/pac.cpp
     src/alchemy/darwin/network/socket.cpp

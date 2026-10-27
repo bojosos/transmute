@@ -7,7 +7,9 @@
 // cancellation; HTTPBodyStream uploads, NSURLCredentialStorage (credentials kept
 // from challenges, default credentials for challenges the delegate leaves to
 // default handling), background configurations, and connectionProxyDictionary
-// through an in-test loopback HTTP proxy. When the network is reachable, a real HTTPS request to
+// through an in-test loopback HTTP proxy; NSURLCache (fresh responses served
+// from the cache, ETag revalidation, no-store, cache policies, the delegate's
+// willCacheResponse:). When the network is reachable, a real HTTPS request to
 // https://example.com is evaluated against the Windows root store.
 // CFSocket: accept, data, write and end-of-stream callbacks through the
 // run loop against host Winsock peers. Bonjour: dns_sd and NSNetService over
@@ -89,6 +91,7 @@ public:
     [[nodiscard]] std::string base() const { return "https://localhost:" + std::to_string(port_); }
     std::vector<std::string> requests() { std::lock_guard lock(mutex_); return requests_; }
     std::size_t handshakes() { std::lock_guard lock(mutex_); return handshakes_; }
+    int hits(const std::string& request) { std::lock_guard lock(mutex_); return hits_[request]; }
     std::string error() { std::lock_guard lock(mutex_); return error_; }
 
 private:
@@ -154,9 +157,11 @@ private:
                 if (tls.read(read, write, buffer, sizeof(buffer), got) != sec::TlsSession::Status::ok || !got) return;
                 body.append(reinterpret_cast<char*>(buffer), got);
             }
+            int hits = 0;   // requests for this method and path so far, this one included
             {
                 std::lock_guard lock(mutex_);
                 requests_.push_back(method + " " + path + (body.empty() ? "" : " " + body));
+                hits = ++hits_[method + " " + path];
             }
             int status = 200;
             std::string reason = "OK", content_type = "text/plain; charset=utf-8", payload, extra;
@@ -176,6 +181,16 @@ private:
                 if (headers["authorization"] == "Basic " + sec::base64_encode(Bytes{'k', 'e', 'e', 'p', 'e', 'r', ':', 'v', 'a', 'u', 'l', 't'}))
                     payload = "stored ok";
                 else { status = 401; reason = "Unauthorized"; extra = "WWW-Authenticate: Basic realm=\"stored\"\r\n"; payload = "denied"; }
+            } else if (path == "/cached") {
+                extra = "Cache-Control: max-age=600\r\n";
+                payload = "cached " + std::to_string(hits);
+            } else if (path == "/validated") {
+                extra = "Cache-Control: no-cache\r\nETag: \"v1\"\r\n";
+                if (headers["if-none-match"] == "\"v1\"") { status = 304; reason = "Not Modified"; }
+                else payload = "validated " + std::to_string(hits);
+            } else if (path == "/no-store") {
+                extra = "Cache-Control: no-store, max-age=600\r\n";
+                payload = "no-store " + std::to_string(hits);
             } else if (path == "/slow") {
                 for (int index = 0; index < 60 && !stop_; ++index) std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 payload = "slow";
@@ -199,6 +214,7 @@ private:
     std::atomic<bool> stop_{};
     std::mutex mutex_;
     std::vector<std::string> requests_;
+    std::map<std::string, int> hits_;
     std::size_t handshakes_{};
     std::string error_;
 };
@@ -281,17 +297,18 @@ std::filesystem::path host_path(const std::string& guest) {
 struct Record {
     std::mutex mutex;
     bool done{};
-    std::int64_t status{}, error{}, challenges{}, responses{}, invalidated{};
+    std::int64_t status{}, error{}, challenges{}, responses{}, invalidated{}, will_cache{};
     Bytes data;
     std::string location_name, response_name;
     std::uintmax_t file_size{};
-    void reset() { std::lock_guard lock(mutex); done = false; status = error = challenges = responses = invalidated = 0; data.clear(); file_size = 0; }
+    void reset() { std::lock_guard lock(mutex); done = false; status = error = challenges = responses = invalidated = will_cache = 0; data.clear(); file_size = 0; }
 };
 
 struct Harness {
     Fixture& f;
     Record record;
     bool accept_trust{true};
+    bool refuse_cache{};   // willCacheResponse: answers nil
     Address completion{}, download_completion{}, delegate_class{};
 
     explicit Harness(Fixture& fixture) : f(fixture) {
@@ -376,6 +393,11 @@ struct Harness {
             std::error_code error;
             std::lock_guard lock(record.mutex);
             record.file_size = std::filesystem::file_size(host_path(f.cf.url_path(s.x[4])), error);
+            s.x[0] = 0;
+        });
+        method("URLSession:dataTask:willCacheResponse:completionHandler:", [this, b](CpuState& s, GuestMemory&) {
+            { std::lock_guard lock(record.mutex); ++record.will_cache; }
+            b->invoke_block(s.x[5], {refuse_cache ? 0 : s.x[4]});
             s.x[0] = 0;
         });
         method("URLSession:task:didCompleteWithError:", [this](CpuState& s, GuestMemory&) {
@@ -896,6 +918,88 @@ void test_sessions(Fixture& f, Harness& h, HttpsServer& server) {
     static_cast<void>(f.send(session, "finishTasksAndInvalidate"));
     eventually([&] { std::lock_guard lock(h.record.mutex); return h.record.invalidated == 1; }, "didBecomeInvalidWithError:");
     require(server.error().empty(), "server error: " + server.error());
+}
+
+// NSURLCache and NSCachedURLResponse, directly and through a session's cache.
+void test_url_cache(Fixture& f, Harness& h, HttpsServer& server) {
+    const auto b = sec::bridge();
+    const auto text_of = [&] { std::lock_guard lock(h.record.mutex); return std::string(h.record.data.begin(), h.record.data.end()); };
+
+    // 1. The cache's own API.
+    alchemy::CallRegs sizes;
+    sizes.x[2] = 1024 * 1024; sizes.x[3] = 0; sizes.x[4] = 0;
+    const auto cache = f.objc.send(f.send(f.cls("NSURLCache"), "alloc"), "initWithMemoryCapacity:diskCapacity:diskPath:", sizes).x0;
+    require(f.send(cache, "memoryCapacity") == 1024 * 1024 && f.send(cache, "currentMemoryUsage") == 0, "a new cache");
+    const auto request = f.send(f.cls("NSURLRequest"), "requestWithURL:", {f.url("https://cache.example/item#part")});
+    const auto other = f.send(f.cls("NSURLRequest"), "requestWithURL:", {f.url("https://cache.example/item")});
+    alchemy::CallRegs fields;
+    fields.x[2] = f.url("https://cache.example/item"); fields.x[3] = f.string("text/plain"); fields.x[4] = 5; fields.x[5] = 0;
+    const auto response = f.objc.send(f.send(f.cls("NSURLResponse"), "alloc"), "initWithURL:MIMEType:expectedContentLength:textEncodingName:", fields).x0;
+    const auto cached_with = [&](Bytes data, std::uint64_t policy) {
+        alchemy::CallRegs registers;
+        registers.x[2] = response; registers.x[3] = b->data(data); registers.x[4] = 0; registers.x[5] = policy;
+        return f.objc.send(f.send(f.cls("NSCachedURLResponse"), "alloc"), "initWithResponse:data:userInfo:storagePolicy:", registers).x0;
+    };
+    const auto entry = cached_with(Bytes{'h', 'e', 'l', 'l', 'o'}, 0);
+    require(f.send(entry, "response") == response && f.send(entry, "storagePolicy") == 0 && f.cf.length(f.send(entry, "data")) == 5,
+            "NSCachedURLResponse accessors");
+    static_cast<void>(f.send(cache, "storeCachedResponse:forRequest:", {entry, request}));
+    require(f.send(cache, "cachedResponseForRequest:", {other}) == entry, "the fragment is not part of the key");
+    require(f.send(cache, "currentMemoryUsage") > 5 && f.send(cache, "currentDiskUsage") == 0, "memory usage");
+    static_cast<void>(f.send(cache, "removeCachedResponseForRequest:", {other}));
+    require(f.send(cache, "cachedResponseForRequest:", {request}) == 0 && f.send(cache, "currentMemoryUsage") == 0, "removeCachedResponseForRequest:");
+    static_cast<void>(f.send(cache, "storeCachedResponse:forRequest:", {cached_with(Bytes{'x'}, 2), request}));
+    require(f.send(cache, "cachedResponseForRequest:", {request}) == 0, "NSURLCacheStorageNotAllowed is not stored");
+    static_cast<void>(f.send(cache, "storeCachedResponse:forRequest:", {cached_with(Bytes(60 * 1024, 'x'), 0), request}));
+    require(f.send(cache, "cachedResponseForRequest:", {request}) == 0, "a response over 5 % of the cache is not stored");
+    static_cast<void>(f.send(cache, "storeCachedResponse:forRequest:", {entry, request}));
+    static_cast<void>(f.send(cache, "removeAllCachedResponses"));
+    require(f.send(cache, "cachedResponseForRequest:", {request}) == 0, "removeAllCachedResponses");
+    const auto shared = f.send(f.cls("NSURLCache"), "sharedURLCache");
+    require(shared != 0 && f.send(shared, "memoryCapacity") == 4 * 1024 * 1024, "the shared cache");
+
+    // 2. A session's cache: an ephemeral configuration has a private one.
+    const auto delegate = h.delegate();
+    const auto session = h.session(delegate);
+    const auto session_cache = f.send(f.send(session, "configuration"), "URLCache");
+    require(session_cache != 0 && session_cache != shared, "an ephemeral session's private cache");
+    const auto fetch = [&](const std::string& path, std::uint64_t policy = 0, bool with_completion = true) {
+        alchemy::CallRegs registers;
+        registers.x[2] = f.url(server.base() + path); registers.x[3] = policy; registers.v[0][0] = std::bit_cast<std::uint64_t>(60.0);
+        const auto value = f.objc.send(f.cls("NSURLRequest"), "requestWithURL:cachePolicy:timeoutInterval:", registers).x0;
+        h.record.reset();
+        const auto task = with_completion ? f.send(session, "dataTaskWithRequest:completionHandler:", {value, h.completion})
+                                          : f.send(session, "dataTaskWithRequest:", {value});
+        static_cast<void>(f.send(task, "resume"));
+        h.wait("GET " + path);
+        return text_of();
+    };
+    // A fresh response (max-age) is served from the cache: one request reaches the server.
+    require(fetch("/cached") == "cached 1" && fetch("/cached") == "cached 1" && server.hits("GET /cached") == 1, "max-age: served from the cache");
+    require(h.record.status == 200, "the cached response's status");
+    // NSURLRequestReloadIgnoringLocalCacheData goes to the server (and stores the new response).
+    require(fetch("/cached", 1) == "cached 2" && fetch("/cached") == "cached 2" && server.hits("GET /cached") == 2, "ReloadIgnoringLocalCacheData");
+    // no-cache with an ETag: revalidated each time; 304 serves the cached body.
+    require(fetch("/validated") == "validated 1" && fetch("/validated") == "validated 1" && server.hits("GET /validated") == 2, "ETag revalidation");
+    // no-store is never cached.
+    require(fetch("/no-store") == "no-store 1" && fetch("/no-store") == "no-store 2", "no-store");
+    // ReturnCacheDataDontLoad: a cached response, or NSURLErrorResourceUnavailable without a network request.
+    require(fetch("/cached", 3) == "cached 2" && server.hits("GET /cached") == 2, "ReturnCacheDataDontLoad with a cached response");
+    static_cast<void>(fetch("/hello-uncached", 3));
+    require(h.record.error == net::url_error::resource_unavailable && server.hits("GET /hello-uncached") == 0, "ReturnCacheDataDontLoad without one");
+    // The delegate's willCacheResponse: decides; nil keeps the response out of the cache.
+    static_cast<void>(f.send(session_cache, "removeAllCachedResponses"));
+    h.refuse_cache = true;
+    static_cast<void>(fetch("/cached", 0, false));
+    require(h.record.will_cache == 1 && f.send(session_cache, "cachedResponseForRequest:", {f.send(f.cls("NSURLRequest"), "requestWithURL:",
+            {f.url(server.base() + "/cached")})}) == 0, "willCacheResponse: answered nil");
+    h.refuse_cache = false;
+    static_cast<void>(fetch("/cached", 0, false));
+    require(h.record.will_cache == 1 && text_of() == "cached 4" && fetch("/cached") == "cached 4" && server.hits("GET /cached") == 4,
+            "willCacheResponse: passed the response through");
+    static_cast<void>(f.send(session, "invalidateAndCancel"));
+    require(server.error().empty(), "server error: " + server.error());
+    std::cout << "URL cache: storage, freshness, revalidation, policies and willCacheResponse:\n";
 }
 
 // A plain HTTP forward proxy on loopback: every request gets "via proxy"; the request lines are kept.
@@ -1445,6 +1549,7 @@ int main() {
             HttpsServer server(identity->context());
             test_sessions(fixture, harness, server);
             test_session_extras(fixture, harness, server);
+            test_url_cache(fixture, harness, server);
         }
         if (sec::host_environment("ALCHEMY_TEST_OFFLINE").empty()) test_internet(fixture, harness);
         std::cout << "Alchemy network tests passed\n";
