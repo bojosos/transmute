@@ -280,6 +280,7 @@ struct ObjcRuntime::Impl {
     std::map<Address, std::shared_ptr<Protocol>> protocols;
     std::map<std::string, Address, std::less<>> protocol_names;
     std::set<Address> constructing_protocols;   // objc_allocateProtocol'd, not yet registered
+    std::vector<Address> load_image_functions;  // objc_addLoadImageFunc's, in order
     string_hash_map<Address> type_strings;
     std::map<Address, Address> protocol_aliases; // Every known protocol_t, canonical ones included.
     Address protocol_class{}, mutation_handler{};
@@ -1357,6 +1358,30 @@ struct ObjcRuntime::Impl {
         hook_setter("_objc_setHook_lazyClassNamer", &Impl::lazy_namer_hook);
         function("__objc_setClassCopyFixupHandler", [this](auto& s, auto&) { copy_fixup_handler = s.x[0]; });
         function("__objc_rootAutorelease", [this](auto& s, auto&) { s.x[0] = queue_autorelease(s.x[0]); });
+        // The root class's own implementations (objc-internal.h), for classes that override
+        // retain/release/alloc and still want NSObject's behaviour underneath.
+        for (const auto* name : {"__objc_rootAlloc", "__objc_rootAllocWithZone"})
+            function(name, [this](auto& s, auto&) { s.x[0] = s.x[0] ? allocate(s.x[0]) : 0; });
+        function("__objc_rootInit", [](auto&, auto&) {});
+        function("__objc_rootRetain", [this](auto& s, auto&) { if (s.x[0] && !immortal(s.x[0])) s.x[0] = process.objects().retain(s.x[0]); });
+        function("__objc_rootRelease", [this](auto& s, auto&) { if (s.x[0] && !immortal(s.x[0])) process.objects().release(s.x[0]); });
+        function("__objc_rootRetainCount", [this](auto& s, auto&) {
+            if (!s.x[0] || immortal(s.x[0])) { s.x[0] = s.x[0] ? UINT64_MAX : 0; return; }
+            const auto record = process.objects().require(s.x[0]); s.x[0] = record->immortal ? UINT64_MAX : record->references.load(); });
+        function("__objc_rootDealloc", [this](auto& s, auto&) {
+            if (!s.x[0] || immortal(s.x[0])) return;
+            destruct(s.x[0]); process.objects().dispose(s.x[0]); });
+        function("__objc_rootTryRetain", [this](auto& s, auto&) {
+            s.x[0] = s.x[0] && (immortal(s.x[0]) || process.objects().try_retain(s.x[0])) ? 1 : 0; });
+        function("__objc_rootIsDeallocating", [this](auto& s, auto&) {
+            const auto view = s.x[0] && !immortal(s.x[0]) ? process.objects().peek(s.x[0]) : std::nullopt;
+            s.x[0] = view && view->destroying ? 1 : 0; });
+        function("__objc_rootHash", [](auto&, auto&) {});   // the object's address
+        function("__objc_rootZone", [this](auto& s, auto&) {
+            const auto zone = process.resolve("/usr/lib/libSystem.B.dylib", "_malloc_default_zone");
+            s.x[0] = zone ? process.calling_engine().invoke_callback(zone->address, std::span<const Address>{}) : 0; });
+        // id objc_retain_autorelease(id): retained, then autoreleased.
+        function("_objc_retain_autorelease", [this](auto& s, auto&) { s.x[0] = autorelease(retain(s.x[0])); });
         function("_objc_isUniquelyReferenced", [this](auto& s, auto&) {
             const auto record = s.x[0] ? process.objects().find(s.x[0]) : nullptr;
             s.x[0] = record && !record->immortal && record->references.load() == 1;
@@ -1866,6 +1891,62 @@ struct ObjcRuntime::Impl {
                     for (const auto address : found->second.classes) if (const auto value = cls(address); !value->metaclass && value->registered) names.push_back(value->name_address);
             }
             s.x[0] = copy_words(names, s.x[1], m); });
+        // void objc_addLoadImageFunc(void (*)(const struct mach_header*)): called now for every image already
+        // initialized, then for each image initialized later, after its classes are set up and before
+        // its +load methods.
+        function("_objc_addLoadImageFunc", [this](auto& s, auto&) {
+            if (!s.x[0]) return;
+            std::set<Address> modules;
+            { std::lock_guard lock(mutex); load_image_functions.push_back(s.x[0]);
+              for (const auto& [module, image] : images) if (image.initialized || image.initializing) modules.insert(module); }
+            for (const auto& info : process.images())
+                if (modules.contains(info.module_id) && info.header) {
+                    const std::array<Address, 1> argument{info.header};
+                    static_cast<void>(process.calling_engine().invoke_callback(s.x[0], argument));
+                } });
+        // void objc_enumerateClasses(const void* image, const char* prefix, Protocol* conforming,
+        //     Class subclassing, void (^block)(Class, BOOL* stop)): the image's registered classes (NULL: the
+        // caller's image; OBJC_DYNAMIC_CLASSES, -1: classes made at run time) whose name starts with
+        // prefix, that conform to the protocol and are the class or a subclass of it, until *stop.
+        function("_objc_enumerateClasses", [this](auto& s, auto& m) {
+            const auto image = s.x[0], block = s.x[4];
+            if (!block) return;
+            std::optional<Address> module;
+            if (image != ~0ULL) {
+                const auto caller = s.x[30] & 0x0000ffffffffffffULL;
+                for (const auto& info : process.images())
+                    if (image ? info.header == image : (caller >= info.begin && caller < info.end)) { module = info.module_id; break; }
+                if (!module) return;
+            }
+            const auto prefix = s.x[1] ? text(m, s.x[1]) : std::string();
+            std::vector<Address> classes;
+            {
+                std::lock_guard lock(mutex);
+                const auto proto = s.x[2] ? canonical_protocol(s.x[2]) : Address{};
+                std::vector<Address> candidates;
+                if (module) { if (const auto found = images.find(*module); found != images.end()) candidates = found->second.classes; }
+                else for (const auto& [name, address] : names) { static_cast<void>(name); if (!cls(address)->module) candidates.push_back(address); }
+                for (const auto address : candidates) {
+                    const auto value = cls(address);
+                    if (value->metaclass || !value->registered || !value->name.starts_with(prefix)) continue;
+                    if (proto && !class_conforms(address, proto)) continue;
+                    if (s.x[3]) {
+                        bool inherits = false;
+                        for (auto current = address; current && !inherits; current = cls(current)->super) inherits = current == s.x[3];
+                        if (!inherits) continue;
+                    }
+                    classes.push_back(address);
+                }
+            }
+            const auto stop = process.allocate_guest(8);
+            const auto invoke = m.read64(block + 16);
+            for (const auto address : classes) {
+                m.write8(stop, 0);
+                const std::array<Address, 3> arguments{block, address, stop};
+                static_cast<void>(process.calling_engine().invoke_callback(invoke, arguments));
+                if (m.read8(stop)) break;
+            }
+            process.release_guest(stop); });
         // Class* objc_copyClassesForImage(const char* image, unsigned* count): the image's registered classes.
         function("_objc_copyClassesForImage", [this](auto& s, auto& m) {
             const auto wanted = text(m, s.x[0]);
@@ -2086,6 +2167,13 @@ struct ObjcRuntime::Impl {
         function("_method_getImplementation", [this](auto& s, auto& m) { std::lock_guard lock(mutex);
             if (!method_owners.contains(s.x[0])) throw std::runtime_error("invalid Objective-C Method");
             s.x[0] = m.read64(s.x[0] + 16); });
+        // id method_invoke(id receiver, Method m, ...): the method's IMP with its selector in x1 and the
+        // remaining registers as they are (callers cast it to the IMP's own type).
+        function("_method_invoke", [this](auto& s, auto& m) {
+            { std::lock_guard lock(mutex); if (!method_owners.contains(s.x[1])) throw std::runtime_error("method_invoke received an invalid Objective-C Method"); }
+            const auto imp = m.read64(s.x[1] + 16);
+            s.x[1] = m.read64(s.x[1]);
+            redirect_to(s, imp); });
         function("_method_getName", [this](auto& s, auto& m) { std::lock_guard lock(mutex);
             if (!method_owners.contains(s.x[0])) throw std::runtime_error("invalid Objective-C Method");
             s.x[0] = m.read64(s.x[0]); });
@@ -2884,13 +2972,24 @@ void ObjcRuntime::rollback_images(std::span<const Address> ids) {
 }
 void ObjcRuntime::initialize_image(Address id) {
     std::vector<std::pair<Address, Address>> loads;
+    std::vector<Address> load_image_functions;
     { std::unique_lock lock(impl_->mutex); const auto found = impl_->images.find(id); if (found == impl_->images.end()) return;
         auto& image = found->second;
         while (image.initializing && image.owner != std::this_thread::get_id()) impl_->image_changed.wait(lock);
         if (image.error) std::rethrow_exception(image.error);
         if (image.initialized || image.initializing) return;
-        image.initializing = true; image.owner = std::this_thread::get_id(); loads = image.loads; }
+        image.initializing = true; image.owner = std::this_thread::get_id(); loads = image.loads;
+        load_image_functions = impl_->load_image_functions; }
     try {
+        // objc_addLoadImageFunc's functions see the image before its +load methods run.
+        if (!load_image_functions.empty())
+            for (const auto& info : impl_->process.images())
+                if (info.module_id == id && info.header) {
+                    const std::array<Address, 1> argument{info.header};
+                    for (const auto function : load_image_functions)
+                        static_cast<void>(impl_->process.calling_engine().invoke_callback(function, argument));
+                    break;
+                }
         const auto load = selector("load");
         for (const auto& [receiver, imp] : loads) { const std::array<Address, 2> args{receiver, load};
             static_cast<void>(impl_->process.calling_engine().invoke_callback(imp, args)); }

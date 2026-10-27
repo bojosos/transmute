@@ -437,6 +437,55 @@ void test_runtime_api() {
     require(list && f.engine.read32(count) == 2 && read(f.engine.read64(list)) == "T" && read(f.engine.read64(list + 24)) == "", "property_copyAttributeList");
     require(f.call("_class_replaceProperty", {cls, f.string("title"), attributes, 1}) == 1 &&
             read(f.call("_property_getAttributes", {f.call("_class_getProperty", {cls, f.string("title")})})) == "T@\"NSString\"", "class_replaceProperty");
+    // method_invoke: the IMP with the method's selector.
+    require(f.call("_method_invoke", {object, method}) == 42, "method_invoke calls the IMP");
+    // The root class's own implementations.
+    const auto probe = f.call("__objc_rootAlloc", {root});
+    require(probe != 0 && f.call("__objc_rootRetain", {probe}) == probe && f.call("__objc_rootRetainCount", {probe}) == 2, "_objc_rootRetain");
+    static_cast<void>(f.call("__objc_rootRelease", {probe}));
+    require(f.call("__objc_rootTryRetain", {probe}) == 1 && f.call("__objc_rootIsDeallocating", {probe}) == 0 &&
+            f.call("__objc_rootHash", {probe}) == probe, "_objc_rootTryRetain / IsDeallocating / Hash");
+    static_cast<void>(f.call("__objc_rootRelease", {probe}));
+    static_cast<void>(f.call("__objc_rootDealloc", {probe}));
+    require(!f.process.objects().peek(probe).has_value(), "_objc_rootDealloc frees the object");
+    // objc_retain_autorelease: one more reference until the pool pops.
+    const auto references = [&f](Address target) { return f.call("_objc_msgSend", {target, f.runtime.selector("retainCount")}); };
+    const auto before = references(other);
+    const auto pool = f.call("_objc_autoreleasePoolPush", {});
+    require(f.call("_objc_retain_autorelease", {other}) == other && references(other) == before + 1, "objc_retain_autorelease");
+    static_cast<void>(f.call("_objc_autoreleasePoolPop", {pool}));
+    require(references(other) == before, "the pool releases it");
+    // objc_enumerateClasses over the classes made at run time (OBJC_DYNAMIC_CLASSES).
+    const auto first = f.call("_objc_allocateClassPair", {root, f.string("AlchemyEnumA"), 0});
+    static_cast<void>(f.call("_objc_registerClassPair", {first}));
+    const auto second = f.call("_objc_allocateClassPair", {first, f.string("AlchemyEnumB"), 0});
+    static_cast<void>(f.call("_objc_registerClassPair", {second}));
+    static std::vector<Address> enumerated;
+    static bool stop_early = false;
+    const auto visit = f.process.install_function("_objc_test_enumerate", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        enumerated.push_back(s.x[1]);
+        if (stop_early) m.write8(s.x[2], 1);
+    });
+    const auto block = f.process.allocate_guest(32);
+    f.engine.fill_bytes(block, 0, 32);
+    f.engine.write64(block + 16, visit);
+    const auto enumerate = [&](Address image, Address subclassing) {
+        enumerated.clear();
+        static_cast<void>(f.call("_objc_enumerateClasses", {image, f.string("AlchemyEnum"), 0, subclassing, block}));
+        return enumerated;
+    };
+    require(enumerate(~0ULL, 0).size() == 2, "both classes made at run time");
+    require(enumerate(~0ULL, second) == std::vector<Address>{second}, "subclasses of AlchemyEnumB");
+    require(enumerate(~0ULL, first).size() == 2, "AlchemyEnumA and its subclass");
+    stop_early = true;
+    require(enumerate(~0ULL, 0).size() == 1, "*stop ends the enumeration");
+    stop_early = false;
+    require(enumerate(0x1234, 0).empty(), "an unknown image has no classes");
+    // objc_addLoadImageFunc: called for the images already initialized (none in this fixture).
+    static int images_seen = 0;
+    const auto loader = f.process.install_function("_objc_test_load_image", [](transmute::CpuState&, transmute::GuestMemory&) { ++images_seen; });
+    static_cast<void>(f.call("_objc_addLoadImageFunc", {loader}));
+    require(images_seen == 0, "no image is initialized here");
     // Protocols made at run time.
     const auto proto = f.call("_objc_allocateProtocol", {f.string("AlchemyRuntimeProtocol")});
     require(proto != 0 && f.call("_objc_allocateProtocol", {f.string("AlchemyRuntimeProtocol")}) == 0, "objc_allocateProtocol once per name");
