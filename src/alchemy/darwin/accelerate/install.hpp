@@ -21,5 +21,6 @@ void install_vforce(InstallContext& context);         // vforce.cpp: vForce
 void install_vimage(InstallContext& context);         // vimage.cpp: vImage buffers, conversions, geometry, convolution
 void install_blas(InstallContext& context);           // blas.cpp: BLAS levels 1-3 and the legacy LAPACK names
 void install_vdsp_more(InstallContext& context);      // vdsp_more.cpp: compound, complex, sorting, filters, 2-D FFTs
+void install_vimage_cg(InstallContext& context);      // vimage_cg.cpp: CGImage buffers and vImageConverter
 
 } // namespace alchemy::gui::fill

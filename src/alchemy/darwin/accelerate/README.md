@@ -40,6 +40,11 @@
     of the 16-bit, CbCr8 and half-float formats.
 
   Temporary buffers aren't used: a temp-size query answers 0.
+* **Real, vImage and CoreGraphics (`vimage_cg.cpp`):** `vImageBuffer_InitWithCGImage`,
+  `vImageCreateCGImageFromBuffer`, `vImageConverter_CreateWithCGImageFormat` with
+  `vImageConvert_AnyToAny`, and the format and size helpers, for gray and RGB images with 8-bit,
+  16-bit or float components, any alpha placement and the default, 16Little and 32Little byte orders.
+  There is no colour management: RGB becomes gray by Rec. 709 luma.
 * **Real, more vDSP (`vdsp_more.cpp`), float and double:** compound arithmetic (vasm, vsbm, vaam,
   vmma, vintb, vpythg, ...), applied ramps, clipping with counts, running sums and integrals,
   normalize, zero crossings, sorting and gathering, polynomials and table interpolation, polar and

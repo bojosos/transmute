@@ -178,6 +178,48 @@ void vectors(Fixture& f) {
     require(read_double(f, sines, 0) == 0 && near(read_double(f, sines, 1), 1) && read_double(f, cosines, 0) == 1, "vvsincos");
 }
 
+// vImage and CoreGraphics: a buffer to a CGImage and back in another layout, and a converter to gray.
+void vimage_cg(Fixture& f) {
+    constexpr std::string_view cg = "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics";
+    const auto rgb = f.call(cg, "_CGColorSpaceCreateDeviceRGB"), gray = f.call(cg, "_CGColorSpaceCreateDeviceGray");
+    const auto format = [&](std::uint32_t bpc, std::uint32_t bpp, Address space, std::uint32_t info) {
+        const auto at = f.block(40);
+        f.engine.write32(at, bpc);
+        f.engine.write32(at + 4, bpp);
+        f.engine.write64(at + 8, space);
+        f.engine.write32(at + 16, info);
+        return at;
+    };
+    // RGBA, straight alpha last: opaque red, half-transparent green.
+    const auto pixels = f.block(8);
+    f.engine.write32(pixels, 0xff0000ff);
+    f.engine.write32(pixels + 4, 0x8000ff00);
+    const auto rgba = format(8, 32, rgb, 3);
+    const auto error = f.block(8);
+    const auto image = f.call(vdsp, "_vImageCreateCGImageFromBuffer", {image_buffer(f, pixels, 1, 2, 8), rgba, 0, 0, 0, error});
+    require(image && f.engine.read64(error) == 0 && f.call(cg, "_CGImageGetWidth", {image}) == 2, "vImageCreateCGImageFromBuffer");
+    // Back as BGRA premultiplied (alpha first, 32Little): green at half alpha is (0, 128, 0, 128).
+    const auto bgra = format(8, 32, rgb, 2 | 0x2000);
+    const auto made = f.block(32);
+    require(verror(f.call(vdsp, "_vImageBuffer_InitWithCGImage", {made, bgra, 0, image, 0})) == 0 && f.engine.read64(made + 16) == 2, "vImageBuffer_InitWithCGImage");
+    const auto data = f.engine.read64(made);
+    require(f.engine.read32(data) == 0xffff0000 && f.engine.read32(data + 4) == 0x80008000,
+            "the pixels in BGRA premultiplied: " + std::to_string(f.engine.read32(data)) + " " + std::to_string(f.engine.read32(data + 4)));
+    // A converter to 8-bit gray with no alpha over a white background: red -> 54, green over white -> 219.
+    const auto white = f.block(8);
+    f.engine.write64(white, std::bit_cast<std::uint64_t>(1.0));
+    const auto gray8 = format(8, 8, gray, 0);
+    const auto converter = f.call(vdsp, "_vImageConverter_CreateWithCGImageFormat", {rgba, gray8, white, 0, error});
+    const auto luma = f.block(2);
+    require(converter && f.call(vdsp, "_vImageConverter_GetNumberOfSourceBuffers", {converter}) == 1 &&
+                verror(f.call(vdsp, "_vImageConvert_AnyToAny", {converter, image_buffer(f, pixels, 1, 2, 8), image_buffer(f, luma, 1, 2, 2), 0, 0})) == 0 &&
+                f.memory().read8(luma) == 54 && f.memory().read8(luma + 1) == 219,
+            "vImageConvert_AnyToAny to gray: " + std::to_string(f.memory().read8(luma)) + " " + std::to_string(f.memory().read8(luma + 1)));
+    static_cast<void>(f.call(vdsp, "_vImageConverter_Release", {converter}));
+    require((f.call(vdsp, "_vImageCGImageFormat_IsEqual", {rgba, rgba}) & 0xff) == 1 && (f.call(vdsp, "_vImageCGImageFormat_IsEqual", {rgba, bgra}) & 0xff) == 0,
+            "vImageCGImageFormat_IsEqual");
+}
+
 // vImage's added conversions, compositing, matrix multiply, morphology, rotation and scaling.
 void vimage_more(Fixture& f) {
     // BGRA8888toRGB888: (B 1, G 2, R 3, A 4) -> (3, 2, 1).
@@ -421,6 +463,7 @@ const Case accelerate_case("accelerate", [](Fixture& f) {
     blas(f);
     vdsp_more(f);
     vimage_more(f);
+    vimage_cg(f);
 });
 
 } // namespace

@@ -632,6 +632,7 @@ void install_accelerate(InstallContext& context) {
     install_vimage(context);
     install_blas(context);
     install_vdsp_more(context);
+    install_vimage_cg(context);
 }
 
 } // namespace alchemy::gui::fill
