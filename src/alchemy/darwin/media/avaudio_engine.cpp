@@ -1,6 +1,7 @@
 #include "alchemy/darwin/media/avaudio.hpp"
 #include "alchemy/darwin/media/hal_io.hpp"
 #include "alchemy/darwin/media/resampler.hpp"
+#include "alchemy/darwin/media/avaudio_effects.hpp"
 
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/gui/runloop.hpp"
@@ -40,6 +41,8 @@
 // - Manual rendering: offline (-renderOffline:toBuffer:error:) or realtime (manualRenderingBlock)
 //   in the format given, with no device; the input node then takes its audio from the block given
 //   to -setManualRenderingInputPCMFormat:inputBlock:.
+// - Effect nodes (AVAudioUnitEQ, Delay, Reverb, Distortion, Varispeed, TimePitch: avaudio_effects.hpp)
+//   process what their input renders, in the connection's channels at the engine's rate.
 // - Render and receiver blocks, and the input block, run under the engines' lock: one that calls
 //   back into the engine or its nodes waits forever (Apple's documentation forbids such calls).
 // - Unavailable, as documented: there is no input device, so -startAndReturnError: fails with an
@@ -55,7 +58,7 @@ constexpr std::int32_t no_device = static_cast<std::int32_t>(0x21646576);   // '
 // AVAudioPlayerNodeBufferOptions
 constexpr std::uint64_t option_loops = 1, option_interrupts = 2, option_interrupts_at_loop = 4;
 
-enum class Kind { output, input, mixer, player, source, sink, other };
+enum class Kind { output, input, mixer, player, source, sink, effect, other };
 // AVAudioEngineManualRenderingStatus and AVAudioEngineManualRenderingError
 constexpr std::int64_t manual_error = -1, manual_success = 0, manual_insufficient_input = 1;
 constexpr std::int32_t manual_invalid_mode = -80800, manual_initialized = -80801, manual_not_running = -80802;
@@ -195,6 +198,8 @@ struct Node final : ObjectPayload {
     Address block{};                   // _Block_copy'd render or receiver block
     Address source_format{};           // retained; 0: the connection's
     std::unique_ptr<GuestList> scratch;
+    // Effect nodes.
+    std::shared_ptr<Effect> effect;
 };
 
 struct EngineState final : ObjectPayload {
@@ -266,6 +271,7 @@ private:
     // The rate the engine renders at (the device's, or the manual format's); 0 with no clock.
     double clock_rate(const EngineState& e) const { return e.manual ? e.manual_pcm.rate : e.io ? e.io->rate() : 0.0; }
     void set_manual(Address engine, bool manual);
+    void install_effects();
 
     Support& support_;
     std::shared_ptr<security::Bridge> bridge_;
@@ -605,6 +611,25 @@ std::vector<double> Engines::pull(Address node_object, std::uint32_t frames, std
     case Kind::input:
         render_input(*n, out.data(), frames, channels);
         break;
+    case Kind::effect: {
+        // The input in this node's channels (a mono input feeds every channel).
+        const auto input = [&](std::uint32_t count) {
+            const auto found = n->inputs.find(0);
+            if (found == n->inputs.end()) return std::vector<double>(static_cast<std::size_t>(count) * channels, 0.0);
+            const auto known = n->input_channels.find(0);
+            const auto source_channels = known != n->input_channels.end() ? known->second : channels;
+            const auto data = pull(found->second, count, source_channels, rate, sample_time, depth + 1, callbacks, taps);
+            if (source_channels == channels) return data;
+            std::vector<double> mapped(static_cast<std::size_t>(count) * channels, 0.0);
+            for (std::uint32_t f = 0; f < count; ++f)
+                for (std::uint32_t c = 0; c < channels; ++c)
+                    mapped[static_cast<std::size_t>(f) * channels + c] =
+                        source_channels == 1 ? data[f] : c < source_channels ? data[static_cast<std::size_t>(f) * source_channels + c] : 0.0;
+            return mapped;
+        };
+        if (n->effect) n->effect->render(out.data(), frames, channels, rate, input);
+        break;
+    }
     case Kind::mixer:
     case Kind::output:
         for (const auto& [bus, source] : n->inputs) {
@@ -839,6 +864,177 @@ void Engines::schedule(Address player, Scheduled item, Address when, std::uint64
     }
 }
 
+// The effect nodes: AVAudioUnitEffect (EQ, Delay, Reverb, Distortion) and AVAudioUnitTimeEffect
+// (Varispeed, TimePitch), and AVAudioUnitEQFilterParameters. Parameters change under the engines' lock.
+struct BandState final : ObjectPayload {
+    std::shared_ptr<Equalizer> equalizer;
+    std::size_t index{};
+};
+
+void Engines::install_effects() {
+    auto& support = support_;
+    auto* sp = &support_;
+    const auto self = shared_from_this();
+    if (!support.objc.find_class("AVAudioUnit")) static_cast<void>(declare(support, "AVAudioUnit", "AVAudioNode"));
+    const auto effect_class = declare(support, "AVAudioUnitEffect", "AVAudioUnit");
+    const auto time_class = declare(support, "AVAudioUnitTimeEffect", "AVAudioUnit");
+    const auto eq_class = declare(support, "AVAudioUnitEQ", "AVAudioUnitEffect");
+    const auto band_class = declare(support, "AVAudioUnitEQFilterParameters", "NSObject");
+    const auto delay_class = declare(support, "AVAudioUnitDelay", "AVAudioUnitEffect");
+    const auto reverb_class = declare(support, "AVAudioUnitReverb", "AVAudioUnitEffect");
+    const auto distortion_class = declare(support, "AVAudioUnitDistortion", "AVAudioUnitEffect");
+    const auto varispeed_class = declare(support, "AVAudioUnitVarispeed", "AVAudioUnitTimeEffect");
+    const auto time_pitch_class = declare(support, "AVAudioUnitTimePitch", "AVAudioUnitTimeEffect");
+    const auto real32 = [](const CpuState& s) { return std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0])); };
+    const auto return_real32 = [](CpuState& s, double value) { s.v[0] = {std::bit_cast<std::uint32_t>(static_cast<float>(value)), 0}; };
+
+    // A node of `cls` around a new effect.
+    const auto initializer = [sp, self](Address cls, auto make) {
+        return [sp, self, cls, make](CpuState& s, GuestMemory&) {
+            const auto object = sp->objc.send_super(s.x[0], cls, sp->objc.selector("init")).x0;
+            if (object) {
+                const auto n = sp->objc.host_state<Node>(object);
+                n->kind = Kind::effect;
+                n->effect = make(s);
+            }
+            s.x[0] = object;
+        };
+    };
+    // The effect of `object` as T.
+    const auto effect_of = [self]<class T>(Address object, T*) {
+        const auto e = std::dynamic_pointer_cast<T>(self->node(object)->effect);
+        if (!e) unsupported("an AVAudioUnit effect method on a node of another kind");
+        return e;
+    };
+    // A float (or double, `wide`) property of effects of type T.
+    const auto property = [&support, self, effect_of, real32, return_real32]<class T>(Address cls, const char* getter, const char* setter, double T::*member, T*,
+                                                                                        bool wide = false) {
+        support.method(cls, getter, [self, effect_of, return_real32, member, wide](CpuState& s, GuestMemory&) {
+            const auto e = effect_of(s.x[0], static_cast<T*>(nullptr));
+            std::lock_guard lock(self->mutex_);
+            if (wide) s.v[0] = {std::bit_cast<std::uint64_t>((*e).*member), 0};
+            else return_real32(s, (*e).*member);
+        }, wide ? "d@:" : "f@:");
+        support.method(cls, setter, [self, effect_of, real32, member, wide](CpuState& s, GuestMemory&) {
+            const auto e = effect_of(s.x[0], static_cast<T*>(nullptr));
+            std::lock_guard lock(self->mutex_);
+            (*e).*member = wide ? std::bit_cast<double>(s.v[0][0]) : static_cast<double>(real32(s));
+        }, wide ? "v@:d" : "v@:f");
+    };
+    // bypass, on both base classes.
+    for (const auto cls : {effect_class, time_class}) {
+        support.method(cls, "bypass", [self](CpuState& s, GuestMemory&) {
+            const auto n = self->node(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            s.x[0] = n->effect && n->effect->bypass ? 1 : 0;
+        }, "B@:");
+        support.method(cls, "setBypass:", [self](CpuState& s, GuestMemory&) {
+            const auto n = self->node(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            if (n->effect) n->effect->bypass = (s.x[2] & 0xff) != 0;
+        }, "v@:B");
+    }
+
+    // ---- AVAudioUnitEQ: -initWithNumberOfBands:, -init (one band), bands, globalGain ----------------
+    const auto make_eq = [](std::size_t count) { return std::make_shared<Equalizer>(count); };
+    support.method(eq_class, "initWithNumberOfBands:", initializer(eq_class, [make_eq](CpuState& s) {
+        return make_eq(static_cast<std::size_t>(std::min<std::uint64_t>(s.x[2], 64)));
+    }), "@@:Q");
+    support.method(eq_class, "init", initializer(eq_class, [make_eq](CpuState&) { return make_eq(1); }), "@@:");
+    support.method(eq_class, "bands", [sp, self, effect_of, band_class](CpuState& s, GuestMemory&) {
+        const auto eq = effect_of(s.x[0], static_cast<Equalizer*>(nullptr));
+        std::size_t count{};
+        {
+            std::lock_guard lock(self->mutex_);
+            count = eq->bands.size();
+        }
+        std::vector<Address> items;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto band = sp->send_id(sp->send_id(band_class, "alloc"), "init");
+            const auto st = sp->objc.host_state<BandState>(band);
+            st->equalizer = eq;
+            st->index = i;
+            items.push_back(band);
+        }
+        const auto array = self->bridge_->array(items);
+        for (const auto item : items) sp->release(item);
+        s.x[0] = sp->send_id(array, "autorelease");
+    }, "@@:");
+    property(eq_class, "globalGain", "setGlobalGain:", &Equalizer::global_gain, static_cast<Equalizer*>(nullptr));
+    // AVAudioUnitEQFilterParameters: a view of one band.
+    const auto band_of = [sp](Address object) {
+        const auto st = sp->objc.find_host_state<BandState>(object);
+        if (!st || !st->equalizer) unsupported("an AVAudioUnitEQFilterParameters not taken from -[AVAudioUnitEQ bands]");
+        return st;
+    };
+    for (const auto& [getter, setter, field] : std::initializer_list<std::tuple<const char*, const char*, double Equalizer::Band::*>>{
+             {"frequency", "setFrequency:", &Equalizer::Band::frequency}, {"bandwidth", "setBandwidth:", &Equalizer::Band::bandwidth},
+             {"gain", "setGain:", &Equalizer::Band::gain}}) {
+        const auto member = field;
+        support.method(band_class, getter, [self, band_of, return_real32, member](CpuState& s, GuestMemory&) {
+            const auto b = band_of(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            return_real32(s, b->equalizer->bands[b->index].*member);
+        }, "f@:");
+        support.method(band_class, setter, [self, band_of, real32, member](CpuState& s, GuestMemory&) {
+            const auto b = band_of(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            b->equalizer->bands[b->index].*member = real32(s);
+        }, "v@:f");
+    }
+    support.method(band_class, "filterType", [self, band_of](CpuState& s, GuestMemory&) {
+        const auto b = band_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = static_cast<std::uint64_t>(b->equalizer->bands[b->index].type);
+    }, "q@:");
+    support.method(band_class, "setFilterType:", [self, band_of](CpuState& s, GuestMemory&) {
+        const auto b = band_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        b->equalizer->bands[b->index].type = std::clamp<std::int64_t>(static_cast<std::int64_t>(s.x[2]), 0, 10);
+    }, "v@:q");
+    support.method(band_class, "bypass", [self, band_of](CpuState& s, GuestMemory&) {
+        const auto b = band_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = b->equalizer->bands[b->index].bypass ? 1 : 0;
+    }, "B@:");
+    support.method(band_class, "setBypass:", [self, band_of](CpuState& s, GuestMemory&) {
+        const auto b = band_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        b->equalizer->bands[b->index].bypass = (s.x[2] & 0xff) != 0;
+    }, "v@:B");
+
+    // ---- AVAudioUnitDelay, Reverb, Distortion ----------------------------------------------------
+    support.method(delay_class, "init", initializer(delay_class, [](CpuState&) { return std::make_shared<Delay>(); }), "@@:");
+    property(delay_class, "delayTime", "setDelayTime:", &Delay::delay_time, static_cast<Delay*>(nullptr), true);
+    property(delay_class, "feedback", "setFeedback:", &Delay::feedback, static_cast<Delay*>(nullptr));
+    property(delay_class, "lowPassCutoff", "setLowPassCutoff:", &Delay::low_pass_cutoff, static_cast<Delay*>(nullptr));
+    property(delay_class, "wetDryMix", "setWetDryMix:", &Delay::wet_dry_mix, static_cast<Delay*>(nullptr));
+    support.method(reverb_class, "init", initializer(reverb_class, [](CpuState&) { return std::make_shared<Reverb>(); }), "@@:");
+    property(reverb_class, "wetDryMix", "setWetDryMix:", &Reverb::wet_dry_mix, static_cast<Reverb*>(nullptr));
+    support.method(reverb_class, "loadFactoryPreset:", [self, effect_of](CpuState& s, GuestMemory&) {
+        const auto e = effect_of(s.x[0], static_cast<Reverb*>(nullptr));
+        std::lock_guard lock(self->mutex_);
+        e->load_preset(static_cast<std::int64_t>(s.x[2]));
+        e->reset();
+    }, "v@:q");
+    support.method(distortion_class, "init", initializer(distortion_class, [](CpuState&) { return std::make_shared<Distortion>(); }), "@@:");
+    property(distortion_class, "preGain", "setPreGain:", &Distortion::pre_gain, static_cast<Distortion*>(nullptr));
+    property(distortion_class, "wetDryMix", "setWetDryMix:", &Distortion::wet_dry_mix, static_cast<Distortion*>(nullptr));
+    support.method(distortion_class, "loadFactoryPreset:", [self, effect_of](CpuState& s, GuestMemory&) {
+        const auto e = effect_of(s.x[0], static_cast<Distortion*>(nullptr));
+        std::lock_guard lock(self->mutex_);
+        e->load_preset(static_cast<std::int64_t>(s.x[2]));
+    }, "v@:q");
+
+    // ---- AVAudioUnitVarispeed, TimePitch ---------------------------------------------------------
+    support.method(varispeed_class, "init", initializer(varispeed_class, [](CpuState&) { return std::make_shared<Varispeed>(); }), "@@:");
+    property(varispeed_class, "rate", "setRate:", &Varispeed::rate, static_cast<Varispeed*>(nullptr));
+    support.method(time_pitch_class, "init", initializer(time_pitch_class, [](CpuState&) { return std::make_shared<TimePitch>(); }), "@@:");
+    property(time_pitch_class, "rate", "setRate:", &TimePitch::rate, static_cast<TimePitch*>(nullptr));
+    property(time_pitch_class, "pitch", "setPitch:", &TimePitch::pitch, static_cast<TimePitch*>(nullptr));
+    property(time_pitch_class, "overlap", "setOverlap:", &TimePitch::overlap, static_cast<TimePitch*>(nullptr));
+}
+
 void Engines::install() {
     auto& support = support_;
     const auto self = shared_from_this();
@@ -894,7 +1090,8 @@ void Engines::install() {
     support.method(node_class, "numberOfInputs", [self](CpuState& s, GuestMemory&) {
         const auto n = self->node(s.x[0]);
         std::lock_guard lock(self->mutex_);
-        s.x[0] = n->kind == Kind::mixer ? (n->inputs.empty() ? 1 : n->inputs.rbegin()->first + 2) : n->kind == Kind::output || n->kind == Kind::sink ? 1 : 0;
+        s.x[0] = n->kind == Kind::mixer ? (n->inputs.empty() ? 1 : n->inputs.rbegin()->first + 2)
+               : n->kind == Kind::output || n->kind == Kind::sink || n->kind == Kind::effect ? 1 : 0;
     }, "Q@:");
     support.method(node_class, "numberOfOutputs", [self](CpuState& s, GuestMemory&) {
         const auto kind = self->node(s.x[0])->kind;
@@ -1222,6 +1419,8 @@ void Engines::install() {
         std::lock_guard lock(self->mutex_);
         s.x[0] = e->running ? 1 : 0;
     }, "B@:");
+    install_effects();
+
     // ---- manual rendering ------------------------------------------------------------------------
     const auto manual_state = [self](Address object) {
         const auto e = self->engine(object);

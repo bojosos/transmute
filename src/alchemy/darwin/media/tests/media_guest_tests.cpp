@@ -1157,6 +1157,96 @@ void avaudio_conversion(Fixture& f) {
     require((f.send(engine, "isInManualRenderingMode") & 0xff) == 0, "manual rendering off");
 }
 
+// AVAudioUnit effects in an offline manual render: a constant mono source through an EQ's global
+// gain, a dry delay, a reverb, a distortion, varispeed and time-pitch into the main mixer.
+void avaudio_effects(Fixture& f) {
+    const auto b = alchemy::gui::security::bridge();
+    const auto format_of = [&](double rate, std::uint32_t channels) {
+        alchemy::CallRegs r{};
+        r.x[2] = 1; r.x[3] = channels; r.x[4] = 0;
+        r.set_d(0, rate);
+        return f.objc.send(f.send(f.cls("AVAudioFormat"), "alloc"), f.objc.selector("initWithCommonFormat:sampleRate:channels:interleaved:"), r).x0;
+    };
+    const auto mono = format_of(48000, 1), stereo = format_of(48000, 2);
+    static std::atomic<std::uint64_t> asked{0};
+    const auto constant = b->make_block([](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto frames = static_cast<std::uint32_t>(s.x[3]);
+        asked += frames;
+        const auto data = m.read64(s.x[4] + 16);
+        for (std::uint32_t i = 0; i < frames; ++i) m.write32(data + 4ULL * i, std::bit_cast<std::uint32_t>(0.25f));
+        s.x[0] = 0;
+    });
+    const auto error = f.block(8);
+    // Renders `frames` through `effect` (source -> effect -> mixer); the first left sample, and how
+    // many frames the source was asked for.
+    const auto run = [&](Address effect, std::uint32_t frames, std::uint32_t at) {
+        const auto engine = f.send(f.send(f.cls("AVAudioEngine"), "alloc"), "init");
+        alchemy::CallRegs manual{};
+        manual.x = {0, 0, 0, stereo, 4096, error, 0, 0};
+        require((f.objc.send(engine, f.objc.selector("enableManualRenderingMode:format:maximumFrameCount:error:"), manual).x0 & 0xff) == 1, "manual rendering");
+        const auto source = f.send(f.send(f.cls("AVAudioSourceNode"), "alloc"), "initWithFormat:renderBlock:", {mono, constant});
+        const auto mixer = f.send(engine, "mainMixerNode");
+        f.send(engine, "attachNode:", {source});
+        f.send(engine, "attachNode:", {effect});
+        f.send(engine, "connect:to:format:", {source, effect, mono});
+        f.send(engine, "connect:to:format:", {effect, mixer, mono});
+        require((f.send(engine, "startAndReturnError:", {error}) & 0xff) == 1, "the engine starts");
+        const auto buffer = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {stereo, 4096});
+        asked = 0;
+        alchemy::CallRegs offline{};
+        offline.x = {0, 0, frames, buffer, error, 0, 0, 0};
+        require(f.objc.send(engine, f.objc.selector("renderOffline:toBuffer:error:"), offline).x0 == 0, "an offline render");
+        const float value = std::bit_cast<float>(f.engine.read32(f.engine.read64(f.send(buffer, "floatChannelData")) + 4ULL * at));
+        f.send(engine, "stop");
+        return std::pair<float, std::uint64_t>{value, asked.load()};
+    };
+    const auto make = [&](const char* name) { return f.send(f.send(f.cls(name), "alloc"), "init"); };
+    const auto set_float = [&](Address object, const char* selector, float value) {
+        alchemy::CallRegs r{};
+        r.set_s(0, value);
+        static_cast<void>(f.objc.send(object, f.objc.selector(selector), r));
+    };
+    // EQ: +6.0206 dB of global gain doubles 0.25; a 0 dB parametric band changes nothing.
+    const auto eq = f.send(f.send(f.cls("AVAudioUnitEQ"), "alloc"), "initWithNumberOfBands:", {2});
+    require(eq && f.cf.length(f.send(eq, "bands")) == 2, "an EQ with two bands");
+    const auto band = f.cf.element(f.send(eq, "bands"), 0);
+    f.send(band, "setFilterType:", {0});
+    require(f.send(band, "filterType") == 0, "the band's filter type");
+    set_float(eq, "setGlobalGain:", 6.0206f);
+    const auto [doubled, eq_asked] = run(eq, 1024, 500);
+    require(std::fabs(doubled - 0.5f) < 1e-3f && eq_asked == 1024, "EQ global gain: " + std::to_string(doubled));
+    // Delay all dry: unchanged.
+    const auto delay = make("AVAudioUnitDelay");
+    set_float(delay, "setWetDryMix:", 0);
+    require(std::fabs(run(delay, 1024, 500).first - 0.25f) < 1e-6f, "a dry delay");
+    // Distortion: a soft clipper keeps a positive input positive and below 1.
+    const auto distortion = make("AVAudioUnitDistortion");
+    f.send(distortion, "loadFactoryPreset:", {3});
+    const auto clipped = run(distortion, 1024, 500).first;
+    require(clipped > 0.25f && clipped < 1.0f, "distortion: " + std::to_string(clipped));
+    // Reverb: a wet signal builds up from the constant input.
+    const auto reverb = make("AVAudioUnitReverb");
+    f.send(reverb, "loadFactoryPreset:", {4});
+    const auto wet = run(reverb, 4096, 4000).first;
+    require(std::isfinite(wet) && wet != 0.0f, "reverb: " + std::to_string(wet));
+    // Varispeed at 2: the source is asked for about twice the frames, and the level holds.
+    const auto varispeed = make("AVAudioUnitVarispeed");
+    set_float(varispeed, "setRate:", 2.0f);
+    const auto [fast, fast_asked] = run(varispeed, 1024, 900);
+    require(fast_asked >= 2000 && fast_asked <= 2200 && std::fabs(fast - 0.25f) < 0.01f,
+            "varispeed: " + std::to_string(fast_asked) + " frames, " + std::to_string(fast));
+    // Time-pitch an octave up at the same tempo: about as many input frames as output ones, the level held.
+    const auto time_pitch = make("AVAudioUnitTimePitch");
+    set_float(time_pitch, "setPitch:", 1200.0f);
+    const auto [shifted, shifted_asked] = run(time_pitch, 4096, 3000);
+    require(shifted_asked >= 4096 && shifted_asked <= 4096 * 2 + 8192 && std::fabs(shifted - 0.25f) < 0.02f,
+            "time-pitch: " + std::to_string(shifted_asked) + " frames, " + std::to_string(shifted));
+    alchemy::CallRegs bypass{};
+    bypass.x[2] = 1;
+    static_cast<void>(f.objc.send(time_pitch, f.objc.selector("setBypass:"), bypass));
+    require((f.send(time_pitch, "bypass") & 0xff) == 1, "bypass");
+}
+
 void music_sequence(Fixture& f) {
     const auto out = f.block(8);
     require(f.status(at, "_NewMusicSequence", {out}) == 0, "NewMusicSequence");
@@ -2311,5 +2401,6 @@ int main() {
         {"av_foundation", av_foundation},
         {"avaudio", avaudio},
         {"avaudio_conversion", avaudio_conversion},
+        {"avaudio_effects", avaudio_effects},
     });
 }
