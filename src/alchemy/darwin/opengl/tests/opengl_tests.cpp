@@ -313,6 +313,16 @@ const Case opengl_case("opengl", [](Fixture& f) {
     }
     const auto renderer = alchemy::host::gl::renderer();
     std::cout << "opengl: host " << renderer->renderer << ", " << renderer->version << ", core " << renderer->major << "." << renderer->minor << "\n";
+    // The checks below need a 4.1 core profile (and framebuffer objects). A host without one (a CI
+    // runner's software OpenGL 1.1) gives a 4.1 core request no renderer, as a Mac without one does.
+    if (renderer->major < 4 || (renderer->major == 4 && renderer->minor < 1)) {
+        require(f.status(gl, "_CGLChoosePixelFormat", {attributes(f, {pfa_opengl_profile, profile_4_1_core, 0}), attributes_out,
+                                                       attributes_out + 8}) == 0 &&
+                    f.engine.read64(attributes_out) == 0 && f.engine.read32(attributes_out + 8) == 0,
+                "no 4.1 core renderer on an older host driver");
+        std::cout << "opengl: the host driver has no 4.1 core profile; contexts not checked\n";
+        return;
+    }
     core_profile(f);
     legacy_profile(f);
     appkit_contexts(f);
