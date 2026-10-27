@@ -546,6 +546,52 @@ void exports_ports_and_messages(Fixture& f) {
     require(f.status(sys, "_mach_port_mod_refs", {self, 0x1234, 1, 1}) == static_cast<std::int32_t>(kern::invalid_name), "unknown name");
 }
 
+// mach_msg_server_once / mach_msg_server (mach/mach_extra.cpp): a MIG-style round trip.
+void exports_msg_server(Fixture& f) {
+    const auto self = f.engine.read32(f.symbol(sys, "_mach_task_self_"));
+    const auto name = f.block(4);
+    require(f.status(sys, "_mach_port_allocate", {self, 1, name}) == 0, "service port");
+    const auto service = f.engine.read32(name);
+    require(f.status(sys, "_mach_port_allocate", {self, 1, name}) == 0, "reply port");
+    const auto reply_port = f.engine.read32(name);
+    require(f.status(sys, "_mach_port_insert_right", {self, service, service, disp::make_send}) == 0, "send right");
+    const auto request = [&](std::uint32_t id) {
+        const auto message = f.block(64);
+        f.engine.write32(message, disp::copy_send | (static_cast<std::uint32_t>(disp::make_send_once) << 8));
+        f.engine.write32(message + 4, 24);
+        f.engine.write32(message + 8, service);
+        f.engine.write32(message + 12, reply_port);
+        f.engine.write32(message + 20, id);
+        require(f.status(sys, "_mach_msg", {message, option::send_msg, 24, 0, 0, 0, 0}) == 0, "request sent");
+    };
+    static std::uint32_t seen = 0;
+    static std::int32_t answer = 0;
+    const auto demux = f.process.install_function("_mach_test_demux", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto in = s.x[0], out = s.x[1];
+        seen = m.read32(in + 20);
+        m.write32(out, m.read32(in) & 0x1f);   // the reply right the request carried
+        m.write32(out + 4, 36);
+        m.write32(out + 8, m.read32(in + 8));
+        m.write32(out + 12, 0);
+        m.write32(out + 20, seen + 100);
+        m.write32(out + 32, static_cast<std::uint32_t>(answer));   // mig_reply_error_t.RetCode
+        s.x[0] = 1;
+    });
+    request(500);
+    require(f.status(sys, "_mach_msg_server_once", {demux, 64, service, 0}) == 0 && seen == 500, "the demux routine ran");
+    const auto buffer = f.block(256);
+    require(f.status(sys, "_mach_msg", {buffer, option::rcv_msg | option::rcv_timeout, 0, 256, reply_port, 100, 0}) == 0 &&
+            f.engine.read32(buffer + 20) == 600, "the reply arrives");
+    answer = -305;   // MIG_NO_REPLY
+    request(501);
+    require(f.status(sys, "_mach_msg_server_once", {demux, 64, service, 0}) == 0 && seen == 501, "a second round");
+    require(f.status(sys, "_mach_msg", {buffer, option::rcv_msg | option::rcv_timeout, 0, 256, reply_port, 5, 0}) ==
+            static_cast<std::int32_t>(mr::rcv_timed_out), "MIG_NO_REPLY sends nothing");
+    // The loop ends on a receive error (here: a timeout on the empty port).
+    require(f.status(sys, "_mach_msg_server", {demux, 64, service, option::rcv_timeout}) == static_cast<std::int32_t>(mr::rcv_timed_out),
+            "mach_msg_server returns on a receive error");
+}
+
 void exports_kevent(Fixture& f) {
     const auto self = f.engine.read32(f.symbol(sys, "_mach_task_self_"));
     const auto name = f.block(4);
@@ -1314,6 +1360,7 @@ int main(int argc, char** argv) {
     return fill_test::run("chrome_mach", {
         {"exports_ports_and_messages", exports_ports_and_messages},
         {"exports_kevent", exports_kevent},
+        {"exports_msg_server", exports_msg_server},
         {"exports_tasks_and_bootstrap", exports_tasks_and_bootstrap},
         {"exports_task_policies", exports_task_policies},
         {"exports_memory_entries", exports_memory_entries},

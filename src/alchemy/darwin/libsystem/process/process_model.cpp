@@ -929,6 +929,18 @@ void DarwinServices::Impl::install_process_services() {
     attribute("_posix_spawnattr_getbinpref_np", [](SpawnAttributes&, auto& s, auto& m) -> std::uint64_t {
         if (s.x[1]) m.write32(s.x[2], 0x0100000cU);
         if (s.x[3]) m.write64(s.x[3], s.x[1] ? 1 : 0); return 0; });
+    // Architecture preferences (cpu type and subtype pairs): as the binary preferences, arm64
+    // (any subtype) or "any" is what runs.
+    attribute("_posix_spawnattr_setarchpref_np", [](SpawnAttributes&, auto& s, auto& m) -> std::uint64_t {
+        const auto count = s.x[1];
+        for (std::uint64_t index = 0; index < count && index < 4; ++index) {
+            const auto type = m.read32(s.x[2] + index * 4);
+            if (type != 0x0100000cU && type != 0xffffffffU && type != 0) return enotsup_error;
+        }
+        if (s.x[4]) m.write64(s.x[4], count); return 0; });
+    attribute("_posix_spawnattr_getarchpref_np", [](SpawnAttributes&, auto& s, auto& m) -> std::uint64_t {
+        if (s.x[1]) { if (s.x[2]) m.write32(s.x[2], 0x0100000cU); if (s.x[3]) m.write32(s.x[3], 0xffffffffU); }
+        if (s.x[4]) m.write64(s.x[4], s.x[1] ? 1 : 0); return 0; });
 
     for (const auto searching : {false, true}) install(searching ? "_posix_spawnp" : "_posix_spawn",
         [this, searching, read_strings, base_request, resolve, exec_in_place, start, actions_of, attributes_of, current_environment](auto& s, auto& m) -> std::uint64_t {

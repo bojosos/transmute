@@ -50,4 +50,5 @@ void install_libsystem_xpc(Provider& p, ObjcRuntime& objc);   // misc/xpc_object
 void install_libsystem_threads_extra(Provider& p);   // process/threads_extra.cpp: QoS, stack attributes, ceilings
 void install_libsystem_bsd_extra(Provider& p);       // misc/bsd_extra.cpp: BSD libc leftovers (string, stdlib, pwcache, ...)
 void install_libsystem_netdb_extra(Provider& p);     // net/netdb_extra.cpp: netdb leftovers and the /etc databases
+void install_libsystem_mach_extra(Provider& p);      // mach/mach_extra.cpp: the MIG server loop, mig_*, clock_sleep, ...
 } // namespace alchemy::export_fill

@@ -111,6 +111,29 @@ void launchd(Fixture& f) {
     const auto bootstrap = f.engine.read32(f.symbol(sys, "_bootstrap_port"));
     require(f.status(sys, "_bootstrap_look_up", {bootstrap, f.text("com.example.service"), port}) == 1102, "bootstrap_look_up");
     require(f.read_text(f.call(sys, "_bootstrap_strerror", {1102})) == "Unknown service name", "bootstrap_strerror");
+    require(f.status(sys, "_bootstrap_look_up2", {bootstrap, f.text("com.example.service"), port, 0, 0}) == 1102, "bootstrap_look_up2");
+    // clock_sleep on the system clock: 10 ms relative; a bad nanosecond count is KERN_INVALID_VALUE.
+    const auto clock = f.block(4);
+    require(f.status(sys, "_host_get_clock_service", {f.call(sys, "_mach_host_self"), 0, clock}) == 0, "host_get_clock_service");
+    const auto wake = f.block(8);
+    require(f.status(sys, "_clock_sleep", {f.engine.read32(clock), 1, 10'000'000ULL << 32, wake}) == 0, "clock_sleep relative");
+    require(f.status(sys, "_clock_sleep", {f.engine.read32(clock), 1, 2'000'000'000ULL << 32, 0}) == 18, "clock_sleep invalid");
+    // getsegbynamefromheader_64 over a synthetic header: one LC_SEGMENT_64 "__DATA".
+    const auto header = f.block(32 + 72);
+    f.engine.write32(header, 0xfeedfacf);
+    f.engine.write32(header + 16, 1);
+    f.engine.write32(header + 32, 0x19);
+    f.engine.write32(header + 36, 72);
+    f.engine.write_bytes(header + 40, std::vector<std::uint8_t>{'_', '_', 'D', 'A', 'T', 'A'});
+    require(f.call(sys, "_getsegbynamefromheader_64", {header, f.text("__DATA")}) == header + 32 &&
+            f.call(sys, "_getsegbynamefromheader_64", {header, f.text("__TEXT")}) == 0, "getsegbynamefromheader_64");
+    // minherit over vm_inherit.
+    const auto self = f.engine.read32(f.symbol(sys, "_mach_task_self_"));
+    const auto cell = f.block(8);
+    require(f.status(sys, "_vm_allocate", {self, cell, 16384, 1}) == 0, "vm_allocate");
+    const auto region = f.engine.read64(cell);
+    require(f.status(sys, "_minherit", {region, 16384, 1}) == 0 && f.status(sys, "_minherit", {region, 16384, 7}) == -1, "minherit");
+    static_cast<void>(f.call(sys, "_vm_deallocate", {self, region, 16384}));
     require(f.call(sys, "_launch_msg", {0}) == 0, "launch_msg fails");
     const auto dictionary = f.call(sys, "_launch_data_alloc", {1});
     const auto value = f.call(sys, "_launch_data_new_string", {f.text("value")});

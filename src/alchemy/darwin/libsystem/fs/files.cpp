@@ -431,6 +431,24 @@ void DarwinServices::Impl::install_extra() {
     }, UINT32_MAX);
     install("_snprintf_l", [this](auto& s, auto& m) { validate_locale(s.x[2]); const auto value = format(m, s.x[3], s.sp); if (s.x[1]) put_text(m, s.x[0], std::string_view(value.data(), static_cast<std::size_t>(std::min<std::uint64_t>(value.size(), s.x[1] - 1)))); return static_cast<std::uint64_t>(value.size()); }, UINT32_MAX);
     install("_asprintf_l", [this](auto& s, auto& m) { validate_locale(s.x[1]); const auto value = format(m, s.x[2], s.sp); const auto address = allocate(value.size() + 1); put_text(m, address, value); m.write64(s.x[0], address); return static_cast<std::uint64_t>(value.size()); }, UINT32_MAX);
+    // The *printf_l forms: the C locale is the only one, so they print as their plain forms.
+    install("_printf_l", [this](auto& s, auto& m) { validate_locale(s.x[0]); return output_stream(m, standard_streams[1], format(m, s.x[1], s.sp)); }, UINT32_MAX);
+    install("_vprintf_l", [this](auto& s, auto& m) { validate_locale(s.x[0]); return output_stream(m, standard_streams[1], format(m, s.x[1], s.x[2])); }, UINT32_MAX);
+    install("_fprintf_l", [this](auto& s, auto& m) { validate_locale(s.x[1]); return output_stream(m, s.x[0], format(m, s.x[2], s.sp)); }, UINT32_MAX);
+    install("_vfprintf_l", [this](auto& s, auto& m) { validate_locale(s.x[1]); return output_stream(m, s.x[0], format(m, s.x[2], s.x[3])); }, UINT32_MAX);
+    for (const auto va : {false, true})
+        install(va ? "_vsprintf_l" : "_sprintf_l", [this, va](auto& s, auto& m) {
+            validate_locale(s.x[1]);
+            const auto value = format(m, s.x[2], va ? s.x[3] : s.sp);
+            put_text(m, s.x[0], value);
+            return static_cast<std::uint64_t>(value.size());
+        }, UINT32_MAX);
+    install("_vsnprintf_l", [this](auto& s, auto& m) {
+        validate_locale(s.x[2]);
+        const auto value = format(m, s.x[3], s.x[4]);
+        if (s.x[1]) put_text(m, s.x[0], std::string_view(value.data(), static_cast<std::size_t>(std::min<std::uint64_t>(value.size(), s.x[1] - 1))));
+        return static_cast<std::uint64_t>(value.size());
+    }, UINT32_MAX);
     install("_vasprintf_l", [this](auto& s, auto& m) { validate_locale(s.x[1]); const auto value = format(m, s.x[2], s.x[3]); const auto address = allocate(value.size() + 1); put_text(m, address, value); m.write64(s.x[0], address); return static_cast<std::uint64_t>(value.size()); }, UINT32_MAX);
     // vsscanf(input, format, va_list): a Darwin va_list addresses the same 8-byte slots.
     install("_vsscanf", [this](auto& s, auto& m) { return scan(m, s.x[0], s.x[1], s.x[2]); }, UINT32_MAX);

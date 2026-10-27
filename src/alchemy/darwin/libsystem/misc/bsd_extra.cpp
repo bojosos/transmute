@@ -22,7 +22,12 @@
 //                 rpmatch; arc4random_stir and arc4random_addrandom do nothing (arc4random
 //                 reads the host's random source on every call, there is no pool to stir)
 //   <stdio.h>     tempnam (over access and mktemp), fgetwln (over fgetln)
-//   <unistd.h>    getwd; mkfifoat, mknodat, mkpathat_np (relative to a directory descriptor)
+//   <unistd.h>    getwd; mkfifoat, mknodat, mkpathat_np (relative to a directory descriptor); setmode, getmode
+//   <libproc.h>   proc_track_dirty, proc_set_dirty, proc_get_dirty, proc_clear_dirty (this process's own
+//                 state; no launchd acts on it), proc_libversion
+//   <membership.h> mbr_gid_to_uuid, mbr_uuid_to_id (the compatibility UUIDs); getpwuuid, getpwuuid_r
+//   <execinfo.h>  backtrace_from_fp, backtrace_image_offsets
+//   minherit (vm_inherit), statfs64/fstatfs64/getfsstat64/getmntinfo64, atof_l, querylocale
 //   <time.h>      timeoff, strptime_l (the "C" locale); ualarm is an explicit stop, as alarm
 //                 (no asynchronous SIGALRM)
 //   <unistd.h>    getpass; <readpassphrase.h> readpassphrase (echo off on a terminal)
@@ -395,6 +400,255 @@ void install_libsystem_bsd_extra(Provider& p) {
         if (s.x[1]) m.write64(s.x[1], length);
         return buffer;
     }, 0);
+
+    // ---- libproc ----
+    // Dirty tracking (launchd's idle exit): this process's own state, kept here; another
+    // process's needs launchd's rights (EPERM). Errors are returned, as libproc does.
+    struct Dirty { std::mutex mutex; std::uint32_t tracking{}; bool dirty{}; };
+    auto dirty = std::make_shared<Dirty>();
+    const auto own = [p](std::uint64_t pid) { return static_cast<std::int32_t>(pid) == static_cast<std::int32_t>(p.call(libsystem_library, "_getpid", {})); };
+    // int proc_track_dirty(pid_t, uint32_t flags): PROC_DIRTY_TRACK 1, ALLOW_IDLE_EXIT 2, DEFER 4, LAUNCH_IN_PROGRESS 8.
+    p.libsystem("_proc_track_dirty", [dirty, own](CpuState& s, GuestMemory&) -> std::uint64_t {
+        if (!own(s.x[0])) return eperm;
+        const auto flags = static_cast<std::uint32_t>(s.x[1]);
+        if (flags & ~0xfU) return einval;
+        std::lock_guard lock(dirty->mutex);
+        dirty->tracking = flags;
+        return 0;
+    });
+    // int proc_set_dirty(pid_t, bool dirty): EINVAL until tracking is on.
+    p.libsystem("_proc_set_dirty", [dirty, own](CpuState& s, GuestMemory&) -> std::uint64_t {
+        if (!own(s.x[0])) return eperm;
+        std::lock_guard lock(dirty->mutex);
+        if (!(dirty->tracking & 1)) return einval;
+        dirty->dirty = (s.x[1] & 0xff) != 0;
+        return 0;
+    });
+    // int proc_get_dirty(pid_t, uint32_t* flags): TRACKED 1, ALLOWS_IDLE_EXIT 2, IS_DIRTY 4, LAUNCH_IS_IN_PROGRESS 8.
+    p.libsystem("_proc_get_dirty", [dirty, own](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!own(s.x[0])) return eperm;
+        if (!s.x[1]) return einval;
+        std::lock_guard lock(dirty->mutex);
+        std::uint32_t flags = 0;
+        if (dirty->tracking & 1) flags |= 1;
+        if (dirty->tracking & 2) flags |= 2;
+        if (dirty->dirty) flags |= 4;
+        if (dirty->tracking & 8) flags |= 8;
+        m.write32(s.x[1], flags);
+        return 0;
+    });
+    // int proc_clear_dirty(pid_t, uint32_t flags): PROC_DIRTY_LAUNCH_IN_PROGRESS (8) ends the launch.
+    p.libsystem("_proc_clear_dirty", [dirty, own](CpuState& s, GuestMemory&) -> std::uint64_t {
+        if (!own(s.x[0])) return eperm;
+        std::lock_guard lock(dirty->mutex);
+        dirty->tracking &= ~(static_cast<std::uint32_t>(s.x[1]) & 8U);
+        return 0;
+    });
+    // int proc_libversion(int* major, int* minor): libproc 1.1.
+    p.libsystem("_proc_libversion", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (s.x[0]) m.write32(s.x[0], 1);
+        if (s.x[1]) m.write32(s.x[1], 1);
+        return 0;
+    });
+
+    // ---- membership: the compatibility UUIDs (user FFFFEEEE-DDDD-CCCC-BBBB-AAAA<uid>, group
+    // ABCDEFAB-CDEF-ABCD-EFAB-CDEF<gid>) ----
+    constexpr std::array<std::uint8_t, 12> user_prefix{0xff, 0xff, 0xee, 0xee, 0xdd, 0xdd, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa};
+    constexpr std::array<std::uint8_t, 12> group_prefix{0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef};
+    // int mbr_gid_to_uuid(gid_t, uuid_t)
+    p.libsystem("_mbr_gid_to_uuid", [group_prefix](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[1]) return einval;
+        m.write_bytes(s.x[1], group_prefix);
+        const auto gid = static_cast<std::uint32_t>(s.x[0]);
+        for (unsigned index = 0; index < 4; ++index) m.write8(s.x[1] + 12 + index, static_cast<std::uint8_t>(gid >> (24 - index * 8)));
+        return 0;
+    });
+    // The id and type (ID_TYPE_UID 0, ID_TYPE_GID 1) a compatibility UUID names.
+    const auto uuid_id = [user_prefix, group_prefix](GuestMemory& m, std::uint64_t uuid) -> std::optional<std::pair<std::uint32_t, std::uint32_t>> {
+        std::array<std::uint8_t, 16> bytes{};
+        m.read_bytes(uuid, bytes);
+        const auto id = static_cast<std::uint32_t>(bytes[12]) << 24 | static_cast<std::uint32_t>(bytes[13]) << 16 |
+                        static_cast<std::uint32_t>(bytes[14]) << 8 | bytes[15];
+        if (std::equal(user_prefix.begin(), user_prefix.end(), bytes.begin())) return std::pair{id, 0U};
+        if (std::equal(group_prefix.begin(), group_prefix.end(), bytes.begin())) return std::pair{id, 1U};
+        return std::nullopt;
+    };
+    // int mbr_uuid_to_id(const uuid_t, id_t* id, int* type): ENOENT for other UUIDs.
+    p.libsystem("_mbr_uuid_to_id", [uuid_id](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[0] || !s.x[1] || !s.x[2]) return einval;
+        const auto found = uuid_id(m, s.x[0]);
+        if (!found) return enoent;
+        m.write32(s.x[1], found->first);
+        m.write32(s.x[2], found->second);
+        return 0;
+    });
+    // struct passwd* getpwuuid(uuid_t) / int getpwuuid_r(uuid_t, struct passwd*, char*, size_t, struct passwd**)
+    p.libsystem("_getpwuuid", [p, uuid_id](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[0]) return 0;
+        const auto found = uuid_id(m, s.x[0]);
+        if (!found || found->second != 0) return 0;
+        return p.call(libsystem_library, "_getpwuid", {found->first});
+    }, 0);
+    p.libsystem("_getpwuuid_r", [p, uuid_id](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (s.x[4]) m.write64(s.x[4], 0);
+        if (!s.x[0]) return einval;
+        const auto found = uuid_id(m, s.x[0]);
+        if (!found || found->second != 0) return 0;   // not found: *result NULL, no error
+        return p.call(libsystem_library, "_getpwuid_r", {found->first, s.x[1], s.x[2], s.x[3], s.x[4]}) & 0xffffffffULL;
+    });
+
+    // ---- <execinfo.h> ----
+    // int backtrace_from_fp(void* fp, void** array, int size): the return addresses of the frame
+    // chain from fp ({previous fp, lr} records; pointer authentication bits cleared).
+    p.libsystem("_backtrace_from_fp", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto size = static_cast<std::int32_t>(s.x[2]);
+        std::int32_t count = 0;
+        for (auto frame = s.x[0]; frame && !(frame & 15) && count < size && m.query_region(frame);) {
+            const auto next = m.read64(frame), address = m.read64(frame + 8) & 0x0000ffffffffffffULL;
+            if (!address) break;
+            m.write64(s.x[1] + static_cast<std::uint64_t>(count++) * 8, address);
+            if (next <= frame) break;
+            frame = next;
+        }
+        return static_cast<std::uint32_t>(count);
+    });
+    // void backtrace_image_offsets(void* const* array, struct image_offset* offsets, int size):
+    // {uuid_t of the image (its LC_UUID), uint32_t offset from its header} per address; zeros for
+    // an address in no image.
+    p.libsystem("_backtrace_image_offsets", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto size = static_cast<std::int32_t>(s.x[2]);
+        const auto info = p.malloc(32);   // Dl_info
+        for (std::int32_t index = 0; index < size; ++index) {
+            const auto address = m.read64(s.x[0] + static_cast<std::uint64_t>(index) * 8);
+            const auto entry = s.x[1] + static_cast<std::uint64_t>(index) * 20;
+            m.fill_bytes(entry, 0, 20);
+            if (!address || !p.call(libsystem_library, "_dladdr", {address, info})) continue;
+            const auto header = m.read64(info + 8);
+            if (!header || m.read32(header) != 0xfeedfacfU) continue;
+            auto cursor = header + 32;
+            for (std::uint32_t command = 0, commands = m.read32(header + 16); command < commands; ++command) {
+                const auto kind = m.read32(cursor), length = m.read32(cursor + 4);
+                if (length < 8) break;
+                if (kind == 0x1b) { m.copy_bytes(entry, cursor + 8, 16); break; }   // LC_UUID
+                cursor += length;
+            }
+            m.write32(entry + 16, static_cast<std::uint32_t>(address - header));
+        }
+        static_cast<void>(p.call(libsystem_library, "_free", {info}));
+        return 0;
+    });
+
+    // int minherit(void* address, size_t length, int inherit): vm_inherit on this task's range.
+    p.libsystem("_minherit", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto task = p.process().resolve(libsystem_library, "_mach_task_self_");
+        const auto inherit = static_cast<std::uint32_t>(s.x[2]);
+        if (!task || inherit > 2) throw Errno{einval};
+        if (p.call(libsystem_library, "_vm_inherit", {m.read32(task->address), s.x[0], s.x[1], inherit}) & 0xffffffffULL) throw Errno{einval};
+        return 0;
+    });
+    // statfs64 / fstatfs64 / getfsstat64 / getmntinfo64: on arm64 the 64-bit-inode forms are the plain ones.
+    for (const auto& [name, target] : std::array<std::pair<const char*, const char*>, 4>{{
+             {"_statfs64", "_statfs"}, {"_fstatfs64", "_fstatfs"}, {"_getfsstat64", "_getfsstat"}, {"_getmntinfo64", "_getmntinfo"}}}) {
+        const std::string function = target;
+        p.libsystem(name, [p, function](CpuState& s, GuestMemory&) -> std::uint64_t {
+            return p.call(libsystem_library, function, {s.x[0], s.x[1], s.x[2]});
+        });
+    }
+    // double atof_l(const char*, locale_t): strtod_l's value.
+    p.libsystem("_atof_l", [&process](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto strtod = process.resolve(libsystem_library, "_strtod_l");
+        if (!strtod) throw std::runtime_error("Darwin atof_l requires strtod_l");
+        CallRegs registers;
+        registers.x[0] = s.x[0]; registers.x[1] = 0; registers.x[2] = s.x[1];
+        const auto result = EngineAdapter(process.calling_engine()).call_regs(strtod->address, registers);
+        s.v[0][0] = result.v[0][0]; s.v[0][1] = result.v[0][1];
+        return result.x0;
+    });
+    // const char* querylocale(int mask, locale_t): "C", the only locale (the mask names categories, LC_ALL_MASK 0x3f).
+    const auto locale_name = process.allocate_guest(2);
+    put_string(static_cast<GuestMemory&>(process.main_engine()), locale_name, "C");
+    p.libsystem("_querylocale", [locale_name](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto mask = static_cast<std::uint32_t>(s.x[0]);
+        if (!mask || (mask & ~0x3fU)) throw Errno{einval};
+        return locale_name;
+    }, 0);
+
+    // ---- setmode(3)/getmode(3) ----
+    // void* setmode(const char* mode): an octal mode or chmod(1) symbolic clauses ([ugoa]*[+-=][rwxXstugo]*...),
+    // checked here and kept (with the umask of the moment) in a malloc'd block; getmode applies it.
+    constexpr std::uint32_t mode_magic = 0x31534d41;   // "AMS1"
+    p.libsystem("_setmode", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto text = bounded_string(m, s.x[0], 1024);
+        if (text.empty()) throw Errno{einval};
+        const bool octal = text.find_first_not_of("01234567") == std::string::npos;
+        if (octal) { if (text.size() > 5 || std::stoul(text, nullptr, 8) > 07777) throw Errno{einval}; }
+        else {
+            std::size_t at = 0;
+            while (true) {
+                while (at < text.size() && std::string_view("ugoa").find(text[at]) != std::string_view::npos) ++at;
+                if (at == text.size() || std::string_view("+-=").find(text[at]) == std::string_view::npos) throw Errno{einval};
+                while (at < text.size() && std::string_view("+-=").find(text[at]) != std::string_view::npos) {
+                    ++at;
+                    while (at < text.size() && std::string_view("rwxXstugo").find(text[at]) != std::string_view::npos) ++at;
+                }
+                if (at == text.size()) break;
+                if (text[at] != ',') throw Errno{einval};
+                ++at;
+            }
+        }
+        const auto mask = static_cast<std::uint32_t>(p.call(libsystem_library, "_umask", {0}));
+        static_cast<void>(p.call(libsystem_library, "_umask", {mask}));
+        const auto block = p.malloc(8 + text.size() + 1);
+        m.write32(block, mode_magic);
+        m.write32(block + 4, mask & 0777);
+        put_string(m, block + 8, text);
+        return block;
+    }, 0);
+    // mode_t getmode(const void* set, mode_t mode): the mode with the set's changes; the file type stays.
+    p.libsystem("_getmode", [mode_magic](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto original = static_cast<std::uint32_t>(s.x[1] & 0xffff);
+        if (!s.x[0] || m.read32(s.x[0]) != mode_magic) return original;
+        const auto mask = m.read32(s.x[0] + 4);
+        const auto text = bounded_string(m, s.x[0] + 8, 1024);
+        if (text.find_first_not_of("01234567") == std::string::npos)
+            return (original & ~07777U) | (static_cast<std::uint32_t>(std::stoul(text, nullptr, 8)) & 07777U);
+        auto mode = original;
+        std::size_t at = 0;
+        while (at <= text.size()) {
+            std::uint32_t who = 0;
+            for (; at < text.size() && std::string_view("ugoa").find(text[at]) != std::string_view::npos; ++at)
+                who |= text[at] == 'u' ? 04700U : text[at] == 'g' ? 02070U : text[at] == 'o' ? 01007U : 07777U;
+            const bool implicit = who == 0;
+            if (implicit) who = 07777U;
+            while (at < text.size() && std::string_view("+-=").find(text[at]) != std::string_view::npos) {
+                const auto op = text[at++];
+                std::uint32_t bits = 0;
+                for (; at < text.size() && std::string_view("rwxXstugo").find(text[at]) != std::string_view::npos; ++at) {
+                    switch (text[at]) {
+                    case 'r': bits |= 0444; break;
+                    case 'w': bits |= 0222; break;
+                    case 'x': bits |= 0111; break;
+                    case 'X': if ((original & 0170000) == 0040000 || (mode & 0111)) bits |= 0111; break;
+                    case 's': bits |= 06000; break;
+                    case 't': bits |= 01000; break;
+                    // Copy another class's current bits to every class.
+                    case 'u': { const auto v = (mode >> 6) & 7; bits |= v << 6 | v << 3 | v; break; }
+                    case 'g': { const auto v = (mode >> 3) & 7; bits |= v << 6 | v << 3 | v; break; }
+                    case 'o': { const auto v = mode & 7; bits |= v << 6 | v << 3 | v; break; }
+                    default: break;
+                    }
+                }
+                auto affected = bits & who;
+                if (implicit) affected &= ~mask;
+                if (op == '+') mode |= affected;
+                else if (op == '-') mode &= ~affected;
+                else { mode &= ~(who & (implicit ? ~mask & 07777U : 07777U)); mode |= affected; }
+            }
+            if (at >= text.size()) break;
+            ++at;   // ','
+        }
+        return mode & 0xffff;
+    });
 
     // ---- <time.h> ----
     // time_t timeoff(struct tm*, long offset): tm read as the time `offset` seconds east of UTC.

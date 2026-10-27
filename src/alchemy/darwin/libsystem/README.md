@@ -95,7 +95,15 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   mkfifoat/mknodat/mkpathat_np (relative to a directory descriptor), telldir/seekdir (core), and
   the malloc zone diagnostics (malloc_zone_check/print/log/claimed_address, discharge checking,
   malloc_printf; `malloc/malloc_zones.cpp`: a guest zone answers through its introspection
-  table, the system zone is consistent by construction). random's initstate/setstate keep one generator per state array
+  table, the system zone is consistent by construction).
+* **Mach user-library and process leftovers** (alchemy-fx, `install_libsystem_gaps`):
+  `mach/mach_extra.cpp` (the MIG server loop mach_msg_server(_once), mig_allocate/
+  deallocate/strncpy, host_kernel_version, clock_sleep, mach_task_is_self,
+  mach_vm_behavior_set, bootstrap_look_up2/register2); in `misc/bsd_extra.cpp` libproc dirty
+  tracking (this process's own; no launchd acts on it), the membership compatibility UUIDs with
+  getpwuuid(_r), backtrace_from_fp/backtrace_image_offsets, minherit, setmode/getmode, the
+  statfs64 forms, atof_l and querylocale; the getsectbyname/getsegbyname/get_etext family in
+  `mach/machsys.cpp`; the *printf_l forms and posix_spawnattr_{set,get}archpref_np (core). random's initstate/setstate keep one generator per state array
   (`misc/libsystem_runtime.cpp`, with the compiler-rt 128-bit, overflow, half-precision and
   complex builtins); Blocks introspection is `misc/libsystem_extra.cpp`'s. sigsuspend, sigpause
   and pause (`process/process_model.cpp`) wait until a handler has run for a signal raised in

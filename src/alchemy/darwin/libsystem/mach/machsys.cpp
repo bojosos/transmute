@@ -713,6 +713,47 @@ void Machsys::install_libc() {
         if (s.x[3]) m.write64(s.x[3], m.read64(entry + 40));
         s.x[0] = m.read64(entry + 32);   // the unslid section address, as Darwin returns it
     });
+    // The segment_command_64 named `segment` in a mapped image header, or 0.
+    const auto find_segment = [](GuestMemory& m, Address header, const std::string& segment) -> Address {
+        if (!header || m.read32(header) != 0xfeedfacfU) return 0;
+        const auto commands = m.read32(header + 16);
+        auto cursor = header + 32;
+        for (std::uint32_t index = 0; index < commands; ++index) {
+            const auto command = m.read32(cursor), size = m.read32(cursor + 4);
+            if (size < 8) return 0;
+            if (command == 0x19) {
+                std::array<std::uint8_t, 16> name{};
+                m.read_bytes(cursor + 8, name);
+                if (std::string(reinterpret_cast<const char*>(name.data()), strnlen(reinterpret_cast<const char*>(name.data()), 16)) == segment)
+                    return cursor;
+            }
+            cursor += size;
+        }
+        return 0;
+    };
+    // getsectbyname(segment, section) / getsegbyname(segment): the main executable's (dyld's image 0)
+    // section_64 / segment_command_64, in its mapped header; getsegbynamefromheader_64 for any header.
+    raw(libsystem, "_getsectbyname", [this, find_section](CpuState& s, GuestMemory& m) {
+        s.x[0] = find_section(m, call(libsystem, "__dyld_get_image_header", {0}), read_cstring(m, s.x[0], 17), read_cstring(m, s.x[1], 17));
+    });
+    raw(libsystem, "_getsegbyname", [this, find_segment](CpuState& s, GuestMemory& m) {
+        s.x[0] = find_segment(m, call(libsystem, "__dyld_get_image_header", {0}), read_cstring(m, s.x[0], 17));
+    });
+    raw(libsystem, "_getsegbynamefromheader_64", [this, find_segment](CpuState& s, GuestMemory& m) {
+        s.x[0] = find_segment(m, s.x[0], read_cstring(m, s.x[1], 17));
+    });
+    // get_etext / get_edata / get_end (end(3)): the first unslid address after the main
+    // executable's __TEXT,__text, __DATA,__data and __DATA segment; 0 when it has none.
+    const auto section_end = [this, find_section](GuestMemory& m, const char* segment, const char* section) -> Address {
+        const auto entry = find_section(m, call(libsystem, "__dyld_get_image_header", {0}), segment, section);
+        return entry ? m.read64(entry + 32) + m.read64(entry + 40) : 0;
+    };
+    raw(libsystem, "_get_etext", [section_end](CpuState& s, GuestMemory& m) { s.x[0] = section_end(m, "__TEXT", "__text"); });
+    raw(libsystem, "_get_edata", [section_end](CpuState& s, GuestMemory& m) { s.x[0] = section_end(m, "__DATA", "__data"); });
+    raw(libsystem, "_get_end", [this, find_segment](CpuState& s, GuestMemory& m) {
+        const auto segment = find_segment(m, call(libsystem, "__dyld_get_image_header", {0}), "__DATA");
+        s.x[0] = segment ? m.read64(segment + 24) + m.read64(segment + 32) : 0;
+    });
     // kevent64: DarwinServices (net/sockets.cpp).
     // Generic (libatomic) __atomic_load(size, src, dest, order) and
     // __atomic_store(size, dest, src, order): one lock serializes them, which

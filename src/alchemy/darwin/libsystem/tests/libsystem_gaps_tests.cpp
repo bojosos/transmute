@@ -684,6 +684,101 @@ void test_bsd_more(Fixture& f) {
     require(f.sys("_inet6_option_space", {4}) == 20, "inet6_option_space");
 }
 
+// B11: Mach user-library helpers, libproc dirty tracking, membership UUIDs, frame-pointer
+// backtraces, minherit, the *64 statfs forms, atof_l, querylocale, setmode/getmode, the
+// *printf_l forms and the spawn arch preferences.
+void test_b11(Fixture& f) {
+    const auto sys = "/usr/lib/libSystem.B.dylib";
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto self = f.engine.read32(f.symbol(sys, "_mach_task_self_"));
+    require(f.sys("_mach_task_is_self", {self}) == 1 && f.sys("_mach_task_is_self", {self + 1}) == 0, "mach_task_is_self");
+    const auto cell = f.process.allocate_guest(8);
+    f.sys("_mig_allocate", {cell, 16384});
+    const auto region = f.engine.read64(cell);
+    require(region != 0, "mig_allocate");
+    static_cast<transmute::GuestMemory&>(f.engine).write8(region, 1);
+    require(f.sys("_mach_vm_behavior_set", {self, region, 16384, 4}) == 0 && f.sys("_mach_vm_behavior_set", {self, region, 16384, 99}) == 4,
+            "mach_vm_behavior_set");
+    f.sys("_mig_deallocate", {region, 16384});
+    const auto copy = f.process.allocate_guest(8);
+    require(f.sys("_mig_strncpy", {copy, f.text("hello"), 4}) == 4 && f.read(copy) == "hel" && f.sys("_mig_strncpy", {copy, f.text("x"), 0}) == 0,
+            "mig_strncpy");
+    const auto version = f.process.allocate_guest(512);
+    require(f.sys("_host_kernel_version", {0, version}) == 0 && !f.read(version).empty(), "host_kernel_version");
+    // libproc dirty tracking of this process.
+    const auto pid = f.sys("_getpid"), flags = f.process.allocate_guest(4);
+    require(f.sys("_proc_set_dirty", {pid, 1}) == 22, "dirty needs tracking");
+    require(f.sys("_proc_track_dirty", {pid, 3}) == 0 && f.sys("_proc_set_dirty", {pid, 1}) == 0 && f.sys("_proc_get_dirty", {pid, flags}) == 0 &&
+            f.engine.read32(flags) == 7, "tracked, idle exit allowed, dirty");
+    require(f.sys("_proc_set_dirty", {pid + 1, 1}) == 1, "another process: EPERM");
+    const auto major = f.process.allocate_guest(4), minor = f.process.allocate_guest(4);
+    require(f.sys("_proc_libversion", {major, minor}) == 0 && f.engine.read32(major) == 1, "proc_libversion");
+    // Membership UUIDs.
+    const auto uuid = f.process.allocate_guest(16), id = f.process.allocate_guest(4), type = f.process.allocate_guest(4);
+    require(f.sys("_mbr_gid_to_uuid", {20, uuid}) == 0 && f.sys("_mbr_uuid_to_id", {uuid, id, type}) == 0 && f.engine.read32(id) == 20 &&
+            f.engine.read32(type) == 1, "a group UUID round trip");
+    require(f.sys("_getpwuuid", {uuid}) == 0, "a group UUID is no user");
+    const std::vector<std::uint8_t> user{0xff, 0xff, 0xee, 0xee, 0xdd, 0xdd, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0, 6, 0x79, 0x32};
+    f.engine.write_bytes(uuid, user);
+    require(f.sys("_mbr_uuid_to_id", {uuid, id, type}) == 0 && f.engine.read32(id) == 424242 && f.engine.read32(type) == 0, "a user UUID");
+    static_cast<transmute::GuestMemory&>(f.engine).write8(uuid, 0x12);
+    require(f.sys("_mbr_uuid_to_id", {uuid, id, type}) == 2, "another UUID: ENOENT");
+    // Frame-pointer backtraces.
+    const auto frames = f.process.allocate_guest(64), addresses = f.process.allocate_guest(32);
+    f.engine.write64(frames, frames + 32); f.engine.write64(frames + 8, 0x1111);
+    f.engine.write64(frames + 32, 0); f.engine.write64(frames + 40, 0x2222);
+    require(f.sys("_backtrace_from_fp", {frames, addresses, 4}) == 2 && f.engine.read64(addresses) == 0x1111 &&
+            f.engine.read64(addresses + 8) == 0x2222, "backtrace_from_fp");
+    const auto offsets = f.process.allocate_guest(20), none = f.process.allocate_guest(8);
+    f.engine.fill_bytes(offsets, 0x55, 20);
+    f.engine.write64(none, 0);
+    f.sys("_backtrace_image_offsets", {none, offsets, 1});
+    require(f.engine.read64(offsets) == 0 && f.engine.read32(offsets + 16) == 0, "no image: zeros");
+    // statfs64, atof_l, querylocale.
+    const auto statistics = f.process.allocate_guest(4096);
+    require(f.sys("_statfs64", {f.text(alchemy::guest_path_string(std::filesystem::temp_directory_path())), statistics}) == 0, "statfs64");
+    alchemy::CallRegs number;
+    number.x[0] = f.text("2.5");
+    require(alchemy::engine_call_regs(f.engine, f.symbol(sys, "_atof_l"), number).d(0) == 2.5, "atof_l");
+    require(f.read(f.sys("_querylocale", {0x3f, 0})) == "C" && f.sys("_querylocale", {0, 0}) == 0, "querylocale");
+    // setmode/getmode.
+    const auto mask = f.sys("_umask", {0}) & 0777;
+    f.sys("_umask", {mask});
+    const auto apply = [&](std::string_view text, Address mode) {
+        const auto set = f.sys("_setmode", {f.text(text)});
+        require(set != 0, "setmode " + std::string(text));
+        const auto result = f.sys("_getmode", {set, mode}) & 0xffff;
+        f.sys("_free", {set});
+        return result;
+    };
+    require(apply("755", 0100600) == 0100755, "an octal mode");
+    require(apply("u+x,go-w", 0100664) == 0100744, "symbolic clauses");
+    require(apply("a=r", 0100777) == 0100444, "a=r");
+    require(apply("=w", 0100644) == ((0100644 & ~(07777 & ~mask)) | (0222 & ~mask)), "the umask applies without who");
+    require(f.sys("_setmode", {f.text("u+q")}) == 0 && errno_value() == 22, "a bad mode");
+    // The *printf_l forms.
+    const auto buffer = f.process.allocate_guest(32);
+    alchemy::CallRegs print;
+    print.x[0] = buffer; print.x[1] = 0; print.x[2] = f.text("%d-%s");
+    print.push_variadic(Address{7});
+    print.push_variadic(f.text("x"));
+    require(alchemy::engine_call_regs(f.engine, f.symbol(sys, "_sprintf_l"), print).x0 == 3 && f.read(buffer) == "7-x", "sprintf_l");
+    const auto list = f.process.allocate_guest(8);
+    f.engine.write64(list, 12345);
+    require(f.sys("_vsnprintf_l", {buffer, 4, 0, f.text("%d"), list}) == 5 && f.read(buffer) == "123", "vsnprintf_l");
+    // Spawn arch preferences.
+    const auto attributes = f.process.allocate_guest(8), types = f.process.allocate_guest(8), subtypes = f.process.allocate_guest(8),
+               count = f.process.allocate_guest(8);
+    require(f.sys("_posix_spawnattr_init", {attributes}) == 0, "posix_spawnattr_init");
+    f.engine.write32(types, 0x0100000c); f.engine.write32(subtypes, 0);
+    require(f.sys("_posix_spawnattr_setarchpref_np", {attributes, 1, types, subtypes, count}) == 0 && f.engine.read64(count) == 1, "setarchpref arm64");
+    f.engine.write32(types, 0x01000007);
+    require(f.sys("_posix_spawnattr_setarchpref_np", {attributes, 1, types, subtypes, count}) == 45, "x86_64 is not available");
+    require(f.sys("_posix_spawnattr_getarchpref_np", {attributes, 1, types, subtypes, count}) == 0 && f.engine.read32(types) == 0x0100000c &&
+            f.engine.read32(subtypes) == 0xffffffffU, "getarchpref");
+    f.sys("_posix_spawnattr_destroy", {attributes});
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -1052,6 +1147,7 @@ int main() {
         stage("netdb extra"); test_netdb_extra(f);
         stage("memory streams"); test_memory_streams(f);
         stage("bsd more"); test_bsd_more(f);
+        stage("b11"); test_b11(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;
