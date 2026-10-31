@@ -122,6 +122,8 @@ $chromeArgs = if ($Native) { @('--remote-debugging-port=0', '--no-proxy-server',
 if ($SwiftShader) { $chromeArgs += @('--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader') }
 elseif (-not $Native) { $chromeArgs += '--disable-gpu' }
 if (-not $Native) { $chromeArgs += '--use-mock-keychain' }
+# V8 runs jitless unless -Jit, with -Native too: a benchmark row compares like with like only with the same mode
+# (results.json records it as v8).
 if (-not $Jit) { $chromeArgs += '--js-flags=--jitless' }
 $profileArg = if ($Native) { $profileDir } else { Get-GuestPath $profileDir }
 $chromeArgs += @("--user-data-dir=$profileArg", '--no-first-run', '--no-default-browser-check',
@@ -482,7 +484,7 @@ try {
         $socket = New-Object Net.WebSockets.ClientWebSocket
         $socket.Options.KeepAliveInterval = [TimeSpan]::Zero
         $socket.ConnectAsync([Uri]"ws://127.0.0.1:$port$path", [Threading.CancellationToken]::None).Wait()
-        Step "DevTools WebSocket connected (port $port)"
+        Step "DevTools WebSocket connected (port $port)$(if (-not $Jit) { '; V8 jitless (pass -Jit for its JIT)' })"
     } else {
         $connectIn = $toChrome.WaitForConnectionAsync()
         $connectOut = $fromChrome.WaitForConnectionAsync()
@@ -694,6 +696,7 @@ $hit = @($allowedLines | Where-Object {
 $summary = [ordered]@{
     result = if ($failure) { "FAIL: $failure" } else { 'PASS: Browser.close, exit 0' }
     exit_code = if ($process.HasExited) { $process.ExitCode } else { $null }
+    v8 = if ($Jit) { 'jit' } else { 'jitless' }
     startup_s = if (Get-Variable startup -ErrorAction SilentlyContinue) { [math]::Round($startup, 1) } else { $null }
     wall_s = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     peak_private_mb = [math]::Round($peak.private); peak_working_set_mb = [math]::Round($peak.working); peak_processes = $peak.processes
