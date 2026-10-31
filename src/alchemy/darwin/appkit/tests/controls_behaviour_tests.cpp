@@ -1039,6 +1039,57 @@ void color_wells(Fixture& f) {
     static_cast<void>(f.id(window, "close"));
 }
 
+// ---- NSSwitch, NSLevelIndicator (frameworks wave U14b) ---------------------------------------
+void switches_and_levels(Fixture& f) {
+    journal.clear();
+    f.describe = [](Address) { return std::string(); };
+    const auto window = f.make_window({{0, 0}, {240, 120}});
+    const auto content = f.id(window, "contentView");
+    // A switch toggles on a click and sends its action; the accent fills it while on.
+    const auto toggle = f.with_rect(f.id(f.cls("NSSwitch"), "alloc"), "initWithFrame:", {{10, 80}, {38, 22}});
+    static_cast<void>(f.id(toggle, "setTarget:", {f.target("switch")}));
+    static_cast<void>(f.id(toggle, "setAction:", {f.objc.selector("acted:")}));
+    static_cast<void>(f.id(content, "addSubview:", {toggle}));
+    f.show(window);
+    require(f.id(toggle, "state") == 0 && !is_accent(f.pixel(window, 18, 91)), "a new switch is off");
+    f.click(window, {29, 91});
+    require(f.id(toggle, "state") == 1 && journal == std::vector<std::string>{"switch:"}, "a click turns the switch on and acts");
+    require(is_accent(f.pixel(window, 18, 91)) && is_light(f.pixel(window, 38, 91)), "on: the accent track, the knob at the right");
+    static_cast<void>(f.id(toggle, "setEnabled:", {0}));
+    f.click(window, {29, 91});
+    require(f.id(toggle, "state") == 1 && journal.size() == 1, "a disabled switch ignores clicks");
+
+    // A continuous capacity indicator fills to its value, warning and critical colours past those levels.
+    const auto meter = f.with_rect(f.id(f.cls("NSLevelIndicator"), "alloc"), "initWithFrame:", {{10, 40}, {200, 18}});
+    require(f.yes(f.id(meter, "cell"), "isKindOfClass:", {f.cls("NSLevelIndicatorCell")}), "the indicator's cell");
+    static_cast<void>(f.id(meter, "setLevelIndicatorStyle:", {1}));
+    static_cast<void>(f.with_double(meter, "setMaxValue:", 10));
+    static_cast<void>(f.with_double(meter, "setWarningValue:", 7));
+    static_cast<void>(f.with_double(meter, "setCriticalValue:", 9));
+    static_cast<void>(f.with_double(meter, "setDoubleValue:", 5));
+    static_cast<void>(f.id(content, "addSubview:", {meter}));
+    const auto filled = f.pixel(window, 60, 49), empty = f.pixel(window, 170, 49);
+    require(filled[1] > 150 && filled[2] < 120 && filled[0] < 120 && !(empty[1] > 150 && empty[2] < 120), "half filled in the normal colour: " + bgra_text(filled));
+    static_cast<void>(f.with_double(meter, "setDoubleValue:", 9.5));
+    const auto critical = f.pixel(window, 60, 49);
+    require(critical[2] > 200 && critical[1] < 120, "past the critical value the fill is red: " + bgra_text(critical));
+    static_cast<void>(f.id(meter, "setNumberOfTickMarks:", {3}));
+    require(std::abs(f.send(meter, "tickMarkValueAtIndex:", [] { CallRegs r; r.x[2] = 1; return r; }()).d(0) - 5) < 1e-9, "the middle tick's value");
+
+    // An editable rating takes its value from a click.
+    const auto rating = f.with_rect(f.id(f.cls("NSLevelIndicator"), "alloc"), "initWithFrame:", {{10, 10}, {100, 20}});
+    static_cast<void>(f.id(rating, "setLevelIndicatorStyle:", {3}));
+    static_cast<void>(f.with_double(rating, "setMaxValue:", 5));
+    static_cast<void>(f.id(rating, "setEditable:", {1}));
+    static_cast<void>(f.id(rating, "setTarget:", {f.target("rating")}));
+    static_cast<void>(f.id(rating, "setAction:", {f.objc.selector("acted:")}));
+    static_cast<void>(f.id(content, "addSubview:", {rating}));
+    f.click(window, {80, 20});   // 70% across: the fourth star
+    require(std::abs(f.send(rating, "doubleValue").d(0) - 4) < 1e-9 && journal.back() == "rating:", "a click on the fourth star rates 4");
+    require(f.send(rating, "intrinsicContentSize").d(0) == 65, "a five-star rating is 65 points wide");
+    static_cast<void>(f.id(window, "close"));
+}
+
 // ---- the text system ------------------------------------------------------------------------
 void text_system(Fixture& f) {
     const auto view = f.with_rect(f.id(f.cls("NSTextView"), "alloc"), "initWithFrame:", {{0, 0}, {300, 100}});
@@ -2001,6 +2052,7 @@ int main() {
         search_fields(f);
         date_pickers(f);
         color_wells(f);
+        switches_and_levels(f);
         text_system(f);
         text_layout(f);
         text_actions(f);

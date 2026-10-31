@@ -171,6 +171,13 @@ sends the panel's action (-changeColor: unless set); -setColor: only posts
 the notification; closing the panel deactivates the well. Colour lists and
 dragging colours stop explicitly.
 
+**Switches and level indicators** (`controls/indicators.cpp`): NSSwitch is
+a pill with a knob that a click toggles (sending its action). NSLevelIndicator
+forwards to its NSLevelIndicatorCell: relevancy, continuous and discrete
+capacity and rating styles, warning and critical colours (inverted when the
+critical level is the lower), tick marks, rating images, and editing by click
+or drag when editable. The default range (0 to 2) is unverified.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

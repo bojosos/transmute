@@ -11,6 +11,7 @@
 //   date_picker.cpp   NSDatePicker / NSDatePickerCell
 //   color_well.cpp    NSColorWell
 //   color_panel.cpp   NSColorPanel
+//   indicators.cpp    NSSwitch, NSLevelIndicator / NSLevelIndicatorCell
 //   text_system.cpp   NSTextStorage / NSLayoutManager / NSTextContainer /
 //                     NSTextViewSharedData coding, NSTextView's attribute,
 //                     selection and typing API, NSFontManager / NSFontPanel
@@ -98,5 +99,7 @@ void install_collection_view(AppKit& kit);
 void install_rulers(AppKit& kit);
 void install_accessibility(AppKit& kit);
 void install_small_additions(AppKit& kit);
+// NSSwitch, NSLevelIndicator / NSLevelIndicatorCell (indicators.cpp; installed by install_small_additions).
+void install_indicators(AppKit& kit);
 
 } // namespace alchemy::gui::completion_kit::controls

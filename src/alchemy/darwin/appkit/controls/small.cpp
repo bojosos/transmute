@@ -224,6 +224,7 @@ void install_small_additions(AppKit& kit) {
             static_cast<void>(k->objc.send_super(s.x[0], touch, k->sel("dealloc")));
         }, "v@:");
     }
+    install_indicators(kit);   // NSSwitch, NSLevelIndicator (indicators.cpp)
 }
 
 } // namespace alchemy::gui::completion_kit::controls
