@@ -2,11 +2,13 @@
 #include "alchemy/darwin/media/hal_io.hpp"
 #include "alchemy/darwin/media/resampler.hpp"
 #include "alchemy/darwin/media/avaudio_effects.hpp"
+#include "alchemy/darwin/media/avaudio_sampler.hpp"
 
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/gui/runloop.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <deque>
@@ -15,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <thread>
@@ -43,6 +46,14 @@
 //   to -setManualRenderingInputPCMFormat:inputBlock:.
 // - Effect nodes (AVAudioUnitEQ, Delay, Reverb, Distortion, Varispeed, TimePitch: avaudio_effects.hpp)
 //   process what their input renders, in the connection's channels at the engine's rate.
+// - AVAudioUnitSampler (avaudio_sampler.hpp) plays SoundFont 2 presets or audio files by note, through
+//   the AVAudioUnitMIDIInstrument messages (notes, controllers, pitch bend, program changes, raw
+//   channel events); DLS banks and .aupreset/.exs instruments answer NO with an error.
+// - AVAudioEnvironmentNode mixes its inputs like a mixer, placing mono ones (AVAudio3DMixing position)
+//   around the listener: distance attenuation by the documented models (exponential, inverse, linear
+//   between the reference and maximum distances) and equal-power stereo panning by azimuth (the
+//   listener's yaw, or its forward vector; pitch and roll are kept but not applied), plus a reverb send
+//   by each input's reverbBlend when the reverb is enabled. Inputs of more channels mix unplaced.
 // - Render and receiver blocks, and the input block, run under the engines' lock: one that calls
 //   back into the engine or its nodes waits forever (Apple's documentation forbids such calls).
 // - Unavailable, as documented: there is no input device, so -startAndReturnError: fails with an
@@ -58,7 +69,19 @@ constexpr std::int32_t no_device = static_cast<std::int32_t>(0x21646576);   // '
 // AVAudioPlayerNodeBufferOptions
 constexpr std::uint64_t option_loops = 1, option_interrupts = 2, option_interrupts_at_loop = 4;
 
-enum class Kind { output, input, mixer, player, source, sink, effect, other };
+enum class Kind { output, input, mixer, player, source, sink, effect, sampler, environment, other };
+
+// AVAudioEnvironmentNode's listener, distance attenuation and reverb.
+struct Environment {
+    std::array<double, 3> listener{};
+    double yaw{}, pitch{}, roll{};     // degrees
+    std::int64_t model{1};             // AVAudioEnvironmentDistanceAttenuationModel: exponential 1, inverse 2, linear 3
+    double reference{1}, maximum{100000}, rolloff{1};
+    bool reverb{};
+    double reverb_level{};             // dB
+    std::int64_t output_type{};
+    Reverb reverb_unit;
+};
 // AVAudioEngineManualRenderingStatus and AVAudioEngineManualRenderingError
 constexpr std::int64_t manual_error = -1, manual_success = 0, manual_insufficient_input = 1;
 constexpr std::int32_t manual_invalid_mode = -80800, manual_initialized = -80801, manual_not_running = -80802;
@@ -200,6 +223,16 @@ struct Node final : ObjectPayload {
     std::unique_ptr<GuestList> scratch;
     // Effect nodes.
     std::shared_ptr<Effect> effect;
+    // AVAudioUnitSampler: its sampler, and the sound bank it loaded (for program changes).
+    std::shared_ptr<Sampler> sampler;
+    std::shared_ptr<std::vector<std::uint8_t>> sound_bank;
+    int bank{}, program{};
+    // AVAudioEnvironmentNode.
+    std::shared_ptr<Environment> environment;
+    // AVAudio3DMixing (as a source of an environment node).
+    std::array<float, 3> position{};
+    float reverb_blend{}, obstruction{}, occlusion{}, mixing_rate{1};
+    std::int64_t rendering_algorithm{}, source_mode{}, point_source_in_head_mode{};
 };
 
 struct EngineState final : ObjectPayload {
@@ -272,6 +305,10 @@ private:
     double clock_rate(const EngineState& e) const { return e.manual ? e.manual_pcm.rate : e.io ? e.io->rate() : 0.0; }
     void set_manual(Address engine, bool manual);
     void install_effects();
+    void install_instruments();
+    void install_environment();
+    void render_environment(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate, double sample_time, unsigned depth,
+                            std::vector<Callback>& callbacks, std::vector<TapDelivery>& taps);
 
     Support& support_;
     std::shared_ptr<security::Bridge> bridge_;
@@ -420,10 +457,10 @@ void Engines::connect(Address engine_object, Address source, Address destination
         }
         std::uint32_t bus = 0;
         if (to_bus) bus = *to_bus;
-        else if (d->kind == Kind::mixer) while (d->inputs.contains(bus)) ++bus;
-        if (d->kind == Kind::player || d->kind == Kind::source || d->kind == Kind::input)
-            unsupported("-[AVAudioEngine connect:to:...] to a node with no input (a player, source or input node)");
-        if (d->kind != Kind::mixer && bus != 0) unsupported("-[AVAudioEngine connect:to:...] to an input bus other than 0 of a node that is not a mixer");
+        else if (d->kind == Kind::mixer || d->kind == Kind::environment) while (d->inputs.contains(bus)) ++bus;
+        if (d->kind == Kind::player || d->kind == Kind::source || d->kind == Kind::input || d->kind == Kind::sampler)
+            unsupported("-[AVAudioEngine connect:to:...] to a node with no input (a player, source, sampler or input node)");
+        if (d->kind != Kind::mixer && d->kind != Kind::environment && bus != 0) unsupported("-[AVAudioEngine connect:to:...] to an input bus other than 0 of a node that is not a mixer");
         if (const auto f = d->input_formats.find(bus); f != d->input_formats.end()) released.push_back(f->second);
         d->inputs[bus] = source;
         d->input_formats[bus] = chosen;
@@ -630,6 +667,12 @@ std::vector<double> Engines::pull(Address node_object, std::uint32_t frames, std
         if (n->effect) n->effect->render(out.data(), frames, channels, rate, input);
         break;
     }
+    case Kind::sampler:
+        if (n->sampler) n->sampler->render(out.data(), frames, channels, rate);
+        break;
+    case Kind::environment:
+        render_environment(*n, out.data(), frames, channels, rate, sample_time, depth, callbacks, taps);
+        break;
     case Kind::mixer:
     case Kind::output:
         for (const auto& [bus, source] : n->inputs) {
@@ -1035,6 +1078,460 @@ void Engines::install_effects() {
     property(time_pitch_class, "overlap", "setOverlap:", &TimePitch::overlap, static_cast<TimePitch*>(nullptr));
 }
 
+void Engines::render_environment(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate, double sample_time, unsigned depth,
+                                 std::vector<Callback>& callbacks, std::vector<TapDelivery>& taps) {
+    const auto& env = *n.environment;
+    const double yaw = env.yaw * std::numbers::pi / 180;
+    const std::array<double, 3> forward{std::sin(yaw), 0, -std::cos(yaw)}, right{std::cos(yaw), 0, std::sin(yaw)};
+    std::vector<double> send(env.reverb ? static_cast<std::size_t>(frames) * channels : 0, 0.0);
+    for (const auto& [bus, source] : n.inputs) {
+        const auto known = n.input_channels.find(bus);
+        const auto source_channels = known != n.input_channels.end() ? known->second : channels;
+        const auto data = pull(source, frames, source_channels, rate, sample_time, depth + 1, callbacks, taps);
+        const auto s = support_.objc.find_host_state<Node>(source);
+        const double volume = s ? s->volume : 1.0;
+        if (source_channels != 1 || !s) {
+            mix_into(out, channels, data.data(), source_channels, frames, volume, s ? s->pan : 0.0);
+            continue;
+        }
+        // Placed: distance gain and an equal-power pan by azimuth.
+        const std::array<double, 3> rel{s->position[0] - env.listener[0], s->position[1] - env.listener[1], s->position[2] - env.listener[2]};
+        const double x = rel[0] * right[0] + rel[1] * right[1] + rel[2] * right[2];
+        const double z = rel[0] * forward[0] + rel[1] * forward[1] + rel[2] * forward[2];
+        const double distance = std::clamp(std::sqrt(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]), env.reference, std::max(env.maximum, env.reference));
+        double gain = 1;
+        if (env.model == 1) gain = std::pow(distance / env.reference, -env.rolloff);
+        else if (env.model == 2) gain = env.reference / (env.reference + env.rolloff * (distance - env.reference));
+        else if (env.model == 3)
+            gain = env.maximum > env.reference ? std::max(0.0, 1 - env.rolloff * (distance - env.reference) / (env.maximum - env.reference)) : 1.0;
+        gain *= volume;
+        const double pan = (x == 0 && z == 0) ? 0.0 : std::sin(std::atan2(x, z));
+        const double theta = (pan + 1) * std::numbers::pi / 4;
+        const double left = std::cos(theta) * gain, right_gain = std::sin(theta) * gain;
+        for (std::uint32_t f = 0; f < frames; ++f) {
+            const double v = data[f];
+            double* o = out + static_cast<std::size_t>(f) * channels;
+            if (channels == 1) o[0] += v * (left + right_gain) / 2;
+            else { o[0] += v * left; o[1] += v * right_gain; }
+            if (env.reverb && s->reverb_blend > 0) {
+                double* r = send.data() + static_cast<std::size_t>(f) * channels;
+                for (std::uint32_t c = 0; c < channels; ++c) r[c] += v * gain * s->reverb_blend;
+            }
+        }
+    }
+    if (env.reverb) {
+        std::vector<double> wet(send.size());
+        n.environment->reverb_unit.wet_dry_mix = 100;
+        n.environment->reverb_unit.render(wet.data(), frames, channels, rate, [&send](std::uint32_t) { return send; });
+        const double level = std::pow(10.0, env.reverb_level / 20.0);
+        for (std::size_t i = 0; i < wet.size(); ++i) out[i] += wet[i] * level;
+    }
+    if (n.output_volume != 1.0f)
+        for (std::size_t i = 0; i < static_cast<std::size_t>(frames) * channels; ++i) out[i] *= n.output_volume;
+}
+
+// The parameter objects of an environment node: views of its Environment.
+struct EnvironmentView final : ObjectPayload { std::shared_ptr<Environment> environment; };
+
+void Engines::install_instruments() {
+    auto& support = support_;
+    auto* sp = &support_;
+    const auto self = shared_from_this();
+    if (!support.objc.find_class("AVAudioUnit")) static_cast<void>(declare(support, "AVAudioUnit", "AVAudioNode"));
+    const auto instrument_class = declare(support, "AVAudioUnitMIDIInstrument", "AVAudioUnit");
+    const auto sampler_class = declare(support, "AVAudioUnitSampler", "AVAudioUnitMIDIInstrument");
+    const auto real32 = [](const CpuState& s, unsigned i) { return std::bit_cast<float>(static_cast<std::uint32_t>(s.v[i][0])); };
+    const auto return_real32 = [](CpuState& s, double value) { s.v[0] = {std::bit_cast<std::uint32_t>(static_cast<float>(value)), 0}; };
+    support.method(sampler_class, "init", [sp, sampler_class](CpuState& s, GuestMemory&) {
+        const auto object = sp->objc.send_super(s.x[0], sampler_class, sp->objc.selector("init")).x0;
+        if (object) {
+            const auto n = sp->objc.host_state<Node>(object);
+            n->kind = Kind::sampler;
+            n->sampler = std::make_shared<Sampler>();
+        }
+        s.x[0] = object;
+    }, "@@:");
+    const auto sampler_of = [self](Address object) {
+        const auto n = self->node(object);
+        if (!n->sampler) unsupported("an AVAudioUnitMIDIInstrument message to a node that is not a sampler");
+        return n;
+    };
+    // MIDI channel messages (status byte, two data bytes) to the sampler; program changes reload the
+    // preset from the loaded sound bank when it has one.
+    const auto channel_event = [self, sampler_of](Address object, unsigned status, unsigned data1, unsigned data2) {
+        const auto n = sampler_of(object);
+        std::lock_guard lock(self->mutex_);
+        const int channel = static_cast<int>(status & 15);
+        switch (status & 0xf0) {
+        case 0x90: n->sampler->note_on(channel, static_cast<int>(data1 & 127), static_cast<int>(data2 & 127)); break;
+        case 0x80: n->sampler->note_off(channel, static_cast<int>(data1 & 127)); break;
+        case 0xb0: n->sampler->controller(channel, static_cast<int>(data1 & 127), static_cast<int>(data2 & 127)); break;
+        case 0xe0: n->sampler->pitch_bend(channel, static_cast<int>((data1 & 127) | ((data2 & 127) << 7))); break;
+        case 0xc0:
+            if (n->sound_bank) {
+                std::string why;
+                if (auto instrument = load_sound_font(*n->sound_bank, n->bank, static_cast<int>(data1 & 127), why)) {
+                    n->sampler->set_instrument(std::move(*instrument));
+                    n->program = static_cast<int>(data1 & 127);
+                }
+            }
+            break;
+        default: break;   // pressure: no effect on the sampler's voices
+        }
+    };
+    // startNote:withVelocity:onChannel: (note x2, velocity x3, channel x4) and the rest.
+    support.method(instrument_class, "startNote:withVelocity:onChannel:", [channel_event](CpuState& s, GuestMemory&) {
+        channel_event(s.x[0], 0x90 | static_cast<unsigned>(s.x[4] & 15), static_cast<unsigned>(s.x[2]), static_cast<unsigned>(s.x[3]));
+    }, "v@:CCC");
+    support.method(instrument_class, "stopNote:onChannel:", [channel_event](CpuState& s, GuestMemory&) {
+        channel_event(s.x[0], 0x80 | static_cast<unsigned>(s.x[3] & 15), static_cast<unsigned>(s.x[2]), 0);
+    }, "v@:CC");
+    support.method(instrument_class, "sendController:withValue:onChannel:", [channel_event](CpuState& s, GuestMemory&) {
+        channel_event(s.x[0], 0xb0 | static_cast<unsigned>(s.x[4] & 15), static_cast<unsigned>(s.x[2]), static_cast<unsigned>(s.x[3]));
+    }, "v@:CCC");
+    support.method(instrument_class, "sendPitchBend:onChannel:", [channel_event](CpuState& s, GuestMemory&) {
+        const auto value = static_cast<unsigned>(s.x[2] & 0x3fff);
+        channel_event(s.x[0], 0xe0 | static_cast<unsigned>(s.x[3] & 15), value & 127, value >> 7);
+    }, "v@:SC");
+    support.method(instrument_class, "sendProgramChange:onChannel:", [channel_event](CpuState& s, GuestMemory&) {
+        channel_event(s.x[0], 0xc0 | static_cast<unsigned>(s.x[3] & 15), static_cast<unsigned>(s.x[2]), 0);
+    }, "v@:CC");
+    support.method(instrument_class, "sendProgramChange:bankMSB:bankLSB:onChannel:", [self, sampler_of, channel_event](CpuState& s, GuestMemory&) {
+        {
+            const auto n = sampler_of(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            n->bank = (s.x[3] & 0xff) == 0x78 ? 128 : static_cast<int>(s.x[4] & 127);
+        }
+        channel_event(s.x[0], 0xc0 | static_cast<unsigned>(s.x[5] & 15), static_cast<unsigned>(s.x[2]), 0);
+    }, "v@:CCCC");
+    for (const auto* selector : {"sendPressure:onChannel:", "sendPressureForKey:withValue:onChannel:", "sendMIDISysExEvent:"})
+        support.method(instrument_class, selector, [](CpuState&, GuestMemory&) {}, "v@:CC");
+    support.method(instrument_class, "sendMIDIEvent:data1:data2:", [channel_event](CpuState& s, GuestMemory&) {
+        channel_event(s.x[0], static_cast<unsigned>(s.x[2] & 0xff), static_cast<unsigned>(s.x[3]), static_cast<unsigned>(s.x[4]));
+    }, "v@:CCC");
+    support.method(instrument_class, "sendMIDIEvent:data1:", [channel_event](CpuState& s, GuestMemory&) {
+        channel_event(s.x[0], static_cast<unsigned>(s.x[2] & 0xff), static_cast<unsigned>(s.x[3]), 0);
+    }, "v@:CC");
+
+    // Loading. kAudioUnitErr_InvalidFile for what cannot be loaded.
+    constexpr std::int32_t invalid_file = -10871;
+    const auto fail = [self](Address error_out, std::string_view text) {
+        if (error_out) self->bridge_->store_error(error_out, self->bridge_->os_status_error(invalid_file, text), true);
+        return 0;
+    };
+    const auto file_bytes = [sp](Address url) -> std::shared_ptr<std::vector<std::uint8_t>> {
+        const auto data = url ? sp->send_id(sp->objc.find_class("NSData"), "dataWithContentsOfURL:", {url}) : 0;
+        if (!data) return nullptr;
+        auto bytes = std::make_shared<std::vector<std::uint8_t>>(static_cast<std::size_t>(sp->send(data, "length").x0));
+        if (!bytes->empty()) sp->memory().read_bytes(sp->send_id(data, "bytes"), *bytes);
+        return bytes;
+    };
+    const auto load_bank = [self, sampler_of, fail, file_bytes](Address object, Address url, int bank, int program, Address error_out) -> std::uint64_t {
+        const auto n = sampler_of(object);
+        auto bytes = file_bytes(url);
+        if (!bytes) return fail(error_out, "AVAudioUnitSampler: the sound bank could not be read");
+        std::string why;
+        auto instrument = load_sound_font(*bytes, bank, program, why);
+        if (!instrument) return fail(error_out, "AVAudioUnitSampler: " + why + " (SoundFont 2 banks only; DLS is not read)");
+        std::lock_guard lock(self->mutex_);
+        n->sampler->set_instrument(std::move(*instrument));
+        n->sound_bank = std::move(bytes);
+        n->bank = bank;
+        n->program = program;
+        return 1;
+    };
+    // -loadSoundBankInstrumentAtURL:program:bankMSB:bankLSB:error: (url x2, program x3, MSB x4, LSB x5, error x6):
+    // kAUSampler_DefaultPercussionBankMSB (0x78) is the SoundFont's bank 128.
+    support.method(sampler_class, "loadSoundBankInstrumentAtURL:program:bankMSB:bankLSB:error:", [load_bank](CpuState& s, GuestMemory&) {
+        const int bank = (s.x[4] & 0xff) == 0x78 ? 128 : static_cast<int>(s.x[5] & 127);
+        s.x[0] = load_bank(s.x[0], s.x[2], bank, static_cast<int>(s.x[3] & 127), s.x[6]);
+    }, "B@:@CCC^@");
+    // -loadInstrumentAtURL:error:: a .sf2 file's first melodic preset (bank 0, program 0).
+    support.method(sampler_class, "loadInstrumentAtURL:error:", [sp, load_bank, fail](CpuState& s, GuestMemory&) {
+        const auto extension = s.x[2] ? sp->cf.utf8(sp->send_id(s.x[2], "pathExtension")) : std::string{};
+        if (extension != "sf2" && extension != "SF2") { s.x[0] = fail(s.x[3], "AVAudioUnitSampler: only SoundFont 2 instruments load (not DLS, .aupreset or .exs)"); return; }
+        s.x[0] = load_bank(s.x[0], s.x[2], 0, 0, s.x[3]);
+    }, "B@:@^@");
+    // -loadAudioFilesAtURLs:error: (NSArray of NSURL): see from_samples.
+    support.method(sampler_class, "loadAudioFilesAtURLs:error:", [self, sp, sampler_of, fail](CpuState& s, GuestMemory&) {
+        const auto n = sampler_of(s.x[0]);
+        std::vector<std::pair<std::vector<float>, double>> files;
+        for (const auto url : s.x[2] ? sp->cf.array_values(s.x[2]) : std::vector<std::uint64_t>{}) {
+            GuestAudio audio;
+            if (open_guest_audio(*sp, sp->cf.url_path(url), audio)) { s.x[0] = fail(s.x[3], "AVAudioUnitSampler: an audio file could not be read"); return; }
+            Decoded decoded;
+            const auto status = decode_file(*sp, audio, decoded);
+            close_guest_audio(*sp, audio);
+            if (status || !decoded.channels) { s.x[0] = fail(s.x[3], "AVAudioUnitSampler: an audio file could not be decoded"); return; }
+            std::vector<float> mono(static_cast<std::size_t>(decoded.frames()));
+            for (std::size_t f = 0; f < mono.size(); ++f) {
+                float sum = 0;
+                for (std::uint32_t c = 0; c < decoded.channels; ++c) sum += decoded.samples[f * decoded.channels + c];
+                mono[f] = sum / static_cast<float>(decoded.channels);
+            }
+            files.emplace_back(std::move(mono), decoded.rate);
+        }
+        if (files.empty()) { s.x[0] = fail(s.x[3], "AVAudioUnitSampler: no audio file to load"); return; }
+        std::lock_guard lock(self->mutex_);
+        n->sampler->set_instrument(from_samples(std::move(files)));
+        n->sound_bank.reset();
+        s.x[0] = 1;
+    }, "B@:@^@");
+    for (const auto& [getter, setter, field, low, high] : std::initializer_list<std::tuple<const char*, const char*, double Sampler::*, double, double>>{
+             {"masterGain", "setMasterGain:", &Sampler::master_gain, -90.0, 12.0}, {"stereoPan", "setStereoPan:", &Sampler::stereo_pan, -1.0, 1.0},
+             {"globalTuning", "setGlobalTuning:", &Sampler::global_tuning, -2400.0, 2400.0}}) {
+        const auto member = field;
+        const auto lo = low, hi = high;
+        support.method(sampler_class, getter, [self, sampler_of, member, return_real32](CpuState& s, GuestMemory&) {
+            const auto n = sampler_of(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            return_real32(s, (*n->sampler).*member);
+        }, "f@:");
+        support.method(sampler_class, setter, [self, sampler_of, member, real32, lo, hi](CpuState& s, GuestMemory&) {
+            const auto n = sampler_of(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            (*n->sampler).*member = std::clamp(static_cast<double>(real32(s, 0)), lo, hi);
+        }, "v@:f");
+    }
+}
+
+void Engines::install_environment() {
+    auto& support = support_;
+    auto* sp = &support_;
+    const auto self = shared_from_this();
+    const auto environment_class = declare(support, "AVAudioEnvironmentNode", "AVAudioNode");
+    const auto distance_class = declare(support, "AVAudioEnvironmentDistanceAttenuationParameters", "NSObject");
+    const auto reverb_class = declare(support, "AVAudioEnvironmentReverbParameters", "NSObject");
+    const auto real32 = [](const CpuState& s, unsigned i) { return static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(s.v[i][0]))); };
+    const auto put32 = [](CpuState& s, unsigned i, double value) { s.v[i] = {std::bit_cast<std::uint32_t>(static_cast<float>(value)), 0}; };
+    support.method(environment_class, "init", [sp, environment_class](CpuState& s, GuestMemory&) {
+        const auto object = sp->objc.send_super(s.x[0], environment_class, sp->objc.selector("init")).x0;
+        if (object) {
+            const auto n = sp->objc.host_state<Node>(object);
+            n->kind = Kind::environment;
+            n->environment = std::make_shared<Environment>();
+        }
+        s.x[0] = object;
+    }, "@@:");
+    const auto env_of = [self](Address object) {
+        const auto n = self->node(object);
+        if (!n->environment) unsupported("an AVAudioEnvironmentNode message to another node");
+        return n;
+    };
+    // listenerPosition (AVAudio3DPoint in s0-s2) and listenerAngularOrientation (yaw, pitch, roll in s0-s2).
+    support.method(environment_class, "listenerPosition", [self, env_of, put32](CpuState& s, GuestMemory&) {
+        const auto n = env_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        for (unsigned i = 0; i < 3; ++i) put32(s, i, n->environment->listener[i]);
+    }, "{AVAudio3DPoint=fff}@:");
+    support.method(environment_class, "setListenerPosition:", [self, env_of, real32](CpuState& s, GuestMemory&) {
+        const auto n = env_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        for (unsigned i = 0; i < 3; ++i) n->environment->listener[i] = real32(s, i);
+    }, "v@:{AVAudio3DPoint=fff}");
+    support.method(environment_class, "listenerAngularOrientation", [self, env_of, put32](CpuState& s, GuestMemory&) {
+        const auto n = env_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        put32(s, 0, n->environment->yaw);
+        put32(s, 1, n->environment->pitch);
+        put32(s, 2, n->environment->roll);
+    }, "{AVAudio3DAngularOrientation=fff}@:");
+    support.method(environment_class, "setListenerAngularOrientation:", [self, env_of, real32](CpuState& s, GuestMemory&) {
+        const auto n = env_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        n->environment->yaw = real32(s, 0);
+        n->environment->pitch = real32(s, 1);
+        n->environment->roll = real32(s, 2);
+    }, "v@:{AVAudio3DAngularOrientation=fff}");
+    // listenerVectorOrientation (AVAudio3DVectorOrientation {forward, up}: 24 bytes, returned through
+    // x8 and passed by reference): the yaw follows the forward vector's direction in the x-z plane.
+    support.method(environment_class, "listenerVectorOrientation", [self, env_of](CpuState& s, GuestMemory& m) {
+        const auto n = env_of(s.x[0]);
+        double yaw{};
+        {
+            std::lock_guard lock(self->mutex_);
+            yaw = n->environment->yaw * std::numbers::pi / 180;
+        }
+        const std::array<float, 6> v{static_cast<float>(std::sin(yaw)), 0, static_cast<float>(-std::cos(yaw)), 0, 1, 0};
+        for (unsigned i = 0; i < 6; ++i) m.write32(s.x[8] + 4 * i, std::bit_cast<std::uint32_t>(v[i]));
+    }, "{AVAudio3DVectorOrientation={AVAudio3DPoint=fff}{AVAudio3DPoint=fff}}@:");
+    support.method(environment_class, "setListenerVectorOrientation:", [self, env_of](CpuState& s, GuestMemory& m) {
+        const auto n = env_of(s.x[0]);
+        const double fx = std::bit_cast<float>(m.read32(s.x[2])), fz = std::bit_cast<float>(m.read32(s.x[2] + 8));
+        std::lock_guard lock(self->mutex_);
+        if (fx != 0 || fz != 0) n->environment->yaw = std::atan2(fx, -fz) * 180 / std::numbers::pi;
+    }, "v@:{AVAudio3DVectorOrientation={AVAudio3DPoint=fff}{AVAudio3DPoint=fff}}");
+    support.method(environment_class, "outputType", [self, env_of](CpuState& s, GuestMemory&) {
+        const auto n = env_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = static_cast<std::uint64_t>(n->environment->output_type);
+    }, "q@:");
+    support.method(environment_class, "setOutputType:", [self, env_of](CpuState& s, GuestMemory&) {
+        const auto n = env_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        n->environment->output_type = static_cast<std::int64_t>(s.x[2]);
+    }, "v@:q");
+    support.method(environment_class, "outputVolume", [self, env_of, put32](CpuState& s, GuestMemory&) {
+        const auto n = env_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        put32(s, 0, n->output_volume);
+    }, "f@:");
+    support.method(environment_class, "setOutputVolume:", [self, env_of, real32](CpuState& s, GuestMemory&) {
+        const auto n = env_of(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        n->output_volume = static_cast<float>(std::clamp(real32(s, 0), 0.0, 1.0));
+    }, "v@:f");
+    support.method(environment_class, "nextAvailableInputBus", [self](CpuState& s, GuestMemory&) {
+        const auto n = self->node(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        std::uint64_t bus = 0;
+        while (n->inputs.contains(static_cast<std::uint32_t>(bus))) ++bus;
+        s.x[0] = bus;
+    }, "Q@:");
+    // AVAudio3DMixingRenderingAlgorithm: equal-power panning (0) is how every input is placed.
+    support.method(environment_class, "applicableRenderingAlgorithms", [sp](CpuState& s, GuestMemory&) {
+        const auto zero = sp->cf.integer(0);
+        const std::array<std::uint64_t, 1> items{zero};
+        const auto array = sp->cf.array(items);
+        sp->release(zero);
+        s.x[0] = sp->send_id(array, "autorelease");
+    }, "@@:");
+    // The parameter objects.
+    const auto view = [sp](Address cls, std::shared_ptr<Environment> e) {
+        const auto object = sp->send_id(sp->send_id(cls, "alloc"), "init");
+        sp->objc.host_state<EnvironmentView>(object)->environment = std::move(e);
+        return sp->send_id(object, "autorelease");
+    };
+    support.method(environment_class, "distanceAttenuationParameters", [env_of, view, distance_class](CpuState& s, GuestMemory&) {
+        s.x[0] = view(distance_class, env_of(s.x[0])->environment);
+    }, "@@:");
+    support.method(environment_class, "reverbParameters", [env_of, view, reverb_class](CpuState& s, GuestMemory&) {
+        s.x[0] = view(reverb_class, env_of(s.x[0])->environment);
+    }, "@@:");
+    const auto viewed = [sp](Address object) {
+        const auto v = sp->objc.find_host_state<EnvironmentView>(object);
+        if (!v || !v->environment) unsupported("an AVAudioEnvironment parameters object not taken from an AVAudioEnvironmentNode");
+        return v->environment;
+    };
+    for (const auto& [getter, setter, field] : std::initializer_list<std::tuple<const char*, const char*, double Environment::*>>{
+             {"referenceDistance", "setReferenceDistance:", &Environment::reference}, {"maximumDistance", "setMaximumDistance:", &Environment::maximum},
+             {"rolloffFactor", "setRolloffFactor:", &Environment::rolloff}}) {
+        const auto member = field;
+        support.method(distance_class, getter, [self, viewed, put32, member](CpuState& s, GuestMemory&) {
+            const auto e = viewed(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            put32(s, 0, (*e).*member);
+        }, "f@:");
+        support.method(distance_class, setter, [self, viewed, real32, member](CpuState& s, GuestMemory&) {
+            const auto e = viewed(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            (*e).*member = std::max(0.0, real32(s, 0));
+        }, "v@:f");
+    }
+    support.method(distance_class, "distanceAttenuationModel", [self, viewed](CpuState& s, GuestMemory&) {
+        const auto e = viewed(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = static_cast<std::uint64_t>(e->model);
+    }, "q@:");
+    support.method(distance_class, "setDistanceAttenuationModel:", [self, viewed](CpuState& s, GuestMemory&) {
+        const auto e = viewed(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        e->model = std::clamp<std::int64_t>(static_cast<std::int64_t>(s.x[2]), 1, 3);
+    }, "v@:q");
+    support.method(reverb_class, "enable", [self, viewed](CpuState& s, GuestMemory&) {
+        const auto e = viewed(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = e->reverb ? 1 : 0;
+    }, "B@:");
+    support.method(reverb_class, "setEnable:", [self, viewed](CpuState& s, GuestMemory&) {
+        const auto e = viewed(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        e->reverb = (s.x[2] & 0xff) != 0;
+    }, "v@:B");
+    support.method(reverb_class, "level", [self, viewed, put32](CpuState& s, GuestMemory&) {
+        const auto e = viewed(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        put32(s, 0, e->reverb_level);
+    }, "f@:");
+    support.method(reverb_class, "setLevel:", [self, viewed, real32](CpuState& s, GuestMemory&) {
+        const auto e = viewed(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        e->reverb_level = std::clamp(real32(s, 0), -40.0, 40.0);
+    }, "v@:f");
+    support.method(reverb_class, "loadFactoryReverbPreset:", [self, viewed](CpuState& s, GuestMemory&) {
+        const auto e = viewed(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        e->reverb_unit.load_preset(static_cast<std::int64_t>(s.x[2]));
+        e->reverb_unit.reset();
+    }, "v@:q");
+    support.method(reverb_class, "filterParameters", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:");   // no reverb filter
+
+    // AVAudio3DMixing on the nodes that feed an environment (players, sources, samplers, mixers, input).
+    const auto sampler_class = support.objc.find_class("AVAudioUnitSampler");
+    for (const auto cls : {player_class_, source_class_, mixer_class_, input_class_, sampler_class}) {
+        if (!cls) continue;
+        support.method(cls, "position", [self, put32](CpuState& s, GuestMemory&) {
+            const auto n = self->node(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            for (unsigned i = 0; i < 3; ++i) put32(s, i, n->position[i]);
+        }, "{AVAudio3DPoint=fff}@:");
+        support.method(cls, "setPosition:", [self, real32](CpuState& s, GuestMemory&) {
+            const auto n = self->node(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            for (unsigned i = 0; i < 3; ++i) n->position[i] = static_cast<float>(real32(s, i));
+        }, "v@:{AVAudio3DPoint=fff}");
+        for (const auto& [getter, setter, field] : std::initializer_list<std::tuple<const char*, const char*, float Node::*>>{
+                 {"reverbBlend", "setReverbBlend:", &Node::reverb_blend}, {"obstruction", "setObstruction:", &Node::obstruction},
+                 {"occlusion", "setOcclusion:", &Node::occlusion}, {"rate", "setRate:", &Node::mixing_rate}}) {
+            const auto member = field;
+            support.method(cls, getter, [self, put32, member](CpuState& s, GuestMemory&) {
+                const auto n = self->node(s.x[0]);
+                std::lock_guard lock(self->mutex_);
+                put32(s, 0, (*n).*member);
+            }, "f@:");
+            support.method(cls, setter, [self, real32, member](CpuState& s, GuestMemory&) {
+                const auto n = self->node(s.x[0]);
+                std::lock_guard lock(self->mutex_);
+                (*n).*member = static_cast<float>(real32(s, 0));
+            }, "v@:f");
+        }
+        for (const auto& [getter, setter, field] : std::initializer_list<std::tuple<const char*, const char*, std::int64_t Node::*>>{
+                 {"renderingAlgorithm", "setRenderingAlgorithm:", &Node::rendering_algorithm}, {"sourceMode", "setSourceMode:", &Node::source_mode},
+                 {"pointSourceInHeadMode", "setPointSourceInHeadMode:", &Node::point_source_in_head_mode}}) {
+            const auto member = field;
+            support.method(cls, getter, [self, member](CpuState& s, GuestMemory&) {
+                const auto n = self->node(s.x[0]);
+                std::lock_guard lock(self->mutex_);
+                s.x[0] = static_cast<std::uint64_t>((*n).*member);
+            }, "q@:");
+            support.method(cls, setter, [self, member](CpuState& s, GuestMemory&) {
+                const auto n = self->node(s.x[0]);
+                std::lock_guard lock(self->mutex_);
+                (*n).*member = static_cast<std::int64_t>(s.x[2]);
+            }, "v@:q");
+        }
+    }
+    // The sampler and environment take volume and pan too (AVAudioMixing).
+    for (const auto cls : {sampler_class, environment_class}) {
+        if (!cls) continue;
+        for (const auto& [getter, setter, field, low, high] : std::initializer_list<std::tuple<const char*, const char*, float Node::*, float, float>>{
+                 {"volume", "setVolume:", &Node::volume, 0.0f, 1.0f}, {"pan", "setPan:", &Node::pan, -1.0f, 1.0f}}) {
+            const auto member = field;
+            const auto lo = low, hi = high;
+            support.method(cls, getter, [self, put32, member](CpuState& s, GuestMemory&) {
+                const auto n = self->node(s.x[0]);
+                std::lock_guard lock(self->mutex_);
+                put32(s, 0, (*n).*member);
+            }, "f@:");
+            support.method(cls, setter, [self, real32, member, lo, hi](CpuState& s, GuestMemory&) {
+                const auto n = self->node(s.x[0]);
+                std::lock_guard lock(self->mutex_);
+                (*n).*member = std::clamp(static_cast<float>(real32(s, 0)), lo, hi);
+            }, "v@:f");
+        }
+    }
+}
+
 void Engines::install() {
     auto& support = support_;
     const auto self = shared_from_this();
@@ -1090,7 +1587,7 @@ void Engines::install() {
     support.method(node_class, "numberOfInputs", [self](CpuState& s, GuestMemory&) {
         const auto n = self->node(s.x[0]);
         std::lock_guard lock(self->mutex_);
-        s.x[0] = n->kind == Kind::mixer ? (n->inputs.empty() ? 1 : n->inputs.rbegin()->first + 2)
+        s.x[0] = n->kind == Kind::mixer || n->kind == Kind::environment ? (n->inputs.empty() ? 1 : n->inputs.rbegin()->first + 2)
                : n->kind == Kind::output || n->kind == Kind::sink || n->kind == Kind::effect ? 1 : 0;
     }, "Q@:");
     support.method(node_class, "numberOfOutputs", [self](CpuState& s, GuestMemory&) {
@@ -1106,7 +1603,7 @@ void Engines::install() {
             return;
         }
         s.x[0] = s.x[2] == 0 ? n->output_format : 0;
-        if (!s.x[0] && s.x[2] == 0 && n->kind == Kind::player) {
+        if (!s.x[0] && s.x[2] == 0 && (n->kind == Kind::player || n->kind == Kind::sampler || n->kind == Kind::environment)) {
             n->output_format = standard_format(self->support_, 44100, 2);
             s.x[0] = n->output_format;
         }
@@ -1420,6 +1917,8 @@ void Engines::install() {
         s.x[0] = e->running ? 1 : 0;
     }, "B@:");
     install_effects();
+    install_instruments();
+    install_environment();
 
     // ---- manual rendering ------------------------------------------------------------------------
     const auto manual_state = [self](Address object) {

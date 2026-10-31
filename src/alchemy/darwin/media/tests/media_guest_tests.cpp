@@ -1334,6 +1334,160 @@ void speech(Fixture& f) {
     require(cancelled == 1 && (f.send(synthesizer, "isSpeaking") & 0xff) == 0 && started == 2, "a stop cancels and drops the queue");
 }
 
+// A SoundFont 2 file of one preset (bank 0, program 0) playing one looped 440 Hz sine sample
+// (root key 69), written from the 2.04 specification's chunk layout.
+std::vector<std::uint8_t> sine_sound_font() {
+    std::vector<std::uint8_t> out;
+    const auto u16 = [](std::vector<std::uint8_t>& b, unsigned v) { b.push_back(static_cast<std::uint8_t>(v)); b.push_back(static_cast<std::uint8_t>(v >> 8)); };
+    const auto u32 = [&](std::vector<std::uint8_t>& b, std::uint32_t v) { u16(b, v & 0xffff); u16(b, v >> 16); };
+    const auto name = [](std::vector<std::uint8_t>& b, const char* text) {
+        std::array<std::uint8_t, 20> n{};
+        std::memcpy(n.data(), text, std::strlen(text));
+        b.insert(b.end(), n.begin(), n.end());
+    };
+    const auto chunk = [&](const char* id, const std::vector<std::uint8_t>& body) {
+        std::vector<std::uint8_t> c(id, id + 4);
+        u32(c, static_cast<std::uint32_t>(body.size()));
+        c.insert(c.end(), body.begin(), body.end());
+        if (body.size() & 1) c.push_back(0);
+        return c;
+    };
+    const auto list = [&](const char* type, const std::vector<std::vector<std::uint8_t>>& parts) {
+        std::vector<std::uint8_t> body(type, type + 4);
+        for (const auto& p : parts) body.insert(body.end(), p.begin(), p.end());
+        return chunk("LIST", body);
+    };
+    constexpr std::uint32_t frames = 44100;
+    std::vector<std::uint8_t> smpl;
+    for (std::uint32_t i = 0; i < frames + 46; ++i)
+        u16(smpl, static_cast<std::uint16_t>(static_cast<std::int16_t>(i < frames ? std::lround(16000 * std::sin(2 * 3.141592653589793 * 440 * i / 44100.0)) : 0)));
+    std::vector<std::uint8_t> phdr, pbag, pmod(10), pgen, inst, ibag, imod(10), igen, shdr, ifil;
+    name(phdr, "Sine"); u16(phdr, 0); u16(phdr, 0); u16(phdr, 0); u32(phdr, 0); u32(phdr, 0); u32(phdr, 0);
+    name(phdr, "EOP"); u16(phdr, 0); u16(phdr, 0); u16(phdr, 1); u32(phdr, 0); u32(phdr, 0); u32(phdr, 0);
+    u16(pbag, 0); u16(pbag, 0); u16(pbag, 1); u16(pbag, 0);
+    u16(pgen, 41); u16(pgen, 0); u16(pgen, 0); u16(pgen, 0);           // instrument 0, terminal
+    name(inst, "SineInst"); u16(inst, 0); name(inst, "EOI"); u16(inst, 1);
+    u16(ibag, 0); u16(ibag, 0); u16(ibag, 2); u16(ibag, 0);
+    u16(igen, 54); u16(igen, 1); u16(igen, 53); u16(igen, 0); u16(igen, 0); u16(igen, 0);   // loop, sample 0, terminal
+    name(shdr, "Sine"); u32(shdr, 0); u32(shdr, frames); u32(shdr, 4410); u32(shdr, frames - 4410); u32(shdr, 44100);
+    shdr.push_back(69); shdr.push_back(0); u16(shdr, 0); u16(shdr, 1);
+    name(shdr, "EOS"); for (int i = 0; i < 26; ++i) shdr.push_back(0);
+    u16(ifil, 2); u16(ifil, 4);
+    const auto riff = std::vector<std::vector<std::uint8_t>>{
+        list("INFO", {chunk("ifil", ifil)}), list("sdta", {chunk("smpl", smpl)}),
+        list("pdta", {chunk("phdr", phdr), chunk("pbag", pbag), chunk("pmod", pmod), chunk("pgen", pgen), chunk("inst", inst),
+                      chunk("ibag", ibag), chunk("imod", imod), chunk("igen", igen), chunk("shdr", shdr)})};
+    std::vector<std::uint8_t> body{'s', 'f', 'b', 'k'};
+    for (const auto& p : riff) body.insert(body.end(), p.begin(), p.end());
+    return chunk("RIFF", body);
+}
+
+// AVAudioUnitSampler playing a SoundFont preset by note (pitch by zero crossings, release to
+// silence, a missing preset failing), and AVAudioEnvironmentNode placing a mono source.
+void sampler_environment(Fixture& f) {
+    const auto b = alchemy::gui::security::bridge();
+    const auto format_of = [&](double rate, std::uint32_t channels) {
+        alchemy::CallRegs r{};
+        r.x[2] = 1; r.x[3] = channels; r.x[4] = 0;
+        r.set_d(0, rate);
+        return f.objc.send(f.send(f.cls("AVAudioFormat"), "alloc"), f.objc.selector("initWithCommonFormat:sampleRate:channels:interleaved:"), r).x0;
+    };
+    const auto stereo = format_of(48000, 2), mono = format_of(48000, 1);
+    const auto error = f.block(8);
+    const auto make_engine = [&]() {
+        const auto engine = f.send(f.send(f.cls("AVAudioEngine"), "alloc"), "init");
+        alchemy::CallRegs manual{};
+        manual.x = {0, 0, 0, stereo, 4096, error, 0, 0};
+        require((f.objc.send(engine, f.objc.selector("enableManualRenderingMode:format:maximumFrameCount:error:"), manual).x0 & 0xff) == 1, "manual rendering");
+        return engine;
+    };
+    const auto render = [&](Address engine, std::uint32_t frames) {
+        const auto buffer = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {stereo, 4096});
+        alchemy::CallRegs offline{};
+        offline.x = {0, 0, frames, buffer, error, 0, 0, 0};
+        require(f.objc.send(engine, f.objc.selector("renderOffline:toBuffer:error:"), offline).x0 == 0, "an offline render");
+        const auto data = f.send(buffer, "floatChannelData");
+        std::array<std::vector<float>, 2> out;
+        for (unsigned c = 0; c < 2; ++c)
+            for (std::uint32_t i = 0; i < frames; ++i) out[c].push_back(std::bit_cast<float>(f.engine.read32(f.engine.read64(data + 8 * c) + 4ULL * i)));
+        return out;
+    };
+    const auto crossings = [](const std::vector<float>& v) {
+        int n = 0;
+        for (std::size_t i = 1; i < v.size(); ++i) n += (v[i - 1] < 0) != (v[i] < 0);
+        return n;
+    };
+    // The sound font as a file.
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_sampler";
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "sine.sf2";
+    {
+        const auto bytes = sine_sound_font();
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    const auto url = f.cf.file_url(alchemy::guest_path_string(path), false);
+    const auto engine = make_engine();
+    const auto sampler = f.send(f.send(f.cls("AVAudioUnitSampler"), "alloc"), "init");
+    f.send(engine, "attachNode:", {sampler});
+    f.send(engine, "connect:to:format:", {sampler, f.send(engine, "mainMixerNode"), stereo});
+    require(f.send(sampler, "loadSoundBankInstrumentAtURL:program:bankMSB:bankLSB:error:", {url, 0, 0x79, 0, error}) == 1, "the sound font's preset loads");
+    require(f.send(sampler, "loadSoundBankInstrumentAtURL:program:bankMSB:bankLSB:error:", {url, 5, 0x79, 0, error}) == 0 && f.engine.read64(error) != 0,
+            "a missing preset fails with an error");
+    require(f.send(sampler, "loadSoundBankInstrumentAtURL:program:bankMSB:bankLSB:error:", {url, 0, 0x79, 0, error}) == 1, "reloaded");
+    require((f.send(engine, "startAndReturnError:", {error}) & 0xff) == 1, "the engine starts");
+    f.send(sampler, "startNote:withVelocity:onChannel:", {69, 127, 0});
+    static_cast<void>(render(engine, 1024));   // the attack
+    const auto a4 = render(engine, 4096);
+    const auto a4_crossings = crossings(a4[0]);
+    // 440 Hz at 48 kHz: about 75 crossings in 4096 frames; an octave up about 150.
+    require(a4_crossings >= 70 && a4_crossings <= 80, "A4 at 440 Hz: " + std::to_string(a4_crossings) + " crossings");
+    f.send(sampler, "stopNote:onChannel:", {69, 0});
+    f.send(sampler, "startNote:withVelocity:onChannel:", {81, 127, 0});
+    static_cast<void>(render(engine, 4096));   // A4's release
+    const auto a5 = render(engine, 4096);
+    require(std::abs(crossings(a5[0]) - 150) <= 8, "A5 an octave up: " + std::to_string(crossings(a5[0])) + " crossings");
+    f.send(sampler, "sendMIDIEvent:data1:data2:", {0x80, 81, 0});
+    static_cast<void>(render(engine, 4096));
+    const auto quiet = render(engine, 1024);
+    require(std::all_of(quiet[0].begin(), quiet[0].end(), [](float v) { return std::fabs(v) < 1e-4f; }), "released notes fall silent");
+    f.send(engine, "stop");
+
+    // AVAudioEnvironmentNode: a mono source of 0.25 at (10, 0, 0) with the inverse model (reference 1,
+    // rolloff 1): 1/10 of it, all to the right.
+    const auto spatial = make_engine();
+    static std::atomic<int> unused{0};
+    const auto constant = b->make_block([](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto frames = static_cast<std::uint32_t>(s.x[3]);
+        const auto data = m.read64(s.x[4] + 16);
+        for (std::uint32_t i = 0; i < frames; ++i) m.write32(data + 4ULL * i, std::bit_cast<std::uint32_t>(0.25f));
+        s.x[0] = 0;
+    });
+    static_cast<void>(unused);
+    const auto source = f.send(f.send(f.cls("AVAudioSourceNode"), "alloc"), "initWithFormat:renderBlock:", {mono, constant});
+    const auto environment = f.send(f.send(f.cls("AVAudioEnvironmentNode"), "alloc"), "init");
+    f.send(spatial, "attachNode:", {source});
+    f.send(spatial, "attachNode:", {environment});
+    f.send(spatial, "connect:to:format:", {source, environment, mono});
+    f.send(spatial, "connect:to:format:", {environment, f.send(spatial, "mainMixerNode"), stereo});
+    const auto distance = f.send(environment, "distanceAttenuationParameters");
+    f.send(distance, "setDistanceAttenuationModel:", {2});
+    alchemy::CallRegs at{};
+    at.set_s(0, 10.0f); at.set_s(1, 0.0f); at.set_s(2, 0.0f);
+    static_cast<void>(f.objc.send(source, f.objc.selector("setPosition:"), at));
+    require(f.objc.send(source, f.objc.selector("position")).s(0) == 10.0f, "the source's position");
+    require((f.send(spatial, "startAndReturnError:", {error}) & 0xff) == 1, "the spatial engine starts");
+    const auto placed = render(spatial, 1024);
+    require(std::fabs(placed[0][500]) < 1e-4f && std::fabs(placed[1][500] - 0.025f) < 1e-4f,
+            "to the right, a tenth: " + std::to_string(placed[0][500]) + " " + std::to_string(placed[1][500]));
+    // Turning the listener to face the source (yaw 90) centres it: equal power, cos(pi/4) of 0.025 each.
+    alchemy::CallRegs turn{};
+    turn.set_s(0, 90.0f); turn.set_s(1, 0.0f); turn.set_s(2, 0.0f);
+    static_cast<void>(f.objc.send(environment, f.objc.selector("setListenerAngularOrientation:"), turn));
+    const auto centred = render(spatial, 1024);
+    require(std::fabs(centred[0][500] - centred[1][500]) < 1e-4f && std::fabs(centred[0][500] - 0.025f * 0.70710678f) < 1e-4f,
+            "facing it, centred: " + std::to_string(centred[0][500]) + " " + std::to_string(centred[1][500]));
+}
+
 void music_sequence(Fixture& f) {
     const auto out = f.block(8);
     require(f.status(at, "_NewMusicSequence", {out}) == 0, "NewMusicSequence");
@@ -2490,5 +2644,6 @@ int main() {
         {"avaudio_conversion", avaudio_conversion},
         {"avaudio_effects", avaudio_effects},
         {"speech", speech},
+        {"sampler_environment", sampler_environment},
     });
 }
