@@ -13,6 +13,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
+#include <tuple>
 #include <array>
 #include <span>
 
@@ -105,6 +107,17 @@ struct Hal {
         }
         return slot;
     }
+    // ALCHEMY_HAL_LOG=1: each unknown property (object, selector, scope, element) on stderr, once.
+    void log_unknown(std::uint32_t object, const hal::Address& address, std::int32_t result) {
+        static const bool enabled = [] { const char* v = std::getenv("ALCHEMY_HAL_LOG"); return v && *v && *v != '0'; }();
+        if (!enabled || result != hal::error::unknown_property) return;
+        const auto key = std::make_tuple(object, address.selector, address.scope, address.element);
+        if (!logged.insert(key).second) return;
+        const auto code = [](std::uint32_t v) { return std::string{char(v >> 24), char(v >> 16), char(v >> 8), char(v)}; };
+        std::cerr << "alchemy: CoreAudio HAL: unknown property '" << code(address.selector) << "' scope '" << code(address.scope)
+                  << "' element " << address.element << " of object " << object << std::endl;
+    }
+    std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>> logged;
     // The device's I/O buffer frame size (kAudioDevicePropertyBufferFrameSize).
     std::uint32_t buffer_frames(std::uint32_t id) {
         hal::Value value;
@@ -308,6 +321,7 @@ void install_hal(Support& support) {
         hal::Value value;
         const auto result = state->get().get(static_cast<std::uint32_t>(s.x[0]), Hal::address(m, s.x[1]),
                                              state->qualifier(m, static_cast<std::uint32_t>(s.x[2]), s.x[3]).value_or(std::string()), value);
+        state->log_unknown(static_cast<std::uint32_t>(s.x[0]), Hal::address(m, s.x[1]), result);
         if (!result) m.write32(s.x[4], value.string ? 8U : static_cast<std::uint32_t>(value.bytes.size()));
         status(s, result);
     });
@@ -321,8 +335,10 @@ void install_hal(Support& support) {
             const auto address = Hal::address(m, s.x[1]);
             const auto qualifier = state->qualifier(m, static_cast<std::uint32_t>(s.x[2]), s.x[3]);
             if (address.selector == hal::four("uidd") && !qualifier) return status(s, hal::error::bad_size);
-            if (const auto result = state->get().get(static_cast<std::uint32_t>(s.x[0]), address, qualifier.value_or(std::string()), value))
+            if (const auto result = state->get().get(static_cast<std::uint32_t>(s.x[0]), address, qualifier.value_or(std::string()), value)) {
+                state->log_unknown(static_cast<std::uint32_t>(s.x[0]), address, result);
                 return status(s, result);
+            }
         }
         const auto room = m.read32(s.x[4]);
         if (value.string) {

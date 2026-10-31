@@ -328,7 +328,7 @@ std::int32_t AudioUnits::set_property(Unit& u, std::uint32_t id, std::uint32_t s
                 if (scope != scope_output) return error::property_not_writable;
                 const auto pcm = af::pcm_from_asbd(data, why);
                 if (!pcm) return error::format_not_supported;
-                if (u.initialized) return error::initialized;
+                if (u.running) return error::initialized;
                 u.input_client = *pcm;
                 u.input_format_set = true;
                 break;
@@ -388,7 +388,9 @@ std::int32_t AudioUnits::set_property(Unit& u, std::uint32_t id, std::uint32_t s
             std::uint32_t value{};
             if (!hal) return error::property_not_writable;
             if (!u32(value)) return error::param;
-            if (u.initialized) return error::initialized;
+            // Chrome enables input on an initialized unit before starting it: allowed while it is not running
+            // (AudioOutputUnitStart checks the input side).
+            if (u.running) return error::initialized;
             if (element == 1 && scope == scope_input) u.enable_input = value != 0;
             else if (element == 0 && scope == scope_output) u.enable_output = value != 0;
             else return error::invalid_element;
@@ -612,6 +614,8 @@ std::int32_t AudioUnits::start(Unit& u) {
         }
         if (u.enable_input) {
             input_device = input_device_of(u);
+            if (!input_device) return error::failed_initialization;   // no input device
+            if (u.input_format_set && u.input_client.rate != input_format(input_device).first) return error::format_not_supported;
             input = hal_input_io(input_device);
             if (!input) return error::invalid_device;
             input_frames = std::min(hal_buffer_frames(input_device), u.max_frames);

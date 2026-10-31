@@ -8,6 +8,7 @@
 #include "alchemy/gui/tests/fill_fixture.hpp"
 #include "alchemy/darwin/media/capture_core.hpp"
 #include "alchemy/darwin/media/hal_core.hpp"
+#include "alchemy/darwin/media/hal_host.hpp"
 #include "alchemy/darwin/media/media_support.hpp"
 #include "alchemy/darwin/kit/support/support_kit.hpp"
 #include "alchemy/darwin/security/bridge.hpp"
@@ -542,6 +543,57 @@ void ioproc_input(Fixture& f) {
     require(f.status(ca, "_AudioDeviceDestroyIOProcID", {microphone, f.engine.read64(id)}) == 0, "destroyed");
 }
 
+// Alchemy's own test devices (ALCHEMY_CAMERA=pattern, ALCHEMY_AUDIO_INPUT=tone) through the host backends: the
+// colour-bar camera and the 440 Hz microphone, which replace the host's devices (none is opened).
+void test_devices(Fixture&) {
+    _putenv_s("ALCHEMY_CAMERA", "pattern");
+    _putenv_s("ALCHEMY_AUDIO_INPUT", "tone");
+    const auto cameras = capture::make_host_backend();
+    const auto listed = cameras->cameras();
+    require(listed.size() == 1 && listed[0].id == "alchemy-test-pattern" && listed[0].formats.size() == 2, "the test pattern is the only camera");
+    require(cameras->camera_access() == capture::Access::allowed && cameras->microphone_access() == capture::Access::allowed, "test devices are allowed");
+    std::mutex mutex;
+    std::vector<std::uint8_t> picture;
+    std::uint32_t width{}, height{};
+    std::atomic<int> pictures{0};
+    capture::OpenError error{};
+    auto stream = cameras->open(listed[0].id, 640, 480, 30, [&](const capture::Picture& p) {
+        std::lock_guard lock(mutex);
+        if (picture.empty()) picture.assign(p.data, p.data + p.size);
+        width = p.width;
+        height = p.height;
+        ++pictures;
+    }, error);
+    require(stream && stream->start(), "the pattern opens");
+    require(wait_for([&] { return pictures >= 3; }), "pictures arrive");
+    stream->stop();
+    {
+        std::lock_guard lock(mutex);
+        require(width == 640 && height == 480 && picture.size() == 640 * 480 * 3 / 2, "640x480 NV12");
+        require(picture[0] == 235 && picture[639] == 16, "white bar on the left, black on the right");
+    }
+    const auto backend = hal::make_host_backend();
+    const auto snapshot = backend->snapshot();
+    const auto tone = std::find_if(snapshot.devices.begin(), snapshot.devices.end(), [](const hal::Device& d) { return d.input; });
+    require(tone != snapshot.devices.end() && tone->uid == "alchemy-test-tone" && snapshot.default_input == tone->uid &&
+                std::count_if(snapshot.devices.begin(), snapshot.devices.end(), [](const hal::Device& d) { return d.input; }) == 1,
+            "the test tone is the only microphone, and the default");
+    std::vector<float> samples;
+    auto input = backend->open_input(*tone, [&](const float* data, std::uint32_t frames, std::uint64_t) {
+        std::lock_guard lock(mutex);
+        samples.insert(samples.end(), data, data + frames);
+    });
+    require(input && input->start(), "the tone opens");
+    require(wait_for([&] { std::lock_guard lock(mutex); return samples.size() >= 4800; }), "the tone arrives");
+    input->stop();
+    double squares = 0, peak = 0;
+    for (const auto v : samples) { squares += double(v) * v; peak = std::max(peak, std::fabs(double(v))); }
+    const auto rms = std::sqrt(squares / samples.size());
+    require(std::fabs(peak - 0.25) < 0.001 && std::fabs(rms - 0.25 / std::sqrt(2.0)) < 0.002, "a sine at a quarter of full scale: " + std::to_string(rms));
+    _putenv_s("ALCHEMY_CAMERA", "");
+    _putenv_s("ALCHEMY_AUDIO_INPUT", "");
+}
+
 } // namespace
 
 int main() {
@@ -555,5 +607,6 @@ int main() {
         {"auhal_input", auhal_input},
         {"audio_queue_input", audio_queue_input},
         {"ioproc_input", ioproc_input},
+        {"test_devices", test_devices},
     });
 }

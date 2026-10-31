@@ -65,6 +65,15 @@ Cloaked runs list no cameras (`ALCHEMY_CAMERA=device` lists them; `ALCHEMY_CAMER
 them in any run) and capture silence from the microphones (`ALCHEMY_AUDIO_INPUT=device` opens
 them; `=null` keeps them silent in any run).
 
+**Test devices (opt-in, no real device is opened):** `ALCHEMY_CAMERA=pattern` makes "Alchemy Test
+Pattern" the only camera (1280x720 and 640x480 colour bars with a moving white square, up to 30
+frames per second), and `ALCHEMY_AUDIO_INPUT=tone` makes "Alchemy Test Tone" the only microphone
+and the default input (mono 48 kHz, a 440 Hz sine at a quarter of full scale). Access to them is
+allowed, since the host's privacy settings concern its real devices. `scripts/chrome/pages/media_capture.html`
+checks them end to end through Chrome's getUserMedia (with `--use-fake-ui-for-media-stream`), and
+the cloaked silent microphone with `expect=silent`. `ALCHEMY_HAL_LOG=1` prints each CoreAudio HAL
+property a program asks for that the HAL does not have, once.
+
 **Audio files (real, `audio_file.cpp`):** AudioFile and ExtAudioFile read and write linear PCM
 WAVE, AIFF, AIFC and CAF, by URL or through the client's callbacks
 (`AudioFileOpenWithCallbacks`, `AudioFileInitializeWithCallbacks`). Writes go into the data, and

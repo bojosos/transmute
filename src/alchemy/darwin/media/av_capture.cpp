@@ -111,7 +111,7 @@ struct PortState final : ObjectPayload { Address input{}; bool enabled{true}; };
 struct ConnectionState final : ObjectPayload {
     Address output{};                       // not retained (the output holds the connection)
     bool enabled{true}, mirrored{}, automatic_mirroring{true};
-    CMTime min_duration{};
+    std::int64_t orientation{1};
 };
 struct OutputState final : ObjectPayload {
     Media media{};
@@ -779,6 +779,30 @@ void Capture::install() {
     for (const auto* selector : {"focusMode", "exposureMode", "whiteBalanceMode", "torchMode", "flashMode"})
         support.method(device_class_, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "q@:");
     support.method(device_class_, "linkedDevices", [array](CpuState& s, GuestMemory&) { s.x[0] = array({}); }, "@@:");
+    // The system video effects and microphone modes (macOS 12-14 Control Center features): none is available
+    // or enabled. Both getter spellings are answered (the class properties' declared getters vary).
+    for (const auto* selector : {"reactionEffectsEnabled", "reactionEffectGesturesEnabled", "isCenterStageEnabled", "centerStageEnabled",
+                                 "isPortraitEffectEnabled", "portraitEffectEnabled", "isStudioLightEnabled", "studioLightEnabled"})
+        support.method(device_class_, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:", true);
+    // AVCaptureCenterStageControlModeUser 0; AVCaptureMicrophoneModeStandard 0.
+    for (const auto* selector : {"centerStageControlMode", "preferredMicrophoneMode", "activeMicrophoneMode"})
+        support.method(device_class_, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "q@:", true);
+    for (const auto* selector : {"canPerformReactionEffects", "isPortraitEffectSupported", "isStudioLightSupported"})
+        support.method(device_class_, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // The device's CoreMediaIO object: none (kCMIOObjectUnknown); CoreMediaIO has no devices here.
+    support.method(device_class_, "connectionID", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "i@:");
+    for (const auto* selector : {"isFocusPointOfInterestSupported", "isExposurePointOfInterestSupported"})
+        support.method(device_class_, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // CGPoint (an HFA of two doubles in d0, d1): the centre, the documented default.
+    for (const auto* selector : {"focusPointOfInterest", "exposurePointOfInterest"})
+        support.method(device_class_, selector, [](CpuState& s, GuestMemory&) {
+            s.v[0] = {std::bit_cast<std::uint64_t>(0.5), 0};
+            s.v[1] = {std::bit_cast<std::uint64_t>(0.5), 0};
+        }, "{CGPoint=dd}@:");
+    support.method(device_class_, "reactionEffectsInProgress", [array](CpuState& s, GuestMemory&) { s.x[0] = array({}); }, "@@:");
+    support.method(device_class_, "availableReactionTypes", [sp](CpuState& s, GuestMemory&) {
+        s.x[0] = sp->send_id(sp->objc.find_class("NSSet"), "set");
+    }, "@@:");
     support.method(device_class_, "formats", [device_of, array](CpuState& s, GuestMemory&) { s.x[0] = array(device_of(s.x[0])->format_objects); }, "@@:");
     support.method(device_class_, "activeFormat", [self, device_of](CpuState& s, GuestMemory&) {
         std::lock_guard lock(self->mutex_);
@@ -856,7 +880,21 @@ void Capture::install() {
         s.x[0] = f->format.width | (static_cast<std::uint64_t>(f->format.height) << 32);
     }, "{?=ii}@:");
     support.method(format_class_, "isVideoBinned", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
-    support.method(format_class_, "isVideoHDRSupported", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // No system video effect, stabilization, multi-camera or HDR mode is supported by any format.
+    for (const auto* selector : {"isVideoHDRSupported", "isPortraitEffectSupported", "isCenterStageSupported", "isStudioLightSupported",
+                                 "reactionEffectsSupported", "isBackgroundReplacementSupported", "isMultiCamSupported",
+                                 "isHighestPhotoQualitySupported", "isGlobalToneMappingSupported", "isHighPhotoQualitySupported"})
+        support.method(format_class_, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    support.method(format_class_, "isVideoStabilizationModeSupported:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[2] == 0 ? 1 : 0; }, "B@:q");
+    for (const auto* selector : {"videoFrameRateRangeForPortraitEffect", "videoFrameRateRangeForCenterStage", "videoFrameRateRangeForStudioLight",
+                                 "videoFrameRateRangeForReactionEffectsInProgress", "videoFrameRateRangeForBackgroundReplacement"})
+        support.method(format_class_, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:");
+    // kAVCaptureColorSpace_sRGB 0.
+    support.method(format_class_, "supportedColorSpaces", [array, sp](CpuState& s, GuestMemory&) {
+        const auto zero = sp->cf.integer(0, 9);
+        s.x[0] = array({zero});
+        sp->release(zero);
+    }, "@@:");
     support.method(format_class_, "videoMaxZoomFactor", [](CpuState& s, GuestMemory&) { s.v[0] = {std::bit_cast<std::uint64_t>(1.0), 0}; }, "d@:");
     support.method(format_class_, "videoFieldOfView", [](CpuState& s, GuestMemory&) { s.v[0] = {0, 0}; }, "f@:");
     support.method(format_class_, "dealloc", [this, sp](CpuState& s, GuestMemory&) {
@@ -1082,7 +1120,29 @@ void Capture::install() {
         connection_of(s.x[0])->automatic_mirroring = (s.x[2] & 0xff) != 0;
     }, "v@:B");
     support.method(connection_class_, "isVideoOrientationSupported", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
-    support.method(connection_class_, "isVideoMinFrameDurationSupported", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // Frame durations belong to the device (activeVideoMin/MaxFrameDuration), as on macOS: the connection's
+    // are not supported, and read as invalid.
+    for (const auto* selector : {"isVideoMinFrameDurationSupported", "isVideoMaxFrameDurationSupported", "isVideoStabilizationSupported",
+                                 "isVideoFieldModeSupported", "isCameraIntrinsicMatrixDeliverySupported", "isCameraIntrinsicMatrixDeliveryEnabled",
+                                 "isVideoStabilizationEnabled", "enablesVideoStabilizationWhenAvailable"})
+        support.method(connection_class_, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    for (const auto* selector : {"videoMinFrameDuration", "videoMaxFrameDuration"})
+        support.method(connection_class_, selector, [self](CpuState& s, GuestMemory&) { self->write_time(s.x[8], time_invalid); }, "{?=qiIq}@:");
+    // AVCaptureVideoOrientationPortrait 1 (kept as set); stabilization off (AVCaptureVideoStabilizationModeOff 0).
+    support.method(connection_class_, "videoOrientation", [connection_of](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<std::uint64_t>(connection_of(s.x[0])->orientation);
+    }, "q@:");
+    support.method(connection_class_, "setVideoOrientation:", [connection_of](CpuState& s, GuestMemory&) {
+        connection_of(s.x[0])->orientation = static_cast<std::int64_t>(s.x[2]);
+    }, "v@:q");
+    for (const auto* selector : {"preferredVideoStabilizationMode", "activeVideoStabilizationMode"})
+        support.method(connection_class_, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "q@:");
+    support.method(connection_class_, "setPreferredVideoStabilizationMode:", [](CpuState&, GuestMemory&) {}, "v@:q");
+    // Rotation: only 0 degrees (the pictures are not rotated).
+    support.method(connection_class_, "isVideoRotationAngleSupported:", [](CpuState& s, GuestMemory&) { s.x[0] = s.v[0][0] == 0 ? 1 : 0; }, "B@:d");
+    support.method(connection_class_, "videoRotationAngle", [](CpuState& s, GuestMemory&) { s.v[0] = {0, 0}; }, "d@:");
+    for (const auto* selector : {"videoScaleAndCropFactor", "videoMaxScaleAndCropFactor"})
+        support.method(connection_class_, selector, [](CpuState& s, GuestMemory&) { s.v[0] = {std::bit_cast<std::uint64_t>(1.0), 0}; }, "d@:");
     support.method(connection_class_, "audioChannels", [array](CpuState& s, GuestMemory&) { s.x[0] = array({}); }, "@@:");
 
     // ---- AVCaptureSession ------------------------------------------------------------------------
