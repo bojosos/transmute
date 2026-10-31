@@ -48,6 +48,22 @@ here); CGColorSpaceCopyBaseColorSpace; no space made here has an HDR transfer
 function (IsHDR / IsPQBased / IsHLGBased / UsesITUR_2100TF are false);
 CGColorSpaceCreateWithColorSyncProfile reads the profile's ICC data.
 
+**PDF reading** (`pdf/pdf_parser.cpp`, `pdf_document.cpp`): CGPDFDocument
+reads PDF files written to the PDF specification: cross-reference tables
+and streams (with /Prev and hybrid sections), object streams, and files
+whose cross-reference data is broken (reconstructed from the object
+headers). Stream data decodes FlateDecode (with predictors), LZWDecode,
+ASCIIHex, ASCII85 and RunLength; DCT and JPX data stays encoded
+(CGPDFStreamCopyData reports the format); CCITT, JBIG2 and Crypt filters
+give no data. Pages, inherited boxes and rotation, drawing transforms,
+the CGPDF object, dictionary, array, stream and string functions (text
+strings and dates included), content streams, resources, operator tables
+and scanners are real. The CGPDFObjectType, CGPDFBox and CGPDFDataFormat
+values follow their documented order (unverified). Not provided:
+decrypting encrypted documents (they stay locked; their structure reads),
+CGContextDrawPDFPage (stops explicitly), the document outline, access
+permissions, and PDF writing (CGPDFContextCreate returns NULL).
+
 ## Moved from darwin/identities/
 
 * `color_space_property_list.cpp`: CGColorSpaceCopyPropertyList answers NULL (the support kit).

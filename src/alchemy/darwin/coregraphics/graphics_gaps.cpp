@@ -456,17 +456,7 @@ void GraphicsGaps::install_core_graphics() {
     constant(core_graphics, "__CGSDefaultConnection", 0);
     for (const auto* name : {"_CGSSetWindowAlpha", "_CGSSetWindowTransform", "_CGSSetWindowWarp", "_CGSSetDenyWindowServerConnections"})
         failure(core_graphics, name, cg_invalid_connection);
-    // PDF: no PDF parser or writer.
-    constant(core_graphics, "_CGPDFDocumentCreateWithProvider", 0);
-    raw(core_graphics, "_CGPDFDocumentGetNumberOfPages", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGPDFDocumentGetNumberOfPages"); s.x[0] = 0; });
-    raw(core_graphics, "_CGPDFDocumentGetPage", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGPDFDocumentGetPage"); s.x[0] = 0; });
-    raw(core_graphics, "_CGPDFPageGetBoxRect", [](CpuState& s, GuestMemory&) {
-        impossible(s.x[0], "CGPDFPageGetBoxRect");
-        const auto infinity = std::numeric_limits<double>::infinity();
-        return_real(s, infinity, 0); return_real(s, infinity, 1); return_real(s, 0, 2); return_real(s, 0, 3);   // CGRectNull
-    });
-    raw(core_graphics, "_CGPDFPageGetRotationAngle", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGPDFPageGetRotationAngle"); s.x[0] = 0; });
-    raw(core_graphics, "_CGContextDrawPDFPage", [](CpuState& s, GuestMemory&) { impossible(s.x[1], "CGContextDrawPDFPage"); });
+    // PDF writing: no PDF writer (reading is coregraphics/pdf_document.cpp).
     constant(core_graphics, "_CGPDFContextCreate", 0);
     raw(core_graphics, "_CGPDFContextClose", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGPDFContextClose"); });
     // Keys.

@@ -20,6 +20,8 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/coregraphics/context_exports.cpp
     src/alchemy/darwin/coregraphics/appkit_drawing.cpp
     src/alchemy/darwin/coregraphics/displays.cpp
+    src/alchemy/darwin/coregraphics/pdf/pdf_parser.cpp
+    src/alchemy/darwin/coregraphics/pdf_document.cpp
     src/alchemy/darwin/coregraphics/imageio/codec.cpp
     src/alchemy/darwin/coregraphics/imageio/imageio_exports.cpp
     src/alchemy/darwin/coregraphics/cg_extra.cpp
@@ -43,6 +45,9 @@ function(alchemy_gui_quartz2d_tests)
     # Quartz Display Services over a fixed screen list and over the host's
     # screens (against host::ui's monitor list).
     alchemy_gui_add_unit_test(alchemy_gui_coregraphics_displays src/alchemy/darwin/coregraphics/tests/displays_tests.cpp)
+    # The PDF reader (pdf/pdf_parser.cpp) on generated files, and the CGPDF
+    # functions over it.
+    alchemy_gui_add_unit_test(alchemy_gui_coregraphics_pdf src/alchemy/darwin/coregraphics/tests/pdf_tests.cpp)
     if(NOT ALCHEMY_GUI_FIXTURES_ENABLED)
         return()
     endif()
