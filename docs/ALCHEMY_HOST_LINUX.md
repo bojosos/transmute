@@ -44,6 +44,7 @@ below. Nothing in `src/alchemy/darwin/` changes.
 | `audio` | WASAPI device enumeration, output and capture streams, the microphone consent store | PipeWire (or ALSA directly) for devices and streams. |
 | `midi` | WinMM `midiIn*`/`midiOut*` | ALSA sequencer, or PipeWire MIDI. |
 | `speech` | SAPI 5 `ISpVoice` speaking into a memory stream | speech-dispatcher or eSpeak NG into a buffer. |
+| `camera` | Media Foundation source readers (`MFEnumDeviceSources`, NV12 output) and the webcam consent store | V4L2 (or PipeWire camera portals), converting to NV12. |
 | `gpu` | Vulkan loader + `vkCreateWin32SurfaceKHR`; D2D, DirectWrite and WIC under CoreGraphics, CoreText and ImageIO | Vulkan with `VK_KHR_wayland_surface`/`xcb_surface` (Vulkan code is unchanged). The 2D stack needs a replacement for D2D/DirectWrite/WIC: Skia, or Cairo + FreeType + HarfBuzz + libpng/libjpeg, behind the same `gpu` area calls. This is the largest single piece of a port. |
 | `debug` | SetUnhandledExceptionFilter and SetErrorMode, RtlLookupFunctionEntry/RtlVirtualUnwind, RtlCaptureStackBackTrace, GetModuleHandleEx | `sigaction` for SIGSEGV/SIGBUS/SIGILL/SIGFPE on an alternate stack, `backtrace()` or libunwind, `dladdr` for module and offset. |
 | network policy (`ALCHEMY_NETWORK`) | in `src/alchemy/host/common/`, above the backends | unchanged: every backend inherits it. |
