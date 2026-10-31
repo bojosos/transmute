@@ -185,6 +185,14 @@ delegate callbacks, stopping and pausing at once or at a word. The pitch base
 is kept, not applied; writing speech to a file stops explicitly; without host
 voices the initializers return nil.
 
+**Toolbar groups and grid layouts:** NSToolbarItemGroup shows its subitems in
+the toolbar strip as one segmented control (the group's view unless it has
+its own), selected by its selection mode; a chosen segment sends the
+subitem's action, else the group's; the control representation is kept (groups
+show expanded). NSCollectionViewGridLayout lays items out in a grid (column and
+row limits, minimum and maximum item sizes, spacing, margins); items past the
+row limit are hidden and the background colours are kept, not drawn.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features
