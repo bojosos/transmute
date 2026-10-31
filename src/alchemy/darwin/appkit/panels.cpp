@@ -6,6 +6,9 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #include <thread>
 
 #include "alchemy/host/ui.hpp"
@@ -17,8 +20,12 @@
 //  * NSPanel (NSWindow with the panel properties; a floating panel is a
 //    floating-level window);
 //  * NSToolbar / NSToolbarItem as objects (identifiers, items, delegate
-//    item creation); a window does not show a toolbar, so -[NSWindow
-//    setToolbar:] with a toolbar fails explicitly;
+//    item creation; window_tabs.cpp shows them), and NSToolbarItemGroup: its
+//    subitems shown as one segmented control (the group's view unless it
+//    has its own), selected by its selection mode (one, any, momentary);
+//    choosing a segment sends the subitem's action, else the group's (with
+//    the group as the sender). The control representation is kept; groups
+//    are always shown expanded;
 //  * NSSavePanel / NSOpenPanel: the Windows common item dialog (file
 //    types from allowed extensions, UTIs and UTTypes; title, prompt, name
 //    label, directory and name; files, folders, multiple selection),
@@ -37,6 +44,16 @@
 //  * a few constants and NSAccessibilityUnignoredDescendant.
 namespace alchemy::gui::appkit {
 namespace {
+struct ToolbarGroupState {
+    std::vector<Address> subitems;            // +1
+    std::vector<bool> selected;               // by subitem
+    std::int64_t mode{}, representation{};    // NSToolbarItemGroupSelectionMode, ...ControlRepresentation
+    Address control{};                        // +1 the segmented control shown (nil until needed)
+};
+std::map<Address, ToolbarGroupState>& toolbar_groups() {
+    static std::map<Address, ToolbarGroupState> groups;
+    return groups;
+}
 struct PrintPanelState final : ObjectPayload {
     std::uint64_t options{0x03};              // NSPrintPanelShowsCopies | NSPrintPanelShowsPageRange
     Address job_style_hint{}, help_anchor{}, default_button_title{};   // +1
@@ -428,6 +445,144 @@ void AppKit::install_panels() {
         const auto receiver = target_for_action(state->action, state->target);
         if (receiver && responds(receiver, "validateToolbarItem:")) state->enabled = send_bool(receiver, "validateToolbarItem:", {s.x[0]});
     }, "v@:");
+
+    // ---- NSToolbarItemGroup ----
+    const auto group = declare_class("NSToolbarItemGroup", "NSToolbarItem");
+    const auto group_of = [](Address value) -> ToolbarGroupState& { return toolbar_groups()[value]; };
+    // The segmented control showing the subitems (made again when they change).
+    const auto sync_control = [this, group_of](Address self) {
+        auto& state = group_of(self);
+        const auto segmented = objc.find_class("NSSegmentedControl");
+        if (!segmented || !state.control) return;
+        const auto control = state.control;
+        static_cast<void>(send_id(control, "setSegmentCount:", {static_cast<Address>(state.subitems.size())}));
+        static_cast<void>(send_id(control, "setTrackingMode:", {static_cast<Address>(state.mode == 2 ? 2 : state.mode == 1 ? 1 : 0)}));
+        for (std::size_t i = 0; i < state.subitems.size(); ++i) {
+            const auto item = state.subitems[i];
+            const auto index = static_cast<Address>(i);
+            if (const auto picture = send(item, "image").x0) static_cast<void>(send_id(control, "setImage:forSegment:", {picture, index}));
+            else {
+                auto title = send(item, "title").x0;
+                if (!title || cf.length(title) == 0) title = send(item, "label").x0;
+                static_cast<void>(send_id(control, "setLabel:forSegment:", {title, index}));
+            }
+            static_cast<void>(send_id(control, "setEnabled:forSegment:", {send_bool(item, "isEnabled") ? 1U : 0U, index}));
+            if (state.mode != 2) static_cast<void>(send_id(control, "setSelected:forSegment:", {state.selected[i] ? 1U : 0U, index}));
+        }
+        static_cast<void>(send(control, "sizeToFit"));
+    };
+    const auto make_control = [this, group_of, sync_control](Address self) {
+        auto& state = group_of(self);
+        const auto segmented = objc.find_class("NSSegmentedControl");
+        if (state.control || !segmented) return;
+        CallRegs frame;
+        put_rect(frame, 0, {{0, 0}, {100, 24}});
+        state.control = send(send(segmented, "alloc").x0, "initWithFrame:", frame).x0;
+        static_cast<void>(send_id(state.control, "setTarget:", {self}));
+        static_cast<void>(send_id(state.control, "setAction:", {sel("_alchemyGroupSegmentChosen:")}));
+        sync_control(self);
+    };
+    method(group, "subitems", [this, group_of](CpuState& s, GuestMemory&) { s.x[0] = auto_array(group_of(s.x[0]).subitems); });
+    method(group, "setSubitems:", [this, group_of, sync_control](CpuState& s, GuestMemory&) {
+        auto& state = group_of(s.x[0]);
+        const auto incoming = items(s.x[2]);
+        for (const auto item : incoming) static_cast<void>(retain(item));
+        for (const auto item : state.subitems) release(item);
+        state.subitems = incoming;
+        state.selected.assign(incoming.size(), false);
+        sync_control(s.x[0]);
+    }, "v@:@");
+    method(group, "selectionMode", [group_of](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(group_of(s.x[0]).mode); }, "q@:");
+    method(group, "setSelectionMode:", [group_of, sync_control](CpuState& s, GuestMemory&) {
+        auto& state = group_of(s.x[0]);
+        state.mode = static_cast<std::int64_t>(s.x[2]);
+        if (state.mode == 2) state.selected.assign(state.subitems.size(), false);
+        sync_control(s.x[0]);
+    }, "v@:q");
+    method(group, "controlRepresentation", [group_of](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(group_of(s.x[0]).representation); }, "q@:");
+    method(group, "setControlRepresentation:", [group_of](CpuState& s, GuestMemory&) { group_of(s.x[0]).representation = static_cast<std::int64_t>(s.x[2]); }, "v@:q");
+    method(group, "selectedIndex", [group_of](CpuState& s, GuestMemory&) {
+        const auto& state = group_of(s.x[0]);
+        std::int64_t found = -1;
+        for (std::size_t i = 0; i < state.selected.size(); ++i) if (state.selected[i]) { found = static_cast<std::int64_t>(i); break; }
+        s.x[0] = static_cast<Address>(found);
+    }, "q@:");
+    method(group, "setSelectedIndex:", [group_of, sync_control](CpuState& s, GuestMemory&) {
+        auto& state = group_of(s.x[0]);
+        const auto index = static_cast<std::int64_t>(s.x[2]);
+        if (state.mode == 2) return;   // momentary groups keep no selection
+        state.selected.assign(state.subitems.size(), false);
+        if (index >= 0 && static_cast<std::size_t>(index) < state.selected.size()) state.selected[static_cast<std::size_t>(index)] = true;
+        sync_control(s.x[0]);
+    }, "v@:q");
+    method(group, "setSelected:atIndex:", [group_of, sync_control](CpuState& s, GuestMemory&) {
+        auto& state = group_of(s.x[0]);
+        const auto index = static_cast<std::size_t>(s.x[3]);
+        if (index >= state.selected.size()) throw std::out_of_range("Alchemy: -[NSToolbarItemGroup setSelected:atIndex:] beyond the subitems");
+        if (state.mode == 2) return;
+        if (state.mode == 0 && bool_arg(s, 2)) state.selected.assign(state.subitems.size(), false);
+        state.selected[index] = bool_arg(s, 2);
+        sync_control(s.x[0]);
+    }, "v@:Bq");
+    method(group, "isSelectedAtIndex:", [group_of](CpuState& s, GuestMemory&) {
+        const auto& state = group_of(s.x[0]);
+        const auto index = static_cast<std::size_t>(s.x[2]);
+        return_bool(s, index < state.selected.size() && state.selected[index]);
+    }, "B@:q");
+    // The view shown: the group's own, else the segmented control.
+    method(group, "view", [this, group, group_of, make_control](CpuState& s, GuestMemory&) {
+        const auto own = objc.send_super(s.x[0], group, sel("view")).x0;
+        if (own) { s.x[0] = own; return; }
+        make_control(s.x[0]);
+        s.x[0] = group_of(s.x[0]).control;
+    });
+    method(group, "_alchemyGroupSegmentChosen:", [this, group_of](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], control = s.x[2];
+        auto& state = group_of(self);
+        const auto index = static_cast<std::int64_t>(send(control, "selectedSegment").x0);
+        if (index < 0 || static_cast<std::size_t>(index) >= state.subitems.size()) return;
+        const auto at = static_cast<std::size_t>(index);
+        if (state.mode == 0) { state.selected.assign(state.subitems.size(), false); state.selected[at] = true; }
+        else if (state.mode == 1) state.selected[at] = send_bool(control, "isSelectedForSegment:", {static_cast<Address>(index)});
+        const auto subitem = state.subitems[at];
+        if (const auto action = send(subitem, "action").x0) static_cast<void>(send_action(action, send(subitem, "target").x0, subitem));
+        else if (const auto own = send(self, "action").x0) static_cast<void>(send_action(own, send(self, "target").x0, self));
+    }, "v@:@");
+    method(group, "dealloc", [this, group](CpuState& s, GuestMemory&) {
+        auto& groups = toolbar_groups();
+        if (const auto found = groups.find(s.x[0]); found != groups.end()) {
+            for (const auto item : found->second.subitems) release(item);
+            release(found->second.control);
+            groups.erase(found);
+        }
+        static_cast<void>(objc.send_super(s.x[0], group, sel("dealloc")));
+    }, "v@:");
+    // +groupWithItemIdentifier:titles:/images:selectionMode:labels:target:action:
+    // one subitem per title or image (labelled by `labels`), with the group's target and action.
+    const auto factory = [this, group](bool images) {
+        return [this, group, images](CpuState& s, GuestMemory&) {
+            const auto action = s.x[7];
+            const auto made = send_id(send(group, "alloc").x0, "initWithItemIdentifier:", {s.x[2]});
+            const auto entries = items(s.x[3]);
+            const auto labels = items(s.x[5]);
+            std::vector<Address> subitems;
+            for (std::size_t i = 0; i < entries.size(); ++i) {
+                const auto item = send_id(send(toolbar_item, "alloc").x0, "initWithItemIdentifier:",
+                                          {auto_string(cf.utf8(s.x[2]) + "." + std::to_string(i))});
+                static_cast<void>(send_id(item, images ? "setImage:" : "setTitle:", {entries[i]}));
+                if (i < labels.size()) static_cast<void>(send_id(item, "setLabel:", {labels[i]}));
+                subitems.push_back(autorelease(item));
+            }
+            static_cast<void>(send_id(made, "setSubitems:", {auto_array(subitems)}));
+            static_cast<void>(send_id(made, "setSelectionMode:", {s.x[4]}));
+            static_cast<void>(send_id(made, "setTarget:", {s.x[6]}));
+            static_cast<void>(send_id(made, "setAction:", {action}));
+            s.x[0] = autorelease(made);
+        };
+    };
+    class_method(group, "groupWithItemIdentifier:titles:selectionMode:labels:target:action:", factory(false), "@@:@@q@@:");
+    class_method(group, "groupWithItemIdentifier:images:selectionMode:labels:target:action:", factory(true), "@@:@@q@@:");
+
     // NSWindow's toolbar methods: window_tabs.cpp.
 
     // ---- NSSavePanel / NSOpenPanel ----

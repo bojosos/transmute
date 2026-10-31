@@ -963,6 +963,42 @@ void app_referenced(Fixture& f) {
             "collection view drag masks");
 }
 
+// NSToolbarItemGroup (the frameworks wave, U15b): subitems from the
+// factory, shown as a segmented control, selection by mode, the action.
+void toolbar_groups(Fixture& f) {
+    std::vector<Address> senders;
+    const auto chooser_class = f.subclass("U15GroupTarget", "NSObject");
+    f.add(chooser_class, "chose:", [&senders](CpuState& s, GuestMemory&) { senders.push_back(s.x[2]); });
+    const auto chooser = f.alloc_init("U15GroupTarget");
+    CallRegs make;
+    make.x[2] = f.str("view-mode");
+    make.x[3] = f.array({f.str("List"), f.str("Grid"), f.str("Cards")});
+    make.x[4] = 0;   // NSToolbarItemGroupSelectionModeSelectOne
+    make.x[5] = f.array({f.str("list"), f.str("grid"), f.str("cards")});
+    make.x[6] = chooser;
+    make.x[7] = f.objc.selector("chose:");
+    const auto group = f.msg(f.cls("NSToolbarItemGroup"), "groupWithItemIdentifier:titles:selectionMode:labels:target:action:", make).x0;
+    const auto subitems = f.id(group, "subitems");
+    require(group && f.id(subitems, "count") == 3 && f.text(f.id(f.id(subitems, "objectAtIndex:", {1}), "label")) == "grid" &&
+                f.text(f.id(group, "itemIdentifier")) == "view-mode",
+            "a group's subitems from the factory");
+    const auto control = f.id(group, "view");
+    require(control && (f.id(control, "isKindOfClass:", {f.cls("NSSegmentedControl")}) & 0xff) && f.id(control, "segmentCount") == 3 &&
+                f.text(f.id(control, "labelForSegment:", {1})) == "Grid",
+            "the group shows as a segmented control");
+    static_cast<void>(f.id(group, "setSelectedIndex:", {1}));
+    require(f.id(group, "selectedIndex") == 1 && f.id(control, "selectedSegment") == 1, "-setSelectedIndex: selects the segment");
+    static_cast<void>(f.id(control, "setSelectedSegment:", {2}));
+    static_cast<void>(f.id(control, "sendAction:to:", {f.id(control, "action"), f.id(control, "target")}));
+    require(f.id(group, "selectedIndex") == 2 && (f.id(group, "isSelectedAtIndex:", {1}) & 0xff) == 0 && senders == std::vector<Address>{group},
+            "choosing a segment selects its subitem and sends the group's action");
+    static_cast<void>(f.id(group, "setSelectionMode:", {1}));   // select any
+    static_cast<void>(f.id(group, "setSelected:atIndex:", {1, 0}));
+    require((f.id(group, "isSelectedAtIndex:", {0}) & 0xff) && (f.id(group, "isSelectedAtIndex:", {2}) & 0xff), "select-any keeps several");
+    static_cast<void>(f.id(group, "setSelectionMode:", {2}));   // momentary
+    require(static_cast<std::int64_t>(f.id(group, "selectedIndex")) == -1, "a momentary group keeps no selection");
+}
+
 // NSSpeechSynthesizer over AVFAudio and the host's voices (the frameworks
 // wave, U15). Without host voices the initializer returns nil; with them, a
 // silent utterance reaches the delegate's word and finish callbacks (NO when
@@ -1024,7 +1060,7 @@ int main() {
                  {"images_and_cursors", images_and_cursors}, {"alerts_and_panels", alerts_and_panels},
                  {"pasteboards_and_text", pasteboards_and_text}, {"containers_and_controllers", containers_and_controllers},
                  {"toolbars_and_tabs", toolbars_and_tabs}, {"c_functions", c_functions},
-                 {"status_items_and_sounds", status_items_and_sounds}, {"app_referenced", app_referenced}, {"speech", speech}}) {
+                 {"status_items_and_sounds", status_items_and_sounds}, {"app_referenced", app_referenced}, {"toolbar_groups", toolbar_groups}, {"speech", speech}}) {
             std::cout << "[appkit api] " << name << std::endl;
             test(f);
         }
