@@ -5,6 +5,7 @@
 //   avaudio_player.cpp   AVAudioPlayer
 //   avaudio_engine.cpp   AVAudioEngine and its nodes (output, input, mixer, player, source, sink)
 //   avaudio_converter.cpp AVAudioConverter, AVAudioCompressedBuffer
+//   avaudio_speech.cpp   AVSpeechSynthesizer, AVSpeechSynthesisVoice (host::speech)
 // AVAudioFormat and AVAudioChannelLayout are avfoundation.cpp's; the helpers here use them through
 // their messages. The classes are published under AVFAudio and AVFoundation (which re-exports it).
 
@@ -25,6 +26,7 @@ inline constexpr std::string_view avf_audio = "/System/Library/Frameworks/AVFAud
 
 void install_avaudio_buffers(Support& support);
 void install_avaudio_converter(Support& support);   // called by install_avaudio_buffers
+void install_avaudio_speech(Support& support);      // called by install_avaudio_buffers
 void install_avaudio_player(Support& support);
 void install_avaudio_engine(Support& support);
 

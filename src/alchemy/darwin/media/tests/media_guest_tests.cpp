@@ -13,6 +13,7 @@
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/host/crypto.hpp"
 #include "alchemy/darwin/media/media_container.hpp"
+#include "alchemy/host/speech.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1247,6 +1248,92 @@ void avaudio_effects(Fixture& f) {
     require((f.send(time_pitch, "bypass") & 0xff) == 1, "bypass");
 }
 
+// AVSpeechSynthesizer over the host's voices: the voice list matches host::speech's; with a voice,
+// writeUtterance hands over speech then an empty buffer, and speakUtterance plays it on the fake
+// device with didStart, willSpeakRange and didFinish, and a stop cancels; without one, an
+// utterance is cancelled.
+void speech(Fixture& f) {
+    constexpr std::string_view run_loop = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+    const auto mode = f.engine.read64(f.symbol(run_loop, "_kCFRunLoopDefaultMode"));
+    const auto run = [&](double seconds) {
+        alchemy::CallRegs r;
+        r.x[0] = mode;
+        r.set_d(0, seconds);
+        static_cast<void>(f.regs(run_loop, "_CFRunLoopRunInMode", r));
+    };
+    static std::atomic<int> started{0}, finished{0}, cancelled{0}, words{0};
+    started = finished = cancelled = words = 0;
+    const auto delegate_class = f.objc.register_native_class("AlchemySpeechTestDelegate", f.cls("NSObject"), 8);
+    const auto count = [&](const char* selector, std::atomic<int>& counter) {
+        static_cast<void>(f.objc.add_native_method(delegate_class, selector, [&counter](transmute::CpuState&, transmute::GuestMemory&) { ++counter; }, false, "v@:@@"));
+    };
+    count("speechSynthesizer:didStartSpeechUtterance:", started);
+    count("speechSynthesizer:didFinishSpeechUtterance:", finished);
+    count("speechSynthesizer:didCancelSpeechUtterance:", cancelled);
+    static_cast<void>(f.objc.add_native_method(delegate_class, "speechSynthesizer:willSpeakRangeOfSpeechString:utterance:",
+                                               [](transmute::CpuState&, transmute::GuestMemory&) { ++words; }, false, "v@:@{_NSRange=QQ}@"));
+    const auto delegate = f.send(f.send(delegate_class, "alloc"), "init");
+    const auto host_voices = alchemy::host::speech::voices();
+    const auto listed = f.send(f.cls("AVSpeechSynthesisVoice"), "speechVoices");
+    const auto voice_count = host_voices ? host_voices->size() : 0;
+    require(f.cf.length(listed) == voice_count, "the voices are the host's: " + std::to_string(voice_count));
+    const auto synthesizer = f.send(f.send(f.cls("AVSpeechSynthesizer"), "alloc"), "init");
+    f.send(synthesizer, "setDelegate:", {delegate});
+    const auto utterance = [&](const char* text) { return f.send(f.cls("AVSpeechUtterance"), "speechUtteranceWithString:", {f.cf.string(text)}); };
+    const auto wait = [&](const std::atomic<int>& counter, double seconds, bool play) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+        std::vector<float> heard;
+        while (counter == 0 && std::chrono::steady_clock::now() < deadline) {
+            if (play) {
+                const auto out = FakeStream::play_paced(1024);
+                heard.insert(heard.end(), out.begin(), out.end());
+            }
+            run(0.01);
+        }
+        return heard;
+    };
+    if (voice_count == 0) {
+        f.send(synthesizer, "speakUtterance:", {utterance("hello")});
+        static_cast<void>(wait(cancelled, 5, false));
+        require(cancelled == 1 && started == 0, "without voices an utterance is cancelled");
+        return;
+    }
+    const auto first = f.cf.element(listed, 0);
+    require(!f.cf.utf8(f.send(first, "identifier")).empty() && !f.cf.utf8(f.send(first, "name")).empty(), "a voice's identifier and name");
+    require(f.send(f.cls("AVSpeechSynthesisVoice"), "voiceWithIdentifier:", {f.send(first, "identifier")}) != 0, "voiceWithIdentifier:");
+    // writeUtterance: buffers of speech, then an empty one.
+    static std::atomic<std::uint64_t> written{0};
+    static std::atomic<int> ended{0};
+    static std::atomic<bool> voiced{false};
+    written = 0; ended = 0; voiced = false;
+    const auto b = alchemy::gui::security::bridge();
+    // (AVAudioBuffer *): count the frames; any sample above the noise floor is speech.
+    const auto collect = b->make_block([&f](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto buffer = s.x[1];
+        const auto frames = f.send(buffer, "frameLength");
+        if (frames == 0) { ++ended; return; }
+        written += frames;
+        const auto data = m.read64(f.send(buffer, "floatChannelData"));
+        for (std::uint64_t i = 0; i < frames; ++i)
+            if (std::fabs(std::bit_cast<float>(m.read32(data + 4 * i))) > 0.01f) { voiced = true; break; }
+    });
+    f.send(synthesizer, "writeUtterance:toBufferCallback:", {utterance("hello world"), collect});
+    static_cast<void>(wait(ended, 15, false));
+    require(ended == 1 && written > 2205 && voiced, "writeUtterance: " + std::to_string(written.load()) + " frames");
+    // Speaking: didStart, word ranges, didFinish, and sound on the device.
+    f.send(synthesizer, "speakUtterance:", {utterance("hello world")});
+    const auto heard = wait(finished, 20, true);
+    require(started == 1 && finished == 1 && words >= 1, "the delegate hears start, " + std::to_string(words.load()) + " words and finish");
+    require(std::any_of(heard.begin(), heard.end(), [](float v) { return std::fabs(v) > 0.01f; }), "speech is heard on the device");
+    // A stop at once cancels the utterance and drops the queue.
+    f.send(synthesizer, "speakUtterance:", {utterance("this is a much longer sentence that is still being spoken when it is stopped")});
+    f.send(synthesizer, "speakUtterance:", {utterance("never spoken")});
+    for (int i = 0; i < 600 && started < 2; ++i) { static_cast<void>(FakeStream::play_paced(256)); run(0.01); }
+    require((f.send(synthesizer, "stopSpeakingAtBoundary:", {0}) & 0xff) == 1, "stopSpeakingAtBoundary:");
+    for (int i = 0; i < 50 && cancelled == 0; ++i) run(0.01);
+    require(cancelled == 1 && (f.send(synthesizer, "isSpeaking") & 0xff) == 0 && started == 2, "a stop cancels and drops the queue");
+}
+
 void music_sequence(Fixture& f) {
     const auto out = f.block(8);
     require(f.status(at, "_NewMusicSequence", {out}) == 0, "NewMusicSequence");
@@ -2402,5 +2489,6 @@ int main() {
         {"avaudio", avaudio},
         {"avaudio_conversion", avaudio_conversion},
         {"avaudio_effects", avaudio_effects},
+        {"speech", speech},
     });
 }

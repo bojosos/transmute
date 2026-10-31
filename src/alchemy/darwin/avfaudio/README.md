@@ -6,8 +6,9 @@
 * **Real, elsewhere:** AVAudioTime, AVAudioPCMBuffer, AVAudioCompressedBuffer, AVAudioFile,
   AVAudioConverter, AVAudioPlayer and AVAudioEngine with its nodes (including the AVAudioUnit effects) are `media/avaudio_*.cpp` (see `media/README.md`); AVAudioFormat and
   AVAudioChannelLayout are `media/avfoundation.cpp`.
-* **Unavailable, as documented:** No voice is installed: `+speechVoices` is empty and the voice lookups return nil. Nothing is ever spoken, so `-isSpeaking` is NO and stop, pause and continue return NO. A host text-to-speech engine (a `host::audio` or `host::ui` speech call) would make it real.
-* **Host dependencies:** none.
+* **Real, elsewhere, speech:** AVSpeechSynthesisVoice and AVSpeechSynthesizer speak with the host's voices (`host::speech`: SAPI on Windows) through the audio output, with the delegate callbacks and `writeUtterance:toBufferCallback:` (`media/avaudio_speech.cpp`).
+* **Unavailable, as documented:** On a host without voices (or without an output device) an utterance is cancelled (`didCancel`) instead of spoken, and a notice is printed once.
+* **Host dependencies:** `host::speech` (through media/avaudio_speech.cpp).
 * **Registration:** `install_avfaudio`, one row of the installer table after the
   fill-only set (fill-only, through `gui::values::Provider`). Chrome 155 first
   linked the framework.

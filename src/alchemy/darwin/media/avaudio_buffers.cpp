@@ -620,6 +620,7 @@ void install_avaudio_buffers(Support& support) {
     support.method(file, "readIntoBuffer:frameCount:error:", [read](CpuState& s, GuestMemory&) { read(s, s.x[2], static_cast<std::uint32_t>(s.x[3]), s.x[4]); }, "B@:@I^@");
 
     install_avaudio_converter(support);   // AVAudioConverter and AVAudioCompressedBuffer (avaudio_converter.cpp)
+    install_avaudio_speech(support);      // AVSpeechSynthesizer and AVSpeechSynthesisVoice (avaudio_speech.cpp)
 }
 
 } // namespace alchemy::gui::completion_kit::media::avaudio
