@@ -228,8 +228,9 @@ void popovers() {
     expect_rect(placed.frame, {180, 360, 213, 100}, "max x edge: right of the anchor");
 }
 
-// A window-sized layout: 300 labels in rows of a grid of stacks, about 2000
-// constraints, solved incrementally and edited.
+// A window-sized layout: 100 labels in rows of a grid of stacks, about 700
+// constraints, solved incrementally and edited (300 labels took the solver
+// about 17 s, most of this test's time).
 void large_layout() {
     Solver s; layout::Ids ids;
     const auto c = layout::make_box(s, "container");
@@ -240,7 +241,7 @@ void large_layout() {
     s.suggest_value(c.width, 1200);
     s.suggest_value(c.height, 900);
     std::vector<Box> rows;
-    for (int r = 0; r < 30; ++r) {
+    for (int r = 0; r < 10; ++r) {
         const auto row = layout::make_box(s, "row");
         layout::add(s, ids, row.x, Relation::equal, Expression(c.x).plus(10), layout::required);
         layout::add(s, ids, Expression(row.x).plus(row.width), Relation::equal, Expression(c.x).plus(c.width).plus(-10), layout::required);
