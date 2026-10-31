@@ -11,6 +11,8 @@
 #include "alchemy/darwin/quartzcore/presenter.hpp"
 #include "alchemy/darwin/quartzcore/quartzcore_vulkan.hpp"
 
+#include <initializer_list>
+#include <tuple>
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -129,6 +131,17 @@ struct ScrollLayerState {
     Size tile_size{256, 256};
 };
 
+// CAEmitterLayer: kept; composition draws no particles.
+struct EmitterLayerState {
+    Address cells{}, shape{}, mode{}, render_mode{};   // retained copies (nil shape/mode/render mode: the defaults)
+    float birth_rate{1}, lifetime{1}, velocity{1}, scale{1}, spin{1};
+    Point position;
+    Size size;
+    double z_position{}, depth{};
+    std::uint32_t seed{};
+    bool preserves_depth{};
+};
+
 struct LayerState final : ObjectPayload {
     std::mutex mutex;
     Rect bounds;
@@ -177,6 +190,7 @@ struct LayerState final : ObjectPayload {
     TextLayerState text;
     ReplicatorLayerState replicator;
     ScrollLayerState scroll;
+    EmitterLayerState emitter;
 };
 
 struct DrawableState final : ObjectPayload {
@@ -373,7 +387,9 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
                                std::exchange(state->shape.fill_rule, 0), std::exchange(state->shape.line_cap, 0),
                                std::exchange(state->shape.line_join, 0), std::exchange(state->shape.dash_pattern, 0),
                                std::exchange(state->text.string, 0), std::exchange(state->text.truncation, 0),
-                               std::exchange(state->text.alignment, 0), std::exchange(state->scroll.mode, 0)};
+                               std::exchange(state->text.alignment, 0), std::exchange(state->scroll.mode, 0),
+                               std::exchange(state->emitter.cells, 0), std::exchange(state->emitter.shape, 0),
+                               std::exchange(state->emitter.mode, 0), std::exchange(state->emitter.render_mode, 0)};
                     for (const auto constraint : std::exchange(state->constraints, {})) objects.push_back(constraint);
                     cf_objects = {std::exchange(state->border_color, 0), std::exchange(state->shadow_color, 0),
                                   std::exchange(state->shadow_path, 0), std::exchange(state->shape.path, 0),
@@ -1216,6 +1232,44 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
             { const auto state = layer(s.x[0]); std::lock_guard lock(state->mutex); state->replicator.transform = value; }
             changed(s.x[0]);
         }, "v@:{CATransform3D=dddddddddddddddd}");
+
+        // CAEmitterLayer: the emitter's configuration and its cells
+        // (CAEmitterCell, graphics/animation.cpp) are kept; composition
+        // draws the layer itself but emits no particles.
+        const auto E = declare("CAEmitterLayer", layer_class, true);
+        string_property(E, "emitterCells", "setEmitterCells:", [](LayerState& v) -> Address& { return v.emitter.cells; }, nullptr, true);
+        string_property(E, "emitterShape", "setEmitterShape:", [](LayerState& v) -> Address& { return v.emitter.shape; }, "point", false);
+        string_property(E, "emitterMode", "setEmitterMode:", [](LayerState& v) -> Address& { return v.emitter.mode; }, "volume", false);
+        string_property(E, "renderMode", "setRenderMode:", [](LayerState& v) -> Address& { return v.emitter.render_mode; }, "unordered", false);
+        for (const auto& [getter, setter, member] : std::initializer_list<std::tuple<const char*, const char*, float EmitterLayerState::*>>{
+                 {"birthRate", "setBirthRate:", &EmitterLayerState::birth_rate}, {"lifetime", "setLifetime:", &EmitterLayerState::lifetime},
+                 {"velocity", "setVelocity:", &EmitterLayerState::velocity}, {"scale", "setScale:", &EmitterLayerState::scale},
+                 {"spin", "setSpin:", &EmitterLayerState::spin}}) {
+            const auto field = member;
+            value_property<float>(E, getter, setter, [field](LayerState& v) -> float& { return v.emitter.*field; }, "f", false);
+        }
+        value_property<double>(E, "emitterZPosition", "setEmitterZPosition:", [](LayerState& v) -> double& { return v.emitter.z_position; }, "d", false);
+        value_property<double>(E, "emitterDepth", "setEmitterDepth:", [](LayerState& v) -> double& { return v.emitter.depth; }, "d", false);
+        value_property<std::uint32_t>(E, "seed", "setSeed:", [](LayerState& v) -> std::uint32_t& { return v.emitter.seed; }, "I", false);
+        value_property<bool>(E, "preservesDepth", "setPreservesDepth:", [](LayerState& v) -> bool& { return v.emitter.preserves_depth; }, "B", false);
+        method(E, "emitterPosition", [this](CpuState& s, GuestMemory&) {
+            const auto state = layer(s.x[0]); std::lock_guard lock(state->mutex);
+            return_real(s, 0, state->emitter.position.x);
+            return_real(s, 1, state->emitter.position.y);
+        }, "{CGPoint=dd}@:");
+        method(E, "setEmitterPosition:", [this](CpuState& s, GuestMemory&) {
+            const auto state = layer(s.x[0]); std::lock_guard lock(state->mutex);
+            state->emitter.position = {real(s, 0), real(s, 1)};
+        }, "v@:{CGPoint=dd}");
+        method(E, "emitterSize", [this](CpuState& s, GuestMemory&) {
+            const auto state = layer(s.x[0]); std::lock_guard lock(state->mutex);
+            return_real(s, 0, state->emitter.size.width);
+            return_real(s, 1, state->emitter.size.height);
+        }, "{CGSize=dd}@:");
+        method(E, "setEmitterSize:", [this](CpuState& s, GuestMemory&) {
+            const auto state = layer(s.x[0]); std::lock_guard lock(state->mutex);
+            state->emitter.size = {real(s, 0), real(s, 1)};
+        }, "v@:{CGSize=dd}");
 
         scroll_layer_class = declare("CAScrollLayer", layer_class, true);
         const auto C = scroll_layer_class;

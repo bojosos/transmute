@@ -68,6 +68,14 @@ keys are its properties, the animation timing function among them).
 is standard dynamic range: EDR contents show clamped. CAMetalLayer's
 `preferredDevice` is the system default device (there is one GPU).
 
+**Springs, value functions, emitters:** CASpringAnimation keeps its mass,
+stiffness, damping and initial velocity; `settlingDuration` is computed from
+that spring's motion (until it stays within 0.1% of the end value), and the
+perceptual duration and bounce (macOS 14) follow the usual conversions
+(unverified). CAValueFunction is made by name. CAEmitterLayer and
+CAEmitterCell keep their whole configuration, but composition emits no
+particles (the emitter layer draws as a plain layer).
+
 ## Moved from darwin/identities/
 
 * `shape_layer_shell.cpp`: the CAShapeLayer shell (the support kit).

@@ -261,12 +261,52 @@ void replicas_geometry_scrolling(Fixture& f) {
 
 } // namespace
 
+// Emitters, springs and value functions (the frameworks wave, U18).
+void emitters_springs(Fixture& f) {
+    const auto text = [&f](Address object) { return object ? f.cf.utf8(object) : std::string("(nil)"); };
+    // An emitter layer keeps its cells and configuration.
+    const auto emitter = f.make("CAEmitterLayer");
+    const auto cell = f.id(f.cls("CAEmitterCell"), "emitterCell");
+    static_cast<void>(f.id(cell, "setName:", {f.cf.string("spark")}));
+    alchemy::CallRegs rate;
+    rate.set_s(0, 25.0f);
+    static_cast<void>(f.objc.send(cell, "setBirthRate:", rate));
+    static_cast<void>(f.id(emitter, "setEmitterCells:", {f.array({cell})}));
+    alchemy::CallRegs where;
+    where.set_d(0, 10);
+    where.set_d(1, 20);
+    static_cast<void>(f.objc.send(emitter, "setEmitterPosition:", where));
+    const auto position = f.objc.send(emitter, "emitterPosition", {});
+    require(f.id(f.id(emitter, "emitterCells"), "count") == 1 && text(f.id(emitter, "emitterShape")) == "point" &&
+                text(f.id(emitter, "renderMode")) == "unordered" && position.d(0) == 10 && position.d(1) == 20,
+            "an emitter layer's cells and configuration");
+    require(f.objc.send(cell, "birthRate", {}).s(0) == 25.0f && (f.id(cell, "isEnabled") & 0xff) == 1 &&
+                f.objc.send(cell, "scale", {}).d(0) == 1 && text(f.id(cell, "minificationFilter")) == "linear" && text(f.id(cell, "name")) == "spark",
+            "an emitter cell's values and defaults");
+    // A spring's settling time follows its parameters.
+    const auto spring = f.id(f.cls("CASpringAnimation"), "animationWithKeyPath:", {f.cf.string("position")});
+    const auto settling = f.objc.send(spring, "settlingDuration", {}).d(0);
+    require(settling > 1.1 && settling < 1.45, "the default spring settles in about 1.27 s: " + std::to_string(settling));
+    require(std::abs(f.objc.send(spring, "perceptualDuration", {}).d(0) - 0.6283) < 1e-3 && std::abs(f.objc.send(spring, "bounce", {}).d(0) - 0.5) < 1e-9,
+            "perceptual duration and bounce of the default spring");
+    alchemy::CallRegs perceptual;
+    perceptual.set_d(0, 0.5);
+    perceptual.set_d(1, 0);
+    const auto critical = f.objc.send(f.id(f.cls("CASpringAnimation"), "alloc"), "initWithPerceptualDuration:bounce:", perceptual).x0;
+    const auto settles = f.objc.send(critical, "settlingDuration", {}).d(0);
+    require(std::abs(f.objc.send(critical, "bounce", {}).d(0)) < 1e-9 && settles > 0.6 && settles < 0.9,
+            "a critically damped spring of 0.5 s: " + std::to_string(settles));
+    // Value functions by name.
+    const auto rotate = f.id(f.cls("CAValueFunction"), "functionWithName:", {f.cf.string("rotateZ")});
+    require(rotate && text(f.id(rotate, "name")) == "rotateZ", "+[CAValueFunction functionWithName:]");
+}
+
 int main() {
     try {
         Fixture f;
         for (const auto& [name, test] : std::initializer_list<std::pair<const char*, void (*)(Fixture&)>>{
                  {"appearance", appearance}, {"drawn_layers", drawn_layers}, {"shapes_text_gradients", shapes_text_gradients},
-                 {"replicas_geometry_scrolling", replicas_geometry_scrolling}}) {
+                 {"replicas_geometry_scrolling", replicas_geometry_scrolling}, {"emitters_springs", emitters_springs}}) {
             std::cout << "[quartzcore layers] " << name << std::endl;
             test(f);
         }
