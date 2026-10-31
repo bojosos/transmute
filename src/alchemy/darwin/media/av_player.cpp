@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -32,8 +33,14 @@
 //   default output device at rate 1 with the player's volume and mute (other rates are silent);
 //   the main queue decodes ahead of the device.
 // - A tick on the main queue (every 1/60 s while a player plays) advances the pictures, fires
-//   periodic and boundary time observers on their queues and, at the item's end, posts
-//   AVPlayerItemDidPlayToEndTimeNotification and pauses (actionAtItemEnd Pause or None).
+//   periodic and boundary time observers on their queues and, at the item's end (its duration, or
+//   forwardPlaybackEndTime when earlier), posts AVPlayerItemDidPlayToEndTimeNotification and
+//   pauses (actionAtItemEnd Pause), keeps the rate (None) or, for an AVQueuePlayer (Advance, its
+//   default), goes on with the next item of its queue (pausing after the last).
+// - AVQueuePlayer: the items, advancing, inserting after an item (nil: at the end) and removing.
+// - AVPlayerLooper keeps fresh copies of its template item (made from its asset, within the time
+//   range when given) queued in its AVQueuePlayer: three at a time, a new one each time one ends
+//   (loopCount counts them), until -disableLooping lets the queue play out.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -64,6 +71,7 @@ struct ItemState final : ObjectPayload {
     std::int64_t status{};                     // AVPlayerItemStatus: 0 unknown, 1 ready, 2 failed
     bool loading{};
     double duration{};                         // seconds (0: unknown)
+    double start_time{}, end_time{};           // where a player starts it; where it ends (0: its duration)
     double width{}, height{};
     // Video: an internal reader of decoded pictures, the picture shown and the next one.
     Address video_track{};                     // the asset's (not retained)
@@ -114,6 +122,17 @@ struct PlayerState final : ObjectPayload {
         std::unique_ptr<Resampler> resampler;
     };
     std::shared_ptr<Audio> audio_out = std::make_shared<Audio>();
+    // AVQueuePlayer: the queue (retained; the current item first) and an AVPlayerLooper driving it (not retained).
+    bool queue_player{};
+    std::vector<Address> queue;
+    Address looper{};
+};
+
+struct LooperState final : ObjectPayload {
+    Address player{}, template_item{};         // retained
+    double start{}, end{};                     // the time range (0, 0: the whole item)
+    std::int64_t loops{};
+    bool disabled{};
 };
 
 struct OutputState final : ObjectPayload {
@@ -164,6 +183,9 @@ private:
 
     void load_item(Address item);
     void attach(Address player, Address item);
+    // AVQueuePlayer: drops the current item and plays the next; false when the queue is empty.
+    bool advance(Address player);
+    Address replica(LooperState& l);   // a new item of the looper's template (autoreleased)
     void set_rate(Address player, double rate);
     void seek(Address player, double seconds);
     void start_reader(Address item, double from);
@@ -183,7 +205,7 @@ private:
 
     Support& support_;
     std::shared_ptr<security::Bridge> bridge_;
-    Address player_class_{}, item_class_{}, output_class_{}, layer_class_{}, token_class_{};
+    Address player_class_{}, item_class_{}, output_class_{}, layer_class_{}, token_class_{}, queue_class_{}, looper_class_{};
     Address tick_function_{};
     std::set<Address> players_;                // every player (not retained)
     std::map<Address, std::shared_ptr<LayerState>> layers_;   // AVPlayerLayers
@@ -438,7 +460,8 @@ void Players::attach(Address player, Address item) {
     stop_audio(player);
     will_change(player, "currentItem");
     const auto old = std::exchange(p->item, retain(item));
-    p->position = 0;
+    const auto start = item ? state<ItemState>(item)->start_time : 0.0;
+    p->position = start;
     p->anchor = std::chrono::steady_clock::now();
     did_change(player, "currentItem");
     release(old);
@@ -447,21 +470,52 @@ void Players::attach(Address player, Address item) {
     const auto owner = shared_from_this();
     const auto kept = retain(item);
     const auto kept_player = retain(player);
-    bridge_->dispatch_async(bridge_->main_queue(), [owner, kept, kept_player] {
+    bridge_->dispatch_async(bridge_->main_queue(), [owner, kept, kept_player, start] {
         owner->load_item(kept);
         const auto p = owner->state<PlayerState>(kept_player);
         if (p->item == kept) {
-            owner->reset_audio(kept_player, 0);
+            owner->reset_audio(kept_player, start);
             if (p->rate != 0) {
                 owner->start_audio(kept_player);
                 owner->schedule();
             }
-            owner->advance_video(kept, 0);
+            owner->advance_video(kept, start);
             owner->show(kept_player);
         }
         owner->release(kept);
         owner->release(kept_player);
     });
+}
+
+Address Players::replica(LooperState& l) {
+    const auto asset = state<ItemState>(l.template_item)->asset;
+    const auto item = support_.send_id(item_class_, "playerItemWithAsset:", {asset});
+    if (item) {
+        const auto s = state<ItemState>(item);
+        s->start_time = l.start;
+        s->end_time = l.end > l.start ? l.end : 0;
+    }
+    return item;
+}
+
+bool Players::advance(Address player) {
+    const auto p = state<PlayerState>(player);
+    if (p->queue.empty()) {
+        attach(player, 0);
+        return false;
+    }
+    const auto finished = p->queue.front();
+    p->queue.erase(p->queue.begin());
+    // A looper puts a fresh copy at the end for the one that ended.
+    if (const auto l = p->looper ? support_.objc.find_host_state<LooperState>(p->looper) : nullptr; l && !l->disabled) {
+        ++l->loops;
+        if (const auto copy = replica(*l)) p->queue.push_back(retain(copy));
+    }
+    will_change(player, "items");
+    attach(player, p->queue.empty() ? 0 : p->queue.front());
+    did_change(player, "items");
+    release(finished);
+    return !p->queue.empty();
 }
 
 void Players::set_rate(Address player, double rate) {
@@ -565,11 +619,22 @@ void Players::tick() {
         fill_audio(*s);
         fire_observers(player, p->last_tick_time, t);
         p->last_tick_time = t;
-        if (s->duration > 0 && t >= s->duration) {
+        const auto end = s->end_time > 0 && (s->duration <= 0 || s->end_time < s->duration) ? s->end_time : s->duration;
+        if (end > 0 && t >= end) {
             const auto item = p->item;
+            if (p->queue_player && p->action_at_end == 0) {   // AVPlayerActionAtItemEndAdvance
+                retain(item);
+                post_end(item);
+                const auto more = advance(player);
+                release(item);
+                if (more) continue;
+                set_rate(player, 0);
+                done.push_back(player);
+                continue;
+            }
             if (p->action_at_end != 2) {   // AVPlayerActionAtItemEndNone keeps the rate
                 set_rate(player, 0);
-                p->position = s->duration;
+                p->position = end;
             }
             post_end(item);
             done.push_back(player);
@@ -735,11 +800,156 @@ void Players::install() {
             }
             st->observers.clear();
             self->release(std::exchange(st->item, 0));
+            for (const auto queued : std::exchange(st->queue, {})) self->release(queued);
         }
         static_cast<void>(self->support_.objc.send_super(s.x[0], player, self->support_.objc.selector("dealloc")));
     }, "v@:");
     support.method(player, "currentItem", [self](CpuState& s, GuestMemory&) { s.x[0] = self->state<PlayerState>(s.x[0])->item; }, "@@:");
     support.method(player, "replaceCurrentItemWithPlayerItem:", [self](CpuState& s, GuestMemory&) { self->attach(s.x[0], s.x[2]); }, "v@:@");
+
+    // ---- AVQueuePlayer ---------------------------------------------------------------------------
+    queue_class_ = declare("AVQueuePlayer", "AVPlayer");
+    const auto queue = queue_class_;
+    const auto make_queue = [self](Address object) {
+        const auto p = self->state<PlayerState>(object);
+        p->queue_player = true;
+        p->action_at_end = 0;   // AVPlayerActionAtItemEndAdvance
+        self->players_.insert(object);
+    };
+    support.method(queue, "init", [self, queue, make_queue](CpuState& s, GuestMemory&) {
+        const auto object = self->support_.objc.send_super(s.x[0], queue, self->support_.objc.selector("init")).x0;
+        if (object) make_queue(object);
+        s.x[0] = object;
+    }, "@@:");
+    support.method(queue, "initWithItems:", [self, queue, make_queue](CpuState& s, GuestMemory&) {
+        const auto object = self->support_.objc.send_super(s.x[0], queue, self->support_.objc.selector("init")).x0;
+        if (!object) { s.x[0] = 0; return; }
+        make_queue(object);
+        const auto p = self->state<PlayerState>(object);
+        if (s.x[2])
+            for (const auto item : self->support_.cf.array_values(s.x[2])) p->queue.push_back(self->retain(item));
+        if (!p->queue.empty()) self->attach(object, p->queue.front());
+        s.x[0] = object;
+    }, "@@:@");
+    support.method(queue, "queuePlayerWithItems:", [self](CpuState& s, GuestMemory&) {
+        s.x[0] = self->support_.send_id(self->support_.send_id(self->support_.send_id(s.x[0], "alloc"), "initWithItems:", {s.x[2]}), "autorelease");
+    }, "@@:@", true);
+    support.method(queue, "items", [self](CpuState& s, GuestMemory&) {
+        s.x[0] = self->support_.send_id(self->bridge_->array(self->state<PlayerState>(s.x[0])->queue), "autorelease");
+    }, "@@:");
+    support.method(queue, "advanceToNextItem", [self](CpuState& s, GuestMemory&) {
+        const auto p = self->state<PlayerState>(s.x[0]);
+        if (p->queue.empty()) return;
+        const auto rate = p->rate;
+        if (!self->advance(s.x[0]) && rate != 0) self->set_rate(s.x[0], 0);
+    }, "v@:");
+    // An item may be inserted once, after a queued item (nil: at the end).
+    const auto can_insert = [self](Address object, Address item, Address after) {
+        const auto& q = self->state<PlayerState>(object)->queue;
+        return item && std::find(q.begin(), q.end(), item) == q.end() && (!after || std::find(q.begin(), q.end(), after) != q.end());
+    };
+    support.method(queue, "canInsertItem:afterItem:", [can_insert](CpuState& s, GuestMemory&) { s.x[0] = can_insert(s.x[0], s.x[2], s.x[3]) ? 1 : 0; }, "B@:@@");
+    support.method(queue, "insertItem:afterItem:", [self, can_insert](CpuState& s, GuestMemory&) {
+        if (!can_insert(s.x[0], s.x[2], s.x[3]))
+            throw std::runtime_error("Alchemy: -[AVQueuePlayer insertItem:afterItem:] cannot insert this item (NSInvalidArgumentException)");
+        const auto p = self->state<PlayerState>(s.x[0]);
+        self->will_change(s.x[0], "items");
+        const auto at = s.x[3] ? std::find(p->queue.begin(), p->queue.end(), s.x[3]) + 1 : p->queue.end();
+        p->queue.insert(at, self->retain(s.x[2]));
+        self->did_change(s.x[0], "items");
+        if (p->queue.size() == 1) self->attach(s.x[0], p->queue.front());
+    }, "v@:@@");
+    support.method(queue, "removeItem:", [self](CpuState& s, GuestMemory&) {
+        const auto p = self->state<PlayerState>(s.x[0]);
+        const auto found = std::find(p->queue.begin(), p->queue.end(), s.x[2]);
+        if (found == p->queue.end()) return;
+        if (found == p->queue.begin()) {
+            const auto rate = p->rate;
+            const auto looper = std::exchange(p->looper, 0);   // a removal is not a loop
+            if (!self->advance(s.x[0]) && rate != 0) self->set_rate(s.x[0], 0);
+            p->looper = looper;
+            return;
+        }
+        self->will_change(s.x[0], "items");
+        const auto item = *found;
+        p->queue.erase(found);
+        self->did_change(s.x[0], "items");
+        self->release(item);
+    }, "v@:@");
+    support.method(queue, "removeAllItems", [self](CpuState& s, GuestMemory&) {
+        const auto p = self->state<PlayerState>(s.x[0]);
+        self->set_rate(s.x[0], 0);
+        self->will_change(s.x[0], "items");
+        const auto items = std::exchange(p->queue, {});
+        self->attach(s.x[0], 0);
+        self->did_change(s.x[0], "items");
+        for (const auto item : items) self->release(item);
+    }, "v@:");
+
+    // ---- AVPlayerLooper ------------------------------------------------------------------------
+    looper_class_ = declare("AVPlayerLooper", "NSObject");
+    const auto looper = looper_class_;
+    // -initWithPlayer:templateItem:timeRange: (CMTimeRange by reference; kCMTimeRangeInvalid: the whole item)
+    const auto init_looper = [self](Address object, Address player_object, Address item, std::optional<std::pair<double, double>> range) {
+        const auto p = player_object ? self->support_.objc.find_host_state<PlayerState>(player_object) : nullptr;
+        if (!p || !p->queue_player || !item)
+            throw std::runtime_error("Alchemy: AVPlayerLooper needs an AVQueuePlayer and a template item (NSInvalidArgumentException)");
+        const auto l = self->state<LooperState>(object);
+        l->player = self->retain(player_object);
+        l->template_item = self->retain(item);
+        if (range) {
+            l->start = range->first;
+            l->end = range->first + range->second;
+        }
+        self->support_.send(player_object, "removeAllItems");
+        p->looper = object;
+        p->action_at_end = 0;
+        for (int i = 0; i < 3; ++i)
+            if (const auto copy = self->replica(*l)) p->queue.push_back(self->retain(copy));
+        if (!p->queue.empty()) self->attach(player_object, p->queue.front());
+        return object;
+    };
+    support.method(looper, "initWithPlayer:templateItem:", [init_looper](CpuState& s, GuestMemory&) { s.x[0] = init_looper(s.x[0], s.x[2], s.x[3], std::nullopt); }, "@@:@@");
+    support.method(looper, "initWithPlayer:templateItem:timeRange:", [init_looper](CpuState& s, GuestMemory& m) {
+        const auto start = read_time(m, s.x[4]), duration = read_time(m, s.x[4] + 24);
+        std::optional<std::pair<double, double>> range;
+        if ((start.flags & 1) && (duration.flags & 1) && seconds_of(duration) > 0) range = std::make_pair(seconds_of(start), seconds_of(duration));
+        s.x[0] = init_looper(s.x[0], s.x[2], s.x[3], range);
+    }, "@@:@@{?={?=qiIq}{?=qiIq}}");
+    support.method(looper, "playerLooperWithPlayer:templateItem:", [self](CpuState& s, GuestMemory&) {
+        s.x[0] = self->support_.send_id(self->support_.send_id(self->support_.send_id(s.x[0], "alloc"), "initWithPlayer:templateItem:", {s.x[2], s.x[3]}), "autorelease");
+    }, "@@:@@", true);
+    support.method(looper, "playerLooperWithPlayer:templateItem:timeRange:", [self](CpuState& s, GuestMemory&) {
+        s.x[0] = self->support_.send_id(self->support_.send_id(self->support_.send_id(s.x[0], "alloc"), "initWithPlayer:templateItem:timeRange:", {s.x[2], s.x[3], s.x[4]}),
+                                        "autorelease");
+    }, "@@:@@{?={?=qiIq}{?=qiIq}}", true);
+    // AVPlayerLooperStatus: ready (1) once made.
+    support.method(looper, "status", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "q@:");
+    support.method(looper, "error", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:");
+    support.method(looper, "loopCount", [self](CpuState& s, GuestMemory&) { s.x[0] = static_cast<std::uint64_t>(self->state<LooperState>(s.x[0])->loops); }, "q@:");
+    support.method(looper, "loopingPlayerItems", [self](CpuState& s, GuestMemory&) {
+        const auto l = self->state<LooperState>(s.x[0]);
+        const auto p = l->player ? self->state<PlayerState>(l->player) : nullptr;
+        s.x[0] = self->support_.send_id(self->bridge_->array(p ? p->queue : std::vector<Address>{}), "autorelease");
+    }, "@@:");
+    support.method(looper, "disableLooping", [self](CpuState& s, GuestMemory&) { self->state<LooperState>(s.x[0])->disabled = true; }, "v@:");
+    support.method(looper, "dealloc", [self, looper](CpuState& s, GuestMemory&) {
+        if (const auto l = self->support_.objc.find_host_state<LooperState>(s.x[0])) {
+            if (const auto p = l->player ? self->support_.objc.find_host_state<PlayerState>(l->player) : nullptr; p && p->looper == s.x[0]) p->looper = 0;
+            self->release(std::exchange(l->player, 0));
+            self->release(std::exchange(l->template_item, 0));
+        }
+        static_cast<void>(self->support_.objc.send_super(s.x[0], looper, self->support_.objc.selector("dealloc")));
+    }, "v@:");
+    // AVPlayerItem.forwardPlaybackEndTime: where the item ends (kCMTimeInvalid: its duration).
+    support.method(item, "forwardPlaybackEndTime", [self](CpuState& s, GuestMemory& m) {
+        const auto end = self->state<ItemState>(s.x[0])->end_time;
+        write_time(m, s.x[8], end > 0 ? time_of(end) : Time{});
+    }, "{?=qiIq}@:");
+    support.method(item, "setForwardPlaybackEndTime:", [self](CpuState& s, GuestMemory& m) {
+        const auto t = read_time(m, s.x[2]);
+        self->state<ItemState>(s.x[0])->end_time = (t.flags & 1) ? std::max(0.0, seconds_of(t)) : 0.0;
+    }, "v@:{?=qiIq}");
     support.method(player, "status", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "q@:");   // AVPlayerStatusReadyToPlay: the player itself can always play
     support.method(player, "error", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:");
     support.method(player, "play", [self](CpuState& s, GuestMemory&) { self->set_rate(s.x[0], 1.0); }, "v@:");

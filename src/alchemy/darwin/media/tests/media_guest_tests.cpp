@@ -2476,6 +2476,62 @@ void av_video(Fixture& f) {
 // AVPlayer: libvpx's VP9 WebM vector loads (status ready, size), shows its pictures on an
 // AVPlayerLayer and through an AVPlayerItemVideoOutput, plays to its end and pauses there, and
 // seeks; an MP3 item's audio reaches the output device.
+// AVQueuePlayer: two 0.15 s items played in turn (an end notification each, then no item); inserting and removing;
+// AVPlayerLooper keeping copies of its template queued and counting loops; forwardPlaybackEndTime.
+void queue_player(Fixture& f) {
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_queue";
+    std::filesystem::create_directories(directory);
+    const auto path = write_wave(directory / "short.wav", 48000, 1, 7200, [](std::uint32_t, std::uint16_t) { return static_cast<std::int16_t>(4096); });
+    const auto url = f.cf.file_url(alchemy::guest_path_string(path), false);
+    const auto mode = f.engine.read64(f.symbol(vt_cf, "_kCFRunLoopDefaultMode"));
+    const auto run = [&](double seconds) {
+        alchemy::CallRegs r;
+        r.x[0] = mode;
+        r.set_d(0, seconds);
+        static_cast<void>(f.regs(vt_cf, "_CFRunLoopRunInMode", r));
+    };
+    static std::atomic<int> ended{0};
+    const auto observer_class = f.objc.register_native_class("AlchemyQueueTestObserver", f.cls("NSObject"), 8);
+    static_cast<void>(f.objc.add_native_method(observer_class, "itemEnded:", [](transmute::CpuState&, transmute::GuestMemory&) { ++ended; }, false, "v@:@"));
+    const auto observer = f.send(f.send(observer_class, "alloc"), "init");
+    const auto center = f.send(f.cls("NSNotificationCenter"), "defaultCenter");
+    f.send(center, "addObserver:selector:name:object:", {observer, f.objc.selector("itemEnded:"), f.cf.string("AVPlayerItemDidPlayToEndTimeNotification"), 0});
+    const auto item = [&] { return f.send(f.cls("AVPlayerItem"), "playerItemWithURL:", {url}); };
+    const auto a = item(), b = item(), c = item();
+    const auto queue = f.send(f.cls("AVQueuePlayer"), "queuePlayerWithItems:", {f.cf.array(std::vector<Address>{a, b})});
+    require(queue && f.send(queue, "currentItem") == a && f.cf.length(f.send(queue, "items")) == 2 && f.send(queue, "actionAtItemEnd") == 0, "AVQueuePlayer");
+    require((f.send(queue, "canInsertItem:afterItem:", {c, a}) & 0xff) == 1 && (f.send(queue, "canInsertItem:afterItem:", {a, 0}) & 0xff) == 0, "canInsertItem:afterItem:");
+    f.send(queue, "insertItem:afterItem:", {c, a});
+    require(f.cf.array_values(f.send(queue, "items")) == std::vector<Address>{a, c, b}, "inserted after the current item");
+    f.send(queue, "removeItem:", {c});
+    require(f.cf.length(f.send(queue, "items")) == 2, "removed");
+    f.send(queue, "play");
+    for (int i = 0; i < 100 && (ended < 2 || f.send(queue, "currentItem")); ++i) run(0.03);
+    require(ended == 2 && f.send(queue, "currentItem") == 0 && f.cf.length(f.send(queue, "items")) == 0, "both items played, then no item: " + std::to_string(ended.load()));
+    require(f.objc.send(queue, f.objc.selector("rate"), {}).s(0) == 0, "stopped after the last item");
+    // AVPlayerLooper on a fresh queue player.
+    const auto looping = f.send(f.send(f.cls("AVQueuePlayer"), "alloc"), "init");
+    const auto looper = f.send(f.cls("AVPlayerLooper"), "playerLooperWithPlayer:templateItem:", {looping, item()});
+    require(looper && f.send(looper, "status") == 1 && f.cf.length(f.send(looper, "loopingPlayerItems")) == 3, "three copies queued");
+    f.send(looping, "play");
+    for (int i = 0; i < 100 && f.send(looper, "loopCount") < 2; ++i) run(0.03);
+    require(f.send(looper, "loopCount") >= 2 && f.cf.length(f.send(looper, "loopingPlayerItems")) == 3 && f.send(looping, "currentItem") != 0, "looping");
+    f.send(looper, "disableLooping");
+    f.send(looping, "pause");
+    // forwardPlaybackEndTime
+    const auto end = f.block(24);
+    f.engine.write64(end, 3);
+    f.engine.write32(end + 8, 100);
+    f.engine.write32(end + 12, 1);
+    const auto d = item();
+    f.send(d, "setForwardPlaybackEndTime:", {end});
+    alchemy::CallRegs r{};
+    r.indirect_result = f.block(24);
+    static_cast<void>(f.objc.send(d, f.objc.selector("forwardPlaybackEndTime"), r));
+    require(f.engine.read64(r.indirect_result) == 18000 && f.engine.read32(r.indirect_result + 8) == 600000, "forwardPlaybackEndTime 0.03 s");
+    f.send(center, "removeObserver:", {observer});
+}
+
 void av_player(Fixture& f) {
     const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_av_player";
     std::filesystem::create_directories(directory);
@@ -2718,6 +2774,7 @@ int main() {
         {"video_toolbox", video_toolbox},
         {"av_video", av_video},
         {"av_player", av_player},
+        {"queue_player", queue_player},
         {"sample_buffer_renderers", sample_buffer_renderers},
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},
