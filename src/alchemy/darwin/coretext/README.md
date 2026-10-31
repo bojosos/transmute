@@ -46,6 +46,16 @@ CTFontManagerCopyAvailableFontURLs and CTFontManagerCreateFontDescriptorsFromDat
 with a non-rectangular path, decimal tab stops, and live mutable string
 proxies (-mutableString, CFAttributedStringGetMutableString).
 
+**Run delegates:** a CTRunDelegate (kCTRunDelegateAttributeName) sizes its
+run: the run's characters are laid out as no-break spaces, measured and
+spaced to the delegate's width (so line breaking sees it), the run takes the
+delegate's ascent and descent and draws nothing; the delegate's dealloc runs
+when it is released. Font collections keep query and exclusion descriptors
+(mutable copies, matching less the excluded names, font attributes per
+match); the font manager makes descriptors from font data, orders family
+names case-insensitively, and keeps fonts enabled (disabling stops
+explicitly). Not provided yet: CTGlyphInfo, ruby annotations, font features.
+
 ## Moved from darwin/identities/
 
 * `font_data.cpp`: kCTFontLanguagesAttribute and CTFontManagerCreateFontDescriptorFromData (the support kit).

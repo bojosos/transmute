@@ -5,6 +5,8 @@
 #include "alchemy/darwin/coregraphics/tests/quartz2d_fixture.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <iostream>
 #include <span>
 #include <string>
@@ -139,6 +141,63 @@ void font_equality(Fixture& f) {
     for (const auto object : {a, b, bigger, other, slanted, copy, d1, d2, d3}) f.call(cf_library, "_CFRelease", {object});
 }
 
+// Run delegates, colour space variants, family name order (the frameworks wave, U21).
+void delegates_spaces_collections(Fixture& f) {
+    const auto font = f.id(ct, "_CTFontCreateWithName", {f.str("Helvetica"), 0}, {12});
+    // A run delegate sizes its run: width 50, ascent 20, descent 5; its refCon; dealloc once.
+    static int deallocs = 0;
+    deallocs = 0;
+    const auto host_function = [&f](const char* name, double value) {
+        const auto address = f.process.install_function(name, [value](transmute::CpuState& s, transmute::GuestMemory&) { s.v[0] = {std::bit_cast<std::uint64_t>(value), 0}; },
+                                                        "/usr/lib/libu21test.dylib");
+        return address;
+    };
+    const auto dealloc = f.process.install_function("_u21_dealloc", [](transmute::CpuState&, transmute::GuestMemory&) { ++deallocs; }, "/usr/lib/libu21test.dylib");
+    const auto callbacks = f.allocate(40);
+    f.engine.write64(callbacks, 1);   // kCTRunDelegateVersion1
+    f.engine.write64(callbacks + 8, dealloc);
+    f.engine.write64(callbacks + 16, host_function("_u21_ascent", 20));
+    f.engine.write64(callbacks + 24, host_function("_u21_descent", 5));
+    f.engine.write64(callbacks + 32, host_function("_u21_width", 50));
+    const auto delegate = f.id(ct, "_CTRunDelegateCreate", {callbacks, 0x1234});
+    require(delegate && f.id(ct, "_CTRunDelegateGetRefCon", {delegate}) == 0x1234, "CTRunDelegateCreate / GetRefCon");
+    std::vector<std::pair<Address, Address>> pairs{{f.str("NSFont"), font}};
+    const auto attributes = f.cf.dictionary(pairs);
+    const auto plain = f.id(cf_library, "_CFAttributedStringCreate", {0, f.str("AB"), attributes});
+    const auto plain_line = f.id(ct, "_CTLineCreateWithAttributedString", {plain});
+    const auto plain_width = f.call(ct, "_CTLineGetTypographicBounds", {plain_line, 0, 0, 0}).d(0);
+    const auto text = f.id(cf_library, "_CFAttributedStringCreateMutable", {0, 0});
+    const std::u16string units = u"A\uFFFCB";
+    const auto string = f.cf.string_utf16(std::span(reinterpret_cast<const std::uint16_t*>(units.data()), units.size()));
+    f.call(cf_library, "_CFAttributedStringReplaceString", {text, 0, 0, string});
+    f.call(cf_library, "_CFAttributedStringSetAttributes", {text, 0, 3, attributes, 1});
+    f.call(cf_library, "_CFAttributedStringSetAttribute", {text, 1, 1, f.str("CTRunDelegate"), delegate});
+    const auto line = f.id(ct, "_CTLineCreateWithAttributedString", {text});
+    const auto metrics = f.allocate(24);
+    const auto width = f.call(ct, "_CTLineGetTypographicBounds", {line, metrics, metrics + 8, metrics + 16}).d(0);
+    require(std::abs(width - plain_width - 50) < 1, "the delegate's run is 50 wide: " + std::to_string(width) + " vs " + std::to_string(plain_width));
+    require(std::abs(f.read_double(metrics) - 20) < 0.01 && f.read_double(metrics + 8) >= 5 - 0.01, "the line takes the delegate's ascent and descent");
+    f.call(cf_library, "_CFRelease", {line});
+    f.call(cf_library, "_CFRelease", {text});
+    f.call(cf_library, "_CFRelease", {delegate});
+    require(deallocs == 1, "the delegate's dealloc callback runs once");
+
+    // Colour space variants.
+    const auto name_of = [&f](Address space) { return space ? f.cf.utf8(f.id(cg, "_CGColorSpaceCopyName", {space})) : std::string("(null)"); };
+    const auto srgb = f.id(cg, "_CGColorSpaceCreateWithName", {f.str("kCGColorSpaceSRGB")});
+    const auto extended = f.id(cg, "_CGColorSpaceCreateExtended", {srgb});
+    require(name_of(extended) == "kCGColorSpaceExtendedSRGB" && name_of(f.id(cg, "_CGColorSpaceCreateLinearized", {srgb})) == "kCGColorSpaceLinearSRGB" &&
+                name_of(f.id(cg, "_CGColorSpaceCreateExtendedLinearized", {srgb})) == "kCGColorSpaceExtendedLinearSRGB" &&
+                name_of(f.id(cg, "_CGColorSpaceCreateCopyWithStandardRange", {extended})) == "kCGColorSpaceSRGB",
+            "extended, linearized and standard-range variants");
+    const auto p3 = f.id(cg, "_CGColorSpaceCreateWithName", {f.str("kCGColorSpaceDisplayP3")});
+    require(f.id(cg, "_CGColorSpaceCreateLinearized", {p3}) == 0 && (f.id(cg, "_CGColorSpaceIsHDR", {p3}) & 0xff) == 0, "no linear Display P3; not HDR");
+
+    // Family names (font collections are tested in coretext_fonts_tests.cpp).
+    require(static_cast<std::int64_t>(f.id(ct, "_CTFontManagerCompareFontFamilyNames", {f.str("arial"), f.str("Times"), 0})) < 0,
+            "family names compare case-insensitively");
+}
+
 } // namespace
 
 int main() {
@@ -149,6 +208,7 @@ int main() {
         Fixture fixture;
         text(fixture);
         font_equality(fixture);
+        delegates_spaces_collections(fixture);
         std::cout << "Alchemy CoreText tests passed\n";
         return 0;
     } catch (const std::exception& error) {

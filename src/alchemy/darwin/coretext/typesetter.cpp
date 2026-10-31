@@ -2,6 +2,8 @@
 #include "alchemy/darwin/coregraphics/context.hpp"
 #include "alchemy/gui/drawn_text.hpp"   // autopress labels (diagnostic)
 
+#include "alchemy/engine_adapter.hpp"
+
 #include <algorithm>
 #include <numeric>
 
@@ -9,6 +11,13 @@
 // IDWriteTextLayout on win32): shaping, font fallback, bidi and line breaking
 // come from it; the glyph runs it lays out become CTRuns. CoreText's own rules then place the lines (typographic
 // ascent / descent / leading, paragraph spacing, alignment, truncation).
+//
+// A CTRunDelegate (kCTRunDelegateAttributeName) sizes its run: the run's
+// characters are laid out as no-break spaces (U+00A0: a glyph, no line break
+// opportunity), measured, and laid out again with their spacing adjusted to
+// the delegate's width, so line breaking sees that width; the run takes the
+// delegate's ascent and descent and draws nothing, as CoreText leaves its
+// drawing to the application.
 namespace alchemy::gui::quartz2d {
 namespace {
 
@@ -68,6 +77,25 @@ void release_line(Quartz& q, LineLayout& line) {
 
 // Lays out text[range] into lines no wider than `width` (single_line: one
 // line, no breaking). Lines own their references (release_line).
+// A CTRunDelegate's callbacks and refCon (CTRunDelegateCallbacks version 1).
+struct RunDelegateState final : ObjectPayload {
+    Address dealloc{}, ascent{}, descent{}, width{}, refcon{};
+};
+struct DelegateMetrics { double ascent{}, descent{}, width{}; };
+// The delegate of a run's attributes, and what its callbacks answer.
+std::optional<DelegateMetrics> delegate_metrics(Quartz& q, Address attributes) {
+    const auto delegate = attributes ? q.dictionary_get(attributes, "CTRunDelegate") : 0;
+    const auto state = delegate ? q.find<RunDelegateState>(delegate) : nullptr;
+    if (!state) return std::nullopt;
+    const auto ask = [&](Address callback) {
+        if (!callback) return 0.0;
+        CallRegs registers;
+        registers.x[0] = state->refcon;
+        return std::max(0.0, EngineAdapter(q.process.calling_engine()).call_regs(callback, registers).d(0));
+    };
+    return DelegateMetrics{ask(state->ascent), ask(state->descent), ask(state->width)};
+}
+
 std::vector<LineLayout> layout_lines(Quartz& q, const AttributedText& text, Range range, double width, bool single_line) {
     std::vector<LineLayout> lines;
     const auto begin = static_cast<std::size_t>(std::clamp<std::int64_t>(range.location, 0, static_cast<std::int64_t>(text.text.size())));
@@ -76,7 +104,7 @@ std::vector<LineLayout> layout_lines(Quartz& q, const AttributedText& text, Rang
     std::vector<std::uint16_t> units(text.text.begin() + static_cast<std::ptrdiff_t>(begin), text.text.begin() + static_cast<std::ptrdiff_t>(end));
     // Styles of the attribute runs inside the range, with their spans.
     std::vector<TextStyle> styles;
-    struct Span { std::size_t start, length, style; };
+    struct Span { std::size_t start, length, style; std::optional<DelegateMetrics> delegate; };
     std::vector<Span> spans;
     {
         std::size_t at = 0;
@@ -84,7 +112,7 @@ std::vector<LineLayout> layout_lines(Quartz& q, const AttributedText& text, Rang
             const auto s = std::max(at, begin), e = std::min(at + run.length, end);
             if (s < e) {
                 styles.push_back(resolve_style(q, run.attributes));
-                spans.push_back({s - begin, e - s, styles.size() - 1});
+                spans.push_back({s - begin, e - s, styles.size() - 1, delegate_metrics(q, run.attributes)});
             }
             at += run.length;
         }
@@ -97,6 +125,9 @@ std::vector<LineLayout> layout_lines(Quartz& q, const AttributedText& text, Rang
     if (single_line)
         for (auto& c : layout_text) if (is_newline(static_cast<std::uint16_t>(c))) c = 0x200b;
     if (layout_text.empty()) layout_text.push_back(0x200b);   // an empty line still has metrics
+    for (const auto& span : spans)
+        if (span.delegate)
+            for (std::size_t i = span.start; i < span.start + span.length && i < layout_text.size(); ++i) layout_text[i] = 0x00a0;
 
     const auto font_span = [](const FontState& font) {
         host::gpu::TextSpan span;
@@ -128,13 +159,28 @@ std::vector<LineLayout> layout_lines(Quartz& q, const AttributedText& text, Rang
         auto entry = font_span(*style.font_state);
         entry.start = span.start;
         entry.length = span.length;
-        entry.character_spacing = style.kern;
+        entry.character_spacing = span.delegate ? 0.0 : style.kern;
         entry.tag = span.style;
         font_spans.push_back(std::move(entry));
     }
     request.spans = font_spans;
     auto laid_out = host::gpu::layout_text(request);
     if (!laid_out) fail("laying out text failed (" + std::string(host::name(laid_out.error())) + ")");
+    // Delegate spans: measure their no-break spaces, then space them to the delegate's width.
+    if (std::any_of(spans.begin(), spans.end(), [](const Span& span) { return span.delegate.has_value(); })) {
+        for (std::size_t i = 0; i < spans.size(); ++i) {
+            const auto& span = spans[i];
+            if (!span.delegate || span.length == 0) continue;
+            double advance = 0;
+            for (const auto& recorded : laid_out->runs)
+                if (recorded.text_position >= span.start && recorded.text_position < span.start + span.length)
+                    for (const auto value : recorded.advances) advance += static_cast<double>(value);
+            font_spans[i].character_spacing = (span.delegate->width - advance) / static_cast<double>(span.length);
+        }
+        request.spans = font_spans;
+        laid_out = host::gpu::layout_text(request);
+        if (!laid_out) fail("laying out text failed (" + std::string(host::name(laid_out.error())) + ")");
+    }
     const auto line_count = laid_out->lines.size();
     const auto& metrics = laid_out->lines;
 
@@ -231,6 +277,12 @@ std::vector<LineLayout> layout_lines(Quartz& q, const AttributedText& text, Rang
         run.ascent = run.face->metrics.ascent * scale + std::max(0.0, style.baseline_offset);
         run.descent = run.face->metrics.descent * scale + std::max(0.0, -style.baseline_offset);
         run.leading = run.face->metrics.leading * scale;
+        if (const auto delegated = delegate_metrics(q, run.attributes)) {
+            run.delegated = true;
+            run.ascent = delegated->ascent + std::max(0.0, style.baseline_offset);
+            run.descent = delegated->descent + std::max(0.0, -style.baseline_offset);
+            run.leading = 0;
+        }
         line.runs.push_back(std::move(run));
     }
     // Lines start at x = 0 (CoreText places them with the line origin).
@@ -309,7 +361,7 @@ std::pair<std::size_t, std::size_t> sub_range(std::int64_t location, std::int64_
 
 void draw_run_at(Quartz& q, ContextState& c, const LineLayout& line, const RunLayout& run, std::size_t first, std::size_t last) {
     Quartz* const quartz = &q;
-        if (first >= last) return;
+        if (first >= last || run.delegated) return;   // a delegate's run is the application's to draw
         const auto& style = line.styles.at(run.style);
         GlyphRunDraw draw;
         draw.face = run.face;
@@ -956,6 +1008,27 @@ void install_typesetter(Quartz& q) {
         draw_run_at(*quartz, *c, *state->layout, run, first, last);
     });
     fn("_CTRunGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = 0x100; });
+    // CTRunDelegateCreate(const CTRunDelegateCallbacks*, void* refCon): version 1
+    // callbacks {version, dealloc, getAscent, getDescent, getWidth}.
+    const auto delegate_class = q.declare_class("_AlchemyCTRunDelegate");
+    fn("_CTRunDelegateCreate", [quartz, delegate_class](CpuState& s, GuestMemory& m) {
+        const auto callbacks = s.x[0];
+        if (!callbacks || static_cast<std::int64_t>(m.read64(callbacks)) != 1) { s.x[0] = 0; return; }   // kCTRunDelegateVersion1 only
+        auto state = std::make_shared<RunDelegateState>();
+        state->dealloc = m.read64(callbacks + 8);
+        state->ascent = m.read64(callbacks + 16);
+        state->descent = m.read64(callbacks + 24);
+        state->width = m.read64(callbacks + 32);
+        state->refcon = s.x[1];
+        s.x[0] = quartz->create(delegate_class, state, [quartz, state](Address) {
+            if (state->dealloc) static_cast<void>(quartz->call_guest(state->dealloc, {state->refcon}));
+        });
+    });
+    fn("_CTRunDelegateGetRefCon", [quartz](CpuState& s, GuestMemory&) {
+        const auto state = s.x[0] ? quartz->find<RunDelegateState>(s.x[0]) : nullptr;
+        s.x[0] = state ? state->refcon : 0;
+    });
+    fn("_CTRunDelegateGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = 0x102; });
 
     // ---- CTTypesetter ----
     const auto make_typesetter = [quartz](Address string) {

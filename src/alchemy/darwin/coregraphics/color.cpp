@@ -2,6 +2,9 @@
 #include "alchemy/darwin/coregraphics/q2d_internal.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <span>
+#include <utility>
 
 // CGColorSpace and CGColor. They replace the headless CGColorSpace shell of
 // darwin_frameworks.cpp (same host class _AlchemyCGColorSpace, same names).
@@ -46,6 +49,24 @@ constexpr NamedSpace named_spaces[] = {
 const NamedSpace* find_named(std::string_view name) {
     for (const auto& entry : named_spaces) if (entry.name == name) return &entry;
     return nullptr;
+}
+// The named variants of a space: (standard, extended) and (gamma, linear) pairs.
+constexpr std::pair<std::string_view, std::string_view> extended_pairs[] = {
+    {"kCGColorSpaceSRGB", "kCGColorSpaceExtendedSRGB"}, {"kCGColorSpaceLinearSRGB", "kCGColorSpaceExtendedLinearSRGB"},
+    {"kCGColorSpaceDisplayP3", "kCGColorSpaceExtendedDisplayP3"}, {"kCGColorSpaceGenericGrayGamma2_2", "kCGColorSpaceExtendedGray"},
+    {"kCGColorSpaceLinearGray", "kCGColorSpaceExtendedLinearGray"}};
+constexpr std::pair<std::string_view, std::string_view> linear_pairs[] = {
+    {"kCGColorSpaceSRGB", "kCGColorSpaceLinearSRGB"}, {"kCGColorSpaceExtendedSRGB", "kCGColorSpaceExtendedLinearSRGB"},
+    {"kCGColorSpaceGenericRGB", "kCGColorSpaceGenericRGBLinear"}, {"kCGColorSpaceGenericGrayGamma2_2", "kCGColorSpaceLinearGray"},
+    {"kCGColorSpaceGenericGray", "kCGColorSpaceLinearGray"}, {"kCGColorSpaceExtendedGray", "kCGColorSpaceExtendedLinearGray"}};
+// `name`'s variant through `pairs` (forward: first -> second), itself when it
+// already is one, "" when there is none.
+std::string_view variant(std::span<const std::pair<std::string_view, std::string_view>> pairs, std::string_view name, bool forward) {
+    for (const auto& [a, b] : pairs) {
+        if ((forward ? a : b) == name) return forward ? b : a;
+        if ((forward ? b : a) == name) return name;
+    }
+    return {};
 }
 
 double encode_srgb(double linear) {
@@ -302,6 +323,44 @@ void Quartz::install_colors() {
         if (info && s.x[1] && !info->table.empty()) m.write_bytes(s.x[1], info->table);
     });
     function(cg, "_CGColorSpaceIsWideGamutRGB", [space](CpuState& s, GuestMemory&) { return_bool(s, s.x[0] && space(s.x[0])->wide); });
+    // Extended-range, linearized and standard-range variants of named spaces
+    // (NULL when the space has no such variant).
+    const auto make_variant = [this, space](Address object, std::string_view name) -> Address {
+        if (name.empty()) return 0;
+        if (object && space(object)->name == name) return retain(object);
+        if (name == "kCGColorSpaceSRGB") return retain(srgb());
+        const auto* named = find_named(name);
+        return named ? make_color_space(named->model, std::string(name)) : 0;
+    };
+    function(cg, "_CGColorSpaceCreateExtended", [space, make_variant](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[0] ? make_variant(s.x[0], variant(extended_pairs, space(s.x[0])->name, true)) : 0;
+    });
+    function(cg, "_CGColorSpaceCreateCopyWithStandardRange", [space, make_variant](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[0] ? make_variant(s.x[0], variant(extended_pairs, space(s.x[0])->name, false)) : 0;
+    });
+    function(cg, "_CGColorSpaceCreateLinearized", [space, make_variant](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[0] ? make_variant(s.x[0], variant(linear_pairs, space(s.x[0])->name, true)) : 0;
+    });
+    function(cg, "_CGColorSpaceCreateExtendedLinearized", [this, space, make_variant](CpuState& s, GuestMemory&) {
+        if (!s.x[0]) return;
+        const auto linear = make_variant(s.x[0], variant(linear_pairs, space(s.x[0])->name, true));
+        s.x[0] = linear ? make_variant(linear, variant(extended_pairs, space(linear)->name, true)) : 0;
+        release(linear);
+    });
+    function(cg, "_CGColorSpaceCopyBaseColorSpace", [this, space](CpuState& s, GuestMemory&) { s.x[0] = s.x[0] ? retain(space(s.x[0])->base) : 0; });
+    // No space made here carries an HDR transfer function (PQ, HLG, ITU-R 2100).
+    for (const auto* name : {"_CGColorSpaceIsHDR", "_CGColorSpaceIsPQBased", "_CGColorSpaceIsHLGBased", "_CGColorSpaceUsesITUR_2100TF"})
+        function(cg, name, [space](CpuState& s, GuestMemory&) {
+            if (s.x[0]) static_cast<void>(space(s.x[0]));
+            return_bool(s, false);
+        });
+    // CGColorSpaceCreateWithColorSyncProfile(profile, options): the profile's ICC data.
+    function(cg, "_CGColorSpaceCreateWithColorSyncProfile", [this, from_icc](CpuState& s, GuestMemory&) {
+        const auto copy = s.x[0] ? process.resolve("/System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync", "_ColorSyncProfileCopyData") : std::nullopt;
+        const auto data = copy ? call_guest(copy->address, {s.x[0], 0}) : 0;
+        s.x[0] = data ? from_icc(data_bytes(data)) : 0;
+        release(data);
+    });
     function(cg, "_CGColorSpaceUsesExtendedRange", [space](CpuState& s, GuestMemory&) { return_bool(s, s.x[0] && space(s.x[0])->extended); });
     function(cg, "_CGColorSpaceSupportsOutput", [space](CpuState& s, GuestMemory&) {
         const auto model = s.x[0] ? space(s.x[0])->model : ColorModel::unknown;

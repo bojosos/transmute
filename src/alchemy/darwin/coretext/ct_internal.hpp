@@ -171,6 +171,7 @@ struct RunLayout {
     bool rtl{};
     double width{}, ascent{}, descent{}, leading{};
     std::size_t style{};                      // index into LineLayout::styles
+    bool delegated{};                         // a CTRunDelegate's run: its metrics, no glyphs drawn
 };
 struct LineLayout {
     std::vector<RunLayout> runs;

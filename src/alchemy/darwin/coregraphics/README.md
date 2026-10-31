@@ -41,6 +41,13 @@ gives no mode list); `CGDisplaySetDisplayMode` accepts only that mode.
 the current mode's width, which is in points on a scaled mode (unverified).
 Reconfiguration callbacks are kept but never called.
 
+**Colour space variants:** CGColorSpaceCreateExtended / Linearized /
+ExtendedLinearized / CopyWithStandardRange map the named spaces onto their
+variants (NULL where a space has none, as Display P3 has no linear variant
+here); CGColorSpaceCopyBaseColorSpace; no space made here has an HDR transfer
+function (IsHDR / IsPQBased / IsHLGBased / UsesITUR_2100TF are false);
+CGColorSpaceCreateWithColorSyncProfile reads the profile's ICC data.
+
 ## Moved from darwin/identities/
 
 * `color_space_property_list.cpp`: CGColorSpaceCopyPropertyList answers NULL (the support kit).

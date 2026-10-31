@@ -190,6 +190,15 @@ const Case coretext_fonts_case("coretext_fonts", [](Fixture& f) {
     }, "/usr/lib/libcoretextfontstest.dylib");
     const auto sorted = f.cf.array_values(f.call(ct, "_CTFontCollectionCreateMatchingFontDescriptorsSortedWithCallback", {both, descending, 0}));
     require(sorted.size() == 2 && sorted[0] > sorted[1], "descriptors sorted by the callback");
+    // Query and exclusion descriptors, mutable copies, attributes (the frameworks wave, U21).
+    const auto mutable_copy = f.call(ct, "_CTFontCollectionCreateMutableCopy", {both});
+    f.call(ct, "_CTFontCollectionSetExclusionDescriptors", {mutable_copy, array(f, {descriptor_named(f, "Menlo-Regular")})});
+    const auto kept = f.cf.array_values(f.call(ct, "_CTFontCollectionCreateMatchingFontDescriptors", {mutable_copy}));
+    const auto kept_names = f.cf.array_values(f.call(ct, "_CTFontCollectionCopyFontAttribute", {mutable_copy, f.cf.string("NSFontNameAttribute"), 0}));
+    require(kept.size() == 1 && kept_names.size() == 1 && f.cf.utf8(kept_names[0]) == "Helvetica" &&
+                f.cf.array_values(f.call(ct, "_CTFontCollectionCopyExclusionDescriptors", {mutable_copy})).size() == 1 &&
+                f.cf.array_values(f.call(ct, "_CTFontCollectionCopyQueryDescriptors", {both})).size() == 2,
+            "an exclusion leaves Helvetica");
 
     // ---- run base advances and origins ----
     const std::vector<std::pair<Address, Address>> pairs{{f.cf.string("NSFont"), font}};

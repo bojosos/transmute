@@ -49,7 +49,8 @@ struct CgEventSource final : ObjectPayload {
     std::int64_t user_data{};
 };
 
-struct FontCollection final : ObjectPayload { Address descriptors{}; };
+// A font collection: its query descriptors and the descriptors it excludes (+1 CFArrays).
+struct FontCollection final : ObjectPayload { Address descriptors{}, exclusions{}; };
 
 class GraphicsGaps final : public Provider {
 public:
@@ -517,7 +518,10 @@ void GraphicsGaps::install_core_text() {
     if (!collection_class) collection_class = objc.register_native_class("__AlchemyCTFontCollection", objc.find_class("NSObject"), 8);
     if (!has(core_text, "_CTFontCollectionCreateFromAvailableFonts")) {
         static_cast<void>(objc.add_native_method(collection_class, "dealloc", [self = shared_from_this(), this](CpuState& s, GuestMemory&) {
-            if (const auto value = objc.find_host_state<FontCollection>(s.x[0])) release(std::exchange(value->descriptors, 0));
+            if (const auto value = objc.find_host_state<FontCollection>(s.x[0])) {
+                release(std::exchange(value->descriptors, 0));
+                release(std::exchange(value->exclusions, 0));
+            }
             static_cast<void>(objc.send_super(s.x[0], collection_class, objc.selector("dealloc")));
         }, false, "v@:"));
     }
@@ -539,10 +543,36 @@ void GraphicsGaps::install_core_text() {
         static_cast<void>(objc.host_state<FontCollection>(object, [&] { return value; }));
         s.x[0] = object;
     });
-    raw(core_text, "_CTFontCollectionCreateMatchingFontDescriptors", [this](CpuState& s, GuestMemory&) {
+    // The matching descriptors: the query descriptors less those an
+    // exclusion descriptor names (by PostScript name, else family).
+    const auto matching = [this](const FontCollection& value) {
+        const auto name_of = [this](Address descriptor) {
+            const auto attributes = call(core_text, "_CTFontDescriptorCopyAttributes", {descriptor});
+            std::string name;
+            for (const auto* key : {"NSFontNameAttribute", "NSFontFamilyAttribute"}) {
+                const auto key_string = cf.string(key);
+                const auto found = attributes ? cf.dictionary_value(attributes, key_string) : 0;
+                release(key_string);
+                if (found) { name = std::string(key) + ":" + cf.utf8(found); break; }
+            }
+            release(attributes);
+            return name;
+        };
+        std::vector<std::string> excluded;
+        for (const auto descriptor : value.exclusions ? cf.array_values(value.exclusions) : std::vector<Address>{}) excluded.push_back(name_of(descriptor));
+        std::vector<Address> kept;
+        for (const auto descriptor : value.descriptors ? cf.array_values(value.descriptors) : std::vector<Address>{})
+            if (excluded.empty() || std::find(excluded.begin(), excluded.end(), name_of(descriptor)) == excluded.end()) kept.push_back(descriptor);
+        return kept;
+    };
+    raw(core_text, "_CTFontCollectionCreateMatchingFontDescriptors", [this, matching](CpuState& s, GuestMemory&) {
         const auto value = s.x[0] ? objc.find_host_state<FontCollection>(s.x[0]) : nullptr;
         if (!value) throw std::runtime_error("Alchemy: CTFontCollectionCreateMatchingFontDescriptors needs a CTFontCollection");
-        s.x[0] = cf.copy(value->descriptors);
+        const auto kept = matching(*value);
+        s.x[0] = kept.empty() ? 0 : cf.array(kept);
+    });
+    raw(core_text, "_CTFontCollectionCreateMatchingFontDescriptorsWithOptions", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = call(core_text, "_CTFontCollectionCreateMatchingFontDescriptors", {s.x[0]});   // (collection, options)
     });
     // Collections of given descriptors, and copies with more.
     const auto make_collection = [this](std::vector<Address> descriptors) {
@@ -581,6 +611,61 @@ void GraphicsGaps::install_core_text() {
             });
         }
         s.x[0] = descriptors.empty() ? 0 : cf.array(descriptors);
+    });
+    raw(core_text, "_CTFontCollectionCopyQueryDescriptors", [this, collection_of](CpuState& s, GuestMemory&) {
+        const auto value = collection_of(s.x[0], "CTFontCollectionCopyQueryDescriptors");
+        s.x[0] = value->descriptors ? cf.copy(value->descriptors) : 0;
+    });
+    raw(core_text, "_CTFontCollectionCopyExclusionDescriptors", [this, collection_of](CpuState& s, GuestMemory&) {
+        const auto value = collection_of(s.x[0], "CTFontCollectionCopyExclusionDescriptors");
+        s.x[0] = value->exclusions ? cf.copy(value->exclusions) : 0;
+    });
+    raw(core_text, "_CTFontCollectionCreateMutableCopy", [this, make_collection, collection_of](CpuState& s, GuestMemory&) {
+        const auto value = collection_of(s.x[0], "CTFontCollectionCreateMutableCopy");
+        const auto copy = make_collection(value->descriptors ? cf.array_values(value->descriptors) : std::vector<Address>{});
+        if (value->exclusions) objc.find_host_state<FontCollection>(copy)->exclusions = cf.copy(value->exclusions);
+        s.x[0] = copy;
+    });
+    for (const auto& [symbol, exclusions] : std::initializer_list<std::pair<const char*, bool>>{
+             {"_CTFontCollectionSetQueryDescriptors", false}, {"_CTFontCollectionSetExclusionDescriptors", true}}) {
+        const bool set_exclusions = exclusions;
+        raw(core_text, symbol, [this, collection_of, set_exclusions](CpuState& s, GuestMemory&) {
+            const auto value = collection_of(s.x[0], "CTFontCollectionSet...Descriptors");
+            auto& slot = set_exclusions ? value->exclusions : value->descriptors;
+            release(std::exchange(slot, s.x[1] ? cf.copy(s.x[1]) : 0));
+        });
+    }
+    // The values of one attribute (or a dictionary of several) for each matching descriptor.
+    raw(core_text, "_CTFontCollectionCopyFontAttribute", [this, collection_of, matching](CpuState& s, GuestMemory&) {
+        // (collection, attributeName, options)
+        std::vector<Address> values;
+        for (const auto descriptor : matching(*collection_of(s.x[0], "CTFontCollectionCopyFontAttribute"))) {
+            const auto found = call(core_text, "_CTFontDescriptorCopyAttribute", {descriptor, s.x[1]});
+            values.push_back(found ? found : call(core_foundation, "_CFRetain", {bridge->constant(core_foundation, "_kCFNull")}));
+        }
+        s.x[0] = cf.array(values);
+        for (const auto value : values) release(value);
+    });
+    raw(core_text, "_CTFontCollectionCopyFontAttributes", [this, collection_of, matching](CpuState& s, GuestMemory&) {
+        // (collection, attributeNames (CFSet), options)
+        std::vector<Address> names;
+        if (s.x[1]) {
+            const auto count = call(core_foundation, "_CFSetGetCount", {s.x[1]});
+            const auto buffer = malloc(std::max<std::uint64_t>(count, 1) * 8);
+            static_cast<void>(call(core_foundation, "_CFSetGetValues", {s.x[1], buffer}));
+            for (std::uint64_t i = 0; i < count; ++i) names.push_back(memory().read64(buffer + i * 8));
+            free(buffer);
+        }
+        std::vector<Address> dictionaries;
+        for (const auto descriptor : matching(*collection_of(s.x[0], "CTFontCollectionCopyFontAttributes"))) {
+            std::vector<std::pair<Address, Address>> pairs;
+            for (const auto name : names)
+                if (const auto found = call(core_text, "_CTFontDescriptorCopyAttribute", {descriptor, name})) pairs.push_back({name, found});
+            dictionaries.push_back(cf.dictionary(pairs));
+            for (const auto& [name, found] : pairs) release(found);
+        }
+        s.x[0] = cf.array(dictionaries);
+        for (const auto dictionary : dictionaries) release(dictionary);
     });
     // CFGetTypeID of a collection.
     raw(core_text, "_CTFontCollectionGetTypeID", [this, make_collection](CpuState& s, GuestMemory&) {

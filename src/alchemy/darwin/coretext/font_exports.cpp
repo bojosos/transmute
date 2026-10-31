@@ -753,8 +753,8 @@ void install_font_exports(Quartz& q) {
         std::vector<std::pair<Address, Address>> pairs{
             {quartz->cf.string("NSFontNameAttribute"), quartz->cf.string(info->postscript)},
             {quartz->cf.string("NSFontFamilyAttribute"), quartz->cf.string(info->family)},
-            {quartz->cf.string("NSFontFaceAttribute"), quartz->cf.string(info->style_name)},
-            {quartz->cf.string("NSCTFontFileURLAttribute"), quartz->retain(url)}};
+            {quartz->cf.string("NSFontFaceAttribute"), quartz->cf.string(info->style_name)}};
+        if (url) pairs.push_back({quartz->cf.string("NSCTFontFileURLAttribute"), quartz->retain(url)});
         const auto attributes = quartz->cf.dictionary(pairs);
         for (const auto& [key, value] : pairs) { quartz->release(key); quartz->release(value); }
         const auto descriptor = make_descriptor(attributes);
@@ -769,6 +769,28 @@ void install_font_exports(Quartz& q) {
         const std::array<Address, 1> values{descriptor};
         s.x[0] = quartz->cf.array(values);
         quartz->release(descriptor);
+    });
+    // CTFontManagerCreateFontDescriptorsFromData(data): the descriptor of the
+    // font in the data (no file URL); NULL for data that is no font.
+    fn("_CTFontManagerCreateFontDescriptorsFromData", [quartz, file_descriptor](CpuState& s, GuestMemory&) {
+        const auto bytes = s.x[0] ? quartz->data_bytes(s.x[0]) : std::vector<std::uint8_t>{};
+        const auto descriptor = bytes.empty() ? 0 : file_descriptor(0, bytes);
+        if (!descriptor) { s.x[0] = 0; return; }
+        const std::array<Address, 1> values{descriptor};
+        s.x[0] = quartz->cf.array(values);
+        quartz->release(descriptor);
+    });
+    // CTFontManagerCompareFontFamilyNames(family1, family2, context): the
+    // order the font panel lists families in, case-insensitive (a
+    // CFComparatorFunction).
+    fn("_CTFontManagerCompareFontFamilyNames", [quartz](CpuState& s, GuestMemory&) {
+        const auto compare = quartz->process.resolve("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFStringCompare");
+        if (!compare) throw std::runtime_error("Alchemy: CTFontManagerCompareFontFamilyNames needs CFStringCompare");
+        s.x[0] = quartz->call_guest(compare->address, {s.x[0], s.x[1], 1 | 32});   // kCFCompareCaseInsensitive | kCFCompareLocalized
+    });
+    // Fonts are always enabled here: enabling does nothing; disabling stops explicitly.
+    fn("_CTFontManagerEnableFontDescriptors", [](CpuState& s, GuestMemory&) {
+        if ((s.x[1] & 0xff) == 0) throw std::runtime_error("unsupported: Alchemy: CTFontManagerEnableFontDescriptors(..., false): fonts cannot be disabled");
     });
     // The descriptors no installed or registered font matches.
     fn("_CTFontManagerRequestFonts", [quartz, descriptor_attributes](CpuState& s, GuestMemory& m) {
