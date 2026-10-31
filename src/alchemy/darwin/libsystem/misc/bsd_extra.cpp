@@ -1,5 +1,6 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
 #include "alchemy/darwin/libsystem/install.hpp"
+#include "alchemy/darwin_version.hpp"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 // BSD libc leftovers (fill-only):
@@ -39,6 +41,8 @@
 //   <stdio.h>     fmtcheck
 //   <ctype.h>     __istype, __isctype, __tolower_l, __toupper_l, _CurrentRuneLocale (the C
 //                 locale, over misc/locale.cpp's rune table)
+//   QLab's: _dyld_is_objc_constant (no shared cache, so nothing is one), os_system_version_get_current_version
+//                 (darwin_version.hpp's macOS), voucher_adopt (each thread's adopted voucher)
 namespace alchemy::export_fill {
 namespace {
 
@@ -858,6 +862,31 @@ void install_libsystem_bsd_extra(Provider& p) {
     });
     p.libsystem("___tolower_l", [p](CpuState& s, GuestMemory&) -> std::uint64_t { return p.call(libsystem_library, "___tolower", {s.x[0]}); });
     p.libsystem("___toupper_l", [p](CpuState& s, GuestMemory&) -> std::uint64_t { return p.call(libsystem_library, "___toupper", {s.x[0]}); });
+    // bool _dyld_is_objc_constant(DyldObjCConstantKind, const void*): whether the address is one of the dyld
+    // shared cache's prebuilt Objective-C constants (strings, classes, selectors). Alchemy loads no shared
+    // cache, so none is; callers then treat the object as an ordinary one.
+    p.libsystem("__dyld_is_objc_constant", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; }, 0);
+    // int os_system_version_get_current_version(struct os_system_version_s {unsigned major, minor, patch;}*):
+    // the macOS version every other interface reports; 0, or EINVAL for NULL.
+    p.libsystem("_os_system_version_get_current_version", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[0]) return einval;
+        m.write32(s.x[0], static_cast<std::uint32_t>(macos_major));
+        m.write32(s.x[0] + 4, static_cast<std::uint32_t>(macos_minor));
+        m.write32(s.x[0] + 8, static_cast<std::uint32_t>(macos_patch));
+        return 0;
+    }, einval);
+    // voucher_t voucher_adopt(voucher_t): makes the voucher (its reference passes to the thread) the calling
+    // thread's and returns the one it replaces (the caller owns that reference). Nothing here makes vouchers
+    // from Mach messages, so a thread's voucher is only what it adopted.
+    struct Vouchers { std::mutex mutex; std::map<std::uint64_t, std::uint64_t> adopted; };
+    auto vouchers = std::make_shared<Vouchers>();
+    p.libsystem("_voucher_adopt", [&process, vouchers](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto thread = process.current_thread();
+        const auto identity = thread ? thread->identity : 0;
+        std::lock_guard lock(vouchers->mutex);
+        auto& slot = vouchers->adopted[identity];
+        return std::exchange(slot, s.x[0]);
+    }, 0);
     // _RuneLocale* _CurrentRuneLocale: the C locale's table.
     if (const auto rune = process.resolve(libsystem_library, "__DefaultRuneLocale")) {
         std::array<std::uint8_t, 8> pointer{};

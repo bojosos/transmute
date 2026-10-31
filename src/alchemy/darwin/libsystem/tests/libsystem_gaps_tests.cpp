@@ -741,6 +741,14 @@ void test_b11(Fixture& f) {
     number.x[0] = f.text("2.5");
     require(alchemy::engine_call_regs(f.engine, f.symbol(sys, "_atof_l"), number).d(0) == 2.5, "atof_l");
     require(f.read(f.sys("_querylocale", {0x3f, 0})) == "C" && f.sys("_querylocale", {0, 0}) == 0, "querylocale");
+    // QLab's: no shared-cache constants, the macOS version, a thread's adopted voucher.
+    require(f.sys("__dyld_is_objc_constant", {0, f.text("x")}) == 0, "_dyld_is_objc_constant");
+    const auto system_version = f.process.allocate_guest(12);
+    require(f.sys("_os_system_version_get_current_version", {system_version}) == 0 && f.engine.read32(system_version) == 14 &&
+            f.engine.read32(system_version + 4) == 0 && f.engine.read32(system_version + 8) == 0 && f.sys("_os_system_version_get_current_version", {0}) == 22,
+            "os_system_version_get_current_version");
+    require(f.sys("_voucher_adopt", {0x1230}) == 0 && f.sys("_voucher_adopt", {0x4560}) == 0x1230 && f.sys("_voucher_adopt", {0}) == 0x4560,
+            "voucher_adopt returns the voucher it replaces");
     // setmode/getmode.
     const auto mask = f.sys("_umask", {0}) & 0777;
     f.sys("_umask", {mask});
