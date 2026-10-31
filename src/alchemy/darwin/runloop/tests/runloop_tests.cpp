@@ -483,6 +483,21 @@ void test_foundation_and_cf(Fixture& f) {
     require(!(f.send(timer, "isValid") & 0xff), "fired one-shot NSTimer is still valid");
     static_cast<void>(f.send(timer, "release"));
 
+    // An invocation timer: -retainArguments when it is made, -invoke when it fires.
+    std::vector<std::string> invocation_calls;
+    const auto invocation_class = f.call(alchemy::objc_library, "_objc_allocateClassPair", {f.objc.find_class("NSObject"), f.string("AlchemyTimerInvocation"), 0});
+    for (const auto* selector : {"retainArguments", "invoke"}) {
+        const std::string name = selector;
+        const auto imp = f.stub("test_invocation_" + name, [&invocation_calls, name](auto& state, auto&) { invocation_calls.push_back(name); state.x[0] = 0; });
+        static_cast<void>(f.call(alchemy::objc_library, "_class_addMethod", {invocation_class, f.objc.selector(selector), imp, f.string("v@:")}));
+    }
+    static_cast<void>(f.call(alchemy::objc_library, "_objc_registerClassPair", {invocation_class}));
+    const auto invocation = f.send(invocation_class, "new");
+    const auto invocation_timer = f.send(timer_class, "scheduledTimerWithTimeInterval:invocation:repeats:", {invocation, 0}, 0.01);
+    require(invocation_timer && invocation_calls == std::vector<std::string>{"retainArguments"}, "an invocation timer retains the arguments");
+    static_cast<void>(loop.run_once(alchemy::gui::default_mode, 0.2, false));
+    require((invocation_calls == std::vector<std::string>{"retainArguments", "invoke"}), "an invocation timer sends -invoke");
+
     // -performSelector:withObject:afterDelay: on a mutable array.
     const auto array = f.cf.array({}, true);
     const auto item = f.cf.string("item");

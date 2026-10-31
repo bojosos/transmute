@@ -2496,7 +2496,9 @@ struct ObjcRuntime::Impl {
             s.x[0] = 0; });
         const auto root = native_class("NSObject", 0, 8);
         add_native(root, "alloc", [this](auto& s, auto&) { s.x[0] = allocate(s.x[0]); }, true);
-        add_native(root, "allocWithZone:", [this](auto& s, auto&) { if (s.x[2]) throw std::runtime_error("Objective-C custom allocation zones are unsupported"); s.x[0] = allocate(s.x[0]); }, true, "@@:^v");
+        // The zone is ignored, as Apple's runtime has done since zones were retired: every object comes
+        // from the default allocator (NSDefaultMallocZone, malloc_default_zone or a custom zone alike).
+        add_native(root, "allocWithZone:", [this](auto& s, auto&) { s.x[0] = allocate(s.x[0]); }, true, "@@:^v");
         add_native(root, "new", [alloc_init](auto& s, auto& m) { alloc_init(s, m); }, true);
         // +[NSObject initialize] does nothing; subclasses reach it through [super initialize].
         add_native(root, "initialize", [](auto&, auto&) {}, true, "v@:");

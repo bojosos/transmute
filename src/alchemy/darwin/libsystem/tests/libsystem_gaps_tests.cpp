@@ -779,6 +779,43 @@ void test_b11(Fixture& f) {
     f.sys("_posix_spawnattr_destroy", {attributes});
 }
 
+// ITIMER_REAL (process/process_model.cpp): SIGALRM from a timer thread.
+void test_itimers(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    static std::atomic<int> alarms{0};
+    const auto handler = f.process.install_function("_gaps_sigalrm", [](transmute::CpuState& s, transmute::GuestMemory&) { ++alarms; s.x[0] = 0; });
+    f.sys("_signal", {14, handler});
+    const auto value = f.process.allocate_guest(32), old = f.process.allocate_guest(32);
+    // One shot in 20 ms: getitimer sees it pending, then the handler runs once.
+    f.engine.fill_bytes(value, 0, 32);
+    f.engine.write64(value + 24, 20000);   // it_value.tv_usec
+    require(f.sys("_setitimer", {0, value, old}) == 0 && f.sys("_getitimer", {0, old}) == 0 && f.engine.read64(old + 24) > 0,
+            "setitimer arms ITIMER_REAL");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (alarms < 1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(alarms == 1, "SIGALRM ran the handler");
+    require(f.sys("_getitimer", {0, old}) == 0 && f.engine.read64(old + 16) == 0 && f.engine.read64(old + 24) == 0, "a fired one-shot is disarmed");
+    // A repeating timer, stopped by a zero value.
+    f.engine.write64(value + 8, 10000); f.engine.write64(value + 24, 10000);
+    require(f.sys("_setitimer", {0, value, 0}) == 0, "repeating timer");
+    while (alarms < 4 && std::chrono::steady_clock::now() < deadline + std::chrono::seconds(5)) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    f.engine.fill_bytes(value, 0, 32);
+    require(alarms >= 4 && f.sys("_setitimer", {0, value, old}) == 0 && f.engine.read64(old + 8) == 10000, "the period repeats it, old value returned");
+    // alarm: the previous seconds left, rounded up; alarm(0) disarms.
+    require(f.sys("_alarm", {5}) == 0 && f.sys("_alarm", {0}) == 5, "alarm returns the seconds left");
+    // ualarm, waited for with sigsuspend.
+    const auto before = alarms.load();
+    const auto mask = f.process.allocate_guest(4);
+    f.engine.write32(mask, 0);
+    require(f.sys("_ualarm", {20000, 20000}) == 0, "ualarm");   // repeating, so an early alarm cannot leave sigsuspend waiting
+    require(f.sys("_sigsuspend", {mask}) == UINT64_MAX && errno_value() == 4 && alarms > before, "sigsuspend wakes for SIGALRM");
+    require(f.sys("_ualarm", {0, 0}) > 0, "ualarm(0) disarms and returns the time left");
+    // CPU-time timers are not available.
+    require(f.sys("_setitimer", {1, value, 0}) == UINT64_MAX && errno_value() == 78, "ITIMER_VIRTUAL is ENOSYS");
+    require(f.sys("_setitimer", {3, value, 0}) == UINT64_MAX && errno_value() == 22, "an unknown timer is EINVAL");
+    f.sys("_signal", {14, 0});
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -1148,6 +1185,7 @@ int main() {
         stage("memory streams"); test_memory_streams(f);
         stage("bsd more"); test_bsd_more(f);
         stage("b11"); test_b11(f);
+        stage("itimers"); test_itimers(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

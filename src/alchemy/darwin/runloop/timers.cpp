@@ -176,8 +176,15 @@ void Provider::install_timers() {
         if (!state.x[3]) throw std::invalid_argument("NSTimer block is nil");
         state.x[0] = make(d_argument(state, 0), state.x[2] & 0xff, 0, 0, 0, state.x[3], false);
     }, true, "@@:dB@?");
-    for (const auto* name : {"scheduledTimerWithTimeInterval:invocation:repeats:", "timerWithTimeInterval:invocation:repeats:"})
-        method(t, name, [](auto&, auto&) { throw std::runtime_error("unsupported NSTimer with an NSInvocation"); }, true, "@@:d@B");
+    // An invocation timer sends -invoke to its NSInvocation (the target; the timer passed along is
+    // ignored by -invoke). As NSTimer does, the invocation retains its arguments.
+    for (const auto scheduled : {true, false})
+        method(t, scheduled ? "scheduledTimerWithTimeInterval:invocation:repeats:" : "timerWithTimeInterval:invocation:repeats:",
+               [this, make, scheduled](auto& state, auto&) {
+            if (!state.x[2]) throw std::invalid_argument("NSTimer invocation is nil");
+            static_cast<void>(objc.send(state.x[2], "retainArguments"));
+            state.x[0] = make(d_argument(state, 0), state.x[3] & 0xff, state.x[2], objc.selector("invoke"), 0, 0, scheduled);
+        }, true, "@@:d@B");
     method(t, "initWithFireDate:interval:target:selector:userInfo:repeats:", [this, initialize](auto& state, auto&) {
         const auto fire = state.x[2] ? cf.date_time(state.x[2]) : CoreFoundation::absolute_time_now();
         initialize(state.x[0], fire, d_argument(state, 0), state.x[6] & 0xff, state.x[3], state.x[4], state.x[5], 0);

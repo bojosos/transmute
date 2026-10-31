@@ -28,8 +28,7 @@
 //   <membership.h> mbr_gid_to_uuid, mbr_uuid_to_id (the compatibility UUIDs); getpwuuid, getpwuuid_r
 //   <execinfo.h>  backtrace_from_fp, backtrace_image_offsets
 //   minherit (vm_inherit), statfs64/fstatfs64/getfsstat64/getmntinfo64, atof_l, querylocale
-//   <time.h>      timeoff, strptime_l (the "C" locale); ualarm is an explicit stop, as alarm
-//                 (no asynchronous SIGALRM)
+//   <time.h>      timeoff, strptime_l (the "C" locale); ualarm is process/process_model.cpp's
 //   <unistd.h>    getpass; <readpassphrase.h> readpassphrase (echo off on a terminal)
 //   <pwd.h>/<grp.h> user_from_uid, group_from_gid, uid_from_user, gid_from_group
 //   <execinfo.h>  backtrace_symbols_fd
@@ -662,9 +661,6 @@ void install_libsystem_bsd_extra(Provider& p) {
     p.libsystem("_strptime_l", [p](CpuState& s, GuestMemory&) -> std::uint64_t {
         return p.call(libsystem_library, "_strptime", {s.x[0], s.x[1], s.x[2]});
     }, 0);
-    p.libsystem("_ualarm", [](CpuState&, GuestMemory&) -> std::uint64_t {
-        throw std::runtime_error("Darwin ualarm requires guest signal delivery, which is unsupported");
-    });
 
     // ---- passphrases ----
     // readpassphrase(prompt, buf, size, flags): the prompt on the terminal (or standard error),

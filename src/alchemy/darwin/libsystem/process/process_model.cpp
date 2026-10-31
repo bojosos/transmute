@@ -1269,6 +1269,122 @@ void DarwinServices::Impl::install_process_services() {
         return suspend(mask & ~(1U << (s.x[0] - 1)));
     });
 
+    // ITIMER_REAL: alarm, ualarm, setitimer and getitimer. A guest thread of this process waits for
+    // the expiry and raises SIGALRM on itself (a process-directed signal may go to any thread), so
+    // the handler runs there, sigsuspend/pause wake, and without a handler the default action ends
+    // the process. Blocking calls on other threads are not interrupted (no EINTR there).
+    // ITIMER_VIRTUAL and ITIMER_PROF (CPU-time timers) are ENOSYS.
+    using microseconds = std::chrono::microseconds;
+    const auto timer_thread = context.install_function("___alchemy_itimer_thread", [this](transmute::CpuState& s, transmute::GuestMemory&) {
+        const auto raise = context.resolve(system_library, "_raise");
+        while (true) {
+            {
+                std::unique_lock lock(mutex);
+                while (!context.requested_exit() && (!real_timer_due || std::chrono::steady_clock::now() < *real_timer_due)) {
+                    const auto poll = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+                    real_timer_changed.wait_until(lock, real_timer_due ? std::min(*real_timer_due, poll) : poll);
+                }
+                if (context.requested_exit()) break;
+                if (real_timer_period.count() > 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    do *real_timer_due += real_timer_period; while (*real_timer_due <= now);
+                } else real_timer_due.reset();
+            }
+            if (raise) {
+                const std::array<std::uint64_t, 1> arguments{14};   // SIGALRM
+                static_cast<void>(EngineAdapter(context.calling_engine()).call(raise->address, arguments));
+            }
+        }
+        s.x[0] = 0;
+    });
+    // The time left and the period (caller holds `mutex`); a running timer has at least 1 us left.
+    const auto real_timer_state = [this]() -> std::pair<microseconds, microseconds> {
+        if (!real_timer_due) return {};
+        const auto left = std::chrono::duration_cast<microseconds>(*real_timer_due - std::chrono::steady_clock::now());
+        return {left.count() > 0 ? left : microseconds{1}, real_timer_period};
+    };
+    // Arms (a zero value disarms) and returns the previous {left, period}; starts the thread once.
+    const auto arm_real_timer = [this, timer_thread, real_timer_state](microseconds value, microseconds period) {
+        std::pair<microseconds, microseconds> previous;
+        bool start = false;
+        {
+            std::lock_guard lock(mutex);
+            previous = real_timer_state();
+            if (value.count() > 0) { real_timer_due = std::chrono::steady_clock::now() + value; real_timer_period = period; }
+            else { real_timer_due.reset(); real_timer_period = {}; }
+            start = real_timer_due && !real_timer_thread;
+            if (start) real_timer_thread = true;
+        }
+        real_timer_changed.notify_all();
+        if (start) {
+            const auto create = context.resolve(system_library, "_pthread_create");
+            const auto detach = context.resolve(system_library, "_pthread_detach");
+            const auto cell = context.allocate_guest(8);
+            const std::array<std::uint64_t, 4> arguments{cell, 0, timer_thread, 0};
+            const auto failed = !create || EngineAdapter(context.calling_engine()).call(create->address, arguments) != 0;
+            if (!failed && detach) {
+                const std::array<std::uint64_t, 1> thread{context.calling_engine().read64(cell)};
+                static_cast<void>(EngineAdapter(context.calling_engine()).call(detach->address, thread));
+            }
+            context.release_guest(cell);
+            if (failed) {
+                std::lock_guard lock(mutex);
+                real_timer_thread = false; real_timer_due.reset(); real_timer_period = {};
+                throw ServiceError{eagain_error};
+            }
+        }
+        return previous;
+    };
+    // struct itimerval {struct timeval it_interval, it_value}; timeval {time_t tv_sec; suseconds_t tv_usec} (16 bytes).
+    const auto read_timeval = [](transmute::GuestMemory& m, std::uint64_t address) -> microseconds {
+        const auto seconds = static_cast<std::int64_t>(m.read64(address));
+        const auto rest = static_cast<std::int32_t>(m.read32(address + 8));
+        if (seconds < 0 || rest < 0 || rest >= 1'000'000) throw ServiceError{einval};
+        return microseconds{seconds * 1'000'000 + rest};
+    };
+    const auto write_timeval = [](transmute::GuestMemory& m, std::uint64_t address, microseconds value) {
+        m.write64(address, static_cast<std::uint64_t>(value.count() / 1'000'000));
+        m.write64(address + 8, static_cast<std::uint64_t>(value.count() % 1'000'000));
+    };
+    const auto timer_kind = [](std::uint64_t which) {
+        if (which > 2) throw ServiceError{einval};
+        if (which != 0) throw ServiceError{enosys};   // ITIMER_VIRTUAL, ITIMER_PROF
+    };
+    install("_setitimer", [arm_real_timer, read_timeval, write_timeval, timer_kind](auto& s, auto& m) -> std::uint64_t {
+        timer_kind(s.x[0]);
+        std::pair<microseconds, microseconds> previous;
+        if (s.x[1]) {
+            validate(m, s.x[1], 32, false);
+            const auto period = read_timeval(m, s.x[1]), value = read_timeval(m, s.x[1] + 16);
+            previous = arm_real_timer(value, period);
+        }
+        if (s.x[2]) {
+            validate(m, s.x[2], 32, true);
+            write_timeval(m, s.x[2], previous.second);
+            write_timeval(m, s.x[2] + 16, previous.first);
+        }
+        return 0;
+    });
+    install("_getitimer", [this, real_timer_state, write_timeval, timer_kind](auto& s, auto& m) -> std::uint64_t {
+        timer_kind(s.x[0]);
+        validate(m, s.x[1], 32, true);
+        std::pair<microseconds, microseconds> current;
+        { std::lock_guard lock(mutex); current = real_timer_state(); }
+        write_timeval(m, s.x[1], current.second);
+        write_timeval(m, s.x[1] + 16, current.first);
+        return 0;
+    });
+    // unsigned alarm(unsigned seconds): the previous timer's seconds left, rounded up.
+    install("_alarm", [arm_real_timer](auto& s, auto&) -> std::uint64_t {
+        const auto previous = arm_real_timer(microseconds{static_cast<std::int64_t>(static_cast<std::uint32_t>(s.x[0])) * 1'000'000}, {});
+        return static_cast<std::uint64_t>((previous.first.count() + 999'999) / 1'000'000);
+    });
+    // useconds_t ualarm(useconds_t value, useconds_t interval): the previous timer's microseconds left.
+    install("_ualarm", [arm_real_timer](auto& s, auto&) -> std::uint64_t {
+        const auto previous = arm_real_timer(microseconds{static_cast<std::uint32_t>(s.x[0])}, microseconds{static_cast<std::uint32_t>(s.x[1])});
+        return static_cast<std::uint64_t>(std::min<std::int64_t>(previous.first.count(), UINT32_MAX));
+    });
+
     // ---- libproc for this process and its children ----
     install("_proc_pidpath", [this](auto& s, auto& m) -> std::uint64_t {
         const auto pid = static_cast<std::uint32_t>(s.x[0]);

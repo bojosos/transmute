@@ -437,6 +437,10 @@ void test_runtime_api() {
     require(list && f.engine.read32(count) == 2 && read(f.engine.read64(list)) == "T" && read(f.engine.read64(list + 24)) == "", "property_copyAttributeList");
     require(f.call("_class_replaceProperty", {cls, f.string("title"), attributes, 1}) == 1 &&
             read(f.call("_property_getAttributes", {f.call("_class_getProperty", {cls, f.string("title")})})) == "T@\"NSString\"", "class_replaceProperty");
+    // +allocWithZone: ignores the zone (any zone, as Apple's runtime).
+    const auto zoned = f.call("_objc_msgSend", {root, f.runtime.selector("allocWithZone:"), 0x1234});
+    require(zoned != 0 && f.call("_object_getClass", {zoned}) == root, "allocWithZone: with a zone");
+    static_cast<void>(f.call("_objc_release", {zoned}));
     // method_invoke: the IMP with the method's selector.
     require(f.call("_method_invoke", {object, method}) == 42, "method_invoke calls the IMP");
     // The root class's own implementations.

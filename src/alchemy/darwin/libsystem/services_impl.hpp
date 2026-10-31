@@ -1234,6 +1234,12 @@ public:
     std::condition_variable signal_handled;
     std::uint64_t handled_signals{};
     std::uint32_t last_handled_signal{};
+    // ITIMER_REAL (process/process_model.cpp): the next expiry and the period, under `mutex`;
+    // `real_timer_thread` once the guest thread that raises SIGALRM runs.
+    std::condition_variable real_timer_changed;
+    std::optional<std::chrono::steady_clock::time_point> real_timer_due;
+    std::chrono::microseconds real_timer_period{};
+    bool real_timer_thread{};
     std::map<std::uint64_t, std::array<std::uint64_t, 2>> resource_limits;
     std::uint64_t creation_mask{022};
 

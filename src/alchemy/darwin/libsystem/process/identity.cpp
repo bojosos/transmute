@@ -194,7 +194,7 @@ void DarwinServices::Impl::install_process_identity() {
     // killpg, setpgid, setsid, posix_spawn and system.
     // openpty, tcgetpgrp, tcsetpgrp: fs/terminal.cpp.
     for (const auto name : {"_forkpty", "_login_tty", "_lockf", "_mkfifo", "_mknod", "_chflags",
-        "_lchflags", "_fchflags", "_lchmod", "_lutimes", "_getitimer", "_setitimer", "_sigaltstack",
+        "_lchflags", "_fchflags", "_lchmod", "_lutimes", "_sigaltstack",
         "_nice", "_setpriority", "_getgrouplist", "_times"})
         install(name, [](auto&, auto&) -> std::uint64_t { throw ServiceError{enosys}; });
     for (const auto name : {"_chown", "_lchown", "_fchown", "_fchownat", "_chroot"})
@@ -234,7 +234,7 @@ void DarwinServices::Impl::install_process_identity() {
     install("_sigwait", [](auto&, auto&) { return static_cast<std::uint64_t>(enosys); }); // Error-number return convention.
     install("_getpwent", [](auto&, auto&) -> std::uint64_t { throw ServiceError{enosys}; }, 0);
     install("_ctermid_r", [](auto&, auto&) -> std::uint64_t { throw ServiceError{enosys}; }, 0);
-    install("_alarm", [](auto&, auto&) -> std::uint64_t { throw std::runtime_error("Darwin alarm requires guest signal delivery, which is unsupported"); });
+    // alarm, ualarm, setitimer, getitimer: process/process_model.cpp.
     for (const auto name : {"_setpwent", "_endpwent"}) install(name, [](auto&, auto&) -> std::uint64_t {
         throw std::runtime_error("Darwin password database enumeration is unsupported");
     });
