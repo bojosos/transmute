@@ -3,8 +3,9 @@
 // Legacy Security interfaces Chrome's images import, cut from
 // darwin/coreservices/services.cpp (install_services calls it in place): the
 // legacy keychain status is real (the one default keychain, unlocked,
-// readable and writable); code signing and CSSM-era ACL calls answer
-// errSecUnimplemented. Code-signing dictionary keys are exported.
+// readable and writable); code signers and CSSM-era ACL calls answer
+// errSecUnimplemented. Guest attribute and code signer keys are exported (the
+// signing-information keys are the security provider's, code_signing.cpp).
 namespace alchemy::gui::values {
 namespace {
 
@@ -33,19 +34,11 @@ void Provider::install_legacy_keychain() {
     failure(security, "_SecKeychainItemCreateFromContent", sec_unimplemented, {6});
     failure(security, "_SecCodeSignerCreate", sec_unimplemented, {2});
     failure(security, "_SecCodeSignerAddSignatureWithErrors", sec_unimplemented, {3});
-    // <Security/SecCode.h>, CSCommon.h keys. The SecCodeSigner keys are SPI and
-    // the kSecCFError* values unverified.
-    string(security, "_kSecCodeInfoCertificates", "certificates");
-    string(security, "_kSecCodeInfoFlags", "flags");
-    string(security, "_kSecCodeInfoMainExecutable", "main-executable");
-    string(security, "_kSecCodeInfoPList", "info-plist");
-    string(security, "_kSecCodeInfoUnique", "unique");
+    // <Security/SecCode.h>, CSCommon.h keys. The SecCodeSigner keys are SPI.
     string(security, "_kSecGuestAttributeAudit", "audit");
     string(security, "_kSecGuestAttributeDynamicCode", "dynamicCode");
     string(security, "_kSecGuestAttributeDynamicCodeInfoPlist", "dynamicCodeInfoPlist");
     string(security, "_kSecGuestAttributePid", "pid");
-    string(security, "_kSecCFErrorResourceAltered", "SecCSResourceAltered");
-    string(security, "_kSecCFErrorResourceMissing", "SecCSResourceMissing");
     string(security, "_kSecCodeSignerEntitlements", "entitlements");
     string(security, "_kSecCodeSignerFlags", "flags");
     string(security, "_kSecCodeSignerIdentity", "signer");

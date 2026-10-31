@@ -4,6 +4,7 @@
 // ECDH, external representations), SecItemImport, the DPAPI keychain, and a
 // SecureTransport client against an in-process SChannel TLS server.
 #include "security_internal.hpp"
+#include "code_signature.hpp"
 #include "keys.hpp"
 #include "tls.hpp"
 
@@ -14,6 +15,7 @@
 #include "alchemy/darwin_threads.hpp"
 #include "alchemy/foundation_bridge.hpp"
 #include "alchemy/gui/install.hpp"
+#include "alchemy/path.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -35,6 +37,7 @@ namespace {
 using Address = std::uint64_t;
 using Bytes = std::vector<std::uint8_t>;
 namespace sec = alchemy::gui::security;
+namespace codesign = alchemy::gui::security::codesign;
 constexpr std::string_view security_library = sec::security_library;
 
 void require(bool value, std::string_view message) {
@@ -523,20 +526,257 @@ void test_secure_transport(Fixture& f, Identity& identity) {
     require(server.ok, "TLS server failed: " + server.error);
 }
 
+// An ad-hoc signed arm64 Mach-O: two pages of code, then a SuperBlob with one SHA-256 CodeDirectory whose special
+// slots carry `info` (slot 1) and `resources` (slot 3) when given. Built here from the public layout.
+std::vector<std::uint8_t> adhoc_macho(const std::string& identifier, const std::vector<std::uint8_t>& info = {},
+                                      const std::vector<std::uint8_t>& resources = {}) {
+    const auto put32le = [](std::vector<std::uint8_t>& out, std::size_t at, std::uint32_t value) {
+        for (int index = 0; index < 4; ++index) out[at + index] = static_cast<std::uint8_t>(value >> (8 * index));
+    };
+    const auto put32 = [](std::vector<std::uint8_t>& out, std::size_t at, std::uint32_t value) {
+        for (int index = 0; index < 4; ++index) out[at + index] = static_cast<std::uint8_t>(value >> (24 - 8 * index));
+    };
+    constexpr std::uint32_t code_limit = 8192;
+    std::vector<std::uint8_t> file(code_limit);
+    for (std::size_t index = 48; index < file.size(); ++index) file[index] = static_cast<std::uint8_t>(index * 31);
+    put32le(file, 0, 0xfeedfacf); put32le(file, 4, 0x0100000c); put32le(file, 8, 0); put32le(file, 12, 2);
+    put32le(file, 16, 1); put32le(file, 20, 16); put32le(file, 24, 0); put32le(file, 28, 0);
+    const std::uint32_t special = resources.empty() ? (info.empty() ? 0 : 1) : 3;
+    const std::uint32_t header = 88, ident_offset = header;
+    const auto ident_size = static_cast<std::uint32_t>(identifier.size() + 1);
+    const std::uint32_t hash_offset = ident_offset + ident_size + special * 32;
+    const std::uint32_t cd_size = hash_offset + 2 * 32;
+    std::vector<std::uint8_t> cd(cd_size);
+    put32(cd, 0, 0xfade0c02); put32(cd, 4, cd_size); put32(cd, 8, 0x20400); put32(cd, 12, 0x2);
+    put32(cd, 16, hash_offset); put32(cd, 20, ident_offset); put32(cd, 24, special); put32(cd, 28, 2); put32(cd, 32, code_limit);
+    cd[36] = 32; cd[37] = 2; cd[38] = 0; cd[39] = 12;
+    std::copy(identifier.begin(), identifier.end(), cd.begin() + ident_offset);
+    const auto sha256 = [](std::span<const std::uint8_t> data) { return *sec::digest("SHA256", data); };
+    if (!info.empty()) { const auto h = sha256(info); std::copy(h.begin(), h.end(), cd.begin() + hash_offset - 32); }
+    if (!resources.empty()) { const auto h = sha256(resources); std::copy(h.begin(), h.end(), cd.begin() + hash_offset - 96); }
+    const std::uint32_t superblob = 20 + cd_size;
+    put32le(file, 32, 0x1d); put32le(file, 36, 16); put32le(file, 40, code_limit); put32le(file, 44, superblob);
+    for (int page = 0; page < 2; ++page) {
+        const auto h = sha256(std::span(file).subspan(static_cast<std::size_t>(page) * 4096, 4096));
+        std::copy(h.begin(), h.end(), cd.begin() + hash_offset + page * 32);
+    }
+    std::vector<std::uint8_t> blob(20);
+    put32(blob, 0, 0xfade0cc0); put32(blob, 4, superblob); put32(blob, 8, 1); put32(blob, 12, 0); put32(blob, 16, 20);
+    blob.insert(blob.end(), cd.begin(), cd.end());
+    file.insert(file.end(), blob.begin(), blob.end());
+    return file;
+}
+
 void test_code_signing(Fixture& f) {
-    const auto url = f.cf.file_url("/Applications/QLab.app", true);
-    const auto code = f.cell();
-    require(f.status("_SecStaticCodeCreateWithPath", {url, 0, code}) == 0, "SecStaticCodeCreateWithPath");
-    require(f.status("_SecStaticCodeCheckValidity", {f.engine.read64(code), 0, 0}) == sec::status::cs_unimplemented,
-            "code signature checks must fail honestly");
+    namespace fs = std::filesystem;
+    const auto temp = fs::temp_directory_path() / ("alchemy-codesign-" + std::to_string(GetCurrentProcessId()));
+    fs::remove_all(temp);
+    fs::create_directories(temp);
+    const auto write = [](const fs::path& path, const std::vector<std::uint8_t>& bytes) {
+        fs::create_directories(path.parent_path());
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    const auto static_code = [&](const fs::path& path) {
+        const auto url = f.cf.file_url(alchemy::guest_path_string(path), fs::is_directory(path));
+        const auto out = f.cell();
+        require(f.status("_SecStaticCodeCreateWithPath", {url, 0, out}) == 0, "SecStaticCodeCreateWithPath");
+        f.release(url);
+        return f.engine.read64(out);
+    };
+    const auto info_of = [&](Address code, std::uint32_t flags) {
+        const auto out = f.cell();
+        require(f.status("_SecCodeCopySigningInformation", {code, flags, out}) == 0, "SecCodeCopySigningInformation");
+        return f.engine.read64(out);
+    };
+    const auto value = [&](Address dictionary, std::string_view key) {
+        const auto name = f.cf.string(key);
+        const auto found = f.core("_CFDictionaryGetValue", {dictionary, name});
+        f.release(name);
+        return found;
+    };
+    const auto validity = [&](Address code, std::uint32_t flags) { return f.status("_SecStaticCodeCheckValidity", {code, flags, 0}); };
+    const auto requirement = [&](std::string_view text) {
+        const auto source = f.cf.string(text), out = f.cell();
+        const auto status = f.status("_SecRequirementCreateWithString", {source, 0, out});
+        f.release(source);
+        require(status == 0, "SecRequirementCreateWithString: " + std::string(text));
+        return f.engine.read64(out);
+    };
+    const auto requirement_text = [&](Address object) {
+        const auto out = f.cell();
+        require(f.status("_SecRequirementCopyString", {object, 0, out}) == 0, "SecRequirementCopyString");
+        const auto text = f.cf.utf8(f.engine.read64(out));
+        f.release(f.engine.read64(out));
+        return text;
+    };
+    const auto satisfies = [&](Address code, std::string_view text) {
+        const auto object = requirement(text);
+        const auto status = f.status("_SecStaticCodeCheckValidity", {code, 0, object});
+        f.release(object);
+        return status;
+    };
+
+    // 0. The requirement language: Apple's text round-trips through the binary form; bad text is errSecCSReqInvalid.
+    const std::string developer_id = "anchor apple generic and identifier \"com.snoize.SnoizeMIDI\" and (certificate "
+        "leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and "
+        "certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"7672N4CCJM\")";
+    const auto parsed_requirement = requirement(developer_id);
+    require(requirement_text(parsed_requirement) == developer_id, "a Developer ID requirement round-trips: " + requirement_text(parsed_requirement));
+    const auto data_out = f.cell(), copy_out = f.cell();
+    require(f.status("_SecRequirementCopyData", {parsed_requirement, 0, data_out}) == 0 &&
+                f.status("_SecRequirementCreateWithData", {f.engine.read64(data_out), 0, copy_out}) == 0 &&
+                requirement_text(f.engine.read64(copy_out)) == developer_id, "SecRequirementCopyData / CreateWithData");
+    for (const auto object : {parsed_requirement, f.engine.read64(data_out), f.engine.read64(copy_out)}) f.release(object);
+    require(requirement_text(requirement("identifier libndi or ! (info[CFBundleVersion] >= \"5\" and cdhash H\"0a0b\")")) ==
+            "identifier libndi or ! (info[CFBundleVersion] >= \"5\" and cdhash H\"0a0b\")", "or / not / info / cdhash text");
+    const auto bad = f.cf.string("identifier and"), bad_errors = f.cell(), bad_out = f.cell();
+    require(f.status("_SecRequirementCreateWithStringAndErrors", {bad, 0, bad_errors, bad_out}) == codesign::cs::requirement_invalid &&
+            f.engine.read64(bad_errors) != 0, "an unparsable requirement");
+    f.release(f.engine.read64(bad_errors));
+    f.release(bad);
+
+    // 1. An ad-hoc signed Mach-O: valid; its signing information; a modified page and an unsigned file fail.
+    const auto binary = temp / "adhoc";
+    auto bytes = adhoc_macho("com.alchemy.adhoc");
+    write(binary, bytes);
+    auto code = static_code(binary);
+    require(validity(code, 0) == 0, "an ad-hoc signature verifies: " + std::to_string(validity(code, 0)));
+    const auto info = info_of(code, 0);
+    require(f.cf.utf8(value(info, "identifier")) == "com.alchemy.adhoc", "the identifier");
+    require(f.cf.number_value(value(info, "flags")).value_or(0) == 2 && f.cf.number_value(value(info, "digest-algorithm")).value_or(0) == 2,
+            "the CodeDirectory flags (ad-hoc) and hash type (SHA-256)");
+    require(f.cf.length(value(info, "unique")) == 20 && f.cf.utf8(value(info, "format")) == "Mach-O thin (arm64)", "the cdhash and format");
+    require(f.cf.utf8(f.cf.description(value(info, "main-executable"))).find("adhoc") != std::string::npos, "the main executable");
+    f.release(info);
+    const auto path_out = f.cell();
+    require(f.status("_SecCodeCopyPath", {code, 0, path_out}) == 0 && f.cf.url_path(f.engine.read64(path_out)).ends_with("/adhoc"), "SecCodeCopyPath");
+    f.release(f.engine.read64(path_out));
+    const auto designated_out = f.cell();
+    require(f.status("_SecCodeCopyDesignatedRequirement", {code, 0, designated_out}) == 0 &&
+            requirement_text(f.engine.read64(designated_out)).starts_with("cdhash H\""), "an ad-hoc designated requirement is its cdhash");
+    require(f.status("_SecStaticCodeCheckValidity", {code, 0, f.engine.read64(designated_out)}) == 0, "it satisfies its designated requirement");
+    f.release(f.engine.read64(designated_out));
+    require(satisfies(code, "identifier \"com.alchemy.adhoc\"") == 0, "identifier requirement");
+    require(satisfies(code, "identifier other") == codesign::cs::requirement_failed, "a failing requirement is errSecCSReqFailed");
+    require(satisfies(code, "anchor apple generic") == codesign::cs::requirement_failed, "ad-hoc code has no anchor");
+    f.release(code);
+    bytes[5000] ^= 0xff;
+    write(binary, bytes);
+    code = static_code(binary);
     const auto errors = f.cell();
-    require(f.status("_SecStaticCodeCheckValidityWithErrors", {f.engine.read64(code), 0, 0, errors}) == sec::status::cs_unimplemented &&
-            f.error_code(f.engine.read64(errors)) == sec::status::cs_unimplemented, "SecStaticCodeCheckValidityWithErrors");
+    require(f.status("_SecStaticCodeCheckValidityWithErrors", {code, 0, 0, errors}) == codesign::cs::signature_failed &&
+            f.error_code(f.engine.read64(errors)) == codesign::cs::signature_failed, "a modified page fails the signature");
     f.release(f.engine.read64(errors));
-    f.release(f.engine.read64(code));
-    f.release(url);
-    const auto requirement_data = f.cell();
-    require(f.status("_SecRequirementCopyData", {0, 0, requirement_data}) == sec::status::cs_unimplemented, "SecRequirementCopyData");
+    require(validity(code, 2) == 0, "kSecCSDoNotValidateExecutable skips the pages");
+    f.release(code);
+    std::vector<std::uint8_t> plain(4096);
+    for (const auto [at, word] : {std::pair{0, 0xfeedfacfU}, std::pair{4, 0x0100000cU}, std::pair{12, 2U}})
+        for (int index = 0; index < 4; ++index) plain[at + index] = static_cast<std::uint8_t>(word >> (8 * index));
+    write(temp / "plain", plain);
+    code = static_code(temp / "plain");
+    require(validity(code, 0) == codesign::cs::unsigned_code, "an unsigned Mach-O is errSecCSUnsigned");
+    const auto plain_info = info_of(code, 0);
+    require(value(plain_info, "identifier") == 0 && value(plain_info, "main-executable") != 0, "unsigned code has no identifier");
+    f.release(plain_info);
+    f.release(code);
+
+    // 2. A bundle with Info.plist and a sealed resource: valid; an altered or missing resource fails with its path.
+    const auto bundle = temp / "Sealed.app";
+    const std::string plist_text = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>"
+        "<key>CFBundleExecutable</key><string>Sealed</string><key>CFBundleIdentifier</key><string>com.alchemy.sealed</string></dict></plist>";
+    const std::vector<std::uint8_t> plist(plist_text.begin(), plist_text.end());
+    const std::string resource_text = "sealed resource";
+    const auto resource_hash = *sec::digest("SHA256", std::span(reinterpret_cast<const std::uint8_t*>(resource_text.data()), resource_text.size()));
+    std::string hash_base64 = sec::base64_encode(resource_hash);
+    const std::string resources_text = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>files2</key><dict>"
+        "<key>Resources/note.txt</key><dict><key>hash2</key><data>" + hash_base64 + "</data></dict></dict></dict></plist>";
+    const std::vector<std::uint8_t> resources(resources_text.begin(), resources_text.end());
+    write(bundle / "Contents" / "Info.plist", plist);
+    write(bundle / "Contents" / "_CodeSignature" / "CodeResources", resources);
+    write(bundle / "Contents" / "Resources" / "note.txt", std::vector<std::uint8_t>(resource_text.begin(), resource_text.end()));
+    write(bundle / "Contents" / "MacOS" / "Sealed", adhoc_macho("com.alchemy.sealed", plist, resources));
+    code = static_code(bundle);
+    require(validity(code, 0) == 0, "a sealed bundle verifies: " + std::to_string(validity(code, 0)));
+    const auto bundle_info = info_of(code, 0);
+    require(value(bundle_info, "info-plist") != 0 && f.cf.utf8(value(bundle_info, "format")).starts_with("app bundle with "),
+            "a bundle's Info.plist and format");
+    f.release(bundle_info);
+    f.release(code);
+    write(bundle / "Contents" / "Resources" / "note.txt", std::vector<std::uint8_t>{'x'});
+    code = static_code(bundle);
+    require(f.status("_SecStaticCodeCheckValidityWithErrors", {code, 0, 0, errors}) == codesign::cs::bad_resource, "an altered resource");
+    const auto user_info = f.core("_CFErrorCopyUserInfo", {f.engine.read64(errors)});
+    require(value(user_info, "SecCSResourceAltered") != 0, "kSecCFErrorResourceAltered names it");
+    f.release(user_info);
+    f.release(f.engine.read64(errors));
+    require(validity(code, 4) == 0, "kSecCSDoNotValidateResources skips them");
+    f.release(code);
+    fs::remove(bundle / "Contents" / "Resources" / "note.txt");
+    code = static_code(bundle);
+    require(validity(code, 0) == codesign::cs::bad_resource, "a missing resource");
+    f.release(code);
+    write(bundle / "Contents" / "Info.plist", std::vector<std::uint8_t>(plist.begin(), plist.end() - 1));
+    code = static_code(bundle);
+    require(validity(code, 4) == codesign::cs::info_plist_failed, "a modified Info.plist");
+    f.release(code);
+
+    // 3. A Developer ID signed application (QLab in the Alchemy root, when present): the CMS signature, the chain to
+    //    Apple Root CA, the sealed resources and nested code.
+    auto qlab = alchemy::default_alchemy_root() / "Applications" / "QLab.app";
+    for (auto dir = fs::current_path(); !fs::exists(qlab) && dir.has_relative_path(); dir = dir.parent_path())
+        qlab = dir / "artifacts" / "alchemy-root" / "Applications" / "QLab.app";
+    if (fs::exists(qlab)) {
+        code = static_code(qlab);
+        require(validity(code, 0) == 0, "QLab's signature verifies: " + std::to_string(validity(code, 0)));
+        const auto signed_info = info_of(code, 2);
+        require(f.cf.utf8(value(signed_info, "identifier")) == "com.figure53.QLab.5" && f.cf.utf8(value(signed_info, "teamid")) == "7672N4CCJM",
+                "QLab's identifier and team");
+        const auto certificates = value(signed_info, "certificates");
+        require(certificates && f.cf.length(certificates) == 3, "the signing chain");
+        const auto root = f.s("_SecCertificateCopyData", {f.cf.element(certificates, 2)});
+        const auto root_sha = sec::digest("SHA256", sec::bridge()->bytes(root));
+        require(root_sha && codesign::is_apple_root(*sec::Certificate::parse(sec::bridge()->bytes(root))), "the chain ends at Apple Root CA");
+        require(value(signed_info, "signing-time") != 0, "the signing time");
+        f.release(root);
+        f.release(signed_info);
+        const auto requirement_info = info_of(code, 4);
+        require(f.cf.utf8(value(requirement_info, "requirements")).starts_with("designated => ") &&
+                value(requirement_info, "designated-requirement") != 0 && value(requirement_info, "entitlements-dict") != 0,
+                "QLab's requirements and entitlements");
+        f.release(requirement_info);
+        const auto qlab_designated = f.cell();
+        require(f.status("_SecCodeCopyDesignatedRequirement", {code, 0, qlab_designated}) == 0 &&
+                f.status("_SecStaticCodeCheckValidity", {code, 0, f.engine.read64(qlab_designated)}) == 0, "QLab satisfies its designated requirement");
+        f.release(f.engine.read64(qlab_designated));
+        require(satisfies(code, "anchor apple generic and certificate leaf[subject.OU] = \"7672N4CCJM\"") == 0, "the Developer ID team");
+        require(satisfies(code, "anchor apple") == codesign::cs::requirement_failed, "QLab is not Apple's own code");
+        require(satisfies(code, "certificate leaf[subject.OU] = OTHERTEAM") == codesign::cs::requirement_failed, "another team");
+        require(validity(code, 8) == 0, "nested code verifies deeply against its recorded requirements");
+        f.release(code);
+        std::cout << "code signing: QLab verified (CMS, Apple Root CA, resources, nested code)\n";
+    } else {
+        std::cout << "code signing: no QLab in the Alchemy root, the Developer ID check skipped\n";
+    }
+
+    // 4. Running code and guests.
+    const auto self = f.cell();
+    require(f.status("_SecCodeCopySelf", {0, self}) == 0 && f.engine.read64(self), "SecCodeCopySelf");
+    require(f.status("_SecCodeCheckValidity", {f.engine.read64(self), 0, 0}) == codesign::cs::unimplemented, "running code is not validated");
+    f.release(f.engine.read64(self));
+    const auto attributes = [&](std::string_view key, Address object) {
+        const auto name = f.cf.string(key);
+        const auto dictionary = sec::bridge()->dictionary({{name, object}});
+        f.release(name);
+        return dictionary;
+    };
+    const auto guest = f.cell();
+    const auto missing_pid = attributes("pid", sec::bridge()->number(999999));
+    require(f.status("_SecCodeCopyGuestWithAttributes", {0, missing_pid, 0, guest}) == codesign::cs::no_such_code, "no such guest");
+    const auto odd = attributes("color", sec::bridge()->number(1));
+    require(f.status("_SecCodeCopyGuestWithAttributes", {0, odd, 0, guest}) == codesign::cs::unsupported_guest_attributes, "unsupported attributes");
+    f.release(missing_pid);
+    f.release(odd);
+    fs::remove_all(temp);
     const auto message = f.s("_SecCopyErrorMessageString", {static_cast<Address>(static_cast<std::uint32_t>(sec::status::item_not_found)), 0});
     require(message && f.cf.utf8(message).find("could not be found") != std::string::npos, "SecCopyErrorMessageString(errSecItemNotFound)");
     f.release(message);

@@ -29,6 +29,8 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/security/keychain.cpp
     src/alchemy/darwin/security/secure_transport.cpp
     src/alchemy/darwin/security/code_signing.cpp
+    src/alchemy/darwin/security/code_signature.cpp
+    src/alchemy/darwin/security/code_requirements.cpp
     src/alchemy/darwin/security/common_crypto.cpp
     src/alchemy/darwin/security/security.cpp
     src/alchemy/darwin/security/gss.cpp

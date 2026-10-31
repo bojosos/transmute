@@ -126,8 +126,8 @@ struct FoundationBridge::Impl {
             method(cls, "isEqual:", [this](auto& state, auto&) { state.x[0] = state.x[2] && cf.equal(state.x[0], state.x[2]); });
             method(cls, "hash", [this](auto& state, auto&) { state.x[0] = cf.hash(state.x[0]); });
             method(cls, "copy", [this](auto& state, auto&) { state.x[0] = cf.copy(state.x[0]); });
+            // The zone is ignored, as Foundation ignores it.
             method(cls, "copyWithZone:", [this](auto& state, auto&) {
-                if (state.x[2]) throw std::runtime_error("Foundation bridge: custom allocation zones are unsupported");
                 state.x[0] = cf.copy(state.x[0]);
             });
         }
