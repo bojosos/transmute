@@ -2294,7 +2294,11 @@ void register_host_entry(std::uint64_t guest_pc, const void* host_code) {
 //   lea rcx, [ctx]; mov rdx, user; mov rax, callback; call rax
 //   ts->fp_host = 0; MXCSR = state(ctx.fpcr, ctx.fpsr); ctx.fpsr &= ~mirrored
 //   cmp [pc], rbx; jne -> jmp [stub_indirect]          (callback moved pc)
+//   interrupt_pending ? pc = x30, exit(interrupt)       (a stop requested meanwhile)
 //   mov rbx, [x30]; RSB top == rbx ? pop, jmp entry : pc = rbx, jmp [stub_indirect]
+// The interrupt poll: the caller's continuation is no safe point (only region
+// starts and loop headers check), so without it a thread that returns from a
+// host call after a stop request runs guest code on.
 namespace {
 
 const void* host_callback_code(HostCallback callback, void* user) {
@@ -2311,10 +2315,12 @@ const void* host_callback_code(HostCallback callback, void* user) {
     a.mov_imm64(Gp::rax, reinterpret_cast<std::uint64_t>(callback));
     a.call(Gp::rax);
     rt::emit_fp_state_from_context(a, ptr(Gp::rsp, 8), rt::kThreadFpHostOffset);
-    const x64::Label redirect = a.new_label(), miss = a.new_label();
+    const x64::Label redirect = a.new_label(), miss = a.new_label(), interrupt = a.new_label();
     a.cmp(64, Gp::rbx, field(offsetof(GuestContext, pc)));
     a.jcc(x64::Cond::ne, redirect);
     a.mov(64, Gp::rbx, ptr(Gp::r15, x_disp(30)));
+    a.cmp(32, field(offsetof(GuestContext, interrupt_pending)), 0);
+    a.jcc(x64::Cond::ne, interrupt);
     a.mov(32, Gp::rax, field(offsetof(GuestContext, rsb_top)));
     a.sub(32, Gp::rax, 1);
     a.and_(32, Gp::rax, static_cast<std::int32_t>(kRsbEntries - 1));
@@ -2329,6 +2335,11 @@ const void* host_callback_code(HostCallback callback, void* user) {
     a.mov(64, field(offsetof(GuestContext, pc)), Gp::rbx);
     a.bind(redirect);
     a.jmp(field(offsetof(GuestContext, stub_indirect)));   // flushed state: loads them on a hit
+    a.bind(interrupt);   // flushed state (rbx was reused): the dispatcher exit that stores nothing
+    a.mov(64, field(offsetof(GuestContext, pc)), Gp::rbx);
+    a.mov(32, field(offsetof(GuestContext, exit_reason)), static_cast<std::int32_t>(ExitReason::interrupt));
+    a.mov_imm64(Gp::rax, reinterpret_cast<std::uint64_t>(rt::g_stubs.dispatch_exit));
+    a.jmp(Gp::rax);
     a.finalize();
     void* code = rt::arena_allocate(a.size(), 16);
     std::memcpy(code, a.data(), a.size());
@@ -2349,6 +2360,7 @@ void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void*
 // entry covers it). It is installed without an adapter; the callback's own
 // entry, behind its adapter, is the fallback.
 //   [mov [x31], sp's host]; lea rcx, [ctx]; mov rax, leaf; call rax; test al, al; jz fallback
+//   interrupt_pending ? pc = x30, exit(interrupt)   (as host_callback_code)
 //   RSB top == x30 ? pop, jmp entry : pc = x30, jmp [stub_indirect_live]
 void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user) {
     register_host_leaf(guest_pc, reinterpret_cast<HostLeafWithData>(leaf), nullptr, callback, user);   // rdx ignored
@@ -2374,7 +2386,7 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* lea
     }
     const int lr_host = (conv.guest_mask >> 30) & 1u ? conv.host[30] : -1;
     x64::Assembler a(128);
-    const x64::Label slow = a.new_label(), miss = a.new_label(), data = a.new_label();
+    const x64::Label slow = a.new_label(), miss = a.new_label(), interrupt = a.new_label(), data = a.new_label();
     if ((conv.guest_mask >> 31) & 1u)   // sp for the leaf (Darwin's stack probe)
         a.mov(64, ptr(Gp::r15, x_disp(31)), x64::gp(static_cast<unsigned>(conv.host[31])));
     a.lea(64, Gp::rcx, ptr(Gp::r15, -kContextBias));
@@ -2386,6 +2398,8 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* lea
     Gp x30 = Gp::r8;   // x30: in its convention host (kept by the call), else its context slot
     if (lr_host >= 0) x30 = x64::gp(static_cast<unsigned>(lr_host));
     else a.mov(64, x30, ptr(Gp::r15, x_disp(30)));
+    a.cmp(32, field(offsetof(GuestContext, interrupt_pending)), 0);   // as host_callback_code
+    a.jcc(x64::Cond::ne, interrupt);
     a.mov(32, Gp::rax, field(offsetof(GuestContext, rsb_top)));
     a.sub(32, Gp::rax, 1);
     a.and_(32, Gp::rax, static_cast<std::int32_t>(kRsbEntries - 1));
@@ -2398,6 +2412,10 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* lea
     a.bind(miss);
     a.mov(64, field(offsetof(GuestContext, pc)), x30);
     a.jmp(field(offsetof(GuestContext, stub_indirect_live)));
+    a.bind(interrupt);   // live state: stub_dispatch_exit stores the convention registers
+    a.mov(64, field(offsetof(GuestContext, pc)), x30);
+    a.mov(32, field(offsetof(GuestContext, exit_reason)), static_cast<std::int32_t>(ExitReason::interrupt));
+    a.jmp(field(offsetof(GuestContext, stub_dispatch_exit)));
     a.bind(slow);
     a.jmp(x64::rip(data));
     a.align(8);

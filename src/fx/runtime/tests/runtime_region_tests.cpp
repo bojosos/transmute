@@ -1024,6 +1024,65 @@ bool divide_by(GuestContext& ctx, void* data) {
 }
 } // namespace
 
+namespace {
+// Request an interrupt on their own thread, as a process stop reaches a
+// thread blocked in a host call: it sets x0 (1000 from the callback, 2000
+// from the leaf).
+void interrupting_callback(GuestContext& ctx, void* user) {
+    ++*static_cast<int*>(user);
+    request_interrupt(ctx, [](GuestContext& c) { c.x[0] = 1000; });
+}
+bool interrupting_leaf(GuestContext& ctx, void* data) {
+    ++*static_cast<int*>(data);
+    request_interrupt(ctx, [](GuestContext& c) { c.x[0] = 2000; });
+    return true;
+}
+} // namespace
+
+// A synthetic call's native entry (callback or leaf) checks
+// interrupt_pending before it returns into translated code: an interrupt
+// requested during the call runs before the caller's continuation.
+FX_TEST(host_entries_poll_interrupts_before_returning) {
+    init();
+    GuestCode code({});
+    const auto pm = code.at(0), cont = code.at(2), callee = code.at(16);
+    set_region_factory(pm, [&](std::uint64_t) {   // M: bl callee; x0 += 100; ret
+        RegionBuilder b(pm);
+        b.entry(pm);
+        auto& a = b.as();
+        a.mov(64, Gp::rax, ptr(Gp::r15, x_disp(30)));
+        a.mov(64, ptr(Gp::r15, x_disp(19)), Gp::rax);
+        const Label continuation = a.new_label();
+        b.call(cont, continuation, callee);
+        a.bind(continuation);
+        b.entry(cont);
+        add_x0(b, 100);
+        a.mov(64, Gp::rax, ptr(Gp::r15, x_disp(19)));
+        a.mov(64, ptr(Gp::r15, x_disp(30)), Gp::rax);
+        b.ret(9);
+        b.cover(pm, pm + 12);
+        return b.finish();
+    });
+    GuestContext& ctx = ensure_thread_context();
+    int calls = 0;
+    CallbackLog log;
+    for (const bool leaf : {false, true}) {
+        if (leaf) register_host_leaf(callee, &interrupting_leaf, &calls, &host_callback, &log);
+        else register_host_callback(callee, &interrupting_callback, &calls);
+        for (int run = 0; run < 3; ++run) {
+            const auto s0 = runtime_stats();
+            ctx.x[0] = 5;
+            call_guest_prepared(ctx, pm);
+            FX_CHECK_EQ(ctx.x[0], leaf ? 2100u : 1100u);   // the interrupt, then x0 += 100
+            FX_CHECK_EQ(delta(s0, runtime_stats()).exits[static_cast<unsigned>(ExitReason::interrupt)], 1u);
+        }
+        unregister_host_entry(callee);
+    }
+    FX_CHECK_EQ(calls, 6);
+    FX_CHECK_EQ(log.calls, 0);
+    set_region_factory(pm, nullptr);
+}
+
 // register_host_leaf with leaf data: the leaf gets its data pointer.
 FX_TEST(host_leaf_gets_its_data) {
     init();
