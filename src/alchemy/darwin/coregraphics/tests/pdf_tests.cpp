@@ -315,6 +315,104 @@ void cgpdf(Fixture& f, const std::string& file) {
     require(f.id(cg, "_CGPDFDocumentCreateWithProvider", {junk}) == 0, "not a PDF");
 }
 
+// PDF contexts: two pages drawn and written, then read back with the reader.
+void writing(Fixture& f) {
+    const auto key = [&f](const char* name) { return f.engine.read64(f.symbol(cg, std::string("_kCGPDFContext") + name)); };
+    const auto rect = [&f](double x, double y, double w, double h) {
+        const auto at = f.allocate(32);
+        const std::array<double, 4> v{x, y, w, h};
+        for (std::size_t i = 0; i < 4; ++i) f.engine.write64(at + i * 8, std::bit_cast<std::uint64_t>(v[i]));
+        return at;
+    };
+    // A password asks for encryption, which is not provided: no context.
+    const auto locked = f.cf.dictionary(std::vector<std::pair<Address, Address>>{{key("UserPassword"), f.str("secret")}});
+    const auto sink = f.id(cg, "_CGDataConsumerCreateWithCFData", {f.id(cf_library, "_CFDataCreateMutable", {0, 0})});
+    require(f.id(cg, "_CGPDFContextCreate", {sink, 0, locked}) == 0, "an encrypted PDF context is refused");
+
+    const auto data = f.id(cf_library, "_CFDataCreateMutable", {0, 0});
+    const auto consumer = f.id(cg, "_CGDataConsumerCreateWithCFData", {data});
+    const auto info = f.cf.dictionary(std::vector<std::pair<Address, Address>>{{key("Title"), f.str("Report")}, {key("Author"), f.str("Ann")}});
+    const auto context = f.id(cg, "_CGPDFContextCreate", {consumer, rect(0, 0, 200, 100), info});
+    require(context != 0, "CGPDFContextCreate");
+    f.call(cg, "_CGContextBeginPage", {context, rect(0, 0, 200, 100)});
+    f.call(cg, "_CGContextSetRGBFillColor", {context}, {1, 0, 0, 0.5});
+    f.call(cg, "_CGContextFillRect", {context}, {10, 10, 50, 30});
+    f.call(cg, "_CGContextSetRGBStrokeColor", {context}, {0, 0, 1, 1});
+    f.call(cg, "_CGContextSetLineWidth", {context}, {2});
+    f.call(cg, "_CGContextStrokeRect", {context}, {5, 5, 190, 90});
+    // A gradient whose second stop is half transparent, clipped.
+    f.call(cg, "_CGContextSaveGState", {context});
+    f.call(cg, "_CGContextClipToRect", {context}, {0, 0, 100, 100});
+    const auto space = f.id(cg, "_CGColorSpaceCreateDeviceRGB");
+    const auto components = f.allocate(64);
+    const std::array<double, 8> colours{1, 0, 0, 1, 0, 0, 1, 0.5};
+    for (std::size_t i = 0; i < colours.size(); ++i) f.engine.write64(components + i * 8, std::bit_cast<std::uint64_t>(colours[i]));
+    const auto gradient = f.id(cg, "_CGGradientCreateWithColorComponents", {space, components, 0, 2});
+    f.call(cg, "_CGContextDrawLinearGradient", {context, gradient, 0}, {0, 0, 100, 0});
+    f.call(cg, "_CGContextRestoreGState", {context});
+    // A 2 x 2 image.
+    Canvas pixels(f, 2, 2);
+    pixels.rgb_fill(0, 1, 0, 1);
+    pixels.fill(0, 0, 2, 2);
+    const auto image = f.id(cg, "_CGBitmapContextCreateImage", {pixels.context});
+    f.call(cg, "_CGContextDrawImage", {context, image}, {120, 20, 40, 40});
+    // A link and a destination.
+    const auto url = f.cf.file_url("/tmp/report.pdf", false);
+    require(url != 0, "a file URL");
+    f.call(cg, "_CGPDFContextSetURLForRect", {context, url}, {10, 10, 50, 30});
+    f.call(cg, "_CGPDFContextAddDestinationAtPoint", {context, f.str("top")}, {0, 100});
+    f.call(cg, "_CGContextEndPage", {context});
+    // A second page with its own media box.
+    const auto box = f.id(cf_library, "_CFDataCreate", {0, rect(0, 0, 300, 300), 32});
+    f.call(cg, "_CGPDFContextBeginPage", {context, f.cf.dictionary(std::vector<std::pair<Address, Address>>{{key("MediaBox"), box}})});
+    f.call(cg, "_CGContextFillRect", {context}, {0, 0, 10, 10});
+    f.call(cg, "_CGPDFContextEndPage", {context});
+    f.call(cg, "_CGPDFContextClose", {context});
+    f.call(cg, "_CGContextRelease", {context});
+
+    const auto length = f.id(cf_library, "_CFDataGetLength", {data});
+    const auto written = f.read(f.id(cf_library, "_CFDataGetBytePtr", {data}), length);
+    std::string error;
+    const auto document = pdf::Document::open(std::make_shared<const std::vector<std::uint8_t>>(written), &error);
+    require(document != nullptr, "the written PDF opens: " + error);
+    require(!document->reconstructed() && document->pages().size() == 2, "two pages and a valid cross-reference table");
+    const auto media = [&](std::size_t page) {
+        std::vector<double> out;
+        for (const auto& value : document->get(document->pages()[page], "MediaBox")->array) out.push_back(value->number_value());
+        return out;
+    };
+    require(media(0) == std::vector<double>{0, 0, 200, 100} && media(1) == std::vector<double>{0, 0, 300, 300}, "media boxes");
+    const auto title = document->get(document->info(), "Title");
+    require(title && title->text == "Report" && document->get(document->info(), "Author")->text == "Ann", "the information dictionary");
+    const auto contents = document->get(document->pages()[0], "Contents");
+    const auto content = document->stream_data(*contents);
+    require(content.has_value(), "page content decodes");
+    const std::string text(content->begin(), content->end());
+    for (const auto* expected : {"1 0 0 rg", "f\n", "0 0 1 RG", "2 w", "S\n", "W n", " sh\n", " Do\n", " gs\n"})
+        require(text.find(expected) != std::string::npos, std::string("page content has \"") + expected + "\":\n" + text);
+    // The image: 2 x 2 RGB, green.
+    const auto resources = document->get(document->pages()[0], "Resources");
+    const auto xobjects = document->get(resources, "XObject");
+    require(xobjects && xobjects->dictionary.entries.size() == 1, "one image");
+    const auto picture = document->resolve(xobjects->dictionary.entries[0].second);
+    const auto samples = document->stream_data(*picture);
+    require(samples && samples->size() == 12 && (*samples)[1] == 255 && (*samples)[0] == 0, "the image's samples");
+    // The half-transparent stop: a soft mask.
+    const auto states = document->get(resources, "ExtGState");
+    bool soft_mask = false;
+    for (const auto& [name, state] : states->dictionary.entries) soft_mask = soft_mask || document->get(document->resolve(state), "SMask");
+    require(soft_mask, "gradient alpha as a soft mask");
+    // The link and the destination.
+    const auto annotations = document->get(document->pages()[0], "Annots");
+    require(annotations && annotations->array.size() == 1, "a link annotation: " + std::string(annotations ? std::to_string(annotations->array.size()) : "none") + " in\n" +
+                std::string(written.begin(), written.end()));
+    const auto action = document->get(document->resolve(annotations->array[0]), "A");
+    const auto uri = document->get(action, "URI")->text;
+    require(uri.starts_with("file:") && uri.ends_with("/report.pdf"), "the link's URL: " + uri);
+    const auto destinations = document->get(document->catalog(), "Dests");
+    require(destinations && document->get(destinations, "top"), "the named destination");
+}
+
 } // namespace
 
 int main() {
@@ -326,6 +424,7 @@ int main() {
         Fixture f;
         cgpdf(f, classic_file(false));
         cgpdf(f, stream_file());
+        writing(f);
         std::cout << "pdf: ok\n";
         return 0;
     } catch (const std::exception& error) {

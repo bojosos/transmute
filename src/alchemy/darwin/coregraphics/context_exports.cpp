@@ -110,6 +110,7 @@ void Quartz::install_contexts() {
     function(cg, "_CGBitmapContextGetAlphaInfo", [bitmap](CpuState& s, GuestMemory&) { const auto c = bitmap(s.x[0]); s.x[0] = c ? c->layout.alpha() : 0; });
     function(cg, "_CGBitmapContextGetBitmapInfo", [bitmap](CpuState& s, GuestMemory&) { const auto c = bitmap(s.x[0]); s.x[0] = c ? c->layout.bitmap_info : 0; });
     context_function("_CGBitmapContextCreateImage", [this](CpuState& s, GuestMemory& m, ContextState& c) {
+        if (c.pdf) { s.x[0] = 0; return; }   // not a bitmap context
         auto bytes = std::make_shared<std::vector<std::uint8_t>>(static_cast<std::size_t>(c.layout.byte_size()));
         // Drawing inside an open transparency layer reaches the bitmap at its end (as on macOS).
         m.read_bytes(c.data, *bytes);
@@ -125,8 +126,10 @@ void Quartz::install_contexts() {
     context_function("_CGContextFlush", [this](CpuState&, GuestMemory&, ContextState& c) { synchronize(*this, c); });
     context_function("_CGContextSynchronize", [this](CpuState&, GuestMemory&, ContextState& c) { synchronize(*this, c); });
     // Page boundaries apply to PDF contexts; a bitmap context has one page.
-    context_function("_CGContextBeginPage", [](CpuState&, GuestMemory&, ContextState&) {});
-    context_function("_CGContextEndPage", [](CpuState&, GuestMemory&, ContextState&) {});
+    context_function("_CGContextBeginPage", [this](CpuState& s, GuestMemory&, ContextState& c) {
+        if (c.pdf) pdf_begin_page(*this, c, s.x[1] ? std::optional<Rect>(read_rect(s.x[1])) : std::nullopt);
+    });
+    context_function("_CGContextEndPage", [](CpuState&, GuestMemory&, ContextState& c) { if (c.pdf) pdf_end_page(c); });
 
     // ---- graphics state ----
     context_function("_CGContextSaveGState", [](CpuState&, GuestMemory&, ContextState& c) { save_state(c); });

@@ -549,6 +549,7 @@ std::shared_ptr<ContextState> context_state(Quartz& q, Address context) {
 
 void fill_path(Quartz& q, ContextState& c, const PathData& base_path, bool even_odd) {
     if (base_path.empty()) return;
+    if (c.pdf) { pdf_fill(q, c, base_path, even_odd); return; }
     const auto paint = prepare_paint(q, c, c.g.fill);
     const auto device_flip = flip(c);
     const auto geometry = make_geometry(base_path, device_flip, even_odd);
@@ -563,6 +564,7 @@ void fill_path(Quartz& q, ContextState& c, const PathData& base_path, bool even_
 
 void stroke_path(Quartz& q, ContextState& c, const PathData& base_path) {
     if (base_path.empty()) return;
+    if (c.pdf) { pdf_stroke(q, c, base_path); return; }
     const auto paint = prepare_paint(q, c, c.g.stroke);
     const auto& g = c.g;
     const auto inverse = g.ctm.inverse();
@@ -585,6 +587,7 @@ void stroke_path(Quartz& q, ContextState& c, const PathData& base_path) {
 
 void clip_to_path(Quartz& q, ContextState& c, const PathData& base_path, bool even_odd) {
     static_cast<void>(q);
+    if (c.pdf) { pdf_clip(c, base_path, even_odd); return; }
     auto item = std::make_shared<ClipItem>();
     item->antialias = antialiasing(c.g);
     if (base_path.empty()) {
@@ -604,6 +607,7 @@ void clip_to_path(Quartz& q, ContextState& c, const PathData& base_path, bool ev
 
 void draw_image(Quartz& q, ContextState& c, Address image, const Rect& rect) {
     if (!image || rect_is_empty(rect)) return;
+    if (c.pdf) { pdf_image(q, c, image, rect); return; }
     const auto info = q.require<ImageInfo>(image, "CGImage");
     auto pixels = q.image_pixels(image);
     if (!pixels || pixels->width == 0 || pixels->height == 0) return;
@@ -660,8 +664,8 @@ void draw_glyphs(Quartz& q, ContextState& c, const GlyphRunDraw& run_draw, Point
         return *outlines;
     };
     if (fills) {
-        if (!run_draw.matrix.is_identity()) {
-            // Font matrices are drawn as outlines.
+        if (!run_draw.matrix.is_identity() || c.pdf) {
+            // Font matrices (and all text in PDF contexts) are drawn as outlines.
             auto saved_fill = c.g.fill;
             if (color) { c.g.fill.color = *color; c.g.fill.pattern.reset(); }
             try { fill_path(q, c, outline_base(), false); } catch (...) { c.g.fill = saved_fill; throw; }
@@ -727,6 +731,7 @@ double user_extent(const ContextState& c, const Affine& user_to_device) {
 void draw_gradient(Quartz& q, ContextState& c, const GradientInfo& gradient, bool radial, Point start, double start_radius, Point end,
                    double end_radius, bool extend_start, bool extend_end) {
     if (gradient.stops.empty()) return;
+    if (c.pdf) { pdf_gradient(q, c, gradient, radial, start, start_radius, end, end_radius, extend_start, extend_end); return; }
     const auto user_to_device = c.g.ctm.then(flip(c));
     const auto opacity = c.g.alpha;
     if (!radial) {
@@ -828,6 +833,7 @@ void draw_gradient(Quartz& q, ContextState& c, const GradientInfo& gradient, boo
 }
 
 void clip_to_mask(Quartz& q, ContextState& c, const Rect& rect, Address mask) {
+    if (c.pdf) unsupported("clipping to a mask in a PDF context");
     const auto info = q.require<ImageInfo>(mask, "CGImage");
     const auto pixels = q.image_pixels(mask);
     // Image masks clip where they would paint; grayscale images clip with
@@ -862,6 +868,7 @@ void clip_to_mask(Quartz& q, ContextState& c, const Rect& rect, Address mask) {
 }
 
 void clear_rect(Quartz& q, ContextState& c, const Rect& rect) {
+    if (c.pdf) return;   // only bitmap and window contexts clear, as CoreGraphics documents
     PathData path;
     path.add_rect(c.g.ctm, rect);
     const auto saved = c.g;
@@ -880,6 +887,7 @@ void clear_rect(Quartz& q, ContextState& c, const Rect& rect) {
 
 void draw_tiled_image(Quartz& q, ContextState& c, Address image, const Rect& rect) {
     if (!image || rect_is_empty(rect)) return;
+    if (c.pdf) { pdf_tiled_image(q, c, image, rect); return; }
     const auto pixels = q.image_pixels(image);
     if (!pixels || pixels->width == 0 || pixels->height == 0) return;
     const auto r = standardize(rect);
@@ -926,6 +934,7 @@ void composite_layer(Quartz& q, ContextState& c, ContextState::Layer layer) {
 void begin_transparency_layer(Quartz& q, ContextState& c, const std::optional<Rect>& rect) {
     static_cast<void>(q);
     static_cast<void>(rect);   // the whole surface is the layer; drawing stays clipped
+    if (c.pdf) { pdf_begin_layer(c); return; }
     ContextState::Layer layer;
     layer.surface = std::make_shared<Surface>(c.layout.width, c.layout.height);
     layer.state = c.g;
@@ -937,6 +946,7 @@ void begin_transparency_layer(Quartz& q, ContextState& c, const std::optional<Re
 }
 
 void end_transparency_layer(Quartz& q, ContextState& c) {
+    if (c.pdf) { restore_state(q, c); return; }
     if (c.layers.empty()) return;   // unbalanced: ignored like CoreGraphics
     auto layer = std::move(c.layers.back());
     c.layers.pop_back();
@@ -962,6 +972,7 @@ void synchronize(Quartz& q, ContextState& c) { static_cast<void>(q); static_cast
 Image snapshot(Quartz& q, ContextState& c) {
     static_cast<void>(q);
     Image image;
+    if (!c.surface) return image;   // PDF contexts have no pixels
     image.width = c.layout.width;
     image.height = c.layout.height;
     const auto pixels = c.surface->read(full(c));

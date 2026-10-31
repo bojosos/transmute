@@ -504,6 +504,7 @@ struct Quartz : std::enable_shared_from_this<Quartz> {
     void install_appkit_drawing();
     void install_displays();   // displays.cpp
     void install_pdf();        // pdf_document.cpp (CGPDFDocument, CGPDFPage, the CGPDF objects and scanner)
+    void install_pdf_context();   // pdf_context.cpp (CGPDFContext)
 
     std::recursive_mutex mutex;
     Address shared_device_rgb{}, shared_device_gray{}, shared_srgb{};

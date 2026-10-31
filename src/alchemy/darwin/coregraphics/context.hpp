@@ -43,6 +43,13 @@ struct ClipItem {
     std::shared_ptr<const std::vector<std::uint8_t>> mask;   // surface-sized alpha (Kind::mask)
 };
 
+// A clip of a PDF context (pdf_context.cpp): the path in base space.
+struct PdfClip {
+    PathData path;
+    bool even_odd{};
+};
+struct PdfRecorder;   // a PDF context's document (pdf_context.cpp)
+
 struct GState {
     Affine ctm;
     std::vector<std::shared_ptr<const ClipItem>> clips;
@@ -62,6 +69,7 @@ struct GState {
     double character_spacing{};
     std::int32_t text_mode{text_mode::fill};
     Size pattern_phase{};
+    std::vector<std::shared_ptr<const PdfClip>> pdf_clips;   // PDF contexts: the clip paths
 };
 
 struct ContextState final : ObjectPayload {
@@ -84,6 +92,7 @@ struct ContextState final : ObjectPayload {
     };
     std::vector<Layer> layers;
     std::shared_ptr<Surface> scratch, coverage;   // complex compositing (lazily created)
+    std::shared_ptr<PdfRecorder> pdf;     // a PDF context: drawing is recorded, there is no surface
     bool destroyed{};
 };
 
@@ -118,5 +127,17 @@ void restore_state(Quartz& q, ContextState& c);
 void synchronize(Quartz& q, ContextState& c);
 // Straight RGBA8, top row first.
 [[nodiscard]] Image snapshot(Quartz& q, ContextState& c);
+
+// The drawing of PDF contexts (pdf_context.cpp), which the entry points above hand over to.
+void pdf_fill(Quartz& q, ContextState& c, const PathData& base_path, bool even_odd);
+void pdf_stroke(Quartz& q, ContextState& c, const PathData& base_path);
+void pdf_clip(ContextState& c, const PathData& base_path, bool even_odd);
+void pdf_image(Quartz& q, ContextState& c, Address image, const Rect& rect);
+void pdf_tiled_image(Quartz& q, ContextState& c, Address image, const Rect& rect);
+void pdf_gradient(Quartz& q, ContextState& c, const GradientInfo& gradient, bool radial, Point start, double start_radius, Point end,
+                  double end_radius, bool extend_start, bool extend_end);
+void pdf_begin_layer(ContextState& c);
+void pdf_begin_page(Quartz& q, ContextState& c, std::optional<Rect> media);
+void pdf_end_page(ContextState& c);
 
 } // namespace alchemy::gui::quartz2d

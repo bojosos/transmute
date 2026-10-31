@@ -61,8 +61,20 @@ strings and dates included), content streams, resources, operator tables
 and scanners are real. The CGPDFObjectType, CGPDFBox and CGPDFDataFormat
 values follow their documented order (unverified). Not provided:
 decrypting encrypted documents (they stay locked; their structure reads),
-CGContextDrawPDFPage (stops explicitly), the document outline, access
-permissions, and PDF writing (CGPDFContextCreate returns NULL).
+CGContextDrawPDFPage (stops explicitly), the document outline and access
+permissions.
+
+**PDF writing** (`pdf_context.cpp`, `pdf/pdf_writer.cpp`): CGPDFContext
+records CGContext drawing as PDF pages: filled and stroked paths (strokes
+under the CTM), DeviceRGB colours with alpha and the blend modes PDF has,
+path clipping, images (alpha as soft masks, image masks in the fill
+colour, tiling), text as glyph outlines (not searchable), gradients as
+shadings (alpha as a soft mask), pages with their boxes, the information
+dictionary, XMP metadata, URL links and named destinations. Not provided:
+encryption and PDF/A (creation fails and says why), shadows (not drawn),
+pattern paint and mask clipping (stop explicitly), transparency layers as
+groups (drawn directly), output intents and linearization (a diagnostic
+says they are not written).
 
 ## Moved from darwin/identities/
 

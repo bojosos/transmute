@@ -456,9 +456,6 @@ void GraphicsGaps::install_core_graphics() {
     constant(core_graphics, "__CGSDefaultConnection", 0);
     for (const auto* name : {"_CGSSetWindowAlpha", "_CGSSetWindowTransform", "_CGSSetWindowWarp", "_CGSSetDenyWindowServerConnections"})
         failure(core_graphics, name, cg_invalid_connection);
-    // PDF writing: no PDF writer (reading is coregraphics/pdf_document.cpp).
-    constant(core_graphics, "_CGPDFContextCreate", 0);
-    raw(core_graphics, "_CGPDFContextClose", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGPDFContextClose"); });
     // Keys.
     for (const auto* name : {"kCGDisplayStreamColorSpace", "kCGDisplayStreamDestinationRect", "kCGDisplayStreamMinimumFrameTime",
                              "kCGDisplayStreamPreserveAspectRatio", "kCGDisplayStreamShowCursor", "kCGWindowBounds",
