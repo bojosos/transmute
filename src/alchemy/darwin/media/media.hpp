@@ -9,9 +9,9 @@
 // and the AVFoundation asset/format/audio-unit classes are the QLab media
 // group's (src/alchemy/darwin/kit/completion/media), installed earlier.
 //
-// Alchemy has no camera, hardware or software video codec and no audio
-// component (audio unit): capture device lists are empty, codec sessions
-// cannot be created and the documented error codes say so. The data types
+// Alchemy has no hardware video codec, no H.264/HEVC codec and no audio
+// component (audio unit): those codec sessions cannot be created and the
+// documented error codes say so. Capture devices are av_capture.cpp's. The data types
 // that need no device are real (CMTime arithmetic, CMBlockBuffer,
 // CMFormatDescription including H.264 parameter sets and audio descriptions,
 // CMSampleBuffer with audio buffer lists, caption appearance defaults).

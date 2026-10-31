@@ -16,7 +16,9 @@
 // cannot be changed from here; nominal sample rates are the endpoint's own
 // rate (shared mode cannot change it). The I/O buffer frame size is a
 // per-process setting kept as set. Output devices play through a Backend
-// output stream (hal_io.hpp runs the IOProcs); input devices have no I/O.
+// output stream (hal_io.hpp runs the IOProcs). Input devices capture through a
+// Backend input stream for AVAudioEngine's input node and AVFoundation capture;
+// their IOProcs have no I/O.
 
 #include <cstdint>
 #include <functional>
@@ -70,12 +72,27 @@ public:
     virtual void stop() = 0;
 };
 
+// Hands `frames` interleaved float frames captured in the device's channels and rate, with the
+// host time (nanoseconds) they were taken at. Called on a thread of the stream.
+using Capture = std::function<void(const float* samples, std::uint32_t frames, std::uint64_t time_ns)>;
+
+// A device's input stream: capture runs between start and stop (stop waits for it).
+class InputStream {
+public:
+    virtual ~InputStream() = default;
+    virtual bool start() = 0;
+    virtual void stop() = 0;
+};
+
 class Backend {
 public:
     virtual ~Backend() = default;
     virtual Snapshot snapshot() = 0;
     // An output stream on `device` (an output device of the snapshot), or nullptr.
     virtual std::unique_ptr<OutputStream> open_output(const Device&, Render) { return nullptr; }
+    // An input stream on `device` (an input device of the snapshot), or nullptr (none, or the host's
+    // privacy settings deny the microphone).
+    virtual std::unique_ptr<InputStream> open_input(const Device&, Capture) { return nullptr; }
 };
 
 struct Address {

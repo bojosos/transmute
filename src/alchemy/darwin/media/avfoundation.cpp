@@ -17,7 +17,7 @@
 
 // AVFoundation assets, asset readers, audio formats and audio-unit classes,
 // and CoreAudioKit's AUGenericView (QLab gap group G5). The capture classes
-// are src/alchemy/darwin/media/video.cpp's.
+// are av_capture.cpp's.
 //
 // - AVURLAsset/AVAsset: file URLs whose audio Alchemy can read (linear PCM
 //   WAVE, AIFF/AIFC, CAF: audio_file_core.hpp; MP3, FLAC, Ogg Opus and MP4
@@ -1588,6 +1588,7 @@ void install_av_foundation(Support& support) {
     }
     install_av_player(support);
     install_av_sample_buffer_renderers(support);
+    install_av_capture(support);
 }
 
 } // namespace alchemy::gui::completion_kit::media

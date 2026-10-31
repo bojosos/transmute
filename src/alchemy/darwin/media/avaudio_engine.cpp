@@ -1,4 +1,5 @@
 #include "alchemy/darwin/media/avaudio.hpp"
+#include "alchemy/darwin/media/hal_core.hpp"
 #include "alchemy/darwin/media/hal_io.hpp"
 #include "alchemy/darwin/media/resampler.hpp"
 #include "alchemy/darwin/media/avaudio_effects.hpp"
@@ -64,9 +65,14 @@
 //   by each input's reverbBlend when the reverb is enabled. Inputs of more channels mix unplaced.
 // - Render and receiver blocks, and the input block, run under the engines' lock: one that calls
 //   back into the engine or its nodes waits forever (Apple's documentation forbids such calls).
-// - Unavailable, as documented: there is no input device, so -startAndReturnError: fails with an
-//   error while the input node feeds the graph outside manual rendering, and the input node's
-//   formats are nil there. Without an output device -startAndReturnError: fails with an error. A tap on a player whose format's rate
+// - The input node is the default input device (hal_open_input: the host's microphone, silent in
+//   cloaked runs) outside manual rendering: its output format is the device's, and while it feeds
+//   the graph, -startAndReturnError: opens the device and -stop closes it. Captured audio waits in a
+//   buffer of at most 200 ms (the oldest is dropped) and is resampled to the engine's rate.
+// - Unavailable, as documented: with no input device, or when the host's privacy settings refuse
+//   the microphone, -startAndReturnError: fails with an error while the input node feeds the graph
+//   (no authorization prompt is shown), and the input node's formats are nil without a device.
+//   Without an output device -startAndReturnError: fails with an error. A tap on a player whose format's rate
 //   is not the engine's stops with a message.
 namespace alchemy::gui::completion_kit::media::avaudio {
 namespace {
@@ -266,6 +272,28 @@ struct SequencerState final : ObjectPayload {
 };
 struct TrackView final : ObjectPayload { std::shared_ptr<SequencerState> sequencer; std::int64_t index{-1}; };   // -1: the tempo track
 
+// Audio from the input device, filled on its capture thread and drained by renders.
+struct InputRing {
+    std::mutex mutex;
+    std::deque<float> samples;         // interleaved
+    std::uint32_t channels{1};
+    double rate{48000};
+    void push(const float* data, std::uint32_t frames) {
+        std::lock_guard lock(mutex);
+        samples.insert(samples.end(), data, data + static_cast<std::size_t>(frames) * channels);
+        const auto limit = static_cast<std::size_t>(rate / 5) * channels;
+        if (samples.size() > limit) samples.erase(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(samples.size() - limit));
+    }
+    // `frames` frames into `out` (silence for what has not arrived).
+    void pop(double* out, std::size_t frames) {
+        std::lock_guard lock(mutex);
+        const auto count = std::min(samples.size(), frames * channels);
+        std::copy_n(samples.begin(), count, out);
+        std::fill(out + count, out + frames * channels, 0.0);
+        samples.erase(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(count));
+    }
+};
+
 struct EngineState final : ObjectPayload {
     Address output{}, mixer{}, input{};   // retained
     std::vector<Address> attached;     // retained (the output, mixer and input nodes too)
@@ -284,6 +312,9 @@ struct EngineState final : ObjectPayload {
     Address manual_block{};            // the manualRenderingBlock (made once)
     Address input_format{}, input_block{};   // retained / _Block_copy'd (the input node's audio)
     af::Pcm input_pcm;
+    // The input device outside manual rendering (opened by start while the input node feeds the graph).
+    std::unique_ptr<hal::InputStream> input_stream;
+    std::shared_ptr<InputRing> input_ring;
 };
 
 // Work to hand the callback thread after a render.
@@ -316,6 +347,7 @@ private:
     void disconnect_output(Address engine, Address node);
     Address output_format(Address node);   // not retained; may be 0
     bool start(Address engine, Address error_out);
+    bool open_input(EngineState& e);
     void stop(Address engine);
     void stop_player(Address node, bool clear);
     void post(const std::shared_ptr<EngineState>& e, std::vector<Callback> callbacks, std::vector<TapDelivery> taps);
@@ -326,7 +358,7 @@ private:
                              std::vector<Callback>& callbacks, std::vector<TapDelivery>& taps);
     void render_player(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate, std::vector<Callback>& callbacks);
     void render_source(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate, double sample_time);
-    void render_input(Node& n, double* out, std::uint32_t frames, std::uint32_t channels);
+    void render_input(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate);
     // One render cycle: the output node's frames, then the sink nodes' deliveries.
     std::vector<double> cycle(EngineState& e, std::uint32_t frames, std::uint32_t channels, double rate,
                               std::vector<Callback>& callbacks, std::vector<TapDelivery>& taps);
@@ -548,12 +580,33 @@ void Engines::disconnect_output(Address engine_object, Address node_object) {
     for (const auto object : released) support_.release(object);
 }
 
+bool Engines::open_input(EngineState& e) {
+    {
+        std::lock_guard lock(mutex_);
+        if (e.input_stream) return true;
+    }
+    const auto device = hal_default_input();
+    const auto devices = hal_input_devices();
+    const auto found = std::find_if(devices.begin(), devices.end(), [&](const HalInputDevice& d) { return d.id == device; });
+    if (!device || found == devices.end()) return false;
+    auto ring = std::make_shared<InputRing>();
+    ring->channels = found->channels;
+    ring->rate = found->rate;
+    auto stream = hal_open_input(device, [ring](const float* samples, std::uint32_t frames, std::uint64_t) { ring->push(samples, frames); });
+    if (!stream || !stream->start()) return false;
+    std::lock_guard lock(mutex_);
+    e.input_stream = std::move(stream);
+    e.input_ring = std::move(ring);
+    return true;
+}
+
 bool Engines::start(Address engine_object, Address error_out) {
     auto e = engine(engine_object);
     const auto fail_with = [&](std::int32_t status, std::string_view text) {
         if (error_out) bridge_->store_error(error_out, bridge_->os_status_error(status, text), true);
         return false;
     };
+    bool needs_input = false;
     {
         std::lock_guard lock(mutex_);
         if (e->running) return true;
@@ -566,11 +619,15 @@ bool Engines::start(Address engine_object, Address error_out) {
             for (const auto other : e->attached)
                 if (const auto o = support_.objc.find_host_state<Node>(other))
                     for (const auto& [bus, source] : o->inputs)
-                        if (source == e->input) return fail_with(no_device, "AVAudioEngine: there is no audio input device under Alchemy");
+                        if (source == e->input) needs_input = true;
+        // A tap on the input node alone runs the input too (speech recognisers do this).
+        if (const auto in = e->input ? support_.objc.find_host_state<Node>(e->input) : nullptr; in && in->tap) needs_input = true;
     }
     static_cast<void>(output_node(engine_object));
     static_cast<void>(device_format(*e));
     if (!e->io) return fail_with(no_device, "AVAudioEngine: there is no audio output device");
+    if (needs_input && !open_input(*e))
+        return fail_with(no_device, "AVAudioEngine: the audio input device did not open (there is none, or the host's privacy settings refuse the microphone)");
     if (!e->thread) e->thread = start_completion_thread(support_.process, "com.apple.avfaudio.engine.callbacks");
     const auto owner = shared_from_this();
     const auto rate = e->io->rate();
@@ -583,8 +640,14 @@ bool Engines::start(Address engine_object, Address error_out) {
         owner->render(engine_object, mix, frames, channels, rate);
     }, hal_buffer_frames(hal_default_output()));
     if (status) {
-        std::lock_guard lock(mutex_);
-        e->running = false;
+        std::unique_ptr<hal::InputStream> input;
+        {
+            std::lock_guard lock(mutex_);
+            e->running = false;
+            input = std::move(e->input_stream);
+            e->input_ring.reset();
+        }
+        if (input) input->stop();
         return fail_with(status, "AVAudioEngine: the output device did not start");
     }
     return true;
@@ -593,12 +656,16 @@ bool Engines::start(Address engine_object, Address error_out) {
 void Engines::stop(Address engine_object) {
     auto e = engine(engine_object);
     std::shared_ptr<hal_io::DeviceIo> io;
+    std::unique_ptr<hal::InputStream> input;
     {
         std::lock_guard lock(mutex_);
         e->running = false;
         io = e->io;
+        input = std::move(e->input_stream);
+        e->input_ring.reset();
     }
     if (io) io->stop(engine_object);
+    if (input) input->stop();
 }
 
 void Engines::post(const std::shared_ptr<EngineState>& e, std::vector<Callback> callbacks, std::vector<TapDelivery> taps) {
@@ -683,7 +750,7 @@ std::vector<double> Engines::pull(Address node_object, std::uint32_t frames, std
         render_source(*n, out.data(), frames, channels, rate, sample_time);
         break;
     case Kind::input:
-        render_input(*n, out.data(), frames, channels);
+        render_input(*n, out.data(), frames, channels, rate);
         break;
     case Kind::effect: {
         // The input in this node's channels (a mono input feeds every channel).
@@ -746,6 +813,14 @@ std::vector<double> Engines::cycle(EngineState& e, std::uint32_t frames, std::ui
     input_short_ = false;
     advance_sequencers(e, frames, rate);
     auto out = pull(e.output, frames, channels, rate, e.sample_time, 0, callbacks, taps);
+    // An input node with a tap that feeds nothing is rendered for its tap.
+    if (const auto in = e.input ? support_.objc.find_host_state<Node>(e.input) : nullptr; in && in->tap) {
+        bool feeds = false;
+        for (const auto object : e.attached)
+            if (const auto o = support_.objc.find_host_state<Node>(object))
+                for (const auto& [bus, source] : o->inputs) feeds = feeds || source == e.input;
+        if (!feeds) static_cast<void>(pull(e.input, frames, in->tap->channels, rate, e.sample_time, 1, callbacks, taps));
+    }
     for (const auto object : e.attached) {
         const auto n = support_.objc.find_host_state<Node>(object);
         if (!n || n->kind != Kind::sink || !n->block || !n->inputs.contains(0)) continue;
@@ -846,9 +921,30 @@ void Engines::render_source(Node& n, double* out, std::uint32_t frames, std::uin
     n.resampler->render(out, frames, call);
 }
 
-void Engines::render_input(Node& n, double* out, std::uint32_t frames, std::uint32_t channels) {
+void Engines::render_input(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate) {
     std::fill(out, out + static_cast<std::size_t>(frames) * channels, 0.0);
     const auto e = n.engine ? support_.objc.find_host_state<EngineState>(n.engine) : nullptr;
+    if (e && !e->manual && e->input_ring) {
+        // The device's audio, in its channels at its rate, mapped and resampled to this connection's.
+        const auto ring = e->input_ring;
+        const auto in_channels = ring->channels;
+        std::vector<double> captured;
+        const auto take = [&](double* to, std::size_t count) {
+            captured.resize(count * in_channels);
+            ring->pop(captured.data(), count);
+            for (std::size_t f = 0; f < count; ++f)
+                for (std::uint32_t c = 0; c < channels; ++c)
+                    to[f * channels + c] = in_channels == 1 ? captured[f] : c < in_channels ? captured[f * in_channels + c] : 0.0;
+        };
+        if (rate <= 0 || rate == ring->rate) return take(out, frames);
+        if (!n.resampler || n.resampler_rate != ring->rate || n.resampler_channels != channels) {
+            n.resampler = std::make_unique<Resampler>(ring->rate, rate, channels);
+            n.resampler_rate = ring->rate;
+            n.resampler_channels = channels;
+        }
+        n.resampler->render(out, frames, take);
+        return;
+    }
     if (!e || !e->manual || !e->input_block) return;
     // const AudioBufferList * (^)(AVAudioFrameCount inNumberOfFrames): nil when there is no input now.
     const auto list = bridge_->invoke_block(e->input_block, {frames});
@@ -2098,10 +2194,20 @@ void Engines::install() {
     }, "Q@:");
     support.method(node_class, "outputFormatForBus:", [self, sp](CpuState& s, GuestMemory&) {
         const auto n = self->node(s.x[0]);
+        // The input node: the manual rendering input's format, else the default input device's (none without one).
+        std::optional<HalInputDevice> device;
+        if (n->kind == Kind::input && s.x[2] == 0) {
+            const auto id = hal_default_input();
+            for (auto& d : hal_input_devices())
+                if (d.id == id) device = std::move(d);
+        }
         std::lock_guard lock(self->mutex_);
-        if (n->kind == Kind::input) {   // no input device: the manual rendering input's format, if any
+        if (n->kind == Kind::input) {
             const auto e = n->engine ? sp->objc.find_host_state<EngineState>(n->engine) : nullptr;
-            s.x[0] = s.x[2] == 0 && e && e->manual ? e->input_format : 0;
+            if (s.x[2] != 0 || !e) { s.x[0] = 0; return; }
+            if (e->manual) { s.x[0] = e->input_format; return; }
+            if (!n->output_format && device) n->output_format = standard_format(self->support_, device->rate, device->channels);
+            s.x[0] = n->output_format;
             return;
         }
         s.x[0] = s.x[2] == 0 ? n->output_format : 0;

@@ -2,6 +2,7 @@
 
 #include "alchemy/host/audio.hpp"
 #include "alchemy/host/process.hpp"
+#include "alchemy/host/time.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -21,6 +22,12 @@
 // (ALCHEMY_GUI_CLOAK) unless ALCHEMY_AUDIO_OUTPUT=device, a stream plays
 // nowhere: a thread of its own takes the frames at the device's rate, so
 // programs run as they would with a device, and the user hears nothing.
+//
+// Input streams are host::audio input streams in the device's rate and
+// channels; the host's privacy settings may refuse them. Silent input: with
+// ALCHEMY_AUDIO_INPUT=null, or in a cloaked run unless
+// ALCHEMY_AUDIO_INPUT=device, a stream captures silence at the device's rate
+// and no microphone is opened.
 namespace alchemy::gui::completion_kit::media::hal {
 namespace {
 
@@ -34,6 +41,66 @@ bool silent_output() {
     }();
     return silent;
 }
+
+bool silent_input() {
+    static const bool silent = [] {
+        const auto input = host::process::environment("ALCHEMY_AUDIO_INPUT").value_or("");
+        if (input == "null") return true;
+        if (input == "device") return false;
+        const auto cloak = host::process::environment("ALCHEMY_GUI_CLOAK").value_or("");
+        return !cloak.empty() && cloak != "0";
+    }();
+    return silent;
+}
+
+class HostInput final : public InputStream {
+public:
+    explicit HostInput(host::audio::InputStream* stream) : stream_(stream) {}
+    ~HostInput() override { host::audio::close_input(stream_); }
+    bool start() override { return static_cast<bool>(host::audio::start_input(stream_)); }
+    void stop() override { host::audio::stop_input(stream_); }
+
+private:
+    host::audio::InputStream* stream_;
+};
+
+// Hands over 10 ms of silence every 10 ms.
+class SilentInput final : public InputStream {
+public:
+    SilentInput(const Device& device, Capture capture) : capture_(std::move(capture)), device_(device) {}
+    ~SilentInput() override { stop(); }
+    bool start() override {
+        std::lock_guard lock(mutex_);
+        if (thread_.joinable()) return true;
+        running_ = true;
+        thread_ = std::thread([this] { run(); });
+        return true;
+    }
+    void stop() override {
+        std::lock_guard lock(mutex_);
+        running_ = false;
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void run() {
+        const auto rate = device_.sample_rate > 0 ? device_.sample_rate : 48000.0;
+        const auto period = static_cast<std::uint32_t>(rate / 100);
+        const std::vector<float> silence(static_cast<std::size_t>(period) * std::max(device_.channels, 1U));
+        auto next = std::chrono::steady_clock::now();
+        while (running_) {
+            next += std::chrono::milliseconds(10);
+            std::this_thread::sleep_until(next);
+            if (running_) capture_(silence.data(), period, host::time::monotonic_ns());
+        }
+    }
+
+    Capture capture_;
+    Device device_;
+    std::mutex mutex_;
+    std::atomic<bool> running_{};
+    std::thread thread_;
+};
 
 class HostStream final : public OutputStream {
 public:
@@ -117,6 +184,17 @@ public:
             return nullptr;
         }
         return std::make_unique<HostStream>(*opened);
+    }
+
+    std::unique_ptr<InputStream> open_input(const Device& device, Capture capture) override {
+        if (!device.input) return nullptr;
+        if (silent_input()) return std::make_unique<SilentInput>(device, std::move(capture));
+        auto opened = host::audio::open_input(device.uid, static_cast<std::uint32_t>(device.sample_rate), device.channels, std::move(capture));
+        if (!opened) {
+            std::cerr << "alchemy: audio input on \"" << device.name << "\" did not open (" << host::name(opened.error()) << ")" << std::endl;
+            return nullptr;
+        }
+        return std::make_unique<HostInput>(*opened);
     }
 };
 

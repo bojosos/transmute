@@ -2009,7 +2009,7 @@ void av_foundation(Fixture& f) {
     const auto description = f.block(20);
     require(manager && f.cf.array_values(f.send(manager, "componentsMatchingDescription:", {description})).empty(), "no components");
     require(f.send(f.send(f.cls("AUAudioUnit"), "alloc"), "initWithComponentDescription:error:", {description, error}) == 0 && f.engine.read64(error) != 0, "no AUAudioUnit");
-    // Capture: discovery finds nothing; a session runs with an output and no input.
+    // Capture (no cameras here): discovery finds nothing; a session runs with an output and no input.
     const auto discovery = f.send(f.cls("AVCaptureDeviceDiscoverySession"), "discoverySessionWithDeviceTypes:mediaType:position:", {0, 0, 0});
     require(discovery && f.cf.array_values(f.send(discovery, "devices")).empty(), "no capture devices");
     const auto session = f.send(f.send(f.cls("AVCaptureSession"), "alloc"), "init");
@@ -2699,6 +2699,7 @@ void sample_buffer_renderers(Fixture& f) {
 int main() {
     alchemy::gui::completion_kit::media::set_midi_backend_factory([] { return std::make_unique<FakeMidi>(); });
     alchemy::gui::completion_kit::media::set_hal_backend_factory([] { return std::make_unique<FakeHal>(); });
+    _putenv_s("ALCHEMY_CAMERA", "none");   // the host's cameras stay out (media_capture_tests.cpp fakes them)
     return fill_test::run("qlab media", {
         {"core_media", core_media},
         {"core_video", core_video},

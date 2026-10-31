@@ -11,15 +11,10 @@
 //   VP8) are vt_decompression.cpp's and pixel transfer sessions
 //   pixel_transfer.cpp's. Hardware decoding is reported unsupported; no
 //   supplemental decoder is available.
-// - AVFoundation: there are no capture devices. Device lists (and discovery
-//   sessions) are empty, default devices nil, authorization "restricted" and
-//   access requests are answered NO; capture inputs fail with
-//   AVErrorDeviceNotConnected. Methods of devices, formats and frame-rate
-//   ranges, which cannot exist, stop with an explicit message. Capture
-//   sessions are real (configuration nesting, preset, outputs, running state)
-//   but can have no input, so no frame is ever delivered; video data outputs
-//   keep their delegate, queue and settings. The still-image output is a
-//   class shell; AVSampleBufferDisplayLayer is av_sample_buffer.cpp's.
+// - AVFoundation: the capture string constants (device types, media types,
+//   notification names). The capture classes are av_capture.cpp's (cameras
+//   over host::camera, microphones over the CoreAudio HAL);
+//   AVSampleBufferDisplayLayer is av_sample_buffer.cpp's.
 // - CoreVideo: the dictionary keys, host time (mach_absolute_time's) and the
 //   Metal texture caches, real objects holding their device (no texture is made
 //   from an image buffer yet). Pixel buffers and pools are core_video.cpp's.
@@ -33,17 +28,6 @@ constexpr std::int32_t cv_invalid_argument = -6661, cv_unsupported = -6663;
 void impossible(std::uint64_t object, std::string_view what) {
     if (object) throw std::runtime_error("Alchemy: " + std::string(what) + " received an object that cannot exist under Alchemy");
 }
-
-struct CaptureSession final : ObjectPayload {
-    bool running{};
-    std::uint32_t configuring{};
-    Address preset{};                  // retained
-    std::vector<Address> outputs;      // retained
-};
-struct VideoDataOutput final : ObjectPayload {
-    Address delegate{}, queue{}, settings{};
-    bool discards_late{true};
-};
 
 class Video final : public Provider {
 public:
@@ -241,153 +225,6 @@ void Video::install_av_foundation() {
              {"_AVVideoScalingModeKey", "AVVideoScalingModeKey"},
              {"_AVVideoScalingModeResizeAspectFill", "AVVideoScalingModeResizeAspectFill"}}})
         string(av_foundation, symbol, value);
-    // No capture devices exist.
-    const auto device = cls(av_foundation, "AVCaptureDevice", "NSObject");
-    method(device, "devices", [this](CpuState& s, GuestMemory&) { s.x[0] = bridge->autorelease(cf.array({})); }, true);
-    method(device, "devicesWithMediaType:", [this](CpuState& s, GuestMemory&) { s.x[0] = bridge->autorelease(cf.array({})); }, true);
-    method(device, "defaultDeviceWithMediaType:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true);
-    method(device, "deviceWithUniqueID:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true);
-    // AVAuthorizationStatusRestricted: access cannot be granted.
-    method(device, "authorizationStatusForMediaType:", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, true, "q@:@");
-    method(device, "requestAccessForMediaType:completionHandler:", [this](CpuState& s, GuestMemory&) {
-        if (s.x[3]) static_cast<void>(bridge->invoke_block(s.x[3], {0}));
-    }, true, "v@:@@?");
-    const auto input = cls(av_foundation, "AVCaptureInput", "NSObject");
-    const auto device_input = cls(av_foundation, "AVCaptureDeviceInput", "AVCaptureInput");
-    static_cast<void>(input);
-    const auto not_connected = [this](GuestMemory& m, Address out) {
-        if (out) m.write64(out, bridge->autorelease(bridge->error("AVFoundationErrorDomain", -11814, "No capture device is connected")));
-    };
-    method(device_input, "deviceInputWithDevice:error:", [not_connected](CpuState& s, GuestMemory& m) { not_connected(m, s.x[3]); s.x[0] = 0; }, true);
-    method(device_input, "initWithDevice:error:", [this, not_connected](CpuState& s, GuestMemory& m) {
-        not_connected(m, s.x[3]);
-        bridge->release(s.x[0]);
-        s.x[0] = 0;
-    });
-    // Methods of objects that cannot exist (no device, so no format or frame-rate range either).
-    const auto impossible_method = [this](Address target, const char* class_name, const char* selector, const char* types) {
-        const std::string what = std::string("-[") + class_name + " " + selector + "]";
-        method(target, selector, [what](CpuState&, GuestMemory&) {
-            throw std::runtime_error("unsupported: Alchemy: " + what + " (no capture device exists, so no instance can)");
-        }, false, types);
-    };
-    for (const auto& [selector, types] : std::initializer_list<std::pair<const char*, const char*>>{
-             {"activeFormat", "@@:"}, {"formats", "@@:"}, {"activeVideoMinFrameDuration", "{?=qiIq}@:"}, {"activeVideoMaxFrameDuration", "{?=qiIq}@:"},
-             {"lockForConfiguration:", "B@:^@"}, {"unlockForConfiguration", "v@:"}, {"setActiveFormat:", "v@:@"},
-             {"setActiveVideoMinFrameDuration:", "v@:{?=qiIq}"}, {"setActiveVideoMaxFrameDuration:", "v@:{?=qiIq}"},
-             {"uniqueID", "@@:"}, {"localizedName", "@@:"}, {"hasMediaType:", "B@:@"}, {"isConnected", "B@:"}})
-        impossible_method(device, "AVCaptureDevice", selector, types);
-    const auto device_format = cls(av_foundation, "AVCaptureDeviceFormat", "NSObject");
-    for (const auto& [selector, types] : std::initializer_list<std::pair<const char*, const char*>>{
-             {"formatDescription", "^{opaqueCMFormatDescription=}@:"}, {"videoSupportedFrameRateRanges", "@@:"}, {"mediaType", "@@:"}})
-        impossible_method(device_format, "AVCaptureDeviceFormat", selector, types);
-    const auto frame_rate_range = cls(av_foundation, "AVFrameRateRange", "NSObject");
-    for (const auto& [selector, types] : std::initializer_list<std::pair<const char*, const char*>>{
-             {"minFrameRate", "d@:"}, {"maxFrameRate", "d@:"}, {"minFrameDuration", "{?=qiIq}@:"}, {"maxFrameDuration", "{?=qiIq}@:"}})
-        impossible_method(frame_rate_range, "AVFrameRateRange", selector, types);
-    // Discovery sessions find no device.
-    const auto discovery = cls(av_foundation, "AVCaptureDeviceDiscoverySession", "NSObject");
-    method(discovery, "discoverySessionWithDeviceTypes:mediaType:position:", [this](CpuState& s, GuestMemory&) {
-        const auto made = objc.send(objc.send(s.x[0], objc.selector("alloc"), {}).x0, objc.selector("init"), {}).x0;
-        s.x[0] = bridge->autorelease(made);
-    }, true, "@@:@@q");
-    method(discovery, "devices", [this](CpuState& s, GuestMemory&) { s.x[0] = bridge->autorelease(cf.array({})); });
-    method(discovery, "supportedMultiCamDeviceSets", [this](CpuState& s, GuestMemory&) { s.x[0] = bridge->autorelease(cf.array({})); });
-
-    // Sessions: real configuration state; no input can be added (none can exist).
-    const auto session = cls(av_foundation, "AVCaptureSession", "NSObject");
-    static_cast<void>(cls(av_foundation, "AVCaptureOutput", "NSObject"));
-    static_cast<void>(cls(av_foundation, "AVCaptureStillImageOutput", "AVCaptureOutput"));
-    const auto data_output = cls(av_foundation, "AVCaptureVideoDataOutput", "AVCaptureOutput");
-    const auto output_class = objc.find_class("AVCaptureOutput");
-    const auto session_state = [this](Address self) { return objc.host_state<CaptureSession>(self); };
-    const auto kind_of = [this](Address object, Address target) {
-        CallRegs registers{};
-        registers.x[2] = target;
-        return (objc.send(object, objc.selector("isKindOfClass:"), registers).x0 & 0xff) != 0;
-    };
-    method(session, "canAddInput:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:@");
-    method(session, "addInput:", [](CpuState& s, GuestMemory&) {
-        throw std::runtime_error(s.x[2] ? "unsupported: Alchemy: -[AVCaptureSession addInput:] with an input (no capture device exists, so no input can)"
-                                        : "Alchemy: -[AVCaptureSession addInput:] with nil (NSInvalidArgumentException)");
-    }, false, "v@:@");
-    method(session, "inputs", [this](CpuState& s, GuestMemory&) { s.x[0] = bridge->autorelease(cf.array({})); });
-    method(session, "canAddOutput:", [session_state, output_class, kind_of](CpuState& s, GuestMemory&) {
-        const auto& outputs = session_state(s.x[0])->outputs;
-        s.x[0] = s.x[2] && kind_of(s.x[2], output_class) && std::find(outputs.begin(), outputs.end(), s.x[2]) == outputs.end() ? 1 : 0;
-    }, false, "B@:@");
-    method(session, "addOutput:", [this, session_state, output_class, kind_of](CpuState& s, GuestMemory&) {
-        auto state = session_state(s.x[0]);
-        if (!s.x[2] || !kind_of(s.x[2], output_class) || std::find(state->outputs.begin(), state->outputs.end(), s.x[2]) != state->outputs.end())
-            throw std::runtime_error("Alchemy: -[AVCaptureSession addOutput:] cannot add this output (NSInvalidArgumentException)");
-        state->outputs.push_back(retain(s.x[2]));
-    }, false, "v@:@");
-    method(session, "removeOutput:", [this, session_state](CpuState& s, GuestMemory&) {
-        auto state = session_state(s.x[0]);
-        const auto found = std::find(state->outputs.begin(), state->outputs.end(), s.x[2]);
-        if (found == state->outputs.end()) return;
-        state->outputs.erase(found);
-        release(s.x[2]);
-    }, false, "v@:@");
-    method(session, "outputs", [this, session_state](CpuState& s, GuestMemory&) { s.x[0] = bridge->autorelease(cf.array(session_state(s.x[0])->outputs)); });
-    method(session, "beginConfiguration", [session_state](CpuState& s, GuestMemory&) { ++session_state(s.x[0])->configuring; }, false, "v@:");
-    method(session, "commitConfiguration", [session_state](CpuState& s, GuestMemory&) {
-        auto state = session_state(s.x[0]);
-        if (state->configuring == 0) throw std::runtime_error("Alchemy: -[AVCaptureSession commitConfiguration] without beginConfiguration (NSGenericException)");
-        --state->configuring;
-    }, false, "v@:");
-    method(session, "sessionPreset", [this, session_state](CpuState& s, GuestMemory&) {
-        auto state = session_state(s.x[0]);
-        s.x[0] = state->preset ? state->preset : cf.constant_string("AVCaptureSessionPresetHigh");
-    });
-    method(session, "canSetSessionPreset:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[2] ? 1 : 0; }, false, "B@:@");   // no input limits a preset
-    method(session, "setSessionPreset:", [this, session_state](CpuState& s, GuestMemory&) {
-        if (!s.x[2]) throw std::runtime_error("Alchemy: -[AVCaptureSession setSessionPreset:] with nil (NSInvalidArgumentException)");
-        auto state = session_state(s.x[0]);
-        const auto old = std::exchange(state->preset, cf.copy(s.x[2]));
-        release(old);
-    }, false, "v@:@");
-    // Running with no input: the session runs and delivers nothing.
-    method(session, "startRunning", [session_state](CpuState& s, GuestMemory&) { session_state(s.x[0])->running = true; }, false, "v@:");
-    method(session, "stopRunning", [session_state](CpuState& s, GuestMemory&) { session_state(s.x[0])->running = false; }, false, "v@:");
-    method(session, "isRunning", [session_state](CpuState& s, GuestMemory&) { s.x[0] = session_state(s.x[0])->running ? 1 : 0; }, false, "B@:");
-    method(session, "isInterrupted", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:");
-    method(session, "dealloc", [this, session](CpuState& s, GuestMemory&) {
-        if (const auto state = objc.find_host_state<CaptureSession>(s.x[0])) {
-            for (const auto output : state->outputs) release(output);
-            state->outputs.clear();
-            release(std::exchange(state->preset, 0));
-        }
-        static_cast<void>(objc.send_super(s.x[0], session, objc.selector("dealloc")));
-    }, false, "v@:");
-    // Video data outputs: delegate (not retained), callback queue (retained) and settings.
-    const auto output_state = [this](Address self) { return objc.host_state<VideoDataOutput>(self); };
-    method(data_output, "setSampleBufferDelegate:queue:", [this, output_state](CpuState& s, GuestMemory&) {
-        if (s.x[2] && !s.x[3]) throw std::runtime_error("Alchemy: -[AVCaptureVideoDataOutput setSampleBufferDelegate:queue:] needs a queue (NSInvalidArgumentException)");
-        auto state = output_state(s.x[0]);
-        if (s.x[3]) static_cast<void>(call(libsystem, "_dispatch_retain", {s.x[3]}));
-        if (state->queue) static_cast<void>(call(libsystem, "_dispatch_release", {state->queue}));
-        state->delegate = s.x[2];
-        state->queue = s.x[2] ? s.x[3] : 0;
-        if (!s.x[2] && s.x[3]) static_cast<void>(call(libsystem, "_dispatch_release", {s.x[3]}));
-    }, false, "v@:@@");
-    method(data_output, "sampleBufferDelegate", [output_state](CpuState& s, GuestMemory&) { s.x[0] = output_state(s.x[0])->delegate; });
-    method(data_output, "sampleBufferCallbackQueue", [output_state](CpuState& s, GuestMemory&) { s.x[0] = output_state(s.x[0])->queue; });
-    method(data_output, "videoSettings", [output_state](CpuState& s, GuestMemory&) { s.x[0] = output_state(s.x[0])->settings; });
-    method(data_output, "setVideoSettings:", [this, output_state](CpuState& s, GuestMemory&) {
-        auto state = output_state(s.x[0]);
-        const auto old = std::exchange(state->settings, s.x[2] ? cf.copy(s.x[2]) : 0);
-        release(old);
-    }, false, "v@:@");
-    method(data_output, "alwaysDiscardsLateVideoFrames", [output_state](CpuState& s, GuestMemory&) { s.x[0] = output_state(s.x[0])->discards_late ? 1 : 0; }, false, "B@:");
-    method(data_output, "setAlwaysDiscardsLateVideoFrames:", [output_state](CpuState& s, GuestMemory&) { output_state(s.x[0])->discards_late = (s.x[2] & 0xff) != 0; }, false, "v@:B");
-    method(data_output, "dealloc", [this, data_output](CpuState& s, GuestMemory&) {
-        if (const auto state = objc.find_host_state<VideoDataOutput>(s.x[0])) {
-            if (state->queue) static_cast<void>(call(libsystem, "_dispatch_release", {std::exchange(state->queue, 0)}));
-            release(std::exchange(state->settings, 0));
-        }
-        static_cast<void>(objc.send_super(s.x[0], data_output, objc.selector("dealloc")));
-    }, false, "v@:");
 }
 
 void Video::install_core_video() {

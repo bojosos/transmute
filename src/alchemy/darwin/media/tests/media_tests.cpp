@@ -175,7 +175,6 @@ void video(Fixture& f) {
     const auto device = f.cls("AVCaptureDevice");
     require(f.cf.length(f.send(device, "devicesWithMediaType:", {f.engine.read64(f.symbol(av, "_AVMediaTypeVideo"))})) == 0, "no capture devices");
     require(f.send(device, "defaultDeviceWithMediaType:", {0}) == 0, "no default device");
-    require(f.send(device, "authorizationStatusForMediaType:", {0}) == 1, "restricted");
     const auto error = f.block(8);
     require(f.send(f.cls("AVCaptureDeviceInput"), "deviceInputWithDevice:error:", {0, error}) == 0, "no input");
     require(f.call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFErrorGetCode", {f.engine.read64(error)}) ==
@@ -298,6 +297,7 @@ int main() {
     // The host's MIDI and audio devices stay out of these tests (deterministic lists).
     _putenv_s("ALCHEMY_MIDI_DEVICES", "none");
     _putenv_s("ALCHEMY_AUDIO_DEVICES", "none");
+    _putenv_s("ALCHEMY_CAMERA", "none");
     return run("media", {{"imports", imports}, {"core media", core_media}, {"video", video}, {"audio", audio}, {"accessibility", accessibility},
                          {"bearers and taps", bearers_and_taps}});
 }

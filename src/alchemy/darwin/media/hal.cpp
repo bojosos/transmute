@@ -22,9 +22,10 @@
 // AudioDeviceAddIOProc form) run on the device's I/O thread through
 // hal_io.hpp, with one interleaved float buffer of the device's I/O buffer
 // frame size, and the device's output stream plays their sum (host::audio;
-// silent in cloaked runs, hal_host.cpp). Input devices have no I/O: starting
-// one answers kAudioHardwareUnsupportedOperationError (a stderr notice says
-// so once). A block IOProc runs on the I/O thread, not on its queue. Host
+// silent in cloaked runs, hal_host.cpp). Input devices have no IOProc I/O:
+// starting one answers kAudioHardwareUnsupportedOperationError (a stderr
+// notice says so once); they capture for AVAudioEngine's input node and
+// AVFoundation capture through hal_open_input. A block IOProc runs on the I/O thread, not on its queue. Host
 // time is mach_absolute_time's
 // (nanoseconds; frequency 1e9).
 namespace alchemy::gui::completion_kit::media {
@@ -184,6 +185,35 @@ std::uint32_t hal_default_output() {
     hal::Value value;
     if (state->get().get(hal::system_object, {hal::four("dOut"), hal::scope_global, 0}, std::nullopt, value) || value.bytes.size() < 4) return 0;
     return value.bytes[0] | (value.bytes[1] << 8) | (value.bytes[2] << 16) | (static_cast<std::uint32_t>(value.bytes[3]) << 24);
+}
+
+std::uint32_t hal_default_input() {
+    const auto state = current();
+    if (!state) return 0;
+    std::lock_guard lock(state->mutex);
+    hal::Value value;
+    if (state->get().get(hal::system_object, {hal::four("dIn "), hal::scope_global, 0}, std::nullopt, value) || value.bytes.size() < 4) return 0;
+    return value.bytes[0] | (value.bytes[1] << 8) | (value.bytes[2] << 16) | (static_cast<std::uint32_t>(value.bytes[3]) << 24);
+}
+
+std::vector<HalInputDevice> hal_input_devices() {
+    std::vector<HalInputDevice> out;
+    const auto state = current();
+    if (!state) return out;
+    std::lock_guard lock(state->mutex);
+    for (const auto id : state->get().devices())
+        if (const auto* device = state->get().device(id); device && device->input)
+            out.push_back({id, device->uid, device->name, std::max(device->channels, 1U), device->sample_rate > 0 ? device->sample_rate : 48000.0});
+    return out;
+}
+
+std::unique_ptr<hal::InputStream> hal_open_input(std::uint32_t id, std::function<void(const float*, std::uint32_t, std::uint64_t)> capture) {
+    const auto state = current();
+    if (!state) return nullptr;
+    std::lock_guard lock(state->mutex);
+    const auto* device = state->get().device(id);
+    if (!device || !device->input || !state->backend) return nullptr;
+    return state->backend->open_input(*device, std::move(capture));
 }
 
 std::uint32_t hal_buffer_frames(std::uint32_t device) {

@@ -49,6 +49,8 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/avfoundation.cpp
     src/alchemy/darwin/media/av_player.cpp
     src/alchemy/darwin/media/av_sample_buffer.cpp
+    src/alchemy/darwin/media/av_capture.cpp
+    src/alchemy/darwin/media/capture_host.cpp
     src/alchemy/darwin/media/caclock.cpp)
 
 # Headless shell (src/alchemy/darwin/shells.hpp): alchemy.exe's answers for
@@ -67,6 +69,9 @@ function(alchemy_gui_media_tests)
     alchemy_gui_add_unit_test(alchemy_gui_media_guest src/alchemy/darwin/media/tests/media_guest_tests.cpp TIMEOUT 180)
     # compressed_audio reads minimp3's conformance vectors.
     target_compile_definitions(alchemy_gui_media_guest PRIVATE ALCHEMY_THIRD_PARTY="${PROJECT_SOURCE_DIR}/third_party")
+    # AVFoundation capture and the audio engine's input over fake cameras and a fake microphone
+    # (its own process: the HAL's device list is read once per process).
+    alchemy_gui_add_unit_test(alchemy_gui_media_capture src/alchemy/darwin/media/tests/media_capture_tests.cpp TIMEOUT 120)
 endfunction()
 alchemy_gui_register_tests(alchemy_gui_media_tests)
 

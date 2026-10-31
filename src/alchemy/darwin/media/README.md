@@ -37,12 +37,33 @@ mono inputs around the listener, with a reverb send), AVAudioSequencer and AVMus
 Files into the engine's instruments, events at their render cycle; loops, mute, solo, rate, positions;
 MIDI endpoints as destinations stop explicitly), volume and pan into mixers, node and player times, and
 taps. Manual rendering (offline and the realtime block) renders the same graph with no device, the
-input node then taking its audio from its manual input block. AVAudioConverter converts PCM
+input node then taking its audio from its manual input block; outside it, the input node is the
+default input device (its format, opened while the node feeds the graph or has a tap). AVAudioConverter converts PCM
 between layouts, channel counts (channel maps, downmix) and rates, and decodes the compressed
 formats that have a decoder (MPEG audio, Opus, FLAC) from AVAudioCompressedBuffers. Unavailable:
 compressed files (nil with an error), compressed output (no encoder: the converter is nil), input
-(no device: an engine fed by the input node fails to start outside manual rendering), scheduling
+without a device or refused by the host (an engine fed by the input node fails to start), scheduling
 at a time and taps at a rate other than the engine's (explicit stops).
+
+**Capture (real, `av_capture.cpp`, `capture_host.cpp`):** AVCaptureDevice lists the host's
+cameras (`host::camera`: Media Foundation on win32) and the HAL's input devices (`host::audio`
+capture streams: WASAPI), with formats, frame-rate ranges, the active format and frame durations,
+and discovery sessions. AVCaptureSession with device inputs runs AVCaptureVideoDataOutput
+(CMSampleBuffers of IOSurface-backed CVPixelBuffers in the asked pixel format and size, mirrored on
+request, on the delegate's queue; late pictures dropped by default) and AVCaptureAudioDataOutput
+(float32 linear PCM at the device's rate). The lists are read once per process (no hot-plug).
+Focus, exposure, torch and flash answer "not supported"; audioSettings are kept but not applied.
+
+**Who decides access:** the host. `+authorizationStatusForMediaType:` reports Windows' privacy
+settings for the camera and microphone (the consent store, read without a prompt): Denied when
+they deny this desktop app, Authorized when they allow it, NotDetermined when they say nothing.
+`+requestAccessForMediaType:completionHandler:` shows no prompt of its own: when the settings say
+nothing, the host decides by opening the default device once (not started), and that answer
+holds for the process; with no device the handler gets NO and the status stays NotDetermined. An
+app's own explanation before asking is the app's; Alchemy never answers Authorized on its own.
+Cloaked runs list no cameras (`ALCHEMY_CAMERA=device` lists them; `ALCHEMY_CAMERA=none` hides
+them in any run) and capture silence from the microphones (`ALCHEMY_AUDIO_INPUT=device` opens
+them; `=null` keeps them silent in any run).
 
 **Audio files (real, `audio_file.cpp`):** AudioFile and ExtAudioFile read and write linear PCM
 WAVE, AIFF, AIFC and CAF, by URL or through the client's callbacks
@@ -59,14 +80,16 @@ and formats a container cannot hold, answer with the AudioFile errors.
 receive blocks get event lists in their protocol. MIDI 2.0-only messages (per-note and
 registered/assignable controllers, 128-bit data) have no MIDI 1.0 form and are dropped.
 
-**Unavailable, as documented (audio):** input devices and AUHAL input
-(`kAudioUnitErr_FailedInitialization`, `kAudioUnitErr_NoConnection`), version 3 audio
+**Unavailable, as documented (audio):** IOProc I/O on input devices, AUHAL input and
+AudioQueue input (`kAudioUnitErr_FailedInitialization`, `kAudioUnitErr_NoConnection`); capture
+goes through AVFoundation and AVAudioEngine's input node. Version 3 audio
 units (AUAudioUnit), other components (`AudioComponentRegister` registers none),
 aggregate devices and process taps. Block IOProcs run on the I/O thread, not their queue.
 
-**Host dependencies:** `host::audio` (endpoints and output streams; WASAPI / MMDevice on win32),
+**Host dependencies:** `host::audio` (endpoints, output and capture streams, the microphone
+privacy setting; WASAPI / MMDevice on win32), `host::camera` (Media Foundation on win32),
 `host::midi` (ports, input, output; WinMM on win32), `host::time`,
-`host::process`. Adapters: `hal_host.cpp`, `midi_host.cpp`.
+`host::process`. Adapters: `hal_host.cpp`, `midi_host.cpp`, `capture_host.cpp`.
 
 **Unsupported (explicit failures):** for example AVAssetReader output that
 needs encoding, sample-rate conversion or channel remapping, and audio-mix
