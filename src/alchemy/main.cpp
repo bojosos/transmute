@@ -3,6 +3,7 @@
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/process.hpp"
+#include "alchemy/process_context.hpp"
 #include "alchemy/macho.hpp"
 #include "alchemy/path.hpp"
 #include "alchemy/inspection.hpp"
@@ -208,6 +209,7 @@ int launch(const std::vector<std::string>& arguments, const std::vector<std::str
         if (child) options.child = std::make_shared<const alchemy::ChildLaunch>(std::move(*child));
         const auto result = alchemy::run_program(path, guest_arguments, options, {},
                                                  options.child ? options.child->envp : environment);
+        alchemy::trace_exit_phase("process state released");
         if (options.jit_stats) {
             std::cerr << "Alchemy JIT: native guest instructions " << result.jit.native_guest_instructions
                       << ", native blocks " << result.jit.native_blocks
@@ -298,6 +300,8 @@ int wmain(int argc, wchar_t** argv) {
     // First, while nothing else has allocated: the executable's load range.
     alchemy::engine_hold_load_range<transmute::ReferenceEngine>(early_load_base(argc, argv));
     alchemy::perf::start();
+    // Registered first, so it runs after the other exit hooks (the fx cache flush).
+    std::atexit([] { alchemy::trace_exit_phase("host exit"); });
     try {
         std::vector<std::string> arguments;
         for (int index = 0; index < argc; ++index) arguments.push_back(utf8(argv[index]));

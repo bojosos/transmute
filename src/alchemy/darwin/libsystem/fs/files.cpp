@@ -945,15 +945,16 @@ void DarwinServices::Impl::install_file_services() {
         return static_cast<std::uint64_t>(descriptor);
     });
     install("_flock", [this](auto& s, auto&) { return flock(static_cast<int>(s.x[0]), static_cast<std::uint32_t>(s.x[1])); });
-    // Actual guest signal delivery is a separate capability. Shutdown cancels
-    // waits with ECANCELED; it must not be reported as a delivered signal.
+    // Actual guest signal delivery is a separate capability. At process exit a
+    // worker stops here (process_exiting); elsewhere shutdown cancels the wait
+    // with ECANCELED, which must not be reported as a delivered signal.
     install("_sleep", [this](auto& s, auto&) {
         const auto seconds = static_cast<std::uint32_t>(s.x[0]);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
         for (;;) {
             const auto remaining = deadline - std::chrono::steady_clock::now();
             if (remaining <= std::chrono::steady_clock::duration::zero()) return std::uint64_t{0};
-            if (context.requested_exit()) {
+            if (process_exiting(context)) {
                 context.set_errno(89);
                 return static_cast<std::uint64_t>(std::chrono::ceil<std::chrono::seconds>(remaining).count());
             }

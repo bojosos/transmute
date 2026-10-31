@@ -610,7 +610,7 @@ std::uint64_t DarwinServices::Impl::network_io(transmute::GuestMemory& memory, c
     std::uint64_t transferred = 0;
     for (;;) {
         if (record->closed || socket->closed) { if (transferred) return transferred; throw ServiceError{ebadf}; }
-        if (context.requested_exit()) { if (transferred) return transferred; throw ServiceError{89}; }
+        if (process_exiting(context)) { if (transferred) return transferred; throw ServiceError{89}; }
         net::Address source;
         std::int64_t count = -1; std::uint32_t error = 0;
         {

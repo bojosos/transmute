@@ -194,6 +194,19 @@ int main(int argc, char** argv) {
                    "_exit() with kevent64, poll and usleep waiters", outcome, "expected status 0 and no wait failing at exit");
         }
         {
+            // A worker in sleep() when main calls _exit(0): its sleep must not
+            // return into guest code (the traced call prints no result), and
+            // nothing it does afterwards changes the status (Chrome: a worker's
+            // fault after exit made status 139).
+            SetEnvironmentVariableA("ALCHEMY_TRACE_CALLS", "_sleep");
+            const auto outcome = run({fx, threads, "exit-fault"});
+            SetEnvironmentVariableA("ALCHEMY_TRACE_CALLS", nullptr);
+            expect(outcome.status == 0 && outcome.seconds < 20 && contains(outcome.output, "exit with a sleeping worker") &&
+                       contains(outcome.output, "_sleep(0x64") && !contains(outcome.output, "_sleep -> 0x64") &&
+                       !contains(outcome.output, "SIGSEGV"),
+                   "_exit() with a worker in sleep", outcome, "expected status 0 and no sleep returning at exit");
+        }
+        {
             const auto outcome = run({fx, threads, "return-busy"});
             expect(outcome.status == 9 && outcome.seconds < 20 && !contains(outcome.output, "alchemy:"),
                    "return from main with busy workers", outcome, "expected prompt status 9");

@@ -662,6 +662,59 @@ its children. `run_windowed` now probes a page that never got its title (process
 whether new navigations commit). Hang dumps carry host stacks, per-thread CPU and stale Mach queues;
 `ALCHEMY_TRACE_PROCESS` logs exits, peer ends and port deaths.
 
+### Follow-up 6 (2026-10-31): windowed Chrome's shutdown exits (139 and 2)
+
+The short app check's windowed Chrome runs reached the page every time, but some ended with status 139 or 2
+after `Browser.close`. These are two different things.
+
+**Fixed: status 139, a worker's fault after `_exit`.** In both runs the browser called `_exit(0)` (traced as
+"exits with status 0"). A worker then read null + 0x28 (`Chrome Framework+0xfd8c6c`, the same pc both times),
+and that fault became the process status. The worker is a Chrome task thread in `pthread_join`; its frames
+match the joiner described under status 2 below. Darwin runs no thread after `_exit`. Under fx, a thread
+still in translated code runs until its next safe point: a hot synthetic call returns into translated code
+without a dispatcher exit (its native entry), and straight-line code checks no interrupt.
+* `FxEngine::record_termination` now ignores a fault once the process is stopping (`_exit`, or an earlier
+  fatal signal), so the first status stands.
+* The same class of bug as Follow-up 5's exit wakes: `sleep()`, socket send and receive, and a worker's run
+  loop (`CFRunLoopRun`, `-[NSRunLoop runMode:beforeDate:]`) still returned into guest code at exit. They now
+  stop the worker (`process_exiting()`).
+* Test: `fx_threads exit-fault`, a worker in `sleep(100)` while main calls `_exit(0)`. On main's binary the
+  traced `sleep` returns 0x64 into the worker; now it does not, and the status is 0.
+* Not reproduced as a Chrome 139 on purpose: 0 in 20 later windowed runs, against 2 of 2 in the app check.
+
+**Found: status 2 is Chrome's teardown watchdog waiting for GoogleUpdater.** "Teardown watchdog expired;
+recording dump and terminating." is Chrome's own message (in Chrome Framework, beside its
+`MacSessionEndingWatchdog`), and 2 is `RESULT_CODE_HUNG`. It fires about 10 s into a teardown that does not
+finish.
+* Chrome starts `GoogleUpdater install` from a startup task (`InstallUpdaterAndRegisterBrowser`,
+  `chrome/browser/updater/browser_updater_client_util_mac.mm`). That task runs `SKIP_ON_SHUTDOWN` and waits up
+  to 120 s for the updater to exit. A `SKIP_ON_SHUTDOWN` task that has already started blocks shutdown.
+* Under Alchemy the install takes 9 to 16 s; natively it takes about 1 to 2 s. It spawns its crash handler and
+  a `launchctl asuser` network worker, retries a mojo connection, and falls back after the network is denied.
+  It also fails: "Can't chmod directory …/GoogleUpdater.app" and then "Copying app … failed"
+  (`mac_setup.mm:97`), with `--install` returning 15. That is an Alchemy file-system gap still to look into.
+* So a `Browser.close` while the install runs holds teardown past the watchdog. All 7 exit-2 runs had the
+  updater running at close. None of the 15 runs without it failed; 7 of 15 runs with it did.
+* There is no switch to keep Chrome from installing the updater, short of the bundle's `KSProductID`, and
+  patching Chrome is out. The fix is faster helper processes (fx-jit-cost, as for Follow-up 5's slow launch),
+  plus the copy failure above.
+
+**Harness: the DevTools input now closes after `Browser.close` is answered.** Chrome stops its pipe reader with
+`shutdown(fd, SHUT_RDWR)` (`devtools_pipe_handler.cc`). That ends a blocked read only on a socket, which is
+what DevTools clients usually pass (libuv's child "pipes" are socketpairs). On our named pipe it is `ENOTSOCK`,
+correctly so for a pipe, and the reader stays in `read(3)`. A teardown task joins it (the `pthread_join` above),
+so the reader ended only when Chrome exited. `run_windowed.ps1` now closes its write end once `Browser.close` is
+answered (`-KeepInput` keeps the old behaviour). Close-to-exit went from 6 to 18 s down to 1 to 6 s over
+12 runs. The one failure among them was the updater case. `web_visit.ps1` still keeps its input open.
+
+**New diagnostics:**
+* `ALCHEMY_TRACE_PROCESS` also prints each exit phase: guest threads joined, process state released, and host
+  exit, each against the exit request (0.1 to 2.5 s per process here).
+* `ALCHEMY_TRACE_CALLS_AFTER_EXIT=1` traces only the provider calls made after the exit request, tagged with
+  the guest thread number.
+* Hang dumps map pthread handles to guest threads, so a `_pthread_join`'s `x0` names the thread it waits for.
+* `run_windowed.ps1 -CloseDump <s>` requests a hang dump that many seconds after `Browser.close`.
+
 ### Open, worst first
 
 1. **fx code arena exhaustion** (gap 1). It needs fx runtime design work, for which a follow-up is proposed:

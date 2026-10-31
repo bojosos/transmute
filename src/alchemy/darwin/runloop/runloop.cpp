@@ -1,6 +1,7 @@
 #include "alchemy/darwin/runloop/runloop_internal.hpp"
 
 #include "alchemy/darwin_dispatch.hpp"
+#include "alchemy/darwin_threads.hpp"
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/gui/install.hpp"
 #include "alchemy/gui/win32_nesting.hpp"
@@ -159,7 +160,8 @@ bool RunLoopImpl::mode_empty(std::string_view mode) const {
 }
 
 bool RunLoopImpl::stop_requested() const {
-    return process_.requested_exit().has_value() || engine_stop_requested(process_.calling_engine());
+    // At process exit a worker's run loop does not return: its thread ends here, as on Darwin.
+    return process_exiting(process_) || engine_stop_requested(process_.calling_engine());
 }
 
 RunResult RunLoopImpl::run_once(std::string_view mode_view, double timeout, bool return_after_source_handled) {

@@ -1307,7 +1307,10 @@ void FxEngine::set_stop_observer(std::function<void(std::uint32_t)> observer) {
 void FxEngine::record_termination(int signal, std::uint32_t status, const std::string& reason) {
     {
         std::lock_guard lock(shared_->stop_lock);
-        if (!shared_->termination)
+        // Once the process stops (_exit, an earlier fatal signal) its status is
+        // settled: on Darwin no thread runs after _exit, so a later fault on a
+        // thread still on its way to the stop does not change it.
+        if (!shared_->termination && !shared_->stopping.load())
             shared_->termination = Termination{status, signal, reason, state_.pc, state_.x[30], state_.x[29], main_};
     }
     request_stop(status);

@@ -515,6 +515,7 @@ ProcessResult run_program(const std::filesystem::path& executable,
             }
         }
         join_stopped_workers(threads, engine, context.requested_exit().value_or(exit));
+        trace_exit_phase("guest threads joined");
         if (!context.requested_exit()) {
             threads.cleanup_thread(*context.thread(engine));
             context.run_finalizers();

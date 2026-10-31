@@ -38,6 +38,11 @@ struct ExecutionTotals {
     std::uint64_t instructions{}, native_guest_instructions{}, native_blocks{}, fallback_instructions{};
 };
 
+// ALCHEMY_TRACE_PROCESS=1, once the guest asked to exit: "[alchemy process] PID: <phase> T s after
+// the exit request" (what keeps a host process alive after the guest's _exit; its parent's waitpid
+// returns only when the host process ends).
+void trace_exit_phase(std::string_view phase);
+
 struct TlsTemplate {
     std::uint64_t module_id{};
     std::vector<std::uint8_t> initial_data;
@@ -284,6 +289,7 @@ private:
     std::uint64_t next_address_{0x600000000ULL};
     std::uint64_t next_thread_{1};
     std::optional<std::uint32_t> exit_;
+    std::atomic<bool> exiting_{false};   // exit_ is set (lock-free, for per-call checks)
     ExecutionTotals worker_totals_;
     std::unique_ptr<ObjectStore> objects_;
     mutable std::mutex waker_mutex_;

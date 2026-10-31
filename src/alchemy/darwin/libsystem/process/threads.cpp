@@ -573,6 +573,23 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                 operation(*owned, state, memory);
             }));
         };
+        // Hang dumps map pthread handles (a waiting _pthread_join's x0) to guest threads.
+        process.at_hang_dump([weak = std::weak_ptr<Impl>(owned)]() -> std::string {
+            const auto self = weak.lock();
+            if (!self) return {};
+            std::ostringstream text;
+            text << "pthread handles (a _pthread_join waits on its x0):\n";
+            std::lock_guard lock(self->metadata);
+            for (const auto& [handle, worker] : self->workers) {
+                text << "  0x" << std::hex << handle << " thread 0x" << worker->context->identity << std::dec;
+                std::unique_lock state(worker->mutex, std::try_to_lock);
+                if (!state) text << " (busy)";
+                else text << (worker->finished ? " finished" : " running") << (worker->detached ? ", detached" : "")
+                          << (worker->joining ? ", being joined" : "");
+                text << '\n';
+            }
+            return text.str();
+        });
         add("_pthread_create", [](auto& self, auto& s, auto& m) { self.create(s, m); });
         add("_pthread_join", [](auto& self, auto& s, auto& m) { self.join(s, m); });
         add("_pthread_self", [](auto& self, auto& s, auto&) { s.x[0] = self.self(); });

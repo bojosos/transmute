@@ -281,7 +281,9 @@ OutputResult ProcessContext::output(unsigned descriptor, std::span<const std::ui
 namespace {
 // ALCHEMY_TRACE_CALLS=<comma-separated symbol prefixes, or *; -prefix excludes>: diagnostic log
 // of provider calls (process id and thread hash, symbol, x0..x3 on entry, x0 on return)
-// to stderr (ALCHEMY_TRACE_CALLS_ERRORS=1: only the calls that return non-zero).
+// to stderr (ALCHEMY_TRACE_CALLS_ERRORS=1: only the calls that return non-zero;
+// ALCHEMY_TRACE_CALLS_AFTER_EXIT=1: only the calls made once the process exit is requested,
+// with the guest thread number, what other threads still do while the process ends).
 // ALCHEMY_TRACE_CALLS_FILTER=<text> limits it to the Alchemy
 // processes whose host command line contains <text> (for example
 // "--alchemy-child-spec": guest children only).
@@ -365,9 +367,15 @@ std::uint64_t ProcessContext::install_function(std::string symbol,
             [&](const std::string& prefix) { return prefix.size() > 1 && prefix.front() == '-' && symbol.starts_with(prefix.substr(1)); });
     if (traced) {
         handler = [this, inner = std::move(handler), name = symbol](transmute::CpuState& state, transmute::GuestMemory& memory) {
+            static const bool after_exit = [] { const auto value = host::process::environment("ALCHEMY_TRACE_CALLS_AFTER_EXIT"); return value && value->starts_with("1"); }();
+            if (after_exit && !exiting_.load(std::memory_order_acquire)) { inner(state, memory); return; }
             char line[256];
             const auto process = static_cast<unsigned long long>(host::process::current_pid());
-            const auto thread = (process << 16) | (std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffff);
+            auto thread = (process << 16) | (std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffff);
+            if (after_exit) {   // pid, then the guest thread number of the fault messages
+                const auto current = current_thread();
+                thread = (process << 16) | (current ? current->identity & 0xffff : 0);
+            }
             std::snprintf(line, sizeof(line), "[call %llx] %s(0x%llx, 0x%llx, 0x%llx, 0x%llx)", thread, name.c_str(),
                 static_cast<unsigned long long>(state.x[0]), static_cast<unsigned long long>(state.x[1]),
                 static_cast<unsigned long long>(state.x[2]), static_cast<unsigned long long>(state.x[3]));
@@ -576,16 +584,36 @@ void ProcessContext::run_finalizers(std::optional<std::uint64_t> dso) {
     }
 }
 
+namespace {
+std::atomic<std::int64_t> exit_requested_at{0};   // steady clock nanoseconds, 0 = not yet
+bool trace_process() {
+    static const bool trace = [] { const auto value = host::process::environment("ALCHEMY_TRACE_PROCESS"); return value && value->starts_with("1"); }();
+    return trace;
+}
+} // namespace
+
+void trace_exit_phase(std::string_view phase) {
+    const auto requested = exit_requested_at.load();
+    if (!requested || !trace_process()) return;
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr, "[alchemy process] %llu: %.*s %.2f s after the exit request\n",
+                 static_cast<unsigned long long>(host::process::current_pid()), static_cast<int>(phase.size()), phase.data(),
+                 static_cast<double>(now - requested) / 1e9);
+}
+
 void ProcessContext::request_exit(std::uint32_t status) {
     {
         std::lock_guard lock(mutex_);
         if (exit_) return;
         exit_ = status;
+        exiting_.store(true, std::memory_order_release);
     }
+    std::int64_t unset = 0;
+    exit_requested_at.compare_exchange_strong(unset, std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
     // ALCHEMY_TRACE_PROCESS=1: the process ends itself (a process that is
     // killed or crashes says nothing here).
-    static const bool trace = [] { const auto value = host::process::environment("ALCHEMY_TRACE_PROCESS"); return value && value->starts_with("1"); }();
-    if (trace) {
+    if (trace_process()) {
         const auto started = host::process::start_time().value_or(0);   // Unix nanoseconds
         const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());

@@ -18,6 +18,7 @@
 #          [-Frames 1] [-Title 'Alchemy probe JS'] [-TitleNot '*running*'] [-Pass 'Alchemy WebGL: PASS']
 #          [-Url file:///...] [-Timeout 300] [-CloseTimeout 120]
 #          [-User harness] [-Headless] [-SingleProcess | -NoSingleProcess] [-Gpu | -SwiftShader] [-Jit] [-Extra @('--flag')] [-Env @{ NAME='value' }]
+#          [-WatchPages] [-CloseDump <seconds>] [-KeepInput]
 # -Title is a -like pattern ('Alchemy WebGL: *'); page titles matching -TitleNot are not taken. With -Pass, the
 # matched title must also match that pattern, or the run fails (Chrome is still closed and its exit checked).
 # The matched title is in status.txt.
@@ -58,7 +59,12 @@ param(
     [string[]]$Extra = @(),
     [hashtable]$Env = @{},
     # Attach to every page from its start (Target.setAutoAttach) and log its navigation events and crashes.
-    [switch]$WatchPages
+    [switch]$WatchPages,
+    # Touch the hang-dump trigger this many seconds after Browser.close if Chrome still runs: every process
+    # left prints where its threads wait during teardown (stderr, and hang-dump-<pid>.txt host stacks).
+    [double]$CloseDump = 0,
+    # Keep the DevTools input pipe open until Chrome exits (by default it closes once Browser.close is answered).
+    [switch]$KeepInput
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
@@ -294,11 +300,22 @@ try {
     }
     $closeId = Send-Cdp 'Browser.close'
     Step 'Browser.close sent'
-    $closing = [Diagnostics.Stopwatch]::StartNew()
+    $closing = [Diagnostics.Stopwatch]::StartNew(); $closeDumped = $false
     while (-not $process.HasExited -and $closing.Elapsed.TotalSeconds -lt $CloseTimeout) {
+        if ($CloseDump -gt 0 -and -not $closeDumped -and $closing.Elapsed.TotalSeconds -ge $CloseDump) {
+            Set-Content $hangTrigger (Get-Date -Format o); $closeDumped = $true
+            Step "hang dump requested $CloseDump s after Browser.close"
+        }
         if ($pipeEnded) { Start-Sleep -Milliseconds 200; continue }
         foreach ($message in (Receive-Cdp 500)) {
-            if ($message.PSObject.Properties['id'] -and $message.id -eq $closeId) { Step 'Browser.close answered' }
+            if ($message.PSObject.Properties['id'] -and $message.id -eq $closeId) {
+                Step 'Browser.close answered'
+                # Nothing more is sent. Chrome stops its pipe reader with shutdown(), which ends a blocked read
+                # only on a socket (what DevTools clients usually pass: libuv's pipes are socketpairs); fd 3 here
+                # is a pipe, so its reader ends at the end of input instead, as with any pipe client. Until then
+                # a teardown task joins that reader (6-18 s teardowns instead of 1-6 s).
+                if (-not $KeepInput) { $toChrome.Dispose(); Step 'DevTools input closed' }
+            }
         }
     }
     # HasExited, not WaitForExit: WaitForExit also waits for the redirected streams, which helper

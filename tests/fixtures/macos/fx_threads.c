@@ -18,6 +18,7 @@ extern void* dispatch_semaphore_create(long);
 extern long dispatch_semaphore_wait(void*, unsigned long long);
 extern int puts(const char*);
 extern int usleep(unsigned);
+extern unsigned sleep(unsigned);
 struct kevent64_s { unsigned long ident; short filter; unsigned short flags; unsigned fflags; long data; unsigned long udata; unsigned long ext[2]; };
 extern int kqueue(void);
 extern int kevent64(int, const struct kevent64_s*, int, struct kevent64_s*, int, unsigned, const void*);
@@ -182,6 +183,18 @@ static void* sleeper(void* argument) {
     for (;;) if (usleep(100000) < 0) { puts("fx threads: usleep failed during exit"); abort(); }
 }
 
+/* Faults as soon as its sleep returns: only a wait that returns at process exit gets there.
+   The first sleep makes later calls take fx's native entry, which returns into translated
+   code without passing the dispatcher (as Chrome's frequent pthread_join calls do). */
+static void* late_faulter(void* argument) {
+    (void)argument;
+    sleep(0);
+    __atomic_fetch_add((int*)&started, 1, __ATOMIC_SEQ_CST);
+    sleep(100);
+    *(volatile int*)0x28 = 1;
+    return 0;
+}
+
 static void* exiter(void* argument) {
     while (started < (int)(unsigned long)argument) usleep(1000);
     usleep(20000);
@@ -276,6 +289,15 @@ int main(int argc, char** argv) {
         usleep(50000);
         puts("fx threads: exit with waiting workers");
         _exit(0);   /* as Chrome's TerminateCurrentProcessImmediately */
+    }
+    if (same(mode, "exit-fault")) {
+        /* A worker in sleep() while main exits: no worker code runs after _exit on Darwin. */
+        pthread_t thread;
+        if (pthread_create(&thread, 0, late_faulter, 0)) return 70;
+        while (started < 1) usleep(1000);
+        usleep(50000);
+        puts("fx threads: exit with a sleeping worker");
+        _exit(0);
     }
     if (same(mode, "trap")) __builtin_trap();
     if (same(mode, "abort")) abort();
