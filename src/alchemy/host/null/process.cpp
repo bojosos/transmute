@@ -15,6 +15,9 @@ Handle standard_handle(Standard) noexcept { return {}; }
 Result<Usage> usage(std::uint32_t) { return Error::unsupported; }
 Result<ThreadUsage> thread_usage() { return Error::unsupported; }
 Result<MemoryUsage> memory_usage() { return Error::unsupported; }
+Result<int> priority() { return Error::unsupported; }
+Status set_priority(int) { return Error::unsupported; }
+Status set_background(bool, bool) { return Error::unsupported; }
 Result<std::vector<Entry>> list() { return Error::unsupported; }
 std::optional<std::string> environment(std::string_view) { return std::nullopt; }
 std::vector<std::string> environment_block() { return {}; }

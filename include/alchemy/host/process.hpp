@@ -47,6 +47,13 @@ struct MemoryUsage {
     std::uint64_t private_bytes{}, heap_committed_bytes{};
 };
 [[nodiscard]] Result<MemoryUsage> memory_usage();
+// Scheduling priority of this process as a nice value, -20 (highest) to 20 (getpriority/setpriority):
+// set_priority picks the host priority class nearest to `nice` (never a real-time one) and priority reports
+// the class as a nice value. set_background puts this process (whole_process) or the calling thread in or out
+// of the host's background mode (PRIO_DARWIN_BG): lower CPU, I/O and memory priority.
+[[nodiscard]] Result<int> priority();
+[[nodiscard]] Status set_priority(int nice);
+[[nodiscard]] Status set_background(bool whole_process, bool background);
 
 // The host processes now running (proc_listpids, sysctl KERN_PROC).
 struct Entry { std::uint32_t pid{}, parent{}; };

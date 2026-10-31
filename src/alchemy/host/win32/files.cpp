@@ -544,7 +544,8 @@ Status unlock(Handle file, std::uint64_t offset, std::uint64_t length) {
     return {};
 }
 
-Status set_times(std::string_view path, std::optional<std::int64_t> accessed_ns, std::optional<std::int64_t> modified_ns) {
+namespace {
+Status set_path_times(std::string_view path, std::optional<std::int64_t> accessed_ns, std::optional<std::int64_t> modified_ns, bool follow) {
     // FILETIME counts 100 ns from 1601-01-01.
     constexpr std::int64_t epoch = 11644473600LL * 10'000'000LL;
     const auto convert = [](std::int64_t value, FILETIME& out) {
@@ -556,14 +557,25 @@ Status set_times(std::string_view path, std::optional<std::int64_t> accessed_ns,
     };
     FILETIME accessed{}, modified{};
     if ((accessed_ns && !convert(*accessed_ns, accessed)) || (modified_ns && !convert(*modified_ns, modified))) return Error::invalid_argument;
+    // FILE_FLAG_OPEN_REPARSE_POINT opens a symbolic link itself.
+    const DWORD flags = FILE_FLAG_BACKUP_SEMANTICS | (follow ? 0 : FILE_FLAG_OPEN_REPARSE_POINT);
     const auto file = CreateFileW(win32::widen(path).c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                  nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                                  nullptr, OPEN_EXISTING, flags, nullptr);
     if (file == INVALID_HANDLE_VALUE) return win32::last_error();
     const bool set = SetFileTime(file, nullptr, accessed_ns ? &accessed : nullptr, modified_ns ? &modified : nullptr) != 0;
     const auto code = GetLastError();
     CloseHandle(file);
     if (!set) return win32::error(code);
     return {};
+}
+} // namespace
+
+Status set_times(std::string_view path, std::optional<std::int64_t> accessed_ns, std::optional<std::int64_t> modified_ns) {
+    return set_path_times(path, accessed_ns, modified_ns, true);
+}
+
+Status set_link_times(std::string_view path, std::optional<std::int64_t> accessed_ns, std::optional<std::int64_t> modified_ns) {
+    return set_path_times(path, accessed_ns, modified_ns, false);
 }
 
 Status rename(std::string_view from, std::string_view to, bool replace) {

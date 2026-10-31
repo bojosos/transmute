@@ -261,6 +261,9 @@ void file_table(const std::string& directory) {
     require(files::set_times(path, std::nullopt, 1'000'000'000LL * 1'700'000'000) &&
                 files::metadata(path)->accessed_ns == 1'000'000'000LL * 1'500'000'000,
         "set_times leaves an absent time");
+    require(files::set_link_times(path, std::nullopt, 1'000'000'000LL * 1'650'000'000) &&
+                files::metadata(path)->modified_ns == 1'000'000'000LL * 1'650'000'000,
+        "set_link_times on a file (not a link) sets its times");
     require(files::access(path, true) && files::set_read_only(path, true) && files::access(path, false) &&
                 files::access(path, true).error() == host::Error::access_denied && files::set_read_only(path, false),
         "access");
@@ -478,6 +481,9 @@ void null_backend() {
         "null open fails");
     require(host::process::usage().error() == host::Error::unsupported && host::process::list().error() == host::Error::unsupported,
         "null process queries fail");
+    require(host::process::priority().error() == host::Error::unsupported && host::process::set_priority(0).error() == host::Error::unsupported &&
+            host::process::set_background(true, true).error() == host::Error::unsupported &&
+            host::files::set_link_times("x", std::nullopt, std::nullopt).error() == host::Error::unsupported, "null priorities and link times fail");
     require(host::time::process_cpu_ns().error() == host::Error::unsupported, "null CPU time fails");
     require(host::process::environment_block().empty() && host::process::image_path(1).error() == host::Error::unsupported,
         "null process queries are empty");
@@ -881,6 +887,11 @@ void real_backend() {
     require(host::process::current_thread_id() != 0, "a thread id");
     const auto usage = host::process::usage();
     require(usage && usage->resident > 0 && usage->virtual_size > 0, "this process's usage");
+    // Priority classes as nice values, and the calling thread's background mode.
+    require(host::process::set_priority(5) && *host::process::priority() == 5 && host::process::set_priority(0) &&
+            *host::process::priority() == 0, "set_priority and priority");
+    require(host::process::set_background(false, true) && host::process::set_background(false, true) &&
+            host::process::set_background(false, false), "set_background on the calling thread");
     const auto processes = host::process::list();
     bool listed = false;
     if (processes) for (const auto& entry : *processes) listed = listed || entry.pid == host::process::current_pid();

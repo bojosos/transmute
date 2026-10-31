@@ -72,6 +72,39 @@ Status set_environment(std::string_view name, std::optional<std::string_view> va
     return {};
 }
 
+// Nice values and priority classes: -20..-15 high, -14..-1 above normal, 0 normal, 1..14 below normal,
+// 15..20 idle; a class reads back as one nice value in its range (-20 for a real-time class).
+Result<int> priority() {
+    switch (GetPriorityClass(GetCurrentProcess())) {
+    case REALTIME_PRIORITY_CLASS: return -20;
+    case HIGH_PRIORITY_CLASS: return -15;
+    case ABOVE_NORMAL_PRIORITY_CLASS: return -5;
+    case NORMAL_PRIORITY_CLASS: return 0;
+    case BELOW_NORMAL_PRIORITY_CLASS: return 5;
+    case IDLE_PRIORITY_CLASS: return 15;
+    default: return win32::last_error();
+    }
+}
+
+Status set_priority(int nice) {
+    const DWORD value = nice <= -15 ? HIGH_PRIORITY_CLASS : nice < 0 ? ABOVE_NORMAL_PRIORITY_CLASS : nice == 0 ? NORMAL_PRIORITY_CLASS
+        : nice < 15 ? BELOW_NORMAL_PRIORITY_CLASS : IDLE_PRIORITY_CLASS;
+    if (!SetPriorityClass(GetCurrentProcess(), value)) return win32::last_error();
+    return {};
+}
+
+Status set_background(bool whole_process, bool background) {
+    const bool set = whole_process
+        ? SetPriorityClass(GetCurrentProcess(), background ? PROCESS_MODE_BACKGROUND_BEGIN : PROCESS_MODE_BACKGROUND_END) != 0
+        : SetThreadPriority(GetCurrentThread(), background ? THREAD_MODE_BACKGROUND_BEGIN : THREAD_MODE_BACKGROUND_END) != 0;
+    if (set) return {};
+    // Entering a mode already entered (or leaving one not entered) leaves it as asked.
+    const auto code = GetLastError();
+    if (code == ERROR_PROCESS_MODE_ALREADY_BACKGROUND || code == ERROR_PROCESS_MODE_NOT_BACKGROUND ||
+        code == ERROR_THREAD_MODE_ALREADY_BACKGROUND || code == ERROR_THREAD_MODE_NOT_BACKGROUND) return {};
+    return win32::error(code);
+}
+
 std::vector<std::string> environment_block() {
     std::vector<std::string> result;
     if (auto* block = GetEnvironmentStringsW()) {

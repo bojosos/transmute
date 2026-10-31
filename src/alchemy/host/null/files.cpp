@@ -42,6 +42,7 @@ Status lock(Handle, std::uint64_t, std::uint64_t, bool) { return Error::unsuppor
 Status unlock(Handle, std::uint64_t, std::uint64_t) { return Error::unsupported; }
 Error error(const std::error_code& code) noexcept { return code ? Error::other : Error::none; }
 Status set_times(std::string_view, std::optional<std::int64_t>, std::optional<std::int64_t>) { return Error::unsupported; }
+Status set_link_times(std::string_view, std::optional<std::int64_t>, std::optional<std::int64_t>) { return Error::unsupported; }
 Status rename(std::string_view, std::string_view, bool) { return Error::unsupported; }
 Status access(std::string_view, bool) { return Error::unsupported; }
 bool is_console(Handle) noexcept { return false; }
