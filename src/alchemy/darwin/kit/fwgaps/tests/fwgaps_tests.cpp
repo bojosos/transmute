@@ -93,7 +93,7 @@ void graphics(Fixture& f) {
     require(f.call(cg, "_CGEventCreateFromData", {0, f.call(cf, "_CFDataCreate", {0, f.text("junk"), 4})}) == 0, "invalid data");
     require(f.call(cg, "_CGPreflightScreenCaptureAccess") == 0, "no screen capture");
     require(f.call(cg, "_CGWindowListCopyWindowInfo", {0, 0}) == 0, "no window list");
-    require(f.call(cg, "_CGPDFDocumentCreateWithProvider", {0x1000}) == 0, "no PDF");
+    require(f.call(cg, "_CGPDFDocumentCreateWithProvider", {0}) == 0, "no provider, no PDF document");   // reading: coregraphics/tests/pdf_tests.cpp
     require(f.status(cg, "_CGSSetWindowAlpha", {0, 1, 0}) == 1002, "CGS calls: invalid connection");
     require(f.string_constant(cg, "_kCGWindowNumber") == "kCGWindowNumber", "kCGWindowNumber");
     // CATransform3D.
