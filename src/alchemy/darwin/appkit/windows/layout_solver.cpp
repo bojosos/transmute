@@ -1,9 +1,9 @@
 #include "alchemy/darwin/appkit/windows/layout_solver.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <limits>
-#include <set>
 #include <utility>
 
 // The incremental simplex tableau of layout_solver.hpp. The tableau keeps
@@ -13,6 +13,11 @@
 // constraint contributes a marker symbol (and possibly a second error
 // symbol) so it can be removed again; preferences contribute error symbols
 // weighted in the objective level of their priority.
+//
+// Rows keep their cells as vectors sorted by symbol (layouts of a few
+// thousand constraints pivot thousands of times, and every pivot substitutes
+// into every row, so lookups and row additions must be cheap: a binary
+// search, and a linear merge).
 namespace alchemy::gui::completion_kit::layout {
 
 Expression& Expression::plus(const Expression& other, double scale) {
@@ -44,21 +49,82 @@ struct Symbol {
     friend bool operator==(const Symbol& a, const Symbol& b) { return a.id == b.id; }
 };
 
+// A row's cells: (symbol, coefficient) sorted by symbol, no zero coefficients.
+class Cells {
+public:
+    using Entry = std::pair<Symbol, double>;
+    using const_iterator = std::vector<Entry>::const_iterator;
+    using iterator = std::vector<Entry>::iterator;
+    [[nodiscard]] const_iterator begin() const { return entries_.begin(); }
+    [[nodiscard]] const_iterator end() const { return entries_.end(); }
+    [[nodiscard]] iterator begin() { return entries_.begin(); }
+    [[nodiscard]] iterator end() { return entries_.end(); }
+    [[nodiscard]] bool empty() const { return entries_.empty(); }
+    [[nodiscard]] std::size_t size() const { return entries_.size(); }
+    [[nodiscard]] iterator find(const Symbol& symbol) {
+        const auto at = lower(symbol);
+        return at != entries_.end() && at->first == symbol ? at : entries_.end();
+    }
+    [[nodiscard]] const_iterator find(const Symbol& symbol) const {
+        const auto at = std::lower_bound(entries_.begin(), entries_.end(), symbol, [](const Entry& e, const Symbol& s) { return e.first < s; });
+        return at != entries_.end() && at->first == symbol ? at : entries_.end();
+    }
+    void erase(iterator at) { entries_.erase(at); }
+    void erase(const Symbol& symbol) {
+        if (const auto at = find(symbol); at != entries_.end()) entries_.erase(at);
+    }
+    // Adds `coefficient` to the symbol's cell (dropping it when it cancels).
+    void add(const Symbol& symbol, double coefficient) {
+        const auto at = lower(symbol);
+        if (at != entries_.end() && at->first == symbol) {
+            at->second += coefficient;
+            if (near_zero(at->second)) entries_.erase(at);
+        } else if (!near_zero(coefficient)) {
+            entries_.insert(at, {symbol, coefficient});
+        }
+    }
+    // this += other * coefficient, as one merge.
+    void add(const Cells& other, double coefficient) {
+        if (other.entries_.empty()) return;
+        std::vector<Entry> merged;
+        merged.reserve(entries_.size() + other.entries_.size());
+        auto a = entries_.begin();
+        auto b = other.entries_.begin();
+        while (a != entries_.end() || b != other.entries_.end()) {
+            if (b == other.entries_.end() || (a != entries_.end() && a->first < b->first)) {
+                merged.push_back(*a++);
+            } else if (a == entries_.end() || b->first < a->first) {
+                const double value = b->second * coefficient;
+                if (!near_zero(value)) merged.push_back({b->first, value});
+                ++b;
+            } else {
+                const double value = a->second + b->second * coefficient;
+                if (!near_zero(value)) merged.push_back({a->first, value});
+                ++a;
+                ++b;
+            }
+        }
+        entries_ = std::move(merged);
+    }
+
+private:
+    iterator lower(const Symbol& symbol) {
+        return std::lower_bound(entries_.begin(), entries_.end(), symbol, [](const Entry& e, const Symbol& s) { return e.first < s; });
+    }
+    std::vector<Entry> entries_;
+};
+
 struct Row {
     double constant{};
-    std::map<Symbol, double> cells;
+    Cells cells;
 
     Row() = default;
     explicit Row(double value) : constant(value) {}
     double add(double value) { return constant += value; }
-    void insert(const Symbol& symbol, double coefficient = 1) {
-        auto& cell = cells[symbol];
-        cell += coefficient;
-        if (near_zero(cell)) cells.erase(symbol);
-    }
+    void insert(const Symbol& symbol, double coefficient = 1) { cells.add(symbol, coefficient); }
     void insert(const Row& other, double coefficient = 1) {
         constant += other.constant * coefficient;
-        for (const auto& [symbol, value] : other.cells) insert(symbol, value * coefficient);
+        cells.add(other.cells, coefficient);
     }
     void remove(const Symbol& symbol) { cells.erase(symbol); }
     void reverse_sign() {
@@ -161,14 +227,6 @@ struct Solver::Impl {
             if (it->second.cells.empty()) it = objective.erase(it);
             else ++it;
         }
-    }
-    // Sign of the objective coefficient vector of `symbol` (lexicographic).
-    [[nodiscard]] int objective_sign(const Symbol& symbol) const {
-        for (const auto& [priority, level] : objective) {
-            const auto value = level.coefficient(symbol);
-            if (!near_zero(value)) return value < 0 ? -1 : 1;
-        }
-        return 0;
     }
     // Compares objective(a) / ca with objective(b) / cb lexicographically.
     [[nodiscard]] int compare_ratio(const Symbol& a, double ca, const Symbol& b, double cb) const {
@@ -280,16 +338,35 @@ struct Solver::Impl {
         }
     }
 
+    // Bland's rule over the objective vector: the lowest symbol whose
+    // coefficient vector is lexicographically negative. The levels' cells are
+    // sorted by symbol, so one merge across the levels (highest priority
+    // first) visits each symbol once with its coefficients in level order.
+    Symbol entering_symbol() const {
+        struct Head { Cells::const_iterator at, end; };
+        std::vector<Head> heads;
+        heads.reserve(objective.size());
+        for (const auto& [priority, level] : objective) heads.push_back({level.cells.begin(), level.cells.end()});
+        for (;;) {
+            const Symbol* lowest = nullptr;
+            for (const auto& head : heads)
+                if (head.at != head.end && (!lowest || head.at->first < *lowest)) lowest = &head.at->first;
+            if (!lowest) return {};
+            const auto symbol = *lowest;
+            int sign = 0;
+            for (auto& head : heads) {   // in priority order
+                if (head.at == head.end || !(head.at->first == symbol)) continue;
+                if (sign == 0 && !near_zero(head.at->second)) sign = head.at->second < 0 ? -1 : 1;
+                ++head.at;
+            }
+            if (sign < 0 && symbol.type != SymbolType::dummy) return symbol;
+        }
+    }
+
     // Minimizes the lexicographic objective.
     void optimize() {
         for (;;) {
-            std::set<Symbol> candidates;
-            for (const auto& [priority, level] : objective)
-                for (const auto& [symbol, value] : level.cells)
-                    if (symbol.type != SymbolType::dummy) candidates.insert(symbol);
-            Symbol entering;
-            for (const auto& symbol : candidates)
-                if (objective_sign(symbol) < 0) { entering = symbol; break; }
+            const auto entering = entering_symbol();
             if (!entering.valid()) break;
             const auto leaving = leaving_row(entering);
             if (leaving == rows.end()) throw SolverError("layout solver: the objective is unbounded");
@@ -333,6 +410,13 @@ struct Solver::Impl {
         optimize_row(*artificial);
         const bool success = near_zero(artificial->constant);
         artificial.reset();
+        if (!success) {
+            // The artificial symbol is still basic (it could not reach 0):
+            // dropping its row drops the new constraint; the other rows are
+            // an equivalent form of the constraints present.
+            rows.erase(art);
+            return false;
+        }
         if (const auto it = rows.find(art); it != rows.end()) {
             Row basic = std::move(it->second);
             rows.erase(it);
@@ -413,22 +497,21 @@ ConstraintId Solver::add_constraint(const Expression& lhs, Relation relation, co
         subject = tag.marker;
     }
     if (!subject.valid()) {
-        // The artificial-variable phase pivots the tableau; a failure restores
-        // it, so a rejected constraint leaves the solver unchanged.
-        const auto saved_rows = d.rows;
-        const auto saved_objective = d.objective;
-        const auto saved_infeasible = d.infeasible;
+        // The artificial-variable phase only changes the basis: when it fails,
+        // the artificial row (the new constraint) goes and the tableau is an
+        // equivalent form of the constraints present, re-optimized, so a
+        // rejected constraint leaves the solution unchanged (no copy of the
+        // tableau is needed).
         bool added{};
         try {
             added = d.add_with_artificial_variable(row);
         } catch (...) {
-            d.rows = saved_rows; d.objective = saved_objective; d.infeasible = saved_infeasible; d.artificial.reset();
+            d.artificial.reset();
             d.prune_objective();
             throw;
         }
         if (!added) {
-            d.rows = saved_rows; d.objective = saved_objective; d.infeasible = saved_infeasible;
-            d.prune_objective();
+            d.optimize();
             throw UnsatisfiableConstraint("layout solver: the required constraint contradicts the required constraints present");
         }
     } else {

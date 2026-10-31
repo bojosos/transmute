@@ -5,6 +5,7 @@
 #include "alchemy/darwin/appkit/windows/layout_geometry.hpp"
 #include "alchemy/darwin/appkit/tests/windows_test_support.hpp"
 
+#include <chrono>
 #include <random>
 #include <string>
 #include <vector>
@@ -228,10 +229,11 @@ void popovers() {
     expect_rect(placed.frame, {180, 360, 213, 100}, "max x edge: right of the anchor");
 }
 
-// A window-sized layout: 100 labels in rows of a grid of stacks, about 700
-// constraints, solved incrementally and edited (300 labels took the solver
-// about 17 s, most of this test's time).
+// A window-sized layout: 300 labels in rows of a grid of stacks, about 2000
+// constraints, solved incrementally and edited, in well under a second (the
+// solver once took 17 s here; the bound is loose for loaded machines).
 void large_layout() {
+    const auto started = std::chrono::steady_clock::now();
     Solver s; layout::Ids ids;
     const auto c = layout::make_box(s, "container");
     layout::add(s, ids, c.x, Relation::equal, 0, layout::required);
@@ -241,7 +243,7 @@ void large_layout() {
     s.suggest_value(c.width, 1200);
     s.suggest_value(c.height, 900);
     std::vector<Box> rows;
-    for (int r = 0; r < 10; ++r) {
+    for (int r = 0; r < 30; ++r) {
         const auto row = layout::make_box(s, "row");
         layout::add(s, ids, row.x, Relation::equal, Expression(c.x).plus(10), layout::required);
         layout::add(s, ids, Expression(row.x).plus(row.width), Relation::equal, Expression(c.x).plus(c.width).plus(-10), layout::required);
@@ -257,6 +259,8 @@ void large_layout() {
     for (const double width : {1000.0, 1400.0, 800.0}) s.suggest_value(c.width, width);
     s.update_variables();
     require(near(s.value(rows.back().width), 780), "large layout row width after edits");
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    require(seconds < 3, "about 2000 constraints took " + std::to_string(seconds) + " s");
 }
 
 void frames() {
