@@ -622,6 +622,38 @@ void unix_sockets(Fixture& f) {
     static_cast<void>(f.call(sys, "_rmdir", {f.text(directory)}));
 }
 
+// The chmod family on a volume that keeps only a read-only attribute, as
+// Darwin's msdosfs does: every mode is accepted, the owner write bit decides
+// read-only and the other bits are ignored. Chrome's updater copies its app
+// with mkdir, chmod(directory, 0700) and fchmod(file, 0755).
+void chmod_modes(Fixture& f) {
+    const auto directory = scratch_directory(f, "chmod");
+    const auto folder = directory + "/App.app", path = directory + "/tool";
+    const auto info = f.block(144);
+    const auto mode = [&](const std::string& name) {
+        require(f.call(sys, "_stat", {f.text(name), info}) == 0, "stat");
+        return f.memory().read8(info + 4) | (f.memory().read8(info + 5) << 8);
+    };
+    require(f.call(sys, "_mkdir", {f.text(folder), 0755}) == 0, "mkdir");
+    require(f.call(sys, "_chmod", {f.text(folder), 0700}) == 0 && f.call(sys, "_chmod", {f.text(folder), 0755}) == 0,
+            "chmod of a directory to 0700 and 0755");
+    require(mode(folder) == 040777, "the directory stays 0777 (stat copies the owner's bits to group and other)");
+    alchemy::CallRegs open{};
+    open.x[0] = f.text(path); open.x[1] = 0x601;   // O_WRONLY | O_CREAT | O_TRUNC
+    open.push_variadic(std::uint64_t{0755});
+    const auto file = static_cast<std::int32_t>(f.regs(sys, "_open", open).x0);
+    require(file >= 0, "create a file");
+    require(f.call(sys, "_fchmod", {static_cast<Address>(file), 0755}) == 0, "fchmod 0755");
+    require(f.call(sys, "_fchmod", {static_cast<Address>(file), 04555}) == 0 && mode(path) == 0100444,
+            "fchmod 04555: read-only, the set-id bit ignored");
+    require(f.call(sys, "_fchmodat", {static_cast<Address>(-2), f.text(path), 0700, 0}) == 0 && mode(path) == 0100666,
+            "fchmodat 0700: writable again");
+    require(f.call(sys, "_chmod", {f.text(path), 0640}) == 0 && mode(path) == 0100666, "chmod 0640");
+    static_cast<void>(f.call(sys, "_close", {static_cast<Address>(file)}));
+    static_cast<void>(f.call(sys, "_unlink", {f.text(path)}));
+    for (const auto& name : {folder, directory}) static_cast<void>(f.call(sys, "_rmdir", {f.text(name)}));
+}
+
 // ProcessSingleton's links (Chromium process_singleton_posix.cc, design):
 // SingletonLock -> "<host>-<pid>" (dangling) and SingletonSocket -> a socket
 // in a temporary directory.
@@ -1353,6 +1385,7 @@ int main(int argc, char** argv) {
         {"sendfile_and_unix_eof", sendfile_and_unix_eof},
         {"unix_sockets", unix_sockets},
         {"symlink_records", symlink_records},
+        {"chmod_modes", chmod_modes},
         {"extended_attributes", extended_attributes},
         {"kevent_timers", kevent_timers},
         {"struct_layouts", struct_layouts},

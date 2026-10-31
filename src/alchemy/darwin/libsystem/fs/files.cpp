@@ -222,14 +222,16 @@ void DarwinServices::Impl::install_extra() {
         put_text(m, address, value);
         return address;
     }, 0);
-    // Windows ACLs cannot represent arbitrary Unix permission bits. Readonly is
-    // supported; unsupported ownership/group distinctions fail explicitly.
+    // The chmod family. The host keeps a file's write permission as its read-only
+    // attribute and no other mode bit (stat reports permissions from it). As on a
+    // Darwin volume that stores no Unix permissions (msdosfs's setattr), any mode
+    // is accepted: the owner write bit sets or clears read-only, and group, other,
+    // execute, set-id and sticky bits are ignored.
     install("_fchmod", [this](auto& s, auto&) {
         const auto record = file(static_cast<int>(s.x[0]));
         if (record->random_device) throw ServiceError{eperm};
         if (record->socket || record->queue) throw ServiceError{45};
         const auto mode = s.x[1] & 07777;   // chmod(2) ignores the file-type bits (libuv passes st_mode)
-        if (mode != 0444 && mode != 0666 && mode != 0400 && mode != 0600) throw ServiceError{enosys};
         if (const auto changed = host::files::set_read_only(path_text(record->path), !(mode & 0200)); !changed)
             throw ServiceError{crt_failure(changed.error())};
         return std::uint64_t{0};
@@ -237,9 +239,7 @@ void DarwinServices::Impl::install_extra() {
     install("_fchmodat", [this](auto& s, auto& m) {
         if (s.x[3]) throw ServiceError{einval};
         const auto name = filesystem_path_at(m, s.x[0], s.x[1]);
-        // The host's attributes hold write permission or none.
-        const auto mode = s.x[2] & 07777;
-        if (mode != 0444 && mode != 0666 && mode != 0400 && mode != 0600) throw ServiceError{enosys};
+        const auto mode = s.x[2] & 07777;   // only the owner write bit is kept (above)
         if (const auto changed = host::files::set_read_only(path_text(name), !(mode & 0200)); !changed) throw ServiceError{crt_failure(changed.error())};
         return std::uint64_t{0};
     });
@@ -836,8 +836,7 @@ void DarwinServices::Impl::install_python_services() {
     });
     install("_chmod", [this](auto& s, auto& m) {
         const auto name = filesystem_path(m, s.x[0]);
-        const auto mode = s.x[1] & 07777;
-        if (mode != 0444 && mode != 0666 && mode != 0400 && mode != 0600) throw ServiceError{enosys};
+        const auto mode = s.x[1] & 07777;   // only the owner write bit is kept (_fchmod)
         if (const auto changed = host::files::set_read_only(path_text(name), !(mode & 0200)); !changed) throw ServiceError{crt_failure(changed.error())};
         return std::uint64_t{0};
     });

@@ -692,12 +692,21 @@ finish.
 * Under Alchemy the install takes 9 to 16 s; natively it takes about 1 to 2 s. It spawns its crash handler and
   a `launchctl asuser` network worker, retries a mojo connection, and falls back after the network is denied.
   It also fails: "Can't chmod directory …/GoogleUpdater.app" and then "Copying app … failed"
-  (`mac_setup.mm:97`), with `--install` returning 15. That is an Alchemy file-system gap still to look into.
+  (`mac_setup.mm:97`), with `--install` returning 15.
+  * **Fixed:** `chmod`, `fchmod` and `fchmodat` accepted only 0444/0666/0400/0600 and failed every other mode with
+    `ENOSYS`. The updater's copy does `mkdir`, then `chmod(directory, 0700)` (0755 when world-readable), then
+    `fchmod` 0644/0755 per file (`CopyDir`, `chrome/updater/util/posix_util.cc`). Now any mode is accepted, as on
+    a Darwin volume that stores no Unix permissions (msdosfs's `setattr`): the owner write bit sets or clears the
+    read-only attribute, and the other bits are ignored. `stat` keeps reporting what the attribute implies.
+    Test: `alchemy_gui_libsystem_leftovers` `chmod_modes`.
+  * The install then copies the app and fails one step later. `launchctl bootout` and `launchctl bootstrap` of
+    its wake agent are unsupported (Alchemy has no launchd; only `launchctl asuser` runs), so `--install`
+    returns 27. Its time is unchanged: 5 to 8 s, against 4 to 12 s before (3 runs each, warm cache). A
+    successful install would need launchd jobs.
 * So a `Browser.close` while the install runs holds teardown past the watchdog. All 7 exit-2 runs had the
   updater running at close. None of the 15 runs without it failed; 7 of 15 runs with it did.
 * There is no switch to keep Chrome from installing the updater, short of the bundle's `KSProductID`, and
-  patching Chrome is out. The fix is faster helper processes (fx-jit-cost, as for Follow-up 5's slow launch),
-  plus the copy failure above.
+  patching Chrome is out. The fix is faster helper processes (fx-jit-cost, as for Follow-up 5's slow launch).
 
 **Harness: the DevTools input now closes after `Browser.close` is answered.** Chrome stops its pipe reader with
 `shutdown(fd, SHUT_RDWR)` (`devtools_pipe_handler.cc`). That ends a blocked read only on a socket, which is

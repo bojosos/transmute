@@ -33,6 +33,13 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   the wide forms (fwscanf, wscanf, swscanf and their va_list forms, wprintf/vwprintf/vfwprintf,
   fputws, fgetws, putwc/putwchar/getwchar, fwide) work on ASCII formats; gets, ctermid and
   vasprintf_l too.
+* **Permissions** (`fs/files.cpp`, `services_impl.hpp`): the host keeps a file's write
+  permission as its read-only attribute and no other mode bit, as Darwin's msdosfs does.
+  stat reports read, write unless read-only, execute for directories and .exe/.cmd/.bat/.com,
+  copied to group and other (0600/0700 for an owner-only ACL). chmod, fchmod and fchmodat
+  accept every mode: the owner write bit sets or clears read-only, and group, other,
+  execute, set-id and sticky bits are ignored, so stat shows what the attribute implies,
+  not the requested bits.
 * **Core libc additions** (both builds, `misc/libc_extra.cpp`, installed last by
   `install_darwin_support`): string and wide-string helpers, `<search.h>`,
   stdlib (putenv, strtonum, reallocarray, getsubopt, heapsort/mergesort/radixsort,
