@@ -460,17 +460,31 @@ struct ModuleLoader::Implementation {
         return std::nullopt;
     }
 
+    // Searches that try several libraries in turn must not stop at a probe stub (ALCHEMY_PROBE_MISSING) for the first
+    // library that lacks the name; the probe gets its stub only when no image or provider library has it.
+    std::optional<std::uint64_t> probe_stub(std::string_view name) {
+        if (ProcessContext::probe_mode() == ProcessContext::ProbeMode::off) return std::nullopt;
+        if (auto value = provider_symbol("/usr/lib/libSystem.B.dylib", name)) return value->address;
+        return std::nullopt;
+    }
+
     std::optional<std::uint64_t> binding(Module& module, std::int32_t ordinal,
                                         std::string_view name) {
         std::optional<Found> found;
         if (module.image.flat_namespace() && ordinal >= 0) {
-            if (auto value = global_symbol(name)) return value->address;
-            if (auto value = scope_symbol(module, name, true)) return value->address;
-            return std::nullopt;
+            {
+                const ProcessContext::RuntimeLookup lookup;
+                if (auto value = global_symbol(name)) return value->address;
+                if (auto value = scope_symbol(module, name, true)) return value->address;
+            }
+            return probe_stub(name);
         }
         if (ordinal == -2 || ordinal == -3) {
-            if (auto value = global_symbol(name, ordinal == -3)) return value->address;
-            return std::nullopt;
+            {
+                const ProcessContext::RuntimeLookup lookup;
+                if (auto value = global_symbol(name, ordinal == -3)) return value->address;
+            }
+            return ordinal == -2 ? probe_stub(name) : std::nullopt;   // a weak lookup (-3) may stay unbound
         }
         if (ordinal == 0) found = exported(module, name);
         else if (ordinal == -1 && main) found = exported(*main, name);
@@ -481,7 +495,10 @@ struct ModuleLoader::Implementation {
             else if (auto value = provider_symbol(module.image.dependencies()[index].install_name, name)) return value->address;
         } else throw std::runtime_error("unsupported special dylib ordinal");
         if (!found) return std::nullopt;
-        if (found->weak) if (auto coalesced = global_symbol(name, true)) return coalesced->address;
+        if (found->weak) {
+            const ProcessContext::RuntimeLookup lookup;   // coalescing must not pick a probe stub over the weak definition
+            if (auto coalesced = global_symbol(name, true)) return coalesced->address;
+        }
         return found->value.address;
     }
 
