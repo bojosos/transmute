@@ -135,7 +135,7 @@ void vectors(Fixture& f) {
     const auto window = f.block(16);
     static_cast<void>(f.call(vdsp, "_vDSP_hann_window", {window, 4, 0}));
     require(read_float(f, window, 0) == 0 && near(read_float(f, window, 2), 1), "Hann");
-    const auto m1 = floats(f, {1, 2, 3, 4, 5, 6}), m2 = floats(f, {1, 0, 0, 1, 1, 1}), product = f.block(16);
+    const auto m1 = floats(f, {1, 2, 3, 4, 5, 6}), m2 = floats(f, {1, 0, 0, 1, 1, 1}), product = f.block(24);   // mtrans writes 3 x 2
     alchemy::CallRegs mmul{};
     mmul.x = {m1, 1, m2, 1, product, 1, 2, 2};
     mmul.push_stack(std::uint64_t{3});
