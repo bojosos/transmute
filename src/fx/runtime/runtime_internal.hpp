@@ -235,6 +235,9 @@ struct ExitInfo {
     // The exit's node in the link or pending list of target_pc (regions.cpp
     // ExitRefs; an exit is in at most one), so removing it is O(1).
     std::uint32_t ref_node = UINT32_MAX;
+    // RegionExit::ic_offset (0: none): a BLR's inline cache. target_pc is 0
+    // (in no list) until its first fill (link_exit) sets it and the imm64.
+    std::uint32_t ic_offset = 0;
 };
 
 // A fixed array inside a region's metadata block (a region and all its
@@ -601,6 +604,7 @@ struct Counters {
     std::atomic<std::uint64_t> jit_window_regions_killed{};
     std::atomic<std::uint64_t> copy_translations{};
     std::atomic<std::uint64_t> copy_cache_hits{};
+    std::atomic<std::uint64_t> inline_cache_fills{};
 };
 inline std::uint64_t ticks_now() noexcept { return host::ticks(); }
 extern Counters g_counters;

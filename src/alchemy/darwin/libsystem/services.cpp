@@ -142,7 +142,9 @@ void DarwinServices::Impl::install_all() {
         [this](std::uint64_t address) { const auto block = allocations.find(address); return block ? std::max<std::uint64_t>(block->size, 1) : 0; },
         [this](std::uint64_t& blocks, std::uint64_t& bytes, std::uint64_t& peak) {
             blocks = allocations.count(); bytes = allocations.bytes(); peak = allocations.peak();
-        }}, malloc_zone);
+        },
+        [this](std::uint64_t size) { return allocate_small(size); },
+        [this](std::uint64_t address) { return release_small(address); }}, malloc_zone);
     install("_memcpy", [](auto& s, auto& m) { m.copy_bytes(s.x[0], s.x[1], s.x[2]); return s.x[0]; });
     install("_memmove", [](auto& s, auto& m) { m.copy_bytes(s.x[0], s.x[1], s.x[2], true); return s.x[0]; });
     install("_memset", [](auto& s, auto& m) { m.fill_bytes(s.x[0], static_cast<std::uint8_t>(s.x[1]), s.x[2]); return s.x[0]; });

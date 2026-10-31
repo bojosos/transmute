@@ -39,7 +39,11 @@ try {
         if (-not (Test-Path $lock) -or -not ((Get-Content $lock -TotalCount 1) -like "$PID *")) { break }   # released
     }
 } finally {
-    if ((Test-Path $lock) -and ((Get-Content $lock -TotalCount 1) -like "$PID *")) { Remove-Item -Force $lock }
-    "# fx perf measurement window`n`nNone open (closed $(Get-Date -Format s)). Building and guest runs are fine." | Set-Content $state
+    # A later window (an extension) owns the lock now: leave both the lock and its state file alone.
+    $ours = (Test-Path $lock) -and ((Get-Content $lock -TotalCount 1) -like "$PID *")
+    if ($ours) { Remove-Item -Force $lock }
+    if ($ours -or -not (Test-Path $lock)) {
+        "# fx perf measurement window`n`nNone open (closed $(Get-Date -Format s)). Building and guest runs are fine." | Set-Content $state
+    }
 }
 'window closed'

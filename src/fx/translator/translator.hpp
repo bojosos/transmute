@@ -87,10 +87,22 @@ struct RegionEntry {
 // them between two patchable jmps: `jmp A` (this field) initially reaches the
 // store, then `jmp B` (rel32_offset). The runtime links A when the target's
 // entry is flags_dead (no store), else B.
+//
+// ic_offset (0: none): a BLR's inline cache. The site compares the target
+// with the imm64 at ic_offset (8-byte aligned), kInlineCacheEmpty until the
+// runtime fills it, and on a match takes the jmp whose rel32 is at
+// rel32_offset (initially the inline lookup, which is always exact). Its
+// first miss while empty exits with ExitReason::link (exit_arg = the rel32
+// field, ctx->pc = the target): the runtime then writes the target into the
+// imm64, once, and from there on the site is an ordinary exit to that
+// target (target_pc is 0 until then), linked and unlinked like the others.
+// Other targets keep taking the inline lookup.
+inline constexpr std::uint64_t kInlineCacheEmpty = 1;
 struct RegionExit {
     std::uint32_t rel32_offset;
     std::uint64_t target_pc;
     std::uint32_t skip_rel32_offset{};
+    std::uint32_t ic_offset{};
 };
 
 enum class FlagsLocation : std::uint8_t {

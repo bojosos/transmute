@@ -256,7 +256,8 @@ private:
         if (late_) ++(w_.swept.test(rva / 4) ? out_.sweep : out_.flow);
 
         if (!w_.follow) return;
-        for (const RegionExit& x : region.exits) defer(x.target_pc);
+        for (const RegionExit& x : region.exits)
+            if (!x.ic_offset) defer(x.target_pc);   // an inline cache's target is found at run time
         for (const auto& [begin, end] : region.guest_ranges) {
             for (std::uint64_t pc = begin; pc + 4 <= end; pc += 4) {
                 std::uint32_t word = 0;

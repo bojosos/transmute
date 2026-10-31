@@ -173,6 +173,7 @@ RuntimeStats runtime_stats() {
     stats.reclaim_scan_failures = c.reclaim_scan_failures.load(std::memory_order_relaxed);
     stats.evicted_regions = c.evicted_regions.load(std::memory_order_relaxed);
     stats.retired_regions = c.retired_regions.load(std::memory_order_relaxed);
+    stats.inline_cache_fills = c.inline_cache_fills.load(std::memory_order_relaxed);
     stats.reclaim_seconds = static_cast<double>(c.reclaim_ticks.load(std::memory_order_relaxed)) * tick;
     stats.reclaim_scan_seconds = static_cast<double>(c.reclaim_scan_ticks.load(std::memory_order_relaxed)) * tick;
     return stats;

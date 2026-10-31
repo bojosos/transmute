@@ -126,6 +126,9 @@ void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void*
 // callback alone.
 using HostLeaf = bool (*)(GuestContext& ctx);
 void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user);
+// The same with `leaf_data` passed to the leaf (its second argument).
+using HostLeafWithData = bool (*)(GuestContext& ctx, void* leaf_data);
+void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* leaf_data, HostCallback callback, void* user);
 // Removes a register_host_entry / register_host_callback entry (no-op if
 // `guest_pc` has none). Exits linked to it are unlinked; the next branch to
 // `guest_pc` resolves it again (e.g. translates guest code there).

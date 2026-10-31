@@ -755,6 +755,9 @@ bool region_is_valid(const TranslatedRegion& r, std::uint64_t pc) {
         if ((e.skip_rel32_offset & 3) != 0 || std::uint64_t{e.skip_rel32_offset} + 4 > r.code.size() ||
             (e.skip_rel32_offset != 0 && e.skip_rel32_offset == e.rel32_offset))
             return false;
+        if (e.ic_offset != 0 && ((e.ic_offset & 7) != 0 || std::uint64_t{e.ic_offset} + 8 > r.code.size() ||
+                                 e.target_pc != 0 || e.skip_rel32_offset != 0))
+            return false;
     }
     for (const auto& f : r.fixups)
         if (std::uint64_t{f.offset} + 8 > r.code.size()) return false;
@@ -931,6 +934,7 @@ const void* install(const TranslatedRegion& t, std::uint64_t pc, std::uint64_t e
         std::int32_t original;
         std::memcpy(&original, code + e.rel32_offset, 4);
         new (&region->exits[i]) ExitInfo{e.rel32_offset, original, e.target_pc, false};
+        region->exits[i].ic_offset = e.ic_offset;
         if (e.skip_rel32_offset) {
             region->exits[i].skip_offset = e.skip_rel32_offset;
             std::memcpy(&region->exits[i].skip_original, code + e.skip_rel32_offset, 4);
@@ -1017,8 +1021,10 @@ const void* install(const TranslatedRegion& t, std::uint64_t pc, std::uint64_t e
         count(g_counters.retired_regions);
     }
     for_each_page(*r, [&](std::uint64_t page) { g.pages.add(page, r); });
-    // Link exits whose targets already exist; the others link when their target is installed.
+    // Link exits whose targets already exist; the others link when their
+    // target is installed. Inline caches wait for their first target.
     for (std::uint32_t i = 0; i < r->exits.size(); ++i) {
+        if (r->exits[i].ic_offset) continue;
         const std::uint64_t target = r->exits[i].target_pc;
         if (const MapEntry* entry = g.entries.find(target)) patch_link(*r, i, *entry);
         else g.pending.add(target, {r, i});
@@ -2020,16 +2026,28 @@ std::size_t live_regions_on_page(std::uint64_t address) {
     return g.pages.count(address & ~(kPage - 1));
 }
 
+// An inline cache's first fill (RegionExit::ic_offset) sets its target: the
+// imm64 the site compares with is written once, before the jmp is linked, so
+// a thread between the compare and the jmp only ever reaches this target's
+// entry or the lookup. From then on it is an ordinary exit to that target.
 void link_exit(std::uint64_t field, std::uint64_t target_pc, const void* host) {
     ExclusiveLock lock(g.map);
     Region* r = region_at(field);
     if (!r || r->dead) return;
     std::uint32_t index;
     ExitInfo* e = find_exit(*r, static_cast<std::uint32_t>(field - reinterpret_cast<std::uint64_t>(r->code)), index);
-    if (!e || e->linked || e->target_pc != target_pc) return;
+    if (!e || e->linked) return;
+    const bool fill = e->ic_offset && e->target_pc == 0 && target_pc != 0 && (target_pc & 3) == 0;
+    if (!fill && e->target_pc != target_pc) return;
     const MapEntry* entry = g.entries.find(target_pc);
     if (!entry || entry->host != host) return;
-    forget_pending(target_pc, r, index);   // an unlinked exit of a live region is pending
+    if (fill) {
+        e->target_pc = target_pc;
+        *reinterpret_cast<volatile std::uint64_t*>(r->code + e->ic_offset) = target_pc;
+        count(g_counters.inline_cache_fills);
+    } else {
+        forget_pending(target_pc, r, index);   // an unlinked exit of a live region is pending
+    }
     patch_link(*r, index, *entry);
 }
 
@@ -2333,6 +2351,10 @@ void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void*
 //   [mov [x31], sp's host]; lea rcx, [ctx]; mov rax, leaf; call rax; test al, al; jz fallback
 //   RSB top == x30 ? pop, jmp entry : pc = x30, jmp [stub_indirect_live]
 void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user) {
+    register_host_leaf(guest_pc, reinterpret_cast<HostLeafWithData>(leaf), nullptr, callback, user);   // rdx ignored
+}
+
+void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* leaf_data, HostCallback callback, void* user) {
     using x64::Gp;
     using x64::ptr;
     rt::ensure_initialized();
@@ -2356,6 +2378,7 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback call
     if ((conv.guest_mask >> 31) & 1u)   // sp for the leaf (Darwin's stack probe)
         a.mov(64, ptr(Gp::r15, x_disp(31)), x64::gp(static_cast<unsigned>(conv.host[31])));
     a.lea(64, Gp::rcx, ptr(Gp::r15, -kContextBias));
+    a.mov_imm64(Gp::rdx, reinterpret_cast<std::uint64_t>(leaf_data));
     a.mov_imm64(Gp::rax, reinterpret_cast<std::uint64_t>(leaf));
     a.call(Gp::rax);
     a.test(8, Gp::rax, Gp::rax);

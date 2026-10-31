@@ -106,12 +106,12 @@ void print_runtime_stats_if_requested() {
                                           "return_to_host", "interrupt", "raise", "redispatch", "tier_up",
                                           "tier_up_loop", "table_shadow"};
     std::fprintf(stderr, "transmute-fx stats: regions=%llu translations=%llu cache_hits=%llu links=%llu "
-                 "interpreted=%llu smc_faults=%llu host_callbacks=%llu guest_exceptions=%llu "
+                 "inline_caches=%llu interpreted=%llu smc_faults=%llu host_callbacks=%llu guest_exceptions=%llu "
                  "threads=%llu arena_used=%llu arena_committed=%llu reclaimed=%llu reclaim_passes=%llu "
                  "evicted=%llu\n",
                  (unsigned long long)st.regions, (unsigned long long)st.translations,
                  (unsigned long long)st.cache_hits, (unsigned long long)st.links,
-                 (unsigned long long)st.interpreted, (unsigned long long)st.smc_write_faults,
+                 (unsigned long long)st.inline_cache_fills, (unsigned long long)st.interpreted, (unsigned long long)st.smc_write_faults,
                  (unsigned long long)st.host_callbacks, (unsigned long long)st.guest_exceptions,
                  (unsigned long long)st.threads_created, (unsigned long long)st.arena_used,
                  (unsigned long long)st.arena_committed, (unsigned long long)st.reclaimed_bytes,

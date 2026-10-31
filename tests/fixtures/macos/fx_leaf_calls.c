@@ -1,7 +1,9 @@
 /* alchemy-fx engine fixture: libSystem's pure memory/string calls (memcpy,
  * memmove, bcopy, memset, bzero, memcmp, strlen), which the fx engine runs on
  * the guest registers without their handler while no byte faults
- * (FxEngine::set_guest_call_leaf). No SDK headers. Every case is called
+ * (FxEngine::set_guest_call_leaf), and malloc, calloc and free, which it runs
+ * on the host heap while the system zone is the default (malloc_zones.cpp's
+ * Zones::malloc_leaf). No SDK headers. Every case is called
  * several times: the first call of a function takes the SVC slot, later ones
  * its native entry. Prints "fx leaf calls: ok" and exits 0, or prints the
  * failing case and exits with its number.
@@ -13,7 +15,17 @@
  *    bzero/bcopy leave x0 as it was, x1 = 0; callee-saved registers kept
  *  6 strlen of an unreadable address: -1 and errno EFAULT (the handler path)
  *  7 ___chkstk_darwin (the stack probe of large frames, size in x9) keeps x0..x15,
- *    x17, x19 and sp, for sizes up to 256 KiB */
+ *    x17, x19 and sp, for sizes up to 256 KiB
+ *  8 allocator calls with and without leaves on the same pointers: malloc and
+ *    calloc blocks (heap sizes and a mapped 300 KiB one) through malloc_size,
+ *    malloc_zone_from_ptr, realloc and malloc_zone_free; posix_memalign and
+ *    malloc_zone_malloc blocks through free; free(NULL); calloc overflow is
+ *    NULL with ENOMEM
+ *  9 a guest zone made the default (the system zone unregistered): malloc and
+ *    calloc reach its callbacks, free of its pointer finds it through its size
+ *    callback, free of a system block still works; then the system zone is
+ *    the default again
+ * 10 four threads malloc, calloc, malloc_size and free at once */
 typedef unsigned long size_t;
 extern void* memcpy(void*, const void*, size_t);
 extern void* memmove(void*, const void*, size_t);
@@ -24,6 +36,21 @@ extern int memcmp(const void*, const void*, size_t);
 extern size_t strlen(const char*);
 extern int* __error(void);
 extern int puts(const char*);
+extern void* malloc(size_t);
+extern void* calloc(size_t, size_t);
+extern void* realloc(void*, size_t);
+extern void free(void*);
+extern size_t malloc_size(const void*);
+extern int posix_memalign(void**, size_t, size_t);
+struct zone;
+extern struct zone* malloc_default_zone(void);
+extern struct zone* malloc_zone_from_ptr(const void*);
+extern void malloc_zone_register(struct zone*);
+extern void malloc_zone_unregister(struct zone*);
+extern void* malloc_zone_malloc(struct zone*, size_t);
+extern void malloc_zone_free(struct zone*, void*);
+extern int pthread_create(unsigned long*, const void*, void* (*)(void*), void*);
+extern int pthread_join(unsigned long, void**);
 
 /* Called through volatile pointers: the compiler neither inlines nor folds them. */
 static void* (*volatile p_memcpy)(void*, const void*, size_t) = memcpy;
@@ -195,6 +222,170 @@ static int unreadable(void) {
     return 1;
 }
 
+/* ---- 8: allocator calls, leaf and handler on the same pointers ---- */
+static void* (*volatile p_malloc)(size_t) = malloc;
+static void* (*volatile p_calloc)(size_t, size_t) = calloc;
+static void (*volatile p_free)(void*) = free;
+
+static int filled(const unsigned char* p, size_t n, unsigned char value) {
+    for (size_t i = 0; i < n; ++i)
+        if (((const volatile unsigned char*)p)[i] != value) return 0;
+    return 1;
+}
+static void set_bytes(unsigned char* p, size_t n, unsigned char value) {
+    for (size_t i = 0; i < n; ++i) ((volatile unsigned char*)p)[i] = value;
+}
+
+static int allocations(void) {
+    static const size_t sizes[] = {0, 1, 24, 100, 4096, 70000, 300u << 10};
+    struct zone* const system = malloc_default_zone();
+    for (int rep = 0; rep < 4; ++rep) {
+        for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+            const size_t n = sizes[i];
+            unsigned char* p = p_malloc(n);
+            if (!p || ((unsigned long)p & 15) || malloc_size(p) < n || malloc_zone_from_ptr(p) != system) return 0;
+            set_bytes(p, n, 0xa5);
+            p = realloc(p, 2 * n + 8);   /* handler, on a leaf block */
+            if (!p || malloc_size(p) < 2 * n + 8 || !filled(p, n, 0xa5)) return 0;
+            p_free(p);                   /* leaf, on a handler block */
+            unsigned char* c = p_calloc(n + 1, 8);
+            if (!c || !filled(c, (n + 1) * 8, 0) || malloc_zone_from_ptr(c) != system) return 0;
+            set_bytes(c, (n + 1) * 8, 0x5a);
+            malloc_zone_free(system, c);   /* handler, on a leaf block */
+            void* aligned = 0;
+            if (posix_memalign(&aligned, i & 1 ? 64 : 8192, n + 1) || ((unsigned long)aligned & (i & 1 ? 63 : 8191)))
+                return 0;
+            if (malloc_zone_from_ptr(aligned) != system) return 0;
+            p_free(aligned);   /* an offset heap block (64) or a mapped one (8192) */
+            void* z = malloc_zone_malloc(system, n);
+            if (!z) return 0;
+            p_free(z);
+        }
+        p_free(0);
+        *__error() = 0;
+        if (p_calloc((size_t)-1 / 2, 4) || *__error() != 12) return 0;
+    }
+    return 1;
+}
+
+/* ---- 9: a guest zone as the default ---- */
+struct zone {
+    void* reserved1;
+    void* reserved2;
+    size_t (*size)(struct zone*, const void*);
+    void* (*malloc)(struct zone*, size_t);
+    void* (*calloc)(struct zone*, size_t, size_t);
+    void* (*valloc)(struct zone*, size_t);
+    void (*free)(struct zone*, void*);
+    void* (*realloc)(struct zone*, void*, size_t);
+    void (*destroy)(struct zone*);
+    const char* zone_name;
+    void* batch_malloc;
+    void* batch_free;
+    void* introspect;
+    unsigned version;
+    void* memalign;
+    void* free_definite_size;
+    void* pressure_relief;
+    void* claimed_address;
+};
+enum { kPoolSlots = 8, kPoolSlot = 256 };
+static _Alignas(16) unsigned char pool[kPoolSlots][kPoolSlot];
+static size_t pool_size[kPoolSlots];   /* 0: free; else the requested size + 1 */
+static volatile int pool_mallocs, pool_callocs, pool_frees;
+
+static int pool_slot(const void* p) {
+    for (int i = 0; i < kPoolSlots; ++i)
+        if (p == pool[i]) return i;
+    return -1;
+}
+static size_t pool_size_of(struct zone* zone, const void* p) {
+    (void)zone;
+    const int i = pool_slot(p);
+    return i >= 0 && pool_size[i] ? pool_size[i] - 1 : 0;
+}
+static void* pool_malloc(struct zone* zone, size_t n) {
+    (void)zone;
+    if (n >= kPoolSlot) return 0;
+    for (int i = 0; i < kPoolSlots; ++i)
+        if (!pool_size[i]) { pool_size[i] = n + 1; ++pool_mallocs; return pool[i]; }
+    return 0;
+}
+static void* pool_calloc(struct zone* zone, size_t count, size_t n) {
+    if (count && n > (size_t)-1 / count) return 0;
+    unsigned char* p = pool_malloc(zone, count * n);
+    if (p) { set_bytes(p, count * n, 0); --pool_mallocs; ++pool_callocs; }
+    return p;
+}
+static void pool_free(struct zone* zone, void* p) {
+    (void)zone;
+    const int i = pool_slot(p);
+    if (i >= 0) { pool_size[i] = 0; ++pool_frees; }
+}
+static struct zone guest_zone = {0, 0, pool_size_of, pool_malloc, pool_calloc, 0, pool_free, 0, 0, "fx-leaf-pool",
+                                 0, 0, 0, 6, 0, 0, 0, 0};
+
+static int guest_default(void) {
+    struct zone* const system = malloc_default_zone();
+    unsigned char* host_block = p_malloc(48);   /* a system block, freed while the guest zone is the default */
+    if (!host_block) return 0;
+    malloc_zone_register(&guest_zone);
+    malloc_zone_unregister(system);
+    int ok = malloc_default_zone() == &guest_zone;
+    for (int rep = 0; ok && rep < 4; ++rep) {
+        const int mallocs = pool_mallocs, callocs = pool_callocs, frees = pool_frees;
+        unsigned char* p = p_malloc(40);
+        unsigned char* c = p_calloc(3, 8);
+        ok = pool_slot(p) >= 0 && pool_slot(c) >= 0 && pool_mallocs == mallocs + 1 && pool_callocs == callocs + 1 &&
+             malloc_size(p) == 40 && malloc_zone_from_ptr(c) == &guest_zone && filled(c, 24, 0);
+        p_free(p);
+        p_free(c);
+        ok = ok && pool_frees == frees + 2;
+    }
+    p_free(host_block);
+    ok = ok && pool_frees == 8;
+    malloc_zone_register(system);
+    malloc_zone_unregister(&guest_zone);
+    ok = ok && malloc_default_zone() == system;
+    unsigned char* after = p_malloc(40);
+    ok = ok && after && pool_slot(after) < 0 && malloc_zone_from_ptr(after) == system && pool_mallocs == 4;
+    p_free(after);
+    return ok;
+}
+
+/* ---- 10: threads ---- */
+static void* churn(void* argument) {
+    const unsigned long seed = (unsigned long)argument;
+    unsigned char* held[16] = {0};
+    for (unsigned long i = 0; i < 20000; ++i) {
+        const unsigned slot = (unsigned)((i * 7 + seed) & 15);
+        if (held[slot]) {
+            if (!filled(held[slot], 8, (unsigned char)slot)) return (void*)1;
+            p_free(held[slot]);
+            held[slot] = 0;
+            continue;
+        }
+        const size_t n = 8 + ((i * 13 + seed) & 1023);
+        held[slot] = i & 1 ? p_calloc(1, n) : p_malloc(n);
+        if (!held[slot] || malloc_size(held[slot]) < n) return (void*)1;
+        set_bytes(held[slot], 8, (unsigned char)slot);
+    }
+    for (unsigned slot = 0; slot < 16; ++slot) p_free(held[slot]);
+    return 0;
+}
+
+static int threads(void) {
+    unsigned long thread[4];
+    for (unsigned long i = 0; i < 4; ++i)
+        if (pthread_create(&thread[i], 0, churn, (void*)(i + 1))) return 0;
+    int ok = 1;
+    for (unsigned long i = 0; i < 4; ++i) {
+        void* result = (void*)1;
+        if (pthread_join(thread[i], &result) || result) ok = 0;
+    }
+    return ok;
+}
+
 int main(void) {
     if (!copies()) { puts("fx leaf calls: case 1 (copies) failed"); return 1; }
     if (!fills()) { puts("fx leaf calls: case 2 (fills) failed"); return 2; }
@@ -203,6 +394,9 @@ int main(void) {
     if (!registers()) { puts("fx leaf calls: case 5 (registers) failed"); return 5; }
     if (!unreadable()) { puts("fx leaf calls: case 6 (strlen of an unreadable address) failed"); return 6; }
     if (!probes()) { puts("fx leaf calls: case 7 (stack probe) failed"); return 7; }
+    if (!allocations()) { puts("fx leaf calls: case 8 (allocator calls) failed"); return 8; }
+    if (!guest_default()) { puts("fx leaf calls: case 9 (a guest default zone) failed"); return 9; }
+    if (!threads()) { puts("fx leaf calls: case 10 (allocator threads) failed"); return 10; }
     puts("fx leaf calls: ok");
     return 0;
 }

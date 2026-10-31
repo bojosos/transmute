@@ -44,6 +44,7 @@ param(
     [string[]]$Bench = @('quick'),
     [int]$Rounds = 5,
     [switch]$NoWarmup,
+[switch]$FreshCache,                                        # a new fx cache per side and round, warmed by a discarded run
     [int]$MaxLoad = 25,
     [int]$QuietMinutes = 30,
     [switch]$NoQuietWait,
@@ -141,21 +142,36 @@ function Clear-PerfLock {
 }
 # WMI queries can fail transiently ("call cancelled"): a failed sample reads as busy, never ends the run.
 function Get-Load { try { [math]::Round((Get-CimInstance Win32_Processor -ErrorAction Stop | Measure-Object -Property LoadPercentage -Average).Average) } catch { 100 } }
-function Get-Builders {
-    # Compilers and linkers, and guest app runs of other sessions (no alchemy-fx of this script is running here).
+function Get-BuilderCpu {
+    # Compilers and linkers, and guest app runs of other sessions (no alchemy-fx of this script is running here):
+    # pid -> CPU seconds so far, or $null when WMI fails (counted as busy).
     try {
-        @(Get-CimInstance Win32_Process -ErrorAction Stop -Filter "Name='cl.exe' OR Name='link.exe' OR Name='ninja.exe' OR Name='lld-link.exe' OR Name='MSBuild.exe' OR Name='alchemy-fx.exe' OR Name='transmute-fx.exe'").Count
-    } catch { 99 }
+        $cpu = @{}
+        foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction Stop -Filter "Name='cl.exe' OR Name='link.exe' OR Name='ninja.exe' OR Name='lld-link.exe' OR Name='MSBuild.exe' OR Name='alchemy-fx.exe' OR Name='transmute-fx.exe'")) {
+            $cpu[[int]$p.ProcessId] = ([double]$p.KernelModeTime + [double]$p.UserModeTime) / 1e7
+        }
+        $cpu
+    } catch { $null }
+}
+function Get-Builders($before, $after) {
+    # Processes that used CPU between the two snapshots. A stuck process with no CPU time (a guest child that
+    # taskkill could not end) does not hold the measurement back.
+    if ($null -eq $before -or $null -eq $after) { return 99 }
+    @($after.Keys | Where-Object { -not $before.ContainsKey($_) -or $after[$_] - $before[$_] -gt 0.05 }).Count
 }
 function Wait-Quiet {
     if ($NoQuietWait) { return "$(Get-Load)" }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     while ($true) {
-        $builders = Get-Builders
+        $before = Get-BuilderCpu
         $loads = @(1..3 | ForEach-Object { Start-Sleep -Seconds 2; Get-Load })
+        $builders = Get-Builders $before (Get-BuilderCpu)
         $max = ($loads | Measure-Object -Maximum).Maximum
         if ($builders -eq 0 -and $max -lt $MaxLoad) { return ($loads -join '/') }
-        if ($clock.Elapsed.TotalMinutes -ge $QuietMinutes) { Say "  not quiet after $QuietMinutes min ($builders build or guest processes, load $($loads -join '/')): measuring anyway"; return "busy:$($loads -join '/')" }
+        # Background load alone may give up after -QuietMinutes and measure (marked busy). A running build or guest app
+        # (one using CPU) never does: it waits up to 6x longer, since a build inside a window distorts every sample.
+        $limit = if ($builders -gt 0) { 6 * $QuietMinutes } else { $QuietMinutes }
+        if ($clock.Elapsed.TotalMinutes -ge $limit) { Say "  not quiet after $limit min ($builders build or guest processes, load $($loads -join '/')): measuring anyway"; return "busy:$($loads -join '/')" }
         Start-Sleep -Seconds 20
     }
 }
@@ -394,6 +410,15 @@ try {
         foreach ($bench in $benches) {
             if ($bench -eq 'micro' -and $round -gt 0) { $null = Wait-Quiet; $null = Invoke-Native $round }
             foreach ($side in $order) {
+                if ($FreshCache -and $round -gt 0) {
+                    # A persistent fx cache fixes a side's level for its lifetime (2026-10-31 A/A: micro ~10 %, Cycles
+                    # ~20 % between identical sides). A fresh cache per side and round, warmed by one discarded run,
+                    # samples that luck instead of freezing it.
+                    $side.cache = Join-Path $Out "cache-$($side.label)-r$round"
+                    New-Item -ItemType Directory -Force $side.cache | Out-Null
+                    $null = Wait-Quiet
+                    $null = @(try { Invoke-Bench $bench $side (Join-Path $Out "r$round\$($side.label)\$bench-warm") } catch { Say "  $bench $($side.label) warm error: $_" })
+                }
                 $load = Wait-Quiet
                 Set-PerfLock
                 $dir = Join-Path $Out "r$round\$($side.label)\$bench"

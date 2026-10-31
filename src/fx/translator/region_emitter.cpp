@@ -2088,6 +2088,9 @@ void RegionEmitter::emit_stubs() {
             a_.align_rel32_after(1);
             emit_exit_jump(s.pc, s.skip_field);
             break;
+        case Stub::K::ic_miss:     // an inline cache's miss, rax = its cached target (emit_inline_cache)
+            emit_inline_cache_miss(s.field, s.lookup);
+            break;
         case Stub::K::exit_tail:   // unlinked tail of an in-line exit jmp (s.field: its opcode)
             fixup_imm64(Gp::rax, s.pc);
             a_.mov(64, ptr(Gp::r15, kPcDisp), Gp::rax);

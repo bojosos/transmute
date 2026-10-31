@@ -33,6 +33,12 @@ struct HostHeap {
     std::function<std::uint64_t(std::uint64_t address)> size;
     // malloc_statistics_t of the system zone: blocks, bytes in use, peak bytes.
     std::function<void(std::uint64_t& blocks, std::uint64_t& bytes, std::uint64_t& peak)> statistics;
+    // Optional fast paths for the engine's allocator leaves: a zero-filled
+    // block (alignment 16) and its release, only where neither needs a guest
+    // mapping, errno or an exception. 0 / false: not done, nothing changed
+    // (allocate / release then run).
+    std::function<std::uint64_t(std::uint64_t size)> allocate_small;
+    std::function<bool(std::uint64_t address)> release_small;
 };
 
 // Installs malloc, calloc, valloc, free, realloc, reallocf, malloc_size,

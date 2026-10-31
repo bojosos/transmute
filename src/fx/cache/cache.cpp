@@ -1208,7 +1208,8 @@ void cache_store_copy(const TranslatedRegion& region, std::int64_t delta) {
     moved.guest_start -= d;
     for (auto& [begin, end] : moved.guest_ranges) begin -= d, end -= d;
     for (auto& e : moved.entries) e.guest_pc -= d;
-    for (auto& e : moved.exits) e.target_pc -= d;
+    for (auto& e : moved.exits)
+        if (!e.ic_offset) e.target_pc -= d;   // inline caches: 0 until filled
     for (auto& f : moved.faults) f.guest_pc -= d;
     for (auto& f : moved.fixups) {
         if (f.kind != FixupKind::guest_address_imm64) continue;

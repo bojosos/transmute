@@ -181,6 +181,20 @@ void mark_engine_call_leaf(Engine& engine, std::uint64_t address, std::string_vi
     if constexpr (requires { engine.set_guest_call_leaf(address, symbol); }) engine.set_guest_call_leaf(address, symbol);
 }
 
+// A provider's own leaf for its synthetic call at `address`: `leaf(x, data)`
+// runs on the guest registers x[0..30] (x0..x9 current; x[31] = sp, read
+// only) before the handler, from translated code, and returns true when it
+// did the call (results in x0..x7). It may use host code and locks, but
+// must not call guest code, raise, change MXCSR or touch the FP registers;
+// returning false it must have changed nothing, and the handler runs. Engines
+// without the capability ignore it.
+using CallLeaf = bool (*)(std::uint64_t* x, void* data);
+template <class Engine>
+void mark_engine_call_custom_leaf(Engine& engine, std::uint64_t address, CallLeaf leaf, void* data) {
+    if constexpr (requires { engine.set_guest_call_custom_leaf(address, leaf, data); })
+        engine.set_guest_call_custom_leaf(address, leaf, data);
+}
+
 // ---- process stop (Darwin exit and fatal signals) ---------------------------
 // Optional engine capability: deliver a stop to every guest thread of the
 // process at its next safe point (back-edge, dispatcher exit, return from a
@@ -383,6 +397,10 @@ void engine_heap_release(Engine& engine, std::uint64_t address) {
     if constexpr (requires { engine.heap_release(address); }) engine.heap_release(address);
     else throw std::logic_error("engine has no guest heap");
 }
+// The engine has that heap (engine_heap_release does not throw logic_error).
+template <class Engine>
+inline constexpr bool engine_has_guest_heap =
+    requires(Engine& engine, std::uint64_t address) { engine.heap_release(address); };
 
 // Optional engine capability: a host->guest call with the full Apple ARM64
 // register image (x0..x8, q0..q7, stack arguments) returning x0/x1 and

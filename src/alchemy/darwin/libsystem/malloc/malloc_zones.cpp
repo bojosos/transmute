@@ -1,4 +1,5 @@
 #include "alchemy/darwin/libsystem/malloc/malloc_zones.hpp"
+#include "alchemy/host/process.hpp"
 
 #include <algorithm>
 #include <array>
@@ -151,6 +152,36 @@ public:
         result = {memory.read32(buffer), memory.read64(buffer + 8), memory.read64(buffer + 16), memory.read64(buffer + 24)};
         heap_.release(buffer);
         return result;
+    }
+
+    // ---- allocator leaves: malloc, calloc and free while the system zone is
+    // the default, on the host heap's fast paths. No guest call, errno or
+    // exception; false: nothing done, and the call's handler runs.
+    [[nodiscard]] bool has_leaves() const noexcept { return heap_.allocate_small && heap_.release_small; }
+    static bool malloc_leaf(std::uint64_t* x, void* data) noexcept {
+        auto& self = *static_cast<Zones*>(data);
+        if (self.default_zone() != self.system_ || ProcessContext::fork_child_guard()) return false;
+        const auto address = self.heap_.allocate_small(x[0]);
+        if (!address) return false;
+        x[0] = address;
+        return true;
+    }
+    static bool calloc_leaf(std::uint64_t* x, void* data) noexcept {
+        auto& self = *static_cast<Zones*>(data);
+        if (self.default_zone() != self.system_ || ProcessContext::fork_child_guard()) return false;
+        if (x[0] && x[1] > UINT64_MAX / x[0]) return false;   // ENOMEM: the handler's
+        const auto address = self.heap_.allocate_small(x[0] * x[1]);   // zero-filled
+        if (!address) return false;
+        x[0] = address;
+        return true;
+    }
+    // A pointer of a guest zone, a mapped block or no block at all: the handler's.
+    static bool free_leaf(std::uint64_t* x, void* data) noexcept {
+        auto& self = *static_cast<Zones*>(data);
+        if (ProcessContext::fork_child_guard()) return false;
+        if (x[0] && !self.heap_.release_small(x[0])) return false;
+        x[0] = 0;
+        return true;
     }
 
     // ---- process-wide calls (malloc(3) and friends) ----
@@ -318,18 +349,31 @@ void install_malloc_zones(ProcessContext& context, HostHeap heap, std::uint64_t 
     // A failed allocation returns 0 with errno ENOMEM.
     auto* process = &context;
     const auto install = [process](const char* name, Operation operation) {
-        static_cast<void>(process->install_function(name, [process, operation = std::move(operation)](auto& s, auto& m) {
+        return process->install_function(name, [process, operation = std::move(operation)](auto& s, auto& m) {
             try { s.x[0] = operation(s, m); }
             catch (const std::bad_alloc&) { process->set_errno(enomem); s.x[0] = 0; }
-        }));
+        });
     };
 
     // malloc(3): allocation goes to the default zone; free, realloc and
     // malloc_size to the zone that owns the pointer.
-    install("_malloc", [zones](auto& s, auto&) { return zones->zone_malloc(zones->default_zone(), s.x[0]); });
-    install("_calloc", [zones](auto& s, auto&) { return zones->zone_calloc(zones->default_zone(), s.x[0], s.x[1]); });
+    const auto malloc_call = install("_malloc", [zones](auto& s, auto&) { return zones->zone_malloc(zones->default_zone(), s.x[0]); });
+    const auto calloc_call = install("_calloc", [zones](auto& s, auto&) { return zones->zone_calloc(zones->default_zone(), s.x[0], s.x[1]); });
     install("_valloc", [zones](auto& s, auto&) { return zones->zone_valloc(zones->default_zone(), s.x[0]); });
-    install("_free", [zones](auto& s, auto&) { return zones->free_pointer(s.x[0]); });
+    const auto free_call = install("_free", [zones](auto& s, auto&) { return zones->free_pointer(s.x[0]); });
+    // Engines that run provider leaves (fx) take malloc, calloc and free
+    // from translated code without the handler while the host heap can
+    // (Zones::malloc_leaf); operator new and delete are the guest libc++'s
+    // and call these. ALCHEMY_FX_ALLOC_LEAF=0 keeps every call on its handler.
+    static const bool allocator_leaves = [] {
+        const auto value = host::process::environment("ALCHEMY_FX_ALLOC_LEAF");
+        return !(value && *value == "0");
+    }();
+    if (allocator_leaves && zones->has_leaves()) {
+        context.set_call_leaf(malloc_call, "_malloc", &Zones::malloc_leaf, zones.get());
+        context.set_call_leaf(calloc_call, "_calloc", &Zones::calloc_leaf, zones.get());
+        context.set_call_leaf(free_call, "_free", &Zones::free_leaf, zones.get());
+    }
     install("_realloc", [zones](auto& s, auto&) { return zones->realloc_pointer(s.x[0], s.x[1]); });
     // reallocf frees the old block when the reallocation fails.
     install("_reallocf", [zones](auto& s, auto&) {

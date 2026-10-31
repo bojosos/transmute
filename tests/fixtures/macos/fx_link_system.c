@@ -57,6 +57,18 @@ LINK_ONLY(pthread_once)
 LINK_ONLY(_tlv_bootstrap)
 LINK_ONLY(sys_icache_invalidate)
 LINK_ONLY(pthread_jit_write_protect_np)
+LINK_ONLY(malloc)
+LINK_ONLY(calloc)
+LINK_ONLY(realloc)
+LINK_ONLY(free)
+LINK_ONLY(malloc_size)
+LINK_ONLY(posix_memalign)
+LINK_ONLY(malloc_default_zone)
+LINK_ONLY(malloc_zone_from_ptr)
+LINK_ONLY(malloc_zone_register)
+LINK_ONLY(malloc_zone_unregister)
+LINK_ONLY(malloc_zone_malloc)
+LINK_ONLY(malloc_zone_free)
 unsigned mach_task_self_ = 0;
 /* Pure memory/string calls (fx_leaf_calls), with their own prototypes. */
 void* memcpy(void* d, const void* s, unsigned long n) { (void)s; (void)n; return d; }

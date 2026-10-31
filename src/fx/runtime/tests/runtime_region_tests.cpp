@@ -1014,6 +1014,35 @@ FX_TEST(host_leaf_runs_or_falls_back_to_its_callback) {
     set_region_factory(pm, nullptr);
 }
 
+namespace {
+// x0 a multiple of *data: divides it (handled). Else declines, changing nothing.
+bool divide_by(GuestContext& ctx, void* data) {
+    const auto divisor = *static_cast<const std::uint64_t*>(data);
+    if (ctx.x[0] % divisor) return false;
+    ctx.x[0] /= divisor;
+    return true;
+}
+} // namespace
+
+// register_host_leaf with leaf data: the leaf gets its data pointer.
+FX_TEST(host_leaf_gets_its_data) {
+    init();
+    GuestCode code({});
+    const auto callee = code.at(16);
+    CallbackLog log;
+    std::uint64_t divisor = 3;
+    register_host_leaf(callee, &divide_by, &divisor, &host_callback, &log);
+    const std::uint64_t nine[] = {9}, seven[] = {7};
+    FX_CHECK_EQ(call_guest(callee, nine), 3u);
+    FX_CHECK_EQ(log.calls, 0);
+    FX_CHECK_EQ(call_guest(callee, seven), 22u);   // 7 * 3 + 1: the callback
+    FX_CHECK_EQ(log.calls, 1);
+    divisor = 7;
+    FX_CHECK_EQ(call_guest(callee, seven), 1u);
+    FX_CHECK_EQ(log.calls, 1);
+    unregister_host_entry(callee);
+}
+
 // ---- process exit ---------------------------------------------------------------------------------
 // Keep last: runtime_prepare_exit stops the preloaders for good.
 

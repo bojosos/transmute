@@ -190,6 +190,10 @@ public:
     // strlen) its native entry runs them on the guest registers directly and
     // takes the handler only when that faults (engine_adapter.hpp).
     void set_guest_call_leaf(std::uint64_t address, std::string_view symbol);
+    // The provider's own leaf for the synthetic call at `address`
+    // (engine_adapter.hpp's CallLeaf): run on the guest registers before the
+    // handler, which runs when it returns false.
+    void set_guest_call_custom_leaf(std::uint64_t address, bool (*leaf)(std::uint64_t* x, void* data), void* data);
 
     // Called by the fx SVC hook on the thread running this engine.
     void handle_svc(void* guest_context, std::uint32_t immediate);

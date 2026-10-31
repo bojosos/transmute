@@ -44,6 +44,51 @@ void RegionEmitter::emit_indirect_jump() {
     a_.jmp(ctx_mem(offsetof(GuestContext, stub_indirect_live)));   // convention registers live
 }
 
+// A BLR's inline cache (RegionExit::ic_offset), target in rcx, state flushed:
+//   mov rax, imm64          ; the cached target (8-byte aligned), kInlineCacheEmpty until filled
+//   cmp rcx, rax
+//   jne miss
+//   jmp rel32               ; the target's entry once linked; initially the lookup
+// miss: rax == kInlineCacheEmpty ? exit(link, the jmp's field) : lookup
+// The miss (and the lookup) are cold with Plan::cold_layout. Clobbers rax,
+// rdx, r9 and EFLAGS.
+void RegionEmitter::emit_inline_cache() {
+    a_.nop(static_cast<unsigned>((8 - (a_.size() + 2) % 8) % 8));
+    a_.db(0x48);   // REX.W
+    a_.db(0xb8);   // mov rax, imm64
+    const auto ic_offset = static_cast<std::uint32_t>(a_.size());
+    a_.dq(kInlineCacheEmpty);
+    a_.cmp(64, Gp::rcx, Gp::rax);
+    const bool cold = plan_.cold_layout && !cold_;
+    Stub s{Stub::K::ic_miss, a_.new_label(), FlagsState::ctx, 0, 0, -1};
+    const auto miss = cold ? s.label : a_.new_label();
+    a_.jcc(Cond::ne, miss);
+    a_.align_rel32_after(1);
+    s.field = a_.bound_label();   // the jmp's opcode; its rel32 follows
+    s.lookup = a_.new_label();
+    const auto field_offset = static_cast<std::uint32_t>(a_.jmp(s.lookup));
+    out_.exits.push_back({field_offset, 0, 0, ic_offset});
+    if (cold) {
+        stubs_.push_back(s);
+        no_fall_at_ = a_.size();
+        return;
+    }
+    a_.bind(miss);
+    emit_inline_cache_miss(s.field, s.lookup);
+}
+
+// rax = the cached target: empty, the fill (ExitReason::link for the jmp at
+// `field`); else the lookup (bound here).
+void RegionEmitter::emit_inline_cache_miss(x64::Label field, x64::Label lookup) {
+    a_.cmp(64, Gp::rax, static_cast<std::int32_t>(kInlineCacheEmpty));
+    a_.jcc_short(Cond::ne, lookup);
+    a_.mov(64, ctx_mem(offsetof(GuestContext, pc)), Gp::rcx);
+    a_.lea(64, Gp::rax, x64::rip(field, 1));
+    a_.jmp(ctx_mem(offsetof(GuestContext, stub_link)));
+    a_.bind(lookup);
+    emit_indirect_jump();
+}
+
 void RegionEmitter::e_branch(const PlanInst& pi) {
     jump_to(pi.taken, static_cast<std::uint64_t>(pi.inst.imm));
 }
@@ -162,7 +207,8 @@ void RegionEmitter::e_call(const PlanInst& pi) {
     rsb_push(return_pc, pi.continuation, ret_reg);
     exit_pins(current_dirty());
     if (indirect) {
-        emit_indirect_jump();
+        if (plan_.inline_cache) emit_inline_cache();
+        else emit_indirect_jump();
         return;
     }
     // Calls always leave the region: the callee is translated as its own region.

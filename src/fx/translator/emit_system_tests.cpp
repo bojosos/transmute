@@ -215,15 +215,31 @@ FX_TEST(system_cycle_counter_reads_host_tsc_and_preserves_state) {
     }
 }
 
+// RNDR and RNDRRS: NZCV 0000 and a random value, or, architecturally
+// allowed when the host's RDRAND reports none (it does under load), NZCV
+// 0100 and 0. Every read must be one of the two; two successful reads (of
+// up to 32 tries) must differ.
 FX_TEST(system_rndr) {
-    auto ctx = make_context(3);
     unsigned consumed = 0;
     emitted_bytes(mrs(0xd53b2400u, 1), &consumed);
     if (consumed == 0) { std::printf("    rdrand unavailable: RNDR declined\n"); return; }
-    ctx.nzcv = 0xf0000000u;
-    Program({mrs(0xd53b2400u, 1), mrs(0xd53b2420u, 2)}).run(ctx);
-    FX_CHECK_EQ(ctx.nzcv & 0xf0000000u, std::uint64_t{0});
-    FX_CHECK(ctx.x[1] != ctx.x[2]);
+    std::uint64_t values[2]{};
+    unsigned successes = 0, failures = 0;
+    for (unsigned attempt = 0; attempt < 32 && successes < 2; ++attempt) {
+        auto ctx = make_context(3 + attempt);
+        ctx.nzcv = 0xf0000000u;
+        Program({mrs(attempt & 1 ? 0xd53b2420u : 0xd53b2400u, 1)}).run(ctx);   // RNDRRS / RNDR
+        const auto flags = ctx.nzcv & 0xf0000000u;
+        if (flags == 0x40000000u) {
+            FX_CHECK_EQ(ctx.x[1], std::uint64_t{0});
+            ++failures;
+            continue;
+        }
+        FX_CHECK_EQ(flags, std::uint64_t{0});
+        values[successes++] = ctx.x[1];
+    }
+    if (successes == 2) FX_CHECK(values[0] != values[1]);
+    else std::printf("    RNDR failed %u of 32 reads (host RDRAND): only the failure encoding checked\n", failures);
 }
 
 FX_TEST(system_declines_fp_and_privileged_registers) {

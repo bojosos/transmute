@@ -164,7 +164,8 @@ private:
         enum class K : std::uint8_t { direct_exit, edge, interrupt, entry, return_trampoline, entry_jump, tier_up,
                                       loop_tier_up, exit_tail, lookup, indirect_exit, reason_exit,
                                       region_tier_up,   // region_tier_up: a loop's counter ran out (tier 2)
-                                      flags_exit } k;   // flags_exit: an exit's flag store and jmp B (skip_field: jmp A)
+                                      flags_exit,       // flags_exit: an exit's flag store and jmp B (skip_field: jmp A)
+                                      ic_miss } k;      // ic_miss: an inline cache's miss (fill or lookup; field: its jmp)
         x64::Label label;
         FlagsState flags;
         std::uint64_t dirty;   // pinned GPRs (low 32 bits) and vectors (high 32 bits)
@@ -178,7 +179,8 @@ private:
         // entry's pin loads): evicted convention registers are still in
         // their hosts, so the exit must not reload them.
         bool boundary{};
-        x64::Label field{};             // exit_tail
+        x64::Label field{};             // exit_tail, ic_miss
+        x64::Label lookup{};            // ic_miss: its jmp's initial target
         std::uint32_t skip_field{};     // flags_exit: its jmp A's rel32 offset
         // Tier 2: pins lent to the register cache where the stub's code
         // starts (exits reload lent convention registers; edge stubs go from
@@ -527,6 +529,8 @@ private:
     void e_call(const PlanInst& pi);
     void e_indirect(const PlanInst& pi);
     void emit_indirect_jump();   // target in rcx, state flushed
+    void emit_inline_cache();    // a BLR's (RegionExit::ic_offset): target in rcx, state flushed
+    void emit_inline_cache_miss(x64::Label field, x64::Label lookup);
     void e_trap(const PlanInst& pi);
     // ---- switch dispatch (Plan::tables; emit_branch.cpp) ----
     void e_table_branch(const PlanInst& pi);

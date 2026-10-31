@@ -28,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -457,14 +458,16 @@ void print_runtime_statistics() {
     std::fprintf(stderr,
                  "alchemy-fx stats: translations %llu (%llu guest instructions), translate %.3f s "
                  "(jit %.3f s, install %.3f s), interpreted %llu, threads %llu, arena %llu KiB (dead %llu KiB), "
-                 "regions %llu, invalidated %llu, smc faults %llu, guest exceptions %llu\n  exits:",
+                 "regions %llu, links %llu (BLR inline caches %llu), invalidated %llu, smc faults %llu, "
+                 "guest exceptions %llu\n  exits:",
                  static_cast<unsigned long long>(stats.translations),
                  static_cast<unsigned long long>(stats.jit_guest_instructions), stats.translate_seconds,
                  stats.jit_seconds, stats.install_seconds, static_cast<unsigned long long>(stats.interpreted),
                  static_cast<unsigned long long>(stats.threads_created),
                  static_cast<unsigned long long>(stats.arena_used / 1024),
                  static_cast<unsigned long long>(stats.arena_dead / 1024),
-                 static_cast<unsigned long long>(stats.regions),
+                 static_cast<unsigned long long>(stats.regions), static_cast<unsigned long long>(stats.links),
+                 static_cast<unsigned long long>(stats.inline_cache_fills),
                  static_cast<unsigned long long>(stats.invalidated_regions),
                  static_cast<unsigned long long>(stats.smc_write_faults),
                  static_cast<unsigned long long>(stats.guest_exceptions));
@@ -587,6 +590,13 @@ struct FxEngine::Shared {
     std::unique_ptr<std::atomic<std::uint8_t>[]> integer_only{new std::atomic<std::uint8_t>[kMaximumGuestCalls]{}};
     // Slots with a leaf fast path (set_guest_call_leaf): a Leaf value.
     std::unique_ptr<std::atomic<std::uint8_t>[]> leaf{new std::atomic<std::uint8_t>[kMaximumGuestCalls]{}};
+    // Provider leaves (kLeafCustom slots, set_guest_call_custom_leaf), under
+    // call_lock; a node's address is the leaf data of its native entry.
+    struct CustomLeaf {
+        bool (*leaf)(std::uint64_t* x, void* data);
+        void* data;
+    };
+    std::unordered_map<std::uint64_t, CustomLeaf> custom_leaves;
     // Slots that have their native host-callback entry (set under call_lock).
     // A slot gets it at its first call, through the SVC slot: a Chrome process
     // registers about 14,000 provider calls and calls a small part of them,
@@ -1532,7 +1542,7 @@ std::uint64_t FxEngine::register_guest_call(GuestCallHandler handler) {
 // once when the probed range is inside the thread's guest stack.
 namespace {
 enum Leaf : std::uint8_t {
-    kLeafNone, kLeafMemcpy, kLeafBcopy, kLeafMemset, kLeafBzero, kLeafMemcmp, kLeafStrlen, kLeafStackProbe
+    kLeafNone, kLeafMemcpy, kLeafBcopy, kLeafMemset, kLeafBzero, kLeafMemcmp, kLeafStrlen, kLeafStackProbe, kLeafCustom
 };
 
 constexpr std::size_t kLeafStringLimit = std::size_t{1} << 20;   // = services' string_limit
@@ -1575,10 +1585,24 @@ bool leaf_call(fx::GuestContext& ctx) {
         if (length < 0 || static_cast<std::size_t>(length) >= kLeafStringLimit) return false;
         x[0] = static_cast<std::uint64_t>(length);
     }
-    x[1] = 0;
-    return true;
+    if constexpr (kind != kLeafStackProbe) {   // (returned above: no unreachable tail)
+        x[1] = 0;
+        return true;
+    }
+}
+
+bool custom_leaf_call(fx::GuestContext& ctx, void* data) {
+    const auto& custom = *static_cast<const FxEngine::Shared::CustomLeaf*>(data);
+    return custom.leaf(ctx.x, custom.data);
 }
 } // namespace
+
+void FxEngine::set_guest_call_custom_leaf(std::uint64_t address, bool (*leaf)(std::uint64_t* x, void* data), void* data) {
+    if (address < kGuestCallBase || address >= kGuestCallEnd || !leaf) return;
+    std::unique_lock lock(shared_->call_lock);
+    shared_->custom_leaves.insert_or_assign(address, Shared::CustomLeaf{leaf, data});
+    shared_->leaf[(address - kGuestCallBase) / kGuestCallStride].store(kLeafCustom, std::memory_order_relaxed);
+}
 
 void FxEngine::set_guest_call_leaf(std::uint64_t address, std::string_view symbol) {
     if (address < kGuestCallBase || address >= kGuestCallEnd) return;
@@ -1605,6 +1629,14 @@ void FxEngine::install_native_entry(std::uint64_t pc) {
     // Leaf fast paths skip the perf frame: with ALCHEMY_PERF every call is counted by its handler.
     fx::HostLeaf leaf = nullptr;
     if (!alchemy::perf::enabled()) {
+        if (shared_->leaf[index].load(std::memory_order_relaxed) == kLeafCustom) {
+            if (const auto found = shared_->custom_leaves.find(pc); found != shared_->custom_leaves.end())
+                fx::register_host_leaf(pc, &custom_leaf_call, &found->second, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
+            else fx::register_host_callback(pc, &FxEngine::host_callback, reinterpret_cast<void*>(pc));
+            shared_->native_entry[index].store(1, std::memory_order_release);
+            shared_->native_entries.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         switch (shared_->leaf[index].load(std::memory_order_relaxed)) {
         case kLeafMemcpy: leaf = &leaf_call<kLeafMemcpy>; break;
         case kLeafBcopy: leaf = &leaf_call<kLeafBcopy>; break;

@@ -31,7 +31,9 @@ inline constexpr std::uint32_t kRecordMagic = 0x4752'5846u;             // "FXRG
 // 5: code layout (RecordHeader::hot_bytes = TranslationStats::hot_bytes).
 // 6: flag stores skipped at links (DiskEntry::flags = RegionEntry::flags_dead,
 //    DiskExit::skip_rel32_offset = RegionExit::skip_rel32_offset).
-inline constexpr std::uint32_t kFormatVersion = 6;
+// 7: BLR inline caches (DiskExit::ic_offset = RegionExit::ic_offset; such an
+//    exit has target_rva 0: its target is found at run time).
+inline constexpr std::uint32_t kFormatVersion = 7;
 // RecordHeader::flags
 inline constexpr std::uint32_t kRecordPinned = 1;  // usable only with the module at pinned_base
 // A tier-0 (provisional, counted) region (TranslatedRegion::tier == 0). Lookups
@@ -115,7 +117,8 @@ inline bool record_tier0(const RecordHeader& h) noexcept { return (h.flags & kRe
 inline constexpr std::uint32_t kEntryFlagsDead = 1;   // DiskEntry::flags (format 6)
 struct DiskEntry { std::uint32_t rva; std::uint32_t offset; std::uint32_t flags; std::uint32_t reserved; };
 // skip_rel32_offset: 0, or a second patchable rel32 (format 6).
-struct DiskExit { std::uint32_t rel32_offset; std::uint32_t target_rva; std::uint32_t skip_rel32_offset; std::uint32_t reserved; };
+// ic_offset: 0, or an inline cache's imm64 (8-byte aligned; format 7).
+struct DiskExit { std::uint32_t rel32_offset; std::uint32_t target_rva; std::uint32_t skip_rel32_offset; std::uint32_t ic_offset; };
 // kind 0 (guest_address_imm64): `rva` is module-relative and rebased on load.
 // kind 1 (literal_imm64): `rva` holds the constant itself, never rebased.
 struct DiskFixup { std::uint32_t offset; std::uint32_t kind; std::uint64_t rva; };

@@ -146,6 +146,10 @@ public:
     [[nodiscard]] std::uint64_t install_function(std::string symbol,
         transmute::GuestCallHandler handler, std::string library = "/usr/lib/libSystem.B.dylib",
         const std::source_location& where = std::source_location::current());
+    // A provider fast path for the call `install_function` returned for
+    // `symbol` (engine_adapter.hpp's CallLeaf). Not set while `symbol` is
+    // traced (ALCHEMY_TRACE_CALLS): the trace keeps every call.
+    void set_call_leaf(std::uint64_t address, std::string_view symbol, bool (*leaf)(std::uint64_t* x, void* data), void* data);
     void install_export(std::string library, std::string symbol, RuntimeExport value,
         const std::source_location& where = std::source_location::current());
     [[nodiscard]] std::optional<RuntimeExport> resolve(std::string_view library,

@@ -355,16 +355,26 @@ thread_local ForkChildGuard* current_fork_child_guard = nullptr;
 
 ForkChildGuard*& ProcessContext::fork_child_guard() noexcept { return current_fork_child_guard; }
 
-std::uint64_t ProcessContext::install_function(std::string symbol,
-    transmute::GuestCallHandler handler, std::string library, const std::source_location& where) {
-    registration_audit::record_export(system_alias(library) ? libsystem : std::string_view(library), symbol, where,
-        system_alias(library));
+namespace {
+bool traced_call(std::string_view symbol) {
     const auto& prefixes = traced_call_prefixes();
-    const bool traced = !prefixes.empty() &&
+    return !prefixes.empty() &&
         std::any_of(prefixes.begin(), prefixes.end(),
             [&](const std::string& prefix) { return prefix.empty() || (prefix.front() != '-' && symbol.starts_with(prefix)); }) &&
         std::none_of(prefixes.begin(), prefixes.end(),
             [&](const std::string& prefix) { return prefix.size() > 1 && prefix.front() == '-' && symbol.starts_with(prefix.substr(1)); });
+}
+} // namespace
+
+void ProcessContext::set_call_leaf(std::uint64_t address, std::string_view symbol, CallLeaf leaf, void* data) {
+    if (!traced_call(symbol)) mark_engine_call_custom_leaf(engine_, address, leaf, data);
+}
+
+std::uint64_t ProcessContext::install_function(std::string symbol,
+    transmute::GuestCallHandler handler, std::string library, const std::source_location& where) {
+    registration_audit::record_export(system_alias(library) ? libsystem : std::string_view(library), symbol, where,
+        system_alias(library));
+    const bool traced = traced_call(symbol);
     if (traced) {
         handler = [this, inner = std::move(handler), name = symbol](transmute::CpuState& state, transmute::GuestMemory& memory) {
             static const bool after_exit = [] { const auto value = host::process::environment("ALCHEMY_TRACE_CALLS_AFTER_EXIT"); return value && value->starts_with("1"); }();

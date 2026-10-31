@@ -120,7 +120,7 @@ bool regions_equal(const TranslatedRegion& a, const TranslatedRegion& b) {
             return false;
     for (std::size_t i = 0; i < a.exits.size(); ++i)
         if (a.exits[i].rel32_offset != b.exits[i].rel32_offset || a.exits[i].target_pc != b.exits[i].target_pc ||
-            a.exits[i].skip_rel32_offset != b.exits[i].skip_rel32_offset)
+            a.exits[i].skip_rel32_offset != b.exits[i].skip_rel32_offset || a.exits[i].ic_offset != b.exits[i].ic_offset)
             return false;
     for (std::size_t i = 0; i < a.fixups.size(); ++i)
         if (a.fixups[i].offset != b.fixups[i].offset || a.fixups[i].kind != b.fixups[i].kind ||

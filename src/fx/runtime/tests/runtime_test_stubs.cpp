@@ -303,7 +303,8 @@ bool cache_lookup_copy(std::uint64_t source_pc, std::int64_t delta, TranslatedRe
     region.guest_start += d;
     for (auto& [begin, end] : region.guest_ranges) begin += d, end += d;
     for (auto& e : region.entries) e.guest_pc += d;
-    for (auto& e : region.exits) e.target_pc += d;
+    for (auto& e : region.exits)
+        if (!e.ic_offset) e.target_pc += d;
     for (auto& f : region.faults) f.guest_pc += d;
     for (auto& f : region.fixups) {
         if (f.kind != FixupKind::guest_address_imm64) continue;

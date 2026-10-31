@@ -414,7 +414,8 @@ void translate_one(State& s, const Job& job) {
     }
     std::vector<std::uint64_t> targets;
     targets.reserve(region.exits.size());
-    for (const RegionExit& x : region.exits) targets.push_back(x.target_pc);
+    for (const RegionExit& x : region.exits)
+        if (!x.ic_offset) targets.push_back(x.target_pc);   // inline caches: no static target
     Exclusive lock(s.lock);
     push_successors_locked(s, job.module, targets.data(), targets.size(), end_rva, job.depth + 1u);
 }
@@ -646,7 +647,8 @@ void external_aot_note_region(const TranslatedRegion& region) {
         if (e > m->base && e - m->base <= m->size) end_rva = std::max(end_rva, static_cast<std::uint32_t>(e - m->base));
     thread_local std::vector<std::uint64_t> targets;
     targets.clear();
-    for (const RegionExit& x : region.exits) targets.push_back(x.target_pc);
+    for (const RegionExit& x : region.exits)
+        if (!x.ic_offset) targets.push_back(x.target_pc);
     note(s, *m, end_rva, targets.data(), targets.size());
 }
 
@@ -659,7 +661,8 @@ void external_aot_note_record(std::uint64_t base, const cachefmt::RecordView& re
     for (std::uint32_t i = 0; i < record.header->n_ranges; ++i) end_rva = std::max(end_rva, record.ranges[i].end_rva);
     thread_local std::vector<std::uint64_t> targets;
     targets.clear();
-    for (std::uint32_t i = 0; i < record.header->n_exits; ++i) targets.push_back(base + record.exits[i].target_rva);
+    for (std::uint32_t i = 0; i < record.header->n_exits; ++i)
+        if (!record.exits[i].ic_offset) targets.push_back(base + record.exits[i].target_rva);
     note(s, *m, end_rva, targets.data(), targets.size());
 }
 

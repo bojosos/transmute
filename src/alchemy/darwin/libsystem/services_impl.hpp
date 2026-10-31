@@ -102,13 +102,14 @@ public:
         auto peak = peak_.load(std::memory_order_relaxed);
         while (bytes > peak && !peak_.compare_exchange_weak(peak, bytes, std::memory_order_relaxed)) {}
     }
-    std::optional<Block> take(std::uint64_t address) {
+    // heap_only: a mapped guest region (base 0) stays and is not returned.
+    std::optional<Block> take(std::uint64_t address, bool heap_only = false) {
         auto& shard = shard_of(address);
         Block block;
         {
             std::lock_guard lock(shard.mutex);
             const auto found = shard.blocks.find(address);
-            if (found == shard.blocks.end()) return std::nullopt;
+            if (found == shard.blocks.end() || (heap_only && !found->second.base)) return std::nullopt;
             block = found->second;
             shard.blocks.erase(found);
         }
@@ -1387,6 +1388,39 @@ public:
         allocations.insert(address, {size, base});
         if (fork_child) note_child_allocation(address);
         return address;
+    }
+    // The allocator leaves' paths (HostHeap::allocate_small/release_small): an
+    // engine heap block only, never a guest mapping; 0 / false: not done
+    // (always, for an engine without a guest heap: it has no small blocks).
+    using MainEngine = std::remove_reference_t<decltype(std::declval<ProcessContext&>().main_engine())>;
+    std::uint64_t allocate_small(std::uint64_t size) noexcept {
+        if constexpr (!engine_has_guest_heap<MainEngine>) {
+            static_cast<void>(size);
+            return 0;
+        } else {
+            if (fork_child) return 0;
+            try {
+                const auto heap = engine_heap_allocate(context.main_engine(), std::max<std::uint64_t>(size, 1), 16);
+                if (!heap) return 0;
+                try { allocations.insert(*heap, {size, *heap}); }
+                catch (...) { engine_heap_release(context.main_engine(), *heap); return 0; }
+                return *heap;
+            } catch (...) { return 0; }
+        }
+    }
+    // Nothing here fails short of a corrupt heap (a block the table holds that
+    // the engine heap rejects): that ends the process (noexcept).
+    bool release_small(std::uint64_t address) noexcept {
+        if constexpr (!engine_has_guest_heap<MainEngine>) {
+            static_cast<void>(address);
+            return false;
+        } else {
+            if (fork_child) return false;
+            const auto block = allocations.take(address, true);
+            if (!block) return false;
+            engine_heap_release(context.main_engine(), block->base);
+            return true;
+        }
     }
     void release(std::uint64_t address) {
         if (!address) return;

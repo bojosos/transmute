@@ -277,18 +277,30 @@ RunResult TestMachine::run(GuestContext& ctx, const CodeSource& code, std::uint6
                 if (const auto* target = entry_for(ctx.pc, code)) {
                     // As the runtime (patch_link): an exit with a flag store links its
                     // jmp A past the store when the target's entry writes NZCV first.
+                    // An inline cache (link_exit) takes its first target, once.
                     auto* field = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(ctx.exit_arg));
+                    bool linkable = true;
                     for (std::size_t i = 0; i < regions.size(); ++i) {
                         auto* base = region_hosts_[i];
                         if (field < base || field >= base + regions[i].code.size()) continue;
-                        for (const auto& e : regions[i].exits)
-                            if (base + e.rel32_offset == field && e.skip_rel32_offset && flags_dead_[ctx.pc]) {
+                        for (const auto& e : regions[i].exits) {
+                            if (base + e.rel32_offset != field) continue;
+                            if (e.skip_rel32_offset && flags_dead_[ctx.pc]) {
                                 field = base + e.skip_rel32_offset;
                                 ++r.skip_links;
                             }
+                            if (e.ic_offset) {
+                                auto* cached = reinterpret_cast<volatile std::uint64_t*>(base + e.ic_offset);
+                                if (*cached == kInlineCacheEmpty) {
+                                    *cached = ctx.pc;
+                                    ++r.ic_fills;
+                                }
+                                linkable = *cached == ctx.pc;
+                            }
+                        }
                         break;
                     }
-                    x64::Assembler::patch_rel32(field, target);
+                    if (linkable) x64::Assembler::patch_rel32(field, target);
                 }
                 r.translations += static_cast<unsigned>(regions.size() - before2);
             }

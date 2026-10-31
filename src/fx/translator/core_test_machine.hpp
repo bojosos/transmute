@@ -48,6 +48,7 @@ struct RunResult {
     unsigned tier_ups{};
     unsigned shadow_misses{};   // ExitReason::table_shadow
     unsigned skip_links{};      // links past an exit's flag store (RegionExit::skip_rel32_offset)
+    unsigned ic_fills{};        // inline caches filled (RegionExit::ic_offset)
 };
 
 class TestMachine {
