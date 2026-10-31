@@ -80,9 +80,18 @@ and formats a container cannot hold, answer with the AudioFile errors.
 receive blocks get event lists in their protocol. MIDI 2.0-only messages (per-note and
 registered/assignable controllers, 128-bit data) have no MIDI 1.0 form and are dropped.
 
-**Unavailable, as documented (audio):** IOProc I/O on input devices, AUHAL input and
-AudioQueue input (`kAudioUnitErr_FailedInitialization`, `kAudioUnitErr_NoConnection`); capture
-goes through AVFoundation and AVAudioEngine's input node. Version 3 audio
+**Audio input (real):** input devices capture (`hal_io.cpp` InputIo over `host::audio`
+capture streams; silence in cloaked runs). IOProcs on an input device get one float input
+buffer of the device's I/O buffer frame size per call on the device's input thread. AUHAL input
+(`kAudioOutputUnitProperty_EnableIO` on bus 1, output optional) calls the input callback per buffer,
+and `AudioUnitRender` on bus 1 hands the buffer over in the client's linear PCM format at the
+device's rate (another rate fails `AudioUnitInitialize` with `kAudioUnitErr_FormatNotSupported`,
+as AUHAL does not convert input rates). AudioQueue input queues record linear PCM in any layout,
+channel count and rate into their enqueued buffers. AVFoundation capture and AVAudioEngine's input
+node open their own streams. Without an input device these fail as documented
+(`kAudioUnitErr_FailedInitialization`, `kAudioUnitErr_NoConnection`, `kAudioQueueErr_InvalidDevice`).
+
+**Unavailable, as documented (audio):** version 3 audio
 units (AUAudioUnit), other components (`AudioComponentRegister` registers none),
 aggregate devices and process taps. Block IOProcs run on the I/O thread, not their queue.
 

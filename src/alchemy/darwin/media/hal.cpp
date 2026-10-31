@@ -22,10 +22,11 @@
 // AudioDeviceAddIOProc form) run on the device's I/O thread through
 // hal_io.hpp, with one interleaved float buffer of the device's I/O buffer
 // frame size, and the device's output stream plays their sum (host::audio;
-// silent in cloaked runs, hal_host.cpp). Input devices have no IOProc I/O:
-// starting one answers kAudioHardwareUnsupportedOperationError (a stderr
-// notice says so once); they capture for AVAudioEngine's input node and
-// AVFoundation capture through hal_open_input. A block IOProc runs on the I/O thread, not on its queue. Host
+// silent in cloaked runs, hal_host.cpp). Input devices capture (hal_io.hpp
+// InputIo): their IOProcs get one interleaved float input buffer of the
+// device's I/O buffer frame size per call, on the device's input thread, and
+// an empty output list (silence in cloaked runs). AVAudioEngine's input node
+// and AVFoundation capture open their own input streams (hal_open_input). A block IOProc runs on the I/O thread, not on its queue. Host
 // time is mach_absolute_time's
 // (nanoseconds; frequency 1e9).
 namespace alchemy::gui::completion_kit::media {
@@ -62,8 +63,8 @@ struct Hal {
     std::optional<hal::Model> model;
     std::vector<Listener> listeners;
     std::map<std::uint32_t, std::shared_ptr<hal_io::DeviceIo>> io;
+    std::map<std::uint32_t, std::shared_ptr<hal_io::InputIo>> inputs;
     std::map<Address, std::shared_ptr<IoProc>> procs;   // by AudioDeviceIOProcID
-    bool io_notice{};
 
     explicit Hal(Support& owner) : support(owner) {}
 
@@ -84,9 +85,15 @@ struct Hal {
         const auto string = m.read64(at);
         return string ? std::optional<std::string>(support.cf.utf8(string)) : std::nullopt;
     }
-    void notice_io() {
-        if (std::exchange(io_notice, true)) return;
-        std::cerr << "alchemy: CoreAudio input devices have no I/O (starting one answers kAudioHardwareUnsupportedOperationError)" << std::endl;
+    // The input device's capture (nullptr for an output device). Under the mutex.
+    std::shared_ptr<hal_io::InputIo> input_io(std::uint32_t id) {
+        auto& slot = inputs[id];
+        if (!slot) {
+            const auto* device = get().device(id);
+            if (!device || !device->input || !backend) return nullptr;
+            slot = std::make_shared<hal_io::InputIo>(support, id, device->channels, device->sample_rate);
+        }
+        return slot;
     }
     // The output device's I/O (nullptr for an input device). Under the mutex.
     std::shared_ptr<hal_io::DeviceIo> device_io(std::uint32_t id) {
@@ -158,6 +165,41 @@ void render_io_proc(Hal& state, IoProc& proc, std::uint32_t device, std::uint32_
     if (out && size) m.read_bytes(out, std::span(reinterpret_cast<std::uint8_t*>(mix), size));
 }
 
+// One input buffer of an IOProc on an input device's input thread: the proc gets one interleaved
+// float input buffer of `frames` frames and an empty output list.
+void render_input_proc(Hal& state, IoProc& proc, std::uint32_t device, std::uint32_t channels, const float* samples, std::uint32_t frames,
+                       const hal_io::Timing& timing) {
+    auto& m = state.support.process.calling_engine();
+    const auto bytes = static_cast<std::size_t>(frames) * channels * 4;
+    if (proc.capacity < bytes) {
+        if (proc.memory) state.support.process.release_guest(proc.memory);
+        proc.memory = state.support.process.allocate_guest(IoProc::data_offset + bytes, 16);
+        proc.capacity = bytes;
+    }
+    const auto base = proc.memory;
+    write_time_stamp(m, base + IoProc::now_offset, timing.now_sample + frames, host_time_now());
+    write_time_stamp(m, base + IoProc::input_time_offset, timing.output_sample, timing.output_host);
+    write_time_stamp(m, base + IoProc::output_time_offset, timing.output_sample, timing.output_host);
+    const auto input = base + IoProc::output_list_offset, data = base + IoProc::data_offset;
+    m.write64(base + IoProc::input_list_offset, 0);   // the output list: mNumberBuffers 0
+    m.write64(input, 1);
+    m.write32(input + 8, channels);
+    m.write32(input + 12, static_cast<std::uint32_t>(bytes));
+    m.write64(input + 16, data);
+    m.write_bytes(data, std::span(reinterpret_cast<const std::uint8_t*>(samples), bytes));
+    EngineAdapter adapter(m);
+    const auto output_list = base + IoProc::input_list_offset;
+    if (proc.block) {
+        const std::array<std::uint64_t, 6> arguments{proc.block, base + IoProc::now_offset, input, base + IoProc::input_time_offset, output_list,
+                                                     base + IoProc::output_time_offset};
+        static_cast<void>(adapter.call(m.read64(proc.block + 16), arguments));
+    } else {
+        const std::array<std::uint64_t, 7> arguments{device, base + IoProc::now_offset, input, base + IoProc::input_time_offset, output_list,
+                                                     base + IoProc::output_time_offset, proc.client_data};
+        static_cast<void>(adapter.call(proc.proc, arguments));
+    }
+}
+
 } // namespace
 
 void set_hal_backend_factory(std::function<std::unique_ptr<hal::Backend>()> factory) { hal_factory() = std::move(factory); }
@@ -185,6 +227,13 @@ std::uint32_t hal_default_output() {
     hal::Value value;
     if (state->get().get(hal::system_object, {hal::four("dOut"), hal::scope_global, 0}, std::nullopt, value) || value.bytes.size() < 4) return 0;
     return value.bytes[0] | (value.bytes[1] << 8) | (value.bytes[2] << 16) | (static_cast<std::uint32_t>(value.bytes[3]) << 24);
+}
+
+std::shared_ptr<hal_io::InputIo> hal_input_io(std::uint32_t device) {
+    const auto state = current();
+    if (!state) return nullptr;
+    std::lock_guard lock(state->mutex);
+    return state->input_io(device);
 }
 
 std::uint32_t hal_default_input() {
@@ -374,6 +423,7 @@ void install_hal(Support& support) {
     const auto destroy = [state](CpuState& s) {
         std::shared_ptr<IoProc> proc;
         std::shared_ptr<hal_io::DeviceIo> io;
+        std::shared_ptr<hal_io::InputIo> input;
         {
             std::lock_guard lock(state->mutex);
             const auto found = state->procs.find(s.x[1]);
@@ -382,8 +432,10 @@ void install_hal(Support& support) {
             proc = std::move(found->second);
             state->procs.erase(found);
             if (const auto slot = state->io.find(proc->device); slot != state->io.end()) io = slot->second;
+            if (const auto slot = state->inputs.find(proc->device); slot != state->inputs.end()) input = slot->second;
         }
         if (io) io->stop(s.x[1]);
+        if (input) input->stop(s.x[1]);
         if (proc->block) static_cast<void>(state->support.call(libsystem, "__Block_release", {proc->block}));
         if (proc->memory) state->support.process.release_guest(proc->memory);
         status(s, 0);
@@ -399,6 +451,7 @@ void install_hal(Support& support) {
         if (!device_check(device)) return status(s, hal::error::bad_device);
         std::shared_ptr<IoProc> proc;
         std::shared_ptr<hal_io::DeviceIo> io;
+        std::shared_ptr<hal_io::InputIo> input;
         std::uint32_t frames{};
         {
             std::lock_guard lock(state->mutex);
@@ -408,12 +461,18 @@ void install_hal(Support& support) {
                 proc = found->second;
             }
             io = state->device_io(device);
+            if (!io) input = state->input_io(device);
             frames = state->buffer_frames(device);
         }
-        if (!io) {
-            state->notice_io();
-            return status(s, hal::error::unsupported);
+        if (input) {
+            hal_io::InputClient client = [](const float*, std::uint32_t, const hal_io::Timing&) {};
+            if (proc)
+                client = [state, proc, device, channels = input->channels()](const float* samples, std::uint32_t count, const hal_io::Timing& timing) {
+                    render_input_proc(*state, *proc, device, channels, samples, count, timing);
+                };
+            return status(s, input->start(s.x[1], std::move(client), frames));
         }
+        if (!io) return status(s, hal::error::unsupported);
         hal_io::Client client = [](float*, std::uint32_t, const hal_io::Timing&) {};
         if (proc)
             client = [state, proc, device, channels = io->channels()](float* mix, std::uint32_t count, const hal_io::Timing& timing) {
@@ -425,12 +484,15 @@ void install_hal(Support& support) {
         const auto device = static_cast<std::uint32_t>(s.x[0]);
         if (!device_check(device)) return status(s, hal::error::bad_device);
         std::shared_ptr<hal_io::DeviceIo> io;
+        std::shared_ptr<hal_io::InputIo> input;
         {
             std::lock_guard lock(state->mutex);
             if (s.x[1] && !state->procs.contains(s.x[1])) return status(s, hal::error::illegal_operation);
             if (const auto found = state->io.find(device); found != state->io.end()) io = found->second;
+            if (const auto found = state->inputs.find(device); found != state->inputs.end()) input = found->second;
         }
         if (io) io->stop(s.x[1]);
+        if (input) input->stop(s.x[1]);
         status(s, 0);
     });
     // AudioDeviceGetCurrentTime(device, AudioTimeStamp *out)

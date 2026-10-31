@@ -197,4 +197,151 @@ void DeviceIo::loop(std::uint64_t generation) {
     wake_.notify_all();
 }
 
+InputIo::InputIo(Support& support, std::uint32_t id, std::uint32_t channels, double rate)
+    : support_(support), id_(id), channels_(std::max(channels, 1U)), rate_(rate > 0 ? rate : 48000.0) {}
+
+InputIo::~InputIo() {
+    std::unique_ptr<hal::InputStream> stream;
+    std::shared_ptr<CompletionThread> thread;
+    {
+        std::lock_guard lock(mutex_);
+        clients_.clear();
+        stream = std::move(stream_);
+        thread = std::move(thread_);
+    }
+    if (stream) stream->stop();
+    stream.reset();
+    if (thread && std::this_thread::get_id() != delivery_thread_) thread->shutdown();
+}
+
+std::int32_t InputIo::start(std::uint64_t key, InputClient client, std::uint32_t buffer_frames) {
+    {
+        std::lock_guard lock(mutex_);
+        if (clients_.contains(key)) return 0;
+        auto entry = std::make_shared<Entry>();
+        entry->client = std::move(client);
+        entry->frames = buffer_frames;
+        clients_[key] = std::move(entry);
+        if (!thread_) thread_ = start_completion_thread(support_.process, "com.apple.audio.IOThread.input");
+        if (stream_) return 0;
+    }
+    std::weak_ptr<InputIo> weak = shared_from_this();
+    auto stream = hal_open_input(id_, [weak](const float* samples, std::uint32_t frames, std::uint64_t host) {
+        if (const auto self = weak.lock()) self->captured(samples, frames, host);
+    });
+    if (!stream || !stream->start()) {
+        std::lock_guard lock(mutex_);
+        clients_.erase(key);
+        return unspecified_error;
+    }
+    std::unique_ptr<hal::InputStream> extra;
+    {
+        std::lock_guard lock(mutex_);
+        if (stream_ || clients_.empty()) extra = std::move(stream);   // raced with another start, or stopped meanwhile
+        else stream_ = std::move(stream);
+    }
+    if (extra) extra->stop();
+    return 0;
+}
+
+void InputIo::stop(std::uint64_t key) {
+    std::unique_ptr<hal::InputStream> stream;
+    {
+        std::unique_lock lock(mutex_);
+        if (!clients_.erase(key)) return;
+        if (std::this_thread::get_id() != delivery_thread_) idle_.wait(lock, [this] { return !delivering_; });
+        if (clients_.empty()) {
+            stream = std::move(stream_);
+            pending_.clear();
+            pending_frames_ = 0;
+        }
+    }
+    if (stream) stream->stop();
+}
+
+bool InputIo::running(std::uint64_t key) const {
+    std::lock_guard lock(mutex_);
+    return clients_.contains(key);
+}
+
+void InputIo::captured(const float* samples, std::uint32_t frames, std::uint64_t host) {
+    std::shared_ptr<CompletionThread> thread;
+    {
+        std::lock_guard lock(mutex_);
+        if (clients_.empty() || !thread_) return;
+        pending_.push_back({std::vector<float>(samples, samples + static_cast<std::size_t>(frames) * channels_), host});
+        pending_frames_ += frames;
+        while (pending_frames_ > static_cast<std::size_t>(rate_) && pending_.size() > 1) {
+            const auto dropped = pending_.front().samples.size() / channels_;
+            pending_frames_ -= dropped;
+            sample_time_ += static_cast<double>(dropped);   // dropped frames still count
+            pending_.pop_front();
+        }
+        if (std::exchange(posted_, true)) return;
+        thread = thread_;
+    }
+    std::weak_ptr<InputIo> weak = shared_from_this();
+    thread->post([weak] {
+        if (const auto self = weak.lock()) self->deliver();
+    });
+}
+
+void InputIo::deliver() {
+    for (;;) {
+        Packet packet;
+        std::vector<std::shared_ptr<Entry>> entries;
+        double first{};
+        {
+            std::lock_guard lock(mutex_);
+            if (pending_.empty()) {
+                posted_ = false;
+                return;
+            }
+            packet = std::move(pending_.front());
+            pending_.pop_front();
+            const auto count = packet.samples.size() / channels_;
+            pending_frames_ -= count;
+            first = sample_time_;
+            sample_time_ += static_cast<double>(count);
+            for (const auto& [key, entry] : clients_) entries.push_back(entry);
+            delivering_ = true;
+            delivery_thread_ = std::this_thread::get_id();
+        }
+        const auto frames = static_cast<std::uint32_t>(packet.samples.size() / channels_);
+        const auto host_of = [&](double sample) {
+            const double offset = (sample - first) / rate_ * 1e9;
+            return static_cast<std::uint64_t>(static_cast<double>(packet.host) + offset);
+        };
+        for (const auto& entry : entries) {
+            {
+                std::lock_guard lock(mutex_);
+                if (std::none_of(clients_.begin(), clients_.end(), [&](const auto& c) { return c.second == entry; })) continue;   // stopped meanwhile
+            }
+            if (entry->frames == 0) {
+                const Timing timing{first, packet.host, first, packet.host, rate_};
+                entry->client(packet.samples.data(), frames, timing);
+                continue;
+            }
+            if (entry->carry.empty()) entry->carry_sample = first;
+            entry->carry.insert(entry->carry.end(), packet.samples.begin(), packet.samples.end());
+            const auto chunk = static_cast<std::size_t>(entry->frames) * channels_;
+            std::size_t at = 0;
+            while (entry->carry.size() - at >= chunk) {
+                const auto sample = entry->carry_sample + static_cast<double>(at / channels_);
+                const auto host = host_of(sample);
+                const Timing timing{sample, host, sample, host, rate_};
+                entry->client(entry->carry.data() + at, entry->frames, timing);
+                at += chunk;
+            }
+            entry->carry.erase(entry->carry.begin(), entry->carry.begin() + static_cast<std::ptrdiff_t>(at));
+            entry->carry_sample += static_cast<double>(at / channels_);
+        }
+        {
+            std::lock_guard lock(mutex_);
+            delivering_ = false;
+        }
+        idle_.notify_all();
+    }
+}
+
 } // namespace alchemy::gui::completion_kit::media::hal_io

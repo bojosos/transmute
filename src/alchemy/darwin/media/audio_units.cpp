@@ -35,10 +35,20 @@
 //   kHALOutputParam_Volume and adds it to the device's output. Render calls never exceed
 //   kAudioUnitProperty_MaximumFramesPerSlice frames. Sample times count the unit's input frames
 //   from its start.
-// - AudioUnitRender pulls the render callback into the caller's buffers (bus 0). Input (bus 1,
-//   kAudioOutputUnitProperty_EnableIO on the input scope) is not provided: enabling it makes
-//   AudioUnitInitialize fail with kAudioUnitErr_FailedInitialization, and pulling bus 1 answers
-//   kAudioUnitErr_NoConnection.
+// - AudioUnitRender pulls the render callback into the caller's buffers (bus 0).
+// - AUHAL input (bus 1, kAudioOutputUnitProperty_EnableIO on the input scope) captures from
+//   kAudioOutputUnitProperty_CurrentDevice when that is an input device, else the default input
+//   device (hal_io.hpp InputIo; silence in cloaked runs). Output can be disabled (EnableIO 0 on the
+//   output scope); with both enabled the output side plays to the current or default output device.
+//   While the unit runs, the input callback (kAudioOutputUnitProperty_SetInputCallback) is called
+//   on the device's input thread once per buffer of the device's I/O buffer frame size (at most
+//   kAudioUnitProperty_MaximumFramesPerSlice), with a NULL buffer list, and AudioUnitRender on bus 1
+//   copies that buffer into the caller's buffers in the output-scope format of element 1 (any linear
+//   PCM at the device's rate; channels beyond the device's are silent, a mono device fills every
+//   channel; buffers with NULL mData get the unit's own memory). AUHAL does not convert the input's
+//   sample rate: another rate makes AudioUnitInitialize answer kAudioUnitErr_FormatNotSupported.
+//   Without an input device AudioUnitInitialize answers kAudioUnitErr_FailedInitialization and
+//   bus 1 kAudioUnitErr_NoConnection; a device the host refuses fails AudioOutputUnitStart.
 // - Property listeners (AudioUnitAddPropertyListener) are called on the setting thread when a
 //   property they watch is set, and for kAudioOutputUnitProperty_IsRunning on start and stop.
 namespace alchemy::gui::completion_kit::media {
@@ -108,6 +118,15 @@ struct Unit {
     double sample_time{};
     std::uint64_t memory{};            // the render buffers: a timestamp, a buffer list, the data
     std::size_t capacity{};
+    // Input (element 1):
+    af::Pcm input_client;              // AudioUnitRender(bus 1)'s format, once set
+    bool input_format_set{};
+    std::shared_ptr<hal_io::InputIo> input_io;
+    std::vector<float> input_samples;  // the buffer the input callback is told about (device channels)
+    std::uint32_t input_frames{}, input_channels{};
+    std::uint64_t input_memory{};      // the input callback's timestamp (64) and flags (8)
+    std::uint64_t scratch{};           // AudioUnitRender(bus 1)'s buffers for NULL mData
+    std::size_t scratch_capacity{};
 };
 
 std::vector<std::uint8_t> float_asbd(double rate, std::uint32_t channels, bool non_interleaved) {
@@ -138,7 +157,29 @@ private:
             if (c.handle == handle) return &c;
         return nullptr;
     }
-    std::uint32_t device_of(const Unit& u) const { return u.device ? u.device : hal_default_output(); }
+    static bool is_input(std::uint32_t device) {
+        if (!device) return false;
+        const auto inputs = hal_input_devices();
+        return std::any_of(inputs.begin(), inputs.end(), [&](const HalInputDevice& d) { return d.id == device; });
+    }
+    // The output side's device (the current device unless it is an input device) and the input side's.
+    std::uint32_t device_of(const Unit& u) const { return u.device && !is_input(u.device) ? u.device : hal_default_output(); }
+    std::uint32_t input_device_of(const Unit& u) const { return is_input(u.device) ? u.device : hal_default_input(); }
+    // An input device's (rate, channels).
+    static std::pair<double, std::uint32_t> input_format(std::uint32_t device) {
+        for (const auto& d : hal_input_devices())
+            if (d.id == device) return {d.rate, d.channels};
+        return {48000.0, 2};
+    }
+    // AudioUnitRender(bus 1)'s format: as set, else float32 non-interleaved in the device's rate and channels.
+    af::Pcm input_client_of(const Unit& u) const {
+        if (u.input_format_set) return u.input_client;
+        std::string why;
+        const auto [rate, channels] = input_format(input_device_of(u));
+        return *af::pcm_from_asbd(float_asbd(rate, channels, true), why);
+    }
+    void input_ready(Unit& u, const float* samples, std::uint32_t frames, const hal_io::Timing& timing);
+    std::int32_t render_input(Unit& u, std::uint64_t list, std::uint32_t frames);
     // The device's format (rate, channels), from its I/O.
     std::pair<double, std::uint32_t> device_format(std::uint32_t device) const {
         if (const auto io = hal_device_io(device)) return {io->rate(), io->channels()};
@@ -192,9 +233,14 @@ std::int32_t AudioUnits::get_property(Unit& u, std::uint32_t id, std::uint32_t s
             out = float_asbd(rate, channels, false);
             return 0;
         }
-        // Element 1, the input side: the input device's format (none here).
-        out = float_asbd(device_format(device_of(u)).first, 2, true);
-        writable = scope == scope_output;
+        // Element 1, the input side: the device's format (input scope) and AudioUnitRender's (output scope).
+        if (scope == scope_input) {
+            const auto [rate, channels] = input_format(input_device_of(u));
+            out = float_asbd(rate, channels, false);
+            return 0;
+        }
+        out = af::asbd_from_pcm(input_client_of(u));
+        writable = true;
         return 0;
     case prop_sample_rate:
         if (scope == scope_input) { f64(u.client.rate); writable = true; return 0; }
@@ -223,7 +269,7 @@ std::int32_t AudioUnits::get_property(Unit& u, std::uint32_t id, std::uint32_t s
         writable = true;
         return 0;
     case prop_current_device:
-        u32(device_of(u));
+        u32(u.enable_input && !u.enable_output ? input_device_of(u) : device_of(u));
         writable = hal;
         return 0;
     case prop_is_running:
@@ -246,7 +292,7 @@ std::int32_t AudioUnits::get_property(Unit& u, std::uint32_t id, std::uint32_t s
         writable = hal;
         return 0;
     case prop_has_io:
-        if (element == 1 && scope == scope_input) u32(0);   // no input device
+        if (element == 1 && scope == scope_input) u32(hal && input_device_of(u) ? 1 : 0);
         else if (element == 0 && scope == scope_output) u32(1);
         else return error::invalid_element;
         return 0;
@@ -277,9 +323,17 @@ std::int32_t AudioUnits::set_property(Unit& u, std::uint32_t id, std::uint32_t s
         switch (id) {
         case prop_stream_format: {
             if (element > 1) return error::invalid_element;
-            if (element == 1) return 0;   // the input side: no input device, the format is kept nowhere
-            if (scope != scope_input) return error::property_not_writable;
             std::string why;
+            if (element == 1) {   // the input side: AudioUnitRender(bus 1)'s format
+                if (scope != scope_output) return error::property_not_writable;
+                const auto pcm = af::pcm_from_asbd(data, why);
+                if (!pcm) return error::format_not_supported;
+                if (u.initialized) return error::initialized;
+                u.input_client = *pcm;
+                u.input_format_set = true;
+                break;
+            }
+            if (scope != scope_input) return error::property_not_writable;
             const auto pcm = af::pcm_from_asbd(data, why);
             if (!pcm) return error::format_not_supported;
             if (u.initialized && u.running) return error::initialized;
@@ -320,7 +374,7 @@ std::int32_t AudioUnits::set_property(Unit& u, std::uint32_t id, std::uint32_t s
             std::uint32_t device{};
             if (!hal) return error::property_not_writable;
             if (!u32(device)) return error::param;
-            if (device && !hal_device_io(device)) return error::invalid_device;
+            if (device && !hal_device_io(device) && !is_input(device)) return error::invalid_device;
             if (u.running) return error::initialized;
             u.device = device;
             break;
@@ -481,27 +535,121 @@ void AudioUnits::render(Unit& u, float* mix, std::uint32_t frames, std::uint32_t
     for (std::size_t i = 0; i < converted.size(); ++i) mix[i] += static_cast<float>(converted[i] * volume);
 }
 
+void AudioUnits::input_ready(Unit& u, const float* samples, std::uint32_t frames, const hal_io::Timing& timing) {
+    auto& m = support_.process.calling_engine();
+    std::uint64_t proc{}, refcon{}, memory{};
+    {
+        std::lock_guard lock(u.mutex);
+        if (!u.input_io) return;
+        u.input_channels = u.input_io->channels();
+        u.input_samples.assign(samples, samples + static_cast<std::size_t>(frames) * u.input_channels);
+        u.input_frames = frames;
+        proc = u.input_proc;
+        refcon = u.input_refcon;
+        if (!u.input_memory) u.input_memory = support_.process.allocate_guest(72, 16);
+        memory = u.input_memory;
+    }
+    if (!proc) return;
+    m.fill_bytes(memory, 0, 72);
+    m.write64(memory, std::bit_cast<std::uint64_t>(timing.output_sample));
+    m.write64(memory + 8, timing.output_host);
+    m.write64(memory + 16, std::bit_cast<std::uint64_t>(1.0));
+    m.write32(memory + 56, 7);   // sample time, host time and rate scalar valid
+    // AURenderCallback(refcon, flags, timestamp, bus 1, frames, NULL)
+    static_cast<void>(call(proc, {refcon, memory + 64, memory, 1, frames, 0}));
+}
+
+// Under the unit's lock.
+std::int32_t AudioUnits::render_input(Unit& u, std::uint64_t list, std::uint32_t frames) {
+    auto& m = support_.process.calling_engine();
+    const auto client = input_client_of(u);
+    const auto planes = client.non_interleaved ? client.channels : 1U;
+    if (m.read32(list) < planes) return error::param;
+    std::vector<double> samples(static_cast<std::size_t>(frames) * client.channels, 0.0);
+    const auto available = std::min(frames, u.input_frames);
+    for (std::uint32_t f = 0; f < available; ++f)
+        for (std::uint32_t c = 0; c < client.channels; ++c) {
+            const auto source = u.input_channels == 1 ? 0U : c;
+            if (source < u.input_channels) samples[static_cast<std::size_t>(f) * client.channels + c] = u.input_samples[static_cast<std::size_t>(f) * u.input_channels + source];
+        }
+    const auto bytes = static_cast<std::size_t>(frames) * client.frame_bytes();
+    std::vector<std::vector<std::uint8_t>> storage(planes, std::vector<std::uint8_t>(bytes));
+    std::vector<std::span<std::uint8_t>> spans(storage.begin(), storage.end());
+    af::encode(client, samples, client.channels, frames, spans);
+    if (u.scratch_capacity < bytes * planes) {
+        if (u.scratch) support_.process.release_guest(u.scratch);
+        u.scratch = support_.process.allocate_guest(bytes * planes, 16);
+        u.scratch_capacity = bytes * planes;
+    }
+    for (std::uint32_t b = 0; b < planes; ++b) {
+        const auto entry = list + 8 + 16ULL * b;
+        auto data = m.read64(entry + 8);
+        if (!data) {
+            data = u.scratch + b * bytes;
+            m.write64(entry + 8, data);
+        } else if (m.read32(entry + 4) < bytes) {
+            return error::param;
+        }
+        m.write32(entry, client.non_interleaved ? 1 : client.channels);
+        m.write32(entry + 4, static_cast<std::uint32_t>(bytes));
+        m.write_bytes(data, storage[b]);
+    }
+    return 0;
+}
+
 std::int32_t AudioUnits::start(Unit& u) {
     std::shared_ptr<hal_io::DeviceIo> io;
+    std::shared_ptr<hal_io::InputIo> input;
+    std::uint32_t input_device{}, input_frames{};
     {
         std::lock_guard lock(u.mutex);
         if (!u.initialized) return error::uninitialized;
         if (u.running) return 0;
-        u.playing_device = device_of(u);
-        io = hal_device_io(u.playing_device);
-        if (!io) return error::invalid_device;
+        if (u.enable_output) {
+            u.playing_device = device_of(u);
+            io = hal_device_io(u.playing_device);
+            if (!io) return error::invalid_device;
+        }
+        if (u.enable_input) {
+            input_device = input_device_of(u);
+            input = hal_input_io(input_device);
+            if (!input) return error::invalid_device;
+            input_frames = std::min(hal_buffer_frames(input_device), u.max_frames);
+        }
         u.io = io;
+        u.input_io = input;
+        u.input_frames = 0;
         u.resampler.reset();
         if (u.start_at_zero) u.sample_time = 0;
     }
     auto self = shared_from_this();
     auto unit_ptr = this->unit(u.handle);
-    const auto channels = io->channels();
-    hal_io::Client client = [self, unit_ptr, channels](float* mix, std::uint32_t frames, const hal_io::Timing& timing) {
-        self->render(*unit_ptr, mix, frames, channels, timing);
+    const auto undo = [&] {
+        std::lock_guard lock(u.mutex);
+        u.io.reset();
+        u.input_io.reset();
     };
-    const auto status = io->start(u.handle, std::move(client), hal_buffer_frames(u.playing_device));
-    if (status) return status;
+    if (input) {
+        const auto status = input->start(u.handle, [self, unit_ptr](const float* samples, std::uint32_t frames, const hal_io::Timing& timing) {
+            self->input_ready(*unit_ptr, samples, frames, timing);
+        }, input_frames);
+        if (status) {
+            undo();
+            return status;
+        }
+    }
+    if (io) {
+        const auto channels = io->channels();
+        hal_io::Client client = [self, unit_ptr, channels](float* mix, std::uint32_t frames, const hal_io::Timing& timing) {
+            self->render(*unit_ptr, mix, frames, channels, timing);
+        };
+        const auto status = io->start(u.handle, std::move(client), hal_buffer_frames(u.playing_device));
+        if (status) {
+            if (input) input->stop(u.handle);
+            undo();
+            return status;
+        }
+    }
     {
         std::lock_guard lock(u.mutex);
         u.running = true;
@@ -512,13 +660,20 @@ std::int32_t AudioUnits::start(Unit& u) {
 
 void AudioUnits::stop(Unit& u) {
     std::shared_ptr<hal_io::DeviceIo> io;
+    std::shared_ptr<hal_io::InputIo> input;
     {
         std::lock_guard lock(u.mutex);
         if (!u.running) return;
         u.running = false;
         io = std::move(u.io);
+        input = u.input_io;
     }
     if (io) io->stop(u.handle);
+    if (input) input->stop(u.handle);
+    {
+        std::lock_guard lock(u.mutex);
+        u.input_io.reset();
+    }
     notify_listeners(u, prop_is_running, scope_global, 0);
 }
 
@@ -619,6 +774,8 @@ void AudioUnits::install() {
         }
         self->stop(*gone);
         if (gone->memory) self->support_.process.release_guest(gone->memory);
+        if (gone->input_memory) self->support_.process.release_guest(gone->input_memory);
+        if (gone->scratch) self->support_.process.release_guest(gone->scratch);
         self->support_.process.release_guest(gone->handle);
         status(s, 0);
     });
@@ -633,7 +790,11 @@ void AudioUnits::install() {
         const auto u = self->unit(s.x[0]);
         if (!u) return status(s, error::bad_component_instance);
         std::lock_guard lock(u->mutex);
-        if (u->enable_input) return status(s, error::failed_initialization);   // no input device
+        if (u->enable_input) {
+            const auto device = self->input_device_of(*u);
+            if (!device) return status(s, error::failed_initialization);   // no input device
+            if (u->input_format_set && u->input_client.rate != input_format(device).first) return status(s, error::format_not_supported);
+        }
         u->initialized = true;
         status(s, 0);
     });
@@ -762,12 +923,19 @@ void AudioUnits::install() {
         status(s, 0);
     });
     // AudioUnitRender(unit, flags*, timestamp*, bus, frames, AudioBufferList *ioData): bus 0 pulls the
-    // render callback into the caller's buffers; bus 1 (input) has no device.
+    // render callback into the caller's buffers; bus 1 copies the input buffer of the current input callback.
     support_.function(audio_unit_library, "_AudioUnitRender", [self, status](CpuState& s, GuestMemory& m) {
         const auto u = self->unit(s.x[0]);
         if (!u) return status(s, error::bad_component_instance);
         const auto bus = static_cast<std::uint32_t>(s.x[3]), frames = static_cast<std::uint32_t>(s.x[4]);
-        if (bus == 1) return status(s, error::no_connection);
+        if (bus == 1) {
+            std::lock_guard lock(u->mutex);
+            if (!u->enable_input || !self->input_device_of(*u)) return status(s, error::no_connection);
+            if (!u->initialized) return status(s, error::uninitialized);
+            if (frames > u->max_frames) return status(s, error::too_many_frames);
+            if (!s.x[5]) return status(s, error::param);
+            return status(s, self->render_input(*u, s.x[5], frames));
+        }
         if (bus != 0) return status(s, error::invalid_element);
         if (!s.x[5]) return status(s, error::param);
         std::uint64_t proc{}, refcon{};

@@ -28,8 +28,20 @@
 // run loop, on the given dispatch queue for AudioQueueNewOutputWithDispatchQueue, and otherwise
 // on the queue's own thread. Volume and pan are applied; play rate and pitch are kept
 // (kAudioQueueParam_PlayRate applies with kAudioQueueProperty_EnableTimePitch only on macOS, and
-// here it is not applied). Unavailable: compressed formats (kAudioFormatUnsupportedDataFormatError:
-// there is no decoder), input queues, offline rendering and processing taps.
+// here it is not applied).
+//
+// Input queues (AudioQueueNewInput, AudioQueueNewInputWithDispatchQueue) record linear PCM from the
+// default input device (hal_io.hpp InputIo; silence in cloaked runs) in the queue's format: the
+// device's channels are mapped (a mono device fills every channel, extra channels are silent) and
+// resampled to the queue's rate, and fill the enqueued buffers in order. A full buffer goes to the
+// callback with its byte size, its first frame's time (sample time in the queue's frames, host time)
+// and its packet count; audio that arrives with no buffer enqueued is lost. AudioQueueStop hands the
+// enqueued buffers back at once, the one being filled with what it holds. Without an input device
+// AudioQueueNewInput answers kAudioQueueErr_InvalidDevice; a device the host refuses fails
+// AudioQueueStart.
+//
+// Unavailable: compressed formats (kAudioFormatUnsupportedDataFormatError: there is no decoder or
+// encoder), offline rendering and processing taps.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -59,7 +71,9 @@ constexpr std::uint64_t buffer_capacity = 0, buffer_data = 8, buffer_size = 16, 
 
 struct Buffer {
     std::uint64_t address{};           // the AudioQueueBuffer (with its data after it)
-    std::uint32_t frames{}, played{};  // while enqueued
+    std::uint32_t frames{}, played{};  // while enqueued (input: its capacity and the frames recorded)
+    double start_sample{};             // input: its first frame's time
+    std::uint64_t start_host{};
     std::uint32_t trim_start{}, trim_end{};
 };
 
@@ -86,6 +100,11 @@ struct Queue {
     std::thread::id callback_thread;   // the queue's own thread, once a callback ran there
     double sample_time{};
     std::shared_ptr<CompletionThread> thread;        // callbacks without a run loop or dispatch queue
+    // Input queues:
+    bool input{};
+    std::shared_ptr<hal_io::InputIo> input_io;
+    std::unique_ptr<Resampler> input_resampler;      // the device's rate to the queue's
+    std::deque<double> input_pending;                // device frames in the queue's channels, waiting for the resampler
 };
 
 class Queues : public std::enable_shared_from_this<Queues> {
@@ -104,6 +123,9 @@ private:
     }
     // Hands `buffer` back to the queue's callback where the queue's callbacks run.
     void give_back(const std::shared_ptr<Queue>& q, std::uint64_t buffer);
+    // An input buffer to the input callback, with its start time and packet count.
+    void give_back_input(const std::shared_ptr<Queue>& q, std::uint64_t buffer, std::uint32_t packets, double sample, std::uint64_t host);
+    void capture(const std::shared_ptr<Queue>& q, const float* samples, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing);
     void notify(const std::shared_ptr<Queue>& q, std::uint32_t property);
     void render(const std::shared_ptr<Queue>& q, float* mix, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing);
     std::int32_t start(const std::shared_ptr<Queue>& q);
@@ -135,6 +157,103 @@ void Queues::give_back(const std::shared_ptr<Queue>& q, std::uint64_t buffer) {
         thread = q->thread;
     }
     thread->post(run);
+}
+
+void Queues::give_back_input(const std::shared_ptr<Queue>& q, std::uint64_t buffer, std::uint32_t packets, double sample, std::uint64_t host) {
+    auto self = shared_from_this();
+    const auto run = [self, q, buffer, packets, sample, host] {
+        {
+            std::lock_guard lock(q->mutex);
+            if (q->disposed) return;
+            if (!q->dispatch_queue && !q->main_queue) q->callback_thread = std::this_thread::get_id();
+        }
+        auto& m = self->support_.process.calling_engine();
+        const auto stamp = self->support_.process.allocate_guest(64, 16);
+        m.fill_bytes(stamp, 0, 64);
+        m.write64(stamp, std::bit_cast<std::uint64_t>(sample));
+        m.write64(stamp + 8, host);
+        m.write64(stamp + 16, std::bit_cast<std::uint64_t>(1.0));
+        m.write32(stamp + 56, 7);   // sample time, host time and rate scalar valid
+        // AudioQueueInputCallback(userData, queue, buffer, startTime, numberPacketDescriptions, packetDescs)
+        if (q->block) static_cast<void>(self->bridge_->invoke_block(q->block, {q->handle, buffer, stamp, packets, 0}));
+        else if (q->callback) static_cast<void>(self->call(q->callback, {q->user_data, q->handle, buffer, stamp, packets, 0}));
+        self->support_.process.release_guest(stamp);
+    };
+    if (q->dispatch_queue) return bridge_->dispatch_async(q->dispatch_queue, run);
+    if (q->main_queue) return bridge_->dispatch_async(bridge_->main_queue(), run);
+    std::shared_ptr<CompletionThread> thread;
+    {
+        std::lock_guard lock(q->mutex);
+        if (!q->thread) q->thread = start_completion_thread(support_.process, "com.apple.audio.AudioQueue");
+        thread = q->thread;
+    }
+    thread->post(run);
+}
+
+// On the input device's thread: the captured frames, in the queue's channels and rate, into the
+// enqueued buffers.
+void Queues::capture(const std::shared_ptr<Queue>& q, const float* samples, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing) {
+    auto& m = support_.process.calling_engine();
+    const auto qc = q->format.channels;
+    std::vector<double> converted;
+    {
+        std::lock_guard lock(q->mutex);
+        if (!q->running) return;
+        for (std::uint32_t f = 0; f < frames; ++f)
+            for (std::uint32_t c = 0; c < qc; ++c) {
+                const auto source = channels == 1 ? 0U : c;
+                q->input_pending.push_back(source < channels ? samples[static_cast<std::size_t>(f) * channels + source] : 0.0);
+            }
+        const auto available = q->input_pending.size() / qc;
+        if (q->format.rate == timing.rate) {
+            converted.assign(q->input_pending.begin(), q->input_pending.end());
+            q->input_pending.clear();
+        } else {
+            if (!q->input_resampler) q->input_resampler = std::make_unique<Resampler>(timing.rate, q->format.rate, qc);
+            auto count = static_cast<std::size_t>(std::floor(static_cast<double>(available) * q->format.rate / timing.rate));
+            while (count && q->input_resampler->input_needed(count) > available) --count;
+            converted.resize(count * qc);
+            q->input_resampler->render(converted.data(), count, [&](double* out, std::size_t n) {
+                const auto take = std::min(n * qc, q->input_pending.size());
+                std::copy_n(q->input_pending.begin(), take, out);
+                std::fill(out + take, out + n * qc, 0.0);
+                q->input_pending.erase(q->input_pending.begin(), q->input_pending.begin() + static_cast<std::ptrdiff_t>(take));
+            });
+        }
+    }
+    const auto total = converted.size() / qc;
+    struct Full { std::uint64_t address{}; std::uint32_t frames{}; double sample{}; std::uint64_t host{}; };
+    std::vector<Full> full;
+    {
+        std::lock_guard lock(q->mutex);
+        const auto planes = q->format.non_interleaved ? qc : 1U;
+        const auto frame_bytes = q->format.frame_bytes();
+        std::size_t at = 0;
+        while (at < total && !q->queued.empty() && !q->paused) {
+            auto& b = q->queued.front();
+            if (b.played == 0) {
+                b.start_sample = q->sample_time;
+                b.start_host = timing.output_host + static_cast<std::uint64_t>(static_cast<double>(at) / q->format.rate * 1e9);
+            }
+            const auto take = std::min<std::size_t>(b.frames - b.played, total - at);
+            std::vector<std::vector<std::uint8_t>> storage(planes, std::vector<std::uint8_t>(take * frame_bytes));
+            std::vector<std::span<std::uint8_t>> spans(storage.begin(), storage.end());
+            af::encode(q->format, std::span(converted).subspan(at * qc, take * qc), qc, take, spans);
+            const auto data = m.read64(b.address + buffer_data);
+            const auto plane_bytes = static_cast<std::size_t>(b.frames) * frame_bytes;
+            for (std::uint32_t p = 0; p < planes; ++p) m.write_bytes(data + p * plane_bytes + static_cast<std::size_t>(b.played) * frame_bytes, storage[p]);
+            b.played += static_cast<std::uint32_t>(take);
+            at += take;
+            q->sample_time += static_cast<double>(take);
+            if (b.played == b.frames) {
+                m.write32(b.address + buffer_size, static_cast<std::uint32_t>(plane_bytes * planes));
+                full.push_back({b.address, b.frames, b.start_sample, b.start_host});
+                q->queued.pop_front();
+            }
+        }
+        if (at < total) q->sample_time += static_cast<double>(total - at);   // no buffer: lost
+    }
+    for (const auto& f : full) give_back_input(q, f.address, f.frames, f.sample, f.host);
 }
 
 void Queues::notify(const std::shared_ptr<Queue>& q, std::uint32_t property) {
@@ -247,6 +366,31 @@ std::int32_t Queues::start(const std::shared_ptr<Queue>& q) {
         q->draining = false;
         if (q->running) return 0;
     }
+    if (q->input) {
+        const auto device = hal_default_input();
+        const auto input = hal_input_io(device);
+        if (!input) return error::invalid_device;
+        {
+            std::lock_guard lock(q->mutex);
+            q->input_io = input;
+            q->running = true;
+            q->input_pending.clear();
+            q->input_resampler.reset();
+        }
+        auto self = shared_from_this();
+        const auto channels = input->channels();
+        const auto status = input->start(q->handle, [self, q, channels](const float* samples, std::uint32_t frames, const hal_io::Timing& timing) {
+            self->capture(q, samples, frames, channels, timing);
+        }, 0);
+        if (status) {
+            std::lock_guard lock(q->mutex);
+            q->running = false;
+            q->input_io.reset();
+            return status;
+        }
+        notify(q, prop_is_running);
+        return 0;
+    }
     const auto device = hal_default_output();
     const auto io = hal_device_io(device);
     if (!io) return error::invalid_device;
@@ -267,6 +411,7 @@ std::int32_t Queues::start(const std::shared_ptr<Queue>& q) {
 
 void Queues::stop_now(const std::shared_ptr<Queue>& q, bool give_back_buffers) {
     std::shared_ptr<hal_io::DeviceIo> io;
+    std::shared_ptr<hal_io::InputIo> input;
     std::vector<std::uint64_t> dropped;
     bool was_running{};
     {
@@ -275,13 +420,24 @@ void Queues::stop_now(const std::shared_ptr<Queue>& q, bool give_back_buffers) {
         q->running = false;
         q->draining = false;
         io = std::move(q->io);
+        input = std::move(q->input_io);
+        if (q->input && give_back_buffers) {
+            // Input buffers go back with what they hold.
+            auto& m = support_.process.calling_engine();
+            const auto per_frame = q->format.frame_bytes() * (q->format.non_interleaved ? q->format.channels : 1U);
+            for (const auto& b : q->queued) m.write32(b.address + buffer_size, b.played * per_frame);
+        }
         if (give_back_buffers)
             for (const auto& b : q->queued) dropped.push_back(b.address);
         if (give_back_buffers) q->queued.clear();
         q->reset_pending = true;
     }
     if (io) io->stop(q->handle);
-    for (const auto buffer : dropped) give_back(q, buffer);
+    if (input) input->stop(q->handle);
+    for (const auto buffer : dropped) {
+        if (q->input) give_back_input(q, buffer, 0, 0, 0);
+        else give_back(q, buffer);
+    }
     if (was_running) notify(q, prop_is_running);
 }
 
@@ -320,6 +476,30 @@ void Queues::install() {
             q.callback = s.x[1];
             q.user_data = s.x[2];
             q.main_queue = main_loop;
+        }));
+    });
+    // AudioQueueNewInput(format, callback, userData, runLoop, runLoopMode, flags, AudioQueueRef *out)
+    support_.function(audio_toolbox, "_AudioQueueNewInput", [self, make, status](CpuState& s, GuestMemory& m) {
+        if (s.x[6]) m.write64(s.x[6], 0);
+        if (!hal_default_input()) return status(s, error::invalid_device);
+        if (!s.x[1]) return status(s, error::param);
+        const auto main_loop = s.x[3] && s.x[3] == self->support_.call(core_foundation, "_CFRunLoopGetMain", {});
+        status(s, make(m, s.x[0], s.x[6], [&](Queue& q) {
+            q.input = true;
+            q.callback = s.x[1];
+            q.user_data = s.x[2];
+            q.main_queue = main_loop;
+        }));
+    });
+    // AudioQueueNewInputWithDispatchQueue(AudioQueueRef *out, format, flags, queue, block)
+    support_.function(audio_toolbox, "_AudioQueueNewInputWithDispatchQueue", [self, make, status](CpuState& s, GuestMemory& m) {
+        if (s.x[0]) m.write64(s.x[0], 0);
+        if (!s.x[3] || !s.x[4]) return status(s, error::param);
+        if (!hal_default_input()) return status(s, error::invalid_device);
+        status(s, make(m, s.x[1], s.x[0], [&](Queue& q) {
+            q.input = true;
+            q.block = self->bridge_->block_copy(s.x[4]);
+            q.dispatch_queue = self->bridge_->retain(s.x[3]);
         }));
     });
     // AudioQueueNewOutputWithDispatchQueue(AudioQueueRef *out, format, flags, queue, block)
@@ -412,6 +592,15 @@ void Queues::install() {
         if (!q->buffers.contains(buffer)) return error::invalid_buffer;
         const auto bytes = m.read32(buffer + buffer_size);
         const auto per_frame = q->format.frame_bytes() * (q->format.non_interleaved ? q->format.channels : 1U);
+        if (q->input) {   // an empty buffer to record into, its whole capacity
+            Buffer b;
+            b.address = buffer;
+            b.frames = q->buffers[buffer] / per_frame;
+            if (!b.frames) return error::invalid_buffer;
+            m.write32(buffer + buffer_size, 0);
+            q->queued.push_back(b);
+            return 0;
+        }
         if (!bytes) return error::buffer_empty;
         if (bytes > q->buffers[buffer]) return error::invalid_buffer;
         Buffer b;
@@ -446,7 +635,7 @@ void Queues::install() {
     support_.function(audio_toolbox, "_AudioQueueStop", [self, status](CpuState& s, GuestMemory&) {
         const auto q = self->find(s.x[0]);
         if (!q) return status(s, error::param);
-        if ((s.x[1] & 0xFF) != 0) {
+        if ((s.x[1] & 0xFF) != 0 || q->input) {   // input queues stop at once
             self->stop_now(q, true);
         } else {
             bool empty{};

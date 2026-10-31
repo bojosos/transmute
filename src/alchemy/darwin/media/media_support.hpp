@@ -25,7 +25,7 @@ namespace alchemy::gui::completion_kit::media {
 namespace midi { class Backend; }
 namespace hal { class Backend; class InputStream; }
 namespace capture { class Backend; }
-namespace hal_io { class DeviceIo; }
+namespace hal_io { class DeviceIo; class InputIo; }
 
 void install_core_midi(Support& support);
 void install_hal(Support& support);
@@ -60,6 +60,8 @@ std::int32_t hal_set_buffer_frames(std::uint32_t device, std::uint32_t frames);
 struct HalInputDevice { std::uint32_t id{}; std::string uid, name; std::uint32_t channels{}; double rate{}; };
 std::vector<HalInputDevice> hal_input_devices();
 std::uint32_t hal_default_input();
+// An input device's shared capture (hal_io.hpp InputIo: AUHAL input, AudioQueue input, IOProcs), or nullptr.
+std::shared_ptr<hal_io::InputIo> hal_input_io(std::uint32_t device);
 std::unique_ptr<hal::InputStream> hal_open_input(std::uint32_t device,
                                                  std::function<void(const float* samples, std::uint32_t frames, std::uint64_t time_ns)> capture);
 

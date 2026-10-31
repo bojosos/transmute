@@ -2,7 +2,9 @@
 // over a fake camera backend and a fake HAL with one microphone: no real camera or microphone is
 // opened. Device discovery and formats, authorization as the (fake) host decides it, sessions
 // delivering NV12 pictures as CMSampleBuffers to a delegate queue (scaled, mirrored, in the pixel
-// format asked for), audio data outputs, and the engine's input node feeding the mixer or a tap.
+// format asked for), audio data outputs, the engine's input node feeding the mixer or a tap, and
+// the lower-level input paths: AUHAL input (input callback and AudioUnitRender on bus 1),
+// AudioQueue input queues, and IOProcs on the input device.
 #include "alchemy/gui/tests/fill_fixture.hpp"
 #include "alchemy/darwin/media/capture_core.hpp"
 #include "alchemy/darwin/media/hal_core.hpp"
@@ -27,7 +29,8 @@ namespace hal = media::hal;
 namespace capture = media::capture;
 
 #define FRAMEWORK(name) "/System/Library/Frameworks/" name ".framework/Versions/A/" name
-constexpr std::string_view cm = FRAMEWORK("CoreMedia"), cv = FRAMEWORK("CoreVideo"), av = FRAMEWORK("AVFoundation");
+constexpr std::string_view cm = FRAMEWORK("CoreMedia"), cv = FRAMEWORK("CoreVideo"), av = FRAMEWORK("AVFoundation"), au = FRAMEWORK("AudioUnit"),
+    at = FRAMEWORK("AudioToolbox"), ca = FRAMEWORK("CoreAudio");
 #undef FRAMEWORK
 constexpr std::string_view libsystem = "/usr/lib/libSystem.B.dylib";
 
@@ -380,6 +383,165 @@ void engine_input(Fixture& f) {
     FakeInput::refuse() = false;
 }
 
+// The default input device's ID (kAudioHardwarePropertyDefaultInputDevice).
+std::uint32_t default_input(Fixture& f) {
+    const auto address = f.block(12), size = f.block(4), value = f.block(4);
+    f.engine.write32(address, four("dIn "));
+    f.engine.write32(address + 4, four("glob"));
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {1, address, 0, 0, size, value}) == 0, "the default input device");
+    return f.engine.read32(value);
+}
+
+// An ASBD: signed 16-bit packed interleaved linear PCM.
+void int16_format(Fixture& f, Address at_, double rate, std::uint32_t channels) {
+    f.engine.write64(at_, std::bit_cast<std::uint64_t>(rate));
+    f.engine.write32(at_ + 8, four("lpcm"));
+    f.engine.write32(at_ + 12, 4 | 8);
+    f.engine.write32(at_ + 16, 2 * channels);
+    f.engine.write32(at_ + 20, 1);
+    f.engine.write32(at_ + 24, 2 * channels);
+    f.engine.write32(at_ + 28, channels);
+    f.engine.write32(at_ + 32, 16);
+    f.engine.write32(at_ + 36, 0);
+}
+
+struct InputSeen {
+    std::atomic<int> calls{0};
+    std::atomic<std::uint32_t> frames{0}, bytes{0}, buffers{0}, outputs{99};
+    std::atomic<std::int32_t> status{1}, sample{0};
+    std::atomic<std::int64_t> sample_time{-1}, previous_time{-1};
+    std::atomic<float> level{0};
+    Address unit{}, list{}, data{};
+};
+InputSeen& input_seen() { static InputSeen value; return value; }
+
+void auhal_input(Fixture& f) {
+    auto& seen = input_seen();
+    const auto description = f.block(20), unit_out = f.block(8), value = f.block(64), size = f.block(4), callback = f.block(16);
+    f.engine.write32(description, four("auou"));
+    f.engine.write32(description + 4, four("ahal"));
+    f.engine.write32(description + 8, four("appl"));
+    const auto component = f.call(au, "_AudioComponentFindNext", {0, description});
+    require(component && f.status(au, "_AudioComponentInstanceNew", {component, unit_out}) == 0, "AUHAL");
+    const auto unit = f.engine.read64(unit_out);
+    seen.unit = unit;
+    seen.list = f.block(24);
+    seen.data = f.block(2 * 4096);
+    // Input on, output off, the microphone as the current device.
+    f.engine.write32(value, 1);
+    require(f.status(au, "_AudioUnitSetProperty", {unit, 2003, 1, 1, value, 4}) == 0, "EnableIO input");
+    f.engine.write32(value, 0);
+    require(f.status(au, "_AudioUnitSetProperty", {unit, 2003, 2, 0, value, 4}) == 0, "EnableIO output off");
+    const auto microphone = default_input(f);
+    f.engine.write32(value, microphone);
+    require(f.status(au, "_AudioUnitSetProperty", {unit, 2000, 0, 0, value, 4}) == 0, "CurrentDevice: the microphone");
+    f.engine.write32(size, 4);
+    require(f.status(au, "_AudioUnitGetProperty", {unit, 2006, 1, 1, value, size}) == 0 && f.engine.read32(value) == 1, "HasIO: input");
+    // The device side of element 1 is the microphone's format; the client side 16-bit mono at its rate.
+    f.engine.write32(size, 40);
+    require(f.status(au, "_AudioUnitGetProperty", {unit, 8, 1, 1, value, size}) == 0 && std::bit_cast<double>(f.engine.read64(value)) == 48000.0 &&
+                f.engine.read32(value + 28) == 1,
+            "the input device's format");
+    int16_format(f, value, 44100, 1);
+    require(f.status(au, "_AudioUnitSetProperty", {unit, 8, 2, 1, value, 40}) == 0, "client format (44.1 kHz)");
+    require(f.status(au, "_AudioUnitInitialize", {unit}) == -10868, "AUHAL does not convert the input's rate");
+    int16_format(f, value, 48000, 1);
+    require(f.status(au, "_AudioUnitSetProperty", {unit, 8, 2, 1, value, 40}) == 0, "client format (48 kHz)");
+    // The input callback pulls bus 1 into its own buffer.
+    const auto proc = f.process.install_function("_alchemy_test_auhal_input", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        auto& seen = input_seen();
+        auto* sp = alchemy::gui::support_kit::support();
+        const auto frames = static_cast<std::uint32_t>(s.x[4]);
+        m.write32(seen.list, 1);
+        m.write32(seen.list + 8, 1);
+        m.write32(seen.list + 12, 2 * 4096);
+        m.write64(seen.list + 16, seen.data);
+        alchemy::CallRegs r{};
+        r.x = {seen.unit, s.x[1], s.x[2], 1, frames, seen.list, 0, 0};
+        seen.status = static_cast<std::int32_t>(sp->call(au, "_AudioUnitRender", r).x0);
+        seen.frames = frames;
+        seen.bytes = m.read32(seen.list + 12);
+        seen.sample = static_cast<std::int16_t>(m.read32(seen.data + 2 * (frames / 2)) & 0xffff);
+        seen.previous_time = seen.sample_time.load();
+        seen.sample_time = static_cast<std::int64_t>(std::bit_cast<double>(m.read64(s.x[2])));
+        ++seen.calls;
+        s.x[0] = 0;
+    }, std::string(au));
+    f.engine.write64(callback, proc);
+    f.engine.write64(callback + 8, 0);
+    require(f.status(au, "_AudioUnitSetProperty", {unit, 2005, 0, 0, callback, 16}) == 0, "the input callback");
+    require(f.status(au, "_AudioUnitInitialize", {unit}) == 0 && f.status(au, "_AudioOutputUnitStart", {unit}) == 0, "started");
+    require(FakeInput::live() == 1, "the microphone opened");
+    require(wait_for([&] { return seen.calls >= 3; }), "the input callback runs");
+    require(seen.status == 0 && seen.frames == 512 && seen.bytes == 1024, "AudioUnitRender: 512 frames of 16-bit mono: " + std::to_string(seen.status.load()));
+    require(seen.sample == 8192, "the microphone's 0.25 as 16-bit: " + std::to_string(seen.sample.load()));
+    require(seen.sample_time - seen.previous_time == 512, "sample times count the device's frames");
+    require(f.status(au, "_AudioOutputUnitStop", {unit}) == 0 && FakeInput::live() == 0, "stopped; the microphone closed");
+    require(f.status(au, "_AudioComponentInstanceDispose", {unit}) == 0, "disposed");
+}
+
+void audio_queue_input(Fixture& f) {
+    auto& seen = input_seen();
+    seen.calls = 0;
+    seen.sample_time = seen.previous_time = -1;
+    const auto format = f.block(40), out = f.block(8);
+    int16_format(f, format, 16000, 2);   // stereo at 16 kHz: mapped and resampled from the mono 48 kHz microphone
+    const auto callback = f.process.install_function("_alchemy_test_queue_input", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        auto& seen = input_seen();
+        auto* sp = alchemy::gui::support_kit::support();
+        const auto buffer = s.x[2];
+        seen.bytes = m.read32(buffer + 16);
+        seen.frames = static_cast<std::uint32_t>(s.x[4]);
+        const auto data = m.read64(buffer + 8);
+        // The middle frame's right channel (the resampler has settled there).
+        seen.sample = static_cast<std::int16_t>(m.read32(data + 4ULL * 800 + 2) & 0xffff);
+        seen.previous_time = seen.sample_time.load();
+        seen.sample_time = static_cast<std::int64_t>(std::bit_cast<double>(m.read64(s.x[3])));
+        ++seen.calls;
+        if (seen.bytes) static_cast<void>(sp->call(at, "_AudioQueueEnqueueBuffer", {s.x[1], buffer, 0, 0}));
+    }, std::string(at));
+    alchemy::CallRegs r{};
+    r.x = {format, callback, 0, 0, 0, 0, out, 0};
+    require(static_cast<std::int32_t>(f.regs(at, "_AudioQueueNewInput", r).x0) == 0, "AudioQueueNewInput");
+    const auto queue = f.engine.read64(out);
+    for (int i = 0; i < 3; ++i) {
+        const auto buffer_out = f.block(8);
+        require(f.status(at, "_AudioQueueAllocateBuffer", {queue, 6400, buffer_out}) == 0, "a buffer");
+        require(f.status(at, "_AudioQueueEnqueueBuffer", {queue, f.engine.read64(buffer_out), 0, 0}) == 0, "enqueued empty");
+    }
+    require(f.status(at, "_AudioQueueStart", {queue, 0}) == 0 && FakeInput::live() == 1, "recording");
+    require(wait_for([&] { return seen.calls >= 4; }, 5), "full buffers reach the callback");
+    require(seen.bytes == 6400 && seen.frames == 1600, "100 ms of 16-bit stereo: " + std::to_string(seen.bytes.load()));
+    require(std::abs(seen.sample - 8192) <= 2, "0.25, resampled, in both channels: " + std::to_string(seen.sample.load()));
+    require(seen.sample_time - seen.previous_time == 1600, "start times in the queue's frames");
+    require(f.status(at, "_AudioQueueStop", {queue, 1}) == 0 && FakeInput::live() == 0, "stopped; the microphone closed");
+    require(f.status(at, "_AudioQueueDispose", {queue, 1}) == 0, "disposed");
+}
+
+void ioproc_input(Fixture& f) {
+    auto& seen = input_seen();
+    seen.calls = 0;
+    const auto microphone = default_input(f);
+    const auto proc = f.process.install_function("_alchemy_test_ioproc_input", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        auto& seen = input_seen();
+        // (device, now, inputData, inputTime, outputData, outputTime, clientData)
+        seen.buffers = m.read32(s.x[2]);
+        seen.bytes = m.read32(s.x[2] + 12);
+        seen.level = std::bit_cast<float>(m.read32(m.read64(s.x[2] + 16)));
+        seen.outputs = m.read32(s.x[4]);
+        ++seen.calls;
+        s.x[0] = 0;
+    }, std::string(ca));
+    const auto id = f.block(8);
+    require(f.status(ca, "_AudioDeviceCreateIOProcID", {microphone, proc, 0, id}) == 0, "an IOProc on the microphone");
+    require(f.status(ca, "_AudioDeviceStart", {microphone, f.engine.read64(id)}) == 0 && FakeInput::live() == 1, "started");
+    require(wait_for([&] { return seen.calls >= 3; }), "the IOProc runs");
+    require(seen.buffers == 1 && seen.bytes == 512 * 4 && seen.outputs == 0 && seen.level == 0.25f, "one 512-frame float input buffer, no output");
+    require(f.status(ca, "_AudioDeviceStop", {microphone, f.engine.read64(id)}) == 0 && FakeInput::live() == 0, "stopped; the microphone closed");
+    require(f.status(ca, "_AudioDeviceDestroyIOProcID", {microphone, f.engine.read64(id)}) == 0, "destroyed");
+}
+
 } // namespace
 
 int main() {
@@ -390,5 +552,8 @@ int main() {
         {"authorization", authorization},
         {"session", session},
         {"engine_input", engine_input},
+        {"auhal_input", auhal_input},
+        {"audio_queue_input", audio_queue_input},
+        {"ioproc_input", ioproc_input},
     });
 }
