@@ -43,6 +43,7 @@ below. Nothing in `src/alchemy/darwin/` changes.
 | `ui` | Win32 windows, messages, DPI, clipboard, OLE drag and drop, IMM, DWM cloak, TaskDialog, shell | Wayland (xdg-shell, xdg-decoration, fractional-scale, text-input-v3, data-device for clipboard and drag and drop, xdg-desktop-portal for file dialogs) with X11 (XCB) as a fallback; "cloaked" runs as an off-screen or headless compositor (e.g. `weston --backend=headless`). |
 | `audio` | WASAPI device enumeration | PipeWire (or ALSA directly) for devices and streams. |
 | `midi` | WinMM `midiIn*`/`midiOut*` | ALSA sequencer, or PipeWire MIDI. |
+| `speech` | SAPI 5 `ISpVoice` speaking into a memory stream | speech-dispatcher or eSpeak NG into a buffer. |
 | `gpu` | Vulkan loader + `vkCreateWin32SurfaceKHR`; D2D, DirectWrite and WIC under CoreGraphics, CoreText and ImageIO | Vulkan with `VK_KHR_wayland_surface`/`xcb_surface` (Vulkan code is unchanged). The 2D stack needs a replacement for D2D/DirectWrite/WIC: Skia, or Cairo + FreeType + HarfBuzz + libpng/libjpeg, behind the same `gpu` area calls. This is the largest single piece of a port. |
 | `debug` | SetUnhandledExceptionFilter and SetErrorMode, RtlLookupFunctionEntry/RtlVirtualUnwind, RtlCaptureStackBackTrace, GetModuleHandleEx | `sigaction` for SIGSEGV/SIGBUS/SIGILL/SIGFPE on an alternate stack, `backtrace()` or libunwind, `dladdr` for module and offset. |
 | network policy (`ALCHEMY_NETWORK`) | in `src/alchemy/host/common/`, above the backends | unchanged: every backend inherits it. |
