@@ -25,6 +25,8 @@
 namespace alchemy::gui::fill {
 
 void install_core_media(InstallContext& context);
+// coremedia_clock.cpp: CMClock, CMTimebase, CMSync, CMSimpleQueue, CMBufferQueue, CMMemoryPool (after install_core_media).
+void install_core_media_clocks(InstallContext& context);
 void install_video_toolbox(InstallContext& context);
 void install_av_foundation(InstallContext& context);
 void install_core_video_gaps(InstallContext& context);

@@ -7,6 +7,7 @@
 list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/install.cpp
     src/alchemy/darwin/media/coremedia.cpp
+    src/alchemy/darwin/media/coremedia_clock.cpp
     src/alchemy/darwin/media/core_video.cpp
     src/alchemy/darwin/media/pixel_transfer.cpp
     src/alchemy/darwin/media/pixel_convert.cpp

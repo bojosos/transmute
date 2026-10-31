@@ -4,6 +4,7 @@ namespace alchemy::gui::fill {
 
 void install_media(InstallContext& context) {
     install_core_media(context);
+    install_core_media_clocks(context);
     install_pixel_transfer(context);
     install_vt_decompression(context);
     install_video_toolbox(context);

@@ -176,6 +176,9 @@ struct FormatDescription final : ObjectPayload {
     Address stream_description{};             // audio: guest AudioStreamBasicDescription (40 bytes)
     Address channel_layout{};                 // audio: guest AudioChannelLayout copy or 0
     std::uint64_t channel_layout_size{};
+    Address cookie{};                         // audio: guest copy of the magic cookie or 0
+    std::uint64_t cookie_size{};
+    Address format_list{};                    // audio: guest AudioFormatListItem (made on first use)
 };
 struct SampleBuffer final : ObjectPayload {
     std::mutex mutex;
@@ -186,6 +189,9 @@ struct SampleBuffer final : ObjectPayload {
     Address attachments{};                     // retained CFArray of mutable dictionaries
     struct Attachment { Address key{}, value{}; std::uint32_t mode{}; };   // retained key and value
     std::vector<Attachment> buffer_attachments;   // CMSetAttachment's (the CMAttachmentBearer calls)
+    bool invalidated{};
+    std::optional<completion_kit::media::CMTime> output_pts;   // CMSampleBufferSetOutputPresentationTimeStamp
+    std::vector<std::uint8_t> packet_descriptions;             // AudioStreamPacketDescription entries (16 bytes each)
 };
 
 class CoreMedia final : public Provider {
@@ -311,6 +317,9 @@ public:
     void install_audio_formats();
     void install_sample_buffer_access();
     void install_attachments();
+    void install_time_more();
+    void install_sample_buffer_more();
+    void install_format_description_more();
     std::int32_t subdivide(Address buffer, std::int64_t index, Address& out);
 };
 
@@ -1005,9 +1014,14 @@ void CoreMedia::install_audio_formats() {
             s.x[0] = status(fd_invalid_parameter);
             return;
         }
-        // Magic cookies belong to compressed formats, which no Alchemy codec decodes.
-        if (s.x[4]) throw std::runtime_error("Alchemy: CMAudioFormatDescriptionCreate with a magic cookie is unsupported (no audio codec exists)");
         auto value = std::make_shared<FormatDescription>();
+        if (s.x[4]) {   // the magic cookie of a compressed format, kept as given
+            std::vector<std::uint8_t> cookie(static_cast<std::size_t>(s.x[4]));
+            m.read_bytes(s.x[5], cookie);
+            value->cookie = malloc(cookie.size());
+            m.write_bytes(value->cookie, cookie);
+            value->cookie_size = cookie.size();
+        }
         value->media_type = fourcc("soun");
         std::vector<std::uint8_t> asbd(40);
         m.read_bytes(s.x[1], asbd);
@@ -1148,10 +1162,11 @@ void CoreMedia::install_sample_buffer_access() {
         std::lock_guard lock(value->mutex);
         s.x[0] = static_cast<std::uint64_t>(value->samples);
     });
-    // Buffers are never invalidated (CMSampleBufferInvalidate is not provided).
+    // Valid until CMSampleBufferInvalidate.
     raw(core_media, "_CMSampleBufferIsValid", [this](CpuState& s, GuestMemory&) {
-        static_cast<void>(state<SampleBuffer>(s.x[0], "CMSampleBuffer"));
-        s.x[0] = 1;
+        const auto value = state<SampleBuffer>(s.x[0], "CMSampleBuffer");
+        std::lock_guard lock(value->mutex);
+        s.x[0] = value->invalidated ? 0 : 1;
     });
     // CMTime CMSampleBufferGetDuration(sbuf): a single timing entry covers every sample.
     raw(core_media, "_CMSampleBufferGetDuration", [this](CpuState& s, GuestMemory& m) {
@@ -1247,6 +1262,518 @@ void CoreMedia::install_sample_buffer_access() {
     });
 }
 
+// CMTime and CMTimeRange beyond the arithmetic (<CoreMedia/CMTime.h>, <CoreMedia/CMTimeRange.h>): comparisons,
+// ratios, ranges (union, intersection, containment, mapping, clamping), dictionaries and descriptions. CMTime and
+// CMTimeRange arguments (24 and 48 bytes) arrive by reference; results go through x8.
+void CoreMedia::install_time_more() {
+    namespace cm = completion_kit::media;
+    using cm::CMTime;
+    const auto range_at = [](GuestMemory& m, Address at) { return cm::CMTimeRange{read_cmtime(m, at), read_cmtime(m, at + 24)}; };
+    const auto write_range = [](GuestMemory& m, Address at, const cm::CMTimeRange& r) {
+        write_cmtime(m, at, r.start);
+        write_cmtime(m, at + 24, r.duration);
+    };
+    const auto valid_range = [](const cm::CMTimeRange& r) {
+        return cm::is_valid(r.start) && cm::is_valid(r.duration) && r.duration.epoch == 0 && cm::compare(r.duration, cm::time_zero) >= 0;
+    };
+    // CMTimeRange kCMTimeRangeZero / kCMTimeRangeInvalid; CMTime dictionary keys; CMTimeRange dictionary keys.
+    std::array<std::uint8_t, 48> zero_range{};
+    {
+        const auto zero = cm::time_zero;
+        std::memcpy(zero_range.data(), &zero.value, 8);
+        std::memcpy(zero_range.data() + 8, &zero.timescale, 4);
+        std::memcpy(zero_range.data() + 12, &zero.flags, 4);
+        std::memcpy(zero_range.data() + 24, &zero.value, 8);
+        std::memcpy(zero_range.data() + 32, &zero.timescale, 4);
+        std::memcpy(zero_range.data() + 36, &zero.flags, 4);
+    }
+    data(core_media, "_kCMTimeRangeZero", zero_range, 8);
+    data(core_media, "_kCMTimeRangeInvalid", std::array<std::uint8_t, 48>{}, 8);
+    for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 6>{{
+             {"_kCMTimeValueKey", "value"}, {"_kCMTimeScaleKey", "timescale"}, {"_kCMTimeEpochKey", "epoch"}, {"_kCMTimeFlagsKey", "flags"},
+             {"_kCMTimeRangeStartKey", "start"}, {"_kCMTimeRangeDurationKey", "duration"}}})
+        string(core_media, symbol, value);
+    raw(core_media, "_CMTimeMakeWithEpoch", [](CpuState& s, GuestMemory& m) {
+        auto time = cm::make(static_cast<std::int64_t>(s.x[0]), static_cast<std::int32_t>(s.x[1]));
+        if (cm::is_valid(time)) time.epoch = static_cast<std::int64_t>(s.x[2]);
+        write_cmtime(m, s.x[8], time);
+    });
+    // CMTimeMultiplyByRatio(time, int32_t multiplier, int32_t divisor): exact when the product fits, else rounded.
+    raw(core_media, "_CMTimeMultiplyByRatio", [](CpuState& s, GuestMemory& m) {
+        const auto time = read_cmtime(m, s.x[0]);
+        const auto multiplier = static_cast<std::int32_t>(s.x[1]), divisor = static_cast<std::int32_t>(s.x[2]);
+        CMTime out = time;
+        if (divisor == 0 || !cm::is_valid(time)) out = cm::time_invalid;
+        else if (!cm::is_numeric(time)) out = (multiplier < 0) != (divisor < 0) && (time.flags & cm::cmtime_flags::positive_infinity) ? cm::time_negative_infinity
+                                            : (multiplier < 0) != (divisor < 0) && (time.flags & cm::cmtime_flags::negative_infinity) ? cm::time_positive_infinity : time;
+        else {
+            const long double exact = static_cast<long double>(time.value) * multiplier / divisor;
+            const auto rounded = std::llround(static_cast<double>(exact));
+            out.value = rounded;
+            if (static_cast<long double>(rounded) != exact) out.flags |= cm::cmtime_flags::rounded;
+        }
+        write_cmtime(m, s.x[8], out);
+    });
+    raw(core_media, "_CMTimeMinimum", [](CpuState& s, GuestMemory& m) {
+        const auto a = read_cmtime(m, s.x[0]), b = read_cmtime(m, s.x[1]);
+        write_cmtime(m, s.x[8], !cm::is_valid(a) || !cm::is_valid(b) ? cm::time_invalid : cm::compare(a, b) <= 0 ? a : b);
+    });
+    raw(core_media, "_CMTimeMaximum", [](CpuState& s, GuestMemory& m) {
+        const auto a = read_cmtime(m, s.x[0]), b = read_cmtime(m, s.x[1]);
+        write_cmtime(m, s.x[8], !cm::is_valid(a) || !cm::is_valid(b) ? cm::time_invalid : cm::compare(a, b) >= 0 ? a : b);
+    });
+    raw(core_media, "_CMTimeAbsoluteValue", [](CpuState& s, GuestMemory& m) {
+        auto time = read_cmtime(m, s.x[0]);
+        if (time.flags & cm::cmtime_flags::negative_infinity) time = cm::time_positive_infinity;
+        else if (cm::is_numeric(time) && time.value < 0) time.value = -time.value;
+        write_cmtime(m, s.x[8], time);
+    });
+    // CMTimeShow / CMTimeRangeShow: the description on stderr, as CFShow does.
+    const auto show = [this](const std::string& text) {
+        const auto line = text + "\n";
+        static_cast<void>(process.output(2, std::span(reinterpret_cast<const std::uint8_t*>(line.data()), line.size())));
+    };
+    raw(core_media, "_CMTimeShow", [show](CpuState& s, GuestMemory& m) { show(cm::description(read_cmtime(m, s.x[0]))); });
+    const auto range_text = [](const cm::CMTimeRange& r) { return "{" + cm::description(r.start) + ", " + cm::description(r.duration) + "}"; };
+    raw(core_media, "_CMTimeRangeShow", [show, range_at, range_text](CpuState& s, GuestMemory& m) { show(range_text(range_at(m, s.x[0]))); });
+    raw(core_media, "_CMTimeRangeCopyDescription", [this, range_at, range_text](CpuState& s, GuestMemory& m) { s.x[0] = cf.string(range_text(range_at(m, s.x[1]))); });
+    // Dictionaries: {value, timescale, flags, epoch} as CFNumbers; ranges {start, duration} of those.
+    const auto time_dictionary = [this](const CMTime& t) {
+        const std::array<std::pair<const char*, Address>, 4> fields{{{"value", cf.integer(t.value, 4)}, {"timescale", cf.integer(t.timescale, 3)},
+                                                                     {"flags", cf.integer(t.flags, 3)}, {"epoch", cf.integer(t.epoch, 4)}}};
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> entries;
+        for (const auto& [key, value] : fields) entries.emplace_back(cf.constant_string(key), value);
+        const auto dictionary = cf.dictionary(entries);
+        for (const auto& [key, value] : fields) release(value);
+        return dictionary;
+    };
+    const auto time_from = [this](Address dictionary) {
+        if (!dictionary || !bridge->is_dictionary(dictionary)) return cm::time_invalid;
+        const auto field = [&](const char* key) { const auto v = cf.dictionary_value(dictionary, cf.constant_string(key)); return v ? bridge->integer(v) : std::nullopt; };
+        const auto value = field("value"), timescale = field("timescale"), flags = field("flags"), epoch = field("epoch");
+        if (!value || !timescale || !flags) return cm::time_invalid;
+        return CMTime{*value, static_cast<std::int32_t>(*timescale), static_cast<std::uint32_t>(*flags), epoch.value_or(0)};
+    };
+    raw(core_media, "_CMTimeCopyAsDictionary", [time_dictionary](CpuState& s, GuestMemory& m) { s.x[0] = time_dictionary(read_cmtime(m, s.x[0])); });
+    raw(core_media, "_CMTimeMakeFromDictionary", [time_from](CpuState& s, GuestMemory& m) { write_cmtime(m, s.x[8], time_from(s.x[0])); });
+    raw(core_media, "_CMTimeRangeCopyAsDictionary", [this, range_at, time_dictionary](CpuState& s, GuestMemory& m) {
+        const auto r = range_at(m, s.x[0]);
+        const auto start = time_dictionary(r.start), duration = time_dictionary(r.duration);
+        s.x[0] = cf.dictionary(std::vector<std::pair<std::uint64_t, std::uint64_t>>{{cf.constant_string("start"), start}, {cf.constant_string("duration"), duration}});
+        release(start);
+        release(duration);
+    });
+    raw(core_media, "_CMTimeRangeMakeFromDictionary", [this, time_from, write_range](CpuState& s, GuestMemory& m) {
+        const auto d = s.x[0];
+        const auto part = [&](const char* key) { return d && bridge->is_dictionary(d) ? time_from(cf.dictionary_value(d, cf.constant_string(key))) : cm::time_invalid; };
+        write_range(m, s.x[8], {part("start"), part("duration")});
+    });
+    raw(core_media, "_CMTimeRangeFromTimeToTime", [write_range](CpuState& s, GuestMemory& m) {
+        const auto start = read_cmtime(m, s.x[0]), end = read_cmtime(m, s.x[1]);
+        write_range(m, s.x[8], {start, cm::subtract(end, start)});
+    });
+    raw(core_media, "_CMTimeRangeGetUnion", [range_at, write_range](CpuState& s, GuestMemory& m) {
+        const auto a = range_at(m, s.x[0]), b = range_at(m, s.x[1]);
+        const auto start = cm::compare(a.start, b.start) <= 0 ? a.start : b.start;
+        const auto end_a = cm::range_end(a), end_b = cm::range_end(b);
+        write_range(m, s.x[8], {start, cm::subtract(cm::compare(end_a, end_b) >= 0 ? end_a : end_b, start)});
+    });
+    raw(core_media, "_CMTimeRangeGetIntersection", [range_at, write_range](CpuState& s, GuestMemory& m) {
+        const auto a = range_at(m, s.x[0]), b = range_at(m, s.x[1]);
+        const auto start = cm::compare(a.start, b.start) >= 0 ? a.start : b.start;
+        const auto end_a = cm::range_end(a), end_b = cm::range_end(b);
+        const auto end = cm::compare(end_a, end_b) <= 0 ? end_a : end_b;
+        write_range(m, s.x[8], cm::compare(end, start) > 0 ? cm::CMTimeRange{start, cm::subtract(end, start)} : cm::CMTimeRange{start, cm::time_zero});
+    });
+    // [start, start + duration): the end is not in the range.
+    raw(core_media, "_CMTimeRangeContainsTime", [range_at, valid_range](CpuState& s, GuestMemory& m) {
+        const auto r = range_at(m, s.x[0]);
+        const auto t = read_cmtime(m, s.x[1]);
+        s.x[0] = valid_range(r) && cm::is_valid(t) && cm::compare(t, r.start) >= 0 && cm::compare(t, cm::range_end(r)) < 0 ? 1 : 0;
+    });
+    raw(core_media, "_CMTimeRangeContainsTimeRange", [range_at, valid_range](CpuState& s, GuestMemory& m) {
+        const auto a = range_at(m, s.x[0]), b = range_at(m, s.x[1]);
+        s.x[0] = valid_range(a) && valid_range(b) && cm::compare(b.start, a.start) >= 0 && cm::compare(cm::range_end(b), cm::range_end(a)) <= 0 ? 1 : 0;
+    });
+    raw(core_media, "_CMTimeRangeEqual", [range_at](CpuState& s, GuestMemory& m) {
+        const auto a = range_at(m, s.x[0]), b = range_at(m, s.x[1]);
+        s.x[0] = cm::compare(a.start, b.start) == 0 && cm::compare(a.duration, b.duration) == 0 ? 1 : 0;
+    });
+    raw(core_media, "_CMTimeClampToRange", [range_at](CpuState& s, GuestMemory& m) {
+        auto t = read_cmtime(m, s.x[0]);
+        const auto r = range_at(m, s.x[1]);
+        if (cm::compare(t, r.start) < 0) t = r.start;
+        else if (cm::compare(t, cm::range_end(r)) > 0) t = cm::range_end(r);
+        write_cmtime(m, s.x[8], t);
+    });
+    // start + (time - start) mod duration, for a time outside the range.
+    raw(core_media, "_CMTimeFoldIntoRange", [range_at](CpuState& s, GuestMemory& m) {
+        auto t = read_cmtime(m, s.x[0]);
+        const auto r = range_at(m, s.x[1]);
+        const auto span = cm::seconds(r.duration);
+        if (cm::is_numeric(t) && span > 0 && (cm::compare(t, r.start) < 0 || cm::compare(t, cm::range_end(r)) >= 0)) {
+            const auto offset = std::fmod(cm::seconds(t) - cm::seconds(r.start), span);
+            t = cm::add(r.start, cm::make_with_seconds(offset < 0 ? offset + span : offset, std::max(t.timescale, r.start.timescale)));
+        }
+        write_cmtime(m, s.x[8], t);
+    });
+    // CMTimeMapTimeFromRangeToRange(t, fromRange, toRange): toStart + (t - fromStart) * toDuration / fromDuration.
+    raw(core_media, "_CMTimeMapTimeFromRangeToRange", [range_at](CpuState& s, GuestMemory& m) {
+        const auto t = read_cmtime(m, s.x[0]);
+        const auto from = range_at(m, s.x[1]), to = range_at(m, s.x[2]);
+        const auto from_span = cm::seconds(from.duration);
+        CMTime out = cm::time_invalid;
+        if (cm::is_numeric(t) && from_span > 0) {
+            const auto scaled = (cm::seconds(t) - cm::seconds(from.start)) * cm::seconds(to.duration) / from_span;
+            out = cm::add(to.start, cm::make_with_seconds(scaled, std::max(to.start.timescale, t.timescale)));
+        }
+        write_cmtime(m, s.x[8], out);
+    });
+    // CMTimeMapping CMTimeMappingMake(CMTimeRange source, CMTimeRange target): 96 bytes through x8.
+    raw(core_media, "_CMTimeMappingMake", [range_at, write_range](CpuState& s, GuestMemory& m) {
+        const auto source = range_at(m, s.x[0]), target = range_at(m, s.x[1]);
+        write_range(m, s.x[8], source);
+        write_range(m, s.x[8] + 48, target);
+    });
+}
+
+// CMSampleBuffer beyond creation and access: timing and size queries, output timestamps, copies, invalidation,
+// readiness (buffers are always ready: data is never provided later), audio sample buffers from packets or
+// buffer lists, and PCM copies. Error codes are <CoreMedia/CMSampleBuffer.h>'s.
+void CoreMedia::install_sample_buffer_more() {
+    namespace cm = completion_kit::media;
+    constexpr std::int32_t sb_already_has_data = -12732, sb_index_out_of_range = -12734, sb_no_sizes = -12735, sb_no_timing = -12736,
+        sb_array_too_small = -12737, sb_invalid_media_type = -12741;
+    constant(core_media, "_CMSampleBufferGetTypeID", static_cast<Address>(TypeId::sample_buffer));
+    constant(core_media, "_CMFormatDescriptionGetTypeID", static_cast<Address>(TypeId::format_description));
+    const auto sample = [this](Address object) { return state<SampleBuffer>(object, "CMSampleBuffer"); };
+    // The timing of sample `index`: one entry covers every sample (each a duration later).
+    const auto timing_of = [](const SampleBuffer& b, std::int64_t index, std::vector<std::uint8_t>& out) -> std::int32_t {
+        const auto entries = static_cast<std::int64_t>(b.timing.size() / 72);
+        if (!entries) return sb_no_timing;
+        if (index < 0 || index >= std::max<std::int64_t>(b.samples, entries)) return sb_index_out_of_range;
+        if (entries == 1) {
+            out.assign(b.timing.begin(), b.timing.begin() + 72);
+            const auto step = cm::multiply(timing_time(b.timing, 0), static_cast<std::int32_t>(index));
+            for (const std::size_t at : {std::size_t{24}, std::size_t{48}}) {
+                const auto time = timing_time(out, at);
+                if (cm::is_numeric(time) && index) put_timing_time(out, at, cm::add(time, step));
+            }
+        } else {
+            out.assign(b.timing.begin() + index * 72, b.timing.begin() + index * 72 + 72);
+        }
+        return 0;
+    };
+    raw(core_media, "_CMSampleBufferGetDecodeTimeStamp", [sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        write_cmtime(m, s.x[8], b->timing.size() >= 72 ? timing_time(b->timing, 48) : cm::time_invalid);
+    });
+    raw(core_media, "_CMSampleBufferGetOutputPresentationTimeStamp", [sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        write_cmtime(m, s.x[8], b->output_pts ? *b->output_pts : b->timing.size() >= 72 ? timing_time(b->timing, 24) : cm::time_invalid);
+    });
+    raw(core_media, "_CMSampleBufferSetOutputPresentationTimeStamp", [sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        b->output_pts = read_cmtime(m, s.x[1]);
+        s.x[0] = 0;
+    });
+    // The output duration: the duration (no trimming or speed attachments are applied).
+    raw(core_media, "_CMSampleBufferGetOutputDuration", [sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        const auto entries = b->timing.size() / 72;
+        cm::CMTime total = entries ? cm::time_zero : cm::time_invalid;
+        for (std::size_t i = 0; i < entries; ++i) {
+            const auto duration = timing_time(b->timing, i * 72);
+            total = cm::add(total, entries == 1 ? cm::multiply(duration, static_cast<std::int32_t>(b->samples)) : duration);
+        }
+        write_cmtime(m, s.x[8], total);
+    });
+    // OSStatus CMSampleBufferGetSampleTimingInfo(sbuf, CMItemIndex, CMSampleTimingInfo *out)
+    raw(core_media, "_CMSampleBufferGetSampleTimingInfo", [sample, timing_of](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        if (!s.x[2]) { s.x[0] = status(sb_required_parameter_missing); return; }
+        std::vector<std::uint8_t> entry;
+        const auto error = timing_of(*b, static_cast<std::int64_t>(s.x[1]), entry);
+        if (!error) m.write_bytes(s.x[2], entry);
+        s.x[0] = status(error);
+    });
+    // OSStatus (sbuf, CMItemCount entries, CMSampleTimingInfo *array, CMItemCount *entriesNeededOut)
+    raw(core_media, "_CMSampleBufferGetSampleTimingInfoArray", [sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        const auto entries = b->timing.size() / 72;
+        if (s.x[3]) m.write64(s.x[3], entries);
+        if (!entries) { s.x[0] = status(sb_no_timing); return; }
+        if (s.x[2]) {
+            if (s.x[1] < entries) { s.x[0] = status(sb_array_too_small); return; }
+            m.write_bytes(s.x[2], b->timing);
+        }
+        s.x[0] = 0;
+    });
+    raw(core_media, "_CMSampleBufferGetSampleSize", [sample](CpuState& s, GuestMemory&) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        const auto index = static_cast<std::int64_t>(s.x[1]);
+        s.x[0] = b->sizes.size() == 1 ? b->sizes[0] : index >= 0 && static_cast<std::size_t>(index) < b->sizes.size() ? b->sizes[static_cast<std::size_t>(index)] : 0;
+    });
+    raw(core_media, "_CMSampleBufferGetSampleSizeArray", [sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        if (s.x[3]) m.write64(s.x[3], b->sizes.size());
+        if (b->sizes.empty()) { s.x[0] = status(sb_no_sizes); return; }
+        if (s.x[2]) {
+            if (s.x[1] < b->sizes.size()) { s.x[0] = status(sb_array_too_small); return; }
+            for (std::size_t i = 0; i < b->sizes.size(); ++i) m.write64(s.x[2] + 8 * i, b->sizes[i]);
+        }
+        s.x[0] = 0;
+    });
+    raw(core_media, "_CMSampleBufferGetTotalSampleSize", [sample](CpuState& s, GuestMemory&) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        std::uint64_t total = 0;
+        if (b->sizes.size() == 1) total = b->sizes[0] * static_cast<std::uint64_t>(std::max<std::int64_t>(b->samples, 0));
+        else for (const auto size : b->sizes) total += size;
+        s.x[0] = total;
+    });
+    raw(core_media, "_CMSampleBufferInvalidate", [sample](CpuState& s, GuestMemory&) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        b->invalidated = true;
+        s.x[0] = 0;
+    });
+    raw(core_media, "_CMSampleBufferDataIsReady", [sample](CpuState& s, GuestMemory&) {
+        static_cast<void>(sample(s.x[0]));
+        s.x[0] = 1;
+    });
+    for (const auto* name : {"_CMSampleBufferSetDataReady", "_CMSampleBufferMakeDataReady"})
+        raw(core_media, name, [sample](CpuState& s, GuestMemory&) {
+            static_cast<void>(sample(s.x[0]));
+            s.x[0] = 0;
+        });
+    raw(core_media, "_CMSampleBufferSetDataBuffer", [this, sample](CpuState& s, GuestMemory&) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        if (!s.x[1]) { s.x[0] = status(sb_required_parameter_missing); return; }
+        if (b->data) { s.x[0] = status(sb_already_has_data); return; }
+        b->data = retain(s.x[1]);
+        s.x[0] = 0;
+    });
+    // A new buffer with the same data, format, image, sizes and buffer attachments (and timing, or the new timing).
+    const auto copy = [this, sample](GuestMemory& m, Address source, const std::vector<std::uint8_t>* timing, Address out) -> std::int32_t {
+        if (!out) return sb_required_parameter_missing;
+        m.write64(out, 0);
+        const auto b = sample(source);
+        std::lock_guard lock(b->mutex);
+        auto value = std::make_shared<SampleBuffer>();
+        value->data = retain(b->data);
+        value->format = retain(b->format);
+        value->image = retain(b->image);
+        value->samples = b->samples;
+        value->timing = timing ? *timing : b->timing;
+        value->sizes = b->sizes;
+        value->packet_descriptions = b->packet_descriptions;
+        for (const auto& a : b->buffer_attachments) value->buffer_attachments.push_back({retain(a.key), retain(a.value), a.mode});
+        m.write64(out, make(sample_class, value));
+        return 0;
+    };
+    raw(core_media, "_CMSampleBufferCreateCopy", [copy](CpuState& s, GuestMemory& m) { s.x[0] = status(copy(m, s.x[1], nullptr, s.x[2])); });
+    // (allocator, original, CMItemCount numSampleTimingEntries, const CMSampleTimingInfo *array, out)
+    raw(core_media, "_CMSampleBufferCreateCopyWithNewTiming", [copy](CpuState& s, GuestMemory& m) {
+        std::vector<std::uint8_t> timing(static_cast<std::size_t>(std::min<std::uint64_t>(s.x[2], 1'000'000) * 72));
+        if (!timing.empty() && s.x[3]) m.read_bytes(s.x[3], timing);
+        s.x[0] = status(copy(m, s.x[1], &timing, s.x[4]));
+    });
+    // Audio sample buffers: one timing entry (a frame's duration at the format's rate, the given presentation
+    // time); with packet descriptions, one size per packet; otherwise linear PCM's bytes per frame.
+    const auto audio_buffer = [this](GuestMemory& m, Address data, Address format, std::int64_t samples, Address pts, Address descriptions,
+                                     Address out) -> std::int32_t {
+        if (!out || !format || !pts) {
+            if (out) m.write64(out, 0);
+            return sb_required_parameter_missing;
+        }
+        m.write64(out, 0);
+        const auto f = objc.find_host_state<FormatDescription>(format);
+        if (!f || f->media_type != fourcc("soun") || !f->stream_description) return sb_invalid_media_type;
+        const auto rate = std::bit_cast<double>(m.read64(f->stream_description));
+        const auto bytes_per_packet = m.read32(f->stream_description + 16);
+        auto value = std::make_shared<SampleBuffer>();
+        value->data = retain(data);
+        value->format = retain(format);
+        value->samples = samples;
+        value->timing.assign(72, 0);
+        put_timing_time(value->timing, 0, rate > 0 ? cm::make(1, static_cast<std::int32_t>(std::lround(rate))) : cm::time_invalid);
+        put_timing_time(value->timing, 24, read_cmtime(m, pts));
+        put_timing_time(value->timing, 48, cm::time_invalid);
+        if (descriptions) {
+            value->packet_descriptions.resize(static_cast<std::size_t>(samples) * 16);
+            m.read_bytes(descriptions, value->packet_descriptions);
+            for (std::int64_t i = 0; i < samples; ++i) value->sizes.push_back(m.read32(descriptions + 16 * i + 12));
+        } else if (bytes_per_packet) {
+            value->sizes.push_back(bytes_per_packet);
+        }
+        m.write64(out, make(sample_class, value));
+        return 0;
+    };
+    // CMAudioSampleBufferCreateWithPacketDescriptions(allocator, dataBuffer, dataReady, callback, refcon, format,
+    //     numSamples, const CMTime *pts (by reference), [stack] packetDescriptions, out)
+    raw(core_media, "_CMAudioSampleBufferCreateWithPacketDescriptions", [audio_buffer](CpuState& s, GuestMemory& m) {
+        s.x[0] = status(audio_buffer(m, s.x[1], s.x[5], static_cast<std::int64_t>(s.x[6]), s.x[7], m.read64(s.sp), m.read64(s.sp + 8)));
+    });
+    // CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator, dataBuffer, format, numSamples, pts, descriptions, out)
+    raw(core_media, "_CMAudioSampleBufferCreateReadyWithPacketDescriptions", [audio_buffer](CpuState& s, GuestMemory& m) {
+        s.x[0] = status(audio_buffer(m, s.x[1], s.x[2], static_cast<std::int64_t>(s.x[3]), s.x[4], s.x[5], s.x[6]));
+    });
+    // OSStatus (sbuf, size_t descriptionsSize, AudioStreamPacketDescription *out, size_t *sizeNeededOut)
+    raw(core_media, "_CMSampleBufferGetAudioStreamPacketDescriptions", [sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        if (s.x[3]) m.write64(s.x[3], b->packet_descriptions.size());
+        if (s.x[2] && !b->packet_descriptions.empty()) {
+            if (s.x[1] < b->packet_descriptions.size()) { s.x[0] = status(sb_array_too_small); return; }
+            m.write_bytes(s.x[2], b->packet_descriptions);
+        }
+        s.x[0] = 0;
+    });
+    // OSStatus CMSampleBufferSetDataBufferFromAudioBufferList(sbuf, allocator, allocator, flags, const AudioBufferList *):
+    // the buffers' bytes, one after another, in a new block buffer.
+    raw(core_media, "_CMSampleBufferSetDataBufferFromAudioBufferList", [this, sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        const auto list = s.x[4];
+        if (!list) { s.x[0] = status(sb_required_parameter_missing); return; }
+        std::vector<std::uint8_t> bytes;
+        for (std::uint32_t i = 0, n = m.read32(list); i < n; ++i) {
+            const auto at = list + 8 + 16ULL * i;
+            std::vector<std::uint8_t> part(m.read32(at + 4));
+            if (const auto from = m.read64(at + 8); from && !part.empty()) m.read_bytes(from, part);
+            bytes.insert(bytes.end(), part.begin(), part.end());
+        }
+        std::lock_guard lock(b->mutex);
+        if (b->data) { s.x[0] = status(sb_already_has_data); return; }
+        std::int32_t error{};
+        const auto block = create_block(0, bytes.size(), 0, 0, bytes.size(), 1, error);
+        if (!block) { s.x[0] = status(error); return; }
+        if (!bytes.empty()) transfer(m, *objc.find_host_state<BlockBuffer>(block), 0, bytes, true);
+        b->data = block;
+        s.x[0] = 0;
+    });
+    // OSStatus CMSampleBufferCopyPCMDataIntoAudioBufferList(sbuf, int32_t frameOffset, int32_t numFrames, AudioBufferList *):
+    // linear PCM only; the data buffer holds the frames interleaved, or plane after plane when non-interleaved.
+    raw(core_media, "_CMSampleBufferCopyPCMDataIntoAudioBufferList", [this, sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        const auto offset = static_cast<std::int32_t>(s.x[1]), frames = static_cast<std::int32_t>(s.x[2]);
+        const auto list = s.x[3];
+        std::lock_guard lock(b->mutex);
+        const auto f = b->format ? objc.find_host_state<FormatDescription>(b->format) : nullptr;
+        if (!list || !f || !f->stream_description || !b->data) { s.x[0] = status(sb_required_parameter_missing); return; }
+        if (m.read32(f->stream_description + 8) != fourcc("lpcm")) { s.x[0] = status(sb_invalid_media_type); return; }
+        const auto bytes_per_frame = m.read32(f->stream_description + 24);
+        const bool non_interleaved = (m.read32(f->stream_description + 12) & 32) != 0;   // kAudioFormatFlagIsNonInterleaved
+        const auto planes = non_interleaved ? m.read32(f->stream_description + 28) : 1U;
+        if (offset < 0 || frames < 0 || offset + frames > b->samples || m.read32(list) < planes) { s.x[0] = status(-50); return; }
+        const auto block = objc.find_host_state<BlockBuffer>(b->data);
+        const auto plane_bytes = static_cast<std::uint64_t>(b->samples) * bytes_per_frame;
+        for (std::uint32_t p = 0; p < planes; ++p) {
+            const auto at = list + 8 + 16ULL * p;
+            const auto wanted = static_cast<std::size_t>(frames) * bytes_per_frame;
+            if (m.read32(at + 4) < wanted || !m.read64(at + 8)) { s.x[0] = status(-50); return; }
+            std::vector<std::uint8_t> part(wanted);
+            if (wanted) transfer(m, *block, p * plane_bytes + static_cast<std::uint64_t>(offset) * bytes_per_frame, part, false);
+            m.write_bytes(m.read64(at + 8), part);
+            m.write32(at + 4, static_cast<std::uint32_t>(wanted));
+        }
+        s.x[0] = 0;
+    });
+}
+
+// CMFormatDescription comparison and generic creation; audio cookies and format lists; video/image matching.
+void CoreMedia::install_format_description_more() {
+    // CMFormatDescriptionCreate(allocator, mediaType, mediaSubType, extensions, out)
+    raw(core_media, "_CMFormatDescriptionCreate", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[4]) { s.x[0] = status(fd_invalid_parameter); return; }
+        auto value = std::make_shared<FormatDescription>();
+        value->media_type = static_cast<std::uint32_t>(s.x[1]);
+        value->subtype = static_cast<std::uint32_t>(s.x[2]);
+        value->extensions = s.x[3] ? cf.copy(s.x[3]) : 0;
+        m.write64(s.x[4], make(format_class, value));
+        s.x[0] = 0;
+    });
+    const auto same = [this](GuestMemory& m, Address a_object, Address b_object, bool extensions) {
+        if (a_object == b_object) return true;
+        const auto a = a_object ? objc.find_host_state<FormatDescription>(a_object) : nullptr;
+        const auto b = b_object ? objc.find_host_state<FormatDescription>(b_object) : nullptr;
+        if (!a || !b || a->media_type != b->media_type || a->subtype != b->subtype || a->width != b->width || a->height != b->height) return false;
+        if (a->parameter_sets != b->parameter_sets) return false;
+        if ((a->stream_description != 0) != (b->stream_description != 0)) return false;
+        if (a->stream_description) {
+            std::vector<std::uint8_t> x(40), y(40);
+            m.read_bytes(a->stream_description, x);
+            m.read_bytes(b->stream_description, y);
+            if (x != y) return false;
+        }
+        if (!extensions) return true;
+        if (!a->extensions || !b->extensions) return !a->extensions && !b->extensions;
+        return cf.equal(a->extensions, b->extensions);
+    };
+    raw(core_media, "_CMFormatDescriptionEqual", [same](CpuState& s, GuestMemory& m) { s.x[0] = same(m, s.x[0], s.x[1], true) ? 1 : 0; });
+    // (a, b, CFTypeRef extensionKeysToIgnore, CFTypeRef atomKeysToIgnore): keys to ignore are not looked at
+    // individually; extensions are compared only when neither list is given.
+    raw(core_media, "_CMFormatDescriptionEqualIgnoringExtensionKeys", [same](CpuState& s, GuestMemory& m) {
+        s.x[0] = same(m, s.x[0], s.x[1], !s.x[2] && !s.x[3]) ? 1 : 0;
+    });
+    // Boolean CMAudioFormatDescriptionEqual(a, b, CMAudioFormatDescriptionMask equalityMask, CMAudioFormatDescriptionMask *out)
+    raw(core_media, "_CMAudioFormatDescriptionEqual", [this, same](CpuState& s, GuestMemory& m) {
+        const auto equal = same(m, s.x[0], s.x[1], (s.x[2] & 8) != 0);   // kCMAudioFormatDescriptionMask_Extensions
+        if (s.x[3]) m.write32(s.x[3], equal ? static_cast<std::uint32_t>(s.x[2]) : 0U);
+        s.x[0] = equal ? 1 : 0;
+    });
+    const auto audio = [this](Address object) -> std::shared_ptr<FormatDescription> {
+        const auto value = object ? objc.find_host_state<FormatDescription>(object) : nullptr;
+        return value && value->media_type == fourcc("soun") ? value : nullptr;
+    };
+    raw(core_media, "_CMAudioFormatDescriptionGetMagicCookie", [audio](CpuState& s, GuestMemory& m) {
+        const auto value = audio(s.x[0]);
+        if (s.x[1]) m.write64(s.x[1], value ? value->cookie_size : 0);
+        s.x[0] = value ? value->cookie : 0;
+    });
+    // AudioFormatListItem {AudioStreamBasicDescription; AudioChannelLayoutTag}: the one format of the description.
+    const auto format_list = [this, audio](GuestMemory& m, Address object) -> Address {
+        const auto value = audio(object);
+        if (!value || !value->stream_description) return 0;
+        if (!value->format_list) {
+            value->format_list = malloc(48);
+            std::vector<std::uint8_t> item(48, 0);
+            m.read_bytes(value->stream_description, std::span(item).first(40));
+            if (value->channel_layout) {
+                const auto tag = m.read32(value->channel_layout);
+                std::memcpy(item.data() + 40, &tag, 4);
+            }
+            m.write_bytes(value->format_list, item);
+        }
+        return value->format_list;
+    };
+    raw(core_media, "_CMAudioFormatDescriptionGetFormatList", [format_list](CpuState& s, GuestMemory& m) {
+        const auto list = format_list(m, s.x[0]);
+        if (s.x[1]) m.write64(s.x[1], list ? 48 : 0);
+        s.x[0] = list;
+    });
+    for (const auto* name : {"_CMAudioFormatDescriptionGetMostCompatibleFormat", "_CMAudioFormatDescriptionGetRichestDecodableFormat"})
+        raw(core_media, name, [format_list](CpuState& s, GuestMemory& m) { s.x[0] = format_list(m, s.x[0]); });
+    // Boolean CMVideoFormatDescriptionMatchesImageBuffer(desc, imageBuffer): the size and (for an uncompressed
+    // description) the pixel format.
+    raw(core_media, "_CMVideoFormatDescriptionMatchesImageBuffer", [this](CpuState& s, GuestMemory&) {
+        const auto value = s.x[0] ? objc.find_host_state<FormatDescription>(s.x[0]) : nullptr;
+        if (!value || !s.x[1] || value->media_type != fourcc("vide")) { s.x[0] = 0; return; }
+        const auto width = call(core_video, "_CVPixelBufferGetWidth", {s.x[1]}), height = call(core_video, "_CVPixelBufferGetHeight", {s.x[1]});
+        const auto format = static_cast<std::uint32_t>(call(core_video, "_CVPixelBufferGetPixelFormatType", {s.x[1]}));
+        s.x[0] = static_cast<std::int64_t>(width) == value->width && static_cast<std::int64_t>(height) == value->height && format == value->subtype ? 1 : 0;
+    });
+}
+
 void CoreMedia::install() {
     if (const auto found = process.resolve(core_foundation, "_kCFAllocatorNull")) null_allocator = process.main_engine().read64(found->address);
     install_time();
@@ -1257,6 +1784,9 @@ void CoreMedia::install() {
     install_audio_formats();
     install_sample_buffer_access();
     install_attachments();
+    install_time_more();
+    install_sample_buffer_more();
+    install_format_description_more();
 }
 
 } // namespace

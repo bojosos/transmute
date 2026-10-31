@@ -8,6 +8,9 @@
 #include "alchemy/darwin/media/media.hpp"
 
 #include <array>
+#include <chrono>
+#include <thread>
+#include <vector>
 #include <cmath>
 #include <span>
 
@@ -185,6 +188,117 @@ void video(Fixture& f) {
     require(f.status(cv, "_CVPixelBufferLockBaseAddress", {0, 0}) == -6661, "NULL lock");
 }
 
+// CMTimeRange, CMTimebase, CMSync, the queues and the sample-buffer timing and size getters.
+void core_media_timing(Fixture& f) {
+    const auto copy_bytes = [&](Address to, Address from, std::size_t n) {
+        std::vector<std::uint8_t> bytes(n);
+        f.engine.read_bytes(from, bytes);
+        f.engine.write_bytes(to, bytes);
+    };
+    const auto time = [&](std::int64_t value, std::int32_t timescale) {
+        const auto at = f.block(24);
+        f.engine.write64(at, static_cast<std::uint64_t>(value));
+        f.engine.write32(at + 8, static_cast<std::uint32_t>(timescale));
+        f.engine.write32(at + 12, 1);
+        return at;
+    };
+    const auto range = [&](std::int64_t start, std::int64_t duration, std::int32_t timescale) {
+        const auto at = f.block(48);
+        copy_bytes(at, time(start, timescale), 24);
+        copy_bytes(at + 24, time(duration, timescale), 24);
+        return at;
+    };
+    const auto seconds_of = [&](Address t) {
+        alchemy::CallRegs r{};
+        r.x[0] = t;
+        return f.regs(cm, "_CMTimeGetSeconds", r).d(0);
+    };
+    const auto x8 = [&](const char* name, std::initializer_list<Address> arguments, std::size_t size = 24) {
+        alchemy::CallRegs r{};
+        std::size_t i = 0;
+        for (const auto a : arguments) r.x[i++] = a;
+        r.indirect_result = f.block(size);
+        static_cast<void>(f.regs(cm, name, r));
+        return r.indirect_result;
+    };
+    // Ranges: [1, 4) and [3, 7) at timescale 1.
+    const auto a = range(1, 3, 1), b = range(3, 4, 1);
+    const auto u = x8("_CMTimeRangeGetUnion", {a, b}, 48), i = x8("_CMTimeRangeGetIntersection", {a, b}, 48);
+    require(seconds_of(u) == 1 && seconds_of(u + 24) == 6, "union [1, 7)");
+    require(seconds_of(i) == 3 && seconds_of(i + 24) == 1, "intersection [3, 4)");
+    require(f.call(cm, "_CMTimeRangeContainsTime", {a, time(1, 1)}) == 1 && f.call(cm, "_CMTimeRangeContainsTime", {a, time(4, 1)}) == 0, "ContainsTime (end excluded)");
+    require(f.call(cm, "_CMTimeRangeContainsTimeRange", {u, b}) == 1 && f.call(cm, "_CMTimeRangeContainsTimeRange", {a, b}) == 0, "ContainsTimeRange");
+    require(seconds_of(x8("_CMTimeClampToRange", {time(9, 1), a})) == 4, "clamped to the end");
+    require(seconds_of(x8("_CMTimeMapTimeFromRangeToRange", {time(2, 1), a, range(10, 6, 1)})) == 12, "mapped: 10 + (2 - 1) * 6 / 3");
+    require(seconds_of(x8("_CMTimeMultiplyByRatio", {time(10, 1), 3, 4})) == 7.5 || seconds_of(x8("_CMTimeMultiplyByRatio", {time(10, 1), 3, 4})) == 8, "ratio");
+    require(seconds_of(x8("_CMTimeMaximum", {time(1, 2), time(2, 3)})) == 2.0 / 3, "maximum");
+    const auto dictionary = f.call(cm, "_CMTimeCopyAsDictionary", {time(5, 7), 0});
+    require(seconds_of(x8("_CMTimeMakeFromDictionary", {dictionary})) == 5.0 / 7, "dictionary round trip");
+    // A timebase on the host clock: stopped, then running at 2x from 10 s.
+    const auto out = f.block(8);
+    const auto clock = f.call(cm, "_CMClockGetHostTimeClock");
+    require(clock && f.status(cm, "_CMTimebaseCreateWithSourceClock", {0, clock, out}) == 0, "CMTimebaseCreateWithSourceClock");
+    const auto timebase = f.engine.read64(out);
+    require(f.status(cm, "_CMTimebaseSetTime", {timebase, time(10, 1)}) == 0 && seconds_of(x8("_CMTimebaseGetTime", {timebase})) == 10, "stopped at 10 s");
+    alchemy::CallRegs rate{};
+    rate.x[0] = timebase;
+    rate.set_d(0, 2.0);
+    require(static_cast<std::int32_t>(f.regs(cm, "_CMTimebaseSetRate", rate).x0) == 0, "SetRate 2");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto later = seconds_of(x8("_CMTimebaseGetTime", {timebase}));
+    require(later > 10.15 && later < 11.5, "running at 2x: " + std::to_string(later));
+    alchemy::CallRegs get_rate{};
+    get_rate.x[0] = timebase;
+    require(f.regs(cm, "_CMTimebaseGetRate", get_rate).d(0) == 2.0 && f.regs(cm, "_CMTimebaseGetEffectiveRate", get_rate).d(0) == 2.0, "rates");
+    alchemy::CallRegs relative{};
+    relative.x[0] = timebase;
+    relative.x[1] = clock;
+    require(f.regs(cm, "_CMSyncGetRelativeRate", relative).d(0) == 2.0, "CMSyncGetRelativeRate");
+    require(f.call(cm, "_CMTimebaseCopySourceClock", {timebase}) == clock, "the source clock");
+    // CMSimpleQueue: capacity 2.
+    require(f.status(cm, "_CMSimpleQueueCreate", {0, 2, out}) == 0, "CMSimpleQueueCreate");
+    const auto simple = f.engine.read64(out);
+    require(f.status(cm, "_CMSimpleQueueEnqueue", {simple, 11}) == 0 && f.status(cm, "_CMSimpleQueueEnqueue", {simple, 22}) == 0 &&
+                f.status(cm, "_CMSimpleQueueEnqueue", {simple, 33}) == -12773,
+            "full at its capacity");
+    require(f.call(cm, "_CMSimpleQueueDequeue", {simple}) == 11 && f.call(cm, "_CMSimpleQueueGetCount", {simple}) == 1, "FIFO");
+    // Sample buffers: three samples, one timing entry (1/30 s from 2 s), one size (100 bytes).
+    const auto timing = f.block(72);
+    copy_bytes(timing, time(1, 30), 24);
+    copy_bytes(timing + 24, time(60, 30), 24);
+    const auto sizes = f.block(8);
+    f.engine.write64(sizes, 100);
+    const auto make_sample = [&](std::int64_t pts) {
+        copy_bytes(timing + 24, time(pts, 30), 24);
+        alchemy::CallRegs r{};
+        r.x = {0, 0, 0, 3, 1, timing, 1, sizes};
+        const auto sample_out = f.block(8);
+        r.push_stack(sample_out);
+        require(static_cast<std::int32_t>(f.regs(cm, "_CMSampleBufferCreateReady", r).x0) == 0, "CMSampleBufferCreateReady");
+        return f.engine.read64(sample_out);
+    };
+    const auto sample = make_sample(60);
+    require(f.call(cm, "_CMSampleBufferGetTotalSampleSize", {sample}) == 300 && f.call(cm, "_CMSampleBufferGetSampleSize", {sample, 2}) == 100, "sizes");
+    const auto info = f.block(72);
+    require(f.status(cm, "_CMSampleBufferGetSampleTimingInfo", {sample, 2, info}) == 0 && seconds_of(info + 24) == 62.0 / 30, "sample 2's time");
+    require(seconds_of(x8("_CMSampleBufferGetOutputDuration", {sample})) == 0.1, "output duration");
+    require(f.call(cm, "_CMSampleBufferIsValid", {sample}) == 1 && f.status(cm, "_CMSampleBufferInvalidate", {sample}) == 0 &&
+                f.call(cm, "_CMSampleBufferIsValid", {sample}) == 0,
+            "invalidated");
+    // CMBufferQueue sorted by output presentation time.
+    alchemy::CallRegs callbacks{};
+    const auto sorted = f.regs(cm, "_CMBufferQueueGetCallbacksForSampleBuffersSortedByOutputPTS", callbacks).x0;
+    require(sorted && f.status(cm, "_CMBufferQueueCreate", {0, 0, sorted, out}) == 0, "CMBufferQueueCreate");
+    const auto queue = f.engine.read64(out);
+    const auto late = make_sample(90), early = make_sample(30);
+    require(f.status(cm, "_CMBufferQueueEnqueue", {queue, late}) == 0 && f.status(cm, "_CMBufferQueueEnqueue", {queue, early}) == 0, "enqueued");
+    require(f.call(cm, "_CMBufferQueueGetBufferCount", {queue}) == 2 && f.call(cm, "_CMBufferQueueGetHead", {queue}) == early, "sorted by time");
+    require(seconds_of(x8("_CMBufferQueueGetDuration", {queue})) == 0.2, "queued duration");
+    require(f.call(cm, "_CMBufferQueueDequeueAndRetain", {queue}) == early && f.status(cm, "_CMBufferQueueMarkEndOfData", {queue}) == 0 &&
+                f.status(cm, "_CMBufferQueueEnqueue", {queue, early}) == -12763,
+            "end of data");
+}
+
 void audio(Fixture& f) {
     const auto address = f.block(12), size = f.block(4), value = f.block(4, 0xff);
     f.engine.write32(address, fourcc("dev#"));
@@ -298,6 +412,6 @@ int main() {
     _putenv_s("ALCHEMY_MIDI_DEVICES", "none");
     _putenv_s("ALCHEMY_AUDIO_DEVICES", "none");
     _putenv_s("ALCHEMY_CAMERA", "none");
-    return run("media", {{"imports", imports}, {"core media", core_media}, {"video", video}, {"audio", audio}, {"accessibility", accessibility},
+    return run("media", {{"imports", imports}, {"core media", core_media}, {"core media timing", core_media_timing}, {"video", video}, {"audio", audio}, {"accessibility", accessibility},
                          {"bearers and taps", bearers_and_taps}});
 }
