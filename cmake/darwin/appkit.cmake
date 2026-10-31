@@ -47,6 +47,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/appkit/controls/search_field.cpp
     src/alchemy/darwin/appkit/controls/date_picker.cpp
     src/alchemy/darwin/appkit/controls/color_well.cpp
+    src/alchemy/darwin/appkit/controls/color_panel.cpp
     src/alchemy/darwin/appkit/controls/text_system.cpp
     src/alchemy/darwin/appkit/controls/text_layout.cpp
     src/alchemy/darwin/appkit/controls/text_actions.cpp

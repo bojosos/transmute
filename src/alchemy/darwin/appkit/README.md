@@ -161,6 +161,16 @@ gestures reach the window server) and dictionary lookups (no Dictionary
 service) stop explicitly. -toggleTouchBarCustomizationPalette: is left
 unanswered, so a menu item with it stays disabled: there is no Touch Bar.
 
+**Colour panel:** NSColorPanel is a floating utility panel built from
+AppKit's own controls (`controls/color_panel.cpp`): a swatch, a picker popup
+and slider rows for the Gray, RGB and HSB pickers, an opacity row while it
+shows alpha, and the accessory view under them. The other modes are kept by
+-mode but shown with the RGB sliders. A change sets the colour, posts
+NSColorPanelColorDidChangeNotification, updates the active NSColorWell and
+sends the panel's action (-changeColor: unless set); -setColor: only posts
+the notification; closing the panel deactivates the well. Colour lists and
+dragging colours stop explicitly.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

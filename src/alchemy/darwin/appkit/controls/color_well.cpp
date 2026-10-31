@@ -9,8 +9,9 @@
 // state (one active well at a time, drawn with the accent border), target
 // and action, -takeColorFrom:, and nib decoding (NSColor, NSIsBordered,
 // NSEnabled). A click activates the well, which shows the shared colour
-// panel as AppKit does; NSColorPanel is not provided (panels.cpp fails
-// explicitly), so that path fails explicitly too.
+// panel (color_panel.cpp) with its colour, as AppKit does; the user's
+// changes in the panel set the active well's colour and send its action,
+// and closing the panel deactivates it.
 namespace alchemy::gui::completion_kit::controls {
 namespace {
 using namespace appkit;
@@ -162,6 +163,18 @@ void install_color_well(AppKit& kit) {
         if (state->active) static_cast<void>(k->send(self, "deactivate"));
         else static_cast<void>(k->send_id(self, "activate:", {1}));
     }, "v@:@");
+    install_color_panel(kit);
+}
+
+void color_panel_changed(AppKit& kit, Address panel) {
+    const auto well = active_well;
+    if (!well) return;
+    static_cast<void>(kit.send_id(well, "setColor:", {kit.send_id(panel, "color")}));
+    static_cast<void>(kit.send_action(kit.send(well, "action").x0, kit.send(well, "target").x0, well));
+}
+
+void color_panel_closed(AppKit& kit) {
+    if (active_well) static_cast<void>(kit.send(active_well, "deactivate"));
 }
 
 } // namespace alchemy::gui::completion_kit::controls

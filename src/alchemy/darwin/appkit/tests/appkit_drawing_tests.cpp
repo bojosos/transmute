@@ -1419,8 +1419,9 @@ void panels_and_models(Fixture& f) {
     });
     require(f.id(open, "runModal") == 0 && f.id(f.id(open, "URLs"), "count") == 0, "a cancelled open panel");
     gui::appkit::set_file_dialog_override({});
-    require(throws([&] { static_cast<void>(f.id(f.cls("NSColorPanel"), "sharedColorPanel")); }), "the color panel must fail explicitly");
-    require(!(f.id(f.cls("NSColorPanel"), "sharedColorPanelExists") & 0xff), "+sharedColorPanelExists");
+    // NSColorPanel is the controls group's (controls/color_panel.cpp, tested in
+    // alchemy_gui_appkit_controls_behaviour); AppKit alone declares the class.
+    require(f.cls("NSColorPanel") != 0, "NSColorPanel is declared");
 
     // NSPrintInfo.
     const auto info = f.id(f.cls("NSPrintInfo"), "sharedPrintInfo");

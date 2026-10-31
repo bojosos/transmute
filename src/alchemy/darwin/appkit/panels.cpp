@@ -25,8 +25,8 @@
 //    modal or as a sheet / with a completion handler;
 //  * NSPrintInfo (paper, margins, orientation); NSPrintPanel objects keep
 //    their options, job style, help anchor, button title and accessory
-//    controllers, while NSPrintPanel / NSPageLayout / NSColorPanel /
-//    NSFontPanel fail when shown;
+//    controllers, while NSPrintPanel / NSPageLayout / NSFontPanel fail when
+//    shown (NSColorPanel is the controls group's, controls/color_panel.cpp);
 //  * NSGestureRecognizer and its Click / Pan / Press / Magnification /
 //    Rotation subclasses as objects attached to views (the window server
 //    reports no gestures, so they stay in NSGestureRecognizerStatePossible);
@@ -715,13 +715,12 @@ void AppKit::install_panels() {
             unsupported("-[NSPrintInfo " + selector + "] (printing system)");
         });
     for (const auto& [name, super_name] : std::initializer_list<std::pair<const char*, const char*>>{
-             {"NSPrintPanel", "NSObject"}, {"NSPageLayout", "NSObject"}, {"NSColorPanel", "NSPanel"}, {"NSFontPanel", "NSPanel"}}) {
+             {"NSPrintPanel", "NSObject"}, {"NSPageLayout", "NSObject"}, {"NSFontPanel", "NSPanel"}}) {
         const auto cls = declare_class(name, super_name);
         const std::string class_name = name;
-        for (const auto* factory : {"pageLayout", "sharedColorPanel", "sharedFontPanel"})
+        for (const auto* factory : {"pageLayout", "sharedFontPanel"})
             class_method(cls, factory, [class_name](CpuState&, GuestMemory&) { unsupported(class_name + " (system panel UI)"); });
-        for (const auto* query : {"sharedColorPanelExists", "sharedFontPanelExists"})
-            class_method(cls, query, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+        class_method(cls, "sharedFontPanelExists", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
         for (const auto* run : {"runModal", "runModalWithPrintInfo:", "beginSheetWithPrintInfo:modalForWindow:delegate:didEndSelector:contextInfo:",
                  "beginSheetUsingPrintInfo:onWindow:completionHandler:", "orderFront:", "makeKeyAndOrderFront:"})
             method(cls, run, [class_name](CpuState&, GuestMemory&) { unsupported(class_name + " (system panel UI)"); });

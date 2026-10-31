@@ -10,6 +10,7 @@
 //   search_field.cpp  NSSearchField / NSSearchFieldCell
 //   date_picker.cpp   NSDatePicker / NSDatePickerCell
 //   color_well.cpp    NSColorWell
+//   color_panel.cpp   NSColorPanel
 //   text_system.cpp   NSTextStorage / NSLayoutManager / NSTextContainer /
 //                     NSTextViewSharedData coding, NSTextView's attribute,
 //                     selection and typing API, NSFontManager / NSFontPanel
@@ -72,6 +73,12 @@ void install_path_control(AppKit& kit);
 void install_search_field(AppKit& kit);
 void install_date_picker(AppKit& kit);
 void install_color_well(AppKit& kit);
+// NSColorPanel (color_panel.cpp; installed by install_color_well), and the
+// active well's side of it (color_well.cpp): a user's change in the panel
+// reaches the active well; closing the panel deactivates it.
+void install_color_panel(AppKit& kit);
+void color_panel_changed(AppKit& kit, Address panel);
+void color_panel_closed(AppKit& kit);
 void install_text_system(AppKit& kit);
 // NSLayoutManager's glyphs and line fragments laid out by CoreText, and the
 // NSTextContainer additions (text_layout.cpp; installed by install_text_system).

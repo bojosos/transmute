@@ -961,9 +961,81 @@ void color_wells(Fixture& f) {
     const auto corner = f.pixel(window, 21, 21);
     require(corner[0] > 200 && corner[2] < 60, "a borderless well fills its bounds with the colour: " + bgra_text(corner));
     require(!f.yes(well, "isActive"), "inactive well");
-    bool threw = false;
-    try { static_cast<void>(f.id(well, "activate:", {1})); } catch (const std::exception&) { threw = true; }
-    require(threw, "activating a well (the colour panel) did not fail explicitly");
+
+    // Activating the well shows the shared colour panel with the well's
+    // colour (frameworks wave U14); the panel's slider changes reach the
+    // well and its action, the panel's target and the notification.
+    journal.clear();
+    f.describe = [](Address) { return std::string(); };   // senders here are the well, the panel and a notification
+    const auto acted = f.objc.selector("acted:");
+    static_cast<void>(f.id(well, "setTarget:", {f.target("well")}));
+    static_cast<void>(f.id(well, "setAction:", {acted}));
+    const auto panel_class = f.cls("NSColorPanel");
+    require(!f.yes(panel_class, "sharedColorPanelExists"), "no colour panel before it is asked for");
+    static_cast<void>(f.id(well, "activate:", {1}));
+    const auto panel = f.id(panel_class, "sharedColorPanel");
+    require(panel && f.yes(panel_class, "sharedColorPanelExists") && f.yes(well, "isActive") && f.yes(panel, "isVisible"),
+            "activating a well shows the shared colour panel");
+    require(f.send(f.id(panel, "color"), "blueComponent").d(0) > 0.99 && f.send(f.id(panel, "color"), "redComponent").d(0) < 0.01,
+            "the panel shows the well's colour");
+    static_cast<void>(f.id(panel, "setTarget:", {f.target("panel")}));
+    static_cast<void>(f.id(panel, "setAction:", {acted}));
+    CallRegs observe;
+    observe.x[2] = f.target("note");
+    observe.x[3] = acted;
+    observe.x[4] = f.str("NSColorPanelColorDidChangeNotification");
+    observe.x[5] = panel;
+    static_cast<void>(f.send(f.id(f.cls("NSNotificationCenter"), "defaultCenter"), "addObserver:selector:name:object:", observe));
+    const auto sliders = [&f, panel] {
+        std::vector<Address> found;
+        const auto views = f.id(f.id(panel, "contentView"), "subviews");
+        const auto count = f.id(views, "count");
+        for (Address i = 0; i < count; ++i)
+            if (const auto view = f.id(views, "objectAtIndex:", {i}); f.yes(view, "isKindOfClass:", {f.cls("NSSlider")})) found.push_back(view);
+        return found;
+    };
+    const auto panel_height = [&f, panel] { return f.send(panel, "frame").d(3); };
+    const auto move = [&f](Address slider, double value) {
+        static_cast<void>(f.with_double(slider, "setDoubleValue:", value));
+        static_cast<void>(f.id(slider, "sendAction:to:", {f.id(slider, "action"), f.id(slider, "target")}));
+    };
+    auto rgb = sliders();
+    require(f.id(panel, "mode") == 1 && rgb.size() == 4 && f.send(rgb[2], "doubleValue").d(0) > 254, "RGB sliders and opacity");
+    move(rgb[0], 255);   // red up: blue becomes magenta
+    const auto magenta = f.id(well, "color");
+    require(f.send(magenta, "redComponent").d(0) > 0.99 && f.send(magenta, "blueComponent").d(0) > 0.99, "the active well follows the panel");
+    require(std::count(journal.begin(), journal.end(), "well:") == 1 && std::count(journal.begin(), journal.end(), "panel:") == 1 &&
+                std::count(journal.begin(), journal.end(), "note:") == 1,
+            "one change: the well's action, the panel's action and the notification");
+    // HSB: magenta's hue is 300; a hue change keeps saturation and brightness.
+    static_cast<void>(f.id(panel, "setMode:", {3}));
+    auto hsb = sliders();
+    require(hsb.size() == 4 && std::abs(f.send(hsb[0], "doubleValue").d(0) - 300) < 0.5 && f.send(hsb[1], "doubleValue").d(0) > 99,
+            "HSB sliders show magenta's hue");
+    move(hsb[0], 120);   // green
+    const auto green = f.id(panel, "color");
+    require(f.send(green, "greenComponent").d(0) > 0.99 && f.send(green, "redComponent").d(0) < 0.01, "a hue of 120 is green");
+    // Opacity, the alpha row and the accessory view.
+    move(hsb[3], 50);
+    require(std::abs(f.send(panel, "alpha").d(0) - 0.5) < 0.01, "the opacity slider sets the alpha");
+    static_cast<void>(f.id(panel, "setShowsAlpha:", {0}));
+    require(sliders().size() == 3 && f.send(panel, "alpha").d(0) == 1, "without the alpha row the alpha is 1");
+    const auto before = panel_height();
+    const auto accessory = f.with_rect(f.id(f.cls("NSView"), "alloc"), "initWithFrame:", {{0, 0}, {120, 40}});
+    static_cast<void>(f.id(panel, "setAccessoryView:", {accessory}));
+    require(f.id(accessory, "superview") == f.id(panel, "contentView") && panel_height() >= before + 40,
+            "the accessory view sits in the panel, which grows for it");
+    // -setColor: posts the notification without sending the action; closing deactivates the well.
+    journal.clear();
+    static_cast<void>(f.id(panel, "setColor:", {f.id(f.cls("NSColor"), "redColor")}));
+    require(journal == std::vector<std::string>{"note:"}, "-setColor: only posts the notification");
+    static_cast<void>(f.id(panel, "setContinuous:", {0}));
+    require(!f.yes(panel, "isContinuous") && !f.yes(sliders()[0], "isContinuous"), "a non-continuous panel's sliders act on release");
+    static_cast<void>(f.id(panel, "close"));
+    require(!f.yes(well, "isActive") && !f.yes(panel, "isVisible"), "closing the panel deactivates the well");
+    static_cast<void>(f.id(panel, "setAccessoryView:", {0}));
+    static_cast<void>(f.id(panel, "setShowsAlpha:", {1}));
+    static_cast<void>(f.id(panel, "setMode:", {1}));
     static_cast<void>(f.id(window, "close"));
 }
 
