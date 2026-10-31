@@ -3,6 +3,7 @@
 #include "alchemy/darwin/media/resampler.hpp"
 #include "alchemy/darwin/media/avaudio_effects.hpp"
 #include "alchemy/darwin/media/avaudio_sampler.hpp"
+#include "alchemy/darwin/media/music_core.hpp"
 
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/gui/runloop.hpp"
@@ -11,6 +12,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <initializer_list>
 #include <limits>
@@ -49,6 +51,12 @@
 // - AVAudioUnitSampler (avaudio_sampler.hpp) plays SoundFont 2 presets or audio files by note, through
 //   the AVAudioUnitMIDIInstrument messages (notes, controllers, pitch bend, program changes, raw
 //   channel events); DLS banks and .aupreset/.exs instruments answer NO with an error.
+// - AVAudioSequencer plays Standard MIDI Files (music_core.hpp: format 0 and 1, tempo maps) into the
+//   engine's MIDI instruments: each track goes to its destinationAudioUnit, or to the first sampler
+//   attached to the engine. Events are dispatched at the start of the render cycle they fall in (the
+//   device's buffer granularity), notes ending after their duration; the rate scales the tempo; tracks
+//   loop over their loop range (numberOfLoops, or forever); mute and solo apply. MIDI endpoints as
+//   destinations are not offered (an explicit stop).
 // - AVAudioEnvironmentNode mixes its inputs like a mixer, placing mono ones (AVAudio3DMixing position)
 //   around the listener: distance attenuation by the documented models (exponential, inverse, linear
 //   between the reference and maximum distances) and equal-power stereo panning by azimuth (the
@@ -235,11 +243,35 @@ struct Node final : ObjectPayload {
     std::int64_t rendering_algorithm{}, source_mode{}, point_source_in_head_mode{};
 };
 
+// AVAudioSequencer's state: the sequence and how each track plays.
+struct TrackPlay {
+    Address destination{};             // retained AVAudioUnit, or 0: the engine's first sampler
+    bool looping{};
+    double loop_start{}, loop_length{};
+    std::int64_t loops{};              // numberOfLoops: 0 forever (AVMusicTrackLoopCountForever is -1, also forever)
+};
+struct PendingOff { double beat{}; Address node{}; std::uint8_t channel{}, key{}; };
+struct SequencerState final : ObjectPayload {
+    Address engine{};                  // not retained
+    std::shared_ptr<music::Sequence> sequence = std::make_shared<music::Sequence>();
+    std::vector<TrackPlay> plays;      // one per sequence track
+    std::vector<Address> track_objects;   // retained AVMusicTrack objects (made on demand), index-aligned
+    Address tempo_object{};            // retained
+    Address user_info{};               // retained
+    bool playing{};
+    double rate{1}, beat{};            // the position, in beats
+    std::uint64_t start_host{};        // host time at the position when playing started (for host-time conversion)
+    double start_seconds{};
+    std::vector<PendingOff> offs;
+};
+struct TrackView final : ObjectPayload { std::shared_ptr<SequencerState> sequencer; std::int64_t index{-1}; };   // -1: the tempo track
+
 struct EngineState final : ObjectPayload {
     Address output{}, mixer{}, input{};   // retained
     std::vector<Address> attached;     // retained (the output, mixer and input nodes too)
     bool running{};
     std::shared_ptr<hal_io::DeviceIo> io;
+    std::vector<std::weak_ptr<SequencerState>> sequencers;
     std::shared_ptr<CompletionThread> thread;
     std::thread::id callback_thread;   // the thread's id, once a callback ran
     double sample_time{};              // frames rendered since the first start
@@ -307,6 +339,11 @@ private:
     void install_effects();
     void install_instruments();
     void install_environment();
+    void install_sequencer();
+    // Plays the sequencers of `e` over the next `frames` frames (the lock is held).
+    void advance_sequencers(EngineState& e, std::uint32_t frames, double rate);
+    void dispatch(Address node, unsigned status, unsigned data1, unsigned data2);
+    Address track_object(const std::shared_ptr<SequencerState>& s, std::int64_t index);
     void render_environment(Node& n, double* out, std::uint32_t frames, std::uint32_t channels, double rate, double sample_time, unsigned depth,
                             std::vector<Callback>& callbacks, std::vector<TapDelivery>& taps);
 
@@ -707,6 +744,7 @@ std::vector<double> Engines::pull(Address node_object, std::uint32_t frames, std
 std::vector<double> Engines::cycle(EngineState& e, std::uint32_t frames, std::uint32_t channels, double rate,
                                    std::vector<Callback>& callbacks, std::vector<TapDelivery>& taps) {
     input_short_ = false;
+    advance_sequencers(e, frames, rate);
     auto out = pull(e.output, frames, channels, rate, e.sample_time, 0, callbacks, taps);
     for (const auto object : e.attached) {
         const auto n = support_.objc.find_host_state<Node>(object);
@@ -1532,6 +1570,470 @@ void Engines::install_environment() {
     }
 }
 
+void Engines::dispatch(Address node, unsigned status, unsigned data1, unsigned data2) {
+    const auto n = node ? support_.objc.find_host_state<Node>(node) : nullptr;
+    if (!n || !n->sampler) return;
+    const int channel = static_cast<int>(status & 15);
+    switch (status & 0xf0) {
+    case 0x90: n->sampler->note_on(channel, static_cast<int>(data1 & 127), static_cast<int>(data2 & 127)); break;
+    case 0x80: n->sampler->note_off(channel, static_cast<int>(data1 & 127)); break;
+    case 0xb0: n->sampler->controller(channel, static_cast<int>(data1 & 127), static_cast<int>(data2 & 127)); break;
+    case 0xe0: n->sampler->pitch_bend(channel, static_cast<int>((data1 & 127) | ((data2 & 127) << 7))); break;
+    case 0xc0:
+        if (n->sound_bank) {
+            std::string why;
+            if (auto instrument = load_sound_font(*n->sound_bank, n->bank, static_cast<int>(data1 & 127), why)) {
+                n->sampler->set_instrument(std::move(*instrument));
+                n->program = static_cast<int>(data1 & 127);
+            }
+        }
+        break;
+    default: break;
+    }
+}
+
+void Engines::advance_sequencers(EngineState& e, std::uint32_t frames, double rate) {
+    std::erase_if(e.sequencers, [](const std::weak_ptr<SequencerState>& w) { return w.expired(); });
+    // The engine's first sampler: the default destination.
+    Address first_sampler{};
+    for (const auto object : e.attached)
+        if (const auto n = support_.objc.find_host_state<Node>(object); n && n->kind == Kind::sampler) { first_sampler = object; break; }
+    for (const auto& weak : e.sequencers) {
+        const auto s = weak.lock();
+        if (!s || !s->playing) continue;
+        auto& seq = *s->sequence;
+        const double from = s->beat;
+        const double seconds = seq.seconds_for_beats(from) + frames / rate * s->rate;
+        const double to = seq.beats_for_seconds(seconds);
+        s->beat = to;
+        // Note-offs that fall in this cycle.
+        for (auto it = s->offs.begin(); it != s->offs.end();) {
+            if (it->beat < to) {
+                dispatch(it->node, 0x80 | it->channel, it->key, 0);
+                it = s->offs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        bool any_solo = false;
+        for (const auto& t : seq.tracks) any_solo = any_solo || t->solo;
+        for (std::size_t i = 0; i < seq.tracks.size(); ++i) {
+            const auto& track = *seq.tracks[i];
+            if (track.mute || (any_solo && !track.solo)) continue;
+            const auto& play = s->plays[i];
+            const Address node = play.destination ? play.destination : first_sampler;
+            // The window [from, to) in track time (offset applied), split at loop ends.
+            std::vector<std::pair<double, double>> windows;
+            double a = from - track.offset, b = to - track.offset;
+            if (play.looping && play.loop_length > 0 && b > play.loop_start + play.loop_length) {
+                const double end = play.loop_start + play.loop_length;
+                const auto loops_done = [&](double t) { return t < end ? 0.0 : std::floor((t - play.loop_start) / play.loop_length); };
+                const double limit = play.loops > 0 ? static_cast<double>(play.loops) : std::numeric_limits<double>::infinity();
+                const auto local = [&](double t) {
+                    const double n = std::min(loops_done(t), limit);
+                    return t - n * play.loop_length;
+                };
+                // Walk the window loop by loop.
+                double t = a;
+                while (t < b) {
+                    const double n = std::min(loops_done(t), limit);
+                    const double next = n < limit ? play.loop_start + (n + 1) * play.loop_length : b;
+                    const double stop = std::min(b, std::max(next, t));
+                    if (stop <= t) break;
+                    windows.emplace_back(local(t), local(t) + (stop - t));
+                    t = stop;
+                }
+            } else {
+                windows.emplace_back(a, b);
+            }
+            for (const auto& [w0, w1] : windows) {
+                const auto first = std::lower_bound(track.events.begin(), track.events.end(), w0, [](const std::shared_ptr<music::Event>& ev, double t) { return ev->time < t; });
+                for (auto it = first; it != track.events.end() && (*it)->time < w1; ++it) {
+                    const auto& ev = **it;
+                    if (ev.type == music::EventType::midi_note && ev.data.size() >= 8) {
+                        // MIDINoteMessage {channel, note, velocity, releaseVelocity, Float32 duration}
+                        float duration{};
+                        std::memcpy(&duration, ev.data.data() + 4, 4);
+                        dispatch(node, 0x90 | (ev.data[0] & 15), ev.data[1], ev.data[2]);
+                        s->offs.push_back({from + (ev.time - w0) + static_cast<double>(duration), node, static_cast<std::uint8_t>(ev.data[0] & 15), ev.data[1]});
+                    } else if (ev.type == music::EventType::midi_channel && ev.data.size() >= 3) {
+                        dispatch(node, ev.data[0], ev.data[1], ev.data[2]);   // MIDIChannelMessage {status, data1, data2, reserved}
+                    }
+                }
+            }
+        }
+    }
+}
+
+Address Engines::track_object(const std::shared_ptr<SequencerState>& s, std::int64_t index) {
+    const auto cls = support_.objc.find_class("AVMusicTrack");
+    const auto make = [&] {
+        const auto object = support_.send_id(support_.send_id(cls, "alloc"), "init");
+        const auto v = support_.objc.host_state<TrackView>(object);
+        v->sequencer = s;
+        v->index = index;
+        return object;
+    };
+    if (index < 0) {
+        if (!s->tempo_object) s->tempo_object = make();
+        return s->tempo_object;
+    }
+    if (s->track_objects.size() <= static_cast<std::size_t>(index)) s->track_objects.resize(static_cast<std::size_t>(index) + 1, 0);
+    auto& slot = s->track_objects[static_cast<std::size_t>(index)];
+    if (!slot) slot = make();
+    return slot;
+}
+
+void Engines::install_sequencer() {
+    auto& support = support_;
+    auto* sp = &support_;
+    const auto self = shared_from_this();
+    const auto sequencer_class = declare(support, "AVAudioSequencer", "NSObject");
+    const auto track_class = declare(support, "AVMusicTrack", "NSObject");
+    const auto state = [self](Address object) { return self->support_.objc.host_state<SequencerState>(object); };
+    const auto fail = [self](Address error_out, std::int32_t status, std::string_view text) {
+        if (error_out) self->bridge_->store_error(error_out, self->bridge_->os_status_error(status, text), true);
+    };
+    // -initWithAudioEngine: (engine x2) and -init (no engine: nothing plays).
+    support.method(sequencer_class, "initWithAudioEngine:", [self, sp, sequencer_class](CpuState& s, GuestMemory&) {
+        const auto object = sp->objc.send_super(s.x[0], sequencer_class, sp->objc.selector("init")).x0;
+        if (object) {
+            const auto st = sp->objc.host_state<SequencerState>(object);
+            st->engine = s.x[2];
+            if (s.x[2]) {
+                const auto e = self->engine(s.x[2]);
+                std::lock_guard lock(self->mutex_);
+                e->sequencers.push_back(st);
+            }
+        }
+        s.x[0] = object;
+    }, "@@:@");
+    support.method(sequencer_class, "dealloc", [self, sp, sequencer_class](CpuState& s, GuestMemory&) {
+        if (const auto st = sp->objc.find_host_state<SequencerState>(s.x[0])) {
+            std::vector<Address> released;
+            {
+                std::lock_guard lock(self->mutex_);
+                st->playing = false;
+                for (const auto& p : st->plays) released.push_back(p.destination);
+                for (const auto t : st->track_objects) released.push_back(t);
+                released.push_back(st->tempo_object);
+                released.push_back(st->user_info);
+                st->plays.clear();
+                st->track_objects.clear();
+            }
+            for (const auto object : released) sp->release(object);
+        }
+        static_cast<void>(sp->objc.send_super(s.x[0], sequencer_class, sp->objc.selector("dealloc")));
+    }, "v@:");
+    // Loading: -loadFromURL:options:error: and -loadFromData:options:error:
+    // (AVMusicSequenceLoadSMF_ChannelsToTracks = 1).
+    const auto load = [self, state, fail](Address object, std::vector<std::uint8_t> bytes, std::uint64_t options, Address error_out) -> std::uint64_t {
+        const auto st = state(object);
+        auto fresh = std::make_shared<music::Sequence>();
+        std::string why;
+        if (!fresh->load_smf(bytes, options & music::load_channels_to_tracks, why)) {
+            fail(error_out, music::error::invalid_file, "AVAudioSequencer: not a Standard MIDI File (" + why + ")");
+            return 0;
+        }
+        std::vector<Address> released;
+        {
+            std::lock_guard lock(self->mutex_);
+            for (const auto& p : st->plays) released.push_back(p.destination);
+            for (const auto t : st->track_objects) released.push_back(t);
+            released.push_back(std::exchange(st->tempo_object, 0));
+            st->track_objects.clear();
+            st->sequence = std::move(fresh);
+            st->plays.assign(st->sequence->tracks.size(), TrackPlay{});
+            st->beat = 0;
+            st->offs.clear();
+        }
+        for (const auto o : released) self->support_.release(o);
+        return 1;
+    };
+    support.method(sequencer_class, "loadFromURL:options:error:", [sp, load, fail](CpuState& s, GuestMemory&) {
+        const auto data = s.x[2] ? sp->send_id(sp->objc.find_class("NSData"), "dataWithContentsOfURL:", {s.x[2]}) : 0;
+        if (!data) { fail(s.x[4], music::error::invalid_file, "AVAudioSequencer: the file could not be read"); s.x[0] = 0; return; }
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(sp->send(data, "length").x0));
+        if (!bytes.empty()) sp->memory().read_bytes(sp->send_id(data, "bytes"), bytes);
+        s.x[0] = load(s.x[0], std::move(bytes), s.x[3], s.x[4]);
+    }, "B@:@Q^@");
+    support.method(sequencer_class, "loadFromData:options:error:", [sp, load](CpuState& s, GuestMemory&) {
+        std::vector<std::uint8_t> bytes(s.x[2] ? static_cast<std::size_t>(sp->send(s.x[2], "length").x0) : 0);
+        if (!bytes.empty()) sp->memory().read_bytes(sp->send_id(s.x[2], "bytes"), bytes);
+        s.x[0] = load(s.x[0], std::move(bytes), s.x[3], s.x[4]);
+    }, "B@:@Q^@");
+    // -dataWithSMPTEResolution:error: and -writeToURL:SMPTEResolution:replaceExisting:error: (format 1; 480 per quarter when 0).
+    const auto smf = [self, state](Address object, std::int64_t resolution) {
+        const auto st = state(object);
+        std::lock_guard lock(self->mutex_);
+        return st->sequence->write_smf(static_cast<std::int16_t>(resolution > 0 ? resolution : 0));
+    };
+    const auto ns_data = [sp](const std::vector<std::uint8_t>& bytes) {
+        const auto buffer = sp->process.allocate_guest(std::max<std::size_t>(bytes.size(), 1), 16);
+        sp->memory().write_bytes(buffer, bytes);
+        const auto data = sp->send_id(sp->objc.find_class("NSData"), "dataWithBytes:length:", {buffer, bytes.size()});
+        sp->process.release_guest(buffer);
+        return data;
+    };
+    support.method(sequencer_class, "dataWithSMPTEResolution:error:", [smf, ns_data](CpuState& s, GuestMemory&) {
+        s.x[0] = ns_data(smf(s.x[0], static_cast<std::int64_t>(s.x[2])));
+    }, "@@:q^@");
+    support.method(sequencer_class, "writeToURL:SMPTEResolution:replaceExisting:error:", [sp, smf, ns_data, fail](CpuState& s, GuestMemory&) {
+        const auto data = ns_data(smf(s.x[0], static_cast<std::int64_t>(s.x[3])));
+        const auto path = s.x[2] ? sp->send_id(s.x[2], "path") : 0;
+        const bool exists = path && (sp->send(sp->send_id(sp->objc.find_class("NSFileManager"), "defaultManager"), "fileExistsAtPath:",
+                                              [path] { CallRegs r{}; r.x[2] = path; return r; }()).x0 & 0xff);
+        if (!path || (exists && !(s.x[4] & 0xff))) { fail(s.x[5], music::error::invalid_file, "AVAudioSequencer: the file exists (replaceExisting is NO) or the URL is not a file"); s.x[0] = 0; return; }
+        CallRegs r{};
+        r.x[2] = s.x[2];
+        r.x[3] = 1;
+        s.x[0] = sp->send(data, "writeToURL:atomically:", r).x0 & 0xff;
+        if (!s.x[0]) fail(s.x[5], music::error::invalid_file, "AVAudioSequencer: the file could not be written");
+    }, "B@:@qB^@");
+    // Tracks.
+    support.method(sequencer_class, "tracks", [self, sp, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::vector<Address> items;
+        {
+            std::lock_guard lock(self->mutex_);
+            for (std::size_t i = 0; i < st->sequence->tracks.size(); ++i) items.push_back(self->track_object(st, static_cast<std::int64_t>(i)));
+        }
+        const auto array = self->bridge_->array(items);
+        s.x[0] = sp->send_id(array, "autorelease");
+    }, "@@:");
+    support.method(sequencer_class, "tempoTrack", [self, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = self->track_object(st, -1);
+    }, "@@:");
+    support.method(sequencer_class, "createAndAppendTrack", [self, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        st->sequence->tracks.push_back(std::make_shared<music::Track>());
+        st->plays.emplace_back();
+        s.x[0] = self->track_object(st, static_cast<std::int64_t>(st->sequence->tracks.size() - 1));
+    }, "@@:");
+    support.method(sequencer_class, "removeTrack:", [self, sp, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        const auto v = s.x[2] ? sp->objc.find_host_state<TrackView>(s.x[2]) : nullptr;
+        Address released{}, destination{};
+        {
+            std::lock_guard lock(self->mutex_);
+            if (!v || v->sequencer != st || v->index < 0 || static_cast<std::size_t>(v->index) >= st->sequence->tracks.size()) { s.x[0] = 0; return; }
+            const auto i = static_cast<std::size_t>(v->index);
+            st->sequence->tracks.erase(st->sequence->tracks.begin() + static_cast<std::ptrdiff_t>(i));
+            destination = st->plays[i].destination;
+            st->plays.erase(st->plays.begin() + static_cast<std::ptrdiff_t>(i));
+            if (i < st->track_objects.size()) {
+                released = st->track_objects[i];
+                st->track_objects.erase(st->track_objects.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+            v->index = -2;   // detached
+            for (std::size_t k = i; k < st->track_objects.size(); ++k)
+                if (const auto other = st->track_objects[k] ? sp->objc.find_host_state<TrackView>(st->track_objects[k]) : nullptr) other->index = static_cast<std::int64_t>(k);
+        }
+        sp->release(destination);
+        sp->release(released);
+        s.x[0] = 1;
+    }, "B@:@");
+    // Transport.
+    support.method(sequencer_class, "prepareToPlay", [](CpuState&, GuestMemory&) {}, "v@:");
+    support.method(sequencer_class, "startAndReturnError:", [self, state, fail](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        const auto e = st->engine ? self->support_.objc.find_host_state<EngineState>(st->engine) : nullptr;
+        if (!e || !e->running) { fail(s.x[2], music::error::invalid_player_state, "AVAudioSequencer: its engine is not running"); s.x[0] = 0; return; }
+        st->playing = true;
+        st->start_host = host_time_now();
+        st->start_seconds = st->sequence->seconds_for_beats(st->beat);
+        s.x[0] = 1;
+    }, "B@:^@");
+    support.method(sequencer_class, "stop", [self, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        st->playing = false;
+        for (const auto& off : st->offs) self->dispatch(off.node, 0x80 | off.channel, off.key, 0);
+        st->offs.clear();
+    }, "v@:");
+    support.method(sequencer_class, "isPlaying", [self, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = st->playing ? 1 : 0;
+    }, "B@:");
+    support.method(sequencer_class, "rate", [self, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.v[0] = {std::bit_cast<std::uint32_t>(static_cast<float>(st->rate)), 0};
+    }, "f@:");
+    support.method(sequencer_class, "setRate:", [self, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        st->rate = std::clamp(static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0]))), 0.0, 100.0);
+    }, "v@:f");
+    const auto position = [self, state](const char* getter, const char* setter, bool seconds) {
+        self->support_.method(self->support_.objc.find_class("AVAudioSequencer"), getter, [self, state, seconds](CpuState& s, GuestMemory&) {
+            const auto st = state(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            const double value = seconds ? st->sequence->seconds_for_beats(st->beat) : st->beat;
+            s.v[0] = {std::bit_cast<std::uint64_t>(value), 0};
+        }, "d@:");
+        self->support_.method(self->support_.objc.find_class("AVAudioSequencer"), setter, [self, state, seconds](CpuState& s, GuestMemory&) {
+            const auto st = state(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            const double value = std::max(0.0, std::bit_cast<double>(s.v[0][0]));
+            for (const auto& off : st->offs) self->dispatch(off.node, 0x80 | off.channel, off.key, 0);
+            st->offs.clear();
+            st->beat = seconds ? st->sequence->beats_for_seconds(value) : value;
+            st->start_host = host_time_now();
+            st->start_seconds = st->sequence->seconds_for_beats(st->beat);
+        }, "v@:d");
+    };
+    position("currentPositionInSeconds", "setCurrentPositionInSeconds:", true);
+    position("currentPositionInBeats", "setCurrentPositionInBeats:", false);
+    support.method(sequencer_class, "secondsForBeats:", [self, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.v[0] = {std::bit_cast<std::uint64_t>(st->sequence->seconds_for_beats(std::bit_cast<double>(s.v[0][0]))), 0};
+    }, "d@:d");
+    support.method(sequencer_class, "beatsForSeconds:", [self, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.v[0] = {std::bit_cast<std::uint64_t>(st->sequence->beats_for_seconds(std::bit_cast<double>(s.v[0][0]))), 0};
+    }, "d@:d");
+    // -hostTimeForBeats:error: (beats d0, error x2) and -beatsForHostTime:error: (host time x2, error x3): while playing.
+    support.method(sequencer_class, "hostTimeForBeats:error:", [self, state, fail](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        if (!st->playing || st->rate <= 0) { fail(s.x[2], music::error::invalid_player_state, "AVAudioSequencer: not playing"); s.x[0] = 0; return; }
+        const double delta = (st->sequence->seconds_for_beats(std::bit_cast<double>(s.v[0][0])) - st->start_seconds) / st->rate;
+        s.x[0] = static_cast<std::uint64_t>(static_cast<std::int64_t>(st->start_host) + static_cast<std::int64_t>(delta * 1e9));
+    }, "Q@:d^@");
+    support.method(sequencer_class, "beatsForHostTime:error:", [self, state, fail](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        if (!st->playing) { fail(s.x[3], music::error::invalid_player_state, "AVAudioSequencer: not playing"); s.v[0] = {0, 0}; return; }
+        const double seconds = st->start_seconds + (static_cast<double>(static_cast<std::int64_t>(s.x[2] - st->start_host)) / 1e9) * st->rate;
+        s.v[0] = {std::bit_cast<std::uint64_t>(st->sequence->beats_for_seconds(seconds)), 0};
+    }, "d@:Q^@");
+    support.method(sequencer_class, "userInfo", [self, sp, state](CpuState& s, GuestMemory&) {
+        const auto st = state(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        if (!st->user_info) st->user_info = sp->send_id(sp->send_id(sp->objc.find_class("NSMutableDictionary"), "alloc"), "init");
+        s.x[0] = st->user_info;
+    }, "@@:");
+
+    // ---- AVMusicTrack: a view of one track (or the tempo track) -----------------------------------
+    const auto view = [sp](Address object) {
+        const auto v = sp->objc.find_host_state<TrackView>(object);
+        if (!v || !v->sequencer || v->index < -1) unsupported("an AVMusicTrack not taken from an AVAudioSequencer (or removed from it)");
+        return v;
+    };
+    const auto track_of = [](const TrackView& v) {
+        return v.index < 0 ? v.sequencer->sequence->tempo : v.sequencer->sequence->tracks.at(static_cast<std::size_t>(v.index));
+    };
+    support.method(track_class, "destinationAudioUnit", [self, view](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = v->index >= 0 ? v->sequencer->plays.at(static_cast<std::size_t>(v->index)).destination : 0;
+    }, "@@:");
+    support.method(track_class, "setDestinationAudioUnit:", [self, sp, view](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        Address old{};
+        {
+            std::lock_guard lock(self->mutex_);
+            if (v->index < 0) return;
+            old = std::exchange(v->sequencer->plays.at(static_cast<std::size_t>(v->index)).destination, sp->retain(s.x[2]));
+        }
+        sp->release(old);
+    }, "v@:@");
+    support.method(track_class, "destinationMIDIEndpoint", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "I@:");
+    support.method(track_class, "setDestinationMIDIEndpoint:", [](CpuState&, GuestMemory&) {
+        unsupported("-[AVMusicTrack setDestinationMIDIEndpoint:] (Alchemy's sequencer plays into the engine's instruments)");
+    }, "v@:I");
+    // loopRange: AVBeatRange {start, length} in d0, d1.
+    support.method(track_class, "loopRange", [self, view](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        const auto& p = v->index >= 0 ? v->sequencer->plays.at(static_cast<std::size_t>(v->index)) : TrackPlay{};
+        s.v[0] = {std::bit_cast<std::uint64_t>(p.loop_start), 0};
+        s.v[1] = {std::bit_cast<std::uint64_t>(p.loop_length), 0};
+    }, "{_AVBeatRange=dd}@:");
+    support.method(track_class, "setLoopRange:", [self, view](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        if (v->index < 0) return;
+        auto& p = v->sequencer->plays.at(static_cast<std::size_t>(v->index));
+        p.loop_start = std::max(0.0, std::bit_cast<double>(s.v[0][0]));
+        p.loop_length = std::max(0.0, std::bit_cast<double>(s.v[1][0]));
+    }, "v@:{_AVBeatRange=dd}");
+    support.method(track_class, "isLoopingEnabled", [self, view](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = v->index >= 0 && v->sequencer->plays.at(static_cast<std::size_t>(v->index)).looping ? 1 : 0;
+    }, "B@:");
+    support.method(track_class, "setLoopingEnabled:", [self, view](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        if (v->index >= 0) v->sequencer->plays.at(static_cast<std::size_t>(v->index)).looping = (s.x[2] & 0xff) != 0;
+    }, "v@:B");
+    support.method(track_class, "numberOfLoops", [self, view](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = static_cast<std::uint64_t>(v->index >= 0 ? v->sequencer->plays.at(static_cast<std::size_t>(v->index)).loops : 0);
+    }, "q@:");
+    support.method(track_class, "setNumberOfLoops:", [self, view](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        if (v->index >= 0) v->sequencer->plays.at(static_cast<std::size_t>(v->index)).loops = static_cast<std::int64_t>(s.x[2]);
+    }, "v@:q");
+    for (const auto& [getter, setter, field] : std::initializer_list<std::tuple<const char*, const char*, bool music::Track::*>>{
+             {"isMuted", "setMuted:", &music::Track::mute}, {"isSoloed", "setSoloed:", &music::Track::solo}}) {
+        const auto member = field;
+        support.method(track_class, getter, [self, view, track_of, member](CpuState& s, GuestMemory&) {
+            const auto v = view(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            s.x[0] = (*track_of(*v)).*member ? 1 : 0;
+        }, "B@:");
+        support.method(track_class, setter, [self, view, track_of, member](CpuState& s, GuestMemory&) {
+            const auto v = view(s.x[0]);
+            std::lock_guard lock(self->mutex_);
+            (*track_of(*v)).*member = (s.x[2] & 0xff) != 0;
+        }, "v@:B");
+    }
+    support.method(track_class, "offsetTime", [self, view, track_of](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.v[0] = {std::bit_cast<std::uint64_t>(track_of(*v)->offset), 0};
+    }, "d@:");
+    support.method(track_class, "setOffsetTime:", [self, view, track_of](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        track_of(*v)->offset = std::bit_cast<double>(s.v[0][0]);
+    }, "v@:d");
+    support.method(track_class, "lengthInBeats", [self, view, track_of](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.v[0] = {std::bit_cast<std::uint64_t>(track_of(*v)->end()), 0};
+    }, "d@:");
+    support.method(track_class, "setLengthInBeats:", [self, view, track_of](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        const auto t = track_of(*v);
+        t->length = std::max(0.0, std::bit_cast<double>(s.v[0][0]));
+        t->length_set = true;
+    }, "v@:d");
+    support.method(track_class, "lengthInSeconds", [self, view, track_of](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.v[0] = {std::bit_cast<std::uint64_t>(v->sequencer->sequence->seconds_for_beats(track_of(*v)->end())), 0};
+    }, "d@:");
+    support.method(track_class, "timeResolution", [self, view](CpuState& s, GuestMemory&) {
+        const auto v = view(s.x[0]);
+        std::lock_guard lock(self->mutex_);
+        s.x[0] = static_cast<std::uint64_t>(v->sequencer->sequence->resolution);
+    }, "Q@:");
+}
+
 void Engines::install() {
     auto& support = support_;
     const auto self = shared_from_this();
@@ -1919,6 +2421,7 @@ void Engines::install() {
     install_effects();
     install_instruments();
     install_environment();
+    install_sequencer();
 
     // ---- manual rendering ------------------------------------------------------------------------
     const auto manual_state = [self](Address object) {

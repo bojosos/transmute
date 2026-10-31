@@ -1488,6 +1488,86 @@ void sampler_environment(Fixture& f) {
             "facing it, centred: " + std::to_string(centred[0][500]) + " " + std::to_string(centred[1][500]));
 }
 
+// AVAudioSequencer: a Standard MIDI File (format 0, 480 ticks a quarter, 120 BPM) of A4 for a beat,
+// a beat's rest, then A5 for a beat, played into the SoundFont sampler in an offline render.
+void sequencer(Fixture& f) {
+    const auto format_of = [&](double rate, std::uint32_t channels) {
+        alchemy::CallRegs r{};
+        r.x[2] = 1; r.x[3] = channels; r.x[4] = 0;
+        r.set_d(0, rate);
+        return f.objc.send(f.send(f.cls("AVAudioFormat"), "alloc"), f.objc.selector("initWithCommonFormat:sampleRate:channels:interleaved:"), r).x0;
+    };
+    const auto stereo = format_of(48000, 2);
+    const auto error = f.block(8);
+    const auto engine = f.send(f.send(f.cls("AVAudioEngine"), "alloc"), "init");
+    alchemy::CallRegs manual{};
+    manual.x = {0, 0, 0, stereo, 4096, error, 0, 0};
+    require((f.objc.send(engine, f.objc.selector("enableManualRenderingMode:format:maximumFrameCount:error:"), manual).x0 & 0xff) == 1, "manual rendering");
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_sequencer";
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "sine.sf2";
+    {
+        const auto bytes = sine_sound_font();
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    const auto sampler = f.send(f.send(f.cls("AVAudioUnitSampler"), "alloc"), "init");
+    f.send(engine, "attachNode:", {sampler});
+    f.send(engine, "connect:to:format:", {sampler, f.send(engine, "mainMixerNode"), stereo});
+    require(f.send(sampler, "loadSoundBankInstrumentAtURL:program:bankMSB:bankLSB:error:", {f.cf.file_url(alchemy::guest_path_string(path), false), 0, 0x79, 0, error}) == 1,
+            "the instrument loads");
+    // The MIDI file.
+    std::vector<std::uint8_t> track{0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20,   // tempo 500000 us
+                                    0x00, 0x90, 69, 100, 0x83, 0x60, 0x80, 69, 0,   // A4 for 480 ticks
+                                    0x83, 0x60, 0x90, 81, 100, 0x83, 0x60, 0x80, 81, 0,   // a rest, A5 for 480 ticks
+                                    0x83, 0x60, 0xff, 0x2f, 0x00};   // end of track at 1920
+    std::vector<std::uint8_t> smf{'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xe0, 'M', 'T', 'r', 'k', 0, 0, 0, static_cast<std::uint8_t>(track.size())};
+    smf.insert(smf.end(), track.begin(), track.end());
+    const auto buffer = f.block(smf.size());
+    f.memory().write_bytes(buffer, smf);
+    const auto data = f.send(f.cls("NSData"), "dataWithBytes:length:", {buffer, smf.size()});
+    const auto sequencer = f.send(f.send(f.cls("AVAudioSequencer"), "alloc"), "initWithAudioEngine:", {engine});
+    require(f.send(sequencer, "loadFromData:options:error:", {data, 0, error}) == 1, "the MIDI file loads");
+    const auto tracks = f.send(sequencer, "tracks");
+    require(f.cf.length(tracks) == 1, "one track");
+    const auto first = f.cf.element(tracks, 0);
+    require(f.objc.send(first, f.objc.selector("lengthInBeats")).d(0) == 4.0 && std::fabs(f.objc.send(first, f.objc.selector("lengthInSeconds")).d(0) - 2.0) < 1e-9,
+            "four beats, two seconds");
+    require((f.send(engine, "startAndReturnError:", {error}) & 0xff) == 1 && (f.send(sequencer, "startAndReturnError:", {error}) & 0xff) == 1, "playing");
+    const auto render = [&](std::uint32_t frames) {
+        const auto pcm = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {stereo, 4096});
+        std::vector<float> left;
+        for (std::uint32_t done = 0; done < frames; done += 4000) {
+            const auto count = std::min<std::uint32_t>(4000, frames - done);
+            alchemy::CallRegs offline{};
+            offline.x = {0, 0, count, pcm, error, 0, 0, 0};
+            require(f.objc.send(engine, f.objc.selector("renderOffline:toBuffer:error:"), offline).x0 == 0, "an offline render");
+            const auto channel = f.engine.read64(f.send(pcm, "floatChannelData"));
+            for (std::uint32_t i = 0; i < count; ++i) left.push_back(std::bit_cast<float>(f.engine.read32(channel + 4ULL * i)));
+        }
+        return left;
+    };
+    const auto crossings = [](const std::vector<float>& v, std::size_t from, std::size_t count) {
+        int n = 0;
+        for (std::size_t i = from + 1; i < from + count; ++i) n += (v[i - 1] < 0) != (v[i] < 0);
+        return n;
+    };
+    const auto loudest = [](const std::vector<float>& v, std::size_t from, std::size_t count) {
+        float m = 0;
+        for (std::size_t i = from; i < from + count; ++i) m = std::max(m, std::fabs(v[i]));
+        return m;
+    };
+    // Two seconds at 48 kHz: A4 in [0, 0.5 s), silence in [0.5, 1), A5 in [1, 1.5).
+    const auto out = render(96000);
+    require(std::abs(crossings(out, 4800, 4800) - 88) <= 6, "A4 plays first: " + std::to_string(crossings(out, 4800, 4800)) + " crossings in 0.1 s");
+    require(loudest(out, 33600, 9600) < 1e-4f, "the rest is silent: " + std::to_string(loudest(out, 33600, 9600)));
+    require(std::abs(crossings(out, 52800, 4800) - 176) <= 8, "A5 plays third: " + std::to_string(crossings(out, 52800, 4800)) + " crossings in 0.1 s");
+    require(std::fabs(f.objc.send(sequencer, f.objc.selector("currentPositionInSeconds")).d(0) - 2.0) < 0.01, "the clock ran two seconds");
+    f.send(sequencer, "stop");
+    require((f.send(sequencer, "isPlaying") & 0xff) == 0, "stopped");
+    const auto written = f.send(sequencer, "dataWithSMPTEResolution:error:", {0, error});
+    require(written && f.engine.read32(f.send(written, "bytes")) == 0x6468544d, "written back as a MIDI file");   // "MThd"
+}
+
 void music_sequence(Fixture& f) {
     const auto out = f.block(8);
     require(f.status(at, "_NewMusicSequence", {out}) == 0, "NewMusicSequence");
@@ -2645,5 +2725,6 @@ int main() {
         {"avaudio_effects", avaudio_effects},
         {"speech", speech},
         {"sampler_environment", sampler_environment},
+        {"sequencer", sequencer},
     });
 }

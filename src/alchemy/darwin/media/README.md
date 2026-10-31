@@ -33,8 +33,10 @@ AVAudioUnitDelay, a Schroeder-Moorer AVAudioUnitReverb, a soft-clipping AVAudioU
 AVAudioUnitVarispeed, and an overlap-add AVAudioUnitTimePitch), AVAudioUnitSampler (SoundFont 2 presets or
 audio files, played by the AVAudioUnitMIDIInstrument messages; DLS, .aupreset and .exs answer NO with an
 error), AVAudioEnvironmentNode (distance attenuation by the documented models and equal-power panning of
-mono inputs around the listener, with a reverb send), volume and pan into mixers, node and player times,
-and taps. Manual rendering (offline and the realtime block) renders the same graph with no device, the
+mono inputs around the listener, with a reverb send), AVAudioSequencer and AVMusicTrack (Standard MIDI
+Files into the engine's instruments, events at their render cycle; loops, mute, solo, rate, positions;
+MIDI endpoints as destinations stop explicitly), volume and pan into mixers, node and player times, and
+taps. Manual rendering (offline and the realtime block) renders the same graph with no device, the
 input node then taking its audio from its manual input block. AVAudioConverter converts PCM
 between layouts, channel counts (channel maps, downmix) and rates, and decodes the compressed
 formats that have a decoder (MPEG audio, Opus, FLAC) from AVAudioCompressedBuffers. Unavailable:
