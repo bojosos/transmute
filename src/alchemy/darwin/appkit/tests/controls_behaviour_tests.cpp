@@ -1210,6 +1210,218 @@ void browsers(Fixture& f) {
     require(f.text(f.id(f.id(plain, "selectedCell"), "stringValue")) == "row 2" && f.integer(plain, "lastColumn") == 0, "a passive delegate's leaf rows");
 }
 
+// ---- NSMatrix (the frameworks wave, U22) -------------------------------------------------------
+Address make_matrix(Fixture& f, gui::Rect frame, Address mode, Address cell_class, Address rows, Address columns) {
+    CallRegs init;
+    gui::appkit::put_rect(init, 0, frame);
+    init.x[2] = mode;
+    init.x[3] = cell_class;
+    init.x[4] = rows;
+    init.x[5] = columns;
+    return f.send(f.id(f.cls("NSMatrix"), "alloc"), "initWithFrame:mode:cellClass:numberOfRows:numberOfColumns:", init).x0;
+}
+
+void drag(Fixture& f, Address window, gui::Point from, gui::Point to) {
+    gui::Event down;
+    down.type = gui::event_type::left_mouse_down;
+    down.window = f.id(window, "windowNumber");
+    down.location = from;
+    down.click_count = 1;
+    down.pressed_buttons = 1;
+    f.server.queue(down);
+    auto moved = down;
+    moved.type = gui::event_type::left_mouse_dragged;
+    moved.location = to;
+    f.server.queue(moved);
+    auto up = moved;
+    up.type = gui::event_type::left_mouse_up;
+    up.pressed_buttons = 0;
+    f.server.queue(up);
+    f.pump();
+}
+
+void matrices(Fixture& f) {
+    journal.clear();
+    const auto window = f.make_window({{0, 0}, {300, 200}});
+    const auto content = f.id(window, "contentView");
+    // A radio matrix of three button cells, 20 points high ((62 - 2 x 1) / 3), tagged 10-12.
+    const auto radio = make_matrix(f, {{10, 100}, {120, 62}}, 0, f.cls("NSButtonCell"), 3, 1);
+    for (Address i = 0; i < 3; ++i) {
+        const auto cell = f.id(radio, "cellAtRow:column:", {i, 0});
+        static_cast<void>(f.id(cell, "setButtonType:", {4}));   // NSButtonTypeRadio
+        static_cast<void>(f.id(cell, "setTitle:", {f.str("Option " + std::to_string(i))}));
+        static_cast<void>(f.id(cell, "setTag:", {10 + i}));
+    }
+    const auto size = f.send(radio, "cellSize");
+    require(f.integer(radio, "numberOfRows") == 3 && f.integer(radio, "numberOfColumns") == 1 && size.d(0) == 120 && size.d(1) == 20 &&
+                f.id(f.id(radio, "cellAtRow:column:", {1, 0}), "class") == f.cls("NSButtonCell"),
+            "a 3 x 1 radio matrix sized from its frame: " + std::to_string(size.d(0)) + " x " + std::to_string(size.d(1)));
+    const auto state_of = [&f, radio](Address row) { return f.integer(f.id(radio, "cellAtRow:column:", {row, 0}), "state"); };
+    require(f.integer(radio, "selectedRow") == 0 && state_of(0) == 1, "a radio matrix starts with its first cell selected");
+    static_cast<void>(f.id(radio, "selectCellAtRow:column:", {1, 0}));
+    require(f.integer(radio, "selectedTag") == 11 && state_of(0) == 0 && state_of(1) == 1, "selecting a radio cell turns the others off");
+    require(f.yes(radio, "selectCellWithTag:", {12}) && f.integer(radio, "selectedRow") == 2 && !f.yes(radio, "selectCellWithTag:", {99}),
+            "-selectCellWithTag:");
+    static_cast<void>(f.id(radio, "deselectAllCells"));
+    require(f.integer(radio, "selectedRow") == 2, "no empty radio selection unless allowed");
+    static_cast<void>(f.id(radio, "setAllowsEmptySelection:", {1}));
+    static_cast<void>(f.id(radio, "deselectAllCells"));
+    require(f.integer(radio, "selectedRow") == -1 && state_of(2) == 0 && f.integer(f.id(radio, "selectedCells"), "count") == 0, "an empty selection");
+    // A click selects a row and sends the matrix's action with the matrix as sender (rows from the top: the matrix is flipped).
+    f.describe = [radio](Address sender) { return sender == radio ? std::string("M") : std::string("?"); };
+    static_cast<void>(f.id(radio, "setTarget:", {f.target("radio")}));
+    static_cast<void>(f.id(radio, "setAction:", {f.objc.selector("acted:")}));
+    static_cast<void>(f.id(radio, "setDoubleAction:", {f.objc.selector("doubleActed:")}));
+    static_cast<void>(f.id(content, "addSubview:", {radio}));
+    f.show(window);
+    f.click(window, {40, 131});   // row 1: window y 121-141
+    require(f.integer(radio, "selectedRow") == 1 && journal == std::vector<std::string>{"radio:M"},
+            "a click selects row 1 and acts: " + joined() + " row " + std::to_string(f.integer(radio, "selectedRow")));
+    require(is_accent(f.pixel(window, 14.5, 131)) && !is_accent(f.pixel(window, 14.5, 152)), "the selected radio cell is drawn on: " + bgra_text(f.pixel(window, 14.5, 131)));
+    f.click(window, {40, 131}, 2);
+    require(log_has("radio:double"), "a double click sends the double action: " + joined());
+    journal.clear();
+    f.key(window, 0x7d, "");   // down
+    require(f.integer(radio, "selectedRow") == 2 && journal == std::vector<std::string>{"radio:M"}, "the down arrow selects the next radio cell: " + joined());
+    static_cast<void>(f.id(f.id(radio, "cellAtRow:column:", {0, 0}), "setKeyEquivalent:", {f.str("a")}));
+    f.key(window, 0x00, "a");
+    require(f.integer(radio, "selectedRow") == 0, "a cell's key equivalent clicks it");
+    // The cell's own action wins over the matrix's.
+    journal.clear();
+    const auto own = f.target("cell");
+    static_cast<void>(f.id(f.id(radio, "cellAtRow:column:", {1, 0}), "setTarget:", {own}));
+    static_cast<void>(f.id(f.id(radio, "cellAtRow:column:", {1, 0}), "setAction:", {f.objc.selector("acted:")}));
+    static_cast<void>(f.id(radio, "selectCellAtRow:column:", {1, 0}));
+    require(f.yes(radio, "sendAction") && journal == std::vector<std::string>{"cell:M"}, "-sendAction prefers the selected cell's action: " + joined());
+    static_cast<void>(f.id(radio, "setEnabled:", {0}));
+    require(!f.yes(f.id(radio, "cellAtRow:column:", {2, 0}), "isEnabled") && !f.yes(radio, "sendAction"), "-setEnabled: reaches every cell");
+    static_cast<void>(f.id(radio, "setEnabled:", {1}));
+
+    // Geometry and the grid, with a prototype cell.
+    const auto grid = f.with_rect(f.id(f.cls("NSMatrix"), "alloc"), "initWithFrame:", {{0, 0}, {10, 10}});
+    require(f.integer(grid, "numberOfRows") == 0 && f.integer(grid, "mode") == 0 && f.id(grid, "cellClass") == f.cls("NSActionCell"), "an empty matrix");
+    const auto prototype = f.id(f.id(f.cls("NSCell"), "alloc"), "initTextCell:", {f.str("p")});
+    static_cast<void>(f.id(grid, "setPrototype:", {prototype}));
+    static_cast<void>(f.id(grid, "renewRows:columns:", {2, 3}));
+    CallRegs registers;
+    registers.set_d(0, 40);
+    registers.set_d(1, 20);
+    static_cast<void>(f.send(grid, "setCellSize:", registers));
+    registers.set_d(0, 2);
+    registers.set_d(1, 3);
+    static_cast<void>(f.send(grid, "setIntercellSpacing:", registers));
+    const auto corner = f.id(grid, "cellAtRow:column:", {1, 2});
+    require(corner && corner != prototype && f.text(f.id(corner, "stringValue")) == "p", "cells are copies of the prototype");
+    const auto frame = f.send(grid, "cellFrameAtRow:column:", [] { CallRegs r; r.x[2] = 1; r.x[3] = 2; return r; }());
+    require(frame.d(0) == 84 && frame.d(1) == 23 && frame.d(2) == 40 && frame.d(3) == 20, "-cellFrameAtRow:column:");
+    static_cast<void>(f.id(grid, "sizeToCells"));
+    const auto bounds = f.send(grid, "frame");
+    require(bounds.d(2) == 124 && bounds.d(3) == 43, "-sizeToCells: " + std::to_string(bounds.d(2)) + " x " + std::to_string(bounds.d(3)));
+    const auto slots = f.process.allocate_guest(16);
+    const auto hit = [&f, grid, slots](double x, double y) {
+        CallRegs r;
+        r.x[2] = slots;
+        r.x[3] = slots + 8;
+        r.set_d(0, x);
+        r.set_d(1, y);
+        return (f.send(grid, "getRow:column:forPoint:", r).x0 & 0xff) != 0;
+    };
+    require(hit(85, 24) && f.engine.read64(slots) == 1 && f.engine.read64(slots + 8) == 2 && !hit(41, 5), "-getRow:column:forPoint: (and a point in the spacing)");
+    const auto first = f.id(grid, "cellAtRow:column:", {0, 0});
+    static_cast<void>(f.id(grid, "insertColumn:", {0}));
+    static_cast<void>(f.id(grid, "addRow"));
+    require(f.integer(grid, "numberOfColumns") == 4 && f.integer(grid, "numberOfRows") == 3 && f.id(grid, "cellAtRow:column:", {0, 1}) == first,
+            "an inserted column moves the cells right");
+    static_cast<void>(f.id(grid, "removeRow:", {0}));
+    require(f.integer(grid, "numberOfRows") == 2 && f.integer(f.id(grid, "cells"), "count") == 8, "-removeRow:");
+    // Shrinking keeps the cells for growing again.
+    std::vector<Address> before;
+    for (const auto cell : f.cf.array_values(f.id(grid, "cells"))) before.push_back(cell);
+    static_cast<void>(f.id(grid, "renewRows:columns:", {1, 1}));
+    static_cast<void>(f.id(grid, "renewRows:columns:", {2, 4}));
+    bool reused = true;
+    for (const auto cell : f.cf.array_values(f.id(grid, "cells"))) reused = reused && std::find(before.begin(), before.end(), cell) != before.end();
+    require(reused, "-renewRows:columns: reuses its cells");
+    // Rows from cells into an empty matrix; sorting by a comparison method.
+    const auto sorted_class = f.subclass("U22TitleCell", "NSCell");
+    f.add(sorted_class, "compareTitle:", [&f](CpuState& s, GuestMemory&) {
+        const auto a = f.text(f.id(s.x[0], "stringValue")), b = f.text(f.id(s.x[2], "stringValue"));
+        s.x[0] = static_cast<Address>(a < b ? -1 : a > b ? 1 : 0);
+    }, "q@:@");
+    std::vector<Address> titled;
+    for (const auto* title : {"c", "a", "b"}) titled.push_back(f.id(f.id(sorted_class, "alloc"), "initTextCell:", {f.str(title)}));
+    const auto row = f.with_rect(f.id(f.cls("NSMatrix"), "alloc"), "initWithFrame:", {{0, 0}, {10, 10}});
+    static_cast<void>(f.id(row, "insertRow:withCells:", {0, f.cf.array(titled)}));
+    require(f.integer(row, "numberOfRows") == 1 && f.integer(row, "numberOfColumns") == 3, "an empty matrix takes a row of cells");
+    static_cast<void>(f.id(row, "sortUsingSelector:", {f.objc.selector("compareTitle:")}));
+    std::string order;
+    for (const auto cell : f.cf.array_values(f.id(row, "cells"))) order += f.text(f.id(cell, "stringValue"));
+    require(order == "abc", "-sortUsingSelector: " + order);
+    // -sendAction:to:forAllCells: stops at the first NO unless told to visit all.
+    static int visits = 0;
+    const auto visitor_class = f.subclass("U22Visitor", "NSObject");
+    f.add(visitor_class, "visit:", [](CpuState& s, GuestMemory&) { ++visits; s.x[0] = 0; }, "B@:@");
+    const auto visitor = f.id(f.id(visitor_class, "alloc"), "init");
+    visits = 0;
+    static_cast<void>(f.id(row, "sendAction:to:forAllCells:", {f.objc.selector("visit:"), visitor, 0}));
+    const auto stopped = visits;
+    static_cast<void>(f.id(row, "sendAction:to:forAllCells:", {f.objc.selector("visit:"), visitor, 1}));
+    require(stopped == 1 && visits == 4, "-sendAction:to:forAllCells:");
+    static_cast<void>(f.id(row, "setToolTip:forCell:", {f.str("tip"), titled[0]}));
+    require(f.text(f.id(row, "toolTipForCell:", {titled[0]})) == "tip" && f.id(row, "selectTextAtRow:column:", {0, 0}) == 0,
+            "tooltips are kept; a cell that is not editable has no text to select");
+
+    // A list matrix: dragging selects a range; -selectAll:, -setSelectionFrom:to:anchor:highlight:.
+    const auto list = make_matrix(f, {{150, 20}, {100, 83}}, 2, f.cls("NSCell"), 4, 1);   // rows 20 high
+    for (Address i = 0; i < 4; ++i) static_cast<void>(f.id(f.id(list, "cellAtRow:column:", {i, 0}), "setStringValue:", {f.str("item " + std::to_string(i))}));
+    static_cast<void>(f.id(content, "addSubview:", {list}));
+    static_cast<void>(f.id(list, "setTarget:", {f.target("list")}));
+    static_cast<void>(f.id(list, "setAction:", {f.objc.selector("acted:")}));
+    journal.clear();
+    drag(f, window, {200, 93}, {200, 52});   // row 0 (window y 83-103) to row 2 (y 41-61)
+    require(f.integer(f.id(list, "selectedCells"), "count") == 3 && f.integer(list, "selectedRow") == 2 && journal.size() == 1,
+            "a drag selects rows 0-2: " + std::to_string(f.integer(f.id(list, "selectedCells"), "count")) + " cells, " + joined());
+    require(!is_light(f.pixel(window, 240, 72)) && is_light(f.pixel(window, 240, 31)), "selected list rows are drawn highlighted");
+    f.click(window, {200, 31});   // row 3 alone
+    require(f.integer(f.id(list, "selectedCells"), "count") == 1 && f.integer(list, "selectedRow") == 3, "a plain click starts a new selection");
+    static_cast<void>(f.id(list, "selectAll:", {0}));
+    require(f.integer(f.id(list, "selectedCells"), "count") == 4, "-selectAll:");
+    static_cast<void>(f.id(list, "setSelectionFrom:to:anchor:highlight:", {1, 2, 1, 0}));
+    require(f.integer(f.id(list, "selectedCells"), "count") == 2 && f.integer(list, "selectedRow") == 3, "-setSelectionFrom:...highlight:NO deselects 1-2");
+    static_cast<void>(f.id(list, "deselectAllCells"));
+    require(f.integer(f.id(list, "selectedCells"), "count") == 0 && f.integer(list, "selectedRow") == -1, "-deselectAllCells");
+    require(!f.yes(list, "acceptsFirstMouse:", {0}) && f.yes(radio, "acceptsFirstMouse:", {0}), "list matrices do not accept the first mouse");
+
+    // A highlight matrix of switches: a click moves the cell to its next state.
+    const auto switches = make_matrix(f, {{10, 20}, {120, 20}}, 1, f.cls("NSButtonCell"), 1, 2);
+    for (Address i = 0; i < 2; ++i) static_cast<void>(f.id(f.id(switches, "cellAtRow:column:", {0, i}), "setButtonType:", {3}));   // NSButtonTypeSwitch
+    static_cast<void>(f.id(content, "addSubview:", {switches}));
+    f.click(window, {80, 30});   // column 1 (x 70.5-130)
+    const auto second = f.id(switches, "cellAtRow:column:", {0, 1});
+    require(f.integer(second, "state") == 1 && f.integer(switches, "selectedColumn") == 1, "a highlight-mode click turns the switch on");
+    f.click(window, {80, 30});
+    require(f.integer(second, "state") == 0, "and off again");
+    static_cast<void>(f.id(window, "close"));
+
+    // An active NSBrowser delegate fills a matrix per column.
+    const auto active_class = f.subclass("U22ActiveBrowserDelegate", "NSObject");
+    f.add(active_class, "browser:createRowsForColumn:inMatrix:", [&f](CpuState& s, GuestMemory&) {
+        const auto matrix = s.x[4];
+        static_cast<void>(f.id(matrix, "renewRows:columns:", {2, 1}));
+        for (Address i = 0; i < 2; ++i) {
+            const auto cell = f.id(matrix, "cellAtRow:column:", {i, 0});
+            static_cast<void>(f.id(cell, "setStringValue:", {f.str("B" + std::to_string(i))}));
+            static_cast<void>(f.id(cell, "setLeaf:", {1}));
+        }
+    }, "v@:@q@");
+    const auto browser = f.with_rect(f.id(f.cls("NSBrowser"), "alloc"), "initWithFrame:", {{0, 0}, {300, 100}});
+    static_cast<void>(f.id(browser, "setDelegate:", {f.id(f.id(active_class, "alloc"), "init")}));
+    static_cast<void>(f.id(browser, "loadColumnZero"));
+    const auto loaded = f.id(browser, "loadedCellAtRow:column:", {1, 0});
+    require(loaded && f.text(f.id(loaded, "stringValue")) == "B1" && f.id(loaded, "class") == f.cls("NSBrowserCell"),
+            "an active delegate's rows become the column");
+}
+
 // ---- the text system ------------------------------------------------------------------------
 void text_system(Fixture& f) {
     const auto view = f.with_rect(f.id(f.cls("NSTextView"), "alloc"), "initWithFrame:", {{0, 0}, {300, 100}});
@@ -2188,6 +2400,7 @@ int main() {
         switches_and_levels(f);
         token_fields(f);
         browsers(f);
+        matrices(f);
         text_system(f);
         text_layout(f);
         text_actions(f);

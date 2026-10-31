@@ -211,12 +211,28 @@ to objects and decides which new ones to add. Tokens made while typing,
 completions and token menus are not provided.
 
 **Browsers** (`controls/browser.cpp`): NSBrowser shows a hierarchy in
-columns from an item-based or passive delegate (active NSMatrix delegates
-stop explicitly). Selecting a branch loads the next column; up to
+columns from an item-based, passive or active delegate (an active delegate
+fills a one-column NSMatrix; -matrixInColumn: is not provided). Selecting a branch loads the next column; up to
 -maxVisibleColumns columns share the width, titled columns draw their
 titles; clicks and the arrow keys select and send the action (a double click
 the double action); paths and the selection index path follow the selection.
 Single selection only; columns do not scroll vertically.
+
+**Matrices** (`controls/matrix.cpp`): NSMatrix keeps a row-major grid of
+cells of one size (made from the prototype, the cell class or NSActionCell)
+with intercell spacing, laid out from the top left; rows and columns are
+added, inserted, removed, renewed and sorted. The radio, highlight, list and
+track modes select as AppKit documents: one selected radio cell whose state
+is on, highlight-mode clicks moving a cell to its next state, list-mode
+selections extended by dragging (by rectangle or in row order), Shift and
+Command. Clicks, Space on the key cell and cells' key equivalents send the
+cell's or the matrix's action with the matrix as sender (a double click then
+the double action); arrow keys move the key cell. The NSControl value API
+reads the selected cell; -setEnabled: and -setFont: apply to every cell.
+The mode values follow the constants' declaration order (unverified). Not
+provided: editing text in cells (-selectText... stop explicitly), cells'
+own tracking in track mode, hover tooltips (they are kept), and NSMatrix in
+nibs.
 
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each

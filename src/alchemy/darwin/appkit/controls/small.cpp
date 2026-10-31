@@ -227,6 +227,7 @@ void install_small_additions(AppKit& kit) {
     install_indicators(kit);   // NSSwitch, NSLevelIndicator (indicators.cpp)
     install_token_field(kit);  // NSTokenField (token_field.cpp)
     install_browser(kit);      // NSBrowser (browser.cpp)
+    install_matrix(kit);       // NSMatrix (matrix.cpp)
 }
 
 } // namespace alchemy::gui::completion_kit::controls

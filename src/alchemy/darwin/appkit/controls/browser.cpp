@@ -14,8 +14,10 @@
 //   -browser:numberOfChildrenOfItem:, -browser:child:ofItem:,
 //   -browser:isLeafItem:, -browser:objectValueForItem:) or passive
 //   (-browser:numberOfRowsInColumn: and -browser:willDisplayCell:atRow:column:,
-//   which fills an NSBrowserCell). Active delegates (NSMatrix rows) stop
-//   explicitly.
+//   which fills an NSBrowserCell), or active
+//   (-browser:createRowsForColumn:inMatrix: fills a one-column NSMatrix of
+//   the browser's cells, which the column then keeps; -matrixInColumn: is
+//   not provided).
 // * Selecting a row in a column drops the columns right of it and, for a
 //   branch, loads the next column. The browser shows up to
 //   -maxVisibleColumns columns (3 by default) sharing its width, the last
@@ -119,7 +121,20 @@ void load_column(AppKit& kit, Address self, std::size_t index) {
             column.cells.push_back(cell);
         }
     } else if (kit.responds(delegate, "browser:createRowsForColumn:inMatrix:")) {
-        unsupported("NSBrowser active delegates (-browser:createRowsForColumn:inMatrix:: NSMatrix columns)");
+        // An active delegate fills a one-column NSMatrix of the browser's cells; the column keeps them.
+        const auto cls = browser_of(kit, self)->cell_class ? browser_of(kit, self)->cell_class : kit.objc.find_class("NSBrowserCell");
+        CallRegs registers;
+        put_rect(registers, 0, {{0, 0}, {100, 100}});
+        registers.x[2] = 2;   // NSListModeMatrix
+        registers.x[3] = cls;
+        registers.x[4] = 0;
+        registers.x[5] = 1;
+        const auto matrix = kit.send(kit.send(kit.objc.find_class("NSMatrix"), "alloc").x0, "initWithFrame:mode:cellClass:numberOfRows:numberOfColumns:", registers).x0;
+        try {
+            static_cast<void>(kit.send_id(delegate, "browser:createRowsForColumn:inMatrix:", {self, static_cast<Address>(index), matrix}));
+            for (const auto cell : kit.items(kit.send_id(matrix, "cells"))) column.cells.push_back(kit.retain(cell));
+        } catch (...) { kit.release(matrix); throw; }
+        kit.release(matrix);
     }
     if (kit.responds(delegate, "browser:titleOfColumn:"))
         column.title = kit.retain(kit.send_id(delegate, "browser:titleOfColumn:", {self, static_cast<Address>(index)}));
@@ -220,8 +235,6 @@ void install_browser(AppKit& kit) {
     kit.method(b, "setDelegate:", [k](CpuState& s, GuestMemory&) {
         const auto state = browser_of(*k, s.x[0]);
         state->delegate = s.x[2];
-        if (s.x[2] && k->responds(s.x[2], "browser:createRowsForColumn:inMatrix:") && !k->responds(s.x[2], "browser:numberOfRowsInColumn:"))
-            unsupported("NSBrowser active delegates (-browser:createRowsForColumn:inMatrix:: NSMatrix columns)");
         drop_columns_after(*k, *state, 0);
         state->loaded = false;
         k->invalidate_view(s.x[0]);
