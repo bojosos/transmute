@@ -1,7 +1,8 @@
 #pragma once
 
-// Host area "audio" (owner: r3; output streams: fw-media). The rules are in
-// include/alchemy/host/host.hpp. Audio devices: enumeration and output streams. The CoreAudio HAL (src/alchemy/darwin/media/hal.cpp, over
+// Host area "audio" (owner: r3; output and input streams: fw-media). The rules are in
+// include/alchemy/host/host.hpp. Audio devices: enumeration, output and input streams, and the
+// microphone's privacy setting. The CoreAudio HAL (src/alchemy/darwin/media/hal.cpp, over
 // hal_core.hpp) runs on this. GUI-only: the backends are src/alchemy/host/<backend>/gui/audio.cpp,
 // compiled into alchemy-fx.
 
@@ -65,5 +66,33 @@ class OutputStream;
 void stop_output(OutputStream* stream) noexcept;
 // Stops and frees the stream.
 void close_output(OutputStream* stream) noexcept;
+
+// ---- input streams ----
+// A shared-mode stream on a capture endpoint. A thread of the backend hands `capture` each packet of
+// interleaved 32-bit float frames in the stream's format as the endpoint delivers it, with the host
+// time (time::monotonic_ns) when the backend took it. `capture` must not call back into the stream.
+using Capture = std::function<void(const float* samples, std::uint32_t frames, std::uint64_t time_ns)>;
+
+struct InputFormat {
+    std::uint32_t sample_rate{}, channels{};
+    std::uint32_t channel_mask{};      // 0 unknown
+};
+
+class InputStream;
+
+// Opens a stream on the capture endpoint `uid` ("" for the default input) in `sample_rate` and
+// `channels` (0: the mixer's). Error::not_found: no such endpoint; Error::access_denied: the host's
+// privacy settings deny the microphone; Error::unsupported: no audio input on this host.
+[[nodiscard]] Result<InputStream*> open_input(std::string_view uid, std::uint32_t sample_rate, std::uint32_t channels, Capture capture);
+[[nodiscard]] InputFormat input_format(const InputStream* stream) noexcept;
+[[nodiscard]] Status start_input(InputStream* stream);
+// Stops; when it returns, `capture` is not running and is not called again until a start.
+void stop_input(InputStream* stream) noexcept;
+void close_input(InputStream* stream) noexcept;
+
+// What the host's privacy settings say about this (desktop) application using the microphone:
+// unknown when they say nothing either way. Reading them shows no prompt.
+enum class Access { unknown, allowed, denied };
+[[nodiscard]] Access microphone_access();
 
 } // namespace alchemy::host::audio
