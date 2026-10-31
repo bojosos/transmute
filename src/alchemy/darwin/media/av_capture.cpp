@@ -200,7 +200,14 @@ private:
     std::vector<Address> devices_of(std::optional<Media> media);
     Address default_device(Media media);
     Address make_format(DeviceState& d, const capture::Format* video);
+public:
     std::int64_t status(Media media);
+    // The status after a request: when the settings say nothing, the host decides by opening the default device
+    // once (not started), and the answer is kept for the process.
+    std::int64_t decide(Media media);
+    std::shared_ptr<CompletionThread> completion_thread() { return thread(); }
+
+private:
     Media media_of(Address type, const char* what);
     std::shared_ptr<CompletionThread> thread();
     void write_time(Address at, const CMTime& t) {
@@ -355,6 +362,28 @@ std::int64_t Capture::status(Media media) {
     std::lock_guard lock(mutex_);
     const auto found = decided_.find(media);
     return found == decided_.end() ? not_determined : found->second;
+}
+
+std::int64_t Capture::decide(Media media) {
+    auto result = status(media);
+    if (result != not_determined) return result;
+    std::optional<std::int64_t> decided;
+    if (media == Media::video) {
+        if (const auto device = default_device(Media::video)) {
+            capture::OpenError error{};
+            auto stream = backend().open(support_.objc.find_host_state<DeviceState>(device)->id, 0, 0, 0, [](const capture::Picture&) {}, error);
+            if (stream) decided = authorized;
+            else if (error == capture::OpenError::denied) decided = denied;
+        }
+    } else if (const auto device = default_device(Media::audio)) {
+        if (hal_open_input(support_.objc.find_host_state<DeviceState>(device)->hal_id, [](const float*, std::uint32_t, std::uint64_t) {})) decided = authorized;
+    }
+    if (decided) {
+        std::lock_guard lock(mutex_);
+        decided_[media] = *decided;
+        result = *decided;
+    }
+    return result;
 }
 
 Address Capture::input_for(SessionState& session, Media media) {
@@ -727,28 +756,8 @@ void Capture::install() {
     support.method(device_class_, "authorizationStatusForMediaType:", [self](CpuState& s, GuestMemory&) {
         s.x[0] = static_cast<std::uint64_t>(self->status(self->media_of(s.x[2], "+[AVCaptureDevice authorizationStatusForMediaType:]")));
     }, "q@:@", true);
-    support.method(device_class_, "requestAccessForMediaType:completionHandler:", [self, sp](CpuState& s, GuestMemory&) {
-        const auto media = self->media_of(s.x[2], "+[AVCaptureDevice requestAccessForMediaType:completionHandler:]");
-        auto status = self->status(media);
-        if (status == not_determined) {
-            // The host decides: opening the default device once (not started) answers without a prompt.
-            std::optional<std::int64_t> decided;
-            if (media == Media::video) {
-                if (const auto device = self->default_device(Media::video)) {
-                    capture::OpenError error{};
-                    auto stream = self->backend().open(sp->objc.find_host_state<DeviceState>(device)->id, 0, 0, 0, [](const capture::Picture&) {}, error);
-                    if (stream) decided = authorized;
-                    else if (error == capture::OpenError::denied) decided = denied;
-                }
-            } else if (const auto device = self->default_device(Media::audio)) {
-                if (hal_open_input(sp->objc.find_host_state<DeviceState>(device)->hal_id, [](const float*, std::uint32_t, std::uint64_t) {})) decided = authorized;
-            }
-            if (decided) {
-                std::lock_guard lock(self->mutex_);
-                self->decided_[media] = *decided;
-                status = *decided;
-            }
-        }
+    support.method(device_class_, "requestAccessForMediaType:completionHandler:", [self](CpuState& s, GuestMemory&) {
+        const auto status = self->decide(self->media_of(s.x[2], "+[AVCaptureDevice requestAccessForMediaType:completionHandler:]"));
         if (s.x[3]) self->thread()->post_block(self->bridge_->block_copy(s.x[3]), {status == authorized ? 1U : 0U});
     }, "v@:@@?", true);
     support.method(device_class_, "uniqueID", [device_of, text](CpuState& s, GuestMemory&) { s.x[0] = text(device_of(s.x[0])->id); }, "@@:");
@@ -1259,6 +1268,24 @@ void Capture::install() {
 
 void set_capture_backend_factory(std::function<std::unique_ptr<capture::Backend>()> factory) { backend_factory() = std::move(factory); }
 
-void install_av_capture(Support& support) { std::make_shared<Capture>(support)->install(); }
+namespace {
+std::weak_ptr<Capture>& the_capture() {
+    static std::weak_ptr<Capture> value;
+    return value;
+}
+} // namespace
+
+std::int64_t capture_authorization(bool video, bool request) {
+    const auto capture = the_capture().lock();
+    if (!capture) return 0;
+    const auto media = video ? Media::video : Media::audio;
+    return request ? capture->decide(media) : capture->status(media);
+}
+
+void install_av_capture(Support& support) {
+    auto capture = std::make_shared<Capture>(support);
+    the_capture() = capture;
+    capture->install();
+}
 
 } // namespace alchemy::gui::completion_kit::media

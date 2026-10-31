@@ -15,6 +15,8 @@
 #include "alchemy/host/time.hpp"
 
 #include <algorithm>
+#include <filesystem>
+#include "alchemy/path.hpp"
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -543,6 +545,65 @@ void ioproc_input(Fixture& f) {
     require(f.status(ca, "_AudioDeviceDestroyIOProcID", {microphone, f.engine.read64(id)}) == 0, "destroyed");
 }
 
+// AVAudioRecorder: 0.5 s of the fake microphone (mono 0.25 at 48 kHz) into a 16-bit stereo 16 kHz WAVE file,
+// with metering; AVAudioApplication's record permission.
+void recorder(Fixture& f) {
+    constexpr std::string_view run_loop = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+    const auto mode = f.engine.read64(f.symbol(run_loop, "_kCFRunLoopDefaultMode"));
+    const auto run = [&](double seconds) {
+        alchemy::CallRegs r;
+        r.x[0] = mode;
+        r.set_d(0, seconds);
+        static_cast<void>(f.regs(run_loop, "_CFRunLoopRunInMode", r));
+    };
+    static std::atomic<int> finished{0};
+    const auto delegate_class = f.objc.register_native_class("AlchemyRecorderTestDelegate", f.cls("NSObject"), 8);
+    static_cast<void>(f.objc.add_native_method(delegate_class, "audioRecorderDidFinishRecording:successfully:",
+                                               [](transmute::CpuState& s, transmute::GuestMemory&) { if (s.x[3] & 0xff) ++finished; }, false, "v@:@B"));
+    const auto delegate = f.send(f.send(delegate_class, "alloc"), "init");
+    const auto path = std::filesystem::temp_directory_path() / "alchemy_recorder_test.wav";
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    const auto url = f.cf.file_url(alchemy::guest_path_string(path), false);
+    const auto settings = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("AVFormatIDKey"), f.cf.integer(four("lpcm"), 3)}, {f.cf.string("AVSampleRateKey"), f.cf.real(16000)},
+        {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(2, 3)}, {f.cf.string("AVLinearPCMBitDepthKey"), f.cf.integer(16, 3)},
+        {f.cf.string("AVLinearPCMIsFloatKey"), f.cf.boolean(false)}});
+    const auto error = f.block(8);
+    const auto recorder = f.send(f.send(f.cls("AVAudioRecorder"), "alloc"), "initWithURL:settings:error:", {url, settings, error});
+    require(recorder && (f.send(recorder, "prepareToRecord") & 0xff) == 1, "AVAudioRecorder prepared");
+    f.send(recorder, "setDelegate:", {delegate});
+    f.send(recorder, "setMeteringEnabled:", {1});
+    alchemy::CallRegs duration{};
+    duration.set_d(0, 0.5);
+    require((f.objc.send(recorder, f.objc.selector("recordForDuration:"), duration).x0 & 0xff) == 1 && (f.send(recorder, "isRecording") & 0xff) == 1 &&
+                FakeInput::live() == 1,
+            "recording");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    f.send(recorder, "updateMeters");
+    alchemy::CallRegs channel{};
+    channel.x[2] = 0;
+    const auto peak = f.objc.send(recorder, f.objc.selector("peakPowerForChannel:"), channel).s(0);
+    const auto average = f.objc.send(recorder, f.objc.selector("averagePowerForChannel:"), channel).s(0);
+    require(std::fabs(peak + 12.04f) < 1.5f && std::fabs(average + 12.04f) < 0.5f, "meters: 0.25 is -12 dB (the peak allows the resampler's ringing): " + std::to_string(peak) + " / " + std::to_string(average));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (finished == 0 && std::chrono::steady_clock::now() < deadline) run(0.02);
+    require(finished == 1 && (f.send(recorder, "isRecording") & 0xff) == 0 && FakeInput::live() == 0, "the duration ends the recording");
+    // The file: 0.5 s of 16 kHz stereo at 0.25.
+    const auto file = f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForReading:error:", {url, error});
+    require(file && f.send(file, "length") == 8000, "8000 frames recorded: " + std::to_string(file ? f.send(file, "length") : 0));
+    const auto processing = f.send(file, "processingFormat");
+    require(f.send(processing, "channelCount") == 2, "stereo");
+    const auto buffer = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {processing, 8000});
+    require((f.send(file, "readIntoBuffer:error:", {buffer, error}) & 0xff) == 1, "read back");
+    const auto right = f.engine.read64(f.send(buffer, "floatChannelData") + 8);
+    require(std::fabs(std::bit_cast<float>(f.engine.read32(right + 4 * 4000)) - 0.25f) < 0.001f, "the microphone's 0.25 in both channels");
+    // AVAudioApplication: the microphone is allowed by the (fake) host settings.
+    const auto application = f.send(f.cls("AVAudioApplication"), "sharedInstance");
+    require(application && f.send(application, "recordPermission") == 0x67726E74, "record permission granted");
+    std::filesystem::remove(path, ignored);
+}
+
 // Alchemy's own test devices (ALCHEMY_CAMERA=pattern, ALCHEMY_AUDIO_INPUT=tone) through the host backends: the
 // colour-bar camera and the 440 Hz microphone, which replace the host's devices (none is opened).
 void test_devices(Fixture&) {
@@ -607,6 +668,7 @@ int main() {
         {"auhal_input", auhal_input},
         {"audio_queue_input", audio_queue_input},
         {"ioproc_input", ioproc_input},
+        {"recorder", recorder},
         {"test_devices", test_devices},
     });
 }

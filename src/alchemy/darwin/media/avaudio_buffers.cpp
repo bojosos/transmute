@@ -621,6 +621,7 @@ void install_avaudio_buffers(Support& support) {
 
     install_avaudio_converter(support);   // AVAudioConverter and AVAudioCompressedBuffer (avaudio_converter.cpp)
     install_avaudio_speech(support);      // AVSpeechSynthesizer and AVSpeechSynthesisVoice (avaudio_speech.cpp)
+    install_avaudio_recorder(support);    // AVAudioRecorder and AVAudioApplication (avaudio_recorder.cpp)
 }
 
 } // namespace alchemy::gui::completion_kit::media::avaudio

@@ -42,6 +42,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/avaudio_effects.cpp
     src/alchemy/darwin/media/avaudio_sampler.cpp
     src/alchemy/darwin/media/avaudio_speech.cpp
+    src/alchemy/darwin/media/avaudio_recorder.cpp
     src/alchemy/darwin/media/music_core.cpp
     src/alchemy/darwin/media/music.cpp
     src/alchemy/darwin/media/audio_file_core.cpp

@@ -27,6 +27,7 @@ inline constexpr std::string_view avf_audio = "/System/Library/Frameworks/AVFAud
 void install_avaudio_buffers(Support& support);
 void install_avaudio_converter(Support& support);   // called by install_avaudio_buffers
 void install_avaudio_speech(Support& support);      // called by install_avaudio_buffers
+void install_avaudio_recorder(Support& support);    // called by install_avaudio_buffers
 void install_avaudio_player(Support& support);
 void install_avaudio_engine(Support& support);
 
