@@ -1000,9 +1000,10 @@ void toolbar_groups(Fixture& f) {
 }
 
 // NSSpeechSynthesizer over AVFAudio and the host's voices (the frameworks
-// wave, U15). Without host voices the initializer returns nil; with them, a
-// silent utterance reaches the delegate's word and finish callbacks (NO when
-// there is no audio output to speak to).
+// wave, U15). Without host voices the initializer returns nil; with them, an
+// utterance (at volume 0, to the silent output stream main() asks for)
+// reaches the delegate's word and finish callbacks (NO when there is no
+// audio output to speak to).
 void speech(Fixture& f) {
     const auto synth_class = f.cls("NSSpeechSynthesizer");
     const auto voices = f.id(synth_class, "availableVoices");
@@ -1052,6 +1053,7 @@ void speech(Fixture& f) {
 int main() {
 #ifdef _WIN32
     _putenv_s("ALCHEMY_GUI_NO_ACTIVATE", "1");
+    _putenv_s("ALCHEMY_AUDIO_OUTPUT", "null");   // the speech test plays to a silent stream, never the speakers
 #endif
     try {
         Fixture f;
