@@ -77,4 +77,19 @@ struct FlowResult {
 // The item under a point (-1: none).
 [[nodiscard]] std::int64_t item_at(const FlowResult& result, Point point);
 
+// NSCollectionViewGridLayout: as many columns as fit items of the minimum
+// width with the minimum spacing (at most maximum_columns; 0: no limit),
+// items widened to share the row up to the maximum width (0: no limit), at
+// the minimum height (else the maximum height, else as tall as wide), rows
+// at most maximum_rows (0: no limit). Items past the last row get empty
+// frames: they are not shown (`shown` counts those that are).
+struct GridLayout {
+    std::size_t maximum_rows{}, maximum_columns{};
+    Size minimum_item{}, maximum_item{};
+    double interitem_spacing{}, line_spacing{};
+    Insets margins;
+};
+struct GridResult : FlowResult { std::size_t shown{}; };
+[[nodiscard]] GridResult grid_layout(const GridLayout& layout, std::size_t count, double width);
+
 } // namespace alchemy::gui::completion_kit::controls::layout

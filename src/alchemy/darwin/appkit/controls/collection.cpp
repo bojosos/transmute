@@ -17,7 +17,10 @@
 //   guest layout subclass's overrides place the items;
 //   NSCollectionViewFlowLayout computes its attributes with layout.cpp's
 //   flow_layout (vertical scrolling, one item size; the delegate's
-//   size / inset / spacing answers are honoured);
+//   size / inset / spacing answers are honoured), and
+//   NSCollectionViewGridLayout with grid_layout (row and column limits, the
+//   minimum and maximum item sizes, spacing, margins; items past the row
+//   limit are hidden; the background colours are kept, not drawn);
 // * selection by click (Command toggles, Shift extends when multiple
 //   selection is allowed) and arrow keys, the delegate's should/did select
 //   messages, -[NSCollectionViewItem setSelected:];
@@ -62,11 +65,14 @@ struct LayoutState final : ObjectPayload {
     Address collection{};                                    // not retained
     layout::FlowLayout flow;
     layout::FlowResult result;                               // the last -prepareLayout
+    layout::GridLayout grid;                                 // NSCollectionViewGridLayout
+    Address grid_backgrounds{};                              // +1 (kept, not drawn)
     Size estimated{};
     std::int64_t direction{};                                // NSCollectionViewScrollDirectionVertical
     std::map<std::string, Address> decoration_classes;
     bool pin_headers{}, pin_footers{}, flow_layout{};
 };
+using GridMetrics = layout::GridLayout;   // (MSVC misreads "std::size_t layout::GridLayout::*" in a template argument)
 struct AttributesState final : ObjectPayload {
     Rect frame;
     Address index_path{};                                    // +1
@@ -522,6 +528,96 @@ void install_collection_view(AppKit& kit) {
             s.x[0] = make_attributes(*k, {{0, state->result.content.height - state->flow.footer}, {width, state->flow.footer}}, 0, 1, kind);
         else s.x[0] = 0;
     });
+
+    // ---- NSCollectionViewGridLayout ----
+    const auto grid_class = kit.declare_class("NSCollectionViewGridLayout", "NSCollectionViewLayout");
+    const auto gl = grid_class;
+    kit.method(gl, "prepareLayout", [k](CpuState& s, GuestMemory&) {
+        const auto state = layout_of(*k, s.x[0]);
+        const auto collection = state->collection;
+        if (!collection) { state->result = {}; return; }
+        const auto width = AppKit::view_bounds(*k->view_state(collection)).size.width;
+        state->result = layout::grid_layout(state->grid, static_cast<std::size_t>(collection_of(*k, collection)->count), width);
+    }, "v@:");
+    kit.method(gl, "collectionViewContentSize", [k](CpuState& s, GuestMemory&) { return_size(s, layout_of(*k, s.x[0])->result.content); }, "{CGSize=dd}@:");
+    const auto grid_attributes = [k](Address layout_object, std::int64_t item) -> Address {
+        const auto state = layout_of(*k, layout_object);
+        if (item < 0 || item >= static_cast<std::int64_t>(state->result.frames.size())) return 0;
+        const auto frame = state->result.frames[static_cast<std::size_t>(item)];
+        const auto made = make_attributes(*k, frame, item, 0, {});
+        if (frame.size.width <= 0) static_cast<void>(k->send_id(made, "setHidden:", {1}));   // past the row limit
+        return made;
+    };
+    kit.method(gl, "layoutAttributesForElementsInRect:", [k, grid_attributes](CpuState& s, GuestMemory&) {
+        const auto state = layout_of(*k, s.x[0]);
+        const auto rect = rect_arg(s);
+        std::vector<Address> list;
+        for (std::size_t i = 0; i < state->result.frames.size(); ++i) {
+            const auto& r = state->result.frames[i];
+            const bool hidden = r.size.width <= 0;
+            const bool meets = r.origin.x < rect.origin.x + rect.size.width && r.origin.x + r.size.width > rect.origin.x &&
+                               r.origin.y < rect.origin.y + rect.size.height && r.origin.y + r.size.height > rect.origin.y;
+            if (hidden || meets) list.push_back(grid_attributes(s.x[0], static_cast<std::int64_t>(i)));
+        }
+        s.x[0] = k->auto_array(list);
+    }, "@@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    kit.method(gl, "layoutAttributesForItemAtIndexPath:", [k, grid_attributes](CpuState& s, GuestMemory&) {
+        s.x[0] = grid_attributes(s.x[0], item_of(*k, s.x[2]));
+    });
+    kit.method(gl, "shouldInvalidateLayoutForBoundsChange:", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    const auto relayout = [k](Address layout_object) {
+        if (const auto collection = layout_of(*k, layout_object)->collection) layout_items(*k, collection);
+    };
+    for (const auto& [getter, setter, member] : std::initializer_list<std::tuple<const char*, const char*, std::size_t GridMetrics::*>>{
+             {"maximumNumberOfRows", "setMaximumNumberOfRows:", &GridMetrics::maximum_rows},
+             {"maximumNumberOfColumns", "setMaximumNumberOfColumns:", &GridMetrics::maximum_columns}}) {
+        const auto field = member;
+        kit.method(gl, getter, [k, field](CpuState& s, GuestMemory&) { s.x[0] = layout_of(*k, s.x[0])->grid.*field; }, "Q@:");
+        kit.method(gl, setter, [k, field, relayout](CpuState& s, GuestMemory&) {
+            layout_of(*k, s.x[0])->grid.*field = static_cast<std::size_t>(s.x[2]);
+            relayout(s.x[0]);
+        }, "v@:Q");
+    }
+    for (const auto& [getter, setter, member] : std::initializer_list<std::tuple<const char*, const char*, Size GridMetrics::*>>{
+             {"minimumItemSize", "setMinimumItemSize:", &GridMetrics::minimum_item},
+             {"maximumItemSize", "setMaximumItemSize:", &GridMetrics::maximum_item}}) {
+        const auto field = member;
+        kit.method(gl, getter, [k, field](CpuState& s, GuestMemory&) { return_size(s, layout_of(*k, s.x[0])->grid.*field); }, "{CGSize=dd}@:");
+        kit.method(gl, setter, [k, field, relayout](CpuState& s, GuestMemory&) {
+            layout_of(*k, s.x[0])->grid.*field = size_arg(s);
+            relayout(s.x[0]);
+        }, "v@:{CGSize=dd}");
+    }
+    for (const auto& [getter, setter, member] : std::initializer_list<std::tuple<const char*, const char*, double GridMetrics::*>>{
+             {"minimumInteritemSpacing", "setMinimumInteritemSpacing:", &GridMetrics::interitem_spacing},
+             {"minimumLineSpacing", "setMinimumLineSpacing:", &GridMetrics::line_spacing}}) {
+        const auto field = member;
+        kit.method(gl, getter, [k, field](CpuState& s, GuestMemory&) { set_d(s, 0, layout_of(*k, s.x[0])->grid.*field); }, "d@:");
+        kit.method(gl, setter, [k, field, relayout](CpuState& s, GuestMemory&) {
+            layout_of(*k, s.x[0])->grid.*field = d(s, 0);
+            relayout(s.x[0]);
+        }, "v@:d");
+    }
+    kit.method(gl, "margins", [k](CpuState& s, GuestMemory&) {
+        const auto& m = layout_of(*k, s.x[0])->grid.margins;
+        set_d(s, 0, m.top);
+        set_d(s, 1, m.left);
+        set_d(s, 2, m.bottom);
+        set_d(s, 3, m.right);
+    }, "{NSEdgeInsets=dddd}@:");
+    kit.method(gl, "setMargins:", [k, relayout](CpuState& s, GuestMemory&) {
+        layout_of(*k, s.x[0])->grid.margins = {d(s, 0), d(s, 1), d(s, 2), d(s, 3)};
+        relayout(s.x[0]);
+    }, "v@:{NSEdgeInsets=dddd}");
+    kit.method(gl, "backgroundColors", [k](CpuState& s, GuestMemory&) { s.x[0] = layout_of(*k, s.x[0])->grid_backgrounds; });
+    kit.method(gl, "setBackgroundColors:", [k](CpuState& s, GuestMemory&) {
+        const auto state = layout_of(*k, s.x[0]);
+        k->release(std::exchange(state->grid_backgrounds, s.x[2] ? k->cf.copy(s.x[2]) : 0));
+    }, "v@:@");
+    kit.method(gl, "dealloc", [k, gl](CpuState& s, GuestMemory&) {
+        if (const auto state = k->objc.find_host_state<LayoutState>(s.x[0])) k->release(std::exchange(state->grid_backgrounds, 0));
+        static_cast<void>(k->objc.send_super(s.x[0], gl, k->sel("dealloc")));
+    }, "v@:");
 
     // ---- _NSCollectionViewCore (archived) ----
     kit.method(core_class, "initWithCoder:", [k](CpuState& s, GuestMemory&) {

@@ -124,6 +124,33 @@ void flow_layout() {
     require(result.frames.empty() && result.content.height == 30 + 20 + 20 + 10, "empty section with header and footer");
 }
 
+// NSCollectionViewGridLayout's grid (the frameworks wave, U15c).
+void grid_layout() {
+    layout::GridLayout grid;
+    grid.minimum_item = {100, 60};
+    grid.interitem_spacing = 10;
+    grid.line_spacing = 8;
+    grid.margins = {5, 10, 5, 10};
+    // 450 wide: room 430 fits four columns of 100 with 10-point gaps.
+    auto result = layout::grid_layout(grid, 9, 450);
+    require(result.columns == 4 && result.shown == 9, "four columns of at least 100 fit in 430");
+    require(result.frames[0].origin.x == 10 && result.frames[0].size.width == 100 && result.frames[4].origin.y == 5 + 60 + 8, "the grid's rows");
+    require(result.content.height == 5 + 3 * 60 + 2 * 8 + 5, "the grid's content height");
+    // Wider rooms widen the items, up to the maximum width; the column limit holds.
+    grid.maximum_columns = 2;
+    grid.maximum_item = {150, 0};
+    result = layout::grid_layout(grid, 3, 450);
+    require(result.columns == 2 && result.frames[0].size.width == 150 && result.frames[1].origin.x == 10 + 150 + 10, "two columns of at most 150");
+    // A row limit leaves the rest out.
+    grid.maximum_rows = 1;
+    result = layout::grid_layout(grid, 3, 450);
+    require(result.shown == 2 && result.frames[2].size.width == 0 && result.content.height == 5 + 60 + 5, "one row shows two items");
+    // Without a minimum height the items are as tall as wide.
+    grid = {};
+    result = layout::grid_layout(grid, 2, 200);
+    require(result.frames[0].size.height == result.frames[0].size.width, "square items by default");
+}
+
 void date_picker_elements() {
     // 2026-10-14 15:05:09 UTC; reference date is 2001-01-01.
     const auto civil = elements::Civil{2026, 10, 14, 15, 5, 9};
@@ -176,6 +203,7 @@ int main() {
         segment_layout();
         path_split();
         flow_layout();
+        grid_layout();
         date_picker_elements();
     } catch (const std::exception& error) {
         std::cerr << "alchemy_gui_appkit_controls_unit: " << error.what() << '\n';

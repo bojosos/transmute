@@ -1698,6 +1698,19 @@ void collection_views(Fixture& f) {
     f.key(window, 0x7c, "");
     require(f.id(f.id(f.id(view, "selectionIndexPaths"), "anyObject"), "item") == 6 && !f.yes(f.id(view, "itemAtIndex:", {5}), "isSelected"),
             "the right arrow moves the selection");
+    // A grid layout (the frameworks wave, U15c): at most three columns of at
+    // least 100, widened to share the row; one row, so items 3-6 are hidden.
+    const auto grid = f.id(f.id(f.cls("NSCollectionViewGridLayout"), "alloc"), "init");
+    CallRegs minimum;
+    gui::appkit::put_size(minimum, 0, {100, 50});
+    static_cast<void>(f.send(grid, "setMinimumItemSize:", minimum));
+    static_cast<void>(f.id(grid, "setMaximumNumberOfColumns:", {3}));
+    static_cast<void>(f.id(grid, "setMaximumNumberOfRows:", {1}));
+    static_cast<void>(f.with_double(grid, "setMinimumInteritemSpacing:", 10));
+    static_cast<void>(f.id(view, "setCollectionViewLayout:", {grid}));
+    require(frame_of(1).d(0) == 160 && frame_of(1).d(2) == 150 && frame_of(1).d(3) == 50, "grid layout frames: " + std::to_string(frame_of(1).d(0)));
+    require(f.yes(f.id(f.id(view, "itemAtIndex:", {4}), "view"), "isHidden") && !f.yes(f.id(f.id(view, "itemAtIndex:", {2}), "view"), "isHidden"),
+            "items past the row limit are hidden");
     static_cast<void>(f.id(window, "close"));
 }
 

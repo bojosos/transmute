@@ -173,6 +173,35 @@ FlowResult flow_layout(const FlowLayout& layout, std::size_t count, double width
     return result;
 }
 
+GridResult grid_layout(const GridLayout& layout, std::size_t count, double width) {
+    GridResult result;
+    const auto& margins = layout.margins;
+    const double room = std::max(0.0, width - margins.left - margins.right);
+    const double minimum_width = std::max(1.0, layout.minimum_item.width);
+    auto columns = std::max<std::size_t>(1, static_cast<std::size_t>(std::floor((room + layout.interitem_spacing) /
+                                                                                 (minimum_width + layout.interitem_spacing))));
+    if (layout.maximum_columns > 0) columns = std::min(columns, layout.maximum_columns);
+    result.columns = columns;
+    double item_width = std::max(0.0, (room - layout.interitem_spacing * static_cast<double>(columns - 1)) / static_cast<double>(columns));
+    if (layout.maximum_item.width > 0) item_width = std::min(item_width, layout.maximum_item.width);
+    item_width = std::max(item_width, layout.minimum_item.width);
+    const double item_height = layout.minimum_item.height > 0 ? layout.minimum_item.height
+                               : layout.maximum_item.height > 0 ? layout.maximum_item.height : item_width;
+    auto rows = count ? (count + columns - 1) / columns : 0;
+    if (layout.maximum_rows > 0) rows = std::min(rows, layout.maximum_rows);
+    result.shown = std::min(count, rows * columns);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i >= result.shown) { result.frames.push_back({}); continue; }
+        const auto row = i / columns, column = i % columns;
+        const double x = margins.left + static_cast<double>(column) * (item_width + layout.interitem_spacing);
+        const double y = margins.top + static_cast<double>(row) * (item_height + layout.line_spacing);
+        result.frames.push_back({{std::round(x), std::round(y)}, {item_width, item_height}});
+    }
+    const double items_height = rows ? static_cast<double>(rows) * item_height + static_cast<double>(rows - 1) * layout.line_spacing : 0;
+    result.content = {width, margins.top + items_height + margins.bottom};
+    return result;
+}
+
 std::int64_t item_at(const FlowResult& result, Point point) {
     for (std::size_t i = 0; i < result.frames.size(); ++i) {
         const auto& r = result.frames[i];
