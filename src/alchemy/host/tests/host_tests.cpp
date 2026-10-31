@@ -293,6 +293,8 @@ void file_table(const std::string& directory) {
     require(files::rename(moved, moved + "2", false).error() == host::Error::exists && files::rename(moved, moved + "2", true), "rename replace");
     std::filesystem::remove(moved + "2");
     require(!files::is_console(file.get()), "a file is not a console");
+    require(!files::console_input_mode(file.get()) && !files::set_console_input_mode(file.get(), {}) &&
+            !files::flush_console_input(file.get()), "console modes fail on a file");
 
     // links and trees
     {

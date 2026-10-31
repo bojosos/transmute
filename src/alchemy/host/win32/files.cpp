@@ -612,6 +612,37 @@ bool is_console(Handle file) noexcept {
     return GetConsoleMode(win32::native(file), &mode) != 0;
 }
 
+Result<ConsoleInputMode> console_input_mode(Handle input) {
+    DWORD mode = 0;
+    if (!GetConsoleMode(win32::native(input), &mode)) return win32::last_error();
+    return ConsoleInputMode{(mode & ENABLE_LINE_INPUT) != 0, (mode & ENABLE_ECHO_INPUT) != 0, (mode & ENABLE_PROCESSED_INPUT) != 0,
+                            (mode & ENABLE_VIRTUAL_TERMINAL_INPUT) != 0};
+}
+
+Status set_console_input_mode(Handle input, const ConsoleInputMode& value) {
+    DWORD mode = 0;
+    if (!GetConsoleMode(win32::native(input), &mode)) return win32::last_error();
+    mode &= ~static_cast<DWORD>(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT);
+    if (value.line) mode |= ENABLE_LINE_INPUT;
+    if (value.line && value.echo) mode |= ENABLE_ECHO_INPUT;   // the console echoes only in line mode
+    if (value.signals) mode |= ENABLE_PROCESSED_INPUT;
+    if (value.escape_sequences) mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+    if (!SetConsoleMode(win32::native(input), mode)) return win32::last_error();
+    return {};
+}
+
+Status enable_console_escape_sequences(Handle output) {
+    DWORD mode = 0;
+    if (!GetConsoleMode(win32::native(output), &mode)) return win32::last_error();
+    if (!SetConsoleMode(win32::native(output), mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) return win32::last_error();
+    return {};
+}
+
+Status flush_console_input(Handle input) {
+    if (!FlushConsoleInputBuffer(win32::native(input))) return win32::last_error();
+    return {};
+}
+
 namespace {
 // An attribute is the alternate data stream "file:name". A ':' in a name
 // (com.apple.metadata:...) is stored as U+F03A, the private-use mapping WSL

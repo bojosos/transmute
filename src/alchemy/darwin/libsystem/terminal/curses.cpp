@@ -27,7 +27,7 @@
 // keypad decodes the xterm cursor, editing and function keys, mousemask turns on xterm SGR
 // mouse reports, which getmouse returns, and a change of the terminal size (TIOCGWINSZ) reads
 // as KEY_RESIZE. initscr needs a terminal on fd 0 and 1 whose attributes can be read (a pseudo-
-// terminal; Alchemy's host console has none, so initscr stops there, as tcgetattr does).
+// terminal, or the host's console, whose termios fs/terminal.cpp maps onto its modes).
 // Colours cannot be redefined (can_change_color is FALSE).
 namespace alchemy::export_fill {
 namespace {

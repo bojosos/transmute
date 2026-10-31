@@ -108,6 +108,18 @@ struct Identity {
 [[nodiscard]] Status access(std::string_view path, bool write);
 // A console (an interactive terminal): isatty of the standard streams.
 [[nodiscard]] bool is_console(Handle file) noexcept;
+// A console's input modes, behind POSIX termios (the macOS layer maps the flags): `line` reads a
+// whole edited line at a time, `echo` shows what is typed (only together with `line`: the host
+// cannot echo characters read one by one), `signals` makes Ctrl+C an interrupt rather than a
+// character, `escape_sequences` delivers special keys (arrows, function keys) as VT sequences.
+struct ConsoleInputMode { bool line{}, echo{}, signals{}, escape_sequences{}; };
+[[nodiscard]] Result<ConsoleInputMode> console_input_mode(Handle input);
+[[nodiscard]] Status set_console_input_mode(Handle input, const ConsoleInputMode& mode);
+// VT escape sequences written to the console are interpreted (colours, cursor movement), where the
+// host can do that.
+[[nodiscard]] Status enable_console_escape_sequences(Handle output);
+// Discards typed input not yet read (TCSAFLUSH, tcflush).
+[[nodiscard]] Status flush_console_input(Handle input);
 
 // Extended attributes: named byte strings attached to a file or directory
 // (getxattr and friends). Names are UTF-8 without '/' or '\'; the host stores

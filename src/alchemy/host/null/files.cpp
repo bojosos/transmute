@@ -45,6 +45,10 @@ Status set_times(std::string_view, std::optional<std::int64_t>, std::optional<st
 Status rename(std::string_view, std::string_view, bool) { return Error::unsupported; }
 Status access(std::string_view, bool) { return Error::unsupported; }
 bool is_console(Handle) noexcept { return false; }
+Result<ConsoleInputMode> console_input_mode(Handle) { return Error::unsupported; }
+Status set_console_input_mode(Handle, const ConsoleInputMode&) { return Error::unsupported; }
+Status enable_console_escape_sequences(Handle) { return Error::unsupported; }
+Status flush_console_input(Handle) { return Error::unsupported; }
 Result<std::vector<std::byte>> get_attribute(std::string_view, std::string_view) { return Error::unsupported; }
 Result<bool> has_attribute(std::string_view, std::string_view) { return Error::unsupported; }
 Status set_attribute(std::string_view, std::string_view, ConstBytes) { return Error::unsupported; }

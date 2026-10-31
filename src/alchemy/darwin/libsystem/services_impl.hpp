@@ -1234,6 +1234,8 @@ public:
     std::condition_variable signal_handled;
     std::uint64_t handled_signals{};
     std::uint32_t last_handled_signal{};
+    // struct termios last set on the console (fs/terminal.cpp), under `mutex`.
+    std::optional<std::array<std::uint8_t, 72>> console_attributes;
     // ITIMER_REAL (process/process_model.cpp): the next expiry and the period, under `mutex`;
     // `real_timer_thread` once the guest thread that raises SIGALRM runs.
     std::condition_variable real_timer_changed;

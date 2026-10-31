@@ -13,6 +13,10 @@
 // writes). There is no echo, canonical-mode line editing, or signal
 // generation (ISIG, SIGWINCH): programs that put the terminal in raw mode, as
 // shells and REPLs do, do not need them.
+//
+// The host's own console (standard streams that are a console) has real
+// termios too: tcgetattr/tcsetattr map ICANON, ECHO and ISIG onto its input
+// modes (host::files::set_console_input_mode); see the comment at tcgetattr.
 #include "alchemy/darwin/libsystem/services_impl.hpp"
 
 #include <cstddef>
@@ -384,23 +388,70 @@ void DarwinServices::Impl::install_terminals() {
             return 0;
         } catch (const ServiceError& error) { return error.value; }
     });
-    const auto console_unsupported = [](const char* name) -> std::uint64_t {
-        // A console terminal would need echo/canonical-mode mapping, which is not implemented.
-        throw std::runtime_error(std::string("Alchemy: ") + name + " on a console terminal is unsupported");
+    // A console (the host's terminal) behind termios: ICANON is its line input, ECHO its echo (the
+    // console echoes only in line mode, so without ICANON nothing is echoed), ISIG Ctrl+C as an
+    // interrupt; without ICANON, special keys arrive as escape sequences, as from a terminal, and
+    // escape sequences written to it are interpreted. Other fields read back as last set (the
+    // defaults of a new terminal at first). TCSAFLUSH discards typed input.
+    constexpr std::uint64_t lflag_echo = 0x8 | 0x2 | 0x1 | 0x40;   // ECHO | ECHOE | ECHOKE | ECHOCTL
+    constexpr std::uint64_t lflag_isig = 0x80, lflag_icanon = 0x100;
+    const auto console_input = []() -> host::Handle {
+        using host::process::Standard;
+        const auto input = host::process::standard_handle(Standard::input);
+        if (!input || !host::files::is_console(input)) throw ServiceError{enotty};
+        return input;
     };
-    install("_tcgetattr", [this, console_unsupported](auto& s, auto& m) {
+    const auto console_get = [this, console_input, lflag_echo, lflag_isig, lflag_icanon](transmute::GuestMemory& m, std::uint64_t address) {
+        TerminalShared value{};
+        initialize(value);
+        { std::lock_guard lock(mutex); if (console_attributes) std::memcpy(&value, console_attributes->data(), termios_size); }
+        const auto mode = host::files::console_input_mode(console_input());
+        if (!mode) throw ServiceError{file_failure(mode.error())};
+        value.lflag &= ~(lflag_echo | lflag_isig | lflag_icanon);
+        if (mode->line) value.lflag |= lflag_icanon;
+        if (mode->line && mode->echo) value.lflag |= lflag_echo;
+        if (mode->signals) value.lflag |= lflag_isig;
+        validate(m, address, termios_size, true);
+        m.write_bytes(address, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(&value), termios_size));
+    };
+    const auto console_set = [this, console_input, lflag_isig, lflag_icanon](transmute::GuestMemory& m, std::uint64_t action, std::uint64_t address) {
+        validate(m, address, termios_size, false);
+        std::array<std::uint8_t, termios_size> bytes{};
+        m.read_bytes(address, bytes);
+        TerminalShared value{};
+        std::memcpy(&value, bytes.data(), termios_size);
+        const auto input = console_input();
+        const host::files::ConsoleInputMode mode{(value.lflag & lflag_icanon) != 0, (value.lflag & 0x8) != 0, (value.lflag & lflag_isig) != 0,
+                                                 (value.lflag & lflag_icanon) == 0};
+        if (const auto set = host::files::set_console_input_mode(input, mode); !set) throw ServiceError{file_failure(set.error())};
+        using host::process::Standard;
+        if (const auto output = host::process::standard_handle(Standard::output); output && host::files::is_console(output))
+            static_cast<void>(host::files::enable_console_escape_sequences(output));
+        if ((action & ~0x10ULL) == 2) static_cast<void>(host::files::flush_console_input(input));   // TCSAFLUSH
+        std::lock_guard lock(mutex);
+        console_attributes = bytes;
+    };
+    install("_tcgetattr", [this, console_get](auto& s, auto& m) {
         if (s.x[0] > INT32_MAX) throw ServiceError{ebadf};
         const auto socket = terminal_socket(static_cast<int>(s.x[0]));
-        if (!socket) { if (!is_terminal(static_cast<int>(s.x[0]))) throw ServiceError{enotty}; return console_unsupported("tcgetattr"); }
+        if (!socket) {
+            if (!is_terminal(static_cast<int>(s.x[0]))) throw ServiceError{enotty};
+            console_get(m, s.x[1]);
+            return std::uint64_t{0};
+        }
         validate(m, s.x[1], termios_size, true);
         m.write_bytes(s.x[1], std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(socket->terminal->shared), termios_size));
         return std::uint64_t{0};
     });
-    install("_tcsetattr", [this, console_unsupported](auto& s, auto& m) {
+    install("_tcsetattr", [this, console_set](auto& s, auto& m) {
         if (s.x[0] > INT32_MAX) throw ServiceError{ebadf};
-        const auto socket = terminal_socket(static_cast<int>(s.x[0]));
-        if (!socket) { if (!is_terminal(static_cast<int>(s.x[0]))) throw ServiceError{enotty}; return console_unsupported("tcsetattr"); }
         if ((s.x[1] & ~0x10ULL) > 2) throw ServiceError{einval};   // TCSANOW, TCSADRAIN, TCSAFLUSH (| TCSASOFT)
+        const auto socket = terminal_socket(static_cast<int>(s.x[0]));
+        if (!socket) {
+            if (!is_terminal(static_cast<int>(s.x[0]))) throw ServiceError{enotty};
+            console_set(m, s.x[1], s.x[2]);
+            return std::uint64_t{0};
+        }
         validate(m, s.x[2], termios_size, false);
         std::array<std::uint8_t, termios_size> value{};
         m.read_bytes(s.x[2], value);
