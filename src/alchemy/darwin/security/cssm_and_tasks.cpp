@@ -62,7 +62,7 @@ void CssmAndTasks::install() {
     for (const auto* name : {"_CSSM_CL_CertAbortCache", "_CSSM_CL_CertAbortQuery", "_CSSM_CL_CertCache",
                              "_CSSM_CL_CertGetFirstCachedFieldValue", "_CSSM_CL_FreeFieldValue", "_SecCertificateGetCLHandle",
                              "_SecTrustGetCssmResultCode", "_SecTrustGetResult", "_SecTrustSetParameters",
-                             "_SecTrustSetOCSPResponse", "_SecTrustSetSignedCertificateTimestamps", "_SecKeychainOpen"})
+                             "_SecTrustSetOCSPResponse", "_SecTrustSetSignedCertificateTimestamps"})
         failure(security, name, sec_unimplemented);
     // Keychain event callbacks: registered and removed, never called, because
     // the keychain (the mock keychain) never changes.
@@ -102,16 +102,7 @@ void CssmAndTasks::install() {
         m.write64(s.x[1] + 8, call(core_foundation, "_CFDataGetBytePtr", {bytes}));
         s.x[0] = 0;
     });
-    // Keychain search list and user-interaction state.
-    raw(security, "_SecKeychainCopySearchList", [this](CpuState& s, GuestMemory& m) {
-        if (!s.x[0]) { s.x[0] = status(sec_param); return; }
-        const auto slot = process.allocate_guest(8);
-        std::vector<Address> keychains;
-        if (call(security, "_SecKeychainCopyDefault", {slot}) == 0) keychains.push_back(m.read64(slot));
-        m.write64(s.x[0], cf.array(keychains));
-        for (const auto keychain : keychains) release(keychain);
-        s.x[0] = 0;
-    });
+    // User-interaction state (the keychain search list is keychain.cpp's).
     raw(security, "_SecKeychainGetUserInteractionAllowed", [this](CpuState& s, GuestMemory& m) {
         if (!s.x[0]) { s.x[0] = status(sec_param); return; }
         std::lock_guard lock(mutex);

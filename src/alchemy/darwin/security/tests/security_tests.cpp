@@ -447,6 +447,161 @@ SOCKET connect_to(std::uint16_t port) {
     return socket_handle;
 }
 
+// The legacy keychain API: internet passwords, attribute lists, searches and keychain files.
+void test_legacy_keychain(Fixture& f) {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("alchemy-legacy-keychain-" + std::to_string(GetCurrentProcessId()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto default_path = dir / "login.keychain";
+    SetEnvironmentVariableW(L"ALCHEMY_KEYCHAIN", default_path.c_str());
+    const auto call_regs = [&](std::string_view name, alchemy::CallRegs registers) {
+        return static_cast<std::int32_t>(static_cast<std::uint32_t>(f.engine.invoke_callback_regs(f.symbol(security_library, name), registers).x0));
+    };
+    const auto fourcc = [](const char* text) {
+        return (static_cast<std::uint32_t>(text[0]) << 24) | (static_cast<std::uint32_t>(text[1]) << 16) | (static_cast<std::uint32_t>(text[2]) << 8) |
+               static_cast<std::uint32_t>(text[3]);
+    };
+    const auto read_text = [&](Address data, std::uint32_t length) {
+        std::string text(length, '\0');
+        auto& memory = static_cast<transmute::GuestMemory&>(f.engine);
+        for (std::uint32_t index = 0; index < length; ++index) text[index] = static_cast<char>(memory.read8(data + index));
+        return text;
+    };
+    // A SecKeychainAttributeList of (tag, text) pairs.
+    const auto attribute_list = [&](std::vector<std::pair<std::uint32_t, std::string>> attributes) {
+        const auto array = f.process.allocate_guest(std::max<std::size_t>(attributes.size() * 16, 16)), list = f.process.allocate_guest(16);
+        for (std::size_t index = 0; index < attributes.size(); ++index) {
+            f.engine.write32(array + index * 16, attributes[index].first);
+            f.engine.write32(array + index * 16 + 4, static_cast<std::uint32_t>(attributes[index].second.size()));
+            f.engine.write64(array + index * 16 + 8, attributes[index].second.empty() ? 0 : f.text_buffer(attributes[index].second));
+        }
+        f.engine.write32(list, static_cast<std::uint32_t>(attributes.size()));
+        f.engine.write64(list + 8, array);
+        return list;
+    };
+
+    // 1. An internet password through the legacy API (stack arguments), seen by SecItem too.
+    const auto server = f.text_buffer("example.com"), account = f.text_buffer("artist"), login_path = f.text_buffer("/login");
+    const auto password = f.text_buffer("inet-pw"), item = f.cell();
+    alchemy::CallRegs add{};
+    add.x = {0, 11, server, 0, 0, 6, account, 6};
+    add.push_stack(std::uint64_t{login_path});
+    add.push_stack(std::uint16_t{443});
+    add.push_stack(fourcc("htps"));
+    add.push_stack(fourcc("dflt"));
+    add.push_stack(std::uint32_t{7});
+    add.push_stack(std::uint64_t{password});
+    add.push_stack(std::uint64_t{item});
+    require(call_regs("_SecKeychainAddInternetPassword", add) == 0 && f.engine.read64(item), "SecKeychainAddInternetPassword");
+    require(call_regs("_SecKeychainAddInternetPassword", add) == sec::status::duplicate_item, "a duplicate internet password");
+    const auto attributes_out = f.cell();
+    const auto query = f.dictionary({{f.constant("kSecClass"), f.constant("kSecClassInternetPassword")},
+                                     {f.constant("kSecAttrServer"), f.string("example.com")}, {f.constant("kSecAttrProtocol"), f.constant("kSecAttrProtocolHTTPS")},
+                                     {f.constant("kSecReturnAttributes"), f.cf.boolean(true)}});
+    require(f.status("_SecItemCopyMatching", {query, attributes_out}) == 0, "SecItemCopyMatching sees the legacy internet password");
+    const auto found_attributes = f.engine.read64(attributes_out);
+    require(f.cf.number_value(f.core("_CFDictionaryGetValue", {found_attributes, f.constant("kSecAttrPort")})).value_or(0) == 443 &&
+            f.cf.utf8(f.core("_CFDictionaryGetValue", {found_attributes, f.constant("kSecAttrPath")})) == "/login", "port and path");
+    f.release(found_attributes);
+    // Find with wildcards (empty strings, port 0, protocol 0, any authentication type).
+    const auto length = f.process.allocate_guest(4), data = f.cell(), found_item = f.cell();
+    alchemy::CallRegs find{};
+    find.x = {0, 11, server, 0, 0, 0, 0, 0};
+    find.push_stack(std::uint64_t{0});
+    find.push_stack(std::uint16_t{0});
+    find.push_stack(std::uint32_t{0});
+    find.push_stack(std::uint32_t{0});
+    find.push_stack(std::uint64_t{length});
+    find.push_stack(std::uint64_t{data});
+    find.push_stack(std::uint64_t{found_item});
+    require(call_regs("_SecKeychainFindInternetPassword", find) == 0 && read_text(f.engine.read64(data), f.engine.read32(length)) == "inet-pw",
+            "SecKeychainFindInternetPassword");
+    require(f.status("_SecKeychainItemFreeContent", {0, f.engine.read64(data)}) == 0, "free the password");
+    const auto inet = f.engine.read64(found_item);
+
+    // 2. Attribute lists: CopyAttributesAndData (chosen tags), CopyContent (the caller's list), ModifyAttributesAndData.
+    const auto tags = f.process.allocate_guest(12), info = f.process.allocate_guest(24);
+    f.engine.write32(tags, fourcc("srvr")); f.engine.write32(tags + 4, fourcc("port")); f.engine.write32(tags + 8, fourcc("ptcl"));
+    f.engine.write32(info, 3); f.engine.write64(info + 8, tags); f.engine.write64(info + 16, 0);
+    const auto item_class = f.process.allocate_guest(4), list_out = f.cell();
+    require(f.status("_SecKeychainItemCopyAttributesAndData", {inet, info, item_class, list_out, length, data}) == 0, "SecKeychainItemCopyAttributesAndData");
+    require(f.engine.read32(item_class) == fourcc("inet"), "the item class");
+    const auto list = f.engine.read64(list_out), entries = f.engine.read64(list + 8);
+    require(f.engine.read32(list) == 3 && read_text(f.engine.read64(entries + 8), f.engine.read32(entries + 4)) == "example.com" &&
+            f.engine.read32(f.engine.read64(entries + 16 + 8)) == 443 && f.engine.read32(f.engine.read64(entries + 32 + 8)) == fourcc("htps"),
+            "server, port and protocol attributes");
+    require(read_text(f.engine.read64(data), f.engine.read32(length)) == "inet-pw", "the data with the attributes");
+    require(f.status("_SecKeychainItemFreeAttributesAndData", {list, f.engine.read64(data)}) == 0, "SecKeychainItemFreeAttributesAndData");
+    const auto label = attribute_list({{fourcc("labl"), "Login"}});
+    require(f.status("_SecKeychainItemModifyAttributesAndData", {inet, label, 0, 0}) == 0, "SecKeychainItemModifyAttributesAndData (a label)");
+    const auto content = attribute_list({{fourcc("labl"), ""}, {fourcc("acct"), ""}});
+    require(f.status("_SecKeychainItemCopyContent", {inet, 0, content, 0, 0}) == 0, "SecKeychainItemCopyContent");
+    const auto content_entries = f.engine.read64(content + 8);
+    require(read_text(f.engine.read64(content_entries + 8), f.engine.read32(content_entries + 4)) == "Login" &&
+            read_text(f.engine.read64(content_entries + 24), f.engine.read32(content_entries + 20)) == "artist", "the label and account");
+    require(f.status("_SecKeychainItemFreeContent", {content, 0}) == 0, "free the content");
+
+    // 3. CreateFromContent and a search.
+    const auto generic = attribute_list({{fourcc("svce"), "com.alchemy.legacy"}, {fourcc("acct"), "searcher"}});
+    const auto secret = f.text_buffer("created"), created = f.cell();
+    require(f.status("_SecKeychainItemCreateFromContent", {fourcc("genp"), generic, 7, secret, 0, 0, created}) == 0, "SecKeychainItemCreateFromContent");
+    const auto search = f.cell(), next = f.cell();
+    const auto by_service = attribute_list({{fourcc("svce"), "com.alchemy.legacy"}});
+    require(f.status("_SecKeychainSearchCreateFromAttributes", {0, fourcc("genp"), by_service, search}) == 0, "SecKeychainSearchCreateFromAttributes");
+    require(f.status("_SecKeychainSearchCopyNext", {f.engine.read64(search), next}) == 0 && f.engine.read64(next), "the search finds it");
+    f.release(f.engine.read64(next));
+    require(f.status("_SecKeychainSearchCopyNext", {f.engine.read64(search), next}) == sec::status::item_not_found, "and only it");
+    f.release(f.engine.read64(search));
+
+    // 4. Another keychain file: create, path, status, lock and unlock with its password, the search list, delete.
+    const auto other = dir / "other.keychain";
+    const auto other_guest = f.text_buffer(alchemy::guest_path_string(other));
+    const auto keychain_out = f.cell(), key = f.text_buffer("open sesame"), wrong = f.text_buffer("wrong");
+    require(f.status("_SecKeychainCreate", {other_guest, 11, key, 0, 0, keychain_out}) == 0 && fs::exists(other), "SecKeychainCreate");
+    const auto keychain = f.engine.read64(keychain_out);
+    require(f.status("_SecKeychainCreate", {other_guest, 11, key, 0, 0, keychain_out}) == -25296, "an existing keychain is errSecDuplicateKeychain");
+    const auto path_length = f.process.allocate_guest(4), path_text = f.process.allocate_guest(1024);
+    f.engine.write32(path_length, 1024);
+    require(f.status("_SecKeychainGetPath", {keychain, path_length, path_text}) == 0 &&
+            read_text(path_text, f.engine.read32(path_length)) == alchemy::guest_path_string(other), "SecKeychainGetPath");
+    const auto status_out = f.process.allocate_guest(4);
+    require(f.status("_SecKeychainGetStatus", {keychain, status_out}) == 0 && f.engine.read32(status_out) == 7, "a new keychain is unlocked");
+    const auto service_text = f.text_buffer("com.alchemy.other"), account_text = f.text_buffer("someone"), pw = f.text_buffer("pw2");
+    require(f.status("_SecKeychainAddGenericPassword", {keychain, 17, service_text, 7, account_text, 3, pw, 0}) == 0, "an item in the other keychain");
+    require(f.status("_SecKeychainLock", {keychain}) == 0 && f.status("_SecKeychainGetStatus", {keychain, status_out}) == 0 &&
+            f.engine.read32(status_out) == 6, "SecKeychainLock");
+    require(f.status("_SecKeychainFindGenericPassword", {keychain, 17, service_text, 0, 0, length, data, 0}) == sec::status::interaction_not_allowed,
+            "a locked keychain answers errSecInteractionNotAllowed");
+    require(f.status("_SecKeychainUnlock", {keychain, 5, wrong, 1}) == -25293, "the wrong password is errSecAuthFailed");
+    require(f.status("_SecKeychainUnlock", {keychain, 11, key, 1}) == 0, "SecKeychainUnlock");
+    require(f.status("_SecKeychainFindGenericPassword", {keychain, 17, service_text, 0, 0, length, data, found_item}) == 0 &&
+            read_text(f.engine.read64(data), f.engine.read32(length)) == "pw2", "found after unlocking");
+    require(f.status("_SecKeychainItemFreeContent", {0, f.engine.read64(data)}) == 0, "free");
+    const auto item_keychain = f.cell();
+    require(f.status("_SecKeychainItemCopyKeychain", {f.engine.read64(found_item), item_keychain}) == 0 &&
+            f.status("_SecKeychainGetPath", {f.engine.read64(item_keychain), (f.engine.write32(path_length, 1024), path_length), path_text}) == 0 &&
+            read_text(path_text, f.engine.read32(path_length)) == alchemy::guest_path_string(other), "SecKeychainItemCopyKeychain");
+    require(f.status("_SecKeychainFindGenericPassword", {0, 17, service_text, 0, 0, 0, 0, 0}) == sec::status::item_not_found,
+            "the default search list does not hold the other keychain");
+    const auto default_out = f.cell();
+    require(f.status("_SecKeychainCopyDefault", {default_out}) == 0, "SecKeychainCopyDefault");
+    const auto search_list = sec::bridge()->array({f.engine.read64(default_out), keychain});
+    require(f.status("_SecKeychainSetSearchList", {search_list}) == 0 &&
+            f.status("_SecKeychainFindGenericPassword", {0, 17, service_text, 0, 0, 0, 0, 0}) == 0, "the search list reaches it");
+    const auto list_out2 = f.cell();
+    require(f.status("_SecKeychainCopySearchList", {list_out2}) == 0 && f.cf.length(f.engine.read64(list_out2)) == 2, "SecKeychainCopySearchList");
+    require(f.status("_SecKeychainDelete", {keychain}) == 0 && !fs::exists(other), "SecKeychainDelete");
+    require(f.status("_SecKeychainGetStatus", {keychain, status_out}) == -25294, "a deleted keychain is errSecNoSuchKeychain");
+    const auto reset = sec::bridge()->array({f.engine.read64(default_out)});
+    require(f.status("_SecKeychainSetSearchList", {reset}) == 0, "reset the search list");
+    for (const auto object : {reset, search_list, f.engine.read64(list_out2), f.engine.read64(default_out), f.engine.read64(item_keychain), keychain,
+                              f.engine.read64(created), inet, f.engine.read64(item), query})
+        f.release(object);
+    SetEnvironmentVariableW(L"ALCHEMY_KEYCHAIN", nullptr);
+    fs::remove_all(dir);
+}
+
 void test_secure_transport(Fixture& f, Identity& identity) {
     // SSLReadFunc / SSLWriteFunc over a blocking socket (the connection ref is the SOCKET).
     const auto read_function = f.process.install_function("test_ssl_read", [](transmute::CpuState& s, transmute::GuestMemory& m) {
@@ -867,6 +1022,7 @@ int main() {
         test_trust(fixture, identity);
         test_keys(fixture, identity);
         test_keychain(fixture);
+        test_legacy_keychain(fixture);
         test_secure_transport(fixture, identity);
         test_code_signing(fixture);
         fixture.release(identity.certificate);

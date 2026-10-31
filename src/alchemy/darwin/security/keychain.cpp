@@ -13,18 +13,32 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <cstdio>
 #include <map>
+#include <set>
 #include <variant>
 
 // Keychain items (SecItemAdd / SecItemCopyMatching / SecItemUpdate /
-// SecItemDelete and the SecKeychain generic-password calls) for generic and
-// internet passwords. The items live in one file per Windows user, encrypted
+// SecItemDelete) and the legacy SecKeychain API for generic and internet
+// passwords. The default keychain is one file per Windows user, encrypted
 // with DPAPI for that user: <Alchemy root>/.alchemy/keychain/<user>.alchemy-keychain
 // when an Alchemy root is configured (outside the guest-visible /Applications
 // and /Library), otherwise %LOCALAPPDATA%/Alchemy/keychain/login.alchemy-keychain;
 // ALCHEMY_KEYCHAIN overrides the path. Keys,
 // certificates and identities are not stored: adding them fails with
 // errSecUnimplemented and queries for them find nothing.
+// Legacy API: generic and internet passwords (add / find with their stack
+// arguments), attribute lists (SecKeychainItemCopyAttributesAndData,
+// CopyContent, ModifyAttributesAndData, CreateFromContent and the Free calls),
+// searches (SecKeychainSearchCreateFromAttributes / CopyNext), and keychain
+// files: SecKeychainCreate makes another file in the same encrypted format
+// that also holds a salted PBKDF2 hash of its password, SecKeychainUnlock
+// checks it (errSecAuthFailed), Lock / LockAll lock keychains for this process
+// (items of a locked keychain answer errSecInteractionNotAllowed, as there is
+// no UI to ask for the password), Open, Delete, GetPath, GetStatus,
+// Set / CopySearchList and Set / CopyDefault. The default keychain is
+// protected by the Windows logon, so it unlocks without a password. SecItem
+// calls use the default keychain.
 namespace alchemy::gui::security {
 namespace {
 
@@ -106,7 +120,9 @@ struct Reader {
     std::string text() { const auto value = bytes(); return std::string(value.begin(), value.end()); }
 };
 
-Bytes serialize(const std::vector<Item>& items, std::uint64_t next_id) {
+constexpr std::uint32_t password_trailer = 0x5750434b;   // "KCPW": a created keychain's password hash
+
+Bytes serialize(const std::vector<Item>& items, std::uint64_t next_id, const std::optional<Bytes>& password) {
     Bytes out;
     put64(out, next_id);
     put32(out, static_cast<std::uint32_t>(items.size()));
@@ -128,10 +144,14 @@ Bytes serialize(const std::vector<Item>& items, std::uint64_t next_id) {
             }
         }
     }
+    if (password) {
+        put32(out, password_trailer);
+        put_bytes(out, *password);
+    }
     return out;
 }
 
-bool deserialize(std::span<const std::uint8_t> data, std::vector<Item>& items, std::uint64_t& next_id) {
+bool deserialize(std::span<const std::uint8_t> data, std::vector<Item>& items, std::uint64_t& next_id, std::optional<Bytes>& password) {
     Reader in{data};
     next_id = in.number(8);
     const auto count = in.number(4);
@@ -158,6 +178,10 @@ bool deserialize(std::span<const std::uint8_t> data, std::vector<Item>& items, s
         }
         items.push_back(std::move(item));
     }
+    if (in.ok && in.at < data.size()) {
+        if (in.number(4) != password_trailer) return false;
+        password = in.bytes();
+    }
     return in.ok && in.at == data.size();
 }
 
@@ -166,7 +190,7 @@ const std::uint8_t entropy_bytes[] = {'A', 'l', 'c', 'h', 'e', 'm', 'y', ' ', 'k
 // The decrypted store, held while the process-wide and cross-process locks are held.
 class Store {
 public:
-    Store() : path_(keychain_path()) {
+    explicit Store(std::filesystem::path path = keychain_path()) : path_(std::move(path)) {
         // Shared by name with other Alchemy processes of this login session.
         auto mutex = host::sync::create_mutex("Alchemy.Keychain." + std::to_string(std::hash<std::wstring>{}(path_.wstring())));
         if (!mutex) fail("cannot create the keychain lock");
@@ -181,9 +205,11 @@ public:
 
     std::vector<Item> items;
     std::uint64_t next_id{1};
+    std::optional<Bytes> password;   // salt (16 bytes) and PBKDF2-SHA256 (32 bytes); none for the default keychain
+    bool existed{};
 
     void save() {
-        auto plain = serialize(items, next_id);
+        auto plain = serialize(items, next_id, password);
         const auto sealed = host::crypto::protect(std::as_bytes(std::span(plain)), std::as_bytes(std::span(entropy_bytes)), "Alchemy keychain");
         host::crypto::secure_zero(std::as_writable_bytes(std::span(plain)));
         if (!sealed) fail("the keychain cannot be encrypted (" + std::string(host::name(sealed.error())) + ")");
@@ -209,13 +235,14 @@ private:
     void load() {
         std::error_code error;
         if (!std::filesystem::exists(path_, error)) return;
+        existed = true;
         std::ifstream file(path_, std::ios::binary);
         Bytes content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         if (content.size() < file_magic.size() || std::memcmp(content.data(), file_magic.data(), file_magic.size()) != 0)
             fail("the keychain file is not an Alchemy keychain: " + narrow(path_.wstring()));
         auto plain = host::crypto::unprotect(std::as_bytes(std::span(content).subspan(file_magic.size())), std::as_bytes(std::span(entropy_bytes)));
         if (!plain) fail("the keychain cannot be decrypted for this user (" + std::string(host::name(plain.error())) + ")");
-        const bool ok = deserialize(std::span(*plain), items, next_id);
+        const bool ok = deserialize(std::span(*plain), items, next_id, password);
         host::crypto::secure_zero(std::as_writable_bytes(std::span(*plain)));
         if (!ok) fail("the keychain file is corrupt");
     }
@@ -224,6 +251,76 @@ private:
 };
 
 std::mutex process_mutex;
+
+// Keychains this process has locked (by host path); the default keychain unlocks without a password.
+std::mutex lock_mutex;
+std::set<std::wstring> locked_keychains;
+bool is_locked(const std::filesystem::path& path) {
+    std::lock_guard lock(lock_mutex);
+    return locked_keychains.contains(path.wstring());
+}
+
+constexpr std::int32_t err_auth_failed = -25293, err_no_such_keychain = -25294, err_duplicate_keychain = -25296,
+    err_buffer_too_small = -25301, err_no_such_attribute = -25303, err_no_such_class = -25306;
+constexpr std::uint32_t pbkdf2_rounds = 20000;
+
+// A keychain password record: a random salt and PBKDF2-SHA256 of the password.
+std::optional<Bytes> password_record(std::span<const std::uint8_t> password) {
+    Bytes record(16 + 32);
+    if (!host::crypto::random(std::as_writable_bytes(std::span(record).first(16)))) return std::nullopt;
+    if (!host::crypto::pbkdf2(host::crypto::Digest::sha256, std::as_bytes(password), std::as_bytes(std::span(record).first(16)),
+                              pbkdf2_rounds, std::as_writable_bytes(std::span(record).subspan(16))))
+        return std::nullopt;
+    return record;
+}
+bool password_matches(const Bytes& record, std::span<const std::uint8_t> password) {
+    if (record.size() != 48) return false;
+    Bytes hash(32);
+    if (!host::crypto::pbkdf2(host::crypto::Digest::sha256, std::as_bytes(password), std::as_bytes(std::span(record).first(16)),
+                              pbkdf2_rounds, std::as_writable_bytes(std::span(hash))))
+        return false;
+    return std::equal(hash.begin(), hash.end(), record.begin() + 16);
+}
+
+// Legacy FourCharCode tags and the store's attribute names / value kinds.
+std::string four_cc(std::uint32_t code) {
+    return {static_cast<char>(code >> 24), static_cast<char>(code >> 16), static_cast<char>(code >> 8), static_cast<char>(code)};
+}
+std::uint32_t four_cc(std::string_view text) {
+    std::uint32_t code = 0;
+    for (std::size_t index = 0; index < 4; ++index) code = (code << 8) | static_cast<std::uint8_t>(index < text.size() ? text[index] : ' ');
+    return code;
+}
+enum class TagKind { text, blob, number, four_char_text, boolean, date };
+TagKind tag_kind(std::string_view tag) {
+    if (tag == "port" || tag == "crtr" || tag == "type" || tag == "scrp") return TagKind::number;
+    if (tag == "ptcl" || tag == "atyp") return TagKind::four_char_text;
+    if (tag == "invi" || tag == "nega" || tag == "cusi") return TagKind::boolean;
+    if (tag == "cdat" || tag == "mdat") return TagKind::date;
+    if (tag == "gena" || tag == "alis" || tag == "sign" || tag == "addr") return TagKind::blob;
+    return TagKind::text;
+}
+// "YYYYMMDDhhmmssZ" (the legacy date attribute) for a CFAbsoluteTime.
+std::string legacy_date(double absolute) {
+    auto seconds = static_cast<std::int64_t>(absolute) + 978307200;
+    auto days = seconds / 86400;
+    seconds -= days * 86400;
+    if (seconds < 0) { seconds += 86400; --days; }
+    days += 719468;
+    const auto era = (days >= 0 ? days : days - 146096) / 146097;
+    const auto day_of_era = days - era * 146097;
+    const auto year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    const auto day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    const auto mp = (5 * day_of_year + 2) / 153;
+    const auto day = day_of_year - (153 * mp + 2) / 5 + 1;
+    const auto month = mp < 10 ? mp + 3 : mp - 9;
+    const auto year = year_of_era + era * 400 + (month <= 2 ? 1 : 0);
+    char text[32];
+    std::snprintf(text, sizeof(text), "%04lld%02lld%02lld%02lld%02lld%02lldZ", static_cast<long long>(year), static_cast<long long>(month),
+                  static_cast<long long>(day), static_cast<long long>(seconds / 3600), static_cast<long long>(seconds / 60 % 60),
+                  static_cast<long long>(seconds % 60));
+    return text;
+}
 
 // Primary-key attributes (duplicate detection).
 const std::vector<std::string>& primary_keys(const std::string& cls) {
@@ -282,7 +379,15 @@ std::optional<std::uint64_t> persistent_id(const Bytes& value) {
     return id;
 }
 
-struct KeychainItemState final : ObjectPayload { std::uint64_t id{}; };
+struct KeychainItemState final : ObjectPayload { std::uint64_t id{}; std::filesystem::path keychain; };   // empty: the default keychain
+struct KeychainState final : ObjectPayload { std::filesystem::path path; };                          // empty: the default keychain
+struct SearchState final : ObjectPayload {
+    std::vector<std::filesystem::path> keychains;
+    std::string cls;
+    std::map<std::string, Value> attributes;
+    std::size_t keychain{};      // the keychain being searched
+    std::uint64_t after{};       // the last item returned from it
+};
 
 struct Keychain {
     Security& sec;
@@ -400,6 +505,7 @@ struct Keychain {
     std::int32_t add(Address attributes, Address result_out) {
         auto query = parse(attributes, true);
         if (query.status) return query.status;
+        if (is_locked(keychain_path())) return status::interaction_not_allowed;
         if (!supported_class(query.cls)) return query.cls == "keys" || query.cls == "cert" || query.cls == "idnt" ? status::unimplemented : status::param;
         if (query.persistent) return status::param;
         std::lock_guard lock(process_mutex);
@@ -425,6 +531,7 @@ struct Keychain {
     std::int32_t copy_matching(Address dictionary, Address result_out) {
         auto query = parse(dictionary, false);
         if (query.status) return query.status;
+        if (is_locked(keychain_path())) return status::interaction_not_allowed;
         if (!supported_class(query.cls)) return status::item_not_found;   // no keys / certificates / identities are stored
         std::vector<Item> found;
         {
@@ -524,10 +631,11 @@ struct Keychain {
         m.read_bytes(pointer, bytes);
         return std::string(bytes.begin(), bytes.end());
     }
-    Address item_ref(std::uint64_t id) {
+    Address item_ref(std::uint64_t id, const std::filesystem::path& keychain = {}) {
         const auto object = b.objc.allocate(item_class);
         auto state = std::make_shared<KeychainItemState>();
         state->id = id;
+        state->keychain = keychain;
         static_cast<void>(b.objc.host_state<KeychainItemState>(object, [&] { return state; }));
         return object;
     }
@@ -535,6 +643,192 @@ struct Keychain {
         const auto state = object ? b.objc.find_host_state<KeychainItemState>(object) : nullptr;
         if (!state) return std::nullopt;
         return state->id;
+    }
+    std::filesystem::path item_keychain(Address object) {
+        const auto state = object ? b.objc.find_host_state<KeychainItemState>(object) : nullptr;
+        return state && !state->keychain.empty() ? state->keychain : keychain_path();
+    }
+
+    // ---- keychains ---------------------------------------------------------------------------------------
+    std::optional<std::filesystem::path> default_override;
+    std::vector<std::filesystem::path> search_list;   // empty: the default keychain alone
+
+    std::filesystem::path default_path() { return default_override.value_or(keychain_path()); }
+    // The host path of a SecKeychainRef (nullopt when it is not one).
+    std::optional<std::filesystem::path> path_of(Address object) {
+        const auto state = object ? b.objc.find_host_state<KeychainState>(object) : nullptr;
+        if (!state) return std::nullopt;
+        return state->path.empty() ? default_path() : state->path;
+    }
+    Address keychain_object(const std::filesystem::path& path) {   // +1
+        const auto object = b.objc.allocate(keychain_class);
+        auto state = std::make_shared<KeychainState>();
+        state->path = path;
+        static_cast<void>(b.objc.host_state<KeychainState>(object, [&] { return state; }));
+        return object;
+    }
+    std::vector<std::filesystem::path> searched() { return search_list.empty() ? std::vector{default_path()} : search_list; }
+    // keychainOrArray: NULL (the search list), a keychain, or an array of keychains. nullopt for anything else.
+    std::optional<std::vector<std::filesystem::path>> keychains_of(Address value) {
+        if (!value) return searched();
+        if (const auto path = path_of(value)) return std::vector{*path};
+        if (!b.is_array(value)) return std::nullopt;
+        std::vector<std::filesystem::path> paths;
+        for (const auto item : b.cf.array_values(value)) {
+            const auto path = path_of(item);
+            if (!path) return std::nullopt;
+            paths.push_back(*path);
+        }
+        return paths;
+    }
+    // A guest path to the host (the Alchemy root, /Volumes/<drive>/, else as given).
+    static std::filesystem::path host_of(const std::string& guest) {
+        if (guest.size() > 10 && guest.starts_with("/Volumes/") && guest[10] == '/') return utf8_path(std::string(1, guest[9]) + ":" + guest.substr(10));
+        if (auto mapped = guest_root_host_path(guest)) return *mapped;
+        return utf8_path(guest);
+    }
+    std::string guest_c_string(GuestMemory& m, Address pointer) {
+        std::string text;
+        for (std::size_t index = 0; pointer && index < 4096; ++index) {
+            const auto c = static_cast<char>(m.read8(pointer + index));
+            if (!c) break;
+            text += c;
+        }
+        return text;
+    }
+
+    // ---- attribute lists ---------------------------------------------------------------------------------
+    // SecKeychainAttributeList {UInt32 count; SecKeychainAttribute *attr}; SecKeychainAttribute {tag; UInt32 length; void *data}.
+    std::optional<std::map<std::string, Value>> read_attributes(GuestMemory& m, Address list) {
+        std::map<std::string, Value> attributes;
+        if (!list) return attributes;
+        const auto count = m.read32(list);
+        const auto array = m.read64(list + 8);
+        if (count > 256 || (count && !array)) return std::nullopt;
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const auto entry = array + index * 16ULL;
+            const auto tag = four_cc(m.read32(entry));
+            const auto length = m.read32(entry + 4);
+            const auto data = m.read64(entry + 8);
+            if (length > (1U << 20) || (length && !data)) return std::nullopt;
+            Bytes bytes(length);
+            if (length) m.read_bytes(data, bytes);
+            Value value;
+            switch (tag_kind(tag)) {
+            case TagKind::text: case TagKind::date:
+                value.kind = Value::Kind::string;
+                value.text.assign(bytes.begin(), bytes.end());
+                while (!value.text.empty() && value.text.back() == 0) value.text.pop_back();
+                if (tag_kind(tag) == TagKind::date) continue;   // creation / modification dates are the store's own
+                break;
+            case TagKind::blob: value.kind = Value::Kind::data; value.bytes = bytes; break;
+            case TagKind::number: case TagKind::boolean: case TagKind::four_char_text: {
+                std::uint32_t number = 0;
+                for (std::size_t at = 0; at < std::min<std::size_t>(4, bytes.size()); ++at) number |= static_cast<std::uint32_t>(bytes[at]) << (8 * at);
+                if (tag_kind(tag) == TagKind::four_char_text) { value.kind = Value::Kind::string; value.text = four_cc(number); }
+                else { value.kind = tag_kind(tag) == TagKind::boolean ? Value::Kind::boolean : Value::Kind::integer; value.integer = number; }
+                break;
+            }
+            }
+            attributes[tag] = std::move(value);
+        }
+        return attributes;
+    }
+    // The legacy bytes of one attribute of an item (nullopt when the item has none).
+    std::optional<Bytes> attribute_bytes(const Item& item, const std::string& tag) {
+        if (tag == "cdat" || tag == "mdat") {
+            const auto text = legacy_date(tag == "cdat" ? item.created : item.modified);
+            Bytes bytes(text.begin(), text.end());
+            bytes.push_back(0);
+            return bytes;
+        }
+        const auto found = item.attributes.find(tag);
+        if (found == item.attributes.end()) return std::nullopt;
+        const auto& value = found->second;
+        const auto number_bytes = [](std::uint32_t number) {
+            return Bytes{static_cast<std::uint8_t>(number), static_cast<std::uint8_t>(number >> 8), static_cast<std::uint8_t>(number >> 16),
+                         static_cast<std::uint8_t>(number >> 24)};
+        };
+        switch (tag_kind(tag)) {
+        case TagKind::four_char_text: return number_bytes(four_cc(value.text));
+        case TagKind::number: case TagKind::boolean: return number_bytes(static_cast<std::uint32_t>(value.integer));
+        default:
+            if (value.kind == Value::Kind::data) return value.bytes;
+            return Bytes(value.text.begin(), value.text.end());
+        }
+    }
+    // Guest allocations handed out for attribute lists, freed by SecKeychainItemFreeAttributesAndData.
+    std::shared_ptr<std::mutex> allocations_mutex = std::make_shared<std::mutex>();   // (the struct is copied once)
+    std::map<Address, std::vector<Address>> list_allocations;
+    Address guest_copy(std::span<const std::uint8_t> bytes) {
+        const auto address = b.process.allocate_guest(std::max<std::size_t>(bytes.size(), 1));
+        if (!bytes.empty()) b.memory().write_bytes(address, bytes);
+        return address;
+    }
+
+    // ---- store access --------------------------------------------------------------------------------------
+    // Runs `work` on the store of `path`; errSecNoSuchKeychain when the file does not exist (other than the
+    // default keychain), errSecInteractionNotAllowed when this process locked it.
+    template <class Work>
+    std::int32_t with_store(const std::filesystem::path& path, bool must_exist, Work work) {
+        if (is_locked(path)) return status::interaction_not_allowed;
+        std::lock_guard lock(process_mutex);
+        Store store(path);
+        if (must_exist && !store.existed && path != default_path() && path != keychain_path()) return err_no_such_keychain;
+        return work(store);
+    }
+    bool legacy_class(std::uint32_t code, std::string& cls) {
+        cls = four_cc(code);
+        return cls == "genp" || cls == "inet";
+    }
+    bool matches_all(const Item& item, const std::string& cls, const std::map<std::string, Value>& attributes) {
+        if (item.cls != cls) return false;
+        for (const auto& [name, value] : attributes)
+            if (!(primary_value(item, name) == value)) return false;
+        return true;
+    }
+    // The first item (by id after `after`) in `paths` that matches; nullopt when none does.
+    std::optional<std::pair<Item, std::filesystem::path>> find_first(const std::vector<std::filesystem::path>& paths, const std::string& cls,
+                                                                    const std::map<std::string, Value>& attributes, std::int32_t& error) {
+        error = 0;
+        for (const auto& path : paths) {
+            std::optional<Item> found;
+            const auto status = with_store(path, true, [&](Store& store) {
+                for (const auto& item : store.items)
+                    if (matches_all(item, cls, attributes)) { found = item; break; }
+                return status::success;
+            });
+            if (status == status::interaction_not_allowed) { error = status; return std::nullopt; }
+            if (found) return std::make_pair(*found, path);
+        }
+        return std::nullopt;
+    }
+    // Adds an item to `path`'s keychain; its id, or the error.
+    std::int32_t add_item(const std::filesystem::path& path, Item item, std::uint64_t& id) {
+        return with_store(path, true, [&](Store& store) {
+            item.id = store.next_id++;
+            item.created = item.modified = CoreFoundation::absolute_time_now();
+            for (const auto& other : store.items) if (duplicates(item, other)) return status::duplicate_item;
+            store.items.push_back(item);
+            store.save();
+            id = item.id;
+            return status::success;
+        });
+    }
+    std::optional<Item> item_of(Address object, std::int32_t& error) {
+        const auto id = item_id(object);
+        if (!id) { error = status::param; return std::nullopt; }
+        std::optional<Item> found;
+        error = with_store(item_keychain(object), true, [&](Store& store) {
+            for (const auto& item : store.items) if (item.id == *id) { found = item; return status::success; }
+            return status::item_not_found;
+        });
+        return found;
+    }
+    // Writes a found password: *length, *data (a guest copy, freed by SecKeychainItemFreeContent).
+    void write_secret(GuestMemory& m, const Item& item, Address length_out, Address data_out) {
+        if (length_out) m.write32(length_out, static_cast<std::uint32_t>(item.secret.size()));
+        if (data_out) m.write64(data_out, guest_copy(item.secret));
     }
 };
 
@@ -589,7 +883,8 @@ void install_keychain(Security& sec) {
     b.function(lib, "_SecKeychainItemGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(TypeId::keychain_item); });
     b.function(lib, "_SecKeychainCopyDefault", [self](CpuState& s, GuestMemory& m) {
         if (!s.x[0]) { s.x[0] = status_value(status::param); return; }
-        if (!self->default_keychain) self->default_keychain = self->b.objc.allocate(self->keychain_class);
+        if (self->default_override) { m.write64(s.x[0], self->keychain_object(*self->default_override)); s.x[0] = 0; return; }
+        if (!self->default_keychain) self->default_keychain = self->keychain_object({});
         m.write64(s.x[0], self->b.retain(self->default_keychain));
         s.x[0] = 0;
     });
@@ -604,81 +899,398 @@ void install_keychain(Security& sec) {
         item.secret.resize(static_cast<std::size_t>(s.x[5]));
         if (!item.secret.empty()) m.read_bytes(s.x[6], item.secret);
         const auto out = s.x[7];
+        const auto path = s.x[0] ? self->path_of(s.x[0]) : std::optional(self->default_path());
+        if (!path) { s.x[0] = status_value(status::param); return; }
         std::uint64_t id{};
-        {
-            std::lock_guard lock(process_mutex);
-            Store store;
-            item.id = store.next_id++;
-            item.created = item.modified = CoreFoundation::absolute_time_now();
-            for (const auto& other : store.items) if (duplicates(item, other)) { s.x[0] = status_value(status::duplicate_item); return; }
-            store.items.push_back(item);
-            store.save();
-            id = item.id;
-        }
-        if (out) m.write64(out, self->item_ref(id));
+        if (const auto status = self->add_item(*path, std::move(item), id)) { s.x[0] = status_value(status); return; }
+        if (out) m.write64(out, self->item_ref(id, *path));
         s.x[0] = 0;
     });
     // OSStatus SecKeychainFindGenericPassword(keychainOrArray, serviceNameLength, serviceName,
     //     accountNameLength, accountName, UInt32 *passwordLength, void **passwordData, itemRef *)
     b.function(lib, "_SecKeychainFindGenericPassword", [self](CpuState& s, GuestMemory& m) {
-        const auto service = self->guest_text(m, s.x[2], s.x[1]), account = self->guest_text(m, s.x[4], s.x[3]);
-        std::optional<Item> found;
-        {
-            std::lock_guard lock(process_mutex);
-            Store store;
-            for (const auto& item : store.items) {
-                if (item.cls != "genp") continue;
-                if (!service.empty() && !(primary_value(item, "svce") == Value{Value::Kind::string, service})) continue;
-                if (!account.empty() && !(primary_value(item, "acct") == Value{Value::Kind::string, account})) continue;
-                found = item;
-                break;
-            }
-        }
-        if (!found) { s.x[0] = status_value(status::item_not_found); return; }
-        if (s.x[5]) m.write32(s.x[5], static_cast<std::uint32_t>(found->secret.size()));
-        if (s.x[6]) {
-            const auto buffer = self->b.process.allocate_guest(std::max<std::size_t>(found->secret.size(), 1));
-            if (!found->secret.empty()) m.write_bytes(buffer, found->secret);
-            m.write64(s.x[6], buffer);
-        }
-        if (s.x[7]) m.write64(s.x[7], self->item_ref(found->id));
+        const auto keychains = self->keychains_of(s.x[0]);
+        if (!keychains) { s.x[0] = status_value(status::param); return; }
+        std::map<std::string, Value> attributes;
+        if (const auto service = self->guest_text(m, s.x[2], s.x[1]); !service.empty()) attributes["svce"] = Value{Value::Kind::string, service};
+        if (const auto account = self->guest_text(m, s.x[4], s.x[3]); !account.empty()) attributes["acct"] = Value{Value::Kind::string, account};
+        std::int32_t error{};
+        const auto found = self->find_first(*keychains, "genp", attributes, error);
+        if (!found) { s.x[0] = status_value(error ? error : status::item_not_found); return; }
+        self->write_secret(m, found->first, s.x[5], s.x[6]);
+        if (s.x[7]) m.write64(s.x[7], self->item_ref(found->first.id, found->second));
         s.x[0] = 0;
     });
-    b.function(lib, "_SecKeychainItemFreeContent", [self](CpuState& s, GuestMemory&) {
-        if (s.x[0]) { s.x[0] = status_value(status::unimplemented); return; }   // attribute lists are never returned
+    // (SecKeychainAttributeList *attrList, void *data): the attribute data SecKeychainItemCopyContent filled in, and the password.
+    b.function(lib, "_SecKeychainItemFreeContent", [self](CpuState& s, GuestMemory& m) {
+        if (s.x[0]) {
+            const auto count = m.read32(s.x[0]);
+            const auto array = m.read64(s.x[0] + 8);
+            for (std::uint32_t index = 0; index < count && array; ++index)
+                if (const auto data = m.read64(array + index * 16ULL + 8)) {
+                    self->b.process.release_guest(data);
+                    m.write64(array + index * 16ULL + 8, 0);
+                }
+        }
         if (s.x[1]) self->b.process.release_guest(s.x[1]);
         s.x[0] = 0;
     });
     b.function(lib, "_SecKeychainItemDelete", [self](CpuState& s, GuestMemory&) {
         const auto id = self->item_id(s.x[0]);
         if (!id) { s.x[0] = status_value(status::param); return; }
-        std::lock_guard lock(process_mutex);
-        Store store;
-        const auto before = store.items.size();
-        std::erase_if(store.items, [&](const Item& item) { return item.id == *id; });
-        if (store.items.size() == before) { s.x[0] = status_value(status::item_not_found); return; }
-        store.save();
-        s.x[0] = 0;
+        s.x[0] = status_value(self->with_store(self->item_keychain(s.x[0]), true, [&](Store& store) {
+            const auto before = store.items.size();
+            std::erase_if(store.items, [&](const Item& item) { return item.id == *id; });
+            if (store.items.size() == before) return status::item_not_found;
+            store.save();
+            return status::success;
+        }));
     });
-    // Only the password data can be changed (attribute lists are not supported).
+    // (itemRef, const SecKeychainAttributeList *attrList, UInt32 length, const void *data)
     b.function(lib, "_SecKeychainItemModifyAttributesAndData", [self](CpuState& s, GuestMemory& m) {
         const auto id = self->item_id(s.x[0]);
         if (!id) { s.x[0] = status_value(status::param); return; }
-        if (s.x[1]) { s.x[0] = status_value(status::unimplemented); return; }
-        if (s.x[2] > (1U << 24)) { s.x[0] = status_value(status::param); return; }
+        const auto attributes = self->read_attributes(m, s.x[1]);
+        if (!attributes || s.x[2] > (1U << 24)) { s.x[0] = status_value(status::param); return; }
         Bytes secret(static_cast<std::size_t>(s.x[2]));
         if (!secret.empty()) m.read_bytes(s.x[3], secret);
-        std::lock_guard lock(process_mutex);
-        Store store;
-        for (auto& item : store.items) {
-            if (item.id != *id) continue;
-            if (s.x[3]) item.secret = secret;
-            item.modified = CoreFoundation::absolute_time_now();
-            store.save();
-            s.x[0] = 0;
+        const bool set_secret = s.x[3] != 0;
+        s.x[0] = status_value(self->with_store(self->item_keychain(s.x[0]), true, [&](Store& store) {
+            for (auto& item : store.items) {
+                if (item.id != *id) continue;
+                const auto before = item;
+                for (const auto& [name, value] : *attributes) item.attributes[name] = value;
+                if (set_secret) item.secret = secret;
+                item.modified = CoreFoundation::absolute_time_now();
+                for (const auto& other : store.items)
+                    if (duplicates(item, other)) { item = before; return status::duplicate_item; }
+                store.save();
+                return status::success;
+            }
+            return status::item_not_found;
+        }));
+    });
+
+    // ---- internet passwords ----
+    // (keychain, serverNameLength, serverName, securityDomainLength, securityDomain, accountNameLength, accountName,
+    //  pathLength, [stack] path, UInt16 port, SecProtocolType, SecAuthenticationType, UInt32 passwordLength,
+    //  const void *passwordData, SecKeychainItemRef *): the stack arguments at their natural alignment.
+    const auto internet_attributes = [self](CpuState& s, GuestMemory& m) {
+        std::map<std::string, Value> attributes;
+        const auto text = [&](const char* tag, Address pointer, Address length) {
+            if (const auto value = self->guest_text(m, pointer, length); !value.empty()) attributes[tag] = Value{Value::Kind::string, value};
+        };
+        text("srvr", s.x[2], s.x[1]);
+        text("sdmn", s.x[4], s.x[3]);
+        text("acct", s.x[6], s.x[5]);
+        text("path", m.read64(s.sp), s.x[7]);
+        if (const auto port = m.read32(s.sp + 8) & 0xffff) { Value value; value.kind = Value::Kind::integer; value.integer = port; attributes["port"] = value; }
+        if (const auto protocol = m.read32(s.sp + 12)) attributes["ptcl"] = Value{Value::Kind::string, four_cc(protocol)};
+        if (const auto type = m.read32(s.sp + 16)) attributes["atyp"] = Value{Value::Kind::string, four_cc(type)};
+        return attributes;
+    };
+    b.function(lib, "_SecKeychainAddInternetPassword", [self, internet_attributes](CpuState& s, GuestMemory& m) {
+        Item item;
+        item.cls = "inet";
+        item.attributes = internet_attributes(s, m);
+        const auto length = m.read32(s.sp + 20);
+        const auto data = m.read64(s.sp + 24), out = m.read64(s.sp + 32);
+        if (length > (1U << 24) || (length && !data)) { s.x[0] = status_value(status::param); return; }
+        item.secret.resize(length);
+        if (length) m.read_bytes(data, item.secret);
+        const auto path = s.x[0] ? self->path_of(s.x[0]) : std::optional(self->default_path());
+        if (!path) { s.x[0] = status_value(status::param); return; }
+        std::uint64_t id{};
+        if (const auto status = self->add_item(*path, std::move(item), id)) { s.x[0] = status_value(status); return; }
+        if (out) m.write64(out, self->item_ref(id, *path));
+        s.x[0] = 0;
+    });
+    // As SecKeychainAddInternetPassword, with [stack] UInt32 *passwordLength (sp + 24), void **passwordData, itemRef *.
+    // Empty strings, port 0, protocol 0 and authentication type 0 match any value.
+    b.function(lib, "_SecKeychainFindInternetPassword", [self, internet_attributes](CpuState& s, GuestMemory& m) {
+        const auto keychains = self->keychains_of(s.x[0]);
+        if (!keychains) { s.x[0] = status_value(status::param); return; }
+        std::int32_t error{};
+        const auto found = self->find_first(*keychains, "inet", internet_attributes(s, m), error);
+        if (!found) { s.x[0] = status_value(error ? error : status::item_not_found); return; }
+        self->write_secret(m, found->first, m.read64(s.sp + 24), m.read64(s.sp + 32));
+        if (const auto out = m.read64(s.sp + 40)) m.write64(out, self->item_ref(found->first.id, found->second));
+        s.x[0] = 0;
+    });
+
+    // ---- attribute lists ----
+    // (itemRef, SecKeychainAttributeInfo *info, SecItemClass *itemClass, SecKeychainAttributeList **attrList,
+    //  UInt32 *length, void **outData). info {UInt32 count; UInt32 *tag; UInt32 *format}; NULL: every attribute.
+    b.function(lib, "_SecKeychainItemCopyAttributesAndData", [self](CpuState& s, GuestMemory& m) {
+        std::int32_t error{};
+        const auto item = self->item_of(s.x[0], error);
+        if (!item) { s.x[0] = status_value(error); return; }
+        std::vector<std::string> tags;
+        if (s.x[1]) {
+            const auto count = m.read32(s.x[1]);
+            const auto list = m.read64(s.x[1] + 8);
+            if (count > 256 || (count && !list)) { s.x[0] = status_value(status::param); return; }
+            for (std::uint32_t index = 0; index < count; ++index) tags.push_back(four_cc(m.read32(list + index * 4ULL)));
+        } else {
+            for (const auto& [name, value] : item->attributes) if (name.size() == 4) tags.push_back(name);
+            tags.push_back("cdat");
+            tags.push_back("mdat");
+        }
+        if (s.x[2]) m.write32(s.x[2], four_cc(item->cls));
+        if (s.x[3]) {
+            std::vector<Address> allocations;
+            const auto array = self->b.process.allocate_guest(std::max<std::size_t>(tags.size() * 16, 16));
+            allocations.push_back(array);
+            for (std::size_t index = 0; index < tags.size(); ++index) {
+                const auto entry = array + index * 16;
+                const auto bytes = self->attribute_bytes(*item, tags[index]);
+                m.write32(entry, four_cc(tags[index]));
+                m.write32(entry + 4, bytes ? static_cast<std::uint32_t>(bytes->size()) : 0);
+                Address data{};
+                if (bytes && !bytes->empty()) { data = self->guest_copy(*bytes); allocations.push_back(data); }
+                m.write64(entry + 8, data);
+            }
+            const auto list = self->b.process.allocate_guest(16);
+            m.write32(list, static_cast<std::uint32_t>(tags.size()));
+            m.write64(list + 8, array);
+            {
+                std::lock_guard lock(*self->allocations_mutex);
+                self->list_allocations[list] = std::move(allocations);
+            }
+            m.write64(s.x[3], list);
+        }
+        self->write_secret(m, *item, s.x[4], s.x[5]);
+        s.x[0] = 0;
+    });
+    // (SecKeychainAttributeList *attrList, void *data)
+    b.function(lib, "_SecKeychainItemFreeAttributesAndData", [self](CpuState& s, GuestMemory&) {
+        if (s.x[0]) {
+            std::vector<Address> allocations;
+            {
+                std::lock_guard lock(*self->allocations_mutex);
+                const auto found = self->list_allocations.find(s.x[0]);
+                if (found == self->list_allocations.end()) { s.x[0] = status_value(status::param); return; }
+                allocations = std::move(found->second);
+                self->list_allocations.erase(found);
+            }
+            for (const auto address : allocations) self->b.process.release_guest(address);
+            self->b.process.release_guest(s.x[0]);
+        }
+        if (s.x[1]) self->b.process.release_guest(s.x[1]);
+        s.x[0] = 0;
+    });
+    // (itemRef, SecItemClass *itemClass, SecKeychainAttributeList *attrList (the caller's tags, filled in),
+    //  UInt32 *length, void **outData)
+    b.function(lib, "_SecKeychainItemCopyContent", [self](CpuState& s, GuestMemory& m) {
+        std::int32_t error{};
+        const auto item = self->item_of(s.x[0], error);
+        if (!item) { s.x[0] = status_value(error); return; }
+        if (s.x[1]) m.write32(s.x[1], four_cc(item->cls));
+        if (s.x[2]) {
+            const auto count = m.read32(s.x[2]);
+            const auto array = m.read64(s.x[2] + 8);
+            if (count > 256 || (count && !array)) { s.x[0] = status_value(status::param); return; }
+            for (std::uint32_t index = 0; index < count; ++index) {
+                const auto entry = array + index * 16ULL;
+                const auto bytes = self->attribute_bytes(*item, four_cc(m.read32(entry)));
+                m.write32(entry + 4, bytes ? static_cast<std::uint32_t>(bytes->size()) : 0);
+                m.write64(entry + 8, bytes && !bytes->empty() ? self->guest_copy(*bytes) : 0);
+            }
+        }
+        self->write_secret(m, *item, s.x[3], s.x[4]);
+        s.x[0] = 0;
+    });
+    // (SecItemClass, SecKeychainAttributeList *attrList, UInt32 length, const void *data, keychain,
+    //  SecAccessRef initialAccess, SecKeychainItemRef *itemRef)
+    b.function(lib, "_SecKeychainItemCreateFromContent", [self](CpuState& s, GuestMemory& m) {
+        Item item;
+        if (!self->legacy_class(static_cast<std::uint32_t>(s.x[0]), item.cls)) {
+            s.x[0] = status_value(s.x[0] == 0x80001000 || s.x[0] == 0x0f || s.x[0] == 0x10 || s.x[0] == 0x11 ? status::unimplemented : err_no_such_class);
             return;
         }
+        auto attributes = self->read_attributes(m, s.x[1]);
+        if (!attributes || s.x[2] > (1U << 24) || (s.x[2] && !s.x[3])) { s.x[0] = status_value(status::param); return; }
+        item.attributes = std::move(*attributes);
+        item.secret.resize(static_cast<std::size_t>(s.x[2]));
+        if (!item.secret.empty()) m.read_bytes(s.x[3], item.secret);
+        const auto path = s.x[4] ? self->path_of(s.x[4]) : std::optional(self->default_path());
+        if (!path) { s.x[0] = status_value(status::param); return; }
+        std::uint64_t id{};
+        if (const auto status = self->add_item(*path, std::move(item), id)) { s.x[0] = status_value(status); return; }
+        if (s.x[6]) m.write64(s.x[6], self->item_ref(id, *path));
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecKeychainItemCopyKeychain", [self](CpuState& s, GuestMemory& m) {
+        if (!self->item_id(s.x[0]) || !s.x[1]) { s.x[0] = status_value(status::param); return; }
+        m.write64(s.x[1], self->keychain_object(self->item_keychain(s.x[0])));
+        s.x[0] = 0;
+    });
+
+    // ---- searches ----
+    const auto search_class = b.define_class("_AlchemySecKeychainSearch", b.object_class, lib);
+    b.function(lib, "_SecKeychainSearchGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(TypeId::keychain_search); });
+    b.register_type_id(search_class, TypeId::keychain_search);
+    // (keychainOrArray, SecItemClass, const SecKeychainAttributeList *, SecKeychainSearchRef *)
+    b.function(lib, "_SecKeychainSearchCreateFromAttributes", [self, search_class](CpuState& s, GuestMemory& m) {
+        const auto keychains = self->keychains_of(s.x[0]);
+        auto attributes = self->read_attributes(m, s.x[2]);
+        if (!keychains || !attributes || !s.x[3]) { s.x[0] = status_value(status::param); return; }
+        auto state = std::make_shared<SearchState>();
+        state->keychains = *keychains;
+        state->attributes = std::move(*attributes);
+        if (!self->legacy_class(static_cast<std::uint32_t>(s.x[1]), state->cls)) state->cls.clear();   // no other class is stored
+        const auto object = self->b.objc.allocate(search_class);
+        static_cast<void>(self->b.objc.host_state<SearchState>(object, [&] { return state; }));
+        m.write64(s.x[3], object);
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecKeychainSearchCopyNext", [self](CpuState& s, GuestMemory& m) {
+        const auto state = s.x[0] ? self->b.objc.find_host_state<SearchState>(s.x[0]) : nullptr;
+        if (!state || !s.x[1]) { s.x[0] = status_value(status::param); return; }
+        while (!state->cls.empty() && state->keychain < state->keychains.size()) {
+            const auto path = state->keychains[state->keychain];
+            std::optional<std::uint64_t> next;
+            const auto status = self->with_store(path, true, [&](Store& store) {
+                for (const auto& item : store.items)
+                    if (item.id > state->after && self->matches_all(item, state->cls, state->attributes) && (!next || item.id < *next)) next = item.id;
+                return status::success;
+            });
+            if (status == status::interaction_not_allowed) { s.x[0] = status_value(status); return; }
+            if (next) {
+                state->after = *next;
+                m.write64(s.x[1], self->item_ref(*next, path));
+                s.x[0] = 0;
+                return;
+            }
+            ++state->keychain;
+            state->after = 0;
+        }
         s.x[0] = status_value(status::item_not_found);
+    });
+
+    // ---- keychains ----
+    // (const char *pathName, UInt32 passwordLength, const void *password, Boolean promptUser, SecAccessRef, SecKeychainRef *)
+    b.function(lib, "_SecKeychainCreate", [self](CpuState& s, GuestMemory& m) {
+        const auto guest = self->guest_c_string(m, s.x[0]);
+        if (guest.empty() || !s.x[5] || s.x[1] > 4096) { s.x[0] = status_value(status::param); return; }
+        if (!s.x[2] && (s.x[3] & 0xff)) { s.x[0] = status_value(status::interaction_not_allowed); return; }   // no UI to ask
+        Bytes password(static_cast<std::size_t>(s.x[1]));
+        if (!password.empty()) m.read_bytes(s.x[2], password);
+        const auto path = Keychain::host_of(guest);
+        std::error_code error;
+        if (std::filesystem::exists(path, error)) { s.x[0] = status_value(err_duplicate_keychain); return; }
+        const auto record = password_record(password);
+        host::crypto::secure_zero(std::as_writable_bytes(std::span(password)));
+        if (!record) { s.x[0] = status_value(status::allocate); return; }
+        {
+            std::lock_guard lock(process_mutex);
+            Store store(path);
+            store.password = *record;
+            store.save();
+        }
+        { std::lock_guard lock(lock_mutex); locked_keychains.erase(path.wstring()); }
+        m.write64(s.x[5], self->keychain_object(path));
+        s.x[0] = 0;
+    });
+    // (const char *pathName, SecKeychainRef *): a reference, whether or not the file exists yet (as on macOS).
+    b.function(lib, "_SecKeychainOpen", [self](CpuState& s, GuestMemory& m) {
+        const auto guest = self->guest_c_string(m, s.x[0]);
+        if (guest.empty() || !s.x[1]) { s.x[0] = status_value(status::param); return; }
+        m.write64(s.x[1], self->keychain_object(Keychain::host_of(guest)));
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecKeychainDelete", [self](CpuState& s, GuestMemory&) {
+        const auto path = self->path_of(s.x[0]);
+        if (!path) { s.x[0] = status_value(status::param); return; }
+        std::lock_guard lock(process_mutex);
+        std::error_code error;
+        if (!std::filesystem::remove(*path, error)) { s.x[0] = status_value(err_no_such_keychain); return; }
+        std::erase(self->search_list, *path);
+        if (self->default_override == *path) self->default_override.reset();
+        s.x[0] = 0;
+    });
+    // (keychain, UInt32 *ioPathLength, char *pathName)
+    b.function(lib, "_SecKeychainGetPath", [self](CpuState& s, GuestMemory& m) {
+        const auto path = s.x[0] ? self->path_of(s.x[0]) : std::optional(self->default_path());
+        if (!path || !s.x[1] || !s.x[2]) { s.x[0] = status_value(status::param); return; }
+        const auto text = guest_path_string(*path);
+        const auto room = m.read32(s.x[1]);
+        m.write32(s.x[1], static_cast<std::uint32_t>(text.size()));
+        if (text.size() + 1 > room) { s.x[0] = status_value(err_buffer_too_small); return; }
+        m.write_bytes(s.x[2], std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+        m.write8(s.x[2] + text.size(), 0);
+        s.x[0] = 0;
+    });
+    // (keychain, SecKeychainStatus *): unlocked (1), readable (2), writable (4).
+    b.function(lib, "_SecKeychainGetStatus", [self](CpuState& s, GuestMemory& m) {
+        const auto path = s.x[0] ? self->path_of(s.x[0]) : std::optional(self->default_path());
+        if (!path || !s.x[1]) { s.x[0] = status_value(status::param); return; }
+        std::error_code error;
+        if (*path != keychain_path() && !std::filesystem::exists(*path, error)) { s.x[0] = status_value(err_no_such_keychain); return; }
+        m.write32(s.x[1], (is_locked(*path) ? 0 : 1) | 2 | 4);
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecKeychainLock", [self](CpuState& s, GuestMemory&) {
+        const auto path = s.x[0] ? self->path_of(s.x[0]) : std::optional(self->default_path());
+        if (!path) { s.x[0] = status_value(status::param); return; }
+        std::lock_guard lock(lock_mutex);
+        locked_keychains.insert(path->wstring());
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecKeychainLockAll", [self](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(lock_mutex);
+        for (const auto& path : self->searched()) locked_keychains.insert(path.wstring());
+        s.x[0] = 0;
+    });
+    // (keychain, UInt32 passwordLength, const void *password, Boolean usePassword)
+    b.function(lib, "_SecKeychainUnlock", [self](CpuState& s, GuestMemory& m) {
+        const auto path = s.x[0] ? self->path_of(s.x[0]) : std::optional(self->default_path());
+        if (!path || s.x[1] > 4096) { s.x[0] = status_value(status::param); return; }
+        std::optional<Bytes> record;
+        bool existed = false;
+        {
+            std::lock_guard lock(process_mutex);
+            Store store(*path);
+            record = store.password;
+            existed = store.existed;
+        }
+        if (!existed && *path != keychain_path()) { s.x[0] = status_value(err_no_such_keychain); return; }
+        if (record) {
+            if (!(s.x[3] & 0xff)) { s.x[0] = status_value(status::interaction_not_allowed); return; }   // no UI to ask
+            Bytes password(static_cast<std::size_t>(s.x[1]));
+            if (!password.empty()) m.read_bytes(s.x[2], password);
+            const bool ok = password_matches(*record, password);
+            host::crypto::secure_zero(std::as_writable_bytes(std::span(password)));
+            if (!ok) { s.x[0] = status_value(err_auth_failed); return; }
+        }
+        std::lock_guard lock(lock_mutex);
+        locked_keychains.erase(path->wstring());
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecKeychainCopySearchList", [self](CpuState& s, GuestMemory& m) {
+        if (!s.x[0]) { s.x[0] = status_value(status::param); return; }
+        std::vector<Address> keychains;
+        for (const auto& path : self->searched()) keychains.push_back(self->keychain_object(path));
+        m.write64(s.x[0], self->b.array(keychains));
+        self->b.release_all(keychains);
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecKeychainSetSearchList", [self](CpuState& s, GuestMemory&) {
+        if (!s.x[0] || !self->b.is_array(s.x[0])) { s.x[0] = status_value(status::param); return; }
+        std::vector<std::filesystem::path> paths;
+        for (const auto value : self->b.cf.array_values(s.x[0])) {
+            const auto path = self->path_of(value);
+            if (!path) { s.x[0] = status_value(status::param); return; }
+            paths.push_back(*path);
+        }
+        self->search_list = std::move(paths);
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecKeychainSetDefault", [self](CpuState& s, GuestMemory&) {
+        const auto path = self->path_of(s.x[0]);
+        if (!path) { s.x[0] = status_value(status::param); return; }
+        self->default_override = *path;
+        s.x[0] = 0;
     });
 }
 
