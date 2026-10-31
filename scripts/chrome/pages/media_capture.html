@@ -1,0 +1,128 @@
+<!doctype html>
+<!-- getUserMedia end to end, no network: asks for the microphone (and, with video=1, the camera), reads what the
+     tracks deliver through MediaStreamTrackProcessor (no AudioContext, so no autoplay gesture is needed) and
+     reports it. Audio: the level (RMS) and the frequency estimated from zero crossings over about 2 s. Video: the
+     frame size, frame count and the colour of the left and right edges.
+     Query: audio=1 (default) and video=0|1; expect=tone (Alchemy's test tone: a 440 Hz sine at 0.25, RMS 0.177)
+     or expect=silent (a cloaked run's silent microphone) or expect=any (any level, any picture). With video=1 and
+     expect other than any, the camera is expected to be Alchemy's test pattern (colour bars: a bright left edge,
+     a dark right edge).
+     The verdict is in the title: "Alchemy capture: PASS ..." or "Alchemy capture: FAIL <reason>".
+     Run under Alchemy with Chrome's --use-fake-ui-for-media-stream (no permission prompt) and Alchemy's test
+     devices, never a real microphone or camera:
+       run_windowed.ps1 -Url 'file:///<guest path>/media_capture.html?expect=tone&video=1'
+         -Title 'Alchemy capture: *' -TitleNot '*running*' -Pass 'Alchemy capture: PASS*'
+         -Extra @('--use-fake-ui-for-media-stream') -Env @{ ALCHEMY_AUDIO_INPUT='tone'; ALCHEMY_CAMERA='pattern' } -->
+<html>
+<head><meta charset="utf-8"><title>Alchemy capture: running</title></head>
+<body>
+<h1>getUserMedia</h1>
+<pre id="status">running</pre>
+<script>
+"use strict";
+const params = new URLSearchParams(location.search);
+const wantAudio = params.get("audio") !== "0", wantVideo = params.get("video") === "1";
+const expect = params.get("expect") || "tone";
+const status = document.getElementById("status");
+const log = (text) => { status.textContent += "\n" + text; };
+
+function withTimeout(promise, ms, what) {
+  return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(what + " timed out")), ms))]);
+}
+
+async function readAudio(track) {
+  const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+  let squares = 0, count = 0, crossings = 0, last = 0, rate = 0, frames = 0;
+  const deadline = performance.now() + 2500;
+  while (performance.now() < deadline) {
+    const { value, done } = await withTimeout(reader.read(), 10000, "audio frame");
+    if (done) break;
+    rate = value.sampleRate;
+    const n = value.numberOfFrames, data = new Float32Array(n);
+    value.copyTo(data, { planeIndex: 0, format: "f32-planar" });
+    value.close();
+    frames++;
+    if (frames <= 5) continue;   // let the pipeline settle
+    for (let i = 0; i < n; i++) {
+      const v = data[i];
+      squares += v * v;
+      if ((v >= 0) !== (last >= 0)) crossings++;
+      last = v;
+    }
+    count += n;
+  }
+  reader.cancel();
+  const rms = count ? Math.sqrt(squares / count) : 0;
+  const freq = count && rate ? crossings / 2 / (count / rate) : 0;
+  return { rms, freq, rate, frames };
+}
+
+async function readVideo(track) {
+  const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+  let frames = 0, width = 0, height = 0, left = null, right = null;
+  const deadline = performance.now() + 2500;
+  while (performance.now() < deadline) {
+    const { value, done } = await withTimeout(reader.read(), 10000, "video frame");
+    if (done) break;
+    frames++;
+    width = value.displayWidth;
+    height = value.displayHeight;
+    if (frames === 5) {
+      const canvas = new OffscreenCanvas(width, height), ctx = canvas.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(value, 0, 0);
+      left = Array.from(ctx.getImageData(4, 4, 1, 1).data.slice(0, 3));
+      right = Array.from(ctx.getImageData(width - 5, 4, 1, 1).data.slice(0, 3));
+    }
+    value.close();
+  }
+  reader.cancel();
+  return { frames, width, height, left, right };
+}
+
+// The microphone's own signal: Chrome's echo cancellation, noise suppression and gain control would
+// treat a steady tone as noise.
+const raw = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+
+async function run() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("no getUserMedia");
+  if (!("MediaStreamTrackProcessor" in window)) throw new Error("no MediaStreamTrackProcessor");
+  const stream = await withTimeout(navigator.mediaDevices.getUserMedia({ audio: wantAudio && raw, video: wantVideo }), 30000, "getUserMedia");
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  log("devices: " + devices.map((d) => d.kind + " '" + d.label + "'").join(", "));
+  // Both tracks are read at once (ending or cancelling one reader first may end the other's source).
+  const audioTrack = wantAudio ? stream.getAudioTracks()[0] : null, videoTrack = wantVideo ? stream.getVideoTracks()[0] : null;
+  if (wantAudio && !audioTrack) throw new Error("no audio track");
+  if (wantVideo && !videoTrack) throw new Error("no video track");
+  if (audioTrack) log("audio track: '" + audioTrack.label + "' " + JSON.stringify(audioTrack.getSettings()));
+  if (videoTrack) log("video track: '" + videoTrack.label + "' " + JSON.stringify(videoTrack.getSettings()));
+  const [a, v] = await Promise.all([audioTrack ? readAudio(audioTrack) : null, videoTrack ? readVideo(videoTrack) : null]);
+  stream.getTracks().forEach((track) => track.stop());
+  const verdict = [];
+  if (a) {
+    log("audio: rms " + a.rms.toFixed(4) + ", " + a.freq.toFixed(1) + " Hz at " + a.rate + " Hz, " + a.frames + " frames");
+    if (a.frames < 10) throw new Error("audio: only " + a.frames + " frames");
+    if (expect === "tone") {
+      if (Math.abs(a.rms - 0.177) > 0.03) throw new Error("audio level " + a.rms.toFixed(4) + ", not the test tone's 0.177");
+      if (Math.abs(a.freq - 440) > 10) throw new Error("audio at " + a.freq.toFixed(1) + " Hz, not 440");
+      verdict.push("tone rms=" + a.rms.toFixed(3) + " " + Math.round(a.freq) + "Hz");
+    } else if (expect === "silent") {
+      if (a.rms > 0.001) throw new Error("audio level " + a.rms.toFixed(4) + ", not silent");
+      verdict.push("audio silent");
+    } else {
+      verdict.push("audio rms=" + a.rms.toFixed(3));
+    }
+  }
+  if (v) {
+    log("video: " + v.frames + " frames of " + v.width + "x" + v.height + ", left " + v.left + ", right " + v.right);
+    if (v.frames < 10) throw new Error("video: only " + v.frames + " frames");
+    if (expect !== "any" && (!v.left || v.left.some((c) => c < 180) || v.right.some((c) => c > 60))) throw new Error("video: not the test pattern's bars");
+    verdict.push("video " + v.width + "x" + v.height + " " + v.frames + " frames" + (expect !== "any" ? " bars" : ""));
+  }
+  return verdict.join(", ");
+}
+
+run().then((text) => { document.title = "Alchemy capture: PASS " + text; log("PASS " + text); },
+           (error) => { document.title = "Alchemy capture: FAIL " + error.message; log("FAIL " + error.message); });
+</script>
+</body>
+</html>
