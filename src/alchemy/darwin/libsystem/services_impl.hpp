@@ -1273,6 +1273,11 @@ public:
     };
     std::map<std::uint32_t, Child> children;
     std::mutex children_mutex;
+    // CPU time of the children this process reaped (getrusage RUSAGE_CHILDREN, times), and of the last child
+    // each thread reaped (wait4's rusage): read while the child's handle still names it. Under children_mutex.
+    struct ReapedUsage { std::uint32_t pid{}; std::uint64_t user_ns{}, system_ns{}; };
+    std::uint64_t reaped_user_ns{}, reaped_system_ns{};
+    std::map<std::uint64_t, ReapedUsage> last_reaped;   // by thread identity
     // EVFILT_PROC: whether `pid` is a child (nullopt: not one, or reaped),
     // and its wait status once it has ended (inner nullopt: still running).
     // Never reaps (process_model.cpp).
@@ -1292,6 +1297,13 @@ public:
     // until exec passes them on (process/process_model.cpp).
     std::array<std::atomic<std::uint32_t>, 4> credential_ids{};
     bool superuser{};
+    // getpriority/setpriority (process/identity.cpp), under `mutex`: the nice value last set (reported while the
+    // host class still matches it), whether the process is in background mode, the threads that are, and
+    // getpwent's position in the password database.
+    std::optional<int> nice_value;
+    bool process_background{};
+    std::set<std::uint64_t> background_threads;
+    std::size_t password_cursor{};
     std::array<std::uint32_t, 4> current_credentials() const;
     void set_credential(std::size_t index, std::uint32_t value);
     std::map<std::uint64_t, std::uint32_t> popen_streams;   // FILE* -> child pid

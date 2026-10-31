@@ -913,6 +913,53 @@ void test_b16(Fixture& f) {
     std::filesystem::remove_all(directory, ignored);
 }
 
+// B17 (process/identity.cpp, fs/files.cpp): the gaps the audited apps reach.
+void test_b17(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    // ctermid_r, times, getrusage(RUSAGE_CHILDREN).
+    const auto buffer = f.process.allocate_guest(64);
+    require(f.sys("_ctermid_r", {buffer}) == buffer && f.read(buffer) == "/dev/tty" && f.sys("_ctermid_r", {0}) == 0, "ctermid_r");
+    const auto tms = f.process.allocate_guest(32);
+    require(f.sys("_times", {tms}) > 0 && f.engine.read64(tms + 16) == 0 && f.engine.read64(tms + 24) == 0, "times (no children reaped)");
+    const auto usage = f.process.allocate_guest(144);
+    require(f.sys("_getrusage", {0xffffffff, usage}) == 0 && f.engine.read64(usage) == 0 && f.sys("_getrusage", {2, usage}) == UINT64_MAX &&
+            errno_value() == 22, "getrusage(RUSAGE_CHILDREN)");
+    // getpwent walks the one account; setpwent rewinds.
+    const auto first = f.sys("_getpwent");
+    require(first != 0 && f.engine.read32(first + 16) == 1000 && f.sys("_getpwent") == 0, "getpwent");
+    f.sys("_setpwent");
+    require(f.sys("_getpwent") != 0, "setpwent rewinds");
+    f.sys("_endpwent");
+    // getgrouplist needs the group database (mach/machsys.cpp): machsys_tests.
+    // lockf over fcntl locks; lutimes and utimensat(AT_SYMLINK_NOFOLLOW) on a file set its own times.
+    // (open's mode is variadic, so the file is made on the host and opened O_RDWR.)
+    const auto host_path = std::filesystem::temp_directory_path() / "alchemy-b17-lockf";
+    std::ofstream(host_path) << "0123456789";
+    const auto path = alchemy::guest_path_string(host_path);
+    const auto fd = f.sys("_open", {f.text(path), 2});
+    require(fd < 1024, "lockf file");
+    require(f.sys("_lockf", {fd, 2, 0}) == 0 && f.sys("_lockf", {fd, 3, 0}) == 0 && f.sys("_lockf", {fd, 0, 0}) == 0 &&
+            f.sys("_lockf", {fd, 9, 0}) == UINT64_MAX && errno_value() == 22, "lockf");
+    f.sys("_close", {fd});
+    const auto times = f.process.allocate_guest(32), status = f.process.allocate_guest(144);
+    f.engine.write64(times, 1'500'000'000); f.engine.write64(times + 8, 0);
+    f.engine.write64(times + 16, 1'600'000'000); f.engine.write64(times + 24, 0);
+    require(f.sys("_lutimes", {f.text(path), times}) == 0 && f.sys("_stat", {f.text(path), status}) == 0 &&
+            f.engine.read64(status + 48) == 1'600'000'000, "lutimes on a file");
+    f.engine.write64(times + 16, 1'650'000'000); f.engine.write64(times + 24, 0);
+    require(f.sys("_utimensat", {static_cast<Address>(-2), f.text(path), times, 0x20}) == 0 && f.sys("_stat", {f.text(path), status}) == 0 &&
+            f.engine.read64(status + 48) == 1'650'000'000, "utimensat with AT_SYMLINK_NOFOLLOW on a file");
+    f.sys("_unlink", {f.text(path)});
+    // Priorities: a nice value back as set; lowering it again needs root; the thread's background mode.
+    require(f.sys("_setpriority", {0, 0, 5}) == 0 && f.sys("_getpriority", {0, 0}) == 5, "setpriority and getpriority");
+    require(f.sys("_setpriority", {0, 0, 0}) == UINT64_MAX && errno_value() == 13, "raising the priority needs root");
+    require(f.sys("_nice", {1}) == 6 && f.sys("_nice", {0xffffffff}) == UINT64_MAX && errno_value() == 1, "nice");
+    require(f.sys("_setpriority", {3, 0, 0x1000}) == 0 && f.sys("_getpriority", {3, 0}) == 1 && f.sys("_setpriority", {3, 0, 0}) == 0 &&
+            f.sys("_getpriority", {3, 0}) == 0, "PRIO_DARWIN_THREAD background");
+    require(f.sys("_setpriority", {0, 1, 5}) == UINT64_MAX && errno_value() == 45 && f.sys("_setpriority", {1, 0, 5}) == UINT64_MAX,
+            "another process's priority is ENOTSUP");
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -1284,6 +1331,7 @@ int main() {
         stage("b11"); test_b11(f);
         stage("itimers"); test_itimers(f);
         stage("b16"); test_b16(f);
+        stage("b17"); test_b17(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

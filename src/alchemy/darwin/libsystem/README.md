@@ -105,6 +105,14 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   the malloc zone diagnostics (malloc_zone_check/print/log/claimed_address, discharge checking,
   malloc_printf; `malloc/malloc_zones.cpp`: a guest zone answers through its introspection
   table, the system zone is consistent by construction).
+* **Process identity and accounting** (core, `process/identity.cpp`): getpriority/setpriority/nice
+  for this process (a nice value as the host priority class nearest to it; only root lowers it;
+  PRIO_DARWIN_THREAD/PROCESS are the host's background modes; another process, PRIO_PGRP and
+  PRIO_USER are ENOTSUP), getrusage and times with the children's CPU time (read when wait*
+  reaps them, as wait4's rusage), getpwent/setpwent/endpwent over the one account,
+  getgrouplist, lockf over fcntl locks, ctermid_r. lutimes and utimensat(AT_SYMLINK_NOFOLLOW)
+  set a symbolic link's own times (`fs/files.cpp`). sigwait (no pending-signal model yet) and
+  sigaltstack stay ENOSYS.
 * **Word expansion and dates** (alchemy-fx, `install_libsystem_gaps`): `fs/wordexp.cpp`
   (wordexp/wordfree: the shell's expansions in the shell's order — tilde, the ${...} parameter
   forms over the environment, command substitution through the guest's popen and /bin/sh,

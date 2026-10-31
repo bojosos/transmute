@@ -1034,14 +1034,22 @@ void DarwinServices::Impl::install_process_services() {
                     if (!status) if (const auto code = ended_child(child.process)) { status = darwin_wait_status(*code); ended = true; }
                     // A child this process ended with SIGKILL (see signal_child) is
                     // reported at once with the signal its exit code carries,
-                    // WIFSIGNALED / WTERMSIG = killed_by; wait4's rusage is zero
-                    // then (as always here). Alchemy delivers no SIGCHLD, so
+                    // WIFSIGNALED / WTERMSIG = killed_by; wait4's rusage is the
+                    // CPU time it used. Alchemy delivers no SIGCHLD, so
                     // nothing else can report the child a second time.
                     if (!status && child.kill_certain) status = child.killed_by & 0x7f;
                     if (!status) { if (child.process) pending.push_back(child_process(child.process)); continue; }
                     const std::pair<std::uint32_t, std::uint32_t> result{child.pid, *status};
                     if (consume) {
-                        if (child.process && ended) host::close(child_process(child.process));
+                        if (child.process && ended) {
+                            if (const auto used = host::process::usage(child.pid)) {
+                                reaped_user_ns += used->user_ns;
+                                reaped_system_ns += used->system_ns;
+                                const auto thread = context.current_thread();
+                                last_reaped[thread ? thread->identity : 0] = {child.pid, used->user_ns, used->system_ns};
+                            }
+                            host::close(child_process(child.process));
+                        }
                         else if (child.process) retire_child_process(child.process, child.pid);
                         children.erase(it);
                     }
@@ -1056,7 +1064,7 @@ void DarwinServices::Impl::install_process_services() {
             else static_cast<void>(host::sync::wait_any(pending, 50'000'000));
         }
     };
-    const auto wait_common = [wait_child](auto& s, auto& m, std::int64_t selector, std::uint64_t status_address,
+    const auto wait_common = [this, wait_child](auto& s, auto& m, std::int64_t selector, std::uint64_t status_address,
                                           std::uint64_t options, std::uint64_t usage) -> std::uint64_t {
         if (options & ~(1ULL | 2ULL | 0x10ULL)) throw ServiceError{einval};   // WNOHANG, WUNTRACED, WCONTINUED
         if (status_address) validate(m, status_address, 4, true);
@@ -1064,7 +1072,21 @@ void DarwinServices::Impl::install_process_services() {
         static_cast<void>(s);
         const auto [pid, status] = wait_child(selector, options, true);
         if (pid && status_address) m.write32(status_address, status);
-        if (pid && usage) m.fill_bytes(usage, 0, 144);
+        if (pid && usage) {
+            // struct rusage: ru_utime @0 and ru_stime @16 (struct timeval); the rest stays 0.
+            m.fill_bytes(usage, 0, 144);
+            ReapedUsage used;
+            {
+                std::lock_guard lock(children_mutex);
+                const auto thread = context.current_thread();
+                if (const auto found = last_reaped.find(thread ? thread->identity : 0); found != last_reaped.end() && found->second.pid == pid)
+                    used = found->second;
+            }
+            for (const auto& [offset, nanoseconds] : std::array<std::pair<std::uint64_t, std::uint64_t>, 2>{{{0, used.user_ns}, {16, used.system_ns}}}) {
+                m.write64(usage + offset, nanoseconds / 1'000'000'000);
+                m.write32(usage + offset + 8, static_cast<std::uint32_t>((nanoseconds % 1'000'000'000) / 1000));
+            }
+        }
         return pid;
     };
     install("_waitpid", [wait_common](auto& s, auto& m) { return wait_common(s, m, static_cast<std::int32_t>(s.x[0]), s.x[1], s.x[2], 0); });

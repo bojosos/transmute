@@ -265,25 +265,28 @@ void DarwinServices::Impl::install_extra() {
         m.write64(s.x[1] + 56, 255);   // f_namemax
         return std::uint64_t{0};
     });
-    install("_utimes", [this](auto& s, auto& m) {
-        const auto name = filesystem_path(m, s.x[0]);
-        std::optional<std::int64_t> access = host::time::realtime_ns(), modified = access;
-        if (s.x[1]) {
-            const auto convert = [&](std::uint64_t address) {
-                const auto seconds = std::bit_cast<std::int64_t>(m.read64(address));
-                const auto micros = m.read32(address + 8);
-                if (micros >= 1000000 || seconds > INT64_MAX / 1'000'000'000 - 1 || seconds < INT64_MIN / 1'000'000'000 + 1) throw ServiceError{einval};
-                return seconds * 1'000'000'000 + static_cast<std::int64_t>(micros) * 1000;
-            };
-            access = convert(s.x[1]); modified = convert(s.x[1] + 16);
-        }
-        // EACCES when the file cannot be opened for its attributes, EINVAL for
-        // an unrepresentable time, ENOENT for a missing path, and EIO when
-        // the times cannot be written to a file that exists (utimes(2)).
-        if (const auto set = host::files::set_times(path_text(name), access, modified); !set)
-            throw ServiceError{file_failure(set.error())};
-        return std::uint64_t{0};
-    });
+    // utimes(path, struct timeval[2]); lutimes sets a symbolic link's own times.
+    for (const auto& [utimes_name, follow] : std::array<std::pair<const char*, bool>, 2>{{{"_utimes", true}, {"_lutimes", false}}})
+        install(utimes_name, [this, follow = follow](auto& s, auto& m) {
+            const auto name = filesystem_path(m, s.x[0]);
+            std::optional<std::int64_t> access = host::time::realtime_ns(), modified = access;
+            if (s.x[1]) {
+                const auto convert = [&](std::uint64_t address) {
+                    const auto seconds = std::bit_cast<std::int64_t>(m.read64(address));
+                    const auto micros = m.read32(address + 8);
+                    if (micros >= 1000000 || seconds > INT64_MAX / 1'000'000'000 - 1 || seconds < INT64_MIN / 1'000'000'000 + 1) throw ServiceError{einval};
+                    return seconds * 1'000'000'000 + static_cast<std::int64_t>(micros) * 1000;
+                };
+                access = convert(s.x[1]); modified = convert(s.x[1] + 16);
+            }
+            // EACCES when the file cannot be opened for its attributes, EINVAL for
+            // an unrepresentable time, ENOENT for a missing path, and EIO when
+            // the times cannot be written to a file that exists (utimes(2)).
+            const auto set = follow ? host::files::set_times(path_text(name), access, modified)
+                                    : host::files::set_link_times(path_text(name), access, modified);
+            if (!set) throw ServiceError{file_failure(set.error())};
+            return std::uint64_t{0};
+        });
     install("_copyfile_state_alloc", [this](auto&, auto&) { const auto address = context.allocate_guest(8); std::lock_guard lock(mutex); copy_states.emplace(address, CopyState{}); return address; }, 0);
     install("_copyfile_state_free", [this](auto& s, auto&) {
         if (!s.x[0]) return std::uint64_t{0};
@@ -1080,8 +1083,12 @@ void DarwinServices::Impl::install_libsystem_files() {
     install("_getmntinfo_r_np", [mount_info](auto& s, auto& m) { return mount_info(m, s.x[0], true, {}); }, 0);
 
     // Times are nanoseconds since the Unix epoch; empty keeps the existing value.
-    const auto set_times = [](const std::filesystem::path& name, std::optional<std::int64_t> access, std::optional<std::int64_t> modified) {
-        if (const auto set = host::files::set_times(path_text(name), access, modified); !set) throw ServiceError{file_failure(set.error())};
+    // `follow` false: a final symbolic link's own times (AT_SYMLINK_NOFOLLOW).
+    const auto set_times = [](const std::filesystem::path& name, std::optional<std::int64_t> access, std::optional<std::int64_t> modified,
+                              bool follow = true) {
+        const auto set = follow ? host::files::set_times(path_text(name), access, modified)
+                                : host::files::set_link_times(path_text(name), access, modified);
+        if (!set) throw ServiceError{file_failure(set.error())};
     };
     const auto now = [] { return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()); };
     // timespec[2] with UTIME_NOW (-1) and UTIME_OMIT (-2) in tv_nsec.
@@ -1107,7 +1114,7 @@ void DarwinServices::Impl::install_libsystem_files() {
     install("_utimensat", [this, set_times, timespecs](auto& s, auto& m) {
         if (s.x[3] & ~0x20ULL) throw ServiceError{einval}; // AT_SYMLINK_NOFOLLOW only
         const auto times = timespecs(m, s.x[2]);
-        set_times(path_at(m, s.x[0], s.x[1]), times[0], times[1]);
+        set_times(path_at(m, s.x[0], s.x[1]), times[0], times[1], (s.x[3] & 0x20) == 0);
         return std::uint64_t{0};
     });
     install("_utime", [this, set_times, now](auto& s, auto& m) {

@@ -222,6 +222,18 @@ void libc(Fixture& f) {
     require(f.call(sys, "_getgrent") == own && f.call(sys, "_getgrent") == wheel && f.call(sys, "_getgrent") == 0, "getgrent");
     static_cast<void>(f.call(sys, "_endgrent"));
     require(f.call(sys, "_getgrent") == own && f.call(sys, "_setgroupent", {1}) == 1 && f.call(sys, "_getgrent") == own, "endgrent/setgroupent rewind");
+    // getgrouplist (process/identity.cpp): basegid, then the groups that list the user (its own group).
+    const auto user = f.read_text(f.engine.read64(f.call(sys, "_getpwuid", {f.call(sys, "_getuid")})));
+    const auto own_gid = f.engine.read32(own + 16);
+    const auto groups = f.block(64), count = f.block(4);
+    f.engine.write32(count, 16);
+    require(f.call(sys, "_getgrouplist", {f.text(user), 20, groups, count}) == 0 && f.engine.read32(count) == 2 &&
+            f.engine.read32(groups) == 20 && f.engine.read32(groups + 4) == own_gid, "getgrouplist");
+    f.engine.write32(count, 1);
+    require(static_cast<std::int32_t>(f.call(sys, "_getgrouplist", {f.text(user), 20, groups, count})) == -1 && f.engine.read32(count) == 2,
+            "getgrouplist too small");
+    f.engine.write32(count, 16);
+    require(f.call(sys, "_getgrouplist", {f.text("nobody"), 7, groups, count}) == 0 && f.engine.read32(count) == 1, "getgrouplist of another name");
     // termios on a descriptor that is not a terminal.
     const auto pipe = f.block(8);
     require(f.status(sys, "_pipe", {pipe}) == 0, "pipe");
