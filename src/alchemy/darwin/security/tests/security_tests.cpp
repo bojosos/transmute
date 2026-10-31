@@ -774,6 +774,10 @@ void test_code_signing(Fixture& f) {
     require(f.status("_SecCodeCopyGuestWithAttributes", {0, missing_pid, 0, guest}) == codesign::cs::no_such_code, "no such guest");
     const auto odd = attributes("color", sec::bridge()->number(1));
     require(f.status("_SecCodeCopyGuestWithAttributes", {0, odd, 0, guest}) == codesign::cs::unsupported_guest_attributes, "unsupported attributes");
+    const auto dynamic = attributes("dynamicCode", sec::bridge()->data(std::vector<std::uint8_t>{1, 2, 3}));
+    require(f.status("_SecCodeCopyGuestWithAttributes", {0, dynamic, 0, guest}) == codesign::cs::unimplemented,
+            "dynamic code is not provided (errSecCSUnimplemented)");
+    f.release(dynamic);
     f.release(missing_pid);
     f.release(odd);
     fs::remove_all(temp);

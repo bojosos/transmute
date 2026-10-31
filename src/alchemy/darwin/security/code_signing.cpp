@@ -21,7 +21,8 @@
 //   its certificate chain (errSecCSUnsigned for unsigned code; resource
 //   failures carry kSecCFErrorResourceAltered / Missing).
 // - Running code: SecCodeCopySelf and SecCodeCopyGuestWithAttributes (a pid
-//   or an audit token, through proc_pidpath) give code objects whose static
+//   or an audit token, through proc_pidpath; dynamic code attributes answer
+//   errSecCSUnimplemented) give code objects whose static
 //   code and signing information are their executable's. Alchemy does not
 //   validate code as it runs (csops reports no CS_VALID), so
 //   SecCodeCheckValidity and the dynamic status answer that: status 0, and
@@ -175,6 +176,11 @@ void install_code_signing(Security& sec) {
                     const auto token = b->bytes(value);   // audit_token_t: eight 32-bit words, the pid is the sixth
                     if (token.size() < 32) { s.x[0] = status_value(codesign::cs::invalid_attribute_values); return; }
                     pid = token[20] | (static_cast<Address>(token[21]) << 8) | (static_cast<Address>(token[22]) << 16) | (static_cast<Address>(token[23]) << 24);
+                } else if (name == "dynamicCode" || name == "dynamicCodeInfoPlist") {
+                    // Dynamic (in-memory) code with its own signature: not provided by Alchemy (Chrome passes it and
+                    // treats errSecCSUnimplemented as "no answer", as before code signing was read at all).
+                    s.x[0] = status_value(codesign::cs::unimplemented);
+                    return;
                 } else {
                     s.x[0] = status_value(codesign::cs::unsupported_guest_attributes);
                     return;
