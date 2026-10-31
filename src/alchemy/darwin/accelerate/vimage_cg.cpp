@@ -21,6 +21,12 @@
 //   (one buffer each side); vImageConverter_Retain/Release, the buffer counts,
 //   MustOperateOutOfPlace (never: sources are read whole first); vImageCGImageFormat_IsEqual;
 //   vImageBuffer_GetSize.
+// - CoreVideo: vImageBuffer_InitWithCVPixelBuffer and vImageBuffer_CopyToCVPixelBuffer between a
+//   buffer in a vImage_CGImageFormat and a CVPixelBuffer of the packed formats 32BGRA, 32ARGB, 32RGBA
+//   and 24RGB (alpha premultiplied, as CoreVideo buffers usually are) or the Y'CbCr formats 420v,
+//   420f and 2vuy (BT.601 unless the buffer's (or the vImageCVImageFormat's) matrix is BT.709;
+//   chroma of 2x1 or 2x2 blocks averaged when written, shared when read);
+//   vImageCVImageFormat_Create / CreateWithCVPixelBuffer / Retain / Release / GetFormatCode.
 // Pixel formats: gray or RGB colour spaces (a NULL colour space is RGB); 8- and 16-bit integer or
 // 32-bit float components; alpha none, first or last, premultiplied or not, or skipped; the default
 // (big-endian), 16Little and 32Little byte orders. Pixels pass through straight-alpha RGBA in
@@ -80,7 +86,43 @@ private:
     struct Converter { Layout from, to; std::array<double, 4> background{}; std::uint32_t references{1}; };
     std::mutex mutex_;
     std::map<Address, Converter> converters_;
+    struct CvFormat { std::uint32_t code{}; bool bt709{}; std::uint32_t references{1}; };
+    std::map<Address, CvFormat> cv_formats_;
+    void install_core_video();
+    // A locked pixel buffer's pixels as straight RGBA (nullopt: an unsupported format).
+    std::optional<Pixels> read_pixel_buffer(GuestMemory& m, Address buffer, bool bt709, std::uint64_t& width, std::uint64_t& height);
+    bool write_pixel_buffer(GuestMemory& m, Address buffer, bool bt709, const Pixels& pixels, std::uint64_t width, std::uint64_t height,
+                            const std::array<double, 4>& background);
+    bool buffer_is_709(Address buffer, Address cv_format);
 };
+
+constexpr std::uint32_t cv_bgra = fourcc("BGRA"), cv_argb = 0x20, cv_rgba = fourcc("RGBA"), cv_rgb24 = 0x18, cv_420v = fourcc("420v"),
+    cv_420f = fourcc("420f"), cv_2vuy = fourcc("2vuy");
+
+// The CGImage layout of a packed CoreVideo format.
+std::optional<Layout> packed_layout(std::uint32_t code) {
+    if (code == cv_bgra) return Layout{8, 32, alpha_premultiplied_first, order_32_little, false, 3, 0};
+    if (code == cv_argb) return Layout{8, 32, alpha_premultiplied_first, 0, false, 3, 0};
+    if (code == cv_rgba) return Layout{8, 32, alpha_premultiplied_last, 0, false, 3, 0};
+    if (code == cv_rgb24) return Layout{8, 24, alpha_none, 0, false, 3, 0};
+    return std::nullopt;
+}
+
+// Y'CbCr <-> RGB in [0, 1] (BT.601 or BT.709; video or full range).
+struct Ycc { double kr, kb; bool full; };
+std::array<double, 4> ycc_to_rgb(const Ycc& k, int y, int cb, int cr) {
+    const double yn = k.full ? y / 255.0 : (y - 16) / 219.0;
+    const double bn = (cb - 128) / (k.full ? 255.0 : 224.0), rn = (cr - 128) / (k.full ? 255.0 : 224.0);
+    const double r = yn + 2 * (1 - k.kr) * rn, b = yn + 2 * (1 - k.kb) * bn;
+    const double g = (yn - k.kr * r - k.kb * b) / (1 - k.kr - k.kb);
+    return {std::clamp(r, 0.0, 1.0), std::clamp(g, 0.0, 1.0), std::clamp(b, 0.0, 1.0), 1.0};
+}
+std::array<double, 3> rgb_to_ycc(const Ycc& k, const std::array<double, 4>& p) {
+    const double y = k.kr * p[0] + (1 - k.kr - k.kb) * p[1] + k.kb * p[2];
+    return {y, (p[2] - y) / (2 * (1 - k.kb)), (p[0] - y) / (2 * (1 - k.kr))};
+}
+std::uint8_t luma_byte(const Ycc& k, double y) { return static_cast<std::uint8_t>(std::clamp(std::lround(k.full ? y * 255 : 16 + y * 219), 0L, 255L)); }
+std::uint8_t chroma_byte(const Ycc& k, double c) { return static_cast<std::uint8_t>(std::clamp(std::lround(128 + c * (k.full ? 255 : 224)), 0L, 255L)); }
 
 std::optional<Layout> VImageCG::layout(std::uint32_t bpc, std::uint32_t bpp, Address space, std::uint32_t info) {
     Layout l{bpc, bpp, info & alpha_mask, info & byte_order_mask, (info & float_components) != 0, 3, space};
@@ -181,7 +223,188 @@ std::array<double, 4> VImageCG::background(GuestMemory& m, Address colors, const
 
 void result(CpuState& s, std::int64_t value) { s.x[0] = static_cast<std::uint64_t>(value); }
 
+bool VImageCG::buffer_is_709(Address buffer, Address cv_format) {
+    {
+        std::lock_guard lock(mutex_);
+        if (const auto found = cv_formats_.find(cv_format); found != cv_formats_.end()) return found->second.bt709;
+    }
+    const auto key = cf.string("CVImageBufferYCbCrMatrix");
+    const auto value = call(core_video, "_CVBufferGetAttachment", {buffer, key, 0});
+    release(key);
+    return value && cf.utf8(value) == "ITU_R_709_2";
+}
+
+std::optional<Pixels> VImageCG::read_pixel_buffer(GuestMemory& m, Address buffer, bool bt709, std::uint64_t& width, std::uint64_t& height) {
+    const auto code = static_cast<std::uint32_t>(call(core_video, "_CVPixelBufferGetPixelFormatType", {buffer}));
+    width = call(core_video, "_CVPixelBufferGetWidth", {buffer});
+    height = call(core_video, "_CVPixelBufferGetHeight", {buffer});
+    if (const auto l = packed_layout(code))
+        return decode(m, *l, call(core_video, "_CVPixelBufferGetBaseAddress", {buffer}), call(core_video, "_CVPixelBufferGetBytesPerRow", {buffer}), width, height);
+    const Ycc k{bt709 ? 0.2126 : 0.299, bt709 ? 0.0722 : 0.114, code == cv_420f};
+    Pixels out(static_cast<std::size_t>(width * height));
+    if (code == cv_420v || code == cv_420f) {
+        const auto y = call(core_video, "_CVPixelBufferGetBaseAddressOfPlane", {buffer, 0}), y_row = call(core_video, "_CVPixelBufferGetBytesPerRowOfPlane", {buffer, 0});
+        const auto c = call(core_video, "_CVPixelBufferGetBaseAddressOfPlane", {buffer, 1}), c_row = call(core_video, "_CVPixelBufferGetBytesPerRowOfPlane", {buffer, 1});
+        for (std::uint64_t row = 0; row < height; ++row)
+            for (std::uint64_t x = 0; x < width; ++x) {
+                const auto chroma = c + (row / 2) * c_row + (x / 2) * 2;
+                out[row * width + x] = ycc_to_rgb(k, m.read8(y + row * y_row + x), m.read8(chroma), m.read8(chroma + 1));
+            }
+        return out;
+    }
+    if (code == cv_2vuy) {   // Cb Y0 Cr Y1
+        const auto base = call(core_video, "_CVPixelBufferGetBaseAddress", {buffer}), row_bytes = call(core_video, "_CVPixelBufferGetBytesPerRow", {buffer});
+        for (std::uint64_t row = 0; row < height; ++row)
+            for (std::uint64_t x = 0; x < width; ++x) {
+                const auto pair = base + row * row_bytes + (x / 2) * 4;
+                out[row * width + x] = ycc_to_rgb(k, m.read8(pair + (x % 2 ? 3 : 1)), m.read8(pair), m.read8(pair + 2));
+            }
+        return out;
+    }
+    return std::nullopt;
+}
+
+bool VImageCG::write_pixel_buffer(GuestMemory& m, Address buffer, bool bt709, const Pixels& pixels, std::uint64_t width, std::uint64_t height,
+                                  const std::array<double, 4>& background) {
+    const auto code = static_cast<std::uint32_t>(call(core_video, "_CVPixelBufferGetPixelFormatType", {buffer}));
+    if (const auto l = packed_layout(code)) {
+        encode(m, *l, pixels, call(core_video, "_CVPixelBufferGetBaseAddress", {buffer}), call(core_video, "_CVPixelBufferGetBytesPerRow", {buffer}), width, height,
+               background);
+        return true;
+    }
+    const Ycc k{bt709 ? 0.2126 : 0.299, bt709 ? 0.0722 : 0.114, code == cv_420f};
+    // Alpha flattened over the background first.
+    const auto flat = [&](std::uint64_t x, std::uint64_t y) {
+        auto p = pixels[y * width + x];
+        for (unsigned c = 0; c < 3; ++c) p[c] = p[c] * p[3] + background[c] * (1 - p[3]);
+        return rgb_to_ycc(k, p);
+    };
+    if (code == cv_420v || code == cv_420f) {
+        const auto y = call(core_video, "_CVPixelBufferGetBaseAddressOfPlane", {buffer, 0}), y_row = call(core_video, "_CVPixelBufferGetBytesPerRowOfPlane", {buffer, 0});
+        const auto c = call(core_video, "_CVPixelBufferGetBaseAddressOfPlane", {buffer, 1}), c_row = call(core_video, "_CVPixelBufferGetBytesPerRowOfPlane", {buffer, 1});
+        for (std::uint64_t row = 0; row < height; ++row)
+            for (std::uint64_t x = 0; x < width; ++x) m.write8(y + row * y_row + x, luma_byte(k, flat(x, row)[0]));
+        for (std::uint64_t row = 0; row < (height + 1) / 2; ++row)
+            for (std::uint64_t x = 0; x < (width + 1) / 2; ++x) {
+                double cb = 0, cr = 0;
+                unsigned count = 0;
+                for (std::uint64_t dy = 0; dy < 2; ++dy)
+                    for (std::uint64_t dx = 0; dx < 2; ++dx) {
+                        const auto v = flat(std::min(x * 2 + dx, width - 1), std::min(row * 2 + dy, height - 1));
+                        cb += v[1];
+                        cr += v[2];
+                        ++count;
+                    }
+                m.write8(c + row * c_row + x * 2, chroma_byte(k, cb / count));
+                m.write8(c + row * c_row + x * 2 + 1, chroma_byte(k, cr / count));
+            }
+        return true;
+    }
+    if (code == cv_2vuy) {
+        const auto base = call(core_video, "_CVPixelBufferGetBaseAddress", {buffer}), row_bytes = call(core_video, "_CVPixelBufferGetBytesPerRow", {buffer});
+        for (std::uint64_t row = 0; row < height; ++row)
+            for (std::uint64_t x = 0; x < width; x += 2) {
+                const auto a = flat(x, row), b = flat(std::min(x + 1, width - 1), row);
+                const auto pair = base + row * row_bytes + (x / 2) * 4;
+                m.write8(pair, chroma_byte(k, (a[1] + b[1]) / 2));
+                m.write8(pair + 1, luma_byte(k, a[0]));
+                m.write8(pair + 2, chroma_byte(k, (a[2] + b[2]) / 2));
+                m.write8(pair + 3, luma_byte(k, b[0]));
+            }
+        return true;
+    }
+    return false;
+}
+
+void VImageCG::install_core_video() {
+    // vImageBuffer_InitWithCVPixelBuffer(vImage_Buffer *buffer, vImage_CGImageFormat *desiredFormat,
+    //     CVPixelBufferRef, vImageCVImageFormatRef, const CGFloat *backgroundColor, vImage_Flags flags)
+    kernel("_vImageBuffer_InitWithCVPixelBuffer", [this](CpuState& s, GuestMemory& m) {
+        const auto out = s.x[0], format = s.x[1], pixel_buffer = s.x[2];
+        const auto flags = static_cast<std::uint32_t>(s.x[5]);
+        if (!out || !format) return result(s, null_pointer);
+        if (!pixel_buffer) return result(s, invalid_image_object);
+        const auto target = layout(m, format);
+        if (!target) return result(s, invalid_image_format);
+        static_cast<void>(call(core_video, "_CVPixelBufferLockBaseAddress", {pixel_buffer, 1}));
+        std::uint64_t width{}, height{};
+        const auto pixels = read_pixel_buffer(m, pixel_buffer, buffer_is_709(pixel_buffer, s.x[3]), width, height);
+        static_cast<void>(call(core_video, "_CVPixelBufferUnlockBaseAddress", {pixel_buffer, 1}));
+        if (!pixels) return result(s, invalid_image_format);
+        Buffer b{};
+        if (flags & no_allocate) {
+            b = read_buffer(m, out);
+            if (!b.data || b.width != width || b.height != height || b.row_bytes < width * target->pixel_bytes()) return result(s, buffer_size_mismatch);
+        } else {
+            b = {0, height, width, ((width * target->pixel_bytes()) + 15) & ~std::uint64_t{15}};
+            b.data = call(libsystem, "_malloc", {std::max<std::uint64_t>(b.row_bytes * height, 16)});
+            if (!b.data) return result(s, memory_allocation_error);
+            m.write64(out, b.data);
+            m.write64(out + 8, height);
+            m.write64(out + 16, width);
+            m.write64(out + 24, b.row_bytes);
+        }
+        encode(m, *target, *pixels, b.data, b.row_bytes, width, height, background(m, s.x[4], *target));
+        result(s, no_error);
+    });
+    // vImageBuffer_CopyToCVPixelBuffer(const vImage_Buffer *buffer, const vImage_CGImageFormat *bufferFormat,
+    //     CVPixelBufferRef, vImageCVImageFormatRef, const CGFloat *backgroundColor, vImage_Flags flags)
+    kernel("_vImageBuffer_CopyToCVPixelBuffer", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[0] || !s.x[1]) return result(s, null_pointer);
+        if (!s.x[2]) return result(s, invalid_image_object);
+        const auto source = layout(m, s.x[1]);
+        if (!source) return result(s, invalid_image_format);
+        const auto b = read_buffer(m, s.x[0]);
+        const auto width = call(core_video, "_CVPixelBufferGetWidth", {s.x[2]}), height = call(core_video, "_CVPixelBufferGetHeight", {s.x[2]});
+        if (!b.data || b.width < width || b.height < height) return result(s, buffer_size_mismatch);
+        const auto pixels = decode(m, *source, b.data, b.row_bytes, width, height);
+        Layout rgb{8, 32, alpha_premultiplied_last, 0, false, 3, 0};
+        static_cast<void>(call(core_video, "_CVPixelBufferLockBaseAddress", {s.x[2], 0}));
+        const bool written = write_pixel_buffer(m, s.x[2], buffer_is_709(s.x[2], s.x[3]), pixels, width, height, background(m, s.x[4], rgb));
+        static_cast<void>(call(core_video, "_CVPixelBufferUnlockBaseAddress", {s.x[2], 0}));
+        result(s, written ? no_error : invalid_image_format);
+    });
+    // vImageCVImageFormatRef vImageCVImageFormat_Create(uint32_t imageFormatType, const vImage_ARGBToYpCbCrMatrix *matrix,
+    //     CFStringRef cvImageBufferChromaLocation, CGColorSpaceRef baseColorspace, int alphaIsOpaqueHint):
+    // the matrix is taken as BT.709 when its first coefficient is 0.2126.
+    const auto make = [this](std::uint32_t code, bool bt709) {
+        const auto handle = process.allocate_guest(16, 16);
+        std::lock_guard lock(mutex_);
+        cv_formats_[handle] = CvFormat{code, bt709};
+        return handle;
+    };
+    kernel("_vImageCVImageFormat_Create", [make](CpuState& s, GuestMemory& m) {
+        const bool bt709 = s.x[1] && std::fabs(std::bit_cast<float>(m.read32(s.x[1])) - 0.2126f) < 1e-4f;
+        s.x[0] = make(static_cast<std::uint32_t>(s.x[0]), bt709);
+    });
+    kernel("_vImageCVImageFormat_CreateWithCVPixelBuffer", [this, make](CpuState& s, GuestMemory&) {
+        if (!s.x[0]) { s.x[0] = 0; return; }
+        const auto code = static_cast<std::uint32_t>(call(core_video, "_CVPixelBufferGetPixelFormatType", {s.x[0]}));
+        s.x[0] = make(code, buffer_is_709(s.x[0], 0));
+    });
+    kernel("_vImageCVImageFormat_Retain", [this](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(mutex_);
+        if (const auto found = cv_formats_.find(s.x[0]); found != cv_formats_.end()) ++found->second.references;
+    });
+    kernel("_vImageCVImageFormat_Release", [this](CpuState& s, GuestMemory&) {
+        bool gone = false;
+        {
+            std::lock_guard lock(mutex_);
+            const auto found = cv_formats_.find(s.x[0]);
+            if (found == cv_formats_.end()) return;
+            if (--found->second.references == 0) { cv_formats_.erase(found); gone = true; }
+        }
+        if (gone) process.release_guest(s.x[0]);
+    });
+    kernel("_vImageCVImageFormat_GetFormatCode", [this](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(mutex_);
+        const auto found = cv_formats_.find(s.x[0]);
+        s.x[0] = found != cv_formats_.end() ? found->second.code : 0;
+    });
+}
+
 void VImageCG::install() {
+    install_core_video();
     // vImageBuffer_InitWithCGImage(vImage_Buffer *buf, vImage_CGImageFormat *format,
     //     const CGFloat *backgroundColor, CGImageRef image, vImage_Flags flags)
     kernel("_vImageBuffer_InitWithCGImage", [this](CpuState& s, GuestMemory& m) {

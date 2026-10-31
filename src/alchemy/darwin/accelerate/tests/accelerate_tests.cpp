@@ -3,6 +3,7 @@
 // (blas.cpp), and BNNS, where no filter can be created (bnns.cpp).
 #include "alchemy/gui/tests/framework_case.hpp"
 
+#include <array>
 #include <bit>
 #include <cmath>
 
@@ -176,6 +177,63 @@ void vectors(Fixture& f) {
     const auto xd = doubles(f, {0, 1.5707963267948966}), sines = f.block(16), cosines = f.block(16);
     static_cast<void>(f.call(vdsp, "_vvsincos", {sines, cosines, xd, n}));
     require(read_double(f, sines, 0) == 0 && near(read_double(f, sines, 1), 1) && read_double(f, cosines, 0) == 1, "vvsincos");
+}
+
+// Y'CbCr 4:2:0 tri-planar round trip, chunky/planar, and CVPixelBuffer copies (420v and BGRA).
+void vimage_video(Fixture& f) {
+    constexpr std::string_view cv = "/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo";
+    // BT.601 video range.
+    const auto range = f.block(32);
+    const std::array<std::uint32_t, 8> video{16, 128, 235, 240, 235, 16, 240, 16};
+    for (unsigned i = 0; i < 8; ++i) f.engine.write32(range + 4 * i, video[i]);
+    const auto to_ycc = f.block(128), to_rgb = f.block(128);
+    require(verror(f.call(vdsp, "_vImageConvert_ARGBToYpCbCr_GenerateConversion",
+                          {f.engine.read64(f.symbol(vdsp, "_kvImage_ARGBToYpCbCrMatrix_ITU_R_601_4")), range, to_ycc, 0, 0, 0})) == 0 &&
+                verror(f.call(vdsp, "_vImageConvert_YpCbCrToARGB_GenerateConversion",
+                              {f.engine.read64(f.symbol(vdsp, "_kvImage_YpCbCrToARGBMatrix_ITU_R_601_4")), range, to_rgb, 0, 0, 0})) == 0,
+            "Y'CbCr conversions");
+    // A 2x2 ARGB block of (255, 200, 100, 50) through 420Yp8_Cb8_Cr8 and back.
+    const auto argb = f.block(16), back = f.block(16), y = f.block(4), cb = f.block(1), cr = f.block(1);
+    for (unsigned i = 0; i < 4; ++i) f.engine.write32(argb + 4 * i, 0x3264c8ff);
+    require(verror(f.call(vdsp, "_vImageConvert_ARGB8888To420Yp8_Cb8_Cr8",
+                          {image_buffer(f, argb, 2, 2, 8), image_buffer(f, y, 2, 2, 2), image_buffer(f, cb, 1, 1, 1), image_buffer(f, cr, 1, 1, 1), to_ycc, 0, 0})) == 0,
+            "ARGB8888To420Yp8_Cb8_Cr8");
+    alchemy::CallRegs decode{};
+    decode.x = {image_buffer(f, y, 2, 2, 2), image_buffer(f, cb, 1, 1, 1), image_buffer(f, cr, 1, 1, 1), image_buffer(f, back, 2, 2, 8), to_rgb, 0, 255, 0};
+    require(verror(f.regs(vdsp, "_vImageConvert_420Yp8_Cb8_Cr8ToARGB8888", decode).x0) == 0, "420Yp8_Cb8_Cr8ToARGB8888");
+    const auto near_byte = [&](Address at, unsigned want) { return std::abs(static_cast<int>(f.memory().read8(at)) - static_cast<int>(want)) <= 2; };
+    require(near_byte(back + 1, 200) && near_byte(back + 2, 100) && near_byte(back + 3, 50) && f.memory().read8(back) == 255,
+            "the round trip keeps the colour: " + std::to_string(f.memory().read8(back + 1)) + " " + std::to_string(f.memory().read8(back + 2)) + " " +
+                std::to_string(f.memory().read8(back + 3)));
+    // PlanarToChunky8: two 2x1 planes interleaved with a stride of 2.
+    const auto planes = f.block(64), p0 = f.block(2), p1 = f.block(2), chunky = f.block(4), pointers = f.block(16);
+    f.memory().write8(p0, 1); f.memory().write8(p0 + 1, 2); f.memory().write8(p1, 3); f.memory().write8(p1 + 1, 4);
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto b = image_buffer(f, i ? p1 : p0, 1, 2, 2);
+        for (unsigned w = 0; w < 4; ++w) f.engine.write64(planes + 32 * i + 8 * w, f.engine.read64(b + 8 * w));
+    }
+    f.engine.write64(pointers, chunky);
+    f.engine.write64(pointers + 8, chunky + 1);
+    require(verror(f.call(vdsp, "_vImageConvert_PlanarToChunky8", {planes, pointers, 2, 2, 2, 1, 4, 0})) == 0 && f.engine.read32(chunky) == 0x04020301,
+            "PlanarToChunky8");
+    // A 2x2 red RGBA buffer into a 420v CVPixelBuffer and back.
+    const auto red = f.block(16), returned = f.block(32), rgba = f.block(40);
+    for (unsigned i = 0; i < 4; ++i) f.engine.write32(red + 4 * i, 0xff0000ff);
+    f.engine.write32(rgba, 8);
+    f.engine.write32(rgba + 4, 32);
+    f.engine.write32(rgba + 16, 3);   // alpha last
+    const auto out = f.block(8);
+    require(f.status(cv, "_CVPixelBufferCreate", {0, 2, 2, 0x34323076, 0, out}) == 0, "a 420v pixel buffer");
+    const auto pixel_buffer = f.engine.read64(out);
+    require(verror(f.call(vdsp, "_vImageBuffer_CopyToCVPixelBuffer", {image_buffer(f, red, 2, 2, 8), rgba, pixel_buffer, 0, 0, 0})) == 0,
+            "vImageBuffer_CopyToCVPixelBuffer to 420v");
+    require(verror(f.call(vdsp, "_vImageBuffer_InitWithCVPixelBuffer", {returned, rgba, pixel_buffer, 0, 0, 0})) == 0, "vImageBuffer_InitWithCVPixelBuffer from 420v");
+    const auto data = f.engine.read64(returned);
+    require(near_byte(data, 255) && near_byte(data + 1, 0) && near_byte(data + 2, 0) && f.memory().read8(data + 3) == 255,
+            "red survives 420v: " + std::to_string(f.memory().read8(data)) + " " + std::to_string(f.memory().read8(data + 1)) + " " + std::to_string(f.memory().read8(data + 2)));
+    const auto format = f.call(vdsp, "_vImageCVImageFormat_CreateWithCVPixelBuffer", {pixel_buffer});
+    require(format && f.call(vdsp, "_vImageCVImageFormat_GetFormatCode", {format}) == 0x34323076, "vImageCVImageFormat");
+    static_cast<void>(f.call(vdsp, "_vImageCVImageFormat_Release", {format}));
 }
 
 // vImage and CoreGraphics: a buffer to a CGImage and back in another layout, and a converter to gray.
@@ -464,6 +522,7 @@ const Case accelerate_case("accelerate", [](Fixture& f) {
     vdsp_more(f);
     vimage_more(f);
     vimage_cg(f);
+    vimage_video(f);
 });
 
 } // namespace

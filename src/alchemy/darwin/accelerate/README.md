@@ -44,7 +44,12 @@
   `vImageCreateCGImageFromBuffer`, `vImageConverter_CreateWithCGImageFormat` with
   `vImageConvert_AnyToAny`, and the format and size helpers, for gray and RGB images with 8-bit,
   16-bit or float components, any alpha placement and the default, 16Little and 32Little byte orders.
-  There is no colour management: RGB becomes gray by Rec. 709 luma.
+  There is no colour management: RGB becomes gray by Rec. 709 luma. CVPixelBuffer copies
+  (`vImageBuffer_InitWithCVPixelBuffer`, `vImageBuffer_CopyToCVPixelBuffer`, `vImageCVImageFormat_*`)
+  cover 32BGRA, 32ARGB, 32RGBA, 24RGB, 420v, 420f and 2vuy (BT.601, or BT.709 from the buffer's matrix).
+* **Real, more Y'CbCr and chunky/planar (`vdsp.cpp`):** 4:2:0 tri-planar to and from ARGB8888, ARGB8888
+  to 4:2:0 bi-planar, 4:2:2 in YpCbYpCr order both ways, and `vImageConvert_PlanarToChunky8`/`F` and
+  `ChunkyToPlanar8`/`F`.
 * **Real, more vDSP (`vdsp_more.cpp`), float and double:** compound arithmetic (vasm, vsbm, vaam,
   vmma, vintb, vpythg, ...), applied ramps, clipping with counts, running sums and integrals,
   normalize, zero crossings, sorting and gathering, polynomials and table interpolation, polar and

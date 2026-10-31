@@ -98,6 +98,7 @@ public:
     }
     void install();
     void install_vimage();
+    void install_more_ycbcr();
 };
 
 void Accelerate::install() {
@@ -621,6 +622,177 @@ void Accelerate::install_vimage() {
         }
         s.x[0] = no_error;
     });
+    install_more_ycbcr();
+}
+
+// The other Y'CbCr layouts, decoding through to_argb and encoding through to_ycbcr as above:
+// 4:2:0 tri-planar (Yp8, Cb8, Cr8), ARGB to 4:2:0 bi-planar (Yp8, CbCr8) and tri-planar (the
+// chroma of each 2x2 block is the mean of its pixels'), and 4:2:2 in YpCbYpCr order (YUYV).
+void Accelerate::install_more_ycbcr() {
+    using namespace vimage;
+    const auto fail = [](CpuState& s, std::int64_t code) { s.x[0] = static_cast<std::uint64_t>(code); };
+    // vImageConvert_420Yp8_Cb8_Cr8ToARGB8888(srcYp, srcCb, srcCr, dest, info, permuteMap, alpha, flags)
+    raw(accelerate, "_vImageConvert_420Yp8_Cb8_Cr8ToARGB8888", [fail](CpuState& s, GuestMemory& m) {
+        for (unsigned i = 0; i < 5; ++i) if (!s.x[i]) return fail(s, null_pointer);
+        const auto info = read_info<5>(m, s.x[4], to_argb_magic);
+        const auto map = permute_map(m, s.x[5]);
+        if (!info || !valid_map(map)) return fail(s, invalid_parameter);
+        const ToArgb c{info->first, info->second};
+        const auto alpha = static_cast<std::uint8_t>(s.x[6]);
+        const auto luma = read_buffer(m, s.x[0]), cb = read_buffer(m, s.x[1]), cr = read_buffer(m, s.x[2]), dest = read_buffer(m, s.x[3]);
+        if (luma.width < dest.width || luma.height < dest.height || cb.width * 2 < dest.width || cb.height * 2 < dest.height ||
+            cr.width * 2 < dest.width || cr.height * 2 < dest.height)
+            return fail(s, roi_larger_than_input);
+        if (dest.width * dest.height > maximum_length) throw std::runtime_error("Alchemy vImage: image too large");
+        const auto half = static_cast<std::size_t>((dest.width + 1) / 2);
+        for (std::uint64_t row = 0; row < dest.height; ++row) {
+            std::vector<std::uint8_t> y(static_cast<std::size_t>(dest.width)), u(half), v(half), out(static_cast<std::size_t>(dest.width * 4));
+            m.read_bytes(luma.data + row * luma.row_bytes, y);
+            m.read_bytes(cb.data + (row / 2) * cb.row_bytes, u);
+            m.read_bytes(cr.data + (row / 2) * cr.row_bytes, v);
+            for (std::size_t x = 0; x < y.size(); ++x) {
+                const auto argb = to_argb(c, y[x], u[x / 2], v[x / 2], alpha);
+                for (unsigned i = 0; i < 4; ++i) out[x * 4 + i] = argb[map[i]];
+            }
+            m.write_bytes(dest.data + row * dest.row_bytes, out);
+        }
+        s.x[0] = no_error;
+    });
+    // ARGB to 4:2:0: vImageConvert_ARGB8888To420Yp8_CbCr8(src, destYp, destCbCr, info, permuteMap, flags) and
+    // vImageConvert_ARGB8888To420Yp8_Cb8_Cr8(src, destYp, destCb, destCr, info, permuteMap, flags).
+    for (const bool planar : {false, true}) {
+        raw(accelerate, planar ? "_vImageConvert_ARGB8888To420Yp8_Cb8_Cr8" : "_vImageConvert_ARGB8888To420Yp8_CbCr8", [fail, planar](CpuState& s, GuestMemory& m) {
+            const unsigned info_at = planar ? 4 : 3;
+            for (unsigned i = 0; i <= info_at; ++i) if (!s.x[i]) return fail(s, null_pointer);
+            const auto info = read_info<8>(m, s.x[info_at], to_ycbcr_magic);
+            const auto map = permute_map(m, s.x[info_at + 1]);
+            if (!info || !valid_map(map)) return fail(s, invalid_parameter);
+            const ToYcbcr c{info->first, info->second};
+            const auto src = read_buffer(m, s.x[0]), luma = read_buffer(m, s.x[1]);
+            const auto first = read_buffer(m, s.x[2]), second = planar ? read_buffer(m, s.x[3]) : Buffer{};
+            if (src.width < luma.width || src.height < luma.height || first.width * 2 < luma.width || first.height * 2 < luma.height)
+                return fail(s, roi_larger_than_input);
+            if (luma.width * luma.height > maximum_length) throw std::runtime_error("Alchemy vImage: image too large");
+            const auto width = luma.width, height = luma.height;
+            std::vector<std::array<double, 3>> pixels(static_cast<std::size_t>(width * height));
+            for (std::uint64_t row = 0; row < height; ++row) {
+                std::vector<std::uint8_t> in(static_cast<std::size_t>(width * 4)), y(static_cast<std::size_t>(width));
+                m.read_bytes(src.data + row * src.row_bytes, in);
+                for (std::uint64_t x = 0; x < width; ++x) {
+                    const auto* p = in.data() + x * 4;
+                    pixels[row * width + x] = to_ycbcr(c, p[map[1]], p[map[2]], p[map[3]]);
+                    y[x] = encode_luma(c.range, pixels[row * width + x][0]);
+                }
+                m.write_bytes(luma.data + row * luma.row_bytes, y);
+            }
+            const auto cw = (width + 1) / 2, ch = (height + 1) / 2;
+            for (std::uint64_t row = 0; row < ch; ++row) {
+                std::vector<std::uint8_t> uv(static_cast<std::size_t>(cw * 2)), u(static_cast<std::size_t>(cw)), v(static_cast<std::size_t>(cw));
+                for (std::uint64_t x = 0; x < cw; ++x) {
+                    double sb = 0, sr = 0;
+                    unsigned count = 0;
+                    for (std::uint64_t dy = 0; dy < 2; ++dy)
+                        for (std::uint64_t dx = 0; dx < 2; ++dx) {
+                            const auto px = std::min(x * 2 + dx, width - 1), py = std::min(row * 2 + dy, height - 1);
+                            sb += pixels[py * width + px][1];
+                            sr += pixels[py * width + px][2];
+                            ++count;
+                        }
+                    u[x] = uv[x * 2] = encode_chroma(c.range, sb / count);
+                    v[x] = uv[x * 2 + 1] = encode_chroma(c.range, sr / count);
+                }
+                if (planar) {
+                    m.write_bytes(first.data + row * first.row_bytes, u);
+                    m.write_bytes(second.data + row * second.row_bytes, v);
+                } else {
+                    m.write_bytes(first.data + row * first.row_bytes, uv);
+                }
+            }
+            s.x[0] = no_error;
+        });
+    }
+    // vImageConvert_422YpCbYpCr8ToARGB8888(src, dest, info, permuteMap, alpha, flags) and
+    // vImageConvert_ARGB8888To422YpCbYpCr8(src, dest, info, permuteMap, flags): Y0 Cb Y1 Cr.
+    raw(accelerate, "_vImageConvert_422YpCbYpCr8ToARGB8888", [fail](CpuState& s, GuestMemory& m) {
+        if (!s.x[0] || !s.x[1] || !s.x[2]) return fail(s, null_pointer);
+        const auto info = read_info<5>(m, s.x[2], to_argb_magic);
+        const auto map = permute_map(m, s.x[3]);
+        if (!info || !valid_map(map)) return fail(s, invalid_parameter);
+        const ToArgb c{info->first, info->second};
+        const auto alpha = static_cast<std::uint8_t>(s.x[4]);
+        const auto src = read_buffer(m, s.x[0]), dest = read_buffer(m, s.x[1]);
+        if (src.width < dest.width || src.height < dest.height) return fail(s, roi_larger_than_input);
+        if (dest.width * dest.height > maximum_length) throw std::runtime_error("Alchemy vImage: image too large");
+        for (std::uint64_t row = 0; row < dest.height; ++row) {
+            std::vector<std::uint8_t> in(static_cast<std::size_t>((dest.width + 1) / 2 * 4)), out(static_cast<std::size_t>(dest.width * 4));
+            m.read_bytes(src.data + row * src.row_bytes, in);
+            for (std::size_t x = 0; x < dest.width; ++x) {
+                const auto* pair = in.data() + x / 2 * 4;   // Y0 Cb Y1 Cr
+                const auto argb = to_argb(c, pair[x % 2 ? 2 : 0], pair[1], pair[3], alpha);
+                for (unsigned i = 0; i < 4; ++i) out[x * 4 + i] = argb[map[i]];
+            }
+            m.write_bytes(dest.data + row * dest.row_bytes, out);
+        }
+        s.x[0] = no_error;
+    });
+    raw(accelerate, "_vImageConvert_ARGB8888To422YpCbYpCr8", [fail](CpuState& s, GuestMemory& m) {
+        if (!s.x[0] || !s.x[1] || !s.x[2]) return fail(s, null_pointer);
+        const auto info = read_info<8>(m, s.x[2], to_ycbcr_magic);
+        const auto map = permute_map(m, s.x[3]);
+        if (!info || !valid_map(map)) return fail(s, invalid_parameter);
+        const ToYcbcr c{info->first, info->second};
+        const auto src = read_buffer(m, s.x[0]), dest = read_buffer(m, s.x[1]);
+        if (src.width < dest.width || src.height < dest.height) return fail(s, roi_larger_than_input);
+        if (dest.width * dest.height > maximum_length) throw std::runtime_error("Alchemy vImage: image too large");
+        for (std::uint64_t row = 0; row < dest.height; ++row) {
+            std::vector<std::uint8_t> in(static_cast<std::size_t>(dest.width * 4)), out(static_cast<std::size_t>((dest.width + 1) / 2 * 4));
+            m.read_bytes(src.data + row * src.row_bytes, in);
+            for (std::size_t x = 0; x < dest.width; x += 2) {
+                const auto* p0 = in.data() + x * 4;
+                const auto* p1 = x + 1 < dest.width ? p0 + 4 : p0;
+                const auto a = to_ycbcr(c, p0[map[1]], p0[map[2]], p0[map[3]]);
+                const auto b = to_ycbcr(c, p1[map[1]], p1[map[2]], p1[map[3]]);
+                auto* o = out.data() + x / 2 * 4;
+                o[0] = encode_luma(c.range, a[0]);
+                o[1] = encode_chroma(c.range, (a[1] + b[1]) / 2);
+                o[2] = encode_luma(c.range, b[0]);
+                o[3] = encode_chroma(c.range, (a[2] + b[2]) / 2);
+            }
+            m.write_bytes(dest.data + row * dest.row_bytes, out);
+        }
+        s.x[0] = no_error;
+    });
+    // Chunky <-> planar: vImageConvert_PlanarToChunky8 / F(const vImage_Buffer srcPlanarBuffers[], void *destChannels[],
+    //     unsigned channelCount, size_t destStrideBytes, vImagePixelCount destWidth, destHeight, size_t destRowBytes, flags)
+    // and vImageConvert_ChunkyToPlanar8 / F(const void *srcChannels[], const vImage_Buffer destPlanarBuffers[],
+    //     unsigned channelCount, size_t srcStrideBytes, vImagePixelCount srcWidth, srcHeight, size_t srcRowBytes, flags):
+    // channel i of pixel x on row y is at channels[i] + y * rowBytes + x * stride.
+    for (const unsigned size : {1U, 4U})
+        for (const bool to_chunky : {true, false}) {
+            const auto name = std::string(to_chunky ? "_vImageConvert_PlanarToChunky" : "_vImageConvert_ChunkyToPlanar") + (size == 1 ? "8" : "F");
+            raw(accelerate, name, [fail, size, to_chunky](CpuState& s, GuestMemory& m) {
+                if (!s.x[0] || !s.x[1]) return fail(s, null_pointer);
+                const auto channels = static_cast<std::uint32_t>(s.x[2]);
+                const auto stride = s.x[3], width = s.x[4], height = s.x[5], row_bytes = s.x[6];
+                if (!channels || channels > 64 || stride < size) return fail(s, invalid_parameter);
+                if (width * height * channels > maximum_length) throw std::runtime_error("Alchemy vImage: image too large");
+                const auto buffers = to_chunky ? s.x[0] : s.x[1], pointers = to_chunky ? s.x[1] : s.x[0];
+                std::vector<std::uint8_t> sample(size);
+                for (std::uint32_t c = 0; c < channels; ++c) {
+                    const auto plane = read_buffer(m, buffers + 32ULL * c);
+                    const auto base = m.read64(pointers + 8ULL * c);
+                    if (!plane.data || !base) return fail(s, null_pointer);
+                    if (plane.width < width || plane.height < height) return fail(s, roi_larger_than_input);
+                    for (std::uint64_t y = 0; y < height; ++y)
+                        for (std::uint64_t x = 0; x < width; ++x) {
+                            const auto planar = plane.data + y * plane.row_bytes + x * size, chunky = base + y * row_bytes + x * stride;
+                            m.read_bytes(to_chunky ? planar : chunky, sample);
+                            m.write_bytes(to_chunky ? chunky : planar, sample);
+                        }
+                }
+                s.x[0] = no_error;
+            });
+        }
 }
 
 } // namespace
