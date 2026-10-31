@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <span>
 #include <atomic>
 #include <cstdint>
 #include <map>
@@ -41,6 +42,8 @@
 //   <stdio.h>     fmtcheck
 //   <ctype.h>     __istype, __isctype, __tolower_l, __toupper_l, _CurrentRuneLocale (the C
 //                 locale, over misc/locale.cpp's rune table)
+//   <sys/mount.h> getvfsbyname (the file system types of the mounted volumes, as getfsstat reports them)
+//   <time.h>      getdate, getdate_err (the DATEMSK templates through strptime, POSIX's defaults)
 //   QLab's: _dyld_is_objc_constant (no shared cache, so nothing is one), os_system_version_get_current_version
 //                 (darwin_version.hpp's macOS), voucher_adopt (each thread's adopted voucher)
 namespace alchemy::export_fill {
@@ -886,6 +889,125 @@ void install_libsystem_bsd_extra(Provider& p) {
         std::lock_guard lock(vouchers->mutex);
         auto& slot = vouchers->adopted[identity];
         return std::exchange(slot, s.x[0]);
+    }, 0);
+    // int getvfsbyname(const char* name, struct vfsconf* vfc): a file system type is configured when a mounted
+    // volume has it (getfsstat). struct vfsconf: vfc_reserved1 @0, vfc_name[15] @4, vfc_typenum @20 (statfs's
+    // f_type), vfc_refcount @24 (the volumes of that type), vfc_flags @28 (MNT_LOCAL), reserved @32 and @36.
+    p.libsystem("_getvfsbyname", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto name = bounded_string(m, s.x[0], 64);
+        if (!s.x[1]) throw Errno{efault};
+        constexpr std::uint64_t statfs_size = 2168;
+        const auto count = p.call(libsystem_library, "_getfsstat", {0, 0, 2});
+        if (count == UINT32_MAX || count == UINT64_MAX || !count) throw Errno{enoent};
+        const auto buffer = p.malloc(count * statfs_size);
+        const auto filled = p.call(libsystem_library, "_getfsstat", {buffer, count * statfs_size, 2});
+        std::uint32_t references{}, flags{}, type{};
+        for (std::uint64_t k = 0; filled <= count && k < filled; ++k) {
+            const auto entry = buffer + k * statfs_size;
+            if (bounded_string(m, entry + 72, 16) != name) continue;
+            ++references;
+            flags |= m.read32(entry + 64) & 0x1000U;
+            type = m.read32(entry + 60);
+        }
+        p.call(libsystem_library, "_free", {buffer});
+        if (!references || name.size() > 14) throw Errno{enoent};
+        m.fill_bytes(s.x[1], 0, 40);
+        m.write_bytes(s.x[1] + 4, std::span(reinterpret_cast<const std::uint8_t*>(name.data()), name.size()));
+        m.write32(s.x[1] + 20, type);
+        m.write32(s.x[1] + 24, references);
+        m.write32(s.x[1] + 28, flags);
+        return 0;
+    });
+    // struct tm* getdate(const char* string): the first DATEMSK template line strptime matches in full, with
+    // POSIX's defaults for what the template leaves out (the current time; a time already past today means
+    // tomorrow; a weekday alone means its next occurrence, today included; a month before the current one
+    // means next year; a month without a day its first), normalized by mktime. Failures set getdate_err:
+    // 1 no DATEMSK, 2 cannot open, 3 cannot stat, 4 not a regular file, 5 read error, 7 no template
+    // matches, 8 invalid date. The result is per thread.
+    const auto getdate_err = p.data(libsystem_library, "_getdate_err", 4);
+    auto dates = std::make_shared<ThreadBuffers>(process, 64);
+    p.libsystem("_getdate", [p, getdate_err, dates](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto fail = [&m, getdate_err](std::uint32_t code) -> std::uint64_t { m.write32(getdate_err, code); return 0; };
+        if (!s.x[0]) return fail(8);
+        const auto input = bounded_string(m, s.x[0], 1024);
+        const auto guest_text = [&p, &m](std::string_view value) {
+            const auto address = p.malloc(value.size() + 1);
+            m.write_bytes(address, std::span(reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+            m.write8(address + value.size(), 0);
+            return address;
+        };
+        const auto key = guest_text("DATEMSK");
+        const auto template_path = p.call(libsystem_library, "_getenv", {key});
+        p.call(libsystem_library, "_free", {key});
+        if (!template_path) return fail(1);
+        const auto mode = guest_text("r");
+        const auto file = p.call(libsystem_library, "_fopen", {template_path, mode});
+        p.call(libsystem_library, "_free", {mode});
+        if (!file) return fail(2);
+        const auto status = p.malloc(144);
+        const bool stat_ok = p.call(libsystem_library, "_fstat", {p.call(libsystem_library, "_fileno", {file}), status}) == 0;
+        const auto file_mode = m.read32(status + 4) & 0xffffU;   // st_mode (16 bits)
+        p.call(libsystem_library, "_free", {status});
+        if (!stat_ok || (file_mode & 0170000) != 0100000) { p.call(libsystem_library, "_fclose", {file}); return fail(stat_ok ? 4 : 3); }
+        // The current local time, for the defaults.
+        const auto clock = p.malloc(8 + 64);
+        m.write64(clock, p.call(libsystem_library, "_time", {0}));
+        p.call(libsystem_library, "_localtime_r", {clock, clock + 8});
+        std::array<std::int32_t, 9> now{};
+        for (std::size_t k = 0; k < now.size(); ++k) now[k] = static_cast<std::int32_t>(m.read32(clock + 8 + k * 4));
+        const auto line = p.malloc(16), result = dates->get();
+        m.write64(line, 0); m.write64(line + 8, 0);
+        constexpr std::int32_t unset = INT32_MIN;
+        enum : std::size_t { sec, min, hour, mday, mon, year, wday };
+        std::uint32_t outcome = 7;
+        for (;;) {
+            const auto length = p.call(libsystem_library, "_getline", {line, line + 8, file});
+            if (length == UINT64_MAX) { if (p.call(libsystem_library, "_ferror", {file})) outcome = 5; break; }
+            auto format = bounded_string(m, m.read64(line), 4096);
+            while (!format.empty() && (format.back() == '\n' || format.back() == '\r')) format.pop_back();
+            if (format.empty()) continue;
+            const auto format_address = guest_text(format);
+            m.fill_bytes(result, 0, 64);
+            for (std::size_t k = 0; k < 8; ++k) m.write32(result + k * 4, static_cast<std::uint32_t>(unset));
+            const auto end = p.call(libsystem_library, "_strptime", {s.x[0], format_address, result});
+            p.call(libsystem_library, "_free", {format_address});
+            if (!end) continue;
+            if (input.find_first_not_of(" \t\n", static_cast<std::size_t>(end - s.x[0])) != std::string::npos) continue;
+            std::array<std::int32_t, 8> tm{};
+            for (std::size_t k = 0; k < tm.size(); ++k) tm[k] = static_cast<std::int32_t>(m.read32(result + k * 4));
+            const bool has_time = tm[hour] != unset || tm[min] != unset || tm[sec] != unset;
+            const bool has_date = tm[mday] != unset || tm[mon] != unset || tm[year] != unset;
+            if (!has_time) { tm[hour] = now[hour]; tm[min] = now[min]; tm[sec] = now[sec]; }
+            else {
+                if (tm[hour] == unset) tm[hour] = now[hour];
+                if (tm[min] == unset) tm[min] = 0;
+                if (tm[sec] == unset) tm[sec] = 0;
+            }
+            if (!has_date && tm[wday] != unset) {
+                tm[year] = now[year]; tm[mon] = now[mon];
+                tm[mday] = now[mday] + (tm[wday] - now[wday] + 7) % 7;
+            } else if (!has_date) {
+                tm[year] = now[year]; tm[mon] = now[mon]; tm[mday] = now[mday];
+                const auto given = (tm[hour] * 60 + tm[min]) * 60 + tm[sec], current = (now[hour] * 60 + now[min]) * 60 + now[sec];
+                if (given < current) ++tm[mday];
+            } else {
+                const bool has_year = tm[year] != unset;
+                if (!has_year) tm[year] = now[year];
+                if (tm[mon] == unset) tm[mon] = now[mon];
+                else if (!has_year && tm[mon] < now[mon]) ++tm[year];
+                if (tm[mday] == unset) tm[mday] = 1;
+            }
+            for (std::size_t k = 0; k < 6; ++k) m.write32(result + k * 4, static_cast<std::uint32_t>(tm[k]));
+            m.write32(result + 32, static_cast<std::uint32_t>(-1));   // tm_isdst: mktime decides
+            outcome = p.call(libsystem_library, "_mktime", {result}) == UINT64_MAX ? 8 : 0;
+            break;
+        }
+        p.call(libsystem_library, "_free", {m.read64(line)});
+        p.call(libsystem_library, "_free", {line});
+        p.call(libsystem_library, "_free", {clock});
+        p.call(libsystem_library, "_fclose", {file});
+        if (outcome) return fail(outcome);
+        return result;
     }, 0);
     // _RuneLocale* _CurrentRuneLocale: the C locale's table.
     if (const auto rune = process.resolve(libsystem_library, "__DefaultRuneLocale")) {

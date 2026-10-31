@@ -51,4 +51,5 @@ void install_libsystem_threads_extra(Provider& p);   // process/threads_extra.cp
 void install_libsystem_bsd_extra(Provider& p);       // misc/bsd_extra.cpp: BSD libc leftovers (string, stdlib, pwcache, ...)
 void install_libsystem_netdb_extra(Provider& p);     // net/netdb_extra.cpp: netdb leftovers and the /etc databases
 void install_libsystem_mach_extra(Provider& p);      // mach/mach_extra.cpp: the MIG server loop, mig_*, clock_sleep, ...
+void install_libsystem_wordexp(Provider& p);         // fs/wordexp.cpp: wordexp(3), wordfree(3)
 } // namespace alchemy::export_fill

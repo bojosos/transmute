@@ -22,6 +22,7 @@ void install_libsystem_gaps(gui::InstallContext& context) {
     export_fill::install_libsystem_bsd_extra(p);
     export_fill::install_libsystem_netdb_extra(p);
     export_fill::install_libsystem_mach_extra(p);
+    export_fill::install_libsystem_wordexp(p);
 }
 
 void install_libsystem_services(gui::InstallContext& context) {

@@ -477,6 +477,24 @@ void test_runtime_api() {
     f.engine.write64(meta_bytes, 0xa5a5);
     require(f.call("_class_getSuperclass", {extra}) == root && f.engine.read64(class_bytes + 16) == 0x5a5a && f.call("_class_getSuperclass", {extra_meta}) != 0,
             "writing the extra bytes leaves the class intact");
+    // objc_duplicateClass: same superclass and methods, each its own Method; Nil for a taken name.
+    const auto original = f.call("_objc_allocateClassPair", {root, f.string("AlchemyDupOriginal"), 0});
+    require(f.add_guest_method(original, "answer", f.code(return_27)), "a method to duplicate");
+    static_cast<void>(f.call("_objc_registerClassPair", {original}));
+    const auto duplicate = f.call("_objc_duplicateClass", {original, f.string("AlchemyDupCopy"), 0});
+    const auto answer = f.runtime.selector("answer");
+    require(duplicate != 0 && duplicate != original && f.call("_class_getSuperclass", {duplicate}) == root &&
+            f.call("_objc_getClass", {f.string("AlchemyDupCopy")}) == duplicate, "objc_duplicateClass registers the copy");
+    const auto copied = f.call("_class_getInstanceMethod", {duplicate, answer}), own = f.call("_class_getInstanceMethod", {original, answer});
+    require(copied != 0 && copied != own && f.call("_method_getImplementation", {copied}) == f.call("_method_getImplementation", {own}),
+            "the copy has its own Method with the same IMP");
+    static_cast<void>(f.call("_method_setImplementation", {copied, f.code(return_42)}));
+    const auto copy_object = f.call("_class_createInstance", {duplicate, 0}), original_object = f.call("_class_createInstance", {original, 0});
+    require(f.call("_objc_msgSend", {copy_object, answer}) == 42 && f.call("_objc_msgSend", {original_object, answer}) == 27,
+            "changing the copy's method leaves the original");
+    require(f.call("_objc_duplicateClass", {original, f.string("AlchemyDupCopy"), 0}) == 0, "objc_duplicateClass with a name in use");
+    static_cast<void>(f.call("_objc_release", {copy_object}));
+    static_cast<void>(f.call("_objc_release", {original_object}));
     const auto extra_object = f.call("_class_createInstance", {extra, 0});
     require(extra_object != 0 && f.call("_object_getClass", {extra_object}) == extra, "an instance of a class with extra bytes");
     static_cast<void>(f.call("_objc_release", {extra_object}));

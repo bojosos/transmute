@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <thread>
+#include <tuple>
 
 namespace {
 
@@ -824,6 +825,94 @@ void test_itimers(Fixture& f) {
     f.sys("_signal", {14, 0});
 }
 
+// fs/wordexp.cpp; getvfsbyname and getdate (misc/bsd_extra.cpp).
+void test_b16(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto set = [&f](std::string_view name, std::string_view value) { f.sys("_setenv", {f.text(name), f.text(value), 1}); };
+    const auto we = f.process.allocate_guest(24);
+    f.engine.fill_bytes(we, 0, 24);
+    const auto words = [&f, we] {
+        std::vector<std::string> result;
+        const auto vector = f.engine.read64(we + 8), offsets = f.engine.read64(we + 16);
+        for (std::uint64_t k = 0; k < f.engine.read64(we); ++k) result.push_back(f.read(f.engine.read64(vector + (offsets + k) * 8)));
+        return result;
+    };
+    const auto expand = [&f, we, &words](std::string_view input, std::uint64_t flags = 0) {
+        const auto status = f.sys("_wordexp", {f.text(input), we, flags});
+        return std::make_pair(status, status == 0 ? words() : std::vector<std::string>{});
+    };
+    set("WE_FOO", "a b");
+    set("HOME", "/Users/test");
+    set("WE_EMPTY", "");
+    // Quotes, parameters, tilde, arithmetic, defaults, splitting and escapes.
+    auto [status, result] = expand("x $WE_FOO 'q r' \"$WE_FOO\" ~/d ${WE_FOO#a} ${#WE_FOO} $((1+2*3)) $(( (7-1) % 4 << 2 )) ${WE_UNSET:-def} a\\ b");
+    require(status == 0 && (result == std::vector<std::string>{"x", "a", "b", "q r", "a b", "/Users/test/d", "b", "3", "7", "8", "def", "a b"}),
+            "wordexp expands, splits and removes quotes");
+    f.sys("_wordfree", {we});
+    require(f.engine.read64(we) == 0 && f.engine.read64(we + 8) == 0, "wordfree");
+    std::tie(status, result) = expand("\"\" $WE_EMPTY \"$WE_EMPTY\" ${WE_FOO:+set} ${WE_NEW=made} $WE_NEW ${WE_FOO%% *}");
+    require(status == 0 && (result == std::vector<std::string>{"", "", "set", "made", "made", "a"}), "empty words and the ${} operators");
+    f.sys("_wordfree", {we});
+    set("IFS", ":");
+    set("WE_LIST", "a::b");
+    std::tie(status, result) = expand("$WE_LIST");
+    require(status == 0 && (result == std::vector<std::string>{"a", "", "b"}), "IFS splitting keeps empty fields");
+    f.sys("_wordfree", {we});
+    f.sys("_unsetenv", {f.text("IFS")});
+    // Errors: no shell grammar, no command substitution with WRDE_NOCMD, WRDE_UNDEF, unbalanced quotes.
+    require(f.sys("_wordexp", {f.text("a|b"), we, 0}) == 1 && f.sys("_wordexp", {f.text("a;b"), we, 0}) == 1, "WRDE_BADCHAR");
+    require(f.sys("_wordexp", {f.text("$(ls)"), we, 0x04}) == 3 && f.sys("_wordexp", {f.text("`ls`"), we, 0x04}) == 3, "WRDE_CMDSUB");
+    require(f.sys("_wordexp", {f.text("$WE_NOPE"), we, 0x20}) == 2 && f.sys("_wordexp", {f.text("${WE_NOPE?}"), we, 0}) == 2, "WRDE_BADVAL");
+    require(f.sys("_wordexp", {f.text("'open"), we, 0}) == 6 && f.sys("_wordexp", {f.text("$((1/0))"), we, 0}) == 6, "WRDE_SYNTAX");
+    // WRDE_DOOFFS reserves slots; WRDE_APPEND adds to the list.
+    f.engine.write64(we + 16, 2);
+    require(f.sys("_wordexp", {f.text("x"), we, 0x02}) == 0 && f.engine.read64(f.engine.read64(we + 8)) == 0 &&
+            f.engine.read64(f.engine.read64(we + 8) + 8) == 0, "WRDE_DOOFFS");
+    require(f.sys("_wordexp", {f.text("y z"), we, 0x02 | 0x01}) == 0 && (words() == std::vector<std::string>{"x", "y", "z"}), "WRDE_APPEND");
+    require(f.sys("_wordexp", {f.text("w"), we, 0x02 | 0x08}) == 0 && (words() == std::vector<std::string>{"w"}), "WRDE_REUSE");
+    f.sys("_wordfree", {we});
+    // Pathname expansion; a quoted pattern stays literal.
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy-wordexp";
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    std::filesystem::create_directories(directory);
+    for (const auto* name : {"a1.txt", "a2.txt", "b.dat"}) std::ofstream(directory / name) << name;
+    const auto guest_directory = alchemy::guest_path_string(directory);
+    std::tie(status, result) = expand(guest_directory + "/*.txt '" + guest_directory + "/*.txt' " + guest_directory + "/none*");
+    require(status == 0 && (result == std::vector<std::string>{guest_directory + "/a1.txt", guest_directory + "/a2.txt",
+                                                               guest_directory + "/*.txt", guest_directory + "/none*"}), "pathname expansion");
+    f.sys("_wordfree", {we});
+
+    // getvfsbyname: the type statfs reports for the temporary directory's volume.
+    const auto statistics = f.process.allocate_guest(2168);
+    require(f.sys("_statfs", {f.text(guest_directory), statistics}) == 0, "statfs for getvfsbyname");
+    const auto type = f.read(statistics + 72);
+    const auto configuration = f.process.allocate_guest(40);
+    require(f.sys("_getvfsbyname", {f.text(type), configuration}) == 0 && f.read(configuration + 4) == type &&
+            f.engine.read32(configuration + 24) >= 1, "getvfsbyname of a mounted type");
+    require(f.sys("_getvfsbyname", {f.text("nosuchfs"), configuration}) == UINT64_MAX && errno_value() == 2, "getvfsbyname of an unknown type");
+
+    // getdate over a DATEMSK template file.
+    const auto getdate_err = f.symbol("/usr/lib/libSystem.B.dylib", "_getdate_err");
+    f.sys("_unsetenv", {f.text("DATEMSK")});
+    require(f.sys("_getdate", {f.text("2024-03-05 10:30")}) == 0 && f.engine.read32(getdate_err) == 1, "getdate without DATEMSK");
+    std::ofstream(directory / "templates") << "%Y-%m-%d %H:%M\n%H:%M\n";
+    set("DATEMSK", guest_directory + "/templates");
+    const auto when = f.sys("_getdate", {f.text("2024-03-05 10:30")});
+    require(when != 0 && f.engine.read32(when + 20) == 124 && f.engine.read32(when + 16) == 2 && f.engine.read32(when + 12) == 5 &&
+            f.engine.read32(when + 8) == 10 && f.engine.read32(when + 4) == 30 && f.engine.read32(when) == 0 && f.engine.read32(when + 24) == 2,
+            "getdate with a full template (a Tuesday)");
+    const auto later = f.sys("_getdate", {f.text("23:59")});
+    require(later != 0 && f.engine.read32(later + 8) == 23 && f.engine.read32(later + 4) == 59, "getdate with a time only");
+    require(f.sys("_getdate", {f.text("not a date")}) == 0 && f.engine.read32(getdate_err) == 7, "getdate without a matching template");
+    set("DATEMSK", guest_directory);
+    // A directory: 4 (not a regular file), or 2 where the host cannot open a directory as a stream.
+    require(f.sys("_getdate", {f.text("10:30")}) == 0 && (f.engine.read32(getdate_err) == 4 || f.engine.read32(getdate_err) == 2),
+            "getdate with a directory as DATEMSK");
+    f.sys("_unsetenv", {f.text("DATEMSK")});
+    std::filesystem::remove_all(directory, ignored);
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -1194,6 +1283,7 @@ int main() {
         stage("bsd more"); test_bsd_more(f);
         stage("b11"); test_b11(f);
         stage("itimers"); test_itimers(f);
+        stage("b16"); test_b16(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

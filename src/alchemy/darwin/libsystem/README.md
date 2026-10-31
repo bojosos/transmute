@@ -98,6 +98,12 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   the malloc zone diagnostics (malloc_zone_check/print/log/claimed_address, discharge checking,
   malloc_printf; `malloc/malloc_zones.cpp`: a guest zone answers through its introspection
   table, the system zone is consistent by construction).
+* **Word expansion and dates** (alchemy-fx, `install_libsystem_gaps`): `fs/wordexp.cpp`
+  (wordexp/wordfree: the shell's expansions in the shell's order — tilde, the ${...} parameter
+  forms over the environment, command substitution through the guest's popen and /bin/sh,
+  $((...)) arithmetic, IFS splitting, pathname expansion through glob, quote removal; unquoted
+  shell operators are WRDE_BADCHAR); in `misc/bsd_extra.cpp` getvfsbyname (the types of the
+  mounted volumes) and getdate/getdate_err (DATEMSK templates through strptime, POSIX's defaults).
 * **Mach user-library and process leftovers** (alchemy-fx, `install_libsystem_gaps`):
   `mach/mach_extra.cpp` (the MIG server loop mach_msg_server(_once), mig_allocate/
   deallocate/strncpy, host_kernel_version, clock_sleep, mach_task_is_self,

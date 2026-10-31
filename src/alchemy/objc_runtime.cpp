@@ -2224,6 +2224,46 @@ struct ObjcRuntime::Impl {
             { std::lock_guard lock(mutex); if (name.empty() || names.contains(name)) { s.x[0] = 0; return; } }
             const auto result = native_class(name, s.x[0], 8, false, 0, s.x[2]); { std::lock_guard lock(mutex); cls(result)->registered = false; } s.x[0] = result; });
         function("_objc_registerClassPair", [this](auto& s, auto&) { std::lock_guard lock(mutex); cls(s.x[0])->registered = true; });
+        // Class objc_duplicateClass(Class original, const char* name, size_t extraBytes): a registered copy under
+        // a new name with the original's superclass, instance layout and variables, protocols, properties and
+        // methods (each its own Method, so method_setImplementation on one leaves the other), class methods
+        // included; Nil for a name in use. Foundation's KVO makes its classes this way.
+        function("_objc_duplicateClass", [this](auto& s, auto& m) {
+            const auto name = s.x[0] && s.x[1] ? text(m, s.x[1]) : std::string();
+            Address superclass{};
+            std::uint32_t size{};
+            {
+                std::lock_guard lock(mutex);
+                if (name.empty() || names.contains(name)) { s.x[0] = 0; return; }
+                const auto original = cls(s.x[0]);
+                if (original->metaclass) throw std::runtime_error("objc_duplicateClass of a metaclass");
+                superclass = original->super;
+                size = original->size;
+            }
+            const auto copy = native_class(name, superclass, size, false, 0, s.x[2]);
+            std::lock_guard lock(mutex);
+            const auto original = cls(s.x[0]);
+            const auto target = cls(copy);
+            auto& memory = process.main_engine();
+            for (const auto& [from, to] : std::array<std::pair<Address, Address>, 2>{{{original->address, copy}, {original->meta, target->meta}}}) {
+                const auto source = cls(from);
+                const auto destination = cls(to);
+                for (const auto& [selector, method] : source->methods) {
+                    Method duplicate{arena_allocate(24), method.selector, method.implementation, method.types};
+                    memory.write64(duplicate.descriptor, duplicate.selector);
+                    memory.write64(duplicate.descriptor + 8, duplicate.types);
+                    memory.write64(duplicate.descriptor + 16, duplicate.implementation);
+                    destination->methods[selector] = duplicate;
+                    method_owners[duplicate.descriptor] = to;
+                }
+                destination->properties = source->properties;
+                destination->protocols = source->protocols;
+                destination->native_protocols = source->native_protocols;
+            }
+            target->ivars = original->ivars;   // the original's property_t entries stay registered as its own
+            flush_caches();
+            s.x[0] = copy;
+        });
         function("_objc_disposeClassPair", [this](auto& s, auto&) { std::lock_guard lock(mutex); const auto value = cls(s.x[0]);
             if (value->registered) throw std::runtime_error("disposing registered Objective-C classes is unsupported");
             flush_caches();
