@@ -56,7 +56,9 @@ param(
     [switch]$SwiftShader,
     [switch]$Jit,
     [string[]]$Extra = @(),
-    [hashtable]$Env = @{}
+    [hashtable]$Env = @{},
+    # Attach to every page from its start (Target.setAutoAttach) and log its navigation events and crashes.
+    [switch]$WatchPages
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
@@ -177,6 +179,18 @@ function Wait-Cdp([int]$Id, [int]$Milliseconds) {
     }
     return $null
 }
+# The browser's startup milestones (histograms it records once): how startup completed (first paint or
+# a timeout), how long after-startup tasks waited, and why the first tab's tracking ended.
+function Log-Startup([string]$Prefix = '') {
+    foreach ($name in 'Startup.BrowserStartupCompleteReason', 'Startup.AfterStartupTaskDelayedUntilTime', 'Startup.FirstWebContents.FinishReason',
+                      'Startup.BrowserWindowDisplay', 'Startup.StartupBrowserCreator.LaunchBrowser') {
+        $answer = Wait-Cdp (Send-Cdp 'Browser.getHistogram' @{ name = $name }) 10000
+        if (-not ($answer -and $answer.PSObject.Properties['result'])) { Step "${Prefix}$name`: none"; continue }
+        $h = $answer.result.histogram
+        $buckets = @($h.buckets | ForEach-Object { "[$($_.low)..$($_.high)):$($_.count)" }) -join ' '
+        Step "${Prefix}$name`: count $($h.count) sum $($h.sum) $buckets"
+    }
+}
 # A page that never got its title: where its document is (attached for one evaluation). "no answer"
 # means the renderer (or the browser) does not answer at all.
 function Probe-Page($Info) {
@@ -188,6 +202,7 @@ function Probe-Page($Info) {
             "$($_.type) $($_.id)$alive" })
         Step "page probe: browser's processes: $($listed -join ', ')"
     }
+    Log-Startup 'page probe: '
     if (-not $Info) { Step 'page probe: no page target'; return }
     $attached = Wait-Cdp (Send-Cdp 'Target.attachToTarget' @{ targetId = $Info.targetId; flatten = $true }) 15000
     if (-not $attached -or -not $attached.PSObject.Properties['result']) { Step "page probe: attach had no answer (target url $($Info.url))"; return }
@@ -229,6 +244,7 @@ try {
     }
     Step 'DevTools pipes connected (fd 3 and 4)'
     $null = Send-Cdp 'Target.setDiscoverTargets' @{ discover = $true }
+    if ($WatchPages) { $null = Send-Cdp 'Target.setAutoAttach' @{ autoAttach = $true; waitForDebuggerOnStart = $false; flatten = $true } }
     $poll = [Diagnostics.Stopwatch]::StartNew()
     $found = $null; $lastPage = $null
     while (-not $found) {
@@ -241,6 +257,17 @@ try {
         if ($pipeEnded) { throw 'the DevTools pipe ended before the page target appeared' }
         if ($poll.Elapsed.TotalSeconds -gt 3) { $null = Send-Cdp 'Target.getTargets'; $poll.Restart() }
         foreach ($message in (Receive-Cdp 500)) {
+            if ($WatchPages -and $message.PSObject.Properties['method']) {
+                $method = $message.method
+                if ($method -eq 'Target.attachedToTarget' -and $message.params.targetInfo.type -eq 'page') {
+                    Step "watch: attached to page $($message.params.targetInfo.targetId) ($($message.params.targetInfo.url))"
+                    $null = Send-Cdp 'Page.enable' @{} $message.params.sessionId
+                } elseif ($method -match '^Page\.(frameRequestedNavigation|frameStartedNavigating|frameStartedLoading|frameNavigated|frameStoppedLoading)$|^(Inspector|Target)\.targetCrashed$|^Target\.detachedFromTarget$') {
+                    $p = $message.params
+                    $detail = if ($p.PSObject.Properties['frame']) { $p.frame.url } elseif ($p.PSObject.Properties['url']) { "$($p.url) $(if ($p.PSObject.Properties['reason']) { $p.reason })$(if ($p.PSObject.Properties['navigationType']) { $p.navigationType })" } elseif ($p.PSObject.Properties['frameId']) { $p.frameId } else { '' }
+                    Step "watch: $method $detail"
+                }
+            }
             $infos = @()
             if ($message.PSObject.Properties['params'] -and $message.params -and $message.params.PSObject.Properties['targetInfo']) { $infos += $message.params.targetInfo }
             if ($message.PSObject.Properties['result'] -and $message.result -and $message.result.PSObject.Properties['targetInfos']) { $infos += $message.result.targetInfos }
@@ -251,6 +278,7 @@ try {
         }
     }
     Step "page target '$($found.title)' ($($found.url))"
+    Log-Startup
     if ($Frames -gt 0) {
         $seen = 0; $since = [Diagnostics.Stopwatch]::StartNew(); $settled = $false
         while ((Get-CaptureFrames) -lt $Frames) {

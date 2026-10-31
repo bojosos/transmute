@@ -635,7 +635,22 @@ Test: `fx_threads exit-wakes`. Chrome's own "Teardown watchdog expired" (exit 2 
 is a separate thing: a slow browser teardown, before the process exits. The fix only removes the `SIGTRAP` that
 sometimes followed it.
 
-**Open: on a slow start, Chrome's startup navigation can be lost.** This was the AV1 gate's hang. It reproduces
+**Root cause found (2026-10-31): Chrome's 15 s child connection timeout, tripped by a slow browser launch.**
+On a slow start (cold fx cache, a loaded machine, or few cores) the browser's `StartupBrowserCreator`
+`LaunchBrowser` takes 35-56 s on its UI thread (2-7 s warm; Chrome's `Startup.StartupBrowserCreator.LaunchBrowser`
+histogram, read through CDP). A Chrome child process gives the browser 15 s to answer its first ping
+(`kConnectionTimeoutS`, `content/child/child_thread_impl.cc`) and otherwise terminates itself with status 0. So the
+network service, the storage service and the startup tab's renderer end after 17-20 s, again after each restart,
+and the startup navigation, already begun (`Page.frameStartedNavigating`), never commits. Reproduced at will on a
+warm cache with `ALCHEMY_DEBUG_CALL_DELAY=50,!--alchemy-child-spec`: 50 µs of busy time per provider call in the
+browser only, 3 runs out of 3. The same run passes with Chrome's `--ipc-connection-timeout=300`. A renderer held 45 s
+at start does not lose the URL, so a late check-in alone is harmless. It is no Alchemy IPC fault. The fix is a
+faster cold launch: in a cold run the browser main thread spends 57.5 % of its first 60 s translating
+(`translate_and_install`, inclusive) and 6.4 % running translated code. Handed to fx-jit-cost.
+
+Earlier notes on the same stall, before the cause was found:
+
+**On a slow start, Chrome's startup navigation can be lost.** This was the AV1 gate's hang. It reproduces
 with a cold fx cache, on a loaded machine, or with Chrome restricted to 2 to 4 cores. The page target keeps the
 file URL, while the document stays `about:blank | complete`. A `Page.navigate` to a `data:` URL, or to the same
 URL, commits within seconds, so the browser, renderer and loaders all work. Chrome's startup trace has no

@@ -1,9 +1,12 @@
 #include "alchemy/darwin/libsystem/mach/mach_ipc.hpp"
+#include "alchemy/host/process.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <typeinfo>
 
 // Mach rights and messages between Alchemy processes (docs/ALCHEMY_PROCESS.md,
 // "Mach ports between processes"), over transport.hpp.
@@ -48,6 +51,17 @@ void broker_unreachable(std::uint32_t broker, const char* operation) {
 }
 Key read_key(Reader& in) { Key key; key.pid = in.u32(); key.id = in.u64(); return key; }
 
+// A message that crosses to another process but arrives degraded (a right as a
+// dead name, out-of-line memory as none): the first few of each kind are said.
+template <class... Arguments>
+void degraded(int kind, const char* format, Arguments... arguments) {
+    static std::atomic<int> said[3]{};
+    if (said[kind].fetch_add(1) >= 5) return;
+    char line[256];
+    std::snprintf(line, sizeof(line), format, arguments...);
+    std::cerr << "alchemy: Mach IPC (pid " << host::process::current_pid() << "): " << line << std::endl;
+}
+
 } // namespace
 
 void MachIpc::connect(std::shared_ptr<Transport> transport, std::uint32_t broker) {
@@ -91,7 +105,7 @@ void MachIpc::write_right(Writer& out, Right right, std::uint32_t recipient, std
         // port whose receive right moved on).
         const auto bytes = std::exchange(right.object->bytes, {});
         const auto data = guest_.forward_object ? guest_.forward_object(bytes, recipient) : std::nullopt;
-        if (data) { out.u8(wire_object); out.blob(*data); } else out.u8(wire_dead);
+        if (data) { out.u8(wire_object); out.blob(*data); } else { degraded(1, "a kernel object for pid %u could not travel: sent as a dead name", recipient); out.u8(wire_dead); }
         return;
     }
     Lock lock(mutex_);
@@ -120,7 +134,10 @@ void MachIpc::write_right(Writer& out, Right right, std::uint32_t recipient, std
         release(std::move(right));
         lock.unlock();
         const auto data = guest_.serialize_object ? guest_.serialize_object(object, recipient) : std::nullopt;
-        if (data) { out.u8(wire_object); out.blob(*data); } else out.u8(wire_dead);
+        if (data) { out.u8(wire_object); out.blob(*data); } else {
+            degraded(1, "a kernel object (%s) for pid %u could not travel: sent as a dead name", object ? typeid(*object).name() : "none", recipient);
+            out.u8(wire_dead);
+        }
         return;
     }
     if (!port->host) {
@@ -173,7 +190,12 @@ void MachIpc::write_right(Writer& out, Right right, std::uint32_t recipient, std
     } else {
         drop_send(port);
     }
-    if (!granted) { out.u8(wire_dead); return; }
+    if (!granted) {
+        degraded(0, "a right to a port of pid %u for pid %u went as a dead name (its host refused or did not answer the grant)", host,
+                 recipient);
+        out.u8(wire_dead);
+        return;
+    }
     out.u8(once ? wire_once : wire_send);
     out.u32(host);
     write_key(out, key);
@@ -294,6 +316,7 @@ void MachIpc::transmit(std::shared_ptr<Message> message, const std::shared_ptr<P
             frame.u8(1);
             frame.blob(*section);
         } else if (descriptor.ool) {
+            degraded(2, "out-of-line memory for pid %u was lost on the way (received as none)", host);
             frame.u8(2);
         } else {
             frame.u8(0);

@@ -323,6 +323,31 @@ const std::vector<std::string>& traced_call_prefixes() {
     }();
     return prefixes;
 }
+// Diagnostic: ALCHEMY_DEBUG_CALL_DELAY=<microseconds>[,<text>] spends that long (busy, like slow code) in every
+// provider call of the processes whose host command line contains <text>, or with "!<text>", does not contain
+// it ("!--alchemy-child-spec": the root process only). A slow (cold, CPU-starved) process on demand.
+std::uint64_t call_delay_microseconds() {
+    static const std::uint64_t delay = [] {
+        const auto value = host::process::environment("ALCHEMY_DEBUG_CALL_DELAY");
+        if (!value || value->empty()) return std::uint64_t{0};
+        const auto comma = value->find(',');
+        auto filter = comma == std::string::npos ? std::string() : value->substr(comma + 1);
+        const bool negate = !filter.empty() && filter.front() == '!';
+        if (negate) filter.erase(0, 1);
+        if (!filter.empty()) {
+            std::string line;
+#ifdef _WIN32
+            for (int index = 0; index < __argc; ++index) {
+                if (__argv) line += std::string(__argv[index]) + ' ';
+                else if (__wargv) { for (const wchar_t* c = __wargv[index]; *c; ++c) line += static_cast<char>(*c < 0x80 ? *c : '?'); line += ' '; }
+            }
+#endif
+            if ((line.find(filter) != std::string::npos) == negate) return std::uint64_t{0};
+        }
+        return static_cast<std::uint64_t>(std::strtoull(value->c_str(), nullptr, 10));
+    }();
+    return delay;
+}
 thread_local ForkChildGuard* current_fork_child_guard = nullptr;
 } // namespace
 
@@ -370,6 +395,13 @@ std::uint64_t ProcessContext::install_function(std::string symbol,
                 return;
             }
             std::fprintf(stderr, "[call %llx] %s -> 0x%llx\n", thread, name.c_str(), static_cast<unsigned long long>(state.x[0]));
+        };
+    }
+    if (const auto delay = call_delay_microseconds()) {   // ALCHEMY_DEBUG_CALL_DELAY
+        handler = [inner = std::move(handler), delay](transmute::CpuState& state, transmute::GuestMemory& memory) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(delay);
+            while (std::chrono::steady_clock::now() < until) {}
+            inner(state, memory);
         };
     }
     // Installing over a placeholder (an explicit-failure stub) makes this the
