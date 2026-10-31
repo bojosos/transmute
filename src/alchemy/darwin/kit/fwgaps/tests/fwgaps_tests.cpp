@@ -63,9 +63,13 @@ void appkit_gaps(Fixture& f) {
     const auto current = f.send(f.cls("NSRunningApplication"), "currentApplication");
     require(static_cast<std::uint32_t>(f.send(current, "processIdentifier")) == static_cast<std::uint32_t>(f.call(sys, "_getpid")), "processIdentifier");
     require(f.send(f.cls("NSRunningApplication"), "runningApplicationWithProcessIdentifier:", {99999}) == 0, "other pid");
-    // No speech voices.
-    require(f.cf.length(f.send(f.cls("NSSpeechSynthesizer"), "availableVoices")) == 0, "no voices");
-    require(f.send(f.send(f.cls("NSSpeechSynthesizer"), "alloc"), "init") == 0, "synthesizer init returns nil");
+    // Speech voices are the host's (through AVFAudio, when installed): a
+    // synthesizer exists exactly when there is a voice (speaking is tested in
+    // alchemy_gui_appkit_api).
+    const bool voiced = f.cf.length(f.send(f.cls("NSSpeechSynthesizer"), "availableVoices")) != 0;
+    const auto synthesizer = f.send(f.send(f.cls("NSSpeechSynthesizer"), "alloc"), "init");
+    require((synthesizer != 0) == voiced, "a synthesizer exactly when there is a voice");
+    if (synthesizer) static_cast<void>(f.send(synthesizer, "release"));
     // NSAnimationContext: changes run at once, then the completion handler.
     const auto bridge = alchemy::gui::security::bridge();
     int order = 0, changes = 0, completion = 0;

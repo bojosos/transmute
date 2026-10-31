@@ -178,6 +178,13 @@ capacity and rating styles, warning and critical colours (inverted when the
 critical level is the lower), tick marks, rating images, and editing by click
 or drag when editable. The default range (0 to 2) is unverified.
 
+**Speech** (`application_services.cpp`): NSSpeechSynthesizer speaks through
+AVSpeechSynthesizer over the host's voices (host::speech): the voices and
+their attributes, rate (words per minute) and volume, the word and finish
+delegate callbacks, stopping and pausing at once or at a word. The pitch base
+is kept, not applied; writing speech to a file stops explicitly; without host
+voices the initializers return nil.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

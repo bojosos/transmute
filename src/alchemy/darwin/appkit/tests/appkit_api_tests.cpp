@@ -12,6 +12,8 @@
 #include "alchemy/gui/tests/fill_fixture.hpp"
 
 #include <bit>
+#include <chrono>
+#include <optional>
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -961,6 +963,54 @@ void app_referenced(Fixture& f) {
             "collection view drag masks");
 }
 
+// NSSpeechSynthesizer over AVFAudio and the host's voices (the frameworks
+// wave, U15). Without host voices the initializer returns nil; with them, a
+// silent utterance reaches the delegate's word and finish callbacks (NO when
+// there is no audio output to speak to).
+void speech(Fixture& f) {
+    const auto synth_class = f.cls("NSSpeechSynthesizer");
+    const auto voices = f.id(synth_class, "availableVoices");
+    const auto count = f.id(voices, "count");
+    if (count == 0) {
+        require(f.id(f.id(synth_class, "alloc"), "init") == 0 && f.id(synth_class, "defaultVoice") == 0, "no host voices: no synthesizer");
+        std::cout << "[appkit api] speech: the host has no voices\n";
+        return;
+    }
+    const auto first = f.id(voices, "objectAtIndex:", {0});
+    require(f.text(f.id(synth_class, "defaultVoice")) == f.text(first), "the host's default voice comes first");
+    const auto attributes = f.id(synth_class, "attributesForVoice:", {first});
+    require(!f.text(f.id(attributes, "objectForKey:", {f.str("VoiceName")})).empty() &&
+                f.text(f.id(attributes, "objectForKey:", {f.str("VoiceIdentifier")})) == f.text(first),
+            "a voice's attributes");
+    require(f.id(f.id(synth_class, "alloc"), "initWithVoice:", {f.str("no such voice")}) == 0, "an unknown voice");
+    const auto synth = f.id(f.id(synth_class, "alloc"), "init");
+    require(synth && f.text(f.id(synth, "voice")) == f.text(first), "a synthesizer with the default voice");
+    CallRegs silent;
+    silent.set_s(0, 0.0f);
+    static_cast<void>(f.msg(synth, "setVolume:", silent));
+    CallRegs fast;
+    fast.set_s(0, 360.0f);
+    static_cast<void>(f.msg(synth, "setRate:", fast));
+    require(f.msg(synth, "rate").s(0) == 360.0f && f.msg(synth, "volume").s(0) == 0.0f, "rate and volume");
+    std::vector<std::string> heard;
+    std::optional<bool> finished;
+    const auto delegate_class = f.subclass("U15SpeechDelegate", "NSObject");
+    f.add(delegate_class, "speechSynthesizer:willSpeakWord:ofString:", [&f, &heard](CpuState& s, GuestMemory&) {
+        const auto text = f.text(s.x[5]);
+        heard.push_back(s.x[3] + s.x[4] <= text.size() ? text.substr(s.x[3], s.x[4]) : std::string("?"));
+    }, "v@:@{_NSRange=QQ}@");
+    f.add(delegate_class, "speechSynthesizer:didFinishSpeaking:", [&finished](CpuState& s, GuestMemory&) { finished = (s.x[3] & 0xff) != 0; }, "v@:@B");
+    static_cast<void>(f.id(synth, "setDelegate:", {f.alloc_init("U15SpeechDelegate")}));
+    require((f.id(synth, "startSpeakingString:", {f.str("Alchemy speaks")}) & 0xff) == 1, "-startSpeakingString:");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (!finished && std::chrono::steady_clock::now() < deadline) f.spin();
+    require(finished.has_value(), "the delegate hears the end of the speech");
+    if (*finished) require(!heard.empty() && heard.front() == "Alchemy", "the words reach the delegate as they are spoken");
+    std::cout << "[appkit api] speech: " << (*finished ? "spoken" : "cancelled (no audio output)") << ", " << heard.size() << " words\n";
+    require((f.id(synth, "isSpeaking") & 0xff) == 0, "not speaking afterwards");
+    static_cast<void>(f.id(synth, "release"));
+}
+
 } // namespace
 
 int main() {
@@ -974,7 +1024,7 @@ int main() {
                  {"images_and_cursors", images_and_cursors}, {"alerts_and_panels", alerts_and_panels},
                  {"pasteboards_and_text", pasteboards_and_text}, {"containers_and_controllers", containers_and_controllers},
                  {"toolbars_and_tabs", toolbars_and_tabs}, {"c_functions", c_functions},
-                 {"status_items_and_sounds", status_items_and_sounds}, {"app_referenced", app_referenced}}) {
+                 {"status_items_and_sounds", status_items_and_sounds}, {"app_referenced", app_referenced}, {"speech", speech}}) {
             std::cout << "[appkit api] " << name << std::endl;
             test(f);
         }
