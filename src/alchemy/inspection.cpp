@@ -170,9 +170,8 @@ public:
                         unsupported_ = true;
                     }
                     const auto numeric = deferred_numeric_api(imported.symbol);
-                    const auto native = imported.symbol == "_vm_remap"
-                        ? std::string_view("Mach VM shared guest-memory alias mapping")
-                        : deferred_native_api(imported.symbol);
+                    // vm_remap is real (shared aliases and copies: libsystem/vm/mach_vm.cpp).
+                    const auto native = deferred_native_api(imported.symbol);
                     if (const auto feature = numeric.empty() ? native : numeric; !feature.empty()) {
                         report.status = "unsupported";
                         selected->requirements.push_back("unsupported " + std::string(feature));
