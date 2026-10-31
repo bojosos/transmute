@@ -603,7 +603,60 @@ void DarwinServices::Impl::install_all() {
     install("_time", [](auto& s, auto& m) { const auto value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()); if (s.x[0]) m.write64(s.x[0], value); return value; });
     install("_nanosleep", [](auto& s, auto& m) { perf::Scope timed(perf::guest_sleep_ticks, perf::guest_sleeps); const auto seconds = m.read64(s.x[0]), nanos = m.read64(s.x[0] + 8); if (seconds > 86400 || nanos >= 1000000000) throw ServiceError{einval}; if (s.x[1]) validate(m, s.x[1], 16, true); precise_sleep_for(std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(seconds) + std::chrono::nanoseconds(nanos))); if (s.x[1]) m.fill_bytes(s.x[1], 0, 16); return std::uint64_t{0}; });
     install("_getpagesize", [](auto&, auto&) { return darwin_arm64_page_size; });
-    install("_sysconf", [](auto& s, auto&) { switch (s.x[0]) { case 29: return darwin_arm64_page_size; case 57: case 58: return static_cast<std::uint64_t>(std::max(1U, std::thread::hardware_concurrency())); case 5: return std::uint64_t{4096}; default: throw ServiceError{einval}; } });
+    // long sysconf(int name), Darwin's <unistd.h> numbering: the limits this system has (macOS 14's where
+    // they are the platform's own: ARG_MAX, the passwd/group buffer sizes, IOV_MAX), the processors and
+    // physical pages of the host, CLK_TCK 100, and the POSIX options as macOS reports them (200112 when
+    // provided; -1, without an error, when not). A name this list does not know is EINVAL.
+    install("_sysconf", [](auto& s, auto&) -> std::uint64_t {
+        constexpr std::int64_t posix = 200112, absent = -1;
+        const auto processors = static_cast<std::int64_t>(std::max(1U, std::thread::hardware_concurrency()));
+        std::int64_t value{};
+        switch (static_cast<std::int32_t>(s.x[0])) {
+        case 1: value = 1048576; break;                     // _SC_ARG_MAX
+        case 2: value = 2666; break;                        // _SC_CHILD_MAX
+        case 3: value = 100; break;                         // _SC_CLK_TCK
+        case 4: value = 16; break;                          // _SC_NGROUPS_MAX
+        case 5: value = 4096; break;                        // _SC_OPEN_MAX (getrlimit RLIMIT_NOFILE)
+        case 6: case 7: case 8: case 17: value = posix; break;   // _SC_JOB_CONTROL, _SC_SAVED_IDS, _SC_VERSION, _SC_2_VERSION
+        case 9: case 11: value = 99; break;                 // _SC_BC_BASE_MAX, _SC_BC_SCALE_MAX
+        case 10: value = 2048; break;                       // _SC_BC_DIM_MAX
+        case 12: value = 1000; break;                       // _SC_BC_STRING_MAX
+        case 13: value = 2; break;                          // _SC_COLL_WEIGHTS_MAX
+        case 14: value = 32; break;                         // _SC_EXPR_NEST_MAX
+        case 15: value = 2048; break;                       // _SC_LINE_MAX
+        case 16: value = 255; break;                        // _SC_RE_DUP_MAX
+        case 26: value = 20; break;                         // _SC_STREAM_MAX
+        case 27: value = 255; break;                        // _SC_TZNAME_MAX
+        case 29: value = static_cast<std::int64_t>(darwin_arm64_page_size); break;   // _SC_PAGESIZE
+        case 56: value = 1024; break;                       // _SC_IOV_MAX
+        case 57: case 58: value = processors; break;        // _SC_NPROCESSORS_CONF, _SC_NPROCESSORS_ONLN
+        case 70: case 71: value = 4096; break;              // _SC_GETGR_R_SIZE_MAX, _SC_GETPW_R_SIZE_MAX
+        case 72: case 73: case 101: value = 255; break;     // _SC_HOST_NAME_MAX, _SC_LOGIN_NAME_MAX, _SC_TTY_NAME_MAX
+        case 85: value = 4; break;                          // _SC_THREAD_DESTRUCTOR_ITERATIONS
+        case 86: value = 512; break;                        // _SC_THREAD_KEYS_MAX
+        case 93: value = 16384; break;                      // _SC_THREAD_STACK_MIN
+        case 107: value = INT32_MAX; break;                 // _SC_ATEXIT_MAX
+        case 120: value = 32; break;                        // _SC_SYMLOOP_MAX
+        case 200: {                                         // _SC_PHYS_PAGES
+            const auto memory = host::system::memory();
+            if (!memory) throw ServiceError{einval};
+            value = static_cast<std::int64_t>(memory->physical / darwin_arm64_page_size);
+            break;
+        }
+        // POSIX options provided here: fsync, mapped files, memory protection, the monotonic clock,
+        // reader-writer locks, regular expressions, the shell, spawn, threads and their safe functions, IPv6.
+        case 38: case 47: case 32: case 74: case 76: case 77: case 78: case 79: case 96: case 91: case 118:
+            value = posix; break;
+        // Not provided: asynchronous and prioritized I/O, memory locking, message passing, priority
+        // scheduling, real-time signals, unnamed semaphores, shared memory objects, synchronized I/O,
+        // timers, barriers, spin locks, typed memory, tracing.
+        case 28: case 30: case 31: case 33: case 34: case 35: case 36: case 37: case 39: case 40: case 41:
+        case 66: case 80: case 102: case 97:
+            value = absent; break;
+        default: throw ServiceError{einval};
+        }
+        return static_cast<std::uint64_t>(value);
+    });
     install("_sysctl", [](auto& s, auto& m) { return numeric_sysctl(s, m); });
     install("_sysctlbyname", [](auto& s, auto& m) {
         const auto value = sysctl_named(text(m, s.x[0]));

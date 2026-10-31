@@ -924,6 +924,13 @@ void test_b17(Fixture& f) {
     const auto usage = f.process.allocate_guest(144);
     require(f.sys("_getrusage", {0xffffffff, usage}) == 0 && f.engine.read64(usage) == 0 && f.sys("_getrusage", {2, usage}) == UINT64_MAX &&
             errno_value() == 22, "getrusage(RUSAGE_CHILDREN)");
+    // sysconf: limits, CLK_TCK, physical pages, an option provided (-1 without an error for one that is not),
+    // EINVAL for an unknown name.
+    require(f.sys("_sysconf", {3}) == 100 && f.sys("_sysconf", {1}) == 1048576 && f.sys("_sysconf", {71}) == 4096 &&
+            f.sys("_sysconf", {200}) > 0 && f.sys("_sysconf", {96}) == 200112, "sysconf");
+    f.engine.write32(f.sys("___error"), 0);
+    require(f.sys("_sysconf", {41}) == UINT64_MAX && errno_value() == 0 && f.sys("_sysconf", {9999}) == UINT64_MAX && errno_value() == 22,
+            "sysconf options and unknown names");
     // getpwent walks the one account; setpwent rewinds.
     const auto first = f.sys("_getpwent");
     require(first != 0 && f.engine.read32(first + 16) == 1000 && f.sys("_getpwent") == 0, "getpwent");
