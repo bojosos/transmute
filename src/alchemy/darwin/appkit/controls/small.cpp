@@ -225,6 +225,7 @@ void install_small_additions(AppKit& kit) {
         }, "v@:");
     }
     install_indicators(kit);   // NSSwitch, NSLevelIndicator (indicators.cpp)
+    install_token_field(kit);  // NSTokenField (token_field.cpp)
 }
 
 } // namespace alchemy::gui::completion_kit::controls

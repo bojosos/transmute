@@ -193,6 +193,14 @@ show expanded). NSCollectionViewGridLayout lays items out in a grid (column and
 row limits, minimum and maximum item sizes, spacing, margins); items past the
 row limit are hidden and the background colours are kept, not drawn.
 
+**Token fields** (`controls/token_field.cpp`): NSTokenField's value is an
+array of represented objects drawn as pills (plain text for
+NSTokenStyleNone). Editing uses the field editor on the tokens' editing
+strings; when editing ends (or the string value is set) the text is split at
+the tokenizing characters (a comma by default), and the delegate maps pieces
+to objects and decides which new ones to add. Tokens made while typing,
+completions and token menus are not provided.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

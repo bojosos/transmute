@@ -20,6 +20,7 @@
 #include "alchemy/darwin/foundation/date_format.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <bit>
 #include <cmath>
 #include <functional>
@@ -1090,6 +1091,50 @@ void switches_and_levels(Fixture& f) {
     static_cast<void>(f.id(window, "close"));
 }
 
+// ---- NSTokenField (frameworks wave U16a) ------------------------------------------------------------
+void token_fields(Fixture& f) {
+    journal.clear();
+    f.describe = [](Address) { return std::string(); };
+    const auto window = f.make_window({{0, 0}, {300, 80}});
+    const auto field = f.with_rect(f.id(f.cls("NSTokenField"), "alloc"), "initWithFrame:", {{10, 30}, {280, 26}});
+    require(f.yes(f.id(field, "cell"), "isKindOfClass:", {f.cls("NSTokenFieldCell")}), "the token field's cell");
+    // A delegate that upper-cases display strings and refuses the token "no".
+    const auto delegate_class = f.subclass("U16TokenDelegate", "NSObject");
+    f.add(delegate_class, "tokenField:displayStringForRepresentedObject:", [&f](CpuState& s, GuestMemory&) {
+        auto text = f.text(s.x[3]);
+        for (auto& c : text) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        s.x[0] = f.str(text);
+    }, "@@:@@");
+    f.add(delegate_class, "tokenField:shouldAddObjects:atIndex:", [&f](CpuState& s, GuestMemory&) {
+        const auto first = f.id(s.x[3], "objectAtIndex:", {0});
+        journal.push_back("add:" + f.text(first) + "@" + std::to_string(s.x[4]));
+        s.x[0] = f.text(first) == "no" ? f.id(f.cls("NSArray"), "array") : s.x[3];
+    }, "@@:@@Q");
+    static_cast<void>(f.id(field, "setDelegate:", {f.id(f.id(delegate_class, "alloc"), "init")}));
+    static_cast<void>(f.id(field, "setStringValue:", {f.str("alpha, beta,, no ,gamma")}));
+    const auto tokens = f.id(field, "objectValue");
+    require(f.integer(tokens, "count") == 3 && f.text(f.id(tokens, "objectAtIndex:", {2})) == "gamma", "tokenized, trimmed, empty and refused pieces dropped");
+    require(f.text(f.id(field, "stringValue")) == "alpha, beta, gamma", "the string value joins the tokens");
+    require(journal == std::vector<std::string>{"add:alpha@0", "add:beta@1", "add:no@2", "add:gamma@2"}, "new tokens are offered: " + joined());
+    // Tokens that are already there are not offered again.
+    journal.clear();
+    static_cast<void>(f.id(field, "setStringValue:", {f.str("gamma,alpha,delta")}));
+    require(journal == std::vector<std::string>{"add:delta@2"} && f.text(f.id(field, "stringValue")) == "gamma, alpha, delta", "existing tokens kept: " + joined());
+    // Drawn as pills.
+    static_cast<void>(f.id(f.id(window, "contentView"), "addSubview:", {field}));
+    f.show(window);
+    require(marked(f, window, {{14, 34}, {60, 18}}) > 50, "the first token's pill and text are drawn");
+    // Editing: the text is the tokens' editing strings; ending it tokenizes again.
+    static_cast<void>(f.id(window, "makeFirstResponder:", {field}));
+    const auto editor = f.id(window, "firstResponder");
+    require(f.text(f.id(editor, "string")) == "gamma, alpha, delta", "the field editor edits the tokens' text");
+    static_cast<void>(f.id(editor, "setString:", {f.str("gamma, omega")}));
+    static_cast<void>(f.id(window, "makeFirstResponder:", {0}));
+    const auto edited = f.id(field, "objectValue");
+    require(f.integer(edited, "count") == 2 && f.text(f.id(edited, "objectAtIndex:", {1})) == "omega", "ending editing tokenizes the text");
+    static_cast<void>(f.id(window, "close"));
+}
+
 // ---- the text system ------------------------------------------------------------------------
 void text_system(Fixture& f) {
     const auto view = f.with_rect(f.id(f.cls("NSTextView"), "alloc"), "initWithFrame:", {{0, 0}, {300, 100}});
@@ -2066,6 +2111,7 @@ int main() {
         date_pickers(f);
         color_wells(f);
         switches_and_levels(f);
+        token_fields(f);
         text_system(f);
         text_layout(f);
         text_actions(f);
