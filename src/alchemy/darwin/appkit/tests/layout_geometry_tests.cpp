@@ -6,6 +6,13 @@
 #include "alchemy/darwin/appkit/tests/windows_test_support.hpp"
 
 #include <chrono>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#undef near   // windows.h's empty near / far macros would hide this file's near()
+#undef far
+#endif
 #include <random>
 #include <string>
 #include <vector>
@@ -229,11 +236,24 @@ void popovers() {
     expect_rect(placed.frame, {180, 360, 213, 100}, "max x edge: right of the anchor");
 }
 
+// This thread's CPU seconds (wall seconds where the host has no thread clock):
+// timing that other processes' load does not stretch.
+double thread_seconds() {
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+        const auto ticks = [](FILETIME t) { return (static_cast<unsigned long long>(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+        return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+    }
+#endif
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // A window-sized layout: 300 labels in rows of a grid of stacks, about 2000
-// constraints, solved incrementally and edited, in well under a second (the
-// solver once took 17 s here; the bound is loose for loaded machines).
+// constraints, solved incrementally and edited, in well under a second of
+// CPU time (the solver once took 17 s here; the bound is loose).
 void large_layout() {
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = thread_seconds();
     Solver s; layout::Ids ids;
     const auto c = layout::make_box(s, "container");
     layout::add(s, ids, c.x, Relation::equal, 0, layout::required);
@@ -259,8 +279,8 @@ void large_layout() {
     for (const double width : {1000.0, 1400.0, 800.0}) s.suggest_value(c.width, width);
     s.update_variables();
     require(near(s.value(rows.back().width), 780), "large layout row width after edits");
-    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    require(seconds < 3, "about 2000 constraints took " + std::to_string(seconds) + " s");
+    const auto seconds = thread_seconds() - started;
+    require(seconds < 3, "about 2000 constraints took " + std::to_string(seconds) + " s of CPU time");
 }
 
 void frames() {
