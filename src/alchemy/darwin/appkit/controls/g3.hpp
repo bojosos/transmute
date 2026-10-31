@@ -13,6 +13,7 @@
 //   color_panel.cpp   NSColorPanel
 //   indicators.cpp    NSSwitch, NSLevelIndicator / NSLevelIndicatorCell
 //   token_field.cpp   NSTokenField / NSTokenFieldCell
+//   browser.cpp       NSBrowser / NSBrowserCell
 //   text_system.cpp   NSTextStorage / NSLayoutManager / NSTextContainer /
 //                     NSTextViewSharedData coding, NSTextView's attribute,
 //                     selection and typing API, NSFontManager / NSFontPanel
@@ -104,5 +105,7 @@ void install_small_additions(AppKit& kit);
 void install_indicators(AppKit& kit);
 // NSTokenField / NSTokenFieldCell (token_field.cpp; installed by install_small_additions).
 void install_token_field(AppKit& kit);
+// NSBrowser / NSBrowserCell (browser.cpp; installed by install_small_additions).
+void install_browser(AppKit& kit);
 
 } // namespace alchemy::gui::completion_kit::controls

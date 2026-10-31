@@ -201,6 +201,14 @@ the tokenizing characters (a comma by default), and the delegate maps pieces
 to objects and decides which new ones to add. Tokens made while typing,
 completions and token menus are not provided.
 
+**Browsers** (`controls/browser.cpp`): NSBrowser shows a hierarchy in
+columns from an item-based or passive delegate (active NSMatrix delegates
+stop explicitly). Selecting a branch loads the next column; up to
+-maxVisibleColumns columns share the width, titled columns draw their
+titles; clicks and the arrow keys select and send the action (a double click
+the double action); paths and the selection index path follow the selection.
+Single selection only; columns do not scroll vertically.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

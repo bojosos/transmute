@@ -1135,6 +1135,81 @@ void token_fields(Fixture& f) {
     static_cast<void>(f.id(window, "close"));
 }
 
+// ---- NSBrowser (frameworks wave U16b) ----------------------------------------------------------------
+void browsers(Fixture& f) {
+    journal.clear();
+    f.describe = [](Address) { return std::string(); };
+    // An item-based delegate over a small tree: root -> Music (Jazz, Rock), Notes.
+    struct Node { std::string name; std::vector<int> children; };
+    static const std::vector<Node> tree{{"root", {1, 4}}, {"Music", {2, 3}}, {"Jazz", {}}, {"Rock", {}}, {"Notes", {}}};
+    static std::vector<Address> items;
+    items.clear();
+    for (const auto& node : tree) items.push_back(f.str(node.name));
+    const auto index_of = [](Address item) {
+        for (std::size_t i = 0; i < items.size(); ++i) if (items[i] == item) return static_cast<int>(i);
+        return 0;   // nil: the root
+    };
+    const auto delegate_class = f.subclass("U16BrowserDelegate", "NSObject");
+    f.add(delegate_class, "rootItemForBrowser:", [](CpuState& s, GuestMemory&) { s.x[0] = items[0]; });
+    f.add(delegate_class, "browser:numberOfChildrenOfItem:", [index_of](CpuState& s, GuestMemory&) {
+        s.x[0] = tree[static_cast<std::size_t>(index_of(s.x[3]))].children.size();
+    }, "q@:@@");
+    f.add(delegate_class, "browser:child:ofItem:", [index_of](CpuState& s, GuestMemory&) {
+        s.x[0] = items[static_cast<std::size_t>(tree[static_cast<std::size_t>(index_of(s.x[4]))].children[s.x[3]])];
+    }, "@@:@q@");
+    f.add(delegate_class, "browser:isLeafItem:", [index_of](CpuState& s, GuestMemory&) {
+        s.x[0] = tree[static_cast<std::size_t>(index_of(s.x[3]))].children.empty() ? 1 : 0;
+    }, "B@:@@");
+    f.add(delegate_class, "browser:objectValueForItem:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[3]; }, "@@:@@");
+    const auto window = f.make_window({{0, 0}, {450, 200}});
+    const auto browser = f.with_rect(f.id(f.cls("NSBrowser"), "alloc"), "initWithFrame:", {{0, 0}, {450, 200}});
+    static_cast<void>(f.id(browser, "setDelegate:", {f.id(f.id(delegate_class, "alloc"), "init")}));
+    static_cast<void>(f.id(browser, "setTarget:", {f.target("browser")}));
+    static_cast<void>(f.id(browser, "setAction:", {f.objc.selector("acted:")}));
+    static_cast<void>(f.id(browser, "setDoubleAction:", {f.objc.selector("doubleActed:")}));
+    static_cast<void>(f.id(f.id(window, "contentView"), "addSubview:", {browser}));
+    static_cast<void>(f.id(browser, "loadColumnZero"));
+    require(f.integer(browser, "lastColumn") == 0 && f.text(f.id(f.id(browser, "loadedCellAtRow:column:", {1, 0}), "stringValue")) == "Notes",
+            "column zero holds the root's children");
+    // A branch loads the next column; the path follows the selection.
+    static_cast<void>(f.id(browser, "selectRow:inColumn:", {0, 0}));
+    require(f.integer(browser, "lastColumn") == 1 && f.text(f.id(browser, "path")) == "/Music" &&
+                f.id(browser, "parentForItemsInColumn:", {1}) == items[1],
+            "selecting Music loads its children");
+    require(f.yes(browser, "setPath:", {f.str("/Music/Rock")}) && f.integer(browser, "selectedRowInColumn:", {1}) == 1 &&
+                f.integer(browser, "selectedColumn") == 1 && f.id(browser, "itemAtRow:inColumn:", {1, 1}) == items[3],
+            "-setPath: selects along the path");
+    const auto path = f.id(browser, "selectionIndexPath");
+    require(f.integer(path, "length") == 2 && f.integer(path, "indexAtPosition:", {1}) == 1, "-selectionIndexPath");
+    require(!f.yes(browser, "setPath:", {f.str("/Music/Blues")}), "a path that is not there");
+    // A click on Notes (column 0, row 1) selects it, drops column 1 and acts; a double click double-acts.
+    f.show(window);
+    f.click(window, {75, 200 - 27});
+    require(f.integer(browser, "selectedRowInColumn:", {0}) == 1 && f.integer(browser, "lastColumn") == 0 && journal == std::vector<std::string>{"browser:"},
+            "a click selects a row and sends the action: " + joined() + " row " + std::to_string(f.integer(browser, "selectedRowInColumn:", {0})));
+    f.click(window, {75, 200 - 27}, 2);
+    require(log_has("browser:double"), "a double click sends the double action");
+    // The arrow keys: up to Music (loading its column), right into Jazz.
+    f.key(window, 0x7e, "");
+    f.key(window, 0x7c, "");
+    require(f.text(f.id(browser, "path")) == "/Music/Jazz", "the arrow keys move the selection: " + f.text(f.id(browser, "path")));
+    require(marked(f, window, {{6, 200 - 18}, {60, 18}}) > 20, "the rows are drawn");
+    static_cast<void>(f.id(window, "close"));
+
+    // A passive delegate fills the cells.
+    const auto passive_class = f.subclass("U16PassiveBrowserDelegate", "NSObject");
+    f.add(passive_class, "browser:numberOfRowsInColumn:", [](CpuState& s, GuestMemory&) { s.x[0] = 3; }, "q@:@q");
+    f.add(passive_class, "browser:willDisplayCell:atRow:column:", [&f](CpuState& s, GuestMemory&) {
+        static_cast<void>(f.id(s.x[3], "setStringValue:", {f.str("row " + std::to_string(s.x[4]))}));
+        static_cast<void>(f.id(s.x[3], "setLeaf:", {1}));
+    }, "v@:@@qq");
+    const auto plain = f.with_rect(f.id(f.cls("NSBrowser"), "alloc"), "initWithFrame:", {{0, 0}, {300, 100}});
+    static_cast<void>(f.id(plain, "setDelegate:", {f.id(f.id(passive_class, "alloc"), "init")}));
+    static_cast<void>(f.id(plain, "loadColumnZero"));
+    static_cast<void>(f.id(plain, "selectRow:inColumn:", {2, 0}));
+    require(f.text(f.id(f.id(plain, "selectedCell"), "stringValue")) == "row 2" && f.integer(plain, "lastColumn") == 0, "a passive delegate's leaf rows");
+}
+
 // ---- the text system ------------------------------------------------------------------------
 void text_system(Fixture& f) {
     const auto view = f.with_rect(f.id(f.cls("NSTextView"), "alloc"), "initWithFrame:", {{0, 0}, {300, 100}});
@@ -2112,6 +2187,7 @@ int main() {
         color_wells(f);
         switches_and_levels(f);
         token_fields(f);
+        browsers(f);
         text_system(f);
         text_layout(f);
         text_actions(f);
