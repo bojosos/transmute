@@ -464,6 +464,22 @@ void test_runtime_api() {
     static_cast<void>(f.call("_objc_registerClassPair", {first}));
     const auto second = f.call("_objc_allocateClassPair", {first, f.string("AlchemyEnumB"), 0});
     static_cast<void>(f.call("_objc_registerClassPair", {second}));
+    // Extra class bytes: zeroed, after the class and the metaclass (object_getIndexedIvars); a name in
+    // use gives Nil.
+    const auto extra = f.call("_objc_allocateClassPair", {root, f.string("AlchemyExtraBytes"), 24});
+    require(extra != 0 && f.call("_objc_allocateClassPair", {root, f.string("AlchemyEnumA"), 0}) == 0, "objc_allocateClassPair with extra bytes");
+    static_cast<void>(f.call("_objc_registerClassPair", {extra}));
+    const auto extra_meta = f.call("_object_getClass", {extra});
+    const auto class_bytes = f.call("_object_getIndexedIvars", {extra}), meta_bytes = f.call("_object_getIndexedIvars", {extra_meta});
+    require(class_bytes == extra + 40 && meta_bytes == extra_meta + 40 && f.engine.read64(class_bytes + 16) == 0 && f.engine.read64(meta_bytes + 16) == 0,
+            "the extra bytes follow the class and the metaclass");
+    f.engine.write64(class_bytes + 16, 0x5a5a);
+    f.engine.write64(meta_bytes, 0xa5a5);
+    require(f.call("_class_getSuperclass", {extra}) == root && f.engine.read64(class_bytes + 16) == 0x5a5a && f.call("_class_getSuperclass", {extra_meta}) != 0,
+            "writing the extra bytes leaves the class intact");
+    const auto extra_object = f.call("_class_createInstance", {extra, 0});
+    require(extra_object != 0 && f.call("_object_getClass", {extra_object}) == extra, "an instance of a class with extra bytes");
+    static_cast<void>(f.call("_objc_release", {extra_object}));
     static std::vector<Address> enumerated;
     static bool stop_early = false;
     const auto visit = f.process.install_function("_objc_test_enumerate", [](transmute::CpuState& s, transmute::GuestMemory& m) {

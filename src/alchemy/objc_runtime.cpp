@@ -664,15 +664,19 @@ struct ObjcRuntime::Impl {
     }
     // `storage` (at least 40 bytes) holds the class record when another
     // provider already exported its address (the Blocks isa symbols).
-    Address native_class(std::string name, Address superclass, std::uint32_t size, bool publish = true, Address storage = 0) {
+    // `extra` zeroed bytes follow the class and the metaclass structures (objc_allocateClassPair's
+    // extraBytes: object_getIndexedIvars of the class or metaclass).
+    Address native_class(std::string name, Address superclass, std::uint32_t size, bool publish = true, Address storage = 0,
+                         std::uint64_t extra = 0) {
         std::lock_guard lock(mutex);
-        if (names.contains(name) || size < 8 || size > (1U << 26))
+        if (names.contains(name) || size < 8 || size > (1U << 26) || extra > (1U << 26) || (storage && extra))
             throw std::runtime_error("invalid or duplicate Objective-C class " + name);
         if (superclass && cls(superclass)->metaclass) throw std::runtime_error("metaclass cannot be an instance superclass");
         if (superclass) size = std::max(size, cls(superclass)->size);
         auto value = std::make_shared<Class>();
         auto meta = std::make_shared<Class>();
-        value->address = storage ? storage : arena_allocate(40, 16); value->meta = arena_allocate(40, 16);
+        value->address = storage ? storage : arena_allocate(40 + extra, 16); value->meta = arena_allocate(40 + extra, 16);
+        if (extra) for (const auto address : {value->address, value->meta}) process.main_engine().fill_bytes(address + 40, 0, extra);
         value->super = superclass; value->name = std::move(name); value->name_address = string(value->name); value->size = size;
         meta->address = value->meta; meta->name = value->name; meta->name_address = value->name_address; meta->metaclass = true;
         value->native = meta->native = true;
@@ -1111,16 +1115,19 @@ struct ObjcRuntime::Impl {
         weak_targets[location] = object;
         weak_referrers[object].push_back(location);
     }
-    // objc_storeWeak / objc_initWeak: a deallocating object is stored as nil.
+    bool is_block(Address object) { return object && !immortal(object) && class_record(object_class(object)).block; }
+    // objc_storeWeak / objc_initWeak: a deallocating object is stored as nil. Heap blocks count their
+    // references in their flag word, not in the object store: the Blocks runtime marks them, and their
+    // last _Block_release clears the references (objc_destructInstance).
     Address store_weak(Address location, Address object, bool initializing) {
         if (!location) throw std::runtime_error("Objective-C weak reference has a null location");
-        if (object && !immortal(object) && class_record(object_class(object)).block)
-            throw std::runtime_error("Objective-C weak references to Blocks are unsupported");
+        const bool block = is_block(object);
         std::lock_guard lock(weak_mutex);
         if (!initializing) weak_unregister(location);
         else weak_targets.erase(location);
         const bool tracked = object && !immortal(object);
-        if (tracked && !process.objects().mark_weakly_referenced(object)) object = 0;
+        if (block) { if (!blocks_call("___alchemy_block_weak", object)) object = 0; }
+        else if (tracked && !process.objects().mark_weakly_referenced(object)) object = 0;
         process.calling_engine().write64(location, object);
         if (tracked && object) weak_register(location, object);
         return object;
@@ -1132,6 +1139,8 @@ struct ObjcRuntime::Impl {
             std::lock_guard lock(weak_mutex);
             object = process.calling_engine().read64(location);
             if (!object || immortal(object)) return object;
+            // A weakly referenced block is cleared before its memory is freed, so it is readable here.
+            if (is_block(object)) return blocks_call("__Block_tryRetain", object) ? object : 0;
             // A store reference pins the object until a custom retain has run.
             if (!process.objects().try_retain(object)) return 0;
         }
@@ -2209,8 +2218,11 @@ struct ObjcRuntime::Impl {
             }
             flush_caches();
             s.x[0] = previous; });
-        function("_objc_allocateClassPair", [this](auto& s, auto& m) { if (s.x[2]) throw std::runtime_error("Objective-C extra class bytes are unsupported");
-            const auto result = native_class(text(m, s.x[1]), s.x[0], 8, false); { std::lock_guard lock(mutex); cls(result)->registered = false; } s.x[0] = result; });
+        // objc_allocateClassPair(superclass, name, extraBytes): NULL for a name in use, as Apple's runtime.
+        function("_objc_allocateClassPair", [this](auto& s, auto& m) {
+            const auto name = s.x[1] ? text(m, s.x[1]) : std::string();
+            { std::lock_guard lock(mutex); if (name.empty() || names.contains(name)) { s.x[0] = 0; return; } }
+            const auto result = native_class(name, s.x[0], 8, false, 0, s.x[2]); { std::lock_guard lock(mutex); cls(result)->registered = false; } s.x[0] = result; });
         function("_objc_registerClassPair", [this](auto& s, auto&) { std::lock_guard lock(mutex); cls(s.x[0])->registered = true; });
         function("_objc_disposeClassPair", [this](auto& s, auto&) { std::lock_guard lock(mutex); const auto value = cls(s.x[0]);
             if (value->registered) throw std::runtime_error("disposing registered Objective-C classes is unsupported");
@@ -2272,7 +2284,10 @@ struct ObjcRuntime::Impl {
         // A dealloc that calls objc_destructInstance and returns without object_dispose keeps the
         // memory (ObjectStore::note_destructed): freed by a later object_dispose.
         function("_objc_destructInstance", [this](auto& s, auto&) {
-            if (s.x[0]) { destruct(s.x[0]); process.objects().note_destructed(s.x[0]); } });
+            if (!s.x[0]) return;
+            // A heap block's last _Block_release: its weak references (it has no object record).
+            if (is_block(s.x[0])) { clear_weak(s.x[0]); return; }
+            destruct(s.x[0]); process.objects().note_destructed(s.x[0]); });
         function("_object_dispose", [this](auto& s, auto&) {
             if (s.x[0]) {
                 // A destructed, kept object (a zombie) is only freed: its isa may name another class now.

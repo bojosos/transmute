@@ -257,6 +257,7 @@ struct State : std::enable_shared_from_this<State> {
     SignalMaskAccess masks;
     std::mutex mutex;        // general state
     std::mutex block_mutex;  // Blocks reference counts (guest flag words)
+    std::set<std::uint64_t> weak_blocks;   // heap blocks with Objective-C weak references (block_mutex)
     std::uint64_t malloc_block_isa{};
     std::uint64_t context_entry{}, context_return{};
     // Mach semaphores.
@@ -362,6 +363,7 @@ struct State : std::enable_shared_from_this<State> {
         if (!block) return;
         if (!accessible(m, block, 32, false)) throw std::runtime_error("_Block_release received an invalid block");
         std::uint32_t flags;
+        bool weak{};
         {
             std::lock_guard lock(block_mutex);
             flags = m.read32(block + 8);
@@ -371,8 +373,13 @@ struct State : std::enable_shared_from_this<State> {
             flags -= 2;
             if (flags & refcount_mask) { m.write32(block + 8, flags); return; }
             m.write32(block + 8, flags | deallocating);
+            weak = weak_blocks.erase(block) != 0;
         }
         if (flags & has_copy_dispose) static_cast<void>(invoke(m.read64(m.read64(block + 24) + 24), {block}));
+        // libobjc's destructInstance hook (_Block_use_RR2) clears the weak references to the block; only
+        // blocks that had one need it.
+        if (weak)
+            if (const auto destruct = find(objc_library, "_objc_destructInstance")) static_cast<void>(invoke(*destruct, {block}));
         context.release_guest(block);
     }
     // __block variables: {isa, forwarding, flags, size, [keep, destroy], [layout], payload}.
@@ -622,6 +629,18 @@ void install_blocks(const std::shared_ptr<State>& state) {
         if ((flags & State::is_global) || !(flags & State::needs_free)) return 1;
         if (flags & State::deallocating) return 0;
         m.write32(s.x[0] + 8, State::increment(flags));
+        return 1;
+    }, 0);
+    // The Objective-C runtime marks a heap block it forms a weak reference to (objc_storeWeak, under its
+    // weak-table lock): false while the block is being deallocated. A marked block's last
+    // _Block_release clears the weak references through objc_destructInstance.
+    install(state, "___alchemy_block_weak", [state](auto& s, auto& m) -> std::uint64_t {
+        if (!s.x[0] || !accessible(m, s.x[0], 32, false)) throw std::runtime_error("Alchemy: a weak reference to an invalid block");
+        std::lock_guard lock(state->block_mutex);
+        const auto flags = m.read32(s.x[0] + 8);
+        if ((flags & State::is_global) || !(flags & State::needs_free)) return 1;
+        if (flags & State::deallocating) return 0;
+        state->weak_blocks.insert(s.x[0]);
         return 1;
     }, 0);
     // _Block_use_RR2(callbacks): object references in blocks already go through objc_retain and

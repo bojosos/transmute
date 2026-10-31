@@ -625,6 +625,40 @@ void test_win32_modal_loops(Fixture& f) {
 }
 } // namespace
 
+// Weak references to Blocks (objc_runtime.cpp and the Blocks runtime; this fixture has both): a heap
+// block's last _Block_release clears them, a deallocating block is stored as nil, global blocks stay.
+void test_weak_blocks(Fixture& f) {
+    using alchemy::objc_library;
+    const auto descriptor = f.process.allocate_guest(16), stack = f.process.allocate_guest(32);
+    f.engine.write64(descriptor, 0); f.engine.write64(descriptor + 8, 32);
+    f.engine.write64(stack, f.symbol(libsystem, "__NSConcreteStackBlock"));
+    f.engine.write32(stack + 8, 0); f.engine.write32(stack + 12, 0);
+    f.engine.write64(stack + 16, 0); f.engine.write64(stack + 24, descriptor);
+    const auto references = [&f](Address block) { return (f.engine.read32(block + 8) & 0xfffe) >> 1; };
+    const auto heap = f.system("__Block_copy", {stack});
+    const auto weak = f.process.allocate_guest(8), other = f.process.allocate_guest(8);
+    require(heap && heap != stack && f.call(objc_library, "_objc_initWeak", {weak, heap}) == heap, "objc_initWeak with a heap block");
+    require(f.call(objc_library, "_objc_loadWeakRetained", {weak}) == heap && references(heap) == 2, "a weak load retains the block");
+    f.system("__Block_release", {heap});
+    f.call(objc_library, "_objc_copyWeak", {other, weak});
+    require(f.engine.read64(other) == heap && f.engine.read64(weak) == heap, "objc_copyWeak");
+    f.system("__Block_release", {heap});
+    require(f.engine.read64(weak) == 0 && f.engine.read64(other) == 0 && f.call(objc_library, "_objc_loadWeakRetained", {weak}) == 0,
+            "the last _Block_release clears the weak references");
+    // A block being deallocated is stored as nil.
+    const auto dying = f.system("__Block_copy", {stack});
+    f.engine.write32(dying + 8, f.engine.read32(dying + 8) | 1);
+    require(f.call(objc_library, "_objc_storeWeak", {weak, dying}) == 0 && f.engine.read64(weak) == 0, "a deallocating block is stored as nil");
+    f.engine.write32(dying + 8, f.engine.read32(dying + 8) & ~1U);
+    f.system("__Block_release", {dying});
+    // Global blocks are not reference counted and never go away.
+    const auto global = f.block(0);
+    require(f.call(objc_library, "_objc_storeWeak", {weak, global}) == global && f.call(objc_library, "_objc_loadWeakRetained", {weak}) == global,
+            "a weak global block");
+    f.call(objc_library, "_objc_destroyWeak", {weak});
+    f.call(objc_library, "_objc_destroyWeak", {other});
+}
+
 int main() {
     try {
         Fixture f;
@@ -636,6 +670,7 @@ int main() {
         test_dispatch(f);
         test_foundation_and_cf(f);
         test_stop_marks(f);
+        test_weak_blocks(f);
         test_win32_modal_loops(f);
         std::cout << "Alchemy GUI run loop tests passed\n";
         return 0;
