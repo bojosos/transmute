@@ -52,6 +52,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/av_player.cpp
     src/alchemy/darwin/media/av_sample_buffer.cpp
     src/alchemy/darwin/media/av_capture.cpp
+    src/alchemy/darwin/media/av_asset_writer.cpp
     src/alchemy/darwin/media/capture_host.cpp
     src/alchemy/darwin/media/caclock.cpp)
 

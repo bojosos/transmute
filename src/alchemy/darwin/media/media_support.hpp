@@ -44,6 +44,8 @@ void install_av_sample_buffer_renderers(Support& support);
 // av_capture.cpp: AVCaptureDevice, discovery, sessions, device inputs and the video and audio data
 // outputs over the capture backend (capture_core.hpp) and the HAL's input devices (from install_av_foundation).
 void install_av_capture(Support& support);
+// av_asset_writer.cpp: AVAssetWriter and AVAssetWriterInput for linear PCM audio files (from install_av_foundation).
+void install_av_asset_writer(Support& support);
 // AVAuthorizationStatus of the camera (video) or microphone as AVCaptureDevice reports it; with `request`, after
 // +requestAccessForMediaType: would have decided it (no prompt). AVAudioApplication's record permission uses it.
 std::int64_t capture_authorization(bool video, bool request);

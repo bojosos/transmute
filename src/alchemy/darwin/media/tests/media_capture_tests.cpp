@@ -604,6 +604,118 @@ void recorder(Fixture& f) {
     std::filesystem::remove(path, ignored);
 }
 
+// A float32 stereo 48 kHz sample buffer of `frames` frames (left 0.5, right -0.25) at `pts` frames.
+Address float_sample_buffer(Fixture& f, std::uint32_t frames, std::int64_t pts) {
+    const auto asbd = f.block(40), out = f.block(8), time = f.block(24);
+    f.engine.write64(asbd, std::bit_cast<std::uint64_t>(48000.0));
+    f.engine.write32(asbd + 8, four("lpcm"));
+    f.engine.write32(asbd + 12, 1 | 8);   // float, packed
+    f.engine.write32(asbd + 16, 8);
+    f.engine.write32(asbd + 20, 1);
+    f.engine.write32(asbd + 24, 8);
+    f.engine.write32(asbd + 28, 2);
+    f.engine.write32(asbd + 32, 32);
+    require(f.status(cm, "_CMAudioFormatDescriptionCreate", {0, asbd, 0, 0, 0, 0, 0, out}) == 0, "CMAudioFormatDescriptionCreate");
+    const auto format = f.engine.read64(out);
+    alchemy::CallRegs create{};
+    create.x[2] = 8ULL * frames;
+    create.x[6] = 8ULL * frames;
+    create.x[7] = 1;
+    create.push_stack(out);
+    require(static_cast<std::int32_t>(f.regs(cm, "_CMBlockBufferCreateWithMemoryBlock", create).x0) == 0, "a block buffer");
+    const auto block = f.engine.read64(out);
+    const auto bytes = f.block(8ULL * frames);
+    for (std::uint32_t i = 0; i < frames; ++i) {
+        f.engine.write32(bytes + 8ULL * i, std::bit_cast<std::uint32_t>(0.5f));
+        f.engine.write32(bytes + 8ULL * i + 4, std::bit_cast<std::uint32_t>(-0.25f));
+    }
+    require(f.status(cm, "_CMBlockBufferReplaceDataBytes", {bytes, block, 0, 8ULL * frames}) == 0, "the samples");
+    f.engine.write64(time, static_cast<std::uint64_t>(pts));
+    f.engine.write32(time + 8, 48000);
+    f.engine.write32(time + 12, 1);
+    require(f.status(cm, "_CMAudioSampleBufferCreateReadyWithPacketDescriptions", {0, block, format, frames, time, 0, out}) == 0, "an audio sample buffer");
+    return f.engine.read64(out);
+}
+
+struct WriterSeen {
+    std::atomic<int> finished{0}, calls{0};
+    Address input{}, buffers[3]{};
+};
+WriterSeen& writer_seen() { static WriterSeen value; return value; }
+
+// AVAssetWriter: float sample buffers into a 16-bit WAVE (settings) and into a CAF (nil settings, through
+// requestMediaDataWhenReadyOnQueue:); video inputs and movie files are refused.
+void asset_writer(Fixture& f) {
+    auto& seen = writer_seen();
+    const auto b = alchemy::gui::security::bridge();
+    const auto error = f.block(8);
+    const auto directory = std::filesystem::temp_directory_path();
+    const auto wav = directory / "alchemy_writer_test.wav", caf = directory / "alchemy_writer_test.caf";
+    std::error_code ignored;
+    std::filesystem::remove(wav, ignored);
+    std::filesystem::remove(caf, ignored);
+    const auto wav_url = f.cf.file_url(alchemy::guest_path_string(wav), false), caf_url = f.cf.file_url(alchemy::guest_path_string(caf), false);
+    const auto type = [&](const char* symbol) { return f.engine.read64(f.symbol(av, symbol)); };
+    require(f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:", {wav_url, type("_AVFileTypeQuickTimeMovie"), error}) == 0 &&
+                f.engine.read64(error) != 0,
+            "no movie writer");
+    const auto writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:", {wav_url, type("_AVFileTypeWAVE"), error});
+    require(writer && f.send(writer, "status") == 0, "a WAVE writer");
+    const auto video = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("vide"), 0});
+    require((f.send(writer, "canAddInput:", {video}) & 0xff) == 0, "no video input (no encoder)");
+    const auto settings = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("AVFormatIDKey"), f.cf.integer(four("lpcm"), 3)}, {f.cf.string("AVSampleRateKey"), f.cf.real(48000)},
+        {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(2, 3)}, {f.cf.string("AVLinearPCMBitDepthKey"), f.cf.integer(16, 3)},
+        {f.cf.string("AVLinearPCMIsFloatKey"), f.cf.boolean(false)}});
+    const auto input = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), settings});
+    require((f.send(writer, "canAddInput:", {input}) & 0xff) == 1, "canAddInput:");
+    f.send(writer, "addInput:", {input});
+    require((f.send(writer, "startWriting") & 0xff) == 1 && f.send(writer, "status") == 1, "writing");
+    f.send(writer, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+    for (int i = 0; i < 3; ++i) {
+        require((f.send(input, "isReadyForMoreMediaData") & 0xff) == 1, "ready");
+        require((f.send(input, "appendSampleBuffer:", {float_sample_buffer(f, 4800, 4800LL * i)}) & 0xff) == 1, "appended");
+    }
+    f.send(input, "markAsFinished");
+    require((f.send(input, "isReadyForMoreMediaData") & 0xff) == 0, "finished inputs are not ready");
+    const auto done = b->make_block([](transmute::CpuState&, transmute::GuestMemory&) { ++writer_seen().finished; });
+    f.send(writer, "finishWritingWithCompletionHandler:", {done});
+    require(wait_for([&] { return seen.finished == 1; }) && f.send(writer, "status") == 2, "completed");
+    const auto read = [&](Address url, std::int64_t expected) {
+        const auto file = f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForReading:error:", {url, error});
+        require(file && static_cast<std::int64_t>(f.send(file, "length")) == expected, "frames written: " + std::to_string(file ? f.send(file, "length") : 0));
+        const auto processing = f.send(file, "processingFormat");
+        const auto buffer = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {processing, static_cast<Address>(expected)});
+        require((f.send(file, "readIntoBuffer:error:", {buffer, error}) & 0xff) == 1, "read back");
+        const auto channels = f.send(buffer, "floatChannelData");
+        const auto left = std::bit_cast<float>(f.engine.read32(f.engine.read64(channels) + 400)), right = std::bit_cast<float>(f.engine.read32(f.engine.read64(channels + 8) + 400));
+        require(std::fabs(left - 0.5f) < 0.001f && std::fabs(right + 0.25f) < 0.001f, "the samples: " + std::to_string(left) + " " + std::to_string(right));
+    };
+    read(wav_url, 14400);
+    // CAF in the buffers' own format (nil settings), fed through requestMediaDataWhenReadyOnQueue:.
+    const auto caf_writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:", {caf_url, type("_AVFileTypeCoreAudioFormat"), error});
+    const auto passthrough = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), 0});
+    f.send(caf_writer, "addInput:", {passthrough});
+    require((f.send(caf_writer, "startWriting") & 0xff) == 1, "writing the CAF");
+    f.send(caf_writer, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+    seen.input = passthrough;
+    for (int i = 0; i < 3; ++i) seen.buffers[i] = float_sample_buffer(f, 2400, 2400LL * i);
+    const auto feed = b->make_block([](transmute::CpuState&, transmute::GuestMemory&) {
+        auto& seen = writer_seen();
+        auto* sp = alchemy::gui::support_kit::support();
+        const auto call = seen.calls++;
+        if (call < 3) static_cast<void>(sp->send_id(seen.input, "appendSampleBuffer:", {seen.buffers[call]}));
+        else static_cast<void>(sp->send(seen.input, "markAsFinished"));
+    });
+    const auto queue = f.call(libsystem, "_dispatch_queue_create", {f.text("writer test"), 0});
+    f.send(passthrough, "requestMediaDataWhenReadyOnQueue:usingBlock:", {queue, feed});
+    require(wait_for([&] { return seen.calls >= 4; }), "the block ran until it finished the input: " + std::to_string(seen.calls.load()));
+    require((f.send(caf_writer, "finishWriting") & 0xff) == 1, "finishWriting");
+    read(caf_url, 7200);
+    std::filesystem::remove(wav, ignored);
+    std::filesystem::remove(caf, ignored);
+}
+
 // Alchemy's own test devices (ALCHEMY_CAMERA=pattern, ALCHEMY_AUDIO_INPUT=tone) through the host backends: the
 // colour-bar camera and the 440 Hz microphone, which replace the host's devices (none is opened).
 void test_devices(Fixture&) {
@@ -669,6 +781,7 @@ int main() {
         {"audio_queue_input", audio_queue_input},
         {"ioproc_input", ioproc_input},
         {"recorder", recorder},
+        {"asset_writer", asset_writer},
         {"test_devices", test_devices},
     });
 }
