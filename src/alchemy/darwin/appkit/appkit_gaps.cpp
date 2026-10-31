@@ -22,7 +22,13 @@
 //   empty). An application's own services
 //   (-initWithTitle:image:alternateImage:handler:) are real: -performWithItems:
 //   tells the delegate and runs the handler, and NSSharingServicePicker shows
-//   the services its delegate offers as a menu at the given rect.
+//   the services its delegate offers as a menu at the given rect;
+// - NSHapticFeedbackManager: the default performer does nothing, as AppKit's
+//   does on a Mac without a Force Touch trackpad;
+// - NSHelpManager: context help is kept per object; no help is shown
+//   (-showContextHelpForObject:locationHint: answers NO), help books are not
+//   registered (NO), and opening or searching a help book stops explicitly
+//   (there is no Help Viewer).
 namespace alchemy::gui::values {
 namespace {
 
@@ -532,6 +538,34 @@ void Provider::install_appkit() {
         static_cast<void>(msg(service, "performWithItems:", {stored(self, "items")}));
     }, false, "v@:@");
     method(picker, "close", [](CpuState&, GuestMemory&) {}, false, "v@:");   // the menu closes when it is chosen from
+
+    // ---- haptics: no Force Touch trackpad ----
+    const auto haptics = cls(appkit, "NSHapticFeedbackManager", "NSObject");
+    const auto performer = cls(appkit, "_NSHapticFeedbackPerformer", "NSObject");
+    method(performer, "performFeedbackPattern:performanceTime:", [](CpuState&, GuestMemory&) {}, false, "v@:qQ");
+    method(haptics, "defaultPerformer", [this, performer](CpuState& s, GuestMemory&) {
+        static Address shared{};
+        if (!shared) shared = create(performer);   // kept for the process
+        s.x[0] = shared;
+    }, true);
+
+    // ---- help: context help kept, no Help Viewer ----
+    const auto help = cls(appkit, "NSHelpManager", "NSObject");
+    singleton(help, "sharedHelpManager");
+    static bool context_mode{};
+    method(help, "isContextHelpModeActive", [](CpuState& s, GuestMemory&) { s.x[0] = context_mode ? 1 : 0; }, true, "B@:");
+    method(help, "setContextHelpModeActive:", [](CpuState& s, GuestMemory&) { context_mode = (s.x[2] & 0xff) != 0; }, true, "v@:B");
+    // Context help per object: kept in the manager's own storage, keyed by the object's address.
+    const auto help_key = [](Address object) { return "help:" + std::to_string(object); };
+    method(help, "setContextHelp:forObject:", [this, help_key](CpuState& s, GuestMemory&) { store(s.x[0], help_key(s.x[3]), s.x[2]); }, false, "v@:@@");
+    method(help, "removeContextHelpForObject:", [this, help_key](CpuState& s, GuestMemory&) { store(s.x[0], help_key(s.x[2]), 0); }, false, "v@:@");
+    method(help, "contextHelpForObject:", [this, help_key](CpuState& s, GuestMemory&) { s.x[0] = stored(s.x[0], help_key(s.x[2])); });
+    method(help, "showContextHelpForObject:locationHint:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:@{CGPoint=dd}");
+    method(help, "registerBooksInBundle:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:@");
+    for (const auto* name : {"openHelpAnchor:inBook:", "findString:inBook:"})
+        method(help, name, [selector = std::string(name)](CpuState&, GuestMemory&) {
+            throw std::runtime_error("unsupported: Alchemy: -[NSHelpManager " + selector + "] (no Help Viewer)");
+        }, false, "v@:@@");
     const auto preview_item = cls(appkit, "NSPreviewRepresentingActivityItem", "NSObject");
     object_properties(preview_item, {"item", "title", "imageProvider", "iconProvider"});
     method(preview_item, "initWithItem:title:image:icon:", [this](CpuState& s, GuestMemory&) {

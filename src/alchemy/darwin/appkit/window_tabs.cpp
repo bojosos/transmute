@@ -551,9 +551,10 @@ void AppKit::install_window_tabs() {
             StripViewState::Part part;
             part.item = item;
             double width{};
+            const auto tracking_class = objc.find_class("NSTrackingSeparatorToolbarItem");
             if (identifier == "NSToolbarFlexibleSpaceItem") { part.flexible = true; ++flexible; }
             else if (identifier == "NSToolbarSpaceItem") width = space_width;
-            else if (identifier == "NSToolbarSeparatorItem") width = separator_width;
+            else if (identifier == "NSToolbarSeparatorItem" || (tracking_class && is_kind(item, tracking_class))) width = separator_width;
             else if (const auto item_view = send(item, "view").x0) {
                 width = view_state(item_view)->frame.size.width;
                 const auto minimum = result_size(send(item, "minSize")), maximum = result_size(send(item, "maxSize"));
@@ -614,7 +615,8 @@ void AppKit::install_window_tabs() {
         for (std::size_t index = 0; index < info->parts.size(); ++index) {
             const auto& part = info->parts[index];
             const auto identifier = cf.utf8(send(part.item, "itemIdentifier").x0);
-            if (identifier == "NSToolbarSeparatorItem") {
+            const auto tracking_class = objc.find_class("NSTrackingSeparatorToolbarItem");
+            if (identifier == "NSToolbarSeparatorItem" || (tracking_class && is_kind(part.item, tracking_class))) {
                 canvas.fill_rect({{part.rect.origin.x + part.rect.size.width / 2, 6}, {1, bounds.size.height - 12}}, th.separator);
                 continue;
             }
@@ -631,6 +633,16 @@ void AppKit::install_window_tabs() {
                 style.color = enabled ? th.text : th.disabled_text;
                 draw_line_in(*this, string16(label), style, part.label, 2);
             }
+            // A menu item's indicator: a small chevron right of the icon.
+            const auto menu_class = objc.find_class("NSMenuToolbarItem");
+            if (menu_class && is_kind(part.item, menu_class) && send_bool(part.item, "showsIndicator") && part.icon.size.width > 0) {
+                drawing::Path chevron;
+                const double x = part.icon.origin.x + part.icon.size.width + 3, y = part.icon.origin.y + part.icon.size.height / 2;
+                chevron.move_to({x - 3, y + 1.5});
+                chevron.line_to({x, y - 1.5});
+                chevron.line_to({x + 3, y + 1.5});
+                canvas.stroke_path(chevron, enabled ? th.text : th.disabled_text, 1.2);
+            }
         }
     }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
     // A click released on the item it started on sends the item's action.
@@ -643,7 +655,40 @@ void AppKit::install_window_tabs() {
             if (rect_contains(info->parts[index].rect, location)) hit = static_cast<std::int64_t>(index);
         if (hit < 0) return;
         const auto item = info->parts[static_cast<std::size_t>(hit)].item;
-        if (!send_bool(item, "isEnabled") || !send(item, "action").x0) return;
+        if (!send_bool(item, "isEnabled")) return;
+        // A menu item pops its menu up under itself; a sharing item shows a picker there.
+        const auto menu_class = objc.find_class("NSMenuToolbarItem");
+        const auto share_class = objc.find_class("NSSharingServicePickerToolbarItem");
+        const auto anchor = info->parts[static_cast<std::size_t>(hit)].rect;
+        if (menu_class && is_kind(item, menu_class) && send(item, "menu").x0) {
+            const auto item_menu = send(item, "menu").x0;
+            info->pressed = hit;
+            invalidate_view(self);
+            std::int64_t chosen{};
+            try { chosen = popup_menu_tracking(item_menu, self, anchor, -1); }
+            catch (...) { info->pressed = -1; invalidate_view(self); throw; }
+            info->pressed = -1;
+            invalidate_view(self);
+            if (chosen >= 0) static_cast<void>(send_id(item_menu, "performActionForItemAtIndex:", {static_cast<Address>(chosen)}));
+            return;
+        }
+        if (share_class && is_kind(item, share_class)) {
+            const auto delegate = send(item, "delegate").x0;
+            const auto picker_class = objc.find_class("NSSharingServicePicker");
+            if (!delegate || !picker_class) return;
+            const auto activity = responds(delegate, "itemsForSharingServicePickerToolbarItem:")
+                                      ? send_id(delegate, "itemsForSharingServicePickerToolbarItem:", {item}) : 0;
+            const auto picker = send_id(send(picker_class, "alloc").x0, "initWithItems:", {activity ? activity : auto_array({})});
+            static_cast<void>(send_id(picker, "setDelegate:", {delegate}));
+            CallRegs show;
+            put_rect(show, 0, anchor);
+            show.x[2] = self;
+            show.x[3] = 1;   // NSMinYEdge
+            static_cast<void>(send(picker, "showRelativeToRect:ofView:preferredEdge:", show));
+            release(picker);
+            return;
+        }
+        if (!send(item, "action").x0) return;
         Point last = location;
         const auto rect = info->parts[static_cast<std::size_t>(hit)].rect;
         const bool released_inside = track_mouse(*this, self, down, [this, self, info, hit](bool inside) {

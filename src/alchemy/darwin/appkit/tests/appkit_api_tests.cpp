@@ -999,6 +999,80 @@ void toolbar_groups(Fixture& f) {
     require(static_cast<std::int64_t>(f.id(group, "selectedIndex")) == -1, "a momentary group keeps no selection");
 }
 
+// The macOS 11 toolbar items, haptics and help (the frameworks wave, U19).
+void modern_toolbar_items(Fixture& f) {
+    // A search item's search field is its view.
+    const auto search = f.id(f.id(f.cls("NSSearchToolbarItem"), "alloc"), "initWithItemIdentifier:", {f.str("search")});
+    const auto field = f.id(search, "searchField");
+    require(field && (f.id(field, "isKindOfClass:", {f.cls("NSSearchField")}) & 0xff) && f.id(search, "view") == field &&
+                (f.id(search, "resignsFirstResponderWithCancel") & 0xff) == 1,
+            "a search toolbar item's field");
+    CallRegs width;
+    width.set_d(0, 200);
+    static_cast<void>(f.msg(search, "setPreferredWidthForSearchField:", width));
+    require(f.rect(f.msg(field, "frame")).size.width == 200 && f.msg(search, "preferredWidthForSearchField").d(0) == 200, "the preferred search width");
+    // A menu item keeps its menu; a tracking separator its split view and divider.
+    const auto menu_item = f.id(f.id(f.cls("NSMenuToolbarItem"), "alloc"), "initWithItemIdentifier:", {f.str("more")});
+    const auto menu = f.alloc_init("NSMenu");
+    static_cast<void>(f.id(menu_item, "setMenu:", {menu}));
+    require(f.id(menu_item, "menu") == menu && (f.id(menu_item, "showsIndicator") & 0xff) == 1, "a menu toolbar item");
+    const auto split = f.view({{0, 0}, {300, 200}}, "NSSplitView");
+    const auto separator = f.id(f.cls("NSTrackingSeparatorToolbarItem"), "trackingSeparatorToolbarItemWithIdentifier:splitView:dividerIndex:",
+                                {f.str("sidebar"), split, 0});
+    require(separator && f.id(separator, "splitView") == split && f.id(separator, "dividerIndex") == 0, "a tracking separator item");
+    // A sharing item asks its delegate for the items when clicked in a shown toolbar.
+    std::vector<Address> asked;
+    const auto share_delegate_class = f.subclass("U19ShareItemDelegate", "NSObject");
+    f.add(share_delegate_class, "itemsForSharingServicePickerToolbarItem:", [&f, &asked](CpuState& s, GuestMemory&) {
+        asked.push_back(s.x[2]);
+        s.x[0] = f.array({});
+    }, "@@:@");
+    const auto share = f.id(f.id(f.cls("NSSharingServicePickerToolbarItem"), "alloc"), "initWithItemIdentifier:", {f.str("share")});
+    static_cast<void>(f.id(share, "setLabel:", {f.str("Share")}));
+    static_cast<void>(f.id(share, "setDelegate:", {f.alloc_init("U19ShareItemDelegate")}));
+    const auto toolbar = f.id(f.id(f.cls("NSToolbar"), "alloc"), "initWithIdentifier:", {f.str("u19")});
+    const auto delegate_class = f.subclass("U19ToolbarDelegate", "NSObject");
+    f.add(delegate_class, "toolbarDefaultItemIdentifiers:", [&f](CpuState& s, GuestMemory&) { s.x[0] = f.array({f.str("share")}); }, "@@:@");
+    f.add(delegate_class, "toolbarAllowedItemIdentifiers:", [&f](CpuState& s, GuestMemory&) { s.x[0] = f.array({f.str("share")}); }, "@@:@");
+    f.add(delegate_class, "toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:", [share](CpuState& s, GuestMemory&) { s.x[0] = share; }, "@@:@@B");
+    static_cast<void>(f.id(toolbar, "setDelegate:", {f.alloc_init("U19ToolbarDelegate")}));
+    const auto window = f.window({{100, 100}, {300, 200}});
+    static_cast<void>(f.id(window, "setToolbar:", {toolbar}));
+    static_cast<void>(f.id(window, "makeKeyAndOrderFront:", {0}));
+    const auto strip = appkit::instance()->window_state(window)->toolbar_view;
+    require(strip != 0, "the toolbar shows");
+    gui::Event down;
+    down.type = gui::event_type::left_mouse_down;
+    down.window = f.id(window, "windowNumber");
+    const auto frame = f.rect(f.msg(strip, "frame"));
+    down.location = {8 + 10, frame.origin.y + frame.size.height / 2};   // the first item, after the padding
+    down.click_count = 1;
+    down.pressed_buttons = 1;
+    f.server.queue(down);
+    auto up = down;
+    up.type = gui::event_type::left_mouse_up;
+    up.pressed_buttons = 0;
+    f.server.queue(up);
+    static_cast<void>(f.server.dispatch_messages());
+    while (const auto event = f.id(f.app, "nextEventMatchingMask:untilDate:inMode:dequeue:", {~0ULL, 0, 0, 1}))
+        static_cast<void>(f.id(f.app, "sendEvent:", {event}));
+    require(asked == std::vector<Address>{share}, "clicking a sharing item asks its delegate for the items");
+    static_cast<void>(f.id(window, "close"));
+
+    // Haptics do nothing without a Force Touch trackpad; help keeps context help, shows none.
+    const auto performer = f.id(f.cls("NSHapticFeedbackManager"), "defaultPerformer");
+    require(performer && performer == f.id(f.cls("NSHapticFeedbackManager"), "defaultPerformer"), "the default haptic performer");
+    static_cast<void>(f.id(performer, "performFeedbackPattern:performanceTime:", {0, 0}));
+    const auto help = f.id(f.cls("NSHelpManager"), "sharedHelpManager");
+    const auto object = f.alloc_init("NSObject");
+    const auto text = f.str("Context help");
+    static_cast<void>(f.id(help, "setContextHelp:forObject:", {text, object}));
+    require(f.text(f.id(help, "contextHelpForObject:", {object})) == "Context help" && (f.id(help, "registerBooksInBundle:", {0}) & 0xff) == 0,
+            "context help kept; no help books");
+    static_cast<void>(f.id(help, "removeContextHelpForObject:", {object}));
+    require(f.id(help, "contextHelpForObject:", {object}) == 0, "context help removed");
+}
+
 // NSSpeechSynthesizer over AVFAudio and the host's voices (the frameworks
 // wave, U15). Without host voices the initializer returns nil; with them, an
 // utterance (at volume 0, to the silent output stream main() asks for)
@@ -1062,7 +1136,7 @@ int main() {
                  {"images_and_cursors", images_and_cursors}, {"alerts_and_panels", alerts_and_panels},
                  {"pasteboards_and_text", pasteboards_and_text}, {"containers_and_controllers", containers_and_controllers},
                  {"toolbars_and_tabs", toolbars_and_tabs}, {"c_functions", c_functions},
-                 {"status_items_and_sounds", status_items_and_sounds}, {"app_referenced", app_referenced}, {"toolbar_groups", toolbar_groups}, {"speech", speech}}) {
+                 {"status_items_and_sounds", status_items_and_sounds}, {"app_referenced", app_referenced}, {"toolbar_groups", toolbar_groups}, {"modern_toolbar_items", modern_toolbar_items}, {"speech", speech}}) {
             std::cout << "[appkit api] " << name << std::endl;
             test(f);
         }

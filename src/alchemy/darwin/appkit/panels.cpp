@@ -50,6 +50,18 @@ struct ToolbarGroupState {
     std::int64_t mode{}, representation{};    // NSToolbarItemGroupSelectionMode, ...ControlRepresentation
     Address control{};                        // +1 the segmented control shown (nil until needed)
 };
+// The macOS 11 toolbar items' own settings.
+struct ToolbarExtras {
+    Address menu{}, split_view{};             // +1
+    Address delegate{};                       // not retained
+    double preferred_width{};
+    std::int64_t divider{};
+    bool shows_indicator{true}, resigns_on_cancel{true};
+};
+std::map<Address, ToolbarExtras>& toolbar_extras() {
+    static std::map<Address, ToolbarExtras> extras;
+    return extras;
+}
 std::map<Address, ToolbarGroupState>& toolbar_groups() {
     static std::map<Address, ToolbarGroupState> groups;
     return groups;
@@ -582,6 +594,87 @@ void AppKit::install_panels() {
     };
     class_method(group, "groupWithItemIdentifier:titles:selectionMode:labels:target:action:", factory(false), "@@:@@q@@:");
     class_method(group, "groupWithItemIdentifier:images:selectionMode:labels:target:action:", factory(true), "@@:@@q@@:");
+
+    // ---- the macOS 11 toolbar items ----
+    // NSSearchToolbarItem: its search field is the item's view (the strip
+    // lays it out); beginning a search interaction makes the field first
+    // responder, ending it gives first responder back to the window.
+    const auto search_item = declare_class("NSSearchToolbarItem", "NSToolbarItem");
+    method(search_item, "initWithItemIdentifier:", [this, search_item](CpuState& s, GuestMemory&) {
+        CallRegs registers;
+        registers.x[2] = s.x[2];
+        const auto self = objc.send_super(s.x[0], search_item, sel("initWithItemIdentifier:"), registers).x0;
+        s.x[0] = self;
+        if (!self) return;
+        if (const auto field_class = objc.find_class("NSSearchField")) {
+            CallRegs frame;
+            put_rect(frame, 0, {{0, 0}, {140, 22}});
+            const auto field = send(send(field_class, "alloc").x0, "initWithFrame:", frame).x0;
+            static_cast<void>(send_id(self, "setView:", {field}));
+            release(field);
+        }
+        toolbar_extras()[self].resigns_on_cancel = true;
+    });
+    method(search_item, "searchField", [this](CpuState& s, GuestMemory&) { s.x[0] = send(s.x[0], "view").x0; });
+    method(search_item, "setSearchField:", [this](CpuState& s, GuestMemory&) { static_cast<void>(send_id(s.x[0], "setView:", {s.x[2]})); }, "v@:@");
+    method(search_item, "preferredWidthForSearchField", [](CpuState& s, GuestMemory&) {
+        set_d(s, 0, toolbar_extras()[s.x[0]].preferred_width);
+    }, "d@:");
+    method(search_item, "setPreferredWidthForSearchField:", [this](CpuState& s, GuestMemory&) {
+        const double width = d(s, 0);
+        toolbar_extras()[s.x[0]].preferred_width = width;
+        if (width > 0) if (const auto field = send(s.x[0], "view").x0) {
+            auto frame = view_state(field)->frame;
+            frame.size.width = width;
+            CallRegs registers;
+            put_rect(registers, 0, frame);
+            static_cast<void>(send(field, "setFrame:", registers));
+        }
+    }, "v@:d");
+    method(search_item, "resignsFirstResponderWithCancel", [](CpuState& s, GuestMemory&) { return_bool(s, toolbar_extras()[s.x[0]].resigns_on_cancel); }, "B@:");
+    method(search_item, "setResignsFirstResponderWithCancel:", [](CpuState& s, GuestMemory&) { toolbar_extras()[s.x[0]].resigns_on_cancel = bool_arg(s, 2); }, "v@:B");
+    method(search_item, "beginSearchInteraction", [this](CpuState& s, GuestMemory&) {
+        const auto field = send(s.x[0], "view").x0;
+        if (const auto owner = field ? view_state(field)->window : 0) static_cast<void>(send_id(owner, "makeFirstResponder:", {field}));
+    }, "v@:");
+    method(search_item, "endSearchInteraction", [this](CpuState& s, GuestMemory&) {
+        const auto field = send(s.x[0], "view").x0;
+        if (const auto owner = field ? view_state(field)->window : 0) static_cast<void>(send_id(owner, "makeFirstResponder:", {0}));
+    }, "v@:");
+    // NSMenuToolbarItem: a click pops its menu up under the item (window_tabs.cpp).
+    const auto menu_item_class = declare_class("NSMenuToolbarItem", "NSToolbarItem");
+    method(menu_item_class, "menu", [](CpuState& s, GuestMemory&) { s.x[0] = toolbar_extras()[s.x[0]].menu; });
+    method(menu_item_class, "setMenu:", [this](CpuState& s, GuestMemory&) { assign(toolbar_extras()[s.x[0]].menu, s.x[2]); }, "v@:@");
+    method(menu_item_class, "showsIndicator", [](CpuState& s, GuestMemory&) { return_bool(s, toolbar_extras()[s.x[0]].shows_indicator); }, "B@:");
+    method(menu_item_class, "setShowsIndicator:", [](CpuState& s, GuestMemory&) { toolbar_extras()[s.x[0]].shows_indicator = bool_arg(s, 2); }, "v@:B");
+    // NSSharingServicePickerToolbarItem: a click shows a sharing service
+    // picker for the delegate's activity items (window_tabs.cpp).
+    const auto share_item = declare_class("NSSharingServicePickerToolbarItem", "NSToolbarItem");
+    method(share_item, "delegate", [](CpuState& s, GuestMemory&) { s.x[0] = toolbar_extras()[s.x[0]].delegate; });
+    method(share_item, "setDelegate:", [](CpuState& s, GuestMemory&) { toolbar_extras()[s.x[0]].delegate = s.x[2]; }, "v@:@");
+    // NSTrackingSeparatorToolbarItem: drawn as a separator (it does not
+    // follow the split view's divider: the strip lays items out in a row).
+    const auto tracking_item = declare_class("NSTrackingSeparatorToolbarItem", "NSToolbarItem");
+    method(tracking_item, "splitView", [](CpuState& s, GuestMemory&) { s.x[0] = toolbar_extras()[s.x[0]].split_view; });
+    method(tracking_item, "setSplitView:", [this](CpuState& s, GuestMemory&) { assign(toolbar_extras()[s.x[0]].split_view, s.x[2]); }, "v@:@");
+    method(tracking_item, "dividerIndex", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(toolbar_extras()[s.x[0]].divider); }, "q@:");
+    method(tracking_item, "setDividerIndex:", [](CpuState& s, GuestMemory&) { toolbar_extras()[s.x[0]].divider = static_cast<std::int64_t>(s.x[2]); }, "v@:q");
+    class_method(tracking_item, "trackingSeparatorToolbarItemWithIdentifier:splitView:dividerIndex:", [this](CpuState& s, GuestMemory&) {
+        const auto made = send_id(send(s.x[0], "alloc").x0, "initWithItemIdentifier:", {s.x[2]});
+        static_cast<void>(send_id(made, "setSplitView:", {s.x[3]}));
+        static_cast<void>(send_id(made, "setDividerIndex:", {s.x[4]}));
+        s.x[0] = autorelease(made);
+    }, "@@:@@q");
+    for (const auto cls : {menu_item_class, tracking_item, search_item})
+        method(cls, "dealloc", [this, cls](CpuState& s, GuestMemory&) {
+            auto& extras = toolbar_extras();
+            if (const auto found = extras.find(s.x[0]); found != extras.end()) {
+                release(found->second.menu);
+                release(found->second.split_view);
+                extras.erase(found);
+            }
+            static_cast<void>(objc.send_super(s.x[0], cls, sel("dealloc")));
+        }, "v@:");
 
     // NSWindow's toolbar methods: window_tabs.cpp.
 

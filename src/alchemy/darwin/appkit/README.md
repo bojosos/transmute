@@ -185,6 +185,15 @@ delegate callbacks, stopping and pausing at once or at a word. The pitch base
 is kept, not applied; writing speech to a file stops explicitly; without host
 voices the initializers return nil.
 
+**macOS 11 toolbar items:** NSSearchToolbarItem's search field is its view
+(begin / end search interaction move first responder); NSMenuToolbarItem pops
+its menu up under the item (with the indicator chevron);
+NSSharingServicePickerToolbarItem shows a sharing service picker for its
+delegate's items; NSTrackingSeparatorToolbarItem is drawn as a separator (it
+does not follow the split view's divider). NSHapticFeedbackManager's performer
+does nothing (no Force Touch trackpad); NSHelpManager keeps context help but
+shows none, registers no help books, and opening or searching one stops.
+
 **Toolbar groups and grid layouts:** NSToolbarItemGroup shows its subitems in
 the toolbar strip as one segmented control (the group's view unless it has
 its own), selected by its selection mode; a chosen segment sends the
