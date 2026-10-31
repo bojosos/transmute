@@ -47,38 +47,50 @@ void install_appkit_extra(Support& support) {
     // A window that is its own first responder is no text input client: no
     // input context (Qt asks the first responder; views keep AppKit's).
     add("NSWindow", "inputContext", [](CpuState& c, GuestMemory&) { c.x[0] = 0; }, "@@:");
-    // -[NSApplication dockTile]: one NSDockTile that keeps its badge label,
-    // content view and badge flag. Windows has no dock, so -display shows
-    // nothing (the taskbar is not driven from it).
+    // -[NSApplication dockTile] and -[NSWindow dockTile] (a miniaturized
+    // window's): NSDockTiles that keep their badge label, content view and
+    // badge flag, made on first use and kept for the process (a window's
+    // with it). Windows has no dock, so -display shows nothing (the taskbar
+    // is not driven from them).
     if (const auto application_class = support.objc.find_class("NSApplication");
         application_class && !instances_respond(support, application_class, "dockTile")) {
-        struct Tile { std::mutex mutex; Address object{}, badge{}, content{}; bool shows_badge = true; };
-        auto tile = std::make_shared<Tile>();
+        struct Tile { Address owner{}, badge{}, content{}; bool shows_badge = true; };
+        struct Tiles { std::mutex mutex; std::map<Address, Tile> by_tile; std::map<Address, Address> by_owner; };
+        auto tiles = std::make_shared<Tiles>();
         const auto tile_class = support.declare_class("NSDockTile", "NSObject", "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit");
-        support.method(application_class, "dockTile", [&support, tile, tile_class](CpuState& c, GuestMemory&) {
-            std::lock_guard lock(tile->mutex);
-            if (!tile->object) {
-                tile->object = support.objc.allocate(tile_class);
-                if (const auto record = support.process.objects().find(tile->object)) record->immortal = true;
+        const auto tile_of = [&support, tiles, tile_class](CpuState& c, GuestMemory&) {
+            const auto owner = c.x[0];
+            std::lock_guard lock(tiles->mutex);
+            auto& object = tiles->by_owner[owner];
+            if (!object) {
+                object = support.objc.allocate(tile_class);
+                if (const auto record = support.process.objects().find(object)) record->immortal = true;
+                tiles->by_tile[object].owner = owner;
             }
-            c.x[0] = tile->object;
-        }, "@@:");
-        support.method(tile_class, "badgeLabel", [tile](CpuState& c, GuestMemory&) { std::lock_guard lock(tile->mutex); c.x[0] = tile->badge; }, "@@:");
-        support.method(tile_class, "setBadgeLabel:", [&support, tile](CpuState& c, GuestMemory&) {
+            c.x[0] = object;
+        };
+        support.method(application_class, "dockTile", tile_of, "@@:");
+        if (const auto window_class = support.objc.find_class("NSWindow"); window_class && !instances_respond(support, window_class, "dockTile"))
+            support.method(window_class, "dockTile", tile_of, "@@:");
+        support.method(tile_class, "owner", [tiles](CpuState& c, GuestMemory&) { std::lock_guard lock(tiles->mutex); c.x[0] = tiles->by_tile[c.x[0]].owner; }, "@@:");
+        support.method(tile_class, "badgeLabel", [tiles](CpuState& c, GuestMemory&) { std::lock_guard lock(tiles->mutex); c.x[0] = tiles->by_tile[c.x[0]].badge; }, "@@:");
+        support.method(tile_class, "setBadgeLabel:", [&support, tiles](CpuState& c, GuestMemory&) {
             const auto copy = c.x[2] ? support.cf.copy(c.x[2]) : 0;
-            std::lock_guard lock(tile->mutex);
-            support.release(std::exchange(tile->badge, copy));
+            Address old{};
+            { std::lock_guard lock(tiles->mutex); old = std::exchange(tiles->by_tile[c.x[0]].badge, copy); }
+            support.release(old);
         }, "v@:@");
-        support.method(tile_class, "contentView", [tile](CpuState& c, GuestMemory&) { std::lock_guard lock(tile->mutex); c.x[0] = tile->content; }, "@@:");
-        support.method(tile_class, "setContentView:", [&support, tile](CpuState& c, GuestMemory&) {
+        support.method(tile_class, "contentView", [tiles](CpuState& c, GuestMemory&) { std::lock_guard lock(tiles->mutex); c.x[0] = tiles->by_tile[c.x[0]].content; }, "@@:");
+        support.method(tile_class, "setContentView:", [&support, tiles](CpuState& c, GuestMemory&) {
             const auto view = support.retain(c.x[2]);
-            std::lock_guard lock(tile->mutex);
-            support.release(std::exchange(tile->content, view));
+            Address old{};
+            { std::lock_guard lock(tiles->mutex); old = std::exchange(tiles->by_tile[c.x[0]].content, view); }
+            support.release(old);
         }, "v@:@");
-        support.method(tile_class, "showsApplicationBadge", [tile](CpuState& c, GuestMemory&) { std::lock_guard lock(tile->mutex); c.x[0] = tile->shows_badge; }, "B@:");
-        support.method(tile_class, "setShowsApplicationBadge:", [tile](CpuState& c, GuestMemory&) {
-            std::lock_guard lock(tile->mutex);
-            tile->shows_badge = (c.x[2] & 0xff) != 0;
+        support.method(tile_class, "showsApplicationBadge", [tiles](CpuState& c, GuestMemory&) { std::lock_guard lock(tiles->mutex); c.x[0] = tiles->by_tile[c.x[0]].shows_badge; }, "B@:");
+        support.method(tile_class, "setShowsApplicationBadge:", [tiles](CpuState& c, GuestMemory&) {
+            std::lock_guard lock(tiles->mutex);
+            tiles->by_tile[c.x[0]].shows_badge = (c.x[2] & 0xff) != 0;
         }, "v@:B");
         support.method(tile_class, "display", [](CpuState&, GuestMemory&) {}, "v@:");
         support.method(tile_class, "size", [](CpuState& c, GuestMemory&) { return_real(c, 0, 128); return_real(c, 1, 128); }, "{CGSize=dd}@:");

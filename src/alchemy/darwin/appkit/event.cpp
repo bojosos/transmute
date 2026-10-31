@@ -379,6 +379,11 @@ void AppKit::install_event() {
     class_method(e, "isMouseCoalescingEnabled", [this](CpuState& s, GuestMemory&) { return_bool(s, coalesce_mouse); }, "B@:");
     class_method(e, "setMouseCoalescingEnabled:", [this](CpuState& s, GuestMemory&) { coalesce_mouse = bool_arg(s, 2); }, "v@:B");
     class_method(e, "isSwipeTrackingFromScrollEventsEnabled", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
+    // Swipe tracking follows a trackpad's scroll gesture; the window server
+    // reports none (swipe tracking is off above).
+    method(e, "trackSwipeEventWithOptions:dampenAmountThresholdMin:max:usingHandler:", [](CpuState&, GuestMemory&) {
+        unsupported("-[NSEvent trackSwipeEventWithOptions:...] (no trackpad swipe gestures)");
+    }, "v@:Qdd@?");
     class_method(e, "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:",
                  [this](CpuState& s, GuestMemory& m) {
         Event source;

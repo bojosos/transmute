@@ -828,6 +828,139 @@ void status_items_and_sounds(Fixture& f) {
     require(f.id(f.id(f.cls("NSSound"), "alloc"), "initWithData:", {junk}) == 0, "data that is no sound gives nil");
 }
 
+// The selectors the audited applications reference that were missing (the
+// frameworks wave, U13): an application's own sharing service and the
+// picker's menu, print panel objects, alert and image delegates, screen
+// pixel alignment, display links, per-window dock tiles, image rep types and
+// collection view drag masks.
+Address global_block(Fixture& f, transmute::GuestCallHandler handler) {
+    static int serial = 0;
+    const auto invoke = f.process.install_function("_u13_test_block_" + std::to_string(serial++), std::move(handler), "/usr/lib/libu13test.dylib");
+    auto isa = f.process.resolve("/usr/lib/libSystem.B.dylib", "__NSConcreteGlobalBlock");
+    if (!isa) isa = f.process.resolve("/usr/lib/system/libsystem_blocks.dylib", "__NSConcreteGlobalBlock");
+    require(isa.has_value(), "the global block class");
+    auto& m = f.process.main_engine();
+    const auto descriptor = f.process.allocate_guest(16);
+    m.write64(descriptor, 0);
+    m.write64(descriptor + 8, 32);
+    const auto literal = f.process.allocate_guest(32);
+    m.write64(literal, isa->address);
+    m.write64(literal + 8, 1ULL << 28);   // BLOCK_IS_GLOBAL
+    m.write64(literal + 16, invoke);
+    m.write64(literal + 24, descriptor);
+    return literal;
+}
+
+void app_referenced(Fixture& f) {
+    const auto items = [&f](Address array) {
+        std::vector<Address> values;
+        const auto count = array ? f.id(array, "count") : 0;
+        for (Address i = 0; i < count; ++i) values.push_back(f.id(array, "objectAtIndex:", {i}));
+        return values;
+    };
+    // An application's own sharing service.
+    std::vector<std::string> said;
+    const auto handler = global_block(f, [&said](CpuState& s, GuestMemory&) { said.push_back("handler"); s.x[0] = 0; });
+    const auto service = f.id(f.id(f.cls("NSSharingService"), "alloc"), "initWithTitle:image:alternateImage:handler:", {f.str("Send to Cue"), 0, 0, handler});
+    require(f.text(f.id(service, "title")) == "Send to Cue" && f.text(f.id(service, "menuItemTitle")) == "Send to Cue", "the service's titles");
+    static_cast<void>(f.id(service, "setMenuItemTitle:", {f.str("Share")}));
+    require(f.text(f.id(service, "menuItemTitle")) == "Share" && (f.id(service, "canPerformWithItems:", {0}) & 0xff) == 1, "menu item title, can perform");
+    const auto share_delegate_class = f.subclass("U13ShareDelegate", "NSObject");
+    f.add(share_delegate_class, "sharingService:willShareItems:", [&said](CpuState&, GuestMemory&) { said.push_back("will"); }, "v@:@@");
+    f.add(share_delegate_class, "sharingService:didShareItems:", [&said](CpuState&, GuestMemory&) { said.push_back("did"); }, "v@:@@");
+    static_cast<void>(f.id(service, "setDelegate:", {f.alloc_init("U13ShareDelegate")}));
+    static_cast<void>(f.id(service, "performWithItems:", {f.array({f.str("cue")})}));
+    const auto joined = [&said] { std::string all; for (const auto& entry : said) all += entry + " "; return all; };
+    require(said == std::vector<std::string>{"will", "handler", "did"}, "-performWithItems: tells the delegate around the handler (got: " + joined() + ")");
+
+    // The picker: the delegate's services as a menu; nothing offered, or a dismissal, chooses nil.
+    const auto window = f.window({{100, 100}, {300, 200}});
+    static_cast<void>(f.id(window, "makeKeyAndOrderFront:", {0}));
+    const auto content = f.id(window, "contentView");
+    std::vector<Address> offered, chosen;
+    const auto picker_delegate_class = f.subclass("U13PickerDelegate", "NSObject");
+    f.add(picker_delegate_class, "sharingServicePicker:sharingServicesForItems:proposedSharingServices:",
+          [&f, &offered](CpuState& s, GuestMemory&) { s.x[0] = f.array(offered); }, "@@:@@@");
+    f.add(picker_delegate_class, "sharingServicePicker:didChooseSharingService:", [&chosen](CpuState& s, GuestMemory&) { chosen.push_back(s.x[3]); }, "v@:@@");
+    const auto picker = f.id(f.id(f.cls("NSSharingServicePicker"), "alloc"), "initWithItems:", {f.array({f.str("cue")})});
+    static_cast<void>(f.id(picker, "setDelegate:", {f.alloc_init("U13PickerDelegate")}));
+    static_cast<void>(f.with_rect(picker, "showRelativeToRect:ofView:preferredEdge:", {{10, 10}, {40, 20}}, {content, 1}));
+    require(chosen == std::vector<Address>{0}, "no services: the delegate hears nil");
+    offered = {service};
+    said.clear();
+    const auto number = f.id(window, "windowNumber");
+    for (const std::uint16_t code : {0x7d, 0x24}) {   // down to the first service, Return
+        gui::Event key;
+        key.type = gui::event_type::key_down;
+        key.window = number;
+        key.key_code = code;
+        f.server.queue(key);
+    }
+    static_cast<void>(f.server.dispatch_messages());   // the queued keys reach AppKit's queue for the menu's tracking
+    static_cast<void>(f.with_rect(picker, "showRelativeToRect:ofView:preferredEdge:", {{10, 10}, {40, 20}}, {content, 1}));
+    require(chosen.size() == 2 && chosen[1] == service && said == std::vector<std::string>{"will", "handler", "did"},
+            "choosing a service from the picker's menu performs it");
+    static_cast<void>(f.id(window, "close"));
+
+    // Print panel objects.
+    const auto panel = f.id(f.cls("NSPrintPanel"), "printPanel");
+    require(panel && f.id(panel, "options") == 3 && f.id(panel, "printInfo") == 0, "a print panel's default options");
+    static_cast<void>(f.id(panel, "setOptions:", {0x23}));
+    static_cast<void>(f.id(panel, "setJobStyleHint:", {f.str("NSPrintPhotoJobStyleHint")}));
+    const auto accessory = f.alloc_init("NSViewController");
+    static_cast<void>(f.id(panel, "addAccessoryController:", {accessory}));
+    require(f.id(panel, "options") == 0x23 && f.text(f.id(panel, "jobStyleHint")) == "NSPrintPhotoJobStyleHint" &&
+                items(f.id(panel, "accessoryControllers")) == std::vector<Address>{accessory},
+            "print panel options, job style and accessories");
+    static_cast<void>(f.id(panel, "removeAccessoryController:", {accessory}));
+    require(items(f.id(panel, "accessoryControllers")).empty(), "removing an accessory");
+
+    // Alert and image delegates; an image that cannot draw asks its delegate.
+    const auto alert = f.alloc_init("NSAlert");
+    const auto alert_delegate = f.alloc_init("NSObject");
+    static_cast<void>(f.id(alert, "setDelegate:", {alert_delegate}));
+    require(f.id(alert, "delegate") == alert_delegate, "-[NSAlert delegate]");
+    int asked = 0;
+    const auto image_delegate_class = f.subclass("U13ImageDelegate", "NSObject");
+    f.add(image_delegate_class, "imageDidNotDraw:inRect:", [&asked](CpuState& s, GuestMemory&) { ++asked; s.x[0] = 0; }, "@@:@{CGRect={CGPoint=dd}{CGSize=dd}}");
+    const auto empty = f.alloc_init("NSImage");
+    const auto image_delegate = f.alloc_init("U13ImageDelegate");
+    static_cast<void>(f.id(empty, "setDelegate:", {image_delegate}));
+    static_cast<void>(f.with_rect(empty, "drawInRect:", {{0, 0}, {16, 16}}));
+    require(f.id(empty, "delegate") == image_delegate && asked == 1, "an image without representations asks -imageDidNotDraw:inRect:");
+
+    // Screens: pixel alignment and display links (also a window's and a view's).
+    const auto screen = f.id(f.cls("NSScreen"), "mainScreen");
+    const auto covered = f.rect(f.msg(screen, "backingAlignedRect:options:", [] {
+        CallRegs r; appkit::put_rect(r, 0, {{1.2, 1.2}, {5.5, 5.5}}); r.x[2] = 0xF00; return r; }()));
+    require(covered.origin.x <= 1.2 && covered.origin.x + covered.size.width >= 6.7, "-[NSScreen backingAlignedRect:options:] covers the rect outward");
+    const auto ticker = f.alloc_init("NSObject");
+    for (const auto owner : {screen, f.window({{0, 0}, {50, 50}}), f.view({{0, 0}, {10, 10}})}) {
+        const auto link = f.id(owner, "displayLinkWithTarget:selector:", {ticker, f.objc.selector("description")});
+        require(link && f.id(link, "isKindOfClass:", {f.cls("CADisplayLink")}) != 0, "-displayLinkWithTarget:selector: makes a CADisplayLink");
+        static_cast<void>(f.id(link, "invalidate"));
+    }
+
+    // Dock tiles: the application's and each window's.
+    const auto tiled = f.window({{0, 0}, {50, 50}});
+    const auto app_tile = f.id(f.app, "dockTile"), window_tile = f.id(tiled, "dockTile");
+    static_cast<void>(f.id(window_tile, "setBadgeLabel:", {f.str("3")}));
+    require(window_tile && window_tile != app_tile && window_tile == f.id(tiled, "dockTile") && f.id(window_tile, "owner") == tiled &&
+                f.text(f.id(window_tile, "badgeLabel")) == "3" && f.id(app_tile, "badgeLabel") == 0,
+            "a window's own dock tile");
+
+    // Image rep types; collection view drag masks.
+    const auto types = items(f.id(f.cls("NSBitmapImageRep"), "imageTypes"));
+    bool jpeg = false;
+    for (const auto type : types) jpeg = jpeg || f.text(type) == "public.jpeg";
+    require(types.size() == 5 && jpeg, "+[NSImageRep imageTypes] lists what the host decodes");
+    const auto collection = f.view({{0, 0}, {100, 100}}, "NSCollectionView");
+    static_cast<void>(f.id(collection, "setDraggingSourceOperationMask:forLocal:", {1, 0}));   // NSDragOperationCopy outside
+    require(f.id(collection, "draggingSession:sourceOperationMaskForDraggingContext:", {0, 0}) == 1 &&
+                f.id(collection, "draggingSession:sourceOperationMaskForDraggingContext:", {0, 1}) == ~0ULL,
+            "collection view drag masks");
+}
+
 } // namespace
 
 int main() {
@@ -841,7 +974,7 @@ int main() {
                  {"images_and_cursors", images_and_cursors}, {"alerts_and_panels", alerts_and_panels},
                  {"pasteboards_and_text", pasteboards_and_text}, {"containers_and_controllers", containers_and_controllers},
                  {"toolbars_and_tabs", toolbars_and_tabs}, {"c_functions", c_functions},
-                 {"status_items_and_sounds", status_items_and_sounds}}) {
+                 {"status_items_and_sounds", status_items_and_sounds}, {"app_referenced", app_referenced}}) {
             std::cout << "[appkit api] " << name << std::endl;
             test(f);
         }

@@ -937,9 +937,20 @@ void Quartz::install_appkit_drawing() {
             const auto rep = bitmap_rep_of(*q, image);
             return rep ? image_from_rep(*q, rep) : render_custom(image);
         };
+        // An image that cannot draw (no representation draws) asks its
+        // delegate's -imageDidNotDraw:inRect: for one to draw instead.
         const auto draw_image_object = [q, cg_image_of](Address image, Rect rect, Rect from, std::uint64_t operation, double fraction, bool respect) {
-            const auto cg = cg_image_of(image);
-            if (!cg) return;
+            auto cg = cg_image_of(image);
+            if (!cg) {
+                const auto delegate = q->send(image, "delegate").x0;
+                if (!delegate || !q->objc.responds(delegate, q->objc.selector("imageDidNotDraw:inRect:"))) return;
+                CallRegs ask;
+                ask.x[2] = image;
+                put_rect(ask, 0, rect);
+                const auto substitute = q->objc.send(delegate, "imageDidNotDraw:inRect:", ask).x0;
+                if (!substitute || substitute == image || !(cg = cg_image_of(substitute))) return;
+                image = substitute;
+            }
             const auto size = result_size(q->send(image, "size"));
             try { draw_cg_image(*q, cg, size, rect, from, operation, fraction, respect); } catch (...) { q->release(cg); throw; }
             q->release(cg);

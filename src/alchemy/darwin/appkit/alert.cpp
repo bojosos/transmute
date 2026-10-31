@@ -135,6 +135,10 @@ void AppKit::install_alert() {
     method(al, "setIcon:", [this, alert_of](CpuState& s, GuestMemory&) { assign(alert_of(s.x[0])->icon, s.x[2]); }, "v@:@");
     method(al, "accessoryView", [alert_of](CpuState& s, GuestMemory&) { s.x[0] = alert_of(s.x[0])->accessory; });
     method(al, "setAccessoryView:", [this, alert_of](CpuState& s, GuestMemory&) { assign(alert_of(s.x[0])->accessory, s.x[2]); }, "v@:@");
+    // The delegate (NSAlertDelegate: -alertShowHelp:, which only the help
+    // button sends).
+    method(al, "delegate", [alert_of](CpuState& s, GuestMemory&) { s.x[0] = alert_of(s.x[0])->delegate; });
+    method(al, "setDelegate:", [alert_of](CpuState& s, GuestMemory&) { alert_of(s.x[0])->delegate = s.x[2]; }, "v@:@");
     // The help button needs a help anchor or delegate; Windows has neither.
     method(al, "showsHelp", [alert_of](CpuState& s, GuestMemory&) { return_bool(s, alert_of(s.x[0])->shows_help); }, "B@:");
     method(al, "setShowsHelp:", [alert_of](CpuState& s, GuestMemory&) {

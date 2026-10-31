@@ -7,7 +7,9 @@ contract is `include/alchemy/gui/layer_contents.hpp`), CoreVideo's
 CVDisplayLink (`display_link.cpp`), CAMetalDisplayLink and the
 CADynamicRange keys (`metal_display_link.cpp`: a CFRunLoopTimer at the
 display's rate on the run loop the link was added to, handing the delegate
-the layer's next drawable), IOSurface (`iosurface.cpp`), CoreImage
+the layer's next drawable) and CADisplayLink (the same timer, sending the
+target its selector; made by AppKit's -displayLinkWithTarget:selector:),
+IOSurface (`iosurface.cpp`), CoreImage
 (`core_image.cpp`, `ci_engine.cpp`), GLKit's math (`glkit.cpp`), and QLab's
 CAAnimation, CATransform3D and CAMediaTimingFunction providers with their
 value math (`graphics_math.cpp`) and property bags (`graphics_support.cpp`).
@@ -59,7 +61,12 @@ gradients, CAReplicatorLayer draws its copies with the instance transform
 and alpha offset (colour offsets and `instanceColor` are kept, not drawn). Hit testing, `containsPoint:`, the `convert*` methods,
 CAScrollLayer scrolling, CAConstraint / CAConstraintLayoutManager layout,
 `renderInContext:` and the CAMediaTiming time conversions are real.
-CATiledLayer draws as one tile.
+CATiledLayer draws as one tile. CATransaction keeps +setValue:forKey: values
+per transaction (nested transactions inherit them; the kCATransaction...
+keys are its properties, the animation timing function among them).
+`wantsExtendedDynamicRangeContent` is kept on every layer, but composition
+is standard dynamic range: EDR contents show clamped. CAMetalLayer's
+`preferredDevice` is the system default device (there is one GPU).
 
 ## Moved from darwin/identities/
 

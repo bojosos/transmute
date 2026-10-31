@@ -417,6 +417,7 @@ struct ImageState final : ObjectPayload {
     Address background_color{}, accessibility_description{};   // +1
     std::array<double, 4> cap_insets{};       // NSEdgeInsets: top, left, bottom, right
     std::int64_t resizing_mode{};             // NSImageResizingModeTile (0) or Stretch (1)
+    Address delegate{};                       // not retained (NSImageDelegate)
 };
 struct ColorState final : ObjectPayload { double red{}, green{}, blue{}, alpha{1}; bool white{}; };
 struct ColorSpaceState final : ObjectPayload { std::string name; std::int64_t model{1}; };   // NSColorSpaceModelRGB
@@ -439,6 +440,7 @@ struct AlertState final : ObjectPayload {
     Address accessory{};                      // +1
     Address icon{};                           // +1 (nil: the application icon)
     Address suppression_button{};             // +1 (made on demand)
+    Address delegate{};                       // not retained (NSAlertDelegate)
     bool shows_help{}, shows_suppression{};
 };
 struct ScreenState final : ObjectPayload { ScreenInfo info; };

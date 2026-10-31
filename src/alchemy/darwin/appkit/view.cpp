@@ -749,6 +749,11 @@ void AppKit::install_view() {
         return_rect(s, rect);
     }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:");
     // Pixel alignment in the window's backing store.
+    // Dictionary lookups (the Look Up panel) need macOS's Dictionary service.
+    for (const auto* name : {"showDefinitionForAttributedString:atPoint:", "showDefinitionForAttributedString:range:options:baselineOriginProvider:"})
+        method(v, name, [selector = std::string(name)](CpuState&, GuestMemory&) {
+            unsupported("-[NSView " + selector + "] (no Dictionary service)");
+        }, "v@:@{CGPoint=dd}");
     method(v, "backingAlignedRect:options:", [this](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto owner = view_state(self)->window;

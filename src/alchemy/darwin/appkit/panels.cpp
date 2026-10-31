@@ -23,8 +23,10 @@
 //    types from allowed extensions, UTIs and UTTypes; title, prompt, name
 //    label, directory and name; files, folders, multiple selection),
 //    modal or as a sheet / with a completion handler;
-//  * NSPrintInfo (paper, margins, orientation), while NSPrintPanel /
-//    NSPageLayout / NSColorPanel / NSFontPanel fail when shown;
+//  * NSPrintInfo (paper, margins, orientation); NSPrintPanel objects keep
+//    their options, job style, help anchor, button title and accessory
+//    controllers, while NSPrintPanel / NSPageLayout / NSColorPanel /
+//    NSFontPanel fail when shown;
 //  * NSGestureRecognizer and its Click / Pan / Press / Magnification /
 //    Rotation subclasses as objects attached to views (the window server
 //    reports no gestures, so they stay in NSGestureRecognizerStatePossible);
@@ -35,6 +37,11 @@
 //  * a few constants and NSAccessibilityUnignoredDescendant.
 namespace alchemy::gui::appkit {
 namespace {
+struct PrintPanelState final : ObjectPayload {
+    std::uint64_t options{0x03};              // NSPrintPanelShowsCopies | NSPrintPanelShowsPageRange
+    Address job_style_hint{}, help_anchor{}, default_button_title{};   // +1
+    std::vector<Address> accessories;         // +1 NSViewController<NSPrintPanelAccessorizing>
+};
 std::mutex file_dialog_mutex;
 FileDialogPresenter file_dialog_override;
 
@@ -711,7 +718,7 @@ void AppKit::install_panels() {
              {"NSPrintPanel", "NSObject"}, {"NSPageLayout", "NSObject"}, {"NSColorPanel", "NSPanel"}, {"NSFontPanel", "NSPanel"}}) {
         const auto cls = declare_class(name, super_name);
         const std::string class_name = name;
-        for (const auto* factory : {"printPanel", "pageLayout", "sharedColorPanel", "sharedFontPanel"})
+        for (const auto* factory : {"pageLayout", "sharedColorPanel", "sharedFontPanel"})
             class_method(cls, factory, [class_name](CpuState&, GuestMemory&) { unsupported(class_name + " (system panel UI)"); });
         for (const auto* query : {"sharedColorPanelExists", "sharedFontPanelExists"})
             class_method(cls, query, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
@@ -719,6 +726,46 @@ void AppKit::install_panels() {
                  "beginSheetUsingPrintInfo:onWindow:completionHandler:", "orderFront:", "makeKeyAndOrderFront:"})
             method(cls, run, [class_name](CpuState&, GuestMemory&) { unsupported(class_name + " (system panel UI)"); });
     }
+    // NSPrintPanel objects: what an application configures before running
+    // one (running it stops above: there is no print dialog).
+    const auto print_panel = objc.find_class("NSPrintPanel");
+    const auto pp = [this](Address value) { return objc.host_state<PrintPanelState>(value); };
+    class_method(print_panel, "printPanel", [this](CpuState& s, GuestMemory&) { s.x[0] = autorelease(send_id(send_id(s.x[0], "alloc"), "init")); });
+    method(print_panel, "options", [pp](CpuState& s, GuestMemory&) { s.x[0] = pp(s.x[0])->options; }, "Q@:");
+    method(print_panel, "setOptions:", [pp](CpuState& s, GuestMemory&) { pp(s.x[0])->options = s.x[2]; }, "v@:Q");
+    for (const auto& [getter, setter, member] : std::initializer_list<std::tuple<const char*, const char*, Address PrintPanelState::*>>{
+             {"jobStyleHint", "setJobStyleHint:", &PrintPanelState::job_style_hint},
+             {"helpAnchor", "setHelpAnchor:", &PrintPanelState::help_anchor},
+             {"defaultButtonTitle", "setDefaultButtonTitle:", &PrintPanelState::default_button_title}}) {
+        const auto field = member;
+        method(print_panel, getter, [pp, field](CpuState& s, GuestMemory&) { s.x[0] = (*pp(s.x[0])).*field; });
+        method(print_panel, setter, [this, pp, field](CpuState& s, GuestMemory&) {
+            const auto value = s.x[2] ? cf.copy(s.x[2]) : 0;
+            release(std::exchange((*pp(s.x[0])).*field, value));
+        }, "v@:@");
+    }
+    method(print_panel, "accessoryControllers", [this, pp](CpuState& s, GuestMemory&) { s.x[0] = auto_array(pp(s.x[0])->accessories); });
+    method(print_panel, "addAccessoryController:", [this, pp](CpuState& s, GuestMemory&) {
+        if (!s.x[2]) fail("-[NSPrintPanel addAccessoryController:] with nil");
+        auto& list = pp(s.x[0])->accessories;
+        if (std::find(list.begin(), list.end(), s.x[2]) == list.end()) list.push_back(retain(s.x[2]));
+    }, "v@:@");
+    method(print_panel, "removeAccessoryController:", [this, pp](CpuState& s, GuestMemory&) {
+        auto& list = pp(s.x[0])->accessories;
+        if (const auto found = std::find(list.begin(), list.end(), s.x[2]); found != list.end()) {
+            list.erase(found);
+            release(s.x[2]);
+        }
+    }, "v@:@");
+    // The print info a running panel shows: none, as no panel runs.
+    method(print_panel, "printInfo", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    method(print_panel, "dealloc", [this, print_panel](CpuState& s, GuestMemory&) {
+        if (const auto state = objc.find_host_state<PrintPanelState>(s.x[0])) {
+            for (const auto value : {state->job_style_hint, state->help_anchor, state->default_button_title}) release(value);
+            for (const auto value : state->accessories) release(value);
+        }
+        static_cast<void>(objc.send_super(s.x[0], print_panel, sel("dealloc")));
+    }, "v@:");
 
     // ---- gesture recognizers ----
     gesture_recognizer = declare_class("NSGestureRecognizer", "NSObject");

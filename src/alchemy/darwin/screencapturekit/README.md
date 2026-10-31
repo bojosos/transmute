@@ -3,6 +3,7 @@
 `/System/Library/Frameworks/ScreenCaptureKit.framework/Versions/A/ScreenCaptureKit` (alchemy-fx).
 
 * **Real:** The content-sharing picker is a singleton that keeps its observers; filter, configuration and stream classes exist.
+  The `SCStreamFrameInfo` attachment keys are exported (values unverified: the constants' names); no stream produces frames.
 * **Unavailable, as documented:** Screen capture is not permitted: shareable content and screenshots complete with `SCStreamErrorUserDeclined` (-3801). Host screen capture (Windows.Graphics.Capture) would make it real.
 * **Host dependencies:** none.
 * **Registration:** `install_screencapturekit`, one row of the installer table after the

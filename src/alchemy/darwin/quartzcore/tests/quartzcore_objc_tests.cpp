@@ -280,6 +280,34 @@ void transactions(Fixture& f) {
     require(f.id(transaction, "disableActions") == 1, "commit did not restore the outer transaction");
     static_cast<void>(f.id(transaction, "commit"));
     static_cast<void>(f.id(transaction, "flush"));
+    // +setValue:forKey: / +valueForKey: (frameworks wave U13): other keys are
+    // kept per transaction and inherited by nested ones; the kCATransaction...
+    // keys are the properties.
+    {
+        const auto key = f.cf.string("chromeKey"), value = f.cf.string("kept");
+        static_cast<void>(f.id(transaction, "begin"));
+        alchemy::CallRegs put;
+        put.x[2] = value;
+        put.x[3] = key;
+        static_cast<void>(f.send(transaction, "setValue:forKey:", put));
+        require(f.id(transaction, "valueForKey:", key) == value, "+valueForKey: returns the value set");
+        static_cast<void>(f.id(transaction, "begin"));
+        require(f.id(transaction, "valueForKey:", key) == value, "a nested transaction inherits the value");
+        static_cast<void>(f.id(transaction, "commit"));
+        const auto timing = f.make("NSObject");
+        static_cast<void>(f.id(transaction, "setAnimationTimingFunction:", timing));
+        require(f.id(transaction, "valueForKey:", f.cf.string("animationTimingFunction")) == timing, "the timing function key");
+        if (f.cls("NSNumber")) {
+            alchemy::CallRegs seconds;
+            seconds.set_d(0, 1.5);
+            static_cast<void>(f.send(transaction, "setAnimationDuration:", seconds));
+            const auto number = f.id(transaction, "valueForKey:", f.cf.string("animationDuration"));
+            require(number && f.send(number, "doubleValue").d(0) == 1.5, "the animation duration key");
+        }
+        static_cast<void>(f.id(transaction, "commit"));
+        require(f.id(transaction, "valueForKey:", key) == 0, "the value ends with its transaction");
+        static_cast<void>(f.id(timing, "release"));
+    }
     const auto media = f.process.resolve(quartz, "_CACurrentMediaTime");
     require(media.has_value(), "CACurrentMediaTime missing");
     // Commit handlers run at the outermost commit in phase order; a completion
@@ -367,6 +395,64 @@ void metal_display_link_properties(Fixture& f) {
     static_cast<void>(f.id(link, "release"));
     static_cast<void>(f.id(layer, "release"));
     std::cout << "metal display link properties ok\n";
+}
+
+// CADisplayLink (frameworks wave U13): on the main run loop it sends its
+// selector to its target at the display rate, not while paused and never
+// after -invalidate, which releases the target.
+void display_link(Fixture& f) {
+    struct Seen { int ticks{}; Address link{}; double timestamp{}, target{}; } seen;
+    const auto target_class = f.objc.register_native_class("U13DisplayLinkTarget", f.cls("NSObject"));
+    static_cast<void>(f.objc.add_native_method(target_class, "tick:", [&](transmute::CpuState& s, transmute::GuestMemory&) {
+        ++seen.ticks;
+        seen.link = s.x[2];
+        seen.timestamp = f.send(s.x[2], "timestamp").d(0);
+        seen.target = f.send(s.x[2], "targetTimestamp").d(0);
+    }, false, "v@:@"));
+    const auto target = f.make("U13DisplayLinkTarget");
+    const auto before = f.retain_count(target);
+    alchemy::CallRegs make;
+    make.x[2] = target;
+    make.x[3] = f.objc.selector("tick:");
+    const auto link = f.send(f.cls("CADisplayLink"), "displayLinkWithTarget:selector:", make).x0;
+    require(link != 0 && f.retain_count(target) == before + 1, "the display link retains its target");
+    require(f.id(link, "isPaused") == 0, "a new link is not paused");
+    const auto mode = f.engine.read64(f.process.resolve("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
+                                                        "_kCFRunLoopDefaultMode")->address);
+    alchemy::CallRegs add;
+    add.x[2] = f.id(f.cls("NSRunLoop"), "currentRunLoop");
+    add.x[3] = mode;
+    static_cast<void>(f.send(link, "addToRunLoop:forMode:", add));
+    const auto run = [&](int milliseconds) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+        while (std::chrono::steady_clock::now() < end)
+            static_cast<void>(alchemy::gui::main_run_loop().run_once(alchemy::gui::default_mode, 0.01, false));
+    };
+    run(400);
+    require(seen.ticks >= 5, "CADisplayLink fired " + std::to_string(seen.ticks) + " times in 400 ms");
+    const auto period = f.send(link, "duration").d(0);
+    require(seen.link == link && seen.timestamp > 0 && period > 0 && std::abs(seen.target - seen.timestamp - period) < 1e-9,
+            "the link, its timestamp and target timestamp");
+    static_cast<void>(f.id(link, "setPaused:", 1));
+    run(30);
+    const auto paused = seen.ticks;
+    run(150);
+    require(seen.ticks == paused, "a paused link does not fire");
+    static_cast<void>(f.id(link, "setPaused:", 0));
+    run(150);
+    require(seen.ticks > paused, "an unpaused link fires again");
+    static_cast<void>(f.id(link, "invalidate"));
+    const auto stopped = seen.ticks;
+    run(150);
+    require(seen.ticks == stopped && f.retain_count(target) == before, "an invalidated link stops and releases its target");
+    static_cast<void>(f.id(target, "release"));
+    f.objc.cleanup_thread(*f.process.thread(f.engine));
+    // CALayer's EDR request is kept.
+    const auto layer = f.make("CALayer");
+    static_cast<void>(f.id(layer, "setWantsExtendedDynamicRangeContent:", 1));
+    require((f.id(layer, "wantsExtendedDynamicRangeContent") & 0xff) == 1, "-[CALayer wantsExtendedDynamicRangeContent]");
+    static_cast<void>(f.id(layer, "release"));
+    std::cout << "display link ok (" << stopped << " ticks)\n";
 }
 
 #ifdef ALCHEMY_HAVE_VULKAN_HEADERS
@@ -492,6 +578,7 @@ int main() {
         metal_layers(f);
         transactions(f);
         metal_display_link_properties(f);
+        display_link(f);
         contents_rect(f);
 #ifdef ALCHEMY_HAVE_VULKAN_HEADERS
         drawables(f);

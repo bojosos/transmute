@@ -1139,6 +1139,8 @@ void AppKit::install_resources() {
         s.x[0] = 1;
     }, "B@:@");
     method(im, "isTemplate", [image_of](CpuState& s, GuestMemory&) { return_bool(s, image_of(s.x[0])->template_image); }, "B@:");
+    method(im, "delegate", [image_of](CpuState& s, GuestMemory&) { s.x[0] = image_of(s.x[0])->delegate; });
+    method(im, "setDelegate:", [image_of](CpuState& s, GuestMemory&) { image_of(s.x[0])->delegate = s.x[2]; }, "v@:@");
     method(im, "setTemplate:", [image_of](CpuState& s, GuestMemory&) { image_of(s.x[0])->template_image = bool_arg(s, 2); }, "v@:B");
     // The colour drawn behind the representations (clear by default).
     method(im, "backgroundColor", [this, image_of](CpuState& s, GuestMemory&) {
@@ -1193,8 +1195,14 @@ void AppKit::install_resources() {
         const auto bytes = pixels ? encode_image(*pixels, ImageFileType::tiff) : std::nullopt;
         s.x[0] = bytes ? make_data(*bytes) : 0;
     });
-    for (const auto* name : {"imageTypes", "imageUnfilteredTypes"})
-        class_method(im, name, [this](CpuState& s, GuestMemory&) { s.x[0] = auto_array({auto_string("public.tiff"), auto_string("public.png")}); });
+    // The types the host's decoder reads (image_codec.cpp): NSImage's, and
+    // every image rep's (NSBitmapImageRep reads them all).
+    for (const auto owner : {im, image_rep})
+        for (const auto* name : {"imageTypes", "imageUnfilteredTypes"})
+            class_method(owner, name, [this](CpuState& s, GuestMemory&) {
+                s.x[0] = auto_array({auto_string("public.tiff"), auto_string("public.png"), auto_string("public.jpeg"),
+                                     auto_string("com.compuserve.gif"), auto_string("com.microsoft.bmp")});
+            });
     class_method(im, "canInitWithPasteboard:", [this](CpuState& s, GuestMemory&) {
         const auto state = objc.host_state<PasteboardState>(s.x[2]);
         const auto server = state->general ? window_server_or_null() : nullptr;
@@ -1726,6 +1734,19 @@ void AppKit::install_resources() {
         const auto rate = info_of(s.x[0]).refresh_rate;
         s.x[0] = static_cast<Address>(rate > 0 ? std::lround(rate) : 60);
     }, "q@:");
+    // Pixel alignment in screen points at the screen's backing scale.
+    method(sc, "backingAlignedRect:options:", [info_of](CpuState& s, GuestMemory&) {
+        return_rect(s, backing_aligned(rect_arg(s), info_of(s.x[0]).backing_scale, s.x[2]));
+    }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:{CGRect={CGPoint=dd}{CGSize=dd}}Q");
+    // -displayLinkWithTarget:selector: (macOS 14) of a screen, a window or a
+    // view: a CADisplayLink (quartzcore/metal_display_link.cpp) at the
+    // display's refresh rate, not yet on a run loop.
+    for (const auto owner : {sc, window, view})
+        method(owner, "displayLinkWithTarget:selector:", [this](CpuState& s, GuestMemory&) {
+            const auto link_class = objc.find_class("CADisplayLink");
+            if (!link_class) unsupported("-displayLinkWithTarget:selector: without QuartzCore's CADisplayLink");
+            s.x[0] = send_id(link_class, "displayLinkWithTarget:selector:", {s.x[2], s.x[3]});
+        }, "@@:@:");
     method(sc, "minimumRefreshInterval", [info_of](CpuState& s, GuestMemory&) {
         const auto rate = info_of(s.x[0]).refresh_rate;
         set_d(s, 0, 1 / (rate > 0 ? rate : 60));

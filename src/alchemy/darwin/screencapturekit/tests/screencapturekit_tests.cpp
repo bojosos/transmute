@@ -11,6 +11,9 @@ using namespace fill_test;
 const Case screencapturekit_case("screencapturekit", [](Fixture& f) {
     require(alchemy::ProcessContext::is_provider_library(LIBRARY), "ScreenCaptureKit identity");
     require(f.string_constant(LIBRARY, "_SCStreamErrorDomain") == "com.apple.ScreenCaptureKit.SCStreamErrorDomain", "error domain");
+    require(f.string_constant(LIBRARY, "_SCStreamFrameInfoDirtyRects") == "SCStreamFrameInfoDirtyRects" &&
+                f.string_constant(LIBRARY, "_SCStreamFrameInfoPresenterOverlayContentRect") == "SCStreamFrameInfoPresenterOverlayContentRect",
+            "frame info keys");
     const auto picker = f.send(f.cls("SCContentSharingPicker"), "sharedPicker");
     require(picker && picker == f.send(f.cls("SCContentSharingPicker"), "sharedPicker"), "picker singleton");
 });

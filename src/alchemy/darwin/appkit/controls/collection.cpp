@@ -43,6 +43,7 @@ struct CollectionState final : ObjectPayload {
     std::set<std::int64_t> selection;
     std::int64_t count{};
     bool selectable{}, multiple{}, empty_selection{true}, laying_out{}, loaded{};
+    std::uint64_t local_drag_mask{~0ULL}, remote_drag_mask{};   // NSDragOperationEvery / None
 };
 // NSCollectionViewItem state (the object's payload is NSViewController's,
 // so this lives beside it, removed by the item's -dealloc).
@@ -620,6 +621,16 @@ void install_collection_view(AppKit& kit) {
     flag("isSelectable", "setSelectable:", &CollectionState::selectable);
     flag("allowsMultipleSelection", "setAllowsMultipleSelection:", &CollectionState::multiple);
     flag("allowsEmptySelection", "setAllowsEmptySelection:", &CollectionState::empty_selection);
+    // The operations a drag from the view allows, inside the application and
+    // outside it (dragging items out itself fails explicitly).
+    kit.method(cv, "setDraggingSourceOperationMask:forLocal:", [k](CpuState& s, GuestMemory&) {
+        const auto state = collection_of(*k, s.x[0]);
+        (bool_arg(s, 3) ? state->local_drag_mask : state->remote_drag_mask) = s.x[2];
+    }, "v@:QB");
+    kit.method(cv, "draggingSession:sourceOperationMaskForDraggingContext:", [k](CpuState& s, GuestMemory&) {
+        const auto state = collection_of(*k, s.x[0]);
+        s.x[0] = s.x[3] == 1 ? state->local_drag_mask : state->remote_drag_mask;   // NSDraggingContextWithinApplication
+    }, "Q@:@q");
     // Registration.
     kit.method(cv, "registerClass:forItemWithIdentifier:", [k](CpuState& s, GuestMemory&) {
         const auto state = collection_of(*k, s.x[0]);

@@ -142,6 +142,25 @@ cancelled it. Views rotate (-setFrameRotation:, -setFrameCenterRotation:,
 testing follow, rotated bounds report their bounding rectangle, and clipping
 is to that rectangle; rotating a layer-backed view stops explicitly.
 
+**What the audited applications reference:** an application's own
+NSSharingService (-initWithTitle:image:alternateImage:handler:) performs by
+telling its delegate and running the handler, and NSSharingServicePicker
+shows the services its delegate offers as a menu at the rect (no system
+sharing services exist: none offered, or a dismissed menu, tells the
+delegate nil). NSPrintPanel objects keep their options, job style, help
+anchor, button title and accessory controllers; running one still stops.
+NSScreen aligns rects to its pixels; NSScreen, NSWindow and NSView make
+CADisplayLinks at the display's rate (QuartzCore). Each window has its own
+NSDockTile (kept, never shown: Windows has no dock). NSAlert and NSImage keep
+their delegates; an image that cannot draw asks -imageDidNotDraw:inRect: for
+a substitute. NSImage and NSImageRep list the types the host decodes (TIFF,
+PNG, JPEG, GIF, BMP). NSCollectionView keeps its drag operation masks
+(dragging items out still stops). NSWorkspace opens the running application
+itself (activating it); launching another stops. Swipe tracking (no trackpad
+gestures reach the window server) and dictionary lookups (no Dictionary
+service) stop explicitly. -toggleTouchBarCustomizationPalette: is left
+unanswered, so a menu item with it stays disabled: there is no Touch Bar.
+
 **Nib keys:** the decoders read the keys Interface Builder archives for the
 controls, cells, tables, scroll views, boxes and menus QLab's nibs use; each
 decoder names the keys it leaves out and why (design-time values, features

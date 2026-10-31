@@ -175,6 +175,24 @@ void install_workspace_and_dragging(Support& support) {
         }
         completion_kit::unsupported("-[NSWorkspace openURLs:withApplicationAtURL:...] launching another macOS application (" + target + ")");
     }, "v@:@@@@?");
+    // -openApplicationAtURL:configuration:completionHandler:: the running
+    // application itself is activated (configuration.activates) and handed
+    // back; other macOS applications are not launched.
+    k.method(ws, "openApplicationAtURL:configuration:completionHandler:", [](CpuState& s, GuestMemory&) {
+        auto& kk = kit();
+        const auto main = kk.send(kk.objc.find_class("NSBundle"), "mainBundle").x0;
+        const auto own = main ? kk.text(kk.send(main, "bundlePath").x0) : std::string();
+        const auto target = s.x[2] ? kk.cf.url_path(s.x[2]) : std::string();
+        if (target.empty() || (target != own && target != own + "/"))
+            completion_kit::unsupported("-[NSWorkspace openApplicationAtURL:...] launching another macOS application (" + target + ")");
+        const bool activates = !s.x[3] || (kk.send(s.x[3], "activates").x0 & 0xff) != 0;
+        const auto app = kk.send(kk.application, "sharedApplication").x0;
+        if (activates) static_cast<void>(kk.send_id(app, "activateIgnoringOtherApps:", {1}));
+        if (s.x[4]) {
+            const auto running = kk.objc.find_class("NSRunningApplication");
+            static_cast<void>(kk.invoke_block(s.x[4], {running ? kk.send(running, "currentApplication").x0 : 0, 0}));
+        }
+    }, "v@:@@@?");
     k.method(ws, "openURL:configuration:completionHandler:", [](CpuState& s, GuestMemory&) {
         auto& kk = kit();
         const bool opened = shell_open(s.x[2]);

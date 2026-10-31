@@ -138,7 +138,7 @@ struct LayerState final : ObjectPayload {
     Rect contents_rect{{0, 0}, {1, 1}};   // unit coordinates of the contents (layer_tree.hpp)
     float opacity{1};
     bool opaque{}, hidden{}, masks_to_bounds{}, needs_display{}, needs_display_on_bounds_change{}, geometry_flipped{},
-        needs_layout{};
+        needs_layout{}, wants_edr{};
     std::uint32_t edge_antialiasing_mask{0xf}, autoresizing_mask{};
     Address delegate{};                // not retained (CALayer delegates are weak)
     Address background_color{}, contents{}, name{};   // retained
@@ -194,7 +194,13 @@ struct DrawableState final : ObjectPayload {
 };
 
 struct TransactionState {
-    struct Level { bool disable_actions{}; double duration{0.25}; Address completion{}; };   // completion: _Block_copy'd
+    // completion: _Block_copy'd; timing_function and values (+setValue:forKey:) retained.
+    struct Level {
+        bool disable_actions{};
+        double duration{0.25};
+        Address completion{}, timing_function{};
+        std::map<std::string, Address> values;
+    };
     std::vector<Level> levels;
     unsigned explicit_depth{};         // +begin minus +commit on this thread
     std::array<std::vector<Address>, 3> commit_handlers;   // by CATransactionPhase; _Block_copy'd
@@ -484,6 +490,9 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         boolean("masksToBounds", "setMasksToBounds:", &LayerState::masks_to_bounds);
         boolean("needsDisplayOnBoundsChange", "setNeedsDisplayOnBoundsChange:", &LayerState::needs_display_on_bounds_change, false);
         boolean("isGeometryFlipped", "setGeometryFlipped:", &LayerState::geometry_flipped);
+        // macOS 14: kept; composition is standard dynamic range, so EDR
+        // contents are shown clamped to SDR.
+        boolean("wantsExtendedDynamicRangeContent", "setWantsExtendedDynamicRangeContent:", &LayerState::wants_edr, false);
         // -contentsAreFlipped: the layer's space is flipped relative to the
         // root of its tree (an odd number of geometry-flipped superlayers).
         method(L, "contentsAreFlipped", [this](CpuState& s, GuestMemory&) {
@@ -1826,6 +1835,17 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
             { std::lock_guard lock(state->mutex); old = std::exchange(state->metal.device, value); }
             release(old);
         }, "v@:@");
+        // The device the layer's display prefers: there is one GPU, the
+        // system default device (the layer's own device when it has one).
+        method(M, "preferredDevice", [this](CpuState& s, GuestMemory&) {
+            Address device{};
+            { const auto state = metal_layer(s.x[0]); std::lock_guard lock(state->mutex); device = state->metal.device; }
+            if (!device) {
+                device = call("/System/Library/Frameworks/Metal.framework/Versions/A/Metal", "_MTLCreateSystemDefaultDevice", {});
+                if (device) device = send(device, "autorelease");
+            }
+            s.x[0] = device;
+        }, "@@:");
         method(M, "pixelFormat", [this](CpuState& s, GuestMemory&) {
             const auto state = metal_layer(s.x[0]); std::lock_guard lock(state->mutex); s.x[0] = state->metal.pixel_format;
         }, "Q@:");
@@ -2118,10 +2138,14 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
             if (transactions.levels.empty()) transactions.levels.emplace_back();   // the implicit transaction
             return transactions.levels.back();
         };
-        method(T, "begin", [current](CpuState&, GuestMemory&) {
+        // A nested transaction starts with its enclosing one's properties
+        // (each holds its own references).
+        method(T, "begin", [this, current](CpuState&, GuestMemory&) {
             auto outer = current();
             outer.completion = 0;   // each transaction has its own completion block
-            transactions.levels.push_back(outer);
+            static_cast<void>(retain(outer.timing_function));
+            for (const auto& [key, value] : outer.values) static_cast<void>(retain(value));
+            transactions.levels.push_back(std::move(outer));
             ++transactions.explicit_depth;
         }, "v@:", true);
         // The outermost commit of a thread (and +flush) tells the commit
@@ -2132,7 +2156,10 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         method(T, "commit", [this](CpuState&, GuestMemory&) {
             Address completion{};
             if (!transactions.levels.empty()) {
-                completion = transactions.levels.back().completion;
+                auto& level = transactions.levels.back();
+                completion = level.completion;
+                release(level.timing_function);
+                for (const auto& [key, value] : level.values) release(value);
                 transactions.levels.pop_back();
             }
             if (transactions.explicit_depth == 0) { if (completion) { perform_soon(completion); block_release(completion); } return; }
@@ -2166,6 +2193,49 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         method(T, "setDisableActions:", [current](CpuState& s, GuestMemory&) { current().disable_actions = flag(s, 2); }, "v@:B", true);
         method(T, "animationDuration", [current](CpuState& s, GuestMemory&) { return_real(s, 0, current().duration); }, "d@:", true);
         method(T, "setAnimationDuration:", [current](CpuState& s, GuestMemory&) { current().duration = real(s, 0); }, "v@:d", true);
+        method(T, "animationTimingFunction", [current](CpuState& s, GuestMemory&) { s.x[0] = current().timing_function; }, "@@:", true);
+        method(T, "setAnimationTimingFunction:", [this, current](CpuState& s, GuestMemory&) {
+            const auto function = retain(s.x[2]);
+            release(std::exchange(current().timing_function, function));
+        }, "v@:@", true);
+        // +setValue:forKey: / +valueForKey: (the kCATransaction... keys are
+        // the properties above; other keys are kept per transaction).
+        method(T, "valueForKey:", [this, current](CpuState& s, GuestMemory&) {
+            const auto key = s.x[2] ? cf.utf8(s.x[2]) : std::string();
+            auto& level = current();
+            const auto number = objc.find_class("NSNumber");
+            if (key == "animationDuration" || key == "disableActions") {
+                CallRegs registers;
+                if (key == "animationDuration") registers.set_d(0, level.duration);
+                else registers.x[2] = level.disable_actions ? 1 : 0;
+                s.x[0] = objc.send(number, key == "animationDuration" ? "numberWithDouble:" : "numberWithBool:", registers).x0;
+            } else if (key == "animationTimingFunction") {
+                s.x[0] = level.timing_function;
+            } else if (key == "completionBlock") {
+                s.x[0] = level.completion;
+            } else {
+                const auto found = level.values.find(key);
+                s.x[0] = found == level.values.end() ? 0 : found->second;
+            }
+        }, "@@:@", true);
+        method(T, "setValue:forKey:", [this, current](CpuState& s, GuestMemory&) {
+            const auto value = s.x[2];
+            const auto key = s.x[3] ? cf.utf8(s.x[3]) : std::string();
+            if (key.empty()) fail("+[CATransaction setValue:forKey:] needs a key");
+            auto& level = current();
+            if (key == "animationDuration") {
+                level.duration = value ? objc.send(value, objc.selector("doubleValue"), {}).d(0) : 0.25;
+            } else if (key == "disableActions") {
+                level.disable_actions = value && (send(value, "boolValue") & 0xff) != 0;
+            } else if (key == "animationTimingFunction" || key == "completionBlock") {
+                static_cast<void>(send(transaction_class, key == "completionBlock" ? "setCompletionBlock:" : "setAnimationTimingFunction:", {value}));
+            } else {
+                const auto kept = retain(value);
+                auto& slot = level.values[key];
+                release(std::exchange(slot, kept));
+                if (!kept) level.values.erase(key);
+            }
+        }, "v@:@@", true);
     }
 
     // ---- composition snapshot (layer_tree.hpp) --------------------------------------------

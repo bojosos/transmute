@@ -12,6 +12,8 @@ const Case accessibility_case("accessibility", [](Fixture& f) {
     require(alchemy::ProcessContext::is_provider_library(LIBRARY), "Accessibility identity");
     const auto content = f.send(f.cls("AXCustomContent"), "customContentWithLabel:value:", {f.cf.string("Label"), f.cf.string("Value")});
     require(f.cf.utf8(f.send(content, "label")) == "Label" && f.cf.utf8(f.send(content, "value")) == "Value", "custom content");
+    require(f.call(LIBRARY, "_AXPrefersNonBlinkingTextInsertionIndicator") == 0, "the insertion indicator blinks (the macOS default)");
+    require(!f.string_constant(LIBRARY, "_AXPrefersNonBlinkingTextInsertionIndicatorDidChangeNotification").empty(), "its notification name");
 });
 
 #undef LIBRARY

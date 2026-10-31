@@ -2,7 +2,10 @@
 #include "alchemy/gui/value_provider.hpp"
 
 // Accessibility: AXCustomContent is a plain value class (label, value,
-// importance).
+// importance). The user's text insertion indicator preference
+// (AXPrefersNonBlinkingTextInsertionIndicator, macOS 14) answers macOS's
+// default, a blinking indicator: the host's caret blink setting is not read,
+// so the preference never changes and its notification is never posted.
 // Chrome 155 first linked the framework (moved from
 // darwin/identities/identities.cpp).
 namespace alchemy::accessibility {
@@ -32,6 +35,10 @@ void Provider::install() {
         store(object, "value", s.x[3]);
         s.x[0] = bridge->autorelease(object);
     }, true);
+    fn(accessibility, "_AXPrefersNonBlinkingTextInsertionIndicator", [](CpuState&, GuestMemory&) -> Address { return 0; });
+    // NSNotificationName; the value is unverified (the constant's name).
+    string(accessibility, "_AXPrefersNonBlinkingTextInsertionIndicatorDidChangeNotification",
+           "AXPrefersNonBlinkingTextInsertionIndicatorDidChangeNotification");
 }
 
 } // namespace

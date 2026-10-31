@@ -1,6 +1,8 @@
 #include "alchemy/darwin/screencapturekit/install.hpp"
 #include "alchemy/gui/value_provider.hpp"
 
+#include <string>
+
 // ScreenCaptureKit (weakly linked): shareable content and screenshots fail
 // with SCStreamErrorUserDeclined.
 // String constants carry the values of Apple's public headers; values
@@ -28,6 +30,12 @@ void Provider::install() {
     ProcessContext::add_provider_library(std::string(screen_capture_kit));
     const auto nothing = [](CpuState&, GuestMemory&) {};
     string(screen_capture_kit, "_SCStreamErrorDomain", "com.apple.ScreenCaptureKit.SCStreamErrorDomain");
+    // The SCStreamFrameInfo keys of a stream sample buffer's attachments
+    // (unverified: the constants' names). No stream produces frames.
+    for (const auto* key : {"SCStreamFrameInfoStatus", "SCStreamFrameInfoDisplayTime", "SCStreamFrameInfoScaleFactor",
+             "SCStreamFrameInfoContentScale", "SCStreamFrameInfoContentRect", "SCStreamFrameInfoBoundingRect",
+             "SCStreamFrameInfoScreenRect", "SCStreamFrameInfoDirtyRects", "SCStreamFrameInfoPresenterOverlayContentRect"})
+        string(screen_capture_kit, "_" + std::string(key), key);
     const auto shareable = cls(screen_capture_kit, "SCShareableContent", "NSObject");
     const auto declined = [this](Address block) {
         complete_with_error(block, "com.apple.ScreenCaptureKit.SCStreamErrorDomain", sc_stream_error_user_declined,

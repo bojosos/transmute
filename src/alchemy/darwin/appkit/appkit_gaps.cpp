@@ -1,6 +1,10 @@
 #include "alchemy/gui/value_provider.hpp"
 
 #include <array>
+#include <bit>
+#include <initializer_list>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 // AppKit gaps of Chrome's framework:
@@ -14,7 +18,11 @@
 //   classes, NSColorList and NSGlassEffectView, each a real, subclassable host
 //   class (the frame views Chrome subclasses are AppKit's, frame_view.cpp);
 // - NSPerformService: no services are installed, so it performs none (NO);
-//   no sharing service exists (+sharingServiceNamed: is nil, the list empty).
+//   no system sharing service exists (+sharingServiceNamed: is nil, the list
+//   empty). An application's own services
+//   (-initWithTitle:image:alternateImage:handler:) are real: -performWithItems:
+//   tells the delegate and runs the handler, and NSSharingServicePicker shows
+//   the services its delegate offers as a menu at the given rect.
 namespace alchemy::gui::values {
 namespace {
 
@@ -428,14 +436,102 @@ void Provider::install_appkit() {
         extend("NSResponder", "setTouchBar:", [this](CpuState& s, GuestMemory&) { store(s.x[0], "touchBar", s.x[2]); }, false, "v@:@");
     }
 
-    // ---- sharing: no sharing services exist ----
+    // ---- sharing: no system services; an application's own services ----
+    const auto msg = [this](Address receiver, const char* selector, std::initializer_list<Address> arguments = {}) {
+        CallRegs registers{};
+        unsigned index = 2;
+        for (const auto value : arguments) registers.x[index++] = value;
+        return objc.send(receiver, selector, registers).x0;
+    };
+    const auto responds = [this](Address object, const char* selector) { return object && objc.responds(object, objc.selector(selector)); };
     const auto sharing = cls(appkit, "NSSharingService", "NSObject");
     method(sharing, "sharingServiceNamed:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true);
     method(sharing, "sharingServicesForItems:", [this](CpuState& s, GuestMemory&) { s.x[0] = bridge->autorelease(cf.array({})); }, true);
+    object_properties(sharing, {"subject", "recipients", "attachmentFileURLs", "permanentLink", "messageBody", "accountName"});
+    weak_properties(sharing, {"delegate"});
+    method(sharing, "initWithTitle:image:alternateImage:handler:", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[2] || !s.x[5]) throw std::invalid_argument("Alchemy: -[NSSharingService initWithTitle:image:alternateImage:handler:] needs a title and a handler");
+        store(s.x[0], "title", s.x[2]);
+        store(s.x[0], "image", s.x[3]);
+        store(s.x[0], "alternateImage", s.x[4]);
+        const auto handler = bridge->block_copy(s.x[5]);
+        store(s.x[0], "handler", handler);
+        bridge->block_release(handler);
+    });
+    for (const auto* name : {"title", "image", "alternateImage"})
+        method(sharing, name, [this, key = std::string(name)](CpuState& s, GuestMemory&) { s.x[0] = stored(s.x[0], key); });
+    // The menu item title is the title until one is set.
+    method(sharing, "menuItemTitle", [this](CpuState& s, GuestMemory&) {
+        const auto title = stored(s.x[0], "menuItemTitle");
+        s.x[0] = title ? title : stored(s.x[0], "title");
+    });
+    method(sharing, "setMenuItemTitle:", [this](CpuState& s, GuestMemory&) { store(s.x[0], "menuItemTitle", s.x[2]); }, false, "v@:@");
+    method(sharing, "canPerformWithItems:", [this](CpuState& s, GuestMemory&) { s.x[0] = stored(s.x[0], "handler") ? 1 : 0; }, false, "B@:@");
+    method(sharing, "performWithItems:", [this, msg, responds](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], items = s.x[2];
+        const auto handler = stored(self, "handler");
+        if (!handler) throw std::logic_error("Alchemy: -[NSSharingService performWithItems:] on a service without a handler");
+        const auto delegate = static_cast<Address>(stored_integer(self, "delegate"));
+        if (responds(delegate, "sharingService:willShareItems:")) static_cast<void>(msg(delegate, "sharingService:willShareItems:", {self, items}));
+        static_cast<void>(bridge->invoke_block(handler, {}));
+        if (responds(delegate, "sharingService:didShareItems:")) static_cast<void>(msg(delegate, "sharingService:didShareItems:", {self, items}));
+    }, false, "v@:@");
     const auto picker = cls(appkit, "NSSharingServicePicker", "NSObject");
     object_properties(picker, {"items"});
     weak_properties(picker, {"delegate"});
     method(picker, "initWithItems:", [this](CpuState& s, GuestMemory&) { store(s.x[0], "items", s.x[2]); });
+    // -showRelativeToRect:ofView:preferredEdge:: the services the delegate
+    // offers (there are no proposed system services) as a menu below the
+    // rect. Choosing one tells the delegate, gives the service the delegate's
+    // service delegate and performs it; dismissing the menu (or no services)
+    // tells the delegate with nil.
+    method(picker, "showRelativeToRect:ofView:preferredEdge:", [this, msg, responds](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], view = s.x[2];
+        const double x = std::bit_cast<double>(s.v[0][0]), y = std::bit_cast<double>(s.v[1][0]), height = std::bit_cast<double>(s.v[3][0]);
+        const auto items = stored(self, "items");
+        const auto delegate = static_cast<Address>(stored_integer(self, "delegate"));
+        auto services = bridge->autorelease(cf.array({}));
+        if (responds(delegate, "sharingServicePicker:sharingServicesForItems:proposedSharingServices:"))
+            services = msg(delegate, "sharingServicePicker:sharingServicesForItems:proposedSharingServices:", {self, items, services});
+        const auto count = services ? cf.length(services) : 0;
+        const auto dismissed = [&] {
+            if (responds(delegate, "sharingServicePicker:didChooseSharingService:"))
+                static_cast<void>(msg(delegate, "sharingServicePicker:didChooseSharingService:", {self, 0}));
+        };
+        if (count == 0 || !view) { dismissed(); return; }
+        const auto menu = msg(msg(objc.find_class("NSMenu"), "alloc"), "initWithTitle:", {bridge->autorelease(cf.string(""))});
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const auto service = cf.element(services, i);
+            const auto item = msg(msg(objc.find_class("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
+                                  {msg(service, "menuItemTitle"), objc.selector("_alchemyShareWithService:"), bridge->autorelease(cf.string(""))});
+            static_cast<void>(msg(item, "setTarget:", {self}));
+            static_cast<void>(msg(item, "setRepresentedObject:", {service}));
+            if (const auto image = msg(service, "image")) static_cast<void>(msg(item, "setImage:", {image}));
+            static_cast<void>(msg(menu, "addItem:", {item}));
+            release(item);
+        }
+        // The menu's top left at the rect's bottom left (the top left in a flipped view).
+        const bool flipped = (msg(view, "isFlipped") & 0xff) != 0;
+        CallRegs popup{};
+        popup.x[2] = 0;
+        popup.set_d(0, x);
+        popup.set_d(1, flipped ? y + height : y);
+        popup.x[3] = view;
+        const bool chosen = (objc.send(menu, "popUpMenuPositioningItem:atLocation:inView:", popup).x0 & 0xff) != 0;
+        release(menu);
+        if (!chosen) dismissed();
+    }, false, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}@Q");
+    method(picker, "_alchemyShareWithService:", [this, msg, responds](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto service = msg(s.x[2], "representedObject");
+        const auto delegate = static_cast<Address>(stored_integer(self, "delegate"));
+        if (responds(delegate, "sharingServicePicker:didChooseSharingService:"))
+            static_cast<void>(msg(delegate, "sharingServicePicker:didChooseSharingService:", {self, service}));
+        if (responds(delegate, "sharingServicePicker:delegateForSharingService:"))
+            static_cast<void>(msg(service, "setDelegate:", {msg(delegate, "sharingServicePicker:delegateForSharingService:", {self, service})}));
+        static_cast<void>(msg(service, "performWithItems:", {stored(self, "items")}));
+    }, false, "v@:@");
+    method(picker, "close", [](CpuState&, GuestMemory&) {}, false, "v@:");   // the menu closes when it is chosen from
     const auto preview_item = cls(appkit, "NSPreviewRepresentingActivityItem", "NSObject");
     object_properties(preview_item, {"item", "title", "imageProvider", "iconProvider"});
     method(preview_item, "initWithItem:title:image:icon:", [this](CpuState& s, GuestMemory&) {
