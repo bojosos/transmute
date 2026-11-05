@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
+#include <optional>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -30,6 +32,14 @@
 //   format (same rate). An existing file opens for writing when its header is the one Alchemy
 //   would write for it (a canonical WAVE, or an Alchemy-written file); others answer
 //   kAudioFileOperationNotSupportedError. ExtAudioFileWriteAsync writes at once.
+// - User data (AudioFileCountUserData and the rest): the chunks of a WAVE, AIFF/AIFC or CAF file
+//   other than its audio data, by ID and index. In a file being written, the chunks of the header
+//   Alchemy writes are fixed; others are set, replaced and removed in memory and follow the audio
+//   data once the header is brought up to date (AudioFileOptimize, AudioFileClose). Compressed files
+//   answer kAudioFileOperationNotSupportedError.
+// - AudioFileGetGlobalInfo / GetGlobalInfoSize describe the file types above: the readable and
+//   writable types, their names, extensions, MIME types, UTIs and HFS codes (and the reverse
+//   lookups), their data formats and the stream descriptions each holds.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -40,7 +50,7 @@ constexpr std::string_view libsystem = "/usr/lib/libSystem.B.dylib";
 // <ExtendedAudioFile.h>
 constexpr std::int32_t ext_invalid_property = -66561, ext_invalid_property_size = -66562, ext_non_pcm_client_format = -66563,
     ext_invalid_seek = -66568;
-constexpr std::int32_t permissions_error = static_cast<std::int32_t>(four("prm?"));
+constexpr std::int32_t permissions_error = static_cast<std::int32_t>(four("prm?")), invalid_chunk = static_cast<std::int32_t>(four("chk?"));
 // <fcntl.h> (Darwin)
 constexpr std::uint64_t o_rdwr = 2, o_creat = 0x200, o_trunc = 0x400, o_excl = 0x800;
 // AudioFileFlags
@@ -53,6 +63,10 @@ struct File {
     bool writable{};
     bool dirty{};                      // the header's sizes are behind the data
     std::vector<std::uint8_t> layout;  // a CAF file's channel layout (written in its header)
+    // User data: the chunks other than the audio data, found at first use. Fixed: part of the header
+    // of a file being written. Held: its bytes in memory (the chunks after a written file's data).
+    struct Chunk { std::uint32_t id{}; std::uint64_t offset{}, size{}; std::vector<std::uint8_t> bytes; bool fixed{}, held{}; };
+    std::optional<std::vector<Chunk>> chunks;
     [[nodiscard]] const Container& container() const { return audio.container; }
     [[nodiscard]] std::uint64_t frames() const { return audio.frames(); }
 };
@@ -67,6 +81,40 @@ struct Ext {
 };
 
 void status(CpuState& s, std::int32_t value) { s.x[0] = static_cast<std::uint64_t>(static_cast<std::int64_t>(value)); }
+
+// The file types AudioFileGetGlobalInfo describes: those Alchemy reads (audio_file_core.hpp and the
+// compressed streams of audio_stream.hpp) and writes (linear PCM only).
+struct FileType {
+    std::uint32_t type;
+    const char* name;
+    std::vector<const char*> extensions, mime, utis;
+    std::vector<std::uint32_t> formats;
+    bool writable;
+};
+const std::vector<FileType>& file_types() {
+    static const std::vector<FileType> types{
+        {four("WAVE"), "WAVE", {"wav", "wave"}, {"audio/wav", "audio/x-wav", "audio/vnd.wave"}, {"com.microsoft.waveform-audio"}, {four("lpcm")}, true},
+        {four("AIFF"), "AIFF", {"aif", "aiff"}, {"audio/aiff", "audio/x-aiff"}, {"public.aiff-audio"}, {four("lpcm")}, true},
+        {four("AIFC"), "AIFC", {"aifc", "aiff", "aif"}, {"audio/aiff", "audio/x-aiff"}, {"public.aifc-audio"}, {four("lpcm")}, true},
+        {four("caff"), "CAF", {"caf"}, {"audio/x-caf"}, {"com.apple.coreaudio-format"}, {four("lpcm")}, true},
+        {four("MPG3"), "MPEG Layer 3", {"mp3"}, {"audio/mpeg", "audio/mpeg3", "audio/mp3", "audio/x-mpeg3"}, {"public.mp3"}, {four(".mp3")}, false},
+        {four("MPG2"), "MPEG Layer 2", {"mp2"}, {"audio/mpeg"}, {}, {four(".mp2")}, false},
+        {four("MPG1"), "MPEG Layer 1", {"mp1"}, {"audio/mpeg"}, {}, {four(".mp1")}, false},
+        {four("flac"), "FLAC", {"flac"}, {"audio/flac"}, {"org.xiph.flac"}, {four("flac")}, false},
+        {four("m4af"), "Apple MPEG-4 Audio", {"m4a", "m4r"}, {"audio/mp4", "audio/x-m4a"}, {"com.apple.m4a-audio"},
+         {four(".mp3"), four("flac"), four("opus")}, false},
+        {four("mp4f"), "MPEG-4 Audio", {"mp4"}, {"audio/mp4"}, {"public.mpeg-4-audio"}, {four(".mp3"), four("flac"), four("opus")}, false},
+    };
+    return types;
+}
+const FileType* file_type(std::uint32_t type) {
+    for (const auto& t : file_types())
+        if (t.type == type) return &t;
+    return nullptr;
+}
+bool same_text(std::string_view a, std::string_view b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) { return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y)); });
+}
 
 struct AudioFiles {
     Support& support;
@@ -159,18 +207,110 @@ struct AudioFiles {
         f.writable = true;
         return 0;
     }
-    // The header's sizes, brought up to date.
+    // The header's sizes, brought up to date, and the held user data after the audio data.
     std::int32_t finish(File& f) {
         if (!f.writable || !f.dirty) return 0;
         std::vector<std::uint8_t> bytes;
         if (const auto result = header(f, bytes)) return result;
         if (const auto result = write_at(f, 0, bytes)) return result;
-        if (f.audio.fd < 0 && f.set_size_proc) {
-            const auto end = f.container().data_offset + f.container().data_bytes;
+        auto end = f.container().data_offset + f.container().data_bytes;
+        if (f.chunks && std::any_of(f.chunks->begin(), f.chunks->end(), [](const File::Chunk& c) { return c.held; })) {
+            const auto type = f.container().file_type;
+            const bool caf = type == four("caff"), little = type == four("WAVE");
+            std::vector<std::uint8_t> tail;
+            if (!caf && (end & 1)) tail.push_back(0);
+            const auto put = [&](std::uint64_t value, int count, bool le) {
+                for (int i = 0; i < count; ++i) tail.push_back(static_cast<std::uint8_t>(value >> (8 * (le ? i : count - 1 - i))));
+            };
+            for (const auto& c : *f.chunks) {
+                if (!c.held) continue;
+                put(c.id, 4, false);
+                put(c.bytes.size(), caf ? 8 : 4, little);
+                tail.insert(tail.end(), c.bytes.begin(), c.bytes.end());
+                if (!caf && (c.bytes.size() & 1)) tail.push_back(0);
+            }
+            if (const auto result = write_at(f, end, tail)) return result;
+            end += tail.size();
+            if (!caf) {   // the RIFF or FORM size covers them
+                std::vector<std::uint8_t> outer;
+                for (int i = 0; i < 4; ++i) outer.push_back(static_cast<std::uint8_t>((end - 8) >> (8 * (little ? i : 3 - i))));
+                if (const auto result = write_at(f, 4, outer)) return result;
+            }
+            f.audio.size = end;
+        }
+        if (f.audio.fd >= 0) {
+            if (size_of(f) > end) static_cast<void>(support.call(libsystem, "_ftruncate", {static_cast<Address>(f.audio.fd), end}));
+        } else if (f.set_size_proc) {
             if (size_of(f) > end) static_cast<void>(call(f.set_size_proc, {f.client, end}));   // OSStatus (*)(void *client, SInt64 size)
         }
         f.dirty = false;
         return 0;
+    }
+
+    // ---- user data ---------------------------------------------------------------------------------
+    // The chunks in [at, end): all but the audio data chunk (stopping at it when `stop_at_audio`);
+    // with `hold` their bytes are read into memory.
+    void scan_chunks(File& f, std::uint64_t at, std::uint64_t end, bool stop_at_audio, bool fixed, bool hold, std::vector<File::Chunk>& out) {
+        const auto type = f.container().file_type;
+        const bool caf = type == four("caff"), little = type == four("WAVE");
+        const std::uint64_t head = caf ? 12 : 8;
+        const auto audio = caf || little ? four("data") : four("SSND");
+        while (at + head <= end) {
+            std::array<std::uint8_t, 12> h{};
+            if (read_at(f, at, std::span(h.data(), head)) != head) break;
+            const auto id = (std::uint32_t(h[0]) << 24) | (h[1] << 16) | (h[2] << 8) | h[3];
+            std::uint64_t length = 0;
+            for (int i = 0; i < (caf ? 8 : 4); ++i) length |= std::uint64_t(h[4 + i]) << (8 * (little ? i : (caf ? 7 : 3) - i));
+            const auto body = at + head;
+            const bool open_ended = caf && length == ~0ULL;
+            if (open_ended || body + length > end) length = end - std::min(end, body);
+            if (id == audio) {
+                if (stop_at_audio) return;
+            } else {
+                File::Chunk c{id, body, length, {}, fixed, hold};
+                if (hold) {
+                    c.bytes.resize(static_cast<std::size_t>(length));
+                    c.bytes.resize(read_at(f, body, c.bytes));
+                    c.size = c.bytes.size();
+                }
+                out.push_back(std::move(c));
+            }
+            if (open_ended) return;
+            at = body + length + (!caf && (length & 1));
+        }
+    }
+    std::int32_t user_chunks(File& f, std::vector<File::Chunk>*& out) {
+        if (f.audio.stream) return error::operation_not_supported;
+        if (!f.chunks) {
+            std::vector<File::Chunk> list;
+            const std::uint64_t first = f.container().file_type == four("caff") ? 8 : 12;
+            if (f.writable) {
+                // The header's chunks, then whatever follows the audio data (held, to be written again after it).
+                scan_chunks(f, first, f.container().data_offset, true, true, false, list);
+                auto after = f.container().data_offset + f.container().data_bytes;
+                if (f.container().file_type != four("caff") && (after & 1)) ++after;
+                scan_chunks(f, after, size_of(f), false, false, true, list);
+            } else {
+                scan_chunks(f, first, f.audio.size, false, false, false, list);
+            }
+            f.chunks = std::move(list);
+        }
+        out = &*f.chunks;
+        return 0;
+    }
+    static File::Chunk* nth_chunk(std::vector<File::Chunk>& list, std::uint32_t id, std::uint32_t index) {
+        for (auto& c : list)
+            if (c.id == id && index-- == 0) return &c;
+        return nullptr;
+    }
+    std::size_t chunk_bytes(const File& f, const File::Chunk& c, std::uint64_t offset, std::span<std::uint8_t> out) {
+        if (offset >= c.size) return 0;
+        out = out.first(static_cast<std::size_t>(std::min<std::uint64_t>(out.size(), c.size - offset)));
+        if (c.held) {
+            std::memcpy(out.data(), c.bytes.data() + offset, out.size());
+            return out.size();
+        }
+        return read_at(f, c.offset + offset, out);
     }
     // Writes `bytes` at `offset` into the audio data (extending it).
     std::int32_t write_data(File& f, std::uint64_t offset, std::span<const std::uint8_t> bytes) {
@@ -653,6 +793,235 @@ void install_audio_file(Support& support) {
         if (!f) return status(s, error::param);
         status(s, state->finish(*f));
     });
+    // ---- user data -------------------------------------------------------------------------------
+    // AudioFileCountUserData(file, UInt32 userDataID, UInt32 *outNumberItems)
+    support.function(lib, "_AudioFileCountUserData", [state](CpuState& s, GuestMemory& m) {
+        std::lock_guard lock(state->mutex);
+        auto* f = state->file(s.x[0]);
+        if (!f || !s.x[2]) return status(s, error::param);
+        std::vector<File::Chunk>* list{};
+        if (const auto result = state->user_chunks(*f, list)) return status(s, result);
+        const auto id = static_cast<std::uint32_t>(s.x[1]);
+        m.write32(s.x[2], static_cast<std::uint32_t>(std::count_if(list->begin(), list->end(), [id](const File::Chunk& c) { return c.id == id; })));
+        status(s, 0);
+    });
+    // AudioFileGetUserDataSize(file, id, index, UInt32 *outSize) / AudioFileGetUserDataSize64(..., UInt64 *outSize)
+    for (const bool wide : {false, true})
+        support.function(lib, wide ? "_AudioFileGetUserDataSize64" : "_AudioFileGetUserDataSize", [state, wide](CpuState& s, GuestMemory& m) {
+            std::lock_guard lock(state->mutex);
+            auto* f = state->file(s.x[0]);
+            if (!f || !s.x[3]) return status(s, error::param);
+            std::vector<File::Chunk>* list{};
+            if (const auto result = state->user_chunks(*f, list)) return status(s, result);
+            const auto* c = AudioFiles::nth_chunk(*list, static_cast<std::uint32_t>(s.x[1]), static_cast<std::uint32_t>(s.x[2]));
+            if (!c) return status(s, invalid_chunk);
+            if (wide) m.write64(s.x[3], c->size);
+            else if (c->size > 0xffffffffULL) return status(s, error::bad_property_size);
+            else m.write32(s.x[3], static_cast<std::uint32_t>(c->size));
+            status(s, 0);
+        });
+    // AudioFileGetUserData(file, id, index, UInt32 *ioSize, void *out): the whole chunk, which must fit.
+    // AudioFileGetUserDataAtOffset(file, id, index, SInt64 offset, UInt32 *ioSize, void *out): what fits from offset.
+    for (const bool at_offset : {false, true})
+        support.function(lib, at_offset ? "_AudioFileGetUserDataAtOffset" : "_AudioFileGetUserData", [state, at_offset](CpuState& s, GuestMemory& m) {
+            const auto size_at = at_offset ? s.x[4] : s.x[3], out = at_offset ? s.x[5] : s.x[4];
+            const auto offset = at_offset ? static_cast<std::int64_t>(s.x[3]) : 0;
+            std::lock_guard lock(state->mutex);
+            auto* f = state->file(s.x[0]);
+            if (!f || !size_at || offset < 0) return status(s, error::param);
+            std::vector<File::Chunk>* list{};
+            if (const auto result = state->user_chunks(*f, list)) return status(s, result);
+            const auto* c = AudioFiles::nth_chunk(*list, static_cast<std::uint32_t>(s.x[1]), static_cast<std::uint32_t>(s.x[2]));
+            if (!c) return status(s, invalid_chunk);
+            const auto room = m.read32(size_at);
+            if (!at_offset && room < c->size) return status(s, error::bad_property_size);
+            std::vector<std::uint8_t> bytes(std::min<std::uint64_t>(room, c->size - std::min<std::uint64_t>(c->size, static_cast<std::uint64_t>(offset))));
+            bytes.resize(state->chunk_bytes(*f, *c, static_cast<std::uint64_t>(offset), bytes));
+            if (!bytes.empty() && !out) return status(s, error::param);
+            if (!bytes.empty()) m.write_bytes(out, bytes);
+            m.write32(size_at, static_cast<std::uint32_t>(bytes.size()));
+            status(s, 0);
+        });
+    // AudioFileSetUserData(file, id, index, UInt32 size, const void *data): replaces the chunk at index, or
+    // adds one past the last; AudioFileRemoveUserData(file, id, index). A file being written only; the
+    // chunks of its header cannot change.
+    const auto change_user_data = [state](CpuState& s, GuestMemory& m, bool remove) {
+        std::lock_guard lock(state->mutex);
+        auto* f = state->file(s.x[0]);
+        if (!f) return status(s, error::param);
+        std::vector<File::Chunk>* list{};
+        if (const auto result = state->user_chunks(*f, list)) return status(s, result);
+        if (!f->writable) return status(s, permissions_error);
+        const auto id = static_cast<std::uint32_t>(s.x[1]);
+        const auto index = static_cast<std::uint32_t>(s.x[2]);
+        const auto audio = f->container().file_type == four("caff") || f->container().file_type == four("WAVE") ? four("data") : four("SSND");
+        if (id == audio || std::any_of(list->begin(), list->end(), [id](const File::Chunk& c) { return c.id == id && c.fixed; }))
+            return status(s, error::operation_not_supported);
+        auto* c = AudioFiles::nth_chunk(*list, id, index);
+        if (remove) {
+            if (!c) return status(s, invalid_chunk);
+            list->erase(list->begin() + (c - list->data()));
+        } else {
+            const auto size = static_cast<std::uint32_t>(s.x[3]);
+            if (size && !s.x[4]) return status(s, error::param);
+            std::vector<std::uint8_t> bytes(size);
+            if (size) m.read_bytes(s.x[4], bytes);
+            if (!c) {
+                list->push_back(File::Chunk{id, 0, 0, {}, false, true});
+                c = &list->back();
+            }
+            c->size = bytes.size();
+            c->bytes = std::move(bytes);
+        }
+        f->dirty = true;
+        status(s, 0);
+    };
+    support.function(lib, "_AudioFileSetUserData", [change_user_data](CpuState& s, GuestMemory& m) { change_user_data(s, m, false); });
+    support.function(lib, "_AudioFileRemoveUserData", [change_user_data](CpuState& s, GuestMemory& m) { change_user_data(s, m, true); });
+
+    // ---- global info ---------------------------------------------------------------------------
+    // The value of kAudioFileGlobalInfo_* `id` for (specifierSize, specifier): bytes, or a +1 CF object made
+    // when `make` is set (its 8 bytes then hold it).
+    const auto global_info = [sp](GuestMemory& m, std::uint32_t id, std::uint32_t specifier_size, Address specifier, bool make,
+                                  std::vector<std::uint8_t>& out) -> std::int32_t {
+        const auto u32s = [&](const std::vector<std::uint32_t>& values) {
+            out.resize(values.size() * 4);
+            if (!values.empty()) std::memcpy(out.data(), values.data(), out.size());
+        };
+        const auto object = [&](Address value) {
+            out.assign(8, 0);
+            std::memcpy(out.data(), &value, 8);
+        };
+        const auto strings = [&](const std::vector<const char*>& values) {
+            if (!make) return object(0);
+            std::vector<Address> items;
+            for (const auto* v : values) items.push_back(sp->cf.string(v));
+            object(sp->cf.array(items));
+            for (const auto item : items) sp->release(item);
+        };
+        const auto type_specifier = [&]() -> const FileType* {
+            if (specifier_size < 4 || !specifier) return nullptr;
+            return file_type(m.read32(specifier));
+        };
+        const auto string_specifier = [&]() -> std::optional<std::string> {
+            if (specifier_size < 8 || !specifier) return std::nullopt;
+            const auto value = m.read64(specifier);
+            return value ? std::optional<std::string>(sp->cf.utf8(value)) : std::nullopt;
+        };
+        std::vector<std::uint32_t> ids;
+        switch (id) {
+        case four("afrf"): case four("afwf"):   // ReadableTypes, WritableTypes
+            for (const auto& t : file_types())
+                if (id == four("afrf") || t.writable) ids.push_back(t.type);
+            u32s(ids);
+            return 0;
+        case four("ftnm"): case four("fmid"): case four("fext"): case four("fmim"): case four("futi"): case four("fhfs"): {
+            if (specifier_size < 4 || !specifier) return error::bad_property_size;
+            const auto* t = type_specifier();
+            if (!t) return error::unsupported_file_type;
+            switch (id) {
+            case four("ftnm"): object(make ? sp->cf.string(t->name) : 0); return 0;   // FileTypeName
+            case four("fmid"): u32s(t->formats); return 0;                             // AvailableFormatIDs
+            case four("fext"): strings(t->extensions); return 0;                       // ExtensionsForType
+            case four("fmim"): strings(t->mime); return 0;                             // MIMETypesForType
+            case four("futi"): strings(t->utis); return 0;                             // UTIsForType
+            default: u32s({t->type}); return 0;                                        // HFSTypeCodesForType
+            }
+        }
+        case four("alxt"): case four("amim"): case four("auti"): {   // AllExtensions, AllMIMETypes, AllUTIs
+            std::vector<const char*> all;
+            for (const auto& t : file_types())
+                for (const auto* v : id == four("alxt") ? t.extensions : id == four("amim") ? t.mime : t.utis)
+                    if (std::none_of(all.begin(), all.end(), [v](const char* have) { return same_text(have, v); })) all.push_back(v);
+            strings(all);
+            return 0;
+        }
+        case four("ahfs"):   // AllHFSTypeCodes
+            for (const auto& t : file_types()) ids.push_back(t.type);
+            u32s(ids);
+            return 0;
+        case four("text"): case four("tmim"): case four("tuti"): {   // TypesForExtension, TypesForMIMEType, TypesForUTI
+            const auto text = string_specifier();
+            if (!text) return error::bad_property_size;
+            for (const auto& t : file_types())
+                for (const auto* v : id == four("text") ? t.extensions : id == four("tmim") ? t.mime : t.utis)
+                    if (same_text(v, *text)) { ids.push_back(t.type); break; }
+            u32s(ids);
+            return 0;
+        }
+        case four("thfs"): {   // TypesForHFSTypeCode (the codes are the type IDs)
+            if (specifier_size < 4 || !specifier) return error::bad_property_size;
+            if (const auto* t = file_type(m.read32(specifier))) ids.push_back(t->type);
+            u32s(ids);
+            return 0;
+        }
+        case four("sdid"): {   // AvailableStreamDescriptionsForFormat: {AudioFileTypeID, AudioFormatID}
+            if (specifier_size < 8 || !specifier) return error::bad_property_size;
+            const auto* t = file_type(m.read32(specifier));
+            if (!t) return error::unsupported_file_type;
+            const auto format = m.read32(specifier + 4);
+            if (std::find(t->formats.begin(), t->formats.end(), format) == t->formats.end()) return error::unsupported_data_format;
+            out.clear();
+            if (format == four("lpcm")) {
+                // Each sample layout the container holds (rate and channels 0: any).
+                for (const bool is_float : {false, true})
+                    for (const std::uint32_t bytes : is_float ? std::vector<std::uint32_t>{4, 8} : std::vector<std::uint32_t>{1, 2, 3, 4})
+                        for (const bool big : {false, true})
+                            for (const bool is_signed : {true, false}) {
+                                if (is_float && !is_signed) continue;
+                                Pcm p;
+                                p.rate = 44100;
+                                p.channels = 1;
+                                p.bits = bytes * 8;
+                                p.container = bytes;
+                                p.is_float = is_float;
+                                p.big_endian = big;
+                                p.is_signed = is_signed;
+                                std::vector<std::uint8_t> header_bytes;
+                                std::string why;
+                                if (write_header(t->type, p, 0, {}, header_bytes, why)) continue;
+                                auto asbd = asbd_from_pcm(p);
+                                std::fill(asbd.begin(), asbd.begin() + 8, std::uint8_t{0});   // mSampleRate 0
+                                for (const std::size_t at : {16, 24, 28}) std::fill_n(asbd.begin() + at, 4, std::uint8_t{0});   // bytes, channels 0
+                                out.insert(out.end(), asbd.begin(), asbd.end());
+                            }
+            } else {
+                const std::uint32_t frames = format == four(".mp1") ? 384 : format == four("opus") ? 960 : format == four("flac") ? 0 : 1152;
+                std::vector<std::uint8_t> asbd(40, 0);
+                std::memcpy(asbd.data() + 8, &format, 4);
+                std::memcpy(asbd.data() + 20, &frames, 4);
+                out = asbd;
+            }
+            return 0;
+        }
+        default:
+            return error::unsupported_property;
+        }
+    };
+    // AudioFileGetGlobalInfoSize(AudioFilePropertyID, UInt32 specifierSize, void *specifier, UInt32 *outDataSize)
+    support.function(lib, "_AudioFileGetGlobalInfoSize", [global_info](CpuState& s, GuestMemory& m) {
+        if (!s.x[3]) return status(s, error::param);
+        std::vector<std::uint8_t> value;
+        if (const auto result = global_info(m, static_cast<std::uint32_t>(s.x[0]), static_cast<std::uint32_t>(s.x[1]), s.x[2], false, value))
+            return status(s, result);
+        m.write32(s.x[3], static_cast<std::uint32_t>(value.size()));
+        status(s, 0);
+    });
+    // AudioFileGetGlobalInfo(AudioFilePropertyID, UInt32 specifierSize, void *specifier, UInt32 *ioDataSize, void *outData):
+    // CF values are +1.
+    support.function(lib, "_AudioFileGetGlobalInfo", [global_info, sp](CpuState& s, GuestMemory& m) {
+        if (!s.x[3]) return status(s, error::param);
+        const auto id = static_cast<std::uint32_t>(s.x[0]);
+        std::vector<std::uint8_t> value;
+        if (const auto result = global_info(m, id, static_cast<std::uint32_t>(s.x[1]), s.x[2], false, value)) return status(s, result);
+        if (m.read32(s.x[3]) < value.size()) return status(s, error::bad_property_size);
+        if (!value.empty() && !s.x[4]) return status(s, error::param);
+        static_cast<void>(global_info(m, id, static_cast<std::uint32_t>(s.x[1]), s.x[2], true, value));
+        if (!value.empty()) m.write_bytes(s.x[4], value);
+        m.write32(s.x[3], static_cast<std::uint32_t>(value.size()));
+        status(s, 0);
+    });
+
     // AudioFileGetPropertyInfo(file, AudioFilePropertyID, UInt32 *outDataSize, UInt32 *isWritable)
     support.function(lib, "_AudioFileGetPropertyInfo", [state](CpuState& s, GuestMemory& m) {
         std::lock_guard lock(state->mutex);

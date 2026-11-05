@@ -1906,6 +1906,82 @@ void audio_file_writing(Fixture& f) {
     require(f.status(at, "_AudioFileClose", {file}) == 0, "closed");
     require(f.status(at, "_AudioFileCreateWithURL", {url_of("out.wav"), 0x57415645, asbd, 0, out}) == static_cast<std::int32_t>(0x70726d3f),
             "an existing file is not replaced without kAudioFileFlags_EraseFile");
+    // User data: a 'LIST' chunk set while writing and then replaced, a 'note' added and removed; the
+    // header's 'fmt ' is listed but fixed. The file reads back with the LIST after its audio data.
+    {
+        constexpr std::uint32_t list_id = 0x4c495354, note_id = 0x6e6f7465, fmt_id = 0x666d7420, data_id = 0x64617461;
+        require(f.status(at, "_AudioFileCreateWithURL", {url_of("user.wav"), 0x57415645, asbd, 1, out}) == 0, "a WAVE for user data");
+        file = f.engine.read64(out);
+        f.engine.write32(count, 100);
+        require(f.status(at, "_AudioFileWritePackets", {file, 0, 400, 0, 0, count, frames}) == 0, "its audio");
+        const auto user = f.block(16);
+        f.memory().write_bytes(user, std::span(reinterpret_cast<const std::uint8_t*>("INFOtest122"), 11));
+        require(f.status(at, "_AudioFileSetUserData", {file, list_id, 0, 9, user}) == 0 &&
+                f.status(at, "_AudioFileSetUserData", {file, list_id, 0, 10, user}) == 0, "LIST set, then replaced");
+        require(f.status(at, "_AudioFileSetUserData", {file, note_id, 0, 3, user}) == 0 && f.status(at, "_AudioFileCountUserData", {file, note_id, count}) == 0 &&
+                f.engine.read32(count) == 1 && f.status(at, "_AudioFileRemoveUserData", {file, note_id, 0}) == 0 &&
+                f.status(at, "_AudioFileCountUserData", {file, note_id, count}) == 0 && f.engine.read32(count) == 0, "a note added and removed");
+        require(f.status(at, "_AudioFileCountUserData", {file, fmt_id, count}) == 0 && f.engine.read32(count) == 1 &&
+                f.status(at, "_AudioFileSetUserData", {file, fmt_id, 0, 3, user}) == static_cast<std::int32_t>(0x6f703f3f) &&
+                f.status(at, "_AudioFileCountUserData", {file, data_id, count}) == 0 && f.engine.read32(count) == 0, "the header's chunks are fixed");
+        require(f.status(at, "_AudioFileClose", {file}) == 0, "closed with user data");
+        std::ifstream in(directory / "user.wav", std::ios::binary);
+        const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        require(bytes.size() == 44 + 400 + 8 + 10 && bytes[4] + (bytes[5] << 8) == 44 + 400 + 18 - 8 && std::memcmp(bytes.data() + 444, "LIST", 4) == 0 &&
+                bytes[448] == 10 && std::memcmp(bytes.data() + 452, "INFOtest12", 10) == 0, "the LIST chunk follows the data on disk");
+        require(f.status(at, "_AudioFileOpenURL", {url_of("user.wav"), 1, 0, out}) == 0, "it reads back");
+        file = f.engine.read64(out);
+        const auto got = f.block(64);
+        f.engine.write32(size, 8);
+        require(f.status(at, "_AudioFileGetProperty", {file, 0x70636e74, size, value}) == 0 && f.engine.read64(value) == 100, "its audio is intact");
+        require(f.status(at, "_AudioFileCountUserData", {file, list_id, count}) == 0 && f.engine.read32(count) == 1 &&
+                f.status(at, "_AudioFileGetUserDataSize", {file, list_id, 0, size}) == 0 && f.engine.read32(size) == 10, "LIST: one, 10 bytes");
+        f.engine.write32(size, 64);
+        require(f.status(at, "_AudioFileGetUserData", {file, list_id, 0, size, got}) == 0 && f.engine.read32(size) == 10 &&
+                f.memory().read8(got + 9) == '2', "AudioFileGetUserData");
+        f.engine.write32(size, 64);
+        require(f.status(at, "_AudioFileGetUserDataAtOffset", {file, list_id, 0, 4, size, got}) == 0 && f.engine.read32(size) == 6 &&
+                f.memory().read8(got) == 't', "AudioFileGetUserDataAtOffset");
+        f.engine.write32(size, 4);
+        require(f.status(at, "_AudioFileGetUserData", {file, list_id, 0, size, got}) == static_cast<std::int32_t>(0x2173697a), "too small ('!siz')");
+        require(f.status(at, "_AudioFileGetUserDataSize", {file, list_id, 1, size}) == static_cast<std::int32_t>(0x63686b3f), "no second LIST ('chk?')");
+        require(f.status(at, "_AudioFileSetUserData", {file, list_id, 0, 3, user}) == static_cast<std::int32_t>(0x70726d3f), "read-only ('prm?')");
+        require(f.status(at, "_AudioFileClose", {file}) == 0, "closed");
+    }
+    // Global info: the types Alchemy writes and reads, their names, extensions and stream descriptions.
+    {
+        const auto specifier = f.block(16), info = f.block(1024);
+        require(f.status(at, "_AudioFileGetGlobalInfoSize", {0x61667766, 0, 0, size}) == 0 && f.engine.read32(size) == 16, "four writable types");
+        f.engine.write32(size, 1024);
+        require(f.status(at, "_AudioFileGetGlobalInfo", {0x61667266, 0, 0, size, info}) == 0 && f.engine.read32(size) >= 32 &&
+                f.engine.read32(info) == 0x57415645, "readable types, WAVE first");
+        f.engine.write32(specifier, 0x63616666);   // 'caff'
+        f.engine.write32(size, 8);
+        require(f.status(at, "_AudioFileGetGlobalInfo", {0x66746e6d, 4, specifier, size, info}) == 0 && f.cf.utf8(f.engine.read64(info)) == "CAF",
+                "kAudioFileGlobalInfo_FileTypeName");
+        f.engine.write32(specifier, 0x57415645);   // 'WAVE'
+        f.engine.write32(size, 8);
+        const auto cf_library = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+        require(f.status(at, "_AudioFileGetGlobalInfo", {0x66657874, 4, specifier, size, info}) == 0 &&
+                f.call(cf_library, "_CFArrayGetCount", {f.engine.read64(info)}) == 2, "ExtensionsForType WAVE");
+        f.engine.write64(specifier, f.cf.string("MP3"));
+        f.engine.write32(size, 64);
+        require(f.status(at, "_AudioFileGetGlobalInfo", {0x74657874, 8, specifier, size, info}) == 0 && f.engine.read32(size) == 4 &&
+                f.engine.read32(info) == 0x4d504733, "TypesForExtension mp3 (any case)");
+        f.engine.write32(specifier, 0x57415645);
+        f.engine.write32(specifier + 4, 0x6c70636d);   // {WAVE, lpcm}
+        f.engine.write32(size, 1024);
+        require(f.status(at, "_AudioFileGetGlobalInfo", {0x73646964, 8, specifier, size, info}) == 0 && f.engine.read32(size) == 6 * 40 &&
+                f.engine.read32(info + 8) == 0x6c70636d, "WAVE holds six sample layouts");
+        f.engine.write32(specifier, 0x4d504733);
+        f.engine.write32(specifier + 4, 0x2e6d7033);   // {MPG3, .mp3}
+        f.engine.write32(size, 1024);
+        require(f.status(at, "_AudioFileGetGlobalInfo", {0x73646964, 8, specifier, size, info}) == 0 && f.engine.read32(size) == 40 &&
+                f.engine.read32(info + 20) == 1152, "MPG3 holds '.mp3'");
+        f.engine.write32(specifier, 0x58585858);
+        require(f.status(at, "_AudioFileGetGlobalInfoSize", {0x66657874, 4, specifier, size}) == static_cast<std::int32_t>(0x7479703f), "unknown type");
+        require(f.status(at, "_AudioFileGetGlobalInfoSize", {0x7a7a7a7a, 0, 0, size}) == static_cast<std::int32_t>(0x7074793f), "unknown property");
+    }
     // AIFF holds big-endian integers only; AIFC also floats; MP3 is no container Alchemy writes.
     require(f.status(at, "_AudioFileCreateWithURL", {url_of("le.aif"), 0x41494646, asbd, 1, out}) == static_cast<std::int32_t>(0x666d743f),
             "AIFF refuses little-endian samples");
