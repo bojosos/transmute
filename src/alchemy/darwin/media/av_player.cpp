@@ -29,7 +29,7 @@
 //   AVPlayerItemVideoOutput added); the picture due at the item's time becomes the contents of
 //   every AVPlayerLayer showing the player, and the outputs hand it out (hasNewPixelBuffer /
 //   copyPixelBuffer). Seeking starts a new reader at the time.
-// - Audio: the item's readable audio track (audio_file.hpp: PCM, MP3, FLAC, Opus) plays on the
+// - Audio: the item's readable audio track (audio_file.hpp: PCM, MP3, FLAC, Opus, ALAC) plays on the
 //   default output device at rate 1 with the player's volume and mute (other rates are silent);
 //   the main queue decodes ahead of the device.
 // - A tick on the main queue (every 1/60 s while a player plays) advances the pictures, fires

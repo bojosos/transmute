@@ -20,11 +20,11 @@
 // - Reading: any of those files. ExtAudioFile converts to any linear PCM client format with the
 //   file's sample rate (kAudioConverterErr_FormatNotSupported otherwise); it has no AudioConverter
 //   object to expose.
-// - Compressed files with a decoder (audio_stream.hpp: MP3, FLAC, Ogg Opus, MP4 and Matroska audio
-//   in those codecs) open read-only: AudioFile describes and reads their packets (data format,
+// - Compressed files with a decoder (audio_stream.hpp: MP3, FLAC, Ogg Opus, Apple Lossless in CAF,
+//   MP4 and Matroska audio in those codecs) open read-only: AudioFile describes and reads their packets (data format,
 //   packet counts and sizes, magic cookie, packet table, ReadPacketData with descriptions;
 //   ReadBytes answers kAudioFileOperationNotSupportedError), and ExtAudioFile reads them decoded.
-//   Other compressed data (AAC, ALAC, ...) answers kAudioFileUnsupportedDataFormatError.
+//   Other compressed data (AAC, ...) answers kAudioFileUnsupportedDataFormatError.
 // - Writing: AudioFileCreateWithURL and InitializeWithCallbacks make files in the format given,
 //   which the container must hold (kAudioFileUnsupportedDataFormatError otherwise); bytes and
 //   packets go into the data, and the header's sizes are brought up to date by AudioFileOptimize
@@ -96,14 +96,14 @@ const std::vector<FileType>& file_types() {
         {four("WAVE"), "WAVE", {"wav", "wave"}, {"audio/wav", "audio/x-wav", "audio/vnd.wave"}, {"com.microsoft.waveform-audio"}, {four("lpcm")}, true},
         {four("AIFF"), "AIFF", {"aif", "aiff"}, {"audio/aiff", "audio/x-aiff"}, {"public.aiff-audio"}, {four("lpcm")}, true},
         {four("AIFC"), "AIFC", {"aifc", "aiff", "aif"}, {"audio/aiff", "audio/x-aiff"}, {"public.aifc-audio"}, {four("lpcm")}, true},
-        {four("caff"), "CAF", {"caf"}, {"audio/x-caf"}, {"com.apple.coreaudio-format"}, {four("lpcm")}, true},
+        {four("caff"), "CAF", {"caf"}, {"audio/x-caf"}, {"com.apple.coreaudio-format"}, {four("lpcm"), four("alac")}, true},
         {four("MPG3"), "MPEG Layer 3", {"mp3"}, {"audio/mpeg", "audio/mpeg3", "audio/mp3", "audio/x-mpeg3"}, {"public.mp3"}, {four(".mp3")}, false},
         {four("MPG2"), "MPEG Layer 2", {"mp2"}, {"audio/mpeg"}, {}, {four(".mp2")}, false},
         {four("MPG1"), "MPEG Layer 1", {"mp1"}, {"audio/mpeg"}, {}, {four(".mp1")}, false},
         {four("flac"), "FLAC", {"flac"}, {"audio/flac"}, {"org.xiph.flac"}, {four("flac")}, false},
         {four("m4af"), "Apple MPEG-4 Audio", {"m4a", "m4r"}, {"audio/mp4", "audio/x-m4a"}, {"com.apple.m4a-audio"},
-         {four(".mp3"), four("flac"), four("opus")}, false},
-        {four("mp4f"), "MPEG-4 Audio", {"mp4"}, {"audio/mp4"}, {"public.mpeg-4-audio"}, {four(".mp3"), four("flac"), four("opus")}, false},
+         {four(".mp3"), four("flac"), four("opus"), four("alac")}, false},
+        {four("mp4f"), "MPEG-4 Audio", {"mp4"}, {"audio/mp4"}, {"public.mpeg-4-audio"}, {four(".mp3"), four("flac"), four("opus"), four("alac")}, false},
     };
     return types;
 }
@@ -986,7 +986,8 @@ void install_audio_file(Support& support) {
                                 out.insert(out.end(), asbd.begin(), asbd.end());
                             }
             } else {
-                const std::uint32_t frames = format == four(".mp1") ? 384 : format == four("opus") ? 960 : format == four("flac") ? 0 : 1152;
+                const std::uint32_t frames = format == four(".mp1") ? 384 : format == four("opus") ? 960 : format == four("flac") ? 0
+                                             : format == four("alac") ? 4096 : 1152;
                 std::vector<std::uint8_t> asbd(40, 0);
                 std::memcpy(asbd.data() + 8, &format, 4);
                 std::memcpy(asbd.data() + 20, &frames, 4);

@@ -1,7 +1,8 @@
 # Media decoders (third_party/, vendored with licence, tag and per-file hashes in
 # each PROVENANCE.md), built as plain C without assembly or intrinsics and
 # linked into alchemy-fx for src/alchemy/darwin/media/media_codecs.cpp:
-#   minimp3 (CC0) for MPEG audio, Opus (BSD-3), libFLAC (BSD-3).
+#   minimp3 (CC0) for MPEG audio, Opus (BSD-3), libFLAC (BSD-3), Apple's ALAC
+#   (Apache-2.0, decoder and encoder).
 # Upstream code keeps its own warnings; it is compiled with them off.
 enable_language(C)
 
@@ -59,6 +60,14 @@ alchemy_codec_library(alchemy_flac ${alchemy_flac_sources})
 target_include_directories(alchemy_flac PUBLIC "${alchemy_flac}/include"
     PRIVATE "${alchemy_codec_gen}/flac" "${alchemy_flac}/src/libFLAC/include")
 target_compile_definitions(alchemy_flac PUBLIC FLAC__NO_DLL PRIVATE HAVE_CONFIG_H)
+
+# ---- ALAC: Apple's open-source codec (decoder and encoder), as its makefile ----
+# EndianPortable.c byte-swaps only when it recognises the target as little endian.
+set(alchemy_alac "${alchemy_codec_root}/alac/codec")
+file(GLOB alchemy_alac_sources CONFIGURE_DEPENDS "${alchemy_alac}/*.c" "${alchemy_alac}/*.cpp")
+alchemy_codec_library(alchemy_alac ${alchemy_alac_sources})
+target_include_directories(alchemy_alac PUBLIC "${alchemy_alac}")
+target_compile_definitions(alchemy_alac PRIVATE TARGET_OS_WIN32=1)
 
 # ---- libvpx: the VP8 and VP9 decoders, generic C, high bit depth -------------
 # config/ holds what libvpx's configure writes for this configuration, and the
@@ -147,14 +156,14 @@ target_link_libraries(alchemy_dav1d PUBLIC alchemy_dav1d_8 alchemy_dav1d_16)
 
 list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/media/media_codecs.cpp src/alchemy/darwin/media/audio_stream.cpp
     src/alchemy/darwin/media/video_frames.cpp src/alchemy/darwin/media/vt_decompression.cpp)
-list(APPEND ALCHEMY_GUI_LINK_LIBRARIES alchemy_minimp3 alchemy_opus alchemy_flac alchemy_vpx alchemy_dav1d)
+list(APPEND ALCHEMY_GUI_LINK_LIBRARIES alchemy_minimp3 alchemy_opus alchemy_flac alchemy_alac alchemy_vpx alchemy_dav1d)
 
 # Decode-and-compare tests: the conformance and test vectors of minimp3, libvpx
-# and dav1d (vendored beside them), and Opus and FLAC signals encoded by those
-# libraries' own encoders inside the test.
+# and dav1d (vendored beside them), and Opus, FLAC and ALAC signals encoded by
+# those libraries' own encoders inside the test.
 function(alchemy_gui_media_codec_tests)
     alchemy_gui_add_unit_test(alchemy_gui_media_codecs src/alchemy/darwin/media/tests/media_codec_tests.cpp)
-    target_link_libraries(alchemy_gui_media_codecs PRIVATE alchemy_opus alchemy_flac)
+    target_link_libraries(alchemy_gui_media_codecs PRIVATE alchemy_opus alchemy_flac alchemy_alac)
     target_compile_definitions(alchemy_gui_media_codecs PRIVATE
         ALCHEMY_THIRD_PARTY="${PROJECT_SOURCE_DIR}/third_party")
 endfunction()

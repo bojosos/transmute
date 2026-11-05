@@ -18,6 +18,7 @@ std::uint32_t file_type_for(std::uint32_t brand) {
     switch (brand) {
     case fourcc("mp3 "): return af::four("MPG3");      // kAudioFileMP3Type
     case fourcc("fLaC"): return af::four("flac");      // kAudioFileFLACType
+    case fourcc("caff"): return af::four("caff");      // kAudioFileCAFType
     case fourcc("M4A "): case fourcc("M4B "): case fourcc("M4P "): return af::four("m4af");   // kAudioFileM4AType
     case fourcc("OggS"): case fourcc("webm"): case fourcc("matr"): return brand;
     default: return af::four("mp4f");                  // kAudioFileMPEG4Type (ISO files)
@@ -72,15 +73,16 @@ std::unique_ptr<Stream> Stream::open(container::ReadAt read, std::uint64_t size,
     s->starts_.push_back(at);
     s->frames_per_packet_ = std::max_element(durations.begin(), durations.end(), [](const auto& a, const auto& b) { return a.second < b.second; })->first;
     s->priming_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(std::llround(t.priming * (t.codec == fourcc("opus") ? 1.0 : scale)), at));
-    // MP3 and FLAC tracks know their exact length; elsewhere it is the packets less the priming.
-    const auto exact = s->movie_.brand == fourcc("mp3 ") || s->movie_.brand == fourcc("fLaC");
+    // MP3, FLAC and CAF (its packet table's valid frames) tracks know their exact length; elsewhere
+    // it is the packets less the priming.
+    const auto exact = s->movie_.brand == fourcc("mp3 ") || s->movie_.brand == fourcc("fLaC") || s->movie_.brand == fourcc("caff");
     s->playable_ = exact && t.duration > 0 ? std::min<std::uint64_t>(static_cast<std::uint64_t>(std::llround(t.duration * scale)), at - s->priming_)
                                            : at - s->priming_;
     s->remainder_ = static_cast<std::uint32_t>(at - s->priming_ - s->playable_);
     // Decoding restarts this far before a seek target: MP3's bit reservoir and filter bank need a
     // few frames; after Opus's 80 ms minimum CELT's predicted band energies are still about a
     // decibel off, so it gets half a second, after which they match a decode from the start.
-    s->preroll_ = t.codec == fourcc("opus") ? 24000 : t.codec == fourcc("flac") ? 0 : 4 * 1152;
+    s->preroll_ = t.codec == fourcc("opus") ? 24000 : t.codec == fourcc("flac") || t.codec == fourcc("alac") ? 0 : 4 * 1152;
     s->buffer_start_ = 0;
     s->next_ = 0;
     status = 0;
@@ -105,7 +107,7 @@ std::vector<std::uint8_t> Stream::asbd() const {
             const auto layer = (first[1] >> 1) & 3;
             format = layer == 3 ? fourcc(".mp1") : layer == 2 ? fourcc(".mp2") : fourcc(".mp3");
         }
-    } else if (format == fourcc("flac")) {
+    } else if (format == fourcc("flac") || format == fourcc("alac")) {
         // kAppleLosslessFormatFlag_16/20/24/32BitSourceData
         flags = decoder_->bits <= 16 ? 1 : decoder_->bits <= 20 ? 2 : decoder_->bits <= 24 ? 3 : 4;
     }

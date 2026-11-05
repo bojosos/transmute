@@ -4,11 +4,15 @@
 // (cmake/darwin/media_codecs.cmake): packets in, as the containers in media_container.hpp cut
 // them, and decoded media out.
 // - Audio: MPEG audio layers I-III ('.mp1', '.mp2', '.mp3', minimp3), Opus ('opus', libopus,
-//   always 48 kHz) and FLAC ('flac', libFLAC), as interleaved 32-bit float PCM.
+//   always 48 kHz), FLAC ('flac', libFLAC) and Apple Lossless ('alac', Apple's open-source ALAC
+//   codec: 16, 20, 24 or 32 bits, 1-8 channels), as interleaved 32-bit float PCM.
 // The codec configuration is what the container stores: dOps or OpusHead for Opus; dfLa, a
-// Matroska "fLaC" CodecPrivate or a bare STREAMINFO block for FLAC; nothing for MPEG audio.
-// Codecs without a decoder here (AAC, ALAC, H.264, HEVC, ProRes, ...) are not supported;
-// callers answer their own "format not supported" error for them.
+// Matroska "fLaC" CodecPrivate or a bare STREAMINFO block for FLAC; for ALAC the
+// ALACSpecificConfig (the magic cookie, optionally after 'frma' and 'alac' atoms, or the MP4
+// 'alac' box payload with its version and flags); nothing for MPEG audio.
+// Codecs without a decoder here (AAC, H.264, HEVC, ProRes, ...) are not supported; callers answer
+// their own "format not supported" error for them.
+// - Audio encoding: ALAC only (AudioEncoder below).
 
 #include <cstdint>
 #include <memory>
@@ -34,6 +38,32 @@ public:
 };
 
 bool audio_decoder_available(std::uint32_t codec);
+
+// An audio encoder. Samples go in interleaved, as integers left-justified in 32 bits (a 16-bit
+// sample is its value << 16), at most `frames_per_packet` frames per call; only a stream's last
+// packet may be shorter. Each call makes one packet, as a container stores it.
+class AudioEncoder {
+public:
+    virtual ~AudioEncoder() = default;
+    // Replaces `packet` with the encoded frames. False, with `why`, when they cannot be encoded.
+    virtual bool encode(std::span<const std::int32_t> samples, std::vector<std::uint8_t>& packet, std::string& why) = 0;
+    // The magic cookie describing the packets encoded so far (ALAC: the ALACSpecificConfig with
+    // their largest size and average bit rate, then the channel layout info above two channels).
+    virtual std::vector<std::uint8_t> cookie() = 0;
+
+    double rate{};
+    std::uint32_t channels{};
+    std::uint32_t bits{};               // the source bit depth the encoder keeps
+    std::uint32_t frames_per_packet{};
+    std::uint32_t max_packet_bytes{};   // no packet is larger
+};
+
+bool audio_encoder_available(std::uint32_t codec);
+
+// An encoder for `codec`: ALAC ('alac') of 16, 20, 24 or 32 bits, 1-8 channels, an integer rate
+// and 1-16384 frames per packet (0: the codec's default, 4096). Null, with `why`, otherwise.
+std::unique_ptr<AudioEncoder> make_audio_encoder(std::uint32_t codec, double rate, std::uint32_t channels, std::uint32_t bits,
+                                                 std::uint32_t frames_per_packet, std::string& why);
 
 // A decoder for `codec` (a container::Track codec fourcc). `rate` and `channels` are the
 // container's; the configuration's values take precedence where it has them. Null, with `why`,

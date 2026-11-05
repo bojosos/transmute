@@ -163,8 +163,11 @@ void parse_stsd(IsoTrack& t, std::span<const std::uint8_t> stsd) {
     for (const auto& b : found) {
         switch (b.type) {
         case fourcc("avcC"): case fourcc("hvcC"): case fourcc("av1C"): case fourcc("vpcC"): case fourcc("esds"):
-        case fourcc("dOps"): case fourcc("dfLa"): case fourcc("alac"):
+        case fourcc("dOps"): case fourcc("dfLa"):
             if (track.config.empty()) track.config.assign(b.payload.begin(), b.payload.end());
+            break;
+        case fourcc("alac"):   // a full box: the ALACSpecificConfig follows its version and flags
+            if (track.config.empty() && b.payload.size() >= 28) track.config.assign(b.payload.begin() + 4, b.payload.end());
             break;
         default: break;
         }
@@ -1006,6 +1009,104 @@ bool parse_flac(const ReadAt& read, std::uint64_t size, Movie& out, std::string&
     return true;
 }
 
+// ---- CAF (compressed formats) -----------------------------------------------------------------------
+
+bool parse_caf(const ReadAt& read, std::uint64_t size, Movie& out, std::string& why) {
+    out = Movie{};
+    out.brand = fourcc("caff");
+    std::array<std::uint8_t, 8> header{};
+    if (!read_exact(read, 0, header) || std::memcmp(header.data(), "caff", 4) != 0 || be16(header.data() + 4) != 1) { why = "not a CAF file"; return false; }
+    Track t;
+    t.kind = Track::Kind::audio;
+    t.id = 1;
+    bool have_desc = false, have_table = false, have_data = false;
+    std::uint32_t bytes_per_packet = 0, frames_per_packet = 0;
+    std::uint64_t data_offset = 0, data_size = 0, packet_count = 0, valid_frames = 0;
+    std::vector<std::uint8_t> table;
+    for (std::uint64_t at = 8; at + 12 <= size;) {
+        std::array<std::uint8_t, 12> h{};
+        if (!read_exact(read, at, h)) break;
+        const auto type = be32(h.data());
+        const auto declared = static_cast<std::int64_t>(be64(h.data() + 4));
+        const std::uint64_t body = at + 12;
+        // Only the data chunk may run to the end of the file (-1).
+        const std::uint64_t length = declared < 0 ? size - body : std::min<std::uint64_t>(std::uint64_t(declared), size - body);
+        if (type == fourcc("desc") && length >= 32) {
+            const auto d = read_bytes(read, body, 32);
+            if (d.size() < 32) break;
+            t.sample_rate = std::bit_cast<double>(be64(d.data()));
+            t.codec = be32(d.data() + 8);
+            bytes_per_packet = be32(d.data() + 16);
+            frames_per_packet = be32(d.data() + 20);
+            t.channels = be32(d.data() + 24);
+            t.bits = be32(d.data() + 28);
+            const char name[5] = {char(d[8]), char(d[9]), char(d[10]), char(d[11]), 0};
+            t.codec_name = name;
+            have_desc = true;
+        } else if (type == fourcc("kuki")) {
+            t.config = read_bytes(read, body, std::min<std::uint64_t>(length, 1 << 20));
+        } else if (type == fourcc("pakt") && length >= 24) {
+            table = read_bytes(read, body, std::min<std::uint64_t>(length, 256ULL << 20));
+            if (table.size() < 24) break;
+            packet_count = be64(table.data());
+            valid_frames = be64(table.data() + 8);
+            t.priming = be32(table.data() + 16);
+            have_table = true;
+        } else if (type == fourcc("data") && length >= 4) {
+            data_offset = body + 4;   // after mEditCount
+            data_size = length - 4;
+            have_data = true;
+        }
+        if (declared < 0) break;
+        at = body + length;
+    }
+    if (!have_desc || !have_data || !(t.sample_rate > 0) || t.sample_rate > 4294967295.0 || !t.channels) { why = "a CAF file without a usable description or data"; return false; }
+    if (t.codec == fourcc("lpcm")) { why = "linear PCM CAF is not a packet stream"; return false; }
+    t.timescale = static_cast<std::uint32_t>(std::llround(t.sample_rate));
+    if (!t.timescale) t.timescale = 1;
+    // Packets: sizes and durations from the packet table where the description leaves them variable.
+    std::size_t pos = 24;
+    const auto varint = [&](std::uint64_t& value) {
+        value = 0;
+        for (int i = 0; i < 10 && pos < table.size(); ++i) {
+            const auto byte = table[pos++];
+            value = (value << 7) | (byte & 0x7f);
+            if (!(byte & 0x80)) return true;
+        }
+        return false;
+    };
+    if (!have_table) {
+        if (!bytes_per_packet || !frames_per_packet) { why = "a variable-size CAF stream without a packet table"; return false; }
+        packet_count = data_size / bytes_per_packet;
+    }
+    if (packet_count > maximum_samples) { why = "too many CAF packets"; return false; }
+    std::uint64_t offset = data_offset, time = 0;
+    t.samples.reserve(static_cast<std::size_t>(packet_count));
+    for (std::uint64_t i = 0; i < packet_count; ++i) {
+        std::uint64_t bytes = bytes_per_packet, frames = frames_per_packet;
+        if (!bytes && !varint(bytes)) { why = "a CAF packet table shorter than its packet count"; return false; }
+        if (!frames && !varint(frames)) { why = "a CAF packet table shorter than its packet count"; return false; }
+        if (offset + bytes > data_offset + data_size || frames > 0xffffffffULL) break;   // a truncated file: the packets that are there
+        Sample s;
+        s.offset = offset;
+        s.size = bytes;
+        s.duration = static_cast<std::uint32_t>(frames);
+        s.pts = s.dts = static_cast<std::int64_t>(time);
+        s.keyframe = true;
+        t.samples.push_back(s);
+        offset += bytes;
+        time += frames;
+    }
+    if (t.samples.empty()) { why = "a CAF file without packets"; return false; }
+    // The valid frames exclude the priming and the remainder; a table without them counts every frame.
+    t.duration = static_cast<std::int64_t>(have_table && valid_frames ? valid_frames : time);
+    if (t.priming >= time) t.priming = 0;
+    out.timescale = t.timescale;
+    out.duration = t.duration;
+    out.tracks.push_back(std::move(t));
+    return true;
+}
+
 // ---- MPEG audio -----------------------------------------------------------------------------------
 
 MpegFrame mpeg_frame(const std::uint8_t* p) {
@@ -1127,8 +1228,9 @@ bool parse(const ReadAt& read, std::uint64_t size, Movie& out, std::string& why)
     if (be32(head.data()) == 0x1A45DFA3) return parse_matroska(read, size, out, why);
     if (std::memcmp(head.data(), "OggS", 4) == 0) return parse_ogg(read, size, out, why);
     if (std::memcmp(head.data(), "fLaC", 4) == 0) return parse_flac(read, size, out, why);
+    if (std::memcmp(head.data(), "caff", 4) == 0) return parse_caf(read, size, out, why);
     if (std::memcmp(head.data(), "ID3", 3) == 0 || mpeg_frame(head.data()).bytes) return parse_mpeg_audio(read, size, out, why);
-    why = "not an MP4, QuickTime, Matroska, WebM, Ogg, FLAC or MP3 file";
+    why = "not an MP4, QuickTime, Matroska, WebM, Ogg, FLAC, CAF or MP3 file";
     return false;
 }
 

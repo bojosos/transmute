@@ -5,6 +5,9 @@
 // - Opus: a stereo signal encoded here by libopus, in Ogg and through an MP4 dOps
 //   configuration, against the input by signal-to-noise ratio.
 // - FLAC: signals encoded here by libFLAC, parsed as native FLAC streams, decoded bit-exactly.
+// - ALAC: signals of 16, 20, 24 and 32 bits in 1, 2 and 6 channels encoded by the ALAC encoder
+//   (media_codecs.hpp), decoded bit-exactly (32-bit to float precision), in CAF and M4A files
+//   built here; malformed cookies and packets are rejected.
 // - VP8 and VP9 (profiles 0, 1 and 2): libvpx's test vectors (IVF, and WebM through the
 //   Matroska parser) against their per-frame MD5s.
 // - AV1 (8 and 10 bits): libaom's test vectors against their per-frame MD5s.
@@ -19,6 +22,7 @@
 #include "opus.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -275,9 +279,213 @@ void flac_tests() {
     require(!d->decode(Bytes{0xff, 0xf8, 0xc9, 0x08, 0x00, 0x00, 0x00, 0x00}, scratch, why), "a broken FLAC frame is rejected");
 }
 
+// ---- ALAC -----------------------------------------------------------------------------------------
+
+Bytes box(const char* type, const Bytes& payload) {
+    Bytes out;
+    put(out, 8 + payload.size(), 4);
+    out.insert(out.end(), type, type + 4);
+    append(out, payload);
+    return out;
+}
+Bytes full(std::uint32_t flags, const Bytes& rest) { Bytes out; put(out, 0, 1); put(out, flags, 3); append(out, rest); return out; }
+
+// Sines (a frequency per channel) with noise, quantised to `bits` and left-justified in 32 bits,
+// with the extreme values at frames 5 and 6.
+std::vector<std::int32_t> alac_signal(std::uint32_t frames, std::uint32_t channels, std::uint32_t bits) {
+    std::vector<std::int32_t> out(std::size_t(frames) * channels);
+    std::uint32_t seed = 12345;
+    const double full_scale = std::ldexp(1.0, int(bits) - 1);
+    for (std::uint32_t f = 0; f < frames; ++f)
+        for (std::uint32_t c = 0; c < channels; ++c) {
+            seed = seed * 1664525u + 1013904223u;
+            const double noise = (double(seed >> 8) / double(1 << 24) - 0.5) * 0.1;
+            const double x = 0.7 * std::sin(2 * 3.14159265358979 * 220.0 * (c + 1) * f / 44100.0) + noise;
+            auto v = std::clamp<std::int64_t>(std::llround(x * full_scale), std::int64_t(-full_scale), std::int64_t(full_scale) - 1);
+            if (f == 5) v = std::int64_t(full_scale) - 1;
+            if (f == 6) v = -std::int64_t(full_scale);
+            out[std::size_t(f) * channels + c] = std::int32_t(std::uint32_t(std::uint64_t(v) << (32 - bits)));
+        }
+    return out;
+}
+
+struct AlacStream { std::vector<Bytes> packets; Bytes cookie; std::uint32_t frames{}; };
+
+AlacStream alac_encode(const std::vector<std::int32_t>& signal, std::uint32_t channels, std::uint32_t bits) {
+    std::string why;
+    auto encoder = codecs::make_audio_encoder(mc::fourcc("alac"), 44100, channels, bits, 0, why);
+    require(encoder && encoder->frames_per_packet == 4096 && encoder->bits == bits, "an ALAC encoder: " + why);
+    AlacStream s;
+    s.frames = std::uint32_t(signal.size() / channels);
+    for (std::size_t at = 0; at < signal.size(); at += std::size_t(4096) * channels) {
+        const auto n = std::min<std::size_t>(std::size_t(4096) * channels, signal.size() - at);
+        Bytes packet;
+        require(encoder->encode(std::span(signal).subspan(at, n), packet, why) && !packet.empty() && packet.size() <= encoder->max_packet_bytes,
+                "ALAC encodes: " + why);
+        s.packets.push_back(std::move(packet));
+    }
+    s.cookie = encoder->cookie();
+    return s;
+}
+
+std::uint32_t be32_at(const Bytes& b, std::size_t at) { return (std::uint32_t(b[at]) << 24) | (std::uint32_t(b[at + 1]) << 16) | (std::uint32_t(b[at + 2]) << 8) | b[at + 3]; }
+
+// A CAF file of the packets: 'desc', 'kuki', 'pakt' (BER sizes, the valid frames and priming) and 'data'.
+Bytes alac_caf(const AlacStream& s, std::uint32_t channels, std::uint32_t bits, std::uint32_t priming) {
+    Bytes file{'c', 'a', 'f', 'f', 0, 1, 0, 0};
+    const auto chunk = [&](const char* type, const Bytes& body) { file.insert(file.end(), type, type + 4); put(file, body.size(), 8); append(file, body); };
+    Bytes desc;
+    put(desc, std::bit_cast<std::uint64_t>(44100.0), 8);
+    desc.insert(desc.end(), {'a', 'l', 'a', 'c'});
+    put(desc, bits == 16 ? 1 : bits == 20 ? 2 : bits == 24 ? 3 : 4, 4); put(desc, 0, 4); put(desc, 4096, 4); put(desc, channels, 4); put(desc, 0, 4);
+    chunk("desc", desc);
+    chunk("kuki", s.cookie);
+    Bytes pakt;
+    const std::uint32_t total = std::uint32_t(s.packets.size()) * 4096;
+    put(pakt, s.packets.size(), 8); put(pakt, s.frames - priming, 8); put(pakt, priming, 4); put(pakt, total - s.frames, 4);
+    for (const auto& p : s.packets) {
+        Bytes ber{static_cast<std::uint8_t>(p.size() & 0x7f)};
+        for (auto v = p.size() >> 7; v; v >>= 7) ber.insert(ber.begin(), static_cast<std::uint8_t>(0x80 | (v & 0x7f)));
+        append(pakt, ber);
+    }
+    chunk("pakt", pakt);
+    Bytes data(4, 0);   // mEditCount
+    for (const auto& p : s.packets) append(data, p);
+    chunk("data", data);
+    return file;
+}
+
+// An M4A file of the packets: an 'alac' sample entry with the cookie in its 'alac' box.
+Bytes alac_m4a(const AlacStream& s, std::uint32_t channels, std::uint32_t bits) {
+    Bytes brand{'M', '4', 'A', ' '}; put(brand, 0, 4);
+    Bytes file = box("ftyp", brand);
+    Bytes data;
+    for (const auto& p : s.packets) append(data, p);
+    const auto data_offset = std::uint32_t(file.size() + 8);
+    append(file, box("mdat", data));
+    Bytes entry(6, 0); put(entry, 1, 2);
+    append(entry, Bytes(8, 0)); put(entry, channels, 2); put(entry, bits, 2); put(entry, 0, 4); put(entry, 44100ULL << 16, 4);
+    append(entry, box("alac", full(0, s.cookie)));
+    Bytes stsd; put(stsd, 1, 4); append(stsd, box("alac", entry));
+    const auto n = std::uint32_t(s.packets.size());
+    const std::uint32_t last = s.frames - (n - 1) * 4096;
+    Bytes stts; put(stts, 2, 4); put(stts, n - 1, 4); put(stts, 4096, 4); put(stts, 1, 4); put(stts, last, 4);
+    Bytes stsc; put(stsc, 1, 4); put(stsc, 1, 4); put(stsc, n, 4); put(stsc, 1, 4);
+    Bytes stsz; put(stsz, 0, 4); put(stsz, n, 4); for (const auto& p : s.packets) put(stsz, p.size(), 4);
+    Bytes stco; put(stco, 1, 4); put(stco, data_offset, 4);
+    Bytes stbl;
+    append(stbl, box("stsd", full(0, stsd))); append(stbl, box("stts", full(0, stts))); append(stbl, box("stsc", full(0, stsc)));
+    append(stbl, box("stsz", full(0, stsz))); append(stbl, box("stco", full(0, stco)));
+    Bytes tkhd(8, 0); put(tkhd, 1, 4); append(tkhd, Bytes(68, 0));
+    Bytes mdhd(8, 0); put(mdhd, 44100, 4); put(mdhd, s.frames, 4); put(mdhd, 0, 4);
+    Bytes hdlr(4, 0); hdlr.insert(hdlr.end(), {'s', 'o', 'u', 'n'}); append(hdlr, Bytes(13, 0));
+    Bytes mdia = box("mdhd", full(0, mdhd));
+    append(mdia, box("hdlr", full(0, hdlr)));
+    append(mdia, box("minf", box("stbl", stbl)));
+    Bytes trak = box("tkhd", full(3, tkhd));
+    append(trak, box("mdia", mdia));
+    Bytes mvhd(8, 0); put(mvhd, 44100, 4); put(mvhd, s.frames, 4); append(mvhd, Bytes(80, 0));
+    Bytes moov = box("mvhd", full(0, mvhd));
+    append(moov, box("trak", trak));
+    append(file, box("moov", moov));
+    return file;
+}
+
+void alac_tests() {
+    std::string why;
+    const auto alac = mc::fourcc("alac");
+    for (const std::uint32_t bits : {16u, 20u, 24u, 32u})
+        for (const std::uint32_t channels : {1u, 2u, 6u}) {
+            const std::string what = "ALAC " + std::to_string(bits) + "-bit " + std::to_string(channels) + " ch";
+            const std::uint32_t frames = 4096 * 2 + 1000;
+            const auto signal = alac_signal(frames, channels, bits);
+            const auto s = alac_encode(signal, channels, bits);
+            // The cookie: the ALACSpecificConfig, then (above two channels) the big-endian layout.
+            require(s.cookie.size() == (channels > 2 ? 48u : 24u) && be32_at(s.cookie, 0) == 4096 && s.cookie[5] == bits && s.cookie[9] == channels &&
+                    be32_at(s.cookie, 20) == 44100, what + ": cookie");
+            std::size_t largest = 0;
+            for (const auto& p : s.packets) largest = std::max(largest, p.size());
+            require(be32_at(s.cookie, 12) == largest && be32_at(s.cookie, 16) > 0, what + ": maxFrameBytes and avgBitRate");
+            if (channels == 6) require(be32_at(s.cookie, 36) == ((124u << 16) | 6), what + ": the MPEG 5.1 (D) layout tag, big endian");
+            auto decoder = codecs::make_audio_decoder(alac, 0, 0, s.cookie, why);
+            require(decoder && decoder->rate == 44100 && decoder->channels == channels && decoder->bits == bits && decoder->max_frames == 4096,
+                    what + ": a decoder: " + why);
+            std::vector<float> decoded;
+            for (const auto& p : s.packets) require(decoder->decode(p, decoded, why), what + ": decodes: " + why);
+            require(decoded.size() == signal.size(), what + ": " + std::to_string(decoded.size() / channels) + " frames");
+            // Up to 24 bits a float holds the sample exactly; a 32-bit sample to float precision.
+            const double tolerance = bits == 32 ? 256.0 : 0.0;
+            for (std::size_t i = 0; i < signal.size(); ++i)
+                require(std::fabs(double(decoded[i]) * 2147483648.0 - double(signal[i])) <= tolerance,
+                        what + ": sample " + std::to_string(i) + " is " + std::to_string(double(decoded[i]) * 2147483648.0) + ", expected " + std::to_string(signal[i]));
+            if (bits != 16 || channels != 2) continue;
+
+            // The cookie as an MP4 'alac' box payload (version and flags first), and wrapped in the
+            // 'frma' and 'alac' atoms of older cookies.
+            Bytes boxed(4, 0);
+            append(boxed, s.cookie);
+            Bytes wrapped{0, 0, 0, 12, 'f', 'r', 'm', 'a', 'a', 'l', 'a', 'c', 0, 0, 0, 36, 'a', 'l', 'a', 'c', 0, 0, 0, 0};
+            append(wrapped, s.cookie);
+            for (const auto* config : {&boxed, &wrapped}) {
+                auto other = codecs::make_audio_decoder(alac, 44100, 2, *config, why);
+                std::vector<float> again;
+                require(other && other->decode(s.packets[0], again, why) &&
+                        std::equal(again.begin(), again.end(), decoded.begin()), "ALAC decodes with a wrapped cookie: " + why);
+            }
+
+            // In CAF (with priming) and M4A, through the stream.
+            for (const std::uint32_t priming : {0u, 100u}) {
+                const auto caf = alac_caf(s, channels, bits, priming);
+                const std::vector<float> reference(decoded.begin() + std::ptrdiff_t(priming) * channels, decoded.end());
+                stream_checks("ALAC in CAF, priming " + std::to_string(priming), caf, reference, channels, 0.0f);
+                std::int32_t status = 0;
+                auto stream = alchemy::gui::completion_kit::media::audio_stream::Stream::open(reader(caf), caf.size(), status, why);
+                const auto asbd = stream->asbd();
+                std::uint32_t format{}, flags{}, per_packet{};
+                std::memcpy(&format, asbd.data() + 8, 4); std::memcpy(&flags, asbd.data() + 12, 4); std::memcpy(&per_packet, asbd.data() + 20, 4);
+                require(stream->file_type() == mc::fourcc("caff") && format == alac && flags == 1 && per_packet == 4096 && stream->magic_cookie() == s.cookie &&
+                        stream->priming() == priming && stream->packet_count() == 3, "ALAC in CAF: the packets' description");
+            }
+            const auto m4a = alac_m4a(s, channels, bits);
+            stream_checks("ALAC in M4A", m4a, decoded, channels, 0.0f);
+            std::int32_t status = 0;
+            auto stream = alchemy::gui::completion_kit::media::audio_stream::Stream::open(reader(m4a), m4a.size(), status, why);
+            require(stream->file_type() == mc::fourcc("m4af") && stream->magic_cookie() == s.cookie, "ALAC in M4A: the cookie without the box's version");
+        }
+
+    // Cookies the library cannot use: no decoder.
+    const auto good = alac_encode(alac_signal(4096, 1, 16), 1, 16);
+    const auto with = [&](std::size_t at, std::uint8_t value) { Bytes c = good.cookie; c[at] = value; return c; };
+    for (const auto& bad : {with(0, 0xff), with(2, 0), with(4, 1), with(5, 18), with(9, 0), with(9, 9), Bytes(good.cookie.begin(), good.cookie.begin() + 20)})
+        require(!codecs::make_audio_decoder(alac, 44100, 1, bad, why), "a bad ALAC cookie is refused");
+    // A partial frame longer than the frame length, a truncated packet and random bytes are rejected
+    // without decoding past the buffers.
+    auto decoder = codecs::make_audio_decoder(alac, 44100, 1, good.cookie, why);
+    std::vector<float> out;
+    // SCE tag 0, instance 0, 12 unused bits, partial frame and escape flags, then 2^20 samples.
+    Bytes partial{0x00, 0x00, 0x12, 0x00, 0x20, 0x00, 0x00};
+    partial.resize(64, 0);
+    require(!decoder->decode(partial, out, why) && out.empty(), "an oversized partial frame is rejected");
+    Bytes truncated(good.packets[0].begin(), good.packets[0].begin() + std::ptrdiff_t(good.packets[0].size() / 2));
+    static_cast<void>(decoder->decode(truncated, out, why));
+    std::uint32_t seed = 7;
+    for (int i = 0; i < 3000; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        Bytes junk(1 + (seed >> 8) % 3000);
+        for (auto& b : junk) { seed = seed * 1664525u + 1013904223u; b = std::uint8_t(seed >> 24); }
+        out.clear();
+        if (decoder->decode(junk, out, why)) require(out.size() <= 4096, "a junk packet decodes to at most a frame length");
+    }
+    require(decoder->decode(good.packets[0], out, why), "the decoder still decodes after rejected packets");
+    // Encoder limits.
+    require(!codecs::make_audio_encoder(alac, 44100, 9, 16, 0, why) && !codecs::make_audio_encoder(alac, 44100, 2, 18, 0, why) &&
+            !codecs::make_audio_encoder(alac, 44100.5, 2, 16, 0, why) && !codecs::make_audio_encoder(alac, 44100, 2, 16, 20000, why) &&
+            !codecs::make_audio_encoder(mc::fourcc("mp4a"), 44100, 2, 16, 0, why), "encoder limits");
+}
+
 void unsupported_tests() {
     std::string why;
-    for (const char* code : {"mp4a", "alac", "avc1"}) {
+    for (const char* code : {"mp4a", "avc1"}) {
         const char c[5] = {code[0], code[1], code[2], code[3], 0};
         require(!codecs::audio_decoder_available(mc::fourcc(c)) && !codecs::make_audio_decoder(mc::fourcc(c), 44100, 2, {}, why) && !why.empty(),
                 std::string(code) + " has no decoder");
@@ -455,6 +663,7 @@ int main() {
         mpeg_tests();
         opus_tests();
         flac_tests();
+        alac_tests();
         vpx_tests();
         av1_tests();
         unsupported_tests();

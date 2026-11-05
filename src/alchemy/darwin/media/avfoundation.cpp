@@ -22,7 +22,7 @@
 // are av_capture.cpp's.
 //
 // - AVURLAsset/AVAsset: file URLs whose audio Alchemy can read (linear PCM
-//   WAVE, AIFF/AIFC, CAF: audio_file_core.hpp; MP3, FLAC, Ogg Opus and MP4
+//   WAVE, AIFF/AIFC, CAF: audio_file_core.hpp; MP3, FLAC, Ogg Opus, ALAC and MP4
 //   or Matroska audio in those codecs, decoded: audio_file.hpp) have one
 //   audio track with its duration, time range and CMAudioFormatDescription.
 //   Container files (MP4, MOV, Matroska/WebM, Ogg, MP3, FLAC:
@@ -382,7 +382,7 @@ struct Av {
         }
         return *s;
     }
-    // An AudioStreamBasicDescription of a stored audio track Alchemy cannot decode (AAC, ALAC, ...).
+    // An AudioStreamBasicDescription of a stored audio track Alchemy cannot decode (AAC, ...).
     static std::vector<std::uint8_t> compressed_asbd(const container::Track& t) {
         std::vector<std::uint8_t> out(40, 0);
         const double rate = t.sample_rate;

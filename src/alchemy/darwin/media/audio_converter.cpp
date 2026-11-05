@@ -26,12 +26,13 @@
 // error, whose status it returns once nothing more comes out). AudioConverterConvertBuffer and
 // AudioConverterConvertComplexBuffer convert between equal sample rates
 // (kAudioConverterErr_InvalidInputSize otherwise, as the API documents for rate changes).
-// Decoding: MPEG audio ('.mp1', '.mp2', '.mp3'), Opus and FLAC input converts to any of those PCM
-// outputs (media_codecs.hpp). The input procedure hands over packets, with their descriptions
-// (without them, one packet, or MPEG frames found by their headers); the magic cookie
-// (kAudioConverterDecompressionMagicCookie) configures Opus and FLAC, and a FLAC stream without
-// one is described by the input format. Other compressed formats (AAC, ALAC, ...) and every
-// encoder answer kAudioConverterErr_FormatNotSupported from AudioConverterNew.
+// Decoding: MPEG audio ('.mp1', '.mp2', '.mp3'), Opus, FLAC and Apple Lossless input converts to
+// any of those PCM outputs (media_codecs.hpp). The input procedure hands over packets, with their
+// descriptions (without them, one packet, or MPEG frames found by their headers); the magic cookie
+// (kAudioConverterDecompressionMagicCookie) configures Opus, FLAC and ALAC, and a FLAC or ALAC
+// stream without one is described by the input format (ALAC with the codec's default coder
+// parameters). Other compressed formats (AAC, ...) and every encoder answer
+// kAudioConverterErr_FormatNotSupported from AudioConverterNew.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -73,13 +74,24 @@ struct Converter {
 
 bool decodable(std::uint32_t format_id) {
     return format_id == four(".mp1") || format_id == four(".mp2") || format_id == four(".mp3") || format_id == four("opus") ||
-           format_id == four("flac");
+           format_id == four("flac") || format_id == four("alac");
 }
 
-// The decoder's configuration: the cookie, or for FLAC without one a STREAMINFO from the format.
+// The decoder's configuration: the cookie, or for FLAC and ALAC without one a STREAMINFO or an
+// ALACSpecificConfig from the format.
 std::vector<std::uint8_t> decoder_config(const Converter& c) {
-    if (!c.cookie.empty() || c.codec != four("flac")) return c.cookie;
+    if (!c.cookie.empty() || (c.codec != four("flac") && c.codec != four("alac"))) return c.cookie;
     const std::uint32_t bits = c.codec_flags == 2 ? 20 : c.codec_flags == 3 ? 24 : c.codec_flags == 4 ? 32 : 16;
+    if (c.codec == four("alac")) {
+        // frameLength, compatibleVersion 0, bitDepth, pb 40, mb 10, kb 14 (the encoder's defaults),
+        // numChannels, maxRun 255, maxFrameBytes and avgBitRate 0 (unknown), sampleRate.
+        const std::uint32_t frames = c.codec_frames_per_packet ? c.codec_frames_per_packet : 4096;
+        const auto rate = static_cast<std::uint32_t>(c.codec_rate);
+        return {static_cast<std::uint8_t>(frames >> 24), static_cast<std::uint8_t>(frames >> 16), static_cast<std::uint8_t>(frames >> 8),
+                static_cast<std::uint8_t>(frames), 0, static_cast<std::uint8_t>(bits), 40, 10, 14, static_cast<std::uint8_t>(c.codec_channels), 0, 255,
+                0, 0, 0, 0, 0, 0, 0, 0, static_cast<std::uint8_t>(rate >> 24), static_cast<std::uint8_t>(rate >> 16), static_cast<std::uint8_t>(rate >> 8),
+                static_cast<std::uint8_t>(rate)};
+    }
     const std::uint32_t block = c.codec_frames_per_packet ? std::min<std::uint32_t>(c.codec_frames_per_packet, 65535) : 4096;
     const auto rate = static_cast<std::uint32_t>(c.codec_rate);
     std::vector<std::uint8_t> info{0, 0, 0, 34, 0, 16, static_cast<std::uint8_t>(block >> 8), static_cast<std::uint8_t>(block), 0, 0, 0, 0, 0, 0};
@@ -373,9 +385,9 @@ std::int32_t Converters::get_property(Converter& c, std::uint32_t id, std::vecto
     case four("xips"):
         if (c.codec) {
             // The largest packet: an MPEG frame (free format at 640 kb/s), six Opus frames, or a
-            // FLAC block stored verbatim.
-            const auto block = c.codec_frames_per_packet ? c.codec_frames_per_packet : 65535U;
-            u32(c.codec == four("opus") ? 6 * 1275 + 7 : c.codec == four("flac") ? block * c.codec_channels * 4 + 64 : 2881);
+            // FLAC or ALAC block stored verbatim.
+            const auto block = c.codec_frames_per_packet ? c.codec_frames_per_packet : c.codec == four("alac") ? 4096U : 65535U;
+            u32(c.codec == four("opus") ? 6 * 1275 + 7 : c.codec == four("flac") || c.codec == four("alac") ? block * c.codec_channels * 4 + 64 : 2881);
             return 0;
         }
         u32(c.in.frame_bytes() * (c.in.non_interleaved ? c.in.channels : 1));

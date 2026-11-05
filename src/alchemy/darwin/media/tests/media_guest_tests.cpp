@@ -13,6 +13,7 @@
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/host/crypto.hpp"
 #include "alchemy/darwin/media/media_container.hpp"
+#include "alchemy/darwin/media/media_codecs.hpp"
 #include "alchemy/host/speech.hpp"
 
 #include <algorithm>
@@ -2580,6 +2581,164 @@ void compressed_audio(Fixture& f) {
     std::filesystem::remove_all(directory, ignored);
 }
 
+// Apple Lossless files (stereo 16-bit, encoded here by the ALAC encoder, in CAF and M4A) through AudioFile,
+// ExtAudioFile, AudioConverter, AVAudioFile and AVAssetReader, compared sample for sample.
+void alac_files(Fixture& f) {
+    namespace codecs = alchemy::gui::completion_kit::media::codecs;
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_alac";
+    std::filesystem::create_directories(directory);
+    constexpr std::uint32_t frames = 4096 * 2 + 1000, channels = 2;
+    std::vector<std::int32_t> signal(std::size_t(frames) * channels);
+    for (std::uint32_t i = 0; i < frames; ++i)
+        for (std::uint32_t c = 0; c < channels; ++c)
+            signal[std::size_t(i) * channels + c] = std::int32_t(std::lround(20000.0 * std::sin(0.01 * (c + 1) * i))) << 16;
+    std::string why;
+    auto encoder = codecs::make_audio_encoder(alchemy::gui::completion_kit::media::container::fourcc("alac"), 44100, channels, 16, 0, why);
+    require(encoder != nullptr, "an ALAC encoder: " + why);
+    std::vector<std::vector<std::uint8_t>> packets;
+    for (std::size_t at = 0; at < signal.size(); at += 4096 * channels) {
+        std::vector<std::uint8_t> packet;
+        require(encoder->encode(std::span(signal).subspan(at, std::min<std::size_t>(4096 * channels, signal.size() - at)), packet, why), "encodes: " + why);
+        packets.push_back(std::move(packet));
+    }
+    const auto cookie = encoder->cookie();
+    const auto be = [](std::vector<std::uint8_t>& out, std::uint64_t value, int bytes) { for (int i = bytes - 1; i >= 0; --i) out.push_back(std::uint8_t(value >> (8 * i))); };
+    // CAF: desc, kuki, pakt (BER sizes), data.
+    std::vector<std::uint8_t> caf{'c', 'a', 'f', 'f', 0, 1, 0, 0};
+    const auto chunk = [&](const char* type, const std::vector<std::uint8_t>& body) { caf.insert(caf.end(), type, type + 4); be(caf, body.size(), 8); caf.insert(caf.end(), body.begin(), body.end()); };
+    std::vector<std::uint8_t> desc;
+    be(desc, std::bit_cast<std::uint64_t>(44100.0), 8); desc.insert(desc.end(), {'a', 'l', 'a', 'c'}); be(desc, 1, 4); be(desc, 0, 4); be(desc, 4096, 4); be(desc, channels, 4); be(desc, 0, 4);
+    chunk("desc", desc);
+    chunk("kuki", cookie);
+    std::vector<std::uint8_t> pakt, data(4, 0);
+    be(pakt, packets.size(), 8); be(pakt, frames, 8); be(pakt, 0, 4); be(pakt, packets.size() * 4096 - frames, 4);
+    for (const auto& p : packets) {
+        std::vector<std::uint8_t> ber{std::uint8_t(p.size() & 0x7f)};
+        for (auto v = p.size() >> 7; v; v >>= 7) ber.insert(ber.begin(), std::uint8_t(0x80 | (v & 0x7f)));
+        pakt.insert(pakt.end(), ber.begin(), ber.end());
+        data.insert(data.end(), p.begin(), p.end());
+    }
+    chunk("pakt", pakt);
+    chunk("data", data);
+    const auto caf_path = directory / "tone.caf";
+    std::ofstream(caf_path, std::ios::binary).write(reinterpret_cast<const char*>(caf.data()), std::streamsize(caf.size()));
+    const auto expected = [&](std::size_t sample) { return float(signal[sample] >> 16) / 32768.0f; };
+
+    // AudioFile: the packets as the file holds them.
+    const auto url = f.cf.file_url(alchemy::guest_path_string(caf_path), false);
+    const auto out = f.block(8), size = f.block(4), value = f.block(64);
+    require(f.status(at, "_AudioFileOpenURL", {url, 1, 0, out}) == 0, "AudioFileOpenURL on an ALAC CAF");
+    const auto file = f.engine.read64(out);
+    f.engine.write32(size, 4);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x66666d74, size, value}) == 0 && f.engine.read32(value) == 0x63616666, "file type 'caff'");
+    f.engine.write32(size, 40);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x64666d74, size, value}) == 0 && f.engine.read32(value + 8) == 0x616c6163 &&
+            f.engine.read32(value + 12) == 1 && f.engine.read32(value + 20) == 4096 && f.engine.read32(value + 28) == channels, "data format 'alac', 16-bit source");
+    f.engine.write32(size, 64);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x6d676963, size, value}) == 0 && f.engine.read32(size) == cookie.size() &&
+            f.engine.read32(value) == 0x00100000, "the magic cookie");   // frameLength 4096, big endian
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x70636e74, size, value}) == 0 && f.engine.read64(value) == packets.size(), "three packets");
+    f.engine.write32(size, 16);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x706e666f, size, value}) == 0 && f.engine.read64(value) == frames && f.engine.read32(value + 8) == 0 &&
+            f.engine.read32(value + 12) == packets.size() * 4096 - frames, "packet table: valid frames and remainder");
+    const auto room = f.block(4), count = f.block(4), descriptions = f.block(16 * 3), packet_bytes = f.block(64 * 1024);
+    f.engine.write32(room, 64 * 1024);
+    f.engine.write32(count, 3);
+    require(f.status(at, "_AudioFileReadPacketData", {file, 0, room, descriptions, 0, count, packet_bytes}) == 0 && f.engine.read32(count) == 3 &&
+            f.engine.read32(descriptions + 12) == packets[0].size() && f.engine.read32(descriptions + 16 + 12) == packets[1].size(), "ReadPacketData");
+
+    // ExtAudioFile: float32 interleaved, exactly the source samples.
+    require(f.status(at, "_ExtAudioFileWrapAudioFileID", {file, 0, out}) == 0, "ExtAudioFileWrapAudioFileID");
+    const auto ext = f.engine.read64(out);
+    const auto client = f.block(40);
+    f.engine.write64(client, std::bit_cast<std::uint64_t>(44100.0));
+    f.engine.write32(client + 8, 0x6c70636d); f.engine.write32(client + 12, 1 | 8);
+    f.engine.write32(client + 16, 4 * channels); f.engine.write32(client + 20, 1); f.engine.write32(client + 24, 4 * channels);
+    f.engine.write32(client + 28, channels); f.engine.write32(client + 32, 32);
+    require(f.status(at, "_ExtAudioFileSetProperty", {ext, 0x63666d74, 40, client}) == 0, "float client format");
+    const auto samples = f.block(4ULL * frames * channels), list = f.block(24), got = f.block(4);
+    f.engine.write32(list, 1); f.engine.write32(list + 8, channels); f.engine.write32(list + 12, 4 * frames * channels); f.engine.write64(list + 16, samples);
+    f.engine.write32(got, frames + 100);
+    require(f.status(at, "_ExtAudioFileRead", {ext, got, list}) == 0 && f.engine.read32(got) == frames, "ExtAudioFileRead decodes every frame");
+    const auto exact = [&](Address at_samples, std::size_t n, std::size_t from) {
+        for (std::size_t i = 0; i < n; ++i)
+            if (std::bit_cast<float>(f.engine.read32(at_samples + 4 * i)) != expected(from + i)) return false;
+        return true;
+    };
+    require(exact(samples, std::size_t(frames) * channels, 0), "ExtAudioFile: the source samples");
+    require(f.status(at, "_ExtAudioFileSeek", {ext, 5000}) == 0, "seek");
+    f.engine.write32(got, 300);
+    require(f.status(at, "_ExtAudioFileRead", {ext, got, list}) == 0 && f.engine.read32(got) == 300 && exact(samples, 300 * channels, 5000 * channels), "a read after a seek");
+    require(f.status(at, "_ExtAudioFileDispose", {ext}) == 0, "ExtAudioFileDispose");
+
+    // AudioConverter: the packets in with the cookie set, float out.
+    const auto alac_format = f.block(40), pcm = f.block(40), converter_out = f.block(8);
+    f.engine.write64(alac_format, std::bit_cast<std::uint64_t>(44100.0));
+    f.engine.write32(alac_format + 8, 0x616c6163); f.engine.write32(alac_format + 12, 1); f.engine.write32(alac_format + 20, 4096); f.engine.write32(alac_format + 28, channels);
+    for (std::uint32_t i = 0; i < 40; i += 4) f.engine.write32(pcm + i, f.engine.read32(client + i));
+    require(f.status(at, "_AudioConverterNew", {alac_format, pcm, converter_out}) == 0, "AudioConverterNew from ALAC");
+    const auto converter = f.engine.read64(converter_out);
+    const auto cookie_at = f.block(cookie.size());
+    f.memory().write_bytes(cookie_at, cookie);
+    require(f.status(at, "_AudioConverterSetProperty", {converter, 0x646d6763, static_cast<std::uint64_t>(cookie.size()), cookie_at}) == 0, "the decompression cookie");
+    static Address alac_packets{}, alac_descriptions{}, alac_one{};
+    static std::uint32_t alac_next{};
+    alac_packets = packet_bytes;
+    alac_descriptions = descriptions;
+    alac_one = f.block(16);
+    alac_next = 0;
+    const auto input = f.process.install_function("_alchemy_test_alac_input", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        if (alac_next >= 3) { m.write32(s.x[1], 0); s.x[0] = 0; return; }
+        const auto entry = alac_descriptions + 16ULL * alac_next++;
+        const auto bytes = m.read32(entry + 12);
+        m.write32(s.x[1], 1);
+        m.write32(s.x[2] + 8 + 4, bytes);
+        m.write64(s.x[2] + 8 + 8, alac_packets + m.read64(entry));
+        m.write64(alac_one, 0); m.write32(alac_one + 8, 0); m.write32(alac_one + 12, bytes);
+        if (s.x[3]) m.write64(s.x[3], alac_one);
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    f.engine.write32(got, frames);
+    f.engine.write32(list + 12, 4 * frames * channels);
+    require(f.status(at, "_AudioConverterFillComplexBuffer", {converter, input, 0, got, list, 0}) == 0 && f.engine.read32(got) >= frames &&
+            exact(samples, std::size_t(frames) * channels, 0), "AudioConverter decodes ALAC packets: " + std::to_string(f.engine.read32(got)));
+    require(f.status(at, "_AudioConverterDispose", {converter}) == 0 && f.status(at, "_AudioFileClose", {file}) == 0, "dispose and close");
+
+    // AVAudioFile and AVAssetReader on the same file.
+    const auto error = f.block(8);
+    const auto av_file = f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForReading:error:", {url, error});
+    require(av_file && static_cast<std::uint32_t>(f.send(av_file, "length")) == frames, "AVAudioFile reads ALAC lengths");
+    const auto processing = f.send(av_file, "processingFormat");
+    const auto buffer = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {processing, 1000});
+    require((f.send(av_file, "readIntoBuffer:error:", {buffer, error}) & 0xff) == 1 && f.send(buffer, "frameLength") == 1000, "AVAudioFile reads 1000 frames");
+    const auto planes = f.send(buffer, "floatChannelData");
+    const auto right = f.engine.read64(planes + 8);
+    require(std::bit_cast<float>(f.engine.read32(right + 4 * 777)) == expected(777 * channels + 1), "AVAudioFile: the right channel");
+    f.send(av_file, "release");
+    const auto asset = f.send(f.cls("AVURLAsset"), "URLAssetWithURL:options:", {url, 0});
+    const auto tracks = f.cf.array_values(f.send(asset, "tracksWithMediaType:", {f.cf.string("soun")}));
+    require(tracks.size() == 1 && (f.send(asset, "isReadable") & 0xff) == 1, "AVURLAsset: one readable ALAC track");
+    const auto reader = f.send(f.cls("AVAssetReader"), "assetReaderWithAsset:error:", {asset, error});
+    const auto output = f.send(f.cls("AVAssetReaderAudioMixOutput"), "assetReaderAudioMixOutputWithAudioTracks:audioSettings:", {f.cf.array(std::vector<Address>{tracks[0]}), 0});
+    static_cast<void>(f.send(reader, "addOutput:", {output}));
+    require((f.send(reader, "startReading") & 0xff) == 1, "AVAssetReader starts");
+    std::size_t read_frames = 0;
+    bool same = true;
+    while (const auto sample = f.send(output, "copyNextSampleBuffer")) {
+        const auto block_list = f.block(64), retained = f.block(8);
+        require(f.status(cm, "_CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer", {sample, 0, block_list, 64, 0, 0, 0, retained}) == 0, "buffer list");
+        const auto bytes = f.engine.read32(block_list + 12);
+        same = same && exact(f.engine.read64(block_list + 16), bytes / 4, read_frames * channels);
+        read_frames += bytes / 4 / channels;
+        static_cast<void>(f.call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFRelease", {f.engine.read64(retained)}));
+        static_cast<void>(f.call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFRelease", {sample}));
+    }
+    require(read_frames == frames && same, "AVAssetReader: every frame, exactly: " + std::to_string(read_frames));
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 // AudioFileStream: minimp3's MP3 vector fed in pieces gives the packets AudioFile reads from the file; a seek
 // to a parsed packet is exact; a WAVE stream gives its frames without descriptions.
 void audio_file_stream(Fixture& f) {
@@ -3544,6 +3703,7 @@ int main() {
         {"audio_files", audio_files},
         {"audio_file_writing", audio_file_writing},
         {"compressed_audio", compressed_audio},
+        {"alac_files", alac_files},
         {"audio_file_stream", audio_file_stream},
         {"video_toolbox", video_toolbox},
         {"av_video", av_video},

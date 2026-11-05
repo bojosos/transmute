@@ -5,7 +5,7 @@
 // through the guest's libSystem, so paths resolve in the root.
 //
 // Linear PCM files (audio_file_core.hpp) are read as they are. Compressed files a
-// decoder exists for (audio_stream.hpp: MP3, FLAC, Ogg Opus, and MP4 or Matroska
+// decoder exists for (audio_stream.hpp: MP3, FLAC, Ogg Opus, ALAC in CAF, and MP4 or Matroska
 // audio in those codecs) carry their stream, and their container describes the
 // decoded audio: 32-bit float, the decoder's rate and channels, data_bytes for the
 // decoded length.

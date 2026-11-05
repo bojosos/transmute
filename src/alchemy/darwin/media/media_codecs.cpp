@@ -6,12 +6,16 @@
 #include "minimp3.h"
 #include "opus_multistream.h"
 #include "FLAC/stream_decoder.h"
+#include "ALACBitUtilities.h"
+#include "ALACDecoder.h"
+#include "ALACEncoder.h"
 #include "vpx/vp8dx.h"
 #include "vpx/vpx_decoder.h"
 #include "dav1d/dav1d.h"
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <deque>
 
@@ -235,6 +239,164 @@ private:
     std::vector<float>* out_{};
     bool failed_{};
     std::string failure_;
+};
+
+// ---- Apple Lossless (Apple's open-source ALAC codec) ----------------------------
+
+std::uint32_t alac_be32(const std::uint8_t* p) { return (std::uint32_t(p[0]) << 24) | (std::uint32_t(p[1]) << 16) | (std::uint32_t(p[2]) << 8) | p[3]; }
+
+bool alac_bits_supported(std::uint32_t bits) { return bits == 16 || bits == 20 || bits == 24 || bits == 32; }
+
+// An ALACSpecificConfig the library can use: frameLength 1-16384, compatible version 0, a bit
+// depth it decodes, 1-8 channels and an entropy-coder limit (kb) a shift can take.
+bool alac_config_valid(std::span<const std::uint8_t> c) {
+    if (c.size() < 24) return false;
+    const auto frame_length = alac_be32(c.data());
+    return frame_length >= 1 && frame_length <= 16384 && c[4] == 0 && alac_bits_supported(c[5]) && c[8] <= 31 && c[9] >= 1 && c[9] <= 8;
+}
+
+class AlacDecoder final : public AudioDecoder {
+public:
+    bool open(std::span<const std::uint8_t> config, double container_rate, std::string& why) {
+        // Older magic cookies wrap the config in 'frma' and 'alac' atoms; an MP4 'alac' box payload
+        // starts with its version and flags.
+        const auto atom = [&](const char* type) { return config.size() >= 12 && std::memcmp(config.data() + 4, type, 4) == 0; };
+        if (atom("frma")) config = config.subspan(12);
+        if (atom("alac")) config = config.subspan(12);
+        if (!alac_config_valid(config) && config.size() >= 28 && alac_be32(config.data()) == 0 && alac_config_valid(config.subspan(4)))
+            config = config.subspan(4);
+        if (!alac_config_valid(config)) { why = "no usable ALACSpecificConfig in the configuration"; return false; }
+        config_.assign(config.begin(), config.begin() + 24);
+        frame_length_ = alac_be32(config_.data());
+        bits = config_[5];
+        channels = config_[9];
+        rate = double(alac_be32(config_.data() + 20));
+        if (rate <= 0) rate = container_rate;
+        max_frames = frame_length_;
+        if (decoder_.Init(config_.data(), std::uint32_t(config_.size())) != 0) { why = "the ALAC decoder rejected its configuration"; return false; }
+        samples_.resize(std::size_t(frame_length_) * channels * 4);
+        return true;
+    }
+
+    bool decode(std::span<const std::uint8_t> packet, std::vector<float>& out, std::string& why) override {
+        // The bit reader does not stop at the packet's end: it reads from a copy followed by more
+        // zeros than one packet's elements can consume (frame length <= 16384 samples of <= 33 bits,
+        // two channels per element).
+        constexpr std::size_t pad = 256 * 1024;
+        input_.assign(packet.begin(), packet.end());
+        input_.resize(packet.size() + pad, 0);
+        BitBuffer bits_in{};
+        BitBufferInit(&bits_in, input_.data(), std::uint32_t(packet.size()));
+        std::uint32_t frames = 0;
+        if (packet.empty() || decoder_.Decode(&bits_in, samples_.data(), frame_length_, channels, &frames) != 0 || frames > frame_length_) {
+            why = "the ALAC decoder rejected the packet";
+            return false;
+        }
+        const std::size_t base = out.size(), count = std::size_t(frames) * channels;
+        out.resize(base + count);
+        const std::uint8_t* s = samples_.data();
+        for (std::size_t i = 0; i < count; ++i) {
+            float v{};
+            switch (bits) {
+            case 16: v = float(std::int16_t(std::uint16_t(s[2 * i] | (s[2 * i + 1] << 8)))) / 32768.0f; break;
+            case 20: case 24: {   // three bytes, little endian; 20-bit samples are left-aligned in them
+                const std::int32_t x = std::int32_t((std::uint32_t(s[3 * i]) << 8) | (std::uint32_t(s[3 * i + 1]) << 16) | (std::uint32_t(s[3 * i + 2]) << 24)) >> 8;
+                v = float(double(x) / 8388608.0);
+                break;
+            }
+            default: {
+                std::int32_t x;
+                std::memcpy(&x, s + 4 * i, 4);
+                v = float(double(x) / 2147483648.0);
+                break;
+            }
+            }
+            out[base + i] = v;
+        }
+        return true;
+    }
+
+    void reset() override {}   // ALAC packets are independent
+
+private:
+    ALACDecoder decoder_;
+    std::vector<std::uint8_t> config_, input_, samples_;
+    std::uint32_t frame_length_{};
+};
+
+class AlacEncoder final : public AudioEncoder {
+public:
+    bool open(double sample_rate, std::uint32_t channel_count, std::uint32_t bit_depth, std::uint32_t frames, std::string& why) {
+        if (!alac_bits_supported(bit_depth)) { why = "ALAC encodes 16, 20, 24 or 32 bits"; return false; }
+        if (channel_count < 1 || channel_count > 8) { why = "ALAC encodes 1-8 channels"; return false; }
+        if (!(sample_rate >= 1 && sample_rate <= 4294967295.0) || sample_rate != std::floor(sample_rate)) { why = "ALAC needs an integer sample rate"; return false; }
+        if (frames == 0) frames = kALACDefaultFramesPerPacket;
+        if (frames > 16384) { why = "ALAC packets hold at most 16384 frames"; return false; }
+        rate = sample_rate;
+        channels = channel_count;
+        bits = bit_depth;
+        frames_per_packet = frames;
+        bytes_per_sample_ = (bits + 7) / 8;   // 20-bit samples take three bytes, left-aligned
+        input_format_ = {rate, kALACFormatLinearPCM, kALACFormatFlagIsSignedInteger | kALACFormatFlagIsPacked, bytes_per_sample_ * channels, 1,
+                         bytes_per_sample_ * channels, channels, bits, 0};
+        output_format_ = {rate, kALACFormatAppleLossless, bits == 16 ? 1u : bits == 20 ? 2u : bits == 24 ? 3u : 4u, 0, frames, 0, channels, 0, 0};
+        encoder_.SetFrameSize(frames);
+        if (encoder_.InitializeEncoder(output_format_) != 0) { why = "the ALAC encoder could not be initialised"; return false; }
+        max_packet_bytes = frames * channels * ((10 + 32) / 8) + 1;   // the encoder's own bound
+        input_.resize(std::size_t(frames) * channels * bytes_per_sample_);
+        output_.resize(max_packet_bytes + kALACMaxEscapeHeaderBytes);
+        return true;
+    }
+
+    bool encode(std::span<const std::int32_t> samples, std::vector<std::uint8_t>& packet, std::string& why) override {
+        const std::size_t frames = samples.size() / channels;
+        if (frames == 0 || frames > frames_per_packet || samples.size() % channels) { why = "an ALAC packet takes 1 to frames_per_packet whole frames"; return false; }
+        std::uint8_t* p = input_.data();
+        for (const std::int32_t sample : samples) {
+            const auto u = std::uint32_t(sample);
+            switch (bits) {
+            case 16: p[0] = std::uint8_t(u >> 16); p[1] = std::uint8_t(u >> 24); p += 2; break;
+            case 20: p[0] = std::uint8_t((u >> 8) & 0xf0); p[1] = std::uint8_t(u >> 16); p[2] = std::uint8_t(u >> 24); p += 3; break;
+            case 24: p[0] = std::uint8_t(u >> 8); p[1] = std::uint8_t(u >> 16); p[2] = std::uint8_t(u >> 24); p += 3; break;
+            default: std::memcpy(p, &u, 4); p += 4; break;
+            }
+        }
+        auto bytes = std::int32_t(frames * channels * bytes_per_sample_);
+        if (encoder_.Encode(input_format_, input_format_, input_.data(), output_.data(), &bytes) != 0 || bytes <= 0 ||
+            std::uint32_t(bytes) > output_.size()) {
+            why = "the ALAC encoder failed";
+            return false;
+        }
+        packet.assign(output_.begin(), output_.begin() + bytes);
+        total_bytes_ += std::uint64_t(bytes);
+        total_frames_ += frames;
+        return true;
+    }
+
+    std::vector<std::uint8_t> cookie() override {
+        std::uint32_t size = encoder_.GetMagicCookieSize(channels);
+        std::vector<std::uint8_t> c(size);
+        encoder_.GetMagicCookie(c.data(), &size);
+        c.resize(size);
+        if (c.size() < 24) return c;
+        // The library leaves the average bit rate at 0: bits per second of what was encoded.
+        const auto rate_bps = total_frames_ ? std::uint32_t(std::min(4294967295.0, double(total_bytes_) * 8 * rate / double(total_frames_))) : 0u;
+        for (int i = 0; i < 4; ++i) c[16 + i] = std::uint8_t(rate_bps >> (24 - 8 * i));
+        // The channel layout info is big endian (ALACMagicCookieDescription.txt); the library writes
+        // its tag in host order.
+        if (c.size() >= 24 + 12 + 12) {
+            std::uint8_t* tag = c.data() + 24 + 12;
+            std::reverse(tag, tag + 4);
+        }
+        return c;
+    }
+
+private:
+    ALACEncoder encoder_;
+    AudioFormatDescription input_format_{}, output_format_{};
+    std::uint32_t bytes_per_sample_{};
+    std::vector<std::uint8_t> input_, output_;
+    std::uint64_t total_bytes_{}, total_frames_{};
 };
 
 // ---- video: copies of the decoders' pictures ----------------------------------
@@ -469,7 +631,20 @@ std::unique_ptr<VideoDecoder> make_video_decoder(std::uint32_t codec, std::span<
 
 bool audio_decoder_available(std::uint32_t codec) {
     return codec == fourcc(".mp1") || codec == fourcc(".mp2") || codec == fourcc(".mp3") || codec == fourcc("opus") ||
-           codec == fourcc("flac");
+           codec == fourcc("flac") || codec == fourcc("alac");
+}
+
+bool audio_encoder_available(std::uint32_t codec) { return codec == fourcc("alac"); }
+
+std::unique_ptr<AudioEncoder> make_audio_encoder(std::uint32_t codec, double rate, std::uint32_t channels, std::uint32_t bits,
+                                                 std::uint32_t frames_per_packet, std::string& why) {
+    if (codec == fourcc("alac")) {
+        auto e = std::make_unique<AlacEncoder>();
+        if (!e->open(rate, channels, bits, frames_per_packet, why)) return nullptr;
+        return e;
+    }
+    why = "no encoder for this audio format";
+    return nullptr;
 }
 
 std::unique_ptr<AudioDecoder> make_audio_decoder(std::uint32_t codec, double rate, std::uint32_t channels,
@@ -484,6 +659,11 @@ std::unique_ptr<AudioDecoder> make_audio_decoder(std::uint32_t codec, double rat
     if (codec == fourcc("flac")) {
         auto d = std::make_unique<FlacDecoder>();
         if (!d->open(config, why)) return nullptr;
+        return d;
+    }
+    if (codec == fourcc("alac")) {
+        auto d = std::make_unique<AlacDecoder>();
+        if (!d->open(config, rate, why)) return nullptr;
         return d;
     }
     why = "no decoder for this audio format";

@@ -6,11 +6,15 @@
 // - Matroska and WebM: Tracks and Clusters, SimpleBlocks and BlockGroups, Xiph, fixed and EBML
 //   lacing, and elements of unknown size (live streams);
 // - Ogg streams of Opus or FLAC;
-// - native FLAC streams and MPEG audio (MP3) streams with or without an ID3v2 tag.
+// - native FLAC streams and MPEG audio (MP3) streams with or without an ID3v2 tag;
+// - CAF files of packets ('desc', the 'kuki' magic cookie, the 'pakt' packet table, 'data'): the
+//   compressed formats (Apple Lossless and the others); linear PCM CAF is audio_file_core.hpp's.
 // Each track names its codec as the sample-entry fourcc CoreMedia uses ('avc1', 'hvc1', 'av01',
 // 'vp08', 'vp09', 'mp4a', '.mp3', 'opus', 'flac', 'alac', 'lpcm', ...) and carries the codec's
 // configuration as the container stores it (avcC, hvcC, av1C, vpcC, esds, dOps, dfLa, the
-// Matroska CodecPrivate). Times are in the track's timescale. Samples are byte ranges of the file.
+// Matroska CodecPrivate, a CAF magic cookie; for MP4 'alac' the ALACSpecificConfig without the box's
+// version and flags, as CAF and AudioFile carry it). Times are in the track's timescale. Samples
+// are byte ranges of the file.
 
 #include <cstdint>
 #include <functional>
@@ -73,6 +77,7 @@ bool parse_matroska(const ReadAt& read, std::uint64_t size, Movie& out, std::str
 bool parse_ogg(const ReadAt& read, std::uint64_t size, Movie& out, std::string& why);
 bool parse_flac(const ReadAt& read, std::uint64_t size, Movie& out, std::string& why);
 bool parse_mpeg_audio(const ReadAt& read, std::uint64_t size, Movie& out, std::string& why);
+bool parse_caf(const ReadAt& read, std::uint64_t size, Movie& out, std::string& why);
 
 // A sample's bytes (empty when the file is shorter than its table says).
 std::vector<std::uint8_t> read_sample(const ReadAt& read, const Track& track, const Sample& sample);

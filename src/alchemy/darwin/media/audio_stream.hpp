@@ -2,7 +2,8 @@
 
 // Compressed audio files as sample streams (host-only core, media group): the first audio track
 // of a container (media_container.hpp) whose codec has a decoder here (media_codecs.hpp) --
-// MP3 files, native and Ogg FLAC, Ogg Opus, and MP4/M4A or Matroska/WebM audio in those codecs.
+// MP3 files, native and Ogg FLAC, Ogg Opus, CAF packet streams (Apple Lossless), and MP4/M4A or
+// Matroska/WebM audio in those codecs (and ALAC).
 // Frames are counted without the encoder's priming and padding (the MP3 encoder delay, the Opus
 // pre-skip, an MP4 edit), so frame 0 is the first audible frame. Reads are sample-accurate: after
 // a seek the decoder starts far enough before the target (MP3's bit reservoir, Opus's energy
@@ -23,12 +24,12 @@ public:
     // The stream of the file's first audio track. Null with an OSStatus in `status`:
     // kAudioFileUnsupportedFileTypeError ('typ?') when no container parser recognises the file or
     // it has no audio, kAudioFileUnsupportedDataFormatError ('fmt?') when its codec has no
-    // decoder here (AAC, ALAC, ...), naming the codec in `why`.
+    // decoder here (AAC, ...), naming the codec in `why`.
     static std::unique_ptr<Stream> open(container::ReadAt read, std::uint64_t size, std::int32_t& status, std::string& why);
 
     [[nodiscard]] const container::Movie& movie() const { return movie_; }
     [[nodiscard]] const container::Track& track() const { return movie_.tracks[index_]; }
-    // AudioFileTypeID: 'MPG3', 'flac', 'mp4f' or 'm4af'; for Ogg and Matroska files Alchemy
+    // AudioFileTypeID: 'MPG3', 'flac', 'caff', 'mp4f' or 'm4af'; for Ogg and Matroska files Alchemy
     // answers the container's own tag ('OggS', 'webm' or 'matr').
     [[nodiscard]] std::uint32_t file_type() const { return file_type_; }
     [[nodiscard]] double rate() const { return decoder_->rate; }

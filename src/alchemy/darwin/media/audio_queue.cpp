@@ -44,8 +44,8 @@
 // AudioQueueStart.
 //
 // Output queues also play compressed packets a decoder exists for (media_codecs.hpp): MPEG audio
-// ('.mp1', '.mp2', '.mp3'), FLAC and Opus, configured by kAudioQueueProperty_MagicCookie (FLAC
-// needs one). Each enqueued buffer's packets (its packet descriptions, those passed to
+// ('.mp1', '.mp2', '.mp3'), FLAC, Opus and Apple Lossless, configured by
+// kAudioQueueProperty_MagicCookie (FLAC and ALAC need one). Each enqueued buffer's packets (its packet descriptions, those passed to
 // AudioQueueEnqueueBuffer, or for MPEG audio without any its frame headers) are decoded when it is
 // enqueued, into the decoder's rate and channels, and play like linear PCM; a packet the decoder
 // rejects plays as silence.
@@ -57,7 +57,7 @@
 // AudioQueueOfflineRender returns, on the calling thread, so the usual render loop can refill and
 // stop the queue as it goes.
 //
-// Unavailable: other compressed formats (AAC, ALAC, ...: kAudioFormatUnsupportedDataFormatError),
+// Unavailable: other compressed formats (AAC, ...: kAudioFormatUnsupportedDataFormatError),
 // compressed input (there is no encoder) and processing taps.
 namespace alchemy::gui::completion_kit::media {
 namespace {
@@ -68,7 +68,7 @@ constexpr std::string_view audio_toolbox = "/System/Library/Frameworks/AudioTool
 constexpr std::string_view core_foundation = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
 constexpr std::uint32_t four(const char (&code)[5]) { return af::four(code); }
 bool compressed_playable(std::uint32_t id) {
-    return id == four(".mp1") || id == four(".mp2") || id == four(".mp3") || id == four("flac") || id == four("opus");
+    return id == four(".mp1") || id == four(".mp2") || id == four(".mp3") || id == four("flac") || id == four("opus") || id == four("alac");
 }
 
 namespace error {
