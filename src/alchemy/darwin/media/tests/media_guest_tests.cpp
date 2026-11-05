@@ -2209,6 +2209,122 @@ void compressed_audio(Fixture& f) {
     std::filesystem::remove_all(directory, ignored);
 }
 
+// AudioFileStream: minimp3's MP3 vector fed in pieces gives the packets AudioFile reads from the file; a seek
+// to a parsed packet is exact; a WAVE stream gives its frames without descriptions.
+void audio_file_stream(Fixture& f) {
+    const std::string vectors = std::string(ALCHEMY_THIRD_PARTY) + "/minimp3/vectors/";
+    std::ifstream in(vectors + "l3-hecommon.bit", std::ios::binary);
+    const std::vector<std::uint8_t> file((std::istreambuf_iterator<char>(in)), {});
+    require(file.size() > 10000, "the MP3 vector");
+    static std::vector<std::uint32_t> properties, sizes;
+    static std::vector<std::uint8_t> packets;
+    static std::uint32_t packet_count{}, flags_seen{}, undescribed{};
+    static Address client_seen{};
+    const auto reset = [] { properties.clear(); sizes.clear(); packets.clear(); packet_count = flags_seen = undescribed = 0; client_seen = 0; };
+    const auto listener = f.process.install_function("_alchemy_test_afs_listener", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        client_seen = s.x[0];
+        properties.push_back(static_cast<std::uint32_t>(s.x[2]));
+        flags_seen |= m.read32(s.x[3]);
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto packets_proc = f.process.install_function("_alchemy_test_afs_packets", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto bytes = static_cast<std::uint32_t>(s.x[1]), n = static_cast<std::uint32_t>(s.x[2]);
+        std::vector<std::uint8_t> data(bytes);
+        m.read_bytes(s.x[3], data);
+        if (!s.x[4]) {
+            ++undescribed;
+            packets.insert(packets.end(), data.begin(), data.end());
+        }
+        for (std::uint32_t i = 0; s.x[4] && i < n; ++i) {
+            const auto start = m.read64(s.x[4] + 16ULL * i);
+            const auto size = m.read32(s.x[4] + 16ULL * i + 12);
+            packets.insert(packets.end(), data.begin() + static_cast<std::ptrdiff_t>(start), data.begin() + static_cast<std::ptrdiff_t>(start + size));
+            sizes.push_back(size);
+        }
+        packet_count += n;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto out = f.block(8), size = f.block(4), value = f.block(64), chunk = f.block(1000);
+    const auto parse = [&](Address stream, const std::vector<std::uint8_t>& bytes, std::size_t from, std::uint32_t flags) {
+        for (std::size_t offset = from; offset < bytes.size(); offset += 1000) {
+            const auto n = std::min<std::size_t>(1000, bytes.size() - offset);
+            f.memory().write_bytes(chunk, std::span(bytes.data() + offset, n));
+            require(f.status(at, "_AudioFileStreamParseBytes", {stream, n, chunk, offset == from ? flags : 0}) == 0, "AudioFileStreamParseBytes");
+        }
+    };
+    reset();
+    require(f.status(at, "_AudioFileStreamOpen", {0x1234, listener, 0, 0, out}) == -50, "a packets procedure is required");
+    require(f.status(at, "_AudioFileStreamOpen", {0x1234, listener, packets_proc, 0x4d504733, out}) == 0, "AudioFileStreamOpen");
+    const auto stream = f.engine.read64(out);
+    f.engine.write32(size, 4);
+    require(f.status(at, "_AudioFileStreamGetProperty", {stream, 0x72656479, size, value}) == 0 && f.engine.read32(value) == 0, "not ready yet");
+    parse(stream, file, 0, 0);
+    require(!properties.empty() && properties.back() == 0x72656479 && flags_seen == 1 && client_seen == 0x1234,
+            "the listener hears the properties, then ReadyToProducePackets");
+    f.engine.write32(size, 40);
+    require(f.status(at, "_AudioFileStreamGetProperty", {stream, 0x64666d74, size, value}) == 0 && f.engine.read32(value + 8) == 0x2e6d7033 &&
+            f.engine.read32(value + 20) == 1152 && f.engine.read32(size) == 40, "data format '.mp3'");
+    require(f.status(at, "_AudioFileStreamGetPropertyInfo", {stream, 0x64666d74, size, value}) == 0 && f.engine.read32(size) == 40 &&
+            f.memory().read8(value) == 0, "GetPropertyInfo: 40 bytes, not writable");
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioFileStreamGetProperty", {stream, 0x646f6666, size, value}) == 0, "data offset");
+    const auto data_offset = f.engine.read64(value);
+
+    // The same packets as AudioFile's (a cut-off last frame aside).
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_stream";
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "hecommon.mp3";
+    std::filesystem::copy_file(vectors + "l3-hecommon.bit", path, std::filesystem::copy_options::overwrite_existing);
+    require(f.status(at, "_AudioFileOpenURL", {f.cf.file_url(alchemy::guest_path_string(path), false), 1, 0, out}) == 0, "AudioFileOpenURL");
+    const auto audio_file = f.engine.read64(out);
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioFileGetProperty", {audio_file, 0x70636e74, size, value}) == 0, "AudioFile packet count");
+    const auto file_packets = static_cast<std::uint32_t>(f.engine.read64(value));
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioFileGetProperty", {audio_file, 0x646f6666, size, value}) == 0 && f.engine.read64(value) == data_offset,
+            "the same data offset as AudioFile");
+    const auto room = f.block(4), count = f.block(4), descriptions = f.block(16ULL * file_packets), file_bytes = f.block(file.size());
+    f.engine.write32(room, static_cast<std::uint32_t>(file.size()));
+    f.engine.write32(count, file_packets);
+    require(f.status(at, "_AudioFileReadPacketData", {audio_file, 0, room, descriptions, 0, count, file_bytes}) == 0, "ReadPacketData");
+    require(packet_count + 1 >= file_packets && packet_count <= file_packets && sizes.size() == packet_count,
+            "every whole frame is a packet: " + std::to_string(packet_count) + " of " + std::to_string(file_packets));
+    std::vector<std::uint8_t> expected(packets.size());
+    f.memory().read_bytes(file_bytes, expected);
+    require(expected == packets, "the packets are AudioFile's");
+    require(f.status(at, "_AudioFileClose", {audio_file}) == 0, "AudioFileClose");
+
+    // Seeking to a parsed packet is exact; parsing from there gives that packet first.
+    std::uint64_t tenth = 0;
+    for (int i = 0; i < 10; ++i) tenth += sizes[static_cast<std::size_t>(i)];
+    const auto flags = f.block(4);
+    f.engine.write32(flags, 0);
+    require(f.status(at, "_AudioFileStreamSeek", {stream, 10, out, flags}) == 0 && f.engine.read64(out) == tenth && f.engine.read32(flags) == 0,
+            "seek to packet 10");
+    const auto first_after = std::vector<std::uint8_t>(packets.begin() + static_cast<std::ptrdiff_t>(tenth),
+                                                       packets.begin() + static_cast<std::ptrdiff_t>(tenth + sizes[10]));
+    reset();
+    parse(stream, file, static_cast<std::size_t>(data_offset + tenth), 1);   // kAudioFileStreamParseFlag_Discontinuity
+    require(packets.size() >= first_after.size() && std::equal(first_after.begin(), first_after.end(), packets.begin()), "packet 10 after the seek");
+    require(f.status(at, "_AudioFileStreamSetProperty", {stream, 0x64666d74, 40, value}) == static_cast<std::int32_t>(0x6e6f7065),
+            "properties cannot be set ('nope')");
+    require(f.status(at, "_AudioFileStreamClose", {stream}) == 0, "AudioFileStreamClose");
+
+    // A WAVE stream: frames, no descriptions.
+    const auto wave_path = write_wave(directory / "ramp.wav", 22050, 2, 3000, [](std::uint32_t i, std::uint16_t c) { return static_cast<std::int16_t>(i * 3 + c); });
+    std::ifstream wave_in(wave_path, std::ios::binary);
+    const std::vector<std::uint8_t> wave((std::istreambuf_iterator<char>(wave_in)), {});
+    reset();
+    require(f.status(at, "_AudioFileStreamOpen", {0, listener, packets_proc, 0, out}) == 0, "AudioFileStreamOpen for WAVE");
+    const auto wave_stream = f.engine.read64(out);
+    parse(wave_stream, wave, 0, 0);
+    require(packet_count == 3000 && undescribed > 0 && sizes.empty() && packets == std::vector<std::uint8_t>(wave.begin() + 44, wave.end()),
+            "WAVE frames: " + std::to_string(packet_count));
+    f.engine.write32(size, 4);
+    require(f.status(at, "_AudioFileStreamGetProperty", {wave_stream, 0x66666d74, size, value}) == 0 && f.engine.read32(value) == 0x57415645, "'WAVE'");
+    require(f.status(at, "_AudioFileStreamClose", {wave_stream}) == 0, "close the WAVE stream");
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 // VTDecompressionSession: libvpx's VP9 test vector (through our WebM parser) and libaom's AV1 test
 // vectors decoded into CVPixelBuffers, compared with the projects' per-frame MD5s; H.264 has no decoder.
 struct DecodedImage { Address image; std::int64_t pts; std::uint32_t flags; std::int32_t status; };
@@ -2771,6 +2887,7 @@ int main() {
         {"audio_files", audio_files},
         {"audio_file_writing", audio_file_writing},
         {"compressed_audio", compressed_audio},
+        {"audio_file_stream", audio_file_stream},
         {"video_toolbox", video_toolbox},
         {"av_video", av_video},
         {"av_player", av_player},

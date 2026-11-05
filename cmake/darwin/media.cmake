@@ -47,6 +47,8 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/music.cpp
     src/alchemy/darwin/media/audio_file_core.cpp
     src/alchemy/darwin/media/audio_file.cpp
+    src/alchemy/darwin/media/audio_file_stream_core.cpp
+    src/alchemy/darwin/media/audio_file_stream.cpp
     src/alchemy/darwin/media/au_listeners.cpp
     src/alchemy/darwin/media/avfoundation.cpp
     src/alchemy/darwin/media/av_player.cpp

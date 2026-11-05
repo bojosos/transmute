@@ -960,6 +960,8 @@ void install_audio_file(Support& support) {
         m.write64(s.x[1], e->position);
         status(s, 0);
     });
+
+    install_audio_file_stream(support);
 }
 
 } // namespace alchemy::gui::completion_kit::media

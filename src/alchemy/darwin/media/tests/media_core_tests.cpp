@@ -11,7 +11,9 @@
 #include "alchemy/darwin/media/midi_host.hpp"
 #include "alchemy/darwin/media/music_core.hpp"
 #include "alchemy/darwin/media/audio_file_core.hpp"
+#include "alchemy/darwin/media/audio_file_stream_core.hpp"
 #include "alchemy/darwin/media/resampler.hpp"
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 
@@ -897,6 +899,178 @@ void container_tests() {
     }
 }
 
+// AudioFileStream's parser: the bytes in pieces of every size, the properties first, then whole packets.
+void audio_file_stream_tests() {
+    namespace afs = cm::audio_file_stream;
+    namespace af = cm::audio_file;
+    struct Seen {
+        std::vector<std::uint32_t> properties;
+        Bytes audio;
+        std::vector<std::uint32_t> sizes;   // per described packet
+        std::uint32_t packets{};
+    };
+    const auto collect = [](const std::vector<afs::Event>& events) {
+        Seen seen;
+        for (const auto& e : events) {
+            if (e.property) {
+                require(seen.audio.empty(), "the properties come before the packets");
+                seen.properties.push_back(e.property);
+                continue;
+            }
+            for (const auto& d : e.descriptions) {
+                require(d.start >= 0 && static_cast<std::size_t>(d.start) + d.bytes <= e.bytes.size(), "a description inside its batch");
+                seen.sizes.push_back(d.bytes);
+            }
+            seen.audio.insert(seen.audio.end(), e.bytes.begin(), e.bytes.end());
+            seen.packets += e.packets;
+        }
+        return seen;
+    };
+    const auto feed = [](afs::Parser& parser, const Bytes& bytes, std::size_t piece, std::vector<afs::Event>& events) {
+        for (std::size_t at = 0; at < bytes.size(); at += piece)
+            require(parser.parse(std::span(bytes.data() + at, std::min(piece, bytes.size() - at)), false, events) == 0, "parse");
+    };
+    const auto value = [](const afs::Parser& parser, std::uint32_t id, const Bytes& in = Bytes(24, 0)) {
+        Bytes out;
+        return parser.property(id, in, out) == 0 ? out : Bytes{};
+    };
+    const auto u64 = [](const Bytes& b, std::size_t at = 0) { std::uint64_t v = 0; if (b.size() >= at + 8) std::memcpy(&v, b.data() + at, 8); return v; };
+    const auto u32 = [](const Bytes& b, std::size_t at = 0) { std::uint32_t v = 0; if (b.size() >= at + 4) std::memcpy(&v, b.data() + at, 4); return v; };
+    const auto has = [](const std::vector<std::uint32_t>& list, const char (&id)[5]) { return std::find(list.begin(), list.end(), af::four(id)) != list.end(); };
+
+    // WAVE: 1000 frames of 16-bit stereo at 48 kHz, then a LIST chunk that is not audio.
+    af::Pcm s16; s16.rate = 48000; s16.channels = 2; s16.bits = 16; s16.container = 2;
+    Bytes wave;
+    std::string why;
+    require(af::write_header(af::four("WAVE"), s16, 4000, {}, wave, why) == 0, "WAVE header: " + why);
+    const auto header = wave.size();
+    for (int i = 0; i < 4000; ++i) wave.push_back(static_cast<std::uint8_t>(i * 7));
+    const Bytes samples(wave.begin() + static_cast<std::ptrdiff_t>(header), wave.end());
+    wav::tag(wave, "LIST"); wav::le(wave, 4, 4); wav::tag(wave, "INFO");
+    for (const std::size_t piece : {std::size_t{1}, std::size_t{7}, std::size_t{4096}, wave.size()}) {
+        afs::Parser parser(0);
+        require(u32(value(parser, af::four("redy"))) == 0 && value(parser, af::four("dfmt")).empty(), "nothing known before the header");
+        std::vector<afs::Event> events;
+        feed(parser, wave, piece, events);
+        const auto seen = collect(events);
+        require(!seen.properties.empty() && seen.properties.back() == af::four("redy") && has(seen.properties, "dfmt") && has(seen.properties, "bcnt") &&
+                has(seen.properties, "pcnt") && has(seen.properties, "doff"), "WAVE properties, then ready, in pieces of " + std::to_string(piece));
+        require(seen.audio == samples && seen.packets == 1000 && seen.sizes.empty(), "WAVE frames without descriptions, in pieces of " + std::to_string(piece));
+        require(u32(value(parser, af::four("ffmt"))) == af::four("WAVE") && u64(value(parser, af::four("bcnt"))) == 4000 &&
+                u64(value(parser, af::four("pcnt"))) == 1000 && u64(value(parser, af::four("doff"))) == header &&
+                value(parser, af::four("dfmt")) == af::asbd_from_pcm(s16) && u32(value(parser, af::four("brat"))) == 48000 * 4 * 8 &&
+                u32(value(parser, af::four("psze"))) == 4, "WAVE property values");
+    }
+    {
+        // Seeking: exact for PCM; the next bytes are the audio data from there.
+        afs::Parser parser(0);
+        std::vector<afs::Event> events;
+        feed(parser, Bytes(wave.begin(), wave.begin() + static_cast<std::ptrdiff_t>(header) + 10), 64, events);
+        std::int64_t offset = 0;
+        bool estimated = true;
+        require(parser.seek(500, offset, estimated) == 0 && offset == 2000 && !estimated, "PCM seek");
+        require(parser.seek(1001, offset, estimated) == afs::error::invalid_packet_offset, "past the end");
+        require(parser.seek(500, offset, estimated) == 0, "seek again");
+        events.clear();
+        feed(parser, Bytes(wave.begin() + static_cast<std::ptrdiff_t>(header) + 2000, wave.end()), 333, events);
+        const auto seen = collect(events);
+        require(seen.packets == 500 && seen.audio == Bytes(samples.begin() + 2000, samples.end()), "the frames after the seek");
+        Bytes question(24, 0), answer;
+        question[8] = 3;   // mPacket
+        require(parser.property(af::four("pkby"), question, answer) == 0 && u64(answer) == 12 && u32(answer, 20) == 0, "PacketToByte");
+    }
+    {
+        // A streamed WAVE leaves its data size open: no byte count, frames until the stream ends.
+        Bytes open(wave.begin(), wave.begin() + static_cast<std::ptrdiff_t>(header) + 4000);
+        for (int i = 0; i < 4; ++i) open[header - 4 + i] = 0xff;
+        afs::Parser parser(0);
+        std::vector<afs::Event> events;
+        feed(parser, open, 100, events);
+        const auto seen = collect(events);
+        Bytes out;
+        require(!has(seen.properties, "bcnt") && parser.property(af::four("bcnt"), {}, out) == afs::error::value_unknown && seen.packets == 1000,
+                "open-ended WAVE");
+    }
+
+    // MPEG audio: an ID3v2 tag, an Info frame (6 frames; LAME delay 576, padding 1000), six frames of 417
+    // or 418 bytes with junk between the fourth and fifth, and an ID3v1 tag at the end.
+    const auto frame = [](int number) {
+        Bytes f{0xff, 0xfb, static_cast<std::uint8_t>(0x90 | (number % 2 ? 2 : 0)), 0x00};
+        f.resize(number % 2 ? 418 : 417, static_cast<std::uint8_t>(number + 1));
+        return f;
+    };
+    Bytes mp3{'I', 'D', '3', 3, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5};
+    auto info = frame(0);
+    std::fill(info.begin() + 4, info.end(), std::uint8_t{0});
+    std::memcpy(info.data() + 36, "Info", 4);
+    info[43] = 0x0f;   // frames, bytes, TOC, quality
+    info[47] = 6;      // frames
+    const std::uint32_t total = 417 + 3 * 417 + 3 * 418;
+    info[50] = static_cast<std::uint8_t>(total >> 8); info[51] = static_cast<std::uint8_t>(total);
+    const std::size_t lame = 36 + 8 + 4 + 4 + 100 + 4;
+    info[lame + 21] = 0x24; info[lame + 22] = 0x03; info[lame + 23] = 0xe8;
+    append(mp3, info);
+    Bytes audio;
+    for (int i = 0; i < 6; ++i) {
+        if (i == 4) append(mp3, Bytes{0x00, 0x12, 0xff, 0x00, 0x34});
+        append(mp3, frame(i));
+        append(audio, frame(i));
+    }
+    Bytes id3v1{'T', 'A', 'G'};
+    id3v1.resize(128, 0x20);
+    append(mp3, id3v1);
+    const std::uint64_t data_offset = 15 + 417;
+    for (const std::size_t piece : {std::size_t{1}, std::size_t{13}, std::size_t{500}, mp3.size()}) {
+        afs::Parser parser(0);
+        std::vector<afs::Event> events;
+        feed(parser, mp3, piece, events);
+        const auto seen = collect(events);
+        require(!seen.properties.empty() && seen.properties.back() == af::four("redy") && has(seen.properties, "pnfo") && has(seen.properties, "pcnt"),
+                "MP3 properties, in pieces of " + std::to_string(piece));
+        require(seen.packets == 6 && seen.audio == audio && seen.sizes == std::vector<std::uint32_t>{417, 418, 417, 418, 417, 418},
+                "MP3 frames past the junk, with descriptions, in pieces of " + std::to_string(piece) + ": " + std::to_string(seen.packets));
+        const auto format = value(parser, af::four("dfmt"));
+        const auto table = value(parser, af::four("pnfo"));
+        require(u32(value(parser, af::four("ffmt"))) == af::four("MPG3") && u32(format, 8) == af::four(".mp3") && u32(format, 20) == 1152 &&
+                u32(format, 28) == 2 && u64(value(parser, af::four("doff"))) == data_offset && u64(value(parser, af::four("pcnt"))) == 6 &&
+                u64(value(parser, af::four("bcnt"))) == total - 417 && u64(table) == 6 * 1152 - 1105 - 1000 && u32(table, 8) == 1105 &&
+                u32(table, 12) == 1000 && u32(value(parser, af::four("psze"))) == 418, "MP3 property values");
+        Bytes question(24, 0), answer;
+        question[0] = 0xf4; question[1] = 0x01;   // mByte 500
+        require(parser.property(af::four("bypk"), question, answer) == 0 && u64(answer, 8) == 1 && u32(answer, 16) == 83 && u32(answer, 20) == 0,
+                "ByteToPacket from the parsed packets");
+        question.assign(24, 0);
+        question[8] = 2;   // mPacket
+        require(parser.property(af::four("pkfr"), question, answer) == 0 && u64(answer) == 2304, "PacketToFrame");
+    }
+    {
+        afs::Parser parser(0);
+        std::vector<afs::Event> events;
+        feed(parser, Bytes(mp3.begin(), mp3.begin() + static_cast<std::ptrdiff_t>(data_offset) + 417 + 418 + 417 + 50), 100, events);
+        require(collect(events).packets == 3, "three whole frames so far");
+        std::int64_t offset = 0;
+        bool estimated = true;
+        require(parser.seek(2, offset, estimated) == 0 && offset == 417 + 418 && !estimated, "a parsed packet's offset is exact");
+        require(parser.seek(7, offset, estimated) == afs::error::invalid_packet_offset, "past the Info frame's count");
+        require(parser.seek(5, offset, estimated) == 0 && estimated, "an unparsed packet's offset is estimated");
+        require(parser.seek(2, offset, estimated) == 0, "seek back");
+        events.clear();
+        const auto from = static_cast<std::ptrdiff_t>(data_offset) + offset;
+        require(parser.parse(std::span(mp3.data() + from, mp3.size() - static_cast<std::size_t>(from)), true, events) == 0, "parse after the seek");
+        require(collect(events).sizes == std::vector<std::uint32_t>{417, 418, 417, 418}, "the frames from packet 2");
+    }
+    {
+        // ADTS AAC is refused; other containers are not streams this parser reads.
+        afs::Parser adts(0), ogg(0);
+        std::vector<afs::Event> events;
+        const Bytes aac{0xff, 0xf1, 0x50, 0x80, 0x01, 0x7f, 0xfc}, oggs{'O', 'g', 'g', 'S', 0, 2};
+        require(adts.parse(aac, false, events) == afs::error::unsupported_data_format, "ADTS AAC");
+        require(ogg.parse(oggs, false, events) == afs::error::unsupported_file_type && ogg.parse(oggs, false, events) == afs::error::unsupported_file_type,
+                "Ogg, and the error stays");
+        require(events.empty(), "no events");
+    }
+}
+
 int main() {
     try {
         resampler_tests();
@@ -910,6 +1084,7 @@ int main() {
         audio_file_writing_tests();
         ump_tests();
         container_tests();
+        audio_file_stream_tests();
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;
