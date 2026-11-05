@@ -413,6 +413,95 @@ void writing(Fixture& f) {
     require(destinations && document->get(destinations, "top"), "the named destination");
 }
 
+// A file of `objects` (object 1 the catalog) with a cross-reference table.
+std::string pdf_file(const std::map<int, std::string>& objects) {
+    std::string out = "%PDF-1.4\n";
+    std::map<int, std::size_t> offsets;
+    for (const auto& [number, body] : objects) {
+        offsets[number] = out.size();
+        out += std::to_string(number) + " 0 obj\n" + body + "\nendobj\n";
+    }
+    const auto size = objects.rbegin()->first + 1;
+    const auto xref = out.size();
+    out += "xref\n0 " + std::to_string(size) + "\n0000000000 65535 f \n";
+    for (int i = 1; i < size; ++i) {
+        char line[32];
+        std::snprintf(line, sizeof line, "%010zu 00000 n \n", offsets.contains(i) ? offsets[i] : 0);
+        out += line;
+    }
+    return out + "trailer\n<< /Size " + std::to_string(size) + " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+}
+
+// CGContextDrawPDFPage: a 100 x 100 page with one thing in each region, drawn into a bitmap.
+void drawing(Fixture& f) {
+    std::string arial;
+    if (std::FILE* file = std::fopen("C:/Windows/Fonts/arial.ttf", "rb")) {
+        char buffer[65536];
+        for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, file)) > 0;) arial.append(buffer, n);
+        std::fclose(file);
+    }
+    const std::string content =
+        "1 0 0 rg 0 0 40 40 re f\n"                                 // red square, (0,0)-(40,40)
+        "0 0 1 RG 4 w 60 10 m 90 10 l S\n"                          // blue line at y = 10
+        "q 50 50 50 50 re W n /Sh1 sh Q\n"                          // black-to-white shading in (50,50)-(100,100)
+        "q 20 0 0 10 10 60 cm /Im1 Do Q\n"                          // 2 x 1 image (red, green) in (10,60)-(30,70)
+        "q 10 0 0 10 35 85 cm BI /W 1 /H 1 /BPC 8 /CS /G ID \x80 EI Q\n"   // gray inline image in (35,85)-(45,95)
+        "q /Fm1 Do Q\n"                                             // a green form clipped to (5,75)-(15,85)
+        "0 g BT /F1 20 Tf 55 20 Td (Hi) Tj ET\n" +
+        std::string(arial.empty() ? "" : "BT /F2 20 Tf 80 20 Td (A) Tj ET\n");
+    std::map<int, std::string> objects;
+    objects[1] = "<< /Type /Catalog /Pages 2 0 R >>";
+    objects[2] = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+    objects[3] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << /Shading << /Sh1 5 0 R >> "
+                 "/XObject << /Im1 6 0 R /Fm1 7 0 R >> /Font << /F1 8 0 R" + std::string(arial.empty() ? "" : " /F2 9 0 R") + " >> >> >>";
+    objects[4] = "<< /Length " + std::to_string(content.size()) + " >>\nstream\n" + content + "\nendstream";
+    objects[5] = "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [50 0 100 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [0 0 0] "
+                 "/C1 [1 1 1] /N 1 >> /Extend [true true] >>";
+    const std::string pixels("\xff\x00\x00\x00\xff\x00", 6);
+    objects[6] = "<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceRGB /Length 6 >>\nstream\n" +
+                 pixels + "\nendstream";
+    const std::string form = "0 1 0 rg 0 0 20 20 re f";
+    objects[7] = "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Matrix [1 0 0 1 5 75] /Length " + std::to_string(form.size()) +
+                 " >>\nstream\n" + form + "\nendstream";
+    objects[8] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
+    if (!arial.empty()) {
+        objects[9] = "<< /Type /Font /Subtype /TrueType /BaseFont /ArialMT /FirstChar 65 /LastChar 65 /Widths [667] "
+                     "/Encoding /WinAnsiEncoding /FontDescriptor 10 0 R >>";
+        objects[10] = "<< /Type /FontDescriptor /FontName /ArialMT /Flags 32 /FontBBox [-665 -325 2000 1006] /ItalicAngle 0 "
+                      "/Ascent 905 /Descent -212 /CapHeight 716 /StemV 80 /FontFile2 11 0 R >>";
+        objects[11] = "<< /Length " + std::to_string(arial.size()) + " /Length1 " + std::to_string(arial.size()) + " >>\nstream\n" + arial + "\nendstream";
+    }
+    const auto file = pdf_file(objects);
+    const auto data = f.id(cf_library, "_CFDataCreate", {0, guest_bytes(f, file), file.size()});
+    const auto provider = f.id(cg, "_CGDataProviderCreateWithCFData", {data});
+    const auto document = f.id(cg, "_CGPDFDocumentCreateWithProvider", {provider});
+    require(document != 0, "the drawing test file opens");
+    const auto page = f.id(cg, "_CGPDFDocumentGetPage", {document, 1});
+    Canvas canvas(f, 100, 100);
+    f.call(cg, "_CGContextDrawPDFPage", {canvas.context, page});
+    const auto describe_at = [&](std::uint32_t x, std::uint32_t y) { return describe(canvas.cg_at(x, y)) + " at " + std::to_string(x) + "," + std::to_string(y); };
+    require(same(canvas.cg_at(20, 20), {255, 0, 0, 255}), "the red square: " + describe_at(20, 20));
+    const auto blue = canvas.cg_at(75, 10);
+    require(blue[2] > 200 && blue[0] < 60 && blue[3] == 255, "the blue line: " + describe_at(75, 10));
+    const auto dark = canvas.cg_at(52, 75), light = canvas.cg_at(97, 75), middle = canvas.cg_at(75, 75);
+    require(dark[0] < 40 && light[0] > 215 && middle[0] > dark[0] && middle[0] < light[0] && canvas.cg_at(52, 45)[3] == 0,
+            "the clipped shading: " + describe_at(52, 75) + " / " + describe_at(75, 75) + " / " + describe_at(97, 75));
+    const auto left = canvas.cg_at(12, 65), right = canvas.cg_at(28, 65);
+    require(left[0] > 200 && left[1] < 80 && right[1] > 200 && right[0] < 80, "the image: " + describe_at(12, 65) + " / " + describe_at(28, 65));
+    const auto gray = canvas.cg_at(40, 90);
+    require(std::abs(gray[0] - 128) < 8 && gray[3] == 255, "the inline image: " + describe_at(40, 90));
+    require(same(canvas.cg_at(10, 80), {0, 255, 0, 255}) && canvas.cg_at(18, 80)[3] == 0, "the form, clipped to its box: " + describe_at(10, 80) + " / " + describe_at(18, 80));
+    const auto ink = [&](std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1) {
+        int count = 0;
+        for (auto y = y0; y < y1; ++y)
+            for (auto x = x0; x < x1; ++x) if (canvas.cg_at(x, y)[3] > 128) ++count;
+        return count;
+    };
+    require(ink(55, 18, 78, 40) > 20, "the Helvetica text: " + std::to_string(ink(55, 18, 78, 40)) + " inked pixels");
+    if (!arial.empty()) require(ink(80, 18, 96, 40) > 15, "the embedded TrueType text: " + std::to_string(ink(80, 18, 96, 40)) + " inked pixels");
+    f.call(cg, "_CGPDFDocumentRelease", {document});
+}
+
 } // namespace
 
 int main() {
@@ -425,6 +514,7 @@ int main() {
         cgpdf(f, classic_file(false));
         cgpdf(f, stream_file());
         writing(f);
+        drawing(f);
         std::cout << "pdf: ok\n";
         return 0;
     } catch (const std::exception& error) {

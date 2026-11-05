@@ -22,6 +22,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/coregraphics/displays.cpp
     src/alchemy/darwin/coregraphics/pdf/pdf_parser.cpp
     src/alchemy/darwin/coregraphics/pdf_document.cpp
+    src/alchemy/darwin/coregraphics/pdf/pdf_render.cpp
     src/alchemy/darwin/coregraphics/pdf/pdf_writer.cpp
     src/alchemy/darwin/coregraphics/pdf_context.cpp
     src/alchemy/darwin/coregraphics/imageio/codec.cpp

@@ -1,5 +1,6 @@
 #include "alchemy/darwin/coregraphics/q2d_internal.hpp"
 #include "alchemy/darwin/coregraphics/pdf/pdf_parser.hpp"
+#include "alchemy/darwin/coregraphics/pdf/pdf_render.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -32,8 +33,8 @@
 //   type), and reports an inline image as an "EI" operator with the image
 //   (a stream) on the stack. CGPDFScannerStop ends the scan, which then
 //   returns true.
-// * Not provided: CGContextDrawPDFPage (stops explicitly), the document
-//   outline and access permissions.
+// * CGContextDrawPDFPage draws through pdf/pdf_render.cpp.
+// * Not provided: the document outline and access permissions.
 namespace alchemy::gui::quartz2d {
 namespace {
 
@@ -357,9 +358,14 @@ void Pdf::install_documents() {
                                    .then(Affine::translation(target.origin.x + target.size.width / 2, target.origin.y + target.size.height / 2));
         q.write_affine(out, transform);
     });
-    // Rendering PDF pages is not provided yet.
-    q.function(cg, "_CGContextDrawPDFPage", [](CpuState& s, GuestMemory&) {
-        if (s.x[0] && s.x[1]) unsupported("CGContextDrawPDFPage (drawing PDF pages)");
+    // Drawing a page (pdf/pdf_render.cpp) in the context's current user space.
+    q.function(cg, "_CGContextDrawPDFPage", [this, page_of](CpuState& s, GuestMemory&) {
+        if (!s.x[0] || !s.x[1]) return;
+        const auto info = page_of(s.x[1]);
+        if (!info->document) return;
+        const auto context = context_state(q, s.x[0]);
+        std::lock_guard lock(context->mutex);
+        render_pdf_page(q, *context, *document_info(info->document)->document, info->page);
     });
 }
 

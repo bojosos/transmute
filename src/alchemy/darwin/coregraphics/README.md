@@ -61,8 +61,25 @@ strings and dates included), content streams, resources, operator tables
 and scanners are real. The CGPDFObjectType, CGPDFBox and CGPDFDataFormat
 values follow their documented order (unverified). Not provided:
 decrypting encrypted documents (they stay locked; their structure reads),
-CGContextDrawPDFPage (stops explicitly), the document outline and access
-permissions.
+the document outline and access permissions.
+
+**Drawing PDF pages** (`pdf/pdf_render.cpp`): CGContextDrawPDFPage
+interprets the page's content in the context's current user space, clipped
+to the crop box, through the same drawing entry points as everything else
+(so a PDF page also draws into a PDF context). Drawn: the graphics state
+(including ExtGState line parameters, constant alpha and blend modes),
+paths, clipping, Gray / RGB / CMYK / ICCBased / CalGray / CalRGB / Lab /
+Indexed / Separation / DeviceN colour (tint transforms through sampled,
+exponential, stitching and PostScript functions), axial and radial
+shadings and shading patterns, images (1 to 16 bits per component, Decode
+arrays, JPEG through ImageIO, stencil masks, soft masks, explicit and
+colour-key masks), inline images, form XObjects, and text with embedded
+TrueType and OpenType programs, simple-font encodings and /Differences,
+composite fonts (Identity CIDs, CIDToGIDMap, /W widths, ToUnicode) and
+Type 3 fonts; other fonts (Type 1 and bare CFF programs, the standard 14)
+use the system font their name maps to, through Unicode. Not drawn (a
+diagnostic says so): tiling patterns, shading types 1 and 4 to 7, soft
+masks in ExtGState, JPEG 2000, CCITT and JBIG2 images, annotations.
 
 **PDF writing** (`pdf_context.cpp`, `pdf/pdf_writer.cpp`): CGPDFContext
 records CGContext drawing as PDF pages: filled and stroked paths (strokes
