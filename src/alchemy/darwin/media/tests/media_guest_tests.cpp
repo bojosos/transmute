@@ -321,6 +321,29 @@ void core_video(Fixture& f) {
         {f.cf.string("PixelFormatType"), f.cf.array(std::vector<Address>(formats.begin(), formats.end()))}}};
     require((f.call(cv, "_CVPixelBufferIsCompatibleWithAttributes", {bgra, f.cf.dictionary(pool_buffers)}) & 0xff) == 0 &&
             (f.call(cv, "_CVPixelBufferIsCompatibleWithAttributes", {bgra, f.cf.dictionary(own)}) & 0xff) == 1, "CVPixelBufferIsCompatibleWithAttributes");
+    // Pixel format descriptions: every format CVPixelBufferCreate makes, a registered one, and the four-character codes.
+    const auto lookup = [&](Address dictionary, const char* key) { return f.call(cf_library, "_CFDictionaryGetValue", {dictionary, f.cf.string(key)}); };
+    const auto all = f.call(cv, "_CVPixelFormatDescriptionArrayCreateWithAllPixelFormatTypes", {0});
+    require(f.call(cf_library, "_CFArrayGetCount", {all}) == 34, "all pixel format types: " + std::to_string(f.call(cf_library, "_CFArrayGetCount", {all})));
+    const auto biplanar = f.call(cv, "_CVPixelFormatDescriptionCreateWithPixelFormatType", {0, 0x34323076});
+    const auto planes_of = lookup(biplanar, "Planes");
+    require(biplanar && f.cf.utf8(lookup(biplanar, "Name")) == "420YpCbCr8BiPlanarVideoRange" && f.call(cf_library, "_CFArrayGetCount", {planes_of}) == 2 &&
+            f.cf.number_value(lookup(f.call(cf_library, "_CFArrayGetValueAtIndex", {planes_of, 1}), "HorizontalSubsampling")).value_or(0) == 2,
+            "the 420v description: name, two planes, chroma subsampled by 2");
+    require(f.call(cv, "_CVPixelFormatDescriptionCreateWithPixelFormatType", {0, 0x7a7a7a7a}) == 0, "no description of an unknown format");
+    const std::array<std::pair<Address, Address>, 1> custom_entries{{{f.cf.string("BitsPerBlock"), f.cf.integer(24)}}};
+    const auto custom = f.cf.dictionary(custom_entries);
+    f.call(cv, "_CVPixelFormatDescriptionRegisterDescriptionWithPixelFormatType", {custom, 0x7a7a7a7a});
+    require(f.call(cv, "_CVPixelFormatDescriptionCreateWithPixelFormatType", {0, 0x7a7a7a7a}) == custom &&
+            f.call(cf_library, "_CFArrayGetCount", {f.call(cv, "_CVPixelFormatDescriptionArrayCreateWithAllPixelFormatTypes", {0})}) == 35,
+            "a registered description");
+    require(f.cf.utf8(f.call(cv, "_CVPixelFormatTypeCopyFourCharCodeString", {0x42475241})) == "BGRA" &&
+            f.cf.utf8(f.call(cv, "_CVPixelFormatTypeCopyFourCharCodeString", {0x20})) == "0x00000020", "CVPixelFormatTypeCopyFourCharCodeString");
+    // CVPixelBufferCopyCreationAttributes: the size and format, and the attributes given.
+    const auto made_with = f.call(cv, "_CVPixelBufferCopyCreationAttributes", {nv12});
+    require(f.cf.number_value(lookup(made_with, "Width")).value_or(0) == 64 && f.cf.number_value(lookup(made_with, "PixelFormatType")).value_or(0) == 0x34323076 &&
+            lookup(made_with, "IOSurfaceProperties") != 0, "CVPixelBufferCopyCreationAttributes");
+    require(f.cf.number_value(lookup(f.call(cv, "_CVPixelBufferCopyCreationAttributes", {bgra}), "Height")).value_or(0) == 20, "without attributes");
     // An image buffer as a format description and a sample buffer.
     const auto description_out = f.block(8);
     require(f.status(cm, "_CMVideoFormatDescriptionCreateForImageBuffer", {0, small, description_out}) == 0, "format description for an image buffer");

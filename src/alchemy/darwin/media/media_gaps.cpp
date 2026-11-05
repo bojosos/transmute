@@ -1,9 +1,13 @@
 #include "alchemy/gui/value_provider.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <limits>
+#include <map>
+#include <string>
 
 // Media and graphics gaps of Chrome's framework:
 // - VideoToolbox / CoreVideo / CoreMedia / AVFoundation dictionary keys and
@@ -61,25 +65,52 @@ constexpr std::int32_t cg_invalid_connection = 1002;
 
 struct PixelFormat {
     std::uint32_t type;
+    const char* name;               // kCVPixelFormatName: the kCVPixelFormatType_ suffix
     std::uint32_t bits_per_block;   // 0 for planar formats (see planes)
-    bool alpha, ycbcr, rgb;
-    const char* range;              // nullptr for RGB formats
+    bool alpha, ycbcr, rgb, gray;
+    const char* range;              // Y'CbCr only
     std::array<std::uint32_t, 3> planes;   // bits per block of each plane
+    std::uint32_t chroma_h, chroma_v;      // the chroma planes' subsampling (planar)
+    bool cg;                               // kCVPixelFormatCGBitmapContextCompatibility / CGImageCompatibility
 };
 
-// <CoreVideo/CVPixelBuffer.h> kCVPixelFormatType_* values.
-constexpr std::array<PixelFormat, 11> pixel_formats{{
-    {0x00000020, 32, true, false, true, nullptr, {}},                  // 32ARGB
-    {fourcc("BGRA"), 32, true, false, true, nullptr, {}},              // 32BGRA
-    {fourcc("RGBA"), 32, true, false, true, nullptr, {}},              // 32RGBA
-    {fourcc("l10r"), 32, true, false, true, nullptr, {}},              // ARGB2101010LEPacked
-    {fourcc("2vuy"), 16, false, true, false, "VideoRange", {}},        // 422YpCbCr8
-    {fourcc("420v"), 0, false, true, false, "VideoRange", {8, 16, 0}},  // 420YpCbCr8BiPlanarVideoRange
-    {fourcc("420f"), 0, false, true, false, "FullRange", {8, 16, 0}},   // 420YpCbCr8BiPlanarFullRange
-    {fourcc("x420"), 0, false, true, false, "VideoRange", {16, 32, 0}}, // 420YpCbCr10BiPlanarVideoRange
-    {fourcc("xf20"), 0, false, true, false, "FullRange", {16, 32, 0}},  // 420YpCbCr10BiPlanarFullRange
-    {fourcc("y420"), 0, false, true, false, "VideoRange", {8, 8, 8}},   // 420YpCbCr8Planar
-    {fourcc("f420"), 0, false, true, false, "FullRange", {8, 8, 8}},    // 420YpCbCr8PlanarFullRange
+// <CoreVideo/CVPixelBuffer.h> kCVPixelFormatType_* values: every format CVPixelBufferCreate makes
+// (core_video.cpp).
+constexpr std::array<PixelFormat, 34> pixel_formats{{
+    {0x00000020, "32ARGB", 32, true, false, true, false, nullptr, {}, 0, 0, true},
+    {fourcc("BGRA"), "32BGRA", 32, true, false, true, false, nullptr, {}, 0, 0, true},
+    {fourcc("RGBA"), "32RGBA", 32, true, false, true, false, nullptr, {}, 0, 0, false},
+    {fourcc("ABGR"), "32ABGR", 32, true, false, true, false, nullptr, {}, 0, 0, false},
+    {0x00000018, "24RGB", 24, false, false, true, false, nullptr, {}, 0, 0, false},
+    {fourcc("24BG"), "24BGR", 24, false, false, true, false, nullptr, {}, 0, 0, false},
+    {0x00000010, "16BE555", 16, false, false, true, false, nullptr, {}, 0, 0, false},
+    {fourcc("L555"), "16LE555", 16, false, false, true, false, nullptr, {}, 0, 0, false},
+    {fourcc("L565"), "16LE565", 16, false, false, true, false, nullptr, {}, 0, 0, false},
+    {fourcc("B565"), "16BE565", 16, false, false, true, false, nullptr, {}, 0, 0, false},
+    {fourcc("l10r"), "ARGB2101010LEPacked", 32, true, false, true, false, nullptr, {}, 0, 0, false},
+    {fourcc("RGhA"), "64RGBAHalf", 64, true, false, true, false, nullptr, {}, 0, 0, false},
+    {fourcc("RGfA"), "128RGBAFloat", 128, true, false, true, false, nullptr, {}, 0, 0, false},
+    {fourcc("2vuy"), "422YpCbCr8", 16, false, true, false, false, "VideoRange", {}, 0, 0, false},
+    {fourcc("yuvs"), "422YpCbCr8_yuvs", 16, false, true, false, false, "VideoRange", {}, 0, 0, false},
+    {fourcc("L008"), "OneComponent8", 8, false, false, false, true, nullptr, {}, 0, 0, false},
+    {fourcc("L016"), "OneComponent16", 16, false, false, false, true, nullptr, {}, 0, 0, false},
+    {fourcc("L00h"), "OneComponent16Half", 16, false, false, false, true, nullptr, {}, 0, 0, false},
+    {fourcc("L00f"), "OneComponent32Float", 32, false, false, false, true, nullptr, {}, 0, 0, false},
+    {fourcc("b16g"), "16Gray", 16, false, false, false, true, nullptr, {}, 0, 0, false},
+    {fourcc("2C08"), "TwoComponent8", 16, false, false, false, false, nullptr, {}, 0, 0, false},
+    {fourcc("2C16"), "TwoComponent16", 32, false, false, false, false, nullptr, {}, 0, 0, false},
+    {fourcc("2C0h"), "TwoComponent16Half", 32, false, false, false, false, nullptr, {}, 0, 0, false},
+    {fourcc("2C0f"), "TwoComponent32Float", 64, false, false, false, false, nullptr, {}, 0, 0, false},
+    {fourcc("420v"), "420YpCbCr8BiPlanarVideoRange", 0, false, true, false, false, "VideoRange", {8, 16, 0}, 2, 2, false},
+    {fourcc("420f"), "420YpCbCr8BiPlanarFullRange", 0, false, true, false, false, "FullRange", {8, 16, 0}, 2, 2, false},
+    {fourcc("x420"), "420YpCbCr10BiPlanarVideoRange", 0, false, true, false, false, "VideoRange", {16, 32, 0}, 2, 2, false},
+    {fourcc("xf20"), "420YpCbCr10BiPlanarFullRange", 0, false, true, false, false, "FullRange", {16, 32, 0}, 2, 2, false},
+    {fourcc("y420"), "420YpCbCr8Planar", 0, false, true, false, false, "VideoRange", {8, 8, 8}, 2, 2, false},
+    {fourcc("f420"), "420YpCbCr8PlanarFullRange", 0, false, true, false, false, "FullRange", {8, 8, 8}, 2, 2, false},
+    {fourcc("422v"), "422YpCbCr8BiPlanarVideoRange", 0, false, true, false, false, "VideoRange", {8, 16, 0}, 2, 1, false},
+    {fourcc("422f"), "422YpCbCr8BiPlanarFullRange", 0, false, true, false, false, "FullRange", {8, 16, 0}, 2, 1, false},
+    {fourcc("444v"), "444YpCbCr8BiPlanarVideoRange", 0, false, true, false, false, "VideoRange", {8, 16, 0}, 1, 1, false},
+    {fourcc("444f"), "444YpCbCr8BiPlanarFullRange", 0, false, true, false, false, "FullRange", {8, 16, 0}, 1, 1, false},
 }};
 
 struct Region final : ObjectPayload { std::array<double, 4> rect{}; };
@@ -230,6 +261,49 @@ void Provider::install_media() {
     string(core_video, "_kCVImageBufferColorPrimaries_DCI_P3", "DCI_P3");
     string(core_video, "_kCVImageBufferColorPrimaries_P3_D65", "P3_D65");
     string(core_video, "_kCVImageBufferAmbientViewingEnvironmentKey", "AmbientViewingEnvironment");
+    // The remaining buffer, image buffer, pixel buffer and Metal cache keys of the CoreVideo headers.
+    for (const auto& [symbol, value] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"_kCVBufferMovieTimeKey", "MovieTime"}, {"_kCVBufferTimeValueKey", "TimeValue"}, {"_kCVBufferTimeScaleKey", "TimeScale"},
+             {"_kCVBufferPropagatedAttachmentsKey", "PropagatedAttachments"}, {"_kCVBufferNonPropagatedAttachmentsKey", "NonPropagatedAttachments"},
+             {"_kCVImageBufferAlphaChannelIsOpaque", "AlphaChannelIsOpaque"}, {"_kCVImageBufferAlphaChannelModeKey", "AlphaChannelMode"},
+             {"_kCVImageBufferAlphaChannelMode_PremultipliedAlpha", "PremultipliedAlpha"},
+             {"_kCVImageBufferAlphaChannelMode_StraightAlpha", "StraightAlpha"}, {"_kCVImageBufferCGColorSpaceKey", "CGColorSpace"},
+             {"_kCVImageBufferChromaLocationBottomFieldKey", "CVImageBufferChromaLocationBottomField"},
+             {"_kCVImageBufferChromaLocation_Left", "Left"}, {"_kCVImageBufferChromaLocation_Center", "Center"},
+             {"_kCVImageBufferChromaLocation_TopLeft", "TopLeft"}, {"_kCVImageBufferChromaLocation_Top", "Top"},
+             {"_kCVImageBufferChromaLocation_BottomLeft", "BottomLeft"}, {"_kCVImageBufferChromaLocation_Bottom", "Bottom"},
+             {"_kCVImageBufferChromaLocation_DV420", "DV 4:2:0"}, {"_kCVImageBufferChromaSubsamplingKey", "CVImageBufferChromaSubsampling"},
+             {"_kCVImageBufferChromaSubsampling_420", "420"}, {"_kCVImageBufferChromaSubsampling_422", "422"},
+             {"_kCVImageBufferChromaSubsampling_411", "411"}, {"_kCVImageBufferDisplayDimensionsKey", "CVDisplayDimensions"},
+             {"_kCVImageBufferDisplayWidthKey", "Width"}, {"_kCVImageBufferDisplayHeightKey", "Height"},
+             {"_kCVImageBufferDisplayMaskRectangleKey", "DisplayMaskRectangle"},
+             {"_kCVImageBufferDisplayMaskRectangleStereoLeftKey", "DisplayMaskRectangleStereoLeft"},
+             {"_kCVImageBufferDisplayMaskRectangleStereoRightKey", "DisplayMaskRectangleStereoRight"},
+             {"_kCVImageBufferDisplayMaskRectangle_ReferenceRasterWidthKey", "ReferenceRasterWidth"},
+             {"_kCVImageBufferDisplayMaskRectangle_ReferenceRasterHeightKey", "ReferenceRasterHeight"},
+             {"_kCVImageBufferDisplayMaskRectangle_RectangleLeftKey", "RectangleLeft"},
+             {"_kCVImageBufferDisplayMaskRectangle_RectangleWidthKey", "RectangleWidth"},
+             {"_kCVImageBufferDisplayMaskRectangle_RectangleTopKey", "RectangleTop"},
+             {"_kCVImageBufferDisplayMaskRectangle_RectangleHeightKey", "RectangleHeight"},
+             {"_kCVImageBufferDisplayMaskRectangle_LeftEdgePointsKey", "LeftEdgePoints"},
+             {"_kCVImageBufferDisplayMaskRectangle_RightEdgePointsKey", "RightEdgePoints"},
+             {"_kCVImageBufferHorizontalDisparityAdjustmentKey", "HorizontalDisparityAdjustment"},
+             {"_kCVImageBufferICCProfileKey", "CVImageBufferICCProfile"},
+             {"_kCVImageBufferLogTransferFunctionKey", "LogTransferFunction"}, {"_kCVImageBufferLogTransferFunction_AppleLog", "AppleLog"},
+             {"_kCVImageBufferLogTransferFunction_AppleLog2", "AppleLog2"},
+             {"_kCVImageBufferPostDecodeProcessingSequenceMetadataKey", "PostDecodeProcessingSequenceMetadata"},
+             {"_kCVImageBufferPostDecodeProcessingFrameMetadataKey", "PostDecodeProcessingFrameMetadata"},
+             {"_kCVImageBufferPreferredCleanApertureKey", "CVImageBufferPreferredCleanAperture"},
+             {"_kCVImageBufferRegionOfInterestKey", "RegionOfInterest"}, {"_kCVImageBufferSceneIlluminationKey", "SceneIllumination"},
+             {"_kCVMetalBufferCacheMaximumBufferAgeKey", "MaximumBufferAge"}, {"_kCVMetalTextureCacheMaximumTextureAgeKey", "MaximumTextureAge"},
+             {"_kCVMetalTextureStorageMode", "MetalTextureStorageMode"}, {"_kCVMetalTextureUsage", "MetalTextureUsage"},
+             {"_kCVPixelBufferIOSurfaceOpenGLESFBOCompatibilityKey", "IOSurfaceOpenGLESFBOCompatibility"},
+             {"_kCVPixelBufferIOSurfaceOpenGLESTextureCompatibilityKey", "IOSurfaceOpenGLESTextureCompatibility"},
+             {"_kCVPixelBufferIOSurfacePurgeableKey", "IOSurfacePurgeable"}, {"_kCVPixelBufferOpenGLESCompatibilityKey", "OpenGLESCompatibility"},
+             {"_kCVPixelBufferOpenGLESTextureCacheCompatibilityKey", "OpenGLESTextureCacheCompatibility"},
+             {"_kCVPixelBufferPoolFreeBufferNotification", "kCVPixelBufferPoolFreeBufferNotification"},
+         })
+        string(core_video, symbol, value);
     string(core_video, "_kCVPixelFormatConstant", "PixelFormat");
     string(core_video, "_kCVPixelFormatBitsPerBlock", "BitsPerBlock");
     string(core_video, "_kCVPixelFormatContainsAlpha", "ContainsAlpha");
@@ -248,37 +322,91 @@ void Provider::install_media() {
         s.x[0] = call(core_video, "_CVBufferGetAttachment", {s.x[0], s.x[1], 0}) != 0;
     });
     constant(core_video, "_CVIsCompressedPixelFormatAvailable", 0);   // no compressed pixel formats
-    raw(core_video, "_CVPixelFormatDescriptionCreateWithPixelFormatType", [this](CpuState& s, GuestMemory&) {
-        const auto type = static_cast<std::uint32_t>(s.x[1]);
+    // The kCVPixelFormat* keys (their strings are the descriptions' keys below).
+    for (const auto* key : {"Name", "BitsPerComponent", "BlackBlock", "BlockHeight", "BlockHorizontalAlignment", "BlockVerticalAlignment",
+                            "BlockWidth", "CGBitmapContextCompatibility", "CGBitmapInfo", "CGImageCompatibility", "CodecType",
+                            "ContainsGrayscale", "ContainsSenselArray", "FillExtendedPixelsCallback", "FourCC", "HorizontalSubsampling",
+                            "OpenGLCompatibility", "OpenGLESCompatibility", "OpenGLFormat", "OpenGLInternalFormat", "OpenGLType",
+                            "QDCompatibility", "VerticalSubsampling"})
+        string(core_video, std::string("_kCVPixelFormat") + key, key);
+    // Descriptions registered with CVPixelFormatDescriptionRegisterDescriptionWithPixelFormatType (retained).
+    auto registered = std::make_shared<std::map<std::uint32_t, Address>>();
+    // A +1 description of `type` (NULL when it is not a format here).
+    const auto describe = [this, registered](std::uint32_t type) -> Address {
+        if (const auto found = registered->find(type); found != registered->end()) return retain(found->second);
         const PixelFormat* format = nullptr;
         for (const auto& entry : pixel_formats) if (entry.type == type) format = &entry;
-        if (!format) { s.x[0] = 0; return; }
+        if (!format) return 0;
         std::vector<std::pair<std::string, Address>> entries;
         entries.emplace_back("PixelFormat", cf.integer(type, 3));
+        entries.emplace_back("Name", cf.string(format->name));
         entries.emplace_back("ContainsAlpha", cf.boolean(format->alpha));
         entries.emplace_back("ContainsYCbCr", cf.boolean(format->ycbcr));
         entries.emplace_back("ContainsRGB", cf.boolean(format->rgb));
+        entries.emplace_back("ContainsGrayscale", cf.boolean(format->gray));
         if (format->range) entries.emplace_back("ComponentRange", cf.string(format->range));
+        if (format->cg) {
+            entries.emplace_back("CGBitmapContextCompatibility", cf.boolean(true));
+            entries.emplace_back("CGImageCompatibility", cf.boolean(true));
+        }
         if (format->bits_per_block) {
             entries.emplace_back("BitsPerBlock", cf.integer(format->bits_per_block, 3));
         } else {
             std::vector<Address> planes;
-            for (const auto bits : format->planes) {
+            for (std::size_t i = 0; i < format->planes.size(); ++i) {
+                const auto bits = format->planes[i];
                 if (!bits) continue;
-                const auto key = cf.string("BitsPerBlock");
-                const auto number = cf.integer(bits, 3);
-                const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> plane{{{key, number}}};
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> plane{{cf.string("BitsPerBlock"), cf.integer(bits, 3)}};
+                if (i > 0) {   // the chroma planes' subsampling
+                    plane.emplace_back(cf.string("HorizontalSubsampling"), cf.integer(format->chroma_h, 3));
+                    plane.emplace_back(cf.string("VerticalSubsampling"), cf.integer(format->chroma_v, 3));
+                }
                 planes.push_back(cf.dictionary(plane));
-                release(key);
-                release(number);
+                for (const auto& [k, v] : plane) { release(k); release(v); }
             }
             entries.emplace_back("Planes", cf.array(planes));
             for (const auto plane : planes) release(plane);
         }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
         for (const auto& [key, value] : entries) pairs.emplace_back(cf.string(key), value);
-        s.x[0] = cf.dictionary(pairs);
+        const auto description = cf.dictionary(pairs);
         for (const auto& [key, value] : pairs) { release(key); release(value); }
+        return description;
+    };
+    // CVPixelFormatDescriptionCreateWithPixelFormatType(allocator, OSType): +1.
+    raw(core_video, "_CVPixelFormatDescriptionCreateWithPixelFormatType", [describe](CpuState& s, GuestMemory&) {
+        s.x[0] = describe(static_cast<std::uint32_t>(s.x[1]));
+    });
+    // CVPixelFormatDescriptionArrayCreateWithAllPixelFormatTypes(allocator): +1, the format types as CFNumbers.
+    raw(core_video, "_CVPixelFormatDescriptionArrayCreateWithAllPixelFormatTypes", [this, registered](CpuState& s, GuestMemory&) {
+        std::vector<Address> numbers;
+        for (const auto& entry : pixel_formats) numbers.push_back(cf.integer(entry.type, 3));
+        for (const auto& [type, description] : *registered)
+            if (std::none_of(pixel_formats.begin(), pixel_formats.end(), [type](const PixelFormat& f) { return f.type == type; }))
+                numbers.push_back(cf.integer(type, 3));
+        s.x[0] = cf.array(numbers);
+        for (const auto n : numbers) release(n);
+    });
+    // CVPixelFormatDescriptionRegisterDescriptionWithPixelFormatType(CFDictionaryRef, OSType): kept and described
+    // from then on (a buffer of it still needs a layout CVPixelBufferCreate knows).
+    raw(core_video, "_CVPixelFormatDescriptionRegisterDescriptionWithPixelFormatType", [this, registered](CpuState& s, GuestMemory&) {
+        if (!s.x[0]) return;
+        auto& slot = (*registered)[static_cast<std::uint32_t>(s.x[1])];
+        const auto old = std::exchange(slot, retain(s.x[0]));
+        if (old) release(old);
+    });
+    // CVPixelFormatTypeCopyFourCharCodeString(OSType): +1, the four characters, or "0x" and eight hex digits
+    // for a code that is not printable (the numeric types such as kCVPixelFormatType_32ARGB).
+    raw(core_video, "_CVPixelFormatTypeCopyFourCharCodeString", [this](CpuState& s, GuestMemory&) {
+        const auto type = static_cast<std::uint32_t>(s.x[0]);
+        std::string text;
+        for (int shift = 24; shift >= 0; shift -= 8) text.push_back(static_cast<char>((type >> shift) & 0xff));
+        if (!std::all_of(text.begin(), text.end(), [](char c) { return c >= 0x20 && c < 0x7f; })) {
+            char hex[16];
+            std::snprintf(hex, sizeof hex, "0x%08x", type);
+            text = hex;
+        }
+        s.x[0] = cf.string(text);
     });
 
     // ---------------------------------------------------------------- CoreMedia

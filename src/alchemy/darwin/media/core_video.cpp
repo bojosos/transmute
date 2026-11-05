@@ -86,6 +86,7 @@ struct PixelBuffer final : ObjectPayload {
     Address data{};                    // the block (planar: the first plane's start)
     std::uint64_t data_size{};
     Address surface{};                 // retained IOSurface, or 0
+    Address attributes{};              // retained creation attributes, or 0 (CVPixelBufferCopyCreationAttributes)
     Address owned{};                   // malloc'd block, or 0
     Address release_callback{}, release_refcon{}, plane_addresses{};   // caller's memory
     bool planar_callback{};
@@ -167,6 +168,7 @@ std::int32_t CoreVideo::create(std::uint32_t width, std::uint32_t height, std::u
     state->planar = spec->plane_count != 0;
     state->planes = layout(*spec, width, height, std::max<std::uint64_t>(alignment, 16));
     state->pool = pool;
+    state->attributes = attributes ? retain(attributes) : 0;
     // IOSurface-backed when asked for, and for Metal and OpenGL use (their textures alias the surface).
     const auto truthy = [&](std::string_view key) { const auto v = value(attributes, key); return v && cf.number_value(v).value_or(0) != 0; };
     if (value(attributes, "IOSurfaceProperties") || truthy("MetalCompatibility") || truthy("OpenGLCompatibility")) {
@@ -202,7 +204,11 @@ std::int32_t CoreVideo::create(std::uint32_t width, std::uint32_t height, std::u
         if (!surface) return cv_allocation_failed;
         const auto made = create_with_surface(surface, out);
         release(surface);   // the buffer holds its own reference
-        if (const auto b = buffer(out)) b->pool = pool;
+        if (const auto b = buffer(out)) {
+            b->pool = pool;
+            b->attributes = std::exchange(state->attributes, 0);
+        }
+        if (state->attributes) release(std::exchange(state->attributes, 0));
         return made;
     }
     std::uint64_t total = 0;
@@ -269,6 +275,7 @@ void CoreVideo::install_buffers() {
             for (const auto& a : attachments) { release(a.key); release(a.value); }
             release(snapshot);
             if (b->surface) release(b->surface);
+            if (b->attributes) release(b->attributes);
             if (b->owned) free(b->owned);
             if (b->release_callback) {
                 EngineAdapter adapter(process.calling_engine());
@@ -393,6 +400,23 @@ void CoreVideo::install_buffers() {
         });
     };
     getter("_CVPixelBufferGetWidth", [](const PixelBuffer& b) -> Address { return b.width; });
+    // CVPixelBufferCopyCreationAttributes(buffer): +1, the attributes it was made with and its Width, Height and
+    // PixelFormatType.
+    raw(core_video, "_CVPixelBufferCopyCreationAttributes", [this](CpuState& s, GuestMemory&) {
+        const auto b = buffer(s.x[0]);
+        if (!b) { s.x[0] = 0; return; }
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> entries;
+        if (b->attributes)
+            for (const auto& [key, value] : cf.dictionary_entries(b->attributes)) {
+                const auto name = cf.utf8(key);
+                if (name != "Width" && name != "Height" && name != "PixelFormatType") entries.emplace_back(retain(key), retain(value));
+            }
+        entries.emplace_back(cf.string("Width"), cf.integer(b->width, 9));
+        entries.emplace_back(cf.string("Height"), cf.integer(b->height, 9));
+        entries.emplace_back(cf.string("PixelFormatType"), cf.integer(b->format, 9));
+        s.x[0] = cf.dictionary(entries);
+        for (const auto& [k, v] : entries) { release(k); release(v); }
+    });
     getter("_CVPixelBufferGetHeight", [](const PixelBuffer& b) -> Address { return b.height; });
     getter("_CVPixelBufferGetPixelFormatType", [](const PixelBuffer& b) -> Address { return b.format; });
     getter("_CVPixelBufferGetBaseAddress", [](const PixelBuffer& b) -> Address { return b.planar ? b.data : b.planes[0].base; });
