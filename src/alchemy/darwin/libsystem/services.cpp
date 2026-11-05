@@ -884,6 +884,18 @@ void DarwinServices::Impl::install_all() {
     // Last: replaces the stubs above (popen, pclose) and the ENOSYS process calls.
     install_process_services();
     install_inherited_descriptors();
+    // The $NOCANCEL variants libc's own callers bind (after every replacement above). No call here is a pthread
+    // cancellation point but those process/threads.cpp names, so each variant is its call; lstat64 is lstat.
+    for (const auto target : {"_accept", "_connect", "_fsync", "_msync", "_nanosleep", "_openat", "_poll", "_pread", "_pwrite",
+                              "_readv", "_writev", "_recvfrom", "_recvmsg", "_sendmsg", "_sendto", "_select$DARWIN_EXTSN"}) {
+        const auto found = context.resolve(system_library, target);
+        if (!found) throw std::logic_error(std::string("Alchemy libSystem: no ") + target + " for its $NOCANCEL variant");
+        context.install_export(std::string(system_library), std::string(target) + "$NOCANCEL", *found);
+    }
+    context.install_export(std::string(system_library), "_lstat64", *context.resolve(system_library, "_lstat"));
+    // int mlockall(int) / munlockall(void): ENOSYS, as Darwin's kernel answers them (mlock locks ranges).
+    for (const auto name : {"_mlockall", "_munlockall"})
+        install(name, [](auto&, auto&) -> std::uint64_t { throw ServiceError{enosys}; });
 }
 
 std::uint64_t DarwinServices::Impl::syscall(std::uint64_t number, transmute::CpuState& s, transmute::GuestMemory& m) {

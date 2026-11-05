@@ -6,6 +6,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <map>
 #include <set>
 #include <thread>
 #include <tuple>
@@ -1249,6 +1250,89 @@ void test_b21(Fixture& f) {
     f.sys("_signal", {30, 0});
 }
 
+// B24: the $NOCANCEL variants and lstat64, mlockall, getattrlistbulk over a directory's position, the dyld image
+// queries.
+void test_b24(Fixture& f) {
+    const auto system = "/usr/lib/libSystem.B.dylib";
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    for (const auto* name : {"_accept", "_connect", "_fsync", "_msync", "_nanosleep", "_openat", "_poll", "_pread", "_pwrite", "_readv",
+                             "_writev", "_recvfrom", "_recvmsg", "_sendmsg", "_sendto", "_select$DARWIN_EXTSN"})
+        require(f.symbol(system, std::string(name) + "$NOCANCEL") == f.symbol(system, name), "a $NOCANCEL variant is its call");
+    require(f.symbol(system, "_lstat64") == f.symbol(system, "_lstat"), "lstat64 is lstat");
+    require(f.sys("_mlockall", {3}) == UINT64_MAX && errno_value() == 78 && f.sys("_munlockall", {}) == UINT64_MAX && errno_value() == 78,
+            "mlockall/munlockall: ENOSYS, as Darwin");
+
+    // getattrlistbulk: NAME, OBJTYPE and ERROR for each entry of a directory with two files and a subdirectory.
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy-bulk";
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    std::filesystem::create_directories(directory / "inner");
+    std::ofstream(directory / "one.txt") << "1";
+    std::ofstream(directory / "two.txt") << "22";
+    const auto guest_directory = alchemy::guest_path_string(directory);
+    const auto fd = f.sys("_open", {f.text(guest_directory), 0});
+    require(static_cast<std::int32_t>(fd) >= 0, "open the directory");
+    const auto list = f.process.allocate_guest(24), buffer = f.process.allocate_guest(4096);
+    f.engine.fill_bytes(list, 0, 24);
+    f.engine.write32(list, 5);
+    f.engine.write32(list + 4, 0x80000000U | 0x1 | 0x8 | 0x20000000U);   // RETURNED_ATTRS, NAME, OBJTYPE, ERROR
+    const auto entries = [&](std::uint64_t count) {
+        std::map<std::string, std::uint32_t> found;
+        std::uint64_t at = buffer;
+        for (std::uint64_t index = 0; index < count; ++index) {
+            const auto length = f.engine.read32(at);
+            require(length % 8 == 0 && f.engine.read32(at + 4) == (0x80000000U | 0x1 | 0x8 | 0x20000000U), "an entry with every attribute");
+            const auto name = f.read(at + 24 + static_cast<std::int32_t>(f.engine.read32(at + 24)));
+            require(f.engine.read32(at + 36) == 0, "ATTR_CMN_ERROR 0");
+            found[name] = f.engine.read32(at + 32);
+            at += length;
+        }
+        return found;
+    };
+    require(f.sys("_getattrlistbulk", {fd, list, buffer, 4096, 0}) == 3, "three entries");
+    const auto all = entries(3);
+    require(all.size() == 3 && all.at("one.txt") == 1 && all.at("two.txt") == 1 && all.at("inner") == 2, "names and VREG/VDIR");
+    require(f.sys("_getattrlistbulk", {fd, list, buffer, 4096, 0}) == 0, "then the end");
+    require(f.sys("_lseek", {fd, 0, 1}) == 3 && f.sys("_lseek", {fd, 0, 0}) == 0, "lseek reads and rewinds the position");
+    // One entry at a time: the buffer holds one record; a duplicate shares the position.
+    const auto one = f.engine.read32(buffer);
+    require(f.sys("_getattrlistbulk", {fd, list, buffer, one, 0}) == 1, "one entry fits");
+    const auto copy = f.sys("_dup", {fd});
+    require(f.sys("_lseek", {copy, 0, 1}) == 1 && f.sys("_getattrlistbulk", {copy, list, buffer, 4096, 0}) == 2 &&
+            f.sys("_lseek", {fd, 0, 1}) == 3, "a duplicate shares the position");
+    f.sys("_lseek", {fd, 0, 0});
+    require(f.sys("_getattrlistbulk", {fd, list, buffer, 8, 0}) == UINT64_MAX && errno_value() == 34, "no room for one entry: ERANGE");
+    f.engine.write32(list + 4, 0x1);
+    require(f.sys("_getattrlistbulk", {fd, list, buffer, 4096, 0}) == UINT64_MAX && errno_value() == 22, "RETURNED_ATTRS is required");
+    const auto file = f.sys("_open", {f.text(guest_directory + "/one.txt"), 0});
+    f.engine.write32(list + 4, 0x80000000U | 0x1);
+    require(f.sys("_getattrlistbulk", {file, list, buffer, 4096, 0}) == UINT64_MAX && errno_value() == 20, "a file: ENOTDIR");
+    require(f.sys("_lseek", {fd, 0, 2}) == UINT64_MAX && errno_value() == 22, "SEEK_END on a directory: EINVAL");
+    for (const auto descriptor : {fd, copy, file}) f.sys("_close", {descriptor});
+    std::filesystem::remove_all(directory, ignored);
+
+    // The dyld image queries on a made-up header: LC_UUID found, a wrong magic refused; no shared cache.
+    const auto header = f.process.allocate_guest(256), uuid = f.process.allocate_guest(16);
+    f.engine.fill_bytes(header, 0, 256);
+    f.engine.write32(header, 0xfeedfacfU); f.engine.write32(header + 12, 6); f.engine.write32(header + 16, 2); f.engine.write32(header + 20, 72 + 24);
+    f.engine.write32(header + 32, 0x19); f.engine.write32(header + 36, 72);   // LC_SEGMENT_64
+    f.engine.write32(header + 104, 0x1b); f.engine.write32(header + 108, 24);   // LC_UUID
+    auto& bytes = static_cast<transmute::GuestMemory&>(f.engine);
+    for (std::uint64_t index = 0; index < 16; ++index) bytes.write8(header + 112 + index, static_cast<std::uint8_t>(0xa0 + index));
+    require(f.sys("__dyld_get_image_uuid", {header, uuid}) == 1 && bytes.read8(uuid) == 0xa0 && bytes.read8(uuid + 15) == 0xaf,
+            "_dyld_get_image_uuid");
+    f.engine.write32(header, 0xfeedfaceU);
+    require(f.sys("__dyld_get_image_uuid", {header, uuid}) == 0, "not a 64-bit Mach-O header");
+    const auto length = f.process.allocate_guest(8);
+    f.engine.write64(length, 77);
+    require(f.sys("__dyld_get_shared_cache_range", {length}) == 0 && f.engine.read64(length) == 77 &&
+            f.sys("__dyld_get_shared_cache_uuid", {uuid}) == 0, "no shared cache");
+    require(f.sys("__dyld_is_memory_immutable", {header, 16}) == 0 && f.sys("__dyld_image_containing_address", {header}) == 0,
+            "heap memory is neither immutable nor in an image");
+    const auto program = f.sys("__dyld_get_prog_image_header", {});
+    require(!program || f.engine.read32(program + 12) == 2, "_dyld_get_prog_image_header is an executable's");
+}
+
 // B22: getloadavg, sysctl vm.loadavg and host_statistics(HOST_LOAD_INFO) from the host's load averages.
 void test_b22(Fixture& f) {
     const auto processors = static_cast<double>(std::thread::hardware_concurrency());
@@ -1678,6 +1762,7 @@ int main() {
         stage("b20"); test_b20(f);
         stage("b21"); test_b21(f);
         stage("b22"); test_b22(f);
+        stage("b24"); test_b24(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

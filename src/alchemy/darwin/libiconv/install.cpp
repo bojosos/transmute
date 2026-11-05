@@ -10,7 +10,9 @@
 
 // libiconv (the GNU interface as shipped in /usr/lib/libiconv.2.dylib):
 // iconv_open/iconv/iconv_close (and the lib-prefixed names) between UTF-8,
-// UTF-16, UCS-2, UTF-32, ASCII and Latin-1, with //TRANSLIT and //IGNORE.
+// UTF-16, UCS-2, UTF-32, ASCII and Latin-1, with //TRANSLIT and //IGNORE;
+// iconvctl (TRIVIALP and the transliterate / discard-ilseq switches),
+// iconvlist and iconv_canonicalize over the same names.
 // Moved from darwin/identities/frameworks.cpp (the headless framework set);
 // registered in both builds by install_darwin_frameworks.
 namespace alchemy::darwin_headless {
@@ -20,34 +22,52 @@ constexpr std::string_view iconv_library = darwin_framework_libraries[15];
 
 // <sys/errno.h>
 constexpr std::uint32_t e2big = 7, ebadf = 9, einval = 22, eilseq = 92;
+// <iconv.h> iconvctl requests.
+constexpr std::uint64_t iconv_trivialp = 0, iconv_get_transliterate = 1, iconv_set_transliterate = 2,
+    iconv_get_discard_ilseq = 3, iconv_set_discard_ilseq = 4;
 
 // ---- iconv (GNU libiconv interface as shipped in /usr/lib/libiconv.2.dylib) ----
 enum class Form { utf8, utf16, ucs2, utf32, ascii, latin1 };
 struct Charset { Form form{Form::utf8}; bool big{true}, detect{}, mark{}; };
-std::optional<Charset> charset(std::string name) {
-    for (auto& character : name) if (character >= 'a' && character <= 'z') character = static_cast<char>(character - 'a' + 'A');
-    const auto is = [&](std::initializer_list<std::string_view> names) {
-        return std::find(names.begin(), names.end(), name) != names.end();
+bool operator==(const Charset& a, const Charset& b) {
+    return a.form == b.form && a.big == b.big && a.detect == b.detect && a.mark == b.mark;
+}
+// The charsets and their names (upper case), the canonical one first: iconv_open, iconvlist and iconv_canonicalize.
+struct CharsetNames { Charset value; std::vector<std::string_view> names; };
+const std::vector<CharsetNames>& charsets() {
+    static const std::vector<CharsetNames> table{
+        {{Form::utf8}, {"UTF-8", "UTF8"}},
+        {{Form::utf16, true, true, true}, {"UTF-16"}},
+        {{Form::utf16, true}, {"UTF-16BE"}},
+        {{Form::utf16, false}, {"UTF-16LE"}},
+        {{Form::ucs2, true, true, false}, {"UCS-2", "ISO-10646-UCS-2", "CSUNICODE"}},
+        {{Form::ucs2, true}, {"UCS-2BE", "UNICODEBIG", "UNICODE-1-1", "CSUNICODE11"}},
+        {{Form::ucs2, false}, {"UCS-2LE", "UNICODELITTLE", "UCS-2-INTERNAL"}},
+        {{Form::utf32, true, true, true}, {"UTF-32"}},
+        {{Form::utf32, true}, {"UTF-32BE"}},
+        // WCHAR_T is native 32-bit.
+        {{Form::utf32, false}, {"UTF-32LE", "UCS-4-INTERNAL", "WCHAR_T"}},
+        {{Form::utf32, true, true, false}, {"UCS-4", "ISO-10646-UCS-4", "CSUCS4"}},
+        {{Form::utf32, true}, {"UCS-4BE"}},
+        {{Form::utf32, false}, {"UCS-4LE"}},
+        {{Form::ascii}, {"ASCII", "US-ASCII", "ANSI_X3.4-1968", "ANSI_X3.4-1986", "ISO646-US", "ISO_646.IRV:1991",
+                         "US", "IBM367", "CP367", "CSASCII", "ISO-IR-6"}},
+        {{Form::latin1}, {"ISO-8859-1", "ISO8859-1", "ISO_8859-1", "ISO_8859-1:1987", "LATIN1", "L1", "IBM819", "CP819",
+                          "CSISOLATIN1", "ISO-IR-100"}},
     };
-    // Darwin's locale_charset() is always UTF-8; WCHAR_T is native 32-bit.
-    if (is({"", "CHAR", "UTF-8", "UTF8"})) return Charset{Form::utf8};
-    if (is({"UTF-16"})) return Charset{Form::utf16, true, true, true};
-    if (is({"UTF-16BE"})) return Charset{Form::utf16, true};
-    if (is({"UTF-16LE"})) return Charset{Form::utf16, false};
-    if (is({"UCS-2", "ISO-10646-UCS-2", "CSUNICODE"})) return Charset{Form::ucs2, true, true, false};
-    if (is({"UCS-2BE", "UNICODEBIG", "UNICODE-1-1", "CSUNICODE11"})) return Charset{Form::ucs2, true};
-    if (is({"UCS-2LE", "UNICODELITTLE", "UCS-2-INTERNAL"})) return Charset{Form::ucs2, false};
-    if (is({"UTF-32"})) return Charset{Form::utf32, true, true, true};
-    if (is({"UTF-32BE"})) return Charset{Form::utf32, true};
-    if (is({"UTF-32LE", "UCS-4-INTERNAL", "WCHAR_T"})) return Charset{Form::utf32, false};
-    if (is({"UCS-4", "ISO-10646-UCS-4", "CSUCS4"})) return Charset{Form::utf32, true, true, false};
-    if (is({"UCS-4BE"})) return Charset{Form::utf32, true};
-    if (is({"UCS-4LE"})) return Charset{Form::utf32, false};
-    if (is({"ASCII", "US-ASCII", "ANSI_X3.4-1968", "ANSI_X3.4-1986", "ISO646-US", "ISO_646.IRV:1991",
-            "US", "IBM367", "CP367", "CSASCII", "ISO-IR-6"})) return Charset{Form::ascii};
-    if (is({"ISO-8859-1", "ISO8859-1", "ISO_8859-1", "ISO_8859-1:1987", "LATIN1", "L1", "IBM819", "CP819",
-            "CSISOLATIN1", "ISO-IR-100"})) return Charset{Form::latin1};
-    return std::nullopt;
+    return table;
+}
+const CharsetNames* charset_names(std::string name) {
+    for (auto& character : name) if (character >= 'a' && character <= 'z') character = static_cast<char>(character - 'a' + 'A');
+    // Darwin's locale_charset() is always UTF-8.
+    if (name.empty() || name == "CHAR") name = "UTF-8";
+    for (const auto& entry : charsets())
+        if (std::find(entry.names.begin(), entry.names.end(), name) != entry.names.end()) return &entry;
+    return nullptr;
+}
+std::optional<Charset> charset(std::string name) {
+    const auto found = charset_names(std::move(name));
+    return found ? std::optional<Charset>(found->value) : std::nullopt;
 }
 struct Converter {
     Charset from, to;
@@ -181,6 +201,18 @@ public:
     using Provider::Provider;
     std::mutex iconv_mutex;
     std::map<Address, std::shared_ptr<Converter>> converters;
+    // Charset names as guest strings, made once and kept (iconv_canonicalize returns them).
+    std::map<std::string_view, Address> name_texts;
+    Address name_text(std::string_view name) {
+        std::lock_guard lock(iconv_mutex);
+        auto& text = name_texts[name];
+        if (!text) {
+            text = context.allocate_guest(name.size() + 1);
+            memory().write_bytes(text, std::span(reinterpret_cast<const std::uint8_t*>(name.data()), name.size()));
+            memory().write8(text + name.size(), 0);
+        }
+        return text;
+    }
     std::shared_ptr<Converter> converter(Address handle) {
         std::lock_guard lock(iconv_mutex);
         const auto found = converters.find(handle);
@@ -234,11 +266,57 @@ public:
             if (result.error) { context.set_errno(result.error); s.x[0] = UINT64_MAX; return; }
             s.x[0] = result.irreversible;
         };
+        // int iconvctl(iconv_t, int request, void* argument): ICONV_TRIVIALP (the conversion copies bytes as
+        // they are) and the //TRANSLIT and //IGNORE switches, through an int. ICONV_SET_HOOKS / _FALLBACKS (and
+        // anything else): EINVAL, as this converter never calls back.
+        const auto control = [this](CpuState& s, GuestMemory& m) {
+            const auto state = converter(s.x[0]);
+            if (!state) { context.set_errno(ebadf); s.x[0] = UINT64_MAX; return; }
+            const auto request = s.x[1], argument = s.x[2];
+            if (request > iconv_set_discard_ilseq || !argument) { context.set_errno(einval); s.x[0] = UINT64_MAX; return; }
+            switch (request) {
+            case iconv_trivialp: m.write32(argument, state->from == state->to && !state->from.detect && !state->from.mark ? 1 : 0); break;
+            case iconv_get_transliterate: m.write32(argument, state->transliterate ? 1 : 0); break;
+            case iconv_set_transliterate: state->transliterate = m.read32(argument) != 0; break;
+            case iconv_get_discard_ilseq: m.write32(argument, state->ignore ? 1 : 0); break;
+            default: state->ignore = m.read32(argument) != 0; break;
+            }
+            s.x[0] = 0;
+        };
+        // const char* iconv_canonicalize(const char* name): the charset's canonical name (as iconvlist gives it
+        // first); an unknown name comes back as it is.
+        const auto canonicalize = [this](CpuState& s, GuestMemory& m) {
+            if (!s.x[0]) return;
+            const auto found = charset_names(guest_text(m, s.x[0], 256));
+            if (!found) return;
+            s.x[0] = name_text(found->names.front());
+        };
+        // void iconvlist(int (*do_one)(unsigned count, const char* const* names, void* data), void* data): each
+        // charset's names, until do_one returns non-zero.
+        const auto list = [this](CpuState& s, GuestMemory& m) {
+            const auto callback = s.x[0], data = s.x[1];
+            s.x[0] = 0;
+            if (!callback) return;
+            for (const auto& entry : charsets()) {
+                const auto names = context.allocate_guest(entry.names.size() * 8);
+                for (std::size_t index = 0; index < entry.names.size(); ++index) m.write64(names + index * 8, name_text(entry.names[index]));
+                Address stop{};
+                try {
+                    const std::array<Address, 3> arguments{entry.names.size(), names, data};
+                    stop = EngineAdapter(context.calling_engine()).call(callback, arguments) & 0xffffffffU;
+                } catch (...) { context.release_guest(names); throw; }
+                context.release_guest(names);
+                if (stop) return;
+            }
+        };
         for (const auto* prefix : {"_", "_lib"}) {
             function(iconv_library, std::string(prefix) + "iconv_open", open);
             function(iconv_library, std::string(prefix) + "iconv_close", close);
             function(iconv_library, std::string(prefix) + "iconv", run);
+            function(iconv_library, std::string(prefix) + "iconvctl", control);
+            function(iconv_library, std::string(prefix) + "iconvlist", list);
         }
+        function(iconv_library, "_iconv_canonicalize", canonicalize);
     }
 };
 

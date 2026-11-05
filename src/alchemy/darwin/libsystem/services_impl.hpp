@@ -1160,6 +1160,8 @@ public:
         std::shared_ptr<NetworkQueue> queue;
         bool socket_alias_released{};
         std::filesystem::path path;
+        // A directory's position (lseek, getattrlistbulk: the entries read so far), shared by its duplicates.
+        std::shared_ptr<std::atomic<std::uint64_t>> directory_position;
         std::shared_ptr<std::mutex> io_gate;
         std::mutex& mutex;
         void release_flock() noexcept {
@@ -1793,6 +1795,10 @@ public:
             if (original->closed) throw ServiceError{ebadf};
             copy->readable = original->readable; copy->writable = original->writable;
             copy->directory = original->directory; copy->path = original->path;
+            if (original->directory) {
+                if (!original->directory_position) original->directory_position = std::make_shared<std::atomic<std::uint64_t>>(0);
+                copy->directory_position = original->directory_position;
+            }
             copy->standard = original->standard; copy->flags = original->flags;
             copy->random_device = original->random_device; copy->random_flags = original->random_flags;
             copy->pipe = original->pipe; copy->pipe_status = original->pipe_status; copy->null_device = original->null_device;
@@ -2200,7 +2206,18 @@ public:
     std::uint64_t seek(int descriptor, std::uint64_t offset, int whence) {
         if (whence < 0 || whence > 2) throw ServiceError{einval};
         auto record = file(descriptor);
-        if (record->directory || record->random_device || record->standard >= 0 || record->socket || record->pipe) throw ServiceError{29};
+        if (record->directory) {
+            // A directory's position counts the entries read (getattrlistbulk); SEEK_END has no meaning there.
+            std::lock_guard lock(record->mutex);
+            if (record->closed) throw ServiceError{ebadf};
+            if (!record->directory_position) record->directory_position = std::make_shared<std::atomic<std::uint64_t>>(0);
+            const auto delta = std::bit_cast<std::int64_t>(offset);
+            const auto start = whence == 0 ? 0 : whence == 1 ? static_cast<std::int64_t>(record->directory_position->load()) : -1;
+            if (start < 0 || (delta < 0 && -delta > start) || (delta > 0 && delta > INT64_MAX - start)) throw ServiceError{einval};
+            record->directory_position->store(static_cast<std::uint64_t>(start + delta));
+            return static_cast<std::uint64_t>(start + delta);
+        }
+        if (record->random_device || record->standard >= 0 || record->socket || record->pipe) throw ServiceError{29};
         std::lock_guard lock(record->mutex);
         if (record->closed) throw ServiceError{ebadf};
         const auto result = host::files::seek(record->native, std::bit_cast<std::int64_t>(offset),

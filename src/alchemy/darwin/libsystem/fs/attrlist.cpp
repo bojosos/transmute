@@ -15,7 +15,7 @@
 #include <vector>
 
 // The getattrlist(2) family (fill-only): getattrlist, fgetattrlist, getattrlistat, setattrlist, fsetattrlist,
-// setattrlistat, from what stat, statfs, the extended attributes and the host volume report.
+// setattrlistat, getattrlistbulk, from what stat, statfs, the extended attributes and the host volume report.
 //
 // getattrlist packs, after its u_int32 length (and the attribute_set_t of ATTR_CMN_RETURNED_ATTRS), the requested
 // attributes in bit order: common, volume, directory (for a directory), file (for anything else), then the
@@ -29,10 +29,17 @@
 // setattrlist sets, in the same order and packing (without the length): ATTR_CMN_CRTIME (the host creation time),
 // MODTIME and ACCTIME (utimensat / futimens), FNDRINFO (the com.apple.FinderInfo extended attribute), OWNERID /
 // GRPID (chown), ACCESSMASK (chmod) and FLAGS (chflags: UF_HIDDEN). Any other attribute cannot be set: EINVAL.
+//
+// getattrlistbulk packs one such record per directory entry (without "." and ".."; symbolic links not followed),
+// from the directory descriptor's position on, as many as fit; each record's length covers its padding to 8 bytes.
+// ATTR_CMN_RETURNED_ATTRS is required and volume attributes are refused (EINVAL); ATTR_CMN_ERROR is 0 for every
+// entry returned (an entry that vanished since the listing is skipped). The position moves past the entries
+// returned (lseek on the directory reads and sets it); 0 entries means the end. A first entry larger than the
+// buffer: ERANGE.
 namespace alchemy::export_fill {
 namespace {
 
-constexpr std::uint32_t enoattr = 93;
+constexpr std::uint32_t enoattr = 93, enotdir = 20;
 constexpr std::uint32_t fsopt_nofollow = 0x1, fsopt_report_fullsize = 0x4, fsopt_pack_inval_attrs = 0x8, fsopt_attr_cmn_extended = 0x20;
 constexpr std::uint32_t attr_cmn_returned_attrs = 0x80000000U, attr_vol_info = 0x80000000U;
 constexpr std::uint32_t vol_valid = 0xF007FFFFU, dir_valid = 0x3FU, file_valid = 0x7FFFU, cmnext_valid = 0x1FFCU;
@@ -113,6 +120,58 @@ public:
     }
 
     std::uint64_t get(const Target& target, std::uint64_t list, std::uint64_t buffer, std::uint64_t size, std::uint32_t options) {
+        auto out = pack(target, list, options, false);
+        if (size < 4) throw Errno{einval};
+        const auto total = out.size();
+        const auto written = static_cast<std::size_t>(std::min<std::uint64_t>(size, total));
+        if (written < total && !(options & fsopt_report_fullsize)) {
+            const auto shown = static_cast<std::uint32_t>(written);
+            std::memcpy(out.data(), &shown, 4);
+        }
+        m_.write_bytes(buffer, std::span<const std::uint8_t>(out.data(), written));
+        return 0;
+    }
+
+    // getattrlistbulk(dirfd, attrList, attrBuf, size, options): the number of entries packed, 0 at the end.
+    std::uint64_t bulk(std::uint64_t fd, std::uint64_t list, std::uint64_t buffer, std::uint64_t size, std::uint64_t options) {
+        const auto [common, volume, directory, file, fork] = read_list(list);
+        static_cast<void>(directory); static_cast<void>(file); static_cast<void>(fork);
+        if (!(common & attr_cmn_returned_attrs) || volume) throw Errno{einval};
+        if (options & ~std::uint64_t{fsopt_pack_inval_attrs | fsopt_attr_cmn_extended}) throw Errno{einval};
+        const auto directory_status = stat({"", fd, true});
+        if ((le32(directory_status, 4) & 0170000) != 0040000) throw Errno{enotdir};
+        auto path = descriptor_path(fd);
+        if (!path.ends_with('/')) path += '/';
+        const auto position = [&](std::optional<std::uint64_t> moved) {
+            const auto result = p_.call(libsystem_library, "_lseek", {fd, moved.value_or(0), moved ? 0U : 1U});   // SEEK_SET / SEEK_CUR
+            if (result == UINT64_MAX) throw Errno{p_.guest_errno()};
+            return result;
+        };
+        const auto names = entry_names(path);
+        auto at = position(std::nullopt);
+        std::vector<std::uint8_t> out;
+        std::uint64_t count{};
+        for (; at < names.size(); ++at) {
+            std::vector<std::uint8_t> entry;
+            try { entry = pack({path + names[static_cast<std::size_t>(at)], std::nullopt, false}, list, static_cast<std::uint32_t>(options), true); }
+            catch (const Errno&) { continue; }   // gone since the listing
+            while (entry.size() % 8) entry.push_back(0);
+            const auto length = static_cast<std::uint32_t>(entry.size());
+            std::memcpy(entry.data(), &length, 4);
+            if (out.size() + entry.size() > size) {
+                if (!count) throw Errno{erange};
+                break;
+            }
+            out.insert(out.end(), entry.begin(), entry.end());
+            ++count;
+        }
+        static_cast<void>(position(at));
+        if (!out.empty()) m_.write_bytes(buffer, out);
+        return count;
+    }
+
+    // The attribute record of getattrlist (bulk: getattrlistbulk's, which answers ATTR_CMN_ERROR).
+    std::vector<std::uint8_t> pack(const Target& target, std::uint64_t list, std::uint32_t options, bool bulk) {
         const auto [common, volume, directory, file, fork] = read_list(list);
         const bool extended = (options & fsopt_attr_cmn_extended) != 0;
         if (volume & ~vol_valid || directory & ~dir_valid || file & ~file_valid || fork & ~(extended ? cmnext_valid : fork_valid))
@@ -204,6 +263,7 @@ public:
             case 0x400000: attribute(0, bit, 8, never); break;
             case 0x800000: case 0x1000000: attribute(0, bit, 16, never); break;
             case 0x10000000: attribute(0, bit, 16, never); break;
+            case 0x20000000: attribute(0, bit, 4, [bulk](Packer& out) { if (!bulk) return false; out.u32(0); return true; }); break;   // ERROR
             default: attribute(0, bit, 4, never); break;
             }
         }
@@ -292,14 +352,7 @@ public:
         std::memcpy(out.data(), &length, 4);
         if (with_returned) std::memcpy(out.data() + 4, returned.data(), 20);
         std::memcpy(out.data() + prefix, body.data(), body.size());
-        if (size < 4) throw Errno{einval};
-        const auto written = static_cast<std::size_t>(std::min<std::uint64_t>(size, total));
-        if (written < total && !(options & fsopt_report_fullsize)) {
-            const auto shown = static_cast<std::uint32_t>(written);
-            std::memcpy(out.data(), &shown, 4);
-        }
-        m_.write_bytes(buffer, std::span<const std::uint8_t>(out.data(), written));
-        return 0;
+        return out;
     }
 
     std::uint64_t set(const Target& target, std::uint64_t list, std::uint64_t buffer, std::uint64_t size, std::uint32_t options) {
@@ -461,6 +514,20 @@ private:
         free(guest);
         return result;
     }
+    // A directory's entry names in readdir order, without "." and "..".
+    std::vector<std::string> entry_names(const std::string& path) {
+        const auto guest = string(path);
+        const auto directory = p_.call(libsystem_library, "_opendir", {guest});
+        free(guest);
+        if (!directory) throw Errno{p_.guest_errno()};
+        std::vector<std::string> names;
+        while (const auto entry = p_.call(libsystem_library, "_readdir", {directory})) {
+            auto name = read(entry + 21);   // struct dirent: d_name at 21
+            if (name != "." && name != "..") names.push_back(std::move(name));
+        }
+        p_.call(libsystem_library, "_closedir", {directory});
+        return names;
+    }
     std::uint32_t entry_count(const std::string& path) {
         const auto guest = string(path);
         const auto directory = p_.call(libsystem_library, "_opendir", {guest});
@@ -548,6 +615,10 @@ void install_libsystem_attrlist(Provider& p) {
         AttributeLists lists(p, m);
         const auto options = static_cast<std::uint32_t>(s.x[5]);
         return lists.get({lists.at_path(s.x[0], s.x[1]), std::nullopt, !(options & fsopt_nofollow)}, s.x[2], s.x[3], s.x[4], options);
+    });
+    p.libsystem("_getattrlistbulk", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        AttributeLists lists(p, m);
+        return lists.bulk(s.x[0], s.x[1], s.x[2], s.x[3], s.x[4]);
     });
     p.libsystem("_setattrlist", [p](CpuState& s, GuestMemory& m) -> std::uint64_t {
         AttributeLists lists(p, m);

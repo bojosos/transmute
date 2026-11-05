@@ -203,6 +203,50 @@ void install_libsystem_process(Provider& p) {
         return kern_success;
     });
 
+    // bool _dyld_get_image_uuid(const struct mach_header*, uuid_t): the image's LC_UUID, false without one.
+    p.libsystem("__dyld_get_image_uuid", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[0] || !s.x[1] || m.read32(s.x[0]) != 0xfeedfacfU) return 0;   // MH_MAGIC_64
+        const auto count = m.read32(s.x[0] + 16), total = m.read32(s.x[0] + 20);
+        std::uint64_t at = s.x[0] + 32;
+        const auto end = at + total;
+        for (std::uint32_t index = 0; index < count && at + 8 <= end; ++index) {
+            const auto command = m.read32(at), size = m.read32(at + 4);
+            if (command == 0x1b && size >= 24) {   // LC_UUID
+                std::array<std::uint8_t, 16> uuid{};
+                m.read_bytes(at + 8, uuid);
+                m.write_bytes(s.x[1], uuid);
+                return 1;
+            }
+            if (size < 8) break;
+            at += size;
+        }
+        return 0;
+    }, 0);
+    // const struct mach_header* _dyld_get_prog_image_header(void): the main executable's (MH_EXECUTE).
+    p.libsystem("__dyld_get_prog_image_header", [&process](CpuState&, GuestMemory& m) -> std::uint64_t {
+        for (const auto& image : process.images())
+            if (image.header && m.read32(image.header + 12) == 2) return image.header;
+        return 0;
+    }, 0);
+    // bool _dyld_image_containing_address(const void*)
+    p.libsystem("__dyld_image_containing_address", [&process](CpuState& s, GuestMemory&) -> std::uint64_t {
+        for (const auto& image : process.images()) if (s.x[0] >= image.begin && s.x[0] < image.end) return 1;
+        return 0;
+    }, 0);
+    // bool _dyld_is_memory_immutable(const void* address, size_t length): the range lies in one image's __TEXT
+    // (never written while the image stays loaded); anything else may change.
+    p.libsystem("__dyld_is_memory_immutable", [&process](CpuState& s, GuestMemory&) -> std::uint64_t {
+        if (s.x[1] > UINT64_MAX - s.x[0]) return 0;
+        for (const auto& image : process.images())
+            for (const auto& section : image.sections)
+                if (section.segment == "__TEXT" && s.x[0] >= section.address && s.x[0] + s.x[1] <= section.address + section.size) return 1;
+        return 0;
+    }, 0);
+    // Alchemy maps every image from its own file: there is no dyld shared cache, so its range is NULL (length
+    // untouched) and it has no UUID (false).
+    p.libsystem("__dyld_get_shared_cache_range", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; }, 0);
+    p.libsystem("__dyld_get_shared_cache_uuid", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; }, 0);
+
     // dyld lookups by address over the loaded images.
     auto names = std::make_shared<std::pair<std::mutex, std::map<std::uint64_t, std::uint64_t>>>();
     p.libsystem("__dyld_get_image_header_containing_address", [&process](CpuState& s, GuestMemory&) -> std::uint64_t {
