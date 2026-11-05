@@ -31,8 +31,14 @@
 // descriptions (without them, one packet, or MPEG frames found by their headers); the magic cookie
 // (kAudioConverterDecompressionMagicCookie) configures Opus, FLAC and ALAC, and a FLAC or ALAC
 // stream without one is described by the input format (ALAC with the codec's default coder
-// parameters). Other compressed formats (AAC, ...) and every encoder answer
-// kAudioConverterErr_FormatNotSupported from AudioConverterNew.
+// parameters).
+// Encoding: linear PCM input converts to Apple Lossless ('alac', media_codecs.hpp) of the output
+// description's source bit depth (kAppleLosslessFormatFlag_*; 0: the nearest the input holds),
+// channels and rate (0: the input's), its frames per packet or 4096. AudioConverterFillComplexBuffer
+// gives whole packets with their descriptions (a short last packet names its frames) while the
+// output buffer has room for the largest one; kAudioConverterCompressionMagicCookie describes the
+// packets so far. Other compressed formats (AAC, ...) answer kAudioConverterErr_FormatNotSupported
+// from AudioConverterNew.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -69,6 +75,10 @@ struct Converter {
     std::uint32_t codec_channels{}, codec_flags{}, codec_frames_per_packet{};
     std::vector<std::uint8_t> cookie;
     std::unique_ptr<codecs::AudioDecoder> decoder;
+    // Encoding: the encoder, fed `out` (PCM of the output's rate and channels), and the source bit
+    // depth it keeps.
+    std::unique_ptr<codecs::AudioEncoder> encoder;
+    std::uint32_t encode_bits{};
     std::mutex mutex;
 };
 
@@ -198,7 +208,12 @@ private:
     void pull_input(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::size_t frames);
     // The same for compressed input: packets, decoded.
     void pull_packets(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::size_t frames);
-    std::int32_t fill(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets, std::uint64_t list);
+    // Up to `room` output frames (interleaved, the output's channels) into `samples`; the frames made.
+    std::size_t render(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::vector<double>& samples, std::size_t room);
+    std::int32_t fill(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets, std::uint64_t list,
+                      std::uint64_t descriptions);
+    std::int32_t fill_packets(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets, std::uint64_t list,
+                              std::uint64_t descriptions);
     std::int32_t get_property(Converter& c, std::uint32_t id, std::vector<std::uint8_t>& out, bool& writable);
     std::int32_t set_property(Converter& c, std::uint32_t id, std::span<const std::uint8_t> data);
 
@@ -326,19 +341,8 @@ void Converters::pull_input(Converter& c, std::uint64_t handle, std::uint64_t pr
     }
 }
 
-std::int32_t Converters::fill(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets,
-                              std::uint64_t list) {
-    auto& m = support_.process.calling_engine();
-    const auto wanted = static_cast<std::size_t>(m.read32(io_packets));
-    if (!wanted) return 0;
-    // The output buffers' room limits the frames too.
-    const auto buffers = c.out.non_interleaved ? c.out.channels : 1U;
-    if (m.read32(list) < buffers) return error::param;
-    auto room = wanted;
-    for (std::uint32_t b = 0; b < buffers; ++b)
-        room = std::min<std::size_t>(room, m.read32(list + 8 + 16ULL * b + 4) / c.out.frame_bytes());
-    if (!room) return error::invalid_output_size;
-    if (const auto result = ensure_decoder(c)) return result;
+std::size_t Converters::render(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::vector<double>& samples,
+                               std::size_t room) {
     if (!c.resampler) c.resampler = std::make_unique<Resampler>(c.in.rate, c.out.rate, c.out.channels);
     // Output frames the input received so far can make, once the input ended.
     const auto limit = [&] {
@@ -346,7 +350,7 @@ std::int32_t Converters::fill(Converter& c, std::uint64_t handle, std::uint64_t 
         const auto possible = static_cast<std::uint64_t>(static_cast<double>(c.input_frames) / c.resampler->ratio());
         return possible > c.output_frames ? std::min<std::size_t>(room, possible - c.output_frames) : 0;
     };
-    std::vector<double> samples(room * c.out.channels);
+    samples.assign(room * c.out.channels, 0.0);
     std::size_t made = 0;
     while (made < room) {
         const auto step = std::min<std::size_t>(room - made, 4096);
@@ -366,9 +370,74 @@ std::int32_t Converters::fill(Converter& c, std::uint64_t handle, std::uint64_t 
         if (c.ended && limit() == 0) break;
     }
     samples.resize(made * c.out.channels);
+    return made;
+}
+
+std::int32_t Converters::fill(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets,
+                              std::uint64_t list, std::uint64_t descriptions) {
+    if (c.encoder) return fill_packets(c, handle, proc, user_data, io_packets, list, descriptions);
+    auto& m = support_.process.calling_engine();
+    const auto wanted = static_cast<std::size_t>(m.read32(io_packets));
+    if (!wanted) return 0;
+    // The output buffers' room limits the frames too.
+    const auto buffers = c.out.non_interleaved ? c.out.channels : 1U;
+    if (m.read32(list) < buffers) return error::param;
+    auto room = wanted;
+    for (std::uint32_t b = 0; b < buffers; ++b)
+        room = std::min<std::size_t>(room, m.read32(list + 8 + 16ULL * b + 4) / c.out.frame_bytes());
+    if (!room) return error::invalid_output_size;
+    if (const auto result = ensure_decoder(c)) return result;
+    std::vector<double> samples;
+    const auto made = render(c, handle, proc, user_data, samples, room);
     encode_list(m, c.out, list, samples, made);
     m.write32(io_packets, static_cast<std::uint32_t>(made));
     return made ? 0 : c.end_status;
+}
+
+// Encoded output: whole packets into the one buffer while it has room for the largest packet.
+std::int32_t Converters::fill_packets(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets,
+                                      std::uint64_t list, std::uint64_t descriptions) {
+    auto& m = support_.process.calling_engine();
+    const auto wanted = m.read32(io_packets);
+    m.write32(io_packets, 0);
+    if (!wanted) return 0;
+    if (m.read32(list) < 1 || !m.read64(list + 16)) return error::param;
+    auto& e = *c.encoder;
+    const auto capacity = m.read32(list + 12);
+    const auto data = m.read64(list + 16);
+    if (capacity < e.max_packet_bytes) return error::invalid_output_size;
+    const double full_scale = std::ldexp(1.0, static_cast<int>(c.encode_bits) - 1);
+    const int shift = 32 - static_cast<int>(c.encode_bits);
+    std::vector<double> samples;
+    std::vector<std::int32_t> values;
+    std::vector<std::uint8_t> packet;
+    std::uint64_t used = 0;
+    std::uint32_t packets = 0;
+    while (packets < wanted && capacity - used >= e.max_packet_bytes) {
+        const auto made = render(c, handle, proc, user_data, samples, e.frames_per_packet);
+        if (!made) break;
+        values.resize(samples.size());
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            const auto v = std::clamp<std::int64_t>(std::llround(samples[i] * full_scale), static_cast<std::int64_t>(-full_scale),
+                                                    static_cast<std::int64_t>(full_scale) - 1);
+            values[i] = static_cast<std::int32_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(v) << shift));
+        }
+        std::string why;
+        if (!e.encode(values, packet, why)) return error::unspecified;
+        m.write_bytes(data + used, packet);
+        if (descriptions) {
+            const auto d = descriptions + 16ULL * packets;
+            m.write64(d, used);
+            m.write32(d + 8, made < e.frames_per_packet ? static_cast<std::uint32_t>(made) : 0);   // mVariableFramesInPacket
+            m.write32(d + 12, static_cast<std::uint32_t>(packet.size()));
+        }
+        used += packet.size();
+        ++packets;
+        if (made < e.frames_per_packet) break;   // the input ended
+    }
+    m.write32(list + 12, static_cast<std::uint32_t>(used));
+    m.write32(io_packets, packets);
+    return packets ? 0 : c.end_status;
 }
 
 std::int32_t Converters::get_property(Converter& c, std::uint32_t id, std::vector<std::uint8_t>& out, bool& writable) {
@@ -392,7 +461,14 @@ std::int32_t Converters::get_property(Converter& c, std::uint32_t id, std::vecto
         }
         u32(c.in.frame_bytes() * (c.in.non_interleaved ? c.in.channels : 1));
         return 0;
-    case four("xops"): u32(c.out.frame_bytes() * (c.out.non_interleaved ? c.out.channels : 1)); return 0;
+    case four("xops"):
+        if (c.encoder) { u32(c.encoder->max_packet_bytes); return 0; }
+        u32(c.out.frame_bytes() * (c.out.non_interleaved ? c.out.channels : 1));
+        return 0;
+    case four("cmgc"):   // kAudioConverterCompressionMagicCookie
+        if (!c.encoder) return error::property_not_supported;
+        out = c.encoder->cookie();
+        return 0;
     case four("srcq"): u32(c.quality); writable = true; return 0;
     case four("srca"): u32(c.complexity); writable = true; return 0;
     case four("prmm"): u32(c.prime_method); writable = true; return 0;
@@ -433,6 +509,7 @@ std::int32_t Converters::set_property(Converter& c, std::uint32_t id, std::span<
         return 0;
     case four("acid"): case four("acod"): {
         if (c.codec && id == four("acid")) return error::property_not_supported;   // a decoder keeps its input format
+        if (c.encoder && id == four("acod")) return error::property_not_supported;   // an encoder keeps its output format
         std::string why;
         const auto format = af::pcm_from_asbd(data, why);
         if (!format) return error::format_not_supported;
@@ -459,6 +536,50 @@ void Converters::install() {
         std::uint32_t in_id{};
         std::memcpy(&in_id, in.data() + 8, 4);
         auto made = std::make_shared<Converter>();
+        std::uint32_t out_id{};
+        std::memcpy(&out_id, outf.data() + 8, 4);
+        if (out_id != four("lpcm")) {
+            // Encoding: linear PCM in, packets out. Unset fields of the output take the input's.
+            const auto from = af::pcm_from_asbd(in, why);
+            if (in_id != four("lpcm") || !from || !codecs::audio_encoder_available(out_id)) return error::format_not_supported;
+            double rate{};
+            std::uint32_t flags{}, frames_per_packet{}, channels{};
+            std::memcpy(&rate, outf.data(), 8);
+            std::memcpy(&flags, outf.data() + 12, 4);
+            std::memcpy(&frames_per_packet, outf.data() + 20, 4);
+            std::memcpy(&channels, outf.data() + 28, 4);
+            if (rate == 0) rate = from->rate;
+            if (!channels) channels = from->channels;
+            if (!flags) flags = from->bits <= 16 ? 1 : from->bits <= 20 ? 2 : from->bits <= 24 ? 3 : 4;
+            if (flags > 4) return error::format_not_supported;
+            const std::uint32_t bits = flags == 1 ? 16 : flags == 2 ? 20 : flags == 3 ? 24 : 32;
+            made->encoder = codecs::make_audio_encoder(out_id, rate, channels, bits, frames_per_packet, why);
+            if (!made->encoder) return error::format_not_supported;
+            made->encode_bits = bits;
+            made->in = *from;
+            made->out.rate = rate;
+            made->out.channels = channels;
+            made->out.is_float = true;
+            made->out.bits = 64;
+            made->out.container = 8;
+            std::memcpy(outf.data(), &rate, 8);
+            std::memcpy(outf.data() + 12, &flags, 4);
+            std::memset(outf.data() + 16, 0, 4);
+            std::memcpy(outf.data() + 20, &made->encoder->frames_per_packet, 4);
+            std::memset(outf.data() + 24, 0, 4);
+            std::memcpy(outf.data() + 28, &channels, 4);
+            std::memset(outf.data() + 32, 0, 4);
+            made->in_asbd = in;
+            made->out_asbd = outf;
+            const auto handle = self->support_.process.allocate_guest(16, 16);
+            m.fill_bytes(handle, 0, 16);
+            {
+                std::lock_guard lock(self->mutex_);
+                self->converters_[handle] = std::move(made);
+            }
+            m.write64(out, handle);
+            return 0;
+        }
         const auto to = af::pcm_from_asbd(outf, why);
         if (!to) return error::format_not_supported;
         if (in_id != four("lpcm")) {
@@ -573,7 +694,7 @@ void Converters::install() {
         if (!c) return status(s, error::param);
         if (!s.x[1] || !s.x[3] || !s.x[4]) return status(s, error::param);
         std::lock_guard lock(c->mutex);
-        status(s, self->fill(*c, s.x[0], s.x[1], s.x[2], s.x[3], s.x[4]));
+        status(s, self->fill(*c, s.x[0], s.x[1], s.x[2], s.x[3], s.x[4], s.x[5]));
     });
     // AudioConverterConvertComplexBuffer(converter, frames, const AudioBufferList *in, AudioBufferList *out)
     support_.function(audio_toolbox, "_AudioConverterConvertComplexBuffer", [self, status](CpuState& s, GuestMemory& m) {
@@ -582,7 +703,7 @@ void Converters::install() {
         if (!s.x[2] || !s.x[3]) return status(s, error::param);
         std::lock_guard lock(c->mutex);
         // Packets need AudioConverterFillComplexBuffer, as rate changes do.
-        if (c->codec || c->in.rate != c->out.rate) return status(s, error::invalid_input_size);
+        if (c->codec || c->encoder || c->in.rate != c->out.rate) return status(s, error::invalid_input_size);
         const auto frames = static_cast<std::uint32_t>(s.x[1]);
         std::int32_t result = 0;
         const auto samples = self->decode_list(m, c->in, s.x[2], frames, result);
@@ -598,7 +719,7 @@ void Converters::install() {
         if (!c) return status(s, error::param);
         if (!s.x[2] || !s.x[3] || !s.x[4]) return status(s, error::param);
         std::lock_guard lock(c->mutex);
-        if (c->codec || c->in.rate != c->out.rate || c->in.non_interleaved || c->out.non_interleaved) return status(s, error::invalid_input_size);
+        if (c->codec || c->encoder || c->in.rate != c->out.rate || c->in.non_interleaved || c->out.non_interleaved) return status(s, error::invalid_input_size);
         const auto in_bytes = static_cast<std::uint32_t>(s.x[1]);
         if (in_bytes % c->in.frame_bytes()) return status(s, error::invalid_input_size);
         const auto frames = in_bytes / c->in.frame_bytes();

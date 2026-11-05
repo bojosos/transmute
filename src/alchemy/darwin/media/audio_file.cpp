@@ -1,4 +1,6 @@
 #include "alchemy/darwin/media/audio_file.hpp"
+#include "alchemy/darwin/media/media_codecs.hpp"
+#include "alchemy/darwin/media/packet_file.hpp"
 
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/engine_adapter.hpp"
@@ -25,6 +27,13 @@
 //   packet counts and sizes, magic cookie, packet table, ReadPacketData with descriptions;
 //   ReadBytes answers kAudioFileOperationNotSupportedError), and ExtAudioFile reads them decoded.
 //   Other compressed data (AAC, ...) answers kAudioFileUnsupportedDataFormatError.
+// - Writing Apple Lossless: CAF and MPEG-4 (M4A) files of 'alac' packets (packet_file.hpp).
+//   AudioFileWritePackets appends packets with their descriptions (from the next packet only), the
+//   magic cookie and packet table info are set as properties, and AudioFileOptimize and
+//   AudioFileClose write the packet table or the movie. ExtAudioFile writes them from any linear
+//   PCM client format: frames are encoded (media_codecs.hpp) in whole packets as they come, the
+//   last, shorter one and the cookie at ExtAudioFileDispose. Such a file is not read back through
+//   the handle that writes it (kAudioFileOperationNotSupportedError).
 // - Writing: AudioFileCreateWithURL and InitializeWithCallbacks make files in the format given,
 //   which the container must hold (kAudioFileUnsupportedDataFormatError otherwise); bytes and
 //   packets go into the data, and the header's sizes are brought up to date by AudioFileOptimize
@@ -67,6 +76,9 @@ struct File {
     // of a file being written. Held: its bytes in memory (the chunks after a written file's data).
     struct Chunk { std::uint32_t id{}; std::uint64_t offset{}, size{}; std::vector<std::uint8_t> bytes; bool fixed{}, held{}; };
     std::optional<std::vector<Chunk>> chunks;
+    // A compressed file being written (packet_file.hpp). container().format is then the linear PCM
+    // ExtAudioFile converts its client frames to before encoding them: 32-bit signed integers.
+    std::optional<packet_file::Writer> packets;
     [[nodiscard]] const Container& container() const { return audio.container; }
     [[nodiscard]] std::uint64_t frames() const { return audio.frames(); }
 };
@@ -78,12 +90,15 @@ struct Ext {
     std::vector<std::uint8_t> client_layout;
     std::uint64_t position{};
     std::uint32_t io_buffer_bytes{32768};
+    // Writing a compressed file: the encoder, and the frames short of a whole packet (left-justified).
+    std::shared_ptr<codecs::AudioEncoder> encoder;
+    std::vector<std::int32_t> unencoded;
 };
 
 void status(CpuState& s, std::int32_t value) { s.x[0] = static_cast<std::uint64_t>(static_cast<std::int64_t>(value)); }
 
 // The file types AudioFileGetGlobalInfo describes: those Alchemy reads (audio_file_core.hpp and the
-// compressed streams of audio_stream.hpp) and writes (linear PCM only).
+// compressed streams of audio_stream.hpp) and writes (linear PCM, and Apple Lossless in CAF and MPEG-4).
 struct FileType {
     std::uint32_t type;
     const char* name;
@@ -102,8 +117,8 @@ const std::vector<FileType>& file_types() {
         {four("MPG1"), "MPEG Layer 1", {"mp1"}, {"audio/mpeg"}, {}, {four(".mp1")}, false},
         {four("flac"), "FLAC", {"flac"}, {"audio/flac"}, {"org.xiph.flac"}, {four("flac")}, false},
         {four("m4af"), "Apple MPEG-4 Audio", {"m4a", "m4r"}, {"audio/mp4", "audio/x-m4a"}, {"com.apple.m4a-audio"},
-         {four(".mp3"), four("flac"), four("opus"), four("alac")}, false},
-        {four("mp4f"), "MPEG-4 Audio", {"mp4"}, {"audio/mp4"}, {"public.mpeg-4-audio"}, {four(".mp3"), four("flac"), four("opus"), four("alac")}, false},
+         {four(".mp3"), four("flac"), four("opus"), four("alac")}, true},
+        {four("mp4f"), "MPEG-4 Audio", {"mp4"}, {"audio/mp4"}, {"public.mpeg-4-audio"}, {four(".mp3"), four("flac"), four("opus"), four("alac")}, true},
     };
     return types;
 }
@@ -210,6 +225,14 @@ struct AudioFiles {
     // The header's sizes, brought up to date, and the held user data after the audio data.
     std::int32_t finish(File& f) {
         if (!f.writable || !f.dirty) return 0;
+        if (f.packets) {
+            for (const auto& [offset, bytes] : f.packets->finish()) {
+                if (const auto result = write_at(f, offset, bytes)) return result;
+                f.audio.size = std::max<std::uint64_t>(f.audio.size, offset + bytes.size());
+            }
+            f.dirty = false;
+            return 0;
+        }
         std::vector<std::uint8_t> bytes;
         if (const auto result = header(f, bytes)) return result;
         if (const auto result = write_at(f, 0, bytes)) return result;
@@ -280,7 +303,7 @@ struct AudioFiles {
         }
     }
     std::int32_t user_chunks(File& f, std::vector<File::Chunk>*& out) {
-        if (f.audio.stream) return error::operation_not_supported;
+        if (f.audio.stream || f.packets) return error::operation_not_supported;
         if (!f.chunks) {
             std::vector<File::Chunk> list;
             const std::uint64_t first = f.container().file_type == four("caff") ? 8 : 12;
@@ -344,6 +367,8 @@ struct AudioFiles {
         std::string why;
         std::uint32_t format_id{};
         std::memcpy(&format_id, asbd.data() + 8, 4);
+        if (format_id != four("lpcm") && packet_file::writable(type, format_id)) return start_packet_file(f, type, asbd);
+        if (type == four("m4af") || type == four("mp4f")) return error::unsupported_data_format;
         if (type != four("WAVE") && type != four("AIFF") && type != four("AIFC") && type != four("caff")) return error::unsupported_file_type;
         const auto format = pcm_from_asbd(asbd, why);
         if (format_id != four("lpcm") || !format) return error::unsupported_data_format;   // no encoder exists
@@ -357,6 +382,61 @@ struct AudioFiles {
         if (const auto result = write_at(f, 0, bytes)) return result;
         f.audio.size = bytes.size();
         return 0;
+    }
+
+    // A new compressed file: the header written, no packets.
+    std::int32_t start_packet_file(File& f, std::uint32_t type, std::span<const std::uint8_t> asbd) {
+        packet_file::Format format;
+        format.file_type = type;
+        std::memcpy(&format.rate, asbd.data(), 8);
+        std::memcpy(&format.format_id, asbd.data() + 8, 4);
+        std::memcpy(&format.flags, asbd.data() + 12, 4);
+        std::memcpy(&format.frames_per_packet, asbd.data() + 20, 4);
+        std::memcpy(&format.channels, asbd.data() + 28, 4);
+        std::string why;
+        auto writer = packet_file::Writer::make(format, why);
+        if (!writer) return error::unsupported_data_format;
+        Pcm source;
+        source.rate = format.rate;
+        source.channels = format.channels;
+        source.bits = 32;
+        source.container = 4;
+        f.audio.container.file_type = type;
+        f.audio.container.format = source;
+        f.audio.container.data_offset = writer->data_offset();
+        f.audio.container.data_bytes = 0;
+        f.writable = true;
+        if (const auto result = write_at(f, 0, writer->header())) return result;
+        f.audio.size = writer->data_offset();
+        f.packets = std::move(*writer);
+        f.dirty = true;
+        return 0;
+    }
+    // A packet written at the data's end.
+    std::int32_t append_packet(File& f, std::span<const std::uint8_t> bytes, std::uint32_t frames) {
+        auto& w = *f.packets;
+        if (const auto result = write_at(f, w.data_end(), bytes)) return result;
+        w.add_packet(static_cast<std::uint32_t>(bytes.size()), frames);
+        f.audio.container.data_bytes = w.data_bytes();
+        f.audio.size = std::max<std::uint64_t>(f.audio.size, w.data_end());
+        f.dirty = true;
+        return 0;
+    }
+    // The compressed description of a file being written.
+    static std::vector<std::uint8_t> packet_asbd(const packet_file::Writer& w) {
+        std::vector<std::uint8_t> out(40, 0);
+        const auto& format = w.format();
+        std::memcpy(out.data(), &format.rate, 8);
+        std::memcpy(out.data() + 8, &format.format_id, 4);
+        std::memcpy(out.data() + 12, &format.flags, 4);
+        std::memcpy(out.data() + 20, &format.frames_per_packet, 4);
+        std::memcpy(out.data() + 28, &format.channels, 4);
+        return out;
+    }
+    // The frames of a file being written: its packets' less the priming and remainder.
+    static std::uint64_t packet_frames(const packet_file::Writer& w) {
+        const std::uint64_t trimmed = std::uint64_t{w.priming()} + w.remainder();
+        return w.frames() > trimmed ? w.frames() - trimmed : 0;
     }
 
     // A property value: bytes, or a +1 CF object (8 bytes) made on demand.
@@ -408,8 +488,44 @@ struct AudioFiles {
         default: return error::unsupported_property;
         }
     }
+    // A compressed file being written.
+    std::int32_t packet_property(const File& f, std::uint32_t id, Value& out) {
+        const auto& w = *f.packets;
+        switch (id) {
+        case four("ffmt"): out.bytes = raw(f.container().file_type); return 0;
+        case four("dfmt"): out.bytes = packet_asbd(w); return 0;
+        case four("bcnt"): out.bytes = raw(w.data_bytes()); return 0;
+        case four("pcnt"): out.bytes = raw(w.packet_count()); return 0;
+        case four("psze"): out.bytes = raw(w.maximum_packet_bytes()); return 0;
+        case four("pkub"):   // a packet stored verbatim
+            out.bytes = raw(std::max(w.maximum_packet_bytes(), w.format().frames_per_packet * w.format().channels * 4 + 64));
+            return 0;
+        case four("doff"): out.bytes = raw(static_cast<std::int64_t>(w.data_offset())); return 0;
+        case four("optm"): out.bytes = raw(std::uint32_t{f.dirty ? 0U : 1U}); return 0;
+        case four("edur"): out.bytes = raw(static_cast<double>(packet_frames(w)) / w.format().rate); return 0;
+        case four("mgic"): out.bytes = w.cookie(); out.writable = true; return 0;
+        case four("pnfo"): {   // AudioFilePacketTableInfo {SInt64 valid; SInt32 priming; SInt32 remainder}
+            out.bytes = raw(static_cast<std::int64_t>(packet_frames(w)));
+            const auto priming = raw(w.priming()), remainder = raw(w.remainder());
+            out.bytes.insert(out.bytes.end(), priming.begin(), priming.end());
+            out.bytes.insert(out.bytes.end(), remainder.begin(), remainder.end());
+            out.writable = true;
+            return 0;
+        }
+        case four("flst"): {
+            out.bytes = packet_asbd(w);
+            const auto tag = raw(0xffff0000U | w.format().channels);
+            out.bytes.insert(out.bytes.end(), tag.begin(), tag.end());
+            out.bytes.resize(48);
+            return 0;
+        }
+        case four("info"): out.bytes.assign(8, 0); out.object = true; return 0;
+        default: return error::unsupported_property;
+        }
+    }
     std::int32_t file_property(const File& f, std::uint32_t id, Value& out) {
         if (f.audio.stream) return stream_property(f, id, out);
+        if (f.packets) return packet_property(f, id, out);
         const auto& c = f.container();
         switch (id) {
         case four("ffmt"): out.bytes = raw(c.file_type); return 0;                                   // kAudioFilePropertyFileFormat
@@ -451,7 +567,9 @@ struct AudioFiles {
         const auto* f = file(e.file);
         if (!f) return error::param;
         switch (id) {
-        case four("ffmt"): out.bytes = f->audio.stream ? f->audio.stream->asbd() : asbd_from_pcm(f->container().format); return 0;   // FileDataFormat
+        case four("ffmt"):   // FileDataFormat
+            out.bytes = f->audio.stream ? f->audio.stream->asbd() : f->packets ? packet_asbd(*f->packets) : asbd_from_pcm(f->container().format);
+            return 0;
         case four("cfmt"): out.bytes = asbd_from_pcm(e.client); out.writable = true; return 0;      // ClientDataFormat
         case four("fclo"):                                                                           // FileChannelLayout
             out.bytes = !f->layout.empty() ? f->layout : layout_for_mask(f->container().channel_mask, f->container().format.channels);
@@ -460,10 +578,14 @@ struct AudioFiles {
             out.bytes = !e.client_layout.empty() ? e.client_layout : layout_for_mask(f->container().channel_mask, e.client.channels);
             out.writable = true;
             return out.bytes.empty() ? ext_invalid_property : 0;
-        case four("#frm"): out.bytes = raw(static_cast<std::int64_t>(f->frames())); return 0;       // FileLengthFrames
+        case four("#frm"):                                                                           // FileLengthFrames
+            out.bytes = raw(static_cast<std::int64_t>(f->packets ? packet_frames(*f->packets) + e.unencoded.size() / f->packets->format().channels : f->frames()));
+            return 0;
         case four("afil"): out.bytes = raw(e.file); return 0;                                       // AudioFile
         case four("fmps"):                                                                           // FileMaxPacketSize
-            out.bytes = raw(f->audio.stream ? f->audio.stream->maximum_packet_bytes() : f->container().format.frame_bytes());
+            out.bytes = raw(f->audio.stream ? f->audio.stream->maximum_packet_bytes()
+                            : f->packets ? (e.encoder ? e.encoder->max_packet_bytes : f->packets->maximum_packet_bytes())
+                                         : f->container().format.frame_bytes());
             return 0;
         case four("cmps"): out.bytes = raw(e.client.frame_bytes()); return 0;                       // ClientMaxPacketSize
         case four("iobs"): out.bytes = raw(e.io_buffer_bytes); out.writable = true; return 0;       // IOBufferSizeBytes
@@ -501,6 +623,7 @@ struct AudioFiles {
     std::int32_t read(Ext& e, GuestMemory& m, Address frames_at, Address list) {
         auto* f = file(e.file);
         if (!f) return error::param;
+        if (f->packets) return error::operation_not_supported;   // a compressed file being written
         std::uint64_t frames = m.read32(frames_at);
         std::vector<Address> data;
         if (const auto result = client_buffers(e, m, list, frames, data)) return result;
@@ -540,6 +663,7 @@ struct AudioFiles {
         if (const auto result = client_buffers(e, m, list, frames, data)) return result;
         if (frames < requested) return error::param;   // the buffers hold fewer frames than asked
         const auto& target = f->container().format;
+        if (f->packets) return encode_frames(e, *f, m, data, frames);
         for (std::uint64_t done = 0; done < frames;) {
             const auto count = std::min<std::uint64_t>(frames - done, 16384);
             std::vector<std::vector<std::uint8_t>> in(data.size(), std::vector<std::uint8_t>(static_cast<std::size_t>(count * e.client.frame_bytes())));
@@ -555,6 +679,68 @@ struct AudioFiles {
             done += count;
         }
         e.position += frames;
+        return 0;
+    }
+    // ExtAudioFileWrite into a compressed file: the client frames as 32-bit integers, rounded to the
+    // source bit depth, encoded a whole packet at a time.
+    std::int32_t encode_frames(Ext& e, File& f, GuestMemory& m, const std::vector<Address>& data, std::uint64_t frames) {
+        auto& w = *f.packets;
+        const auto& format = w.format();
+        const std::uint32_t bits = format.flags == 1 ? 16 : format.flags == 2 ? 20 : format.flags == 3 ? 24 : 32;
+        if (!e.encoder) {
+            std::string why;
+            e.encoder = codecs::make_audio_encoder(format.format_id, format.rate, format.channels, bits, format.frames_per_packet, why);
+            if (!e.encoder) return error::unsupported_data_format;
+        }
+        const auto& target = f.container().format;
+        const std::size_t per_packet = std::size_t(e.encoder->frames_per_packet) * format.channels;
+        const std::int64_t step = bits == 32 ? 1 : std::int64_t{1} << (32 - bits);
+        std::vector<std::uint8_t> packet;
+        for (std::uint64_t done = 0; done < frames;) {
+            const auto count = std::min<std::uint64_t>(frames - done, 16384);
+            std::vector<std::vector<std::uint8_t>> in(data.size(), std::vector<std::uint8_t>(static_cast<std::size_t>(count * e.client.frame_bytes())));
+            std::vector<std::span<const std::uint8_t>> spans;
+            for (std::size_t i = 0; i < data.size(); ++i) {
+                m.read_bytes(data[i] + done * e.client.frame_bytes(), in[i]);
+                spans.emplace_back(in[i]);
+            }
+            const auto samples = decode(e.client, spans, static_cast<std::size_t>(count));
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(count * target.frame_bytes()));
+            encode(target, samples, e.client.channels, static_cast<std::size_t>(count), {std::span<std::uint8_t>(bytes)});
+            for (std::size_t i = 0; i + 4 <= bytes.size(); i += 4) {
+                std::int32_t v;
+                std::memcpy(&v, bytes.data() + i, 4);
+                if (step > 1) {   // to the nearest value of the source depth
+                    const auto rounded = static_cast<std::int64_t>(std::floor((static_cast<double>(v) + static_cast<double>(step / 2)) / static_cast<double>(step))) * step;
+                    v = static_cast<std::int32_t>(std::clamp<std::int64_t>(rounded, -(std::int64_t{1} << 31), (std::int64_t{1} << 31) - step));
+                }
+                e.unencoded.push_back(v);
+            }
+            while (e.unencoded.size() >= per_packet) {
+                std::string why;
+                if (!e.encoder->encode(std::span<const std::int32_t>(e.unencoded.data(), per_packet), packet, why)) return error::unsupported_data_format;
+                if (const auto result = append_packet(f, packet, 0)) return result;
+                e.unencoded.erase(e.unencoded.begin(), e.unencoded.begin() + static_cast<std::ptrdiff_t>(per_packet));
+            }
+            done += count;
+        }
+        e.position += frames;
+        return 0;
+    }
+    // ExtAudioFileDispose of a compressed file being written: the last, shorter packet, and the cookie.
+    std::int32_t flush(Ext& e) {
+        auto* f = file(e.file);
+        if (!f || !f->packets || !e.encoder) return 0;
+        const auto channels = f->packets->format().channels;
+        if (!e.unencoded.empty()) {
+            std::vector<std::uint8_t> packet;
+            std::string why;
+            if (!e.encoder->encode(e.unencoded, packet, why)) return error::unsupported_data_format;
+            if (const auto result = append_packet(*f, packet, static_cast<std::uint32_t>(e.unencoded.size() / channels))) return result;
+            e.unencoded.clear();
+        }
+        f->packets->set_cookie(e.encoder->cookie());
+        f->dirty = true;
         return 0;
     }
 };
@@ -1056,6 +1242,23 @@ void install_audio_file(Support& support) {
         std::vector<std::uint8_t> data(size);
         if (size) m.read_bytes(s.x[3], data);
         const auto id = static_cast<std::uint32_t>(s.x[1]);
+        if (f->packets) {
+            // A compressed file: its magic cookie and packet table info.
+            if (id == four("mgic")) {
+                f->packets->set_cookie(std::move(data));
+            } else if (id == four("pnfo")) {
+                if (size < 16) return status(s, error::bad_property_size);
+                std::int32_t priming{}, remainder{};
+                std::memcpy(&priming, data.data() + 8, 4);
+                std::memcpy(&remainder, data.data() + 12, 4);
+                if (priming < 0 || remainder < 0) return status(s, error::param);
+                f->packets->set_priming(static_cast<std::uint32_t>(priming), static_cast<std::uint32_t>(remainder));
+            } else {
+                return status(s, id == four("dfmt") ? error::operation_not_supported : error::unsupported_property);
+            }
+            f->dirty = true;
+            return status(s, 0);
+        }
         if (id != four("dfmt") && id != four("cmap")) return status(s, error::unsupported_property);
         if (f->container().data_bytes) return status(s, error::operation_not_supported);   // the data is written in the old layout
         if (id == four("cmap") && f->container().file_type != four("caff")) return status(s, error::unsupported_property);
@@ -1102,6 +1305,7 @@ void install_audio_file(Support& support) {
         if (!f || !s.x[2] || !s.x[5] || !s.x[6]) return status(s, error::param);
         const auto packet = static_cast<std::int64_t>(s.x[4]);
         if (packet < 0) return status(s, error::invalid_packet_offset);
+        if (f->packets) return status(s, error::operation_not_supported);   // a compressed file being written
         if (f->audio.stream) {
             // Compressed packets: as many whole ones as fit, with their descriptions
             // (AudioStreamPacketDescription {SInt64 start; UInt32 variableFrames; UInt32 bytes}).
@@ -1159,6 +1363,26 @@ void install_audio_file(Support& support) {
         if (!f || !s.x[5] || !s.x[6]) return status(s, error::param);
         const auto packet = static_cast<std::int64_t>(s.x[4]);
         if (packet < 0) return status(s, error::invalid_packet_offset);
+        if (f->packets) {
+            // Compressed packets, each with its description, appended at the next packet.
+            if (static_cast<std::uint64_t>(packet) != f->packets->packet_count()) return status(s, error::invalid_packet_offset);
+            const auto count = m.read32(s.x[5]);
+            if (count && !s.x[3]) return status(s, error::param);
+            const auto total = static_cast<std::uint32_t>(s.x[2]);
+            std::uint32_t written = 0;
+            std::int32_t result = 0;
+            for (; written < count; ++written) {
+                const auto d = s.x[3] + 16ULL * written;
+                const auto offset = m.read64(d);
+                const auto frames = m.read32(d + 8), bytes = m.read32(d + 12);
+                if (offset + bytes > total) { result = error::param; break; }
+                std::vector<std::uint8_t> data(bytes);
+                m.read_bytes(s.x[6] + offset, data);
+                if ((result = state->append_packet(*f, data, frames))) break;
+            }
+            m.write32(s.x[5], written);
+            return status(s, result);
+        }
         const auto frame_bytes = f->container().format.frame_bytes();
         const auto count = std::min<std::uint64_t>(m.read32(s.x[5]), static_cast<std::uint32_t>(s.x[2]) / frame_bytes);
         std::vector<std::uint8_t> bytes(static_cast<std::size_t>(count * frame_bytes));
@@ -1232,11 +1456,12 @@ void install_audio_file(Support& support) {
         std::lock_guard lock(state->mutex);
         auto* e = state->ext(s.x[0]);
         if (!e) return status(s, error::param);
+        const auto flushed = state->flush(*e);
         if (e->owns_file) state->close(e->file);
         else if (auto* f = state->file(e->file)) static_cast<void>(state->finish(*f));
         state->exts.erase(s.x[0]);
         state->support.process.release_guest(s.x[0]);
-        status(s, 0);
+        status(s, flushed);
     });
     // ExtAudioFileGetPropertyInfo(ext, ExtAudioFilePropertyID, UInt32 *outSize, Boolean *outWritable)
     support.function(lib, "_ExtAudioFileGetPropertyInfo", [state](CpuState& s, GuestMemory& m) {

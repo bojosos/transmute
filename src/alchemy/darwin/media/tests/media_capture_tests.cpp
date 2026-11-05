@@ -712,8 +712,35 @@ void asset_writer(Fixture& f) {
     require(wait_for([&] { return seen.calls >= 4; }), "the block ran until it finished the input: " + std::to_string(seen.calls.load()));
     require((f.send(caf_writer, "finishWriting") & 0xff) == 1, "finishWriting");
     read(caf_url, 7200);
+    // Apple Lossless into an M4A file: settings other than linear PCM and ALAC are refused.
+    const auto m4a = directory / "alchemy_writer_test.m4a";
+    std::filesystem::remove(m4a, ignored);
+    const auto m4a_url = f.cf.file_url(alchemy::guest_path_string(m4a), false);
+    const auto alac_settings = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("AVFormatIDKey"), f.cf.integer(four("alac"), 3)}, {f.cf.string("AVSampleRateKey"), f.cf.real(48000)},
+        {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(2, 3)}, {f.cf.string("AVEncoderBitDepthHintKey"), f.cf.integer(16, 3)}});
+    const auto aac_settings = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("AVFormatIDKey"), f.cf.integer(four("aac "), 3)}, {f.cf.string("AVSampleRateKey"), f.cf.real(48000)},
+        {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(2, 3)}});
+    const auto m4a_writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:", {m4a_url, type("_AVFileTypeAppleM4A"), error});
+    require(m4a_writer != 0, "an M4A writer");
+    require((f.send(m4a_writer, "canApplyOutputSettings:forMediaType:", {alac_settings, f.cf.string("soun")}) & 0xff) == 1 &&
+                (f.send(m4a_writer, "canApplyOutputSettings:forMediaType:", {aac_settings, f.cf.string("soun")}) & 0xff) == 0,
+            "Apple Lossless settings apply; AAC has no encoder");
+    const auto pcm_input = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), settings});
+    require((f.send(m4a_writer, "canAddInput:", {pcm_input}) & 0xff) == 0, "M4A files do not hold linear PCM");
+    const auto alac_input = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), alac_settings});
+    require((f.send(m4a_writer, "canAddInput:", {alac_input}) & 0xff) == 1, "an Apple Lossless input");
+    f.send(m4a_writer, "addInput:", {alac_input});
+    require((f.send(m4a_writer, "startWriting") & 0xff) == 1, "writing the M4A");
+    f.send(m4a_writer, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+    for (int i = 0; i < 3; ++i) require((f.send(alac_input, "appendSampleBuffer:", {float_sample_buffer(f, 4800, 4800LL * i)}) & 0xff) == 1, "appended");
+    f.send(alac_input, "markAsFinished");
+    require((f.send(m4a_writer, "finishWriting") & 0xff) == 1, "finishWriting the M4A");
+    read(m4a_url, 14400);
     std::filesystem::remove(wav, ignored);
     std::filesystem::remove(caf, ignored);
+    std::filesystem::remove(m4a, ignored);
 }
 
 // Alchemy's own test devices (ALCHEMY_CAMERA=pattern, ALCHEMY_AUDIO_INPUT=tone) through the host backends: the

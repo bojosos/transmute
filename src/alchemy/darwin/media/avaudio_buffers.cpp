@@ -22,11 +22,11 @@
 // - AVAudioFile for reading the files AudioFile reads (linear PCM WAVE, AIFF/AIFC, CAF:
 //   audio_file_core.hpp), converted to its processing format (by default float32
 //   deinterleaved at the file's rate and channels) as it is read into buffers.
-// - AVAudioFile for writing (WAVE, AIFF/AIFC or CAF by the URL's extension; linear PCM settings)
-//   through ExtAudioFile (audio_file.cpp): buffers of the processing format are converted to the
-//   file's format as they are written.
-// - Unavailable, as documented: compressed files and settings (no decoder or encoder) answer nil
-//   with an error.
+// - AVAudioFile for writing (WAVE, AIFF/AIFC or CAF by the URL's extension; linear PCM settings;
+//   or Apple Lossless, AVFormatIDKey 'alac', into .caf, .m4a or .mp4, of AVEncoderBitDepthHintKey
+//   or AVLinearPCMBitDepthKey bits, 16 by default) through ExtAudioFile (audio_file.cpp): buffers
+//   of the processing format are converted to the file's format, or encoded, as they are written.
+// - Unavailable, as documented: other compressed settings (no encoder) answer nil with an error.
 namespace alchemy::gui::completion_kit::media::avaudio {
 
 namespace af = audio_file;
@@ -134,13 +134,14 @@ std::optional<af::Pcm> format_pcm(Support& support, Address format) {
     return af::pcm_from_asbd(asbd, why);
 }
 
-Address make_format(Support& support, const af::Pcm& pcm, const std::vector<std::uint8_t>& layout) {
+namespace {
+// An AVAudioFormat of a stream description (with a layout above two channels).
+Address format_of(Support& support, const std::vector<std::uint8_t>& asbd, std::uint32_t channels, const std::vector<std::uint8_t>& layout) {
     auto& m = support.memory();
-    const auto asbd = af::asbd_from_pcm(pcm);
     const auto at = support.process.allocate_guest(40, 8);
     m.write_bytes(at, asbd);
     Address channel_layout{};
-    if (pcm.channels > 2) {
+    if (channels > 2) {
         const auto layout_class = support.objc.find_class("AVAudioChannelLayout");
         if (!layout.empty()) {
             const auto bytes = support.process.allocate_guest(layout.size(), 8);
@@ -149,7 +150,7 @@ Address make_format(Support& support, const af::Pcm& pcm, const std::vector<std:
             support.process.release_guest(bytes);
         } else {
             CallRegs tag{};
-            tag.x[2] = (147U << 16) | pcm.channels;   // kAudioChannelLayoutTag_DiscreteInOrder
+            tag.x[2] = (147U << 16) | channels;   // kAudioChannelLayoutTag_DiscreteInOrder
             channel_layout = support.send(support.send_id(layout_class, "alloc"), "initWithLayoutTag:", tag).x0;
         }
     }
@@ -160,6 +161,11 @@ Address make_format(Support& support, const af::Pcm& pcm, const std::vector<std:
     release(support, channel_layout);
     support.process.release_guest(at);
     return format;
+}
+} // namespace
+
+Address make_format(Support& support, const af::Pcm& pcm, const std::vector<std::uint8_t>& layout) {
+    return format_of(support, af::asbd_from_pcm(pcm), pcm.channels, layout);
 }
 
 Address standard_format(Support& support, double rate, std::uint32_t channels) {
@@ -500,15 +506,22 @@ void install_avaudio_buffers(Support& support) {
         if (common < 1 || common > 4) return fail_with(param_error, "AVAudioFile: not a common PCM format");
         auto extension = sp->cf.utf8(sp->send_id(url, "pathExtension"));
         for (auto& c : extension) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const auto format_id = static_cast<std::uint32_t>(setting("AVFormatIDKey").value_or(af::four("lpcm")));
+        const bool lossless = format_id == af::four("alac");
         const std::uint32_t type = extension == "wav" || extension == "wave" ? af::four("WAVE")
                                  : extension == "aif" || extension == "aiff" ? af::four("AIFF")
                                  : extension == "aifc" ? af::four("AIFC")
-                                 : extension == "caf" ? af::four("caff") : 0;
-        if (!type) return fail_with(af::error::unsupported_file_type, "AVAudioFile writes .wav, .aif, .aifc and .caf files");
-        if (setting("AVFormatIDKey").value_or(af::four("lpcm")) != af::four("lpcm"))
-            return fail_with(af::error::unsupported_data_format, "AVAudioFile writes linear PCM (no audio encoder exists under Alchemy)");
+                                 : extension == "caf" ? af::four("caff")
+                                 : lossless && (extension == "m4a" || extension == "m4r") ? af::four("m4af")
+                                 : lossless && extension == "mp4" ? af::four("mp4f") : 0;
+        if (!type)
+            return fail_with(af::error::unsupported_file_type, lossless ? "AVAudioFile writes Apple Lossless into .caf, .m4a and .mp4 files"
+                                                                        : "AVAudioFile writes linear PCM into .wav, .aif, .aifc and .caf files");
+        if (format_id != af::four("lpcm") && !lossless)
+            return fail_with(af::error::unsupported_data_format, "AVAudioFile writes linear PCM and Apple Lossless (no other audio encoder exists under Alchemy)");
         const auto rate = setting("AVSampleRateKey"), channels = setting("AVNumberOfChannelsKey");
         if (!rate || !(*rate > 0) || !channels || *channels < 1 || *channels > 64) return fail_with(param_error, "AVAudioFile settings need a sample rate and channels");
+        if (lossless && *channels > 8) return fail_with(af::error::unsupported_data_format, "Apple Lossless holds 1-8 channels");
         af::Pcm pcm;
         pcm.rate = *rate;
         pcm.channels = static_cast<std::uint32_t>(*channels);
@@ -521,7 +534,18 @@ void install_avaudio_buffers(Support& support) {
         auto& m = sp->memory();
         const auto asbd = sp->process.allocate_guest(48, 8);
         const auto out = asbd + 40;
-        m.write_bytes(asbd, af::asbd_from_pcm(pcm));
+        // Apple Lossless: kAppleLosslessFormatFlag_16/20/24/32BitSourceData, 4096 frames per packet.
+        std::vector<std::uint8_t> file_asbd = af::asbd_from_pcm(pcm);
+        if (lossless) {
+            const auto depth = setting("AVEncoderBitDepthHintKey").value_or(setting("AVLinearPCMBitDepthKey").value_or(16));
+            const std::uint32_t flags = depth <= 16 ? 1 : depth <= 20 ? 2 : depth <= 24 ? 3 : 4, per_packet = 4096, id = af::four("alac");
+            std::fill(file_asbd.begin() + 8, file_asbd.end(), std::uint8_t{0});
+            std::memcpy(file_asbd.data() + 8, &id, 4);
+            std::memcpy(file_asbd.data() + 12, &flags, 4);
+            std::memcpy(file_asbd.data() + 20, &per_packet, 4);
+            std::memcpy(file_asbd.data() + 28, &pcm.channels, 4);
+        }
+        m.write_bytes(asbd, file_asbd);
         m.write64(out, 0);
         // ExtAudioFileCreateWithURL(url, type, &format, NULL, kAudioFileFlags_EraseFile, &out)
         auto status = static_cast<std::int32_t>(sp->call(audio_toolbox, "_ExtAudioFileCreateWithURL", {url, type, asbd, 0, 1, out}));
@@ -539,7 +563,7 @@ void install_avaudio_buffers(Support& support) {
         f->url = sp->send_id(url, "retain");
         f->writer = writer;
         f->processing = processing;
-        f->file_format = make_format(*sp, pcm);
+        f->file_format = lossless ? format_of(*sp, file_asbd, pcm.channels, {}) : make_format(*sp, pcm);
         f->processing_format = make_format(*sp, processing);
     };
     support.method(file, "initForWriting:settings:error:", [open_for_writing](CpuState& s, GuestMemory&) {

@@ -32,6 +32,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/hal.cpp
     src/alchemy/darwin/media/resampler.cpp
     src/alchemy/darwin/media/audio_source.cpp
+    src/alchemy/darwin/media/packet_file.cpp
     src/alchemy/darwin/media/audio_units.cpp
     src/alchemy/darwin/media/audio_converter.cpp
     src/alchemy/darwin/media/audio_queue.cpp

@@ -1,6 +1,7 @@
 #include "alchemy/darwin/media/media_support.hpp"
 #include "alchemy/darwin/media/audio_file_core.hpp"
 #include "alchemy/darwin/media/cmtime.hpp"
+#include "alchemy/darwin/media/packet_file.hpp"
 
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/engine_adapter.hpp"
@@ -10,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -17,11 +19,13 @@
 #include <string>
 #include <vector>
 
-// AVAssetWriter and AVAssetWriterInput for audio files: WAVE, AIFF, AIFC and CAF of linear PCM, written through
-// ExtAudioFile (audio_file.cpp).
+// AVAssetWriter and AVAssetWriterInput for audio files: WAVE, AIFF, AIFC and CAF of linear PCM, and CAF, Apple M4A and
+// MPEG-4 of Apple Lossless, written through ExtAudioFile (audio_file.cpp).
 // - The file's format is the audio input's outputSettings (AVFormatIDKey linear PCM, AVSampleRateKey,
-//   AVNumberOfChannelsKey, AVLinearPCMBitDepthKey, ...IsFloat, ...IsBigEndian), or with nil settings the format of the
-//   first appended buffer. The file is created by -startWriting (with settings) or at the first append.
+//   AVNumberOfChannelsKey, AVLinearPCMBitDepthKey, ...IsFloat, ...IsBigEndian; or AVFormatIDKey 'alac' with
+//   AVEncoderBitDepthHintKey or AVLinearPCMBitDepthKey bits, 16 by default), or with nil settings the format of the
+//   first appended buffer (linear PCM files only). The file is created by -startWriting (with settings) or at the first
+//   append.
 // - -appendSampleBuffer: writes a linear PCM CMSampleBuffer at the file's sample rate (converted between PCM layouts,
 //   sample formats and channel counts by ExtAudioFile); buffers that end before the session's start time or begin at
 //   or after its end time are dropped. Inputs are always ready for more data until -markAsFinished.
@@ -29,12 +33,18 @@
 // - -finishWritingWithCompletionHandler: closes the file, sets the status to completed and calls the handler on a
 //   thread of the writer; -cancelWriting deletes the file.
 // - Unavailable, as documented answers: video inputs (no video encoder: -canAddInput: NO, -addInput: stops with
-//   NSInvalidArgumentException), compressed audio settings (no encoder: -canApplyOutputSettings:forMediaType: NO),
-//   and the movie and MPEG-4 file types (no QuickTime or MPEG-4 writer: the initializer fails with an error).
+//   NSInvalidArgumentException), compressed audio settings other than Apple Lossless (no encoder:
+//   -canApplyOutputSettings:forMediaType: NO), and the QuickTime movie and video file types (the initializer fails with
+//   an error).
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
 namespace af = audio_file;
+
+// The file types that hold linear PCM.
+bool pcm_container(std::uint32_t container) {
+    return container == af::four("WAVE") || container == af::four("AIFF") || container == af::four("AIFC") || container == af::four("caff");
+}
 
 constexpr std::string_view av_foundation = "/System/Library/Frameworks/AVFoundation.framework/Versions/A/AVFoundation";
 constexpr std::string_view audio_toolbox = "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox";
@@ -72,8 +82,9 @@ public:
     void install();
 
 private:
-    // The file format of `settings` for `container`, or nullopt (not linear PCM or incomplete).
-    std::optional<af::Pcm> settings_pcm(Address settings, std::uint32_t container);
+    // The file's AudioStreamBasicDescription for `settings` in `container`, or nullopt (a format the container does not
+    // hold or nothing encodes, or incomplete settings).
+    std::optional<std::vector<std::uint8_t>> settings_asbd(Address settings, std::uint32_t container);
     std::int32_t create_file(WriterState& w, const std::vector<std::uint8_t>& asbd);
     bool append(Address input_object, Address sample);
     void fail(WriterState& w, std::int64_t code, const std::string& text) {
@@ -86,7 +97,7 @@ private:
     Address writer_class_{}, input_class_{};
 };
 
-std::optional<af::Pcm> Writers::settings_pcm(Address settings, std::uint32_t container) {
+std::optional<std::vector<std::uint8_t>> Writers::settings_asbd(Address settings, std::uint32_t container) {
     if (!settings || !bridge_->is_dictionary(settings)) return std::nullopt;
     const auto setting = [&](const char* key) -> std::optional<double> {
         const auto k = support_.cf.string(key);
@@ -94,9 +105,25 @@ std::optional<af::Pcm> Writers::settings_pcm(Address settings, std::uint32_t con
         support_.release(k);
         return value ? bridge_->real(value) : std::nullopt;
     };
-    if (setting("AVFormatIDKey").value_or(af::four("lpcm")) != af::four("lpcm")) return std::nullopt;
+    const auto format_id = static_cast<std::uint32_t>(setting("AVFormatIDKey").value_or(af::four("lpcm")));
     const auto rate = setting("AVSampleRateKey"), channels = setting("AVNumberOfChannelsKey");
     if (!rate || !(*rate > 0) || !channels || *channels < 1 || *channels > 64) return std::nullopt;
+    if (format_id == af::four("alac")) {
+        // kAppleLosslessFormatFlag_16/20/24/32BitSourceData, 4096 frames per packet.
+        if (!packet_file::writable(container, format_id) || *channels > 8) return std::nullopt;
+        const auto depth = setting("AVEncoderBitDepthHintKey").value_or(setting("AVLinearPCMBitDepthKey").value_or(16));
+        const std::uint32_t flags = depth <= 16 ? 1 : depth <= 20 ? 2 : depth <= 24 ? 3 : 4, per_packet = 4096,
+                            count = static_cast<std::uint32_t>(*channels);
+        const double sample_rate = *rate;
+        std::vector<std::uint8_t> asbd(40, 0);
+        std::memcpy(asbd.data(), &sample_rate, 8);
+        std::memcpy(asbd.data() + 8, &format_id, 4);
+        std::memcpy(asbd.data() + 12, &flags, 4);
+        std::memcpy(asbd.data() + 20, &per_packet, 4);
+        std::memcpy(asbd.data() + 28, &count, 4);
+        return asbd;
+    }
+    if (format_id != af::four("lpcm") || !pcm_container(container)) return std::nullopt;
     af::Pcm pcm;
     pcm.rate = *rate;
     pcm.channels = static_cast<std::uint32_t>(*channels);
@@ -106,7 +133,7 @@ std::optional<af::Pcm> Writers::settings_pcm(Address settings, std::uint32_t con
     pcm.big_endian = setting("AVLinearPCMIsBigEndianKey").value_or(container == af::four("AIFF") || container == af::four("AIFC")) != 0;
     pcm.is_signed = pcm.is_float || !(container == af::four("WAVE") && pcm.bits == 8);
     pcm.aligned_high = !pcm.is_float && pcm.bits < pcm.container * 8 && container != af::four("caff");
-    return pcm;
+    return af::asbd_from_pcm(pcm);
 }
 
 std::int32_t Writers::create_file(WriterState& w, const std::vector<std::uint8_t>& asbd) {
@@ -161,8 +188,8 @@ bool Writers::append(Address input_object, Address sample) {
         if (w->end && is_numeric(*w->end) && compare(pts, *w->end) >= 0) return true;      // after it
     }
     if (!w->ext) {
-        auto file = settings_pcm(in->settings, w->container);
-        auto file_asbd = file ? af::asbd_from_pcm(*file) : asbd;
+        const auto file = settings_asbd(in->settings, w->container);
+        auto file_asbd = file ? *file : asbd;
         if (!file && (w->container == af::four("AIFF")) && !pcm->is_float) {   // AIFF integers are big-endian
             auto big = *pcm;
             big.big_endian = true;
@@ -243,11 +270,12 @@ void Writers::install() {
     support.method(writer_class_, "initWithURL:fileType:error:", [self, sp](CpuState& s, GuestMemory&) {
         const auto type = s.x[3] ? sp->cf.utf8(s.x[3]) : std::string{};
         const std::uint32_t container = type == "com.microsoft.waveform-audio" ? af::four("WAVE") : type == "public.aiff-audio" ? af::four("AIFF")
-                                      : type == "public.aifc-audio" ? af::four("AIFC") : type == "com.apple.coreaudio-format" ? af::four("caff") : 0;
+                                      : type == "public.aifc-audio" ? af::four("AIFC") : type == "com.apple.coreaudio-format" ? af::four("caff")
+                                      : type == "com.apple.m4a-audio" ? af::four("m4af") : type == "public.mpeg-4" ? af::four("mp4f") : 0;
         if (!s.x[2] || !container) {
             if (s.x[4])
                 self->bridge_->store_error(s.x[4], self->bridge_->error("AVFoundationErrorDomain", av_error_unknown,
-                                                                        "AVAssetWriter writes WAVE, AIFF, AIFC and CAF audio files (no QuickTime or MPEG-4 writer exists under Alchemy)"),
+                                                                        "AVAssetWriter writes WAVE, AIFF, AIFC, CAF, M4A and MPEG-4 audio files (no QuickTime movie writer exists under Alchemy)"),
                                            true);
             sp->release(s.x[0]);
             s.x[0] = 0;
@@ -295,22 +323,24 @@ void Writers::install() {
         std::lock_guard lock(w->mutex);
         s.x[0] = sp->send_id(self->bridge_->array(w->inputs), "autorelease");
     }, "@@:");
-    // Linear PCM audio settings (or nil: passthrough); nothing else has an encoder.
+    // Linear PCM or Apple Lossless audio settings (or nil: passthrough); nothing else has an encoder.
     support.method(writer_class_, "canApplyOutputSettings:forMediaType:", [self, sp](CpuState& s, GuestMemory&) {
         const auto type = s.x[3] ? sp->cf.utf8(s.x[3]) : std::string{};
-        s.x[0] = type == "soun" && (!s.x[2] || self->settings_pcm(s.x[2], af::four("caff"))) ? 1 : 0;
+        s.x[0] = type == "soun" && (!s.x[2] || self->settings_asbd(s.x[2], af::four("caff"))) ? 1 : 0;
     }, "B@:@@");
     support.method(writer_class_, "canAddInput:", [self, sp, writer_of](CpuState& s, GuestMemory&) {
         const auto w = writer_of(s.x[0]);
         const auto in = s.x[2] ? sp->objc.find_host_state<WriterInput>(s.x[2]) : nullptr;
         std::lock_guard lock(w->mutex);
         const bool audio = in && sp->cf.utf8(in->media_type) == "soun";
-        s.x[0] = audio && w->status == status_unknown && w->inputs.empty() && !in->writer && (!in->settings || self->settings_pcm(in->settings, w->container)) ? 1 : 0;
+        // Passthrough (nil settings) writes linear PCM, which MPEG-4 files do not hold.
+        const bool format_ok = in && (in->settings ? self->settings_asbd(in->settings, w->container).has_value() : pcm_container(w->container));
+        s.x[0] = audio && w->status == status_unknown && w->inputs.empty() && !in->writer && format_ok ? 1 : 0;
     }, "B@:@");
     support.method(writer_class_, "addInput:", [sp, writer_of](CpuState& s, GuestMemory&) {
         if (!(sp->send(s.x[0], "canAddInput:", [&] { CallRegs r{}; r.x[2] = s.x[2]; return r; }()).x0 & 0xff))
-            throw std::runtime_error("Alchemy: -[AVAssetWriter addInput:] cannot add this input (one linear PCM audio input before -startWriting; "
-                                     "no video encoder exists under Alchemy) (NSInvalidArgumentException)");
+            throw std::runtime_error("Alchemy: -[AVAssetWriter addInput:] cannot add this input (one linear PCM or Apple Lossless audio input "
+                                     "the file type holds, before -startWriting; no video encoder exists under Alchemy) (NSInvalidArgumentException)");
         const auto w = writer_of(s.x[0]);
         std::lock_guard lock(w->mutex);
         w->inputs.push_back(sp->retain(s.x[2]));
@@ -323,8 +353,8 @@ void Writers::install() {
         w->status = status_writing;
         if (!w->inputs.empty()) {
             const auto in = sp->objc.find_host_state<WriterInput>(w->inputs.front());
-            if (const auto pcm = self->settings_pcm(in->settings, w->container))
-                if (const auto status = self->create_file(*w, af::asbd_from_pcm(*pcm))) self->fail(*w, status, "AVAssetWriter could not create the file in that format");
+            if (const auto file = self->settings_asbd(in->settings, w->container))
+                if (const auto status = self->create_file(*w, *file)) self->fail(*w, status, "AVAssetWriter could not create the file in that format");
         }
         s.x[0] = w->status == status_writing ? 1 : 0;
     }, "B@:");

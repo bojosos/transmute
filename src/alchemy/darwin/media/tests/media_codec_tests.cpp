@@ -7,13 +7,15 @@
 // - FLAC: signals encoded here by libFLAC, parsed as native FLAC streams, decoded bit-exactly.
 // - ALAC: signals of 16, 20, 24 and 32 bits in 1, 2 and 6 channels encoded by the ALAC encoder
 //   (media_codecs.hpp), decoded bit-exactly (32-bit to float precision), in CAF and M4A files
-//   built here; malformed cookies and packets are rejected.
+//   built here; malformed cookies and packets are rejected; CAF and M4A files made by the packet-file
+//   writer (packet_file.hpp) read back the same.
 // - VP8 and VP9 (profiles 0, 1 and 2): libvpx's test vectors (IVF, and WebM through the
 //   Matroska parser) against their per-frame MD5s.
 // - AV1 (8 and 10 bits): libaom's test vectors against their per-frame MD5s.
 #include "alchemy/darwin/media/audio_stream.hpp"
 #include "alchemy/darwin/media/media_codecs.hpp"
 #include "alchemy/darwin/media/media_container.hpp"
+#include "alchemy/darwin/media/packet_file.hpp"
 #include "alchemy/darwin/media/video_frames.hpp"
 
 #include "alchemy/host/crypto.hpp"
@@ -477,6 +479,62 @@ void alac_tests() {
         if (decoder->decode(junk, out, why)) require(out.size() <= 4096, "a junk packet decodes to at most a frame length");
     }
     require(decoder->decode(good.packets[0], out, why), "the decoder still decodes after rejected packets");
+    // The packet-file writer: CAF (constant and varying packet frames, priming) and M4A files of the
+    // packets read back through the stream exactly.
+    namespace pf = alchemy::gui::completion_kit::media::packet_file;
+    const std::uint32_t frames = 4096 * 2 + 1000;
+    const auto signal = alac_signal(frames, 2, 24);
+    const auto s = alac_encode(signal, 2, 24);
+    std::vector<float> decoded;
+    auto reference_decoder = codecs::make_audio_decoder(alac, 0, 0, s.cookie, why);
+    for (const auto& p : s.packets) require(reference_decoder->decode(p, decoded, why), "decodes");
+    const auto write_file = [&](std::uint32_t type, std::uint32_t priming, bool tell_frames) {
+        pf::Format format{type, 44100, alac, 3, 4096, 2};
+        auto w = pf::Writer::make(format, why);
+        require(w.has_value(), "a packet-file writer: " + why);
+        Bytes file = w->header();
+        for (std::size_t i = 0; i < s.packets.size(); ++i) {
+            require(w->data_end() == file.size(), "packets go at the data's end");
+            append(file, s.packets[i]);
+            const bool last = i + 1 == s.packets.size();
+            w->add_packet(std::uint32_t(s.packets[i].size()), tell_frames || last ? (last ? frames - 4096 * 2 : 4096) : 0);
+        }
+        w->set_cookie(s.cookie);
+        if (priming) w->set_priming(priming, 0);
+        for (const auto& [offset, bytes] : w->finish()) {
+            if (file.size() < offset + bytes.size()) file.resize(offset + bytes.size());
+            std::copy(bytes.begin(), bytes.end(), file.begin() + std::ptrdiff_t(offset));
+        }
+        return file;
+    };
+    for (const auto type : {mc::fourcc("caff"), mc::fourcc("m4af"), mc::fourcc("mp4f")}) {
+        const auto file = write_file(type, 0, false);
+        stream_checks("packet-file writer " + std::to_string(type), file, decoded, 2, 0.0f);
+        std::int32_t status = 0;
+        auto stream = alchemy::gui::completion_kit::media::audio_stream::Stream::open(reader(file), file.size(), status, why);
+        require(stream->magic_cookie() == s.cookie && stream->packet_count() == 3 && stream->file_type() == (type == mc::fourcc("caff") ? type : type),
+                "packet-file writer: the cookie and packets");
+    }
+    const std::vector<float> primed(decoded.begin() + 2 * 300, decoded.end());
+    stream_checks("packet-file writer, CAF with priming", write_file(mc::fourcc("caff"), 300, true), primed, 2, 0.0f);
+    {   // Varying frames: the description says 0 frames per packet and the table has each packet's.
+        pf::Format format{mc::fourcc("caff"), 44100, alac, 3, 4096, 2};
+        auto w = pf::Writer::make(format, why);
+        w->add_packet(100, 1000);
+        w->add_packet(100, 4096);
+        Bytes file = w->header();
+        file.resize(file.size() + 200);
+        for (const auto& [offset, bytes] : w->finish()) {
+            if (file.size() < offset + bytes.size()) file.resize(offset + bytes.size());
+            std::copy(bytes.begin(), bytes.end(), file.begin() + std::ptrdiff_t(offset));
+        }
+        mc::Movie movie;
+        require(mc::parse(reader(file), file.size(), movie, why) && movie.tracks[0].samples.size() == 2 && movie.tracks[0].samples[0].duration == 1000 &&
+                movie.tracks[0].duration == 5096, "a CAF of varying packet frames");
+    }
+    require(!pf::Writer::make({mc::fourcc("WAVE"), 44100, alac, 1, 4096, 2}, why) && !pf::Writer::make({mc::fourcc("caff"), 44100, alac, 0, 4096, 2}, why) &&
+            !pf::Writer::make({mc::fourcc("caff"), 44100, alac, 1, 4096, 9}, why) && !pf::Writer::make({mc::fourcc("m4af"), 44100, mc::fourcc("aac "), 1, 1024, 2}, why),
+            "the writer's limits");
     // Encoder limits.
     require(!codecs::make_audio_encoder(alac, 44100, 9, 16, 0, why) && !codecs::make_audio_encoder(alac, 44100, 2, 18, 0, why) &&
             !codecs::make_audio_encoder(alac, 44100.5, 2, 16, 0, why) && !codecs::make_audio_encoder(alac, 44100, 2, 16, 20000, why) &&
