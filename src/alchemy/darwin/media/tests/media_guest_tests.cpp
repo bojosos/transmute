@@ -2400,6 +2400,45 @@ void audio_file_stream(Fixture& f) {
     reset();
     parse(stream, file, static_cast<std::size_t>(data_offset + tenth), 1);   // kAudioFileStreamParseFlag_Discontinuity
     require(packets.size() >= first_after.size() && std::equal(first_after.begin(), first_after.end(), packets.begin()), "packet 10 after the seek");
+
+    // A streaming player: those packets into an AudioQueue of the stream's '.mp3' format, decoded and played.
+    static std::atomic<int> queue_returned{0};
+    queue_returned = 0;
+    const auto queue_callback = f.process.install_function("_alchemy_test_afs_queue_callback",
+                                                           [](transmute::CpuState&, transmute::GuestMemory&) { ++queue_returned; },
+                                                           "/usr/lib/alchemy_test_io.dylib");
+    const auto stream_format = f.block(40), queue_out = f.block(8), buffer_out = f.block(8);
+    f.engine.write32(size, 40);
+    require(f.status(at, "_AudioFileStreamGetProperty", {stream, 0x64666d74, size, stream_format}) == 0, "the stream's format");
+    require(f.status(at, "_AudioQueueNewOutput", {stream_format, queue_callback, 0, 0, 0, 0, queue_out}) == 0, "AudioQueueNewOutput for '.mp3'");
+    const auto queue = f.engine.read64(queue_out);
+    const auto queued_packets = static_cast<std::uint32_t>(std::min<std::size_t>(40, sizes.size()));
+    std::uint32_t total = 0;
+    for (std::uint32_t i = 0; i < queued_packets; ++i) total += sizes[i];
+    require(f.status(at, "_AudioQueueAllocateBufferWithPacketDescriptions", {queue, total, queued_packets, buffer_out}) == 0, "a buffer with descriptions");
+    const auto queue_buffer = f.engine.read64(buffer_out);
+    f.memory().write_bytes(f.engine.read64(queue_buffer + 8), std::span(packets.data(), total));
+    f.engine.write32(queue_buffer + 16, total);
+    const auto queue_descriptions = f.engine.read64(queue_buffer + 40);
+    for (std::uint32_t i = 0, offset = 0; i < queued_packets; offset += sizes[i++]) {
+        f.engine.write64(queue_descriptions + 16ULL * i, offset);
+        f.engine.write32(queue_descriptions + 16ULL * i + 8, 0);
+        f.engine.write32(queue_descriptions + 16ULL * i + 12, sizes[i]);
+    }
+    f.engine.write32(queue_buffer + 48, queued_packets);
+    require(f.status(at, "_AudioQueueEnqueueBuffer", {queue, queue_buffer, 0, 0}) == 0, "the MP3 packets enqueued");
+    require(f.status(at, "_AudioQueueStart", {queue, 0}) == 0, "AudioQueueStart");
+    const auto heard = FakeStream::play_until_sound(512);
+    require(std::any_of(heard.begin(), heard.end(), [](float v) { return std::fabs(v) > 1e-4f; }), "the decoded MP3 plays");
+    const auto queue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (queue_returned == 0 && std::chrono::steady_clock::now() < queue_deadline) {
+        static_cast<void>(FakeStream::play_paced(2048));
+    }
+    require(queue_returned == 1, "the played buffer comes back");
+    require(f.status(at, "_AudioQueueStop", {queue, 1}) == 0 && f.status(at, "_AudioQueueDispose", {queue, 1}) == 0, "queue stopped and disposed");
+    f.engine.write32(stream_format + 8, 0x61616320);   // 'aac '
+    require(f.status(at, "_AudioQueueNewOutput", {stream_format, queue_callback, 0, 0, 0, 0, queue_out}) == static_cast<std::int32_t>(0x666d743f),
+            "AAC has no decoder ('fmt?')");
     require(f.status(at, "_AudioFileStreamSetProperty", {stream, 0x64666d74, 40, value}) == static_cast<std::int32_t>(0x6e6f7065),
             "properties cannot be set ('nope')");
     require(f.status(at, "_AudioFileStreamClose", {stream}) == 0, "AudioFileStreamClose");

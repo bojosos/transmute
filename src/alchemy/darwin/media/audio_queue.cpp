@@ -1,6 +1,8 @@
 #include "alchemy/darwin/media/media_support.hpp"
 #include "alchemy/darwin/media/audio_file_core.hpp"
 #include "alchemy/darwin/media/hal_io.hpp"
+#include "alchemy/darwin/media/media_codecs.hpp"
+#include "alchemy/darwin/media/media_container.hpp"
 #include "alchemy/darwin/media/resampler.hpp"
 
 #include "alchemy/darwin/security/bridge.hpp"
@@ -40,8 +42,15 @@
 // AudioQueueNewInput answers kAudioQueueErr_InvalidDevice; a device the host refuses fails
 // AudioQueueStart.
 //
-// Unavailable: compressed formats (kAudioFormatUnsupportedDataFormatError: there is no decoder or
-// encoder), offline rendering and processing taps.
+// Output queues also play compressed packets a decoder exists for (media_codecs.hpp): MPEG audio
+// ('.mp1', '.mp2', '.mp3'), FLAC and Opus, configured by kAudioQueueProperty_MagicCookie (FLAC
+// needs one). Each enqueued buffer's packets (its packet descriptions, those passed to
+// AudioQueueEnqueueBuffer, or for MPEG audio without any its frame headers) are decoded when it is
+// enqueued, into the decoder's rate and channels, and play like linear PCM; a packet the decoder
+// rejects plays as silence.
+//
+// Unavailable: other compressed formats (AAC, ALAC, ...: kAudioFormatUnsupportedDataFormatError),
+// compressed input (there is no encoder), offline rendering and processing taps.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -50,6 +59,9 @@ namespace af = audio_file;
 constexpr std::string_view audio_toolbox = "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox";
 constexpr std::string_view core_foundation = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
 constexpr std::uint32_t four(const char (&code)[5]) { return af::four(code); }
+bool compressed_playable(std::uint32_t id) {
+    return id == four(".mp1") || id == four(".mp2") || id == four(".mp3") || id == four("flac") || id == four("opus");
+}
 
 namespace error {
 inline constexpr std::int32_t invalid_buffer = -66687, buffer_empty = -66686, invalid_property = -66684, invalid_property_size = -66683,
@@ -75,6 +87,7 @@ struct Buffer {
     double start_sample{};             // input: its first frame's time
     std::uint64_t start_host{};
     std::uint32_t trim_start{}, trim_end{};
+    std::shared_ptr<const std::vector<float>> decoded;   // a compressed queue's buffer, decoded (interleaved)
 };
 
 struct Listener { std::uint32_t property{}; std::uint64_t proc{}, data{}; };
@@ -100,6 +113,11 @@ struct Queue {
     std::thread::id callback_thread;   // the queue's own thread, once a callback ran there
     double sample_time{};
     std::shared_ptr<CompletionThread> thread;        // callbacks without a run loop or dispatch queue
+    // Compressed output: the format ID, frames per packet, magic cookie and decoder (made at the
+    // first enqueue); `format` is then the decoded audio, 32-bit float interleaved.
+    std::uint32_t codec{}, codec_frames_per_packet{};
+    std::vector<std::uint8_t> cookie;
+    std::unique_ptr<codecs::AudioDecoder> decoder;
     // Input queues:
     bool input{};
     std::shared_ptr<hal_io::InputIo> input_io;
@@ -128,6 +146,9 @@ private:
     void capture(const std::shared_ptr<Queue>& q, const float* samples, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing);
     void notify(const std::shared_ptr<Queue>& q, std::uint32_t property);
     void render(const std::shared_ptr<Queue>& q, float* mix, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing);
+    // A compressed queue's buffer of `bytes`: its packets decoded into `b` (under the queue's mutex).
+    std::int32_t decode(Queue& q, GuestMemory& m, std::uint64_t buffer, std::uint32_t bytes, std::uint32_t description_count,
+                        std::uint64_t descriptions, Buffer& b);
     std::int32_t start(const std::shared_ptr<Queue>& q);
     void stop_now(const std::shared_ptr<Queue>& q, bool give_back_buffers);
 
@@ -256,6 +277,61 @@ void Queues::capture(const std::shared_ptr<Queue>& q, const float* samples, std:
     for (const auto& f : full) give_back_input(q, f.address, f.frames, f.sample, f.host);
 }
 
+std::int32_t Queues::decode(Queue& q, GuestMemory& m, std::uint64_t buffer, std::uint32_t bytes, std::uint32_t description_count,
+                            std::uint64_t descriptions, Buffer& b) {
+    if (!q.decoder) {
+        std::string why;
+        const auto codec = q.codec == four(".mp1") || q.codec == four(".mp2") ? four(".mp3") : q.codec;
+        q.decoder = codecs::make_audio_decoder(codec, q.format.rate, q.format.channels, q.cookie, why);
+        if (!q.decoder) return error::unsupported_format;
+        // Before playback the queue takes the decoder's rate and channels.
+        if (!q.resampler) {
+            q.format.rate = q.decoder->rate;
+            q.format.channels = q.decoder->channels;
+        }
+    }
+    std::vector<std::uint8_t> data(bytes);
+    m.read_bytes(m.read64(buffer + buffer_data), data);
+    // The packets: the descriptions passed in, else the buffer's own, else (MPEG audio) its frames,
+    // else the whole buffer.
+    if (!description_count || !descriptions) {
+        description_count = m.read32(buffer + buffer_description_count);
+        descriptions = description_count ? m.read64(buffer + buffer_descriptions) : 0;
+    }
+    std::vector<std::pair<std::size_t, std::size_t>> packets;
+    for (std::uint32_t i = 0; descriptions && i < description_count; ++i) {
+        const auto start = m.read64(descriptions + 16ULL * i);
+        const auto size = m.read32(descriptions + 16ULL * i + 12);
+        if (start + size > bytes) return error::invalid_buffer;
+        packets.emplace_back(static_cast<std::size_t>(start), size);
+    }
+    if (packets.empty() && (q.codec == four(".mp1") || q.codec == four(".mp2") || q.codec == four(".mp3"))) {
+        for (std::size_t at = 0; at + 4 <= data.size();) {
+            const auto frame = container::mpeg_frame(data.data() + at);
+            if (!frame.bytes) { ++at; continue; }
+            packets.emplace_back(at, std::min<std::size_t>(frame.bytes, data.size() - at));
+            at += frame.bytes;
+        }
+    }
+    if (packets.empty()) packets.emplace_back(0, data.size());
+    auto decoded = std::make_shared<std::vector<float>>();
+    const auto channels = q.decoder->channels;
+    for (const auto& [start, size] : packets) {
+        std::string why;
+        const auto before = decoded->size();
+        if (!q.decoder->decode(std::span(data).subspan(start, size), *decoded, why)) {
+            decoded->resize(before);
+            decoded->resize(before + static_cast<std::size_t>(q.codec_frames_per_packet) * channels, 0.0f);   // silence
+        }
+    }
+    // A queue that started before its decoder existed keeps its format: the decoded channels must match it.
+    if (channels != q.format.channels) return error::unsupported_format;
+    b.frames = static_cast<std::uint32_t>(decoded->size() / channels);
+    b.decoded = std::move(decoded);
+    if (!b.frames) return error::buffer_empty;
+    return 0;
+}
+
 void Queues::notify(const std::shared_ptr<Queue>& q, std::uint32_t property) {
     std::vector<Listener> listeners;
     {
@@ -283,18 +359,24 @@ void Queues::render(const std::shared_ptr<Queue>& q, float* mix, std::uint32_t f
             const auto start = std::max(current.played, current.trim_start);
             const auto take = static_cast<std::uint32_t>(std::min<std::size_t>(count - done, end > start ? end - start : 0));
             if (take) {
-                const auto data = m.read64(current.address + buffer_data);
-                const auto bytes = static_cast<std::size_t>(take) * q->format.frame_bytes();
-                std::vector<std::vector<std::uint8_t>> storage;
-                std::vector<std::span<const std::uint8_t>> spans;
-                const auto planes = q->format.non_interleaved ? q->format.channels : 1U;
-                const auto plane_bytes = static_cast<std::size_t>(current.frames) * q->format.frame_bytes();
-                for (std::uint32_t p = 0; p < planes; ++p) {
-                    storage.emplace_back(bytes);
-                    m.read_bytes(data + p * plane_bytes + static_cast<std::size_t>(start) * q->format.frame_bytes(), storage.back());
-                    spans.emplace_back(storage.back());
+                std::vector<double> samples;
+                if (current.decoded) {
+                    const auto from = current.decoded->begin() + static_cast<std::ptrdiff_t>(start) * q->format.channels;
+                    samples.assign(from, from + static_cast<std::ptrdiff_t>(take) * q->format.channels);
+                } else {
+                    const auto data = m.read64(current.address + buffer_data);
+                    const auto bytes = static_cast<std::size_t>(take) * q->format.frame_bytes();
+                    std::vector<std::vector<std::uint8_t>> storage;
+                    std::vector<std::span<const std::uint8_t>> spans;
+                    const auto planes = q->format.non_interleaved ? q->format.channels : 1U;
+                    const auto plane_bytes = static_cast<std::size_t>(current.frames) * q->format.frame_bytes();
+                    for (std::uint32_t p = 0; p < planes; ++p) {
+                        storage.emplace_back(bytes);
+                        m.read_bytes(data + p * plane_bytes + static_cast<std::size_t>(start) * q->format.frame_bytes(), storage.back());
+                        spans.emplace_back(storage.back());
+                    }
+                    samples = af::decode(q->format, spans, take);
                 }
-                const auto samples = af::decode(q->format, spans, take);
                 for (std::uint32_t f = 0; f < take; ++f)
                     for (std::uint32_t c = 0; c < channels; ++c) {
                         const auto source = q->format.channels == 1 ? 0U : c;
@@ -450,12 +532,33 @@ void Queues::install() {
         std::vector<std::uint8_t> bytes(40);
         m.read_bytes(asbd, bytes);
         std::string why;
-        const auto format = af::pcm_from_asbd(bytes, why);
-        if (!format) return error::unsupported_format;
         auto q = std::make_shared<Queue>();
-        q->format = *format;
+        if (const auto format = af::pcm_from_asbd(bytes, why)) {
+            q->format = *format;
+        } else {
+            // A compressed format a decoder exists for: the decoded audio is float32 interleaved
+            // (the rate and channels are the decoder's once it is made).
+            std::uint32_t id{};
+            std::memcpy(&id, bytes.data() + 8, 4);
+            if (!compressed_playable(id)) return error::unsupported_format;
+            double rate{};
+            std::memcpy(&rate, bytes.data(), 8);
+            std::uint32_t frames_per_packet{}, channels{};
+            std::memcpy(&frames_per_packet, bytes.data() + 20, 4);
+            std::memcpy(&channels, bytes.data() + 28, 4);
+            if (!(rate > 0) || !channels) return error::unsupported_format;
+            q->codec = id;
+            q->codec_frames_per_packet = frames_per_packet;
+            q->format.rate = rate;
+            q->format.channels = channels;
+            q->format.bits = 32;
+            q->format.container = 4;
+            q->format.is_float = true;
+            q->format.is_signed = true;
+        }
         q->asbd = bytes;
         setup(*q);
+        if (q->input && q->codec) return error::unsupported_format;   // no encoder
         q->handle = self->support_.process.allocate_guest(16, 16);
         m.fill_bytes(q->handle, 0, 16);
         {
@@ -605,7 +708,11 @@ void Queues::install() {
         if (bytes > q->buffers[buffer]) return error::invalid_buffer;
         Buffer b;
         b.address = buffer;
-        b.frames = bytes / per_frame;
+        if (q->codec) {
+            if (const auto result = self->decode(*q, m, buffer, bytes, static_cast<std::uint32_t>(s.x[2]), s.x[3], b)) return result;
+        } else {
+            b.frames = bytes / per_frame;
+        }
         b.trim_start = std::min(trim_start, b.frames);
         b.trim_end = std::min(trim_end, b.frames - b.trim_start);
         q->queued.push_back(b);
@@ -713,6 +820,10 @@ void Queues::install() {
         case prop_device_sample_rate: { const double rate = device ? device->rate() : 0; out.resize(8); std::memcpy(out.data(), &rate, 8); return 0; }
         case prop_device_channels: u32(device ? device->channels() : 0); return 0;
         case prop_stream_description: out = q.asbd; return 0;
+        case prop_magic_cookie:
+            if (q.cookie.empty()) return error::invalid_property;
+            out = q.cookie;
+            return 0;
         case prop_maximum_output_packet_size: u32(q.format.frame_bytes() * (q.format.non_interleaved ? q.format.channels : 1U)); return 0;
         case prop_enable_level_metering: u32(q.metering ? 1 : 0); return 0;
         case prop_decode_buffer_size_frames: u32(2048); return 0;
@@ -779,8 +890,14 @@ void Queues::install() {
             // A device UID (CFString): only the default output plays here; NULL selects it.
             if (s.x[2] && s.x[3] >= 8 && m.read64(s.x[2])) return status(s, error::invalid_device);
             break;
+        case prop_magic_cookie:
+            // The decoder's configuration; a new cookie makes a new decoder at the next enqueue.
+            q->cookie.assign(static_cast<std::size_t>(s.x[2] ? static_cast<std::uint32_t>(s.x[3]) : 0), 0);
+            if (!q->cookie.empty()) m.read_bytes(s.x[2], q->cookie);
+            q->decoder.reset();
+            break;
         case prop_enable_time_pitch: case prop_time_pitch_algorithm: case prop_time_pitch_bypass: case prop_decode_buffer_size_frames:
-        case prop_channel_layout: case prop_magic_cookie:
+        case prop_channel_layout:
             break;
         default: return status(s, error::invalid_property);
         }
