@@ -724,6 +724,47 @@ void test_legacy_keychain(Fixture& f) {
     require(f.status("_SecKeychainGetStatus", {keychain, status_out}) == -25294, "a deleted keychain is errSecNoSuchKeychain");
     const auto reset = sec::bridge()->array({f.engine.read64(default_out)});
     require(f.status("_SecKeychainSetSearchList", {reset}) == 0, "reset the search list");
+
+    // 5. Access control: recorded with an item and reported (nothing prompts).
+    const auto app = f.cell(), app_data = f.cell();
+    require(f.status("_SecTrustedApplicationCreateFromPath", {f.text_buffer("/Applications/Example.app"), app}) == 0 &&
+            f.status("_SecTrustedApplicationCopyData", {f.engine.read64(app), app_data}) == 0 &&
+            f.bytes(f.engine.read64(app_data)) == Bytes{'/', 'A', 'p', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', 's', '/', 'E', 'x', 'a', 'm', 'p', 'l', 'e', '.',
+                                                       'a', 'p', 'p'}, "SecTrustedApplicationCreateFromPath / CopyData");
+    const auto trusted = sec::bridge()->array({f.engine.read64(app)});
+    const auto access_out = f.cell();
+    require(f.status("_SecAccessCreate", {f.string("Example access"), trusted, access_out}) == 0 &&
+            f.core("_CFGetTypeID", {f.engine.read64(access_out)}) == f.s("_SecAccessGetTypeID"), "SecAccessCreate");
+    const auto acls_out = f.cell();
+    require(f.status("_SecAccessCopyACLList", {f.engine.read64(access_out), acls_out}) == 0 && f.cf.length(f.engine.read64(acls_out)) == 2,
+            "SecAccessCopyACLList: an owner and a use ACL");
+    const auto use_acl = f.core("_CFArrayGetValueAtIndex", {f.engine.read64(acls_out), 1});
+    const auto apps_out = f.cell(), description_out = f.cell(), prompt_out = f.process.allocate_guest(2);
+    require(f.status("_SecACLCopyContents", {use_acl, apps_out, description_out, prompt_out}) == 0 && f.engine.read64(apps_out) &&
+            f.cf.length(f.engine.read64(apps_out)) == 1 && f.cf.utf8(f.engine.read64(description_out)) == "Example access", "SecACLCopyContents");
+    // Any application, as Chrome sets its item's ACLs.
+    require(f.status("_SecACLSetContents", {use_acl, 0, f.string("Any application"), 0}) == 0 &&
+            f.status("_SecACLCopyContents", {use_acl, apps_out, description_out, prompt_out}) == 0 && f.engine.read64(apps_out) == 0,
+            "SecACLSetContents (any application)");
+    const auto acl_attributes = attribute_list({{fourcc("svce"), "com.alchemy.acl"}, {fourcc("acct"), "acl"}});
+    const auto acl_item = f.cell();
+    require(f.status("_SecKeychainItemCreateFromContent", {fourcc("genp"), acl_attributes, 3, f.text_buffer("abc"), 0, f.engine.read64(access_out), acl_item}) == 0,
+            "SecKeychainItemCreateFromContent with an initial access");
+    const auto item_access = f.cell(), item_acls = f.cell();
+    require(f.status("_SecKeychainItemCopyAccess", {f.engine.read64(acl_item), item_access}) == 0 &&
+            f.status("_SecAccessCopyACLList", {f.engine.read64(item_access), item_acls}) == 0 && f.cf.length(f.engine.read64(item_acls)) == 2,
+            "SecKeychainItemCopyAccess");
+    const auto stored_use = f.core("_CFArrayGetValueAtIndex", {f.engine.read64(item_acls), 1});
+    require(f.status("_SecACLCopyContents", {stored_use, apps_out, description_out, prompt_out}) == 0 && f.engine.read64(apps_out) == 0 &&
+            f.cf.utf8(f.engine.read64(description_out)) == "Any application", "the item keeps the access it was created with");
+    const auto none_out = f.cell();
+    require(f.status("_SecAccessCreate", {f.string("No application"), sec::bridge()->array({}), none_out}) == 0 &&
+            f.status("_SecKeychainItemSetAccess", {f.engine.read64(acl_item), f.engine.read64(none_out)}) == 0 &&
+            f.status("_SecKeychainItemCopyAccess", {f.engine.read64(acl_item), item_access}) == 0 &&
+            f.status("_SecAccessCopyACLList", {f.engine.read64(item_access), item_acls}) == 0 &&
+            f.status("_SecACLCopyContents", {f.core("_CFArrayGetValueAtIndex", {f.engine.read64(item_acls), 1}), apps_out, 0, 0}) == 0 &&
+            f.engine.read64(apps_out) && f.cf.length(f.engine.read64(apps_out)) == 0, "SecKeychainItemSetAccess (an empty trusted list)");
+    require(f.status("_SecKeychainItemDelete", {f.engine.read64(acl_item)}) == 0, "delete the access-controlled item");
     for (const auto object : {reset, search_list, f.engine.read64(list_out2), f.engine.read64(default_out), f.engine.read64(item_keychain), keychain,
                               f.engine.read64(created), inet, f.engine.read64(item), query})
         f.release(object);

@@ -4,6 +4,8 @@ Security.framework, GSS.framework, CommonCrypto and CryptoKit's host core.
 
 - **Covers:** SecCertificate, SecPolicy and SecTrust over the Windows chain
   engine; SecKey over CNG; SecItem keychain items in a DPAPI-protected file;
+  legacy item access control (SecAccess, SecACL, SecTrustedApplication),
+  recorded with the item and reported, never enforced and never prompting;
   SecureTransport (SSLContext) over SChannel; SecRandomCopyBytes;
   CommonCrypto digests, HMAC, random bytes and CCCryptor; MD4; the GSS-API C
   bindings; CryptoKit's SHA-2, HMAC, HKDF, ChaCha20-Poly1305 and P-521

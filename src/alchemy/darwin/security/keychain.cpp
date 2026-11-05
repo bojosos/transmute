@@ -78,6 +78,21 @@ struct Item {
     std::map<std::string, Value> attributes;  // keyed by attribute name ("acct", "svce", ...)
     Bytes secret;
     double created{}, modified{};
+    Bytes access;                             // a serialized Access (SecKeychainItemSetAccess / initialAccess); empty: none set
+};
+
+// ---- access control (legacy SecAccess / SecACL / SecTrustedApplication) -----------------------------
+// Recorded and reported: one guest process and no prompt UI, so nothing is enforced and nothing prompts.
+
+struct Acl {
+    std::string role;                                   // "owner" (changes the access) or "use" (reads the secret)
+    std::optional<std::vector<std::string>> applications;   // trusted application paths; nullopt: any application
+    std::string description;
+    std::uint32_t prompt{};                             // SecKeychainPromptSelector
+};
+struct Access {
+    std::string descriptor;
+    std::vector<std::shared_ptr<Acl>> acls;
 };
 
 // ---- storage ----------------------------------------------------------------------------------------
@@ -121,6 +136,45 @@ struct Reader {
 };
 
 constexpr std::uint32_t password_trailer = 0x5750434b;   // "KCPW": a created keychain's password hash
+constexpr std::uint32_t access_trailer = 0x4341434b;     // "KCAC": item access (id, serialized Access)
+
+Bytes serialize_access(const Access& access) {
+    Bytes out;
+    put_text(out, access.descriptor);
+    put32(out, static_cast<std::uint32_t>(access.acls.size()));
+    for (const auto& acl : access.acls) {
+        put_text(out, acl->role);
+        out.push_back(acl->applications ? 1 : 0);
+        if (acl->applications) {
+            put32(out, static_cast<std::uint32_t>(acl->applications->size()));
+            for (const auto& path : *acl->applications) put_text(out, path);
+        }
+        put_text(out, acl->description);
+        put32(out, acl->prompt);
+    }
+    return out;
+}
+std::optional<Access> deserialize_access(std::span<const std::uint8_t> data) {
+    Reader in{data};
+    Access access;
+    access.descriptor = in.text();
+    const auto count = in.number(4);
+    for (std::uint64_t index = 0; in.ok && index < count && index < 64; ++index) {
+        auto acl = std::make_shared<Acl>();
+        acl->role = in.text();
+        if (in.number(1)) {
+            std::vector<std::string> paths;
+            const auto apps = in.number(4);
+            for (std::uint64_t a = 0; in.ok && a < apps && a < 1024; ++a) paths.push_back(in.text());
+            acl->applications = std::move(paths);
+        }
+        acl->description = in.text();
+        acl->prompt = static_cast<std::uint32_t>(in.number(4));
+        access.acls.push_back(std::move(acl));
+    }
+    if (!in.ok || in.at != data.size()) return std::nullopt;
+    return access;
+}
 
 Bytes serialize(const std::vector<Item>& items, std::uint64_t next_id, const std::optional<Bytes>& password) {
     Bytes out;
@@ -147,6 +201,14 @@ Bytes serialize(const std::vector<Item>& items, std::uint64_t next_id, const std
     if (password) {
         put32(out, password_trailer);
         put_bytes(out, *password);
+    }
+    std::size_t with_access = 0;
+    for (const auto& item : items) with_access += item.access.empty() ? 0 : 1;
+    if (with_access) {
+        put32(out, access_trailer);
+        put32(out, static_cast<std::uint32_t>(with_access));
+        for (const auto& item : items)
+            if (!item.access.empty()) { put64(out, item.id); put_bytes(out, item.access); }
     }
     return out;
 }
@@ -178,9 +240,20 @@ bool deserialize(std::span<const std::uint8_t> data, std::vector<Item>& items, s
         }
         items.push_back(std::move(item));
     }
-    if (in.ok && in.at < data.size()) {
-        if (in.number(4) != password_trailer) return false;
-        password = in.bytes();
+    while (in.ok && in.at < data.size()) {
+        const auto tag = in.number(4);
+        if (tag == password_trailer) {
+            password = in.bytes();
+        } else if (tag == access_trailer) {
+            const auto count = in.number(4);
+            for (std::uint64_t index = 0; in.ok && index < count; ++index) {
+                const auto id = in.number(8);
+                auto access = in.bytes();
+                for (auto& item : items) if (item.id == id) item.access = std::move(access);
+            }
+        } else {
+            return false;
+        }
     }
     return in.ok && in.at == data.size();
 }
@@ -380,6 +453,9 @@ std::optional<std::uint64_t> persistent_id(const Bytes& value) {
 }
 
 struct KeychainItemState final : ObjectPayload { std::uint64_t id{}; std::filesystem::path keychain; };   // empty: the default keychain
+struct AccessState final : ObjectPayload { std::shared_ptr<Access> access; };
+struct AclState final : ObjectPayload { std::shared_ptr<Access> access; std::shared_ptr<Acl> acl; };
+struct TrustedApplicationState final : ObjectPayload { std::string path; };
 struct KeychainState final : ObjectPayload { std::filesystem::path path; };                          // empty: the default keychain
 struct SearchState final : ObjectPayload {
     std::vector<std::filesystem::path> keychains;
@@ -393,6 +469,62 @@ struct Keychain {
     Security& sec;
     Bridge& b;
     Address item_class{}, keychain_class{}, default_keychain{};
+    Address access_class{}, acl_class{}, trusted_class{};
+
+    // ---- access control ----
+    std::shared_ptr<Access> access_of(Address object) {
+        const auto state = object ? b.objc.find_host_state<AccessState>(object) : nullptr;
+        return state ? state->access : nullptr;
+    }
+    Address make_access(std::shared_ptr<Access> access) {
+        const auto object = b.objc.allocate(access_class);
+        b.objc.host_state<AccessState>(object)->access = std::move(access);
+        return object;
+    }
+    Address make_trusted(std::string path) {
+        const auto object = b.objc.allocate(trusted_class);
+        b.objc.host_state<TrustedApplicationState>(object)->path = std::move(path);
+        return object;
+    }
+    // The calling application's executable path (its main bundle's).
+    std::string calling_application() {
+        const auto bundle = b.call(alchemy::core_foundation_library, "_CFBundleGetMainBundle", {});
+        const auto url = bundle ? b.call(alchemy::core_foundation_library, "_CFBundleCopyExecutableURL", {bundle}) : 0;
+        if (!url) return {};
+        auto path = b.cf.url_path(url);
+        b.release(url);
+        return path;
+    }
+    // A CFArray of SecTrustedApplicationRefs as paths; nullopt for NULL (any application). false when an entry is not one.
+    bool application_paths(Address list, std::optional<std::vector<std::string>>& out) {
+        out.reset();
+        if (!list) return true;
+        if (!b.is_array(list)) return false;
+        std::vector<std::string> paths;
+        for (const auto entry : b.cf.array_values(list)) {
+            const auto state = entry ? b.objc.find_host_state<TrustedApplicationState>(entry) : nullptr;
+            if (!state) return false;
+            paths.push_back(state->path);
+        }
+        out = std::move(paths);
+        return true;
+    }
+    // SecAccessCreate's lists: an owner ACL (no application changes the access without confirmation)
+    // and the use ACL of the trusted applications.
+    std::shared_ptr<Access> new_access(std::string descriptor, std::optional<std::vector<std::string>> trusted) {
+        auto access = std::make_shared<Access>();
+        access->descriptor = descriptor;
+        auto owner = std::make_shared<Acl>();
+        owner->role = "owner";
+        owner->applications = std::vector<std::string>{};
+        owner->description = descriptor;
+        auto use = std::make_shared<Acl>();
+        use->role = "use";
+        use->applications = std::move(trusted);
+        use->description = std::move(descriptor);
+        access->acls = {std::move(owner), std::move(use)};
+        return access;
+    }
 
     std::optional<Value> value_of(Address object) {
         if (!object) return std::nullopt;
@@ -1113,6 +1245,11 @@ void install_keychain(Security& sec) {
         item.attributes = std::move(*attributes);
         item.secret.resize(static_cast<std::size_t>(s.x[2]));
         if (!item.secret.empty()) m.read_bytes(s.x[3], item.secret);
+        if (s.x[5]) {   // initialAccess
+            const auto access = self->access_of(s.x[5]);
+            if (!access) { s.x[0] = status_value(status::param); return; }
+            item.access = serialize_access(*access);
+        }
         const auto path = s.x[4] ? self->path_of(s.x[4]) : std::optional(self->default_path());
         if (!path) { s.x[0] = status_value(status::param); return; }
         std::uint64_t id{};
@@ -1120,6 +1257,156 @@ void install_keychain(Security& sec) {
         if (s.x[6]) m.write64(s.x[6], self->item_ref(id, *path));
         s.x[0] = 0;
     });
+    // ---- access control: recorded with the items and reported; nothing prompts or is enforced ----
+    self->access_class = b.define_class("_AlchemySecAccess", b.object_class, lib);
+    self->acl_class = b.define_class("_AlchemySecACL", b.object_class, lib);
+    self->trusted_class = b.define_class("_AlchemySecTrustedApplication", b.object_class, lib);
+    b.register_type_id(self->access_class, TypeId::sec_access);
+    b.register_type_id(self->acl_class, TypeId::sec_acl);
+    b.register_type_id(self->trusted_class, TypeId::sec_trusted_application);
+    b.function(lib, "_SecAccessGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(TypeId::sec_access); });
+    b.function(lib, "_SecACLGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(TypeId::sec_acl); });
+    b.function(lib, "_SecTrustedApplicationGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(TypeId::sec_trusted_application); });
+    // OSStatus SecTrustedApplicationCreateFromPath(const char *path, SecTrustedApplicationRef *): NULL is the calling application.
+    b.function(lib, "_SecTrustedApplicationCreateFromPath", [self](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) { s.x[0] = status_value(status::param); return; }
+        auto path = s.x[0] ? self->guest_c_string(m, s.x[0]) : self->calling_application();
+        if (path.empty()) { s.x[0] = status_value(status::param); return; }
+        m.write64(s.x[1], self->make_trusted(std::move(path)));
+        s.x[0] = 0;
+    });
+    // SecTrustedApplicationCopyData / SetData: the application's identifying data (here, its path).
+    b.function(lib, "_SecTrustedApplicationCopyData", [self](CpuState& s, GuestMemory& m) {
+        const auto state = s.x[0] ? self->b.objc.find_host_state<TrustedApplicationState>(s.x[0]) : nullptr;
+        if (!state || !s.x[1]) { s.x[0] = status_value(status::param); return; }
+        m.write64(s.x[1], self->b.data(std::span(reinterpret_cast<const std::uint8_t*>(state->path.data()), state->path.size())));
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecTrustedApplicationSetData", [self](CpuState& s, GuestMemory&) {
+        const auto state = s.x[0] ? self->b.objc.find_host_state<TrustedApplicationState>(s.x[0]) : nullptr;
+        if (!state || !s.x[1] || !self->b.is_data(s.x[1])) { s.x[0] = status_value(status::param); return; }
+        const auto bytes = self->b.bytes(s.x[1]);
+        state->path.assign(bytes.begin(), bytes.end());
+        s.x[0] = 0;
+    });
+    // OSStatus SecAccessCreate(CFStringRef descriptor, CFArrayRef trustedlist, SecAccessRef *accessRef):
+    // NULL trusts the calling application, an empty array none.
+    b.function(lib, "_SecAccessCreate", [self](CpuState& s, GuestMemory& m) {
+        if (!s.x[2] || !s.x[0] || !self->b.is_string(s.x[0])) { s.x[0] = status_value(status::param); return; }
+        std::optional<std::vector<std::string>> trusted;
+        if (!self->application_paths(s.x[1], trusted)) { s.x[0] = status_value(status::param); return; }
+        if (!s.x[1]) trusted = std::vector<std::string>{self->calling_application()};
+        m.write64(s.x[2], self->make_access(self->new_access(self->b.text(s.x[0]), std::move(trusted))));
+        s.x[0] = 0;
+    });
+    const auto make_acl = [self](const std::shared_ptr<Access>& access, std::shared_ptr<Acl> acl) {
+        const auto object = self->b.objc.allocate(self->acl_class);
+        auto state = self->b.objc.host_state<AclState>(object);
+        state->access = access;
+        state->acl = std::move(acl);
+        return object;
+    };
+    // OSStatus SecAccessCopyACLList(SecAccessRef, CFArrayRef *aclList)
+    b.function(lib, "_SecAccessCopyACLList", [self, make_acl](CpuState& s, GuestMemory& m) {
+        const auto access = self->access_of(s.x[0]);
+        if (!access || !s.x[1]) { s.x[0] = status_value(status::param); return; }
+        std::vector<Address> acls;
+        for (const auto& acl : access->acls) acls.push_back(make_acl(access, acl));
+        m.write64(s.x[1], self->b.array(acls));
+        self->b.release_all(acls);
+        s.x[0] = 0;
+    });
+    const auto acl_of = [self](Address object) {
+        const auto state = object ? self->b.objc.find_host_state<AclState>(object) : nullptr;
+        return state && state->acl ? state : nullptr;
+    };
+    // OSStatus SecACLCopyContents(SecACLRef, CFArrayRef *applicationList, CFStringRef *description,
+    //     SecKeychainPromptSelector *promptSelector): a NULL list is any application.
+    b.function(lib, "_SecACLCopyContents", [self, acl_of](CpuState& s, GuestMemory& m) {
+        const auto state = acl_of(s.x[0]);
+        if (!state) { s.x[0] = status_value(status::param); return; }
+        if (s.x[1]) {
+            Address list{};
+            if (state->acl->applications) {
+                std::vector<Address> apps;
+                for (const auto& path : *state->acl->applications) apps.push_back(self->make_trusted(path));
+                list = self->b.array(apps);
+                self->b.release_all(apps);
+            }
+            m.write64(s.x[1], list);
+        }
+        if (s.x[2]) m.write64(s.x[2], self->b.string(state->acl->description));
+        if (s.x[3]) m.write_bytes(s.x[3], std::vector<std::uint8_t>{static_cast<std::uint8_t>(state->acl->prompt), static_cast<std::uint8_t>(state->acl->prompt >> 8)});
+        s.x[0] = 0;
+    });
+    // OSStatus SecACLSetContents(SecACLRef, CFArrayRef applicationList, CFStringRef description, SecKeychainPromptSelector)
+    b.function(lib, "_SecACLSetContents", [self, acl_of](CpuState& s, GuestMemory&) {
+        const auto state = acl_of(s.x[0]);
+        std::optional<std::vector<std::string>> apps;
+        if (!state || !self->application_paths(s.x[1], apps) || (s.x[2] && !self->b.is_string(s.x[2]))) { s.x[0] = status_value(status::param); return; }
+        state->acl->applications = std::move(apps);
+        state->acl->description = s.x[2] ? self->b.text(s.x[2]) : std::string();
+        state->acl->prompt = static_cast<std::uint16_t>(s.x[3]);
+        s.x[0] = 0;
+    });
+    // OSStatus SecACLCreateWithSimpleContents(SecAccessRef, CFArrayRef applicationList, CFStringRef description,
+    //     SecKeychainPromptSelector, SecACLRef *newAcl): another use ACL.
+    b.function(lib, "_SecACLCreateWithSimpleContents", [self, make_acl](CpuState& s, GuestMemory& m) {
+        const auto access = self->access_of(s.x[0]);
+        auto acl = std::make_shared<Acl>();
+        if (!access || !s.x[4] || !self->application_paths(s.x[1], acl->applications) || (s.x[2] && !self->b.is_string(s.x[2]))) {
+            s.x[0] = status_value(status::param);
+            return;
+        }
+        acl->role = "use";
+        acl->description = s.x[2] ? self->b.text(s.x[2]) : std::string();
+        acl->prompt = static_cast<std::uint16_t>(s.x[3]);
+        access->acls.push_back(acl);
+        m.write64(s.x[4], make_acl(access, acl));
+        s.x[0] = 0;
+    });
+    b.function(lib, "_SecACLRemove", [acl_of](CpuState& s, GuestMemory&) {
+        const auto state = acl_of(s.x[0]);
+        if (!state) { s.x[0] = status_value(status::param); return; }
+        std::erase(state->access->acls, state->acl);
+        s.x[0] = 0;
+    });
+    // OSStatus SecKeychainItemCopyAccess(SecKeychainItemRef, SecAccessRef *): the item's recorded access, else
+    // the access it was created with by default (the calling application trusted).
+    b.function(lib, "_SecKeychainItemCopyAccess", [self](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) { s.x[0] = status_value(status::param); return; }
+        std::int32_t error{};
+        const auto item = self->item_of(s.x[0], error);
+        if (!item) { s.x[0] = status_value(error); return; }
+        std::optional<Access> access;
+        if (!item->access.empty()) access = deserialize_access(item->access);
+        if (!access) {
+            std::string label;
+            for (const auto* name : {"labl", "svce", "srvr"})
+                if (const auto found = item->attributes.find(name); label.empty() && found != item->attributes.end()) label = found->second.text;
+            access = *self->new_access(label, std::vector<std::string>{self->calling_application()});
+        }
+        m.write64(s.x[1], self->make_access(std::make_shared<Access>(std::move(*access))));
+        s.x[0] = 0;
+    });
+    // OSStatus SecKeychainItemSetAccess(SecKeychainItemRef, SecAccessRef)
+    b.function(lib, "_SecKeychainItemSetAccess", [self](CpuState& s, GuestMemory&) {
+        const auto access = self->access_of(s.x[1]);
+        const auto id = self->item_id(s.x[0]);
+        if (!access || !id) { s.x[0] = status_value(status::param); return; }
+        const auto serialized = serialize_access(*access);
+        s.x[0] = status_value(self->with_store(self->item_keychain(s.x[0]), true, [&](Store& store) {
+            for (auto& item : store.items)
+                if (item.id == *id) {
+                    item.access = serialized;
+                    item.modified = CoreFoundation::absolute_time_now();
+                    store.save();
+                    return status::success;
+                }
+            return status::item_not_found;
+        }));
+    });
+
     b.function(lib, "_SecKeychainItemCopyKeychain", [self](CpuState& s, GuestMemory& m) {
         if (!self->item_id(s.x[0]) || !s.x[1]) { s.x[0] = status_value(status::param); return; }
         m.write64(s.x[1], self->keychain_object(self->item_keychain(s.x[0])));

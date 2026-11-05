@@ -2,8 +2,8 @@
 
 // Legacy Security interfaces Chrome's images import, cut from
 // darwin/coreservices/services.cpp (install_services calls it in place): the
-// keychain calls are the security provider's (keychain.cpp); code signers and
-// CSSM-era ACL calls answer
+// keychain calls, with their access control (SecAccess / SecACL), are the
+// security provider's (keychain.cpp); code signers answer
 // errSecUnimplemented. Guest attribute and code signer keys are exported (the
 // signing-information keys are the security provider's, code_signing.cpp).
 namespace alchemy::gui::values {
@@ -17,10 +17,6 @@ constexpr std::int32_t sec_unimplemented = -4, sec_param = -50;
 } // namespace
 
 void Provider::install_legacy_keychain() {
-    failure(security, "_SecACLCopyContents", sec_unimplemented, {1, 2});
-    failure(security, "_SecACLSetContents", sec_unimplemented);
-    failure(security, "_SecAccessCopyACLList", sec_unimplemented, {1});
-    failure(security, "_SecAccessCreate", sec_unimplemented, {2});
     failure(security, "_SecCodeSignerCreate", sec_unimplemented, {2});
     failure(security, "_SecCodeSignerAddSignatureWithErrors", sec_unimplemented, {3});
     // <Security/SecCode.h>, CSCommon.h keys. The SecCodeSigner keys are SPI.

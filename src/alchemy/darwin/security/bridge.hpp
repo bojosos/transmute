@@ -58,7 +58,9 @@ enum class TypeId : std::uint64_t {
     ssl_context, http_message, transform, keychain, keychain_item, task, socket, keychain_search,
     // SystemConfiguration (darwin/systemconfiguration).
     sc_dynamic_store, sc_reachability, sc_preferences, sc_network_interface, sc_network_service, sc_network_set,
-    sc_network_protocol
+    sc_network_protocol,
+    // Legacy keychain access control (keychain.cpp).
+    sec_access, sec_acl, sec_trusted_application
 };
 
 // A host-implemented guest block: invoke runs `handler` with the block's
