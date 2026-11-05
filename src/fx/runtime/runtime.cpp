@@ -165,6 +165,7 @@ RuntimeStats runtime_stats() {
     stats.jit_window_regions_killed = c.jit_window_regions_killed.load(std::memory_order_relaxed);
     stats.copy_translations = c.copy_translations.load(std::memory_order_relaxed);
     stats.copy_cache_hits = c.copy_cache_hits.load(std::memory_order_relaxed);
+    stats.translation_waits = c.translation_waits.load(std::memory_order_relaxed);
     stats.code_ranges = rt::registered_code_range_count();
     stats.code_range_publishes = c.code_range_publishes.load(std::memory_order_relaxed);
     stats.reclaim_passes = c.reclaim_passes.load(std::memory_order_relaxed);

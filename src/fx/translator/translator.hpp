@@ -97,7 +97,11 @@ struct RegionEntry {
 // imm64, once, and from there on the site is an ordinary exit to that
 // target (target_pc is 0 until then), linked and unlinked like the others.
 // Other targets keep taking the inline lookup.
+// A site has up to two entries, each its own exit: the second's imm64 is at
+// the first's + kInlineCacheStride, and the runtime fills the first, then the
+// second, never both with one target (link_exit).
 inline constexpr std::uint64_t kInlineCacheEmpty = 1;
+inline constexpr std::uint32_t kInlineCacheStride = 32;
 struct RegionExit {
     std::uint32_t rel32_offset;
     std::uint64_t target_pc;

@@ -255,6 +255,8 @@ struct ExternalAotStats {
     std::uint64_t cold_files{};           // .fxa files written
     std::uint64_t lookups{};              // cache lookups that searched a pool
     double lookup_seconds{};              // their time, waits and record checks included
+    std::uint64_t recorded_starts{};      // (additive) region starts an earlier fx build recorded (cold modules)
+    std::uint64_t recorded_jobs{};        // (additive) recorded starts handed to the workers
 };
 ExternalAotStats cache_external_aot_stats() noexcept;
 

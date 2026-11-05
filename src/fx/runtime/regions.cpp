@@ -3,12 +3,13 @@
 // guest pages (self-modifying code), and the reclaim of dead code chunks.
 //
 // Locks (cold paths only; the lookup-table hit path takes none):
-//   g_translate  serializes translations (cache lookup, translate_region, install)
+//   g_translate  serializes tier-ups, and guards the JIT's reusable regions
+//                (first translations run in parallel, one thread per pc: g_in_flight)
 //   g_reclaim_pass  serializes reclaim passes (taken before g_map)
 //   g_map        SRW lock over every structure below and the lookup-table writes
 //   registry     (threads.cpp) taken inside g_map to scrub RSBs / kick threads
 //   arena        (arena.cpp) taken inside g_map (never held while threads are suspended)
-//   g_preload, g_reclaim.lock  queues (innermost; never held while taking another lock)
+//   g_preload, g_reclaim.lock, g_in_flight.lock  queues (innermost; never held while taking another lock)
 //
 // Linking is eager in both directions: installing a region links its exits
 // to existing entries and links the pending (unlinked) exits of live regions
@@ -1219,6 +1220,40 @@ const void* install_from_copy_source(std::uint64_t pc, std::int64_t delta, LiveC
     return host;
 }
 
+// The pcs guest threads are translating now (translate_and_install). Another
+// thread that needs one of them waits for its installation instead of
+// translating the same code again; different pcs translate in parallel.
+struct InFlight {
+    host::RwLock lock;
+    host::CondVar done;
+    std::vector<std::uint64_t> pcs;
+};
+InFlight g_in_flight;
+
+struct InFlightClaim {
+    explicit InFlightClaim(std::uint64_t pc) : pc_(pc) {
+        ExclusiveLock lock(g_in_flight.lock);
+        while (std::find(g_in_flight.pcs.begin(), g_in_flight.pcs.end(), pc) != g_in_flight.pcs.end()) {
+            count(g_counters.translation_waits);
+            g_in_flight.done.wait_for(g_in_flight.lock, host::kWaitForever);
+        }
+        g_in_flight.pcs.push_back(pc);
+    }
+    ~InFlightClaim() {
+        {
+            ExclusiveLock lock(g_in_flight.lock);
+            auto& pcs = g_in_flight.pcs;
+            pcs.erase(std::find(pcs.begin(), pcs.end(), pc_));
+        }
+        g_in_flight.done.notify_all();
+    }
+    InFlightClaim(const InFlightClaim&) = delete;
+    InFlightClaim& operator=(const InFlightClaim&) = delete;
+
+private:
+    std::uint64_t pc_;
+};
+
 // Persists a JIT translation: in its module's cache, or in the source
 // module's cache for a copy whose guest bytes equal the source's.
 void store_translation(const TranslatedRegion& region, bool copy, std::int64_t delta) {
@@ -1233,7 +1268,10 @@ void store_translation(const TranslatedRegion& region, bool copy, std::int64_t d
 
 const void* translate_and_install(std::uint64_t pc) {
     TickScope total{g_counters.translate_ticks};
-    std::lock_guard serialize(g.translate);
+    // Cache lookups, translations and installs of different pcs run in
+    // parallel (install arbitrates under the map lock, as for the preloader);
+    // g.translate guards only g_reusable here.
+    InFlightClaim claim(pc);
     const TranslateOptions topts = first_tier_options(pc);
     const bool cache = options().enable_translation_cache;
     bool try_cache = cache;
@@ -1265,11 +1303,12 @@ const void* translate_and_install(std::uint64_t pc) {
                 continue;
             }
         }
-        // Reused per thread (translations hold g.translate): no allocations
-        // for the source's read log or the region's vectors once warm.
+        // Reused per thread: no allocations for the source's read log or the
+        // region's vectors once warm.
         thread_local LiveCodeSource source;
         const bool registered = in_registered_code_memory(pc);
         if (registered && attempt == 0) {
+            std::lock_guard reusable(g.translate);
             apply_reusable_drops();
             if (auto it = g_reusable.find(pc); it != g_reusable.end() && same_words(it->second.reads)) {
                 source.reset();
@@ -1309,8 +1348,11 @@ const void* translate_and_install(std::uint64_t pc) {
             installed = install(region, pc, 0, &source);
         }
         if (installed) {
+            if (registered) {
+                std::lock_guard reusable(g.translate);
+                keep_reusable(pc, region, source);
+            }
             if (cache) store_translation(region, copy, copy_delta);
-            if (registered) keep_reusable(pc, region, source);
             return installed;
         }
     }
@@ -2026,10 +2068,25 @@ std::size_t live_regions_on_page(std::uint64_t address) {
     return g.pages.count(address & ~(kPage - 1));
 }
 
-// An inline cache's first fill (RegionExit::ic_offset) sets its target: the
-// imm64 the site compares with is written once, before the jmp is linked, so
-// a thread between the compare and the jmp only ever reaches this target's
-// entry or the lookup. From then on it is an ordinary exit to that target.
+// An inline cache entry's first fill (RegionExit::ic_offset) sets its
+// target: the imm64 the site compares with is written once, before the jmp is
+// linked, so a thread between the compare and the jmp only ever reaches this
+// target's entry or the lookup. From then on it is an ordinary exit to that
+// target. An entry is not filled with the target its sibling (the other
+// entry of a two-entry site, kInlineCacheStride away) holds: a thread that
+// read the first entry before another filled it misses with the same target.
+static bool inline_cache_sibling_holds(const Region& r, std::uint32_t index, std::uint64_t target_pc) {
+    const auto& e = r.exits[index];
+    for (const std::uint32_t other : {index - 1, index + 1}) {
+        if (other >= r.exits.size()) continue;
+        const auto& o = r.exits[other];
+        if (o.ic_offset && (o.ic_offset + kInlineCacheStride == e.ic_offset || e.ic_offset + kInlineCacheStride == o.ic_offset) &&
+            o.target_pc == target_pc)
+            return true;
+    }
+    return false;
+}
+
 void link_exit(std::uint64_t field, std::uint64_t target_pc, const void* host) {
     ExclusiveLock lock(g.map);
     Region* r = region_at(field);
@@ -2039,6 +2096,7 @@ void link_exit(std::uint64_t field, std::uint64_t target_pc, const void* host) {
     if (!e || e->linked) return;
     const bool fill = e->ic_offset && e->target_pc == 0 && target_pc != 0 && (target_pc & 3) == 0;
     if (!fill && e->target_pc != target_pc) return;
+    if (fill && inline_cache_sibling_holds(*r, index, target_pc)) return;
     const MapEntry* entry = g.entries.find(target_pc);
     if (!entry || entry->host != host) return;
     if (fill) {

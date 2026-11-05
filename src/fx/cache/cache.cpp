@@ -992,6 +992,86 @@ int module_cache_state(std::uint64_t base, std::wstring* stem, cachefmt::Key* ke
     return state;
 }
 
+std::vector<std::vector<std::uint32_t>> recorded_starts(const std::wstring& stem, const cachefmt::Key& key,
+                                                        std::size_t max) {
+    std::vector<std::vector<std::uint32_t>> out;
+    const std::size_t slash = stem.find_last_of(L"\\/");
+    const std::size_t dot = stem.rfind(L'.');
+    if (slash == std::wstring::npos || dot == std::wstring::npos || dot < slash || max == 0) return out;
+    const std::wstring prefix = stem.substr(0, dot + 1);   // <directory>\<module name>.
+    const auto other_key = [&](const std::wstring& s) {
+        if (s == stem || s.size() != stem.size() || s.compare(0, prefix.size(), prefix) != 0) return false;
+        for (std::size_t i = prefix.size(); i < s.size(); ++i)
+            if (!std::iswxdigit(s[i])) return false;
+        return true;
+    };
+    Global& g = G();
+    ensure_listing(g, stem.substr(0, slash));
+    struct Candidate {
+        std::wstring stem;
+        std::uint64_t time = 0;
+        bool main = false;
+        std::vector<JournalFile> journals;
+    };
+    std::vector<Candidate> candidates;
+    {
+        Shared lock(g.listing_lock);
+        for (const auto& s : g.listing_mains)
+            if (other_key(s)) candidates.push_back({s, 0, true, {}});
+        for (const auto& [s, journals] : g.listing_journals) {
+            if (!other_key(s)) continue;
+            auto it = std::find_if(candidates.begin(), candidates.end(), [&](const Candidate& c) { return c.stem == s; });
+            if (it == candidates.end()) it = candidates.insert(candidates.end(), Candidate{s, 0, false, {}});
+            it->journals = journals;
+        }
+    }
+    const auto same_image = [&](const std::uint8_t* data, std::size_t size, std::uint32_t kind) {
+        cachefmt::FileHeader h{};
+        return cachefmt::parse_header(data, size, kind, h) && h.key.format_version == key.format_version &&
+               h.key.image_hash == key.image_hash && h.key.file_size == key.file_size;
+    };
+    for (auto& c : candidates) {
+        std::uint64_t bytes = 0;
+        if (c.main) file::attributes(c.stem + L".fxc", &bytes, &c.time);
+        for (const auto& j : c.journals) c.time = std::max(c.time, j.time);
+        std::sort(c.journals.begin(), c.journals.end(), [](const JournalFile& a, const JournalFile& b) { return a.time < b.time; });
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.time > b.time; });
+    // One list per file (a journal is one process's first-use order), each start once.
+    const auto collect = [&](const std::uint8_t* data, std::size_t begin, std::size_t end) {
+        std::vector<std::uint32_t> list;
+        std::unordered_set<std::uint32_t> seen;
+        for (std::size_t offset = begin; offset + sizeof(cachefmt::RecordHeader) <= end && list.size() < max;) {
+            RecordView v;
+            if (!cachefmt::decode_record(data + offset, end - offset, false, v)) break;   // a torn tail
+            if (seen.insert(v.header->start_rva).second) list.push_back(v.header->start_rva);
+            offset += v.header->size;
+        }
+        if (!list.empty()) out.push_back(std::move(list));
+    };
+    for (const auto& c : candidates) {
+        bool matched = false;
+        if (c.main) {
+            pe::MappedFile file;
+            if (file.open(c.stem + L".fxc", false) && same_image(file.data(), file.size(), cachefmt::kKindMain)) {
+                matched = true;
+                const auto* h = reinterpret_cast<const cachefmt::FileHeader*>(file.data());
+                if (h->records_offset <= file.size() && h->records_size <= file.size() - h->records_offset)
+                    collect(file.data(), static_cast<std::size_t>(h->records_offset),
+                            static_cast<std::size_t>(h->records_offset + h->records_size));
+            }
+        }
+        for (const auto& j : c.journals) {
+            pe::MappedFile file;
+            if (!file.open(j.path, true) || !same_image(file.data(), file.size(), cachefmt::kKindJournal)) continue;
+            matched = true;
+            collect(file.data(), sizeof(cachefmt::FileHeader), file.size());
+        }
+        if (matched) break;   // the newest stem of this image only
+    }
+    return out;
+}
+
 void testing_reset(bool flush) {
     external_aot_testing_reset();
     Global& g = configured();

@@ -72,6 +72,15 @@ void testing_reset(bool flush);
 int module_cache_state(std::uint64_t base, std::wstring* stem, cachefmt::Key* key, bool* has_cold,
                        const std::uint8_t** main_data = nullptr);
 
+// The region starts (RVAs) that files of the same image under another key
+// (an earlier fx build: same format version, image hash and size) hold: one
+// list per file (the main file, then its journals by time; a journal is one
+// process's first-use order), each in stored order, each start once per list,
+// at most `max` per list. From the newest such stem; empty if none. Hints
+// only: the caller translates them from live memory.
+std::vector<std::vector<std::uint32_t>> recorded_starts(const std::wstring& stem, const cachefmt::Key& key,
+                                                        std::size_t max);
+
 // ---- background translation of external modules (external_aot.cpp) ----------
 using ExternalAotTranslateFn = TranslatedRegion (*)(std::uint64_t guest_pc, const CodeSource& code,
                                                    const TranslateOptions& options);

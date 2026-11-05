@@ -480,10 +480,12 @@ void print_runtime_statistics() {
     if (aot.regions || aot.hits)
         std::fprintf(stderr,
                      "alchemy-fx aot: regions %llu (%llu guest instructions, %.3f s worker time, %llu flow jobs, "
-                     "%llu static), lookups %llu (%.3f s), hits %llu, waits %llu (%.3f s), discarded %llu, cold files %llu\n",
+                     "%llu static, %llu recorded of %llu), lookups %llu (%.3f s), hits %llu, waits %llu (%.3f s), discarded %llu, "
+                     "cold files %llu\n",
                      static_cast<unsigned long long>(aot.regions), static_cast<unsigned long long>(aot.guest_instructions),
                      aot.translate_seconds, static_cast<unsigned long long>(aot.flow_jobs),
-                     static_cast<unsigned long long>(aot.static_regions), static_cast<unsigned long long>(aot.lookups),
+                     static_cast<unsigned long long>(aot.static_regions), static_cast<unsigned long long>(aot.recorded_jobs),
+                     static_cast<unsigned long long>(aot.recorded_starts), static_cast<unsigned long long>(aot.lookups),
                      aot.lookup_seconds, static_cast<unsigned long long>(aot.hits),
                      static_cast<unsigned long long>(aot.waits), aot.wait_seconds,
                      static_cast<unsigned long long>(aot.discarded), static_cast<unsigned long long>(aot.cold_files));

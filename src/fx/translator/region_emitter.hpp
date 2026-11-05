@@ -179,8 +179,11 @@ private:
         // entry's pin loads): evicted convention registers are still in
         // their hosts, so the exit must not reload them.
         bool boundary{};
-        x64::Label field{};             // exit_tail, ic_miss
-        x64::Label lookup{};            // ic_miss: its jmp's initial target
+        x64::Label field{};             // exit_tail, ic_miss (its first entry's jmp)
+        x64::Label lookup{};            // ic_miss: the jmps' initial target
+        x64::Label field2{};            // ic_miss, two entries: the second entry's jmp
+        x64::Label first_imm{};         // ic_miss, two entries: the first entry's imm64
+        bool two_entries{};             // ic_miss
         std::uint32_t skip_field{};     // flags_exit: its jmp A's rel32 offset
         // Tier 2: pins lent to the register cache where the stub's code
         // starts (exits reload lent convention registers; edge stubs go from
@@ -530,7 +533,7 @@ private:
     void e_indirect(const PlanInst& pi);
     void emit_indirect_jump();   // target in rcx, state flushed
     void emit_inline_cache();    // a BLR's (RegionExit::ic_offset): target in rcx, state flushed
-    void emit_inline_cache_miss(x64::Label field, x64::Label lookup);
+    void emit_inline_cache_miss(const Stub& s);
     void e_trap(const PlanInst& pi);
     // ---- switch dispatch (Plan::tables; emit_branch.cpp) ----
     void e_table_branch(const PlanInst& pi);

@@ -291,7 +291,13 @@ RunResult TestMachine::run(GuestContext& ctx, const CodeSource& code, std::uint6
                             }
                             if (e.ic_offset) {
                                 auto* cached = reinterpret_cast<volatile std::uint64_t*>(base + e.ic_offset);
-                                if (*cached == kInlineCacheEmpty) {
+                                // Not the target the site's other entry holds (link_exit).
+                                bool sibling = false;
+                                for (const auto& o : regions[i].exits)
+                                    if (o.ic_offset && (o.ic_offset + kInlineCacheStride == e.ic_offset ||
+                                                        e.ic_offset + kInlineCacheStride == o.ic_offset))
+                                        sibling = sibling || *reinterpret_cast<volatile std::uint64_t*>(base + o.ic_offset) == ctx.pc;
+                                if (*cached == kInlineCacheEmpty && !sibling) {
                                     *cached = ctx.pc;
                                     ++r.ic_fills;
                                 }

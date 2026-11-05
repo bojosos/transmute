@@ -96,6 +96,8 @@ struct EnvScope {
 } // namespace
 
 FX_TEST(external_aot_flow_ahead_serves_lookups_and_promotes_used_regions) {
+    EnvScope no_static(L"TRANSMUTE_FX_BACKGROUND_AOT_DELAY", L"100000");   // a busy machine's slow test process
+
     TempDir dir(L"xaot");
     FakeModule m(64 * 1024, 41);
     write_program(m);
@@ -180,4 +182,66 @@ FX_TEST(external_aot_disabled_by_environment) {
     TranslatedRegion got;
     FX_CHECK(!cache_lookup(m.base() + kA, got));
     cache_detail::testing_reset(false);
+}
+
+// A build whose translator changed (another source fingerprint) starts the
+// module cold, but once the guest uses a start an earlier build recorded for
+// the same image, it translates the starts that followed it there ahead of
+// the guest; another image's records are not used.
+FX_TEST(external_aot_translates_an_earlier_builds_recorded_starts) {
+    EnvScope no_static(L"TRANSMUTE_FX_BACKGROUND_AOT_DELAY", L"100000");   // no static phase: what is translated is recorded
+
+    TempDir dir(L"xaotrecorded");
+    FakeModule m(64 * 1024, 44);
+    write_program(m);
+    const GuestModule info = m.info(kImageHash ^ 3, L"recorded.dylib");
+    const auto session = [&](std::uint64_t fingerprint, const GuestModule& module) {
+        cache_detail::testing_reset(false);
+        cache_detail::set_source_fingerprint_for_tests(fingerprint);
+        start_session(dir);
+        cache_module_loaded(module);
+    };
+    // The earlier build: the guest used A, then D, then E (no background translation).
+    session(0x1111, info);
+    for (const std::uint32_t rva : {kA, kD, kE})
+        cache_store(stub_translate(m.base() + rva, ModuleMemory(m), TranslateOptions{}));
+    cache_flush();
+    FX_CHECK_EQ(dir.files(L"*.fxc").size(), std::size_t{1});
+
+    // This build: nothing recorded is translated before the guest follows the list.
+    session(0x2222, info);
+    TranslatedRegion got;
+    FX_CHECK(!cache_lookup(m.base() + kD, got));   // the old build's file is not used as such
+    cache_detail::external_aot_start(request_for(m, false), &stub_translate);
+    cache_detail::external_aot_testing_wait_idle(10000);
+    FX_CHECK(cache_external_aot_stats().recorded_starts >= 3u);   // the main file (and any journal left)
+    FX_CHECK_EQ(cache_external_aot_stats().recorded_jobs, std::uint64_t{0});
+    // The guest JITs A: D and E follow (flow-ahead cannot reach D or E from A).
+    cache_store(stub_translate(m.base() + kA, ModuleMemory(m), TranslateOptions{}));
+    cache_detail::external_aot_testing_wait_idle(10000);
+    FX_CHECK_EQ(cache_external_aot_stats().recorded_jobs, std::uint64_t{2});
+    FX_CHECK(cache_lookup(m.base() + kD, got));   // translated from live memory by this build
+    FX_CHECK_EQ(got.guest_start, m.base() + kD);
+    FX_CHECK(cache_lookup(m.base() + kE, got));
+
+    // Another image of the same name: nothing recorded for it.
+    FakeModule other(64 * 1024, 45);
+    write_program(other);
+    session(0x3333, other.info(kImageHash ^ 4, L"recorded.dylib"));
+    cache_detail::external_aot_start(request_for(other, false), &stub_translate);
+    cache_detail::external_aot_testing_wait_idle(10000);
+    FX_CHECK_EQ(cache_external_aot_stats().recorded_starts, std::uint64_t{0});
+
+    // TRANSMUTE_FX_EXTERNAL_AOT_RECORDED=0 turns it off.
+    {
+        EnvScope off(L"TRANSMUTE_FX_EXTERNAL_AOT_RECORDED", L"0");
+        session(0x4444, info);
+        cache_detail::external_aot_start(request_for(m, false), &stub_translate);
+        cache_store(stub_translate(m.base() + kA, ModuleMemory(m), TranslateOptions{}));
+        cache_detail::external_aot_testing_wait_idle(10000);
+        FX_CHECK_EQ(cache_external_aot_stats().recorded_starts, std::uint64_t{0});
+        FX_CHECK(!cache_lookup(m.base() + kD, got));
+    }
+    cache_detail::testing_reset(false);
+    cache_detail::set_source_fingerprint_for_tests(0);
 }

@@ -638,7 +638,7 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
     plan.align_loops = overrides.align_loops;
     plan.align_hot = overrides.align_hot;
     plan.flag_skip = !overrides.no_flag_skip;
-    plan.inline_cache = !overrides.no_inline_cache;
+    plan.inline_cache_entries = overrides.no_inline_cache ? 0u : overrides.inline_cache_one ? 1u : 2u;
     plan.rsb_push = overrides.old_rsb ? Plan::RsbPush::old_masked : overrides.rsb_call ? Plan::RsbPush::call : Plan::RsbPush::inline_flag_free;
     plan.loop_alignment = overrides.align32 ? 32u : 16u;
     plan.carry_clean = !overrides.carry_dirty && !(plan.optimize && overrides.t2_carry);   // t2carry: dirty across loop edges

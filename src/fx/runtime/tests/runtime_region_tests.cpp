@@ -1377,3 +1377,51 @@ FX_TEST(tier1_install_keeps_entries_of_equal_or_higher_tiers) {
     set_region_factory(pa, nullptr);
     set_region_factory(pb, nullptr);
 }
+
+// ---- parallel first translations -----------------------------------------------------------
+
+FX_TEST(threads_translate_different_pcs_in_parallel_and_the_same_pc_once) {
+    init();
+    GuestCode code({});
+    const auto pa = code.at(0), pb = code.at(16);
+    HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<int> built_a{0};
+    // A's translation blocks until released; B's does not.
+    set_region_factory(pa, [&](std::uint64_t) {
+        ++built_a;
+        SetEvent(entered);
+        WaitForSingleObject(release, 10000);
+        return tier1_region(pa, 1);
+    });
+    set_region_factory(pb, [&](std::uint64_t) { return tier1_region(pb, 10); });
+    const auto s0 = runtime_stats();
+    const void* host_first = nullptr;
+    const void* host_second = nullptr;
+    std::function<void()> first = [&] { host_first = rt::translate_and_install(pa); };
+    std::function<void()> second = [&] { host_second = rt::translate_and_install(pa); };
+    HANDLE t1 = start_thread(&first);
+    FX_REQUIRE(WaitForSingleObject(entered, 5000) == WAIT_OBJECT_0);
+    HANDLE t2 = start_thread(&second);
+    // Another pc translates while A's translation is in flight.
+    FX_CHECK(rt::translate_and_install(pb) != nullptr);
+    // The second thread waits for A instead of translating it again.
+    for (int i = 0; i < 500 && runtime_stats().translation_waits == s0.translation_waits; ++i) Sleep(10);
+    FX_CHECK(runtime_stats().translation_waits - s0.translation_waits >= 1u);
+    FX_CHECK_EQ(WaitForSingleObject(t2, 0), static_cast<DWORD>(WAIT_TIMEOUT));
+    SetEvent(release);
+    FX_CHECK_EQ(WaitForSingleObject(t1, 5000), static_cast<DWORD>(WAIT_OBJECT_0));
+    FX_CHECK_EQ(WaitForSingleObject(t2, 5000), static_cast<DWORD>(WAIT_OBJECT_0));
+    FX_CHECK_EQ(built_a.load(), 1);
+    FX_CHECK(host_first != nullptr);
+    FX_CHECK_EQ(host_first, host_second);
+    const std::uint64_t args[] = {0};
+    FX_CHECK_EQ(call_guest(pa, args), 1u);
+    FX_CHECK_EQ(call_guest(pb, args), 10u);
+    CloseHandle(t1);
+    CloseHandle(t2);
+    CloseHandle(entered);
+    CloseHandle(release);
+    set_region_factory(pa, nullptr);
+    set_region_factory(pb, nullptr);
+}

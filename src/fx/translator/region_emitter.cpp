@@ -2089,7 +2089,7 @@ void RegionEmitter::emit_stubs() {
             emit_exit_jump(s.pc, s.skip_field);
             break;
         case Stub::K::ic_miss:     // an inline cache's miss, rax = its cached target (emit_inline_cache)
-            emit_inline_cache_miss(s.field, s.lookup);
+            emit_inline_cache_miss(s);
             break;
         case Stub::K::exit_tail:   // unlinked tail of an in-line exit jmp (s.field: its opcode)
             fixup_imm64(Gp::rax, s.pc);
@@ -2706,6 +2706,12 @@ void RegionEmitter::fpconst_compute() {
         if (entry[static_cast<std::size_t>(leaders[k])])
             for (unsigned r = 0; r < 32; ++r) s_.fpc_in[k * 32 + r] = kUnknown;
     const auto table = registered_families();
+    // A register's state depends only on its own definitions (no copies are
+    // tracked), so only the registers some min/max reads need joining.
+    std::uint32_t tracked = 0;
+    for (std::int32_t i = 0; i < n; ++i)
+        if (is_fp_minmax_word(plan_.words[static_cast<std::size_t>(i)])) tracked |= plan_.insts[static_cast<std::size_t>(i)].vreads;
+    if (tracked == 0) return;
 
     struct Gpr {
         bool known;
@@ -2722,7 +2728,9 @@ void RegionEmitter::fpconst_compute() {
         const unsigned rd = w & 31u;
         bool defined = true;
         FpConst c{1, 0, 0, 0};
-        if ((w & 0xff201fe0u) == 0x1e201000u && ((w >> 22) & 3u) < 2) {   // FMOV S/D, #imm
+        if (!((tracked >> rd) & 1u)) {   // its state is never read: unknown, like the other writes
+            defined = false;
+        } else if ((w & 0xff201fe0u) == 0x1e201000u && ((w >> 22) & 3u) < 2) {   // FMOV S/D, #imm
             c.lo = fp_expand_imm8((w >> 13) & 0xffu, ((w >> 22) & 3u) == 1);
         } else if ((w & 0xbff8fc00u) == 0x0f00f400u) {                      // FMOV Vd.2S/4S, #imm (op = 0)
             const std::uint64_t v = fp_expand_imm8(((w >> 11) & 0xe0u) | ((w >> 5) & 31u), false);
@@ -2803,7 +2811,8 @@ void RegionEmitter::fpconst_compute() {
                     if (t < 0 || t >= n || entry[static_cast<std::size_t>(t)]) return;
                     const auto slot = s_.fpc_slot[static_cast<std::size_t>(t)];
                     if (slot < 0) return;   // the next instruction of this block
-                    for (unsigned r = 0; r < 32; ++r) {
+                    for (auto m = tracked; m; m &= m - 1) {
+                        const auto r = static_cast<unsigned>(std::countr_zero(m));
                         auto& in = s_.fpc_in[static_cast<std::size_t>(slot) * 32 + r];
                         const auto j = join(in, st[r]);
                         if (j.state != in.state || j.quiet != in.quiet || j.lo != in.lo || j.hi != in.hi) {

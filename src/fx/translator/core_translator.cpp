@@ -131,6 +131,7 @@ const PlanOverrides& default_overrides() {
             d.rsb_call = k("rsbcall");
             d.old_rsb = k("oldrsb");
             d.no_inline_cache = k("noinlinecache");
+            d.inline_cache_one = k("ic1");
         }
         if (const char* v = std::getenv("TRANSMUTE_FX_INLINE")) d.inline_max = static_cast<unsigned>(std::strtoul(v, nullptr, 10));
         return d;
@@ -160,7 +161,8 @@ std::uint32_t codegen_layout_bits() {
     return (o.cold_entries ? 1u : 0u) | (o.align_loops ? 2u : 0u) | (o.align_hot ? 4u : 0u) | (o.align32 ? 8u : 0u) |
            (o.no_vzero_join ? 16u : 0u) | (o.no_shadows ? 32u : 0u) |
            (o.no_flag_skip ? 64u : 0u) | (o.no_loop_inline ? 128u : 0u) |
-           (o.rsb_call ? 256u : 0u) | (o.old_rsb ? 512u : 0u) | (o.no_inline_cache ? 1024u : 0u);
+           (o.rsb_call ? 256u : 0u) | (o.old_rsb ? 512u : 0u) | (o.no_inline_cache ? 1024u : 0u) |
+           (o.inline_cache_one ? 2048u : 0u);
 }
 
 unsigned codegen_inline_max() { return default_overrides().inline_max; }

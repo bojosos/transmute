@@ -604,6 +604,7 @@ struct Counters {
     std::atomic<std::uint64_t> jit_window_regions_killed{};
     std::atomic<std::uint64_t> copy_translations{};
     std::atomic<std::uint64_t> copy_cache_hits{};
+    std::atomic<std::uint64_t> translation_waits{};
     std::atomic<std::uint64_t> inline_cache_fills{};
 };
 inline std::uint64_t ticks_now() noexcept { return host::ticks(); }

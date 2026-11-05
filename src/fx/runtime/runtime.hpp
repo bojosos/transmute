@@ -195,6 +195,9 @@ struct RuntimeStats {
     // source module's cache instead.
     std::uint64_t copy_translations{};
     std::uint64_t copy_cache_hits{};
+    // (additive) Translations that waited for another thread translating the
+    // same pc (translate_and_install) instead of translating it again.
+    std::uint64_t translation_waits{};
     // (additive) BLR inline caches filled (RegionExit::ic_offset): each
     // site's first target; included in links.
     std::uint64_t inline_cache_fills{};

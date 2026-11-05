@@ -6,6 +6,9 @@
 //  - reports the slowest regions to translate.
 //
 //   fx_translator_image_audit <image.exe|dll> [dump-dir]
+//
+// With TRANSMUTE_FX_JIT_REPLAY, the image is a Mach-O and the run replays a
+// list of first-tier translations instead (replay_main).
 #include "fx/cache/format.hpp"
 #include "fx/cache/pe_view.hpp"
 #include "fx/translator/region_emitter.hpp"   // core_counters
@@ -25,6 +28,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 using namespace transmute::fx;
@@ -92,11 +96,264 @@ struct Slow {
     std::size_t code;
 };
 
+// The arm64 __TEXT segment of a Mach-O image (thin or fat), mapped at an
+// arbitrary base: guest code without function bounds, as the JIT sees a
+// macOS image. has_entry is true for the entries of regions translated
+// earlier in the same pass, as the runtime's map would be.
+class MachTextSource final : public CodeSource {
+public:
+    MachTextSource(std::uint64_t base, std::uint64_t size) : base_(base), size_(size) {}
+    bool read(std::uint64_t address, std::uint32_t& word) const override {
+        if (address < base_ || address - base_ + 4 > size_ || (address & 3)) return false;
+        std::memcpy(&word, reinterpret_cast<const void*>(address), 4);
+        return true;
+    }
+    bool has_entry(std::uint64_t pc) const override { return entries.count(pc) != 0; }
+    bool image_code(std::uint64_t address) const override { return address >= base_ && address - base_ < size_; }
+    std::unordered_set<std::uint64_t> entries;
+
+private:
+    std::uint64_t base_, size_;
+};
+
+std::uint32_t big32(const std::uint8_t* p) {
+    return std::uint32_t{p[0]} << 24 | std::uint32_t{p[1]} << 16 | std::uint32_t{p[2]} << 8 | p[3];
+}
+
+// Maps the arm64 __TEXT of the Mach-O at `path`; returns its base, or 0.
+std::uint64_t map_mach_text(const std::wstring& path, std::uint64_t& size) {
+    pe::MappedFile file;
+    if (!file.open(path, false) || file.size() < 32) return 0;
+    const auto* data = static_cast<const std::uint8_t*>(file.data());
+    std::uint64_t slice = 0, slice_size = file.size();
+    if (big32(data) == 0xcafebabeu) {   // fat: the arm64 slice
+        slice_size = 0;
+        const auto n = big32(data + 4);
+        for (std::uint32_t i = 0; i < n && 8 + 20ull * (i + 1) <= file.size(); ++i) {
+            const auto* a = data + 8 + 20ull * i;
+            if (big32(a) == 0x0100000cu) {
+                slice = big32(a + 8);
+                slice_size = big32(a + 12);
+            }
+        }
+        if (!slice_size || slice + slice_size > file.size()) return 0;
+    }
+    const auto* header = data + slice;
+    std::uint32_t magic, ncmds;
+    std::memcpy(&magic, header, 4);
+    std::memcpy(&ncmds, header + 16, 4);
+    if (magic != 0xfeedfacfu) return 0;
+    std::uint64_t at = 32;
+    for (std::uint32_t i = 0; i < ncmds && at + 8 <= slice_size; ++i) {
+        std::uint32_t cmd, cmdsize;
+        std::memcpy(&cmd, header + at, 4);
+        std::memcpy(&cmdsize, header + at + 4, 4);
+        if (cmdsize < 8) return 0;
+        if (cmd == 0x19 && std::strncmp(reinterpret_cast<const char*>(header + at + 8), "__TEXT", 16) == 0) {
+            std::uint64_t vmsize, fileoff, filesize;
+            std::memcpy(&vmsize, header + at + 32, 8);
+            std::memcpy(&fileoff, header + at + 40, 8);
+            std::memcpy(&filesize, header + at + 48, 8);
+            if (fileoff + filesize > slice_size || filesize > vmsize) return 0;
+            // At a fixed base where possible: the output hash covers absolute guest addresses.
+            auto* memory = static_cast<std::uint8_t*>(
+                host::vm::allocate(reinterpret_cast<void*>(std::uintptr_t{0x200000000}), vmsize, host::vm::kReadWrite));
+            if (!memory) memory = static_cast<std::uint8_t*>(host::vm::allocate(nullptr, vmsize, host::vm::kReadWrite));
+            if (!memory) return 0;
+            std::memcpy(memory, header + fileoff, filesize);
+            size = filesize;
+            return reinterpret_cast<std::uint64_t>(memory);
+        }
+        at += cmdsize;
+    }
+    return 0;
+}
+
+// TRANSMUTE_FX_JIT_REPLAY=<starts file>[,<reps>]: translates, single-threaded,
+// the region starts listed in the file (first token of each line: hex RVA in
+// the image's __TEXT, e.g. a cold run's cache journal in store order) with
+// the runtime's first-tier options (lazy, budget 4096, window 8 KiB / 2 KiB),
+// skipping starts an earlier region already provides; best of <reps> passes,
+// with a hash of the output. TRANSMUTE_FX_JIT_BENCH_SAMPLE=1: RIP samples.
+int replay_main(const std::wstring& path, const char* spec) {
+    std::uint64_t size = 0;
+    const std::uint64_t base = map_mach_text(path, size);
+    if (!base) {
+        std::fwprintf(stderr, L"no arm64 __TEXT in %ls\n", path.c_str());
+        return 1;
+    }
+    std::string list = spec;
+    unsigned reps = 3;
+    if (const auto comma = list.find(','); comma != std::string::npos) {
+        reps = std::max(1u, static_cast<unsigned>(std::strtoul(list.c_str() + comma + 1, nullptr, 10)));
+        list.resize(comma);
+    }
+    std::vector<std::uint64_t> pcs;
+    if (FILE* f = std::fopen(list.c_str(), "r")) {
+        char line[4096];
+        while (std::fgets(line, sizeof(line), f)) {
+            char* end = nullptr;
+            const auto rva = std::strtoull(line, &end, 16);
+            if (end != line && rva + 4 <= size) pcs.push_back(base + rva);
+        }
+        std::fclose(f);
+    }
+    if (const char* limit = std::getenv("TRANSMUTE_FX_JIT_REPLAY_LIMIT"))
+        pcs.resize(std::min<std::size_t>(pcs.size(), std::strtoull(limit, nullptr, 10)));
+    std::printf("__TEXT mapped at 0x%llx, 0x%llx bytes; %zu starts\n", static_cast<unsigned long long>(base),
+                static_cast<unsigned long long>(size), pcs.size());
+    register_fp_emitters();
+    register_neon_emitters();
+    register_system_emitters();
+    TranslateOptions options;   // as rt::first_tier_options for image code
+    options.lazy = true;
+    options.lazy_max_instructions = 4096;
+    options.tier_threshold = 4096;
+    options.window_forward = 8192;
+    options.window_backward = 2048;
+    MachTextSource source(base, size);
+    namespace sample = host::sample;
+    const sample::Thread self = sample::open_current_thread();
+    host::set_thread_priority(host::current_thread(), host::ThreadPriority::above_normal);
+    if (const char* cpu = std::getenv("TRANSMUTE_FX_JIT_BENCH_CPU"))
+        host::set_thread_affinity(host::current_thread(), std::uint64_t{1} << std::strtoul(cpu, nullptr, 10));
+    std::atomic<bool> sampling{false}, stop{false};
+    std::vector<std::uint64_t> samples;
+    samples.reserve(1u << 22);   // the sampler must not allocate: the suspended thread may hold the heap lock
+    std::thread sampler;
+    if (std::getenv("TRANSMUTE_FX_JIT_BENCH_SAMPLE")) {
+        sampler = std::thread([&] {
+            while (!stop) {
+                if (sampling && samples.size() < samples.capacity() && sample::suspend(self)) {
+                    sample::Registers registers;
+                    if (sample::capture(self, registers, false)) samples.push_back(host::rip(registers.context()));
+                    sample::resume(self);
+                }
+                host::sleep_ms(0);
+                for (volatile int spin = 0; spin < 20000; ++spin) {}
+            }
+        });
+    }
+    double best = 1e30;
+    std::uint64_t insns = 0, bytes = 0, hash = 0, regions = 0, tier0 = 0;
+    // Per start: the best time over the passes (the passes translate the same
+    // sequence), so that a busy machine's interruptions drop out.
+    std::vector<double> region_best(pcs.size(), 1e30);
+    std::vector<Slow> slow;
+    for (unsigned rep = 0; rep <= reps; ++rep) {   // pass 0 warms up
+        std::uint64_t h = 0xcbf29ce484222325ULL;
+        const auto mix = [&](const void* data, std::size_t n) {
+            const auto* p = static_cast<const std::uint8_t*>(data);
+            for (std::size_t k = 0; k < n; ++k) h = (h ^ p[k]) * 0x100000001b3ULL;
+        };
+        std::uint64_t n_insns = 0, n_bytes = 0, n_regions = 0, n_tier0 = 0;
+        double spent = 0;
+        source.entries.clear();
+        sampling = rep > 0;
+        for (std::size_t index = 0; index < pcs.size(); ++index) {
+            const auto pc = pcs[index];
+            if (source.entries.count(pc)) continue;
+            thread_local TranslatedRegion r;   // reused, as the JIT does
+            const auto a = std::chrono::steady_clock::now();
+            try {
+                translate_region(pc, source, options, r);
+            } catch (...) {
+                continue;
+            }
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+            spent += s;
+            if (rep > 0) region_best[index] = std::min(region_best[index], s);
+            for (const auto& e : r.entries) source.entries.insert(e.guest_pc);
+            ++n_regions;
+            n_tier0 += r.tier == 0;
+            n_insns += r.stats.guest_instructions;
+            n_bytes += r.code.size();
+            if (rep == 1) {
+                slow.push_back({static_cast<double>(index), 0, static_cast<std::uint32_t>(pc - base),
+                                r.stats.guest_instructions, r.code.size()});
+                mix(r.code.data(), r.code.size());
+                for (const auto& e : r.entries) { mix(&e.guest_pc, 8); mix(&e.offset, 4); }
+                for (const auto& e : r.exits) { mix(&e.rel32_offset, 4); mix(&e.target_pc, 8); }
+                for (const auto& f : r.fixups) { mix(&f.offset, 4); mix(&f.kind, 1); mix(&f.value, 8); }
+                for (const auto& f : r.faults) { mix(&f.host_begin, 8); mix(&f.guest_pc, 8); mix(&f.flags, 2); mix(&f.map, 2); }
+                for (const auto& m : r.fault_maps) mix(&m, sizeof(m));
+                for (const auto& p : r.fault_map_regs) mix(&p, sizeof(p));
+                for (const auto& p : r.pins) mix(&p, sizeof(p));
+                mix(&r.tier, 1);
+                mix(&r.tier_counter, 4);
+            }
+        }
+        sampling = false;
+        if (rep == 1) hash = h;
+        if (rep > 0) best = std::min(best, spent);
+        insns = n_insns;
+        bytes = n_bytes;
+        regions = n_regions;
+        tier0 = n_tier0;
+    }
+    stop = true;
+    if (sampler.joinable()) sampler.join();
+    std::printf("jit replay: %llu regions (%llu tier 0), %llu guest instructions, %.1f MiB code, best %.3f s, "
+                "%.1f ns/instruction, %.1f us/region, output hash %016llx\n",
+                static_cast<unsigned long long>(regions), static_cast<unsigned long long>(tier0),
+                static_cast<unsigned long long>(insns), static_cast<double>(bytes) / (1 << 20), best,
+                best * 1e9 / static_cast<double>(std::max<std::uint64_t>(1, insns)),
+                best * 1e6 / static_cast<double>(std::max<std::uint64_t>(1, regions)), static_cast<unsigned long long>(hash));
+    std::printf("per pass: %.1f emitted regions, %.1f retries (a retry builds the plan and emits again)\n",
+                static_cast<double>(core::core_counters().regions.load()) / (reps + 1),
+                static_cast<double>(core::core_counters().retries.load()) / (reps + 1));
+    double floor = 0;
+    for (auto& s : slow) {   // us held the start's index until now
+        s.us = region_best[static_cast<std::size_t>(s.us)] * 1e6;
+        floor += s.us;
+    }
+    std::sort(slow.begin(), slow.end(), [](const Slow& a, const Slow& b) { return a.us > b.us; });
+    double top = 0;
+    for (std::size_t k = 0; k < slow.size() && k < slow.size() / 100; ++k) top += slow[k].us;
+    std::printf("sum of per-region best times: %.3f s (%.1f ns/instruction); slowest 1%% of regions: %.0f%% of it\n",
+                floor * 1e-6, floor * 1e3 / static_cast<double>(std::max<std::uint64_t>(1, insns)),
+                100.0 * top / std::max(1e-9, floor));
+    for (std::size_t k = 0; k < slow.size() && k < 12; ++k)
+        std::printf("  rva 0x%08x %8.0f us  %5u insns  %7zu bytes\n", slow[k].rva, slow[k].us, slow[k].insns, slow[k].code);
+    if (!samples.empty()) {
+        sample::load_symbols();
+        std::map<std::string, unsigned> counts;
+        for (const auto rip : samples) {
+            const std::string name = sample::symbol(rip);
+            counts[name.empty() ? "?" : name]++;
+        }
+        std::vector<std::pair<unsigned, std::string>> sorted;
+        for (const auto& [k, v] : counts) sorted.emplace_back(v, k);
+        std::sort(sorted.rbegin(), sorted.rend());
+        std::printf("%zu samples\n", samples.size());
+        for (std::size_t i = 0; i < sorted.size() && i < 50; ++i)
+            std::printf("  %5.1f%% %s\n", 100.0 * sorted[i].first / std::max<std::size_t>(1, samples.size()),
+                        sorted[i].second.c_str());
+        if (const char* want = std::getenv("TRANSMUTE_FX_JIT_BENCH_LINES")) {
+            std::map<std::pair<std::string, unsigned>, unsigned> lines;
+            for (const auto rip : samples) {
+                const std::string name = sample::symbol(rip);
+                if (name.empty() || !std::strstr(name.c_str(), want)) continue;
+                std::string source_file;
+                unsigned line = 0;
+                if (sample::source_line(rip, source_file, line)) lines[{source_file, line}]++;
+            }
+            std::vector<std::pair<unsigned, std::pair<std::string, unsigned>>> by;
+            for (const auto& [k, v] : lines) by.emplace_back(v, k);
+            std::sort(by.rbegin(), by.rend());
+            for (std::size_t i = 0; i < by.size() && i < 40; ++i)
+                std::printf("    %5u %s:%u\n", by[i].first, by[i].second.first.c_str(), by[i].second.second);
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
     std::wstring path = argc > 1 ? argv[1]
                                  : L"C:\\dev\\transmute\\artifacts\\arm64-stage\\Blender Foundation\\Blender 4.5\\blender.exe";
+    if (const char* replay = std::getenv("TRANSMUTE_FX_JIT_REPLAY")) return replay_main(path, replay);
     const std::wstring dump_dir = argc > 2 ? argv[2] : L"";
     pe::MappedFile file;
     pe::Image image;

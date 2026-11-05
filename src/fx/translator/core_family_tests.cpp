@@ -698,55 +698,66 @@ FX_TEST(core_rsb_push_bytes_per_bl) {
 }
 
 // BLR inline caches (RegionExit::ic_offset): one BLR through a vtable on the
-// stack whose slots are rewritten between calls and whose index alternates
-// later, in regions cut short and whole. Every run matches the reference;
-// the site takes its first target (an ic fill) unless
-// TRANSMUTE_FX_CORE=noinlinecache, and other targets take the lookup.
+// stack whose slots are rewritten between calls (three targets in turn) and
+// whose index alternates later, in regions cut short and whole. Every run
+// matches the reference, with two entries per site, one (ic1) and none
+// (noinlinecache); two entries fill more than one (the site sees three
+// targets), none fill nothing.
 FX_TEST(core_blr_inline_cache) {
     auto& r = runner();
     using namespace a64;
     const std::vector<std::uint32_t> prog = {
-        adr(false, 21 * 4, 9),                        // 0  adr x9, f
-        adr(false, 22 * 4, 10),                       // 1  adr x10, g
-        ldst_pair(2, 3, false, -2, 10, 31, 9),        // 2  stp x9, x10, [sp, #-16]!   vtable {f, g}
-        movw(true, 2, 0, 300, 12),                    // 3  movz x12, #300
-        movw(true, 2, 0, 0, 11),                      // 4  movz x11, #0
-        ldst_reg(3, 1, 11, 3, true, 31, 13),          // 5  L: ldr x13, [sp, x11, lsl #3]
-        blr(13),                                      // 6
-        add_imm(true, true, true, 12, 12, 1),         // 7  subs x12, x12, #1
-        bcond(0, 11),                                 // 8  b.eq end
-        add_imm(true, true, true, 31, 12, 250),       // 9  cmp x12, #250
-        bcond(1, 2),                                  // 10 b.ne 12
-        ldst_uimm(3, 0, 0, 31, 10),                   // 11 str x10, [sp]        slot 0 = g
-        add_imm(true, true, true, 31, 12, 100),       // 12 cmp x12, #100
-        bcond(1, 2),                                  // 13 b.ne 15
-        ldst_uimm(3, 0, 1, 31, 9),                    // 14 str x9, [sp, #8]     slot 1 = f
-        add_imm(true, true, true, 31, 12, 200),       // 15 cmp x12, #200
-        bcond(2, -11),                                // 16 b.hs L
-        logic_imm(true, 0, 1, 0, 0, 12, 11),          // 17 and x11, x12, #1    alternate slots
-        b(-13),                                       // 18 b L
-        add_imm(true, false, false, 31, 31, 16),      // 19 end: add sp, sp, #16
-        b(5),                                         // 20 b out
-        add_imm(true, false, false, 0, 0, 1),         // 21 f: add x0, x0, #1
-        ret(),                                        // 22
-        add_imm(true, false, false, 0, 0, 3),         // 23 g: add x0, x0, #3
-        ret(),                                        // 24
-        nop(),                                        // 25 out
+        adr(false, 25 * 4, 9),                        // 0  adr x9, f
+        adr(false, 26 * 4, 10),                       // 1  adr x10, g
+        adr(false, 27 * 4, 14),                       // 2  adr x14, h
+        ldst_pair(2, 3, false, -2, 10, 31, 9),        // 3  stp x9, x10, [sp, #-16]!   vtable {f, g}
+        movw(true, 2, 0, 300, 12),                    // 4  movz x12, #300
+        movw(true, 2, 0, 0, 11),                      // 5  movz x11, #0
+        ldst_reg(3, 1, 11, 3, true, 31, 13),          // 6  L: ldr x13, [sp, x11, lsl #3]
+        blr(13),                                      // 7
+        add_imm(true, true, true, 12, 12, 1),         // 8  subs x12, x12, #1
+        bcond(0, 14),                                 // 9  b.eq end
+        add_imm(true, true, true, 31, 12, 250),       // 10 cmp x12, #250
+        bcond(1, 2),                                  // 11 b.ne 13
+        ldst_uimm(3, 0, 0, 31, 10),                   // 12 str x10, [sp]        slot 0 = g
+        add_imm(true, true, true, 31, 12, 100),       // 13 cmp x12, #100
+        bcond(1, 2),                                  // 14 b.ne 16
+        ldst_uimm(3, 0, 1, 31, 9),                    // 15 str x9, [sp, #8]     slot 1 = f
+        add_imm(true, true, true, 31, 12, 50),        // 16 cmp x12, #50
+        bcond(1, 2),                                  // 17 b.ne 19
+        ldst_uimm(3, 0, 0, 31, 14),                   // 18 str x14, [sp]        slot 0 = h
+        add_imm(true, true, true, 31, 12, 200),       // 19 cmp x12, #200
+        bcond(2, -14),                                // 20 b.hs L
+        logic_imm(true, 0, 1, 0, 0, 12, 11),          // 21 and x11, x12, #1    alternate slots
+        b(-16),                                       // 22 b L
+        add_imm(true, false, false, 31, 31, 16),      // 23 end: add sp, sp, #16
+        b(7),                                         // 24 b out
+        add_imm(true, false, false, 0, 0, 1),         // 25 f: add x0, x0, #1
+        ret(),                                        // 26
+        add_imm(true, false, false, 0, 0, 3),         // 27 g: add x0, x0, #3
+        ret(),                                        // 28
+        add_imm(true, false, false, 0, 0, 7),         // 29 h: add x0, x0, #7
+        ret(),                                        // 30
+        nop(),                                        // 31 out
     };
     const auto saved = r.machine.options;
-    for (const bool cache : {true, false}) {
-        core::PlanOverrides o = core::default_plan_overrides();
-        o.no_inline_cache = !cache;
-        core::set_overrides_for_testing(&o);
-        for (const unsigned len : {1u, 3u, 7u, 4096u}) {
+    for (const unsigned len : {1u, 3u, 7u, 4096u}) {
+        unsigned fills[3]{};   // by entries per site
+        for (const unsigned entries : {2u, 1u, 0u}) {
+            core::PlanOverrides o = core::default_plan_overrides();
+            o.no_inline_cache = entries == 0;
+            o.inline_cache_one = entries == 1;
+            core::set_overrides_for_testing(&o);
             r.machine.options.max_instructions = len;
             auto ctx = r.context(8100 + len);
-            FX_CHECK(r.run(prog, ctx, std::string("blr inline cache ") + (cache ? "on " : "off ") + std::to_string(len),
+            FX_CHECK(r.run(prog, ctx, "blr inline cache, " + std::to_string(entries) + " entries, " + std::to_string(len),
                            100000));
-            if (cache) FX_CHECK(r.last.ic_fills >= 1u);
-            else FX_CHECK_EQ(r.last.ic_fills, 0u);
+            fills[entries] = r.last.ic_fills;
+            core::set_overrides_for_testing(nullptr);
         }
-        core::set_overrides_for_testing(nullptr);
+        FX_CHECK_EQ(fills[0], 0u);
+        FX_CHECK(fills[1] >= 1u);
+        FX_CHECK(fills[2] > fills[1]);
     }
     r.machine.options = saved;
 }

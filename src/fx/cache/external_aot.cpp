@@ -13,6 +13,17 @@
 //    macOS Blender's cold start, direct targets of earlier regions start 43%
 //    of the main image's regions (70% of their instructions) and the function
 //    right after an earlier region another 15%.
+//  * recorded (before flow-ahead): a module without a main file for this
+//    build's key whose image an earlier fx build cached (another key: the
+//    translator changed) gets that build's region starts, a list per file in
+//    first-use order (recorded_starts; a journal is one process's). Once the
+//    guest uses a start of a list, the starts after it are translated, at most
+//    TRANSMUTE_FX_EXTERNAL_AOT_RECORDED past the furthest one the guest used:
+//    a list the guest does not follow (another kind of process) costs nothing.
+//    Measured on a cold Chrome browser across two builds: the earlier
+//    browser's journal held 95% of its regions, the first half all of them, in
+//    nearly the same order. Only the starts are used: every region is
+//    translated from live memory as below.
 //  * static (later, idle priority): every function start of modules up to a
 //    text size limit, after the process has run as long as PE background AOT
 //    waits (TRANSMUTE_FX_BACKGROUND_AOT_DELAY). A module done completely is
@@ -36,7 +47,9 @@
 // guest's own regions, default 1), TRANSMUTE_FX_EXTERNAL_AOT_STATIC=<MiB>
 // (largest text translated whole, default 2, 0 = flow-ahead only),
 // TRANSMUTE_FX_EXTERNAL_AOT_WAIT=1 (a lookup waits for an in-flight
-// translation of its pc instead of missing), TRANSMUTE_FX_EXTERNAL_AOT_BOUNDS=1
+// translation of its pc instead of missing), TRANSMUTE_FX_EXTERNAL_AOT_RECORDED=<n>
+// (recorded starts translated at most n regions past the guest's, default
+// 4096, 0 = none), TRANSMUTE_FX_EXTERNAL_AOT_BOUNDS=1
 // (worker regions end at the next function start instead of the JIT's
 // synthetic window). The defaults were the cheapest on macOS Blender's cold
 // start: waiting and function-bounded (larger) regions cost the guest more in
@@ -90,6 +103,16 @@ struct PoolRecord {
     std::vector<std::uint8_t> bytes;
 };
 
+// One file's recorded starts (an earlier build's process, in first-use
+// order). The guest's use of them moves `frontier`; workers translate the
+// starts just past it, so a list the guest does not follow costs nothing.
+struct RecordedList {
+    std::vector<std::uint32_t> starts;
+    std::unordered_map<std::uint32_t, std::uint32_t> position;   // start rva -> index
+    std::atomic<std::int64_t> frontier{-1};   // furthest index the guest used
+    std::size_t cursor = 0;                   // next index for the workers (queue lock)
+};
+
 struct XModule : std::enable_shared_from_this<XModule> {
     std::uint64_t base{}, size{}, text_begin{}, text_end{};
     std::vector<std::uint32_t> starts;   // function start rvas, sorted, unique
@@ -108,6 +131,10 @@ struct XModule : std::enable_shared_from_this<XModule> {
     // Worker-only state (queue lock).
     bool static_wanted = false, static_done = false, has_cold = false;
     std::size_t static_cursor = 0;
+    // Region starts an earlier fx build recorded for this image
+    // (recorded_starts, a list per file), published once (recorded_ready).
+    std::vector<std::unique_ptr<RecordedList>> recorded;
+    std::atomic<bool> recorded_ready{false};
     std::wstring stem;
     cachefmt::Key key{};
 
@@ -126,9 +153,11 @@ struct XModule : std::enable_shared_from_this<XModule> {
 };
 
 struct Job {
+    enum Kind : std::uint8_t { flow, recorded, check };   // flow: flow-ahead and static (by depth); check: module_active only
     std::shared_ptr<XModule> module;
     std::uint32_t rva;
     std::uint8_t depth;
+    Kind kind = flow;
 };
 
 constexpr unsigned kMaxModules = 4096;
@@ -149,6 +178,7 @@ struct State {
     std::atomic<bool> inbox_pending{false};
     unsigned threads = 0, busy = 0, max_threads = 0;
     unsigned depth = 1;
+    unsigned recorded_ahead = 4096;   // recorded starts translated past the guest's frontier (0: none)
     bool wait_in_flight = false;  // lookups wait for a running translation of their pc
     bool bounds = false;          // regions end at the next function start
     std::uint64_t static_limit = 2u << 20;
@@ -158,7 +188,7 @@ struct State {
     std::atomic<bool> active{false};    // any module registered
     std::atomic<bool> stopping{false};
     std::atomic<std::uint64_t> regions{}, instructions{}, ticks{}, discarded{}, hits{}, waits{}, wait_ticks{},
-        flow_jobs{}, static_regions{}, cold_files{}, lookups{}, lookup_ticks{};
+        flow_jobs{}, static_regions{}, cold_files{}, lookups{}, lookup_ticks{}, recorded_starts{}, recorded_jobs{};
 };
 
 State& S() {
@@ -185,6 +215,7 @@ void configure_locked(State& s) {
     s.static_after_ms = std::uint64_t{env_unsigned(L"TRANSMUTE_FX_BACKGROUND_AOT_DELAY", 20)} * 1000;
     s.wait_in_flight = env_unsigned(L"TRANSMUTE_FX_EXTERNAL_AOT_WAIT", 0) != 0;
     s.bounds = env_unsigned(L"TRANSMUTE_FX_EXTERNAL_AOT_BOUNDS", 0) != 0;
+    s.recorded_ahead = env_unsigned(L"TRANSMUTE_FX_EXTERNAL_AOT_RECORDED", 4096);
 }
 
 // Guarded 4-byte read: access violations and in-page errors fail.
@@ -335,15 +366,78 @@ bool module_active(State& s, const std::shared_ptr<XModule>& m) {
     cachefmt::Key key{};
     bool has_cold = false;
     const int state = module_cache_state(m->base, &stem, &key, &has_cold);   // may wait for the open task
-    Exclusive lock(s.lock);
-    if (m->state == 0) {
-        m->state = state == 0 ? 1 : 2;
-        m->stem = std::move(stem);
-        m->key = key;
-        m->has_cold = has_cold;
-        if (has_cold || m->state != 1) m->static_wanted = false;   // done by an earlier process
+    bool load_recorded = false;
+    {
+        Exclusive lock(s.lock);
+        if (m->state == 0) {
+            m->state = state == 0 ? 1 : 2;
+            m->stem = stem;
+            m->key = key;
+            m->has_cold = has_cold;
+            if (has_cold || m->state != 1) m->static_wanted = false;   // done by an earlier process
+            load_recorded = m->state == 1 && !has_cold && s.recorded_ahead != 0;
+        }
+        if (!load_recorded) return m->state == 1;
     }
+    // A cold module: what an earlier fx build translated for this image is
+    // what this one needs, in first-use order (95% of a cold Chrome browser's
+    // regions, the first half all of them, measured across two builds).
+    constexpr std::size_t kMaxRecorded = 1u << 16;
+    std::vector<std::unique_ptr<RecordedList>> lists;
+    std::size_t total = 0;
+    try {
+        for (auto& starts : recorded_starts(stem, key, kMaxRecorded)) {
+            auto list = std::make_unique<RecordedList>();
+            for (const std::uint32_t rva : starts)
+                if (m->in_text(m->base + rva)) list->starts.push_back(rva);
+            list->position.reserve(list->starts.size());
+            for (std::uint32_t i = 0; i < list->starts.size(); ++i) list->position.emplace(list->starts[i], i);
+            total += list->starts.size();
+            if (!list->starts.empty()) lists.push_back(std::move(list));
+        }
+    } catch (...) {
+        lists.clear();   // out of memory or an unreadable file: flow-ahead only
+        total = 0;
+    }
+    Exclusive lock(s.lock);
+    s.recorded_starts.fetch_add(total, std::memory_order_relaxed);
+    m->recorded = std::move(lists);
+    m->recorded_ready.store(true, std::memory_order_release);
     return m->state == 1;
+}
+
+// Guest side, lock-free: the guest used the region starting at `rva`.
+void note_recorded(XModule& m, std::uint32_t rva) {
+    if (!m.recorded_ready.load(std::memory_order_acquire)) return;
+    for (const auto& list : m.recorded) {
+        const auto it = list->position.find(rva);
+        if (it == list->position.end()) continue;
+        std::int64_t seen = list->frontier.load(std::memory_order_relaxed);
+        while (seen < it->second && !list->frontier.compare_exchange_weak(seen, it->second, std::memory_order_relaxed)) {}
+    }
+}
+
+// lock held: the next recorded start, not translated yet, at most
+// recorded_ahead past the guest's frontier in a list the guest follows.
+// Starts behind the frontier are skipped: the guest is past them.
+bool recorded_job_locked(State& s, Job& job, bool take = true) {
+    for (const auto& m : s.modules) {
+        if (m->dead.load() || m->state != 1 || !m->recorded_ready.load(std::memory_order_acquire)) continue;
+        for (const auto& list : m->recorded) {
+            const std::int64_t frontier = list->frontier.load(std::memory_order_relaxed);
+            if (frontier < 0) continue;
+            const std::size_t limit = std::min(list->starts.size(), static_cast<std::size_t>(frontier) + 1 + s.recorded_ahead);
+            std::size_t cursor = std::max(list->cursor, static_cast<std::size_t>(frontier) + 1);
+            while (cursor < limit && m->test(list->starts[cursor])) ++cursor;   // the guest or a worker has it
+            if (take) list->cursor = cursor;   // (a peek, under the shared lock, changes nothing)
+            if (cursor >= limit) continue;
+            if (!take) return true;
+            job = {m, list->starts[cursor], static_cast<std::uint8_t>(s.depth), Job::recorded};   // no flow-ahead from it
+            list->cursor = cursor + 1;
+            return true;
+        }
+    }
+    return false;
 }
 
 void translate_one(State& s, const Job& job) {
@@ -484,6 +578,11 @@ std::uint32_t worker_main(void*) {
                     return 0;
                 }
                 drain_inbox_locked(s);
+                // Recorded starts first: a better guess than flow-ahead's.
+                if (recorded_job_locked(s, job)) {
+                    s.recorded_jobs.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
                 if (!s.queue.empty()) {
                     job = std::move(s.queue.front());
                     s.queue.pop_front();
@@ -526,7 +625,8 @@ std::uint32_t worker_main(void*) {
                 Shared lock(s.lock);
                 wanted = job.module->static_wanted;   // false once a cold file turned up
             }
-            if (!is_static) s.flow_jobs.fetch_add(1, std::memory_order_relaxed);
+            if (job.kind == Job::check) wanted = false;   // the module is checked (and its recorded starts loaded)
+            else if (!is_static && job.kind == Job::flow) s.flow_jobs.fetch_add(1, std::memory_order_relaxed);
             if (wanted) translate_one(s, job);
         }
         job.module.reset();
@@ -595,6 +695,8 @@ void external_aot_start(const ExternalAotRequest& request, ExternalAotTranslateF
     s.table[slot].store(m.get(), std::memory_order_release);
     s.table_count.store(slot + 1, std::memory_order_release);
     for (const std::uint64_t pc : request.roots) push_locked(s, m, pc, 0, false);   // as if the guest ran them
+    // Check the module first: a cold one may have an earlier build's recorded starts.
+    if (s.recorded_ahead != 0) s.queue.push_front({m, 0, static_cast<std::uint8_t>(s.depth), Job::check});
     s.active.store(true);
     start_workers_locked(s);
 }
@@ -639,6 +741,7 @@ void external_aot_note_region(const TranslatedRegion& region) {
     if (!s.active.load(std::memory_order_relaxed) || s.stopping.load(std::memory_order_relaxed)) return;
     XModule* m = find_module(s, region.guest_start);
     if (!m || m->state.load(std::memory_order_relaxed) == 2) return;
+    note_recorded(*m, static_cast<std::uint32_t>(region.guest_start - m->base));
     // The guest has these: never translate them again here.
     for (const RegionEntry& e : region.entries)
         if (m->in_text(e.guest_pc)) m->claim(static_cast<std::uint32_t>(e.guest_pc - m->base));
@@ -657,6 +760,7 @@ void external_aot_note_record(std::uint64_t base, const cachefmt::RecordView& re
     if (!s.active.load(std::memory_order_relaxed) || s.stopping.load(std::memory_order_relaxed)) return;
     XModule* m = find_module(s, base);
     if (!m || m->base != base || m->state.load(std::memory_order_relaxed) == 2) return;
+    note_recorded(*m, record.header->start_rva);
     std::uint32_t end_rva = 0;
     for (std::uint32_t i = 0; i < record.header->n_ranges; ++i) end_rva = std::max(end_rva, record.ranges[i].end_rva);
     thread_local std::vector<std::uint64_t> targets;
@@ -733,7 +837,7 @@ void external_aot_testing_reset() {
     s.active.store(false);
     s.stopping.store(false);
     for (auto* c : {&s.regions, &s.instructions, &s.ticks, &s.discarded, &s.hits, &s.waits, &s.wait_ticks, &s.flow_jobs,
-                    &s.static_regions, &s.cold_files, &s.lookups, &s.lookup_ticks})
+                    &s.static_regions, &s.cold_files, &s.lookups, &s.lookup_ticks, &s.recorded_starts, &s.recorded_jobs})
         c->store(0);
 }
 
@@ -743,7 +847,8 @@ void external_aot_testing_wait_idle(unsigned timeout_ms) {
     for (;;) {
         {
             Shared lock(s.lock);
-            if (s.queue.empty() && s.busy == 0 && !s.inbox_pending.load()) return;
+            Job pending;
+            if (s.queue.empty() && s.busy == 0 && !s.inbox_pending.load() && !recorded_job_locked(s, pending, false)) return;
         }
         if (host::monotonic_ms() >= deadline) return;
         host::sleep_ms(1);
@@ -770,6 +875,8 @@ ExternalAotStats cache_external_aot_stats() noexcept {
     out.cold_files = s.cold_files.load();
     out.lookups = s.lookups.load();
     out.lookup_seconds = static_cast<double>(s.lookup_ticks.load()) * tick_seconds();
+    out.recorded_starts = s.recorded_starts.load();
+    out.recorded_jobs = s.recorded_jobs.load();
     return out;
 }
 

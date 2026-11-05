@@ -190,13 +190,16 @@ if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD AND macos_dir)
         ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1;TRANSMUTE_FX_GLOBALS=sp,x0,x1,x19,x20,fp,lr")
     # BLR sites whose targets change (vtable slots, JIT rewrites, unmap and
     # remap, a vm_remap alias, a target that tiers up): fx's BLR inline caches
-    # (RegionExit::ic_offset), and the same without them.
+    # (RegionExit::ic_offset) with two entries, one (ic1) and none.
     add_test(NAME alchemy_fx_inline_cache COMMAND alchemy-fx "${macos_dir}/fx_inline_cache")
     set_tests_properties(alchemy_fx_inline_cache PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx inline cache: ok"
         ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1")
     add_test(NAME alchemy_fx_inline_cache_off COMMAND alchemy-fx "${macos_dir}/fx_inline_cache")
     set_tests_properties(alchemy_fx_inline_cache_off PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx inline cache: ok"
         ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1;TRANSMUTE_FX_CORE=noinlinecache")
+    add_test(NAME alchemy_fx_inline_cache_ic1 COMMAND alchemy-fx "${macos_dir}/fx_inline_cache")
+    set_tests_properties(alchemy_fx_inline_cache_ic1 PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx inline cache: ok"
+        ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1;TRANSMUTE_FX_CORE=ic1")
     # BRs through a writable dispatch table (V8's Ignition) take fx's table
     # shadows: handlers rewritten, table entries changed, two tables, threads;
     # and the same with the shadows off.

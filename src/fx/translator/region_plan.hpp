@@ -183,7 +183,9 @@ struct Plan {
     // smaller), or the masked sequence before that (oldrsb; the flags are
     // stored before it).
     enum class RsbPush : std::uint8_t { inline_flag_free, call, old_masked } rsb_push{};
-    bool inline_cache{};              // BLRs have an inline cache (RegionExit::ic_offset)
+    // Entries of a BLR's inline cache (RegionExit::ic_offset): 2, 1 (ic1) or
+    // 0 (noinlinecache: the inline lookup only).
+    unsigned inline_cache_entries{};
     unsigned loop_alignment{16};      // bytes (align32: 32)
     unsigned interpret_count{};
     unsigned blocks{};
@@ -304,6 +306,7 @@ struct PlanOverrides {
     // TRANSMUTE_FX_CORE=noinlinecache: BLRs take the inline lookup only (no
     // RegionExit::ic_offset).
     bool no_inline_cache{};
+    bool inline_cache_one{};          // TRANSMUTE_FX_CORE=ic1: one entry per site, not two
 };
 
 struct FamilyTable {
