@@ -414,7 +414,7 @@ void composite_window(Support& support, WindowServer& server, WindowId window, R
         const auto stats = tree::compose(snapshot, {s.roots[root].frame, content.height, scale}, target, clip);
         if (stats.unsupported_transforms && !s.transform_reported) {
             s.transform_reported = true;
-            diagnostic("unsupported: a CALayer whose transform maps it to nothing, or a transformed or masked layer larger than 8192 pixels, is not composited");
+            diagnostic("unsupported: a CALayer whose transform maps it to nothing or reaches behind the viewer, or a transformed or masked layer larger than 8192 pixels, is not composited");
         }
     }
     const WindowServer::BitmapView view{width, height, static_cast<std::size_t>(width) * 4, composite.bgra.data()};

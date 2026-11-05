@@ -37,16 +37,25 @@
 //   layers draw nothing; opacity multiplies down the tree (per layer, not as
 //   a group). Pixels are premultiplied BGRA composited source-over; opaque
 //   images and colours replace.
-// - Transforms are the 2D (affine) parts of the layers' CATransform3Ds. A
-//   layer whose accumulated transform rotates or shears, or that has a mask,
-//   is drawn as a group: it and its sublayers go into an offscreen buffer in
+// - Transforms: the layers' CATransform3Ds (their 2D parts when they are
+//   affine). As Core Animation documents, a layer flattens its sublayers into
+//   its plane: a sublayer's 3D transform (with its superlayer's
+//   sublayerTransform, perspective m34 included) is projected onto the
+//   superlayer's plane. A CATransformLayer does not flatten: its sublayers
+//   (and theirs, through nested transform layers) stay in its superlayer's 3D
+//   space and are drawn back to front by the depth of their centres; the
+//   transform layer's own background, contents, border, shadow and mask are
+//   not drawn and its opacity applies to each sublayer. A layer whose
+//   accumulated transform rotates, shears or is projective, or that has a
+//   mask, is drawn as a group: it and its sublayers go into an offscreen buffer in
 //   an axis-aligned space of the same resolution, the mask layer's alpha
 //   (the mask drawn like a sublayer of the layer) multiplies it, and the
 //   buffer is resampled into the target through the rest of the transform
 //   (bilinear, nearest where the layer's magnification filter is
-//   kCAFilterNearest). A transform that maps the layer to nothing, or a group
-//   larger than 8192 pixels on a side, is counted in
-//   Stats::unsupported_transforms and not drawn.
+//   kCAFilterNearest). A transform that maps the layer to nothing, a layer
+//   that reaches behind the viewer (w <= 0), or a group larger than 8192
+//   pixels on a side, is counted in Stats::unsupported_transforms and not
+//   drawn.
 // - Contents drawn at another size are filtered as the layer's
 //   minificationFilter / magnificationFilter say: linear (Core Animation's
 //   default; bilinear) or nearest. kCAFilterTrilinear minifies as linear.
@@ -130,6 +139,11 @@ struct Layer {
     std::optional<std::array<float, 4>> border;   // straight RGBA
     std::optional<Shadow> shadow;                 // opacity > 0
     bool nearest_minification{}, nearest_magnification{};   // kCAFilterNearest (else linear)
+    // The whole CATransform3Ds (sixteen doubles, row vectors as Core Animation
+    // lays them out) when they are not affine; otherwise `transform` and
+    // `sublayer_transform` above are used.
+    std::optional<std::array<double, 16>> transform3d, sublayer_transform3d;
+    bool transform_layer{};                       // a CATransformLayer (see the model above)
     std::shared_ptr<const Layer> mask;            // the mask layer (its alpha), in this layer's sublayer space
     std::vector<Layer> sublayers;
 };

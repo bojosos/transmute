@@ -284,6 +284,81 @@ void rotations_masks_and_filters() {
     nearest.expect(10, 15, blue, "and the right half blue");
 }
 
+// 3D: perspective (a sublayerTransform's m34) projects a turned layer onto its
+// superlayer's plane; a CATransformLayer keeps its sublayers in 3D, drawn back
+// to front by depth, and draws nothing itself.
+void perspective_and_transform_layers() {
+    const double pi = 3.14159265358979323846;
+    const double c = std::cos(pi / 3), s = std::sin(pi / 3);
+    // Row vectors (Core Animation's layout): a turn of 60 degrees about the y axis.
+    const std::array<double, 16> turn{c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1};
+    const auto blue_column_height = [](const Canvas& canvas, long x) {
+        long count = 0;
+        for (long y = 0; y < static_cast<long>(canvas.height); ++y) {
+            const auto p = canvas.at(x, y);
+            if (p[0] > 128 && p[2] < 128) ++count;
+        }
+        return count;
+    };
+    const auto blue_columns = [&](const Canvas& canvas) {
+        std::vector<long> columns;
+        for (long x = 0; x < static_cast<long>(canvas.width); ++x) if (blue_column_height(canvas, x) > 0) columns.push_back(x);
+        return columns;
+    };
+    auto root = layer({{0, 0}, {40, 40}}, {0, 0});
+    root.background = rgba(red);
+    auto card = layer({{0, 0}, {20, 20}}, {20, 20}, {0.5, 0.5});
+    card.background = rgba(blue);
+    card.transform3d = turn;
+    root.sublayers = {card};
+    // Orthographic: half as wide (cos 60), both edges as tall.
+    Canvas flat(40, 40);
+    auto flat_target = flat.target();
+    auto stats = t::compose(root, {{{0, 0}, {40, 40}}, 40, 1}, flat_target, {});
+    auto columns = blue_columns(flat);
+    require(stats.unsupported_transforms == 0 && columns.size() >= 9 && columns.size() <= 12, "orthographic width: " + std::to_string(columns.size()));
+    const auto flat_left = blue_column_height(flat, columns.front() + 1), flat_right = blue_column_height(flat, columns.back() - 1);
+    require(std::abs(flat_left - flat_right) <= 1, "orthographic: equal edges " + std::to_string(flat_left) + " / " + std::to_string(flat_right));
+    // Perspective (m34 = -1/40 in the superlayer's sublayerTransform): the nearer edge is taller.
+    std::array<double, 16> perspective{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, -1.0 / 40, 0, 0, 0, 1};
+    root.sublayer_transform3d = perspective;
+    root.anchor = {0.5, 0.5};
+    root.position = {20, 20};
+    Canvas deep(40, 40);
+    auto deep_target = deep.target();
+    stats = t::compose(root, {{{0, 0}, {40, 40}}, 40, 1}, deep_target, {});
+    columns = blue_columns(deep);
+    require(stats.unsupported_transforms == 0 && columns.size() >= 6, "the perspective card is drawn: " + std::to_string(columns.size()));
+    const auto left = blue_column_height(deep, columns.front() + 1), right = blue_column_height(deep, columns.back() - 1);
+    require(std::abs(left - right) >= 3, "perspective: the nearer edge is taller " + std::to_string(left) + " / " + std::to_string(right));
+
+    // Two overlapping squares 5 points in front of and behind their parent's plane: the later (behind) one in array order.
+    auto front = layer({{0, 0}, {10, 10}}, {20, 20}, {0.5, 0.5});
+    front.background = rgba(green);
+    front.transform3d = std::array<double, 16>{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 5, 1};
+    auto back = layer({{0, 0}, {10, 10}}, {20, 20}, {0.5, 0.5});
+    back.background = rgba(blue);
+    back.transform3d = std::array<double, 16>{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, -5, 1};
+    auto plain = layer({{0, 0}, {40, 40}}, {0, 0});
+    plain.background = rgba(white);
+    auto holder = layer({{0, 0}, {40, 40}}, {0, 0});
+    holder.sublayers = {front, back};
+    plain.sublayers = {holder};
+    Canvas flattened(40, 40);
+    auto flattened_target = flattened.target();
+    t::compose(plain, {{{0, 0}, {40, 40}}, 40, 1}, flattened_target, {});
+    flattened.expect(20, 20, blue, "a flattening layer draws its sublayers in order");
+    // In a CATransformLayer the nearer one is in front, and its own background is not drawn.
+    holder.transform_layer = true;
+    holder.background = rgba(red);
+    plain.sublayers = {holder};
+    Canvas three_d(40, 40);
+    auto three_d_target = three_d.target();
+    t::compose(plain, {{{0, 0}, {40, 40}}, 40, 1}, three_d_target, {});
+    three_d.expect(20, 20, green, "a CATransformLayer draws the nearer sublayer in front");
+    three_d.expect(5, 5, white, "and not its own background");
+}
+
 void clip_and_unsupported_transforms() {
     auto root = layer({{0, 0}, {20, 20}}, {0, 0});
     root.background = rgba(red);
@@ -438,6 +513,7 @@ int main() {
         hidden_opacity_clipping_and_order();
         clip_and_unsupported_transforms();
         rotations_masks_and_filters();
+        perspective_and_transform_layers();
         contents_rect();
         corners_borders_shadows();
     } catch (const std::exception& error) {

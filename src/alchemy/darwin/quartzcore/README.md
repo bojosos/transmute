@@ -48,9 +48,18 @@ uses the 2D (affine) part of each transform: rotated, sheared and masked
 layers are drawn as groups (offscreen at the same resolution, the `mask`
 layer's alpha applied, then resampled bilinearly into place), and scaled
 contents follow `minificationFilter` / `magnificationFilter` (linear by
-default, or nearest; trilinear minifies as linear). The 3D parts (perspective,
-z) are not drawn yet; a transform that maps a layer to nothing, or a group
-over 8192 pixels on a side, is reported once and not drawn. Changes inside a
+default, or nearest; trilinear minifies as linear). Whole CATransform3Ds are
+used: as Core Animation documents, a layer flattens its sublayers into its
+plane (a sublayer's 3D transform, with the superlayer's sublayerTransform and
+its perspective m34, is projected onto that plane and resampled
+projectively), and a CATransformLayer does not: its sublayers, through
+nested transform layers, stay in 3D and are drawn back to front by the depth
+of their centres, without the transform layer's own background, contents,
+border, shadow or mask (its opacity applies to each sublayer). Layers that
+intersect one another in depth are not split (each is drawn whole, in depth
+order). A transform that maps a layer to nothing, a layer reaching behind the
+viewer, or a group over 8192 pixels on a side, is reported once and not
+drawn. Changes inside a
 mask layer show at the masked layer's next change. Filters (`filters`,
 `compositingFilter`) and conic gradients are not drawn (conic reported once).
 

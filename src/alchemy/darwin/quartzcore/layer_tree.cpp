@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <numeric>
 
 // CALayer tree composition (layer_tree.hpp).
@@ -75,13 +76,6 @@ void sample(const Image& image, double x, double y, bool nearest, std::uint8_t* 
     }
 }
 
-Affine inverse(const Affine& m) {
-    const double det = m.a * m.d - m.b * m.c;
-    if (std::abs(det) < 1e-12) return {};
-    const double a = m.d / det, b = -m.b / det, c = -m.c / det, d = m.a / det;
-    return {a, b, c, d, -(a * m.tx + c * m.ty), -(b * m.tx + d * m.ty)};
-}
-
 // The bounding box of `r`'s four corners through `m` (any affine transform).
 Box map_corners(const Affine& m, const Box& r) {
     const Point corners[4] = {m.apply({r.x0, r.y0}), m.apply({r.x1, r.y0}), m.apply({r.x0, r.y1}), m.apply({r.x1, r.y1})};
@@ -92,21 +86,83 @@ Box map_corners(const Affine& m, const Box& r) {
 
 Box box_of(const Rect& r) { return {r.origin.x, r.origin.y, r.origin.x + r.size.width, r.origin.y + r.size.height}; }
 
-// A layer's sublayer space -> its bounds space: the flip, then sublayerTransform about the anchor point.
-Affine sublayer_space(const Layer& value) {
-    const auto& b = value.bounds;
-    const Point anchor{b.origin.x + value.anchor.x * b.size.width, b.origin.y + value.anchor.y * b.size.height};
-    Affine inner;
-    if (value.geometry_flipped) inner = inner.after({1, 0, 0, -1, 0, 2 * b.origin.y + b.size.height});
-    if (!value.sublayer_transform.identity())
-        inner = inner.after(Affine::translation(anchor.x, anchor.y).after(value.sublayer_transform).after(Affine::translation(-anchor.x, -anchor.y)));
-    return inner;
+// ---- 3D: CATransform3D chains (row vectors) and their projection onto a plane ----
+using M4 = std::array<double, 16>;
+constexpr M4 identity4{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+// p * a * b: a first.
+M4 mul(const M4& a, const M4& b) {
+    M4 r{};
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            double sum = 0;
+            for (int k = 0; k < 4; ++k) sum += a[i * 4 + k] * b[k * 4 + j];
+            r[i * 4 + j] = sum;
+        }
+    return r;
 }
+M4 m4_of(const Affine& a) { return {a.a, a.b, 0, 0, a.c, a.d, 0, 0, 0, 0, 1, 0, a.tx, a.ty, 0, 1}; }
 
-Affine local_to_parent(const Layer& value) {
+// A plane projective map: [X Y W] = m * [x y 1], the point (X / W, Y / W).
+struct Proj {
+    std::array<double, 9> m{1, 0, 0, 0, 1, 0, 0, 0, 1};
+    [[nodiscard]] Proj after(const Proj& inner) const {
+        Proj r;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) r.m[i * 3 + j] = m[i * 3] * inner.m[j] + m[i * 3 + 1] * inner.m[3 + j] + m[i * 3 + 2] * inner.m[6 + j];
+        return r;
+    }
+    [[nodiscard]] bool affine() const {
+        return std::abs(m[6]) <= 1e-12 * std::abs(m[8]) && std::abs(m[7]) <= 1e-12 * std::abs(m[8]) && m[8] > 0;
+    }
+    [[nodiscard]] Affine to_affine() const { return {m[0] / m[8], m[3] / m[8], m[1] / m[8], m[4] / m[8], m[2] / m[8], m[5] / m[8]}; }
+    [[nodiscard]] std::optional<Point> apply(Point p) const {
+        const double w = m[6] * p.x + m[7] * p.y + m[8];
+        if (!(w > 1e-9)) return std::nullopt;
+        return Point{(m[0] * p.x + m[1] * p.y + m[2]) / w, (m[3] * p.x + m[4] * p.y + m[5]) / w};
+    }
+    [[nodiscard]] std::optional<Proj> inverse() const {
+        const auto& a = m;
+        const double c00 = a[4] * a[8] - a[5] * a[7], c01 = a[5] * a[6] - a[3] * a[8], c02 = a[3] * a[7] - a[4] * a[6];
+        const double det = a[0] * c00 + a[1] * c01 + a[2] * c02;
+        if (!(std::abs(det) > 1e-18) || !std::isfinite(det)) return std::nullopt;
+        Proj r;
+        r.m = {c00 / det, (a[2] * a[7] - a[1] * a[8]) / det, (a[1] * a[5] - a[2] * a[4]) / det,
+               c01 / det, (a[0] * a[8] - a[2] * a[6]) / det, (a[2] * a[3] - a[0] * a[5]) / det,
+               c02 / det, (a[1] * a[6] - a[0] * a[7]) / det, (a[0] * a[4] - a[1] * a[3]) / det};
+        return r;
+    }
+};
+Proj proj_of(const Affine& a) { return {{a.a, a.c, a.tx, a.b, a.d, a.ty, 0, 0, 1}}; }
+// The projection of the plane z = 0 through `t`.
+Proj reduce(const M4& t) { return {{t[0], t[4], t[12], t[1], t[5], t[13], t[3], t[7], t[15]}}; }
+
+// A layer's space -> its superlayer's (3D): the anchor point, the transform, the position.
+M4 local4(const Layer& value) {
     const auto& b = value.bounds;
     const Point anchor{b.origin.x + value.anchor.x * b.size.width, b.origin.y + value.anchor.y * b.size.height};
-    return Affine::translation(value.position.x, value.position.y).after(value.transform).after(Affine::translation(-anchor.x, -anchor.y));
+    return mul(mul(m4_of(Affine::translation(-anchor.x, -anchor.y)), value.transform3d ? *value.transform3d : m4_of(value.transform)),
+               m4_of(Affine::translation(value.position.x, value.position.y)));
+}
+// A layer's sublayer space -> its bounds space (3D): sublayerTransform about the anchor point, then the flip.
+M4 sub4(const Layer& value) {
+    const auto& b = value.bounds;
+    const Point anchor{b.origin.x + value.anchor.x * b.size.width, b.origin.y + value.anchor.y * b.size.height};
+    auto out = mul(mul(m4_of(Affine::translation(-anchor.x, -anchor.y)),
+                       value.sublayer_transform3d ? *value.sublayer_transform3d : m4_of(value.sublayer_transform)),
+                   m4_of(Affine::translation(anchor.x, anchor.y)));
+    if (value.geometry_flipped) out = mul(out, m4_of({1, 0, 0, -1, 0, 2 * b.origin.y + b.size.height}));
+    return out;
+}
+// The bounding box of `r` through a projective map (nullopt when part of it is behind the viewer).
+std::optional<Box> project_corners(const Proj& m, const Box& r) {
+    std::optional<Box> out;
+    for (const Point p : {Point{r.x0, r.y0}, Point{r.x1, r.y0}, Point{r.x0, r.y1}, Point{r.x1, r.y1}}) {
+        const auto q = m.apply(p);
+        if (!q) return std::nullopt;
+        if (!out) out = Box{q->x, q->y, q->x, q->y};
+        else out = Box{std::min(out->x0, q->x), std::min(out->y0, q->y), std::max(out->x1, q->x), std::max(out->y1, q->y)};
+    }
+    return out;
 }
 
 // What a layer and its sublayers may cover, in its bounds space.
@@ -118,11 +174,12 @@ Box extent(const Layer& value, int depth) {
                std::max(out.x1, out.x1 + value.shadow->offset.width) + grow, std::max(out.y1, out.y1 + value.shadow->offset.height) + grow};
     }
     if (value.masks_to_bounds || depth > 64) return out;
-    const auto inner = sublayer_space(value);
+    const auto inner = sub4(value);
     for (const auto& child : value.sublayers) {
         if (child.hidden) continue;
-        const auto box = map_corners(inner.after(local_to_parent(child)), extent(child, depth + 1));
-        out = {std::min(out.x0, box.x0), std::min(out.y0, box.y0), std::max(out.x1, box.x1), std::max(out.y1, box.y1)};
+        const auto box = project_corners(reduce(mul(local4(child), inner)), extent(child, depth + 1));
+        if (!box) return {-1e7, -1e7, 1e7, 1e7};   // reaches behind the viewer: anything may be covered
+        out = {std::min(out.x0, box->x0), std::min(out.y0, box->y0), std::max(out.x1, box->x1), std::max(out.y1, box->y1)};
     }
     return out;
 }
@@ -183,12 +240,22 @@ class Composer {
 public:
     Composer(Target& target, Stats& stats) : target_(target), stats_(stats) {}
 
+    // A layer whose space maps to the target through `h` (projective in general).
+    void layer(const Layer& value, const Proj& h, PixelRect clip, float parent_alpha, bool self) {
+        if (value.hidden) return;
+        if (value.transform_layer) { transform_layer(value, identity4, h, clip, parent_alpha); return; }
+        if (h.affine()) { layer(value, h.to_affine(), clip, parent_alpha, self); return; }
+        if (parent_alpha * std::clamp(value.opacity, 0.0F, 1.0F) <= 0) return;
+        group(value, h, clip, parent_alpha, self);
+    }
+
     void layer(const Layer& value, const Affine& m, PixelRect clip, float parent_alpha, bool self, bool grouped = false) {
         if (value.hidden) return;
+        if (value.transform_layer && !grouped) { transform_layer(value, identity4, proj_of(m), clip, parent_alpha); return; }
         const float alpha = parent_alpha * std::clamp(value.opacity, 0.0F, 1.0F);
         if (alpha <= 0) return;
         if (!grouped && (std::abs(m.b) > epsilon || std::abs(m.c) > epsilon || value.mask)) {
-            group(value, m, clip, parent_alpha, self);
+            group(value, proj_of(m), clip, parent_alpha, self);
             return;
         }
         const auto box = map_box(m, value.bounds);
@@ -215,12 +282,17 @@ public:
     }
 
     void sublayers(const Layer& value, const Affine& m, PixelRect own_clip, float alpha) {
-        const auto inner = m.after(sublayer_space(value));
+        const auto plane = proj_of(m);
+        const auto inner = sub4(value);
         std::vector<const Layer*> order;
         order.reserve(value.sublayers.size());
         for (const auto& child : value.sublayers) order.push_back(&child);
         std::stable_sort(order.begin(), order.end(), [](const Layer* l, const Layer* r) { return l->z_position < r->z_position; });
-        for (const auto* child : order) layer(*child, inner.after(local_to_parent(*child)), own_clip, alpha, true);
+        for (const auto* child : order) {
+            const auto chain = mul(local4(*child), inner);   // the child's space -> this layer's (3D)
+            if (child->transform_layer) transform_layer(*child, chain, plane, own_clip, alpha);
+            else layer(*child, plane.after(reduce(chain)), own_clip, alpha, true);
+        }
     }
 
     void save(PixelRect area, std::vector<std::uint8_t>& saved) {
@@ -344,22 +416,59 @@ public:
         pass(w, h, [w](long column, long i) { return static_cast<std::size_t>(i * w + column); });
     }
 
+    // A CATransformLayer whose space maps into the flattening plane through
+    // `chain` (3D), that plane mapping to the target through `plane`: its
+    // sublayers, through nested transform layers, back to front by depth.
+    void transform_layer(const Layer& value, const M4& chain, const Proj& plane, PixelRect clip, float parent_alpha) {
+        struct Item { const Layer* layer; M4 chain; float alpha; double depth; std::size_t order; };
+        std::vector<Item> items;
+        const std::function<void(const Layer&, const M4&, float, int)> collect = [&](const Layer& node, const M4& to_plane, float alpha, int depth) {
+            if (node.hidden || depth > 64) return;
+            const float own = alpha * std::clamp(node.opacity, 0.0F, 1.0F);
+            if (own <= 0) return;
+            const auto inner = mul(sub4(node), to_plane);
+            for (const auto& child : node.sublayers) {
+                const auto child_chain = mul(local4(child), inner);
+                if (child.transform_layer) { collect(child, child_chain, own, depth + 1); continue; }
+                const auto& b = child.bounds;
+                const double cx = b.origin.x + b.size.width / 2, cy = b.origin.y + b.size.height / 2;
+                const double z = cx * child_chain[2] + cy * child_chain[6] + child_chain[14];
+                const double w = cx * child_chain[3] + cy * child_chain[7] + child_chain[15];
+                items.push_back({&child, child_chain, own, w > 1e-9 ? z / w : z, items.size()});
+            }
+        };
+        collect(value, chain, parent_alpha, 0);
+        std::stable_sort(items.begin(), items.end(), [](const Item& l, const Item& r) { return l.depth < r.depth; });
+        for (const auto& item : items) layer(*item.layer, plane.after(reduce(item.chain)), clip, item.alpha, true);
+    }
+
     // A layer drawn as a group (layer_tree.hpp): offscreen in an axis-aligned
-    // space of the same resolution and orientation, masked, then resampled
-    // through the rest of the transform.
-    void group(const Layer& value, const Affine& m, PixelRect clip, float parent_alpha, bool self) {
-        const double det = m.a * m.d - m.b * m.c;
+    // space of the same resolution and orientation (the transform's local
+    // scale at the layer's centre), masked, then resampled through the rest
+    // of the transform (projective in general).
+    void group(const Layer& value, const Proj& map, PixelRect clip, float parent_alpha, bool self) {
+        const auto& b = value.bounds;
+        const double cx = b.origin.x + b.size.width / 2, cy = b.origin.y + b.size.height / 2;
+        const auto& hm = map.m;
+        const double X = hm[0] * cx + hm[1] * cy + hm[2], Y = hm[3] * cx + hm[4] * cy + hm[5], W = hm[6] * cx + hm[7] * cy + hm[8];
+        if (!(W > 1e-9)) { ++stats_.unsupported_transforms; return; }
+        // The Jacobian of the map at the centre.
+        const double j11 = (hm[0] * W - X * hm[6]) / (W * W), j12 = (hm[1] * W - X * hm[7]) / (W * W);
+        const double j21 = (hm[3] * W - Y * hm[6]) / (W * W), j22 = (hm[4] * W - Y * hm[7]) / (W * W);
+        const double det = j11 * j22 - j12 * j21;
         if (!(std::abs(det) > 1e-12) || !std::isfinite(det)) { ++stats_.unsupported_transforms; return; }
-        const double sx = std::hypot(m.a, m.b), sy = std::hypot(m.c, m.d);
+        const double sx = std::max(std::hypot(j11, j21), 1e-3), sy = std::max(std::hypot(j12, j22), 1e-3);
         const double ys = det < 0 ? -1.0 : 1.0;   // the offscreen space keeps the transform's orientation
         const Affine scale{sx, 0, 0, ys * sy, 0, 0};
-        const Affine rest = m.after(Affine{1 / sx, 0, 0, 1 / (ys * sy), 0, 0});   // offscreen -> target (rotation, shear, translation)
-        const Affine back = inverse(rest);
+        const Proj rest = map.after(proj_of(Affine{1 / sx, 0, 0, 1 / (ys * sy), 0, 0}));   // offscreen -> target
+        const auto back_map = rest.inverse();
+        if (!back_map) { ++stats_.unsupported_transforms; return; }
+        const Proj back = *back_map;
         auto area = map_corners(scale, extent(value, 0));
-        const auto visible = map_corners(back, {static_cast<double>(clip.x0), static_cast<double>(clip.y0), static_cast<double>(clip.x1),
-                                                static_cast<double>(clip.y1)});
-        area = {std::max(area.x0, visible.x0 - 2), std::max(area.y0, visible.y0 - 2), std::min(area.x1, visible.x1 + 2),
-                std::min(area.y1, visible.y1 + 2)};
+        if (const auto visible = project_corners(back, {static_cast<double>(clip.x0), static_cast<double>(clip.y0), static_cast<double>(clip.x1),
+                                                        static_cast<double>(clip.y1)}))
+            area = {std::max(area.x0, visible->x0 - 2), std::max(area.y0, visible->y0 - 2), std::min(area.x1, visible->x1 + 2),
+                    std::min(area.y1, visible->y1 + 2)};
         if (!(area.x1 > area.x0) || !(area.y1 > area.y0)) return;
         const PixelRect px{static_cast<long>(std::floor(area.x0)) - 1, static_cast<long>(std::floor(area.y0)) - 1,
                            static_cast<long>(std::ceil(area.x1)) + 1, static_cast<long>(std::ceil(area.y1)) + 1};
@@ -373,7 +482,7 @@ public:
         if (value.mask) {
             std::vector<std::uint8_t> mask_pixels(pixels.size(), 0);
             Target mask_buffer{buffer.width, buffer.height, buffer.stride, mask_pixels.data()};
-            Composer(mask_buffer, stats_).layer(*value.mask, offscreen.after(sublayer_space(value)).after(local_to_parent(*value.mask)), whole, 1.0F, true);
+            Composer(mask_buffer, stats_).layer(*value.mask, proj_of(offscreen).after(reduce(mul(local4(*value.mask), sub4(value)))), whole, 1.0F, true);
             for (std::size_t i = 0; i < pixels.size(); i += 4) {
                 const unsigned k = mask_pixels[i + 3];
                 if (k == 255) continue;
@@ -381,8 +490,10 @@ public:
             }
         }
         // Resample into the target over the buffer's footprint.
-        const auto footprint = map_corners(rest, {static_cast<double>(px.x0), static_cast<double>(px.y0), static_cast<double>(px.x1),
-                                                  static_cast<double>(px.y1)});
+        const auto projected = project_corners(rest, {static_cast<double>(px.x0), static_cast<double>(px.y0), static_cast<double>(px.x1),
+                                                      static_cast<double>(px.y1)});
+        if (!projected) { ++stats_.unsupported_transforms; return; }   // part of it is behind the viewer
+        const auto footprint = *projected;
         const auto target_area = PixelRect{static_cast<long>(std::floor(footprint.x0)), static_cast<long>(std::floor(footprint.y0)),
                                            static_cast<long>(std::ceil(footprint.x1)), static_cast<long>(std::ceil(footprint.y1))}.intersect(clip);
         if (target_area.empty()) return;
@@ -392,7 +503,8 @@ public:
             auto* row = at(target_area.x0, y);
             for (long x = target_area.x0; x < target_area.x1; ++x, row += 4) {
                 const auto p = back.apply({static_cast<double>(x) + 0.5, static_cast<double>(y) + 0.5});
-                const double bx = p.x - static_cast<double>(px.x0), by = p.y - static_cast<double>(px.y0);
+                if (!p) continue;
+                const double bx = p->x - static_cast<double>(px.x0), by = p->y - static_cast<double>(px.y0);
                 if (bx < -0.5 || by < -0.5 || bx > static_cast<double>(w) + 0.5 || by > static_cast<double>(h) + 0.5) continue;
                 std::uint8_t pixel[4];
                 sample(image, bx, by, nearest, pixel);

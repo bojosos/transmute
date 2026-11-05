@@ -233,6 +233,7 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
     CoreFoundation& cf;
     Address layer_class{}, metal_layer_class{}, drawable_class{}, transaction_class{};
     Address shape_layer_class{}, text_layer_class{}, replicator_layer_class{}, scroll_layer_class{}, gradient_layer_class{};
+    Address transform_layer_class{};   // CATransformLayer: its sublayers stay in 3D (layer_tree.hpp)
     std::mutex colors_mutex;
     Address black{}, white{};   // immortal opaque CGColors (the shape fill and text colour defaults)
     std::mutex completion_mutex;
@@ -2838,6 +2839,8 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         out.anchor = p.anchor;
         out.transform = affine_of(p.transform);
         out.sublayer_transform = affine_of(p.sublayer_transform);
+        out.transform3d = graphics_math::transform_is_affine(p.transform) ? std::nullopt : std::optional(p.transform);
+        out.sublayer_transform3d = graphics_math::transform_is_affine(p.sublayer_transform) ? std::nullopt : std::optional(p.sublayer_transform);
         out.z_position = p.z;
         out.opacity = static_cast<float>(std::clamp(p.opacity, 0.0, 1.0));
         out.hidden = p.hidden;
@@ -3201,6 +3204,8 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
             out.anchor = state->anchor;
             out.transform = affine_of(state->transform);
             out.sublayer_transform = affine_of(state->sublayer_transform);
+            if (!graphics_math::transform_is_affine(state->transform)) out.transform3d = state->transform;
+            if (!graphics_math::transform_is_affine(state->sublayer_transform)) out.sublayer_transform3d = state->sublayer_transform;
             out.z_position = state->z_position;
             out.contents_scale = state->contents_scale;
             out.contents_rect = state->contents_rect;
@@ -3226,6 +3231,7 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
             minification = retain(state->minification_filter);
             magnification = retain(state->magnification_filter);
         }
+        out.transform_layer = transform_layer_class && is_kind(object, transform_layer_class);
         out.nearest_minification = minification && cf.utf8(minification) == "nearest";
         out.nearest_magnification = magnification && cf.utf8(magnification) == "nearest";
         release(minification);
@@ -3278,6 +3284,8 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         drawable_class = declare("CAMetalDrawable", root, false);
         transaction_class = declare("CATransaction", root, true);
         install_layer();
+        // CATransformLayer: a CALayer the composition does not flatten (layer_tree.hpp).
+        transform_layer_class = declare("CATransformLayer", layer_class, true);
         install_layer_appearance();
         install_gradient_layer();
         install_shape_and_text_layers();

@@ -151,6 +151,16 @@ void appearance(Fixture& f) {
     require(masked.mask && near(masked.mask->bounds.size.width, 4) && masked.nearest_magnification && !masked.nearest_minification,
             "the mask and filters in the snapshot");
     static_cast<void>(f.id(layer, "setMask:", {0}));
+    // A CATransformLayer and a perspective transform reach the snapshot whole.
+    const auto three_d = f.make("CATransformLayer");
+    const auto matrix = f.process.allocate_guest(128, 8);
+    const std::array<double, 16> perspective{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, -0.025, 0, 0, 0, 1};
+    for (unsigned i = 0; i < 16; ++i) f.engine.write64(matrix + i * 8, std::bit_cast<std::uint64_t>(perspective[i]));
+    static_cast<void>(f.id(three_d, "setSublayerTransform:", {matrix}));
+    const auto deep = qc::snapshot_tree(f.objc, three_d);
+    require(deep.transform_layer && deep.sublayer_transform3d && near((*deep.sublayer_transform3d)[11], -0.025) && !deep.transform3d,
+            "a CATransformLayer with a perspective sublayerTransform in the snapshot");
+    require(!qc::snapshot_tree(f.objc, layer).transform_layer, "a CALayer is not a transform layer");
 }
 
 void drawn_layers(Fixture& f) {
