@@ -10,9 +10,23 @@
 #include <stdexcept>
 #include <string>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace {
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+long process_id() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return static_cast<long>(getpid());
+#endif
 }
 } // namespace
 
@@ -29,7 +43,9 @@ int main() {
             std::cout << "Alchemy MSL smoke skipped (no clang)\n";
             return 0;
         }
-        const auto directory = std::filesystem::temp_directory_path() / "alchemy_msl_smoke";
+        // Per process: test runs of other build trees use the same test.
+        const auto directory =
+            std::filesystem::temp_directory_path() / ("alchemy_msl_smoke_" + std::to_string(process_id()));
         std::filesystem::remove_all(directory);
         // dump_source and the cache read their environment once, on first use.
 #ifdef _MSC_VER

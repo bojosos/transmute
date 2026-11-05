@@ -1292,7 +1292,10 @@ int main(int argc, char** argv) {
     try {
         // Each group runs in its own process: give it a private result cache
         // (fixtures and corpus measure real compile times, so they run uncached).
-        const auto cache = fs::temp_directory_path() / ("alchemy_msl_tests_" + group);
+        // Per process, not per group: test runs of other build trees use the
+        // same group names, and removing their directory would delete the
+        // metal_stdlib they materialised in it mid-run.
+        const auto cache = fs::temp_directory_path() / ("alchemy_msl_tests_" + group + "_" + std::to_string(_getpid()));
         std::error_code ignored;
         fs::remove_all(cache, ignored);
         const bool uncached = group == "fixtures" || group == "corpus" || group == "chrome_corpus" || group == "preprocessor";

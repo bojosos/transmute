@@ -27,6 +27,33 @@ set(ALCHEMY_HEADLESS_ONLY_SOURCES)
 target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/frameworks.cpp
     src/alchemy/darwin/headless_additions.cpp)
+# Local test inputs that never enter git (a translator DLL, dumped shader
+# corpora) live under artifacts/. A git worktree has no artifacts/ of its own,
+# so alchemy_local_artifact(<out> <relative path>) looks in this checkout's
+# artifacts/, then in the main checkout's (the parent of git's common
+# directory); <out> is the first that exists, else empty.
+set(alchemy_artifact_roots "${PROJECT_SOURCE_DIR}/artifacts")
+find_package(Git QUIET)
+if(GIT_EXECUTABLE)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${PROJECT_SOURCE_DIR}" rev-parse --path-format=absolute --git-common-dir
+        OUTPUT_VARIABLE alchemy_git_common_dir OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE alchemy_git_result)
+    if(alchemy_git_result EQUAL 0 AND alchemy_git_common_dir)
+        get_filename_component(alchemy_main_checkout "${alchemy_git_common_dir}" DIRECTORY)
+        if(NOT alchemy_main_checkout STREQUAL PROJECT_SOURCE_DIR)
+            list(APPEND alchemy_artifact_roots "${alchemy_main_checkout}/artifacts")
+        endif()
+    endif()
+endif()
+function(alchemy_local_artifact out relative)
+    foreach(root IN LISTS alchemy_artifact_roots)
+        if(EXISTS "${root}/${relative}")
+            set(${out} "${root}/${relative}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    set(${out} "" PARENT_SCOPE)
+endfunction()
+
 file(GLOB alchemy_darwin_fragments CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/darwin/*.cmake")
 list(SORT alchemy_darwin_fragments)
 foreach(fragment IN LISTS alchemy_darwin_fragments)

@@ -72,19 +72,29 @@ function(alchemy_gui_metal_tests)
     # dumped metallib becomes real VkPipelines. 77 (skipped) without a GPU,
     # without the translator DLL (scripts/m2v/build_capi.ps1) or without a
     # dumped library (ALCHEMY_MSL_DUMP's metallib-*.metallib; never in git).
-    set(alchemy_m2v_capi_default "")
-    if(EXISTS "${PROJECT_SOURCE_DIR}/artifacts/m2v-capi/m2v_capi.dll")
-        set(alchemy_m2v_capi_default "${PROJECT_SOURCE_DIR}/artifacts/m2v-capi/m2v_capi.dll")
-    endif()
+    # Both are found in this checkout's artifacts/ or the main checkout's
+    # (alchemy_local_artifact), so worktree gates run the test too; an empty
+    # cached value is looked up again at every configure.
+    alchemy_local_artifact(alchemy_m2v_capi_default "m2v-capi/m2v_capi.dll")
     set(ALCHEMY_M2V_CAPI "${alchemy_m2v_capi_default}" CACHE FILEPATH
         "m2v_capi.dll (scripts/m2v/build_capi.ps1) for the alchemy_metal_air test")
-    file(GLOB alchemy_m2v_dumped_libraries "${PROJECT_SOURCE_DIR}/artifacts/chrome-msl-corpus/*/metallib-*.metallib")
-    set(alchemy_m2v_test_library_default "")
-    if(alchemy_m2v_dumped_libraries)
-        list(GET alchemy_m2v_dumped_libraries 0 alchemy_m2v_test_library_default)
+    if(NOT ALCHEMY_M2V_CAPI AND alchemy_m2v_capi_default)
+        set_property(CACHE ALCHEMY_M2V_CAPI PROPERTY VALUE "${alchemy_m2v_capi_default}")
     endif()
+    set(alchemy_m2v_test_library_default "")
+    foreach(root IN LISTS alchemy_artifact_roots)
+        file(GLOB alchemy_m2v_dumped_libraries "${root}/chrome-msl-corpus/*/metallib-*.metallib")
+        if(alchemy_m2v_dumped_libraries)
+            list(SORT alchemy_m2v_dumped_libraries)
+            list(GET alchemy_m2v_dumped_libraries 0 alchemy_m2v_test_library_default)
+            break()
+        endif()
+    endforeach()
     set(ALCHEMY_M2V_TEST_LIBRARY "${alchemy_m2v_test_library_default}" CACHE FILEPATH
         "A dumped metallib (ANGLE's, from ALCHEMY_MSL_DUMP) for the alchemy_metal_air test")
+    if(NOT ALCHEMY_M2V_TEST_LIBRARY AND alchemy_m2v_test_library_default)
+        set_property(CACHE ALCHEMY_M2V_TEST_LIBRARY PROPERTY VALUE "${alchemy_m2v_test_library_default}")
+    endif()
     alchemy_gui_add_unit_test(alchemy_metal_air src/alchemy/darwin/metal/tests/metal_air_tests.cpp TIMEOUT 300)
     set_tests_properties(alchemy_metal_air PROPERTIES SKIP_RETURN_CODE 77
         ENVIRONMENT "ALCHEMY_M2V_CAPI=${ALCHEMY_M2V_CAPI};ALCHEMY_M2V_TEST_LIBRARY=${ALCHEMY_M2V_TEST_LIBRARY}")
