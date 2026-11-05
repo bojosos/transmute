@@ -3179,7 +3179,15 @@ void av_player(Fixture& f) {
     require(rate_of(player) == 1.0f && f.send(player, "timeControlStatus") == 2, "playing");
     for (int i = 0; i < 60 && rate_of(player) != 0.0f; ++i) run(0.05);
     require(rate_of(player) == 0.0f && std::fabs(time_of(player, "currentTime") - duration) < 1e-3, "the player pauses at the item's end");
-    require(f.send(layer, "contents") != first_contents, "the layer shows later pictures");
+    // A later picture is the one shown (the output sees a new one, presented after time 0). Not the layer's contents
+    // pointer: the first picture's surface is freed once replaced, so a later surface can reuse its address.
+    static_cast<void>(first_contents);
+    const auto display = f.block(24);
+    require(f.send(layer, "contents") != 0 && (f.send(output, "hasNewPixelBufferForItemTime:", {when}) & 0xff) == 1, "a new picture after playing");
+    const auto last = f.send(output, "copyPixelBufferForItemTime:itemTimeForDisplay:", {when, display});
+    const auto display_scale = static_cast<std::int32_t>(f.engine.read32(display + 8));
+    require(last && display_scale > 0 && static_cast<std::int64_t>(f.engine.read64(display)) > 0, "the layer shows later pictures");
+    f.call(vt_cf, "_CFRelease", {last});
     // Seeking back.
     write_time(f, when, 100, 1000);
     f.send(player, "seekToTime:", {when});
