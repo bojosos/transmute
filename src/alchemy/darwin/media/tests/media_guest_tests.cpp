@@ -1755,6 +1755,75 @@ void music_sequence(Fixture& f) {
     require(static_cast<std::int32_t>(f.regs(at, "_MusicTrackNewExtendedTempoEvent", tempo).x0) == -10853, "tempo events need the tempo track");
     // Writing a file.
     require(f.status(at, "_MusicSequenceFileCreateData", {sequence, 0x6d696469, 0, 480, out}) == 0 && f.engine.read64(out) != 0, "FileCreateData");
+    // Editing through the guest ABI, on a second sequence loaded from the same file (seven events now in the first).
+    {
+        const auto edit_out = f.block(8);
+        require(f.status(at, "_NewMusicSequence", {edit_out}) == 0, "a sequence to edit");
+        const auto edited = f.engine.read64(edit_out);
+        require(f.status(at, "_MusicSequenceFileLoadData", {edited, data, 0, 0}) == 0 && f.status(at, "_MusicSequenceGetIndTrack", {edited, 0, edit_out}) == 0,
+                "loaded");
+        const auto edit_track = f.engine.read64(edit_out);
+        const auto event_count = [&](Address t) {
+            require(f.status(at, "_NewMusicEventIterator", {t, edit_out}) == 0, "an iterator");
+            const auto it = f.engine.read64(edit_out);
+            std::uint32_t n = 0;
+            for (;; ++n) {
+                require(f.status(at, "_MusicEventIteratorHasCurrentEvent", {it, has}) == 0, "HasCurrentEvent");
+                if (!f.memory().read8(has)) break;
+                static_cast<void>(f.status(at, "_MusicEventIteratorNextEvent", {it}));
+            }
+            static_cast<void>(f.status(at, "_DisposeMusicEventIterator", {it}));
+            return n;
+        };
+        // Cut [3, 4): the control and program changes at 3 go, the SysEx at 4 moves to 3.
+        alchemy::CallRegs cut{};
+        cut.x[0] = edit_track; cut.set_d(0, 3.0); cut.set_d(1, 4.0);
+        require(f.regs(at, "_MusicTrackCut", cut).x0 == 0 && event_count(edit_track) == 4, "MusicTrackCut");
+        // Copy [0, 1) of the first sequence's track to 10 (merge: nothing moves).
+        alchemy::CallRegs merge{};
+        merge.x[0] = track; merge.x[1] = edit_track; merge.set_d(0, 0.0); merge.set_d(1, 1.0); merge.set_d(2, 10.0);
+        require(f.regs(at, "_MusicTrackMerge", merge).x0 == 0 && event_count(edit_track) == 8, "MusicTrackMerge copies four events");
+        // The last event (at 10.25, the added note copied) moves to 0.5 through the iterator.
+        require(f.status(at, "_NewMusicEventIterator", {edit_track, edit_out}) == 0, "iterator");
+        const auto it = f.engine.read64(edit_out);
+        alchemy::CallRegs seek{};
+        seek.x[0] = it; seek.set_d(0, 10.2);
+        require(f.regs(at, "_MusicEventIteratorSeek", seek).x0 == 0, "seek");
+        alchemy::CallRegs move{};
+        move.x[0] = it; move.set_d(0, 0.5);
+        require(f.regs(at, "_MusicEventIteratorSetEventTime", move).x0 == 0 &&
+                f.status(at, "_MusicEventIteratorGetEventInfo", {it, time, type, payload, size}) == 0 &&
+                std::bit_cast<double>(f.engine.read64(time)) == 0.5 && f.engine.read32(type) == 6, "SetEventTime: the iterator stays on it");
+        const auto channel = f.block(4);
+        f.memory().write8(channel, 0xb0); f.memory().write8(channel + 1, 1); f.memory().write8(channel + 2, 64);
+        require(f.status(at, "_MusicEventIteratorSetEventInfo", {it, 7, channel}) == 0 &&
+                f.status(at, "_MusicEventIteratorGetEventInfo", {it, time, type, payload, size}) == 0 && f.engine.read32(type) == 7 &&
+                f.engine.read32(size) == 4 && f.memory().read8(f.engine.read64(payload) + 2) == 64, "SetEventInfo: now a control change");
+        require(f.status(at, "_MusicEventIteratorSetEventInfo", {it, 3, channel}) == -10853, "no tempo event outside the tempo track");
+        require(f.status(at, "_DisposeMusicEventIterator", {it}) == 0, "iterator disposed");
+        alchemy::CallRegs clear{};
+        clear.x[0] = edit_track; clear.set_d(0, 10.0); clear.set_d(1, 20.0);
+        require(f.regs(at, "_MusicTrackClear", clear).x0 == 0 && event_count(edit_track) == 5, "MusicTrackClear");
+        require(f.status(at, "_MusicSequenceReverse", {edited}) == 0 && event_count(edit_track) == 5, "MusicSequenceReverse keeps the events");
+        // Seconds: the tempo track becomes 60 BPM, so beats are seconds.
+        require(f.status(at, "_MusicSequenceSetSequenceType", {edited, 0x73656373}) == 0 &&
+                f.status(at, "_MusicSequenceGetSequenceType", {edited, count}) == 0 && f.engine.read32(count) == 0x73656373, "seconds type");
+        alchemy::CallRegs in_seconds{};
+        in_seconds.x[0] = edited; in_seconds.x[1] = time; in_seconds.set_d(0, 7.0);
+        require(f.regs(at, "_MusicSequenceGetSecondsForBeats", in_seconds).x0 == 0 && std::bit_cast<double>(f.engine.read64(time)) == 7.0, "beats are seconds");
+        require(f.status(at, "_MusicSequenceSetSequenceType", {edited, 0x73616d70}) == -10846, "samples need an AUGraph");
+        // MusicSequenceFileCreate writes the file, which loads back.
+        const auto directory = std::filesystem::temp_directory_path() / "alchemy_media_music_edit";
+        std::filesystem::create_directories(directory);
+        const auto url = f.cf.file_url(alchemy::guest_path_string(directory / "edited.mid"), false);
+        require(f.status(at, "_MusicSequenceFileCreate", {edited, url, 0x6d696469, 1, 480}) == 0, "MusicSequenceFileCreate");
+        require(f.status(at, "_MusicSequenceFileCreate", {edited, url, 0x6d696469, 0, 480}) == static_cast<std::int32_t>(0x70726d3f), "no erase flag: not replaced");
+        require(f.status(at, "_MusicSequenceFileLoad", {edited, url, 0, 0}) == 0 && f.status(at, "_MusicSequenceGetIndTrack", {edited, 0, edit_out}) == 0 &&
+                event_count(f.engine.read64(edit_out)) == 5, "the written file loads back");
+        require(f.status(at, "_DisposeMusicSequence", {edited}) == 0, "disposed");
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+    }
     // The player plays the sequence to a MIDI destination.
     const auto player_out = f.block(8);
     require(f.status(at, "_NewMusicPlayer", {player_out}) == 0, "NewMusicPlayer");

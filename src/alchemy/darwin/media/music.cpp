@@ -32,6 +32,12 @@
 // and parameter, AU preset and extended-note events, which address audio
 // units, are not dispatched. Stopping or moving the play position drops the
 // held packets of the destination and ends the notes that are sounding.
+//
+// Editing: MusicTrackClear, Cut, CopyInsert, Merge and MoveEvents, MusicSequenceReverse
+// (music_core.hpp), MusicEventIteratorSetEventTime and SetEventInfo. Copied AU preset events retain
+// their preset again. MusicSequenceSetSequenceType takes beats or seconds (a seconds sequence's tempo
+// track becomes 60 BPM, so beats are seconds); samples need an AUGraph. MusicSequenceFileCreate writes
+// the Standard MIDI File through the guest's libSystem.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -492,6 +498,116 @@ void install_music(Support& support) {
         status(s, 0);
     });
 
+    // MusicSequenceSetSequenceType(sequence, MusicSequenceType): 'beat' or 'secs' (its tempo becomes 60 BPM).
+    support.function(lib, "_MusicSequenceSetSequenceType", [state](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(state->mutex);
+        const auto owner = state->sequence(s.x[0]);
+        if (!owner) return status(s, music::error::param);
+        const auto type = static_cast<std::uint32_t>(s.x[1]);
+        if (type != 0x62656174 && type != 0x73656373) return status(s, music::error::invalid_sequence_type);   // 'beat', 'secs'
+        if (type == 0x73656373) {
+            auto& tempo = *owner->sequence->tempo;
+            std::erase_if(tempo.events, [&](const std::shared_ptr<music::Event>& e) {
+                if (e->type != music::EventType::extended_tempo) return false;
+                state->release_event(*e);
+                return true;
+            });
+            auto event = std::make_shared<music::Event>();
+            event->type = music::EventType::extended_tempo;
+            event->data = music::tempo_payload(60);
+            tempo.insert(std::move(event));
+        }
+        owner->sequence->type = type;
+        status(s, 0);
+    });
+    // MusicSequenceFileCreate(sequence, CFURLRef, MusicSequenceFileTypeID, MusicSequenceFileFlags, SInt16 resolution):
+    // kMusicSequenceFileFlags_EraseFile (1) replaces an existing file.
+    support.function(lib, "_MusicSequenceFileCreate", [state, sp](CpuState& s, GuestMemory& m) {
+        std::vector<std::uint8_t> bytes;
+        {
+            std::lock_guard lock(state->mutex);
+            const auto owner = state->sequence(s.x[0]);
+            if (!owner || !s.x[1]) return status(s, music::error::param);
+            if (static_cast<std::uint32_t>(s.x[2]) != midi_file_type) return status(s, music::error::invalid_sequence_type);
+            bytes = owner->sequence->write_smf(static_cast<std::int16_t>(s.x[4]));
+        }
+        const auto path = sp->cf.url_path(s.x[1]);
+        const auto text = sp->process.allocate_guest(path.size() + 1, 1);
+        std::vector<std::uint8_t> name(path.begin(), path.end());
+        name.push_back(0);
+        m.write_bytes(text, name);
+        // O_WRONLY | O_CREAT | (O_TRUNC or O_EXCL), mode 0644
+        const std::uint64_t flags = 1 | 0x200 | ((s.x[3] & 1) ? 0x400 : 0x800);
+        const auto fd = static_cast<std::int64_t>(sp->call(libsystem, "_open", {text, flags, 0644}));
+        sp->process.release_guest(text);
+        if (fd < 0) return status(s, static_cast<std::int32_t>(0x70726d3f));   // kAudioFilePermissionsError 'prm?'
+        const auto buffer = sp->process.allocate_guest(std::max<std::size_t>(bytes.size(), 1), 8);
+        m.write_bytes(buffer, bytes);
+        const auto wrote = static_cast<std::int64_t>(sp->call(libsystem, "_write", {static_cast<Address>(fd), buffer, bytes.size()}));
+        sp->process.release_guest(buffer);
+        static_cast<void>(sp->call(libsystem, "_close", {static_cast<Address>(fd)}));
+        status(s, wrote == static_cast<std::int64_t>(bytes.size()) ? 0 : static_cast<std::int32_t>(0x70726d3f));
+    });
+    // MusicSequenceReverse(sequence)
+    support.function(lib, "_MusicSequenceReverse", [state](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(state->mutex);
+        const auto owner = state->sequence(s.x[0]);
+        if (!owner) return status(s, music::error::param);
+        owner->sequence->reverse();
+        status(s, 0);
+    });
+
+    // ---- editing -----------------------------------------------------------------------------
+    // The times of a range [d0, d1): finite, not negative, start before end.
+    const auto range_ok = [](double start, double end) { return std::isfinite(start) && std::isfinite(end) && start >= 0 && end > start; };
+    // MusicTrackClear(track, MusicTimeStamp start [d0], end [d1]) and MusicTrackCut (later events move back).
+    for (const bool cut : {false, true})
+        support.function(lib, cut ? "_MusicTrackCut" : "_MusicTrackClear", [state, range_ok, cut](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(state->mutex);
+            auto* ref = state->track(s.x[0]);
+            if (!ref) return status(s, music::error::track_not_found);
+            if (!range_ok(real(s, 0), real(s, 1))) return status(s, music::error::param);
+            const auto removed = cut ? ref->track->cut(real(s, 0), real(s, 1)) : ref->track->clear(real(s, 0), real(s, 1));
+            for (const auto& e : removed) state->release_event(*e);
+            status(s, 0);
+        });
+    // MusicTrackCopyInsert(source, start [d0], end [d1], destination, insertTime [d2]): the destination's events from
+    // insertTime move later to make room. MusicTrackMerge: the same without moving them.
+    for (const bool make_room : {true, false})
+        support.function(lib, make_room ? "_MusicTrackCopyInsert" : "_MusicTrackMerge", [state, sp, range_ok, make_room](CpuState& s, GuestMemory&) {
+            std::lock_guard lock(state->mutex);
+            auto* source = state->track(s.x[0]);
+            auto* destination = state->track(s.x[1]);
+            if (!source || !destination) return status(s, music::error::track_not_found);
+            const double start = real(s, 0), end = real(s, 1), at = real(s, 2);
+            if (!range_ok(start, end) || !(at >= 0) || !std::isfinite(at)) return status(s, music::error::param);
+            const auto owner = destination->owner.lock();
+            const bool tempo_destination = owner && owner->sequence->tempo == destination->track;
+            auto copies = source->track->copy_range(start, end);
+            for (const auto& e : copies) {
+                // Tempo events belong in a tempo track only, and only they (with meta events) do.
+                if ((e->type == music::EventType::extended_tempo) != tempo_destination && e->type != music::EventType::meta)
+                    return status(s, music::error::invalid_event_type);
+            }
+            for (const auto& e : copies)
+                if (e->type == music::EventType::au_preset && e->data.size() >= 16) {
+                    std::uint64_t preset{};
+                    std::memcpy(&preset, e->data.data() + 8, 8);
+                    sp->retain(preset);
+                }
+            destination->track->insert_at(copies, at, make_room ? end - start : 0);
+            status(s, 0);
+        });
+    // MusicTrackMoveEvents(track, start [d0], end [d1], moveTime [d2]): by moveTime (negative: earlier, not before 0).
+    support.function(lib, "_MusicTrackMoveEvents", [state, range_ok](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(state->mutex);
+        auto* ref = state->track(s.x[0]);
+        if (!ref) return status(s, music::error::track_not_found);
+        if (!range_ok(real(s, 0), real(s, 1)) || !std::isfinite(real(s, 2))) return status(s, music::error::param);
+        ref->track->move(real(s, 0), real(s, 1), real(s, 2));
+        status(s, 0);
+    });
+
     // ---- tracks -----------------------------------------------------------------------------
     support.function(lib, "_MusicTrackGetSequence", [state](CpuState& s, GuestMemory& m) {
         std::lock_guard lock(state->mutex);
@@ -690,6 +806,64 @@ void install_music(Support& support) {
         if (s.x[2]) m.write32(s.x[2], static_cast<std::uint32_t>(event.type));
         if (s.x[3]) m.write64(s.x[3], state->guest_copy(event));
         if (s.x[4]) m.write32(s.x[4], static_cast<std::uint32_t>(event.data.size()));
+        status(s, 0);
+    });
+    // MusicEventIteratorSetEventTime(iterator, MusicTimeStamp [d0]): the event moves; the iterator stays on it.
+    support.function(lib, "_MusicEventIteratorSetEventTime", [state, iterator_of](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(state->mutex);
+        auto* it = iterator_of(s.x[0]);
+        if (!it) return status(s, music::error::param);
+        const double time = real(s, 0);
+        if (!(time >= 0) || !std::isfinite(time)) return status(s, music::error::param);
+        auto& events = it->track->events;
+        if (it->index >= events.size()) return status(s, music::error::end_of_track);
+        auto event = events[it->index];
+        events.erase(events.begin() + static_cast<std::ptrdiff_t>(it->index));
+        event->time = time;
+        it->track->insert(event);
+        it->index = static_cast<std::size_t>(std::find(events.begin(), events.end(), event) - events.begin());
+        status(s, 0);
+    });
+    // MusicEventIteratorSetEventInfo(iterator, MusicEventType, const void *eventData): the current event's type and
+    // payload (the C structure, sized as the MusicTrackNew*Event calls read it).
+    support.function(lib, "_MusicEventIteratorSetEventInfo", [state, sp, iterator_of, payload](CpuState& s, GuestMemory& m) {
+        if (!s.x[2]) return status(s, music::error::param);
+        const auto type = static_cast<music::EventType>(static_cast<std::uint32_t>(s.x[1]));
+        std::vector<std::uint8_t> bytes;
+        switch (type) {
+        case music::EventType::midi_note: bytes = payload(m, s.x[2], 8, std::nullopt, 0); break;
+        case music::EventType::midi_channel: bytes = payload(m, s.x[2], 4, std::nullopt, 0); break;
+        case music::EventType::midi_raw: bytes = payload(m, s.x[2], 0, 0, 4); break;
+        case music::EventType::meta: bytes = payload(m, s.x[2], 0, 4, 8); break;
+        case music::EventType::user: bytes = payload(m, s.x[2], 0, 0, 4); break;
+        case music::EventType::parameter: case music::EventType::au_preset: bytes = payload(m, s.x[2], 16, std::nullopt, 0); break;
+        case music::EventType::extended_tempo: bytes = payload(m, s.x[2], 8, std::nullopt, 0); break;
+        case music::EventType::extended_note: {
+            const auto count = m.read32(s.x[2] + 12);
+            if (count > 4096) return status(s, music::error::param);
+            bytes = payload(m, s.x[2], 24 + 8 * static_cast<std::size_t>(count > 2 ? count - 2 : 0), std::nullopt, 0);
+            break;
+        }
+        default: return status(s, music::error::invalid_event_type);
+        }
+        std::lock_guard lock(state->mutex);
+        auto* it = iterator_of(s.x[0]);
+        if (!it) return status(s, music::error::param);
+        auto& events = it->track->events;
+        if (it->index >= events.size()) return status(s, music::error::end_of_track);
+        auto* ref = state->track(it->track_handle);
+        const auto owner = ref ? ref->owner.lock() : nullptr;
+        const bool tempo_track = owner && owner->sequence->tempo == it->track;
+        if ((type == music::EventType::extended_tempo) != tempo_track && type != music::EventType::meta) return status(s, music::error::invalid_event_type);
+        auto& event = *events[it->index];
+        state->release_event(event);   // the old payload's guest copy and preset retain
+        if (type == music::EventType::au_preset) {
+            std::uint64_t preset{};
+            std::memcpy(&preset, bytes.data() + 8, 8);
+            sp->retain(preset);
+        }
+        event.type = type;
+        event.data = std::move(bytes);
         status(s, 0);
     });
     support.function(lib, "_MusicEventIteratorDeleteEvent", [state, iterator_of](CpuState& s, GuestMemory&) {

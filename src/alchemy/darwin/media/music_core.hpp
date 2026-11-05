@@ -25,6 +25,12 @@
 // - SMF writing: format 1 at the given resolution (480 when 0): the tempo
 //   track first, then each track. User, parameter, AU preset and extended
 //   note events have no SMF form and are left out.
+// - Editing (MusicTrackClear, Cut, CopyInsert, Merge, MoveEvents,
+//   MusicSequenceReverse) works on the events whose time is in [start, end);
+//   removed events go back to the caller (the binding releases their guest
+//   copies and retains). Moved events stop at time 0. Reversing maps each
+//   event to (sequence end - time - duration), the duration of notes being
+//   their length, over every track and the tempo track.
 
 #include <cstdint>
 #include <memory>
@@ -67,7 +73,21 @@ struct Track {
 
     void insert(std::shared_ptr<Event> event);
     [[nodiscard]] double end() const;              // the length property, or the end of the last event
+    [[nodiscard]] double content_end() const;      // the end of the last event
+
+    // Removes the events in [start, end); Cut also moves the later ones back by end - start.
+    std::vector<std::shared_ptr<Event>> clear(double start, double end);
+    std::vector<std::shared_ptr<Event>> cut(double start, double end);
+    // Copies of the events in [start, end), their times relative to start (no guest copies).
+    [[nodiscard]] std::vector<std::shared_ptr<Event>> copy_range(double start, double end) const;
+    // Adds `copies` at `at`; with `room` > 0 the events at or after `at` first move later by it (CopyInsert).
+    void insert_at(const std::vector<std::shared_ptr<Event>>& copies, double at, double room);
+    // Moves the events in [start, end) by `by` (not before 0).
+    void move(double start, double end, double by);
 };
+
+// The length of an event (notes: their duration; others 0).
+[[nodiscard]] double event_duration(const Event& event);
 
 struct TimeSignature { double beat{}; std::uint32_t numerator{4}, denominator{4}; };
 
@@ -90,6 +110,8 @@ public:
     // Replaces the content with a Standard MIDI File; false when malformed.
     bool load_smf(std::span<const std::uint8_t> bytes, std::uint32_t flags, std::string& why);
     [[nodiscard]] std::vector<std::uint8_t> write_smf(std::int16_t resolution) const;
+    // MusicSequenceReverse.
+    void reverse();
 
 private:
     struct Segment { double beat, seconds, bpm; };

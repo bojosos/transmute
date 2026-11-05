@@ -99,19 +99,90 @@ void Track::insert(std::shared_ptr<Event> event) {
     events.insert(at, std::move(event));
 }
 
-double Track::end() const {
-    if (length_set) return length;
+double event_duration(const Event& e) {
+    if (e.type == EventType::midi_note) return get_float(e.data, 4);
+    if (e.type == EventType::extended_note) return get_float(e.data, 8);
+    return 0;
+}
+
+double Track::end() const { return length_set ? length : content_end(); }
+
+double Track::content_end() const {
     double last = 0;
-    for (const auto& e : events) {
-        double end = e->time;
-        if (e->type == EventType::midi_note) end += get_float(e->data, 4);
-        else if (e->type == EventType::extended_note) end += get_float(e->data, 8);
-        last = std::max(last, end);
-    }
+    for (const auto& e : events) last = std::max(last, e->time + event_duration(*e));
     return last;
 }
 
+std::vector<std::shared_ptr<Event>> Track::clear(double start, double end) {
+    std::vector<std::shared_ptr<Event>> removed;
+    std::erase_if(events, [&](const std::shared_ptr<Event>& e) {
+        if (e->time < start || e->time >= end) return false;
+        removed.push_back(e);
+        return true;
+    });
+    return removed;
+}
+
+std::vector<std::shared_ptr<Event>> Track::cut(double start, double end) {
+    auto removed = clear(start, end);
+    for (auto& e : events)
+        if (e->time >= end) e->time -= end - start;
+    return removed;
+}
+
+std::vector<std::shared_ptr<Event>> Track::copy_range(double start, double end) const {
+    std::vector<std::shared_ptr<Event>> copies;
+    for (const auto& e : events)
+        if (e->time >= start && e->time < end) {
+            auto copy = std::make_shared<Event>();
+            copy->time = e->time - start;
+            copy->type = e->type;
+            copy->data = e->data;
+            copies.push_back(std::move(copy));
+        }
+    return copies;
+}
+
+void Track::insert_at(const std::vector<std::shared_ptr<Event>>& copies, double at, double room) {
+    if (room > 0)
+        for (auto& e : events)
+            if (e->time >= at) e->time += room;
+    for (const auto& copy : copies) {
+        copy->time += at;
+        insert(copy);
+    }
+}
+
+void Track::move(double start, double end, double by) {
+    std::vector<std::shared_ptr<Event>> moving;
+    std::erase_if(events, [&](const std::shared_ptr<Event>& e) {
+        if (e->time < start || e->time >= end) return false;
+        moving.push_back(e);
+        return true;
+    });
+    for (auto& e : moving) {
+        e->time = std::max(0.0, e->time + by);
+        insert(e);
+    }
+}
+
 Sequence::Sequence() : tempo(std::make_shared<Track>()) {}
+
+void Sequence::reverse() {
+    double length = tempo->content_end();
+    for (const auto& t : tracks) length = std::max(length, t->content_end());
+    const auto flip = [length](Track& t) {
+        auto events = std::move(t.events);
+        t.events.clear();
+        // Back to front, so events at the same time keep a mirrored order.
+        for (auto it = events.rbegin(); it != events.rend(); ++it) {
+            (*it)->time = std::max(0.0, length - (*it)->time - event_duration(**it));
+            t.insert(*it);
+        }
+    };
+    flip(*tempo);
+    for (const auto& t : tracks) flip(*t);
+}
 
 std::vector<Sequence::Segment> Sequence::tempo_map() const {
     std::vector<Segment> map{{0, 0, 120}};

@@ -383,6 +383,56 @@ void music_tests() {
     // Insertion order and tempo-less defaults.
     music::Sequence empty;
     require(empty.seconds_for_beats(4) == 2.0 && empty.to_bar_beat(4, 0).bar == 2, "120 BPM, 4/4 by default");
+
+    // Editing: tracks of control changes whose value is twice their time.
+    const auto make = [](std::initializer_list<double> at) {
+        auto t = std::make_shared<music::Track>();
+        for (const auto time : at) {
+            auto e = std::make_shared<music::Event>();
+            e->time = time;
+            e->type = music::EventType::midi_channel;
+            e->data = music::channel_payload(0xb0, static_cast<std::uint8_t>(time * 2), 0);
+            t->insert(std::move(e));
+        }
+        return t;
+    };
+    const auto times = [](const music::Track& t) {
+        std::vector<double> out;
+        for (const auto& e : t.events) out.push_back(e->time);
+        return out;
+    };
+    auto edited = make({0, 1, 2, 3});
+    require(edited->clear(1, 2).size() == 1 && (times(*edited) == std::vector<double>{0, 2, 3}), "clear [1, 2)");
+    edited = make({0, 1, 2, 3});
+    require(edited->cut(1, 2).size() == 1 && (times(*edited) == std::vector<double>{0, 1, 2}), "cut moves the later events back");
+    const auto source = make({0, 1, 2, 3});
+    auto destination = make({0, 1, 2});
+    destination->insert_at(source->copy_range(1, 3), 1, 2);
+    require((times(*destination) == std::vector<double>{0, 1, 2, 3, 4}) && destination->events[1]->data[1] == 2 &&
+            destination->events[3]->data[1] == 2 && source->events.size() == 4, "copy-insert makes room");
+    destination = make({0, 1});
+    destination->insert_at(source->copy_range(0, 2), 0.5, 0);
+    require((times(*destination) == std::vector<double>{0, 0.5, 1, 1.5}), "merge");
+    edited = make({0, 1, 2, 3});
+    edited->move(2, 4, -1.5);
+    require((times(*edited) == std::vector<double>{0, 0.5, 1, 1.5}), "move events earlier");
+    edited->move(0, 1, -5);
+    require(edited->events.front()->time == 0, "not before 0");
+    // Reverse: a 1-beat note at 0 and a control at 3 in a 3-beat sequence.
+    music::Sequence backwards;
+    auto t = std::make_shared<music::Track>();
+    auto n = std::make_shared<music::Event>();
+    n->type = music::EventType::midi_note;
+    n->data = music::note_payload(0, 60, 100, 0, 1.0f);
+    t->insert(n);
+    auto c = std::make_shared<music::Event>();
+    c->time = 3;
+    c->type = music::EventType::midi_channel;
+    c->data = music::channel_payload(0xb0, 7, 1);
+    t->insert(c);
+    backwards.tracks.push_back(t);
+    backwards.reverse();
+    require(t->events[0]->type == music::EventType::midi_channel && t->events[0]->time == 0 && t->events[1]->time == 2, "reverse");
 }
 
 // ---- AudioFile / ExtAudioFile core -------------------------------------------------------------
