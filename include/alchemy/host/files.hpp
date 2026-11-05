@@ -93,6 +93,9 @@ struct Identity {
     std::array<std::uint8_t, 16> id{};
 };
 [[nodiscard]] Result<Identity> identity(Handle file);
+// The path of the file `inode` (Metadata::inode) on the mounted volume `device` (Metadata::device), whatever
+// its name now (fsgetpath). not_found when no mounted volume has that number or it has no such file.
+[[nodiscard]] Result<std::string> path_of(std::uint64_t device, std::uint64_t inode);
 // Byte-range locks on the host file (flock emulation). lock never waits: a
 // conflicting holder makes it fail with Error::would_block.
 [[nodiscard]] Status lock(Handle file, std::uint64_t offset, std::uint64_t length, bool exclusive);

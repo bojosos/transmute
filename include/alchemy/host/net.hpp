@@ -77,6 +77,7 @@ struct Interface {
     std::vector<Assigned> addresses;       // unicast IPv4 and IPv6 addresses
     std::uint32_t ipv6_index{};            // the IPv6 interface index (best_interface for an IPv6 destination)
     std::vector<Address> gateways;         // default gateways, port 0
+    std::vector<Address> groups;           // the multicast groups joined on it (getifmaddrs), port 0
 };
 [[nodiscard]] Result<std::vector<Interface>> interfaces();
 

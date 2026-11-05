@@ -516,6 +516,45 @@ Result<Metadata> metadata(std::string_view path, bool follow) {
 
 Result<Metadata> metadata(Handle file) { return describe(win32::native(file), false); }
 
+Result<std::string> path_of(std::uint64_t device, std::uint64_t inode) {
+    // The drive whose volume serial number is `device`, then the file by its 64-bit file index there.
+    const auto drives = GetLogicalDrives();
+    for (wchar_t letter = L'A'; letter <= L'Z'; ++letter) {
+        if (!(drives & (1UL << (letter - L'A')))) continue;
+        const std::wstring root{letter, L':', L'\\'};
+        DWORD serial{};
+        if (!GetVolumeInformationW(root.c_str(), nullptr, 0, &serial, nullptr, nullptr, nullptr, 0) || serial != device) continue;
+        const auto volume = CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (volume == INVALID_HANDLE_VALUE) return win32::last_error();
+        FILE_ID_DESCRIPTOR id{};
+        id.dwSize = sizeof(id);
+        id.Type = FileIdType;
+        id.FileId.QuadPart = static_cast<LONGLONG>(inode);
+        const auto file = OpenFileById(volume, &id, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, FILE_FLAG_BACKUP_SEMANTICS);
+        CloseHandle(volume);
+        if (file == INVALID_HANDLE_VALUE) {
+            const auto error = GetLastError();
+            return error == ERROR_INVALID_PARAMETER ? Error::not_found : win32::error(error);
+        }
+        std::wstring path(1024, L'\0');
+        auto length = GetFinalPathNameByHandleW(file, path.data(), static_cast<DWORD>(path.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (length >= path.size()) {
+            path.resize(length + 1);
+            length = GetFinalPathNameByHandleW(file, path.data(), static_cast<DWORD>(path.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        }
+        const auto failure = length ? 0 : GetLastError();
+        CloseHandle(file);
+        if (!length || length >= path.size()) return failure ? win32::error(failure) : Error::io;
+        path.resize(length);
+        if (path.starts_with(L"\\\\?\\UNC\\")) path = L"\\\\" + path.substr(8);
+        else if (path.starts_with(L"\\\\?\\")) path = path.substr(4);
+        return win32::narrow(path);
+    }
+    return Error::not_found;
+}
+
 Result<Identity> identity(Handle file) {
     FILE_ID_INFO information{};
     if (!GetFileInformationByHandleEx(win32::native(file), FileIdInfo, &information, sizeof(information))) return win32::last_error();

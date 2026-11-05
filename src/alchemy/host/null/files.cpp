@@ -38,6 +38,7 @@ Result<std::size_t> pipe_available(Handle) { return Error::unsupported; }
 Result<Metadata> metadata(std::string_view, bool) { return Error::unsupported; }
 Result<Metadata> metadata(Handle) { return Error::unsupported; }
 Result<Identity> identity(Handle) { return Error::unsupported; }
+Result<std::string> path_of(std::uint64_t, std::uint64_t) { return Error::unsupported; }
 Status lock(Handle, std::uint64_t, std::uint64_t, bool) { return Error::unsupported; }
 Status unlock(Handle, std::uint64_t, std::uint64_t) { return Error::unsupported; }
 Error error(const std::error_code& code) noexcept { return code ? Error::other : Error::none; }

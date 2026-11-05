@@ -235,6 +235,13 @@ void file_table(const std::string& directory) {
         "metadata of an owner-only file");
     const auto first = files::identity(file.get());
     require(first && first->id != std::array<std::uint8_t, 16>{}, "identity");
+    // path_of: the file by its volume and inode (its long, normalized path: the same file).
+    const auto found_path = files::path_of(by_path->device, by_path->inode);
+    const auto found = found_path ? files::metadata(*found_path) : host::Result<files::Metadata>(host::Error::not_found);
+    require(found && found->inode == by_path->inode && found->device == by_path->device, "path_of finds the file");
+    require(files::path_of(by_path->device, 0x7fff'ffff'ffffULL).error() == host::Error::not_found &&
+                files::path_of(0x12345678U ^ by_path->device ^ 1U, by_path->inode).error() == host::Error::not_found,
+        "path_of: no such file, no such volume");
     require(!files::is_character_device(file.get()), "a file is not a character device");
     // locks: a second handle of the same file conflicts
     auto other = files::open(path, files::Access::read, files::Create::open_existing);
@@ -520,6 +527,7 @@ void null_backend() {
                 host::files::watch_directory("x").error() == host::Error::unsupported &&
                 host::files::watch_tree("x").error() == host::Error::unsupported &&
                 host::files::volume_roots().error() == host::Error::unsupported &&
+                host::files::path_of(1, 1).error() == host::Error::unsupported &&
                 host::files::create_temporary("x").error() == host::Error::unsupported,
         "null file queries fail");
     require(host::sync::create_mutex("x").error() == host::Error::unsupported &&

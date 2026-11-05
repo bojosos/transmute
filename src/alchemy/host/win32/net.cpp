@@ -110,7 +110,7 @@ Result<std::uint32_t> best_interface(const Address& destination) {
 }
 
 Result<std::vector<Interface>> interfaces() {
-    constexpr ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS;
+    constexpr ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS;
     ULONG size = 32 * 1024;
     std::vector<std::uint8_t> buffer;
     ULONG status = ERROR_BUFFER_OVERFLOW;
@@ -162,6 +162,8 @@ Result<std::vector<Interface>> interfaces() {
         entry.ipv6_index = adapter->Ipv6IfIndex;
         for (auto* gateway = adapter->FirstGatewayAddress; gateway; gateway = gateway->Next)
             if (const auto address = address_of(gateway->Address.lpSockaddr)) entry.gateways.push_back(*address);
+        for (auto* group = adapter->FirstMulticastAddress; group; group = group->Next)
+            if (const auto address = address_of(group->Address.lpSockaddr)) entry.groups.push_back(*address);
         result.push_back(std::move(entry));
     }
     return result;
