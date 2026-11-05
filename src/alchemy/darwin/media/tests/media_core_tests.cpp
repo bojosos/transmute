@@ -12,6 +12,7 @@
 #include "alchemy/darwin/media/music_core.hpp"
 #include "alchemy/darwin/media/audio_file_core.hpp"
 #include "alchemy/darwin/media/audio_file_stream_core.hpp"
+#include "alchemy/darwin/media/audio_source.hpp"
 #include "alchemy/darwin/media/resampler.hpp"
 #include <algorithm>
 #include <filesystem>
@@ -1121,6 +1122,64 @@ void audio_file_stream_tests() {
     }
 }
 
+// Audio sources: a sequence of segments of fake sources (placement, gaps, channel mapping, overlap,
+// random access, and a source at another rate).
+void audio_source_tests() {
+    namespace as = cm::audio_source;
+    struct Fake final : as::Source {
+        double source_rate{};
+        std::uint32_t source_channels{};
+        std::uint64_t length{};
+        std::function<double(std::uint64_t, std::uint32_t)> value;
+        double rate() const override { return source_rate; }
+        std::uint32_t channels() const override { return source_channels; }
+        std::uint64_t frames() const override { return length; }
+        std::size_t read(std::uint64_t start, std::size_t count, std::vector<double>& out) override {
+            if (start >= length) return 0;
+            count = static_cast<std::size_t>(std::min<std::uint64_t>(count, length - start));
+            for (std::size_t f = 0; f < count; ++f)
+                for (std::uint32_t c = 0; c < source_channels; ++c) out.push_back(value(start + f, c));
+            return count;
+        }
+    };
+    const auto fake = [](double rate, std::uint32_t channels, std::uint64_t length, std::function<double(std::uint64_t, std::uint32_t)> value) {
+        auto f = std::make_shared<Fake>();
+        f->source_rate = rate;
+        f->source_channels = channels;
+        f->length = length;
+        f->value = std::move(value);
+        return f;
+    };
+    const auto ramp = fake(100, 1, 50, [](std::uint64_t f, std::uint32_t) { return static_cast<double>(f) / 100; });
+    const auto pair = fake(100, 2, 50, [](std::uint64_t, std::uint32_t c) { return c == 0 ? 0.5 : -0.5; });
+    as::Sequence sequence(100, 2, {{ramp, 5, 10, 20}, {pair, 0, 40, 10}, {nullptr, 0, 30, 5}});
+    require(sequence.frames() == 50 && sequence.channels() == 2 && sequence.rate() == 100, "a sequence's length is its last segment's end");
+    std::vector<double> all;
+    require(sequence.read(0, 100, all) == 50 && all.size() == 100, "reads stop at the end");
+    const auto at = [&](std::size_t frame, std::uint32_t channel) { return all[frame * 2 + channel]; };
+    require(at(0, 0) == 0 && at(9, 1) == 0, "silence before the first segment");
+    require(at(10, 0) == 0.05 && at(10, 1) == 0.05 && at(29, 0) == 0.24, "the mono segment from its source frame 5, on both channels");
+    require(at(30, 0) == 0 && at(39, 1) == 0, "silence in the gap and the empty segment");
+    require(at(40, 0) == 0.5 && at(49, 1) == -0.5, "the stereo segment");
+    std::vector<double> part;
+    require(sequence.read(15, 5, part) == 5 && std::equal(part.begin(), part.end(), all.begin() + 30), "random access reads the same frames");
+    // Overlap adds; stereo into a mono sequence averages.
+    as::Sequence mono(100, 1, {{pair, 0, 0, 10}, {ramp, 0, 5, 10}});
+    std::vector<double> mixed;
+    require(mono.read(0, 15, mixed) == 15 && mixed[0] == 0 && std::fabs(mixed[7] - 0.02) < 1e-12 && std::fabs(mixed[12] - 0.07) < 1e-12,
+            "stereo averaged to mono, overlapping segments add");
+    // A source at half the rate: a constant comes out as the same constant (past the filter's edges), read in
+    // pieces that continue the stream or all at once.
+    const auto slow = fake(50, 1, 100, [](std::uint64_t, std::uint32_t) { return 0.25; });
+    as::Sequence pieces(100, 1, {{slow, 0, 0, 200}}), whole(100, 1, {{slow, 0, 0, 200}});
+    std::vector<double> a, b;
+    for (std::uint64_t start = 0; start < 200; start += 30) static_cast<void>(pieces.read(start, 30, a));
+    static_cast<void>(whole.read(0, 200, b));
+    require(a.size() == 200 && b.size() == 200, "resampled reads");
+    for (std::size_t i = 60; i < 140; ++i)
+        require(std::fabs(a[i] - 0.25) < 0.01 && std::fabs(a[i] - b[i]) < 1e-6, "resampled constant at " + std::to_string(i) + ": " + std::to_string(a[i]));
+}
+
 int main() {
     try {
         resampler_tests();
@@ -1135,6 +1194,7 @@ int main() {
         ump_tests();
         container_tests();
         audio_file_stream_tests();
+        audio_source_tests();
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

@@ -1,4 +1,5 @@
 #include "alchemy/darwin/media/audio_file.hpp"
+#include "alchemy/darwin/media/audio_source.hpp"
 #include "alchemy/darwin/media/media_codecs.hpp"
 #include "alchemy/darwin/media/media_container.hpp"
 #include "alchemy/darwin/media/pixel_convert.hpp"
@@ -113,6 +114,28 @@ struct ReaderState final : ObjectPayload {
     Address error{};                   // retained NSError
     Time start{time_zero}, duration{time_positive_infinity};
 };
+// An asset reader output's audio from its asset's file: exactly what read_audio_frames reads.
+class FileSource final : public audio_source::Source {
+public:
+    FileSource(Support& support, GuestAudio audio) : support_(support), audio_(std::move(audio)) {}
+    [[nodiscard]] double rate() const override { return audio_.container.format.rate; }
+    [[nodiscard]] std::uint32_t channels() const override { return audio_.container.format.channels; }
+    [[nodiscard]] std::uint64_t frames() const override { return audio_.frames(); }
+    std::size_t read(std::uint64_t start, std::size_t count, std::vector<double>& out) override {
+        return closed_ ? 0 : read_audio_frames(support_, audio_, start, count, out);
+    }
+    void close() override {
+        if (closed_) return;
+        closed_ = true;
+        close_guest_audio(support_, audio_);
+    }
+
+private:
+    Support& support_;
+    GuestAudio audio_;
+    bool closed_{};
+};
+
 struct OutputState final : ObjectPayload {
     std::vector<Address> tracks;       // retained
     Address settings{};                // retained dictionary or 0
@@ -121,7 +144,7 @@ struct OutputState final : ObjectPayload {
     Address audio_mix{};               // retained
     audio_file::Pcm client;
     bool client_set{};
-    GuestAudio file;
+    std::shared_ptr<audio_source::Source> source;   // the decoded audio the output reads
     std::uint64_t position{}, end{};
     Address format_description{};      // retained, for `client`
     bool finished{};
@@ -390,7 +413,7 @@ struct Av {
         r->status = 2;   // AVAssetReaderStatusCompleted
     }
     void close_output(OutputState& o) {
-        close_guest_audio(support, o.file);
+        if (o.source) std::exchange(o.source, nullptr)->close();
         if (o.format_description) { support.release(o.format_description); o.format_description = 0; }
         close_guest_fd(support, std::exchange(o.fd, -1));
         if (o.session) {
@@ -731,7 +754,6 @@ struct Av {
         if (o->finished || !o->reader) return 0;
         auto r = state<ReaderState>(o->reader);
         if (r->status != 1) return 0;
-        const auto& asset = *state<AssetState>(r->asset);
         const auto frames = std::min<std::uint64_t>(o->end - std::min(o->end, o->position), 8192);
         if (!frames) {
             o->finished = true;
@@ -739,9 +761,8 @@ struct Av {
             finish_reader_if_done(o->reader);
             return 0;
         }
-        const auto& source = asset.container.format;
         std::vector<double> samples;
-        const auto got = read_audio_frames(support, o->file, o->position, static_cast<std::size_t>(frames), samples);
+        const auto got = o->source ? o->source->read(o->position, static_cast<std::size_t>(frames), samples) : 0;
         if (!got) {   // the file ended early
             o->finished = true;
             close_output(*o);
@@ -753,7 +774,7 @@ struct Av {
         std::vector<std::uint8_t> data(static_cast<std::size_t>(plane * planes));
         std::vector<std::span<std::uint8_t>> spans;
         for (std::uint32_t i = 0; i < planes; ++i) spans.emplace_back(data.data() + i * plane, static_cast<std::size_t>(plane));
-        audio_file::encode(o->client, samples, source.channels, got, spans);
+        audio_file::encode(o->client, samples, o->source->channels(), got, spans);
         auto& m = support.memory();
         // CMBlockBufferCreateWithMemoryBlock(NULL, NULL, length, NULL, NULL, 0, length, kCMBlockBufferAssureMemoryNowFlag, &out)
         const auto block_out = support.process.allocate_guest(8, 8);
@@ -1082,8 +1103,10 @@ void install_av_foundation(Support& support) {
                 continue;
             }
             av->client_format(*os, asset);
-            if (const auto result = open_guest_audio(av->support, av->support.cf.url_path(av->state<AssetState>(r->asset)->url), os->file))
+            GuestAudio audio;
+            if (const auto result = open_guest_audio(av->support, av->support.cf.url_path(av->state<AssetState>(r->asset)->url), audio))
                 return failed(av->bridge->os_status_error(result, "The media file could not be opened again for reading"));
+            os->source = std::make_shared<FileSource>(av->support, std::move(audio));
             os->position = first;
             os->end = last;
             os->finished = false;
