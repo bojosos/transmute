@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
+#include "alchemy/darwin/libsystem/net/interface_names.hpp"
 #include "alchemy/host/net.hpp"
 
 #include <algorithm>
@@ -28,10 +29,12 @@ std::vector<Interface> host_interfaces() {
     std::vector<Interface> result;
     const auto host = host::net::interfaces();
     if (!host) return result;
-    unsigned ethernet = 0, tunnel = 0;
+    const auto names = libsystem::darwin_interface_names(*host);
     std::vector<Interface> up, down;
-    for (const auto& adapter : *host) {
+    for (std::size_t position = 0; position < host->size(); ++position) {
+        const auto& adapter = (*host)[position];
         Interface entry;
+        entry.name = names[position];
         entry.index = adapter.index;
         entry.up = adapter.up;
         entry.loopback = adapter.kind == host::net::InterfaceKind::loopback;
@@ -55,14 +58,8 @@ std::vector<Interface> host_interfaces() {
         }
         (entry.up ? up : down).push_back(std::move(entry));
     }
-    for (auto* list : {&up, &down}) {
-        for (auto& entry : *list) {
-            if (entry.loopback) entry.name = "lo0";
-            else if (entry.point_to_point) entry.name = "utun" + std::to_string(tunnel++);
-            else entry.name = "en" + std::to_string(ethernet++);
-            result.push_back(std::move(entry));
-        }
-    }
+    for (auto* list : {&up, &down})
+        for (auto& entry : *list) result.push_back(std::move(entry));
     // Darwin lists lo0 first.
     std::stable_partition(result.begin(), result.end(), [](const Interface& entry) { return entry.loopback; });
     return result;

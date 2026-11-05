@@ -1,6 +1,7 @@
 // Independently authored Darwin socket ABI adapters. Guest descriptors share
 // the file table; native sockets never escape into guest structures.
 #include "alchemy/darwin/libsystem/services_impl.hpp"
+#include "alchemy/darwin/libsystem/net/interface_names.hpp"
 
 namespace alchemy {
 namespace {
@@ -194,13 +195,12 @@ struct NetworkInterface { std::uint32_t index; std::string name; };
 std::vector<NetworkInterface> network_interfaces() {
     const auto interfaces = net::interfaces();
     if (!interfaces) throw ServiceError{file_failure(interfaces.error())};
+    // The host's indices under the names getifaddrs gives them (net/interface_names.hpp; host adapter names need
+    // not fit IF_NAMESIZE).
+    const auto names = libsystem::darwin_interface_names(*interfaces);
     std::vector<NetworkInterface> result;
-    for (const auto& entry : *interfaces) {
-        if (!entry.index) continue;
-        // Darwin names must fit IF_NAMESIZE (16); host adapter names need not.
-        // These are explicit Alchemy names for the real host indices.
-        result.push_back({entry.index, std::string(entry.kind == net::InterfaceKind::loopback ? "lo" : "if") + std::to_string(entry.index)});
-    }
+    for (std::size_t position = 0; position < interfaces->size(); ++position)
+        if ((*interfaces)[position].index) result.push_back({(*interfaces)[position].index, names[position]});
     return result;
 }
 // The 32-bit value of an inet_aton dotted address (one to four parts, each

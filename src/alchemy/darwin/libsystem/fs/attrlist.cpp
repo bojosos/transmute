@@ -28,8 +28,7 @@
 //
 // setattrlist sets, in the same order and packing (without the length): ATTR_CMN_CRTIME (the host creation time),
 // MODTIME and ACCTIME (utimensat / futimens), FNDRINFO (the com.apple.FinderInfo extended attribute), OWNERID /
-// GRPID (chown), ACCESSMASK (chmod) and FLAGS (only the flags the object already has: BSD flags are not stored
-// here). Any other attribute cannot be set: EINVAL.
+// GRPID (chown), ACCESSMASK (chmod) and FLAGS (chflags: UF_HIDDEN). Any other attribute cannot be set: EINVAL.
 namespace alchemy::export_fill {
 namespace {
 
@@ -372,11 +371,7 @@ public:
             if ((owner && *owner != le32(status, 16)) || (group && *group != le32(status, 20))) { free(guest_path); throw Errno{eperm}; }
         }
         if (mode) check(p_.call(libsystem_library, follow ? "_chmod" : "_lchmod", {guest_path, *mode & 07777}));
-        if (flags) {
-            // BSD flags are not stored here: only the flags the object has (none) can be set.
-            const auto status = stat({path, std::nullopt, follow});
-            if (*flags != le32(status, 116)) { free(guest_path); throw Errno{45}; }   // ENOTSUP
-        }
+        if (flags) check(p_.call(libsystem_library, follow ? "_chflags" : "_lchflags", {guest_path, *flags}));
         free(guest_path);
         return 0;
     }

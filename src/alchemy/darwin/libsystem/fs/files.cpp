@@ -227,6 +227,26 @@ void DarwinServices::Impl::install_extra() {
     // Darwin volume that stores no Unix permissions (msdosfs's setattr), any mode
     // is accepted: the owner write bit sets or clears read-only, and group, other,
     // execute, set-id and sticky bits are ignored.
+    // The chflags family: the BSD flags a Windows volume can keep. UF_HIDDEN (0x8000) is the host's hidden
+    // attribute, which stat reports in st_flags; any other flag is ENOTSUP, as on a Darwin volume that cannot
+    // store it. chflags follows a final symbolic link, lchflags does not.
+    for (const auto& [chflags_name, follow] : std::array<std::pair<const char*, bool>, 2>{{{"_chflags", true}, {"_lchflags", false}}})
+        install(chflags_name, [this, follow = follow](auto& s, auto& m) {
+            const auto name = filesystem_path(m, s.x[0]);
+            const auto flags = static_cast<std::uint32_t>(s.x[1]);
+            if (flags & ~0x8000U) throw ServiceError{45};
+            if (const auto set = host::files::set_hidden(path_text(name), flags != 0, follow); !set) throw ServiceError{file_failure(set.error())};
+            return std::uint64_t{0};
+        });
+    install("_fchflags", [this](auto& s, auto&) {
+        const auto record = file(static_cast<int>(s.x[0]));
+        if (record->random_device) throw ServiceError{eperm};
+        if (record->socket || record->queue) throw ServiceError{45};
+        const auto flags = static_cast<std::uint32_t>(s.x[1]);
+        if (flags & ~0x8000U) throw ServiceError{45};
+        if (const auto set = host::files::set_hidden(path_text(record->path), flags != 0); !set) throw ServiceError{file_failure(set.error())};
+        return std::uint64_t{0};
+    });
     install("_fchmod", [this](auto& s, auto&) {
         const auto record = file(static_cast<int>(s.x[0]));
         if (record->random_device) throw ServiceError{eperm};

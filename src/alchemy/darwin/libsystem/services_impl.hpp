@@ -648,7 +648,7 @@ inline std::uint64_t file_size(host::Handle file, std::uint32_t (*failure)(host:
 struct HostMetadata {
     std::uint64_t inode{}, size{}, allocated{}, links{};
     std::uint32_t device{};
-    bool directory{}, symlink{}, private_owner{}, read_only{};
+    bool directory{}, symlink{}, private_owner{}, read_only{}, hidden{};
     std::array<std::array<std::uint64_t, 2>, 4> times{};   // access, modification, change, birth: {seconds, nanoseconds}
 };
 // Unix-epoch nanoseconds as a Darwin timespec (seconds rounded down).
@@ -664,6 +664,7 @@ inline HostMetadata host_metadata(const host::Result<host::files::Metadata>& fou
     result.inode = value.inode; result.size = value.size; result.allocated = value.allocated; result.links = value.links;
     result.device = static_cast<std::uint32_t>(value.device);
     result.directory = value.directory; result.symlink = value.symlink; result.private_owner = value.owner_only; result.read_only = value.read_only;
+    result.hidden = value.hidden;
     result.times = {darwin_time(value.accessed_ns), darwin_time(value.modified_ns), darwin_time(value.changed_ns), darwin_time(value.created_ns)};
     return result;
 }
@@ -2449,8 +2450,9 @@ public:
         const auto links = static_cast<std::uint16_t>(std::min<std::uint64_t>(details.links, UINT16_MAX));
         memory.write8(result + 6, static_cast<std::uint8_t>(links));
         memory.write8(result + 7, static_cast<std::uint8_t>(links >> 8));
-        // Darwin uid/gid and BSD flags have no established host mapping.
+        // Darwin uid/gid have no established host mapping. st_flags: UF_HIDDEN is the host's hidden attribute (chflags).
         memory.write32(result + 16, 1000); memory.write32(result + 20, 1000);
+        if (details.hidden) memory.write32(result + 116, 0x8000);
         memory.write32(result + 24, drive);
         for (std::size_t index = 0; index < details.times.size(); ++index) {
             memory.write64(result + 32 + index * 16, details.times[index][0]);

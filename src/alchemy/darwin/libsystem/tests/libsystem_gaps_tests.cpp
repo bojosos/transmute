@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <set>
 #include <thread>
 #include <tuple>
 
@@ -1082,13 +1083,55 @@ void test_b18(Fixture& f) {
     require(f.sys("_getattrlist", {f.text(path), list, buffer, 1024, 0}) == 0 && f.engine.read32(buffer) == 36 &&
             memory.read8(buffer + 4) == 1 && memory.read8(buffer + 35) == 32, "FNDRINFO round trip");
     set_list(0x40000, 0, 0, 0);
-    f.engine.write32(buffer, 0);
-    require(f.sys("_setattrlist", {f.text(path), list, buffer, 4, 0}) == 0, "setting the flags it has");
     f.engine.write32(buffer, 0x8000);
+    require(f.sys("_setattrlist", {f.text(path), list, buffer, 4, 0}) == 0 && f.sys("_stat", {f.text(path), status}) == 0 &&
+            f.engine.read32(status + 116) == 0x8000, "FLAGS sets UF_HIDDEN");
+    f.engine.write32(buffer, 0x2);
     require(f.sys("_setattrlist", {f.text(path), list, buffer, 4, 0}) == UINT64_MAX && errno_value() == 45, "other flags are ENOTSUP");
+    f.engine.write32(buffer, 0);
+    require(f.sys("_setattrlist", {f.text(path), list, buffer, 4, 0}) == 0, "clearing the flags");
     set_list(0x800, 0, 0, 0);
     require(f.sys("_setattrlist", {f.text(path), list, buffer, 16, 0}) == UINT64_MAX && errno_value() == 22, "CHGTIME cannot be set");
     std::filesystem::remove_all(directory, ignored);
+}
+
+// B19: chflags (fs/files.cpp) and the network interface names (net/interface_names.hpp).
+void test_b19(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto host_path = std::filesystem::temp_directory_path() / "alchemy-b19-flags";
+    std::ofstream(host_path) << "flags";
+    const auto path = alchemy::guest_path_string(host_path);
+    const auto status = f.process.allocate_guest(144);
+    require(f.sys("_chflags", {f.text(path), 0x8000}) == 0 && f.sys("_stat", {f.text(path), status}) == 0 &&
+            f.engine.read32(status + 116) == 0x8000, "chflags UF_HIDDEN shows in st_flags");
+    require(f.sys("_chflags", {f.text(path), 0x8002}) == UINT64_MAX && errno_value() == 45, "a flag the volume cannot keep is ENOTSUP");
+    const auto fd = f.sys("_open", {f.text(path), 0});
+    require(fd < 1024 && f.sys("_fchflags", {fd, 0}) == 0 && f.sys("_fstat", {fd, status}) == 0 && f.engine.read32(status + 116) == 0,
+            "fchflags clears it");
+    f.sys("_close", {fd});
+    require(f.sys("_lchflags", {f.text(path), 0}) == 0, "lchflags on a file");
+    std::error_code ignored;
+    std::filesystem::remove(host_path, ignored);
+    // if_nameindex, if_nametoindex and if_indextoname use getifaddrs' names (lo0, en<n>, utun<n>).
+    const auto list = f.sys("_if_nameindex");
+    require(list != 0, "if_nameindex");
+    const auto addresses = f.process.allocate_guest(8);
+    require(f.sys("_getifaddrs", {addresses}) == 0, "getifaddrs");
+    std::set<std::string> listed;
+    for (auto entry = f.engine.read64(addresses); entry; entry = f.engine.read64(entry)) listed.insert(f.read(f.engine.read64(entry + 8)));
+    const auto name_buffer = f.process.allocate_guest(16);
+    bool loopback = false;
+    for (auto entry = list; f.engine.read32(entry); entry += 16) {
+        const auto index = f.engine.read32(entry);
+        const auto name = f.read(f.engine.read64(entry + 8));
+        loopback = loopback || name == "lo0";
+        require(listed.count(name) == 1, "if_nameindex name " + name + " is a getifaddrs name");
+        require(f.sys("_if_nametoindex", {f.text(name)}) == index && f.sys("_if_indextoname", {index, name_buffer}) == name_buffer &&
+                f.read(name_buffer) == name, "if_nametoindex and if_indextoname for " + name);
+    }
+    require(loopback, "lo0 is listed");
+    f.sys("_if_freenameindex", {list});
+    f.sys("_freeifaddrs", {f.engine.read64(addresses)});
 }
 
 // net/netdb_extra.cpp.
@@ -1464,6 +1507,7 @@ int main() {
         stage("b16"); test_b16(f);
         stage("b17"); test_b17(f);
         stage("b18"); test_b18(f);
+        stage("b19"); test_b19(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;
