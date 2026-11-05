@@ -33,14 +33,18 @@ alchemy_gui_register_tests(alchemy_darwin_coreservices_tests)
 
 # Moved from darwin/identities/: carbon_core.cpp (fp aliases, FSGetVolumeInfo;
 # its own installer-table row), launch_services.cpp (LaunchServices, Spotlight,
-# Time Machine, Component Manager, UTI queries; fill-only, kit/fwgaps) and
+# Time Machine, Component Manager, UTI queries; fill-only, kit/fwgaps),
+# file_manager.cpp (FSRef, FSFindFolder, LaunchServices item queries; fill-only,
+# kit/fwgaps) and
 # icon_refs.cpp (ReleaseIconRef; the support kit).
 list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/coreservices/carbon_core.cpp
     src/alchemy/darwin/coreservices/launch_services.cpp
+    src/alchemy/darwin/coreservices/file_manager.cpp
     src/alchemy/darwin/coreservices/icon_refs.cpp)
 alchemy_gui_add_framework_case(coreservices_launch_services src/alchemy/darwin/coreservices/tests/coreservices_cases_tests.cpp)
 alchemy_gui_add_framework_case(coreservices_carbon_core src/alchemy/darwin/coreservices/tests/coreservices_cases_tests.cpp)
+alchemy_gui_add_framework_case(coreservices_file_manager src/alchemy/darwin/coreservices/tests/coreservices_cases_tests.cpp)
 
 # Headless additions (both builds; darwin/headless_additions.hpp), moved from
 # darwin/identities/installer_frameworks.cpp:

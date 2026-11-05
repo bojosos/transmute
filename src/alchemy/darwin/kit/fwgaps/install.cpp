@@ -11,6 +11,7 @@ void install_fwgaps(InstallContext& context) {
     install_appkit_gaps(context);
     install_graphics_gaps(context);
     install_coreservices_launch_services(context);
+    install_coreservices_file_manager(context);
     install_security_cssm_and_tasks(context);
     install_securityinterface(context);
     install_systemconfiguration_errors_and_aliases(context);
