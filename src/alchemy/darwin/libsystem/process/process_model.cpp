@@ -1119,12 +1119,10 @@ void DarwinServices::Impl::install_process_services() {
     });
 
     // ---- signals to processes ----
-    // The calling thread receives a signal it sends to its own process:
-    // SIG_IGN and ignored-by-default signals do nothing, a handler runs now,
-    // the default action of a terminating signal ends the process.
-    const auto deliver_self = [this](std::uint64_t signal) -> std::uint64_t {
+    // A signal delivered on the calling thread: SIG_IGN and ignored-by-default signals do nothing, a handler runs
+    // now, the default action of a terminating signal ends the process.
+    const auto run_action = [this](std::uint64_t signal) -> std::uint64_t {
         if (!signal) return 0;
-        if (context.signal_observed) context.signal_observed(static_cast<int>(signal));
         SignalAction action;
         { std::lock_guard lock(mutex); action = signal_table()[static_cast<std::size_t>(signal)]; }
         if (action.handler == 1 && signal != 9 && signal != 17) return 0;
@@ -1193,6 +1191,59 @@ void DarwinServices::Impl::install_process_services() {
         if (child.killed_by && signal == 9) child.kill_certain = true;
         return 0;
     };
+    // Generation (sigprocmask(2), sigwait(2)): a signal for the calling thread (raise), for another thread of this
+    // process (pthread_kill, `other_thread`) or for the process (kill, the interval timer: `process_wide`) stays
+    // pending while it is blocked: in the thread it is for, or for the process in `mask_owner` (the calling thread,
+    // or the thread that armed the timer). SIG_IGN discards it. Not blocked, it is delivered now on the calling
+    // thread; a signal for another thread waits until that thread unblocks it, waits for signals (sigsuspend,
+    // pause, sigwait) or changes its mask; it does not interrupt the thread. SIGKILL and SIGSTOP cannot be blocked.
+    // Dispatch signal sources (signal_observed) see every signal generated.
+    const auto generate = [this, run_action](std::uint64_t signal, bool process_wide, std::optional<std::uint64_t> other_thread,
+                                             std::optional<std::uint64_t> mask_owner) -> std::uint64_t {
+        if (!signal) return 0;
+        if (context.signal_observed) context.signal_observed(static_cast<int>(signal));
+        const auto bit = 1U << (signal - 1);
+        const auto identity = context.current_thread()->identity;
+        {
+            std::lock_guard lock(mutex);
+            if (signal_table()[static_cast<std::size_t>(signal)].handler == 1 && signal != 9 && signal != 17) return 0;
+            if (other_thread && *other_thread != identity) {
+                thread_pending[*other_thread] |= bit;
+                signal_handled.notify_all();
+                return 0;
+            }
+            const auto owner = mask_owner.value_or(identity);
+            const bool blocked = signal != 9 && signal != 17 && (signal_masks[owner] & bit);
+            if (blocked) {
+                if (process_wide) process_pending |= bit;
+                else thread_pending[identity] |= bit;
+                signal_handled.notify_all();
+                return 0;
+            }
+        }
+        return run_action(signal);
+    };
+    // Runs the pending signals `mask` does not block on the calling thread, its own first, lowest number first.
+    const auto deliver_pending = [this, run_action](std::uint32_t mask) -> bool {
+        const auto identity = context.current_thread()->identity;
+        bool delivered = false;
+        for (;;) {
+            std::uint64_t signal = 0;
+            {
+                std::lock_guard lock(mutex);
+                auto& own = thread_pending[identity];
+                const auto ready = (own | process_pending) & ~mask;
+                if (!ready) return delivered;
+                const auto bit = ready & (~ready + 1);
+                if (own & bit) own &= ~bit; else process_pending &= ~bit;
+                signal = static_cast<std::uint64_t>(std::countr_zero(bit)) + 1;
+            }
+            static_cast<void>(run_action(signal));
+            delivered = true;
+        }
+    };
+    deliver_pending_signals = deliver_pending;
+    const auto deliver_self = [generate](std::uint64_t signal) -> std::uint64_t { return generate(signal, true, std::nullopt, std::nullopt); };
     const auto kill = [this, deliver_self, signal_child](std::int64_t pid, std::uint64_t signal) -> std::uint64_t {
         if (signal > 31) throw ServiceError{einval};
         if (pid > 0) {
@@ -1253,31 +1304,78 @@ void DarwinServices::Impl::install_process_services() {
         if (static_cast<std::int32_t>(s.x[0]) <= 1) throw ServiceError{einval};
         return kill(-static_cast<std::int64_t>(static_cast<std::int32_t>(s.x[0])), s.x[1]);
     });
-    install("_raise", [deliver_self](auto& s, auto&) {
+    install("_raise", [generate](auto& s, auto&) {
         if (s.x[0] == 0 || s.x[0] > 31) throw ServiceError{einval};
-        return deliver_self(s.x[0]);
+        return generate(s.x[0], false, std::nullopt, std::nullopt);
     });
     // sigsuspend(mask) / pause() / sigpause(signal): the thread's mask becomes `mask` (pause
-    // keeps it; sigpause unblocks `signal`) until a handler for a signal outside it has run
-    // (raise or kill from any thread of this process), then the old mask is back and the call
-    // fails with EINTR, as it always does. Alchemy delivers no asynchronous signals from
-    // outside the process (SIGCHLD, SIGALRM, terminal signals), so only those wake it.
-    const auto suspend = [this](std::optional<std::uint32_t> mask) -> std::uint64_t {
+    // keeps it; sigpause unblocks `signal`) until a signal outside it is delivered, then the old
+    // mask is back and the call fails with EINTR, as it always does. No signals come from outside
+    // the process (SIGCHLD, terminal signals); the interval timer's SIGALRM does.
+    // A pending signal the mask unblocks is delivered on this thread at once (and one that becomes pending later
+    // wakes it); a handler run on another thread for a signal outside the mask wakes it too.
+    const auto suspend = [this, deliver_pending](std::optional<std::uint32_t> mask) -> std::uint64_t {
         const auto identity = context.current_thread()->identity;
-        std::unique_lock lock(mutex);
-        auto& current = signal_masks[identity];
-        const auto previous = current;
-        const auto waiting = mask ? *mask & ~((1U << 8) | (1U << 16)) : previous;
-        current = waiting;
-        const auto seen = handled_signals;
-        while (true) {
-            if (handled_signals != seen && last_handled_signal && !(waiting & (1U << (last_handled_signal - 1)))) break;
-            if (context.requested_exit()) break;
-            signal_handled.wait_for(lock, std::chrono::milliseconds(50));
+        std::uint32_t previous, waiting;
+        {
+            std::lock_guard lock(mutex);
+            auto& current = signal_masks[identity];
+            previous = current;
+            waiting = mask ? *mask & ~((1U << 8) | (1U << 16)) : previous;
+            current = waiting;
         }
-        signal_masks[identity] = previous;
+        const auto restore = [this, identity, &previous] { std::lock_guard lock(mutex); signal_masks[identity] = previous; };
+        try {
+            for (;;) {
+                if (deliver_pending(waiting)) break;
+                std::unique_lock lock(mutex);
+                const auto seen = handled_signals;
+                bool woke = false;
+                while (!((thread_pending[identity] | process_pending) & ~waiting)) {
+                    if (handled_signals != seen && last_handled_signal && !(waiting & (1U << (last_handled_signal - 1)))) { woke = true; break; }
+                    if (context.requested_exit()) { woke = true; break; }
+                    signal_handled.wait_for(lock, std::chrono::milliseconds(50));
+                }
+                if (woke) break;
+            }
+        } catch (...) { restore(); throw; }
+        restore();
         throw ServiceError{eintr_error};
     };
+    // int sigwait(const sigset_t* set, int* sig): takes a pending signal of `set` (the thread's own first) without
+    // running its handler, waiting until one is generated; the error number is the result (EINVAL for an empty set).
+    install("_sigwait", [this](auto& s, auto& m) -> std::uint64_t {
+        validate(m, s.x[0], 4, false);
+        validate(m, s.x[1], 4, true);
+        const auto set = m.read32(s.x[0]) & ~((1U << 8) | (1U << 16));
+        if (!set) return einval;
+        const auto identity = context.current_thread()->identity;
+        std::unique_lock lock(mutex);
+        for (;;) {
+            auto& own = thread_pending[identity];
+            if (const auto ready = (own | process_pending) & set) {
+                const auto bit = ready & (~ready + 1);
+                if (own & bit) own &= ~bit; else process_pending &= ~bit;
+                m.write32(s.x[1], static_cast<std::uint32_t>(std::countr_zero(bit)) + 1);
+                return 0;
+            }
+            if (context.requested_exit()) return eintr_error;
+            signal_handled.wait_for(lock, std::chrono::milliseconds(50));
+        }
+    });
+    // Hidden entries for the thread layer (process/threads.cpp): pthread_kill of another thread, and a new thread's
+    // signal mask (its creator's) and empty pending set.
+    install("___alchemy_signal_thread", [generate](auto& s, auto&) -> std::uint64_t {
+        return generate(s.x[1], false, s.x[0], std::nullopt);
+    });
+    install("___alchemy_signal_inherit", [this](auto& s, auto&) -> std::uint64_t {
+        const auto identity = context.current_thread()->identity;
+        std::lock_guard lock(mutex);
+        const auto mask = signal_masks[identity];
+        signal_masks[s.x[0]] = mask;
+        thread_pending[s.x[0]] = 0;
+        return 0;
+    });
     for (const auto name : {"_sigsuspend", "_sigsuspend$NOCANCEL"})
         install(name, [suspend](auto& s, auto& m) -> std::uint64_t {
             validate(m, s.x[0], 4, false);
@@ -1297,9 +1395,9 @@ void DarwinServices::Impl::install_process_services() {
     // the process. Blocking calls on other threads are not interrupted (no EINTR there).
     // ITIMER_VIRTUAL and ITIMER_PROF (CPU-time timers) are ENOSYS.
     using microseconds = std::chrono::microseconds;
-    const auto timer_thread = context.install_function("___alchemy_itimer_thread", [this](transmute::CpuState& s, transmute::GuestMemory&) {
-        const auto raise = context.resolve(system_library, "_raise");
+    const auto timer_thread = context.install_function("___alchemy_itimer_thread", [this, generate](transmute::CpuState& s, transmute::GuestMemory&) {
         while (true) {
+            std::uint64_t owner{};
             {
                 std::unique_lock lock(mutex);
                 while (!context.requested_exit() && (!real_timer_due || std::chrono::steady_clock::now() < *real_timer_due)) {
@@ -1311,11 +1409,11 @@ void DarwinServices::Impl::install_process_services() {
                     const auto now = std::chrono::steady_clock::now();
                     do *real_timer_due += real_timer_period; while (*real_timer_due <= now);
                 } else real_timer_due.reset();
+                owner = real_timer_owner;
             }
-            if (raise) {
-                const std::array<std::uint64_t, 1> arguments{14};   // SIGALRM
-                static_cast<void>(EngineAdapter(context.calling_engine()).call(raise->address, arguments));
-            }
+            // SIGALRM for the process: pending while the arming thread blocks it (sigwait takes it), else its handler
+            // runs here.
+            static_cast<void>(generate(14, true, std::nullopt, owner));
         }
         s.x[0] = 0;
     });
@@ -1332,7 +1430,10 @@ void DarwinServices::Impl::install_process_services() {
         {
             std::lock_guard lock(mutex);
             previous = real_timer_state();
-            if (value.count() > 0) { real_timer_due = std::chrono::steady_clock::now() + value; real_timer_period = period; }
+            if (value.count() > 0) {
+                real_timer_due = std::chrono::steady_clock::now() + value; real_timer_period = period;
+                real_timer_owner = context.current_thread()->identity;
+            }
             else { real_timer_due.reset(); real_timer_period = {}; }
             start = real_timer_due && !real_timer_thread;
             if (start) real_timer_thread = true;

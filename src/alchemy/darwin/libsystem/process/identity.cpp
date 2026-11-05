@@ -204,21 +204,31 @@ void DarwinServices::Impl::install_process_identity() {
         // A fork child changes its own copy of the dispositions (they reach exec).
         std::lock_guard lock(mutex); auto& value = signal_table()[static_cast<std::size_t>(s.x[0])];
         if (s.x[2]) { m.write64(s.x[2], value.handler); m.write32(s.x[2] + 8, value.mask); m.write32(s.x[2] + 12, value.flags); }
-        if (s.x[1]) value = replacement; return std::uint64_t{0};
+        if (s.x[1]) value = replacement;
+        if (s.x[1] && replacement.handler == 1) discard_pending_signal(s.x[0]);   // SIG_IGN discards a pending signal
+        return std::uint64_t{0};
     });
     install("_signal", [this](auto& s, auto&) {
         if (s.x[0] == 0 || s.x[0] >= signal_actions.size() || s.x[0] == 9 || s.x[0] == 17) throw ServiceError{einval};
         std::lock_guard lock(mutex); auto& value = signal_table()[static_cast<std::size_t>(s.x[0])]; const auto old = value.handler;
-        value = {s.x[1], 0, 2}; return old;
+        value = {s.x[1], 0, 2};
+        if (s.x[1] == 1) discard_pending_signal(s.x[0]);
+        return old;
     });
     install("_sigprocmask", [this](auto& s, auto& m) {
         std::uint32_t replacement = 0;
         if (s.x[1]) { if (s.x[0] < 1 || s.x[0] > 3) throw ServiceError{einval}; validate(m, s.x[1], 4, false); replacement = m.read32(s.x[1]) & ~((1U << 8) | (1U << 16)); }
         if (s.x[2]) validate(m, s.x[2], 4, true);
         const auto identity = context.current_thread()->identity;
-        std::lock_guard lock(mutex); auto& mask = signal_masks[identity];
-        if (s.x[2]) m.write32(s.x[2], mask);
-        if (s.x[1]) { if (s.x[0] == 1) mask |= replacement; else if (s.x[0] == 2) mask &= ~replacement; else mask = replacement; }
+        std::uint32_t now;
+        {
+            std::lock_guard lock(mutex); auto& mask = signal_masks[identity];
+            if (s.x[2]) m.write32(s.x[2], mask);
+            if (s.x[1]) { if (s.x[0] == 1) mask |= replacement; else if (s.x[0] == 2) mask &= ~replacement; else mask = replacement; }
+            now = mask;
+        }
+        // Pending signals the new mask unblocks are delivered before sigprocmask returns.
+        if (s.x[1] && deliver_pending_signals) static_cast<void>(deliver_pending_signals(now));
         return std::uint64_t{0};
     });
     for (const auto name : {"_sigemptyset", "_sigfillset"}) install(name, [full = std::string_view(name) == "_sigfillset"](auto& s, auto& m) {
@@ -230,7 +240,14 @@ void DarwinServices::Impl::install_process_identity() {
         if (operation == 2) return static_cast<std::uint64_t>((value & bit) != 0);
         m.write32(s.x[0], operation == 0 ? value | bit : value & ~bit); return std::uint64_t{0};
     });
-    install("_sigpending", [](auto& s, auto& m) { validate(m, s.x[0], 4, true); m.write32(s.x[0], 0); return std::uint64_t{0}; });
+    // sigpending: the blocked signals pending for the calling thread or for the process.
+    install("_sigpending", [this](auto& s, auto& m) {
+        validate(m, s.x[0], 4, true);
+        const auto identity = context.current_thread()->identity;
+        std::lock_guard lock(mutex);
+        m.write32(s.x[0], thread_pending[identity] | process_pending);
+        return std::uint64_t{0};
+    });
     // kill: install_process_services (process_model.cpp).
     // Real process creation, credential changes, terminal objects, and signal
     // delivery are intentionally unavailable. Their ABI imports resolve, then
@@ -321,7 +338,7 @@ void DarwinServices::Impl::install_process_identity() {
     // Supplementary groups stay {1000}; a root process may set them (no effect).
     for (const auto name : {"_initgroups", "_setgroups"})
         install(name, [this](auto&, auto&) -> std::uint64_t { if (current_credentials()[1] != 0) throw ServiceError{eperm}; return 0; });
-    install("_sigwait", [](auto&, auto&) { return static_cast<std::uint64_t>(enosys); }); // Error-number return convention.
+    // sigwait: process/process_model.cpp.
     // A guest call to another libSystem function.
     const auto guest = [this](std::string_view name, std::initializer_list<std::uint64_t> arguments) {
         const auto function = context.resolve(system_library, name);

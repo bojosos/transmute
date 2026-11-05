@@ -1134,6 +1134,78 @@ void test_b19(Fixture& f) {
     f.sys("_freeifaddrs", {f.engine.read64(addresses)});
 }
 
+// B20: pending signals (process/process_model.cpp, process/identity.cpp, process/threads.cpp).
+void test_b20(Fixture& f) {
+    static std::atomic<int> handled{0};
+    static std::atomic<std::uint32_t> child_mask{0}, child_signal{0};
+    static Fixture* fixture = &f;
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto handler = f.process.install_function("_b20_handler", [](transmute::CpuState& s, transmute::GuestMemory&) { ++handled; s.x[0] = 0; });
+    f.sys("_signal", {30, handler});
+    f.sys("_signal", {31, handler});
+    const auto set = f.process.allocate_guest(4), old = f.process.allocate_guest(4), pending = f.process.allocate_guest(4), signal = f.process.allocate_guest(4);
+    const auto mask_call = [&f, set](std::uint64_t how, std::uint32_t bits) { f.engine.write32(set, bits); return f.sys("_sigprocmask", {how, set, 0}); };
+    const auto pending_now = [&f, pending] { f.sys("_sigpending", {pending}); return f.engine.read32(pending); };
+    constexpr std::uint32_t usr1 = 1U << 29, usr2 = 1U << 30, alarm = 1U << 13;
+    handled = 0;
+    // raise while blocked: pending, delivered when unblocked.
+    mask_call(1, usr1);
+    require(f.sys("_raise", {30}) == 0 && handled == 0 && pending_now() == usr1, "a blocked signal stays pending");
+    mask_call(2, usr1);
+    require(handled == 1 && pending_now() == 0, "unblocking delivers it");
+    // sigwait takes a pending signal without its handler.
+    mask_call(1, usr2);
+    f.sys("_raise", {31});
+    f.engine.write32(set, usr2);
+    require(f.sys("_sigwait", {set, signal}) == 0 && f.engine.read32(signal) == 31 && handled == 1 && pending_now() == 0, "sigwait");
+    f.engine.write32(set, 0);
+    require(f.sys("_sigwait", {set, signal}) == 22, "sigwait with an empty set is EINVAL");
+    // kill to the process while blocked; sigsuspend with an empty mask delivers it, then the mask is back.
+    mask_call(1, usr1);
+    require(f.sys("_kill", {f.sys("_getpid"), 30}) == 0 && handled == 1 && pending_now() == usr1, "kill while blocked");
+    f.engine.write32(set, 0);
+    require(f.sys("_sigsuspend", {set}) == UINT64_MAX && errno_value() == 4 && handled == 2, "sigsuspend delivers a pending signal");
+    require(f.sys("_sigprocmask", {1, 0, old}) == 0 && (f.engine.read32(old) & usr1), "the mask is back after sigsuspend");
+    // SIG_IGN discards a pending signal.
+    f.sys("_raise", {30});
+    require(pending_now() == usr1, "pending again");
+    f.sys("_signal", {30, 1});
+    require(pending_now() == 0, "SIG_IGN discards it");
+    f.sys("_signal", {30, handler});
+    mask_call(2, usr1 | usr2);
+    // The interval timer's SIGALRM, blocked by the thread that armed it, for sigwait.
+    mask_call(1, alarm);
+    const auto value = f.process.allocate_guest(32);
+    f.engine.fill_bytes(value, 0, 32);
+    f.engine.write64(value + 24, 20000);
+    require(f.sys("_setitimer", {0, value, 0}) == 0, "setitimer");
+    f.engine.write32(set, alarm);
+    require(f.sys("_sigwait", {set, signal}) == 0 && f.engine.read32(signal) == 14, "sigwait takes the timer's SIGALRM");
+    mask_call(2, alarm);
+    // A new thread inherits the mask; pthread_kill to it waits in its pending set for its sigwait.
+    const auto child = f.process.install_function("_b20_child", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        auto& engine = fixture->process.calling_engine();
+        const auto cell = fixture->process.allocate_guest(8);
+        const auto call = [&engine](Address function, std::initializer_list<Address> arguments) {
+            return alchemy::EngineAdapter(engine).call(function, std::span(arguments.begin(), arguments.size()));
+        };
+        static_cast<void>(call(fixture->symbol("/usr/lib/libSystem.B.dylib", "_sigprocmask"), {1, 0, cell}));
+        child_mask = engine.read32(cell);
+        engine.write32(cell, 1U << 30);
+        if (call(fixture->symbol("/usr/lib/libSystem.B.dylib", "_sigwait"), {cell, cell + 4}) == 0) child_signal = engine.read32(cell + 4);
+        s.x[0] = 0;
+    });
+    mask_call(1, usr2);
+    const auto thread = f.process.allocate_guest(8);
+    require(f.sys("_pthread_create", {thread, 0, child, 0}) == 0, "pthread_create");
+    require(f.sys("_pthread_kill", {f.engine.read64(thread), 31}) == 0, "pthread_kill to another thread");
+    require(f.sys("_pthread_join", {f.engine.read64(thread), 0}) == 0, "pthread_join");
+    require((child_mask & usr2) && child_signal == 31 && handled == 2, "the thread inherited the mask and sigwait took its signal");
+    mask_call(2, usr2);
+    f.sys("_signal", {30, 0});
+    f.sys("_signal", {31, 0});
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -1508,6 +1580,7 @@ int main() {
         stage("b17"); test_b17(f);
         stage("b18"); test_b18(f);
         stage("b19"); test_b19(f);
+        stage("b20"); test_b20(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

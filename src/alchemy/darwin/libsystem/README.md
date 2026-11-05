@@ -114,8 +114,14 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   set a symbolic link's own times (`fs/files.cpp`). chflags/lchflags/fchflags keep UF_HIDDEN as the
   host's hidden attribute, which stat reports in st_flags; other flags are ENOTSUP. Network
   interfaces have one set of names (`net/interface_names.hpp`: lo0, en<n>, utun<n>) for getifaddrs
-  and the if_* calls. sigwait (no pending-signal model yet) and
-  sigaltstack stay ENOSYS.
+  and the if_* calls. sigaltstack stays ENOSYS.
+* **Signals within the process** (core, `process/process_model.cpp`): a signal blocked where it
+  goes stays pending (for the calling thread: raise; another thread: pthread_kill; the process:
+  kill to itself, the interval timer, which follows the mask of the thread that armed it) until
+  sigprocmask/pthread_sigmask unblocks it or sigsuspend/pause wait with it unblocked, which run
+  its handler on that thread; sigwait takes it without the handler, sigpending reports it,
+  SIG_IGN discards it. New threads inherit their creator's mask. A signal for another thread
+  does not interrupt it: it waits for that thread's next unblocking or wait.
 * **Attribute lists** (alchemy-fx, `install_libsystem_gaps`): `fs/attrlist.cpp`, the getattrlist(2)
   family (get/set, f and at forms) packed from stat, statfs, the extended attributes and the host
   volume: the common attributes this file system keeps, the directory and file ones, the volume's

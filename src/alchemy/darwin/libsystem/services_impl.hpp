@@ -1236,6 +1236,19 @@ public:
     std::condition_variable signal_handled;
     std::uint64_t handled_signals{};
     std::uint32_t last_handled_signal{};
+    // Pending signals (process/process_model.cpp), under `mutex`: generated while blocked, for one thread (raise,
+    // pthread_kill) or for the process (kill, the interval timer), until unblocked or taken by sigwait.
+    // signal_handled is notified when one becomes pending. deliver_pending_signals(mask) runs, on the calling
+    // thread, the pending signals `mask` does not block (sigprocmask after unblocking); false when there were none.
+    std::map<std::uint64_t, std::uint32_t> thread_pending;
+    std::uint32_t process_pending{};
+    std::function<bool(std::uint32_t)> deliver_pending_signals;
+    // Discards a pending `signal` everywhere (its disposition became SIG_IGN). Caller holds `mutex`.
+    void discard_pending_signal(std::uint64_t signal) {
+        const auto bit = ~(1U << (signal - 1));
+        process_pending &= bit;
+        for (auto& [identity, pending] : thread_pending) { static_cast<void>(identity); pending &= bit; }
+    }
     // struct termios last set on the console (fs/terminal.cpp), under `mutex`.
     std::optional<std::array<std::uint8_t, 72>> console_attributes;
     // ITIMER_REAL (process/process_model.cpp): the next expiry and the period, under `mutex`;
@@ -1244,6 +1257,7 @@ public:
     std::optional<std::chrono::steady_clock::time_point> real_timer_due;
     std::chrono::microseconds real_timer_period{};
     bool real_timer_thread{};
+    std::uint64_t real_timer_owner{};   // the thread that armed it: its mask decides whether SIGALRM is pending
     std::map<std::uint64_t, std::array<std::uint64_t, 2>> resource_limits;
     std::uint64_t creation_mask{022};
 

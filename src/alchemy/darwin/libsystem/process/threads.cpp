@@ -386,6 +386,11 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             ++worker_generation;
         }
         memory.write64(output, worker->handle);
+        // The new thread's signal mask is its creator's, its pending set empty (process/process_model.cpp).
+        if (const auto inherit = process.resolve("/usr/lib/libSystem.B.dylib", "___alchemy_signal_inherit")) {
+            const std::array<std::uint64_t, 1> arguments{worker->context->identity};
+            static_cast<void>(EngineAdapter(process.calling_engine()).call(inherit->address, arguments));
+        }
         try {
             const auto owned = shared_from_this();
             worker->host = std::thread([owned, worker] {
@@ -661,12 +666,25 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             const auto result = EngineAdapter(self.process.calling_engine()).call(function->address, arguments);
             s.x[0] = result == UINT64_MAX ? self.process.calling_engine().read32(self.process.current_thread()->errno_address) : 0;
         });
+        // pthread_kill(thread, signal): to this thread as raise; to another thread of this process, a signal that
+        // stays pending for it until it unblocks it or waits for signals (process/process_model.cpp).
         add("_pthread_kill", [](auto& self, auto& s, auto&) {
             if (s.x[1] > 31) { s.x[0] = einval; return; }
             const auto own = self.self();
-            std::lock_guard lock(self.metadata);
-            if (s.x[0] != own && !self.workers.contains(s.x[0])) { s.x[0] = esrch; return; }
-            s.x[0] = s.x[1] ? 78 : 0;
+            std::uint64_t identity{};
+            {
+                std::lock_guard lock(self.metadata);
+                if (s.x[0] != own && !self.workers.contains(s.x[0])) { s.x[0] = esrch; return; }
+                if (s.x[0] != own) for (const auto& [thread, handle] : self.handles) if (handle == s.x[0]) identity = thread;
+            }
+            if (!s.x[1]) { s.x[0] = 0; return; }
+            const auto signal = s.x[1];
+            const auto function = self.process.resolve("/usr/lib/libSystem.B.dylib", s.x[0] == own ? "_raise" : "___alchemy_signal_thread");
+            if (!function) { s.x[0] = 78; return; }
+            const auto result = s.x[0] == own
+                ? EngineAdapter(self.process.calling_engine()).call(function->address, std::array<std::uint64_t, 1>{signal})
+                : EngineAdapter(self.process.calling_engine()).call(function->address, std::array<std::uint64_t, 2>{identity, signal});
+            s.x[0] = result == UINT64_MAX ? self.process.calling_engine().read32(self.process.current_thread()->errno_address) : 0;
         });
         add("_sched_yield", [](auto&, auto& s, auto&) { std::this_thread::yield(); s.x[0] = 0; });
         add("_pthread_atfork", [](auto& self, auto& s, auto&) {
