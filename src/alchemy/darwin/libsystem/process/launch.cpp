@@ -339,10 +339,10 @@ ExecTarget resolve_exec(std::string_view guest_path, std::vector<std::string> ar
             // launchctl asuser <uid> <program> [arguments]: the program in that
             // user's launchd bootstrap. Alchemy has one user session, so for the
             // caller's own user (or from root) it is the program itself, resolved
-            // here as exec would; other launchctl uses need launchd.
-            if (argv.size() < 4 || argv[1] != "asuser")
-                throw ProcessError(enoexec, "launchctl " + (argv.size() > 1 ? argv[1] : std::string()) +
-                    ": unsupported (no launchd; only 'asuser <uid> <program>' runs)");
+            // here as exec would. Every other launchctl use is the built-in tool
+            // talking to the session launchd (darwin/launchd/launchctl.cpp); it
+            // finds the Alchemy root from the calling program.
+            if (argv.size() < 4 || argv[1] != "asuser") return {"launchctl", environment.main_executable, path, std::move(argv)};
             const auto& user = argv[2];
             if (user.empty() || user.size() > 10 || !std::all_of(user.begin(), user.end(), [](char c) { return c >= '0' && c <= '9'; }))
                 throw ProcessError(einval, "launchctl asuser: bad uid " + user);

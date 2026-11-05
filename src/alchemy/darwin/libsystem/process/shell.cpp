@@ -3,6 +3,7 @@
 // Unsupported syntax fails explicitly with status 2 (docs/ALCHEMY_PROCESS.md).
 #define _CRT_SECURE_NO_WARNINGS
 #include "alchemy/darwin_process.hpp"
+#include "alchemy/darwin/launchd/launchctl.hpp"
 #include "alchemy/host/files.hpp"
 #include "alchemy/host/net.hpp"
 #include "alchemy/host/process.hpp"
@@ -735,6 +736,8 @@ int run_child_tool(const ChildLaunch& launch, const std::vector<std::string>& la
         output(2, "socketfilterfw: unsupported option (Alchemy has no application firewall)\n");
         return 1;
     }
+    if (launch.tool == "launchctl")
+        return launchd::launchctl_main(launch, launch_options, [&shell](int fd, std::string_view text) { shell.output(fd, text); });
     if (launch.tool != "sh") throw std::runtime_error("unknown Alchemy child tool " + launch.tool);
     const auto& argv = launch.argv;
     std::size_t index = 1;

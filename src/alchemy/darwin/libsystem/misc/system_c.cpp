@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/completion/runtime/common.hpp"
+#include "alchemy/darwin/launchd/service_management.hpp"
 
 #include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 
@@ -31,7 +32,7 @@
 //   the sending thread when it has none.
 //   NSAllMapTableKeys/Values, NSHomeDirectoryForUser, NSPoint/Size/RectFromString,
 //   NSEdgeInsetsZero and the NSAppleScript/NSProgress string constants.
-//   SMJobSubmit / SMJobRemove fail explicitly (no launchd); kSMDomain* constants.
+//   kSMDomain* constants (the job calls are the session launchd's: darwin/launchd/).
 namespace alchemy::gui::completion_kit {
 namespace {
 
@@ -606,8 +607,9 @@ void install_system_functions(Support& support) {
     // ---- ServiceManagement ----
     support.string_constant(service_management, "_kSMDomainSystemLaunchd", "kSMDomainSystemLaunchd");
     support.string_constant(service_management, "_kSMDomainUserLaunchd", "kSMDomainUserLaunchd");
-    support.function(service_management, "_SMJobSubmit", [](CpuState&, GuestMemory&) { unsupported("SMJobSubmit (no launchd under Alchemy)"); });
-    support.function(service_management, "_SMJobRemove", [](CpuState&, GuestMemory&) { unsupported("SMJobRemove (no launchd under Alchemy)"); });
+    // SMJobSubmit, SMJobRemove, SMJobCopyDictionary, SMCopyAllJobDictionaries and
+    // launch_activate_socket: the session launchd's (darwin/launchd/service_management.cpp).
+    install_launchd_jobs(support);
     ProcessContext::add_provider_library(std::string(service_management));
 }
 

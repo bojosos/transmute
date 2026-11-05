@@ -335,9 +335,11 @@ alchemy: fork emulation: the child called _pthread_mutex_lock before exec; ... f
   scripts, for the License Server and Unified Login services:
   `registerLicenseServerAsService`, `unregisterLicenseServerAsService`,
   `registerService` and `unregisterService`. They register launchd agents
-  with `launchctl`, `sudo`, `chown` and `cp`. They are unsupported: the
-  launchd tools do not exist, so the built-in shell reports `command not found`
-  and the scripts that use `if` fail with status 2.
+  with `launchctl`, `sudo`, `chown` and `cp`. They are unsupported: `sudo`
+  does not exist (the built-in shell reports `command not found`), the scripts
+  that use `if` fail with status 2, and `launchctl load` as root acts on the
+  system domain, which Alchemy does not run (exit 45 with a message; the
+  user's own domain is the session launchd, `src/alchemy/darwin/launchd/`).
 - **The installer** (running as root, `ALCHEMY_SUPERUSER=1`) changes
   credentials and the environment between fork and exec, asks the shell for
   `command -v`, `ps` and `getconf ARG_MAX`, and calls
@@ -565,6 +567,10 @@ Mach IPC works across the Alchemy process tree on alchemy-fx
     across the tree.
   - Entries of a process that dies are removed.
   - `bootstrap_parent` answers BOOTSTRAP_NOT_PRIVILEGED.
+- **launchd jobs.** Jobs (`launchctl`, `SMJobSubmit`) belong to the session
+  launchd, one per user and Alchemy root, which outlives a process tree
+  (`src/alchemy/darwin/launchd/README.md`). Each job is the root of its own
+  tree.
 - **Special ports.**
   - `posix_spawnattr_setspecialport_np` ports are exported to the child when
     `posix_spawn` has created it (`ProcessContext::spawn_started`).

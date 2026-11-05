@@ -381,8 +381,12 @@ static void test_launchctl(void) {
     close(outp[0]);
     char* foreign[] = {(char*)"launchctl", (char*)"asuser", other, (char*)self, (char*)"child", (char*)"exit", (char*)"0", 0};
     check(posix_spawn(&pid, "/bin/launchctl", 0, 0, foreign, environ) == 1, t, "asuser another uid: EPERM", 0);
-    char* list[] = {(char*)"launchctl", (char*)"list", 0};
-    check(posix_spawn(&pid, "/bin/launchctl", 0, 0, list, environ) == 8, t, "other launchctl commands: ENOEXEC", 0);
+    /* Other subcommands run the built-in launchctl (launchd_model tests them):
+     * an unknown one exits 64 without starting the session launchd. */
+    char* unknown[] = {(char*)"launchctl", (char*)"no-such-subcommand", 0};
+    check(posix_spawn(&pid, "/bin/launchctl", 0, 0, unknown, environ) == 0, t, "other launchctl commands run", 0);
+    status = -1;
+    check(waitpid(pid, &status, 0) == pid && (status >> 8) == 64, t, "an unknown subcommand exits 64", status);
     check(access("/bin/launchctl", 1) == 0, t, "access(/bin/launchctl, X_OK)", errno);
     done(t, before);
 }
