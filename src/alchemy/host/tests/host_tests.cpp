@@ -268,6 +268,13 @@ void file_table(const std::string& directory) {
                 files::metadata(path)->created_ns == 1'000'000'000LL * 1'400'000'000 &&
                 files::metadata(path)->modified_ns == 1'000'000'000LL * 1'650'000'000,
         "set_creation_time sets only the creation time");
+    {
+        const auto value = std::as_bytes(std::span("finder", 6));
+        require(files::set_attribute(path, "com.example.keep", value) &&
+                    files::metadata(path)->modified_ns == 1'000'000'000LL * 1'650'000'000 &&
+                    files::remove_attribute(path, "com.example.keep"),
+            "an extended attribute leaves the modification time");
+    }
     require(files::access(path, true) && files::set_read_only(path, true) && files::access(path, false) &&
                 files::access(path, true).error() == host::Error::access_denied && files::set_read_only(path, false),
         "access");

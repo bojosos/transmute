@@ -700,6 +700,10 @@ Status set_attribute(std::string_view path, std::string_view name, ConstBytes va
                                     nullptr, CREATE_ALWAYS, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (stream == INVALID_HANDLE_VALUE) return win32::last_error();
     struct Close { HANDLE handle; ~Close() { CloseHandle(handle); } } close{stream};
+    // An extended attribute is not the file's data: writing it must not move the file's modification or access
+    // time (all-ones FILETIMEs stop NTFS from updating them for this handle).
+    FILETIME keep{0xFFFFFFFFU, 0xFFFFFFFFU};
+    static_cast<void>(SetFileTime(stream, nullptr, &keep, &keep));
     DWORD written = 0;
     if (!value.empty() && (!WriteFile(stream, value.data(), static_cast<DWORD>(value.size()), &written, nullptr) || written != value.size()))
         return win32::last_error();
