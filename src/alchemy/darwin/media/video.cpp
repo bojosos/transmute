@@ -15,9 +15,10 @@
 //   notification names). The capture classes are av_capture.cpp's (cameras
 //   over host::camera, microphones over the CoreAudio HAL);
 //   AVSampleBufferDisplayLayer is av_sample_buffer.cpp's.
-// - CoreVideo: the dictionary keys, host time (mach_absolute_time's) and the
-//   Metal texture caches, real objects holding their device (no texture is made
-//   from an image buffer yet). Pixel buffers and pools are core_video.cpp's.
+// - CoreVideo: the dictionary keys, host time (mach_absolute_time's), the ITU-T
+//   H.273 code points of the colour attachment values, whether a pixel buffer
+//   matches attributes, and the Metal texture caches, real objects holding their
+//   device. Pixel buffers and pools are core_video.cpp's.
 namespace alchemy::gui::fill {
 namespace {
 
@@ -35,6 +36,7 @@ public:
     void install_video_toolbox();
     void install_av_foundation();
     void install_core_video();
+    void install_code_points();
     void install_metal_texture_cache();
 };
 
@@ -159,6 +161,48 @@ void Video::install_metal_texture_cache() {
     });
 }
 
+// CV{ColorPrimaries,TransferFunction,YCbCrMatrix}GetIntegerCodePointForString and
+// ...GetStringForIntegerCodePoint: the ITU-T H.273 numbers of the attachment values. An unknown string
+// is 2 (unspecified); an unknown number has no string (NULL). The strings are the exported constants.
+void Video::install_code_points() {
+    struct Point { int code; const char* symbol; const char* value; };
+    using Table = std::vector<Point>;
+    static const Table primaries{{1, "_kCVImageBufferColorPrimaries_ITU_R_709_2", "ITU_R_709_2"},
+                                 {5, "_kCVImageBufferColorPrimaries_EBU_3213", "EBU_3213"},
+                                 {6, "_kCVImageBufferColorPrimaries_SMPTE_C", "SMPTE_C"},
+                                 {9, "_kCVImageBufferColorPrimaries_ITU_R_2020", "ITU_R_2020"},
+                                 {11, "_kCVImageBufferColorPrimaries_DCI_P3", "DCI_P3"},
+                                 {12, "_kCVImageBufferColorPrimaries_P3_D65", "P3_D65"},
+                                 {22, "_kCVImageBufferColorPrimaries_P22", "P22"}};
+    static const Table transfer{{1, "_kCVImageBufferTransferFunction_ITU_R_709_2", "ITU_R_709_2"},
+                                {7, "_kCVImageBufferTransferFunction_SMPTE_240M_1995", "SMPTE_240M_1995"},
+                                {8, "_kCVImageBufferTransferFunction_Linear", "Linear"},
+                                {13, "_kCVImageBufferTransferFunction_sRGB", "IEC_sRGB"},
+                                {14, "_kCVImageBufferTransferFunction_ITU_R_2020", "ITU_R_2020"},
+                                {16, "_kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ", "SMPTE_ST_2084_PQ"},
+                                {17, "_kCVImageBufferTransferFunction_SMPTE_ST_428_1", "SMPTE_ST_428_1"},
+                                {18, "_kCVImageBufferTransferFunction_ITU_R_2100_HLG", "ITU_R_2100_HLG"}};
+    static const Table matrix{{1, "_kCVImageBufferYCbCrMatrix_ITU_R_709_2", "ITU_R_709_2"},
+                              {6, "_kCVImageBufferYCbCrMatrix_ITU_R_601_4", "ITU_R_601_4"},
+                              {7, "_kCVImageBufferYCbCrMatrix_SMPTE_240M_1995", "SMPTE_240M_1995"},
+                              {9, "_kCVImageBufferYCbCrMatrix_ITU_R_2020", "ITU_R_2020"}};
+    for (const auto& entry : std::array<std::pair<const char*, const Table*>, 3>{{
+             {"ColorPrimaries", &primaries}, {"TransferFunction", &transfer}, {"YCbCrMatrix", &matrix}}}) {
+        const std::string kind = entry.first;
+        const Table* table = entry.second;
+        raw(core_video, "_CV" + kind + "GetIntegerCodePointForString", [this, table](CpuState& s, GuestMemory&) {
+            const auto text = s.x[0] ? cf.utf8(s.x[0]) : std::string();
+            const auto found = std::find_if(table->begin(), table->end(), [&](const Point& p) { return text == p.value; });
+            s.x[0] = static_cast<std::uint64_t>(found != table->end() ? found->code : 2);
+        });
+        raw(core_video, "_CV" + kind + "GetStringForIntegerCodePoint", [this, table](CpuState& s, GuestMemory& m) {
+            const auto code = static_cast<int>(static_cast<std::int32_t>(s.x[0]));
+            const auto found = std::find_if(table->begin(), table->end(), [&](const Point& p) { return code == p.code; });
+            s.x[0] = found != table->end() ? m.read64(symbol(core_video, found->symbol)) : 0;
+        });
+    }
+}
+
 void Video::install_video_toolbox() {
     // VTCompressionSessionCreate(allocator, width, height, codec, encoderSpecification, sourceAttributes,
     //     compressedDataAllocator, outputCallback, [stack] refcon, compressionSessionOut)
@@ -169,6 +213,25 @@ void Video::install_video_toolbox() {
         raw(video_toolbox, name, [](CpuState& s, GuestMemory&) { s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter); });
     raw(video_toolbox, "_VTCompressionSessionInvalidate", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "VTCompressionSessionInvalidate"); });
     constant(video_toolbox, "_VTIsHardwareDecodeSupported", 0);
+    // The encoder list is empty (VTCopyVideoEncoderList(options, CFArrayRef *out)), so no encoder has
+    // properties to report, and stereo MV-HEVC neither decodes nor encodes.
+    raw(video_toolbox, "_VTCopyVideoEncoderList", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) { s.x[0] = status(vt_parameter); return; }
+        m.write64(s.x[1], cf.array(std::vector<Address>{}));
+        s.x[0] = 0;
+    });
+    // VTCopySupportedPropertyDictionaryForEncoder(width, height, codec, encoderSpecification, CFStringRef *encoderIDOut,
+    //     CFDictionaryRef *supportedPropertiesOut)
+    raw(video_toolbox, "_VTCopySupportedPropertyDictionaryForEncoder", [](CpuState& s, GuestMemory& m) {
+        if (s.x[4]) m.write64(s.x[4], 0);
+        if (s.x[5]) m.write64(s.x[5], 0);
+        s.x[0] = status(vt_could_not_find_encoder);
+    });
+    constant(video_toolbox, "_VTIsStereoMVHEVCDecodeSupported", 0);
+    constant(video_toolbox, "_VTIsStereoMVHEVCEncodeSupported", 0);
+    for (const auto* key : {"CodecType", "EncoderID", "CodecName", "EncoderName", "DisplayName", "GPURegistryID", "InstanceLimit",
+                            "IsHardwareAccelerated", "PerformanceRating", "QualityRating", "SupportedSelectionProperties", "SupportsFrameReordering"})
+        string(video_toolbox, "_kVTVideoEncoderList_" + std::string(key), key);
     raw(video_toolbox, "_VTRegisterSupplementalVideoDecoderIfAvailable", [](CpuState&, GuestMemory&) {});   // none is available
     for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 16>{{
              {"_kVTCompressionPropertyKey_AllowFrameReordering", "AllowFrameReordering"},
@@ -277,6 +340,30 @@ void Video::install_core_video() {
         return_real(s, numer && denom ? 1e9 * denom / numer : 1e9);
     });
     raw(core_video, "_CVGetHostClockMinimumTimeDelta", [](CpuState& s, GuestMemory&) { s.x[0] = 1; });
+    string(core_video, "_kCVImageBufferColorPrimaries_P22", "P22");
+    install_code_points();
+    // CVPixelBufferIsCompatibleWithAttributes(CVPixelBufferRef, CFDictionaryRef): the buffer's width,
+    // height and pixel format (one or any of an array) against those the attributes name.
+    raw(core_video, "_CVPixelBufferIsCompatibleWithAttributes", [this](CpuState& s, GuestMemory&) {
+        const auto buffer = s.x[0], attributes = s.x[1];
+        if (!buffer || call(core_foundation, "_CFGetTypeID", {buffer}) != call(core_video, "_CVPixelBufferGetTypeID", {})) { s.x[0] = 0; return; }
+        if (!attributes || cf.kind(attributes) != ObjectKind::dictionary) { s.x[0] = 1; return; }
+        const auto number = [this](Address value) { return value ? cf.number_value(value) : std::nullopt; };
+        bool compatible = true;
+        for (const auto& [key, value] : cf.dictionary_entries(attributes)) {
+            const auto name = cf.utf8(key);
+            if (name == "Width" || name == "Height") {
+                const auto want = number(value);
+                const auto have = call(core_video, name == "Width" ? "_CVPixelBufferGetWidth" : "_CVPixelBufferGetHeight", {buffer});
+                if (want && static_cast<std::uint64_t>(*want) != have) compatible = false;
+            } else if (name == "PixelFormatType") {
+                const auto have = static_cast<double>(static_cast<std::uint32_t>(call(core_video, "_CVPixelBufferGetPixelFormatType", {buffer})));
+                std::vector<Address> formats = cf.kind(value) == ObjectKind::array ? cf.array_values(value) : std::vector<Address>{value};
+                if (std::none_of(formats.begin(), formats.end(), [&](Address f) { return number(f) == have; })) compatible = false;
+            }
+        }
+        s.x[0] = compatible ? 1 : 0;
+    });
     install_metal_texture_cache();
 }
 

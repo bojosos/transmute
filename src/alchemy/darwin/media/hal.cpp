@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -30,7 +31,9 @@
 // an empty output list (silence in cloaked runs). AVAudioEngine's input node
 // and AVFoundation capture open their own input streams (hal_open_input). A block IOProc runs on the I/O thread, not on its queue. Host
 // time is mach_absolute_time's
-// (nanoseconds; frequency 1e9).
+// (nanoseconds; frequency 1e9). The older AudioHardware, AudioDevice and
+// AudioStream property calls answer the same properties, addressed by the
+// direction (input or output scope) and channel (element).
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -138,6 +141,50 @@ void write_time_stamp(GuestMemory& m, Address at, double sample_time, std::uint6
     m.write64(at + 8, host_time);
     m.write64(at + 16, std::bit_cast<std::uint64_t>(1.0));
     m.write32(at + 56, 7);   // kAudioTimeStampSampleTimeValid | HostTimeValid | RateScalarValid
+}
+
+// AudioObjectGetPropertyData's work (also the older AudioHardware/AudioDevice/AudioStream calls): the
+// value into (UInt32 *ioSize, void *out). Arrays are truncated to the elements that fit; other values
+// need their whole size. CFStrings are +1.
+std::int32_t get_property(Hal& state, GuestMemory& m, std::uint32_t object, const hal::Address& address,
+                          const std::optional<std::string>& qualifier, Address size_at, Address out) {
+    hal::Value value;
+    {
+        std::lock_guard lock(state.mutex);
+        if (address.selector == hal::four("uidd") && !qualifier) return hal::error::bad_size;
+        if (const auto result = state.get().get(object, address, qualifier.value_or(std::string()), value)) {
+            state.log_unknown(object, address, result);
+            return result;
+        }
+    }
+    const auto room = m.read32(size_at);
+    if (value.string) {
+        if (room < 8 || !out) return hal::error::bad_size;
+        m.write64(out, state.support.cf.string(*value.string));
+        m.write32(size_at, 8);
+        return 0;
+    }
+    auto size = static_cast<std::uint32_t>(value.bytes.size());
+    if (value.element_size) size = std::min(size, room / value.element_size * value.element_size);
+    else if (room < size) return hal::error::bad_size;
+    if (size && !out) return hal::error::param;
+    if (size) m.write_bytes(out, std::vector<std::uint8_t>(value.bytes.begin(), value.bytes.begin() + size));
+    m.write32(size_at, size);
+    return 0;
+}
+
+// The device's clock now, while its output runs.
+bool device_now(Hal& state, std::uint32_t device, hal_io::Timing& timing, double& rate) {
+    std::shared_ptr<hal_io::DeviceIo> io;
+    {
+        std::lock_guard lock(state.mutex);
+        if (const auto found = state.io.find(device); found != state.io.end()) io = found->second;
+        const auto* d = state.get().device(device);
+        rate = d && d->sample_rate > 0 ? d->sample_rate : 48000.0;
+    }
+    if (!io || !io->now(timing)) return false;
+    if (timing.rate > 0) rate = timing.rate;
+    return true;
 }
 
 // One buffer of an IOProc on the device's I/O thread: the proc gets an empty input list and
@@ -325,35 +372,12 @@ void install_hal(Support& support) {
         if (!result) m.write32(s.x[4], value.string ? 8U : static_cast<std::uint32_t>(value.bytes.size()));
         status(s, result);
     });
-    // (object, address, qualifierSize, qualifier, UInt32 *ioDataSize, void *outData): arrays are
-    // truncated to the elements that fit; other values need their whole size. CFStrings are +1.
+    // (object, address, qualifierSize, qualifier, UInt32 *ioDataSize, void *outData)
     support.function(core_audio, "_AudioObjectGetPropertyData", [state](CpuState& s, GuestMemory& m) {
         if (!s.x[1] || !s.x[4]) return status(s, hal::error::param);
-        hal::Value value;
-        {
-            std::lock_guard lock(state->mutex);
-            const auto address = Hal::address(m, s.x[1]);
-            const auto qualifier = state->qualifier(m, static_cast<std::uint32_t>(s.x[2]), s.x[3]);
-            if (address.selector == hal::four("uidd") && !qualifier) return status(s, hal::error::bad_size);
-            if (const auto result = state->get().get(static_cast<std::uint32_t>(s.x[0]), address, qualifier.value_or(std::string()), value)) {
-                state->log_unknown(static_cast<std::uint32_t>(s.x[0]), address, result);
-                return status(s, result);
-            }
-        }
-        const auto room = m.read32(s.x[4]);
-        if (value.string) {
-            if (room < 8 || !s.x[5]) return status(s, hal::error::bad_size);
-            m.write64(s.x[5], state->support.cf.string(*value.string));
-            m.write32(s.x[4], 8);
-            return status(s, 0);
-        }
-        auto size = static_cast<std::uint32_t>(value.bytes.size());
-        if (value.element_size) size = std::min(size, room / value.element_size * value.element_size);
-        else if (room < size) return status(s, hal::error::bad_size);
-        if (size && !s.x[5]) return status(s, hal::error::param);
-        if (size) m.write_bytes(s.x[5], std::vector<std::uint8_t>(value.bytes.begin(), value.bytes.begin() + size));
-        m.write32(s.x[4], size);
-        status(s, 0);
+        const auto address = Hal::address(m, s.x[1]);
+        const auto qualifier = state->qualifier(m, static_cast<std::uint32_t>(s.x[2]), s.x[3]);
+        status(s, get_property(*state, m, static_cast<std::uint32_t>(s.x[0]), address, qualifier, s.x[4], s.x[5]));
     });
     // (object, address, qualifierSize, qualifier, UInt32 dataSize, const void *data)
     support.function(core_audio, "_AudioObjectSetPropertyData", [state](CpuState& s, GuestMemory& m) {
@@ -390,6 +414,97 @@ void install_hal(Support& support) {
             std::lock_guard lock(state->mutex);
             status(s, state->get().kind(static_cast<std::uint32_t>(s.x[0])) ? 0 : hal::error::bad_object);
         });
+
+    // ---- the older property calls (AudioHardwareDeprecated.h) ---------------------------------
+    // The system's properties are global; a device's are in the input or output scope and the
+    // channel's element; a stream's are global, in the channel's element.
+    const auto global = [](std::uint64_t selector) { return hal::Address{static_cast<std::uint32_t>(selector), hal::scope_global, 0}; };
+    const auto directed = [](std::uint64_t channel, std::uint64_t is_input, std::uint64_t selector) {
+        return hal::Address{static_cast<std::uint32_t>(selector), (is_input & 0xff) ? hal::scope_input : hal::scope_output, static_cast<std::uint32_t>(channel)};
+    };
+    const auto in_channel = [](std::uint64_t channel, std::uint64_t selector) {
+        return hal::Address{static_cast<std::uint32_t>(selector), hal::scope_global, static_cast<std::uint32_t>(channel)};
+    };
+    // ...GetPropertyInfo: (UInt32 *outSize, Boolean *outWritable), either may be NULL.
+    const auto info = [state](CpuState& s, GuestMemory& m, std::uint32_t object, const hal::Address& address, Address size_at, Address writable_at) {
+        std::lock_guard lock(state->mutex);
+        hal::Value value;
+        const auto result = state->get().get(object, address, std::nullopt, value);
+        state->log_unknown(object, address, result);
+        if (result) return status(s, result);
+        bool settable{};
+        if (state->get().settable(object, address, settable)) settable = false;
+        if (size_at) m.write32(size_at, value.string ? 8U : static_cast<std::uint32_t>(value.bytes.size()));
+        if (writable_at) m.write8(writable_at, settable ? 1 : 0);
+        status(s, 0);
+    };
+    // ...SetProperty: (UInt32 size, const void *data); the AudioTimeStamp of when is not used (now).
+    const auto set = [state](CpuState& s, GuestMemory& m, std::uint32_t object, const hal::Address& address, std::uint64_t size, Address data) {
+        if (size && !data) return status(s, hal::error::param);
+        std::vector<std::uint8_t> bytes(static_cast<std::uint32_t>(size));
+        if (!bytes.empty()) m.read_bytes(data, bytes);
+        std::lock_guard lock(state->mutex);
+        status(s, state->get().set(object, address, bytes));
+    };
+    const auto get = [state](CpuState& s, GuestMemory& m, std::uint32_t object, const hal::Address& address, Address size_at, Address out) {
+        if (!size_at) return status(s, hal::error::param);
+        status(s, get_property(*state, m, object, address, std::nullopt, size_at, out));
+    };
+    const auto object = [](std::uint64_t value) { return static_cast<std::uint32_t>(value); };
+    // AudioHardwareGetPropertyInfo(id, outSize, outWritable), AudioHardwareGetProperty(id, ioSize, out),
+    // AudioHardwareSetProperty(id, size, data)
+    support.function(core_audio, "_AudioHardwareGetPropertyInfo", [info, global](CpuState& s, GuestMemory& m) {
+        info(s, m, hal::system_object, global(s.x[0]), s.x[1], s.x[2]);
+    });
+    support.function(core_audio, "_AudioHardwareGetProperty", [get, global](CpuState& s, GuestMemory& m) {
+        get(s, m, hal::system_object, global(s.x[0]), s.x[1], s.x[2]);
+    });
+    support.function(core_audio, "_AudioHardwareSetProperty", [set, global](CpuState& s, GuestMemory& m) {
+        set(s, m, hal::system_object, global(s.x[0]), s.x[1], s.x[2]);
+    });
+    // AudioDeviceGetPropertyInfo(device, channel, isInput, id, outSize, outWritable),
+    // AudioDeviceGetProperty(device, channel, isInput, id, ioSize, out),
+    // AudioDeviceSetProperty(device, when, channel, isInput, id, size, data)
+    support.function(core_audio, "_AudioDeviceGetPropertyInfo", [info, directed, object](CpuState& s, GuestMemory& m) {
+        info(s, m, object(s.x[0]), directed(s.x[1], s.x[2], s.x[3]), s.x[4], s.x[5]);
+    });
+    support.function(core_audio, "_AudioDeviceGetProperty", [get, directed, object](CpuState& s, GuestMemory& m) {
+        get(s, m, object(s.x[0]), directed(s.x[1], s.x[2], s.x[3]), s.x[4], s.x[5]);
+    });
+    support.function(core_audio, "_AudioDeviceSetProperty", [set, directed, object](CpuState& s, GuestMemory& m) {
+        set(s, m, object(s.x[0]), directed(s.x[2], s.x[3], s.x[4]), s.x[5], s.x[6]);
+    });
+    // AudioStreamGetPropertyInfo(stream, channel, id, outSize, outWritable),
+    // AudioStreamGetProperty(stream, channel, id, ioSize, out),
+    // AudioStreamSetProperty(stream, when, channel, id, size, data)
+    support.function(core_audio, "_AudioStreamGetPropertyInfo", [info, in_channel, object](CpuState& s, GuestMemory& m) {
+        info(s, m, object(s.x[0]), in_channel(s.x[1], s.x[2]), s.x[3], s.x[4]);
+    });
+    support.function(core_audio, "_AudioStreamGetProperty", [get, in_channel, object](CpuState& s, GuestMemory& m) {
+        get(s, m, object(s.x[0]), in_channel(s.x[1], s.x[2]), s.x[3], s.x[4]);
+    });
+    support.function(core_audio, "_AudioStreamSetProperty", [set, in_channel, object](CpuState& s, GuestMemory& m) {
+        set(s, m, object(s.x[0]), in_channel(s.x[2], s.x[3]), s.x[4], s.x[5]);
+    });
+    // The older listeners, like AudioObjectAddPropertyListener's, are never called: nothing changes.
+    // AudioHardwareAdd/RemovePropertyListener(id, proc[, client])
+    for (const auto* name : {"_AudioHardwareAddPropertyListener", "_AudioHardwareRemovePropertyListener"})
+        support.function(core_audio, name, [](CpuState& s, GuestMemory&) { status(s, s.x[1] ? 0 : hal::error::param); });
+    // AudioDeviceAdd/RemovePropertyListener(device, channel, isInput, id, proc[, client]),
+    // AudioStreamAdd/RemovePropertyListener(stream, channel, id, proc[, client])
+    const auto listener = [state](CpuState& s, Address proc) {
+        if (!proc) return status(s, hal::error::param);
+        std::lock_guard lock(state->mutex);
+        status(s, state->get().kind(static_cast<std::uint32_t>(s.x[0])) ? 0 : hal::error::bad_object);
+    };
+    for (const auto* name : {"_AudioDeviceAddPropertyListener", "_AudioDeviceRemovePropertyListener"})
+        support.function(core_audio, name, [listener](CpuState& s, GuestMemory&) { listener(s, s.x[4]); });
+    for (const auto* name : {"_AudioStreamAddPropertyListener", "_AudioStreamRemovePropertyListener"})
+        support.function(core_audio, name, [listener](CpuState& s, GuestMemory&) { listener(s, s.x[3]); });
+    // AudioHardwareUnload(): nothing is loaded that could be unloaded.
+    support.function(core_audio, "_AudioHardwareUnload", [](CpuState& s, GuestMemory&) { status(s, 0); });
+    // AudioObjectShow(object): a debugging aid that prints nothing here.
+    support.function(core_audio, "_AudioObjectShow", [](CpuState&, GuestMemory&) {});
 
     // ---- device I/O ----------------------------------------------------------------------
     const auto device_check = [state](std::uint32_t device) {
@@ -524,6 +639,48 @@ void install_hal(Support& support) {
         hal_io::Timing timing;
         if (!io || !io->now(timing)) return status(s, hal::error::not_running);
         write_time_stamp(m, s.x[1], timing.now_sample, timing.now_host);
+        status(s, 0);
+    });
+
+    // AudioDeviceTranslateTime(device, const AudioTimeStamp *in, AudioTimeStamp *out): a sample time to
+    // host time (or a host time to sample time) along the device's clock, while its output runs.
+    support.function(core_audio, "_AudioDeviceTranslateTime", [state, device_check](CpuState& s, GuestMemory& m) {
+        const auto device = static_cast<std::uint32_t>(s.x[0]);
+        if (!device_check(device)) return status(s, hal::error::bad_device);
+        if (!s.x[1] || !s.x[2]) return status(s, hal::error::param);
+        hal_io::Timing timing;
+        double rate{};
+        if (!device_now(*state, device, timing, rate)) return status(s, hal::error::not_running);
+        const auto flags = m.read32(s.x[1] + 56);
+        double sample{};
+        std::uint64_t host{};
+        if (flags & 1) {   // kAudioTimeStampSampleTimeValid
+            sample = std::bit_cast<double>(m.read64(s.x[1]));
+            host = static_cast<std::uint64_t>(static_cast<std::int64_t>(timing.now_host) + std::llround((sample - timing.now_sample) / rate * 1e9));
+        } else if (flags & 2) {   // kAudioTimeStampHostTimeValid
+            host = m.read64(s.x[1] + 8);
+            sample = timing.now_sample + static_cast<double>(static_cast<std::int64_t>(host - timing.now_host)) * rate / 1e9;
+        } else {
+            return status(s, hal::error::param);
+        }
+        write_time_stamp(m, s.x[2], sample, host);
+        status(s, 0);
+    });
+    // AudioDeviceGetNearestStartTime(device, AudioTimeStamp *ioRequestedStartTime, UInt32 flags): any time
+    // from now on can start I/O; an earlier one becomes now.
+    support.function(core_audio, "_AudioDeviceGetNearestStartTime", [state, device_check](CpuState& s, GuestMemory& m) {
+        const auto device = static_cast<std::uint32_t>(s.x[0]);
+        if (!device_check(device)) return status(s, hal::error::bad_device);
+        if (!s.x[1]) return status(s, hal::error::param);
+        hal_io::Timing timing;
+        double rate{};
+        if (!device_now(*state, device, timing, rate)) return status(s, hal::error::not_running);
+        const auto flags = m.read32(s.x[1] + 56);
+        double sample = timing.now_sample;
+        if (flags & 1) sample = std::max(sample, std::bit_cast<double>(m.read64(s.x[1])));
+        else if (flags & 2) sample = std::max(sample, timing.now_sample + static_cast<double>(static_cast<std::int64_t>(m.read64(s.x[1] + 8) - timing.now_host)) * rate / 1e9);
+        write_time_stamp(m, s.x[1], sample,
+                         static_cast<std::uint64_t>(static_cast<std::int64_t>(timing.now_host) + std::llround((sample - timing.now_sample) / rate * 1e9)));
         status(s, 0);
     });
 

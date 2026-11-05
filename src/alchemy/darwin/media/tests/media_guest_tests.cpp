@@ -267,6 +267,59 @@ void core_video(Fixture& f) {
     require(near(pixel, 0xFF) && near(pixel >> 8, 0x80) && near(pixel >> 16, 0x00) && (pixel >> 24) == 0xFF,
             "the color survives a Y'CbCr round trip: " + std::to_string(pixel));
     require(f.status(vt, "_VTPixelTransferSessionTransferImage", {session, bgra, 0}) == -12902, "no destination");
+    // VTPixelRotationSession: the orange picture with a green top-left pixel, turned clockwise into 20x30.
+    f.engine.write32(base, 0xFF00FF00);
+    const auto close = [](std::uint32_t a, std::uint32_t b) {
+        for (int i = 0; i < 32; i += 8)
+            if (std::abs(static_cast<int>((a >> i) & 0xFF) - static_cast<int>((b >> i) & 0xFF)) > 1) return false;
+        return true;
+    };
+    require(f.status(vt, "_VTPixelRotationSessionCreate", {0, session_out}) == 0, "VTPixelRotationSessionCreate");
+    const auto rotation = f.engine.read64(session_out);
+    require(f.call(cf_library, "_CFGetTypeID", {rotation}) == f.call(vt, "_VTPixelRotationSessionGetTypeID"), "a rotation session type");
+    require(f.status(vt, "_VTSessionSetProperty", {rotation, f.engine.read64(f.symbol(vt, "_kVTPixelRotationPropertyKey_Rotation")),
+                                                  f.engine.read64(f.symbol(vt, "_kVTRotation_CW90"))}) == 0, "rotate clockwise");
+    require(f.status(cv, "_CVPixelBufferCreate", {0, 20, 30, 0x42475241, 0, out}) == 0, "a 20x30 destination");
+    const auto turned = f.engine.read64(out);
+    require(f.status(vt, "_VTPixelRotationSessionRotateImage", {rotation, bgra, small}) == -12902, "the destination must have the rotated size");
+    require(f.status(vt, "_VTPixelRotationSessionRotateImage", {rotation, bgra, turned}) == 0, "rotated");
+    const auto turned_rows = f.call(cv, "_CVPixelBufferGetBytesPerRow", {turned}), turned_base = f.call(cv, "_CVPixelBufferGetBaseAddress", {turned});
+    require(close(f.engine.read32(turned_base + 19 * 4), 0xFF00FF00) && close(f.engine.read32(turned_base), 0xFF0080FF) &&
+            close(f.engine.read32(turned_base + 29 * turned_rows + 19 * 4), 0xFF0080FF), "the top-left pixel is now top-right");
+    require(f.status(vt, "_VTSessionSetProperty", {rotation, f.engine.read64(f.symbol(vt, "_kVTPixelRotationPropertyKey_FlipVerticalOrientation")),
+                                                  f.engine.read64(f.symbol(cf_library, "_kCFBooleanTrue"))}) == 0 &&
+            f.status(vt, "_VTPixelRotationSessionRotateImage", {rotation, bgra, turned}) == 0 &&
+            close(f.engine.read32(turned_base + 29 * turned_rows + 19 * 4), 0xFF00FF00), "then flipped vertically: bottom-right");
+    f.call(vt, "_VTPixelRotationSessionInvalidate", {rotation});
+    require(f.status(vt, "_VTPixelRotationSessionRotateImage", {rotation, bgra, turned}) == -12903, "invalidated");
+    // VTCreateCGImageFromCVPixelBuffer: the 20x30 picture as a premultiplied CGImage.
+    const auto cg_library = "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics";
+    require(f.status(vt, "_VTCreateCGImageFromCVPixelBuffer", {turned, 0, out}) == 0 && f.engine.read64(out) != 0, "VTCreateCGImageFromCVPixelBuffer");
+    const auto cg_image = f.engine.read64(out);
+    require(f.call(cg_library, "_CGImageGetWidth", {cg_image}) == 20 && f.call(cg_library, "_CGImageGetHeight", {cg_image}) == 30 &&
+            f.call(cg_library, "_CGImageGetAlphaInfo", {cg_image}) == 2, "its size, premultiplied alpha");
+    require(f.status(vt, "_VTCreateCGImageFromCVPixelBuffer", {0, 0, out}) == -12902 && f.engine.read64(out) == 0, "no buffer");
+    // No video encoder: an empty list, no encoder properties, no MV-HEVC.
+    require(f.status(vt, "_VTCopyVideoEncoderList", {0, out}) == 0 && f.call(cf_library, "_CFArrayGetCount", {f.engine.read64(out)}) == 0,
+            "an empty encoder list");
+    require(f.status(vt, "_VTCopySupportedPropertyDictionaryForEncoder", {64, 64, 0x61766331, 0, out, session_out}) == -12908, "no encoder");
+    require((f.call(vt, "_VTIsStereoMVHEVCDecodeSupported") & 0xff) == 0, "no MV-HEVC decoding");
+    // The H.273 code points of the colour attachment values.
+    const auto bt2020 = f.engine.read64(f.symbol(cv, "_kCVImageBufferColorPrimaries_ITU_R_2020"));
+    require(f.call(cv, "_CVColorPrimariesGetIntegerCodePointForString", {bt2020}) == 9 &&
+            f.call(cv, "_CVColorPrimariesGetStringForIntegerCodePoint", {9}) == bt2020 &&
+            f.call(cv, "_CVColorPrimariesGetStringForIntegerCodePoint", {99}) == 0 &&
+            f.call(cv, "_CVColorPrimariesGetIntegerCodePointForString", {f.cf.string("nonsense")}) == 2, "colour primaries code points");
+    require(f.call(cv, "_CVTransferFunctionGetIntegerCodePointForString", {f.engine.read64(f.symbol(cv, "_kCVImageBufferTransferFunction_sRGB"))}) == 13 &&
+            f.cf.utf8(f.call(cv, "_CVYCbCrMatrixGetStringForIntegerCodePoint", {6})) == "ITU_R_601_4", "transfer function and matrix code points");
+    // CVPixelBufferIsCompatibleWithAttributes: the 30x20 BGRA buffer against the pool's 8x8, and its own size
+    // with either of two formats.
+    const std::array<Address, 2> formats{f.cf.integer(0x34323076), f.cf.integer(0x42475241)};
+    const std::array<std::pair<Address, Address>, 3> own{{
+        {f.cf.string("Width"), f.cf.integer(30)}, {f.cf.string("Height"), f.cf.integer(20)},
+        {f.cf.string("PixelFormatType"), f.cf.array(std::vector<Address>(formats.begin(), formats.end()))}}};
+    require((f.call(cv, "_CVPixelBufferIsCompatibleWithAttributes", {bgra, f.cf.dictionary(pool_buffers)}) & 0xff) == 0 &&
+            (f.call(cv, "_CVPixelBufferIsCompatibleWithAttributes", {bgra, f.cf.dictionary(own)}) & 0xff) == 1, "CVPixelBufferIsCompatibleWithAttributes");
     // An image buffer as a format description and a sample buffer.
     const auto description_out = f.block(8);
     require(f.status(cm, "_CMVideoFormatDescriptionCreateForImageBuffer", {0, small, description_out}) == 0, "format description for an image buffer");
@@ -552,12 +605,55 @@ void core_audio(Fixture& f) {
     require(played[0] == 0.25f && played[1] == 0.25f, "the IOProc's samples play");
     require(f.status(ca, "_AudioDeviceGetCurrentTime", {device, data}) == 0 && std::bit_cast<double>(f.engine.read64(data)) >= 256 &&
             f.engine.read32(data + 56) == 7, "current time while running");
+    // AudioDeviceTranslateTime: a sample time to host time, and that host time back.
+    const auto in_time = f.block(64), out_time = f.block(64);
+    f.engine.write64(in_time, std::bit_cast<std::uint64_t>(1000.0));
+    f.engine.write32(in_time + 56, 1);   // kAudioTimeStampSampleTimeValid
+    require(f.status(ca, "_AudioDeviceTranslateTime", {device, in_time, out_time}) == 0 && f.engine.read32(out_time + 56) == 7 &&
+            std::bit_cast<double>(f.engine.read64(out_time)) == 1000.0, "sample time to host time");
+    f.engine.write64(in_time + 8, f.engine.read64(out_time + 8));
+    f.engine.write32(in_time + 56, 2);   // kAudioTimeStampHostTimeValid
+    require(f.status(ca, "_AudioDeviceTranslateTime", {device, in_time, out_time}) == 0 &&
+            std::fabs(std::bit_cast<double>(f.engine.read64(out_time)) - 1000.0) < 4800.0,
+            "host time back to sample time (the clock is read again: within 0.1 s)");
+    f.engine.write64(in_time, std::bit_cast<std::uint64_t>(0.0));
+    f.engine.write32(in_time + 56, 1);
+    require(f.status(ca, "_AudioDeviceGetNearestStartTime", {device, in_time, 0}) == 0 && std::bit_cast<double>(f.engine.read64(in_time)) >= 256,
+            "the nearest start time is not in the past");
     require(f.status(ca, "_AudioDeviceStop", {device, proc_id}) == 0, "AudioDeviceStop");
     require(f.status(ca, "_AudioDeviceGetCurrentTime", {device, data}) == hal::error::not_running, "stopped");
+    require(f.status(ca, "_AudioDeviceTranslateTime", {device, in_time, out_time}) == hal::error::not_running, "no translation when stopped");
     require(f.status(ca, "_AudioDeviceDestroyIOProcID", {device, proc_id}) == 0, "IOProc destroyed");
     require(f.status(ca, "_AudioDeviceDestroyIOProcID", {device, proc_id}) == hal::error::illegal_operation, "destroyed twice");
     set(hal::four("dOut"), hal::scope_global);
     require(f.status(ca, "_AudioObjectAddPropertyListener", {1, address, 0x1000, 0}) == 0, "listener");
+
+    // The older property calls: the same properties by direction and channel.
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioHardwareGetProperty", {hal::four("dOut"), size, data}) == 0 && f.engine.read32(data) == device, "AudioHardwareGetProperty");
+    const auto writable = f.block(8);
+    f.engine.write64(writable, 0xff);
+    require(f.status(ca, "_AudioDeviceGetPropertyInfo", {device, 0, 0, hal::four("fsiz"), size, writable}) == 0 && f.engine.read32(size) == 4 &&
+            f.memory().read8(writable) == 1, "AudioDeviceGetPropertyInfo: the buffer size is writable");
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioDeviceGetProperty", {device, 0, 0, hal::four("fsiz"), size, data}) == 0, "AudioDeviceGetProperty");
+    const auto frames = f.engine.read32(data);
+    require(f.status(ca, "_AudioDeviceSetProperty", {device, 0, 0, 0, hal::four("fsiz"), 4, data}) == 0, "AudioDeviceSetProperty");
+    set(hal::four("fsiz"), hal::scope_global);
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioObjectGetPropertyData", {device, address, 0, 0, size, data}) == 0 && f.engine.read32(data) == frames, "the same buffer size");
+    f.engine.write32(size, 64);
+    require(f.status(ca, "_AudioDeviceGetProperty", {device, 0, 0, hal::four("name"), size, data}) == 0 && f.engine.read32(size) > 1 &&
+            f.memory().read8(data) != 0, "the device's C string name");
+    f.engine.write32(size, 64);
+    require(f.status(ca, "_AudioDeviceGetProperty", {device, 0, 0, hal::four("stm#"), size, data}) == 0 && f.engine.read32(size) == 4, "its stream");
+    const auto stream = f.engine.read32(data);
+    f.engine.write32(size, 4);
+    require(f.status(ca, "_AudioStreamGetProperty", {stream, 0, hal::four("sdir"), size, data}) == 0 && f.engine.read32(data) == 0, "AudioStreamGetProperty");
+    require(f.status(ca, "_AudioStreamGetPropertyInfo", {stream, 0, hal::four("sdir"), size, 0}) == 0 && f.engine.read32(size) == 4, "AudioStreamGetPropertyInfo");
+    require(f.status(ca, "_AudioDeviceAddPropertyListener", {device, 0, 0, hal::four("nsrt"), 0x1000, 0}) == 0 &&
+            f.status(ca, "_AudioDeviceAddPropertyListener", {77, 0, 0, hal::four("nsrt"), 0x1000, 0}) == hal::error::bad_object, "older listeners");
+    require(f.status(ca, "_AudioHardwareUnload", {}) == 0, "AudioHardwareUnload");
     require(f.call(ca, "_AudioConvertHostTimeToNanos", {12345}) == 12345, "host time is nanoseconds");
 }
 

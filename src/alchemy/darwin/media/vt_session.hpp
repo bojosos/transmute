@@ -1,7 +1,7 @@
 #pragma once
 
-// The state every VTSession object carries (pixel transfer sessions, pixel_transfer.cpp, and
-// decompression sessions, vt_decompression.cpp): its properties, which VTSessionSetProperty /
+// The state every VTSession object carries (pixel transfer and pixel rotation sessions,
+// pixel_transfer.cpp, and decompression sessions, vt_decompression.cpp): its properties, which VTSessionSetProperty /
 // CopyProperty / SetProperties / CopySupportedPropertyDictionary (pixel_transfer.cpp) keep for
 // the keys of its kind.
 
@@ -15,7 +15,7 @@
 namespace alchemy::gui::fill {
 
 struct VTSessionState final : ObjectPayload {
-    enum class Kind { pixel_transfer, decompression } kind{Kind::pixel_transfer};
+    enum class Kind { pixel_transfer, decompression, pixel_rotation } kind{Kind::pixel_transfer};
     std::mutex mutex;
     std::map<std::string, Address> properties;   // retained values
     bool invalid{};
