@@ -413,16 +413,14 @@ void install_iokit_registry(Provider& p, ObjcRuntime&, CoreFoundation& cf) {
         m.write32(s.x[2], registry->handle(std::nullopt, std::move(found)));
         s.x[0] = kern_success;
     });
-    // io_registry_entry_t IORegistryEntryFromPath(mach_port_t, const io_string_t path): "IOService:/"
-    // (also "IODeviceTree:/") is the root; deeper paths name entries by their names.
-    install("_IORegistryEntryFromPath", [ready](CpuState& s, GuestMemory& m) {
-        const auto path = guest_string(m, s.x[1], 512);
+    // An entry from a registry path: "IOService:/" (also "IODeviceTree:/") is the root; deeper paths name
+    // entries by their names. 0 for none.
+    const auto from_path = [ready](const std::string& path) -> std::uint64_t {
         const auto registry = ready();
-        s.x[0] = 0;
         std::string rest;
         if (path.starts_with("IOService:")) rest = path.substr(10);
         else if (path == "IODeviceTree:/" || path == "IODeviceTree:") rest = "/";
-        else return;
+        else return 0;
         std::vector<std::string> names;
         for (std::size_t at = 0; at < rest.size();) {
             const auto end = rest.find('/', at);
@@ -430,8 +428,13 @@ void install_iokit_registry(Provider& p, ObjcRuntime&, CoreFoundation& cf) {
             if (end == std::string::npos) break;
             at = end + 1;
         }
-        if (const auto found = registry->find_path(names)) s.x[0] = registry->handle(found);
-    });
+        const auto found = registry->find_path(names);
+        return found ? registry->handle(found) : 0;
+    };
+    // io_registry_entry_t IORegistryEntryFromPath(mach_port_t, const io_string_t path)
+    install("_IORegistryEntryFromPath", [from_path](CpuState& s, GuestMemory& m) { s.x[0] = from_path(guest_string(m, s.x[1], 512)); });
+    // io_registry_entry_t IORegistryEntryCopyFromPath(mach_port_t, CFStringRef path): the same, any length.
+    install("_IORegistryEntryCopyFromPath", [from_path, &cf](CpuState& s, GuestMemory&) { s.x[0] = s.x[1] ? from_path(cf.utf8(s.x[1])) : 0; });
     install("_IOIteratorNext", [ready](CpuState& s, GuestMemory&) {
         const auto registry = ready();
         const auto next = registry->next(static_cast<std::uint32_t>(s.x[0]));
@@ -562,17 +565,28 @@ void install_iokit_registry(Provider& p, ObjcRuntime&, CoreFoundation& cf) {
         m.write32(s.x[2], registry->handle(children.front()));
         s.x[0] = kern_success;
     });
-    // kern_return_t IORegistryEntryGetPath(entry, plane, io_string_t path): "IOService:/name/name".
-    install("_IORegistryEntryGetPath", [ready, entry_of, service_plane](CpuState& s, GuestMemory& m) {
-        const auto entry = entry_of(s.x[0]);
-        if (!entry || !s.x[2] || !service_plane(m, s.x[1])) { s.x[0] = io_return_bad_argument; return; }
+    // An entry's path in the IOService plane: "IOService:/name/name".
+    const auto path_of = [ready](std::size_t entry) {
         const auto registry = ready();
         std::vector<std::string> names;
-        for (std::optional<std::size_t> at = *entry; at && registry->entry(*at).parent; at = registry->entry(*at).parent)
+        for (std::optional<std::size_t> at = entry; at && registry->entry(*at).parent; at = registry->entry(*at).parent)
             names.push_back(registry->entry_name(*at));
         std::string path = "IOService:";
         for (auto name = names.rbegin(); name != names.rend(); ++name) path += "/" + *name;
         if (names.empty()) path += "/";
+        return path;
+    };
+    // CFStringRef IORegistryEntryCopyPath(entry, plane): the same as IORegistryEntryGetPath, any length; NULL for
+    // an invalid entry or another plane.
+    install("_IORegistryEntryCopyPath", [entry_of, service_plane, path_of, &cf](CpuState& s, GuestMemory& m) {
+        const auto entry = entry_of(s.x[0]);
+        s.x[0] = entry && service_plane(m, s.x[1]) ? cf.string(path_of(*entry)) : 0;
+    });
+    // kern_return_t IORegistryEntryGetPath(entry, plane, io_string_t path): "IOService:/name/name".
+    install("_IORegistryEntryGetPath", [entry_of, service_plane, path_of](CpuState& s, GuestMemory& m) {
+        const auto entry = entry_of(s.x[0]);
+        if (!entry || !s.x[2] || !service_plane(m, s.x[1])) { s.x[0] = io_return_bad_argument; return; }
+        const auto path = path_of(*entry);
         if (path.size() > 511) { s.x[0] = io_return_bad_argument; return; }
         std::vector<std::uint8_t> bytes(path.begin(), path.end());
         bytes.push_back(0);
@@ -685,7 +699,11 @@ void install_iokit_registry(Provider& p, ObjcRuntime&, CoreFoundation& cf) {
     // Connections are never handed out, so every connect argument is invalid
     // (IOServiceClose: iokit.cpp, which also closes power root ports).
     for (const auto name : {"_IOConnectCallMethod", "_IOConnectCallStructMethod", "_IOConnectCallScalarMethod",
-                            "_IOConnectCallAsyncMethod", "_IOConnectCallAsyncStructMethod", "_IOConnectCallAsyncScalarMethod"})
+                            "_IOConnectCallAsyncMethod", "_IOConnectCallAsyncStructMethod", "_IOConnectCallAsyncScalarMethod",
+                            "_IOConnectSetNotificationPort", "_IOConnectMapMemory", "_IOConnectMapMemory64",
+                            "_IOConnectUnmapMemory", "_IOConnectUnmapMemory64", "_IOConnectSetCFProperty",
+                            "_IOConnectSetCFProperties", "_IOConnectAddClient", "_IOConnectTrap0", "_IOConnectTrap1",
+                            "_IOConnectTrap2", "_IOConnectTrap3", "_IOConnectTrap4", "_IOConnectTrap5", "_IOConnectTrap6"})
         install(name, [](CpuState& s, GuestMemory&) { s.x[0] = 0xe00002c2; });
 }
 

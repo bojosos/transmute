@@ -187,6 +187,16 @@ void registry_walk(Fixture& f) {
     const auto id_a = f.block(8), id_b = f.block(8);
     require(f.status(iokit, "_IORegistryEntryGetRegistryEntryID", {again, id_a}) == 0 && f.status(iokit, "_IORegistryEntryGetRegistryEntryID", {first, id_b}) == 0 &&
             f.engine.read64(id_a) == f.engine.read64(id_b), "the same entry");
+    // The CFString forms: IORegistryEntryCopyPath and IORegistryEntryCopyFromPath.
+    require(f.cf.utf8(f.call(iokit, "_IORegistryEntryCopyPath", {first, f.text("IOService")})) == path &&
+            f.call(iokit, "_IORegistryEntryCopyPath", {first, f.text("IODeviceTree")}) == 0, "IORegistryEntryCopyPath");
+    const auto copied = static_cast<std::uint32_t>(f.call(iokit, "_IORegistryEntryCopyFromPath", {0, f.cf.string(path)}));
+    require(copied != 0 && f.status(iokit, "_IORegistryEntryGetRegistryEntryID", {copied, id_a}) == 0 &&
+            f.engine.read64(id_a) == f.engine.read64(id_b), "IORegistryEntryCopyFromPath");
+    require(f.call(iokit, "_IORegistryEntryCopyFromPath", {0, f.cf.string("IOService:/NoSuchEntry")}) == 0, "no such path");
+    // No connection exists, so the IOConnect calls refuse any argument.
+    require(f.status(iokit, "_IOConnectMapMemory64", {0x1234, 0, 0, f.block(8), f.block(8), 1}) == 0xe00002c2 &&
+            f.status(iokit, "_IOConnectTrap0", {0x1234, 0}) == 0xe00002c2, "IOConnect calls: kIOReturnBadArgument");
     // Child and parent iterators.
     const auto iterator = f.block(4);
     require(f.status(iokit, "_IORegistryEntryGetChildIterator", {root, f.text("IOService"), iterator}) == 0 &&
