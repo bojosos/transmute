@@ -9,6 +9,7 @@ Result<CpuTimes> cpu_times() { return Error::unsupported; }
 Result<std::vector<CpuTimes>> processor_times() { return Error::unsupported; }
 Result<std::array<std::uint8_t, 16>> machine_uuid() { return Error::unsupported; }
 Result<Pressure> memory_pressure() { return Error::unsupported; }
+Result<std::array<double, 3>> load_average() { return Error::unsupported; }
 Result<std::string> host_name(bool) { return Error::unsupported; }
 Result<std::string> user_name() { return Error::unsupported; }
 Result<PowerRequest> PowerRequest::create(std::string_view, bool, bool) { return Error::unsupported; }

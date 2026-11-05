@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <functional>
 #include <mutex>
 
@@ -76,6 +78,44 @@ Result<Pressure> memory_pressure() {
     // Without the high-memory notification, assume plenty.
     if (!high || (QueryMemoryResourceNotification(high, &state) && state)) return Pressure::normal;
     return Pressure::warning;
+}
+
+Result<std::array<double, 3>> load_average() {
+    struct State {
+        std::mutex mutex;
+        bool started{};
+        std::uint64_t busy_ns{}, total_ns{};
+        std::chrono::steady_clock::time_point at;
+        std::array<double, 3> averages{};
+    };
+    static State state;
+    const auto times = cpu_times();
+    if (!times) return times.error();
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const auto processors = static_cast<double>(std::max<DWORD>(1, info.dwNumberOfProcessors));
+    const auto busy_ns = times->user_ns + times->system_ns, total_ns = busy_ns + times->idle_ns;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(state.mutex);
+    const auto busy = [&](std::uint64_t busy_delta, std::uint64_t total_delta) {
+        return total_delta ? processors * static_cast<double>(busy_delta) / static_cast<double>(total_delta) : 0.0;
+    };
+    if (!state.started) {
+        state.averages.fill(busy(busy_ns, total_ns));
+        state.started = true;
+    } else if (total_ns > state.total_ns) {
+        const auto load = busy(busy_ns - std::min(busy_ns, state.busy_ns), total_ns - state.total_ns);
+        const auto elapsed = std::chrono::duration<double>(now - state.at).count();
+        constexpr std::array<double, 3> periods{60.0, 300.0, 900.0};
+        for (std::size_t index = 0; index < periods.size(); ++index) {
+            const auto kept = std::exp(-elapsed / periods[index]);
+            state.averages[index] = state.averages[index] * kept + load * (1.0 - kept);
+        }
+    } else return state.averages;   // no processor time has passed since the last call
+    state.busy_ns = busy_ns;
+    state.total_ns = total_ns;
+    state.at = now;
+    return state.averages;
 }
 
 Result<std::string> host_name(bool physical) {

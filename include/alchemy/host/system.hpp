@@ -3,7 +3,7 @@
 // Host area "system" (owner: r2). The rules are in include/alchemy/host/host.hpp. Machine facts:
 // CPU, memory and memory pressure, power and battery, network adapters, host and user names.
 // Written by r1 for libSystem (cross-owner, agreed with r2): cpu_times, processor_times,
-// machine_uuid, memory_pressure.
+// machine_uuid, memory_pressure, load_average.
 // Written by r3 for IOKit (cross-owner, agreed with r2): power_status, watch_sleep,
 // watch_power_source.
 
@@ -42,6 +42,13 @@ struct CpuTimes {
 // critical when memory is low, normal when it is plentiful, else warning.
 enum class Pressure : std::uint8_t { normal, warning, critical };
 [[nodiscard]] Result<Pressure> memory_pressure();
+
+// The 1, 5 and 15 minute load averages (getloadavg, sysctl vm.loadavg): how
+// many processors were busy, averaged with exponential decay over those
+// periods. Each call folds in the use since the last one; the first starts
+// from the average since boot. Threads waiting for a processor are not
+// counted, so the values stay at or below the processor count.
+[[nodiscard]] Result<std::array<double, 3>> load_average();
 
 // The machine's DNS host name (gethostname, SCDynamicStoreCopyComputerName).
 // `physical` asks for the computer's own name rather than the one it answers

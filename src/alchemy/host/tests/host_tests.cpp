@@ -532,6 +532,7 @@ void null_backend() {
     require(host::system::cpu_times().error() == host::Error::unsupported &&
                 host::system::processor_times().error() == host::Error::unsupported &&
                 host::system::machine_uuid().error() == host::Error::unsupported &&
+                host::system::load_average().error() == host::Error::unsupported &&
                 host::system::host_name().error() == host::Error::unsupported &&
                 host::system::user_name().error() == host::Error::unsupported &&
                 host::system::PowerRequest::create("test", true, false).error() == host::Error::unsupported &&
@@ -1197,6 +1198,11 @@ void real_backend() {
     const auto processors = host::system::processor_times();
     require(total && total->user_ns + total->system_ns + total->idle_ns > 0, "system CPU times");
     require(processors && !processors->empty(), "per-processor CPU times");
+    const auto first_load = host::system::load_average(), second_load = host::system::load_average();
+    const auto load_in_range = [&](const auto& load) {
+        return load && std::ranges::all_of(*load, [&](double value) { return value >= 0 && value <= static_cast<double>(processors->size()) + 0.01; });
+    };
+    require(load_in_range(first_load) && load_in_range(second_load), "load averages within the processor count");
     const auto uuid = host::system::machine_uuid();
     require(uuid && *uuid != std::array<std::uint8_t, 16>{} && *host::system::machine_uuid() == *uuid, "a stable machine uuid");
     require(static_cast<bool>(host::net::initialize()), "net::initialize");
