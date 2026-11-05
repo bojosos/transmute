@@ -967,6 +967,130 @@ void test_b17(Fixture& f) {
             "another process's priority is ENOTSUP");
 }
 
+// fs/attrlist.cpp: the getattrlist(2) family.
+void test_b18(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy-attrlist";
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    std::filesystem::create_directories(directory);
+    std::ofstream(directory / "attr.txt") << "hello";
+    const auto guest_directory = alchemy::guest_path_string(directory), path = guest_directory + "/attr.txt";
+    const auto list = f.process.allocate_guest(24), buffer = f.process.allocate_guest(1024), status = f.process.allocate_guest(144);
+    const auto set_list = [&f, list](std::uint32_t common, std::uint32_t volume, std::uint32_t dir, std::uint32_t file, std::uint32_t count = 5) {
+        f.engine.fill_bytes(list, 0, 24);
+        f.engine.write32(list, count);
+        f.engine.write32(list + 4, common); f.engine.write32(list + 8, volume); f.engine.write32(list + 12, dir); f.engine.write32(list + 16, file);
+    };
+    const auto reference = [&f, buffer](std::uint64_t at) { return f.read(buffer + at + static_cast<std::int32_t>(f.engine.read32(buffer + at))); };
+    // A file: the returned set, then NAME, OBJTYPE, MODTIME, USERACCESS, FILEID, FULLPATH; LINKCOUNT, TOTALSIZE.
+    set_list(0x80000000U | 0x1 | 0x8 | 0x400 | 0x200000 | 0x2000000 | 0x8000000, 0, 0, 0x1 | 0x2);
+    require(f.sys("_getattrlist", {f.text(path), list, buffer, 1024, 0}) == 0 && f.sys("_stat", {f.text(path), status}) == 0, "getattrlist of a file");
+    require(f.engine.read32(buffer + 4) == (0x80000000U | 0x1 | 0x8 | 0x400 | 0x200000 | 0x2000000 | 0x8000000) &&
+            f.engine.read32(buffer + 16) == 3, "the returned attribute set");
+    require(reference(24) == "attr.txt" && f.engine.read32(buffer + 32) == 1, "NAME and OBJTYPE");
+    require(f.engine.read64(buffer + 36) == f.engine.read64(status + 48) && f.engine.read64(buffer + 44) == f.engine.read64(status + 56), "MODTIME");
+    require((f.engine.read32(buffer + 52) & 6) == 6 && f.engine.read64(buffer + 56) == f.engine.read64(status + 8), "USERACCESS and FILEID");
+    const auto full = reference(64);
+    require(full.size() > 9 && full.substr(full.size() - 9) == "/attr.txt" && f.engine.read32(buffer + 72) == 1 && f.engine.read64(buffer + 76) == 5,
+            "FULLPATH, LINKCOUNT and TOTALSIZE");
+    require(f.engine.read32(buffer) == 96 + full.size() + 1 + (4 - (full.size() + 1) % 4) % 4, "the length counts the variable data");
+    // Too small a buffer: the length is what was written, or with FSOPT_REPORT_FULLSIZE the whole size.
+    const auto whole = f.engine.read32(buffer);
+    require(f.sys("_getattrlist", {f.text(path), list, buffer, 8, 0}) == 0 && f.engine.read32(buffer) == 8 &&
+            f.sys("_getattrlist", {f.text(path), list, buffer, 8, 0x4}) == 0 && f.engine.read32(buffer) == whole, "truncation");
+    // An attribute not kept here: left out, or zeros with FSOPT_PACK_INVAL_ATTRS; never in the returned set.
+    set_list(0x80000000U | 0x80000, 0, 0, 0);
+    require(f.sys("_getattrlist", {f.text(path), list, buffer, 1024, 0}) == 0 && f.engine.read32(buffer) == 24 && f.engine.read32(buffer + 4) == 0x80000000U &&
+            f.sys("_getattrlist", {f.text(path), list, buffer, 1024, 0x8}) == 0 && f.engine.read32(buffer) == 28, "GEN_COUNT is not returned");
+    // A directory: OBJTYPE and ENTRYCOUNT (file attributes are not returned for it).
+    set_list(0x8, 0, 0x2, 0x2);
+    require(f.sys("_getattrlist", {f.text(guest_directory), list, buffer, 1024, 0}) == 0 && f.engine.read32(buffer) == 12 &&
+            f.engine.read32(buffer + 4) == 2 && f.engine.read32(buffer + 8) == 1, "a directory's type and entry count");
+    // The volume at /: its capabilities say attribute lists are supported.
+    set_list(0, 0x80000000U | 0x20000, 0, 0);
+    const auto volume_result = f.sys("_getattrlist", {f.text("/"), list, buffer, 1024, 0});
+    const auto root_info = f.process.allocate_guest(2168);
+    f.sys("_statfs", {f.text("/"), root_info});
+    require(volume_result == 0, "getattrlist of / with volume attributes: result " + std::to_string(volume_result) + " errno " +
+            std::to_string(errno_value()) + ", statfs mount point '" + f.read(root_info + 88) + "'");
+    require(f.engine.read32(buffer) == 36 && (f.engine.read32(buffer + 8) & 0x2) && f.engine.read32(buffer + 24) == 0x001F7FFF,
+            "the volume's capabilities");
+    set_list(0x8000000, 0, 0, 0);
+    const auto root_result = f.sys("_getattrlist", {f.text("/"), list, buffer, 1024, 0});
+    require(root_result == 0, "FULLPATH of /: errno " + std::to_string(errno_value()));
+    // (Without an Alchemy root, / is the host drive, whose path is /Volumes/C.)
+    const auto root_path = reference(4);
+    require(root_path == "/" || (root_path.front() == '/' && root_path.back() != '/'), "FULLPATH of / is '" + root_path + "'");
+    // EINVAL: volume attributes not at the root, without ATTR_VOL_INFO, the wrong bitmap count.
+    set_list(0, 0x80000000U | 0x20000, 0, 0);
+    require(f.sys("_getattrlist", {f.text(path), list, buffer, 1024, 0}) == UINT64_MAX && errno_value() == 22, "volume attributes of a file");
+    set_list(0, 0x20000, 0, 0);
+    require(f.sys("_getattrlist", {f.text("/"), list, buffer, 1024, 0}) == UINT64_MAX && errno_value() == 22, "volume attributes without ATTR_VOL_INFO");
+    set_list(0x1, 0, 0, 0, 4);
+    require(f.sys("_getattrlist", {f.text(path), list, buffer, 1024, 0}) == UINT64_MAX && errno_value() == 22, "ATTR_BIT_MAP_COUNT");
+    set_list(0x1, 0, 0, 0);
+    require(f.sys("_getattrlist", {f.text(guest_directory + "/missing"), list, buffer, 1024, 0}) == UINT64_MAX && errno_value() == 2, "ENOENT");
+    // fgetattrlist and getattrlistat name the same file.
+    set_list(0x1, 0, 0, 0);
+    const auto fd = f.sys("_open", {f.text(path), 0});
+    require(fd < 1024 && f.sys("_fgetattrlist", {fd, list, buffer, 1024, 0}) == 0 && reference(4) == "attr.txt", "fgetattrlist");
+    f.sys("_close", {fd});
+    require(f.sys("_getattrlistat", {static_cast<Address>(-2), f.text(path), list, buffer, 1024, 0}) == 0 && reference(4) == "attr.txt", "getattrlistat");
+    // setattrlist: CRTIME, MODTIME and ACCTIME, FNDRINFO, FLAGS (only the ones it has); CHGTIME cannot be set.
+    set_list(0x200 | 0x400 | 0x1000 | 0x4000, 0, 0, 0);
+    const std::array<std::uint64_t, 6> times{1'400'000'000, 0, 1'600'000'000, 500, 1'500'000'000, 0};
+    for (std::size_t k = 0; k < times.size(); ++k) f.engine.write64(buffer + k * 8, times[k]);
+    auto& memory = static_cast<transmute::GuestMemory&>(f.engine);
+    for (std::uint64_t k = 0; k < 32; ++k) memory.write8(buffer + 48 + k, static_cast<std::uint8_t>(k + 1));
+    {
+        // Step by step: CRTIME alone, then MODTIME and ACCTIME.
+        const auto step = f.process.allocate_guest(64);
+        set_list(0x200, 0, 0, 0);
+        f.engine.write64(step, 1'300'000'000); f.engine.write64(step + 8, 0);
+        const auto crtime = f.sys("_setattrlist", {f.text(path), list, step, 16, 0});
+        f.sys("_stat", {f.text(path), status});
+        require(crtime == 0 && f.engine.read64(status + 80) == 1'300'000'000,
+                "CRTIME alone: result " + std::to_string(crtime) + " birth " + std::to_string(f.engine.read64(status + 80)));
+        set_list(0x400 | 0x1000, 0, 0, 0);
+        f.engine.write64(step, 1'610'000'000); f.engine.write64(step + 8, 0); f.engine.write64(step + 16, 1'510'000'000); f.engine.write64(step + 24, 0);
+        const auto times_result = f.sys("_setattrlist", {f.text(path), list, step, 32, 0});
+        f.sys("_stat", {f.text(path), status});
+        require(times_result == 0 && f.engine.read64(status + 48) == 1'610'000'000 && f.engine.read64(status + 32) == 1'510'000'000,
+                "MODTIME and ACCTIME: result " + std::to_string(times_result) + " modified " + std::to_string(f.engine.read64(status + 48)) +
+                " accessed " + std::to_string(f.engine.read64(status + 32)));
+        // The three times together, then the Finder information alone.
+        set_list(0x200 | 0x400 | 0x1000, 0, 0, 0);
+        const auto three = f.sys("_setattrlist", {f.text(path), list, buffer, 48, 0});
+        f.sys("_stat", {f.text(path), status});
+        require(three == 0 && f.engine.read64(status + 80) == 1'400'000'000 && f.engine.read64(status + 48) == 1'600'000'000,
+                "three times: birth " + std::to_string(f.engine.read64(status + 80)) + " modified " + std::to_string(f.engine.read64(status + 48)));
+        set_list(0x4000, 0, 0, 0);
+        const auto finder = f.sys("_setattrlist", {f.text(path), list, buffer + 48, 32, 0});
+        f.sys("_stat", {f.text(path), status});
+        require(finder == 0 && f.engine.read64(status + 80) == 1'400'000'000 && f.engine.read64(status + 48) == 1'600'000'000,
+                "FNDRINFO leaves the times: birth " + std::to_string(f.engine.read64(status + 80)) + " modified " + std::to_string(f.engine.read64(status + 48)));
+        set_list(0x200 | 0x400 | 0x1000 | 0x4000, 0, 0, 0);
+    }
+    const auto set_result = f.sys("_setattrlist", {f.text(path), list, buffer, 80, 0});
+    require(set_result == 0, "setattrlist: errno " + std::to_string(errno_value()));
+    require(f.sys("_stat", {f.text(path), status}) == 0 && f.engine.read64(status + 80) == 1'400'000'000 &&
+            f.engine.read64(status + 48) == 1'600'000'000 && f.engine.read64(status + 56) == 500 && f.engine.read64(status + 32) == 1'500'000'000,
+            "setattrlist times: birth " + std::to_string(f.engine.read64(status + 80)) + " modified " + std::to_string(f.engine.read64(status + 48)) +
+            "." + std::to_string(f.engine.read64(status + 56)) + " accessed " + std::to_string(f.engine.read64(status + 32)));
+    set_list(0x4000, 0, 0, 0);
+    require(f.sys("_getattrlist", {f.text(path), list, buffer, 1024, 0}) == 0 && f.engine.read32(buffer) == 36 &&
+            memory.read8(buffer + 4) == 1 && memory.read8(buffer + 35) == 32, "FNDRINFO round trip");
+    set_list(0x40000, 0, 0, 0);
+    f.engine.write32(buffer, 0);
+    require(f.sys("_setattrlist", {f.text(path), list, buffer, 4, 0}) == 0, "setting the flags it has");
+    f.engine.write32(buffer, 0x8000);
+    require(f.sys("_setattrlist", {f.text(path), list, buffer, 4, 0}) == UINT64_MAX && errno_value() == 45, "other flags are ENOTSUP");
+    set_list(0x800, 0, 0, 0);
+    require(f.sys("_setattrlist", {f.text(path), list, buffer, 16, 0}) == UINT64_MAX && errno_value() == 22, "CHGTIME cannot be set");
+    std::filesystem::remove_all(directory, ignored);
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -1339,6 +1463,7 @@ int main() {
         stage("itimers"); test_itimers(f);
         stage("b16"); test_b16(f);
         stage("b17"); test_b17(f);
+        stage("b18"); test_b18(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

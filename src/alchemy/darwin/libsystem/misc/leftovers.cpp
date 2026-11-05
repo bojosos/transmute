@@ -41,7 +41,7 @@
 //   ENOENT (macOS's answer for a file without one); the entry and permset
 //   accessors fail with EINVAL, as no acl_t can exist.
 // - __mac_syscall: no MAC policy module is loaded (ENOSYS).
-// - getattrlist: not provided by the host filesystem layer (ENOTSUP).
+// - getattrlist and its family: fs/attrlist.cpp (installed earlier, with the gaps).
 // - csops operations other than CS_OPS_STATUS: ENOTSUP (no code signature).
 namespace alchemy::gui::fill {
 namespace {
@@ -351,10 +351,7 @@ void Leftovers::install() {
         const auto length = call(libsystem, "_confstr", {65536 + s.x[0], s.x[1], s.x[2]});
         return length && length <= s.x[2] ? s.x[1] : 0;
     });
-    // Attribute lists (getattrlist(2) family): no volume here offers them, as a file system
-    // without attribute-list support answers.
-    for (const auto name : {"_getattrlist", "_fgetattrlist", "_getattrlistat", "_setattrlist", "_fsetattrlist", "_setattrlistat"})
-        fn(libsystem, name, [this](CpuState&, GuestMemory&) { set_errno(enotsup); return minus_one; });
+    // The getattrlist(2) family: fs/attrlist.cpp.
     fn(libsystem, "_posix_spawn_file_actions_addchdir", [this](CpuState& s, GuestMemory&) {
         return call(libsystem, "_posix_spawn_file_actions_addchdir_np", {s.x[0], s.x[1]});
     });

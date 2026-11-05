@@ -56,6 +56,7 @@ list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES
 #   misc/bsd_extra.cpp, net/netdb_extra.cpp, mach/mach_extra.cpp: BSD libc, netdb (the /etc
 #     databases) and Mach user-library leftovers; pieces of install_libsystem_gaps (fill-only).
 #   fs/wordexp.cpp: wordexp(3)/wordfree(3), the shell's word expansions (fill-only).
+#   fs/attrlist.cpp: getattrlist(2) and setattrlist(2) and their f/at forms (fill-only).
 #   */libsystem_*.cpp: libSystem names a renderer plug-in's images import, fill-only
 #     (libsystem::install_libsystem_gaps and install_libsystem_services rows;
 #     shared kit src/alchemy/darwin/kit/export_fill/).
@@ -99,6 +100,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/libsystem/net/netdb_extra.cpp
     src/alchemy/darwin/libsystem/mach/mach_extra.cpp
     src/alchemy/darwin/libsystem/fs/wordexp.cpp
+    src/alchemy/darwin/libsystem/fs/attrlist.cpp
     src/alchemy/darwin/libsystem/process/foundation_threads.cpp
     src/alchemy/darwin/libsystem/process/process_io.cpp
     src/alchemy/darwin/libsystem/misc/system_c.cpp

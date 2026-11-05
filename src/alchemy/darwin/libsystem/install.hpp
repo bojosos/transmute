@@ -52,4 +52,5 @@ void install_libsystem_bsd_extra(Provider& p);       // misc/bsd_extra.cpp: BSD 
 void install_libsystem_netdb_extra(Provider& p);     // net/netdb_extra.cpp: netdb leftovers and the /etc databases
 void install_libsystem_mach_extra(Provider& p);      // mach/mach_extra.cpp: the MIG server loop, mig_*, clock_sleep, ...
 void install_libsystem_wordexp(Provider& p);         // fs/wordexp.cpp: wordexp(3), wordfree(3)
+void install_libsystem_attrlist(Provider& p);        // fs/attrlist.cpp: the getattrlist(2) family
 } // namespace alchemy::export_fill

@@ -113,6 +113,13 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   getgrouplist, lockf over fcntl locks, ctermid_r. lutimes and utimensat(AT_SYMLINK_NOFOLLOW)
   set a symbolic link's own times (`fs/files.cpp`). sigwait (no pending-signal model yet) and
   sigaltstack stay ENOSYS.
+* **Attribute lists** (alchemy-fx, `install_libsystem_gaps`): `fs/attrlist.cpp`, the getattrlist(2)
+  family (get/set, f and at forms) packed from stat, statfs, the extended attributes and the host
+  volume: the common attributes this file system keeps, the directory and file ones, the volume's
+  (capabilities as the host file system has them) and the extended common ones; the rest is left
+  out (or zeros with FSOPT_PACK_INVAL_ATTRS) and ATTR_CMN_RETURNED_ATTRS says so. setattrlist sets
+  the creation, modification and access times, the Finder information, the mode and (only the
+  ones it has) the flags.
 * **Word expansion and dates** (alchemy-fx, `install_libsystem_gaps`): `fs/wordexp.cpp`
   (wordexp/wordfree: the shell's expansions in the shell's order — tilde, the ${...} parameter
   forms over the environment, command substitution through the guest's popen and /bin/sh,
