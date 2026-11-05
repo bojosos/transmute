@@ -176,12 +176,7 @@ void install_coreservices(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         return lower(type_string(s.x[0])) == lower(type_string(s.x[1])) ? 1 : 0;
     });
 
-    // ---- LaunchServices ----
-    // CFURLRef LSCopyDefaultApplicationURLForURL(CFURLRef, LSRolesMask, CFErrorRef*)
-    function("_LSCopyDefaultApplicationURLForURL", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
-        if (s.x[2]) m.write64(s.x[2], 0);
-        return 0;
-    });
+    // LaunchServices: launch_services.cpp's application registry.
 }
 
 } // namespace alchemy::export_fill

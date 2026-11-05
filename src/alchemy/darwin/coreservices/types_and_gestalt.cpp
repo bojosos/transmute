@@ -97,12 +97,9 @@ public:
             m.write32(s.x[1], static_cast<std::uint32_t>(*value));
             s.x[0] = 0;
         });
-        // No applications are registered with Launch Services in Alchemy.
+        // LSCopyDefaultApplicationURLForContentType: launch_services_headless.cpp (alchemy.exe) or
+        // launch_services.cpp's application registry (alchemy-fx).
         constexpr std::int32_t application_not_found = -10814;
-        function(core_services, "_LSCopyDefaultApplicationURLForContentType", [](CpuState& s, GuestMemory& m) {
-            if (s.x[2]) m.write64(s.x[2], 0);
-            s.x[0] = 0;
-        });
         function(core_services, "_LSOpenCFURLRef", [this](CpuState& s, GuestMemory& m) {
             const auto text = std::string("Alchemy: LSOpenCFURLRef is unsupported (no Launch Services); the URL was not opened\n");
             static_cast<void>(context.output(2, std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size())));

@@ -46,6 +46,9 @@ void install_user_defaults_shell(ProcessContext& process, ObjcRuntime& objc, Cor
 void install_cf_date_formatter_shell(ProcessContext& process);
 // CFSocket*, explicit failures; alchemy-fx: darwin/network/socket.cpp.
 void install_cfsocket_shell(ProcessContext& process);
+// LSCopyDefaultApplicationURLForContentType without an application registry (NULL);
+// alchemy-fx: darwin/coreservices/launch_services.cpp's registry.
+void install_launch_services_shell(ProcessContext& process);
 // AuthorizationCreate / AuthorizationExecuteWithPrivileges; alchemy-fx:
 // darwin/security/code_signing.cpp.
 void install_authorization_shell(ProcessContext& process);

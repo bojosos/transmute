@@ -187,8 +187,7 @@ void install_uttypes(Support& support) {
         if (text.size() == 4) for (const auto c : text) code = (code << 8) | static_cast<unsigned char>(c);
         s.x[0] = code;
     });
-    // CFArrayRef LSCopyApplicationURLsForURL(CFURLRef, LSRolesMask): no registered applications.
-    support.fill_function(core_services_library, "_LSCopyApplicationURLsForURL", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    // LSCopyApplicationURLsForURL: launch_services.cpp's application registry.
 }
 
 } // namespace alchemy::gui::completion_kit::data

@@ -4,7 +4,7 @@
 #
 # Unicode collation (UnicodeUtilities) over the host's linguistic comparison,
 # UTType functions and the UTType class over one type table (uttype.cpp),
-# LaunchServices answers (no application registry), Apple Event descriptors
+# LaunchServices answers (an application registry in launch_services.cpp), Apple Event descriptors
 # without an Apple Event server, the accessibility client without an
 # accessibility server, and the other system-service gaps in services.cpp.
 list(APPEND ALCHEMY_GUI_SOURCES
@@ -45,11 +45,17 @@ list(APPEND ALCHEMY_GUI_SOURCES
 alchemy_gui_add_framework_case(coreservices_launch_services src/alchemy/darwin/coreservices/tests/coreservices_cases_tests.cpp)
 alchemy_gui_add_framework_case(coreservices_carbon_core src/alchemy/darwin/coreservices/tests/coreservices_cases_tests.cpp)
 alchemy_gui_add_framework_case(coreservices_file_manager src/alchemy/darwin/coreservices/tests/coreservices_cases_tests.cpp)
+alchemy_gui_add_framework_case(coreservices_application_registry src/alchemy/darwin/coreservices/tests/coreservices_cases_tests.cpp)
 
 # Headless additions (both builds; darwin/headless_additions.hpp), moved from
 # darwin/identities/installer_frameworks.cpp:
 target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/coreservices/types_and_gestalt.cpp)
+# Headless shell (darwin/foundation/headless_shells.hpp): alchemy.exe only; the
+# _fx twin is empty, because there launch_services.cpp's registry owns the name.
+target_sources(alchemy_core PRIVATE src/alchemy/darwin/coreservices/launch_services_headless.cpp)
+list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES src/alchemy/darwin/coreservices/launch_services_headless.cpp)
+list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/coreservices/launch_services_fx.cpp)
 
 # Headless framework set (both builds; darwin/headless_additions.hpp), moved
 # from darwin/identities/frameworks.cpp:

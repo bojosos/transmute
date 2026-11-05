@@ -2,13 +2,27 @@
 
 #include "alchemy/darwin/coreservices/uttype.hpp"
 
+#include <algorithm>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
 // CoreServices: LaunchServices, Spotlight, Time Machine, the Component
 // Manager and UTI queries.
 // - LaunchServices registration and login items cannot be changed (no
 //   LaunchServices server: kLSServerCommunicationErr / NULL); display names
 //   and UTI tag queries are real (the UTI table of the CoreServices provider).
-//   No application is registered, so the handler and application queries
-//   find none (NULL, kLSApplicationNotFoundErr). UTTypeIsDeclared,
+//   The application registry is the applications in the guest root's
+//   Applications folders (/Applications and its subfolders one level down,
+//   /System/Applications, ~/Applications), read once from their Info.plist:
+//   bundle identifier, URL schemes (CFBundleURLTypes) and document types
+//   (CFBundleDocumentTypes: content types, extensions, role, LSHandlerRank).
+//   The handler and application queries answer from it: the default
+//   handler is the claiming application with the highest rank (a specific
+//   content type or extension before a wildcard), the first found among
+//   equals. Defaults cannot be changed (there is no LaunchServices
+//   database). UTTypeIsDeclared,
 //   UTTypeIsDynamic and UTTypeCopyDeclaringBundleURL (the system types are
 //   CoreTypes.bundle's) answer from the UTI table. The item queries over
 //   FSRefs and URLs are file_manager.cpp's.
@@ -21,6 +35,40 @@ namespace alchemy::gui::fill {
 namespace {
 
 constexpr std::int32_t ls_server_communication = -10822, ls_application_not_found = -10814, unimp_err = -4, param_err = -50;
+// LSRolesMask.
+constexpr std::uint32_t role_none = 1, role_viewer = 2, role_editor = 4, role_shell = 8;
+
+namespace uti = completion_kit::uttype;
+
+std::string lower(std::string text) {
+    for (auto& c : text) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return text;
+}
+
+struct DocumentType {
+    std::vector<std::string> content_types, extensions;   // extensions lower-case
+    std::uint32_t roles{};
+    int rank{2};
+};
+struct Application {
+    std::string path, identifier, name;
+    std::vector<std::string> schemes;   // lower-case
+    int scheme_rank{2};
+    std::vector<DocumentType> documents;
+};
+int rank_of(const std::string& value) {
+    if (value == "Owner") return 3;
+    if (value == "Alternate") return 1;
+    if (value == "None") return 0;
+    return 2;   // Default
+}
+std::uint32_t roles_of(const std::string& value) {
+    if (value == "Editor") return role_editor | role_viewer;
+    if (value == "Viewer") return role_viewer;
+    if (value == "Shell") return role_shell;
+    if (value == "None") return role_none;
+    return role_editor | role_viewer;   // CFBundleTypeRole defaults to Editor
+}
 
 class LaunchServices final : public Provider {
 public:
@@ -28,6 +76,178 @@ public:
     Address item_last{};
 
     void install();
+
+    // ---- the application registry ----
+    std::once_flag scanned;
+    std::vector<Application> applications;
+
+    std::string text_of(Address object) { return object && bridge->is_string(object) ? cf.utf8(object) : std::string(); }
+    Address value_of(Address dictionary, std::string_view key) {
+        if (!dictionary || !bridge->is_dictionary(dictionary)) return 0;
+        const auto name = cf.string(key);
+        const auto value = cf.dictionary_value(dictionary, name);
+        release(name);
+        return value;
+    }
+    std::vector<std::string> strings_of(Address array, bool fold) {
+        std::vector<std::string> out;
+        if (!array) return out;
+        if (bridge->is_string(array)) { out.push_back(fold ? lower(cf.utf8(array)) : cf.utf8(array)); return out; }
+        if (!bridge->is_array(array)) return out;
+        for (const auto item : cf.array_values(array))
+            if (bridge->is_string(item)) out.push_back(fold ? lower(cf.utf8(item)) : cf.utf8(item));
+        return out;
+    }
+    std::vector<std::string> directory(const std::string& path) {
+        const auto manager_class = objc.find_class("NSFileManager");
+        if (!manager_class) return {};
+        const auto manager = objc.send(manager_class, "defaultManager").x0;
+        CallRegs registers{};
+        registers.x[2] = cf.string(path);
+        registers.x[3] = 0;
+        const auto names = objc.send(manager, "contentsOfDirectoryAtPath:error:", registers).x0;
+        release(registers.x[2]);
+        std::vector<std::string> out;
+        if (names) for (const auto name : cf.array_values(names)) out.push_back(cf.utf8(name));
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+    void add_application(const std::string& path) {
+        const auto url = cf.file_url(path, true);
+        const auto bundle = call(core_foundation, "_CFBundleCreate", {0, url});
+        release(url);
+        if (!bundle) return;
+        const auto info = call(core_foundation, "_CFBundleGetInfoDictionary", {bundle});
+        Application app;
+        app.path = path;
+        app.identifier = text_of(value_of(info, "CFBundleIdentifier"));
+        app.name = text_of(value_of(info, "CFBundleName"));
+        if (app.name.empty()) {
+            app.name = path.substr(path.find_last_of('/') + 1);
+            if (app.name.ends_with(".app")) app.name.resize(app.name.size() - 4);
+        }
+        if (const auto types = value_of(info, "CFBundleURLTypes"); types && bridge->is_array(types))
+            for (const auto type : cf.array_values(types)) {
+                for (auto& scheme : strings_of(value_of(type, "CFBundleURLSchemes"), true)) app.schemes.push_back(std::move(scheme));
+                if (const auto rank = text_of(value_of(type, "LSHandlerRank")); !rank.empty()) app.scheme_rank = rank_of(rank);
+            }
+        if (const auto types = value_of(info, "CFBundleDocumentTypes"); types && bridge->is_array(types))
+            for (const auto type : cf.array_values(types)) {
+                DocumentType document;
+                document.content_types = strings_of(value_of(type, "LSItemContentTypes"), false);
+                document.extensions = strings_of(value_of(type, "CFBundleTypeExtensions"), true);
+                document.roles = roles_of(text_of(value_of(type, "CFBundleTypeRole")));
+                document.rank = rank_of(text_of(value_of(type, "LSHandlerRank")));
+                if (!document.content_types.empty() || !document.extensions.empty()) app.documents.push_back(std::move(document));
+            }
+        release(bundle);
+        applications.push_back(std::move(app));
+    }
+    const std::vector<Application>& registry() {
+        std::call_once(scanned, [this] {
+            std::vector<std::string> roots{"/Applications", "/System/Applications"};
+            const auto key = strdup("HOME");
+            const auto home = call(libsystem, "_getenv", {key});
+            free(key);
+            if (home) if (const auto path = read_cstring(memory(), home); !path.empty() && path != "/") roots.push_back(path + "/Applications");
+            for (const auto& root : roots)
+                for (const auto& name : directory(root)) {
+                    const auto path = root + "/" + name;
+                    if (name.ends_with(".app")) { add_application(path); continue; }
+                    if (name.starts_with(".")) continue;
+                    for (const auto& inner : directory(path))   // a folder of applications (Utilities, a suite)
+                        if (inner.ends_with(".app")) add_application(path + "/" + inner);
+                }
+        });
+        return applications;
+    }
+
+    // How well `document` claims `type` (with the file's `extension`): -1 when it does not.
+    static int claim(const DocumentType& document, const std::string& type, const std::string& extension, std::uint32_t roles) {
+        if (roles != 0xffffffff && !(document.roles & roles)) return -1;
+        bool specific = false, wildcard = false;
+        for (const auto& declared : document.content_types) {
+            if (declared == "public.item" || declared == "public.data" || declared == "public.content") wildcard |= uti::conforms(type, declared);
+            else specific |= lower(declared) == lower(type) || uti::conforms(type, declared);
+        }
+        for (const auto& candidate : document.extensions) {
+            if (candidate == "*") wildcard = true;
+            else if (!extension.empty() && candidate == lower(extension)) specific = true;
+            else if (extension.empty()) for (const auto& tag : uti::tags(type, uti::Tag::filename_extension)) specific |= candidate == lower(tag);
+        }
+        if (!specific && !wildcard) return -1;
+        return (specific ? 10 : 0) + document.rank;
+    }
+    // The applications for a content type (or a file extension), best first.
+    std::vector<const Application*> for_type(const std::string& type, const std::string& extension, std::uint32_t roles) {
+        std::vector<std::pair<int, const Application*>> found;
+        for (const auto& app : registry()) {
+            int best = -1;
+            for (const auto& document : app.documents) best = std::max(best, claim(document, type, extension, roles));
+            if (best >= 0) found.emplace_back(best, &app);
+        }
+        std::stable_sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::vector<const Application*> out;
+        for (const auto& [score, app] : found) out.push_back(app);
+        return out;
+    }
+    std::vector<const Application*> for_scheme(std::string scheme) {
+        scheme = lower(std::move(scheme));
+        std::vector<std::pair<int, const Application*>> found;
+        for (const auto& app : registry())
+            if (std::find(app.schemes.begin(), app.schemes.end(), scheme) != app.schemes.end()) found.emplace_back(app.scheme_rank, &app);
+        std::stable_sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::vector<const Application*> out;
+        for (const auto& [rank, app] : found) out.push_back(app);
+        return out;
+    }
+    // The applications for a URL: a file URL by its item's type, any other by its scheme.
+    std::vector<const Application*> for_url(Address url, std::uint32_t roles) {
+        if (!url) return {};
+        const auto scheme_object = call(core_foundation, "_CFURLCopyScheme", {url});
+        const auto scheme = lower(text_of(scheme_object));
+        release(scheme_object);
+        if (scheme != "file") return scheme.empty() ? std::vector<const Application*>{} : for_scheme(scheme);
+        auto path = cf.url_path(url);
+        const bool folder = path.size() > 1 && path.back() == '/';
+        while (path.size() > 1 && path.back() == '/') path.pop_back();
+        const auto name = path.substr(path.find_last_of('/') + 1);
+        const auto dot = name.find_last_of('.');
+        const auto extension = dot == std::string::npos || dot == 0 ? std::string() : lower(name.substr(dot + 1));
+        std::string type = folder && extension.empty() ? "public.folder" : "public.data";
+        if (!extension.empty()) if (const auto found = uti::for_tag(uti::Tag::filename_extension, extension)) type = *found;
+        return for_type(type, extension, roles);
+    }
+    Address url_of(const Application& app) { return cf.file_url(app.path, true); }
+    Address url_array(const std::vector<const Application*>& apps) {
+        if (apps.empty()) return 0;
+        std::vector<Address> urls;
+        for (const auto* app : apps) urls.push_back(url_of(*app));
+        const auto array = cf.array(urls);
+        for (const auto url : urls) release(url);
+        return array;
+    }
+    Address identifier_array(const std::vector<const Application*>& apps) {
+        std::vector<Address> names;
+        for (const auto* app : apps) if (!app->identifier.empty()) names.push_back(cf.string(app->identifier));
+        if (names.empty()) return 0;
+        const auto array = cf.array(names);
+        for (const auto name : names) release(name);
+        return array;
+    }
+    // The FSRef and URL outputs of the Carbon calls (either may be NULL); OSStatus.
+    std::int32_t deliver(GuestMemory& m, const Application* app, Address ref, Address url) {
+        if (url) m.write64(url, 0);
+        if (!app) return ls_application_not_found;
+        if (ref) {
+            const auto text = strdup(app->path);
+            const auto result = static_cast<std::int32_t>(call(core_services, "_FSPathMakeRef", {text, ref, 0}));
+            free(text);
+            if (result) return result;
+        }
+        if (url) m.write64(url, url_of(*app));
+        return 0;
+    }
 };
 
 void LaunchServices::install() {
@@ -122,25 +342,95 @@ void LaunchServices::install() {
              {"_kUTTypeZipArchive", "public.zip-archive"}})
         if (!has(core_services, name)) string(core_services, name, value);
 
-    // Applications: none is registered with LaunchServices.
+    // ---- applications ----
+    // Test hook: add the applications of a folder (a guest path) to the registry.
+    static_cast<void>(process.install_function("__alchemy_ls_scan_folder", [this](CpuState& s, GuestMemory& m) {
+        static_cast<void>(registry());
+        const auto folder = read_cstring(m, s.x[0]);
+        for (const auto& name : directory(folder)) if (name.ends_with(".app")) add_application(folder + "/" + name);
+    }, "alchemy.internal"));
+    const auto not_found = [this](GuestMemory& m, Address error, const char* why) {
+        if (error) m.write64(error, bridge->os_status_error(ls_application_not_found, why));
+    };
     // CFArrayRef LSCopyApplicationURLsForBundleIdentifier(CFStringRef, CFErrorRef *)
-    raw(core_services, "_LSCopyApplicationURLsForBundleIdentifier", [this](CpuState& s, GuestMemory& m) {
-        if (s.x[1]) m.write64(s.x[1], bridge->os_status_error(ls_application_not_found, "no application with that bundle identifier is registered"));
-        s.x[0] = 0;
+    raw(core_services, "_LSCopyApplicationURLsForBundleIdentifier", [this, not_found](CpuState& s, GuestMemory& m) {
+        if (s.x[1]) m.write64(s.x[1], 0);
+        const auto wanted = lower(text_of(s.x[0]));
+        std::vector<const Application*> apps;
+        for (const auto& app : registry()) if (!wanted.empty() && lower(app.identifier) == wanted) apps.push_back(&app);
+        s.x[0] = url_array(apps);
+        if (!s.x[0]) not_found(m, s.x[1], "no application with that bundle identifier is installed");
     });
-    for (const auto* name : {"_LSCopyDefaultHandlerForURLScheme", "_LSCopyAllHandlersForURLScheme",
-                             "_LSCopyDefaultRoleHandlerForContentType", "_LSCopyAllRoleHandlersForContentType"})
-        constant(core_services, name, 0);
-    // LSFindApplicationForInfo(creator, bundleID, name, FSRef *, CFURLRef *),
-    // LSGetApplicationForURL(url, roles, FSRef *, CFURLRef *),
-    // LSGetApplicationForInfo(type, creator, extension, roles, FSRef *, CFURLRef *),
-    // LSCanURLAcceptURL(target, item, roles, flags, Boolean *accepts).
-    failure(core_services, "_LSFindApplicationForInfo", ls_application_not_found, {4});
-    failure(core_services, "_LSGetApplicationForURL", ls_application_not_found, {3});
-    failure(core_services, "_LSGetApplicationForInfo", ls_application_not_found, {5});
-    raw(core_services, "_LSCanURLAcceptURL", [](CpuState& s, GuestMemory& m) {
-        if (s.x[4]) m.write8(s.x[4], 0);
-        s.x[0] = status(s.x[0] && s.x[1] && s.x[4] ? ls_application_not_found : param_err);
+    // CFStringRef LSCopyDefaultHandlerForURLScheme(CFStringRef) / CFArrayRef LSCopyAllHandlersForURLScheme(CFStringRef)
+    raw(core_services, "_LSCopyDefaultHandlerForURLScheme", [this](CpuState& s, GuestMemory&) {
+        const auto apps = for_scheme(text_of(s.x[0]));
+        s.x[0] = apps.empty() || apps[0]->identifier.empty() ? 0 : cf.string(apps[0]->identifier);
+    });
+    raw(core_services, "_LSCopyAllHandlersForURLScheme", [this](CpuState& s, GuestMemory&) { s.x[0] = identifier_array(for_scheme(text_of(s.x[0]))); });
+    // CFStringRef LSCopyDefaultRoleHandlerForContentType(CFStringRef, LSRolesMask) / LSCopyAllRoleHandlersForContentType
+    raw(core_services, "_LSCopyDefaultRoleHandlerForContentType", [this](CpuState& s, GuestMemory&) {
+        const auto apps = for_type(text_of(s.x[0]), {}, static_cast<std::uint32_t>(s.x[1]));
+        s.x[0] = apps.empty() || apps[0]->identifier.empty() ? 0 : cf.string(apps[0]->identifier);
+    });
+    raw(core_services, "_LSCopyAllRoleHandlersForContentType", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = identifier_array(for_type(text_of(s.x[0]), {}, static_cast<std::uint32_t>(s.x[1])));
+    });
+    // CFURLRef LSCopyDefaultApplicationURLForURL(CFURLRef, LSRolesMask, CFErrorRef *) / ...ForContentType(CFStringRef, ...)
+    raw(core_services, "_LSCopyDefaultApplicationURLForURL", [this, not_found](CpuState& s, GuestMemory& m) {
+        if (s.x[2]) m.write64(s.x[2], 0);
+        const auto apps = for_url(s.x[0], static_cast<std::uint32_t>(s.x[1]));
+        s.x[0] = apps.empty() ? 0 : url_of(*apps[0]);
+        if (!s.x[0]) not_found(m, s.x[2], "no application can open the URL");
+    });
+    raw(core_services, "_LSCopyDefaultApplicationURLForContentType", [this, not_found](CpuState& s, GuestMemory& m) {
+        if (s.x[2]) m.write64(s.x[2], 0);
+        const auto apps = for_type(text_of(s.x[0]), {}, static_cast<std::uint32_t>(s.x[1]));
+        s.x[0] = apps.empty() ? 0 : url_of(*apps[0]);
+        if (!s.x[0]) not_found(m, s.x[2], "no application handles the content type");
+    });
+    // CFArrayRef LSCopyApplicationURLsForURL(CFURLRef, LSRolesMask)
+    raw(core_services, "_LSCopyApplicationURLsForURL", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = url_array(for_url(s.x[0], static_cast<std::uint32_t>(s.x[1])));
+    });
+    // OSStatus LSFindApplicationForInfo(OSType creator, CFStringRef bundleID, CFStringRef name, FSRef *, CFURLRef *):
+    // by bundle identifier, or by name ("Example" or "Example.app"); creator codes are not recorded.
+    raw(core_services, "_LSFindApplicationForInfo", [this](CpuState& s, GuestMemory& m) {
+        const auto identifier = lower(text_of(s.x[1]));
+        auto name = lower(text_of(s.x[2]));
+        if (name.ends_with(".app")) name.resize(name.size() - 4);
+        const Application* found = nullptr;
+        for (const auto& app : registry()) {
+            const auto file = lower(app.path.substr(app.path.find_last_of('/') + 1));
+            if ((!identifier.empty() && lower(app.identifier) == identifier) ||
+                (identifier.empty() && !name.empty() && (file == name + ".app" || lower(app.name) == name))) { found = &app; break; }
+        }
+        s.x[0] = status(deliver(m, found, s.x[3], s.x[4]));
+    });
+    // OSStatus LSGetApplicationForURL(CFURLRef, LSRolesMask, FSRef *, CFURLRef *)
+    raw(core_services, "_LSGetApplicationForURL", [this](CpuState& s, GuestMemory& m) {
+        const auto apps = for_url(s.x[0], static_cast<std::uint32_t>(s.x[1]));
+        s.x[0] = status(deliver(m, apps.empty() ? nullptr : apps[0], s.x[2], s.x[3]));
+    });
+    // OSStatus LSGetApplicationForInfo(OSType type, OSType creator, CFStringRef extension, LSRolesMask, FSRef *, CFURLRef *)
+    raw(core_services, "_LSGetApplicationForInfo", [this](CpuState& s, GuestMemory& m) {
+        const auto extension = lower(text_of(s.x[2]));
+        std::string type = "public.data";
+        if (!extension.empty()) if (const auto found = uti::for_tag(uti::Tag::filename_extension, extension)) type = *found;
+        const auto apps = extension.empty() ? std::vector<const Application*>{} : for_type(type, extension, static_cast<std::uint32_t>(s.x[3]));
+        s.x[0] = status(deliver(m, apps.empty() ? nullptr : apps[0], s.x[4], s.x[5]));
+    });
+    // OSStatus LSCanURLAcceptURL(CFURLRef item, CFURLRef target, LSRolesMask, LSAcceptanceFlags, Boolean *accepts)
+    raw(core_services, "_LSCanURLAcceptURL", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[0] || !s.x[1] || !s.x[4]) { s.x[0] = status(param_err); return; }
+        m.write8(s.x[4], 0);
+        auto target = cf.url_path(s.x[1]);
+        while (target.size() > 1 && target.back() == '/') target.pop_back();
+        const Application* app = nullptr;
+        for (const auto& candidate : registry()) if (candidate.path == target) { app = &candidate; break; }
+        if (!app) { s.x[0] = status(ls_application_not_found); return; }
+        const auto handlers = for_url(s.x[0], static_cast<std::uint32_t>(s.x[2]));
+        m.write8(s.x[4], std::find(handlers.begin(), handlers.end(), app) != handlers.end() ? 1 : 0);
+        s.x[0] = 0;
     });
 }
 

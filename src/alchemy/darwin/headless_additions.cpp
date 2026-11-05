@@ -21,6 +21,7 @@ void install_additions(ProcessContext& context, ObjcRuntime& objc, CoreFoundatio
     install_coreservices_types_and_gestalt(context, objc, cf);
     foundation_shells::install_cf_date_formatter_shell(context);   // alchemy.exe only (r2's headless shells)
     foundation_shells::install_cfsocket_shell(context);
+    foundation_shells::install_launch_services_shell(context);   // alchemy.exe only
     install_quartzcore_contents_formats(context, objc, cf);
     install_appkit_class_shells(context, objc, cf);
 }

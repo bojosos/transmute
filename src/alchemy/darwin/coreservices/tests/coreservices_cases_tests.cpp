@@ -75,9 +75,11 @@ const Case coreservices_file_manager_case("coreservices_file_manager", [](Fixtur
             f.status(cs, "_FSRefMakePath", {folder, path, 1024}) == 0 && !f.read_text(path).empty(), "FSFindFolder(kTemporaryFolderType)");
     require(f.status(cs, "_FSFindFolder", {static_cast<Address>(-32764), 0x74656d70, 0, folder}) == -43, "no network domain");
     // Applications and UTIs.
-    require(f.status(cs, "_LSGetApplicationForURL", {f.cf.file_url(root, true), 0xffffffff, 0, value}) == -10814 && f.engine.read64(value) == 0,
-            "no registered applications");
-    require(f.call(cs, "_LSCopyDefaultHandlerForURLScheme", {string(f, "http")}) == 0, "no URL handler");
+    const auto unclaimed = f.call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFURLCreateWithString",
+                                  {0, string(f, "alchemy-unclaimed-scheme://item"), 0});
+    require(f.status(cs, "_LSGetApplicationForURL", {unclaimed, 0xffffffff, 0, value}) == -10814 && f.engine.read64(value) == 0,
+            "no application for an unclaimed scheme");
+    require(f.call(cs, "_LSCopyDefaultHandlerForURLScheme", {string(f, "alchemy-unclaimed-scheme")}) == 0, "no URL handler");
     require(f.call(cs, "_UTTypeIsDeclared", {string(f, "public.plain-text")}) == 1 && f.call(cs, "_UTTypeIsDeclared", {string(f, "com.example.none")}) == 0,
             "UTTypeIsDeclared");
     require(f.call(cs, "_UTTypeCopyDeclaringBundleURL", {string(f, "public.jpeg")}) != 0, "UTTypeCopyDeclaringBundleURL");
@@ -98,6 +100,54 @@ const Case coreservices_file_manager_case("coreservices_file_manager", [](Fixtur
     require(f.call(cs, "_MDItemCreate", {0, string(f, root + "/missing")}) == 0, "no item for a missing path");
     const auto query = f.call(cs, "_MDQueryCreate", {0, string(f, "kMDItemFSName == \"*.txt\""), 0, 0});
     require(query && f.call(cs, "_MDQueryExecute", {query, 0}) == 0 && f.call(cs, "_MDQueryGetResultCount", {query}) == 0, "queries cannot run");
+    std::filesystem::remove_all(host);
+});
+
+// The application registry (launch_services.cpp) over two applications in a test folder.
+const Case coreservices_application_registry_case("coreservices_application_registry", [](Fixture& f) {
+    const auto host = std::filesystem::temp_directory_path() / "alchemy_ls_registry_case";
+    std::filesystem::remove_all(host);
+    const auto plist = [&](const std::string& app, const std::string& body) {
+        std::filesystem::create_directories(host / app / "Contents");
+        std::ofstream(host / app / "Contents" / "Info.plist")
+            << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>" << body << "</dict></plist>\n";
+    };
+    plist("Example.app", "<key>CFBundleIdentifier</key><string>com.example.viewer</string><key>CFBundleName</key><string>Example</string>"
+                         "<key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>examplescheme</string></array></dict></array>"
+                         "<key>CFBundleDocumentTypes</key><array><dict><key>LSItemContentTypes</key><array><string>public.plain-text</string></array>"
+                         "<key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Owner</string></dict></array>");
+    plist("Other.app", "<key>CFBundleIdentifier</key><string>com.example.other</string>"
+                       "<key>CFBundleDocumentTypes</key><array><dict><key>CFBundleTypeExtensions</key><array><string>*</string></array>"
+                       "<key>CFBundleTypeRole</key><string>Editor</string></dict></array>");
+    { std::ofstream(host / "notes.txt") << "text"; }
+    const auto root = alchemy::guest_path_string(host);
+    static_cast<void>(f.call("alchemy.internal", "__alchemy_ls_scan_folder", {f.text(root)}));
+    const auto app_path = [&](Address url) { auto path = f.cf.url_path(url); while (path.size() > 1 && path.back() == '/') path.pop_back(); return path; };
+    const auto error = f.block(8);
+    const auto urls = f.call(cs, "_LSCopyApplicationURLsForBundleIdentifier", {string(f, "com.example.viewer"), error});
+    require(urls && f.cf.array_values(urls).size() == 1 && app_path(f.cf.array_values(urls)[0]).ends_with("/Example.app"),
+            "LSCopyApplicationURLsForBundleIdentifier");
+    require(f.call(cs, "_LSCopyApplicationURLsForBundleIdentifier", {string(f, "com.example.none"), error}) == 0 && f.engine.read64(error) != 0,
+            "an unknown bundle identifier");
+    require(f.cf.utf8(f.call(cs, "_LSCopyDefaultHandlerForURLScheme", {string(f, "examplescheme")})) == "com.example.viewer", "URL scheme handler");
+    require(f.cf.utf8(f.call(cs, "_LSCopyDefaultRoleHandlerForContentType", {string(f, "public.plain-text"), 0xffffffff})) == "com.example.viewer",
+            "a specific content type before a wildcard");
+    require(f.cf.utf8(f.call(cs, "_LSCopyDefaultRoleHandlerForContentType", {string(f, "public.plain-text"), 4})) == "com.example.other",
+            "the editor role");
+    const auto all = f.call(cs, "_LSCopyAllRoleHandlersForContentType", {string(f, "public.jpeg"), 0xffffffff});
+    require(all && f.cf.array_values(all).size() >= 1, "LSCopyAllRoleHandlersForContentType");
+    const auto notes = f.cf.file_url(root + "/notes.txt", false);
+    const auto app = f.call(cs, "_LSCopyDefaultApplicationURLForURL", {notes, 0xffffffff, error});
+    require(app && app_path(app).ends_with("/Example.app"), "LSCopyDefaultApplicationURLForURL");
+    require(app_path(f.call(cs, "_LSCopyDefaultApplicationURLForContentType", {string(f, "public.plain-text"), 0xffffffff, error})).ends_with("/Example.app"),
+            "LSCopyDefaultApplicationURLForContentType");
+    const auto ref = f.block(80), found = f.block(8);
+    require(f.status(cs, "_LSFindApplicationForInfo", {0, 0, string(f, "Example"), ref, found}) == 0 && f.engine.read64(found) != 0, "LSFindApplicationForInfo");
+    const auto accepts = f.block(1);
+    require(f.status(cs, "_LSCanURLAcceptURL", {notes, f.cf.file_url(root + "/Example.app", true), 0xffffffff, 0, accepts}) == 0 &&
+            f.memory().read8(accepts) == 1, "LSCanURLAcceptURL");
+    require(f.status(cs, "_LSCanURLAcceptURL", {notes, f.cf.file_url(root + "/Missing.app", true), 0xffffffff, 0, accepts}) == -10814,
+            "an unregistered target");
     std::filesystem::remove_all(host);
 });
 
