@@ -18,6 +18,24 @@ const Case usernotifications_case("usernotifications", [](Fixture& f) {
     const auto action = f.send(f.cls("UNNotificationAction"), "actionWithIdentifier:title:options:", {f.cf.string("id"), f.cf.string("T"), 4});
     require(f.cf.utf8(f.send(action, "identifier")) == "id" && f.send(action, "options") == 4, "action");
     require(f.string_constant(LIBRARY, "_UNNotificationDefaultActionIdentifier") == "com.apple.UNNotificationDefaultActionIdentifier", "default action");
+    // Triggers.
+    alchemy::CallRegs interval{};
+    interval.set_d(0, 120.0);
+    interval.x[2] = 1;
+    const auto trigger = f.objc.send(f.cls("UNTimeIntervalNotificationTrigger"), "triggerWithTimeInterval:repeats:", interval).x0;
+    require(trigger && f.send(trigger, "repeats") == 1 && f.send(trigger, "nextTriggerDate") != 0, "UNTimeIntervalNotificationTrigger");
+    bool refused{};
+    alchemy::CallRegs short_repeat{};
+    short_repeat.set_d(0, 5.0);
+    short_repeat.x[2] = 1;
+    try { static_cast<void>(f.objc.send(f.cls("UNTimeIntervalNotificationTrigger"), "triggerWithTimeInterval:repeats:", short_repeat)); }
+    catch (const std::exception&) { refused = true; }
+    require(refused, "a repeating trigger needs at least 60 seconds");
+    const auto calendar = f.send(f.cls("UNCalendarNotificationTrigger"), "triggerWithDateMatchingComponents:repeats:", {f.cf.string("components"), 0});
+    require(calendar && f.send(calendar, "repeats") == 0 && f.send(calendar, "dateComponents") != 0, "UNCalendarNotificationTrigger");
+    const auto icon = f.send(f.cls("UNNotificationActionIcon"), "iconWithSystemImageName:", {f.cf.string("bell")});
+    require(f.cf.utf8(f.send(icon, "systemImageName")) == "bell", "UNNotificationActionIcon");
+    require(f.send(center, "supportsContentExtensions") == 0, "no content extensions");
 });
 
 #undef LIBRARY

@@ -3,7 +3,11 @@
 
 // AuthenticationServices: no authenticator exists. Authorization requests
 // complete with ASAuthorizationErrorNotHandled; the browser credential
-// manager reports access as denied and has no platform credentials.
+// manager reports access as denied and has no platform credentials. The
+// Apple ID, password and platform public-key providers make real request
+// objects (and the Apple ID provider knows no user: credential state
+// NotFound); a web authentication session cannot start (no browser can
+// present it: -canStart and -start are NO, the completion is not called).
 // String constants carry the values of Apple's public headers; values
 // marked "(unverified)" follow the framework's naming convention and could
 // not be checked against a header. Chrome 155 first linked the framework (moved from
@@ -90,6 +94,89 @@ void Provider::install() {
     method(platform_provider, "initWithRelyingPartyIdentifier:", [this](CpuState& s, GuestMemory&) {
         store(s.x[0], "relyingPartyIdentifier", s.x[2]);
     });
+
+    // Requests (value objects) and the providers that make them.
+    string(authentication_services, "_ASAuthorizationScopeFullName", "full_name");
+    string(authentication_services, "_ASAuthorizationScopeEmail", "email");
+    string(authentication_services, "_ASAuthorizationOperationImplicit", "implicit");
+    string(authentication_services, "_ASAuthorizationOperationLogin", "login");
+    string(authentication_services, "_ASAuthorizationOperationRefresh", "refresh");
+    string(authentication_services, "_ASAuthorizationOperationLogout", "logout");
+    const auto request = cls(authentication_services, "ASAuthorizationRequest", "NSObject");
+    object_properties(request, {"provider"});
+    const auto openid_request = cls(authentication_services, "ASAuthorizationOpenIDRequest", "ASAuthorizationRequest");
+    object_properties(openid_request, {"provider", "requestedScopes", "state", "nonce", "requestedOperation"});
+    const auto apple_id_request = cls(authentication_services, "ASAuthorizationAppleIDRequest", "ASAuthorizationOpenIDRequest");
+    object_properties(apple_id_request, {"provider", "requestedScopes", "state", "nonce", "requestedOperation", "user"});
+    const auto password_request = cls(authentication_services, "ASAuthorizationPasswordRequest", "ASAuthorizationRequest");
+    const auto registration_request = cls(authentication_services, "ASAuthorizationPlatformPublicKeyCredentialRegistrationRequest", "ASAuthorizationRequest");
+    object_properties(registration_request, {"provider", "relyingPartyIdentifier", "challenge", "name", "displayName", "userID",
+                                             "userVerificationPreference", "attestationPreference", "largeBlob", "prf"});
+    const auto assertion_request = cls(authentication_services, "ASAuthorizationPlatformPublicKeyCredentialAssertionRequest", "ASAuthorizationRequest");
+    object_properties(assertion_request, {"provider", "relyingPartyIdentifier", "challenge", "allowedCredentials",
+                                          "userVerificationPreference", "largeBlob", "prf"});
+    // A request of `cls` whose provider is `provider` (autoreleased).
+    const auto make_request = [this](Address target, Address provider) {
+        const auto object = create(target);
+        store(object, "provider", provider);
+        return bridge->autorelease(object);
+    };
+    const auto operation = [this](std::string_view name) { return bridge->constant(authentication_services, std::string("_") + std::string(name)); };
+    method(platform_provider, "createCredentialRegistrationRequestWithChallenge:name:userID:",
+           [this, make_request, registration_request](CpuState& s, GuestMemory&) {
+        const auto object = make_request(registration_request, s.x[0]);
+        store(object, "relyingPartyIdentifier", stored(s.x[0], "relyingPartyIdentifier"));
+        store(object, "challenge", s.x[2]);
+        store(object, "name", s.x[3]);
+        store(object, "userID", s.x[4]);
+        s.x[0] = object;
+    });
+    method(platform_provider, "createCredentialAssertionRequestWithChallenge:",
+           [this, make_request, assertion_request](CpuState& s, GuestMemory&) {
+        const auto object = make_request(assertion_request, s.x[0]);
+        store(object, "relyingPartyIdentifier", stored(s.x[0], "relyingPartyIdentifier"));
+        store(object, "challenge", s.x[2]);
+        s.x[0] = object;
+    });
+    const auto apple_id_provider = cls(authentication_services, "ASAuthorizationAppleIDProvider", "NSObject");
+    method(apple_id_provider, "createRequest", [this, make_request, apple_id_request, operation](CpuState& s, GuestMemory&) {
+        const auto object = make_request(apple_id_request, s.x[0]);
+        store(object, "requestedOperation", operation("ASAuthorizationOperationLogin"));
+        s.x[0] = object;
+    });
+    // -getCredentialStateForUserID:completion: no Apple ID is signed in, so no user is known
+    // (ASAuthorizationAppleIDProviderCredentialNotFound, no error).
+    constexpr std::uint64_t credential_not_found = 2;
+    method(apple_id_provider, "getCredentialStateForUserID:completion:", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[3]) return;
+        const auto block = bridge->block_copy(s.x[3]);
+        bridge->dispatch_async(bridge->main_queue(), [this, block] {
+            static_cast<void>(bridge->invoke_block(block, {credential_not_found, 0}));
+            bridge->block_release(block);
+        });
+    }, false, "v@:@@?");
+    const auto password_provider = cls(authentication_services, "ASAuthorizationPasswordProvider", "NSObject");
+    method(password_provider, "createRequest", [make_request, password_request](CpuState& s, GuestMemory&) {
+        s.x[0] = make_request(password_request, s.x[0]);
+    });
+
+    // ASWebAuthenticationSession: no browser can present the session.
+    const auto web_session = cls(authentication_services, "ASWebAuthenticationSession", "NSObject");
+    object_properties(web_session, {"URL", "callbackURLScheme", "completionHandler", "additionalHeaderFields"});
+    integer_properties(web_session, {"prefersEphemeralWebBrowserSession"});
+    weak_properties(web_session, {"presentationContextProvider"});
+    method(web_session, "initWithURL:callbackURLScheme:completionHandler:", [this](CpuState& s, GuestMemory&) {
+        store(s.x[0], "URL", s.x[2]);
+        store(s.x[0], "callbackURLScheme", s.x[3]);
+        if (s.x[4]) {
+            const auto block = bridge->block_copy(s.x[4]);
+            store(s.x[0], "completionHandler", block);
+            bridge->block_release(block);
+        }
+    });
+    method(web_session, "canStart", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:");
+    method(web_session, "start", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:");
+    method(web_session, "cancel", nothing, false, "v@:");
     // ASAuthorizationWebBrowserPublicKeyCredentialManager: access to platform
     // credentials is denied (AuthorizationState: Authorized 0, Denied 1,
     // NotDetermined 2; unverified order).

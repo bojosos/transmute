@@ -1,9 +1,15 @@
 #include "alchemy/darwin/usernotifications/install.hpp"
 #include "alchemy/gui/value_provider.hpp"
 
+#include <bit>
+#include <stdexcept>
+
 // UserNotifications: notifications are not allowed (authorization denied,
-// requests fail with UNErrorCodeNotificationsNotAllowed); content, actions,
-// categories and requests are real value objects.
+// requests and badge counts fail with UNErrorCodeNotificationsNotAllowed);
+// content, actions, action icons, categories, triggers (time interval with
+// its next fire date, calendar, push), notifications and requests are real
+// value objects. Categories set on the center read back from
+// getNotificationCategoriesWithCompletionHandler:.
 // String constants carry the values of Apple's public headers; values
 // marked "(unverified)" follow the framework's naming convention and could
 // not be checked against a header. Chrome 155 first linked the framework (moved from
@@ -35,9 +41,14 @@ void Provider::install() {
     string(user_notifications, "_UNErrorDomain", "UNErrorDomain");
     const auto content = cls(user_notifications, "UNNotificationContent", "NSObject");
     const auto mutable_content = cls(user_notifications, "UNMutableNotificationContent", "UNNotificationContent");
-    for (const auto target : {content, mutable_content})
+    for (const auto target : {content, mutable_content}) {
         object_properties(target, {"title", "subtitle", "body", "userInfo", "attachments", "categoryIdentifier",
-                                   "threadIdentifier", "sound", "badge", "targetContentIdentifier"});
+                                   "threadIdentifier", "sound", "badge", "targetContentIdentifier", "launchImageName",
+                                   "summaryArgument", "filterCriteria"});
+        integer_properties(target, {"summaryArgumentCount"});
+        real_properties(target, {"relevanceScore"});
+    }
+    integer_properties(content, {"interruptionLevel"});
     integer_properties(mutable_content, {"interruptionLevel"});
     const auto action = cls(user_notifications, "UNNotificationAction", "NSObject");
     object_properties(action, {"identifier", "title"});
@@ -72,6 +83,69 @@ void Provider::install() {
         store_integer(object, "options", static_cast<std::int64_t>(s.x[5]));
         s.x[0] = bridge->autorelease(object);
     }, true);
+    // Triggers.
+    const auto trigger = cls(user_notifications, "UNNotificationTrigger", "NSObject");
+    integer_properties(trigger, {"repeats"});
+    const auto interval_trigger = cls(user_notifications, "UNTimeIntervalNotificationTrigger", "UNNotificationTrigger");
+    method(interval_trigger, "timeInterval", [this](CpuState& s, GuestMemory&) {
+        s.v[0][0] = static_cast<std::uint64_t>(stored_integer(s.x[0], "interval"));   // the double's bits
+    }, false, "d@:");
+    method(interval_trigger, "triggerWithTimeInterval:repeats:", [this, interval_trigger](CpuState& s, GuestMemory&) {
+        const auto interval = std::bit_cast<double>(s.v[0][0]);
+        if (!(interval > 0) || ((s.x[2] & 0xff) && interval < 60)) {   // the documented minimum for repeating triggers
+            throw std::invalid_argument("Alchemy: UNTimeIntervalNotificationTrigger: the time interval must be greater than 0 (60 when repeating)");
+        }
+        const auto object = create(interval_trigger);
+        store_integer(object, "interval", static_cast<std::int64_t>(s.v[0][0]));
+        store_integer(object, "repeats", (s.x[2] & 0xff) ? 1 : 0);
+        const auto created = bridge->cf.date(CoreFoundation::absolute_time_now());
+        store(object, "created", created);
+        release(created);
+        s.x[0] = bridge->autorelease(object);
+    }, true, "@@:dB");
+    // -nextTriggerDate: the creation time plus the interval.
+    method(interval_trigger, "nextTriggerDate", [this](CpuState& s, GuestMemory&) {
+        const auto created = stored(s.x[0], "created");
+        const auto interval = std::bit_cast<double>(static_cast<std::uint64_t>(stored_integer(s.x[0], "interval")));
+        s.x[0] = created ? bridge->autorelease(bridge->cf.date(bridge->cf.date_time(created) + interval)) : 0;
+    });
+    const auto calendar_trigger = cls(user_notifications, "UNCalendarNotificationTrigger", "UNNotificationTrigger");
+    object_properties(calendar_trigger, {"dateComponents"});
+    method(calendar_trigger, "triggerWithDateMatchingComponents:repeats:", [this, calendar_trigger](CpuState& s, GuestMemory&) {
+        const auto object = create(calendar_trigger);
+        store(object, "dateComponents", s.x[2]);
+        store_integer(object, "repeats", (s.x[3] & 0xff) ? 1 : 0);
+        s.x[0] = bridge->autorelease(object);
+    }, true, "@@:@B");
+    // -nextTriggerDate: the next date matching the components (NSCalendar's own matching).
+    method(calendar_trigger, "nextTriggerDate", [this](CpuState& s, GuestMemory&) {
+        const auto components = stored(s.x[0], "dateComponents");
+        const auto calendar_class = objc.find_class("NSCalendar");
+        if (!components || !calendar_class) { s.x[0] = 0; return; }
+        const auto calendar = objc.send(calendar_class, objc.selector("currentCalendar"), CallRegs{}).x0;
+        const auto now = bridge->cf.date(CoreFoundation::absolute_time_now());
+        CallRegs registers{};
+        registers.x[2] = now;
+        registers.x[3] = components;
+        registers.x[4] = 1 << 10;   // NSCalendarMatchNextTime
+        const auto next = objc.send_if_responds(calendar, objc.selector("nextDateAfterDate:matchingComponents:options:"), registers);
+        s.x[0] = next ? next->x0 : 0;
+        release(now);
+    });
+    static_cast<void>(cls(user_notifications, "UNPushNotificationTrigger", "UNNotificationTrigger"));
+    // A delivered notification (none is delivered here; a value object).
+    const auto notification = cls(user_notifications, "UNNotification", "NSObject");
+    object_properties(notification, {"date", "request"});
+    // Action icons.
+    const auto icon = cls(user_notifications, "UNNotificationActionIcon", "NSObject");
+    object_properties(icon, {"systemImageName", "templateImageName"});
+    for (const auto& [selector, key] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"iconWithSystemImageName:", "systemImageName"}, {"iconWithTemplateImageName:", "templateImageName"}})
+        method(icon, selector, [this, icon, name = key](CpuState& s, GuestMemory&) {
+            const auto object = create(icon);
+            store(object, name, s.x[2]);
+            s.x[0] = bridge->autorelease(object);
+        }, true);
     const auto request = cls(user_notifications, "UNNotificationRequest", "NSObject");
     object_properties(request, {"identifier", "content", "trigger"});
     method(request, "requestWithIdentifier:content:trigger:", [this](CpuState& s, GuestMemory&) {
@@ -150,6 +224,25 @@ void Provider::install() {
         });
     };
     method(center, "getDeliveredNotificationsWithCompletionHandler:", empty_list, false, "v@:@?");
+    // The categories set on the center (an NSSet; empty when none was set).
+    method(center, "getNotificationCategoriesWithCompletionHandler:", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[2]) return;
+        const auto block = bridge->block_copy(s.x[2]);
+        const auto center = retain(s.x[0]);
+        bridge->dispatch_async(bridge->main_queue(), [this, block, center] {
+            auto categories = retain(stored(center, "notificationCategories"));
+            if (!categories) categories = retain(objc.send(objc.find_class("NSSet"), objc.selector("set"), CallRegs{}).x0);
+            static_cast<void>(bridge->invoke_block(block, {categories}));
+            release(categories);
+            release(center);
+            bridge->block_release(block);
+        });
+    }, false, "v@:@?");
+    // Badges need the notification permission.
+    method(center, "setBadgeCount:withCompletionHandler:", [this](CpuState& s, GuestMemory&) {
+        complete_with_error(s.x[3], "UNErrorDomain", un_error_notifications_not_allowed, "Notifications are not allowed", 0);
+    }, false, "v@:q@?");
+    method(center, "supportsContentExtensions", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:");
     method(center, "getPendingNotificationRequestsWithCompletionHandler:", empty_list, false, "v@:@?");
     for (const auto* selector : {"removeDeliveredNotificationsWithIdentifiers:", "removePendingNotificationRequestsWithIdentifiers:"})
         method(center, selector, nothing, false, "v@:@");   // nothing was delivered or is pending
