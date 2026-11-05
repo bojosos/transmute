@@ -71,7 +71,7 @@ inline constexpr std::int32_t invalid_property = -10879, invalid_parameter = -10
 // Scopes.
 constexpr std::uint32_t scope_global = 0, scope_input = 1, scope_output = 2;
 // Properties.
-constexpr std::uint32_t prop_class_info = 0, prop_make_connection = 1, prop_sample_rate = 2, prop_parameter_list = 3,
+constexpr std::uint32_t prop_class_info = 0, prop_make_connection = 1, prop_sample_rate = 2, prop_parameter_list = 3, prop_parameter_info = 4,
     prop_stream_format = 8, prop_element_count = 11, prop_latency = 12, prop_supported_channel_layout_tags = 13,
     prop_maximum_frames_per_slice = 14, prop_audio_channel_layout = 19, prop_tail_time = 20, prop_bypass = 21,
     prop_last_render_error = 22, prop_set_render_callback = 23, prop_render_quality = 26, prop_should_allocate_buffer = 51,
@@ -249,6 +249,25 @@ std::int32_t AudioUnits::get_property(Unit& u, std::uint32_t id, std::uint32_t s
     case prop_element_count:
         u32(hal ? 2 : 1);
         return 0;
+    case prop_parameter_list:   // the global scope's one parameter
+        if (scope == scope_global) u32(param_volume);
+        else out.clear();
+        return 0;
+    case prop_parameter_info: {
+        // AudioUnitParameterInfo (104 bytes) of kHALOutputParam_Volume: "Volume", linear gain 0-1, default 1.
+        if (scope != scope_global || element != param_volume) return error::invalid_parameter;
+        out.assign(104, 0);
+        std::memcpy(out.data(), "Volume", 6);
+        const std::uint32_t unit = 6;   // kAudioUnitParameterUnit_LinearGain
+        const float minimum = 0, maximum = 1, initial = 1;
+        const std::uint32_t flags = (1U << 30) | (1U << 31);   // kAudioUnitParameterFlag_IsReadable | IsWritable
+        std::memcpy(out.data() + 80, &unit, 4);
+        std::memcpy(out.data() + 84, &minimum, 4);
+        std::memcpy(out.data() + 88, &maximum, 4);
+        std::memcpy(out.data() + 92, &initial, 4);
+        std::memcpy(out.data() + 96, &flags, 4);
+        return 0;
+    }
     case prop_latency:
         f64(0);
         return 0;

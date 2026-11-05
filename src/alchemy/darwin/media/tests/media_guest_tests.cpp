@@ -2112,6 +2112,79 @@ void au_listeners(Fixture& f) {
     require(f.status(at, "_AUListenerDispose", {listener}) == -50, "dispose twice");
     require(f.status(au, "_AudioComponentCopyName", {0, out}) == -50 && f.status(au, "_AudioComponentGetDescription", {0, out}) == -50, "no components");
     require(f.status(au, "_AudioUnitAddRenderNotify", {0x5000, 0x1000, 0}) == bad_instance, "no units");
+
+    // A real parameter: the default output's kHALOutputParam_Volume (0-1, linear).
+    const auto description = f.block(20), size = f.block(4), info = f.block(112);
+    f.engine.write32(description, 0x61756F75);        // 'auou'
+    f.engine.write32(description + 4, 0x64656620);    // 'def '
+    require(f.status(au, "_AudioComponentInstanceNew", {f.call(au, "_AudioComponentFindNext", {0, description}), out}) == 0, "an output unit");
+    const auto unit = f.engine.read64(out);
+    f.engine.write32(size, 104);
+    require(f.status(au, "_AudioUnitGetProperty", {unit, 4, 0, 14, info, size}) == 0 && f.engine.read32(size) == 104 &&
+            std::bit_cast<float>(f.engine.read32(info + 88)) == 1.0f && f.memory().read8(info) == 'V', "kAudioUnitProperty_ParameterInfo");
+    f.engine.write64(parameter, unit);
+    f.engine.write32(parameter + 8, 14);
+    f.engine.write32(parameter + 12, 0);
+    f.engine.write32(parameter + 16, 0);
+    alchemy::CallRegs linear{};
+    linear.x[0] = parameter;
+    linear.set_s(0, 0.25f);
+    require(f.regs(at, "_AUParameterValueToLinear", linear).s(0) == 0.25f, "AUParameterValueToLinear");
+    linear.set_s(0, 2.0f);
+    require(f.regs(at, "_AUParameterValueToLinear", linear).s(0) == 1.0f, "clamped to the range");
+    linear.set_s(0, 0.75f);
+    require(f.regs(at, "_AUParameterValueFromLinear", linear).s(0) == 0.75f, "AUParameterValueFromLinear");
+    const auto text = f.block(32);
+    const auto format = [&](double value, std::uint32_t digits) {
+        alchemy::CallRegs r{};
+        r.x[0] = parameter; r.x[1] = text; r.x[2] = digits;
+        r.set_d(0, value);
+        static_cast<void>(f.regs(at, "_AUParameterFormatValue", r));
+        std::string out;
+        for (Address a = text; f.memory().read8(a); ++a) out.push_back(static_cast<char>(f.memory().read8(a)));
+        return out;
+    };
+    require(format(3.14159, 4) == "3.142" && format(123.456, 4) == "123.5" && format(0.5, 3) == "0.50", "AUParameterFormatValue: " + format(3.14159, 4));
+    // A dispatch-queue listener hears AUParameterSet on its queue, with the value.
+    static std::atomic<int> heard{0};
+    static std::atomic<std::uint32_t> heard_value{0};
+    const auto b = alchemy::gui::security::bridge();
+    const auto block = b->make_block([](transmute::CpuState& s, transmute::GuestMemory& m) {
+        if (s.x[1] == 0x77 && m.read32(s.x[2] + 8) == 14) {
+            heard_value = static_cast<std::uint32_t>(s.v[0][0]);
+            ++heard;
+        }
+    });
+    const auto queue = f.call("/usr/lib/libSystem.B.dylib", "_dispatch_get_global_queue", {0, 0});
+    alchemy::CallRegs make{};
+    make.x[0] = out; make.x[1] = queue; make.x[2] = block;
+    require(f.regs(at, "_AUListenerCreateWithDispatchQueue", make).x0 == 0, "AUListenerCreateWithDispatchQueue");
+    const auto queued = f.engine.read64(out);
+    require(f.status(at, "_AUListenerAddParameter", {queued, 0x77, parameter}) == 0, "its parameter");
+    alchemy::CallRegs set_volume{};
+    set_volume.x[0] = 0; set_volume.x[2] = parameter;
+    set_volume.set_s(0, 0.5f);
+    require(f.regs(at, "_AUParameterSet", set_volume).x0 == 0, "AUParameterSet on the unit");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (heard == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(heard == 1 && std::bit_cast<float>(heard_value.load()) == 0.5f, "the block hears 0.5 on its queue");
+    // An event listener hears a gesture begin through AUEventListenerNotify.
+    static std::atomic<std::uint32_t> gesture{99};
+    const auto event_proc = f.process.install_function("_alchemy_test_au_event", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        gesture = m.read32(s.x[2]);
+    }, "/usr/lib/alchemy_test_io.dylib");
+    alchemy::CallRegs event_create{};
+    event_create.x[0] = event_proc; event_create.x[4] = out;
+    require(f.regs(at, "_AUEventListenerCreate", event_create).x0 == 0, "an event listener");
+    const auto gestures = f.engine.read64(out);
+    f.engine.write32(event, 1);   // kAudioUnitEvent_BeginParameterChangeGesture
+    std::vector<std::uint8_t> parameter_bytes(24);
+    f.memory().read_bytes(parameter, parameter_bytes);
+    f.memory().write_bytes(event + 8, parameter_bytes);
+    require(f.status(at, "_AUEventListenerAddEventType", {gestures, 0, event}) == 0 &&
+            f.status(at, "_AUEventListenerNotify", {0, 0, event}) == 0 && gesture == 1, "AUEventListenerNotify: a gesture begins");
+    require(f.status(at, "_AUListenerDispose", {queued}) == 0 && f.status(at, "_AUListenerDispose", {gestures}) == 0 &&
+            f.status(au, "_AudioComponentInstanceDispose", {unit}) == 0, "listeners and unit disposed");
 }
 
 // AVFoundation: an asset over a generated WAVE file, a reader vending float samples, value
