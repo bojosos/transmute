@@ -232,6 +232,22 @@ their groups out in one row that does not scroll. Horizontal scroll direction
 and pinned boundary items fail as unsupported. The NSRectAlignment and
 NSDirectionalRectEdge raw values follow their documented order (not verified).
 
+**Tree controller** (`bindings.cpp`, with NSObjectController and
+NSArrayController): NSTreeNode (represented object, parent, child nodes and
+mutableChildNodes through KVC, index paths, descendants, sorting) and
+NSTreeController. Its arranged objects are a tree of NSTreeNodes built from
+the content (the top level) and each object's children key path, cut at the
+leaf key path, sorted at every level by the sort descriptors; model objects'
+children are observed, so changes made elsewhere rebuild the tree. Selection
+is by index paths (selectionIndexPaths, selectedNodes, selectedObjects, the
+selection proxy). Insertions, removals and moves edit the model through
+-mutableArrayValueForKeyPath: (the content for the top level); the last
+index of an insertion counts in the model's order, and a move's destination
+is a path in the tree without the moved nodes. The count key path is kept but
+not used (children are read at once). A tree controller decoded from a nib
+fails explicitly: its archive keys are not documented. NSOutlineView and
+NSTableView do not take content bindings yet.
+
 **Token fields** (`controls/token_field.cpp`): NSTokenField's value is an
 array of represented objects drawn as pills (plain text for
 NSTokenStyleNone). Editing uses the field editor on the tokens' editing

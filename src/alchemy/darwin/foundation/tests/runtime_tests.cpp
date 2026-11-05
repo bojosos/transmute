@@ -6,6 +6,7 @@
 // Cocoa bindings, notification queues, operations, the file manager, Cocoa
 // scripting, and CoreFoundation's class identities and CFFileDescriptor.
 #include "alchemy/darwin/kit/completion/runtime/common.hpp"
+#include "alchemy/darwin/kit/completion/data/providers.hpp"
 #include "alchemy/darwin/foundation/invocation_core.hpp"
 #include "alchemy/darwin/foundation/sdef.hpp"
 #include "alchemy/darwin/foundation/undo_core.hpp"
@@ -176,6 +177,8 @@ struct Fixture {
         completion_kit::install_collections(*support);
         completion_kit::install_key_value_observing(*support);
         completion_kit::install_bindings(*support);
+        completion_kit::data::install_pointer_collections(*support);   // NSIndexPath (tree controllers)
+        completion_kit::data::install_sorting(*support);               // NSSortDescriptor (tree controllers)
         completion_kit::install_kvc_collections(*support);
         completion_kit::install_notification_queue(*support);
         completion_kit::install_value_transformers(*support);
@@ -508,6 +511,102 @@ void test_key_value_observing(Fixture& f) {
     require(f.send(model.items[root], "count") == 1 && f.text(f.send(model.items[root], "objectAtIndex:", {0})) == "b", "proxy edits reach -setItems:");
     require(notes.size() == 3 && f.send(proxy, "count") == 1, "each proxy edit notifies the observers of items");
     f.send(root, "removeObserver:forKeyPath:", {observer, string("items")});
+}
+
+// ---- NSTreeNode and NSTreeController ------------------------------------------------------------
+void test_tree_controllers(Fixture& f) {
+    const auto integer = [&f](Address receiver, std::string_view selector, std::initializer_list<Address> arguments = {}) {
+        return static_cast<std::int64_t>(f.send(receiver, selector, arguments));
+    };
+    const auto flag_of = [&f](Address receiver, std::string_view selector) { return static_cast<std::int64_t>(f.send(receiver, selector) & 0xff); };
+    // NSTreeNode on its own.
+    const auto tree_node = f.cls("NSTreeNode");
+    const auto top = f.send(tree_node, "treeNodeWithRepresentedObject:", {f.cf.string("top")});
+    const auto leaf = f.send(tree_node, "treeNodeWithRepresentedObject:", {f.cf.string("leaf")});
+    (f.send(f.send(top, "mutableChildNodes"), "addObject:", {leaf}));
+    require(f.send(leaf, "parentNode") == top && flag_of(top, "isLeaf") == 0 && flag_of(leaf, "isLeaf") == 1 &&
+                integer(f.send(leaf, "indexPath"), "indexAtPosition:", {0}) == 0 && integer(f.send(top, "childNodes"), "count") == 1,
+            "NSTreeNode children through mutableChildNodes");
+    (f.send(f.send(top, "mutableChildNodes"), "removeObjectAtIndex:", {0}));
+    require(f.send(leaf, "parentNode") == 0 && integer(f.send(top, "childNodes"), "count") == 0, "a removed child loses its parent");
+
+    // A model class: name, items (the children), flag.
+    struct Model { std::map<Address, Address> name, items; std::map<Address, bool> flag; };
+    static Model model;
+    model = {};
+    const auto item_class = f.objc.register_native_class("G2TreeItem", f.cls("NSObject"), 16);
+    f.support->method(item_class, "name", [](CpuState& s, GuestMemory&) { s.x[0] = model.name[s.x[0]]; }, "@@:");
+    f.support->method(item_class, "setName:", [](CpuState& s, GuestMemory&) { model.name[s.x[0]] = s.x[2]; }, "v@:@");
+    f.support->method(item_class, "items", [](CpuState& s, GuestMemory&) { s.x[0] = model.items[s.x[0]]; }, "@@:");
+    f.support->method(item_class, "setItems:", [&f](CpuState& s, GuestMemory&) { model.items[s.x[0]] = s.x[2] ? f.send(s.x[2], "copy") : 0; }, "v@:@");
+    f.support->method(item_class, "flag", [](CpuState& s, GuestMemory&) { s.x[0] = model.flag[s.x[0]]; }, "B@:");
+    f.support->method(item_class, "setFlag:", [](CpuState& s, GuestMemory&) { model.flag[s.x[0]] = (s.x[2] & 0xff) != 0; }, "v@:B");
+    const auto item = [&](const char* name, std::vector<Address> children) {
+        const auto made = f.send(f.send(item_class, "alloc"), "init");
+        (f.send(made, "setName:", {f.cf.string(name)}));
+        (f.send(made, "setItems:", {f.cf.array(children)}));
+        return made;
+    };
+    const auto a1 = item("a1", {}), a2 = item("a2", {});
+    const auto a = item("beta", {a1, a2}), b = item("alpha", {});
+    const auto tree = f.send(f.send(f.cls("NSTreeController"), "alloc"), "init");
+    (f.send(tree, "setObjectClass:", {item_class}));
+    (f.send(tree, "setChildrenKeyPath:", {f.cf.string("items")}));
+    (f.send(tree, "setContent:", {f.cf.array(std::vector<Address>{a, b}, true)}));
+    const auto path = [&](std::initializer_list<Address> indexes) {
+        auto made = f.send(f.cls("NSIndexPath"), "indexPathWithIndex:", {*indexes.begin()});
+        for (auto it = indexes.begin() + 1; it != indexes.end(); ++it) made = f.send(made, "indexPathByAddingIndex:", {*it});
+        return made;
+    };
+    const auto node_at = [&](std::initializer_list<Address> indexes) { return f.send(f.send(tree, "arrangedObjects"), "descendantNodeAtIndexPath:", {path(indexes)}); };
+    const auto at = [&](std::initializer_list<Address> indexes) {
+        const auto node = node_at(indexes);
+        return node ? f.send(node, "representedObject") : 0;
+    };
+    const auto names = [&](Address array_object) {
+        std::string out;
+        for (const auto value : f.cf.array_values(array_object)) out += (out.empty() ? "" : ",") + f.text(model.name[value]);
+        return out;
+    };
+    require(integer(f.send(f.send(tree, "arrangedObjects"), "childNodes"), "count") == 2 && at({0, 1}) == a2 && at({1}) == b, "the arranged tree");
+    const auto a2_node = node_at({0, 1});
+    require(f.send(f.send(a2_node, "parentNode"), "representedObject") == a && flag_of(f.send(a2_node, "indexPath"), "length") == 2 && integer(a2_node, "isLeaf") == 1,
+            "arranged nodes know their parent and index path");
+    require(names(f.send(tree, "selectedObjects")) == "beta", "avoidsEmptySelection selects the first node: " + names(f.send(tree, "selectedObjects")));
+    // The selection proxy, and a binding through it.
+    const auto label = f.send(f.send(item_class, "alloc"), "init");
+    (f.send(label, "bind:toObject:withKeyPath:options:", {f.cf.string("name"), tree, f.cf.string("selection.name"), 0}));
+    require((f.send(tree, "setSelectionIndexPath:", {path({0, 1})}) & 0xff) == 1 && names(f.send(tree, "selectedObjects")) == "a2" && f.text(model.name[label]) == "a2",
+            "selecting by index path: " + f.text(model.name[label]));
+    // Inserting at an index path edits the model's children and selects the new object.
+    const auto c = item("c", {});
+    (f.send(tree, "insertObject:atArrangedObjectIndexPath:", {c, path({0, 1})}));
+    require(names(model.items[a]) == "a1,c,a2" && names(f.send(tree, "selectedObjects")) == "c", "insertObject:atArrangedObjectIndexPath: " + names(model.items[a]));
+    // A model change made elsewhere rebuilds the tree.
+    const auto d = item("d", {});
+    (f.send(b, "setItems:", {f.cf.array(std::vector<Address>{d})}));
+    require(at({1, 0}) == d && names(f.send(tree, "selectedObjects")) == "c", "the tree follows its model's children");
+    (f.send(tree, "remove:", {0}));
+    require(names(model.items[a]) == "a1,a2" && names(f.send(tree, "selectedObjects")) == "beta", "remove: takes the selected objects out of the model");
+    // Sorting applies at every level.
+    const auto by_name = f.send(f.cls("NSSortDescriptor"), "sortDescriptorWithKey:ascending:", {f.cf.string("name"), 1});
+    (f.send(tree, "setSortDescriptors:", {f.cf.array(std::vector<Address>{by_name})}));
+    require(at({0}) == b && at({1}) == a && at({1, 1}) == a2, "sorted arranged objects");
+    // A move, then a new child of the selected node.
+    (f.send(tree, "moveNode:toIndexPath:", {node_at({1, 1}), path({0, 0})}));
+    require(names(model.items[b]) == "a2,d" && names(model.items[a]) == "a1", "moveNode:toIndexPath: " + names(model.items[b]));
+    (f.send(tree, "setSelectionIndexPath:", {path({0})}));
+    require(flag_of(tree, "canAddChild") == 1, "canAddChild with one selected container");
+    (f.send(tree, "addChild:", {0}));
+    require(integer(model.items[b], "count") == 3 && integer(f.send(tree, "selectionIndexPath"), "length") == 2, "addChild: appends a new object and selects it");
+    // A leaf key path stops the children.
+    (f.send(b, "setFlag:", {1}));
+    (f.send(tree, "setLeafKeyPath:", {f.cf.string("flag")}));
+    require(flag_of(node_at({0}), "isLeaf") == 1 && integer(f.send(node_at({0}), "childNodes"), "count") == 0, "leafKeyPath");
+    (f.send(label, "unbind:", {f.cf.string("name")}));
+    bool threw = false;
+    try { (f.send(f.send(f.cls("NSTreeController"), "alloc"), "initWithCoder:", {0})); } catch (const std::exception&) { threw = true; }
+    require(threw, "a nib-decoded tree controller did not fail");
 }
 
 // ---- file handles, pipes, notification queues, operations ----
@@ -853,6 +952,7 @@ int main() {
         test_forwarding(fixture);
         test_undo_manager(fixture, target_class, recorder);
         test_key_value_observing(fixture);
+        test_tree_controllers(fixture);
         test_notification_queue(fixture);
         test_value_transformers(fixture);
         test_operations(fixture);
