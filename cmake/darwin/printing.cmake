@@ -1,13 +1,12 @@
 # Printing for strict mode (src/alchemy/darwin/printing/): libcups (no scheduler;
-# real option, destination and IPP message data) and PrintCore (PM*).
-# Installed by gui::fill::install_printing (fill-only).
+# real option, destination and IPP message data). Installed by
+# gui::fill::install_printing (fill-only). PrintCore (PM*) is print_core.cpp below.
 list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/printing/install.cpp
-    src/alchemy/darwin/printing/cups.cpp
-    src/alchemy/darwin/printing/printcore.cpp)
+    src/alchemy/darwin/printing/cups.cpp)
 
-# PrintCore gaps of Chrome's images (print_core_gaps.cpp, installed by
-# darwin/coreservices/services.cpp's install_services).
+# The values provider's PrintCore entry (print_core_gaps.cpp, called by
+# darwin/coreservices/services.cpp's install_services; empty since print_core.cpp).
 list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/printing/print_core_gaps.cpp)
 
 function(alchemy_gui_printing_tests)
@@ -18,4 +17,4 @@ alchemy_gui_register_tests(alchemy_gui_printing_tests)
 # Headless additions (both builds; darwin/headless_additions.hpp), moved from
 # darwin/identities/installer_frameworks.cpp:
 target_sources(alchemy_core PRIVATE
-    src/alchemy/darwin/printing/no_printers.cpp)
+    src/alchemy/darwin/printing/print_core.cpp)

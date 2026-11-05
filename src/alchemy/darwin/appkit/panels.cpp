@@ -2,6 +2,7 @@
 #include "alchemy/path.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <map>
@@ -169,6 +170,7 @@ struct PrintInfoState final : ObjectPayload {
     bool horizontally_centered{true}, vertically_centered{true};
     Address paper_name{}, printer{};          // +1
     Address dictionary{};                     // +1 NSMutableDictionary (-dictionary; job disposition, saving URL)
+    Address pm_settings{}, pm_format{}, pm_session{};   // +1 PrintCore objects (-PMPrintSettings ...), made on demand
 };
 struct GestureState final : ObjectPayload {
     Address target{}, action{}, delegate{}, view{};
@@ -942,6 +944,7 @@ void AppKit::install_panels() {
         to->paper_name = retain(to->paper_name);
         to->printer = retain(to->printer);
         to->dictionary = to->dictionary ? send_id(to->dictionary, "mutableCopy") : 0;
+        to->pm_settings = to->pm_format = to->pm_session = 0;   // the copy makes its own PrintCore objects
         s.x[0] = copy;
     });
     const auto print_real = [this, pi](const char* getter, const char* setter, double PrintInfoState::*member) {
@@ -1022,11 +1025,148 @@ void AppKit::install_panels() {
     // There are no printers (NSPrinter has none to give): nil unless one was set.
     method(print_info, "printer", [pi](CpuState& s, GuestMemory&) { s.x[0] = pi(s.x[0])->printer; });
     method(print_info, "setPrinter:", [this, pi](CpuState& s, GuestMemory&) { assign(pi(s.x[0])->printer, s.x[2]); }, "v@:@");
-    for (const auto* name : {"PMPrintSession", "PMPrintSettings", "PMPageFormat",
-             "printSettings", "updateFromPMPrintSettings", "updateFromPMPageFormat"})
-        method(print_info, name, [selector = std::string(name)](CpuState&, GuestMemory&) {
-            unsupported("-[NSPrintInfo " + selector + "] (printing system)");
-        });
+    // PrintCore objects (darwin/printing/print_core.cpp) for the print info:
+    // -PMPrintSettings / -PMPageFormat / -PMPrintSession give objects the print
+    // info owns, set from its values each time they are asked for (copies,
+    // page range, a save job's destination file; the paper upright with the
+    // 18-point imageable margins of -imageablePageBounds, the orientation), and
+    // -updateFromPMPrintSettings / -updateFromPMPageFormat take their values
+    // back. -printSettings (PrintCore's key / value dictionary) is not kept.
+    static constexpr std::string_view application_services =
+        "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices";
+    static Address pm_scratch{};   // 48 bytes: an output pointer, then margins or a 32-bit value (main thread)
+    const auto pm_call = [this](std::string_view symbol, const CallRegs& registers) {
+        const auto found = process.resolve(application_services, symbol);
+        if (!found) unsupported("-[NSPrintInfo PrintCore] without " + std::string(symbol));
+        return static_cast<std::int32_t>(EngineAdapter(process.calling_engine()).call_regs(found->address, registers).x0);
+    };
+    const auto pm = [pm_call](std::string_view symbol, std::initializer_list<Address> arguments) {
+        CallRegs registers;
+        unsigned index = 0;
+        for (const auto argument : arguments) registers.x[index++] = argument;
+        return pm_call(symbol, registers);
+    };
+    const auto scratch = [this] {
+        if (!pm_scratch) pm_scratch = process.allocate_guest(48, 8);
+        return pm_scratch;
+    };
+    // A +1 object from a PM function whose last argument is the output.
+    const auto pm_object = [this, pm_call, scratch](std::string_view symbol, std::initializer_list<Address> before) {
+        const auto out = scratch();
+        memory().write64(out, 0);
+        CallRegs registers;
+        unsigned index = 0;
+        for (const auto argument : before) registers.x[index++] = argument;
+        registers.x[index] = out;
+        if (const auto status = pm_call(symbol, registers); status != 0)
+            unsupported("-[NSPrintInfo PrintCore] " + std::string(symbol) + " failed (" + std::to_string(status) + ")");
+        return memory().read64(out);
+    };
+    const auto pm_u32 = [this, pm, scratch](std::string_view symbol, Address target, std::uint32_t fallback) {
+        const auto out = scratch() + 8;
+        return pm(symbol, {target, out}) == 0 ? memory().read32(out) : fallback;
+    };
+    const auto number_value = [this](Address dictionary, std::string_view key, double fallback) {
+        const auto value = send_id(dictionary, "objectForKey:", {auto_string(key)});
+        return value ? send(value, "doubleValue").d(0) : fallback;
+    };
+    const auto session_of = [pi, pm_object](Address self) {
+        const auto state = pi(self);
+        if (!state->pm_session) state->pm_session = pm_object("_PMCreateSession", {});
+        return state->pm_session;
+    };
+    const auto settings_of = [this, pi, pm, pm_object, dictionary_of, number_value, session_of](Address self) {
+        const auto state = pi(self);
+        const auto session = session_of(self);
+        if (!state->pm_settings) state->pm_settings = pm_object("_PMCreatePrintSettings", {});
+        const auto dictionary = dictionary_of(self);
+        const auto settings = state->pm_settings;
+        static_cast<void>(pm("_PMSetCopies", {settings, static_cast<Address>(std::max(1.0, number_value(dictionary, "NSCopies", 1))), 0}));
+        const bool all = number_value(dictionary, "NSAllPages", 1) != 0;
+        static_cast<void>(pm("_PMSetFirstPage", {settings, all ? 1 : static_cast<Address>(std::max(1.0, number_value(dictionary, "NSFirstPage", 1))), 0}));
+        static_cast<void>(pm("_PMSetLastPage", {settings, all ? Address{0xffffffff} : static_cast<Address>(std::max(1.0, number_value(dictionary, "NSLastPage", 1))), 0}));
+        const auto disposition = send_id(dictionary, "objectForKey:", {auto_string("NSJobDisposition")});
+        const auto url = send_id(dictionary, "objectForKey:", {auto_string("NSJobSavingURL")});
+        const bool save = disposition && cf.utf8(disposition) == "NSPrintSaveJob" && url;
+        static_cast<void>(pm("_PMSessionSetDestination", {session, settings, save ? 2u : 1u, save ? auto_string("application/pdf") : 0, save ? url : 0}));
+        return settings;
+    };
+    method(print_info, "PMPrintSettings", [settings_of](CpuState& s, GuestMemory&) { s.x[0] = settings_of(s.x[0]); }, "^v@:");
+    method(print_info, "PMPrintSession", [settings_of, session_of](CpuState& s, GuestMemory&) {
+        static_cast<void>(settings_of(s.x[0]));
+        s.x[0] = session_of(s.x[0]);
+    }, "^v@:");
+    method(print_info, "PMPageFormat", [this, pi, pm, pm_call, scratch](CpuState& s, GuestMemory&) {
+        const auto state = pi(s.x[0]);
+        const auto out = scratch();
+        const auto margins = out + 16;
+        for (unsigned i = 0; i < 4; ++i) memory().write64(margins + i * 8, std::bit_cast<std::uint64_t>(18.0));
+        CallRegs custom;
+        const auto name = state->paper_name ? state->paper_name : auto_string("custom");
+        custom.x[0] = 0; custom.x[1] = name; custom.x[2] = name; custom.x[3] = margins; custom.x[4] = out;
+        custom.set_d(0, std::min(state->paper.width, state->paper.height));
+        custom.set_d(1, std::max(state->paper.width, state->paper.height));
+        if (pm_call("_PMPaperCreateCustom", custom) != 0) unsupported("-[NSPrintInfo PMPageFormat] PMPaperCreateCustom failed");
+        const auto paper = memory().read64(out);
+        // PMCreatePageFormatWithPMPaper(&format, paper): the output comes first.
+        const auto status = pm("_PMCreatePageFormatWithPMPaper", {out + 8, paper});
+        static_cast<void>(pm("_PMRelease", {paper}));
+        if (status != 0) unsupported("-[NSPrintInfo PMPageFormat] PMCreatePageFormatWithPMPaper failed");
+        const auto format = memory().read64(out + 8);
+        static_cast<void>(pm("_PMSetOrientation", {format, state->orientation == 1 ? 2u : 1u, 0}));   // NSPaperOrientationLandscape 1
+        if (const auto old = std::exchange(state->pm_format, format)) static_cast<void>(pm("_PMRelease", {old}));
+        s.x[0] = format;
+    }, "^v@:");
+    method(print_info, "updateFromPMPrintSettings", [this, pi, pm, pm_object, pm_u32, dictionary_of](CpuState& s, GuestMemory&) {
+        const auto state = pi(s.x[0]);
+        if (!state->pm_settings) return;
+        const auto dictionary = dictionary_of(s.x[0]);
+        const auto put = [&](std::string_view key, Address value) { static_cast<void>(send_id(dictionary, "setObject:forKey:", {value, auto_string(key)})); };
+        const auto integer = [&](std::uint32_t value) { return send_id(objc.find_class("NSNumber"), "numberWithLongLong:", {static_cast<Address>(value)}); };
+        put("NSCopies", integer(pm_u32("_PMGetCopies", state->pm_settings, 1)));
+        const auto first = pm_u32("_PMGetFirstPage", state->pm_settings, 1), last = pm_u32("_PMGetLastPage", state->pm_settings, 0xffffffff);
+        const bool all = first <= 1 && last == 0xffffffff;
+        put("NSAllPages", integer(all ? 1 : 0));
+        put("NSFirstPage", integer(first));
+        put("NSLastPage", integer(all ? first : last));
+        if (state->pm_session) {
+            const auto type_out = pm_scratch + 8;
+            if (pm("_PMSessionGetDestinationType", {state->pm_session, state->pm_settings, type_out}) == 0 && memory().read32(type_out) == 2) {
+                put("NSJobDisposition", auto_string("NSPrintSaveJob"));
+                if (const auto url = pm_object("_PMSessionCopyDestinationLocation", {state->pm_session, state->pm_settings})) {
+                    put("NSJobSavingURL", url);
+                    release(url);
+                }
+            }
+        }
+    }, "v@:");
+    method(print_info, "updateFromPMPageFormat", [this, pi, pm, pm_u32, scratch](CpuState& s, GuestMemory&) {
+        const auto state = pi(s.x[0]);
+        if (!state->pm_format) return;
+        const auto out = scratch();
+        if (pm("_PMGetPageFormatPaper", {state->pm_format, out}) != 0) return;
+        const auto paper = memory().read64(out);
+        double width = state->paper.width, height = state->paper.height;
+        if (pm("_PMPaperGetWidth", {paper, out + 8}) == 0) width = std::bit_cast<double>(memory().read64(out + 8));
+        if (pm("_PMPaperGetHeight", {paper, out + 8}) == 0) height = std::bit_cast<double>(memory().read64(out + 8));
+        const auto orientation = pm_u32("_PMGetOrientation", state->pm_format, 1);
+        const bool landscape = orientation == 2 || orientation == 4;
+        state->orientation = landscape ? 1 : 0;
+        state->paper = landscape ? Size{std::max(width, height), std::min(width, height)} : Size{std::min(width, height), std::max(width, height)};
+    }, "v@:");
+    method(print_info, "printSettings", [](CpuState&, GuestMemory&) {
+        unsupported("-[NSPrintInfo printSettings] (PrintCore's key / value dictionary is not kept; use PMPrintSettingsSetValue)");
+    });
+    method(print_info, "dealloc", [this, pi, pm](CpuState& s, GuestMemory&) {
+        if (const auto state = objc.find_host_state<PrintInfoState>(s.x[0])) {
+            for (auto* slot : {&state->pm_format, &state->pm_settings, &state->pm_session})
+                if (const auto object = std::exchange(*slot, 0)) static_cast<void>(pm("_PMRelease", {object}));
+            release(std::exchange(state->paper_name, 0));
+            release(std::exchange(state->printer, 0));
+            release(std::exchange(state->dictionary, 0));
+        }
+        static_cast<void>(objc.send_super(s.x[0], print_info, sel("dealloc")));
+    }, "v@:");
     for (const auto& [name, super_name] : std::initializer_list<std::pair<const char*, const char*>>{
              {"NSPrintPanel", "NSObject"}, {"NSPageLayout", "NSObject"}, {"NSFontPanel", "NSPanel"}}) {
         const auto cls = declare_class(name, super_name);

@@ -1,15 +1,13 @@
 #pragma once
 
-// Printing for strict mode (src/alchemy/printing): libcups and the PrintCore
-// (PM*) functions of ApplicationServices that Qt PrintSupport and Chromium
-// link. No printing system runs under Alchemy; installed by install_printing
-// (fill-only).
+// Printing for strict mode (src/alchemy/darwin/printing): libcups, which Qt
+// PrintSupport and Chromium link (no scheduler runs under Alchemy); installed
+// by install_printing (fill-only). PrintCore (PM*) is print_core.cpp's.
 
 #include "alchemy/gui/fill_provider.hpp"
 
 namespace alchemy::gui::fill {
 
 void install_cups(InstallContext& context);
-void install_print_core(InstallContext& context);
 
 } // namespace alchemy::gui::fill
