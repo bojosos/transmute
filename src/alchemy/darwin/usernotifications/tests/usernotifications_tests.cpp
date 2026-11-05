@@ -33,6 +33,11 @@ const Case usernotifications_case("usernotifications", [](Fixture& f) {
     require(refused, "a repeating trigger needs at least 60 seconds");
     const auto calendar = f.send(f.cls("UNCalendarNotificationTrigger"), "triggerWithDateMatchingComponents:repeats:", {f.cf.string("components"), 0});
     require(calendar && f.send(calendar, "repeats") == 0 && f.send(calendar, "dateComponents") != 0, "UNCalendarNotificationTrigger");
+    // A real NSDateComponents: the next 09:00 (NSCalendar's nextDateAfterDate:matchingComponents:options:).
+    const auto components = f.send(f.send(f.cls("NSDateComponents"), "alloc"), "init");
+    static_cast<void>(f.send(components, "setHour:", {9}));
+    const auto daily = f.send(f.cls("UNCalendarNotificationTrigger"), "triggerWithDateMatchingComponents:repeats:", {components, 1});
+    require(f.send(daily, "nextTriggerDate") != 0, "a calendar trigger's next date");
     const auto icon = f.send(f.cls("UNNotificationActionIcon"), "iconWithSystemImageName:", {f.cf.string("bell")});
     require(f.cf.utf8(f.send(icon, "systemImageName")) == "bell", "UNNotificationActionIcon");
     require(f.send(center, "supportsContentExtensions") == 0, "no content extensions");

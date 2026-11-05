@@ -298,6 +298,54 @@ void calendar_arithmetic() {
     jan1.year = 2021; jan1.month = 1; jan1.day = 1;
     const auto iso_week = cal::split(cal::combine(jan1, utc, iso), cal::week_of_year | cal::year_for_week_of_year, utc, iso);
     require(iso_week.week_of_year == 53 && iso_week.year_for_week_of_year == 2020, "ISO week of 2021-01-01");
+}
+
+// -nextDateAfterDate:matchingComponents:options: and -date:matchesComponents: (calendar::next_matching / matches).
+void calendar_matching() {
+    const cal::Offset utc = [](double) { return std::int64_t{0}; };
+    const cal::Offset cet = [](double) { return std::int64_t{3600}; };
+    const cal::Rules us{1, 1};
+    const auto at = [&](std::int64_t y, std::int64_t mo, std::int64_t d, std::int64_t h = 0, std::int64_t mi = 0, std::int64_t sec = 0,
+                        const cal::Offset* offset = nullptr) {
+        cal::Components c;
+        c.year = y; c.month = mo; c.day = d; c.hour = h; c.minute = mi; c.second = sec;
+        return cal::combine(c, offset ? *offset : utc, us);
+    };
+    const auto t = at(2026, 10, 13, 14, 5, 9);   // a Tuesday
+    const auto next = [&](cal::Components wanted, bool backwards = false, const cal::Offset* offset = nullptr) {
+        return cal::next_matching(t, wanted, offset ? *offset : utc, us, backwards);
+    };
+    cal::Components c;
+    c.hour = 9;
+    require(next(c) == at(2026, 10, 14, 9), "hour 9: tomorrow 09:00:00");
+    require(next(c, true) == at(2026, 10, 13, 9), "hour 9 backwards: today 09:00:00");
+    require(next(c, false, &cet) == at(2026, 10, 14, 9, 0, 0, &cet), "hour 9 in the calendar's zone");
+    c = {};
+    c.minute = 30;
+    require(next(c) == at(2026, 10, 13, 14, 30), "minute 30: this hour");
+    c = {};
+    c.day = 1;
+    require(next(c) == at(2026, 11, 1), "day 1: the next month");
+    c = {};
+    c.weekday = 2;
+    require(next(c) == at(2026, 10, 19), "weekday 2: next Monday");
+    c = {};
+    c.month = 2; c.day = 29;
+    require(next(c) == at(2028, 2, 29), "February 29: the next leap year");
+    c.day = 30;
+    require(!next(c), "February 30 never comes");
+    c = {};
+    c.year = 2020;
+    require(!next(c), "a past year");
+    c = {};
+    c.year = 2040; c.month = 1; c.day = 1;
+    require(next(c) == at(2040, 1, 1), "a year beyond the search window");
+    require(!next(cal::Components{}), "nothing specified");
+    cal::Components fields;
+    fields.hour = 14; fields.minute = 5;
+    require(cal::matches(t, fields, utc, us), "date:matchesComponents:");
+    fields.hour = 15;
+    require(!cal::matches(t, fields, utc, us), "date:matchesComponents: (another hour)");
     // Lenient components and month arithmetic.
     cal::Components lenient;
     lenient.year = 2026; lenient.month = 13; lenient.day = 1;
@@ -422,6 +470,7 @@ int main() {
         {"scanner numbers", scanner_numbers},
         {"predicate format", predicate_format},
         {"calendar arithmetic", calendar_arithmetic},
+        {"calendar matching", calendar_matching},
         {"byte counts", byte_counts},
         {"XML documents", xml_documents},
         {"date formatter default date", date_default},

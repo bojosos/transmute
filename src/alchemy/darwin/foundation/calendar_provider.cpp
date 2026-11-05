@@ -12,7 +12,9 @@
 // the calendar core (calendar.cpp), with time-zone offsets from the
 // calendar's NSTimeZone (-secondsFromGMTForDate:). Other calendar
 // identifiers Foundation knows (hebrew, islamic, ...) fail explicitly;
-// unknown ones give nil. NSCalendarWrapComponents is not provided.
+// unknown ones give nil. NSCalendarWrapComponents is not provided. Matching
+// dates (nextDateAfterDate:..., date:matchesComponents:, enumerateDates...)
+// are strict: days without the wanted fields are skipped.
 // NSDate additions: +dateWithTimeInterval:sinceDate:, +now,
 // -descriptionWithLocale: (NSDate and NSNumber).
 // CFCalendar over the same objects (a CFCalendarRef is an NSCalendar):
@@ -214,6 +216,50 @@ void install_calendars(Support& support) {
         c.nanosecond = static_cast<std::int64_t>(m.read64(s.sp + 8));
         s.x[0] = cal->date(calendar::combine(c, cal->offset(st->zone), st->rules));
     }, "@@:qqqqqqqq");
+    // Matching dates (NSCalendarOptions: NSCalendarSearchBackwards; the matches are strict).
+    constexpr std::uint64_t search_backwards = 1u << 2;
+    const auto next_date = [cal](Address self, double after, const Components& wanted, std::uint64_t options) -> Address {
+        const auto st = cal->state(self);
+        const auto found = calendar::next_matching(after, wanted, cal->offset(st->zone), st->rules, (options & search_backwards) != 0);
+        return found ? cal->date(*found) : 0;
+    };
+    support.method(nc, "nextDateAfterDate:matchingComponents:options:", [cal, next_date](CpuState& s, GuestMemory&) {
+        s.x[0] = next_date(s.x[0], cal->date_value(s.x[2]), cal->components_of(s.x[3]), s.x[4]);
+    }, "@@:@@Q");
+    support.method(nc, "nextDateAfterDate:matchingUnit:value:options:", [cal, next_date](CpuState& s, GuestMemory&) {
+        Components wanted;
+        wanted.set(static_cast<calendar::Unit>(s.x[3]), static_cast<std::int64_t>(s.x[4]));
+        s.x[0] = next_date(s.x[0], cal->date_value(s.x[2]), wanted, s.x[5]);
+    }, "@@:@QqQ");
+    support.method(nc, "nextDateAfterDate:matchingHour:minute:second:options:", [cal, next_date](CpuState& s, GuestMemory&) {
+        Components wanted;
+        wanted.hour = static_cast<std::int64_t>(s.x[3]);
+        wanted.minute = static_cast<std::int64_t>(s.x[4]);
+        wanted.second = static_cast<std::int64_t>(s.x[5]);
+        s.x[0] = next_date(s.x[0], cal->date_value(s.x[2]), wanted, s.x[6]);
+    }, "@@:@qqqQ");
+    support.method(nc, "date:matchesComponents:", [cal](CpuState& s, GuestMemory&) {
+        const auto st = cal->state(s.x[0]);
+        return_bool(s, calendar::matches(cal->date_value(s.x[2]), cal->components_of(s.x[3]), cal->offset(st->zone), st->rules));
+    }, "B@:@@");
+    // -enumerateDatesStartingAfterDate:matchingComponents:options:usingBlock: block(NSDate *date, BOOL exactMatch, BOOL *stop)
+    support.method(nc, "enumerateDatesStartingAfterDate:matchingComponents:options:usingBlock:", [cal, sp](CpuState& s, GuestMemory& m) {
+        if (!s.x[5]) return;
+        const auto st = cal->state(s.x[0]);
+        const auto wanted = cal->components_of(s.x[3]);
+        const bool backwards = (s.x[4] & search_backwards) != 0;
+        auto after = cal->date_value(s.x[2]);
+        const auto stop = sp->process.allocate_guest(8, 8);
+        m.fill_bytes(stop, 0, 8);
+        for (;;) {
+            const auto found = calendar::next_matching(after, wanted, cal->offset(st->zone), st->rules, backwards);
+            if (!found) break;
+            static_cast<void>(rt::invoke_block(*sp, s.x[5], {cal->date(*found), 1, stop}));
+            if (m.read8(stop)) break;
+            after = *found;
+        }
+        sp->process.release_guest(stop);
+    }, "v@:@@Q@?");
     support.method(nc, "startOfDayForDate:", [cal](CpuState& s, GuestMemory&) {
         s.x[0] = cal->date(calendar::start_of_day(cal->date_value(s.x[2]), cal->offset(cal->state(s.x[0])->zone)));
     }, "@@:@");

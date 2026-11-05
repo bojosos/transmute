@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <tuple>
+#include <vector>
 
 namespace alchemy::gui::completion_kit::calendar {
 namespace {
@@ -282,6 +283,95 @@ std::optional<std::int64_t> ordinality(Unit smaller, Unit larger, double referen
 double start_of_day(double reference, const Offset& offset) {
     const auto l = local(reference, offset);
     return to_reference(static_cast<double>(l.days) * day_seconds, offset);
+}
+
+namespace {
+
+constexpr Unit day_units[] = {era, year, month, day, weekday, weekday_ordinal, quarter, week_of_month, week_of_year, year_for_week_of_year};
+constexpr std::uint64_t all_day_units = era | year | month | day | weekday | weekday_ordinal | quarter | week_of_month | week_of_year |
+                                        year_for_week_of_year;
+
+std::vector<std::int64_t> candidates(const Components& wanted, Unit unit, bool free, std::int64_t last) {
+    if (const auto value = wanted.get(unit); value != undefined) return {value};
+    if (!free) return {0};
+    std::vector<std::int64_t> out;
+    for (std::int64_t value = 0; value <= last; ++value) out.push_back(value);
+    return out;
+}
+
+} // namespace
+
+bool matches(double reference, const Components& wanted, const Offset& offset, const Rules& rules) {
+    const auto parts = split(reference, all_day_units | hour | minute | second | nanosecond, offset, rules);
+    bool any = false;
+    for (const auto unit : {era, year, month, day, weekday, weekday_ordinal, quarter, week_of_month, week_of_year, year_for_week_of_year,
+                            hour, minute, second, nanosecond}) {
+        const auto value = wanted.get(unit);
+        if (value == undefined) continue;
+        any = true;
+        if (parts.get(unit) != value) return false;
+    }
+    return any;
+}
+
+std::optional<double> next_matching(double after, const Components& wanted, const Offset& offset, const Rules& rules, bool backwards) {
+    bool day_level = false;
+    for (const auto unit : day_units) day_level |= wanted.get(unit) != undefined;
+    const bool has_hour = wanted.hour != undefined, has_minute = wanted.minute != undefined, has_second = wanted.second != undefined;
+    if (!day_level && !has_hour && !has_minute && !has_second) return std::nullopt;
+    if ((has_hour && (wanted.hour < 0 || wanted.hour > 23)) || (has_minute && (wanted.minute < 0 || wanted.minute > 59)) ||
+        (has_second && (wanted.second < 0 || wanted.second > 59)))
+        return std::nullopt;
+    // The free time units: those larger than the smallest specified one.
+    const int smallest = has_second ? 0 : has_minute ? 1 : has_hour ? 2 : 3;
+    auto hours = candidates(wanted, hour, smallest < 2, 23), minutes = candidates(wanted, minute, smallest < 1, 59),
+         seconds = candidates(wanted, second, false, 59);
+    if (backwards) {
+        std::reverse(hours.begin(), hours.end());
+        std::reverse(minutes.begin(), minutes.end());
+        std::reverse(seconds.begin(), seconds.end());
+    }
+    auto start = start_of_day(after, offset);
+    // A wanted year beyond the search window: start at its first (or, backwards, last) day.
+    if (wanted.year != undefined) {
+        const auto now = split(after, year, offset, rules).year;
+        if (!backwards && wanted.year > now) {
+            Components first;
+            first.year = wanted.year; first.month = 1; first.day = 1;
+            start = combine(first, offset, rules);
+        } else if (backwards && wanted.year < now) {
+            Components last;
+            last.year = wanted.year; last.month = 12; last.day = 31;
+            start = combine(last, offset, rules);
+        } else if ((!backwards && wanted.year < now) || (backwards && wanted.year > now)) {
+            return std::nullopt;
+        }
+    }
+    constexpr int window = 366 * 8;
+    for (int step = 0; step <= window; ++step) {
+        // Noon of the day, away from daylight-saving changes, then its fields.
+        const auto noon = start + (backwards ? -1.0 : 1.0) * static_cast<double>(step) * 86400.0 + 43200.0;
+        const auto parts = split(noon, all_day_units, offset, rules);
+        if (wanted.year != undefined && ((!backwards && parts.year > wanted.year) || (backwards && parts.year < wanted.year))) return std::nullopt;
+        bool day_matches = true;
+        for (const auto unit : day_units) {
+            const auto value = wanted.get(unit);
+            if (value != undefined && parts.get(unit) != value) { day_matches = false; break; }
+        }
+        if (!day_matches) continue;
+        for (const auto h : hours)
+            for (const auto m : minutes)
+                for (const auto sec : seconds) {
+                    Components at;
+                    at.year = parts.year; at.month = parts.month; at.day = parts.day;
+                    at.hour = h; at.minute = m; at.second = sec;
+                    const auto when = combine(at, offset, rules);
+                    const auto check = split(when, hour | minute | second, offset, rules);
+                    if (check.hour != h || check.minute != m || check.second != sec) continue;   // inside a daylight-saving gap
+                    if (backwards ? when < after : when > after) return when;
+                }
+    }
+    return std::nullopt;
 }
 
 } // namespace alchemy::gui::completion_kit::calendar

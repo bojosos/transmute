@@ -59,4 +59,17 @@ using Offset = std::function<std::int64_t(double reference)>;
 
 [[nodiscard]] std::int64_t days_in_month(std::int64_t year, std::int64_t month);
 
+// -nextDateAfterDate:matchingComponents:options:: the first time strictly
+// after (or, `backwards`, before) `after` whose local fields equal every
+// specified field of `wanted`. Units smaller than the smallest specified
+// time unit take their minimum ({hour 9} is 09:00:00; a day-level match is
+// at 00:00:00), larger unspecified units are free. Days without the wanted
+// fields (February 30) are skipped, as NSCalendarMatchStrictly does; the
+// search covers eight years from `after` (or from the wanted year).
+// nullopt: no match, or nothing specified.
+[[nodiscard]] std::optional<double> next_matching(double after, const Components& wanted, const Offset& offset, const Rules& rules,
+                                                  bool backwards);
+// -date:matchesComponents:: every specified field equals the date's.
+[[nodiscard]] bool matches(double reference, const Components& wanted, const Offset& offset, const Rules& rules);
+
 } // namespace alchemy::gui::completion_kit::calendar
