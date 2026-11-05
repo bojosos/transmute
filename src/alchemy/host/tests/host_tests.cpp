@@ -264,6 +264,10 @@ void file_table(const std::string& directory) {
     require(files::set_link_times(path, std::nullopt, 1'000'000'000LL * 1'650'000'000) &&
                 files::metadata(path)->modified_ns == 1'000'000'000LL * 1'650'000'000,
         "set_link_times on a file (not a link) sets its times");
+    require(files::set_creation_time(path, 1'000'000'000LL * 1'400'000'000) &&
+                files::metadata(path)->created_ns == 1'000'000'000LL * 1'400'000'000 &&
+                files::metadata(path)->modified_ns == 1'000'000'000LL * 1'650'000'000,
+        "set_creation_time sets only the creation time");
     require(files::access(path, true) && files::set_read_only(path, true) && files::access(path, false) &&
                 files::access(path, true).error() == host::Error::access_denied && files::set_read_only(path, false),
         "access");
@@ -483,7 +487,8 @@ void null_backend() {
         "null process queries fail");
     require(host::process::priority().error() == host::Error::unsupported && host::process::set_priority(0).error() == host::Error::unsupported &&
             host::process::set_background(true, true).error() == host::Error::unsupported &&
-            host::files::set_link_times("x", std::nullopt, std::nullopt).error() == host::Error::unsupported, "null priorities and link times fail");
+            host::files::set_link_times("x", std::nullopt, std::nullopt).error() == host::Error::unsupported &&
+            host::files::set_creation_time("x", 0).error() == host::Error::unsupported, "null priorities and link times fail");
     require(host::time::process_cpu_ns().error() == host::Error::unsupported, "null CPU time fails");
     require(host::process::environment_block().empty() && host::process::image_path(1).error() == host::Error::unsupported,
         "null process queries are empty");

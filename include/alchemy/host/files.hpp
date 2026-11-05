@@ -102,6 +102,9 @@ struct Identity {
 [[nodiscard]] Status set_times(std::string_view path, std::optional<std::int64_t> accessed_ns, std::optional<std::int64_t> modified_ns);
 // set_times on the path itself: a symbolic link's own times (lutimes, AT_SYMLINK_NOFOLLOW), not its target's.
 [[nodiscard]] Status set_link_times(std::string_view path, std::optional<std::int64_t> accessed_ns, std::optional<std::int64_t> modified_ns);
+// A path's creation (birth) time, Unix-epoch nanoseconds (setattrlist ATTR_CMN_CRTIME); with `follow` false, a
+// symbolic link's own.
+[[nodiscard]] Status set_creation_time(std::string_view path, std::int64_t created_ns, bool follow = true);
 // rename(2); without `replace` an existing `to` fails with Error::exists,
 // checked atomically by the host.
 [[nodiscard]] Status rename(std::string_view from, std::string_view to, bool replace);
