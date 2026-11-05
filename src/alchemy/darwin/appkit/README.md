@@ -218,6 +218,20 @@ items / cell views / row views / section header views through their provider
 blocks (table section headers are rows before each section). Applying a
 snapshot reloads the view: differences are not animated.
 
+**Compositional layout** (`controls/compositional.cpp`):
+NSCollectionViewCompositionalLayout builds its sections from a section or a
+section provider block (its environment's container is the collection view's
+size) and stacks them vertically with the configuration's spacing. Fractional,
+absolute and estimated dimensions (estimated sizes are used as given: no
+self-sizing); horizontal, vertical, `count` (equal shares), nested and custom
+groups repeat down a section; item content insets and leading / top edge
+spacing; anchored supplementary items, boundary headers and footers (section
+and layout), and background decoration items drawn with the view class
+registered for their kind, behind the items. Orthogonal scrolling sections lay
+their groups out in one row that does not scroll. Horizontal scroll direction
+and pinned boundary items fail as unsupported. The NSRectAlignment and
+NSDirectionalRectEdge raw values follow their documented order (not verified).
+
 **Token fields** (`controls/token_field.cpp`): NSTokenField's value is an
 array of represented objects drawn as pills (plain text for
 NSTokenStyleNone). Editing uses the field editor on the tokens' editing

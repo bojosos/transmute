@@ -242,6 +242,23 @@ void layout_items(AppKit& kit, Address self) {
                     }
                 }
                 if (const auto found = state->supplementaries.find(key); found != state->supplementaries.end()) view = found->second;
+            } else if (category == 2) {
+                // Decoration views (section backgrounds): the class the layout registered for the kind, behind the items.
+                const auto kind = kit.text(kit.send_id(entry, "representedElementKind"));
+                const auto key = "decoration/" + kind + "/" + std::to_string(path ? kit.send_id(path, "section") : 0);
+                if (!state->supplementaries.contains(key)) {
+                    const auto info = layout_of(kit, state->layout);
+                    if (const auto found = info->decoration_classes.find(kind); found != info->decoration_classes.end()) {
+                        CallRegs zero;
+                        put_rect(zero, 0, {});
+                        const auto made = kit.send(kit.send(found->second, "alloc").x0, "initWithFrame:", zero).x0;
+                        if (made) {
+                            state->supplementaries[key] = made;
+                            static_cast<void>(kit.send_id(self, "addSubview:positioned:relativeTo:", {made, static_cast<Address>(-1), 0}));   // NSWindowBelow
+                        }
+                    }
+                }
+                if (const auto found = state->supplementaries.find(key); found != state->supplementaries.end()) view = found->second;
             }
             if (!view) continue;
             CallRegs registers;
@@ -1059,6 +1076,17 @@ void install_collection_view(AppKit& kit) {
             static_cast<void>(k->send_id(self, "scrollToItemsAtIndexPaths:scrollPosition:", {path_set(*k, *state, {next}), 0}));
         }, "v@:@");
     }
+}
+
+
+// For the compositional layout (compositional.cpp).
+Address collection_layout_attributes(AppKit& kit, Rect frame, Address path, std::int64_t category, std::string_view kind) {
+    return make_attributes(kit, frame, path, category, kind);
+}
+Address collection_view_of_layout(AppKit& kit, Address layout_object) { return layout_of(kit, layout_object)->collection; }
+std::vector<std::int64_t> collection_section_counts(AppKit& kit, Address collection) {
+    const auto state = collection_of(kit, collection);
+    return state->sections.empty() ? std::vector<std::int64_t>{state->count} : state->sections;
 }
 
 } // namespace alchemy::gui::completion_kit::controls

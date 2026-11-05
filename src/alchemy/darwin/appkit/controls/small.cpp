@@ -229,6 +229,7 @@ void install_small_additions(AppKit& kit) {
     install_browser(kit);      // NSBrowser (browser.cpp)
     install_matrix(kit);       // NSMatrix (matrix.cpp)
     install_diffable_data_sources(kit);   // diffable.cpp
+    install_compositional_layout(kit);    // compositional.cpp
 }
 
 } // namespace alchemy::gui::completion_kit::controls

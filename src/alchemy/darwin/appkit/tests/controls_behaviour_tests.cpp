@@ -2143,6 +2143,107 @@ void diffable_sources(Fixture& f) {
     static_cast<void>(f.id(window, "close"));
 }
 
+// ---- NSCollectionViewCompositionalLayout -------------------------------------------------------
+void compositional(Fixture& f) {
+    const auto dimension = [&f](const char* kind, double value) { return f.with_double(f.cls("NSCollectionLayoutDimension"), kind, value); };
+    const auto size = [&f](Address width, Address height) { return f.id(f.cls("NSCollectionLayoutSize"), "sizeWithWidthDimension:heightDimension:", {width, height}); };
+    const auto list = [&f](std::vector<Address> values) { return f.cf.array(values); };
+    const auto absolute = [&dimension](double value) { return dimension("absoluteDimension:", value); };
+    const auto fraction_w = [&dimension](double value) { return dimension("fractionalWidthDimension:", value); };
+    const auto fraction_h = [&dimension](double value) { return dimension("fractionalHeightDimension:", value); };
+    require(f.integer(fraction_w(0.5), "isFractionalWidth") == 1 && f.send(absolute(7), "dimension").d(0) == 7, "dimensions");
+
+    // Section 0: a header, two items per row with a badge on each, a background decoration.
+    const auto anchor = f.id(f.cls("NSCollectionLayoutAnchor"), "layoutAnchorWithEdges:", {1 | 8});
+    const auto badge = f.id(f.cls("NSCollectionLayoutSupplementaryItem"), "supplementaryItemWithLayoutSize:elementKind:containerAnchor:",
+                            {size(absolute(10), absolute(10)), f.str("badge"), anchor});
+    const auto tile = f.id(f.cls("NSCollectionLayoutItem"), "itemWithLayoutSize:supplementaryItems:", {size(fraction_w(0.5), fraction_h(1)), list({badge})});
+    const auto row = f.id(f.cls("NSCollectionLayoutGroup"), "horizontalGroupWithLayoutSize:subitem:count:", {size(fraction_w(1), absolute(50)), tile, 2});
+    require(f.text(f.id(row, "visualDescription")) == "horizontal group of 2 items", "a group's description");
+    const auto first = f.id(f.id(f.cls("NSCollectionLayoutSection"), "sectionWithGroup:", {row}), "retain");
+    CallRegs insets;
+    insets.set_d(0, 10); insets.set_d(1, 0); insets.set_d(2, 0); insets.set_d(3, 0);
+    static_cast<void>(f.send(first, "setContentInsets:", insets));
+    static_cast<void>(f.with_double(first, "setInterGroupSpacing:", 5));
+    const auto header = f.id(f.cls("NSCollectionLayoutBoundarySupplementaryItem"), "boundarySupplementaryItemWithLayoutSize:elementKind:alignment:",
+                             {size(fraction_w(1), absolute(20)), f.str("header"), 1});
+    static_cast<void>(f.id(first, "setBoundarySupplementaryItems:", {list({header})}));
+    const auto background = f.id(f.cls("NSCollectionLayoutDecorationItem"), "backgroundDecorationItemWithElementKind:", {f.str("bg")});
+    static_cast<void>(f.id(first, "setDecorationItems:", {list({background})}));
+    // Section 1: a nested group, a column of two items beside a tall one.
+    const auto half = f.id(f.cls("NSCollectionLayoutItem"), "itemWithLayoutSize:", {size(fraction_w(1), fraction_h(0.5))});
+    const auto column = f.id(f.cls("NSCollectionLayoutGroup"), "verticalGroupWithLayoutSize:subitems:", {size(absolute(100), fraction_h(1)), list({half, half})});
+    const auto tall = f.id(f.cls("NSCollectionLayoutItem"), "itemWithLayoutSize:", {size(absolute(100), fraction_h(1))});
+    const auto nested = f.id(f.cls("NSCollectionLayoutGroup"), "horizontalGroupWithLayoutSize:subitems:", {size(fraction_w(1), absolute(60)), list({column, tall})});
+    const auto second = f.id(f.id(f.cls("NSCollectionLayoutSection"), "sectionWithGroup:", {nested}), "retain");
+
+    static Address sections[2];
+    static double container_width;
+    sections[0] = first;
+    sections[1] = second;
+    container_width = 0;
+    const auto provider = f.block("u27_section_provider", [&f](CpuState& s, GuestMemory&) {
+        container_width = f.send(f.id(s.x[2], "container"), "contentSize").d(0);
+        s.x[0] = sections[s.x[1] & 1];
+    });
+    const auto configuration = f.id(f.id(f.cls("NSCollectionViewCompositionalLayoutConfiguration"), "alloc"), "init");
+    static_cast<void>(f.with_double(configuration, "setInterSectionSpacing:", 8));
+    bool threw = false;
+    try { static_cast<void>(f.id(configuration, "setScrollDirection:", {1})); } catch (const std::exception&) { threw = true; }
+    require(threw, "horizontal scrolling did not fail");
+    const auto layout = f.id(f.id(f.cls("NSCollectionViewCompositionalLayout"), "alloc"), "initWithSectionProvider:configuration:", {provider, configuration});
+    const auto decoration_class = f.subclass("TestU27Background", "NSView");
+    static_cast<void>(f.id(layout, "registerClass:forDecorationViewOfKind:", {decoration_class, f.str("bg")}));
+
+    const auto item_class = f.subclass("TestU27CompositionalItem", "NSCollectionViewItem");
+    f.add(item_class, "loadView", [&f](CpuState& s, GuestMemory&) {
+        static_cast<void>(f.id(s.x[0], "setView:", {f.with_rect(f.id(f.cls("NSView"), "alloc"), "initWithFrame:", {{0, 0}, {10, 10}})}));
+    }, "v@:");
+    const auto view = f.with_rect(f.id(f.cls("NSCollectionView"), "alloc"), "initWithFrame:", {{0, 0}, {400, 300}});
+    static_cast<void>(f.id(view, "setCollectionViewLayout:", {layout}));
+    static_cast<void>(f.id(view, "registerClass:forItemWithIdentifier:", {item_class, f.str("cell")}));
+    const auto items = f.block("u27b_item_provider", [&f](CpuState& s, GuestMemory&) {
+        s.x[0] = f.id(s.x[1], "makeItemWithIdentifier:forIndexPath:", {f.str("cell"), s.x[2]});
+    });
+    const auto source = f.id(f.id(f.cls("NSCollectionViewDiffableDataSource"), "alloc"), "initWithCollectionView:itemProvider:", {view, items});
+    const auto snapshot = f.id(f.id(f.cls("NSDiffableDataSourceSnapshot"), "alloc"), "init");
+    static_cast<void>(f.id(snapshot, "appendSectionsWithIdentifiers:", {list({f.str("A"), f.str("B")})}));
+    static_cast<void>(f.id(snapshot, "appendItemsWithIdentifiers:intoSectionWithIdentifier:", {list({f.str("a0"), f.str("a1"), f.str("a2"), f.str("a3")}), f.str("A")}));
+    static_cast<void>(f.id(snapshot, "appendItemsWithIdentifiers:intoSectionWithIdentifier:", {list({f.str("b0"), f.str("b1"), f.str("b2")}), f.str("B")}));
+    static_cast<void>(f.id(source, "applySnapshot:animatingDifferences:", {snapshot, 0}));
+    require(container_width == 400, "the section provider container: " + std::to_string(container_width));
+
+    const auto frame_text = [](const CallResult& r) {
+        return std::to_string(r.d(0)) + "," + std::to_string(r.d(1)) + " " + std::to_string(r.d(2)) + "x" + std::to_string(r.d(3));
+    };
+    const auto is_frame = [](const CallResult& r, double x, double y, double w, double h) { return r.d(0) == x && r.d(1) == y && r.d(2) == w && r.d(3) == h; };
+    const auto path = [&f](Address item, Address section) { return f.id(f.cls("NSIndexPath"), "indexPathForItem:inSection:", {item, section}); };
+    const auto item_frame = [&](Address item, Address section) { return f.send(f.id(layout, "layoutAttributesForItemAtIndexPath:", {path(item, section)}), "frame"); };
+    // Header 0..20, insets 10, rows at 30 and 85 (spacing 5), section end 135; then 8 apart, section 1 at 143.
+    require(is_frame(item_frame(1, 0), 200, 30, 200, 50), "the second tile: " + frame_text(item_frame(1, 0)));
+    require(is_frame(item_frame(2, 0), 0, 85, 200, 50), "the second row: " + frame_text(item_frame(2, 0)));
+    require(is_frame(item_frame(0, 1), 0, 143, 100, 30) && is_frame(item_frame(1, 1), 0, 173, 100, 30) && is_frame(item_frame(2, 1), 100, 143, 100, 60),
+            "the nested group: " + frame_text(item_frame(1, 1)) + " / " + frame_text(item_frame(2, 1)));
+    const auto supplementary = [&](const char* kind, Address item) {
+        return f.send(f.id(layout, "layoutAttributesForSupplementaryViewOfKind:atIndexPath:", {f.str(kind), path(item, 0)}), "frame");
+    };
+    require(is_frame(supplementary("header", 0), 0, 0, 400, 20), "the header: " + frame_text(supplementary("header", 0)));
+    require(is_frame(supplementary("badge", 1), 390, 30, 10, 10), "the badge on the top trailing corner: " + frame_text(supplementary("badge", 1)));
+    require(f.send(layout, "collectionViewContentSize").d(1) == 203, "the content height: " + std::to_string(f.send(layout, "collectionViewContentSize").d(1)));
+    CallRegs everything;
+    gui::appkit::put_rect(everything, 0, {{0, 0}, {400, 300}});
+    Address decoration = 0;
+    for (const auto attributes : f.cf.array_values(f.send(layout, "layoutAttributesForElementsInRect:", everything).x0))
+        if (f.integer(attributes, "representedElementCategory") == 2) decoration = attributes;
+    require(decoration && is_frame(f.send(decoration, "frame"), 0, 20, 400, 115) && static_cast<std::int64_t>(f.integer(decoration, "zIndex")) == -1,
+            "the background decoration");
+    Address made = 0;
+    for (const auto subview : f.cf.array_values(f.id(view, "subviews")))
+        if (f.id(subview, "class") == decoration_class) made = subview;
+    require(made && is_frame(f.send(made, "frame"), 0, 20, 400, 115), "the decoration view behind the items");
+    require(is_frame(f.send(f.id(f.id(view, "itemAtIndexPath:", {path(2, 1)}), "view"), "frame"), 100, 143, 100, 60), "item views follow the layout");
+}
+
 // ---- NSRulerView and NSScrollView rulers / insets -------------------------------------------------
 void rulers(Fixture& f) {
     const auto scroll = f.with_rect(f.id(f.cls("NSScrollView"), "alloc"), "initWithFrame:", {{0, 0}, {300, 200}});
@@ -2506,6 +2607,7 @@ int main() {
         tables(f);
         collection_views(f);
         diffable_sources(f);
+        compositional(f);
         rulers(f);
         accessibility(f);
         small_additions(f);
