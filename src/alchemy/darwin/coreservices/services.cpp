@@ -10,10 +10,8 @@
 //   server answers, so every message to another process fails with
 //   kAXErrorCannotComplete and observers cannot be created.
 //   UAZoomChangeFocus has no Zoom to inform (noErr: Zoom is not enabled).
-// - CoreServices / Carbon: Apple Event descriptors are real (AECreateDesc,
-//   AEPutParamDesc, AEGetParamDesc, AEDisposeDesc, AECreateAppleEvent);
-//   handlers are recorded but no event ever arrives (no Apple Event server);
-//   AESendMessage fails with connectionInvalid; LaunchServices registration
+// - CoreServices / Carbon: Apple Event descriptors are apple_events.cpp's
+//   (called in place); LaunchServices registration
 //   and LSOpenFromURLSpec fail (kLSServerCommunicationErr); Spotlight
 //   attributes cannot be set. The process is not a trusted AX client.
 //   The Carbon event loop is empty (ReceiveNextEvent: eventLoopTimedOutErr).
@@ -35,9 +33,7 @@ using fill::status;
 
 constexpr std::int32_t ax_cannot_complete = -25204, ax_illegal_argument = -25201;
 constexpr std::int32_t ls_server_communication = -10822;
-constexpr std::int32_t ae_connection_invalid = -609, ae_param = -50, ae_desc_not_found = -1701;
 constexpr std::int32_t event_loop_timed_out = -9875, event_not_handled = -9874;
-constexpr std::uint32_t type_null = fill::fourcc("null");
 
 // <HIServices/AXValue.h> kAXValueType*: CGPoint 1, CGSize 2, CGRect 3, CFRange 4, AXError 5.
 std::size_t ax_value_size(std::uint64_t type) {
@@ -53,11 +49,6 @@ struct AxValue final : ObjectPayload { std::uint64_t type{}; std::vector<std::ui
 struct AxElement final : ObjectPayload { std::int64_t pid{}; };
 struct TextMarker final : ObjectPayload { std::vector<std::uint8_t> bytes; };
 struct TextMarkerRange final : ObjectPayload { Address start{}, end{}; };   // retained markers
-
-// An Apple Event descriptor's data: AEDesc.dataHandle points at a guest
-// block {size (8 bytes), bytes}. Records and events keep their parameters
-// host-side, keyed by the dataHandle.
-struct AeRecord { std::map<std::uint32_t, std::pair<std::uint32_t, std::vector<std::uint8_t>>> parameters; };
 
 } // namespace
 
@@ -185,119 +176,7 @@ void Provider::install_services() {
 
     install_print_core();            // darwin/printing/print_core_gaps.cpp
 
-    // ---------------------------------------------------------------- Apple Events
-    // AEDesc { DescType descriptorType; AEDataStorage dataHandle; } (16 bytes).
-    auto records = std::make_shared<std::map<Address, AeRecord>>();
-    const auto make_handle = [this](std::span<const std::uint8_t> bytes) {
-        const auto handle = malloc(8 + bytes.size());
-        memory().write64(handle, bytes.size());
-        if (!bytes.empty()) memory().write_bytes(handle + 8, bytes);
-        return handle;
-    };
-    const auto handle_bytes = [](GuestMemory& m, Address handle) {
-        std::vector<std::uint8_t> bytes;
-        if (!handle) return bytes;
-        bytes.resize(static_cast<std::size_t>(m.read64(handle)));
-        if (!bytes.empty()) m.read_bytes(handle + 8, bytes);
-        return bytes;
-    };
-    // OSErr AECreateDesc(DescType, const void *dataPtr, Size, AEDesc *result)
-    raw(core_services, "_AECreateDesc", [this, make_handle](CpuState& s, GuestMemory& m) {
-        if (!s.x[3]) { s.x[0] = status(ae_param); return; }
-        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(s.x[2]));
-        if (!bytes.empty()) {
-            if (!s.x[1]) { s.x[0] = status(ae_param); return; }
-            m.read_bytes(s.x[1], bytes);
-        }
-        m.write32(s.x[3], static_cast<std::uint32_t>(s.x[0]));
-        m.write64(s.x[3] + 8, make_handle(bytes));
-        s.x[0] = 0;
-    });
-    // OSErr AEDisposeDesc(AEDesc *): frees the data and leaves a null descriptor.
-    raw(core_services, "_AEDisposeDesc", [this, records](CpuState& s, GuestMemory& m) {
-        if (!s.x[0]) { s.x[0] = status(ae_param); return; }
-        const auto handle = m.read64(s.x[0] + 8);
-        if (handle) {
-            {
-                std::lock_guard lock(mutex);
-                records->erase(handle);
-            }
-            free(handle);
-        }
-        m.write32(s.x[0], type_null);
-        m.write64(s.x[0] + 8, 0);
-        s.x[0] = 0;
-    });
-    // OSErr AECreateAppleEvent(AEEventClass, AEEventID, const AEAddressDesc *target,
-    //     AEReturnID, AETransactionID, AppleEvent *result): an event record
-    //     ('aevt') whose class, ID and target are parameters.
-    raw(core_services, "_AECreateAppleEvent", [this, records, make_handle, handle_bytes](CpuState& s, GuestMemory& m) {
-        if (!s.x[5]) { s.x[0] = status(ae_param); return; }
-        const auto handle = make_handle({});
-        AeRecord record;
-        auto four = [](std::uint32_t value) {
-            return std::vector<std::uint8_t>{static_cast<std::uint8_t>(value), static_cast<std::uint8_t>(value >> 8),
-                                             static_cast<std::uint8_t>(value >> 16), static_cast<std::uint8_t>(value >> 24)};
-        };
-        record.parameters[fill::fourcc("evcl")] = {fill::fourcc("type"), four(static_cast<std::uint32_t>(s.x[0]))};
-        record.parameters[fill::fourcc("evid")] = {fill::fourcc("type"), four(static_cast<std::uint32_t>(s.x[1]))};
-        if (s.x[2]) record.parameters[fill::fourcc("addr")] = {m.read32(s.x[2]), handle_bytes(m, m.read64(s.x[2] + 8))};
-        {
-            std::lock_guard lock(mutex);
-            (*records)[handle] = std::move(record);
-        }
-        m.write32(s.x[5], fill::fourcc("aevt"));
-        m.write64(s.x[5] + 8, handle);
-        s.x[0] = 0;
-    });
-    // OSErr AEPutParamDesc(AppleEvent *, AEKeyword, const AEDesc *)
-    raw(core_services, "_AEPutParamDesc", [this, records, handle_bytes](CpuState& s, GuestMemory& m) {
-        if (!s.x[0] || !s.x[2]) { s.x[0] = status(ae_param); return; }
-        const auto handle = m.read64(s.x[0] + 8);
-        std::lock_guard lock(mutex);
-        const auto found = records->find(handle);
-        if (found == records->end()) { s.x[0] = status(-1700); return; }   // errAECoercionFail: not a record
-        found->second.parameters[static_cast<std::uint32_t>(s.x[1])] = {m.read32(s.x[2]), handle_bytes(m, m.read64(s.x[2] + 8))};
-        s.x[0] = 0;
-    });
-    // OSErr AEGetParamDesc(const AppleEvent *, AEKeyword, DescType desiredType, AEDesc *result)
-    raw(core_services, "_AEGetParamDesc", [this, records, make_handle](CpuState& s, GuestMemory& m) {
-        if (!s.x[0] || !s.x[3]) { s.x[0] = status(ae_param); return; }
-        m.write32(s.x[3], type_null);
-        m.write64(s.x[3] + 8, 0);
-        std::pair<std::uint32_t, std::vector<std::uint8_t>> parameter;
-        {
-            std::lock_guard lock(mutex);
-            const auto found = records->find(m.read64(s.x[0] + 8));
-            if (found == records->end()) { s.x[0] = status(ae_desc_not_found); return; }
-            const auto entry = found->second.parameters.find(static_cast<std::uint32_t>(s.x[1]));
-            if (entry == found->second.parameters.end()) { s.x[0] = status(ae_desc_not_found); return; }
-            parameter = entry->second;
-        }
-        // Only typeWildCard ('****') or the stored type: no coercion handlers exist.
-        const auto desired = static_cast<std::uint32_t>(s.x[2]);
-        if (desired != fill::fourcc("****") && desired != parameter.first) { s.x[0] = status(-1700); return; }
-        m.write32(s.x[3], parameter.first);
-        m.write64(s.x[3] + 8, make_handle(parameter.second));
-        s.x[0] = 0;
-    });
-    // Handlers are recorded; no Apple Event is ever delivered to this process.
-    auto handlers = std::make_shared<std::set<std::pair<std::uint32_t, std::uint32_t>>>();
-    raw(core_services, "_AEInstallEventHandler", [this, handlers](CpuState& s, GuestMemory&) {
-        std::lock_guard lock(mutex);
-        handlers->insert({static_cast<std::uint32_t>(s.x[0]), static_cast<std::uint32_t>(s.x[1])});
-        s.x[0] = 0;
-    });
-    raw(core_services, "_AERemoveEventHandler", [this, handlers](CpuState& s, GuestMemory&) {
-        std::lock_guard lock(mutex);
-        s.x[0] = handlers->erase({static_cast<std::uint32_t>(s.x[0]), static_cast<std::uint32_t>(s.x[1])}) ? 0 : status(-1717);   // errAEHandlerNotFound
-    });
-    // AESendMessage(event, reply, mode, timeout): no process can receive it.
-    raw(core_services, "_AESendMessage", [](CpuState& s, GuestMemory& m) {
-        if (s.x[1]) { m.write32(s.x[1], type_null); m.write64(s.x[1] + 8, 0); }
-        s.x[0] = status(ae_connection_invalid);
-    });
-    failure(carbon, "_AEProcessEvent", event_not_handled);
+    install_apple_events();          // darwin/coreservices/apple_events.cpp
     failure(core_services, "_LSRegisterURL", ls_server_communication);
     // LSOpenFromURLSpec(const LSLaunchURLSpec*, CFURLRef* outLaunchedURL):
     // no Launch Services server opens anything (NSWorkspace opens files).

@@ -109,6 +109,7 @@ public:
     void install_service_management();    // darwin/servicemanagement/job_bless.cpp
     void install_disk_claims();           // darwin/diskarbitration/claims.cpp
     void install_fsevents();              // darwin/coreservices/fsevents.cpp
+    void install_apple_events();          // darwin/coreservices/apple_events.cpp
     void install_media();
     void install_foundation();
     void install_selectors();

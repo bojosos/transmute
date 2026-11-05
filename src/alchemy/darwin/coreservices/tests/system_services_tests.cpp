@@ -76,6 +76,89 @@ void system_services(Fixture& f) {
     }
 }
 
+constexpr Address code(const char (&text)[5]) {
+    return (Address{static_cast<unsigned char>(text[0])} << 24) | (Address{static_cast<unsigned char>(text[1])} << 16) |
+        (Address{static_cast<unsigned char>(text[2])} << 8) | static_cast<unsigned char>(text[3]);
+}
+
+// Apple Event descriptors (apple_events.cpp): lists, records, attributes, coercion, handlers.
+void apple_events(Fixture& f) {
+    const auto desc = [&] { return f.block(16); };
+    const auto data_of = [&](Address d) {
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(f.call(cs, "_AEGetDescDataSize", {d})));
+        const auto buffer = f.block(bytes.size() + 1);
+        require(f.status(cs, "_AEGetDescData", {d, buffer, bytes.size()}) == 0, "AEGetDescData");
+        if (!bytes.empty()) f.engine.read_bytes(buffer, bytes);
+        return bytes;
+    };
+    const auto int32_buffer = [&](std::int32_t value) {
+        const auto buffer = f.block(4);
+        f.engine.write32(buffer, static_cast<std::uint32_t>(value));
+        return buffer;
+    };
+    // A list of a long, text and a nested record.
+    const auto list = desc(), record = desc(), item = desc(), copy = desc(), count = f.block(8), keyword = f.block(4);
+    require(f.status(cs, "_AECreateList", {0, 0, 0, list}) == 0 && f.engine.read32(list) == code("list"), "AECreateList(list)");
+    require(f.status(cs, "_AECreateList", {0, 0, 1, record}) == 0 && f.engine.read32(record) == code("reco"), "AECreateList(record)");
+    require(f.status(cs, "_AEPutPtr", {list, 0, code("long"), int32_buffer(42), 4}) == 0, "AEPutPtr");
+    require(f.status(cs, "_AEPutPtr", {list, 0, code("utf8"), f.text("caf\xc3\xa9"), 5}) == 0, "AEPutPtr(utf8)");
+    require(f.status(cs, "_AEPutParamPtr", {record, code("pnam"), code("TEXT"), f.text("inner"), 5}) == 0, "AEPutParamPtr into a record");
+    require(f.status(cs, "_AEPutDesc", {list, 0, record}) == 0, "AEPutDesc(record)");
+    require(f.status(cs, "_AEPutPtr", {list, 9, code("long"), int32_buffer(1), 4}) == -1719, "errAEIllegalIndex");
+    require(f.status(cs, "_AECountItems", {list, count}) == 0 && f.engine.read64(count) == 3, "AECountItems");
+    // The nested record survives: it was copied into the list, so disposing of the original does not touch it.
+    require(f.status(cs, "_AEDisposeDesc", {record}) == 0, "dispose the record");
+    require(f.status(cs, "_AEGetNthDesc", {list, 3, code("****"), keyword, item}) == 0 && f.engine.read32(item) == code("reco") &&
+            f.engine.read32(keyword) == code("****"), "AEGetNthDesc(record)");
+    const auto type = f.block(4), size = f.block(8), buffer = f.block(32);
+    require(f.status(cs, "_AEGetNthPtr", {item, 1, code("TEXT"), keyword, type, buffer, 32, size}) == 0 && f.engine.read32(keyword) == code("pnam") &&
+            f.engine.read64(size) == 5 && f.read_text(buffer, 5) == "inner", "AEGetNthPtr on the nested record");
+    // Coercions: long to text and to double, utf8 to utxt, an impossible one.
+    require(f.status(cs, "_AEGetNthPtr", {list, 1, code("TEXT"), keyword, type, buffer, 32, size}) == 0 && f.read_text(buffer, 2) == "42",
+            "long to TEXT");
+    require(f.status(cs, "_AEGetNthPtr", {list, 1, code("doub"), keyword, type, buffer, 32, size}) == 0 && f.engine.read32(type) == code("doub") &&
+            std::bit_cast<double>(f.engine.read64(buffer)) == 42.0, "long to double");
+    require(f.status(cs, "_AEGetNthPtr", {list, 2, code("utxt"), keyword, type, buffer, 32, size}) == 0 && f.engine.read64(size) == 8 &&
+            (f.engine.read32(buffer + 4) >> 16) == 0xe9, "utf8 to utxt");
+    require(f.status(cs, "_AEGetNthPtr", {list, 2, code("long"), keyword, type, buffer, 32, size}) == -1700, "text that is no number");
+    require(f.status(cs, "_AECoerceDesc", {item, code("long"), copy}) == -1700, "a record is no number");
+    // Truncated reads report the whole size.
+    require(f.status(cs, "_AEGetNthPtr", {list, 2, code("utf8"), keyword, type, buffer, 2, size}) == 0 && f.engine.read64(size) == 5, "actual size");
+    // Duplicates are deep.
+    require(f.status(cs, "_AEDuplicateDesc", {list, copy}) == 0 && f.engine.read64(copy + 8) != f.engine.read64(list + 8), "AEDuplicateDesc");
+    require(f.status(cs, "_AEPutPtr", {copy, 0, code("long"), int32_buffer(7), 4}) == 0, "change the duplicate");
+    require(f.status(cs, "_AECountItems", {list, count}) == 0 && f.engine.read64(count) == 3, "the original is unchanged");
+    // Events: class, ID and return ID are attributes, not parameters.
+    const auto event = desc();
+    require(f.status(cs, "_AECreateAppleEvent", {code("aevt"), code("odoc"), 0, static_cast<Address>(-1), 0, event}) == 0, "AECreateAppleEvent");
+    require(f.status(cs, "_AEGetAttributePtr", {event, code("evid"), code("type"), type, buffer, 4, size}) == 0 && f.engine.read32(buffer) == code("odoc"),
+            "keyEventIDAttr");
+    require(f.status(cs, "_AEGetAttributePtr", {event, code("rtid"), code("long"), type, buffer, 4, size}) == 0 &&
+            static_cast<std::int32_t>(f.engine.read32(buffer)) > 0, "a generated return ID");
+    require(f.status(cs, "_AEGetParamPtr", {event, code("evid"), code("****"), type, buffer, 4, size}) == -1701, "the ID is no parameter");
+    require(f.status(cs, "_AEPutAttributePtr", {event, code("subj"), code("long"), int32_buffer(5), 4}) == 0, "AEPutAttributePtr");
+    require(f.status(cs, "_AEGetAttributeDesc", {event, code("subj"), code("****"), item}) == 0 && data_of(item).size() == 4, "AEGetAttributeDesc");
+    require(f.status(cs, "_AEPutParamDesc", {event, code("----"), list}) == 0, "a list parameter");
+    require(f.status(cs, "_AEGetParamDesc", {event, code("----"), code("list"), item}) == 0 && f.status(cs, "_AECountItems", {item, count}) == 0 &&
+            f.engine.read64(count) == 3, "the list parameter keeps its items");
+    require(f.status(cs, "_AEPutAttributePtr", {list, code("subj"), code("long"), int32_buffer(5), 4}) == -1703, "attributes belong to events");
+    // Booleans.
+    require(f.status(cs, "_AECreateDesc", {code("true"), 0, 0, item}) == 0 && f.status(cs, "_AECoerceDesc", {item, code("bool"), copy}) == 0 &&
+            data_of(copy) == std::vector<std::uint8_t>{1}, "true to bool");
+    // Handlers.
+    const auto handler = f.block(8), refcon = f.block(8);
+    require(f.status(cs, "_AEInstallEventHandler", {code("aevt"), code("odoc"), 0x1234, 0x5678, 0}) == 0, "AEInstallEventHandler");
+    require(f.status(cs, "_AEGetEventHandler", {code("aevt"), code("odoc"), handler, refcon, 0}) == 0 && f.engine.read64(handler) == 0x1234 &&
+            f.engine.read64(refcon) == 0x5678, "AEGetEventHandler");
+    require(f.status(cs, "_AERemoveEventHandler", {code("aevt"), code("odoc"), 0x1234, 0}) == 0 &&
+            f.status(cs, "_AEGetEventHandler", {code("aevt"), code("odoc"), handler, refcon, 0}) == -1717, "AERemoveEventHandler");
+    // AEInitializeDesc.
+    f.engine.write32(item, 0x12345678);
+    static_cast<void>(f.call(cs, "_AEInitializeDesc", {item}));
+    require(f.engine.read32(item) == code("null") && f.engine.read64(item + 8) == 0, "AEInitializeDesc");
+    for (const auto d : {list, copy, event}) require(f.status(cs, "_AEDisposeDesc", {d}) == 0, "AEDisposeDesc");
+}
+
 } // namespace
 
 // FSEvents (fsevents.cpp): a file-events stream on a dispatch queue reports a
@@ -136,5 +219,5 @@ void fsevents(Fixture& f) {
 }
 
 int main() {
-    return run("coreservices system services", {{"system services", system_services}, {"fsevents", fsevents}});
+    return run("coreservices system services", {{"system services", system_services}, {"apple events", apple_events}, {"fsevents", fsevents}});
 }

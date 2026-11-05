@@ -10,6 +10,7 @@
 list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/coreservices/coreservices.cpp
     src/alchemy/darwin/coreservices/services.cpp
+    src/alchemy/darwin/coreservices/apple_events.cpp
     src/alchemy/darwin/coreservices/fsevents.cpp
     src/alchemy/darwin/coreservices/uttype.cpp
     src/alchemy/darwin/coreservices/uttype_provider.cpp
