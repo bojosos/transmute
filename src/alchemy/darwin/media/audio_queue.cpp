@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -49,8 +50,15 @@
 // enqueued, into the decoder's rate and channels, and play like linear PCM; a packet the decoder
 // rejects plays as silence.
 //
+// Offline rendering: after AudioQueueSetOfflineRenderFormat (a linear PCM format) the queue plays
+// into the buffers given to AudioQueueOfflineRender instead of a device, from where it stands (the
+// time stamp is not used): its audio converted, resampled and mixed as for a device, with its
+// volume and pan. Buffers that finish playing go back to the callback before
+// AudioQueueOfflineRender returns, on the calling thread, so the usual render loop can refill and
+// stop the queue as it goes.
+//
 // Unavailable: other compressed formats (AAC, ALAC, ...: kAudioFormatUnsupportedDataFormatError),
-// compressed input (there is no encoder), offline rendering and processing taps.
+// compressed input (there is no encoder) and processing taps.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -66,6 +74,7 @@ bool compressed_playable(std::uint32_t id) {
 namespace error {
 inline constexpr std::int32_t invalid_buffer = -66687, buffer_empty = -66686, invalid_property = -66684, invalid_property_size = -66683,
     invalid_parameter = -66682, invalid_device = -66680, buffer_in_queue = -66679, invalid_run_state = -66678,
+    invalid_offline_mode = -66626,
     unsupported_format = static_cast<std::int32_t>(four("fmt?")), param = -50;
 }
 
@@ -118,6 +127,8 @@ struct Queue {
     std::uint32_t codec{}, codec_frames_per_packet{};
     std::vector<std::uint8_t> cookie;
     std::unique_ptr<codecs::AudioDecoder> decoder;
+    // Offline rendering: the format AudioQueueOfflineRender writes (no device while it is set).
+    std::optional<af::Pcm> offline;
     // Input queues:
     bool input{};
     std::shared_ptr<hal_io::InputIo> input_io;
@@ -145,7 +156,12 @@ private:
     void give_back_input(const std::shared_ptr<Queue>& q, std::uint64_t buffer, std::uint32_t packets, double sample, std::uint64_t host);
     void capture(const std::shared_ptr<Queue>& q, const float* samples, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing);
     void notify(const std::shared_ptr<Queue>& q, std::uint32_t property);
-    void render(const std::shared_ptr<Queue>& q, float* mix, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing);
+    // Mixes the queue's next `frames` into `mix`. Finished buffers go back to the callback where its
+    // callbacks run, or with `finished` set are listed there for the caller to hand back.
+    void render(const std::shared_ptr<Queue>& q, float* mix, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing,
+                std::vector<std::uint64_t>* finished_out = nullptr);
+    // Hands `buffer` to the callback on this thread (offline rendering).
+    void give_back_now(const std::shared_ptr<Queue>& q, std::uint64_t buffer);
     // A compressed queue's buffer of `bytes`: its packets decoded into `b` (under the queue's mutex).
     std::int32_t decode(Queue& q, GuestMemory& m, std::uint64_t buffer, std::uint32_t bytes, std::uint32_t description_count,
                         std::uint64_t descriptions, Buffer& b);
@@ -342,7 +358,17 @@ void Queues::notify(const std::shared_ptr<Queue>& q, std::uint32_t property) {
     for (const auto& l : listeners) static_cast<void>(call(l.proc, {l.data, q->handle, property}));
 }
 
-void Queues::render(const std::shared_ptr<Queue>& q, float* mix, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing) {
+void Queues::give_back_now(const std::shared_ptr<Queue>& q, std::uint64_t buffer) {
+    {
+        std::lock_guard lock(q->mutex);
+        if (q->disposed) return;
+    }
+    if (q->block) static_cast<void>(bridge_->invoke_block(q->block, {q->handle, buffer}));
+    else if (q->callback) static_cast<void>(call(q->callback, {q->user_data, q->handle, buffer}));
+}
+
+void Queues::render(const std::shared_ptr<Queue>& q, float* mix, std::uint32_t frames, std::uint32_t channels, const hal_io::Timing& timing,
+                    std::vector<std::uint64_t>* finished_out) {
     auto& m = support_.process.calling_engine();
     std::vector<std::uint64_t> finished;
     bool ran_dry = false;
@@ -428,7 +454,9 @@ void Queues::render(const std::shared_ptr<Queue>& q, float* mix, std::uint32_t f
         q->averages.resize(channels);
         for (std::uint32_t c = 0; c < channels; ++c) q->averages[c] = std::sqrt(sums[c] / std::max<std::size_t>(frames, 1));
     }
-    for (const auto buffer : finished) give_back(q, buffer);
+    if (finished_out) finished_out->insert(finished_out->end(), finished.begin(), finished.end());
+    else
+        for (const auto buffer : finished) give_back(q, buffer);
     bool stop = false;
     {
         std::lock_guard lock(q->mutex);
@@ -470,6 +498,16 @@ std::int32_t Queues::start(const std::shared_ptr<Queue>& q) {
             q->input_io.reset();
             return status;
         }
+        notify(q, prop_is_running);
+        return 0;
+    }
+    bool offline{};
+    {
+        std::lock_guard lock(q->mutex);
+        offline = q->offline.has_value();
+        if (offline) q->running = true;   // AudioQueueOfflineRender plays it
+    }
+    if (offline) {
         notify(q, prop_is_running);
         return 0;
     }
@@ -934,6 +972,65 @@ void Queues::install() {
         m.write64(s.x[2] + 16, std::bit_cast<std::uint64_t>(1.0));
         m.write32(s.x[2] + 56, 7);
         if (s.x[3]) m.write8(s.x[3], 0);
+        status(s, 0);
+    });
+    // AudioQueueSetOfflineRenderFormat(aq, const AudioStreamBasicDescription *format, const AudioChannelLayout *layout):
+    // linear PCM to render offline, or NULL for the device again. Not while the queue runs.
+    support_.function(audio_toolbox, "_AudioQueueSetOfflineRenderFormat", [self, status](CpuState& s, GuestMemory& m) {
+        const auto q = self->find(s.x[0]);
+        if (!q) return status(s, error::param);
+        if (q->input) return status(s, error::invalid_offline_mode);
+        std::optional<af::Pcm> format;
+        if (s.x[1]) {
+            std::vector<std::uint8_t> bytes(40);
+            m.read_bytes(s.x[1], bytes);
+            std::string why;
+            format = af::pcm_from_asbd(bytes, why);
+            if (!format) return status(s, error::unsupported_format);
+        }
+        std::lock_guard lock(q->mutex);
+        if (q->running) return status(s, error::invalid_run_state);
+        q->offline = format;
+        q->resampler.reset();   // made again for the new output rate
+        status(s, 0);
+    });
+    // AudioQueueOfflineRender(aq, const AudioTimeStamp *timestamp, AudioQueueBufferRef buffer, UInt32 frames): the
+    // next `frames` into the buffer in the offline format (fewer when its capacity is smaller); 0 frames primes.
+    support_.function(audio_toolbox, "_AudioQueueOfflineRender", [self, status](CpuState& s, GuestMemory& m) {
+        const auto q = self->find(s.x[0]);
+        if (!q) return status(s, error::param);
+        const auto buffer = s.x[2];
+        af::Pcm format;
+        std::uint32_t capacity{};
+        bool running{};
+        {
+            std::lock_guard lock(q->mutex);
+            if (!q->offline) return status(s, error::invalid_offline_mode);
+            const auto found = q->buffers.find(buffer);
+            if (found == q->buffers.end()) return status(s, error::invalid_buffer);
+            format = *q->offline;
+            capacity = found->second;
+            running = q->running;
+        }
+        const auto planes = format.non_interleaved ? format.channels : 1U;
+        const auto per_frame = format.frame_bytes() * planes;
+        const auto frames = std::min(static_cast<std::uint32_t>(s.x[3]), capacity / per_frame);
+        m.write32(buffer + buffer_size, 0);
+        if (!frames || !running) return status(s, 0);
+        std::vector<float> mix(static_cast<std::size_t>(frames) * format.channels, 0.0f);
+        hal_io::Timing timing;
+        timing.rate = format.rate;
+        std::vector<std::uint64_t> finished;
+        self->render(q, mix.data(), frames, format.channels, timing, &finished);
+        const std::vector<double> samples(mix.begin(), mix.end());
+        const auto plane_bytes = static_cast<std::size_t>(frames) * format.frame_bytes();
+        std::vector<std::vector<std::uint8_t>> storage(planes, std::vector<std::uint8_t>(plane_bytes));
+        std::vector<std::span<std::uint8_t>> spans(storage.begin(), storage.end());
+        af::encode(format, samples, format.channels, frames, spans);
+        const auto data = m.read64(buffer + buffer_data);
+        for (std::uint32_t p = 0; p < planes; ++p) m.write_bytes(data + p * plane_bytes, storage[p]);
+        m.write32(buffer + buffer_size, static_cast<std::uint32_t>(plane_bytes * planes));
+        for (const auto played : finished) self->give_back_now(q, played);
         status(s, 0);
     });
     // AudioQueueCreateTimeline(aq, AudioQueueTimelineRef *out) / AudioQueueDisposeTimeline: the

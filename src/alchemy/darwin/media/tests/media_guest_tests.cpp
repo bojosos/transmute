@@ -842,6 +842,39 @@ void audio_queue(Fixture& f) {
     while (returned == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     require(returned == 1, "the played buffer comes back to the callback");
     require(f.status(at, "_AudioQueueStop", {queue, 1}) == 0 && f.status(at, "_AudioQueueDispose", {queue, 1}) == 0, "stopped and disposed");
+
+    // Offline rendering: 1024 frames of 0.5 rendered as 16-bit stereo, 512 at a time; the buffer
+    // comes back to the callback inside the call that finishes it, and then there is silence.
+    returned = 0;
+    require(f.status(at, "_AudioQueueNewOutput", {format, callback, 0, 0, 0, 0, queue_out}) == 0, "an offline queue");
+    const auto offline = f.engine.read64(queue_out);
+    const auto out_buffer = f.block(8);
+    require(f.status(at, "_AudioQueueAllocateBuffer", {offline, 1024 * 8, buffer_out}) == 0 &&
+            f.status(at, "_AudioQueueAllocateBuffer", {offline, 512 * 4, out_buffer}) == 0, "source and render buffers");
+    const auto source = f.engine.read64(buffer_out), rendered = f.engine.read64(out_buffer);
+    for (std::uint32_t i = 0; i < 1024 * 2; ++i) f.engine.write32(f.engine.read64(source + 8) + 4ULL * i, std::bit_cast<std::uint32_t>(0.5f));
+    f.engine.write32(source + 16, 1024 * 8);
+    const auto stamp = f.block(64);
+    require(f.status(at, "_AudioQueueOfflineRender", {offline, stamp, rendered, 512}) == -66626, "not offline yet");
+    const auto s16 = f.block(40);
+    f.engine.write64(s16, std::bit_cast<std::uint64_t>(48000.0));
+    f.engine.write32(s16 + 8, 0x6C70636D);
+    f.engine.write32(s16 + 12, 4 | 8);   // signed integer, packed
+    f.engine.write32(s16 + 16, 4); f.engine.write32(s16 + 20, 1); f.engine.write32(s16 + 24, 4);
+    f.engine.write32(s16 + 28, 2); f.engine.write32(s16 + 32, 16);
+    require(f.status(at, "_AudioQueueSetOfflineRenderFormat", {offline, s16, 0}) == 0, "AudioQueueSetOfflineRenderFormat");
+    require(f.status(at, "_AudioQueueEnqueueBuffer", {offline, source, 0, 0}) == 0 && f.status(at, "_AudioQueueStart", {offline, 0}) == 0,
+            "enqueued and started (no device)");
+    require(f.status(at, "_AudioQueueOfflineRender", {offline, stamp, rendered, 0}) == 0 && f.engine.read32(rendered + 16) == 0, "priming");
+    const auto rendered_data = f.engine.read64(rendered + 8);
+    const auto sample = [&](std::uint32_t index) { return static_cast<std::int16_t>(f.memory().read8(rendered_data + 2ULL * index) | (f.memory().read8(rendered_data + 2ULL * index + 1) << 8)); };
+    require(f.status(at, "_AudioQueueOfflineRender", {offline, stamp, rendered, 512}) == 0 && f.engine.read32(rendered + 16) == 512 * 4 &&
+            std::abs(sample(0) - 16384) <= 1 && std::abs(sample(1023) - 16384) <= 1 && returned == 0, "the first 512 frames");
+    require(f.status(at, "_AudioQueueOfflineRender", {offline, stamp, rendered, 512}) == 0 && std::abs(sample(1023) - 16384) <= 1 && returned == 1,
+            "the last 512 frames; the buffer is back");
+    require(f.status(at, "_AudioQueueOfflineRender", {offline, stamp, rendered, 512}) == 0 && sample(0) == 0 && sample(1023) == 0, "then silence");
+    require(f.status(at, "_AudioQueueSetOfflineRenderFormat", {offline, 0, 0}) == -66678, "not while running");
+    require(f.status(at, "_AudioQueueStop", {offline, 1}) == 0 && f.status(at, "_AudioQueueDispose", {offline, 1}) == 0, "offline queue disposed");
 }
 
 // OpenAL over the fake device: a constant mono buffer at the listener plays centered (equal power).
