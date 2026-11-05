@@ -4,7 +4,10 @@
 // bounded by what QLab 5.6.3 uses: DispatchQoS, DispatchWorkItemFlags,
 // DispatchQueue.Attributes and AutoreleaseFrequency, DispatchQueue.main,
 // init(label:qos:attributes:autoreleaseFrequency:target:) and
-// async(group:qos:flags:execute:). Written from Apple's public documentation.
+// async(group:qos:flags:execute:); and what Maccy and Pika (SwiftUI apps) add:
+// DispatchTime (now, +), DispatchWorkItem, asyncAfter, global(qos:),
+// DispatchGroup.notify and the file-system object source. Written from
+// Apple's public documentation.
 // QoS classes and the QoS-related work item flags are scheduling hints:
 // Alchemy's libdispatch runs work on host threads without QoS, so they do
 // not change where or when work runs; the barrier flag is honored.
@@ -184,5 +187,189 @@ extension DispatchQueue {
         } else {
             __dispatch_async(self, work)
         }
+    }
+
+    /// Schedules a block for execution at the specified time, and returns immediately.
+    public func asyncAfter(deadline: DispatchTime, qos: DispatchQoS = .unspecified, flags: DispatchWorkItemFlags = [],
+                           execute work: @escaping @convention(block) () -> Void) {
+        if flags.isEmpty { __dispatch_after(deadline.rawValue, self, work); return }
+        _withFlagged(work, flags) { ___alchemy_dispatch_after(deadline.rawValue, self, $0) }
+    }
+
+    /// Schedules a work item for execution at the specified time, and returns immediately.
+    public func asyncAfter(deadline: DispatchTime, execute: DispatchWorkItem) {
+        ___alchemy_dispatch_after(deadline.rawValue, self, execute._block)
+    }
+
+    /// Returns the global system queue with the specified quality-of-service class.
+    public static func global(qos: DispatchQoS.QoSClass = .default) -> DispatchQueue {
+        return __dispatch_get_global_queue(Int(qos.rawValue.rawValue), 0)
+    }
+}
+
+// ---- DispatchTime ------------------------------------------------------------------
+
+/// A point in time relative to the default clock, with nanosecond precision.
+public struct DispatchTime: Comparable {
+    /// The raw dispatch_time_t value.
+    public let rawValue: dispatch_time_t
+
+    /// A time in the distant future.
+    public static let distantFuture = DispatchTime(rawValue: ~0)
+
+    /// Returns the current time.
+    public static func now() -> DispatchTime {
+        return DispatchTime(rawValue: __dispatch_time(0, 0))   // DISPATCH_TIME_NOW
+    }
+
+    /// Creates a time from a raw dispatch_time_t value.
+    public init(rawValue: dispatch_time_t) { self.rawValue = rawValue }
+
+    public static func < (a: DispatchTime, b: DispatchTime) -> Bool { return a.rawValue < b.rawValue }
+}
+
+/// Returns a time the given number of seconds after a time (the distant future for one beyond the clock's range).
+public func + (time: DispatchTime, seconds: Double) -> DispatchTime {
+    precondition(!seconds.isNaN, "Dispatch: a NaN interval")
+    let nanoseconds = seconds * 1_000_000_000
+    if nanoseconds >= Double(Int64.max) { return .distantFuture }
+    let delta = nanoseconds <= Double(Int64.min) ? Int64.min : Int64(nanoseconds)
+    return DispatchTime(rawValue: __dispatch_time(time.rawValue, delta))
+}
+
+// ---- DispatchWorkItem ----------------------------------------------------------------
+
+/// The work you want to perform, encapsulated in a way that lets you attach a completion handle or execution
+/// dependencies, and cancel it before it runs.
+public class DispatchWorkItem {
+    /// The dispatch block (dispatch_block_create) the queues run, held by pointer to keep its identity; owned.
+    internal let _block: UnsafeMutableRawPointer
+
+    /// Creates a work item with the given flags and block.
+    public init(flags: DispatchWorkItemFlags, block: @escaping @convention(block) () -> Void) {
+        guard let created = ___alchemy_dispatch_block_create(UInt(flags.rawValue), block) else {
+            preconditionFailure("Dispatch: dispatch_block_create failed")
+        }
+        _block = created
+    }
+
+    deinit { ___alchemy_block_release(_block) }
+
+    /// Creates a work item with the given quality-of-service class, flags and block.
+    public convenience init(qos: DispatchQoS = .unspecified, flags: DispatchWorkItemFlags = [],
+                            block: @escaping @convention(block) () -> Void) {
+        self.init(flags: flags, block: block)   // QoS is a scheduling hint here (see above)
+    }
+
+    /// Executes the work item's block synchronously on the current thread.
+    public func perform() {
+        // A block is called through its invoke function (at offset 16) with the block itself.
+        let invoke = _block.load(fromByteOffset: 16, as: (@convention(c) (UnsafeMutableRawPointer) -> Void).self)
+        invoke(_block)
+    }
+
+    /// Cancels the work item: if it has not started yet, it does not run.
+    public func cancel() { ___alchemy_dispatch_block_cancel(_block) }
+
+    /// Whether the work item was cancelled.
+    public var isCancelled: Bool { return ___alchemy_dispatch_block_testcancel(_block) != 0 }
+}
+
+// ---- DispatchGroup -------------------------------------------------------------------
+
+extension DispatchGroup {
+    /// Schedules a block to run on a queue when every task in the group has finished.
+    public func notify(qos: DispatchQoS = .unspecified, flags: DispatchWorkItemFlags = [], queue: DispatchQueue,
+                       execute work: @escaping @convention(block) () -> Void) {
+        if flags.isEmpty { __dispatch_group_notify(self, queue, work); return }
+        _withFlagged(work, flags) { ___alchemy_dispatch_group_notify(self, queue, $0) }
+    }
+}
+
+/// Passes a dispatch block that carries work item flags to `use` (which copies it if it keeps it), then releases it.
+private func _withFlagged(_ work: @escaping @convention(block) () -> Void, _ flags: DispatchWorkItemFlags,
+                          _ use: (UnsafeMutableRawPointer) -> Void) {
+    guard let block = ___alchemy_dispatch_block_create(UInt(flags.rawValue), work) else {
+        preconditionFailure("Dispatch: dispatch_block_create failed")
+    }
+    use(block)
+    ___alchemy_block_release(block)
+}
+
+// ---- Dispatch sources ----------------------------------------------------------------
+
+/// The type of a dispatch source's event and cancellation handlers.
+public typealias DispatchSourceHandler = @convention(block) () -> Void
+
+/// A source's object as the class every dispatch source is (protocol existentials of sources are that object).
+private func _dispatchSource(_ object: AnyObject) -> DispatchSource {
+    return unsafeBitCast(object, to: DispatchSource.self)
+}
+
+extension DispatchSource {
+    /// The events a file-system object source monitors (DISPATCH_VNODE_*).
+    public struct FileSystemEvent: OptionSet, RawRepresentable {
+        public let rawValue: UInt
+        public init(rawValue: UInt) { self.rawValue = rawValue }
+
+        /// The file-system object was deleted from the namespace.
+        public static let delete = FileSystemEvent(rawValue: 0x1)
+        /// The file-system object's data changed.
+        public static let write = FileSystemEvent(rawValue: 0x2)
+        /// The file-system object changed in size.
+        public static let extend = FileSystemEvent(rawValue: 0x4)
+        /// The file-system object's metadata changed.
+        public static let attrib = FileSystemEvent(rawValue: 0x8)
+        /// The file-system object's link count changed.
+        public static let link = FileSystemEvent(rawValue: 0x10)
+        /// The file-system object was renamed in the namespace.
+        public static let rename = FileSystemEvent(rawValue: 0x20)
+        /// The file-system object was revoked.
+        public static let revoke = FileSystemEvent(rawValue: 0x40)
+        /// The file-system object was unlocked.
+        public static let funlock = FileSystemEvent(rawValue: 0x100)
+    }
+
+    /// Creates a dispatch source that monitors a file descriptor for the given events.
+    public static func makeFileSystemObjectSource(fileDescriptor: Int32, eventMask: FileSystemEvent,
+                                                  queue: DispatchQueue? = nil) -> DispatchSourceFileSystemObject {
+        let source = __dispatch_source_create(___alchemy_dispatch_source_type_vnode(), UInt(bitPattern: Int(fileDescriptor)),
+                                              eventMask.rawValue, queue)
+        return unsafeBitCast(source, to: DispatchSourceFileSystemObject.self)
+    }
+}
+
+extension DispatchSourceProtocol {
+    /// Sets the event handler block for the dispatch source.
+    public func setEventHandler(qos: DispatchQoS = .unspecified, flags: DispatchWorkItemFlags = [], handler: DispatchSourceHandler?) {
+        let source = _dispatchSource(self)
+        if let handler = handler, !flags.isEmpty {
+            _withFlagged(handler, flags) { ___alchemy_dispatch_source_set_event_handler(source, $0) }
+        } else {
+            __dispatch_source_set_event_handler(source, handler)
+        }
+    }
+
+    /// Sets the cancellation handler block for the dispatch source.
+    public func setCancelHandler(qos: DispatchQoS = .unspecified, flags: DispatchWorkItemFlags = [], handler: DispatchSourceHandler?) {
+        let source = _dispatchSource(self)
+        if let handler = handler, !flags.isEmpty {
+            _withFlagged(handler, flags) { ___alchemy_dispatch_source_set_cancel_handler(source, $0) }
+        } else {
+            __dispatch_source_set_cancel_handler(source, handler)
+        }
+    }
+
+    /// Resumes the dispatch source.
+    public func resume() { __dispatch_resume(_dispatchSource(self)) }
+
+    /// Cancels the dispatch source: its event handler does not run again, and its cancellation handler runs.
+    public func cancel() { __dispatch_source_cancel(_dispatchSource(self)) }
+}
+
+extension DispatchSourceFileSystemObject {
+    /// The events the file-system object source observed.
+    public var data: DispatchSource.FileSystemEvent {
+        return DispatchSource.FileSystemEvent(rawValue: __dispatch_source_get_data(_dispatchSource(self)))
     }
 }
