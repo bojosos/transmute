@@ -140,7 +140,12 @@ std::optional<Record> lookup(std::uint32_t pid) {
     const auto process = host::process::open(pid);
     if (!process) return std::nullopt;
     std::optional<Record> result;
-    if (handle_running(*process)) {
+    // A process that has exited is gone, though its handle is signalled only once the host
+    // has torn it down (over a minute for a large address space on a loaded machine): a
+    // Chrome launch would otherwise take a dying browser for the live owner of its profile.
+    // (A process that exits with status 259, STILL_ACTIVE, still reads as running until its
+    // handle is signalled: the behaviour before this check.)
+    if (handle_running(*process) && host_running(pid)) {
         if (const auto object = host::sections::open_existing(object_name(pid), false)) {
             if (const auto view = host::sections::map(*object, 0, sizeof(Shared), false)) {
                 result = read_shared(*reinterpret_cast<const Shared*>(*view));

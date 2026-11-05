@@ -455,7 +455,12 @@ ProcessResult run_program(const std::filesystem::path& executable,
         return result;
     });
     // A fatal signal raised on any guest thread records the process status.
-    set_engine_stop_observer(engine, [&context](std::uint32_t status) { context.request_exit(status); });
+    // On the signalled thread: ALCHEMY_TRACE_CALLS_RING prints its last provider calls (exit
+    // requests its status before stopping the engine, so it prints nothing).
+    set_engine_stop_observer(engine, [&context](std::uint32_t status) {
+        if (!context.requested_exit()) context.print_call_ring();
+        context.request_exit(status);
+    });
     const auto report_termination = [&](const EngineTermination& termination) {
         std::ostringstream report;
         report << "alchemy: guest terminated by " << GuestSignalTermination::name(termination.signal)

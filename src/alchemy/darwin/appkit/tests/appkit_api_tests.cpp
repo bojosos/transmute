@@ -1078,6 +1078,39 @@ void modern_toolbar_items(Fixture& f) {
 // utterance (at volume 0, to the silent output stream main() asks for)
 // reaches the delegate's word and finish callbacks (NO when there is no
 // audio output to speak to).
+// NSAnimationNonblocking: -startAnimation returns at once and the run loop runs the
+// frames and the delegate's -animationDidEnd: (Chrome's window-close animator closes
+// its window there, after its own close call returned); -stopAnimation ends it at once.
+void nonblocking_animation(Fixture& f) {
+    static int ended = 0, stopped = 0;
+    const auto delegate_class = f.subclass("NonblockingAnimationDelegate", "NSObject");
+    f.add(delegate_class, "animationDidEnd:", [](CpuState&, GuestMemory&) { ++ended; });
+    f.add(delegate_class, "animationDidStop:", [](CpuState&, GuestMemory&) { ++stopped; });
+    const auto delegate = f.alloc_init("NonblockingAnimationDelegate");
+    const auto make = [&] {
+        CallRegs registers;
+        registers.set_d(0, 0.05);
+        registers.x[2] = 3;   // NSAnimationLinear
+        const auto made = f.msg(f.id(f.cls("NSAnimation"), "alloc"), "initWithDuration:animationCurve:", registers).x0;
+        static_cast<void>(f.id(made, "setAnimationBlockingMode:", {1}));   // NSAnimationNonblocking
+        static_cast<void>(f.id(made, "setDelegate:", {delegate}));
+        return made;
+    };
+    const auto animation = make();
+    static_cast<void>(f.id(animation, "startAnimation"));
+    require((f.id(animation, "isAnimating") & 0xff) && ended == 0, "a non-blocking animation runs after -startAnimation returns");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!ended && std::chrono::steady_clock::now() < deadline) f.spin();
+    require(ended == 1 && stopped == 0 && !(f.id(animation, "isAnimating") & 0xff) && f.msg(animation, "currentProgress").s(0) == 1.0f,
+            "the run loop runs it to its end (-animationDidEnd:)");
+    const auto second = make();
+    static_cast<void>(f.id(second, "startAnimation"));
+    static_cast<void>(f.id(second, "stopAnimation"));
+    require(stopped == 1 && ended == 1 && !(f.id(second, "isAnimating") & 0xff), "-stopAnimation ends it at once (-animationDidStop:)");
+    for (int i = 0; i < 4; ++i) f.spin();
+    require(ended == 1 && stopped == 1, "nothing runs after the stop");
+}
+
 void speech(Fixture& f) {
     const auto synth_class = f.cls("NSSpeechSynthesizer");
     const auto voices = f.id(synth_class, "availableVoices");
@@ -1136,7 +1169,8 @@ int main() {
                  {"images_and_cursors", images_and_cursors}, {"alerts_and_panels", alerts_and_panels},
                  {"pasteboards_and_text", pasteboards_and_text}, {"containers_and_controllers", containers_and_controllers},
                  {"toolbars_and_tabs", toolbars_and_tabs}, {"c_functions", c_functions},
-                 {"status_items_and_sounds", status_items_and_sounds}, {"app_referenced", app_referenced}, {"toolbar_groups", toolbar_groups}, {"modern_toolbar_items", modern_toolbar_items}, {"speech", speech}}) {
+                 {"status_items_and_sounds", status_items_and_sounds}, {"app_referenced", app_referenced}, {"toolbar_groups", toolbar_groups},
+                 {"modern_toolbar_items", modern_toolbar_items}, {"nonblocking_animation", nonblocking_animation}, {"speech", speech}}) {
             std::cout << "[appkit api] " << name << std::endl;
             test(f);
         }

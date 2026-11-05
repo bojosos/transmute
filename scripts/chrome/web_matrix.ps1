@@ -2,7 +2,7 @@
 # windowed Chrome under alchemy-fx (web_visit.ps1: cloaked, fresh anonymous profile, network open with the update and
 # telemetry hosts refused), one site per browser, ANGLE and Graphite on SwiftShader with V8's JIT unless -Cpu/-Jitless.
 # With -Native <chrome.exe> the same sites run in a native Windows Chrome (the baseline; -Exe is then ignored).
-# Usage: web_matrix.ps1 -Exe <build>\Release\alchemy-fx.exe -Out <scratch dir> [-Batch 1|2] [-Only name,name] [-Cpu]
+# Usage: web_matrix.ps1 -Exe <build>\Release\alchemy-fx.exe -Out <scratch dir> [-Batch 1|2|3] [-Only name,name] [-Cpu]
 #          [-Jitless] [-Native <chrome.exe>] [-Root <alchemy-root-chrome>] [-RuntimeDir <alchemy-llvm-arm64>]
 # -Batch 2 is the second set of sites: logged-out landing pages of large web apps, a read-only editor view and a WebGL
 # demo (frame rate read by the fps action). Nothing is typed, submitted, bought or signed into.
@@ -57,6 +57,25 @@ if ($Batch -eq 2) {
         @('figma', 'https://www.figma.com/', 'scroll', 10),
         @('google-docs', 'https://www.google.com/docs/about/', 'scroll', 8),
         @('webgl-aquarium', 'https://webglsamples.org/aquarium/aquarium.html', 'fps', 15)
+    )
+}
+if ($Batch -eq 3) {
+    # Page types the first two batches miss: Chrome's PDF viewer, WebAssembly and service-worker apps, editors in
+    # workers, Canvas 2D charts, SVG notebooks, raster map tiles, web components, a right-to-left script, embedded
+    # live examples (iframes) and heavy news and product pages.
+    $sites = @(
+        @('pdf', 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf', 'none', 8),
+        @('squoosh', 'https://squoosh.app/', 'none', 10),
+        @('vscode-dev', 'https://vscode.dev/', 'none', 20),
+        @('excalidraw', 'https://excalidraw.com/', 'none', 10),
+        @('chartjs', 'https://www.chartjs.org/docs/latest/samples/bar/vertical.html', 'none', 8),
+        @('observable-d3', 'https://observablehq.com/@d3/gallery', 'scroll', 15),
+        @('openstreetmap', 'https://www.openstreetmap.org/#map=15/48.8584/2.2945', 'none', 10),
+        @('lit-dev', 'https://lit.dev/', 'scroll', 8),
+        @('ar-wiki', 'https://ar.wikipedia.org/wiki/%D8%A7%D9%84%D9%84%D8%BA%D8%A9_%D8%A7%D9%84%D8%B9%D8%B1%D8%A8%D9%8A%D8%A9', 'none', 5),
+        @('mdn-input', 'https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input/range', 'scroll', 8),
+        @('cnn', 'https://edition.cnn.com/', 'reject-consent+scroll', 10),
+        @('apple', 'https://www.apple.com/', 'scroll', 10)
     )
 }
 foreach ($site in $sites) {

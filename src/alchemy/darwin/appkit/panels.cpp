@@ -194,6 +194,10 @@ struct AnimationState final : ObjectPayload {
     Address view_animations{};                // +1 NSArray of dictionaries (NSViewAnimation)
     bool animating{};
     std::vector<float> marks;                 // progress marks, ascending
+    // A non-blocking animation runs from the main run loop: its next frame's timer (holding a
+    // retain of the animation until the animation ends), its start and the progress shown last.
+    TimerId timer{};
+    double started{}, shown{};
 };
 
 // NSAnimationCurve applied to a progress in [0, 1].
@@ -1249,11 +1253,60 @@ void AppKit::install_panels() {
         const auto state = an(s.x[0]);
         set_f(s, 0, static_cast<float>(eased(state->curve, state->progress)));
     }, "f@:");
-    // Starting runs the animation to completion in the calling thread: every
-    // frame updates the progress (-setCurrentProgress:, which NSViewAnimation
-    // applies to its targets) and displays the windows, then the delegate
-    // hears -animationDidEnd:. A delegate may refuse to start.
-    method(animation, "startAnimation", [this, an](CpuState& s, GuestMemory&) {
+    // One frame: the progress (-setCurrentProgress:, which NSViewAnimation applies
+    // to its targets), the progress marks passed since `previous`
+    // (-animation:didReachProgressMark:), then the windows displayed.
+    const auto animation_frame = [this, an](Address self, double previous, double progress) {
+        CallRegs registers;
+        registers.v[0] = {std::bit_cast<std::uint32_t>(static_cast<float>(progress)), 0};
+        static_cast<void>(send(self, "setCurrentProgress:", registers));
+        for (const auto mark : std::vector<float>(an(self)->marks))
+            if (mark > previous && mark <= progress)
+                if (const auto delegate = an(self)->delegate; delegate && responds(delegate, "animation:didReachProgressMark:")) {
+                    CallRegs told;
+                    told.x[2] = self;
+                    told.v[0] = {std::bit_cast<std::uint32_t>(mark), 0};
+                    static_cast<void>(send(delegate, "animation:didReachProgressMark:", told));
+                }
+        display_pending();
+    };
+    // The end: the delegate hears -animationDidEnd: (it ran to the end) or -animationDidStop:.
+    const auto animation_end = [this, an](Address self, bool completed) {
+        an(self)->animating = false;
+        static_cast<void>(send(self, "_alchemyEndAnimation"));
+        if (const auto delegate = an(self)->delegate)
+            static_cast<void>(send_optional(delegate, completed ? "animationDidEnd:" : "animationDidStop:", [&] { CallRegs r; r.x[2] = self; return r; }()));
+    };
+    // A non-blocking animation's next frame, from the main run loop (one timer per
+    // frame; the timer's retain of the animation passes on until it ends).
+    const auto schedule_frame = std::make_shared<std::function<void(Address)>>();
+    *schedule_frame = [this, an, animation_frame, animation_end, weak = std::weak_ptr(schedule_frame)](Address self) {
+        auto* loop = run_loop_or_null();
+        const auto state = an(self);
+        state->timer = loop->add_timer(monotonic_seconds() + 1.0 / state->frame_rate, 0, common_modes,
+                                       [this, an, animation_frame, animation_end, weak, self](TimerId) {
+            const auto state = an(self);
+            state->timer = 0;
+            const auto elapsed = monotonic_seconds() - state->started;
+            const auto progress = state->duration > 0 ? std::min(1.0, elapsed / state->duration) : 1.0;
+            const auto previous = std::exchange(state->shown, progress);
+            try {
+                animation_frame(self, previous, progress);
+                // Still running (not stopped during the frame): the next frame, or the end.
+                const bool running = an(self)->animating;
+                if (running && progress < 1) {
+                    if (const auto next = weak.lock()) { (*next)(self); return; }
+                }
+                animation_end(self, running);
+            } catch (...) { release(self); throw; }
+            release(self);
+        });
+    };
+    // NSAnimationBlocking (0, the default) runs the animation to completion in the
+    // calling thread. NSAnimationNonblocking (1) returns at once and runs it from
+    // the run loop, delegate messages included; NSAnimationNonblockingThreaded (2)
+    // does the same here, from the main run loop. A delegate may refuse to start.
+    method(animation, "startAnimation", [this, an, animation_frame, animation_end, schedule_frame](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto state = an(self);
         if (state->animating) return;
@@ -1261,33 +1314,36 @@ void AppKit::install_panels() {
         state->animating = true;
         state->progress = 0;
         static_cast<void>(send(self, "_alchemyBeginAnimation"));
+        if (state->blocking_mode != 0 && run_loop_or_null() && &process.calling_engine() == &process.main_engine()) {
+            state->started = monotonic_seconds();
+            state->shown = 0;
+            static_cast<void>(retain(self));   // the frame timer's
+            (*schedule_frame)(self);
+            return;
+        }
         const auto frames = std::max<std::int64_t>(1, static_cast<std::int64_t>(std::ceil(state->duration * state->frame_rate)));
         const auto start = std::chrono::steady_clock::now();
         for (std::int64_t frame = 1; frame <= frames && an(self)->animating; ++frame) {
             const auto progress = static_cast<double>(frame) / static_cast<double>(frames);
             std::this_thread::sleep_until(start + std::chrono::duration<double>(state->duration * progress));
-            const auto previous = static_cast<double>(frame - 1) / static_cast<double>(frames);
-            CallRegs registers;
-            registers.v[0] = {std::bit_cast<std::uint32_t>(static_cast<float>(progress)), 0};
-            static_cast<void>(send(self, "setCurrentProgress:", registers));
-            // Progress marks passed in this frame: -animation:didReachProgressMark:.
-            for (const auto mark : std::vector<float>(an(self)->marks))
-                if (mark > previous && mark <= progress)
-                    if (const auto delegate = an(self)->delegate; delegate && responds(delegate, "animation:didReachProgressMark:")) {
-                        CallRegs told;
-                        told.x[2] = self;
-                        told.v[0] = {std::bit_cast<std::uint32_t>(mark), 0};
-                        static_cast<void>(send(delegate, "animation:didReachProgressMark:", told));
-                    }
-            display_pending();
+            animation_frame(self, static_cast<double>(frame - 1) / static_cast<double>(frames), progress);
         }
-        const bool completed = an(self)->animating;
-        an(self)->animating = false;
-        static_cast<void>(send(self, "_alchemyEndAnimation"));
-        if (const auto delegate = an(self)->delegate)
-            static_cast<void>(send_optional(delegate, completed ? "animationDidEnd:" : "animationDidStop:", [&] { CallRegs r; r.x[2] = self; return r; }()));
+        animation_end(self, an(self)->animating);
     }, "v@:");
-    method(animation, "stopAnimation", [an](CpuState& s, GuestMemory&) { an(s.x[0])->animating = false; }, "v@:");
+    // Stopping a non-blocking animation ends it at once (-animationDidStop:); a
+    // blocking one ends after its current frame.
+    method(animation, "stopAnimation", [this, an, animation_end](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto state = an(self);
+        if (!state->animating) return;
+        if (const auto timer = std::exchange(state->timer, TimerId{})) {
+            if (auto* loop = run_loop_or_null()) loop->cancel_timer(timer);
+            animation_end(self, false);
+            release(self);   // the frame timer's
+            return;
+        }
+        state->animating = false;
+    }, "v@:");
     method(animation, "progressMarks", [this, an](CpuState& s, GuestMemory&) {
         std::vector<Address> values;
         for (const auto mark : an(s.x[0])->marks) values.push_back(autorelease(cf.real(mark)));

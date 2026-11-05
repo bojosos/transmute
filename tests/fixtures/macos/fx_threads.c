@@ -299,7 +299,7 @@ int main(int argc, char** argv) {
         puts("fx threads: exit with a sleeping worker");
         _exit(0);
     }
-    if (same(mode, "trap")) __builtin_trap();
+    if (same(mode, "trap")) { puts("fx threads: trap"); __builtin_trap(); }   /* a CHECK after a call */
     if (same(mode, "abort")) abort();
     return 2;
 }

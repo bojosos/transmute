@@ -724,6 +724,47 @@ answered (`-KeepInput` keeps the old behaviour). Close-to-exit went from 6 to 18
 * Hang dumps map pthread handles to guest threads, so a `_pthread_join`'s `x0` names the thread it waits for.
 * `run_windowed.ps1 -CloseDump <s>` requests a hang dump that many seconds after `Browser.close`.
 
+### Follow-up 7 (2026-11-01): the browser's `brk #0` after "Page Unresponsive"
+
+**Fixed: Chrome's browser main thread died at `Chrome Framework+0x294ca68` (`brk #0`, SIGTRAP, status 133) once its
+"Page Unresponsive" dialog closed.** fw-ui saw it on 10-26 and the fx perf lead on cold AV1 runs. In both, a slow
+renderer brought up the dialog, which closed again when the renderer caught up.
+* **The calls in progress at the trap,** from the new `ALCHEMY_TRACE_CALLS_RING`, were `-[NSApplication run]`,
+  then `-[NSAnimation startAnimation]`, then `-[NSWindow close]`, with Chrome's CHECK inside the close.
+* **The cause:** Chrome closes a dialog window through its window-close animator. The animator sets
+  `NSAnimationNonblocking` and calls `-[NSWindow close]` from `-animationDidEnd:`. Alchemy ran every NSAnimation
+  to completion inside `-startAnimation`, so the window closed (and Chrome's widget bridge tore down) while Chrome
+  was still inside its own close call.
+* **The fix:** `NSAnimationNonblocking` (and `NonblockingThreaded`), started on the main thread, now return from
+  `-startAnimation` at once. The main run loop runs the frames (common modes) and then `-animationDidEnd:`.
+  `-stopAnimation` ends such an animation at once with `-animationDidStop:`. `NSAnimationBlocking`, the default,
+  keeps running synchronously (`appkit/panels.cpp`). Test: `alchemy_gui_appkit_api` `nonblocking_animation`.
+* **Reproduced at will:** `web_visit.ps1`'s new `hang` action keeps the page busy for `-Play` seconds while a Shift
+  key press waits for it. DevTools detaches for the hang, because Chrome shows no hang dialog to an attached
+  debugger. The fx perf lead's AV1 dialog came from a cold start instead.
+
+**New diagnostic: `ALCHEMY_TRACE_CALLS_RING=<n>`** (with `ALCHEMY_TRACE_CALLS=*` and, to keep other processes
+fast, `ALCHEMY_TRACE_CALLS_FILTER`).
+* Nothing is printed while the app runs. Each thread keeps its last n provider calls and the calls still in
+  progress.
+* When a fatal signal ends the process, the signalled thread prints both lists. The in-progress list names
+  the providers whose guest callback hit a CHECK, which a backtrace shows only as host frames
+  (`0x7fffffff0000`).
+* Test: `fx_threads trap`.
+
+**Fixed: a dying Chrome process that the next launch handed over to.** "Could not be terminated" is `taskkill` on a
+host process already exiting. Here Windows took over a minute to unmap one Alchemy process's address space on a
+fully loaded machine; it had one thread left and no handles.
+* **The fault:** the process handle is not signalled until the host has torn the process down, so
+  `process_tree::lookup` still found the pid, and `kill(pid, 0)` succeeded. A next browser on the same profile then
+  read the old one's `SingletonLock` as alive and handed its launch over (the lead's "exits 0 within 12 s").
+* **The fix:** `lookup` now also needs the host process's exit code unset (`157b50e1`).
+* **Zombies are unaffected:** a non-child pid was already gone once its host process ended, because `lookup` never
+  modelled other processes' zombies. A process's own unreaped children keep their zombie semantics in `kill`'s child
+  path.
+* **Not tested:** no fixture can make a process whose exit code is set while its handle is still unsignalled.
+* **Harness:** runs still use one profile per launch.
+
 ### Open, worst first
 
 1. **fx code arena exhaustion** (gap 1). It needs fx runtime design work, for which a follow-up is proposed:

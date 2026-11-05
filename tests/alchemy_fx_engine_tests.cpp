@@ -262,6 +262,19 @@ int main(int argc, char** argv) {
                    "worker fault while main joins", outcome, "expected status 139 from the worker");
         }
         {
+            // ALCHEMY_TRACE_CALLS_RING keeps each thread's last calls and prints
+            // the signalled thread's: the puts before the trap, with its result.
+            SetEnvironmentVariableA("ALCHEMY_TRACE_CALLS", "*");
+            SetEnvironmentVariableA("ALCHEMY_TRACE_CALLS_RING", "8");
+            const auto outcome = run({fx, threads, "trap"});
+            SetEnvironmentVariableA("ALCHEMY_TRACE_CALLS", nullptr);
+            SetEnvironmentVariableA("ALCHEMY_TRACE_CALLS_RING", nullptr);
+            expect(outcome.status == 133 && contains(outcome.output, "the last provider calls of guest thread") &&
+                       contains(outcome.output, "  _puts(") && contains(outcome.output, ") -> 0x") &&
+                       !contains(outcome.output, "[call ") && !contains(outcome.output, "provider calls in progress"),
+                   "ALCHEMY_TRACE_CALLS_RING prints the trapping thread's calls", outcome, "expected status 133 and the ring");
+        }
+        {
             const auto outcome = run({fx, threads, "trap"});
             expect(outcome.status == 133 && contains(outcome.output, "SIGTRAP") && contains(outcome.output, "brk #0x1"),
                    "__builtin_trap -> SIGTRAP", outcome, "expected status 133");

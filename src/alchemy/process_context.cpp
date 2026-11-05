@@ -283,7 +283,10 @@ namespace {
 // of provider calls (process id and thread hash, symbol, x0..x3 on entry, x0 on return)
 // to stderr (ALCHEMY_TRACE_CALLS_ERRORS=1: only the calls that return non-zero;
 // ALCHEMY_TRACE_CALLS_AFTER_EXIT=1: only the calls made once the process exit is requested,
-// with the guest thread number, what other threads still do while the process ends).
+// with the guest thread number, what other threads still do while the process ends;
+// ALCHEMY_TRACE_CALLS_RING=<n>: none, but each thread keeps its last n calls and the calls in
+// progress, printed for the thread whose fatal signal ends the process: what led to a CHECK or
+// a fault, and which providers the faulting guest callback runs inside).
 // ALCHEMY_TRACE_CALLS_FILTER=<text> limits it to the Alchemy
 // processes whose host command line contains <text> (for example
 // "--alchemy-child-spec": guest children only).
@@ -379,6 +382,31 @@ std::uint64_t ProcessContext::install_function(std::string symbol,
         handler = [this, inner = std::move(handler), name = symbol](transmute::CpuState& state, transmute::GuestMemory& memory) {
             static const bool after_exit = [] { const auto value = host::process::environment("ALCHEMY_TRACE_CALLS_AFTER_EXIT"); return value && value->starts_with("1"); }();
             if (after_exit && !exiting_.load(std::memory_order_acquire)) { inner(state, memory); return; }
+            // ALCHEMY_TRACE_CALLS_RING=<n>: nothing printed; each thread keeps its last n calls (print_call_ring).
+            static const std::size_t ring = [] {
+                const auto value = host::process::environment("ALCHEMY_TRACE_CALLS_RING");
+                return value ? static_cast<std::size_t>(std::strtoull(value->c_str(), nullptr, 10)) : std::size_t{0};
+            }();
+            if (ring) {
+                const auto current = current_thread();
+                if (!current) { inner(state, memory); return; }
+                if (current->call_ring.size() != ring) current->call_ring.resize(ring);
+                const auto index = current->call_ring_next++;
+                char entry[192];
+                std::snprintf(entry, sizeof(entry), "%s(0x%llx, 0x%llx, 0x%llx, 0x%llx)", name.c_str(),
+                    static_cast<unsigned long long>(state.x[0]), static_cast<unsigned long long>(state.x[1]),
+                    static_cast<unsigned long long>(state.x[2]), static_cast<unsigned long long>(state.x[3]));
+                current->call_ring[index % ring] = entry;
+                current->call_stack.emplace_back(entry);
+                struct Pop { std::vector<std::string>& stack; ~Pop() { stack.pop_back(); } } pop{current->call_stack};
+                inner(state, memory);
+                // The result, unless calls made inside this one (guest callbacks) went round the ring.
+                if (current->call_ring_next - index <= ring) {
+                    std::snprintf(entry, sizeof(entry), " -> 0x%llx", static_cast<unsigned long long>(state.x[0]));
+                    current->call_ring[index % ring] += entry;
+                }
+                return;
+            }
             char line[256];
             const auto process = static_cast<unsigned long long>(host::process::current_pid());
             auto thread = (process << 16) | (std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffff);
@@ -609,6 +637,22 @@ void trace_exit_phase(std::string_view phase) {
     std::fprintf(stderr, "[alchemy process] %llu: %.*s %.2f s after the exit request\n",
                  static_cast<unsigned long long>(host::process::current_pid()), static_cast<int>(phase.size()), phase.data(),
                  static_cast<double>(now - requested) / 1e9);
+}
+
+void ProcessContext::print_call_ring() {
+    const auto current = current_thread();
+    if (!current || current->call_ring.empty()) return;
+    const auto size = current->call_ring.size();
+    std::string text = "alchemy: the last provider calls of guest thread " + std::to_string(current->identity) + ", oldest first:\n";
+    for (std::size_t offset = 0; offset < size; ++offset) {
+        const auto& entry = current->call_ring[(current->call_ring_next + offset) % size];
+        if (!entry.empty()) text += "  " + entry + "\n";
+    }
+    if (!current->call_stack.empty()) {
+        text += "alchemy: provider calls in progress on that thread, outermost first (the guest code above runs inside them):\n";
+        for (const auto& entry : current->call_stack) text += "  " + entry + "\n";
+    }
+    std::fputs(text.c_str(), stderr);
 }
 
 void ProcessContext::request_exit(std::uint32_t status) {

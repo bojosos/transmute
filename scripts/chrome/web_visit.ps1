@@ -22,13 +22,17 @@
 #                              players' errors and warnings (CDP Media domain) go into the entry's "media";
 #   fps                        counts requestAnimationFrame callbacks for -Play seconds (a page's frame rate);
 #   html                       saves the page's markup (document.documentElement.outerHTML) as page-<n>.html;
+#   hang                       keeps the page's main thread busy for -Play seconds with a Shift press (CDP
+#                              Input.dispatchKeyEvent) waiting, so Chrome shows and then closes its
+#                              "Page Unresponsive" dialog (DevTools detaches for it: Chrome shows none to an
+#                              attached debugger); reports whether the browser lived through it;
 #   reject-consent[+action]    a cookie consent wall: clicks its "Reject all" button (never anything else; the only
 #                              click this script makes), waits for the page, then runs the action;
 #   speedometer, jetstream, motionmark
 #                              browserbench.org's Speedometer 3, JetStream 2.2 and MotionMark 1.3, started as their
 #                              Start buttons do and read when they finish (no probe or screenshot; the Network
 #                              domain stays off for the whole run).
-# Nothing is typed or submitted.
+# Nothing is typed or submitted (hang presses Shift over CDP, nothing else).
 #
 # Usage: web_visit.ps1 -Exe <build>\Release\alchemy-fx.exe -OutDir <scratch dir> -Url https://example.com/[,...]
 #          [-Name label,...] [-Action <action>,...] [-SwiftShader] [-Jit] [-Settle 5] [-LoadTimeout 120] [-Play 5]
@@ -578,6 +582,25 @@ try {
                 }
                 elseif ($act -eq 'fps') { $entry.action_result = Evaluate ($fpsScript -replace 'PLAY_MS', "$($Play * 1000)") $session ($Play + 60) }
                 elseif ($act -eq 'video') { $entry.action_result = Evaluate ($videoScript -replace 'PLAY_MS', "$($Play * 1000)") $session ($Play + 90) }
+                elseif ($act -eq 'hang') {
+                    # The page's main thread busy for -Play seconds while an input event waits for it: Chrome's hang
+                    # monitor shows its "Page Unresponsive" dialog, which closes again once the page answers. Chrome
+                    # shows none while DevTools is attached to the page, so the session detaches for the hang and
+                    # attaches again afterwards.
+                    $null = Invoke-Cdp 'Runtime.evaluate' @{ expression = "setTimeout(() => { const t = Date.now(); while (Date.now() - t < $($Play * 1000)) {} }, 1000); 'scheduled'"; returnByValue = $true } $session
+                    $pump = [Diagnostics.Stopwatch]::StartNew()
+                    while ($pump.Elapsed.TotalSeconds -lt 3) { Pump-Cdp 250 }
+                    # A Shift press (types nothing): key events wait for the renderer's ack, which arms the hang monitor.
+                    $null = Send-Cdp 'Input.dispatchKeyEvent' @{ type = 'rawKeyDown'; key = 'Shift'; code = 'ShiftLeft'; windowsVirtualKeyCode = 16 } $session
+                    $null = Send-Cdp 'Input.dispatchKeyEvent' @{ type = 'keyUp'; key = 'Shift'; code = 'ShiftLeft'; windowsVirtualKeyCode = 16 } $session
+                    $null = Send-Cdp 'Target.detachFromTarget' @{ sessionId = $session }
+                    while ($pump.Elapsed.TotalSeconds -lt $Play + 20 -and -not $process.HasExited) { Pump-Cdp 250 }   # shown, then closed
+                    if (-not $process.HasExited) {
+                        $session = (Invoke-Cdp 'Target.attachToTarget' @{ targetId = $page.targetId; flatten = $true } '' 60).sessionId
+                        $alive = Evaluate "'alive'" $session 60
+                    }
+                    $entry.action_result = "busy $Play s (detached): browser running $(-not $process.HasExited), page answers '$alive' after $([math]::Round($pump.Elapsed.TotalSeconds, 1)) s"
+                }
                 if (-not $NoScreenshot) {
                     $shot = Invoke-Cdp 'Page.captureScreenshot' @{ format = 'png' } $session 60
                     [IO.File]::WriteAllBytes((Join-Path $OutDir "shot-$($index + 1)-$($label -replace '[^\w.-]', '_').png"), [Convert]::FromBase64String($shot.data))

@@ -92,6 +92,11 @@ struct ThreadContext {
     std::optional<std::uint64_t> exit_value;
     std::vector<AutoreleasePool> autorelease_pools;
     std::vector<std::uint64_t> unpooled_autoreleases;
+    // ALCHEMY_TRACE_CALLS_RING=<n>: this thread's last n traced provider calls, oldest first from
+    // call_ring_next (printed when a fatal signal on this thread ends the process).
+    std::vector<std::string> call_ring;
+    std::size_t call_ring_next{};
+    std::vector<std::string> call_stack;   // with the ring: the traced calls in progress (guest callbacks inside)
 };
 
 // Owns compatibility state; engine execution and memory internals remain Transmute's.
@@ -192,6 +197,8 @@ public:
     [[nodiscard]] std::string hang_dump_sections() const;
     void run_finalizers(std::optional<std::uint64_t> dso = {});
     void request_exit(std::uint32_t status);
+    // ALCHEMY_TRACE_CALLS_RING: prints the calling thread's last traced provider calls to stderr.
+    void print_call_ring();
     [[nodiscard]] std::optional<std::uint32_t> requested_exit() const;
     void record_worker_execution(std::uint64_t instructions, const transmute::JitStats& stats);
     [[nodiscard]] ExecutionTotals worker_execution() const;
