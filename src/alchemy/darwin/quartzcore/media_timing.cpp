@@ -10,8 +10,8 @@
 //   linear (0,0)(1,1), easeIn (0.42,0)(1,1), easeOut (0,0)(0.58,1),
 //   easeInEaseOut (0.42,0)(0.58,1), default (0.25,0.1)(0.25,1).
 // The kCAMediaTimingFunction* name constants are exported when missing.
-// Animations are timed but not interpolated (quartzcore.cpp), so the curve is
-// data here; graphics/graphics_math.cpp evaluates it (timing_curve_value).
+// quartzcore.cpp's presentation values shape an animation's progress with
+// it (graphics_math.cpp's timing_curve_value).
 namespace alchemy::gui::completion_kit {
 namespace {
 

@@ -74,6 +74,26 @@ keys are its properties, the animation timing function among them).
 is standard dynamic range: EDR contents show clamped. CAMetalLayer's
 `preferredDevice` is the system default device (there is one GPU).
 
+**Animations (presentation values):** while a layer has animations, the
+composition shows its presentation values, redrawn each frame (60 Hz) until
+the last animation ends. CABasicAnimations are interpolated at the current
+media time: CAMediaTiming (begin time, time offset, speed, duration,
+repeats, autoreverses, fill mode), the timing function's curve (linear when
+nil), from / to / by values (a missing one is the current value), additive
+and cumulative. Key paths: opacity, zPosition, cornerRadius, borderWidth,
+the shadow's opacity, radius and offset, position, anchorPoint, bounds and
+their components, contentsRect, transform and sublayerTransform (the 2D part
+decomposed into translation, rotation the shorter way, scale and shear; the
+rest linear) with transform.rotation(.z) / .scale(.x .y) / .translation(.x
+.y), the background, border and shadow colours, and hidden; other key paths
+are left at their values. `-presentationLayer` is a copy made by
+`-initWithLayer:` (which copies the CALayer state) with those values;
+`-modelLayer` answers the model. NSValue's `+valueWithCATransform3D:` /
+`-CATransform3DValue` are provided. Keyframe, group, spring and transition
+animations are timed (delegate messages, removal) but do not change what is
+shown yet. Layer trees AppKit draws itself (no contents) do not show
+presentation values.
+
 **Springs, value functions, emitters:** CASpringAnimation keeps its mass,
 stiffness, damping and initial velocity; `settlingDuration` is computed from
 that spring's motion (until it stays within 0.1% of the end value), and the

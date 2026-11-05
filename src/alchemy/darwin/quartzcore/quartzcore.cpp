@@ -7,6 +7,7 @@
 #include "alchemy/gui/runloop.hpp"
 #include "alchemy/gui/window_server.hpp"
 #include "alchemy/darwin/coregraphics/quartz2d.hpp"
+#include "alchemy/darwin/quartzcore/graphics_math.hpp"
 #include "alchemy/darwin/quartzcore/layer_tree.hpp"
 #include "alchemy/darwin/quartzcore/presenter.hpp"
 #include "alchemy/darwin/quartzcore/quartzcore_vulkan.hpp"
@@ -24,6 +25,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -93,6 +95,7 @@ struct MetalLayerState {
 
 // CATransform3D: m11 ... m44, row-major (row vectors), as Core Animation lays it out.
 using Transform3D = std::array<double, 16>;
+namespace graphics_math = alchemy::gui::completion_kit::graphics;
 constexpr Transform3D identity_transform() { return {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}; }
 
 struct GradientLayerState {
@@ -180,6 +183,7 @@ struct LayerState final : ObjectPayload {
     Address style{};                   // retained copy
     // The mask layer (retained) and the contents filters (retained copies; nil: kCAFilterLinear).
     Address mask{}, minification_filter{}, magnification_filter{};
+    Address model_layer{};             // a presentation layer's model layer (retained; nil for model layers)
     // The layer's CAMediaTiming.
     double begin_time{}, time_offset{}, repeat_duration{}, duration{};
     float speed{1}, repeat_count{};
@@ -367,6 +371,7 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
                                 std::exchange(state->corner_curve, 0), std::exchange(state->contents_gravity, 0),
                                 std::exchange(state->preferred_dynamic_range, 0), std::exchange(state->mask, 0),
                                 std::exchange(state->minification_filter, 0), std::exchange(state->magnification_filter, 0),
+                                std::exchange(state->model_layer, 0),
                                 std::exchange(state->gradient.colors, 0),
                                 std::exchange(state->gradient.locations, 0), std::exchange(state->gradient.type, 0)};
                     // Timed animations keep their layer alive, so any left
@@ -788,9 +793,9 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
     // when its active duration has elapsed (duration, 0.25 s when 0;
     // repeatCount or repeatDuration; autoreverses; speed; infinite repeats and
     // speed 0 never finish), then removal when removedOnCompletion. Removing
-    // or replacing it earlier sends animationDidStop:finished:NO. Values are
-    // never interpolated: there is no render tree, so a layer shows its model
-    // values.
+    // or replacing it earlier sends animationDidStop:finished:NO. While a
+    // layer has animations, the composition shows its presentation values
+    // (below: CABasicAnimations interpolated each frame).
     // ---- geometry between layers (the composition's model, layer_tree.hpp) ----------
     static tree::Affine inverse(const tree::Affine& m) {
         const double det = m.a * m.d - m.b * m.c;
@@ -1589,6 +1594,448 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         for (auto& child : value.sublayers) resolve_contents(child);
     }
 
+    // ---- presentation values (layer_tree.hpp's snapshot, -presentationLayer) ------------------------
+    // What a layer shows while CABasicAnimations run: its model values with
+    // each animation (in the order added) applied at the current media time.
+    // CAMediaTiming maps the time (beginTime, timeOffset, speed, duration (0:
+    // 0.25 s), repeatCount / repeatDuration, autoreverses, fillMode); the
+    // timing function shapes the progress (linear when nil); fromValue /
+    // toValue / byValue choose the endpoints as Core Animation documents (a
+    // missing endpoint is the current value); additive adds to the current
+    // value; cumulative adds the earlier repeats' change. Transforms
+    // interpolate their 2D parts decomposed (translation, rotation by the
+    // shorter way, scale, shear) and the rest linearly. Key paths: opacity,
+    // zPosition, cornerRadius, borderWidth, shadowOpacity, shadowRadius,
+    // shadowOffset, position (.x .y), anchorPoint (.x .y), bounds (.origin
+    // .size and their components), contentsRect, transform and
+    // sublayerTransform (with transform.rotation(.z), .scale(.x .y),
+    // .translation(.x .y)), backgroundColor, borderColor, shadowColor and
+    // hidden. Other key paths and the other animation classes (keyframes,
+    // groups, springs, transitions) leave the values as they are.
+    struct Presented {
+        Rect bounds;
+        Point position, anchor{0.5, 0.5};
+        Transform3D transform{identity_transform()}, sublayer_transform{identity_transform()};
+        double z{}, corner_radius{}, border_width{}, shadow_radius{3};
+        double opacity{1}, shadow_opacity{};
+        Size shadow_offset{0, -3};
+        Rect contents_rect{{0, 0}, {1, 1}};
+        bool hidden{};
+        std::array<double, 4> background{}, border{}, shadow_color{0, 0, 0, 1};
+        bool has_background{}, has_border{};
+        std::uint32_t changed{};   // which colours an animation set: 1 background, 2 border, 4 shadow
+    };
+    struct Value {
+        enum class Kind { none, number, point, size, rect, transform, color } kind{Kind::none};
+        std::array<double, 16> v{};
+    };
+    static unsigned value_count(Value::Kind kind) {
+        switch (kind) {
+        case Value::Kind::number: return 1;
+        case Value::Kind::point: case Value::Kind::size: return 2;
+        case Value::Kind::rect: case Value::Kind::color: return 4;
+        case Value::Kind::transform: return 16;
+        default: return 0;
+        }
+    }
+    std::mutex scratch_mutex;
+    Address scratch{};   // 128 bytes for -getValue:size: and timing control points (allocated once)
+    Address scratch_buffer() {
+        if (!scratch) scratch = process.allocate_guest(128, 16);
+        return scratch;
+    }
+    Value decode(Address object) {
+        Value out;
+        if (!object) return out;
+        if (cf.kind(object) == ObjectKind::number) {
+            out.kind = Value::Kind::number;
+            out.v[0] = cf.number_value(object).value_or(0);
+            return out;
+        }
+        if (objc.responds(object, objc.selector("objCType"))) {
+            const auto type_address = send(object, "objCType");
+            bool terminated{};
+            const auto bytes = type_address ? memory().read_string(type_address, 1, 256, &terminated) : std::vector<std::uint8_t>{};
+            const std::string type(bytes.begin(), bytes.end());
+            if (type.starts_with("{CGPoint=") || type.starts_with("{_NSPoint=")) out.kind = Value::Kind::point;
+            else if (type.starts_with("{CGSize=") || type.starts_with("{_NSSize=")) out.kind = Value::Kind::size;
+            else if (type.starts_with("{CGRect=") || type.starts_with("{_NSRect=")) out.kind = Value::Kind::rect;
+            else if (type.starts_with("{CATransform3D=")) out.kind = Value::Kind::transform;
+            else if (type == "d" || type == "f" || type == "q" || type == "i" || type == "l") {
+                out.kind = Value::Kind::number;
+                out.v[0] = objc.send(object, "doubleValue").d(0);
+                return out;
+            } else return out;
+            const auto count = value_count(out.kind);
+            std::lock_guard lock(scratch_mutex);
+            const auto at = scratch_buffer();
+            static_cast<void>(send(object, "getValue:size:", {at, count * 8}));
+            for (unsigned i = 0; i < count; ++i) out.v[i] = std::bit_cast<double>(memory().read64(at + i * 8));
+            return out;
+        }
+        const std::array<std::uint64_t, 1> argument{object};
+        if (cf.invoke("CFGetTypeID", argument) == call(core_graphics_library(), "_CGColorGetTypeID", {})) {
+            if (const auto c = color_components(object)) {
+                out.kind = Value::Kind::color;
+                for (unsigned i = 0; i < 4; ++i) out.v[i] = (*c)[i];
+            }
+        }
+        return out;
+    }
+    // The 2D part of a transform as translation, rotation, scale and shear (and back).
+    struct Parts { double tx{}, ty{}, angle{}, sx{1}, sy{1}, shear{}; };
+    static Parts parts_of(const Transform3D& t) {
+        Parts p;
+        const double a = t[0], b = t[1], c = t[4], d = t[5];
+        p.tx = t[12];
+        p.ty = t[13];
+        p.sx = std::hypot(a, b);
+        p.angle = p.sx > 0 ? std::atan2(b, a) : 0;
+        const double cs = std::cos(p.angle), sn = std::sin(p.angle);
+        p.shear = c * cs + d * sn;
+        p.sy = -c * sn + d * cs;
+        return p;
+    }
+    static Transform3D with_parts(Transform3D t, const Parts& p) {
+        const double cs = std::cos(p.angle), sn = std::sin(p.angle);
+        t[0] = p.sx * cs; t[1] = p.sx * sn;
+        t[4] = p.shear * cs - p.sy * sn; t[5] = p.shear * sn + p.sy * cs;
+        t[12] = p.tx; t[13] = p.ty;
+        return t;
+    }
+    static Value lerp(const Value& from, const Value& to, double f) {
+        Value out = to;
+        if (from.kind != to.kind) return f < 0.5 ? from : to;
+        if (to.kind == Value::Kind::transform) {
+            Transform3D a{}, b{};
+            std::copy(from.v.begin(), from.v.end(), a.begin());
+            std::copy(to.v.begin(), to.v.end(), b.begin());
+            Transform3D mixed{};
+            for (unsigned i = 0; i < 16; ++i) mixed[i] = a[i] + (b[i] - a[i]) * f;
+            const auto pa = parts_of(a), pb = parts_of(b);
+            double turn = pb.angle - pa.angle;
+            constexpr double pi = 3.14159265358979323846;
+            while (turn > pi) turn -= 2 * pi;
+            while (turn < -pi) turn += 2 * pi;
+            const Parts p{pa.tx + (pb.tx - pa.tx) * f, pa.ty + (pb.ty - pa.ty) * f, pa.angle + turn * f, pa.sx + (pb.sx - pa.sx) * f,
+                          pa.sy + (pb.sy - pa.sy) * f, pa.shear + (pb.shear - pa.shear) * f};
+            const auto t = with_parts(mixed, p);
+            std::copy(t.begin(), t.end(), out.v.begin());
+            return out;
+        }
+        for (unsigned i = 0; i < value_count(to.kind); ++i) out.v[i] = from.v[i] + (to.v[i] - from.v[i]) * f;
+        return out;
+    }
+    // a + b (transforms: b applied after a), a - b (transforms: a with b undone).
+    static Value combine(const Value& a, const Value& b, double sign) {
+        Value out = a;
+        if (a.kind != b.kind) return a;
+        if (a.kind == Value::Kind::transform) {
+            Transform3D ta{}, tb{};
+            std::copy(a.v.begin(), a.v.end(), ta.begin());
+            std::copy(b.v.begin(), b.v.end(), tb.begin());
+            const auto t = sign > 0 ? graphics_math::transform_concat(ta, tb) : graphics_math::transform_concat(ta, graphics_math::transform_invert(tb));
+            std::copy(t.begin(), t.end(), out.v.begin());
+            return out;
+        }
+        for (unsigned i = 0; i < value_count(a.kind); ++i) out.v[i] = a.v[i] + sign * b.v[i];
+        return out;
+    }
+    static Value number(double x) { Value v; v.kind = Value::Kind::number; v.v[0] = x; return v; }
+    static Value pair(Value::Kind kind, double x, double y) { Value v; v.kind = kind; v.v[0] = x; v.v[1] = y; return v; }
+    static Value rect_value(const Rect& r) { Value v; v.kind = Value::Kind::rect; v.v = {r.origin.x, r.origin.y, r.size.width, r.size.height}; return v; }
+    static Value transform_value(const Transform3D& t) { Value v; v.kind = Value::Kind::transform; std::copy(t.begin(), t.end(), v.v.begin()); return v; }
+    static Value color_value(const std::array<double, 4>& c) { Value v; v.kind = Value::Kind::color; std::copy(c.begin(), c.end(), v.v.begin()); return v; }
+    static std::optional<Value> get(const Presented& p, std::string_view key) {
+        using K = Value::Kind;
+        if (key == "opacity") return number(p.opacity);
+        if (key == "zPosition") return number(p.z);
+        if (key == "cornerRadius") return number(p.corner_radius);
+        if (key == "borderWidth") return number(p.border_width);
+        if (key == "shadowOpacity") return number(p.shadow_opacity);
+        if (key == "shadowRadius") return number(p.shadow_radius);
+        if (key == "hidden") return number(p.hidden ? 1 : 0);
+        if (key == "shadowOffset") return pair(K::size, p.shadow_offset.width, p.shadow_offset.height);
+        if (key == "position") return pair(K::point, p.position.x, p.position.y);
+        if (key == "position.x") return number(p.position.x);
+        if (key == "position.y") return number(p.position.y);
+        if (key == "anchorPoint") return pair(K::point, p.anchor.x, p.anchor.y);
+        if (key == "anchorPoint.x") return number(p.anchor.x);
+        if (key == "anchorPoint.y") return number(p.anchor.y);
+        if (key == "bounds") return rect_value(p.bounds);
+        if (key == "bounds.origin") return pair(K::point, p.bounds.origin.x, p.bounds.origin.y);
+        if (key == "bounds.origin.x") return number(p.bounds.origin.x);
+        if (key == "bounds.origin.y") return number(p.bounds.origin.y);
+        if (key == "bounds.size") return pair(K::size, p.bounds.size.width, p.bounds.size.height);
+        if (key == "bounds.size.width") return number(p.bounds.size.width);
+        if (key == "bounds.size.height") return number(p.bounds.size.height);
+        if (key == "contentsRect") return rect_value(p.contents_rect);
+        if (key == "transform") return transform_value(p.transform);
+        if (key == "sublayerTransform") return transform_value(p.sublayer_transform);
+        const auto parts = parts_of(p.transform);
+        if (key == "transform.rotation" || key == "transform.rotation.z") return number(parts.angle);
+        if (key == "transform.scale") return number((parts.sx + parts.sy) / 2);
+        if (key == "transform.scale.x") return number(parts.sx);
+        if (key == "transform.scale.y") return number(parts.sy);
+        if (key == "transform.translation") return pair(K::size, parts.tx, parts.ty);
+        if (key == "transform.translation.x") return number(parts.tx);
+        if (key == "transform.translation.y") return number(parts.ty);
+        if (key == "backgroundColor") return color_value(p.background);
+        if (key == "borderColor") return color_value(p.border);
+        if (key == "shadowColor") return color_value(p.shadow_color);
+        return std::nullopt;
+    }
+    static void set(Presented& p, std::string_view key, const Value& v) {
+        const auto x = v.v[0], y = v.v[1];
+        if (key == "opacity") p.opacity = x;
+        else if (key == "zPosition") p.z = x;
+        else if (key == "cornerRadius") p.corner_radius = x;
+        else if (key == "borderWidth") p.border_width = x;
+        else if (key == "shadowOpacity") p.shadow_opacity = x;
+        else if (key == "shadowRadius") p.shadow_radius = x;
+        else if (key == "hidden") p.hidden = x >= 0.5;
+        else if (key == "shadowOffset") p.shadow_offset = {x, y};
+        else if (key == "position") p.position = {x, y};
+        else if (key == "position.x") p.position.x = x;
+        else if (key == "position.y") p.position.y = x;
+        else if (key == "anchorPoint") p.anchor = {x, y};
+        else if (key == "anchorPoint.x") p.anchor.x = x;
+        else if (key == "anchorPoint.y") p.anchor.y = x;
+        else if (key == "bounds") p.bounds = {{x, y}, {v.v[2], v.v[3]}};
+        else if (key == "bounds.origin") p.bounds.origin = {x, y};
+        else if (key == "bounds.origin.x") p.bounds.origin.x = x;
+        else if (key == "bounds.origin.y") p.bounds.origin.y = x;
+        else if (key == "bounds.size") p.bounds.size = {x, y};
+        else if (key == "bounds.size.width") p.bounds.size.width = x;
+        else if (key == "bounds.size.height") p.bounds.size.height = x;
+        else if (key == "contentsRect") p.contents_rect = {{x, y}, {v.v[2], v.v[3]}};
+        else if (key == "transform" || key == "sublayerTransform") {
+            auto& target = key == "transform" ? p.transform : p.sublayer_transform;
+            std::copy(v.v.begin(), v.v.end(), target.begin());
+        } else if (key.starts_with("transform.")) {
+            auto parts = parts_of(p.transform);
+            if (key == "transform.rotation" || key == "transform.rotation.z") parts.angle = x;
+            else if (key == "transform.scale") { parts.sx = x; parts.sy = x; }
+            else if (key == "transform.scale.x") parts.sx = x;
+            else if (key == "transform.scale.y") parts.sy = x;
+            else if (key == "transform.translation") { parts.tx = x; parts.ty = y; }
+            else if (key == "transform.translation.x") parts.tx = x;
+            else if (key == "transform.translation.y") parts.ty = x;
+            p.transform = with_parts(p.transform, parts);
+        } else if (key == "backgroundColor") { std::copy_n(v.v.begin(), 4, p.background.begin()); p.has_background = true; p.changed |= 1; }
+        else if (key == "borderColor") { std::copy_n(v.v.begin(), 4, p.border.begin()); p.has_border = true; p.changed |= 2; }
+        else if (key == "shadowColor") { std::copy_n(v.v.begin(), 4, p.shadow_color.begin()); p.changed |= 4; }
+    }
+    // The animation's progress at `now` (CAMediaTiming), or nullopt when it has no effect then.
+    struct Progress { double fraction{}; double iteration{}; };
+    std::optional<Progress> progress_of(Address animation, double now) {
+        const double begin = objc.send(animation, "beginTime").d(0);
+        double duration = objc.send(animation, "duration").d(0);
+        if (!(duration > 0)) duration = 0.25;
+        const double speed = objc.send(animation, "speed").s(0);
+        const double offset = objc.send(animation, "timeOffset").d(0);
+        const double repeat_count = objc.send(animation, "repeatCount").s(0);
+        const double repeat_duration = objc.send(animation, "repeatDuration").d(0);
+        const bool autoreverses = (send(animation, "autoreverses") & 0xff) != 0;
+        const auto fill_object = send(animation, "fillMode");
+        const auto fill = fill_object ? cf.utf8(fill_object) : std::string("removed");
+        const double single = duration * (autoreverses ? 2 : 1);
+        const double active = repeat_duration > 0 ? repeat_duration : single * (repeat_count > 0 ? repeat_count : 1.0);
+        double local = (now - begin) * speed + offset;
+        if (local < 0) {
+            if (fill != "backwards" && fill != "both") return std::nullopt;
+            local = 0;
+        }
+        bool ended = false;
+        if (std::isfinite(active) && local >= active) {
+            if (fill != "forwards" && fill != "both") return std::nullopt;
+            local = active;
+            ended = true;
+        }
+        double iteration = std::floor(local / single);
+        double within = local - iteration * single;
+        if (ended && within < 1e-12 && iteration > 0) { iteration -= 1; within = single; }
+        if (autoreverses && within > duration) within = 2 * duration - within;
+        double fraction = std::clamp(within / duration, 0.0, 1.0);
+        if (const auto timing = send(animation, "timingFunction")) {
+            std::array<float, 4> points{0, 0, 1, 1};
+            std::lock_guard lock(scratch_mutex);
+            const auto at = scratch_buffer();
+            for (unsigned index = 1; index <= 2; ++index) {
+                static_cast<void>(send(timing, "getControlPointAtIndex:values:", {index, at}));
+                points[(index - 1) * 2] = std::bit_cast<float>(memory().read32(at));
+                points[(index - 1) * 2 + 1] = std::bit_cast<float>(memory().read32(at + 4));
+            }
+            fraction = graphics_math::timing_curve_value(points, fraction);
+        }
+        return Progress{fraction, iteration};
+    }
+    // Applies the layer's running animations to `p`; true when one changed it.
+    bool present(Address object, Presented& p, double now) {
+        const auto basic = objc.find_class("CABasicAnimation");
+        const auto spring = objc.find_class("CASpringAnimation");
+        if (!basic) return false;
+        std::vector<Address> animations;
+        {
+            const auto state = layer(object);
+            std::lock_guard lock(state->mutex);
+            for (const auto& a : state->animations) animations.push_back(a.animation);
+        }
+        for (auto& animation : animations) animation = retain(animation);
+        bool any = false;
+        try {
+            for (const auto animation : animations) {
+                if (!is_kind(animation, basic) || (spring && is_kind(animation, spring))) continue;
+                const auto key_object = send(animation, "keyPath");
+                if (!key_object) continue;
+                const auto key = cf.utf8(key_object);
+                const auto current = get(p, key);
+                if (!current) continue;
+                const auto at = progress_of(animation, now);
+                if (!at) continue;
+                const auto from = decode(send(animation, "fromValue")), to = decode(send(animation, "toValue")), by = decode(send(animation, "byValue"));
+                const bool f = from.kind != Value::Kind::none, t = to.kind != Value::Kind::none, b = by.kind != Value::Kind::none;
+                const bool additive = (send(animation, "isAdditive") & 0xff) != 0;
+                // With additive, missing endpoints are the identity (zero), not the current value.
+                Value zero = *current;
+                if (zero.kind == Value::Kind::transform) zero = transform_value(identity_transform());
+                else zero.v = {};
+                const auto& base = additive ? zero : *current;
+                Value start, end;
+                if (f && t) { start = from; end = to; }
+                else if (f && b) { start = from; end = combine(from, by, 1); }
+                else if (b && t) { start = combine(to, by, -1); end = to; }
+                else if (f) { start = from; end = base; }
+                else if (t) { start = base; end = to; }
+                else if (b) { start = base; end = combine(base, by, 1); }
+                else continue;
+                if (start.kind == Value::Kind::number && current->kind != Value::Kind::number) continue;   // a mismatched value
+                auto value = lerp(start, end, at->fraction);
+                if ((send(animation, "isCumulative") & 0xff) != 0 && at->iteration > 0)
+                    for (int i = 0; i < static_cast<int>(std::min(at->iteration, 1000.0)); ++i) value = combine(value, combine(end, start, -1), 1);
+                if (additive) value = combine(*current, value, 1);
+                if (value.kind != current->kind) continue;
+                set(p, key, value);
+                any = true;
+            }
+        } catch (...) {
+            for (const auto animation : animations) release(animation);
+            throw;
+        }
+        for (const auto animation : animations) release(animation);
+        return any;
+    }
+    // While layers have animations, a frame timer marks them changed so the
+    // composition shows each frame's presentation values.
+    std::mutex animating_mutex;
+    std::set<Address> animating;   // layers with animations (their animations retain them)
+    TimerId frame_timer{};
+    static constexpr double frame_interval = 1.0 / 60;
+    void start_frames(Address object) {
+        std::lock_guard lock(animating_mutex);
+        animating.insert(object);
+        if (!frame_timer && main_run_loop_available())
+            frame_timer = main_run_loop().add_timer(monotonic_seconds() + frame_interval, frame_interval, common_modes, [this](TimerId) { frame(); });
+    }
+    // The layer has no animations left: one last frame shows its model values.
+    void stop_frames(Address object) {
+        { std::lock_guard lock(animating_mutex); animating.erase(object); }
+        changed(object);
+    }
+    void frame() {
+        std::vector<Address> layers;
+        {
+            std::lock_guard lock(animating_mutex);
+            layers.assign(animating.begin(), animating.end());
+            if (layers.empty()) {
+                if (frame_timer && main_run_loop_available()) main_run_loop().cancel_timer(frame_timer);
+                frame_timer = 0;
+                return;
+            }
+        }
+        for (const auto object : layers) changed(object);
+    }
+    Presented presented_of(LayerState& state) {   // the model values (state locked by the caller)
+        Presented p;
+        p.bounds = state.bounds;
+        p.position = state.position;
+        p.anchor = state.anchor;
+        p.transform = state.transform;
+        p.sublayer_transform = state.sublayer_transform;
+        p.z = state.z_position;
+        p.corner_radius = state.corner_radius;
+        p.border_width = state.border_width;
+        p.shadow_radius = state.shadow_radius;
+        p.opacity = state.opacity;
+        p.shadow_opacity = state.shadow_opacity;
+        p.shadow_offset = state.shadow_offset;
+        p.contents_rect = state.contents_rect;
+        p.hidden = state.hidden;
+        return p;
+    }
+    void colours_of(Presented& p, Address background, Address border, Address shadow) {
+        if (const auto c = color_components(background)) { for (unsigned i = 0; i < 4; ++i) p.background[i] = (*c)[i]; p.has_background = true; }
+        if (const auto c = color_components(border)) { for (unsigned i = 0; i < 4; ++i) p.border[i] = (*c)[i]; p.has_border = true; }
+        if (const auto c = color_components(shadow)) for (unsigned i = 0; i < 4; ++i) p.shadow_color[i] = (*c)[i];
+    }
+    Address srgb(const std::array<double, 4>& c) {
+        CallRegs registers;
+        for (unsigned i = 0; i < 4; ++i) registers.set_d(i, std::clamp(c[i], 0.0, 1.0));
+        return call_regs(core_graphics_library(), "_CGColorCreateSRGB", registers).x0;
+    }
+    // -[CALayer presentationLayer]: a copy made by -initWithLayer: with the current presentation values.
+    Address presentation_layer(Address self) {
+        const auto copy = send(send(send(self, "class"), "alloc"), "initWithLayer:", {self});
+        if (!copy) return 0;
+        Presented p;
+        Address background{}, border{}, shadow{};
+        {
+            const auto state = layer(self);
+            std::lock_guard lock(state->mutex);
+            p = presented_of(*state);
+            background = cf_retain(state->background_color);
+            border = cf_retain(state->border_color);
+            shadow = cf_retain(state->shadow_color);
+        }
+        colours_of(p, background, border, shadow);
+        cf_release(background);
+        cf_release(border);
+        cf_release(shadow);
+        if (present(self, p, monotonic_seconds())) {
+            const auto made_background = p.changed & 1 ? srgb(p.background) : 0, made_border = p.changed & 2 ? srgb(p.border) : 0,
+                       made_shadow = p.changed & 4 ? srgb(p.shadow_color) : 0;
+            std::vector<Address> old;
+            {
+                const auto state = layer(copy);
+                std::lock_guard lock(state->mutex);
+                state->bounds = p.bounds;
+                state->position = p.position;
+                state->anchor = p.anchor;
+                state->transform = p.transform;
+                state->sublayer_transform = p.sublayer_transform;
+                state->z_position = p.z;
+                state->corner_radius = p.corner_radius;
+                state->border_width = p.border_width;
+                state->shadow_radius = p.shadow_radius;
+                state->opacity = static_cast<float>(p.opacity);
+                state->shadow_opacity = static_cast<float>(p.shadow_opacity);
+                state->shadow_offset = p.shadow_offset;
+                state->contents_rect = p.contents_rect;
+                state->hidden = p.hidden;
+                if (made_background) old.push_back(std::exchange(state->background_color, made_background));
+                if (made_border) old.push_back(std::exchange(state->border_color, made_border));
+                if (made_shadow) old.push_back(std::exchange(state->shadow_color, made_shadow));
+            }
+            for (const auto object : old) cf_release(object);
+        }
+        {
+            const auto state = layer(copy);
+            std::lock_guard lock(state->mutex);
+            state->model_layer = retain(self);
+        }
+        return send(copy, "autorelease");
+    }
+
     void install_layer_animations() {
         const auto L = layer_class;
         method(L, "addAnimation:forKey:", [this](CpuState& s, GuestMemory&) { add_animation(s.x[0], s.x[2], s.x[3]); }, "v@:@@");
@@ -1612,6 +2059,60 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
             if (s.x[2]) remove_animations(s.x[0], s.x[2]);
         }, "v@:@");
         method(L, "removeAllAnimations", [this](CpuState& s, GuestMemory&) { remove_animations(s.x[0], std::nullopt); }, "v@:");
+        method(L, "presentationLayer", [this](CpuState& s, GuestMemory&) { s.x[0] = presentation_layer(s.x[0]); }, "@@:");
+        method(L, "modelLayer", [this](CpuState& s, GuestMemory&) {
+            const auto state = layer(s.x[0]);
+            std::lock_guard lock(state->mutex);
+            s.x[0] = state->model_layer ? state->model_layer : s.x[0];
+        }, "@@:");
+        // -initWithLayer: (shadow copies such as presentation layers): the
+        // CALayer state of `layer`, without its sublayers, superlayer,
+        // delegate or animations; subclasses copy their own properties.
+        method(L, "initWithLayer:", [this, L](CpuState& s, GuestMemory&) {
+            const auto self = objc.send_super(s.x[0], L, objc.selector("init")).x0;
+            s.x[0] = self;
+            const auto source = s.x[2];
+            if (!self || !source || !objc.find_host_state<LayerState>(source)) return;
+            LayerState copy;
+            {
+                const auto from = layer(source);
+                std::lock_guard lock(from->mutex);
+                copy.bounds = from->bounds; copy.position = from->position; copy.anchor = from->anchor;
+                copy.contents_scale = from->contents_scale; copy.z_position = from->z_position; copy.contents_rect = from->contents_rect;
+                copy.opacity = from->opacity; copy.opaque = from->opaque; copy.hidden = from->hidden;
+                copy.masks_to_bounds = from->masks_to_bounds; copy.geometry_flipped = from->geometry_flipped;
+                copy.transform = from->transform; copy.sublayer_transform = from->sublayer_transform;
+                copy.corner_radius = from->corner_radius; copy.masked_corners = from->masked_corners; copy.border_width = from->border_width;
+                copy.shadow_opacity = from->shadow_opacity; copy.shadow_offset = from->shadow_offset; copy.shadow_radius = from->shadow_radius;
+                copy.contents = from->contents; copy.contents_gravity = from->contents_gravity; copy.corner_curve = from->corner_curve;
+                copy.mask = from->mask; copy.minification_filter = from->minification_filter; copy.magnification_filter = from->magnification_filter;
+                copy.background_color = from->background_color; copy.border_color = from->border_color;
+                copy.shadow_color = from->shadow_color; copy.shadow_path = from->shadow_path;
+            }
+            for (auto* slot : {&copy.contents, &copy.contents_gravity, &copy.corner_curve, &copy.mask, &copy.minification_filter, &copy.magnification_filter})
+                *slot = retain(*slot);
+            for (auto* slot : {&copy.background_color, &copy.border_color, &copy.shadow_color, &copy.shadow_path}) *slot = cf_retain(*slot);
+            std::vector<Address> old, old_cf;
+            {
+                const auto to = layer(self);
+                std::lock_guard lock(to->mutex);
+                to->bounds = copy.bounds; to->position = copy.position; to->anchor = copy.anchor;
+                to->contents_scale = copy.contents_scale; to->z_position = copy.z_position; to->contents_rect = copy.contents_rect;
+                to->opacity = copy.opacity; to->opaque = copy.opaque; to->hidden = copy.hidden;
+                to->masks_to_bounds = copy.masks_to_bounds; to->geometry_flipped = copy.geometry_flipped;
+                to->transform = copy.transform; to->sublayer_transform = copy.sublayer_transform;
+                to->corner_radius = copy.corner_radius; to->masked_corners = copy.masked_corners; to->border_width = copy.border_width;
+                to->shadow_opacity = copy.shadow_opacity; to->shadow_offset = copy.shadow_offset; to->shadow_radius = copy.shadow_radius;
+                old = {std::exchange(to->contents, copy.contents), std::exchange(to->contents_gravity, copy.contents_gravity),
+                       std::exchange(to->corner_curve, copy.corner_curve), std::exchange(to->mask, copy.mask),
+                       std::exchange(to->minification_filter, copy.minification_filter),
+                       std::exchange(to->magnification_filter, copy.magnification_filter)};
+                old_cf = {std::exchange(to->background_color, copy.background_color), std::exchange(to->border_color, copy.border_color),
+                          std::exchange(to->shadow_color, copy.shadow_color), std::exchange(to->shadow_path, copy.shadow_path)};
+            }
+            for (const auto object : old) release(object);
+            for (const auto object : old_cf) cf_release(object);
+        }, "@@:@");
     }
     void add_animation(Address self, Address animation, Address key) {
         if (!animation) fail("-[CALayer addAnimation:forKey:] with a nil animation");
@@ -1645,9 +2146,12 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         TimerId stop{};
         if (std::isfinite(active))
             stop = loop.add_timer(begin + active, 0, common_modes, [this, self, copy](TimerId) { animation_finished(self, copy); });
-        const auto state = layer(self);
-        std::lock_guard lock(state->mutex);
-        state->animations.push_back({key_copy, copy, start, stop});
+        {
+            const auto state = layer(self);
+            std::lock_guard lock(state->mutex);
+            state->animations.push_back({key_copy, copy, start, stop});
+        }
+        start_frames(self);
     }
     static LayerState::Animation* find_animation(LayerState& state, Address animation) {
         for (auto& a : state.animations) if (a.animation == animation) return &a;
@@ -1681,13 +2185,18 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         stop_delegate(animation, true);
         if ((send(animation, "isRemovedOnCompletion") & 0xff) != 0) {
             std::optional<LayerState::Animation> removed;
+            bool none{};
             {
                 std::lock_guard lock(state->mutex);
                 const auto it = std::find_if(state->animations.begin(), state->animations.end(),
                                              [&](const LayerState::Animation& a) { return a.animation == animation; });
                 if (it != state->animations.end()) { removed = *it; state->animations.erase(it); }
+                none = state->animations.empty();
             }
-            if (removed) { release(removed->key); release(removed->animation); release(self); }
+            if (removed) {
+                if (none) stop_frames(self);
+                release(removed->key); release(removed->animation); release(self);
+            }
         }
         release(animation);
     }
@@ -1704,6 +2213,7 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
     void remove_animations(Address self, std::optional<Address> key) {
         const auto state = layer(self);
         std::vector<LayerState::Animation> removed;
+        bool none{};
         {
             std::lock_guard lock(state->mutex);
             for (auto it = state->animations.begin(); it != state->animations.end();) {
@@ -1711,7 +2221,9 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
                 removed.push_back(*it);
                 it = state->animations.erase(it);
             }
+            none = state->animations.empty();
         }
+        if (!removed.empty() && none) stop_frames(self);
         for (const auto& entry : removed) {
             if (main_run_loop_available()) {
                 if (entry.start_timer) main_run_loop().cancel_timer(entry.start_timer);
@@ -2316,6 +2828,32 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
                                     static_cast<float>(values[3])};
     }
     static tree::Affine affine_of(const Transform3D& t) { return {t[0], t[1], t[4], t[5], t[12], t[13]}; }
+    // The presentation values over a snapshot's model values.
+    static void apply(const Presented& p, tree::Layer& out) {
+        const auto colour = [](const std::array<double, 4>& c) {
+            return std::array<float, 4>{static_cast<float>(c[0]), static_cast<float>(c[1]), static_cast<float>(c[2]), static_cast<float>(c[3])};
+        };
+        out.bounds = p.bounds;
+        out.position = p.position;
+        out.anchor = p.anchor;
+        out.transform = affine_of(p.transform);
+        out.sublayer_transform = affine_of(p.sublayer_transform);
+        out.z_position = p.z;
+        out.opacity = static_cast<float>(std::clamp(p.opacity, 0.0, 1.0));
+        out.hidden = p.hidden;
+        out.corner_radius = p.corner_radius;
+        out.border_width = p.border_width;
+        out.contents_rect = p.contents_rect;
+        if (p.changed & 1) out.background = colour(p.background);
+        if (p.changed & 2) out.border = colour(p.border);
+        if (p.shadow_opacity > 0) {
+            if (!out.shadow) out.shadow = tree::Shadow{colour(p.shadow_color), 0, p.shadow_offset, p.shadow_radius, std::nullopt};
+            out.shadow->opacity = static_cast<float>(std::min(p.shadow_opacity, 1.0));
+            out.shadow->offset = p.shadow_offset;
+            out.shadow->radius = p.shadow_radius;
+            if (p.changed & 4) out.shadow->color = colour(p.shadow_color);
+        } else out.shadow.reset();
+    }
     // Layers marked for display that draw themselves (a delegate that draws,
     // or a class with its own -drawInContext:) draw before they are shown; a
     // view's backing layer is drawn by AppKit.
@@ -2653,6 +3191,8 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         tree::Layer out;
         std::vector<Address> children;
         Address background{}, gravity{}, border{}, shadow_color{}, shadow_path{}, mask{}, minification{}, magnification{};
+        bool animated{};
+        Presented presented;
         {
             const auto state = layer(object);
             std::lock_guard lock(state->mutex);
@@ -2680,6 +3220,8 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
             shadow_color = cf_retain(state->shadow_color);
             shadow_path = cf_retain(state->shadow_path);
             children = state->sublayers;
+            animated = !state->animations.empty();
+            if (animated) presented = presented_of(*state);
             mask = retain(state->mask);
             minification = retain(state->minification_filter);
             magnification = retain(state->magnification_filter);
@@ -2699,6 +3241,10 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         if (out.shadow) {
             if (shadow_color) if (const auto c = color_components(shadow_color)) out.shadow->color = *c;
             if (shadow_path) out.shadow->path = path_mask(shadow_path, out.contents_scale);
+        }
+        if (animated) {
+            colours_of(presented, background, border, shadow_color);
+            if (present(object, presented, monotonic_seconds())) apply(presented, out);
         }
         cf_release(shadow_color);
         cf_release(shadow_path);

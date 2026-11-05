@@ -11,12 +11,15 @@
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/foundation_bridge.hpp"
 #include "alchemy/gui/install.hpp"
+#include "alchemy/gui/runloop.hpp"
 #include "alchemy/darwin/quartzcore/layer_tree.hpp"
 #include "alchemy/darwin/quartzcore/quartzcore.hpp"
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <iostream>
+#include <bit>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -314,12 +317,139 @@ void emitters_springs(Fixture& f) {
     require(rotate && text(f.id(rotate, "name")) == "rotateZ", "+[CAValueFunction functionWithName:]");
 }
 
+// Running CABasicAnimations: presentation values in the snapshot and -presentationLayer.
+void animations(Fixture& f) {
+    const auto qc_lib = std::string_view("/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore");
+    const auto now = [&f, qc_lib] {
+        const auto found = f.process.resolve(qc_lib, "_CACurrentMediaTime");
+        require(found.has_value(), "missing CACurrentMediaTime");
+        return alchemy::EngineAdapter(f.engine).call_regs(found->address, {}).d(0);
+    };
+    const auto number = [&f](double value) {
+        alchemy::CallRegs registers;
+        registers.set_d(0, value);
+        return f.send(f.cls("NSNumber"), "numberWithDouble:", registers).x0;
+    };
+    const auto point = [&f](double x, double y) {
+        alchemy::CallRegs registers;
+        registers.set_d(0, x); registers.set_d(1, y);
+        return f.send(f.cls("NSValue"), "valueWithPoint:", registers).x0;
+    };
+    // An animation of `key` that began `elapsed` seconds ago and lasts `duration`.
+    const auto animation = [&](const char* key, double elapsed, double duration) {
+        const auto made = f.id(f.cls("CABasicAnimation"), "animationWithKeyPath:", {f.cf.string(key)});
+        f.reals(made, "setDuration:", {duration});
+        f.reals(made, "setBeginTime:", {now() - elapsed});
+        return made;
+    };
+    const auto layer = f.make("CALayer");
+    f.reals(layer, "setBounds:", {0, 0, 20, 20});
+    f.reals(layer, "setPosition:", {10, 10});
+    static_cast<void>(f.id(layer, "setBackgroundColor:", {f.color(1, 0, 0, 1)}));
+
+    // Opacity halfway from 0 to 1 (linear: no timing function).
+    const auto fade = animation("opacity", 50, 100);
+    static_cast<void>(f.id(fade, "setFromValue:", {number(0)}));
+    static_cast<void>(f.id(fade, "setToValue:", {number(1)}));
+    static_cast<void>(f.id(layer, "addAnimation:forKey:", {fade, f.cf.string("fade")}));
+    auto shown = qc::snapshot_tree(f.objc, layer);
+    require(near(shown.opacity, 0.5, 0.01), "opacity halfway: " + std::to_string(shown.opacity));
+    require(near(f.send(layer, "opacity").s(0), 1), "the model value is unchanged");
+    const auto presentation = f.id(layer, "presentationLayer");
+    require(presentation && presentation != layer && near(f.send(presentation, "opacity").s(0), 0.5, 0.01) &&
+                f.id(presentation, "modelLayer") == layer && f.id(layer, "modelLayer") == layer,
+            "-presentationLayer: " + std::to_string(f.send(presentation, "opacity").s(0)));
+
+    // Position a quarter of the way with ease-in (slower at first), to-only from the model value.
+    const auto move = animation("position", 25, 100);
+    static_cast<void>(f.id(move, "setToValue:", {point(110, 10)}));
+    static_cast<void>(f.id(move, "setTimingFunction:", {f.id(f.cls("CAMediaTimingFunction"), "functionWithName:", {f.cf.string("easeIn")})}));
+    static_cast<void>(f.id(layer, "addAnimation:forKey:", {move, f.cf.string("move")}));
+    shown = qc::snapshot_tree(f.objc, layer);
+    require(shown.position.x > 10.5 && shown.position.x < 35 && near(shown.position.y, 10), "ease-in position: " + std::to_string(shown.position.x));
+
+    // A colour halfway from red to blue, and a rotation halfway to a half turn.
+    const auto tint = animation("backgroundColor", 50, 100);
+    static_cast<void>(f.id(tint, "setToValue:", {f.color(0, 0, 1, 1)}));
+    static_cast<void>(f.id(layer, "addAnimation:forKey:", {tint, f.cf.string("tint")}));
+    const auto turn = animation("transform.rotation.z", 50, 100);
+    static_cast<void>(f.id(turn, "setFromValue:", {number(0)}));
+    static_cast<void>(f.id(turn, "setToValue:", {number(3.14159265358979)}));
+    static_cast<void>(f.id(layer, "addAnimation:forKey:", {turn, f.cf.string("turn")}));
+    shown = qc::snapshot_tree(f.objc, layer);
+    require(shown.background && near((*shown.background)[0], 0.5, 0.02) && near((*shown.background)[2], 0.5, 0.02), "colour halfway");
+    require(near(shown.transform.a, 0, 0.03) && near(shown.transform.b, 1, 0.03), "a quarter turn halfway to a half turn");
+
+    // A transform value (NSValue CATransform3D): scale 2 reached halfway from the identity... after the turn's removal.
+    static_cast<void>(f.id(layer, "removeAnimationForKey:", {f.cf.string("turn")}));
+    const auto matrix = f.process.allocate_guest(128, 8);
+    const std::array<double, 16> scale{2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    for (unsigned i = 0; i < 16; ++i) f.engine.write64(matrix + i * 8, std::bit_cast<std::uint64_t>(scale[i]));
+    const auto boxed = f.id(f.cls("NSValue"), "valueWithCATransform3D:", {matrix});
+    const auto back = f.process.allocate_guest(128, 8);
+    static_cast<void>(f.id(boxed, "getValue:size:", {back, 128}));   // the bytes -CATransform3DValue copies (x8 does not pass through objc.send)
+    require(std::bit_cast<double>(f.engine.read64(back)) == 2 && std::bit_cast<double>(f.engine.read64(back + 40)) == 2, "NSValue CATransform3D round trip");
+    const auto grow = animation("transform", 50, 100);
+    static_cast<void>(f.id(grow, "setToValue:", {boxed}));
+    static_cast<void>(f.id(layer, "addAnimation:forKey:", {grow, f.cf.string("grow")}));
+    shown = qc::snapshot_tree(f.objc, layer);
+    require(near(shown.transform.a, 1.5, 0.02) && near(shown.transform.d, 1.5, 0.02), "scale halfway to 2: " + std::to_string(shown.transform.a));
+
+    // Fill modes: an animation that has not begun has no effect, unless it fills backwards.
+    const auto later = animation("cornerRadius", -100, 10);
+    static_cast<void>(f.id(later, "setFromValue:", {number(7)}));
+    static_cast<void>(f.id(later, "setToValue:", {number(9)}));
+    static_cast<void>(f.id(layer, "addAnimation:forKey:", {later, f.cf.string("later")}));
+    require(near(qc::snapshot_tree(f.objc, layer).corner_radius, 0), "a future animation without fill");
+    static_cast<void>(f.id(layer, "removeAnimationForKey:", {f.cf.string("later")}));
+    static_cast<void>(f.id(later, "setFillMode:", {f.cf.string("backwards")}));
+    static_cast<void>(f.id(layer, "addAnimation:forKey:", {later, f.cf.string("later")}));
+    require(near(qc::snapshot_tree(f.objc, layer).corner_radius, 7), "fillMode backwards shows the from value");
+
+    // Additive: by 5 over the model border width 2, halfway.
+    f.reals(layer, "setBorderWidth:", {2});
+    const auto widen = animation("borderWidth", 50, 100);
+    static_cast<void>(f.id(widen, "setByValue:", {number(5)}));
+    static_cast<void>(f.id(widen, "setAdditive:", {1}));
+    static_cast<void>(f.id(layer, "addAnimation:forKey:", {widen, f.cf.string("widen")}));
+    require(near(qc::snapshot_tree(f.objc, layer).border_width, 4.5, 0.05), "additive by-value halfway");
+
+    // Without animations the model values show again.
+    static_cast<void>(f.id(layer, "removeAllAnimations"));
+    shown = qc::snapshot_tree(f.objc, layer);
+    require(near(shown.opacity, 1) && near(shown.position.x, 10) && near(shown.transform.a, 1) && near(shown.border_width, 2) &&
+                shown.background && near((*shown.background)[0], 1),
+            "the model values after removeAllAnimations");
+
+    // While an animation runs, each frame marks the layer changed (the composition redraws it); afterwards nothing does.
+    static Address watched;
+    static int frames;
+    watched = layer;
+    frames = 0;
+    qc::observe_layer_changes("layer kinds test frames", [](std::uint64_t changed) { if (changed == watched) ++frames; });
+    const auto pulse = animation("opacity", 0, 100);
+    static_cast<void>(f.id(pulse, "setToValue:", {number(0)}));
+    static_cast<void>(f.id(layer, "addAnimation:forKey:", {pulse, f.cf.string("pulse")}));
+    const auto run = [](double seconds) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+        while (std::chrono::steady_clock::now() < until)
+            static_cast<void>(alchemy::gui::main_run_loop().run_once(alchemy::gui::default_mode, 0.01, false));
+    };
+    run(0.25);
+    require(frames >= 4, "frames while animating: " + std::to_string(frames));
+    static_cast<void>(f.id(layer, "removeAllAnimations"));
+    frames = 0;
+    run(0.15);
+    require(frames <= 1, "frames after the animations ended: " + std::to_string(frames));
+    watched = 0;
+}
+
 int main() {
     try {
         Fixture f;
         for (const auto& [name, test] : std::initializer_list<std::pair<const char*, void (*)(Fixture&)>>{
                  {"appearance", appearance}, {"drawn_layers", drawn_layers}, {"shapes_text_gradients", shapes_text_gradients},
-                 {"replicas_geometry_scrolling", replicas_geometry_scrolling}, {"emitters_springs", emitters_springs}}) {
+                 {"replicas_geometry_scrolling", replicas_geometry_scrolling}, {"emitters_springs", emitters_springs}, {"animations", animations}}) {
             std::cout << "[quartzcore layers] " << name << std::endl;
             test(f);
         }

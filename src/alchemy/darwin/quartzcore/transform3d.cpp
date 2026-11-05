@@ -26,6 +26,22 @@ void write(GuestMemory& m, Address at, const Transform3D& t) {
 
 void install_transform3d(Support& support) {
     const auto fn = [&support](const char* symbol, Handler handler) { support.fill_function(quartzcore_library, symbol, std::move(handler)); };
+    // NSValue's QuartzCore additions: +valueWithCATransform3D: (the transform
+    // by reference in x2) and -CATransform3DValue (returned through x8).
+    if (const auto value_class = support.objc.find_class("NSValue")) {
+        auto* sp = &support;
+        static constexpr char encoding[] = "{CATransform3D=dddddddddddddddd}";
+        const auto type = support.process.allocate_guest(sizeof encoding, 8);
+        support.memory().write_bytes(type, std::span(reinterpret_cast<const std::uint8_t*>(encoding), sizeof encoding));
+        support.method(value_class, "valueWithCATransform3D:", [sp, type](CpuState& s, GuestMemory&) {
+            if (!s.x[2]) fail("+[NSValue valueWithCATransform3D:] without a transform");
+            s.x[0] = sp->send_id(sp->objc.find_class("NSValue"), "valueWithBytes:objCType:", {s.x[2], type});
+        }, "@@:{CATransform3D=dddddddddddddddd}", true);
+        support.method(value_class, "CATransform3DValue", [sp](CpuState& s, GuestMemory&) {
+            if (!s.x[8]) fail("-[NSValue CATransform3DValue] result without storage (x8)");
+            static_cast<void>(sp->send_id(s.x[0], "getValue:size:", {s.x[8], 128}));
+        }, "{CATransform3D=dddddddddddddddd}@:");
+    }
     fn("_CATransform3DIsIdentity", [](CpuState& s, GuestMemory& m) { put_bool(s, transform_is_identity(read(m, s.x[0]))); });
     fn("_CATransform3DEqualToTransform", [](CpuState& s, GuestMemory& m) { put_bool(s, read(m, s.x[0]) == read(m, s.x[1])); });
     fn("_CATransform3DMakeTranslation", [](CpuState& s, GuestMemory& m) { write(m, s.x[8], transform_translation(d(s, 0), d(s, 1), d(s, 2))); });

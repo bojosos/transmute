@@ -17,9 +17,9 @@
 // (CAAnimation is key-value coding compliant for any key), and the objects
 // are copied when added to a layer (-[CALayer addAnimation:forKey:] in
 // src/alchemy/darwin/quartzcore/quartzcore.cpp, which runs their timing and sends
-// the delegate's animationDidStart: / animationDidStop:finished:). There is
-// no render tree, so the animated values themselves are never interpolated:
-// the layer shows its model values.
+// the delegate's animationDidStart: / animationDidStop:finished:, and shows
+// CABasicAnimations' presentation values; keyframe, group, spring and
+// transition animations are timed but do not change what is shown).
 //
 // CASpringAnimation's settlingDuration is computed from its spring: the
 // motion of a mass on a damped spring from the start value to the end value

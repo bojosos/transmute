@@ -479,6 +479,7 @@ void install_foundation_classes(Provider& p, ObjcRuntime& objc, CoreFoundation& 
             if (type.starts_with("{_NSRange=") || type.starts_with("{CGPoint=") || type.starts_with("{CGSize=") || type.starts_with("{_NSPoint=") ||
                 type.starts_with("{_NSSize=")) return 16;
             if (type.starts_with("{CGRect=") || type.starts_with("{_NSRect=")) return 32;
+            if (type.starts_with("{CATransform3D=")) return 128;   // QuartzCore's NSValue additions (transform3d.cpp)
             return std::nullopt;
         };
         // +valueWithBytes:objCType: / -initWithBytes:objCType:
