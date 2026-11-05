@@ -16,6 +16,7 @@
 #include "alchemy/host/speech.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -2836,6 +2837,77 @@ void av_video(Fixture& f) {
 // AVPlayer: libvpx's VP9 WebM vector loads (status ready, size), shows its pictures on an
 // AVPlayerLayer and through an AVPlayerItemVideoOutput, plays to its end and pauses there, and
 // seeks; an MP3 item's audio reaches the output device.
+// AudioServices: a 0.1 s WAVE of 0.5 plays on the fake device; when it ends, the procedure added for it
+// and a play's block complete on the main queue; a sound disposed while it plays does not complete;
+// the alert completes at once; the per-sound properties; a sound over 30 s is refused.
+void system_sounds(Fixture& f) {
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_media_system_sounds";
+    std::filesystem::create_directories(directory);
+    const auto path = write_wave(directory / "ding.wav", 48000, 2, 4800, [](std::uint32_t, std::uint16_t) { return static_cast<std::int16_t>(16384); });
+    const auto mode = f.engine.read64(f.symbol(vt_cf, "_kCFRunLoopDefaultMode"));
+    const auto run = [&](double seconds) {
+        alchemy::CallRegs r;
+        r.x[0] = mode;
+        r.set_d(0, seconds);
+        static_cast<void>(f.regs(vt_cf, "_CFRunLoopRunInMode", r));
+    };
+    static std::atomic<int> completions{0}, blocks{0};
+    static std::uint64_t completed_id{}, completed_client{};
+    const auto proc = f.process.install_function("_alchemy_test_sound_done", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        completed_id = s.x[0] & 0xffffffff;
+        completed_client = s.x[1];
+        ++completions;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto b = alchemy::gui::security::bridge();
+    const auto done = b->make_block([](transmute::CpuState&, transmute::GuestMemory&) { ++blocks; });
+    const auto pump = [&](const std::function<bool()>& until) {
+        for (int i = 0; i < 200 && !until(); ++i) {
+            static_cast<void>(FakeStream::play_paced(1024));
+            run(0.005);
+        }
+        return until();
+    };
+    const auto out = f.block(8);
+    require(f.status(at, "_AudioServicesCreateSystemSoundID", {f.cf.file_url(alchemy::guest_path_string(path), false), out}) == 0,
+            "AudioServicesCreateSystemSoundID");
+    const auto sound = f.engine.read32(out);
+    require(f.status(at, "_AudioServicesAddSystemSoundCompletion", {sound, f.call(vt_cf, "_CFRunLoopGetMain"), 0, proc, 0x42}) == 0,
+            "AudioServicesAddSystemSoundCompletion");
+    f.call(at, "_AudioServicesPlaySystemSound", {sound});
+    const auto heard = FakeStream::play_until_sound(256);
+    require(std::fabs(heard[0] - 0.5f) < 0.01f && std::fabs(heard[1] - 0.5f) < 0.01f, "the sound plays: " + std::to_string(heard[0]));
+    require(pump([] { return completions == 1; }) && completed_id == sound && completed_client == 0x42, "its completion procedure ran");
+    f.call(at, "_AudioServicesPlaySystemSoundWithCompletion", {sound, done});
+    require(pump([] { return blocks == 1 && completions == 2; }), "the block and the procedure complete a second play");
+    // Properties: kAudioServicesPropertyIsUISound per sound.
+    const auto specifier = f.block(4), size = f.block(4), value = f.block(4);
+    f.engine.write32(specifier, sound);
+    f.engine.write32(size, 4);
+    require(f.status(at, "_AudioServicesGetProperty", {0x69737569, 4, specifier, size, value}) == 0 && f.engine.read32(value) == 1, "a UI sound");
+    f.engine.write32(value, 0);
+    require(f.status(at, "_AudioServicesSetProperty", {0x69737569, 4, specifier, 4, value}) == 0 &&
+            f.status(at, "_AudioServicesGetProperty", {0x69737569, 4, specifier, size, value}) == 0 && f.engine.read32(value) == 0, "set to not a UI sound");
+    require(f.status(at, "_AudioServicesGetPropertyInfo", {0x69737569, 0, 0, size, 0}) == static_cast<std::int32_t>(0x7370633f) &&
+            f.status(at, "_AudioServicesGetPropertyInfo", {0x7a7a7a7a, 4, specifier, size, 0}) == static_cast<std::int32_t>(0x7074793f),
+            "specifier and property errors");
+    // Disposed while it plays: it stops and does not complete.
+    f.call(at, "_AudioServicesPlaySystemSound", {sound});
+    static_cast<void>(FakeStream::play_until_sound(256));
+    require(f.status(at, "_AudioServicesDisposeSystemSoundID", {sound}) == 0, "disposed while playing");
+    static_cast<void>(pump([] { return false; }));
+    require(completions == 2, "no completion for the disposed play");
+    require(f.status(at, "_AudioServicesDisposeSystemSoundID", {sound}) == -1500, "disposed twice");
+    // kSystemSoundID_UserPreferredAlert (no AppKit here: nothing sounds) completes at once.
+    f.call(at, "_AudioServicesPlayAlertSoundWithCompletion", {0x1000, done});
+    require(pump([] { return blocks == 2; }), "the alert completes");
+    // Over 30 seconds is not a system sound.
+    const auto long_path = write_wave(directory / "long.wav", 8000, 1, 8000 * 31, [](std::uint32_t, std::uint16_t) { return static_cast<std::int16_t>(0); });
+    require(f.status(at, "_AudioServicesCreateSystemSoundID", {f.cf.file_url(alchemy::guest_path_string(long_path), false), out}) == -1502,
+            "kAudioServicesSystemSoundExceededMaximumDurationError");
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 // AVQueuePlayer: two 0.15 s items played in turn (an end notification each, then no item); inserting and removing;
 // AVPlayerLooper keeping copies of its template queued and counting loops; forwardPlaybackEndTime.
 void queue_player(Fixture& f) {
@@ -3136,6 +3208,7 @@ int main() {
         {"av_video", av_video},
         {"av_player", av_player},
         {"queue_player", queue_player},
+        {"system_sounds", system_sounds},
         {"sample_buffer_renderers", sample_buffer_renderers},
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},

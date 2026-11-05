@@ -37,6 +37,8 @@ void install_music(Support& support);
 void install_audio_file(Support& support);
 // audio_file_stream.cpp: AudioFileStream (from install_audio_file).
 void install_audio_file_stream(Support& support);
+// audio_services.cpp: AudioServices system sounds (from install_audio_file).
+void install_audio_services(Support& support);
 void install_au_listeners(Support& support);
 void install_av_foundation(Support& support);
 // av_player.cpp: AVPlayer, AVPlayerItem, AVPlayerItemVideoOutput, AVPlayerLayer (from install_av_foundation).

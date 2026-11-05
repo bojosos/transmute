@@ -1331,6 +1331,7 @@ void install_audio_file(Support& support) {
     });
 
     install_audio_file_stream(support);
+    install_audio_services(support);
 }
 
 } // namespace alchemy::gui::completion_kit::media
