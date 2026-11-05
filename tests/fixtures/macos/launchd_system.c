@@ -1,0 +1,25 @@
+/* Project-authored link-only libSystem identities for the launchd_model
+ * fixture. Alchemy supplies these at run time; the bodies are never mapped. */
+#define LINK_ONLY(name) int name(void) { return -777; }
+char** environ;
+LINK_ONLY(__error)
+LINK_ONLY(write)
+LINK_ONLY(read)
+LINK_ONLY(close)
+LINK_ONLY(pipe)
+LINK_ONLY(open)
+LINK_ONLY(unlink)
+LINK_ONLY(_exit)
+LINK_ONLY(waitpid)
+LINK_ONLY(getpid)
+LINK_ONLY(getppid)
+LINK_ONLY(getuid)
+LINK_ONLY(getenv)
+LINK_ONLY(usleep)
+LINK_ONLY(system)
+LINK_ONLY(proc_pidpath)
+LINK_ONLY(posix_spawn)
+LINK_ONLY(posix_spawn_file_actions_init)
+LINK_ONLY(posix_spawn_file_actions_destroy)
+LINK_ONLY(posix_spawn_file_actions_adddup2)
+LINK_ONLY(posix_spawn_file_actions_addclose)

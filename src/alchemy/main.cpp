@@ -1,5 +1,6 @@
 #include "alchemy/alchemy_root.hpp"
 #include "alchemy/darwin_process.hpp"
+#include "alchemy/darwin/launchd/client.hpp"
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/process.hpp"
@@ -52,6 +53,7 @@ void usage() {
                  "       alchemy doctor [options] program\n"
                  "       alchemy install [--root DIRECTORY] [--links FILE] [--replace] [--no-infer]\n"
                  "                       [--no-native-links] Bundle.app\n"
+                 "       alchemy launchd [--root DIRECTORY] [options]  the session launchd (started on demand)\n"
                  "Options: --jit --jit-stats --load-base ADDRESS --root DIRECTORY\n"
                  "         --dylib-dir DIRECTORY --runtime-dir DIRECTORY --instruction-limit COUNT\n"
                  "         --fd N=MODE:TARGET  the program starts with descriptor N (3..4095) open on\n"
@@ -114,6 +116,8 @@ int launch(const std::vector<std::string>& arguments, const std::vector<std::str
             return 1;
         }
         if (arguments[1] == "install") return install(arguments, environment);
+        // The session launchd (src/alchemy/darwin/launchd/): started by launchctl and SMJobSubmit.
+        if (arguments[1] == "launchd") return alchemy::launchd::server_main({arguments.begin() + 2, arguments.end()});
         std::size_t index = 1;
 #ifdef ALCHEMY_WITH_GUI
         if (arguments[index] == "msl-seed") {
