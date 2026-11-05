@@ -26,6 +26,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/security/tls.cpp
     src/alchemy/darwin/security/keys.cpp
     src/alchemy/darwin/security/certificates.cpp
+    src/alchemy/darwin/security/certificate_values.cpp
     src/alchemy/darwin/security/keychain.cpp
     src/alchemy/darwin/security/secure_transport.cpp
     src/alchemy/darwin/security/code_signing.cpp

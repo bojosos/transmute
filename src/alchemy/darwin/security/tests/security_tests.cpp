@@ -2,7 +2,8 @@
 // NSError/CFError, certificates and trust (custom anchors, host names,
 // exceptions, system roots), SecKey (RSA / EC sign, verify, encrypt, decrypt,
 // ECDH, external representations), SecItemImport, the DPAPI keychain, and a
-// SecureTransport client against an in-process SChannel TLS server.
+// SecureTransport client against an in-process SChannel TLS server. The legacy
+// SecKey calls, SecItemExport and SecCertificateCopyValues.
 #include "security_internal.hpp"
 #include "code_signature.hpp"
 #include "keys.hpp"
@@ -296,6 +297,134 @@ void test_keys(Fixture& f, Identity& identity) {
     for (const auto object : {list, pem_data, ec_external, shared2, shared1, ec_signature, ec2_public, ec_public, ec2, ec, ec_parameters,
                               attributes, signature2, imported, private_attributes, external, raw_decrypted, raw_encrypted, block_data,
                               decrypted, encrypted, tampered, signature, message, rsa_public, rsa, rsa_parameters})
+        f.release(object);
+}
+
+// The legacy SecKey calls, SecItemExport and SecCertificateCopyValues.
+void test_legacy_keys_and_export(Fixture& f, Identity& identity) {
+    const auto error = f.cell();
+    const auto buffer = [&](const Bytes& bytes) {
+        const auto address = f.process.allocate_guest(bytes.size() + 1);
+        f.engine.write_bytes(address, bytes);
+        return address;
+    };
+    const auto read = [&](Address address, std::size_t size) {
+        Bytes bytes(size);
+        f.engine.read_bytes(address, bytes);
+        return bytes;
+    };
+    const auto rsa_parameters = key_parameters(f, true, 2048);
+    const auto rsa = f.s("_SecKeyCreateRandomKey", {rsa_parameters, error});
+    const auto rsa_public = f.s("_SecKeyCopyPublicKey", {rsa});
+    require(rsa && rsa_public, "RSA key for the legacy calls");
+    // SecKeyRawSign with kSecPaddingPKCS1SHA256 over a digest is PKCS#1 v1.5 (deterministic): it equals
+    // SecKeyCreateSignature with kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA256.
+    Bytes digest(32);
+    for (std::size_t index = 0; index < digest.size(); ++index) digest[index] = static_cast<std::uint8_t>(index * 7);
+    const auto digest_buffer = buffer(digest);
+    const auto signature_buffer = f.process.allocate_guest(512), length = f.cell();
+    f.engine.write64(length, 512);
+    require(f.status("_SecKeyRawSign", {rsa, 0x8004, digest_buffer, 32, signature_buffer, length}) == 0 && f.engine.read64(length) == 256,
+            "SecKeyRawSign(PKCS1SHA256)");
+    const auto digest_data = f.data(digest);
+    const auto signature = f.s("_SecKeyCreateSignature", {rsa, f.constant("kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA256"), digest_data, error});
+    require(signature && f.bytes(signature) == read(signature_buffer, 256), "SecKeyRawSign equals SecKeyCreateSignature");
+    require(f.status("_SecKeyRawVerify", {rsa_public, 0x8004, digest_buffer, 32, signature_buffer, 256}) == 0, "SecKeyRawVerify");
+    f.engine.write_bytes(digest_buffer + 3, Bytes{static_cast<std::uint8_t>(digest[3] ^ 1)});
+    require(f.status("_SecKeyRawVerify", {rsa_public, 0x8004, digest_buffer, 32, signature_buffer, 256}) != 0, "SecKeyRawVerify accepted a changed digest");
+    f.engine.write_bytes(digest_buffer + 3, Bytes{digest[3]});
+    f.engine.write64(length, 100);
+    require(f.status("_SecKeyRawSign", {rsa, 0x8004, digest_buffer, 32, signature_buffer, length}) == -50, "SecKeyRawSign with a short buffer");
+    require(f.status("_SecKeyRawSign", {rsa, 0x8000, digest_buffer, 16, signature_buffer, length}) == -4, "kSecPaddingPKCS1MD2 is unimplemented");
+    // SecKeyEncrypt / SecKeyDecrypt with kSecPaddingPKCS1 and kSecPaddingOAEP.
+    const Bytes secret{'s', 'e', 's', 's', 'i', 'o', 'n', ' ', 'k', 'e', 'y'};
+    for (const Address padding : {Address{1}, Address{2}}) {
+        const auto cipher = f.process.allocate_guest(256), cipher_length = f.cell(), plain = f.process.allocate_guest(256), plain_length = f.cell();
+        f.engine.write64(cipher_length, 256);
+        f.engine.write64(plain_length, 256);
+        require(f.status("_SecKeyEncrypt", {rsa_public, padding, buffer(secret), secret.size(), cipher, cipher_length}) == 0 &&
+                f.engine.read64(cipher_length) == 256, "SecKeyEncrypt");
+        require(f.status("_SecKeyDecrypt", {rsa, padding, cipher, 256, plain, plain_length}) == 0 &&
+                read(plain, static_cast<std::size_t>(f.engine.read64(plain_length))) == secret, "SecKeyDecrypt");
+    }
+    // ECDSA over a digest (DER signatures), whatever the padding.
+    const auto ec_parameters = key_parameters(f, false, 256);
+    const auto ec = f.s("_SecKeyCreateRandomKey", {ec_parameters, error});
+    const auto ec_public = f.s("_SecKeyCopyPublicKey", {ec});
+    f.engine.write64(length, 512);
+    require(f.status("_SecKeyRawSign", {ec, 1, digest_buffer, 32, signature_buffer, length}) == 0, "SecKeyRawSign(ECDSA)");
+    require(f.status("_SecKeyRawVerify", {ec_public, 1, digest_buffer, 32, signature_buffer, f.engine.read64(length)}) == 0, "SecKeyRawVerify(ECDSA)");
+
+    // SecItemExport.
+    const auto out = f.cell();
+    const auto der = identity.identity->certificate()->der();
+    require(f.status("_SecItemExport", {identity.certificate, 0, 0, 0, out}) == 0 && f.bytes(f.engine.read64(out)) == der, "SecItemExport(X.509 DER)");
+    f.release(f.engine.read64(out));
+    require(f.status("_SecItemExport", {identity.certificate, 9, 1, 0, out}) == 0, "SecItemExport(PEM armour)");
+    const auto armoured = f.bytes(f.engine.read64(out));
+    const std::string armoured_text(armoured.begin(), armoured.end());
+    require(armoured_text.starts_with("-----BEGIN CERTIFICATE-----\n") && armoured_text.ends_with("-----END CERTIFICATE-----\n"), "PEM certificate");
+    f.release(f.engine.read64(out));
+    const auto pair = f.array({identity.certificate, rsa_public});
+    require(f.status("_SecItemExport", {pair, 0, 0, 0, out}) == 0, "SecItemExport(PEM sequence)");
+    const auto sequence = f.engine.read64(out);
+    const auto items = f.cell();
+    const auto format = f.process.allocate_guest(4), type = f.process.allocate_guest(4);
+    f.engine.write32(format, 0);
+    f.engine.write32(type, 0);
+    require(f.status("_SecItemImport", {sequence, 0, format, type, 0, 0, 0, items}) == 0 && f.engine.read32(format) == 10 &&
+            f.core("_CFArrayGetCount", {f.engine.read64(items)}) == 2, "SecItemImport of the exported sequence");
+    const auto imported_public = f.core("_CFArrayGetValueAtIndex", {f.engine.read64(items), 1});
+    require(sec::security()->key_of(imported_public)->public_external() == sec::security()->key_of(rsa_public)->public_external(),
+            "exported public key round trip");
+    f.release(f.engine.read64(items));
+    f.release(sequence);
+    for (const auto key : {ec, rsa}) {
+        require(f.status("_SecItemExport", {key, 1, 1, 0, out}) == 0, "SecItemExport(private key)");
+        const auto exported = f.engine.read64(out);
+        const auto text = f.bytes(exported);
+        require(std::string(text.begin(), text.end()).starts_with(key == ec ? "-----BEGIN EC PRIVATE KEY-----" : "-----BEGIN RSA PRIVATE KEY-----"),
+                "private key PEM label");
+        require(f.status("_SecItemImport", {exported, 0, 0, 0, 0, 0, 0, items}) == 0, "SecItemImport of an exported private key");
+        const auto back = f.core("_CFArrayGetValueAtIndex", {f.engine.read64(items), 0});
+        require(sec::security()->key_of(back)->private_external() == sec::security()->key_of(key)->private_external(), "private key round trip");
+        f.release(f.engine.read64(items));
+        f.release(exported);
+    }
+    require(f.status("_SecItemExport", {identity.certificate, 12, 0, 0, out}) == -4, "PKCS#12 export is unimplemented");
+    require(f.status("_SecItemExport", {rsa_public, 9, 0, 0, out}) == -50, "a key is not X.509");
+
+    // SecCertificateCopyValues.
+    const auto values = f.s("_SecCertificateCopyValues", {identity.certificate, 0, error});
+    require(values != 0, "SecCertificateCopyValues");
+    const auto field = [&](Address dictionary, std::string_view oid) { return f.core("_CFDictionaryGetValue", {dictionary, f.constant(oid)}); };
+    const auto value_of = [&](Address property) { return f.core("_CFDictionaryGetValue", {property, f.constant("kSecPropertyKeyValue")}); };
+    const auto subject = field(values, "kSecOIDX509V1SubjectName");
+    require(subject && f.core("_CFDictionaryGetValue", {subject, f.constant("kSecPropertyKeyType")}) == f.constant("kSecPropertyTypeSection"),
+            "subject name section");
+    bool found_name = false;
+    for (const auto entry : f.cf.array_values(value_of(subject))) {
+        const auto label = f.core("_CFDictionaryGetValue", {entry, f.constant("kSecPropertyKeyLabel")});
+        if (sec::bridge()->text(label) == "2.5.4.3") found_name = sec::bridge()->text(value_of(entry)) == "alchemy.test";
+    }
+    require(found_name, "subject common name property");
+    const auto not_after = field(values, "kSecOIDX509V1ValidityNotAfter");
+    require(not_after && sec::bridge()->real(value_of(not_after)) == identity.identity->certificate()->not_after(), "not-after number");
+    require(sec::bridge()->text(value_of(field(values, "kSecOIDX509V1Version"))) == "3", "version");
+    require(field(values, "kSecOIDX509V1SubjectPublicKey") && field(values, "kSecOIDX509V1Signature"), "public key and signature data");
+    const auto names = f.core("_CFDictionaryGetValue", {values, f.string("2.5.29.17")});
+    require(names != 0, "subjectAltName extension");
+    std::vector<std::string> dns;
+    for (const auto entry : f.cf.array_values(value_of(names)))
+        if (sec::bridge()->text(f.core("_CFDictionaryGetValue", {entry, f.constant("kSecPropertyKeyLabel")})) == "DNS Name")
+            dns.push_back(sec::bridge()->text(value_of(entry)));
+    require(dns == std::vector<std::string>{"alchemy.test", "localhost"}, "subjectAltName DNS names");
+    const auto common_names = field(values, "kSecOIDCommonName");
+    require(common_names && f.core("_CFArrayGetCount", {value_of(common_names)}) == 1, "kSecOIDCommonName");
+    const auto keys = f.array({f.constant("kSecOIDX509V1SubjectName"), f.constant("kSecOIDX509V1SerialNumber")});
+    const auto filtered = f.s("_SecCertificateCopyValues", {identity.certificate, keys, error});
+    require(filtered && f.core("_CFDictionaryGetCount", {filtered}) == 2, "SecCertificateCopyValues with keys");
+    for (const auto object : {filtered, keys, values, pair, ec_public, ec, ec_parameters, signature, digest_data, rsa_public, rsa, rsa_parameters})
         f.release(object);
 }
 
@@ -1021,6 +1150,7 @@ int main() {
         auto identity = make_identity(fixture);
         test_trust(fixture, identity);
         test_keys(fixture, identity);
+        test_legacy_keys_and_export(fixture, identity);
         test_keychain(fixture);
         test_legacy_keychain(fixture);
         test_secure_transport(fixture, identity);

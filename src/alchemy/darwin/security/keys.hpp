@@ -28,6 +28,7 @@ struct KeyMaterial {
     [[nodiscard]] Bytes public_external() const;    // SecKeyCopyExternalRepresentation of the public key
     [[nodiscard]] Bytes private_external() const;   // ... of the private key (private keys only)
     [[nodiscard]] Bytes spki() const;                // DER SubjectPublicKeyInfo
+    [[nodiscard]] Bytes sec1() const;                // DER ECPrivateKey with the curve and point (EC private keys only)
     [[nodiscard]] std::size_t block_size() const noexcept;   // SecKeyGetBlockSize
 };
 using KeyPtr = std::shared_ptr<const KeyMaterial>;

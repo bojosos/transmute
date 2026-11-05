@@ -89,6 +89,7 @@ private:
 [[nodiscard]] std::shared_ptr<Security> security();
 
 void install_certificates(Security& security);
+void install_certificate_values(Security& security);   // SecCertificateCopyValues and the kSecOID constants
 void install_keys(Security& security);
 void install_keychain(Security& security);
 void install_secure_transport(Security& security);

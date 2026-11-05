@@ -171,32 +171,47 @@ Bytes KeyMaterial::private_external() const {
     return result;
 }
 
+namespace {
+
+Bytes encode_oid(std::string_view dotted) {
+    std::vector<std::uint64_t> parts;
+    std::size_t at = 0;
+    while (at < dotted.size()) {
+        auto next = dotted.find('.', at);
+        if (next == std::string_view::npos) next = dotted.size();
+        parts.push_back(std::stoull(std::string(dotted.substr(at, next - at))));
+        at = next + 1;
+    }
+    Bytes body{static_cast<std::uint8_t>(parts[0] * 40 + parts[1])};
+    for (std::size_t index = 2; index < parts.size(); ++index) {
+        Bytes chunk;
+        auto value = parts[index];
+        chunk.insert(chunk.begin(), static_cast<std::uint8_t>(value & 0x7f));
+        while (value >>= 7) chunk.insert(chunk.begin(), static_cast<std::uint8_t>(0x80 | (value & 0x7f)));
+        append(body, chunk);
+    }
+    return der::encode(0x06, body);
+}
+
+} // namespace
+
 Bytes KeyMaterial::spki() const {
-    const auto encode_oid = [](std::string_view dotted) {
-        std::vector<std::uint64_t> parts;
-        std::size_t at = 0;
-        while (at < dotted.size()) {
-            auto next = dotted.find('.', at);
-            if (next == std::string_view::npos) next = dotted.size();
-            parts.push_back(std::stoull(std::string(dotted.substr(at, next - at))));
-            at = next + 1;
-        }
-        Bytes body{static_cast<std::uint8_t>(parts[0] * 40 + parts[1])};
-        for (std::size_t index = 2; index < parts.size(); ++index) {
-            Bytes chunk;
-            auto value = parts[index];
-            chunk.insert(chunk.begin(), static_cast<std::uint8_t>(value & 0x7f));
-            while (value >>= 7) chunk.insert(chunk.begin(), static_cast<std::uint8_t>(0x80 | (value & 0x7f)));
-            append(body, chunk);
-        }
-        return der::encode(0x06, body);
-    };
     Bytes algorithm;
     if (type == Type::rsa) algorithm = der::sequence({encode_oid(rsa_oid), der::encode(0x05, Bytes{})});
     else algorithm = der::sequence({encode_oid(ec_oid), encode_oid(curve_by_coordinate(coordinate)->oid)});
     Bytes bits{0};
     append(bits, public_external());
     return der::sequence({algorithm, der::encode(0x03, bits)});
+}
+
+Bytes KeyMaterial::sec1() const {
+    if (type != Type::ec || !is_private) return {};
+    Bytes point{0};
+    append(point, public_external());
+    // ECPrivateKey ::= SEQUENCE { version 1, privateKey OCTET STRING, [0] parameters, [1] publicKey } (RFC 5915).
+    return der::sequence({der::integer(Bytes{1}), der::encode(0x04, padded(k, coordinate)),
+                          der::encode(0xa0, encode_oid(curve_by_coordinate(coordinate)->oid)),
+                          der::encode(0xa1, der::encode(0x03, point))});
 }
 
 std::size_t KeyMaterial::block_size() const noexcept { return type == Type::rsa ? n.size() : coordinate; }
@@ -506,6 +521,39 @@ constexpr std::uint32_t format_unknown = 0, format_openssl = 1, format_raw_key =
     format_pkcs12 = 12;
 constexpr std::uint32_t item_unknown = 0, item_private_key = 1, item_public_key = 2, item_certificate = 4, item_aggregate = 5;
 constexpr std::int32_t err_unknown_format = -25257, err_passphrase_required = -25260;
+constexpr std::uint32_t export_pem_armour = 1;   // kSecItemPemArmour
+
+// SecPadding of the legacy SecKey calls as a SecKeyAlgorithm; "" when not provided.
+std::string legacy_algorithm(const KeyMaterial& key, std::uint32_t padding, KeyOperation operation) {
+    const bool sign = operation == KeyOperation::sign || operation == KeyOperation::verify;
+    if (key.type == KeyMaterial::Type::ec) return sign ? "algid:sign:ECDSA:digest-X962" : "";   // the data is a digest; DER signatures
+    if (!sign) {
+        switch (padding) {
+        case 0: return "algid:encrypt:RSA:raw";              // kSecPaddingNone
+        case 1: return "algid:encrypt:RSA:PKCS1";            // kSecPaddingPKCS1
+        case 2: return "algid:encrypt:RSA:OAEP:SHA1";        // kSecPaddingOAEP
+        default: return "";
+        }
+    }
+    switch (padding) {
+    case 0: case 0x4000: return "algid:sign:RSA:raw";             // kSecPaddingNone, kSecPaddingSigRaw
+    case 1: return "algid:sign:RSA:digest-PKCS1v15";              // PKCS#1 padding without a DigestInfo
+    case 0x8001: return "algid:sign:RSA:digest-PKCS1v15:MD5";     // kSecPaddingPKCS1MD5 ...
+    case 0x8002: return "algid:sign:RSA:digest-PKCS1v15:SHA1";
+    case 0x8003: return "algid:sign:RSA:digest-PKCS1v15:SHA224";
+    case 0x8004: return "algid:sign:RSA:digest-PKCS1v15:SHA256";
+    case 0x8005: return "algid:sign:RSA:digest-PKCS1v15:SHA384";
+    case 0x8006: return "algid:sign:RSA:digest-PKCS1v15:SHA512";
+    default: return "";                                           // kSecPaddingPKCS1MD2
+    }
+}
+
+std::string pem(std::string_view label, std::span<const std::uint8_t> der) {
+    const auto body = base64_encode(der);
+    std::string text = "-----BEGIN " + std::string(label) + "-----\n";
+    for (std::size_t at = 0; at < body.size(); at += 64) text += body.substr(at, 64) + "\n";
+    return text + "-----END " + std::string(label) + "-----\n";
+}
 
 struct Imported {
     std::vector<Address> items;   // +1
@@ -753,6 +801,84 @@ void install_keys(Security& sec) {
             return;
         }
         s.x[0] = self->result(key_exchange(*key, *peer, self->algorithm(s.x[1])), s.x[4]);
+    });
+
+    // The legacy SecKey calls (raw buffers, SecPadding): OSStatus SecKeyRawSign(key, padding, data, dataLen, sig, size_t *sigLen),
+    // SecKeyRawVerify(key, padding, signedData, signedDataLen, sig, sigLen), SecKeyEncrypt / SecKeyDecrypt(key, padding,
+    // in, inLen, out, size_t *outLen).
+    const auto legacy = [self](CpuState& s, GuestMemory& m, KeyOperation operation) -> std::int32_t {
+        const auto key = self->sec.key_of(s.x[0]);
+        if (!key || (s.x[3] && !s.x[2]) || !s.x[4]) return status::param;
+        const auto algorithm = legacy_algorithm(*key, static_cast<std::uint32_t>(s.x[1]), operation);
+        if (algorithm.empty()) return status::unimplemented;
+        if (s.x[3] > (1u << 20)) return status::param;
+        Bytes input(static_cast<std::size_t>(s.x[3]));
+        if (!input.empty()) m.read_bytes(s.x[2], input);
+        if (operation == KeyOperation::verify) {
+            if (s.x[5] > (1u << 20)) return status::param;
+            Bytes signature(static_cast<std::size_t>(s.x[5]));
+            if (!signature.empty()) m.read_bytes(s.x[4], signature);
+            const auto value = key_verify(*key, algorithm, input, signature);
+            return value.value ? status::success : value.status;
+        }
+        if (!s.x[5]) return status::param;
+        const auto value = operation == KeyOperation::sign ? key_sign(*key, algorithm, input)
+                         : operation == KeyOperation::encrypt ? key_encrypt(*key, algorithm, input)
+                                                               : key_decrypt(*key, algorithm, input);
+        if (!value.value) return value.status;
+        if (m.read64(s.x[5]) < value.value->size()) return status::param;   // the buffer is too small
+        if (!value.value->empty()) m.write_bytes(s.x[4], *value.value);
+        m.write64(s.x[5], value.value->size());
+        return status::success;
+    };
+    const std::pair<const char*, KeyOperation> legacy_calls[] = {{"_SecKeyRawSign", KeyOperation::sign}, {"_SecKeyRawVerify", KeyOperation::verify},
+                                                                 {"_SecKeyEncrypt", KeyOperation::encrypt}, {"_SecKeyDecrypt", KeyOperation::decrypt}};
+    for (const auto& [name, operation] : legacy_calls)
+        b.function(lib, name, [legacy, operation](CpuState& s, GuestMemory& m) {
+            s.x[0] = static_cast<Address>(static_cast<std::int64_t>(legacy(s, m, operation)));
+        });
+
+    // OSStatus SecItemExport(CFTypeRef secItemOrArray, SecExternalFormat outputFormat, SecItemImportExportFlags flags,
+    //     const SecItemImportExportKeyParameters *keyParams, CFDataRef *exportedData): certificates as X.509 DER or PEM,
+    // keys in the OpenSSL formats (SubjectPublicKeyInfo, PKCS#1 RSAPrivateKey, SEC1 ECPrivateKey). Wrapped (encrypted)
+    // keys, PKCS#12, PKCS#7, SSH and raw symmetric keys answer errSecUnimplemented.
+    b.function(lib, "_SecItemExport", [self](CpuState& s, GuestMemory& m) {
+        const auto answer = [&](std::int32_t code) { s.x[0] = static_cast<Address>(static_cast<std::int64_t>(code)); };
+        if (!s.x[0] || !s.x[4]) return answer(status::param);
+        const auto items = self->b.is_array(s.x[0]) ? self->b.cf.array_values(s.x[0]) : std::vector<Address>{s.x[0]};
+        if (items.empty()) return answer(status::param);
+        auto format = static_cast<std::uint32_t>(s.x[1]);
+        const bool armour = (s.x[2] & export_pem_armour) != 0;
+        std::vector<std::pair<std::string, Bytes>> blocks;   // PEM label, DER
+        bool certificates = true;
+        for (const auto item : items) {
+            if (const auto certificate = self->sec.certificate_of(item)) {
+                blocks.emplace_back("CERTIFICATE", certificate->der());
+            } else if (const auto key = self->sec.key_of(item)) {
+                certificates = false;
+                if (!key->is_private) blocks.emplace_back("PUBLIC KEY", key->spki());
+                else if (key->type == KeyMaterial::Type::rsa) blocks.emplace_back("RSA PRIVATE KEY", key->private_external());
+                else blocks.emplace_back("EC PRIVATE KEY", key->sec1());
+            } else {
+                return answer(status::unimplemented);   // identities (PKCS#12) and other items
+            }
+        }
+        if (format == format_unknown) format = blocks.size() > 1 ? format_pem_sequence : certificates ? format_x509 : format_openssl;
+        if (format == format_x509 && !certificates) return answer(status::param);
+        if (format == format_openssl && certificates) return answer(status::param);
+        if (format != format_x509 && format != format_openssl && format != format_pem_sequence) return answer(status::unimplemented);
+        Bytes output;
+        if (format == format_pem_sequence || armour) {
+            for (const auto& [label, der] : blocks) {
+                const auto text = pem(label, der);
+                output.insert(output.end(), text.begin(), text.end());
+            }
+        } else {
+            if (blocks.size() != 1) return answer(status::param);   // DER holds one item
+            output = blocks[0].second;
+        }
+        m.write64(s.x[4], self->b.data(output));
+        answer(status::success);
     });
 
     // OSStatus SecItemImport(CFDataRef importedData, CFStringRef fileNameOrExtension,

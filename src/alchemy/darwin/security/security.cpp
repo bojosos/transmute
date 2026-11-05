@@ -188,6 +188,7 @@ void install_security(InstallContext& context) {
         instance = provider;
     }
     install_certificates(*provider);
+    install_certificate_values(*provider);
     install_keys(*provider);
     install_keychain(*provider);
     install_secure_transport(*provider);
