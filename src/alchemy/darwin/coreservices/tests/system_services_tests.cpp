@@ -211,6 +211,18 @@ void fsevents(Fixture& f) {
     require(info == 0x1234, "callback info: " + std::to_string(info.load()));
     const auto latest = f.call(cs, "_FSEventStreamGetLatestEventId", {stream}), current = f.call(cs, "_FSEventsGetCurrentEventId");
     require(latest > 0 && current >= latest, "event ids: latest " + std::to_string(latest) + ", current " + std::to_string(current));
+    // The last id before a time: none before 2001, the current one before a time far ahead.
+    const auto before = [&](double time) {
+        alchemy::CallRegs registers{};
+        registers.x[0] = 0;
+        registers.set_d(0, time);
+        return f.regs(cs, "_FSEventsGetLastEventIdForDeviceBeforeTime", registers).x0;
+    };
+    require(before(-1.0) == 0 && before(1e10) >= current, "FSEventsGetLastEventIdForDeviceBeforeTime");
+    require(f.call(cs, "_FSEventsCopyUUIDForDevice", {0}) == 0 && f.call(cs, "_FSEventsPurgeEventsForDeviceUpToEventId", {0, current}) == 0,
+            "no event store, and purging needs root");
+    const auto description = f.cf.utf8(f.call(cs, "_FSEventStreamCopyDescription", {stream}));
+    require(description.find("pathsToWatch") != std::string::npos && description.find(directory) != std::string::npos, "FSEventStreamCopyDescription");
     static_cast<void>(f.call(cs, "_FSEventStreamStop", {stream}));
     static_cast<void>(f.call(cs, "_FSEventStreamInvalidate", {stream}));
     static_cast<void>(f.call(cs, "_FSEventStreamRelease", {stream}));

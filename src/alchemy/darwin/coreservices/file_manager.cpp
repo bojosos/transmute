@@ -28,6 +28,13 @@
 //     kind, extension, invisibility (a leading dot or UF_HIDDEN); file
 //     types and creators are '????'. LSSetItemAttribute changes nothing:
 //     kLSAttributeNotSettableErr.
+//   - Metadata: MDItemCreate / MDItemCreateWithURL make an item for an
+//     existing path whose attributes are the file system's (kMDItemPath,
+//     FSName, DisplayName, ContentType, ContentTypeTree, Kind, FSSize, the
+//     creation and change dates, FSInvisible, and a bundle's
+//     CFBundleIdentifier), as for an item no Spotlight index has seen. There
+//     is no index, so queries cannot run: MDQueryCreate makes a query whose
+//     MDQueryExecute returns false, with no results.
 // Struct layouts follow the Carbon headers' 2-byte packing (MacTypes.h).
 namespace alchemy::gui::fill {
 namespace {
@@ -41,6 +48,10 @@ constexpr std::uint32_t fsref_magic = 0x52465341;   // "ASFR" little-endian
 constexpr std::uint64_t mac_epoch_offset = 2082844800;   // seconds from 1904-01-01 to 1970-01-01 (UTC)
 constexpr std::uint16_t mode_type = 0170000, mode_directory = 0040000, mode_link = 0120000;
 constexpr std::uint32_t uf_hidden = 0x8000;
+constexpr double unix_to_absolute = 978307200.0;   // seconds from 1970-01-01 to 2001-01-01
+
+struct MetadataItem final : ObjectPayload { std::string path; };
+struct MetadataQuery final : ObjectPayload { std::string text; };
 
 struct Stat {
     std::uint16_t mode{};
@@ -265,6 +276,42 @@ public:
         return name;
     }
 
+    // The metadata attributes of an item: (kMDItem name, +1 value), in a fixed order.
+    std::vector<std::pair<std::string, Address>> metadata(const std::string& path) {
+        std::vector<std::pair<std::string, Address>> out;
+        const auto value = item(path);
+        if (!value) return out;
+        const auto date = [&](std::int64_t seconds, std::uint32_t nanoseconds) {
+            return cf.date(static_cast<double>(seconds) + nanoseconds / 1e9 - unix_to_absolute);
+        };
+        out.emplace_back("kMDItemPath", cf.string(path));
+        out.emplace_back("kMDItemFSName", cf.string(value->name));
+        out.emplace_back("kMDItemDisplayName", cf.string(display_name(*value)));
+        out.emplace_back("kMDItemContentType", cf.string(value->type));
+        std::vector<Address> tree{cf.string(value->type)};
+        for (const auto& parent : uti::supertypes(value->type)) tree.push_back(cf.string(parent));
+        out.emplace_back("kMDItemContentTypeTree", cf.array(tree));
+        for (const auto item : tree) release(item);
+        out.emplace_back("kMDItemKind", cf.string(kind(*value)));
+        if (!value->directory) out.emplace_back("kMDItemFSSize", cf.integer(value->info.size, 4));
+        out.emplace_back("kMDItemFSCreationDate", date(value->info.birth, value->info.birth_ns));
+        out.emplace_back("kMDItemFSContentChangeDate", date(value->info.modify, value->info.modify_ns));
+        out.emplace_back("kMDItemContentCreationDate", date(value->info.birth, value->info.birth_ns));
+        out.emplace_back("kMDItemContentModificationDate", date(value->info.modify, value->info.modify_ns));
+        out.emplace_back("kMDItemFSInvisible", retain(cf.boolean(value->invisible)));
+        if (value->package) {
+            const auto url = cf.file_url(path, true);
+            const auto bundle = call(core_foundation, "_CFBundleCreate", {0, url});
+            release(url);
+            if (bundle) {
+                if (const auto identifier = call(core_foundation, "_CFBundleGetIdentifier", {bundle}))
+                    out.emplace_back("kMDItemCFBundleIdentifier", retain(identifier));
+                release(bundle);
+            }
+        }
+        return out;
+    }
+
     void install();
 
 private:
@@ -481,6 +528,87 @@ void FileManager::install() {
         m.write32(s.x[2], flags);
         s.x[0] = 0;
     });
+
+    // ---- Metadata --------------------------------------------------------------------------------------
+    for (const auto* name : {"kMDItemPath", "kMDItemFSName", "kMDItemDisplayName", "kMDItemContentType", "kMDItemContentTypeTree",
+                             "kMDItemKind", "kMDItemFSSize", "kMDItemFSCreationDate", "kMDItemFSContentChangeDate",
+                             "kMDItemContentCreationDate", "kMDItemContentModificationDate", "kMDItemFSInvisible",
+                             "kMDItemCFBundleIdentifier"}) {
+        const auto symbol = "_" + std::string(name);
+        if (!has(core_services, symbol)) string(core_services, symbol, name);
+    }
+    const auto item_class = cls(core_services, "__MDItem", "NSObject");
+    const auto query_class = cls(core_services, "__MDQuery", "NSObject");
+    const auto make_item = [this, item_class](std::string path) -> Address {
+        while (path.size() > 1 && path.back() == '/') path.pop_back();
+        if (path.empty() || path[0] != '/' || !stat(path, false)) return 0;
+        const auto object = objc.allocate(item_class);
+        objc.host_state<MetadataItem>(object)->path = std::move(path);
+        return object;
+    };
+    // MDItemRef MDItemCreate(CFAllocatorRef, CFStringRef path); MDItemCreateWithURL(CFAllocatorRef, CFURLRef)
+    raw(core_services, "_MDItemCreate", [this, make_item](CpuState& s, GuestMemory&) { s.x[0] = s.x[1] ? make_item(cf.utf8(s.x[1])) : 0; });
+    raw(core_services, "_MDItemCreateWithURL", [this, make_item](CpuState& s, GuestMemory&) { s.x[0] = s.x[1] ? make_item(cf.url_path(s.x[1])) : 0; });
+    const auto item_path = [this](Address object) {
+        const auto value = object ? objc.find_host_state<MetadataItem>(object) : nullptr;
+        return value ? value->path : std::string();
+    };
+    // CFTypeRef MDItemCopyAttribute(MDItemRef, CFStringRef name)
+    raw(core_services, "_MDItemCopyAttribute", [this, item_path](CpuState& s, GuestMemory&) {
+        const auto path = item_path(s.x[0]);
+        const auto name = s.x[1] && !path.empty() ? cf.utf8(s.x[1]) : std::string();
+        Address result{};
+        for (const auto& [key, value] : metadata(path)) {
+            if (!result && key == name) result = value;
+            else release(value);
+        }
+        s.x[0] = result;
+    });
+    // CFDictionaryRef MDItemCopyAttributes(MDItemRef, CFArrayRef names); CFArrayRef MDItemCopyAttributeNames(MDItemRef)
+    raw(core_services, "_MDItemCopyAttributes", [this, item_path](CpuState& s, GuestMemory&) {
+        const auto path = item_path(s.x[0]);
+        if (path.empty() || !s.x[1]) { s.x[0] = 0; return; }
+        std::vector<std::string> wanted;
+        for (const auto name : cf.array_values(s.x[1])) wanted.push_back(cf.utf8(name));
+        std::vector<std::pair<Address, Address>> entries;
+        std::vector<Address> owned;
+        for (const auto& [key, value] : metadata(path)) {
+            owned.push_back(value);
+            if (std::find(wanted.begin(), wanted.end(), key) == wanted.end()) continue;
+            const auto name = cf.string(key);
+            owned.push_back(name);
+            entries.emplace_back(name, value);
+        }
+        s.x[0] = cf.dictionary(entries);
+        for (const auto object : owned) release(object);
+    });
+    raw(core_services, "_MDItemCopyAttributeNames", [this, item_path](CpuState& s, GuestMemory&) {
+        const auto path = item_path(s.x[0]);
+        if (path.empty()) { s.x[0] = 0; return; }
+        std::vector<Address> names;
+        for (const auto& [key, value] : metadata(path)) {
+            names.push_back(cf.string(key));
+            release(value);
+        }
+        s.x[0] = cf.array(names);
+        for (const auto name : names) release(name);
+    });
+    // MDQueryRef MDQueryCreate(CFAllocatorRef, CFStringRef queryString, CFArrayRef valueListAttrs, CFArrayRef sortingAttrs)
+    raw(core_services, "_MDQueryCreate", [this, query_class](CpuState& s, GuestMemory&) {
+        if (!s.x[1]) { s.x[0] = 0; return; }
+        const auto object = objc.allocate(query_class);
+        objc.host_state<MetadataQuery>(object)->text = cf.utf8(s.x[1]);
+        s.x[0] = object;
+    });
+    // Boolean MDQueryExecute(MDQueryRef, CFOptionFlags): no Spotlight index answers queries.
+    raw(core_services, "_MDQueryExecute", [this](CpuState& s, GuestMemory&) {
+        notice_once("Alchemy: MDQueryExecute: there is no Spotlight index; the query does not run\n");
+        s.x[0] = 0;
+    });
+    raw(core_services, "_MDQueryStop", [](CpuState&, GuestMemory&) {});
+    constant(core_services, "_MDQueryGetResultCount", 0);
+    constant(core_services, "_MDQueryGetResultAtIndex", 0);
+    constant(core_services, "_MDQueryCopyValueOfAttribute", 0);
 }
 
 } // namespace

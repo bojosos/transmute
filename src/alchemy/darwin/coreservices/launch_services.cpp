@@ -12,7 +12,7 @@
 //   UTTypeIsDynamic and UTTypeCopyDeclaringBundleURL (the system types are
 //   CoreTypes.bundle's) answer from the UTI table. The item queries over
 //   FSRefs and URLs are file_manager.cpp's.
-// - Spotlight items cannot be created; Time Machine excludes nothing.
+// - Spotlight attributes cannot be set; Time Machine excludes nothing.
 // - Component Manager: no components (OpenDefaultComponent returns NULL).
 // The Qt WebEngine images first imported them (moved from
 // darwin/identities/system_gaps.cpp); installed by the fill-only kit
@@ -77,8 +77,7 @@ void LaunchServices::install() {
     string(core_services, "_kLSQuarantineTypeKey", "LSQuarantineType");
     string(core_services, "_kLSQuarantineTypeOtherDownload", "LSQuarantineTypeOtherDownload");
     string(core_services, "_kLSQuarantineTypeWebDownload", "LSQuarantineTypeWebDownload");
-    // Spotlight is not available.
-    constant(core_services, "_MDItemCreate", 0);
+    // Spotlight metadata cannot be set (MDItemSetAttribute below); items and queries are file_manager.cpp's.
     string(core_services, "_kMDItemWhereFroms", "kMDItemWhereFroms");
     // Private calls: no compatibility fixes and no LaunchServices connection exist.
     raw(core_services, "__CSCheckFixDisable", [](CpuState&, GuestMemory&) {});

@@ -8,6 +8,7 @@
 #include <bit>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <thread>
@@ -33,8 +34,15 @@
 // or of CFDictionaries {path, fileID} (UseExtendedData; fileID is 0: the
 // host's file ids are not exposed). Event ids count up from 1 per process.
 //
+// FSEventStreamCopyDescription / FSEventStreamShow describe a stream (Show
+// writes it to stderr). FSEventsGetLastEventIdForDeviceBeforeTime answers
+// from the times this process's event ids were issued (ids are per process,
+// not per device).
+//
 // Not provided: history (sinceWhen other than kFSEventStreamEventIdSinceNow
-// replays nothing; no HistoryDone event is sent), device-relative streams
+// replays nothing; no HistoryDone event is sent), so no device has an event
+// store (FSEventsCopyUUIDForDevice: NULL) and purging one needs root
+// (FSEventsPurgeEventsForDeviceUpToEventId: false); device-relative streams
 // (FSEventStreamCreateRelativeToDevice fails: NULL), IgnoreSelf / MarkSelf
 // (own events are not told apart), and root-path change tracking (WatchRoot).
 namespace alchemy::gui::values {
@@ -48,6 +56,30 @@ constexpr std::uint32_t flag_must_scan_subdirs = 0x1, flag_user_dropped = 0x2, i
     item_renamed = 0x800, item_modified = 0x1000, item_is_file = 0x10000, item_is_dir = 0x20000;
 
 std::atomic<std::uint64_t> last_event_id{0};
+
+// When event ids were issued: (CFAbsoluteTime, the last id issued then), one entry per issuing moment, the last 4096.
+std::mutex issued_mutex;
+std::deque<std::pair<double, std::uint64_t>> issued;
+
+std::uint64_t issue_event_id() {
+    const auto id = ++last_event_id;
+    const auto now = CoreFoundation::absolute_time_now();
+    std::lock_guard lock(issued_mutex);
+    if (!issued.empty() && issued.back().first == now) issued.back().second = id;
+    else issued.emplace_back(now, id);
+    if (issued.size() > 4096) issued.pop_front();
+    return id;
+}
+// The last id issued before `time` (0: none).
+std::uint64_t last_id_before(double time) {
+    std::lock_guard lock(issued_mutex);
+    std::uint64_t result = 0;
+    for (const auto& [when, id] : issued) {
+        if (when >= time) break;
+        result = id;
+    }
+    return result;
+}
 
 struct Event {
     std::string path;
@@ -203,7 +235,7 @@ void Provider::install_fsevents() {
             for (const auto& exclusion : state->exclusions) if (under(trimmed(path), exclusion)) return;
             for (auto& event : state->pending)
                 if (event.path == path) { event.flags |= event_flags; return; }
-            state->pending.push_back({std::move(path), event_flags, ++last_event_id});
+            state->pending.push_back({std::move(path), event_flags, issue_event_id()});
         };
         auto first_pending = std::chrono::steady_clock::time_point::max();
         for (;;) {
@@ -428,6 +460,39 @@ void Provider::install_fsevents() {
         s.x[0] = state->latest;
     });
     raw(core_services, "_FSEventsGetCurrentEventId", [](CpuState& s, GuestMemory&) { s.x[0] = last_event_id.load(); });
+    // FSEventStreamEventId FSEventsGetLastEventIdForDeviceBeforeTime(dev_t, CFAbsoluteTime time (d0))
+    raw(core_services, "_FSEventsGetLastEventIdForDeviceBeforeTime", [](CpuState& s, GuestMemory&) {
+        s.x[0] = last_id_before(std::bit_cast<double>(s.v[0][0]));
+    });
+    // CFUUIDRef FSEventsCopyUUIDForDevice(dev_t): no device keeps an event store here.
+    raw(core_services, "_FSEventsCopyUUIDForDevice", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    // Boolean FSEventsPurgeEventsForDeviceUpToEventId(dev_t, FSEventStreamEventId): only root may purge.
+    raw(core_services, "_FSEventsPurgeEventsForDeviceUpToEventId", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    // CFStringRef FSEventStreamCopyDescription(ConstFSEventStreamRef); void FSEventStreamShow(ConstFSEventStreamRef)
+    const auto describe = [state_of](Address object) {
+        const auto state = state_of(object);
+        std::lock_guard lock(state->mutex);
+        char head[160];
+        std::snprintf(head, sizeof(head), "FSEventStreamRef @ 0x%llx:\n   callback = 0x%llx\n   context = {info = 0x%llx}\n   numPathsToWatch = %zu\n",
+                      static_cast<unsigned long long>(object), static_cast<unsigned long long>(state->callback),
+                      static_cast<unsigned long long>(state->info), state->paths.size());
+        std::string text = head;
+        text += "   pathsToWatch = {\n";
+        for (std::size_t index = 0; index < state->paths.size(); ++index)
+            text += "      " + std::to_string(index) + ": " + state->paths[index] + "\n";
+        text += "   }\n";
+        char tail[160];
+        std::snprintf(tail, sizeof(tail), "   latestEventId = %llu\n   latency = %f (seconds)\n   flags = 0x%08x\n   started = %s\n",
+                      static_cast<unsigned long long>(state->latest), state->latency, state->flags, state->started ? "true" : "false");
+        return text + tail;
+    };
+    raw(core_services, "_FSEventStreamCopyDescription", [this, describe](CpuState& s, GuestMemory&) { s.x[0] = cf.string(describe(s.x[0])); });
+    raw(core_services, "_FSEventStreamShow", [this, describe](CpuState& s, GuestMemory&) {
+        const auto text = describe(s.x[0]);
+        const auto buffer = strdup(text);
+        static_cast<void>(call(fill::libsystem, "_write", {2, buffer, text.size()}));
+        free(buffer);
+    });
     raw(core_services, "_FSEventStreamCopyPathsBeingWatched", [this, state_of](CpuState& s, GuestMemory&) {
         const auto state = state_of(s.x[0]);
         std::vector<std::string> paths;

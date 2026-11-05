@@ -22,7 +22,6 @@ const Case coreservices_launch_services_case("coreservices_launch_services", [](
     require(f.call(cs, "_OpenDefaultComponent", {0x6f736120, 0x73637074}) == 0, "no OSA component");
     const auto excluded = f.block(1, 1);
     require(f.status(cs, "_CSBackupIsItemExcluded", {url, excluded}) == 0 && f.memory().read8(excluded) == 0, "nothing excluded");
-    require(f.call(cs, "_MDItemCreate", {0, string(f, "/tmp")}) == 0, "no Spotlight");
 });
 
 const Case coreservices_file_manager_case("coreservices_file_manager", [](Fixture& f) {
@@ -82,6 +81,23 @@ const Case coreservices_file_manager_case("coreservices_file_manager", [](Fixtur
     require(f.call(cs, "_UTTypeIsDeclared", {string(f, "public.plain-text")}) == 1 && f.call(cs, "_UTTypeIsDeclared", {string(f, "com.example.none")}) == 0,
             "UTTypeIsDeclared");
     require(f.call(cs, "_UTTypeCopyDeclaringBundleURL", {string(f, "public.jpeg")}) != 0, "UTTypeCopyDeclaringBundleURL");
+    // Metadata: file-system attributes; queries cannot run.
+    const auto md = f.call(cs, "_MDItemCreateWithURL", {0, f.cf.file_url(root + "/Example.app", true)});
+    require(md != 0, "MDItemCreateWithURL");
+    require(f.cf.utf8(f.call(cs, "_MDItemCopyAttribute", {md, string(f, "kMDItemFSName")})) == "Example.app" &&
+            f.cf.utf8(f.call(cs, "_MDItemCopyAttribute", {md, string(f, "kMDItemContentType")})) == "com.apple.application-bundle",
+            "MDItemCopyAttribute");
+    const auto tree = f.call(cs, "_MDItemCopyAttribute", {md, string(f, "kMDItemContentTypeTree")});
+    require(tree && f.cf.array_values(tree).size() >= 2, "kMDItemContentTypeTree");
+    require(f.call(cs, "_MDItemCopyAttribute", {md, string(f, "kMDItemNoSuchAttribute")}) == 0, "an absent attribute");
+    const auto names = f.call(cs, "_MDItemCopyAttributeNames", {md});
+    require(names && f.cf.array_values(names).size() >= 8, "MDItemCopyAttributeNames");
+    const auto some = f.call(cs, "_MDItemCopyAttributes", {md, f.cf.array(std::vector<Address>{string(f, "kMDItemPath"), string(f, "kMDItemKind")})});
+    require(some && f.cf.dictionary_value(some, string(f, "kMDItemKind")) != 0 && f.cf.dictionary_value(some, string(f, "kMDItemPath")) != 0,
+            "MDItemCopyAttributes");
+    require(f.call(cs, "_MDItemCreate", {0, string(f, root + "/missing")}) == 0, "no item for a missing path");
+    const auto query = f.call(cs, "_MDQueryCreate", {0, string(f, "kMDItemFSName == \"*.txt\""), 0, 0});
+    require(query && f.call(cs, "_MDQueryExecute", {query, 0}) == 0 && f.call(cs, "_MDQueryGetResultCount", {query}) == 0, "queries cannot run");
     std::filesystem::remove_all(host);
 });
 
