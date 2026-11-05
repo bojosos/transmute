@@ -45,6 +45,8 @@ void install_os_log(Support& support);
 void install_audio(Support& support);
 void install_key_value_coding(Support& support);
 void install_formatters(Support& support);
+// NSDateInterval, NSISO8601DateFormatter and the components / relative / interval formatters (foundation/date_formatters.cpp).
+void install_date_formatters(Support& support);
 void install_collections(Support& support);
 void install_json_serialization(Support& support);
 void install_constants(Support& support);

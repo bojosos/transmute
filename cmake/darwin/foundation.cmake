@@ -24,6 +24,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/foundation/number_format.cpp
     src/alchemy/darwin/foundation/date_format.cpp
     src/alchemy/darwin/foundation/formatters.cpp
+    src/alchemy/darwin/foundation/date_formatters.cpp
     src/alchemy/darwin/foundation/collections.cpp
     src/alchemy/darwin/foundation/json.cpp
     src/alchemy/darwin/foundation/json_serialization.cpp
@@ -197,3 +198,6 @@ alchemy_gui_add_framework_case(foundation_file_attribute_keys src/alchemy/darwin
 target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/foundation/class_shells_and_events.cpp
     src/alchemy/darwin/foundation/geometry.cpp)
+
+# NSDateInterval, NSISO8601DateFormatter, the components / relative / interval formatters, CFDateFormatter parsing.
+alchemy_gui_add_framework_case(foundation_date_classes src/alchemy/darwin/foundation/tests/date_classes_case.cpp)

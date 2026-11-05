@@ -35,6 +35,7 @@ void install_foundation_values_and_formats(support_kit::Support& support) {
     completion_kit::install_key_value_coding(support);
     completion_kit::install_collections(support);
     completion_kit::install_formatters(support);
+    completion_kit::install_date_formatters(support);
     completion_kit::install_json_serialization(support);
     completion_kit::install_constants(support);
     completion_kit::install_file_attributes(support);

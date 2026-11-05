@@ -1,5 +1,7 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
 
+#include "alchemy/darwin/foundation/date_format.hpp"
+
 #include "alchemy/host/locale.hpp"
 #include "alchemy/object_store.hpp"
 
@@ -13,13 +15,17 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
 // Locale-dependent CoreFoundation formatting Qt Core's system locale uses:
 // CFLocaleCopyDisplayNameForPropertyValue, CFDateFormatter
-// (style patterns, symbol properties, formatting a CFDate) and
+// (style patterns, symbol properties, formatting a CFDate, parsing a string
+// with NSDateFormatter's parser (foundation/date_format.cpp: month and day
+// names in English) in the default time zone, patterns from templates) and
 // CFNumberFormatter (styles, properties, formatting numbers). CFCalendar is
 // NSCalendar (foundation/calendar_provider.cpp).
 //
@@ -455,6 +461,64 @@ void install_cf_locale(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         no_allocator(s.x[0]);
         const auto value = date_formatter(s.x[1]);
         s.x[0] = cf.string(format_date(value->data, value->pattern_text, std::bit_cast<double>(s.v[0][0])));
+    });
+
+    // Parsing: the formatter's pattern over the text (or the range of it), in the default time zone at the parsed time.
+    const auto parse = [&cf, &process, date_formatter](std::uint64_t formatter, std::uint64_t string, std::uint64_t range) -> std::optional<double> {
+        const auto value = date_formatter(formatter);
+        if (!string) return std::nullopt;
+        const auto all = cf.units(string);
+        std::size_t start = 0, count = all.size();
+        auto& m = process.calling_engine();
+        if (range) {
+            const auto location = static_cast<std::int64_t>(m.read64(range)), length = static_cast<std::int64_t>(m.read64(range + 8));
+            if (location < 0 || length < 0 || static_cast<std::size_t>(location + length) > all.size()) return std::nullopt;
+            start = static_cast<std::size_t>(location);
+            count = static_cast<std::size_t>(length);
+        }
+        const std::u16string text(all.begin() + static_cast<std::ptrdiff_t>(start), all.begin() + static_cast<std::ptrdiff_t>(start + count));
+        const auto pattern_units = cf.units(value->pattern);
+        const std::u16string pattern(pattern_units.begin(), pattern_units.end());
+        namespace dates = gui::completion_kit::dates;
+        const auto now = CoreFoundation::absolute_time_now();
+        auto offset = local_time(now).offset;
+        std::optional<double> parsed;
+        try {
+            parsed = dates::parse(pattern, text, offset);
+            if (parsed) {   // the zone's offset at the parsed time (across a DST change)
+                const auto at = local_time(*parsed).offset;
+                if (at != offset) parsed = dates::parse(pattern, text, at);
+            }
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string("Alchemy CFDateFormatter parsing: ") + error.what());
+        }
+        if (parsed && range) m.write64(range + 8, count);   // the whole range was used
+        return parsed;
+    };
+    // CFDateRef CFDateFormatterCreateDateFromString(alloc, CFDateFormatterRef, CFStringRef, CFRange *rangep)
+    function("_CFDateFormatterCreateDateFromString", [&cf, parse, no_allocator](CpuState& s, GuestMemory&) {
+        no_allocator(s.x[0]);
+        const auto parsed = parse(s.x[1], s.x[2], s.x[3]);
+        s.x[0] = parsed ? cf.date(*parsed) : 0;
+    });
+    // Boolean CFDateFormatterGetAbsoluteTimeFromString(CFDateFormatterRef, CFStringRef, CFRange *rangep, CFAbsoluteTime *atp)
+    function("_CFDateFormatterGetAbsoluteTimeFromString", [parse](CpuState& s, GuestMemory& m) {
+        const auto parsed = parse(s.x[0], s.x[1], s.x[2]);
+        if (parsed && s.x[3]) m.write64(s.x[3], std::bit_cast<std::uint64_t>(*parsed));
+        s.x[0] = parsed ? 1 : 0;
+    });
+    // CFStringRef CFDateFormatterCreateDateFormatFromTemplate(alloc, CFStringRef template, CFOptionFlags, CFLocaleRef):
+    // en_US patterns for every locale (as NSDateFormatter's templates).
+    function("_CFDateFormatterCreateDateFormatFromTemplate", [&cf, no_allocator](CpuState& s, GuestMemory&) {
+        no_allocator(s.x[0]);
+        if (!s.x[1]) { s.x[0] = 0; return; }
+        const auto units = cf.units(s.x[1]);
+        try {
+            const auto pattern = gui::completion_kit::dates::pattern_from_template(std::u16string(units.begin(), units.end()));
+            s.x[0] = cf.string_utf16(std::span(reinterpret_cast<const std::uint16_t*>(pattern.data()), pattern.size()));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string("Alchemy CFDateFormatter template: ") + error.what());
+        }
     });
 
     // ---- CFNumberFormatter ----
