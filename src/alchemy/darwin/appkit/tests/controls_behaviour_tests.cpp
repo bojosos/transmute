@@ -12,6 +12,7 @@
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/foundation_bridge.hpp"
 #include "alchemy/darwin/kit/completion/completion_kit.hpp"
+#include "alchemy/darwin/kit/completion/runtime/common.hpp"
 #include "alchemy/darwin/appkit/controls/layout.hpp"
 #include "alchemy/darwin/appkit/drawing.hpp"
 #include "alchemy/darwin/coregraphics/quartz2d.hpp"
@@ -73,6 +74,12 @@ struct Fixture {
         gui::install_quartz2d(context);   // the CoreText layer (NSAttributedString, NSParagraphStyle) the text system builds on
         gui::install_support_kit(context); // libobjc gap fillers (associated objects) installed before the QLab groups
         support = std::make_shared<gui::completion_kit::Support>(process, objc, cf);
+        // Bindings and the controllers, with the KVC / KVO they build on (the runtime group's, installed before the controls).
+        gui::completion_kit::install_key_value_coding(*support);
+        gui::completion_kit::install_collections(*support);
+        gui::completion_kit::install_key_value_observing(*support);
+        gui::completion_kit::install_bindings(*support);
+        gui::completion_kit::install_kvc_collections(*support);
         gui::completion_kit::install_group_controls(*support);
         app = id(cls("NSApplication"), "sharedApplication");
         static_cast<void>(id(app, "finishLaunching"));
@@ -2244,6 +2251,94 @@ void compositional(Fixture& f) {
     require(is_frame(f.send(f.id(f.id(view, "itemAtIndexPath:", {path(2, 1)}), "view"), "frame"), 100, 143, 100, 60), "item views follow the layout");
 }
 
+// ---- NSTableView / NSOutlineView content bindings -------------------------------------------------
+void table_bindings(Fixture& f) {
+    struct Model { std::map<Address, Address> name, items; };
+    static Model model;
+    model = {};
+    const auto item_class = f.subclass("TestU30Item", "NSObject");
+    f.add(item_class, "name", [](CpuState& s, GuestMemory&) { s.x[0] = model.name[s.x[0]]; }, "@@:");
+    f.add(item_class, "setName:", [](CpuState& s, GuestMemory&) { model.name[s.x[0]] = s.x[2]; }, "v@:@");
+    f.add(item_class, "items", [](CpuState& s, GuestMemory&) { s.x[0] = model.items[s.x[0]]; }, "@@:");
+    f.add(item_class, "setItems:", [&f](CpuState& s, GuestMemory&) { model.items[s.x[0]] = s.x[2] ? f.id(s.x[2], "copy") : 0; }, "v@:@");
+    const auto item = [&](const char* name, std::vector<Address> children) {
+        const auto made = f.id(f.id(item_class, "alloc"), "init");
+        static_cast<void>(f.id(made, "setName:", {f.str(name)}));
+        static_cast<void>(f.id(made, "setItems:", {f.cf.array(children)}));
+        return made;
+    };
+    const auto bind = [&](Address receiver, const char* name, Address observed, const char* path) {
+        static_cast<void>(f.id(receiver, "bind:toObject:withKeyPath:options:", {f.str(name), observed, f.str(path), 0}));
+    };
+    const auto indexes = [&](Address set) {
+        std::string out;
+        for (auto index = f.id(set, "firstIndex"); index != ~0ull >> 1; index = f.id(set, "indexGreaterThanIndex:", {index}))
+            out += (out.empty() ? "" : ",") + std::to_string(index);
+        return out;
+    };
+
+    // A table over an array controller: content, a column's value, the selection both ways, edits.
+    const auto x = item("x", {}), y = item("y", {}), z = item("z", {});
+    const auto controller = f.id(f.id(f.cls("NSArrayController"), "alloc"), "init");
+    static_cast<void>(f.id(controller, "setContent:", {f.cf.array(std::vector<Address>{x, y, z}, true)}));
+    const auto table = f.with_rect(f.id(f.cls("NSTableView"), "alloc"), "initWithFrame:", {{0, 0}, {200, 120}});
+    const auto column = f.id(f.id(f.cls("NSTableColumn"), "alloc"), "initWithIdentifier:", {f.str("name")});
+    static_cast<void>(f.id(table, "addTableColumn:", {column}));
+    static_cast<void>(f.id(table, "setAllowsMultipleSelection:", {1}));
+    bind(table, "content", controller, "arrangedObjects");
+    bind(table, "selectionIndexes", controller, "selectionIndexes");
+    bind(column, "value", controller, "arrangedObjects.name");
+    require(f.integer(table, "numberOfRows") == 3, "the bound table's rows: " + std::to_string(f.integer(table, "numberOfRows")));
+    const auto value = [&](Address row) { return f.text(f.id(table, "_alchemyObjectValue:row:", {column, row})); };
+    require(value(1) == "y", "a column's value binding per row: " + value(1));
+    require(indexes(f.id(table, "selectedRowIndexes")) == "0", "the controller's selection reaches the table");
+    static_cast<void>(f.id(table, "selectRowIndexes:byExtendingSelection:", {f.id(f.cls("NSIndexSet"), "indexSetWithIndex:", {2}), 0}));
+    require(indexes(f.id(controller, "selectionIndexes")) == "2" && f.text(model.name[f.id(f.id(controller, "selectedObjects"), "objectAtIndex:", {0})]) == "z",
+            "the table's selection reaches the controller");
+    static_cast<void>(f.id(f.id(table, "dataSource"), "tableView:setObjectValue:forTableColumn:row:", {table, f.str("w"), column, 0}));
+    require(f.id(table, "dataSource") == 0 && f.text(model.name[x]) == "x", "-dataSource is the application's (none)");
+    static_cast<void>(f.id(f.id(table, "_alchemyBindingSource"), "tableView:setObjectValue:forTableColumn:row:", {table, f.str("w"), column, 0}));
+    require(f.text(model.name[x]) == "w", "an edit goes back through the column's binding");
+    // New content: rows and the selection follow the controller.
+    const auto v = item("v", {});
+    static_cast<void>(f.id(controller, "insertObject:atArrangedObjectIndex:", {v, 0}));
+    require(f.integer(table, "numberOfRows") == 4 && value(0) == "v" && indexes(f.id(table, "selectedRowIndexes")) == "0",
+            "inserted content reloads the table: " + indexes(f.id(table, "selectedRowIndexes")));
+
+    // An outline view over a tree controller.
+    const auto a1 = item("a1", {}), a2 = item("a2", {});
+    const auto a = item("a", {a1, a2}), b = item("b", {});
+    const auto tree = f.id(f.id(f.cls("NSTreeController"), "alloc"), "init");
+    static_cast<void>(f.id(tree, "setChildrenKeyPath:", {f.str("items")}));
+    static_cast<void>(f.id(tree, "setContent:", {f.cf.array(std::vector<Address>{a, b}, true)}));
+    const auto outline = f.with_rect(f.id(f.cls("NSOutlineView"), "alloc"), "initWithFrame:", {{0, 0}, {200, 120}});
+    const auto outline_column = f.id(f.id(f.cls("NSTableColumn"), "alloc"), "initWithIdentifier:", {f.str("name")});
+    static_cast<void>(f.id(outline, "addTableColumn:", {outline_column}));
+    static_cast<void>(f.id(outline, "setOutlineTableColumn:", {outline_column}));
+    bind(outline, "content", tree, "arrangedObjects");
+    bind(outline, "selectionIndexPaths", tree, "selectionIndexPaths");
+    bind(outline_column, "value", tree, "arrangedObjects.name");
+    const auto outline_value = [&](Address row) { return f.text(f.id(outline, "_alchemyObjectValue:row:", {outline_column, row})); };
+    require(f.integer(outline, "numberOfRows") == 2 && outline_value(1) == "b" && f.integer(outline, "isExpandable:", {f.id(outline, "itemAtRow:", {0})}) == 1,
+            "the bound outline's top level");
+    // Selecting a nested index path in the controller expands its parent.
+    const auto path = f.id(f.id(f.cls("NSIndexPath"), "indexPathWithIndex:", {0}), "indexPathByAddingIndex:", {1});
+    static_cast<void>(f.id(tree, "setSelectionIndexPath:", {path}));
+    require(f.integer(outline, "numberOfRows") == 4 && outline_value(2) == "a2" && indexes(f.id(outline, "selectedRowIndexes")) == "2",
+            "the tree's selection expands and selects: " + indexes(f.id(outline, "selectedRowIndexes")));
+    // The user's selection goes back as index paths.
+    static_cast<void>(f.id(outline, "selectRowIndexes:byExtendingSelection:", {f.id(f.cls("NSIndexSet"), "indexSetWithIndex:", {3}), 0}));
+    require(f.text(model.name[f.id(f.id(tree, "selectedObjects"), "objectAtIndex:", {0})]) == "b", "the outline's selection reaches the tree controller");
+    // A model change rebuilds the tree; expanded items stay expanded.
+    const auto a3 = item("a3", {});
+    static_cast<void>(f.id(a, "setItems:", {f.cf.array(std::vector<Address>{a1, a2, a3})}));
+    require(f.integer(outline, "numberOfRows") == 5 && outline_value(3) == "a3" && indexes(f.id(outline, "selectedRowIndexes")) == "4",
+            "the outline follows its tree: " + std::to_string(f.integer(outline, "numberOfRows")));
+    for (const auto* name : {"value"}) static_cast<void>(f.id(column, "unbind:", {f.str(name)}));
+    for (const auto* name : {"content", "selectionIndexes"}) static_cast<void>(f.id(table, "unbind:", {f.str(name)}));
+    for (const auto* name : {"content", "selectionIndexPaths"}) static_cast<void>(f.id(outline, "unbind:", {f.str(name)}));
+}
+
 // ---- NSRulerView and NSScrollView rulers / insets -------------------------------------------------
 void rulers(Fixture& f) {
     const auto scroll = f.with_rect(f.id(f.cls("NSScrollView"), "alloc"), "initWithFrame:", {{0, 0}, {300, 200}});
@@ -2608,6 +2703,7 @@ int main() {
         collection_views(f);
         diffable_sources(f);
         compositional(f);
+        table_bindings(f);
         rulers(f);
         accessibility(f);
         small_additions(f);

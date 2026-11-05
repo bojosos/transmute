@@ -245,8 +245,24 @@ selection proxy). Insertions, removals and moves edit the model through
 index of an insertion counts in the model's order, and a move's destination
 is a path in the tree without the moved nodes. The count key path is kept but
 not used (children are read at once). A tree controller decoded from a nib
-fails explicitly: its archive keys are not documented. NSOutlineView and
-NSTableView do not take content bindings yet.
+fails explicitly: its archive keys are not documented.
+
+**Table and outline bindings** (`containers.cpp`'s `install_table_bindings`,
+`bindings.cpp`): NSTableView's "content" (an array controller's
+arrangedObjects) and "selectionIndexes", NSOutlineView's "content" (a tree
+controller's arrangedObjects: its NSTreeNodes are the items) and
+"selectionIndexPaths" (expanding the selected items' ancestors), and a
+column's "value" ("arrangedObjects.<key path>", resolved per row, with the
+binding's value transformer and placeholders; edits go back through it).
+While content is bound the table asks it, not its data source (-dataSource
+still answers the application's). The user's selection goes back to the
+selection binding. Expanded outline items stay expanded across new content
+(by represented object). Without a column binding a row's object value is the
+row's object (an outline item's represented object), and view-based cell
+views get it as their objectValue (as with a data source answering object
+values). Model objects' own key changes show when the table next reads them;
+the other table bindings (sortDescriptors, enabled, font, ...) are not
+provided.
 
 **Token fields** (`controls/token_field.cpp`): NSTokenField's value is an
 array of represented objects drawn as pills (plain text for

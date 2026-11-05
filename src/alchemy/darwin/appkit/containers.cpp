@@ -103,6 +103,12 @@ struct TableState final : ControlState {
     std::set<Address> expanded;                           // items retained while expanded? (not retained: data-source owned)
     Address outline_column{};
     double indentation{16};
+    // Cocoa bindings (install_table_bindings): the bound content (+1), the
+    // source answering from it (+1, the data source while bound) and the
+    // application's own data source, kept for -dataSource.
+    Address bound_content{}, bound_source{}, app_source{};
+    std::vector<Address> bound_rows;                      // the content's rows (tables), as of the last -setContent:
+    bool applying_selection{};
 };
 struct HeaderState final : ObjectPayload { Address table{}; };
 // NSTableRowView: its table and row, the drawing state the table gives it.
@@ -1498,13 +1504,22 @@ void AppKit::install_tables(Address header_cell_class) {
                 for (auto& [row, value] : std::exchange(typed->row_views, {})) release(value);
                 for (auto& [key, list] : std::exchange(typed->reuse, {})) for (const auto value : list) release(value);
                 for (auto& [key, value] : std::exchange(typed->registered_nibs, {})) release(value);
+                release(std::exchange(typed->bound_content, 0));
+                release(std::exchange(typed->bound_source, 0));
             }
         static_cast<void>(objc.send_super(s.x[0], table_view, sel("dealloc")));
     }, "v@:");
     method(tv, "isFlipped", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
     method(tv, "acceptsFirstResponder", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
-    method(tv, "dataSource", [table_of](CpuState& s, GuestMemory&) { s.x[0] = table_of(s.x[0])->data_source; });
-    method(tv, "setDataSource:", [table_of](CpuState& s, GuestMemory&) { table_of(s.x[0])->data_source = s.x[2]; }, "v@:@");
+    method(tv, "dataSource", [table_of](CpuState& s, GuestMemory&) {
+        const auto state = table_of(s.x[0]);
+        s.x[0] = state->bound_source ? state->app_source : state->data_source;
+    });
+    // While content is bound, the bound content answers and the data source is only kept.
+    method(tv, "setDataSource:", [table_of](CpuState& s, GuestMemory&) {
+        const auto state = table_of(s.x[0]);
+        (state->bound_source ? state->app_source : state->data_source) = s.x[2];
+    }, "v@:@");
     method(tv, "delegate", [table_of](CpuState& s, GuestMemory&) { s.x[0] = table_of(s.x[0])->table_delegate; });
     method(tv, "setDelegate:", [table_of](CpuState& s, GuestMemory&) { table_of(s.x[0])->table_delegate = s.x[2]; }, "v@:@");
     method(tv, "doubleAction", [table_of](CpuState& s, GuestMemory&) { s.x[0] = table_of(s.x[0])->double_action; }, ":@:");
@@ -1783,6 +1798,9 @@ void AppKit::install_tables(Address header_cell_class) {
         const auto made = send_id(self, "_alchemyViewFor:row:", {state->columns[column], static_cast<Address>(row)});
         if (!made) { s.x[0] = 0; return; }
         state->cell_views[key] = retain(made);
+        if (state->data_source && responds(made, "setObjectValue:") &&
+            responds(state->data_source, is_kind(self, outline_view) ? "outlineView:objectValueForTableColumn:byItem:" : "tableView:objectValueForTableColumn:row:"))
+            static_cast<void>(send_id(made, "setObjectValue:", {send_id(self, "_alchemyObjectValue:row:", {state->columns[column], static_cast<Address>(row)})}));
         CallRegs frame;
         frame.x[2] = column; frame.x[3] = static_cast<Address>(row);
         auto rect = result_rect(send(self, "frameOfCellAtColumn:row:", frame));
@@ -1923,6 +1941,7 @@ void AppKit::install_tables(Address header_cell_class) {
         const bool outline = is_kind(self, outline_view);
         post(outline ? "NSOutlineViewSelectionDidChangeNotification" : "NSTableViewSelectionDidChangeNotification", self, delegate,
              outline ? "outlineViewSelectionDidChange:" : "tableViewSelectionDidChange:");
+        if (responds(self, "_alchemySelectionDidChange")) static_cast<void>(send(self, "_alchemySelectionDidChange"));   // bindings (install_table_bindings)
     };
     method(tv, "selectedRow", [table_of](CpuState& s, GuestMemory&) {
         const auto& selection = table_of(s.x[0])->selection;
@@ -2615,7 +2634,10 @@ void AppKit::install_container_coding() {
 // cell and the accessibility getters; NSOutlineView's item-level updates and
 // drop targets; NSScroller parts; NSScrollView rulers, insets and floating
 // subviews.
+void install_table_bindings(AppKit& kit);
+
 void install_container_additions(AppKit& kit) {
+    install_table_bindings(kit);
     auto* const k = &kit;
     const auto table_of = [k](Address value) { return k->extension<TableState>(value); };
     const auto row_of = [k](Address value) { return k->extension<RowViewState>(value); };
@@ -2832,6 +2854,7 @@ void install_container_additions(AppKit& kit) {
         if (state->selection != before) {
             k->invalidate_view(self);
             k->post("NSOutlineViewSelectionDidChangeNotification", self, state->table_delegate, "outlineViewSelectionDidChange:");
+            if (k->responds(self, "_alchemySelectionDidChange")) static_cast<void>(k->send(self, "_alchemySelectionDidChange"));
         }
     };
     for (const auto* name : {"insertItemsAtIndexes:inParent:withAnimation:", "removeItemsAtIndexes:inParent:withAnimation:"})
@@ -2966,6 +2989,190 @@ void install_container_additions(AppKit& kit) {
         static_cast<void>(k->send_id(state->clip, "addSubview:", {s.x[2]}));
         static_cast<void>(k->send_id(self, "reflectScrolledClipView:", {state->clip}));
     }, "v@:@q");
+}
+
+// Cocoa bindings for NSTableView and NSOutlineView (Bindings Reference):
+// * "content" (an array controller's or array's arrangedObjects; for an
+//   outline view, a tree controller's arrangedObjects: NSTreeNodes) arrives
+//   through KVC as -setContent:. A source object then answers the table's
+//   data-source questions from it (the application's data source is kept for
+//   -dataSource but not asked). Outline items are the tree nodes; expanded
+//   items stay expanded across new content (by represented object).
+// * A column's "value" binding (to "arrangedObjects.<key path>") is resolved
+//   per row by bindings.cpp: <key path> of the row's object (an outline
+//   item's represented object). Edits go back the same way. Without one, a
+//   row's object value is the row's object (the represented object).
+// * "selectionIndexes" (tables) / "selectionIndexPaths" (outline views,
+//   expanding the selected items' ancestors) arrive through KVC, and the
+//   user's selection goes back through -_alchemyPropagateValue:forBinding:.
+// * View-based cell views get their row's object value as objectValue.
+// Model objects' own key changes are seen when the table next reads them
+// (content changes reload it).
+void install_table_bindings(AppKit& kit) {
+    auto* const k = &kit;
+    const auto table_of = [k](Address value) { return k->extension<TableState>(value); };
+    const auto values_of = [k](Address array_object) {
+        std::vector<Address> out;
+        if (!array_object) return out;
+        const auto count = k->send_id(array_object, "count");
+        for (Address i = 0; i < count; ++i) out.push_back(k->send_id(array_object, "objectAtIndex:", {i}));
+        return out;
+    };
+    // The rows of bound content: an array, a tree root's child nodes, or a set.
+    const auto rows_of = [k, values_of](Address content) -> std::vector<Address> {
+        if (!content || content == k->send_id(k->objc.find_class("NSNull"), "null")) return {};
+        if (k->responds(content, "objectAtIndex:")) return values_of(content);
+        if (k->responds(content, "childNodes")) return values_of(k->send_id(content, "childNodes"));
+        if (k->responds(content, "allObjects")) return values_of(k->send_id(content, "allObjects"));
+        return {};
+    };
+    const auto children_of = [k, table_of, values_of, rows_of](Address table, Address item) -> std::vector<Address> {
+        if (!item) return rows_of(table_of(table)->bound_content);
+        return k->responds(item, "childNodes") ? values_of(k->send_id(item, "childNodes")) : std::vector<Address>{};
+    };
+    const auto represented = [k](Address item) { return item && k->responds(item, "representedObject") ? k->send_id(item, "representedObject") : item; };
+    const auto has_binding = [k](Address object, const char* name) { return object && k->send_id(object, "infoForBinding:", {k->auto_string(name)}) != 0; };
+    const auto column_value = [k, has_binding](Address column, Address object) {
+        if (!has_binding(column, "value")) return object;
+        return k->send_id(column, "_alchemyValueForBinding:ofObject:", {k->auto_string("value"), object});
+    };
+    const auto set_column_value = [k, has_binding](Address column, Address object, Address value) {
+        if (has_binding(column, "value")) static_cast<void>(k->send_id(column, "_alchemySetValue:forBinding:ofObject:", {value, k->auto_string("value"), object}));
+    };
+
+    // ---- the source answering from bound content ----
+    const auto source = kit.declare_class("_AlchemyTableContentSource", "NSObject");
+    kit.method(source, "numberOfRowsInTableView:", [table_of](CpuState& s, GuestMemory&) { s.x[0] = table_of(s.x[2])->bound_rows.size(); }, "q@:@");
+    kit.method(source, "tableView:objectValueForTableColumn:row:", [table_of, column_value](CpuState& s, GuestMemory&) {
+        const auto& rows = table_of(s.x[2])->bound_rows;
+        s.x[0] = s.x[4] < rows.size() ? column_value(s.x[3], rows[s.x[4]]) : 0;
+    }, "@@:@@q");
+    kit.method(source, "tableView:setObjectValue:forTableColumn:row:", [table_of, set_column_value](CpuState& s, GuestMemory&) {
+        const auto rows = table_of(s.x[2])->bound_rows;
+        if (s.x[5] < rows.size()) set_column_value(s.x[4], rows[s.x[5]], s.x[3]);
+    }, "v@:@@@q");
+    kit.method(source, "outlineView:numberOfChildrenOfItem:", [children_of](CpuState& s, GuestMemory&) { s.x[0] = children_of(s.x[2], s.x[3]).size(); }, "q@:@@");
+    kit.method(source, "outlineView:child:ofItem:", [children_of](CpuState& s, GuestMemory&) {
+        const auto children = children_of(s.x[2], s.x[4]);
+        s.x[0] = s.x[3] < children.size() ? children[s.x[3]] : 0;
+    }, "@@:@q@");
+    kit.method(source, "outlineView:isItemExpandable:", [k, children_of](CpuState& s, GuestMemory&) {
+        const auto item = s.x[3];
+        if (item && k->responds(item, "isLeaf")) { s.x[0] = (k->send(item, "isLeaf").x0 & 0xff) ? 0 : 1; return; }
+        s.x[0] = !children_of(s.x[2], item).empty();
+    }, "B@:@@");
+    kit.method(source, "outlineView:objectValueForTableColumn:byItem:", [column_value, represented](CpuState& s, GuestMemory&) {
+        s.x[0] = column_value(s.x[3], represented(s.x[4]));
+    }, "@@:@@@");
+    kit.method(source, "outlineView:setObjectValue:forTableColumn:byItem:", [set_column_value, represented](CpuState& s, GuestMemory&) {
+        set_column_value(s.x[4], represented(s.x[5]), s.x[3]);
+    }, "v@:@@@@");
+
+    // ---- content ----
+    const auto tv = kit.table_view;
+    const auto ov = kit.outline_view;
+    // Selection bindings read again (new content renumbers rows).
+    const auto apply_selection_binding = [k](Address self) {
+        const bool outline = k->is_kind(self, k->outline_view);
+        const auto info = k->send_id(self, "infoForBinding:", {k->auto_string(outline ? "selectionIndexPaths" : "selectionIndexes")});
+        if (!info) return;
+        const auto observed = k->send_id(info, "objectForKey:", {k->auto_string("NSObservedObject")});
+        const auto path = k->send_id(info, "objectForKey:", {k->auto_string("NSObservedKeyPath")});
+        const auto value = k->send_id(observed, "valueForKeyPath:", {path});
+        static_cast<void>(k->send_id(self, outline ? "setSelectionIndexPaths:" : "setSelectionIndexes:", {value}));
+    };
+    kit.method(tv, "content", [table_of](CpuState& s, GuestMemory&) { s.x[0] = table_of(s.x[0])->bound_content; }, "@@:");
+    // The source answering from bound content (nil while nothing is bound; an Alchemy SPI for tests).
+    kit.method(tv, "_alchemyBindingSource", [table_of](CpuState& s, GuestMemory&) { s.x[0] = table_of(s.x[0])->bound_source; }, "@@:");
+    kit.method(tv, "setContent:", [k, table_of, source, rows_of, represented, children_of, apply_selection_binding](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto state = table_of(self);
+        const bool outline = k->is_kind(self, k->outline_view);
+        std::vector<Address> was_expanded;
+        if (outline) for (const auto item : state->expanded) was_expanded.push_back(represented(item));
+        k->assign(state->bound_content, s.x[2]);
+        if (!state->bound_source) {
+            state->bound_source = k->alloc_init(source);
+            state->app_source = std::exchange(state->data_source, state->bound_source);
+        }
+        state->bound_rows = outline ? std::vector<Address>{} : rows_of(state->bound_content);
+        if (outline) {
+            state->expanded.clear();
+            const std::function<void(Address, int)> walk = [&](Address item, int depth) {
+                if (depth > 256) return;
+                for (const auto child : children_of(self, item)) {
+                    if (std::find(was_expanded.begin(), was_expanded.end(), represented(child)) == was_expanded.end()) continue;
+                    state->expanded.insert(child);
+                    walk(child, depth + 1);
+                }
+            };
+            if (!was_expanded.empty()) walk(0, 0);
+        }
+        static_cast<void>(k->send(self, "reloadData"));
+        state->applying_selection = true;
+        try { apply_selection_binding(self); } catch (...) { state->applying_selection = false; throw; }
+        state->applying_selection = false;
+    }, "v@:@");
+
+    // ---- selection ----
+    kit.method(tv, "selectionIndexes", [k](CpuState& s, GuestMemory&) { s.x[0] = k->send_id(s.x[0], "selectedRowIndexes"); }, "@@:");
+    kit.method(tv, "setSelectionIndexes:", [k, table_of](CpuState& s, GuestMemory&) {
+        const auto state = table_of(s.x[0]);
+        const auto empty = k->send_id(k->send_id(k->objc.find_class("NSIndexSet"), "alloc"), "init");
+        const bool was = std::exchange(state->applying_selection, true);
+        try {
+            static_cast<void>(k->send_id(s.x[0], "selectRowIndexes:byExtendingSelection:", {s.x[2] ? s.x[2] : empty, 0}));
+        } catch (...) { state->applying_selection = was; k->release(empty); throw; }
+        state->applying_selection = was;
+        k->release(empty);
+    }, "v@:@");
+    kit.method(ov, "selectionIndexPaths", [k, table_of](CpuState& s, GuestMemory&) {
+        const auto state = table_of(s.x[0]);
+        std::vector<Address> paths;
+        for (const auto row : state->selection)
+            if (row >= 0 && row < static_cast<std::int64_t>(state->outline_rows.size())) {
+                const auto item = state->outline_rows[static_cast<std::size_t>(row)].item;
+                if (item && k->responds(item, "indexPath")) paths.push_back(k->send_id(item, "indexPath"));
+            }
+        s.x[0] = k->auto_array(paths);
+    }, "@@:");
+    // The selected index paths' items, their ancestors expanded.
+    kit.method(ov, "setSelectionIndexPaths:", [k, table_of, values_of](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto state = table_of(self);
+        const auto root = state->bound_content;
+        std::vector<Address> items;
+        bool expanded_more = false;
+        for (const auto path : values_of(s.x[2])) {
+            if (!root || !k->responds(root, "descendantNodeAtIndexPath:")) break;
+            const auto item = k->send_id(root, "descendantNodeAtIndexPath:", {path});
+            if (!item) continue;
+            items.push_back(item);
+            for (auto parent = k->send_id(item, "parentNode"); parent && parent != root; parent = k->send_id(parent, "parentNode"))
+                expanded_more |= state->expanded.insert(parent).second;
+        }
+        if (expanded_more) static_cast<void>(k->send(self, "reloadData"));
+        const auto rows = k->send_id(k->send_id(k->objc.find_class("NSMutableIndexSet"), "alloc"), "init");
+        for (const auto item : items) {
+            const auto row = static_cast<std::int64_t>(k->send_id(self, "rowForItem:", {item}));
+            if (row >= 0) static_cast<void>(k->send_id(rows, "addIndex:", {static_cast<Address>(row)}));
+        }
+        const bool was = std::exchange(state->applying_selection, true);
+        try {
+            static_cast<void>(k->send_id(self, "selectRowIndexes:byExtendingSelection:", {rows, 0}));
+        } catch (...) { state->applying_selection = was; k->release(rows); throw; }
+        state->applying_selection = was;
+        k->release(rows);
+    }, "v@:@");
+    // The user's selection goes back to a selection binding.
+    kit.method(tv, "_alchemySelectionDidChange", [k, table_of, has_binding](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        if (table_of(self)->applying_selection) return;
+        const bool outline = k->is_kind(self, k->outline_view);
+        const char* name = outline ? "selectionIndexPaths" : "selectionIndexes";
+        if (!has_binding(self, name)) return;
+        static_cast<void>(k->send_id(self, "_alchemyPropagateValue:forBinding:", {k->send_id(self, name), k->auto_string(name)}));
+    }, "v@:");
 }
 
 } // namespace alchemy::gui::appkit

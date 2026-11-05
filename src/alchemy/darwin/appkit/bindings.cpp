@@ -24,6 +24,10 @@
 // -valueClassForBinding: and -optionDescriptionsForBinding: complete the
 // protocol. Bindings end when the receiver is deallocated.
 //
+// A table column's bindings ("value" to "arrangedObjects.name") are per row:
+// they are not observed; the table asks -_alchemyValueForBinding:ofObject:
+// for each row's object (containers.cpp's install_table_bindings).
+//
 // The view-to-model direction belongs to the bound control: after a user
 // edit it sends -_alchemyPropagateValue:forBinding: (an Alchemy SPI on
 // NSObject), which applies the reverse transformation and sets the observed
@@ -229,6 +233,20 @@ struct Bindings {
             std::lock_guard lock(mutex);
             table[{receiver, name}] = binding;
         }
+        // A table column's bindings name its table's rows ("arrangedObjects.name"): the
+        // table resolves them per row (-_alchemyValueForBinding:ofObject:), so nothing is observed here.
+        if (is_table_column(receiver)) {
+            kvo::on_dealloc(support, receiver, "bindings", [this](Address gone) {
+                std::vector<std::string> names;
+                {
+                    std::lock_guard lock(mutex);
+                    for (const auto& [key, value] : table) { static_cast<void>(value); if (key.first == gone) names.push_back(key.second); }
+                }
+                for (const auto& value : names) unbind(gone, value);
+            });
+            if (const auto table_view = support.send_id(receiver, "tableView")) static_cast<void>(support.send(table_view, "reloadData"));
+            return;
+        }
         const auto id = kvo::observe(support, observed, binding.key_path, kvo::option_new,
                                      [this, receiver, name](Address, Address) { apply(name, receiver); });
         {
@@ -255,6 +273,36 @@ struct Bindings {
         }
         const auto options = binding.options ? binding.options : dictionary(support, {});
         return dictionary(support, {{"NSObservedObject", binding.observed}, {"NSObservedKeyPath", binding.path}, {"NSOptions", options}});
+    }
+    bool is_table_column(Address object) {
+        const auto cls = support.objc.find_class("NSTableColumn");
+        return cls && (support.send(object, "isKindOfClass:", [&] { CallRegs r; r.x[2] = cls; return r; }()).x0 & 0xff);
+    }
+    // A per-row binding ("arrangedObjects.name" on a table column): the key path after its first
+    // component, applied to one row's object.
+    std::optional<Binding> binding_of(Address receiver, const std::string& name) {
+        std::lock_guard lock(mutex);
+        const auto found = table.find({receiver, name});
+        if (found == table.end()) return std::nullopt;
+        return found->second;
+    }
+    static std::string row_key_path(const Binding& binding) {
+        const auto dot = binding.key_path.find('.');
+        return dot == std::string::npos ? std::string() : binding.key_path.substr(dot + 1);
+    }
+    Address row_value(Address receiver, const std::string& name, Address object) {
+        const auto binding = binding_of(receiver, name);
+        if (!binding) return 0;
+        const auto rest = row_key_path(*binding);
+        const auto value = rest.empty() || !object ? object : support.send_id(object, "valueForKeyPath:", {string(support, rest)});
+        return forward_value(*binding, value);
+    }
+    void set_row_value(Address receiver, const std::string& name, Address object, Address value) {
+        const auto binding = binding_of(receiver, name);
+        if (!binding || !object) return;
+        const auto rest = row_key_path(*binding);
+        if (rest.empty()) fail("NSInternalInconsistencyException: the binding " + name + " names the rows themselves; they cannot be set");
+        static_cast<void>(support.send_id(object, "setValue:forKeyPath:", {reverse_value(*binding, value), string(support, rest)}));
     }
     void propagate(Address receiver, const std::string& name, Address value) {
         Binding binding;
@@ -335,7 +383,8 @@ struct Bindings {
         return result;
     }
     // Content changed: rearranges and keeps (or resets) the selection.
-    void content_changed(Address controller, Address new_content, bool select_inserted_last = false) {
+    // `inserted`: objects just added, selected when the controller selects inserted objects.
+    void content_changed(Address controller, Address new_content, const std::vector<Address>& inserted = {}) {
         const auto state = state_of(controller);
         if (state->tree) { rebuild_tree(controller, std::nullopt, new_content); return; }
         will(controller, {"content", "arrangedObjects", "selectionIndexes", "selection", "selectedObjects", "canRemove", "canSelectNext", "canSelectPrevious"});
@@ -347,8 +396,11 @@ struct Bindings {
                 support.release(std::exchange(state->arranged, arrange(controller, *state)));
                 const auto arranged = values_of(state->arranged);
                 std::vector<Address> indexes;
-                if (select_inserted_last && state->selects_inserted && !arranged.empty()) indexes.push_back(arranged.size() - 1);
-                else if (state->preserves_selection) {
+                if (!inserted.empty() && state->selects_inserted) {
+                    for (const auto object : inserted)
+                        for (std::size_t i = 0; i < arranged.size(); ++i) if (arranged[i] == object) { indexes.push_back(i); break; }
+                }
+                if (indexes.empty() && state->preserves_selection) {
                     for (const auto object : previous_selection)
                         for (std::size_t i = 0; i < arranged.size(); ++i) if (arranged[i] == object) { indexes.push_back(i); break; }
                 }
@@ -697,6 +749,13 @@ void install_bindings(Support& support) {
     support.method(root, "_alchemyPropagateValue:forBinding:", [self](CpuState& s, GuestMemory&) {
         if (s.x[3]) self->propagate(s.x[0], self->support.cf.utf8(s.x[3]), s.x[2]);
     }, "v@:@@");
+    // Per-row bindings (table columns): the binding's value for one row's object, and an edit of it.
+    support.method(root, "_alchemyValueForBinding:ofObject:", [self](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[2] ? self->row_value(s.x[0], self->support.cf.utf8(s.x[2]), s.x[3]) : 0;
+    }, "@@:@@");
+    support.method(root, "_alchemySetValue:forBinding:ofObject:", [self](CpuState& s, GuestMemory&) {
+        if (s.x[3]) self->set_row_value(s.x[0], self->support.cf.utf8(s.x[3]), s.x[4], s.x[2]);
+    }, "v@:@@@");
     support.method(root, "exposeBinding:", [self](CpuState& s, GuestMemory&) {
         if (!s.x[2]) return;
         std::lock_guard lock(self->mutex);
@@ -937,18 +996,18 @@ void install_bindings(Support& support) {
     }, "B@:@");
     support.method(ac, "addObject:", [self](CpuState& s, GuestMemory&) {
         const auto object = s.x[2];
-        self->content_changed(s.x[0], self->edited_content(s.x[0], [object](std::vector<Address>& v) { v.push_back(object); }), true);
+        self->content_changed(s.x[0], self->edited_content(s.x[0], [object](std::vector<Address>& v) { v.push_back(object); }), {object});
     }, "v@:@");
     support.method(ac, "addObjects:", [self](CpuState& s, GuestMemory&) {
         const auto added = self->values_of(s.x[2]);
-        self->content_changed(s.x[0], self->edited_content(s.x[0], [&](std::vector<Address>& v) { v.insert(v.end(), added.begin(), added.end()); }), true);
+        self->content_changed(s.x[0], self->edited_content(s.x[0], [&](std::vector<Address>& v) { v.insert(v.end(), added.begin(), added.end()); }), added);
     }, "v@:@");
     support.method(ac, "insertObject:atArrangedObjectIndex:", [self](CpuState& s, GuestMemory&) {
         const auto object = s.x[2];
         const auto index = s.x[3];
         self->content_changed(s.x[0], self->edited_content(s.x[0], [object, index](std::vector<Address>& v) {
             v.insert(v.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(index, v.size())), object);
-        }), true);
+        }), {object});
     }, "v@:@Q");
     support.method(ac, "removeObject:", [self](CpuState& s, GuestMemory&) {
         const auto object = s.x[2];
