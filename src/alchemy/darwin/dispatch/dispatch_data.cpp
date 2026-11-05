@@ -44,11 +44,14 @@ void install_dispatch_data(Provider& p, ObjcRuntime& objc) {
 
     // DISPATCH_DATA_DESTRUCTOR_FREE / _MUNMAP are the values of these
     // variables: private marker addresses compared by dispatch_data_create.
-    const auto markers = process.allocate_guest(32, 16);
-    process.main_engine().fill_bytes(markers, 0, 32);
-    const auto free_marker = markers, munmap_marker = markers + 16;
+    // _NONE (the caller keeps the buffer) and _VM_DEALLOCATE (vm_deallocate frees it) likewise.
+    const auto markers = process.allocate_guest(64, 16);
+    process.main_engine().fill_bytes(markers, 0, 64);
+    const auto free_marker = markers, munmap_marker = markers + 16, none_marker = markers + 32, vm_marker = markers + 48;
     process.main_engine().write64(p.data(libsystem_library, "__dispatch_data_destructor_free", 8), free_marker);
     process.main_engine().write64(p.data(libsystem_library, "__dispatch_data_destructor_munmap", 8), munmap_marker);
+    process.main_engine().write64(p.data(libsystem_library, "__dispatch_data_destructor_none", 8), none_marker);
+    process.main_engine().write64(p.data(libsystem_library, "__dispatch_data_destructor_vm_deallocate", 8), vm_marker);
 
     const auto payload_of = [&process](std::uint64_t object) -> std::shared_ptr<DispatchData> {
         const auto record = object ? process.objects().find(object) : nullptr;
@@ -78,7 +81,7 @@ void install_dispatch_data(Provider& p, ObjcRuntime& objc) {
 
     // dispatch_data_t dispatch_data_create(const void* buffer, size_t size,
     //     dispatch_queue_t queue, dispatch_block_t destructor)
-    p.libsystem("_dispatch_data_create", [p, make, free_marker, munmap_marker](CpuState& s, GuestMemory& m) -> std::uint64_t {
+    p.libsystem("_dispatch_data_create", [p, make, free_marker, munmap_marker, none_marker, vm_marker](CpuState& s, GuestMemory& m) -> std::uint64_t {
         const auto buffer = s.x[0], size = s.x[1], queue = s.x[2], destructor = s.x[3];
         if (size && !buffer) throw std::runtime_error("Alchemy dispatch_data_create: null buffer");
         if (size > (1ULL << 32)) throw std::runtime_error("Alchemy dispatch_data_create: buffer larger than 4 GiB");
@@ -89,10 +92,25 @@ void install_dispatch_data(Provider& p, ObjcRuntime& objc) {
             static_cast<void>(p.call(libsystem_library, "_free", {buffer}));
         } else if (destructor == munmap_marker) {
             static_cast<void>(p.call(libsystem_library, "_munmap", {buffer, size}));
+        } else if (destructor == vm_marker) {
+            const auto task = p.process().resolve(libsystem_library, "_mach_task_self_");
+            if (!task) throw std::runtime_error("Alchemy dispatch_data_create: DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE needs mach_task_self_");
+            static_cast<void>(p.call(libsystem_library, "_vm_deallocate", {m.read32(task->address), buffer, size}));
+        } else if (destructor == none_marker) {
+            // The caller keeps its buffer.
         } else if (destructor) {
             const auto target = queue ? queue : p.call(libsystem_library, "_dispatch_get_global_queue", {0, 0});
             static_cast<void>(p.call(libsystem_library, "_dispatch_async", {target, destructor}));
         }
+        return object;
+    }, 0);
+
+    // dispatch_data_t dispatch_data_create_alloc(size_t size, void** buffer): a new object with `size` bytes (zeroed)
+    // the caller fills through *buffer; the empty object and NULL for 0.
+    p.libsystem("_dispatch_data_create_alloc", [make, payload_of](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (s.x[0] > (1ULL << 32)) throw std::runtime_error("Alchemy dispatch_data_create_alloc: buffer larger than 4 GiB");
+        const auto object = make(std::vector<std::uint8_t>(static_cast<std::size_t>(s.x[0])));
+        if (s.x[1]) m.write64(s.x[1], s.x[0] ? payload_of(object)->buffer : 0);
         return object;
     }, 0);
 

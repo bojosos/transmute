@@ -36,6 +36,29 @@ void test_guest_dispatch_data(Fixture& f) {
         const auto free_destructor = f.engine.read64(f.symbol(system, "__dispatch_data_destructor_free"));
         const auto adopted = f.sys("_dispatch_data_create", {owned, 4, 0, free_destructor});
         require(f.sys("_dispatch_data_get_size", {adopted}) == 4, "dispatch_data_create with DISPATCH_DATA_DESTRUCTOR_FREE");
+        // _NONE leaves the caller's buffer alone; _VM_DEALLOCATE gives it back with vm_deallocate.
+        const auto kept = f.text("kept");
+        const auto none = f.sys("_dispatch_data_create", {kept, 4, 0, f.engine.read64(f.symbol(system, "__dispatch_data_destructor_none"))});
+        require(f.sys("_dispatch_data_get_size", {none}) == 4 && f.read(kept) == "kept", "DISPATCH_DATA_DESTRUCTOR_NONE");
+        const auto region = f.process.allocate_guest(8);
+        const std::uint64_t task = f.engine.read32(f.symbol(system, "_mach_task_self_"));
+        require(f.sys("_vm_allocate", {task, region, 16384, 1}) == 0, "vm_allocate for the data");
+        const auto pages = f.engine.read64(region);
+        f.engine.write32(pages, 0x31323334);
+        const auto vm_destructor = f.engine.read64(f.symbol(system, "__dispatch_data_destructor_vm_deallocate"));
+        const auto from_vm = f.sys("_dispatch_data_create", {pages, 4, 0, vm_destructor});
+        require(f.sys("_dispatch_data_get_size", {from_vm}) == 4 && f.sys("_vm_allocate", {task, region, 16384, 0}) == 0 && f.engine.read64(region) == pages &&
+                f.sys("_vm_deallocate", {task, pages, 16384}) == 0,
+                "DISPATCH_DATA_DESTRUCTOR_VM_DEALLOCATE deallocates the region (it can be allocated there again)");
+        // dispatch_data_create_alloc: the caller fills the object's own buffer.
+        const auto filled = f.process.allocate_guest(8);
+        const auto allocated = f.sys("_dispatch_data_create_alloc", {6, filled});
+        require(allocated && f.sys("_dispatch_data_get_size", {allocated}) == 6 && f.engine.read64(filled) != 0, "dispatch_data_create_alloc");
+        f.engine.write_bytes(f.engine.read64(filled), std::vector<std::uint8_t>{'f', 'i', 'l', 'l', 'e', 'd'});
+        const auto mapped = f.sys("_dispatch_data_create_map", {allocated, buffer, size});
+        require(f.engine.read64(buffer) == f.engine.read64(filled) && f.read(f.engine.read64(buffer)).substr(0, 6) == "filled", "its buffer is the object's");
+        require(f.sys("_dispatch_data_create_alloc", {0, filled}) == empty && f.engine.read64(filled) == 0, "dispatch_data_create_alloc(0)");
+        for (const auto object : {none, from_vm, mapped, allocated}) f.sys("_dispatch_release", {object});
         // data and its map are one object (two references).
         const auto before = f.process.objects().live_count();
         for (const auto object : {map, sub, both, adopted}) f.sys("_dispatch_release", {object});

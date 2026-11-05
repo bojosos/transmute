@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <initializer_list>
 #include <iterator>
 #include <thread>
@@ -554,6 +555,28 @@ void test_runtime_api() {
     static_cast<void>(f.call("_objc_release_x1", {0, other}));
     require(f.call("_objc_msgSend", {other, f.runtime.selector("retainCount")}) == 2, "objc_release_x1");
     require(f.call("_objc_unretainedObject", {other}) == other, "objc_unretainedObject is the identity");
+    // objc_sync_try_enter: recursive for the owner, NO for another thread while held, nil succeeds.
+    require(f.call("_objc_sync_try_enter", {other}) == 1 && f.call("_objc_sync_try_enter", {other}) == 1 &&
+            f.call("_objc_sync_try_enter", {0}) == 1, "objc_sync_try_enter takes the monitor");
+    const auto try_entry = f.export_address("_objc_sync_try_enter");
+    auto worker = f.engine.fork_thread(0, 0);
+    const auto elsewhere = [&] {
+        return std::async(std::launch::async, [&] { return worker->invoke_callback(try_entry, std::array<Address, 1>{other}); }).get();
+    };
+    require(elsewhere() == 0, "another thread cannot take a held monitor");
+    require(f.call("_objc_sync_exit", {other}) == 0 && f.call("_objc_sync_exit", {other}) == 0, "objc_sync_exit twice");
+    require(elsewhere() == 1, "another thread takes the released monitor");
+    // objc_retain_autoreleaseReturnValue, objc_copyImageHeaders (as many as objc_copyImageNames), objc_autoreleasePoolPrint.
+    const auto print_pool = f.call("_objc_autoreleasePoolPush", {});
+    require(f.call("_objc_retain_autoreleaseReturnValue", {other}) == other &&
+            f.call("_objc_msgSend", {other, f.runtime.selector("retainCount")}) == 3, "objc_retain_autoreleaseReturnValue retains");
+    static_cast<void>(f.call("_objc_autoreleasePoolPrint", {}));
+    static_cast<void>(f.call("_objc_autoreleasePoolPop", {print_pool}));
+    require(f.call("_objc_msgSend", {other, f.runtime.selector("retainCount")}) == 2, "and the pool releases it");
+    const auto header_count = f.process.allocate_guest(4);
+    static_cast<void>(f.call("_objc_copyImageHeaders", {header_count}));
+    static_cast<void>(f.call("_objc_copyImageNames", {count}));
+    require(f.engine.read32(header_count) == f.engine.read32(count), "objc_copyImageHeaders");
 }
 
 } // namespace

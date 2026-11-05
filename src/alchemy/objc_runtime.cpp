@@ -1206,6 +1206,16 @@ struct ObjcRuntime::Impl {
         value->owner = self; value->depth = 1;
         return sync_success;
     }
+    // objc_sync_try_enter: the monitor when no other thread holds it (it is recursive); nil succeeds.
+    bool sync_try_enter(Address object) {
+        if (!object) return true;
+        const auto value = monitor(object, true);
+        std::lock_guard lock(value->mutex);
+        if (value->depth && value->owner != std::this_thread::get_id()) return false;
+        if (value->depth) ++value->depth;
+        else { value->owner = std::this_thread::get_id(); value->depth = 1; }
+        return true;
+    }
     Address sync_exit(Address object) {
         if (!object) return sync_success;
         const auto value = monitor(object, false);
@@ -1391,6 +1401,8 @@ struct ObjcRuntime::Impl {
             s.x[0] = zone ? process.calling_engine().invoke_callback(zone->address, std::span<const Address>{}) : 0; });
         // id objc_retain_autorelease(id): retained, then autoreleased.
         function("_objc_retain_autorelease", [this](auto& s, auto&) { s.x[0] = autorelease(retain(s.x[0])); });
+        // id objc_retain_autoreleaseReturnValue(id): retained, then returned autoreleased.
+        function("_objc_retain_autoreleaseReturnValue", [this](auto& s, auto&) { s.x[0] = autorelease(retain(s.x[0])); });
         function("_objc_isUniquelyReferenced", [this](auto& s, auto&) {
             const auto record = s.x[0] ? process.objects().find(s.x[0]) : nullptr;
             s.x[0] = record && !record->immortal && record->references.load() == 1;
@@ -1582,6 +1594,8 @@ struct ObjcRuntime::Impl {
     // handler; objc_setUncaughtExceptionHandler's handler.
     Address ehtype_vptr{}, throw_stub{}, exception_destructor{}, terminate_handler{}, previous_terminate{};
     Address uncaught_handler{}, exception_preprocessor{};
+    // objc_setExceptionMatcher's matcher (none: the default) and the default's guest address.
+    Address exception_matcher{}, default_matcher{};
     std::atomic<bool> terminate_installed{false};
     // A libc++abi function, or 0 before it is loaded: a provider export, else the loaded guest
     // LLVM runtime's, found as dlsym(RTLD_DEFAULT) finds it (provider resolution sees provider
@@ -1621,16 +1635,31 @@ struct ObjcRuntime::Impl {
         // __shim_type_info noop1 and noop2, then can_catch (virtual slot 4); the rest pad
         // __class_type_info's search slots, which these types never reach.
         const auto noop = function("___alchemy_objc_ehtype_noop", [](auto&, auto&) {});
+        // Whether the exception's class is the handler's class or a subclass of it: the default exception matcher,
+        // int (*)(Class catch_class, id exception), which objc_setExceptionMatcher first returns.
+        const auto is_kind = [this](Address handler_class, Address object) {
+            for (auto address = object_class(object); address; address = class_record(address).super)
+                if (address == handler_class) return true;
+            return false;
+        };
+        default_matcher = function("___alchemy_objc_default_exception_matcher", [is_kind](auto& s, auto&) {
+            s.x[0] = s.x[0] && s.x[1] && is_kind(s.x[0], s.x[1]) ? 1 : 0;
+        });
         // bool can_catch(const __shim_type_info* catch_type, const __shim_type_info* thrown, void*& adjusted)
-        const auto can_catch = function("___alchemy_objc_ehtype_can_catch", [this](auto& s, auto& m) {
+        const auto can_catch = function("___alchemy_objc_ehtype_can_catch", [this, is_kind](auto& s, auto& m) {
             const auto catch_type = s.x[0], thrown = s.x[1], adjusted = s.x[2];
             s.x[0] = 0;
             if (!thrown || !adjusted || m.read64(thrown) != ehtype_vptr) return;   // a C++ exception
             const auto object = m.read64(m.read64(adjusted));
             if (const auto handler_class = m.read64(catch_type + 16)) {   // NULL: OBJC_EHTYPE_id
                 if (!object) return;
-                bool kind = false;
-                for (auto address = object_class(object); address && !kind; address = class_record(address).super) kind = address == handler_class;
+                Address matcher{};
+                { std::lock_guard lock(mutex); matcher = exception_matcher; }
+                bool kind{};
+                if (matcher && matcher != default_matcher) {
+                    const std::array<Address, 2> args{handler_class, object};
+                    kind = (process.calling_engine().invoke_callback(matcher, args) & 0xffffffffU) != 0;
+                } else kind = is_kind(handler_class, object);
                 if (!kind) return;
             }
             m.write64(adjusted, object);   // __cxa_begin_catch hands the object to the @catch
@@ -1888,6 +1917,14 @@ struct ObjcRuntime::Impl {
             { std::lock_guard lock(mutex); for (const auto& [module, image] : images) { static_cast<void>(image); modules.push_back(module); } }
             for (const auto module : modules) if (const auto name = image_name(module)) names.push_back(name);
             s.x[0] = copy_words(names, s.x[0], m); });
+        // const struct mach_header** objc_copyImageHeaders(unsigned* count): the headers of the images with
+        // Objective-C metadata, as objc_copyImageNames lists them.
+        function("_objc_copyImageHeaders", [this](auto& s, auto& m) {
+            std::set<Address> modules;
+            { std::lock_guard lock(mutex); for (const auto& [module, image] : images) { static_cast<void>(image); modules.insert(module); } }
+            std::vector<Address> headers;
+            for (const auto& image : process.images()) if (image.header && modules.contains(image.module_id)) headers.push_back(image.header);
+            s.x[0] = copy_words(headers, s.x[0], m); });
         // const char** objc_copyClassNamesForImage(const char* image, unsigned* count)
         function("_objc_copyClassNamesForImage", [this](auto& s, auto& m) {
             const auto wanted = text(m, s.x[0]);
@@ -2321,6 +2358,35 @@ struct ObjcRuntime::Impl {
         function("_objc_autoreleasePoolPush", [this](auto& s, auto&) { Address token{}; { std::lock_guard lock(mutex); token = next_pool++; }
             process.current_thread()->autorelease_pools.push_back({token, {}}); s.x[0] = token; });
         function("_objc_autoreleasePoolPop", [this](auto& s, auto&) { drain(*process.current_thread(), s.x[0]); });
+        // void objc_autoreleasePoolPrint(void): the calling thread's pools and the objects each will release, on
+        // the guest's stderr (a debugging aid; the layout is Alchemy's).
+        function("_objc_autoreleasePoolPrint", [this](auto&, auto&) {
+            const auto& thread = *process.current_thread();
+            Address pid{};
+            if (const auto getpid = process.resolve("/usr/lib/libSystem.B.dylib", "_getpid"))
+                pid = process.calling_engine().invoke_callback(getpid->address, std::span<const Address>{});
+            const auto prefix = "objc[" + std::to_string(pid) + "]: ";
+            std::size_t pending = thread.unpooled_autoreleases.size();
+            for (const auto& pool : thread.autorelease_pools) pending += pool.objects.size();
+            std::ostringstream text;
+            text << prefix << "##############\n" << prefix << "AUTORELEASE POOLS for thread " << thread.identity << '\n'
+                 << prefix << pending << " releases pending.\n";
+            const auto entry = [&](Address object) {
+                std::string name = "?";
+                try { if (const auto address = object_class(object)) { std::lock_guard lock(mutex); name = cls(address)->name; } }
+                catch (const std::exception&) {}
+                text << prefix << "  0x" << std::hex << object << std::dec << "  " << name << '\n';
+            };
+            if (!thread.unpooled_autoreleases.empty()) text << prefix << "(outside any pool)\n";
+            for (const auto object : thread.unpooled_autoreleases) entry(object);
+            for (const auto& pool : thread.autorelease_pools) {
+                text << prefix << "POOL " << pool.token << '\n';
+                for (const auto object : pool.objects) entry(object);
+            }
+            text << prefix << "##############\n";
+            const auto bytes = text.str();
+            static_cast<void>(process.output(2, std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size())));
+        });
         // A dealloc that calls objc_destructInstance and returns without object_dispose keeps the
         // memory (ObjectStore::note_destructed): freed by a later object_dispose.
         function("_objc_destructInstance", [this](auto& s, auto&) {
@@ -2380,6 +2446,14 @@ struct ObjcRuntime::Impl {
         // objc_exception_preprocessor objc_setExceptionPreprocessor(fn): the previous one.
         function("_objc_setExceptionPreprocessor", [this](auto& s, auto&) {
             std::lock_guard lock(mutex); s.x[0] = std::exchange(exception_preprocessor, s.x[0]); });
+        // objc_exception_matcher objc_setExceptionMatcher(fn): the previous one (at first the default matcher). An
+        // @catch naming a class asks the matcher whether the exception matches; @catch (id) catches every one.
+        function("_objc_setExceptionMatcher", [this](auto& s, auto&) {
+            std::lock_guard lock(mutex);
+            const auto previous = exception_matcher ? exception_matcher : default_matcher;
+            exception_matcher = s.x[0];
+            s.x[0] = previous;
+        });
         // objc_terminate: the uncaught-exception path; it never returns.
         function("_objc_terminate", [this](auto& s, auto& m) { terminate(s, m); });
         // objc_copyStruct(dest, src, size, atomic, hasStrong): the accessor
@@ -2401,6 +2475,8 @@ struct ObjcRuntime::Impl {
         function("_objc_retainBlock", [this](auto& s, auto&) { if (s.x[0]) s.x[0] = blocks_call("__Block_copy", s.x[0]); });
         function("_objc_sync_enter", [this](auto& s, auto&) { s.x[0] = sync_enter(s.x[0]); });
         function("_objc_sync_exit", [this](auto& s, auto&) { s.x[0] = sync_exit(s.x[0]); });
+        // BOOL objc_sync_try_enter(id): YES when it took the object's @synchronized monitor without waiting.
+        function("_objc_sync_try_enter", [this](auto& s, auto&) { s.x[0] = sync_try_enter(s.x[0]) ? 1 : 0; });
         function("_objc_setEnumerationMutationHandler", [this](auto& s, auto&) { std::lock_guard lock(mutex); mutation_handler = s.x[0]; });
         function("_objc_enumerationMutation", [this](auto& s, auto&) {
             Address handler{}; { std::lock_guard lock(mutex); handler = mutation_handler; }

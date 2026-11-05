@@ -36,6 +36,22 @@ const Case objc_exception_types_case("objc_exception_types", [](Fixture& f) {
     f.engine.write64(adjusted, payload);
     require(f.engine.invoke_callback(can_catch, std::array<Address, 3>{own_type, payload + 8, adjusted}) == 0 &&
             f.engine.read64(adjusted) == payload, "an unrelated class does not match");
+    // objc_setExceptionMatcher: first the default (class or subclass); a custom matcher decides for @catch (Class*),
+    // and @catch (id) still catches everything.
+    const auto default_matcher = f.call(objc_lib, "_objc_setExceptionMatcher", {0});
+    require(default_matcher && f.engine.invoke_callback(default_matcher, std::array<Address, 2>{object_class, object}) == 1 &&
+            f.engine.invoke_callback(default_matcher, std::array<Address, 2>{other, object}) == 0, "the default exception matcher");
+    static Address asked_class{};
+    const auto accept_all = f.process.install_function("__fill_test_matcher", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        asked_class = s.x[0]; s.x[0] = 1;
+    });
+    require(f.call(objc_lib, "_objc_setExceptionMatcher", {accept_all}) == default_matcher, "objc_setExceptionMatcher returns the previous one");
+    f.engine.write64(adjusted, payload);
+    require(f.engine.invoke_callback(can_catch, std::array<Address, 3>{own_type, payload + 8, adjusted}) == 1 && asked_class == other &&
+            f.engine.read64(adjusted) == object, "a custom matcher decides");
+    require(f.call(objc_lib, "_objc_setExceptionMatcher", {default_matcher}) == accept_all, "the default restored");
+    f.engine.write64(adjusted, payload);
+    require(f.engine.invoke_callback(can_catch, std::array<Address, 3>{own_type, payload + 8, adjusted}) == 0, "the default again");
     const auto cxx_type = f.block(24);   // a C++ type_info with some other vtable
     f.engine.write64(cxx_type, 0x1234);
     require(f.engine.invoke_callback(can_catch, std::array<Address, 3>{ehtype, cxx_type, adjusted}) == 0, "a C++ exception does not match");
