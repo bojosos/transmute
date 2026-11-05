@@ -1242,6 +1242,10 @@ public:
     // thread, the pending signals `mask` does not block (sigprocmask after unblocking); false when there were none.
     std::map<std::uint64_t, std::uint32_t> thread_pending;
     std::uint32_t process_pending{};
+    // sigaltstack per thread, under `mutex`: the alternate stack, whether it is disabled, and whether a handler runs
+    // on it now (SS_ONSTACK).
+    struct AlternateStack { std::uint64_t base{}, size{}; bool disabled{true}, active{}; };
+    std::map<std::uint64_t, AlternateStack> alternate_stacks;
     std::function<bool(std::uint32_t)> deliver_pending_signals;
     // Discards a pending `signal` everywhere (its disposition became SIG_IGN). Caller holds `mutex`.
     void discard_pending_signal(std::uint64_t signal) {

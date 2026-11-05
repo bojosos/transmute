@@ -1,14 +1,18 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
 #include "alchemy/darwin/libsystem/install.hpp"
+#include "alchemy/darwin/libsystem/misc/crypt_des.hpp"
 
 #include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 
-// <stdlib.h> leftovers: the rand48 generators (drand48(3)); crypt(3) answers ENOSYS. One 48-bit linear congruential
+// <stdlib.h> leftovers: the rand48 generators (drand48(3)) and the DES password hash (crypt(3), with POSIX's encrypt and
+// setkey; misc/crypt_des.hpp). One 48-bit linear congruential
 // generator per process, X(n+1) = (a X(n) + c) mod 2^48, with a = 0x5DEECE66D and c = 0xB
 // until lcong48 changes them; the *rand48 forms that take xsubi[3] keep their own X.
 namespace alchemy::export_fill {
@@ -86,11 +90,50 @@ void install_libsystem_stdlib(Provider& p) {
         return 0;
     });
 
-    // crypt(3), encrypt and setkey: the DES password hash is not implemented yet, so crypt
-    // fails with ENOSYS (NULL) and encrypt/setkey set ENOSYS, as POSIX allows for them.
-    p.libsystem("_crypt", [](CpuState&, GuestMemory&) -> std::uint64_t { throw Errno{enosys}; }, 0);
-    for (const auto* name : {"_encrypt", "_setkey"})
-        p.libsystem(name, [](CpuState&, GuestMemory&) -> std::uint64_t { throw Errno{enosys}; }, 0);
+    // char* crypt(const char* key, const char* setting): the DES hash, traditional ("ss": 13 characters) or
+    // extended ("_" + count + salt: 20 characters), in a buffer per thread valid until its next call; NULL with
+    // EINVAL for a short extended setting.
+    struct CryptState { std::mutex mutex; std::map<std::uint64_t, std::uint64_t> buffers; std::array<std::uint64_t, 16> keys{}; };
+    auto crypt_state = std::make_shared<CryptState>();
+    p.libsystem("_crypt", [p, crypt_state](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[0] || !s.x[1]) throw Errno{efault};
+        const auto key_bytes = m.read_string(s.x[0], 1, 4096), setting_bytes = m.read_string(s.x[1], 1, 4096);
+        const auto hashed = libsystem::des::crypt(std::string(key_bytes.begin(), key_bytes.end()),
+                                                  std::string(setting_bytes.begin(), setting_bytes.end()));
+        if (!hashed) throw Errno{einval};
+        const auto thread = p.process().current_thread();
+        std::uint64_t buffer;
+        {
+            std::lock_guard lock(crypt_state->mutex);
+            auto& slot = crypt_state->buffers[thread ? thread->identity : 0];
+            if (!slot) slot = p.process().allocate_guest(32);
+            buffer = slot;
+        }
+        m.write_bytes(buffer, std::span(reinterpret_cast<const std::uint8_t*>(hashed->c_str()), hashed->size() + 1));
+        return buffer;
+    }, 0);
+    // void setkey(const char key[64]) and void encrypt(char block[64], int decrypt): DES on 64 one-bit bytes, with
+    // the process's key from setkey.
+    const auto bits_in = [](GuestMemory& m, std::uint64_t address) {
+        if (!address) throw Errno{efault};
+        std::uint64_t value{};
+        for (std::uint64_t i = 0; i < 64; ++i) value = (value << 1) | (m.read8(address + i) & 1);
+        return value;
+    };
+    p.libsystem("_setkey", [crypt_state, bits_in](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto keys = libsystem::des::schedule(bits_in(m, s.x[0]));
+        std::lock_guard lock(crypt_state->mutex);
+        crypt_state->keys = keys;
+        return 0;
+    }, 0);
+    p.libsystem("_encrypt", [crypt_state, bits_in](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto block = bits_in(m, s.x[0]);
+        std::array<std::uint64_t, 16> keys;
+        { std::lock_guard lock(crypt_state->mutex); keys = crypt_state->keys; }
+        const auto result = libsystem::des::cipher(block, keys, s.x[1] != 0);
+        for (std::uint64_t i = 0; i < 64; ++i) m.write8(s.x[0] + i, static_cast<std::uint8_t>((result >> (63 - i)) & 1));
+        return 0;
+    }, 0);
 }
 
 } // namespace alchemy::export_fill

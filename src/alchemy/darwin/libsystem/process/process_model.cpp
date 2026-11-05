@@ -1121,27 +1121,61 @@ void DarwinServices::Impl::install_process_services() {
     // ---- signals to processes ----
     // A signal delivered on the calling thread: SIG_IGN and ignored-by-default signals do nothing, a handler runs
     // now, the default action of a terminating signal ends the process.
-    const auto run_action = [this](std::uint64_t signal) -> std::uint64_t {
+    // A handler with SA_ONSTACK runs on the thread's alternate stack (sigaltstack) when one is set and no handler runs
+    // on it already: through this trampoline, which switches sp around the call. x0..x2: the handler's arguments,
+    // x3: the handler, x4: the top of the alternate stack.
+    constexpr std::array<std::uint32_t, 7> on_stack_code{
+        0x910003e9U,   // mov x9, sp
+        0x9100009fU,   // mov sp, x4
+        0xa9bf7be9U,   // stp x9, x30, [sp, #-16]!
+        0xd63f0060U,   // blr x3
+        0xa8c17be9U,   // ldp x9, x30, [sp], #16
+        0x9100013fU,   // mov sp, x9
+        0xd65f03c0U};  // ret
+    const auto on_stack = context.allocate_guest(on_stack_code.size() * 4);
+    for (std::size_t index = 0; index < on_stack_code.size(); ++index) context.calling_engine().write32(on_stack + index * 4, on_stack_code[index]);
+    context.calling_engine().set_memory_access(on_stack, true, false, true);
+    const auto run_action = [this, on_stack](std::uint64_t signal) -> std::uint64_t {
         if (!signal) return 0;
         SignalAction action;
         { std::lock_guard lock(mutex); action = signal_table()[static_cast<std::size_t>(signal)]; }
         if (action.handler == 1 && signal != 9 && signal != 17) return 0;
         if (action.handler > 1 && signal != 9 && signal != 17) {
             if (action.flags & 4) { std::lock_guard lock(mutex); signal_table()[static_cast<std::size_t>(signal)] = SignalAction{}; }   // SA_RESETHAND
-            if (action.flags & 0x40) {   // SA_SIGINFO: (signal, siginfo_t*, ucontext*)
-                const auto info = context.allocate_guest(104);
-                auto& memory = context.calling_engine();
-                memory.fill_bytes(info, 0, 104);
-                memory.write32(info, static_cast<std::uint32_t>(signal)); memory.write32(info + 12, process_id()); memory.write32(info + 16, 1000);
-                try {
-                    const std::array<std::uint64_t, 3> arguments{signal, info, 0};
-                    static_cast<void>(EngineAdapter(context.calling_engine()).call(action.handler, arguments));
-                } catch (...) { context.release_guest(info); throw; }
-                context.release_guest(info);
-            } else {
-                const std::array<std::uint64_t, 1> arguments{signal};
-                static_cast<void>(EngineAdapter(context.calling_engine()).call(action.handler, arguments));
+            const auto identity = context.current_thread()->identity;
+            std::optional<std::uint64_t> stack_top;
+            if (action.flags & 1) {   // SA_ONSTACK
+                std::lock_guard lock(mutex);
+                if (const auto found = alternate_stacks.find(identity); found != alternate_stacks.end() && !found->second.disabled && !found->second.active) {
+                    stack_top = (found->second.base + found->second.size) & ~15ULL;
+                    found->second.active = true;
+                }
             }
+            const auto invoke_handler = [&](std::uint64_t info, std::uint64_t context_argument) {
+                if (stack_top) {
+                    const std::array<std::uint64_t, 5> arguments{signal, info, context_argument, action.handler, *stack_top};
+                    static_cast<void>(EngineAdapter(context.calling_engine()).call(on_stack, arguments));
+                } else {
+                    const std::array<std::uint64_t, 3> arguments{signal, info, context_argument};
+                    static_cast<void>(EngineAdapter(context.calling_engine()).call(action.handler, arguments));
+                }
+            };
+            const auto leave_stack = [&] {
+                if (!stack_top) return;
+                std::lock_guard lock(mutex);
+                alternate_stacks[identity].active = false;
+            };
+            try {
+                if (action.flags & 0x40) {   // SA_SIGINFO: (signal, siginfo_t*, ucontext*)
+                    const auto info = context.allocate_guest(104);
+                    auto& memory = context.calling_engine();
+                    memory.fill_bytes(info, 0, 104);
+                    memory.write32(info, static_cast<std::uint32_t>(signal)); memory.write32(info + 12, process_id()); memory.write32(info + 16, 1000);
+                    try { invoke_handler(info, 0); } catch (...) { context.release_guest(info); throw; }
+                    context.release_guest(info);
+                } else invoke_handler(0, 0);
+            } catch (...) { leave_stack(); throw; }
+            leave_stack();
             {
                 std::lock_guard lock(mutex);
                 ++handled_signals;
@@ -1342,6 +1376,33 @@ void DarwinServices::Impl::install_process_services() {
         restore();
         throw ServiceError{eintr_error};
     };
+    // int sigaltstack(const stack_t* ss, stack_t* oss): stack_t {ss_sp @0, ss_size @8, ss_flags @16}. The old stack
+    // with SS_ONSTACK (1) while a handler runs on it, SS_DISABLE (4) when there is none; a new one: EPERM while on it,
+    // EINVAL for other flags, ENOMEM below MINSIGSTKSZ (32 KiB).
+    install("_sigaltstack", [this](auto& s, auto& m) -> std::uint64_t {
+        const auto identity = context.current_thread()->identity;
+        std::optional<AlternateStack> replacement;
+        if (s.x[0]) {
+            validate(m, s.x[0], 24, false);
+            const auto flags = m.read32(s.x[0] + 16);
+            if (flags & ~4U) throw ServiceError{einval};
+            AlternateStack value{m.read64(s.x[0]), m.read64(s.x[0] + 8), (flags & 4) != 0, false};
+            if (!value.disabled && value.size < 32768) throw ServiceError{enomem};
+            replacement = value;
+        }
+        if (s.x[1]) validate(m, s.x[1], 24, true);
+        std::lock_guard lock(mutex);
+        auto& current = alternate_stacks[identity];
+        if (s.x[1]) {
+            m.write64(s.x[1], current.base); m.write64(s.x[1] + 8, current.size);
+            m.write32(s.x[1] + 16, (current.active ? 1U : 0U) | (current.disabled ? 4U : 0U));
+        }
+        if (replacement) {
+            if (current.active) throw ServiceError{eperm};
+            current = *replacement;
+        }
+        return 0;
+    });
     // int sigwait(const sigset_t* set, int* sig): takes a pending signal of `set` (the thread's own first) without
     // running its handler, waiting until one is generated; the error number is the result (EINVAL for an empty set).
     install("_sigwait", [this](auto& s, auto& m) -> std::uint64_t {

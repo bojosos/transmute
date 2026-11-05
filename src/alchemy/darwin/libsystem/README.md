@@ -114,14 +114,15 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   set a symbolic link's own times (`fs/files.cpp`). chflags/lchflags/fchflags keep UF_HIDDEN as the
   host's hidden attribute, which stat reports in st_flags; other flags are ENOTSUP. Network
   interfaces have one set of names (`net/interface_names.hpp`: lo0, en<n>, utun<n>) for getifaddrs
-  and the if_* calls. sigaltstack stays ENOSYS.
+  and the if_* calls.
 * **Signals within the process** (core, `process/process_model.cpp`): a signal blocked where it
   goes stays pending (for the calling thread: raise; another thread: pthread_kill; the process:
   kill to itself, the interval timer, which follows the mask of the thread that armed it) until
   sigprocmask/pthread_sigmask unblocks it or sigsuspend/pause wait with it unblocked, which run
   its handler on that thread; sigwait takes it without the handler, sigpending reports it,
   SIG_IGN discards it. New threads inherit their creator's mask. A signal for another thread
-  does not interrupt it: it waits for that thread's next unblocking or wait.
+  does not interrupt it: it waits for that thread's next unblocking or wait. sigaltstack keeps an
+  alternate stack per thread; a handler with SA_ONSTACK runs on it (a trampoline switches sp).
 * **Attribute lists** (alchemy-fx, `install_libsystem_gaps`): `fs/attrlist.cpp`, the getattrlist(2)
   family (get/set, f and at forms) packed from stat, statfs, the extended attributes and the host
   volume: the common attributes this file system keeps, the directory and file ones, the volume's
@@ -151,8 +152,9 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
   `misc/fts_err.cpp`'s.
 * **Unavailable services, answered with their own error codes:** NIS (`yp_get_default_domain`
   YPERR_NODOM, the map calls YPERR_YPBIND) and Sun RPC (`clnt_create` fails with
-  RPC_PMAPFAILURE; the XDR codecs stop explicitly, since no client handle can exist). `crypt`,
-  `encrypt` and `setkey` answer ENOSYS until the DES hash is implemented. Attribute lists
+  RPC_PMAPFAILURE; the XDR codecs stop explicitly, since no client handle can exist). `crypt`
+  (the traditional and extended DES hashes), `encrypt` and `setkey` use `misc/crypt_des.hpp`
+  (DES from FIPS 46-3's tables). Attribute lists
   (`getattrlist` family) answer ENOTSUP, `fchflags` ENOSYS as `chflags`, no file carries an ACL.
   `proc_pidfdinfo` describes this process's vnode descriptors only. Another thread's registers
   (`thread_get_state`, `thread_set_state`, `thread_abort(_safely)`) are not reachable.

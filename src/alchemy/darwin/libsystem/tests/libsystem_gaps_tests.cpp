@@ -1206,6 +1206,47 @@ void test_b20(Fixture& f) {
     f.sys("_signal", {31, 0});
 }
 
+// B21: sigaltstack (process/process_model.cpp).
+void test_b21(Fixture& f) {
+    static std::atomic<std::uint64_t> handler_sp{0};
+    static std::atomic<std::uint32_t> handler_flags{0};
+    static Fixture* fixture = &f;
+    const auto handler = f.process.install_function("_b21_onstack", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        handler_sp = s.sp;
+        auto& engine = fixture->process.calling_engine();
+        const auto old = fixture->process.allocate_guest(24);
+        const std::array<std::uint64_t, 2> arguments{0, old};
+        static_cast<void>(alchemy::EngineAdapter(engine).call(fixture->symbol("/usr/lib/libSystem.B.dylib", "_sigaltstack"), arguments));
+        handler_flags = m.read32(old + 16);
+        s.x[0] = 0;
+    });
+    const auto ss = f.process.allocate_guest(24), old = f.process.allocate_guest(24), action = f.process.allocate_guest(16);
+    require(f.sys("_sigaltstack", {0, old}) == 0 && f.engine.read32(old + 16) == 4, "no alternate stack at first (SS_DISABLE)");
+    constexpr std::uint64_t size = 65536;
+    const auto stack = f.process.allocate_guest(size);
+    f.engine.write64(ss, stack); f.engine.write64(ss + 8, size); f.engine.write32(ss + 16, 0);
+    require(f.sys("_sigaltstack", {ss, old}) == 0 && f.sys("_sigaltstack", {0, old}) == 0 && f.engine.read64(old) == stack &&
+            f.engine.read32(old + 16) == 0, "sigaltstack sets the stack");
+    // A handler with SA_ONSTACK runs on it, and sees SS_ONSTACK.
+    f.engine.write64(action, handler); f.engine.write32(action + 8, 0); f.engine.write32(action + 12, 1);   // SA_ONSTACK
+    require(f.sys("_sigaction", {30, action, 0}) == 0 && f.sys("_raise", {30}) == 0, "raise with an SA_ONSTACK handler");
+    require(handler_sp >= stack && handler_sp < stack + size && handler_flags == 1, "the handler ran on the alternate stack");
+    require(f.sys("_sigaltstack", {0, old}) == 0 && f.engine.read32(old + 16) == 0, "no longer on it afterwards");
+    // Without SA_ONSTACK the handler runs on the thread's stack.
+    f.engine.write32(action + 12, 0);
+    f.sys("_sigaction", {30, action, 0});
+    f.sys("_raise", {30});
+    require(handler_sp < stack || handler_sp >= stack + size, "without SA_ONSTACK, the thread's stack");
+    // EINVAL for other flags, ENOMEM below MINSIGSTKSZ, SS_DISABLE turns it off.
+    f.engine.write32(ss + 16, 2);
+    require(f.sys("_sigaltstack", {ss, 0}) == UINT64_MAX && f.engine.read32(f.sys("___error")) == 22, "EINVAL");
+    f.engine.write32(ss + 16, 0); f.engine.write64(ss + 8, 4096);
+    require(f.sys("_sigaltstack", {ss, 0}) == UINT64_MAX && f.engine.read32(f.sys("___error")) == 12, "ENOMEM");
+    f.engine.write32(ss + 16, 4);
+    require(f.sys("_sigaltstack", {ss, 0}) == 0 && f.sys("_sigaltstack", {0, old}) == 0 && f.engine.read32(old + 16) == 4, "SS_DISABLE");
+    f.sys("_signal", {30, 0});
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -1413,7 +1454,28 @@ void test_app_imports(Fixture& f) {
         f.engine.write32(seed, 0x0001330E); f.engine.write32(seed + 4, 0);
         const auto previous = f.sys("_seed48", {seed});
         require(previous && f.sys("_lrand48") == 89400484, "seed48");
-        require(f.sys("_crypt", {f.text("x"), f.text("ab")}) == 0, "crypt answers ENOSYS");
+        // crypt: the DES hashes (reference values from another crypt(3) implementation).
+        for (const auto& [key, setting, expected] : std::array<std::tuple<const char*, const char*, const char*>, 6>{{
+                 {"test", "ab", "abgOeLfPimXQo"}, {"password", "..", "..UZoIyj/Hy/c"}, {"", "ab", "abmF1QH4PEr.E"},
+                 {"test", "_J9..salt", "_J9..salthGVxOQgfL1M"}, {"abcdefghij", "_J9..salt", "_J9..saltiRi1HO8NmTo"},
+                 {"a long password over eight", "_J9..salt", "_J9..saltIWvpcSQoZS2"}}}) {
+            const auto hashed = f.sys("_crypt", {f.text(key), f.text(setting)});
+            require(hashed && f.read(hashed) == expected, std::string("crypt(\"") + key + "\", \"" + setting + "\") is " +
+                    (hashed ? f.read(hashed) : std::string("NULL")));
+        }
+        require(f.sys("_crypt", {f.text("x"), f.text("_J9")}) == 0 && f.engine.read32(f.sys("___error")) == 22, "a short extended setting");
+        // setkey and encrypt: a block encrypted and decrypted with the same key comes back.
+        const auto bits = f.process.allocate_guest(64), block = f.process.allocate_guest(64);
+        auto& memory = static_cast<transmute::GuestMemory&>(f.engine);
+        for (std::uint64_t i = 0; i < 64; ++i) { memory.write8(bits + i, static_cast<std::uint8_t>((i * 7) % 3 == 0)); memory.write8(block + i, static_cast<std::uint8_t>(i % 5 == 1)); }
+        f.sys("_setkey", {bits});
+        f.sys("_encrypt", {block, 0});
+        bool changed = false;
+        for (std::uint64_t i = 0; i < 64; ++i) changed = changed || memory.read8(block + i) != static_cast<std::uint8_t>(i % 5 == 1);
+        f.sys("_encrypt", {block, 1});
+        bool same = true;
+        for (std::uint64_t i = 0; i < 64; ++i) same = same && memory.read8(block + i) == static_cast<std::uint8_t>(i % 5 == 1);
+        require(changed && same, "encrypt and decrypt with setkey's key");
     }
     // ndbm: store, fetch, replace, insert-exists, delete, iterate, reopen.
     {
@@ -1581,6 +1643,7 @@ int main() {
         stage("b18"); test_b18(f);
         stage("b19"); test_b19(f);
         stage("b20"); test_b20(f);
+        stage("b21"); test_b21(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

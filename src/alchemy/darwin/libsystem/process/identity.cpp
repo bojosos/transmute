@@ -302,7 +302,8 @@ void DarwinServices::Impl::install_process_identity() {
     // killpg, setpgid, setsid, posix_spawn and system.
     // openpty, tcgetpgrp, tcsetpgrp: fs/terminal.cpp.
     // chflags, lchflags, fchflags: fs/files.cpp.
-    for (const auto name : {"_forkpty", "_login_tty", "_mkfifo", "_mknod", "_lchmod", "_sigaltstack"})
+    // sigaltstack: process/process_model.cpp.
+    for (const auto name : {"_forkpty", "_login_tty", "_mkfifo", "_mknod", "_lchmod"})
         install(name, [](auto&, auto&) -> std::uint64_t { throw ServiceError{enosys}; });
     for (const auto name : {"_chown", "_lchown", "_fchown", "_fchownat", "_chroot"})
         install(name, [](auto&, auto&) -> std::uint64_t { throw ServiceError{eperm}; });
