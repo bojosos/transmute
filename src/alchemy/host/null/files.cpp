@@ -44,6 +44,7 @@ Error error(const std::error_code& code) noexcept { return code ? Error::other :
 Status set_times(std::string_view, std::optional<std::int64_t>, std::optional<std::int64_t>) { return Error::unsupported; }
 Status set_link_times(std::string_view, std::optional<std::int64_t>, std::optional<std::int64_t>) { return Error::unsupported; }
 Status set_creation_time(std::string_view, std::int64_t, bool) { return Error::unsupported; }
+Status set_hidden(std::string_view, bool, bool) { return Error::unsupported; }
 Status rename(std::string_view, std::string_view, bool) { return Error::unsupported; }
 Status access(std::string_view, bool) { return Error::unsupported; }
 bool is_console(Handle) noexcept { return false; }

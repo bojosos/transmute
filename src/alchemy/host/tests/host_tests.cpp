@@ -268,6 +268,10 @@ void file_table(const std::string& directory) {
                 files::metadata(path)->created_ns == 1'000'000'000LL * 1'400'000'000 &&
                 files::metadata(path)->modified_ns == 1'000'000'000LL * 1'650'000'000,
         "set_creation_time sets only the creation time");
+    require(!files::metadata(path)->hidden && files::set_hidden(path, true) && files::metadata(path)->hidden &&
+                files::metadata(path)->modified_ns == 1'000'000'000LL * 1'650'000'000 && files::set_hidden(path, false) &&
+                !files::metadata(path)->hidden,
+        "set_hidden and Metadata::hidden");
     {
         const auto value = std::as_bytes(std::span("finder", 6));
         require(files::set_attribute(path, "com.example.keep", value) &&
@@ -495,7 +499,8 @@ void null_backend() {
     require(host::process::priority().error() == host::Error::unsupported && host::process::set_priority(0).error() == host::Error::unsupported &&
             host::process::set_background(true, true).error() == host::Error::unsupported &&
             host::files::set_link_times("x", std::nullopt, std::nullopt).error() == host::Error::unsupported &&
-            host::files::set_creation_time("x", 0).error() == host::Error::unsupported, "null priorities and link times fail");
+            host::files::set_creation_time("x", 0).error() == host::Error::unsupported &&
+            host::files::set_hidden("x", true).error() == host::Error::unsupported, "null priorities and link times fail");
     require(host::time::process_cpu_ns().error() == host::Error::unsupported, "null CPU time fails");
     require(host::process::environment_block().empty() && host::process::image_path(1).error() == host::Error::unsupported,
         "null process queries are empty");

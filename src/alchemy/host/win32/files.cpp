@@ -495,6 +495,7 @@ Result<Metadata> describe(HANDLE file, bool symlinks) {
     result.mode = information.dwFileAttributes;
     result.directory = (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     result.read_only = (information.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0;
+    result.hidden = (information.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0;
     result.owner_only = owner_only_acl(file);
     result.accessed_ns = unix_ns(basic.LastAccessTime);
     result.modified_ns = unix_ns(basic.LastWriteTime);
@@ -582,6 +583,24 @@ Status set_link_times(std::string_view path, std::optional<std::int64_t> accesse
 
 Status set_creation_time(std::string_view path, std::int64_t created_ns, bool follow) {
     return set_path_times(path, std::nullopt, std::nullopt, follow, created_ns);
+}
+
+Status set_hidden(std::string_view path, bool hidden, bool follow) {
+    // Through a handle, so that a symbolic link itself can be reached (FILE_FLAG_OPEN_REPARSE_POINT).
+    const DWORD flags = FILE_FLAG_BACKUP_SEMANTICS | (follow ? 0 : FILE_FLAG_OPEN_REPARSE_POINT);
+    const auto file = CreateFileW(win32::widen(path).c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, flags, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return win32::last_error();
+    struct Close { HANDLE handle; ~Close() { CloseHandle(handle); } } close{file};
+    FILE_BASIC_INFO basic{};
+    if (!GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic))) return win32::last_error();
+    const DWORD changed = hidden ? (basic.FileAttributes | FILE_ATTRIBUTE_HIDDEN) : (basic.FileAttributes & ~DWORD{FILE_ATTRIBUTE_HIDDEN});
+    if (changed == basic.FileAttributes) return {};
+    // Zero times leave them as they are; no attribute at all is FILE_ATTRIBUTE_NORMAL.
+    FILE_BASIC_INFO update{};
+    update.FileAttributes = changed ? changed : FILE_ATTRIBUTE_NORMAL;
+    if (!SetFileInformationByHandle(file, FileBasicInfo, &update, sizeof(update))) return win32::last_error();
+    return {};
 }
 
 Status rename(std::string_view from, std::string_view to, bool replace) {

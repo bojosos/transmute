@@ -82,6 +82,7 @@ struct Metadata {
     std::uint64_t device{}, inode{}, size{}, allocated{}, links{};
     std::uint32_t mode{};                      // the host's attribute or mode bits
     bool directory{}, symlink{}, read_only{}, owner_only{};
+    bool hidden{};                             // the host's hidden attribute (chflags UF_HIDDEN)
     std::int64_t accessed_ns{}, modified_ns{}, changed_ns{}, created_ns{};   // Unix epoch
 };
 [[nodiscard]] Result<Metadata> metadata(std::string_view path, bool follow = true);
@@ -105,6 +106,8 @@ struct Identity {
 // A path's creation (birth) time, Unix-epoch nanoseconds (setattrlist ATTR_CMN_CRTIME); with `follow` false, a
 // symbolic link's own.
 [[nodiscard]] Status set_creation_time(std::string_view path, std::int64_t created_ns, bool follow = true);
+// Sets or clears a path's hidden attribute (chflags UF_HIDDEN); with `follow` false, a symbolic link's own.
+[[nodiscard]] Status set_hidden(std::string_view path, bool hidden, bool follow = true);
 // rename(2); without `replace` an existing `to` fails with Error::exists,
 // checked atomically by the host.
 [[nodiscard]] Status rename(std::string_view from, std::string_view to, bool replace);
