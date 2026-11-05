@@ -1,6 +1,7 @@
 #include "alchemy/darwin_threads.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <thread>
@@ -143,6 +144,61 @@ void test_explicit_thread_exit() {
     require(cleanups == 1, "pthread_exit did not execute its cleanup handler");
     require(!f.process.requested_exit(), "pthread_exit terminated the process");
 }
+// Deferred cancellation: a worker looping on pthread_testcancel, and one waiting in pthread_cond_wait, end as
+// pthread_exit(PTHREAD_CANCELED) at the request, running their cleanup handlers; the waiter holds the mutex again.
+void test_cancellation() {
+    Fixture f;
+    const auto address = [&](std::string_view name) {
+        const auto exported = f.process.resolve(system_library, name);
+        require(exported.has_value(), "pthread export missing");
+        return exported->address;
+    };
+    static std::atomic<std::uint64_t> cleaned{0};
+    const auto cleanup = f.engine.register_guest_call([](auto& state, auto&) { cleaned += state.x[0]; });
+    // ldr x<reg>, the literal at `literal`; blr x16; b back by `instructions`.
+    const auto load = [&](std::uint64_t at, std::uint32_t reg, std::uint64_t literal) {
+        f.engine.write32(at, 0x58000000U | static_cast<std::uint32_t>(((literal - at) / 4) << 5) | reg);
+    };
+    constexpr std::uint32_t call_x16 = 0xd63f0200;
+    const auto back = [](std::uint32_t instructions) { return 0x14000000U | ((0U - instructions) & 0x03ffffffU); };
+    const auto mutex = data + 1600, condition = data + 1700;
+    // Worker 1 at code: push cleanup(5), then pthread_testcancel forever.
+    const auto pool = code + 2048;
+    f.engine.write64(pool, data + 128); f.engine.write64(pool + 8, cleanup); f.engine.write64(pool + 16, 5);
+    f.engine.write64(pool + 24, address("___alchemy_pthread_cleanup_push")); f.engine.write64(pool + 32, address("_pthread_testcancel"));
+    load(code, 0, pool); load(code + 4, 1, pool + 8); load(code + 8, 2, pool + 16); load(code + 12, 16, pool + 24);
+    f.engine.write32(code + 16, call_x16);
+    load(code + 20, 16, pool + 32); f.engine.write32(code + 24, call_x16); f.engine.write32(code + 28, back(2));
+    // Worker 2 at code + 512: lock the mutex, push cleanup(7), then pthread_cond_wait forever.
+    const auto waiter = code + 512, pool2 = code + 2560;
+    f.engine.write64(pool2, mutex); f.engine.write64(pool2 + 8, address("_pthread_mutex_lock"));
+    f.engine.write64(pool2 + 16, data + 160); f.engine.write64(pool2 + 24, cleanup); f.engine.write64(pool2 + 32, 7);
+    f.engine.write64(pool2 + 40, address("___alchemy_pthread_cleanup_push"));
+    f.engine.write64(pool2 + 48, condition); f.engine.write64(pool2 + 56, address("_pthread_cond_wait"));
+    load(waiter, 0, pool2); load(waiter + 4, 16, pool2 + 8); f.engine.write32(waiter + 8, call_x16);
+    load(waiter + 12, 0, pool2 + 16); load(waiter + 16, 1, pool2 + 24); load(waiter + 20, 2, pool2 + 32);
+    load(waiter + 24, 16, pool2 + 40); f.engine.write32(waiter + 28, call_x16);
+    load(waiter + 32, 0, pool2 + 48); load(waiter + 36, 1, pool2); load(waiter + 40, 16, pool2 + 56);
+    f.engine.write32(waiter + 44, call_x16); f.engine.write32(waiter + 48, back(4));
+    f.engine.set_memory_access(code, true, false, true);
+    require(f.call("_pthread_mutex_init", {mutex, 0}) == 0 && f.call("_pthread_cond_init", {condition, 0}) == 0, "cancel objects");
+
+    require(f.call("_pthread_create", {data, 0, code, 0}) == 0, "testcancel worker create");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    require(f.call("_pthread_cancel", {f.engine.read64(data)}) == 0, "pthread_cancel a worker");
+    require(f.call("_pthread_join", {f.engine.read64(data), data + 8}) == 0 && f.engine.read64(data + 8) == 1,
+        "a cancelled worker's result is PTHREAD_CANCELED");
+    require(cleaned == 5, "the cancelled worker ran its cleanup handler");
+
+    require(f.call("_pthread_create", {data + 16, 0, waiter, 0}) == 0, "waiting worker create");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    require(f.call("_pthread_cancel", {f.engine.read64(data + 16)}) == 0, "pthread_cancel a waiting worker");
+    require(f.call("_pthread_join", {f.engine.read64(data + 16), data + 8}) == 0 && f.engine.read64(data + 8) == 1,
+        "a worker cancelled in pthread_cond_wait ends with PTHREAD_CANCELED");
+    require(cleaned == 12, "the waiting worker ran its cleanup handler");
+    require(f.call("_pthread_mutex_trylock", {mutex}) == 16, "it took the mutex back before its cleanup handlers");
+}
+
 void test_tlv_and_cleanup() {
     Fixture f;
     alchemy::TlsTemplate tls;
@@ -234,9 +290,12 @@ void test_attributes_names_and_stop() {
     require(f.call("_pthread_getname_np", {f.call("_pthread_self", {}), buffer, 64}) == 0 &&
         f.engine.read64(buffer) == 0x00007265'6b726f77ULL, "getname");
     require(f.call("_pthread_set_qos_class_self_np", {0x19, 0}) == 0 && f.call("_pthread_set_qos_class_self_np", {0x77, 0}) == 22, "qos classes");
-    require(f.call("_pthread_cancel", {f.call("_pthread_self", {})}) == 78, "pthread_cancel is explicitly unsupported");
     require(f.call("_pthread_setcancelstate", {0, value}) == 0 && f.engine.read32(value) == 1 &&
         f.call("_pthread_setcancelstate", {1, value}) == 0 && f.engine.read32(value) == 0, "cancel state round trip");
+    // With cancellation disabled a request waits: testcancel and join return normally.
+    require(f.call("_pthread_setcancelstate", {0, 0}) == 0 && f.call("_pthread_cancel", {f.call("_pthread_self", {})}) == 0 &&
+        f.call("_pthread_testcancel", {}) == 0 && !f.process.thread(f.engine)->exit_value, "a disabled request waits");
+    require(f.call("_pthread_cancel", {0x7777000}) == 3, "pthread_cancel of an unknown thread: ESRCH");
     require(f.call("_pthread_atfork", {0, 0, 0}) == 0, "pthread_atfork records handlers");
     // A worker blocked in a libSystem wait unwinds cooperatively at process exit.
     require(f.call("_pthread_mutex_lock", {data + 1600}) == 0, "stop mutex lock");
@@ -262,6 +321,7 @@ int main() {
         test_configurable_stacks(false);
         test_configurable_stacks(true);
         test_explicit_thread_exit();
+        test_cancellation();
         test_tlv_and_cleanup();
         test_guards_and_timed_condition();
         test_address_waits_and_context_release();

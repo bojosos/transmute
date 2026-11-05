@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <optional>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <random>
 #include <thread>
+#include <vector>
 
 // Process, Mach host and dyld queries a renderer plug-in imports: libproc (proc_listpids),
 // host_statistics,
@@ -171,7 +173,15 @@ void install_libsystem_process(Provider& p) {
         const auto capacity = m.read32(count_address);
         std::vector<std::uint32_t> words;
         if (flavor == host_load_info) {
-            words.assign(6, 0);   // avenrun[3], mach_factor[3] (LOAD_SCALE 1000)
+            // host_load_info: avenrun[3], the load averages, and mach_factor[3], the processors left idle by
+            // them; LOAD_SCALE 1000.
+            const auto averages = host::system::load_average();
+            if (!averages) return kern_failure;
+            const auto processors = static_cast<double>(std::max<std::size_t>(1, host::system::processor_times().value_or(
+                std::vector<host::system::CpuTimes>(1)).size()));
+            for (const auto average : *averages) words.push_back(static_cast<std::uint32_t>(std::lround(std::max(0.0, average) * 1000)));
+            for (const auto average : *averages)
+                words.push_back(static_cast<std::uint32_t>(std::lround(std::max(0.0, processors - average) * 1000)));
         } else if (flavor == host_vm_info) {
             const auto status = memory_status();
             const auto page = darwin_arm64_page_size;

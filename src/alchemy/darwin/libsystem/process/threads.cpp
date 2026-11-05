@@ -12,6 +12,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <sstream>
 #include <thread>
@@ -124,6 +125,10 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
     std::map<std::uint64_t, unsigned> mutex_shared, condition_attributes;
     std::map<std::uint64_t, std::string> names;
     std::map<std::uint64_t, std::pair<unsigned, unsigned>> cancel_modes;
+    // pthread_cancel requests not yet acted on, by thread identity, and how many (so cancellation points cost one
+    // load while there are none).
+    std::set<std::uint64_t> cancel_requests;
+    std::atomic<std::size_t> cancel_count{};
     std::vector<std::array<std::uint64_t, 3>> fork_handlers;
     std::uint64_t next_key{1};
     std::uint64_t worker_generation{};
@@ -160,6 +165,37 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
     }
 
     bool stopping() { return closing.load() || process.requested_exit().has_value(); }
+    // Deferred cancellation: whether the calling thread has a request and cancellation enabled.
+    bool cancel_due() {
+        if (cancel_count.load(std::memory_order_relaxed) == 0) return false;
+        const auto identity = process.current_thread()->identity;
+        std::lock_guard lock(metadata);
+        if (!cancel_requests.contains(identity)) return false;
+        const auto mode = cancel_modes.find(identity);
+        return mode == cancel_modes.end() || mode->second.first == 1;
+    }
+    // Acts on it as pthread_exit(PTHREAD_CANCELED) does: the call returns into the exit shim, then the thread's
+    // cleanup handlers and key destructors run (cleanup). Cancellation is disabled from here on, as POSIX has it.
+    void act_on_cancel(transmute::CpuState& state) {
+        const auto identity = process.current_thread()->identity;
+        {
+            std::lock_guard lock(metadata);
+            cancel_requests.erase(identity);
+            cancel_count.store(cancel_requests.size());
+            cancel_modes.try_emplace(identity, 1U, 2U).first->second.first = 0;
+        }
+        state.x[0] = 1;   // PTHREAD_CANCELED
+        state.x[30] = exit_shim;
+    }
+    bool cancel_point(transmute::CpuState& state) {
+        if (!cancel_due()) return false;
+        act_on_cancel(state);
+        return true;
+    }
+    void forget_cancel(std::uint64_t identity) {
+        std::lock_guard lock(metadata);
+        if (cancel_requests.erase(identity)) cancel_count.store(cancel_requests.size());
+    }
     // Workers unwind at process exit; the main thread keeps the explicit result.
     void stop_point() { if (guest_worker_must_stop(process)) throw GuestThreadStop{}; }
 
@@ -343,6 +379,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             }
         }
         if (process.cleanup_objects) process.cleanup_objects(thread);
+        forget_cancel(thread.identity);
         for (const auto& [module, address] : thread.tls_blocks) {
             static_cast<void>(module);
             process.release_guest(address);
@@ -596,7 +633,8 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             return text.str();
         });
         add("_pthread_create", [](auto& self, auto& s, auto& m) { self.create(s, m); });
-        add("_pthread_join", [](auto& self, auto& s, auto& m) { self.join(s, m); });
+        // A cancellation point on entry; a join already waiting is not interrupted.
+        add("_pthread_join", [](auto& self, auto& s, auto& m) { if (!self.cancel_point(s)) self.join(s, m); });
         add("_pthread_self", [](auto& self, auto& s, auto&) { s.x[0] = self.self(); });
         add("_pthread_equal", [](auto&, auto& s, auto&) { s.x[0] = s.x[0] == s.x[1] ? 1 : 0; });
         add("_pthread_attr_init", [](auto& self, auto& s, auto& m) {
@@ -723,16 +761,27 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             const bool known = qos == 0x21 || qos == 0x19 || qos == 0x15 || qos == 0x11 || qos == 0x09 || qos == 0;
             s.x[0] = known && relative <= 0 && relative >= -15 ? 0 : einval;
         });
+        // int pthread_cancel(pthread_t): a request the thread acts on at its next cancellation point with
+        // cancellation enabled: pthread_testcancel, pthread_cond_wait/timedwait (also while waiting, after taking
+        // the mutex back), pthread_join (on entry). Blocking I/O and sleeps are not cancellation points here.
         add("_pthread_cancel", [](auto& self, auto& s, auto&) {
             const auto own = self.self();
+            const auto identity = self.process.current_thread()->identity;
             std::lock_guard lock(self.metadata);
-            if (s.x[0] != own && !self.workers.contains(s.x[0])) { s.x[0] = esrch; return; }
-            s.x[0] = 78; // ENOSYS: asynchronous and deferred cancellation are not implemented.
+            std::uint64_t target = identity;
+            if (s.x[0] != own) {
+                const auto found = self.workers.find(s.x[0]);
+                if (found == self.workers.end()) { s.x[0] = esrch; return; }
+                target = found->second->context->identity;
+            }
+            self.cancel_requests.insert(target);
+            self.cancel_count.store(self.cancel_requests.size());
+            s.x[0] = 0;
         });
         for (const auto& [name, type] : std::array<std::pair<const char*, bool>, 2>{{{"_pthread_setcancelstate", false}, {"_pthread_setcanceltype", true}}}) {
             add(name, [type](auto& self, auto& s, auto& m) {
-                // State 1/0 is enable/disable, type 2/0 deferred/asynchronous. No cancellation is
-                // ever delivered, so these only record the mode for the old-value output.
+                // State 1/0 is enable/disable, type 2/0 deferred/asynchronous. Asynchronous cancellation acts at
+                // the same points as deferred.
                 const auto value = static_cast<std::uint32_t>(s.x[0]);
                 if (type ? value != 0 && value != 2 : value > 1) { s.x[0] = einval; return; }
                 if (s.x[1] && !accessible(m, s.x[1], 4)) { s.x[0] = einval; return; }
@@ -744,7 +793,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                 slot = value; s.x[0] = 0;
             });
         }
-        add("_pthread_testcancel", [](auto&, auto& s, auto&) { s.x[0] = 0; });
+        add("_pthread_testcancel", [](auto& self, auto& s, auto&) { if (!self.cancel_point(s)) s.x[0] = 0; });
         add("_pthread_yield_np", [](auto&, auto& s, auto&) { std::this_thread::yield(); s.x[0] = 0; });
         for (const auto name : {"_sched_get_priority_min", "_sched_get_priority_max"}) add(name, [](auto& self, auto& s, auto&) {
             // Only the ordinary SCHED_OTHER policy is implemented.
@@ -936,6 +985,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                             Clock::time_point::max() : Clock::time_point(whole + fraction);
                     }
                 }
+                if (self.cancel_point(s)) return;
                 if (shared_condition) { s.x[0] = self.pshared_cond_wait(m, s.x[0], s.x[1], deadline); return; }
                 std::unique_lock lock(condition->gate);
                 const auto generation = condition->generation;
@@ -943,15 +993,18 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                 if (released != 0) { s.x[0] = released; return; }
                 ++condition->waiters;
                 std::uint32_t error = 0;
+                bool cancelled = false;
                 while (generation == condition->generation && condition->tickets == 0) {
                     condition->changed.wait_for(lock, poll_period);
                     if (timed && std::chrono::system_clock::now() >= deadline) { error = etimedout; break; }
                     if (self.stopping()) { error = ecanceled; break; }
+                    if (self.cancel_due()) { cancelled = true; break; }
                 }
                 if (generation == condition->generation && condition->tickets != 0) --condition->tickets;
                 --condition->waiters; lock.unlock();
                 if (error == ecanceled) self.stop_point();
                 const auto acquired = shared_mutex ? self.pshared_lock(m, s.x[1], false) : self.mutex_lock(mutex, false);
+                if (cancelled && acquired == 0) { self.act_on_cancel(s); return; }
                 s.x[0] = acquired != 0 ? acquired : error;
             });
         }

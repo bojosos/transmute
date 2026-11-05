@@ -449,6 +449,17 @@ inline std::uint64_t physical_memory() {
     if (const auto memory = host::system::memory()) return memory->physical;
     return 8ULL << 30;
 }
+// The host's 1, 5 and 15 minute load averages (host::system::load_average) in Darwin's fixed point: fixpt_t with
+// FSCALE 2048, as struct loadavg holds them.
+inline constexpr std::uint32_t load_fscale = 2048;
+inline std::array<std::uint32_t, 3> load_averages_fixed() {
+    const auto averages = host::system::load_average();
+    if (!averages) throw ServiceError{file_failure(averages.error())};
+    std::array<std::uint32_t, 3> fixed{};
+    for (std::size_t index = 0; index < fixed.size(); ++index)
+        fixed[index] = static_cast<std::uint32_t>(std::lround(std::max(0.0, (*averages)[index]) * load_fscale));
+    return fixed;
+}
 inline std::string host_cpu_brand() {
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     std::array<int, 4> registers{};
@@ -496,6 +507,16 @@ inline std::optional<SysctlValue> sysctl_named(std::string_view name) {
     if (name == "hw.optional.armv8_crc32" || name == "hw.optional.arm.FEAT_CRC32") return sysctl_integer(1, 4);
     // Other optional ISA features are reported absent so guests keep baseline code paths.
     if (name.starts_with("hw.optional.")) return sysctl_integer(0, 4);
+    // vm.loadavg: struct loadavg { fixpt_t ldavg[3]; long fscale; }, 24 bytes on arm64.
+    if (name == "vm.loadavg") {
+        SysctlValue value;
+        value.bytes.assign(24, 0);
+        const auto fixed = load_averages_fixed();
+        for (std::size_t index = 0; index < 3; ++index)
+            for (unsigned byte = 0; byte < 4; ++byte) value.bytes[index * 4 + byte] = static_cast<std::uint8_t>(fixed[index] >> (byte * 8));
+        for (unsigned byte = 0; byte < 8; ++byte) value.bytes[16 + byte] = static_cast<std::uint8_t>(std::uint64_t{load_fscale} >> (byte * 8));
+        return value;
+    }
     if (name == "kern.ostype") return sysctl_string("Darwin");
     if (name == "kern.osrelease") return sysctl_string(darwin_release);
     if (name == "kern.osversion") return sysctl_string(darwin_build);
@@ -522,12 +543,13 @@ inline std::optional<SysctlValue> sysctl_named(std::string_view name) {
 }
 // Fixed Darwin MIB numbers; int widths follow the numeric interface.
 struct SysctlMib { int top, second; std::string_view name; unsigned width; };
-inline constexpr std::array<SysctlMib, 17> sysctl_mibs{{
+inline constexpr std::array<SysctlMib, 18> sysctl_mibs{{
     {6, 1, "hw.machine", 0}, {6, 2, "hw.model", 0}, {6, 3, "hw.ncpu", 4}, {6, 4, "hw.byteorder", 4},
     {6, 7, "hw.pagesize", 4}, {6, 16, "hw.cachelinesize", 4}, {6, 17, "hw.l1icachesize", 4},
     {6, 18, "hw.l1dcachesize", 4}, {6, 20, "hw.l2cachesize", 4}, {6, 24, "hw.memsize", 8},
     {6, 25, "hw.activecpu", 4}, {1, 1, "kern.ostype", 0}, {1, 2, "kern.osrelease", 0},
-    {1, 4, "kern.version", 0}, {1, 8, "kern.argmax", 4}, {1, 10, "kern.hostname", 0}, {1, 65, "kern.osversion", 0}}};
+    {1, 4, "kern.version", 0}, {1, 8, "kern.argmax", 4}, {1, 10, "kern.hostname", 0}, {1, 65, "kern.osversion", 0},
+    {2, 2, "vm.loadavg", 0}}};
 // Names without fixed numbers get private MIBs {sysctl_private, index}.
 inline constexpr int sysctl_private = 0x414c;
 inline constexpr std::array<std::string_view, 27> sysctl_private_names{

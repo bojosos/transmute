@@ -4,6 +4,8 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
+#include <cmath>
 #include <set>
 #include <thread>
 #include <tuple>
@@ -1247,6 +1249,37 @@ void test_b21(Fixture& f) {
     f.sys("_signal", {30, 0});
 }
 
+// B22: getloadavg, sysctl vm.loadavg and host_statistics(HOST_LOAD_INFO) from the host's load averages.
+void test_b22(Fixture& f) {
+    const auto processors = static_cast<double>(std::thread::hardware_concurrency());
+    const auto averages = f.process.allocate_guest(32);
+    f.engine.write64(averages + 24, 0x5a5a5a5a5a5a5a5aULL);
+    require(f.sys("_getloadavg", {averages, 5}) == 3 && f.engine.read64(averages + 24) == 0x5a5a5a5a5a5a5a5aULL,
+            "getloadavg stores three");
+    for (std::uint64_t index = 0; index < 3; ++index) {
+        const auto value = std::bit_cast<double>(f.engine.read64(averages + index * 8));
+        require(value >= 0 && value <= processors + 0.01 && value * 2048 == std::round(value * 2048), "a load average in fixed point");
+    }
+    require(f.sys("_getloadavg", {averages, 2}) == 2 && f.sys("_getloadavg", {averages, 0}) == 0, "getloadavg stores nelem");
+    const auto buffer = f.process.allocate_guest(32), length = f.process.allocate_guest(8);
+    f.engine.write64(length, 32);
+    require(f.sys("_sysctlbyname", {f.text("vm.loadavg"), buffer, length, 0, 0}) == 0 && f.engine.read64(length) == 24 &&
+            f.engine.read64(buffer + 16) == 2048 && f.engine.read32(buffer) <= static_cast<std::uint32_t>(processors * 2048 + 21),
+            "sysctl vm.loadavg: struct loadavg");
+    const auto mib = f.process.allocate_guest(8);
+    f.engine.write32(mib, 2); f.engine.write32(mib + 4, 2); f.engine.write64(length, 32);
+    require(f.sys("_sysctl", {mib, 2, buffer, length, 0, 0}) == 0 && f.engine.read64(length) == 24 && f.engine.read64(buffer + 16) == 2048,
+            "sysctl {CTL_VM, VM_LOADAVG}");
+    const auto info = f.process.allocate_guest(24), count = f.process.allocate_guest(4);
+    f.engine.write32(count, 6);
+    require(f.sys("_host_statistics", {0, 1, info, count}) == 0 && f.engine.read32(count) == 6, "host_statistics HOST_LOAD_INFO");
+    for (std::uint64_t index = 0; index < 3; ++index) {
+        const auto load = f.engine.read32(info + index * 4), factor = f.engine.read32(info + 12 + index * 4);
+        require(load <= processors * 1000 + 10 && load + factor >= processors * 1000 - 10 && load + factor <= processors * 1000 + 10,
+                "avenrun and mach_factor add up to the processors");
+    }
+}
+
 // net/netdb_extra.cpp.
 void test_netdb_extra(Fixture& f) {
     const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
@@ -1644,6 +1677,7 @@ int main() {
         stage("b19"); test_b19(f);
         stage("b20"); test_b20(f);
         stage("b21"); test_b21(f);
+        stage("b22"); test_b22(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

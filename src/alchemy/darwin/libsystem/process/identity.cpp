@@ -117,7 +117,18 @@ void DarwinServices::Impl::install_process_identity() {
         m.write64(s.x[0] + 16, children_user / tick); m.write64(s.x[0] + 24, children_system / tick);
         return host::time::monotonic_ns() / tick;
     });
-    install("_getloadavg", [](auto&, auto&) -> std::uint64_t { throw ServiceError{enosys}; });
+    // int getloadavg(double loadavg[], int nelem): up to three of the 1, 5 and 15 minute load averages, as
+    // vm.loadavg holds them; the count stored (nelem when it is below 3, as BSD's does).
+    install("_getloadavg", [](auto& s, auto& m) -> std::uint64_t {
+        const auto wanted = static_cast<std::int32_t>(s.x[1]);
+        const auto count = std::min(wanted, 3);
+        if (count > 0) validate(m, s.x[0], static_cast<std::uint64_t>(count) * 8, true);
+        const auto fixed = load_averages_fixed();
+        for (std::int32_t index = 0; index < count; ++index)
+            m.write64(s.x[0] + static_cast<std::uint64_t>(index) * 8,
+                      std::bit_cast<std::uint64_t>(static_cast<double>(fixed[static_cast<std::size_t>(index)]) / load_fscale));
+        return static_cast<std::uint64_t>(static_cast<std::int64_t>(count));
+    });
     // getpriority/setpriority(which, who, prio) for this process: PRIO_PROCESS (0) is its nice value, -20..20,
     // as the host priority class nearest to it (only root may lower it); PRIO_DARWIN_THREAD (3, the calling
     // thread) and PRIO_DARWIN_PROCESS (4) put it in or out of the host's background mode with PRIO_DARWIN_BG
