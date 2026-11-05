@@ -112,6 +112,11 @@ struct Spawn {
     bool new_group{};                         // a new console process group (no console signals from ours)
     bool suspended{};                         // the child's first thread waits for resume()
     bool end_with_parent{};                   // the child ends when this process does (a kill-on-close job)
+    // The child outlives this process (the session launchd): no console of its
+    // own or ours, outside this process's children's job and, where the host's
+    // job limits allow it, outside the jobs this process runs in. Ignores
+    // end_with_parent.
+    bool detached{};
 };
 struct Child {
     Handle process, thread;                   // close both with host::close

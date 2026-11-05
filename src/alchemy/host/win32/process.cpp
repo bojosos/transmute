@@ -239,7 +239,9 @@ HANDLE children_job() {
         const auto handle = CreateJobObjectW(nullptr, nullptr);
         if (!handle) return HANDLE{};
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Breakaway is allowed only for children started with
+        // CREATE_BREAKAWAY_FROM_JOB (Spawn::detached); every other child stays.
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         if (!SetInformationJobObject(handle, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
             CloseHandle(handle);
             return HANDLE{};
@@ -278,14 +280,22 @@ Result<Child> spawn(const Spawn& options) {
     startup.lpAttributeList = attributes;
     DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
     if (options.suspended) flags |= CREATE_SUSPENDED;
-    if (!GetConsoleWindow()) flags |= CREATE_NO_WINDOW;   // never open a console window
+    if (options.detached) flags |= DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;   // no console at all
+    else if (!GetConsoleWindow()) flags |= CREATE_NO_WINDOW;   // never open a console window
     if (options.new_group) flags |= CREATE_NEW_PROCESS_GROUP;
     const auto directory = win32::widen(options.working_directory);
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, !list.empty(), flags, nullptr,
-                        directory.empty() ? nullptr : directory.c_str(), &startup.StartupInfo, &process))
-        return win32::last_error();
-    if (options.end_with_parent) {
+    auto created = CreateProcessW(nullptr, command.data(), nullptr, nullptr, !list.empty(), flags, nullptr,
+                                  directory.empty() ? nullptr : directory.c_str(), &startup.StartupInfo, &process);
+    if (!created && options.detached && GetLastError() == ERROR_ACCESS_DENIED) {
+        // A job this process runs in (one it did not make) refuses breakaway:
+        // the child stays in that job and ends with it.
+        flags &= ~static_cast<DWORD>(CREATE_BREAKAWAY_FROM_JOB);
+        created = CreateProcessW(nullptr, command.data(), nullptr, nullptr, !list.empty(), flags, nullptr,
+                                 directory.empty() ? nullptr : directory.c_str(), &startup.StartupInfo, &process);
+    }
+    if (!created) return win32::last_error();
+    if (options.end_with_parent && !options.detached) {
         if (const auto job = children_job(); !job || !AssignProcessToJobObject(job, process.hProcess)) {
             const auto error = win32::last_error();
             TerminateProcess(process.hProcess, 1);
