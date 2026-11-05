@@ -56,6 +56,7 @@ struct CellState final : ObjectPayload {
     std::uint64_t send_action_mask{4};        // NSEventMaskLeftMouseUp
     bool enabled{true}, highlighted{}, bordered{}, bezeled{}, editable{}, selectable{}, scrollable{}, wraps{};
     bool continuous{}, allows_mixed{}, transparent{}, draws_background{}, secure{}, pulls_down{}, single_line{};
+    bool echoes_bullets{true};                // NSSecureTextFieldCell: NO shows no characters at all
     bool truncates_last_line{}, shows_first_responder{}, frame_style_bezel{}, image_frame{};
     // NSTextField / NSTextFieldCell settings (controls/text_actions.cpp).
     Address placeholder_attributed{}, allowed_locales{}, content_type{};   // +1
@@ -148,6 +149,7 @@ struct TextState final : ObjectPayload {
     std::int64_t writing_direction{-1};                          // NSWritingDirection (-1 natural)
     bool editable{true}, selectable{true}, rich_text{true}, field_editor{}, draws_background{true};
     bool horizontally_resizable{}, vertically_resizable{true}, secure{};
+    bool echoes_bullets{true};                                   // a secure field editor: bullets, or nothing
     Address container{};                                         // +1 NSTextContainer (made on demand)
     // TextKit (text_system.cpp): the storage and layout manager the view
     // shows (+1; made on demand, decoded, or given by

@@ -124,10 +124,27 @@ indents) both ways; flattened RTFD stops, -writeRTFDToFile: writes a TXT.rtf
 directory. Find (NSTextFinder and the find panel actions) searches the find
 pasteboard's string; the find bar and the replace actions stop explicitly.
 NSFontManager's Font menu actions record the change and -convertFont:
-applies it (traits, sizes, weights); the font panel, TextKit 2, vertical
-layout and the link / list / table panels stop explicitly. NSTextField
+applies it (traits, sizes, weights). NSFontPanel (`controls/font_panel.cpp`)
+is a real floating panel built from AppKit's controls: family and typeface
+pop-ups, a size field and pop-up, a sample line; choosing sends -changeFont:
+through -modifyFontViaPanel:, and -panelConvertFont: applies only what was
+chosen (its modes, collections, favourites and effects are not provided).
+The styles panel, TextKit 2, vertical layout and the link / list / table
+panels stop explicitly. NSSecureTextField shows bullets (or nothing at all
+with -setEchosBullets:NO), its field editor too, refuses copy and cut, and
+records secure event input while edited (Carbon's EnableSecureEventInput
+count, which IsSecureEventInputEnabled answers): this process's record only,
+no keyboard input is shielded from other programs on the host.
+NSTextAttachmentCell sizes and draws its image on the baseline. NSTextField
 and NSTextInputContext keep their newer settings; the one keyboard input
 source is the host's layout.
+
+**Path items, transition layouts:** NSPathControl's -pathItems are
+NSPathControlItems viewing its component cells (an item's title or image
+changes its component); -setPathItems: makes a component per item.
+NSCollectionViewTransitionLayout interpolates its current and next layouts'
+attributes by -transitionProgress (elements only one layout has fade);
+NSCollectionView's interactive transitions are not provided.
 
 **Presentation, table editing, rotation:** NSViewController presents as a
 sheet (a window attached to the presenter's), a modal window (a modal

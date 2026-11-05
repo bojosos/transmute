@@ -17,6 +17,8 @@
 //   matrix.cpp        NSMatrix
 //   diffable.cpp      diffable data sources and snapshots
 //   compositional.cpp NSCollectionViewCompositionalLayout
+//   font_panel.cpp    NSFontPanel
+//   attachment_cell.cpp NSTextAttachmentCell
 //   text_system.cpp   NSTextStorage / NSLayoutManager / NSTextContainer /
 //                     NSTextViewSharedData coding, NSTextView's attribute,
 //                     selection and typing API, NSFontManager / NSFontPanel
@@ -116,5 +118,9 @@ void install_matrix(AppKit& kit);
 void install_diffable_data_sources(AppKit& kit);
 // NSCollectionViewCompositionalLayout and its descriptions (compositional.cpp; installed by install_small_additions).
 void install_compositional_layout(AppKit& kit);
+// NSFontPanel (font_panel.cpp; installed by text_system.cpp).
+void install_font_panel(AppKit& kit);
+// NSTextAttachmentCell (attachment_cell.cpp; installed by text_system.cpp).
+void install_attachment_cell(AppKit& kit);
 
 } // namespace alchemy::gui::completion_kit::controls

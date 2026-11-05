@@ -737,6 +737,8 @@ void GraphicsGaps::install_misc() {
     method(detector, "detectorOfType:context:options:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true);
     // Carbon.
     raw(carbon, "_EnableSecureEventInput", [this](CpuState& s, GuestMemory&) { std::lock_guard lock(mutex); ++secure_input; s.x[0] = 0; });
+    // Boolean IsSecureEventInputEnabled(void): this process's count (no system-wide secure input exists here).
+    raw(carbon, "_IsSecureEventInputEnabled", [this](CpuState& s, GuestMemory&) { std::lock_guard lock(mutex); s.x[0] = secure_input > 0 ? 1 : 0; });
     raw(carbon, "_DisableSecureEventInput", [this](CpuState& s, GuestMemory&) {
         std::lock_guard lock(mutex);
         if (secure_input) --secure_input;

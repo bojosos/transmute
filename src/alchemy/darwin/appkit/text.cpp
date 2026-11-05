@@ -38,7 +38,7 @@ TextStyle style_of(AppKit& kit, Address value, const TextState& state) {
     return style;
 }
 std::u16string shown_text(const TextState& state) {
-    if (state.secure) return std::u16string(state.value.size(), bullet);
+    if (state.secure) return state.echoes_bullets ? std::u16string(state.value.size(), bullet) : std::u16string();
     // Line and paragraph separators (-insertLineBreak:) break lines like newlines.
     auto shown = state.value;
     std::replace_if(shown.begin(), shown.end(), [](char16_t c) { return c == 0x2028 || c == 0x2029; }, char16_t{0x0a});
@@ -107,6 +107,10 @@ void AppKit::begin_field_editing(Address field) {
     editing->editable = cell_info->editable;
     editing->selectable = cell_info->selectable || cell_info->editable;
     editing->secure = cell_info->secure;
+    editing->echoes_bullets = cell_info->echoes_bullets;
+    // A secure field records secure event input while it is edited (this
+    // process's record: there is no system-wide secure input here).
+    if (editing->secure) secure_input(true);
     editing->alignment = cell_info->alignment;
     editing->scroll_x = 0;
     editing->draws_background = false;
@@ -129,6 +133,15 @@ void AppKit::begin_field_editing(Address field) {
     }
 }
 
+// Carbon's EnableSecureEventInput / DisableSecureEventInput (a count this
+// process keeps; IsSecureEventInputEnabled answers it): no keyboard input is
+// actually shielded from other programs on the host.
+void AppKit::secure_input(bool enable) {
+    constexpr std::string_view carbon = "/System/Library/Frameworks/Carbon.framework/Versions/A/Carbon";
+    const auto symbol = enable ? "_EnableSecureEventInput" : "_DisableSecureEventInput";
+    if (process.resolve(carbon, symbol)) static_cast<void>(guest_call(carbon, symbol, {}));
+}
+
 void AppKit::end_field_editing(Address field, bool send_action_too) {
     const auto control_state = extension<ControlState>(field);
     const auto editor = control_state->editor;
@@ -136,6 +149,7 @@ void AppKit::end_field_editing(Address field, bool send_action_too) {
     const auto editing = text_state(*this, editor);
     if (const auto target_cell = control_cell(*this, field))
         release(std::exchange(cell_state(*this, target_cell)->contents, string(drawing::utf8(editing->value))));
+    if (std::exchange(editing->secure, false)) secure_input(false);
     control_state->editor = 0;
     editing->client = 0;
     editing->delegate = 0;

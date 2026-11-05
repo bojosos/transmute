@@ -1130,8 +1130,7 @@ void install_text_system(AppKit& kit) {
         kit.method(fm, "sendAction", [k](CpuState& s, GuestMemory&) {
             return_bool(s, enabled && action && k->send_action(action, target, s.x[0]));
         }, "B@:");
-        // The font panel: an existing one is answered (none is ever made:
-        // the panel UI is not provided), creating one fails explicitly.
+        // The font panel (font_panel.cpp): the shared one, made when asked to create it.
         kit.method(fm, "fontPanel:", [k](CpuState& s, GuestMemory&) {
             const auto panel_class = k->objc.find_class("NSFontPanel");
             if (!bool_arg(s, 2)) {
@@ -1292,29 +1291,17 @@ void install_text_system(AppKit& kit) {
             }
             s.x[0] = font_menu;
         }, "@@:B");
-        for (const auto* name : {"orderFrontFontPanel:", "orderFrontStylesPanel:"}) {
-            const std::string selector = name;
-            kit.method(fm, selector, [selector](CpuState&, GuestMemory&) { unsupported("-[NSFontManager " + selector + "] (no font panel UI is provided)"); }, "v@:@");
-        }
+        // The font panel (font_panel.cpp) is ordered front; the styles panel is not provided.
+        kit.method(fm, "orderFrontFontPanel:", [k](CpuState& s, GuestMemory&) {
+            const auto panel = k->send_id(k->objc.find_class("NSFontPanel"), "sharedFontPanel");
+            static_cast<void>(k->send_id(panel, "orderFront:", {s.x[2]}));
+        }, "v@:@");
+        kit.method(fm, "orderFrontStylesPanel:", [](CpuState&, GuestMemory&) { unsupported("-[NSFontManager orderFrontStylesPanel:] (no styles panel UI is provided)"); }, "v@:@");
         static Address panel_factory{};
         kit.class_method(fm, "setFontPanelFactory:", [](CpuState& s, GuestMemory&) { panel_factory = s.x[2]; }, "v@:#");   // kept: no panel is made
     }
-    if (const auto panel = kit.objc.find_class("NSFontPanel")) {
-        // With no panel UI there is never a pending panel change: the font is unchanged.
-        kit.method(panel, "panelConvertFont:", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[2]; });
-        // Settings of a panel that is never shown (kept for the getters).
-        static Address accessory{}, panel_font{};   // +1
-        static bool panel_enabled = true, panel_multiple{};
-        kit.method(panel, "accessoryView", [](CpuState& s, GuestMemory&) { s.x[0] = accessory; });
-        kit.method(panel, "setAccessoryView:", [k](CpuState& s, GuestMemory&) { k->assign(accessory, s.x[2]); }, "v@:@");
-        kit.method(panel, "isEnabled", [](CpuState& s, GuestMemory&) { return_bool(s, panel_enabled); }, "B@:");
-        kit.method(panel, "setEnabled:", [](CpuState& s, GuestMemory&) { panel_enabled = bool_arg(s, 2); }, "v@:B");
-        kit.method(panel, "setPanelFont:isMultiple:", [k](CpuState& s, GuestMemory&) {
-            k->assign(panel_font, s.x[2]);
-            panel_multiple = bool_arg(s, 3);
-        }, "v@:@B");
-        kit.method(panel, "reloadDefaultFontFamilies", [](CpuState&, GuestMemory&) {}, "v@:");   // the families are read when shown, and it never is
-    }
+    install_font_panel(kit);   // font_panel.cpp: the shared font panel
+    install_attachment_cell(kit);   // attachment_cell.cpp
     install_text_layout(kit);
     install_text_actions(kit);
     install_text_finder(kit);

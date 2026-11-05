@@ -675,6 +675,7 @@ struct AppKit : std::enable_shared_from_this<AppKit> {
     Address field_editor_for(Address window_object);
     void begin_field_editing(Address text_field_object);
     void end_field_editing(Address text_field_object, bool send_action_too);
+    void secure_input(bool enable);   // text.cpp: a secure field's editing (Carbon's secure event input count)
     Address editing_field_editor(Address text_field_object);   // 0 when not editing
     void install_containers();
     void install_index_sets();

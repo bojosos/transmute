@@ -1189,7 +1189,7 @@ void AppKit::install_text_fields() {
         const auto& th = theme_for(owner);
         auto style = cell_text_style(*this, self, th);
         auto value = cell_text(*this, self);
-        if (state->secure) value.assign(value.size(), char16_t{0x2022});
+        if (state->secure) value.assign(state->echoes_bullets ? value.size() : 0, char16_t{0x2022});
         if (value.empty() && state->placeholder) {
             value = string16(state->placeholder);
             style.color = th.secondary_text;
@@ -1209,9 +1209,11 @@ void AppKit::install_text_fields() {
         s.x[0] = objc.send_super(s.x[0], secure_text_field_cell, sel("initTextCell:"), registers).x0;
         cs(s.x[0])->secure = true;
     });
-    method(secure_text_field_cell, "echosBullets", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
-    method(secure_text_field_cell, "setEchosBullets:", [](CpuState& s, GuestMemory&) {
-        if (!bool_arg(s, 2)) unsupported("-[NSSecureTextFieldCell setEchosBullets:NO]");
+    // echosBullets NO: the field shows no characters at all (nor bullets) while keeping its value.
+    method(secure_text_field_cell, "echosBullets", [cs](CpuState& s, GuestMemory&) { return_bool(s, cs(s.x[0])->echoes_bullets); }, "B@:");
+    method(secure_text_field_cell, "setEchosBullets:", [this, cs](CpuState& s, GuestMemory&) {
+        cs(s.x[0])->echoes_bullets = bool_arg(s, 2);
+        if (const auto view = cs(s.x[0])->control_view) invalidate_view(view);
     }, "v@:B");
 
     const auto f = text_field;

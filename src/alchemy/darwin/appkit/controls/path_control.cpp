@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <tuple>
 
 // NSPathControl / NSPathCell / NSPathComponentCell (the inspectors' file
 // target path): the URL split into component cells (layout.cpp split_path),
@@ -13,6 +14,11 @@
 // component makes it -clickedPathComponentCell and sends the action; a
 // double click sends the double action. Nib decoding reads the URL, the
 // component cells, the style, the placeholder and the delegate.
+// NSPathControlItem (macOS 10.10): -pathItems are views of the component
+// cells (changing an item's title or image changes its component), and
+// -setPathItems: makes a component cell per item (title or attributed title,
+// image; items made by the application have no URL); -clickedPathItem is the
+// item of the clicked component.
 namespace alchemy::gui::completion_kit::controls {
 namespace {
 using namespace appkit;
@@ -35,6 +41,9 @@ struct PathState final : ObjectPayload {
     bool editable{};
 };
 struct ComponentState final : ObjectPayload { Address url{}; };   // +1
+// NSPathControlItem: a view of one component cell (+1) of a path control, or,
+// for an item the application made and has not set yet, its own values (+1).
+struct ItemState final : ObjectPayload { Address cell{}, title{}, attributed{}, image{}; };
 
 constexpr double separator_width = 14;   // the chevron between components
 constexpr double icon_size = 16;
@@ -455,6 +464,70 @@ void install_path_control(AppKit& kit) {
         const auto action = clicks >= 2 && state->double_action ? state->double_action : info->action;
         static_cast<void>(k->send_id(self, "sendAction:to:", {action, info->target}));
     }, "v@:@");
+    // ---- NSPathControlItem ----
+    const auto item_class = kit.declare_class("NSPathControlItem", "NSObject");
+    const auto item_of = [k](Address item) { return k->objc.host_state<ItemState>(item); };
+    const auto item_for = [k, item_class, item_of](Address cell) {   // an autoreleased item viewing `cell`
+        const auto item = k->alloc_init(item_class);
+        item_of(item)->cell = k->retain(cell);
+        return k->autorelease(item);
+    };
+    kit.method(item_class, "dealloc", [k, item_class](CpuState& s, GuestMemory&) {
+        if (const auto state = k->objc.find_host_state<ItemState>(s.x[0]))
+            for (auto* slot : {&state->cell, &state->title, &state->attributed, &state->image}) k->release(std::exchange(*slot, 0));
+        static_cast<void>(k->objc.send_super(s.x[0], item_class, k->sel("dealloc")));
+    }, "v@:");
+    for (const auto& [getter, setter, cell_getter, cell_setter, member] :
+         std::initializer_list<std::tuple<const char*, const char*, const char*, const char*, Address ItemState::*>>{
+             {"title", "setTitle:", "stringValue", "setStringValue:", &ItemState::title},
+             {"attributedTitle", "setAttributedTitle:", "attributedStringValue", "setAttributedStringValue:", &ItemState::attributed},
+             {"image", "setImage:", "image", "setImage:", &ItemState::image}}) {
+        kit.method(item_class, getter, [k, item_of, cell_getter = std::string(cell_getter), member = member](CpuState& s, GuestMemory&) {
+            const auto state = item_of(s.x[0]);
+            s.x[0] = state->cell ? k->send_id(state->cell, cell_getter) : (*state).*member;
+        });
+        kit.method(item_class, setter, [k, item_of, cell_setter = std::string(cell_setter), member = member](CpuState& s, GuestMemory&) {
+            const auto state = item_of(s.x[0]);
+            if (!state->cell) { k->assign((*state).*member, s.x[2]); return; }
+            static_cast<void>(k->send_id(state->cell, cell_setter, {s.x[2]}));
+            if (const auto view = cell_state(*k, state->cell)->control_view) k->invalidate_view(view);
+        }, "v@:@");
+    }
+    kit.method(item_class, "URL", [k, item_of](CpuState& s, GuestMemory&) {
+        const auto cell = item_of(s.x[0])->cell;
+        s.x[0] = cell ? component_of(*k, cell)->url : 0;
+    });
+    kit.method(control_class, "pathItems", [k, item_for](CpuState& s, GuestMemory&) {
+        std::vector<Address> items;
+        const auto cells = k->send_id(s.x[0], "pathComponentCells");
+        for (const auto cell : cells ? k->items(cells) : std::vector<Address>{}) items.push_back(item_for(cell));
+        s.x[0] = k->auto_array(items);
+    });
+    kit.method(control_class, "setPathItems:", [k, item_of](CpuState& s, GuestMemory&) {
+        const auto control = s.x[0];
+        const auto component_class = k->send(k->objc.object_class(k->send_id(control, "cell")), "pathComponentCellClass").x0;
+        std::vector<Address> cells;
+        for (const auto item : s.x[2] ? k->items(s.x[2]) : std::vector<Address>{}) {
+            const auto state = item_of(item);
+            const auto cell = k->alloc_init(component_class);
+            const auto title = k->send_id(item, "title");
+            const auto attributed = k->send_id(item, "attributedTitle");
+            if (attributed) static_cast<void>(k->send_id(cell, "setAttributedStringValue:", {attributed}));
+            else static_cast<void>(k->send_id(cell, "setStringValue:", {title ? title : k->auto_string("")}));
+            if (const auto image = k->send_id(item, "image")) static_cast<void>(k->send_id(cell, "setImage:", {image}));
+            if (state->cell) static_cast<void>(k->send_id(cell, "setURL:", {component_of(*k, state->cell)->url}));
+            // The item now views its component.
+            for (auto* slot : {&state->title, &state->attributed, &state->image}) k->release(std::exchange(*slot, 0));
+            k->release(std::exchange(state->cell, k->retain(cell)));
+            cells.push_back(cell);
+        }
+        static_cast<void>(k->send_id(control, "setPathComponentCells:", {k->auto_array(cells)}));
+        for (const auto cell : cells) k->release(cell);
+    }, "v@:@");
+    kit.method(control_class, "clickedPathItem", [k, item_for](CpuState& s, GuestMemory&) {
+        const auto cell = k->send_id(s.x[0], "clickedPathComponentCell");
+        s.x[0] = cell ? item_for(cell) : 0;
+    });
 }
 
 } // namespace alchemy::gui::completion_kit::controls

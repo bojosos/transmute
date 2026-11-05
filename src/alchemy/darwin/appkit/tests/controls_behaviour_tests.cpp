@@ -27,6 +27,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1855,9 +1856,22 @@ void fonts_and_fields(Fixture& f) {
             "family names and collections");
     const auto menu = f.id(fonts, "fontMenu:", {1});
     require(menu && f.id(fonts, "fontMenu:", {0}) == menu && f.integer(menu, "numberOfItems") == 7, "the Font menu");
+    // The font panel: ordered front, it shows a font; only the choices made in it convert fonts.
+    static_cast<void>(f.id(fonts, "orderFrontFontPanel:", {0}));
+    const auto font_panel = f.id(fonts, "fontPanel:", {0});
+    require(font_panel && f.yes(f.cls("NSFontPanel"), "sharedFontPanelExists") && f.yes(font_panel, "isVisible"), "the font panel is shown");
+    static_cast<void>(f.id(font_panel, "setPanelFont:isMultiple:", {small, 0}));
+    require(f.id(font_panel, "panelConvertFont:", {small}) == small, "with no choice the font is unchanged");
+    const auto size_sender = f.with_rect(f.id(f.cls("NSTextField"), "alloc"), "initWithFrame:", {{0, 0}, {40, 20}});
+    static_cast<void>(f.with_double(size_sender, "setDoubleValue:", 24));
+    static_cast<void>(f.id(font_panel, "_alchemySizeChosen:", {size_sender}));
+    const auto resized = f.id(font_panel, "panelConvertFont:", {small});
+    require(resized && f.send(resized, "pointSize").d(0) == 24 && f.text(f.id(resized, "familyName")) == f.text(f.id(small, "familyName")),
+            "a size chosen in the panel converts the size only");
+    static_cast<void>(f.id(font_panel, "orderOut:", {0}));
     stopped = false;
-    try { static_cast<void>(f.id(fonts, "orderFrontFontPanel:", {0})); } catch (const std::exception&) { stopped = true; }
-    require(stopped, "the font panel stops explicitly");
+    try { static_cast<void>(f.id(fonts, "orderFrontStylesPanel:", {0})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "the styles panel stops explicitly");
 
     // Text fields and their cells.
     const auto field = f.with_rect(f.id(f.cls("NSTextField"), "alloc"), "initWithFrame:", {{0, 0}, {100, 22}});
@@ -2339,6 +2353,121 @@ void table_bindings(Fixture& f) {
     for (const auto* name : {"content", "selectionIndexPaths"}) static_cast<void>(f.id(outline, "unbind:", {f.str(name)}));
 }
 
+// ---- NSSecureTextField, NSTextAttachmentCell, NSPathControlItem, NSCollectionViewTransitionLayout --------
+void qlab_classes(Fixture& f) {
+    // A secure field: bullets by default, nothing at all without echoing; secure input recorded while edited.
+    const auto secure = f.with_rect(f.id(f.cls("NSSecureTextField"), "alloc"), "initWithFrame:", {{10, 10}, {150, 22}});
+    const auto other = f.with_rect(f.id(f.cls("NSSecureTextField"), "alloc"), "initWithFrame:", {{10, 50}, {150, 22}});
+    for (const auto field : {secure, other}) {
+        static_cast<void>(f.id(field, "setStringValue:", {f.str("hunter2hunter2")}));
+        static_cast<void>(f.id(field, "setBezeled:", {0}));
+        static_cast<void>(f.id(field, "setDrawsBackground:", {0}));
+    }
+    require(f.yes(f.id(secure, "cell"), "echosBullets"), "bullets by default");
+    static_cast<void>(f.id(f.id(other, "cell"), "setEchosBullets:", {0}));
+    require(!f.yes(f.id(other, "cell"), "echosBullets") && f.text(f.id(other, "stringValue")) == "hunter2hunter2", "echosBullets NO keeps the value");
+    const auto window = f.make_window({{0, 0}, {300, 200}});
+    // A plain field first takes the window's initial focus, so neither secure field is being edited.
+    const auto focus = f.with_rect(f.id(f.cls("NSTextField"), "alloc"), "initWithFrame:", {{10, 130}, {150, 22}});
+    static_cast<void>(f.id(f.id(window, "contentView"), "addSubview:", {focus}));
+    static_cast<void>(f.id(f.id(window, "contentView"), "addSubview:", {secure}));
+    static_cast<void>(f.id(f.id(window, "contentView"), "addSubview:", {other}));
+    f.show(window);
+    static_cast<void>(f.id(window, "makeFirstResponder:", {focus}));
+    const auto bullets = marked(f, window, {{14, 12}, {140, 18}}), nothing = marked(f, window, {{14, 52}, {140, 18}});
+    require(f.id(secure, "currentEditor") == 0 && bullets > 40 && nothing < 5,
+            "bullets shown (" + std::to_string(bullets) + "), nothing echoed (" + std::to_string(nothing) + ")");
+    constexpr std::string_view carbon = "/System/Library/Frameworks/Carbon.framework/Versions/A/Carbon";
+    const auto secure_enabled = [&f, carbon]() -> std::optional<bool> {
+        const auto found = f.process.resolve(carbon, "_IsSecureEventInputEnabled");
+        if (!found) return std::nullopt;
+        return (f.engine.invoke_callback(found->address, {}) & 0xff) != 0;
+    };
+    const auto before = secure_enabled();
+    f.click(window, {50, 21});
+    require(f.id(secure, "currentEditor") != 0, "editing the secure field");
+    require(marked(f, window, {{14, 12}, {140, 18}}) > 40, "the field editor shows bullets too");
+    if (before) require(*secure_enabled(), "secure event input while a secure field is edited");
+    static_cast<void>(f.id(window, "makeFirstResponder:", {0}));
+    if (before) require(!*secure_enabled(), "and not after");
+    static_cast<void>(f.id(window, "close"));
+
+    // A text attachment cell: its image's size, on the baseline.
+    CallRegs image_size;
+    gui::appkit::put_size(image_size, 0, {20, 10});
+    const auto sized = f.send(f.id(f.cls("NSImage"), "alloc"), "initWithSize:", image_size).x0;
+    const auto cell = f.id(f.id(f.cls("NSTextAttachmentCell"), "alloc"), "initImageCell:", {sized});
+    // (NSTextAttachment is the values kit's, not installed here: any object stands for it.)
+    const auto attachment = f.id(f.id(f.cls("NSObject"), "alloc"), "init");
+    static_cast<void>(f.id(cell, "setAttachment:", {attachment}));
+    CallRegs frame_request;
+    gui::appkit::put_rect(frame_request, 0, {{0, 0}, {300, 20}});
+    frame_request.set_d(4, 7); frame_request.set_d(5, 0);
+    frame_request.x[3] = 3;
+    const auto cell_frame = f.send(cell, "cellFrameForTextContainer:proposedLineFragment:glyphPosition:characterIndex:", frame_request);
+    require(f.id(cell, "attachment") == attachment && f.send(cell, "cellSize").d(0) == 20 && cell_frame.d(2) == 20 && cell_frame.d(3) == 10 &&
+                cell_frame.d(0) == 0 && f.yes(cell, "wantsToTrackMouse"),
+            "NSTextAttachmentCell size and frame");
+
+    // Path control items: views of the component cells; setting items makes components.
+    const auto control = f.with_rect(f.id(f.cls("NSPathControl"), "alloc"), "initWithFrame:", {{10, 30}, {380, 22}});
+    static_cast<void>(f.id(control, "setURL:", {f.id(f.cls("NSURL"), "URLWithString:", {f.str("file:///Users/bob/Music/song.wav")})}));
+    const auto items = f.id(control, "pathItems");
+    const auto count = f.integer(items, "count");
+    const auto last = f.id(items, "objectAtIndex:", {static_cast<Address>(count - 1)});
+    require(count >= 5 && f.text(f.id(last, "title")) == "song.wav" && f.text(f.id(f.id(last, "URL"), "lastPathComponent")) == "song.wav", "pathItems");
+    static_cast<void>(f.id(last, "setTitle:", {f.str("Song")}));
+    const auto cells = f.id(control, "pathComponentCells");
+    require(f.text(f.id(f.id(cells, "objectAtIndex:", {static_cast<Address>(count - 1)}), "stringValue")) == "Song", "an item's title changes its component");
+    const auto first_item = f.id(f.id(f.cls("NSPathControlItem"), "alloc"), "init");
+    const auto second_item = f.id(f.id(f.cls("NSPathControlItem"), "alloc"), "init");
+    static_cast<void>(f.id(first_item, "setTitle:", {f.str("Show")}));
+    static_cast<void>(f.id(second_item, "setTitle:", {f.str("Cue 1")}));
+    require(f.text(f.id(first_item, "title")) == "Show" && f.id(first_item, "URL") == 0, "an item of its own");
+    static_cast<void>(f.id(control, "setPathItems:", {f.cf.array(std::vector<Address>{first_item, second_item})}));
+    const auto made = f.id(control, "pathComponentCells");
+    require(f.integer(made, "count") == 2 && f.text(f.id(f.id(made, "objectAtIndex:", {1}), "stringValue")) == "Cue 1" &&
+                f.text(f.id(f.id(f.id(control, "pathItems"), "objectAtIndex:", {0}), "title")) == "Show",
+            "setPathItems: makes the components");
+
+    // A transition layout halfway between item sizes 100x50 and 50x50.
+    const auto item_class = f.subclass("TestU35Item", "NSCollectionViewItem");
+    f.add(item_class, "loadView", [&f](CpuState& s, GuestMemory&) {
+        static_cast<void>(f.id(s.x[0], "setView:", {f.with_rect(f.id(f.cls("NSView"), "alloc"), "initWithFrame:", {{0, 0}, {10, 10}})}));
+    }, "v@:");
+    const auto flow = [&f](double width, double height) {
+        const auto layout = f.id(f.id(f.cls("NSCollectionViewFlowLayout"), "alloc"), "init");
+        CallRegs size;
+        gui::appkit::put_size(size, 0, {width, height});
+        static_cast<void>(f.send(layout, "setItemSize:", size));
+        return layout;
+    };
+    const auto wide = flow(100, 50), square = flow(50, 50);
+    const auto transition = f.id(f.id(f.cls("NSCollectionViewTransitionLayout"), "alloc"), "initWithCurrentLayout:nextLayout:", {wide, square});
+    require(f.id(transition, "currentLayout") == wide && f.id(transition, "nextLayout") == square, "the two layouts");
+    const auto view = f.with_rect(f.id(f.cls("NSCollectionView"), "alloc"), "initWithFrame:", {{0, 0}, {400, 300}});
+    static_cast<void>(f.id(view, "registerClass:forItemWithIdentifier:", {item_class, f.str("cell")}));
+    const auto provider = f.block("u35_item_provider", [&f](CpuState& s, GuestMemory&) {
+        s.x[0] = f.id(s.x[1], "makeItemWithIdentifier:forIndexPath:", {f.str("cell"), s.x[2]});
+    });
+    static_cast<void>(f.id(view, "setCollectionViewLayout:", {transition}));
+    const auto source = f.id(f.id(f.cls("NSCollectionViewDiffableDataSource"), "alloc"), "initWithCollectionView:itemProvider:", {view, provider});
+    const auto snapshot = f.id(f.id(f.cls("NSDiffableDataSourceSnapshot"), "alloc"), "init");
+    static_cast<void>(f.id(snapshot, "appendSectionsWithIdentifiers:", {f.cf.array(std::vector<Address>{f.str("S")})}));
+    static_cast<void>(f.id(snapshot, "appendItemsWithIdentifiers:", {f.cf.array(std::vector<Address>{f.str("a"), f.str("b")})}));
+    static_cast<void>(f.with_double(transition, "setTransitionProgress:", 0.5));
+    static_cast<void>(f.id(source, "applySnapshot:animatingDifferences:", {snapshot, 0}));
+    const auto path = f.id(f.cls("NSIndexPath"), "indexPathForItem:inSection:", {0, 0});
+    const auto halfway = f.send(f.id(transition, "layoutAttributesForItemAtIndexPath:", {path}), "frame");
+    require(halfway.d(2) == 75 && halfway.d(3) == 50 && f.send(transition, "transitionProgress").d(0) == 0.5,
+            "items halfway between the layouts: " + std::to_string(halfway.d(2)));
+    CallRegs spin;
+    spin.set_d(0, 0.25);
+    spin.x[2] = f.str("spin");
+    static_cast<void>(f.send(transition, "updateValue:forAnimatedKey:", spin));
+    require(f.send(transition, "valueForAnimatedKey:", [&] { CallRegs r; r.x[2] = f.str("spin"); return r; }()).d(0) == 0.25, "animated keys");
+}
+
 // ---- NSRulerView and NSScrollView rulers / insets -------------------------------------------------
 void rulers(Fixture& f) {
     const auto scroll = f.with_rect(f.id(f.cls("NSScrollView"), "alloc"), "initWithFrame:", {{0, 0}, {300, 200}});
@@ -2475,7 +2604,7 @@ void small_additions(Fixture& f) {
     require(f.id(fonts, "availableMembersOfFontFamily:", {f.str("No Such Family Here")}) == 0, "an unknown family has no members");
     const auto chosen = f.with_double(f.cls("NSFont"), "systemFontOfSize:", 17);
     static_cast<void>(f.id(fonts, "setSelectedFont:isMultiple:", {chosen, 0}));
-    require(f.id(fonts, "selectedFont") == chosen && f.id(fonts, "fontPanel:", {0}) == 0, "the font manager's selected font");
+    require(f.id(fonts, "selectedFont") == chosen, "the font manager's selected font");
     // NSTouch answers its API (no touches are delivered).
     require(f.objc.responds(f.id(f.cls("NSTouch"), "alloc"), f.objc.selector("normalizedPosition")), "NSTouch");
 }
@@ -2704,6 +2833,7 @@ int main() {
         diffable_sources(f);
         compositional(f);
         table_bindings(f);
+        qlab_classes(f);
         rulers(f);
         accessibility(f);
         small_additions(f);

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <mutex>
 #include <set>
 
 // NSCollectionView (QLab's template chooser, and sectioned collections):
@@ -400,6 +401,8 @@ void install_index_paths(AppKit& kit) {
 }
 
 } // namespace
+
+void install_transition_layout(AppKit& kit);
 
 void install_collection_view(AppKit& kit) {
     auto* const k = &kit;
@@ -1076,6 +1079,156 @@ void install_collection_view(AppKit& kit) {
             static_cast<void>(k->send_id(self, "scrollToItemsAtIndexPaths:scrollPosition:", {path_set(*k, *state, {next}), 0}));
         }, "v@:@");
     }
+    install_transition_layout(kit);
+}
+
+// NSCollectionViewTransitionLayout: a layout between two others. Both are
+// prepared for the collection view, and their attributes are interpolated by
+// -transitionProgress (0: the current layout, 1: the next): an element both
+// lay out moves and fades between them; one only the current layout has
+// fades out, one only the next has fades in; the content size is
+// interpolated too. Setting the progress lays the collection view out again.
+// -updateValue:forAnimatedKey: keeps the values -valueForAnimatedKey:
+// answers (a subclass's own animated parameters). NSCollectionView's
+// interactive transitions (-startInteractiveTransitionToCollectionViewLayout:)
+// are not provided: a transition layout is set like any layout.
+void install_transition_layout(AppKit& kit) {
+    auto* const k = &kit;
+    struct TransitionState final : ObjectPayload {
+        Address current{}, next{};             // +1
+        double progress{};
+        std::map<std::string, double> values;  // -updateValue:forAnimatedKey:
+    };
+    const auto tl = kit.declare_class("NSCollectionViewTransitionLayout", "NSCollectionViewLayout");
+    // (A layout already carries LayoutState: the transition's own state is kept by layout object.)
+    static std::mutex transitions_mutex;
+    static std::map<Address, std::shared_ptr<TransitionState>> transitions;
+    const auto state_of = [](Address self) {
+        std::lock_guard lock(transitions_mutex);
+        auto& slot = transitions[self];
+        if (!slot) slot = std::make_shared<TransitionState>();
+        return slot;
+    };
+    kit.method(tl, "initWithCurrentLayout:nextLayout:", [k, tl, state_of](CpuState& s, GuestMemory&) {
+        const auto self = k->objc.send_super(s.x[0], tl, k->sel("init")).x0;
+        s.x[0] = self;
+        if (!self) return;
+        const auto state = state_of(self);
+        state->current = k->retain(s.x[2]);
+        state->next = k->retain(s.x[3]);
+    });
+    kit.method(tl, "dealloc", [k, tl](CpuState& s, GuestMemory&) {
+        std::shared_ptr<TransitionState> state;
+        {
+            std::lock_guard lock(transitions_mutex);
+            if (const auto found = transitions.find(s.x[0]); found != transitions.end()) { state = found->second; transitions.erase(found); }
+        }
+        if (state) {
+            k->release(std::exchange(state->current, 0));
+            k->release(std::exchange(state->next, 0));
+        }
+        static_cast<void>(k->objc.send_super(s.x[0], tl, k->sel("dealloc")));
+    }, "v@:");
+    kit.method(tl, "currentLayout", [state_of](CpuState& s, GuestMemory&) { s.x[0] = state_of(s.x[0])->current; });
+    kit.method(tl, "nextLayout", [state_of](CpuState& s, GuestMemory&) { s.x[0] = state_of(s.x[0])->next; });
+    kit.method(tl, "transitionProgress", [state_of](CpuState& s, GuestMemory&) { set_d(s, 0, state_of(s.x[0])->progress); }, "d@:");
+    kit.method(tl, "setTransitionProgress:", [k, state_of](CpuState& s, GuestMemory&) {
+        state_of(s.x[0])->progress = std::clamp(d(s, 0), 0.0, 1.0);
+        static_cast<void>(k->send(s.x[0], "invalidateLayout"));
+    }, "v@:d");
+    kit.method(tl, "updateValue:forAnimatedKey:", [k, state_of](CpuState& s, GuestMemory&) {
+        if (s.x[2]) state_of(s.x[0])->values[k->text(s.x[2])] = d(s, 0);
+    }, "v@:d@");
+    kit.method(tl, "valueForAnimatedKey:", [k, state_of](CpuState& s, GuestMemory&) {
+        const auto state = state_of(s.x[0]);
+        const auto found = s.x[2] ? state->values.find(k->text(s.x[2])) : state->values.end();
+        set_d(s, 0, found == state->values.end() ? 0.0 : found->second);
+    }, "d@:@");
+    // Both layouts work for this layout's collection view.
+    kit.method(tl, "prepareLayout", [k, state_of](CpuState& s, GuestMemory&) {
+        const auto state = state_of(s.x[0]);
+        const auto collection = layout_of(*k, s.x[0])->collection;
+        for (const auto inner : {state->current, state->next}) {
+            if (!inner) continue;
+            layout_of(*k, inner)->collection = collection;
+            static_cast<void>(k->send(inner, "prepareLayout"));
+        }
+    }, "v@:");
+    const auto content_of = [k](Address layout_object) { return layout_object ? result_size(k->send(layout_object, "collectionViewContentSize")) : Size{}; };
+    kit.method(tl, "collectionViewContentSize", [state_of, content_of](CpuState& s, GuestMemory&) {
+        const auto state = state_of(s.x[0]);
+        const auto a = content_of(state->current), b = content_of(state->next);
+        const double f = state->progress;
+        return_size(s, {a.width + (b.width - a.width) * f, a.height + (b.height - a.height) * f});
+    }, "{CGSize=dd}@:");
+    // The interpolated attributes of both layouts' elements (keyed by category, kind and index path).
+    struct Element { Rect frame; double alpha{1}; Address path{}; std::int64_t category{}; std::string kind; };
+    const auto elements_of = [k](Address layout_object) {
+        std::map<std::string, Element> out;
+        if (!layout_object) return out;
+        CallRegs everything;
+        put_rect(everything, 0, {{-1e6, -1e6}, {2e6, 2e6}});
+        const auto list = k->send(layout_object, "layoutAttributesForElementsInRect:", everything).x0;
+        for (const auto attributes : list ? k->items(list) : std::vector<Address>{}) {
+            Element e;
+            e.frame = result_rect(k->send(attributes, "frame"));
+            e.alpha = k->send(attributes, "alpha").d(0);
+            e.path = k->send_id(attributes, "indexPath");
+            e.category = static_cast<std::int64_t>(k->send(attributes, "representedElementCategory").x0);
+            e.kind = k->text(k->send_id(attributes, "representedElementKind"));
+            const auto section = e.path ? k->send_id(e.path, "section") : 0, item = e.path ? k->send_id(e.path, "item") : 0;
+            out[std::to_string(e.category) + "/" + e.kind + "/" + std::to_string(section) + "/" + std::to_string(item)] = e;
+        }
+        return out;
+    };
+    const auto blended = [k, state_of, elements_of](Address self) {
+        const auto state = state_of(self);
+        const double f = state->progress;
+        auto from = elements_of(state->current);
+        const auto to = elements_of(state->next);
+        std::vector<Element> out;
+        for (auto& [key, a] : from) {
+            const auto found = to.find(key);
+            if (found == to.end()) { a.alpha *= 1 - f; out.push_back(a); continue; }
+            const auto& b = found->second;
+            Element e = a;
+            e.frame = {{a.frame.origin.x + (b.frame.origin.x - a.frame.origin.x) * f, a.frame.origin.y + (b.frame.origin.y - a.frame.origin.y) * f},
+                       {a.frame.size.width + (b.frame.size.width - a.frame.size.width) * f, a.frame.size.height + (b.frame.size.height - a.frame.size.height) * f}};
+            e.alpha = a.alpha + (b.alpha - a.alpha) * f;
+            out.push_back(e);
+        }
+        for (const auto& [key, b] : to)
+            if (!from.contains(key)) { auto e = b; e.alpha *= f; out.push_back(e); }
+        return out;
+    };
+    const auto attributes_of = [k](const Element& e) {
+        const auto made = make_attributes(*k, e.frame, e.path, e.category, e.kind);
+        CallRegs alpha;
+        alpha.set_d(0, e.alpha);
+        static_cast<void>(k->send(made, "setAlpha:", alpha));
+        return made;
+    };
+    kit.method(tl, "layoutAttributesForElementsInRect:", [k, blended, attributes_of](CpuState& s, GuestMemory&) {
+        const auto rect = rect_arg(s);
+        std::vector<Address> list;
+        for (const auto& e : blended(s.x[0])) {
+            const auto& r = e.frame;
+            if (r.origin.x < rect.origin.x + rect.size.width && r.origin.x + r.size.width > rect.origin.x &&
+                r.origin.y < rect.origin.y + rect.size.height && r.origin.y + r.size.height > rect.origin.y)
+                list.push_back(attributes_of(e));
+        }
+        s.x[0] = k->auto_array(list);
+    }, "@@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    kit.method(tl, "layoutAttributesForItemAtIndexPath:", [k, blended, attributes_of](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0];
+        const auto section = k->send_id(s.x[2], "section"), item = k->send_id(s.x[2], "item");
+        s.x[0] = 0;
+        for (const auto& e : blended(self)) {
+            if (e.category != 0 || !e.path || k->send_id(e.path, "section") != section || k->send_id(e.path, "item") != item) continue;
+            s.x[0] = attributes_of(e);
+            return;
+        }
+    });
 }
 
 

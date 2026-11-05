@@ -1167,8 +1167,9 @@ void AppKit::install_panels() {
         }
         static_cast<void>(objc.send_super(s.x[0], print_info, sel("dealloc")));
     }, "v@:");
+    // (NSFontPanel is a real panel: controls/font_panel.cpp.)
     for (const auto& [name, super_name] : std::initializer_list<std::pair<const char*, const char*>>{
-             {"NSPrintPanel", "NSObject"}, {"NSPageLayout", "NSObject"}, {"NSFontPanel", "NSPanel"}}) {
+             {"NSPrintPanel", "NSObject"}, {"NSPageLayout", "NSObject"}}) {
         const auto cls = declare_class(name, super_name);
         const std::string class_name = name;
         for (const auto* factory : {"pageLayout", "sharedFontPanel"})
