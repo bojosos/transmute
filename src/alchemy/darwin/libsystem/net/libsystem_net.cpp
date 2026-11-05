@@ -274,6 +274,75 @@ void install_libsystem_net(Provider& p) {
         return 0;
     });
 
+    // int getifmaddrs(struct ifmaddrs** ifmap): the multicast groups each interface joined (host::net::Interface::
+    // groups), under the Darwin interface names, as one block freeifmaddrs releases: {ifma_next; ifma_name, the
+    // interface's sockaddr_dl; ifma_addr, the group's sockaddr_in / sockaddr_in6; ifma_lladdr, on an Ethernet
+    // interface the group's link-layer address (01:00:5e and the IPv4 group's low 23 bits, 33:33 and the IPv6
+    // group's low 32 bits), else NULL}. The link-layer groups are not listed on their own.
+    p.libsystem("_getifmaddrs", [&process, blocks](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if (!s.x[0]) throw Errno{efault};
+        const auto adapters = host::net::interfaces();
+        if (!adapters) { m.write64(s.x[0], 0); return 0; }
+        const auto names = libsystem::darwin_interface_names(*adapters);
+        Image image;
+        std::uint64_t previous = UINT64_MAX;
+        for (std::size_t position = 0; position < adapters->size(); ++position) {
+            const auto& adapter = (*adapters)[position];
+            const auto& name = names[position];
+            const bool loopback = adapter.kind == host::net::InterfaceKind::loopback, ether = !loopback && adapter.hardware.size() == 6;
+            const auto type = loopback ? ift_loop : ether ? ift_ether : ift_other;
+            const auto link_address = [&](std::span<const std::uint8_t> address, bool with_name) {
+                const auto name_length = with_name ? static_cast<std::uint8_t>(name.size()) : std::uint8_t{0};
+                const auto address_length = static_cast<std::uint8_t>(address.size());
+                const auto length = static_cast<std::uint8_t>(std::max<unsigned>(20, 8U + name_length + address_length));
+                const auto dl = image.reserve(length);
+                image.put8(dl, length); image.put8(dl + 1, 18);   // AF_LINK
+                image.put16(dl + 2, static_cast<std::uint16_t>(adapter.index));
+                image.put8(dl + 4, type); image.put8(dl + 5, name_length); image.put8(dl + 6, address_length);
+                if (name_length) std::memcpy(&image.bytes[static_cast<std::size_t>(dl + 8)], name.data(), name_length);
+                if (address_length) std::memcpy(&image.bytes[static_cast<std::size_t>(dl + 8 + name_length)], address.data(), address_length);
+                return dl;
+            };
+            std::optional<std::uint64_t> interface_name;
+            for (const auto& group : adapter.groups) {
+                const bool v4 = group.family == host::net::Family::ipv4;
+                if (!v4 && group.family != host::net::Family::ipv6) continue;
+                // The entry first: the block's first entry sits at its base, the list head.
+                const auto entry = image.reserve(32);
+                if (!interface_name) interface_name = link_address(adapter.hardware, true);
+                if (previous != UINT64_MAX) image.pointer(previous, entry);
+                previous = entry;
+                image.pointer(entry + 8, *interface_name);
+                image.pointer(entry + 16, socket_address(image, v4 ? 2 : 30, std::span(group.bytes.data(), v4 ? 4 : 16), v4 ? 0 : group.scope_id));
+                if (ether) {
+                    std::array<std::uint8_t, 6> mac{};
+                    if (v4) mac = {0x01, 0x00, 0x5e, static_cast<std::uint8_t>(group.bytes[1] & 0x7f), group.bytes[2], group.bytes[3]};
+                    else mac = {0x33, 0x33, group.bytes[12], group.bytes[13], group.bytes[14], group.bytes[15]};
+                    image.pointer(entry + 24, link_address(mac, false));
+                }
+            }
+        }
+        if (previous == UINT64_MAX) { m.write64(s.x[0], 0); return 0; }
+        const auto block = process.allocate_guest(image.bytes.size(), 16);
+        image.relocate(block);
+        m.write_bytes(block, image.bytes);
+        { std::lock_guard lock(blocks->first); blocks->second.push_back(block); }
+        m.write64(s.x[0], block);
+        return 0;
+    });
+    // void freeifmaddrs(struct ifmaddrs*): only lists getifmaddrs returned.
+    p.libsystem("_freeifmaddrs", [&process, blocks](CpuState& s, GuestMemory&) -> std::uint64_t {
+        if (!s.x[0]) return 0;
+        {
+            std::lock_guard lock(blocks->first);
+            const auto found = std::find(blocks->second.begin(), blocks->second.end(), s.x[0]);
+            if (found == blocks->second.end()) throw std::runtime_error("Alchemy freeifmaddrs: pointer was not returned by getifmaddrs");
+            blocks->second.erase(found);
+        }
+        process.release_guest(s.x[0]);
+        return 0;
+    });
+
     // int pselect(int, fd_set*, fd_set*, fd_set*, const struct timespec*, const sigset_t*)
     // Alchemy delivers no asynchronous signals, so the temporary mask has no
     // observable effect; the wait is select() with the timeout converted.

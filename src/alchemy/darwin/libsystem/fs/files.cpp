@@ -1036,6 +1036,20 @@ void DarwinServices::Impl::install_libsystem_files() {
     };
     install("_statfs", [this, statfs](auto& s, auto& m) { return statfs(m, path(m, s.x[0]), s.x[1]); });
     install("_fstatfs", [this, statfs](auto& s, auto& m) { return statfs(m, file(static_cast<int>(s.x[0]))->path, s.x[1]); });
+    // ssize_t fsgetpath(char* buffer, size_t size, fsid_t* fsid, uint64_t object): the path of the file `object`
+    // (st_ino) on the volume `fsid` (f_fsid: {st_dev, 0}) under whatever name it has now; the length with the NUL.
+    // ENOENT when the volume has no such file, ENOSPC when the path does not fit.
+    install("_fsgetpath", [this](auto& s, auto& m) -> std::uint64_t {
+        if (!s.x[0] || !s.x[2]) throw ServiceError{einval};
+        validate(m, s.x[2], 8, false);
+        const auto found = host::files::path_of(m.read32(s.x[2]), s.x[3]);
+        if (!found) throw ServiceError{file_failure(found.error())};
+        const auto guest = guest_path_string(utf8_path(*found));
+        if (guest.size() + 1 > s.x[1]) throw ServiceError{enospc};
+        validate(m, s.x[0], guest.size() + 1, true);
+        m.write_bytes(s.x[0], std::span(reinterpret_cast<const std::uint8_t*>(guest.c_str()), guest.size() + 1));
+        return guest.size() + 1;
+    });
     for (const auto alias : {"_statfs$INODE64", "_fstatfs$INODE64"})
         context.install_export(std::string(system_library), alias, *context.resolve(system_library, std::string_view(alias).substr(0, std::string_view(alias).find('$'))));
     // The mounted file systems: the host volume that holds "/" first, then every other host

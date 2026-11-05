@@ -206,16 +206,15 @@ public:
 
     // malloc_get_all_zones: a guest array libmalloc owns (rewritten here on every call).
     std::pair<std::uint64_t, std::uint32_t> all_zones() {
-        const auto list = zones();
-        std::lock_guard lock(array_mutex_);
-        if (array_capacity_ < list->size()) {
-            const auto capacity = std::max<std::size_t>(8, list->size() * 2);
-            array_ = context_.allocate_guest(capacity * 8);   // an earlier array stays valid for its readers
-            array_capacity_ = capacity;
-        }
-        auto& memory = context_.calling_engine();
-        for (std::size_t index = 0; index < list->size(); ++index) memory.write64(array_ + index * 8, (*list)[index]);
-        return {array_, static_cast<std::uint32_t>(list->size())};
+        std::lock_guard lock(mutex_);
+        return fill(*zones_);
+    }
+    // malloc_zones / malloc_num_zones (libmalloc's exported list): the guest variables, rewritten with the array
+    // on every register and unregister from now on.
+    void export_list(std::uint64_t zones_variable, std::uint64_t count_variable) {
+        std::lock_guard lock(mutex_);
+        { std::lock_guard array_lock(array_mutex_); zones_variable_ = zones_variable; count_variable_ = count_variable; }
+        static_cast<void>(fill(*zones_));
     }
 
 private:
@@ -224,11 +223,26 @@ private:
         if (!function) return 0;
         return call(function, std::span<const std::uint64_t>(arguments.begin(), arguments.size()));
     }
+    // The array (and the exported variables) for `list`; under mutex_, which comes before array_mutex_.
+    std::pair<std::uint64_t, std::uint32_t> fill(const std::vector<std::uint64_t>& list) {
+        std::lock_guard lock(array_mutex_);
+        if (array_capacity_ < list.size()) {
+            const auto capacity = std::max<std::size_t>(8, list.size() * 2);
+            array_ = context_.allocate_guest(capacity * 8);   // an earlier array stays valid for its readers
+            array_capacity_ = capacity;
+        }
+        auto& memory = context_.calling_engine();
+        for (std::size_t index = 0; index < list.size(); ++index) memory.write64(array_ + index * 8, list[index]);
+        const auto count = static_cast<std::uint32_t>(list.size());
+        if (zones_variable_) { memory.write64(zones_variable_, array_); memory.write32(count_variable_, count); }
+        return {array_, count};
+    }
     void publish(std::shared_ptr<std::vector<std::uint64_t>> next) {
         default_.store(next->empty() ? system_ : next->front(), std::memory_order_release);
         guest_zones_.store(std::any_of(next->begin(), next->end(), [this](auto zone) { return zone != system_; }),
                            std::memory_order_release);
         zones_ = std::move(next);
+        static_cast<void>(fill(*zones_));
     }
 
     ProcessContext& context_;
@@ -241,6 +255,7 @@ private:
     std::mutex array_mutex_;
     std::uint64_t array_{};
     std::size_t array_capacity_{};
+    std::uint64_t zones_variable_{}, count_variable_{};
 };
 
 // A zone argument of NULL names the default zone.
@@ -419,6 +434,14 @@ void install_malloc_zones(ProcessContext& context, HostHeap heap, std::uint64_t 
         if (s.x[3]) m.write32(s.x[3], count);
         return kern_success;
     });
+    // malloc_zone_t** malloc_zones; unsigned malloc_num_zones: the registered zones, as malloc_get_all_zones lists them.
+    {
+        const auto variables = context.allocate_guest(16, 8);
+        context.main_engine().fill_bytes(variables, 0, 16);
+        context.install_export(std::string(libsystem), "_malloc_zones", {variables, ExportKind::data});
+        context.install_export(std::string(libsystem), "_malloc_num_zones", {variables + 8, ExportKind::data});
+        zones->export_list(variables, variables + 8);
+    }
     install("_malloc_zone_from_ptr", [zones](auto& s, auto&) { return zones->owner(s.x[0]); });
     // One shared host heap: a created zone is the system zone, and destroying it frees nothing.
     install("_malloc_create_zone", [zones](auto&, auto&) { return zones->system(); });

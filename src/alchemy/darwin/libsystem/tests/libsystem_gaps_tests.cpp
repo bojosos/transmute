@@ -1333,6 +1333,64 @@ void test_b24(Fixture& f) {
     require(!program || f.engine.read32(program + 12) == 2, "_dyld_get_prog_image_header is an executable's");
 }
 
+// B25: fsgetpath, getifmaddrs, malloc_zones / malloc_num_zones.
+void test_b25(Fixture& f) {
+    const auto system = "/usr/lib/libSystem.B.dylib";
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    // fsgetpath: a file by {st_dev, 0} and st_ino, under its current name.
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy-fsgetpath";
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    std::filesystem::create_directories(directory);
+    std::ofstream(directory / "before.txt") << "x";
+    const auto status = f.process.allocate_guest(144), fsid = f.process.allocate_guest(8), buffer = f.process.allocate_guest(1024);
+    require(f.sys("_stat", {f.text(alchemy::guest_path_string(directory / "before.txt")), status}) == 0, "stat the file");
+    std::filesystem::rename(directory / "before.txt", directory / "after.txt");
+    f.engine.write32(fsid, f.engine.read32(status)); f.engine.write32(fsid + 4, 0);
+    const auto length = f.sys("_fsgetpath", {buffer, 1024, fsid, f.engine.read64(status + 8)});
+    const auto found = f.read(buffer);
+    const auto again = f.process.allocate_guest(144);
+    require(length == found.size() + 1 && found.ends_with("/after.txt") && f.sys("_stat", {buffer, again}) == 0 &&
+            f.engine.read64(again + 8) == f.engine.read64(status + 8), "fsgetpath follows the renamed file");
+    require(f.sys("_fsgetpath", {buffer, 4, fsid, f.engine.read64(status + 8)}) == UINT64_MAX && errno_value() == 28, "ENOSPC");
+    require(f.sys("_fsgetpath", {buffer, 1024, fsid, 0x7fff'ffff'ffffULL}) == UINT64_MAX && errno_value() == 2, "ENOENT");
+    std::filesystem::remove_all(directory, ignored);
+
+    // getifmaddrs: every entry names its interface (AF_LINK) and a group (AF_INET / AF_INET6); an Ethernet group's
+    // link-layer address is the mapped multicast MAC.
+    const auto list = f.process.allocate_guest(8);
+    require(f.sys("_getifmaddrs", {list}) == 0, "getifmaddrs");
+    std::size_t entries{};
+    for (auto entry = f.engine.read64(list); entry; entry = f.engine.read64(entry)) {
+        ++entries;
+        const auto name = f.engine.read64(entry + 8), address = f.engine.read64(entry + 16), link = f.engine.read64(entry + 24);
+        const auto family = static_cast<transmute::GuestMemory&>(f.engine).read8(address + 1);
+        require(static_cast<transmute::GuestMemory&>(f.engine).read8(name + 1) == 18 && (family == 2 || family == 30), "ifma_name and ifma_addr");
+        if (link) {
+            auto& bytes = static_cast<transmute::GuestMemory&>(f.engine);
+            const auto mac = link + 8 + bytes.read8(link + 5);
+            require(bytes.read8(link + 1) == 18 && bytes.read8(link + 6) == 6 &&
+                    (family == 2 ? bytes.read8(mac) == 0x01 && bytes.read8(mac + 2) == 0x5e : bytes.read8(mac) == 0x33 && bytes.read8(mac + 1) == 0x33),
+                    "ifma_lladdr is the mapped multicast address");
+        }
+    }
+    std::cout << "[b25] getifmaddrs entries: " << entries << '\n';
+    require(f.sys("_freeifmaddrs", {f.engine.read64(list)}) == 0, "freeifmaddrs");
+
+    // malloc_zones / malloc_num_zones follow malloc_zone_register / unregister.
+    const auto zones = f.symbol(system, "_malloc_zones"), count = f.symbol(system, "_malloc_num_zones");
+    const auto listed = f.process.allocate_guest(8), listed_count = f.process.allocate_guest(4);
+    require(f.sys("_malloc_get_all_zones", {0, 0, listed, listed_count}) == 0 && f.engine.read32(count) == f.engine.read32(listed_count) &&
+            f.engine.read64(f.engine.read64(zones)) == f.sys("_malloc_default_zone", {}), "malloc_zones starts as the registered list");
+    const auto before = f.engine.read32(count);
+    const auto zone = f.process.allocate_guest(256);
+    f.engine.fill_bytes(zone, 0, 256);
+    f.sys("_malloc_zone_register", {zone});
+    require(f.engine.read32(count) == before + 1 && f.engine.read64(f.engine.read64(zones) + before * 8ULL) == zone, "a registered zone is listed");
+    f.sys("_malloc_zone_unregister", {zone});
+    require(f.engine.read32(count) == before, "and unlisted again");
+}
+
 // B22: getloadavg, sysctl vm.loadavg and host_statistics(HOST_LOAD_INFO) from the host's load averages.
 void test_b22(Fixture& f) {
     const auto processors = static_cast<double>(std::thread::hardware_concurrency());
@@ -1763,6 +1821,7 @@ int main() {
         stage("b21"); test_b21(f);
         stage("b22"); test_b22(f);
         stage("b24"); test_b24(f);
+        stage("b25"); test_b25(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;
