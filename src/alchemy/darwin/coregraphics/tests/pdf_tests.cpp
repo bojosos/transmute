@@ -502,6 +502,88 @@ void drawing(Fixture& f) {
     f.call(cg, "_CGPDFDocumentRelease", {document});
 }
 
+// Printing: a 200 x 500 view (green, a red band along its top) through NSPrintOperation, NSPDFImageRep, NSImage.
+void printing(Fixture& f) {
+    const auto view_class = f.objc.register_native_class("U26PrintedView", f.cls("NSView"), 8);
+    static_cast<void>(f.objc.add_native_method(view_class, "drawRect:", [&f](CpuState&, GuestMemory&) {
+        const auto context = f.send(f.send(f.cls("NSGraphicsContext"), "currentContext").x0, "CGContext").x0;
+        f.call(cg, "_CGContextSetRGBFillColor", {context}, {0, 1, 0, 1});
+        f.call(cg, "_CGContextFillRect", {context}, {0, 0, 200, 500});
+        f.call(cg, "_CGContextSetRGBFillColor", {context}, {1, 0, 0, 1});
+        f.call(cg, "_CGContextFillRect", {context}, {0, 480, 200, 20});
+    }, false, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}"));
+    const auto view = f.send(f.send(view_class, "alloc").x0, "initWithFrame:", {}, {0, 0, 200, 500}).x0;
+    require(view != 0, "the printed view");
+    const auto operation_class = f.cls("NSPrintOperation");
+    const auto with_rect = [&f](Address receiver, std::string_view selector, std::initializer_list<Address> x, std::initializer_list<double> rect) {
+        return f.send(receiver, selector, x, rect).x0;
+    };
+
+    // A PDF operation: one page the size of the rectangle, the view drawn on it.
+    const auto data = f.send(f.send(f.cls("NSMutableData"), "alloc").x0, "init").x0;
+    const auto copying = with_rect(operation_class, "PDFOperationWithView:insideRect:toData:", {view, data}, {0, 0, 200, 100});
+    require(copying && (f.send(copying, "isCopyingOperation").x0 & 0xff) == 1 && (f.send(copying, "showsPrintPanel").x0 & 0xff) == 0, "a PDF operation");
+    require((f.send(copying, "runOperation").x0 & 0xff) == 1, "the PDF operation runs");
+    const auto length = f.id(cf_library, "_CFDataGetLength", {data});
+    const auto bytes = f.read(f.id(cf_library, "_CFDataGetBytePtr", {data}), length);
+    const auto document = pdf::Document::open(std::make_shared<const std::vector<std::uint8_t>>(bytes));
+    require(document && document->pages().size() == 1, "one page written");
+    std::vector<double> media;
+    for (const auto& value : document->get(document->pages()[0], "MediaBox")->array) media.push_back(value->number_value());
+    require(media == std::vector<double>{0, 0, 200, 100}, "the page is the rectangle's size");
+    // Drawn back: the view's green.
+    const auto provider = f.id(cg, "_CGDataProviderCreateWithCFData", {data});
+    const auto written = f.id(cg, "_CGPDFDocumentCreateWithProvider", {provider});
+    Canvas canvas(f, 200, 100);
+    f.call(cg, "_CGContextDrawPDFPage", {canvas.context, f.id(cg, "_CGPDFDocumentGetPage", {written, 1})});
+    const auto centre = canvas.cg_at(100, 50);
+    require(centre[1] > 200 && centre[0] < 60 && centre[3] == 255, "the printed page shows the view: " + describe(centre));
+    // -dataWithPDFInsideRect:.
+    const auto pdf = with_rect(view, "dataWithPDFInsideRect:", {}, {0, 0, 200, 500});
+    require(pdf && f.cf.utf8(f.send(f.send(f.cls("NSString"), "alloc").x0, "initWithData:encoding:", {f.send(pdf, "subdataWithRange:", {0, 5}).x0, 1}).x0) == "%PDF-",
+            "-dataWithPDFInsideRect:");
+
+    // A save job: 300 x 400 paper, 20-point margins; 500 points of view over 360 printable: two pages.
+    const auto info = f.send(f.send(f.cls("NSPrintInfo"), "alloc").x0, "init").x0;
+    f.send(info, "setPaperSize:", {}, {300, 400});
+    for (const auto* margin : {"setLeftMargin:", "setRightMargin:", "setTopMargin:", "setBottomMargin:"}) f.send(info, margin, {}, {20});
+    const auto dictionary = f.send(info, "dictionary").x0;
+    require(f.cf.utf8(f.send(dictionary, "objectForKey:", {f.str("NSJobDisposition")}).x0) == "NSPrintSpoolJob", "spool jobs by default");
+    const auto url = f.cf.file_url("/tmp/alchemy-u26-print.pdf", false);
+    f.send(dictionary, "setObject:forKey:", {f.str("NSPrintSaveJob"), f.str("NSJobDisposition")});
+    f.send(dictionary, "setObject:forKey:", {url, f.str("NSJobSavingURL")});
+    require(f.cf.utf8(f.send(info, "jobDisposition").x0) == "NSPrintSaveJob", "-jobDisposition reads the dictionary");
+    const auto job = f.send(operation_class, "printOperationWithView:printInfo:", {view, info}).x0;
+    require((f.send(job, "runOperation").x0 & 0xff) == 1, "the save job runs");
+    const auto range = f.send(job, "pageRange");
+    require(range.x0 == 1 && range.x1 == 2, "two pages: " + std::to_string(range.x1));
+    const auto saved = f.id(cg, "_CGPDFDocumentCreateWithURL", {url});
+    require(saved && f.id(cg, "_CGPDFDocumentGetNumberOfPages", {saved}) == 2, "the saved file has two pages");
+    const auto box = f.call(cg, "_CGPDFPageGetBoxRect", {f.id(cg, "_CGPDFDocumentGetPage", {saved, 1}), 0});
+    require(box.d(2) == 300 && box.d(3) == 400, "pages on the paper size");
+    // A spool job: there are no printers.
+    const auto spool = f.send(operation_class, "printOperationWithView:", {view}).x0;
+    require((f.send(spool, "runOperation").x0 & 0xff) == 0, "a spool job fails: no printers");
+    require(f.send(f.send(f.cls("NSPrinter"), "printerNames").x0, "count").x0 == 0, "no printers");
+
+    // NSPDFImageRep and NSImage over PDF data.
+    const auto rep = f.send(f.cls("NSPDFImageRep"), "imageRepWithData:", {data}).x0;
+    const auto bounds = f.send(rep, "bounds");
+    require(rep && f.send(rep, "pageCount").x0 == 1 && bounds.d(2) == 200 && bounds.d(3) == 100, "NSPDFImageRep");
+    const auto image = f.send(f.send(f.cls("NSImage"), "alloc").x0, "initWithData:", {data}).x0;
+    const auto size = f.send(image, "size");
+    require(image && size.d(0) == 200 && size.d(1) == 100 &&
+                f.send(f.send(f.send(image, "representations").x0, "objectAtIndex:", {0}).x0, "class").x0 == f.cls("NSPDFImageRep"),
+            "an NSImage from PDF data holds an NSPDFImageRep");
+    Canvas drawn(f, 200, 100);
+    const auto graphics = f.send(f.cls("NSGraphicsContext"), "graphicsContextWithCGContext:flipped:", {drawn.context, 0}).x0;
+    f.send(f.cls("NSGraphicsContext"), "setCurrentContext:", {graphics});
+    f.send(image, "drawInRect:", {}, {0, 0, 200, 100});
+    f.send(f.cls("NSGraphicsContext"), "setCurrentContext:", {0});
+    const auto shown = drawn.cg_at(100, 50);
+    require(shown[1] > 200 && shown[3] == 255, "the NSImage draws its PDF page: " + describe(shown));
+}
+
 } // namespace
 
 int main() {
@@ -515,6 +597,7 @@ int main() {
         cgpdf(f, stream_file());
         writing(f);
         drawing(f);
+        printing(f);
         std::cout << "pdf: ok\n";
         return 0;
     } catch (const std::exception& error) {

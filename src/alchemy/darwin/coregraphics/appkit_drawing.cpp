@@ -1,3 +1,4 @@
+#include "alchemy/darwin/coregraphics/appkit_printing.hpp"
 #include "alchemy/darwin/coretext/ct_internal.hpp"
 #include "alchemy/darwin/coregraphics/context.hpp"
 #include "alchemy/darwin/coregraphics/quartz2d.hpp"
@@ -935,7 +936,15 @@ void Quartz::install_appkit_drawing() {
         };
         const auto cg_image_of = [q, render_custom](Address image) -> Address {
             const auto rep = bitmap_rep_of(*q, image);
-            return rep ? image_from_rep(*q, rep) : render_custom(image);
+            if (rep) return image_from_rep(*q, rep);
+            if (const auto custom = render_custom(image)) return custom;
+            // An NSPDFImageRep (appkit_printing.cpp), at the current context's scale.
+            double scale = 1;
+            if (const auto c = current_state(*q)) {
+                std::lock_guard lock(c->mutex);
+                scale = std::sqrt(std::abs(c->g.ctm.a * c->g.ctm.d - c->g.ctm.b * c->g.ctm.c));
+            }
+            return render_pdf_rep_image(*q, image, scale);
         };
         // An image that cannot draw (no representation draws) asks its
         // delegate's -imageDidNotDraw:inRect: for one to draw instead.

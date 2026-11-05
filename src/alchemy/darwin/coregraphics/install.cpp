@@ -26,6 +26,7 @@ void install(InstallContext& context) {
     quartz->install_displays();
     quartz->install_pdf();
     quartz->install_pdf_context();
+    quartz->install_appkit_printing();
 }
 
 } // namespace alchemy::gui::quartz2d

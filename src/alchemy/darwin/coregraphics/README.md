@@ -81,6 +81,22 @@ use the system font their name maps to, through Unicode. Not drawn (a
 diagnostic says so): tiling patterns, shading types 1 and 4 to 7, soft
 masks in ExtGState, JPEG 2000, CCITT and JBIG2 images, annotations.
 
+**Printing** (`appkit_printing.cpp`, AppKit classes over this layer):
+NSPrintOperation writes PDF. **Printed pages are images; text is not
+selectable**: each page is the view's rectangle drawn at 300 dpi (150 for
+very large pages) through -cacheDisplayInRect:toBitmapImageRep: and placed
+on a CGPDFContext page (vector printing needs AppKit's own control drawing
+to reach non-bitmap contexts, later work). Pagination follows NSPrintInfo:
+paper size, margins, scaling, automatic / fit / clip pagination,
+centring, views that know their page range (-rectForPage:), and
+NSPrintFirstPage / NSPrintLastPage. PDF operations (to data or a file),
+-dataWithPDFInsideRect: and NSPrintSaveJob (to NSPrintJobSavingURL) write
+the file; there are no printers, so spool jobs, previews and print panels
+make -runOperation answer NO with a diagnostic (never a job that did not
+happen). NSPrinter lists no printers. NSPDFImageRep (and an NSImage made
+from PDF data) draws its pages through the page renderer. EPS output stops
+explicitly.
+
 **PDF writing** (`pdf_context.cpp`, `pdf/pdf_writer.cpp`): CGPDFContext
 records CGContext drawing as PDF pages: filled and stroked paths (strokes
 under the CTM), DeviceRGB colours with alpha and the blend modes PDF has,

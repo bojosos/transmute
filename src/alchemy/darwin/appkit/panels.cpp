@@ -168,6 +168,7 @@ struct PrintInfoState final : ObjectPayload {
     std::int64_t orientation{}, horizontal_pagination{2}, vertical_pagination{0};
     bool horizontally_centered{true}, vertically_centered{true};
     Address paper_name{}, printer{};          // +1
+    Address dictionary{};                     // +1 NSMutableDictionary (-dictionary; job disposition, saving URL)
 };
 struct GestureState final : ObjectPayload {
     Address target{}, action{}, delegate{}, view{};
@@ -241,7 +242,22 @@ void AppKit::install_panels() {
              {"_NSPrintPaperName", "NSPaperName"}, {"_NSPrintPaperSize", "NSPaperSize"},
              {"_NSPrintOrientation", "NSOrientation"}, {"_NSPrintScalingFactor", "NSScalingFactor"},
              {"_NSPrintLeftMargin", "NSLeftMargin"}, {"_NSPrintRightMargin", "NSRightMargin"},
-             {"_NSPrintTopMargin", "NSTopMargin"}, {"_NSPrintBottomMargin", "NSBottomMargin"}})
+             {"_NSPrintTopMargin", "NSTopMargin"}, {"_NSPrintBottomMargin", "NSBottomMargin"},
+             // The other print attribute keys and job dispositions (values in the
+             // same pattern; unverified).
+             {"_NSPrintHorizontalPagination", "NSHorizontalPagination"}, {"_NSPrintVerticalPagination", "NSVerticalPagination"},
+             {"_NSPrintHorizontallyCentered", "NSHorizontallyCentered"}, {"_NSPrintVerticallyCentered", "NSVerticallyCentered"},
+             {"_NSPrintJobDisposition", "NSJobDisposition"}, {"_NSPrintJobSavingURL", "NSJobSavingURL"},
+             {"_NSPrintJobSavingFileNameExtensionHidden", "NSJobSavingFileNameExtensionHidden"},
+             {"_NSPrintSpoolJob", "NSPrintSpoolJob"}, {"_NSPrintSaveJob", "NSPrintSaveJob"},
+             {"_NSPrintPreviewJob", "NSPrintPreviewJob"}, {"_NSPrintCancelJob", "NSPrintCancelJob"},
+             // (NSPrintFirstPage, NSPrintLastPage and NSPrintAllPages: application_services.cpp.)
+             {"_NSPrintCopies", "NSCopies"}, {"_NSPrintPrinter", "NSPrinter"}, {"_NSPrintPrinterName", "NSPrinterName"},
+             {"_NSPrintMustCollate", "NSMustCollate"}, {"_NSPrintReversePageOrder", "NSReversePageOrder"},
+             {"_NSPrintSelectionOnly", "NSPrintSelectionOnly"}, {"_NSPrintHeaderAndFooter", "NSPrintHeaderAndFooter"},
+             {"_NSPrintPagesAcross", "NSPagesAcross"}, {"_NSPrintPagesDown", "NSPagesDown"},
+             {"_NSPrintDetailedErrorReporting", "NSDetailedErrorReporting"}, {"_NSPrintFaxNumber", "NSFaxNumber"},
+             {"_NSPrintTime", "NSPrintTime"}})
         string_constant(symbol, value);
     // NSAccessibilityUnignoredDescendant: the element itself unless it says
     // it is ignored, else the first unignored descendant through its
@@ -913,15 +929,19 @@ void AppKit::install_panels() {
         number("NSBottomMargin", state->bottom);
         number("NSScalingFactor", state->scaling);
         if (const auto size = send_id(s.x[2], "objectForKey:", {auto_string("NSPaperSize")})) state->paper = result_size(send(size, "sizeValue"));
+        // The other attributes (job disposition, saving URL, page range) are kept as given.
+        state->dictionary = send_id(s.x[2], "mutableCopy");
     });
     method(print_info, "copyWithZone:", [this, pi](CpuState& s, GuestMemory&) {
         const auto copy = alloc_init(print_info);
         auto to = pi(copy);
         const auto from = pi(s.x[0]);
         release(to->paper_name);
+        release(to->dictionary);
         *to = *from;
         to->paper_name = retain(to->paper_name);
         to->printer = retain(to->printer);
+        to->dictionary = to->dictionary ? send_id(to->dictionary, "mutableCopy") : 0;
         s.x[0] = copy;
     });
     const auto print_real = [this, pi](const char* getter, const char* setter, double PrintInfoState::*member) {
@@ -961,7 +981,48 @@ void AppKit::install_panels() {
         return_rect(s, {{18, 18}, {std::max(0.0, state->paper.width - 36), std::max(0.0, state->paper.height - 36)}});
     }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:");
     method(print_info, "setUpPrintOperationDefaultValues", [](CpuState&, GuestMemory&) {}, "v@:");
-    for (const auto* name : {"PMPrintSession", "PMPrintSettings", "PMPageFormat", "printer", "setPrinter:", "dictionary",
+    // The print info dictionary: the attributes above mirrored into it, and
+    // the ones only it holds (job disposition, saving URL, page range...).
+    const auto dictionary_of = [this, pi](Address self) {
+        const auto state = pi(self);
+        if (!state->dictionary) state->dictionary = alloc_init(objc.find_class("NSMutableDictionary"));
+        const auto put = [&](std::string_view key, Address value) { static_cast<void>(send_id(state->dictionary, "setObject:forKey:", {value, auto_string(key)})); };
+        const auto number = [&](double value) {
+            CallRegs registers;
+            registers.set_d(0, value);
+            return send(objc.find_class("NSNumber"), "numberWithDouble:", registers).x0;
+        };
+        const auto integer = [&](std::int64_t value) { return send_id(objc.find_class("NSNumber"), "numberWithLongLong:", {static_cast<Address>(value)}); };
+        CallRegs size;
+        size.set_d(0, state->paper.width);
+        size.set_d(1, state->paper.height);
+        // (+[NSValue valueWithSize:] is Foundation's; without it the paper size stays out of the dictionary.)
+        if (responds(objc.find_class("NSValue"), "valueWithSize:")) put("NSPaperSize", send(objc.find_class("NSValue"), "valueWithSize:", size).x0);
+        if (state->paper_name) put("NSPaperName", state->paper_name);
+        put("NSLeftMargin", number(state->left));
+        put("NSRightMargin", number(state->right));
+        put("NSTopMargin", number(state->top));
+        put("NSBottomMargin", number(state->bottom));
+        put("NSScalingFactor", number(state->scaling));
+        put("NSOrientation", integer(state->orientation));
+        put("NSHorizontalPagination", integer(state->horizontal_pagination));
+        put("NSVerticalPagination", integer(state->vertical_pagination));
+        put("NSHorizontallyCentered", integer(state->horizontally_centered ? 1 : 0));
+        put("NSVerticallyCentered", integer(state->vertically_centered ? 1 : 0));
+        if (!send_id(state->dictionary, "objectForKey:", {auto_string("NSJobDisposition")})) put("NSJobDisposition", auto_string("NSPrintSpoolJob"));
+        return state->dictionary;
+    };
+    method(print_info, "dictionary", [dictionary_of](CpuState& s, GuestMemory&) { s.x[0] = dictionary_of(s.x[0]); });
+    method(print_info, "jobDisposition", [this, dictionary_of](CpuState& s, GuestMemory&) {
+        s.x[0] = send_id(dictionary_of(s.x[0]), "objectForKey:", {auto_string("NSJobDisposition")});
+    });
+    method(print_info, "setJobDisposition:", [this, dictionary_of](CpuState& s, GuestMemory&) {
+        static_cast<void>(send_id(dictionary_of(s.x[0]), "setObject:forKey:", {s.x[2] ? s.x[2] : auto_string("NSPrintSpoolJob"), auto_string("NSJobDisposition")}));
+    }, "v@:@");
+    // There are no printers (NSPrinter has none to give): nil unless one was set.
+    method(print_info, "printer", [pi](CpuState& s, GuestMemory&) { s.x[0] = pi(s.x[0])->printer; });
+    method(print_info, "setPrinter:", [this, pi](CpuState& s, GuestMemory&) { assign(pi(s.x[0])->printer, s.x[2]); }, "v@:@");
+    for (const auto* name : {"PMPrintSession", "PMPrintSettings", "PMPageFormat",
              "printSettings", "updateFromPMPrintSettings", "updateFromPMPageFormat"})
         method(print_info, name, [selector = std::string(name)](CpuState&, GuestMemory&) {
             unsupported("-[NSPrintInfo " + selector + "] (printing system)");

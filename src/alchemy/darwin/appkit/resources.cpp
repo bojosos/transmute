@@ -1181,6 +1181,20 @@ void AppKit::install_resources() {
     // Image files decode eagerly (PNG, TIFF, JPEG, BMP, GIF, ICO); data the
     // host cannot read gives nil, as AppKit does for undecodable data.
     const auto init_from = [this](CpuState& s, std::optional<std::vector<std::uint8_t>> bytes) {
+        // PDF data: an NSPDFImageRep (the Quartz layer's printing classes), the image its page's size.
+        if (bytes && bytes->size() >= 5 && std::string_view(reinterpret_cast<const char*>(bytes->data()), 5) == "%PDF-")
+            if (const auto pdf_class = objc.find_class("NSPDFImageRep")) {
+                const auto rep = send_id(send_id(pdf_class, "alloc"), "initWithData:", {make_data(*bytes)});
+                if (!rep) { release(s.x[0]); s.x[0] = 0; return; }
+                static_cast<void>(send_id(s.x[0], "addRepresentation:", {rep}));
+                CallRegs size;
+                const auto measured = result_size(send(rep, "size"));
+                size.set_d(0, measured.width);
+                size.set_d(1, measured.height);
+                static_cast<void>(send(s.x[0], "setSize:", size));
+                release(rep);
+                return;
+            }
         const auto decoded = bytes ? decode_image(*bytes) : std::nullopt;
         if (!decoded) { release(s.x[0]); s.x[0] = 0; return; }
         fill_image(s.x[0], *decoded);

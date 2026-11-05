@@ -149,6 +149,11 @@ shows the services its delegate offers as a menu at the rect (no system
 sharing services exist: none offered, or a dismissed menu, tells the
 delegate nil). NSPrintPanel objects keep their options, job style, help
 anchor, button title and accessory controllers; running one still stops.
+NSPrintInfo keeps a print info dictionary (its attributes mirrored, plus job
+disposition, saving URL and page range) and has no printer unless one is
+set; NSPrintOperation, NSPrinter and NSPDFImageRep are the Quartz layer's
+(coregraphics/appkit_printing.cpp: printed pages are images, text is not
+selectable).
 NSScreen aligns rects to its pixels; NSScreen, NSWindow and NSView make
 CADisplayLinks at the display's rate (QuartzCore). Each window has its own
 NSDockTile (kept, never shown: Windows has no dock). NSAlert and NSImage keep
