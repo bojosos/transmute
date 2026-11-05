@@ -15,8 +15,9 @@
 // no proxy, the dictionary enables no proxy. Proxy auto-configuration (PAC
 // URL, auto-detect) is reported in the ProxyAutoConfig* / ProxyAutoDiscovery
 // keys only; nothing evaluates PAC scripts (urllib ignores them on macOS too).
-// Other SystemConfiguration interfaces are not provided: their imports stay
-// unresolved and fail at bind.
+// The dynamic store and reachability (sysconfig_store.cpp), SCPreferences and
+// the network configuration objects (sysconfig_network.cpp) are the network
+// provider's; SCError / SCErrorString are errors_and_aliases.cpp's.
 
 #include <cstdint>
 #include <functional>
@@ -33,6 +34,18 @@ namespace alchemy::gui::sysconfig {
 
 // SCDynamicStoreCopyProxies and the kSCPropNetProxies* keys (install.cpp).
 void install_proxies(InstallContext& context);
+
+// The calling thread's SCError() status (errors_and_aliases.cpp): kSCStatus* values.
+inline constexpr std::int32_t status_failed = 1001, status_invalid_argument = 1002, status_access_error = 1003,
+    status_no_key = 1004, status_need_lock = 1007;
+void set_last_status(std::int32_t status);
+[[nodiscard]] std::int32_t last_status();
+
+// A network service ID from a host adapter name (a Windows adapter GUID loses its braces).
+inline std::string service_id(std::string_view adapter) {
+    if (adapter.size() > 2 && adapter.front() == '{' && adapter.back() == '}') adapter = adapter.substr(1, adapter.size() - 2);
+    return std::string(adapter);
+}
 
 inline constexpr std::string_view library =
     "/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration";

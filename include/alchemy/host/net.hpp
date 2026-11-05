@@ -66,6 +66,7 @@ struct Interface {
     std::string display_name;              // its human-readable name
     InterfaceKind kind{InterfaceKind::other};
     bool up{}, multicast{};
+    bool dhcp{};                           // its IPv4 configuration comes from DHCP
     std::uint32_t mtu{};                   // 0: unknown
     std::uint64_t speed{};                 // transmit bits per second; 0: unknown
     std::vector<std::uint8_t> hardware;    // the link-layer address; empty when none

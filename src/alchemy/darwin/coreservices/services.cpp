@@ -336,7 +336,6 @@ void Provider::install_services() {
         }
     }
 
-    install_network_interfaces();    // darwin/systemconfiguration/network_interfaces.cpp
     install_iokit_gaps();            // darwin/iokit/iokit_gaps.cpp
     install_service_management();    // darwin/servicemanagement/job_bless.cpp
     install_disk_claims();           // darwin/diskarbitration/claims.cpp

@@ -3,12 +3,16 @@
 - **Covers:** SCDynamicStoreCopyProxies and the kSCPropNetProxies* keys over
   the user's proxy configuration (system_configuration.cpp); the
   dynamic store and SCNetworkReachability over the host's network state
-  (sysconfig_store.cpp, installed with the network provider).
+  (sysconfig_store.cpp); SCPreferences, SCNetworkInterface / Service / Set /
+  Protocol and SCCopyLastError over the host's adapters (sysconfig_network.cpp).
+  Both are installed with the network provider.
 - **Host dependencies:** the host `http` area (the user's proxy settings),
   `net` (interfaces, DNS configuration, best interface, names) and `system`
   (computer and user names).
-- **Unsupported, failing explicitly:** writing to the dynamic store;
-  configuration sets and preferences.
+- **Unsupported, failing explicitly:** writing to the dynamic store
+  (SetValue / RemoveValue / NotifyValue) and committing or locking
+  preferences: an unprivileged process has no write access
+  (kSCStatusAccessError).
 - **Registration:** `install_system_configuration`; the store is part of
   `install_network`.
 - **Extension points:** none. A provider layering behaviour over another

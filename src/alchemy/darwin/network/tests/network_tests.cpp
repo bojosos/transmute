@@ -25,6 +25,7 @@
 #include "mdns.hpp"
 #include "tls.hpp"
 
+#include "alchemy/darwin/systemconfiguration/system_configuration.hpp"
 #include "alchemy/darwin_dispatch.hpp"
 #include "alchemy/darwin_frameworks.hpp"
 #include "alchemy/darwin_services.hpp"
@@ -38,6 +39,7 @@
 #include <ws2tcpip.h>
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -805,6 +807,100 @@ void test_system_configuration(Fixture& f) {
     static_cast<void>(f.core("_CFRelease", {last_target}));
     eventually([&] { return released_infos.load() == 2; }, "watchers deallocate the store and the target they held last");
     for (const auto object : {local, missing, by_address, store}) static_cast<void>(f.core("_CFRelease", {object}));
+}
+
+// The store's writes, service keys and notified keys; SCPreferences and the
+// network configuration objects; SCCopyLastError.
+void test_system_configuration_network(Fixture& f) {
+    namespace sysconfig = alchemy::gui::sysconfig;
+    const std::string lib = "/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration";
+    const auto constant = [&](std::string_view name) { return f.engine.read64(f.symbol(lib, "_" + std::string(name))); };
+    const auto get = [&](Address dictionary, std::string_view key) { return f.core("_CFDictionaryGetValue", {dictionary, f.string(key)}); };
+    const auto store = f.call(lib, "_SCDynamicStoreCreate", {0, f.string("alchemy.test.network"), 0, 0});
+    require(f.core("_CFGetTypeID", {store}) == f.call(lib, "_SCDynamicStoreGetTypeID"), "SCDynamicStoreGetTypeID");
+    // Writes need configd's write access.
+    sysconfig::set_last_status(0);
+    require(f.call(lib, "_SCDynamicStoreSetValue", {store, f.string("State:/Alchemy/Test"), f.string("value")}) == 0 &&
+            sysconfig::last_status() == sysconfig::status_access_error, "SCDynamicStoreSetValue is refused");
+    const auto error = f.call(lib, "_SCCopyLastError");
+    require(error && f.core("_CFErrorGetCode", {error}) == 1003 &&
+            f.text(f.core("_CFErrorGetDomain", {error})) == "com.apple.SystemConfiguration", "SCCopyLastError");
+    require(f.call(lib, "_SCDynamicStoreRemoveValue", {store, f.string("State:/Alchemy/Test")}) == 0, "SCDynamicStoreRemoveValue is refused");
+    require(f.call(lib, "_SCDynamicStoreNotifyValue", {store, f.string("State:/Alchemy/Test")}) == 0, "SCDynamicStoreNotifyValue is refused");
+    // Keys.
+    const auto state = constant("kSCDynamicStoreDomainState");
+    require(f.text(f.call(lib, "_SCDynamicStoreKeyCreateNetworkServiceEntity", {0, state, f.string("ABC"), constant("kSCEntNetDNS")})) ==
+            "State:/Network/Service/ABC/DNS", "SCDynamicStoreKeyCreateNetworkServiceEntity");
+    require(f.text(f.call(lib, "_SCDynamicStoreKeyCreateNetworkInterface", {0, state})) == "State:/Network/Interface",
+            "SCDynamicStoreKeyCreateNetworkInterface");
+    // Notified keys: nothing has changed since the keys were set.
+    const auto pattern = f.string("State:/Network/Interface/[^/]+/IPv4");
+    require(f.call(lib, "_SCDynamicStoreSetNotificationKeys", {store, 0, f.cf.array(std::vector<Address>{pattern})}) == 1, "notification keys");
+    const auto notified = f.call(lib, "_SCDynamicStoreCopyNotifiedKeys", {store});
+    require(notified && f.core("_CFArrayGetCount", {notified}) == 0, "SCDynamicStoreCopyNotifiedKeys");
+    // The primary service's entities, when this host has an IPv4 route.
+    std::string primary_service;
+    if (const auto global = f.call(lib, "_SCDynamicStoreCopyValue", {store, f.string("State:/Network/Global/IPv4")})) {
+        primary_service = f.text(get(global, "PrimaryService"));
+        require(primary_service.find('{') == std::string::npos, "service IDs have no braces");
+        const auto key = f.call(lib, "_SCDynamicStoreKeyCreateNetworkServiceEntity", {0, state, f.string(primary_service), constant("kSCEntNetIPv4")});
+        const auto ipv4 = f.call(lib, "_SCDynamicStoreCopyValue", {store, key});
+        require(ipv4 && f.text(get(ipv4, "InterfaceName")) == f.text(get(global, "PrimaryInterface")), "State:/Network/Service/<primary>/IPv4");
+    }
+
+    // SCPreferences over the host's adapters.
+    const auto prefs = f.call(lib, "_SCPreferencesCreate", {0, f.string("alchemy.test"), 0});
+    require(prefs && f.core("_CFGetTypeID", {prefs}) == f.call(lib, "_SCPreferencesGetTypeID"), "SCPreferencesCreate");
+    std::vector<std::string> keys;
+    for (const auto key : f.cf.array_values(f.call(lib, "_SCPreferencesCopyKeyList", {prefs}))) keys.push_back(f.text(key));
+    std::sort(keys.begin(), keys.end());
+    require(keys == std::vector<std::string>{"CurrentSet", "NetworkServices", "Sets", "System"}, "SCPreferencesCopyKeyList");
+    require(f.call(lib, "_SCPreferencesGetValue", {prefs, constant("kSCPrefCurrentSet")}) != 0, "SCPreferencesGetValue(CurrentSet)");
+    const auto services = f.call(lib, "_SCNetworkServiceCopyAll", {prefs});
+    std::vector<std::string> ids;
+    for (const auto service : f.cf.array_values(services)) {
+        ids.push_back(f.text(f.call(lib, "_SCNetworkServiceGetServiceID", {service})));
+        require(f.call(lib, "_SCNetworkServiceGetName", {service}) != 0 && f.call(lib, "_SCNetworkServiceGetEnabled", {service}) == 1, "service name");
+        const auto interface = f.call(lib, "_SCNetworkServiceGetInterface", {service});
+        require(interface && f.core("_CFGetTypeID", {interface}) == f.call(lib, "_SCNetworkInterfaceGetTypeID"), "SCNetworkServiceGetInterface");
+        const auto bsd = f.text(f.call(lib, "_SCNetworkInterfaceGetBSDName", {interface}));
+        require(bsd.starts_with("en"), "service interface name " + bsd);
+        require(f.call(lib, "_SCNetworkInterfaceGetInterfaceType", {interface}) != 0 &&
+                f.call(lib, "_SCNetworkInterfaceGetLocalizedDisplayName", {interface}) != 0, "interface type and display name");
+        const auto protocol = f.call(lib, "_SCNetworkServiceCopyProtocol", {service, constant("kSCNetworkProtocolTypeIPv4")});
+        require(protocol && f.call(lib, "_SCNetworkProtocolGetEnabled", {protocol}) == 1, "SCNetworkServiceCopyProtocol(IPv4)");
+        const auto method = f.text(get(f.call(lib, "_SCNetworkProtocolGetConfiguration", {protocol}), "ConfigMethod"));
+        require(method == "DHCP" || method == "Manual", "IPv4 ConfigMethod " + method);
+        require(f.call(lib, "_SCNetworkServiceCopyProtocol", {service, f.string("NoSuchProtocol")}) == 0, "an absent protocol");
+        static_cast<void>(f.core("_CFRelease", {protocol}));
+    }
+    if (!primary_service.empty())
+        require(std::find(ids.begin(), ids.end(), primary_service) != ids.end(), "the store's primary service is a preferences service");
+    const auto set = f.call(lib, "_SCNetworkSetCopyCurrent", {prefs});
+    require(set && f.text(f.call(lib, "_SCNetworkSetGetName", {set})) == "Automatic", "SCNetworkSetCopyCurrent");
+    require(f.core("_CFArrayGetCount", {f.call(lib, "_SCNetworkSetCopyServices", {set})}) == ids.size(), "SCNetworkSetCopyServices");
+    const auto order = f.call(lib, "_SCPreferencesPathGetValue",
+                              {prefs, f.string("/Sets/" + f.text(f.call(lib, "_SCNetworkSetGetSetID", {set})) + "/Network/Global/IPv4")});
+    require(order && f.core("_CFArrayGetCount", {get(order, "ServiceOrder")}) == ids.size(), "SCPreferencesPathGetValue(ServiceOrder)");
+    // Changes stay in the session: committing and locking need write access.
+    require(f.call(lib, "_SCPreferencesCommitChanges", {prefs}) == 1, "committing no changes");
+    require(f.call(lib, "_SCPreferencesSetValue", {prefs, f.string("AlchemyTest"), f.string("value")}) == 1 &&
+            f.text(f.call(lib, "_SCPreferencesGetValue", {prefs, f.string("AlchemyTest")})) == "value", "SCPreferencesSetValue");
+    require(f.call(lib, "_SCPreferencesCommitChanges", {prefs}) == 0 && sysconfig::last_status() == sysconfig::status_access_error,
+            "SCPreferencesCommitChanges is refused");
+    require(f.call(lib, "_SCPreferencesLock", {prefs, 0}) == 0 && f.call(lib, "_SCPreferencesUnlock", {prefs}) == 0, "SCPreferencesLock");
+    static_cast<void>(f.call(lib, "_SCPreferencesSynchronize", {prefs}));
+    require(f.call(lib, "_SCPreferencesGetValue", {prefs, f.string("AlchemyTest")}) == 0 && f.call(lib, "_SCPreferencesCommitChanges", {prefs}) == 1,
+            "SCPreferencesSynchronize drops the changes");
+    const auto other = f.call(lib, "_SCPreferencesCreate", {0, f.string("alchemy.test"), f.string("com.alchemy.none.plist")});
+    require(f.core("_CFArrayGetCount", {f.call(lib, "_SCPreferencesCopyKeyList", {other})}) == 0, "another prefsID reads as empty");
+    // SCNetworkInterfaceCopyAll: getifaddrs names, types.
+    for (const auto interface : f.cf.array_values(f.call(lib, "_SCNetworkInterfaceCopyAll"))) {
+        const auto bsd = f.text(f.call(lib, "_SCNetworkInterfaceGetBSDName", {interface}));
+        const auto type = f.text(f.call(lib, "_SCNetworkInterfaceGetInterfaceType", {interface}));
+        require(bsd.starts_with("en") && (type == "Ethernet" || type == "IEEE80211" || type == "PPP" || type == "WWAN"), "interface " + bsd + " " + type);
+    }
+    for (const auto object : {other, set, services, prefs, notified, error, store}) static_cast<void>(f.core("_CFRelease", {object}));
 }
 
 // libresolv: res_ninit / res_nsearch / res_getservers against the Windows DNS servers.
@@ -1999,6 +2095,7 @@ int main() {
         test_sockets(fixture);
         test_proxy_auto_configuration(fixture);
         test_system_configuration(fixture);
+        test_system_configuration_network(fixture);
         test_resolver(fixture, sec::host_environment("ALCHEMY_TEST_OFFLINE").empty());
         // DNS-SD multicast leaves the machine: refused by design under ALCHEMY_NETWORK=loopback.
         if (alchemy::network_policy::loopback_only()) std::cout << "Bonjour: skipped (ALCHEMY_NETWORK=loopback)\n";

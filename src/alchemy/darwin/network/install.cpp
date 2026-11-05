@@ -26,6 +26,7 @@ void install_network(InstallContext& context) {
     network::install_pac(urls);
     network::install_sockets(urls->b);
     network::install_system_configuration_store(urls->b);
+    network::install_system_configuration_network(urls->b);
     network::install_resolver(urls->b);
     network::install_dns_sd(urls->b);
     network::install_net_services(urls->b);

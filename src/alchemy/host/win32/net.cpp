@@ -126,6 +126,7 @@ Result<std::vector<Interface>> interfaces() {
         entry.index = adapter->IfIndex ? adapter->IfIndex : adapter->Ipv6IfIndex;
         entry.id = adapter->AdapterName ? adapter->AdapterName : "";
         entry.display_name = adapter->FriendlyName ? win32::narrow(adapter->FriendlyName) : std::string();
+        entry.dhcp = (adapter->Flags & IP_ADAPTER_DHCP_ENABLED) != 0;
         switch (adapter->IfType) {
         case IF_TYPE_SOFTWARE_LOOPBACK: entry.kind = InterfaceKind::loopback; break;
         case IF_TYPE_ETHERNET_CSMACD: entry.kind = InterfaceKind::ethernet; break;

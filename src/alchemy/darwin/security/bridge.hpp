@@ -55,7 +55,10 @@ inline constexpr std::string_view libsystem_library = "/usr/lib/libSystem.B.dyli
 // extended for them; see Bridge::register_type_id).
 enum class TypeId : std::uint64_t {
     error = 0x400, certificate, trust, policy, key, identity, access, static_code, code, requirement,
-    ssl_context, http_message, transform, keychain, keychain_item, task, socket, keychain_search
+    ssl_context, http_message, transform, keychain, keychain_item, task, socket, keychain_search,
+    // SystemConfiguration (darwin/systemconfiguration).
+    sc_dynamic_store, sc_reachability, sc_preferences, sc_network_interface, sc_network_service, sc_network_set,
+    sc_network_protocol
 };
 
 // A host-implemented guest block: invoke runs `handler` with the block's

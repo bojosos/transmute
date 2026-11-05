@@ -1,4 +1,5 @@
 #include "alchemy/darwin/network/network_internal.hpp"
+#include "alchemy/darwin/systemconfiguration/system_configuration.hpp"
 
 #include "alchemy/darwin_threads.hpp"
 #include "alchemy/host/net.hpp"
@@ -21,16 +22,26 @@
 //
 // Dynamic store keys with values (anything else reads as absent, NULL):
 //   State:/Network/Global/IPv4|IPv6      PrimaryInterface, PrimaryService, Router
-//   State:/Network/Global/DNS            ServerAddresses, DomainName (the primary
-//                                        IPv4 adapter's DNS servers and suffix)
+//   State:/Network/Global/DNS            ServerAddresses, DomainName, SearchDomains
+//                                        (the primary IPv4 adapter's DNS servers
+//                                        and suffixes)
 //   State:/Network/Interface             Interfaces
 //   State:/Network/Interface/<if>/IPv4   Addresses, SubnetMasks
 //   State:/Network/Interface/<if>/IPv6   Addresses, PrefixLength
+//   State:/Network/Service/<id>/IPv4     Addresses, SubnetMasks, InterfaceName, Router
+//   State:/Network/Service/<id>/IPv6     Addresses, PrefixLength, InterfaceName, Router
+//   State:/Network/Service/<id>/DNS      ServerAddresses, DomainName, SearchDomains
 //   Setup:/System                        ComputerName, ComputerNameEncoding
 //   Setup:/Network/HostNames             LocalHostName
 //   State:/Users/ConsoleUser             Name, UID, GID
-// Interface names are Alchemy's guest names (lo / if<index>, as getifaddrs and
-// if_nametoindex report them); services are the Windows adapter GUIDs.
+// Interface names are Alchemy's guest names (lo / if<index>, as
+// if_nametoindex reports them); services are the Windows adapter GUIDs
+// without braces (the SCPreferences service IDs, sysconfig_network.cpp).
+// Writes (SCDynamicStoreSetValue / RemoveValue / NotifyValue) need configd's
+// write access, which an unprivileged process does not have: they answer
+// FALSE with kSCStatusAccessError. SCDynamicStoreCopyNotifiedKeys reports the
+// watched keys whose values changed since the notification keys were set or
+// last copied.
 // Notifications: with SCDynamicStoreSetDispatchQueue or
 // SCDynamicStoreCreateRunLoopSource, a guest dispatch worker re-reads the
 // watched keys (SetNotificationKeys keys and patterns) every second; the keys
@@ -122,21 +133,43 @@ Snapshot snapshot() {
         const auto base = "State:/Network/Interface/" + name;
         if (!v4_addresses.empty()) result[base + "/IPv4"] = {{"Addresses", v4_addresses}, {"SubnetMasks", v4_masks}};
         if (!v6_addresses.empty()) result[base + "/IPv6"] = {{"Addresses", v6_addresses}, {"PrefixLength", v6_prefixes}};
-        const auto service = adapter.id.empty() ? name : adapter.id;
-        const auto global = [&](Family family, const char* key) {
-            Entity entity{{"PrimaryInterface", name}, {"PrimaryService", service}};
+        const auto service = sysconfig::service_id(adapter.id.empty() ? name : adapter.id);
+        const auto router = [&](Family family, Entity& entity) {
             for (const auto& gateway : adapter.gateways)
                 if (gateway.family == family) { entity["Router"] = address_text(gateway); break; }
+        };
+        const auto global = [&](Family family, const char* key) {
+            Entity entity{{"PrimaryInterface", name}, {"PrimaryService", service}};
+            router(family, entity);
             result[key] = std::move(entity);
         };
+        const auto service_base = "State:/Network/Service/" + service;
+        if (adapter.kind != host::net::InterfaceKind::loopback) {
+            if (!v4_addresses.empty()) {
+                Entity entity{{"Addresses", v4_addresses}, {"SubnetMasks", v4_masks}, {"InterfaceName", name}};
+                router(Family::ipv4, entity);
+                result[service_base + "/IPv4"] = std::move(entity);
+            }
+            if (!v6_addresses.empty()) {
+                Entity entity{{"Addresses", v6_addresses}, {"PrefixLength", v6_prefixes}, {"InterfaceName", name}};
+                router(Family::ipv6, entity);
+                result[service_base + "/IPv6"] = std::move(entity);
+            }
+        }
+        const auto dns = adapter.kind == host::net::InterfaceKind::loopback ? std::nullopt : std::optional(host::net::dns_configuration(index));
+        Entity dns_entity;
+        if (dns && *dns) {
+            std::vector<std::string> servers, domains;
+            for (const auto& server : (*dns)->servers) servers.push_back(address_text(server));
+            for (const auto& domain : (*dns)->search) domains.push_back(ascii(domain));
+            dns_entity["ServerAddresses"] = servers;
+            if (!domains.empty()) { dns_entity["DomainName"] = domains.front(); dns_entity["SearchDomains"] = domains; }
+            if (!servers.empty()) result[service_base + "/DNS"] = dns_entity;
+        }
         if (v4 && *v4 == index) {
             global(Family::ipv4, "State:/Network/Global/IPv4");
-            const auto dns = host::net::dns_configuration(index);
-            std::vector<std::string> servers;
-            if (dns) for (const auto& server : dns->servers) servers.push_back(address_text(server));
-            Entity entity{{"ServerAddresses", servers}};
-            if (dns && !dns->search.empty()) entity["DomainName"] = ascii(dns->search.front());
-            if (!servers.empty()) result["State:/Network/Global/DNS"] = std::move(entity);
+            if (dns_entity.contains("ServerAddresses") && !std::get<std::vector<std::string>>(dns_entity["ServerAddresses"]).empty())
+                result["State:/Network/Global/DNS"] = dns_entity;
         }
         if (v6 && *v6 == adapter.ipv6_index) global(Family::ipv6, "State:/Network/Global/IPv6");
     }
@@ -149,6 +182,7 @@ struct StoreState final : ObjectPayload {
     std::mutex mutex;
     Address callout{}, info{}, release_info{};
     std::vector<std::string> keys, patterns;
+    std::optional<std::map<std::string, Entity>> notified_base;   // SCDynamicStoreCopyNotifiedKeys' last view
     Address queue{};                          // +1 dispatch queue (notifications)
     std::uint64_t generation{};               // bumps when the queue changes (stops a watcher)
     bool watching{};
@@ -438,11 +472,17 @@ void install_system_configuration_store(const std::shared_ptr<Bridge>& b) {
              {"kSCPropSystemComputerName", "ComputerName"}, {"kSCPropSystemComputerNameEncoding", "ComputerNameEncoding"},
              {"kSCPropNetLocalHostName", "LocalHostName"}, {"kSCCompNetwork", "Network"}, {"kSCCompGlobal", "Global"},
              {"kSCCompInterface", "Interface"}, {"kSCCompService", "Service"}, {"kSCCompSystem", "System"},
-             {"kSCCompAnyRegex", "[^/]+"}})
+             {"kSCCompAnyRegex", "[^/]+"}, {"kSCEntNetDNS", "DNS"}, {"kSCEntNetProxies", "Proxies"},
+             {"kSCPropNetDNSServerAddresses", "ServerAddresses"}, {"kSCPropNetDNSSearchDomains", "SearchDomains"},
+             {"kSCPropNetDNSDomainName", "DomainName"}, {"kSCPropInterfaceName", "InterfaceName"}})
         constant(name, value);
 
     self->store_class = b->define_class("_AlchemySCDynamicStore", b->object_class, lib);
     self->reachability_class = b->define_class("_AlchemySCNetworkReachability", b->object_class, lib);
+    b->register_type_id(self->store_class, security::TypeId::sc_dynamic_store);
+    b->register_type_id(self->reachability_class, security::TypeId::sc_reachability);
+    install("_SCDynamicStoreGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(security::TypeId::sc_dynamic_store); });
+    install("_SCNetworkReachabilityGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(security::TypeId::sc_reachability); });
     b->method(self->store_class, "dealloc", [self](CpuState& s, GuestMemory&) {
         if (const auto value = self->b->objc.find_host_state<StoreState>(s.x[0])) {
             Address queue{}, info{}, release_info{};
@@ -525,10 +565,40 @@ void install_system_configuration_store(const std::shared_ptr<Bridge>& b) {
     install("_SCDynamicStoreSetNotificationKeys", [self](CpuState& s, GuestMemory&) {
         const auto value = self->state(s.x[0]);
         auto keys = self->strings(s.x[1]), patterns = self->strings(s.x[2]);
+        auto base = Store::watched(snapshot(), keys, patterns);
         std::lock_guard lock(value->mutex);
         value->keys = std::move(keys); value->patterns = std::move(patterns);
+        value->notified_base = std::move(base);
         s.x[0] = 1;
     });
+    // CFArrayRef SCDynamicStoreCopyNotifiedKeys(SCDynamicStoreRef): the watched keys changed since the last call.
+    install("_SCDynamicStoreCopyNotifiedKeys", [self](CpuState& s, GuestMemory&) {
+        const auto value = self->state(s.x[0]);
+        std::vector<std::string> keys, patterns;
+        std::optional<std::map<std::string, Entity>> previous;
+        {
+            std::lock_guard lock(value->mutex);
+            keys = value->keys; patterns = value->patterns; previous = value->notified_base;
+        }
+        std::vector<Address> names;
+        if (previous) {
+            auto current = Store::watched(snapshot(), keys, patterns);
+            for (const auto& [key, entity] : current)
+                if (const auto found = previous->find(key); found == previous->end() || found->second != entity) names.push_back(self->b->string(key));
+            for (const auto& [key, entity] : *previous) if (!current.contains(key)) names.push_back(self->b->string(key));
+            std::lock_guard lock(value->mutex);
+            value->notified_base = std::move(current);
+        }
+        s.x[0] = self->b->array(names);
+        self->b->release_all(names);
+    });
+    // Boolean SCDynamicStoreSetValue / RemoveValue / NotifyValue: configd's write access is not granted here.
+    for (const auto* name : {"_SCDynamicStoreSetValue", "_SCDynamicStoreRemoveValue", "_SCDynamicStoreNotifyValue"})
+        install(name, [self](CpuState& s, GuestMemory&) {
+            static_cast<void>(self->state(s.x[0]));
+            sysconfig::set_last_status(sysconfig::status_access_error);
+            s.x[0] = 0;
+        });
     // CFRunLoopSourceRef SCDynamicStoreCreateRunLoopSource(CFAllocatorRef, SCDynamicStoreRef, CFIndex order):
     // a version 0 source whose info is the store; schedule/cancel record the
     // run loops it joins, perform calls the callout with the changed keys.
@@ -648,6 +718,16 @@ void install_system_configuration_store(const std::shared_ptr<Bridge>& b) {
         auto key = self->b->text(s.x[1]) + "/Network/Interface/" + self->b->text(s.x[2]);
         if (s.x[3]) key += "/" + self->b->text(s.x[3]);
         s.x[0] = self->b->string(key);
+    });
+    // CFStringRef SCDynamicStoreKeyCreateNetworkServiceEntity(allocator, domain, serviceID, entity)
+    install("_SCDynamicStoreKeyCreateNetworkServiceEntity", [self](CpuState& s, GuestMemory&) {
+        auto key = self->b->text(s.x[1]) + "/Network/Service/" + self->b->text(s.x[2]);
+        if (s.x[3]) key += "/" + self->b->text(s.x[3]);
+        s.x[0] = self->b->string(key);
+    });
+    // CFStringRef SCDynamicStoreKeyCreateNetworkInterface(allocator, domain)
+    install("_SCDynamicStoreKeyCreateNetworkInterface", [self](CpuState& s, GuestMemory&) {
+        s.x[0] = self->b->string(self->b->text(s.x[1]) + "/Network/Interface");
     });
     install("_SCDynamicStoreKeyCreateComputerName", [self](CpuState& s, GuestMemory&) { s.x[0] = self->b->string("Setup:/System"); });
     install("_SCDynamicStoreKeyCreateConsoleUser", [self](CpuState& s, GuestMemory&) { s.x[0] = self->b->string("State:/Users/ConsoleUser"); });

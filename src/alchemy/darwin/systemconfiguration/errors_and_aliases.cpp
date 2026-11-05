@@ -1,3 +1,4 @@
+#include "alchemy/darwin/systemconfiguration/system_configuration.hpp"
 #include "alchemy/gui/fill_provider.hpp"
 
 #include <map>
@@ -12,10 +13,19 @@
 // The Qt WebEngine images first imported them (moved from
 // darwin/identities/system_gaps.cpp); installed by the fill-only kit
 // (kit/fwgaps/install.cpp) at the old position.
+namespace alchemy::gui::sysconfig {
+
+namespace {
+thread_local std::int32_t sc_last_status = 0;
+} // namespace
+
+void set_last_status(std::int32_t status) { sc_last_status = status; }
+std::int32_t last_status() { return sc_last_status; }
+
+} // namespace alchemy::gui::sysconfig
+
 namespace alchemy::gui::fill {
 namespace {
-
-thread_local std::int32_t sc_last_status = 0;
 
 class ErrorsAndAliases final : public Provider {
 public:
@@ -26,7 +36,7 @@ public:
 };
 
 void ErrorsAndAliases::install() {
-    raw(system_configuration, "_SCError", [](CpuState& s, GuestMemory&) { s.x[0] = status(sc_last_status); });
+    raw(system_configuration, "_SCError", [](CpuState& s, GuestMemory&) { s.x[0] = status(sysconfig::last_status()); });
     raw(system_configuration, "_SCErrorString", [this](CpuState& s, GuestMemory&) {
         static const std::map<std::int32_t, std::string_view> texts{
             {0, "Success!"}, {1001, "Failed!"}, {1002, "Invalid argument!"}, {1003, "Permission denied!"},
@@ -49,7 +59,7 @@ void ErrorsAndAliases::install() {
     // with callbacks and scheduling.
     raw(system_configuration, "_SCNetworkReachabilityCreateWithAddressPair", [this](CpuState& s, GuestMemory&) {
         const auto address = s.x[2] ? s.x[2] : s.x[1];
-        if (!address) { sc_last_status = 1002; s.x[0] = 0; return; }
+        if (!address) { sysconfig::set_last_status(sysconfig::status_invalid_argument); s.x[0] = 0; return; }
         s.x[0] = call(system_configuration, "_SCNetworkReachabilityCreateWithAddress", {s.x[0], address});
     });
     // Chromium binds these SCDynamicStore functions through IOKit's ordinal.

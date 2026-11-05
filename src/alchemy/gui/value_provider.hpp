@@ -105,7 +105,6 @@ public:
     void install_legacy_keychain();       // darwin/security/legacy_keychain.cpp
     void install_sandbox();               // darwin/libsystem/misc/sandbox.cpp
     void install_open_directory();        // darwin/opendirectory/constants.cpp
-    void install_network_interfaces();    // darwin/systemconfiguration/network_interfaces.cpp
     void install_iokit_gaps();            // darwin/iokit/iokit_gaps.cpp
     void install_service_management();    // darwin/servicemanagement/job_bless.cpp
     void install_disk_claims();           // darwin/diskarbitration/claims.cpp

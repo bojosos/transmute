@@ -94,6 +94,8 @@ void install_cookies(const std::shared_ptr<Urls>& urls);
 void install_pac(const std::shared_ptr<Urls>& urls);
 // SCDynamicStore / SCNetworkReachability over the Windows network state (sysconfig_store.cpp).
 void install_system_configuration_store(const std::shared_ptr<Bridge>& b);
+// SCPreferences, SCNetworkInterface / Service / Set / Protocol and SCCopyLastError (sysconfig_network.cpp).
+void install_system_configuration_network(const std::shared_ptr<Bridge>& b);
 // libresolv res_9_n* DNS queries against the Windows DNS servers (resolver.cpp).
 void install_resolver(const std::shared_ptr<Bridge>& b);
 // CFSocket (socket.cpp); replaces the installer frameworks' explicit failures.

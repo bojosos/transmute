@@ -5,13 +5,14 @@
 # _scproxy, urllib.request on darwin) over the Windows user's proxy
 # configuration (system_configuration.cpp; winhttp.dll is loaded at run time,
 # no link dependency), and the dynamic store and reachability over the
-# Windows network state (sysconfig_store.cpp, part of the network provider's
-# install, cmake/darwin/network.cmake). The identity is listed in
+# Windows network state (sysconfig_store.cpp), and SCPreferences and the
+# network configuration objects (sysconfig_network.cpp), both part of the
+# network provider's install (cmake/darwin/network.cmake). The identity is listed in
 # darwin_framework_libraries.
 list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/systemconfiguration/system_configuration.cpp
     src/alchemy/darwin/systemconfiguration/sysconfig_store.cpp
-    src/alchemy/darwin/systemconfiguration/network_interfaces.cpp
+    src/alchemy/darwin/systemconfiguration/sysconfig_network.cpp
     src/alchemy/darwin/systemconfiguration/install.cpp)
 
 function(alchemy_darwin_systemconfiguration_tests)

@@ -1,6 +1,6 @@
 // Chrome's system-service gaps in r2's frameworks (coreservices/services.cpp and
 // the pieces it calls: security/legacy_keychain.cpp,
-// systemconfiguration/network_interfaces.cpp): AX values and elements, Apple
+// systemconfiguration/sysconfig_network.cpp): AX values and elements, Apple
 // Event descriptors, legacy keychain status, SCNetworkInterfaceCopyAll. Split out
 // of the Chrome frameworks tests.
 #include "alchemy/gui/tests/fill_fixture.hpp"
