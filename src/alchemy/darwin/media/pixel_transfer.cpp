@@ -354,13 +354,13 @@ void PixelTransfer::install() {
 
     // ---- VTPixelRotationSession ------------------------------------------------------------------
     for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 7>{{
-             {"_kVTPixelRotationPropertyKey_Rotation", "Rotation"},
-             {"_kVTPixelRotationPropertyKey_FlipHorizontalOrientation", "FlipHorizontalOrientation"},
-             {"_kVTPixelRotationPropertyKey_FlipVerticalOrientation", "FlipVerticalOrientation"},
-             {"_kVTRotation_0", "0"},
-             {"_kVTRotation_CW90", "CW90"},
-             {"_kVTRotation_180", "180"},
-             {"_kVTRotation_CCW90", "CCW90"}}})
+             {"_kVTPixelRotationPropertyKey_Rotation", "Rotation"},   // (unverified: naming convention)
+             {"_kVTPixelRotationPropertyKey_FlipHorizontalOrientation", "FlipHorizontalOrientation"},   // (unverified: naming convention)
+             {"_kVTPixelRotationPropertyKey_FlipVerticalOrientation", "FlipVerticalOrientation"},   // (unverified: naming convention)
+             {"_kVTRotation_0", "0"},   // (unverified: naming convention)
+             {"_kVTRotation_CW90", "CW90"},   // (unverified: naming convention)
+             {"_kVTRotation_180", "180"},   // (unverified: naming convention)
+             {"_kVTRotation_CCW90", "CCW90"}}})   // (unverified: naming convention), as are the six above
         string(video_toolbox, symbol, value);
     constant(video_toolbox, "_VTPixelRotationSessionGetTypeID", static_cast<Address>(TypeId::vt_pixel_rotation_session));
     // VTPixelRotationSessionCreate(allocator, VTPixelRotationSessionRef *out)

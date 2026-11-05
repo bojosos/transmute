@@ -231,7 +231,7 @@ void Video::install_video_toolbox() {
     constant(video_toolbox, "_VTIsStereoMVHEVCEncodeSupported", 0);
     for (const auto* key : {"CodecType", "EncoderID", "CodecName", "EncoderName", "DisplayName", "GPURegistryID", "InstanceLimit",
                             "IsHardwareAccelerated", "PerformanceRating", "QualityRating", "SupportedSelectionProperties", "SupportsFrameReordering"})
-        string(video_toolbox, "_kVTVideoEncoderList_" + std::string(key), key);
+        string(video_toolbox, "_kVTVideoEncoderList_" + std::string(key), key);   // each (unverified: naming convention)
     raw(video_toolbox, "_VTRegisterSupplementalVideoDecoderIfAvailable", [](CpuState&, GuestMemory&) {});   // none is available
     for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 16>{{
              {"_kVTCompressionPropertyKey_AllowFrameReordering", "AllowFrameReordering"},
@@ -340,7 +340,7 @@ void Video::install_core_video() {
         return_real(s, numer && denom ? 1e9 * denom / numer : 1e9);
     });
     raw(core_video, "_CVGetHostClockMinimumTimeDelta", [](CpuState& s, GuestMemory&) { s.x[0] = 1; });
-    string(core_video, "_kCVImageBufferColorPrimaries_P22", "P22");
+    string(core_video, "_kCVImageBufferColorPrimaries_P22", "P22");   // (unverified: naming convention)
     install_code_points();
     // CVPixelBufferIsCompatibleWithAttributes(CVPixelBufferRef, CFDictionaryRef): the buffer's width,
     // height and pixel format (one or any of an array) against those the attributes name.

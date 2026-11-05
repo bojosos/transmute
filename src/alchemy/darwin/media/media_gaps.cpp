@@ -261,47 +261,65 @@ void Provider::install_media() {
     string(core_video, "_kCVImageBufferColorPrimaries_DCI_P3", "DCI_P3");
     string(core_video, "_kCVImageBufferColorPrimaries_P3_D65", "P3_D65");
     string(core_video, "_kCVImageBufferAmbientViewingEnvironmentKey", "AmbientViewingEnvironment");
-    // The remaining buffer, image buffer, pixel buffer and Metal cache keys of the CoreVideo headers.
+    // The remaining buffer, image buffer, pixel buffer and Metal cache keys of the CoreVideo headers. The Apple Log values
+    // are documented (kVTCompressionPropertyKey_LogTransferFunction); the others follow the naming convention.
     for (const auto& [symbol, value] : std::initializer_list<std::pair<const char*, const char*>>{
-             {"_kCVBufferMovieTimeKey", "MovieTime"}, {"_kCVBufferTimeValueKey", "TimeValue"}, {"_kCVBufferTimeScaleKey", "TimeScale"},
-             {"_kCVBufferPropagatedAttachmentsKey", "PropagatedAttachments"}, {"_kCVBufferNonPropagatedAttachmentsKey", "NonPropagatedAttachments"},
-             {"_kCVImageBufferAlphaChannelIsOpaque", "AlphaChannelIsOpaque"}, {"_kCVImageBufferAlphaChannelModeKey", "AlphaChannelMode"},
-             {"_kCVImageBufferAlphaChannelMode_PremultipliedAlpha", "PremultipliedAlpha"},
-             {"_kCVImageBufferAlphaChannelMode_StraightAlpha", "StraightAlpha"}, {"_kCVImageBufferCGColorSpaceKey", "CGColorSpace"},
-             {"_kCVImageBufferChromaLocationBottomFieldKey", "CVImageBufferChromaLocationBottomField"},
-             {"_kCVImageBufferChromaLocation_Left", "Left"}, {"_kCVImageBufferChromaLocation_Center", "Center"},
-             {"_kCVImageBufferChromaLocation_TopLeft", "TopLeft"}, {"_kCVImageBufferChromaLocation_Top", "Top"},
-             {"_kCVImageBufferChromaLocation_BottomLeft", "BottomLeft"}, {"_kCVImageBufferChromaLocation_Bottom", "Bottom"},
-             {"_kCVImageBufferChromaLocation_DV420", "DV 4:2:0"}, {"_kCVImageBufferChromaSubsamplingKey", "CVImageBufferChromaSubsampling"},
-             {"_kCVImageBufferChromaSubsampling_420", "420"}, {"_kCVImageBufferChromaSubsampling_422", "422"},
-             {"_kCVImageBufferChromaSubsampling_411", "411"}, {"_kCVImageBufferDisplayDimensionsKey", "CVDisplayDimensions"},
-             {"_kCVImageBufferDisplayWidthKey", "Width"}, {"_kCVImageBufferDisplayHeightKey", "Height"},
-             {"_kCVImageBufferDisplayMaskRectangleKey", "DisplayMaskRectangle"},
-             {"_kCVImageBufferDisplayMaskRectangleStereoLeftKey", "DisplayMaskRectangleStereoLeft"},
-             {"_kCVImageBufferDisplayMaskRectangleStereoRightKey", "DisplayMaskRectangleStereoRight"},
-             {"_kCVImageBufferDisplayMaskRectangle_ReferenceRasterWidthKey", "ReferenceRasterWidth"},
-             {"_kCVImageBufferDisplayMaskRectangle_ReferenceRasterHeightKey", "ReferenceRasterHeight"},
-             {"_kCVImageBufferDisplayMaskRectangle_RectangleLeftKey", "RectangleLeft"},
-             {"_kCVImageBufferDisplayMaskRectangle_RectangleWidthKey", "RectangleWidth"},
-             {"_kCVImageBufferDisplayMaskRectangle_RectangleTopKey", "RectangleTop"},
-             {"_kCVImageBufferDisplayMaskRectangle_RectangleHeightKey", "RectangleHeight"},
-             {"_kCVImageBufferDisplayMaskRectangle_LeftEdgePointsKey", "LeftEdgePoints"},
-             {"_kCVImageBufferDisplayMaskRectangle_RightEdgePointsKey", "RightEdgePoints"},
-             {"_kCVImageBufferHorizontalDisparityAdjustmentKey", "HorizontalDisparityAdjustment"},
-             {"_kCVImageBufferICCProfileKey", "CVImageBufferICCProfile"},
-             {"_kCVImageBufferLogTransferFunctionKey", "LogTransferFunction"}, {"_kCVImageBufferLogTransferFunction_AppleLog", "com.apple.rec2020.apple-log"},
+             {"_kCVBufferMovieTimeKey", "MovieTime"},   // (unverified: naming convention)
+             {"_kCVBufferTimeValueKey", "TimeValue"},   // (unverified: naming convention)
+             {"_kCVBufferTimeScaleKey", "TimeScale"},   // (unverified: naming convention)
+             {"_kCVBufferPropagatedAttachmentsKey", "PropagatedAttachments"},   // (unverified: naming convention)
+             {"_kCVBufferNonPropagatedAttachmentsKey", "NonPropagatedAttachments"},   // (unverified: naming convention)
+             {"_kCVImageBufferAlphaChannelIsOpaque", "AlphaChannelIsOpaque"},   // (unverified: naming convention)
+             {"_kCVImageBufferAlphaChannelModeKey", "AlphaChannelMode"},   // (unverified: naming convention)
+             {"_kCVImageBufferAlphaChannelMode_PremultipliedAlpha", "PremultipliedAlpha"},   // (unverified: naming convention)
+             {"_kCVImageBufferAlphaChannelMode_StraightAlpha", "StraightAlpha"},   // (unverified: naming convention)
+             {"_kCVImageBufferCGColorSpaceKey", "CGColorSpace"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaLocationBottomFieldKey", "CVImageBufferChromaLocationBottomField"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaLocation_Left", "Left"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaLocation_Center", "Center"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaLocation_TopLeft", "TopLeft"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaLocation_Top", "Top"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaLocation_BottomLeft", "BottomLeft"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaLocation_Bottom", "Bottom"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaLocation_DV420", "DV 4:2:0"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaSubsamplingKey", "CVImageBufferChromaSubsampling"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaSubsampling_420", "420"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaSubsampling_422", "422"},   // (unverified: naming convention)
+             {"_kCVImageBufferChromaSubsampling_411", "411"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayDimensionsKey", "CVDisplayDimensions"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayWidthKey", "Width"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayHeightKey", "Height"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangleKey", "DisplayMaskRectangle"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangleStereoLeftKey", "DisplayMaskRectangleStereoLeft"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangleStereoRightKey", "DisplayMaskRectangleStereoRight"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangle_ReferenceRasterWidthKey", "ReferenceRasterWidth"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangle_ReferenceRasterHeightKey", "ReferenceRasterHeight"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangle_RectangleLeftKey", "RectangleLeft"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangle_RectangleWidthKey", "RectangleWidth"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangle_RectangleTopKey", "RectangleTop"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangle_RectangleHeightKey", "RectangleHeight"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangle_LeftEdgePointsKey", "LeftEdgePoints"},   // (unverified: naming convention)
+             {"_kCVImageBufferDisplayMaskRectangle_RightEdgePointsKey", "RightEdgePoints"},   // (unverified: naming convention)
+             {"_kCVImageBufferHorizontalDisparityAdjustmentKey", "HorizontalDisparityAdjustment"},   // (unverified: naming convention)
+             {"_kCVImageBufferICCProfileKey", "CVImageBufferICCProfile"},   // (unverified: naming convention)
+             {"_kCVImageBufferLogTransferFunctionKey", "LogTransferFunction"},   // (unverified: naming convention)
+             {"_kCVImageBufferLogTransferFunction_AppleLog", "com.apple.rec2020.apple-log"},
              {"_kCVImageBufferLogTransferFunction_AppleLog2", "com.apple.apple-wide-gamut.apple-log"},
-             {"_kCVImageBufferPostDecodeProcessingSequenceMetadataKey", "PostDecodeProcessingSequenceMetadata"},
-             {"_kCVImageBufferPostDecodeProcessingFrameMetadataKey", "PostDecodeProcessingFrameMetadata"},
-             {"_kCVImageBufferPreferredCleanApertureKey", "CVImageBufferPreferredCleanAperture"},
-             {"_kCVImageBufferRegionOfInterestKey", "RegionOfInterest"}, {"_kCVImageBufferSceneIlluminationKey", "SceneIllumination"},
-             {"_kCVMetalBufferCacheMaximumBufferAgeKey", "MaximumBufferAge"}, {"_kCVMetalTextureCacheMaximumTextureAgeKey", "MaximumTextureAge"},
-             {"_kCVMetalTextureStorageMode", "MetalTextureStorageMode"}, {"_kCVMetalTextureUsage", "MetalTextureUsage"},
-             {"_kCVPixelBufferIOSurfaceOpenGLESFBOCompatibilityKey", "IOSurfaceOpenGLESFBOCompatibility"},
-             {"_kCVPixelBufferIOSurfaceOpenGLESTextureCompatibilityKey", "IOSurfaceOpenGLESTextureCompatibility"},
-             {"_kCVPixelBufferIOSurfacePurgeableKey", "IOSurfacePurgeable"}, {"_kCVPixelBufferOpenGLESCompatibilityKey", "OpenGLESCompatibility"},
-             {"_kCVPixelBufferOpenGLESTextureCacheCompatibilityKey", "OpenGLESTextureCacheCompatibility"},
-             {"_kCVPixelBufferPoolFreeBufferNotification", "kCVPixelBufferPoolFreeBufferNotification"},
+             {"_kCVImageBufferPostDecodeProcessingSequenceMetadataKey", "PostDecodeProcessingSequenceMetadata"},   // (unverified: naming convention)
+             {"_kCVImageBufferPostDecodeProcessingFrameMetadataKey", "PostDecodeProcessingFrameMetadata"},   // (unverified: naming convention)
+             {"_kCVImageBufferPreferredCleanApertureKey", "CVImageBufferPreferredCleanAperture"},   // (unverified: naming convention)
+             {"_kCVImageBufferRegionOfInterestKey", "RegionOfInterest"},   // (unverified: naming convention)
+             {"_kCVImageBufferSceneIlluminationKey", "SceneIllumination"},   // (unverified: naming convention)
+             {"_kCVMetalBufferCacheMaximumBufferAgeKey", "MaximumBufferAge"},   // (unverified: naming convention)
+             {"_kCVMetalTextureCacheMaximumTextureAgeKey", "MaximumTextureAge"},   // (unverified: naming convention)
+             {"_kCVMetalTextureStorageMode", "MetalTextureStorageMode"},   // (unverified: naming convention)
+             {"_kCVMetalTextureUsage", "MetalTextureUsage"},   // (unverified: naming convention)
+             {"_kCVPixelBufferIOSurfaceOpenGLESFBOCompatibilityKey", "IOSurfaceOpenGLESFBOCompatibility"},   // (unverified: naming convention)
+             {"_kCVPixelBufferIOSurfaceOpenGLESTextureCompatibilityKey", "IOSurfaceOpenGLESTextureCompatibility"},   // (unverified: naming convention)
+             {"_kCVPixelBufferIOSurfacePurgeableKey", "IOSurfacePurgeable"},   // (unverified: naming convention)
+             {"_kCVPixelBufferOpenGLESCompatibilityKey", "OpenGLESCompatibility"},   // (unverified: naming convention)
+             {"_kCVPixelBufferOpenGLESTextureCacheCompatibilityKey", "OpenGLESTextureCacheCompatibility"},   // (unverified: naming convention)
+             {"_kCVPixelBufferPoolFreeBufferNotification", "kCVPixelBufferPoolFreeBufferNotification"},   // (unverified: naming convention)
          })
         string(core_video, symbol, value);
     string(core_video, "_kCVPixelFormatConstant", "PixelFormat");
@@ -328,7 +346,7 @@ void Provider::install_media() {
                             "ContainsGrayscale", "ContainsSenselArray", "FillExtendedPixelsCallback", "FourCC", "HorizontalSubsampling",
                             "OpenGLCompatibility", "OpenGLESCompatibility", "OpenGLFormat", "OpenGLInternalFormat", "OpenGLType",
                             "QDCompatibility", "VerticalSubsampling"})
-        string(core_video, std::string("_kCVPixelFormat") + key, key);
+        string(core_video, std::string("_kCVPixelFormat") + key, key);   // each (unverified: naming convention)
     // Descriptions registered with CVPixelFormatDescriptionRegisterDescriptionWithPixelFormatType (retained).
     auto registered = std::make_shared<std::map<std::uint32_t, Address>>();
     // A +1 description of `type` (NULL when it is not a format here).
