@@ -8,10 +8,10 @@ CoreServices, with UniformTypeIdentifiers and some ApplicationServices pieces.
   guest root's Applications folders (launch_services.cpp); Apple Event descriptors; the
   accessibility client; the other system-service gaps in services.cpp.
 - **Host dependencies:** host::locale collation (compare, sort_key).
-- **Unsupported, failing explicitly:** there is no Launch Services database
-  (default handlers cannot be changed, and registration answers
-  kLSServerCommunicationErr), no Apple Event server and no accessibility
-  server. Messages to other processes fail. A headless process has no
+- **Unsupported, failing explicitly:** there is no Apple Event server and no
+  accessibility server. LaunchServices keeps its own store (the
+  com.alchemy.LaunchServices preferences domain: LSRegisterURL's bundles and
+  the default handlers set), not Apple's database. Messages to other processes fail. A headless process has no
   application registry (launch_services_headless.cpp).
 - **Registration:** still called from the export-fill, qlab data and values
   aggregators.

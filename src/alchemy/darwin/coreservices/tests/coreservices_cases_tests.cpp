@@ -5,6 +5,7 @@
 #include "alchemy/gui/tests/framework_case.hpp"
 #include "alchemy/path.hpp"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 
@@ -18,14 +19,16 @@ const Case coreservices_launch_services_case("coreservices_launch_services", [](
     const auto url = f.cf.file_url("/Applications/Example.app", true);
     const auto name = f.block(8);
     require(f.status(cs, "_LSCopyDisplayNameForURL", {url, name}) == 0 && f.cf.utf8(f.engine.read64(name)) == "Example", "LSCopyDisplayNameForURL");
-    require(f.status(cs, "_LSSetDefaultHandlerForURLScheme", {string(f, "http"), string(f, "com.example")}) == -10822, "LaunchServices unavailable");
+    require(f.status(cs, "_LSSetDefaultHandlerForURLScheme", {string(f, "http"), string(f, "com.example.not-installed")}) == -10814,
+            "a default handler must be an installed application");
     require(f.call(cs, "_OpenDefaultComponent", {0x6f736120, 0x73637074}) == 0, "no OSA component");
     const auto excluded = f.block(1, 1);
     require(f.status(cs, "_CSBackupIsItemExcluded", {url, excluded}) == 0 && f.memory().read8(excluded) == 0, "nothing excluded");
 });
 
 const Case coreservices_file_manager_case("coreservices_file_manager", [](Fixture& f) {
-    const auto host = std::filesystem::temp_directory_path() / "alchemy_file_manager_case";
+    const auto host = (std::filesystem::temp_directory_path() /
+        ("alchemy_file_manager_case_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));   // unique: the case also runs in alchemy_gui_framework_cases
     std::filesystem::remove_all(host);
     std::filesystem::create_directories(host / "Example.app");
     { std::ofstream(host / "notes.txt") << "twelve bytes"; }
@@ -34,7 +37,7 @@ const Case coreservices_file_manager_case("coreservices_file_manager", [](Fixtur
     const auto ref = f.block(80), other = f.block(80), is_directory = f.block(1), path = f.block(1024);
     // FSPathMakeRef / FSRefMakePath / FSCompareFSRefs.
     require(f.status(cs, "_FSPathMakeRef", {f.text(root + "/notes.txt"), ref, is_directory}) == 0 && f.memory().read8(is_directory) == 0, "FSPathMakeRef");
-    require(f.status(cs, "_FSRefMakePath", {ref, path, 1024}) == 0 && f.read_text(path).ends_with("/alchemy_file_manager_case/notes.txt"), "FSRefMakePath");
+    require(f.status(cs, "_FSRefMakePath", {ref, path, 1024}) == 0 && f.read_text(path).ends_with("/" + host.filename().string() + "/notes.txt"), "FSRefMakePath");
     require(f.status(cs, "_FSRefMakePath", {ref, path, 4}) == -2110, "pathTooLongErr");
     require(f.status(cs, "_FSPathMakeRef", {f.text(root + "/missing"), other, 0}) == -43, "fnfErr for a missing item");
     require(f.status(cs, "_FSPathMakeRef", {f.text(root + "/./notes.txt"), other, 0}) == 0 && f.status(cs, "_FSCompareFSRefs", {ref, other}) == 0,
@@ -53,7 +56,7 @@ const Case coreservices_file_manager_case("coreservices_file_manager", [](Fixtur
             f.cf.utf8(f.engine.read64(value)) == "public.plain-text", "kLSItemContentType");
     require(f.status(cs, "_LSCopyItemAttribute", {ref, 0xffffffff, f.cf.string("LSItemExtension"), value}) == 0 &&
             f.cf.utf8(f.engine.read64(value)) == "txt", "kLSItemExtension");
-    require(f.status(cs, "_LSSetItemAttribute", {ref, 0xffffffff, f.cf.string("LSItemExtensionIsHidden"), 0}) == -10821, "kLSAttributeNotSettableErr");
+    require(f.status(cs, "_LSSetItemAttribute", {ref, 0xffffffff, f.cf.string("LSItemExtensionIsHidden"), 0}) == -10663, "kLSAttributeNotSettableErr");
     const auto app = f.block(80);
     require(f.status(cs, "_FSPathMakeRef", {f.text(root + "/Example.app"), app, 0}) == 0 &&
             f.status(cs, "_LSCopyItemAttribute", {app, 0xffffffff, f.cf.string("LSItemContentType"), value}) == 0 &&
@@ -105,7 +108,8 @@ const Case coreservices_file_manager_case("coreservices_file_manager", [](Fixtur
 
 // The application registry (launch_services.cpp) over two applications in a test folder.
 const Case coreservices_application_registry_case("coreservices_application_registry", [](Fixture& f) {
-    const auto host = std::filesystem::temp_directory_path() / "alchemy_ls_registry_case";
+    const auto host = (std::filesystem::temp_directory_path() /
+        ("alchemy_ls_registry_case_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));   // unique: the case also runs in alchemy_gui_framework_cases
     std::filesystem::remove_all(host);
     const auto plist = [&](const std::string& app, const std::string& body) {
         std::filesystem::create_directories(host / app / "Contents");
@@ -148,6 +152,31 @@ const Case coreservices_application_registry_case("coreservices_application_regi
             f.memory().read8(accepts) == 1, "LSCanURLAcceptURL");
     require(f.status(cs, "_LSCanURLAcceptURL", {notes, f.cf.file_url(root + "/Missing.app", true), 0xffffffff, 0, accepts}) == -10814,
             "an unregistered target");
+    // The store: defaults set here come first; LSRegisterURL adds a bundle outside the scanned folders.
+    require(f.status(cs, "_LSSetDefaultHandlerForURLScheme", {string(f, "examplescheme"), string(f, "com.example.other")}) == 0 &&
+            f.cf.utf8(f.call(cs, "_LSCopyDefaultHandlerForURLScheme", {string(f, "examplescheme")})) == "com.example.other",
+            "LSSetDefaultHandlerForURLScheme");
+    require(f.status(cs, "_LSSetDefaultRoleHandlerForContentType", {string(f, "public.plain-text"), 2, string(f, "com.example.other")}) == 0 &&
+            f.cf.utf8(f.call(cs, "_LSCopyDefaultRoleHandlerForContentType", {string(f, "public.plain-text"), 2})) == "com.example.other",
+            "LSSetDefaultRoleHandlerForContentType");
+    require(f.status(cs, "_LSSetDefaultHandlerForURLScheme", {string(f, "examplescheme"), string(f, "com.example.none")}) == -10814,
+            "a default for an unknown application");
+    const auto extra = host / "elsewhere";
+    std::filesystem::create_directories(extra / "Third.app" / "Contents");
+    std::filesystem::create_directories(extra / "Plain");
+    std::ofstream(extra / "Third.app" / "Contents" / "Info.plist")
+        << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>com.example.third</string>"
+           "</dict></plist>\n";
+    const auto extra_root = alchemy::guest_path_string(extra);
+    require(f.status(cs, "_LSRegisterURL", {f.cf.file_url(extra_root + "/Third.app", true), 0}) == 0 &&
+            f.call(cs, "_LSCopyApplicationURLsForBundleIdentifier", {string(f, "com.example.third"), error}) != 0, "LSRegisterURL");
+    require(f.status(cs, "_LSRegisterURL", {f.cf.file_url(extra_root + "/Plain", true), 0}) == -10811, "kLSNotAnApplicationErr");
+    require(f.status(cs, "_LSRegisterURL", {f.cf.file_url(extra_root + "/Missing.app", true), 0}) == -43, "fnfErr");
+    constexpr std::string_view cf_lib = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+    const auto domain = string(f, "com.alchemy.LaunchServices");
+    for (const auto* key : {"URLSchemeHandlers", "ContentTypeHandlers", "RegisteredApplications"})   // leave no defaults behind
+        static_cast<void>(f.call(cf_lib, "_CFPreferencesSetAppValue", {string(f, key), 0, domain}));
+    static_cast<void>(f.call(cf_lib, "_CFPreferencesAppSynchronize", {domain}));
     std::filesystem::remove_all(host);
 });
 

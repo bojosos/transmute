@@ -177,7 +177,7 @@ void Provider::install_services() {
     install_print_core();            // darwin/printing/print_core_gaps.cpp
 
     install_apple_events();          // darwin/coreservices/apple_events.cpp
-    failure(core_services, "_LSRegisterURL", ls_server_communication);
+    // LSRegisterURL: launch_services.cpp (the application registry and its store).
     // LSOpenFromURLSpec(const LSLaunchURLSpec*, CFURLRef* outLaunchedURL):
     // no Launch Services server opens anything (NSWorkspace opens files).
     raw(core_services, "_LSOpenFromURLSpec", [](CpuState& s, GuestMemory& m) {

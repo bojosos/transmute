@@ -3,6 +3,7 @@
 #include "alchemy/darwin/coreservices/uttype.hpp"
 
 #include <algorithm>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -21,8 +22,12 @@
 //   The handler and application queries answer from it: the default
 //   handler is the claiming application with the highest rank (a specific
 //   content type or extension before a wildcard), the first found among
-//   equals. Defaults cannot be changed (there is no LaunchServices
-//   database). UTTypeIsDeclared,
+//   equals. The Alchemy LaunchServices store (the CFPreferences domain
+//   com.alchemy.LaunchServices in the guest user's preferences) keeps what
+//   LSRegisterURL registers (bundles outside the scanned folders, or
+//   refreshed ones) and the defaults LSSetDefaultHandlerForURLScheme and
+//   LSSetDefaultRoleHandlerForContentType set; a default set for a scheme
+//   or content type comes before the ranked choice. UTTypeIsDeclared,
 //   UTTypeIsDynamic and UTTypeCopyDeclaringBundleURL (the system types are
 //   CoreTypes.bundle's) answer from the UTI table. The item queries over
 //   FSRefs and URLs are file_manager.cpp's.
@@ -36,7 +41,12 @@ namespace {
 
 constexpr std::int32_t ls_server_communication = -10822, ls_application_not_found = -10814, unimp_err = -4, param_err = -50;
 // LSRolesMask.
-constexpr std::uint32_t role_none = 1, role_viewer = 2, role_editor = 4, role_shell = 8;
+constexpr std::uint32_t role_none = 1, role_viewer = 2, role_editor = 4, role_shell = 8, role_all = 0xffffffff;
+constexpr std::int32_t fnf_err = -43, ls_not_an_application = -10811;
+constexpr std::string_view store_domain = "com.alchemy.LaunchServices";
+// The store's role keys (LSRolesMask bits, and every role).
+constexpr std::pair<std::uint32_t, const char*> role_keys[] = {{role_editor, "Editor"}, {role_viewer, "Viewer"}, {role_shell, "Shell"},
+                                                               {role_none, "None"}};
 
 namespace uti = completion_kit::uttype;
 
@@ -80,6 +90,10 @@ public:
     // ---- the application registry ----
     std::once_flag scanned;
     std::vector<Application> applications;
+    // The store (com.alchemy.LaunchServices).
+    std::vector<std::string> registered;                                      // LSRegisterURL paths
+    std::map<std::string, std::string> scheme_defaults;                       // scheme -> bundle identifier
+    std::map<std::string, std::map<std::string, std::string>> type_defaults;  // content type -> role key -> identifier
 
     std::string text_of(Address object) { return object && bridge->is_string(object) ? cf.utf8(object) : std::string(); }
     Address value_of(Address dictionary, std::string_view key) {
@@ -112,12 +126,17 @@ public:
         std::sort(out.begin(), out.end());
         return out;
     }
-    void add_application(const std::string& path) {
+    // Adds (or, already registered, replaces) the application at `path`; false when it is no bundle.
+    bool add_application(const std::string& path) {
         const auto url = cf.file_url(path, true);
         const auto bundle = call(core_foundation, "_CFBundleCreate", {0, url});
         release(url);
-        if (!bundle) return;
+        if (!bundle) return false;
         const auto info = call(core_foundation, "_CFBundleGetInfoDictionary", {bundle});
+        if (!info || !bridge->is_dictionary(info) || !value_of(info, "CFBundleExecutable") && !value_of(info, "CFBundleIdentifier")) {
+            release(bundle);
+            return false;
+        }
         Application app;
         app.path = path;
         app.identifier = text_of(value_of(info, "CFBundleIdentifier"));
@@ -141,7 +160,80 @@ public:
                 if (!document.content_types.empty() || !document.extensions.empty()) app.documents.push_back(std::move(document));
             }
         release(bundle);
-        applications.push_back(std::move(app));
+        if (const auto found = std::find_if(applications.begin(), applications.end(), [&](const Application& a) { return a.path == app.path; });
+            found != applications.end())
+            *found = std::move(app);
+        else
+            applications.push_back(std::move(app));
+        return true;
+    }
+
+    // ---- the store ----
+    Address store_value(std::string_view key) {
+        const auto name = cf.string(key), domain = cf.string(store_domain);
+        const auto value = call(core_foundation, "_CFPreferencesCopyAppValue", {name, domain});
+        release(name);
+        release(domain);
+        return value;   // +1 or 0
+    }
+    void store_set(std::string_view key, Address value) {
+        const auto name = cf.string(key), domain = cf.string(store_domain);
+        static_cast<void>(call(core_foundation, "_CFPreferencesSetAppValue", {name, value, domain}));
+        static_cast<void>(call(core_foundation, "_CFPreferencesAppSynchronize", {domain}));
+        release(name);
+        release(domain);
+    }
+    void load_store() {
+        if (const auto paths = store_value("RegisteredApplications")) {
+            registered = strings_of(paths, false);
+            release(paths);
+        }
+        if (const auto schemes = store_value("URLSchemeHandlers")) {
+            if (bridge->is_dictionary(schemes))
+                for (const auto& [key, value] : cf.dictionary_entries(schemes)) scheme_defaults[lower(text_of(key))] = text_of(value);
+            release(schemes);
+        }
+        if (const auto types = store_value("ContentTypeHandlers")) {
+            if (bridge->is_dictionary(types))
+                for (const auto& [key, roles] : cf.dictionary_entries(types))
+                    if (bridge->is_dictionary(roles))
+                        for (const auto& [role, value] : cf.dictionary_entries(roles)) type_defaults[lower(text_of(key))][text_of(role)] = text_of(value);
+            release(types);
+        }
+    }
+    Address strings_value(const std::map<std::string, std::string>& values) {
+        std::vector<std::pair<Address, Address>> entries;
+        for (const auto& [key, value] : values) entries.emplace_back(cf.string(key), cf.string(value));
+        const auto result = cf.dictionary(entries);
+        for (const auto& [key, value] : entries) { release(key); release(value); }
+        return result;
+    }
+    void save_store() {
+        std::vector<Address> paths;
+        for (const auto& path : registered) paths.push_back(cf.string(path));
+        const auto list = cf.array(paths);
+        for (const auto path : paths) release(path);
+        store_set("RegisteredApplications", list);
+        release(list);
+        const auto schemes = strings_value(scheme_defaults);
+        store_set("URLSchemeHandlers", schemes);
+        release(schemes);
+        std::vector<std::pair<Address, Address>> entries;
+        for (const auto& [type, roles] : type_defaults) entries.emplace_back(cf.string(type), strings_value(roles));
+        const auto types = cf.dictionary(entries);
+        for (const auto& [key, value] : entries) { release(key); release(value); }
+        store_set("ContentTypeHandlers", types);
+        release(types);
+    }
+    const Application* by_identifier(const std::string& identifier) {
+        for (const auto& app : registry()) if (!identifier.empty() && lower(app.identifier) == lower(identifier)) return &app;
+        return nullptr;
+    }
+    // The stored default first (when it names an installed application).
+    static void put_first(std::vector<const Application*>& apps, const Application* preferred) {
+        if (!preferred) return;
+        std::erase(apps, preferred);
+        apps.insert(apps.begin(), preferred);
     }
     const std::vector<Application>& registry() {
         std::call_once(scanned, [this] {
@@ -158,6 +250,8 @@ public:
                     for (const auto& inner : directory(path))   // a folder of applications (Utilities, a suite)
                         if (inner.ends_with(".app")) add_application(path + "/" + inner);
                 }
+            load_store();
+            for (const auto& path : registered) static_cast<void>(add_application(path));   // gone ones are skipped
         });
         return applications;
     }
@@ -189,6 +283,14 @@ public:
         std::stable_sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         std::vector<const Application*> out;
         for (const auto& [score, app] : found) out.push_back(app);
+        if (const auto stored = type_defaults.find(lower(type)); stored != type_defaults.end()) {
+            const Application* preferred = nullptr;
+            for (const auto& [bit, key] : role_keys)
+                if (!preferred && (roles & bit))
+                    if (const auto entry = stored->second.find(key); entry != stored->second.end()) preferred = by_identifier(entry->second);
+            if (!preferred) if (const auto entry = stored->second.find("All"); entry != stored->second.end()) preferred = by_identifier(entry->second);
+            put_first(out, preferred);
+        }
         return out;
     }
     std::vector<const Application*> for_scheme(std::string scheme) {
@@ -199,6 +301,7 @@ public:
         std::stable_sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         std::vector<const Application*> out;
         for (const auto& [rank, app] : found) out.push_back(app);
+        if (const auto stored = scheme_defaults.find(scheme); stored != scheme_defaults.end()) put_first(out, by_identifier(stored->second));
         return out;
     }
     // The applications for a URL: a file URL by its item's type, any other by its scheme.
@@ -274,8 +377,6 @@ void LaunchServices::install() {
     // finds none and returns NULL; dispatching needs an instance that can never exist.
     constant(core_services, "_OpenDefaultComponent", 0);
     unsupported(core_services, "_CallComponentDispatch", "no Component Manager components exist; OpenDefaultComponent never returns an instance");
-    failure(core_services, "_LSSetDefaultHandlerForURLScheme", ls_server_communication);
-    failure(core_services, "_LSSetDefaultRoleHandlerForContentType", ls_server_communication);
     // Login items / shared file lists: the lists are always empty and cannot be changed.
     constant(core_services, "_LSSharedFileListInsertItemURL", 0);
     constant(core_services, "_LSSharedFileListItemCopyProperty", 0);
@@ -343,6 +444,46 @@ void LaunchServices::install() {
         if (!has(core_services, name)) string(core_services, name, value);
 
     // ---- applications ----
+    // OSStatus LSRegisterURL(CFURLRef inURL, Boolean inUpdate): an application bundle joins the registry (and the store).
+    raw(core_services, "_LSRegisterURL", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[0]) { s.x[0] = status(param_err); return; }
+        auto path = cf.url_path(s.x[0]);
+        while (path.size() > 1 && path.back() == '/') path.pop_back();
+        static_cast<void>(registry());
+        const auto known = std::find_if(applications.begin(), applications.end(), [&](const Application& app) { return app.path == path; });
+        if (known != applications.end() && !(s.x[1] & 0xff)) { s.x[0] = 0; return; }   // already registered, no update asked
+        const auto text = strdup(path);
+        const auto exists = static_cast<std::int32_t>(call(libsystem, "_access", {text, 0})) == 0;
+        free(text);
+        if (!exists) { s.x[0] = status(fnf_err); return; }
+        if (!add_application(path)) { s.x[0] = status(ls_not_an_application); return; }
+        if (std::find(registered.begin(), registered.end(), path) == registered.end()) {
+            registered.push_back(path);
+            save_store();
+        }
+        s.x[0] = 0;
+    });
+    // OSStatus LSSetDefaultHandlerForURLScheme(CFStringRef scheme, CFStringRef bundleID)
+    raw(core_services, "_LSSetDefaultHandlerForURLScheme", [this](CpuState& s, GuestMemory&) {
+        const auto scheme = lower(text_of(s.x[0])), identifier = text_of(s.x[1]);
+        if (scheme.empty() || identifier.empty()) { s.x[0] = status(param_err); return; }
+        if (!by_identifier(identifier)) { s.x[0] = status(ls_application_not_found); return; }
+        scheme_defaults[scheme] = identifier;
+        save_store();
+        s.x[0] = 0;
+    });
+    // OSStatus LSSetDefaultRoleHandlerForContentType(CFStringRef contentType, LSRolesMask role, CFStringRef bundleID)
+    raw(core_services, "_LSSetDefaultRoleHandlerForContentType", [this](CpuState& s, GuestMemory&) {
+        const auto type = lower(text_of(s.x[0])), identifier = text_of(s.x[2]);
+        const auto roles = static_cast<std::uint32_t>(s.x[1]);
+        if (type.empty() || identifier.empty() || !roles) { s.x[0] = status(param_err); return; }
+        if (!by_identifier(identifier)) { s.x[0] = status(ls_application_not_found); return; }
+        auto& stored = type_defaults[type];
+        if (roles == role_all) stored["All"] = identifier;
+        else for (const auto& [bit, key] : role_keys) if (roles & bit) stored[key] = identifier;
+        save_store();
+        s.x[0] = 0;
+    });
     // Test hook: add the applications of a folder (a guest path) to the registry.
     static_cast<void>(process.install_function("__alchemy_ls_scan_folder", [this](CpuState& s, GuestMemory& m) {
         static_cast<void>(registry());

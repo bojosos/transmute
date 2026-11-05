@@ -42,8 +42,8 @@ namespace {
 namespace uti = completion_kit::uttype;
 
 constexpr std::int32_t no_err = 0, param_err = -50, io_err = -36, fnf_err = -43, f_bsy_err = -47, bad_fsref = -1401,
-    not_a_folder = -1407, refs_different = -1420, path_too_long = -2110, access_denied = -5000, ls_not_settable = -10821,
-    ls_attribute_not_found = -10813;
+    not_a_folder = -1407, refs_different = -1420, path_too_long = -2110, access_denied = -5000, ls_not_settable = -10663,   // kLSAttributeNotSettableErr
+    ls_attribute_not_found = -10662;                                                              // kLSAttributeNotFoundErr
 constexpr std::uint32_t fsref_magic = 0x52465341;   // "ASFR" little-endian
 constexpr std::uint64_t mac_epoch_offset = 2082844800;   // seconds from 1904-01-01 to 1970-01-01 (UTC)
 constexpr std::uint16_t mode_type = 0170000, mode_directory = 0040000, mode_link = 0120000;
