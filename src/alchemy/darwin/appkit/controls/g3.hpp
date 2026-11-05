@@ -15,6 +15,7 @@
 //   token_field.cpp   NSTokenField / NSTokenFieldCell
 //   browser.cpp       NSBrowser / NSBrowserCell
 //   matrix.cpp        NSMatrix
+//   diffable.cpp      diffable data sources and snapshots
 //   text_system.cpp   NSTextStorage / NSLayoutManager / NSTextContainer /
 //                     NSTextViewSharedData coding, NSTextView's attribute,
 //                     selection and typing API, NSFontManager / NSFontPanel
@@ -110,5 +111,7 @@ void install_token_field(AppKit& kit);
 void install_browser(AppKit& kit);
 // NSMatrix (matrix.cpp; installed by install_small_additions).
 void install_matrix(AppKit& kit);
+// NSDiffableDataSourceSnapshot, NSCollectionView / NSTableView diffable data sources (diffable.cpp; installed by install_small_additions).
+void install_diffable_data_sources(AppKit& kit);
 
 } // namespace alchemy::gui::completion_kit::controls

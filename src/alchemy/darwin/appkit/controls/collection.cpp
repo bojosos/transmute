@@ -6,8 +6,9 @@
 #include <map>
 #include <set>
 
-// NSCollectionView (QLab's template chooser) with one section:
-// * items from the data source (collectionView:numberOfItemsInSection:,
+// NSCollectionView (QLab's template chooser, and sectioned collections):
+// * items from the data source (numberOfSectionsInCollectionView:,
+//   collectionView:numberOfItemsInSection:,
 //   collectionView:itemForRepresentedObjectAtIndexPath:), made with
 //   -makeItemWithIdentifier:forIndexPath: from a registered class or nib
 //   (else the nib named like the identifier, as AppKit falls back to);
@@ -16,8 +17,9 @@
 //   -collectionViewContentSize, -layoutAttributesForElementsInRect:), so a
 //   guest layout subclass's overrides place the items;
 //   NSCollectionViewFlowLayout computes its attributes with layout.cpp's
-//   flow_layout (vertical scrolling, one item size; the delegate's
-//   size / inset / spacing answers are honoured), and
+//   flow_layout, section by section stacked vertically (vertical
+//   scrolling, one item size per section; the delegate's size / inset /
+//   spacing / header / footer answers per section are honoured), and
 //   NSCollectionViewGridLayout with grid_layout (row and column limits, the
 //   minimum and maximum item sizes, spacing, margins; items past the row
 //   limit are hidden; the background colours are kept, not drawn);
@@ -27,7 +29,8 @@
 // * nib decoding of the collection view and its _NSCollectionViewCore
 //   (which archives the layout), NSCollectionViewLayout subclasses and
 //   NSCollectionViewItem (an NSViewController).
-// Several sections, horizontal scrolling and drag and drop fail explicitly.
+// Items are numbered flat across sections inside (index paths convert).
+// Horizontal scrolling and drag and drop fail explicitly.
 // NSIndexPath (Foundation; the AppKit item/section additions) is
 // supplemented when Foundation lacks +indexPathForItem:inSection:.
 namespace alchemy::gui::completion_kit::controls {
@@ -44,7 +47,8 @@ struct CollectionState final : ObjectPayload {
     std::vector<Address> items;                              // +1 NSCollectionViewItems, by item index
     std::map<std::string, Address> supplementaries;          // +1 views by "kind/index"
     std::set<std::int64_t> selection;
-    std::int64_t count{};
+    std::int64_t count{};                                    // items in all sections
+    std::vector<std::int64_t> sections;                      // items per section
     bool selectable{}, multiple{}, empty_selection{true}, laying_out{}, loaded{};
     std::uint64_t local_drag_mask{~0ULL}, remote_drag_mask{};   // NSDragOperationEvery / None
 };
@@ -61,10 +65,18 @@ std::map<Address, ItemState>& item_states() {
     return table;
 }
 ItemState& item_state(Address item) { return item_states()[item]; }
+struct FlowSection {
+    double top{};                                            // where the section starts
+    layout::FlowLayout metrics;
+    layout::FlowResult result;                               // frames from the section's top
+    std::int64_t first{};                                    // its first item's flat number
+};
 struct LayoutState final : ObjectPayload {
     Address collection{};                                    // not retained
     layout::FlowLayout flow;
-    layout::FlowResult result;                               // the last -prepareLayout
+    layout::FlowResult result;                               // the last -prepareLayout (grid; the flow's first section)
+    std::vector<FlowSection> flow_sections;                  // the flow layout's sections
+    Size flow_content;
     layout::GridLayout grid;                                 // NSCollectionViewGridLayout
     Address grid_backgrounds{};                              // +1 (kept, not drawn)
     Size estimated{};
@@ -92,71 +104,93 @@ const char* const footer_kind = "UICollectionElementKindSectionFooter";
 std::shared_ptr<CollectionState> collection_of(AppKit& kit, Address view) { return kit.extension<CollectionState>(view); }
 std::shared_ptr<LayoutState> layout_of(AppKit& kit, Address layout) { return kit.objc.host_state<LayoutState>(layout); }
 
-Address index_path(AppKit& kit, std::int64_t item) {
-    return kit.send_id(index_path_class, "indexPathForItem:inSection:", {static_cast<Address>(item), 0});
+Address section_path(AppKit& kit, std::int64_t section) {
+    return kit.send_id(index_path_class, "indexPathForItem:inSection:", {0, static_cast<Address>(section)});
 }
-std::int64_t item_of(AppKit& kit, Address path) {
+// A flat item number's index path (section, item).
+Address index_path(AppKit& kit, const CollectionState& state, std::int64_t flat) {
+    std::int64_t section = 0, item = flat;
+    while (section + 1 < static_cast<std::int64_t>(state.sections.size()) && item >= state.sections[static_cast<std::size_t>(section)]) {
+        item -= state.sections[static_cast<std::size_t>(section)];
+        ++section;
+    }
+    return kit.send_id(index_path_class, "indexPathForItem:inSection:", {static_cast<Address>(item), static_cast<Address>(section)});
+}
+// An index path's flat item number (-1: none).
+std::int64_t item_of(AppKit& kit, const CollectionState& state, Address path) {
     if (!path) return -1;
-    if (static_cast<std::int64_t>(kit.send_id(path, "section")) != 0) unsupported("NSCollectionView sections other than 0");
-    return static_cast<std::int64_t>(kit.send_id(path, "item"));
+    const auto section = static_cast<std::int64_t>(kit.send_id(path, "section"));
+    const auto item = static_cast<std::int64_t>(kit.send_id(path, "item"));
+    if (state.sections.empty()) return section == 0 ? item : -1;
+    if (section < 0 || section >= static_cast<std::int64_t>(state.sections.size()) || item < 0 ||
+        item >= state.sections[static_cast<std::size_t>(section)])
+        return -1;
+    std::int64_t flat = item;
+    for (std::int64_t s = 0; s < section; ++s) flat += state.sections[static_cast<std::size_t>(s)];
+    return flat;
 }
-Address path_set(AppKit& kit, const std::set<std::int64_t>& items) {
+Address path_set(AppKit& kit, const CollectionState& state, const std::set<std::int64_t>& items) {
     std::vector<Address> paths;
-    for (const auto item : items) paths.push_back(index_path(kit, item));
+    for (const auto item : items) paths.push_back(index_path(kit, state, item));
     const auto array = kit.auto_array(paths);
     return kit.send_id(kit.objc.find_class("NSSet"), "setWithArray:", {array});
 }
-std::set<std::int64_t> items_of_set(AppKit& kit, Address set) {
+std::set<std::int64_t> items_of_set(AppKit& kit, const CollectionState& state, Address set) {
     std::set<std::int64_t> out;
     if (!set) return out;
     const auto all = kit.responds(set, "allObjects") ? kit.send_id(set, "allObjects") : set;
-    for (const auto path : kit.items(all)) out.insert(item_of(kit, path));
+    for (const auto path : kit.items(all))
+        if (const auto item = item_of(kit, state, path); item >= 0) out.insert(item);
     return out;
 }
 
-Address make_attributes(AppKit& kit, Rect frame, std::int64_t item, std::int64_t category, std::string_view kind) {
+Address make_attributes(AppKit& kit, Rect frame, Address path, std::int64_t category, std::string_view kind) {
     const auto made = kit.objc.allocate(attributes_class);
     const auto state = kit.objc.host_state<AttributesState>(made);
     state->frame = frame;
-    state->index_path = kit.retain(index_path(kit, item));
+    state->index_path = kit.retain(path);
     state->category = category;
     if (!kind.empty()) state->kind = kit.string(kind);
     return kit.autorelease(made);
 }
 
-// The flow layout's metrics, with the delegate's answers (one section).
-void flow_metrics(AppKit& kit, Address layout_object, LayoutState& state) {
+// The flow layout's metrics for `section`, with the delegate's answers.
+layout::FlowLayout flow_metrics(AppKit& kit, Address layout_object, const LayoutState& state, std::int64_t section_index) {
+    auto metrics = state.flow;
     const auto collection = state.collection;
-    if (!collection) return;
-    const auto delegate = collection_of(kit, collection)->delegate;
-    if (!delegate) return;
+    if (!collection) return metrics;
+    const auto collection_state = collection_of(kit, collection);
+    const auto delegate = collection_state->delegate;
+    if (!delegate) return metrics;
     const auto ask = [&](const char* selector, CallRegs registers) {
         registers.x[2] = collection;
         registers.x[3] = layout_object;
         return kit.send_optional(delegate, selector, registers);
     };
     CallRegs section;
-    section.x[4] = 0;
+    section.x[4] = static_cast<Address>(section_index);
     if (const auto inset = ask("collectionView:layout:insetForSectionAtIndex:", section))
-        state.flow.section_inset = {inset->d(0), inset->d(1), inset->d(2), inset->d(3)};
-    if (const auto value = ask("collectionView:layout:minimumLineSpacingForSectionAtIndex:", section)) state.flow.line_spacing = value->d(0);
-    if (const auto value = ask("collectionView:layout:minimumInteritemSpacingForSectionAtIndex:", section)) state.flow.interitem_spacing = value->d(0);
-    if (const auto value = ask("collectionView:layout:referenceSizeForHeaderInSection:", section)) state.flow.header = value->d(1);
-    if (const auto value = ask("collectionView:layout:referenceSizeForFooterInSection:", section)) state.flow.footer = value->d(1);
+        metrics.section_inset = {inset->d(0), inset->d(1), inset->d(2), inset->d(3)};
+    if (const auto value = ask("collectionView:layout:minimumLineSpacingForSectionAtIndex:", section)) metrics.line_spacing = value->d(0);
+    if (const auto value = ask("collectionView:layout:minimumInteritemSpacingForSectionAtIndex:", section)) metrics.interitem_spacing = value->d(0);
+    if (const auto value = ask("collectionView:layout:referenceSizeForHeaderInSection:", section)) metrics.header = value->d(1);
+    if (const auto value = ask("collectionView:layout:referenceSizeForFooterInSection:", section)) metrics.footer = value->d(1);
     if (kit.responds(delegate, "collectionView:layout:sizeForItemAtIndexPath:")) {
-        const auto count = collection_of(kit, collection)->count;
+        const auto count = section_index < static_cast<std::int64_t>(collection_state->sections.size())
+                               ? collection_state->sections[static_cast<std::size_t>(section_index)] : 0;
         std::optional<Size> uniform;
         for (std::int64_t i = 0; i < count; ++i) {
             CallRegs registers;
-            registers.x[4] = index_path(kit, i);
+            registers.x[4] = kit.send_id(index_path_class, "indexPathForItem:inSection:", {static_cast<Address>(i), static_cast<Address>(section_index)});
             const auto answer = ask("collectionView:layout:sizeForItemAtIndexPath:", registers);
             const Size size{answer->d(0), answer->d(1)};
             if (uniform && (uniform->width != size.width || uniform->height != size.height))
-                unsupported("NSCollectionViewFlowLayout items of different sizes");
+                unsupported("NSCollectionViewFlowLayout items of different sizes in a section");
             uniform = size;
         }
-        if (uniform) state.flow.item = *uniform;
+        if (uniform) metrics.item = *uniform;
     }
+    return metrics;
 }
 
 // Lays the items and supplementary views out from the layout's attributes.
@@ -184,7 +218,8 @@ void layout_items(AppKit& kit, Address self) {
         for (const auto entry : attributes ? kit.items(attributes) : std::vector<Address>{}) {
             CallRegs none;
             const auto frame = result_rect(kit.send(entry, "frame", none));
-            const auto item = item_of(kit, kit.send_id(entry, "indexPath"));
+            const auto path = kit.send_id(entry, "indexPath");
+            const auto item = item_of(kit, *state, path);
             const auto category = static_cast<std::int64_t>(kit.send_id(entry, "representedElementCategory"));
             Address view{};
             if (category == 0) {
@@ -192,11 +227,15 @@ void layout_items(AppKit& kit, Address self) {
                     view = kit.send_id(state->items[static_cast<std::size_t>(item)], "view");
             } else if (category == 1) {
                 const auto kind = kit.text(kit.send_id(entry, "representedElementKind"));
-                const auto key = kind + "/" + std::to_string(item);
-                if (!state->supplementaries.contains(key) && state->delegate &&
-                    kit.responds(state->delegate, "collectionView:viewForSupplementaryElementOfKind:atIndexPath:")) {
-                    const auto made = kit.send_id(state->delegate, "collectionView:viewForSupplementaryElementOfKind:atIndexPath:",
-                                                  {self, kit.auto_string(kind), index_path(kit, item)});
+                const auto key = kind + "/" + std::to_string(path ? kit.send_id(path, "section") : 0) + "/" +
+                                 std::to_string(path ? kit.send_id(path, "item") : 0);
+                // The data source's supplementary views (a diffable data source's provider), else the delegate's.
+                const auto provider = state->data_source && kit.responds(state->data_source, "collectionView:viewForSupplementaryElementOfKind:atIndexPath:")
+                                          ? state->data_source : state->delegate;
+                if (!state->supplementaries.contains(key) && provider &&
+                    kit.responds(provider, "collectionView:viewForSupplementaryElementOfKind:atIndexPath:")) {
+                    const auto made = kit.send_id(provider, "collectionView:viewForSupplementaryElementOfKind:atIndexPath:",
+                                                  {self, kit.auto_string(kind), path});
                     if (made) {
                         state->supplementaries[key] = kit.retain(made);
                         static_cast<void>(kit.send_id(self, "addSubview:", {made}));
@@ -237,17 +276,19 @@ void reload(AppKit& kit, Address self) {
     discard_items(kit, *state);
     state->loaded = true;
     state->count = 0;
+    state->sections.clear();
     if (const auto source = state->data_source) {
-        if (kit.responds(source, "numberOfSectionsInCollectionView:")) {
-            const auto sections = static_cast<std::int64_t>(kit.send_id(source, "numberOfSectionsInCollectionView:", {self}));
-            if (sections > 1) unsupported("NSCollectionView with " + std::to_string(sections) + " sections");
-            if (sections == 0) { layout_items(kit, self); return; }
+        const auto sections = kit.responds(source, "numberOfSectionsInCollectionView:")
+                                  ? static_cast<std::int64_t>(kit.send_id(source, "numberOfSectionsInCollectionView:", {self})) : 1;
+        for (std::int64_t section = 0; section < sections; ++section) {
+            const auto count = static_cast<std::int64_t>(kit.send_id(source, "collectionView:numberOfItemsInSection:", {self, static_cast<Address>(section)}));
+            state->sections.push_back(std::max<std::int64_t>(0, count));
+            state->count += state->sections.back();
         }
-        state->count = static_cast<std::int64_t>(kit.send_id(source, "collectionView:numberOfItemsInSection:", {self, 0}));
     }
     for (auto it = state->selection.begin(); it != state->selection.end();) it = *it >= state->count ? state->selection.erase(it) : std::next(it);
     for (std::int64_t i = 0; i < state->count; ++i) {
-        const auto item = kit.send_id(state->data_source, "collectionView:itemForRepresentedObjectAtIndexPath:", {self, index_path(kit, i)});
+        const auto item = kit.send_id(state->data_source, "collectionView:itemForRepresentedObjectAtIndexPath:", {self, index_path(kit, *state, i)});
         if (!item) unsupported("collectionView:itemForRepresentedObjectAtIndexPath: answered nil");
         state->items.push_back(kit.retain(item));
         item_state(item).collection = self;
@@ -267,9 +308,9 @@ void change_selection(AppKit& kit, Address self, std::set<std::int64_t> wanted, 
     const auto delegate = state->delegate;
     if (from_user && delegate) {
         if (!added.empty() && kit.responds(delegate, "collectionView:shouldSelectItemsAtIndexPaths:"))
-            added = items_of_set(kit, kit.send_id(delegate, "collectionView:shouldSelectItemsAtIndexPaths:", {self, path_set(kit, added)}));
+            added = items_of_set(kit, *state, kit.send_id(delegate, "collectionView:shouldSelectItemsAtIndexPaths:", {self, path_set(kit, *state, added)}));
         if (!removed.empty() && kit.responds(delegate, "collectionView:shouldDeselectItemsAtIndexPaths:"))
-            removed = items_of_set(kit, kit.send_id(delegate, "collectionView:shouldDeselectItemsAtIndexPaths:", {self, path_set(kit, removed)}));
+            removed = items_of_set(kit, *state, kit.send_id(delegate, "collectionView:shouldDeselectItemsAtIndexPaths:", {self, path_set(kit, *state, removed)}));
     }
     for (const auto item : removed) state->selection.erase(item);
     for (const auto item : added) state->selection.insert(item);
@@ -279,9 +320,9 @@ void change_selection(AppKit& kit, Address self, std::set<std::int64_t> wanted, 
         if (item < static_cast<std::int64_t>(state->items.size())) static_cast<void>(kit.send_id(state->items[static_cast<std::size_t>(item)], "setSelected:", {1}));
     if (from_user && delegate) {
         if (!removed.empty()) static_cast<void>(kit.send_optional(delegate, "collectionView:didDeselectItemsAtIndexPaths:",
-                                                                [&] { CallRegs r; r.x[2] = self; r.x[3] = path_set(kit, removed); return r; }()));
+                                                                [&] { CallRegs r; r.x[2] = self; r.x[3] = path_set(kit, *state, removed); return r; }()));
         if (!added.empty()) static_cast<void>(kit.send_optional(delegate, "collectionView:didSelectItemsAtIndexPaths:",
-                                                              [&] { CallRegs r; r.x[2] = self; r.x[3] = path_set(kit, added); return r; }()));
+                                                              [&] { CallRegs r; r.x[2] = self; r.x[3] = path_set(kit, *state, added); return r; }()));
     }
     kit.invalidate_view(self);
 }
@@ -360,10 +401,10 @@ void install_collection_view(AppKit& kit) {
     const auto at = attributes_class;
     const auto as = [k](Address value) { return k->objc.host_state<AttributesState>(value); };
     kit.class_method(at, "layoutAttributesForItemWithIndexPath:", [k](CpuState& s, GuestMemory&) {
-        s.x[0] = make_attributes(*k, {}, item_of(*k, s.x[2]), 0, {});
+        s.x[0] = make_attributes(*k, {}, s.x[2], 0, {});
     });
     kit.class_method(at, "layoutAttributesForSupplementaryViewOfKind:withIndexPath:", [k](CpuState& s, GuestMemory&) {
-        s.x[0] = make_attributes(*k, {}, item_of(*k, s.x[3]), 1, k->text(s.x[2]));
+        s.x[0] = make_attributes(*k, {}, s.x[3], 1, k->text(s.x[2]));
     });
     kit.method(at, "frame", [as](CpuState& s, GuestMemory&) { return_rect(s, as(s.x[0])->frame); }, "{CGRect={CGPoint=dd}{CGSize=dd}}@:");
     kit.method(at, "setFrame:", [as](CpuState& s, GuestMemory&) { as(s.x[0])->frame = rect_arg(s); }, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
@@ -486,13 +527,31 @@ void install_collection_view(AppKit& kit) {
         const auto state = layout_of(*k, self);
         if (state->direction != 0) unsupported("NSCollectionViewFlowLayout horizontal scrolling");
         const auto collection = state->collection;
-        if (!collection) { state->result = {}; return; }
-        flow_metrics(*k, self, *state);
+        state->flow_sections.clear();
+        if (!collection) { state->result = {}; state->flow_content = {}; return; }
+        const auto collection_state = collection_of(*k, collection);
         const auto width = AppKit::view_bounds(*k->view_state(collection)).size.width;
-        state->result = layout::flow_layout(state->flow, static_cast<std::size_t>(collection_of(*k, collection)->count), width);
+        // Each section below the last: its header, items and footer.
+        double top = 0;
+        std::int64_t first = 0;
+        const auto sections = collection_state->sections.empty() ? std::vector<std::int64_t>{collection_state->count} : collection_state->sections;
+        for (std::size_t section = 0; section < sections.size(); ++section) {
+            FlowSection entry;
+            entry.top = top;
+            entry.first = first;
+            entry.metrics = flow_metrics(*k, self, *state, static_cast<std::int64_t>(section));
+            entry.result = layout::flow_layout(entry.metrics, static_cast<std::size_t>(sections[section]), width);
+            top += entry.result.content.height;
+            first += sections[section];
+            state->flow_sections.push_back(std::move(entry));
+        }
+        state->flow_content = {width, top};
+        state->result = state->flow_sections.empty() ? layout::FlowResult{} : state->flow_sections.front().result;
     }, "v@:");
-    kit.method(fl, "collectionViewContentSize", [k](CpuState& s, GuestMemory&) { return_size(s, layout_of(*k, s.x[0])->result.content); }, "{CGSize=dd}@:");
-    kit.method(fl, "layoutAttributesForElementsInRect:", [k](CpuState& s, GuestMemory&) {
+    kit.method(fl, "collectionViewContentSize", [k](CpuState& s, GuestMemory&) { return_size(s, layout_of(*k, s.x[0])->flow_content); }, "{CGSize=dd}@:");
+    // A flow section's element frames (in the view): its header, item `i`, its footer.
+    const auto shifted = [](Rect r, double dy) { return Rect{{r.origin.x, r.origin.y + dy}, r.size}; };
+    kit.method(fl, "layoutAttributesForElementsInRect:", [k, shifted](CpuState& s, GuestMemory&) {
         const auto state = layout_of(*k, s.x[0]);
         const auto rect = rect_arg(s);
         const auto meets = [&](Rect r) {
@@ -500,33 +559,48 @@ void install_collection_view(AppKit& kit) {
                    r.origin.y < rect.origin.y + rect.size.height && r.origin.y + r.size.height > rect.origin.y;
         };
         std::vector<Address> list;
-        const auto width = state->result.content.width;
-        if (state->flow.header > 0) {
-            const Rect header{{0, 0}, {width, state->flow.header}};
-            if (meets(header)) list.push_back(make_attributes(*k, header, 0, 1, header_kind));
-        }
-        for (std::size_t i = 0; i < state->result.frames.size(); ++i)
-            if (meets(state->result.frames[i])) list.push_back(make_attributes(*k, state->result.frames[i], static_cast<std::int64_t>(i), 0, {}));
-        if (state->flow.footer > 0) {
-            const Rect footer{{0, state->result.content.height - state->flow.footer}, {width, state->flow.footer}};
-            if (meets(footer)) list.push_back(make_attributes(*k, footer, 0, 1, footer_kind));
+        const auto collection = state->collection ? collection_of(*k, state->collection) : nullptr;
+        const auto width = state->flow_content.width;
+        for (std::size_t section = 0; section < state->flow_sections.size(); ++section) {
+            const auto& entry = state->flow_sections[section];
+            if (entry.metrics.header > 0) {
+                const Rect header{{0, entry.top}, {width, entry.metrics.header}};
+                if (meets(header)) list.push_back(make_attributes(*k, header, section_path(*k, static_cast<std::int64_t>(section)), 1, header_kind));
+            }
+            for (std::size_t i = 0; i < entry.result.frames.size(); ++i) {
+                const auto frame = shifted(entry.result.frames[i], entry.top);
+                if (meets(frame) && collection)
+                    list.push_back(make_attributes(*k, frame, index_path(*k, *collection, entry.first + static_cast<std::int64_t>(i)), 0, {}));
+            }
+            if (entry.metrics.footer > 0) {
+                const Rect footer{{0, entry.top + entry.result.content.height - entry.metrics.footer}, {width, entry.metrics.footer}};
+                if (meets(footer)) list.push_back(make_attributes(*k, footer, section_path(*k, static_cast<std::int64_t>(section)), 1, footer_kind));
+            }
         }
         s.x[0] = k->auto_array(list);
     }, "@@:{CGRect={CGPoint=dd}{CGSize=dd}}");
-    kit.method(fl, "layoutAttributesForItemAtIndexPath:", [k](CpuState& s, GuestMemory&) {
+    kit.method(fl, "layoutAttributesForItemAtIndexPath:", [k, shifted](CpuState& s, GuestMemory&) {
         const auto state = layout_of(*k, s.x[0]);
-        const auto item = item_of(*k, s.x[2]);
-        s.x[0] = item >= 0 && item < static_cast<std::int64_t>(state->result.frames.size())
-                     ? make_attributes(*k, state->result.frames[static_cast<std::size_t>(item)], item, 0, {}) : 0;
+        s.x[0] = 0;
+        if (!state->collection || !s.x[2]) return;
+        const auto section = static_cast<std::size_t>(k->send_id(s.x[2], "section"));
+        const auto item = static_cast<std::size_t>(k->send_id(s.x[2], "item"));
+        if (section >= state->flow_sections.size() || item >= state->flow_sections[section].result.frames.size()) return;
+        const auto& entry = state->flow_sections[section];
+        s.x[0] = make_attributes(*k, shifted(entry.result.frames[item], entry.top), s.x[2], 0, {});
     });
     kit.method(fl, "layoutAttributesForSupplementaryViewOfKind:atIndexPath:", [k](CpuState& s, GuestMemory&) {
         const auto state = layout_of(*k, s.x[0]);
         const auto kind = k->text(s.x[2]);
-        const auto width = state->result.content.width;
-        if (kind == header_kind && state->flow.header > 0) s.x[0] = make_attributes(*k, {{0, 0}, {width, state->flow.header}}, 0, 1, kind);
-        else if (kind == footer_kind && state->flow.footer > 0)
-            s.x[0] = make_attributes(*k, {{0, state->result.content.height - state->flow.footer}, {width, state->flow.footer}}, 0, 1, kind);
-        else s.x[0] = 0;
+        const auto section = s.x[3] ? static_cast<std::size_t>(k->send_id(s.x[3], "section")) : 0;
+        s.x[0] = 0;
+        if (section >= state->flow_sections.size()) return;
+        const auto& entry = state->flow_sections[section];
+        const auto width = state->flow_content.width;
+        if (kind == header_kind && entry.metrics.header > 0)
+            s.x[0] = make_attributes(*k, {{0, entry.top}, {width, entry.metrics.header}}, s.x[3], 1, kind);
+        else if (kind == footer_kind && entry.metrics.footer > 0)
+            s.x[0] = make_attributes(*k, {{0, entry.top + entry.result.content.height - entry.metrics.footer}, {width, entry.metrics.footer}}, s.x[3], 1, kind);
     });
 
     // ---- NSCollectionViewGridLayout ----
@@ -544,7 +618,8 @@ void install_collection_view(AppKit& kit) {
         const auto state = layout_of(*k, layout_object);
         if (item < 0 || item >= static_cast<std::int64_t>(state->result.frames.size())) return 0;
         const auto frame = state->result.frames[static_cast<std::size_t>(item)];
-        const auto made = make_attributes(*k, frame, item, 0, {});
+        if (!state->collection) return 0;
+        const auto made = make_attributes(*k, frame, index_path(*k, *collection_of(*k, state->collection), item), 0, {});
         if (frame.size.width <= 0) static_cast<void>(k->send_id(made, "setHidden:", {1}));   // past the row limit
         return made;
     };
@@ -562,7 +637,8 @@ void install_collection_view(AppKit& kit) {
         s.x[0] = k->auto_array(list);
     }, "@@:{CGRect={CGPoint=dd}{CGSize=dd}}");
     kit.method(gl, "layoutAttributesForItemAtIndexPath:", [k, grid_attributes](CpuState& s, GuestMemory&) {
-        s.x[0] = grid_attributes(s.x[0], item_of(*k, s.x[2]));
+        const auto state = layout_of(*k, s.x[0]);
+        s.x[0] = state->collection ? grid_attributes(s.x[0], item_of(*k, *collection_of(*k, state->collection), s.x[2])) : 0;
     });
     kit.method(gl, "shouldInvalidateLayoutForBoundsChange:", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:{CGRect={CGPoint=dd}{CGSize=dd}}");
     const auto relayout = [k](Address layout_object) {
@@ -817,17 +893,16 @@ void install_collection_view(AppKit& kit) {
     kit.method(cv, "numberOfSections", [k](CpuState& s, GuestMemory&) {
         const auto state = collection_of(*k, s.x[0]);
         if (!state->loaded) reload(*k, s.x[0]);
-        s.x[0] = 1;
+        s.x[0] = state->sections.size();
     }, "q@:");
     kit.method(cv, "numberOfItemsInSection:", [k](CpuState& s, GuestMemory&) {
         const auto state = collection_of(*k, s.x[0]);
-        if (s.x[2] != 0) unsupported("NSCollectionView sections other than 0");
         if (!state->loaded) reload(*k, s.x[0]);
-        s.x[0] = static_cast<Address>(state->count);
+        s.x[0] = s.x[2] < state->sections.size() ? static_cast<Address>(state->sections[s.x[2]]) : 0;
     }, "q@:q");
     kit.method(cv, "itemAtIndexPath:", [k](CpuState& s, GuestMemory&) {
         const auto state = collection_of(*k, s.x[0]);
-        const auto item = item_of(*k, s.x[2]);
+        const auto item = item_of(*k, *state, s.x[2]);
         s.x[0] = item >= 0 && item < static_cast<std::int64_t>(state->items.size()) ? state->items[static_cast<std::size_t>(item)] : 0;
     });
     kit.method(cv, "itemAtIndex:", [k](CpuState& s, GuestMemory&) {
@@ -835,15 +910,17 @@ void install_collection_view(AppKit& kit) {
         s.x[0] = s.x[2] < state->items.size() ? state->items[s.x[2]] : 0;
     }, "@@:Q");
     kit.method(cv, "indexPathForItem:", [k](CpuState& s, GuestMemory&) {
-        const auto& list = collection_of(*k, s.x[0])->items;
+        const auto state = collection_of(*k, s.x[0]);
+        const auto& list = state->items;
         const auto found = std::find(list.begin(), list.end(), s.x[2]);
-        s.x[0] = found == list.end() ? 0 : index_path(*k, found - list.begin());
+        s.x[0] = found == list.end() ? 0 : index_path(*k, *state, found - list.begin());
     });
     kit.method(cv, "visibleItems", [k](CpuState& s, GuestMemory&) { s.x[0] = k->auto_array(collection_of(*k, s.x[0])->items); });
     kit.method(cv, "indexPathsForVisibleItems", [k](CpuState& s, GuestMemory&) {
+        const auto state = collection_of(*k, s.x[0]);
         std::set<std::int64_t> all;
-        for (std::int64_t i = 0; i < collection_of(*k, s.x[0])->count; ++i) all.insert(i);
-        s.x[0] = path_set(*k, all);
+        for (std::int64_t i = 0; i < state->count; ++i) all.insert(i);
+        s.x[0] = path_set(*k, *state, all);
     });
     kit.method(cv, "frameForItemAtIndex:", [k](CpuState& s, GuestMemory&) {
         const auto state = collection_of(*k, s.x[0]);
@@ -856,13 +933,18 @@ void install_collection_view(AppKit& kit) {
         const auto point = point_arg(s);
         for (std::size_t i = 0; i < state->items.size(); ++i) {
             const auto view = k->send_id(state->items[i], "view");
-            if (view && !k->view_state(view)->hidden && rect_contains(k->view_state(view)->frame, point)) { s.x[0] = index_path(*k, static_cast<std::int64_t>(i)); return; }
+            if (view && !k->view_state(view)->hidden && rect_contains(k->view_state(view)->frame, point)) { s.x[0] = index_path(*k, *state, static_cast<std::int64_t>(i)); return; }
         }
         s.x[0] = 0;
     }, "@@:{CGPoint=dd}");
     // Selection.
-    kit.method(cv, "selectionIndexPaths", [k](CpuState& s, GuestMemory&) { s.x[0] = path_set(*k, collection_of(*k, s.x[0])->selection); });
-    kit.method(cv, "setSelectionIndexPaths:", [k](CpuState& s, GuestMemory&) { change_selection(*k, s.x[0], items_of_set(*k, s.x[2]), false); }, "v@:@");
+    kit.method(cv, "selectionIndexPaths", [k](CpuState& s, GuestMemory&) {
+        const auto state = collection_of(*k, s.x[0]);
+        s.x[0] = path_set(*k, *state, state->selection);
+    });
+    kit.method(cv, "setSelectionIndexPaths:", [k](CpuState& s, GuestMemory&) {
+        change_selection(*k, s.x[0], items_of_set(*k, *collection_of(*k, s.x[0]), s.x[2]), false);
+    }, "v@:@");
     kit.method(cv, "selectionIndexes", [k](CpuState& s, GuestMemory&) {
         const auto made = k->send(k->send(k->objc.find_class("NSMutableIndexSet"), "alloc").x0, "init").x0;
         for (const auto item : collection_of(*k, s.x[0])->selection) static_cast<void>(k->send_id(made, "addIndex:", {static_cast<Address>(item)}));
@@ -876,14 +958,16 @@ void install_collection_view(AppKit& kit) {
         change_selection(*k, s.x[0], wanted, false);
     }, "v@:@");
     kit.method(cv, "selectItemsAtIndexPaths:scrollPosition:", [k](CpuState& s, GuestMemory&) {
-        auto wanted = collection_of(*k, s.x[0])->selection;
-        for (const auto item : items_of_set(*k, s.x[2])) wanted.insert(item);
+        const auto state = collection_of(*k, s.x[0]);
+        auto wanted = state->selection;
+        for (const auto item : items_of_set(*k, *state, s.x[2])) wanted.insert(item);
         change_selection(*k, s.x[0], wanted, false);
         if (s.x[3] != 0 && !wanted.empty()) static_cast<void>(k->send_id(s.x[0], "scrollToItemsAtIndexPaths:scrollPosition:", {s.x[2], s.x[3]}));
     }, "v@:@Q");
     kit.method(cv, "deselectItemsAtIndexPaths:", [k](CpuState& s, GuestMemory&) {
-        auto wanted = collection_of(*k, s.x[0])->selection;
-        for (const auto item : items_of_set(*k, s.x[2])) wanted.erase(item);
+        const auto state = collection_of(*k, s.x[0]);
+        auto wanted = state->selection;
+        for (const auto item : items_of_set(*k, *state, s.x[2])) wanted.erase(item);
         change_selection(*k, s.x[0], wanted, false);
     }, "v@:@");
     kit.method(cv, "selectAll:", [k](CpuState& s, GuestMemory&) {
@@ -898,7 +982,7 @@ void install_collection_view(AppKit& kit) {
         const auto state = collection_of(*k, s.x[0]);
         Rect target{};
         bool any = false;
-        for (const auto item : items_of_set(*k, s.x[2])) {
+        for (const auto item : items_of_set(*k, *state, s.x[2])) {
             if (item < 0 || item >= static_cast<std::int64_t>(state->items.size())) continue;
             const auto view = k->send_id(state->items[static_cast<std::size_t>(item)], "view");
             if (!view) continue;
@@ -943,7 +1027,7 @@ void install_collection_view(AppKit& kit) {
         CallRegs at;
         put_point(at, 0, point);
         const auto path = k->send(self, "indexPathForItemAtPoint:", at).x0;
-        const auto item = path ? item_of(*k, path) : -1;
+        const auto item = path ? item_of(*k, *state, path) : -1;
         const auto flags = k->event_state(s.x[2])->event.modifier_flags;
         auto wanted = state->selection;
         if (item < 0) {
@@ -972,7 +1056,7 @@ void install_collection_view(AppKit& kit) {
             const auto current = state->selection.empty() ? (move > 0 ? -1 : state->count) : (move > 0 ? *state->selection.rbegin() : *state->selection.begin());
             const auto next = std::clamp<std::int64_t>(current + move, 0, state->count - 1);
             change_selection(*k, self, {next}, true);
-            static_cast<void>(k->send_id(self, "scrollToItemsAtIndexPaths:scrollPosition:", {path_set(*k, {next}), 0}));
+            static_cast<void>(k->send_id(self, "scrollToItemsAtIndexPaths:scrollPosition:", {path_set(*k, *state, {next}), 0}));
         }, "v@:@");
     }
 }

@@ -52,6 +52,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/appkit/controls/token_field.cpp
     src/alchemy/darwin/appkit/controls/browser.cpp
     src/alchemy/darwin/appkit/controls/matrix.cpp
+    src/alchemy/darwin/appkit/controls/diffable.cpp
     src/alchemy/darwin/appkit/controls/text_system.cpp
     src/alchemy/darwin/appkit/controls/text_layout.cpp
     src/alchemy/darwin/appkit/controls/text_actions.cpp

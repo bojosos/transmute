@@ -228,6 +228,7 @@ void install_small_additions(AppKit& kit) {
     install_token_field(kit);  // NSTokenField (token_field.cpp)
     install_browser(kit);      // NSBrowser (browser.cpp)
     install_matrix(kit);       // NSMatrix (matrix.cpp)
+    install_diffable_data_sources(kit);   // diffable.cpp
 }
 
 } // namespace alchemy::gui::completion_kit::controls

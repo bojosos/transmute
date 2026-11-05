@@ -1634,12 +1634,17 @@ void AppKit::install_tables(Address header_cell_class) {
         const auto state = table_of(s.x[0]);
         CallRegs registers;
         registers.x[2] = s.x[0]; registers.x[3] = s.x[2]; registers.x[4] = s.x[3];
-        const auto answer = state->table_delegate ? send_optional(state->table_delegate, "tableView:viewForTableColumn:row:", registers) : std::nullopt;
+        auto answer = state->table_delegate ? send_optional(state->table_delegate, "tableView:viewForTableColumn:row:", registers) : std::nullopt;
+        // A data source that makes the views (NSTableViewDiffableDataSource) after the delegate.
+        if (!answer && state->data_source) answer = send_optional(state->data_source, "tableView:viewForTableColumn:row:", registers);
         s.x[0] = answer ? answer->x0 : 0;
     }, "@@:@q");
     method(tv, "_alchemyViewBased", [this, table_of](CpuState& s, GuestMemory&) {
-        const auto delegate = table_of(s.x[0])->table_delegate;
-        return_bool(s, delegate && responds(delegate, is_kind(s.x[0], outline_view) ? "outlineView:viewForTableColumn:item:" : "tableView:viewForTableColumn:row:"));
+        const auto state = table_of(s.x[0]);
+        const auto delegate = state->table_delegate;
+        const bool outline = is_kind(s.x[0], outline_view);
+        return_bool(s, (delegate && responds(delegate, outline ? "outlineView:viewForTableColumn:item:" : "tableView:viewForTableColumn:row:")) ||
+                           (!outline && state->data_source && responds(state->data_source, "tableView:viewForTableColumn:row:")));
     }, "B@:");
     method(tv, "_alchemyHeightOfRow:", [this, table_of](CpuState& s, GuestMemory&) {
         const auto state = table_of(s.x[0]);
@@ -1824,6 +1829,12 @@ void AppKit::install_tables(Address header_cell_class) {
             ask.x[3] = outline ? send_id(self, "itemAtRow:", {static_cast<Address>(row)}) : static_cast<Address>(row);
             if (const auto answer = send_optional(delegate, outline ? "outlineView:rowViewForItem:" : "tableView:rowViewForRow:", ask))
                 made = retain(answer->x0);
+        }
+        if (!made && state->data_source && !is_kind(self, outline_view)) {
+            CallRegs ask;
+            ask.x[2] = self;
+            ask.x[3] = static_cast<Address>(row);
+            if (const auto answer = send_optional(state->data_source, "tableView:rowViewForRow:", ask)) made = retain(answer->x0);
         }
         if (!made) {
             CallRegs zero;

@@ -24,8 +24,8 @@ rasterizing), `host::locale` (case mapping). On win32: user32, gdi32,
 shell32, ole32, windowscodecs, comctl32 (TaskDialogIndirect), the Windows
 Spell Checking API.
 
-**Unsupported (explicit failures):** for example NSCollectionView sections
-other than 0, horizontal NSCollectionViewFlowLayout scrolling, planar
+**Unsupported (explicit failures):** for example horizontal
+NSCollectionViewFlowLayout scrolling, planar
 NSBitmapImageRep data, and NSWindow frame autosave without NSUserDefaults.
 Also -[NSSavePanel ok:] / -cancel: while the Windows file dialog is open,
 -[NSImageRep CGImageForProposedRect:context:hints:] of a representation that
@@ -206,6 +206,17 @@ subitem's action, else the group's; the control representation is kept (groups
 show expanded). NSCollectionViewGridLayout lays items out in a grid (column and
 row limits, minimum and maximum item sizes, spacing, margins); items past the
 row limit are hidden and the background colours are kept, not drawn.
+NSCollectionView has sections (the flow layout stacks them, each with the
+delegate's metrics, header and footer).
+
+**Diffable data sources** (`controls/diffable.cpp`):
+NSDiffableDataSourceSnapshot keeps section and item identifiers (compared
+with -isEqual:) and is built, queried and edited through its documented
+calls; duplicate or unknown identifiers raise. NSCollectionViewDiffableDataSource
+and NSTableViewDiffableDataSource become their view's data source and make
+items / cell views / row views / section header views through their provider
+blocks (table section headers are rows before each section). Applying a
+snapshot reloads the view: differences are not animated.
 
 **Token fields** (`controls/token_field.cpp`): NSTokenField's value is an
 array of represented objects drawn as pills (plain text for

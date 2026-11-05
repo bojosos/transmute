@@ -2046,6 +2046,103 @@ void collection_views(Fixture& f) {
     static_cast<void>(f.id(window, "close"));
 }
 
+// ---- diffable data sources and sectioned collection views (the frameworks wave, U27a) -----------
+void diffable_sources(Fixture& f) {
+    const auto strings = [&f](std::initializer_list<const char*> values) {
+        std::vector<Address> made;
+        for (const auto* value : values) made.push_back(f.str(value));
+        return f.cf.array(made);
+    };
+    const auto texts = [&f](Address array) {
+        std::string out;
+        for (const auto item : f.cf.array_values(array)) out += (out.empty() ? "" : ",") + f.text(item);
+        return out;
+    };
+    // Snapshots.
+    const auto snapshot = f.id(f.id(f.cls("NSDiffableDataSourceSnapshot"), "alloc"), "init");
+    static_cast<void>(f.id(snapshot, "appendSectionsWithIdentifiers:", {strings({"A", "B"})}));
+    static_cast<void>(f.id(snapshot, "appendItemsWithIdentifiers:intoSectionWithIdentifier:", {strings({"a1", "a2"}), f.str("A")}));
+    static_cast<void>(f.id(snapshot, "appendItemsWithIdentifiers:", {strings({"b1"})}));
+    static_cast<void>(f.id(snapshot, "insertItemsWithIdentifiers:beforeItemWithIdentifier:", {strings({"a0"}), f.str("a1")}));
+    require(f.integer(snapshot, "numberOfItems") == 4 && f.integer(snapshot, "numberOfSections") == 2 &&
+                f.integer(snapshot, "indexOfItemIdentifier:", {f.str("b1")}) == 3 &&
+                f.text(f.id(snapshot, "sectionIdentifierForSectionContainingItemIdentifier:", {f.str("a2")})) == "A" &&
+                f.integer(snapshot, "numberOfItemsInSection:", {f.str("B")}) == 1,
+            "a snapshot's sections and items");
+    static_cast<void>(f.id(snapshot, "moveItemWithIdentifier:afterItemWithIdentifier:", {f.str("b1"), f.str("a2")}));
+    static_cast<void>(f.id(snapshot, "deleteItemsWithIdentifiers:", {strings({"a1"})}));
+    require(texts(f.id(snapshot, "itemIdentifiers")) == "a0,a2,b1" && f.integer(snapshot, "numberOfItemsInSection:", {f.str("B")}) == 0,
+            "moves and deletes: " + texts(f.id(snapshot, "itemIdentifiers")));
+    const auto copy = f.id(snapshot, "copy");
+    static_cast<void>(f.id(copy, "deleteAllItems"));
+    require(f.integer(copy, "numberOfSections") == 0 && f.integer(snapshot, "numberOfItems") == 3, "copies are independent");
+
+    // A collection view over a diffable data source: two sections, laid out one after the other.
+    static std::vector<std::string> provided;
+    provided.clear();
+    const auto item_class = f.subclass("TestU27CollectionItem", "NSCollectionViewItem");
+    f.add(item_class, "loadView", [&f](CpuState& s, GuestMemory&) {
+        static_cast<void>(f.id(s.x[0], "setView:", {f.with_rect(f.id(f.cls("NSView"), "alloc"), "initWithFrame:", {{0, 0}, {10, 10}})}));
+    }, "v@:");
+    const auto layout = f.id(f.id(f.cls("NSCollectionViewFlowLayout"), "alloc"), "init");
+    CallRegs item_size;
+    gui::appkit::put_size(item_size, 0, {100, 50});
+    static_cast<void>(f.send(layout, "setItemSize:", item_size));
+    const auto view = f.with_rect(f.id(f.cls("NSCollectionView"), "alloc"), "initWithFrame:", {{0, 0}, {470, 300}});
+    static_cast<void>(f.id(view, "setCollectionViewLayout:", {layout}));
+    static_cast<void>(f.id(view, "registerClass:forItemWithIdentifier:", {item_class, f.str("cell")}));
+    const auto provider = f.block("u27_item_provider", [&f](CpuState& s, GuestMemory&) {
+        provided.push_back(f.text(s.x[3]));
+        s.x[0] = f.id(s.x[1], "makeItemWithIdentifier:forIndexPath:", {f.str("cell"), s.x[2]});
+    });
+    const auto source = f.id(f.id(f.cls("NSCollectionViewDiffableDataSource"), "alloc"), "initWithCollectionView:itemProvider:", {view, provider});
+    require(f.id(view, "dataSource") == source, "the diffable data source is the collection view's data source");
+    const auto shown = f.id(f.id(f.cls("NSDiffableDataSourceSnapshot"), "alloc"), "init");
+    static_cast<void>(f.id(shown, "appendSectionsWithIdentifiers:", {strings({"S1", "S2"})}));
+    static_cast<void>(f.id(shown, "appendItemsWithIdentifiers:intoSectionWithIdentifier:", {strings({"x1", "x2", "x3"}), f.str("S1")}));
+    static_cast<void>(f.id(shown, "appendItemsWithIdentifiers:intoSectionWithIdentifier:", {strings({"y1"}), f.str("S2")}));
+    static_cast<void>(f.id(source, "applySnapshot:animatingDifferences:", {shown, 1}));
+    require(f.integer(view, "numberOfSections") == 2 && f.integer(view, "numberOfItemsInSection:", {1}) == 1 && provided.size() == 4 && provided[3] == "y1",
+            "applying a snapshot loads its sections and items");
+    const auto path = [&f](Address item, Address section) { return f.id(f.cls("NSIndexPath"), "indexPathForItem:inSection:", {item, section}); };
+    const auto second = f.id(f.id(view, "itemAtIndexPath:", {path(0, 1)}), "view");
+    const auto frame = f.send(second, "frame");
+    require(frame.d(1) >= 50 && frame.d(0) == 0, "the second section lies below the first: y " + std::to_string(frame.d(1)));
+    require(f.text(f.id(source, "itemIdentifierForIndexPath:", {path(0, 1)})) == "y1" &&
+                f.integer(f.id(source, "indexPathForItemIdentifier:", {f.str("x3")}), "item") == 2,
+            "identifiers and index paths");
+    require(f.integer(f.id(source, "snapshot"), "numberOfItems") == 4, "-snapshot copies the applied one");
+
+    // A table view over a diffable data source, then with section header rows.
+    const auto table = f.with_rect(f.id(f.cls("NSTableView"), "alloc"), "initWithFrame:", {{0, 0}, {200, 120}});
+    const auto column = f.id(f.id(f.cls("NSTableColumn"), "alloc"), "initWithIdentifier:", {f.str("c")});
+    static_cast<void>(f.with_double(column, "setWidth:", 200));
+    static_cast<void>(f.id(table, "addTableColumn:", {column}));
+    const auto cells = f.block("u27_cell_provider", [&f](CpuState& s, GuestMemory&) {
+        s.x[0] = f.id(f.cls("NSTextField"), "labelWithString:", {s.x[4]});
+    });
+    const auto rows = f.id(f.id(f.cls("NSTableViewDiffableDataSource"), "alloc"), "initWithTableView:cellProvider:", {table, cells});
+    const auto listed = f.id(f.id(f.cls("NSDiffableDataSourceSnapshot"), "alloc"), "init");
+    static_cast<void>(f.id(listed, "appendSectionsWithIdentifiers:", {strings({"T"})}));
+    static_cast<void>(f.id(listed, "appendItemsWithIdentifiers:", {strings({"r1", "r2"})}));
+    static_cast<void>(f.id(rows, "applySnapshot:animatingDifferences:", {listed, 0}));
+    require(f.integer(table, "numberOfRows") == 2, "the table's rows are the snapshot's items");
+    const auto window = f.make_window({{0, 0}, {200, 120}});
+    static_cast<void>(f.id(f.id(window, "contentView"), "addSubview:", {table}));
+    f.show(window);
+    const auto cell = f.id(table, "viewAtColumn:row:makeIfNecessary:", {0, 1, 1});
+    require(cell && f.text(f.id(cell, "stringValue")) == "r2", "the cell provider makes the views");
+    const auto headers = f.block("u27_header_provider", [&f](CpuState& s, GuestMemory&) {
+        s.x[0] = f.id(f.cls("NSTextField"), "labelWithString:", {s.x[3]});
+    });
+    static_cast<void>(f.id(rows, "setSectionHeaderViewProvider:", {headers}));
+    static_cast<void>(f.id(rows, "applySnapshot:animatingDifferences:", {listed, 0}));
+    require(f.integer(table, "numberOfRows") == 3 && f.integer(rows, "rowForItemIdentifier:", {f.str("r1")}) == 1 &&
+                f.text(f.id(rows, "sectionIdentifierForRow:", {0})) == "T" && f.id(rows, "itemIdentifierForRow:", {0}) == 0,
+            "section header rows");
+    static_cast<void>(f.id(window, "close"));
+}
+
 // ---- NSRulerView and NSScrollView rulers / insets -------------------------------------------------
 void rulers(Fixture& f) {
     const auto scroll = f.with_rect(f.id(f.cls("NSScrollView"), "alloc"), "initWithFrame:", {{0, 0}, {300, 200}});
@@ -2408,6 +2505,7 @@ int main() {
         text_tabs(f);
         tables(f);
         collection_views(f);
+        diffable_sources(f);
         rulers(f);
         accessibility(f);
         small_additions(f);
