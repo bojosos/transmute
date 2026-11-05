@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/fwgaps/fwgaps.hpp"
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 
 #include <algorithm>
 #include <array>
@@ -117,7 +118,7 @@ public:
         return objc.send(receiver, selector, registers).x0;
     }
     [[noreturn]] static void fail(const std::string& why) { throw std::runtime_error("Alchemy CoreFoundation: " + why); }
-    static void default_allocator(Address allocator) { if (allocator) fail("custom allocators are unsupported"); }
+    void default_allocator(Address allocator) { if (!cf_allocators::accepted(process.objects(), allocator)) fail("allocators other than the default and CFAllocatorCreate's are unsupported"); }
     Address string_of(std::string_view text) { return cf.string(text); }
     std::string text_of(Address string) { return string ? cf.utf8(string) : std::string(); }
     Address retained(Address object) { return object ? retain(object) : 0; }

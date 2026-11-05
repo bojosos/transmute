@@ -799,7 +799,10 @@ void Streams::install() {
                 if (data) objc_release(self->support, data);
                 for (const auto& [name, value] : properties) { self->support.release(name); self->support.release(value); }
                 // No-copy bytes go to their deallocator (kCFAllocatorNull: the caller keeps them).
-                if (bytes && !data && deallocator != self->null_allocator) static_cast<void>(self->support.call(libsystem, "_free", {bytes}));
+                if (bytes && !data && deallocator != self->null_allocator) {
+                    if (deallocator) static_cast<void>(self->support.call(core_foundation, "_CFAllocatorDeallocate", {deallocator, bytes}));
+                    else static_cast<void>(self->support.call(libsystem, "_free", {bytes}));
+                }
                 if (state->bound) {
                     std::lock_guard lock(state->bound->mutex);
                     (state->input ? state->bound->reader : state->bound->writer) = 0;

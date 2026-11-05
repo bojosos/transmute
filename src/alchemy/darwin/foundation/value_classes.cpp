@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 
 #include "alchemy/host/locale.hpp"
 #include "alchemy/host/system.hpp"
@@ -302,8 +303,8 @@ void install_foundation_classes(Provider& p, ObjcRuntime& objc, CoreFoundation& 
         const auto text = name ? cf.utf8(name) : std::string{};
         return !text.empty() && resolve_zone(text) ? make_time_zone(process, cf, objc, text) : 0;
     };
-    const auto no_allocator = [](std::uint64_t allocator) {
-        if (allocator) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+    const auto no_allocator = [&process](std::uint64_t allocator) {
+        if (!cf_allocators::accepted(process.objects(), allocator)) throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
     };
     // CFTimeZoneRef CFTimeZoneCreateWithName(CFAllocatorRef, CFStringRef name, Boolean tryAbbrev)
     p.function(core_foundation_library, "_CFTimeZoneCreateWithName", [named, no_allocator](CpuState& s, GuestMemory&) -> std::uint64_t {

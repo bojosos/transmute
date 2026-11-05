@@ -1,4 +1,5 @@
 #include "alchemy/core_foundation.hpp"
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 #include "alchemy/darwin/corefoundation/cf_encodings.hpp"
 #include "alchemy/host/files.hpp"
 #include "alchemy/host/locale.hpp"
@@ -416,7 +417,7 @@ struct CoreFoundation::Impl {
     std::uint64_t create(ObjectKind kind, std::shared_ptr<ObjectPayload> payload, std::function<void(std::uint64_t)> destroy = {}, bool immortal = false) {
         return context.objects().create(32, class_address(kind), kind, std::move(payload), std::move(destroy), immortal);
     }
-    void allocator(std::uint64_t value) { if (value) invalid("custom allocators are unsupported"); }
+    void allocator(std::uint64_t value) { if (!cf_allocators::accepted(context.objects(), value)) invalid("allocators other than the default and CFAllocatorCreate's are unsupported"); }
     std::shared_ptr<ObjectRecord> object(std::uint64_t address) {
         if (!address) invalid("null object");
         if (auto found = context.objects().find(address)) return found;

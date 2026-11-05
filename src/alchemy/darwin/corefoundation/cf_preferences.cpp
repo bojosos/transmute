@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 #include "alchemy/darwin/corefoundation/cf_plist.hpp"
 
 #include "alchemy/path.hpp"
@@ -200,7 +201,7 @@ void install_cf_preferences(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) 
     // XML and binary; the OpenStep format cannot be written (as on macOS).
     function("_CFPropertyListCreateData", [&process, &cf, data_object](CpuState& s, GuestMemory& m) {
         if (s.x[4]) m.write64(s.x[4], 0);
-        if (s.x[0]) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+        if (!cf_allocators::accepted(process.objects(), s.x[0])) throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
         if (!s.x[1] || (s.x[2] != plist_xml_format && s.x[2] != plist_binary_format)) { s.x[0] = 0; return; }
         const auto value = plist_from_guest(process, cf, s.x[1]);
         if (s.x[2] == plist_xml_format) {

@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/fwgaps/fwgaps.hpp"
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 
 #include "alchemy/host/locale.hpp"
 
@@ -24,8 +25,8 @@
 //   CFStringCreateWithBytesNoCopy, CFStringGetFileSystemRepresentation
 //   (decomposed UTF-8, as HFS+/APFS names), CFUUIDGetConstantUUIDWithBytes.
 //   CFStringFindWithOptions is with the other string calls (cf_strings.cpp).
-// - No hyphenation dictionaries exist; legacy resource maps never open;
-//   custom allocators cannot be created (CFAllocatorCreate returns NULL).
+// - No hyphenation dictionaries exist; legacy resource maps never open.
+//   Custom allocators are cf_allocators.cpp's.
 namespace alchemy::gui::fill {
 namespace {
 
@@ -300,14 +301,16 @@ void CoreFoundationGaps::remove_observers(Address center, Address observer, Addr
 
 void CoreFoundationGaps::install_strings() {
     // CFStringCreateWithBytesNoCopy(alloc, bytes, numBytes, encoding, isExternalRepresentation, contentsDeallocator):
-    // the bytes are copied, then released with the deallocator (unless kCFAllocatorNull).
+    // the bytes are copied, then released with the deallocator (unless kCFAllocatorNull): the default
+    // allocator frees them, a CFAllocatorCreate allocator gets them through CFAllocatorDeallocate.
     raw(core_foundation, "_CFStringCreateWithBytesNoCopy", [this](CpuState& s, GuestMemory& m) {
         const auto result = call(core_foundation, "_CFStringCreateWithBytes", {s.x[0], s.x[1], s.x[2], s.x[3], s.x[4]});
         Address null_allocator = UINT64_MAX;
         if (const auto found = process.resolve(core_foundation, "_kCFAllocatorNull")) null_allocator = m.read64(found->address);
         if (result && s.x[5] != null_allocator) {
-            if (s.x[5] != 0) throw std::runtime_error("Alchemy: CFStringCreateWithBytesNoCopy with a custom deallocator");
-            free(s.x[1]);
+            if (s.x[5] == 0) free(s.x[1]);
+            else if (cf_allocators::find(process.objects(), s.x[5])) static_cast<void>(call(core_foundation, "_CFAllocatorDeallocate", {s.x[5], s.x[1]}));
+            else throw std::runtime_error("Alchemy: CFStringCreateWithBytesNoCopy with a deallocator CFAllocatorCreate did not make");
         }
         s.x[0] = result;
     });
@@ -364,8 +367,7 @@ void CoreFoundationGaps::install_misc() {
         for (std::uint64_t index = 0; index < count; ++index)
             static_cast<void>(call(core_foundation, "_CFArrayInsertValueAtIndex", {array, location + index, replacements[static_cast<std::size_t>(index)]}));
     });
-    // Custom allocators cannot be created; the malloc allocators are the default allocator.
-    constant(core_foundation, "_CFAllocatorCreate", 0);
+    // The malloc allocators are the default allocator (custom allocators: cf_allocators.cpp).
     value(core_foundation, "_kCFAllocatorMalloc", 0);
     value(core_foundation, "_kCFAllocatorMallocZone", 0);
     // Legacy resource maps (resource forks) never open.

@@ -1,5 +1,7 @@
 #include "alchemy/darwin/corefoundation/install.hpp"
 
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
+
 #include "alchemy/gui/value_provider.hpp"
 #include "alchemy/darwin/kit/fwgaps/fwgaps.hpp"
 #include "alchemy/darwin/kit/completion/runtime/common.hpp"
@@ -22,7 +24,10 @@ void install_corefoundation_additions(export_fill::Provider& provider, ObjcRunti
     export_fill::install_cf_locale(provider, objc, cf);
 }
 
-void install_corefoundation_file_descriptors(support_kit::Support& support) { completion_kit::install_cf_extras(support); }
+void install_corefoundation_file_descriptors(support_kit::Support& support) {
+    completion_kit::install_cf_extras(support);
+    cf_allocators::install(support);
+}
 
 void install_corefoundation_sets_and_charsets(InstallContext& context) {
     fill::install_cf_gaps(context);

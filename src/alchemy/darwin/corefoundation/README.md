@@ -63,12 +63,20 @@
   values, the most compatible Mac encoding and the list of available
   encodings) is ported from swift-corelibs-foundation
   (third_party/swift-corelibs-foundation).
+- **Custom allocators** (cf_allocators.cpp): CFAllocatorCreate keeps the
+  CFAllocatorContext (info retained, released with the allocator); its
+  callbacks serve CFAllocatorAllocate, Reallocate, Deallocate and
+  GetPreferredSizeForSize, and the bytes a NoCopy creator is given with it
+  as the deallocator. Objects created with one keep CoreFoundation's own
+  storage, so CFGetAllocator reports the default allocator;
+  CFAllocatorSetDefault is not provided. Ctest
+  `alchemy_gui_corefoundation_allocators`.
 - **Host dependencies:** time zone and locale data (std::chrono tzdb,
   host::locale); ICU (host::icu, System32 icu.dll on Windows) for encodings,
   case mapping, transforms and character clusters. Phase 2 moves the rest
   behind the host `time` and `locale` areas.
 - **Unsupported, failing explicitly:**
-  * custom CFSet and CFBag callbacks and custom allocators;
+  * custom CFSet and CFBag callbacks;
   * kCFCopyStringDictionaryKeyCallBacks and kCFCopyStringSetCallBacks are not
     exported (collections retain their keys, and these would copy them);
   * non-file URLs without the network provider;

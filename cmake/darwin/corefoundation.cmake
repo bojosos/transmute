@@ -32,6 +32,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/corefoundation/cf_preferences.cpp
     src/alchemy/darwin/corefoundation/cf_locale.cpp
     src/alchemy/darwin/corefoundation/cf_file_descriptors.cpp
+    src/alchemy/darwin/corefoundation/cf_allocators.cpp
     src/alchemy/darwin/corefoundation/cf_string_clusters.cpp
     src/alchemy/darwin/corefoundation/install.cpp
     src/alchemy/darwin/corefoundation/user_defaults_fx.cpp
@@ -77,6 +78,7 @@ alchemy_gui_register_tests(alchemy_darwin_corefoundation_tests)
 # CFStringHasPrefix/HasSuffix and kCFAllocatorNull (its own installer-table row).
 list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/corefoundation/time_zones_and_uuids.cpp)
 alchemy_gui_add_framework_case(corefoundation_time_zones_and_uuids src/alchemy/darwin/corefoundation/tests/time_zones_and_uuids_tests.cpp)
+alchemy_gui_add_framework_case(corefoundation_allocators src/alchemy/darwin/corefoundation/tests/cf_allocators_tests.cpp)
 
 # Headless additions (both builds; darwin/headless_additions.hpp), moved from
 # darwin/identities/installer_frameworks.cpp:

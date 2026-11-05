@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 
 #include "alchemy/darwin/foundation/date_format.hpp"
 
@@ -331,8 +332,8 @@ void install_cf_locale(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     };
     const auto date_formatter_class = native_class("__NSCFDateFormatter");
     const auto number_formatter_class = native_class("__NSCFNumberFormatter");
-    const auto no_allocator = [](std::uint64_t allocator) {
-        if (allocator) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+    const auto no_allocator = [&process](std::uint64_t allocator) {
+        if (!cf_allocators::accepted(process.objects(), allocator)) throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
     };
     const auto payload = [&process]<class T>(std::uint64_t object, const char* what) {
         const auto record = object ? process.objects().find(object) : nullptr;

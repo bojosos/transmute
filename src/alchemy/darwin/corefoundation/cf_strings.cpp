@@ -1,4 +1,5 @@
 #include "alchemy/darwin/corefoundation/cf_encodings.hpp"
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 #include "alchemy/darwin/headless_provider.hpp"
 
 #include "alchemy/host/icu.hpp"
@@ -449,7 +450,7 @@ void Strings::install() {
 void Strings::install_editing() {
     // CFMutableStringRef CFStringCreateMutable(CFAllocatorRef, CFIndex maxLength)
     function(core_foundation_library, "_CFStringCreateMutable", [this](CpuState& s, GuestMemory&) {
-        if (s.x[0]) fail("custom allocators are unsupported");
+        if (!cf_allocators::accepted(context.objects(), s.x[0])) fail("allocators other than the default and CFAllocatorCreate's are unsupported");
         const auto empty = cf.string("");
         s.x[0] = cf.mutable_copy(empty);
         context.objects().release(empty);
@@ -736,7 +737,7 @@ void Strings::install_search() {
     function(core_foundation_library, "_CFStringGetParagraphBounds", [this](CpuState& s, GuestMemory&) { line_bounds(s, false); });
     // CFArrayRef CFStringCreateArrayBySeparatingStrings(CFAllocatorRef, CFStringRef, CFStringRef separator)
     function(core_foundation_library, "_CFStringCreateArrayBySeparatingStrings", [this](CpuState& s, GuestMemory&) {
-        if (s.x[0]) fail("custom allocators are unsupported");
+        if (!cf_allocators::accepted(context.objects(), s.x[0])) fail("allocators other than the default and CFAllocatorCreate's are unsupported");
         require(s.x[1], "CFStringCreateArrayBySeparatingStrings");
         require(s.x[2], "CFStringCreateArrayBySeparatingStrings (separator)");
         const auto units = read(s.x[1]);
@@ -756,7 +757,7 @@ void Strings::install_search() {
     });
     // CFStringRef CFStringCreateByCombiningStrings(CFAllocatorRef, CFArrayRef, CFStringRef separator)
     function(core_foundation_library, "_CFStringCreateByCombiningStrings", [this](CpuState& s, GuestMemory&) {
-        if (s.x[0]) fail("custom allocators are unsupported");
+        if (!cf_allocators::accepted(context.objects(), s.x[0])) fail("allocators other than the default and CFAllocatorCreate's are unsupported");
         require(s.x[1], "CFStringCreateByCombiningStrings");
         const auto values = cf.array_values(s.x[1]);
         const auto separator = values.size() > 1 ? (require(s.x[2], "CFStringCreateByCombiningStrings (separator)"), read(s.x[2])) : Units{};
@@ -825,7 +826,7 @@ void Strings::install_search() {
     });
     // CFStringRef CFStringCreateWithPascalString(CFAllocatorRef, ConstStr255Param, CFStringEncoding)
     function(core_foundation_library, "_CFStringCreateWithPascalString", [this](CpuState& s, GuestMemory& m) {
-        if (s.x[0]) fail("custom allocators are unsupported");
+        if (!cf_allocators::accepted(context.objects(), s.x[0])) fail("allocators other than the default and CFAllocatorCreate's are unsupported");
         require(s.x[1], "CFStringCreateWithPascalString");
         s.x[0] = cf.invoke("CFStringCreateWithBytes", std::array<Address, 5>{0, s.x[1] + 1, m.read8(s.x[1]), s.x[2], 0});
     });
@@ -849,7 +850,7 @@ void Strings::install_search() {
     function(core_foundation_library, "_CFStringGetPascalStringPtr", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     // CFStringRef CFStringCreateFromExternalRepresentation(CFAllocatorRef, CFDataRef, CFStringEncoding)
     function(core_foundation_library, "_CFStringCreateFromExternalRepresentation", [this](CpuState& s, GuestMemory&) {
-        if (s.x[0]) fail("custom allocators are unsupported");
+        if (!cf_allocators::accepted(context.objects(), s.x[0])) fail("allocators other than the default and CFAllocatorCreate's are unsupported");
         require(s.x[1], "CFStringCreateFromExternalRepresentation");
         const auto bytes = cf.invoke("CFDataGetBytePtr", std::array<Address, 1>{s.x[1]});
         const auto length = cf.invoke("CFDataGetLength", std::array<Address, 1>{s.x[1]});

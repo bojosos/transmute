@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 
 #include "alchemy/host/files.hpp"
 #include "alchemy/object_store.hpp"
@@ -99,15 +100,18 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     // The bytes are copied. A deallocator other than kCFAllocatorNull hands
     // the buffer to CF: with the default allocator (NULL or
     // kCFAllocatorDefault/SystemDefault/Malloc, all NULL here) it is freed now;
-    // custom allocators are unsupported (as everywhere in Alchemy CF).
+    // a CFAllocatorCreate allocator gets it through its deallocate callback
+    // (CFAllocatorDeallocate).
     const auto null_allocator = [&process]() -> std::uint64_t {
         const auto found = process.resolve(core_foundation_library, "_kCFAllocatorNull");
         return found ? process.main_engine().read64(found->address) : 0;
     };
-    const auto release_contents = [p, null_allocator](std::uint64_t deallocator, std::uint64_t bytes) {
+    const auto release_contents = [p, &process, null_allocator](std::uint64_t deallocator, std::uint64_t bytes) {
         if (!bytes || (deallocator && deallocator == null_allocator())) return;
-        if (deallocator) throw std::runtime_error("Alchemy CoreFoundation: custom contents deallocators are unsupported");
-        static_cast<void>(p.call(libsystem_library, "_free", {bytes}));
+        if (!deallocator) { static_cast<void>(p.call(libsystem_library, "_free", {bytes})); return; }
+        if (!cf_allocators::find(process.objects(), deallocator))
+            throw std::runtime_error("Alchemy CoreFoundation: contents deallocators other than the default, kCFAllocatorNull and CFAllocatorCreate's are unsupported");
+        static_cast<void>(p.call(core_foundation_library, "_CFAllocatorDeallocate", {deallocator, bytes}));
     };
     // CFDataRef CFDataCreateWithBytesNoCopy(alloc, const UInt8*, CFIndex, CFAllocatorRef deallocator)
     function(cf_library, "_CFDataCreateWithBytesNoCopy", [&cf, release_contents](CpuState& s, GuestMemory&) {
@@ -132,8 +136,8 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         s.x[0] = s.x[1] ? cf.invoke("CFStringCreateWithCString", std::array<std::uint64_t, 3>{s.x[0], s.x[1], utf8_encoding}) : 0;
     });
     // CFMutableStringRef CFStringCreateMutableCopy(alloc, CFIndex maxLength, CFStringRef)
-    function(cf_library, "_CFStringCreateMutableCopy", [&cf](CpuState& s, GuestMemory&) {
-        if (s.x[0]) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+    function(cf_library, "_CFStringCreateMutableCopy", [&process, &cf](CpuState& s, GuestMemory&) {
+        if (!cf_allocators::accepted(process.objects(), s.x[0])) throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
         s.x[0] = cf.mutable_copy(s.x[2]);
     });
     // CFStringEncoding CFStringGetSystemEncoding(void): kCFStringEncodingMacRoman, as on macOS.
@@ -167,7 +171,7 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     });
     // CFUUIDRef CFUUIDCreateFromUUIDBytes(alloc, CFUUIDBytes): the bytes arrive in x1/x2.
     function(cf_library, "_CFUUIDCreateFromUUIDBytes", [&process, &objc](CpuState& s, GuestMemory&) {
-        if (s.x[0]) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+        if (!cf_allocators::accepted(process.objects(), s.x[0])) throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
         auto payload = std::make_shared<CfUuid>();
         std::memcpy(payload->bytes.data(), &s.x[1], 8);
         std::memcpy(payload->bytes.data() + 8, &s.x[2], 8);
@@ -233,7 +237,7 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     function(cf_library, "_CFBundleGetMainBundle", [bundle_class, send](CpuState& s, GuestMemory&) { s.x[0] = send(bundle_class(), "mainBundle"); });
     // CFBundleRef CFBundleCreate(alloc, CFURLRef bundleURL)
     function(cf_library, "_CFBundleCreate", [&process, &objc, &cf, bundle_class, send](CpuState& s, GuestMemory&) {
-        if (s.x[0]) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+        if (!cf_allocators::accepted(process.objects(), s.x[0])) throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
         if (!s.x[1]) { s.x[0] = 0; return; }
         const auto path = cf.string(cf.url_path(s.x[1]));
         const auto object = objc.allocate(bundle_class());
@@ -295,7 +299,7 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     // CFArrayRef CFBundleCreateBundlesFromDirectory(alloc, CFURLRef directoryURL, CFStringRef bundleType):
     // the bundles directly inside the directory whose extension is bundleType (any extension when NULL).
     function(cf_library, "_CFBundleCreateBundlesFromDirectory", [&process, &cf, bundle_class, send](CpuState& s, GuestMemory&) {
-        if (s.x[0]) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+        if (!cf_allocators::accepted(process.objects(), s.x[0])) throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
         std::vector<std::uint64_t> values;
         const auto directory = s.x[1] ? cf.url_path(s.x[1]) : std::string{};
         const auto type = s.x[2] ? cf.utf8(s.x[2]) : std::string{};

@@ -1,4 +1,5 @@
 #include "alchemy/darwin/headless_additions.hpp"
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 #include "alchemy/darwin/headless_provider.hpp"
 
 #include "alchemy/darwin/corefoundation/cf_encodings.hpp"
@@ -36,8 +37,8 @@ public:
     using Provider::Provider;
     std::mutex names_mutex;
     std::map<std::uint32_t, Address> encoding_names;
-    static void default_allocator(Address allocator) {
-        if (allocator) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+    void default_allocator(Address allocator) {
+        if (!cf_allocators::accepted(context.objects(), allocator)) throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
     }
     void install() {
         // A US-English macOS reports Mac Roman as the legacy system encoding.
@@ -83,14 +84,16 @@ public:
             s.x[0] = guest_call(objc_library, "_objc_autorelease", {s.x[0]});
         });
         // NoCopy: the characters are copied, then the buffer goes to its
-        // deallocator at once (kCFAllocatorNull: the caller keeps it).
+        // deallocator at once (kCFAllocatorNull: the caller keeps it; a
+        // CFAllocatorCreate allocator: CFAllocatorDeallocate).
         function(core_foundation_library, "_CFStringCreateWithCStringNoCopy", [this, null_allocator](CpuState& s, GuestMemory&) {
             default_allocator(s.x[0]);
             const auto deallocator = s.x[3];
             const auto result = cf.invoke("CFStringCreateWithCString", std::array<Address, 3>{0, s.x[1], s.x[2]});
             if (deallocator != null_allocator) {
                 default_allocator(deallocator);
-                static_cast<void>(guest_call(libsystem, "_free", {s.x[1]}));
+                if (deallocator) static_cast<void>(guest_call(core_foundation_library, "_CFAllocatorDeallocate", {deallocator, s.x[1]}));
+                else static_cast<void>(guest_call(libsystem, "_free", {s.x[1]}));
             }
             s.x[0] = result;
         });

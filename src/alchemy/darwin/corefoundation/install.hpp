@@ -31,7 +31,7 @@ class Provider;
 namespace alchemy::gui {
 
 void install_corefoundation_additions(export_fill::Provider& provider, ObjcRuntime& objc, CoreFoundation& cf);  // cf_extra, cf_preferences, cf_locale
-void install_corefoundation_file_descriptors(support_kit::Support& support);   // cf_file_descriptors.cpp (and libSystem's fts_err.cpp)
+void install_corefoundation_file_descriptors(support_kit::Support& support);   // cf_file_descriptors.cpp (and libSystem's fts_err.cpp), cf_allocators.cpp
 void install_corefoundation_sets_and_charsets(InstallContext& context);      // cf_sets_notifications.cpp, charset.cpp
 void install_corefoundation_string_clusters(values::Provider& frameworks);  // cf_string_clusters.cpp
 // Its own installer-table row, in the former install_framework_gaps position:
