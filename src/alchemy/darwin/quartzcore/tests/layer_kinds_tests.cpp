@@ -135,6 +135,19 @@ void appearance(Fixture& f) {
     static_cast<void>(f.id(layer, "setShadowPath:", {f.rect_path(0, 0, 10, 10)}));
     const auto with_path = qc::snapshot_tree(f.objc, layer);
     require(with_path.shadow && with_path.shadow->path && with_path.shadow->path->width >= 10, "the shadow path mask");
+    // The mask layer and the contents filters reach the snapshot.
+    const auto text = [&f](Address object) { return object ? f.cf.utf8(object) : std::string("(nil)"); };
+    require(text(f.id(layer, "minificationFilter")) == "linear" && text(f.id(layer, "magnificationFilter")) == "linear" &&
+                f.id(layer, "mask") == 0, "default filters and no mask");
+    const auto mask = f.make("CALayer");
+    f.reals(mask, "setBounds:", {0, 0, 4, 4});
+    static_cast<void>(f.id(layer, "setMask:", {mask}));
+    static_cast<void>(f.id(layer, "setMagnificationFilter:", {f.cf.string("nearest")}));
+    const auto masked = qc::snapshot_tree(f.objc, layer);
+    require(f.id(layer, "mask") == mask && text(f.id(layer, "magnificationFilter")) == "nearest", "mask and filter getters");
+    require(masked.mask && near(masked.mask->bounds.size.width, 4) && masked.nearest_magnification && !masked.nearest_minification,
+            "the mask and filters in the snapshot");
+    static_cast<void>(f.id(layer, "setMask:", {0}));
 }
 
 void drawn_layers(Fixture& f) {

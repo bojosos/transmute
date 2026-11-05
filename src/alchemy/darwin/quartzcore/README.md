@@ -44,9 +44,15 @@ presentation.
 
 **Unsupported (explicit failures):** for example planar IOSurfaces,
 CoreImage kernels, and some CIImage source pixel formats. Layer composition
-draws axis-aligned transforms only (rotating or shearing layers are skipped
-and reported once), with nearest-neighbour sampling; masks (the `mask`
-layer), filters and conic gradients are not drawn (conic reported once).
+uses the 2D (affine) part of each transform: rotated, sheared and masked
+layers are drawn as groups (offscreen at the same resolution, the `mask`
+layer's alpha applied, then resampled bilinearly into place), and scaled
+contents follow `minificationFilter` / `magnificationFilter` (linear by
+default, or nearest; trilinear minifies as linear). The 3D parts (perspective,
+z) are not drawn yet; a transform that maps a layer to nothing, or a group
+over 8192 pixels on a side, is reported once and not drawn. Changes inside a
+mask layer show at the masked layer's next change. Filters (`filters`,
+`compositingFilter`) and conic gradients are not drawn (conic reported once).
 
 **Layer appearance and kinds (drawn):** background colours with corner
 radii (per corner, `maskedCorners`), borders, shadows (opacity, offset,

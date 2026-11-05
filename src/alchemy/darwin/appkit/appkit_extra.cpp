@@ -220,9 +220,9 @@ void install_appkit_extra(Support& support) {
     stored("NSWindow", "preservesContentDuringLiveResize", "setPreservesContentDuringLiveResize:", false, 1, "B@:", "v@:B");
     stored("NSWindow", "displaysWhenScreenProfileChanges", "setDisplaysWhenScreenProfileChanges:", false, 0, "B@:", "v@:B");
     stored("NSWindow", "colorSpace", "setColorSpace:", false, 0, "@@:", "v@:@");
-    // CALayer properties QuartzCore does not model (contentsGravity is
-    // QuartzCore's): masks, corner radii and filters are recorded but not
-    // applied to the composition.
+    // CALayer properties, fallbacks where QuartzCore does not model them
+    // (QuartzCore's mask, filters and contentsGravity are used when present;
+    // the rest are recorded, not applied to the composition).
     stored("CALayer", "mask", "setMask:", false, 0, "@@:", "v@:@");
     stored("CALayer", "contentsFormat", "setContentsFormat:", false, 0, "@@:", "v@:@");
     stored("CALayer", "minificationFilter", "setMinificationFilter:", false, 0, "@@:", "v@:@");

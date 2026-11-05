@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -196,6 +197,93 @@ void hidden_opacity_clipping_and_order() {
     sublayers_only.expect(5, 5, green, "but draws its sublayers");
 }
 
+bool near(const Pixel& got, const Pixel& want, int tolerance = 8) {
+    for (int i = 0; i < 4; ++i) if (std::abs(static_cast<int>(got[i]) - static_cast<int>(want[i])) > tolerance) return false;
+    return true;
+}
+
+// Rotated layers are drawn as groups, resampled bilinearly; masks multiply
+// by the mask layer's alpha; scaled contents follow the layer's filters.
+void rotations_masks_and_filters() {
+    const double r = std::sqrt(0.5);
+    // A 10x10 blue square turned 45 degrees about its centre (10, 10) over red: a diamond.
+    auto root = layer({{0, 0}, {20, 20}}, {0, 0});
+    root.background = rgba(red);
+    auto diamond = layer({{0, 0}, {10, 10}}, {10, 10}, {0.5, 0.5});
+    diamond.transform = {r, r, -r, r, 0, 0};
+    diamond.background = rgba(blue);
+    root.sublayers = {diamond};
+    Canvas canvas(20, 20);
+    auto target = canvas.target();
+    const auto stats = t::compose(root, {{{0, 0}, {20, 20}}, 20, 1}, target, {});
+    require(stats.unsupported_transforms == 0, "a rotated layer is drawn");
+    canvas.expect(10, 10, blue, "the diamond's centre");
+    canvas.expect(10, 4, blue, "its top point region (6 above the centre, inside the 7.07 half-diagonal)");
+    canvas.expect(15, 10, blue, "its right point region");
+    canvas.expect(5, 5, red, "an unrotated square's corner is outside the diamond");
+    canvas.expect(15, 15, red, "the other corner");
+    const auto edge = canvas.at(13, 13);   // on the diamond's edge: antialiased
+    require(edge[0] > 0 && edge[0] < 255 && edge[2] > 0 && edge[3] == 255, "the rotated edge is antialiased: " + text(edge));
+
+    // A rotation inside a rotation: the inner layer turned back is axis-aligned again.
+    auto outer = layer({{0, 0}, {20, 20}}, {10, 10}, {0.5, 0.5});
+    outer.transform = {r, r, -r, r, 0, 0};
+    auto inner = layer({{0, 0}, {6, 6}}, {10, 10}, {0.5, 0.5});
+    inner.transform = {r, -r, r, r, 0, 0};
+    inner.background = rgba(green);
+    outer.sublayers = {inner};
+    root.sublayers = {outer};
+    Canvas nested(20, 20);
+    auto nested_target = nested.target();
+    t::compose(root, {{{0, 0}, {20, 20}}, 20, 1}, nested_target, {});
+    nested.expect(8, 8, green, "the inner square, upright");
+    nested.expect(11, 11, green, "its other side");
+    nested.expect(10, 5, red, "outside it");
+
+    // A mask: an image whose top half is opaque and bottom half clear keeps the top of a green layer.
+    const Picture half(20, 20, white, clear);
+    auto masked = layer({{0, 0}, {20, 20}}, {0, 0});
+    masked.background = rgba(green);
+    auto mask = layer({{0, 0}, {20, 20}}, {0, 0});
+    mask.contents = half.image(false);
+    masked.mask = std::make_shared<const t::Layer>(mask);
+    root.sublayers = {masked};
+    Canvas masking(20, 20);
+    auto masking_target = masking.target();
+    t::compose(root, {{{0, 0}, {20, 20}}, 20, 1}, masking_target, {});
+    masking.expect(3, 3, green, "the mask's opaque top keeps the layer");
+    masking.expect(16, 8, green, "down to the middle");
+    masking.expect(3, 16, red, "its clear bottom hides it");
+    // A half-transparent mask (a background of alpha 0.5) halves the layer.
+    auto faded = layer({{0, 0}, {20, 20}}, {0, 0});
+    faded.background = {1, 1, 1, 0.5F};
+    masked.mask = std::make_shared<const t::Layer>(faded);
+    root.sublayers = {masked};
+    Canvas fading(20, 20);
+    auto fading_target = fading.target();
+    t::compose(root, {{{0, 0}, {20, 20}}, 20, 1}, fading_target, {});
+    require(near(fading.at(10, 10), {0, 128, 127, 255}), "a half-alpha mask blends the layer over what is below: " + text(fading.at(10, 10)));
+
+    // Filters: a 2x1 image (red, blue) stretched over 20x10 pixels.
+    std::vector<std::uint8_t> two{0, 0, 255, 255, 255, 0, 0, 255};
+    auto stretched = layer({{0, 0}, {20, 10}}, {0, 0});
+    stretched.contents = t::Image{2, 1, 8, two.data(), true};
+    root.sublayers = {stretched};
+    Canvas linear(20, 20);
+    auto linear_target = linear.target();
+    t::compose(root, {{{0, 0}, {20, 20}}, 20, 1}, linear_target, {});
+    const auto middle = linear.at(10, 15);
+    require(middle[0] > 80 && middle[0] < 175 && middle[2] > 80 && middle[2] < 175, "kCAFilterLinear blends across the middle: " + text(middle));
+    linear.expect(0, 15, red, "the left edge stays red");
+    linear.expect(19, 15, blue, "the right edge stays blue");
+    root.sublayers[0].nearest_magnification = true;
+    Canvas nearest(20, 20);
+    auto nearest_target = nearest.target();
+    t::compose(root, {{{0, 0}, {20, 20}}, 20, 1}, nearest_target, {});
+    nearest.expect(9, 15, red, "kCAFilterNearest: the left half red");
+    nearest.expect(10, 15, blue, "and the right half blue");
+}
+
 void clip_and_unsupported_transforms() {
     auto root = layer({{0, 0}, {20, 20}}, {0, 0});
     root.background = rgba(red);
@@ -215,9 +303,10 @@ void clip_and_unsupported_transforms() {
     Canvas second(20, 20);
     auto second_target = second.target();
     const auto stats = t::compose(root, {{{0, 0}, {20, 20}}, 20, 1}, second_target, {});
-    require(stats.unsupported_transforms == 1, "a rotation is skipped and counted");
+    require(stats.unsupported_transforms == 0, "a quarter turn is drawn");
+    second.expect(14, 6, blue, "the quarter-turned square");
     second.expect(9, 10, green, "a scale transform is drawn (bottom-left 10x10)");
-    second.expect(10, 9, red, "beyond the scaled layer");
+    second.expect(16, 9, red, "beyond the scaled and turned layers");
 }
 
 } // namespace
@@ -348,6 +437,7 @@ int main() {
         gravity_scale_and_resize();
         hidden_opacity_clipping_and_order();
         clip_and_unsupported_transforms();
+        rotations_masks_and_filters();
         contents_rect();
         corners_borders_shadows();
     } catch (const std::exception& error) {

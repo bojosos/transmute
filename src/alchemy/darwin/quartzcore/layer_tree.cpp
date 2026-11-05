@@ -42,6 +42,91 @@ void blend(std::uint8_t* dst, const std::uint8_t* src, unsigned alpha) {
     }
 }
 
+// Image pixels a sample may read (inclusive): the part of the image drawn.
+struct Span { long x0, y0, x1, y1; };
+
+// The premultiplied pixel of `image` at continuous coordinates (x, y)
+// (pixel centres at i + 0.5), the edge pixels of `span` repeated outside it:
+// bilinear, or the nearest pixel.
+void sample(const Image& image, double x, double y, bool nearest, std::uint8_t* out, const Span* span = nullptr) {
+    const long first_x = span ? span->x0 : 0, first_y = span ? span->y0 : 0;
+    const long last_x = span ? span->x1 : static_cast<long>(image.width) - 1, last_y = span ? span->y1 : static_cast<long>(image.height) - 1;
+    if (nearest) {
+        const long sx = std::clamp(static_cast<long>(std::floor(x)), first_x, last_x), sy = std::clamp(static_cast<long>(std::floor(y)), first_y, last_y);
+        std::memcpy(out, image.bgra + static_cast<std::size_t>(sy) * image.stride + static_cast<std::size_t>(sx) * 4, 4);
+        return;
+    }
+    const double fx = x - 0.5, fy = y - 0.5;
+    const double x0f = std::floor(fx), y0f = std::floor(fy);
+    double tx = fx - x0f, ty = fy - y0f;
+    if (tx < 1e-6) tx = 0; else if (tx > 1 - 1e-6) tx = 1;
+    if (ty < 1e-6) ty = 0; else if (ty > 1 - 1e-6) ty = 1;
+    const long x0 = static_cast<long>(x0f), y0 = static_cast<long>(y0f);
+    const auto px = [&](long cx, long cy) {
+        return image.bgra + static_cast<std::size_t>(std::clamp(cy, first_y, last_y)) * image.stride + static_cast<std::size_t>(std::clamp(cx, first_x, last_x)) * 4;
+    };
+    const auto* p00 = px(x0, y0);
+    const auto* p10 = px(x0 + 1, y0);
+    const auto* p01 = px(x0, y0 + 1);
+    const auto* p11 = px(x0 + 1, y0 + 1);
+    for (int i = 0; i < 4; ++i) {
+        const double top = p00[i] + (p10[i] - p00[i]) * tx, bottom = p01[i] + (p11[i] - p01[i]) * tx;
+        out[i] = static_cast<std::uint8_t>(std::clamp(std::lround(top + (bottom - top) * ty), 0L, 255L));
+    }
+}
+
+Affine inverse(const Affine& m) {
+    const double det = m.a * m.d - m.b * m.c;
+    if (std::abs(det) < 1e-12) return {};
+    const double a = m.d / det, b = -m.b / det, c = -m.c / det, d = m.a / det;
+    return {a, b, c, d, -(a * m.tx + c * m.ty), -(b * m.tx + d * m.ty)};
+}
+
+// The bounding box of `r`'s four corners through `m` (any affine transform).
+Box map_corners(const Affine& m, const Box& r) {
+    const Point corners[4] = {m.apply({r.x0, r.y0}), m.apply({r.x1, r.y0}), m.apply({r.x0, r.y1}), m.apply({r.x1, r.y1})};
+    Box out{corners[0].x, corners[0].y, corners[0].x, corners[0].y};
+    for (const auto& p : corners) { out.x0 = std::min(out.x0, p.x); out.y0 = std::min(out.y0, p.y); out.x1 = std::max(out.x1, p.x); out.y1 = std::max(out.y1, p.y); }
+    return out;
+}
+
+Box box_of(const Rect& r) { return {r.origin.x, r.origin.y, r.origin.x + r.size.width, r.origin.y + r.size.height}; }
+
+// A layer's sublayer space -> its bounds space: the flip, then sublayerTransform about the anchor point.
+Affine sublayer_space(const Layer& value) {
+    const auto& b = value.bounds;
+    const Point anchor{b.origin.x + value.anchor.x * b.size.width, b.origin.y + value.anchor.y * b.size.height};
+    Affine inner;
+    if (value.geometry_flipped) inner = inner.after({1, 0, 0, -1, 0, 2 * b.origin.y + b.size.height});
+    if (!value.sublayer_transform.identity())
+        inner = inner.after(Affine::translation(anchor.x, anchor.y).after(value.sublayer_transform).after(Affine::translation(-anchor.x, -anchor.y)));
+    return inner;
+}
+
+Affine local_to_parent(const Layer& value) {
+    const auto& b = value.bounds;
+    const Point anchor{b.origin.x + value.anchor.x * b.size.width, b.origin.y + value.anchor.y * b.size.height};
+    return Affine::translation(value.position.x, value.position.y).after(value.transform).after(Affine::translation(-anchor.x, -anchor.y));
+}
+
+// What a layer and its sublayers may cover, in its bounds space.
+Box extent(const Layer& value, int depth) {
+    Box out = box_of(value.bounds);
+    if (value.shadow) {
+        const double grow = 2 * std::abs(value.shadow->radius) + 1;
+        out = {std::min(out.x0, out.x0 + value.shadow->offset.width) - grow, std::min(out.y0, out.y0 + value.shadow->offset.height) - grow,
+               std::max(out.x1, out.x1 + value.shadow->offset.width) + grow, std::max(out.y1, out.y1 + value.shadow->offset.height) + grow};
+    }
+    if (value.masks_to_bounds || depth > 64) return out;
+    const auto inner = sublayer_space(value);
+    for (const auto& child : value.sublayers) {
+        if (child.hidden) continue;
+        const auto box = map_corners(inner.after(local_to_parent(child)), extent(child, depth + 1));
+        out = {std::min(out.x0, box.x0), std::min(out.y0, box.y0), std::max(out.x1, box.x1), std::max(out.y1, box.y1)};
+    }
+    return out;
+}
+
 // A rounded rectangle in target pixels: per target corner (top-left,
 // top-right, bottom-left, bottom-right) the x and y radii.
 struct Rounding {
@@ -98,11 +183,14 @@ class Composer {
 public:
     Composer(Target& target, Stats& stats) : target_(target), stats_(stats) {}
 
-    void layer(const Layer& value, const Affine& m, PixelRect clip, float parent_alpha, bool self) {
+    void layer(const Layer& value, const Affine& m, PixelRect clip, float parent_alpha, bool self, bool grouped = false) {
         if (value.hidden) return;
         const float alpha = parent_alpha * std::clamp(value.opacity, 0.0F, 1.0F);
         if (alpha <= 0) return;
-        if (std::abs(m.b) > epsilon || std::abs(m.c) > epsilon) { ++stats_.unsupported_transforms; return; }
+        if (!grouped && (std::abs(m.b) > epsilon || std::abs(m.c) > epsilon || value.mask)) {
+            group(value, m, clip, parent_alpha, self);
+            return;
+        }
         const auto box = map_box(m, value.bounds);
         const auto bounds_pixels = pixels_of(box);
         const auto round = rounding_of(value, m, box);
@@ -127,16 +215,7 @@ public:
     }
 
     void sublayers(const Layer& value, const Affine& m, PixelRect own_clip, float alpha) {
-        // The sublayers' space -> this layer's bounds space: the flip, then
-        // sublayerTransform about the anchor point.
-        const auto& b = value.bounds;
-        const Point anchor{b.origin.x + value.anchor.x * b.size.width, b.origin.y + value.anchor.y * b.size.height};
-        auto inner = m;
-        if (value.geometry_flipped) inner = inner.after({1, 0, 0, -1, 0, 2 * b.origin.y + b.size.height});
-        if (!value.sublayer_transform.identity())
-            inner = inner.after(Affine::translation(anchor.x, anchor.y)
-                                    .after(value.sublayer_transform)
-                                    .after(Affine::translation(-anchor.x, -anchor.y)));
+        const auto inner = m.after(sublayer_space(value));
         std::vector<const Layer*> order;
         order.reserve(value.sublayers.size());
         for (const auto& child : value.sublayers) order.push_back(&child);
@@ -265,12 +344,62 @@ public:
         pass(w, h, [w](long column, long i) { return static_cast<std::size_t>(i * w + column); });
     }
 
-    static Affine local_to_parent(const Layer& value) {
-        const auto& b = value.bounds;
-        const Point anchor{b.origin.x + value.anchor.x * b.size.width, b.origin.y + value.anchor.y * b.size.height};
-        return Affine::translation(value.position.x, value.position.y)
-            .after(value.transform)
-            .after(Affine::translation(-anchor.x, -anchor.y));
+    // A layer drawn as a group (layer_tree.hpp): offscreen in an axis-aligned
+    // space of the same resolution and orientation, masked, then resampled
+    // through the rest of the transform.
+    void group(const Layer& value, const Affine& m, PixelRect clip, float parent_alpha, bool self) {
+        const double det = m.a * m.d - m.b * m.c;
+        if (!(std::abs(det) > 1e-12) || !std::isfinite(det)) { ++stats_.unsupported_transforms; return; }
+        const double sx = std::hypot(m.a, m.b), sy = std::hypot(m.c, m.d);
+        const double ys = det < 0 ? -1.0 : 1.0;   // the offscreen space keeps the transform's orientation
+        const Affine scale{sx, 0, 0, ys * sy, 0, 0};
+        const Affine rest = m.after(Affine{1 / sx, 0, 0, 1 / (ys * sy), 0, 0});   // offscreen -> target (rotation, shear, translation)
+        const Affine back = inverse(rest);
+        auto area = map_corners(scale, extent(value, 0));
+        const auto visible = map_corners(back, {static_cast<double>(clip.x0), static_cast<double>(clip.y0), static_cast<double>(clip.x1),
+                                                static_cast<double>(clip.y1)});
+        area = {std::max(area.x0, visible.x0 - 2), std::max(area.y0, visible.y0 - 2), std::min(area.x1, visible.x1 + 2),
+                std::min(area.y1, visible.y1 + 2)};
+        if (!(area.x1 > area.x0) || !(area.y1 > area.y0)) return;
+        const PixelRect px{static_cast<long>(std::floor(area.x0)) - 1, static_cast<long>(std::floor(area.y0)) - 1,
+                           static_cast<long>(std::ceil(area.x1)) + 1, static_cast<long>(std::ceil(area.y1)) + 1};
+        const long w = px.x1 - px.x0, h = px.y1 - px.y0;
+        if (w > 8192 || h > 8192) { ++stats_.unsupported_transforms; return; }
+        std::vector<std::uint8_t> pixels(static_cast<std::size_t>(w * h * 4), 0);
+        Target buffer{static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h), static_cast<std::size_t>(w) * 4, pixels.data()};
+        const PixelRect whole{0, 0, w, h};
+        const Affine offscreen = Affine::translation(static_cast<double>(-px.x0), static_cast<double>(-px.y0)).after(scale);
+        Composer(buffer, stats_).layer(value, offscreen, whole, parent_alpha, self, true);
+        if (value.mask) {
+            std::vector<std::uint8_t> mask_pixels(pixels.size(), 0);
+            Target mask_buffer{buffer.width, buffer.height, buffer.stride, mask_pixels.data()};
+            Composer(mask_buffer, stats_).layer(*value.mask, offscreen.after(sublayer_space(value)).after(local_to_parent(*value.mask)), whole, 1.0F, true);
+            for (std::size_t i = 0; i < pixels.size(); i += 4) {
+                const unsigned k = mask_pixels[i + 3];
+                if (k == 255) continue;
+                for (int c = 0; c < 4; ++c) pixels[i + static_cast<std::size_t>(c)] = static_cast<std::uint8_t>((pixels[i + static_cast<std::size_t>(c)] * k + 127) / 255);
+            }
+        }
+        // Resample into the target over the buffer's footprint.
+        const auto footprint = map_corners(rest, {static_cast<double>(px.x0), static_cast<double>(px.y0), static_cast<double>(px.x1),
+                                                  static_cast<double>(px.y1)});
+        const auto target_area = PixelRect{static_cast<long>(std::floor(footprint.x0)), static_cast<long>(std::floor(footprint.y0)),
+                                           static_cast<long>(std::ceil(footprint.x1)), static_cast<long>(std::ceil(footprint.y1))}.intersect(clip);
+        if (target_area.empty()) return;
+        const Image image{buffer.width, buffer.height, buffer.stride, pixels.data(), false};
+        const bool nearest = value.nearest_magnification;
+        for (long y = target_area.y0; y < target_area.y1; ++y) {
+            auto* row = at(target_area.x0, y);
+            for (long x = target_area.x0; x < target_area.x1; ++x, row += 4) {
+                const auto p = back.apply({static_cast<double>(x) + 0.5, static_cast<double>(y) + 0.5});
+                const double bx = p.x - static_cast<double>(px.x0), by = p.y - static_cast<double>(px.y0);
+                if (bx < -0.5 || by < -0.5 || bx > static_cast<double>(w) + 0.5 || by > static_cast<double>(h) + 0.5) continue;
+                std::uint8_t pixel[4];
+                sample(image, bx, by, nearest, pixel);
+                if (pixel[3] == 0 && pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0) continue;
+                blend(row, pixel, 255);
+            }
+        }
     }
 
 private:
@@ -353,7 +482,7 @@ private:
             return;   // an empty (or invalid) contentsRect draws nothing
         const auto destination = value.contents_frame ? map_box(m, *value.contents_frame) : place(value, m, box);
         if (!source.whole) {
-            sub_image(image, source, destination, clip, alpha);
+            sub_image(value, image, source, destination, clip, alpha);
             return;
         }
         const auto pixels = pixels_of(destination);
@@ -364,6 +493,14 @@ private:
         const unsigned a = static_cast<unsigned>(std::lround(std::clamp(alpha, 0.0F, 1.0F) * 255.0F));
         const bool one_to_one = dw == static_cast<long>(image.width) && dh == static_cast<long>(image.height);
         const bool copy = image.opaque && a == 255;
+        if (!one_to_one) {
+            // Scaled: the layer's filter (magnification when the image grows on either axis).
+            const bool magnified = dw > static_cast<long>(image.width) || dh > static_cast<long>(image.height);
+            const bool nearest = magnified ? value.nearest_magnification : value.nearest_minification;
+            const Source whole{0, 0, static_cast<double>(image.width), static_cast<double>(image.height), true};
+            filtered(image, whole, pixels, area, a, copy, nearest);
+            return;
+        }
         for (long y = area.y0; y < area.y1; ++y) {
             const long sy = one_to_one ? y - pixels.y0 : static_cast<long>(((y - pixels.y0) * 2 + 1) * static_cast<long long>(image.height) / (2 * dh));
             const auto* source = image.bgra + static_cast<std::size_t>(std::clamp(sy, 0L, static_cast<long>(image.height) - 1)) * image.stride;
@@ -382,23 +519,35 @@ private:
     }
 
     // A contentsRect other than the unit rectangle: the source part scaled
-    // into `destination`, nearest neighbour, edge pixels repeated outside it.
-    void sub_image(const Image& image, const Source& source, const Box& destination, PixelRect clip, float alpha) {
+    // into `destination` with the layer's filter, edge pixels repeated outside it.
+    void sub_image(const Layer& value, const Image& image, const Source& source, const Box& destination, PixelRect clip, float alpha) {
         const auto pixels = pixels_of(destination);
         const auto area = pixels.intersect(clip);
         if (area.empty()) return;
         ++stats_.images_drawn;
-        const double dw = static_cast<double>(pixels.x1 - pixels.x0), dh = static_cast<double>(pixels.y1 - pixels.y0);
         const unsigned a = static_cast<unsigned>(std::lround(std::clamp(alpha, 0.0F, 1.0F) * 255.0F));
         const bool copy = image.opaque && a == 255;
+        const bool magnified = static_cast<double>(pixels.x1 - pixels.x0) > source.width || static_cast<double>(pixels.y1 - pixels.y0) > source.height;
+        filtered(image, source, pixels, area, a, copy, magnified ? value.nearest_magnification : value.nearest_minification);
+    }
+    // `source` (image pixels) scaled onto `pixels`, drawing `area` of it.
+    void filtered(const Image& image, const Source& source, PixelRect pixels, PixelRect area, unsigned a, bool copy, bool nearest) {
+        const double dw = static_cast<double>(pixels.x1 - pixels.x0), dh = static_cast<double>(pixels.y1 - pixels.y0);
+        if (!(dw > 0) || !(dh > 0)) return;
+        // Samples stay inside the drawn part of the image (contentsRect): its edge pixels repeat.
         const long last_x = static_cast<long>(image.width) - 1, last_y = static_cast<long>(image.height) - 1;
+        Span span{std::clamp(static_cast<long>(std::floor(source.x + 1e-9)), 0L, last_x), std::clamp(static_cast<long>(std::floor(source.y + 1e-9)), 0L, last_y),
+                  std::clamp(static_cast<long>(std::ceil(source.x + source.width - 1e-9)) - 1, 0L, last_x),
+                  std::clamp(static_cast<long>(std::ceil(source.y + source.height - 1e-9)) - 1, 0L, last_y)};
+        span.x1 = std::max(span.x1, span.x0);
+        span.y1 = std::max(span.y1, span.y0);
         for (long y = area.y0; y < area.y1; ++y) {
-            const long sy = std::clamp(static_cast<long>(std::floor(source.y + (static_cast<double>(y - pixels.y0) + 0.5) * source.height / dh)), 0L, last_y);
-            const auto* row_source = image.bgra + static_cast<std::size_t>(sy) * image.stride;
+            const double sy = source.y + (static_cast<double>(y - pixels.y0) + 0.5) * source.height / dh;
             auto* row = at(area.x0, y);
             for (long x = area.x0; x < area.x1; ++x, row += 4) {
-                const long sx = std::clamp(static_cast<long>(std::floor(source.x + (static_cast<double>(x - pixels.x0) + 0.5) * source.width / dw)), 0L, last_x);
-                const auto* pixel = row_source + static_cast<std::size_t>(sx) * 4;
+                const double sx = source.x + (static_cast<double>(x - pixels.x0) + 0.5) * source.width / dw;
+                std::uint8_t pixel[4];
+                sample(image, sx, sy, nearest, pixel, &span);
                 if (copy) std::memcpy(row, pixel, 4);
                 else blend(row, pixel, a);
             }

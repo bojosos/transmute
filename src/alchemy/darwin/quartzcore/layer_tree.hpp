@@ -37,10 +37,19 @@
 //   layers draw nothing; opacity multiplies down the tree (per layer, not as
 //   a group). Pixels are premultiplied BGRA composited source-over; opaque
 //   images and colours replace.
-// - Only axis-aligned transforms (scale and translation, including flips)
-//   are drawn; a layer whose accumulated transform rotates or shears is
-//   skipped with its sublayers and counted in Stats::unsupported_transforms.
-//   Sampling is nearest-neighbour.
+// - Transforms are the 2D (affine) parts of the layers' CATransform3Ds. A
+//   layer whose accumulated transform rotates or shears, or that has a mask,
+//   is drawn as a group: it and its sublayers go into an offscreen buffer in
+//   an axis-aligned space of the same resolution, the mask layer's alpha
+//   (the mask drawn like a sublayer of the layer) multiplies it, and the
+//   buffer is resampled into the target through the rest of the transform
+//   (bilinear, nearest where the layer's magnification filter is
+//   kCAFilterNearest). A transform that maps the layer to nothing, or a group
+//   larger than 8192 pixels on a side, is counted in
+//   Stats::unsupported_transforms and not drawn.
+// - Contents drawn at another size are filtered as the layer's
+//   minificationFilter / magnificationFilter say: linear (Core Animation's
+//   default; bilinear) or nearest. kCAFilterTrilinear minifies as linear.
 
 #include "alchemy/gui/window_server.hpp"
 
@@ -120,6 +129,8 @@ struct Layer {
     double border_width{};
     std::optional<std::array<float, 4>> border;   // straight RGBA
     std::optional<Shadow> shadow;                 // opacity > 0
+    bool nearest_minification{}, nearest_magnification{};   // kCAFilterNearest (else linear)
+    std::shared_ptr<const Layer> mask;            // the mask layer (its alpha), in this layer's sublayer space
     std::vector<Layer> sublayers;
 };
 

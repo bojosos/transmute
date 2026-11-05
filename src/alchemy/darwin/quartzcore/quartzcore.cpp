@@ -178,6 +178,8 @@ struct LayerState final : ObjectPayload {
     float shadow_opacity{};
     Size shadow_offset{0, -3};
     Address style{};                   // retained copy
+    // The mask layer (retained) and the contents filters (retained copies; nil: kCAFilterLinear).
+    Address mask{}, minification_filter{}, magnification_filter{};
     // The layer's CAMediaTiming.
     double begin_time{}, time_offset{}, repeat_duration{}, duration{};
     float speed{1}, repeat_count{};
@@ -363,7 +365,8 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
                     had_contents = state->contents != 0;
                     retained = {std::exchange(state->contents, 0), std::exchange(state->name, 0),
                                 std::exchange(state->corner_curve, 0), std::exchange(state->contents_gravity, 0),
-                                std::exchange(state->preferred_dynamic_range, 0),
+                                std::exchange(state->preferred_dynamic_range, 0), std::exchange(state->mask, 0),
+                                std::exchange(state->minification_filter, 0), std::exchange(state->magnification_filter, 0),
                                 std::exchange(state->gradient.colors, 0),
                                 std::exchange(state->gradient.locations, 0), std::exchange(state->gradient.type, 0)};
                     // Timed animations keep their layer alive, so any left
@@ -580,6 +583,12 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         object("name", "setName:", &LayerState::name, true);
         // contentsGravity: kCAGravityResize unless set.
         object("contentsGravity", "setContentsGravity:", &LayerState::contents_gravity, true, false, true, "resize");
+        // The mask layer: its alpha masks the layer and its sublayers (layer_tree.hpp). Changes
+        // inside the mask layer show at the masked layer's next change.
+        object("mask", "setMask:", &LayerState::mask, false, false, true);
+        // kCAFilterLinear / kCAFilterNearest (kCAFilterTrilinear minifies as linear).
+        object("minificationFilter", "setMinificationFilter:", &LayerState::minification_filter, true, false, true, "linear");
+        object("magnificationFilter", "setMagnificationFilter:", &LayerState::magnification_filter, true, false, true, "linear");
         // preferredDynamicRange (CADynamicRange* strings, metal_display_link.cpp):
         // stored; the compositor shows standard dynamic range only. The
         // default CADynamicRangeAutomatic is unverified.
@@ -2643,7 +2652,7 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
         display_if_drawn(object);
         tree::Layer out;
         std::vector<Address> children;
-        Address background{}, gravity{}, border{}, shadow_color{}, shadow_path{};
+        Address background{}, gravity{}, border{}, shadow_color{}, shadow_path{}, mask{}, minification{}, magnification{};
         {
             const auto state = layer(object);
             std::lock_guard lock(state->mutex);
@@ -2671,6 +2680,19 @@ struct QuartzCore : std::enable_shared_from_this<QuartzCore> {
             shadow_color = cf_retain(state->shadow_color);
             shadow_path = cf_retain(state->shadow_path);
             children = state->sublayers;
+            mask = retain(state->mask);
+            minification = retain(state->minification_filter);
+            magnification = retain(state->magnification_filter);
+        }
+        out.nearest_minification = minification && cf.utf8(minification) == "nearest";
+        out.nearest_magnification = magnification && cf.utf8(magnification) == "nearest";
+        release(minification);
+        release(magnification);
+        if (mask) {
+            try {
+                out.mask = std::make_shared<const tree::Layer>(snapshot(mask, depth + 1, flipped != out.geometry_flipped));
+            } catch (...) { release(mask); throw; }
+            release(mask);
         }
         out.background = color_components(background);
         if (border) out.border = color_components(border);
