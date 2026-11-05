@@ -3355,6 +3355,174 @@ void sample_buffer_renderers(Fixture& f) {
     require(f.send(failing, "status") == 2 && f.send(failing, "error") != 0, "no H.264 decoder: the layer fails with an error");
 }
 
+// AVMutableComposition of two WAVE files (A: mono 48 kHz at 0.5; B: stereo 44.1 kHz at -0.25), edited with
+// inserts, an empty range and a removal, read through AVAssetReader; AVMutableAudioMix volume ramps.
+void compositions(Fixture& f) {
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_composition";
+    std::filesystem::create_directories(directory);
+    const auto write_wave = [&](const std::filesystem::path& path, std::uint32_t rate, std::uint32_t channels, std::uint32_t frames, std::int16_t value) {
+        std::vector<std::uint8_t> file;
+        const auto le = [&](std::uint32_t v, int bytes) { for (int i = 0; i < bytes; ++i) file.push_back(static_cast<std::uint8_t>(v >> (8 * i))); };
+        const auto tag = [&](const char* text) { file.insert(file.end(), text, text + 4); };
+        const auto bytes = frames * channels * 2;
+        tag("RIFF"); le(36 + bytes, 4); tag("WAVE");
+        tag("fmt "); le(16, 4); le(1, 2); le(channels, 2); le(rate, 4); le(rate * channels * 2, 4); le(channels * 2, 2); le(16, 2);
+        tag("data"); le(bytes, 4);
+        for (std::uint32_t i = 0; i < frames * channels; ++i) le(static_cast<std::uint16_t>(value), 2);
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+    };
+    write_wave(directory / "a.wav", 48000, 1, 4800, 16384);
+    write_wave(directory / "b.wav", 44100, 2, 4410, -8192);
+    const auto open = [&](const char* name) {
+        const auto url = f.cf.file_url(alchemy::guest_path_string(directory / name), false);
+        const auto asset = f.send(f.cls("AVURLAsset"), "URLAssetWithURL:options:", {url, 0});
+        const auto tracks = f.cf.array_values(f.send(asset, "tracksWithMediaType:", {f.cf.string("soun")}));
+        require(tracks.size() == 1, std::string("the audio track of ") + name);
+        return std::make_pair(url, tracks[0]);
+    };
+    const auto [url_a, track_a] = open("a.wav");
+    const auto [url_b, track_b] = open("b.wav");
+    const auto range = f.block(48), at = f.block(24), error = f.block(8), time = f.block(96);
+    const auto set_range = [&](std::int64_t start_ms, std::int64_t duration_ms) {
+        write_time(f, range, start_ms, 1000);
+        write_time(f, range + 24, duration_ms, 1000);
+    };
+    const auto seconds = [&](Address t) { return static_cast<double>(static_cast<std::int64_t>(f.engine.read64(t))) / f.engine.read32(t + 8); };
+
+    const auto composition = f.send(f.cls("AVMutableComposition"), "composition");
+    require(composition != 0, "+[AVMutableComposition composition]");
+    const auto track = f.send(composition, "addMutableTrackWithMediaType:preferredTrackID:", {f.cf.string("soun"), 0});
+    require(track != 0 && f.send(track, "trackID") == 1, "a composition track with ID 1");
+    set_range(0, 100);
+    write_time(f, at, 0, 1000);
+    require((f.send(track, "insertTimeRange:ofTrack:atTime:error:", {range, track_a, at, error}) & 0xff) == 1, "insert A at 0");
+    write_time(f, at, 100, 1000);
+    require((f.send(track, "insertTimeRange:ofTrack:atTime:error:", {range, track_b, at, error}) & 0xff) == 1, "insert B at 0.1 s");
+    set_range(100, 50);
+    static_cast<void>(f.send(composition, "insertEmptyTimeRange:", {range}));
+    auto segments = f.cf.array_values(f.send(track, "segments"));
+    require(segments.size() == 3 && (f.send(segments[1], "isEmpty") & 0xff) == 1 && (f.send(segments[2], "isEmpty") & 0xff) == 0, "A, empty, B");
+    alchemy::CallRegs mapping{};
+    mapping.indirect_result = time;
+    static_cast<void>(f.objc.send(segments[2], f.objc.selector("timeMapping"), mapping));
+    require(seconds(time) == 0 && seconds(time + 24) == 0.1 && seconds(time + 48) == 0.15 && seconds(time + 72) == 0.1, "B's mapping: source [0, 0.1) at 0.15 s");
+    // Removing [0.05, 0.1) takes A's second half: A [0, 0.05), empty [0.05, 0.1), B [0.1, 0.2).
+    set_range(50, 50);
+    static_cast<void>(f.send(composition, "removeTimeRange:", {range}));
+    segments = f.cf.array_values(f.send(track, "segments"));
+    require(segments.size() == 3, "three segments after the removal");
+    static_cast<void>(f.objc.send(segments[0], f.objc.selector("timeMapping"), mapping));
+    require(seconds(time + 72) == 0.05 && seconds(time + 24) == 0.05, "A's first half");
+    write_time(f, at, 120, 1000);
+    const auto segment_b = f.send(track, "segmentForTrackTime:", {at});
+    require(segment_b && f.send(segment_b, "sourceURL") == url_b && f.send(segment_b, "sourceTrackID") == 1, "the segment at 0.12 s is B's");
+    static_cast<void>(f.objc.send(segment_b, f.objc.selector("timeMapping"), mapping));
+    require(seconds(time + 48) == 0.1, "B starts at 0.1 s");
+    alchemy::CallRegs none{};
+    none.indirect_result = time;
+    static_cast<void>(f.objc.send(composition, f.objc.selector("duration"), none));
+    require(seconds(time) == 0.2, "the composition lasts 0.2 s");
+    require(f.cf.array_values(f.send(composition, "tracksWithMediaType:", {f.cf.string("soun")})).size() == 1, "one audio track");
+
+    // Reads every frame of an output as interleaved floats (channels per frame in `channels`).
+    const auto read_all = [&](Address output, std::uint32_t& channels) {
+        const auto reader = f.send(f.cls("AVAssetReader"), "assetReaderWithAsset:error:", {composition, error});
+        require(reader != 0, "an AVAssetReader of the composition");
+        static_cast<void>(f.send(reader, "addOutput:", {output}));
+        require((f.send(reader, "startReading") & 0xff) == 1, "startReading");
+        std::vector<float> samples;
+        while (const auto sample = f.send(output, "copyNextSampleBuffer")) {
+            const auto description = f.call(cm, "_CMSampleBufferGetFormatDescription", {sample});
+            channels = f.engine.read32(f.call(cm, "_CMAudioFormatDescriptionGetStreamBasicDescription", {description}) + 28);
+            const auto list = f.block(64), retained = f.block(8);
+            require(f.status(cm, "_CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer", {sample, 0, list, 64, 0, 0, 0, retained}) == 0, "buffer list");
+            const auto bytes = f.engine.read32(list + 12);
+            const auto data = f.engine.read64(list + 16);
+            for (std::uint32_t i = 0; i < bytes / 4; ++i) samples.push_back(std::bit_cast<float>(f.engine.read32(data + 4ULL * i)));
+            static_cast<void>(f.call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFRelease", {f.engine.read64(retained)}));
+            static_cast<void>(f.call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFRelease", {sample}));
+        }
+        require(f.send(reader, "status") == 2, "the reader completes");
+        return samples;
+    };
+    const auto near = [](float value, float expected) { return std::fabs(value - expected) < 0.02f; };
+    std::vector<std::pair<Address, Address>> entries{
+        {f.cf.string("AVFormatIDKey"), f.cf.integer(0x6c70636d, 3)}, {f.cf.string("AVLinearPCMBitDepthKey"), f.cf.integer(32, 3)},
+        {f.cf.string("AVLinearPCMIsFloatKey"), f.cf.boolean(true)}, {f.cf.string("AVLinearPCMIsNonInterleaved"), f.cf.boolean(false)}};
+    std::uint32_t channels = 0;
+    auto samples = read_all(f.send(f.cls("AVAssetReaderTrackOutput"), "assetReaderTrackOutputWithTrack:outputSettings:", {track, f.cf.dictionary(entries)}), channels);
+    // At A's rate (48 kHz) with B's two channels: 0.2 s is 9600 frames.
+    require(channels == 2 && samples.size() == 9600 * 2, "9600 stereo frames: " + std::to_string(samples.size()));
+    const auto frame = [&](double t, std::uint32_t c) { return samples[static_cast<std::size_t>(t * 48000) * 2 + c]; };
+    require(near(frame(0.025, 0), 0.5f) && near(frame(0.025, 1), 0.5f), "A (mono to both channels)");
+    require(frame(0.075, 0) == 0 && frame(0.075, 1) == 0, "the empty segment is silent");
+    require(near(frame(0.15, 0), -0.25f) && near(frame(0.15, 1), -0.25f), "B resampled to 48 kHz: " + std::to_string(frame(0.15, 0)));
+
+    // An audio mix: a ramp from 1 to 0 over [0, 0.1), then 0.5 from 0.1 s.
+    const auto parameters = f.send(f.cls("AVMutableAudioMixInputParameters"), "audioMixInputParametersWithTrack:", {track});
+    require(parameters && f.send(parameters, "trackID") == 1, "input parameters for track 1");
+    set_range(0, 100);
+    alchemy::CallRegs ramp{};
+    ramp.set_s(0, 1.0f);
+    ramp.set_s(1, 0.0f);
+    ramp.x[2] = range;
+    static_cast<void>(f.objc.send(parameters, f.objc.selector("setVolumeRampFromStartVolume:toEndVolume:timeRange:"), ramp));
+    write_time(f, at, 100, 1000);
+    alchemy::CallRegs point{};
+    point.set_s(0, 0.5f);
+    point.x[2] = at;
+    static_cast<void>(f.objc.send(parameters, f.objc.selector("setVolume:atTime:"), point));
+    const auto start_volume = f.block(4), end_volume = f.block(4), ramp_range = f.block(48);
+    write_time(f, at, 50, 1000);
+    require((f.send(parameters, "getVolumeRampForTime:startVolume:endVolume:timeRange:", {at, start_volume, end_volume, ramp_range}) & 0xff) == 1 &&
+                std::bit_cast<float>(f.engine.read32(start_volume)) == 1.0f && std::bit_cast<float>(f.engine.read32(end_volume)) == 0.0f &&
+                seconds(ramp_range) == 0 && seconds(ramp_range + 24) == 0.1, "the ramp at 0.05 s");
+    write_time(f, at, 150, 1000);
+    require((f.send(parameters, "getVolumeRampForTime:startVolume:endVolume:timeRange:", {at, start_volume, end_volume, ramp_range}) & 0xff) == 1 &&
+                std::bit_cast<float>(f.engine.read32(start_volume)) == 0.5f && seconds(ramp_range) == 0.1 && (f.engine.read32(ramp_range + 36) & 4) != 0,
+            "the point at 0.1 s lasts");
+    const auto mix = f.send(f.cls("AVMutableAudioMix"), "audioMix");
+    static_cast<void>(f.send(mix, "setInputParameters:", {f.cf.array(std::vector<Address>{parameters})}));
+    require(f.cf.array_values(f.send(mix, "inputParameters")).size() == 1, "the mix's parameters");
+    const auto mix_output = f.send(f.cls("AVAssetReaderAudioMixOutput"), "assetReaderAudioMixOutputWithAudioTracks:audioSettings:",
+                                   {f.cf.array(std::vector<Address>{track}), 0});
+    static_cast<void>(f.send(mix_output, "setAudioMix:", {mix}));
+    samples = read_all(mix_output, channels);
+    require(samples.size() == 9600 * 2, "the mix reads 9600 frames");
+    require(near(frame(0.025, 0), 0.375f), "A at 3/4 volume: " + std::to_string(frame(0.025, 0)));
+    require(near(frame(0.15, 1), -0.125f), "B at half volume: " + std::to_string(frame(0.15, 1)));
+
+    // The same parameters on a file asset's track (ID 1): A ramped.
+    const auto file_reader = f.send(f.cls("AVAssetReader"), "assetReaderWithAsset:error:", {f.send(track_a, "asset"), error});
+    const auto file_output = f.send(f.cls("AVAssetReaderAudioMixOutput"), "assetReaderAudioMixOutputWithAudioTracks:audioSettings:",
+                                    {f.cf.array(std::vector<Address>{track_a}), 0});
+    static_cast<void>(f.send(file_output, "setAudioMix:", {mix}));
+    static_cast<void>(f.send(file_reader, "addOutput:", {file_output}));
+    require((f.send(file_reader, "startReading") & 0xff) == 1, "a file reader with a mix");
+    const auto first = f.send(file_output, "copyNextSampleBuffer");
+    const auto list = f.block(64), retained = f.block(8);
+    require(first && f.status(cm, "_CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer", {first, 0, list, 64, 0, 0, 0, retained}) == 0, "a mixed file buffer");
+    require(near(std::bit_cast<float>(f.engine.read32(f.engine.read64(list + 16))), 0.5f), "the ramp starts at full volume");
+
+    // A whole asset into a new composition: its audio track gets a composition track.
+    set_range(0, 100);
+    write_time(f, at, 0, 1000);
+    const auto whole = f.send(f.cls("AVMutableComposition"), "composition");
+    require((f.send(whole, "insertTimeRange:ofAsset:atTime:error:", {range, f.send(track_b, "asset"), at, error}) & 0xff) == 1, "insert B's asset");
+    const auto whole_tracks = f.cf.array_values(f.send(whole, "tracks"));
+    require(whole_tracks.size() == 1 && f.send(whole, "mutableTrackCompatibleWithTrack:", {track_a}) == whole_tracks[0], "a compatible audio track");
+    static_cast<void>(f.objc.send(whole, f.objc.selector("duration"), none));
+    require(seconds(time) == 0.1, "B's 0.1 s");
+
+    // An asset with no readable media is refused.
+    const auto missing = f.send(f.cls("AVURLAsset"), "URLAssetWithURL:options:", {f.cf.file_url(alchemy::guest_path_string(directory / "missing.wav"), false), 0});
+    f.engine.write64(error, 0);
+    require((f.send(composition, "insertTimeRange:ofAsset:atTime:error:", {range, missing, at, error}) & 0xff) == 0 && f.engine.read64(error) != 0,
+            "no insert from unreadable media");
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 } // namespace
 
 int main() {
@@ -3385,6 +3553,7 @@ int main() {
         {"sample_buffer_renderers", sample_buffer_renderers},
         {"au_listeners", au_listeners},
         {"av_foundation", av_foundation},
+        {"compositions", compositions},
         {"avaudio", avaudio},
         {"avaudio_conversion", avaudio_conversion},
         {"avaudio_effects", avaudio_effects},

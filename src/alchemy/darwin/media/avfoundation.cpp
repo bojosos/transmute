@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -40,6 +41,12 @@
 //   as they are (NotSync on non-sync video samples), or with settings
 //   decoded pictures (a VTDecompressionSession with the settings as its
 //   destination attributes, from the sync sample before the time range).
+// - AVMutableComposition and its tracks: segments of file assets' tracks
+//   (inserted, empty, removed), read by AVAssetReader as one audio source
+//   (audio_source.hpp: other rates resampled, gaps silent, tracks added);
+//   AVMutableAudioMix volume ramps apply to mix outputs. Composition video
+//   is not read, and changes of speed (scaleTimeRange:toDuration:) and
+//   audio taps stop with an explicit message. Playback is file assets only.
 // - AVAssetImageGenerator decodes the first decodable video track through a
 //   reader: the picture at or before the time (the sync sample before it
 //   with the default unbounded tolerances), scaled to the maximum size;
@@ -96,6 +103,10 @@ struct AssetState final : ObjectPayload {
     Address track{};                   // the readable audio track (one of `tracks`)
     std::vector<Address> tracks;       // retained AVAssetTracks
     std::shared_ptr<container::Movie> movie;   // container files (MP4, MOV, WebM, Ogg, MP3, FLAC)
+    // AVComposition: tracks made of segments of other assets (loaded from the start, no file of its own).
+    bool composition{};
+    std::int32_t next_track_id{1};
+    double natural_width{}, natural_height{};
     [[nodiscard]] bool readable() const { return loaded && !tracks.empty(); }
     [[nodiscard]] bool audio_readable() const { return loaded && status == 0; }
     [[nodiscard]] std::uint64_t frames() const { return container.data_bytes / container.format.frame_bytes(); }
@@ -106,6 +117,60 @@ struct TrackState final : ObjectPayload {
     std::int32_t id{1};
     bool video{}, decodable{true}, readable_audio{};
     std::size_t index{};               // in the asset's movie (container files)
+    // AVCompositionTrack: segments in time order, contiguous from 0, in seconds. A segment plays
+    // `duration` seconds of its URL's track `source_track` from `source_start` at `start`, or is
+    // empty (silence). The URLs are retained.
+    struct Segment { bool empty{}; Address url{}; std::int32_t source_track{}; double source_start{}, start{}, duration{}; };
+    bool composition{};
+    std::vector<Segment> segments;
+    float preferred_volume{1};
+    bool enabled{true};
+    [[nodiscard]] double end() const { return segments.empty() ? 0 : segments.back().start + segments.back().duration; }
+};
+
+// AVAudioMixInputParameters: the volume of track `track_id` over time, from ramps (a point set with
+// -setVolume:atTime: is a ramp of no duration). Before the first ramp the volume is 1; after a ramp
+// it stays at the ramp's end volume.
+struct VolumeRamp { double start{}, duration{}; float from{1}, to{1}; };
+float volume_at(const std::vector<VolumeRamp>& ramps, double t) {
+    float g = 1;
+    for (const auto& r : ramps) {
+        if (t < r.start) break;
+        if (r.duration > 0 && t < r.start + r.duration) return r.from + (r.to - r.from) * static_cast<float>((t - r.start) / r.duration);
+        g = r.to;
+    }
+    return g;
+}
+struct MixParameters final : ObjectPayload {
+    std::int32_t track_id{};
+    std::vector<VolumeRamp> ramps;     // by start
+    Address pitch_algorithm{};         // retained NSString or 0
+};
+struct AudioMixState final : ObjectPayload { std::vector<Address> parameters; };   // retained AVAudioMixInputParameters
+struct SegmentState final : ObjectPayload { TrackState::Segment segment; };      // AVCompositionTrackSegment (URL retained)
+
+// A source's frames scaled by an audio mix's volume over time.
+class GainSource final : public audio_source::Source {
+public:
+    GainSource(std::shared_ptr<audio_source::Source> inner, std::vector<VolumeRamp> ramps) : inner_(std::move(inner)), ramps_(std::move(ramps)) {}
+    [[nodiscard]] double rate() const override { return inner_->rate(); }
+    [[nodiscard]] std::uint32_t channels() const override { return inner_->channels(); }
+    [[nodiscard]] std::uint64_t frames() const override { return inner_->frames(); }
+    std::size_t read(std::uint64_t start, std::size_t count, std::vector<double>& out) override {
+        const auto base = out.size();
+        const auto got = inner_->read(start, count, out);
+        const auto channels = inner_->channels();
+        for (std::size_t f = 0; f < got; ++f) {
+            const auto g = volume_at(ramps_, static_cast<double>(start + f) / inner_->rate());
+            for (std::uint32_t c = 0; c < channels; ++c) out[base + f * channels + c] *= g;
+        }
+        return got;
+    }
+    void close() override { inner_->close(); }
+
+private:
+    std::shared_ptr<audio_source::Source> inner_;
+    std::vector<VolumeRamp> ramps_;
 };
 struct ReaderState final : ObjectPayload {
     Address asset{};                   // retained
@@ -374,7 +439,116 @@ struct Av {
     }
     // The asset's duration: of its decoded audio for audio files (priming and padding removed),
     // else the container's.
+    static Time time_of_seconds(double seconds) { return {std::llround(seconds * 1e6), 1000000, 1, 0}; }
+    static double seconds_of_time(const Time& t) {
+        if (!(t.flags & 1) || t.timescale <= 0) return 0;
+        if (t.flags & 4) return std::numeric_limits<double>::infinity();
+        return static_cast<double>(t.value) / t.timescale;
+    }
+    // ---- composition tracks -----------------------------------------------------------
+    // Splits the segment that spans `t` (inside it, not at an edge) in two.
+    void split_at(std::vector<TrackState::Segment>& segments, double t) {
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            auto& s = segments[i];
+            if (t <= s.start + 1e-9 || t >= s.start + s.duration - 1e-9) continue;
+            auto second = s;
+            const auto first = t - s.start;
+            s.duration = first;
+            second.start = t;
+            second.duration -= first;
+            second.source_start += first;
+            second.url = retain(second.url);
+            segments.insert(segments.begin() + static_cast<std::ptrdiff_t>(i) + 1, second);
+            return;
+        }
+    }
+    // Inserts `segment` at its start: the segments from there move later by its duration (a gap
+    // before it, past the track's end, is an empty segment).
+    void insert_segment(TrackState& t, TrackState::Segment segment) {
+        auto& segments = t.segments;
+        if (segment.start > t.end() + 1e-9) segments.push_back({true, 0, 0, 0, t.end(), segment.start - t.end()});
+        segment.start = std::min(segment.start, t.end());
+        split_at(segments, segment.start);
+        for (auto& s : segments)
+            if (s.start >= segment.start - 1e-9) s.start += segment.duration;
+        const auto at = std::find_if(segments.begin(), segments.end(), [&](const TrackState::Segment& s) { return s.start > segment.start; });
+        segments.insert(at, segment);
+    }
+    // Removes [start, start + duration): the later segments move earlier by it.
+    void remove_range(TrackState& t, double start, double duration) {
+        auto& segments = t.segments;
+        split_at(segments, start);
+        split_at(segments, start + duration);
+        std::erase_if(segments, [&](const TrackState::Segment& s) {
+            const bool inside = s.start >= start - 1e-9 && s.start + s.duration <= start + duration + 1e-9;
+            if (inside) release(s.url);
+            return inside;
+        });
+        for (auto& s : segments)
+            if (s.start >= start + duration - 1e-9) s.start -= duration;
+    }
+    // The audio of a composition's tracks: each track a Sequence of its segments' files (at the rate of
+    // its first source, with the most channels among them) scaled by the mix's volume for its track ID,
+    // several tracks added in one Sequence. Null with an OSStatus when a source does not open.
+    std::shared_ptr<audio_source::Source> composition_source(const std::vector<Address>& tracks, Address audio_mix, std::int32_t& status) {
+        std::vector<std::shared_ptr<audio_source::Source>> track_sources;
+        for (const auto track : tracks) {
+            const auto& t = *state<TrackState>(track);
+            std::vector<std::pair<const TrackState::Segment*, std::shared_ptr<audio_source::Source>>> opened;
+            double rate = 0;
+            std::uint32_t channels = 0;
+            for (const auto& s : t.segments) {
+                if (s.empty || !s.url) continue;
+                GuestAudio audio;
+                if ((status = open_guest_audio(support, support.cf.url_path(s.url), audio))) {
+                    for (auto& [segment, source] : opened) source->close();
+                    return nullptr;
+                }
+                auto source = std::make_shared<FileSource>(support, std::move(audio));
+                if (!rate) rate = source->rate();
+                channels = std::max(channels, source->channels());
+                opened.emplace_back(&s, std::move(source));
+            }
+            if (!rate) { rate = 44100; channels = 2; }
+            std::vector<audio_source::Segment> placed;
+            for (auto& [segment, source] : opened)
+                placed.push_back({source, static_cast<std::uint64_t>(std::llround(segment->source_start * source->rate())),
+                                  static_cast<std::uint64_t>(std::llround(segment->start * rate)), static_cast<std::uint64_t>(std::llround(segment->duration * rate))});
+            std::shared_ptr<audio_source::Source> sequence = std::make_shared<audio_source::Sequence>(rate, channels, std::move(placed));
+            // The sequence's length is the track's, silent after the last sounding segment.
+            if (sequence->frames() < static_cast<std::uint64_t>(std::llround(t.end() * rate)))
+                sequence = std::make_shared<audio_source::Sequence>(rate, channels, std::vector<audio_source::Segment>{
+                    {sequence, 0, 0, sequence->frames()}, {nullptr, 0, static_cast<std::uint64_t>(std::llround(t.end() * rate)), 0}});
+            if (auto ramps = mix_parameters(audio_mix, t.id)) sequence = std::make_shared<GainSource>(sequence, std::move(*ramps));
+            track_sources.push_back(std::move(sequence));
+        }
+        status = 0;
+        if (track_sources.size() == 1) return track_sources.front();
+        const double rate = track_sources.empty() ? 44100 : track_sources.front()->rate();
+        std::uint32_t channels = 1;
+        std::vector<audio_source::Segment> all;
+        for (const auto& source : track_sources) {
+            channels = std::max(channels, source->channels());
+            all.push_back({source, 0, 0, static_cast<std::uint64_t>(std::llround(static_cast<double>(source->frames()) / source->rate() * rate))});
+        }
+        return std::make_shared<audio_source::Sequence>(rate, channels, std::move(all));
+    }
+    // The volume ramps of the mix's input parameters for `track_id`, if it has some.
+    std::optional<std::vector<VolumeRamp>> mix_parameters(Address audio_mix, std::int32_t track_id) {
+        if (!audio_mix) return std::nullopt;
+        for (const auto p : state<AudioMixState>(audio_mix)->parameters) {
+            const auto parameters = state<MixParameters>(p);
+            if (parameters->track_id == track_id) return parameters->ramps;
+        }
+        return std::nullopt;
+    }
+
     Time duration_of(const AssetState& s) {
+        if (s.composition) {
+            double end = 0;
+            for (const auto t : s.tracks) end = std::max(end, state<TrackState>(t)->end());
+            return time_of_seconds(end);
+        }
         if (!s.readable()) return time_invalid;
         const bool has_video = std::any_of(s.tracks.begin(), s.tracks.end(), [this](Address t) { return state<TrackState>(t)->video; });
         if (s.movie && (has_video || !s.audio_readable())) {
@@ -396,6 +570,7 @@ struct Av {
     }
     // A container track's time range in its own timescale.
     std::pair<Time, Time> track_range(const AssetState& asset, const TrackState& t) {
+        if (t.composition) return {time_of_seconds(0), time_of_seconds(t.end())};
         if (!asset.movie || t.readable_audio) {
             const auto duration = duration_of(asset);
             return {{0, duration.timescale, 1, 0}, duration};
@@ -814,6 +989,395 @@ struct Av {
     }
 };
 
+// AVComposition / AVMutableComposition, AVCompositionTrack / AVMutableCompositionTrack and
+// AVCompositionTrackSegment: tracks of segments of file assets' tracks (TrackState::Segment), read by
+// AVAssetReader through audio_source Sequences. AVAudioMix / AVMutableAudioMix and their input
+// parameters: volume ramps per track ID, applied by mix outputs. Changing a range's speed
+// (scaleTimeRange:toDuration:, segments whose source and target durations differ) is not supported.
+void install_compositions(const std::shared_ptr<Av>& av, Support& support) {
+    const auto declare = [&](const char* name, const char* superclass) {
+        const auto found = support.objc.find_class(name);
+        return found ? found : support.declare_class(name, superclass, av_foundation);
+    };
+    const auto composition = declare("AVComposition", "AVAsset");
+    const auto mutable_composition = declare("AVMutableComposition", "AVComposition");
+    const auto composition_track = declare("AVCompositionTrack", "AVAssetTrack");
+    const auto mutable_track = declare("AVMutableCompositionTrack", "AVCompositionTrack");
+    static_cast<void>(declare("AVAssetTrackSegment", "NSObject"));
+    const auto segment_class = declare("AVCompositionTrackSegment", "AVAssetTrackSegment");
+    const auto audio_mix = declare("AVAudioMix", "NSObject");
+    const auto mutable_mix = declare("AVMutableAudioMix", "AVAudioMix");
+    const auto parameters_class = declare("AVAudioMixInputParameters", "NSObject");
+    const auto mutable_parameters = declare("AVMutableAudioMixInputParameters", "AVAudioMixInputParameters");
+    const auto range_at = [](GuestMemory& m, Address at) {
+        return std::make_pair(Av::seconds_of_time(read_time(m, at)), Av::seconds_of_time(read_time(m, at + 24)));
+    };
+    const auto write_range = [](GuestMemory& m, Address at, double start, double duration) {
+        write_time(m, at, Av::time_of_seconds(start));
+        write_time(m, at + 24, Av::time_of_seconds(duration));
+    };
+    const auto boolean = [](CpuState& s, bool value) { s.x[0] = value ? 1 : 0; };
+
+    // ---- AVMutableComposition ---------------------------------------------------------------
+    for (const auto* name : {"composition", "compositionWithURLAssetInitializationOptions:"})
+        support.method(mutable_composition, name, [av](CpuState& s, GuestMemory&) { s.x[0] = av->autorelease(av->alloc_init(s.x[0])); }, "@@:", true);
+    support.method(composition, "init", [av, composition](CpuState& s, GuestMemory&) {
+        const auto self = av->support.objc.send_super(s.x[0], composition, av->support.objc.selector("init")).x0;
+        if (self) {
+            auto st = av->state<AssetState>(self);
+            st->composition = true;
+            st->loaded = true;   // nothing to load: its tracks are what is put in it
+        }
+        s.x[0] = self;
+    }, "@@:");
+    support.method(composition, "naturalSize", [av](CpuState& s, GuestMemory&) {
+        const auto st = av->state<AssetState>(s.x[0]);
+        s.v[0] = {std::bit_cast<std::uint64_t>(st->natural_width), 0};
+        s.v[1] = {std::bit_cast<std::uint64_t>(st->natural_height), 0};
+    }, "{CGSize=dd}@:");
+    support.method(mutable_composition, "setNaturalSize:", [av](CpuState& s, GuestMemory&) {
+        const auto st = av->state<AssetState>(s.x[0]);
+        st->natural_width = std::bit_cast<double>(s.v[0][0]);
+        st->natural_height = std::bit_cast<double>(s.v[1][0]);
+    }, "v@:{CGSize=dd}");
+    support.method(composition, "URLAssetInitializationOptions", [av](CpuState& s, GuestMemory&) { s.x[0] = av->autorelease(av->bridge->dictionary({})); }, "@@:");
+    // -addMutableTrackWithMediaType:preferredTrackID: (kCMPersistentTrackID_Invalid, 0: the next free ID). Audio or video.
+    const auto add_track = [av, mutable_track](Address self, const std::string& type, std::int32_t preferred) -> Address {
+        if (type != "soun" && type != "vide") return 0;
+        auto st = av->state<AssetState>(self);
+        const auto taken = [&](std::int32_t id) {
+            return std::any_of(st->tracks.begin(), st->tracks.end(), [&](Address t) { return av->state<TrackState>(t)->id == id; });
+        };
+        std::int32_t id = preferred;
+        if (id <= 0 || taken(id))
+            while (taken(id = st->next_track_id++)) {}
+        const auto track = av->alloc_init(mutable_track);   // +1, held by the composition
+        auto t = av->state<TrackState>(track);
+        t->asset = self;
+        t->id = id;
+        t->composition = true;
+        t->video = type == "vide";
+        t->readable_audio = !t->video;
+        t->decodable = !t->video;
+        st->tracks.push_back(track);
+        return track;
+    };
+    support.method(mutable_composition, "addMutableTrackWithMediaType:preferredTrackID:", [av, add_track](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[2] ? add_track(s.x[0], av->support.cf.utf8(s.x[2]), static_cast<std::int32_t>(s.x[3])) : 0;
+    }, "@@:@i");
+    support.method(mutable_composition, "removeTrack:", [av](CpuState& s, GuestMemory&) {
+        auto st = av->state<AssetState>(s.x[0]);
+        const auto found = std::find(st->tracks.begin(), st->tracks.end(), s.x[2]);
+        if (found == st->tracks.end()) return;
+        st->tracks.erase(found);
+        av->release(s.x[2]);
+    }, "v@:@");
+    support.method(mutable_composition, "mutableTrackCompatibleWithTrack:", [av](CpuState& s, GuestMemory&) {
+        const bool video = s.x[2] && av->state<TrackState>(s.x[2])->video;
+        const auto self = std::exchange(s.x[0], 0);
+        for (const auto t : av->state<AssetState>(self)->tracks)
+            if (av->state<TrackState>(t)->video == video) { s.x[0] = t; return; }
+    }, "@@:@");
+    // Inserts `duration` seconds of a file asset's track from `source_start` at `at` (NO with an error otherwise).
+    const auto insert_track_range = [av](Address composition_track_object, Address source_track, double source_start, double duration, double at,
+                                         Address error_out) -> bool {
+        auto& t = *av->state<TrackState>(composition_track_object);
+        const auto source = source_track ? av->support.objc.find_host_state<TrackState>(source_track) : nullptr;
+        const auto source_asset = source ? av->state<AssetState>(source->asset) : nullptr;
+        if (!source || !source_asset->url || source->composition) {
+            av->store_error(error_out, av_error_operation_not_supported_for_asset, "Composition segments come from file assets' tracks under Alchemy");
+            return false;
+        }
+        if (source->video != t.video) {
+            av->store_error(error_out, av_error_operation_not_supported_for_asset, "The track's media type differs from the composition track's");
+            return false;
+        }
+        const double available = Av::seconds_of_time(av->track_range(av->load(source->asset), *source).second) - source_start;
+        duration = std::min(duration, available);
+        if (!(duration > 0) || source_start < 0 || at < 0) {
+            av->store_error(error_out, av_error_unknown, "The time range is empty or outside the track");
+            return false;
+        }
+        if (!t.format_description && source->format_description) t.format_description = av->retain(source->format_description);
+        av->insert_segment(t, {false, av->retain(source_asset->url), source->id, source_start, at, duration});
+        return true;
+    };
+
+    // -insertTimeRange:ofAsset:atTime:error: (CMTimeRange *, AVAsset, CMTime *, NSError **): every track of the asset
+    // into a composition track of its media type (made when there is none), the composition's other tracks
+    // getting the same time empty.
+    support.method(mutable_composition, "insertTimeRange:ofAsset:atTime:error:", [av, add_track, insert_track_range, range_at](CpuState& s, GuestMemory& m) {
+        const auto [start, duration_in] = range_at(m, s.x[2]);
+        const double at = Av::seconds_of_time(read_time(m, s.x[4]));
+        if (!s.x[3] || !av->load(s.x[3]).readable()) {
+            av->store_error(s.x[5], av_error_file_format_not_recognized, "Cannot Open (no track of the media can be read under Alchemy)");
+            s.x[0] = 0;
+            return;
+        }
+        const double duration = std::min(duration_in, Av::seconds_of_time(av->duration_of(av->load(s.x[3]))) - start);
+        auto st = av->state<AssetState>(s.x[0]);
+        std::vector<Address> used;
+        std::map<bool, std::size_t> next_of_kind;
+        for (const auto source : av->load(s.x[3]).tracks) {
+            const bool video = av->state<TrackState>(source)->video;
+            // The composition's next track of this kind, or a new one.
+            Address target = 0;
+            std::size_t seen = 0;
+            for (const auto t : st->tracks)
+                if (av->state<TrackState>(t)->video == video && seen++ == next_of_kind[video]) { target = t; break; }
+            if (!target) target = add_track(s.x[0], video ? "vide" : "soun", 0);
+            ++next_of_kind[video];
+            if (!insert_track_range(target, source, start, duration, at, s.x[5])) { s.x[0] = 0; return; }
+            used.push_back(target);
+        }
+        for (const auto t : st->tracks)
+            if (std::find(used.begin(), used.end(), t) == used.end()) av->insert_segment(*av->state<TrackState>(t), {true, 0, 0, 0, at, duration});
+        s.x[0] = 1;
+    }, "B@:{?={?=qiIq}{?=qiIq}}@{?=qiIq}^@");
+    const auto each_track = [av](Address self, const std::function<void(TrackState&)>& apply) {
+        for (const auto t : av->state<AssetState>(self)->tracks) apply(*av->state<TrackState>(t));
+    };
+    support.method(mutable_composition, "insertEmptyTimeRange:", [av, each_track, range_at](CpuState& s, GuestMemory& m) {
+        const auto [start, duration] = range_at(m, s.x[2]);
+        if (duration > 0) each_track(s.x[0], [&](TrackState& t) { av->insert_segment(t, {true, 0, 0, 0, start, duration}); });
+    }, "v@:{?={?=qiIq}{?=qiIq}}");
+    support.method(mutable_composition, "removeTimeRange:", [av, each_track, range_at](CpuState& s, GuestMemory& m) {
+        const auto [start, duration] = range_at(m, s.x[2]);
+        if (duration > 0) each_track(s.x[0], [&](TrackState& t) { av->remove_range(t, start, duration); });
+    }, "v@:{?={?=qiIq}{?=qiIq}}");
+    for (const auto cls : {mutable_composition, mutable_track})
+        support.method(cls, "scaleTimeRange:toDuration:", [](CpuState&, GuestMemory&) {
+            unsupported("scaleTimeRange:toDuration: (changing a composition range's speed is not supported under Alchemy)");
+        }, "v@:{?={?=qiIq}{?=qiIq}}{?=qiIq}");
+
+    // ---- AVCompositionTrack / AVMutableCompositionTrack ----------------------------------------
+    support.method(composition_track, "dealloc", [av, composition_track](CpuState& s, GuestMemory&) {
+        if (const auto t = av->support.objc.find_host_state<TrackState>(s.x[0]))
+            for (auto& segment : std::exchange(t->segments, {})) av->release(segment.url);
+        static_cast<void>(av->support.objc.send_super(s.x[0], composition_track, av->support.objc.selector("dealloc")));
+    }, "v@:");
+    const auto make_segment = [av, segment_class](const TrackState::Segment& segment) {
+        const auto object = av->alloc_init(segment_class);
+        auto copy = segment;
+        copy.url = av->retain(copy.url);
+        av->state<SegmentState>(object)->segment = copy;
+        return av->autorelease(object);
+    };
+    support.method(composition_track, "segments", [av, make_segment](CpuState& s, GuestMemory&) {
+        std::vector<Address> segments;
+        for (const auto& segment : av->state<TrackState>(s.x[0])->segments) segments.push_back(make_segment(segment));
+        s.x[0] = av->autorelease(av->bridge->array(segments));
+    }, "@@:");
+    support.method(composition_track, "segmentForTrackTime:", [av, make_segment](CpuState& s, GuestMemory& m) {
+        const double t = Av::seconds_of_time(read_time(m, s.x[2]));
+        const auto self = std::exchange(s.x[0], 0);
+        for (const auto& segment : av->state<TrackState>(self)->segments)
+            if (t >= segment.start && t < segment.start + segment.duration) { s.x[0] = make_segment(segment); return; }
+    }, "@@:{?=qiIq}");
+    support.method(mutable_track, "setSegments:", [av](CpuState& s, GuestMemory&) {
+        auto& t = *av->state<TrackState>(s.x[0]);
+        std::vector<TrackState::Segment> segments;
+        for (const auto object : s.x[2] ? av->support.cf.array_values(s.x[2]) : std::vector<Address>{}) {
+            const auto st = av->support.objc.find_host_state<SegmentState>(object);
+            if (!st) unsupported("-[AVMutableCompositionTrack setSegments:] with a segment Alchemy did not make");
+            auto copy = st->segment;
+            copy.url = av->retain(copy.url);
+            segments.push_back(copy);
+        }
+        std::sort(segments.begin(), segments.end(), [](const auto& a, const auto& b) { return a.start < b.start; });
+        for (auto& old : std::exchange(t.segments, std::move(segments))) av->release(old.url);
+    }, "v@:@");
+    // -validateTrackSegments:error: the segments are in order, contiguous from zero, and not empty.
+    support.method(mutable_track, "validateTrackSegments:error:", [av, boolean](CpuState& s, GuestMemory&) {
+        double end = 0;
+        for (const auto object : s.x[2] ? av->support.cf.array_values(s.x[2]) : std::vector<Address>{}) {
+            const auto st = av->support.objc.find_host_state<SegmentState>(object);
+            if (!st || std::fabs(st->segment.start - end) > 1e-6 || !(st->segment.duration > 0)) {
+                av->store_error(s.x[3], av_error_unknown, "The segments are not contiguous from time zero");
+                return boolean(s, false);
+            }
+            end += st->segment.duration;
+        }
+        boolean(s, true);
+    }, "B@:@^@");
+    support.method(mutable_track, "insertTimeRange:ofTrack:atTime:error:", [insert_track_range, range_at, boolean](CpuState& s, GuestMemory& m) {
+        const auto [start, duration] = range_at(m, s.x[2]);
+        boolean(s, insert_track_range(s.x[0], s.x[3], start, duration, Av::seconds_of_time(read_time(m, s.x[4])), s.x[5]));
+    }, "B@:{?={?=qiIq}{?=qiIq}}@{?=qiIq}^@");
+    // -insertTimeRanges:ofTracks:atTime:error: (NSArray of NSValue CMTimeRanges, NSArray of tracks): one after another.
+    support.method(mutable_track, "insertTimeRanges:ofTracks:atTime:error:", [av, insert_track_range, boolean](CpuState& s, GuestMemory& m) {
+        const auto ranges = s.x[2] ? av->support.cf.array_values(s.x[2]) : std::vector<Address>{};
+        const auto tracks = s.x[3] ? av->support.cf.array_values(s.x[3]) : std::vector<Address>{};
+        if (ranges.size() != tracks.size()) unsupported("-[AVMutableCompositionTrack insertTimeRanges:ofTracks:atTime:error:] with different counts");
+        double at = Av::seconds_of_time(read_time(m, s.x[4]));
+        const auto buffer = av->support.process.allocate_guest(48, 8);
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            CallRegs get{};
+            get.x[2] = buffer;
+            static_cast<void>(av->support.send(ranges[i], "getValue:", get));
+            const double start = Av::seconds_of_time(read_time(m, buffer)), duration = Av::seconds_of_time(read_time(m, buffer + 24));
+            if (!insert_track_range(s.x[0], tracks[i], start, duration, at, s.x[5])) {
+                av->support.process.release_guest(buffer);
+                return boolean(s, false);
+            }
+            at += duration;
+        }
+        av->support.process.release_guest(buffer);
+        boolean(s, true);
+    }, "B@:@@{?=qiIq}^@");
+    support.method(mutable_track, "insertEmptyTimeRange:", [av, range_at](CpuState& s, GuestMemory& m) {
+        const auto [start, duration] = range_at(m, s.x[2]);
+        if (duration > 0) av->insert_segment(*av->state<TrackState>(s.x[0]), {true, 0, 0, 0, start, duration});
+    }, "v@:{?={?=qiIq}{?=qiIq}}");
+    support.method(mutable_track, "removeTimeRange:", [av, range_at](CpuState& s, GuestMemory& m) {
+        const auto [start, duration] = range_at(m, s.x[2]);
+        if (duration > 0) av->remove_range(*av->state<TrackState>(s.x[0]), start, duration);
+    }, "v@:{?={?=qiIq}{?=qiIq}}");
+    support.method(composition_track, "preferredVolume", [av](CpuState& s, GuestMemory&) {
+        s.v[0] = {std::bit_cast<std::uint32_t>(av->state<TrackState>(s.x[0])->preferred_volume), 0};
+    }, "f@:");
+    support.method(mutable_track, "setPreferredVolume:", [av](CpuState& s, GuestMemory&) {
+        av->state<TrackState>(s.x[0])->preferred_volume = std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0]));
+    }, "v@:f");
+    support.method(composition_track, "isEnabled", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<TrackState>(s.x[0])->enabled ? 1 : 0; }, "B@:");
+    support.method(mutable_track, "setEnabled:", [av](CpuState& s, GuestMemory&) { av->state<TrackState>(s.x[0])->enabled = (s.x[2] & 0xff) != 0; }, "v@:B");
+
+    // ---- AVCompositionTrackSegment -----------------------------------------------------------
+    support.method(segment_class, "dealloc", [av, segment_class](CpuState& s, GuestMemory&) {
+        if (const auto st = av->support.objc.find_host_state<SegmentState>(s.x[0])) av->release(std::exchange(st->segment.url, 0));
+        static_cast<void>(av->support.objc.send_super(s.x[0], segment_class, av->support.objc.selector("dealloc")));
+    }, "v@:");
+    // -initWithURL:trackID:sourceTimeRange:targetTimeRange: (the two ranges' durations must agree: no change of speed).
+    support.method(segment_class, "initWithURL:trackID:sourceTimeRange:targetTimeRange:", [av, range_at](CpuState& s, GuestMemory& m) {
+        const auto [source_start, source_duration] = range_at(m, s.x[4]);
+        const auto [target_start, target_duration] = range_at(m, s.x[5]);
+        if (std::fabs(source_duration - target_duration) > 1e-6)
+            unsupported("an AVCompositionTrackSegment whose source and target durations differ (a change of speed is not supported under Alchemy)");
+        av->state<SegmentState>(s.x[0])->segment = {false, av->retain(s.x[2]), static_cast<std::int32_t>(s.x[3]), source_start, target_start, target_duration};
+    }, "@@:@i{?={?=qiIq}{?=qiIq}}{?={?=qiIq}{?=qiIq}}");
+    support.method(segment_class, "compositionTrackSegmentWithURL:trackID:sourceTimeRange:targetTimeRange:", [av](CpuState& s, GuestMemory&) {
+        CallRegs r{};
+        r.x[2] = s.x[2]; r.x[3] = s.x[3]; r.x[4] = s.x[4]; r.x[5] = s.x[5];
+        s.x[0] = av->autorelease(av->support.send(av->support.send_id(s.x[0], "alloc"), "initWithURL:trackID:sourceTimeRange:targetTimeRange:", r).x0);
+    }, "@@:@i{?={?=qiIq}{?=qiIq}}{?={?=qiIq}{?=qiIq}}", true);
+    support.method(segment_class, "initWithTimeRange:", [av, range_at](CpuState& s, GuestMemory& m) {
+        const auto [start, duration] = range_at(m, s.x[2]);
+        av->state<SegmentState>(s.x[0])->segment = {true, 0, 0, 0, start, duration};
+    }, "@@:{?={?=qiIq}{?=qiIq}}");
+    support.method(segment_class, "compositionTrackSegmentWithTimeRange:", [av](CpuState& s, GuestMemory&) {
+        CallRegs r{};
+        r.x[2] = s.x[2];
+        s.x[0] = av->autorelease(av->support.send(av->support.send_id(s.x[0], "alloc"), "initWithTimeRange:", r).x0);
+    }, "@@:{?={?=qiIq}{?=qiIq}}", true);
+    support.method(segment_class, "isEmpty", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<SegmentState>(s.x[0])->segment.empty ? 1 : 0; }, "B@:");
+    support.method(segment_class, "sourceURL", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<SegmentState>(s.x[0])->segment.url; }, "@@:");
+    support.method(segment_class, "sourceTrackID", [av](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<std::uint32_t>(av->state<SegmentState>(s.x[0])->segment.source_track);
+    }, "i@:");
+    // CMTimeMapping -timeMapping (x8): {source CMTimeRange, target CMTimeRange}; an empty segment's source is invalid.
+    support.method(segment_class, "timeMapping", [av, write_range](CpuState& s, GuestMemory& m) {
+        const auto& segment = av->state<SegmentState>(s.x[0])->segment;
+        if (segment.empty) {
+            write_time(m, s.x[8], time_invalid);
+            write_time(m, s.x[8] + 24, time_invalid);
+        } else {
+            write_range(m, s.x[8], segment.source_start, segment.duration);
+        }
+        write_range(m, s.x[8] + 48, segment.start, segment.duration);
+    }, "{?={?={?=qiIq}{?=qiIq}}{?={?=qiIq}{?=qiIq}}}@:");
+
+    // ---- AVAudioMix / AVMutableAudioMix --------------------------------------------------------
+    support.method(audio_mix, "dealloc", [av, audio_mix](CpuState& s, GuestMemory&) {
+        if (const auto st = av->support.objc.find_host_state<AudioMixState>(s.x[0]))
+            for (const auto p : std::exchange(st->parameters, {})) av->release(p);
+        static_cast<void>(av->support.objc.send_super(s.x[0], audio_mix, av->support.objc.selector("dealloc")));
+    }, "v@:");
+    support.method(audio_mix, "init", [av, audio_mix](CpuState& s, GuestMemory&) {
+        const auto self = av->support.objc.send_super(s.x[0], audio_mix, av->support.objc.selector("init")).x0;
+        if (self) static_cast<void>(av->state<AudioMixState>(self));
+        s.x[0] = self;
+    }, "@@:");
+    support.method(mutable_mix, "audioMix", [av](CpuState& s, GuestMemory&) { s.x[0] = av->autorelease(av->alloc_init(s.x[0])); }, "@@:", true);
+    support.method(audio_mix, "inputParameters", [av](CpuState& s, GuestMemory&) {
+        s.x[0] = av->autorelease(av->bridge->array(av->state<AudioMixState>(s.x[0])->parameters));
+    }, "@@:");
+    support.method(mutable_mix, "setInputParameters:", [av](CpuState& s, GuestMemory&) {
+        std::vector<Address> kept;
+        for (const auto p : s.x[2] ? av->support.cf.array_values(s.x[2]) : std::vector<Address>{}) {
+            if (!av->support.objc.find_host_state<MixParameters>(p)) unsupported("-[AVMutableAudioMix setInputParameters:] with parameters Alchemy did not make");
+            kept.push_back(av->retain(p));
+        }
+        for (const auto old : std::exchange(av->state<AudioMixState>(s.x[0])->parameters, kept)) av->release(old);
+    }, "v@:@");
+
+    // ---- AVAudioMixInputParameters / AVMutableAudioMixInputParameters ---------------------------
+    support.method(parameters_class, "dealloc", [av, parameters_class](CpuState& s, GuestMemory&) {
+        if (const auto st = av->support.objc.find_host_state<MixParameters>(s.x[0])) av->release(std::exchange(st->pitch_algorithm, 0));
+        static_cast<void>(av->support.objc.send_super(s.x[0], parameters_class, av->support.objc.selector("dealloc")));
+    }, "v@:");
+    support.method(parameters_class, "init", [av, parameters_class](CpuState& s, GuestMemory&) {
+        const auto self = av->support.objc.send_super(s.x[0], parameters_class, av->support.objc.selector("init")).x0;
+        if (self) static_cast<void>(av->state<MixParameters>(self));
+        s.x[0] = self;
+    }, "@@:");
+    support.method(mutable_parameters, "audioMixInputParameters", [av](CpuState& s, GuestMemory&) { s.x[0] = av->autorelease(av->alloc_init(s.x[0])); }, "@@:", true);
+    support.method(mutable_parameters, "audioMixInputParametersWithTrack:", [av](CpuState& s, GuestMemory&) {
+        const auto object = av->alloc_init(s.x[0]);
+        if (s.x[2]) av->state<MixParameters>(object)->track_id = av->state<TrackState>(s.x[2])->id;
+        s.x[0] = av->autorelease(object);
+    }, "@@:@", true);
+    support.method(parameters_class, "trackID", [av](CpuState& s, GuestMemory&) { s.x[0] = static_cast<std::uint32_t>(av->state<MixParameters>(s.x[0])->track_id); }, "i@:");
+    support.method(mutable_parameters, "setTrackID:", [av](CpuState& s, GuestMemory&) { av->state<MixParameters>(s.x[0])->track_id = static_cast<std::int32_t>(s.x[2]); }, "v@:i");
+    support.method(parameters_class, "audioTimePitchAlgorithm", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<MixParameters>(s.x[0])->pitch_algorithm; }, "@@:");
+    support.method(mutable_parameters, "setAudioTimePitchAlgorithm:", [av](CpuState& s, GuestMemory&) {
+        auto st = av->state<MixParameters>(s.x[0]);
+        av->release(std::exchange(st->pitch_algorithm, av->retain(s.x[2])));
+    }, "v@:@");
+    support.method(parameters_class, "audioTapProcessor", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "^{opaqueMTAudioProcessingTap=}@:");
+    support.method(mutable_parameters, "setAudioTapProcessor:", [](CpuState& s, GuestMemory&) {
+        if (s.x[2]) unsupported("-[AVMutableAudioMixInputParameters setAudioTapProcessor:] (MTAudioProcessingTap is not available under Alchemy)");
+    }, "v@:^{opaqueMTAudioProcessingTap=}");
+    const auto add_ramp = [av](Address self, VolumeRamp ramp) {
+        auto& ramps = av->state<MixParameters>(self)->ramps;
+        std::erase_if(ramps, [&](const VolumeRamp& r) { return r.start == ramp.start; });
+        ramps.insert(std::upper_bound(ramps.begin(), ramps.end(), ramp, [](const VolumeRamp& a, const VolumeRamp& b) { return a.start < b.start; }), ramp);
+    };
+    // -setVolume:atTime: (Float32 [s0], CMTime *).
+    support.method(mutable_parameters, "setVolume:atTime:", [add_ramp](CpuState& s, GuestMemory& m) {
+        const auto volume = std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0]));
+        add_ramp(s.x[0], {Av::seconds_of_time(read_time(m, s.x[2])), 0, volume, volume});
+    }, "v@:f{?=qiIq}");
+    // -setVolumeRampFromStartVolume:toEndVolume:timeRange: (Float32 [s0], Float32 [s1], CMTimeRange *).
+    support.method(mutable_parameters, "setVolumeRampFromStartVolume:toEndVolume:timeRange:", [add_ramp, range_at](CpuState& s, GuestMemory& m) {
+        const auto [start, duration] = range_at(m, s.x[2]);
+        add_ramp(s.x[0], {start, duration, std::bit_cast<float>(static_cast<std::uint32_t>(s.v[0][0])), std::bit_cast<float>(static_cast<std::uint32_t>(s.v[1][0]))});
+    }, "v@:ff{?={?=qiIq}{?=qiIq}}");
+    // -getVolumeRampForTime:startVolume:endVolume:timeRange: (CMTime *, float *, float *, CMTimeRange *): the ramp that
+    // includes the time (a point's lasts until the next ramp).
+    support.method(parameters_class, "getVolumeRampForTime:startVolume:endVolume:timeRange:", [av, write_range](CpuState& s, GuestMemory& m) {
+        const double t = Av::seconds_of_time(read_time(m, s.x[2]));
+        const auto& ramps = av->state<MixParameters>(s.x[0])->ramps;
+        for (std::size_t i = 0; i < ramps.size(); ++i) {
+            const auto& r = ramps[i];
+            const double end = r.duration > 0 ? r.start + r.duration : (i + 1 < ramps.size() ? ramps[i + 1].start : std::numeric_limits<double>::infinity());
+            if (t < r.start || t >= end) continue;
+            if (s.x[3]) m.write32(s.x[3], std::bit_cast<std::uint32_t>(r.from));
+            if (s.x[4]) m.write32(s.x[4], std::bit_cast<std::uint32_t>(r.to));
+            if (s.x[5]) {
+                if (std::isinf(end)) {
+                    write_time(m, s.x[5], Av::time_of_seconds(r.start));
+                    write_time(m, s.x[5] + 24, time_positive_infinity);
+                } else {
+                    write_range(m, s.x[5], r.start, end - r.start);
+                }
+            }
+            s.x[0] = 1;
+            return;
+        }
+        s.x[0] = 0;
+    }, "B@:{?=qiIq}^f^f^{?={?=qiIq}{?=qiIq}}");
+}
+
 } // namespace
 
 void install_av_foundation(Support& support) {
@@ -1090,6 +1654,37 @@ void install_av_foundation(Support& support) {
         for (const auto o : r->outputs) {
             auto os = av->state<OutputState>(o);
             const auto& t = *av->state<TrackState>(os->tracks.front());
+            if (asset.composition) {
+                // A composition's audio tracks: their segments as one source, in the source's own format
+                // for the client format's defaults.
+                if (std::any_of(os->tracks.begin(), os->tracks.end(), [av](Address track) { return av->state<TrackState>(track)->video; }))
+                    return failed(av->bridge->error("AVFoundationErrorDomain", av_error_operation_not_supported_for_asset,
+                                                    "Video composition tracks are not read under Alchemy"));
+                std::int32_t opened{};
+                os->source = av->composition_source(os->tracks, os->mix ? os->audio_mix : 0, opened);
+                if (!os->source) return failed(av->bridge->os_status_error(opened, "A composition segment's media could not be opened"));
+                auto& composite = *av->state<AssetState>(r->asset);
+                composite.container.format = audio_file::Pcm{};
+                composite.container.format.rate = os->source->rate();
+                composite.container.format.channels = os->source->channels();
+                composite.container.format.bits = 32;
+                composite.container.format.container = 4;
+                composite.container.format.is_float = true;
+                composite.container.data_bytes = os->source->frames() * composite.container.format.frame_bytes();
+                av->client_format(*os, composite);
+                const auto source_frames = os->source->frames();
+                const auto source_rate = os->source->rate();
+                const auto frame_of = [&](const Time& time) -> std::uint64_t {
+                    if ((time.flags & 4) || !(time.flags & 1)) return source_frames;
+                    if (time.timescale <= 0 || time.value <= 0) return 0;
+                    return std::min<std::uint64_t>(source_frames, static_cast<std::uint64_t>(std::llround(static_cast<double>(time.value) / time.timescale * source_rate)));
+                };
+                os->position = frame_of(r->start);
+                os->end = (r->duration.flags & 4) ? source_frames : std::min<std::uint64_t>(source_frames, os->position + frame_of(r->duration));
+                os->finished = false;
+                os->format_description = av->make_format_description(audio_file::asbd_from_pcm(os->client), {});
+                continue;
+            }
             // Video, and stored audio read as it is (no settings) or that has no decoder: samples.
             if (t.video || !t.readable_audio || (asset.movie && !os->settings && !os->mix)) {
                 if (os->settings && !t.decodable)
@@ -1107,6 +1702,9 @@ void install_av_foundation(Support& support) {
             if (const auto result = open_guest_audio(av->support, av->support.cf.url_path(av->state<AssetState>(r->asset)->url), audio))
                 return failed(av->bridge->os_status_error(result, "The media file could not be opened again for reading"));
             os->source = std::make_shared<FileSource>(av->support, std::move(audio));
+            // An audio mix's volume ramps for the track.
+            if (os->mix)
+                if (auto ramps = av->mix_parameters(os->audio_mix, t.id)) os->source = std::make_shared<GainSource>(os->source, std::move(*ramps));
             os->position = first;
             os->end = last;
             os->finished = false;
@@ -1171,20 +1769,20 @@ void install_av_foundation(Support& support) {
         r.x[2] = s.x[2]; r.x[3] = s.x[3];
         s.x[0] = av->autorelease(av->support.send(av->support.send_id(s.x[0], "alloc"), "initWithAudioTracks:audioSettings:", r).x0);
     }, "@@:@@", true);
-    // A mix of the asset's audio tracks: every readable asset has one, so the mix is that track.
+    // A mix of the asset's audio tracks: a file asset has one readable audio track; a composition's
+    // audio tracks are added together.
     support.method(mix_output, "initWithAudioTracks:audioSettings:", [av, init_output](CpuState& s, GuestMemory&) {
         init_output(s, s.x[2] ? av->support.cf.array_values(s.x[2]) : std::vector<Address>{}, s.x[3], true);
-        if (av->state<OutputState>(s.x[0])->tracks.size() != 1) unsupported("AVAssetReaderAudioMixOutput over several tracks (Alchemy assets have one audio track)");
+        const auto& tracks = av->state<OutputState>(s.x[0])->tracks;
+        const bool composition = std::all_of(tracks.begin(), tracks.end(), [av](Address t) { return av->state<TrackState>(t)->composition; });
+        if (tracks.size() != 1 && !composition) unsupported("AVAssetReaderAudioMixOutput over several tracks of a file asset (Alchemy reads one audio track of a file)");
     }, "@@:@@");
     support.method(mix_output, "audioTracks", [av](CpuState& s, GuestMemory&) { s.x[0] = av->autorelease(av->bridge->array(av->state<OutputState>(s.x[0])->tracks)); }, "@@:");
     support.method(mix_output, "audioSettings", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<OutputState>(s.x[0])->settings; }, "@@:");
     support.method(mix_output, "audioMix", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<OutputState>(s.x[0])->audio_mix; }, "@@:");
-    // An AVAudioMix sets per-track volume ramps; a one-track mix with input parameters is not applied.
+    // An AVAudioMix: the volume ramps of its input parameters apply to the tracks they name.
     support.method(mix_output, "setAudioMix:", [av](CpuState& s, GuestMemory&) {
-        if (s.x[2]) {
-            const auto parameters = av->support.send_id(s.x[2], "inputParameters");
-            if (parameters && av->support.cf.length(parameters)) unsupported("AVAudioMix input parameters (volume ramps) on an AVAssetReaderAudioMixOutput");
-        }
+        if (s.x[2] && !av->support.objc.find_host_state<AudioMixState>(s.x[2])) unsupported("-[AVAssetReaderAudioMixOutput setAudioMix:] with an audio mix Alchemy did not make");
         auto st = av->state<OutputState>(s.x[0]);
         const auto old = std::exchange(st->audio_mix, av->retain(s.x[2]));
         av->release(old);
@@ -1609,6 +2207,7 @@ void install_av_foundation(Support& support) {
             support.method(generic, selector, [name](CpuState&, GuestMemory&) { cannot_exist(name); }, "v@:B");
         }
     }
+    install_compositions(av, support);
     install_av_player(support);
     install_av_sample_buffer_renderers(support);
     install_av_capture(support);
