@@ -1,5 +1,7 @@
 #include "alchemy/darwin/kit/completion/runtime/common.hpp"
 
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
+
 #include <bit>
 #include <cmath>
 #include <map>
@@ -427,12 +429,12 @@ void install_system_functions(Support& support) {
     };
     support.function(core_foundation, "_CFAllocatorAllocate", [&support, standard_allocator, null_allocator](CpuState& s, GuestMemory&) {
         if (null_allocator(s.x[0])) { s.x[0] = 0; return; }
-        if (!standard_allocator(s.x[0])) unsupported("CFAllocatorAllocate with a custom allocator");
+        if (!standard_allocator(s.x[0])) { s.x[0] = cf_allocators::allocate(support, s.x[0], s.x[1], s.x[2]); return; }
         s.x[0] = s.x[1] ? support.call(libsystem, "_malloc", {s.x[1]}) : 0;
     });
     support.function(core_foundation, "_CFAllocatorDeallocate", [&support, standard_allocator, null_allocator](CpuState& s, GuestMemory&) {
         if (null_allocator(s.x[0]) || !s.x[1]) return;
-        if (!standard_allocator(s.x[0])) unsupported("CFAllocatorDeallocate with a custom allocator");
+        if (!standard_allocator(s.x[0])) { cf_allocators::deallocate(support, s.x[0], s.x[1]); return; }
         static_cast<void>(support.call(libsystem, "_free", {s.x[1]}));
     });
     support.function(core_foundation, "_CFArrayExchangeValuesAtIndices", [&support](CpuState& s, GuestMemory&) {
