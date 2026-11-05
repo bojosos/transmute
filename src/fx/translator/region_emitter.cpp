@@ -2291,6 +2291,7 @@ void RegionEmitter::run() {
     neon_end_region(a_);     // after the last unconditional jump: never executed
     const auto pool_end = a_.size();
     emit_host_tables();      // switch dispatch data (never executed)
+    emit_inline_cache_slots();   // BLR inline caches' targets (data)
     std::uint32_t counter_slot = 0;
     if (entry_counter) {
         a_.align(4);
@@ -2307,6 +2308,7 @@ void RegionEmitter::run() {
     }
     a_.finalize();
     patch_host_tables();
+    set_inline_cache_offsets();
     // The constant pool is data: mark it as literals so the persistent cache's
     // relocation audit does not read adjacent constants (e.g. 0x80808080 then
     // 1) as module addresses.

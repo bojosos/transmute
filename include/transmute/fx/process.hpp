@@ -122,8 +122,8 @@ void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void*
 // raise or exit. If it returns true, execution continues at x30 (the return
 // address). If it returns false it must have changed nothing, and the call
 // runs `callback` exactly as register_host_callback would. When the
-// convention holds one of x0..x9 (TRANSMUTE_FX_GLOBALS), the entry is the
-// callback alone.
+// convention holds some of x0..x9 (TRANSMUTE_FX_GLOBALS), the entry stores
+// them to their context slots before the leaf and loads them back after it.
 using HostLeaf = bool (*)(GuestContext& ctx);
 void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user);
 // The same with `leaf_data` passed to the leaf (its second argument).

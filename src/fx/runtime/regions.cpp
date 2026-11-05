@@ -27,6 +27,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2431,28 +2432,34 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* lea
     const auto field = [](std::size_t offset) { return ptr(Gp::r15, ctx_disp(offset)); };
     const std::int32_t rsb = ctx_disp(offsetof(GuestContext, rsb));
     const auto& conv = translator_register_convention();
-    if ((conv.guest_mask & 0x3ffu) != 0) {
-        // x0..x9 live in convention hosts (TRANSMUTE_FX_GLOBALS): their context
-        // slots are stale where the leaf would read them. The callback alone.
-        rt::install_host_entry(guest_pc, host_callback_code(callback, user));
-        return;
-    }
+    // x0..x9 in convention hosts (TRANSMUTE_FX_GLOBALS): stored to their slots
+    // for the leaf, loaded back after it (its results). A declined leaf
+    // changed nothing, so the fallback's adapter stores the same values.
+    const auto arguments = conv.guest_mask & 0x3ffu;
+    const auto each_argument = [&](auto&& fn) {
+        for (auto m = arguments; m; m &= m - 1) {
+            const auto g = static_cast<unsigned>(std::countr_zero(m));
+            fn(ptr(Gp::r15, x_disp(g)), x64::gp(static_cast<unsigned>(conv.host[g])));
+        }
+    };
     const void* fallback = host_callback_code(callback, user);
     {
         rt::ExclusiveLock lock(rt::g.map);
         fallback = rt::host_entry_adapter(fallback);
     }
     const int lr_host = (conv.guest_mask >> 30) & 1u ? conv.host[30] : -1;
-    x64::Assembler a(128);
+    x64::Assembler a(256);
     const x64::Label slow = a.new_label(), miss = a.new_label(), interrupt = a.new_label(), data = a.new_label();
     if ((conv.guest_mask >> 31) & 1u)   // sp for the leaf (Darwin's stack probe)
         a.mov(64, ptr(Gp::r15, x_disp(31)), x64::gp(static_cast<unsigned>(conv.host[31])));
+    each_argument([&](x64::Mem slot, Gp host) { a.mov(64, slot, host); });
     a.lea(64, Gp::rcx, ptr(Gp::r15, -kContextBias));
     a.mov_imm64(Gp::rdx, reinterpret_cast<std::uint64_t>(leaf_data));
     a.mov_imm64(Gp::rax, reinterpret_cast<std::uint64_t>(leaf));
     a.call(Gp::rax);
     a.test(8, Gp::rax, Gp::rax);
     a.jcc(x64::Cond::e, slow);
+    each_argument([&](x64::Mem slot, Gp host) { a.mov(64, host, slot); });
     Gp x30 = Gp::r8;   // x30: in its convention host (kept by the call), else its context slot
     if (lr_host >= 0) x30 = x64::gp(static_cast<unsigned>(lr_host));
     else a.mov(64, x30, ptr(Gp::r15, x_disp(30)));

@@ -88,20 +88,20 @@ struct RegionEntry {
 // store, then `jmp B` (rel32_offset). The runtime links A when the target's
 // entry is flags_dead (no store), else B.
 //
-// ic_offset (0: none): a BLR's inline cache. The site compares the target
-// with the imm64 at ic_offset (8-byte aligned), kInlineCacheEmpty until the
-// runtime fills it, and on a match takes the jmp whose rel32 is at
-// rel32_offset (initially the inline lookup, which is always exact). Its
-// first miss while empty exits with ExitReason::link (exit_arg = the rel32
-// field, ctx->pc = the target): the runtime then writes the target into the
-// imm64, once, and from there on the site is an ordinary exit to that
-// target (target_pc is 0 until then), linked and unlinked like the others.
-// Other targets keep taking the inline lookup.
-// A site has up to two entries, each its own exit: the second's imm64 is at
-// the first's + kInlineCacheStride, and the runtime fills the first, then the
-// second, never both with one target (link_exit).
+// ic_offset (0: none): an entry of a BLR's inline cache. The site compares
+// the target with the 8-byte slot at ic_offset (8-byte aligned, data in the
+// region), kInlineCacheEmpty until the runtime fills it, and on a match takes
+// the `je` whose rel32 is at rel32_offset (initially the inline lookup, which
+// is always exact). A miss while the entry is empty exits with
+// ExitReason::link (exit_arg = the rel32 field, ctx->pc = the target): the
+// runtime then writes the target into the slot, once, and from there on the
+// entry is an ordinary exit to that target (target_pc is 0 until then),
+// linked and unlinked like the others. Other targets take the lookup.
+// A site has up to two entries, each its own exit: the second's slot is
+// kInlineCacheStride bytes after the first's, and the runtime fills the
+// first, then the second, never both with one target (link_exit).
 inline constexpr std::uint64_t kInlineCacheEmpty = 1;
-inline constexpr std::uint32_t kInlineCacheStride = 32;
+inline constexpr std::uint32_t kInlineCacheStride = 8;
 struct RegionExit {
     std::uint32_t rel32_offset;
     std::uint64_t target_pc;

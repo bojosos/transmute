@@ -47,72 +47,76 @@ void RegionEmitter::emit_indirect_jump() {
 
 // A BLR's inline cache (RegionExit::ic_offset), target in rcx, state flushed.
 // An entry:
-//   mov rax, imm64          ; its target (8-byte aligned), kInlineCacheEmpty until filled
-//   cmp rcx, rax
-//   jne next                ; the second entry, or the miss
-//   jmp rel32               ; the target's entry once linked; initially the lookup
-// With two entries the second follows the first, its imm64 kInlineCacheStride
-// bytes after the first's (the padding is fixed by the first's alignment).
-// miss: an empty entry is filled (exit(link, its jmp's field)), the first
-// one first; with both full, the lookup. The miss and the lookup are cold
-// with Plan::cold_layout. Clobbers rax, rdx, r9 and EFLAGS.
+//   cmp rcx, [rip + slot]   ; its target (data after the stubs), kInlineCacheEmpty until filled
+//   je rel32                ; the target's entry once linked; initially the lookup
+// With two entries the second follows the first (its slot kInlineCacheStride
+// after the first's); then `jmp miss`. DS prefixes on the cmp (no-ops) align
+// each je's rel32, so a hit runs two instructions. miss: an empty entry is
+// filled (exit(link, its je's field)), the first one first; with both full,
+// the lookup. The miss and the lookup are cold with Plan::cold_layout.
+// Clobbers rax, rdx, r9 and EFLAGS.
 void RegionEmitter::emit_inline_cache() {
     const bool cold = plan_.cold_layout && !cold_;
     Stub s{Stub::K::ic_miss, a_.new_label(), FlagsState::ctx, 0, 0, -1};
     s.two_entries = plan_.inline_cache_entries > 1;
     s.lookup = a_.new_label();
-    const auto miss = cold ? s.label : a_.new_label();
-    std::uint32_t first = 0;
-    for (unsigned entry = 0; entry < (s.two_entries ? 2u : 1u); ++entry) {
-        a_.nop(static_cast<unsigned>((8 - (a_.size() + 2) % 8) % 8));
-        a_.db(0x48);   // REX.W
-        a_.db(0xb8);   // mov rax, imm64
-        if (entry == 0) s.first_imm = a_.bound_label();
-        const auto ic_offset = static_cast<std::uint32_t>(a_.size());
-        if (entry == 0) first = ic_offset;
-        else if (ic_offset != first + kInlineCacheStride) throw std::logic_error("inline cache entries out of step");
-        a_.dq(kInlineCacheEmpty);
-        a_.cmp(64, Gp::rcx, Gp::rax);
-        const bool last = !s.two_entries || entry == 1;
-        const auto next = last ? miss : a_.new_label();
-        a_.jcc(Cond::ne, next);   // rel32 even when near: the stride stays fixed
-        a_.align_rel32_after(1);
-        const auto field = a_.bound_label();   // the jmp's opcode; its rel32 follows
-        (entry == 0 ? s.field : s.field2) = field;
-        const auto field_offset = static_cast<std::uint32_t>(a_.jmp(s.lookup));
-        out_.exits.push_back({field_offset, 0, 0, ic_offset});
-        if (!last) a_.bind(next);
+    s.slots = a_.new_label();
+    const unsigned entries = s.two_entries ? 2u : 1u;
+    ic_slots_.push_back({s.slots, static_cast<std::uint32_t>(out_.exits.size()), entries});
+    for (unsigned entry = 0; entry < entries; ++entry) {
+        // cmp rcx, [rip + d] is 7 bytes and je's opcode 2.
+        for (auto pad = (4 - (a_.size() + 9) % 4) % 4; pad != 0; --pad) a_.db(0x3e);
+        a_.cmp(64, Gp::rcx, x64::rip(s.slots, static_cast<std::int32_t>(kInlineCacheStride * entry)));
+        (entry == 0 ? s.field : s.field2) = a_.bound_label();   // the je's opcode; its rel32 follows
+        const auto field_offset = static_cast<std::uint32_t>(a_.jcc(Cond::e, s.lookup));
+        if (field_offset % 4 != 0) throw std::logic_error("inline cache je not patchable");
+        out_.exits.push_back({field_offset, 0, 0, 0});   // ic_offset: set_inline_cache_offsets
     }
     if (cold) {
+        a_.jmp(s.label);
         stubs_.push_back(s);
         no_fall_at_ = a_.size();
         return;
     }
-    a_.bind(miss);
     emit_inline_cache_miss(s);
 }
 
-// rax = the last entry's target. An empty entry (the first one first) is
-// filled: ExitReason::link for its jmp's field. Both full: the lookup (bound
-// here).
+// The last entry is full: the lookup (bound here). Else the first empty
+// entry is filled: ExitReason::link for its je's field.
 void RegionEmitter::emit_inline_cache_miss(const Stub& s) {
-    a_.cmp(64, Gp::rax, static_cast<std::int32_t>(kInlineCacheEmpty));
+    const auto empty = static_cast<std::int32_t>(kInlineCacheEmpty);
+    a_.cmp(64, x64::rip(s.slots, s.two_entries ? static_cast<std::int32_t>(kInlineCacheStride) : 0), empty);
     a_.jcc_short(Cond::ne, s.lookup);
     a_.mov(64, ctx_mem(offsetof(GuestContext, pc)), Gp::rcx);
     if (s.two_entries) {
         const auto fill_second = a_.new_label();
-        a_.cmp(64, x64::rip(s.first_imm), static_cast<std::int32_t>(kInlineCacheEmpty));
+        a_.cmp(64, x64::rip(s.slots), empty);
         a_.jcc_short(Cond::ne, fill_second);
-        a_.lea(64, Gp::rax, x64::rip(s.field, 1));
+        a_.lea(64, Gp::rax, x64::rip(s.field, 2));
         a_.jmp(ctx_mem(offsetof(GuestContext, stub_link)));
         a_.bind(fill_second);
-        a_.lea(64, Gp::rax, x64::rip(s.field2, 1));
+        a_.lea(64, Gp::rax, x64::rip(s.field2, 2));
     } else {
-        a_.lea(64, Gp::rax, x64::rip(s.field, 1));
+        a_.lea(64, Gp::rax, x64::rip(s.field, 2));
     }
     a_.jmp(ctx_mem(offsetof(GuestContext, stub_link)));
     a_.bind(s.lookup);
     emit_indirect_jump();
+}
+
+void RegionEmitter::emit_inline_cache_slots() {
+    for (const auto& site : ic_slots_) {
+        a_.align(8);
+        a_.bind(site.label);
+        for (unsigned entry = 0; entry < site.entries; ++entry) a_.dq(kInlineCacheEmpty);
+    }
+}
+
+void RegionEmitter::set_inline_cache_offsets() {
+    for (const auto& site : ic_slots_)
+        for (unsigned entry = 0; entry < site.entries; ++entry)
+            out_.exits[site.first_exit + entry].ic_offset =
+                static_cast<std::uint32_t>(a_.offset_of(site.label)) + kInlineCacheStride * entry;
 }
 
 void RegionEmitter::e_branch(const PlanInst& pi) {

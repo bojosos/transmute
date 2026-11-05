@@ -759,6 +759,17 @@ FX_TEST(core_blr_inline_cache) {
         FX_CHECK(fills[1] >= 1u);
         FX_CHECK(fills[2] > fills[1]);
     }
+    // Every host alignment of the site: 0..16 instructions in front move it
+    // through more than a cache line, so some entries' `cmp rcx, [rip + slot]`
+    // cross one (whole region, two entries).
+    r.machine.options.max_instructions = 4096;
+    for (unsigned pad = 0; pad <= 16; ++pad) {
+        std::vector<std::uint32_t> shifted(pad, add_imm(true, false, false, 15, 15, 1));   // add x15, x15, #1
+        shifted.insert(shifted.end(), prog.begin(), prog.end());
+        auto ctx = r.context(8200 + pad);
+        FX_CHECK(r.run(shifted, ctx, "blr inline cache shifted by " + std::to_string(pad), 100000));
+        FX_CHECK(r.last.ic_fills >= 2u);
+    }
     r.machine.options = saved;
 }
 

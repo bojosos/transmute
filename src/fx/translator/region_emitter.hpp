@@ -179,10 +179,10 @@ private:
         // entry's pin loads): evicted convention registers are still in
         // their hosts, so the exit must not reload them.
         bool boundary{};
-        x64::Label field{};             // exit_tail, ic_miss (its first entry's jmp)
-        x64::Label lookup{};            // ic_miss: the jmps' initial target
-        x64::Label field2{};            // ic_miss, two entries: the second entry's jmp
-        x64::Label first_imm{};         // ic_miss, two entries: the first entry's imm64
+        x64::Label field{};             // exit_tail, ic_miss (its first entry's je)
+        x64::Label lookup{};            // ic_miss: the jes' initial target
+        x64::Label field2{};            // ic_miss, two entries: the second entry's je
+        x64::Label slots{};             // ic_miss: the entries' slots (emit_inline_cache_slots)
         bool two_entries{};             // ic_miss
         std::uint32_t skip_field{};     // flags_exit: its jmp A's rel32 offset
         // Tier 2: pins lent to the register cache where the stub's code
@@ -555,6 +555,16 @@ private:
     std::vector<HostTable> host_tables_;
     void emit_host_tables();
     void patch_host_tables();
+    // BLR inline caches' slots (emit_inline_cache): data after the stubs, one
+    // 8-byte slot per entry; RegionExit::ic_offset once the code is final.
+    struct InlineCacheSlots {
+        x64::Label label;
+        std::uint32_t first_exit;   // out_.exits index of the site's first entry
+        unsigned entries;
+    };
+    std::vector<InlineCacheSlots> ic_slots_;
+    void emit_inline_cache_slots();
+    void set_inline_cache_offsets();
 
     // ---- vector value facts (EmitContext::vec_fact; neon fusion) ----------------
     // Before emission, prepare_facts() asks the families what their fusions
