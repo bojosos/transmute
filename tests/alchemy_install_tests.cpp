@@ -269,6 +269,31 @@ void runtime_links_and_system_directories() {
     require(read(product / "bin" / "tool") == "tool-binary", "removing the link changed its target");
 }
 
+// runtime.tsv is shared by every process of a root (a browser and its helpers): a write merges with what the file
+// holds now, keeps this process's links that another writer dropped, drops records whose link is gone, and a stale
+// record (its link removed by another process) does not block making the link again.
+void runtime_links_shared_between_processes() {
+    Scratch scratch;
+    const auto root = alchemy::create_alchemy_root(scratch.base / "root");
+    alchemy::configure_alchemy_root(root);
+    const auto product = root / "Users" / "alchemy" / "Product";
+    std::filesystem::create_directories(product / "data");
+    alchemy::create_runtime_link(product / "First", "data");
+    alchemy::create_runtime_link(product / "Second", "data");
+    const auto manifest = root / ".alchemy" / "links" / "runtime.tsv";
+    // An older writer that knew only First rewrote the file, and listed a link that no longer exists.
+    write(manifest, "alchemy-links\t1\nlink\tdir\truntime-junction\tUsers/alchemy/Product/First\tdata\n"
+                    "link\tdir\truntime-junction\tUsers/alchemy/Product/Ghost\tdata\n");
+    alchemy::create_runtime_link(product / "Third", "data");
+    const auto text = read(manifest);
+    require(text.find("Product/First\t") != std::string::npos && text.find("Product/Second\t") != std::string::npos &&
+            text.find("Product/Third\t") != std::string::npos, "a merged write lost a link that exists");
+    require(text.find("Product/Ghost\t") == std::string::npos, "a record without its link was kept");
+    std::filesystem::remove(product / "Second");   // removed by another process; this one still has the record
+    alchemy::create_runtime_link(product / "Second", "data");
+    require(std::filesystem::is_directory(product / "Second"), "a stale record blocked making the link again");
+}
+
 void unconfigured_paths_unchanged() {
     alchemy::clear_alchemy_root();
     require(!alchemy::guest_root_host_path("/Applications/X.app"), "unconfigured root mapped /Applications");
@@ -286,7 +311,7 @@ int main() {
         unconfigured_paths_unchanged();
         inferred_install_and_resolution();
         link_list_install();
-        runtime_links_and_system_directories();
+        runtime_links_and_system_directories(); runtime_links_shared_between_processes();
         unconfigured_paths_unchanged();
         std::cout << "Alchemy install tests passed\n";
         return 0;

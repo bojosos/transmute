@@ -227,15 +227,35 @@ namespace {
 std::filesystem::path runtime_manifest() {
     return *state().root / ".alchemy" / "links" / "runtime.tsv";
 }
-void write_runtime_manifest() {
+// Records this process's change to its run-time links (`added` under `key`, or the removal of `key`) in
+// runtime.tsv. Every process of a root writes that file (a browser and its helpers do), so the change is merged
+// into what the file holds now rather than replacing it with this process's view; records whose link no longer
+// exists are dropped, and the merged set becomes this process's view too.
+void write_runtime_manifest(const std::string& key, const InstalledLink* added) {
+    auto& current = state();
     const auto file = runtime_manifest();
     std::filesystem::create_directories(file.parent_path());
-    const auto temporary = std::filesystem::path(file).concat(".tmp");
+    LinkMap merged;
+    std::error_code error;
+    if (std::filesystem::is_regular_file(file, error)) {
+        try { merged = read_manifest(file); } catch (const std::runtime_error&) { merged.clear(); }
+    }
+    // This process's own run-time records too: one an older writer dropped is kept while its link exists.
+    for (const auto& [name, link] : current.links)
+        if (link.representation.rfind("runtime-", 0) == 0) merged.try_emplace(name, link);
+    if (added) merged.insert_or_assign(key, *added);
+    else merged.erase(key);
+    for (auto entry = merged.begin(); entry != merged.end();) {
+        const auto host = utf8_path(current.generic + "/" + entry->second.path).make_preferred();
+        if (!std::filesystem::exists(std::filesystem::symlink_status(host, error))) entry = merged.erase(entry);
+        else ++entry;
+    }
+    const auto temporary = std::filesystem::path(file).concat(".tmp" + std::to_string(host::process::current_pid()));
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         output << "alchemy-links\t1\n";
-        for (const auto& [key, link] : state().links) {
-            static_cast<void>(key);
+        for (const auto& [name, link] : merged) {
+            static_cast<void>(name);
             if (link.representation.rfind("runtime-", 0) != 0) continue;
             output << "link\t" << (link.directory ? "dir" : "file") << '\t' << link.representation << '\t'
                    << link.path << '\t' << link.target << '\n';
@@ -243,6 +263,11 @@ void write_runtime_manifest() {
         if (!output) throw std::runtime_error("cannot write link manifest " + generic_text(temporary));
     }
     std::filesystem::rename(temporary, file);
+    for (auto entry = current.links.begin(); entry != current.links.end();) {
+        if (entry->second.representation.rfind("runtime-", 0) == 0 && !merged.contains(entry->first)) entry = current.links.erase(entry);
+        else ++entry;
+    }
+    for (const auto& [name, link] : merged) current.links.insert_or_assign(name, link);
 }
 [[noreturn]] void link_error(int code, const std::string& what) {
     throw std::system_error(code, std::generic_category(), "Alchemy run-time link: " + what);
@@ -256,8 +281,9 @@ void create_runtime_link(const std::filesystem::path& link, const std::string& t
     if (target.empty() || target.front() == '/' || target.find_first_of(std::string_view("\t\n\r\0", 4)) != std::string::npos)
         link_error(EINVAL, "unsupported link text: " + target);
     std::error_code error;
-    if (std::filesystem::exists(std::filesystem::symlink_status(link, error)) || installed_link(link))
-        link_error(EEXIST, generic_text(link));
+    if (std::filesystem::exists(std::filesystem::symlink_status(link, error))) link_error(EEXIST, generic_text(link));
+    // A record without its link is stale (another process removed the link): the new link replaces it.
+    if (installed_link(link)) current.links.erase(link_key(*relative));
     const auto parent = parent_of(*relative);
     const auto joined = normalize_relative(parent.empty() ? target : parent + "/" + target);
     if (!joined) link_error(EXDEV, "link target leaves the Alchemy root: " + target);
@@ -284,7 +310,7 @@ void create_runtime_link(const std::filesystem::path& link, const std::string& t
         }
     }
     current.links.insert_or_assign(link_key(record.path), record);
-    write_runtime_manifest();
+    write_runtime_manifest(link_key(record.path), &record);
 }
 
 void forget_installed_link(const std::filesystem::path& host) {
@@ -301,7 +327,7 @@ void forget_installed_link(const std::filesystem::path& host) {
     if (found == current.links.end()) return;
     const bool runtime = found->second.representation.rfind("runtime-", 0) == 0;
     current.links.erase(found);
-    if (runtime) write_runtime_manifest();
+    if (runtime) write_runtime_manifest(key, nullptr);
 }
 
 std::filesystem::path resolve_installed_links(const std::filesystem::path& host) {
