@@ -1,3 +1,4 @@
+#include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 #include "alchemy/darwin/shell_kit.hpp"
 #include "alchemy/darwin/shells.hpp"
 
@@ -6,7 +7,9 @@
 // alchemy.exe only (darwin/shells.hpp): CoreText's headless answers, from the
 // framework identities (darwin/headless_additions.cpp): the
 // attribute keys are real constants, CFAttributedStringCreate makes the
-// Foundation provider's NSAttributedString, and text layout fails explicitly.
+// Foundation provider's NSAttributedString (with the default allocator or a
+// CFAllocatorCreate one, as the other CF creators), and text layout fails
+// explicitly.
 namespace alchemy::darwin_shells {
 namespace {
 constexpr std::string_view appkit = "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit";
@@ -17,8 +20,9 @@ constexpr std::string_view core_text = "/System/Library/Frameworks/CoreText.fram
 void install_coretext_shell(ProcessContext& context, ObjcRuntime& objc, CoreFoundation& cf) {
     ShellKit kit{context, objc, cf};
     // Toll-free bridged: the Foundation provider's NSAttributedString.
-    kit.function(core_foundation_library, "_CFAttributedStringCreate", [&objc](CpuState& s, GuestMemory&) {
-        if (s.x[0]) throw std::runtime_error("Alchemy CoreFoundation: custom allocators are unsupported");
+    kit.function(core_foundation_library, "_CFAttributedStringCreate", [&context, &objc](CpuState& s, GuestMemory&) {
+        if (!cf_allocators::accepted(context.objects(), s.x[0]))
+            throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
         const auto cls = objc.find_class("NSAttributedString");
         if (!cls) throw std::runtime_error("Alchemy installer frameworks: missing class NSAttributedString");
         const auto object = objc.send(cls, "alloc", CallRegs{}).x0;
