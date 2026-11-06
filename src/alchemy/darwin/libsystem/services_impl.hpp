@@ -410,14 +410,14 @@ inline std::uint64_t random_device_stat(transmute::GuestMemory& memory, std::uin
     return device_stat(memory, result, node ? *node : device_nodes[2], 0);
 }
 
-inline std::string temporary_suffix() {
+inline std::string temporary_suffix(std::size_t length = 6) {
     constexpr std::string_view alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     std::string value;
-    while (value.size() < 6) {
+    while (value.size() < length) {
         std::array<std::uint8_t, 16> bytes{}; cryptographic_random(bytes);
         for (const auto byte : bytes) {
             if (byte < 248) value += alphabet[byte % 62];
-            if (value.size() == 6) break;
+            if (value.size() == length) break;
         }
     }
     return value;
@@ -2004,12 +2004,17 @@ public:
         std::uint64_t suffix_length, bool directory) {
         const auto specification = text(memory, address);
         validate(memory, address, specification.size() + 1, true);
-        if (suffix_length > specification.size() || specification.size() - suffix_length < 6)
+        if (suffix_length > specification.size() ||
+            specification.find('/', specification.size() - static_cast<std::size_t>(suffix_length)) != std::string::npos)
             throw ServiceError{einval};
-        const auto offset = specification.size() - static_cast<std::size_t>(suffix_length) - 6;
-        if (specification.substr(offset, 6) != "XXXXXX") throw ServiceError{einval};
-        for (unsigned attempt = 0; attempt < 128; ++attempt) {
-            auto candidate = specification; candidate.replace(offset, 6, temporary_suffix());
+        // As Libc's mktemp family: every 'X' just before the suffix is replaced, however many
+        // there are (none: the name is tried as it is).
+        const auto end = specification.size() - static_cast<std::size_t>(suffix_length);
+        auto offset = end;
+        while (offset > 0 && specification[offset - 1] == 'X') --offset;
+        const auto count = end - offset;
+        for (unsigned attempt = 0; attempt < (count ? 128U : 1U); ++attempt) {
+            auto candidate = specification; candidate.replace(offset, count, temporary_suffix(count));
             const auto name = translate_path(candidate);
             if (directory) {
                 if (const auto created = host::files::create_directory(path_text(name), true); !created) {

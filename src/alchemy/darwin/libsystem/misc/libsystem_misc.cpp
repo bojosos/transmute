@@ -179,9 +179,12 @@ void install_libsystem_misc(Provider& p) {
     // CLOCK_REALTIME deadline.
     p.libsystem("_pthread_cond_timedwait_relative_np", [p, &process](CpuState& s, GuestMemory& m) -> std::uint64_t {
         if (!s.x[2]) return p.call(libsystem_library, "_pthread_cond_wait", {s.x[0], s.x[1]});
-        const auto seconds = static_cast<std::int64_t>(m.read64(s.x[2]));
-        const auto nanos = static_cast<std::int64_t>(m.read64(s.x[2] + 8));
-        if (seconds < 0 || nanos < 0 || nanos >= 1'000'000'000) return einval;
+        auto seconds = static_cast<std::int64_t>(m.read64(s.x[2]));
+        auto nanos = static_cast<std::int64_t>(m.read64(s.x[2] + 8));
+        if (nanos < 0 || nanos >= 1'000'000'000) return einval;
+        // A negative interval is already over: the wait still drops and retakes the mutex,
+        // then times out (libpthread's cond_timed tests expect ETIMEDOUT, not EINVAL).
+        if (seconds < 0) seconds = nanos = 0;
         const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         const auto deadline = now + seconds * 1'000'000'000 + nanos;
         const auto spec = process.allocate_guest(16);

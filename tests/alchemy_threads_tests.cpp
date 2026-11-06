@@ -5,8 +5,10 @@
 #include <chrono>
 #include <future>
 #include <thread>
+#include <utility>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -83,7 +85,7 @@ void test_configurable_stacks(bool jit) {
     f.process.jit_stats = jit;
     require(f.call("_pthread_attr_init", {data + 128}) == 0, "stack attributes failed");
     require(f.call("_pthread_attr_getstacksize", {data + 128, data + 256}) == 0 &&
-            f.engine.read64(data + 256) == 1024ULL * 1024,
+            f.engine.read64(data + 256) == 512ULL * 1024,
             "worker default incorrectly inherited the main stack size");
     require(f.call("_pthread_attr_setstacksize", {data + 128, large_stack}) == 0 &&
             f.call("_pthread_attr_getstacksize", {data + 128, data + 256}) == 0 &&
@@ -345,9 +347,90 @@ void test_attributes_names_and_stop() {
     require(result.wait_for(std::chrono::seconds(2)) == std::future_status::ready && result.get(), "blocked worker did not stop cooperatively");
 }
 
+// pthread_cond_signal wakes a thread blocked when it was called: a thread that starts
+// waiting afterwards (here the signaller itself) cannot take that wakeup. A NULL
+// pthread_cond_timedwait deadline is an untimed wait.
+void test_condition_wakeup_order() {
+    Fixture f;
+    const auto address = [&](std::string_view name) {
+        const auto exported = f.process.resolve(system_library, name);
+        require(exported.has_value(), "pthread export missing");
+        return exported->address;
+    };
+    static std::atomic<int> woke{0};
+    woke = 0;
+    const auto record = f.engine.register_guest_call([](auto&, auto&) { ++woke; });
+    const auto load = [&](std::uint64_t at, std::uint32_t reg, std::uint64_t literal) {
+        f.engine.write32(at, 0x58000000U | static_cast<std::uint32_t>(((literal - at) / 4) << 5) | reg);
+    };
+    constexpr std::uint32_t call_x16 = 0xd63f0200;
+    const auto mutex = data + 1600, condition = data + 1700;
+    // The worker: lock; pthread_cond_wait (or pthread_cond_timedwait with a NULL deadline); record; unlock; pthread_exit(0).
+    const auto worker = code + 1024, pool = code + 3072;
+    f.engine.write64(pool, mutex); f.engine.write64(pool + 8, address("_pthread_mutex_lock"));
+    f.engine.write64(pool + 16, condition); f.engine.write64(pool + 24, address("_pthread_cond_wait"));
+    f.engine.write64(pool + 32, record); f.engine.write64(pool + 40, address("_pthread_mutex_unlock"));
+    f.engine.write64(pool + 48, 0); f.engine.write64(pool + 56, address("_pthread_exit"));
+    f.engine.write64(pool + 64, address("_pthread_cond_timedwait"));
+    // Two copies: at `worker` waiting with pthread_cond_wait (pool + 24), at `worker + 128` with
+    // pthread_cond_timedwait and a NULL deadline (pool + 64).
+    for (const auto [at, wait] : {std::pair{worker, pool + 24}, std::pair{worker + 128, pool + 64}}) {
+        load(at, 0, pool); load(at + 4, 16, pool + 8); f.engine.write32(at + 8, call_x16);
+        load(at + 12, 0, pool + 16); load(at + 16, 1, pool); load(at + 20, 2, pool + 48); load(at + 24, 16, wait);
+        f.engine.write32(at + 28, call_x16);
+        load(at + 32, 16, pool + 32); f.engine.write32(at + 36, call_x16);
+        load(at + 40, 0, pool); load(at + 44, 16, pool + 40); f.engine.write32(at + 48, call_x16);
+        load(at + 52, 0, pool + 48); load(at + 56, 16, pool + 56); f.engine.write32(at + 60, call_x16);
+    }
+    f.engine.set_memory_access(code, true, false, true);
+    require(f.call("_pthread_mutex_init", {mutex, 0}) == 0 && f.call("_pthread_cond_init", {condition, 0}) == 0, "condition objects");
+    for (const bool timed : {false, true}) {
+        woke = 0;
+        require(f.call("_pthread_create", {data, 0, timed ? worker + 128 : worker, 0}) == 0, "waiting worker create");
+        const auto deadline_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        // The worker holds the mutex until it waits, so once this lock succeeds after a pause it is waiting.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(f.call("_pthread_mutex_lock", {mutex}) == 0, "signaller lock");
+        require(f.call("_pthread_cond_signal", {condition}) == 0, "signal");
+        const auto now = std::chrono::system_clock::now() + std::chrono::milliseconds(300);
+        const auto since = now.time_since_epoch();
+        f.engine.write64(data + 512, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(since).count()));
+        f.engine.write64(data + 520, static_cast<std::uint64_t>((std::chrono::duration_cast<std::chrono::nanoseconds>(since) % std::chrono::seconds(1)).count()));
+        require(f.call("_pthread_cond_timedwait", {condition, mutex, data + 512}) == 60, "a later waiter took the signal");
+        require(f.call("_pthread_mutex_unlock", {mutex}) == 0, "signaller unlock");
+        while (woke == 0 && std::chrono::steady_clock::now() < deadline_at) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        require(woke == 1, timed ? "a NULL-deadline waiter missed its signal" : "the signalled waiter did not wake");
+        require(f.call("_pthread_join", {f.engine.read64(data), 0}) == 0, "waiting worker join");
+    }
+}
+
+// Joined threads and finished detached threads leave the thread table: more threads than
+// its 1024 limit can be made over the process's life.
+void test_thread_reaping() {
+    Fixture f;
+    f.engine.write32(code, 0xd2824680); // mov x0, #0x1234
+    f.engine.write32(code + 4, 0xd65f03c0); // ret
+    f.engine.set_memory_access(code, true, false, true);
+    for (int index = 0; index < 1100; ++index) {
+        require(f.call("_pthread_create", {data, 0, code, 0}) == 0, "joinable create " + std::to_string(index));
+        require(f.call("_pthread_join", {f.engine.read64(data), 0}) == 0, "join");
+    }
+    for (int batch = 0; batch < 40; ++batch) {
+        for (int index = 0; index < 32; ++index) {
+            require(f.call("_pthread_create", {data, 0, code, 0}) == 0,
+                    "detached create " + std::to_string(batch * 32 + index));
+            require(f.call("_pthread_detach", {f.engine.read64(data)}) == 0, "detach");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    f.threads.join_workers();
+}
+
 int main() {
     try {
         test_mutex_keys_and_once();
+        test_condition_wakeup_order();
+        test_thread_reaping();
         test_workers(false);
         test_workers(true);
         test_configurable_stacks(false);

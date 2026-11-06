@@ -78,6 +78,7 @@ void tasks(Fixture& f) {
             "task_policy_get(TASK_CATEGORY_POLICY)");
     require(f.status(sys, "_task_suspend", {self}) == 46, "task_suspend");
     require(f.status(sys, "_thread_switch", {0, 0, 0}) == 0, "thread_switch");
+    require(f.status(sys, "_swtch_pri", {0}) == 0 && f.status(sys, "_swtch", {}) == 0, "swtch_pri / swtch yield and answer FALSE");
 }
 
 void vm(Fixture& f) {

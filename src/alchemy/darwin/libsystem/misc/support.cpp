@@ -356,6 +356,8 @@ void install_darwin_support(ProcessContext& context) {
         try { validate(memory, s.sp - size, size, true); }
         catch (const SupportError&) { throw std::runtime_error("Darwin stack probe exceeds checked stack bounds"); }
     }));
+    // libpthread's name for the same probe.
+    context.install_export(std::string(system_library), "_thread_chkstk_darwin", *context.resolve(system_library, "___chkstk_darwin"));
     // libm (double, float and long double): install_darwin_numeric (numeric_math.cpp).
     install(state, "___isPlatformVersionAtLeast", [](auto& s, auto&) {
         // Platform 1 is macOS. This is Alchemy's supported API profile, not image SDK metadata.

@@ -260,6 +260,11 @@ void Machsys::install_mach() {
         else std::this_thread::yield();
         s.x[0] = kern_success;
     });
+    // boolean_t swtch_pri(int pri), boolean_t swtch(void): the Mach yield traps. Their result
+    // says whether the caller should yield again because other threads want the CPU; the
+    // host does not tell, so it is FALSE (callers use it only as a spin-loop hint).
+    for (const auto* name : {"_swtch_pri", "_swtch"})
+        raw(libsystem, name, [](CpuState& s, GuestMemory&) { std::this_thread::yield(); s.x[0] = 0; });
 
     // VM: the mach_vm_* and vm_* names share implementations (identical ABI on arm64, where
     // vm_address_t and vm_size_t are 64-bit).

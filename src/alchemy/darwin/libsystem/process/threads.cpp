@@ -9,6 +9,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <memory>
 #include <exception>
 #include <limits>
 #include <mutex>
@@ -80,6 +82,10 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         std::uint64_t generation{};
         std::uint64_t tickets{};
         unsigned waiters{};
+        // pthread_cond_wait's waiters in arrival order, each with its wake flag:
+        // pthread_cond_signal wakes the oldest thread blocked when it is called,
+        // so a thread that starts waiting later cannot take that wakeup.
+        std::deque<std::shared_ptr<bool>> queue;
     };
     struct AddressWait : Condition {
         std::uint32_t operation{};
@@ -104,6 +110,9 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         bool complete{};
     };
     struct ThreadAttribute { std::uint64_t stack_size{}; bool detached{}; };
+    // Darwin's default stack for a pthread_create thread (libpthread's
+    // DEFAULT_STACK_SIZE); the main thread's comes from the executable.
+    static constexpr std::uint64_t darwin_default_stack_size = 512 * 1024;
 
     explicit Impl(ProcessContext& value) : process(value) {}
     ProcessContext& process;
@@ -389,9 +398,36 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         if (thread.tlv_table) process.main_engine().fill_bytes(thread.tlv_table, 0, tlv_table_entries * 8);
     }
 
+    // Joined threads, and detached ones that have finished: their pthread_t is no
+    // longer valid, so their entries, engines and thread objects go, as libpthread
+    // frees them. A worker whose lock is busy is left for the next pass (create
+    // takes a new worker's lock before `metadata`).
+    void reap() {
+        std::vector<std::shared_ptr<Worker>> done;
+        {
+            std::lock_guard lock(metadata);
+            for (auto entry = workers.begin(); entry != workers.end();) {
+                const auto worker = entry->second;
+                std::unique_lock worker_lock(worker->mutex, std::try_to_lock);
+                const bool gone = worker_lock && !worker->joining &&
+                    (worker->joined || (worker->detached && worker->finished));
+                if (!gone) { ++entry; continue; }
+                handles.erase(worker->context->identity);
+                done.push_back(worker);
+                entry = workers.erase(entry);
+            }
+            if (!done.empty()) ++worker_generation;
+        }
+        for (const auto& worker : done) {
+            if (worker->host.joinable()) worker->host.join();   // already past its guest code
+            process.release_guest(worker->handle);
+        }
+    }
+
     void create(transmute::CpuState& state, transmute::GuestMemory& memory) {
         if (stopping()) { state.x[0] = eagain; return; }
         if (!accessible(memory, state.x[0], 8) || state.x[2] == 0) { state.x[0] = einval; return; }
+        reap();
         ThreadAttribute attribute;
         if (state.x[1] != 0) {
             std::lock_guard lock(metadata);
@@ -403,7 +439,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         auto worker = std::make_shared<Worker>();
         worker->detached = attribute.detached;
         worker->engine = EngineAdapter(process.calling_engine()).create_worker(
-            state.x[2], state.x[3], attribute.stack_size);
+            state.x[2], state.x[3], attribute.stack_size ? attribute.stack_size : darwin_default_stack_size);
         worker->engine->set_instruction_limit(process.instruction_limit);
         worker->engine->set_jit_profiling(process.jit_stats);
         worker->context = process.thread(*worker->engine);
@@ -662,10 +698,9 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             found->second.stack_size = s.x[1]; s.x[0] = 0;
         });
         add("_pthread_attr_getstacksize", [](auto& self, auto& s, auto& m) {
-            const auto default_size = EngineAdapter(self.process.calling_engine()).default_worker_stack_size();
             std::lock_guard lock(self.metadata); const auto found = self.thread_attributes.find(s.x[0]);
             if (found == self.thread_attributes.end() || !accessible(m, s.x[1], 8)) { s.x[0] = einval; return; }
-            m.write64(s.x[1], found->second.stack_size ? found->second.stack_size : default_size); s.x[0] = 0;
+            m.write64(s.x[1], found->second.stack_size ? found->second.stack_size : darwin_default_stack_size); s.x[0] = 0;
         });
         add("_pthread_attr_setdetachstate", [](auto& self, auto& s, auto&) {
             std::lock_guard lock(self.metadata); const auto found = self.thread_attributes.find(s.x[0]);
@@ -956,8 +991,11 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                 const auto value = self.object(self.conditions, m, s.x[0], cond_size);
                 if (!value) { s.x[0] = einval; return; }
                 std::lock_guard lock(value->gate);
-                if (broadcast) { ++value->generation; value->tickets = 0; value->changed.notify_all(); }
-                else if (value->tickets < value->waiters) { ++value->tickets; value->changed.notify_one(); }
+                if (!value->queue.empty()) {
+                    if (broadcast) { for (const auto& woken : value->queue) *woken = true; value->queue.clear(); }
+                    else { *value->queue.front() = true; value->queue.pop_front(); }
+                    value->changed.notify_all();   // the woken thread re-checks its own flag
+                }
                 s.x[0] = 0;
             });
         }
@@ -969,7 +1007,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                 const auto mutex = shared_mutex ? nullptr : self.object(self.mutexes, m, s.x[1], mutex_size);
                 if ((!shared_condition && !condition) || (!shared_mutex && !mutex)) { s.x[0] = einval; return; }
                 auto deadline = std::chrono::system_clock::time_point::max();
-                if (timed) {
+                if (timed && s.x[2]) {   // a NULL abstime waits without a deadline, as libpthread's does
                     if (!accessible(m, s.x[2], 16, false)) { s.x[0] = einval; return; }
                     const auto seconds = static_cast<std::int64_t>(m.read64(s.x[2])); const auto nanos = m.read64(s.x[2] + 8);
                     if (nanos >= 1'000'000'000) { s.x[0] = einval; return; }
@@ -988,19 +1026,24 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                 if (self.cancel_point(s)) return;
                 if (shared_condition) { s.x[0] = self.pshared_cond_wait(m, s.x[0], s.x[1], deadline); return; }
                 std::unique_lock lock(condition->gate);
-                const auto generation = condition->generation;
                 const auto released = shared_mutex ? self.pshared_unlock(m, s.x[1]) : self.mutex_unlock(mutex);
                 if (released != 0) { s.x[0] = released; return; }
+                const auto woken = std::make_shared<bool>(false);
+                condition->queue.push_back(woken);
                 ++condition->waiters;
                 std::uint32_t error = 0;
                 bool cancelled = false;
-                while (generation == condition->generation && condition->tickets == 0) {
+                while (!*woken) {
                     condition->changed.wait_for(lock, poll_period);
+                    if (*woken) break;
                     if (timed && std::chrono::system_clock::now() >= deadline) { error = etimedout; break; }
                     if (self.stopping()) { error = ecanceled; break; }
                     if (self.cancel_due()) { cancelled = true; break; }
                 }
-                if (generation == condition->generation && condition->tickets != 0) --condition->tickets;
+                // Signalled: the wakeup is this thread's, whatever else happened meanwhile
+                // (a cancellation is then acted on at the next cancellation point).
+                if (*woken) { if (error != ecanceled) error = 0; cancelled = false; }
+                else std::erase(condition->queue, woken);
                 --condition->waiters; lock.unlock();
                 if (error == ecanceled) self.stop_point();
                 const auto acquired = shared_mutex ? self.pshared_lock(m, s.x[1], false) : self.mutex_lock(mutex, false);

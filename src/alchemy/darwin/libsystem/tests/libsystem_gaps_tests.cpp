@@ -1866,6 +1866,9 @@ void test_b31(Fixture& f) {
     require(f.sys("_bind", {socket, address, 16}) == 0, "bind ignores sin_len and sin_zero");
     require(f.sys("_bind", {socket, address, 8}) == UINT64_MAX && errno_value() == 22, "a short address is EINVAL");
     static_cast<void>(f.sys("_close", {socket}));
+
+    // libpthread's name for the stack probe.
+    require(f.symbol(system, "_thread_chkstk_darwin") == f.symbol(system, "___chkstk_darwin"), "thread_chkstk_darwin");
 }
 
 } // namespace

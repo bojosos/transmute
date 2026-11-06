@@ -324,8 +324,15 @@ void temporary_files_and_directory_descriptors() {
         "negative mkstemps suffix accepted");
     require(f.call("_mkstemps", {directory.guest("bad-XXXXXX.dat"), 1000}) == UINT64_MAX && f.error() == 22,
         "oversized mkstemps suffix accepted");
-    require(f.call("_mkstemp", {directory.guest("malformed-XXXXX")}) == UINT64_MAX && f.error() == 22,
-        "malformed template accepted");
+    // Darwin's Libc replaces however many trailing X's there are (not only six).
+    const auto short_template = directory.guest("short-XXXXX");
+    const auto short_file = f.call("_mkstemp", {short_template});
+    const auto short_name = f.read_string(short_template);
+    require(short_file != UINT64_MAX && short_name.size() > 11 && short_name.substr(short_name.size() - 11, 6) == "short-" &&
+        short_name.substr(short_name.size() - 5) != "XXXXX",
+        "a five-X template was not filled in");
+    require(f.call("_mkstemps", {directory.guest("slash-XXXXXX/x"), 2}) == UINT64_MAX && f.error() == 22,
+        "a suffix with a slash accepted");
     require(f.call("_mkstemp", {1}) == UINT64_MAX && f.error() == 14, "bad template pointer not EFAULT");
     const auto readonly = directory.guest("readonly-XXXXXX");
     f.engine.set_memory_access(readonly, true, false, false);
@@ -340,7 +347,8 @@ void temporary_files_and_directory_descriptors() {
     require(f.call("_stat", {child, permissions}) == 0 &&
         ((f.memory().read8(permissions + 4) | (f.memory().read8(permissions + 5) << 8)) & 0777) == 0700,
         "temporary directory permissions are not 0700");
-    require(f.call("_mkdtemp", {directory.guest("bad-directory")}) == 0 && f.error() == 22, "bad mkdtemp error convention");
+    // No X's left: Darwin's mkdtemp tries the name as it is, which now exists.
+    require(f.call("_mkdtemp", {child}) == 0 && f.error() == 17, "bad mkdtemp error convention");
     for (const auto descriptor : {first, second, suffix}) require(f.call("_close", {descriptor}) == 0, "temporary descriptor close failed");
 
     const auto stream = f.call("_tmpfile");
