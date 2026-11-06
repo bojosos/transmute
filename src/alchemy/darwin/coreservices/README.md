@@ -5,10 +5,12 @@ CoreServices, with UniformTypeIdentifiers and some ApplicationServices pieces.
 - **Covers:** Unicode collation (UnicodeUtilities) over the host's linguistic
   comparison; UTType functions and the UTType class over one type table
   (uttype.cpp); LaunchServices answers, with an application registry over the
-  guest root's Applications folders (launch_services.cpp); Apple Event descriptors; the
+  guest root's Applications folders (launch_services.cpp); Apple Event descriptors, and
+  events a process sends itself (its own handlers); the
   accessibility client; the other system-service gaps in services.cpp.
 - **Host dependencies:** host::locale collation (compare, sort_key).
-- **Unsupported, failing explicitly:** there is no Apple Event server and no
+- **Unsupported, failing explicitly:** there is no Apple Event server (an
+  event for another process is connectionInvalid) and no
   accessibility server. LaunchServices keeps its own store (the
   com.alchemy.LaunchServices preferences domain: LSRegisterURL's bundles and
   the default handlers set), not Apple's database. LSOpenFromURLSpec opens

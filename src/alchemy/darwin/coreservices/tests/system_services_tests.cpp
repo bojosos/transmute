@@ -152,6 +152,55 @@ void apple_events(Fixture& f) {
             f.engine.read64(refcon) == 0x5678, "AEGetEventHandler");
     require(f.status(cs, "_AERemoveEventHandler", {code("aevt"), code("odoc"), 0x1234, 0}) == 0 &&
             f.status(cs, "_AEGetEventHandler", {code("aevt"), code("odoc"), handler, refcon, 0}) == -1717, "AERemoveEventHandler");
+    // AESendMessage to this process: the installed handler runs, with the reply event.
+    static Address seen_event, seen_reply, seen_refcon;
+    static std::int32_t handler_result;
+    seen_event = seen_reply = seen_refcon = 0;
+    handler_result = 0;
+    const auto ping = f.process.install_function("_ae_test_ping_handler", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        seen_event = s.x[0];
+        seen_reply = s.x[1];
+        seen_refcon = s.x[2];
+        s.x[0] = static_cast<Address>(static_cast<std::int64_t>(handler_result));
+    });
+    const auto psn = f.block(8), target = f.block(16), self_event = f.block(16), reply = f.block(16), number = f.block(4), actual = f.block(8);
+    f.engine.write32(psn, 0);
+    f.engine.write32(psn + 4, 2);   // kCurrentProcess
+    require(f.status(cs, "_AECreateDesc", {code("psn "), psn, 8, target}) == 0 &&
+            f.status(cs, "_AECreateAppleEvent", {code("Alch"), code("ping"), target, static_cast<Address>(-1), 0, self_event}) == 0, "an event for this process");
+    require(f.status(cs, "_AESendMessage", {self_event, reply, 3, 60}) == -1708, "no handler: errAEEventNotHandled");
+    require(f.status(cs, "_AEInstallEventHandler", {code("Alch"), code("ping"), ping, 0x5eed, 0}) == 0, "install the handler");
+    require(f.status(cs, "_AESendMessage", {self_event, reply, 3, 60}) == 0 && seen_event == self_event && seen_reply == reply && seen_refcon == 0x5eed,
+            "kAEWaitReply runs the handler with the reply");
+    require(f.engine.read32(reply) == code("aevt") && f.status(cs, "_AEGetAttributePtr", {reply, code("evid"), code("type"), 0, number, 4, actual}) == 0 &&
+            f.engine.read32(number) == code("ansr"), "the reply is an 'ansr' event");
+    handler_result = -50;
+    require(f.status(cs, "_AESendMessage", {self_event, reply, 3, 60}) == 0 &&
+            f.status(cs, "_AEGetParamPtr", {reply, code("errn"), code("long"), 0, number, 4, actual}) == 0 &&
+            static_cast<std::int32_t>(f.engine.read32(number)) == -50, "a handler error goes into the reply's keyErrorNumber");
+    require(f.status(cs, "_AESendMessage", {self_event, reply, 1, 60}) == -50 && f.engine.read32(seen_reply) == code("null"),
+            "kAENoReply: the handler's error is the result, with a null reply");
+    require(f.status(cs, "_AESendMessage", {self_event, reply, 2, 60}) == -50, "kAEQueueReply is refused (paramErr)");
+    handler_result = 0;
+    // By pid: this process, and another one.
+    const auto pid_value = f.block(4);
+    f.engine.write32(pid_value, static_cast<std::uint32_t>(f.call(sys, "_getpid")));
+    const auto pid_target = f.block(16), pid_event = f.block(16);
+    require(f.status(cs, "_AECreateDesc", {code("kpid"), pid_value, 4, pid_target}) == 0 &&
+            f.status(cs, "_AECreateAppleEvent", {code("Alch"), code("ping"), pid_target, static_cast<Address>(-1), 0, pid_event}) == 0 &&
+            f.status(cs, "_AESendMessage", {pid_event, reply, 3, 60}) == 0, "an event for this pid");
+    f.engine.write32(pid_value, f.engine.read32(pid_value) + 1);
+    const auto other_target = f.block(16), other_event = f.block(16);
+    require(f.status(cs, "_AECreateDesc", {code("kpid"), pid_value, 4, other_target}) == 0 &&
+            f.status(cs, "_AECreateAppleEvent", {code("Alch"), code("ping"), other_target, static_cast<Address>(-1), 0, other_event}) == 0 &&
+            f.status(cs, "_AESendMessage", {other_event, reply, 3, 60}) == -609, "another process has no Apple Event server");
+    // A wildcard handler takes events with no handler of their own.
+    const auto other_class = f.block(16);
+    require(f.status(cs, "_AECreateAppleEvent", {code("Othr"), code("thng"), target, static_cast<Address>(-1), 0, other_class}) == 0 &&
+            f.status(cs, "_AEInstallEventHandler", {code("****"), code("****"), ping, 0x77, 0}) == 0 &&
+            f.status(cs, "_AESendMessage", {other_class, reply, 3, 60}) == 0 && seen_refcon == 0x77, "the typeWildCard handler");
+    for (const auto keyword : {code("Alch"), code("****")})
+        static_cast<void>(f.status(cs, "_AERemoveEventHandler", {keyword, keyword == code("Alch") ? code("ping") : code("****"), ping, 0}));
     // AEInitializeDesc.
     f.engine.write32(item, 0x12345678);
     static_cast<void>(f.call(cs, "_AEInitializeDesc", {item}));

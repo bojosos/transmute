@@ -34,15 +34,17 @@
 //     four-character codes among 'type' / 'enum' / 'keyw' / 'prop'. Anything
 //     else is errAECoercionFail.
 //   - Handlers are recorded (AEInstallEventHandler / AEGetEventHandler /
-//     AERemoveEventHandler), but no Apple Event server delivers events:
-//     AESendMessage fails with connectionInvalid, AEProcessAppleEvent and
-//     AEProcessEvent report the event as not handled.
+//     AERemoveEventHandler). AESendMessage delivers an event addressed to
+//     this process to its handler; there is no Apple Event server, so an
+//     event for any other process fails with connectionInvalid, and
+//     AEProcessAppleEvent and AEProcessEvent report the event as not handled.
 namespace alchemy::gui::values {
 namespace {
 
 using fill::carbon;
 using fill::core_services;
 using fill::fourcc;
+using fill::libsystem;
 using fill::status;
 
 constexpr std::int32_t ae_param = -50, ae_coercion_fail = -1700, ae_desc_not_found = -1701, ae_wrong_data_type = -1703,
@@ -537,7 +539,7 @@ void Provider::install_apple_events() {
     });
 
     // ---- handlers --------------------------------------------------------------------------------------
-    // Handlers are recorded; no Apple Event is ever delivered to this process.
+    // Handlers are recorded; AESendMessage delivers this process's own events to them.
     auto handlers = std::make_shared<std::map<std::pair<std::uint32_t, std::uint32_t>, std::pair<Address, Address>>>();
     // OSErr AEInstallEventHandler(AEEventClass, AEEventID, AEEventHandlerUPP, SRefCon, Boolean isSysHandler)
     raw(core_services, "_AEInstallEventHandler", [this, handlers](CpuState& s, GuestMemory&) {
@@ -562,10 +564,93 @@ void Provider::install_apple_events() {
         std::lock_guard lock(mutex);
         s.x[0] = handlers->erase({static_cast<std::uint32_t>(s.x[0]), static_cast<std::uint32_t>(s.x[1])}) ? 0 : status(ae_handler_not_found);
     });
-    // AESendMessage(event, reply, mode, timeout): no process can receive it.
-    raw(core_services, "_AESendMessage", [write_null](CpuState& s, GuestMemory& m) {
-        write_null(m, s.x[1]);
-        s.x[0] = status(ae_connection_invalid);
+    // Whether an event's target address (keyAddressAttr) is this process: kCurrentProcess as a
+    // ProcessSerialNumber, this pid (typeKernelProcessID), or this application's bundle identifier.
+    const auto addressed_to_self = [this](const AeNode* address) {
+        if (!address) return false;
+        if (address->type == fourcc("psn ") && address->bytes.size() == 8) {
+            std::uint32_t high{}, low{};
+            std::memcpy(&high, address->bytes.data(), 4);
+            std::memcpy(&low, address->bytes.data() + 4, 4);
+            return high == 0 && low == 2;   // kCurrentProcess (GetCurrentProcess answers it too)
+        }
+        if (address->type == fourcc("kpid") && address->bytes.size() == 4) {
+            std::int32_t pid{};
+            std::memcpy(&pid, address->bytes.data(), 4);
+            return pid == static_cast<std::int32_t>(call(libsystem, "_getpid", {}));
+        }
+        if (address->type == fourcc("bund")) {
+            const auto bundle = call(fill::core_foundation, "_CFBundleGetMainBundle", {});
+            const auto identifier = bundle ? call(fill::core_foundation, "_CFBundleGetIdentifier", {bundle}) : 0;
+            return identifier && cf.utf8(identifier) == std::string(address->bytes.begin(), address->bytes.end());
+        }
+        return false;
+    };
+    // OSErr AESendMessage(const AppleEvent *, AppleEvent *reply, AESendMode, long timeOutInTicks): an
+    // event addressed to this process (kCurrentProcess, this pid or this application's bundle
+    // identifier) runs the handler installed for its class and ID (or a typeWildCard one) now, on the
+    // sending thread. With kAEWaitReply the reply is an Apple Event ('aevt' / 'ansr') the handler fills,
+    // and a handler error goes into its keyErrorNumber ('errn'); with kAENoReply the handler's error is
+    // the result. Queued replies need an event loop that would deliver them: paramErr. Any other target
+    // has no Apple Event server to reach it: connectionInvalid.
+    raw(core_services, "_AESendMessage", [this, handlers, read_node, write_node, write_null, with_record, addressed_to_self](CpuState& s, GuestMemory& m) {
+        const auto event = s.x[0], reply = s.x[1];
+        const auto reply_mode = static_cast<std::uint32_t>(s.x[2]) & 3;   // kAENoReply 1, kAEQueueReply 2, kAEWaitReply 3
+        write_null(m, reply);
+        if (!event) { s.x[0] = status(ae_param); return; }
+        const auto node = read_node(m, event);
+        if (node.type != type_event || !node.record) { s.x[0] = status(ae_param); return; }
+        const auto attribute = [&](std::uint32_t key) -> const AeNode* {
+            for (const auto& [name, value] : node.record->attributes) if (name == key) return &value;
+            return nullptr;
+        };
+        const auto code = [&](std::uint32_t key) -> std::uint32_t {
+            const auto found = attribute(key);
+            std::uint32_t value{};
+            if (found && found->bytes.size() == 4) std::memcpy(&value, found->bytes.data(), 4);
+            return value;
+        };
+        if (!addressed_to_self(attribute(fourcc("addr")))) { s.x[0] = status(ae_connection_invalid); return; }
+        if (reply_mode == 2) { s.x[0] = status(ae_param); return; }
+        const auto event_class = code(fourcc("evcl")), event_id = code(fourcc("evid"));
+        std::pair<Address, Address> handler{};
+        {
+            std::lock_guard lock(mutex);
+            for (const auto& key : {std::pair{event_class, event_id}, std::pair{event_class, type_wildcard}, std::pair{type_wildcard, event_id},
+                                    std::pair{type_wildcard, type_wildcard}})
+                if (const auto found = handlers->find(key); found != handlers->end()) { handler = found->second; break; }
+        }
+        if (!handler.first) { s.x[0] = status(ae_event_not_handled); return; }
+        const bool wants_reply = reply_mode == 3 && reply;
+        if (wants_reply) {
+            auto record = std::make_shared<AeRecord>();
+            record->attributes.emplace_back(fourcc("evcl"), AeNode{fourcc("type"), raw_bytes(type_event), nullptr});
+            record->attributes.emplace_back(fourcc("evid"), AeNode{fourcc("type"), raw_bytes(fourcc("ansr")), nullptr});
+            for (const auto key : {fourcc("rtid"), fourcc("tran")})
+                if (const auto found = attribute(key)) record->attributes.emplace_back(key, copy_node(*found));
+            write_node(m, reply, AeNode{type_event, {}, record});
+        }
+        // OSErr (*AEEventHandlerUPP)(const AppleEvent *, AppleEvent *reply, SRefCon): a null reply without kAEWaitReply.
+        Address empty{};
+        if (!wants_reply) {
+            empty = malloc(16);
+            write_null(m, empty);
+        }
+        CallRegs registers{};
+        registers.x[0] = event;
+        registers.x[1] = wants_reply ? reply : empty;
+        registers.x[2] = handler.second;
+        const auto result = static_cast<std::int16_t>(EngineAdapter(process.calling_engine()).call_regs(handler.first, registers).x0);
+        if (empty) free(empty);
+        if (result && wants_reply) {
+            with_record(m, reply, [&](AeRecord* record) {
+                if (record) record->parameters.emplace_back(fourcc("errn"), AeNode{fourcc("long"), raw_bytes(static_cast<std::int32_t>(result)), nullptr});
+                return 0;
+            });
+            s.x[0] = 0;
+            return;
+        }
+        s.x[0] = status(result);
     });
     // OSErr AEProcessAppleEvent(const EventRecord *): no high-level event ever arrives.
     failure(carbon, "_AEProcessAppleEvent", ae_event_not_handled);   // HIToolbox, like AEProcessEvent
