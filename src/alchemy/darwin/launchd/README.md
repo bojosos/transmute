@@ -91,6 +91,38 @@ table that `launchctl`, `SMJobSubmit` and friends talk to.
 * **Refused, with a log line:** connecting sockets (SockPassive false) and
   named services (only port numbers).
 
+## XPC connections (alchemy-fx)
+
+`xpc_connections.cpp` (moved from `libsystem/misc/xpc_objects.cpp`, whose
+internals it shares through `misc/xpc_internal.hpp`):
+
+* **Transport.** Both ends are Alchemy's libxpc, so the wire format is
+  Alchemy's own. One Mach message carries one XPC message: the object graph
+  serialized inline, plus port descriptors for fds (fileports), Mach send
+  rights and endpoints. Errors, connections and shared memory do not travel.
+* **Clients** (`xpc_connection_create_mach_service`, `create_from_endpoint`)
+  connect at resume: a look-up (job services through the session launchd),
+  then a hello carrying the client's inbox, answered with the peer's inbox.
+  Messages wait until then. When the peer dies, a Mach-service client gets
+  XPC_ERROR_CONNECTION_INTERRUPTED and the next send connects again (the job
+  is launched anew on demand); other clients get INVALID.
+* **Listeners** (`XPC_CONNECTION_MACH_SERVICE_LISTENER`, anonymous
+  `xpc_connection_create(NULL)`, `xpc_main` in a job) hand each hello to the
+  handler as a peer connection. A peer stays alive until it ends.
+* **Messages:**
+  * Replies use send-once rights (`create_reply`, `get_remote_connection`).
+  * `send_message_with_reply_sync` waits on the calling thread.
+  * `send_barrier` runs on the connection's queue.
+  * `cancel` sends a goodbye, and INVALID comes last.
+* **Peer identity** (pid, euid, egid, asid, audit token) comes from the audit
+  trailer of the messages received.
+* **Delivery** runs on guest dispatch queues (MACH_RECV and MACH_SEND dead-name
+  sources), never on host threads.
+* **Not yet:** bundled XPC services (`xpc_connection_create` with a name, and
+  `xpc_main` outside a launchd job) and NSXPCConnection. The privileged flag
+  (the system domain) is invalid. Without the Mach layer (alchemy.exe, unit
+  fixtures) every connection is invalid, as before.
+
 ## launchctl
 
 A built-in tool child (`launchctl.cpp`), like `sh`. `asuser` still execs its
@@ -150,3 +182,7 @@ These are refused, by the user's decisions of 2026-11-05:
     message launches the job, which checks in and answers; a second request
     reaches the same job; the service is gone after bootout.
   * `sockets`: `launch_activate_socket` and its errors, and the CheckIn reply.
+  * `xpc`: a client in another tree calls a job's XPC Mach service. It
+    covers a sync reply carrying an fd, an async reply, the peer's pid, the
+    job's exit (INTERRUPTED), a new run on the next request, and cancel
+    (INVALID).

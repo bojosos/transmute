@@ -50,7 +50,7 @@ function(alchemy_launchd_session_tests)
         DEPENDS "${macos_dir}/launchd_model.o" "${macos_dir}/launchd_system.dylib" VERBATIM)
     add_custom_target(alchemy_launchd_fixtures DEPENDS "${macos_dir}/launchd_model")
     add_dependencies(alchemy_process_model_tests alchemy_launchd_fixtures)
-    add_test(NAME alchemy_launchd_session_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${macos_dir}/launchd_model" launchctl mach sockets)
+    add_test(NAME alchemy_launchd_session_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${macos_dir}/launchd_model" launchctl mach sockets xpc)
     set_tests_properties(alchemy_launchd_session_fx PROPERTIES TIMEOUT 600
         ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback")
 endfunction()

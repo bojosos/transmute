@@ -437,6 +437,168 @@ static void test_sockets(void) {
     done(t, before);
 }
 
+/* ---- XPC over Mach (L3) ---------------------------------------------------------------------- */
+typedef void* xpc_object_t;
+extern xpc_object_t xpc_connection_create_mach_service(const char*, void*, unsigned long long);
+extern void xpc_connection_set_event_handler(xpc_object_t, void*);
+extern void xpc_connection_resume(xpc_object_t);
+extern void xpc_connection_cancel(xpc_object_t);
+extern void xpc_connection_send_message(xpc_object_t, xpc_object_t);
+extern void xpc_connection_send_message_with_reply(xpc_object_t, xpc_object_t, void*, void*);
+extern xpc_object_t xpc_connection_send_message_with_reply_sync(xpc_object_t, xpc_object_t);
+extern int xpc_connection_get_pid(xpc_object_t);
+extern xpc_object_t xpc_dictionary_create(const char* const*, const xpc_object_t*, size_t);
+extern xpc_object_t xpc_dictionary_create_reply(xpc_object_t);
+extern xpc_object_t xpc_dictionary_get_remote_connection(xpc_object_t);
+extern void xpc_dictionary_set_string(xpc_object_t, const char*, const char*);
+extern void xpc_dictionary_set_int64(xpc_object_t, const char*, long long);
+extern void xpc_dictionary_set_fd(xpc_object_t, const char*, int);
+extern const char* xpc_dictionary_get_string(xpc_object_t, const char*);
+extern long long xpc_dictionary_get_int64(xpc_object_t, const char*);
+extern int xpc_dictionary_dup_fd(xpc_object_t, const char*);
+extern const void* xpc_get_type(xpc_object_t);
+extern void xpc_release(xpc_object_t);
+extern const char _xpc_type_dictionary, _xpc_type_connection, _xpc_type_error;
+extern const char _xpc_error_connection_interrupted, _xpc_error_connection_invalid;
+extern void* _NSConcreteGlobalBlock[];
+
+/* Global blocks written out by hand (no -fblocks): isa, BLOCK_IS_GLOBAL, invoke, descriptor. */
+struct block_descriptor { unsigned long reserved, size; };
+struct block { void* isa; int flags; int reserved; void* invoke; struct block_descriptor* descriptor; };
+static struct block_descriptor block_size = {0, sizeof(struct block)};
+#define GLOBAL_BLOCK(function) { _NSConcreteGlobalBlock, 1 << 28, 0, (void*)(function), &block_size }
+
+/* The service: echoes value + 1, its pid, and 4 bytes read from a passed fd; "quit" exits. */
+static void service_message(struct block* self, xpc_object_t event) {
+    (void)self;
+    if (xpc_get_type(event) != &_xpc_type_dictionary) return;
+    const char* op = xpc_dictionary_get_string(event, "op");
+    if (op && same(op, "quit")) _exit(0);
+    xpc_object_t reply = xpc_dictionary_create_reply(event);
+    if (!reply) return;
+    xpc_dictionary_set_int64(reply, "pid", getpid());
+    xpc_dictionary_set_int64(reply, "value", xpc_dictionary_get_int64(event, "value") + 1);
+    char text[8] = {0};
+    const int fd = xpc_dictionary_dup_fd(event, "fd");
+    if (fd >= 0) { read(fd, text, 4); close(fd); }
+    xpc_dictionary_set_string(reply, "read", text);
+    xpc_connection_send_message(xpc_dictionary_get_remote_connection(event), reply);
+    xpc_release(reply);
+}
+static struct block service_message_block = GLOBAL_BLOCK(service_message);
+static void service_peer(struct block* self, xpc_object_t peer) {
+    (void)self;
+    if (xpc_get_type(peer) != &_xpc_type_connection) return;
+    xpc_connection_set_event_handler(peer, &service_message_block);
+    xpc_connection_resume(peer);
+}
+static struct block service_peer_block = GLOBAL_BLOCK(service_peer);
+static int xpc_service(const char* name) {
+    xpc_object_t listener = xpc_connection_create_mach_service(name, 0, 1 /* XPC_CONNECTION_MACH_SERVICE_LISTENER */);
+    xpc_connection_set_event_handler(listener, &service_peer_block);
+    xpc_connection_resume(listener);
+    for (;;) usleep(100000);
+}
+
+static volatile const void* client_error;
+static void client_event(struct block* self, xpc_object_t event) { (void)self; if (xpc_get_type(event) == &_xpc_type_error) client_error = event; }
+static struct block client_event_block = GLOBAL_BLOCK(client_event);
+static volatile long long async_value = -1;
+static void client_reply(struct block* self, xpc_object_t reply) {
+    (void)self;
+    async_value = xpc_get_type(reply) == &_xpc_type_dictionary ? xpc_dictionary_get_int64(reply, "value") : -2;
+}
+static struct block client_reply_block = GLOBAL_BLOCK(client_reply);
+
+static xpc_object_t echo_request(long long value, int fd) {
+    xpc_object_t message = xpc_dictionary_create(0, 0, 0);
+    xpc_dictionary_set_string(message, "op", "echo");
+    xpc_dictionary_set_int64(message, "value", value);
+    if (fd >= 0) xpc_dictionary_set_fd(message, "fd", fd);
+    return message;
+}
+
+static void test_xpc(void) {
+    const int before = failures; const char* t = "xpc";
+    char uid[24], pidtext[24], label[128], name[160], domain[64], service[192], plist[1024], body[4096], output[8192];
+    number(uid, (long)getuid());
+    number(pidtext, (long)getpid());
+    const char* tmp = getenv("TMPDIR");
+    if (!tmp) { check(0, t, "TMPDIR", 0); return; }
+    copy(label, "com.alchemy.test.xpc"); append(label, pidtext);
+    copy(name, label); append(name, ".service");
+    copy(domain, "gui/"); append(domain, uid);
+    copy(service, domain); append(service, "/"); append(service, label);
+    copy(plist, tmp); if (plist[length(plist) - 1] != '/') append(plist, "/"); append(plist, label); append(plist, ".plist");
+    body[0] = 0;
+    append(body, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n");
+    append(body, "<key>Label</key><string>"); append(body, label); append(body, "</string>\n");
+    append(body, "<key>ProgramArguments</key><array><string>"); append(body, self);
+    append(body, "</string><string>child</string><string>xpc-service</string><string>"); append(body, name); append(body, "</string></array>\n");
+    append(body, "<key>MachServices</key><dict><key>"); append(body, name); append(body, "</key><true/></dict>\n");
+    append(body, "<key>ThrottleInterval</key><integer>1</integer>\n");
+    append(body, "</dict>\n</plist>\n");
+    check(write_file(plist, body) == 0, t, "write the job plist", 0);
+    char* bootstrap[] = {(char*)"launchctl", (char*)"bootstrap", domain, plist, 0};
+    int status = launchctl(bootstrap, output, sizeof output);
+    check(status == 0, t, "bootstrap an XPC service job", status);
+
+    xpc_object_t connection = xpc_connection_create_mach_service(name, 0, 0);
+    xpc_connection_set_event_handler(connection, &client_event_block);
+    xpc_connection_resume(connection);
+    /* A synchronous request launches the job; the reply carries its pid and what it read from our pipe. */
+    int fds[2];
+    pipe(fds);
+    write(fds[1], "abcd", 4);
+    close(fds[1]);
+    xpc_object_t request = echo_request(41, fds[0]);
+    close(fds[0]);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(connection, request);
+    xpc_release(request);
+    const int is_dictionary = xpc_get_type(reply) == &_xpc_type_dictionary;
+    check(is_dictionary, t, "send_message_with_reply_sync: a dictionary", 0);
+    long long first_pid = 0;
+    if (is_dictionary) {
+        first_pid = xpc_dictionary_get_int64(reply, "pid");
+        const char* read_back = xpc_dictionary_get_string(reply, "read");
+        check(xpc_dictionary_get_int64(reply, "value") == 42, t, "the service answered value + 1", (long)xpc_dictionary_get_int64(reply, "value"));
+        check(first_pid > 0 && first_pid != getpid(), t, "the service is another process", (long)first_pid);
+        check(read_back && same(read_back, "abcd"), t, "an fd travelled in the message", 0);
+        check(xpc_connection_get_pid(connection) == first_pid, t, "xpc_connection_get_pid is the peer", xpc_connection_get_pid(connection));
+    }
+    xpc_release(reply);
+    /* An asynchronous reply. */
+    request = echo_request(99, -1);
+    xpc_connection_send_message_with_reply(connection, request, 0, &client_reply_block);
+    xpc_release(request);
+    for (int i = 0; i < 600 && async_value == -1; ++i) usleep(50000);
+    check(async_value == 100, t, "send_message_with_reply: the reply block", (long)async_value);
+    /* The service exits: the connection is interrupted, and the next request reaches a new run. */
+    xpc_object_t quit = xpc_dictionary_create(0, 0, 0);
+    xpc_dictionary_set_string(quit, "op", "quit");
+    xpc_connection_send_message(connection, quit);
+    xpc_release(quit);
+    for (int i = 0; i < 600 && client_error != (const void*)&_xpc_error_connection_interrupted; ++i) usleep(50000);
+    check(client_error == (const void*)&_xpc_error_connection_interrupted, t, "the service's exit interrupts the connection", 0);
+    request = echo_request(7, -1);
+    reply = xpc_connection_send_message_with_reply_sync(connection, request);
+    xpc_release(request);
+    const long long second_pid = xpc_get_type(reply) == &_xpc_type_dictionary ? xpc_dictionary_get_int64(reply, "pid") : -1;
+    check(second_pid > 0 && second_pid != first_pid && xpc_dictionary_get_int64(reply, "value") == 8, t, "after an interruption a new run answers", (long)second_pid);
+    xpc_release(reply);
+    /* Cancel: invalid last. */
+    client_error = 0;
+    xpc_connection_cancel(connection);
+    for (int i = 0; i < 200 && client_error != (const void*)&_xpc_error_connection_invalid; ++i) usleep(50000);
+    check(client_error == (const void*)&_xpc_error_connection_invalid, t, "cancel ends with XPC_ERROR_CONNECTION_INVALID", 0);
+    xpc_release(connection);
+    char* bootout[] = {(char*)"launchctl", (char*)"bootout", service, 0};
+    status = launchctl(bootout, output, sizeof output);
+    check(status == 0, t, "bootout", status);
+    unlink(plist);
+    done(t, before);
+}
+
 static int child(int argc, char** argv) {
     if (argc >= 4 && same(argv[2], "job")) {
         char text[256], digits[24];
@@ -454,6 +616,7 @@ static int child(int argc, char** argv) {
     }
     if (argc >= 4 && same(argv[2], "mach-job")) return mach_job(argv[3]);
     if (argc >= 3 && same(argv[2], "socket-job")) return socket_job();
+    if (argc >= 4 && same(argv[2], "xpc-service")) return xpc_service(argv[3]);
     out(2, "unknown child mode\n");
     return 2;
 }
@@ -465,6 +628,7 @@ int main(int argc, char** argv) {
     if (same(argv[1], "launchctl")) test_launchctl();
     else if (same(argv[1], "mach")) test_mach();
     else if (same(argv[1], "sockets")) test_sockets();
+    else if (same(argv[1], "xpc")) test_xpc();
     else { out(2, "unknown test\n"); return 2; }
     return failures;
 }
