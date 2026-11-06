@@ -83,6 +83,19 @@ keys are its properties, the animation timing function among them).
 is standard dynamic range: EDR contents show clamped. CAMetalLayer's
 `preferredDevice` is the system default device (there is one GPU).
 
+**CARenderer** (`renderer.cpp`, installed by the support kit): a layer tree
+rendered into an MTLTexture (`+rendererWithMTLTexture:options:`,
+`-setDestination:`) with the window composition's model and contents (the
+tree as shown now, running animations included; 'BGRA' IOSurfaces and
+CGImages). The renderer's bounds (the texture's size at first) fill the
+texture; the rendered area is cleared first. BGRA8 and RGBA8 textures,
+private storage through a blit on the `kCARendererMetalCommandQueue`
+option's queue. No change tracking: `-updateBounds` is the whole bounds.
+`-nextFrameTime` is one 60 Hz frame later while a layer animates, else
+infinity. Other texture formats stop explicitly, and so does
+`+rendererWithCGLContext:options:` (no OpenGL context exists). Test:
+`tests/renderer_tests.cpp` (ctest `alchemy_gui_quartzcore_renderer`).
+
 **Animations (presentation values):** while a layer has animations, the
 composition shows its presentation values, redrawn each frame (60 Hz) until
 the last animation ends. CABasicAnimations are interpolated at the current

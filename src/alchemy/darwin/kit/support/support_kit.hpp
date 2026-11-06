@@ -47,6 +47,8 @@
 #include <string_view>
 #include <vector>
 
+namespace alchemy::gui::quartzcore::tree { struct Layer; }
+
 namespace alchemy::gui::support_kit {
 
 using Address = std::uint64_t;
@@ -136,6 +138,12 @@ void install_metal_display_link(Support& support);
 
 // ---- CALayer contents (layer_contents.cpp) --------------------------------------------------
 void install_layer_contents(Support& support);
+// Resolves every contents object of a snapshot (IOSurfaces in 'BGRA',
+// CGImages) into host pixels, as the window composition does; the result
+// owns the pixels the tree's tree::Image values point into.
+[[nodiscard]] std::shared_ptr<const void> resolve_layer_contents(Support& support, quartzcore::tree::Layer& root);
+// CARenderer: a layer tree rendered into an MTLTexture (darwin/quartzcore/renderer.cpp).
+void install_quartzcore_renderer(Support& support);
 
 // ---- CoreGraphics display modes, event taps (cg_extra.cpp) ---------------------------------------
 void install_cg_extra(Support& support);

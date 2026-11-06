@@ -25,7 +25,8 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/quartzcore/iosurface.cpp
     src/alchemy/darwin/quartzcore/display_link.cpp
     src/alchemy/darwin/quartzcore/metal_display_link.cpp
-    src/alchemy/darwin/quartzcore/layer_contents.cpp)
+    src/alchemy/darwin/quartzcore/layer_contents.cpp
+    src/alchemy/darwin/quartzcore/renderer.cpp)
 if(ALCHEMY_VULKAN_INCLUDE)
     # Same definitions as cmake/darwin/metal.cmake; repeated so presentation
     # does not depend on another fragment.
@@ -49,6 +50,10 @@ function(alchemy_gui_quartzcore_tests)
     # provider, the in-memory window server).
     alchemy_gui_add_unit_test(alchemy_gui_quartzcore_compositing
         src/alchemy/darwin/quartzcore/tests/compositing_tests.cpp TIMEOUT 120)
+    # CARenderer: layer trees rendered into MTLTextures (pixels; skipped
+    # without a Metal device).
+    alchemy_gui_add_unit_test(alchemy_gui_quartzcore_renderer
+        src/alchemy/darwin/quartzcore/tests/renderer_tests.cpp TIMEOUT 120)
     # Presentation against a real Vulkan device (test double for Metal's
     # bridge) and a real Win32 window. Exit code 77: no Vulkan driver or no
     # interactive desktop (skipped, not failed).

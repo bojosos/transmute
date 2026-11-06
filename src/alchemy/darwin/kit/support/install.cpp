@@ -108,6 +108,7 @@ void install_support_kit(InstallContext& context) {
     install_iosurface(value);
     install_display_link(value);
     install_layer_contents(value);
+    install_quartzcore_renderer(value);
     install_opengl_no_context(value);
     install_foundation_associated_objects(value);
     install_cg_extra(value);

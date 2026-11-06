@@ -512,6 +512,12 @@ void schedule_retry(Support& support) {
 
 } // namespace
 
+std::shared_ptr<const void> resolve_layer_contents(Support& support, quartzcore::tree::Layer& root) {
+    auto keep = std::make_shared<std::vector<std::unique_ptr<Pixels>>>();
+    resolve(support, root, *keep);
+    return keep;
+}
+
 void install_layer_contents(Support& support) {
     const auto layer_class = support.objc.find_class("CALayer");
     if (!layer_class) fail("QuartzCore CALayer is missing (install_quartzcore must run first)");
