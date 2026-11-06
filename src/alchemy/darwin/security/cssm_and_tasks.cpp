@@ -80,7 +80,7 @@ void CssmAndTasks::install() {
     });
     failure(security, "_SecIdentitySearchCreate", sec_unimplemented, {2});
     failure(security, "_SecIdentitySearchCopyNext", sec_param, {1});
-    constant(security, "_SecIdentityCopyPreferred", 0);
+    // SecIdentityCopyPreferred / SetPreferred: keychain.cpp (identity preferences).
     // SecTrustSetKeychains: certificate evaluation never searches keychains, so
     // only an empty search list (no keychains) is honoured.
     raw(security, "_SecTrustSetKeychains", [this](CpuState& s, GuestMemory&) {
@@ -145,7 +145,7 @@ void CssmAndTasks::install() {
     raw(security, "_SecTaskCopyValueForEntitlement", [](CpuState& s, GuestMemory& m) { if (s.x[2]) m.write64(s.x[2], 0); s.x[0] = 0; });
     raw(security, "_SecTaskCopySigningIdentifier", [](CpuState& s, GuestMemory& m) { if (s.x[1]) m.write64(s.x[1], 0); s.x[0] = 0; });
     constant(security, "_SecTaskGetCodeSignStatus", 0);
-    string(security, "_kSecAttrSubject", "subj");
+    // kSecAttrSubject: keychain.cpp (the certificate attributes).
     string(security, "_kSecUseAuthenticationContext", "u_AuthCtx");
 }
 

@@ -14,6 +14,7 @@
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/darwin/security/x509.hpp"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,10 +31,17 @@ struct KeyMaterial;   // keys.cpp
 
 struct CertificateState final : ObjectPayload { CertificatePtr certificate; };
 struct PolicyState final : ObjectPayload { TrustPolicy policy; };
-struct KeyState final : ObjectPayload { std::shared_ptr<const KeyMaterial> key; };
+struct KeyState final : ObjectPayload {
+    std::shared_ptr<const KeyMaterial> key;
+    bool extractable{true};                   // kSecAttrIsExtractable: false refuses the external representation
+    bool permanent{};                         // a keychain key (kSecAttrIsPermanent)
+};
 struct IdentityState final : ObjectPayload {
     Address certificate{};                    // +1 SecCertificate
     host::crypto::Identity identity;          // the certificate with its private key (TLS); an imported key dies with it
+    // A keychain identity's private key (keychain.cpp); empty for PKCS#12 imports, whose key the host holds.
+    std::shared_ptr<const KeyMaterial> private_key;
+    bool private_key_extractable{true};
 };
 struct TrustState final : ObjectPayload {
     std::mutex mutex;
@@ -74,8 +82,14 @@ public:
     // The SecTrust's evaluation inputs, with any SecTrustSetExceptions data.
     [[nodiscard]] TrustRequest trust_request(Address trust) const;
 
-    Address make_key(std::shared_ptr<const KeyMaterial> key);
+    Address make_key(std::shared_ptr<const KeyMaterial> key, bool extractable = true, bool permanent = false);
     [[nodiscard]] std::shared_ptr<const KeyMaterial> key_of(Address object) const;
+    [[nodiscard]] std::shared_ptr<const KeyState> key_state(Address object) const;   // nullptr when not a SecKey
+
+    // Keychain storage for keys.cpp (installed by keychain.cpp): stores a generated key as a keychain
+    // key with the caller's attributes (labels, tags, extractability), those of `nested` (its
+    // kSecPrivateKeyAttrs / kSecPublicKeyAttrs, 0 for none) over those of `parameters`. OSStatus.
+    std::function<std::int32_t(const std::shared_ptr<const KeyMaterial>& key, Address parameters, Address nested)> store_key;
 
     // Writes OSStatus-domain CFError to a `CFErrorRef *`.
     void set_error(Address out, std::int32_t status, std::string_view description);

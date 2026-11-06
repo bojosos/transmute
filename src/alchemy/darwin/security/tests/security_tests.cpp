@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -772,6 +773,168 @@ void test_legacy_keychain(Fixture& f) {
     fs::remove_all(dir);
 }
 
+constexpr std::uint8_t test_certificate_der[] = {
+    0x30, 0x82, 0x01, 0x98, 0x30, 0x82, 0x01, 0x3d, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x14, 0x24, 0x0b, 0x47,
+    0x4f, 0x0c, 0x02, 0x4f, 0xc3, 0x15, 0x59, 0xc1, 0x5f, 0x06, 0xf2, 0x9f, 0xee, 0xab, 0xd9, 0x5d, 0xb0, 0x30,
+    0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02, 0x30, 0x20, 0x31, 0x1e, 0x30, 0x1c, 0x06,
+    0x03, 0x55, 0x04, 0x03, 0x0c, 0x15, 0x41, 0x6c, 0x63, 0x68, 0x65, 0x6d, 0x79, 0x20, 0x4b, 0x65, 0x79, 0x63,
+    0x68, 0x61, 0x69, 0x6e, 0x20, 0x54, 0x65, 0x73, 0x74, 0x30, 0x20, 0x17, 0x0d, 0x32, 0x36, 0x31, 0x31, 0x30,
+    0x36, 0x30, 0x34, 0x34, 0x30, 0x32, 0x39, 0x5a, 0x18, 0x0f, 0x32, 0x31, 0x32, 0x36, 0x31, 0x30, 0x31, 0x33,
+    0x30, 0x34, 0x34, 0x30, 0x32, 0x39, 0x5a, 0x30, 0x20, 0x31, 0x1e, 0x30, 0x1c, 0x06, 0x03, 0x55, 0x04, 0x03,
+    0x0c, 0x15, 0x41, 0x6c, 0x63, 0x68, 0x65, 0x6d, 0x79, 0x20, 0x4b, 0x65, 0x79, 0x63, 0x68, 0x61, 0x69, 0x6e,
+    0x20, 0x54, 0x65, 0x73, 0x74, 0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+    0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04, 0x18, 0x59, 0x3c, 0xa6,
+    0x92, 0xb3, 0x81, 0x45, 0x28, 0x5b, 0x4d, 0xc7, 0x29, 0x72, 0xa1, 0xb7, 0xf1, 0x25, 0x85, 0x4f, 0xc6, 0xa3,
+    0x78, 0xe5, 0xa3, 0xda, 0x54, 0x97, 0x13, 0x20, 0x0e, 0xbb, 0x30, 0x59, 0x37, 0x61, 0x63, 0x32, 0x38, 0xd3,
+    0x50, 0xb4, 0x6d, 0xd3, 0x7e, 0xb0, 0x30, 0xe8, 0x91, 0xde, 0xbf, 0x2f, 0x47, 0x82, 0x76, 0x60, 0x78, 0xe9,
+    0xf1, 0xa4, 0xe5, 0xf6, 0x26, 0x90, 0xa3, 0x53, 0x30, 0x51, 0x30, 0x1d, 0x06, 0x03, 0x55, 0x1d, 0x0e, 0x04,
+    0x16, 0x04, 0x14, 0x51, 0x0b, 0xd7, 0xe4, 0xb9, 0xbe, 0x7c, 0x5d, 0xed, 0x13, 0x04, 0x11, 0x09, 0x05, 0xa7,
+    0x6b, 0x8c, 0xec, 0x07, 0x54, 0x30, 0x1f, 0x06, 0x03, 0x55, 0x1d, 0x23, 0x04, 0x18, 0x30, 0x16, 0x80, 0x14,
+    0x51, 0x0b, 0xd7, 0xe4, 0xb9, 0xbe, 0x7c, 0x5d, 0xed, 0x13, 0x04, 0x11, 0x09, 0x05, 0xa7, 0x6b, 0x8c, 0xec,
+    0x07, 0x54, 0x30, 0x0f, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff, 0x04, 0x05, 0x30, 0x03, 0x01, 0x01,
+    0xff, 0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02, 0x03, 0x49, 0x00, 0x30, 0x46,
+    0x02, 0x21, 0x00, 0xa9, 0x27, 0xaa, 0x80, 0x6e, 0x33, 0x9e, 0xf3, 0xe1, 0x8b, 0xb7, 0xde, 0xd1, 0xed, 0x25,
+    0xdf, 0x6c, 0xe6, 0x81, 0x57, 0xa6, 0xca, 0x9d, 0xc4, 0xf3, 0x29, 0xba, 0xc1, 0xde, 0x92, 0xc2, 0xf7, 0x02,
+    0x21, 0x00, 0xcb, 0x2a, 0x83, 0x56, 0x8a, 0x67, 0x67, 0xdf, 0xfc, 0x45, 0x27, 0x7c, 0x01, 0x91, 0x2e, 0xbc,
+    0xb1, 0xb7, 0x57, 0x88, 0x10, 0x6a, 0xce, 0x83, 0x6b, 0xe4, 0x20, 0x2b, 0xe3, 0x8f, 0x87, 0xb9,
+};
+constexpr std::uint8_t test_private_key[] = {
+    0x04, 0x18, 0x59, 0x3c, 0xa6, 0x92, 0xb3, 0x81, 0x45, 0x28, 0x5b, 0x4d, 0xc7, 0x29, 0x72, 0xa1, 0xb7, 0xf1,
+    0x25, 0x85, 0x4f, 0xc6, 0xa3, 0x78, 0xe5, 0xa3, 0xda, 0x54, 0x97, 0x13, 0x20, 0x0e, 0xbb, 0x30, 0x59, 0x37,
+    0x61, 0x63, 0x32, 0x38, 0xd3, 0x50, 0xb4, 0x6d, 0xd3, 0x7e, 0xb0, 0x30, 0xe8, 0x91, 0xde, 0xbf, 0x2f, 0x47,
+    0x82, 0x76, 0x60, 0x78, 0xe9, 0xf1, 0xa4, 0xe5, 0xf6, 0x26, 0x90, 0x21, 0x8b, 0xf4, 0xb8, 0x1b, 0x3c, 0xf2,
+    0xda, 0x4d, 0xa3, 0x5e, 0x36, 0x22, 0x5a, 0x97, 0xb3, 0x1b, 0x8c, 0x00, 0x25, 0xc3, 0xac, 0x7b, 0xb2, 0x8a,
+    0xdc, 0x37, 0x92, 0x7b, 0xab, 0x44, 0xab,
+};
+
+// Keys, certificates and identities in the keychain file (keychain.cpp). The fixture is a P-256 key
+// and a self-signed certificate of it ("CN=Alchemy Keychain Test"), made for this test.
+void test_keychain_keys(Fixture& f) {
+    const auto path = std::filesystem::temp_directory_path() / ("alchemy-keychain-keys-" + std::to_string(GetCurrentProcessId()) + ".db");
+    std::filesystem::remove(path);
+    SetEnvironmentVariableW(L"ALCHEMY_KEYCHAIN", path.c_str());
+    const auto k = [&](std::string_view name) { return f.constant(name); };
+    const auto yes = f.cf.boolean(true), no = f.cf.boolean(false);
+    const auto error = f.cell(), out = f.cell(), other = f.cell();
+    const auto key_data = f.data(std::span(test_private_key));
+    const auto key_type = f.dictionary({{k("kSecAttrKeyType"), k("kSecAttrKeyTypeECSECPrimeRandom")}, {k("kSecAttrKeyClass"), k("kSecAttrKeyClassPrivate")}});
+    const auto key = f.s("_SecKeyCreateWithData", {key_data, key_type, error});
+    const auto certificate_data = f.data(std::span(test_certificate_der));
+    const auto certificate = f.s("_SecCertificateCreateWithData", {0, certificate_data});
+    require(key && certificate, "the test key and certificate");
+
+    // 1. A certificate alone is no identity.
+    require(f.status("_SecIdentityCreateWithCertificate", {0, certificate, out}) == sec::status::item_not_found, "no stored key: no identity");
+    const auto add_certificate = f.dictionary({{k("kSecClass"), k("kSecClassCertificate")}, {k("kSecValueRef"), certificate}});
+    require(f.status("_SecItemAdd", {add_certificate, 0}) == 0, "SecItemAdd of a certificate");
+    require(f.status("_SecItemAdd", {add_certificate, 0}) == sec::status::duplicate_item, "the same certificate again");
+    const auto identities = f.dictionary({{k("kSecClass"), k("kSecClassIdentity")}, {k("kSecReturnRef"), yes}});
+    require(f.status("_SecItemCopyMatching", {identities, out}) == sec::status::item_not_found, "a certificate without its key is no identity");
+    const auto certificate_query = f.dictionary({{k("kSecClass"), k("kSecClassCertificate")}, {k("kSecReturnAttributes"), yes}});
+    require(f.status("_SecItemCopyMatching", {certificate_query, out}) == 0, "the certificate is stored");
+    const auto certificate_attributes = f.engine.read64(out);
+    require(f.cf.utf8(f.core("_CFDictionaryGetValue", {certificate_attributes, k("kSecAttrLabel")})) == "Alchemy Keychain Test" &&
+            f.core("_CFDictionaryGetValue", {certificate_attributes, k("kSecAttrPublicKeyHash")}) != 0,
+            "a certificate's label and public key hash");
+
+    // 2. The private key, stored non-extractable: its bytes stay in the keychain, it still signs.
+    const auto add_key = f.dictionary({{k("kSecClass"), k("kSecClassKey")}, {k("kSecValueRef"), key}, {k("kSecAttrLabel"), f.string("Test key")},
+                                       {k("kSecAttrIsExtractable"), no}, {k("kSecReturnRef"), yes}});
+    require(f.status("_SecItemAdd", {add_key, out}) == 0 && f.engine.read64(out), "SecItemAdd of a key, returning its reference");
+    const auto stored_key = f.engine.read64(out);
+    require(f.s("_SecKeyCopyExternalRepresentation", {stored_key, error}) == 0 && f.error_code(f.engine.read64(error)) == sec::status::data_not_available,
+            "a non-extractable key refuses its external representation");
+    const auto message = f.data("keychain message");
+    const auto ecdsa = k("kSecKeyAlgorithmECDSASignatureMessageX962SHA256");
+    const auto signature = f.s("_SecKeyCreateSignature", {stored_key, ecdsa, message, error});
+    const auto public_key = f.s("_SecKeyCopyPublicKey", {key});
+    require(signature && (f.s("_SecKeyVerifySignature", {public_key, ecdsa, message, signature, error}) & 0xff) == 1, "the stored key signs");
+    const auto key_data_query = f.dictionary({{k("kSecClass"), k("kSecClassKey")}, {k("kSecAttrLabel"), f.string("Test key")}, {k("kSecReturnData"), yes}});
+    require(f.status("_SecItemCopyMatching", {key_data_query, out}) == sec::status::data_not_available, "no data for a non-extractable key");
+    const auto key_query = f.dictionary({{k("kSecClass"), k("kSecClassKey")}, {k("kSecAttrKeyClass"), k("kSecAttrKeyClassPrivate")},
+                                         {k("kSecReturnAttributes"), yes}});
+    require(f.status("_SecItemCopyMatching", {key_query, out}) == 0, "the key is found by its class");
+    const auto key_attributes = f.engine.read64(out);
+    require(f.core("_CFDictionaryGetValue", {key_attributes, k("kSecAttrIsExtractable")}) == no &&
+            f.core("_CFDictionaryGetValue", {key_attributes, k("kSecAttrKeyType")}) != 0 &&
+            f.core("_CFEqual", {f.core("_CFDictionaryGetValue", {key_attributes, k("kSecAttrApplicationLabel")}),
+                                f.core("_CFDictionaryGetValue", {certificate_attributes, k("kSecAttrPublicKeyHash")})}) == 1,
+            "a key's attributes (its application label is the certificate's public key hash)");
+    // The file is encrypted: the private scalar does not appear in it.
+    const auto stored = [&] {   // read and closed (an open file would keep the next save from replacing it)
+        std::ifstream file(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    }();
+    const std::string scalar(reinterpret_cast<const char*>(test_private_key) + 65, 32);
+    require(!stored.empty() && stored.find(scalar) == std::string::npos, "the keychain file does not hold the key in the clear");
+
+    // 3. The identity: the certificate with its stored key.
+    require(f.status("_SecIdentityCreateWithCertificate", {0, certificate, out}) == 0, "SecIdentityCreateWithCertificate");
+    const auto identity = f.engine.read64(out);
+    require(f.status("_SecIdentityCopyPrivateKey", {identity, other}) == 0 &&
+            f.s("_SecKeyCopyExternalRepresentation", {f.engine.read64(other), error}) == 0, "the identity's private key (still not extractable)");
+    require(f.status("_SecIdentityCopyCertificate", {identity, other}) == 0 &&
+            f.bytes(f.s("_SecCertificateCopyData", {f.engine.read64(other)})) == Bytes(std::begin(test_certificate_der), std::end(test_certificate_der)),
+            "the identity's certificate");
+    require(f.status("_SecItemCopyMatching", {identities, out}) == 0 && f.engine.read64(out), "SecItemCopyMatching(kSecClassIdentity)");
+    const auto all_identities = f.dictionary({{k("kSecClass"), k("kSecClassIdentity")}, {k("kSecReturnRef"), yes}, {k("kSecMatchLimit"), k("kSecMatchLimitAll")}});
+    require(f.status("_SecItemCopyMatching", {all_identities, out}) == 0 && f.core("_CFArrayGetCount", {f.engine.read64(out)}) == 1, "one identity");
+    const auto by_reference = f.dictionary({{k("kSecValueRef"), identity}, {k("kSecReturnAttributes"), yes}});
+    require(f.status("_SecItemCopyMatching", {by_reference, out}) == 0, "an identity found by its reference");
+
+    // 4. Preferences.
+    const auto name = f.string("https://alchemy.test/");
+    require(f.status("_SecIdentitySetPreferred", {identity, name, 0}) == 0 && f.s("_SecIdentityCopyPreferred", {name, 0, 0}) != 0,
+            "SecIdentitySetPreferred / CopyPreferred");
+    const auto unrelated = f.array({f.data("not an issuer")});
+    require(f.s("_SecIdentityCopyPreferred", {name, 0, unrelated}) == 0, "a preferred identity from another issuer is not offered");
+    require(f.s("_SecIdentityCopyPreferred", {f.string("https://other.test/"), 0, 0}) == 0, "no preference under another name");
+
+    // A keychain identity cannot serve TLS yet (SecureTransport needs a host identity): refused explicitly.
+    const auto context = f.s("_SSLCreateContext", {0, 1, 0});
+    const auto chain = f.array({identity});
+    require(context && f.status("_SSLSetCertificate", {context, chain}) == sec::status::unimplemented, "SSLSetCertificate(keychain identity)");
+    f.release(context);
+
+    // 5. Deleting the identity deletes its certificate and key; the preference then names nothing.
+    const auto delete_identity = f.dictionary({{k("kSecClass"), k("kSecClassIdentity")}, {k("kSecValueRef"), identity}});
+    require(f.status("_SecItemDelete", {delete_identity}) == 0, "SecItemDelete of the identity");
+    require(f.status("_SecItemCopyMatching", {certificate_query, out}) == sec::status::item_not_found &&
+            f.status("_SecItemCopyMatching", {key_query, out}) == sec::status::item_not_found, "its certificate and key are gone");
+    require(f.s("_SecIdentityCopyPreferred", {name, 0, 0}) == 0, "a preference for a deleted identity offers nothing");
+    require(f.status("_SecIdentitySetPreferred", {0, name, 0}) == 0, "removing the preference");
+
+    // 6. SecItemAdd of an identity stores both halves.
+    const auto identity_add = f.dictionary({{k("kSecValueRef"), identity}, {k("kSecReturnRef"), yes}});
+    require(f.status("_SecItemAdd", {identity_add, out}) == 0 && f.engine.read64(out), "SecItemAdd of an identity");
+    require(f.status("_SecItemAdd", {identity_add, out}) == sec::status::duplicate_item, "the same identity again");
+    require(f.status("_SecItemDelete", {delete_identity}) == 0, "and its deletion");
+
+    // 7. Permanent generated keys: both halves are stored with the label.
+    const auto size = f.cf.integer(256, 4);
+    const auto generated_label = f.string("Generated key");
+    const auto parameters = f.dictionary({{k("kSecAttrKeyType"), k("kSecAttrKeyTypeECSECPrimeRandom")}, {k("kSecAttrKeySizeInBits"), size},
+                                          {k("kSecAttrIsPermanent"), yes}, {k("kSecAttrLabel"), generated_label}});
+    const auto generated = f.s("_SecKeyCreateRandomKey", {parameters, error});
+    require(generated && f.core("_CFDictionaryGetValue", {f.s("_SecKeyCopyAttributes", {generated}), k("kSecAttrIsPermanent")}) == yes,
+            "SecKeyCreateRandomKey(kSecAttrIsPermanent)");
+    const auto generated_query = f.dictionary({{k("kSecClass"), k("kSecClassKey")}, {k("kSecAttrLabel"), generated_label},
+                                               {k("kSecReturnRef"), yes}, {k("kSecMatchLimit"), k("kSecMatchLimitAll")}});
+    require(f.status("_SecItemCopyMatching", {generated_query, out}) == 0 && f.core("_CFArrayGetCount", {f.engine.read64(out)}) == 2,
+            "the private and public keys are stored");
+    const auto generated_delete = f.dictionary({{k("kSecClass"), k("kSecClassKey")}, {k("kSecAttrLabel"), generated_label}});
+    require(f.status("_SecItemDelete", {generated_delete}) == 0 && f.status("_SecItemCopyMatching", {generated_query, out}) == sec::status::item_not_found,
+            "deleting them");
+    // Token (Secure Enclave) keys are still refused.
+    const auto token = f.dictionary({{k("kSecAttrKeyType"), k("kSecAttrKeyTypeECSECPrimeRandom")}, {k("kSecAttrKeySizeInBits"), size},
+                                     {k("kSecAttrTokenID"), k("kSecAttrTokenIDSecureEnclave")}});
+    require(f.s("_SecKeyCreateRandomKey", {token, error}) == 0 && f.error_code(f.engine.read64(error)) == sec::status::unimplemented,
+            "Secure Enclave keys are refused");
+
+    SetEnvironmentVariableW(L"ALCHEMY_KEYCHAIN", nullptr);
+    std::filesystem::remove(path);
+}
+
 void test_secure_transport(Fixture& f, Identity& identity) {
     // SSLReadFunc / SSLWriteFunc over a blocking socket (the connection ref is the SOCKET).
     const auto read_function = f.process.install_function("test_ssl_read", [](transmute::CpuState& s, transmute::GuestMemory& m) {
@@ -1193,6 +1356,7 @@ int main() {
         test_keys(fixture, identity);
         test_legacy_keys_and_export(fixture, identity);
         test_keychain(fixture);
+        test_keychain_keys(fixture);
         test_legacy_keychain(fixture);
         test_secure_transport(fixture, identity);
         test_code_signing(fixture);

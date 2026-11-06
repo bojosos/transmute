@@ -3,7 +3,11 @@
 Security.framework, GSS.framework, CommonCrypto and CryptoKit's host core.
 
 - **Covers:** SecCertificate, SecPolicy and SecTrust over the Windows chain
-  engine; SecKey over CNG; SecItem keychain items in a DPAPI-protected file;
+  engine; SecKey over CNG; SecItem keychain items in a DPAPI-protected file
+  (passwords, keys and certificates; identities are a stored certificate
+  with its stored private key, and identity preferences are records of the
+  same file; nothing goes to the Windows certificate store; a
+  non-extractable key never gives up its bytes);
   legacy item access control (SecAccess, SecACL, SecTrustedApplication),
   recorded with the item and reported, never enforced and never prompting;
   SecureTransport (SSLContext) over SChannel; SecRandomCopyBytes;
@@ -13,7 +17,10 @@ Security.framework, GSS.framework, CommonCrypto and CryptoKit's host core.
 - **Host dependencies:** crypt32, ncrypt, secur32 and bcrypt (delay-loaded),
   DPAPI. Phase 2 moves them behind the host `crypto` area.
 - **Unsupported, failing explicitly:** GSS mechanisms (Kerberos, NTLM and
-  SPNEGO answer GSS_S_UNAVAILABLE); code signing, Authorization and
+  SPNEGO answer GSS_S_UNAVAILABLE); a PKCS#12 identity cannot be stored
+  (the host holds its key without export rights) and a keychain identity
+  cannot serve TLS yet (SecureTransport needs a host identity); Secure
+  Enclave keys; code signing, Authorization and
   SecTransform answer honestly that nothing is signed or authorized.
 - **Registration:** `install_security` (install.cpp, one row in
   src/alchemy/gui/install.cpp): Security.framework, then GSS. Security's own CF types answer

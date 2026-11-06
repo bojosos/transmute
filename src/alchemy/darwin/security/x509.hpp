@@ -56,6 +56,7 @@ enum class TrustResult : std::uint32_t { invalid = 0, proceed = 1, deny = 3, uns
 namespace status {
 inline constexpr std::int32_t success = 0, unimplemented = -4, param = -50, allocate = -108, not_available = -25291,
     duplicate_item = -25299, item_not_found = -25300, interaction_not_allowed = -25308, decode = -26275,
+    data_not_available = -25316,
     host_name_mismatch = -67602, invalid_extended_key_usage = -67609, incomplete_revocation = -67635,
     certificate_expired = -67818, certificate_not_yet_valid = -67819, certificate_revoked = -67820,
     not_trusted = -67843, invalid_key_ref = -67712, unsupported_algorithm = -67722, verify_failed = -67808,

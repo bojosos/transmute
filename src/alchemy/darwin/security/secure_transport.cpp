@@ -329,7 +329,11 @@ void install_secure_transport(Security& sec) {
         if (!configurable(st)) return status::param;
         const auto values = s.x[1] ? self->b.cf.array_values(s.x[1]) : std::vector<Address>{};
         if (values.empty()) { self->b.release(std::exchange(st.identity, 0)); return 0; }
-        if (!self->b.objc.find_host_state<IdentityState>(values[0])) return status::param;
+        const auto identity = self->b.objc.find_host_state<IdentityState>(values[0]);
+        if (!identity) return status::param;
+        // A keychain identity holds its key as key material; SChannel needs a host identity
+        // (a certificate with a host key), which only PKCS#12 imports have.
+        if (!identity->identity) return status::unimplemented;
         // Further entries are intermediates; SChannel sends the chain it builds itself.
         self->b.release(std::exchange(st.identity, self->b.retain(values[0])));
         return 0;
@@ -434,9 +438,16 @@ void install_secure_transport(Security& sec) {
         m.write64(s.x[1], self->b.retain(state->certificate));
         s.x[0] = 0;
     });
-    b.function(lib, "_SecIdentityCopyPrivateKey", [](CpuState& s, GuestMemory&) { s.x[0] = status_value(status::unimplemented); });
-    // Private keys are never stored in the keychain, so no certificate has an identity there.
-    b.function(lib, "_SecIdentityCreateWithCertificate", [](CpuState& s, GuestMemory&) { s.x[0] = status_value(status::item_not_found); });
+    // OSStatus SecIdentityCopyPrivateKey(SecIdentityRef, SecKeyRef *): a keychain identity's stored key;
+    // a PKCS#12 import's key is the host's, not available as a SecKey.
+    b.function(lib, "_SecIdentityCopyPrivateKey", [self](CpuState& s, GuestMemory& m) {
+        const auto state = s.x[0] ? self->b.objc.find_host_state<IdentityState>(s.x[0]) : nullptr;
+        if (!state || !s.x[1]) { s.x[0] = status_value(status::param); return; }
+        if (!state->private_key) { s.x[0] = status_value(status::unimplemented); return; }
+        m.write64(s.x[1], self->sec.make_key(state->private_key, state->private_key_extractable, true));
+        s.x[0] = 0;
+    });
+    // SecIdentityCreateWithCertificate: keychain.cpp (the stored private key).
     // OSStatus SecPKCS12Import(CFDataRef, CFDictionaryRef options, CFArrayRef *items)
     b.function(lib, "_SecPKCS12Import", [self](CpuState& s, GuestMemory& m) {
         if (!self->b.is_data(s.x[0]) || !s.x[2]) { s.x[0] = status_value(status::param); return; }

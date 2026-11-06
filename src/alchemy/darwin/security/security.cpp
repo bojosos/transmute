@@ -157,11 +157,13 @@ TrustOutcome Security::evaluate(Address trust) {
     return outcome;
 }
 
-Address Security::make_key(std::shared_ptr<const KeyMaterial> material) {
+Address Security::make_key(std::shared_ptr<const KeyMaterial> material, bool extractable, bool permanent) {
     if (!material) fail("null key");
     const auto object = b->objc.allocate(key_class);
     auto state = std::make_shared<KeyState>();
     state->key = std::move(material);
+    state->extractable = extractable;
+    state->permanent = permanent;
     static_cast<void>(b->objc.host_state<KeyState>(object, [&] { return state; }));
     return object;
 }
@@ -170,6 +172,10 @@ std::shared_ptr<const KeyMaterial> Security::key_of(Address object) const {
     if (!object) return nullptr;
     const auto state = b->objc.find_host_state<KeyState>(object);
     return state ? state->key : nullptr;
+}
+
+std::shared_ptr<const KeyState> Security::key_state(Address object) const {
+    return object ? b->objc.find_host_state<KeyState>(object) : nullptr;
 }
 
 void Security::set_error(Address out, std::int32_t status_code, std::string_view description) {

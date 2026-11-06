@@ -577,7 +577,8 @@ struct Keys {
         sec.set_error(error_out, value.status, value.error);
         return 0;
     }
-    Address attributes(const KeyMaterial& key) {
+    Address attributes(const KeyState& state) {
+        const auto& key = *state.key;
         std::vector<std::pair<Address, Address>> entries;
         std::vector<Address> owned;
         const auto put = [&](std::string_view name, Address value, bool own) {
@@ -588,7 +589,8 @@ struct Keys {
         put("kSecAttrKeyClass", sec.key(key.is_private ? "kSecAttrKeyClassPrivate" : "kSecAttrKeyClassPublic"), false);
         put("kSecAttrKeySizeInBits", b.number(key.bits), true);
         put("kSecAttrEffectiveKeySize", b.number(key.bits), true);
-        put("kSecAttrIsPermanent", b.cf.boolean(false), false);
+        put("kSecAttrIsPermanent", b.cf.boolean(state.permanent), false);
+        put("kSecAttrIsExtractable", b.cf.boolean(state.extractable), false);
         const bool rsa = key.type == KeyMaterial::Type::rsa;
         put("kSecAttrCanEncrypt", b.cf.boolean(rsa && !key.is_private), false);
         put("kSecAttrCanDecrypt", b.cf.boolean(rsa && key.is_private), false);
@@ -596,7 +598,7 @@ struct Keys {
         put("kSecAttrCanVerify", b.cf.boolean(!key.is_private), false);
         put("kSecAttrCanDerive", b.cf.boolean(!rsa && key.is_private), false);
         if (const auto label = digest("SHA1", key.public_external())) put("kSecAttrApplicationLabel", b.data(*label), true);
-        put("kSecValueData", b.data(key.is_private ? key.private_external() : key.public_external()), true);
+        if (state.extractable) put("kSecValueData", b.data(key.is_private ? key.private_external() : key.public_external()), true);
         const auto value = b.dictionary(entries);
         b.release_all(owned);
         return value;
@@ -616,14 +618,33 @@ struct Keys {
         else if (const auto text = b.maybe_text(size)) bits = static_cast<unsigned>(std::stoul(*text));
         return std::make_pair(*kind, bits);
     }
-    // Creating keys in the keychain or in a token (Secure Enclave) is not provided.
+    // Creating keys in a token (Secure Enclave) is not provided; permanent keys go to the keychain.
     std::optional<std::string> unsupported_storage(Address parameters) {
-        if (sec.get_bool(parameters, "kSecAttrIsPermanent")) return "permanent (keychain) keys are not supported";
-        for (const auto* nested : {"kSecPrivateKeyAttrs", "kSecPublicKeyAttrs"})
-            if (const auto inner = sec.get(parameters, nested); inner && b.is_dictionary(inner) && sec.get_bool(inner, "kSecAttrIsPermanent"))
-                return "permanent (keychain) keys are not supported";
         if (sec.get(parameters, "kSecAttrTokenID")) return "token (Secure Enclave) keys are not supported";
         return std::nullopt;
+    }
+    // A key-generation dictionary's nested kSecPrivateKeyAttrs / kSecPublicKeyAttrs (0 when absent).
+    Address nested(Address parameters, const char* name) {
+        const auto inner = sec.get(parameters, name);
+        return inner && b.is_dictionary(inner) ? inner : 0;
+    }
+    // A boolean attribute of one half: its nested dictionary's, else the top level's.
+    bool flag(Address parameters, const char* half, std::string_view name, bool fallback) {
+        if (const auto inner = nested(parameters, half); inner && sec.get(inner, name)) return sec.get_bool(inner, name);
+        return sec.get_bool(parameters, name, fallback);
+    }
+    struct Generated { std::int32_t status{}; bool extractable{true}, permanent{}; };
+    // A generated pair's keychain storage (kSecAttrIsPermanent on either half) and the private key's
+    // extractability. The public key is stored first, so a refused private key leaves only it behind.
+    Generated store_generated(Address parameters, const KeyPtr& key) {
+        Generated out;
+        out.extractable = flag(parameters, "kSecPrivateKeyAttrs", "kSecAttrIsExtractable", true);
+        out.permanent = flag(parameters, "kSecPrivateKeyAttrs", "kSecAttrIsPermanent", false);
+        const bool public_permanent = flag(parameters, "kSecPublicKeyAttrs", "kSecAttrIsPermanent", false);
+        if ((out.permanent || public_permanent) && !sec.store_key) { out.status = status::unimplemented; return out; }
+        if (public_permanent) out.status = sec.store_key(public_key_of(*key), parameters, nested(parameters, "kSecPublicKeyAttrs"));
+        if (!out.status && out.permanent) out.status = sec.store_key(key, parameters, nested(parameters, "kSecPrivateKeyAttrs"));
+        return out;
     }
 
     void add_der(Imported& out, std::span<const std::uint8_t> bytes, std::string_view label) {
@@ -712,6 +733,7 @@ void install_keys(Security& sec) {
         {"kSecAttrKeyTypeECSECPrimeRandom", "73"}, {"kSecAttrKeyClass", "kcls"}, {"kSecAttrKeyClassPublic", "0"},
         {"kSecAttrKeyClassPrivate", "1"}, {"kSecAttrKeyClassSymmetric", "2"}, {"kSecAttrKeySizeInBits", "bsiz"},
         {"kSecAttrEffectiveKeySize", "esiz"}, {"kSecAttrIsPermanent", "perm"}, {"kSecAttrApplicationTag", "atag"},
+        {"kSecAttrIsExtractable", "extr"}, {"kSecAttrIsSensitive", "sens"},
         {"kSecAttrApplicationLabel", "klbl"}, {"kSecAttrCanEncrypt", "encr"}, {"kSecAttrCanDecrypt", "decr"},
         {"kSecAttrCanSign", "sign"}, {"kSecAttrCanVerify", "vrfy"}, {"kSecAttrCanDerive", "drve"},
         {"kSecAttrCanWrap", "wrap"}, {"kSecAttrCanUnwrap", "unwp"}, {"kSecAttrTokenID", "tkid"},
@@ -738,23 +760,38 @@ void install_keys(Security& sec) {
         if (!key) { sec.set_error(s.x[2], status::decode, "the key data is not a valid key of that type"); s.x[0] = 0; return; }
         s.x[0] = sec.make_key(key);
     });
+    // CFDataRef SecKeyCopyExternalRepresentation(SecKeyRef, CFErrorRef *): a non-extractable key
+    // (kSecAttrIsExtractable false) refuses with errSecDataNotAvailable.
     b.function(lib, "_SecKeyCopyExternalRepresentation", [self](CpuState& s, GuestMemory&) {
-        const auto key = self->require_key(s.x[0]);
-        s.x[0] = self->b.data(key->is_private ? key->private_external() : key->public_external());
+        const auto state = self->sec.key_state(s.x[0]);
+        if (!state) fail("expected a SecKeyRef");
+        if (!state->extractable) {
+            self->sec.set_error(s.x[1], status::data_not_available, "the key is not extractable");
+            s.x[0] = 0;
+            return;
+        }
+        const auto& key = *state->key;
+        s.x[0] = self->b.data(key.is_private ? key.private_external() : key.public_external());
     });
     b.function(lib, "_SecKeyCopyPublicKey", [self](CpuState& s, GuestMemory&) {
         const auto key = self->require_key(s.x[0]);
         s.x[0] = self->sec.make_key(key->is_private ? public_key_of(*key) : key);
     });
     b.function(lib, "_SecKeyGetBlockSize", [self](CpuState& s, GuestMemory&) { s.x[0] = self->require_key(s.x[0])->block_size(); });
-    b.function(lib, "_SecKeyCopyAttributes", [self](CpuState& s, GuestMemory&) { s.x[0] = self->attributes(*self->require_key(s.x[0])); });
+    b.function(lib, "_SecKeyCopyAttributes", [self](CpuState& s, GuestMemory&) {
+        const auto state = self->sec.key_state(s.x[0]);
+        if (!state) fail("expected a SecKeyRef");
+        s.x[0] = self->attributes(*state);
+    });
     b.function(lib, "_SecKeyCreateRandomKey", [self](CpuState& s, GuestMemory&) {
         const auto type = self->type_of(s.x[0]);
         if (!type) { self->sec.set_error(s.x[1], status::param, "unsupported key type"); s.x[0] = 0; return; }
         if (const auto why = self->unsupported_storage(s.x[0])) { self->sec.set_error(s.x[1], status::unimplemented, *why); s.x[0] = 0; return; }
         const auto key = generate_key(type->first, type->second);
         if (!key) { self->sec.set_error(s.x[1], status::param, "unsupported key size"); s.x[0] = 0; return; }
-        s.x[0] = self->sec.make_key(key);
+        const auto stored = self->store_generated(s.x[0], key);
+        if (stored.status) { self->sec.set_error(s.x[1], stored.status, "the key could not be stored in the keychain"); s.x[0] = 0; return; }
+        s.x[0] = self->sec.make_key(key, stored.extractable, stored.permanent);
     });
     b.function(lib, "_SecKeyGeneratePair", [self](CpuState& s, GuestMemory& m) {
         const auto type = self->type_of(s.x[0]);
@@ -762,8 +799,11 @@ void install_keys(Security& sec) {
         if (self->unsupported_storage(s.x[0])) { s.x[0] = static_cast<Address>(static_cast<std::int64_t>(status::unimplemented)); return; }
         const auto key = generate_key(type->first, type->second);
         if (!key) { s.x[0] = static_cast<Address>(static_cast<std::int64_t>(status::param)); return; }
-        m.write64(s.x[1], self->sec.make_key(public_key_of(*key)));
-        m.write64(s.x[2], self->sec.make_key(key));
+        const auto stored = self->store_generated(s.x[0], key);
+        if (stored.status) { s.x[0] = static_cast<Address>(static_cast<std::int64_t>(stored.status)); return; }
+        const bool public_permanent = self->flag(s.x[0], "kSecPublicKeyAttrs", "kSecAttrIsPermanent", false);
+        m.write64(s.x[1], self->sec.make_key(public_key_of(*key), true, public_permanent));
+        m.write64(s.x[2], self->sec.make_key(key, stored.extractable, stored.permanent));
         s.x[0] = 0;
     });
     b.function(lib, "_SecKeyIsAlgorithmSupported", [self](CpuState& s, GuestMemory&) {

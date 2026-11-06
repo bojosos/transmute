@@ -1,5 +1,7 @@
 #include "alchemy/darwin/security/security_internal.hpp"
 
+#include "alchemy/darwin/security/keys.hpp"
+
 #include "alchemy/alchemy_root.hpp"
 #include "alchemy/host/crypto.hpp"
 #include "alchemy/host/files.hpp"
@@ -24,9 +26,14 @@
 // with DPAPI for that user: <Alchemy root>/.alchemy/keychain/<user>.alchemy-keychain
 // when an Alchemy root is configured (outside the guest-visible /Applications
 // and /Library), otherwise %LOCALAPPDATA%/Alchemy/keychain/login.alchemy-keychain;
-// ALCHEMY_KEYCHAIN overrides the path. Keys,
-// certificates and identities are not stored: adding them fails with
-// errSecUnimplemented and queries for them find nothing.
+// ALCHEMY_KEYCHAIN overrides the path. Keys and certificates are
+// stored in the same file (nothing goes to the Windows certificate store):
+// a key item holds the SecKey external representation, a certificate item
+// its DER, each with the attributes macOS gives them. An identity is a
+// stored certificate whose public key hash (pkhh) is a stored private key's
+// application label (klbl), as on macOS; kSecAttrIsExtractable false keeps
+// a key's bytes from being returned (errSecDataNotAvailable). Identity
+// preferences (SecIdentitySetPreferred) are records of the same file.
 // Legacy API: generic and internet passwords (add / find with their stack
 // arguments), attribute lists (SecKeychainItemCopyAttributesAndData,
 // CopyContent, ModifyAttributesAndData, CreateFromContent and the Free calls),
@@ -71,6 +78,11 @@ struct Value {
         return false;
     }
 };
+
+Value text_value(std::string text) { Value value; value.kind = Value::Kind::string; value.text = std::move(text); return value; }
+Value data_value(Bytes bytes) { Value value; value.kind = Value::Kind::data; value.bytes = std::move(bytes); return value; }
+Value integer_value(std::int64_t number) { Value value; value.kind = Value::Kind::integer; value.integer = number; return value; }
+Value boolean_value(bool on) { Value value; value.kind = Value::Kind::boolean; value.integer = on ? 1 : 0; return value; }
 
 struct Item {
     std::uint64_t id{};
@@ -399,6 +411,12 @@ std::string legacy_date(double absolute) {
 const std::vector<std::string>& primary_keys(const std::string& cls) {
     static const std::vector<std::string> generic{"acct", "svce", "agrp", "sync"};
     static const std::vector<std::string> internet{"acct", "sdmn", "srvr", "ptcl", "atyp", "port", "path", "agrp", "sync"};
+    static const std::vector<std::string> key{"kcls", "klbl", "atag", "type", "bsiz", "esiz", "agrp"};
+    static const std::vector<std::string> certificate{"ctyp", "issr", "slnr", "agrp"};
+    static const std::vector<std::string> preference{"svce"};
+    if (cls == "keys") return key;
+    if (cls == "cert") return certificate;
+    if (cls == "iprf") return preference;
     return cls == "inet" ? internet : generic;
 }
 
@@ -407,6 +425,7 @@ struct Query {
     std::map<std::string, Value> attributes;
     std::optional<Bytes> secret;
     std::optional<std::uint64_t> persistent;   // v_PersistentRef
+    Address ref{};                             // v_Ref: the item to add, or a match value
     bool sync_any{};
     bool return_data{}, return_attributes{}, return_ref{}, return_persistent{};
     std::optional<bool> limit_all;             // m_Limit
@@ -573,8 +592,7 @@ struct Keychain {
                 if (!id) { query.status = status::param; return query; }
                 query.persistent = *id;
             } else if (name == "v_Ref") {
-                query.status = status::unimplemented;   // item references as match values
-                return query;
+                query.ref = value_object;
             } else if (name == "r_Data") query.return_data = truthy();
             else if (name == "r_Attributes") query.return_attributes = truthy();
             else if (name == "r_Ref") query.return_ref = truthy();
@@ -598,15 +616,246 @@ struct Keychain {
                 query.attributes[name] = std::move(*value);
             }
         }
+        if (query.cls.empty() && query.ref) query.cls = ref_class(query.ref);
         if (query.cls.empty()) query.status = status::param;
         static_cast<void>(for_add);
         return query;
     }
 
+    // ---- keys, certificates and identities ----
+    // A stored key's own attributes: kSecAttrKeyClass and kSecAttrKeyType hold their constants'
+    // values, kSecAttrApplicationLabel the SHA-1 of the public key (as SecKeyCopyAttributes reports).
+    static std::map<std::string, Value> key_attributes(const KeyMaterial& key) {
+        std::map<std::string, Value> out;
+        const bool rsa = key.type == KeyMaterial::Type::rsa;
+        out["kcls"] = text_value(key.is_private ? "1" : "0");
+        out["type"] = text_value(rsa ? "42" : "73");
+        out["bsiz"] = integer_value(key.bits);
+        out["esiz"] = integer_value(key.bits);
+        out["perm"] = boolean_value(true);
+        out["encr"] = boolean_value(rsa && !key.is_private);
+        out["decr"] = boolean_value(rsa && key.is_private);
+        out["sign"] = boolean_value(key.is_private);
+        out["vrfy"] = boolean_value(!key.is_private);
+        out["drve"] = boolean_value(!rsa && key.is_private);
+        if (const auto label = digest("SHA1", key.public_external())) out["klbl"] = data_value(*label);
+        return out;
+    }
+    // A certificate's attributes: CSSM_CERT_X_509v3 (3), CSSM_CERT_ENCODING_DER (3), the DER names
+    // and serial number, and the SHA-1 of the public key (pkhh, its private key's klbl).
+    static std::map<std::string, Value> certificate_attributes(const Certificate& certificate) {
+        std::map<std::string, Value> out;
+        out["ctyp"] = integer_value(3);
+        out["cenc"] = integer_value(3);
+        out["subj"] = data_value(certificate.subject_sequence());
+        out["issr"] = data_value(certificate.issuer_sequence());
+        out["slnr"] = data_value(certificate.serial_number());
+        out["labl"] = text_value(certificate.subject_summary());
+        if (const auto key = key_from_spki(certificate.subject_public_key_info()))
+            if (const auto hash = digest("SHA1", key->public_external())) out["pkhh"] = data_value(*hash);
+        return out;
+    }
+    static bool is_text(const Item& item, const char* name, std::string_view value) {
+        const auto found = item.attributes.find(name);
+        return found != item.attributes.end() && found->second.kind == Value::Kind::string && found->second.text == value;
+    }
+    static bool extractable(const Item& item) {
+        const auto found = item.attributes.find("extr");
+        return found == item.attributes.end() || found->second.integer != 0;
+    }
+    // The key of a key item (nullptr when the stored bytes are not one).
+    static KeyPtr item_key(const Item& item) {
+        const auto type = is_text(item, "type", "42") ? KeyMaterial::Type::rsa : KeyMaterial::Type::ec;
+        return key_from_external(type, is_text(item, "kcls", "1"), item.secret);
+    }
+    // A key item for `key`: the caller's attributes, then the key's own.
+    static Item key_item(const KeyMaterial& key, bool can_extract, std::map<std::string, Value> attributes) {
+        Item item;
+        item.cls = "keys";
+        item.attributes = std::move(attributes);
+        if (const auto found = item.attributes.find("extr"); found != item.attributes.end()) can_extract = found->second.integer != 0;
+        for (auto& [name, value] : key_attributes(key)) item.attributes[name] = std::move(value);
+        item.attributes["extr"] = boolean_value(can_extract);
+        item.secret = key.is_private ? key.private_external() : key.public_external();
+        return item;
+    }
+    // A certificate item: its own attributes, the caller's label (and other attributes) over them.
+    static Item certificate_item(const Certificate& certificate, const std::map<std::string, Value>& attributes) {
+        Item item;
+        item.cls = "cert";
+        item.attributes = certificate_attributes(certificate);
+        for (const auto& [name, value] : attributes)
+            if (name != "ctyp" && name != "cenc" && name != "subj" && name != "issr" && name != "slnr" && name != "pkhh") item.attributes[name] = value;
+        item.secret = certificate.der();
+        return item;
+    }
+    // The stored private key of a certificate item (its klbl is the certificate's pkhh), or nullptr.
+    static const Item* private_key_for(const std::vector<Item>& items, const Item& certificate) {
+        const auto hash = certificate.attributes.find("pkhh");
+        if (hash == certificate.attributes.end()) return nullptr;
+        for (const auto& item : items)
+            if (item.cls == "keys" && is_text(item, "kcls", "1"))
+                if (const auto label = item.attributes.find("klbl"); label != item.attributes.end() && label->second == hash->second) return &item;
+        return nullptr;
+    }
+    // Adds `item` with a fresh id unless it duplicates a stored one.
+    static std::int32_t insert(Store& store, Item& item) {
+        item.id = store.next_id;
+        item.created = item.modified = CoreFoundation::absolute_time_now();
+        for (const auto& other : store.items) if (duplicates(item, other)) return status::duplicate_item;
+        ++store.next_id;
+        store.items.push_back(item);
+        return status::success;
+    }
+
+    // The class of an item reference (kSecValueRef): keys, cert or idnt ("" for anything else).
+    std::string ref_class(Address ref) {
+        if (sec.key_state(ref)) return "keys";
+        if (sec.certificate_of(ref)) return "cert";
+        if (b.objc.find_host_state<IdentityState>(ref)) return "idnt";
+        return {};
+    }
+    // kSecValueRef as a match value: the reference's identifying attributes.
+    std::int32_t match_ref(Query& query) {
+        if (!query.ref) return status::success;
+        if (const auto key = sec.key_state(query.ref)) {
+            auto own = key_attributes(*key->key);
+            query.attributes["kcls"] = own["kcls"];
+            query.attributes["klbl"] = own["klbl"];
+            return query.cls == "keys" ? status::success : status::param;
+        }
+        auto certificate = sec.certificate_of(query.ref);
+        if (const auto identity = certificate ? nullptr : b.objc.find_host_state<IdentityState>(query.ref))
+            certificate = sec.certificate_of(identity->certificate);
+        if (!certificate || (query.cls != "cert" && query.cls != "idnt")) return status::param;
+        query.attributes["issr"] = data_value(certificate->issuer_sequence());
+        query.attributes["slnr"] = data_value(certificate->serial_number());
+        return status::success;
+    }
+    Address key_ref(const Item& item) {
+        const auto key = item_key(item);
+        return key ? sec.make_key(key, extractable(item), true) : 0;
+    }
+    Address certificate_ref(const Item& item) {
+        const auto certificate = Certificate::parse(item.secret);
+        return certificate ? sec.make_certificate(certificate) : 0;
+    }
+    // A +1 SecIdentity of a stored certificate and private key.
+    Address identity_ref(const CertificatePtr& certificate, const Item& key) {
+        const auto material = item_key(key);
+        if (!certificate || !material) return 0;
+        const auto object = b.objc.allocate(sec.identity_class);
+        auto state = std::make_shared<IdentityState>();
+        state->certificate = sec.make_certificate(certificate);
+        state->private_key = material;
+        state->private_key_extractable = extractable(key);
+        static_cast<void>(b.objc.host_state<IdentityState>(object, [&] { return state; }));
+        return object;
+    }
+
+    std::int32_t add_identity(const Query& query, Address result_out) {
+        const auto state = query.ref ? b.objc.find_host_state<IdentityState>(query.ref) : nullptr;
+        if (!state) return status::param;
+        if (!state->private_key) return status::unimplemented;   // a PKCS#12 import: the host holds its key, which cannot be stored
+        const auto certificate = sec.certificate_of(state->certificate);
+        if (!certificate) return status::param;
+        auto certificate_entry = certificate_item(*certificate, query.attributes);
+        auto key_entry = key_item(*state->private_key, state->private_key_extractable, {});
+        std::lock_guard lock(process_mutex);
+        Store store;
+        const auto certificate_status = insert(store, certificate_entry);
+        const auto key_status = insert(store, key_entry);
+        if (certificate_status && key_status) return status::duplicate_item;
+        store.save();
+        if (result_out && returns_anything(query)) {
+            // The stored halves (a half that was already there is the stored one).
+            const auto stored = std::find_if(store.items.begin(), store.items.end(), [&](const Item& item) {
+                return item.cls == "cert" && item.secret == certificate_entry.secret;
+            });
+            const auto stored_key = stored != store.items.end() ? private_key_for(store.items, *stored) : nullptr;
+            const auto result = stored_key ? identity_result(*stored, *stored_key, query) : std::nullopt;
+            b.memory().write64(result_out, result.value_or(0));
+        }
+        return status::success;
+    }
+    bool identity_matches(const Item& certificate, const Item& key, const Query& query) {
+        if (query.persistent && certificate.id != *query.persistent) return false;
+        for (const auto& [name, value] : query.attributes) {
+            const auto mine = certificate.attributes.find(name);
+            if (mine != certificate.attributes.end() && mine->second == value) continue;
+            const auto theirs = key.attributes.find(name);
+            if (theirs != key.attributes.end() && theirs->second == value) continue;
+            return false;
+        }
+        return true;
+    }
+    // One identity result (+1): its reference, the certificate's attributes or persistent reference;
+    // nullopt for data (an identity has none of its own).
+    std::optional<Address> identity_result(const Item& certificate, const Item& key, const Query& query) {
+        if (query.return_data) return std::nullopt;
+        Address ref{};
+        if (query.return_ref) {
+            ref = identity_ref(Certificate::parse(certificate.secret), key);
+            if (!ref) return std::nullopt;
+        }
+        const int kinds = (query.return_ref ? 1 : 0) + (query.return_attributes ? 1 : 0) + (query.return_persistent ? 1 : 0);
+        if (kinds == 1 && query.return_ref) return ref;
+        if (kinds == 1 && query.return_persistent) return b.data(persistent_ref(certificate.id));
+        std::vector<std::pair<Address, Address>> entries;
+        std::vector<Address> owned;
+        const auto put = [&](const std::string& name, Address value) {
+            const auto name_object = b.string(name);
+            owned.push_back(name_object);
+            owned.push_back(value);
+            entries.emplace_back(name_object, value);
+        };
+        if (query.return_attributes) {
+            put("class", b.string("idnt"));
+            for (const auto& [name, value] : certificate.attributes) put(name, object_of(value));
+        }
+        if (ref) put("v_Ref", ref);
+        if (query.return_persistent) put("v_PersistentRef", b.data(persistent_ref(certificate.id)));
+        const auto result = b.dictionary(entries);
+        b.release_all(owned);
+        return result;
+    }
+    std::int32_t copy_identities(const Query& query, Address result_out) {
+        std::vector<std::pair<Item, Item>> found;
+        {
+            std::lock_guard lock(process_mutex);
+            Store store;
+            for (const auto& certificate : store.items) {
+                if (certificate.cls != "cert") continue;
+                const auto key = private_key_for(store.items, certificate);
+                if (!key || !identity_matches(certificate, *key, query)) continue;
+                found.emplace_back(certificate, *key);
+                if (!query.limit_all.value_or(false)) break;
+            }
+        }
+        if (found.empty()) return status::item_not_found;
+        if (!result_out || !returns_anything(query)) return status::success;
+        std::vector<Address> values;
+        for (const auto& [certificate, key] : found) {
+            const auto value = identity_result(certificate, key, query);
+            if (!value) { b.release_all(values); return status::unimplemented; }
+            values.push_back(*value);
+        }
+        if (!query.limit_all.value_or(false)) { b.memory().write64(result_out, values[0]); return status::success; }
+        b.memory().write64(result_out, b.array(values));
+        b.release_all(values);
+        return status::success;
+    }
+
     // One result value per the r_* flags (+1); nullopt when a return type is unsupported.
     std::optional<Address> result_of(const Item& item, const Query& query) {
-        if (query.return_ref) return std::nullopt;
-        const int kinds = (query.return_data ? 1 : 0) + (query.return_attributes ? 1 : 0) + (query.return_persistent ? 1 : 0);
+        Address ref{};
+        if (query.return_ref) {
+            ref = item.cls == "keys" ? key_ref(item) : item.cls == "cert" ? certificate_ref(item) : 0;
+            if (!ref) return std::nullopt;   // passwords have no reference
+        }
+        const int kinds = (query.return_data ? 1 : 0) + (query.return_attributes ? 1 : 0) + (query.return_persistent ? 1 : 0) +
+            (query.return_ref ? 1 : 0);
+        if (kinds == 1 && query.return_ref) return ref;
         if (kinds == 1 && query.return_data) return b.data(item.secret);
         if (kinds == 1 && query.return_persistent) return b.data(persistent_ref(item.id));
         std::vector<std::pair<Address, Address>> entries;
@@ -624,6 +873,7 @@ struct Keychain {
             put("mdat", b.cf.date(item.modified));
         }
         if (query.return_data) put("v_Data", b.data(item.secret));
+        if (ref) put("v_Ref", ref);
         if (query.return_persistent) put("v_PersistentRef", b.data(persistent_ref(item.id)));
         const auto result = b.dictionary(entries);
         b.release_all(owned);
@@ -632,21 +882,52 @@ struct Keychain {
     bool returns_anything(const Query& query) {
         return query.return_data || query.return_attributes || query.return_ref || query.return_persistent;
     }
-    bool supported_class(const std::string& cls) { return cls == "genp" || cls == "inet"; }
+    bool supported_class(const std::string& cls) { return cls == "genp" || cls == "inet" || cls == "keys" || cls == "cert"; }
 
     std::int32_t add(Address attributes, Address result_out) {
         auto query = parse(attributes, true);
         if (query.status) return query.status;
         if (is_locked(keychain_path())) return status::interaction_not_allowed;
-        if (!supported_class(query.cls)) return query.cls == "keys" || query.cls == "cert" || query.cls == "idnt" ? status::unimplemented : status::param;
         if (query.persistent) return status::param;
+        if (query.cls == "idnt") return add_identity(query, result_out);
+        if (!supported_class(query.cls)) return status::param;
+        Item item;
+        if (query.cls == "keys") {
+            // kSecValueRef (a SecKey), or kSecValueData with the key's type and class.
+            KeyPtr key;
+            bool can_extract = true;
+            if (const auto state = query.ref ? sec.key_state(query.ref) : nullptr) {
+                key = state->key;
+                can_extract = state->extractable;
+            } else if (query.ref || !query.secret) {
+                return status::param;
+            } else {
+                const auto type = query.attributes.find("type");
+                const auto cls = query.attributes.find("kcls");
+                const auto is = [](const auto& found, const auto& end, std::string_view text, std::int64_t number) {
+                    return found != end && (found->second.text == text || (found->second.kind == Value::Kind::integer && found->second.integer == number));
+                };
+                const bool rsa = is(type, query.attributes.end(), "42", 42), ec = is(type, query.attributes.end(), "73", 73);
+                const bool is_private = is(cls, query.attributes.end(), "1", 1), is_public = is(cls, query.attributes.end(), "0", 0);
+                if ((!rsa && !ec) || (!is_private && !is_public)) return status::param;
+                key = key_from_external(rsa ? KeyMaterial::Type::rsa : KeyMaterial::Type::ec, is_private, *query.secret);
+                if (!key) return status::decode;
+            }
+            item = key_item(*key, can_extract, query.attributes);
+        } else if (query.cls == "cert") {
+            // kSecValueRef (a SecCertificate) or kSecValueData (its DER).
+            const auto certificate = query.ref ? sec.certificate_of(query.ref) : query.secret ? Certificate::parse(*query.secret) : nullptr;
+            if (!certificate) return query.secret && !query.ref ? status::decode : status::param;
+            item = certificate_item(*certificate, query.attributes);
+        } else {
+            if (query.ref) return status::param;
+            item.cls = query.cls;
+            item.attributes = query.attributes;
+            item.secret = query.secret.value_or(Bytes{});
+        }
         std::lock_guard lock(process_mutex);
         Store store;
-        Item item;
         item.id = store.next_id++;
-        item.cls = query.cls;
-        item.attributes = query.attributes;
-        item.secret = query.secret.value_or(Bytes{});
         item.created = item.modified = CoreFoundation::absolute_time_now();
         for (const auto& other : store.items) if (duplicates(item, other)) return status::duplicate_item;
         std::optional<Address> result;
@@ -664,7 +945,9 @@ struct Keychain {
         auto query = parse(dictionary, false);
         if (query.status) return query.status;
         if (is_locked(keychain_path())) return status::interaction_not_allowed;
-        if (!supported_class(query.cls)) return status::item_not_found;   // no keys / certificates / identities are stored
+        if (const auto error = match_ref(query)) return error;
+        if (query.cls == "idnt") return copy_identities(query, result_out);
+        if (!supported_class(query.cls)) return status::item_not_found;
         std::vector<Item> found;
         {
             std::lock_guard lock(process_mutex);
@@ -678,6 +961,9 @@ struct Keychain {
         }
         if (found.empty()) return status::item_not_found;
         if (!result_out || !returns_anything(query)) return status::success;
+        if (query.return_data)
+            for (const auto& item : found)
+                if (item.cls == "keys" && !extractable(item)) return status::data_not_available;   // kSecAttrIsExtractable false
         if (!query.limit_all.value_or(false)) {
             const auto value = result_of(found[0], query);
             if (!value) return status::unimplemented;
@@ -700,7 +986,10 @@ struct Keychain {
         if (query.status) return query.status;
         auto change = parse_changes(changes);
         if (change.status) return change.status;
+        if (const auto error = match_ref(query)) return error;
+        if (query.cls == "idnt") return status::unimplemented;   // an identity is its certificate and key: update them
         if (!supported_class(query.cls)) return status::item_not_found;
+        if ((query.cls == "keys" || query.cls == "cert") && change.secret) return status::param;   // their bytes are what they are
         std::lock_guard lock(process_mutex);
         Store store;
         bool any = false;
@@ -745,6 +1034,24 @@ struct Keychain {
     std::int32_t remove(Address dictionary) {
         auto query = parse(dictionary, false);
         if (query.status) return query.status;
+        if (const auto error = match_ref(query)) return error;
+        if (query.cls == "idnt") {
+            // An identity goes with its certificate and private key.
+            std::lock_guard lock(process_mutex);
+            Store store;
+            std::set<std::uint64_t> doomed;
+            for (const auto& certificate : store.items) {
+                if (certificate.cls != "cert") continue;
+                const auto key = private_key_for(store.items, certificate);
+                if (!key || !identity_matches(certificate, *key, query)) continue;
+                doomed.insert(certificate.id);
+                doomed.insert(key->id);
+            }
+            if (doomed.empty()) return status::item_not_found;
+            std::erase_if(store.items, [&](const Item& item) { return doomed.contains(item.id); });
+            store.save();
+            return status::success;
+        }
         if (!supported_class(query.cls)) return status::item_not_found;
         std::lock_guard lock(process_mutex);
         Store store;
@@ -999,7 +1306,10 @@ void install_keychain(Security& sec) {
         {"kSecMatchCaseInsensitive", "m_CaseInsensitive"}, {"kSecUseDataProtectionKeychain", "nleg"},
         {"kSecUseKeychain", "u_Keychain"}, {"kSecUseAuthenticationUI", "u_AuthUI"}, {"kSecUseOperationPrompt", "u_OperationPrompt"},
         {"kSecUseAuthenticationUIAllow", "u_AuthUIA"}, {"kSecUseAuthenticationUIFail", "u_AuthUIF"},
-        {"kSecUseAuthenticationUISkip", "u_AuthUIS"}};
+        {"kSecUseAuthenticationUISkip", "u_AuthUIS"},
+        // Certificate attributes (Apple's open-source SecItemConstants values).
+        {"kSecAttrCertificateType", "ctyp"}, {"kSecAttrCertificateEncoding", "cenc"}, {"kSecAttrSubject", "subj"},
+        {"kSecAttrIssuer", "issr"}, {"kSecAttrSerialNumber", "slnr"}, {"kSecAttrPublicKeyHash", "pkhh"}};
     for (const auto& [name, value] : constants) sec.export_constant(name, value);
 
     b.function(lib, "_SecItemAdd", [self](CpuState& s, GuestMemory&) { s.x[0] = status_value(self->add(s.x[0], s.x[1])); });
@@ -1009,6 +1319,93 @@ void install_keychain(Security& sec) {
     });
     b.function(lib, "_SecItemUpdate", [self](CpuState& s, GuestMemory&) { s.x[0] = status_value(self->update(s.x[0], s.x[1])); });
     b.function(lib, "_SecItemDelete", [self](CpuState& s, GuestMemory&) { s.x[0] = status_value(self->remove(s.x[0])); });
+
+    // Keychain storage of generated keys (SecKeyCreateRandomKey / SecKeyGeneratePair with kSecAttrIsPermanent).
+    sec.store_key = [self](const KeyPtr& key, Address parameters, Address nested) -> std::int32_t {
+        if (is_locked(keychain_path())) return status::interaction_not_allowed;
+        constexpr std::pair<const char*, const char*> kept[] = {{"kSecAttrLabel", "labl"}, {"kSecAttrApplicationTag", "atag"},
+            {"kSecAttrIsExtractable", "extr"}, {"kSecAttrIsSensitive", "sens"}, {"kSecAttrAccessGroup", "agrp"}};
+        std::map<std::string, Value> attributes;
+        for (const auto dictionary : {parameters, nested})   // the nested dictionary's last: it wins
+            if (dictionary)
+                for (const auto& [name, tag] : kept)
+                    if (const auto value = self->value_of(self->sec.get(dictionary, name))) attributes[tag] = *value;
+        auto item = Keychain::key_item(*key, true, std::move(attributes));
+        std::lock_guard lock(process_mutex);
+        Store store;
+        if (const auto error = Keychain::insert(store, item)) return error;
+        store.save();
+        return status::success;
+    };
+    // OSStatus SecIdentityCreateWithCertificate(CFTypeRef keychainOrArray, SecCertificateRef, SecIdentityRef *):
+    // the certificate with its stored private key (there is one keychain).
+    b.function(lib, "_SecIdentityCreateWithCertificate", [self](CpuState& s, GuestMemory& m) {
+        const auto certificate = self->sec.certificate_of(s.x[1]);
+        if (!certificate || !s.x[2]) { s.x[0] = status_value(status::param); return; }
+        if (is_locked(keychain_path())) { s.x[0] = status_value(status::interaction_not_allowed); return; }
+        const auto entry = Keychain::certificate_item(*certificate, {});
+        std::lock_guard lock(process_mutex);
+        Store store;
+        const auto key = Keychain::private_key_for(store.items, entry);
+        if (!key) { s.x[0] = status_value(status::item_not_found); return; }
+        m.write64(s.x[2], self->identity_ref(certificate, *key));
+        s.x[0] = 0;
+    });
+    // Identity preferences: a record of the keychain naming the identity's certificate (issuer and
+    // serial number) under `name`; keyUsage is not distinguished.
+    // OSStatus SecIdentitySetPreferred(SecIdentityRef identity, CFStringRef name, CFArrayRef keyUsage): NULL removes it.
+    b.function(lib, "_SecIdentitySetPreferred", [self](CpuState& s, GuestMemory&) {
+        if (!s.x[1] || !self->b.is_string(s.x[1])) { s.x[0] = status_value(status::param); return; }
+        CertificatePtr certificate;
+        if (s.x[0]) {
+            const auto state = self->b.objc.find_host_state<IdentityState>(s.x[0]);
+            certificate = state ? self->sec.certificate_of(state->certificate) : nullptr;
+            if (!certificate) { s.x[0] = status_value(status::param); return; }
+        }
+        if (is_locked(keychain_path())) { s.x[0] = status_value(status::interaction_not_allowed); return; }
+        const auto name = self->b.text(s.x[1]);
+        std::lock_guard lock(process_mutex);
+        Store store;
+        std::erase_if(store.items, [&](const Item& item) { return item.cls == "iprf" && Keychain::is_text(item, "svce", name); });
+        if (certificate) {
+            Item preference;
+            preference.cls = "iprf";
+            preference.attributes["svce"] = text_value(name);
+            preference.attributes["issr"] = data_value(certificate->issuer_sequence());
+            preference.attributes["slnr"] = data_value(certificate->serial_number());
+            if (const auto error = Keychain::insert(store, preference)) { s.x[0] = status_value(error); return; }
+        }
+        store.save();
+        s.x[0] = 0;
+    });
+    // SecIdentityRef SecIdentityCopyPreferred(CFStringRef name, CFArrayRef keyUsage, CFArrayRef validIssuers):
+    // the preferred identity while its certificate and private key are stored (with validIssuers, only when
+    // its issuer's DER name is one of them); NULL otherwise.
+    b.function(lib, "_SecIdentityCopyPreferred", [self](CpuState& s, GuestMemory&) {
+        const auto name_object = s.x[0], issuers = s.x[2];
+        s.x[0] = 0;
+        if (!name_object || !self->b.is_string(name_object) || is_locked(keychain_path())) return;
+        const auto name = self->b.text(name_object);
+        std::lock_guard lock(process_mutex);
+        Store store;
+        const auto preference = std::find_if(store.items.begin(), store.items.end(), [&](const Item& item) {
+            return item.cls == "iprf" && Keychain::is_text(item, "svce", name);
+        });
+        if (preference == store.items.end()) return;
+        const auto certificate = std::find_if(store.items.begin(), store.items.end(), [&](const Item& item) {
+            return item.cls == "cert" && item.attributes.contains("issr") && item.attributes.contains("slnr") &&
+                item.attributes.at("issr") == preference->attributes.at("issr") && item.attributes.at("slnr") == preference->attributes.at("slnr");
+        });
+        if (certificate == store.items.end()) return;
+        const auto key = Keychain::private_key_for(store.items, *certificate);
+        if (!key) return;
+        if (issuers && self->b.is_array(issuers) && !self->b.cf.array_values(issuers).empty()) {
+            const auto& issuer = certificate->attributes.at("issr").bytes;
+            const auto values = self->b.cf.array_values(issuers);
+            if (std::none_of(values.begin(), values.end(), [&](Address value) { return self->b.is_data(value) && self->b.bytes(value) == issuer; })) return;
+        }
+        s.x[0] = self->identity_ref(Certificate::parse(certificate->secret), *key);
+    });
 
     // Legacy keychain API (generic passwords in the one keychain).
     b.function(lib, "_SecKeychainGetTypeID", [](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(TypeId::keychain); });
