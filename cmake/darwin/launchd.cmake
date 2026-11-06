@@ -30,8 +30,8 @@ endif()
 # launchctl end to end: a guest program bootstraps, lists, prints,
 # kickstarts, signals and boots out a job of the session launchd, submits
 # and removes another, and uses the session environment. Run by the process
-# model driver (its job object must be empty afterwards: the session launchd
-# ends with the test's process tree). Registered for after configuration
+# model driver (its job object must be empty soon after the test: the session
+# launchd ends with the test's process tree, at once with LINGER and GRACE 0). Registered for after configuration
 # (alchemy-fx and the process model driver are defined later).
 function(alchemy_launchd_session_tests)
     if(NOT (ALCHEMY_CLANG AND ALCHEMY_LD64_LLD AND macos_dir AND TARGET alchemy_process_model_tests))
@@ -67,10 +67,10 @@ function(alchemy_launchd_session_tests)
     add_dependencies(alchemy_process_model_tests alchemy_launchd_fixtures)
     add_test(NAME alchemy_launchd_session_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${macos_dir}/launchd_model" launchctl mach sockets xpc)
     set_tests_properties(alchemy_launchd_session_fx PROPERTIES TIMEOUT 600
-        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback")
+        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0")
     # Bundled XPC services: the model run from inside its application bundle.
     add_test(NAME alchemy_launchd_xpc_bundle_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${app}/MacOS/launchd_model" xpc-bundle)
     set_tests_properties(alchemy_launchd_xpc_bundle_fx PROPERTIES TIMEOUT 600
-        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback")
+        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0")
 endfunction()
 alchemy_gui_register_tests(alchemy_launchd_session_tests)
