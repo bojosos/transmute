@@ -49,9 +49,15 @@ $current = $null
 foreach ($line in $listing) {
     if ($line.StartsWith('Path = ')) {
         if ($current) { $entries.Add([pscustomobject]$current) }
-        $current = @{ Path = $line.Substring(7); Folder = $false; Mode = '' }
+        $current = @{ Path = $line.Substring(7); Folder = $false; Mode = ''; Target = '' }
     } elseif ($current -and $line -eq 'Folder = +') { $current.Folder = $true }
-    elseif ($current -and $line.StartsWith('Mode = ')) { $current.Mode = $line.Substring(7) }
+    elseif ($current -and $line.StartsWith('Mode = ')) {
+        $current.Mode = $line.Substring(7)
+        # An APFS image's records have no Folder line; the mode says it.
+        if ($current.Mode.StartsWith('d')) { $current.Folder = $true }
+    }
+    # APFS records also carry a link's target text.
+    elseif ($current -and $line.StartsWith('Symbolic Link = ')) { $current.Target = $line.Substring(16) }
     # A zip lists the Unix mode after the DOS attribute letters: "Attributes = D drwxr-xr-x".
     elseif ($current -and -not $current.Mode -and $line -match '^Attributes = .*?([-dlbcps][-rwxsStT]{9})$') { $current.Mode = $Matches[1] }
 }
@@ -60,9 +66,11 @@ if ($current) { $entries.Add([pscustomobject]$current) }
 $entries = @($entries | Where-Object { $_.Path -and $_.Path -ne $dmgPath -and $_.Path -notmatch '\.(dmg|hfs|apfs)$' })
 
 # 2. Select the bundle: a top-level .app folder of the volume (of the archive, for a zip).
+# 7-Zip lists an HFS+ image's files under the volume's folder, but an APFS
+# image's (after its "<n>.apfs" container record) at the top level.
 $isZip = [IO.Path]::GetExtension($dmgPath) -ieq '.zip'
-$appPattern = if ($isZip) { '^[^\\]+\.app$' } else { '^[^\\]+\\[^\\]+\.app$' }
-$apps = @($entries | Where-Object { $_.Folder -and $_.Path -match $appPattern })
+$apps = @($entries | Where-Object { $_.Folder -and $_.Path -match '^[^\\]+\.app$' })
+if (-not $isZip -and -not $apps.Count) { $apps = @($entries | Where-Object { $_.Folder -and $_.Path -match '^[^\\]+\\[^\\]+\.app$' }) }
 if ($App) { $apps = @($apps | Where-Object { (Split-Path $_.Path -Leaf) -ieq $App -or (Split-Path $_.Path -Leaf) -ieq "$App.app" }) }
 if ($apps.Count -ne 1) {
     throw "expected exactly one top-level .app in the image, found: " + (($apps | ForEach-Object Path) -join ', ') + " (use -App)"
@@ -88,9 +96,16 @@ try {
     $records.Add("# links recovered from $(Split-Path $dmgPath -Leaf) by alchemy_install_dmg.ps1")
     $targetFile = Join-Path $Staging 'target.bin'
     foreach ($link in $links) {
-        cmd /c "`"$SevenZip`" x -so -- `"$dmgPath`" `"$($link.Path)`" > `"$targetFile`" 2>nul"
-        if ($LASTEXITCODE -ne 0) { throw "cannot read link target of $($link.Path) (exit $LASTEXITCODE)" }
-        $target = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($targetFile))
+        $target = $link.Target
+        if (-not $target) {
+            cmd /c "`"$SevenZip`" x -so -- `"$dmgPath`" `"$($link.Path)`" > `"$targetFile`" 2>nul"
+            if ($LASTEXITCODE -ne 0) { throw "cannot read link target of $($link.Path) (exit $LASTEXITCODE)" }
+            # The extracted data can be padded past the target text: it ends at the first NUL.
+            $bytes = [IO.File]::ReadAllBytes($targetFile)
+            $end = [Array]::IndexOf($bytes, [byte]0)
+            if ($end -lt 0) { $end = $bytes.Length }
+            $target = [Text.Encoding]::UTF8.GetString($bytes, 0, $end)
+        }
         if (-not $target -or $target.Contains("`n") -or $target.Contains("`t")) { throw "unsupported link target for $($link.Path)" }
         $relative = $link.Path.Substring($prefix.Length).Replace('\', '/')
         $records.Add("$relative`t$target")
