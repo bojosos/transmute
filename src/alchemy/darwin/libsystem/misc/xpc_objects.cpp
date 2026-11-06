@@ -1,3 +1,4 @@
+#include "alchemy/darwin/libsystem/misc/xpc_internal.hpp"
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
 #include "alchemy/darwin/libsystem/install.hpp"
@@ -25,232 +26,14 @@
 // XPC_TYPE_* descriptors are those classes. Values are retained by the containers that hold
 // them, and returned borrowed by the getters, as in libxpc.
 //
-// Connections: no launchd runs under Alchemy, so no named or anonymous XPC service can be
-// reached. A connection behaves as one whose service does not exist: once resumed, its event
-// handler receives XPC_ERROR_CONNECTION_INVALID; messages are discarded; replies are
-// XPC_ERROR_CONNECTION_INVALID (asynchronously, or returned by _sync); cancelling delivers
-// XPC_ERROR_CONNECTION_INVALID last. xpc_main stops (no process here is launched as an XPC
-// service). Shared memory objects name guest memory, which every thread of the process
-// already shares, so mapping one returns its own region. Activities are kept by launchd, which
+// Connections, endpoints, replies and xpc_main are darwin/launchd/xpc_connections.cpp (the
+// internals both files share: xpc_internal.hpp). Shared memory objects name guest memory,
+// which every thread of the process already shares, so mapping one returns its own region. Activities are kept by launchd, which
 // is not there to run them: registering one succeeds and its handler never runs.
 namespace alchemy::export_fill {
-namespace {
 
-enum class Type : unsigned {
-    dictionary, array, string, int64, uint64, boolean, double_value, date, data, uuid, fd, null, error, connection, endpoint, shmem, mach_send, count
-};
-constexpr std::array<const char*, static_cast<std::size_t>(Type::count)> type_names{
-    "dictionary", "array", "string", "int64", "uint64", "bool", "double", "date", "data", "uuid", "fd", "null", "error", "connection", "endpoint", "shmem", "mach_send"};
+using namespace xpc_detail;
 
-struct Value : ObjectPayload {
-    Type type{};
-    std::mutex mutex;
-    std::vector<std::pair<std::string, std::uint64_t>> entries;   // dictionary and error: key -> retained value, in insertion order
-    std::vector<std::uint64_t> items;                              // array: retained values
-    std::string text;                                              // string, connection name
-    std::uint64_t guest{};                                         // guest copy of the string, data or UUID bytes
-    std::int64_t integer{};                                        // int64, uint64, bool, date, fd
-    double real{};
-    std::vector<std::uint8_t> bytes;                               // data, uuid
-    // connection
-    std::uint64_t handler{}, queue{}, context{}, finalizer{};
-    bool resumed{}, cancelled{}, invalidated{};
-    std::uint64_t connection{};                                    // endpoint: its connection (retained)
-    std::uint64_t region{}, length{};                              // shmem: the guest region it names
-};
-
-struct Xpc {
-    explicit Xpc(Provider& provider, ObjcRuntime& runtime) : p(provider), objc(runtime) {}
-    Provider p;
-    ObjcRuntime& objc;
-    std::array<std::uint64_t, static_cast<std::size_t>(Type::count)> classes{}, names{};
-    std::uint64_t root{}, bool_true{}, bool_false{}, connection_invalid{}, connection_interrupted{}, termination_imminent{};
-    std::uint64_t deliver_entry{};
-    std::mutex mutex;
-    struct Delivery { std::uint64_t block{}, argument{}, connection{}; };
-    std::map<std::uint64_t, Delivery> deliveries;
-    std::uint64_t next_delivery{1};
-
-    ProcessContext& process() { return p.process(); }
-    GuestMemory& memory() { return process().calling_engine(); }
-    std::shared_ptr<Value> value(std::uint64_t object) {
-        if (!object) return nullptr;
-        const auto record = process().objects().find(object);
-        return record ? std::dynamic_pointer_cast<Value>(record->payload) : nullptr;
-    }
-    std::shared_ptr<Value> typed(std::uint64_t object, Type type) {
-        const auto found = value(object);
-        return found && found->type == type ? found : nullptr;
-    }
-    std::uint64_t retain(std::uint64_t object) { return object ? process().objects().retain(object) : 0; }
-    void release(std::uint64_t object) { if (object) process().objects().release(object); }
-    std::uint64_t guest_copy(std::span<const std::uint8_t> bytes, bool terminate) {
-        const auto address = process().allocate_guest(bytes.size() + (terminate ? 1 : 0) + 1);
-        if (!bytes.empty()) memory().write_bytes(address, bytes);
-        if (terminate) memory().write8(address + bytes.size(), 0);
-        return address;
-    }
-    // A new object of `type` (+1). Its destruction releases what it holds.
-    std::uint64_t make(Type type, const std::function<void(Value&)>& fill = {}, bool immortal = false) {
-        auto payload = std::make_shared<Value>();
-        payload->type = type;
-        if (fill) fill(*payload);
-        if (type == Type::string || type == Type::data || type == Type::uuid) {
-            const auto& source = type == Type::string ? std::vector<std::uint8_t>(payload->text.begin(), payload->text.end()) : payload->bytes;
-            payload->guest = guest_copy(source, type == Type::string);
-        }
-        return process().objects().create(16, classes[static_cast<std::size_t>(type)], ObjectKind::instance, payload,
-            [this, held = payload](std::uint64_t) {
-                for (const auto& [key, item] : held->entries) { static_cast<void>(key); release(item); }
-                for (const auto item : held->items) release(item);
-                if (held->type == Type::fd && held->integer >= 0) static_cast<void>(p.call(libsystem_library, "_close", {static_cast<std::uint64_t>(held->integer)}));
-                if (held->type == Type::connection) {
-                    if (held->finalizer) static_cast<void>(EngineAdapter(process().calling_engine()).call(held->finalizer, std::array<std::uint64_t, 1>{held->context}));
-                    if (held->handler) static_cast<void>(p.call(libsystem_library, "__Block_release", {held->handler}));
-                    if (held->queue) static_cast<void>(p.call(libsystem_library, "_dispatch_release", {held->queue}));
-                }
-                if (held->type == Type::endpoint) release(held->connection);
-                if (held->guest) process().release_guest(held->guest);
-            }, immortal);
-    }
-    std::uint64_t string_object(const std::string& text) { return make(Type::string, [&](Value& v) { v.text = text; }); }
-    // Dictionary access (key order kept for xpc_dictionary_apply).
-    std::uint64_t get(std::uint64_t dictionary, const std::string& key) {
-        const auto found = value(dictionary);
-        if (!found || (found->type != Type::dictionary && found->type != Type::error)) return 0;
-        std::lock_guard lock(found->mutex);
-        for (const auto& [name, item] : found->entries) if (name == key) return item;
-        return 0;
-    }
-    void set(std::uint64_t dictionary, const std::string& key, std::uint64_t item, bool retained) {
-        const auto found = typed(dictionary, Type::dictionary);
-        if (!found) throw std::runtime_error("Alchemy XPC: a dictionary function on an object that is not an XPC dictionary");
-        if (item && !retained) item = retain(item);
-        std::uint64_t old{};
-        {
-            std::lock_guard lock(found->mutex);
-            const auto at = std::find_if(found->entries.begin(), found->entries.end(), [&](const auto& entry) { return entry.first == key; });
-            if (at != found->entries.end()) {
-                old = at->second;
-                if (item) at->second = item; else found->entries.erase(at);
-            } else if (item) found->entries.emplace_back(key, item);
-        }
-        release(old);
-    }
-    std::uint64_t at(std::uint64_t array, std::uint64_t index) {
-        const auto found = typed(array, Type::array);
-        if (!found) return 0;
-        std::lock_guard lock(found->mutex);
-        return index < found->items.size() ? found->items[static_cast<std::size_t>(index)] : 0;
-    }
-    // index SIZE_MAX (XPC_ARRAY_APPEND) appends.
-    void put(std::uint64_t array, std::uint64_t index, std::uint64_t item, bool retained) {
-        const auto found = typed(array, Type::array);
-        if (!found) throw std::runtime_error("Alchemy XPC: an array function on an object that is not an XPC array");
-        if (!item) throw std::runtime_error("Alchemy XPC: a NULL value for an XPC array");
-        if (!retained) item = retain(item);
-        std::uint64_t old{};
-        {
-            std::lock_guard lock(found->mutex);
-            if (index == UINT64_MAX) found->items.push_back(item);
-            else if (index < found->items.size()) old = std::exchange(found->items[static_cast<std::size_t>(index)], item);
-            else { release(item); throw std::runtime_error("Alchemy XPC: an array index past the end"); }
-        }
-        release(old);
-    }
-    std::uint64_t error(const std::string& description) {
-        const auto text = string_object(description);
-        return make(Type::error, [&](Value& v) { v.entries.emplace_back("XPCErrorDescription", text); }, true);
-    }
-    // Calls `block(argument)` on `queue` (the default global queue when 0), retaining the
-    // argument and the block until it ran.
-    void deliver(std::uint64_t queue, std::uint64_t block, std::uint64_t argument) {
-        if (!block) return;
-        const auto copy = p.call(libsystem_library, "__Block_copy", {block});
-        std::uint64_t id;
-        { std::lock_guard lock(mutex); id = next_delivery++; deliveries[id] = Delivery{copy, retain(argument)}; }
-        const auto target = queue ? queue : p.call(libsystem_library, "_dispatch_get_global_queue", {0, 0});
-        static_cast<void>(p.call(libsystem_library, "_dispatch_async_f", {target, id, deliver_entry}));
-    }
-    std::string describe(std::uint64_t object, unsigned depth = 0) {
-        const auto found = value(object);
-        if (!found) return "<invalid>";
-        std::unique_lock lock(found->mutex);
-        char buffer[64];
-        switch (found->type) {
-        case Type::string: return "<string: \"" + found->text + "\">";
-        case Type::int64: std::snprintf(buffer, sizeof buffer, "<int64: %lld>", static_cast<long long>(found->integer)); return buffer;
-        case Type::uint64: std::snprintf(buffer, sizeof buffer, "<uint64: %llu>", static_cast<unsigned long long>(found->integer)); return buffer;
-        case Type::boolean: return found->integer ? "<bool: true>" : "<bool: false>";
-        case Type::double_value: std::snprintf(buffer, sizeof buffer, "<double: %g>", found->real); return buffer;
-        case Type::date: std::snprintf(buffer, sizeof buffer, "<date: %lld>", static_cast<long long>(found->integer)); return buffer;
-        case Type::data: return "<data: { length = " + std::to_string(found->bytes.size()) + " bytes }>";
-        case Type::null: return "<null>";
-        case Type::fd: return "<fd: " + std::to_string(found->integer) + ">";
-        case Type::connection: return "<connection: { name = " + found->text + " }>";
-        default: break;
-        }
-        if (depth > 16) return "<...>";
-        std::string text = found->type == Type::array ? "<array: { count = " + std::to_string(found->items.size()) + ", contents =" :
-            "<" + std::string(type_names[static_cast<std::size_t>(found->type)]) + ": { count = " + std::to_string(found->entries.size()) + ", contents =";
-        // Children are described without this object's lock.
-        const auto entries = found->entries;
-        const auto items = found->items;
-        lock.unlock();
-        for (const auto& [key, item] : entries) text += "\n\t\"" + key + "\" => " + describe(item, depth + 1);
-        for (std::size_t index = 0; index < items.size(); ++index) text += "\n\t" + std::to_string(index) + ": " + describe(items[index], depth + 1);
-        return text + "\n}>";
-    }
-    std::uint64_t copy(std::uint64_t object) {
-        const auto found = value(object);
-        if (!found) return 0;
-        if (found->type == Type::boolean || found->type == Type::error || found->type == Type::null) return retain(object);
-        if (found->type == Type::connection || found->type == Type::endpoint) return retain(object);
-        std::vector<std::pair<std::string, std::uint64_t>> entries;
-        std::vector<std::uint64_t> items;
-        Value scalar;
-        {
-            std::lock_guard lock(found->mutex);
-            entries = found->entries; items = found->items;
-            scalar.text = found->text; scalar.integer = found->integer; scalar.real = found->real; scalar.bytes = found->bytes;
-        }
-        for (auto& [key, item] : entries) { static_cast<void>(key); item = copy(item); }
-        for (auto& item : items) item = copy(item);
-        if (found->type == Type::fd) {
-            const auto duplicate = static_cast<std::int32_t>(p.call(libsystem_library, "_dup", {static_cast<std::uint64_t>(scalar.integer)}));
-            if (duplicate < 0) return 0;
-            scalar.integer = duplicate;
-        }
-        return make(found->type, [&](Value& v) {
-            v.entries = std::move(entries); v.items = std::move(items);
-            v.text = scalar.text; v.integer = scalar.integer; v.real = scalar.real; v.bytes = scalar.bytes;
-        });
-    }
-    bool equal(std::uint64_t left, std::uint64_t right) {
-        if (left == right) return true;
-        const auto a = value(left), b = value(right);
-        if (!a || !b || a->type != b->type) return false;
-        std::vector<std::pair<std::string, std::uint64_t>> ea, eb;
-        std::vector<std::uint64_t> ia, ib;
-        {
-            std::scoped_lock lock(a->mutex, b->mutex);
-            if (a->text != b->text || a->integer != b->integer || a->bytes != b->bytes ||
-                std::memcmp(&a->real, &b->real, sizeof a->real) != 0) return false;
-            if (a->entries.size() != b->entries.size() || a->items.size() != b->items.size()) return false;
-            ea = a->entries; eb = b->entries; ia = a->items; ib = b->items;
-        }
-        for (const auto& [key, item] : ea) {
-            const auto other = std::find_if(eb.begin(), eb.end(), [&](const auto& entry) { return entry.first == key; });
-            if (other == eb.end() || !equal(item, other->second)) return false;
-        }
-        for (std::size_t index = 0; index < ia.size(); ++index) if (!equal(ia[index], ib[index])) return false;
-        return true;
-    }
-};
-
-std::string read_text(GuestMemory& m, std::uint64_t address) { return guest_string(m, address, 1 << 20); }
-
-} // namespace
 
 void install_libsystem_xpc(Provider& p, ObjcRuntime& objc) {
     const auto xpc = std::make_shared<Xpc>(p, objc);
@@ -433,9 +216,6 @@ void install_libsystem_xpc(Provider& p, ObjcRuntime& objc) {
         return dictionary;
     }, 0);
     p.libsystem("_xpc_dictionary_create_empty", [xpc](CpuState&, GuestMemory&) -> std::uint64_t { return xpc->make(Type::dictionary); }, 0);
-    // Only a message received from a connection has a reply; none ever arrives here.
-    p.libsystem("_xpc_dictionary_create_reply", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; }, 0);
-    p.libsystem("_xpc_dictionary_get_remote_connection", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; }, 0);
     p.libsystem("_xpc_dictionary_set_value", [xpc](CpuState& s, GuestMemory& m) -> std::uint64_t {
         xpc->set(s.x[0], read_text(m, s.x[1]), s.x[2], false); return 0;
     });
@@ -599,140 +379,8 @@ void install_libsystem_xpc(Provider& p, ObjcRuntime& objc) {
             return xpc->typed(item, type) ? item : 0;
         }, 0);
 
-    // ---- connections (no service is reachable) ----
-    const auto make_connection = [xpc](GuestMemory& m, std::uint64_t name, std::uint64_t queue) {
-        const auto text = name ? read_text(m, name) : std::string("anonymous");
-        if (queue) static_cast<void>(xpc->p.call(libsystem_library, "_dispatch_retain", {queue}));
-        return xpc->make(Type::connection, [&](Value& v) { v.text = text; v.queue = queue; });
-    };
-    p.libsystem("_xpc_connection_create", [make_connection](CpuState& s, GuestMemory& m) -> std::uint64_t { return make_connection(m, s.x[0], s.x[1]); }, 0);
-    p.libsystem("_xpc_connection_create_mach_service", [make_connection](CpuState& s, GuestMemory& m) -> std::uint64_t {
-        return make_connection(m, s.x[0], s.x[1]);
-    }, 0);
-    p.libsystem("_xpc_connection_create_from_endpoint", [xpc, make_connection](CpuState& s, GuestMemory& m) -> std::uint64_t {
-        const auto endpoint = xpc->typed(s.x[0], Type::endpoint);
-        if (!endpoint) return 0;
-        const auto target = xpc->typed(endpoint->connection, Type::connection);
-        const auto name = xpc->process().allocate_guest(256);
-        put_string(m, name, target ? target->text : std::string("endpoint"));
-        const auto result = make_connection(m, name, 0);
-        xpc->process().release_guest(name);
-        return result;
-    }, 0);
-    const auto connection_of = [xpc](std::uint64_t object) {
-        const auto found = xpc->typed(object, Type::connection);
-        if (!found) throw std::runtime_error("Alchemy XPC: a connection function on an object that is not an XPC connection");
-        return found;
-    };
-    // Once resumed (or activated), the connection's handler learns the service is not there.
-    const auto invalidate = [xpc, connection_of](std::uint64_t object) {
-        const auto found = connection_of(object);
-        std::uint64_t handler{}, queue{};
-        {
-            std::lock_guard lock(found->mutex);
-            if (found->invalidated || !found->resumed) return;
-            found->invalidated = true;
-            handler = found->handler; queue = found->queue;
-        }
-        xpc->deliver(queue, handler, xpc->connection_invalid);
-    };
-    p.libsystem("_xpc_connection_set_event_handler", [xpc, connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        const auto found = connection_of(s.x[0]);
-        const auto copy = s.x[1] ? xpc->p.call(libsystem_library, "__Block_copy", {s.x[1]}) : 0;
-        std::uint64_t old;
-        { std::lock_guard lock(found->mutex); old = std::exchange(found->handler, copy); }
-        if (old) static_cast<void>(xpc->p.call(libsystem_library, "__Block_release", {old}));
-        return 0;
-    });
-    p.libsystem("_xpc_connection_set_target_queue", [xpc, connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        const auto found = connection_of(s.x[0]);
-        if (s.x[1]) static_cast<void>(xpc->p.call(libsystem_library, "_dispatch_retain", {s.x[1]}));
-        std::uint64_t old;
-        { std::lock_guard lock(found->mutex); old = std::exchange(found->queue, s.x[1]); }
-        if (old) static_cast<void>(xpc->p.call(libsystem_library, "_dispatch_release", {old}));
-        return 0;
-    });
-    for (const auto* name : {"_xpc_connection_resume", "_xpc_connection_activate"})
-        p.libsystem(name, [connection_of, invalidate](CpuState& s, GuestMemory&) -> std::uint64_t {
-            const auto found = connection_of(s.x[0]);
-            { std::lock_guard lock(found->mutex); found->resumed = true; }
-            invalidate(s.x[0]);
-            return 0;
-        });
-    p.libsystem("_xpc_connection_suspend", [connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        static_cast<void>(connection_of(s.x[0])); return 0;
-    });
-    p.libsystem("_xpc_connection_cancel", [connection_of, invalidate](CpuState& s, GuestMemory&) -> std::uint64_t {
-        const auto found = connection_of(s.x[0]);
-        { std::lock_guard lock(found->mutex); found->cancelled = true; found->resumed = true; }
-        invalidate(s.x[0]);
-        return 0;
-    });
-    // Messages to a connection whose service does not exist are discarded.
-    p.libsystem("_xpc_connection_send_message", [connection_of](CpuState& s, GuestMemory&) -> std::uint64_t { static_cast<void>(connection_of(s.x[0])); return 0; });
-    p.libsystem("_xpc_connection_send_message_with_reply", [xpc, connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        static_cast<void>(connection_of(s.x[0]));
-        xpc->deliver(s.x[2], s.x[3], xpc->connection_invalid);
-        return 0;
-    });
-    p.libsystem("_xpc_connection_send_message_with_reply_sync", [xpc, connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        static_cast<void>(connection_of(s.x[0]));
-        return xpc->retain(xpc->connection_invalid);
-    }, 0);
-    p.libsystem("_xpc_connection_send_barrier", [xpc, connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        const auto found = connection_of(s.x[0]);
-        std::uint64_t queue;
-        { std::lock_guard lock(found->mutex); queue = found->queue; }
-        if (s.x[1]) {
-            // dispatch_block_t: no argument; deliver passes one, which the block ignores.
-            xpc->deliver(queue, s.x[1], 0);
-        }
-        return 0;
-    });
-    p.libsystem("_xpc_connection_get_name", [xpc, connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        const auto found = connection_of(s.x[0]);
-        std::lock_guard lock(found->mutex);
-        if (!found->guest) found->guest = xpc->guest_copy(std::span(reinterpret_cast<const std::uint8_t*>(found->text.data()), found->text.size()), true);
-        return found->guest;
-    }, 0);
-    // No peer: pid, uid, gid and audit session are 0.
-    for (const auto* name : {"_xpc_connection_get_pid", "_xpc_connection_get_euid", "_xpc_connection_get_egid", "_xpc_connection_get_asid"})
-        p.libsystem(name, [connection_of](CpuState& s, GuestMemory&) -> std::uint64_t { static_cast<void>(connection_of(s.x[0])); return 0; });
-    p.libsystem("_xpc_connection_set_context", [connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        const auto found = connection_of(s.x[0]); std::lock_guard lock(found->mutex); found->context = s.x[1]; return 0;
-    });
-    p.libsystem("_xpc_connection_get_context", [connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        const auto found = connection_of(s.x[0]); std::lock_guard lock(found->mutex); return found->context;
-    }, 0);
-    p.libsystem("_xpc_connection_set_finalizer_f", [connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        const auto found = connection_of(s.x[0]); std::lock_guard lock(found->mutex); found->finalizer = s.x[1]; return 0;
-    });
-    // int xpc_connection_set_peer_code_signing_requirement(connection, const char*): the requirement is
-    // kept (no peer ever connects to be checked).
-    p.libsystem("_xpc_connection_set_peer_code_signing_requirement", [connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        static_cast<void>(connection_of(s.x[0])); return 0;
-    });
-    p.libsystem("_xpc_endpoint_create", [xpc, connection_of](CpuState& s, GuestMemory&) -> std::uint64_t {
-        static_cast<void>(connection_of(s.x[0]));
-        const auto connection = xpc->retain(s.x[0]);
-        return xpc->make(Type::endpoint, [&](Value& v) { v.connection = connection; });
-    }, 0);
-    // xpc_connection_get_audit_token(connection, audit_token_t*): no peer, an all-zero token.
-    p.libsystem("_xpc_connection_get_audit_token", [connection_of](CpuState& s, GuestMemory& m) -> std::uint64_t {
-        static_cast<void>(connection_of(s.x[0]));
-        if (s.x[1]) m.write_bytes(s.x[1], std::array<std::uint8_t, 32>{});
-        return 0;
-    });
-    // Connections stored in dictionaries (only XPC messages carry them between processes).
-    p.libsystem("_xpc_dictionary_set_connection", [xpc, connection_of](CpuState& s, GuestMemory& m) -> std::uint64_t {
-        static_cast<void>(connection_of(s.x[2]));
-        xpc->set(s.x[0], read_text(m, s.x[1]), s.x[2], false);
-        return 0;
-    });
-    p.libsystem("_xpc_dictionary_create_connection", [xpc](CpuState& s, GuestMemory& m) -> std::uint64_t {
-        const auto item = xpc->get(s.x[0], read_text(m, s.x[1]));
-        return xpc->typed(item, Type::connection) ? xpc->retain(item) : 0;
-    }, 0);
+    // Connections, endpoints, replies, xpc_main and transactions: darwin/launchd/xpc_connections.cpp.
+    xpc_detail::install_xpc_connections(p, xpc);
     // Mach send rights in dictionaries: the port name is kept and handed back.
     p.libsystem("_xpc_dictionary_set_mach_send", [xpc](CpuState& s, GuestMemory& m) -> std::uint64_t {
         xpc->set(s.x[0], read_text(m, s.x[1]), xpc->make(Type::mach_send, [&](Value& v) { v.integer = static_cast<std::uint32_t>(s.x[2]); }), true);
@@ -765,13 +413,6 @@ void install_libsystem_xpc(Provider& p, ObjcRuntime& objc) {
     p.libsystem("_xpc_activity_get_state", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; });   // XPC_ACTIVITY_STATE_CHECK_IN
     p.libsystem("_xpc_activity_set_state", [](CpuState&, GuestMemory&) -> std::uint64_t { return 1; });
     p.libsystem("_xpc_activity_should_defer", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; });
-    // xpc_main(handler): this process was not launched as an XPC service (no launchd).
-    p.libsystem("_xpc_main", [](CpuState&, GuestMemory&) -> std::uint64_t {
-        throw std::runtime_error("Alchemy: xpc_main is unsupported (no launchd: this process is not an XPC service)");
-    });
-    // Transactions count outstanding work for sudden termination, which never happens here.
-    for (const auto* name : {"_xpc_transaction_begin", "_xpc_transaction_end"})
-        p.libsystem(name, [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; });
     // xpc_set_event_stream_handler(stream, queue, handler): launchd sends no events here.
     p.libsystem("_xpc_set_event_stream_handler", [](CpuState&, GuestMemory&) -> std::uint64_t { return 0; });
 }

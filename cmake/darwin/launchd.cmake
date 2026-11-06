@@ -15,6 +15,9 @@ list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/launchd/service_management.cp
 # GUI (alchemy-fx only): the MachServices ports (the cross-process Mach layer),
 # passed to the server by main().
 list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/launchd/mach_services.cpp)
+# GUI (alchemy-fx only): XPC connections, endpoints, replies and xpc_main (installed by
+# libsystem/misc/xpc_objects.cpp's install_libsystem_xpc after the XPC objects).
+list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/launchd/xpc_connections.cpp)
 alchemy_gui_add_framework_case(launchd_service_management src/alchemy/darwin/launchd/tests/service_management_tests.cpp)
 
 if(BUILD_TESTING)
