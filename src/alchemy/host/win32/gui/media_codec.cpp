@@ -122,6 +122,16 @@ GUID subtype_of(Codec codec) {
     return codec == Codec::h264 ? MFVideoFormat_H264 : codec == Codec::hevc ? MFVideoFormat_HEVC : MFAudioFormat_AAC;
 }
 
+// The audio encoders' delays (the frames their output starts with), by CLSID, as measure_delay measured them on
+// Windows 11: noise encoded, decoded by the system's AAC decoder, the shift that best matches the input plus the
+// frames the decoder held back to hide its own delay (Microsoft's encoder: shift 0, one 1024-frame block held).
+// The host GUI test measures them again and fails if they differ. An encoder not listed has an unknown delay (0)
+// and is not used for files or AudioConverter.
+struct KnownDelay { const char* clsid; std::uint32_t frames; };
+constexpr KnownDelay known_delays[] = {
+    {"{93AF0C51-2275-45D2-A35B-F2BA21CAED00}", 1024},   // Microsoft AAC Audio Encoder MFT (48 kHz stereo, Windows 11, 2026-11-06)
+};
+
 // The encoder transforms of `codec`, preferred first (Media Foundation's sort: hardware before software).
 struct Found {
     Com<IMFActivate> activate;
@@ -151,6 +161,8 @@ std::vector<Found> enumerate(Codec codec) {
         f.component.id = SUCCEEDED(list[i]->GetGUID(MFT_TRANSFORM_CLSID_Attribute, &clsid)) ? guid_text(clsid) : "mft-" + std::to_string(i);
         UINT32 mft_flags{};
         f.component.hardware = SUCCEEDED(list[i]->GetUINT32(MF_TRANSFORM_FLAGS_Attribute, &mft_flags)) && (mft_flags & MFT_ENUM_FLAG_HARDWARE);
+        for (const auto& known : known_delays)
+            if (_stricmp(known.clsid, f.component.id.c_str()) == 0) f.component.delay = known.frames;
         out.push_back(std::move(f));
     }
     CoTaskMemFree(list);
@@ -750,6 +762,116 @@ Status drain(AudioEncoder* encoder, std::vector<Sample>& out) {
     encoder->ready.clear();
     if (error != Error::none) return error;
     return {};
+}
+
+Result<std::uint32_t> measure_delay(const AudioSettings& settings) {
+    const auto opened = open_audio(settings);
+    if (!opened) return opened.error();
+    auto* encoder = *opened;
+    const auto rate = settings.sample_rate, channels = settings.channels;
+    // One second of deterministic noise, encoded.
+    std::vector<std::int16_t> input(std::size_t(rate) * channels);
+    std::uint32_t seed = 1;
+    for (auto& v : input) {
+        seed = seed * 1664525u + 1013904223u;
+        v = static_cast<std::int16_t>(static_cast<std::int32_t>(seed >> 16) % 8000 - 4000);
+    }
+    std::vector<Sample> packets;
+    for (std::size_t at = 0; at < input.size(); at += 1024ULL * channels)
+        if (!encode(encoder, std::span(input).subspan(at, std::min<std::size_t>(1024ULL * channels, input.size() - at)), packets)) { close(encoder); return Error::io; }
+    if (!drain(encoder, packets)) { close(encoder); return Error::io; }
+    const auto config = configuration(encoder);
+    close(encoder);
+    // Decoded by the host's AAC decoder.
+    Worker worker;
+    std::size_t held = 0;   // samples out before the drain: the rest are what the decoder held back
+    const auto decoded = worker.run([&]() -> Result<std::vector<std::int16_t>> {
+        MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Audio, MFAudioFormat_AAC}, out_info{MFMediaType_Audio, MFAudioFormat_PCM};
+        IMFActivate** list{};
+        UINT32 count{};
+        if (FAILED(MFTEnumEx(MFT_CATEGORY_AUDIO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, &in_info, &out_info, &list, &count)) || !count) {
+            if (list) CoTaskMemFree(list);
+            return Error::not_found;
+        }
+        Com<IMFActivate> activate;
+        activate.p = list[0];
+        for (UINT32 i = 1; i < count; ++i) list[i]->Release();
+        CoTaskMemFree(list);
+        Driver d;
+        if (d.start(activate.p) != Error::none) return Error::io;
+        Com<IMFMediaType> in;
+        if (FAILED(MFCreateMediaType(in.put()))) return Error::no_memory;
+        in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        in->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        in->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
+        in->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
+        in->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+        in->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+        // MF_MT_USER_DATA: HEAACWAVEINFO after WAVEFORMATEX (payload type 0: raw; profile 0x29), then the AudioSpecificConfig.
+        std::vector<std::uint8_t> user(12, 0);
+        user[2] = 0x29;
+        user.insert(user.end(), config.begin(), config.end());
+        in->SetBlob(MF_MT_USER_DATA, user.data(), static_cast<UINT32>(user.size()));
+        if (FAILED(d.transform->SetInputType(d.in_id, in.p, 0))) return Error::invalid_argument;
+        bool typed = false;
+        for (DWORD i = 0; !typed; ++i) {
+            Com<IMFMediaType> offered;
+            if (FAILED(d.transform->GetOutputAvailableType(d.out_id, i, offered.put()))) break;
+            GUID subtype{};
+            UINT32 bits{};
+            if (SUCCEEDED(offered->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == MFAudioFormat_PCM &&
+                SUCCEEDED(offered->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits)) && bits == 16)
+                typed = SUCCEEDED(d.transform->SetOutputType(d.out_id, offered.p, 0));
+        }
+        if (!typed || d.begin() != Error::none) return Error::invalid_argument;
+        std::vector<std::int16_t> pcm;
+        const auto take = [&pcm](IMFSample* s) {
+            const auto bytes = bytes_of(s);
+            const auto at = pcm.size();
+            pcm.resize(at + bytes.size() / 2);
+            std::memcpy(pcm.data() + at, bytes.data(), bytes.size() / 2 * 2);
+        };
+        LONGLONG time = 0;
+        for (const auto& p : packets) {
+            Com<IMFMediaBuffer> buffer;
+            Com<IMFSample> sample;
+            if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(p.data.size()), buffer.put())) || FAILED(MFCreateSample(sample.put())) ||
+                FAILED(sample->AddBuffer(buffer.p)))
+                return Error::no_memory;
+            BYTE* data{};
+            if (FAILED(buffer->Lock(&data, nullptr, nullptr))) return Error::io;
+            std::memcpy(data, p.data.data(), p.data.size());
+            buffer->Unlock();
+            buffer->SetCurrentLength(static_cast<DWORD>(p.data.size()));
+            sample->SetSampleTime(time);
+            sample->SetSampleDuration(1024LL * 10000000 / rate);
+            time += 1024LL * 10000000 / rate;
+            if (d.feed(sample.p, take) != Error::none) return Error::io;
+        }
+        held = pcm.size();   // what came out before the drain
+        if (d.drain(take) != Error::none) return Error::io;
+        d.stop();
+        d.transform.reset();
+        static_cast<void>(activate->ShutdownObject());
+        return pcm;
+    });
+    if (!decoded) return decoded.error();
+    // The shift (in frames, up to 4096) at which the decoded first channel best matches the input's.
+    const auto& out = *decoded;
+    const std::size_t span = rate / 2;
+    std::uint32_t best = 0;
+    double best_score = -1;
+    for (std::uint32_t shift = 0; shift <= 4096; ++shift) {
+        if ((std::size_t(shift) + span) * channels > out.size()) break;
+        double score = 0;
+        for (std::size_t i = 0; i < span; ++i) score += double(out[(shift + i) * channels]) * input[i * channels];
+        if (score > best_score) { best_score = score; best = shift; }
+    }
+    if (best_score <= 0) return Error::io;
+    // A decoder that hides its own delay holds that many frames back until the drain (Microsoft's holds one
+    // 1024-frame block); a player trimming by the stream's priming outputs every frame as it comes, so for it
+    // those frames are delay too.
+    return best + static_cast<std::uint32_t>((out.size() - held) / channels);
 }
 
 void close(AudioEncoder* encoder) noexcept {

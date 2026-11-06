@@ -173,6 +173,16 @@ void media_codecs() {
               << packets.size() << " packets\n";
     mc::close(encoder);
     require(mc::open_audio({mc::Codec::aac, 7, channels}).error() == host::Error::invalid_argument, "a rate no encoder takes is refused");
+    // Each AAC encoder's recorded delay is what decoding its output measures (the host's decoder; skipped without one).
+    for (const auto& component : *listed) {
+        const auto r = std::find(component.sample_rates.begin(), component.sample_rates.end(), 48000u) != component.sample_rates.end() ? 48000u : component.sample_rates.front();
+        const auto n = std::find(component.channel_counts.begin(), component.channel_counts.end(), 2u) != component.channel_counts.end() ? 2u : component.channel_counts.front();
+        const auto measured = mc::measure_delay({mc::Codec::aac, r, n, 0, component.id});
+        if (!measured && measured.error() == host::Error::not_found) { std::cout << "no AAC decoder to measure " << component.name << " with: skipped\n"; continue; }
+        require(static_cast<bool>(measured), component.name + ": the delay is measured");
+        std::cout << "AAC encoder " << component.name << " " << component.id << ": measured delay " << *measured << ", recorded " << component.delay << '\n';
+        require(*measured == component.delay, component.name + ": the measured delay is the recorded one");
+    }
 }
 
 void real_backend() {

@@ -25,5 +25,6 @@ std::vector<std::uint8_t> configuration(const AudioEncoder*) { return {}; }
 Status encode(AudioEncoder*, std::span<const std::int16_t>, std::vector<Sample>&) { return Error::unsupported; }
 Status drain(AudioEncoder*, std::vector<Sample>&) { return Error::unsupported; }
 void close(AudioEncoder*) noexcept {}
+Result<std::uint32_t> measure_delay(const AudioSettings&) { return Error::unsupported; }
 
 } // namespace alchemy::host::media_codec
