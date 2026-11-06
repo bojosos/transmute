@@ -64,6 +64,8 @@ const Family families[] = {
      {"kCGColorSpaceLinearSRGB", "kCGColorSpaceExtendedLinearSRGB", "kCGColorSpaceGenericRGBLinear"}},
     {"Display P3", false, p3_red, p3_green, p3_blue, d65, srgb_curve,
      {"kCGColorSpaceDisplayP3", "kCGColorSpaceExtendedDisplayP3"}},
+    {"Linear Display P3", false, p3_red, p3_green, p3_blue, d65, linear_curve,
+     {"kCGColorSpaceLinearDisplayP3", "kCGColorSpaceExtendedLinearDisplayP3"}},
     {"DCI-P3", false, p3_red, p3_green, p3_blue, {0.314, 0.351}, {0, {2.6}}, {"kCGColorSpaceDCIP3"}},
     {"Adobe RGB (1998)", false, {0.640, 0.330}, {0.210, 0.710}, {0.150, 0.060}, d65, {0, {563.0 / 256}},
      {"kCGColorSpaceAdobeRGB1998"}},

@@ -191,7 +191,10 @@ void delegates_spaces_collections(Fixture& f) {
                 name_of(f.id(cg, "_CGColorSpaceCreateCopyWithStandardRange", {extended})) == "kCGColorSpaceSRGB",
             "extended, linearized and standard-range variants");
     const auto p3 = f.id(cg, "_CGColorSpaceCreateWithName", {f.str("kCGColorSpaceDisplayP3")});
-    require(f.id(cg, "_CGColorSpaceCreateLinearized", {p3}) == 0 && (f.id(cg, "_CGColorSpaceIsHDR", {p3}) & 0xff) == 0, "no linear Display P3; not HDR");
+    require(name_of(f.id(cg, "_CGColorSpaceCreateLinearized", {p3})) == "kCGColorSpaceLinearDisplayP3" &&
+                name_of(f.id(cg, "_CGColorSpaceCreateExtendedLinearized", {p3})) == "kCGColorSpaceExtendedLinearDisplayP3" &&
+                (f.id(cg, "_CGColorSpaceIsHDR", {p3}) & 0xff) == 0,
+            "linear Display P3 variants; not HDR");
 
     // Family names (font collections are tested in coretext_fonts_tests.cpp).
     require(static_cast<std::int64_t>(f.id(ct, "_CTFontManagerCompareFontFamilyNames", {f.str("arial"), f.str("Times"), 0})) < 0,

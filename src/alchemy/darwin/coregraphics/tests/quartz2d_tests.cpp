@@ -450,6 +450,8 @@ void color_profiles(Fixture& f) {
         {"kCGColorSpaceGenericRGBLinear", false, {{0.64, 0.33}, {0.30, 0.60}, {0.15, 0.06}, {0.3127, 0.3290}}, 1.0},
         {"kCGColorSpaceDisplayP3", false, {{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}, {0.3127, 0.3290}}, 2.4},
         {"kCGColorSpaceExtendedDisplayP3", false, {{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}, {0.3127, 0.3290}}, 2.4},
+        {"kCGColorSpaceLinearDisplayP3", false, {{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}, {0.3127, 0.3290}}, 1.0},
+        {"kCGColorSpaceExtendedLinearDisplayP3", false, {{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}, {0.3127, 0.3290}}, 1.0},
         {"kCGColorSpaceDCIP3", false, {{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}, {0.314, 0.351}}, 2.6},
         {"kCGColorSpaceAdobeRGB1998", false, {{0.64, 0.33}, {0.21, 0.71}, {0.15, 0.06}, {0.3127, 0.3290}}, 563.0 / 256},
         {"kCGColorSpaceITUR_709", false, {{0.64, 0.33}, {0.30, 0.60}, {0.15, 0.06}, {0.3127, 0.3290}}, 1 / 0.45},

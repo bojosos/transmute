@@ -432,8 +432,10 @@ void GraphicsGaps::install_core_graphics() {
         if (s.x[2]) m.write64(s.x[2], 0);
         s.x[0] = 0;
     });
+    // Window lists (and their images) are screen-capture information: NULL, as
+    // CGPreflightScreenCaptureAccess answers above.
     for (const auto* name : {"_CGWindowListCopyWindowInfo", "_CGWindowListCreateDescriptionFromArray", "_CGWindowListCreateImage",
-                             "_CGWindowListCreateImageFromArray"})
+                             "_CGWindowListCreateImageFromArray", "_CGWindowListCreate"})
         constant(core_graphics, name, 0);
     // CGWindowLevel CGWindowLevelForKey(CGWindowLevelKey): CGWindowLevel.h's
     // levels, which AppKit's NS*WindowLevel values equal (normal 0, floating 3,
@@ -727,8 +729,7 @@ void GraphicsGaps::install_core_text() {
 }
 
 void GraphicsGaps::install_misc() {
-    // IOSurface (its Mach ports are QuartzCore's iosurface.cpp).
-    string(iosurface, "_kIOSurfacePlaneBytesPerElement", "IOSurfacePlaneBytesPerElement");
+    // (IOSurface's plane keys are QuartzCore's iosurface.cpp.)
     // CoreImage: no feature detectors are available.
     for (const auto* name : {"CIDetectorAccuracy", "CIDetectorAccuracyHigh", "CIDetectorAccuracyLow", "CIDetectorTypeFace",
                              "CIDetectorTypeQRCode", "CIDetectorTypeText"})

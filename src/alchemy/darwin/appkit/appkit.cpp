@@ -372,7 +372,11 @@ void AppKit::install() {
              {"_NSURLPboardType", "Apple URL pasteboard type"}, {"_NSPasteboardTypeURL", "public.url"},
              {"_NSBackingPropertyOldScaleFactorKey", "NSBackingPropertyOldScaleFactorKey"},
              {"_NSImageNameApplicationIcon", "NSApplicationIcon"},
-             {"_NSCalibratedRGBColorSpace", "NSCalibratedRGBColorSpace"}})
+             {"_NSCalibratedRGBColorSpace", "NSCalibratedRGBColorSpace"},
+             // NSDeviceDescriptionKey: the keys of -[NSScreen deviceDescription] (resources.cpp).
+             {"_NSDeviceResolution", "NSDeviceResolution"}, {"_NSDeviceColorSpaceName", "NSDeviceColorSpaceName"},
+             {"_NSDeviceBitsPerSample", "NSDeviceBitsPerSample"}, {"_NSDeviceIsScreen", "NSDeviceIsScreen"},
+             {"_NSDeviceIsPrinter", "NSDeviceIsPrinter"}, {"_NSDeviceSize", "NSDeviceSize"}})
         string_constant(symbol, value);
     // The run loop's own mode objects, so that a guest comparing
     // -[NSRunLoop currentMode] or CFRunLoopCopyCurrentMode with these

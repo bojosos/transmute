@@ -519,6 +519,10 @@ void iosurface_planar(Fixture& f) {
             {f.cf.string("IOSurfacePlaneInfo"), planes}, {f.cf.string("IOSurfaceAllocSize"), number(f, 645120)}}};
         return f.call(iosurface, "_IOSurfaceCreate", {f.cf.dictionary(entries)});
     };
+    // The plane keys an application builds this dictionary from (Godot binds the element ones).
+    for (const auto* name : {"IOSurfacePlaneWidth", "IOSurfacePlaneHeight", "IOSurfacePlaneBytesPerElement", "IOSurfacePlaneElementWidth",
+                             "IOSurfacePlaneElementHeight", "IOSurfacePlaneBytesPerRow", "IOSurfacePlaneSize", "IOSurfacePlaneOffset"})
+        require(f.string_constant(iosurface, std::string("_k") + name) == name, std::string("_k") + name);
     const std::array<Address, 2> nv12{plane(854, 480, 1, 896, 430080, 0), plane(427, 240, 2, 896, 215040, 430080)};
     const auto surface = create(f.cf.array(nv12));
     require(surface != 0, "IOSurfaceCreate of a planar surface");

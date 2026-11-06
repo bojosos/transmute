@@ -136,6 +136,32 @@ void AppKit::install_carbon() {
             s.x[0] = cf.boolean(true);
         }
     });
+    // The process has one input source, the window server's keyboard layout
+    // (enabled and selected). TISCreateInputSourceList(properties,
+    // includeAllInstalled) lists it when each property of the filter equals
+    // its value (a NULL filter matches); TISSelectInputSource of it succeeds
+    // without changing anything (paramErr for anything else).
+    function(carbon_library, "_TISCreateInputSourceList", [this](CpuState& s, GuestMemory&) {
+        const auto filter = s.x[0];
+        std::vector<Address> values;
+        if (const auto source = guest_call(carbon_library, "_TISCopyCurrentKeyboardInputSource", {})) {
+            bool matches = true;
+            if (filter)
+                for (const auto& [key, wanted] : cf.dictionary_entries(filter)) {
+                    const auto value = guest_call(carbon_library, "_TISGetInputSourceProperty", {source, key});
+                    matches = matches && value && cf.equal(value, wanted);
+                }
+            if (matches) values.push_back(source);
+            s.x[0] = cf.array(values);
+            process.objects().release(source);
+            return;
+        }
+        s.x[0] = cf.array(values);
+    });
+    function(carbon_library, "_TISSelectInputSource", [this](CpuState& s, GuestMemory&) {
+        const auto record = s.x[0] ? process.objects().find(s.x[0]) : nullptr;
+        s.x[0] = record && std::dynamic_pointer_cast<InputSourceState>(record->payload) ? 0 : static_cast<std::uint32_t>(-50);
+    });
 
     // UCKeyTranslate(layout, keyCode, keyAction, modifierKeyState, keyboardType,
     //   options, deadKeyState*, maxStringLength, actualStringLength*, unicodeString*)

@@ -31,6 +31,8 @@ constexpr NamedSpace named_spaces[] = {
     {"kCGColorSpaceGenericRGBLinear", ColorModel::rgb, true, false, false},
     {"kCGColorSpaceDisplayP3", ColorModel::rgb, false, false, true},
     {"kCGColorSpaceExtendedDisplayP3", ColorModel::rgb, false, true, true},
+    {"kCGColorSpaceLinearDisplayP3", ColorModel::rgb, true, false, true},
+    {"kCGColorSpaceExtendedLinearDisplayP3", ColorModel::rgb, true, true, true},
     {"kCGColorSpaceDCIP3", ColorModel::rgb, false, false, true},
     {"kCGColorSpaceAdobeRGB1998", ColorModel::rgb, false, false, true},
     {"kCGColorSpaceITUR_709", ColorModel::rgb, false, false, false},
@@ -54,11 +56,12 @@ const NamedSpace* find_named(std::string_view name) {
 constexpr std::pair<std::string_view, std::string_view> extended_pairs[] = {
     {"kCGColorSpaceSRGB", "kCGColorSpaceExtendedSRGB"}, {"kCGColorSpaceLinearSRGB", "kCGColorSpaceExtendedLinearSRGB"},
     {"kCGColorSpaceDisplayP3", "kCGColorSpaceExtendedDisplayP3"}, {"kCGColorSpaceGenericGrayGamma2_2", "kCGColorSpaceExtendedGray"},
-    {"kCGColorSpaceLinearGray", "kCGColorSpaceExtendedLinearGray"}};
+    {"kCGColorSpaceLinearGray", "kCGColorSpaceExtendedLinearGray"}, {"kCGColorSpaceLinearDisplayP3", "kCGColorSpaceExtendedLinearDisplayP3"}};
 constexpr std::pair<std::string_view, std::string_view> linear_pairs[] = {
     {"kCGColorSpaceSRGB", "kCGColorSpaceLinearSRGB"}, {"kCGColorSpaceExtendedSRGB", "kCGColorSpaceExtendedLinearSRGB"},
     {"kCGColorSpaceGenericRGB", "kCGColorSpaceGenericRGBLinear"}, {"kCGColorSpaceGenericGrayGamma2_2", "kCGColorSpaceLinearGray"},
-    {"kCGColorSpaceGenericGray", "kCGColorSpaceLinearGray"}, {"kCGColorSpaceExtendedGray", "kCGColorSpaceExtendedLinearGray"}};
+    {"kCGColorSpaceGenericGray", "kCGColorSpaceLinearGray"}, {"kCGColorSpaceExtendedGray", "kCGColorSpaceExtendedLinearGray"},
+    {"kCGColorSpaceDisplayP3", "kCGColorSpaceLinearDisplayP3"}, {"kCGColorSpaceExtendedDisplayP3", "kCGColorSpaceExtendedLinearDisplayP3"}};
 // `name`'s variant through `pairs` (forward: first -> second), itself when it
 // already is one, "" when there is none.
 std::string_view variant(std::span<const std::pair<std::string_view, std::string_view>> pairs, std::string_view name, bool forward) {
@@ -144,7 +147,8 @@ Rgba Quartz::to_rgba(Address space, std::span<const double> c, double alpha) {
         auto r = at(0), g = at(1), b = at(2);
         if (info && info->linear) { r = encode_srgb(r); g = encode_srgb(g); b = encode_srgb(b); }
         const auto* named = !info ? nullptr : info->name.empty() ? &info->profile : &info->name;
-        if (named && (*named == "kCGColorSpaceDisplayP3" || *named == "kCGColorSpaceExtendedDisplayP3" || *named == "kCGColorSpaceDCIP3")) {
+        if (named && (*named == "kCGColorSpaceDisplayP3" || *named == "kCGColorSpaceExtendedDisplayP3" || *named == "kCGColorSpaceDCIP3" ||
+                      *named == "kCGColorSpaceLinearDisplayP3" || *named == "kCGColorSpaceExtendedLinearDisplayP3")) {
             // Display P3 (sRGB transfer, P3 primaries, D65) -> XYZ -> sRGB.
             const auto lr = decode_srgb(r), lg = decode_srgb(g), lb = decode_srgb(b);
             const auto x = 0.4865709 * lr + 0.2656677 * lg + 0.1982173 * lb;

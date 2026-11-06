@@ -31,6 +31,21 @@ void install_accessibility(Support& support) {
     for (const auto& [symbol, value] : std::initializer_list<std::pair<const char*, const char*>>{
              {"_NSAccessibilitySearchFieldSubrole", "AXSearchField"},
              {"_NSAccessibilitySecureTextFieldSubrole", "AXSecureTextField"},
+             {"_NSAccessibilityDialogSubrole", "AXDialog"},
+             {"_NSAccessibilitySwitchSubrole", "AXSwitch"},
+             {"_NSAccessibilityTableRowSubrole", "AXTableRow"},
+             {"_NSAccessibilityToggleSubrole", "AXToggle"},
+             {"_NSAccessibilityUnknownSubrole", "AXUnknown"},
+             {"_NSAccessibilitySelectedRowsChangedNotification", "AXSelectedRowsChanged"},
+             {"_NSAccessibilityAnnouncementRequestedNotification", "AXAnnouncementRequested"},
+             // The announcement's user-info keys and these text attributes follow the
+             // AX naming of the others (unverified: the documentation gives no values).
+             {"_NSAccessibilityAnnouncementKey", "AXAnnouncementKey"},
+             {"_NSAccessibilityPriorityKey", "AXPriorityKey"},
+             {"_NSAccessibilityLanguageTextAttribute", "AXLanguageText"},
+             {"_NSAccessibilityStrikethroughColorTextAttribute", "AXStrikethroughColor"},
+             {"_NSAccessibilityUnderlineColorTextAttribute", "AXUnderlineColor"},
+             {"_NSAccessibilityTextAlignmentAttribute", "AXTextAlignment"},
              {"_NSAccessibilityChildrenAttribute", "AXChildren"},
              {"_NSAccessibilityFocusedAttribute", "AXFocused"},
              {"_NSAccessibilitySelectedTextRangeAttribute", "AXSelectedTextRange"},

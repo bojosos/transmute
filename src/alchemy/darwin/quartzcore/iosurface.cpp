@@ -578,6 +578,9 @@ void install_iosurface(Support& support) {
              {"_kIOSurfacePlaneInfo", "IOSurfacePlaneInfo"}, {"_kIOSurfacePlaneWidth", "IOSurfacePlaneWidth"},
              {"_kIOSurfacePlaneHeight", "IOSurfacePlaneHeight"}, {"_kIOSurfacePlaneBytesPerRow", "IOSurfacePlaneBytesPerRow"},
              {"_kIOSurfacePlaneOffset", "IOSurfacePlaneOffset"}, {"_kIOSurfacePlaneSize", "IOSurfacePlaneSize"},
+             {"_kIOSurfacePlaneBytesPerElement", "IOSurfacePlaneBytesPerElement"},
+             {"_kIOSurfacePlaneElementWidth", "IOSurfacePlaneElementWidth"},
+             {"_kIOSurfacePlaneElementHeight", "IOSurfacePlaneElementHeight"},
              {"_kIOSurfacePixelFormat", "IOSurfacePixelFormat"}, {"_kIOSurfaceCacheMode", "IOSurfaceCacheMode"},
              {"_kIOSurfaceIsGlobal", "IOSurfaceIsGlobal"}, {"_kIOSurfaceName", "IOSurfaceName"},
              {"_kIOSurfacePixelSizeCastingAllowed", "IOSurfacePixelSizeCastingAllowed"}})

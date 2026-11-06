@@ -274,7 +274,10 @@ void install_animation(Support& support) {
              {"_kCAEmitterLayerPoints", "points"}, {"_kCAEmitterLayerOutline", "outline"}, {"_kCAEmitterLayerSurface", "surface"},
              {"_kCAEmitterLayerVolume", "volume"}, {"_kCAEmitterLayerUnordered", "unordered"},
              {"_kCAEmitterLayerOldestFirst", "oldestFirst"}, {"_kCAEmitterLayerOldestLast", "oldestLast"},
-             {"_kCAEmitterLayerBackToFront", "backToFront"}, {"_kCAEmitterLayerAdditive", "additive"}})
+             {"_kCAEmitterLayerBackToFront", "backToFront"}, {"_kCAEmitterLayerAdditive", "additive"},
+             // A CAContext option key (Godot binds it; CAContext has no public
+             // documentation, so the value follows the naming above: unverified).
+             {"_kCAContextCIFilterBehavior", "ciFilterBehavior"}})
         if (!support.process.resolve(quartzcore_library, symbol)) support.string_constant(quartzcore_library, symbol, value);
 }
 

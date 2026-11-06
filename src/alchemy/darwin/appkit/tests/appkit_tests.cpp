@@ -678,6 +678,15 @@ void carbon(Fixture& f) {
     require(data != 0, "kTISPropertyUnicodeKeyLayoutData");
     const auto ascii_key = f.engine.read64(f.process.resolve(gui::appkit::carbon_library, "_kTISPropertyInputSourceIsASCIICapable")->address);
     require(call(gui::appkit::carbon_library, "_TISGetInputSourceProperty", {source, ascii_key}) == f.cf.boolean(true), "ASCII capable");
+    // The one input source: listed (NULL filter, a matching filter), not for another ID; selecting it succeeds.
+    const auto id_key = f.engine.read64(f.process.resolve(gui::appkit::carbon_library, "_kTISPropertyInputSourceID")->address);
+    const auto listed = [&](Address filter) { return f.cf.length(call(gui::appkit::carbon_library, "_TISCreateInputSourceList", {filter, 0})); };
+    const auto own_id = call(gui::appkit::carbon_library, "_TISGetInputSourceProperty", {source, id_key});
+    const std::array<std::pair<Address, Address>, 1> same_id{{{id_key, own_id}}}, other_id{{{id_key, f.cf.string("com.example.none")}}};
+    require(listed(0) == 1 && listed(f.cf.dictionary(same_id)) == 1 && listed(f.cf.dictionary(other_id)) == 0, "TISCreateInputSourceList");
+    require(call(gui::appkit::carbon_library, "_TISSelectInputSource", {source}) == 0 &&
+                static_cast<std::int32_t>(call(gui::appkit::carbon_library, "_TISSelectInputSource", {f.cf.string("x")})) == -50,
+            "TISSelectInputSource");
     const auto bytes = f.id(data, "bytes");
     const auto buffer = f.process.allocate_guest(64);
     const auto dead = buffer, actual = buffer + 8, output = buffer + 16;

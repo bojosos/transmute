@@ -1782,6 +1782,17 @@ void AppKit::install_resources() {
             {"NSDeviceColorSpaceName", string("NSCalibratedRGBColorSpace")}}};
         std::vector<std::pair<Address, Address>> values;
         for (const auto& [key, value] : entries) values.emplace_back(string(key), value);
+        // The size in points and the resolution (72 dpi per backing pixel per point), as NSValue sizes.
+        if (const auto value_class = objc.find_class("NSValue"); value_class && responds(value_class, "valueWithSize:")) {
+            const auto size_value = [&](double width, double height) {
+                CallRegs size;
+                size.set_d(0, width);
+                size.set_d(1, height);
+                return retain(send(value_class, "valueWithSize:", size).x0);
+            };
+            values.emplace_back(string("NSDeviceSize"), size_value(info.frame.size.width, info.frame.size.height));
+            values.emplace_back(string("NSDeviceResolution"), size_value(72 * info.backing_scale, 72 * info.backing_scale));
+        }
         const auto dictionary = cf.dictionary(values);
         for (const auto& [key, value] : values) { process.objects().release(key); process.objects().release(value); }
         s.x[0] = autorelease(dictionary);
