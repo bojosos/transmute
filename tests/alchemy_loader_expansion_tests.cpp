@@ -315,6 +315,16 @@ void persistent_loader_tests() {
     const std::array<std::uint64_t, 2> lookup{tls_handle, name};
     expect(dlsym && engine.invoke_callback(dlsym->address, lookup) == tls_storage,
            "guest dlsym returned a TLS descriptor instead of calling-thread storage");
+    // An unversioned framework path names the provider identity of its current version (the Swift concurrency
+    // runtime dlopens ".../CoreFoundation.framework/CoreFoundation" with RTLD_NOLOAD and looks up CFRunLoopRun).
+    context.install_export("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFRunLoopRun",
+                           {0x1234, alchemy::ExportKind::function});
+    for (const auto* path : {"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+                             "/System/Library/Frameworks/CoreFoundation.framework/Versions/Current/CoreFoundation"}) {
+        const auto framework = loader.open(path, 1 | 0x10);   // RTLD_LAZY | RTLD_NOLOAD
+        const auto found = loader.symbol(framework, "CFRunLoopRun");
+        expect(found && found->address == 0x1234, "dlsym on an unversioned framework handle missed its provider's export");
+    }
 }
 
 // Darwin's libSystem re-exports libunwind: a libSystem-ordinal import of an

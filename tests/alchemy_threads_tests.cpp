@@ -199,6 +199,19 @@ void test_cancellation() {
     require(f.call("_pthread_mutex_trylock", {mutex}) == 16, "it took the mutex back before its cleanup handlers");
 }
 
+// The Swift runtime's reserved keys (__PTK_FRAMEWORK_SWIFT_KEY0-9, 100-109) work without pthread_key_init_np, and
+// pthread_key_create never hands them out.
+void test_reserved_swift_keys() {
+    Fixture f;
+    require(f.call("_pthread_setspecific", {103, 0x1234}) == 0 && f.call("_pthread_getspecific", {103}) == 0x1234 &&
+            f.call("_pthread_setspecific", {109, 7}) == 0 && f.call("_pthread_getspecific", {109}) == 7, "reserved keys 100-109");
+    for (int index = 0; index < 120; ++index) {
+        require(f.call("_pthread_key_create", {data + 256, 0}) == 0, "key create failed");
+        const auto key = f.engine.read64(data + 256);
+        require(key < 100 || key > 109, "pthread_key_create handed out a reserved key");
+    }
+}
+
 // os_unfair_recursive_lock {lock word, count}: the owner takes it again, another thread cannot until the last unlock.
 void test_recursive_unfair_lock() {
     Fixture f;
@@ -342,6 +355,7 @@ int main() {
         test_explicit_thread_exit();
         test_cancellation();
         test_recursive_unfair_lock();
+        test_reserved_swift_keys();
         test_tlv_and_cleanup();
         test_guards_and_timed_condition();
         test_address_waits_and_context_release();

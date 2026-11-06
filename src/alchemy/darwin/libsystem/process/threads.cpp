@@ -1121,6 +1121,13 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             }
             s.x[0] = 0;
         });
+        // The Swift runtime's __PTK_FRAMEWORK_SWIFT_KEY0-9 (100-109) are reserved, as on Darwin: usable with
+        // get/setspecific without pthread_key_init_np (which only attaches a destructor), never handed out by
+        // pthread_key_create. _Concurrency keeps its current task and executor in them.
+        {
+            std::lock_guard lock(metadata);
+            for (std::uint64_t key = 100; key < 110; ++key) keys.try_emplace(key, 0);
+        }
         add("_pthread_key_create", [](auto& self, auto& s, auto& m) {
             if (!accessible(m, s.x[0], 8)) { s.x[0] = einval; return; }
             std::lock_guard lock(self.metadata);

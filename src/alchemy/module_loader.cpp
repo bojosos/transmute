@@ -1,5 +1,6 @@
 #include "alchemy/module_loader.hpp"
 #include "alchemy/alchemy_root.hpp"
+#include "alchemy/darwin_frameworks.hpp"
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/host/files.hpp"
 #include "alchemy/path.hpp"
@@ -83,6 +84,30 @@ bool runtime_provider_fallback(std::string_view identity) {
 
 bool apple_system_path(std::string_view identity) {
     return identity.starts_with("/usr/lib/") || identity.starts_with("/System/Library/");
+}
+
+// The provider identity an unversioned framework path names: "X.framework/X" and "X.framework/Versions/Current/X"
+// are the framework's current version, which a provider is registered under as "X.framework/Versions/<V>/X"
+// (dlopen of the short path, as the Swift concurrency runtime opens CoreFoundation). Other paths as given.
+std::string framework_provider_identity(std::string_view path) {
+    const auto marker = path.find(".framework/");
+    if (marker == std::string_view::npos) return std::string(path);
+    const auto start = path.rfind('/', marker);
+    const auto name = path.substr(start == std::string_view::npos ? 0 : start + 1,
+                                  marker - (start == std::string_view::npos ? 0 : start + 1));
+    const auto directory = path.substr(0, marker + 11);   // ".../X.framework/"
+    const auto rest = path.substr(marker + 11);
+    if (name.empty() || (rest != name && rest != "Versions/Current/" + std::string(name))) return std::string(path);
+    const auto matches = [&](std::string_view identity) {
+        return identity.starts_with(directory) && identity.substr(directory.size()).starts_with("Versions/") &&
+            identity.ends_with("/" + std::string(name)) && identity.size() == directory.size() + 11 + name.size();
+    };
+    for (const auto identity : darwin_framework_libraries) if (matches(identity)) return std::string(identity);
+    for (const std::string_view identity : {"/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
+                                            "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
+                                            "/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate"})
+        if (matches(identity)) return std::string(identity);
+    return std::string(path);
 }
 
 class InitializationFailure final : public std::runtime_error {
@@ -907,8 +932,9 @@ std::uint64_t ModuleLoader::open(std::string_view path, unsigned flags, std::uin
         else {
             const auto source = loader.find_path(path, loader.containing(caller), true);
             if (!source) {
-                if (!loader.provider(path)) throw std::runtime_error("missing guest dylib: " + std::string(path));
-                provider = path;
+                const auto identity = framework_provider_identity(path);
+                if (!loader.provider(identity)) throw std::runtime_error("missing guest dylib: " + std::string(path));
+                provider = identity;
             } else {
                 selected = loader.existing(*source);
                 if (!selected && (flags & 0x10U) != 0) throw std::runtime_error("RTLD_NOLOAD module is not resident");
