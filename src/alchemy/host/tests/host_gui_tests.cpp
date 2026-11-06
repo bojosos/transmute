@@ -1,4 +1,4 @@
-// Host layer tests for the GUI-only areas (ui, audio, midi; compiled into
+// Host layer tests for the GUI-only areas (ui, audio, midi, media_codec; compiled into
 // alchemy-fx, so alchemy_host_tests, which links alchemy_core alone, cannot
 // reach them). A real backend answers its queries and refuses what does not
 // exist without opening anything; on the null backend every call fails with
@@ -6,6 +6,7 @@
 #include "alchemy/host/audio.hpp"
 #include "alchemy/host/gpu.hpp"
 #include "alchemy/host/host.hpp"
+#include "alchemy/host/media_codec.hpp"
 #include "alchemy/host/midi.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/host/sync.hpp"
@@ -15,11 +16,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <span>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -64,6 +68,111 @@ void null_backend() {
                 host::gpu::layout_text({}).error() == host::Error::unsupported,
         "null fonts fail");
     require(host::gpu::raster_metrics({"Arial", 64}).error() == host::Error::unsupported, "null raster text fails");
+    namespace mc = host::media_codec;
+    require(mc::encoders(mc::Codec::h264).error() == host::Error::unsupported && mc::open_video({}).error() == host::Error::unsupported &&
+                mc::open_audio({mc::Codec::aac, 48000, 2}).error() == host::Error::unsupported,
+        "null media encoders fail");
+}
+
+// The host's media encoders, where it has them: a machine without one of them reports the skip.
+void media_codecs() {
+    namespace mc = host::media_codec;
+    const auto names = [](mc::Codec c) { return c == mc::Codec::h264 ? "H.264" : c == mc::Codec::hevc ? "HEVC" : "AAC"; };
+    // Video: 60 pictures of a moving gradient, a keyframe forced at 45.
+    for (const auto codec : {mc::Codec::h264, mc::Codec::hevc}) {
+        const auto listed = mc::encoders(codec);
+        require(static_cast<bool>(listed), std::string(names(codec)) + " encoders are listed");
+        if (listed->empty()) { std::cout << "no " << names(codec) << " encoder on this host: skipped\n"; continue; }
+        for (const auto& c : *listed) require(!c.id.empty() && c.codec == codec, "an encoder has an id");
+        mc::VideoSettings settings;
+        settings.codec = codec;
+        settings.width = 320;
+        settings.height = 240;
+        settings.frame_rate = 30;
+        settings.keyframe_interval = 30;
+        const auto opened = mc::open_video(settings);
+        if (!opened) { std::cout << "no " << names(codec) << " encoder took 320x240 here (" << host::name(opened.error()) << "): skipped\n"; continue; }
+        auto* encoder = *opened;
+        std::vector<std::uint8_t> luma(320 * 240), chroma(320 * 120);
+        std::vector<mc::Sample> samples;
+        for (int i = 0; i < 60; ++i) {
+            for (std::uint32_t y = 0; y < 240; ++y)
+                for (std::uint32_t x = 0; x < 320; ++x) luma[y * 320 + x] = static_cast<std::uint8_t>((x + y + i * 4) & 0xff);
+            std::fill(chroma.begin(), chroma.end(), static_cast<std::uint8_t>(128 + (i & 15)));
+            mc::Picture p{320, 240, luma.data(), 320, chroma.data(), 320, i * 333333LL, 333333};
+            require(static_cast<bool>(mc::encode(encoder, p, i == 45, samples)), std::string(names(codec)) + " encodes a picture");
+        }
+        require(static_cast<bool>(mc::drain(encoder, samples)), std::string(names(codec)) + " drains");
+        require(samples.size() == 60, std::string(names(codec)) + ": a sample per picture, " + std::to_string(samples.size()));
+        require(samples.front().keyframe && samples.front().pts == 0, std::string(names(codec)) + ": the first sample is a keyframe");
+        bool forced = false;
+        for (const auto& s : samples) {
+            std::size_t at = 0;
+            while (at + 4 <= s.data.size()) at += 4 + ((std::size_t(s.data[at]) << 24) | (s.data[at + 1] << 16) | (s.data[at + 2] << 8) | s.data[at + 3]);
+            require(at == s.data.size() && !s.data.empty(), std::string(names(codec)) + ": samples are length-prefixed NAL units");
+            forced = forced || (s.pts == 45 * 333333LL && s.keyframe);
+        }
+        require(forced, std::string(names(codec)) + ": the forced keyframe");
+        const auto sets = mc::parameter_sets(encoder);
+        const auto type = [codec](const std::vector<std::uint8_t>& u) { return codec == mc::Codec::hevc ? (u[0] >> 1) & 0x3f : u[0] & 0x1f; };
+        require(sets.size() == (codec == mc::Codec::hevc ? 3u : 2u) && type(sets[0]) == (codec == mc::Codec::hevc ? 32 : 7),
+            std::string(names(codec)) + ": the parameter sets");
+        std::cout << names(codec) << " encoder: " << mc::component(encoder).name << (mc::component(encoder).hardware ? " (hardware)" : "") << '\n';
+        const auto first_id = mc::component(encoder).id;
+        mc::close(encoder);
+        // Every other component by its id: ten pictures, a sample each (software encoders are synchronous
+        // transforms, hardware ones asynchronous).
+        for (const auto& other : *listed) {
+            if (other.id == first_id) continue;
+            auto by_id = settings;
+            by_id.component = other.id;
+            const auto again = mc::open_video(by_id);
+            if (!again) { std::cout << names(codec) << " encoder " << other.name << " refused 320x240 (" << host::name(again.error()) << ")\n"; continue; }
+            std::vector<mc::Sample> few;
+            for (int i = 0; i < 10; ++i) {
+                mc::Picture p{320, 240, luma.data(), 320, chroma.data(), 320, i * 333333LL, 333333};
+                require(static_cast<bool>(mc::encode(*again, p, false, few)), other.name + " encodes");
+            }
+            require(static_cast<bool>(mc::drain(*again, few)) && few.size() == 10 && few.front().keyframe && mc::parameter_sets(*again).size() >= 2,
+                other.name + ": ten samples, the first a keyframe: " + std::to_string(few.size()));
+            std::cout << names(codec) << " encoder: " << other.name << (other.hardware ? " (hardware)" : "") << '\n';
+            mc::close(*again);
+        }
+        settings.width = 321;
+        require(mc::open_video(settings).error() == host::Error::invalid_argument, "odd sizes are refused");
+        settings.width = 320;
+        settings.component = "no such encoder";
+        require(mc::open_video(settings).error() == host::Error::not_found, "an unknown component is not found");
+    }
+    // AAC: one second of a sine at the encoder's own rate and channels.
+    const auto listed = mc::encoders(mc::Codec::aac);
+    require(static_cast<bool>(listed), "AAC encoders are listed");
+    if (listed->empty()) { std::cout << "no AAC encoder on this host: skipped\n"; return; }
+    const auto& c = listed->front();
+    require(!c.sample_rates.empty() && !c.channel_counts.empty() && !c.bit_rates.empty(), "the AAC encoder says what it takes");
+    const auto rate = std::find(c.sample_rates.begin(), c.sample_rates.end(), 48000u) != c.sample_rates.end() ? 48000u : c.sample_rates.front();
+    const auto channels = std::find(c.channel_counts.begin(), c.channel_counts.end(), 2u) != c.channel_counts.end() ? 2u : c.channel_counts.front();
+    const auto opened = mc::open_audio({mc::Codec::aac, rate, channels, 0, c.id});
+    require(static_cast<bool>(opened), "an AAC encoder opens: " + std::string(host::name(opened.error())) + " (" + c.name + ", " + std::to_string(rate) + " Hz, " +
+                                           std::to_string(channels) + " ch, " + std::to_string(c.bit_rates.size()) + " bit rates)");
+    auto* encoder = *opened;
+    require(mc::frames_per_packet(encoder) == 1024 && std::find(c.bit_rates.begin(), c.bit_rates.end(), mc::bit_rate(encoder)) != c.bit_rates.end(),
+        "1024 frames a packet, at a bit rate it lists");
+    const auto config = mc::configuration(encoder);
+    require(config.size() >= 2 && (config[0] >> 3) == 2 && ((config[1] >> 3) & 15) == channels, "an AAC-LC AudioSpecificConfig of the channels");
+    std::vector<std::int16_t> pcm(std::size_t(rate) * channels);
+    for (std::size_t i = 0; i < pcm.size(); ++i) pcm[i] = static_cast<std::int16_t>(10000 * std::sin(0.05 * double(i / channels)));
+    std::vector<mc::Sample> packets;
+    for (std::size_t at = 0; at < pcm.size(); at += 1000 * channels)
+        require(static_cast<bool>(mc::encode(encoder, std::span(pcm).subspan(at, std::min<std::size_t>(1000 * channels, pcm.size() - at)), packets)), "AAC encodes");
+    require(static_cast<bool>(mc::drain(encoder, packets)), "AAC drains");
+    const auto expected = (rate + 1023) / 1024;
+    require(packets.size() >= expected && packets.size() <= expected + 3, "AAC packets for a second: " + std::to_string(packets.size()));
+    for (const auto& p : packets) require(!p.data.empty() && p.data.size() < 6144 * channels, "an AAC frame");
+    std::cout << "AAC encoder: " << c.name << ", " << rate << " Hz, " << channels << " ch, " << mc::bit_rate(encoder) << " b/s, "
+              << packets.size() << " packets\n";
+    mc::close(encoder);
+    require(mc::open_audio({mc::Codec::aac, 7, channels}).error() == host::Error::invalid_argument, "a rate no encoder takes is refused");
 }
 
 void real_backend() {
@@ -259,7 +368,10 @@ void real_backend() {
 int main() {
     try {
         if (host::backend() == "null") null_backend();
-        else real_backend();
+        else {
+            real_backend();
+            media_codecs();
+        }
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;
