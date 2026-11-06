@@ -42,8 +42,7 @@ table that `launchctl`, `SMJobSubmit` and friends talk to.
   StartInterval, StartCalendarInterval, EnvironmentVariables,
   WorkingDirectory, StandardInPath, StandardOutPath, StandardErrorPath,
   ThrottleInterval, Disabled, LimitLoadToSessionType (Aqua, Background and
-  StandardIO load). MachServices and Sockets are read and reported (on-demand
-  launch is the next batch).
+  StandardIO load), MachServices (below) and Sockets (below).
 * **Accepted without effect:** resource limits, priorities, ProcessType, user
   and group names, and other keys launchd honours on macOS. `launchctl print`
   lists them under "keys without effect under Alchemy".
@@ -56,6 +55,41 @@ table that `launchctl`, `SMJobSubmit` and friends talk to.
 * **Signals.** As kill(2) between Alchemy processes: a signal whose default
   action ends a process ends the job (it cannot run a handler for a signal
   sent from outside); stopping signals are refused.
+
+## MachServices (alchemy-fx)
+
+`mach_services.cpp` and the session launchd hooks in
+`libsystem/mach/mach_remote.cpp`:
+
+* **The server holds the ports.** It runs a Mach port space with no guest code
+  and makes a port for each MachServices name when the job loads.
+* **Look-ups work from any process tree.** A `bootstrap_look_up` that a tree's
+  own registry misses asks the session launchd, if one runs, and gets a send
+  right to its port. The tree's own dynamic names behave as before.
+* **On-demand launch.** Messages queue at the server. The first one starts the
+  job (throttled by ThrottleInterval) when an application uses the session.
+* **Check-in.** The job's `bootstrap_check_in` of a name its job declares
+  takes the receive right; the queued messages follow, and later look-ups
+  reach the job directly. Only that job's process can check the name in.
+  HideUntilCheckIn hides the name until then.
+* **Job exit.** A port the job had checked in dies with it, and the server
+  makes a new one for the next run. Old send rights become dead names, as an
+  XPC client sees "interrupted".
+* **alchemy.exe** (no cross-process Mach layer) loads such jobs, but their
+  services have no ports. `launchctl print` says so.
+
+## Sockets
+
+* **What is made.** Listening sockets are made at load: a Unix-domain path
+  (SockPathName), or a numeric TCP or UDP port on SockNodeName. Without a
+  node they bind every address, or only loopback under
+  `ALCHEMY_NETWORK=loopback`. IPv4 and IPv6 are both made unless SockFamily
+  picks one.
+* **Every run of the job gets them**, at descriptors 3 and up.
+  `launch_activate_socket(key)` returns them, and `launch_msg("CheckIn")`
+  answers Label, Sockets and MachServices.
+* **Refused, with a log line:** connecting sockets (SockPassive false) and
+  named services (only port numbers).
 
 ## launchctl
 
@@ -81,8 +115,9 @@ program directly (`process/launch.cpp`).
 
 * **SMJobSubmit and SMJobRemove** work in the user domain.
 * **SMJobCopyDictionary and SMCopyAllJobDictionaries** answer from the session.
-* **launch_activate_socket** answers ESRCH for a process that is not a job,
-  and ENOENT for a job (no Sockets yet).
+* **launch_activate_socket** returns a job's sockets (a malloc'd array). It
+  answers ESRCH for a process that is not a job, and ENOENT for a key the
+  job does not have.
 * **The system domain fails** with kSMErrorAuthorizationFailure.
 * **Stay in `darwin/servicemanagement/`:** SMJobBless (refused) and
   SMAppService and login items (not registered: the user's decision is
@@ -107,6 +142,11 @@ These are refused, by the user's decisions of 2026-11-05:
   (`tests/service_management_tests.cpp`): the ServiceManagement calls without
   a session launchd.
 * `alchemy_launchd_session_fx` (`tests/fixtures/macos/launchd_model.c`, under
-  alchemy-fx): `launchctl` end to end. It covers bootstrap, list, print,
-  kickstart, kill, bootout, the system domain, submit and remove, setenv and
-  getenv, and `system("launchctl ...")`.
+  alchemy-fx). Three cases:
+  * `launchctl`: launchctl end to end. It covers bootstrap, list, print,
+    kickstart, kill, bootout, the system domain, submit and remove, setenv
+    and getenv, and `system("launchctl ...")`.
+  * `mach`: a job's service found from another process tree. The first
+    message launches the job, which checks in and answers; a second request
+    reaches the same job; the service is gone after bootout.
+  * `sockets`: `launch_activate_socket` and its errors, and the CheckIn reply.
