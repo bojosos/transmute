@@ -44,12 +44,18 @@ bool system_alias(std::string_view value) {
 // re-export of AudioToolbox, where the AudioComponent / AudioUnit /
 // AudioOutputUnit functions live, so an image linked against either finds a
 // name registered under the other (Chrome links AudioUnit, Electron
-// AudioToolbox). One hop only.
+// AudioToolbox). Likewise AVFoundation re-exports AVFAudio, where the audio
+// classes and constants (AVSpeechUtteranceDefaultSpeechRate, ...) live: Godot
+// binds them through AVFoundation, newer builds through AVFAudio. One hop only.
 constexpr std::string_view audio_toolbox_library = "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox";
 constexpr std::string_view audio_unit_library = "/System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit";
+constexpr std::string_view av_foundation_library = "/System/Library/Frameworks/AVFoundation.framework/Versions/A/AVFoundation";
+constexpr std::string_view avf_audio_library = "/System/Library/Frameworks/AVFAudio.framework/Versions/A/AVFAudio";
 std::string_view reexport_partner(std::string_view library) {
     if (library == audio_toolbox_library) return audio_unit_library;
     if (library == audio_unit_library) return audio_toolbox_library;
+    if (library == av_foundation_library) return avf_audio_library;
+    if (library == avf_audio_library) return av_foundation_library;
     return {};
 }
 
