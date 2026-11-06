@@ -2532,6 +2532,148 @@ void accessibility(Fixture& f) {
     require(f.text(f.id(element, "accessibilityIdentifier")) == "row-1", "element identifier");
 }
 
+// ---- the accessibility client (applicationservices/ax_client.cpp) ------------------------------------
+void ax_client(Fixture& f) {
+    journal.clear();
+    constexpr std::string_view services = "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices";
+    const auto call = [&f](std::string_view library, std::string_view symbol, std::vector<Address> arguments) -> Address {
+        const auto found = f.process.resolve(library, symbol);
+        require(found.has_value(), "missing " + std::string(symbol));
+        return f.engine.invoke_callback(found->address, arguments);
+    };
+    const auto ax = [&](std::string_view symbol, std::vector<Address> arguments) {
+        return static_cast<std::int32_t>(call(services, symbol, std::move(arguments)));
+    };
+    const auto out = f.process.allocate_guest(16);
+    // The value of an attribute (0 when the call fails).
+    const auto value = [&](Address element, std::string_view attribute) -> Address {
+        const auto status = ax("_AXUIElementCopyAttributeValue", {element, f.str(attribute), out});
+        return status == 0 ? f.engine.read64(out) : 0;
+    };
+    const auto role = [&](Address element) { return f.text(value(element, "AXRole")); };
+    const auto elements = [&](Address array) {
+        std::vector<Address> items;
+        for (std::int64_t i = 0, n = array ? f.integer(array, "count") : 0; i < n; ++i) items.push_back(f.id(array, "objectAtIndex:", {static_cast<Address>(i)}));
+        return items;
+    };
+    const auto names = [&](std::string_view symbol, Address element) {
+        std::vector<std::string> list;
+        if (ax(symbol, {element, out}) != 0) return list;
+        for (const auto name : elements(f.engine.read64(out))) list.push_back(f.text(name));
+        return list;
+    };
+    const auto has = [](const std::vector<std::string>& list, const char* name) { return std::find(list.begin(), list.end(), name) != list.end(); };
+
+    // A window: an editable field, a button, a slider and, inside a plain view, a label.
+    const auto window = f.make_window({{100, 100}, {320, 200}});
+    static_cast<void>(f.id(window, "setTitle:", {f.str("Cues")}));
+    const auto content = f.id(window, "contentView");
+    const auto field = f.with_rect(f.id(f.cls("NSTextField"), "alloc"), "initWithFrame:", {{10, 150}, {150, 22}});
+    const auto button = f.with_rect(f.id(f.cls("NSButton"), "alloc"), "initWithFrame:", {{10, 110}, {80, 24}});
+    static_cast<void>(f.id(button, "setTitle:", {f.str("Go")}));
+    static_cast<void>(f.id(button, "setTarget:", {f.target("ax")}));
+    static_cast<void>(f.id(button, "setAction:", {f.objc.selector("acted:")}));
+    const auto slider = f.with_rect(f.id(f.cls("NSSlider"), "alloc"), "initWithFrame:", {{10, 70}, {150, 22}});
+    const auto group = f.with_rect(f.id(f.cls("NSView"), "alloc"), "initWithFrame:", {{10, 10}, {200, 40}});
+    const auto label = f.id(f.cls("NSTextField"), "labelWithString:", {f.str("Status")});
+    static_cast<void>(f.id(group, "addSubview:", {label}));
+    for (const auto view : {field, button, slider, group}) static_cast<void>(f.id(content, "addSubview:", {view}));
+    f.show(window);
+
+    // This process's application element.
+    const auto pid = static_cast<std::int32_t>(call("/usr/lib/libSystem.B.dylib", "_getpid", {}));
+    const auto app = call(services, "_AXUIElementCreateApplication", {static_cast<Address>(pid)});
+    require(app != 0 && role(app) == "AXApplication", "the application element: " + role(app));
+    require(ax("_AXUIElementGetPid", {app, out}) == 0 && static_cast<std::int32_t>(f.engine.read32(out)) == pid, "AXUIElementGetPid");
+    const auto focused_window = value(app, "AXFocusedWindow");
+    require(focused_window && role(focused_window) == "AXWindow" && f.text(value(focused_window, "AXTitle")) == "Cues", "the focused window");
+    bool listed = false;
+    for (const auto item : elements(value(app, "AXWindows"))) listed = listed || f.yes(item, "isEqual:", {focused_window});
+    require(listed, "AXWindows lists the window");
+    require(has(names("_AXUIElementCopyAttributeNames", focused_window), "AXChildren") && has(names("_AXUIElementCopyActionNames", focused_window), "AXRaise"),
+            "the window's attribute and action names");
+
+    // Children skip the plain view; parents skip it too.
+    const auto children = elements(value(focused_window, "AXChildren"));
+    std::string roles;
+    for (const auto child : children) roles += role(child) + " ";
+    require(roles == "AXTextField AXButton AXSlider AXStaticText ", "the window's children: " + roles);
+    const auto field_element = children[0], button_element = children[1], slider_element = children[2], label_element = children[3];
+    require(f.yes(value(label_element, "AXParent"), "isEqual:", {focused_window}) && f.yes(value(button_element, "AXWindow"), "isEqual:", {focused_window}),
+            "AXParent and AXWindow");
+    require(f.text(value(button_element, "AXTitle")) == "Go" && f.text(value(label_element, "AXValue")) == "Status" &&
+                f.yes(value(button_element, "AXEnabled"), "boolValue"),
+            "titles, values and the enabled state");
+    if (f.process.resolve(services, "_AXValueGetValue")) {
+        const auto size = value(button_element, "AXSize");
+        require(size && call(services, "_AXValueGetValue", {size, 2, out}) == 1 &&
+                    std::bit_cast<double>(f.engine.read64(out)) == 80 && std::bit_cast<double>(f.engine.read64(out + 8)) == 24,
+                "AXSize");
+    }
+
+    // Actions and settable values.
+    require(has(names("_AXUIElementCopyActionNames", button_element), "AXPress"), "a button presses");
+    require(ax("_AXUIElementPerformAction", {button_element, f.str("AXPress")}) == 0, "AXPress");
+    f.pump();
+    require(journal.size() == 1 && journal[0].starts_with("ax:"), "AXPress clicks the button: " + joined());
+    require(ax("_AXUIElementPerformAction", {label_element, f.str("AXPress")}) == -25206, "a label has no AXPress");
+    require(ax("_AXUIElementSetAttributeValue", {field_element, f.str("AXValue"), f.str("Q1")}) == 0 && f.text(f.id(field, "stringValue")) == "Q1",
+            "AXValue sets a field's string");
+    require(ax("_AXUIElementSetAttributeValue", {slider_element, f.str("AXValue"), f.cf.real(0.75)}) == 0 && f.send(slider, "doubleValue").d(0) == 0.75,
+            "AXValue sets a slider's number");
+    require(ax("_AXUIElementCopyAttributeValue", {button_element, f.str("AXNoSuchThing"), out}) == -25205, "an unsupported attribute");
+
+    // Another process: no accessibility server answers.
+    const auto stranger = call(services, "_AXUIElementCreateApplication", {static_cast<Address>(pid + 1)});
+    require(ax("_AXUIElementCopyAttributeValue", {stranger, f.str("AXRole"), out}) == -25204 && f.engine.read64(out) == 0 &&
+                ax("_AXUIElementPerformAction", {stranger, f.str("AXRaise")}) == -25204,
+            "another process's element cannot complete");
+    require(ax("_AXObserverCreate", {static_cast<Address>(pid + 1), 1, out}) == -25204, "no observer of another process");
+
+    // An observer of the field's value changes.
+    // (The element and the notification are the callback's only while it runs.)
+    std::vector<Address> delivered;
+    Address expected_element{};
+    bool element_matched{};
+    std::string delivered_name;
+    const auto callback = f.process.install_function("ax_client_test_callback", [&](CpuState& s, GuestMemory&) {
+        delivered = {s.x[0], s.x[1], s.x[2], s.x[3]};
+        element_matched = expected_element && f.yes(s.x[1], "isEqual:", {expected_element});
+        delivered_name = f.text(s.x[2]);
+    }, "alchemy.test");
+    require(ax("_AXObserverCreate", {static_cast<Address>(pid), callback, out}) == 0, "AXObserverCreate");
+    const auto observer = f.engine.read64(out);
+    if (f.process.resolve("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFRunLoopSourceCreate"))
+        require(call(services, "_AXObserverGetRunLoopSource", {observer}) != 0, "the observer's run loop source");
+    const auto changed = f.str("AXValueChanged");
+    expected_element = field_element;
+    require(ax("_AXObserverAddNotification", {observer, field_element, changed, 0x1234}) == 0 &&
+                ax("_AXObserverAddNotification", {observer, field_element, changed, 0x1234}) == -25209,
+            "AXObserverAddNotification");
+    constexpr std::string_view appkit_library = "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit";
+    static_cast<void>(call(appkit_library, "_NSAccessibilityPostNotification", {button, changed}));   // not observed
+    static_cast<void>(f.next_event());
+    require(delivered.empty(), "a notification for another element is not delivered");
+    static_cast<void>(call(appkit_library, "_NSAccessibilityPostNotification", {field, changed}));
+    static_cast<void>(f.next_event());
+    require(delivered.size() == 4 && delivered[0] == observer && element_matched && delivered_name == "AXValueChanged" &&
+                delivered[3] == 0x1234,
+            "the observer's callback");
+    require(ax("_AXObserverRemoveNotification", {observer, field_element, changed}) == 0 &&
+                ax("_AXObserverRemoveNotification", {observer, field_element, changed}) == -25210,
+            "AXObserverRemoveNotification");
+    delivered.clear();
+    static_cast<void>(call(appkit_library, "_NSAccessibilityPostNotification", {field, changed}));
+    static_cast<void>(f.next_event());
+    require(delivered.empty(), "nothing delivered after removal");
+
+    // The system-wide element answers this process's focus.
+    const auto system_wide = call(services, "_AXUIElementCreateSystemWide", {});
+    const auto focused = value(system_wide, "AXFocusedUIElement");
+    require(focused && !role(focused).empty(), "the system-wide focused element");
+    static_cast<void>(f.id(window, "close"));
+}
+
 // ---- small additions -------------------------------------------------------------------------------
 void small_additions(Fixture& f) {
     journal.clear();
@@ -2836,6 +2978,7 @@ int main() {
         qlab_classes(f);
         rulers(f);
         accessibility(f);
+        ax_client(f);
         small_additions(f);
         appearances(f);
         scrolling_text(f);

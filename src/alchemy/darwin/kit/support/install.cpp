@@ -119,6 +119,7 @@ void install_support_kit(InstallContext& context) {
     install_coregraphics_color_space_property_list(value);
     install_coreservices_icon_refs(value);
     install_applicationservices_icon_services(value);
+    install_applicationservices_ax_client(value);
     install_accessibility(value);
     install_appkit_extra(value);
     install_pasteboard(value);

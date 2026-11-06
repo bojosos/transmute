@@ -1,4 +1,5 @@
 #include "alchemy/darwin/appkit/windows/windows_internal.hpp"
+#include "alchemy/darwin/kit/support/support_kit.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -495,9 +496,11 @@ void install_window_extras(Support& support) {
              {"_NSCollectionElementKindSectionFooter", "UICollectionElementKindSectionFooter"},
              {"_NSImageNameComputer", "NSComputer"}})
         if (!k.process.resolve(appkit::appkit_library, symbol)) k.string_constant(symbol, value);
-    // No assistive application is connected under Windows, so a posted
-    // accessibility notification has no observer.
-    k.function(appkit::appkit_library, "_NSAccessibilityPostNotificationWithUserInfo", [](CpuState&, GuestMemory&) {});
+    // No assistive application is connected under Windows: a posted
+    // accessibility notification reaches only this process's own AXObservers.
+    k.function(appkit::appkit_library, "_NSAccessibilityPostNotificationWithUserInfo", [](CpuState& s, GuestMemory&) {
+        support_kit::ax_client_post(s.x[0], s.x[1], s.x[2]);
+    });
     // void NSDrawThreePartImage(NSRect frame, NSImage *start, NSImage *fill,
     //   NSImage *end, BOOL vertical, NSCompositingOperation op, CGFloat alpha, BOOL flipped)
     k.function(appkit::appkit_library, "_NSDrawThreePartImage", [](CpuState& s, GuestMemory&) {

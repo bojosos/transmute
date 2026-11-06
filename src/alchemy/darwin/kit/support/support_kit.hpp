@@ -151,6 +151,12 @@ void install_metal_stage_input_output_shell(Support& support);   // darwin/metal
 void install_coregraphics_color_space_property_list(Support& support);   // darwin/coregraphics/color_space_property_list.cpp
 void install_coreservices_icon_refs(Support& support);   // darwin/coreservices/icon_refs.cpp
 void install_applicationservices_icon_services(Support& support);   // darwin/applicationservices/icon_services.cpp
+// The accessibility client (AXUIElement / AXObserver) for this process's own
+// tree (darwin/applicationservices/ax_client.cpp). ax_client_post delivers a
+// notification posted for `object` (NSAccessibilityPostNotification...) to
+// the observers registered for it; `info` may be 0.
+void install_applicationservices_ax_client(Support& support);
+void ax_client_post(Address object, Address notification, Address info);
 void install_accessibility(Support& support);
 void install_mutable_string(Support& support);   // mutable_string.cpp
 void install_wait_trace(Support& support);   // wait_trace.cpp (ALCHEMY_WAIT_DUMP)

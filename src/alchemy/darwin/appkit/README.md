@@ -32,6 +32,11 @@ Also -[NSSavePanel ok:] / -cancel: while the Windows file dialog is open,
 is not a bitmap, and +[NSColor colorWithColorSpace:components:count:] in
 colour spaces other than gray, RGB and CMYK.
 
+**Accessibility:** the NSAccessibility properties are stored on the object,
+and this process's own AXUIElement / AXObserver client reads them
+(`darwin/applicationservices/ax_client.cpp`): accessibility notifications
+reach its observers. No assistive application on the host sees the tree.
+
 **Unavailable, as documented:** remote notifications (no Apple Push
 Notification service: -registerForRemoteNotifications fails through the
 delegate with an NSCocoaErrorDomain error), and Finder tags in save panels

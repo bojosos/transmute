@@ -5,8 +5,9 @@
 // AppKit accessibility names and functions Qt's Cocoa accessibility bridge
 // (QMacAccessibilityElement, QCocoaAccessibility) binds. The constants carry
 // AppKit's values. No assistive-technology client exists on the host side of
-// Alchemy, so notifications posted with NSAccessibilityPostNotification have
-// no receiver (they are dropped, as on macOS with no client listening); the
+// Alchemy: notifications posted with NSAccessibilityPostNotification reach
+// only this process's own AXObservers (applicationservices/ax_client.cpp) and
+// are otherwise dropped, as on macOS with no client listening; the
 // "unignored" helpers treat every element as not ignored.
 namespace alchemy::gui::support_kit {
 namespace {
@@ -58,7 +59,7 @@ void install_accessibility(Support& support) {
         constant(symbol, value);
 
     auto* s = &support;
-    support.fill_function(lib, "_NSAccessibilityPostNotification", [](CpuState&, GuestMemory&) {});
+    support.fill_function(lib, "_NSAccessibilityPostNotification", [](CpuState& c, GuestMemory&) { ax_client_post(c.x[0], c.x[1], 0); });
     // NSAccessibilityRoleDescription(role, subrole): the role name without
     // "AX", in lower case words ("AXPopUpButton" -> "pop up button").
     support.fill_function(lib, "_NSAccessibilityRoleDescription", [s](CpuState& c, GuestMemory&) {
