@@ -20,7 +20,8 @@ using namespace fill_test;
 #define FRAMEWORK(name) "/System/Library/Frameworks/" name ".framework/Versions/A/" name
 constexpr std::string_view cm = FRAMEWORK("CoreMedia"), vt = FRAMEWORK("VideoToolbox"), av = FRAMEWORK("AVFoundation"),
     cv = FRAMEWORK("CoreVideo"), at = FRAMEWORK("AudioToolbox"), au = FRAMEWORK("AudioUnit"), ca = FRAMEWORK("CoreAudio"),
-    midi = FRAMEWORK("CoreMIDI"), ma = FRAMEWORK("MediaAccessibility"), ic = FRAMEWORK("ImageCaptureCore");
+    midi = FRAMEWORK("CoreMIDI"), ma = FRAMEWORK("MediaAccessibility"), ic = FRAMEWORK("ImageCaptureCore"),
+    gc = FRAMEWORK("GameController");
 #undef FRAMEWORK
 constexpr std::string_view sys = "/usr/lib/libSystem.B.dylib";
 
@@ -405,6 +406,37 @@ void bearers_and_taps(Fixture& f) {
         require(f.cf.length(f.send(f.send(f.send(output_class, "alloc"), "init"), "availablePhotoCodecTypes")) == 0, "an unconnected photo output");
 }
 
+// GameController as Godot binds it: the input element names, GCColor, button and axis elements an app sets, and
+// no controllers.
+void game_controller(Fixture& f) {
+    for (const char* name : {"ButtonA", "ButtonB", "ButtonX", "ButtonY", "ButtonMenu", "ButtonOptions", "DirectionPad", "DualShockTouchpadButton",
+                             "DualShockTouchpadOne", "DualShockTouchpadTwo", "LeftShoulder", "LeftThumbstick", "LeftThumbstickButton", "LeftTrigger",
+                             "RightShoulder", "RightThumbstick", "RightThumbstickButton", "RightTrigger", "XboxPaddleOne", "XboxPaddleTwo",
+                             "XboxPaddleThree", "XboxPaddleFour"})
+        require(f.string_constant(gc, std::string("_GCInput") + name) == name, std::string("GCInput") + name);
+    require(f.string_constant(gc, "_GCHapticsLocalityLeftHandle") == "LeftHandle" &&
+            f.string_constant(gc, "_GCControllerDidConnectNotification") == "GCControllerDidConnectNotification", "haptics and notification names");
+    alchemy::CallRegs rgb{};
+    rgb.set_s(0, 1.0f);
+    rgb.set_s(1, 0.5f);
+    rgb.set_s(2, 0.25f);
+    const auto color = f.objc.send(f.send(f.cls("GCColor"), "alloc"), f.objc.selector("initWithRed:green:blue:"), rgb).x0;
+    require(color && f.objc.send(color, f.objc.selector("red"), {}).s(0) == 1.0f && f.objc.send(color, f.objc.selector("green"), {}).s(0) == 0.5f &&
+            f.objc.send(color, f.objc.selector("blue"), {}).s(0) == 0.25f && f.send(color, "copy") == color, "GCColor");
+    const auto button = f.send(f.send(f.cls("GCControllerButtonInput"), "alloc"), "init");
+    require((f.send(button, "isPressed") & 0xff) == 0, "a button at rest");
+    alchemy::CallRegs value{};
+    value.set_s(0, 0.75f);
+    static_cast<void>(f.objc.send(button, f.objc.selector("setValue:"), value));
+    require((f.send(button, "isPressed") & 0xff) == 1 && f.objc.send(button, f.objc.selector("value"), {}).s(0) == 0.75f && f.send(button, "collection") == 0,
+            "a pressed button keeps its value");
+    const auto axis = f.send(f.send(f.cls("GCControllerAxisInput"), "alloc"), "init");
+    value.set_s(0, -0.5f);
+    static_cast<void>(f.objc.send(axis, f.objc.selector("setValue:"), value));
+    require(f.objc.send(axis, f.objc.selector("value"), {}).s(0) == -0.5f && f.send(axis, "valueChangedHandler") == 0, "an axis keeps its value");
+    require(f.cf.array_values(f.send(f.cls("GCController"), "controllers")).empty() && f.send(f.cls("GCController"), "current") == 0, "no controllers");
+}
+
 } // namespace
 
 int main() {
@@ -413,5 +445,5 @@ int main() {
     _putenv_s("ALCHEMY_AUDIO_DEVICES", "none");
     _putenv_s("ALCHEMY_CAMERA", "none");
     return run("media", {{"imports", imports}, {"core media", core_media}, {"core media timing", core_media_timing}, {"video", video}, {"audio", audio}, {"accessibility", accessibility},
-                         {"bearers and taps", bearers_and_taps}});
+                         {"bearers and taps", bearers_and_taps}, {"game controller", game_controller}});
 }

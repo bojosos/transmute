@@ -30,8 +30,10 @@
 // - CoreMIDI 2.0 event lists are real; there are no MIDI endpoints, so input
 //   ports bind to the provider's block-based ports (which never receive) and
 //   sending fails with kMIDIObjectNotFound.
-// - GameController: notification names, haptic localities and the pad
-//   classes (no controller is ever connected).
+// - GameController: notification names, haptic localities, the input element
+//   names (GCInputButtonA and the rest), the pad classes, GCColor (a real RGB
+//   value) and the button and axis element classes (values an app can set; no
+//   controller is ever connected, so the system makes none).
 // - CoreGraphics: no display is mirrored; CGRegion is a real rectangle value;
 //   windows cannot be excluded from capture (kCGErrorInvalidConnection).
 // - CoreText: CTFontCreateForStringWithLanguage is CTFontCreateForString (the
@@ -468,6 +470,52 @@ void Provider::install_media() {
     for (const auto* name : {"Default", "All", "Handles", "LeftHandle", "RightHandle", "Triggers", "LeftTrigger", "RightTrigger"})
         string(game_controller, std::string("_GCHapticsLocality") + name, name);   // (unverified: value = locality name)
     float_constant(game_controller, "_GCHapticDurationInfinite", std::numeric_limits<float>::infinity());   // (unverified)
+    // The physical input element names (GCInputButtonName, GCInputDirectionPadName): the documentation gives
+    // their names, not their values.
+    for (const auto* name : {"ButtonA", "ButtonB", "ButtonX", "ButtonY", "ButtonHome", "ButtonMenu", "ButtonOptions", "ButtonShare",
+                             "DirectionPad", "LeftThumbstick", "RightThumbstick", "LeftThumbstickButton", "RightThumbstickButton",
+                             "LeftShoulder", "RightShoulder", "LeftTrigger", "RightTrigger", "LeftBumper", "RightBumper", "LeftPaddle",
+                             "RightPaddle", "LeftSideButton", "RightSideButton", "XboxPaddleOne", "XboxPaddleTwo", "XboxPaddleThree",
+                             "XboxPaddleFour", "DualShockTouchpadOne", "DualShockTouchpadTwo", "DualShockTouchpadButton", "Thumbstick",
+                             "ThumbstickButton", "Trigger", "GripButton", "StylusTip", "StylusPrimaryButton", "StylusSecondaryButton",
+                             "DirectionalDpad", "DirectionalCardinalDpad", "DirectionalCenterButton", "DirectionalTouchSurfaceButton",
+                             "MicroGamepadDpad", "MicroGamepadButtonA", "MicroGamepadButtonX", "MicroGamepadButtonMenu"})
+        string(game_controller, std::string("_GCInput") + name, name);   // (unverified: value = the name after "GCInput")
+    // GCColor: an RGB value of float components (a DualShock or DualSense light).
+    const auto color = cls(game_controller, "GCColor", "NSObject");
+    real_properties(color, {"red", "green", "blue"}, true);
+    method(color, "initWithRed:green:blue:", [this](CpuState& s, GuestMemory&) {
+        const auto state = properties(s.x[0]);
+        std::lock_guard lock(state->mutex);
+        state->reals["red"] = fill::real32(s, 0);
+        state->reals["green"] = fill::real32(s, 1);
+        state->reals["blue"] = fill::real32(s, 2);
+    }, false, "@@:fff");
+    method(color, "copyWithZone:", [this](CpuState& s, GuestMemory&) { s.x[0] = objc.send(s.x[0], "retain").x0; }, false, "@@:^{_NSZone=}");   // immutable
+    // The elements of a controller's input profile. None is connected, so the system makes none; one an app
+    // creates keeps the value it is given (pressed above 0) and its handlers.
+    if (!objc.find_class("GCControllerElement")) static_cast<void>(cls(game_controller, "GCControllerElement", "NSObject"));
+    const auto element = objc.find_class("GCControllerElement");
+    integer_properties(element, {"isAnalog", "isBoundToSystemGesture", "preferredSystemGestureState"});
+    object_properties(element, {"localizedName", "unmappedLocalizedName", "sfSymbolsName", "unmappedSfSymbolsName"});
+    method(element, "collection", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    method(element, "aliases", [this](CpuState& s, GuestMemory&) {
+        const auto set = objc.find_class("NSSet");
+        s.x[0] = set ? objc.send(set, "set").x0 : 0;
+    });
+    const auto button = cls(game_controller, "GCControllerButtonInput", "GCControllerElement");
+    real_properties(button, {"value"}, true);
+    integer_properties(button, {"isTouched"});
+    object_properties(button, {"valueChangedHandler", "pressedChangedHandler", "touchedChangedHandler"});
+    method(button, "isPressed", [this](CpuState& s, GuestMemory&) {
+        const auto state = properties(s.x[0]);
+        std::lock_guard lock(state->mutex);
+        const auto found = state->reals.find("value");
+        s.x[0] = found != state->reals.end() && found->second > 0 ? 1 : 0;
+    }, false, "B@:");
+    const auto axis = cls(game_controller, "GCControllerAxisInput", "GCControllerElement");
+    real_properties(axis, {"value"}, true);
+    object_properties(axis, {"valueChangedHandler"});
     if (!objc.find_class("GCPhysicalInputProfile")) static_cast<void>(cls(game_controller, "GCPhysicalInputProfile", "NSObject"));
     if (!objc.find_class("GCExtendedGamepad")) static_cast<void>(cls(game_controller, "GCExtendedGamepad", "GCPhysicalInputProfile"));
     for (const auto* name : {"GCDualSenseGamepad", "GCDualShockGamepad", "GCXboxGamepad"})
