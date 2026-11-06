@@ -1,11 +1,13 @@
 #include "alchemy/gui/fill_provider.hpp"
 
 #include "alchemy/call_regs.hpp"
+#include "alchemy/darwin/launchd/client.hpp"
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/process_tree.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/host/system.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <set>
@@ -65,8 +67,8 @@ struct LaunchNode {
     std::vector<Address> array;                         // owned children (0 = empty slot)
 };
 // <launch.h> launch_data_type_t
-constexpr std::uint32_t launch_dictionary = 1, launch_array = 2, launch_integer = 4, launch_real = 5, launch_bool = 6,
-    launch_string = 7, launch_opaque = 8, launch_errno = 9;
+constexpr std::uint32_t launch_dictionary = 1, launch_array = 2, launch_fd = 3, launch_integer = 4, launch_real = 5, launch_bool = 6,
+    launch_string = 7, launch_opaque = 8, launch_errno = 9, launch_machport = 10;
 
 class Machsys final : public Provider {
 public:
@@ -429,8 +431,73 @@ void Machsys::install_launchd() {
         if (!slot) slot = cstring(text);
         s.x[0] = slot;
     });
-    // launch_msg: launchd is absent.
-    raw(libsystem, "_launch_msg", [this](CpuState& s, GuestMemory&) { set_errno(e_notsup); s.x[0] = 0; });
+    // launch_msg: only the CheckIn request, and only in a job of the session
+    // launchd (darwin/launchd/): its Label, its Sockets (fd nodes) and its
+    // MachServices (receive rights, checked in here). Any other request, or a
+    // process the session launchd did not start, fails with ENOTSUP as before.
+    raw(libsystem, "_launch_msg", [this](CpuState& s, GuestMemory& m) {
+        const auto request = s.x[0];
+        bool check_in = false;
+        {
+            std::lock_guard lock(mutex);
+            const auto found = launch.find(request);
+            check_in = found != launch.end() && found->second.type == launch_string && found->second.text == "CheckIn";
+        }
+        const auto job = check_in ? launchd::check_in_job() : std::nullopt;
+        if (!job) { set_errno(e_notsup); s.x[0] = 0; return; }
+        const auto string_node = [this](const std::string& text) { LaunchNode node; node.type = launch_string; node.text = text; return new_node(std::move(node)); };
+        LaunchNode sockets;
+        sockets.type = launch_dictionary;
+        for (const auto& [key, fd] : job->sockets) {
+            auto at = std::find_if(sockets.dict.begin(), sockets.dict.end(), [&](const auto& item) { return item.first == key; });
+            if (at == sockets.dict.end()) {
+                LaunchNode list;
+                list.type = launch_array;
+                sockets.dict.emplace_back(key, new_node(std::move(list)));
+                at = sockets.dict.end() - 1;
+            }
+            LaunchNode descriptor;
+            descriptor.type = launch_fd;
+            descriptor.integer = fd;
+            const auto child = new_node(std::move(descriptor));
+            with_node(at->second, [&](LaunchNode& list) { list.array.push_back(child); return 0; });
+        }
+        LaunchNode services;
+        services.type = launch_dictionary;
+        const auto bootstrap = process.resolve(libsystem, "_bootstrap_port");
+        const auto bootstrap_port = bootstrap ? m.read32(bootstrap->address) : 0;
+        const auto cell = malloc(8);
+        for (const auto& service : job->services) {
+            m.write32(cell, 0);
+            const auto name = cstring(service);
+            const auto status = call(libsystem, "_bootstrap_check_in", {bootstrap_port, name, cell});
+            if (status != 0) continue;
+            LaunchNode port;
+            port.type = launch_machport;
+            port.integer = m.read32(cell);
+            services.dict.emplace_back(service, new_node(std::move(port)));
+        }
+        free(cell);
+        LaunchNode reply;
+        reply.type = launch_dictionary;
+        reply.dict.emplace_back("Label", string_node(job->label));
+        if (!sockets.dict.empty()) reply.dict.emplace_back("Sockets", new_node(std::move(sockets)));
+        if (!services.dict.empty()) reply.dict.emplace_back("MachServices", new_node(std::move(services)));
+        s.x[0] = new_node(std::move(reply));
+    });
+    // launch_data_new_fd / get_fd, launch_data_new_machport / get_machport (the CheckIn reply's leaves).
+    raw(libsystem, "_launch_data_new_fd", [this](CpuState& s, GuestMemory&) {
+        LaunchNode node; node.type = launch_fd; node.integer = static_cast<std::int32_t>(s.x[0]); s.x[0] = new_node(std::move(node));
+    });
+    raw(libsystem, "_launch_data_get_fd", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<std::uint32_t>(with_node(s.x[0], [](LaunchNode& n) { return n.type == launch_fd ? n.integer : -1; }));
+    });
+    raw(libsystem, "_launch_data_new_machport", [this](CpuState& s, GuestMemory&) {
+        LaunchNode node; node.type = launch_machport; node.integer = static_cast<std::uint32_t>(s.x[0]); s.x[0] = new_node(std::move(node));
+    });
+    raw(libsystem, "_launch_data_get_machport", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<std::uint32_t>(with_node(s.x[0], [](LaunchNode& n) { return n.type == launch_machport ? n.integer : 0; }));
+    });
     // launch_data_t containers (real).
     raw(libsystem, "_launch_data_alloc", [this](CpuState& s, GuestMemory&) {
         LaunchNode node;
