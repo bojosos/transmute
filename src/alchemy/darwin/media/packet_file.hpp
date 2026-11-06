@@ -13,7 +13,9 @@
 //   finish() sets that size and adds 'moov': one sound track whose sample entry is the format's
 //   ('alac', with the cookie in its 'alac' box), and the sample tables (stts, stsc, stsz, stco: one
 //   chunk), version 1 times when they need 64 bits.
-// Formats: Apple Lossless ('alac') in either container.
+// Formats: Apple Lossless ('alac') and AAC-LC ('aac ': an 'mp4a' sample entry whose 'esds' holds the ES
+// descriptor the cookie is) in either container. MPEG-4 files present the frames between the priming and the
+// remainder through an edit list.
 
 #include <cstdint>
 #include <optional>
@@ -26,8 +28,8 @@ namespace alchemy::gui::completion_kit::media::packet_file {
 struct Format {
     std::uint32_t file_type{};          // 'caff', 'm4af' or 'mp4f'
     double rate{};
-    std::uint32_t format_id{};          // 'alac'
-    std::uint32_t flags{};              // kAppleLosslessFormatFlag_* (1-4: 16, 20, 24, 32-bit source)
+    std::uint32_t format_id{};          // 'alac' or 'aac '
+    std::uint32_t flags{};              // ALAC: kAppleLosslessFormatFlag_* (1-4: 16, 20, 24, 32-bit source); AAC: 0 or 2 (LC)
     std::uint32_t frames_per_packet{};
     std::uint32_t channels{};
 };

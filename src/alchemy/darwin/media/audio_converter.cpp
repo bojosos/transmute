@@ -1,4 +1,5 @@
 #include "alchemy/darwin/media/media_support.hpp"
+#include "alchemy/darwin/media/aac_encoder.hpp"
 #include "alchemy/darwin/media/audio_file_core.hpp"
 #include "alchemy/darwin/media/media_codecs.hpp"
 #include "alchemy/darwin/media/media_container.hpp"
@@ -8,6 +9,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -37,8 +40,15 @@
 // channels and rate (0: the input's), its frames per packet or 4096. AudioConverterFillComplexBuffer
 // gives whole packets with their descriptions (a short last packet names its frames) while the
 // output buffer has room for the largest one; kAudioConverterCompressionMagicCookie describes the
-// packets so far. Other compressed formats (AAC, ...) answer kAudioConverterErr_FormatNotSupported
-// from AudioConverterNew.
+// packets so far.
+// AAC ('aac ', AAC-LC: mFormatFlags 0 or kMPEG4Object_AAC_LC) encodes through the host system's AAC
+// encoder (aac_encoder.hpp) when it takes the output's rate and channels (0: the input's); otherwise, and
+// on a host without one, AudioConverterNew answers kAudioConverterErr_FormatNotSupported. Packets are
+// 1024 frames, the encoder's delay leading (kAudioConverterPrimeInfo); kAudioConverterEncodeBitRate
+// picks among the bit rates the encoder offers (kAudioConverterApplicableEncodeBitRates and
+// ...AvailableEncodeBitRates; ...EncodeSampleRates likewise) until the first conversion; the
+// compression magic cookie is the MPEG-4 ES descriptor. Other compressed formats answer
+// kAudioConverterErr_FormatNotSupported from AudioConverterNew.
 namespace alchemy::gui::completion_kit::media {
 namespace {
 
@@ -79,8 +89,25 @@ struct Converter {
     // depth it keeps.
     std::unique_ptr<codecs::AudioEncoder> encoder;
     std::uint32_t encode_bits{};
+    // AAC: the encoder (opened at the first conversion or cookie, at `aac_bit_rate`), its packets not yet
+    // handed out, and whether it has been drained.
+    bool aac{};
+    std::unique_ptr<aac::Encoder> aac_encoder;
+    std::uint32_t aac_bit_rate{};
+    std::deque<std::vector<std::uint8_t>> aac_ready;
+    bool aac_drained{};
     std::mutex mutex;
 };
+
+// The AAC encoder of the converter, opened if it is not yet: false if none takes its format.
+bool ensure_aac(Converter& c) {
+    if (c.aac_encoder) return true;
+    std::string why;
+    c.aac_encoder = aac::open(static_cast<std::uint32_t>(c.out.rate), c.out.channels, c.aac_bit_rate, why);
+    return c.aac_encoder != nullptr;
+}
+// The largest AAC frame: 6144 bits per channel.
+std::uint32_t aac_max_packet(const Converter& c) { return 768 * c.out.channels; }
 
 bool decodable(std::uint32_t format_id) {
     return format_id == four(".mp1") || format_id == four(".mp2") || format_id == four(".mp3") || format_id == four("opus") ||
@@ -214,6 +241,8 @@ private:
                       std::uint64_t descriptions);
     std::int32_t fill_packets(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets, std::uint64_t list,
                               std::uint64_t descriptions);
+    std::int32_t fill_aac(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets, std::uint64_t list,
+                          std::uint64_t descriptions);
     std::int32_t get_property(Converter& c, std::uint32_t id, std::vector<std::uint8_t>& out, bool& writable);
     std::int32_t set_property(Converter& c, std::uint32_t id, std::span<const std::uint8_t> data);
 
@@ -376,6 +405,7 @@ std::size_t Converters::render(Converter& c, std::uint64_t handle, std::uint64_t
 std::int32_t Converters::fill(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets,
                               std::uint64_t list, std::uint64_t descriptions) {
     if (c.encoder) return fill_packets(c, handle, proc, user_data, io_packets, list, descriptions);
+    if (c.aac) return fill_aac(c, handle, proc, user_data, io_packets, list, descriptions);
     auto& m = support_.process.calling_engine();
     const auto wanted = static_cast<std::size_t>(m.read32(io_packets));
     if (!wanted) return 0;
@@ -440,6 +470,58 @@ std::int32_t Converters::fill_packets(Converter& c, std::uint64_t handle, std::u
     return packets ? 0 : c.end_status;
 }
 
+// AAC output: 1024-frame blocks of the input, as 16-bit samples, through the encoder; its packets, whole, while
+// the buffer has room for the largest.
+std::int32_t Converters::fill_aac(Converter& c, std::uint64_t handle, std::uint64_t proc, std::uint64_t user_data, std::uint64_t io_packets,
+                                  std::uint64_t list, std::uint64_t descriptions) {
+    auto& m = support_.process.calling_engine();
+    const auto wanted = m.read32(io_packets);
+    m.write32(io_packets, 0);
+    if (!wanted) return 0;
+    if (m.read32(list) < 1 || !m.read64(list + 16)) return error::param;
+    const auto capacity = m.read32(list + 12);
+    const auto data = m.read64(list + 16);
+    if (capacity < aac_max_packet(c)) return error::invalid_output_size;
+    if (!ensure_aac(c)) return error::format_not_supported;
+    std::vector<double> samples;
+    std::vector<std::int16_t> pcm;
+    std::vector<std::vector<std::uint8_t>> made;
+    std::uint64_t used = 0;
+    std::uint32_t packets = 0;
+    while (packets < wanted && capacity - used >= aac_max_packet(c)) {
+        if (c.aac_ready.empty()) {
+            if (c.aac_drained) break;
+            const auto frames = render(c, handle, proc, user_data, samples, aac::frames_per_packet);
+            pcm.resize(samples.size());
+            for (std::size_t i = 0; i < samples.size(); ++i)
+                pcm[i] = static_cast<std::int16_t>(std::clamp<long>(std::lround(samples[i] * 32768.0), -32768, 32767));
+            made.clear();
+            bool ok = !frames || c.aac_encoder->encode(pcm, made);
+            if (frames < aac::frames_per_packet) {   // the input ended: the encoder's last packets
+                ok = ok && c.aac_encoder->drain(made);
+                c.aac_drained = true;
+            }
+            if (!ok) return error::unspecified;
+            for (auto& p : made) c.aac_ready.push_back(std::move(p));
+            continue;
+        }
+        const auto packet = std::move(c.aac_ready.front());
+        c.aac_ready.pop_front();
+        m.write_bytes(data + used, packet);
+        if (descriptions) {
+            const auto d = descriptions + 16ULL * packets;
+            m.write64(d, used);
+            m.write32(d + 8, 0);
+            m.write32(d + 12, static_cast<std::uint32_t>(packet.size()));
+        }
+        used += packet.size();
+        ++packets;
+    }
+    m.write32(list + 12, static_cast<std::uint32_t>(used));
+    m.write32(io_packets, packets);
+    return packets ? 0 : c.end_status;
+}
+
 std::int32_t Converters::get_property(Converter& c, std::uint32_t id, std::vector<std::uint8_t>& out, bool& writable) {
     const auto u32 = [&](std::uint32_t value) { out.resize(4); std::memcpy(out.data(), &value, 4); };
     writable = false;
@@ -463,16 +545,50 @@ std::int32_t Converters::get_property(Converter& c, std::uint32_t id, std::vecto
         return 0;
     case four("xops"):
         if (c.encoder) { u32(c.encoder->max_packet_bytes); return 0; }
+        if (c.aac) { u32(aac_max_packet(c)); return 0; }
         u32(c.out.frame_bytes() * (c.out.non_interleaved ? c.out.channels : 1));
         return 0;
     case four("cmgc"):   // kAudioConverterCompressionMagicCookie
+        if (c.aac) {
+            if (!ensure_aac(c)) return error::format_not_supported;
+            const auto bits = c.aac_encoder->bit_rate();
+            out = aac::es_descriptor(c.aac_encoder->audio_specific_config(), bits, bits, aac_max_packet(c));
+            return 0;
+        }
         if (!c.encoder) return error::property_not_supported;
         out = c.encoder->cookie();
         return 0;
+    case four("brat"):   // kAudioConverterEncodeBitRate
+        if (!c.aac) return error::property_not_supported;
+        u32(c.aac_encoder ? c.aac_encoder->bit_rate() : c.aac_bit_rate);
+        if (!c.aac_encoder && !c.aac_bit_rate && ensure_aac(c)) u32(c.aac_encoder->bit_rate());
+        writable = true;
+        return 0;
+    case four("aebr"): case four("vebr"): case four("aesr"): case four("vesr"): {   // the encode bit rates and sample rates
+        if (!c.aac) return error::property_not_supported;
+        const auto caps = aac::capabilities();
+        const auto& values = id == four("aebr") || id == four("vebr") ? caps.bit_rates : caps.sample_rates;
+        out.clear();
+        for (const auto v : values) {   // AudioValueRange {Float64 mMinimum; Float64 mMaximum}
+            const double d = v;
+            const auto at = out.size();
+            out.resize(at + 16);
+            std::memcpy(out.data() + at, &d, 8);
+            std::memcpy(out.data() + at + 8, &d, 8);
+        }
+        return 0;
+    }
     case four("srcq"): u32(c.quality); writable = true; return 0;
     case four("srca"): u32(c.complexity); writable = true; return 0;
     case four("prmm"): u32(c.prime_method); writable = true; return 0;
-    case four("prim"): out.assign(8, 0); writable = true; return 0;   // no leading or trailing frames
+    case four("prim"):   // AudioConverterPrimeInfo {leadingFrames, trailingFrames}: an AAC encoder's delay leads
+        out.assign(8, 0);
+        if (c.aac && ensure_aac(c)) {
+            const auto leading = c.aac_encoder->priming();
+            std::memcpy(out.data(), &leading, 4);
+        }
+        writable = true;
+        return 0;
     case four("chmp"): {
         out.resize(4ULL * c.out.channels);
         for (std::uint32_t o = 0; o < c.out.channels; ++o) {
@@ -495,6 +611,19 @@ std::int32_t Converters::set_property(Converter& c, std::uint32_t id, std::span<
     case four("srca"): if (data.size() < 4) return error::bad_property_size; c.complexity = value; return 0;
     case four("prmm"): if (data.size() < 4) return error::bad_property_size; c.prime_method = value; return 0;
     case four("prim"): return 0;
+    case four("brat"): {
+        if (!c.aac) return error::property_not_supported;
+        if (data.size() < 4) return error::bad_property_size;
+        if (c.output_frames) return error::property_not_supported;   // only before the first conversion
+        // The nearest bit rate the encoder offers.
+        const auto caps = aac::capabilities();
+        std::uint32_t chosen = value;
+        for (const auto rate : caps.bit_rates)
+            if (chosen == value || std::llabs(std::int64_t{rate} - value) < std::llabs(std::int64_t{chosen} - value)) chosen = rate;
+        c.aac_bit_rate = chosen;
+        c.aac_encoder.reset();
+        return 0;
+    }
     case four("dmgc"):
         if (!c.codec) return error::property_not_supported;
         c.cookie.assign(data.begin(), data.end());
@@ -538,6 +667,49 @@ void Converters::install() {
         auto made = std::make_shared<Converter>();
         std::uint32_t out_id{};
         std::memcpy(&out_id, outf.data() + 8, 4);
+        if (out_id == four("aac ")) {
+            // AAC-LC from linear PCM, at a rate and channel count the host's encoder takes.
+            const auto from = af::pcm_from_asbd(in, why);
+            if (in_id != four("lpcm") || !from) return error::format_not_supported;
+            double rate{};
+            std::uint32_t flags{}, channels{};
+            std::memcpy(&rate, outf.data(), 8);
+            std::memcpy(&flags, outf.data() + 12, 4);
+            std::memcpy(&channels, outf.data() + 28, 4);
+            if (rate == 0) rate = from->rate;
+            if (!channels) channels = from->channels;
+            if (flags != 0 && flags != 2) return error::format_not_supported;   // kMPEG4Object_AAC_LC only
+            const auto caps = aac::capabilities();
+            const auto takes = [](const std::vector<std::uint32_t>& list, double v) {
+                return std::find(list.begin(), list.end(), static_cast<std::uint32_t>(v)) != list.end() && v == std::floor(v);
+            };
+            if (!takes(caps.sample_rates, rate) || !takes(caps.channel_counts, channels)) return error::format_not_supported;
+            made->aac = true;
+            made->in = *from;
+            made->out.rate = rate;
+            made->out.channels = channels;
+            made->out.is_float = true;
+            made->out.bits = 64;
+            made->out.container = 8;
+            const std::uint32_t lc = 2, per_packet = aac::frames_per_packet, zero = 0;
+            std::memcpy(outf.data(), &rate, 8);
+            std::memcpy(outf.data() + 12, &lc, 4);
+            std::memcpy(outf.data() + 16, &zero, 4);
+            std::memcpy(outf.data() + 20, &per_packet, 4);
+            std::memcpy(outf.data() + 24, &zero, 4);
+            std::memcpy(outf.data() + 28, &channels, 4);
+            std::memcpy(outf.data() + 32, &zero, 4);
+            made->in_asbd = in;
+            made->out_asbd = outf;
+            const auto handle = self->support_.process.allocate_guest(16, 16);
+            m.fill_bytes(handle, 0, 16);
+            {
+                std::lock_guard lock(self->mutex_);
+                self->converters_[handle] = std::move(made);
+            }
+            m.write64(out, handle);
+            return 0;
+        }
         if (out_id != four("lpcm")) {
             // Encoding: linear PCM in, packets out. Unset fields of the output take the input's.
             const auto from = af::pcm_from_asbd(in, why);
@@ -642,6 +814,10 @@ void Converters::install() {
         c->resampler.reset();
         c->pending.clear();
         if (c->decoder) c->decoder->reset();
+        // AAC: a new stream (the encoder is opened again at the next conversion).
+        c->aac_encoder.reset();
+        c->aac_ready.clear();
+        c->aac_drained = false;
         c->input_frames = c->output_frames = 0;
         c->ended = false;
         c->end_status = 0;
@@ -703,7 +879,7 @@ void Converters::install() {
         if (!s.x[2] || !s.x[3]) return status(s, error::param);
         std::lock_guard lock(c->mutex);
         // Packets need AudioConverterFillComplexBuffer, as rate changes do.
-        if (c->codec || c->encoder || c->in.rate != c->out.rate) return status(s, error::invalid_input_size);
+        if (c->codec || c->encoder || c->aac || c->in.rate != c->out.rate) return status(s, error::invalid_input_size);
         const auto frames = static_cast<std::uint32_t>(s.x[1]);
         std::int32_t result = 0;
         const auto samples = self->decode_list(m, c->in, s.x[2], frames, result);
@@ -719,7 +895,8 @@ void Converters::install() {
         if (!c) return status(s, error::param);
         if (!s.x[2] || !s.x[3] || !s.x[4]) return status(s, error::param);
         std::lock_guard lock(c->mutex);
-        if (c->codec || c->encoder || c->in.rate != c->out.rate || c->in.non_interleaved || c->out.non_interleaved) return status(s, error::invalid_input_size);
+        if (c->codec || c->encoder || c->aac || c->in.rate != c->out.rate || c->in.non_interleaved || c->out.non_interleaved)
+            return status(s, error::invalid_input_size);
         const auto in_bytes = static_cast<std::uint32_t>(s.x[1]);
         if (in_bytes % c->in.frame_bytes()) return status(s, error::invalid_input_size);
         const auto frames = in_bytes / c->in.frame_bytes();

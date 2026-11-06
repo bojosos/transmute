@@ -48,4 +48,8 @@ std::size_t read_audio_frames(const GuestAudio& audio, const audio_file::ReadAt&
                               std::vector<double>& out);
 std::size_t read_audio_frames(Support& support, const GuestAudio& audio, std::uint64_t start, std::size_t count, std::vector<double>& out);
 
+// The bit rate an ExtAudioFile writing AAC encodes at (AVAudioFile's and AVAssetWriter's AVEncoderBitRateKey;
+// the encoder's nearest), set before its first write. Without it, the encoder's own choice.
+void set_encode_bit_rate(Address ext, std::uint32_t bits_per_second);
+
 } // namespace alchemy::gui::completion_kit::media

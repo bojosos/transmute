@@ -1,4 +1,5 @@
 #include "alchemy/darwin/media/audio_file.hpp"
+#include "alchemy/darwin/media/aac_encoder.hpp"
 #include "alchemy/darwin/media/media_codecs.hpp"
 #include "alchemy/darwin/media/packet_file.hpp"
 
@@ -27,7 +28,8 @@
 //   packet counts and sizes, magic cookie, packet table, ReadPacketData with descriptions;
 //   ReadBytes answers kAudioFileOperationNotSupportedError), and ExtAudioFile reads them decoded.
 //   Other compressed data (AAC, ...) answers kAudioFileUnsupportedDataFormatError.
-// - Writing Apple Lossless: CAF and MPEG-4 (M4A) files of 'alac' packets (packet_file.hpp).
+// - Writing Apple Lossless and AAC: CAF and MPEG-4 (M4A) files of 'alac' or 'aac ' packets (packet_file.hpp;
+//   AAC through the host's encoder, aac_encoder.hpp, its delay as the priming).
 //   AudioFileWritePackets appends packets with their descriptions (from the next packet only), the
 //   magic cookie and packet table info are set as properties, and AudioFileOptimize and
 //   AudioFileClose write the packet table or the movie. ExtAudioFile writes them from any linear
@@ -93,7 +95,15 @@ struct Ext {
     // Writing a compressed file: the encoder, and the frames short of a whole packet (left-justified).
     std::shared_ptr<codecs::AudioEncoder> encoder;
     std::vector<std::int32_t> unencoded;
+    // AAC: the encoder and the frames it has taken.
+    std::shared_ptr<aac::Encoder> aac;
+    std::uint64_t aac_frames{};
 };
+
+// AVAudioFile's and AVAssetWriter's AVEncoderBitRateKey for the ExtAudioFile they write through
+// (set_encode_bit_rate in audio_file.hpp).
+std::mutex bit_rate_mutex;
+std::map<Address, std::uint32_t> bit_rates;
 
 void status(CpuState& s, std::int32_t value) { s.x[0] = static_cast<std::uint64_t>(static_cast<std::int64_t>(value)); }
 
@@ -111,14 +121,14 @@ const std::vector<FileType>& file_types() {
         {four("WAVE"), "WAVE", {"wav", "wave"}, {"audio/wav", "audio/x-wav", "audio/vnd.wave"}, {"com.microsoft.waveform-audio"}, {four("lpcm")}, true},
         {four("AIFF"), "AIFF", {"aif", "aiff"}, {"audio/aiff", "audio/x-aiff"}, {"public.aiff-audio"}, {four("lpcm")}, true},
         {four("AIFC"), "AIFC", {"aifc", "aiff", "aif"}, {"audio/aiff", "audio/x-aiff"}, {"public.aifc-audio"}, {four("lpcm")}, true},
-        {four("caff"), "CAF", {"caf"}, {"audio/x-caf"}, {"com.apple.coreaudio-format"}, {four("lpcm"), four("alac")}, true},
+        {four("caff"), "CAF", {"caf"}, {"audio/x-caf"}, {"com.apple.coreaudio-format"}, {four("lpcm"), four("alac"), four("aac ")}, true},
         {four("MPG3"), "MPEG Layer 3", {"mp3"}, {"audio/mpeg", "audio/mpeg3", "audio/mp3", "audio/x-mpeg3"}, {"public.mp3"}, {four(".mp3")}, false},
         {four("MPG2"), "MPEG Layer 2", {"mp2"}, {"audio/mpeg"}, {}, {four(".mp2")}, false},
         {four("MPG1"), "MPEG Layer 1", {"mp1"}, {"audio/mpeg"}, {}, {four(".mp1")}, false},
         {four("flac"), "FLAC", {"flac"}, {"audio/flac"}, {"org.xiph.flac"}, {four("flac")}, false},
         {four("m4af"), "Apple MPEG-4 Audio", {"m4a", "m4r"}, {"audio/mp4", "audio/x-m4a"}, {"com.apple.m4a-audio"},
-         {four(".mp3"), four("flac"), four("opus"), four("alac")}, true},
-        {four("mp4f"), "MPEG-4 Audio", {"mp4"}, {"audio/mp4"}, {"public.mpeg-4-audio"}, {four(".mp3"), four("flac"), four("opus"), four("alac")}, true},
+         {four(".mp3"), four("flac"), four("opus"), four("alac"), four("aac ")}, true},
+        {four("mp4f"), "MPEG-4 Audio", {"mp4"}, {"audio/mp4"}, {"public.mpeg-4-audio"}, {four(".mp3"), four("flac"), four("opus"), four("alac"), four("aac ")}, true},
     };
     return types;
 }
@@ -652,7 +662,7 @@ struct AudioFiles {
         return 0;
     }
     // ExtAudioFileWrite's work: `frames` client frames at the position, in the file's format.
-    std::int32_t write(Ext& e, GuestMemory& m, std::uint32_t requested, Address list) {
+    std::int32_t write(Ext& e, GuestMemory& m, std::uint32_t requested, Address list, Address handle) {
         auto* f = file(e.file);
         if (!f) return error::param;
         if (!f->writable) return permissions_error;
@@ -663,7 +673,7 @@ struct AudioFiles {
         if (const auto result = client_buffers(e, m, list, frames, data)) return result;
         if (frames < requested) return error::param;   // the buffers hold fewer frames than asked
         const auto& target = f->container().format;
-        if (f->packets) return encode_frames(e, *f, m, data, frames);
+        if (f->packets) return encode_frames(e, *f, m, data, frames, handle);
         for (std::uint64_t done = 0; done < frames;) {
             const auto count = std::min<std::uint64_t>(frames - done, 16384);
             std::vector<std::vector<std::uint8_t>> in(data.size(), std::vector<std::uint8_t>(static_cast<std::size_t>(count * e.client.frame_bytes())));
@@ -683,17 +693,28 @@ struct AudioFiles {
     }
     // ExtAudioFileWrite into a compressed file: the client frames as 32-bit integers, rounded to the
     // source bit depth, encoded a whole packet at a time.
-    std::int32_t encode_frames(Ext& e, File& f, GuestMemory& m, const std::vector<Address>& data, std::uint64_t frames) {
+    std::int32_t encode_frames(Ext& e, File& f, GuestMemory& m, const std::vector<Address>& data, std::uint64_t frames, Address handle) {
         auto& w = *f.packets;
         const auto& format = w.format();
-        const std::uint32_t bits = format.flags == 1 ? 16 : format.flags == 2 ? 20 : format.flags == 3 ? 24 : 32;
-        if (!e.encoder) {
+        const bool is_aac = format.format_id == four("aac ");
+        const std::uint32_t bits = is_aac || format.flags == 1 ? 16 : format.flags == 2 ? 20 : format.flags == 3 ? 24 : 32;
+        if (is_aac && !e.aac) {
+            std::uint32_t bit_rate = 0;
+            {
+                std::lock_guard lock(bit_rate_mutex);
+                if (const auto found = bit_rates.find(handle); found != bit_rates.end()) bit_rate = found->second;
+            }
+            std::string why;
+            e.aac = aac::open(static_cast<std::uint32_t>(format.rate), format.channels, bit_rate, why);
+            if (!e.aac) return error::unsupported_data_format;
+            w.set_priming(e.aac->priming(), 0);
+        } else if (!is_aac && !e.encoder) {
             std::string why;
             e.encoder = codecs::make_audio_encoder(format.format_id, format.rate, format.channels, bits, format.frames_per_packet, why);
             if (!e.encoder) return error::unsupported_data_format;
         }
         const auto& target = f.container().format;
-        const std::size_t per_packet = std::size_t(e.encoder->frames_per_packet) * format.channels;
+        const std::size_t per_packet = is_aac ? 0 : std::size_t(e.encoder->frames_per_packet) * format.channels;
         const std::int64_t step = bits == 32 ? 1 : std::int64_t{1} << (32 - bits);
         std::vector<std::uint8_t> packet;
         for (std::uint64_t done = 0; done < frames;) {
@@ -716,6 +737,19 @@ struct AudioFiles {
                 }
                 e.unencoded.push_back(v);
             }
+            if (is_aac) {
+                // 16-bit samples into the AAC encoder, which keeps what does not yet make a packet.
+                std::vector<std::int16_t> pcm(e.unencoded.size());
+                for (std::size_t i = 0; i < pcm.size(); ++i) pcm[i] = static_cast<std::int16_t>(e.unencoded[i] >> 16);
+                e.unencoded.clear();
+                std::vector<std::vector<std::uint8_t>> made;
+                if (!e.aac->encode(pcm, made)) return error::unsupported_data_format;
+                for (const auto& p : made)
+                    if (const auto result = append_packet(f, p, 0)) return result;
+                e.aac_frames += count;
+                done += count;
+                continue;
+            }
             while (e.unencoded.size() >= per_packet) {
                 std::string why;
                 if (!e.encoder->encode(std::span<const std::int32_t>(e.unencoded.data(), per_packet), packet, why)) return error::unsupported_data_format;
@@ -730,7 +764,23 @@ struct AudioFiles {
     // ExtAudioFileDispose of a compressed file being written: the last, shorter packet, and the cookie.
     std::int32_t flush(Ext& e) {
         auto* f = file(e.file);
-        if (!f || !f->packets || !e.encoder) return 0;
+        if (!f || !f->packets) return 0;
+        if (e.aac) {
+            // The encoder's last packets; the cookie; the frames past the input are the remainder.
+            std::vector<std::vector<std::uint8_t>> made;
+            if (!e.aac->drain(made)) return error::unsupported_data_format;
+            for (const auto& p : made)
+                if (const auto result = append_packet(*f, p, 0)) return result;
+            auto& w = *f->packets;
+            const auto bits = e.aac->bit_rate();
+            w.set_cookie(aac::es_descriptor(e.aac->audio_specific_config(), bits, bits, 768 * w.format().channels));
+            const auto used = std::uint64_t{e.aac->priming()} + e.aac_frames;
+            w.set_priming(e.aac->priming(), w.frames() > used ? static_cast<std::uint32_t>(w.frames() - used) : 0);
+            f->dirty = true;
+            e.aac.reset();
+            return 0;
+        }
+        if (!e.encoder) return 0;
         const auto channels = f->packets->format().channels;
         if (!e.unencoded.empty()) {
             std::vector<std::uint8_t> packet;
@@ -871,6 +921,11 @@ std::size_t read_audio_frames(Support& support, const GuestAudio& audio, std::ui
     const auto fd = audio.fd;
     return read_audio_frames(audio, [&support, fd](std::uint64_t offset, std::span<std::uint8_t> bytes) { return read_guest(support, fd, offset, bytes); },
                              start, count, out);
+}
+
+void set_encode_bit_rate(Address ext, std::uint32_t bits_per_second) {
+    std::lock_guard lock(bit_rate_mutex);
+    bit_rates[ext] = bits_per_second;
 }
 
 void install_audio_file(Support& support) {
@@ -1173,7 +1228,7 @@ void install_audio_file(Support& support) {
                             }
             } else {
                 const std::uint32_t frames = format == four(".mp1") ? 384 : format == four("opus") ? 960 : format == four("flac") ? 0
-                                             : format == four("alac") ? 4096 : 1152;
+                                             : format == four("alac") ? 4096 : format == four("aac ") ? 1024 : 1152;
                 std::vector<std::uint8_t> asbd(40, 0);
                 std::memcpy(asbd.data() + 8, &format, 4);
                 std::memcpy(asbd.data() + 20, &frames, 4);
@@ -1457,6 +1512,10 @@ void install_audio_file(Support& support) {
         auto* e = state->ext(s.x[0]);
         if (!e) return status(s, error::param);
         const auto flushed = state->flush(*e);
+        {
+            std::lock_guard lock(bit_rate_mutex);
+            bit_rates.erase(s.x[0]);
+        }
         if (e->owns_file) state->close(e->file);
         else if (auto* f = state->file(e->file)) static_cast<void>(state->finish(*f));
         state->exts.erase(s.x[0]);
@@ -1537,7 +1596,7 @@ void install_audio_file(Support& support) {
             std::lock_guard lock(state->mutex);
             auto* e = state->ext(s.x[0]);
             if (!e) return status(s, error::param);
-            status(s, state->write(*e, m, static_cast<std::uint32_t>(s.x[1]), s.x[2]));
+            status(s, state->write(*e, m, static_cast<std::uint32_t>(s.x[1]), s.x[2], s.x[0]));
         });
     // ExtAudioFileSeek(ext, SInt64 frameOffset), ExtAudioFileTell(ext, SInt64 *out)
     support.function(lib, "_ExtAudioFileSeek", [state](CpuState& s, GuestMemory&) {

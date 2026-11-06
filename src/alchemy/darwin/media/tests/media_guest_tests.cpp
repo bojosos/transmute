@@ -14,6 +14,7 @@
 #include "alchemy/host/crypto.hpp"
 #include "alchemy/darwin/media/media_container.hpp"
 #include "alchemy/darwin/media/media_codecs.hpp"
+#include "fake_aac.hpp"
 #include "alchemy/host/speech.hpp"
 
 #include <algorithm>
@@ -2895,6 +2896,142 @@ void alac_writing(Fixture& f) {
     std::filesystem::remove_all(directory, ignored);
 }
 
+// AAC through the fake encoder (fake_aac.hpp: 2048 frames of delay, 8-byte packets): AudioConverter's packets, delay,
+// cookie and bit rates; ExtAudioFile and AVAudioFile writing M4A and CAF files, read back by the container parser
+// (Alchemy decodes no AAC).
+void aac_encoding(Fixture& f) {
+    namespace mc = alchemy::gui::completion_kit::media::container;
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_aac";
+    std::filesystem::create_directories(directory);
+    constexpr std::uint32_t frames = 10000, channels = 2, packets_expected = (fake_aac::priming + frames + 1023) / 1024;
+    std::vector<std::uint8_t> source(std::size_t(frames) * channels * 2);
+    for (std::uint32_t i = 0; i < frames * channels; ++i) {
+        const auto v = static_cast<std::int16_t>(std::lround(12000.0 * std::sin(0.02 * i)));
+        source[2 * i] = static_cast<std::uint8_t>(v);
+        source[2 * i + 1] = static_cast<std::uint8_t>(static_cast<std::uint16_t>(v) >> 8);
+    }
+    const auto pcm = f.block(source.size());
+    f.memory().write_bytes(pcm, source);
+    const auto int16 = f.block(40), aac_format = f.block(40), out = f.block(8), size = f.block(4), value = f.block(256);
+    const auto write_asbd = [&](Address at_, double rate, std::uint32_t id, std::uint32_t flags, std::uint32_t bytes_per_packet, std::uint32_t per_packet,
+                                std::uint32_t bytes_per_frame, std::uint32_t count, std::uint32_t bits) {
+        f.engine.write64(at_, std::bit_cast<std::uint64_t>(rate));
+        f.engine.write32(at_ + 8, id); f.engine.write32(at_ + 12, flags); f.engine.write32(at_ + 16, bytes_per_packet); f.engine.write32(at_ + 20, per_packet);
+        f.engine.write32(at_ + 24, bytes_per_frame); f.engine.write32(at_ + 28, count); f.engine.write32(at_ + 32, bits); f.engine.write32(at_ + 36, 0);
+    };
+    write_asbd(int16, 48000, 0x6c70636d, 4 | 8, 4, 1, 4, channels, 16);
+    write_asbd(aac_format, 0, 0x61616320, 0, 0, 0, 0, 0, 0);   // rate and channels: the input's
+
+    // AudioConverter.
+    require(f.status(at, "_AudioConverterNew", {int16, aac_format, out}) == 0, "AudioConverterNew to AAC");
+    const auto converter = f.engine.read64(out);
+    f.engine.write32(size, 40);
+    require(f.status(at, "_AudioConverterGetProperty", {converter, 0x61636f64, size, value}) == 0 && std::bit_cast<double>(f.engine.read64(value)) == 48000 &&
+            f.engine.read32(value + 12) == 2 && f.engine.read32(value + 20) == 1024 && f.engine.read32(value + 28) == channels, "AAC-LC, 1024 frames a packet");
+    f.engine.write32(size, 256);
+    require(f.status(at, "_AudioConverterGetProperty", {converter, 0x61657372, size, value}) == 0 && f.engine.read32(size) == 32 &&
+            std::bit_cast<double>(f.engine.read64(value + 16)) == 48000, "the encode sample rates");
+    f.engine.write32(size, 256);
+    require(f.status(at, "_AudioConverterGetProperty", {converter, 0x61656272, size, value}) == 0 && f.engine.read32(size) == 48, "three encode bit rates");
+    f.engine.write32(value, 100000);
+    require(f.status(at, "_AudioConverterSetProperty", {converter, 0x62726174, 4, value}) == 0, "set the bit rate");
+    f.engine.write32(size, 4);
+    require(f.status(at, "_AudioConverterGetProperty", {converter, 0x62726174, size, value}) == 0 && f.engine.read32(value) == 96000, "the nearest bit rate");
+    f.engine.write32(size, 4);
+    require(f.status(at, "_AudioConverterGetProperty", {converter, 0x786f7073, size, value}) == 0 && f.engine.read32(value) == 1536, "the largest packet");
+    static Address aac_pcm{};
+    static std::uint32_t aac_next{};
+    aac_pcm = pcm;
+    aac_next = 0;
+    const auto input = f.process.install_function("_alchemy_test_aac_input", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto n = std::min<std::uint32_t>(m.read32(s.x[1]), std::min<std::uint32_t>(777, frames - aac_next));
+        m.write32(s.x[1], n);
+        m.write32(s.x[2] + 8 + 4, n * 4);
+        m.write64(s.x[2] + 8 + 8, aac_pcm + 4ULL * aac_next);
+        aac_next += n;
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto buffer = f.block(64 * 1536), descriptions = f.block(16 * 64), list = f.block(24), count = f.block(4);
+    f.engine.write32(list, 1); f.engine.write32(list + 8, channels); f.engine.write32(list + 12, 64 * 1536); f.engine.write64(list + 16, buffer);
+    f.engine.write32(count, 64);
+    require(f.status(at, "_AudioConverterFillComplexBuffer", {converter, input, 0, count, list, descriptions}) == 0 && f.engine.read32(count) == packets_expected,
+            "a packet per 1024 frames of delay and input: " + std::to_string(f.engine.read32(count)));
+    require(f.engine.read32(descriptions + 12) == 8 && f.engine.read32(buffer) == 0 && f.engine.read32(buffer + 4) == 0x21434141 &&
+            f.engine.read64(descriptions + 16 * 11) == 11 * 8 && f.engine.read32(buffer + 11 * 8) == 11, "the packets in order, described");
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioConverterGetProperty", {converter, 0x7072696d, size, value}) == 0 && f.engine.read32(value) == fake_aac::priming, "the delay leads");
+    f.engine.write32(size, 256);
+    require(f.status(at, "_AudioConverterGetProperty", {converter, 0x636d6763, size, value}) == 0 && f.memory().read8(value) == 0x03, "the ES descriptor cookie");
+    std::vector<std::uint8_t> cookie(f.engine.read32(size));
+    f.memory().read_bytes(value, cookie);
+    const std::uint8_t asc[] = {0x11, 0x90};   // AAC-LC, 48 kHz, two channels
+    require(std::search(cookie.begin(), cookie.end(), std::begin(asc), std::end(asc)) != cookie.end(), "the AudioSpecificConfig of 48 kHz stereo in the cookie");
+    require(f.status(at, "_AudioConverterDispose", {converter}) == 0, "dispose");
+    write_asbd(aac_format, 22050, 0x61616320, 0, 0, 0, 0, channels, 0);
+    require(f.status(at, "_AudioConverterNew", {int16, aac_format, out}) == static_cast<std::int32_t>(0x666d743f), "no AAC encoder takes 22050 Hz");
+
+    // Files, parsed back.
+    const auto parse = [&](const std::filesystem::path& path, mc::Movie& movie) {
+        std::ifstream in(path, std::ios::binary);
+        std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
+        std::string why;
+        const mc::ReadAt read = [&bytes](std::uint64_t at_, std::span<std::uint8_t> o) -> std::size_t {
+            if (at_ >= bytes.size()) return 0;
+            const auto n = std::min<std::size_t>(o.size(), bytes.size() - static_cast<std::size_t>(at_));
+            std::memcpy(o.data(), bytes.data() + at_, n);
+            return n;
+        };
+        require(mc::parse(read, bytes.size(), movie, why) && !movie.tracks.empty(), path.filename().string() + " parses: " + why);
+    };
+    for (const auto& [type, name] : {std::pair{0x6d346166u, "ext.m4a"}, std::pair{0x63616666u, "ext.caf"}}) {
+        const auto path = directory / name;
+        write_asbd(aac_format, 48000, 0x61616320, 2, 0, 1024, 0, channels, 0);
+        require(f.status(at, "_ExtAudioFileCreateWithURL", {f.cf.file_url(alchemy::guest_path_string(path), false), type, aac_format, 0, 1, out}) == 0,
+                std::string(name) + ": ExtAudioFileCreateWithURL");
+        const auto ext = f.engine.read64(out);
+        require(f.status(at, "_ExtAudioFileSetProperty", {ext, 0x63666d74, 40, int16}) == 0, std::string(name) + ": a 16-bit client");
+        const auto piece = f.block(24);
+        for (std::uint32_t at_frame = 0; at_frame < frames;) {
+            const auto n = std::min<std::uint32_t>(frames - at_frame, 3333);
+            f.engine.write32(piece, 1); f.engine.write32(piece + 8, channels); f.engine.write32(piece + 12, n * 4); f.engine.write64(piece + 16, pcm + 4ULL * at_frame);
+            require(f.status(at, "_ExtAudioFileWrite", {ext, n, piece}) == 0, std::string(name) + ": ExtAudioFileWrite");
+            at_frame += n;
+        }
+        require(f.status(at, "_ExtAudioFileDispose", {ext}) == 0, std::string(name) + ": dispose");
+        mc::Movie movie;
+        parse(path, movie);
+        const auto& t = movie.tracks[0];
+        require(t.samples.size() == packets_expected && t.priming == fake_aac::priming && !t.config.empty() &&
+                    (type == 0x63616666u ? t.codec == mc::fourcc("aac ") && t.duration == frames : t.codec == mc::fourcc("mp4a")),
+                std::string(name) + ": the packets, the delay as priming, the ES descriptor: " + std::to_string(t.samples.size()) + " " + std::to_string(t.priming));
+    }
+
+    // AVAudioFile: AAC settings at 192 kb/s into an M4A; a rate no encoder takes is refused.
+    const auto error = f.block(8);
+    const auto settings = [&](double rate) {
+        return f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+            {f.cf.string("AVFormatIDKey"), f.cf.integer(0x61616320, 3)}, {f.cf.string("AVSampleRateKey"), f.cf.real(rate)},
+            {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(channels, 3)}, {f.cf.string("AVEncoderBitRateKey"), f.cf.integer(192000, 3)}});
+    };
+    const auto av_path = directory / "avaudiofile.m4a";
+    const auto av_url = f.cf.file_url(alchemy::guest_path_string(av_path), false);
+    require(f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForWriting:settings:error:", {av_url, settings(22050), error}) == 0, "22050 Hz AAC is refused");
+    const auto file = f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForWriting:settings:error:", {av_url, settings(48000), error});
+    require(file != 0 && f.engine.read32(f.send(f.send(file, "fileFormat"), "streamDescription") + 8) == 0x61616320, "AVAudioFile writes AAC");
+    const auto pcm_buffer = f.send(f.send(f.cls("AVAudioPCMBuffer"), "alloc"), "initWithPCMFormat:frameCapacity:", {f.send(file, "processingFormat"), frames});
+    f.send(pcm_buffer, "setFrameLength:", {frames});
+    require((f.send(file, "writeFromBuffer:error:", {pcm_buffer, error}) & 0xff) == 1, "writeFromBuffer:error:");
+    f.send(file, "release");
+    mc::Movie movie;
+    parse(av_path, movie);
+    const auto& config = movie.tracks[0].config;
+    const std::uint8_t bits[] = {0x00, 0x02, 0xee, 0x00};   // 192000, big endian
+    require(movie.tracks[0].samples.size() == packets_expected && std::search(config.begin(), config.end(), std::begin(bits), std::end(bits)) != config.end(),
+            "the M4A's ES descriptor carries 192 kb/s");
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 // AudioFileStream: minimp3's MP3 vector fed in pieces gives the packets AudioFile reads from the file; a seek
 // to a parsed packet is exact; a WAVE stream gives its frames without descriptions.
 void audio_file_stream(Fixture& f) {
@@ -3843,6 +3980,7 @@ void compositions(Fixture& f) {
 int main() {
     alchemy::gui::completion_kit::media::set_midi_backend_factory([] { return std::make_unique<FakeMidi>(); });
     alchemy::gui::completion_kit::media::set_hal_backend_factory([] { return std::make_unique<FakeHal>(); });
+    fake_aac::install();   // AAC results do not depend on the host's encoders
     _putenv_s("ALCHEMY_CAMERA", "none");   // the host's cameras stay out (media_capture_tests.cpp fakes them)
     return fill_test::run("qlab media", {
         {"core_media", core_media},
@@ -3861,6 +3999,7 @@ int main() {
         {"compressed_audio", compressed_audio},
         {"alac_files", alac_files},
         {"alac_writing", alac_writing},
+        {"aac_encoding", aac_encoding},
         {"audio_file_stream", audio_file_stream},
         {"video_toolbox", video_toolbox},
         {"av_video", av_video},

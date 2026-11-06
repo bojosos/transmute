@@ -10,6 +10,8 @@
 #include "alchemy/darwin/media/hal_core.hpp"
 #include "alchemy/darwin/media/hal_host.hpp"
 #include "alchemy/darwin/media/media_support.hpp"
+#include "alchemy/darwin/media/media_container.hpp"
+#include "fake_aac.hpp"
 #include "alchemy/darwin/kit/support/support_kit.hpp"
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/host/time.hpp"
@@ -21,6 +23,9 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -724,9 +729,12 @@ void asset_writer(Fixture& f) {
         {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(2, 3)}});
     const auto m4a_writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:", {m4a_url, type("_AVFileTypeAppleM4A"), error});
     require(m4a_writer != 0, "an M4A writer");
+    fake_aac::install(true);
     require((f.send(m4a_writer, "canApplyOutputSettings:forMediaType:", {alac_settings, f.cf.string("soun")}) & 0xff) == 1 &&
                 (f.send(m4a_writer, "canApplyOutputSettings:forMediaType:", {aac_settings, f.cf.string("soun")}) & 0xff) == 0,
-            "Apple Lossless settings apply; AAC has no encoder");
+            "Apple Lossless settings apply; AAC needs an encoder");
+    fake_aac::install();
+    require((f.send(m4a_writer, "canApplyOutputSettings:forMediaType:", {aac_settings, f.cf.string("soun")}) & 0xff) == 1, "AAC applies with an encoder");
     const auto pcm_input = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), settings});
     require((f.send(m4a_writer, "canAddInput:", {pcm_input}) & 0xff) == 0, "M4A files do not hold linear PCM");
     const auto alac_input = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), alac_settings});
@@ -738,6 +746,36 @@ void asset_writer(Fixture& f) {
     f.send(alac_input, "markAsFinished");
     require((f.send(m4a_writer, "finishWriting") & 0xff) == 1, "finishWriting the M4A");
     read(m4a_url, 14400);
+    // AAC into another M4A: its packets and the encoder's delay as the priming.
+    const auto aac_file = directory / "alchemy_writer_test_aac.m4a";
+    std::filesystem::remove(aac_file, ignored);
+    const auto aac_writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:",
+                                   {f.cf.file_url(alchemy::guest_path_string(aac_file), false), type("_AVFileTypeAppleM4A"), error});
+    const auto aac_input = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), aac_settings});
+    require((f.send(aac_writer, "canAddInput:", {aac_input}) & 0xff) == 1, "an AAC input");
+    f.send(aac_writer, "addInput:", {aac_input});
+    require((f.send(aac_writer, "startWriting") & 0xff) == 1, "writing the AAC M4A");
+    f.send(aac_writer, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+    for (int i = 0; i < 3; ++i) require((f.send(aac_input, "appendSampleBuffer:", {float_sample_buffer(f, 4800, 4800LL * i)}) & 0xff) == 1, "appended");
+    f.send(aac_input, "markAsFinished");
+    require((f.send(aac_writer, "finishWriting") & 0xff) == 1, "finishWriting the AAC M4A");
+    {
+        std::ifstream in(aac_file, std::ios::binary);
+        std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
+        namespace mc = alchemy::gui::completion_kit::media::container;
+        mc::Movie movie;
+        std::string why;
+        const mc::ReadAt reader = [&bytes](std::uint64_t at_, std::span<std::uint8_t> o) -> std::size_t {
+            if (at_ >= bytes.size()) return 0;
+            const auto n = std::min<std::size_t>(o.size(), bytes.size() - static_cast<std::size_t>(at_));
+            std::memcpy(o.data(), bytes.data() + at_, n);
+            return n;
+        };
+        require(mc::parse(reader, bytes.size(), movie, why) && movie.tracks.size() == 1 && movie.tracks[0].codec == mc::fourcc("mp4a") &&
+                    movie.tracks[0].priming == fake_aac::priming && movie.tracks[0].samples.size() == (fake_aac::priming + 14400 + 1023) / 1024,
+                "the AAC M4A: " + why);
+    }
+    std::filesystem::remove(aac_file, ignored);
     std::filesystem::remove(wav, ignored);
     std::filesystem::remove(caf, ignored);
     std::filesystem::remove(m4a, ignored);

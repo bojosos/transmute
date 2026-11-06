@@ -1,4 +1,5 @@
 #include "alchemy/darwin/media/avaudio.hpp"
+#include "alchemy/darwin/media/aac_encoder.hpp"
 
 #include "alchemy/darwin/security/bridge.hpp"
 
@@ -24,8 +25,10 @@
 //   deinterleaved at the file's rate and channels) as it is read into buffers.
 // - AVAudioFile for writing (WAVE, AIFF/AIFC or CAF by the URL's extension; linear PCM settings;
 //   or Apple Lossless, AVFormatIDKey 'alac', into .caf, .m4a or .mp4, of AVEncoderBitDepthHintKey
-//   or AVLinearPCMBitDepthKey bits, 16 by default) through ExtAudioFile (audio_file.cpp): buffers
-//   of the processing format are converted to the file's format, or encoded, as they are written.
+//   or AVLinearPCMBitDepthKey bits, 16 by default; or AAC, 'aac ', at AVEncoderBitRateKey, through
+//   the host's AAC encoder where it takes the rate and channels) through ExtAudioFile
+//   (audio_file.cpp): buffers of the processing format are converted to the file's format, or
+//   encoded, as they are written.
 // - Unavailable, as documented: other compressed settings (no encoder) answer nil with an error.
 namespace alchemy::gui::completion_kit::media::avaudio {
 
@@ -507,21 +510,28 @@ void install_avaudio_buffers(Support& support) {
         auto extension = sp->cf.utf8(sp->send_id(url, "pathExtension"));
         for (auto& c : extension) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         const auto format_id = static_cast<std::uint32_t>(setting("AVFormatIDKey").value_or(af::four("lpcm")));
-        const bool lossless = format_id == af::four("alac");
+        const bool lossless = format_id == af::four("alac"), is_aac = format_id == af::four("aac ");
+        const bool packets = lossless || is_aac;
         const std::uint32_t type = extension == "wav" || extension == "wave" ? af::four("WAVE")
                                  : extension == "aif" || extension == "aiff" ? af::four("AIFF")
                                  : extension == "aifc" ? af::four("AIFC")
                                  : extension == "caf" ? af::four("caff")
-                                 : lossless && (extension == "m4a" || extension == "m4r") ? af::four("m4af")
-                                 : lossless && extension == "mp4" ? af::four("mp4f") : 0;
+                                 : packets && (extension == "m4a" || extension == "m4r") ? af::four("m4af")
+                                 : packets && extension == "mp4" ? af::four("mp4f") : 0;
         if (!type)
-            return fail_with(af::error::unsupported_file_type, lossless ? "AVAudioFile writes Apple Lossless into .caf, .m4a and .mp4 files"
-                                                                        : "AVAudioFile writes linear PCM into .wav, .aif, .aifc and .caf files");
-        if (format_id != af::four("lpcm") && !lossless)
-            return fail_with(af::error::unsupported_data_format, "AVAudioFile writes linear PCM and Apple Lossless (no other audio encoder exists under Alchemy)");
+            return fail_with(af::error::unsupported_file_type, packets ? "AVAudioFile writes Apple Lossless and AAC into .caf, .m4a and .mp4 files"
+                                                                       : "AVAudioFile writes linear PCM into .wav, .aif, .aifc and .caf files");
+        if (format_id != af::four("lpcm") && !packets)
+            return fail_with(af::error::unsupported_data_format, "AVAudioFile writes linear PCM, Apple Lossless and AAC (no other audio encoder exists under Alchemy)");
         const auto rate = setting("AVSampleRateKey"), channels = setting("AVNumberOfChannelsKey");
         if (!rate || !(*rate > 0) || !channels || *channels < 1 || *channels > 64) return fail_with(param_error, "AVAudioFile settings need a sample rate and channels");
-        if (lossless && *channels > 8) return fail_with(af::error::unsupported_data_format, "Apple Lossless holds 1-8 channels");
+        if (packets && *channels > 8) return fail_with(af::error::unsupported_data_format, "Apple Lossless and AAC files here hold 1-8 channels");
+        if (is_aac) {
+            const auto caps = aac::capabilities();
+            const auto takes = [](const std::vector<std::uint32_t>& list, double v) { return std::find(list.begin(), list.end(), static_cast<std::uint32_t>(v)) != list.end(); };
+            if (!takes(caps.sample_rates, *rate) || !takes(caps.channel_counts, *channels))
+                return fail_with(af::error::unsupported_data_format, caps.empty() ? "no AAC encoder exists on this host" : "no AAC encoder here takes that sample rate and channel count");
+        }
         af::Pcm pcm;
         pcm.rate = *rate;
         pcm.channels = static_cast<std::uint32_t>(*channels);
@@ -536,9 +546,11 @@ void install_avaudio_buffers(Support& support) {
         const auto out = asbd + 40;
         // Apple Lossless: kAppleLosslessFormatFlag_16/20/24/32BitSourceData, 4096 frames per packet.
         std::vector<std::uint8_t> file_asbd = af::asbd_from_pcm(pcm);
-        if (lossless) {
+        if (packets) {
+            // AAC: AAC-LC (object type 2), 1024 frames per packet.
             const auto depth = setting("AVEncoderBitDepthHintKey").value_or(setting("AVLinearPCMBitDepthKey").value_or(16));
-            const std::uint32_t flags = depth <= 16 ? 1 : depth <= 20 ? 2 : depth <= 24 ? 3 : 4, per_packet = 4096, id = af::four("alac");
+            const std::uint32_t flags = is_aac ? 2 : depth <= 16 ? 1 : depth <= 20 ? 2 : depth <= 24 ? 3 : 4, per_packet = is_aac ? 1024 : 4096,
+                                id = format_id;
             std::fill(file_asbd.begin() + 8, file_asbd.end(), std::uint8_t{0});
             std::memcpy(file_asbd.data() + 8, &id, 4);
             std::memcpy(file_asbd.data() + 12, &flags, 4);
@@ -550,6 +562,8 @@ void install_avaudio_buffers(Support& support) {
         // ExtAudioFileCreateWithURL(url, type, &format, NULL, kAudioFileFlags_EraseFile, &out)
         auto status = static_cast<std::int32_t>(sp->call(audio_toolbox, "_ExtAudioFileCreateWithURL", {url, type, asbd, 0, 1, out}));
         const auto writer = m.read64(out);
+        if (!status && is_aac)
+            if (const auto bits = setting("AVEncoderBitRateKey")) set_encode_bit_rate(writer, static_cast<std::uint32_t>(*bits));
         const auto processing = common_pcm(common, pcm.rate, pcm.channels, interleaved);
         if (!status) {
             // The client format: the processing format (kExtAudioFileProperty_ClientDataFormat).
@@ -563,7 +577,7 @@ void install_avaudio_buffers(Support& support) {
         f->url = sp->send_id(url, "retain");
         f->writer = writer;
         f->processing = processing;
-        f->file_format = lossless ? format_of(*sp, file_asbd, pcm.channels, {}) : make_format(*sp, pcm);
+        f->file_format = packets ? format_of(*sp, file_asbd, pcm.channels, {}) : make_format(*sp, pcm);
         f->processing_format = make_format(*sp, processing);
     };
     support.method(file, "initForWriting:settings:error:", [open_for_writing](CpuState& s, GuestMemory&) {

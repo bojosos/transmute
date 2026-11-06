@@ -49,17 +49,21 @@ void put_matrix(Bytes& out) {
 } // namespace
 
 bool writable(std::uint32_t file_type, std::uint32_t format_id) {
-    return format_id == four("alac") && (file_type == four("caff") || file_type == four("m4af") || file_type == four("mp4f"));
+    return (format_id == four("alac") || format_id == four("aac ")) && (file_type == four("caff") || file_type == four("m4af") || file_type == four("mp4f"));
 }
 
 std::optional<Writer> Writer::make(const Format& format, std::string& why) {
     if (!writable(format.file_type, format.format_id)) { why = "this format is not written into this file type"; return std::nullopt; }
-    if (format.flags < 1 || format.flags > 4) { why = "Apple Lossless needs a source bit depth (kAppleLosslessFormatFlag_16BitSourceData to _32BitSourceData)"; return std::nullopt; }
-    if (format.channels < 1 || format.channels > 8) { why = "Apple Lossless holds 1-8 channels"; return std::nullopt; }
+    const bool lossless = format.format_id == four("alac");
+    if (lossless && (format.flags < 1 || format.flags > 4)) { why = "Apple Lossless needs a source bit depth (kAppleLosslessFormatFlag_16BitSourceData to _32BitSourceData)"; return std::nullopt; }
+    if (!lossless && format.flags != 0 && format.flags != 2) { why = "AAC files here hold AAC-LC (kMPEG4Object_AAC_LC)"; return std::nullopt; }
+    if (!lossless && format.frames_per_packet && format.frames_per_packet != 1024) { why = "AAC-LC packets hold 1024 frames"; return std::nullopt; }
+    if (format.channels < 1 || format.channels > 8) { why = "these files hold 1-8 channels"; return std::nullopt; }
     if (!(format.rate >= 1 && format.rate <= 4294967295.0) || format.rate != std::floor(format.rate)) { why = "an integer sample rate is needed"; return std::nullopt; }
     Writer w;
     w.format_ = format;
-    if (!w.format_.frames_per_packet) w.format_.frames_per_packet = 4096;
+    if (!lossless) w.format_.flags = 2;
+    if (!w.format_.frames_per_packet) w.format_.frames_per_packet = lossless ? 4096 : 1024;
     if (w.format_.frames_per_packet > 16384) { why = "Apple Lossless packets hold at most 16384 frames"; return std::nullopt; }
     auto& h = w.header_;
     if (format.file_type == four("caff")) {
@@ -68,7 +72,7 @@ std::optional<Writer> Writer::make(const Format& format, std::string& why) {
         put(h, 32, 8);
         put(h, std::bit_cast<std::uint64_t>(format.rate), 8);
         put(h, format.format_id, 4);
-        put(h, format.flags, 4);
+        put(h, w.format_.flags, 4);
         put(h, 0, 4);                                 // mBytesPerPacket: variable
         put(h, w.format_.frames_per_packet, 4);
         put(h, format.channels, 4);
@@ -152,17 +156,22 @@ std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> Writer::finish_
     put(size, 16 + data_bytes_, 8);
     writes.emplace_back(size_field_, std::move(size));
     const auto rate = static_cast<std::uint32_t>(format_.rate);
+    // The media holds every frame; the movie presents those between the priming and the remainder (the
+    // edit list below), the movie's timescale being the media's.
     const std::uint64_t duration = frames_;
+    const std::uint64_t trimmed = std::uint64_t{priming_} + remainder_;
+    const std::uint64_t presented = duration > trimmed ? duration - trimmed : 0;
+    const bool edited = trimmed != 0;
     const int version = duration > 0xffffffffULL ? 1 : 0;
-    const auto put_times = [&](Bytes& out, bool with_timescale) {   // creation, modification, [timescale,] duration
+    const auto put_times = [&](Bytes& out, bool with_timescale, std::uint64_t length) {   // creation, modification, [timescale,] duration
         put(out, 0, version ? 8 : 4);
         put(out, 0, version ? 8 : 4);
         if (with_timescale) put(out, rate, 4);
-        put(out, duration, version ? 8 : 4);
+        put(out, length, version ? 8 : 4);
     };
     // mvhd
     Bytes mvhd;
-    put_times(mvhd, true);
+    put_times(mvhd, true, presented);
     put(mvhd, 0x00010000, 4);   // rate 1.0
     put(mvhd, 0x0100, 2);       // volume 1.0
     put(mvhd, 0, 2 + 8);
@@ -175,7 +184,7 @@ std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> Writer::finish_
     put(tkhd, 0, version ? 8 : 4);
     put(tkhd, 1, 4);
     put(tkhd, 0, 4);
-    put(tkhd, duration, version ? 8 : 4);
+    put(tkhd, presented, version ? 8 : 4);
     put(tkhd, 0, 8 + 2 + 2);    // reserved, layer, alternate_group
     put(tkhd, 0x0100, 2);       // volume
     put(tkhd, 0, 2);
@@ -183,7 +192,7 @@ std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> Writer::finish_
     put(tkhd, 0, 8);            // width, height
     // mdhd: the sample rate as the timescale, language "und".
     Bytes mdhd;
-    put_times(mdhd, true);
+    put_times(mdhd, true, duration);
     put(mdhd, 0x55c4, 2);
     put(mdhd, 0, 2);
     Bytes hdlr;
@@ -198,14 +207,16 @@ std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> Writer::finish_
     put(entry, 1, 2);                                   // data_reference_index
     put(entry, 0, 8);
     put(entry, format_.channels, 2);
-    const std::uint32_t bits = format_.flags == 1 ? 16 : format_.flags == 2 ? 20 : format_.flags == 3 ? 24 : 32;
+    const bool lossless = format_.format_id == four("alac");
+    const std::uint32_t bits = !lossless ? 16 : format_.flags == 1 ? 16 : format_.flags == 2 ? 20 : format_.flags == 3 ? 24 : 32;
     put(entry, bits, 2);
     put(entry, 0, 4);
     put(entry, rate <= 0xffff ? std::uint64_t{rate} << 16 : 0, 4);   // 16.16; the ALAC config has the rate above that
-    append(entry, full(four("alac"), 0, 0, cookie_));
+    // ALAC: the ALACSpecificConfig in an 'alac' box; AAC: the ES descriptor in an 'esds' box.
+    append(entry, full(lossless ? four("alac") : four("esds"), 0, 0, cookie_));
     Bytes stsd;
     put(stsd, 1, 4);
-    append(stsd, box(format_.format_id, entry));
+    append(stsd, box(lossless ? four("alac") : four("mp4a"), entry));
     // stts: runs of equal durations.
     Bytes stts_runs;
     std::uint32_t runs = 0;
@@ -248,6 +259,16 @@ std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> Writer::finish_
     append(mdia, full(four("hdlr"), 0, 0, hdlr));
     append(mdia, box(four("minf"), minf));
     Bytes trak = full(four("tkhd"), version, 7, tkhd);
+    if (edited) {
+        // One edit: the presented frames, from the media time after the priming, at normal rate.
+        Bytes elst;
+        put(elst, 1, 4);
+        put(elst, presented, version ? 8 : 4);
+        put(elst, priming_, version ? 8 : 4);
+        put(elst, 1, 2);
+        put(elst, 0, 2);
+        append(trak, box(four("edts"), full(four("elst"), version, 0, elst)));
+    }
     append(trak, box(four("mdia"), mdia));
     Bytes moov = full(four("mvhd"), version, 0, mvhd);
     append(moov, box(four("trak"), trak));

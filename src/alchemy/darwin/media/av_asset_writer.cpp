@@ -2,6 +2,8 @@
 #include "alchemy/darwin/media/audio_file_core.hpp"
 #include "alchemy/darwin/media/cmtime.hpp"
 #include "alchemy/darwin/media/packet_file.hpp"
+#include "alchemy/darwin/media/aac_encoder.hpp"
+#include "alchemy/darwin/media/audio_file.hpp"
 
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/engine_adapter.hpp"
@@ -23,7 +25,8 @@
 // MPEG-4 of Apple Lossless, written through ExtAudioFile (audio_file.cpp).
 // - The file's format is the audio input's outputSettings (AVFormatIDKey linear PCM, AVSampleRateKey,
 //   AVNumberOfChannelsKey, AVLinearPCMBitDepthKey, ...IsFloat, ...IsBigEndian; or AVFormatIDKey 'alac' with
-//   AVEncoderBitDepthHintKey or AVLinearPCMBitDepthKey bits, 16 by default), or with nil settings the format of the
+//   AVEncoderBitDepthHintKey or AVLinearPCMBitDepthKey bits, 16 by default; or 'aac ' at AVEncoderBitRateKey, where
+//   the host's AAC encoder takes the rate and channels), or with nil settings the format of the
 //   first appended buffer (linear PCM files only). The file is created by -startWriting (with settings) or at the first
 //   append.
 // - -appendSampleBuffer: writes a linear PCM CMSampleBuffer at the file's sample rate (converted between PCM layouts,
@@ -33,7 +36,7 @@
 // - -finishWritingWithCompletionHandler: closes the file, sets the status to completed and calls the handler on a
 //   thread of the writer; -cancelWriting deletes the file.
 // - Unavailable, as documented answers: video inputs (no video encoder: -canAddInput: NO, -addInput: stops with
-//   NSInvalidArgumentException), compressed audio settings other than Apple Lossless (no encoder:
+//   NSInvalidArgumentException), compressed audio settings other than Apple Lossless and AAC (no encoder:
 //   -canApplyOutputSettings:forMediaType: NO), and the QuickTime movie and video file types (the initializer fails with
 //   an error).
 namespace alchemy::gui::completion_kit::media {
@@ -108,11 +111,18 @@ std::optional<std::vector<std::uint8_t>> Writers::settings_asbd(Address settings
     const auto format_id = static_cast<std::uint32_t>(setting("AVFormatIDKey").value_or(af::four("lpcm")));
     const auto rate = setting("AVSampleRateKey"), channels = setting("AVNumberOfChannelsKey");
     if (!rate || !(*rate > 0) || !channels || *channels < 1 || *channels > 64) return std::nullopt;
-    if (format_id == af::four("alac")) {
-        // kAppleLosslessFormatFlag_16/20/24/32BitSourceData, 4096 frames per packet.
+    if (format_id == af::four("alac") || format_id == af::four("aac ")) {
+        // ALAC: kAppleLosslessFormatFlag_16/20/24/32BitSourceData, 4096 frames per packet. AAC: AAC-LC, 1024 frames
+        // per packet, at a rate and channel count the host's encoder takes.
+        const bool is_aac = format_id == af::four("aac ");
         if (!packet_file::writable(container, format_id) || *channels > 8) return std::nullopt;
+        if (is_aac) {
+            const auto caps = aac::capabilities();
+            const auto takes = [](const std::vector<std::uint32_t>& list, double v) { return std::find(list.begin(), list.end(), static_cast<std::uint32_t>(v)) != list.end(); };
+            if (!takes(caps.sample_rates, *rate) || !takes(caps.channel_counts, *channels)) return std::nullopt;
+        }
         const auto depth = setting("AVEncoderBitDepthHintKey").value_or(setting("AVLinearPCMBitDepthKey").value_or(16));
-        const std::uint32_t flags = depth <= 16 ? 1 : depth <= 20 ? 2 : depth <= 24 ? 3 : 4, per_packet = 4096,
+        const std::uint32_t flags = is_aac ? 2 : depth <= 16 ? 1 : depth <= 20 ? 2 : depth <= 24 ? 3 : 4, per_packet = is_aac ? 1024 : 4096,
                             count = static_cast<std::uint32_t>(*channels);
         const double sample_rate = *rate;
         std::vector<std::uint8_t> asbd(40, 0);
@@ -145,6 +155,16 @@ std::int32_t Writers::create_file(WriterState& w, const std::vector<std::uint8_t
     const auto status = static_cast<std::int32_t>(support_.call(audio_toolbox, "_ExtAudioFileCreateWithURL", {w.url, w.container, scratch, 0, 1, scratch + 40}));
     if (!status) w.ext = m.read64(scratch + 40);
     support_.process.release_guest(scratch);
+    // AAC: the input's AVEncoderBitRateKey.
+    std::uint32_t format_id{};
+    std::memcpy(&format_id, asbd.data() + 8, 4);
+    if (!status && format_id == af::four("aac ") && !w.inputs.empty())
+        if (const auto in = support_.objc.find_host_state<WriterInput>(w.inputs.front()); in && in->settings && bridge_->is_dictionary(in->settings)) {
+            const auto key = support_.cf.string("AVEncoderBitRateKey");
+            const auto value = bridge_->lookup(in->settings, key);
+            support_.release(key);
+            if (const auto bits = value ? bridge_->real(value) : std::nullopt) set_encode_bit_rate(w.ext, static_cast<std::uint32_t>(*bits));
+        }
     return status;
 }
 
