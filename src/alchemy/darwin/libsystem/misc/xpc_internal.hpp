@@ -32,6 +32,12 @@ enum class Type : unsigned {
 inline constexpr std::array<const char*, static_cast<std::size_t>(Type::count)> type_names{
     "dictionary", "array", "string", "int64", "uint64", "bool", "double", "date", "data", "uuid", "fd", "null", "error", "connection", "endpoint", "shmem", "mach_send"};
 
+// What the connections (darwin/launchd/xpc_connections.cpp) keep on an object: a connection's
+// ports, state and handlers, or a received message's reply right. It ends with the object.
+struct ConnectionSide {
+    virtual ~ConnectionSide() = default;
+};
+
 struct Value : ObjectPayload {
     Type type{};
     std::mutex mutex;
@@ -42,9 +48,7 @@ struct Value : ObjectPayload {
     std::int64_t integer{};                                        // int64, uint64, bool, date, fd
     double real{};
     std::vector<std::uint8_t> bytes;                               // data, uuid
-    // connection
-    std::uint64_t handler{}, queue{}, context{}, finalizer{};
-    bool resumed{}, cancelled{}, invalidated{};
+    std::shared_ptr<ConnectionSide> link;                          // connection or received message (xpc_connections.cpp)
     std::uint64_t connection{};                                    // endpoint: its connection (retained)
     std::uint64_t region{}, length{};                              // shmem: the guest region it names
 };
@@ -94,11 +98,7 @@ struct Xpc {
                 for (const auto& [key, item] : held->entries) { static_cast<void>(key); release(item); }
                 for (const auto item : held->items) release(item);
                 if (held->type == Type::fd && held->integer >= 0) static_cast<void>(p.call(libsystem_library, "_close", {static_cast<std::uint64_t>(held->integer)}));
-                if (held->type == Type::connection) {
-                    if (held->finalizer) static_cast<void>(EngineAdapter(process().calling_engine()).call(held->finalizer, std::array<std::uint64_t, 1>{held->context}));
-                    if (held->handler) static_cast<void>(p.call(libsystem_library, "__Block_release", {held->handler}));
-                    if (held->queue) static_cast<void>(p.call(libsystem_library, "_dispatch_release", {held->queue}));
-                }
+                held->link.reset();   // the connections' record ends here, with the object
                 if (held->type == Type::endpoint) release(held->connection);
                 if (held->guest) process().release_guest(held->guest);
             }, immortal);

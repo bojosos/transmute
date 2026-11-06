@@ -61,8 +61,17 @@ struct PendingReply {
     std::uint64_t source{}, block{}, queue{};
 };
 
-struct Conn {
+class Connections;
+
+// A connection's record (Value::link): its ports, state and handlers. The destructor ends what it
+// holds when the connection object is destroyed.
+struct Conn final : ConnectionSide {
+    ~Conn() override;
+    std::weak_ptr<Connections> owner;
     std::uint64_t object{};        // its OS_xpc_connection (not retained here)
+    std::string name;
+    std::uint64_t handler{}, target{}, context{}, finalizer{};   // event block (copied), target queue (retained), finalizer
+    bool resumed{}, cancelled{};
     Role role{Role::client};
     bool mach_service{}, interrupts{};   // a Mach-service client: a dead peer interrupts, it does not invalidate
     bool bundled{};                // a bundled XPC service of this application (the name is its bundle identifier)
@@ -79,9 +88,14 @@ struct Conn {
     std::array<std::uint32_t, 8> audit{};
 };
 
-struct Received {
-    std::uint32_t reply{};         // the sender's send-once reply right (0: none)
-    std::uint64_t connection{};    // the connection it arrived on (not retained)
+// A message's record (Value::link): a received message's reply right and connection, or the
+// right a reply dictionary answers. A right never used is destroyed with the message.
+struct MessageSide final : ConnectionSide {
+    ~MessageSide() override;
+    std::weak_ptr<Connections> owner;
+    std::uint32_t reply{};         // received: the sender's send-once reply right (0: none or used)
+    std::uint64_t connection{};    // received: the connection it arrived on (not retained)
+    std::uint32_t answers{};       // a reply dictionary: the send-once right it answers
 };
 
 struct Channel {
@@ -90,17 +104,14 @@ struct Channel {
     std::uint32_t port{};
 };
 
-class Connections {
+class Connections : public std::enable_shared_from_this<Connections> {
 public:
     Connections(Provider& provider, std::shared_ptr<Xpc> xpc) : p(provider), xpc_(std::move(xpc)) {}
 
     Provider p;
     std::shared_ptr<Xpc> xpc_;
     std::mutex mutex;
-    std::map<std::uint64_t, std::shared_ptr<Conn>> conns;
     std::map<std::uint64_t, Channel> channels;
-    std::map<std::uint64_t, Received> received;       // dictionary -> where it came from
-    std::map<std::uint64_t, std::uint32_t> reply_to;  // reply dictionary -> the send-once right it answers
     std::uint64_t next_channel{1};
     std::uint64_t event_entry{}, connect_entry{};
 
@@ -116,14 +127,39 @@ public:
     std::uint32_t task() { const auto at = symbol("_mach_task_self_"); return at ? memory().read32(at) : 0; }
     std::uint32_t bootstrap() { const auto at = symbol("_bootstrap_port"); return at ? memory().read32(at) : 0; }
 
+    // The record of a connection object (made on first use); a stop for any other object.
     std::shared_ptr<Conn> conn(std::uint64_t object) {
-        if (!xpc_->typed(object, Type::connection)) throw std::runtime_error("Alchemy XPC: a connection function on an object that is not an XPC connection");
-        std::lock_guard lock(mutex);
-        auto& found = conns[object];
-        if (!found) { found = std::make_shared<Conn>(); found->object = object; }
+        const auto v = xpc_->typed(object, Type::connection);
+        if (!v) throw std::runtime_error("Alchemy XPC: a connection function on an object that is not an XPC connection");
+        std::lock_guard lock(v->mutex);
+        if (auto found = std::dynamic_pointer_cast<Conn>(v->link)) return found;
+        auto made = std::make_shared<Conn>();
+        made->owner = weak_from_this();
+        made->object = object;
+        made->name = v->text;
+        v->link = made;
+        return made;
+    }
+    // A live connection's record, or nullptr (the object is gone).
+    std::shared_ptr<Conn> live(std::uint64_t object) {
+        const auto v = xpc_->typed(object, Type::connection);
+        if (!v) return nullptr;
+        std::lock_guard lock(v->mutex);
+        return std::dynamic_pointer_cast<Conn>(v->link);
+    }
+    // A message's record (made when `make`).
+    std::shared_ptr<MessageSide> message_side(std::uint64_t object, bool make) {
+        const auto v = xpc_->typed(object, Type::dictionary);
+        if (!v) return nullptr;
+        std::lock_guard lock(v->mutex);
+        auto found = std::dynamic_pointer_cast<MessageSide>(v->link);
+        if (!found && make) {
+            found = std::make_shared<MessageSide>();
+            found->owner = weak_from_this();
+            v->link = found;
+        }
         return found;
     }
-    std::shared_ptr<Value> value(std::uint64_t object) { return xpc_->typed(object, Type::connection); }
 
     // ---- ports ----------------------------------------------------------------------------
     std::uint32_t new_receive() {
@@ -405,17 +441,17 @@ public:
     // ---- connection life -----------------------------------------------------------------------
     std::uint64_t make_connection(const std::string& name, std::uint64_t queue) {
         if (queue) static_cast<void>(sys("_dispatch_retain", {queue}));
-        const auto object = xpc_->make(Type::connection, [&](Value& v) { v.text = name; v.queue = queue; });
-        static_cast<void>(conn(object));
+        const auto object = xpc_->make(Type::connection, [&](Value& v) { v.text = name; });
+        const auto c = conn(object);
+        std::lock_guard lock(mutex);
+        c->target = queue;
         return object;
     }
 
     // The serial queue a connection's events run on.
     std::uint64_t queue_of(const std::shared_ptr<Conn>& c) {
-        const auto v = value(c->object);
-        std::uint64_t target;
-        { std::lock_guard lock(v->mutex); target = v->queue; }
         std::lock_guard lock(mutex);
+        const auto target = c->target;
         if (!c->queue) {
             const auto label = process().allocate_guest(32);
             put_string(memory(), label, "com.apple.xpc.connection");
@@ -428,22 +464,24 @@ public:
     // Calls the connection's handler with `event` (on its queue: we are there), or keeps the
     // event until the connection is resumed.
     void handle(const std::shared_ptr<Conn>& c, std::uint64_t event) {
-        const auto v = value(c->object);
         std::uint64_t handler;
-        bool resumed;
-        { std::lock_guard lock(v->mutex); handler = v->handler; resumed = v->resumed; }
-        if (!resumed) { std::lock_guard lock(mutex); c->incoming.push_back(xpc_->retain(event)); return; }
+        {
+            std::lock_guard lock(mutex);
+            if (!c->resumed) { c->incoming.push_back(xpc_->retain(event)); return; }
+            handler = c->handler;
+        }
         if (!handler) return;
         static_cast<void>(EngineAdapter(process().calling_engine()).call(memory().read64(handler + 16), std::array<std::uint64_t, 2>{handler, event}));
     }
 
     // `event` to the handler on the connection's queue (asynchronously), or kept until resume.
     void post(const std::shared_ptr<Conn>& c, std::uint64_t event) {
-        const auto v = value(c->object);
         std::uint64_t handler;
-        bool resumed;
-        { std::lock_guard lock(v->mutex); handler = v->handler; resumed = v->resumed; }
-        if (!resumed) { std::lock_guard lock(mutex); c->incoming.push_back(xpc_->retain(event)); return; }
+        {
+            std::lock_guard lock(mutex);
+            if (!c->resumed) { c->incoming.push_back(xpc_->retain(event)); return; }
+            handler = c->handler;
+        }
         if (handler) xpc_->deliver(queue_of(c), handler, event);
     }
 
@@ -496,9 +534,7 @@ public:
 
     // A client connects: hello to the service, carrying a send right to its new inbox.
     void connect(const std::shared_ptr<Conn>& c) {
-        const auto v = value(c->object);
-        std::string name;
-        { std::lock_guard lock(v->mutex); name = v->text; }
+        const auto name = c->name;
         std::uint32_t service;
         {
             std::lock_guard lock(mutex);
@@ -666,10 +702,9 @@ public:
             const auto found = channels.find(id);
             if (found == channels.end()) return;
             channel = found->second;
-            const auto owner = conns.find(channel.connection);
-            if (owner == conns.end()) return;
-            c = owner->second;
         }
+        c = live(channel.connection);
+        if (!c) return;
         if (channel.kind == Channel::dead) {
             { std::lock_guard lock(mutex); c->dead = true; }
             fail(c, c->interrupts);
@@ -688,10 +723,7 @@ public:
     // A listener's hello: a new peer connection to its handler.
     void on_hello(const std::shared_ptr<Conn>& listener, Incoming& in) {
         if (in.id != id_hello || !in.remote) { release_ports(in.ports); if (in.remote) drop_send(in.remote); return; }
-        const auto lv = value(listener->object);
-        std::string name;
-        { std::lock_guard lock(lv->mutex); name = lv->text; }
-        const auto object = make_connection(name, 0);
+        const auto object = make_connection(listener->name, 0);
         const auto peer = conn(object);
         const auto inbox = new_receive();
         {
@@ -742,9 +774,9 @@ public:
             if (in.remote) drop_send(in.remote);
             return;
         }
-        {
-            std::lock_guard lock(mutex);
-            received[message] = Received{in.remote_type == move_send_once ? in.remote : 0, c->object};
+        if (const auto side = message_side(message, true)) {
+            side->reply = in.remote_type == move_send_once ? in.remote : 0;
+            side->connection = c->object;
         }
         handle(c, message);
         xpc_->release(message);
@@ -775,10 +807,7 @@ public:
     void send_message(std::uint64_t object, std::uint64_t message, std::uint64_t reply_queue, std::uint64_t reply_block) {
         const auto c = conn(object);
         std::uint32_t answer_to = 0;
-        {
-            std::lock_guard lock(mutex);
-            if (const auto found = reply_to.find(message); found != reply_to.end()) { answer_to = found->second; reply_to.erase(found); }
-        }
+        if (const auto side = message_side(message, false)) { std::lock_guard lock(mutex); answer_to = std::exchange(side->answers, 0); }
         if (answer_to) {
             std::vector<std::uint8_t> body;
             std::vector<Port> ports;
@@ -830,11 +859,9 @@ public:
 
     // A resumed client that is not connected connects on its queue; the waiting messages follow.
     void schedule_connect(const std::shared_ptr<Conn>& c) {
-        bool resumed;
-        { const auto v = value(c->object); std::lock_guard lock(v->mutex); resumed = v->resumed; }
         {
             std::lock_guard lock(mutex);
-            if (!resumed || c->role != Role::client || c->connecting || c->connected || c->finished) return;
+            if (!c->resumed || c->role != Role::client || c->connecting || c->connected || c->finished) return;
         }
         static_cast<void>(xpc_->retain(c->object));
         static_cast<void>(sys("_dispatch_async_f", {queue_of(c), c->object, connect_entry}));
@@ -843,9 +870,7 @@ public:
     // A client that is not connected (yet, or after an interruption) connects, and waits a
     // little for the answer when called off its queue (sync replies need it).
     void ensure_connected(const std::shared_ptr<Conn>& c) {
-        bool resumed;
-        { const auto v = value(c->object); std::lock_guard lock(v->mutex); resumed = v->resumed; }
-        if (!resumed || c->role != Role::client) return;
+        { std::lock_guard lock(mutex); if (!c->resumed || c->role != Role::client) return; }
         connect(c);
         // The answer is read here directly (the inbox source may run on another thread first).
         for (int i = 0; i < 200; ++i) {
@@ -890,9 +915,8 @@ public:
 
     void resume(std::uint64_t object) {
         const auto c = conn(object);
-        const auto v = value(object);
         bool first;
-        { std::lock_guard lock(v->mutex); first = !v->resumed; v->resumed = true; }
+        { std::lock_guard lock(mutex); first = !c->resumed; c->resumed = true; }
         if (!first) return;
         // Events that waited for the handler.
         std::deque<std::uint64_t> waiting;
@@ -900,7 +924,7 @@ public:
         const auto queue = queue_of(c);
         for (const auto event : waiting) {
             std::uint64_t handler;
-            { std::lock_guard lock(v->mutex); handler = v->handler; }
+            { std::lock_guard lock(mutex); handler = c->handler; }
             if (handler) xpc_->deliver(queue, handler, event);
             xpc_->release(event);
         }
@@ -923,8 +947,7 @@ public:
 
     void cancel(std::uint64_t object) {
         const auto c = conn(object);
-        const auto v = value(object);
-        { std::lock_guard lock(v->mutex); v->cancelled = true; v->resumed = true; }
+        { std::lock_guard lock(mutex); c->cancelled = true; c->resumed = true; }
         std::uint32_t peer, service;
         Role role;
         { std::lock_guard lock(mutex); peer = c->peer; service = c->service; role = c->role; }
@@ -934,7 +957,7 @@ public:
         // The invalid error comes last, on the connection's queue.
         const auto queue = queue_of(c);
         std::uint64_t handler;
-        { std::lock_guard lock(v->mutex); handler = v->handler; }
+        { std::lock_guard lock(mutex); handler = c->handler; }
         std::vector<PendingReply> replies;
         {
             std::lock_guard lock(mutex);
@@ -958,6 +981,44 @@ public:
         release_held(c);
     }
 };
+
+// The connection object is destroyed: its sources, rights, waiting messages, handler, queues,
+// and the finalizer last but one (as libxpc runs it when the connection is released).
+Conn::~Conn() {
+    const auto self = owner.lock();
+    if (!self) return;
+    try {
+        for (auto* source : {&service_source, &inbox_source, &dead_source}) self->cancel_source(*source);
+        for (auto& reply : replies) {
+            self->cancel_source(reply.source);
+            self->drop_receive(reply.port);
+            if (reply.block) static_cast<void>(self->sys("__Block_release", {reply.block}));
+        }
+        if (role == Role::listener) self->drop_receive(service); else self->drop_send(service);
+        self->drop_receive(inbox);
+        self->drop_send(peer);
+        for (const auto message : outgoing) self->xpc_->release(message);
+        for (const auto event : incoming) self->xpc_->release(event);
+        if (finalizer) static_cast<void>(EngineAdapter(self->process().calling_engine()).call(finalizer, std::array<std::uint64_t, 1>{context}));
+        if (handler) static_cast<void>(self->sys("__Block_release", {handler}));
+        if (target) static_cast<void>(self->sys("_dispatch_release", {target}));
+        if (queue) static_cast<void>(self->sys("_dispatch_release", {queue}));
+        std::lock_guard lock(self->mutex);
+        std::erase_if(self->channels, [&](const auto& item) { return item.second.connection == object; });
+    } catch (...) {
+    }
+}
+
+// A message that never answered its sender's reply right, or a reply never sent: the right goes.
+MessageSide::~MessageSide() {
+    const auto self = owner.lock();
+    if (!self) return;
+    try {
+        if (reply) self->drop_send(reply);
+        if (answers) self->drop_send(answers);
+    } catch (...) {
+    }
+}
 
 } // namespace
 
@@ -1024,9 +1085,7 @@ void install_xpc_connections(Provider& p, const std::shared_ptr<Xpc>& xpc) {
         const auto endpoint = self->xpc_->typed(s.x[0], Type::endpoint);
         if (!endpoint) return 0;
         const auto target = self->conn(endpoint->connection);
-        const auto tv = self->value(endpoint->connection);
-        std::string name;
-        { std::lock_guard lock(tv->mutex); name = tv->text; }
+        const auto name = target->name;
         std::uint32_t service;
         Role role;
         { std::lock_guard lock(self->mutex); service = target->service; role = target->role; }
@@ -1047,22 +1106,18 @@ void install_xpc_connections(Provider& p, const std::shared_ptr<Xpc>& xpc) {
 
     // ---- configuration ----
     p.libsystem("_xpc_connection_set_event_handler", [self](CpuState& s, GuestMemory&) -> std::uint64_t {
-        static_cast<void>(self->conn(s.x[0]));
-        const auto v = self->value(s.x[0]);
+        const auto c = self->conn(s.x[0]);
         const auto copy = s.x[1] ? self->sys("__Block_copy", {s.x[1]}) : 0;
         std::uint64_t old;
-        { std::lock_guard lock(v->mutex); old = std::exchange(v->handler, copy); }
+        { std::lock_guard lock(self->mutex); old = std::exchange(c->handler, copy); }
         if (old) static_cast<void>(self->sys("__Block_release", {old}));
         return 0;
     });
     p.libsystem("_xpc_connection_set_target_queue", [self](CpuState& s, GuestMemory&) -> std::uint64_t {
         const auto c = self->conn(s.x[0]);
-        const auto v = self->value(s.x[0]);
         if (s.x[1]) static_cast<void>(self->sys("_dispatch_retain", {s.x[1]}));
-        std::uint64_t old;
-        { std::lock_guard lock(v->mutex); old = std::exchange(v->queue, s.x[1]); }
-        std::uint64_t own;
-        { std::lock_guard lock(self->mutex); own = c->queue; }
+        std::uint64_t old, own;
+        { std::lock_guard lock(self->mutex); old = std::exchange(c->target, s.x[1]); own = c->queue; }
         if (own && s.x[1]) static_cast<void>(self->sys("_dispatch_set_target_queue", {own, s.x[1]}));
         if (old) static_cast<void>(self->sys("_dispatch_release", {old}));
         return 0;
@@ -1091,28 +1146,29 @@ void install_xpc_connections(Provider& p, const std::shared_ptr<Xpc>& xpc) {
     });
     // A reply to a message received from a peer: the sender's reply right.
     p.libsystem("_xpc_dictionary_create_reply", [self](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto side = self->message_side(s.x[0], false);
         std::uint32_t right;
         {
             std::lock_guard lock(self->mutex);
-            const auto found = self->received.find(s.x[0]);
-            if (found == self->received.end() || !found->second.reply) return 0;
-            right = std::exchange(found->second.reply, 0);
+            if (!side || !side->reply) return 0;
+            right = std::exchange(side->reply, 0);
         }
         const auto reply = self->xpc_->make(Type::dictionary);
+        const auto answer = self->message_side(reply, true);
         std::lock_guard lock(self->mutex);
-        self->reply_to[reply] = right;
+        answer->answers = right;
         return reply;
     }, 0);
     p.libsystem("_xpc_dictionary_get_remote_connection", [self](CpuState& s, GuestMemory&) -> std::uint64_t {
+        const auto side = self->message_side(s.x[0], false);
         std::lock_guard lock(self->mutex);
-        const auto found = self->received.find(s.x[0]);
-        return found == self->received.end() ? 0 : found->second.connection;
+        return side ? side->connection : 0;
     }, 0);
 
     // ---- identity ----
     p.libsystem("_xpc_connection_get_name", [self](CpuState& s, GuestMemory&) -> std::uint64_t {
         static_cast<void>(self->conn(s.x[0]));
-        const auto v = self->value(s.x[0]);
+        const auto v = self->xpc_->typed(s.x[0], Type::connection);
         std::lock_guard lock(v->mutex);
         if (!v->guest) v->guest = self->xpc_->guest_copy(std::span(reinterpret_cast<const std::uint8_t*>(v->text.data()), v->text.size()), true);
         return v->guest;
@@ -1134,13 +1190,13 @@ void install_xpc_connections(Provider& p, const std::shared_ptr<Xpc>& xpc) {
         return 0;
     });
     p.libsystem("_xpc_connection_set_context", [self](CpuState& s, GuestMemory&) -> std::uint64_t {
-        static_cast<void>(self->conn(s.x[0])); const auto v = self->value(s.x[0]); std::lock_guard lock(v->mutex); v->context = s.x[1]; return 0;
+        const auto c = self->conn(s.x[0]); std::lock_guard lock(self->mutex); c->context = s.x[1]; return 0;
     });
     p.libsystem("_xpc_connection_get_context", [self](CpuState& s, GuestMemory&) -> std::uint64_t {
-        static_cast<void>(self->conn(s.x[0])); const auto v = self->value(s.x[0]); std::lock_guard lock(v->mutex); return v->context;
+        const auto c = self->conn(s.x[0]); std::lock_guard lock(self->mutex); return c->context;
     }, 0);
     p.libsystem("_xpc_connection_set_finalizer_f", [self](CpuState& s, GuestMemory&) -> std::uint64_t {
-        static_cast<void>(self->conn(s.x[0])); const auto v = self->value(s.x[0]); std::lock_guard lock(v->mutex); v->finalizer = s.x[1]; return 0;
+        const auto c = self->conn(s.x[0]); std::lock_guard lock(self->mutex); c->finalizer = s.x[1]; return 0;
     });
     // int xpc_connection_set_peer_code_signing_requirement(connection, const char*): Alchemy
     // has no code signatures to check a peer against; the requirement is kept, unchecked.
