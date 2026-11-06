@@ -56,6 +56,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/appkit/controls/compositional.cpp
     src/alchemy/darwin/appkit/controls/font_panel.cpp
     src/alchemy/darwin/appkit/controls/attachment_cell.cpp
+    src/alchemy/darwin/appkit/controls/adaptive_image_glyph.cpp
     src/alchemy/darwin/appkit/controls/text_system.cpp
     src/alchemy/darwin/appkit/controls/text_layout.cpp
     src/alchemy/darwin/appkit/controls/text_actions.cpp

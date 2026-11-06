@@ -1302,6 +1302,7 @@ void install_text_system(AppKit& kit) {
     }
     install_font_panel(kit);   // font_panel.cpp: the shared font panel
     install_attachment_cell(kit);   // attachment_cell.cpp
+    install_adaptive_image_glyph(kit);   // adaptive_image_glyph.cpp
     install_text_layout(kit);
     install_text_actions(kit);
     install_text_finder(kit);

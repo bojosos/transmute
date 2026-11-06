@@ -37,6 +37,13 @@ and added attributes, matching by mandatory keys, the default and
 monospaced system designs (serif and rounded are nil, as for an unavailable
 design). System font widths other than standard stop explicitly.
 
+**Adaptive image glyphs:** CTFontGetTypographicBoundsForAdaptiveImageProvider
+answers a square of the font's ascent + descent standing on the baseline (an
+Alchemy sizing: no metric is documented), and
+CTFontDrawImageFromAdaptiveImageProviderAtPoint draws the provider's image
+for that square at the context's device scale. Line layout does not place
+them (kCTAdaptiveImageProviderAttributeName is kept, not laid out).
+
 **Not registered:** CTRunDelegate and CTGlyphInfo (the host's line layout
 has no inline objects or glyph substitutions), CTRubyAnnotation, font
 features (CTFontCopyFeatures, CTFontDescriptorCreateCopyWithFeature) and

@@ -2674,6 +2674,79 @@ void ax_client(Fixture& f) {
     static_cast<void>(f.id(window, "close"));
 }
 
+// ---- adaptive image glyphs (controls/adaptive_image_glyph.cpp, coretext/font_exports.cpp) ------------
+void adaptive_image_glyphs(Fixture& f) {
+    constexpr std::string_view cg = "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics";
+    constexpr std::string_view image_io = "/System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO";
+    constexpr std::string_view cf_library = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+    constexpr std::string_view ct = "/System/Library/Frameworks/CoreText.framework/Versions/A/CoreText";
+    const auto call = [&f](std::string_view library, std::string_view symbol, std::vector<Address> arguments) -> Address {
+        const auto found = f.process.resolve(library, symbol);
+        require(found.has_value(), "missing " + std::string(symbol));
+        return f.engine.invoke_callback(found->address, arguments);
+    };
+    const auto regs = [&f](std::string_view library, std::string_view symbol, const CallRegs& registers) {
+        return alchemy::engine_call_regs(f.engine, f.process.resolve(library, symbol)->address, registers);
+    };
+    // A 32 x 32 opaque red image, as PNG content.
+    const auto space = call(cg, "_CGColorSpaceCreateDeviceRGB", {});
+    const auto bitmap = call(cg, "_CGBitmapContextCreate", {0, 32, 32, 8, 128, space, 2 | 0x2000});
+    CallRegs red;
+    red.x[0] = bitmap;
+    red.set_d(0, 1); red.set_d(1, 0); red.set_d(2, 0); red.set_d(3, 1);
+    static_cast<void>(regs(cg, "_CGContextSetRGBFillColor", red));
+    CallRegs fill;
+    fill.x[0] = bitmap;
+    fill.set_d(0, 0); fill.set_d(1, 0); fill.set_d(2, 32); fill.set_d(3, 32);
+    static_cast<void>(regs(cg, "_CGContextFillRect", fill));
+    const auto image = call(cg, "_CGBitmapContextCreateImage", {bitmap});
+    const auto png = call(cf_library, "_CFDataCreateMutable", {0, 0});
+    const auto destination = call(image_io, "_CGImageDestinationCreateWithData", {png, f.str("public.png"), 1, 0});
+    require(destination != 0, "a PNG destination");
+    static_cast<void>(call(image_io, "_CGImageDestinationAddImage", {destination, image, 0}));
+    require((call(image_io, "_CGImageDestinationFinalize", {destination}) & 0xff) != 0, "PNG content");
+
+    const auto glyph = f.id(f.id(f.cls("NSAdaptiveImageGlyph"), "alloc"), "initWithImageContent:", {png});
+    const auto twin = f.id(f.id(f.cls("NSAdaptiveImageGlyph"), "alloc"), "initWithImageContent:", {png});
+    require(glyph && f.text(f.id(glyph, "contentIdentifier")).size() == 64 && f.yes(glyph, "isEqual:", {twin}) &&
+                f.integer(f.id(glyph, "imageContent"), "length") == f.integer(png, "length") && f.text(f.id(glyph, "contentDescription")).empty(),
+            "the glyph's content and identifier");
+    // The provider's image for a 16-point square at 2x: the 32-pixel image, fitted to 16 x 16.
+    const auto placed = f.process.allocate_guest(32);
+    CallRegs request;
+    request.set_d(0, 16); request.set_d(1, 16); request.set_d(2, 2);
+    request.x[2] = placed; request.x[3] = placed + 16;
+    const auto provided = f.send(glyph, "imageForProposedSize:scaleFactor:imageOffset:imageSize:", request).x0;
+    const auto at = [&f, placed](unsigned i) { return std::bit_cast<double>(f.engine.read64(placed + i * 8)); };
+    require(provided && call(cg, "_CGImageGetWidth", {provided}) == 32 && at(2) == 16 && at(3) == 16 && at(0) == 0, "imageForProposedSize:...");
+
+    // CoreText: the glyph's square on the baseline, and its pixels where it is drawn.
+    CallRegs size;
+    size.set_d(0, 20);
+    const auto font = f.send(f.cls("NSFont"), "systemFontOfSize:", size).x0;
+    CallRegs bounds_query;
+    bounds_query.x[0] = font; bounds_query.x[1] = glyph;
+    const auto bounds = regs(ct, "_CTFontGetTypographicBoundsForAdaptiveImageProvider", bounds_query);
+    const double ascent = std::abs(f.send(font, "ascender").d(0)), descent = std::abs(f.send(font, "descender").d(0));
+    require(std::abs(bounds.d(2) - (ascent + descent)) < 0.01 && bounds.d(2) == bounds.d(3) && std::abs(bounds.d(1) + descent) < 0.01,
+            "CTFontGetTypographicBoundsForAdaptiveImageProvider");
+    const auto canvas = call(cg, "_CGBitmapContextCreate", {0, 64, 64, 8, 256, space, 2 | 0x2000});
+    CallRegs draw;
+    draw.x[0] = font; draw.x[1] = glyph; draw.x[2] = canvas;
+    draw.set_d(0, 10); draw.set_d(1, 20);
+    static_cast<void>(regs(ct, "_CTFontDrawImageFromAdaptiveImageProviderAtPoint", draw));
+    const auto data = call(cg, "_CGBitmapContextGetData", {canvas});
+    // Bottom-left origin: the square spans x 10..10+side, y 20-descent..20+ascent; row 0 is the top.
+    const auto pixel = [&](int x, int y_up) { return f.engine.read32(data + static_cast<Address>((63 - y_up) * 256 + x * 4)); };
+    const auto inside = pixel(10 + static_cast<int>(bounds.d(2) / 2), 20 + static_cast<int>(ascent / 2));
+    require(((inside >> 16) & 0xff) > 200 && (inside & 0xff) < 40, "the glyph drawn red");
+    require(pixel(4, 4) == 0, "nothing drawn outside it");
+
+    const auto text_view = f.with_rect(f.id(f.cls("NSTextView"), "alloc"), "initWithFrame:", {{0, 0}, {100, 50}});
+    static_cast<void>(f.id(text_view, "setSupportsAdaptiveImageFormat:", {1}));
+    require(f.yes(text_view, "supportsAdaptiveImageFormat"), "-supportsAdaptiveImageFormat");
+}
+
 // ---- small additions -------------------------------------------------------------------------------
 void small_additions(Fixture& f) {
     journal.clear();
@@ -2979,6 +3052,7 @@ int main() {
         rulers(f);
         accessibility(f);
         ax_client(f);
+        adaptive_image_glyphs(f);
         small_additions(f);
         appearances(f);
         scrolling_text(f);

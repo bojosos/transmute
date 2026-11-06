@@ -142,7 +142,15 @@ count, which IsSecureEventInputEnabled answers): this process's record only,
 no keyboard input is shielded from other programs on the host.
 NSTextAttachmentCell sizes and draws its image on the baseline. NSTextField
 and NSTextInputContext keep their newer settings; the one keyboard input
-source is the host's layout.
+source is the host's layout (TISCreateInputSourceList lists it,
+TISSelectInputSource of it changes nothing).
+NSAdaptiveImageGlyph (`controls/adaptive_image_glyph.cpp`) keeps its image
+content and gives CoreText images of it (decoded through ImageIO: HEIC
+content needs the host's HEIF codec, else no image). Its
+`contentIdentifier` is the SHA-256 of the content, not the identifier stored
+in the image, and `contentDescription` is empty: Alchemy does not read that
+metadata. The text system keeps NSAdaptiveImageGlyphAttributeName and
+`supportsAdaptiveImageFormat` but does not lay the glyphs out.
 
 **Path items, transition layouts:** NSPathControl's -pathItems are
 NSPathControlItems viewing its component cells (an item's title or image

@@ -2,6 +2,9 @@
 #include "alchemy/darwin/coregraphics/context.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cmath>
 #include <map>
 #include <mutex>
 #include <numbers>
@@ -506,6 +509,52 @@ void install_font_exports(Quartz& q) {
         const auto c = context_state(*quartz, s.x[4]);
         std::lock_guard lock(c->mutex);
         draw_glyphs(*quartz, *c, run, {}, std::nullopt);
+    });
+    // Adaptive image glyphs (CTAdaptiveImageProviding: NSAdaptiveImageGlyph,
+    // appkit/controls/adaptive_image_glyph.cpp). A glyph takes a square of the
+    // font's ascent + descent standing on the baseline (Alchemy's sizing:
+    // CoreText documents no metric for it) and is drawn with the provider's
+    // image for that square at the context's device scale, placed by the
+    // offset and size the provider answers.
+    if (!q.process.resolve(lib, "_kCTAdaptiveImageProviderAttributeName"))
+        q.string_constant(lib, "_kCTAdaptiveImageProviderAttributeName", "CTAdaptiveImageProvider");   // (unverified)
+    const auto adaptive_bounds = [font](Address font_object) -> Rect {
+        const auto state = font(font_object);
+        const auto ascent = std::abs(state->face->metrics.ascent * state->scale());
+        const auto descent = std::abs(state->face->metrics.descent * state->scale());
+        return {{0, -descent}, {ascent + descent, ascent + descent}};
+    };
+    fn("_CTFontGetTypographicBoundsForAdaptiveImageProvider", [adaptive_bounds](CpuState& s, GuestMemory&) {
+        return_rect(s, adaptive_bounds(s.x[0]));
+    });
+    fn("_CTFontDrawImageFromAdaptiveImageProviderAtPoint", [quartz, adaptive_bounds](CpuState& s, GuestMemory&) {
+        // (font, provider, CGPoint d0 d1, context)
+        const auto font_object = s.x[0], provider = s.x[1], context = s.x[2];
+        const Point point{std::bit_cast<double>(s.v[0][0]), std::bit_cast<double>(s.v[1][0])};
+        if (!provider || !context) return;
+        const auto bounds = adaptive_bounds(font_object);
+        const auto c = context_state(*quartz, context);
+        double scale{};
+        {
+            std::lock_guard lock(c->mutex);
+            const auto device = c->g.ctm.then(c->base_ctm);
+            scale = std::hypot(device.a, device.b);
+        }
+        if (!(scale > 0) || !std::isfinite(scale)) scale = 1;
+        const auto placed = quartz->process.allocate_guest(32, 8);   // imageOffset, imageSize
+        CallRegs request;
+        request.set_d(0, bounds.size.width);
+        request.set_d(1, bounds.size.height);
+        request.set_d(2, scale);
+        request.x[2] = placed;
+        request.x[3] = placed + 16;
+        const auto image = quartz->send(provider, "imageForProposedSize:scaleFactor:imageOffset:imageSize:", request).x0;
+        std::array<double, 4> values{};
+        for (unsigned i = 0; i < 4; ++i) values[i] = std::bit_cast<double>(quartz->memory().read64(placed + i * 8));
+        quartz->process.release_guest(placed);
+        if (!image || !(values[2] > 0) || !(values[3] > 0)) return;
+        std::lock_guard lock(c->mutex);
+        draw_image(*quartz, *c, image, {{point.x + bounds.origin.x + values[0], point.y + bounds.origin.y + values[1]}, {values[2], values[3]}});
     });
     fn("_CTFontGetLigatureCaretPositions", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     fn("_CTFontGetVerticalTranslationsForGlyphs", [quartz, font](CpuState& s, GuestMemory&) {

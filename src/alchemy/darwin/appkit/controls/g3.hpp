@@ -122,5 +122,6 @@ void install_compositional_layout(AppKit& kit);
 void install_font_panel(AppKit& kit);
 // NSTextAttachmentCell (attachment_cell.cpp; installed by text_system.cpp).
 void install_attachment_cell(AppKit& kit);
+void install_adaptive_image_glyph(AppKit& kit);   // adaptive_image_glyph.cpp
 
 } // namespace alchemy::gui::completion_kit::controls

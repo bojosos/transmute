@@ -166,6 +166,7 @@ struct TextState final : ObjectPayload {
     std::uint64_t selection_granularity{}, selection_affinity{};
     std::int64_t writing_tools_behavior{}, spell_tag{-1};
     bool accepts_glyph_info{}, allows_background_change{}, adaptive_colors{}, imports_graphics{}, uses_font_panel{true};
+    bool supports_adaptive_images{};   // -supportsAdaptiveImageFormat (kept; the glyphs are not laid out)
     bool aborting{};                                             // field editor: editing ends by cancellation (no action)
 };
 [[nodiscard]] inline std::shared_ptr<TextState> text_state(AppKit& kit, Address view) { return kit.extension<TextState>(view); }

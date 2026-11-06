@@ -680,6 +680,7 @@ void install_text_actions(AppKit& kit) {
     flag("acceptsGlyphInfo", "setAcceptsGlyphInfo:", &TextState::accepts_glyph_info);
     flag("allowsDocumentBackgroundColorChange", "setAllowsDocumentBackgroundColorChange:", &TextState::allows_background_change);
     flag("usesAdaptiveColorMappingForDarkAppearance", "setUsesAdaptiveColorMappingForDarkAppearance:", &TextState::adaptive_colors);
+    flag("supportsAdaptiveImageFormat", "setSupportsAdaptiveImageFormat:", &TextState::supports_adaptive_images);
     kit.method(tv, "allowedInputSourceLocales", [k](CpuState& s, GuestMemory&) { s.x[0] = text_state(*k, s.x[0])->allowed_locales; });
     kit.method(tv, "setAllowedInputSourceLocales:", [k](CpuState& s, GuestMemory&) {
         const auto state = text_state(*k, s.x[0]);
