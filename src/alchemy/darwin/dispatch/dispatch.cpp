@@ -107,7 +107,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     struct Semaphore {
         std::mutex gate;
         std::deque<std::shared_ptr<Waiter>> waiters;
-        std::uint64_t permits{}, references{1};
+        std::uint64_t permits{}, references{1}, context{};
         bool retired{};
     };
     struct Group;
@@ -150,7 +150,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     // dispatch_queue_attr_t: the two shared attributes and the variants made from them.
     struct Attribute { Kind kind{Kind::serial}; bool inactive{}; std::uint32_t qos{}; std::uint64_t frequency{}; };
     struct Group {
-        std::uint64_t address{}, count{}, references{1};
+        std::uint64_t address{}, count{}, references{1}, context{};
         std::vector<std::pair<std::uint64_t, Work>> notifications;   // target queue (retained), work
         bool released{};
     };
@@ -201,6 +201,9 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     std::map<std::uint64_t, std::uint64_t> draining; // thread identity -> queue being drained
     std::map<std::uint64_t, Attribute> attributes;     // dispatch_queue_attr_t -> what it describes
     std::map<std::uint64_t, std::uint64_t> finalizers; // dispatch_set_finalizer_f: object -> function
+    // dispatch_set_context of the other providers' objects (I/O channels, data), until
+    // dispatch_object_disposed.
+    std::map<std::uint64_t, std::uint64_t> object_contexts;
     // dispatch_block_create's blocks (the block object -> its state).
     struct BlockState {
         std::uint64_t original{}, flags{};
@@ -409,7 +412,6 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
                     if (value.references == UINT64_MAX) throw std::runtime_error("dispatch reference count overflow");
                     ++value.references;
                 } else if (--value.references == 0) { value.released = true; retire_group(value); }
-                return;
             } else if (const auto source = sources.find(address); source != sources.end()) {
                 auto& value = *source->second;
                 if (retain) {
@@ -422,10 +424,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
                     // stops and no further handlers are submitted.
                     value.disposed = value.canceled = true; ++value.generation;
                     disposed = source->second;
-                    if (const auto finalizer = finalizers.find(address); finalizer != finalizers.end()) {
-                        pending_destructors.emplace_back(value.context, finalizer->second);
-                        finalizers.erase(finalizer);
-                    }
+                    dispose_finalizer(address, value.context);
                     sources.erase(source);
                 }
                 if (!disposed) return;
@@ -441,7 +440,10 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
                 } else {
                     if (value.references == 1 && !value.waiters.empty())
                         throw std::runtime_error("dispatch semaphore released with active waiters");
-                    if (--value.references == 0) { value.retired = true; semaphores.erase(found); destroy = true; }
+                    if (--value.references == 0) {
+                        dispose_finalizer(address, value.context);
+                        value.retired = true; semaphores.erase(found); destroy = true;
+                    }
                 }
             }
         }
@@ -641,6 +643,16 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         const auto found = queues.find(address);
         return found != queues.end() && !found->second->released;
     }
+    // Caller holds metadata. A disposed object's finalizer runs with its context
+    // (run_destructors), and only when that context is non-NULL, as libdispatch's
+    // _dispatch_dispose does; libdispatch runs it on the target queue, here it runs
+    // on the releasing thread.
+    void dispose_finalizer(std::uint64_t address, std::uint64_t context) {
+        const auto finalizer = finalizers.find(address);
+        if (finalizer == finalizers.end()) return;
+        if (context) pending_destructors.emplace_back(context, finalizer->second);
+        finalizers.erase(finalizer);
+    }
     // Caller holds metadata. Frees a released queue once nothing references it.
     void retire(std::uint64_t address, Queue& value) {
         if (!value.released || !value.items.empty() || value.active || value.owner || value.running) return;
@@ -649,10 +661,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
             if (entry.second) pending_destructors.push_back(entry);
         }
         value.specifics.clear();
-        if (const auto finalizer = finalizers.find(address); finalizer != finalizers.end()) {
-            pending_destructors.emplace_back(value.context, finalizer->second);
-            finalizers.erase(finalizer);
-        }
+        dispose_finalizer(address, value.context);
         if (value.target) pending_target_releases.push_back(value.target);
         const auto label = value.label;
         queues.erase(address);
@@ -972,7 +981,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
             return;
         }
         if (const auto found = sources.find(address); found != sources.end()) { ++found->second->suspended; return; }
-        throw std::runtime_error("dispatch_suspend of an object that cannot be suspended");
+        // Groups, semaphores, I/O channels, data: libdispatch's dispatch_suspend ignores them.
     }
     void resume(std::uint64_t address) {
         std::shared_ptr<Source> source;
@@ -990,7 +999,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
                 if (source->inactive) source->inactive = false;
                 else if (!source->suspended) throw std::runtime_error("dispatch_resume of a source that is not suspended");
                 else --source->suspended;
-            } else throw std::runtime_error("dispatch_resume of an object that cannot be resumed");
+            } else return;   // not a queue or source: ignored, as libdispatch's dispatch_resume does
         }
         if (source) { source_ready(source); return; }
         activate(address, start);
@@ -1018,10 +1027,19 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         if (queue_address) { activate(queue_address, start); return; }
         source_ready(source);
     }
-    std::uint64_t* context_slot(std::uint64_t address) {
-        if (const auto found = queues.find(address); found != queues.end() && !found->second->released) return &found->second->context;
+    // Caller holds metadata. Every dispatch object has a context, NULL until set, except
+    // the global and main queues (libdispatch's NO_CONTEXT types): nullptr for those.
+    // Other providers' objects keep theirs in object_contexts (made when `create`).
+    std::uint64_t* context_slot(std::uint64_t address, bool create) {
+        if (!address) throw std::runtime_error("dispatch context of a NULL object");
+        if (const auto found = queues.find(address); found != queues.end())
+            return found->second->immortal ? nullptr : &found->second->context;
         if (const auto found = sources.find(address); found != sources.end()) return &found->second->context;
-        throw std::runtime_error("dispatch context of an object without one");
+        if (const auto found = groups.find(address); found != groups.end()) return &found->second->context;
+        if (const auto found = semaphores.find(address); found != semaphores.end()) return &found->second->context;
+        if (create) return &object_contexts[address];
+        const auto found = object_contexts.find(address);
+        return found == object_contexts.end() ? nullptr : &found->second;
     }
     void set_target(std::uint64_t address, std::uint64_t target) {
         std::lock_guard lock(metadata);
@@ -1086,6 +1104,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     void retire_group(Group& value) {
         if (!value.released || value.count || !value.notifications.empty()) return;
         const auto address = value.address;
+        dispose_finalizer(address, value.context);
         groups.erase(address);
         process.release_guest(address);
     }
@@ -1096,11 +1115,13 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     }
     void leave(const std::shared_ptr<Group>& value) {
         std::vector<std::pair<std::uint64_t, Work>> ready;
+        bool emptied{};
         {
             std::lock_guard lock(metadata);
             if (value->count == 0) throw std::runtime_error("unbalanced dispatch_group_leave");
-            if (--value->count == 0) { ready.swap(value->notifications); retire_group(*value); }
+            if (--value->count == 0) { ready.swap(value->notifications); retire_group(*value); emptied = true; }
         }
+        if (emptied) run_destructors();   // a released group's finalizer
         group_changed.notify_all();
         for (auto& [target, work] : ready) { async(target, std::move(work)); reference(target, false); }
     }
@@ -1991,14 +2012,21 @@ void Dispatch::install_queues() {
     install("_dispatch_resume", [](auto& self, auto& s, auto&) { self.resume(s.x[0]); return std::uint64_t{0}; });
     install("_dispatch_activate", [](auto& self, auto& s, auto&) { self.activate_object(s.x[0]); return std::uint64_t{0}; });
     install("_dispatch_set_context", [](auto& self, auto& s, auto&) {
-        std::lock_guard lock(self.metadata); *self.context_slot(s.x[0]) = s.x[1]; return std::uint64_t{0};
+        std::lock_guard lock(self.metadata);
+        if (const auto slot = self.context_slot(s.x[0], true)) *slot = s.x[1];
+        return std::uint64_t{0};
     });
-    install("_dispatch_get_context", [](auto& self, auto& s, auto&) { std::lock_guard lock(self.metadata); return *self.context_slot(s.x[0]); });
+    install("_dispatch_get_context", [](auto& self, auto& s, auto&) {
+        std::lock_guard lock(self.metadata);
+        const auto slot = self.context_slot(s.x[0], false);
+        return slot ? *slot : std::uint64_t{0};
+    });
     // dispatch_set_finalizer_f(object, finalizer): called with the object's context once the
-    // object's last reference is released (queues and sources).
+    // object's last reference is released, if that context is non-NULL. The global and main
+    // queues ignore it (they have no context).
     install("_dispatch_set_finalizer_f", [](auto& self, auto& s, auto&) {
         std::lock_guard lock(self.metadata);
-        if (!self.queues.contains(s.x[0]) && !self.sources.contains(s.x[0])) throw std::runtime_error("dispatch_set_finalizer_f of an object without a context");
+        if (!self.context_slot(s.x[0], false) && self.queues.contains(s.x[0])) return std::uint64_t{0};
         if (s.x[1]) self.finalizers[s.x[0]] = s.x[1]; else self.finalizers.erase(s.x[0]);
         return std::uint64_t{0};
     });
@@ -2220,6 +2248,21 @@ void set_dispatch_object_classes(ProcessContext& context, const DispatchObjectCl
 std::optional<DispatchObjectInfo> dispatch_object_info(ProcessContext& context, std::uint64_t object) {
     const auto dispatch = dispatch_of(context);
     return dispatch ? dispatch->info(object) : std::nullopt;
+}
+
+void dispatch_object_disposed(ProcessContext& context, std::uint64_t object) {
+    const auto dispatch = dispatch_of(context);
+    if (!dispatch) return;
+    {
+        std::lock_guard lock(dispatch->metadata);
+        std::uint64_t value{};
+        if (const auto found = dispatch->object_contexts.find(object); found != dispatch->object_contexts.end()) {
+            value = found->second;
+            dispatch->object_contexts.erase(found);
+        }
+        dispatch->dispose_finalizer(object, value);
+    }
+    dispatch->run_destructors();
 }
 
 void add_dispatch_reference_handler(ProcessContext& context, DispatchReferenceHandler handler) {

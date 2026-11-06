@@ -8,6 +8,7 @@
 #include <mutex>
 #include <thread>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <future>
@@ -256,11 +257,43 @@ void test_queues() {
     static_cast<void>(f.call("_dispatch_release", {serial}));
     f.threads.join_workers();
 }
+
+// libdispatch's object.c: every object has a context, NULL until set, except the
+// global and main queues; dispatch_resume ignores objects that are not queues or
+// sources; a finalizer runs only when the context is non-NULL.
+void test_object_semantics() {
+    QueueFixture f;
+    std::mutex gate;
+    std::vector<std::uint64_t> finalized;
+    const auto finalizer = f.process.install_function("test_dispatch_finalizer", [&](auto& s, auto&) {
+        std::lock_guard lock(gate); finalized.push_back(s.x[0]); s.x[0] = 0;
+    });
+    const auto queue = f.call("_dispatch_queue_create", {f.string("test.context"), 0});
+    const auto group = f.call("_dispatch_group_create");
+    const auto semaphore = f.call("_dispatch_semaphore_create", {0});
+    for (const auto object : {queue, group, semaphore})
+        require(f.call("_dispatch_get_context", {object}) == 0, "a fresh object's context is not NULL");
+    static_cast<void>(f.call("_dispatch_set_context", {semaphore, 0x5150}));
+    require(f.call("_dispatch_get_context", {semaphore}) == 0x5150, "semaphore context");
+    const auto global = f.call("_dispatch_get_global_queue", {0, 0});
+    static_cast<void>(f.call("_dispatch_set_context", {global, 0x77}));
+    require(f.call("_dispatch_get_context", {global}) == 0, "a global queue kept a context");
+    static_cast<void>(f.call("_dispatch_resume", {group}));    // ignored, not an error
+    static_cast<void>(f.call("_dispatch_suspend", {semaphore}));
+    // The queue's context stays NULL: its finalizer must not run; the semaphore's and
+    // the group's run with their contexts.
+    static_cast<void>(f.call("_dispatch_set_context", {group, 0x6160}));
+    for (const auto object : {queue, group, semaphore}) static_cast<void>(f.call("_dispatch_set_finalizer_f", {object, finalizer}));
+    for (const auto object : {queue, group, semaphore}) static_cast<void>(f.call("_dispatch_release", {object}));
+    std::lock_guard lock(gate);
+    require(finalized.size() == 2 && std::find(finalized.begin(), finalized.end(), 0x5150) != finalized.end() &&
+            std::find(finalized.begin(), finalized.end(), 0x6160) != finalized.end(), "finalizers by context");
+}
 } // namespace
 
 int main() {
     try {
-        test_counting_and_ownership(); test_deadlines(); test_concurrent_waiters(); test_queues(); test_shutdown();
+        test_counting_and_ownership(); test_deadlines(); test_concurrent_waiters(); test_queues(); test_object_semantics(); test_shutdown();
         std::cout << "Alchemy dispatch tests passed\n"; return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

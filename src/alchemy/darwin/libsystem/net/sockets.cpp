@@ -14,17 +14,18 @@ net::Family host_family(int domain) {
 }
 int guest_family(net::Family family) { return family == net::Family::ipv4 ? 2 : family == net::Family::ipv6 ? 30 : 0; }
 // A guest sockaddr_in / sockaddr_in6 (Darwin layout: sin_len, sin_family, port in network order).
+// sin_len is not read: xnu's sockargs() replaces sa_len with the length argument.
 net::Address read_network_address(const transmute::GuestMemory& memory, std::uint64_t address, std::uint64_t length) {
     if (length < 2 || length > 255) throw ServiceError{einval};
     validate(memory, address, length, false);
     const auto family = memory.read8(address + 1);
     if (family == 2) {
-        if (length < 16 || (memory.read8(address) && memory.read8(address) != 16)) throw ServiceError{einval};
+        if (length < 16) throw ServiceError{einval};
         std::array<std::uint8_t, 6> bytes{}; memory.read_bytes(address + 2, bytes);
         return net::Address::ipv4({bytes[2], bytes[3], bytes[4], bytes[5]}, static_cast<std::uint16_t>(bytes[0] << 8 | bytes[1]));
     }
     if (family == 30) {
-        if (length < 28 || (memory.read8(address) && memory.read8(address) != 28)) throw ServiceError{einval};
+        if (length < 28) throw ServiceError{einval};
         std::array<std::uint8_t, 22> bytes{}; memory.read_bytes(address + 2, bytes);
         std::array<std::uint8_t, 16> value{}; std::copy_n(bytes.begin() + 6, 16, value.begin());
         auto result = net::Address::ipv6(value, static_cast<std::uint16_t>(bytes[0] << 8 | bytes[1]), memory.read32(address + 24));

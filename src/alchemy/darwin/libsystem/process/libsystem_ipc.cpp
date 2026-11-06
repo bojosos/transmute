@@ -163,6 +163,19 @@ void install_libsystem_ipc(Provider& p) {
             throw Errno{enosys};
         });
     }
+    // System V message queues: unavailable in the same way (ENOSYS).
+    for (const auto* name : {"_msgget", "_msgctl", "_msgsnd", "_msgrcv"}) {
+        p.libsystem(name, [&process, state, name](CpuState&, GuestMemory&) -> std::uint64_t {
+            bool first;
+            { std::lock_guard lock(state->mutex); first = state->reported.insert(name + 1).second; }
+            if (first) {
+                const std::string message = std::string("Alchemy: ") + (name + 1) +
+                    " is unsupported (no System V message queues between Alchemy processes)\n";
+                static_cast<void>(process.output(2, std::span(reinterpret_cast<const std::uint8_t*>(message.data()), message.size())));
+            }
+            throw Errno{enosys};
+        });
+    }
     // int shmdt(const void*): shmat never attaches a segment, so no address is one.
     p.libsystem("_shmdt", [](CpuState&, GuestMemory&) -> std::uint64_t { throw Errno{einval}; });
 }

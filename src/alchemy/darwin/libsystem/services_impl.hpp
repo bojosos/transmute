@@ -736,9 +736,35 @@ inline HostMetadata host_metadata(const std::filesystem::path& path, bool nofoll
 }
 inline HostMetadata host_metadata(host::Handle file) { return host_metadata(host::files::metadata(file)); }
 
+// %n stores the count written so far, with the width its length modifier
+// gives (hh char, h short, l/ll/q/z/t/j 64 bits, otherwise int), and a NULL
+// pointer is skipped, as Apple's Libc (FreeBSD vfprintf) does. Its printf
+// honours %n only in a format string in read-only memory (a literal) and
+// stops the program otherwise; `counts` is null then.
+inline void store_printf_count(transmute::GuestMemory* counts, std::string_view length, std::uint64_t target,
+                               std::size_t written) {
+    if (!target) return;
+    if (!counts)
+        throw std::runtime_error("%n used in a non-immutable format string");
+    const auto value = static_cast<std::uint64_t>(written);
+    if (length == "hh") counts->write8(target, static_cast<std::uint8_t>(value));
+    else if (length == "h") {
+        const std::array bytes{static_cast<std::uint8_t>(value), static_cast<std::uint8_t>(value >> 8)};
+        counts->write_bytes(target, bytes);
+    } else if (length.empty() || length == "L") counts->write32(target, static_cast<std::uint32_t>(value));
+    else counts->write64(target, value);
+}
+
+// Libc's check: the format's first byte is in memory that is not writable.
+inline bool immutable_format(const transmute::GuestMemory& memory, std::uint64_t address) {
+    const auto region = memory.query_region(address);
+    return region && !region->writable;
+}
+
 // Parse the guest format and read Apple ARM64 stack slots ourselves. Only local
 // host values enter snprintf; a guest pointer or va_list is never forwarded.
-inline std::string format_text(const transmute::GuestMemory& memory, std::string_view input, std::uint64_t& arguments) {
+inline std::string format_text(const transmute::GuestMemory& memory, std::string_view input, std::uint64_t& arguments,
+                               transmute::GuestMemory* counts = nullptr) {
     std::string output;
     const auto next = [&]() {
         const auto value = memory.read64(arguments);
@@ -798,6 +824,10 @@ inline std::string format_text(const transmute::GuestMemory& memory, std::string
         }
         if (at == input.size()) throw std::runtime_error("Darwin printf has an incomplete conversion");
         const auto conversion = input[at++];
+        if (conversion == 'n') {
+            store_printf_count(counts, length, next(), output.size());
+            continue;
+        }
         if ((length == "L" && std::string_view("eEfFgGaA").find(conversion) == std::string_view::npos) ||
             ((conversion == 's' || conversion == 'c') && !length.empty()) ||
             (std::string_view("eEfFgGaA").find(conversion) != std::string_view::npos && !length.empty() && length != "l" && length != "L") ||
@@ -866,6 +896,12 @@ inline std::string format(const transmute::GuestMemory& memory, std::uint64_t fo
     return format_text(memory, input, arguments);
 }
 
+// The printf family proper: %n may store into the guest when the format is a literal.
+inline std::string format(transmute::GuestMemory& memory, std::uint64_t format_address, std::uint64_t arguments) {
+    const auto input = text(memory, format_address);
+    return format_text(memory, input, arguments, immutable_format(memory, format_address) ? &memory : nullptr);
+}
+
 // UTF-8 -> code points (invalid sequences become U+FFFD).
 inline std::u32string utf8_to_utf32(std::string_view text) {
     std::u32string out;
@@ -918,7 +954,8 @@ inline std::string utf32_to_utf8(std::u32string_view text) {
 // UTF-8 (the guest's multibyte encoding); %c a char. Width and precision of
 // string conversions count characters. Every other conversion is the narrow
 // printf's (format_text) with the same Apple ARM64 stack-slot arguments.
-inline std::u32string wide_format_text(const transmute::GuestMemory& memory, std::uint64_t format_address, std::uint64_t arguments) {
+inline std::u32string wide_format_text(const transmute::GuestMemory& memory, std::uint64_t format_address, std::uint64_t arguments,
+                                       transmute::GuestMemory* counts = nullptr) {
     std::u32string input;
     for (std::uint64_t at = 0;; ++at) {
         if (at == string_limit) throw std::runtime_error("Darwin wide printf format exceeds limit");
@@ -1023,7 +1060,11 @@ inline std::u32string wide_format_text(const transmute::GuestMemory& memory, std
             continue;
         }
         if (conversion > 127) throw std::runtime_error("unsupported Darwin wide printf conversion");
-        if (conversion == U'n') throw std::runtime_error("unsupported Darwin printf conversion %n");
+        if (conversion == U'n') {
+            arguments = peek;   // past the '*' slots
+            store_printf_count(counts, length, next(), output.size());
+            continue;
+        }
         spec += length;
         spec += static_cast<char>(conversion);
         const auto narrow = format_text(memory, spec, arguments);
@@ -1032,6 +1073,11 @@ inline std::u32string wide_format_text(const transmute::GuestMemory& memory, std
         append(converted);
     }
     return output;
+}
+
+// The wprintf family proper: Libc's vfwprintf stores %n whatever memory holds the format.
+inline std::u32string wide_format_text(transmute::GuestMemory& memory, std::uint64_t format_address, std::uint64_t arguments) {
+    return wide_format_text(static_cast<const transmute::GuestMemory&>(memory), format_address, arguments, &memory);
 }
 
 inline bool space(char character) { return character == ' ' || (character >= '\t' && character <= '\r'); }

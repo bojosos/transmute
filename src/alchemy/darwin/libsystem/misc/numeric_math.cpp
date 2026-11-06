@@ -71,7 +71,12 @@ template<class R> R rounded(R input, unsigned mode) {
     }
     return value == R{} ? std::copysign(value, input) : value;
 }
-template<class R> void install_precision(ProcessContext& context, std::string suffix) {
+// The sign of Γ(x): negative for x in (-2k-1, -2k), k >= 0.
+template<class R> std::int32_t gamma_sign(R x) {
+    return x < R{} && std::floor(x) != x && static_cast<std::int64_t>(std::floor(x)) % 2 != 0 ? -1 : 1;
+}
+// signgam: the int lgamma, lgammaf and lgammal store Γ's sign in (math.h).
+template<class R> void install_precision(ProcessContext& context, std::string suffix, std::uint64_t signgam) {
     const auto install = [&](std::string name, transmute::GuestCallHandler handler) {
         static_cast<void>(context.install_function("_" + name + suffix,
             [&context, operation = name, handler = std::move(handler)](auto& s, auto& m) {
@@ -96,9 +101,13 @@ template<class R> void install_precision(ProcessContext& context, std::string su
         {"fabs",std::fabs},{"exp2",std::exp2},{"acosh",std::acosh},{"asinh",std::asinh},{"atanh",std::atanh},{"cbrt",std::cbrt},
         {"cosh",std::cosh},{"erf",std::erf},{"erfc",std::erfc},{"expm1",std::expm1},{"log1p",std::log1p},{"log2",std::log2},
         {"sinh",std::sinh},{"tanh",std::tanh},{"trunc",std::trunc},{"logb",std::logb},{"round",std::round},
-        {"lgamma",[](R value) { return std::lgamma(value); }},
         {"__exp10",[](R value) { return std::pow(R{10}, value); }}}; // ___exp10 and ___exp10f
     for (const auto& [name, function] : unary) install(name, [function](auto& s, auto&) { result(s, function(argument<R>(s, 0))); });
+    install("lgamma", [signgam](auto& s, auto& m) {
+        const auto x = argument<R>(s, 0);
+        m.write32(signgam, static_cast<std::uint32_t>(gamma_sign(x)));
+        result(s, std::lgamma(x));
+    });
     const std::pair<const char*, R(*)(R,R)> binary[]{
         {"pow",std::pow},{"atan2",std::atan2},{"fmod",std::fmod},{"hypot",std::hypot},{"copysign",std::copysign},{"nextafter",std::nextafter}};
     for (const auto& [name, function] : binary) install(name, [function](auto& s, auto&) { result(s, function(argument<R>(s, 0), argument<R>(s, 1))); });
@@ -191,9 +200,7 @@ template<class R> void install_precision_extra(ProcessContext& context, const st
     if (const auto name = "_lgamma" + suffix + "_r"; !context.resolve("/usr/lib/libSystem.B.dylib", name))
         static_cast<void>(context.install_function(name, numeric_floating_handler([](auto& s, auto& m) {
             const auto x = argument<R>(s, 0);
-            std::int32_t sign = 1;
-            if (x < R{} && std::floor(x) != x && static_cast<std::int64_t>(std::floor(x)) % 2 != 0) sign = -1;
-            if (s.x[0]) m.write32(s.x[0], static_cast<std::uint32_t>(sign));
+            if (s.x[0]) m.write32(s.x[0], static_cast<std::uint32_t>(gamma_sign(x)));
             result(s, std::lgamma(x));
         })));
     // nan(const char* tag): a quiet NaN (the tag's payload is not encoded).
@@ -303,7 +310,10 @@ transmute::GuestCallHandler numeric_floating_handler(transmute::GuestCallHandler
 }
 
 void install_darwin_numeric_math(ProcessContext& context) {
-    install_precision<float>(context, "f"); install_precision<double>(context, ""); install_precision<double>(context, "l");
+    const auto signgam = context.allocate_guest(4);
+    context.install_export("/usr/lib/libSystem.B.dylib", "_signgam", {signgam, ExportKind::data});
+    install_precision<float>(context, "f", signgam); install_precision<double>(context, "", signgam);
+    install_precision<double>(context, "l", signgam);
     static_cast<void>(context.install_function("___sincosf_stret", numeric_floating_handler([](auto& s, auto&) {
         const auto input = argument<float>(s, 0); result(s, std::sin(input)); result(s, std::cos(input), 1);
     })));

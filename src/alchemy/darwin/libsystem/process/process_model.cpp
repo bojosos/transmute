@@ -836,6 +836,12 @@ void DarwinServices::Impl::install_process_services() {
     };
     install("_fork", fork);
     install("_vfork", fork);
+    // daemon(3) keeps running the program in a forked child, which fork
+    // emulation cannot do (its child runs only up to exec or _exit).
+    install("_daemon", [](auto&, auto&) -> std::uint64_t {
+        std::cerr << "alchemy: daemon() needs a forked child that keeps running; it fails with ENOSYS" << std::endl;
+        throw ServiceError{enosys};
+    });
 
     // ---- posix_spawn ----
     install("_posix_spawn_file_actions_init", [this](auto& s, auto& m) -> std::uint64_t {
@@ -1639,6 +1645,9 @@ void DarwinServices::Impl::install_process_services() {
         context.release_guest(s.x[0]);
         return wait_child(pid, 0, true).second;
     });
+    // The name with both _POSIX_C_SOURCE and _DARWIN_C_SOURCE. Darwin's version
+    // also takes "r+" (one bidirectional socket); here that mode stays EINVAL.
+    context.install_export(std::string(system_library), "_popen$DARWIN_EXTSN", *context.resolve(system_library, "_popen"));
     install("_system", [this, base_request, start, wait_child, current_environment](auto& s, auto& m) -> std::uint64_t {
         if (!s.x[0]) return 1;   // a command processor is available (the built-in shell)
         auto request = base_request(current_environment());

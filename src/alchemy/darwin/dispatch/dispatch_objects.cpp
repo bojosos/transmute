@@ -226,6 +226,7 @@ void install_dispatch_objects(Support& support) {
         }
         if (!destroy) return;
         static_cast<void>(support.call(libsystem, "_dispatch_release", {queue_object}));
+        dispatch_object_disposed(support.process, object);
         support.process.release_guest(object);
     };
     // dispatch_retain/dispatch_release accept channels (a reference handler of

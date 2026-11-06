@@ -168,7 +168,10 @@ void install_dispatch_data(Provider& p, ObjcRuntime& objc) {
         add_dispatch_reference_handler(process, [&process, payload_of](std::uint64_t object, bool retain) {
             if (!payload_of(object)) return false;
             if (retain) static_cast<void>(process.objects().retain(object));
-            else process.objects().release(object);
+            else {
+                process.objects().release(object);
+                if (!payload_of(object)) dispatch_object_disposed(process, object);
+            }
             return true;
         });
 }

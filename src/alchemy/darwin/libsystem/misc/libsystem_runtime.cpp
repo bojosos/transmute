@@ -824,6 +824,12 @@ void install_libsystem_runtime(Provider& p) {
             throw std::runtime_error("Alchemy: __vsprintf_chk detected a buffer overflow (abort)");
         return static_cast<std::uint32_t>(written);
     });
+    // int __vsnprintf_chk(char* s, size_t maxlen, int flag, size_t slen, const char* format, va_list ap):
+    // what fortified vsnprintf calls; a bound larger than the destination aborts, as Libc's does.
+    p.libsystem("___vsnprintf_chk", [p](CpuState& s, GuestMemory&) -> std::uint64_t {
+        if (s.x[3] < s.x[1]) throw std::runtime_error("Alchemy: __vsnprintf_chk detected a buffer overflow (abort)");
+        return p.call(libsystem_library, "_vsnprintf", {s.x[0], s.x[1], s.x[4], s.x[5]});
+    });
 
     // CommonCrypto: MD4 (RFC 1320) over the 92-byte CC_MD4_CTX, and the system RNG.
     p.libsystem("_CC_MD4_Init", [](CpuState& s, GuestMemory& m) -> std::uint64_t {

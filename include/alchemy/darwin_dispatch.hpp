@@ -54,4 +54,8 @@ struct DispatchObjectInfo {
 // Handlers run outside the provider's locks and may call back into it.
 using DispatchReferenceHandler = std::function<bool(std::uint64_t object, bool retain)>;
 void add_dispatch_reference_handler(ProcessContext& context, DispatchReferenceHandler handler);
+// Another provider's dispatch object (an I/O channel, data) is gone: its context and
+// finalizer (dispatch_set_context / dispatch_set_finalizer_f) are dropped, and the
+// finalizer runs when both are set. Call it outside the provider's locks.
+void dispatch_object_disposed(ProcessContext& context, std::uint64_t object);
 } // namespace alchemy

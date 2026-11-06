@@ -1797,6 +1797,77 @@ void test_app_imports(Fixture& f) {
     }
 }
 
+// B31: conformance findings (conformance/results.md).
+void test_b31(Fixture& f) {
+    const auto system = "/usr/lib/libSystem.B.dylib";
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    auto& bytes = static_cast<transmute::GuestMemory&>(f.engine);
+    // printf %n, as Apple's Libc: stored when the format is in read-only memory (a
+    // literal), with the length modifier's width; a NULL pointer is skipped; a format
+    // in writable memory stops the program. wprintf stores it whatever holds the format.
+    const auto literal = [&f](std::string_view value) {
+        const auto address = f.process.allocate_guest(value.size() + 1);
+        f.engine.write_bytes(address, {reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
+        static_cast<transmute::GuestMemory&>(f.engine).write8(address + value.size(), 0);
+        f.engine.set_memory_access(address, true, false, false);
+        return address;
+    };
+    const auto buffer = f.process.allocate_guest(64), list = f.process.allocate_guest(32), count = f.process.allocate_guest(16);
+    f.engine.write64(count, ~0ULL); f.engine.write64(count + 8, ~0ULL);
+    f.engine.write64(list, 7); f.engine.write64(list + 8, count);
+    require(f.sys("_vsnprintf", {buffer, 64, literal("ab%dc%n!"), list}) == 5 && f.read(buffer) == "ab7c!" &&
+            f.engine.read64(count) == 0xffffffff00000004ULL, "%n stores an int");
+    f.engine.write64(list, count); f.engine.write64(list + 8, count + 8);
+    require(f.sys("_vsnprintf", {buffer, 64, literal("xyz%hhnabc%lln"), list}) == 6 &&
+            f.engine.read64(count) == 0xffffffff00000003ULL && f.engine.read64(count + 8) == 6, "%hhn and %lln");
+    f.engine.write64(list, 0);
+    require(f.sys("_vsnprintf", {buffer, 64, f.text("q%n"), list}) == 1, "a NULL %n pointer is skipped");
+    f.engine.write64(list, count);
+    bool stopped{};
+    try { static_cast<void>(f.sys("_vsnprintf", {buffer, 64, f.text("q%n"), list})); } catch (const std::runtime_error&) { stopped = true; }
+    require(stopped && f.engine.read64(count) == 0xffffffff00000003ULL, "%n in a writable format stopped the program");
+    const std::u32string wide_format{char32_t{0xe9}, U't', char32_t{0xe9}, U'%', U'n'};   // e-acute, t, e-acute
+    const auto wide = f.process.allocate_guest((wide_format.size() + 1) * 4);
+    for (std::size_t at = 0; at <= wide_format.size(); ++at) f.engine.write32(wide + at * 4, at < wide_format.size() ? wide_format[at] : 0);
+    f.engine.write64(count, ~0ULL);
+    require(f.sys("_vswprintf", {buffer, 16, wide, list}) == 3 && f.engine.read64(count) == 0xffffffff00000003ULL,
+            "wprintf %n counts wide characters");
+    // __vsnprintf_chk (fortified vsnprintf): the bound must fit the destination's size.
+    f.engine.write64(list, 42);
+    require(f.sys("___vsnprintf_chk", {buffer, 8, 0, 64, f.text("n=%d"), list}) == 4 && f.read(buffer) == "n=42", "__vsnprintf_chk");
+    stopped = false;
+    try { static_cast<void>(f.sys("___vsnprintf_chk", {buffer, 65, 0, 64, f.text("x"), list})); } catch (const std::runtime_error&) { stopped = true; }
+    require(stopped, "__vsnprintf_chk with a bound past the destination did not stop");
+
+    // signgam: lgamma stores the sign of Gamma(x) there.
+    const auto signgam = f.symbol(system, "_signgam");
+    const auto lgamma = [&f, system](double value) {
+        alchemy::CallRegs registers;
+        registers.v[0] = alchemy::VectorRegister{std::bit_cast<std::uint64_t>(value), 0};
+        return alchemy::engine_call_regs(f.engine, f.symbol(system, "_lgamma"), registers).d(0);
+    };
+    require(std::abs(lgamma(-0.5) - 1.2655121234846454) < 1e-12 && bytes.read32(signgam) == 0xffffffffU, "lgamma(-0.5) sets signgam -1");
+    require(std::abs(lgamma(3.0) - std::log(2.0)) < 1e-12 && bytes.read32(signgam) == 1, "lgamma(3) sets signgam 1");
+
+    // Names programs with _DARWIN_C_SOURCE import, and the ones that are unavailable (ENOSYS 78).
+    require(f.symbol(system, "_popen$DARWIN_EXTSN") == f.symbol(system, "_popen"), "popen$DARWIN_EXTSN is popen");
+    require(f.sys("_daemon", {0, 0}) == UINT64_MAX && errno_value() == 78, "daemon is ENOSYS");
+    require(static_cast<std::uint32_t>(f.sys("_msgget", {0, 0x200})) == UINT32_MAX && errno_value() == 78, "msgget is ENOSYS");
+    require(static_cast<std::uint32_t>(f.sys("_msgctl", {0, 2, 0})) == UINT32_MAX && errno_value() == 78, "msgctl is ENOSYS");
+
+    // bind: sin_len is replaced by the length argument (xnu sockargs), so garbage there is harmless.
+    const auto socket = f.sys("_socket", {2, 1, 0});
+    require(static_cast<std::uint32_t>(socket) != UINT32_MAX, "socket");
+    const auto address = f.process.allocate_guest(16);
+    for (unsigned at = 0; at < 16; ++at) bytes.write8(address + at, 0xaa);
+    bytes.write8(address + 1, 2);                                         // AF_INET
+    bytes.write8(address + 2, 0); bytes.write8(address + 3, 0);          // port 0
+    f.engine.write32(address + 4, 0x0100007f);                            // 127.0.0.1
+    require(f.sys("_bind", {socket, address, 16}) == 0, "bind ignores sin_len and sin_zero");
+    require(f.sys("_bind", {socket, address, 8}) == UINT64_MAX && errno_value() == 22, "a short address is EINVAL");
+    static_cast<void>(f.sys("_close", {socket}));
+}
+
 } // namespace
 
 int main() {
@@ -1829,6 +1900,7 @@ int main() {
         stage("b22"); test_b22(f);
         stage("b24"); test_b24(f);
         stage("b25"); test_b25(f);
+        stage("b31"); test_b31(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;
