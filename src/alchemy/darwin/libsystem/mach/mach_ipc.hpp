@@ -328,6 +328,29 @@ public:
     // A routine on the task of process `pid` (Guest::task_call there); empty
     // when that process cannot be reached.
     std::optional<std::vector<std::uint8_t>> task_call(std::uint32_t pid, const std::vector<std::uint8_t>& call);
+
+    // ---- the session launchd (darwin/launchd/) -------------------------------
+    // Names the session launchd answers for: a look-up the tree's registry
+    // misses (the service's host and key), and a job's check-in of a service
+    // its job declares (the host that offers the receive right). Both return
+    // nothing when no session launchd runs; set once by the provider.
+    struct Launchd {
+        std::function<std::optional<std::pair<std::uint32_t, Key>>(const std::string& service)> look_up;
+        std::function<std::optional<std::uint32_t>(const std::string& service)> check_in;
+    };
+    void set_launchd(Launchd hooks);
+    // The session launchd's side: a receive right of this space gets a key
+    // (others can be granted rights to it) and is held here until offered.
+    Key export_receive(Name name);
+    // Moves the receive right `name` out of the space into an offer to
+    // process `pid` under `service` (kern_return_t).
+    std::uint32_t offer_receive(std::uint32_t pid, const std::string& service, Name name);
+    // The job's side: takes the receive right `host` offers under `service`
+    // (its queued messages follow); bootstrap status codes.
+    std::uint32_t take_offer(std::uint32_t host, const std::string& service, Name& out);
+    // Whether the port named `key` (hosted or forwarded by this process) is
+    // still alive.
+    bool key_alive(Key key);
     // Transport::Handler (transport threads).
     void frame(std::uint32_t from, std::uint32_t type, Reader& payload) override;
     Transport::Payload request(std::uint32_t from, std::uint32_t type, Reader& payload) override;
@@ -391,6 +414,16 @@ private:
     std::map<std::uint32_t, std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>> specials_;   // child -> wires
     std::chrono::steady_clock::time_point last_spawn_{};
     std::condition_variable specials_changed_;
+    // The session launchd.
+    Launchd launchd_;
+    std::map<std::pair<std::uint32_t, std::string>, Right> offers_;      // (pid, service) -> receive right
 };
+
+// Host-only handling of the kernel objects and out-of-line sections a message
+// from another process carries (mach_exports.cpp): passed on to `recipient`
+// (its handles moved there), or closed. For a MachIpc without guest code (the
+// session launchd's).
+std::optional<std::vector<std::uint8_t>> forward_wire_object(const std::vector<std::uint8_t>& object, std::uint32_t recipient);
+void discard_wire_object(const std::vector<std::uint8_t>& object);
 
 } // namespace alchemy::libsystem::mach

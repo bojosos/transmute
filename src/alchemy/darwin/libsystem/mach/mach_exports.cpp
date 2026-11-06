@@ -1,5 +1,6 @@
 #include "alchemy/darwin/libsystem/install.hpp"
 #include "alchemy/darwin/libsystem/mach/mach_ipc.hpp"
+#include "alchemy/darwin/launchd/client.hpp"
 
 #include "alchemy/cross_process_memory.hpp"
 #include "alchemy/process_tree.hpp"
@@ -758,6 +759,22 @@ void MachProvider::install() {
     }
     root = broker == transport->self();
     ipc->connect(transport, broker);
+    // The session launchd's services (darwin/launchd/): look-ups the tree's
+    // registry misses, and a job's check-ins of the services its job declares
+    // (a job has XPC_SERVICE_NAME). Without a session launchd a miss costs one
+    // failed pipe open, and nothing else changes.
+    {
+        MachIpc::Launchd hooks;
+        hooks.look_up = [](const std::string& service) -> std::optional<std::pair<std::uint32_t, Key>> {
+            const auto where = launchd::look_up_service(service);
+            if (!where) return std::nullopt;
+            return std::pair{where->host, Key{where->key_pid, where->key_id}};
+        };
+        const bool job = std::any_of(process.environment.begin(), process.environment.end(),
+                                     [](const std::string& entry) { return entry.starts_with("XPC_SERVICE_NAME="); });
+        if (job) hooks.check_in = [](const std::string& service) { return launchd::check_in_service(service); };
+        ipc->set_launchd(std::move(hooks));
+    }
     process.at_teardown([transport = transport] { transport->stop(); });
     static_cast<void>(audit_token());   // computed on this (guest-calling) thread, reused by transport threads
     // posix_spawn: the special ports set with posix_spawnattr_setspecialport_np.
@@ -1598,6 +1615,13 @@ void MachProvider::install_task_policies() {
 }
 
 } // namespace
+
+namespace mach {
+std::optional<std::vector<std::uint8_t>> forward_wire_object(const std::vector<std::uint8_t>& object, std::uint32_t recipient) {
+    return MachProvider::forward_object(object, recipient);
+}
+void discard_wire_object(const std::vector<std::uint8_t>& object) { MachProvider::discard_object(object); }
+} // namespace mach
 
 void install_mach_ipc(gui::InstallContext& context) {
     const auto provider = std::make_shared<MachProvider>(context);

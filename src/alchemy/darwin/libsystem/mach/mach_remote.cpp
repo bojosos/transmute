@@ -27,15 +27,22 @@
 //   and drops its units (peer_died, from a process-handle wait).
 // - The bootstrap registry of the tree lives in the root process (broker).
 //
-// Frames: 1 message, 2 release, 3 send-once destroyed, 4 dead. Requests: 10
-// grant, 11 check-in, 12 look-up, 13 register, 14 special ports.
+// - Services of the session launchd (darwin/launchd/): a look-up the
+//   registry misses asks it (only when it runs); a job's check-in of a
+//   service its job declares takes the receive right the session launchd
+//   offers it (its queued messages follow once the job says it has it).
+//
+// Frames: 1 message, 2 release, 3 send-once destroyed, 4 dead, 5 offer taken.
+// Requests: 10 grant, 11 check-in, 12 look-up, 13 register, 14 special
+// ports, 15 task call, 16 take an offer.
 namespace alchemy::libsystem::mach {
 namespace {
 
 enum : std::uint8_t { wire_null = 0, wire_dead = 1, wire_send = 2, wire_once = 3, wire_receive = 4, wire_task = 5, wire_object = 6 };
 enum : std::uint32_t {
-    frame_message = 1, frame_release = 2, frame_send_once_destroyed = 3, frame_dead = 4,
+    frame_message = 1, frame_release = 2, frame_send_once_destroyed = 3, frame_dead = 4, frame_offer_taken = 5,
     request_grant = 10, request_check_in = 11, request_look_up = 12, request_register = 13, request_specials = 14, request_task = 15,
+    request_take_offer = 16,
 };
 constexpr std::uint32_t bootstrap_unknown_service = 1102, bootstrap_service_active = 1103, bootstrap_not_privileged = 1100;
 constexpr auto rpc_timeout = std::chrono::seconds(10);
@@ -481,6 +488,27 @@ void MachIpc::frame(std::uint32_t from, std::uint32_t type, Reader& in) {
         if (const auto found = proxies_.find({from, key}); found != proxies_.end()) kill_port(found->second);
         return;
     }
+    case frame_offer_taken: {
+        // The job has the port an offer moved to it: the messages queued here
+        // follow, then the port only forwards.
+        const auto key = read_key(in);
+        std::shared_ptr<Port> port;
+        std::deque<std::shared_ptr<Message>> queue;
+        {
+            Lock lock(mutex_);
+            const auto found = proxies_.find({from, key});
+            if (found == proxies_.end() || !found->second->migrating) return;
+            port = found->second;
+            queue = std::move(port->queue);
+            port->queue.clear();
+        }
+        for (auto& queued : queue) transmit(queued, port, true);
+        Lock lock(mutex_);
+        port->migrating = false;
+        retire_proxy(port);
+        touch();
+        return;
+    }
     default:
         return;
     }
@@ -534,10 +562,36 @@ Transport::Payload MachIpc::request(std::uint32_t from, std::uint32_t type, Read
         const auto service = in.text();
         Lock lock(mutex_);
         const auto found = registry_.find(service);
-        if (found == registry_.end()) { answer.u32(bootstrap_unknown_service); break; }
+        if (found == registry_.end()) {
+            // A service of the session launchd, if one runs.
+            const auto look_up = launchd_.look_up;
+            lock.unlock();
+            const auto hit = look_up ? look_up(service) : std::nullopt;
+            if (!hit) { answer.u32(bootstrap_unknown_service); break; }
+            answer.u32(0);
+            answer.u32(hit->first);
+            write_key(answer, hit->second);
+            break;
+        }
         answer.u32(0);
         answer.u32(found->second.first);
         write_key(answer, found->second.second);
+        break;
+    }
+    case request_take_offer: {
+        const auto service = in.text();
+        Right right;
+        {
+            Lock lock(mutex_);
+            const auto found = offers_.find({from, service});
+            if (found == offers_.end()) { answer.u8(0); break; }
+            right = std::move(found->second);
+            offers_.erase(found);
+        }
+        answer.u8(1);
+        // The port stays migrating (local senders wait) until the taker says it has it.
+        std::vector<std::shared_ptr<Port>> migrated;
+        write_right(answer, std::move(right), from, migrated);
         break;
     }
     case request_task: {
@@ -602,6 +656,12 @@ void MachIpc::peer_died(std::uint32_t pid) {
 std::uint32_t MachIpc::bootstrap_check_in(const std::string& service, Name& out) {
     out = 0;
     if (!transport_) return bootstrap_unknown_service;
+    // A service the session launchd keeps for this job: its receive right.
+    std::function<std::optional<std::uint32_t>(const std::string&)> launchd_check_in;
+    { Lock lock(mutex_); launchd_check_in = launchd_.check_in; }
+    if (launchd_check_in) {
+        if (const auto host = launchd_check_in(service)) return take_offer(*host, service, out);
+    }
     Name receive{};
     if (allocate(right::receive, receive) != kern::success) return kern::resource_shortage;
     Key key;
@@ -650,8 +710,16 @@ std::uint32_t MachIpc::bootstrap_look_up(const std::string& service, Name& out) 
     if (broker_ == self_) {
         Lock lock(mutex_);
         const auto found = registry_.find(service);
-        if (found == registry_.end()) return bootstrap_unknown_service;
-        std::tie(host, key) = found->second;
+        if (found == registry_.end()) {
+            // A service of the session launchd, if one runs.
+            const auto look_up = launchd_.look_up;
+            lock.unlock();
+            const auto hit = look_up ? look_up(service) : std::nullopt;
+            if (!hit) return bootstrap_unknown_service;
+            std::tie(host, key) = *hit;
+        } else {
+            std::tie(host, key) = found->second;
+        }
     } else {
         Writer request;
         request.text(service);
@@ -803,6 +871,72 @@ std::vector<std::pair<std::uint32_t, Right>> MachIpc::inherited_special_ports(st
     }
     touch();
     return result;
+}
+
+// ---- the session launchd ----------------------------------------------------------------
+
+void MachIpc::set_launchd(Launchd hooks) {
+    Lock lock(mutex_);
+    launchd_ = std::move(hooks);
+}
+
+Key MachIpc::export_receive(Name name) {
+    Lock lock(mutex_);
+    auto* entry = find(name);
+    if (!entry || !entry->receive || !entry->port || !transport_) return {};
+    transport_->start();
+    const auto port = entry->port;
+    if (!port->key.pid) {
+        port->key = Key{self_, port->id};
+        hosted_[port->key] = port;
+    }
+    return port->key;
+}
+
+std::uint32_t MachIpc::offer_receive(std::uint32_t pid, const std::string& service, Name name) {
+    Right right;
+    if (const auto status = take(name, disp::move_receive, right)) return status;
+    Lock lock(mutex_);
+    if (const auto found = offers_.find({pid, service}); found != offers_.end()) {
+        auto old = std::move(found->second);
+        offers_.erase(found);
+        release(std::move(old));
+    }
+    offers_[{pid, service}] = std::move(right);
+    return kern::success;
+}
+
+std::uint32_t MachIpc::take_offer(std::uint32_t host, const std::string& service, Name& out) {
+    out = 0;
+    if (!transport_) return bootstrap_unknown_service;
+    transport_->start();
+    Writer request;
+    request.text(service);
+    const auto answer = transport_->call(host, request_take_offer, std::move(request.bytes), rpc_timeout);
+    if (!answer) return bootstrap_unknown_service;
+    Reader reader{*answer};
+    if (!reader.u8()) return bootstrap_unknown_service;
+    Key key;
+    {
+        Lock lock(mutex_);
+        auto right = read_right(reader, host);
+        if (!right.port || right.type != disp::port_receive) { release(std::move(right)); return bootstrap_unknown_service; }
+        key = right.port->key;
+        out = copyout(std::move(right));
+        touch();
+    }
+    Writer taken;
+    write_key(taken, key);
+    static_cast<void>(transport_->post(host, frame_offer_taken, std::move(taken.bytes)));
+    return 0;
+}
+
+bool MachIpc::key_alive(Key key) {
+    Lock lock(mutex_);
+    if (const auto found = hosted_.find(key); found != hosted_.end() && found->second->active) return true;
+    for (const auto& [where, proxy] : proxies_)
+        if (where.second == key && proxy->active) return true;
+    return false;
 }
 
 } // namespace alchemy::libsystem::mach
