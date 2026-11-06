@@ -1,8 +1,10 @@
 #include "alchemy/gui/fill_provider.hpp"
 
 #include "alchemy/darwin/coreservices/uttype.hpp"
+#include "alchemy/host/ui.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -461,6 +463,39 @@ void LaunchServices::install() {
             registered.push_back(path);
             save_store();
         }
+        s.x[0] = 0;
+    });
+    // OSStatus LSOpenFromURLSpec(const LSLaunchURLSpec*, CFURLRef* outLaunchedURL), the spec being
+    // { CFURLRef appURL; CFArrayRef itemURLs; const AEDesc* passThruParams; LSLaunchFlags launchFlags; ... }:
+    // without an appURL each item opens with the host's handler for it (files by their association, other
+    // URLs by their scheme's handler), as NSWorkspace opens them; kLSLaunchAndPrint prints files. Launching a
+    // guest application (appURL) has no Launch Services server. outLaunchedURL is NULL: the host
+    // application that opened an item is not a guest application.
+    raw(core_services, "_LSOpenFromURLSpec", [this](CpuState& s, GuestMemory& m) {
+        constexpr std::uint32_t launch_and_print = 0x2;
+        if (s.x[1]) m.write64(s.x[1], 0);
+        if (!s.x[0]) { s.x[0] = status(param_err); return; }
+        const auto app = m.read64(s.x[0]), items = m.read64(s.x[0] + 8);
+        const auto flags = m.read32(s.x[0] + 24);
+        if (app) { s.x[0] = status(ls_server_communication); return; }
+        if (!items || !bridge->is_array(items) || cf.array_values(items).empty()) { s.x[0] = status(param_err); return; }
+        std::vector<std::string> targets;
+        for (const auto item : cf.array_values(items)) {
+            const auto string = item ? objc.send(item, "absoluteString").x0 : 0;
+            const auto absolute = text_of(string);
+            if (absolute.empty()) { s.x[0] = status(param_err); return; }
+            if (!absolute.starts_with("file:")) { targets.push_back(absolute); continue; }
+            const auto path = cf.url_path(item);
+            const auto text = strdup(path);
+            const auto exists = static_cast<std::int32_t>(call(libsystem, "_access", {text, 0})) == 0;
+            free(text);
+            if (!exists) { s.x[0] = status(fnf_err); return; }
+            const auto host = process.map_guest_path ? process.map_guest_path(path) : std::filesystem::path(path);
+            const auto bytes = host.u8string();
+            targets.emplace_back(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        for (const auto& target : targets)
+            if (!host::ui::shell_open(target, (flags & launch_and_print) ? "print" : "open")) { s.x[0] = status(ls_application_not_found); return; }
         s.x[0] = 0;
     });
     // OSStatus LSSetDefaultHandlerForURLScheme(CFStringRef scheme, CFStringRef bundleID)

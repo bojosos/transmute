@@ -11,7 +11,8 @@ CoreServices, with UniformTypeIdentifiers and some ApplicationServices pieces.
 - **Unsupported, failing explicitly:** there is no Apple Event server and no
   accessibility server. LaunchServices keeps its own store (the
   com.alchemy.LaunchServices preferences domain: LSRegisterURL's bundles and
-  the default handlers set), not Apple's database. Messages to other processes fail. A headless process has no
+  the default handlers set), not Apple's database. LSOpenFromURLSpec opens
+  items with the host's handlers but launches no guest application. Messages to other processes fail. A headless process has no
   application registry (launch_services_headless.cpp).
 - **Registration:** still called from the export-fill, qlab data and values
   aggregators.
@@ -24,6 +25,6 @@ CoreServices, with UniformTypeIdentifiers and some ApplicationServices pieces.
 ## Moved from darwin/identities/
 
 * `carbon_core.cpp`: the fp.h aliases and FSGetVolumeInfo/FSGetVolumeParms over the host's fixed volumes (its own row; ctest `alchemy_gui_coreservices_carbon_core`).
-* `launch_services.cpp`: LaunchServices registration and login items cannot change (kLSServerCommunicationErr), display names and UTI tag queries are real, Spotlight and the Component Manager have nothing (fill-only, kit/fwgaps; ctest `alchemy_gui_coreservices_launch_services`).
+* `launch_services.cpp`: the application registry, LSRegisterURL and the default handlers (the store above), LSOpenFromURLSpec (items open with the host's handlers, as NSWorkspace opens them; launching a guest application answers kLSServerCommunicationErr), login items cannot change, display names and UTI tag queries are real, Spotlight and the Component Manager have nothing (fill-only, kit/fwgaps; ctest `alchemy_gui_coreservices_launch_services`).
 * `icon_refs.cpp`: ReleaseIconRef (the support kit).
 * `types_and_gestalt.cpp`, `shared_file_lists.cpp`, `carbon_core_math.cpp`: headless, every build: the UTType table, Gestalt (14.0.0), Launch Services answers that need no applications, empty LSSharedFileLists, and the CarbonCore fp.h math.

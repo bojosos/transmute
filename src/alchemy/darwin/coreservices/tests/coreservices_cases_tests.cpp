@@ -24,6 +24,18 @@ const Case coreservices_launch_services_case("coreservices_launch_services", [](
     require(f.call(cs, "_OpenDefaultComponent", {0x6f736120, 0x73637074}) == 0, "no OSA component");
     const auto excluded = f.block(1, 1);
     require(f.status(cs, "_CSBackupIsItemExcluded", {url, excluded}) == 0 && f.memory().read8(excluded) == 0, "nothing excluded");
+    // LSOpenFromURLSpec { appURL, itemURLs, passThruParams, launchFlags, asyncRefCon }: the refusals and
+    // argument checks (nothing here reaches the host's handlers).
+    const auto spec = f.block(40), launched = f.block(8, 0xff);
+    f.engine.write64(spec, url);
+    require(f.status(cs, "_LSOpenFromURLSpec", {spec, launched}) == -10822 && f.engine.read64(launched) == 0,
+            "launching a guest application is refused");
+    f.engine.write64(spec, 0);
+    require(f.status(cs, "_LSOpenFromURLSpec", {spec, launched}) == -50 && f.status(cs, "_LSOpenFromURLSpec", {0, 0}) == -50,
+            "LSOpenFromURLSpec without items");
+    const std::uint64_t missing[] = {f.cf.file_url("/Users/Shared/alchemy-no-such-item.txt", false)};
+    f.engine.write64(spec + 8, f.cf.array(missing));
+    require(f.status(cs, "_LSOpenFromURLSpec", {spec, launched}) == -43, "LSOpenFromURLSpec of a missing file is fnfErr");
 });
 
 const Case coreservices_file_manager_case("coreservices_file_manager", [](Fixture& f) {

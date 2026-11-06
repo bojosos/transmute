@@ -32,7 +32,6 @@ using fill::core_services;
 using fill::status;
 
 constexpr std::int32_t ax_cannot_complete = -25204, ax_illegal_argument = -25201;
-constexpr std::int32_t ls_server_communication = -10822;
 constexpr std::int32_t event_loop_timed_out = -9875, event_not_handled = -9874;
 
 // <HIServices/AXValue.h> kAXValueType*: CGPoint 1, CGSize 2, CGRect 3, CFRange 4, AXError 5.
@@ -178,12 +177,7 @@ void Provider::install_services() {
 
     install_apple_events();          // darwin/coreservices/apple_events.cpp
     // LSRegisterURL: launch_services.cpp (the application registry and its store).
-    // LSOpenFromURLSpec(const LSLaunchURLSpec*, CFURLRef* outLaunchedURL):
-    // no Launch Services server opens anything (NSWorkspace opens files).
-    raw(core_services, "_LSOpenFromURLSpec", [](CpuState& s, GuestMemory& m) {
-        if (s.x[1]) m.write64(s.x[1], 0);
-        s.x[0] = status(ls_server_communication);
-    });
+    // LSOpenFromURLSpec: launch_services.cpp (items open with the host's handlers).
     constant(core_services, "_MDItemSetAttribute", 0);   // Boolean: Spotlight is not available
     string(core_services, "__kLSOpenOptionBackgroundLaunchKey", "LSBackgroundLaunch");   // (unverified)
     // Carbon event loop: nothing is ever queued.
