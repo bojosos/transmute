@@ -33,6 +33,9 @@ struct Component {
     // Audio encoders: what they take (rates in hertz, bit rates in bits per second), as the component
     // itself reports them.
     std::vector<std::uint32_t> sample_rates, channel_counts, bit_rates;
+    // Audio encoders: the frames of delay their output starts with (the priming a player skips), as measured
+    // for this component (measure_delay below); 0: not known.
+    std::uint32_t delay{};
 };
 
 // The host's encoders of `codec`, the preferred first. Error::unsupported: none on this host's backend.
@@ -118,5 +121,11 @@ class AudioEncoder;
 // No more samples: every remaining packet is appended.
 [[nodiscard]] Status drain(AudioEncoder* encoder, std::vector<Sample>& out);
 void close(AudioEncoder* encoder) noexcept;
+
+// Test support (the host test that keeps each component's recorded delay honest): the delay of the encoder
+// `settings` opens, measured by decoding what it makes of a noise signal with the host's own decoder and finding
+// the shift that matches the input, plus any frames the decoder held back to hide its own delay (a player that
+// trims by the priming sees those as delay too). Nothing decoded leaves this call. Error::not_found: no decoder.
+[[nodiscard]] Result<std::uint32_t> measure_delay(const AudioSettings& settings);
 
 } // namespace alchemy::host::media_codec
