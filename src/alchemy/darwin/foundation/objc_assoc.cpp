@@ -41,6 +41,8 @@ void install_objc_associations(Support& support) {
     support.fill_function(objc_library, "_objc_setAssociatedObject", [s](CpuState& c, GuestMemory&) {
         const auto object = c.x[0], key = c.x[1], value = c.x[2], policy = c.x[3];
         if (!object) return;
+        if (s->call(objc_library, "___alchemy_objc_forbids_associated_objects", {object}) & 1)
+            fail("objc_setAssociatedObject called on an instance of a class that does not allow associated objects");
         if (policy != policy_assign && !owns(policy)) fail("objc_setAssociatedObject: unknown association policy");
         Entry entry{value, policy};
         if (value && (policy == policy_retain || policy == policy_retain_nonatomic))
