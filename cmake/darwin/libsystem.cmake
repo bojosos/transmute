@@ -131,8 +131,11 @@ function(alchemy_gui_libsystem_tests)
         src/alchemy/darwin/libsystem/tests/libsystem_leftovers_tests.cpp TIMEOUT 120)
     # The pieces first written for a renderer plug-in (split from the export-fill tests; shared
     # fixture src/alchemy/darwin/kit/export_fill/tests/export_fill_test_kit.hpp).
+    # TIMEOUT 240: one executable with ~30 stages, many of them host file operations, which slow down
+    # sharply when the host is at 100% CPU (other gates running). It took 105-190 s there while its
+    # b17 stage left the process below normal priority (fixed: the test restores it), about 21 s since.
     alchemy_gui_add_unit_test(alchemy_gui_libsystem_gaps
-        src/alchemy/darwin/libsystem/tests/libsystem_gaps_tests.cpp TIMEOUT 120)
+        src/alchemy/darwin/libsystem/tests/libsystem_gaps_tests.cpp TIMEOUT 240)
     # misc/libc_extra.cpp: string, wide, search.h, stdlib, time, ctype, signal and path helpers.
     alchemy_gui_add_unit_test(alchemy_gui_libc_extra
         src/alchemy/darwin/libsystem/tests/libc_extra_tests.cpp TIMEOUT 120)
