@@ -1153,6 +1153,31 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             if (self.mutex_unlock(self.object(self.mutexes, m, s.x[0], 4)))
                 throw std::runtime_error("os_unfair_lock_unlock of a lock not owned by this thread");
         });
+        // os_unfair_recursive_lock {os_unfair_lock ourl_lock; uint32_t ourl_count}: the owner taking it again
+        // counts in ourl_count; unlock counts down before it releases the lock. The options are hints.
+        const auto recursive_owner = [](auto& self, auto& m, std::uint64_t address) {
+            const auto value = self.object(self.mutexes, m, address, 4);
+            if (!value || !accessible(m, address, 8)) throw std::runtime_error("os_unfair_recursive_lock on an invalid lock");
+            std::lock_guard lock(value->gate);
+            return std::pair{value, value->owner == self.process.current_thread()->identity};
+        };
+        add("_os_unfair_recursive_lock_lock_with_options", [recursive_owner](auto& self, auto& s, auto& m) {
+            const auto [value, owned] = recursive_owner(self, m, s.x[0]);
+            if (owned) { m.write32(s.x[0] + 4, m.read32(s.x[0] + 4) + 1); return; }
+            if (self.mutex_lock(value, false)) throw std::runtime_error("os_unfair_recursive_lock_lock failed");
+        });
+        add("_os_unfair_recursive_lock_trylock", [recursive_owner](auto& self, auto& s, auto& m) {
+            const auto address = s.x[0];
+            const auto [value, owned] = recursive_owner(self, m, address);
+            if (owned) { m.write32(address + 4, m.read32(address + 4) + 1); s.x[0] = 1; return; }
+            s.x[0] = self.mutex_lock(value, true) == 0;
+        });
+        add("_os_unfair_recursive_lock_unlock", [recursive_owner](auto& self, auto& s, auto& m) {
+            const auto [value, owned] = recursive_owner(self, m, s.x[0]);
+            if (!owned) throw std::runtime_error("os_unfair_recursive_lock_unlock of a lock not owned by this thread");
+            if (const auto count = m.read32(s.x[0] + 4)) { m.write32(s.x[0] + 4, count - 1); return; }
+            if (self.mutex_unlock(value)) throw std::runtime_error("os_unfair_recursive_lock_unlock failed");
+        });
         for (const auto must_own : {true, false}) add(must_own ? "_os_unfair_lock_assert_owner" : "_os_unfair_lock_assert_not_owner",
             [must_own](auto& self, auto& s, auto& m) {
                 const auto value = self.object(self.mutexes, m, s.x[0], 4, false);

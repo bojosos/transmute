@@ -339,7 +339,8 @@ private:
         // RO_HAS_SWIFT_INITIALIZER (0x40) is meaningful for Swift classes only.
         // RO_HAS_WEAK_WITHOUT_ARC (0x200): manual-retain-release code with
         // __weak ivars, which it manages through objc_storeWeak/objc_loadWeak.
-        if (flags & ~(swift ? 0x3f7U : 0x3b7U)) malformed("unsupported class flags 0x" + hex(flags) + " (obsolete ivar releasers)");
+        // RO_FORBIDS_ASSOCIATED_OBJECTS (0x400): recorded (forbids_associated_objects).
+        if (flags & ~(swift ? 0x7f7U : 0x7b7U)) malformed("unsupported class flags 0x" + hex(flags) + " (obsolete ivar releasers)");
         if (((flags & 1U) != 0) != meta) malformed("class/metaclass flag mismatch");
         // ro+56 is the weak ivar layout. ARC code manages __weak ivars itself
         // through objc_initWeak/objc_storeWeak/objc_destroyWeak (provided),
@@ -357,6 +358,7 @@ private:
             implementation(result.swift_initializer);
         }
         result.root = (flags & 2U) != 0;
+        result.forbids_associated_objects = (flags & 0x400U) != 0;
         result.instance_start = memory_.read32(add(ro, 4));
         result.instance_size = memory_.read32(add(ro, 8));
         if (result.instance_start > result.instance_size || result.instance_size > maximum_instance)

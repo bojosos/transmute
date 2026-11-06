@@ -890,6 +890,19 @@ void install_libsystem_bsd_extra(Provider& p) {
         auto& slot = vouchers->adopted[identity];
         return std::exchange(slot, s.x[0]);
     }, 0);
+    // voucher_t voucher_copy(void) (and voucher_copy_without_importance): the calling thread's voucher, retained
+    // (os_retain), or NULL when it adopted none: the Swift task runtime records it for each job it creates.
+    for (const auto* name : {"_voucher_copy", "_voucher_copy_without_importance"})
+        p.libsystem(name, [p, &process, vouchers](CpuState&, GuestMemory&) -> std::uint64_t {
+            const auto thread = process.current_thread();
+            const auto identity = thread ? thread->identity : 0;
+            std::uint64_t voucher{};
+            {
+                std::lock_guard lock(vouchers->mutex);
+                if (const auto found = vouchers->adopted.find(identity); found != vouchers->adopted.end()) voucher = found->second;
+            }
+            return voucher ? p.call(libsystem_library, "_os_retain", {voucher}) : 0;
+        }, 0);
     // int getvfsbyname(const char* name, struct vfsconf* vfc): a file system type is configured when a mounted
     // volume has it (getfsstat). struct vfsconf: vfc_reserved1 @0, vfc_name[15] @4, vfc_typenum @20 (statfs's
     // f_type), vfc_refcount @24 (the volumes of that type), vfc_flags @28 (MNT_LOCAL), reserved @32 and @36.

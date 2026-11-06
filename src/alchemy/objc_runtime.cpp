@@ -204,6 +204,7 @@ struct ObjcRuntime::Impl {
         bool swift{};
         Address swift_initializer{};
         std::atomic<bool> swift_pending{false};
+        bool forbids_associated_objects{};   // RO_FORBIDS_ASSOCIATED_OBJECTS (subclasses inherit it)
         std::map<Address, Method> methods;
         std::vector<ObjcIvarInfo> ivars;
         // Declared properties (a metaclass's are the class properties):
@@ -1312,6 +1313,7 @@ struct ObjcRuntime::Impl {
             value->metaclass = source.is_metaclass; value->ivars = source.ivars; value->properties = source.properties;
             value->swift = source.swift; value->swift_initializer = source.swift_initializer;
             value->swift_pending = source.swift_initializer != 0;
+            value->forbids_associated_objects = source.forbids_associated_objects;
             for (const auto& method : source.methods) {
                 auto entry = make_method(method.selector, method.implementation, method.types);
                 value->methods[entry.selector] = entry; method_owners[entry.descriptor] = value->address;
@@ -2475,6 +2477,14 @@ struct ObjcRuntime::Impl {
         function("_objc_retainBlock", [this](auto& s, auto&) { if (s.x[0]) s.x[0] = blocks_call("__Block_copy", s.x[0]); });
         function("_objc_sync_enter", [this](auto& s, auto&) { s.x[0] = sync_enter(s.x[0]); });
         function("_objc_sync_exit", [this](auto& s, auto&) { s.x[0] = sync_exit(s.x[0]); });
+        // BOOL ___alchemy_objc_forbids_associated_objects(id): whether the object's class or a superclass has
+        // RO_FORBIDS_ASSOCIATED_OBJECTS, for objc_setAssociatedObject (darwin/foundation/objc_assoc.cpp).
+        function("___alchemy_objc_forbids_associated_objects", [this](auto& s, auto&) {
+            bool forbids = false;
+            for (auto address = object_class(s.x[0]); address && !forbids; address = class_record(address).super)
+                forbids = class_record(address).forbids_associated_objects;
+            s.x[0] = forbids ? 1 : 0;
+        });
         // BOOL objc_sync_try_enter(id): YES when it took the object's @synchronized monitor without waiting.
         function("_objc_sync_try_enter", [this](auto& s, auto&) { s.x[0] = sync_try_enter(s.x[0]) ? 1 : 0; });
         function("_objc_setEnumerationMutationHandler", [this](auto& s, auto&) { std::lock_guard lock(mutex); mutation_handler = s.x[0]; });
@@ -2906,6 +2916,7 @@ void ObjcRuntime::prepare_images(std::span<const ImageRuntimeInfo> runtime_image
                 value->properties = info.properties;
                 value->swift = info.swift; value->swift_initializer = info.swift_initializer;
                 value->swift_pending = info.swift_initializer != 0;
+                value->forbids_associated_objects = info.forbids_associated_objects;
                 transaction.classes.push_back(value->address);
                 impl_->publish_class(value);
                 if (!value->metaclass) impl_->names.emplace(value->name, value->address);

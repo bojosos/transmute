@@ -566,6 +566,9 @@ void test_runtime_api() {
     require(elsewhere() == 0, "another thread cannot take a held monitor");
     require(f.call("_objc_sync_exit", {other}) == 0 && f.call("_objc_sync_exit", {other}) == 0, "objc_sync_exit twice");
     require(elsewhere() == 1, "another thread takes the released monitor");
+    // An ordinary class allows associated objects (RO_FORBIDS_ASSOCIATED_OBJECTS: tests/alchemy_objc_metadata_tests.cpp).
+    require(f.call("___alchemy_objc_forbids_associated_objects", {other}) == 0 &&
+            f.call("___alchemy_objc_forbids_associated_objects", {0}) == 0, "associated objects allowed");
     // objc_retain_autoreleaseReturnValue, objc_copyImageHeaders (as many as objc_copyImageNames), objc_autoreleasePoolPrint.
     const auto print_pool = f.call("_objc_autoreleasePoolPush", {});
     require(f.call("_objc_retain_autoreleaseReturnValue", {other}) == other &&

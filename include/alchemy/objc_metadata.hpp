@@ -37,6 +37,9 @@ struct ObjcClassInfo {
     bool swift{};
     std::uint64_t swift_initializer{};
     bool root{};   // RO_ROOT: a root class (no superclass by design)
+    // RO_FORBIDS_ASSOCIATED_OBJECTS (0x400; Swift sets it on actor classes): objc_setAssociatedObject on an
+    // instance of the class, or of a subclass, is a fatal error.
+    bool forbids_associated_objects{};
     std::vector<ObjcMethodInfo> methods;
     std::vector<ObjcIvarInfo> ivars;
     std::vector<ObjcProtocolReference> protocols;

@@ -172,10 +172,21 @@ void protocols_and_references() {
     rejects([&] { static_cast<void>(f.parse()); }, "Swift stub categories");
 }
 } // namespace
+// RO_FORBIDS_ASSOCIATED_OBJECTS (0x400, on Swift actor classes) is accepted and recorded; other unknown bits are not.
+void forbids_associated_objects() {
+    Fixture f;
+    require(!f.parse().at(0).classes.at(0).forbids_associated_objects, "an ordinary class allows associated objects");
+    f.engine.write32(base + 160, 2 | 0x400);
+    const auto parsed = f.parse();
+    require(parsed.at(0).classes.at(0).forbids_associated_objects, "RO_FORBIDS_ASSOCIATED_OBJECTS recorded");
+    f.engine.write32(base + 160, 2 | 0x800);
+    rejects([&] { static_cast<void>(f.parse()); }, "unsupported class flags");
+}
+
 int main() {
     try {
         ordinary_and_small_methods(); ivars_categories_and_nonlazy_lists(); malformed_metadata_is_transactional();
-        protocols_and_references();
+        protocols_and_references(); forbids_associated_objects();
         std::cout << "Objective-C metadata tests passed\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

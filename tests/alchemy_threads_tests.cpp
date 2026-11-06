@@ -199,6 +199,25 @@ void test_cancellation() {
     require(f.call("_pthread_mutex_trylock", {mutex}) == 16, "it took the mutex back before its cleanup handlers");
 }
 
+// os_unfair_recursive_lock {lock word, count}: the owner takes it again, another thread cannot until the last unlock.
+void test_recursive_unfair_lock() {
+    Fixture f;
+    const auto lock = data + 1800;
+    f.engine.write64(lock, 0);
+    static_cast<void>(f.call("_os_unfair_recursive_lock_lock_with_options", {lock, 0}));
+    static_cast<void>(f.call("_os_unfair_recursive_lock_lock_with_options", {lock, 0x10000}));
+    require(f.engine.read32(lock + 4) == 1 && f.call("_os_unfair_recursive_lock_trylock", {lock}) == 1 && f.engine.read32(lock + 4) == 2,
+        "the owner takes the recursive lock again");
+    const auto trylock = f.process.resolve(system_library, "_os_unfair_recursive_lock_trylock")->address;
+    auto worker = f.engine.fork_thread(0, 0);
+    const auto elsewhere = [&] {
+        return std::async(std::launch::async, [&] { return worker->invoke_callback(trylock, std::array{lock}); }).get();
+    };
+    require(elsewhere() == 0, "another thread cannot take it while it is held");
+    for (int unlock = 0; unlock < 3; ++unlock) static_cast<void>(f.call("_os_unfair_recursive_lock_unlock", {lock}));
+    require(f.engine.read32(lock + 4) == 0 && elsewhere() == 1, "the last unlock releases it");
+}
+
 void test_tlv_and_cleanup() {
     Fixture f;
     alchemy::TlsTemplate tls;
@@ -322,6 +341,7 @@ int main() {
         test_configurable_stacks(true);
         test_explicit_thread_exit();
         test_cancellation();
+        test_recursive_unfair_lock();
         test_tlv_and_cleanup();
         test_guards_and_timed_condition();
         test_address_waits_and_context_release();

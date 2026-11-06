@@ -2,6 +2,7 @@
 #include "alchemy/darwin_services.hpp"
 #include "alchemy/darwin_threads.hpp"
 #include "alchemy/engine_adapter.hpp"
+#include "alchemy/host/time.hpp"
 
 #include <atomic>
 #include <mutex>
@@ -86,6 +87,16 @@ void test_deadlines() {
     f.rejected([&] { static_cast<void>(f.call("_dispatch_walltime", {UINT64_MAX - 4, 0})); }, "overflowing timespec address accepted");
     require(f.call("_dispatch_semaphore_signal", {semaphore}) == 0 &&
         f.call("_dispatch_semaphore_wait", {semaphore, wall}) == 0, "timeout consumed a future permit or rejected an available one");
+    // Darwin's encoding: wall times set bits 63 and 62; bit 63 alone is a continuous-clock deadline (as the Swift
+    // concurrency runtime builds them), which waits on that clock and keeps it through dispatch_time.
+    require((f.call("_dispatch_time", {forever - 1, 0}) >> 62) == 3 && (f.call("_dispatch_walltime", {0, 0}) >> 62) == 3,
+            "wall times set bits 63 and 62");
+    require((f.call("_dispatch_time", {0, 0}) >> 63) == 0, "DISPATCH_TIME_NOW is an uptime value");
+    const auto continuous = (1ULL << 63) | (alchemy::host::time::continuous_ns() + 30'000'000);
+    require(f.call("_dispatch_time", {continuous, 5}) == continuous + 5, "dispatch_time keeps the continuous clock");
+    const auto begin = std::chrono::steady_clock::now();
+    require(f.call("_dispatch_semaphore_wait", {semaphore, continuous}) != 0 &&
+            std::chrono::steady_clock::now() - begin >= std::chrono::milliseconds(20), "a continuous-clock deadline waits on that clock");
     static_cast<void>(f.call("_dispatch_release", {semaphore}));
 }
 
@@ -195,6 +206,31 @@ void test_queues() {
     { std::lock_guard lock(gate); require(order.back() == 100 && threads.back() == f.process.current_thread()->identity, "dispatch_sync runs inline after queued work"); }
     const auto global = f.call("_dispatch_get_global_queue", {0, 0});
     require(global && f.call("_dispatch_get_global_queue", {0, 1}) == 0, "global queue flags");
+    // DISPATCH_QUEUE_COOPERATIVE (0x4, the Swift concurrency runtime's flag): the same global queues.
+    require(f.call("_dispatch_get_global_queue", {0x19, 4}) == f.call("_dispatch_get_global_queue", {0x19, 0}) &&
+            f.call("_dispatch_get_global_queue", {0x19, 4}) != 0, "the cooperative global queues");
+    // dispatch_queue_set_width: a concurrent queue limited to one item at a time.
+    {
+        static std::atomic<int> running{0}, most{0}, done{0};
+        const auto measured = f.process.install_function("test_dispatch_width_work", [](auto& s, auto&) {
+            const auto now = ++running;
+            for (auto seen = most.load(); now > seen && !most.compare_exchange_weak(seen, now);) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            --running; ++done; s.x[0] = 0;
+        });
+        const auto attribute = f.process.resolve("/usr/lib/libSystem.B.dylib", "__dispatch_queue_attr_concurrent")->address;
+        const auto narrow = f.call("_dispatch_queue_create", {f.string("test.width"), attribute});
+        static_cast<void>(f.call("_dispatch_queue_set_width", {narrow, 1}));
+        for (std::uint64_t index = 0; index < 6; ++index) static_cast<void>(f.call("_dispatch_async_f", {narrow, index, measured}));
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (done < 6) {
+            require(std::chrono::steady_clock::now() < until, "width-limited work did not run");
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        require(most == 1, "a width-1 concurrent queue ran two items at once");
+        static_cast<void>(f.call("_dispatch_queue_set_width", {narrow, static_cast<std::uint64_t>(-3)}));   // MAX_LOGICAL_CPUS
+        static_cast<void>(f.call("_dispatch_release", {narrow}));
+    }
     for (std::uint64_t index = 0; index < 16; ++index) static_cast<void>(f.call("_dispatch_async_f", {global, 1000 + index, work}));
     wait_for(25);
     const auto start = std::chrono::steady_clock::now();

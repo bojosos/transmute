@@ -755,6 +755,8 @@ void test_b11(Fixture& f) {
             "os_system_version_get_current_version");
     require(f.sys("_voucher_adopt", {0x1230}) == 0 && f.sys("_voucher_adopt", {0x4560}) == 0x1230 && f.sys("_voucher_adopt", {0}) == 0x4560,
             "voucher_adopt returns the voucher it replaces");
+    require(f.sys("_voucher_copy", {}) == 0 && f.sys("_voucher_copy_without_importance", {}) == 0,
+            "voucher_copy: NULL while the thread has adopted none");
     // setmode/getmode.
     const auto mask = f.sys("_umask", {0}) & 0777;
     f.sys("_umask", {mask});

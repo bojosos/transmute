@@ -29,10 +29,15 @@
 namespace alchemy {
 namespace {
 constexpr std::string_view system_library = "/usr/lib/libSystem.B.dylib";
+// dispatch_time_t as Darwin encodes it (the Swift concurrency runtime builds such values itself): bit 63 clear, the
+// uptime clock (mach_absolute_time: nanoseconds, the timebase is 1/1); bit 63 alone, the continuous clock
+// (mach_continuous_time) in the low bits; bits 63 and 62, the wall clock as the negated nanoseconds since the epoch.
+// DISPATCH_TIME_NOW 0, DISPATCH_TIME_FOREVER ~0, DISPATCH_WALLTIME_NOW ~1; values reach DISPATCH_TIME_MAX_VALUE.
+enum class Clock { uptime, continuous, wall };
 constexpr std::uint64_t forever = UINT64_MAX;
 constexpr std::uint64_t wall_now = UINT64_MAX - 1;
-constexpr std::uint64_t wall_bit = 1ULL << 63;
-constexpr std::uint64_t maximum_time = wall_bit - 3;
+constexpr std::uint64_t monotonic_bit = 1ULL << 63, wall_bit = 1ULL << 62;
+constexpr std::uint64_t maximum_time = wall_bit - 1;   // DISPATCH_TIME_MAX_VALUE
 constexpr std::uint64_t queue_marker = 0x414c434851554555ULL;
 constexpr std::uint64_t group_marker = 0x414c434847525550ULL;
 constexpr std::uint64_t source_marker = 0x414c434853524345ULL;
@@ -44,15 +49,28 @@ constexpr auto poll_period = std::chrono::milliseconds(10);
 constexpr auto idle_period = std::chrono::seconds(1);
 constexpr std::uint64_t timer_slice = 50'000'000;   // ns; bounds wall-clock drift and exit latency
 
-std::uint64_t now(bool wall) {
-    if (wall) return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+std::uint64_t now(Clock clock) {
+    if (clock == Clock::wall) return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
-    const auto value = host::time::monotonic_ns();
+    const auto value = clock == Clock::continuous ? host::time::continuous_ns() : host::time::monotonic_ns();
     if (value > maximum_time) throw std::runtime_error("dispatch monotonic clock overflow");
     return value;
 }
+// A clock's time (nanoseconds) as a dispatch_time_t. A wall time stays above 2, clear of FOREVER and WALLTIME_NOW.
+std::uint64_t encode(Clock clock, std::uint64_t value) {
+    value = std::clamp<std::uint64_t>(value, clock == Clock::wall ? 3 : 1, maximum_time);
+    if (clock == Clock::uptime) return value;
+    if (clock == Clock::continuous) return value | monotonic_bit;
+    return ~value + 1;
+}
+// The clock and time of a dispatch_time_t (not NOW, FOREVER or WALLTIME_NOW).
+std::pair<Clock, std::uint64_t> decode(std::uint64_t when) {
+    if (!(when & monotonic_bit)) return {Clock::uptime, when};
+    if (when & wall_bit) return {Clock::wall, ~when + 1};
+    return {Clock::continuous, when & ~monotonic_bit};
+}
 
-std::uint64_t deadline(std::uint64_t base, std::int64_t delta, bool wall) {
+std::uint64_t deadline(Clock clock, std::uint64_t base, std::int64_t delta) {
     if (base > maximum_time) return forever;
     std::uint64_t value;
     if (delta >= 0) {
@@ -63,15 +81,15 @@ std::uint64_t deadline(std::uint64_t base, std::int64_t delta, bool wall) {
         const auto amount = static_cast<std::uint64_t>(-(delta + 1)) + 1;
         value = amount >= base ? 1 : base - amount;
     }
-    return std::max<std::uint64_t>(1, value) | (wall ? wall_bit : 0);
+    return encode(clock, value);
 }
 
-// Nanoseconds until an encoded dispatch_time_t deadline; zero when due.
+// Nanoseconds until an encoded dispatch_time_t deadline, on its own clock; zero when due.
 std::uint64_t remaining(std::uint64_t when) {
-    if (when == 0) return 0;
+    if (when == 0 || when == wall_now) return 0;
     if (when == forever) return forever;
-    const bool wall = (when & wall_bit) != 0;
-    const auto at = when & ~wall_bit, current = now(wall);
+    const auto [clock, at] = decode(when);
+    const auto current = now(clock);
     return current >= at ? 0 : at - current;
 }
 
@@ -127,6 +145,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         std::uint64_t target{};
         bool inactive{};          // created from an initially-inactive attribute until dispatch_activate
         std::uint32_t qos{};      // the attribute's QoS class (QOS_CLASS_UNSPECIFIED 0)
+        unsigned width{};         // concurrent: dispatch_queue_set_width's limit (0: concurrency())
     };
     // dispatch_queue_attr_t: the two shared attributes and the variants made from them.
     struct Attribute { Kind kind{Kind::serial}; bool inactive{}; std::uint32_t qos{}; std::uint64_t frequency{}; };
@@ -672,14 +691,15 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
             return 1;
         }
         if (value.barrier_running) return 0;
+        const auto limit = value.width ? value.width : concurrency();
         std::size_t runnable = 0;
         for (const auto& item : value.items) {
             if (item.barrier) { if (runnable == 0 && value.running == 0) runnable = 1; break; }
-            if (++runnable >= concurrency()) break;
+            if (++runnable >= limit) break;
         }
         const auto idle = value.active - value.executing;
-        if (runnable <= idle || value.active >= concurrency()) return 0;
-        const auto count = std::min(static_cast<unsigned>(runnable - idle), concurrency() - value.active);
+        if (runnable <= idle || value.active >= limit) return 0;
+        const auto count = std::min(static_cast<unsigned>(runnable - idle), limit - value.active);
         value.active += count;
         return count;
     }
@@ -1395,7 +1415,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     }
     void arm_poll() {
         const auto self = shared_from_this();
-        schedule_timer(deadline(now(false), 250'000'000, false), [self] { self->poll_sources(); },
+        schedule_timer(deadline(Clock::uptime, now(Clock::uptime), 250'000'000), [self] { self->poll_sources(); },
                        [self] { std::lock_guard lock(self->metadata); self->polling = false; });
     }
     void poll_sources() {
@@ -1589,8 +1609,8 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     void set_timer(std::uint64_t address, std::uint64_t start, std::uint64_t interval) {
         const auto value = source(address);
         // DISPATCH_TIME_NOW and DISPATCH_WALLTIME_NOW start from the current time.
-        if (start == 0) start = deadline(now(false), 0, false);
-        else if (start == wall_now) start = deadline(now(true), 0, true);
+        if (start == 0) start = deadline(Clock::uptime, now(Clock::uptime), 0);
+        else if (start == wall_now) start = deadline(Clock::wall, now(Clock::wall), 0);
         std::uint64_t generation;
         {
             std::lock_guard lock(metadata);
@@ -1615,13 +1635,14 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
             // DISPATCH_TIME_FOREVER (and zero) intervals fire once. Missed
             // periods coalesce into the data count, as on Darwin.
             if (value->interval && value->interval != forever) {
-                const bool wall = (when & wall_bit) != 0;
-                next = deadline(when & ~wall_bit, static_cast<std::int64_t>(std::min(value->interval, maximum_time)), wall);
-                const auto current = now(wall);
-                if (next != forever && (next & ~wall_bit) <= current) {
-                    const auto missed = (current - (next & ~wall_bit)) / value->interval + 1;
+                const auto [clock, at] = decode(when);
+                next = deadline(clock, at, static_cast<std::int64_t>(std::min(value->interval, maximum_time)));
+                const auto current = now(clock);
+                if (next != forever && decode(next).second <= current) {
+                    const auto next_at = decode(next).second;
+                    const auto missed = (current - next_at) / value->interval + 1;
                     value->pending += missed;
-                    next = deadline(next & ~wall_bit, static_cast<std::int64_t>(std::min(missed * value->interval, maximum_time)), wall);
+                    next = deadline(clock, next_at, static_cast<std::int64_t>(std::min(missed * value->interval, maximum_time)));
                 }
             }
         }
@@ -1629,8 +1650,10 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         source_ready(value);
     }
 
+    // The global queue of a QoS class or legacy priority. Flags: 0, or DISPATCH_QUEUE_COOPERATIVE (0x4, the
+    // Swift concurrency runtime's): the same queues, which never run more items at once than concurrency().
     std::uint64_t global_queue(std::int64_t identifier, std::uint64_t flags) const {
-        if (flags) return 0;
+        if (flags & ~std::uint64_t{0x4}) return 0;
         switch (identifier) {
         case 2: case 0x21: case 0x19: return global[0];
         case 0: case 0x15: return global[1];
@@ -1809,6 +1832,17 @@ void Dispatch::install_queues() {
     timer_entry = process.install_function("__alchemy_dispatch_timer", [owned](auto& state, auto&) {
         owned->timer_service(); state.x[0] = 0;
     }, "alchemy.internal");
+    // void dispatch_queue_set_width(dispatch_queue_t, long width) (SPI): how many items a private concurrent queue
+    // runs at once: a count, or DISPATCH_QUEUE_WIDTH_ACTIVE_CPUS (-1), _MAX_PHYSICAL_CPUS (-2) or
+    // _MAX_LOGICAL_CPUS (-3), all concurrency() here. Serial, main and global queues keep theirs.
+    install("_dispatch_queue_set_width", [](auto& self, auto& s, auto&) {
+        const auto width = std::bit_cast<std::int64_t>(s.x[1]);
+        const auto value = self.queue(s.x[0]);
+        std::lock_guard lock(self.metadata);
+        if (value->kind != Kind::concurrent || value->immortal || width == 0 || width < -3) return std::uint64_t{0};
+        value->width = width < 0 ? self.concurrency() : static_cast<unsigned>(std::min<std::int64_t>(width, 64));
+        return std::uint64_t{0};
+    });
     install("_dispatch_get_global_queue", [](auto& self, auto& s, auto&) {
         return self.global_queue(std::bit_cast<std::int64_t>(s.x[0]), s.x[1]);
     });
@@ -2132,13 +2166,15 @@ void install_darwin_dispatch(ProcessContext& context) {
     });
     implementation->install("_dispatch_time", [](auto&, auto& state, auto&) {
         const auto when = state.x[0];
+        const auto delta = std::bit_cast<std::int64_t>(state.x[1]);
         if (when == forever) return forever;
-        const bool wall = when == wall_now || (when & wall_bit) != 0;
-        const auto base = when == 0 || when == wall_now ? now(wall) : when & ~wall_bit;
-        return deadline(base, std::bit_cast<std::int64_t>(state.x[1]), wall);
+        if (when == 0) return deadline(Clock::uptime, now(Clock::uptime), delta);
+        if (when == wall_now) return deadline(Clock::wall, now(Clock::wall), delta);
+        const auto [clock, base] = decode(when);
+        return deadline(clock, base, delta);
     });
     implementation->install("_dispatch_walltime", [](auto&, auto& state, auto& memory) {
-        auto base = now(true);
+        auto base = now(Clock::wall);
         if (state.x[0]) {
             const auto address = state.x[0];
             if (address > UINT64_MAX - 15) throw std::runtime_error("dispatch_walltime address overflow");
@@ -2150,7 +2186,7 @@ void install_darwin_dispatch(ProcessContext& context) {
             if (count > (maximum_time - static_cast<std::uint64_t>(nanos)) / 1'000'000'000) return forever;
             base = count * 1'000'000'000 + static_cast<std::uint64_t>(nanos);
         }
-        return deadline(base, std::bit_cast<std::int64_t>(state.x[1]), true);
+        return deadline(Clock::wall, base, std::bit_cast<std::int64_t>(state.x[1]));
     });
     implementation->install_queues();
     std::lock_guard lock(registry().mutex);
