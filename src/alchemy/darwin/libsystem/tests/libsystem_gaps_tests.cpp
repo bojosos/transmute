@@ -1,6 +1,7 @@
 // The libSystem pieces first written for a renderer plug-in (net/, process/ and misc/libsystem_*.cpp):
 // pure helpers and the guest-visible exports (split from the export-fill tests).
 #include "alchemy/darwin/kit/export_fill/tests/export_fill_test_kit.hpp"
+#include "alchemy/host/process.hpp"
 
 #include <array>
 #include <atomic>
@@ -969,6 +970,10 @@ void test_b17(Fixture& f) {
             f.sys("_getpriority", {3, 0}) == 0, "PRIO_DARWIN_THREAD background");
     require(f.sys("_setpriority", {0, 1, 5}) == UINT64_MAX && errno_value() == 45 && f.sys("_setpriority", {1, 0, 5}) == UINT64_MAX,
             "another process's priority is ENOTSUP");
+    // The guest cannot raise its priority again (only root may), so the test does it through the host: left at
+    // nice 6, every later stage ran below normal priority and starved on a loaded machine (past ctest's timeout).
+    require(static_cast<bool>(alchemy::host::process::set_priority(0)) && f.sys("_getpriority", {0, 0}) == 0,
+            "the test restores normal priority for the stages after it");
 }
 
 // fs/attrlist.cpp: the getattrlist(2) family.
