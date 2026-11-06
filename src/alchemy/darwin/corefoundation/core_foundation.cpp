@@ -814,6 +814,7 @@ struct CoreFoundation::Impl {
             return boolean(directory && (extension == ".app" || extension == ".bundle" || extension == ".framework" || extension == ".plugin"));
         }
         if (name == "IsHiddenKey") return boolean(hidden_item || (file_name.size() > 1 && file_name[0] == '.' && file_name != ".."));
+        if (name == "IsSystemImmutableKey") return boolean(false);   // host files have no system-immutable flag
         if (name == "IsReadableKey") return boolean(error ? false : (permissions & std::filesystem::perms::owner_read) != std::filesystem::perms::none);
         if (name == "IsWritableKey") return boolean(!read_only_item && !(volume && volume->read_only));
         if (name == "IsExecutableKey") return boolean(directory || (!error && (permissions & std::filesystem::perms::owner_exec) != std::filesystem::perms::none));
@@ -838,6 +839,7 @@ struct CoreFoundation::Impl {
         if (name == "VolumeIsRemovableKey") return boolean(volume->removable);
         if (name == "VolumeIsInternalKey") return boolean(volume->local && !volume->removable);
         if (name == "VolumeIsReadOnlyKey") return boolean(volume->read_only);
+        if (name == "VolumeSupportsCaseSensitiveNamesKey") return boolean(false);   // host volumes compare names case-insensitively
         return std::uint64_t{0};
     }
     std::uint64_t volume_enumerator() {

@@ -6,6 +6,7 @@
 #include "alchemy/path.hpp"
 
 #include <array>
+#include <bit>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -177,6 +178,17 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         std::memcpy(payload->bytes.data() + 8, &s.x[2], 8);
         s.x[0] = process.objects().create(16, cf_uuid_class(objc), ObjectKind::instance, std::move(payload));
     });
+
+    // const double kCFCoreFoundationVersionNumber: the newest value open-source CoreFoundation documents,
+    // kCFCoreFoundationVersionNumber10_11_Max (CFBase.h; Apple's documentation gives no numbers), as no
+    // later release's number is published. A check against 10.11 or older passes; one against a newer
+    // release's number sees an older CoreFoundation than the 14.0 that Gestalt and the system version
+    // report, so code that keys features off this number takes its older path.
+    if (!provided(process, cf_library, "_kCFCoreFoundationVersionNumber")) {
+        const auto cell = process.allocate_guest(8);
+        process.main_engine().write64(cell, std::bit_cast<std::uint64_t>(1299.0));
+        process.install_export(cf_library, "_kCFCoreFoundationVersionNumber", {cell, ExportKind::data});
+    }
 
     // ---- CFURL ----
     // CFDictionaryRef CFURLCopyResourcePropertiesForKeys(CFURLRef, CFArrayRef keys, CFErrorRef*)
