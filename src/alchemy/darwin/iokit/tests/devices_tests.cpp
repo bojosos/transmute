@@ -126,6 +126,14 @@ void power(Fixture& f) {
 
 void other_devices(Fixture& f) {
     require(f.status(ff, "_FFIsForceFeedback", {0x2c03}) == static_cast<std::int32_t>(0x80004002U), "no force feedback");
+    // The calls Godot binds take a device or effect that cannot exist: invalid parameters.
+    const auto ff_status = f.block(4);
+    f.engine.write32(ff_status, 7);
+    require(f.status(ff, "_FFDeviceGetForceFeedbackProperty", {0, 1, ff_status, 4}) == static_cast<std::int32_t>(0x80070057U) &&
+                f.status(ff, "_FFDeviceSetForceFeedbackProperty", {0, 1, ff_status}) == static_cast<std::int32_t>(0x80070057U) &&
+                f.status(ff, "_FFDeviceSendForceFeedbackCommand", {0, 1}) == static_cast<std::int32_t>(0x80070057U) &&
+                f.status(ff, "_FFEffectGetEffectStatus", {0, ff_status}) == static_cast<std::int32_t>(0x80070057U) && f.engine.read32(ff_status) == 0,
+            "no force-feedback device or effect");
     // Disk Arbitration: completion kit's local arbiter (installed before this
     // fill-only provider) gives sessions; a path that is not a volume has no disk.
     const auto session = f.call(da, "_DASessionCreate", {0});

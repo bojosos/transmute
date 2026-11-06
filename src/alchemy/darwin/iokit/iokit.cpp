@@ -901,9 +901,12 @@ void IoKit::install_force_feedback() {
     failure(force_feedback, "_FFIsForceFeedback", fferr_no_interface);
     failure(force_feedback, "_FFCreateDevice", fferr_no_interface, {1});
     failure(force_feedback, "_FFDeviceCreateEffect", fferr_invalid_param, {3});
+    // No device or effect reference can exist (FFCreateDevice fails), so every call taking one has an invalid parameter.
     for (const auto* name : {"_FFDeviceGetForceFeedbackCapabilities", "_FFDeviceReleaseEffect", "_FFEffectSetParameters", "_FFEffectStart",
-                             "_FFEffectStop", "_FFReleaseDevice"})
+                             "_FFEffectStop", "_FFReleaseDevice", "_FFDeviceGetForceFeedbackProperty", "_FFDeviceSetForceFeedbackProperty",
+                             "_FFDeviceSendForceFeedbackCommand"})
         failure(force_feedback, name, fferr_invalid_param);
+    failure(force_feedback, "_FFEffectGetEffectStatus", fferr_invalid_param, {1});   // FFEffectGetEffectStatus(effect, FFEffectStatusFlag *)
 }
 
 void IoKit::install_disk_arbitration() {
