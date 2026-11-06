@@ -1,3 +1,4 @@
+#include "alchemy/alchemy_root.hpp"
 #include "alchemy/darwin_services.hpp"
 #include "alchemy/process.hpp"
 #include "alchemy/path.hpp"
@@ -659,10 +660,42 @@ void compiled_fixture(const std::filesystem::path& program) {
 
 } // namespace
 
+// rename(2) of a link onto a link and unlink(2) of a link inside an Alchemy root, as Chromium's updater uses them
+// ("Current" replaced by renaming a fresh "NewCurrent" link onto it), also for a link this process has no record
+// of (another process made it).
+void runtime_link_renames() {
+    const auto base = std::filesystem::temp_directory_path() /
+        ("alchemy-runtime-links-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto root = alchemy::create_alchemy_root(base);
+    struct Cleanup { std::filesystem::path path; ~Cleanup() { alchemy::clear_alchemy_root(); std::error_code e; std::filesystem::remove_all(path, e); } } cleanup{base};
+    alchemy::configure_alchemy_root(root);
+    const auto folder = root / "Users" / "links";
+    std::filesystem::create_directories(folder / "152");
+    std::ofstream(folder / "152" / "marker") << "x";
+    Fixture f;
+    const auto current = f.string("/Users/links/Current"), fresh = f.string("/Users/links/NewCurrent"), target = f.string("152");
+    std::error_code error;
+    const auto present = [&](std::string_view name) { return std::filesystem::exists(std::filesystem::symlink_status(folder / name, error)); };
+    require(f.call("_symlink", {target, fresh}) == 0 && f.call("_symlink", {target, current}) == 0, "two links to one directory");
+    require(f.call("_rename", {fresh, current}) == 0, "rename of a link onto a link");
+    require(!present("NewCurrent") && std::filesystem::is_regular_file(folder / "Current" / "marker"), "the renamed link replaced the other");
+    const auto text = f.context.allocate_guest(64);
+    require(f.call("_readlink", {current, text, 64}) == 3, "the moved link keeps its text");
+    require(f.call("_unlink", {current}) == 0 && !present("Current") && std::filesystem::is_regular_file(folder / "152" / "marker"),
+            "unlink removes the link, not its target");
+    // A link without a record here: unlink still removes the link itself.
+    require(f.call("_symlink", {target, current}) == 0, "the link again");
+    std::filesystem::remove(root / ".alchemy" / "links" / "runtime.tsv");
+    alchemy::configure_alchemy_root(root);
+    require(f.call("_unlink", {current}) == 0 && !present("Current") && std::filesystem::is_regular_file(folder / "152" / "marker"),
+            "unlink of a link another process made");
+}
+
 int main(int argc, char** argv) {
     try {
         memory_and_format(); files_stdio_syscalls(); environment_clock_mapping(); termination_wrappers(); locale_and_scanning(); guest_path_roundtrips();
         jumps_and_contexts(); blocks_runtime(); mach_and_identity(); patterns_and_directories(); libc_leftovers();
+        runtime_link_renames();
         if (argc == 2) compiled_fixture(argv[1]);
         std::cout << "Alchemy Darwin services tests passed\n";
         return 0;

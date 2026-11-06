@@ -253,8 +253,48 @@ inline std::uint32_t host_error(const std::error_code& error) {
 // one is open elsewhere (the host's POSIX-semantics rename; Windows refuses
 // MoveFileEx then with access denied). Directories and the rest keep
 // std::filesystem::rename.
+// A host symbolic link or junction at `path` itself (not followed): what lstat reports as a link.
+inline bool is_host_link(const std::filesystem::path& path) {
+    const auto bytes = path.u8string();
+    const auto found = host::files::metadata(std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()), false);
+    return found && found->symlink;
+}
+// rename(2) of a link (a recorded run-time link, or a host symlink or junction) moves the link itself and, like a
+// rename onto a file, replaces a link or file at `to` (a directory there: EISDIR; a directory onto a link: ENOTDIR).
+// A recorded link is made again at `to` from its text and its record moves with it; Windows will not move a
+// junction onto an existing one.
+inline void rename_link(const std::filesystem::path& from, const std::filesystem::path& to) {
+    std::error_code error;
+    const auto record = installed_link(from);
+    const bool from_link = record || is_host_link(from);
+    const bool to_link = installed_link(to).has_value() || is_host_link(to);
+    const auto to_status = std::filesystem::symlink_status(to, error);
+    if (!from_link && std::filesystem::is_directory(from, error)) throw ServiceError{20};   // ENOTDIR
+    if (!to_link && std::filesystem::exists(to_status) && std::filesystem::is_directory(to_status)) throw ServiceError{21};   // EISDIR
+    if (to_link || std::filesystem::exists(to_status)) {
+        if (!std::filesystem::remove(to, error) && error) throw ServiceError{host_error(error)};
+        forget_installed_link(to);
+    }
+    if (record) {
+        try { create_runtime_link(to, record->target); }
+        catch (const std::system_error& failure) {
+            throw ServiceError{failure.code().category() == std::generic_category() ? host_error(failure.code().value())
+                                                                                    : host_error(failure.code())};
+        }
+        std::filesystem::remove(from, error);
+        forget_installed_link(from);
+        return;
+    }
+    std::filesystem::rename(from, to, error);
+    if (error) throw ServiceError{host_error(error)};
+}
 inline void rename_path(const std::filesystem::path& from, const std::filesystem::path& to) {
     std::error_code error;
+    if (from.lexically_normal() == to.lexically_normal()) {   // rename onto itself does nothing
+        if (!std::filesystem::exists(std::filesystem::symlink_status(from, error))) throw ServiceError{2};
+        return;
+    }
+    if (installed_link(from) || installed_link(to) || is_host_link(from) || is_host_link(to)) { rename_link(from, to); return; }
     std::filesystem::rename(from, to, error);
     if (!error) return;
     const auto failure = host_error(error);

@@ -529,10 +529,11 @@ void DarwinServices::Impl::install_all() {
         const auto value = filesystem_path(m, s.x[0]); std::error_code error;
         if (libsystem::remove_symlink_record(value)) return std::uint64_t{0};
         remove_unix_socket_file(value);
-        // A recorded link (junction or hard link) is removed like a symlink.
-        if (installed_link(value)) {
+        // A link is removed itself, never what it points to: a recorded one (junction or hard link), or any host
+        // symlink or junction (lstat reports those as links), recorded or not (another process may have made it).
+        if (const bool recorded = installed_link(value).has_value(); recorded || is_host_link(value)) {
             if (!std::filesystem::remove(value, error)) throw ServiceError{error ? host_error(error) : enoent};
-            forget_installed_link(value);
+            if (recorded) forget_installed_link(value);
             return std::uint64_t{0};
         }
         if (std::filesystem::is_directory(value, error)) throw ServiceError{eisdir};
