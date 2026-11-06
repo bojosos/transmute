@@ -116,12 +116,24 @@ void install_launchd_jobs(Support& support) {
         if (const auto info = launchd->info(text(support, label))) s.x[0] = guest_value(support, info->dictionary);
     });
     // int launch_activate_socket(const char* name, int** fds, size_t* count): the
-    // sockets launchd made for the job's Sockets entry `name`. ESRCH for a
-    // process launchd did not start; a job has no sockets yet (ENOENT).
-    support.function(rt::libsystem, "_launch_activate_socket", [&support](CpuState& s, GuestMemory&) {
+    // descriptors of the sockets the session launchd made for the job's Sockets
+    // entry `name` (a malloc'd array the caller frees). ESRCH for a process
+    // launchd did not start, ENOENT for a name the job does not have.
+    support.function(rt::libsystem, "_launch_activate_socket", [&support](CpuState& s, GuestMemory& m) {
+        const auto name = s.x[0], out_fds = s.x[1], out_count = s.x[2];
+        if (!name || !out_fds || !out_count) { s.x[0] = 22; return; }
         GuestBlock key(support, "XPC_SERVICE_NAME");
-        const bool job = support.call(rt::libsystem, "_getenv", {key}) != 0;
-        s.x[0] = job ? 2 : 3;
+        if (!support.call(rt::libsystem, "_getenv", {key})) { s.x[0] = 3; return; }
+        auto launchd = session(support, false);
+        std::vector<std::int32_t> descriptors;
+        const auto status = launchd ? launchd->sockets(c_string(m, name), descriptors) : 3;
+        if (status) { s.x[0] = static_cast<std::uint64_t>(status); return; }
+        const auto array = support.call(rt::libsystem, "_malloc", {descriptors.size() * 4});
+        if (!array) { s.x[0] = 12; return; }   // ENOMEM
+        for (std::size_t index = 0; index < descriptors.size(); ++index) m.write32(array + index * 4, static_cast<std::uint32_t>(descriptors[index]));
+        m.write64(out_fds, array);
+        m.write64(out_count, descriptors.size());
+        s.x[0] = 0;
     });
     // CFArrayRef SMCopyAllJobDictionaries(CFStringRef domain): +1 (empty for the system domain).
     support.function(service_management, "_SMCopyAllJobDictionaries", [&support](CpuState& s, GuestMemory&) {

@@ -251,6 +251,192 @@ static void test_launchctl(void) {
     done(t, before);
 }
 
+/* ---- MachServices: on-demand launch and check-in (L2) ------------------------------------------- */
+typedef unsigned mach_port_t;
+extern mach_port_t bootstrap_port;
+extern int bootstrap_look_up(mach_port_t, const char*, mach_port_t*);
+extern int bootstrap_check_in(mach_port_t, const char*, mach_port_t*);
+extern mach_port_t mach_reply_port(void);
+extern int mach_msg(void*, int, unsigned, unsigned, mach_port_t, unsigned, mach_port_t);
+
+#define MACH_SEND_MSG 1
+#define MACH_RCV_MSG 2
+#define MACH_RCV_TIMEOUT 0x100
+#define COPY_SEND 19
+#define MAKE_SEND_ONCE 21
+#define MOVE_SEND_ONCE 18
+#define RCV_AUDIT (3u << 24)
+
+typedef struct { unsigned bits, size; mach_port_t remote, local, voucher; int id; } header_t;
+typedef struct { header_t header; unsigned value; } small_t;
+typedef struct { header_t header; unsigned words[64]; } buffer_t;
+
+/* The job: checks in the service, answers each request with its pid, forever. */
+static int mach_job(const char* service) {
+    mach_port_t port = 0;
+    if (bootstrap_check_in(bootstrap_port, service, &port) != 0 || !port) { out(2, "check-in failed\n"); return 3; }
+    for (;;) {
+        buffer_t buffer;
+        if (mach_msg(&buffer, MACH_RCV_MSG, 0, sizeof buffer, port, 0, 0) != 0) return 4;
+        small_t reply;
+        reply.header.bits = MOVE_SEND_ONCE;
+        reply.header.size = sizeof reply;
+        reply.header.remote = buffer.header.remote;
+        reply.header.local = 0;
+        reply.header.voucher = 0;
+        reply.header.id = buffer.header.id + 1;
+        reply.value = (unsigned)getpid();
+        if (mach_msg(&reply, MACH_SEND_MSG, sizeof reply, 0, 0, 0, 0) != 0) return 5;
+    }
+}
+
+/* Sends request `id` to `server` and waits for the job's answer: its pid, or -1. */
+static long mach_ask(mach_port_t server, int id) {
+    const mach_port_t reply = mach_reply_port();
+    union { small_t request; buffer_t answer; } message;
+    message.request.header.bits = COPY_SEND | (MAKE_SEND_ONCE << 8);
+    message.request.header.size = sizeof(small_t);
+    message.request.header.remote = server;
+    message.request.header.local = reply;
+    message.request.header.voucher = 0;
+    message.request.header.id = id;
+    message.request.value = 0;
+    if (mach_msg(&message, MACH_SEND_MSG | MACH_RCV_MSG | MACH_RCV_TIMEOUT, sizeof(small_t), sizeof(buffer_t), reply, 90000, 0) != 0) return -1;
+    if (message.answer.header.id != id + 1) return -2;
+    return (long)message.answer.words[0];
+}
+
+static void test_mach(void) {
+    const int before = failures; const char* t = "mach";
+    char uid[24], pidtext[24], label[128], service_name[128], domain[64], service[192], plist[1024], body[4096], output[8192];
+    number(uid, (long)getuid());
+    number(pidtext, (long)getpid());
+    const char* tmp = getenv("TMPDIR");
+    if (!tmp) { check(0, t, "TMPDIR", 0); return; }
+    copy(label, "com.alchemy.test.mach"); append(label, pidtext);
+    copy(service_name, label); append(service_name, ".service");
+    copy(domain, "gui/"); append(domain, uid);
+    copy(service, domain); append(service, "/"); append(service, label);
+    copy(plist, tmp); if (plist[length(plist) - 1] != '/') append(plist, "/"); append(plist, label); append(plist, ".plist");
+    body[0] = 0;
+    append(body, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n");
+    append(body, "<key>Label</key><string>"); append(body, label); append(body, "</string>\n");
+    append(body, "<key>ProgramArguments</key><array><string>"); append(body, self);
+    append(body, "</string><string>child</string><string>mach-job</string><string>"); append(body, service_name); append(body, "</string></array>\n");
+    append(body, "<key>MachServices</key><dict><key>"); append(body, service_name); append(body, "</key><true/></dict>\n");
+    append(body, "</dict>\n</plist>\n");
+    check(write_file(plist, body) == 0, t, "write the job plist", 0);
+    char* bootstrap[] = {(char*)"launchctl", (char*)"bootstrap", domain, plist, 0};
+    int status = launchctl(bootstrap, output, sizeof output);
+    check(status == 0, t, "bootstrap a job with MachServices", status);
+    /* Not running yet; its service is found all the same (another process tree). */
+    char* list_one[] = {(char*)"launchctl", (char*)"list", label, 0};
+    status = launchctl(list_one, output, sizeof output);
+    check(status == 0 && !find(output, "\"PID\""), t, "the job does not run before a message", status);
+    mach_port_t server = 0;
+    const int found = bootstrap_look_up(bootstrap_port, service_name, &server);
+    check(found == 0 && server != 0, t, "bootstrap_look_up of the job's service", found);
+    /* The first message launches the job; it checks in, receives it and answers. */
+    const long first = server ? mach_ask(server, 700) : -1;
+    check(first > 0, t, "the job launched on demand answers", first);
+    status = launchctl(list_one, output, sizeof output);
+    char pid_field[48]; copy(pid_field, "\"PID\" = "); number(pid_field + length(pid_field), first);
+    check(status == 0 && find(output, pid_field) != 0, t, "the answering process is the job", first);
+    /* A second message goes straight to the job (the port moved there). */
+    const long second = server ? mach_ask(server, 710) : -1;
+    check(second == first, t, "a second request reaches the same job", second);
+    char* bootout[] = {(char*)"launchctl", (char*)"bootout", service, 0};
+    status = launchctl(bootout, output, sizeof output);
+    check(status == 0, t, "bootout", status);
+    mach_port_t gone = 0;
+    check(bootstrap_look_up(bootstrap_port, service_name, &gone) != 0, t, "the service is gone after bootout", 0);
+    unlink(plist);
+    done(t, before);
+}
+
+/* ---- Sockets: launch_activate_socket (L2) ----------------------------------------------------- */
+extern int launch_activate_socket(const char*, int**, size_t*);
+extern void free(void*);
+extern void* launch_msg(void*);
+extern void* launch_data_new_string(const char*);
+extern void* launch_data_dict_lookup(void*, const char*);
+extern int launch_data_get_type(void*);
+extern unsigned long launch_data_array_get_count(void*);
+extern void* launch_data_array_get_index(void*, unsigned long);
+extern int launch_data_get_fd(void*);
+extern void launch_data_free(void*);
+
+/* The job: reports its Sockets entry, then waits until launchd ends it. */
+static int socket_job(void) {
+    char text[256], digits[24];
+    int* fds = 0; size_t count = 0;
+    const int error = launch_activate_socket("Listeners", &fds, &count);
+    int* none = 0; size_t none_count = 0;
+    const int missing = launch_activate_socket("NoSuchKey", &none, &none_count);
+    text[0] = 0;
+    append(text, "sockets error="); append(text, number(digits, error));
+    append(text, " count="); append(text, number(digits, (long)count));
+    append(text, " fd="); append(text, number(digits, count ? fds[0] : -1));
+    append(text, " missing="); append(text, number(digits, missing));
+    /* The legacy CheckIn: Label (a string) and Sockets.Listeners[0] (the same descriptor). */
+    void* request = launch_data_new_string("CheckIn");
+    void* reply = launch_msg(request);
+    void* label = reply ? launch_data_dict_lookup(reply, "Label") : 0;
+    void* sockets = reply ? launch_data_dict_lookup(reply, "Sockets") : 0;
+    void* listeners = sockets ? launch_data_dict_lookup(sockets, "Listeners") : 0;
+    const long first = listeners && launch_data_array_get_count(listeners) == 1 ? launch_data_get_fd(launch_data_array_get_index(listeners, 0)) : -1;
+    append(text, " checkin_label="); append(text, number(digits, label ? launch_data_get_type(label) : -1));
+    append(text, " checkin_fd="); append(text, number(digits, first));
+    if (reply) launch_data_free(reply);
+    launch_data_free(request);
+    append(text, "\n");
+    out(1, text);
+    if (fds) free(fds);
+    for (int i = 0; i < 600; ++i) usleep(100000);
+    return 0;
+}
+
+static void test_sockets(void) {
+    const int before = failures; const char* t = "sockets";
+    char uid[24], pidtext[24], label[128], domain[64], service[192], plist[1024], marker[1024], path[1024], body[4096], text[4096], output[8192];
+    number(uid, (long)getuid());
+    number(pidtext, (long)getpid());
+    const char* tmp = getenv("TMPDIR");
+    if (!tmp) { check(0, t, "TMPDIR", 0); return; }
+    /* Not a job: ESRCH. */
+    int* fds = 0; size_t count = 0;
+    check(launch_activate_socket("Listeners", &fds, &count) == 3, t, "launch_activate_socket outside a job: ESRCH", 0);
+    copy(label, "com.alchemy.test.sockets"); append(label, pidtext);
+    copy(domain, "gui/"); append(domain, uid);
+    copy(service, domain); append(service, "/"); append(service, label);
+    copy(plist, tmp); if (plist[length(plist) - 1] != '/') append(plist, "/"); append(plist, label); append(plist, ".plist");
+    copy(marker, tmp); if (marker[length(marker) - 1] != '/') append(marker, "/"); append(marker, label); append(marker, ".out");
+    copy(path, tmp); if (path[length(path) - 1] != '/') append(path, "/"); append(path, "lx"); append(path, pidtext); append(path, ".sock");
+    unlink(marker);
+    body[0] = 0;
+    append(body, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n");
+    append(body, "<key>Label</key><string>"); append(body, label); append(body, "</string>\n");
+    append(body, "<key>ProgramArguments</key><array><string>"); append(body, self);
+    append(body, "</string><string>child</string><string>socket-job</string><string>x</string></array>\n");
+    append(body, "<key>RunAtLoad</key><true/>\n");
+    append(body, "<key>StandardOutPath</key><string>"); append(body, marker); append(body, "</string>\n");
+    append(body, "<key>Sockets</key><dict><key>Listeners</key><dict><key>SockPathName</key><string>"); append(body, path);
+    append(body, "</string></dict></dict>\n</dict>\n</plist>\n");
+    check(write_file(plist, body) == 0, t, "write the job plist", 0);
+    char* bootstrap[] = {(char*)"launchctl", (char*)"bootstrap", domain, plist, 0};
+    int status = launchctl(bootstrap, output, sizeof output);
+    check(status == 0, t, "bootstrap a job with Sockets", status);
+    check(wait_for(marker, "sockets ", text, sizeof text, 60000), t, "the job reports its sockets", 0);
+    check(field(text, "error") == 0 && field(text, "count") == 1 && field(text, "fd") == 3, t, "Listeners: one socket at descriptor 3", field(text, "fd"));
+    check(field(text, "missing") == 2, t, "an unknown key: ENOENT", field(text, "missing"));
+    check(field(text, "checkin_label") == 7 && field(text, "checkin_fd") == 3, t, "launch_msg CheckIn: Label and Sockets", field(text, "checkin_fd"));
+    char* bootout[] = {(char*)"launchctl", (char*)"bootout", service, 0};
+    status = launchctl(bootout, output, sizeof output);
+    check(status == 0, t, "bootout", status);
+    unlink(plist); unlink(marker); unlink(path);
+    done(t, before);
+}
+
 static int child(int argc, char** argv) {
     if (argc >= 4 && same(argv[2], "job")) {
         char text[256], digits[24];
@@ -266,6 +452,8 @@ static int child(int argc, char** argv) {
         for (int i = 0; i < 600; ++i) usleep(100000);   /* until launchd ends it */
         return 0;
     }
+    if (argc >= 4 && same(argv[2], "mach-job")) return mach_job(argv[3]);
+    if (argc >= 3 && same(argv[2], "socket-job")) return socket_job();
     out(2, "unknown child mode\n");
     return 2;
 }
@@ -275,6 +463,8 @@ int main(int argc, char** argv) {
     if (argc >= 3 && same(argv[1], "child")) return child(argc, argv);
     if (argc < 2) { out(2, "usage: launchd_model <test>|child <mode>\n"); return 2; }
     if (same(argv[1], "launchctl")) test_launchctl();
+    else if (same(argv[1], "mach")) test_mach();
+    else if (same(argv[1], "sockets")) test_sockets();
     else { out(2, "unknown test\n"); return 2; }
     return failures;
 }

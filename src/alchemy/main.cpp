@@ -117,7 +117,13 @@ int launch(const std::vector<std::string>& arguments, const std::vector<std::str
         }
         if (arguments[1] == "install") return install(arguments, environment);
         // The session launchd (src/alchemy/darwin/launchd/): started by launchctl and SMJobSubmit.
-        if (arguments[1] == "launchd") return alchemy::launchd::server_main({arguments.begin() + 2, arguments.end()});
+        if (arguments[1] == "launchd") {
+#ifdef ALCHEMY_WITH_GUI
+            return alchemy::launchd::server_main({arguments.begin() + 2, arguments.end()}, &alchemy::launchd::make_mach_services);
+#else
+            return alchemy::launchd::server_main({arguments.begin() + 2, arguments.end()});
+#endif
+        }
         std::size_t index = 1;
 #ifdef ALCHEMY_WITH_GUI
         if (arguments[index] == "msl-seed") {

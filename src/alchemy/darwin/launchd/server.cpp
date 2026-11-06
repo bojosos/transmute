@@ -1,11 +1,14 @@
 #include "alchemy/darwin/launchd/client.hpp"
 #include "alchemy/darwin/launchd/job.hpp"
+#include "alchemy/darwin/launchd/mach_services.hpp"
 #include "alchemy/darwin/launchd/protocol.hpp"
 
 #include "alchemy/alchemy_root.hpp"
 #include "alchemy/darwin_process.hpp"
 #include "alchemy/host/files.hpp"
 #include "alchemy/host/ipc.hpp"
+#include "alchemy/host/net.hpp"
+#include "alchemy/host/network_policy.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/host/sync.hpp"
 #include "alchemy/path.hpp"
@@ -124,8 +127,18 @@ std::optional<std::chrono::system_clock::time_point> next_calendar(const std::ve
     return std::nullopt;
 }
 
+// A socket of a job's Sockets entry: made at load, kept here, handed to every
+// run of the job at descriptor `fd`.
+struct JobSocket {
+    std::string key;
+    host::Handle handle;
+    int fd{};
+    std::int32_t domain{}, type{};   // Darwin AF_* and SOCK_* values
+};
+
 struct Job {
     JobSpec spec;
+    std::vector<JobSocket> sockets;
     std::string path;                         // guest path of its plist ("" when submitted)
     std::uint32_t pid{};                      // 0: not running
     std::optional<std::int32_t> last_status;  // wait status of the last run
@@ -142,8 +155,8 @@ struct Process {
 
 class Server {
 public:
-    Server(std::string name, std::vector<std::string> launch_options)
-        : name_(std::move(name)), launch_options_(std::move(launch_options)) {
+    Server(std::string name, std::vector<std::string> launch_options, std::unique_ptr<MachServices> mach)
+        : name_(std::move(name)), launch_options_(std::move(launch_options)), mach_(std::move(mach)) {
         grace_ = seconds_setting("ALCHEMY_LAUNCHD_GRACE", 300);
         linger_ = seconds_setting("ALCHEMY_LAUNCHD_LINGER", 3);
         if (const auto root = configured_alchemy_root())
@@ -154,6 +167,7 @@ public:
     int run(host::Handle first_listener) {
         log("started for " + name_ + " (grace " + std::to_string(grace_.count()) + " s)");
         std::thread([this, first_listener] { accept_loop(first_listener); }).detach();
+        if (mach_) std::thread([this] { demand_loop(); }).detach();
         if (const auto agents = host::process::environment("ALCHEMY_LAUNCHD_AGENTS"); agents && *agents == "1") load_agents();
         std::unique_lock lock(mutex_);
         // A client that started this server says hello at once.
@@ -215,7 +229,7 @@ private:
                     caller.pid = in.u32(); caller.tree_root = in.u32(); caller.tree_version = in.u32();
                     hello(caller);
                 } else {
-                    handle(op, in, answer);
+                    handle(op, in, answer, caller);
                 }
             } catch (const std::exception& error) {
                 log(std::string("bad request: ") + error.what());
@@ -262,7 +276,22 @@ private:
         cv_.notify_all();
     }
 
-    void handle(wire::Op op, wire::Reader& in, wire::Writer& out) {
+    // A message queued on a service port of a job that does not run (on demand launch).
+    void demand_loop() {
+        for (;;) {
+            { std::lock_guard lock(mutex_); if (stopping_) return; }
+            const auto seen = mach_->epoch();
+            auto names = mach_->pending();
+            const bool any = !names.empty();
+            if (any) {
+                { std::lock_guard events(events_mutex_); demanded_ = std::move(names); }
+                wake();
+            }
+            mach_->wait(seen, std::chrono::milliseconds(any ? 500 : 2000));
+        }
+    }
+
+    void handle(wire::Op op, wire::Reader& in, wire::Writer& out, const Caller& caller) {
         std::unique_lock lock(mutex_);
         switch (op) {
         case wire::Op::load: {
@@ -341,6 +370,52 @@ private:
             out.i32(status).text(message);
             break;
         }
+        case wire::Op::mach_look_up: {
+            const auto service = in.text();
+            const auto owner = service_owner_.find(service);
+            const auto job = owner == service_owner_.end() ? jobs_.end() : jobs_.find(owner->second);
+            if (!mach_ || job == jobs_.end()) { out.i32(wire::status_no_such_service); break; }
+            const auto& spec = job->second.spec.mach_services;
+            const auto entry = std::find_if(spec.begin(), spec.end(), [&](const MachService& item) { return item.name == service; });
+            if (entry != spec.end() && entry->hide_until_check_in && !checked_in_.contains(service)) { out.i32(wire::status_no_such_service); break; }
+            const auto where = mach_->locate(service);
+            if (!where) { out.i32(wire::status_no_such_service); break; }
+            out.i32(0).u32(where->host).u32(where->key_pid).u64(where->key_id);
+            break;
+        }
+        case wire::Op::mach_check_in: {
+            const auto service = in.text();
+            const auto owner = service_owner_.find(service);
+            const auto job = owner == service_owner_.end() ? jobs_.end() : jobs_.find(owner->second);
+            // Only the job that declares the service checks it in.
+            if (!mach_ || job == jobs_.end() || !caller.pid || job->second.pid != caller.pid) { out.i32(wire::status_no_such_service); break; }
+            if (!mach_->offer(service, caller.pid)) { out.i32(1103); break; }   // BOOTSTRAP_SERVICE_ACTIVE
+            checked_in_.insert(service);
+            log(job->first + " (pid " + std::to_string(caller.pid) + ") checked in " + service);
+            out.i32(0).u32(mach_->self());
+            break;
+        }
+        case wire::Op::sockets: {
+            const auto key = in.text();
+            const auto job = std::find_if(jobs_.begin(), jobs_.end(), [&](const auto& item) { return caller.pid && item.second.pid == caller.pid; });
+            if (job == jobs_.end()) { out.i32(3); break; }   // ESRCH: not a job
+            std::vector<std::int32_t> descriptors;
+            for (const auto& socket : job->second.sockets) if (socket.key == key) descriptors.push_back(socket.fd);
+            if (descriptors.empty()) { out.i32(2); break; }   // ENOENT
+            out.i32(0).u32(static_cast<std::uint32_t>(descriptors.size()));
+            for (const auto descriptor : descriptors) out.i32(descriptor);
+            break;
+        }
+        case wire::Op::job: {
+            const auto job = std::find_if(jobs_.begin(), jobs_.end(), [&](const auto& item) { return caller.pid && item.second.pid == caller.pid; });
+            if (job == jobs_.end()) { out.i32(3); break; }   // ESRCH: not a job
+            out.i32(0).text(job->first);
+            out.u32(static_cast<std::uint32_t>(job->second.sockets.size()));
+            for (const auto& socket : job->second.sockets) out.text(socket.key).i32(socket.fd);
+            out.u32(static_cast<std::uint32_t>(job->second.spec.mach_services.size()));
+            for (const auto& service : job->second.spec.mach_services) out.text(service.name);
+            break;
+        }
         case wire::Op::stop: {
             const auto found = jobs_.find(in.text());
             if (found == jobs_.end()) { out.i32(wire::status_no_such_service).text("Could not find specified service"); break; }
@@ -378,6 +453,12 @@ private:
             message = "service already loaded";
             return wire::status_already_loaded;
         }
+        for (const auto& service : spec.mach_services) {
+            if (const auto owner = service_owner_.find(service.name); owner != service_owner_.end()) {
+                message = "the Mach service " + service.name + " belongs to " + owner->second;
+                return 17;   // EEXIST
+            }
+        }
         if (flags & wire::load_write) {
             overrides_[spec.label] = false;
             write_overrides();
@@ -394,6 +475,13 @@ private:
         auto& job = jobs_[label];
         job.spec = std::move(spec);
         job.path = path;
+        for (const auto& service : job.spec.mach_services) {
+            service_owner_[service.name] = label;
+            if (!mach_) log(label + ": the Mach service " + service.name + " has no port (the session launchd runs without Mach IPC)");
+            else if (!mach_->create(service.name)) log(label + ": cannot make a port for the Mach service " + service.name);
+        }
+        int next_fd = 3;
+        for (const auto& socket : job.spec.sockets) open_sockets(label, socket, next_fd, job.sockets);
         const auto now = Clock::now();
         if (job.spec.start_interval) job.next_interval = now + std::chrono::seconds(*job.spec.start_interval);
         job.next_calendar_time = next_calendar(job.spec.calendar, std::chrono::system_clock::now());
@@ -414,6 +502,12 @@ private:
         if (found == jobs_.end()) { message = "Could not find specified service"; return wire::status_no_such_service; }
         const auto pid = found->second.pid;
         if (pid) terminate(found->second, 15);
+        for (const auto& socket : found->second.sockets) host::net::close_socket(socket.handle);
+        for (const auto& service : found->second.spec.mach_services) {
+            service_owner_.erase(service.name);
+            checked_in_.erase(service.name);
+            if (mach_) mach_->destroy(service.name);
+        }
         jobs_.erase(found);
         log("removed " + label);
         // bootout returns once the job's process has ended.
@@ -526,6 +620,16 @@ private:
             request.fds.push_back(descriptor(0, job.spec.standard_in, keep));
             request.fds.push_back(descriptor(1, job.spec.standard_out, keep));
             request.fds.push_back(descriptor(2, job.spec.standard_error ? job.spec.standard_error : job.spec.standard_out, keep));
+            for (const auto& socket : job.sockets) {
+                ChildFd entry;
+                entry.fd = socket.fd;
+                entry.kind = ChildFdKind::socket;
+                entry.handle = static_cast<std::uint64_t>(socket.handle.value);
+                entry.socket_domain = socket.domain;
+                entry.socket_type = socket.type;
+                entry.flags = 2;   // O_RDWR
+                request.fds.push_back(std::move(entry));
+            }
             request.ppid = 1;   // launchd
             request.new_session = true;
             request.launch_options = launch_options_;
@@ -566,6 +670,64 @@ private:
         }
     }
 
+    // The listening (passive) sockets of a Sockets entry: a Unix-domain path,
+    // or a TCP/UDP port on SockNodeName (default: every address, or only the
+    // loopback addresses under ALCHEMY_NETWORK=loopback), IPv4 and IPv6 unless
+    // SockFamily picks one.
+    void open_sockets(const std::string& label, const SocketSpec& spec, int& next_fd, std::vector<JobSocket>& out) {
+        const auto refuse = [&](const std::string& why) { log(label + ": Sockets " + spec.key + ": " + why); };
+        if (!spec.passive) { refuse("connecting sockets (SockPassive false) are not supported; none made"); return; }
+        if (!host::net::initialize()) { refuse("no host socket stack"); return; }
+        const auto make = [&](host::net::Family family, const host::net::Address& address, std::int32_t domain) {
+            const auto type = spec.stream || family == host::net::Family::local ? host::net::SocketType::stream : host::net::SocketType::datagram;
+            auto socket = host::net::open_socket(family, type);
+            if (!socket) { refuse("cannot make a socket (" + std::string(host::name(socket.error())) + ")"); return; }
+            if (const auto bound = host::net::bind(*socket, address); !bound) {
+                refuse("cannot bind " + host::net::to_string(address) + " (" + std::string(host::name(bound.error())) + ")");
+                host::net::close_socket(*socket);
+                return;
+            }
+            if (type == host::net::SocketType::stream) {
+                if (const auto listening = host::net::listen(*socket, 128); !listening) {
+                    refuse("cannot listen (" + std::string(host::name(listening.error())) + ")");
+                    host::net::close_socket(*socket);
+                    return;
+                }
+            }
+            out.push_back(JobSocket{spec.key, *socket, next_fd++, domain, type == host::net::SocketType::stream ? 1 : 2});
+            log(label + ": Sockets " + spec.key + " listens on " + host::net::to_string(address) + " (descriptor " + std::to_string(out.back().fd) + ")");
+        };
+        if (spec.family == "Unix" || !spec.path.empty()) {
+            const auto native = path_utf8(host_path(spec.path));
+            std::error_code ignored;
+            std::filesystem::remove(utf8_path(native), ignored);
+            make(host::net::Family::local, host::net::Address::local(native), 1);
+            return;
+        }
+        const auto digits = !spec.service.empty() && std::all_of(spec.service.begin(), spec.service.end(), [](char c) { return c >= '0' && c <= '9'; });
+        if (!digits || spec.service.size() > 5 || std::stoul(spec.service) > 65535) {
+            refuse("the service " + spec.service + " is not a port number (named services are not resolved)");
+            return;
+        }
+        const auto port = static_cast<std::uint16_t>(std::stoul(spec.service));
+        const bool v4 = spec.family.empty() || spec.family == "IPv4" || spec.family == "IPv4v6";
+        const bool v6 = spec.family.empty() || spec.family == "IPv6" || spec.family == "IPv4v6";
+        if (!spec.node.empty()) {
+            auto address = host::net::parse_numeric(spec.node, port);
+            if (!address && host::net::loopback_host(spec.node)) address = host::net::Address::ipv4({127, 0, 0, 1}, port);
+            if (!address) { refuse("the node " + spec.node + " is not a numeric address"); return; }
+            make(address->family, *address, address->family == host::net::Family::ipv6 ? 30 : 2);
+            return;
+        }
+        const bool loopback = network_policy::loopback_only();
+        if (v4) make(host::net::Family::ipv4, host::net::Address::ipv4(loopback ? std::array<std::uint8_t, 4>{127, 0, 0, 1} : std::array<std::uint8_t, 4>{}, port), 2);
+        if (v6) {
+            std::array<std::uint8_t, 16> any{};
+            if (loopback) any[15] = 1;
+            make(host::net::Family::ipv6, host::net::Address::ipv6(any, port), 30);
+        }
+    }
+
     bool keep_alive_holds(const Job& job, std::optional<std::int32_t> status) const {
         const auto& keep = job.spec.keep_alive;
         if (keep.always) return true;
@@ -586,10 +748,12 @@ private:
 
     void drain_events(std::unique_lock<std::mutex>&) {
         std::vector<std::uint32_t> exited, ended;
+        std::vector<std::string> demanded;
         {
             std::lock_guard events(events_mutex_);
             exited.swap(exited_);
             ended.swap(ended_trees_);
+            demanded.swap(demanded_);
         }
         for (const auto pid : ended) {
             if (sessions_.erase(pid)) log("application tree " + std::to_string(pid) + " ended");
@@ -609,11 +773,33 @@ private:
             auto& job = found->second;
             job.pid = 0;
             job.last_status = status;
+            // A port the job had checked in died with it: a new one, for the next run.
+            for (const auto& service : job.spec.mach_services) {
+                if (!checked_in_.erase(service.name) || !mach_) continue;
+                mach_->destroy(service.name);
+                if (!mach_->create(service.name)) log(label + ": cannot make a new port for the Mach service " + service.name);
+            }
             log(label + " (pid " + std::to_string(pid) + ") ended with " +
                 ((status & 0x7f) ? "signal " + std::to_string(status & 0x7f) : "status " + std::to_string((status >> 8) & 0xff)));
             if (!ending_ && keep_alive_holds(job, status)) {
                 const auto earliest = job.last_start + std::chrono::seconds(job.spec.throttle_interval);
                 job.restart_at = std::max(Clock::now(), earliest);
+            }
+        }
+        // Messages waiting for jobs that do not run: launch them (throttled).
+        if (active()) {
+            std::string ignored;
+            for (const auto& service : demanded) {
+                const auto owner = service_owner_.find(service);
+                const auto found = owner == service_owner_.end() ? jobs_.end() : jobs_.find(owner->second);
+                if (found == jobs_.end() || found->second.pid) continue;
+                auto& job = found->second;
+                if (job.runs && Clock::now() < job.last_start + std::chrono::seconds(job.spec.throttle_interval)) {
+                    job.restart_at = job.last_start + std::chrono::seconds(job.spec.throttle_interval);
+                    continue;
+                }
+                log("a message for " + service + " starts " + found->first);
+                static_cast<void>(start(job, ignored));
             }
         }
         cv_.notify_all();
@@ -677,6 +863,11 @@ private:
         std::vector<Value> arguments;
         for (const auto& argument : job.spec.arguments) arguments.push_back(Value::of_string(argument));
         value.set("ProgramArguments", Value::of_array(std::move(arguments)));
+        if (!job.sockets.empty()) {
+            auto sockets = Value::of_dictionary();
+            for (const auto& socket : job.sockets) sockets.set(socket.key + " (descriptor " + std::to_string(socket.fd) + ")", Value::of_string("listening"));
+            value.set("sockets", std::move(sockets));
+        }
         if (!job.spec.mach_services.empty()) {
             auto services = Value::of_dictionary();
             for (const auto& service : job.spec.mach_services) services.set(service.name, Value::of_integer(0));
@@ -713,6 +904,12 @@ private:
         if (!job.spec.calendar.empty()) value.set("calendar intervals", Value::of_integer(static_cast<std::int64_t>(job.spec.calendar.size())));
         value.set("keepalive", Value::of_boolean(job.spec.keep_alive.any()));
         value.set("run at load", Value::of_boolean(job.spec.run_at_load));
+        if (!job.spec.mach_services.empty()) {
+            auto services = Value::of_dictionary();
+            for (const auto& service : job.spec.mach_services)
+                services.set(service.name, Value::of_string(!mach_ ? "no port (no Mach IPC)" : checked_in_.contains(service.name) ? "checked in" : "held by launchd"));
+            value.set("endpoints", std::move(services));
+        }
         value.set("disabled", Value::of_boolean(disabled(job.spec)));
         std::vector<Value> ignored;
         for (const auto& key : job.spec.ignored_keys) ignored.push_back(Value::of_string(key));
@@ -769,6 +966,9 @@ private:
 
     std::string name_;
     std::vector<std::string> launch_options_;
+    std::unique_ptr<MachServices> mach_;
+    std::map<std::string, std::string> service_owner_;   // Mach service -> job label
+    std::set<std::string> checked_in_;                   // services whose receive right went to the job
     std::chrono::seconds grace_{}, linger_{};
     std::optional<std::filesystem::path> overrides_path_;
 
@@ -786,11 +986,12 @@ private:
 
     std::mutex events_mutex_;
     std::vector<std::uint32_t> exited_, ended_trees_;
+    std::vector<std::string> demanded_;
 };
 
 } // namespace
 
-int server_main(const std::vector<std::string>& arguments) {
+int server_main(const std::vector<std::string>& arguments, MachServicesFactory mach) {
     std::vector<std::string> launch_options;
     std::optional<std::filesystem::path> root;
     for (std::size_t index = 0; index < arguments.size(); ++index) {
@@ -810,7 +1011,7 @@ int server_main(const std::vector<std::string>& arguments) {
         std::cerr << "alchemy launchd: cannot listen on " << name << " (" << host::name(listener.error()) << ")" << std::endl;
         return 1;
     }
-    Server server(name, std::move(launch_options));
+    Server server(name, std::move(launch_options), mach ? mach() : nullptr);
     const auto status = server.run(*listener);
     std::cerr.flush();
     host::process::terminate_self(static_cast<std::uint32_t>(status));

@@ -219,9 +219,9 @@ private:
         return result;
     }
 
-    std::optional<std::string> label_of_file(const std::string& guest) {
+    std::optional<std::string> label_of_file(const std::string& guest, const char* what) {
         int status = 0;
-        const auto value = read(guest, "Unload", status);
+        const auto value = read(guest, what, status);
         if (!value) return std::nullopt;
         const auto* label = value->find("Label");
         if (!label || !label->is(Value::Kind::string)) { err(guest + ": no Label\n"); return std::nullopt; }
@@ -253,7 +253,7 @@ private:
         int result = 0;
         for (std::size_t i = 1; i < args.size(); ++i)
             for (const auto& file : plists(args[i])) {
-                const auto found = label_of_file(file);
+                const auto found = label_of_file(file, "Boot-out");
                 if (!found) { result = 2; continue; }
                 if (const auto status = remove_label(*found, "Boot-out")) result = status;
             }
@@ -288,7 +288,7 @@ private:
         int result = 0;
         for (const auto& path : paths)
             for (const auto& file : plists(path)) {
-                const auto label = label_of_file(file);
+                const auto label = label_of_file(file, "Unload");
                 if (!label) { result = 2; continue; }
                 if (write) {
                     if (auto* launchd = session(true)) { std::string message; static_cast<void>(launchd->set_enabled(*label, false, message)); }

@@ -9,6 +9,7 @@
 // (ALCHEMY_LAUNCHD_GRACE seconds, default 300), and its jobs end with it.
 // README.md in this directory has the details.
 
+#include "alchemy/darwin/launchd/mach_services.hpp"
 #include "alchemy/darwin/launchd/plist.hpp"
 
 #include "alchemy/host/host.hpp"
@@ -25,6 +26,13 @@ struct ListEntry {
     std::int64_t pid{-1};            // -1: not running
     std::int32_t last_status{};      // last exit status (negative: the signal that ended it)
     std::string label;
+};
+
+// What a job learns about itself at a legacy launch_msg CheckIn.
+struct JobCheckIn {
+    std::string label;
+    std::vector<std::pair<std::string, std::int32_t>> sockets;   // (Sockets key, descriptor)
+    std::vector<std::string> services;                         // its MachServices
 };
 
 struct JobInfo {
@@ -70,6 +78,12 @@ public:
     std::optional<std::string> variable(const std::string& name);
     std::int32_t start(const std::string& label, std::string& message);
     std::int32_t stop(const std::string& label, std::string& message);
+    std::optional<ServiceLocation> mach_look_up(const std::string& service);
+    std::optional<std::uint32_t> mach_check_in(const std::string& service);
+    // launch_activate_socket for this process (a job): the descriptors of the
+    // job's Sockets entry `key`; a status (ESRCH: not a job, ENOENT: no such key).
+    std::int32_t sockets(const std::string& key, std::vector<std::int32_t>& descriptors);
+    std::optional<JobCheckIn> job();
 
 private:
     explicit Session(host::Handle channel) : channel_(channel) {}
@@ -77,10 +91,25 @@ private:
     host::Handle channel_;
 };
 
+// MachServices of the session launchd, for the Mach layer (mach_exports.cpp).
+// Where a job's service port is; nothing (after one failed pipe open) when no
+// session launchd runs.
+[[nodiscard]] std::optional<ServiceLocation> look_up_service(const std::string& service);
+// This process, a job, checking in a service its job declares: the process
+// that offers the receive right. Nothing when no session launchd runs or the
+// service is not this job's.
+[[nodiscard]] std::optional<std::uint32_t> check_in_service(const std::string& service);
+
+// This process's job (launch_msg CheckIn); nothing when no session launchd
+// runs or this process is not one of its jobs.
+[[nodiscard]] std::optional<JobCheckIn> check_in_job();
+
 // The session launchd's pipe name for this user and root (host::ipc).
 [[nodiscard]] std::string pipe_name();
 
 // `alchemy-fx launchd [--root <root>] [runtime options]`: the server's main.
-int server_main(const std::vector<std::string>& arguments);
+// `mach` makes the MachServices ports (alchemy-fx: make_mach_services); without
+// it, jobs' MachServices are reported but have no ports.
+int server_main(const std::vector<std::string>& arguments, MachServicesFactory mach = nullptr);
 
 } // namespace alchemy::launchd

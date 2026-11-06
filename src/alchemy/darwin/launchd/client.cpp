@@ -178,7 +178,20 @@ std::unique_ptr<Session> Session::open(bool start, const std::vector<std::string
     wire::Writer hello;
     hello.u32(static_cast<std::uint32_t>(wire::Op::hello)).u32(caller.pid).u32(caller.tree_root).u32(caller.tree_version);
     try { static_cast<void>(session->call(hello.bytes)); }
-    catch (const std::exception& failure) { say(failure.what()); return nullptr; }
+    catch (const std::exception& failure) {
+        // A session launchd that was ending as this connected: again, after it is gone.
+        static thread_local int retries = 0;
+        if (retries < 2) {
+            ++retries;
+            session.reset();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            auto again = open(start, launch_options, error);
+            --retries;
+            return again;
+        }
+        say(failure.what());
+        return nullptr;
+    }
     return session;
 }
 
@@ -287,6 +300,76 @@ std::int32_t Session::start(const std::string& label, std::string& message) {
     const auto status = in.i32();
     message = in.text();
     return status;
+}
+
+std::optional<ServiceLocation> Session::mach_look_up(const std::string& service) {
+    auto request = op(wire::Op::mach_look_up);
+    request.text(service);
+    wire::Reader in(call(request.bytes));
+    if (in.i32() != 0) return std::nullopt;
+    ServiceLocation where;
+    where.host = in.u32();
+    where.key_pid = in.u32();
+    where.key_id = in.u64();
+    return where;
+}
+
+std::optional<std::uint32_t> Session::mach_check_in(const std::string& service) {
+    auto request = op(wire::Op::mach_check_in);
+    request.text(service);
+    wire::Reader in(call(request.bytes));
+    if (in.i32() != 0) return std::nullopt;
+    return in.u32();
+}
+
+std::int32_t Session::sockets(const std::string& key, std::vector<std::int32_t>& descriptors) {
+    auto request = op(wire::Op::sockets);
+    request.text(key);
+    wire::Reader in(call(request.bytes));
+    const auto status = in.i32();
+    if (status) return status;
+    descriptors.resize(in.u32());
+    for (auto& descriptor : descriptors) descriptor = in.i32();
+    return 0;
+}
+
+std::optional<JobCheckIn> Session::job() {
+    wire::Reader in(call(op(wire::Op::job).bytes));
+    if (in.i32() != 0) return std::nullopt;
+    JobCheckIn result;
+    result.label = in.text();
+    result.sockets.resize(in.u32());
+    for (auto& [key, fd] : result.sockets) { key = in.text(); fd = in.i32(); }
+    result.services.resize(in.u32());
+    for (auto& service : result.services) service = in.text();
+    return result;
+}
+
+std::optional<JobCheckIn> check_in_job() {
+    try {
+        const auto session = Session::open(false, {});
+        return session ? session->job() : std::nullopt;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<ServiceLocation> look_up_service(const std::string& service) {
+    try {
+        const auto session = Session::open(false, {});
+        return session ? session->mach_look_up(service) : std::nullopt;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::uint32_t> check_in_service(const std::string& service) {
+    try {
+        const auto session = Session::open(false, {});
+        return session ? session->mach_check_in(service) : std::nullopt;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
 }
 
 std::int32_t Session::stop(const std::string& label, std::string& message) {

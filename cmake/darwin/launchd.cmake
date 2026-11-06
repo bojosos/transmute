@@ -12,6 +12,9 @@ target_sources(alchemy_core PRIVATE
 # GUI (alchemy-fx only): ServiceManagement's job calls and launch_activate_socket
 # (installed by libsystem/misc/system_c.cpp's install_system_functions).
 list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/launchd/service_management.cpp)
+# GUI (alchemy-fx only): the MachServices ports (the cross-process Mach layer),
+# passed to the server by main().
+list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/launchd/mach_services.cpp)
 alchemy_gui_add_framework_case(launchd_service_management src/alchemy/darwin/launchd/tests/service_management_tests.cpp)
 
 if(BUILD_TESTING)
@@ -44,7 +47,7 @@ function(alchemy_launchd_session_tests)
         DEPENDS "${macos_dir}/launchd_model.o" "${macos_dir}/launchd_system.dylib" VERBATIM)
     add_custom_target(alchemy_launchd_fixtures DEPENDS "${macos_dir}/launchd_model")
     add_dependencies(alchemy_process_model_tests alchemy_launchd_fixtures)
-    add_test(NAME alchemy_launchd_session_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${macos_dir}/launchd_model" launchctl)
+    add_test(NAME alchemy_launchd_session_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${macos_dir}/launchd_model" launchctl mach sockets)
     set_tests_properties(alchemy_launchd_session_fx PROPERTIES TIMEOUT 600
         ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback")
 endfunction()

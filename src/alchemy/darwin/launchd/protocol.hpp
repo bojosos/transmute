@@ -31,6 +31,10 @@ enum class Op : std::uint32_t {
     getenv = 12,     // text name -> status, text value
     start = 13,      // text label -> status
     stop = 14,       // text label -> status
+    mach_look_up = 15,   // text service -> status, u32 host, u32 key pid, u64 key id
+    mach_check_in = 16,  // text service (the caller is the job) -> status, u32 host offering the receive right
+    sockets = 17,        // text Sockets key (the caller is the job) -> status, u32 count, then i32 descriptors
+    job = 18,            // (the caller is the job) -> status, text label, u32 n (text key, i32 fd), u32 n (text service)
 };
 
 inline constexpr std::uint8_t load_submit = 1;       // SMJobSubmit / launchctl submit: no on-disk path
@@ -57,6 +61,7 @@ public:
     Writer& u32(std::uint32_t value) { put(&value, 4); return *this; }
     Writer& i32(std::int32_t value) { put(&value, 4); return *this; }
     Writer& i64(std::int64_t value) { put(&value, 8); return *this; }
+    Writer& u64(std::uint64_t value) { put(&value, 8); return *this; }
     Writer& text(std::string_view value) { u32(static_cast<std::uint32_t>(value.size())); put(value.data(), value.size()); return *this; }
     std::vector<std::uint8_t> bytes;
 private:
@@ -73,6 +78,7 @@ public:
     std::uint32_t u32() { std::uint32_t v; take(&v, 4); return v; }
     std::int32_t i32() { std::int32_t v; take(&v, 4); return v; }
     std::int64_t i64() { std::int64_t v; take(&v, 8); return v; }
+    std::uint64_t u64() { std::uint64_t v; take(&v, 8); return v; }
     std::string text() {
         const auto size = u32();
         if (size > bytes_.size() - at_) throw WireError("launchd: truncated message");
