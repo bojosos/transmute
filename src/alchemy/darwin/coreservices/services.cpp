@@ -4,11 +4,9 @@
 #include <cstdio>
 
 // System-service gaps of Chrome's framework and helpers:
-// - ApplicationServices, accessibility client (AXUIElement / AXObserver):
-//   AXValue, AXTextMarker and AXTextMarkerRange are real values;
-//   AXUIElementCreateApplication makes a real element, but no accessibility
-//   server answers, so every message to another process fails with
-//   kAXErrorCannotComplete and observers cannot be created.
+// - ApplicationServices, accessibility values: AXValue, AXTextMarker and
+//   AXTextMarkerRange are real values (the AXUIElement / AXObserver client
+//   for this process's own tree is applicationservices/ax_client.cpp).
 //   UAZoomChangeFocus has no Zoom to inform (noErr: Zoom is not enabled).
 // - CoreServices / Carbon: Apple Event descriptors are apple_events.cpp's
 //   (called in place); LaunchServices registration
@@ -31,7 +29,6 @@ using fill::core_foundation;
 using fill::core_services;
 using fill::status;
 
-constexpr std::int32_t ax_cannot_complete = -25204, ax_illegal_argument = -25201;
 constexpr std::int32_t event_loop_timed_out = -9875, event_not_handled = -9874;
 
 // <HIServices/AXValue.h> kAXValueType*: CGPoint 1, CGSize 2, CGRect 3, CFRange 4, AXError 5.
@@ -45,7 +42,6 @@ std::size_t ax_value_size(std::uint64_t type) {
 }
 
 struct AxValue final : ObjectPayload { std::uint64_t type{}; std::vector<std::uint8_t> bytes; };
-struct AxElement final : ObjectPayload { std::int64_t pid{}; };
 struct TextMarker final : ObjectPayload { std::vector<std::uint8_t> bytes; };
 struct TextMarkerRange final : ObjectPayload { Address start{}, end{}; };   // retained markers
 
@@ -54,16 +50,13 @@ struct TextMarkerRange final : ObjectPayload { Address start{}, end{}; };   // r
 void Provider::install_services() {
     // ---------------------------------------------------------------- AX client
     const auto value_class = cls(application_services, "__AXValue", "NSObject");
-    const auto element_class = cls(application_services, "__AXUIElement", "NSObject");
     const auto marker_class = cls(application_services, "__AXTextMarker", "NSObject");
     const auto range_class = cls(application_services, "__AXTextMarkerRange", "NSObject");
     // CFGetTypeID values for the HIServices types (Chrome range 0x700).
     register_type(value_class, static_cast<fill::TypeId>(0x700));
-    register_type(element_class, static_cast<fill::TypeId>(0x701));
     register_type(marker_class, static_cast<fill::TypeId>(0x702));
     register_type(range_class, static_cast<fill::TypeId>(0x703));
     constant(application_services, "_AXValueGetTypeID", 0x700);
-    constant(application_services, "_AXUIElementGetTypeID", 0x701);
     constant(application_services, "_AXTextMarkerGetTypeID", 0x702);
     constant(application_services, "_AXTextMarkerRangeGetTypeID", 0x703);
     raw(application_services, "_AXValueCreate", [this, value_class](CpuState& s, GuestMemory& m) {
@@ -87,26 +80,6 @@ void Provider::install_services() {
         m.write_bytes(s.x[2], value->bytes);
         s.x[0] = 1;
     });
-    raw(application_services, "_AXUIElementCreateApplication", [this, element_class](CpuState& s, GuestMemory&) {
-        const auto object = objc.allocate(element_class);
-        objc.host_state<AxElement>(object)->pid = static_cast<std::int32_t>(s.x[0]);
-        s.x[0] = object;
-    });
-    // Messages to an element: no accessibility server answers.
-    failure(application_services, "_AXUIElementCopyAttributeValue", ax_cannot_complete, {2});
-    failure(application_services, "_AXUIElementCopyAttributeNames", ax_cannot_complete, {1});
-    failure(application_services, "_AXUIElementCopyActionNames", ax_cannot_complete, {1});
-    failure(application_services, "_AXUIElementCopyParameterizedAttributeNames", ax_cannot_complete, {1});
-    failure(application_services, "_AXUIElementCopyParameterizedAttributeValue", ax_cannot_complete, {3});
-    failure(application_services, "_AXUIElementSetAttributeValue", ax_cannot_complete);
-    failure(application_services, "_AXUIElementPerformAction", ax_cannot_complete);
-    // AXObserverCreateWithInfoCallback(pid, callback, AXObserverRef *): no
-    // notification can ever be delivered, so no observer is created.
-    failure(application_services, "_AXObserverCreateWithInfoCallback", ax_cannot_complete, {2});
-    failure(application_services, "_AXObserverCreate", ax_cannot_complete, {2});
-    failure(application_services, "_AXObserverAddNotification", ax_illegal_argument);   // only a NULL observer can exist
-    failure(application_services, "_AXObserverRemoveNotification", ax_illegal_argument);
-    constant(application_services, "_AXObserverGetRunLoopSource", 0);
     // The process is not a trusted accessibility client (no accessibility
     // server exists to trust it); kAXTrustedCheckOptionPrompt shows nothing.
     constant(application_services, "_AXIsProcessTrusted", 0);
