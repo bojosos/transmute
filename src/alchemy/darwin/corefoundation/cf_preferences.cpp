@@ -32,6 +32,14 @@
 // executable name). Files are binary property lists, as cfprefsd writes them;
 // both encodings are read. Values are cached per domain and written by the
 // synchronize calls; an unmodified domain is re-read from disk then.
+//
+// Managed (forced) preferences, as configuration profiles install them, are
+// read from /Library/Managed Preferences/<user>/<domain>.plist, then
+// /Library/Managed Preferences/<domain>.plist (ALCHEMY_MANAGED_PREFERENCES in
+// the environment names another directory). They come first in every search,
+// are never written, are re-read when the file changes, and
+// CFPreferencesAppValueIsForced / -objectIsForcedForKey: report them. Without
+// such files nothing is forced.
 namespace alchemy::export_fill {
 namespace {
 
@@ -49,6 +57,8 @@ struct Domain {
     std::filesystem::path file;
     Plist values{Plist::Kind::dictionary};
     bool loaded{}, dirty{}, writable{true};
+    bool managed{};                                  // a managed (forced) domain: re-read when the file changes
+    std::filesystem::file_time_type stamp{};
 };
 
 class Preferences {
@@ -71,6 +81,41 @@ public:
         }
         load(value, false);
         return value;
+    }
+    // The managed (forced) domains of `application`: the user's, then everyone's.
+    std::vector<Domain*> managed(const std::string& application) {
+        std::vector<Domain*> list;
+        auto directory = environment_value(process_, "ALCHEMY_MANAGED_PREFERENCES");
+        if (directory.empty()) directory = "/Library/Managed Preferences";
+        while (directory.size() > 1 && directory.back() == '/') directory.pop_back();
+        for (const bool per_user : {true, false}) {
+            const auto user = user_name();
+            if (per_user && user.empty()) continue;
+            const auto path = (per_user ? directory + "/" + user : directory) + "/" + application + ".plist";
+            std::lock_guard lock(mutex_);
+            auto& value = domains_["managed|" + path];
+            if (value.file.empty()) {
+                value.file = host_path(process_, path);
+                value.writable = false;
+                value.managed = true;
+            }
+            std::error_code error;
+            const auto stamp = std::filesystem::last_write_time(value.file, error);
+            const auto current = error ? std::filesystem::file_time_type{} : stamp;
+            load(value, value.loaded && current != value.stamp);
+            value.stamp = current;
+            list.push_back(&value);
+        }
+        return list;
+    }
+    // Whether `key` has a forced value for `application` (or for every application).
+    bool forced(const std::string& key, const std::string& application) {
+        for (const auto& name : {application, std::string(".GlobalPreferences")})
+            for (auto* domain : managed(name)) {
+                std::lock_guard lock(mutex_);
+                if (domain->values.find(key)) return true;
+            }
+        return false;
     }
     std::mutex& mutex() { return mutex_; }
     static void load(Domain& value, bool force) {
@@ -126,11 +171,22 @@ public:
         while (value.size() > 1 && value.back() == '/') value.pop_back();
         return value;
     }
+    // The user's short name (USER, else the home directory's last component).
+    std::string user_name() {
+        auto value = environment_value(process_, "USER");
+        if (value.empty()) {
+            const auto directory = home();
+            const auto slash = directory.rfind('/');
+            value = slash == std::string::npos ? directory : directory.substr(slash + 1);
+        }
+        return value;
+    }
     bool is(std::uint64_t string, std::string_view name) { return string && cf_.utf8(string) == name; }
 
-    // The CFPreferencesCopyAppValue search list.
+    // The CFPreferencesCopyAppValue search list: the forced values first.
     std::vector<Domain*> search(const std::string& application) {
-        std::vector<Domain*> list;
+        std::vector<Domain*> list = managed(application);
+        for (auto* domain : managed(".GlobalPreferences")) list.push_back(domain);
         for (const auto& [app, any_user, current_host] : std::array<std::tuple<std::string, bool, bool>, 6>{{
                  {application, false, true}, {application, false, false}, {".GlobalPreferences", false, true},
                  {".GlobalPreferences", false, false}, {application, true, false}, {".GlobalPreferences", true, false}}})
@@ -285,6 +341,10 @@ void install_cf_preferences(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) 
             s.x[0] = !number ? 0 : boolean ? (*number != 0 ? 1 : 0) : static_cast<std::uint64_t>(static_cast<std::int64_t>(*number));
         });
     }
+    // Boolean CFPreferencesAppValueIsForced(CFStringRef key, CFStringRef applicationID): a managed value.
+    function("_CFPreferencesAppValueIsForced", [&cf, preferences](CpuState& s, GuestMemory&) {
+        s.x[0] = s.x[0] && s.x[1] && preferences->forced(cf.utf8(s.x[0]), preferences->application_name(s.x[1])) ? 1 : 0;
+    });
     // CFArrayRef CFPreferencesCopyKeyList(app, user, host): NULL when the domain is empty.
     function("_CFPreferencesCopyKeyList", [&process, &cf, preferences](CpuState& s, GuestMemory&) {
         auto& domain = preferences->domain(s.x[0], s.x[1], s.x[2]);
@@ -358,6 +418,12 @@ void install_cf_preferences(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) 
     // application (or suite), added suites, the global domain, registration.
     const auto lookup = [preferences, state](std::uint64_t object, const std::string& key) -> std::optional<Plist> {
         const auto defaults = state(object);
+        // Forced values win over everything, the argument domain included (they cannot be overridden).
+        for (const auto& name : {defaults->suite.empty() ? preferences->current_application() : defaults->suite, std::string(".GlobalPreferences")})
+            for (auto* domain : preferences->managed(name)) {
+                std::lock_guard lock(preferences->mutex());
+                if (const auto* value = domain->values.find(key)) return *value;
+            }
         if (const auto* value = defaults->arguments.find(key)) return *value;
         std::vector<std::string> names{defaults->suite.empty() ? preferences->current_application() : defaults->suite};
         names.insert(names.end(), defaults->suites.begin(), defaults->suites.end());
@@ -519,7 +585,10 @@ void install_cf_preferences(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) 
         std::lock_guard lock(preferences->mutex());
         s.x[0] = Preferences::synchronize(domain) ? 1 : 0;
     }, false, "B@:");
-    method("objectIsForcedForKey:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:@");   // no managed preferences
+    method("objectIsForcedForKey:", [&cf, preferences, state](CpuState& s, GuestMemory&) {
+        const auto defaults = state(s.x[0]);
+        s.x[0] = s.x[2] && preferences->forced(cf.utf8(s.x[2]), defaults->suite.empty() ? preferences->current_application() : defaults->suite) ? 1 : 0;
+    }, false, "B@:@");
     method("dictionaryRepresentation", [&process, &cf, preferences, state, autorelease](CpuState& s, GuestMemory&) {
         const auto defaults = state(s.x[0]);
         Plist merged = defaults->registration;
@@ -596,7 +665,10 @@ void install_cf_preferences(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) 
         else defaults->volatile_domains.erase(name);
         s.x[0] = 0;
     }, false, "v@:@");
-    method("objectIsForcedForKey:inDomain:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:@@");   // no managed preferences
+    method("objectIsForcedForKey:inDomain:", [&cf, preferences](CpuState& s, GuestMemory&) {
+        const auto domain = s.x[3] ? cf.utf8(s.x[3]) : std::string();
+        s.x[0] = s.x[2] && !domain.empty() && preferences->forced(cf.utf8(s.x[2]), domain == "NSGlobalDomain" ? ".GlobalPreferences" : domain) ? 1 : 0;
+    }, false, "B@:@@");
     // URLs: stored as their absolute strings; a stored path ("/..." or "~/...") reads back as a file URL.
     method("setURL:forKey:", [&objc](CpuState& s, GuestMemory&) {
         CallRegs registers{};

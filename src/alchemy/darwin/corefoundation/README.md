@@ -80,7 +80,11 @@
   * kCFCopyStringDictionaryKeyCallBacks and kCFCopyStringSetCallBacks are not
     exported (collections retain their keys, and these would copy them);
   * non-file URLs without the network provider;
-  * managed preferences (none exist);
+  * managed preferences are read, never written: /Library/Managed
+    Preferences/<user>/<domain>.plist and /Library/Managed
+    Preferences/<domain>.plist in the guest root (ALCHEMY_MANAGED_PREFERENCES
+    names another directory) win over the user's values and report as forced;
+    without them nothing is forced;
   * kCFStringEncodingNonLossyASCII and kCFStringEncodingNextStepLatin, which
     have no ICU converter (CFStringIsEncodingAvailable says so);
   * mutating an immutable string, which stops where CF would log and ignore

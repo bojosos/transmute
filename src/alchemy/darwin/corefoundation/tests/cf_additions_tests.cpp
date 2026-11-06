@@ -5,6 +5,8 @@
 #include "alchemy/darwin/kit/export_fill/tests/export_fill_test_kit.hpp"
 #include "alchemy/darwin/corefoundation/cf_plist.hpp"
 
+#include <fstream>
+
 namespace {
 
 void test_plist() {
@@ -223,6 +225,29 @@ void test_guest_preferences(Fixture& f) {
         const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> registered{{{f.cf.string("Fallback"), f.cf.integer(5)}}};
         send(suite, "registerDefaults:", {f.cf.dictionary(registered)});
         require(send(suite, "integerForKey:", {f.cf.string("Fallback")}).x0 == 5, "registration domain");
+        // Managed (forced) preferences: everyone's and this user's files win, and say they are forced.
+        const auto managed = std::filesystem::temp_directory_path() / "alchemy_export_fill_managed";
+        std::filesystem::remove_all(managed, ignored);
+        std::filesystem::create_directories(managed / "alchemytest");
+        const auto plist = [](const std::filesystem::path& path, const std::string& body) {
+            std::ofstream(path) << R"(<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>)" << body << "</dict></plist>";
+        };
+        require(f.call(cf, "_CFPreferencesAppValueIsForced", {f.cf.string("RenderMode"), app}) == 0, "nothing is forced without managed files");
+        plist(managed / "com.example.alchemytest.plist", "<key>RenderMode</key><string>CPU</string>");
+        plist(managed / "alchemytest" / "com.example.alchemytest.plist", "<key>Threads</key><integer>2</integer>");
+        f.process.environment.push_back("ALCHEMY_MANAGED_PREFERENCES=" + alchemy::guest_path_string(managed));
+        f.process.environment.push_back("USER=alchemytest");
+        require(f.cf.utf8(f.call(cf, "_CFPreferencesCopyAppValue", {f.cf.string("RenderMode"), app})) == "CPU" &&
+                f.call(cf, "_CFPreferencesAppValueIsForced", {f.cf.string("RenderMode"), app}) == 1 &&
+                f.call(cf, "_CFPreferencesAppValueIsForced", {f.cf.string("Denoise"), app}) == 0, "a forced value wins and is forced");
+        require(f.cf.utf8(send(suite, "objectForKey:", {f.cf.string("RenderMode")}).x0) == "CPU" &&
+                send(suite, "objectIsForcedForKey:", {f.cf.string("RenderMode")}).x0 == 1 &&
+                send(suite, "integerForKey:", {f.cf.string("Threads")}).x0 == 2 &&
+                send(suite, "objectIsForcedForKey:inDomain:", {f.cf.string("Threads"), app}).x0 == 1 &&
+                send(suite, "objectIsForcedForKey:", {f.cf.string("Denoise")}).x0 == 0, "NSUserDefaults sees the forced values");
+        std::filesystem::remove_all(managed, ignored);
+        require(f.cf.utf8(f.call(cf, "_CFPreferencesCopyAppValue", {f.cf.string("RenderMode"), app})) == "GPU" &&
+                send(suite, "integerForKey:", {f.cf.string("Threads")}).x0 == 12, "removed managed files force nothing");
         require(send(suite, "synchronize").x0 == 1, "NSUserDefaults synchronize");
         const auto fresh = send(f.objc.allocate(defaults_class), "initWithSuiteName:", {app}).x0;
         require(send(fresh, "integerForKey:", {f.cf.string("Threads")}).x0 == 12 && send(fresh, "integerForKey:", {f.cf.string("Fallback")}).x0 == 0,

@@ -117,7 +117,7 @@ void Provider::install_foundation() {
             static_cast<void>(bridge->call_address(applier, arguments));
         }
     });
-    constant(core_foundation, "_CFPreferencesAppValueIsForced", 0);   // no managed (forced) preferences
+    // CFPreferencesAppValueIsForced: cf_preferences.cpp (managed preferences).
     // void CFStringAppend(CFMutableStringRef, CFStringRef)
     raw(core_foundation, "_CFStringAppend", [this](CpuState& s, GuestMemory&) {
         if (!s.x[0] || !s.x[1]) return;
