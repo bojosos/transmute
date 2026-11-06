@@ -93,7 +93,7 @@ template<typename A> void io(A& a, Type& v) {
 }
 template<typename A> void io(A& a, Descriptor& v) { io(a, v.set); io(a, v.binding); io(a, v.type); io(a, v.count); }
 template<typename A> void io(A& a, BufferBinding::Argument& v) {
-    io(a, v.name); io(a, v.id); io(a, v.count); io(a, v.offset); io(a, v.stride); io(a, v.pointer); io(a, v.type);
+    io(a, v.name); io(a, v.id); io(a, v.count); io(a, v.offset); io(a, v.stride); io(a, v.pointer); io(a, v.type); io(a, v.resource);
 }
 template<typename A> void io(A& a, BufferBinding& v) {
     io(a, v.index); io(a, v.name); io(a, v.space); io(a, v.access); io(a, v.type); io(a, v.reference);
@@ -127,7 +127,7 @@ template<typename A> void io(A& a, Reflection& v) {
     io(a, v.function_constants);
     io(a, v.builtins); io(a, v.stage_in); io(a, v.outputs); io(a, v.inputs); io(a, v.color_outputs); io(a, v.color_inputs); io(a, v.depth);
     io(a, v.writes_sample_mask); io(a, v.writes_stencil); io(a, v.early_fragment_tests); io(a, v.discards);
-    io(a, v.max_total_threads_per_threadgroup); io(a, v.threadgroup_memory); io(a, v.uses_simdgroup_operations);
+    io(a, v.max_total_threads_per_threadgroup); io(a, v.threadgroup_memory); io(a, v.uses_simdgroup_operations); io(a, v.bindless);
     io(a, v.notes);
 }
 template<typename A> void io(A& a, Function& v) { io(a, v.name); io(a, v.stage); io(a, v.spirv); io(a, v.reflection); }

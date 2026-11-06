@@ -1,4 +1,6 @@
 #include "alchemy/darwin/metal/resources.hpp"
+
+#include "alchemy/darwin/metal/bindless.hpp"
 #include "alchemy/darwin/metal/interop.hpp"
 
 #include <algorithm>
@@ -504,9 +506,12 @@ Texture::~Texture() {
     const auto handle = owns_image ? image : VK_NULL_HANDLE;
     auto allocation = memory;
     auto buffer_view_handle = buffer_view;
+    const auto slot = bindless_slot_;
     if (handle) owner->cancel_initial_layout(handle);
     if (views.empty() && !handle && !buffer_view_handle) return;
-    owner->defer([owner, views, handle, allocation, buffer_view_handle]() mutable {
+    owner->defer([owner, views, handle, allocation, buffer_view_handle, slot]() mutable {
+        if (slot)
+            if (auto* bindless = Bindless::of(*owner)) bindless->remove_texture(slot);
         for (const auto value : views) owner->vk.vkDestroyImageView(owner->device, value, nullptr);
         if (buffer_view_handle) owner->vk.vkDestroyBufferView(owner->device, buffer_view_handle, nullptr);
         if (handle) owner->vk.vkDestroyImage(owner->device, handle, nullptr);
@@ -704,7 +709,8 @@ std::unordered_map<std::uint64_t, std::weak_ptr<Sampler>> sampler_tokens;
 
 std::uint64_t sampler_token(const std::shared_ptr<Sampler>& sampler) {
     if (!sampler) return 0;
-    const auto token = reinterpret_cast<std::uint64_t>(sampler.get());
+    const auto slot = sampler->bindless_slot();
+    const auto token = slot ? std::uint64_t{slot} : reinterpret_cast<std::uint64_t>(sampler.get());
     std::lock_guard lock(sampler_tokens_mutex);
     sampler_tokens[token] = sampler;
     return token;
@@ -755,13 +761,39 @@ std::shared_ptr<Sampler> Sampler::with_lod_clamp(const std::shared_ptr<Sampler>&
 Sampler::~Sampler() {
     {
         std::lock_guard lock(sampler_tokens_mutex);
-        const auto found = sampler_tokens.find(reinterpret_cast<std::uint64_t>(this));
-        if (found != sampler_tokens.end() && found->second.expired()) sampler_tokens.erase(found);
+        for (const auto token : {reinterpret_cast<std::uint64_t>(this), std::uint64_t{slot_}}) {
+            const auto found = token ? sampler_tokens.find(token) : sampler_tokens.end();
+            if (found != sampler_tokens.end() && found->second.expired()) sampler_tokens.erase(found);
+        }
     }
     if (!sampler) return;
     Device* owner = device.get();
     const auto handle = sampler;
-    owner->defer([owner, handle] { owner->vk.vkDestroySampler(owner->device, handle, nullptr); });
+    const auto slot = slot_;
+    owner->defer([owner, handle, slot] {
+        if (slot)
+            if (auto* bindless = Bindless::of(*owner)) bindless->remove_sampler(slot);
+        owner->vk.vkDestroySampler(owner->device, handle, nullptr);
+    });
+}
+
+std::uint32_t Sampler::bindless_slot() {
+    std::lock_guard lock(slot_mutex_);
+    if (!slot_)
+        if (auto* bindless = Bindless::of(*device)) slot_ = bindless->add_sampler(sampler);
+    return slot_;
+}
+
+std::uint32_t Texture::bindless_slot() {
+    // Drawables and other wrapped images, and IOSurface-backed textures, are
+    // brought up to date (layout, surface pages) where a command buffer binds
+    // them directly; an argument buffer would bypass that: no slot.
+    const Texture& root = parent ? *parent : *this;
+    if (!root.owns_image || root.surface) return 0;
+    std::lock_guard lock(views_mutex_);
+    if (!bindless_slot_ && (view || storage_view) && !buffer_view)
+        if (auto* bindless = Bindless::of(*device)) bindless_slot_ = bindless->add_texture(view, storage_view);
+    return bindless_slot_;
 }
 
 bool Heap::reserve(std::uint64_t bytes) {

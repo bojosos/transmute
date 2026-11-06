@@ -3,6 +3,7 @@
 // written to the MSL contract's fixed resource model and compiled to SPIR-V
 // at build time; their Reflection is written by hand exactly as the MSL
 // compiler reports it. Exit code 77 (ctest SKIP) when no device exists.
+#include "alchemy/darwin/metal/bindless.hpp"
 #include "alchemy/darwin/metal/commands.hpp"
 #include "alchemy/darwin/metal/device.hpp"
 #include "alchemy/darwin/metal/formats.hpp"
@@ -1148,6 +1149,118 @@ fragment float4 bary_linear(Linear in [[stage_in]]) { return float4(in.b, 1.0); 
     }
 }
 
+// Argument buffers holding textures and samplers (tier 2, bindless.hpp): a
+// fragment samples one of two 1x1 textures (red, green) picked at run time
+// from an argument buffer that also holds the sampler, by MTLResourceID; a
+// kernel writes a storage texture named in an argument buffer.
+void test_bindless_argument_buffers(const std::shared_ptr<metal::Device>& device) {
+    if (!metal::Bindless::of(*device)) {
+        std::cout << "SKIP: argument buffers with textures (no bindless descriptor set on this device)\n";
+        return;
+    }
+    const auto compiled = msl::compile(R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VertexIn { float2 position [[attribute(0)]]; };
+struct VertexOut { float4 position [[position]]; };
+vertex VertexOut ab_vertex(VertexIn in [[stage_in]]) {
+    VertexOut out;
+    out.position = float4(in.position, 0.0, 1.0);
+    return out;
+}
+struct Textures {
+    array<texture2d<float>, 2> images [[id(0)]];
+    sampler nearest [[id(2)]];
+};
+fragment float4 ab_pick(VertexOut in [[stage_in]], constant Textures& t [[buffer(0)]], constant uint& which [[buffer(1)]]) {
+    return t.images[which].sample(t.nearest, float2(0.5));
+}
+struct Target { texture2d<float, access::write> image [[id(0)]]; };
+kernel void ab_fill(constant Target& target [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    target.image.write(float4(0.25, 0.5, 0.75, 1.0), gid);
+}
+)", {});
+    expect(compiled.success(), "bindless MSL compiles: " + msl::format_diagnostics(compiled.diagnostics));
+    if (!compiled.success()) return;
+    const auto function = [&](std::string_view name) {
+        for (const auto& item : compiled.functions)
+            if (item.name == name) return std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(item));
+        throw std::runtime_error("missing function " + std::string(name));
+    };
+    for (const auto& item : compiled.functions)
+        expect(item.name == "ab_vertex" || item.reflection.bindless, item.name + " reads the bindless set");
+
+    // Two 1x1 textures and their argument buffer: images[0], images[1], the sampler.
+    const auto texel = [&](std::array<std::uint8_t, 4> rgba) {
+        metal::TextureDescriptor d;
+        d.width = d.height = 1;
+        auto texture = metal::Texture::create(device, d);
+        texture->replace_region({0, 0, 0, 1, 1, 1}, 0, 0, std::span<const std::uint8_t>(rgba.data(), rgba.size()), 4, 0);
+        return texture;
+    };
+    const auto red = texel({255, 0, 0, 255}), green = texel({0, 255, 0, 255});
+    const auto sampler = metal::Sampler::create(device, metal::SamplerDescriptor{});
+    const std::uint64_t ids[3] = {red->bindless_slot(), green->bindless_slot(), metal::sampler_token(sampler)};
+    expect(ids[0] && ids[1] && ids[0] != ids[1] && ids[2], "textures and the sampler get bindless slots");
+    const auto arguments = shared_buffer(device, sizeof(ids));
+    std::memcpy(arguments->contents(), ids, sizeof(ids));
+
+    metal::RenderPipelineDescriptor descriptor;
+    descriptor.vertex = function("ab_vertex");
+    descriptor.fragment = function("ab_pick");
+    descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+    descriptor.attributes[0] = metal::VertexAttribute{29, 0, 0};
+    descriptor.layouts[0] = metal::VertexLayout{8, 1, 1};
+    descriptor.label = "bindless pick";
+    const auto pipeline = metal::RenderPipeline::create(device, descriptor);
+    expect(pipeline->bindless, "the pipeline layout has the bindless set");
+    for (const std::uint32_t which : {1U, 0U}) {
+        metal::RenderPass pass;
+        pass.colors[0].texture = render_target(device);
+        pass.colors[0].load_action = 2;
+        pass.colors[0].store_action = 1;
+        pass.colors[0].clear_color = {0, 0, 1, 1};
+        const auto readback = draw_top_half(device, pass, {pipeline}, [&](metal::CommandBuffer& commands, std::size_t) {
+            commands.set_buffer(metal::Stage::fragment, 0, arguments, 0);
+            commands.set_bytes(metal::Stage::fragment, 1, {reinterpret_cast<const std::uint8_t*>(&which), sizeof(which)});
+        });
+        const auto inside = pixel(readback->contents(), 256, 32, 4), outside = pixel(readback->contents(), 256, 32, 60);
+        const std::array<std::uint8_t, 4> expected = which ? std::array<std::uint8_t, 4>{0, 255, 0, 255}
+                                                           : std::array<std::uint8_t, 4>{255, 0, 0, 255};
+        expect(inside == expected, "the argument buffer's texture " + std::to_string(which) + " is sampled: " + format_pixel(inside));
+        expect(outside == std::array<std::uint8_t, 4>{0, 0, 255, 255}, "clear colour outside: " + format_pixel(outside));
+    }
+
+    // A storage texture named in an argument buffer, written by a kernel.
+    metal::TextureDescriptor target_descriptor;
+    target_descriptor.width = target_descriptor.height = 4;
+    target_descriptor.usage = metal::texture_usage::shader_read | metal::texture_usage::shader_write;
+    target_descriptor.options = {metal::StorageMode::private_};
+    const auto target = metal::Texture::create(device, target_descriptor);
+    const std::uint64_t target_id = target->bindless_slot();
+    expect(target_id != 0, "the storage texture gets a bindless slot");
+    const auto target_arguments = shared_buffer(device, 8);
+    std::memcpy(target_arguments->contents(), &target_id, 8);
+    const auto kernel = metal::ComputePipeline::create(device, function("ab_fill"));
+    expect(kernel->bindless, "the kernel's layout has the bindless set");
+    auto readback = shared_buffer(device, 4 * 256);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_compute(false);
+    commands->set_compute_pipeline(kernel);
+    commands->set_buffer(metal::Stage::kernel, 0, target_arguments, 0);
+    commands->dispatch_threads({4, 4, 1}, {4, 4, 1});
+    commands->end_encoding();
+    commands->begin_blit();
+    commands->copy_texture_to_buffer(target, 0, 0, {0, 0, 0, 4, 4, 1}, readback, 0, 256, 4 * 256);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "bindless kernel command buffer completes");
+    const auto written = pixel(readback->contents(), 256, 3, 3);
+    const auto near = [](std::uint8_t value, int expected) { return std::abs(static_cast<int>(value) - expected) <= 1; };
+    expect(near(written[0], 64) && near(written[1], 128) && near(written[2], 191) && written[3] == 255,
+           "the kernel wrote the argument buffer's storage texture: " + format_pixel(written));
+}
+
 // Framebuffer fetch: a [[color(1)]] fragment input reads what an earlier
 // draw of the same render pass wrote to color attachment 1 (input
 // attachment at binding 224 + 1, dynamic rendering local read).
@@ -1293,6 +1406,7 @@ int main() {
         test_framebuffer_fetch(device);
         test_depth_resolve_filters(device);
         test_barycentric_coordinates(device);
+        test_bindless_argument_buffers(device);
         test_argument_buffer_samplers(device);
 #else
         std::cout << "SKIP: shader tests (glslangValidator was not found at configure time)\n";

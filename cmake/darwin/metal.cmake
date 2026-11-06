@@ -20,6 +20,7 @@ if(ALCHEMY_VULKAN_INCLUDE)
         src/alchemy/darwin/metal/external_memory.cpp
         src/alchemy/darwin/metal/shared_events.cpp
         src/alchemy/darwin/metal/residency.cpp
+        src/alchemy/darwin/metal/bindless.cpp
         # newLibraryWithData: through the AIR translator DLL, when present
         # (external/m2v-capi, LGPL, loaded at run time; THIRD_PARTY_NOTICES.md).
         src/alchemy/darwin/metal/json.cpp

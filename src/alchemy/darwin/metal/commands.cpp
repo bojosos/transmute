@@ -1,5 +1,7 @@
 #include "alchemy/darwin/metal/commands.hpp"
 
+#include "alchemy/darwin/metal/bindless.hpp"
+
 #include "alchemy/host/time.hpp"
 #include "alchemy/perf.hpp"
 
@@ -1358,6 +1360,7 @@ void CommandBuffer::flush_render(std::uint32_t primitive) {
     if (render_pipeline_->layout != bound_layout_) {
         bound_layout_ = render_pipeline_->layout;
         for (auto& stage : render_stages_) stage.dirty = true;
+        if (render_pipeline_->bindless) Bindless::of(*device)->bind(command, VK_PIPELINE_BIND_POINT_GRAPHICS, bound_layout_);
     }
     if (primitive != bound_topology_) {
         device->vk.vkCmdSetPrimitiveTopology(command, primitive_topology(primitive));
@@ -1534,7 +1537,11 @@ void CommandBuffer::flush_compute(const std::array<std::uint32_t, 3>& threads, c
         bound_pipeline_ = pipeline;
         perf::add(perf::mtl_pipeline_binds);
     }
-    if (compute_pipeline_->layout != bound_layout_) { bound_layout_ = compute_pipeline_->layout; compute_stage_.dirty = true; }
+    if (compute_pipeline_->layout != bound_layout_) {
+        bound_layout_ = compute_pipeline_->layout;
+        compute_stage_.dirty = true;
+        if (compute_pipeline_->bindless) Bindless::of(*device)->bind(command, VK_PIPELINE_BIND_POINT_COMPUTE, bound_layout_);
+    }
     if (compute_stage_.dirty) {
         const auto set = write_set(compute_stage_, compute_pipeline_->stage, &compute_pipeline_->function->reflection());
         if (set) device->vk.vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, bound_layout_, 0, 1, &set, 0, nullptr);

@@ -13,6 +13,7 @@
 //     them.
 #include "alchemy/gui/tests/fill_fixture.hpp"
 
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -303,6 +304,59 @@ kernel void archived(device uint* out [[buffer(0)]], uint i [[thread_position_in
             "a missing archive file fails with MTLBinaryArchiveErrorInvalidFile");
 }
 
+// Tier 2 argument buffers: an encoder made from a function's argument
+// buffer of a texture, a sampler and a buffer writes the texture's and the
+// sampler's gpuResourceID (bindless slots) and the buffer's address at the
+// members' offsets; one made from MTLArgumentDescriptors lays a texture out
+// the same way.
+void tier2_arguments(Fixture& f) {
+    const auto d = device(f);
+    if (!d) { std::cout << "  no Metal device (no Vulkan 1.3 GPU): skipped\n"; return; }
+    if (f.send(d, "argumentBuffersSupport") != 1) { std::cout << "  argumentBuffersSupport is Tier1: skipped\n"; return; }
+    const auto error = f.block(8);
+    const auto library = f.send(d, "newLibraryWithSource:options:error:", {f.cf.string(R"(
+#include <metal_stdlib>
+using namespace metal;
+struct Material { texture2d<float> image [[id(0)]]; sampler nearest [[id(1)]]; device float* out [[id(2)]]; };
+kernel void tier2(constant Material& m [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    m.out[i] = m.image.sample(m.nearest, float2(0.5), level(0)).x;
+}
+)"), 0, error});
+    require(library != 0, "tier 2 kernel compiles");
+    const auto function = f.send(library, "newFunctionWithName:", {f.cf.string("tier2")});
+    const auto encoder = f.send(function, "newArgumentEncoderWithBufferIndex:", {0});
+    require(encoder != 0 && f.send(encoder, "encodedLength") == 24, "a 24-byte argument buffer (three 8-byte members)");
+    const auto arguments = f.send(d, "newBufferWithLength:options:", {24, 0});
+    static_cast<void>(f.send(encoder, "setArgumentBuffer:offset:", {arguments, 0}));
+    const auto texture_descriptor = make(f, "MTLTextureDescriptor");
+    static_cast<void>(f.send(texture_descriptor, "setWidth:", {4}));
+    static_cast<void>(f.send(texture_descriptor, "setHeight:", {4}));
+    const auto texture = f.send(d, "newTextureWithDescriptor:", {texture_descriptor});
+    const auto sampler = f.send(d, "newSamplerStateWithDescriptor:", {make(f, "MTLSamplerDescriptor")});
+    const auto out = f.send(d, "newBufferWithLength:options:", {64, 0});
+    static_cast<void>(f.send(encoder, "setTexture:atIndex:", {texture, 0}));
+    static_cast<void>(f.send(encoder, "setSamplerState:atIndex:", {sampler, 1}));
+    static_cast<void>(f.send(encoder, "setBuffer:offset:atIndex:", {out, 0, 2}));
+    const auto contents = f.send(arguments, "contents");
+    const auto texture_id = f.send(texture, "gpuResourceID"), sampler_id = f.send(sampler, "gpuResourceID");
+    require(texture_id != 0 && sampler_id != 0, "the texture and the sampler have MTLResourceIDs");
+    require(f.engine.read64(contents) == texture_id && f.engine.read64(contents + 8) == sampler_id &&
+                f.engine.read64(contents + 16) == f.send(out, "gpuAddress"),
+            "setTexture:/setSamplerState:/setBuffer: write the resource IDs and the address");
+    // MTLArgumentDescriptor: a texture member is an 8-byte MTLResourceID too.
+    const auto texture_argument = make(f, "MTLArgumentDescriptor");
+    static_cast<void>(f.send(texture_argument, "setDataType:", {58}));   // MTLDataTypeTexture
+    static_cast<void>(f.send(texture_argument, "setIndex:", {0}));
+    const std::array<Address, 1> descriptors{texture_argument};
+    const auto by_descriptor = f.send(d, "newArgumentEncoderWithArguments:", {f.cf.array(descriptors)});
+    require(by_descriptor != 0 && f.send(by_descriptor, "encodedLength") == 8, "an MTLArgumentDescriptor texture takes 8 bytes");
+    static_cast<void>(f.send(by_descriptor, "setArgumentBuffer:offset:", {arguments, 0}));
+    static_cast<void>(f.send(by_descriptor, "setTexture:atIndex:", {texture, 0}));
+    require(f.engine.read64(contents) == texture_id, "the descriptor-made encoder writes the same ID");
+    for (const auto object : {encoder, by_descriptor, arguments, texture, sampler, out, function, library})
+        static_cast<void>(f.send(object, "release"));
+}
+
 // Documented refusals: a dynamic library (supportsDynamicLibraries is NO)
 // fails with MTLLibraryErrorUnsupported, and a texture of a pixel format the
 // device has no format for (ASTC) is nil.
@@ -328,5 +382,5 @@ void refusals(Fixture& f) {
 int main() {
     return run("metal libraries", {{"libraries and argument buffers", libraries}, {"reflection", reflection},
                                     {"precompiled libraries", precompiled}, {"binary archives", archives},
-                                    {"refusals", refusals}});
+                                    {"refusals", refusals}, {"tier 2 argument buffers", tier2_arguments}});
 }

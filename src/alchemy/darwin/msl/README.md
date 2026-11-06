@@ -178,7 +178,18 @@ lowering -> SPIR-V module + Reflection     lower.cpp, spirv_builder.cpp
     read from memory like any buffer; `BufferBinding::arguments` gives
     MTLArgumentEncoder each id's byte offset (MSL size rules, which the
     wrappers `static_assert` against clang's layout) and the struct's length.
-    Textures or samplers next to them are an explicit error.
+  * Textures and samplers in argument buffers (tier 2, M2): such members
+    (and arrays of them) are MTLResourceIDs of 8 bytes (a texture object is
+    `{uint __h, __hi}`, aligned 8). Every texture accessor passes its handle
+    through `__msl_tex_handle(h, kind)` (kind = TextureType | scalar class << 8
+    | access << 12). A constant handle is a `[[texture(n)]]` binding as
+    before; a handle loaded from memory indexes a runtime array of that image
+    type at set `bindless_descriptor_set` (binding 0 sampled, 1 storage),
+    and a loaded sampler handle the sampler array at binding 2, with
+    `NonUniform` indices (`Reflection::bindless`). Handles that mix a
+    binding and a loaded value, and texture atomics or texture buffers read
+    from argument buffers, are explicit errors. Argument buffers of samplers
+    only keep their static binding (above).
   * Framebuffer fetch: a fragment `[[color(n)]]` input (a parameter, or the
     members of a struct parameter such as Blender's `FragmentTileIn`) is an
     `OpImageRead` of a `SubpassData` input attachment n at binding `224 + n`
@@ -307,9 +318,10 @@ loop guards, every WGSL texture kind; ANGLE's function constants (derived
 ones included), guarded depth/sample-mask outputs and parameters, macros
 from `MTLCompileOptions`, and texture environments of thread pointers.
 
-Unsupported (explicit errors): `double`, `bfloat`, run-time selected
-textures/samplers (a handle not constant after inlining), argument buffers
-holding textures, or samplers together with other members, generic pointers stored in memory, array
+Unsupported (explicit errors): `double`, `bfloat`, textures/samplers
+selected at run time among bindings (a phi of `[[texture(n)]]` handles; ones
+read from argument buffers are supported), atomics on textures and texture
+buffers read from argument buffers, generic pointers stored in memory, array
 varyings and array vertex attributes, kernel `[[stage_in]]`,
 centroid and sample interpolation of `[[barycentric_coord]]`, mesh/object/tile/
 visible/intersection functions, ray tracing, imageblocks, `memcpy`/`memset`

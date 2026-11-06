@@ -1397,7 +1397,8 @@ void install_texture() {
     getter("buffer", [](Texture&, TextureState& state) -> std::uint64_t { return state.buffer; }, "@@:");
     getter("bufferOffset", [](Texture& t, TextureState&) -> std::uint64_t { return t.buffer_offset; });
     getter("bufferBytesPerRow", [](Texture& t, TextureState&) -> std::uint64_t { return t.bytes_per_row; });
-    getter("gpuResourceID", [](Texture& t, TextureState&) -> std::uint64_t { return reinterpret_cast<std::uint64_t>(t.view); });
+    // MTLResourceID: the slot in the device's bindless set (0 without one).
+    getter("gpuResourceID", [](Texture& t, TextureState&) -> std::uint64_t { return t.bindless_slot(); });
     getter("rootResource", [](Texture&, TextureState& state) -> std::uint64_t { return state.parent ? state.parent : state.buffer; }, "@@:");
 
     r.method(cls, "replaceRegion:mipmapLevel:withBytes:bytesPerRow:", on<TextureState>(what, [](TextureState& t, CpuState& s, GuestMemory& m) {
@@ -1679,8 +1680,11 @@ void install_library_and_function() {
         // offsets clang gave the struct.
         auto encoder = std::make_shared<ArgumentEncoderState>();
         for (const auto& argument : found->arguments) {
-            const auto kind = argument.pointer ? data_type_pointer
-                                               : static_cast<std::uint32_t>(data_type(reflection, argument.type));
+            using Resource = msl::BufferBinding::Argument::Resource;
+            const auto kind = argument.pointer                         ? data_type_pointer
+                              : argument.resource == Resource::texture ? data_type_texture
+                              : argument.resource == Resource::sampler ? data_type_sampler
+                                                                       : static_cast<std::uint32_t>(data_type(reflection, argument.type));
             for (std::uint32_t element = 0; element < std::max(1U, argument.count); ++element)
                 encoder->slots[argument.id + element] = {argument.offset + element * argument.stride, kind, 1, argument.stride};
         }
@@ -2032,9 +2036,31 @@ void install_argument_encoder() {
     r.method(cls, "setSamplerStates:withRange:", on<ArgumentEncoderState>(what, [sampler_slot](ArgumentEncoderState& a, CpuState& s, GuestMemory& m) {
         for (std::uint64_t index = 0; index < s.x[4]; ++index) sampler_slot(a, s.x[3] + index, m.read64(s.x[2] + 8 * index));
     }), false, "v@:^@{_NSRange=QQ}");
-    // Textures inside argument buffers need a bindless descriptor heap the
-    // MSL contract does not define yet.
-    for (const auto selector : {"setTexture:atIndex:", "setTextures:withRange:", "setRenderPipelineState:atIndex:",
+    // Textures: the texture's MTLResourceID, its slot in the device's
+    // bindless set (bindless.hpp), which shaders index (0 = nil).
+    const auto texture_slot = [slot](ArgumentEncoderState& a, std::uint64_t index, Address object) {
+        const auto found = a.slots.find(static_cast<std::uint32_t>(index));
+        if (found != a.slots.end() && found->second.data_type != data_type_texture)
+            throw std::runtime_error("Alchemy Metal: argument encoder index " + std::to_string(index) + " is not a texture");
+        std::uint64_t id = 0;
+        if (object) {
+            id = texture_of_object(object)->bindless_slot();
+            if (!id)
+                throw std::runtime_error("Alchemy Metal: this texture cannot be in an argument buffer (no bindless descriptor "
+                                         "set on this device, the set is full, or it is a texture buffer, a drawable or "
+                                         "IOSurface-backed)");
+        }
+        std::memcpy(slot(a, index), &id, 8);
+    };
+    r.method(cls, "setTexture:atIndex:", on<ArgumentEncoderState>(what, [texture_slot](ArgumentEncoderState& a, CpuState& s, GuestMemory&) {
+        texture_slot(a, s.x[3], s.x[2]);
+    }), false, "v@:@Q");
+    r.method(cls, "setTextures:withRange:", on<ArgumentEncoderState>(what, [texture_slot](ArgumentEncoderState& a, CpuState& s, GuestMemory& m) {
+        for (std::uint64_t index = 0; index < s.x[4]; ++index) texture_slot(a, s.x[3] + index, m.read64(s.x[2] + 8 * index));
+    }), false, "v@:^@{_NSRange=QQ}");
+    // Pipelines, ICBs, acceleration structures and function tables inside
+    // argument buffers are not translated.
+    for (const auto selector : {"setRenderPipelineState:atIndex:",
                                 "setComputePipelineState:atIndex:", "setIndirectCommandBuffer:atIndex:",
                                 "setAccelerationStructure:atIndex:", "setVisibleFunctionTable:atIndex:",
                                 "setIntersectionFunctionTable:atIndex:"})
@@ -2095,8 +2121,10 @@ void install_small_objects() {
         install_label(cls);
         install_device_getter(cls);
     }
+    // MTLResourceID: the sampler's argument-buffer token, its bindless slot
+    // when the device has the set (the value setSamplerState: writes).
     r.method(classes.sampler, "gpuResourceID", on<SamplerObject>("MTLSamplerState", [](SamplerObject& value, CpuState& s, GuestMemory&) {
-        s.x[0] = reinterpret_cast<std::uint64_t>(value.sampler->sampler);
+        s.x[0] = sampler_token(value.sampler);
     }), false, "Q@:");
 
     // Heaps.

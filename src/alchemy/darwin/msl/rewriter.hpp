@@ -72,6 +72,7 @@ struct InterfaceBuffer {
         std::uint32_t id{}, count{1}, offset{}, stride{8};
         bool pointer{true};
         TypeSpelling type;                 // data members
+        BufferBinding::Argument::Resource resource{BufferBinding::Argument::Resource::data};   // texture / sampler IDs
     };
     bool argument_buffer{};
     std::vector<Argument> arguments;

@@ -148,6 +148,8 @@ public:
     RenderPipelineDescriptor descriptor;
     std::array<StageLayout, 2> stages{};          // vertex (set 0), fragment (set 1)
     VkPipelineLayout layout{};
+    // A stage reads the bindless set (set msl::bindless_descriptor_set of `layout`).
+    bool bindless{};
     // The VkPipeline for an MTLPrimitiveType and raster_variant bits (created
     // on first use).
     [[nodiscard]] VkPipeline pipeline(std::uint32_t primitive_type, std::uint32_t raster = 0);
@@ -181,6 +183,7 @@ public:
     const std::shared_ptr<ShaderFunction> function;
     StageLayout stage;
     VkPipelineLayout layout{};
+    bool bindless{};   // the kernel reads the bindless set (set msl::bindless_descriptor_set)
     std::uint32_t max_total_threads{}, thread_execution_width{};
     std::uint32_t static_threadgroup_memory{};
     // The kernel declares the push-constant grid block (kernel_push_constant_size),

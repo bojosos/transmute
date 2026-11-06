@@ -1130,14 +1130,23 @@ void test_reflection() {
                     d.arguments[2].offset == 16 && d.arguments[2].stride == 16 && d.argument_length == 32 &&
                     d.argument_alignment == 16,
                 "argument buffer data members");
+        // Textures and samplers next to buffers (tier 2): MTLResourceIDs of 8
+        // bytes, read through the bindless set.
         const auto textures = msl::compile("#include <metal_stdlib>\nusing namespace metal;\n"
-                                           "struct T { device float* p [[id(0)]]; texture2d<float> t [[id(1)]]; };\n"
-                                           "kernel void k(constant T& a [[buffer(0)]]) { a.p[0] = 1.0f; }\n",
+                                           "struct T { device float* p [[id(0)]]; texture2d<float> t [[id(1)]]; "
+                                           "sampler s [[id(2)]]; array<texture2d<float>, 2> more [[id(3)]]; float x [[id(5)]]; };\n"
+                                           "kernel void k(constant T& a [[buffer(0)]]) {\n"
+                                           "    a.p[0] = a.t.sample(a.s, float2(0.5), level(0)).x + a.more[1].get_width() + a.x; }\n",
                                            msl::CompileOptions{});
-        require(!textures.success() &&
-                    msl::format_diagnostics(textures.diagnostics).find("argument buffer 'T' member 't'") != std::string::npos,
-                "a texture in an argument buffer of buffers is an explicit error: " +
-                    msl::format_diagnostics(textures.diagnostics));
+        require(textures.success(), "textures in an argument buffer: " + msl::format_diagnostics(textures.diagnostics));
+        const auto& k = function(textures, "k").reflection;
+        const auto& t = buffer(k, 0);
+        using Resource = msl::BufferBinding::Argument::Resource;
+        require(k.bindless && t.arguments.size() == 5 && t.arguments[1].offset == 8 &&
+                    t.arguments[1].resource == Resource::texture && t.arguments[2].offset == 16 &&
+                    t.arguments[2].resource == Resource::sampler && t.arguments[3].offset == 24 && t.arguments[3].count == 2 &&
+                    t.arguments[3].stride == 8 && t.arguments[4].offset == 40 && t.argument_length == 48,
+                "argument buffer texture and sampler members are 8-byte MTLResourceIDs read through the bindless set");
     }
     test_interface_signedness();
     std::cout << "reflection: ok\n";

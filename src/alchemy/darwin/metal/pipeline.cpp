@@ -1,5 +1,7 @@
 #include "alchemy/darwin/metal/pipeline.hpp"
 
+#include "alchemy/darwin/metal/bindless.hpp"
+
 #include "alchemy/darwin/metal/formats.hpp"
 #include "alchemy/darwin/metal/resources.hpp"
 #include "alchemy/perf.hpp"
@@ -16,6 +18,14 @@
 // Metal pipelines on Vulkan. See pipeline.hpp.
 namespace alchemy::metal {
 namespace {
+
+// The bindless set for a pipeline that reads textures or samplers from
+// argument buffers, or an explicit failure on a device without one.
+const Bindless& bindless_layout(Device& device) {
+    if (const auto* bindless = Bindless::of(device)) return *bindless;
+    throw std::runtime_error("Alchemy Metal: textures or samplers in argument buffers need descriptor indexing with "
+                             "update-after-bind, which this Vulkan device does not support (argumentBuffersSupport is Tier1)");
+}
 
 // Location -> signedness (true: signed) of every Input variable of integer
 // scalar or vector type in a SPIR-V module (vertex attributes).
@@ -370,9 +380,12 @@ std::shared_ptr<RenderPipeline> RenderPipeline::create(std::shared_ptr<Device> d
     result->stages[1] = make_stage_layout(d, descriptor.fragment ? &result->linked_fragment_.reflection : nullptr,
                                           VK_SHADER_STAGE_FRAGMENT_BIT,
                                           descriptor.fragment ? &descriptor.fragment->constants : nullptr);
-    const VkDescriptorSetLayout sets[] = {result->stages[0].set_layout, result->stages[1].set_layout};
+    result->bindless = result->linked_vertex_.reflection.bindless ||
+                       (descriptor.fragment && result->linked_fragment_.reflection.bindless);
+    VkDescriptorSetLayout sets[] = {result->stages[0].set_layout, result->stages[1].set_layout, VK_NULL_HANDLE};
+    if (result->bindless) sets[2] = bindless_layout(d).layout;
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layout.setLayoutCount = 2;
+    layout.setLayoutCount = result->bindless ? 3 : 2;
     layout.pSetLayouts = sets;
     check(d.vk.vkCreatePipelineLayout(d.device, &layout, nullptr, &result->layout), "vkCreatePipelineLayout");
     result->vertex_module_ = create_module(d, result->linked_vertex_.spirv, result->linked_vertex_.name);
@@ -605,9 +618,16 @@ std::shared_ptr<ComputePipeline> ComputePipeline::create(std::shared_ptr<Device>
         index += count;
     }
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, msl::kernel_push_constant_size};
+    result->bindless = reflection.bindless;
+    VkDescriptorSetLayout sets[] = {result->stage.set_layout, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    if (result->bindless) {
+        const auto& bindless = bindless_layout(d);
+        sets[1] = bindless.empty_layout;
+        sets[2] = bindless.layout;
+    }
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layout.setLayoutCount = 1;
-    layout.pSetLayouts = &result->stage.set_layout;
+    layout.setLayoutCount = result->bindless ? 3 : 1;
+    layout.pSetLayouts = sets;
     layout.pushConstantRangeCount = 1;
     layout.pPushConstantRanges = &push;
     check(d.vk.vkCreatePipelineLayout(d.device, &layout, nullptr, &result->layout), "vkCreatePipelineLayout");

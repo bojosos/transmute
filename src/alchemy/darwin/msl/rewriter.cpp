@@ -1235,8 +1235,9 @@ private:
     // The members of an argument buffer of samplers: a struct whose members
     // all carry [[id(n)]] and are `sampler`, `array<sampler, N>` or
     // `sampler name[N]` (`access`: 0, 1, 2 per member). nullopt when the
-    // struct is no such argument buffer (no sampler member with an [[id]]);
-    // samplers mixed with other members are an error (`failed`).
+    // struct is no such argument buffer: no sampler member with an [[id]], or
+    // samplers mixed with other members, which the general argument-buffer
+    // path reads from memory (bindless samplers).
     std::optional<std::vector<ArgumentBufferSamplers::Member>> sampler_argument_buffer(
         const StructDef& def, std::uint32_t line, std::vector<std::pair<int, std::string>>& access, bool& failed) {
         std::vector<ArgumentBufferSamplers::Member> members;
@@ -1265,11 +1266,10 @@ private:
             members.push_back({member.name, *evaluate_integer(id->args[0]), count});
             access.emplace_back(kind, member.name);
         }
-        if (members.empty()) return std::nullopt;
-        if (!others.empty()) {
-            error(line, "argument buffer '" + def.name + "' holds samplers and '" + others.front() +
-                  "': only argument buffers of samplers ([[id(n)]] sampler / array<sampler, N> members) are supported");
-            failed = true;
+        (void)line;
+        (void)failed;
+        if (members.empty() || !others.empty()) {
+            access.clear();
             return std::nullopt;
         }
         return members;
@@ -1329,7 +1329,13 @@ private:
             }
             std::uint32_t size = 8, align = 8;
             argument.pointer = !type.empty() && type.back() == '*';
-            if (!argument.pointer) {
+            const bool texture = type.rfind("texture", 0) == 0 || type.rfind("depth", 0) == 0;
+            if (texture || type == "sampler") {
+                // An MTLResourceID (8 bytes): the bindless slot of the texture or sampler.
+                argument.pointer = false;
+                argument.resource = texture ? BufferBinding::Argument::Resource::texture
+                                            : BufferBinding::Argument::Resource::sampler;
+            } else if (!argument.pointer) {
                 argument.type = resolve_spelling(member.type);
                 const auto& t = argument.type;
                 const auto element = scalar_size(t.scalar);
@@ -1342,8 +1348,8 @@ private:
                     align = element * (t.components == 3 ? 4 : t.components);
                     size = align * t.columns;
                 } else {
-                    fail("of type '" + member.type + "' is unsupported (argument buffers hold buffer pointers and "
-                         "scalar/vector/matrix data here; textures and samplers need bindless descriptors)");
+                    fail("of type '" + member.type + "' is unsupported (argument buffers hold buffer pointers, "
+                         "textures, samplers and scalar/vector/matrix data here)");
                     return false;
                 }
                 if (!element) { fail("has an unknown scalar type"); return false; }
@@ -1591,7 +1597,8 @@ private:
                     }
                     if (texture.type.array_length) {
                         body << "    " << type << ' ' << var << ";\n    for (uint __i = 0; __i < " << texture.type.array_length
-                             << "u; ++__i) " << var << "[__i].__h = (" << texture.index << "u << 16) | __i;\n";
+                             << "u; ++__i) { " << var << "[__i].__h = (" << texture.index << "u << 16) | __i; " << var
+                             << "[__i].__hi = 0; }\n";
                     } else {
                         body << "    " << type << ' ' << var << " = metal::__msl_texture<metal::remove_cv_t<" << type
                              << ">>(" << texture.index << "u);\n";

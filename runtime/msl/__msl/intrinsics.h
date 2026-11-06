@@ -46,6 +46,9 @@ template<typename R, typename C> R __msl_tex_read(uint t, C coord, uint layer, u
 template<typename V, typename C> void __msl_tex_write(uint t, C coord, uint layer, uint lod, V value);
 // `what`: 0 width, 1 height, 2 depth, 3 array length, 4 mip levels, 5 samples.
 uint __msl_tex_query(uint t, uint what, uint lod) __MSL_PURE;
+// A texture handle with its kind (texture.h, __MSL_TEXTURE_HANDLE): the value
+// is `h`; the lowering reads `kind` when `h` is not a compile-time binding.
+uint __msl_tex_handle(uint h, uint kind) __MSL_PURE;
 // `op`: 0 add, 1 sub, 2 and, 3 or, 4 xor, 5 min, 6 max, 7 exchange.
 template<typename T, typename C> T __msl_tex_atomic(uint t, C coord, uint layer, uint op, T value);
 void __msl_tex_fence(uint t);

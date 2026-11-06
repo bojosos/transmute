@@ -105,10 +105,10 @@ template<typename T> constexpr T operator,(__msl_rv, T value) { return value; }
 // would otherwise be ambiguous: each converts to the other).
 template<typename T, int N> constexpr vec<T, N> operator,(__msl_rv, packed_vec<T, N> value) { return value; }
 
-template<typename T> inline T __msl_texture(uint binding) { T t; t.__h = binding << 16; return t; }
+template<typename T> inline T __msl_texture(uint binding) { T t; t.__h = binding << 16; t.__hi = 0; return t; }
 template<typename T, size_t N> inline array<T, N> __msl_texture_array(uint binding) {
     array<T, N> r;
-    for (size_t i = 0; i < N; ++i) r.__elems[i].__h = (binding << 16) | uint(i);
+    for (size_t i = 0; i < N; ++i) { r.__elems[i].__h = (binding << 16) | uint(i); r.__elems[i].__hi = 0; }
     return r;
 }
 inline sampler __msl_sampler(uint binding) { sampler s; s.__h = binding; return s; }

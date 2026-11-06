@@ -29,6 +29,17 @@ compile through `darwin/msl/`. Without Vulkan headers at build time only
 **Host dependencies:** `host::gpu` (the Vulkan loader and window-surface
 extension; vulkan-1.dll on win32), `host::ui` (monitor identities).
 
+**Argument buffers, tier 2** (`bindless.cpp`): one device-wide descriptor
+set (arrays of sampled images, storage images and samplers; update after
+bind) holds every texture and sampler a client asked an MTLResourceID for;
+gpuResourceID and MTLArgumentEncoder setTexture(s):/setSamplerState(s):
+write that slot, which shaders index (msl README). argumentBuffersSupport is
+Tier2 only on devices with descriptor indexing and update-after-bind.
+Pipelines whose shaders read the set get it at set 2 of their layout.
+Pipelines, ICBs, acceleration structures and function tables in argument
+buffers stop explicitly; useResource:/useHeap: need nothing (textures stay
+in GENERAL).
+
 **Command buffer times:** kernelStartTime/kernelEndTime are the host's submit
 and observed completion; GPUStartTime/GPUEndTime come from two timestamp
 queries per command buffer, recorded once the process first asked for GPU

@@ -1323,7 +1323,7 @@ private:
                     else fail("dynamic builtin output index");
                 }
                 if (name == "__msl_tex_atomic") {
-                    if (auto handle = maybe_const(v->operands[0])) atomic_textures_.insert(static_cast<std::uint32_t>(*handle >> 16));
+                    if (auto handle = maybe_const(unwrap_handle(v->operands[0]))) atomic_textures_.insert(static_cast<std::uint32_t>(*handle >> 16));
                 }
             }
         }
@@ -1428,12 +1428,9 @@ private:
     };
     std::map<std::uint32_t, ImageInfo> images_;
     std::set<std::uint32_t> used_textures_, used_samplers_;
-    ImageInfo& image(std::uint32_t binding) {
-        auto found = images_.find(binding);
-        if (found != images_.end()) return found->second;
-        const auto& info = texture_info(binding);
+    // The image type of a texture kind (no variable yet).
+    ImageInfo image_of_type(TextureType type, Scalar scalar, Access access, bool atomic) {
         ImageInfo image;
-        const auto type = info.type.texture;
         std::uint32_t dim = 1;
         using T = TextureType;
         switch (type) {
@@ -1451,15 +1448,13 @@ private:
                    type == T::depth2d_ms_array;
         image.depth = type == T::depth2d || type == T::depth2d_array || type == T::depth2d_ms ||
                       type == T::depth2d_ms_array || type == T::depth_cube || type == T::depth_cube_array;
-        image.storage = info.type.access == Access::write || info.type.access == Access::read_write;
-        image.scalar = info.type.scalar;
-        const bool is_signed = info.type.scalar == Scalar::int32 || info.type.scalar == Scalar::int16 ||
-                               info.type.scalar == Scalar::int8;
-        const bool is_int = is_signed || info.type.scalar == Scalar::uint32 || info.type.scalar == Scalar::uint16 ||
-                            info.type.scalar == Scalar::uint8;
+        image.storage = access == Access::write || access == Access::read_write;
+        image.scalar = scalar;
+        const bool is_signed = scalar == Scalar::int32 || scalar == Scalar::int16 || scalar == Scalar::int8;
+        const bool is_int = is_signed || scalar == Scalar::uint32 || scalar == Scalar::uint16 || scalar == Scalar::uint8;
         image.sampled_type = is_int ? (is_signed ? t_i32() : t_u32()) : t_f32();
         std::uint32_t format = 0;
-        if (atomic_textures_.count(binding)) {
+        if (atomic) {
             if (!is_int) fail("texture atomics need an int or uint texture");
             format = is_signed ? 24 : 33;   // R32i / R32ui
             image.storage = true;
@@ -1470,11 +1465,18 @@ private:
         if (image.ms && image.storage) m_.capability(spv::capability::StorageImageMultisample);
         if (image.ms && image.arrayed && image.storage) m_.capability(spv::capability::ImageMSArray);
         if (image.storage && format == 0) {
-            if (info.type.access == Access::read_write) m_.capability(spv::capability::StorageImageReadWithoutFormat);
+            if (access == Access::read_write) m_.capability(spv::capability::StorageImageReadWithoutFormat);
             m_.capability(spv::capability::StorageImageWriteWithoutFormat);
         }
         image.image_type = m_.type_image(image.sampled_type, dim, image.depth ? 1 : 0, image.arrayed ? 1 : 0,
                                          image.ms ? 1 : 0, image.storage ? 2 : 1, format);
+        return image;
+    }
+    ImageInfo& image(std::uint32_t binding) {
+        auto found = images_.find(binding);
+        if (found != images_.end()) return found->second;
+        const auto& info = texture_info(binding);
+        auto image = image_of_type(info.type.texture, info.type.scalar, info.type.access, atomic_textures_.count(binding) != 0);
         auto var_type = image.image_type;
         if (info.type.array_length) var_type = m_.type_array(image.image_type, c_u32(info.type.array_length));
         image.var = m_.variable(m_.type_pointer(spv::storage::UniformConstant, var_type), spv::storage::UniformConstant);
@@ -1484,8 +1486,111 @@ private:
         interface_.push_back(image.var);
         return images_.emplace(binding, image).first->second;
     }
+
+    // ---- bindless textures and samplers (argument buffers, M2) ----------------------------
+    // A handle reaches the texture intrinsics through __msl_tex_handle(h,
+    // kind): `h` without the wrapper, and the kind when there is one.
+    static bool is_call_to(Value* v, std::string_view name) {
+        return v && v->kind == Value::Kind::instruction && v->op == Opcode::call && v->callee &&
+               ir::demangled_identifier(v->callee->name) == name;
+    }
+    Value* unwrap_handle(Value* handle, std::optional<std::uint32_t>* kind = nullptr) {
+        if (!is_call_to(handle, "__msl_tex_handle")) return handle;
+        if (kind) kind->emplace(static_cast<std::uint32_t>(const_int(handle->operands[1])));
+        return handle->operands[0];
+    }
+    // Whether a non-constant handle was read from memory (an argument buffer)
+    // on every path: a phi or select mixing in a binding handle, or anything
+    // else, keeps the old explicit error.
+    bool loaded_handle(Value* v, int depth = 0) {
+        if (!v || depth > 16) return false;
+        if (v->kind != Value::Kind::instruction) return false;
+        switch (v->op) {
+        case Opcode::load: return true;
+        case Opcode::trunc: case Opcode::zext: case Opcode::sext: case Opcode::bitcast: case Opcode::and_:
+            return loaded_handle(v->operands[0], depth + 1);
+        case Opcode::phi:
+            for (auto* operand : v->operands)
+                if (operand && operand->kind != Value::Kind::block && !loaded_handle(operand, depth + 1)) return false;
+            return true;
+        case Opcode::select: return loaded_handle(v->operands[1], depth + 1) && loaded_handle(v->operands[2], depth + 1);
+        case Opcode::extractvalue: case Opcode::extractelement: return loaded_handle(v->operands[0], depth + 1);
+        default: return false;
+        }
+    }
+    std::map<std::uint32_t, ImageInfo> bindless_images_;   // kind -> image type and runtime-array variable
+    std::uint32_t bindless_sampler_var_{};
+    bool reflection_bindless_{};
+    bool atomic_texture_op_{};   // lower_texture is lowering a texture atomic
+    void bindless_used(bool storage) {
+        reflection_bindless_ = true;
+        m_.capability(spv::capability::RuntimeDescriptorArray);
+        m_.capability(spv::capability::ShaderNonUniform);
+        m_.capability(storage ? spv::capability::StorageImageArrayNonUniformIndexing
+                              : spv::capability::SampledImageArrayNonUniformIndexing);
+    }
+    std::set<std::uint32_t> non_uniform_ids_;   // bindless images and samplers (and what is made of them)
+    std::uint32_t non_uniform(std::uint32_t id) {
+        m_.decorate(id, spv::decoration::NonUniform);
+        non_uniform_ids_.insert(id);
+        return id;
+    }
+    std::pair<ImageInfo*, std::uint32_t> bindless_texture(Value* handle, std::uint32_t kind) {
+        const auto type = static_cast<TextureType>(kind & 0xff);
+        if (static_cast<std::uint32_t>(type) > static_cast<std::uint32_t>(TextureType::depth_cube_array))
+            fail("texture handle with an unknown texture kind");
+        if (type == TextureType::texture_buffer) fail("texture buffers in argument buffers are unsupported");
+        const auto scalar_class = (kind >> 8) & 0xf;
+        const auto scalar = scalar_class == 1 ? Scalar::int32 : scalar_class == 2 ? Scalar::uint32 : Scalar::float32;
+        // metal::access: sample, read, write, read_write.
+        static constexpr Access accesses[] = {Access::sample, Access::read, Access::write, Access::read_write};
+        const auto access = accesses[(kind >> 12) & 3];
+        // Texture atomics need the image's R32 format, which a kind does not carry.
+        if (atomic_texture_op_) fail("atomics on a texture read from an argument buffer are unsupported");
+        const bool atomic = false;
+        auto found = bindless_images_.find(kind);
+        if (found == bindless_images_.end()) {
+            auto image = image_of_type(type, scalar, access, atomic);
+            const auto array = m_.type_runtime_array(image.image_type);
+            image.var = m_.variable(m_.type_pointer(spv::storage::UniformConstant, array), spv::storage::UniformConstant);
+            m_.decorate(image.var, spv::decoration::DescriptorSet, {bindless_descriptor_set});
+            m_.decorate(image.var, spv::decoration::Binding,
+                        {image.storage ? bindless_storage_image_binding : bindless_sampled_image_binding});
+            m_.name(image.var, image.storage ? "bindless.storage" : "bindless.sampled");
+            interface_.push_back(image.var);
+            found = bindless_images_.emplace(kind, image).first;
+        }
+        auto& img = found->second;
+        bindless_used(img.storage);
+        const auto index = non_uniform(value_op(sop::CopyObject, t_u32(), {id_of(handle)}));
+        const auto pointer = non_uniform(value_op(sop::AccessChain, m_.type_pointer(spv::storage::UniformConstant, img.image_type),
+                                                  {img.var, index}));
+        return {&img, non_uniform(value_op(sop::Load, img.image_type, {pointer}))};
+    }
+    std::uint32_t bindless_sampler(Value* handle) {
+        const auto sampler_type = m_.type_sampler();
+        if (!bindless_sampler_var_) {
+            const auto array = m_.type_runtime_array(sampler_type);
+            bindless_sampler_var_ = m_.variable(m_.type_pointer(spv::storage::UniformConstant, array), spv::storage::UniformConstant);
+            m_.decorate(bindless_sampler_var_, spv::decoration::DescriptorSet, {bindless_descriptor_set});
+            m_.decorate(bindless_sampler_var_, spv::decoration::Binding, {bindless_sampler_binding});
+            m_.name(bindless_sampler_var_, "bindless.samplers");
+            interface_.push_back(bindless_sampler_var_);
+        }
+        bindless_used(false);
+        // The 64-bit handle's low word is the slot.
+        auto index = id_of(handle);
+        if (handle->type && scalar_bits(handle->type) == 64) index = value_op(sop::UConvert, t_u32(), {index});
+        index = non_uniform(value_op(sop::CopyObject, t_u32(), {index}));
+        const auto pointer = non_uniform(value_op(sop::AccessChain, m_.type_pointer(spv::storage::UniformConstant, sampler_type),
+                                                  {bindless_sampler_var_, index}));
+        return non_uniform(value_op(sop::Load, sampler_type, {pointer}));
+    }
+
     // Resolves a texture handle operand to (binding, image id loaded from the variable).
-    std::pair<ImageInfo*, std::uint32_t> texture(Value* handle) {
+    std::pair<ImageInfo*, std::uint32_t> texture(Value* wrapped) {
+        std::optional<std::uint32_t> kind;
+        Value* handle = unwrap_handle(wrapped, &kind);
         std::uint32_t binding;
         std::uint32_t element = 0;
         bool dynamic = false;
@@ -1497,6 +1602,8 @@ private:
             binding = static_cast<std::uint32_t>(*maybe_const(handle->operands[0]) >> 16);
             element = id_of(handle->operands[1]);
             dynamic = true;
+        } else if (kind && loaded_handle(handle)) {
+            return bindless_texture(handle, *kind);   // read from an argument buffer: an MTLResourceID
         } else {
             fail("a texture whose binding is not known at compile time (texture selected at run time) is unsupported");
         }
@@ -1518,6 +1625,7 @@ private:
     std::map<std::uint64_t, std::uint32_t> constexpr_samplers_;   // state -> slot
     std::uint32_t sampler(Value* handle) {
         const auto value = maybe_const(handle);
+        if (!value && loaded_handle(handle)) return bindless_sampler(handle);   // read from an argument buffer
         if (!value) fail("a sampler not known at compile time is unsupported");
         const auto sampler_type = m_.type_sampler();
         std::uint32_t var;
@@ -1711,6 +1819,7 @@ private:
 
     std::uint32_t lower_texture(const std::string& name, Value* v) {
         const auto& ops = v->operands;
+        atomic_texture_op_ = name == "__msl_tex_atomic";
         if (name == "__msl_tex_query") {
             auto [img, id] = texture(ops[0]);
             const auto what = static_cast<std::uint32_t>(const_int(ops[1]));
@@ -1741,7 +1850,9 @@ private:
             name == "__msl_tex_gather_compare") {
             if (img->storage) fail("sampling a texture declared with write or read_write access");
             const auto s = sampler(ops[1]);
-            const auto sampled_image = value_op(sop::SampledImage, m_.type_sampled_image(img->image_type), {image_id, s});
+            auto sampled_image = value_op(sop::SampledImage, m_.type_sampled_image(img->image_type), {image_id, s});
+            // The operand of the image instruction: NonUniform when either part is.
+            if (non_uniform_ids_.count(image_id) || non_uniform_ids_.count(s)) sampled_image = non_uniform(sampled_image);
             const auto coord = sample_coordinate(*img, ops[2], ops[3]);
             const auto vec4 = t_vec(img->sampled_type, 4);
             std::uint32_t mask = 0;
@@ -1852,7 +1963,7 @@ private:
             const auto scalar = img->sampled_type;
             // The texel pointer needs the image variable itself.
             std::uint32_t pointer_var = img->var;
-            if (texture_info(static_cast<std::uint32_t>(*maybe_const(ops[0]) >> 16)).type.array_length)
+            if (texture_info(static_cast<std::uint32_t>(*maybe_const(unwrap_handle(ops[0])) >> 16)).type.array_length)
                 fail("atomics on arrays of textures are unsupported");
             const auto pointer = value_op(sop::ImageTexelPointer, m_.type_pointer(spv::storage::Image, scalar),
                 {pointer_var, coord, c_u32(0)});
@@ -2516,6 +2627,7 @@ private:
             if (op >= sop::DPdxFine) m_.capability(spv::capability::DerivativeControl);
             return bind(v, value_op(op, type, {id_of(ops[1])}));
         }
+        if (name == "__msl_tex_handle") return bind(v, id_of(ops[0]));   // the kind is read where the handle is used
         if (name.rfind("__msl_tex_", 0) == 0) {
             const auto r = lower_texture(name, v);
             if (type) bind(v, r);
@@ -3153,7 +3265,8 @@ private:
                 argument.offset = a.offset;
                 argument.stride = a.stride;
                 argument.pointer = a.pointer;
-                if (!a.pointer) argument.type = add_reflection_type(r, a.type);
+                argument.resource = a.resource;
+                if (!a.pointer && a.resource == BufferBinding::Argument::Resource::data) argument.type = add_reflection_type(r, a.type);
                 binding.arguments.push_back(std::move(argument));
             }
             binding.argument_length = b.argument_length;
@@ -3296,6 +3409,7 @@ private:
             r.threadgroup_memory.push_back(std::move(memory));
         }
         r.uses_simdgroup_operations = uses_simd_;
+        r.bindless = reflection_bindless_;
         r.notes = entry_.notes;
     }
     static float half_to_float(std::uint16_t h) {

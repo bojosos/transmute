@@ -212,6 +212,11 @@ public:
     [[nodiscard]] const std::shared_ptr<SurfaceBacking>& surface_backing() const noexcept {
         return parent ? parent->surface : surface;
     }
+    // Its slot in the device's bindless set (bindless.hpp), which is its
+    // MTLResourceID: made on first use, 0 without the set, when the set is
+    // full, for texture buffers, drawables (wrapped images) and IOSurface-
+    // backed textures.
+    [[nodiscard]] std::uint32_t bindless_slot();
 
     [[nodiscard]] bool is_buffer() const noexcept { return descriptor.type == TextureType::texture_buffer; }
     // Vulkan array layers of this texture (cubes count 6 per cube).
@@ -245,6 +250,7 @@ private:
                              const VkComponentMapping& components);
     std::mutex views_mutex_;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> attachment_views_;
+    std::uint32_t bindless_slot_{};   // views_mutex_
 };
 
 [[nodiscard]] VkImageViewType view_type(TextureType type);
@@ -280,16 +286,24 @@ public:
     const std::shared_ptr<Device> device;
     SamplerDescriptor descriptor;
     VkSampler sampler{};
+    // Its slot in the device's bindless set (bindless.hpp), which is its
+    // MTLResourceID and its argument-buffer token: made on first use, 0
+    // without the set or when the set is full.
+    [[nodiscard]] std::uint32_t bindless_slot();
 private:
     explicit Sampler(std::shared_ptr<Device> owner) : device(std::move(owner)) {}
+    std::mutex slot_mutex_;
+    std::uint32_t slot_{};
     std::mutex clamped_mutex_;
     std::map<std::pair<float, float>, std::shared_ptr<Sampler>> clamped_;
 };
 [[nodiscard]] VkSamplerCreateInfo sampler_info(const Device& device, const SamplerDescriptor& descriptor);
 // Samplers inside argument buffers (MTLArgumentEncoder setSamplerState:):
-// the buffer holds an opaque 64-bit token per sampler (0 = nil), resolved
-// when a draw or dispatch binds the argument buffer. A token stays valid
-// while its sampler lives; resolving a dead one throws.
+// the buffer holds a 64-bit token per sampler (0 = nil): its bindless slot
+// when the device has the bindless set (so shaders that index the set and
+// argument buffers of samplers bound at draw time read the same value),
+// else an opaque value. A token stays valid while its sampler lives;
+// resolving a dead one throws.
 [[nodiscard]] std::uint64_t sampler_token(const std::shared_ptr<Sampler>& sampler);
 [[nodiscard]] std::shared_ptr<Sampler> sampler_from_token(std::uint64_t token);
 

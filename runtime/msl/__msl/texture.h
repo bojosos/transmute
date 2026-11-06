@@ -6,6 +6,11 @@
 
 namespace metal {
 
+// Texture and sampler accessors are one intrinsic call each: always inlined,
+// so the lowering sees every handle in the entry point (large generated
+// entry points can exceed clang's inlining budget otherwise).
+#pragma clang attribute push (__attribute__((always_inline)), apply_to = function)
+
 // ---- sampler state --------------------------------------------------------------------
 // The renamed MSL spelling of read_write (an OpenCL keyword) is
 // __msl_id_read_write; the source rewriter renames the user's token.
@@ -82,242 +87,260 @@ struct gradientcube { float3 dx, dy; gradientcube(float3 a, float3 b) : dx(a), d
 // Sample and read results: vec<T, 4> for colour textures, T for depth.
 template<typename T> using __texel = __ext<T, 4>;
 
+// A texture object's handle: a [[texture(n)]] binding (binding << 16 | array
+// element) or, read from an argument buffer, a bindless descriptor slot (an
+// MTLResourceID: 8 bytes, the high word unused). Every intrinsic receives it
+// through __msl_tex_handle with the texture's kind (TextureType | scalar class
+// << 8 | access << 12), which the lowering needs to type a bindless slot.
+template<typename T> struct __msl_scalar_class { static constexpr uint value = 0; };   // float, half
+template<> struct __msl_scalar_class<int> { static constexpr uint value = 1; };
+template<> struct __msl_scalar_class<short> { static constexpr uint value = 1; };
+template<> struct __msl_scalar_class<char> { static constexpr uint value = 1; };
+template<> struct __msl_scalar_class<uint> { static constexpr uint value = 2; };
+template<> struct __msl_scalar_class<ushort> { static constexpr uint value = 2; };
+template<> struct __msl_scalar_class<uchar> { static constexpr uint value = 2; };
+#define __MSL_TEXTURE_HANDLE(KIND) \
+    uint __h, __hi; \
+    uint __hk() const { return __msl_tex_handle(__h, uint(KIND) | (__msl_scalar_class<T>::value << 8) | (uint(A) << 12)); }
+
 // The texture types, in the order of TextureType in compiler.hpp. Coordinates
 // for read/write use uint vectors (ushort overloads convert).
-template<typename T, access A = access::sample> struct texture1d {
-    uint __h;
+template<typename T, access A = access::sample> struct alignas(8) texture1d {
+    __MSL_TEXTURE_HANDLE(0)
     vec<T, 4> sample(sampler s, float c) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c, 0u, 0u, 0.0f, 0.0f, 0.0f, 0); }
-    vec<T, 4> read(uint c, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__h, c, 0u, lod); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c, 0u, 0u, 0.0f, 0.0f, 0.0f, 0); }
+    vec<T, 4> read(uint c, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__hk(), c, 0u, lod); }
     vec<T, 4> read(ushort c, ushort lod = 0) const { return read(uint(c), uint(lod)); }
-    void write(vec<T, 4> v, uint c, uint lod = 0) const { __msl_tex_write(__h, c, 0u, lod, v.v); }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
-    void fence() const { __msl_tex_fence(__h); }
+    void write(vec<T, 4> v, uint c, uint lod = 0) const { __msl_tex_write(__hk(), c, 0u, lod, v.v); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
+    void fence() const { __msl_tex_fence(__hk()); }
 };
-template<typename T, access A = access::sample> struct texture1d_array {
-    uint __h;
+template<typename T, access A = access::sample> struct alignas(8) texture1d_array {
+    __MSL_TEXTURE_HANDLE(1)
     vec<T, 4> sample(sampler s, float c, uint array) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c, array, 0u, 0.0f, 0.0f, 0.0f, 0); }
-    vec<T, 4> read(uint c, uint array, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__h, c, array, lod); }
-    void write(vec<T, 4> v, uint c, uint array, uint lod = 0) const { __msl_tex_write(__h, c, array, lod, v.v); }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_array_size() const { return __msl_tex_query(__h, 3, 0); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
-    void fence() const { __msl_tex_fence(__h); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c, array, 0u, 0.0f, 0.0f, 0.0f, 0); }
+    vec<T, 4> read(uint c, uint array, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__hk(), c, array, lod); }
+    void write(vec<T, 4> v, uint c, uint array, uint lod = 0) const { __msl_tex_write(__hk(), c, array, lod, v.v); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_array_size() const { return __msl_tex_query(__hk(), 3, 0); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
+    void fence() const { __msl_tex_fence(__hk()); }
 };
 
-template<typename T, access A = access::sample> struct texture2d {
-    uint __h;
+template<typename T, access A = access::sample> struct alignas(8) texture2d {
+    __MSL_TEXTURE_HANDLE(2)
     vec<T, 4> sample(sampler s, float2 c, int2 offset = int2(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 0u, 0.0f, float2(0).v, float2(0).v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 0u, 0.0f, float2(0).v, float2(0).v, offset.v); }
     vec<T, 4> sample(sampler s, float2 c, bias b, int2 offset = int2(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 1u, b.value, float2(0).v, float2(0).v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 1u, b.value, float2(0).v, float2(0).v, offset.v); }
     vec<T, 4> sample(sampler s, float2 c, level l, int2 offset = int2(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 2u, l.value, float2(0).v, float2(0).v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 2u, l.value, float2(0).v, float2(0).v, offset.v); }
     vec<T, 4> sample(sampler s, float2 c, gradient2d g, int2 offset = int2(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 3u, 0.0f, g.dx.v, g.dy.v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 3u, 0.0f, g.dx.v, g.dy.v, offset.v); }
     vec<T, 4> gather(sampler s, float2 c, int2 offset = int2(0), component k = component::x) const {
-        return __msl_tex_gather<__texel<T>>(__h, s.__h, c.v, 0u, offset.v, (uint)k); }
-    vec<T, 4> read(uint2 c, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__h, c.v, 0u, lod); }
+        return __msl_tex_gather<__texel<T>>(__hk(), s.__h, c.v, 0u, offset.v, (uint)k); }
+    vec<T, 4> read(uint2 c, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, 0u, lod); }
     vec<T, 4> read(ushort2 c, ushort lod = 0) const { return read(uint2(c), uint(lod)); }
-    void write(vec<T, 4> v, uint2 c, uint lod = 0) const { __msl_tex_write(__h, c.v, 0u, lod, v.v); }
+    void write(vec<T, 4> v, uint2 c, uint lod = 0) const { __msl_tex_write(__hk(), c.v, 0u, lod, v.v); }
     void write(vec<T, 4> v, ushort2 c, ushort lod = 0) const { write(v, uint2(c), uint(lod)); }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_height(uint lod = 0) const { return __msl_tex_query(__h, 1, lod); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
-    void fence() const { __msl_tex_fence(__h); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_height(uint lod = 0) const { return __msl_tex_query(__hk(), 1, lod); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
+    void fence() const { __msl_tex_fence(__hk()); }
 #define __MSL_TEX_ATOMICS(COORD, CEXPR, LAYER_PARAM, LAYER) \
-    vec<T, 4> atomic_fetch_add(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__h, CEXPR, LAYER, 0u, v)); } \
-    vec<T, 4> atomic_fetch_sub(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__h, CEXPR, LAYER, 1u, v)); } \
-    vec<T, 4> atomic_fetch_and(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__h, CEXPR, LAYER, 2u, v)); } \
-    vec<T, 4> atomic_fetch_or(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__h, CEXPR, LAYER, 3u, v)); } \
-    vec<T, 4> atomic_fetch_xor(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__h, CEXPR, LAYER, 4u, v)); } \
-    vec<T, 4> atomic_fetch_min(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__h, CEXPR, LAYER, 5u, v)); } \
-    vec<T, 4> atomic_fetch_max(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__h, CEXPR, LAYER, 6u, v)); } \
-    vec<T, 4> atomic_exchange(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__h, CEXPR, LAYER, 7u, v)); }
+    vec<T, 4> atomic_fetch_add(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__hk(), CEXPR, LAYER, 0u, v)); } \
+    vec<T, 4> atomic_fetch_sub(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__hk(), CEXPR, LAYER, 1u, v)); } \
+    vec<T, 4> atomic_fetch_and(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__hk(), CEXPR, LAYER, 2u, v)); } \
+    vec<T, 4> atomic_fetch_or(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__hk(), CEXPR, LAYER, 3u, v)); } \
+    vec<T, 4> atomic_fetch_xor(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__hk(), CEXPR, LAYER, 4u, v)); } \
+    vec<T, 4> atomic_fetch_min(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__hk(), CEXPR, LAYER, 5u, v)); } \
+    vec<T, 4> atomic_fetch_max(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__hk(), CEXPR, LAYER, 6u, v)); } \
+    vec<T, 4> atomic_exchange(COORD c LAYER_PARAM, T v) const { return vec<T, 4>(__msl_tex_atomic(__hk(), CEXPR, LAYER, 7u, v)); }
     __MSL_TEX_ATOMICS(uint2, c.v, , 0u)
 };
-template<typename T, access A = access::sample> struct texture2d_array {
-    uint __h;
+template<typename T, access A = access::sample> struct alignas(8) texture2d_array {
+    __MSL_TEXTURE_HANDLE(3)
     vec<T, 4> sample(sampler s, float2 c, uint array, int2 offset = int2(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, array, 0u, 0.0f, float2(0).v, float2(0).v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, array, 0u, 0.0f, float2(0).v, float2(0).v, offset.v); }
     vec<T, 4> sample(sampler s, float2 c, uint array, bias b, int2 offset = int2(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, array, 1u, b.value, float2(0).v, float2(0).v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, array, 1u, b.value, float2(0).v, float2(0).v, offset.v); }
     vec<T, 4> sample(sampler s, float2 c, uint array, level l, int2 offset = int2(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, array, 2u, l.value, float2(0).v, float2(0).v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, array, 2u, l.value, float2(0).v, float2(0).v, offset.v); }
     vec<T, 4> sample(sampler s, float2 c, uint array, gradient2d g, int2 offset = int2(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, array, 3u, 0.0f, g.dx.v, g.dy.v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, array, 3u, 0.0f, g.dx.v, g.dy.v, offset.v); }
     vec<T, 4> gather(sampler s, float2 c, uint array, int2 offset = int2(0), component k = component::x) const {
-        return __msl_tex_gather<__texel<T>>(__h, s.__h, c.v, array, offset.v, (uint)k); }
-    vec<T, 4> read(uint2 c, uint array, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__h, c.v, array, lod); }
+        return __msl_tex_gather<__texel<T>>(__hk(), s.__h, c.v, array, offset.v, (uint)k); }
+    vec<T, 4> read(uint2 c, uint array, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, array, lod); }
     vec<T, 4> read(ushort2 c, ushort array, ushort lod = 0) const { return read(uint2(c), uint(array), uint(lod)); }
-    void write(vec<T, 4> v, uint2 c, uint array, uint lod = 0) const { __msl_tex_write(__h, c.v, array, lod, v.v); }
+    void write(vec<T, 4> v, uint2 c, uint array, uint lod = 0) const { __msl_tex_write(__hk(), c.v, array, lod, v.v); }
     void write(vec<T, 4> v, ushort2 c, ushort array, ushort lod = 0) const {
         write(v, uint2(c), uint(array), uint(lod)); }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_height(uint lod = 0) const { return __msl_tex_query(__h, 1, lod); }
-    uint get_array_size() const { return __msl_tex_query(__h, 3, 0); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
-    void fence() const { __msl_tex_fence(__h); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_height(uint lod = 0) const { return __msl_tex_query(__hk(), 1, lod); }
+    uint get_array_size() const { return __msl_tex_query(__hk(), 3, 0); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
+    void fence() const { __msl_tex_fence(__hk()); }
     __MSL_TEX_ATOMICS(uint2, c.v, __MSL_COMMA uint array, array)
 };
-template<typename T, access A = access::read> struct texture2d_ms {
-    uint __h;
-    vec<T, 4> read(uint2 c, uint sample) const { return __msl_tex_read<__texel<T>>(__h, c.v, 0u, sample); }
-    uint get_width() const { return __msl_tex_query(__h, 0, 0); }
-    uint get_height() const { return __msl_tex_query(__h, 1, 0); }
-    uint get_num_samples() const { return __msl_tex_query(__h, 5, 0); }
+template<typename T, access A = access::read> struct alignas(8) texture2d_ms {
+    __MSL_TEXTURE_HANDLE(4)
+    vec<T, 4> read(uint2 c, uint sample) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, 0u, sample); }
+    uint get_width() const { return __msl_tex_query(__hk(), 0, 0); }
+    uint get_height() const { return __msl_tex_query(__hk(), 1, 0); }
+    uint get_num_samples() const { return __msl_tex_query(__hk(), 5, 0); }
 };
-template<typename T, access A = access::read> struct texture2d_ms_array {
-    uint __h;
-    vec<T, 4> read(uint2 c, uint array, uint sample) const { return __msl_tex_read<__texel<T>>(__h, c.v, array, sample); }
-    uint get_width() const { return __msl_tex_query(__h, 0, 0); }
-    uint get_height() const { return __msl_tex_query(__h, 1, 0); }
-    uint get_array_size() const { return __msl_tex_query(__h, 3, 0); }
-    uint get_num_samples() const { return __msl_tex_query(__h, 5, 0); }
+template<typename T, access A = access::read> struct alignas(8) texture2d_ms_array {
+    __MSL_TEXTURE_HANDLE(5)
+    vec<T, 4> read(uint2 c, uint array, uint sample) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, array, sample); }
+    uint get_width() const { return __msl_tex_query(__hk(), 0, 0); }
+    uint get_height() const { return __msl_tex_query(__hk(), 1, 0); }
+    uint get_array_size() const { return __msl_tex_query(__hk(), 3, 0); }
+    uint get_num_samples() const { return __msl_tex_query(__hk(), 5, 0); }
 };
-template<typename T, access A = access::sample> struct texture3d {
-    uint __h;
+template<typename T, access A = access::sample> struct alignas(8) texture3d {
+    __MSL_TEXTURE_HANDLE(6)
     vec<T, 4> sample(sampler s, float3 c, int3 offset = int3(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 0u, 0.0f, float3(0).v, float3(0).v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 0u, 0.0f, float3(0).v, float3(0).v, offset.v); }
     vec<T, 4> sample(sampler s, float3 c, bias b, int3 offset = int3(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 1u, b.value, float3(0).v, float3(0).v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 1u, b.value, float3(0).v, float3(0).v, offset.v); }
     vec<T, 4> sample(sampler s, float3 c, level l, int3 offset = int3(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 2u, l.value, float3(0).v, float3(0).v, offset.v); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 2u, l.value, float3(0).v, float3(0).v, offset.v); }
     vec<T, 4> sample(sampler s, float3 c, gradient3d g, int3 offset = int3(0)) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 3u, 0.0f, g.dx.v, g.dy.v, offset.v); }
-    vec<T, 4> read(uint3 c, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__h, c.v, 0u, lod); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 3u, 0.0f, g.dx.v, g.dy.v, offset.v); }
+    vec<T, 4> read(uint3 c, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, 0u, lod); }
     vec<T, 4> read(ushort3 c, ushort lod = 0) const { return read(uint3(c), uint(lod)); }
-    void write(vec<T, 4> v, uint3 c, uint lod = 0) const { __msl_tex_write(__h, c.v, 0u, lod, v.v); }
+    void write(vec<T, 4> v, uint3 c, uint lod = 0) const { __msl_tex_write(__hk(), c.v, 0u, lod, v.v); }
     void write(vec<T, 4> v, ushort3 c, ushort lod = 0) const { write(v, uint3(c), uint(lod)); }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_height(uint lod = 0) const { return __msl_tex_query(__h, 1, lod); }
-    uint get_depth(uint lod = 0) const { return __msl_tex_query(__h, 2, lod); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
-    void fence() const { __msl_tex_fence(__h); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_height(uint lod = 0) const { return __msl_tex_query(__hk(), 1, lod); }
+    uint get_depth(uint lod = 0) const { return __msl_tex_query(__hk(), 2, lod); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
+    void fence() const { __msl_tex_fence(__hk()); }
     __MSL_TEX_ATOMICS(uint3, c.v, , 0u)
 };
-template<typename T, access A = access::sample> struct texturecube {
-    uint __h;
+template<typename T, access A = access::sample> struct alignas(8) texturecube {
+    __MSL_TEXTURE_HANDLE(7)
     vec<T, 4> sample(sampler s, float3 c) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 0u, 0.0f, float3(0).v, float3(0).v, 0); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 0u, 0.0f, float3(0).v, float3(0).v, 0); }
     vec<T, 4> sample(sampler s, float3 c, bias b) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 1u, b.value, float3(0).v, float3(0).v, 0); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 1u, b.value, float3(0).v, float3(0).v, 0); }
     vec<T, 4> sample(sampler s, float3 c, level l) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 2u, l.value, float3(0).v, float3(0).v, 0); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 2u, l.value, float3(0).v, float3(0).v, 0); }
     vec<T, 4> sample(sampler s, float3 c, gradientcube g) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, 0u, 3u, 0.0f, g.dx.v, g.dy.v, 0); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, 0u, 3u, 0.0f, g.dx.v, g.dy.v, 0); }
     vec<T, 4> gather(sampler s, float3 c, component k = component::x) const {
-        return __msl_tex_gather<__texel<T>>(__h, s.__h, c.v, 0u, 0, (uint)k); }
-    vec<T, 4> read(uint2 c, uint face, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__h, c.v, face, lod); }
-    void write(vec<T, 4> v, uint2 c, uint face, uint lod = 0) const { __msl_tex_write(__h, c.v, face, lod, v.v); }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_height(uint lod = 0) const { return __msl_tex_query(__h, 1, lod); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
-    void fence() const { __msl_tex_fence(__h); }
+        return __msl_tex_gather<__texel<T>>(__hk(), s.__h, c.v, 0u, 0, (uint)k); }
+    vec<T, 4> read(uint2 c, uint face, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, face, lod); }
+    void write(vec<T, 4> v, uint2 c, uint face, uint lod = 0) const { __msl_tex_write(__hk(), c.v, face, lod, v.v); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_height(uint lod = 0) const { return __msl_tex_query(__hk(), 1, lod); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
+    void fence() const { __msl_tex_fence(__hk()); }
 };
-template<typename T, access A = access::sample> struct texturecube_array {
-    uint __h;
+template<typename T, access A = access::sample> struct alignas(8) texturecube_array {
+    __MSL_TEXTURE_HANDLE(8)
     vec<T, 4> sample(sampler s, float3 c, uint array) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, array, 0u, 0.0f, float3(0).v, float3(0).v, 0); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, array, 0u, 0.0f, float3(0).v, float3(0).v, 0); }
     vec<T, 4> sample(sampler s, float3 c, uint array, bias b) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, array, 1u, b.value, float3(0).v, float3(0).v, 0); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, array, 1u, b.value, float3(0).v, float3(0).v, 0); }
     vec<T, 4> sample(sampler s, float3 c, uint array, level l) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, array, 2u, l.value, float3(0).v, float3(0).v, 0); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, array, 2u, l.value, float3(0).v, float3(0).v, 0); }
     vec<T, 4> sample(sampler s, float3 c, uint array, gradientcube g) const {
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, c.v, array, 3u, 0.0f, g.dx.v, g.dy.v, 0); }
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, c.v, array, 3u, 0.0f, g.dx.v, g.dy.v, 0); }
     vec<T, 4> gather(sampler s, float3 c, uint array, component k = component::x) const {
-        return __msl_tex_gather<__texel<T>>(__h, s.__h, c.v, array, 0, (uint)k); }
+        return __msl_tex_gather<__texel<T>>(__hk(), s.__h, c.v, array, 0, (uint)k); }
     vec<T, 4> read(uint2 c, uint face, uint array, uint lod = 0) const {
-        return __msl_tex_read<__texel<T>>(__h, c.v, array * 6u + face, lod); }
+        return __msl_tex_read<__texel<T>>(__hk(), c.v, array * 6u + face, lod); }
     void write(vec<T, 4> v, uint2 c, uint face, uint array, uint lod = 0) const {
-        __msl_tex_write(__h, c.v, array * 6u + face, lod, v.v); }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_height(uint lod = 0) const { return __msl_tex_query(__h, 1, lod); }
-    uint get_array_size() const { return __msl_tex_query(__h, 3, 0); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
-    void fence() const { __msl_tex_fence(__h); }
+        __msl_tex_write(__hk(), c.v, array * 6u + face, lod, v.v); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_height(uint lod = 0) const { return __msl_tex_query(__hk(), 1, lod); }
+    uint get_array_size() const { return __msl_tex_query(__hk(), 3, 0); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
+    void fence() const { __msl_tex_fence(__hk()); }
 };
-template<typename T, access A = access::read> struct texture_buffer {
-    uint __h;
-    vec<T, 4> read(uint c) const { return __msl_tex_read<__texel<T>>(__h, c, 0u, 0u); }
-    void write(vec<T, 4> v, uint c) const { __msl_tex_write(__h, c, 0u, 0u, v.v); }
-    uint get_width() const { return __msl_tex_query(__h, 0, 0); }
-    void fence() const { __msl_tex_fence(__h); }
+template<typename T, access A = access::read> struct alignas(8) texture_buffer {
+    __MSL_TEXTURE_HANDLE(9)
+    vec<T, 4> read(uint c) const { return __msl_tex_read<__texel<T>>(__hk(), c, 0u, 0u); }
+    void write(vec<T, 4> v, uint c) const { __msl_tex_write(__hk(), c, 0u, 0u, v.v); }
+    uint get_width() const { return __msl_tex_query(__hk(), 0, 0); }
+    void fence() const { __msl_tex_fence(__hk()); }
 };
 
 // Depth textures: sample/read return T, sample_compare compares in hardware.
 #define __MSL_DEPTH_SAMPLE(C, CV, LAYER_PARAM, LAYER, O, OV, OZ) \
     T sample(sampler s, C c LAYER_PARAM O) const { \
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, CV, LAYER, 0u, 0.0f, CV, CV, OV).x; } \
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, CV, LAYER, 0u, 0.0f, CV, CV, OV).x; } \
     T sample(sampler s, C c LAYER_PARAM, level l O) const { \
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, CV, LAYER, 2u, l.value, CV, CV, OV).x; } \
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, CV, LAYER, 2u, l.value, CV, CV, OV).x; } \
     T sample(sampler s, C c LAYER_PARAM, bias b O) const { \
-        return __msl_tex_sample<__texel<T>>(__h, s.__h, CV, LAYER, 1u, b.value, CV, CV, OV).x; } \
+        return __msl_tex_sample<__texel<T>>(__hk(), s.__h, CV, LAYER, 1u, b.value, CV, CV, OV).x; } \
     T sample_compare(sampler s, C c LAYER_PARAM, float ref O) const { \
-        return (T)__msl_tex_sample_compare<float>(__h, s.__h, CV, LAYER, ref, 0u, 0.0f, OV); } \
+        return (T)__msl_tex_sample_compare<float>(__hk(), s.__h, CV, LAYER, ref, 0u, 0.0f, OV); } \
     T sample_compare(sampler s, C c LAYER_PARAM, float ref, level l O) const { \
-        return (T)__msl_tex_sample_compare<float>(__h, s.__h, CV, LAYER, ref, 2u, l.value, OV); }
-template<typename T = float, access A = access::sample> struct depth2d {
-    uint __h;
+        return (T)__msl_tex_sample_compare<float>(__hk(), s.__h, CV, LAYER, ref, 2u, l.value, OV); }
+template<typename T = float, access A = access::sample> struct alignas(8) depth2d {
+    __MSL_TEXTURE_HANDLE(10)
     __MSL_DEPTH_SAMPLE(float2, c.v, , 0u, __MSL_COMMA int2 offset = int2(0), offset.v, int2(0))
     vec<T, 4> gather(sampler s, float2 c, int2 offset = int2(0)) const {
-        return __msl_tex_gather<__texel<T>>(__h, s.__h, c.v, 0u, offset.v, 0u); }
+        return __msl_tex_gather<__texel<T>>(__hk(), s.__h, c.v, 0u, offset.v, 0u); }
     vec<T, 4> gather_compare(sampler s, float2 c, float ref, int2 offset = int2(0)) const {
-        return __msl_tex_gather_compare<__texel<T>>(__h, s.__h, c.v, 0u, ref, offset.v); }
-    T read(uint2 c, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__h, c.v, 0u, lod).x; }
-    void write(T v, uint2 c, uint lod = 0) const { __msl_tex_write(__h, c.v, 0u, lod, vec<T, 4>(v).v); }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_height(uint lod = 0) const { return __msl_tex_query(__h, 1, lod); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
+        return __msl_tex_gather_compare<__texel<T>>(__hk(), s.__h, c.v, 0u, ref, offset.v); }
+    T read(uint2 c, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, 0u, lod).x; }
+    void write(T v, uint2 c, uint lod = 0) const { __msl_tex_write(__hk(), c.v, 0u, lod, vec<T, 4>(v).v); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_height(uint lod = 0) const { return __msl_tex_query(__hk(), 1, lod); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
 };
-template<typename T = float, access A = access::sample> struct depth2d_array {
-    uint __h;
+template<typename T = float, access A = access::sample> struct alignas(8) depth2d_array {
+    __MSL_TEXTURE_HANDLE(11)
     __MSL_DEPTH_SAMPLE(float2, c.v, __MSL_COMMA uint array, array, __MSL_COMMA int2 offset = int2(0), offset.v, int2(0))
     vec<T, 4> gather(sampler s, float2 c, uint array, int2 offset = int2(0)) const {
-        return __msl_tex_gather<__texel<T>>(__h, s.__h, c.v, array, offset.v, 0u); }
+        return __msl_tex_gather<__texel<T>>(__hk(), s.__h, c.v, array, offset.v, 0u); }
     vec<T, 4> gather_compare(sampler s, float2 c, uint array, float ref, int2 offset = int2(0)) const {
-        return __msl_tex_gather_compare<__texel<T>>(__h, s.__h, c.v, array, ref, offset.v); }
-    T read(uint2 c, uint array, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__h, c.v, array, lod).x; }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_height(uint lod = 0) const { return __msl_tex_query(__h, 1, lod); }
-    uint get_array_size() const { return __msl_tex_query(__h, 3, 0); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
+        return __msl_tex_gather_compare<__texel<T>>(__hk(), s.__h, c.v, array, ref, offset.v); }
+    T read(uint2 c, uint array, uint lod = 0) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, array, lod).x; }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_height(uint lod = 0) const { return __msl_tex_query(__hk(), 1, lod); }
+    uint get_array_size() const { return __msl_tex_query(__hk(), 3, 0); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
 };
-template<typename T = float, access A = access::read> struct depth2d_ms {
-    uint __h;
-    T read(uint2 c, uint sample) const { return __msl_tex_read<__texel<T>>(__h, c.v, 0u, sample).x; }
-    uint get_width() const { return __msl_tex_query(__h, 0, 0); }
-    uint get_height() const { return __msl_tex_query(__h, 1, 0); }
-    uint get_num_samples() const { return __msl_tex_query(__h, 5, 0); }
+template<typename T = float, access A = access::read> struct alignas(8) depth2d_ms {
+    __MSL_TEXTURE_HANDLE(12)
+    T read(uint2 c, uint sample) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, 0u, sample).x; }
+    uint get_width() const { return __msl_tex_query(__hk(), 0, 0); }
+    uint get_height() const { return __msl_tex_query(__hk(), 1, 0); }
+    uint get_num_samples() const { return __msl_tex_query(__hk(), 5, 0); }
 };
-template<typename T = float, access A = access::read> struct depth2d_ms_array {
-    uint __h;
-    T read(uint2 c, uint array, uint sample) const { return __msl_tex_read<__texel<T>>(__h, c.v, array, sample).x; }
-    uint get_width() const { return __msl_tex_query(__h, 0, 0); }
-    uint get_height() const { return __msl_tex_query(__h, 1, 0); }
-    uint get_array_size() const { return __msl_tex_query(__h, 3, 0); }
-    uint get_num_samples() const { return __msl_tex_query(__h, 5, 0); }
+template<typename T = float, access A = access::read> struct alignas(8) depth2d_ms_array {
+    __MSL_TEXTURE_HANDLE(13)
+    T read(uint2 c, uint array, uint sample) const { return __msl_tex_read<__texel<T>>(__hk(), c.v, array, sample).x; }
+    uint get_width() const { return __msl_tex_query(__hk(), 0, 0); }
+    uint get_height() const { return __msl_tex_query(__hk(), 1, 0); }
+    uint get_array_size() const { return __msl_tex_query(__hk(), 3, 0); }
+    uint get_num_samples() const { return __msl_tex_query(__hk(), 5, 0); }
 };
-template<typename T = float, access A = access::sample> struct depthcube {
-    uint __h;
+template<typename T = float, access A = access::sample> struct alignas(8) depthcube {
+    __MSL_TEXTURE_HANDLE(14)
     __MSL_DEPTH_SAMPLE(float3, c.v, , 0u, , 0, 0)
-    vec<T, 4> gather(sampler s, float3 c) const { return __msl_tex_gather<__texel<T>>(__h, s.__h, c.v, 0u, 0, 0u); }
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_height(uint lod = 0) const { return __msl_tex_query(__h, 1, lod); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
+    vec<T, 4> gather(sampler s, float3 c) const { return __msl_tex_gather<__texel<T>>(__hk(), s.__h, c.v, 0u, 0, 0u); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_height(uint lod = 0) const { return __msl_tex_query(__hk(), 1, lod); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
 };
-template<typename T = float, access A = access::sample> struct depthcube_array {
-    uint __h;
+template<typename T = float, access A = access::sample> struct alignas(8) depthcube_array {
+    __MSL_TEXTURE_HANDLE(15)
     __MSL_DEPTH_SAMPLE(float3, c.v, __MSL_COMMA uint array, array, , 0, 0)
-    uint get_width(uint lod = 0) const { return __msl_tex_query(__h, 0, lod); }
-    uint get_height(uint lod = 0) const { return __msl_tex_query(__h, 1, lod); }
-    uint get_array_size() const { return __msl_tex_query(__h, 3, 0); }
-    uint get_num_mip_levels() const { return __msl_tex_query(__h, 4, 0); }
+    uint get_width(uint lod = 0) const { return __msl_tex_query(__hk(), 0, lod); }
+    uint get_height(uint lod = 0) const { return __msl_tex_query(__hk(), 1, lod); }
+    uint get_array_size() const { return __msl_tex_query(__hk(), 3, 0); }
+    uint get_num_mip_levels() const { return __msl_tex_query(__hk(), 4, 0); }
 };
 #undef __MSL_DEPTH_SAMPLE
 #undef __MSL_TEX_ATOMICS
 #undef __MSL_COMMA
+
+#pragma clang attribute pop
 
 } // namespace metal

@@ -1,4 +1,6 @@
 #include "alchemy/darwin/metal/device.hpp"
+
+#include "alchemy/darwin/metal/bindless.hpp"
 #include "alchemy/host/gpu.hpp"
 #include "alchemy/host/process.hpp"
 
@@ -310,7 +312,7 @@ void Device::initialize(const DeviceOptions& options) {
     X(scalarBlockLayout) X(uniformBufferStandardLayout) X(shaderSubgroupExtendedTypes)                           \
     X(separateDepthStencilLayouts) X(hostQueryReset) X(timelineSemaphore) X(bufferDeviceAddress)                 \
     X(vulkanMemoryModel) X(vulkanMemoryModelDeviceScope) X(shaderOutputViewportIndex) X(shaderOutputLayer)       \
-    X(subgroupBroadcastDynamicId)
+    X(subgroupBroadcastDynamicId) X(descriptorBindingSampledImageUpdateAfterBind)                                     X(descriptorBindingStorageImageUpdateAfterBind) X(descriptorBindingUpdateUnusedWhilePending)
 #define ALCHEMY_F13(X) X(pipelineCreationCacheControl) X(shaderDemoteToHelperInvocation)                           \
     X(shaderTerminateInvocation) X(subgroupSizeControl) X(computeFullSubgroups) X(synchronization2)               \
     X(shaderZeroInitializeWorkgroupMemory) X(dynamicRendering) X(shaderIntegerDotProduct) X(maintenance4)
@@ -476,10 +478,10 @@ void Device::build_profile() {
     p.max_threadgroup_memory = limits.maxComputeSharedMemorySize;
     p.thread_execution_width = properties11.subgroupSize ? properties11.subgroupSize : 32;
     // Tier 2 argument buffers: arbitrary buffer pointers (buffer device
-    // address) plus descriptor indexing for resource arrays.
-    const bool indexing = features12.runtimeDescriptorArray && features12.descriptorBindingPartiallyBound &&
-                          features12.shaderSampledImageArrayNonUniformIndexing;
-    p.argument_buffers_tier = features12.bufferDeviceAddress && indexing ? 1 : 0;
+    // address) and textures and samplers by MTLResourceID, which the
+    // bindless set (bindless.hpp) needs descriptor indexing and
+    // update-after-bind for.
+    p.argument_buffers_tier = Bindless::supported(*this) ? 1 : 0;
     // MTLReadWriteTextureTier2 is defined by a format list (Metal feature
     // set tables): read_write access to R32/RGBA32/RGBA16 float and integer,
     // RGBA8, R16 and R8 textures. Vulkan 1.3 backs it per format with

@@ -114,6 +114,14 @@ inline constexpr std::uint32_t argument_buffer_sampler_binding_base = 192;
 // Framebuffer fetch (addition by A6, wave 2; see ColorInput): a fragment
 // input [[color(n)]] reads input attachment n at binding 224 + n.
 inline constexpr std::uint32_t color_input_binding_base = 224;
+// Argument buffers holding textures and samplers (bindless, M2): one
+// device-wide descriptor set at this index for every stage. A texture or
+// sampler read from an argument buffer is an MTLResourceID, its index into
+// these runtime arrays; Reflection::bindless says a function reads them.
+inline constexpr std::uint32_t bindless_descriptor_set = 2;
+inline constexpr std::uint32_t bindless_sampled_image_binding = 0;
+inline constexpr std::uint32_t bindless_storage_image_binding = 1;
+inline constexpr std::uint32_t bindless_sampler_binding = 2;
 inline constexpr std::uint32_t maximum_buffers = 31;     // [[buffer(0..30)]]
 inline constexpr std::uint32_t maximum_textures = 128;
 inline constexpr std::uint32_t maximum_samplers = 16;
@@ -208,15 +216,18 @@ struct BufferBinding {
     // members in declaration order, at the byte offsets clang gives them (the
     // generated wrapper static_asserts each one). The shader reads the struct
     // from memory like any other buffer, so an MTLArgumentEncoder writes buffer
-    // device addresses (8 bytes) and constant data at these offsets. Textures
-    // and samplers in such a struct are unsupported (no bindless descriptors).
+    // device addresses (8 bytes) and constant data at these offsets. Texture
+    // and sampler members (M2) are MTLResourceIDs (8 bytes): the shader indexes
+    // the bindless set (bindless_descriptor_set) with them.
     struct Argument {
+        enum class Resource : std::uint32_t { data, texture, sampler };
         std::string name;
         std::uint32_t id{};               // [[id(n)]]; an array takes ids id .. id + count - 1
         std::uint32_t count{1};           // elements of an array member
         std::uint32_t offset{};           // byte offset of element 0
         std::uint32_t stride{8};          // bytes between elements
-        bool pointer{true};               // a buffer pointer, else constant data of `type`
+        bool pointer{true};               // a buffer pointer, else constant data of `type` or a resource
+        Resource resource{Resource::data};   // texture / sampler: an MTLResourceID (pointer is false)
         std::uint32_t type{};             // data element type (index into Reflection::types)
     };
     std::vector<Argument> arguments;
@@ -373,6 +384,9 @@ struct Reflection {
     std::uint32_t max_total_threads_per_threadgroup{};   // [[max_total_threads_per_threadgroup(n)]], 0 = none
     std::vector<ThreadgroupMemory> threadgroup_memory;
     bool uses_simdgroup_operations{};
+    // Reads textures or samplers through the bindless set
+    // (bindless_descriptor_set): ones loaded from argument buffers.
+    bool bindless{};
     // Lowering notes for diagnostics and the Metal trace (e.g. "argument
     // buffer buffer(2): textures inside argument buffers are unsupported").
     std::vector<std::string> notes;

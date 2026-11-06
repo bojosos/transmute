@@ -83,7 +83,7 @@ namespace decoration {
 enum : std::uint32_t { SpecId = 1, Block = 2, ArrayStride = 6, BuiltIn = 11, NoPerspective = 13, Flat = 14,
     Centroid = 16, Sample = 17, Invariant = 18, NonWritable = 24, NonReadable = 25, Location = 30, Component = 31,
     Index = 32, Binding = 33, DescriptorSet = 34, Offset = 35, Aliased = 20, Restrict = 19, InputAttachmentIndex = 43,
-    AliasedPointer = 5356, RestrictPointer = 5355 };
+    AliasedPointer = 5356, RestrictPointer = 5355, NonUniform = 5300 };
 }
 namespace builtin {
 enum : std::uint32_t { Position = 0, PointSize = 1, ClipDistance = 3, PrimitiveId = 7, InvocationId = 8, Layer = 9,
@@ -104,7 +104,8 @@ enum : std::uint32_t { Matrix = 0, Shader = 1, Geometry = 2, Float16 = 9, Float6
     SampleRateShading = 35, ImageCubeArray = 34, DrawParameters = 4427, StorageBuffer16BitAccess = 4433,
     StorageBuffer8BitAccess = 4448, StencilExportEXT = 5013, FragmentBarycentricKHR = 5284, ShaderLayer = 69, ShaderViewportIndex = 70,
     PhysicalStorageBufferAddresses = 5347, AtomicFloat32AddEXT = 6033, Int64Atomics = 12,
-    MinLod = 42, DemoteToHelperInvocation = 5379, InputAttachment = 40 };
+    MinLod = 42, DemoteToHelperInvocation = 5379, InputAttachment = 40, ShaderNonUniform = 5301,
+    RuntimeDescriptorArray = 5302, SampledImageArrayNonUniformIndexing = 5307, StorageImageArrayNonUniformIndexing = 5309 };
 }
 
 using Words = std::vector<std::uint32_t>;
@@ -136,6 +137,7 @@ public:
         return type({op::TypeImage, sampled, dim, depth, arrayed, ms, sampled_kind, format});
     }
     std::uint32_t type_sampler() { return type({op::TypeSampler}); }
+    std::uint32_t type_runtime_array(std::uint32_t element) { return type({op::TypeRuntimeArray, element}); }
     std::uint32_t type_sampled_image(std::uint32_t image) { return type({op::TypeSampledImage, image}); }
 
     // ---- constants ----------------------------------------------------------------------
