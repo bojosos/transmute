@@ -1,8 +1,13 @@
 #include "alchemy/darwin/libsystem/misc/xpc_internal.hpp"
 
+#include "alchemy/darwin/launchd/plist.hpp"
+#include "alchemy/path.hpp"
+
 #include <bit>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <set>
 #include <optional>
 #include <stdexcept>
 
@@ -25,8 +30,14 @@
 //   it. The peer's pid, uid, gid and audit token come from the received messages' audit trailer.
 // * Delivery is on guest dispatch queues (MACH_RECV sources, and MACH_SEND dead-name sources
 //   for the peer), never on host threads.
-// Not here: bundled XPC services (xpc_connection_create with a name, xpc_main in one) and the
-// privileged flag (the system domain) are invalid; shared memory objects do not travel.
+// * Bundled XPC services (xpc_connection_create with a name): the .xpc bundle whose
+//   CFBundleIdentifier is the name, in the main bundle's Contents/XPCServices or a framework's
+//   XPCServices of the main bundle. One instance serves the application's process tree
+//   (ServiceType Application): a client looks the name up in the tree, and when no instance has
+//   checked it in, starts the service as its child (XPC_SERVICE_NAME = the name, plus the
+//   XPCService EnvironmentVariables) and waits for its xpc_main to check in.
+// Not here: the privileged flag (the system domain) is invalid; ServiceType User/System and
+// JoinExistingSession are treated as Application; shared memory objects do not travel.
 namespace alchemy::export_fill::xpc_detail {
 namespace {
 
@@ -54,6 +65,7 @@ struct Conn {
     std::uint64_t object{};        // its OS_xpc_connection (not retained here)
     Role role{Role::client};
     bool mach_service{}, interrupts{};   // a Mach-service client: a dead peer interrupts, it does not invalidate
+    bool bundled{};                // a bundled XPC service of this application (the name is its bundle identifier)
     std::uint32_t service{};       // client: a send right to the listener; listener: its receive right
     std::uint32_t inbox{};         // client and peer: this end's receive right
     std::uint32_t peer{};          // client and peer: a send right to the other end's inbox
@@ -90,7 +102,7 @@ public:
     std::map<std::uint64_t, Received> received;       // dictionary -> where it came from
     std::map<std::uint64_t, std::uint32_t> reply_to;  // reply dictionary -> the send-once right it answers
     std::uint64_t next_channel{1};
-    std::uint64_t event_entry{};
+    std::uint64_t event_entry{}, connect_entry{};
 
     ProcessContext& process() { return p.process(); }
     GuestMemory& memory() { return process().calling_engine(); }
@@ -465,7 +477,7 @@ public:
         { std::lock_guard lock(mutex); inbox = std::exchange(c->inbox, 0); peer = std::exchange(c->peer, 0); }
         drop_receive(inbox);
         drop_send(peer);
-        if (interrupted && c->mach_service) {
+        if (interrupted && (c->mach_service || c->bundled)) {
             // The next send looks the service up again (its job may run anew).
             std::uint32_t service;
             { std::lock_guard lock(mutex); service = std::exchange(c->service, 0); }
@@ -494,14 +506,8 @@ public:
             service = c->service;
         }
         if (!mach()) { fail(c, false); return; }
-        if (!service && c->mach_service) {
-            GuestCell cell(*this);
-            const auto text = process().allocate_guest(name.size() + 1);
-            put_string(memory(), text, name);
-            const auto status = sys("_bootstrap_look_up", {bootstrap(), text, cell.address});
-            process().release_guest(text);
-            if (status == 0) service = memory().read32(cell.address);
-        }
+        if (!service && c->mach_service) service = look_up(name);
+        if (!service && c->bundled) service = start_bundled(name);
         if (!service) { fail(c, false); return; }
         const auto inbox = new_receive();
         const auto queue = queue_of(c);
@@ -516,6 +522,115 @@ public:
             if (c->mach_service) { std::lock_guard lock(mutex); c->service = 0; }
             fail(c, c->interrupts);
         }
+    }
+
+    // A send right to `name` in the bootstrap namespace (0: unknown).
+    std::uint32_t look_up(const std::string& name) {
+        GuestCell cell(*this);
+        const auto text = process().allocate_guest(name.size() + 1);
+        put_string(memory(), text, name);
+        const auto status = sys("_bootstrap_look_up", {bootstrap(), text, cell.address});
+        process().release_guest(text);
+        return status == 0 ? memory().read32(cell.address) : 0;
+    }
+
+    struct Bundled {
+        std::filesystem::path executable;
+        std::vector<std::pair<std::string, std::string>> environment;
+    };
+
+    // The .xpc bundle of the main bundle (or one of its frameworks) whose identifier is `name`.
+    std::optional<Bundled> find_bundled(const std::string& name) {
+        // The main bundle: the executable's Contents/MacOS/.. when it is in one.
+        const auto executable = process().executable;
+        const auto macos = executable.parent_path();
+        if (macos.filename() != "MacOS" || macos.parent_path().filename() != "Contents") return std::nullopt;
+        const auto contents = macos.parent_path();
+        std::vector<std::filesystem::path> folders{contents / "XPCServices"};
+        std::error_code error;
+        for (const auto& framework : std::filesystem::directory_iterator(contents / "Frameworks", error)) {
+            if (framework.path().extension() != ".framework") continue;
+            folders.push_back(framework.path() / "XPCServices");
+            for (const auto& version : std::filesystem::directory_iterator(framework.path() / "Versions", error))
+                if (version.path().filename() != "Current") folders.push_back(version.path() / "XPCServices");
+        }
+        for (const auto& folder : folders) {
+            std::error_code ignored;
+            for (const auto& bundle : std::filesystem::directory_iterator(folder, ignored)) {
+                if (bundle.path().extension() != ".xpc") continue;
+                try {
+                    const auto info = launchd::read_plist_file(path_utf8(bundle.path() / "Contents" / "Info.plist"));
+                    const auto* identifier = info.find("CFBundleIdentifier");
+                    const auto* program = info.find("CFBundleExecutable");
+                    if (!identifier || identifier->text != name || !program || program->text.empty()) continue;
+                    Bundled found;
+                    found.executable = bundle.path() / "Contents" / "MacOS" / utf8_path(program->text);
+                    if (const auto* service = info.find("XPCService"))
+                        if (const auto* variables = service->find("EnvironmentVariables"))
+                            for (const auto& [key, item] : variables->dictionary)
+                                if (item.is(launchd::Value::Kind::string)) found.environment.emplace_back(key, item.text);
+                    return found;
+                } catch (const std::exception&) {
+                    continue;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::set<std::string> starting;   // bundled services this process is starting (under mutex)
+
+    // A bundled service of this application: the instance the tree has, or a new one started
+    // here and waited for (it checks its name in from xpc_main).
+    std::uint32_t start_bundled(const std::string& name) {
+        if (const auto found = look_up(name)) return found;
+        const auto bundle = find_bundled(name);
+        if (!bundle) return 0;
+        bool mine;
+        { std::lock_guard lock(mutex); mine = starting.insert(name).second; }
+        if (mine) {
+            // argv {path}, the environment plus XPC_SERVICE_NAME and the bundle's variables.
+            std::vector<std::string> extra{"XPC_SERVICE_NAME=" + name};
+            for (const auto& [key, text] : bundle->environment) extra.push_back(key + "=" + text);
+            const auto environment_cell = sys("__NSGetEnviron", {});
+            const auto environment_array = environment_cell ? memory().read64(environment_cell) : 0;
+            std::vector<std::uint64_t> pointers;
+            for (std::uint64_t at = environment_array; at; at += 8) {
+                const auto entry = memory().read64(at);
+                if (!entry) break;
+                if (read_text(memory(), entry).starts_with("XPC_SERVICE_NAME=")) continue;
+                pointers.push_back(entry);
+            }
+            std::vector<std::uint64_t> owned;
+            const auto guest_text = [&](const std::string& text) {
+                const auto address = process().allocate_guest(text.size() + 1);
+                put_string(memory(), address, text);
+                owned.push_back(address);
+                return address;
+            };
+            for (const auto& item : extra) pointers.push_back(guest_text(item));
+            const auto path = guest_text(guest_path_string(bundle->executable));
+            const auto envp = process().allocate_guest((pointers.size() + 1) * 8);
+            for (std::size_t i = 0; i < pointers.size(); ++i) memory().write64(envp + i * 8, pointers[i]);
+            memory().write64(envp + pointers.size() * 8, 0);
+            const auto argv = process().allocate_guest(16);
+            memory().write64(argv, path);
+            memory().write64(argv + 8, 0);
+            GuestCell pid(*this);
+            const auto status = sys("_posix_spawn", {pid.address, path, 0, 0, argv, envp});
+            process().release_guest(argv);
+            process().release_guest(envp);
+            for (const auto address : owned) process().release_guest(address);
+            if (status != 0) { std::lock_guard lock(mutex); starting.erase(name); return 0; }
+        }
+        // Wait for its check-in (a cold service takes a while to start).
+        std::uint32_t found = 0;
+        for (int i = 0; i < 600 && !found; ++i) {
+            found = look_up(name);
+            if (!found) static_cast<void>(sys("_usleep", {50000}));
+        }
+        if (mine) { std::lock_guard lock(mutex); starting.erase(name); }
+        return found;
     }
 
     void flush(const std::shared_ptr<Conn>& c) {
@@ -710,7 +825,19 @@ public:
             if (!connected) c->outgoing.push_back(xpc_->retain(message));
         }
         if (connected) deliver_message(c, peer, message, 0, 0);
-        else ensure_connected(c);
+        else schedule_connect(c);
+    }
+
+    // A resumed client that is not connected connects on its queue; the waiting messages follow.
+    void schedule_connect(const std::shared_ptr<Conn>& c) {
+        bool resumed;
+        { const auto v = value(c->object); std::lock_guard lock(v->mutex); resumed = v->resumed; }
+        {
+            std::lock_guard lock(mutex);
+            if (!resumed || c->role != Role::client || c->connecting || c->connected || c->finished) return;
+        }
+        static_cast<void>(xpc_->retain(c->object));
+        static_cast<void>(sys("_dispatch_async_f", {queue_of(c), c->object, connect_entry}));
     }
 
     // A client that is not connected (yet, or after an interruption) connects, and waits a
@@ -785,7 +912,13 @@ public:
             else fail(c, false);
             return;
         }
-        if (role == Role::client) connect(c);
+        if (role != Role::client) return;
+        bool bundled;
+        { std::lock_guard lock(mutex); bundled = c->bundled; }
+        if (!bundled) { connect(c); return; }
+        // Starting a bundled service can take seconds: on the connection's queue, not here.
+        static_cast<void>(xpc_->retain(object));
+        static_cast<void>(sys("_dispatch_async_f", {queue, object, connect_entry}));
     }
 
     void cancel(std::uint64_t object) {
@@ -834,10 +967,18 @@ void install_xpc_connections(Provider& p, const std::shared_ptr<Xpc>& xpc) {
         self->on_event(s.x[0]);
         s.x[0] = 0;
     });
+    // A resumed client's connect, on its queue (context: the connection, retained by resume).
+    self->connect_entry = p.process().install_function("__alchemy_xpc_connect", [self](CpuState& s, GuestMemory&) {
+        const auto object = s.x[0];
+        self->connect(self->conn(object));
+        self->flush(self->conn(object));
+        self->xpc_->release(object);
+        s.x[0] = 0;
+    });
 
     // ---- creation ----
     // xpc_connection_create(name, queue): NULL is an anonymous listener; a name is a bundled XPC
-    // service, which no host runs yet (invalid once resumed).
+    // service of this application.
     p.libsystem("_xpc_connection_create", [self](CpuState& s, GuestMemory& m) -> std::uint64_t {
         const auto name = s.x[0] ? read_text(m, s.x[0]) : std::string("anonymous");
         const auto object = self->make_connection(name, s.x[1]);
@@ -847,6 +988,11 @@ void install_xpc_connections(Provider& p, const std::shared_ptr<Xpc>& xpc) {
             std::lock_guard lock(self->mutex);
             c->role = Role::listener;
             c->service = port;
+        } else {
+            // A bundled XPC service; a dead instance is replaced on the next send.
+            std::lock_guard lock(self->mutex);
+            c->role = Role::client;
+            c->bundled = c->interrupts = true;
         }
         return object;
     }, 0);
@@ -1012,10 +1158,11 @@ void install_xpc_connections(Provider& p, const std::shared_ptr<Xpc>& xpc) {
         return self->xpc_->typed(item, Type::connection) ? self->xpc_->retain(item) : 0;
     }, 0);
 
-    // xpc_main(handler): in a job of the session launchd, its service (XPC_SERVICE_NAME, the
-    // label; the job declares it in MachServices) is a listener whose peers go to the handler,
-    // and the process serves them until it is ended. Elsewhere this process is not an XPC
-    // service, and xpc_main stops.
+    // xpc_main(handler): the service named XPC_SERVICE_NAME is a listener whose peers go to the
+    // handler, and the process serves them until it is ended: a bundled XPC service (the name
+    // checked in to its application's tree), or a job of the session launchd (its label, which
+    // the job declares in MachServices). Elsewhere this process is not an XPC service, and
+    // xpc_main stops.
     p.libsystem("_xpc_main", [self](CpuState& s, GuestMemory& m) -> std::uint64_t {
         const auto key = self->process().allocate_guest(32);
         put_string(m, key, "XPC_SERVICE_NAME");

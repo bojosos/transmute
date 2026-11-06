@@ -57,6 +57,8 @@ LINK_ONLY(xpc_dictionary_get_int64)
 LINK_ONLY(xpc_dictionary_dup_fd)
 LINK_ONLY(xpc_get_type)
 LINK_ONLY(xpc_release)
+LINK_ONLY(xpc_connection_create)
+LINK_ONLY(xpc_main)
 const char _xpc_type_dictionary = 0, _xpc_type_connection = 0, _xpc_type_error = 0;
 const char _xpc_error_connection_interrupted = 0, _xpc_error_connection_invalid = 0;
 void* _NSConcreteGlobalBlock[32];

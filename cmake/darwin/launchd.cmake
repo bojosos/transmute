@@ -48,10 +48,29 @@ function(alchemy_launchd_session_tests)
         COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main
             "${macos_dir}/launchd_model.o" "${macos_dir}/launchd_system.dylib" -o "${macos_dir}/launchd_model"
         DEPENDS "${macos_dir}/launchd_model.o" "${macos_dir}/launchd_system.dylib" VERBATIM)
-    add_custom_target(alchemy_launchd_fixtures DEPENDS "${macos_dir}/launchd_model")
+    # LaunchdModel.app: launchd_model with a bundled XPC service (L4).
+    alchemy_object(launchd_xpc_service launchd_xpc_service.c)
+    add_custom_command(OUTPUT "${macos_dir}/launchd_xpc_service"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main
+            "${macos_dir}/launchd_xpc_service.o" "${macos_dir}/launchd_system.dylib" -o "${macos_dir}/launchd_xpc_service"
+        DEPENDS "${macos_dir}/launchd_xpc_service.o" "${macos_dir}/launchd_system.dylib" VERBATIM)
+    set(app "${macos_dir}/LaunchdModel.app/Contents")
+    set(service "${app}/XPCServices/com.alchemy.test.echo.xpc/Contents")
+    file(MAKE_DIRECTORY "${app}/MacOS" "${service}/MacOS")
+    file(WRITE "${app}/Info.plist" "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>CFBundleIdentifier</key><string>com.alchemy.test.launchd-model</string>\n<key>CFBundleExecutable</key><string>launchd_model</string>\n</dict></plist>\n")
+    file(WRITE "${service}/Info.plist" "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>CFBundleIdentifier</key><string>com.alchemy.test.echo</string>\n<key>CFBundleExecutable</key><string>echo_service</string>\n<key>CFBundlePackageType</key><string>XPC!</string>\n<key>XPCService</key><dict><key>ServiceType</key><string>Application</string>\n<key>EnvironmentVariables</key><dict><key>ALCHEMY_TEST_XPC_ENV</key><string>from-info-plist</string></dict></dict>\n</dict></plist>\n")
+    add_custom_command(OUTPUT "${app}/MacOS/launchd_model" "${service}/MacOS/echo_service"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${macos_dir}/launchd_model" "${app}/MacOS/launchd_model"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${macos_dir}/launchd_xpc_service" "${service}/MacOS/echo_service"
+        DEPENDS "${macos_dir}/launchd_model" "${macos_dir}/launchd_xpc_service" VERBATIM)
+    add_custom_target(alchemy_launchd_fixtures DEPENDS "${macos_dir}/launchd_model" "${app}/MacOS/launchd_model" "${service}/MacOS/echo_service")
     add_dependencies(alchemy_process_model_tests alchemy_launchd_fixtures)
     add_test(NAME alchemy_launchd_session_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${macos_dir}/launchd_model" launchctl mach sockets xpc)
     set_tests_properties(alchemy_launchd_session_fx PROPERTIES TIMEOUT 600
+        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback")
+    # Bundled XPC services: the model run from inside its application bundle.
+    add_test(NAME alchemy_launchd_xpc_bundle_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${app}/MacOS/launchd_model" xpc-bundle)
+    set_tests_properties(alchemy_launchd_xpc_bundle_fx PROPERTIES TIMEOUT 600
         ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback")
 endfunction()
 alchemy_gui_register_tests(alchemy_launchd_session_tests)

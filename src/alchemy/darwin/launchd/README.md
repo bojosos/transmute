@@ -118,8 +118,19 @@ internals it shares through `misc/xpc_internal.hpp`):
   trailer of the messages received.
 * **Delivery** runs on guest dispatch queues (MACH_RECV and MACH_SEND dead-name
   sources), never on host threads.
-* **Not yet:** bundled XPC services (`xpc_connection_create` with a name, and
-  `xpc_main` outside a launchd job) and NSXPCConnection. The privileged flag
+* **Bundled XPC services** (`xpc_connection_create(name)`): the `.xpc` bundle
+  whose CFBundleIdentifier is `name`, in the main bundle's
+  `Contents/XPCServices` or a framework's `XPCServices`.
+  * One instance serves the application's process tree. If no instance has
+    checked the name in, the client starts the service as its child, with
+    `XPC_SERVICE_NAME` set to the name and the XPCService
+    EnvironmentVariables. The service's `xpc_main` checks the name in.
+  * A service that exits is started again on the next send.
+  * Resume and send don't block while it starts: the connect runs on the
+    connection's queue.
+  * ServiceType User and System, and JoinExistingSession, are treated as
+    Application.
+* **Not yet:** NSXPCConnection (L5). The privileged flag
   (the system domain) is invalid. Without the Mach layer (alchemy.exe, unit
   fixtures) every connection is invalid, as before.
 
@@ -186,3 +197,8 @@ These are refused, by the user's decisions of 2026-11-05:
     covers a sync reply carrying an fd, an async reply, the peer's pid, the
     job's exit (INTERRUPTED), a new run on the next request, and cancel
     (INVALID).
+* `alchemy_launchd_xpc_bundle_fx` (the model run from `LaunchdModel.app`,
+  with `tests/fixtures/macos/launchd_xpc_service.c` as its bundled service).
+  It covers the service started as the app's child, XPC_SERVICE_NAME and the
+  Info.plist environment, one instance for two connections, and an unknown
+  name being invalid.

@@ -599,6 +599,57 @@ static void test_xpc(void) {
     done(t, before);
 }
 
+/* ---- Bundled XPC services (L4): run from LaunchdModel.app/Contents/MacOS ---------------------------- */
+extern xpc_object_t xpc_connection_create(const char*, void*);
+
+static long long bundled_ask(xpc_object_t connection, long long value, char* service, char* extra, long long* ppid) {
+    xpc_object_t request = xpc_dictionary_create(0, 0, 0);
+    xpc_dictionary_set_int64(request, "value", value);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(connection, request);
+    xpc_release(request);
+    long long pid = -1;
+    if (xpc_get_type(reply) == &_xpc_type_dictionary && xpc_dictionary_get_int64(reply, "value") == value + 1) {
+        pid = xpc_dictionary_get_int64(reply, "pid");
+        if (ppid) *ppid = xpc_dictionary_get_int64(reply, "ppid");
+        const char* s = xpc_dictionary_get_string(reply, "service");
+        const char* e = xpc_dictionary_get_string(reply, "extra");
+        if (service) copy(service, s ? s : "");
+        if (extra) copy(extra, e ? e : "");
+    } else if (xpc_get_type(reply) == &_xpc_type_error) {
+        pid = reply == (void*)&_xpc_error_connection_invalid ? -3 : -4;
+    }
+    xpc_release(reply);
+    return pid;
+}
+
+static void test_xpc_bundle(void) {
+    const int before = failures; const char* t = "xpc-bundle";
+    char service[128] = {0}, extra[128] = {0};
+    long long ppid = 0;
+    xpc_object_t first = xpc_connection_create("com.alchemy.test.echo", 0);
+    xpc_connection_set_event_handler(first, &client_event_block);
+    xpc_connection_resume(first);
+    const long long pid = bundled_ask(first, 1, service, extra, &ppid);
+    check(pid > 0 && pid != getpid(), t, "the bundled service answers from its own process", (long)pid);
+    check(ppid == getpid(), t, "the service is this application's child", (long)ppid);
+    check(same(service, "com.alchemy.test.echo"), t, "XPC_SERVICE_NAME is its bundle identifier", 0);
+    check(same(extra, "from-info-plist"), t, "XPCService EnvironmentVariables reach it", 0);
+    /* A second connection reaches the same instance (ServiceType Application). */
+    xpc_object_t second = xpc_connection_create("com.alchemy.test.echo", 0);
+    xpc_connection_set_event_handler(second, &client_event_block);
+    xpc_connection_resume(second);
+    check(bundled_ask(second, 10, 0, 0, 0) == pid, t, "one instance serves the application", 0);
+    /* A name no bundle has: invalid. */
+    xpc_object_t none = xpc_connection_create("com.alchemy.test.none", 0);
+    xpc_connection_set_event_handler(none, &client_event_block);
+    xpc_connection_resume(none);
+    check(bundled_ask(none, 3, 0, 0, 0) == -3, t, "an unknown service is XPC_ERROR_CONNECTION_INVALID", 0);
+    xpc_connection_cancel(first);
+    xpc_connection_cancel(second);
+    xpc_connection_cancel(none);
+    done(t, before);
+}
+
 static int child(int argc, char** argv) {
     if (argc >= 4 && same(argv[2], "job")) {
         char text[256], digits[24];
@@ -629,6 +680,7 @@ int main(int argc, char** argv) {
     else if (same(argv[1], "mach")) test_mach();
     else if (same(argv[1], "sockets")) test_sockets();
     else if (same(argv[1], "xpc")) test_xpc();
+    else if (same(argv[1], "xpc-bundle")) test_xpc_bundle();
     else { out(2, "unknown test\n"); return 2; }
     return failures;
 }
