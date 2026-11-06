@@ -8,6 +8,7 @@
 #include "alchemy/darwin/metal/formats.hpp"
 #include "alchemy/darwin/metal/pipeline.hpp"
 #include "alchemy/darwin/metal/resources.hpp"
+#include "alchemy/msl/compiler.hpp"
 
 #include <array>
 #include <atomic>
@@ -995,6 +996,158 @@ std::string format_pixel(const std::array<std::uint8_t, 4>& p) {
     return std::to_string(p[0]) + " " + std::to_string(p[1]) + " " + std::to_string(p[2]) + " " + std::to_string(p[3]);
 }
 
+// MTLMultisampleDepthResolveFilter: the top-half triangle (z = 0) drawn into a
+// 4x depth target cleared to 1 and resolved into a single-sample one. Pixels
+// on the triangle's slanted edges are partly covered, so their samples hold
+// both 0 and 1: Min resolves them to 0, Max to 1, Sample0 to one of the two.
+// Inside and outside the triangle every filter gives 0 and 1.
+void test_depth_resolve_filters(const std::shared_ptr<metal::Device>& device) {
+    if (!(device->profile().texture_sample_counts & 4)) {
+        std::cout << "SKIP: depth resolve filters (no 4x multisampling)\n";
+        return;
+    }
+    metal::RenderPipelineDescriptor descriptor;
+    descriptor.vertex = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(vertex_function()));
+    descriptor.fragment = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(fragment_function(false)));
+    descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+    descriptor.depth_format = metal::pixel_format::depth32_float;
+    descriptor.sample_count = 4;
+    descriptor.attributes[0] = metal::VertexAttribute{29, 0, 0};
+    descriptor.layouts[0] = metal::VertexLayout{8, 1, 1};
+    descriptor.label = "depth resolve";
+    const auto pipeline = metal::RenderPipeline::create(device, descriptor);
+    auto depth_state = std::make_shared<metal::DepthStencilState>();
+    depth_state->depth_write = true;   // compare Always
+    const auto target = [&](std::uint32_t format, std::uint32_t samples) {
+        metal::TextureDescriptor texture;
+        texture.type = samples > 1 ? metal::TextureType::type2d_ms : metal::TextureType::type2d;
+        texture.pixel_format = format;
+        texture.width = texture.height = 64;
+        texture.sample_count = samples;
+        texture.usage = metal::texture_usage::render_target | metal::texture_usage::shader_read;
+        texture.options = {metal::StorageMode::private_};
+        return metal::Texture::create(device, texture);
+    };
+    const float tint[] = {1, 1, 1, 1};
+    const auto resolve = [&](std::uint32_t filter) {
+        const auto resolved = target(metal::pixel_format::depth32_float, 1);
+        metal::RenderPass pass;
+        pass.colors[0].texture = target(metal::pixel_format::rgba8_unorm, 4);
+        pass.colors[0].load_action = 2;
+        pass.colors[0].store_action = 0;   // DontCare
+        pass.depth.texture = target(metal::pixel_format::depth32_float, 4);
+        pass.depth.load_action = 2;
+        pass.depth.clear_depth = 1.0;
+        pass.depth.store_action = 2;       // MultisampleResolve
+        pass.depth.resolve_texture = resolved;
+        pass.depth.resolve_filter = filter;
+        const float positions[] = {-1, 1, 1, 1, 0, 0};
+        auto vertices = shared_buffer(device, sizeof(positions));
+        std::memcpy(vertices->contents(), positions, sizeof(positions));
+        const float colors[] = {1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1};
+        auto readback = shared_buffer(device, 64 * 256);
+        auto commands = metal::CommandBuffer::create(device);
+        commands->begin_render(pass);
+        commands->set_render_pipeline(pipeline);
+        commands->set_depth_stencil(depth_state);
+        commands->set_buffer(metal::Stage::vertex, 0, vertices, 0);
+        commands->set_bytes(metal::Stage::vertex, 1, {reinterpret_cast<const std::uint8_t*>(colors), sizeof(colors)});
+        commands->set_bytes(metal::Stage::fragment, 0, {reinterpret_cast<const std::uint8_t*>(tint), sizeof(tint)});
+        commands->draw(3, 0, 3, 1, 0);
+        commands->end_encoding();
+        commands->begin_blit();
+        commands->copy_texture_to_buffer(resolved, 0, 0, {0, 0, 0, 64, 64, 1}, readback, 0, 256, 64 * 256);
+        commands->end_encoding();
+        commands->commit();
+        expect(commands->wait(UINT64_MAX), "depth resolve command buffer completes");
+        std::vector<float> depths(64 * 64);
+        std::memcpy(depths.data(), readback->contents(), depths.size() * sizeof(float));
+        return depths;
+    };
+    const auto sample0 = resolve(0);
+    const bool min_max = (device->profile().depth_resolve_modes & (VK_RESOLVE_MODE_MIN_BIT | VK_RESOLVE_MODE_MAX_BIT)) ==
+                         (VK_RESOLVE_MODE_MIN_BIT | VK_RESOLVE_MODE_MAX_BIT);
+    expect(sample0[4 * 64 + 32] == 0.0F && sample0[60 * 64 + 32] == 1.0F,
+           "Sample0 depth resolve: 0 inside the triangle, the clear depth 1 outside");
+    if (!min_max) {
+        bool refused = false;
+        try { static_cast<void>(resolve(1)); } catch (const std::exception&) { refused = true; }
+        expect(refused, "a Min depth resolve stops explicitly on a device without MIN/MAX resolves");
+        std::cout << "SKIP: Min/Max depth resolves (the device has no MIN/MAX depth resolve modes)\n";
+        return;
+    }
+    const auto minimum = resolve(1), maximum = resolve(2);
+    std::size_t edges = 0;
+    for (std::size_t index = 0; index < minimum.size(); ++index) {
+        const auto lo = minimum[index], hi = maximum[index], s0 = sample0[index];
+        expect(lo <= s0 && s0 <= hi, "Min <= Sample0 <= Max at every pixel");
+        if (lo == 0.0F && hi == 1.0F) ++edges;
+    }
+    std::cout << "  depth resolve: " << edges << " partly covered edge pixels (Min 0, Max 1)\n";
+    expect(edges > 0, "edge pixels resolve to 0 with Min and to 1 with Max");
+    expect(minimum[4 * 64 + 32] == 0.0F && maximum[4 * 64 + 32] == 0.0F, "inside: every filter gives 0");
+    expect(minimum[60 * 64 + 32] == 1.0F && maximum[60 * 64 + 32] == 1.0F, "outside: every filter gives 1");
+}
+
+// [[barycentric_coord]] from MSL source (perspective and center_no_perspective):
+// the top-half triangle's fragments output their barycentrics as colour, so
+// the pixel next to each vertex is nearly pure red, green and blue. Skipped
+// without VK_KHR_fragment_shader_barycentric (supportsShaderBarycentricCoordinates NO).
+void test_barycentric_coordinates(const std::shared_ptr<metal::Device>& device) {
+    if (!device->fragment_shader_barycentric) {
+        std::cout << "SKIP: barycentric coordinates (no VK_KHR_fragment_shader_barycentric)\n";
+        return;
+    }
+    const auto compiled = msl::compile(R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VertexIn { float2 position [[attribute(0)]]; };
+struct VertexOut { float4 position [[position]]; };
+vertex VertexOut bary_vertex(VertexIn in [[stage_in]]) {
+    VertexOut out;
+    out.position = float4(in.position, 0.0, 1.0);
+    return out;
+}
+fragment float4 bary_perspective(VertexOut in [[stage_in]], float3 b [[barycentric_coord]]) { return float4(b, 1.0); }
+struct Linear { float4 position [[position]]; float3 b [[barycentric_coord, center_no_perspective]]; };
+fragment float4 bary_linear(Linear in [[stage_in]]) { return float4(in.b, 1.0); }
+)", {});
+    expect(compiled.success(), "barycentric MSL compiles: " + msl::format_diagnostics(compiled.diagnostics));
+    if (!compiled.success()) return;
+    const auto function = [&](std::string_view name) {
+        for (const auto& item : compiled.functions)
+            if (item.name == name) return std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(item));
+        throw std::runtime_error("missing function " + std::string(name));
+    };
+    for (const auto* fragment : {"bary_perspective", "bary_linear"}) {
+        metal::RenderPipelineDescriptor descriptor;
+        descriptor.vertex = function("bary_vertex");
+        descriptor.fragment = function(fragment);
+        descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+        descriptor.attributes[0] = metal::VertexAttribute{29, 0, 0};
+        descriptor.layouts[0] = metal::VertexLayout{8, 1, 1};
+        descriptor.label = fragment;
+        const auto pipeline = metal::RenderPipeline::create(device, descriptor);
+        metal::RenderPass pass;
+        pass.colors[0].texture = render_target(device);
+        pass.colors[0].load_action = 2;
+        pass.colors[0].store_action = 1;
+        pass.colors[0].clear_color = {0, 0, 0, 1};
+        const auto readback = draw_top_half(device, pass, {pipeline}, [](metal::CommandBuffer&, std::size_t) {});
+        // Vertices: (-1, 1) top left, (1, 1) top right, (0, 0) the centre.
+        const auto left = pixel(readback->contents(), 256, 2, 1), right = pixel(readback->contents(), 256, 61, 1),
+                   centre = pixel(readback->contents(), 256, 32, 30);
+        const auto dominant = [](const std::array<std::uint8_t, 4>& p, int channel) {
+            for (int c = 0; c < 3; ++c)
+                if (c == channel ? p[c] < 200 : p[c] > 60) return false;
+            return true;
+        };
+        expect(dominant(left, 0) && dominant(right, 1) && dominant(centre, 2),
+               std::string(fragment) + ": barycentrics weight the nearest vertex: " + format_pixel(left) + " / " +
+                   format_pixel(right) + " / " + format_pixel(centre));
+    }
+}
+
 // Framebuffer fetch: a [[color(1)]] fragment input reads what an earlier
 // draw of the same render pass wrote to color attachment 1 (input
 // attachment at binding 224 + 1, dynamic rendering local read).
@@ -1138,6 +1291,8 @@ int main() {
         test_visibility_results(device, metal::StorageMode::shared);
         test_sampler_lod_clamp(device);
         test_framebuffer_fetch(device);
+        test_depth_resolve_filters(device);
+        test_barycentric_coordinates(device);
         test_argument_buffer_samplers(device);
 #else
         std::cout << "SKIP: shader tests (glslangValidator was not found at configure time)\n";

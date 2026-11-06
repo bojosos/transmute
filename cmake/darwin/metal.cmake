@@ -19,6 +19,7 @@ if(ALCHEMY_VULKAN_INCLUDE)
         src/alchemy/darwin/metal/surface_textures.cpp
         src/alchemy/darwin/metal/external_memory.cpp
         src/alchemy/darwin/metal/shared_events.cpp
+        src/alchemy/darwin/metal/residency.cpp
         # newLibraryWithData: through the AIR translator DLL, when present
         # (external/m2v-capi, LGPL, loaded at run time; THIRD_PARTY_NOTICES.md).
         src/alchemy/darwin/metal/json.cpp

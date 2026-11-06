@@ -116,6 +116,10 @@ struct Attachment {
     std::uint32_t store_action{};     // MTLStoreAction
     std::shared_ptr<Texture> resolve_texture;
     std::uint32_t resolve_level{}, resolve_slice{}, resolve_depth_plane{};
+    // Depth: MTLMultisampleDepthResolveFilter (Sample0 = 0, Min = 1, Max = 2);
+    // stencil: MTLMultisampleStencilResolveFilter (Sample0 = 0,
+    // DepthResolvedSample = 1). Unused for colour attachments.
+    std::uint32_t resolve_filter{};
     std::array<double, 4> clear_color{0, 0, 0, 1};
     double clear_depth{1};
     std::uint32_t clear_stencil{};
@@ -238,7 +242,20 @@ public:
     // bounds one wait (callers loop to poll for process stops).
     bool wait(std::uint64_t timeout_ns);
     [[nodiscard]] std::uint64_t timeline_value() const noexcept { return value_; }
-    // GPU start/end times are not measured: kernelStartTime etc. report 0.
+    // kernelStartTime / kernelEndTime / GPUStartTime / GPUEndTime, seconds on
+    // mach_absolute_time's clock (host::time::monotonic_ns), all 0 until the
+    // command buffer completed. The kernel times are the host's: when commit
+    // submitted it and when its completion was observed. The GPU times are
+    // two timestamp queries (the start of its first recording, the end of
+    // its last) mapped to the host clock through the calibrated device clock;
+    // without VK_KHR/EXT_calibrated_timestamps the end is the observed
+    // completion and the start that minus the measured GPU duration. Command
+    // buffers record the queries only once the process asked for GPU times
+    // (want_gpu_times); before that, and without timestamp support, the GPU
+    // times are the kernel times.
+    struct Times { double kernel_start{}, kernel_end{}, gpu_start{}, gpu_end{}; };
+    [[nodiscard]] Times times();
+    static void want_gpu_times() noexcept;
     // Runs host work once the GPU finished (before guest handlers).
     void on_complete(std::function<void()> work);
     // Retains an object until completion (retainedReferences).
@@ -384,6 +401,12 @@ private:
     bool finalized_{};
     bool final_status_{};                 // finalize() finished: status_ is completed or error
     std::thread::id finalizer_;           // the thread running finalize()
+    // times(): the two timestamp queries (when recorded), the host times of
+    // submission and observed completion, and the result (final_status_).
+    VkQueryPool timing_{};
+    std::uint64_t submit_ns_{}, complete_ns_{};
+    Times times_{};
+    void resolve_times();
 };
 
 } // namespace alchemy::metal

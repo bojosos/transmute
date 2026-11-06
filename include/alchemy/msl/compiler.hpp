@@ -344,7 +344,8 @@ enum class Builtin : std::uint32_t { vertex_id, instance_id, base_vertex, base_i
     clip_distance, front_facing, point_coord, sample_id, sample_mask, primitive_id, render_target_array_index,
     viewport_array_index, thread_position_in_grid, thread_position_in_threadgroup, threadgroup_position_in_grid,
     threads_per_threadgroup, threads_per_grid, threadgroups_per_grid, thread_index_in_threadgroup,
-    thread_index_in_simdgroup, simdgroup_index_in_threadgroup, threads_per_simdgroup, simdgroups_per_threadgroup };
+    thread_index_in_simdgroup, simdgroup_index_in_threadgroup, threads_per_simdgroup, simdgroups_per_threadgroup,
+    barycentric_coord, barycentric_coord_no_perspective };
 
 struct Reflection {
     Stage stage{Stage::vertex};

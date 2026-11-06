@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,11 @@ struct DeviceProfile {
     bool barycentric_coordinates{}, bc_compression{}, float32_filtering{}, float32_blending{},
         depth24_stencil8{}, query_texture_lod{true}, shader_draw_parameters{};
     std::uint32_t texture_sample_counts{};          // VkSampleCountFlags valid for color and depth targets
+    // VkResolveModeFlags of multisample depth and stencil resolves
+    // (MTLMultisampleDepthResolveFilter Min/Max need MIN/MAX).
+    std::uint32_t depth_resolve_modes{}, stencil_resolve_modes{};
+    // Depth and stencil of one image may resolve with different modes.
+    bool independent_resolve{};
     std::uint32_t max_texture_2d{}, max_texture_3d{}, max_texture_cube{}, max_texture_layers{};
     std::uint32_t max_color_attachments{};
     std::uint32_t max_vertex_attributes{}, max_vertex_bindings{};
@@ -189,6 +195,11 @@ public:
     // ---- pipeline cache --------------------------------------------------------
     VkPipelineCache pipeline_cache{};
     void save_pipeline_cache();
+    // MTLBinaryArchive: the cache's data (vkGetPipelineCacheData), and data
+    // merged into it (a VkPipelineCache made from it; the driver ignores data
+    // of another device or driver version).
+    [[nodiscard]] std::vector<std::uint8_t> pipeline_cache_data();
+    void merge_pipeline_cache(std::span<const std::uint8_t> data);
     // A pipeline was created: the next submission at least 2 s after the last
     // creation saves the cache (a process that is killed, as GUI harnesses
     // do, never reaches ~Device).

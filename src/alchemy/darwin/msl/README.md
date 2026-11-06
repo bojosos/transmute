@@ -205,7 +205,10 @@ lowering -> SPIR-V module + Reflection     lower.cpp, spirv_builder.cpp
     `sample_mask` (in/out), `[[depth(any|less|greater)]]`, `point_size`,
     `clip_distance`, `render_target_array_index`, `viewport_array_index`,
     all kernel grid/threadgroup ids and sizes, SIMD-group lane/index/width
-    (kernels and fragments).
+    (kernels and fragments), `[[barycentric_coord]]` (`BaryCoordKHR`, or
+    `BaryCoordNoPerspKHR` with `center_no_perspective`; the device needs
+    `VK_KHR_fragment_shader_barycentric`, which is what
+    supportsShaderBarycentricCoordinates reports).
   * SIMD-group functions -> `GroupNonUniform*` (`simd_sum/product/min/max/
     and/or/xor`, prefix sums/products, `simd_shuffle*`, `simd_broadcast*`,
     `simd_ballot/any/all/vote`, `simd_is_first`, `quad_*`); barriers ->
@@ -308,7 +311,7 @@ Unsupported (explicit errors): `double`, `bfloat`, run-time selected
 textures/samplers (a handle not constant after inlining), argument buffers
 holding textures, or samplers together with other members, generic pointers stored in memory, array
 varyings and array vertex attributes, kernel `[[stage_in]]`,
-`[[barycentric_coord]]`, mesh/object/tile/
+centroid and sample interpolation of `[[barycentric_coord]]`, mesh/object/tile/
 visible/intersection functions, ray tracing, imageblocks, `memcpy`/`memset`
 with run-time length, recursion and non-inlinable calls, irreducible control
 flow, vector function constants, pixel-coordinate samplers with bias/gradient

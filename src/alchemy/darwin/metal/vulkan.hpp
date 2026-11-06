@@ -45,6 +45,7 @@ namespace alchemy::metal {
     X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) X(vkBeginCommandBuffer)                    \
     X(vkEndCommandBuffer) X(vkCreateShaderModule) X(vkDestroyShaderModule)                         \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)                   \
+    X(vkMergePipelineCaches)                                                                       \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout)       \
     X(vkDestroyPipelineLayout) X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines)            \
     X(vkDestroyPipeline) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool)                      \

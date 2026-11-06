@@ -14,6 +14,7 @@
 #include "alchemy/darwin/cryptotokenkit/install.hpp"
 #include "alchemy/darwin/localauthenticationembeddedui/install.hpp"
 #include "alchemy/darwin/mediaplayer/install.hpp"
+#include "alchemy/darwin/metalfx/install.hpp"
 #include "alchemy/darwin/opengl/install.hpp"
 #include "alchemy/darwin/openal/openal.hpp"
 #include "alchemy/darwin/safariservices/install.hpp"
@@ -108,6 +109,7 @@ constexpr Installer installers[] = {
     {"install_cryptotokenkit", cryptotokenkit::install_cryptotokenkit},
     {"install_localauthenticationembeddedui", localauthenticationembeddedui::install_localauthenticationembeddedui},
     {"install_mediaplayer", mediaplayer::install_mediaplayer},
+    {"install_metalfx", metalfx::install_metalfx},
     {"install_safariservices", safariservices::install_safariservices},
     {"install_usernotifications", usernotifications::install_usernotifications},
     {"install_vision", vision::install_vision},

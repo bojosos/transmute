@@ -250,8 +250,24 @@ const std::map<std::string_view, Builtin>& builtin_attributes() {
         {"thread_execution_width", Builtin::threads_per_simdgroup},
         {"simdgroup_index_in_threadgroup", Builtin::simdgroup_index_in_threadgroup},
         {"threads_per_simdgroup", Builtin::threads_per_simdgroup},
-        {"simdgroups_per_threadgroup", Builtin::simdgroups_per_threadgroup}};
+        {"simdgroups_per_threadgroup", Builtin::simdgroups_per_threadgroup},
+        {"barycentric_coord", Builtin::barycentric_coord}};
     return map;
+}
+
+// [[barycentric_coord]] with its interpolation qualifier: perspective (the
+// default, center_perspective) or center_no_perspective. Centroid and
+// sample interpolation of barycentrics are not translated: nullopt.
+template <class Attributes>
+std::optional<Builtin> barycentric_builtin(const Attributes& attributes) {
+    for (const auto& attribute : attributes) {
+        const auto& kind = attribute.name;
+        if (kind == "center_no_perspective") return Builtin::barycentric_coord_no_perspective;
+        if (kind == "centroid_perspective" || kind == "centroid_no_perspective" || kind == "sample_perspective" ||
+            kind == "sample_no_perspective")
+            return std::nullopt;
+    }
+    return Builtin::barycentric_coord;
 }
 
 // The natural (Vulkan) type a builtin input is read as.
@@ -259,6 +275,7 @@ const char* builtin_input_type(Builtin builtin) {
     switch (builtin) {
     case Builtin::position: return "float4";
     case Builtin::point_coord: return "float2";
+    case Builtin::barycentric_coord: case Builtin::barycentric_coord_no_perspective: return "float3";
     case Builtin::front_facing: return "bool";
     case Builtin::thread_position_in_grid: case Builtin::thread_position_in_threadgroup:
     case Builtin::threadgroup_position_in_grid: case Builtin::threads_per_threadgroup:
@@ -270,6 +287,7 @@ std::string raw_type(const char* type) {
     const std::string_view t(type);
     if (t == "float4") return "metal::__ext<float, 4>";
     if (t == "float2") return "metal::__ext<float, 2>";
+    if (t == "float3") return "metal::__ext<float, 3>";
     if (t == "uint3") return "metal::__ext<uint, 3>";
     return std::string(t);
 }
@@ -281,6 +299,7 @@ bool valid_builtin(Stage stage, Builtin builtin, bool input) {
     case Builtin::position: return (stage == Stage::fragment && input) || (stage == Stage::vertex && !input);
     case Builtin::point_size: case Builtin::clip_distance: return stage == Stage::vertex && !input;
     case Builtin::front_facing: case Builtin::point_coord: case Builtin::sample_id: case Builtin::primitive_id:
+    case Builtin::barycentric_coord: case Builtin::barycentric_coord_no_perspective:
         return stage == Stage::fragment && input;
     case Builtin::sample_mask: return stage == Stage::fragment;
     case Builtin::render_target_array_index: case Builtin::viewport_array_index:
@@ -1639,15 +1658,24 @@ private:
                     stage_in(entry, *def, var, body, next_input);
                     args.push_back(var);
                 } else if (const auto found = builtin_attributes().find(kind); found != builtin_attributes().end()) {
-                    if (!valid_builtin(entry.stage, found->second, true)) {
+                    auto builtin = found->second;
+                    if (builtin == Builtin::barycentric_coord) {
+                        const auto refined = barycentric_builtin(attributes);
+                        if (!refined) {
+                            error(attribute.line, "centroid and sample interpolation of [[barycentric_coord]] is unsupported");
+                            continue;
+                        }
+                        builtin = *refined;
+                    }
+                    if (!valid_builtin(entry.stage, builtin, true)) {
                         error(attribute.line, "[[" + kind + "]] is not an input of this stage");
                         continue;
                     }
-                    const auto* natural = builtin_input_type(found->second);
+                    const auto* natural = builtin_input_type(builtin);
                     body << "    auto " << var << " = metal::__msl_builtin_in<" << type << ", " << raw_type(natural)
-                         << ">(" << static_cast<std::uint32_t>(found->second) << "u);\n";
+                         << ">(" << static_cast<std::uint32_t>(builtin) << "u);\n";
                     args.push_back(var);
-                    entry.builtin_inputs.push_back({found->second, name});
+                    entry.builtin_inputs.push_back({builtin, name});
                 } else if (kind == "color" && entry.stage == Stage::fragment) {
                     // Framebuffer fetch: `float4 c [[color(n)]]`.
                     const auto color = attribute.args.empty() ? std::optional<std::uint32_t>{} : evaluate_integer(attribute.args[0]);
@@ -1740,24 +1768,29 @@ private:
                 const auto found = builtin_attributes().find(attribute.name);
                 if (found == builtin_attributes().end()) continue;
                 builtin = true;
-                if (found->second == Builtin::point_size || found->second == Builtin::clip_distance) break;   // vertex-only
-                if (!valid_builtin(Stage::fragment, found->second, true)) {
+                auto kind = found->second;
+                if (kind == Builtin::point_size || kind == Builtin::clip_distance) break;   // vertex-only
+                if (kind == Builtin::barycentric_coord) {
+                    const auto refined = barycentric_builtin(member.attributes);
+                    if (!refined) {
+                        error(attribute.line, "centroid and sample interpolation of [[barycentric_coord]] is unsupported");
+                        break;
+                    }
+                    kind = *refined;
+                }
+                if (!valid_builtin(Stage::fragment, kind, true)) {
                     error(attribute.line, "[[" + attribute.name + "]] is not a fragment input");
                     break;
                 }
-                const auto* natural = builtin_input_type(found->second);
+                const auto* natural = builtin_input_type(kind);
                 guarded(access + " = metal::__msl_builtin_in<decltype(" + access + "), " + raw_type(natural) + ">(" +
-                        std::to_string(static_cast<std::uint32_t>(found->second)) + "u);");
-                entry.builtin_inputs.push_back({found->second, member.name});
+                        std::to_string(static_cast<std::uint32_t>(kind)) + "u);");
+                entry.builtin_inputs.push_back({kind, member.name});
                 break;
             }
             if (builtin) continue;
             if (find_attribute(member.attributes, "color")) {
                 error(member.line, "framebuffer fetch ([[color(n)]] fragment inputs) is unsupported");
-                continue;
-            }
-            if (find_attribute(member.attributes, "barycentric_coord")) {
-                error(member.line, "[[barycentric_coord]] is unsupported");
                 continue;
             }
             if (!member.array_suffix.empty()) {

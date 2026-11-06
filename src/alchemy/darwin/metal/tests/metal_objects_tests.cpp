@@ -10,11 +10,13 @@
 //     -newCommandQueueWithDescriptor:, -newLogStateWithDescriptor:error:;
 //     MTLSharedEvent CPU signals and waits, GPU-side waits for a CPU signal
 //     and GPU signals; MTLEvent signal-then-wait across command buffers;
-//     MTLFence updates and waits between encoders.
+//     MTLFence updates and waits between encoders; MTLResidencySet
+//     bookkeeping and the MTLIO factories' MTLIOErrorDomain refusal.
 #include "alchemy/gui/tests/fill_fixture.hpp"
 #include "alchemy/darwin/metal/gpu_identity.hpp"
 
 #include <array>
+#include <iomanip>
 #include <atomic>
 #include <bit>
 #include <memory>
@@ -48,6 +50,98 @@ void counter_names(Fixture& f) {
     require(f.string_constant(metal, "_MTLCommonCounterTimestamp") == "GPUTimestamp", "MTLCommonCounterTimestamp");
     require(f.string_constant(metal, "_MTLCommonCounterSetStatistic") == "statistic", "MTLCommonCounterSetStatistic");
     require(f.string_constant(metal, "_MTLCommonCounterSetStageUtilization") == "stageutilization", "MTLCommonCounterSetStageUtilization");
+    require(f.string_constant(metal, "_MTLCommonCounterTotalCycles") == "TotalCycles", "MTLCommonCounterTotalCycles");
+    // Error domains equal the domains of the provider's NSErrors.
+    for (const auto* domain : {"MTLLibraryErrorDomain", "MTLCommandBufferErrorDomain", "MTLCaptureErrorDomain",
+                               "MTLCounterErrorDomain", "MTLBinaryArchiveDomain", "MTLDynamicLibraryDomain", "MTLIOErrorDomain",
+                               "MTLLogStateErrorDomain", "MTLTensorDomain", "MTLCommandBufferEncoderInfoErrorKey"})
+        require(f.string_constant(metal, std::string("_") + domain) == domain, domain);
+}
+
+Address device(Fixture& f);
+
+// kernelStartTime/EndTime (host submit and completion) and GPUStartTime/EndTime
+// (timestamp queries, recorded once the process asked for GPU times).
+void gpu_times(Fixture& f) {
+    const auto d = device(f);
+    if (!d) { std::cout << "  no Metal device: skipped\n"; return; }
+    const auto queue = f.send(d, "newCommandQueue");
+    const auto seconds = [&](Address buffer, const char* selector) { return f.objc.send(buffer, selector, {}).d(0); };
+    const auto run = [&] {
+        const auto buffer = f.send(queue, "commandBuffer");
+        require(seconds(buffer, "GPUStartTime") == 0.0, "no GPU time before completion");
+        const auto target = f.send(d, "newBufferWithLength:options:", {1 << 20, 0});
+        const auto blit = f.send(buffer, "blitCommandEncoder");
+        alchemy::CallRegs fill{};
+        fill.x[2] = target;
+        fill.x[3] = 0;          // NSRange {0, length}
+        fill.x[4] = 1 << 20;
+        fill.x[5] = 0x5a;
+        static_cast<void>(f.objc.send(blit, "fillBuffer:range:value:", fill));
+        static_cast<void>(f.send(blit, "endEncoding"));
+        static_cast<void>(f.send(buffer, "commit"));
+        static_cast<void>(f.send(buffer, "waitUntilCompleted"));
+        static_cast<void>(f.send(target, "release"));
+        return buffer;
+    };
+    static_cast<void>(run());   // asks for GPU times: later command buffers record them
+    const auto measured = run();
+    const auto kernel_start = seconds(measured, "kernelStartTime"), kernel_end = seconds(measured, "kernelEndTime");
+    const auto gpu_start = seconds(measured, "GPUStartTime"), gpu_end = seconds(measured, "GPUEndTime");
+    std::cout << std::fixed << std::setprecision(6) << "  kernel " << kernel_start << " .. " << kernel_end << ", GPU "
+              << gpu_start << " .. " << gpu_end << " (GPU " << (gpu_end - gpu_start) * 1e6 << " us)\n"
+              << std::defaultfloat;
+    require(kernel_start > 0 && kernel_end >= kernel_start, "kernel times are the host's submit and completion");
+    require(gpu_end >= gpu_start && gpu_start > 0, "GPU times are ordered");
+    // The calibrated device clock and the host clock agree to well within a
+    // second; the GPU ran between submission and the observed completion.
+    require(gpu_start > kernel_start - 1.0 && gpu_end < kernel_end + 1.0, "GPU times lie near the command buffer's life");
+    static_cast<void>(f.send(queue, "release"));
+}
+
+// MTLResidencySet bookkeeping (everything is resident on Vulkan) and the
+// MTLIO factories' MTLIOErrorDomain refusal.
+void residency_and_io(Fixture& f) {
+    const auto descriptor = make(f, "MTLResidencySetDescriptor");
+    static_cast<void>(f.send(descriptor, "setLabel:", {f.cf.string("frame")}));
+    static_cast<void>(f.send(descriptor, "setInitialCapacity:", {4}));
+    require(f.send(descriptor, "initialCapacity") == 4, "residency set descriptor keeps its capacity");
+    const auto d = device(f);
+    if (!d) { std::cout << "  no Metal device: skipped\n"; return; }
+    const auto set = f.send(d, "newResidencySetWithDescriptor:error:", {descriptor, 0});
+    require(set != 0 && f.cf.utf8(f.send(set, "label")) == "frame" && f.send(set, "device") == d, "a labelled residency set");
+    const auto a = f.send(d, "newBufferWithLength:options:", {4096, 0});
+    const auto b = f.send(d, "newBufferWithLength:options:", {8192, 0});
+    static_cast<void>(f.send(set, "addAllocation:", {a}));
+    const auto pair = f.block(16);
+    f.engine.write64(pair, a);
+    f.engine.write64(pair + 8, b);
+    static_cast<void>(f.send(set, "addAllocations:count:", {pair, 2}));   // a again: kept once
+    require(f.send(set, "allocationCount") == 2 && f.send(set, "containsAllocation:", {b}) == 1, "two allocations");
+    require(f.send(set, "allocatedSize") == 0, "nothing committed yet");
+    static_cast<void>(f.send(set, "commit"));
+    require(f.send(set, "allocatedSize") >= 4096 + 8192, "the committed size covers both buffers");
+    static_cast<void>(f.send(set, "requestResidency"));
+    const auto queue = f.send(d, "newCommandQueue");
+    static_cast<void>(f.send(queue, "addResidencySet:", {set}));
+    const auto buffer = f.send(queue, "commandBuffer");
+    static_cast<void>(f.send(buffer, "useResidencySet:", {set}));
+    static_cast<void>(f.send(buffer, "commit"));
+    static_cast<void>(f.send(buffer, "waitUntilCompleted"));
+    require(f.send(buffer, "status") == 4, "a command buffer using the set completes");
+    static_cast<void>(f.send(queue, "removeResidencySet:", {set}));
+    static_cast<void>(f.send(set, "removeAllocation:", {a}));
+    require(f.send(set, "allocationCount") == 1 && f.send(set, "containsAllocation:", {a}) == 0, "removed");
+    static_cast<void>(f.send(set, "removeAllAllocations"));
+    require(f.send(set, "allocationCount") == 0, "emptied");
+    for (const auto object : {set, a, b, queue, descriptor}) static_cast<void>(f.send(object, "release"));
+
+    const auto error = f.block(8);
+    // The URL is never opened: any object stands in for it.
+    require(f.send(d, "newIOHandleWithURL:error:", {f.cf.string("file:///nonexistent.bin"), error}) == 0, "no Metal IO handle");
+    const auto failure = f.engine.read64(error);
+    require(failure != 0 && f.cf.utf8(f.send(failure, "domain")) == "MTLIOErrorDomain" && f.send(failure, "code") == 2,
+            "MTLIOErrorDomain / MTLIOErrorInternal");
 }
 
 Address device(Fixture& f) {
@@ -381,5 +475,6 @@ int main() {
     return run("metal objects", {{"descriptors", descriptors}, {"counter names", counter_names}, {"identity", identity}, {"counters", counters},
                                  {"queues and logs", queues_and_logs}, {"shared events", shared_events},
                                  {"sampler lod clamps", sampler_lod_clamps}, {"shared event listeners", shared_event_listeners},
-                                 {"host buffers", host_buffers}});
+                                 {"host buffers", host_buffers}, {"residency and io", residency_and_io},
+                                 {"gpu times", gpu_times}});
 }

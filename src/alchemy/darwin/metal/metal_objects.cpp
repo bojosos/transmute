@@ -20,11 +20,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 
 // Metal object classes on the host layer (owner: A5): MTLDevice, MTLBuffer,
 // MTLTexture, MTLSamplerState, MTLHeap, MTLLibrary, MTLFunction, pipeline
@@ -39,12 +41,13 @@ namespace {
 // ---- states ----------------------------------------------------------------------------
 
 struct DeviceState final : Held { std::shared_ptr<Device> device; Address name{}; };
-struct BufferState final : Held { std::shared_ptr<Buffer> buffer; Address device{}; std::shared_ptr<Heap> heap; };
+struct BufferState final : Held { std::shared_ptr<Buffer> buffer; Address device{}, heap_object{}; std::shared_ptr<Heap> heap; };
 struct TextureState final : Held {
     std::shared_ptr<Texture> texture;
     Address device{}, parent{}, buffer{};
     std::uint32_t parent_level{}, parent_slice{};
     std::shared_ptr<Heap> heap;
+    Address heap_object{};   // the MTLHeap it was made from (retained), or 0
 };
 struct SamplerObject final : Held { std::shared_ptr<Sampler> sampler; Address device{}; };
 struct DepthStencilObject final : Held { std::shared_ptr<DepthStencilState> state; Address device{}; };
@@ -189,6 +192,35 @@ Address keep_retained(Held& held, Address object) {
     return object;
 }
 
+// -setPurgeableState: answers the previous state and records the new one
+// (Held::purgeable; MTLPurgeableStateKeepCurrent = 1 only asks). Contents are
+// never discarded, which Volatile and Empty allow; a resource set to Empty
+// answers Empty afterwards, so the client treats its contents as lost, as on
+// Metal.
+void install_purgeable_state(Address cls) {
+    runtime().method(cls, "setPurgeableState:", [](CpuState& s, GuestMemory&) {
+        const auto requested = s.x[2];
+        const auto held = state<Held>(s.x[0], "MTLResource");
+        if (requested != 1 && (requested < 2 || requested > 4))
+            throw std::runtime_error("Alchemy Metal: setPurgeableState: with an invalid MTLPurgeableState");
+        std::lock_guard lock(held->mutex);
+        s.x[0] = held->purgeable;
+        if (requested != 1) held->purgeable = requested;
+    }, false, "Q@:Q");
+}
+
+// Binary archive files: this header, then the device's VkPipelineCache data.
+constexpr std::string_view archive_magic{"AlchemyMTLBinaryArchive1\n", 25};
+
+// The host path of a file NSURL (empty for nil).
+std::filesystem::path archive_path(Address url) {
+    if (!url) return {};
+    auto& r = runtime();
+    const auto guest = r.utf8(r.objc.send(url, "path").x0);
+    if (guest.empty()) return {};
+    return r.process.map_guest_path ? r.process.map_guest_path(guest) : std::filesystem::path(guest);
+}
+
 // MTLStorageMode etc. as returned by resources.
 void install_resource_queries(Address cls, bool texture) {
     auto& r = runtime();
@@ -207,7 +239,7 @@ void install_resource_queries(Address cls, bool texture) {
     }, false, "Q@:");
     r.method(cls, "resourceOptions", [options](CpuState& s, GuestMemory&) { s.x[0] = options(s.x[0]).encode(); }, false, "Q@:");
     // Residency and purgeability: every resource stays resident.
-    r.method(cls, "setPurgeableState:", [](CpuState& s, GuestMemory&) { s.x[0] = 2; }, false, "Q@:Q");   // NonVolatile
+    install_purgeable_state(cls);
     r.method(cls, "isAliasable", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:");
     r.method(cls, "makeAliasable", [](CpuState&, GuestMemory&) {}, false, "v@:");
     r.method(cls, "heapOffset", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "Q@:");
@@ -593,6 +625,9 @@ RenderPass render_pass(Address descriptor) {
             for (int c = 0; c < 4; ++c) target.clear_color[c] = std::bit_cast<double>(values[10][c]);
         } else if (stencil) target.clear_stencil = u32(10);
         else target.clear_depth = std::bit_cast<double>(values[10][0]);
+        if (!color)
+            target.resolve_filter = static_cast<std::uint32_t>(
+                descriptor_u64(object, stencil ? "stencilResolveFilter" : "depthResolveFilter"));
     };
     if (const auto colors = descriptor_child(descriptor, "colorAttachments"))
         for (std::uint32_t index = 0; index < 8; ++index)
@@ -1069,9 +1104,17 @@ void install_command_buffer() {
         s.x[0] = b.commands->status() == CommandBufferStatus::error
                      ? r.error("MTLCommandBufferErrorDomain", 1, b.commands->error()) : 0;
     }, "@@:");
-    // GPU timestamps are not measured.
-    for (const auto selector : {"kernelStartTime", "kernelEndTime", "GPUStartTime", "GPUEndTime"})
-        method(selector, [](CommandBufferState&, CpuState& s, GuestMemory&) { return_real(s, 0.0); }, "d@:");
+    // Seconds on mach_absolute_time's clock once completed, else 0
+    // (CommandBuffer::times). The first request for GPU times turns on the
+    // timestamp queries for the command buffers recorded after it.
+    using Times = CommandBuffer::Times;
+    for (const auto& [selector, field, gpu] : std::initializer_list<std::tuple<const char*, double Times::*, bool>>{
+             {"kernelStartTime", &Times::kernel_start, false}, {"kernelEndTime", &Times::kernel_end, false},
+             {"GPUStartTime", &Times::gpu_start, true}, {"GPUEndTime", &Times::gpu_end, true}})
+        method(selector, [field, gpu](CommandBufferState& b, CpuState& s, GuestMemory&) {
+            if (gpu) CommandBuffer::want_gpu_times();
+            return_real(s, b.commands->times().*field);
+        }, "d@:");
     method("renderCommandEncoderWithDescriptor:", [](CommandBufferState& b, CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         RenderPass pass;
@@ -1266,6 +1309,17 @@ Address new_texture(Address device, Address descriptor) {
         auto buffer = Buffer::create(metal_device, static_cast<std::uint64_t>(d.width) * info->block_bytes, d.options);
         return new_texture_object_for(device, Texture::create_buffer_texture(buffer, d, 0, 0));
     }
+    const auto* info = pixel_format_info(d.pixel_format);
+    if (!info || !metal_device->format_features(metal_device->texture_format(d.pixel_format))) {
+        static std::mutex mutex;
+        static std::set<std::uint32_t> reported;
+        bool first{};
+        { std::lock_guard lock(mutex); first = reported.insert(d.pixel_format).second; }
+        if (first)
+            std::fprintf(stderr, "[alchemy metal] newTextureWithDescriptor: answers nil: MTLPixelFormat %u is not supported%s\n",
+                         d.pixel_format, info ? " by this Vulkan device" : "");
+        return 0;
+    }
     return new_texture_object_for(device, Texture::create(metal_device, d));
 }
 
@@ -1289,7 +1343,7 @@ void install_buffer() {
         if (s.x[2] > b.buffer->length || s.x[3] > b.buffer->length - s.x[2])
             throw std::runtime_error("Alchemy Metal: didModifyRange: outside the buffer");
     }), false, "v@:{_NSRange=QQ}");
-    r.method(cls, "heap", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    r.method(cls, "heap", on<BufferState>(what, [](BufferState& b, CpuState& s, GuestMemory&) { s.x[0] = b.heap_object; }));
     r.method(cls, "remoteStorageBuffer", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     r.method(cls, "addDebugMarker:range:", [](CpuState&, GuestMemory&) {}, false, "v@:@{_NSRange=QQ}");
     r.method(cls, "removeAllDebugMarkers", [](CpuState&, GuestMemory&) {}, false, "v@:");
@@ -2061,20 +2115,25 @@ void install_small_objects() {
     r.method(classes.heap, "hazardTrackingMode", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) { s.x[0] = h.heap->options.hazard_tracking; }), false, "Q@:");
     r.method(classes.heap, "resourceOptions", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) { s.x[0] = h.heap->options.encode(); }), false, "Q@:");
     r.method(classes.heap, "type", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) { s.x[0] = h.heap->type; }), false, "q@:");
-    r.method(classes.heap, "setPurgeableState:", [](CpuState& s, GuestMemory&) { s.x[0] = 2; }, false, "Q@:Q");
+    install_purgeable_state(classes.heap);
     r.method(classes.heap, "newBufferWithLength:options:", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) {
         if (!h.heap->reserve(s.x[2])) { s.x[0] = 0; return; }
         auto options = ResourceOptions::decode(s.x[3]);
         options.storage = h.heap->options.storage;
         const auto heap = h.heap;
         const auto length = s.x[2];
+        const auto self = s.x[0];
         s.x[0] = new_buffer(h.device, options, length, heap);
+        const auto buffer = state<BufferState>(s.x[0], "MTLBuffer");
+        buffer->heap_object = keep_retained(*buffer, self);
     }), false, "@@:QQ");
     r.method(classes.heap, "newTextureWithDescriptor:", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) {
         const auto object = new_texture(h.device, s.x[2]);
+        if (!object) { s.x[0] = 0; return; }
         const auto texture = state<TextureState>(object, "MTLTexture");
         if (!h.heap->reserve(texture->texture->allocated_size())) { runtime().release(object); s.x[0] = 0; return; }
         texture->heap = h.heap;
+        texture->heap_object = keep_retained(*texture, s.x[0]);
         s.x[0] = object;
     }), false, "@@:@");
 
@@ -2159,16 +2218,66 @@ void install_small_objects() {
     r.method(scope, "endScope", [](CpuState&, GuestMemory&) {}, false, "v@:");
     r.method(scope, "commandQueue", on<ScopeState>("MTLCaptureScope", [](ScopeState& value, CpuState& s, GuestMemory&) { s.x[0] = value.queue; }));
 
-    // Binary archives: pipelines are cached by the device's persistent
-    // VkPipelineCache when they are created, so adding them to an archive
-    // and serializing it reduces to saving that cache.
+    // Binary archives. Alchemy's pipelines are VkPipelines, and what an
+    // archive can hold for them is the device's VkPipelineCache: adding a
+    // pipeline creates it (which caches it), serializeToURL: writes the cache
+    // behind an Alchemy header, and an archive made from such a file merges
+    // it back (newBinaryArchiveWithDescriptor:error:). Tile and mesh pipelines
+    // and functions (function pointers) cannot be made, so adding them fails
+    // with MTLBinaryArchiveErrorCompilationFailure (3).
     const auto archive = classes.archive;
-    for (const auto selector : {"addComputePipelineFunctionsWithDescriptor:error:", "addRenderPipelineFunctionsWithDescriptor:error:",
-                                "addTileRenderPipelineFunctionsWithDescriptor:error:", "addMeshRenderPipelineFunctionsWithDescriptor:error:"})
-        r.method(archive, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, false, "B@:@^@");
-    r.method(archive, "addFunctionWithDescriptor:library:error:", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, false, "B@:@@^@");
-    r.method(archive, "serializeToURL:error:", on<ArchiveState>("MTLBinaryArchive", [](ArchiveState& a, CpuState& s, GuestMemory&) {
-        device_of_object(a.device)->save_pipeline_cache();
+    const auto add_pipeline = [&r](const char* create, bool compute) {
+        return on<ArchiveState>("MTLBinaryArchive", [&r, create, compute](ArchiveState& a, CpuState& s, GuestMemory& m) {
+            const auto error_out = s.x[3];
+            const auto scratch = r.process.allocate_guest(8);
+            m.write64(scratch, 0);
+            CallRegs call{};
+            call.x[2] = s.x[2];
+            if (compute) call.x[5] = scratch;   // ...WithDescriptor:options:0 reflection:NULL error:
+            else call.x[3] = scratch;           // ...WithDescriptor:error:
+            const auto pipeline = r.objc.send(a.device, create, call).x0;
+            const auto failure = m.read64(scratch);
+            r.process.release_guest(scratch);
+            if (pipeline) {
+                r.release(pipeline);
+                s.x[0] = 1;
+                return;
+            }
+            std::string why = "the pipeline could not be created";
+            if (failure) why += ": " + r.utf8(r.objc.send(failure, "localizedDescription").x0);
+            r.set_error(m, error_out, "MTLBinaryArchiveDomain", 3, why);
+            s.x[0] = 0;
+        });
+    };
+    r.method(archive, "addComputePipelineFunctionsWithDescriptor:error:",
+             add_pipeline("newComputePipelineStateWithDescriptor:options:reflection:error:", true), false, "B@:@^@");
+    r.method(archive, "addRenderPipelineFunctionsWithDescriptor:error:",
+             add_pipeline("newRenderPipelineStateWithDescriptor:error:", false), false, "B@:@^@");
+    for (const auto& [selector, what] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"addTileRenderPipelineFunctionsWithDescriptor:error:", "tile render pipelines are not translated"},
+             {"addMeshRenderPipelineFunctionsWithDescriptor:error:", "mesh render pipelines are not translated"}})
+        r.method(archive, selector, [&r, what](CpuState& s, GuestMemory& m) {
+            r.set_error(m, s.x[3], "MTLBinaryArchiveDomain", 3, what);
+            s.x[0] = 0;
+        }, false, "B@:@^@");
+    r.method(archive, "addFunctionWithDescriptor:library:error:", [&r](CpuState& s, GuestMemory& m) {
+        r.set_error(m, s.x[4], "MTLBinaryArchiveDomain", 3, "functions for function pointers are not supported (supportsFunctionPointers is NO)");
+        s.x[0] = 0;
+    }, false, "B@:@@^@");
+    r.method(archive, "serializeToURL:error:", on<ArchiveState>("MTLBinaryArchive", [&r](ArchiveState& a, CpuState& s, GuestMemory& m) {
+        const auto path = archive_path(s.x[2]);
+        const auto data = device_of_object(a.device)->pipeline_cache_data();
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        if (file) {
+            file.write(archive_magic.data(), static_cast<std::streamsize>(archive_magic.size()));
+            file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        }
+        if (path.empty() || !file) {
+            // MTLBinaryArchiveErrorInvalidFile (1)
+            r.set_error(m, s.x[3], "MTLBinaryArchiveDomain", 1, "the archive could not be written to " + path.string());
+            s.x[0] = 0;
+            return;
+        }
         s.x[0] = 1;
     }), false, "B@:@^@");
 
@@ -2432,7 +2541,25 @@ void install_device() {
         value->device = s.x[0];
         s.x[0] = r.create(classes.argument_encoder, std::move(value));
     }, false, "@@:@");
-    r.method(cls, "newBinaryArchiveWithDescriptor:error:", [&r](CpuState& s, GuestMemory&) {
+    // An archive from a URL: a file serializeToURL: wrote is merged into the
+    // device's pipeline cache; any other file (an archive made on macOS or
+    // for another GPU) holds nothing this device can use, and the archive
+    // starts empty, as one made for another device does. A missing or
+    // unreadable file fails with MTLBinaryArchiveErrorInvalidFile (1).
+    r.method(cls, "newBinaryArchiveWithDescriptor:error:", [&r](CpuState& s, GuestMemory& m) {
+        if (const auto url = s.x[2] ? descriptor_object(s.x[2], "url") : 0) {
+            const auto path = archive_path(url);
+            std::ifstream file(path, std::ios::binary);
+            if (path.empty() || !file) {
+                r.set_error(m, s.x[3], "MTLBinaryArchiveDomain", 1, "no binary archive at " + path.string());
+                s.x[0] = 0;
+                return;
+            }
+            const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            if (bytes.size() >= archive_magic.size() && std::equal(archive_magic.begin(), archive_magic.end(), bytes.begin()))
+                device_of_object(s.x[0])->merge_pipeline_cache(std::span(
+                    reinterpret_cast<const std::uint8_t*>(bytes.data()) + archive_magic.size(), bytes.size() - archive_magic.size()));
+        }
         auto value = std::make_shared<ArchiveState>();
         value->device = s.x[0];
         s.x[0] = r.create(classes.archive, std::move(value));
@@ -2527,7 +2654,8 @@ void install_device() {
             s.x[0] = 0;
         }, false, "@@:@^@");
 
-    const auto compile = [&r](Address device, Address source, Address options, std::string& error) -> Address {
+    // `code`: the MTLLibraryError of a failure (CompileFailure unless set).
+    const auto compile = [&r](Address device, Address source, Address options, std::string& error, std::int64_t& code) -> Address {
         perf::Scope timed(perf::mtl_library_ticks, perf::mtl_libraries);
         perf::phase("first newLibraryWithSource:");
         if (perf::enabled()) perf::count_key("newLibraryWithSource: by thread", perf::is_main_thread() ? "main" : "other");
@@ -2539,6 +2667,13 @@ void install_device() {
             settings = compile_options(options);
         }
         settings.subgroup_size = device_of_object(device)->profile().thread_execution_width;
+        // MTLLibraryTypeDynamic (1): dynamic libraries are not supported
+        // (supportsDynamicLibraries is NO), MTLLibraryErrorUnsupported (1).
+        if (options && descriptor_u64(options, "libraryType") == 1) {
+            error = "dynamic Metal libraries (MTLLibraryTypeDynamic) are not supported: supportsDynamicLibraries is NO";
+            code = 1;
+            return 0;
+        }
         static_cast<void>(msl::dump_source(text, settings));
         msl::CompileResult result;
         try {
@@ -2555,15 +2690,17 @@ void install_device() {
     };
     r.method(cls, "newLibraryWithSource:options:error:", [&r, compile](CpuState& s, GuestMemory& m) {
         std::string error;
+        std::int64_t code = 3;   // MTLLibraryErrorCompileFailure
         const auto error_out = s.x[4];
-        s.x[0] = compile(s.x[0], s.x[2], s.x[3], error);
-        if (!s.x[0]) r.set_error(m, error_out, "MTLLibraryErrorDomain", 3, error);   // MTLLibraryErrorCompileFailure
+        s.x[0] = compile(s.x[0], s.x[2], s.x[3], error, code);
+        if (!s.x[0]) r.set_error(m, error_out, "MTLLibraryErrorDomain", code, error);
     }, false, "@@:@@^@");
     r.method(cls, "newLibraryWithSource:options:completionHandler:", [&r, compile](CpuState& s, GuestMemory&) {
         std::string error;
+        std::int64_t code = 3;   // MTLLibraryErrorCompileFailure
         const auto block = s.x[4];
-        const auto library = compile(s.x[0], s.x[2], s.x[3], error);
-        const auto failure = library ? 0 : r.error("MTLLibraryErrorDomain", 3, error);
+        const auto library = compile(s.x[0], s.x[2], s.x[3], error, code);
+        const auto failure = library ? 0 : r.error("MTLLibraryErrorDomain", code, error);
         r.invoke_block(block, {library, failure}, false);
         r.release(library);
     }, false, "v@:@@@?");
@@ -2725,8 +2862,8 @@ void Runtime::set_error(GuestMemory& memory, Address out, std::string_view domai
 
 std::shared_ptr<Event> event_of(Address object) { return state<EventState>(object, "MTLEvent")->event; }
 
-// MTLCommonCounterSet and MTLCommonCounter names (NSString constants). The
-// device's timestamp set and its counter answer these names (Dawn matches
+// Metal's NSString constants: the MTLCommonCounterSet and MTLCommonCounter
+// names, error domains and user-info keys. The device's timestamp set and its counter answer these names (Dawn matches
 // them case-insensitively). Their string values are not in Apple's headers
 // (unverified). Clients compare a set's or counter's name with these same
 // exported constants (Dawn's IsGPUCounterSupported, by design), so what
@@ -2738,7 +2875,38 @@ void install_counter_names(Runtime& r, const std::source_location& where = std::
              {"_MTLCommonCounterSetTimestamp", "timestamp"},
              {"_MTLCommonCounterSetStageUtilization", "stageutilization"},
              {"_MTLCommonCounterSetStatistic", "statistic"},
-             {"_MTLCommonCounterTimestamp", "GPUTimestamp"}}) {
+             {"_MTLCommonCounterTimestamp", "GPUTimestamp"},
+             // The statistic and stage-utilization counters: no counter set
+             // answers them (counterSets has only the timestamp set), so they
+             // only need to exist and differ (values unverified).
+             {"_MTLCommonCounterTessellationInputPatches", "TessellationInputPatches"},
+             {"_MTLCommonCounterVertexInvocations", "VertexInvocations"},
+             {"_MTLCommonCounterPostTessellationVertexInvocations", "PostTessellationVertexInvocations"},
+             {"_MTLCommonCounterClipperInvocations", "ClipperInvocations"},
+             {"_MTLCommonCounterClipperPrimitivesOut", "ClipperPrimitivesOut"},
+             {"_MTLCommonCounterFragmentInvocations", "FragmentInvocations"},
+             {"_MTLCommonCounterFragmentsPassed", "FragmentsPassed"},
+             {"_MTLCommonCounterComputeKernelInvocations", "ComputeKernelInvocations"},
+             {"_MTLCommonCounterTotalCycles", "TotalCycles"},
+             {"_MTLCommonCounterVertexCycles", "VertexCycles"},
+             {"_MTLCommonCounterTessellationCycles", "TessellationCycles"},
+             {"_MTLCommonCounterPostTessellationVertexCycles", "PostTessellationVertexCycles"},
+             {"_MTLCommonCounterFragmentCycles", "FragmentCycles"},
+             {"_MTLCommonCounterRenderTargetWriteCycles", "RenderTargetWriteCycles"},
+             // NSError domains and user-info keys. Each domain's value is the
+             // domain of the NSErrors this provider creates (r.error /
+             // r.set_error), so a client comparing an error's domain with the
+             // constant matches (the values themselves are unverified).
+             {"_MTLLibraryErrorDomain", "MTLLibraryErrorDomain"},
+             {"_MTLCommandBufferErrorDomain", "MTLCommandBufferErrorDomain"},
+             {"_MTLCaptureErrorDomain", "MTLCaptureErrorDomain"},
+             {"_MTLCounterErrorDomain", "MTLCounterErrorDomain"},
+             {"_MTLBinaryArchiveDomain", "MTLBinaryArchiveDomain"},
+             {"_MTLDynamicLibraryDomain", "MTLDynamicLibraryDomain"},
+             {"_MTLIOErrorDomain", "MTLIOErrorDomain"},
+             {"_MTLLogStateErrorDomain", "MTLLogStateErrorDomain"},
+             {"_MTLTensorDomain", "MTLTensorDomain"},
+             {"_MTLCommandBufferEncoderInfoErrorKey", "MTLCommandBufferEncoderInfoErrorKey"}}) {
         const auto slot = r.process.allocate_guest(8);
         r.process.main_engine().write64(slot, r.cf.constant_string(value));
         r.process.install_export(std::string(metal_library), symbol, {slot, ExportKind::data});
@@ -2871,6 +3039,7 @@ void install_objects(Runtime& r) {
     install_small_objects();
     install_shared_events(r);   // g3: cross-process MTLSharedEvent (shared_events.cpp)
     install_listener_dispatch(r);
+    install_residency_and_io(r);   // residency.cpp
 
     // MTLCreateSystemDefaultDevice / MTLCopyAllDevices replace the headless
     // shells; the Vulkan device is created on the first call.

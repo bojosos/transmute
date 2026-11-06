@@ -1195,6 +1195,10 @@ private:
         case Builtin::clip_distance: m_.capability(spv::capability::ClipDistance); return ClipDistance;
         case Builtin::front_facing: return FrontFacing;
         case Builtin::point_coord: return PointCoord;
+        case Builtin::barycentric_coord: case Builtin::barycentric_coord_no_perspective:
+            m_.capability(spv::capability::FragmentBarycentricKHR);
+            m_.extension("SPV_KHR_fragment_shader_barycentric");
+            return b == Builtin::barycentric_coord ? BaryCoordKHR : BaryCoordNoPerspKHR;
         case Builtin::sample_id: m_.capability(spv::capability::SampleRateShading); return SampleId;
         case Builtin::sample_mask: return SampleMask;
         case Builtin::primitive_id: m_.capability(spv::capability::Geometry); return PrimitiveId;
@@ -1278,6 +1282,7 @@ private:
         switch (b) {
         case Builtin::position: type = t_vec(t_f32(), 4); break;
         case Builtin::point_coord: type = t_vec(t_f32(), 2); break;
+        case Builtin::barycentric_coord: case Builtin::barycentric_coord_no_perspective: type = t_vec(t_f32(), 3); break;
         case Builtin::front_facing: type = t_bool(); break;
         case Builtin::thread_position_in_grid: case Builtin::thread_position_in_threadgroup:
         case Builtin::threadgroup_position_in_grid: case Builtin::threadgroups_per_grid: type = t_vec(t_u32(), 3); break;

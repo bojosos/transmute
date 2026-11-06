@@ -184,6 +184,10 @@ std::vector<ClassSpec> specifications() {
           u("maxFragmentBufferBindCount"), u("maxKernelBufferBindCount")}},
         {"MTLIntersectionFunctionTableDescriptor", "NSObject", {u("functionCount")}, {}, 0,
          {"intersectionFunctionTableDescriptor"}},
+        // residency.cpp: residency sets (bookkeeping) and Metal IO (refused).
+        {"MTLResidencySetDescriptor", "NSObject", {object("label"), u("initialCapacity")}},
+        {"MTLIOCommandQueueDescriptor", "NSObject",
+         {u("maxCommandBufferCount"), u("priority"), u("type"), u("maxCommandsInFlight"), object("scratchBufferAllocator")}},
     };
 }
 

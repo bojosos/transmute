@@ -128,6 +128,7 @@ struct Held : ObjectPayload {
     std::mutex mutex;
     Address label{};
     std::vector<Address> owned;   // +1 references
+    std::uint64_t purgeable{2};   // resources: MTLPurgeableState (NonVolatile = 2, Volatile = 3, Empty = 4)
     // Takes the references to release (dealloc).
     std::vector<Address> take() {
         std::lock_guard lock(mutex);
@@ -204,6 +205,12 @@ struct SurfaceTextureStats { std::uint64_t uploads{}, downloads{}; bool imported
 // -[MTLSharedEvent newSharedEventHandle], -[MTLDevice newSharedEventWithHandle:],
 // MTLSharedEventHandle; after the device and the event classes.
 void install_shared_events(Runtime& runtime);
+
+// ---- residency sets and Metal IO (residency.cpp) -------------------------------------------
+// MTLResidencySet (bookkeeping: everything is resident on Vulkan), the queue
+// and command buffer calls that attach it, and the MTLIO factories (nil with
+// an MTLIOErrorDomain error); after the device, queue and command buffer classes.
+void install_residency_and_io(Runtime& runtime);
 
 // ---- QuartzCore (quartzcore_link.cpp) -----------------------------------------------------
 // Registers a new MTLDevice object with QuartzCore's presentation contract

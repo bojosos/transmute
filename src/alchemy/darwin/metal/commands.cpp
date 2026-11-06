@@ -1,8 +1,10 @@
 #include "alchemy/darwin/metal/commands.hpp"
 
+#include "alchemy/host/time.hpp"
 #include "alchemy/perf.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +18,10 @@ namespace {
 
 constexpr VkDeviceSize chunk_size = 1ULL << 20;
 constexpr VkDeviceSize bytes_alignment = 64;
+
+// Set once the process asked for a command buffer's GPU times
+// (CommandBuffer::want_gpu_times): later command buffers record them.
+std::atomic<bool> gpu_times_wanted{};
 
 // Upload memory recycled between command buffers of one device.
 struct UploadPool {
@@ -404,6 +410,7 @@ CommandBuffer::~CommandBuffer() {
             auto& pool = upload_pool(*device);
             for (auto& chunk : chunks_) pool.release({chunk.buffer, chunk.memory, chunk.address, chunk.size});
             if (queries_) device->vk.vkDestroyQueryPool(device->device, queries_, nullptr);
+            if (timing_) device->vk.vkDestroyQueryPool(device->device, timing_, nullptr);
         } catch (const std::exception&) {
         }
     }
@@ -421,12 +428,59 @@ VkCommandBuffer CommandBuffer::recording() {
         check(device->vk.vkAllocateCommandBuffers(device->device, &allocate, &buffer), "vkAllocateCommandBuffers");
         commands_.buffers.push_back(buffer);
     }
+    const bool first = commands_.used == 0;
     current_ = commands_.buffers[commands_.used++];
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(device->vk.vkBeginCommandBuffer(current_, &begin), "vkBeginCommandBuffer");
+    if (first && gpu_times_wanted.load(std::memory_order_relaxed) && device->profile().timestamps) {
+        // GPUStartTime: query 0 here, query 1 at the end of commit's recording.
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = 2;
+        check(device->vk.vkCreateQueryPool(device->device, &info, nullptr, &timing_), "vkCreateQueryPool");
+        device->vk.vkCmdResetQueryPool(current_, timing_, 0, 2);
+        device->vk.vkCmdWriteTimestamp2(current_, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, timing_, 0);
+    }
     full_barrier();
     return current_;
+}
+
+void CommandBuffer::want_gpu_times() noexcept { gpu_times_wanted.store(true, std::memory_order_relaxed); }
+
+CommandBuffer::Times CommandBuffer::times() {
+    if (status() != CommandBufferStatus::completed) return {};
+    std::lock_guard lock(status_mutex_);
+    return times_;
+}
+
+// After completion, before the queries are destroyed (finalize).
+void CommandBuffer::resolve_times() {
+    complete_ns_ = std::max(host::time::monotonic_ns(), submit_ns_);
+    Times result{static_cast<double>(submit_ns_) / 1e9, static_cast<double>(complete_ns_) / 1e9, 0, 0};
+    result.gpu_start = result.kernel_start;
+    result.gpu_end = result.kernel_end;
+    if (timing_) {
+        std::array<std::uint64_t, 2> ticks{};
+        const auto read = device->vk.vkGetQueryPoolResults(device->device, timing_, 0, 2, sizeof(ticks), ticks.data(),
+                                                           sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        device->vk.vkDestroyQueryPool(device->device, timing_, nullptr);
+        timing_ = VK_NULL_HANDLE;
+        const auto bits = device->timestamp_valid_bits;
+        const std::uint64_t mask = bits >= 64 || bits == 0 ? ~std::uint64_t{0} : (std::uint64_t{1} << bits) - 1;
+        const double period = device->profile().timestamp_period;   // ns per tick
+        if (read == VK_SUCCESS && period > 0) {
+            const auto duration = static_cast<double>((ticks[1] - ticks[0]) & mask) * period;
+            if (const auto now_tick = device->gpu_timestamp()) {
+                const auto now_ns = static_cast<double>(host::time::monotonic_ns());
+                const auto end_ago = static_cast<double>((*now_tick - ticks[1]) & mask) * period;
+                result.gpu_end = (now_ns - end_ago) / 1e9;
+            }
+            result.gpu_start = result.gpu_end - duration / 1e9;
+        }
+    }
+    std::lock_guard lock(status_mutex_);
+    times_ = result;
 }
 
 void CommandBuffer::close_recording() {
@@ -796,7 +850,29 @@ void CommandBuffer::begin_render(const RenderPass& pass) {
     if (!sized && (!pass.width || !pass.height))
         throw std::runtime_error("Metal render pass without attachments needs renderTargetWidth and renderTargetHeight");
     pass_layers_ = std::max(1U, pass.layers);
-    const auto attachment_info = [&](const Attachment& attachment, bool color) {
+    // Multisample resolves: colour averages (integer formats take sample 0);
+    // depth follows depthResolveFilter (Min/Max need the device's MIN/MAX
+    // resolve modes); stencil takes sample 0, which is also the sample a
+    // Sample0 depth resolve chose (DepthResolvedSample). What Vulkan cannot
+    // express stops explicitly instead of resolving differently.
+    const auto& profile = device->profile();
+    const auto resolve_mode = [&](const Attachment& attachment, bool color, bool stencil) -> VkResolveModeFlagBits {
+        if (color) return attachment.texture->info->integer() ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+        if (stencil) {
+            if (attachment.resolve_filter == 1 && pass.depth.texture && resolves(pass.depth.store_action) &&
+                pass.depth.resolve_filter != 0)
+                throw std::runtime_error("Alchemy Metal: stencilResolveFilter DepthResolvedSample with a Min/Max depth resolve "
+                                         "is not translated (Vulkan resolves stencil on its own)");
+            return VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        }
+        const auto mode = attachment.resolve_filter == 1 ? VK_RESOLVE_MODE_MIN_BIT
+                          : attachment.resolve_filter == 2 ? VK_RESOLVE_MODE_MAX_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        if (!(profile.depth_resolve_modes & mode))
+            throw std::runtime_error("Alchemy Metal: depthResolveFilter Min/Max needs a MIN/MAX depth resolve, which this Vulkan "
+                                     "device does not support");
+        return mode;
+    };
+    const auto attachment_info = [&](const Attachment& attachment, bool color, bool stencil = false) {
         VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         if (!attachment.texture) return info;
         const auto& texture = *attachment.texture;
@@ -809,7 +885,7 @@ void CommandBuffer::begin_render(const RenderPass& pass) {
             const auto& resolve = *attachment.resolve_texture;
             const auto resolve_layer = resolve.descriptor.type == TextureType::type3d ? attachment.resolve_depth_plane
                                                                                        : attachment.resolve_slice;
-            info.resolveMode = color && !texture.info->integer() ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+            info.resolveMode = resolve_mode(attachment, color, stencil);
             info.resolveImageView = attachment.resolve_texture->attachment_view(attachment.resolve_level, resolve_layer, pass_layers_);
             info.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
         }
@@ -832,7 +908,14 @@ void CommandBuffer::begin_render(const RenderPass& pass) {
         if (pass.colors[index].texture) color_count = index + 1;
     for (std::uint32_t index = 0; index < color_count; ++index) color_infos_.push_back(attachment_info(pass.colors[index], true));
     depth_info_ = attachment_info(pass.depth, false);
-    stencil_info_ = attachment_info(pass.stencil, false);
+    stencil_info_ = attachment_info(pass.stencil, false, true);
+    // Both aspects of one texture resolving with different modes (a Min/Max
+    // depth resolve) needs independentResolve.
+    if (pass.depth.texture && pass.depth.texture == pass.stencil.texture && depth_info_.resolveMode != VK_RESOLVE_MODE_NONE &&
+        stencil_info_.resolveMode != VK_RESOLVE_MODE_NONE && depth_info_.resolveMode != stencil_info_.resolveMode &&
+        !profile.independent_resolve)
+        throw std::runtime_error("Alchemy Metal: this Vulkan device resolves the depth and stencil of one texture with one "
+                                 "mode (no independentResolve), and the pass asks for a Min/Max depth and a Sample0 stencil");
     if (pass.stencil.texture) stencil_info_.clearValue.depthStencil.stencil = pass.stencil.clear_stencil;
     rendering_ = {VK_STRUCTURE_TYPE_RENDERING_INFO};
     rendering_.renderArea = {{0, 0}, extent_};
@@ -1746,6 +1829,7 @@ void CommandBuffer::commit() {
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &host;
     device->vk.vkCmdPipelineBarrier2(command, &dependency);
+    if (timing_) device->vk.vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, timing_, 1);
     close_recording();
     const bool surfaces = !surface_uses_.empty();
     const bool first_uses = surfaces && std::any_of(surface_uses_.begin(), surface_uses_.end(),
@@ -1799,6 +1883,7 @@ void CommandBuffer::commit() {
         status_ = CommandBufferStatus::committed;
     }
     std::uint64_t value{};
+    submit_ns_ = host::time::monotonic_ns();
     try {
         value = device->submit(batches_);
     } catch (const std::exception& failure) {
@@ -1855,6 +1940,7 @@ void CommandBuffer::finalize() {
     }
     std::string failure;
     try {
+        resolve_times();
         release_resources();
     } catch (const std::exception& error) {
         failure = error.what();

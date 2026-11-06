@@ -91,7 +91,7 @@ enum : std::uint32_t { Position = 0, PointSize = 1, ClipDistance = 3, PrimitiveI
     FragDepth = 22, NumWorkgroups = 24, WorkgroupSize = 25, WorkgroupId = 26, LocalInvocationId = 27,
     GlobalInvocationId = 28, LocalInvocationIndex = 29, SubgroupSize = 36, NumSubgroups = 38, SubgroupId = 40,
     SubgroupLocalInvocationId = 41, VertexIndex = 42, InstanceIndex = 43, BaseVertex = 4424, BaseInstance = 4425,
-    FragStencilRefEXT = 5014 };
+    FragStencilRefEXT = 5014, BaryCoordKHR = 5286, BaryCoordNoPerspKHR = 5287 };
 }
 namespace capability {
 enum : std::uint32_t { Matrix = 0, Shader = 1, Geometry = 2, Float16 = 9, Float64 = 10, Int64 = 11,
@@ -102,7 +102,7 @@ enum : std::uint32_t { Matrix = 0, Shader = 1, Geometry = 2, Float16 = 9, Float6
     GroupNonUniformVote = 62, GroupNonUniformArithmetic = 63, GroupNonUniformBallot = 64,
     GroupNonUniformShuffle = 65, GroupNonUniformShuffleRelative = 66, GroupNonUniformQuad = 68,
     SampleRateShading = 35, ImageCubeArray = 34, DrawParameters = 4427, StorageBuffer16BitAccess = 4433,
-    StorageBuffer8BitAccess = 4448, StencilExportEXT = 5013, ShaderLayer = 69, ShaderViewportIndex = 70,
+    StorageBuffer8BitAccess = 4448, StencilExportEXT = 5013, FragmentBarycentricKHR = 5284, ShaderLayer = 69, ShaderViewportIndex = 70,
     PhysicalStorageBufferAddresses = 5347, AtomicFloat32AddEXT = 6033, Int64Atomics = 12,
     MinLod = 42, DemoteToHelperInvocation = 5379, InputAttachment = 40 };
 }

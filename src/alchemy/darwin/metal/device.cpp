@@ -436,10 +436,12 @@ void Device::build_profile() {
     VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
     VkPhysicalDeviceVulkan11Properties properties11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
     VkPhysicalDeviceMaintenance4Properties maintenance4{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES};
+    VkPhysicalDeviceDepthStencilResolveProperties resolve{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
     VkPhysicalDeviceProperties2 all{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     all.pNext = &id;
     id.pNext = &properties11;
     properties11.pNext = &maintenance4;
+    maintenance4.pNext = &resolve;
     vk.vkGetPhysicalDeviceProperties2(physical, &all);
     const auto& limits = properties.limits;
 
@@ -512,6 +514,9 @@ void Device::build_profile() {
     p.shader_draw_parameters = true;
     p.texture_sample_counts = limits.framebufferColorSampleCounts & limits.framebufferDepthSampleCounts &
                               limits.sampledImageColorSampleCounts;
+    p.depth_resolve_modes = resolve.supportedDepthResolveModes;
+    p.stencil_resolve_modes = resolve.supportedStencilResolveModes;
+    p.independent_resolve = resolve.independentResolve;
     p.max_texture_2d = limits.maxImageDimension2D;
     p.max_texture_3d = limits.maxImageDimension3D;
     p.max_texture_cube = limits.maxImageDimensionCube;
@@ -981,6 +986,29 @@ void Device::note_pipeline_cache_dirty() noexcept {
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     cache_dirty_ms_.store(std::max<std::int64_t>(now, 1), std::memory_order_relaxed);
+}
+
+std::vector<std::uint8_t> Device::pipeline_cache_data() {
+    if (!pipeline_cache) return {};
+    std::size_t size{};
+    check(vk.vkGetPipelineCacheData(device, pipeline_cache, &size, nullptr), "vkGetPipelineCacheData");
+    std::vector<std::uint8_t> data(size);
+    check(vk.vkGetPipelineCacheData(device, pipeline_cache, &size, data.data()), "vkGetPipelineCacheData");
+    data.resize(size);
+    return data;
+}
+
+void Device::merge_pipeline_cache(std::span<const std::uint8_t> data) {
+    if (!pipeline_cache || data.empty()) return;
+    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    info.initialDataSize = data.size();
+    info.pInitialData = data.data();
+    VkPipelineCache loaded{};
+    check(vk.vkCreatePipelineCache(device, &info, nullptr, &loaded), "vkCreatePipelineCache");
+    const auto merged = vk.vkMergePipelineCaches(device, pipeline_cache, 1, &loaded);
+    vk.vkDestroyPipelineCache(device, loaded, nullptr);
+    check(merged, "vkMergePipelineCaches");
+    note_pipeline_cache_dirty();
 }
 
 void Device::save_pipeline_cache() {

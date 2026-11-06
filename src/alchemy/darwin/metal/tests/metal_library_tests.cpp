@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <process.h>
 #include <fstream>
 #include <iterator>
 
@@ -248,9 +249,84 @@ void precompiled(Fixture& f) {
             "a compute pipeline state of a precompiled kernel answers its thread limits");
 }
 
+// MTLBinaryArchive: adding a compute pipeline creates it (into the device's
+// pipeline cache), tile/mesh pipelines and functions are refused with
+// MTLBinaryArchiveErrorCompilationFailure, serializeToURL: writes a file an
+// archive made from that URL loads, and a missing file fails InvalidFile.
+void archives(Fixture& f) {
+    const auto d = device(f);
+    if (!d) { std::cout << "  no Metal device (no Vulkan 1.3 GPU): skipped\n"; return; }
+    const auto error = f.block(8);
+    const auto library = f.send(d, "newLibraryWithSource:options:error:", {f.cf.string(R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void archived(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) { out[i] = i * 3u; }
+)"), 0, error});
+    require(library != 0, "archive kernel compiles");
+    const auto pipeline = make(f, "MTLComputePipelineDescriptor");
+    static_cast<void>(f.send(pipeline, "setComputeFunction:", {f.send(library, "newFunctionWithName:", {f.cf.string("archived")})}));
+    const auto empty = make(f, "MTLBinaryArchiveDescriptor");
+    const auto archive = f.send(d, "newBinaryArchiveWithDescriptor:error:", {empty, error});
+    require(archive != 0, "an empty archive");
+    require(f.send(archive, "addComputePipelineFunctionsWithDescriptor:error:", {pipeline, error}) == 1, "a compute pipeline is added");
+    f.engine.write64(error, 0);
+    require(f.send(archive, "addMeshRenderPipelineFunctionsWithDescriptor:error:", {make(f, "MTLBinaryArchiveDescriptor"), error}) == 0,
+            "a mesh pipeline is refused");
+    const auto refusal = f.engine.read64(error);
+    require(refusal != 0 && f.cf.utf8(f.send(refusal, "domain")) == "MTLBinaryArchiveDomain" && f.send(refusal, "code") == 3,
+            "MTLBinaryArchiveDomain / CompilationFailure");
+    const auto host = std::filesystem::weakly_canonical(std::filesystem::temp_directory_path()) /
+                      ("alchemy_metal_archive_" + std::to_string(_getpid()) + ".bin");
+    std::filesystem::remove(host);
+    // The guest path of the host file: as is without a mapping, else
+    // /Volumes/<drive>/<rest>, checked against the mapping.
+    std::string guest = host.generic_string();
+    if (f.process.map_guest_path) {
+        const auto drive = host.root_name().string();
+        guest = "/Volumes/" + drive.substr(0, 1) + "/" + host.relative_path().generic_string();
+        std::error_code ignored;
+        if (std::filesystem::weakly_canonical(f.process.map_guest_path(guest), ignored) != host) {
+            std::cout << "  " << guest << " does not map to " << host.string() << ": file round trip skipped\n";
+            return;
+        }
+    }
+    const auto url = f.send(f.cls("NSURL"), "fileURLWithPath:isDirectory:", {f.cf.string(guest), 0});
+    require(f.send(archive, "serializeToURL:error:", {url, error}) == 1 && std::filesystem::file_size(host) > 25,
+            "serializeToURL: writes the archive file");
+    const auto loading = make(f, "MTLBinaryArchiveDescriptor");
+    static_cast<void>(f.send(loading, "setUrl:", {url}));
+    require(f.send(d, "newBinaryArchiveWithDescriptor:error:", {loading, error}) != 0, "the written archive loads");
+    std::filesystem::remove(host);
+    f.engine.write64(error, 0);
+    require(f.send(d, "newBinaryArchiveWithDescriptor:error:", {loading, error}) == 0 && f.engine.read64(error) != 0 &&
+                f.send(f.engine.read64(error), "code") == 1,
+            "a missing archive file fails with MTLBinaryArchiveErrorInvalidFile");
+}
+
+// Documented refusals: a dynamic library (supportsDynamicLibraries is NO)
+// fails with MTLLibraryErrorUnsupported, and a texture of a pixel format the
+// device has no format for (ASTC) is nil.
+void refusals(Fixture& f) {
+    const auto d = device(f);
+    if (!d) { std::cout << "  no Metal device (no Vulkan 1.3 GPU): skipped\n"; return; }
+    const auto error = f.block(8);
+    const auto options = make(f, "MTLCompileOptions");
+    static_cast<void>(f.send(options, "setLibraryType:", {1}));   // MTLLibraryTypeDynamic
+    const auto library = f.send(d, "newLibraryWithSource:options:error:",
+                                {f.cf.string("kernel void k(device uint* p [[buffer(0)]]) { p[0] = 1; }\n"), options, error});
+    require(library == 0 && f.engine.read64(error) != 0 && f.send(f.engine.read64(error), "code") == 1,
+            "a dynamic library fails with MTLLibraryErrorUnsupported");
+    const auto descriptor = make(f, "MTLTextureDescriptor");
+    static_cast<void>(f.send(descriptor, "setPixelFormat:", {204}));   // MTLPixelFormatASTC_4x4_LDR
+    static_cast<void>(f.send(descriptor, "setWidth:", {16}));
+    static_cast<void>(f.send(descriptor, "setHeight:", {16}));
+    require(f.send(d, "newTextureWithDescriptor:", {descriptor}) == 0, "an ASTC texture is nil");
+}
+
 } // namespace
 
 int main() {
     return run("metal libraries", {{"libraries and argument buffers", libraries}, {"reflection", reflection},
-                                    {"precompiled libraries", precompiled}});
+                                    {"precompiled libraries", precompiled}, {"binary archives", archives},
+                                    {"refusals", refusals}});
 }
