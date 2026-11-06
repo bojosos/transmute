@@ -536,6 +536,10 @@ void test_runtime_api() {
     f.call("_protocol_addMethodDescription", {proto, f.runtime.selector("late"), f.string("v@:"), 1, 1});
     require(f.call("_protocol_getMethodDescription", {proto, f.runtime.selector("ping:"), 1, 1}) == f.runtime.selector("ping:") &&
             f.call("_protocol_getMethodDescription", {proto, f.runtime.selector("late"), 1, 1}) == 0, "a registered protocol is immutable");
+    // No extended types recorded: _protocol_getMethodTypeEncoding gives the plain types.
+    require(read(f.call("__protocol_getMethodTypeEncoding", {proto, f.runtime.selector("ping:"), 1, 1})) == "v@:@" &&
+            f.call("__protocol_getMethodTypeEncoding", {proto, f.runtime.selector("ping:"), 0, 1}) == 0,
+            "_protocol_getMethodTypeEncoding of a run-time protocol");
     const auto property_count = f.process.allocate_guest(4);
     const auto properties = f.call("_protocol_copyPropertyList", {proto, property_count});
     require(properties && f.engine.read32(property_count) == 1 && read(f.call("_property_getName", {f.engine.read64(properties)})) == "title",

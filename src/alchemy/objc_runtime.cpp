@@ -237,6 +237,9 @@ struct ObjcRuntime::Impl {
         std::vector<Address> protocols;
         // Required instance, required class, optional instance, optional class.
         std::array<std::vector<ObjcMethodInfo>, 4> methods;
+        // The extended type encodings (protocol_t's extendedMethodTypes), parallel to
+        // `methods`; empty when the protocol records none.
+        std::array<std::vector<std::string>, 4> extended_types;
         // Declared (required) properties: instance, class.
         std::array<std::vector<ObjcPropertyInfo>, 2> properties;
     };
@@ -2534,6 +2537,27 @@ struct ObjcRuntime::Impl {
                 pending.insert(pending.end(), current->protocols.begin(), current->protocols.end());
             }
             s.x[0] = 0; });
+        // const char* _protocol_getMethodTypeEncoding(Protocol*, SEL, BOOL required, BOOL instance):
+        // the method's extended type encoding (with block signatures, such as @?<v@?@"NSError">),
+        // or its plain types when the protocol records no extended ones; incorporated protocols
+        // are searched; NULL when none has the method. NSXPCInterface reads reply block types here.
+        function("__protocol_getMethodTypeEncoding", [this](auto& s, auto& m) {
+            const auto name = s.x[1] ? text(m, s.x[1]) : std::string{};
+            const auto list = (s.x[2] & 0xff ? 0U : 2U) + (s.x[3] & 0xff ? 0U : 1U);
+            std::lock_guard lock(mutex);
+            if (!s.x[0] || name.empty()) { s.x[0] = 0; return; }
+            std::vector<Address> pending{canonical_protocol(s.x[0])}; std::set<Address> visited;
+            while (!pending.empty()) {
+                const auto current = protocols.at(pending.front()); pending.erase(pending.begin());
+                if (!visited.insert(current->address).second) continue;
+                const auto& entries = current->methods[list];
+                for (std::size_t index = 0; index < entries.size(); ++index) if (entries[index].selector == name) {
+                    const auto& extended = current->extended_types[list];
+                    s.x[0] = type_string(index < extended.size() ? extended[index] : entries[index].types); return;
+                }
+                pending.insert(pending.end(), current->protocols.begin(), current->protocols.end());
+            }
+            s.x[0] = 0; });
         function("_protocol_copyMethodDescriptionList", [this](auto& s, auto& m) {
             const auto list = (s.x[1] & 0xff ? 0U : 2U) + (s.x[2] & 0xff ? 0U : 1U);
             std::vector<Address> values;
@@ -2864,6 +2888,13 @@ void ObjcRuntime::prepare_images(std::span<const ImageRuntimeInfo> runtime_image
                 value->address = info.address; value->name = info.name; value->module = image.module_id;
                 value->name_address = impl_->string(info.demangled_name.empty() ? info.name : info.demangled_name);
                 value->methods = {info.instance_methods, info.class_methods, info.optional_instance_methods, info.optional_class_methods};
+                // extendedMethodTypes covers the four lists in order, one entry per method.
+                if (!info.extended_types.empty()) {
+                    std::size_t next = 0;
+                    for (std::size_t list = 0; list < value->methods.size(); ++list)
+                        for (std::size_t index = 0; index < value->methods[list].size() && next < info.extended_types.size(); ++index)
+                            value->extended_types[list].push_back(info.extended_types[next++]);
+                }
                 value->properties = {info.properties, info.class_properties};
                 for (const auto& list : value->properties) for (const auto& property : list) impl_->property_records.insert(property.address);
                 impl_->protocols.emplace(info.address, value); impl_->protocol_names.emplace(info.name, info.address);

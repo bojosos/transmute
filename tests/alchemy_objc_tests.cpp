@@ -215,6 +215,8 @@ void test_protocols() {
     f.engine.write64(first, first + 64); protocol(first + 64, first + 512, 0);
     f.engine.write64(first + 64 + 24, first + 256); f.engine.write32(first + 256, 24); f.engine.write32(first + 260, 1);
     f.engine.write64(first + 264, first + 528); f.engine.write64(first + 272, first + 544);
+    // Its extendedMethodTypes: one entry for the one method.
+    bytes(first + 656, "@\"NSString\"16@0:8"); f.engine.write64(first + 640, first + 656); f.engine.write64(first + 64 + 72, first + 640);
     bytes(second + 512, "Shared"); bytes(second + 528, "Child"); bytes(second + 544, "Adopt");
     f.engine.write64(second, second + 64); f.engine.write64(second + 8, second + 192);
     f.engine.write64(second + 16, second + 64); f.engine.write64(second + 24, second + 320);
@@ -257,6 +259,11 @@ void test_protocols() {
     require(f.call("_protocol_getMethodDescription", {derived, f.runtime.selector("answer"), 1, 1}) == f.runtime.selector("answer") &&
         f.call("_protocol_getMethodDescription", {derived, f.runtime.selector("answer"), 0, 1}) == 0,
         "inherited protocol method description lookup failed");
+    const auto encoding = f.call("__protocol_getMethodTypeEncoding", {derived, f.runtime.selector("answer"), 1, 1});
+    const auto encoding_bytes = static_cast<const transmute::GuestMemory&>(f.engine).read_string(encoding, 1, 64);
+    require(encoding && std::string(encoding_bytes.begin(), encoding_bytes.end()) == "@\"NSString\"16@0:8" &&
+        f.call("__protocol_getMethodTypeEncoding", {derived, f.runtime.selector("answer"), 0, 1}) == 0,
+        "_protocol_getMethodTypeEncoding: the extended types, through an incorporated protocol");
     const auto count = f.process.allocate_guest(4);
     bool unavailable{}; try { f.call("_class_copyProtocolList", {adopter, count}); } catch (const std::runtime_error& error) {
         unavailable = std::string_view(error.what()).find("libSystem allocator") != std::string_view::npos; }
