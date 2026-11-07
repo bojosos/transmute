@@ -1,0 +1,6 @@
+SQLite 3.54.1 threadsafe 1 journal wal
+reader rows 600 sum 179700 fts 2 json 45
+math 2442
+grouped: pattern=90900 palette=90300 layer=90000 gradient=90600 canvas=89700 brush=89400 (collation called)
+blob Alchemy-blob-IO length 16
+backup steps several rows 600; deserialized rows 100 integrity ok

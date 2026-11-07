@@ -41,3 +41,20 @@ code and as a `qsort` comparator called back from the libSystem provider.
 The sources carry BTI landing pads (`hint #34` and `#36`), which are no-ops on cores without BTI.
 alchemy-fx runs them; the in-process reference interpreter does not decode them yet, so the test runs
 the fixture in alchemy-fx processes only.
+
+## SQLite: /usr/lib/libsqlite3.dylib
+
+SQLite 3.54.1 (public domain), the amalgamation, `scripts/build_alchemy_sqlite.ps1`, compatibility version
+9.0.0 and current version 380.0.0. It exports every global the amalgamation defines (300 names: the
+C interface and data such as `sqlite3_version` and `sqlite3_temp_directory`), which covers the 107
+names Krita, darktable, LibreOffice and the bundled Python `sqlite3` modules import. The feature set
+(`runtime/sqlite/sqlite_cfg.h`) is close to what macOS applications expect: FTS3/4/5, R*Tree and
+Geopoly, column metadata, the pre-update hook, unlock notification, `dbstat`, statement and snapshot
+APIs, math functions, loadable extensions, and API argument checks. File locking is the portable
+POSIX style through `fcntl` record locks; Apple's AFP and proxy locking styles are off, and memory
+comes from `malloc` rather than a private malloc zone. WAL mode works: its shared-memory index is a
+`MAP_SHARED` mapping of the `-shm` file, which alchemy-fx shares between Alchemy processes.
+
+The fixture runs a file database in WAL mode with a second connection, prepared statements, FTS5,
+JSON and math functions, a guest SQL function and collation, the blob and backup APIs, and
+serialize/deserialize.

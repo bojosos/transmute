@@ -43,3 +43,4 @@ function(alchemy_oss_runtime name)
 endfunction()
 
 alchemy_oss_runtime(libffi INSTALL_NAME /usr/lib/libffi.dylib UPSTREAM https://github.com/libffi/libffi)
+alchemy_oss_runtime(sqlite INSTALL_NAME /usr/lib/libsqlite3.dylib UPSTREAM https://www.sqlite.org)
