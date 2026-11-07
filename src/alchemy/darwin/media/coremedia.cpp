@@ -1,6 +1,7 @@
 #include "alchemy/darwin/media/media.hpp"
 
 #include "alchemy/darwin/media/cmtime.hpp"
+#include "alchemy/darwin/media/video_config.hpp"
 
 #include <algorithm>
 #include <array>
@@ -614,6 +615,34 @@ void CoreMedia::install_block_buffers() {
 void CoreMedia::install_format_descriptions() {
     format_class = native_class("__AlchemyCMFormatDescription");
     register_type(format_class, TypeId::format_description);
+    namespace vc = completion_kit::media::video_config;
+    // The extensions `base` (or none) with `record` as the sample-description extension atom `atom` (+1).
+    const auto with_atom = [this](Address base, const char* atom, const std::vector<std::uint8_t>& record) -> Address {
+        const auto outer_key = cf.string("SampleDescriptionExtensionAtoms"), atom_key = cf.string(atom), data = bridge->data(record);
+        std::vector<std::pair<Address, Address>> atoms;
+        const auto existing = base ? cf.dictionary_value(base, outer_key) : 0;
+        if (existing && cf.kind(existing) == ObjectKind::dictionary)
+            for (const auto& entry : cf.dictionary_entries(existing))
+                if (!cf.equal(entry.first, atom_key)) atoms.push_back(entry);
+        atoms.emplace_back(atom_key, data);
+        const auto inner = cf.dictionary(atoms);
+        std::vector<std::pair<Address, Address>> entries;
+        if (base)
+            for (const auto& entry : cf.dictionary_entries(base))
+                if (!cf.equal(entry.first, outer_key)) entries.push_back(entry);
+        entries.emplace_back(outer_key, inner);
+        const auto out = cf.dictionary(entries);
+        for (const auto object : {outer_key, atom_key, data, inner}) release(object);
+        return out;
+    };
+    // Guest copies of the parameter sets (GetH264/HEVCParameterSetAtIndex hand out their pointers).
+    const auto copy_sets = [this](FormatDescription& value, GuestMemory& m) {
+        for (const auto& set : value.parameter_sets) {
+            const auto copy = malloc(set.size());
+            m.write_bytes(copy, set);
+            value.parameter_set_copies.push_back(copy);
+        }
+    };
     if (!has(core_media, "_CMVideoFormatDescriptionCreate")) {
         static_cast<void>(objc.add_native_method(format_class, "dealloc", [self = shared_from_this(), this](CpuState& s, GuestMemory&) {
             if (const auto value = objc.find_host_state<FormatDescription>(s.x[0])) {
@@ -627,7 +656,7 @@ void CoreMedia::install_format_descriptions() {
         }, false, "v@:"));
     }
     // CMVideoFormatDescriptionCreate(allocator, codecType, width, height, extensions, CMVideoFormatDescriptionRef *out)
-    raw(core_media, "_CMVideoFormatDescriptionCreate", [this](CpuState& s, GuestMemory& m) {
+    raw(core_media, "_CMVideoFormatDescriptionCreate", [this, copy_sets](CpuState& s, GuestMemory& m) {
         if (!s.x[5]) { s.x[0] = status(fd_invalid_parameter); return; }
         auto value = std::make_shared<FormatDescription>();
         value->media_type = fourcc("vide");
@@ -635,12 +664,29 @@ void CoreMedia::install_format_descriptions() {
         value->width = static_cast<std::int32_t>(s.x[2]);
         value->height = static_cast<std::int32_t>(s.x[3]);
         value->extensions = s.x[4] ? cf.copy(s.x[4]) : 0;
+        // H.264 and HEVC: the parameter sets of the avcC or hvcC atom (for GetH264/HEVCParameterSetAtIndex).
+        if (value->extensions && (value->subtype == fourcc("avc1") || value->subtype == fourcc("hvc1"))) {
+            const auto outer_key = cf.string("SampleDescriptionExtensionAtoms"), atom_key = cf.string(value->subtype == fourcc("avc1") ? "avcC" : "hvcC");
+            const auto atoms = cf.dictionary_value(value->extensions, outer_key);
+            const auto record = atoms && cf.kind(atoms) == ObjectKind::dictionary ? cf.dictionary_value(atoms, atom_key) : 0;
+            release(outer_key);
+            release(atom_key);
+            if (record && bridge->is_data(record)) {
+                const auto bytes = bridge->bytes(record);
+                const auto read = value->subtype == fourcc("avc1") ? vc::read_avc_configuration(bytes) : vc::read_hevc_configuration(bytes);
+                if (read) {
+                    value->parameter_sets = read->sets;
+                    value->nal_header_length = static_cast<std::int32_t>(read->nal_length_size);
+                    copy_sets(*value, m);
+                }
+            }
+        }
         m.write64(s.x[5], make(format_class, value));
         s.x[0] = 0;
     });
     // CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator, count, const uint8_t *const *sets,
     //     const size_t *sizes, int NALUnitHeaderLength, CMFormatDescriptionRef *out)
-    raw(core_media, "_CMVideoFormatDescriptionCreateFromH264ParameterSets", [this](CpuState& s, GuestMemory& m) {
+    raw(core_media, "_CMVideoFormatDescriptionCreateFromH264ParameterSets", [this, with_atom, copy_sets](CpuState& s, GuestMemory& m) {
         const auto count = s.x[1];
         const auto header = static_cast<std::int32_t>(s.x[4]);
         if (s.x[5]) m.write64(s.x[5], 0);
@@ -663,17 +709,16 @@ void CoreMedia::install_format_descriptions() {
         if (!dimensions) { s.x[0] = status(fd_invalid_parameter); return; }
         value->width = dimensions->first;
         value->height = dimensions->second;
-        for (const auto& set : value->parameter_sets) {
-            const auto copy = malloc(set.size());
-            m.write_bytes(copy, set);
-            value->parameter_set_copies.push_back(copy);
-        }
+        // The avcC record of the sets as the sample-description extension atom, for writers and readers of it.
+        if (const auto record = vc::avc_configuration(value->parameter_sets, static_cast<unsigned>(header)); !record.empty())
+            value->extensions = with_atom(0, "avcC", record);
+        copy_sets(*value, m);
         m.write64(s.x[5], make(format_class, value));
         s.x[0] = 0;
     });
     // CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator, count, sets, sizes, NALUnitHeaderLength,
     //     extensions, CMFormatDescriptionRef *out): the size from the SPS (NAL type 33) among the sets.
-    raw(core_media, "_CMVideoFormatDescriptionCreateFromHEVCParameterSets", [this](CpuState& s, GuestMemory& m) {
+    raw(core_media, "_CMVideoFormatDescriptionCreateFromHEVCParameterSets", [this, with_atom, copy_sets](CpuState& s, GuestMemory& m) {
         const auto count = s.x[1];
         const auto header = static_cast<std::int32_t>(s.x[4]);
         if (s.x[6]) m.write64(s.x[6], 0);
@@ -697,12 +742,12 @@ void CoreMedia::install_format_descriptions() {
         if (!dimensions) { s.x[0] = status(fd_invalid_parameter); return; }
         value->width = dimensions->first;
         value->height = dimensions->second;
-        value->extensions = s.x[5] ? retain(s.x[5]) : 0;
-        for (const auto& set : value->parameter_sets) {
-            const auto copy = malloc(set.size());
-            m.write_bytes(copy, set);
-            value->parameter_set_copies.push_back(copy);
-        }
+        // The extensions given, with the sets' hvcC record as the sample-description extension atom.
+        if (const auto record = vc::hevc_configuration(value->parameter_sets, static_cast<unsigned>(header)); !record.empty())
+            value->extensions = with_atom(s.x[5], "hvcC", record);
+        else
+            value->extensions = s.x[5] ? cf.copy(s.x[5]) : 0;
+        copy_sets(*value, m);
         m.write64(s.x[6], make(format_class, value));
         s.x[0] = 0;
     });

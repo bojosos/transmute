@@ -34,6 +34,9 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/audio_source.cpp
     src/alchemy/darwin/media/packet_file.cpp
     src/alchemy/darwin/media/aac_encoder.cpp
+    src/alchemy/darwin/media/video_config.cpp
+    src/alchemy/darwin/media/video_encoder.cpp
+    src/alchemy/darwin/media/vt_compression.cpp
     src/alchemy/darwin/media/audio_units.cpp
     src/alchemy/darwin/media/audio_converter.cpp
     src/alchemy/darwin/media/audio_queue.cpp

@@ -5,12 +5,12 @@
 
 // VideoToolbox, AVFoundation and the CoreVideo pixel-buffer gaps.
 //
-// - VideoToolbox: Alchemy has no video encoder. Compression session creation
-//   fails with kVTCouldNotFindVideoEncoderErr; since no such session can exist,
-//   its calls answer kVTInvalidSessionErr. Decompression sessions (AV1, VP9,
-//   VP8) are vt_decompression.cpp's and pixel transfer sessions
-//   pixel_transfer.cpp's. Hardware decoding is reported unsupported; no
-//   supplemental decoder is available.
+// - VideoToolbox: the string constants. Compression sessions (H.264, HEVC over
+//   the host's encoders) and the encoder list are vt_compression.cpp's,
+//   decompression sessions (AV1, VP9, VP8) vt_decompression.cpp's and pixel
+//   transfer sessions pixel_transfer.cpp's. Hardware decoding is reported
+//   unsupported; no supplemental or professional-workflow codec is available
+//   to register.
 // - AVFoundation: the capture string constants (device types, media types,
 //   notification names). The capture classes are av_capture.cpp's (cameras
 //   over host::camera, microphones over the CoreAudio HAL);
@@ -22,13 +22,7 @@
 namespace alchemy::gui::fill {
 namespace {
 
-constexpr std::int32_t vt_parameter = -12902, vt_invalid_session = -12903, vt_pixel_transfer_not_supported = -12905,
-    vt_could_not_find_encoder = -12908;
 constexpr std::int32_t cv_invalid_argument = -6661, cv_unsupported = -6663;
-
-void impossible(std::uint64_t object, std::string_view what) {
-    if (object) throw std::runtime_error("Alchemy: " + std::string(what) + " received an object that cannot exist under Alchemy");
-}
 
 class Video final : public Provider {
 public:
@@ -204,35 +198,40 @@ void Video::install_code_points() {
 }
 
 void Video::install_video_toolbox() {
-    // VTCompressionSessionCreate(allocator, width, height, codec, encoderSpecification, sourceAttributes,
-    //     compressedDataAllocator, outputCallback, [stack] refcon, compressionSessionOut)
-    failure(video_toolbox, "_VTCompressionSessionCreate", vt_could_not_find_encoder, {9});
-    // Pixel transfer sessions and the VTSession property calls are pixel_transfer.cpp's, decompression
-    // sessions vt_decompression.cpp's.
-    for (const auto* name : {"_VTCompressionSessionCompleteFrames", "_VTCompressionSessionEncodeFrame"})
-        raw(video_toolbox, name, [](CpuState& s, GuestMemory&) { s.x[0] = status(s.x[0] ? vt_invalid_session : vt_parameter); });
-    raw(video_toolbox, "_VTCompressionSessionInvalidate", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "VTCompressionSessionInvalidate"); });
+    // Compression sessions and the encoder list are vt_compression.cpp's, pixel transfer sessions and the VTSession
+    // property calls pixel_transfer.cpp's, decompression sessions vt_decompression.cpp's.
     constant(video_toolbox, "_VTIsHardwareDecodeSupported", 0);
-    // The encoder list is empty (VTCopyVideoEncoderList(options, CFArrayRef *out)), so no encoder has
-    // properties to report, and stereo MV-HEVC neither decodes nor encodes.
-    raw(video_toolbox, "_VTCopyVideoEncoderList", [this](CpuState& s, GuestMemory& m) {
-        if (!s.x[1]) { s.x[0] = status(vt_parameter); return; }
-        m.write64(s.x[1], cf.array(std::vector<Address>{}));
-        s.x[0] = 0;
-    });
-    // VTCopySupportedPropertyDictionaryForEncoder(width, height, codec, encoderSpecification, CFStringRef *encoderIDOut,
-    //     CFDictionaryRef *supportedPropertiesOut)
-    raw(video_toolbox, "_VTCopySupportedPropertyDictionaryForEncoder", [](CpuState& s, GuestMemory& m) {
-        if (s.x[4]) m.write64(s.x[4], 0);
-        if (s.x[5]) m.write64(s.x[5], 0);
-        s.x[0] = status(vt_could_not_find_encoder);
-    });
+    // Stereo MV-HEVC neither decodes nor encodes.
     constant(video_toolbox, "_VTIsStereoMVHEVCDecodeSupported", 0);
     constant(video_toolbox, "_VTIsStereoMVHEVCEncodeSupported", 0);
     for (const auto* key : {"CodecType", "EncoderID", "CodecName", "EncoderName", "DisplayName", "GPURegistryID", "InstanceLimit",
                             "IsHardwareAccelerated", "PerformanceRating", "QualityRating", "SupportedSelectionProperties", "SupportsFrameReordering"})
         string(video_toolbox, "_kVTVideoEncoderList_" + std::string(key), key);   // each (unverified: naming convention)
     raw(video_toolbox, "_VTRegisterSupplementalVideoDecoderIfAvailable", [](CpuState&, GuestMemory&) {});   // none is available
+    // No professional-workflow (ProRes RAW, ...) decoder or encoder exists here to register.
+    raw(video_toolbox, "_VTRegisterProfessionalVideoWorkflowVideoDecoders", [](CpuState&, GuestMemory&) {});
+    raw(video_toolbox, "_VTRegisterProfessionalVideoWorkflowVideoEncoders", [](CpuState&, GuestMemory&) {});
+    // Compression property keys (the honoured ones and those sessions answer kVTPropertyNotSupportedErr for;
+    // vt_compression.cpp) and profile levels, each (unverified: naming convention): the name after
+    // kVTCompressionPropertyKey_ or kVTProfileLevel_.
+    for (const auto* key : {"Quality", "PixelAspectRatio", "MaxH264SliceBytes", "ConstantBitRate", "MoreFramesBeforeStart", "MoreFramesAfterEnd",
+                            "PrioritizeEncodingSpeedOverQuality", "SpatialAdaptiveQPLevel", "SuggestedLookAheadFrameCount", "PreserveDynamicHDRMetadata",
+                            "MultiPassStorage", "MinAllowedFrameQP", "MaxAllowedFrameQP", "H264EntropyMode", "FieldDetail", "FieldCount",
+                            "AllowTemporalCompression"})
+        string(video_toolbox, "_kVTCompressionPropertyKey_" + std::string(key), key);
+    for (const auto* level : {"H264_Baseline_1_3", "H264_Baseline_3_0", "H264_Baseline_3_1", "H264_Baseline_3_2", "H264_Baseline_4_1",
+                              "H264_Main_3_0", "H264_Main_3_1", "H264_Main_3_2", "H264_Main_4_0", "H264_Main_4_1", "H264_Main_5_0", "H264_High_5_0"})
+        string(video_toolbox, "_kVTProfileLevel_" + std::string(level), level);
+    // Each (unverified: naming convention).
+    for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 7>{{
+             {"_kVTH264EntropyMode_CAVLC", "CAVLC"},
+             {"_kVTH264EntropyMode_CABAC", "CABAC"},
+             {"_kVTVideoEncoderSpecification_EncoderID", "EncoderID"},
+             {"_kVTVideoEncoderSpecification_RequiredEncoderGPURegistryID", "RequiredEncoderGPURegistryID"},
+             {"_kVTPropertySupportedValueListKey", "SupportedValueList"},
+             {"_kVTDecompressionProperty_FieldMode_DeinterlaceFields", "DeinterlaceFields"},
+             {"_kVTDecompressionProperty_DeinterlaceMode_Temporal", "Temporal"}}})
+        string(video_toolbox, symbol, value);
     for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 16>{{
              {"_kVTCompressionPropertyKey_AllowFrameReordering", "AllowFrameReordering"},
              {"_kVTCompressionPropertyKey_AverageBitRate", "AverageBitRate"},

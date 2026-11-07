@@ -248,8 +248,9 @@ void Provider::install_media() {
         string(video_toolbox, std::string("_kVTProfileLevel_") + name, name);
     string(video_toolbox, "_kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder", "EnableHardwareAcceleratedVideoEncoder");
     string(video_toolbox, "_kVTVideoEncoderSpecification_EnableLowLatencyRateControl", "EnableLowLatencyRateControl");
-    // The encoder's per-frame quality metrics (CalculateMeanSquaredError); no encoder runs, so
-    // no sample carries them. (unverified: value = key name without its prefix)
+    // The encoder's per-frame quality metrics (CalculateMeanSquaredError); the encoders here
+    // (vt_compression.cpp) do not report them, so no sample carries them. (unverified: value = key
+    // name without its prefix)
     string(video_toolbox, "_kVTSampleAttachmentKey_QualityMetrics", "QualityMetrics");
     for (const auto* name : {"LumaMeanSquaredError", "ChromaBlueMeanSquaredError", "ChromaRedMeanSquaredError"})
         string(video_toolbox, std::string("_kVTSampleAttachmentQualityMetricsKey_") + name, name);

@@ -163,12 +163,13 @@ void video(Fixture& f) {
     require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, fourcc("avc1"), 640, 480, 0, format_out}) == 0, "an H.264 description");
     require(f.status(vt, "_VTDecompressionSessionCreate", {0, f.engine.read64(format_out), 0, 0, 0, out}) == -12906 && f.engine.read64(out) == 0,
             "no H.264 decoder");
+    // H.264 and HEVC encode where the host has an encoder (media_guest_tests' vt_compression); JPEG never does.
     alchemy::CallRegs compress{};
-    compress.x[1] = 640; compress.x[2] = 480; compress.x[3] = fourcc("avc1");
+    compress.x[1] = 640; compress.x[2] = 480; compress.x[3] = fourcc("jpeg");
     const auto session = f.block(8, 0xff);
     compress.push_stack(Address{0});
     compress.push_stack(session);
-    require(static_cast<std::int32_t>(f.regs(vt, "_VTCompressionSessionCreate", compress).x0) == -12908 && f.engine.read64(session) == 0, "no encoder");
+    require(static_cast<std::int32_t>(f.regs(vt, "_VTCompressionSessionCreate", compress).x0) == -12908 && f.engine.read64(session) == 0, "no JPEG encoder");
     require(f.status(vt, "_VTPixelTransferSessionCreate", {0, out}) == 0 && f.engine.read64(out) != 0, "a pixel transfer session");
     require(f.status(vt, "_VTSessionSetProperty", {0, 0, 0}) == -12902, "session calls");
     require(f.call(vt, "_VTIsHardwareDecodeSupported", {fourcc("avc1")}) == 0, "no hardware decode");

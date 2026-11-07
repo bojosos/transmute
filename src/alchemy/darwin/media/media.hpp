@@ -36,6 +36,8 @@ void install_core_video_pixel_buffers(InstallContext& context);
 void install_pixel_transfer(InstallContext& context);
 // vt_decompression.cpp: VTDecompressionSession for AV1, VP9 and VP8 (before install_video_toolbox).
 void install_vt_decompression(InstallContext& context);
+// vt_compression.cpp: VTCompressionSession for H.264 and HEVC and the encoder list (before install_video_toolbox).
+void install_vt_compression(InstallContext& context);
 void install_audio(InstallContext& context);
 void install_media_accessibility(InstallContext& context);
 void install_image_capture(InstallContext& context);

@@ -15,6 +15,9 @@
 #include "alchemy/darwin/media/media_container.hpp"
 #include "alchemy/darwin/media/media_codecs.hpp"
 #include "fake_aac.hpp"
+#include "fake_video.hpp"
+#include "alchemy/darwin/media/video_config.hpp"
+#include "alchemy/host/media_codec.hpp"
 #include "alchemy/host/speech.hpp"
 
 #include <algorithm>
@@ -302,10 +305,12 @@ void core_video(Fixture& f) {
     require(f.call(cg_library, "_CGImageGetWidth", {cg_image}) == 20 && f.call(cg_library, "_CGImageGetHeight", {cg_image}) == 30 &&
             f.call(cg_library, "_CGImageGetAlphaInfo", {cg_image}) == 2, "its size, premultiplied alpha");
     require(f.status(vt, "_VTCreateCGImageFromCVPixelBuffer", {0, 0, out}) == -12902 && f.engine.read64(out) == 0, "no buffer");
-    // No video encoder: an empty list, no encoder properties, no MV-HEVC.
+    // A host without video encoders: an empty list, no encoder properties; no MV-HEVC.
+    fake_video::install(true);
     require(f.status(vt, "_VTCopyVideoEncoderList", {0, out}) == 0 && f.call(cf_library, "_CFArrayGetCount", {f.engine.read64(out)}) == 0,
             "an empty encoder list");
     require(f.status(vt, "_VTCopySupportedPropertyDictionaryForEncoder", {64, 64, 0x61766331, 0, out, session_out}) == -12908, "no encoder");
+    fake_video::install();
     require((f.call(vt, "_VTIsStereoMVHEVCDecodeSupported") & 0xff) == 0, "no MV-HEVC decoding");
     // The H.273 code points of the colour attachment values.
     const auto bt2020 = f.engine.read64(f.symbol(cv, "_kCVImageBufferColorPrimaries_ITU_R_2020"));
@@ -3535,6 +3540,375 @@ void video_toolbox(Fixture& f) {
     }
 }
 
+// VTCompressionSession over the fake encoders (fake_video.hpp): the encoder list and specification, the properties
+// as the encoder's settings, frames in any buffer format (the fake gives back each picture's mean Y'CbCr), the
+// output callback and handler with each frame's refcon and times, keyframes forced and NotSync marks, reordered
+// frames with decode times, the format description's parameter sets and avcC/hvcC atom, CompleteFrames, the pool,
+// Invalidate and the refusals.
+struct Encoded {
+    Address refcon{}, sample{}, output_refcon{};
+    std::int32_t status{};
+    std::uint32_t flags{};
+};
+std::vector<Encoded>& vt_encoded() { static std::vector<Encoded> value; return value; }
+
+void vt_compression(Fixture& f) {
+    namespace vc = alchemy::gui::completion_kit::media::video_config;
+    fake_video::install();
+    vt_fixture = &f;
+    const auto cfl = std::string(vt_cf);
+    const auto callback = f.process.install_function("_alchemy_test_vt_encoded", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        // (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer)
+        if (s.x[4]) static_cast<void>(vt_fixture->call(vt_cf, "_CFRetain", {s.x[4]}));
+        vt_encoded().push_back({s.x[1], s.x[4], s.x[0], static_cast<std::int32_t>(s.x[2]), static_cast<std::uint32_t>(s.x[3])});
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto out = f.block(8), session_out = f.block(8);
+    // The encoder list: Alchemy's IDs.
+    require(f.status(vt, "_VTCopyVideoEncoderList", {0, out}) == 0, "VTCopyVideoEncoderList");
+    const auto list = f.cf.array_values(f.engine.read64(out));
+    require(list.size() == 3, "three encoders listed");
+    const auto entry = [&](Address dictionary, const char* key) { return f.cf.dictionary_value(dictionary, f.cf.string(key)); };
+    require(f.cf.utf8(entry(list[0], "EncoderID")) == "com.alchemy.mediafoundation.h264.0" && f.cf.number_value(entry(list[0], "CodecType")) == 0x61766331 &&
+            f.cf.utf8(entry(list[0], "CodecName")) == "H.264" && entry(list[1], "IsHardwareAccelerated") == f.cf.boolean(true) &&
+            f.cf.utf8(entry(list[2], "EncoderID")) == "com.alchemy.mediafoundation.hevc.0", "the encoders' IDs, codecs and kinds");
+    const auto create = [&](std::uint32_t width, std::uint32_t height, std::uint32_t codec, Address specification, Address attributes, Address refcon,
+                            bool with_callback = true) {
+        alchemy::CallRegs r{};
+        r.x[1] = width; r.x[2] = height; r.x[3] = codec; r.x[4] = specification; r.x[5] = attributes; r.x[7] = with_callback ? callback : 0;
+        r.push_stack(refcon);
+        r.push_stack(session_out);
+        f.engine.write64(session_out, 0xdead);
+        return static_cast<std::int32_t>(f.regs(vt, "_VTCompressionSessionCreate", r).x0);
+    };
+    const auto spec = [&](const char* key, Address value) {
+        const std::array<std::pair<Address, Address>, 1> entries{{{f.cf.string(key), value}}};
+        return f.cf.dictionary(entries);
+    };
+    // Refusals at creation.
+    require(create(64, 48, 0x6a706567 /* 'jpeg' */, 0, 0, 0) == -12908 && f.engine.read64(session_out) == 0, "no JPEG encoder");
+    require(create(63, 48, 0x61766331, 0, 0, 0) == -12908, "odd sizes have no encoder");
+    require(create(64, 48, 0x68766331, spec("RequireHardwareAcceleratedVideoEncoder", f.cf.boolean(true)), 0, 0) == -12908, "no hardware HEVC encoder");
+    require(create(64, 48, 0x61766331, spec("EncoderID", f.cf.string("com.apple.videotoolbox.videoencoder.h264")), 0, 0) == -12908,
+            "Apple's encoder IDs are not Alchemy's");
+    require(create(64, 48, 0x61766331, spec("RequiredEncoderGPURegistryID", f.cf.integer(1)), 0, 0) == -12908, "no encoder on a named GPU");
+    require(f.status(vt, "_VTCopySupportedPropertyDictionaryForEncoder", {64, 48, 0x61766331, spec("RequireHardwareAcceleratedVideoEncoder", f.cf.boolean(true)),
+            out, session_out}) == 0 && f.cf.utf8(f.engine.read64(out)) == "com.alchemy.mediafoundation.h264.1" &&
+            f.cf.dictionary_value(f.engine.read64(session_out), f.cf.string("AverageBitRate")) != 0, "the hardware encoder's ID and supported keys");
+
+    // H.264 at 64x48 on the hardware encoder, by its ID.
+    require(create(64, 48, 0x61766331, spec("EncoderID", f.cf.string("com.alchemy.mediafoundation.h264.1")), 0, 0x5150) == 0, "VTCompressionSessionCreate");
+    auto session = f.engine.read64(session_out);
+    require(f.call(cfl, "_CFGetTypeID", {session}) == f.call(vt, "_VTCompressionSessionGetTypeID"), "its type");
+    const auto set = [&](const char* key, Address value) { return f.status(vt, "_VTSessionSetProperty", {session, f.cf.string(key), value}); };
+    require(set("AverageBitRate", f.cf.integer(500000)) == 0 && set("ExpectedFrameRate", f.cf.integer(25)) == 0 &&
+            set("MaxKeyFrameInterval", f.cf.integer(10)) == 0 && set("ProfileLevel", f.cf.string("H264_Main_3_1")) == 0 &&
+            set("RealTime", f.cf.boolean(true)) == 0 && set("AllowFrameReordering", f.cf.boolean(false)) == 0, "the properties");
+    const std::array<Address, 2> limits{f.cf.integer(50000), f.cf.integer(1)};   // 50 kB per second: 400 kb/s
+    require(set("DataRateLimits", f.cf.array(limits)) == 0, "DataRateLimits");
+    require(set("Quality", f.cf.real(0.5)) == -12900 && set("MaxH264SliceBytes", f.cf.integer(1000)) == -12900, "keys not honoured: not supported");
+    require(set("ProfileLevel", f.cf.string("HEVC_Main_AutoLevel")) == -12902 && set("AverageBitRate", f.cf.string("fast")) == -12902,
+            "values refused");
+    require(set("UsingHardwareAcceleratedVideoEncoder", f.cf.boolean(false)) == -12901, "a read-only key");
+    require(f.status(vt, "_VTSessionCopyProperty", {session, f.cf.string("UsingHardwareAcceleratedVideoEncoder"), 0, out}) == 0 &&
+            f.engine.read64(out) == f.cf.boolean(true), "the hardware encoder is used");
+    // The pool: the session's size, 420v.
+    const auto pool = f.call(vt, "_VTCompressionSessionGetPixelBufferPool", {session});
+    require(pool != 0 && f.status(cv, "_CVPixelBufferPoolCreatePixelBuffer", {0, pool, out}) == 0, "a pool buffer");
+    const auto pooled = f.engine.read64(out);
+    require(f.call(cv, "_CVPixelBufferGetWidth", {pooled}) == 64 && f.call(cv, "_CVPixelBufferGetHeight", {pooled}) == 48 &&
+            f.call(cv, "_CVPixelBufferGetPixelFormatType", {pooled}) == 0x34323076, "64x48 420v");
+    // Frames: a BGRA buffer twice the size (scaled), mid grey then white; the pool's 420v buffer filled directly.
+    const auto bgra_out = f.block(8);
+    require(f.status(cv, "_CVPixelBufferCreate", {0, 128, 96, 0x42475241, 0, bgra_out}) == 0, "a BGRA buffer");
+    const auto bgra = f.engine.read64(bgra_out);
+    const auto fill_bgra = [&](std::uint8_t v) {
+        f.call(cv, "_CVPixelBufferLockBaseAddress", {bgra, 0});
+        const auto base = f.call(cv, "_CVPixelBufferGetBaseAddress", {bgra}), row = f.call(cv, "_CVPixelBufferGetBytesPerRow", {bgra});
+        for (Address y = 0; y < 96; ++y) f.memory().write_bytes(base + y * row, std::vector<std::uint8_t>(128 * 4, v));
+        f.call(cv, "_CVPixelBufferUnlockBaseAddress", {bgra, 0});
+    };
+    const auto fill_420v = [&](std::uint8_t y, std::uint8_t cb, std::uint8_t cr) {
+        f.call(cv, "_CVPixelBufferLockBaseAddress", {pooled, 0});
+        const auto luma = f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {pooled, 0}), luma_row = f.call(cv, "_CVPixelBufferGetBytesPerRowOfPlane", {pooled, 0});
+        const auto chroma = f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {pooled, 1}), chroma_row = f.call(cv, "_CVPixelBufferGetBytesPerRowOfPlane", {pooled, 1});
+        for (Address r = 0; r < 48; ++r) f.memory().write_bytes(luma + r * luma_row, std::vector<std::uint8_t>(64, y));
+        std::vector<std::uint8_t> pairs;
+        for (int i = 0; i < 32; ++i) { pairs.push_back(cb); pairs.push_back(cr); }
+        for (Address r = 0; r < 24; ++r) f.memory().write_bytes(chroma + r * chroma_row, pairs);
+        f.call(cv, "_CVPixelBufferUnlockBaseAddress", {pooled, 0});
+    };
+    const auto pts = f.block(24), duration = f.block(24), info = f.block(4);
+    const auto times = [&](std::int64_t frame) {
+        f.engine.write64(pts, static_cast<Address>(frame * 40)); f.engine.write32(pts + 8, 1000); f.engine.write32(pts + 12, 1); f.engine.write64(pts + 16, 0);
+        f.engine.write64(duration, 40); f.engine.write32(duration + 8, 1000); f.engine.write32(duration + 12, 1); f.engine.write64(duration + 16, 0);
+    };
+    const auto force_key = spec("ForceKeyFrame", f.cf.boolean(true));
+    vt_encoded().clear();
+    for (std::int64_t i = 0; i < 12; ++i) {
+        times(i);
+        Address image = bgra;
+        if (i < 4) fill_bgra(i < 2 ? 0x80 : 0xff);
+        else { fill_420v(static_cast<std::uint8_t>(100 + i), 90, 160); image = pooled; }
+        require(f.status(vt, "_VTCompressionSessionEncodeFrame", {session, image, pts, duration, i == 6 ? force_key : 0, 0x1000 + static_cast<Address>(i), info}) == 0,
+                "VTCompressionSessionEncodeFrame " + std::to_string(i));
+        require((f.engine.read32(info) & 1) == 0, "never asynchronous");
+    }
+    require(f.status(vt, "_VTCompressionSessionCompleteFrames", {session, pts}) == 0, "CompleteFrames");
+    require(fake_video::last.bit_rate == 400000 && fake_video::last.frame_rate == 25 && fake_video::last.keyframe_interval == 10 &&
+            fake_video::last.profile == fake_video::enc::Profile::h264_main && fake_video::last.level == 31 && fake_video::last.real_time &&
+            !fake_video::last.frame_reordering && fake_video::last.require_hardware == false && fake_video::last.encoder_id == "com.alchemy.mediafoundation.h264.1",
+            "the encoder's settings: the bit rate under the data rate limit, the rate, interval, profile and level");
+    require(set("AverageBitRate", f.cf.integer(1000000)) == -12901, "the running encoder is not retuned");
+    require(vt_encoded().size() == 12, "a sample per frame: " + std::to_string(vt_encoded().size()));
+    Address first_format{};
+    for (std::size_t i = 0; i < vt_encoded().size(); ++i) {
+        const auto& e = vt_encoded()[i];
+        require(e.status == 0 && e.flags == 0 && e.sample && e.refcon == 0x1000 + i && e.output_refcon == 0x5150, "frame " + std::to_string(i) + " came out in order");
+        alchemy::CallRegs r{};
+        r.x[0] = e.sample;
+        const auto time = f.block(24);
+        r.indirect_result = time;
+        f.regs(cm, "_CMSampleBufferGetPresentationTimeStamp", r);
+        require(f.engine.read64(time) == i * 40 && f.engine.read32(time + 8) == 1000, "its presentation time");
+        f.regs(cm, "_CMSampleBufferGetDuration", r);
+        require(f.engine.read64(time) == 40, "its duration");
+        // The picture the encoder got: the fake's payload after the NAL header (number, mean Y, Cb, Cr).
+        const auto block = f.call(cm, "_CMSampleBufferGetDataBuffer", {e.sample});
+        const auto length = f.call(cm, "_CMBlockBufferGetDataLength", {block});
+        const auto bytes = f.block(length);
+        require(length == 12 && f.status(cm, "_CMBlockBufferCopyDataBytes", {block, 0, length, bytes}) == 0, "the sample's NAL unit");
+        const auto y = f.memory().read8(bytes + 9), cb = f.memory().read8(bytes + 10), cr = f.memory().read8(bytes + 11);
+        if (i < 2) require(y >= 124 && y <= 128 && cb == 128 && cr == 128, "mid grey as video-range Y'CbCr: " + std::to_string(y));
+        else if (i < 4) require(y >= 233 && y <= 236 && cb == 128 && cr == 128, "white as video-range Y'CbCr: " + std::to_string(y));
+        else require(y == 100 + i && cb == 90 && cr == 160, "the 420v planes as they are");
+        const bool key = i == 0 || i == 6;
+        require((f.memory().read8(bytes + 4) & 0x1f) == (key ? 5 : 1), "keyframes where they were forced (and the first)");
+        const auto attachments = f.call(cm, "_CMSampleBufferGetSampleAttachmentsArray", {e.sample, 0});
+        const auto first = attachments ? f.cf.element(attachments, 0) : 0;
+        const auto not_sync = first ? f.cf.dictionary_value(first, f.cf.string("NotSync")) : 0;
+        require(key ? not_sync == 0 : not_sync == f.cf.boolean(true), "NotSync on the others");
+        const auto format = f.call(cm, "_CMSampleBufferGetFormatDescription", {e.sample});
+        if (!first_format) first_format = format;
+        require(format == first_format, "one format description");
+    }
+    // The format description: H.264 64x48 from the encoder's parameter sets, with its avcC atom.
+    require(f.call(cm, "_CMFormatDescriptionGetMediaSubType", {first_format}) == 0x61766331 &&
+            f.call(cm, "_CMVideoFormatDescriptionGetDimensions", {first_format}) == (64 | (Address{48} << 32)), "avc1 64x48");
+    const auto sets_count = f.block(8), header = f.block(4);
+    require(f.status(cm, "_CMVideoFormatDescriptionGetH264ParameterSetAtIndex", {first_format, 0, 0, 0, sets_count, header}) == 0 &&
+            f.engine.read64(sets_count) == 2 && f.engine.read32(header) == 4, "two parameter sets, 4-byte lengths");
+    const auto atoms = f.call(cm, "_CMFormatDescriptionGetExtension", {first_format, f.cf.string("SampleDescriptionExtensionAtoms")});
+    const auto avcc = atoms ? f.cf.dictionary_value(atoms, f.cf.string("avcC")) : 0;
+    require(avcc != 0, "the avcC atom");
+    const auto avcc_bytes = f.call(cfl, "_CFDataGetLength", {avcc});
+    std::vector<std::uint8_t> record(avcc_bytes);
+    f.memory().read_bytes(f.call(cfl, "_CFDataGetBytePtr", {avcc}), record);
+    const auto read = vc::read_avc_configuration(record);
+    require(read && read->sets.size() == 2 && read->nal_length_size == 4 && record[1] == 77 && record[3] == 31, "avcC: Main 3.1, SPS and PPS");
+    // A CMVideoFormatDescription made from that atom has the same parameter sets.
+    const std::array<std::pair<Address, Address>, 1> atom_entries{{{f.cf.string("avcC"), avcc}}};
+    const std::array<std::pair<Address, Address>, 1> extension_entries{{{f.cf.string("SampleDescriptionExtensionAtoms"), f.cf.dictionary(atom_entries)}}};
+    require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, 0x61766331, 64, 48, f.cf.dictionary(extension_entries), out}) == 0 &&
+            f.status(cm, "_CMVideoFormatDescriptionGetH264ParameterSetAtIndex", {f.engine.read64(out), 1, 0, 0, sets_count, header}) == 0 &&
+            f.engine.read64(sets_count) == 2, "the atom's parameter sets");
+    for (const auto& e : vt_encoded()) f.call(cfl, "_CFRelease", {e.sample});
+    f.call(vt, "_VTCompressionSessionInvalidate", {session});
+    times(20);
+    require(f.status(vt, "_VTCompressionSessionEncodeFrame", {session, bgra, pts, duration, 0, 0, info}) == -12903, "invalidated");
+    f.call(cfl, "_CFRelease", {session});
+
+    // HEVC with reordered frames, through output handlers; a picture that never comes out is reported as dropped.
+    require(create(64, 48, 0x68766331, 0, 0, 0, false) == 0, "an HEVC session without a callback");
+    session = f.engine.read64(session_out);
+    require(f.status(vt, "_VTSessionSetProperty", {session, f.cf.string("ProfileLevel"), f.cf.string("HEVC_Main_AutoLevel")}) == 0 &&
+            f.status(vt, "_VTCompressionSessionPrepareToEncodeFrames", {session}) == 0 && fake_video::last.frame_reordering &&
+            fake_video::last.profile == fake_video::enc::Profile::hevc_main, "prepared: reordering allowed by default");
+    times(0);
+    require(f.status(vt, "_VTCompressionSessionEncodeFrame", {session, bgra, pts, duration, 0, 0, info}) == -12902, "no callback: handlers only");
+    static std::vector<std::tuple<std::int32_t, std::uint32_t, Address>> handled;
+    handled.clear();
+    const auto handler_fn = f.process.install_function("_alchemy_test_vt_handled", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        // block(OSStatus, VTEncodeInfoFlags, CMSampleBufferRef)
+        if (s.x[3]) static_cast<void>(vt_fixture->call(vt_cf, "_CFRetain", {s.x[3]}));
+        handled.emplace_back(static_cast<std::int32_t>(s.x[1]), static_cast<std::uint32_t>(s.x[2]), s.x[3]);
+    }, "/usr/lib/alchemy_test_io.dylib");
+    // A compiler-emitted (global) block whose invoke is that function.
+    const auto handler = f.block(32), descriptor = f.block(16);
+    f.engine.write64(descriptor + 8, 32);
+    f.engine.write64(handler, f.process.resolve("/usr/lib/libSystem.B.dylib", "__NSConcreteGlobalBlock")->address);
+    f.engine.write32(handler + 8, 1U << 28);   // BLOCK_IS_GLOBAL
+    f.engine.write64(handler + 16, handler_fn);
+    f.engine.write64(handler + 24, descriptor);
+    for (std::int64_t i = 0; i < 5; ++i) {
+        times(i);
+        require(f.status(vt, "_VTCompressionSessionEncodeFrameWithOutputHandler", {session, bgra, pts, duration, 0, info, handler}) == 0, "HEVC frame");
+    }
+    require(handled.size() == 5, "frames 0, 2, 1, 4, 3 so far: " + std::to_string(handled.size()));
+    require(f.status(vt, "_VTCompressionSessionCompleteFrames", {session, pts}) == 0, "CompleteFrames");
+    std::vector<std::int64_t> order, decode_order;
+    for (const auto& [result, flags, sample] : handled) {
+        require(result == 0 && flags == 0 && sample, "handled");
+        alchemy::CallRegs r{};
+        r.x[0] = sample;
+        const auto time = f.block(24);
+        r.indirect_result = time;
+        f.regs(cm, "_CMSampleBufferGetPresentationTimeStamp", r);
+        order.push_back(static_cast<std::int64_t>(f.engine.read64(time)));
+        f.regs(cm, "_CMSampleBufferGetDecodeTimeStamp", r);
+        decode_order.push_back(static_cast<std::int64_t>(f.engine.read64(time)));
+    }
+    require(order == std::vector<std::int64_t>{0, 80, 40, 160, 120}, "decode order: the reordered pairs");
+    require(std::is_sorted(decode_order.begin(), decode_order.end()) && decode_order[1] <= order[1], "decode times in order, before the presentation times");
+    const auto hevc_format = f.call(cm, "_CMSampleBufferGetFormatDescription", {std::get<2>(handled[0])});
+    const auto hevc_atoms = f.call(cm, "_CMFormatDescriptionGetExtension", {hevc_format, f.cf.string("SampleDescriptionExtensionAtoms")});
+    const auto hvcc = hevc_atoms ? f.cf.dictionary_value(hevc_atoms, f.cf.string("hvcC")) : 0;
+    require(hvcc != 0 && f.call(cm, "_CMVideoFormatDescriptionGetDimensions", {hevc_format}) == (64 | (Address{48} << 32)), "hvc1 64x48 with its hvcC atom");
+    std::vector<std::uint8_t> hevc_record(f.call(cfl, "_CFDataGetLength", {hvcc}));
+    f.memory().read_bytes(f.call(cfl, "_CFDataGetBytePtr", {hvcc}), hevc_record);
+    const auto hevc_read = vc::read_hevc_configuration(hevc_record);
+    require(hevc_read && hevc_read->sets.size() == 3 && hevc_record[12] == 93 && (hevc_record[1] & 0x1f) == 1, "hvcC: Main, level 3.1, VPS, SPS, PPS");
+    for (const auto& h : handled) f.call(cfl, "_CFRelease", {std::get<2>(h)});
+    f.call(vt, "_VTCompressionSessionInvalidate", {session});
+    f.call(cfl, "_CFRelease", {session});
+
+    // AllowTemporalCompression off: every frame a keyframe.
+    require(create(64, 48, 0x61766331, 0, 0, 0) == 0, "an H.264 session");
+    session = f.engine.read64(session_out);
+    require(f.status(vt, "_VTSessionSetProperty", {session, f.cf.string("AllowTemporalCompression"), f.cf.boolean(false)}) == 0, "no temporal compression");
+    vt_encoded().clear();
+    for (std::int64_t i = 0; i < 3; ++i) {
+        times(i);
+        require(f.status(vt, "_VTCompressionSessionEncodeFrame", {session, bgra, pts, duration, 0, 0, info}) == 0, "a frame");
+    }
+    for (const auto& e : vt_encoded()) {
+        const auto attachments = f.call(cm, "_CMSampleBufferGetSampleAttachmentsArray", {e.sample, 0});
+        require(!f.cf.dictionary_value(f.cf.element(attachments, 0), f.cf.string("NotSync")), "every frame a keyframe");
+        f.call(cfl, "_CFRelease", {e.sample});
+    }
+    times(1);
+    require(f.status(vt, "_VTCompressionSessionEncodeFrame", {session, bgra, pts, duration, 0, 0, info}) == -12902, "presentation times increase");
+    f.call(vt, "_VTCompressionSessionInvalidate", {session});
+    f.call(cfl, "_CFRelease", {session});
+
+    // Multi-pass is not available.
+    require(f.status(vt, "_VTMultiPassStorageCreate", {0, 0, f.block(48), 0, out}) == -12907 && f.engine.read64(out) == 0, "no multi-pass storage");
+}
+
+// VTCompressionSession over the host's own encoders (skipped where there is none): 30 frames of a moving gradient
+// at 160x120, H.264 and HEVC, decoded back by the host's decoders (host/media_codec.hpp) from the session's samples
+// and format description: every frame, close to what went in.
+void vt_compression_host(Fixture& f) {
+    namespace mc = alchemy::host::media_codec;
+    namespace enc = alchemy::gui::completion_kit::media::video_encoding;
+    enc::set_backend({});
+    struct Restore { ~Restore() { fake_video::install(); } } restore;
+    vt_fixture = &f;
+    const auto cfl = std::string(vt_cf);
+    const auto out = f.block(8), session_out = f.block(8), info = f.block(4), pts = f.block(24), duration = f.block(24);
+    const auto callback = f.process.install_function("_alchemy_test_vt_encoded_host", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        if (s.x[4]) static_cast<void>(vt_fixture->call(vt_cf, "_CFRetain", {s.x[4]}));
+        vt_encoded().push_back({s.x[1], s.x[4], s.x[0], static_cast<std::int32_t>(s.x[2]), static_cast<std::uint32_t>(s.x[3])});
+    }, "/usr/lib/alchemy_test_io.dylib");
+    for (const auto codec : {0x61766331u, 0x68766331u}) {
+        const char* name = codec == 0x61766331u ? "H.264" : "HEVC";
+        const auto mc_codec = codec == 0x61766331u ? mc::Codec::h264 : mc::Codec::hevc;
+        const auto decoders = mc::decoders(mc_codec);
+        alchemy::CallRegs r{};
+        r.x[1] = 160; r.x[2] = 120; r.x[3] = codec; r.x[7] = callback;
+        r.push_stack(Address{0});
+        r.push_stack(session_out);
+        const auto created = static_cast<std::int32_t>(f.regs(vt, "_VTCompressionSessionCreate", r).x0);
+        if (created == -12908 || !decoders || decoders->empty()) {
+            std::cout << "[qlab media] no " << name << " encoder or decoder on this host: skipped" << std::endl;
+            continue;
+        }
+        require(created == 0, std::string(name) + ": VTCompressionSessionCreate");
+        const auto session = f.engine.read64(session_out);
+        require(f.status(vt, "_VTSessionSetProperty", {session, f.cf.string("AverageBitRate"), f.cf.integer(2000000)}) == 0, "a generous bit rate");
+        const auto buffer_out = f.block(8);
+        require(f.status(cv, "_CVPixelBufferCreate", {0, 160, 120, 0x42475241, 0, buffer_out}) == 0, "BGRA");
+        const auto image = f.engine.read64(buffer_out);
+        std::vector<std::vector<std::uint8_t>> grey;   // each frame's luma as the encoder got it (BT.601 video range of R = G = B)
+        vt_encoded().clear();
+        for (int i = 0; i < 30; ++i) {
+            f.call(cv, "_CVPixelBufferLockBaseAddress", {image, 0});
+            const auto base = f.call(cv, "_CVPixelBufferGetBaseAddress", {image}), row = f.call(cv, "_CVPixelBufferGetBytesPerRow", {image});
+            std::vector<std::uint8_t> luma(160 * 120);
+            for (Address y = 0; y < 120; ++y) {
+                std::vector<std::uint8_t> line(160 * 4);
+                for (Address x = 0; x < 160; ++x) {
+                    const auto v = static_cast<std::uint8_t>((x + y + i * 3) & 0xff);
+                    line[x * 4] = line[x * 4 + 1] = line[x * 4 + 2] = v;
+                    line[x * 4 + 3] = 255;
+                    luma[y * 160 + x] = static_cast<std::uint8_t>(std::lround(16 + v * 219.0 / 255));
+                }
+                f.memory().write_bytes(base + y * row, line);
+            }
+            f.call(cv, "_CVPixelBufferUnlockBaseAddress", {image, 0});
+            grey.push_back(std::move(luma));
+            f.engine.write64(pts, static_cast<Address>(i)); f.engine.write32(pts + 8, 30); f.engine.write32(pts + 12, 1); f.engine.write64(pts + 16, 0);
+            f.engine.write64(duration, 1); f.engine.write32(duration + 8, 30); f.engine.write32(duration + 12, 1); f.engine.write64(duration + 16, 0);
+            require(f.status(vt, "_VTCompressionSessionEncodeFrame", {session, image, pts, duration, 0, static_cast<Address>(i), info}) == 0, std::string(name) + " encodes");
+        }
+        require(f.status(vt, "_VTCompressionSessionCompleteFrames", {session, pts}) == 0, std::string(name) + ": CompleteFrames");
+        require(vt_encoded().size() == 30, std::string(name) + ": 30 samples, " + std::to_string(vt_encoded().size()));
+        // The parameter sets from the format description, the samples' bytes and times to the host's decoder.
+        const auto format = f.call(cm, "_CMSampleBufferGetFormatDescription", {vt_encoded()[0].sample});
+        const auto count = f.block(8), header = f.block(4), pointer = f.block(8), size = f.block(8);
+        const char* getter = codec == 0x61766331u ? "_CMVideoFormatDescriptionGetH264ParameterSetAtIndex" : "_CMVideoFormatDescriptionGetHEVCParameterSetAtIndex";
+        require(f.status(cm, getter, {format, 0, pointer, size, count, header}) == 0 && f.engine.read32(header) == 4, std::string(name) + ": the parameter sets");
+        std::vector<std::vector<std::uint8_t>> sets;
+        for (Address k = 0; k < f.engine.read64(count); ++k) {
+            require(f.status(cm, getter, {format, k, pointer, size, 0, 0}) == 0, "a parameter set");
+            std::vector<std::uint8_t> set(f.engine.read64(size));
+            f.memory().read_bytes(f.engine.read64(pointer), set);
+            sets.push_back(std::move(set));
+        }
+        const auto decoder = mc::open_video_decoder({mc_codec, sets, 160, 120, {}});
+        require(static_cast<bool>(decoder), std::string(name) + ": the host's decoder opens on the session's parameter sets");
+        std::vector<mc::DecodedPicture> pictures;
+        for (const auto& e : vt_encoded()) {
+            require(e.status == 0 && e.sample, std::string(name) + ": a sample");
+            const auto block = f.call(cm, "_CMSampleBufferGetDataBuffer", {e.sample});
+            const auto length = f.call(cm, "_CMBlockBufferGetDataLength", {block});
+            const auto bytes = f.block(length);
+            require(f.status(cm, "_CMBlockBufferCopyDataBytes", {block, 0, length, bytes}) == 0, "its bytes");
+            mc::Sample sample;
+            sample.data.resize(length);
+            f.memory().read_bytes(bytes, sample.data);
+            alchemy::CallRegs t{};
+            t.x[0] = e.sample;
+            const auto time = f.block(24);
+            t.indirect_result = time;
+            f.regs(cm, "_CMSampleBufferGetPresentationTimeStamp", t);
+            sample.pts = static_cast<std::int64_t>(f.engine.read64(time)) * 10000000 / 30;
+            sample.duration = 10000000 / 30;
+            const auto attachments = f.call(cm, "_CMSampleBufferGetSampleAttachmentsArray", {e.sample, 0});
+            sample.keyframe = !f.cf.dictionary_value(f.cf.element(attachments, 0), f.cf.string("NotSync"));
+            require(static_cast<bool>(mc::decode(*decoder, sample, pictures)), std::string(name) + " decodes");
+            f.call(cfl, "_CFRelease", {e.sample});
+        }
+        require(static_cast<bool>(mc::drain(*decoder, pictures)) && pictures.size() == 30, std::string(name) + ": 30 pictures, " + std::to_string(pictures.size()));
+        double worst = 1e9;
+        for (std::size_t i = 0; i < pictures.size(); ++i) {
+            const auto& p = pictures[i];
+            require(p.width == 160 && p.height == 120 && p.pts == static_cast<std::int64_t>(i) * 10000000 / 30, std::string(name) + ": picture in order");
+            double error = 0;
+            for (std::uint32_t y = 0; y < 120; ++y)
+                for (std::uint32_t x = 0; x < 160; ++x) {
+                    const double d = double(p.luma[y * p.luma_stride + x]) - grey[i][y * 160 + x];
+                    error += d * d;
+                }
+            worst = std::min(worst, 10 * std::log10(255.0 * 255.0 / std::max(error / (160.0 * 120.0), 1e-9)));
+        }
+        require(worst > 30, std::string(name) + ": every picture close to its frame, worst PSNR " + std::to_string(worst));
+        std::cout << "[qlab media] " << name << " through VTCompressionSession and back: worst PSNR " << worst << " dB" << std::endl;
+        mc::close(*decoder);
+        f.call(vt, "_VTCompressionSessionInvalidate", {session});
+        f.call(cfl, "_CFRelease", {session});
+    }
+}
+
 // AVFoundation over container files: libvpx's VP9 WebM vector as an AVURLAsset (its video track),
 // read as stored samples and as decoded 420v pictures (against the vector's per-frame MD5s), and
 // an image from AVAssetImageGenerator; an MP3 file's audio track read as its stored packets.
@@ -4150,7 +4524,8 @@ void compositions(Fixture& f) {
 int main() {
     alchemy::gui::completion_kit::media::set_midi_backend_factory([] { return std::make_unique<FakeMidi>(); });
     alchemy::gui::completion_kit::media::set_hal_backend_factory([] { return std::make_unique<FakeHal>(); });
-    fake_aac::install();   // AAC results do not depend on the host's encoders
+    fake_aac::install();   // AAC and video results do not depend on the host's encoders
+    fake_video::install();
     _putenv_s("ALCHEMY_CAMERA", "none");   // the host's cameras stay out (media_capture_tests.cpp fakes them)
     return fill_test::run("qlab media", {
         {"core_media", core_media},
@@ -4173,6 +4548,8 @@ int main() {
         {"aac_decoding", aac_decoding},
         {"audio_file_stream", audio_file_stream},
         {"video_toolbox", video_toolbox},
+        {"vt_compression", vt_compression},
+        {"vt_compression_host", vt_compression_host},
         {"av_video", av_video},
         {"av_player", av_player},
         {"queue_player", queue_player},

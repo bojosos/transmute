@@ -7,6 +7,7 @@ void install_media(InstallContext& context) {
     install_core_media_clocks(context);
     install_pixel_transfer(context);
     install_vt_decompression(context);
+    install_vt_compression(context);
     install_video_toolbox(context);
     install_av_foundation(context);
     install_core_video_pixel_buffers(context);

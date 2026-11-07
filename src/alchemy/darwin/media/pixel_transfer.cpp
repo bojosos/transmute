@@ -42,6 +42,11 @@ constexpr std::array<const char*, 9> property_keys{"ScalingMode", "DestinationCl
                                                    "DestinationYCbCrMatrix", "RealTime"};
 // Pixel rotation sessions: the kVTPixelRotationPropertyKey_* strings.
 constexpr std::array<const char*, 3> rotation_keys{"Rotation", "FlipHorizontalOrientation", "FlipVerticalOrientation"};
+// Compression sessions (vt_compression.cpp): the kVTCompressionPropertyKey_* strings it honours (the
+// others answer kVTPropertyNotSupportedErr).
+constexpr std::array<const char*, 10> compression_keys{"AverageBitRate", "DataRateLimits", "ExpectedFrameRate", "MaxKeyFrameInterval",
+                                                       "MaxKeyFrameIntervalDuration", "AllowFrameReordering", "AllowTemporalCompression",
+                                                       "ProfileLevel", "RealTime", "UsingHardwareAcceleratedVideoEncoder"};
 // Decompression sessions (vt_decompression.cpp): the kVTDecompressionPropertyKey_* strings.
 constexpr std::array<const char*, 10> decompression_keys{"RealTime", "ThreadCount", "MaximizePowerEfficiency", "OutputPoolRequestedMinimumBufferCount",
                                                          "PixelTransferProperties", "ReducedResolutionDecode", "FieldMode", "DeinterlaceMode",
@@ -403,6 +408,8 @@ void PixelTransfer::install() {
         if (!s.x[1]) { s.x[0] = status(vt_parameter); return; }
         const auto name = cf.utf8(s.x[1]);
         if (!known(*value, name) || name == "UsingHardwareAcceleratedVideoDecoder") { s.x[0] = status(vt_property_not_supported); return; }
+        if (value->check_set)
+            if (const auto refused = value->check_set(name, s.x[2])) { s.x[0] = status(refused); return; }
         const auto retained = retain(s.x[2]);
         Address old{};
         {
@@ -419,6 +426,11 @@ void PixelTransfer::install() {
         if (!s.x[1] || !s.x[3]) { s.x[0] = status(vt_parameter); return; }
         const auto name = cf.utf8(s.x[1]);
         if (!known(*value, name)) { s.x[0] = status(vt_property_not_supported); return; }
+        if (const auto made = value->computed ? value->computed(name) : 0) {
+            m.write64(s.x[3], made);
+            s.x[0] = 0;
+            return;
+        }
         Address found{};
         {
             std::lock_guard lock(value->mutex);
@@ -462,6 +474,7 @@ void PixelTransfer::install() {
 std::span<const char* const> vt_session_keys(VTSessionState::Kind kind) {
     if (kind == VTSessionState::Kind::decompression) return decompression_keys;
     if (kind == VTSessionState::Kind::pixel_rotation) return rotation_keys;
+    if (kind == VTSessionState::Kind::compression) return compression_keys;
     return property_keys;
 }
 

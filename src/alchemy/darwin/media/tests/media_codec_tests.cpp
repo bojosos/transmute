@@ -16,7 +16,9 @@
 #include "alchemy/darwin/media/media_codecs.hpp"
 #include "alchemy/darwin/media/media_container.hpp"
 #include "alchemy/darwin/media/packet_file.hpp"
+#include "alchemy/darwin/media/video_config.hpp"
 #include "alchemy/darwin/media/video_frames.hpp"
+#include "fake_video.hpp"
 
 #include "alchemy/host/crypto.hpp"
 
@@ -541,6 +543,44 @@ void alac_tests() {
             !codecs::make_audio_encoder(mc::fourcc("mp4a"), 44100, 2, 16, 0, why), "encoder limits");
 }
 
+// The avcC and hvcC records (ISO/IEC 14496-15) of parameter sets as fake_video.hpp makes them, field by field, and read
+// back into the same sets.
+void configuration_record_tests() {
+    namespace vc = alchemy::gui::completion_kit::media::video_config;
+    // H.264 High 4.0 (its record adds chroma format and bit depths), 4-byte lengths.
+    const auto sps = fake_video::h264_sps(1920, 1080, 100, 40);
+    const std::vector<std::uint8_t> pps{0x68, 0xce, 0x38, 0x80};
+    const auto avc = vc::avc_configuration({sps, pps}, 4);
+    std::vector<std::uint8_t> expected{1, 100, 0, 40, 0xff, 0xe1, 0, static_cast<std::uint8_t>(sps.size())};
+    expected.insert(expected.end(), sps.begin(), sps.end());
+    expected.insert(expected.end(), {1, 0, 4});
+    expected.insert(expected.end(), pps.begin(), pps.end());
+    expected.insert(expected.end(), {0xfd, 0xf8, 0xf8, 0});   // 4:2:0, 8-bit luma and chroma, no SPS extensions
+    require(avc == expected, "avcC of H.264 High 4.0");
+    const auto avc_read = vc::read_avc_configuration(avc);
+    require(avc_read && avc_read->nal_length_size == 4 && avc_read->sets == vc::NalUnits{sps, pps}, "avcC read back");
+    // Main: no high-profile fields; 2-byte lengths.
+    const auto main_sps = fake_video::h264_sps(64, 48, 77, 31);
+    const auto main = vc::avc_configuration({main_sps, pps}, 2);
+    require(main.size() == 6 + 2 + main_sps.size() + 1 + 2 + pps.size() && main[4] == 0xfd, "avcC of Main 3.1, 2-byte lengths");
+    require(vc::avc_configuration({pps}, 4).empty() && vc::avc_configuration({main_sps, pps}, 3).empty(), "no SPS, or 3-byte lengths: no record");
+    require(!vc::read_avc_configuration(std::vector<std::uint8_t>{1, 77, 0, 31, 0xff, 0xe1, 0, 9, 0x67}), "a truncated avcC");
+
+    // HEVC Main 4.1 at 1280x720 with a VPS, an SPS and a PPS.
+    const std::vector<std::uint8_t> vps{0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60}, hevc_pps{0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40};
+    const auto hevc_sps = fake_video::hevc_sps(1280, 720, 123);
+    const auto hevc = vc::hevc_configuration({vps, hevc_sps, hevc_pps}, 4);
+    require(hevc.size() == 23 + 3 * 5 + vps.size() + hevc_sps.size() + hevc_pps.size(), "hvcC size");
+    require(hevc[0] == 1 && hevc[1] == 0x01 && hevc[2] == 0x60 && hevc[6] == 0x90 && hevc[12] == 123, "hvcC: Main, its compatibility and constraint flags, level 4.1");
+    require(hevc[13] == 0xf0 && hevc[14] == 0 && hevc[15] == 0xfc && hevc[16] == 0xfd && hevc[17] == 0xf8 && hevc[18] == 0xf8,
+            "hvcC: no segmentation or parallelism, 4:2:0, 8 bits");
+    require(hevc[21] == ((1 << 3) | (1 << 2) | 3) && hevc[22] == 3, "hvcC: one temporal layer, nested, 4-byte lengths; three arrays");
+    require(hevc[23] == (0x80 | 32) && hevc[24] == 0 && hevc[25] == 1, "hvcC: the VPS array first, complete");
+    const auto hevc_read = vc::read_hevc_configuration(hevc);
+    require(hevc_read && hevc_read->nal_length_size == 4 && hevc_read->sets == vc::NalUnits{vps, hevc_sps, hevc_pps}, "hvcC read back");
+    require(vc::hevc_configuration({vps, hevc_pps}, 4).empty(), "no SPS: no record");
+}
+
 void unsupported_tests() {
     std::string why;
     for (const char* code : {"avc1"}) {   // ('mp4a' decodes where the host has an AAC decoder)
@@ -724,6 +764,7 @@ int main() {
         alac_tests();
         vpx_tests();
         av1_tests();
+        configuration_record_tests();
         unsupported_tests();
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
