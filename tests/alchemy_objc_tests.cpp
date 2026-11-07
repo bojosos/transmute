@@ -138,6 +138,13 @@ void test_dynamic_registration() {
     require(f.call("_method_getImplementation", {method}) == second &&
         f.call("_method_setImplementation", {method, first}) == second && f.call("_objc_msgSend", {object, sel}) == 27,
         "method inspection/replacement failed");
+    // objc4's method_* functions answer nil for a NULL Method (a class_getInstanceMethod miss).
+    require(f.call("_method_getImplementation", {0}) == 0 && f.call("_method_getName", {0}) == 0 &&
+        f.call("_method_getTypeEncoding", {0}) == 0 && f.call("_method_getNumberOfArguments", {0}) == 0 &&
+        f.call("_method_copyReturnType", {0}) == 0 && f.call("_method_getDescription", {0}) == 0 &&
+        f.call("_method_setImplementation", {0, first}) == 0, "a NULL Method was not nil");
+    static_cast<void>(f.call("_method_exchangeImplementations", {method, 0}));
+    require(f.call("_objc_msgSend", {object, sel}) == 27, "exchanging with a NULL Method changed the method");
     const auto inherited = f.runtime.selector("hash");
     const auto inherited_method = f.call("_class_getInstanceMethod", {cls, inherited});
     require(f.call("_class_replaceMethod", {cls, inherited, second, encoding}) == 0 &&

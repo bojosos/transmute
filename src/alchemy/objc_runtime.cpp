@@ -1438,6 +1438,7 @@ struct ObjcRuntime::Impl {
         function("_class_setSuperclass", [set_superclass](auto& s, auto& m) { s.x[0] = set_superclass(s.x[0], s.x[1], m); });
         function("_objc_setSuperclass", [set_superclass](auto& s, auto& m) { static_cast<void>(set_superclass(s.x[0], s.x[1], m)); });
         function("_method_exchangeImplementations", [this](auto& s, auto& m) {
+            if (!s.x[0] || !s.x[1]) return;   // objc4: nothing happens
             std::lock_guard lock(mutex);
             const auto first = method_owners.find(s.x[0]), second = method_owners.find(s.x[1]);
             if (first == method_owners.end() || second == method_owners.end()) throw std::runtime_error("invalid Objective-C Method exchange");
@@ -2022,8 +2023,10 @@ struct ObjcRuntime::Impl {
             if (s.x[0] && s.x[2]) for (; made < count; ++made) m.write64(s.x[2] + 8ULL * made, allocate(s.x[0], s.x[1]));
             s.x[0] = made; });
         // Method signatures: the type encoding's return type and arguments (self and _cmd included).
+        // A NULL Method has no types (objc4: no arguments, a NULL copy, an empty string).
         const auto method_types = [this](transmute::GuestMemory& m, Address method_address) {
             Address types{};
+            if (!method_address) return std::vector<std::string>{};
             { std::lock_guard lock(mutex); if (!method_owners.contains(method_address)) throw std::runtime_error("invalid Objective-C Method"); }
             types = m.read64(method_address + 8);
             return types ? split_types(text(m, types)) : std::vector<std::string>{};
@@ -2032,6 +2035,7 @@ struct ObjcRuntime::Impl {
             const auto parts = method_types(m, s.x[0]); s.x[0] = parts.empty() ? 0 : parts.size() - 1; });
         // char* method_copyReturnType(Method) / method_copyArgumentType(Method, index): malloc'd, or NULL.
         function("_method_copyReturnType", [this, method_types](auto& s, auto& m) {
+            if (!s.x[0]) return;
             const auto parts = method_types(m, s.x[0]); s.x[0] = malloc_text(m, parts.empty() ? std::string("?") : parts[0]); });
         function("_method_copyArgumentType", [this, method_types](auto& s, auto& m) {
             const auto parts = method_types(m, s.x[0]); const auto index = static_cast<std::uint32_t>(s.x[1]);
@@ -2051,6 +2055,7 @@ struct ObjcRuntime::Impl {
             copy_type(m, s.x[2], s.x[3], index + 1 < parts.size() ? parts[index + 1] : std::string()); });
         // struct objc_method_description* method_getDescription(Method): the Method's {SEL, types} words.
         function("_method_getDescription", [this](auto& s, auto&) {
+            if (!s.x[0]) return;
             std::lock_guard lock(mutex); if (!method_owners.contains(s.x[0])) throw std::runtime_error("invalid Objective-C Method"); });
         // Instance variables by Ivar: object_getIvar reads the word; object_setIvar stores it
         // unretained (no ivar layout is kept), object_setIvarWithStrongDefault as a strong ivar.
@@ -2215,7 +2220,8 @@ struct ObjcRuntime::Impl {
         // The pre-2.0 names of the two above.
         function("_class_respondsToMethod", [this](auto& s, auto&) { s.x[0] = class_responds(s.x[0], s.x[1]); });
         function("_class_lookupMethod", [this](auto& s, auto&) { s.x[0] = implementation_or_forward(s.x[0], s.x[1]); });
-        function("_method_getImplementation", [this](auto& s, auto& m) { std::lock_guard lock(mutex);
+        // objc4's method_* getters answer nil for a NULL Method (a class_getInstanceMethod miss).
+        function("_method_getImplementation", [this](auto& s, auto& m) { if (!s.x[0]) return; std::lock_guard lock(mutex);
             if (!method_owners.contains(s.x[0])) throw std::runtime_error("invalid Objective-C Method");
             s.x[0] = m.read64(s.x[0] + 16); });
         // id method_invoke(id receiver, Method m, ...): the method's IMP with its selector in x1 and the
@@ -2225,10 +2231,10 @@ struct ObjcRuntime::Impl {
             const auto imp = m.read64(s.x[1] + 16);
             s.x[1] = m.read64(s.x[1]);
             redirect_to(s, imp); });
-        function("_method_getName", [this](auto& s, auto& m) { std::lock_guard lock(mutex);
+        function("_method_getName", [this](auto& s, auto& m) { if (!s.x[0]) return; std::lock_guard lock(mutex);
             if (!method_owners.contains(s.x[0])) throw std::runtime_error("invalid Objective-C Method");
             s.x[0] = m.read64(s.x[0]); });
-        function("_method_getTypeEncoding", [this](auto& s, auto& m) { std::lock_guard lock(mutex);
+        function("_method_getTypeEncoding", [this](auto& s, auto& m) { if (!s.x[0]) return; std::lock_guard lock(mutex);
             if (!method_owners.contains(s.x[0])) throw std::runtime_error("invalid Objective-C Method");
             s.x[0] = m.read64(s.x[0] + 8); });
         function("_class_addMethod", [this](auto& s, auto& m) { auto value = make_method(text(m, s.x[1]), s.x[2], text(m, s.x[3]));
@@ -2248,7 +2254,7 @@ struct ObjcRuntime::Impl {
             target->methods[sel] = value; method_owners[value.descriptor] = target->address; s.x[0] = 0;
             flush_caches();
         });
-        function("_method_setImplementation", [this](auto& s, auto& m) { std::lock_guard lock(mutex); const auto owner = method_owners.find(s.x[0]);
+        function("_method_setImplementation", [this](auto& s, auto& m) { if (!s.x[0]) return; std::lock_guard lock(mutex); const auto owner = method_owners.find(s.x[0]);
             if (owner == method_owners.end() || !s.x[1]) throw std::runtime_error("invalid Objective-C Method replacement");
             const auto previous = m.read64(s.x[0] + 16); m.write64(s.x[0] + 16, s.x[1]);
             auto& value = cls(owner->second)->methods.at(m.read64(s.x[0]));
