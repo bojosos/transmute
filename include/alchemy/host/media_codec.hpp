@@ -61,6 +61,9 @@ struct VideoSettings {
     std::uint32_t bit_rate{};              // average bits per second (0: the encoder's choice)
     std::uint32_t keyframe_interval{};     // at most this many frames between keyframes (0: the encoder's choice)
     Profile profile{Profile::automatic};
+    // The level as the stream's level_idc (H.264: 10 times the level, 31 for 3.1; HEVC: general_level_idc, 30 times
+    // the level, 123 for 4.1); 0: the encoder's choice.
+    std::uint32_t level{};
     bool real_time{};                      // favour latency over compression
     bool frame_reordering{};               // allow B-frames (output in decode order, dts before pts)
     bool require_hardware{};
