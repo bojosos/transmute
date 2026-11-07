@@ -28,6 +28,8 @@
 //   arguments back. +currentConnection is the connection whose message is being handled.
 // * Listeners hand each new peer to -listener:shouldAcceptNewConnection:; +serviceListener's
 //   -resume serves forever, as xpc_main does.
+// * Without XPC connections (alchemy.exe, unit fixtures) a connection keeps its configuration
+//   and -resume fails explicitly.
 // Not here: unarchiving does not enforce the interface's allowed classes (setClasses: is
 // kept, not applied); proxies and listener endpoints as arguments, NSXPCCoder-specific
 // coding and NSProgress across XPC are refused with an error.
@@ -197,6 +199,10 @@ public:
 
     Address xpc(const char* name, std::initializer_list<Address> arguments) { return support.call(libsystem, name, arguments); }
     Address symbol(const char* name) { const auto found = support.process.resolve(libsystem, name); return found ? found->address : 0; }
+    // XPC connections are installed (alchemy-fx): without them a connection keeps its
+    // configuration and connecting fails explicitly.
+    bool transport() { return symbol("_xpc_connection_create") != 0; }
+    [[noreturn]] void no_transport(std::string_view what) { unsupported(std::string(what) + ": no XPC connection (XPC connections are not installed in this process)"); }
     std::shared_ptr<ConnectionState> connection_of(Address object) { return support.objc.host_state<ConnectionState>(object); }
     std::shared_ptr<InterfaceState> interface_of(Address object) { return object ? support.objc.find_host_state<InterfaceState>(object) : nullptr; }
 
@@ -546,6 +552,7 @@ public:
 
     void resume(Address connection) {
         const auto state = connection_of(connection);
+        if (!transport()) no_transport("-[NSXPCConnection resume]");
         Address xpc_connection;
         {
             std::lock_guard lock(state->mutex);
@@ -644,7 +651,7 @@ void install_xpc(Support& support) {
         const auto state = connection_of(s.x[0]);
         state->name = s.x[2] ? support.send_id(s.x[2], "copy") : 0;
         const auto name = s.x[2] ? self->c_text(text(support, s.x[2])) : 0;
-        state->xpc = name ? self->xpc("_xpc_connection_create", {name, 0}) : 0;   // a bundled XPC service
+        state->xpc = name && self->transport() ? self->xpc("_xpc_connection_create", {name, 0}) : 0;   // a bundled XPC service
         if (name) support.process.release_guest(name);
         static_cast<void>(m);
     }, "@@:@");
@@ -655,7 +662,7 @@ void install_xpc(Support& support) {
         state->options = s.x[3];
         const auto name = s.x[2] ? self->c_text(text(support, s.x[2])) : 0;
         // NSXPCConnectionPrivileged (1 << 12): the system domain, which XPC refuses.
-        state->xpc = name ? self->xpc("_xpc_connection_create_mach_service", {name, 0, (s.x[3] & (1u << 12)) ? 2u : 0u}) : 0;
+        state->xpc = name && self->transport() ? self->xpc("_xpc_connection_create_mach_service", {name, 0, (s.x[3] & (1u << 12)) ? 2u : 0u}) : 0;
         if (name) support.process.release_guest(name);
     }, "@@:@Q");
     support.method(connection, "initWithListenerEndpoint:", [&support, self, connection_of](CpuState& s, GuestMemory&) {
@@ -777,7 +784,7 @@ void install_xpc(Support& support) {
         const auto object = support.send_id(support.send_id(listener, "alloc"), "init");
         const auto state = listener_of(object);
         state->anonymous = true;
-        state->xpc = self->xpc("_xpc_connection_create", {0, 0});
+        if (self->transport()) state->xpc = self->xpc("_xpc_connection_create", {0, 0});
         s.x[0] = autoreleased(support, object);
     }, "@@:", true);
     support.method(listener, "initWithMachServiceName:", [&support, listener_of](CpuState& s, GuestMemory&) {
@@ -788,6 +795,7 @@ void install_xpc(Support& support) {
     support.method(listener, "resume", [&support, self, listener_of](CpuState& s, GuestMemory&) {
         const auto object = s.x[0];
         const auto state = listener_of(object);
+        if (!self->transport()) self->no_transport("-[NSXPCListener resume]");
         if (!state->xpc) {
             std::string name;
             if (state->service) {
