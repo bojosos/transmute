@@ -118,6 +118,7 @@ enum class TypeId : std::uint64_t {
     cm_clock, cm_timebase, cm_simple_queue, cm_buffer_queue, cm_memory_pool,   // darwin/media/coremedia_clock.cpp
     vt_pixel_rotation_session,       // darwin/media/pixel_transfer.cpp
     allocator,                       // darwin/corefoundation/cf_allocators.cpp
+    vt_compression_session,          // darwin/media/vt_compression.cpp
 };
 
 inline std::int64_t sign32(std::uint64_t value) { return static_cast<std::int32_t>(static_cast<std::uint32_t>(value)); }
