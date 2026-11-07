@@ -407,6 +407,10 @@ private:
             ivar.size = memory_.read32(add(entry, 28));
             if (exponent != UINT32_MAX && exponent > 20) malformed("invalid ivar alignment exponent");
             ivar.alignment = exponent == UINT32_MAX ? 8 : (1U << exponent);
+            // The Swift runtime's instantiated generic classes (Combine's ReduceProducer)
+            // can list fields with size 0 and offset 0 that their metadata lays out; objc4
+            // does not check them, and nothing reads them through the ivar list.
+            if (!ivar.size && swift) continue;
             if (ivar.offset < result.instance_start || ivar.offset > result.instance_size ||
                 ivar.size > result.instance_size - ivar.offset || !ivar.size)
                 malformed("ivar outside class instance extent");

@@ -101,6 +101,13 @@ void ivars_categories_and_nonlazy_lists() {
         decoded[0].nonlazy_categories.size() == 1, "category/nonlazy metadata mismatch");
     f.engine.write32(base + 1400, 15);
     rejects([&] { static_cast<void>(f.parse()); }, "ivar outside");
+    // Size 0 at offset 0: rejected for an Objective-C class; skipped for a Swift class (an
+    // instantiated generic class's field, which its metadata lays out).
+    f.engine.write32(base + 1400, 0); f.engine.write32(base + 1236, 0);
+    rejects([&] { static_cast<void>(f.parse()); }, "ivar outside");
+    f.engine.write64(base + 96, (base + 160) | 2);   // FAST_IS_SWIFT_STABLE
+    decoded = f.parse();
+    require(decoded[0].classes[0].swift && decoded[0].classes[0].ivars.empty(), "a Swift ivar of size 0 was not skipped");
 }
 void malformed_metadata_is_transactional() {
     Fixture f;
