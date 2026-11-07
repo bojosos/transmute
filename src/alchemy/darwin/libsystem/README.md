@@ -14,7 +14,7 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
 * **GUI** (alchemy-fx): in-process and cross-process Mach IPC (`mach/`), and
   the pieces first written for a renderer plug-in (`*/libsystem_*.cpp`), Qt WebEngine
   (`mach/machsys.cpp`), Chrome (`misc/leftovers.cpp`) and QLab
-  (`misc/{oslog,system_c,xpc,log_store,oslog_store}.cpp`,
+  (`misc/{oslog,system_c,log_store,oslog_store}.cpp`,
   `process/{process_io,foundation_threads}.cpp`).
 * **Headless-only shells** (one declaration, one definition per build):
   `mach/task_headless.cpp` (alchemy.exe: mach_port_deallocate, task_info,
@@ -57,10 +57,9 @@ libproc, SysV IPC), for `/usr/lib/libSystem.B.dylib` and its re-exports.
 * **XPC** (GUI, `misc/xpc_objects.cpp`): the C object API (dictionaries,
   arrays, strings, numbers, booleans, dates, data, UUIDs, descriptors, null,
   errors, endpoints, shared memory) as `OS_xpc_*` objects, with copies,
-  equality and descriptions. No launchd runs, so connections act as ones whose
-  service does not exist: resumed, they deliver `XPC_ERROR_CONNECTION_INVALID`;
-  replies are that error; `xpc_main` stops. Activities never run.
-  NSXPCConnection is `misc/xpc.cpp`'s.
+  equality and descriptions. Activities never run. Connections, `xpc_main`
+  and NSXPCConnection are `darwin/launchd/`'s (`xpc_connections.cpp`,
+  `nsxpc.cpp`; the shared internals are `misc/xpc_internal.hpp`).
 * **os extras** (GUI): activities with identifiers that nest per thread
   (`OS_ACTIVITY_CURRENT`, initiate, apply, get_active) and workgroups
   (join/leave tokens, cancel, intervals, the working arena, ports through

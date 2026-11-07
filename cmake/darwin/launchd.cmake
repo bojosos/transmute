@@ -18,6 +18,9 @@ list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/launchd/mach_services.cpp)
 # GUI (alchemy-fx only): XPC connections, endpoints, replies and xpc_main (installed by
 # libsystem/misc/xpc_objects.cpp's install_libsystem_xpc after the XPC objects).
 list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/launchd/xpc_connections.cpp)
+# GUI (alchemy-fx only): NSXPCConnection, NSXPCListener, NSXPCInterface (moved from
+# libsystem/misc/xpc.cpp; installed by kit/completion/runtime/install.cpp's install_xpc).
+list(APPEND ALCHEMY_GUI_SOURCES src/alchemy/darwin/launchd/nsxpc.cpp)
 alchemy_gui_add_framework_case(launchd_service_management src/alchemy/darwin/launchd/tests/service_management_tests.cpp)
 
 if(BUILD_TESTING)

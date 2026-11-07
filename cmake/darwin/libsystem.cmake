@@ -60,9 +60,9 @@ list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES
 #   */libsystem_*.cpp: libSystem names a renderer plug-in's images import, fill-only
 #     (libsystem::install_libsystem_gaps and install_libsystem_services rows;
 #     shared kit src/alchemy/darwin/kit/export_fill/).
-#   misc/{system_c,xpc,log_store,oslog_store}.cpp, process/{process_io,
-#     foundation_threads}.cpp: OSAtomic/OSSpinLock and other C leftovers, NSXPC*,
-#     the os_log message store and OSLogStore, NSFileHandle/NSPipe/NSTask,
+#   misc/{system_c,log_store,oslog_store}.cpp, process/{process_io,
+#     foundation_threads}.cpp: OSAtomic/OSSpinLock and other C leftovers (NSXPC* is
+#     darwin/launchd/nsxpc.cpp), the os_log message store and OSLogStore, NSFileHandle/NSPipe/NSTask,
 #     NSThread additions and Foundation locks (QLab runtime group;
 #     installed by kit/completion/runtime/install.cpp, shared kit).
 #   misc/oslog.cpp: os_log objects as Objective-C objects (installed by
@@ -106,7 +106,6 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/libsystem/misc/system_c.cpp
     src/alchemy/darwin/libsystem/misc/log_store.cpp
     src/alchemy/darwin/libsystem/misc/oslog_store.cpp
-    src/alchemy/darwin/libsystem/misc/xpc.cpp
     src/alchemy/darwin/libsystem/misc/oslog.cpp
     src/alchemy/darwin/libsystem/misc/fts_err.cpp
     src/alchemy/darwin/libsystem/misc/sandbox.cpp)
