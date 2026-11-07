@@ -421,9 +421,12 @@ void GraphicsGaps::install_core_graphics() {
     constant_real(core_graphics, "_CGDisplayRotation", 0.0);
     constant(core_graphics, "_CGDisplayUsesForceToGray", 0);
     constant(core_graphics, "_CGFontRenderingGetFontSmoothingDisabled", 0);
-    // Screen capture is not available.
-    constant(core_graphics, "_CGPreflightScreenCaptureAccess", 0);
-    constant(core_graphics, "_CGRequestScreenCaptureAccess", 0);
+    // Screen capture is granted for the process's own content only: the
+    // window lists, their images and ScreenCaptureKit show nothing else
+    // (darwin/screencapturekit/install.cpp, which registers the window lists).
+    // CGDisplayStream is not available.
+    constant(core_graphics, "_CGPreflightScreenCaptureAccess", 1);
+    constant(core_graphics, "_CGRequestScreenCaptureAccess", 1);
     constant(core_graphics, "_CGDisplayStreamCreate", 0);
     raw(core_graphics, "_CGDisplayStreamGetRunLoopSource", [](CpuState& s, GuestMemory&) { impossible(s.x[0], "CGDisplayStreamGetRunLoopSource"); s.x[0] = 0; });
     for (const auto* name : {"_CGDisplayStreamStart", "_CGDisplayStreamStop"})
@@ -432,11 +435,6 @@ void GraphicsGaps::install_core_graphics() {
         if (s.x[2]) m.write64(s.x[2], 0);
         s.x[0] = 0;
     });
-    // Window lists (and their images) are screen-capture information: NULL, as
-    // CGPreflightScreenCaptureAccess answers above.
-    for (const auto* name : {"_CGWindowListCopyWindowInfo", "_CGWindowListCreateDescriptionFromArray", "_CGWindowListCreateImage",
-                             "_CGWindowListCreateImageFromArray", "_CGWindowListCreate"})
-        constant(core_graphics, name, 0);
     // CGWindowLevel CGWindowLevelForKey(CGWindowLevelKey): CGWindowLevel.h's
     // levels, which AppKit's NS*WindowLevel values equal (normal 0, floating 3,
     // modal panel 8, main menu 24, status 25, pop-up menu 101, screen saver

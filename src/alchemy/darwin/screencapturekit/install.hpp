@@ -6,7 +6,7 @@
 // alchemy-fx only).
 namespace alchemy::screencapturekit {
 
-// install.cpp (fill-only, through gui::values::Provider).
+// install.cpp (through the support kit, which runs before this row).
 void install_screencapturekit(gui::InstallContext& context);
 
 } // namespace alchemy::screencapturekit

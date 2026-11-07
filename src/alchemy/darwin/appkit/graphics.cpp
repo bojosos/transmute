@@ -3,6 +3,7 @@
 #include "alchemy/darwin/appkit/controls_internal.hpp"
 #include "alchemy/gui/layer_contents.hpp"   // layer-backed views with -updateLayer (qt-vfb)
 #include "alchemy/darwin/appkit/asset_catalog.hpp"
+#include "alchemy/darwin/windowserver/presented_pixels.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -265,7 +266,11 @@ void AppKit::present_window(Address target, Rect window_rect) {
             parts.swap(next);
         }
     const WindowServer::BitmapView view{backing->width, backing->height, backing->stride, backing->mirror.data()};
-    for (const auto& part : parts) if (!rect_is_empty(part)) server->present_bitmap(state->id, view, part);
+    for (const auto& part : parts)
+        if (!rect_is_empty(part)) {
+            server->present_bitmap(state->id, view, part);
+            presented::record(*server, state->id, view, part);   // own-content capture (screencapturekit/)
+        }
     capture_presented(target);
 }
 

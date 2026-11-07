@@ -5,7 +5,8 @@
 # picked up by cmake/AlchemyHost.cmake).
 list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/windowserver/install.cpp
-    src/alchemy/darwin/windowserver/screen_layout.cpp)
+    src/alchemy/darwin/windowserver/screen_layout.cpp
+    src/alchemy/darwin/windowserver/presented_pixels.cpp)
 # System libraries of every supported Windows version (user32/gdi32 for
 # windows and input, imm32 for IME, ole32/shell32 for file drops, shcore for
 # per-monitor DPI). Nothing touches them before the guest asks for a window.

@@ -1,5 +1,5 @@
-// ScreenCaptureKit (src/alchemy/darwin/screencapturekit/): the identity, and the documented
-// "unavailable" answers.
+// ScreenCaptureKit (src/alchemy/darwin/screencapturekit/): the identity, the
+// constants and the picker singleton (own-content capture: own_content_tests.cpp).
 #include "alchemy/gui/tests/framework_case.hpp"
 
 namespace {
@@ -16,6 +16,9 @@ const Case screencapturekit_case("screencapturekit", [](Fixture& f) {
             "frame info keys");
     const auto picker = f.send(f.cls("SCContentSharingPicker"), "sharedPicker");
     require(picker && picker == f.send(f.cls("SCContentSharingPicker"), "sharedPicker"), "picker singleton");
+    // No window exists here: the own content lists none (own_content_tests.cpp shows windows).
+    require(f.call("/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics", "_CGPreflightScreenCaptureAccess") == 1,
+            "screen capture granted for own content");
 });
 
 #undef LIBRARY

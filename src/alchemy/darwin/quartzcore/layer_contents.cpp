@@ -3,6 +3,7 @@
 #include "alchemy/darwin/quartzcore/layer_tree.hpp"
 #include "alchemy/darwin/quartzcore/presenter.hpp"
 #include "alchemy/darwin/quartzcore/quartzcore.hpp"
+#include "alchemy/darwin/windowserver/presented_pixels.hpp"
 
 #include "alchemy/gui/layer_contents.hpp"
 #include "alchemy/gui/runloop.hpp"
@@ -420,6 +421,7 @@ void composite_window(Support& support, WindowServer& server, WindowId window, R
     const WindowServer::BitmapView view{width, height, static_cast<std::size_t>(width) * 4, composite.bgra.data()};
     const Rect presented{{clip.x0 / scale, content.height - clip.y1 / scale}, {(clip.x1 - clip.x0) / scale, (clip.y1 - clip.y0) / scale}};
     server.present_bitmap(window, view, presented);
+    gui::presented::record(server, window, view, presented);   // own-content capture (screencapturekit/)
     ++composite.frames;
     ++s.compositions;
     if (quartzcore::present_trace_enabled() && (composite.frames <= 3 || composite.frames % 300 == 0)) {

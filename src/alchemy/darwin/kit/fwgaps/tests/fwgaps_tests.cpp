@@ -91,8 +91,10 @@ void graphics(Fixture& f) {
     require(again.d(0) == location.d(0) && again.d(1) == location.d(1), "event data round trip");
     require(f.call(cg, "_CGEventGetIntegerValueField", {event, 1}) == 0, "unset field is 0");
     require(f.call(cg, "_CGEventCreateFromData", {0, f.call(cf, "_CFDataCreate", {0, f.text("junk"), 4})}) == 0, "invalid data");
-    require(f.call(cg, "_CGPreflightScreenCaptureAccess") == 0, "no screen capture");
-    require(f.call(cg, "_CGWindowListCopyWindowInfo", {0, 0}) == 0, "no window list");
+    // Granted for own content only; with no windows the list is empty (screencapturekit_tests.cpp lists windows).
+    require(f.call(cg, "_CGPreflightScreenCaptureAccess") == 1, "screen capture of own content");
+    const auto windows = f.call(cg, "_CGWindowListCopyWindowInfo", {0, 0});
+    require(windows && f.cf.length(windows) == 0, "no own window, an empty window list");
     require(f.call(cg, "_CGPDFDocumentCreateWithProvider", {0}) == 0, "no provider, no PDF document");   // reading: coregraphics/tests/pdf_tests.cpp
     require(f.status(cg, "_CGSSetWindowAlpha", {0, 1, 0}) == 1002, "CGS calls: invalid connection");
     require(f.string_constant(cg, "_kCGWindowNumber") == "kCGWindowNumber", "kCGWindowNumber");

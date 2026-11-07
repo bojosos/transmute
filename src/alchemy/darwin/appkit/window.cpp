@@ -1,5 +1,6 @@
 #include "alchemy/darwin/appkit/status_items.hpp"
 #include "alchemy/darwin/appkit/appkit_internal.hpp"
+#include "alchemy/darwin/windowserver/presented_pixels.hpp"
 #include "alchemy/path.hpp"
 
 #include <algorithm>
@@ -126,6 +127,7 @@ void AppKit::destroy_server_window(WindowState& state) {
         // A window's own sink callback is still running: destroy it after.
         if (dispatching == id) { pending_destroy.push_back(id); return; }
     }
+    presented::forget(id);
     if (const auto server = window_server_or_null()) server->destroy_window(id);
 }
 
@@ -658,6 +660,7 @@ void AppKit::handle_window_event(WindowId id, const Event& event) {
                 else ++it;
             }
         }
+        for (const auto value : destroy) presented::forget(value);
         if (const auto server = window_server_or_null()) for (const auto value : destroy) server->destroy_window(value);
     };
     const auto target = window_for_id(id);
