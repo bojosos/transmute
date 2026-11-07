@@ -64,6 +64,14 @@ void notifications(Fixture& f) {
             f.call(iokit, "_IOIteratorNext", {f.engine.read32(terminated)}) == 0, "nothing terminates");
     const auto interest = f.block(4);
     require(f.status(iokit, "_IOServiceAddInterestNotification", {port, first, f.text("IOGeneralInterest"), 0x1000, 0, interest}) == 0, "interest");
+    // A message from the port's Mach receive right is never an IOKit notification here
+    // (they arrive through the run-loop source), so it runs no callback; NULL is refused.
+    const auto message = f.block(64);
+    f.engine.write32(message + 4, 64);   // msgh_size
+    static_cast<void>(f.call(iokit, "_IODispatchCalloutFromMessage", {0, message, port}));
+    bool refused = false;
+    try { static_cast<void>(f.call(iokit, "_IODispatchCalloutFromMessage", {0, 0, port})); } catch (const std::exception&) { refused = true; }
+    require(refused, "IODispatchCalloutFromMessage of a NULL message");
     // Registry entry queries.
     const auto name = f.block(128);
     require(f.status(iokit, "_IORegistryEntryGetName", {first, name}) == 0 && f.read_text(name) == "IOPlatformExpertDevice", "entry name");

@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <stdexcept>
@@ -349,6 +350,12 @@ void temporary_files_and_directory_descriptors() {
         "temporary directory permissions are not 0700");
     // No X's left: Darwin's mkdtemp tries the name as it is, which now exists.
     require(f.call("_mkdtemp", {child}) == 0 && f.error() == 17, "bad mkdtemp error convention");
+    // The directory part is checked first (Libc's find_temp_path): ENOTDIR under a file or device, ENOENT when missing.
+    require(f.call("_mkdtemp", {f.string("/dev/null/fooXXXXXX")}) == 0 && f.error() == 20, "mkdtemp under /dev/null is ENOTDIR");
+    require(f.call("_mkstemp", {f.string("/dev/null/fooXXXXXX")}) == UINT64_MAX && f.error() == 20, "mkstemp under /dev/null is ENOTDIR");
+    { std::ofstream plain(directory.path / "plain"); plain << "x"; }
+    require(f.call("_mkstemp", {directory.guest("plain/fooXXXXXX")}) == UINT64_MAX && f.error() == 20, "mkstemp under a file is ENOTDIR");
+    require(f.call("_mkdtemp", {directory.guest("missing/fooXXXXXX")}) == 0 && f.error() == 2, "mkdtemp under a missing directory is ENOENT");
     for (const auto descriptor : {first, second, suffix}) require(f.call("_close", {descriptor}) == 0, "temporary descriptor close failed");
 
     const auto stream = f.call("_tmpfile");

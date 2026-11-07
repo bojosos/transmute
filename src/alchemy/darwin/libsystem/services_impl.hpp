@@ -2013,6 +2013,17 @@ public:
         auto offset = end;
         while (offset > 0 && specification[offset - 1] == 'X') --offset;
         const auto count = end - offset;
+        // The directory part is checked first, as find_temp_path does: ENOTDIR when it is
+        // not a directory (a template under /dev/null), ENOENT when it is missing.
+        if (const auto slash = specification.rfind('/', offset ? offset - 1 : 0); slash != std::string::npos && slash > 0) {
+            const auto parent = translate_path(specification.substr(0, slash));
+            if (device_node(parent) || is_pseudo_terminal_path(parent)) throw ServiceError{enotdir};
+            std::error_code error;
+            const auto status = std::filesystem::status(parent, error);
+            if (status.type() == std::filesystem::file_type::not_found) throw ServiceError{enoent};
+            if (error) throw ServiceError{host_error(error)};
+            if (!std::filesystem::is_directory(status)) throw ServiceError{enotdir};
+        }
         for (unsigned attempt = 0; attempt < (count ? 128U : 1U); ++attempt) {
             auto candidate = specification; candidate.replace(offset, count, temporary_suffix(count));
             const auto name = translate_path(candidate);

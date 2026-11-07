@@ -139,7 +139,8 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
     std::set<std::uint64_t> cancel_requests;
     std::atomic<std::size_t> cancel_count{};
     std::vector<std::array<std::uint64_t, 3>> fork_handlers;
-    std::uint64_t next_key{1};
+    static constexpr std::uint64_t first_dynamic_key = 256;   // libpthread's __pthread_tsd_start
+    std::uint64_t next_key{first_dynamic_key};
     std::uint64_t worker_generation{};
     std::uint64_t exit_shim{};
     std::atomic<bool> closing{};
@@ -1174,7 +1175,9 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         add("_pthread_key_create", [](auto& self, auto& s, auto& m) {
             if (!accessible(m, s.x[0], 8)) { s.x[0] = einval; return; }
             std::lock_guard lock(self.metadata);
-            if (self.keys.size() >= 512) { s.x[0] = eagain; return; }
+            // As libpthread: 512 keys for the program (PTHREAD_KEYS_MAX), numbered from 256; the
+            // framework-reserved keys below 256 (pthread_key_init_np) are not among them.
+            if (std::distance(self.keys.lower_bound(first_dynamic_key), self.keys.end()) >= 512) { s.x[0] = eagain; return; }
             while (self.keys.contains(self.next_key)) ++self.next_key; // Skip framework-reserved keys.
             const auto key = self.next_key++; self.keys.emplace(key, s.x[1]); m.write64(s.x[0], key); s.x[0] = 0;
         });
@@ -1183,7 +1186,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         add("_pthread_key_init_np", [](auto& self, auto& s, auto&) {
             std::lock_guard lock(self.metadata);
             const auto key = static_cast<std::uint64_t>(static_cast<std::uint32_t>(s.x[0]));
-            if (key == 0 || key >= 512) { s.x[0] = einval; return; }
+            if (key == 0 || key >= first_dynamic_key) { s.x[0] = einval; return; }
             self.keys[key] = s.x[1]; s.x[0] = 0;
         });
         // os_unfair_lock: a 32-bit lock word, zero-initialized, owned by one

@@ -1871,6 +1871,20 @@ void test_b31(Fixture& f) {
     require(f.symbol(system, "_thread_chkstk_darwin") == f.symbol(system, "___chkstk_darwin"), "thread_chkstk_darwin");
 }
 
+void test_b33(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    // sbrk / brk, as Libc's emulation: a 4 MiB region handed out in order.
+    const auto start = f.sys("_sbrk", {0});
+    require(start && start != UINT64_MAX, "sbrk(0) answers the break");
+    require(f.sys("_sbrk", {100}) == start && f.sys("_sbrk", {0}) == start + 100, "sbrk moves the break");
+    f.engine.write64(start + 92, 0x1122334455667788ULL);
+    require(f.engine.read64(start + 92) == 0x1122334455667788ULL, "the memory sbrk handed out is usable");
+    require(f.sys("_sbrk", {static_cast<std::uint32_t>(-50)}) == start + 100, "a negative increment answers the break");
+    require(f.sys("_sbrk", {5 * 1024 * 1024}) == UINT64_MAX && errno_value() == 12, "more than the region is ENOMEM");
+    require(f.sys("_sbrk", {0}) == start + 100, "a failed sbrk leaves the break");
+    require(f.sys("_brk", {start + 4096}) == UINT64_MAX && errno_value() == 12, "brk is ENOMEM");
+}
+
 } // namespace
 
 int main() {
@@ -1904,6 +1918,7 @@ int main() {
         stage("b24"); test_b24(f);
         stage("b25"); test_b25(f);
         stage("b31"); test_b31(f);
+        stage("b33"); test_b33(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;

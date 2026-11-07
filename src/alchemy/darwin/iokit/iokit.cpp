@@ -530,6 +530,14 @@ void IoKit::install_notifications() {
         { std::lock_guard lock(mutex); previous = std::exchange(value->queue, s.x[1]); }
         if (previous) static_cast<void>(call(libsystem, "_dispatch_release", {previous}));
     });
+    // void IODispatchCalloutFromMessage(void* unused, mach_msg_header_t* msg, void* reference): IOKitLib
+    // runs the callback an IOKit notification message names. Alchemy delivers its notifications
+    // through the port's run-loop source or dispatch queue and never queues one on the port's Mach
+    // receive right, so a message received there is not an IOKit notification, and IOKitLib leaves
+    // such messages alone too.
+    raw(iokit, "_IODispatchCalloutFromMessage", [](CpuState& s, GuestMemory&) {
+        if (!s.x[1]) throw std::runtime_error("Alchemy: IODispatchCalloutFromMessage of a NULL message");
+    });
     // IOServiceAddMatchingNotification(port, type, matching (consumed), callback, refCon, io_iterator_t *):
     // first-match/publish/matched notifications start with the current matches;
     // termination notifications start empty (nothing is ever removed).

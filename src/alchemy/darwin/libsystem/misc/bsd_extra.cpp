@@ -195,6 +195,24 @@ void install_libsystem_bsd_extra(Provider& p) {
         return 0;
     });
 
+    // ---- <unistd.h> break ----
+    // void* sbrk(int increment) and void* brk(const void*), as Libc's emulation (emulated/brk.c):
+    // a 4 MiB region allocated on first use is handed out in order; a non-positive increment
+    // answers the current break; more than what is left, and every brk, fail with ENOMEM.
+    struct Break { std::mutex mutex; std::uint64_t current{}, remaining{4 * 1024 * 1024}; bool ready{}; };
+    const auto heap = std::make_shared<Break>();
+    p.libsystem("_sbrk", [&process, heap](CpuState& s, GuestMemory&) -> std::uint64_t {
+        std::lock_guard lock(heap->mutex);
+        if (!heap->ready) { heap->current = process.allocate_guest(heap->remaining, 16384); heap->ready = true; }
+        const auto size = static_cast<std::int32_t>(static_cast<std::uint32_t>(s.x[0]));
+        if (size <= 0) return heap->current;
+        if (static_cast<std::uint64_t>(size) > heap->remaining) throw Errno{enomem};
+        heap->current += static_cast<std::uint64_t>(size);
+        heap->remaining -= static_cast<std::uint64_t>(size);
+        return heap->current - static_cast<std::uint64_t>(size);
+    });
+    p.libsystem("_brk", [](CpuState&, GuestMemory&) -> std::uint64_t { throw Errno{enomem}; });
+
     // ---- wide characters ----
     p.libsystem("_wcstoimax", [p](CpuState& s, GuestMemory&) -> std::uint64_t { return p.call(libsystem_library, "_wcstoll", {s.x[0], s.x[1], s.x[2]}); });
     p.libsystem("_wcstoumax", [p](CpuState& s, GuestMemory&) -> std::uint64_t { return p.call(libsystem_library, "_wcstoull", {s.x[0], s.x[1], s.x[2]}); });

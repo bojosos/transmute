@@ -202,16 +202,20 @@ void test_cancellation() {
 }
 
 // The Swift runtime's reserved keys (__PTK_FRAMEWORK_SWIFT_KEY0-9, 100-109) work without pthread_key_init_np, and
-// pthread_key_create never hands them out.
+// pthread_key_create never hands them out. As libpthread, the program has all 512 keys (PTHREAD_KEYS_MAX), numbered
+// from 256: the reserved ones are not counted.
 void test_reserved_swift_keys() {
     Fixture f;
     require(f.call("_pthread_setspecific", {103, 0x1234}) == 0 && f.call("_pthread_getspecific", {103}) == 0x1234 &&
             f.call("_pthread_setspecific", {109, 7}) == 0 && f.call("_pthread_getspecific", {109}) == 7, "reserved keys 100-109");
-    for (int index = 0; index < 120; ++index) {
-        require(f.call("_pthread_key_create", {data + 256, 0}) == 0, "key create failed");
+    for (int index = 0; index < 512; ++index) {
+        require(f.call("_pthread_key_create", {data + 256, 0}) == 0, "key create failed before 512 keys");
         const auto key = f.engine.read64(data + 256);
-        require(key < 100 || key > 109, "pthread_key_create handed out a reserved key");
+        require(key >= 256, "pthread_key_create handed out a key below 256");
     }
+    require(f.call("_pthread_key_create", {data + 256, 0}) == 35, "the 513th key is EAGAIN");
+    require(f.call("_pthread_key_init_np", {120, 0}) == 0 && f.call("_pthread_key_init_np", {256, 0}) == 22,
+            "pthread_key_init_np takes reserved keys only");
 }
 
 // os_unfair_recursive_lock {lock word, count}: the owner takes it again, another thread cannot until the last unlock.
