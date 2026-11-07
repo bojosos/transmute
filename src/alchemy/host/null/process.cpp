@@ -23,6 +23,7 @@ std::optional<std::string> environment(std::string_view) { return std::nullopt; 
 std::vector<std::string> environment_block() { return {}; }
 Status set_environment(std::string_view, std::optional<std::string_view>) { return Error::unsupported; }
 Result<std::uint32_t> exit_code(Handle) { return Error::unsupported; }
+Result<std::uint32_t> wait_exit(Handle) { return Error::unsupported; }
 Status terminate(Handle, std::uint32_t) { return Error::unsupported; }
 Status terminate_pid(std::uint32_t, std::uint32_t) { return Error::unsupported; }
 void terminate_self(std::uint32_t exit_code) noexcept { std::_Exit(static_cast<int>(exit_code)); }

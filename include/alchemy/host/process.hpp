@@ -69,8 +69,12 @@ struct Entry { std::uint32_t pid{}, parent{}; };
 // Child and other host processes. A process Handle (from spawning) is
 // signalled for sync::wait_any when the process ends; close it with
 // host::close.
-// The exit code of an ended process; Error::busy while it still runs.
+// The exit code of an ended process; Error::busy while it still runs. A process has
+// ended once its exit code is set, which can be well before its handle is signalled:
+// the host tears a large address space down first (tens of seconds on a loaded machine).
 [[nodiscard]] Result<std::uint32_t> exit_code(Handle process);
+// Waits until a process has ended in exit_code's sense and returns its exit code.
+[[nodiscard]] Result<std::uint32_t> wait_exit(Handle process);
 // Ends a process with `exit_code` (kill(2) of a process that cannot run a
 // handler): by handle, or by host pid.
 [[nodiscard]] Status terminate(Handle process, std::uint32_t exit_code);

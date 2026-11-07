@@ -36,7 +36,7 @@ void DarwinServices::Impl::install_all() {
         }
         if (found->second.reaped) return std::nullopt;
         if (found->second.pseudo_status) return true;
-        // The child's host process (launch.cpp's opaque handle) is signalled once it ends.
+        // The child's host process (launch.cpp's opaque handle) has an exit code once it ends.
         return found->second.process &&
                static_cast<bool>(host::process::exit_code(host::Handle{reinterpret_cast<std::uintptr_t>(found->second.process)}));
     };

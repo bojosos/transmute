@@ -119,10 +119,22 @@ std::vector<std::string> environment_block() {
 }
 
 Result<std::uint32_t> exit_code(Handle process) {
-    if (WaitForSingleObject(win32::native(process), 0) == WAIT_TIMEOUT) return Error::busy;
+    // The exit code is set when the process terminates; the handle is signalled only once
+    // its address space is torn down. A process that exits with STILL_ACTIVE (259) itself
+    // has ended only when its handle is signalled.
     DWORD code = 0;
+    if (GetExitCodeProcess(win32::native(process), &code) && code != STILL_ACTIVE) return static_cast<std::uint32_t>(code);
+    if (WaitForSingleObject(win32::native(process), 0) == WAIT_TIMEOUT) return Error::busy;
     if (!GetExitCodeProcess(win32::native(process), &code)) return win32::last_error();
     return static_cast<std::uint32_t>(code);
+}
+
+Result<std::uint32_t> wait_exit(Handle process) {
+    for (DWORD wait = 1;; wait = std::min<DWORD>(wait * 2, 50)) {
+        const auto code = exit_code(process);
+        if (code || code.error() != Error::busy) return code;
+        if (WaitForSingleObject(win32::native(process), wait) == WAIT_FAILED) return win32::last_error();
+    }
 }
 
 Status terminate(Handle process, std::uint32_t exit_code) {

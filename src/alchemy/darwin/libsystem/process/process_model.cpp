@@ -664,9 +664,8 @@ void DarwinServices::Impl::install_process_services() {
         std::cout.flush(); std::cerr.flush();
         // Other threads of the old image never run again.
         host::process::suspend_other_threads();
-        const std::array processes{child_process(spawned.process)};
-        static_cast<void>(host::sync::wait_any(processes, std::nullopt));
-        host::process::terminate_self(host::process::exit_code(processes[0]).value_or(0));
+        // Ends as soon as the new image has ended, not once the host has torn it down.
+        host::process::terminate_self(host::process::wait_exit(child_process(spawned.process)).value_or(0));
     };
     // Spawns `request` from the current table (process or fork child) and
     // returns the pid; registers it. In a fork child it is the exec.

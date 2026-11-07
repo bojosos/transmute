@@ -26,6 +26,7 @@
 #include <atomic>
 #include <deque>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -459,6 +460,25 @@ void spawn_general(const std::string& self) {
     host::process::Spawn missing;
     missing.program = self + ".missing";
     require(host::process::spawn(missing).error() == host::Error::not_found, "spawn of a missing program");
+}
+
+// A process has ended once its exit code is set (before the host has torn it down);
+// one whose exit code is STILL_ACTIVE's 259 only once its handle is signalled.
+void exit_codes(const std::string& self) {
+    for (const std::uint32_t code : {7U, 259U}) {
+        host::process::Spawn options;
+        options.program = self;
+        options.arguments = {"--exit-child", std::to_string(code)};
+        auto child = host::process::spawn(options);
+        require(child && child->process, "spawn an exiting child");
+        host::OwnedHandle process(child->process), thread(child->thread);
+        require(host::process::wait_exit(process.get()).value_or(0) == code, "wait_exit returns the exit code");
+        require(*host::process::exit_code(process.get()) == code, "exit_code of an ended child");
+        if (code == 259) {
+            const std::array processes{process.get()};
+            require(static_cast<bool>(host::sync::wait_any(processes, 0)), "a child that exits with 259 has ended once signalled");
+        }
+    }
 }
 
 // A listener, a client, both directions, a second listener, cancel.
@@ -936,6 +956,7 @@ void real_backend() {
         "start_time");
     spawn_piped(*image);
     spawn_general(*image);
+    exit_codes(*image);
     const auto pipe = host::files::create_pipe();
     require(static_cast<bool>(pipe), "a pipe for duplicate_into");
     host::OwnedHandle pipe_read(pipe->read), pipe_write(pipe->write);
@@ -1264,6 +1285,7 @@ void real_backend() {
 int main(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == "--pipe-child") return pipe_child(argc, argv);
     if (argc > 2 && std::string_view(argv[1]) == "--section-child") return section_child(argv);
+    if (argc > 2 && std::string_view(argv[1]) == "--exit-child") return std::atoi(argv[2]);
     try {
         result_type();
         addresses();
