@@ -77,6 +77,39 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+## OpenCombine (guest `Combine.framework`)
+
+`third_party/opencombine` vendors OpenCombine's sources:
+<https://github.com/OpenCombine/OpenCombine>, tag `0.14.0`, commit
+`8576f0d579b27020beccbccc3ea6844f3ddfc2c2`, MIT license, with the mechanical
+changes `third_party/opencombine/PROVENANCE.md` records.
+`scripts/build_alchemy_swift.ps1` builds them, with the project's own
+`runtime/swift/combine/` sources, into the guest
+`/System/Library/Frameworks/Combine.framework/Versions/A/Combine`. Its license
+notice follows verbatim.
+
+MIT License
+
+Copyright (c) 2019 Sergej Jaskiewicz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ## tsl::robin_map (host hash containers)
 
 `third_party/robin-map` vendors the header-only robin-map library:
