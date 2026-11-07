@@ -23,9 +23,21 @@ FOUNDATION = re.compile(r"^_(OBJC_CLASS_\$_|OBJC_METACLASS_\$_|NS[A-Z])")
 
 
 def symbols(nm: str, paths: list[str], flags: list[str]) -> set[str]:
+    # Batches stay under the Windows command-line limit (32767 characters),
+    # whatever the length of the output directory's paths.
+    batches: list[list[str]] = [[]]
+    length = 0
+    for path in paths:
+        if batches[-1] and length + len(path) + 3 > 24000:
+            batches.append([])
+            length = 0
+        batches[-1].append(path)
+        length += len(path) + 3
     result: set[str] = set()
-    for start in range(0, len(paths), 200):
-        output = subprocess.run([nm, *flags, *paths[start:start + 200]], check=True, capture_output=True, text=True).stdout
+    for batch in batches:
+        if not batch:
+            continue
+        output = subprocess.run([nm, *flags, *batch], check=True, capture_output=True, text=True).stdout
         for line in output.splitlines():
             parts = line.split()
             if parts and not line.endswith(":"):
@@ -39,7 +51,8 @@ def main() -> None:
     runtimes, objects = sys.argv[3:separator], sys.argv[separator + 1:]
     undefined = symbols(nm, objects, ["-u", "-j"])
     defined = symbols(nm, objects, ["-g", "--defined-only", "-j"]) | symbols(nm, runtimes, ["-g", "--defined-only", "-j"])
-    needed = sorted(undefined - defined)
+    # The linker defines ___dso_handle (#dsohandle) in every image.
+    needed = sorted(undefined - defined - {"___dso_handle"})
     groups = {
         "objc": [s for s in needed if OBJC.match(s)],
         "foundation": [s for s in needed if not OBJC.match(s) and FOUNDATION.match(s)],

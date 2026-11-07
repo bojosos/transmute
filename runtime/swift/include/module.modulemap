@@ -24,3 +24,10 @@ module os [system] {
   header "os/log.h"
   export *
 }
+
+// The C library under the open-source Darwin overlay (libswiftDarwin, from
+// stdlib/public/Platform) and _Concurrency's `import Darwin`.
+module Darwin [system] {
+  header "AlchemyDarwin.h"
+  export *
+}

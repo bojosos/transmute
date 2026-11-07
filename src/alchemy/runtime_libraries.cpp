@@ -15,13 +15,19 @@ constexpr std::string_view expat_source = "https://github.com/libexpat/libexpat"
 
 constexpr std::string_view swift_source = "https://github.com/swiftlang/swift";
 
-constexpr std::array<RuntimeLibraryIdentity, 14> identities{{
+constexpr std::array<RuntimeLibraryIdentity, 18> identities{{
     {"/usr/lib/libc++.1.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libc++abi.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libunwind.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libexpat.1.dylib", expat_source, "scripts/build_alchemy_expat.ps1", false},
     // The Swift runtime and standard library (docs/ALCHEMY_SWIFT.md).
     {"/usr/lib/swift/libswiftCore.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
+    // Open-source stdlib modules from the same sources (Platform, Concurrency,
+    // Observation, Synchronization).
+    {"/usr/lib/swift/libswiftDarwin.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
+    {"/usr/lib/swift/libswift_Concurrency.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
+    {"/usr/lib/swift/libswiftObservation.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
+    {"/usr/lib/swift/libswiftSynchronization.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     // Project-authored overlays built by the same script (runtime/swift/overlays).
     {"/usr/lib/swift/libswiftFoundation.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     {"/usr/lib/swift/libswiftos.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},

@@ -115,6 +115,8 @@ int strerror_r(int, char*, size_t);
 int strcoll(const char*, const char*);
 size_t strxfrm(char*, const char*, size_t);
 FILE* fopen(const char*, const char*);
+int vdprintf(int, const char*, va_list);
+int dprintf(int, const char*, ...);
 FILE* freopen(const char*, const char*, FILE*);
 FILE* fdopen(int, const char*);
 int fclose(FILE*);
@@ -176,6 +178,8 @@ char* asctime(const struct tm*);
 char* ctime(const time_t*);
 size_t strftime(char*, size_t, const char*, const struct tm*);
 int clock_gettime(int, struct timespec*);
+int clock_getres(int, struct timespec*);
+uint64_t clock_gettime_nsec_np(int);
 int timespec_get(struct timespec*, int);
 int nanosleep(const struct timespec*, struct timespec*);
 int gettimeofday(struct timeval*, void*);
@@ -199,6 +203,9 @@ int isatty(int);
 unsigned sleep(unsigned);
 int usleep(unsigned);
 void __assert_rtn(const char*, const char*, int, const char*) __attribute__((noreturn));
+typedef int errno_t;
+typedef size_t rsize_t;
+errno_t memset_s(void*, rsize_t, int, rsize_t);
 #ifdef __cplusplus
 }
 #endif
@@ -225,6 +232,11 @@ void __assert_rtn(const char*, const char*, int, const char*) __attribute__((nor
 #define CLOCK_REALTIME 0
 #define CLOCK_MONOTONIC 6
 #define CLOCK_MONOTONIC_RAW 4
+#define CLOCK_MONOTONIC_RAW_APPROX 5
+#define CLOCK_UPTIME_RAW 8
+#define CLOCK_UPTIME_RAW_APPROX 9
+#define CLOCK_PROCESS_CPUTIME_ID 12
+#define CLOCK_THREAD_CPUTIME_ID 16
 #define TIME_UTC 1
 #define _SC_NPROCESSORS_ONLN 58
 #define EDOM 33

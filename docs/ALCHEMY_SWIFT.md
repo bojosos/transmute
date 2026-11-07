@@ -235,3 +235,34 @@ All three are Apache 2.0 with the Runtime Library Exception. Provenance
 (URL, tag, commit SHA, licenses) would be recorded in
 `artifacts/alchemy-swift/provenance.json` and in
 `runtime/THIRD_PARTY_NOTICES.md`, as for the LLVM runtimes.
+
+## Open-source stdlib modules beyond the core
+
+Apps built with current SDKs link more of the open-source Swift stdlib than QLab does. Maccy 2.8.0 and Pika 2.0.2
+(SwiftUI apps with min macOS 14.0) strongly link `libswift_Concurrency`, and Maccy also links `libswiftObservation`.
+`build_alchemy_swift.ps1` builds these from the same pinned swift-6.2-RELEASE sources as the core. It uses the
+core's Swift flags, minus the core's identity and its core-only optimizer flags, so the exported names match Apple's
+builds of the same release:
+
+| Identity | Sources | Notes |
+| --- | --- | --- |
+| `/usr/lib/swift/libswiftDarwin.dylib` | `stdlib/public/Platform`: Platform, TiocConstants, POSIXError, MachError, Darwin.swift.gyb, tgmath.swift.gyb | over the `Darwin` Clang module (`runtime/swift/include/AlchemyDarwin.h` → `runtime/include`) |
+| `/usr/lib/swift/libswift_Concurrency.dylib` | `stdlib/public/Concurrency`, with the Darwin global executor (`DispatchGlobalExecutor.cpp`, `DispatchExecutor.swift`, `CFExecutor.swift`) | `SWIFT_CONCURRENCY_USES_DISPATCH`, async frame pointers, and its own copy of the threading package. The linker-support file is not built: it only redirects install names for back deployment |
+| `/usr/lib/swift/libswiftObservation.dylib` | `stdlib/public/Observation` | the library behind `@Observable` |
+| `/usr/lib/swift/libswiftSynchronization.dylib` | `stdlib/public/Synchronization`, with the Darwin `Mutex` | `Atomic` and `Mutex` |
+
+A Mach-O detail: the C library's `FILE` is the complete `struct __sFILE` (BSD stdio's public layout). The Darwin
+overlay's `stdin`, `stdout` and `stderr` getters mangle that name (`$s6Darwin6stderrSpySo7__sFILEVGvg`).
+
+**What _Concurrency expects from the providers.** Measured with a guest async test (tasks, `async let`, task
+groups, actors, `AsyncStream`, task-locals, cancellation, checked continuations and `MainActor`):
+* `voucher_copy`, `os_unfair_recursive_lock_lock_with_options` and `os_unfair_recursive_lock_unlock`;
+* `pthread_getspecific`/`pthread_setspecific` on the statically reserved Swift keys 100–109
+  (`__PTK_FRAMEWORK_SWIFT_KEY0-9`) without `pthread_key_init_np`;
+* Swift classes, including actors, whose `class_ro` sets RO_FORBIDS_ASSOCIATED_OBJECTS (0x400);
+* `dlsym` on a handle from `dlopen(".../CoreFoundation.framework/CoreFoundation", RTLD_NOLOAD)` (the CFRunLoop main
+  executor);
+* `dispatch_time_t` deadlines in Apple arm64 mach time: absolute 24 MHz ticks with the fixed timebase 125/3, and
+  bit 63 set for the continuous clock. `DispatchGlobalExecutor.cpp` builds these values itself.
+
+The libSystem, libdispatch and Objective-C runtime providers own these items.

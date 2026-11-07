@@ -44,6 +44,12 @@ double fma(double, double, double); float fmaf(float, float, float); long double
 double nan(const char*); float nanf(const char*); long double nanl(const char*);
 double nexttoward(double, long double); float nexttowardf(float, long double); long double nexttowardl(long double, long double);
 double remquo(double, double, int*); float remquof(float, float, int*); long double remquol(long double, long double, int*);
+ALCHEMY_MATH_UNARY(logb)
+double j0(double); double j1(double); double jn(int, double);
+double y0(double); double y1(double); double yn(int, double);
+double gamma(double); double significand(double);
+double scalb(double, double);
+float lgammaf_r(float, int*); double lgamma_r(double, int*); long double lgammal_r(long double, int*);
 #undef ALCHEMY_MATH_UNARY
 #undef ALCHEMY_MATH_BINARY
 #ifdef __cplusplus

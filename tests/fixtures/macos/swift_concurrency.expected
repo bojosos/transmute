@@ -1,0 +1,13 @@
+task 49
+async let 25
+group 385
+actor 100
+stream [0, 1, 2, 3, 4]
+sleep true true
+task-local outer outer
+cancelled true
+continuation 99
+main actor
+observation 1 third
+atomic 8000
+darwin true true

@@ -317,6 +317,155 @@ function Link-Library([string]$name, [string]$installName, [string[]]$objects, [
 }
 Link-Library 'swiftCore' '/usr/lib/swift/libswiftCore.dylib' @($coreObjects + $cObjects) @($cxx)
 
+# --- Open-source stdlib modules beyond the core, from the same pinned sources
+# and with the core's Swift flags (so their ABI matches Apple's builds of the
+# same release): the Darwin overlay (stdlib/public/Platform, over the Darwin
+# Clang module of runtime/swift/include) and _Concurrency with its dispatch
+# global executor.
+$stdlibObj = "$obj/stdlib"
+$null = New-Item -ItemType Directory -Force -Path "$stdlibObj/gyb", "$stdlibObj/c"
+# The core's Swift flags without its identity, its outputs and its core-only
+# optimizer flags (stdlib/public/core/CMakeLists.txt).
+function Stdlib-Flags([string]$module, [string]$library, [switch]$ParseStdlib) {
+    $flags = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $coreFlags.Count; $i++) {
+        $flag = $coreFlags[$i]
+        if ($flag -in @('-module-name', '-module-link-name', '-group-info-path', '-emit-module-path', '-emit-module-interface-path')) { $i++; continue }
+        if ($flag -in @('-nostdimport', '-empty-abi-descriptor', '-prespecialize-generic-metadata')) { continue }
+        if ($flag -eq '-parse-stdlib' -and !$ParseStdlib) { continue }
+        if ($flag -in @('-Xcc', '-Xllvm') -and $coreFlags[$i + 1] -match '^(-DswiftCore_EXPORTS|-sil-inline-generics|-sil-partial-specialization)$') { $i++; continue }
+        $flags.Add($flag)
+    }
+    $flags.AddRange([string[]](@('-module-name', $module, '-module-link-name', $library, '-I', "$obj/core", '-I', $stdlibObj,
+        '-disable-implicit-concurrency-module-import', '-disable-implicit-string-processing-module-import',
+        '-emit-module-path', "$stdlibObj/$module.swiftmodule") + @($sysroot | ForEach-Object { @('-Xcc', "-I$_") })))
+    return , $flags
+}
+function Build-StdlibSwift([string]$module, [string[]]$flags, [string[]]$sources) {
+    $objects = @($sources | ForEach-Object { "$stdlibObj/$module-" + [System.IO.Path]::GetFileNameWithoutExtension($_) + '.o' })
+    $signature = ($flags + $sources) -join "`n"
+    if (Needs-Build $objects[-1] $signature $sources) {
+        $arguments = @($flags) + $sources
+        foreach ($object in $objects) { $arguments += @('-o', $object) }
+        Invoke-Tool $frontend $arguments "$stdlibObj/$module"
+        Set-Content -LiteralPath "$($objects[-1]).flags" -Value $signature -Encoding utf8
+    }
+    return $objects
+}
+function Expand-Gyb([string]$source, [string]$output) {
+    if ((Test-Path -LiteralPath $output) -and (Get-Item -LiteralPath $output).LastWriteTimeUtc -gt (Get-Item -LiteralPath $source).LastWriteTimeUtc) { return }
+    & $Python -I "$repo/scripts/alchemy_swift_gyb.py" "$swift/utils" -DCMAKE_SIZEOF_VOID_P=8 '--line-directive=' -o $output $source
+    if ($LASTEXITCODE) { throw "gyb failed: $source" }
+}
+if ($Library -eq 'all') {
+    # /usr/lib/swift/libswiftDarwin.dylib (Platform/CMakeLists.txt: swift_platform_sources, POSIXError, MachError and
+    # Darwin.swift.gyb, an SDK overlay).
+    $platform = "$swift/stdlib/public/Platform"
+    foreach ($name in @('Darwin', 'tgmath')) { Expand-Gyb "$platform/$name.swift.gyb" "$stdlibObj/gyb/$name.swift" }
+    $darwinFlags = Stdlib-Flags 'Darwin' 'swiftDarwin'
+    $darwinFlags.AddRange([string[]]@('-autolink-force-load'))
+    $darwinObjects = Build-StdlibSwift 'Darwin' $darwinFlags (@('Platform.swift', 'TiocConstants.swift', 'POSIXError.swift', 'MachError.swift' |
+        ForEach-Object { "$platform/$_" }) + @("$stdlibObj/gyb/Darwin.swift", "$stdlibObj/gyb/tgmath.swift"))
+    Link-Library 'swiftDarwin' '/usr/lib/swift/libswiftDarwin.dylib' $darwinObjects @($cxx, "$out/libswiftCore.dylib")
+
+    # /usr/lib/swift/libswift_Concurrency.dylib (Concurrency/CMakeLists.txt with SWIFT_CONCURRENCY_GLOBAL_EXECUTOR
+    # "dispatch" on Darwin). Its linker-support file only emits $ld$previous install-name redirects for back
+    # deployment, which the /usr/lib/swift identity does not need.
+    $concurrency = "$swift/stdlib/public/Concurrency"
+    $concurrencyList = Get-Content -LiteralPath "$concurrency/CMakeLists.txt" -Raw
+    function Concurrency-Sources([string]$variable) {
+        if ($concurrencyList -notmatch "(?s)set\($variable\s(.*?)\)") { throw "Cannot read $variable from Concurrency/CMakeLists.txt" }
+        return @([regex]::Matches($Matches[1], '[A-Za-z0-9_+./-]+\.(swift|cpp|c|gyb)') | ForEach-Object { $_.Value })
+    }
+    $concurrencyGyb = @(Concurrency-Sources 'SWIFT_CONCURRENCY_GYB_SOURCES')
+    foreach ($name in $concurrencyGyb) { Expand-Gyb "$concurrency/$name" ("$stdlibObj/gyb/" + ($name -replace '\.gyb$', '')) }
+    $concurrencySwift = @(@(Concurrency-Sources 'SWIFT_RUNTIME_CONCURRENCY_SWIFT_SOURCES') + @('DispatchExecutor.swift', 'CFExecutor.swift', 'ExecutorImpl.swift') |
+        ForEach-Object { "$concurrency/$_" }) + @($concurrencyGyb | ForEach-Object { "$stdlibObj/gyb/" + ($_ -replace '\.gyb$', '') })
+    $concurrencyFlags = Stdlib-Flags '_Concurrency' 'swift_Concurrency' -ParseStdlib
+    $concurrencyFlags.AddRange([string[]]@('-I', "$concurrency/InternalShims", '-enable-experimental-feature', 'IsolatedAny',
+        '-swift-async-frame-pointer=always', '-D', 'SWIFT_CONCURRENCY_USES_DISPATCH'))
+    $concurrencyObjects = Build-StdlibSwift '_Concurrency' $concurrencyFlags $concurrencySwift
+    $concurrencyC = @(@(Concurrency-Sources 'SWIFT_RUNTIME_CONCURRENCY_C_SOURCES') + @('DispatchGlobalExecutor.cpp', 'ExecutorImpl.cpp') |
+        Where-Object { $_ -notlike 'linker-support/*' })
+    $concurrencyCommon = @($commonC | Where-Object { $_ -ne '-DswiftCore_EXPORTS' }) + @('-Dswift_Concurrency_EXPORTS',
+        '-DSWIFT_CONCURRENCY_USES_DISPATCH', '-D__STDC_WANT_LIB_EXT1__=1', '-fswift-async-fp=always', '-fblocks',
+        '-DSWIFT_TARGET_LIBRARY_NAME=swift_Concurrency', '-I', $concurrency)
+    # Local patch (approved; recorded in provenance.json): DispatchGlobalExecutor.cpp converts deadlines to Apple
+    # arm64's fixed 125/3 mach timebase, but Alchemy's mach_timebase_info is 1/1 (nanoseconds). The generated copy
+    # takes the file's own nanoseconds configuration (upstream's x86_64 and non-Apple one) and is marked as modified.
+    $patchedDirectory = "$stdlibObj/patched"
+    $null = New-Item -ItemType Directory -Force -Path $patchedDirectory
+    $executorSource = Get-Content -LiteralPath "$concurrency/DispatchGlobalExecutor.cpp" -Raw
+    $timeUnitLine = '#if defined(__i386__) || defined(__x86_64__) || !defined(__APPLE__)'
+    if ($executorSource.IndexOf($timeUnitLine) -lt 0) { throw 'DispatchGlobalExecutor.cpp: the time-unit selection line changed upstream' }
+    $executorPatched = "// Modified by Alchemy (scripts/build_alchemy_swift.ps1) from swift $swiftTag" +
+        " stdlib/public/Concurrency/DispatchGlobalExecutor.cpp:`n// TIME_UNIT_USES_NANOSECONDS is forced on, because Alchemy's mach timebase is 1/1.`n" +
+        $executorSource.Replace($timeUnitLine, '#if 1 // Alchemy: was ' + $timeUnitLine.Substring(4))
+    $executorCopy = "$patchedDirectory/DispatchGlobalExecutor.cpp"
+    if (!(Test-Path -LiteralPath $executorCopy) -or (Get-Content -LiteralPath $executorCopy -Raw) -ne $executorPatched) {
+        [System.IO.File]::WriteAllText($executorCopy, $executorPatched)
+    }
+    $work = [System.Collections.Generic.List[object]]::new()
+    foreach ($file in $concurrencyC) {
+        $source = if ($file -eq 'DispatchGlobalExecutor.cpp') { $executorCopy } else { "$concurrency/$file" }
+        $object = "$stdlibObj/c/" + [System.IO.Path]::GetFileNameWithoutExtension($file) + '.o'
+        $flags = @($concurrencyCommon + @('-x', 'c++', '-std=c++17', '-c', $source, '-o', $object))
+        $signature = $flags -join "`n"
+        $concurrencyObjects += $object
+        if (!(Needs-Build $object $signature @($source))) { continue }
+        $rspPath = "$object.rsp"
+        [System.IO.File]::WriteAllLines($rspPath, [string[]]@($flags | ForEach-Object { if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ } }))
+        $signatureCopy = $signature
+        $objectCopy = $object
+        $work.Add(@{ Name = $source; Exe = $clang; Arguments = "@`"$rspPath`""
+            Done = { Set-Content -LiteralPath "$objectCopy.flags" -Value $signatureCopy -Encoding utf8 }.GetNewClosure() })
+    }
+    if ($work.Count) { Write-Host "Compiling $($work.Count) _Concurrency units"; Invoke-Jobs $work }
+    # _Concurrency incorporates its own copy of the threading package (INCORPORATE_OBJECT_LIBRARIES swiftThreading).
+    $concurrencyObjects += @($cObjects | Where-Object { $_ -like '*/swiftThreading_*' })
+    Link-Library 'swift_Concurrency' '/usr/lib/swift/libswift_Concurrency.dylib' $concurrencyObjects @($cxx, "$out/libswiftCore.dylib", "$out/libswiftDarwin.dylib")
+
+    # /usr/lib/swift/libswiftObservation.dylib (Observation/Sources/Observation/CMakeLists.txt).
+    $observation = "$swift/stdlib/public/Observation/Sources/Observation"
+    $observationFlags = Stdlib-Flags 'Observation' 'swiftObservation'
+    $observationFlags.AddRange([string[]]@('-enable-experimental-feature', 'ExtensionMacros'))
+    $observationObjects = Build-StdlibSwift 'Observation' $observationFlags @('Locking.swift', 'Observable.swift',
+        'ObservationRegistrar.swift', 'ObservationTracking.swift', 'Observations.swift', 'ThreadLocal.swift' | ForEach-Object { "$observation/$_" })
+    $observationCommon = @($commonC | Where-Object { $_ -ne '-DswiftCore_EXPORTS' }) + @('-DswiftObservation_EXPORTS',
+        '-DSWIFT_TARGET_LIBRARY_NAME=swiftObservation')
+    $work = [System.Collections.Generic.List[object]]::new()
+    foreach ($file in @('Locking.cpp', 'ThreadLocal.cpp')) {
+        $source = "$observation/$file"
+        $object = "$stdlibObj/c/Observation-" + [System.IO.Path]::GetFileNameWithoutExtension($file) + '.o'
+        $flags = @($observationCommon + @('-x', 'c++', '-std=c++17', '-c', $source, '-o', $object))
+        $signature = $flags -join "`n"
+        $observationObjects += $object
+        if (!(Needs-Build $object $signature @($source))) { continue }
+        $rspPath = "$object.rsp"
+        [System.IO.File]::WriteAllLines($rspPath, [string[]]@($flags | ForEach-Object { if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ } }))
+        $signatureCopy = $signature
+        $objectCopy = $object
+        $work.Add(@{ Name = $source; Exe = $clang; Arguments = "@`"$rspPath`""
+            Done = { Set-Content -LiteralPath "$objectCopy.flags" -Value $signatureCopy -Encoding utf8 }.GetNewClosure() })
+    }
+    if ($work.Count) { Invoke-Jobs $work }
+    Link-Library 'swiftObservation' '/usr/lib/swift/libswiftObservation.dylib' $observationObjects @($cxx, "$out/libswiftCore.dylib",
+        "$out/libswift_Concurrency.dylib", "$out/libswiftDarwin.dylib")
+
+    # /usr/lib/swift/libswiftSynchronization.dylib (Synchronization/CMakeLists.txt, the Darwin Mutex).
+    $synchronization = "$swift/stdlib/public/Synchronization"
+    foreach ($name in @('AtomicIntegers', 'AtomicStorage')) { Expand-Gyb "$synchronization/Atomics/$name.swift.gyb" "$stdlibObj/gyb/$name.swift" }
+    $synchronizationFlags = Stdlib-Flags 'Synchronization' 'swiftSynchronization'
+    $synchronizationFlags.AddRange([string[]]@('-enable-builtin-module', '-enable-experimental-feature', 'RawLayout',
+        '-enable-experimental-feature', 'StaticExclusiveOnly'))
+    $synchronizationObjects = Build-StdlibSwift 'Synchronization' $synchronizationFlags (@('Atomic', 'AtomicBool', 'AtomicFloats',
+        'AtomicLazyReference', 'AtomicMemoryOrderings', 'AtomicOptional', 'AtomicPointers', 'AtomicRepresentable', 'WordPair' |
+        ForEach-Object { "$synchronization/Atomics/$_.swift" }) + @("$synchronization/Cell.swift", "$synchronization/Mutex/DarwinImpl.swift",
+        "$synchronization/Mutex/Mutex.swift", "$stdlibObj/gyb/AtomicIntegers.swift", "$stdlibObj/gyb/AtomicStorage.swift"))
+    Link-Library 'swiftSynchronization' '/usr/lib/swift/libswiftSynchronization.dylib' $synchronizationObjects @($cxx,
+        "$out/libswiftCore.dylib", "$out/libswiftDarwin.dylib")
+}
+
 # --- Project-authored overlays (runtime/swift/overlays/<Module>): Swift
 # modules named like the SDK overlays they stand in for, compiled with
 # library evolution against the built standard library and the
@@ -433,6 +582,8 @@ $provenance = [ordered]@{
     architecture_flags = @('-mcpu=generic', '-march=armv8-a')
     guest_header_profile = 'Alchemy-authored Darwin, Objective-C and Foundation declarations; no Apple SDK payloads'
     build_script_sha256 = $scriptHash
+    local_patches = @([ordered]@{ file = 'stdlib/public/Concurrency/DispatchGlobalExecutor.cpp'
+        change = 'TIME_UNIT_USES_NANOSECONDS forced on (Alchemy mach timebase 1/1); generated copy marked as modified' })
     guest_headers = @($headerRecords)
     outputs = @($outputs | ForEach-Object { [ordered]@{ name = $_.Name; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } })
     licenses = @(Get-ChildItem -LiteralPath $out -File | Where-Object { $_.Name -like 'LICENSE.*.txt' -or $_.Name -eq 'THIRD_PARTY_NOTICES.md' } | Sort-Object Name | ForEach-Object {
