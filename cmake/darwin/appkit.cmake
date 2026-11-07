@@ -31,6 +31,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/appkit/nib_archive.cpp
     src/alchemy/darwin/appkit/nib_keyed.cpp
     src/alchemy/darwin/appkit/nib.cpp
+    src/alchemy/darwin/appkit/storyboard.cpp
     src/alchemy/darwin/appkit/asset_catalog.cpp
     src/alchemy/darwin/appkit/rtf.cpp
     src/alchemy/darwin/appkit/documents.cpp)
@@ -144,7 +145,8 @@ function(alchemy_gui_appkit_tests)
         src/alchemy/darwin/appkit/tests/layout_solver_tests.cpp
         src/alchemy/darwin/appkit/tests/layout_geometry_tests.cpp)
     alchemy_gui_add_unit_test(alchemy_gui_appkit_windows
-        src/alchemy/darwin/appkit/tests/windows_appkit_tests.cpp)
+        src/alchemy/darwin/appkit/tests/windows_appkit_tests.cpp
+        src/alchemy/darwin/appkit/tests/storyboard_tests.cpp)
     # AppKit string drawing with arm64 NSTextAlignment values (pixels, fake window server).
     alchemy_gui_add_unit_test(alchemy_gui_appkit_text_alignment src/alchemy/darwin/appkit/tests/text_alignment_tests.cpp)
     # The public API added for the selectors real applications send, over

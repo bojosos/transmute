@@ -345,6 +345,13 @@ void AppKit::install_panels() {
         post("NSToolbarWillAddItemNotification", self, state->delegate, "toolbarWillAddItem:", autorelease(user_info));
         toolbar_changed(self);
     }, "v@:@q");
+    // An archived toolbar's default items (nib.cpp): the item objects
+    // themselves, appended as the toolbar is decoded.
+    method(toolbar, "_alchemyAppendArchivedItem:", [this, tb, ti](CpuState& s, GuestMemory&) {
+        if (!s.x[2]) return;
+        ti(s.x[2])->toolbar = s.x[0];
+        tb(s.x[0])->items.push_back(retain(s.x[2]));
+    }, "v@:@");
     method(toolbar, "removeItemAtIndex:", [this, tb, ti](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto state = tb(self);

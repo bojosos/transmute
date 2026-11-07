@@ -7,7 +7,8 @@
 #include <set>
 
 // Nib loading: NSNib, -[NSBundle loadNibNamed:owner:topLevelObjects:],
-// NSApplicationMain (principal class + NSMainNibFile), and the nib coder.
+// NSApplicationMain (principal class + NSMainNibFile or NSMainStoryboardFile),
+// and the nib coder.
 //
 // A compiled nib (NIBArchive, nib_archive.hpp) is instantiated object by
 // object: values (strings, numbers, collections, colors, fonts) become
@@ -23,6 +24,14 @@
 // A class the archive needs that does not exist, or an AppKit class whose
 // coding is not provided here (no -initWithCoder:), fails explicitly.
 //
+// Storyboard scenes (storyboard.cpp) add: external placeholders
+// (NSNibExternalObjectPlaceholder) resolved from the loader's table; an
+// NSApplication placeholder's IBMainMenu becomes the main menu; class
+// swappers marked NSInitializeWithInit are made with -init; a view
+// controller's NSExternalObjectsTableForViewLoading is kept for its view's
+// nib; and a creator block may make the scene controller (the File's Owner's
+// sceneController outlet).
+//
 // Ownership follows +[NSBundle loadNibNamed:owner:]: top-level objects keep
 // the reference the load made (the caller owns them; the topLevelObjects:
 // array holds them too); other objects are owned by their parents.
@@ -36,6 +45,10 @@ struct NibLoad {
     std::vector<std::uint32_t> order;         // objects sent -awakeFromNib
     std::vector<Address> buffers;             // decodeBytesForKey: memory (released with the load)
     Address owner{};
+    std::map<std::string, Address> externals; // external placeholder identifier -> object (not retained)
+    Address creator{};                        // block making the scene controller (storyboards)
+    std::optional<std::uint32_t> scene;       // the scene controller (the owner's sceneController outlet)
+    std::set<std::uint32_t> creating;         // objects whose creator block is running
 };
 struct CoderState final : ObjectPayload {
     std::shared_ptr<NibLoad> load;
@@ -323,10 +336,36 @@ void decode_window_template(AppKit& kit, const std::shared_ptr<NibLoad>& load, s
     static_cast<void>(coder);
 }
 
+// A storyboard view controller's NSExternalObjectsTableForViewLoading: the
+// scene objects its view's nib refers to (controllers.cpp loads the view).
+void keep_view_externals(AppKit& kit, const std::shared_ptr<NibLoad>& load, std::uint32_t index, Address object, Address coder) {
+    const auto table = load->archive.object_at(index, "NSExternalObjectsTableForViewLoading");
+    if (!table || !object || !kit.send_bool(object, "isKindOfClass:", {kit.view_controller})) return;
+    const auto elements = load->archive.elements(*table);   // key, value, key, value...
+    if (elements.size() % 2) fail("malformed NSExternalObjectsTableForViewLoading");
+    std::vector<std::pair<std::string, Address>> externals;
+    for (std::size_t i = 0; i < elements.size(); i += 2) {
+        const auto key = load->archive.string_value(elements[i]);
+        if (!key) fail("NSExternalObjectsTableForViewLoading key that is not a string");
+        externals.emplace_back(*key, instantiate(kit, load, elements[i + 1], coder));
+    }
+    kit.objc.host_state<ControllerState>(object)->view_externals = std::move(externals);
+}
+
 Address instantiate(AppKit& kit, const std::shared_ptr<NibLoad>& load, std::uint32_t index, Address coder) {
     if (const auto found = load->made.find(index); found != load->made.end()) return found->second;
+    if (load->creating.contains(index)) fail("nib object #" + std::to_string(index) + " (the scene controller) is referenced while its creator block runs");
     auto& archive = load->archive;
     const auto name = archive.class_name(index);
+    // Storyboard external objects (the storyboard, upstream scene objects).
+    if (name == "NSNibExternalObjectPlaceholder") {
+        const auto identifier = archive.string_at(index, "NSExternalObjectPlaceholderIdentifier").value_or("");
+        const auto found = load->externals.find(identifier);
+        if (found == load->externals.end()) fail("nib external object '" + identifier + "' was not provided by the loader");
+        load->placeholders.insert(index);
+        load->made.emplace(index, found->second);
+        return found->second;
+    }
     bool handled{};
     if (const auto value = make_value(kit, load, index, coder, handled); handled) {
         load->made.emplace(index, value);
@@ -342,6 +381,9 @@ Address instantiate(AppKit& kit, const std::shared_ptr<NibLoad>& load, std::uint
             load->placeholders.insert(index);
             const auto shared = kit.app ? kit.app : kit.shared_application(kit.application);
             load->made.emplace(index, shared);
+            // A storyboard's main menu scene.
+            if (const auto menu_index = archive.object_at(index, "IBMainMenu"))
+                if (const auto menu = instantiate(kit, load, *menu_index, coder)) kit.send_id(shared, "setMainMenu:", {menu});
             return shared;
         }
         const auto cls = kit.objc.find_class(cls_name);
@@ -370,6 +412,9 @@ Address instantiate(AppKit& kit, const std::shared_ptr<NibLoad>& load, std::uint
         if (const auto content = archive.object_at(index, "NSWindowView"))
             if (const auto made = instantiate(kit, load, *content, coder)) kit.send_id(window_object, "setContentView:", {made});
         decode_window_template(kit, load, index, window_object, coder);
+        // Interface Builder archives the window's toolbar under NSViewClass.
+        if (const auto toolbar_index = archive.object_at(index, "NSViewClass"); toolbar_index && archive.class_name(*toolbar_index) == "NSToolbar")
+            if (const auto made = instantiate(kit, load, *toolbar_index, coder)) kit.send_id(window_object, "setToolbar:", {made});
         for (const auto& [key, selector] : {std::pair<const char*, const char*>{"NSWindowContentMinSize", "setContentMinSize:"},
                                             {"NSWindowContentMaxSize", "setContentMaxSize:"}, {"NSMinSize", "setMinSize:"},
                                             {"NSMaxSize", "setMaxSize:"}, {"NSMinFullScreenContentSize", "setMinFullScreenContentSize:"},
@@ -394,9 +439,36 @@ Address instantiate(AppKit& kit, const std::shared_ptr<NibLoad>& load, std::uint
     }
     const auto cls = kit.objc.find_class(cls_name);
     if (!cls) fail("nib object class " + cls_name + " does not exist");
+    auto& coder_state = *kit.objc.host_state<CoderState>(coder);
+    // A storyboard creator block makes the scene controller from the coder (nil: as usual).
+    if (load->creator && load->scene == index) {
+        load->creating.insert(index);
+        coder_state.stack.push_back(index);
+        Address created{};
+        try { created = kit.invoke_block(load->creator, {coder}); } catch (...) {
+            coder_state.stack.pop_back();
+            load->creating.erase(index);
+            throw;
+        }
+        coder_state.stack.pop_back();
+        load->creating.erase(index);
+        if (created) {
+            load->made.emplace(index, kit.retain(created));   // the block's result is not owned
+            load->order.push_back(index);
+            keep_view_externals(kit, load, index, created, coder);
+            return created;
+        }
+    }
+    // Swapped classes Interface Builder marks to be made with -init (Rectangle's
+    // application delegate) are not decoded.
+    if (name == "NSClassSwapper" && archive.find(index, "NSInitializeWithInit") && archive.find(index, "NSInitializeWithInit")->integer) {
+        const auto object = kit.alloc_init(cls);
+        load->made.emplace(index, object);
+        load->order.push_back(index);
+        return object;
+    }
     const auto object = kit.send(cls, "alloc").x0;
     load->made.emplace(index, object);   // cycles (superview <-> subviews) see the allocated object
-    auto& coder_state = *kit.objc.host_state<CoderState>(coder);
     coder_state.stack.push_back(index);
     Address result{};
     try {
@@ -422,6 +494,7 @@ Address instantiate(AppKit& kit, const std::shared_ptr<NibLoad>& load, std::uint
     coder_state.stack.pop_back();
     if (result != object) load->made[index] = result;
     load->order.push_back(index);
+    keep_view_externals(kit, load, index, result, coder);
     return result;
 }
 
@@ -528,10 +601,16 @@ std::vector<Address> run_load(AppKit& kit, const std::shared_ptr<NibLoad>& load)
     std::vector<Address> top_level;
     try {
         load->graph = nib::read_graph(load->archive);
+        for (const auto& connection : load->graph.connections)
+            if (connection.kind == nib::Connection::Kind::outlet && connection.source == load->graph.root && connection.label == "sceneController")
+                load->scene = connection.destination;
         // Every object the graph lists, then whatever they reference.
         for (const auto& [child, parent] : load->graph.parents) {
+            // An archived toolbar decodes the items it shows (its default
+            // items); its other items are only offered to customization,
+            // which is not provided, so they are not made.
+            if (load->archive.class_name(parent) == "NSToolbar") continue;
             static_cast<void>(instantiate(kit, load, child, coder));
-            static_cast<void>(parent);
         }
         for (const auto window_index : load->graph.visible_windows) static_cast<void>(instantiate(kit, load, window_index, coder));
         // Connections.
@@ -613,9 +692,14 @@ std::vector<Address> run_load(AppKit& kit, const std::shared_ptr<NibLoad>& load)
 } // namespace
 
 std::vector<Address> AppKit::load_nib(std::span<const std::uint8_t> bytes, Address owner) {
+    return load_nib(bytes, owner, NibOptions{});
+}
+std::vector<Address> AppKit::load_nib(std::span<const std::uint8_t> bytes, Address owner, const NibOptions& options) {
     auto load = std::make_shared<NibLoad>();
     load->archive = nib::Archive::parse_any(bytes);   // NIBArchive or keyed archive (bplist)
     load->owner = owner;
+    load->externals = options.externals;
+    load->creator = options.creator;
     return run_load(*this, load);
 }
 
@@ -803,6 +887,7 @@ void AppKit::install_nib() {
                     if (!bytes) fail("the main nib " + text(main_nib) + " is missing from the bundle");
                     static_cast<void>(load_nib(*bytes, shared));
                 }
+                static_cast<void>(load_main_storyboard(bundle, shared));   // NSMainStoryboardFile (storyboard.cpp)
             }
             static_cast<void>(send(shared, "run"));
             s.x[0] = 0;
@@ -901,6 +986,55 @@ void AppKit::install_nib_coding() {
         }
         release(s.x[0]);
         s.x[0] = retain(make_cursor(kind));
+    });
+    // NSToolbar (as Interface Builder archives a window's toolbar): its
+    // settings and its default items (NSToolbarIBDefaultItems), which it shows
+    // without a delegate. The other items Interface Builder lists
+    // (NSToolbarIBIdentifiedItems, NSToolbarIBAllowedItems,
+    // NSToolbarIBSelectableItems) appear only through customization, which is
+    // not provided: they are not decoded, and inserting one by identifier
+    // fails as for any toolbar without a delegate. A centered item identifier
+    // fails explicitly.
+    method(toolbar, "initWithCoder:", [this, access](CpuState& s, GuestMemory&) {
+        const auto a = access(s.x[2]);
+        const auto self = send_id(s.x[0], "initWithIdentifier:", {a.object("NSToolbarIdentifier")});
+        s.x[0] = self;
+        if (const auto delegate = a.object("NSToolbarDelegate")) static_cast<void>(send_id(self, "setDelegate:", {delegate}));
+        static_cast<void>(send_id(self, "setVisible:", {static_cast<Address>(a.flag("NSToolbarPrefersToBeShown", true))}));
+        static_cast<void>(send_id(self, "setAllowsUserCustomization:", {static_cast<Address>(a.flag("NSToolbarAllowsUserCustomization"))}));
+        static_cast<void>(send_id(self, "setAutosavesConfiguration:", {static_cast<Address>(a.flag("NSToolbarAutosavesConfiguration"))}));
+        static_cast<void>(send_id(self, "setDisplayMode:", {static_cast<Address>(a.integer("NSToolbarDisplayMode", 0))}));
+        static_cast<void>(send_id(self, "setSizeMode:", {static_cast<Address>(a.integer("NSToolbarSizeMode", 0))}));
+        if (a.object("NSToolbarCenteredItemIdentifier")) unsupported("archived NSToolbar with a centered item identifier");
+        if (const auto defaults = a.object("NSToolbarIBDefaultItems"))
+            for (const auto item : items(defaults)) static_cast<void>(send_id(self, "_alchemyAppendArchivedItem:", {item}));
+    });
+    // NSToolbarItem: its identifier, texts, image or view, target and action,
+    // sizes and states. Not read: NSToolbarItemNavigational and
+    // NSToolbarIsUserRemovable (customization), NSToolbarItemIgnoreMinMaxSizes.
+    method(toolbar_item, "initWithCoder:", [this, access](CpuState& s, GuestMemory&) {
+        const auto a = access(s.x[2]);
+        const auto self = send_id(s.x[0], "initWithItemIdentifier:", {a.object("NSToolbarItemIdentifier")});
+        s.x[0] = self;
+        for (const auto& [key, setter] : {std::pair<const char*, const char*>{"NSToolbarItemLabel", "setLabel:"},
+                                          {"NSToolbarItemPaletteLabel", "setPaletteLabel:"}, {"NSToolbarItemToolTip", "setToolTip:"},
+                                          {"NSToolbarItemImage", "setImage:"}, {"NSToolbarItemView", "setView:"},
+                                          {"NSToolbarItemTitle", "setTitle:"}, {"NSToolbarItemTarget", "setTarget:"},
+                                          {"NSToolbarItemMenuFormRepresentation", "setMenuFormRepresentation:"}})
+            if (const auto value = a.object(key)) static_cast<void>(send_id(self, setter, {value}));
+        if (const auto action = a.string("NSToolbarItemAction")) static_cast<void>(send_id(self, "setAction:", {sel(*action)}));
+        for (const auto& [key, setter] : {std::pair<const char*, const char*>{"NSToolbarItemMinSize", "setMinSize:"}, {"NSToolbarItemMaxSize", "setMaxSize:"}})
+            if (const auto size = a.rect(key)) {
+                CallRegs registers;
+                put_size(registers, 0, size->size);
+                static_cast<void>(send(self, setter, registers));
+            }
+        static_cast<void>(send_id(self, "setBordered:", {static_cast<Address>(a.flag("NSToolbarItemBordered"))}));
+        static_cast<void>(send_id(self, "setEnabled:", {static_cast<Address>(a.flag("NSToolbarItemEnabled", true))}));
+        static_cast<void>(send_id(self, "setAutovalidates:", {static_cast<Address>(a.flag("NSToolbarItemAutovalidates", true))}));
+        static_cast<void>(send_id(self, "setTag:", {static_cast<Address>(a.integer("NSToolbarItemTag", 0))}));
+        static_cast<void>(send_id(self, "setVisibilityPriority:", {static_cast<Address>(a.integer("NSToolbarItemVisibilityPriority", 0))}));
+        static_cast<void>(send_id(self, "setStyle:", {static_cast<Address>(a.integer("NSToolbarItemStyle", 0))}));
     });
     // NSObject-level default: plain -init (placeholders' guest classes).
     method(responder, "initWithCoder:", [this](CpuState& s, GuestMemory&) { s.x[0] = send(s.x[0], "init").x0; });

@@ -339,6 +339,57 @@ magnification 1; another magnification stops explicitly).
 NSUserDefaultsController applies changes immediately even when a nib says
 NSAppliesImmediately NO (deferred application is not modelled).
 
+**Archived toolbars:** a window template's toolbar (archived under
+NSViewClass) is decoded with its settings and its default items, which it
+shows without a delegate. The other items Interface Builder lists for it are
+offered only to customization, which is not provided: they are not made, and
+inserting one by identifier fails as for any toolbar without a delegate. A
+centered item identifier stops explicitly.
+
+**Storyboards (`storyboard.cpp`):** NSStoryboard and NSStoryboardSegue over
+compiled storyboards. Apple does not document the compiled form; what is read
+is what a released application's .storyboardc holds (Rectangle 2.0.4, MIT
+licensed), and anything else is refused rather than guessed.
+* `+storyboardWithName:bundle:` finds `<name>.storyboardc` like any resource
+  (Base.lproj included). Its Info.plist may hold NSStoryboardVersion (1), the
+  identifier-to-scene-nib table, Interface Builder's identifier ids and the
+  main menu scene. Any other key or version stops explicitly. The key for an
+  initial controller has not been seen, so a storyboard with one is refused,
+  and `-instantiateInitialController` answers nil for the storyboards that
+  open.
+* `-instantiateControllerWithIdentifier:` (and the `creator:` variants) loads
+  the scene's nib:
+  * the scene's controller (its swapped class) comes back autoreleased and
+    keeps the scene's other top-level objects;
+  * an unknown identifier raises;
+  * `-storyboard` is set;
+  * a window controller whose window came from the scene gets
+    `-windowDidLoad`;
+  * a creator block makes the controller from the coder, and a nil result
+    means the default initialization.
+* A view controller's view loads lazily from its own nib in the .storyboardc
+  (NSNibName). The scene objects that nib refers to are passed as external
+  objects (NSExternalObjectsTableForViewLoading). A runtime attribute sets a
+  window's content view controller.
+* The nib loader resolves external placeholders from the loader's table. It
+  also makes an NSApplication placeholder's IBMainMenu the main menu, and makes
+  class swappers marked NSInitializeWithInit with -init (an application
+  delegate in a main menu scene).
+* NSApplicationMain with NSMainStoryboardFile loads the main menu scene (NSApp
+  the File's Owner) and keeps the storyboard as `+mainStoryboard`.
+* Segues: no sample has segue templates, so a scene archiving a segue key
+  stops explicitly. `-performSegueWithIdentifier:sender:` raises as for an
+  identifier the controller has no segue for.
+  `-shouldPerformSegueWithIdentifier:sender:` answers YES, and
+  `-prepareForSegue:sender:` does nothing (override points). NSStoryboardSegue
+  keeps its identifier and controllers, and its `-perform` runs the perform
+  handler.
+* Tests: `tests/storyboard_tests.cpp` (in `alchemy_gui_appkit_windows`):
+  * project-authored scenes with the same layout;
+  * Rectangle's own LogViewer and Main storyboards, with stand-ins for its
+    Swift classes, when the app is installed under C:\dev\apps-wave\storyboard
+    (else skipped).
+
 ## Moved from darwin/identities/
 
 * `constants_and_shells.cpp`: pasteboard, document and notification constants, NSBitsPerPixelFromDepth, NSStatusBar/NSStackView shells (the support kit).

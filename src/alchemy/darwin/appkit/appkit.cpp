@@ -415,6 +415,7 @@ void AppKit::install() {
     install_documents();
     install_user_defaults_controller();
     install_nib();
+    install_storyboards();   // after the nib loader and the controllers
 }
 
 } // namespace appkit

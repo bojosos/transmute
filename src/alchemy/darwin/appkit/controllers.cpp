@@ -28,8 +28,9 @@ void AppKit::install_controllers() {
     const auto cs = [this](Address value) { return objc.host_state<ControllerState>(value); };
     const auto release_all = [this](ControllerState& state) {
         for (auto* slot : {&state.window, &state.view, &state.nib_name, &state.nib_bundle, &state.title, &state.represented,
-                 &state.autosave_name, &state.identifier, &state.content_view_controller})
+                 &state.autosave_name, &state.identifier, &state.content_view_controller, &state.storyboard})
             release(std::exchange(*slot, 0));
+        state.view_externals.clear();
         for (const auto child : std::exchange(state.children, {})) release(child);
         for (const auto object : std::exchange(state.top_level, {})) release(object);
         for (const auto controller : std::exchange(state.presented, {})) release(controller);
@@ -37,15 +38,24 @@ void AppKit::install_controllers() {
     };
     // Loads nib `name` from `bundle` with `owner` as File's Owner, keeping
     // its top-level objects in the controller.
+    // A storyboard scene's controller (storyboard.cpp) loads its view's nib
+    // from the .storyboardc, with the storyboard and the scene objects the
+    // nib refers to as its external objects.
     const auto load = [this, cs](Address self, Address owner) {
         const auto state = cs(self);
         if (!state->nib_name) return false;
         const auto name = text(state->nib_name);
-        const auto bytes = read_nib_file(state->nib_bundle, name);
-        if (!bytes) fail("nib '" + name + "' was not found in the controller's bundle");
+        const auto storyboard = state->storyboard;
+        const auto bytes = storyboard ? storyboard_nib(storyboard, name) : read_nib_file(state->nib_bundle, name);
+        if (!bytes) fail("nib '" + name + "' was not found in the controller's " + (storyboard ? "storyboard" : "bundle"));
+        NibOptions options;
+        if (storyboard) {
+            options.externals.emplace("NSStoryboardPlaceholder", storyboard);
+            for (const auto& [identifier, object] : state->view_externals) options.externals[identifier] = object;
+        }
         state->loading = true;
         std::vector<Address> objects;
-        try { objects = load_nib(*bytes, owner ? owner : self); } catch (...) { cs(self)->loading = false; throw; }
+        try { objects = load_nib(*bytes, owner ? owner : self, options); } catch (...) { cs(self)->loading = false; throw; }
         const auto after = cs(self);
         after->loading = false;
         after->top_level.insert(after->top_level.end(), objects.begin(), objects.end());
@@ -179,7 +189,13 @@ void AppKit::install_controllers() {
         release(std::exchange(state->nib_name, s.x[2] ? cf.copy(s.x[2]) : 0));
         assign(state->nib_bundle, s.x[3]);
     });
-    method(vc, "initWithCoder:", [this](CpuState& s, GuestMemory&) { s.x[0] = send_id(s.x[0], "initWithNibName:bundle:", {0, 0}); });
+    // Archived controllers: NSNibName names the view's nib (a storyboard scene's is in its .storyboardc).
+    method(vc, "initWithCoder:", [this](CpuState& s, GuestMemory&) {
+        const auto coder = s.x[2];
+        const auto key = auto_string("NSNibName");
+        const auto nib_name = coder && send_bool(coder, "containsValueForKey:", {key}) ? send_id(coder, "decodeObjectForKey:", {key}) : 0;
+        s.x[0] = send_id(s.x[0], "initWithNibName:bundle:", {nib_name, 0});
+    });
     method(vc, "dealloc", [this, release_all](CpuState& s, GuestMemory&) {
         if (const auto state = objc.find_host_state<ControllerState>(s.x[0])) release_all(*state);
         static_cast<void>(objc.send_super(s.x[0], view_controller, sel("dealloc")));
@@ -424,8 +440,7 @@ void AppKit::install_controllers() {
     }, "v@:@");
     method(vc, "sourceItemView", [cs](CpuState& s, GuestMemory&) { s.x[0] = cs(s.x[0])->source_item_view; });
     method(vc, "setSourceItemView:", [cs](CpuState& s, GuestMemory&) { cs(s.x[0])->source_item_view = s.x[2]; }, "v@:@");
-    // Controllers are not loaded from storyboards here (NSStoryboard is not provided).
-    method(vc, "storyboard", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    // -storyboard and segues: storyboard.cpp.
     // Swaps one child's view for another's in place (the transition options' animations are not run: the change applies at once).
     method(vc, "transitionFromViewController:toViewController:options:completionHandler:", [this, cs](CpuState& s, GuestMemory&) {
         const auto self = s.x[0], from = s.x[2], to = s.x[3], completion = s.x[5];

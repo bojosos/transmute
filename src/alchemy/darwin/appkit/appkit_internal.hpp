@@ -334,6 +334,12 @@ struct ControllerState final : ResponderState {
     Address nib_name{}, nib_bundle{}, title{}, represented{}, autosave_name{};   // +1
     Address identifier{}, content_view_controller{};   // +1
     Address owner{}, document{}, parent{};    // not retained
+    // Storyboard scenes (storyboard.cpp): the storyboard (+1), and the scene
+    // objects the view's nib refers to by external identifier
+    // (NSExternalObjectsTableForViewLoading; not retained: the controller
+    // itself or objects it keeps).
+    Address storyboard{};
+    std::vector<std::pair<std::string, Address>> view_externals;
     std::vector<Address> children;            // +1 child view controllers
     std::vector<Address> top_level;           // +1 top-level objects of the loaded nib
     // NSViewController presentation: the controllers this one presented
@@ -689,6 +695,22 @@ struct AppKit : std::enable_shared_from_this<AppKit> {
     std::vector<Address> load_nib(std::span<const std::uint8_t> bytes, Address owner);
     // The bytes of nib `name` in `bundle` (nil: the main bundle).
     std::optional<std::vector<std::uint8_t>> read_nib_file(Address bundle, std::string_view name);
+    // A nib load's storyboard additions: the objects external placeholders
+    // (NSNibExternalObjectPlaceholder) stand for, by identifier, and a block
+    // that makes the scene's controller (-instantiateController...creator:).
+    struct NibOptions {
+        std::map<std::string, Address> externals;
+        Address creator{};
+    };
+    std::vector<Address> load_nib(std::span<const std::uint8_t> bytes, Address owner, const NibOptions& options);
+    // NSStoryboard and NSStoryboardSegue (storyboard.cpp).
+    void install_storyboards();
+    // The bytes of the compiled nib `name` inside `storyboard`'s .storyboardc.
+    std::optional<std::vector<std::uint8_t>> storyboard_nib(Address storyboard, std::string_view name);
+    // NSApplicationMain with NSMainStoryboardFile: opens the main storyboard
+    // and loads its main menu scene (NSApp the File's Owner); nil without one.
+    Address load_main_storyboard(Address bundle, Address application);
+    std::function<Address(Address bundle)> main_storyboard_hook;   // storyboard.cpp
 
     // ---- software drawing (graphics.cpp) ------------------------------------------------
     // Registers a method and returns its IMP.

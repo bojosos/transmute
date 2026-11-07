@@ -1084,6 +1084,7 @@ void auto_layout_tests() {
     layout_guides_and_safe_areas(f);
     split_views_and_controllers(f);
     presentation_editing_rotation(f);
+    storyboards(f);   // last: it adds NSObject's key-value coding
 }
 
 } // namespace windows_appkit_tests

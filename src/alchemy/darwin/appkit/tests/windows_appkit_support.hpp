@@ -67,6 +67,8 @@ struct Fixture {
 };
 
 void expect_frame(Fixture& f, Address view_object, alchemy::gui::Rect wanted, const std::string& what);
+// NSStoryboard and NSStoryboardSegue (storyboard_tests.cpp).
+void storyboards(Fixture& f);
 
 // Builds NIBArchive files value by value (objects are declared first so
 // references can point forward).
