@@ -21,7 +21,34 @@ typedef unsigned long clock_t;
 struct timespec { time_t tv_sec; long tv_nsec; };
 struct timeval { long tv_sec; int tv_usec; };
 struct tm { int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst; long tm_gmtoff; char* tm_zone; };
-typedef struct alchemy_file FILE;
+typedef long long fpos_t;
+struct __sbuf { unsigned char* _base; int _size; };
+struct __sFILEX;
+/* Darwin's public stdio FILE (struct __sFILE in the open-source Libc's
+   stdio.h, from BSD stdio). The name matters beyond C: Swift mangles it into
+   the Darwin overlay's stdin/stdout/stderr ($s6Darwin6stderrSpySo7__sFILEVGvg). */
+typedef struct __sFILE {
+    unsigned char* _p; int _r; int _w; short _flags; short _file; struct __sbuf _bf; int _lbfsize;
+    void* _cookie; int (*_close)(void*); int (*_read)(void*, char*, int); fpos_t (*_seek)(void*, fpos_t, int);
+    int (*_write)(void*, const char*, int); struct __sbuf _ub; struct __sFILEX* _extra; int _ur;
+    unsigned char _ubuf[3]; unsigned char _nbuf[1]; struct __sbuf _lb; int _blksize; fpos_t _offset;
+} FILE;
+/* The LP64 layout: guest code that uses stdio's inline accessors reads these fields. */
+#ifdef __cplusplus
+#define ALCHEMY_STATIC_ASSERT(condition, message) static_assert(condition, message)
+#else
+#define ALCHEMY_STATIC_ASSERT(condition, message) _Static_assert(condition, message)
+#endif
+ALCHEMY_STATIC_ASSERT(sizeof(struct __sbuf) == 16, "struct __sbuf size");
+ALCHEMY_STATIC_ASSERT(sizeof(FILE) == 152, "FILE size");
+ALCHEMY_STATIC_ASSERT(offsetof(FILE, _r) == 8 && offsetof(FILE, _w) == 12 && offsetof(FILE, _flags) == 16 &&
+    offsetof(FILE, _file) == 18 && offsetof(FILE, _bf) == 24 && offsetof(FILE, _lbfsize) == 40, "FILE buffer fields");
+ALCHEMY_STATIC_ASSERT(offsetof(FILE, _cookie) == 48 && offsetof(FILE, _close) == 56 && offsetof(FILE, _read) == 64 &&
+    offsetof(FILE, _seek) == 72 && offsetof(FILE, _write) == 80, "FILE function fields");
+ALCHEMY_STATIC_ASSERT(offsetof(FILE, _ub) == 88 && offsetof(FILE, _extra) == 104 && offsetof(FILE, _ur) == 112 &&
+    offsetof(FILE, _ubuf) == 116 && offsetof(FILE, _nbuf) == 119 && offsetof(FILE, _lb) == 120 &&
+    offsetof(FILE, _blksize) == 136 && offsetof(FILE, _offset) == 144, "FILE ungetc and line-buffer fields");
+#undef ALCHEMY_STATIC_ASSERT
 extern FILE* __stdinp;
 extern FILE* __stdoutp;
 extern FILE* __stderrp;
