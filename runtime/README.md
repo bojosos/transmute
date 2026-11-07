@@ -90,13 +90,29 @@ Without the runtime, `/usr/lib/libxml2.2.dylib` stays a declaration-only
 identity: programs that link it without calling it still load, and a call
 fails as an unresolved import.
 
+## Guest libxslt and libexslt
+
+`scripts/build_alchemy_libxslt.ps1 -LibXml2Directory <libxml2 runtime>` builds
+libxslt 1.1.45 and libexslt 0.8.25 (MIT) from the sources vendored in
+`third_party/libxslt` (checked against its `PROVENANCE.md`) into
+`artifacts/alchemy-libxslt-arm64`: `libxslt.1.dylib` (install name
+`/usr/lib/libxslt.1.dylib`, compatibility version 3.0.0, current version
+3.45.0) and `libexslt.0.dylib` (`/usr/lib/libexslt.0.dylib`, 9.0.0 and 9.25.0),
+libtool's Darwin versions for these releases. Both link two-level against the
+guest libxml2 runtime, whose output directory supplies the headers. The
+profiler and threads are on; the debugger, modules and EXSLT crypto (which
+needs libgcrypt) are off. The script pins the libSystem imports and fills in
+upstream's `xsltconfig.h.in` and `exsltconfig.h.in`; `runtime/libxslt/config.h`
+replaces the generated configuration header. Run programs with both runtime
+directories (`--runtime-dir <libxslt> --runtime-dir <libxml2>`).
+
 ## Runtime identity allow-list
 
 A Mach-O whose install name lies under `/usr/lib` or `/System/Library` is
 normally rejected, because those identities belong to Alchemy's host
 providers. `include/alchemy/runtime_libraries.hpp` lists the exceptions:
 `libc++.1`, `libc++abi` and `libunwind` from LLVM, `libexpat.1` from Expat,
-and `libxml2.2` from libxml2. Each entry names its upstream repository and build script. The loader
+and `libxml2.2` from libxml2, and `libxslt.1` and `libexslt.0` from libxslt. Each entry names its upstream repository and build script. The loader
 and `doctor` accept an allow-listed identity only when all of these hold:
 
 - The file is found through `--runtime-dir`. `--dylib-dir` and `@rpath` never

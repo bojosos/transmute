@@ -86,7 +86,8 @@ The expanded host profile requires x64 Windows 10 or Windows Server 2016.
 `--runtime-dir` selects independently built ARM64 guest runtime libraries.
 These are LLVM's libc++, libc++abi and libunwind, and Expat's
 `/usr/lib/libexpat.1.dylib` (`scripts/build_alchemy_expat.ps1`), and libxml2's
-`/usr/lib/libxml2.2.dylib` (`scripts/build_alchemy_libxml2.ps1`). Only the
+`/usr/lib/libxml2.2.dylib` (`scripts/build_alchemy_libxml2.ps1`), with libxslt's
+`/usr/lib/libxslt.1.dylib` and `/usr/lib/libexslt.0.dylib` (`scripts/build_alchemy_libxslt.ps1`). Only the
 allow-listed Apple identities are accepted, and only with a matching
 `provenance.json` beside them. See [runtime build instructions](../runtime/README.md#runtime-identity-allow-list).
 Without those libraries, `/usr/lib/libc++.1.dylib` remains a declaration-only
