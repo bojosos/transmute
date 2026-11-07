@@ -266,3 +266,26 @@ groups, actors, `AsyncStream`, task-locals, cancellation, checked continuations 
   bit 63 set for the continuous clock. `DispatchGlobalExecutor.cpp` builds these values itself.
 
 The libSystem, libdispatch and Objective-C runtime providers own these items.
+
+## Swift API under a provider's identity (companions)
+
+Apps built for macOS 14 and later bind Foundation's Swift overlay names
+(`$s10Foundation...`) through `Foundation.framework`'s ordinal, while older
+apps (QLab, min macOS 11) bind them through `/usr/lib/swift/libswiftFoundation.dylib`.
+Foundation.framework is a host provider, so the loader gives it a
+companion: the runtime identity libswiftFoundation (`companion_identity()`
+in runtime_libraries.cpp).
+
+* **Lazy.** An image loads the companion only when one of its imports from
+  the provider is a name the provider lacks. It's loaded from the runtime
+  directories during the dependency load, provenance-checked like any
+  runtime identity, and initialized before the image. Processes without
+  such an import are unchanged.
+* **Order.** Lookups through the provider identity (binding, re-exports,
+  flat namespace, `dlsym`) ask the provider first, then the companion, and
+  only then the diagnostic probe. `dlsym` on a provider handle that misses
+  loads the companion as a `dlopen` would.
+* **Absent companion.** The names stay unresolved, or weak-null, as before.
+* **Doctor.** `doctor --deps` reports the names a companion serves as
+  `guest` under the companion's identity.
+

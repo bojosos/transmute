@@ -277,6 +277,11 @@ const RuntimeLibraryIdentity* runtime_library_identity(std::string_view install_
     return nullptr;
 }
 
+std::string_view companion_identity(std::string_view provider) noexcept {
+    if (provider == "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation") return "/usr/lib/swift/libswiftFoundation.dylib";
+    return {};
+}
+
 std::filesystem::path find_runtime_library(const RuntimeLibraryIdentity& identity,
     std::span<const std::filesystem::path> runtime_directories) {
     const auto filename = utf8_path(identity.install_name).filename();

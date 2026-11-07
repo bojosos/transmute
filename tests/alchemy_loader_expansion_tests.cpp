@@ -54,7 +54,7 @@ std::size_t command(std::vector<std::uint8_t>& bytes, std::uint32_t kind, std::u
     put32(bytes, 20, get32(bytes, 20) + size);
     return at;
 }
-std::vector<std::uint8_t> image(std::uint32_t type = 2, bool tls = false) {
+std::vector<std::uint8_t> image(std::uint32_t type = 2, bool tls = false, std::string_view identity = "@loader_path/unit.dylib") {
     std::vector<std::uint8_t> bytes(0x3000);
     put32(bytes, 0, 0xfeedfacf); put32(bytes, 4, 0x0100000c);
     put32(bytes, 12, type); put32(bytes, 24, 0x85);
@@ -80,8 +80,9 @@ std::vector<std::uint8_t> image(std::uint32_t type = 2, bool tls = false) {
     }
     if (type == 2) { const auto at = command(bytes, 0x80000028, 24); put64(bytes, at + 8, 0x500); }
     if (type == 6) {
-        const auto at = command(bytes, 0xd, 56); put32(bytes, at + 8, 24);
-        text(bytes, at + 24, "@loader_path/unit.dylib");
+        const auto at = command(bytes, 0xd, std::max<std::uint32_t>(56, static_cast<std::uint32_t>((24 + identity.size() + 1 + 7) & ~7ULL)));
+        put32(bytes, at + 8, 24);
+        text(bytes, at + 24, identity);
     }
     put32(bytes, 0x500, 0x528000e0); // mov w0, #7
     put32(bytes, 0x504, 0xd65f03c0); // ret
@@ -390,6 +391,107 @@ void libsystem_unwinder_reexport_tests() {
     expect(other != 0, "non-unwinder libSystem import lost its provider fallback");
 }
 
+// A provider identity's companion (runtime_libraries.hpp companion_identity):
+// Foundation.framework's Swift names come from the guest libswiftFoundation,
+// loaded only for an image importing a name the provider lacks.
+void provider_companion_tests() {
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("alchemy-companion-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(directory / "runtime");
+    std::filesystem::create_directories(directory / "empty-runtime");
+    struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); } } cleanup{directory};
+    const auto write = [&](const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
+        std::ofstream output(path, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        expect(static_cast<bool>(output), "cannot write authored test image"); return path;
+    };
+    constexpr std::string_view foundation = "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation";
+    // Binds each name of `names` from dylib ordinal 1 into consecutive __DATA slots.
+    const auto binds = [](std::initializer_list<std::string_view> names) {
+        std::vector<std::uint8_t> stream{0x11, 0x71, 0};
+        for (const auto name : names) {
+            stream.push_back(0x40);
+            for (const auto byte : name) stream.push_back(static_cast<std::uint8_t>(byte));
+            stream.push_back(0); stream.push_back(0x90);
+        }
+        stream.push_back(0);
+        return stream;
+    };
+    // The companion: binds a provider name itself (no cycle) and exports a name the provider lacks.
+    auto companion = image(6, false, "/usr/lib/swift/libswiftFoundation.dylib");
+    dependency(companion, foundation);
+    exports(companion, "_swift_only", 0, 0x504);
+    classic(companion, {{{}, binds({"_provided"}), {}, {}}});
+    write(directory / "runtime" / "libswiftFoundation.dylib", companion);
+    {
+        std::ofstream provenance(directory / "runtime" / "provenance.json", std::ios::binary);
+        provenance << "{\"source\":\"https://github.com/swiftlang/swift\",\"outputs\":[{\"name\":\"libswiftFoundation.dylib\",\"sha256\":\""
+                   << alchemy::sha256_file(directory / "runtime" / "libswiftFoundation.dylib") << "\"}]}";
+    }
+    auto plain = image(8); dependency(plain, foundation);
+    classic(plain, {{{}, binds({"_provided"}), {}, {}}});
+    const auto plain_source = write(directory / "plain.bundle", plain);
+    auto user = image(8); dependency(user, foundation);
+    exports(user, "_slots", 0, 0x1000);
+    classic(user, {{{}, binds({"_provided", "_swift_only"}), {}, {}}});
+    const auto user_source = write(directory / "user.bundle", user);
+    const auto main = write(directory / "main", image());
+    constexpr std::uint64_t provided = 0xf00d0000ULL;
+    const auto setup = [&](transmute::ReferenceEngine& engine, alchemy::ProcessContext& context) {
+        context.working_directory = directory;
+        context.base_resolver = [](std::string_view library, std::string_view symbol) -> std::optional<std::uint64_t> {
+            if (library == "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation" && symbol == "_provided") return provided;
+            return std::nullopt;
+        };
+        static_cast<void>(engine);
+    };
+    {   // Binding: the provider first, then the companion; only an image that misses loads it.
+        transmute::ReferenceEngine engine(transmute::ExecutionStart{preferred + 0x500});
+        alchemy::ProcessContext context(engine, [](unsigned, std::span<const std::uint8_t> bytes) { return alchemy::OutputResult{bytes.size(), 0}; });
+        setup(engine, context);
+        alchemy::ModuleLoader loader(context, main, {}, {}, {directory / "runtime"});
+        static_cast<void>(loader.load_main());
+        loader.initialize({});
+        const auto images = context.images().size();
+        static_cast<void>(loader.open(plain_source.string(), 2 | 4));
+        expect(context.images().size() == images + 1, "an image without provider misses loaded the companion");
+        fails([&] { static_cast<void>(loader.open("/usr/lib/swift/libswiftFoundation.dylib", 2 | 0x10)); }, "not resident");
+        const auto user_handle = loader.open(user_source.string(), 2 | 4);
+        expect(context.images().size() == images + 3, "the companion was not loaded for a provider miss");
+        const auto companion_handle = loader.open("/usr/lib/swift/libswiftFoundation.dylib", 2 | 4 | 0x10);
+        const auto swift_only = loader.symbol(companion_handle, "swift_only");
+        expect(swift_only && engine.read32(swift_only->address) == 0xd65f03c0, "companion export missing");
+        const auto slots = loader.symbol(user_handle, "slots");
+        expect(slots && engine.read64(slots->address) == provided, "a provider name did not bind to the provider");
+        expect(engine.read64(slots->address + 8) == swift_only->address, "a provider miss did not bind to the companion export");
+        const auto via_provider = loader.symbol(loader.open(std::string(foundation), 2), "swift_only");
+        expect(via_provider && via_provider->address == swift_only->address, "dlsym(Foundation) missed the companion export");
+    }
+    {   // Without the companion in the runtime directories: unresolved, as before.
+        transmute::ReferenceEngine engine(transmute::ExecutionStart{preferred + 0x500});
+        alchemy::ProcessContext context(engine, [](unsigned, std::span<const std::uint8_t> bytes) { return alchemy::OutputResult{bytes.size(), 0}; });
+        setup(engine, context);
+        alchemy::ModuleLoader loader(context, main, {}, {}, {directory / "empty-runtime"});
+        static_cast<void>(loader.load_main());
+        loader.initialize({});
+        static_cast<void>(loader.open(plain_source.string(), 2 | 4));
+        fails([&] { static_cast<void>(loader.open(user_source.string(), 2 | 4)); }, "unresolved strong import");
+        expect(!loader.symbol(loader.open(std::string(foundation), 2), "swift_only"), "a missing companion answered dlsym");
+    }
+    {   // dlsym on a provider handle loads the companion at run time.
+        transmute::ReferenceEngine engine(transmute::ExecutionStart{preferred + 0x500});
+        alchemy::ProcessContext context(engine, [](unsigned, std::span<const std::uint8_t> bytes) { return alchemy::OutputResult{bytes.size(), 0}; });
+        setup(engine, context);
+        alchemy::ModuleLoader loader(context, main, {}, {}, {directory / "runtime"});
+        static_cast<void>(loader.load_main());
+        loader.initialize({});
+        const auto images = context.images().size();
+        const auto found = loader.symbol(loader.open(std::string(foundation), 2), "swift_only");
+        expect(found && engine.read32(found->address) == 0xd65f03c0 && context.images().size() == images + 1,
+               "dlsym(Foundation) did not load the companion");
+    }
+}
+
 void fixture_tests(const std::filesystem::path& main, const std::string& plugin) {
     for (const bool jit : {false, true}) for (const auto base : {preferred, 0x180000000ULL}) {
         alchemy::RunOptions options; options.jit = jit; options.jit_stats = jit; options.load_base = base;
@@ -413,6 +515,7 @@ int main(int argc, char** argv) {
         parser_tests();
         persistent_loader_tests();
         libsystem_unwinder_reexport_tests();
+        provider_companion_tests();
         if (argc == 3) fixture_tests(argv[1], argv[2]);
         else if (argc == 2) {
             const auto inspected = alchemy::MachOImage::load(argv[1]);

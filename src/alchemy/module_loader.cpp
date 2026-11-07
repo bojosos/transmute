@@ -125,6 +125,9 @@ struct ModuleLoader::Implementation {
         std::uint64_t id{};
         std::uint64_t base{};
         std::vector<Module*> dependencies;
+        // Companions of provider dependencies this image binds names from:
+        // initialized before it, like its dependencies.
+        std::vector<Module*> companions;
         std::vector<std::filesystem::path> runpaths;
         bool global{};
         bool initialized{};
@@ -317,7 +320,11 @@ struct ModuleLoader::Implementation {
             const auto path = find_path(dependency.install_name, module);
             if (!path) {
                 if (dependency.install_name == "/usr/lib/libSystem.B.dylib") load_system_unwinder(module);
-                if (provider(dependency.install_name) || dependency.weak) { module->dependencies.push_back(nullptr); continue; }
+                if (provider(dependency.install_name) || dependency.weak) {
+                    module->dependencies.push_back(nullptr);
+                    load_companion(*module, dependency.install_name, static_cast<std::int32_t>(module->dependencies.size()));
+                    continue;
+                }
                 throw std::runtime_error("missing guest dylib: " + dependency.install_name);
             }
             auto* target = load(*path, module, global);
@@ -415,7 +422,50 @@ struct ModuleLoader::Implementation {
                 break;
             }
         }
+        // A resident companion answers what the provider itself lacks, before
+        // any diagnostic probe stub (ALCHEMY_PROBE_MISSING) would.
+        if (auto* companion = resident_companion(library)) {
+            {
+                const ProcessContext::RuntimeLookup lookup;
+                if (auto value = context.resolve(library, name)) return value;
+            }
+            if (auto found = exported(*companion, name)) return found->value;
+        }
         return context.resolve(library, name);
+    }
+
+    Module* resident_companion(std::string_view provider) {
+        const auto identity = companion_identity(provider);
+        if (identity.empty()) return nullptr;
+        for (const auto& module : modules) if (module->image.install_name() == identity) return module.get();
+        return nullptr;
+    }
+
+    // Loads `provider`'s companion for `module` when one of the module's
+    // imports from that dependency (`ordinal`) is a name the provider lacks.
+    // Without the companion in the runtime directories nothing changes: the
+    // names stay unresolved (or weak-null) as before. The companion is
+    // provenance-checked like every runtime identity (load()).
+    void load_companion(Module& module, std::string_view provider, std::int32_t ordinal) {
+        const auto identity = companion_identity(provider);
+        if (identity.empty()) return;
+        if (auto* resident = resident_companion(provider)) {
+            if (resident != &module) module.companions.push_back(resident);   // the companion itself links the provider
+            return;
+        }
+        bool missing = false;
+        {
+            const ProcessContext::RuntimeLookup lookup;   // never a probe stub
+            for (const auto& item : module.image.imports()) {
+                if (item.library_ordinal != ordinal || context.resolve(provider, item.symbol)) continue;
+                missing = true;
+                break;
+            }
+        }
+        if (!missing) return;
+        const auto path = find_path(identity, &module);
+        if (!path) return;
+        module.companions.push_back(load(*path, &module, false));
     }
 
     std::optional<RuntimeExport> global_symbol(std::string_view name, bool all = false,
@@ -697,6 +747,7 @@ struct ModuleLoader::Implementation {
             if (module.initialized || module.initializing == std::this_thread::get_id() || context.requested_exit()) return;
             module.initializing = std::this_thread::get_id();
             dependencies = module.dependencies;
+            dependencies.insert(dependencies.end(), module.companions.begin(), module.companions.end());
             arguments = startup;
         }
         try {
@@ -975,7 +1026,7 @@ std::uint64_t ModuleLoader::open(std::string_view path, unsigned flags, std::uin
 std::optional<RuntimeExport> ModuleLoader::symbol(std::uint64_t handle, std::string_view name,
                                                  std::uint64_t caller) {
     auto& loader = *implementation_;
-    std::lock_guard lock(loader.mutex);
+    std::unique_lock lock(loader.mutex);
     const std::string mangled = "_" + std::string(name);
     std::optional<RuntimeExport> result;
     if (handle == UINT64_MAX - 1) result = loader.global_symbol(mangled); // RTLD_DEFAULT
@@ -1002,8 +1053,19 @@ std::optional<RuntimeExport> ModuleLoader::symbol(std::uint64_t handle, std::str
     } else {
         const auto found = loader.handles.find(handle);
         if (found == loader.handles.end() || found->second.references == 0) throw std::runtime_error("invalid or closed dynamic-library handle");
-        if (!found->second.provider.empty()) result = loader.provider_symbol(found->second.provider, mangled);
-        else if (found->second.module) {
+        if (!found->second.provider.empty()) {
+            const std::string provider = found->second.provider;
+            result = loader.provider_symbol(provider, mangled);
+            // A name the provider lacks at run time: its companion loads now,
+            // as a dlopen of it would (initializers run without the lock).
+            const auto companion = companion_identity(provider);
+            if (!result && !companion.empty() && !loader.resident_companion(provider) && loader.find_path(companion, nullptr)) {
+                lock.unlock();
+                static_cast<void>(open(companion, 2U | 4U, caller));   // RTLD_NOW | RTLD_LOCAL
+                lock.lock();
+                result = loader.provider_symbol(provider, mangled);
+            }
+        } else if (found->second.module) {
             if (found->second.default_scope && !found->second.first) {
                 result = loader.global_symbol(mangled);
                 if (!result) loader.context.set_dlerror("symbol not found: " + std::string(name));

@@ -24,6 +24,14 @@ struct RuntimeLibraryIdentity {
 
 [[nodiscard]] const RuntimeLibraryIdentity* runtime_library_identity(std::string_view install_name) noexcept;
 
+// The runtime identity whose exports answer the names a host-provider identity
+// lacks (its "companion"), or empty. Apps built for macOS 14 and later bind
+// Foundation's Swift overlay ($s10Foundation...) through Foundation.framework
+// itself, older ones through libswiftFoundation. The loader loads a companion
+// only for an image importing a name the provider lacks, and searches it after
+// the provider (docs/ALCHEMY_SWIFT.md).
+[[nodiscard]] std::string_view companion_identity(std::string_view provider) noexcept;
+
 // The file a runtime identity resolves to in the given runtime directories, by
 // the install name's file name. Returns an empty path when none exists.
 [[nodiscard]] std::filesystem::path find_runtime_library(const RuntimeLibraryIdentity& identity,

@@ -117,8 +117,13 @@ public:
             }
             Dependency report{dependency.install_name, "missing", {}, dependency.weak};
             if (target) { report.status = "guest"; report.path = utf8(*target); }
-            else if (ProcessContext::is_provider_library(dependency.install_name)) report.status = "provider";
-            else if (!dependency.weak) unsupported_ = true;
+            else if (ProcessContext::is_provider_library(dependency.install_name)) {
+                report.status = "provider";
+                // The loader's companion of this provider (module_loader.cpp load_companion), when the image
+                // imports a name the provider lacks.
+                add_companion(*selected.image, dependency.install_name,
+                    static_cast<std::int32_t>(selected.dependencies.size() + 1), path, runpaths);
+            } else if (!dependency.weak) unsupported_ = true;
             selected.dependencies.push_back(std::move(report));
             selected.targets.push_back(target);
             if (target && recursive_) add(*target, runpaths);
@@ -144,6 +149,12 @@ public:
                         else if (has_export(*selected->targets[slot], imported.symbol, {})) report.status = "guest";
                     } else if (resident_unwinder(report.library, imported.symbol)) report.status = "guest";
                     else if (context_.resolve(report.library, imported.symbol)) report.status = "provider";
+                    else if (const auto companion = companions_.find(report.library);
+                             companion != companions_.end() && has_export(companion->second, imported.symbol, {})) {
+                        // Served by the companion: reported under its identity.
+                        report.library = std::string(companion_identity(report.library));
+                        report.status = "guest";
+                    }
                 } else if (imported.library_ordinal == 0) {
                     report.library = "self";
                     if (has_export(selected->path, imported.symbol, {})) report.status = "guest";
@@ -302,6 +313,25 @@ private:
         }
         return {};
     }
+    void add_companion(const MachOImage& image, const std::string& provider, std::int32_t ordinal,
+        const std::filesystem::path& loader, const std::vector<std::filesystem::path>& runpaths) {
+        const auto identity = companion_identity(provider);
+        if (identity.empty() || !recursive_ || companions_.contains(provider)) return;
+        bool missing = false;
+        {
+            const ProcessContext::RuntimeLookup lookup;   // never a probe stub
+            for (const auto& item : image.imports()) {
+                if (item.library_ordinal == ordinal && !context_.resolve(provider, item.symbol)) { missing = true; break; }
+            }
+        }
+        if (!missing) return;
+        const auto runtime_failures = runtime_failures_.size();
+        const auto found = locate(identity, loader, runpaths);
+        if (runtime_failures_.size() != runtime_failures) unsupported_ = true;
+        if (!found) return;
+        companions_.emplace(provider, *found);
+        add(*found, runpaths);
+    }
     // Mirrors the loader (module_loader.cpp provider_symbol): libSystem
     // re-exports libunwind, so libSystem imports bind to an inspected
     // resident LLVM libunwind (from --runtime-dir) before the provider.
@@ -338,6 +368,7 @@ private:
     bool recursive_{}, unsupported_{};
     mutable std::vector<std::string> runtime_failures_;
     std::map<std::filesystem::path, std::size_t> indices_;
+    std::map<std::string, std::filesystem::path, std::less<>> companions_;   // provider identity -> inspected companion
     std::vector<std::unique_ptr<Item>> items_;
 };
 
