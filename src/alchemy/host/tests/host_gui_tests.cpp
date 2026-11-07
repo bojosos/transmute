@@ -166,6 +166,41 @@ void media_codecs() {
             std::cout << names(codec) << " encoder: " << other.name << (other.hardware ? " (hardware)" : "") << '\n';
             mc::close(*again);
         }
+        // A profile and level asked for are the stream's (the SPS's profile_idc and level_idc), and an encoder takes
+        // pictures again after a drain (VTCompressionSessionCompleteFrames, then more frames).
+        {
+            auto levelled = settings;
+            levelled.profile = codec == mc::Codec::h264 ? mc::Profile::h264_main : mc::Profile::hevc_main;
+            levelled.level = codec == mc::Codec::h264 ? 31 : 93;   // 3.1
+            const auto again = mc::open_video(levelled);
+            require(static_cast<bool>(again), std::string(names(codec)) + ": main profile, level 3.1 opens");
+            std::vector<mc::Sample> few;
+            for (int i = 0; i < 5; ++i) {
+                mc::Picture p{320, 240, luma.data(), 320, chroma.data(), 320, i * 333333LL, 333333};
+                require(static_cast<bool>(mc::encode(*again, p, false, few)), std::string(names(codec)) + ": level 3.1 encodes");
+            }
+            require(static_cast<bool>(mc::drain(*again, few)) && few.size() == 5, std::string(names(codec)) + ": five samples before the drain");
+            for (int i = 5; i < 10; ++i) {
+                mc::Picture p{320, 240, luma.data(), 320, chroma.data(), 320, i * 333333LL, 333333};
+                require(static_cast<bool>(mc::encode(*again, p, false, few)), std::string(names(codec)) + ": encodes after a drain");
+            }
+            require(static_cast<bool>(mc::drain(*again, few)) && few.size() == 10, std::string(names(codec)) + ": ten samples after a second drain, " +
+                std::to_string(few.size()));
+            // The SPS without its emulation prevention bytes: H.264 profile_idc and level_idc at 1 and 3; HEVC's
+            // general_profile_idc (low 5 bits) and general_level_idc at 3 and 14 (after the 2-byte header).
+            const auto sets_now = mc::parameter_sets(*again);
+            const auto& sps = sets_now.at(codec == mc::Codec::hevc ? 1 : 0);
+            std::vector<std::uint8_t> raw;
+            for (std::size_t i = 0, zeros = 0; i < sps.size(); ++i) {
+                if (zeros >= 2 && sps[i] == 3) { zeros = 0; continue; }
+                raw.push_back(sps[i]);
+                zeros = sps[i] == 0 ? zeros + 1 : 0;
+            }
+            const unsigned profile = codec == mc::Codec::h264 ? raw.at(1) : raw.at(3) & 0x1f, level = codec == mc::Codec::h264 ? raw.at(3) : raw.at(14);
+            require(profile == (codec == mc::Codec::h264 ? 77 : 1) && level == levelled.level,
+                std::string(names(codec)) + ": profile " + std::to_string(profile) + ", level_idc " + std::to_string(level));
+            mc::close(*again);
+        }
         settings.width = 321;
         require(mc::open_video(settings).error() == host::Error::invalid_argument, "odd sizes are refused");
         settings.width = 320;

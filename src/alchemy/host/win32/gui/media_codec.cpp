@@ -245,6 +245,8 @@ public:
         if (FAILED(hr)) return Error::io;
         return pull(output);
     }
+    // Everything the transform holds; then a new stream starts, so it takes input again (an asynchronous one asks
+    // for none until it is told the stream starts, and its earlier requests are void).
     Error drain(const std::function<void(IMFSample*)>& output) {
         static_cast<void>(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0));
         if (FAILED(transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0))) return Error::io;
@@ -253,9 +255,12 @@ public:
             while (!drained) {
                 if (const auto error = next_event(true, output); error != Error::none) return error;
             }
-            return Error::none;
+            need_input = 0;
+        } else if (const auto error = pull(output); error != Error::none) {
+            return error;
         }
-        return pull(output);
+        if (FAILED(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0))) return Error::io;
+        return Error::none;
     }
     void stop() {
         if (transform) {
@@ -553,6 +558,8 @@ Result<VideoEncoder*> open_video(const VideoSettings& settings) {
             case Profile::hevc_main10: out_type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_10); break;
             default: break;
             }
+            // eAVEncH264VLevel and eAVEncH265VLevel are the level_idc values themselves.
+            if (s.level) out_type->SetUINT32(MF_MT_MPEG2_LEVEL, s.level);
             bool typed = SUCCEEDED(d.transform->SetOutputType(d.out_id, out_type.p, 0));
             if (typed) {
                 in_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
