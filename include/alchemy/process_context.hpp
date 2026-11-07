@@ -255,6 +255,11 @@ public:
     // IPC provider passes the child its special ports this way.
     std::function<void(std::uint64_t)> spawn_starting;
     std::function<void(std::uint64_t, std::uint32_t)> spawn_started;
+    // The child's special ports as wire rights (slot, bytes), asked for after the
+    // child exists and before it runs, with the same token and pid; they travel
+    // in its launch specification (ChildLaunch::special_ports). Set by the Mach
+    // IPC provider; a child then adopts them from `child_launch`.
+    std::function<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>(std::uint64_t, std::uint32_t)> spawn_special_ports;
     // Set by DarwinServices (Mach fileports): guest descriptor `fd` described
     // for process `target` (a Windows pid; 0 is this process; empty for a bad
     // or untransferable descriptor), and a new guest descriptor made from a
