@@ -759,6 +759,71 @@ void Machsys::install_libc() {
         const auto segment = find_segment(m, call(libsystem, "__dyld_get_image_header", {0}), "__DATA");
         s.x[0] = segment ? m.read64(segment + 24) + m.read64(segment + 32) : 0;
     });
+    // <mach-o/arch.h>: NXArchInfo {name, cputype, cpusubtype, byteorder, description} (32 bytes), from a
+    // table in guest memory built on first use, with the names and numbers of Apple's open-source cctools
+    // (families first, so CPU_SUBTYPE_MULTIPLE finds the general entry). byteorder: 1 little, 2 big.
+    struct ArchEntry { std::string_view name; std::int32_t type, subtype; std::uint32_t order; std::string_view description; };
+    static constexpr std::array<ArchEntry, 19> arch_entries{{
+        {"i386", 7, 3, 1, "Intel 80x86"}, {"x86_64", 0x01000007, 3, 1, "Intel x86-64"},
+        {"x86_64h", 0x01000007, 8, 1, "Intel x86-64h Haswell"}, {"ppc", 18, 0, 2, "PowerPC"},
+        {"ppc64", 0x01000012, 0, 2, "PowerPC 64-bit"}, {"arm", 12, 0, 1, "ARM"}, {"arm64", 0x0100000c, 0, 1, "ARM64"},
+        {"arm64_32", 0x0200000c, 1, 1, "arm64_32_v8"}, {"any", -1, -1, 0, "Architecture Independent"},
+        {"little", -1, 0, 1, "Little Endian"}, {"big", -1, 1, 2, "Big Endian"},
+        {"armv6", 12, 6, 1, "arm v6"}, {"armv7", 12, 9, 1, "arm v7"}, {"armv7s", 12, 11, 1, "arm v7s"},
+        {"armv7k", 12, 12, 1, "arm v7k"}, {"armv7m", 12, 15, 1, "arm v7m"}, {"armv7em", 12, 16, 1, "arm v7em"},
+        {"arm64v8", 0x0100000c, 1, 1, "arm64v8"}, {"arm64e", 0x0100000c, 2, 1, "arm64e"},
+    }};
+    const auto arch_state = std::make_shared<std::pair<std::once_flag, Address>>();
+    const auto arch_entry = [this, arch_state](GuestMemory& m, std::size_t index) -> Address {
+        std::call_once(arch_state->first, [&] {
+            std::uint64_t size = arch_entries.size() * 32;
+            for (const auto& entry : arch_entries) size += entry.name.size() + entry.description.size() + 2;
+            const auto table = process.allocate_guest(size, 16);
+            auto strings = table + arch_entries.size() * 32;
+            const auto text = [&m, &strings](std::string_view value) {
+                const auto at = strings;
+                m.write_bytes(at, {reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
+                m.write8(at + value.size(), 0);
+                strings += value.size() + 1;
+                return at;
+            };
+            for (std::size_t at = 0; at < arch_entries.size(); ++at) {
+                const auto& entry = arch_entries[at];
+                const auto record = table + at * 32;
+                m.write64(record, text(entry.name));
+                m.write32(record + 8, static_cast<std::uint32_t>(entry.type));
+                m.write32(record + 12, static_cast<std::uint32_t>(entry.subtype));
+                m.write32(record + 16, entry.order);
+                m.write32(record + 20, 0);
+                m.write64(record + 24, text(entry.description));
+            }
+            arch_state->second = table;
+        });
+        return arch_state->second + index * 32;
+    };
+    // NXGetLocalArchInfo: this machine is arm64 (no pointer authentication, so not arm64e).
+    raw(libsystem, "_NXGetLocalArchInfo", [arch_entry](CpuState& s, GuestMemory& m) { s.x[0] = arch_entry(m, 6); });
+    raw(libsystem, "_NXGetArchInfoFromName", [this, arch_entry](CpuState& s, GuestMemory& m) {
+        const auto name = read_cstring(m, s.x[0], 64);
+        s.x[0] = 0;
+        for (std::size_t at = 0; at < arch_entries.size(); ++at)
+            if (arch_entries[at].name == name) { s.x[0] = arch_entry(m, at); return; }
+    });
+    // NXGetArchInfoFromCpuType(cputype, cpusubtype): the entry of that type whose subtype matches without
+    // its capability bits (CPU_SUBTYPE_MASK), or the type's first entry for CPU_SUBTYPE_MULTIPLE (-1);
+    // NULL for a subtype the table does not know.
+    raw(libsystem, "_NXGetArchInfoFromCpuType", [arch_entry](CpuState& s, GuestMemory& m) {
+        const auto type = static_cast<std::int32_t>(s.x[0]), subtype = static_cast<std::int32_t>(s.x[1]);
+        constexpr std::uint32_t capabilities = 0xff000000U;
+        s.x[0] = 0;
+        for (std::size_t at = 0; at < arch_entries.size(); ++at) {
+            const auto& entry = arch_entries[at];
+            if (entry.type == type && (subtype == -1 ||
+                    (static_cast<std::uint32_t>(entry.subtype) & ~capabilities) == (static_cast<std::uint32_t>(subtype) & ~capabilities))) {
+                s.x[0] = arch_entry(m, at); return;
+            }
+        }
+    });
     // kevent64: DarwinServices (net/sockets.cpp).
     // Generic (libatomic) __atomic_load(size, src, dest, order) and
     // __atomic_store(size, dest, src, order): one lock serializes them, which

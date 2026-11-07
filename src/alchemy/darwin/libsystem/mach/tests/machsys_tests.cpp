@@ -190,6 +190,18 @@ void libc(Fixture& f) {
     require(f.call(sys, "_getsectdatafromheader_64", {header, f.text("__TEXT"), f.text("__text"), size}) == 0x100004000 &&
             f.engine.read64(size) == 0x1234, "getsectdatafromheader_64");
     require(f.call(sys, "_getsectbynamefromheader_64", {header, f.text("__DATA"), f.text("__data")}) == 0, "missing section");
+    // <mach-o/arch.h>: NXArchInfo {name, cputype, cpusubtype, byteorder, description}.
+    const auto local = f.call(sys, "_NXGetLocalArchInfo");
+    require(local && f.read_text(f.engine.read64(local)) == "arm64" && f.engine.read32(local + 8) == 0x0100000c &&
+            f.engine.read32(local + 16) == 1, "NXGetLocalArchInfo is arm64, little-endian");
+    require(f.call(sys, "_NXGetArchInfoFromName", {f.text("arm64")}) == local, "NXGetArchInfoFromName(arm64)");
+    const auto x86 = f.call(sys, "_NXGetArchInfoFromCpuType", {0x01000007, 0x80000003});   // x86_64 with CPU_SUBTYPE_LIB64
+    require(x86 && f.read_text(f.engine.read64(x86)) == "x86_64", "NXGetArchInfoFromCpuType ignores capability bits");
+    require(f.read_text(f.engine.read64(f.call(sys, "_NXGetArchInfoFromCpuType", {0x0100000c, 2}))) == "arm64e" &&
+            f.read_text(f.engine.read64(f.call(sys, "_NXGetArchInfoFromCpuType", {12, 0xffffffffULL}))) == "arm",
+            "NXGetArchInfoFromCpuType subtypes and CPU_SUBTYPE_MULTIPLE");
+    require(f.call(sys, "_NXGetArchInfoFromCpuType", {0x0100000c, 77}) == 0 && f.call(sys, "_NXGetArchInfoFromName", {f.text("vax")}) == 0,
+            "unknown architectures are NULL");
     // ilogbf (float in s0).
     alchemy::CallRegs registers{};
     registers.set_s(0, 8.0f);
