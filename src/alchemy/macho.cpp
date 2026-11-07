@@ -943,9 +943,13 @@ MachOImage MachOImage::parse_omitting(std::span<const std::uint8_t> bytes,
                 const auto& segment = image.segments_[segment_index];
                 const auto raw = file.u64(add(segment.file_offset, offset));
                 const auto target = raw & 0x00ffffffffffffffULL;
+                // Go's linker rebases one-past-the-end pointers (runtime.end, etext), so a target equal to a
+                // segment's end is accepted, as dyld does.
                 if (target < image.preferred_base_ ||
-                    !std::any_of(image.segments_.begin(), image.segments_.end(),
-                        [&](const auto& candidate) { return contains(candidate, target, 1); })) {
+                    !std::any_of(image.segments_.begin(), image.segments_.end(), [&](const auto& candidate) {
+                        return contains(candidate, target, 1) ||
+                               (!pagezero(candidate) && target == candidate.address + candidate.size);
+                    })) {
                     invalid("classic rebase target outside mapped image");
                 }
                 Fixup fixup;

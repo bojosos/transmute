@@ -136,6 +136,16 @@ void parser_tests() {
     });
     expect(engine.read64(preferred + 0x1000) == preferred + 0x500, "classic rebasing failed");
     expect(engine.read64(preferred + 0x1008) == 0x500000000ULL, "classic signed binding addend failed");
+    // A classic rebase may point one past a segment's end (Go's runtime.end); one byte further, or anywhere below
+    // the image base (the __PAGEZERO range), is still refused.
+    const auto rebased_to = [&](std::uint64_t target) { auto copy = bytes; put64(copy, 0x1000, target); return copy; };
+    auto image_end = alchemy::MachOImage::parse(rebased_to(preferred + 0x3000));
+    transmute::ReferenceEngine end_engine(transmute::ExecutionStart{preferred + 0x500});
+    image_end.map(end_engine, preferred);
+    image_end.bind(end_engine, preferred, [](auto, auto, auto) -> std::optional<std::uint64_t> { return 0x500000001ULL; });
+    expect(end_engine.read64(preferred + 0x1000) == preferred + 0x3000, "one-past-the-end classic rebase failed");
+    fails([&] { static_cast<void>(alchemy::MachOImage::parse(rebased_to(preferred + 0x3001))); }, "classic rebase target outside");
+    fails([&] { static_cast<void>(alchemy::MachOImage::parse(rebased_to(0x1000))); }, "classic rebase target outside");
     auto invalid_ordinal = bytes; invalid_ordinal[0x2080] = 0x12;
     fails([&] { static_cast<void>(alchemy::MachOImage::parse(invalid_ordinal)); }, "ordinal");
     auto truncated = bytes; put32(truncated, 32 + get32(truncated, 20) - 48 + 12, 2);
