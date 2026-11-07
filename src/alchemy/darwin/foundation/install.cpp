@@ -12,6 +12,7 @@
 namespace alchemy::gui::completion_kit {
 void install_streams(Support& support);          // streams.cpp
 void install_url_components(Support& support);   // url_components.cpp
+void install_ubiquitous_store_and_item_providers(Support& support);   // kvs_and_item_providers.cpp
 } // namespace alchemy::gui::completion_kit
 namespace alchemy::gui::completion_kit::data {
 void install_strings_more(Support& support);       // strings_more.cpp
@@ -84,6 +85,7 @@ void install_foundation_kvc_collections_and_queues(support_kit::Support& support
     completion_kit::install_kvc_collections(support);
     completion_kit::install_notification_queue(support);
     completion_kit::install_value_transformers(support);
+    completion_kit::install_ubiquitous_store_and_item_providers(support);
 }
 
 void install_foundation_files_and_bundles(support_kit::Support& support) {

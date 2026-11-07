@@ -7,7 +7,10 @@
   JSON, property lists, keyed archives and coding, XML, KVC, KVO (kvo.cpp,
   the one implementation), notification queues, block notification
   observers and distributed notifications, undo, invocations, exceptions,
-  bundles, file manager additions and Cocoa scripting.
+  bundles, file manager additions and Cocoa scripting;
+  NSUbiquitousKeyValueStore as a local per-application store (no iCloud:
+  nothing is shared and no external change is ever posted) and
+  NSItemProvider within this process (kvs_and_item_providers.cpp).
 - **Also here for now:** libobjc's associated objects (objc_assoc.cpp). They
   belong to the Objective-C runtime (src/alchemy/objc/), which stays put in
   this wave.

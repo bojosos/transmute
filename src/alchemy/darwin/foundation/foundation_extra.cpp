@@ -1249,6 +1249,13 @@ struct Extra {
         }, false, "B@:^cQ");
         method(u, "lastPathComponent", [this](auto& state, auto&) { state.x[0] = auto_string(last_component(cf.url_path(state.x[0]))); });
         method(u, "pathExtension", [this](auto& state, auto&) { state.x[0] = auto_string(path_extension(cf.url_path(state.x[0]))); });
+        // The path's components, "/" first for an absolute path (file URL paths carry no trailing slash).
+        method(u, "pathComponents", [this](auto& state, auto&) {
+            const auto value = cf.url_path(state.x[0]);
+            auto parts = components(value);
+            if (value.starts_with('/')) parts.insert(parts.begin(), "/");
+            state.x[0] = autorelease(string_array(parts));
+        });
         method(u, "URLByAppendingPathComponent:", [this](auto& state, auto&) { state.x[0] = autorelease(url_for(append_component(cf.url_path(state.x[0]), text(state.x[2])), std::nullopt)); });
         method(u, "URLByAppendingPathComponent:isDirectory:", [this](auto& state, auto&) { state.x[0] = autorelease(url_for(append_component(cf.url_path(state.x[0]), text(state.x[2])), (state.x[3] & 0xff) != 0)); }, false, "@@:@B");
         method(u, "URLByDeletingLastPathComponent", [this](auto& state, auto&) { state.x[0] = autorelease(url_for(delete_last_component(cf.url_path(state.x[0])), true)); });
