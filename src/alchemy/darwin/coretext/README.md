@@ -59,7 +59,19 @@ spaced to the delegate's width (so line breaking sees it), the run takes the
 delegate's ascent and descent and draws nothing; the delegate's dealloc runs
 when it is released. Font collections keep query and exclusion descriptors
 (mutable copies, matching less the excluded names, font attributes per
-match); the font manager makes descriptors from font data, orders family
+match). Matching is by font:
+* CTFontDescriptorCreateMatchingFontDescriptors and the collections answer
+  one normalized descriptor per matching face. It carries the PostScript,
+  family, style and display names, the size and the traits dictionary
+  (symbolic, weight, width, slant), which font maps such as Pango's read.
+* A family alone matches every face of the family, only the bold / italic
+  ones when the descriptor has those symbolic traits, and nothing when the
+  family is unknown.
+* The available-fonts collection queries each family, so it answers every
+  face.
+* Exclusions apply to the matches, by PostScript name or family.
+
+The font manager makes descriptors from font data, orders family
 names case-insensitively, and keeps fonts enabled (disabling stops
 explicitly). Not provided yet: CTGlyphInfo, ruby annotations, font features.
 

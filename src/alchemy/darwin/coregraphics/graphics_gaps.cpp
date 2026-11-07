@@ -530,26 +530,34 @@ void GraphicsGaps::install_core_text() {
         static_cast<void>(objc.host_state<FontCollection>(object, [&] { return value; }));
         s.x[0] = object;
     });
-    // The matching descriptors: the query descriptors less those an
-    // exclusion descriptor names (by PostScript name, else family).
+    // The matching descriptors: the normalized descriptors of the fonts each
+    // query descriptor matches (CTFontDescriptorCreateMatchingFontDescriptors:
+    // every face of a family, with its name, style and traits), less those an
+    // exclusion descriptor names (its PostScript name, else its family). +1 each.
     const auto matching = [this](const FontCollection& value) {
-        const auto name_of = [this](Address descriptor) {
-            const auto attributes = call(core_text, "_CTFontDescriptorCopyAttributes", {descriptor});
-            std::string name;
-            for (const auto* key : {"NSFontNameAttribute", "NSFontFamilyAttribute"}) {
-                const auto key_string = cf.string(key);
-                const auto found = attributes ? cf.dictionary_value(attributes, key_string) : 0;
-                release(key_string);
-                if (found) { name = std::string(key) + ":" + cf.utf8(found); break; }
-            }
-            release(attributes);
-            return name;
+        const auto attribute = [this](Address descriptor, const char* key) {
+            const auto key_string = cf.string(key);
+            const auto found = call(core_text, "_CTFontDescriptorCopyAttribute", {descriptor, key_string});
+            release(key_string);
+            std::string text = found ? cf.utf8(found) : std::string();
+            if (found) release(found);
+            return text;
         };
-        std::vector<std::string> excluded;
-        for (const auto descriptor : value.exclusions ? cf.array_values(value.exclusions) : std::vector<Address>{}) excluded.push_back(name_of(descriptor));
+        std::vector<std::pair<std::string, std::string>> excluded;   // (attribute, value)
+        for (const auto descriptor : value.exclusions ? cf.array_values(value.exclusions) : std::vector<Address>{})
+            for (const auto* key : {"NSFontNameAttribute", "NSFontFamilyAttribute"})
+                if (auto text = attribute(descriptor, key); !text.empty()) { excluded.emplace_back(key, std::move(text)); break; }
         std::vector<Address> kept;
-        for (const auto descriptor : value.descriptors ? cf.array_values(value.descriptors) : std::vector<Address>{})
-            if (excluded.empty() || std::find(excluded.begin(), excluded.end(), name_of(descriptor)) == excluded.end()) kept.push_back(descriptor);
+        for (const auto query : value.descriptors ? cf.array_values(value.descriptors) : std::vector<Address>{}) {
+            const auto matches = call(core_text, "_CTFontDescriptorCreateMatchingFontDescriptors", {query, 0});
+            for (const auto descriptor : matches ? cf.array_values(matches) : std::vector<Address>{}) {
+                const bool out = std::any_of(excluded.begin(), excluded.end(), [&](const auto& entry) {
+                    return attribute(descriptor, entry.first.c_str()) == entry.second;
+                });
+                if (!out) kept.push_back(call(core_foundation, "_CFRetain", {descriptor}));
+            }
+            if (matches) release(matches);
+        }
         return kept;
     };
     raw(core_text, "_CTFontCollectionCreateMatchingFontDescriptors", [this, matching](CpuState& s, GuestMemory&) {
@@ -557,6 +565,7 @@ void GraphicsGaps::install_core_text() {
         if (!value) throw std::runtime_error("Alchemy: CTFontCollectionCreateMatchingFontDescriptors needs a CTFontCollection");
         const auto kept = matching(*value);
         s.x[0] = kept.empty() ? 0 : cf.array(kept);
+        for (const auto descriptor : kept) release(descriptor);
     });
     raw(core_text, "_CTFontCollectionCreateMatchingFontDescriptorsWithOptions", [this](CpuState& s, GuestMemory&) {
         s.x[0] = call(core_text, "_CTFontCollectionCreateMatchingFontDescriptors", {s.x[0]});   // (collection, options)
@@ -585,8 +594,8 @@ void GraphicsGaps::install_core_text() {
         s.x[0] = make_collection(std::move(descriptors));
     });
     // (collection, sortCallback(first, second, refCon) -> CFComparisonResult, refCon)
-    raw(core_text, "_CTFontCollectionCreateMatchingFontDescriptorsSortedWithCallback", [this, collection_of](CpuState& s, GuestMemory&) {
-        auto descriptors = cf.array_values(collection_of(s.x[0], "CTFontCollectionCreateMatchingFontDescriptorsSortedWithCallback")->descriptors);
+    raw(core_text, "_CTFontCollectionCreateMatchingFontDescriptorsSortedWithCallback", [this, collection_of, matching](CpuState& s, GuestMemory&) {
+        auto descriptors = matching(*collection_of(s.x[0], "CTFontCollectionCreateMatchingFontDescriptorsSortedWithCallback"));
         if (const auto callback = s.x[1]) {
             const auto context = s.x[2];
             std::stable_sort(descriptors.begin(), descriptors.end(), [this, callback, context](Address a, Address b) {
@@ -598,6 +607,7 @@ void GraphicsGaps::install_core_text() {
             });
         }
         s.x[0] = descriptors.empty() ? 0 : cf.array(descriptors);
+        for (const auto descriptor : descriptors) release(descriptor);
     });
     raw(core_text, "_CTFontCollectionCopyQueryDescriptors", [this, collection_of](CpuState& s, GuestMemory&) {
         const auto value = collection_of(s.x[0], "CTFontCollectionCopyQueryDescriptors");
@@ -629,6 +639,7 @@ void GraphicsGaps::install_core_text() {
         for (const auto descriptor : matching(*collection_of(s.x[0], "CTFontCollectionCopyFontAttribute"))) {
             const auto found = call(core_text, "_CTFontDescriptorCopyAttribute", {descriptor, s.x[1]});
             values.push_back(found ? found : call(core_foundation, "_CFRetain", {bridge->constant(core_foundation, "_kCFNull")}));
+            release(descriptor);
         }
         s.x[0] = cf.array(values);
         for (const auto value : values) release(value);
@@ -650,6 +661,7 @@ void GraphicsGaps::install_core_text() {
                 if (const auto found = call(core_text, "_CTFontDescriptorCopyAttribute", {descriptor, name})) pairs.push_back({name, found});
             dictionaries.push_back(cf.dictionary(pairs));
             for (const auto& [name, found] : pairs) release(found);
+            release(descriptor);
         }
         s.x[0] = cf.array(dictionaries);
         for (const auto dictionary : dictionaries) release(dictionary);

@@ -348,6 +348,9 @@ void install_font_exports(Quartz& q) {
             {quartz->cf.string("NSFontFamilyAttribute"), quartz->cf.string(state.family)},
             {quartz->cf.string("NSFontSizeAttribute"), quartz->cf.real(state.size)},
             {quartz->cf.string("NSCTFontTraitsAttribute"), traits_dictionary(state)}};
+        // kCTFontStyleNameAttribute and kCTFontDisplayNameAttribute (font maps such as Pango's read them).
+        if (!state.face->style_name.empty()) pairs.emplace_back(quartz->cf.string("NSFontFaceAttribute"), quartz->cf.string(state.face->style_name));
+        if (!state.display.empty()) pairs.emplace_back(quartz->cf.string("NSFontVisibleNameAttribute"), quartz->cf.string(state.display));
         const auto dictionary = quartz->cf.dictionary(pairs);
         for (const auto& [key, value] : pairs) { quartz->release(key); quartz->release(value); }
         auto descriptor = std::make_shared<DescriptorState>();
@@ -622,14 +625,36 @@ void install_font_exports(Quartz& q) {
         s.x[0] = font_descriptor(*quartz->find<FontState>(created));
         quartz->release(created);
     });
+    // Normalized descriptors (name, family, style, traits...) of every
+    // matching face. A family alone (the query descriptors of
+    // CTFontCollectionCreateFromAvailableFonts) matches each face of the
+    // family, those with the descriptor's bold / italic symbolic traits when
+    // it has some, and NULL when the family is unknown; anything else matches
+    // the descriptor's best face.
     fn("_CTFontDescriptorCreateMatchingFontDescriptors", [quartz, descriptor_attributes, from_attributes, font_descriptor](CpuState& s, GuestMemory&) {
-        const auto created = from_attributes(descriptor_attributes(s.x[0]), 0, {});
-        if (!created) { s.x[0] = 0; return; }
-        const auto descriptor = font_descriptor(*quartz->find<FontState>(created));
-        quartz->release(created);
-        const std::array<Address, 1> values{descriptor};
-        s.x[0] = quartz->cf.array(values);
-        quartz->release(descriptor);
+        const auto attributes = descriptor_attributes(s.x[0]);
+        const auto value = [&](std::string_view key) { return quartz->dictionary_get(attributes, key); };
+        std::vector<Address> descriptors;
+        const auto family = value("NSFontFamilyAttribute");
+        if (family && !value("NSFontNameAttribute") && !value("NSCTFontFileURLAttribute")) {
+            std::optional<std::uint32_t> wanted;
+            if (const auto traits = value("NSCTFontTraitsAttribute"))
+                if (const auto symbolic = quartz->number(quartz->dictionary_get(traits, "NSCTFontSymbolicTrait")))
+                    wanted = static_cast<std::uint32_t>(*symbolic) & (font_trait::bold | font_trait::italic);
+            const auto family_name = quartz->cf.utf8(family);
+            const auto size = quartz->number(value("NSFontSizeAttribute")).value_or(0);
+            for (const auto& face : family_members(family_name)) {
+                const auto created = make_font(*quartz, {face, face->postscript, family_name, face->full_name}, size > 0 ? size : 12);
+                const auto state = quartz->find<FontState>(created);
+                if (!wanted || (state->traits() & (font_trait::bold | font_trait::italic)) == *wanted) descriptors.push_back(font_descriptor(*state));
+                quartz->release(created);
+            }
+        } else if (const auto created = from_attributes(attributes, 0, {})) {
+            descriptors.push_back(font_descriptor(*quartz->find<FontState>(created)));
+            quartz->release(created);
+        }
+        s.x[0] = descriptors.empty() ? 0 : quartz->cf.array(descriptors);
+        for (const auto descriptor : descriptors) quartz->release(descriptor);
     });
     fn("_CTFontDescriptorCopyAttributes", [quartz, descriptor_attributes](CpuState& s, GuestMemory&) { s.x[0] = quartz->retain(descriptor_attributes(s.x[0])); });
     fn("_CTFontDescriptorCopyAttribute", [quartz, descriptor_attributes](CpuState& s, GuestMemory&) {

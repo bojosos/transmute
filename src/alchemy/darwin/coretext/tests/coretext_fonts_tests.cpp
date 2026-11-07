@@ -190,6 +190,44 @@ const Case coretext_fonts_case("coretext_fonts", [](Fixture& f) {
     }, "/usr/lib/libcoretextfontstest.dylib");
     const auto sorted = f.cf.array_values(f.call(ct, "_CTFontCollectionCreateMatchingFontDescriptorsSortedWithCallback", {both, descending, 0}));
     require(sorted.size() == 2 && sorted[0] > sorted[1], "descriptors sorted by the callback");
+    // Matching is by font: the available-fonts collection (one family query
+    // descriptor per family) answers a normalized descriptor per face, with
+    // name, family, style and traits (Pango's CoreText font map reads them).
+    // Times New Roman stands for a system family: Arial's file was registered
+    // above, and registered faces of a family come first.
+    const auto key = [&f](const char* name) { return f.cf.string(name); };
+    const auto symbolic_of = [&](Address descriptor) {
+        const auto traits = f.call(ct, "_CTFontDescriptorCopyAttribute", {descriptor, key("NSCTFontTraitsAttribute")});
+        return traits ? static_cast<std::int64_t>(f.cf.number_value(f.cf.dictionary_value(traits, key("NSCTFontSymbolicTrait"))).value_or(-1)) : -1;
+    };
+    const auto available = f.call(ct, "_CTFontCollectionCreateFromAvailableFonts", {0});
+    const auto faces = f.cf.array_values(f.call(ct, "_CTFontCollectionCreateMatchingFontDescriptors", {available}));
+    std::size_t times_faces = 0;
+    for (const auto face : faces) {
+        const auto traits = f.call(ct, "_CTFontDescriptorCopyAttribute", {face, key("NSCTFontTraitsAttribute")});
+        require(traits && f.cf.dictionary_value(traits, key("NSCTFontSymbolicTrait")) && f.cf.dictionary_value(traits, key("NSCTFontWeightTrait")),
+                "every available face carries its symbolic and weight traits");
+        const auto name = f.call(ct, "_CTFontDescriptorCopyAttribute", {face, key("NSFontNameAttribute")});
+        const auto family = f.call(ct, "_CTFontDescriptorCopyAttribute", {face, key("NSFontFamilyAttribute")});
+        require(name && family, "every available face has its PostScript and family names");
+        if (f.cf.utf8(family) == "Times New Roman") ++times_faces;
+    }
+    require(faces.size() > 10 && times_faces == 4, "one descriptor per face (Times New Roman has " + std::to_string(times_faces) + ")");
+    // A family with bold symbolic traits matches its bold faces (regular and
+    // italic); an unknown family matches nothing.
+    const auto bold_traits = f.cf.dictionary(std::vector<std::pair<Address, Address>>{{key("NSCTFontSymbolicTrait"), f.cf.integer(2)}});
+    const auto bold_query = f.call(ct, "_CTFontDescriptorCreateWithAttributes",
+                                   {f.cf.dictionary(std::vector<std::pair<Address, Address>>{{key("NSFontFamilyAttribute"), f.cf.string("Times New Roman")},
+                                                                                             {key("NSCTFontTraitsAttribute"), bold_traits}})});
+    const auto bold_matches = f.call(ct, "_CTFontDescriptorCreateMatchingFontDescriptors", {bold_query, 0});
+    const auto bold_faces = bold_matches ? f.cf.array_values(bold_matches) : std::vector<Address>{};
+    require(bold_faces.size() == 1 && symbolic_of(bold_faces[0]) >= 0 && (symbolic_of(bold_faces[0]) & 3) == 2,
+            "Times New Roman's bold face (" + std::to_string(bold_faces.size()) + " matched)");
+    const auto style = f.call(ct, "_CTFontDescriptorCopyAttribute", {bold_faces[0], key("NSFontFaceAttribute")});
+    require(style && f.cf.utf8(style) == "Bold", "the style name (kCTFontStyleNameAttribute)");
+    const auto unknown = f.call(ct, "_CTFontDescriptorCreateWithAttributes",
+                                {f.cf.dictionary(std::vector<std::pair<Address, Address>>{{key("NSFontFamilyAttribute"), f.cf.string("Alchemy No Such Family")}})});
+    require(f.call(ct, "_CTFontDescriptorCreateMatchingFontDescriptors", {unknown, 0}) == 0, "an unknown family matches nothing");
     // Query and exclusion descriptors, mutable copies, attributes (the frameworks wave, U21).
     const auto mutable_copy = f.call(ct, "_CTFontCollectionCreateMutableCopy", {both});
     f.call(ct, "_CTFontCollectionSetExclusionDescriptors", {mutable_copy, array(f, {descriptor_named(f, "Menlo-Regular")})});
