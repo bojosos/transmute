@@ -765,6 +765,50 @@ fully loaded machine; it had one thread left and no handles.
 * **Not tested:** no fixture can make a process whose exit code is set while its handle is still unsignalled.
 * **Harness:** runs still use one profile per launch.
 
+### Follow-up 8 (2026-11-07): the teardown watchdog in the frameworks app checks
+
+**Fixed: Chrome's teardown watchdog (exit 2) fired because the browser saw exited children as running.** The
+frameworks sessions' app checks had it on 10/14 and 2/4 runs of a branch, against 2/14 and 0/4 on main.
+* **The watchdog:** `shutdown_watchdog_mac.cc` arms 10 s in `BrowserProcessImpl::StartTearDown`. On expiry it
+  records a dump and calls `_exit(RESULT_CODE_HUNG)`.
+* **What the browser waits for:** for each child it still has, the process launcher calls
+  `ForceNormalProcessTerminationSync`. That sends SIGTERM, then runs `EnsureProcessTerminated`: up to 2 s for
+  `EVFILT_PROC NOTE_EXIT`, then SIGKILL and a blocking `waitpid`. Some waits take `WaitForExitWithTimeout`'s
+  `waitpid(WNOHANG)` and `usleep` loop instead.
+* **Hang dumps every 3 s after `Browser.close`:** in every failing windowed run, a browser thread was in
+  `waitpid` or that loop on a child that had already exited, 0.3 to 45 s earlier. The children were a renderer
+  and the mac_notifications utility.
+* **The fault:** `host::process::exit_code` reported a process as ended only once its handle was signalled. Windows
+  signals the handle after it has torn the address space down. A sampler of `GetExitCodeProcess` against the handle
+  measured that gap on this loaded machine:
+  * 14 of 120 Alchemy processes signalled 2 s or more after their exit code was set;
+  * the longest gap was 67 s.
+
+  `waitpid`, `EVFILT_PROC` and `kill`'s child path all ask `exit_code`, so during that gap they saw the child as
+  running.
+* **The fix:** a process has ended once its exit code is set. One whose exit code is `STILL_ACTIVE` (259) has
+  ended once it is signalled, as before. `wait_exit` waits for that, and an exec-in-place image now ends with its
+  new image. Test: `alchemy_host` `exit_codes`.
+* **A/A on main `400d3b63`, at 100 % load throughout,** with the 5182c218 binary (from before B28 to B33, the Swift
+  runtime and the loader companions) as a third side. Watchdog runs:
+  * main copy 1: 2/8;
+  * main copy 2: 2/10;
+  * 5182c218: 2/8.
+
+  No recent main commit made it worse. The rate follows load: other sessions' builds kept the machine at 100 %,
+  and the worst rounds hit the headless 300 s timeout.
+* **A/B, main against the fix, interleaved, 6 rounds at 100 % load:**
+  * main: 3/12 watchdog (headless 2/6, windowed 1/6);
+  * fix: 0/12.
+
+  In main's failing headless run, a renderer had exited 44 trace lines before the browser saw it end, and the
+  watchdog came right after.
+* **What else delays an exit on a loaded machine:**
+  * **Helpers' own exit work, now visible in `ALCHEMY_TRACE_PROCESS`:** "guest state released" took up to
+    3.5 s (the network service), and "translations persisted" took 1.6 to 5 s (the fx cache flush and merge).
+  * **GoogleUpdater:** an install (in a fresh home) or the installed updater's `launcher` can still be running at
+    close. A `SKIP_ON_SHUTDOWN` task that has already started holds teardown (Follow-up 6).
+
 ### Open, worst first
 
 1. **fx code arena exhaustion** (gap 1). It needs fx runtime design work, for which a follow-up is proposed:
