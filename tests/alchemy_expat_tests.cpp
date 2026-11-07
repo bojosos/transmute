@@ -111,7 +111,7 @@ void hashes(const std::filesystem::path& scratch) {
 void in_process(const std::filesystem::path& program, const std::filesystem::path& runtime, const std::filesystem::path& scratch) {
     hashes(scratch);
     require(alchemy::runtime_library_identity("/usr/lib/libexpat.1.dylib") != nullptr, "libexpat identity is not allow-listed");
-    require(alchemy::runtime_library_identity("/usr/lib/libxml2.2.dylib") == nullptr, "unexpected allow-listed identity");
+    require(alchemy::runtime_library_identity("/usr/lib/libpcap.A.dylib") == nullptr, "unexpected allow-listed identity");
     require(alchemy::runtime_library_identity("/usr/lib/libexpat.dylib") == nullptr, "unversioned name must not be allow-listed");
     positive(program, runtime);
 

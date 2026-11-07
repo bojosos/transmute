@@ -14,7 +14,7 @@ namespace alchemy {
 // GPU, audio device, input source or IOKit registry exists, so queries answer
 // "none" and operations that would need a device return the framework's
 // documented failure code. Absent symbols stay unresolved and fail at bind.
-inline constexpr std::array<std::string_view, 52> darwin_framework_libraries{
+inline constexpr std::array<std::string_view, 51> darwin_framework_libraries{
     "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit",
     "/System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa",
     "/System/Library/Frameworks/Metal.framework/Versions/A/Metal",
@@ -94,9 +94,9 @@ inline constexpr std::array<std::string_view, 52> darwin_framework_libraries{
     "/System/Library/Frameworks/Quartz.framework/Versions/A/Quartz",
     "/usr/lib/libsandbox.1.dylib",
     // Linked without imported symbols by a renderer SDK's image and material
-    // libraries. Any symbol bound to them stays unresolved.
-    "/System/Library/Frameworks/GLUT.framework/Versions/A/GLUT",
-    "/usr/lib/libxml2.2.dylib"};
+    // libraries. Any symbol bound to them stays unresolved. (/usr/lib/libxml2.2.dylib,
+    // which they link too, is a runtime identity: alchemy/runtime_libraries.hpp.)
+    "/System/Library/Frameworks/GLUT.framework/Versions/A/GLUT"};
 
 [[nodiscard]] inline bool darwin_framework_library(std::string_view library) {
     return std::find(darwin_framework_libraries.begin(), darwin_framework_libraries.end(), library) !=

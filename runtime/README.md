@@ -68,13 +68,35 @@ configuration header, and no Apple SDK is used.
 Pass the output directory with an additional `--runtime-dir`. For example:
 `alchemy-fx --runtime-dir artifacts\alchemy-llvm-arm64 --runtime-dir artifacts\alchemy-expat-arm64 app`.
 
+## Guest libxml2
+
+`scripts/build_alchemy_libxml2.ps1` builds libxml2 2.15.4 (MIT) from the sources
+vendored in `third_party/libxml2` (byte-identical to the release tarball; the
+script checks every file against `third_party/libxml2/PROVENANCE.md` before
+building) into `artifacts/alchemy-libxml2-arm64/libxml2.2.dylib`. The library
+uses the install name `/usr/lib/libxml2.2.dylib`, with compatibility version
+10.0.0 and current version 10.9.0, the versions macOS applications record for
+it (lld, clang and cmake among them). The feature set is upstream's default
+plus Schematron and the HTTP ABI stubs; ICU, zlib and the legacy APIs are off.
+Character sets libxml2 does not decode itself (UTF-32, UCS-4) go through
+`/usr/lib/libiconv.2.dylib`, Alchemy's libiconv provider. Every non-static
+symbol is exported, as upstream builds it. The script fails if the objects
+import any libSystem symbol outside its reviewed list. `runtime/libxml2/config.h`
+replaces the generated configuration header, the script fills in upstream's
+`xmlversion.h.in`, and no Apple SDK is used. The output's `include/` holds the
+public headers for runtimes built on top of libxml2.
+
+Without the runtime, `/usr/lib/libxml2.2.dylib` stays a declaration-only
+identity: programs that link it without calling it still load, and a call
+fails as an unresolved import.
+
 ## Runtime identity allow-list
 
 A Mach-O whose install name lies under `/usr/lib` or `/System/Library` is
 normally rejected, because those identities belong to Alchemy's host
 providers. `include/alchemy/runtime_libraries.hpp` lists the exceptions:
-`libc++.1`, `libc++abi` and `libunwind` from LLVM, and `libexpat.1` from
-Expat. Each entry names its upstream repository and build script. The loader
+`libc++.1`, `libc++abi` and `libunwind` from LLVM, `libexpat.1` from Expat,
+and `libxml2.2` from libxml2. Each entry names its upstream repository and build script. The loader
 and `doctor` accept an allow-listed identity only when all of these hold:
 
 - The file is found through `--runtime-dir`. `--dylib-dir` and `@rpath` never
@@ -84,7 +106,7 @@ and `doctor` accept an allow-listed identity only when all of these hold:
 - That `provenance.json` lists the file under `outputs` with its exact SHA-256.
 
 Any other case fails with the requirement that was not met. The LLVM
-identities stay declaration-only provider identities when no runtime
+and libxml2 identities stay declaration-only provider identities when no runtime
 directory supplies them. A missing libexpat is a missing dependency.
 
 Reference specifications: [LLVM vendor build instructions](https://libcxx.llvm.org/VendorDocumentation.html),

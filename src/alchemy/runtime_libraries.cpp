@@ -12,14 +12,18 @@ namespace {
 
 constexpr std::string_view llvm_source = "https://github.com/llvm/llvm-project";
 constexpr std::string_view expat_source = "https://github.com/libexpat/libexpat";
+constexpr std::string_view libxml2_source = "https://gitlab.gnome.org/GNOME/libxml2";
 
 constexpr std::string_view swift_source = "https://github.com/swiftlang/swift";
 
-constexpr std::array<RuntimeLibraryIdentity, 19> identities{{
+constexpr std::array<RuntimeLibraryIdentity, 20> identities{{
     {"/usr/lib/libc++.1.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libc++abi.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libunwind.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libexpat.1.dylib", expat_source, "scripts/build_alchemy_expat.ps1", false},
+    // libxml2 (third_party/libxml2). Without the runtime it stays a declaration-only
+    // identity: programs that link it without calling it (renderer SDK libraries) still load.
+    {"/usr/lib/libxml2.2.dylib", libxml2_source, "scripts/build_alchemy_libxml2.ps1", true},
     // The Swift runtime and standard library (docs/ALCHEMY_SWIFT.md).
     {"/usr/lib/swift/libswiftCore.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     // Open-source stdlib modules from the same sources (Platform, Concurrency,
