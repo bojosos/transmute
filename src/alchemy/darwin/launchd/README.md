@@ -130,9 +130,50 @@ internals it shares through `misc/xpc_internal.hpp`):
     connection's queue.
   * ServiceType User and System, and JoinExistingSession, are treated as
     Application.
-* **Not yet:** NSXPCConnection (L5). The privileged flag
+* **Not here:** the privileged flag
   (the system domain) is invalid. Without the Mach layer (alchemy.exe, unit
   fixtures) every connection is invalid, as before.
+
+## NSXPCConnection (alchemy-fx)
+
+`nsxpc.cpp` (moved from `libsystem/misc/xpc.cpp`) puts NSXPCInterface,
+NSXPCConnection and NSXPCListener on the C XPC connections above, so the
+transport, bundled services, job services and peer identity are theirs.
+
+* **Connections:** `initWithServiceName:` is a bundled service,
+  `initWithMachServiceName:options:` a Mach service (the privileged option is
+  invalid) and `initWithListenerEndpoint:` an anonymous listener's endpoint.
+* **Messages** (both ends are Alchemy's, so the format is its own): an XPC
+  dictionary `{sel, args, reply}`. `args` is an NSKeyedArchiver archive of the
+  arguments by position; scalars travel as NSNumber, and nil is left out. A
+  reply carries `{args}` for the reply block.
+* **Remote object proxies** answer the selectors of the remote interface's
+  protocol: required and optional instance methods, incorporated protocols
+  too. The arguments are read from the call's registers by the protocol's
+  types; the reply block's own types come from the extended encoding
+  (`_protocol_getMethodTypeEncoding`).
+  * The reply block runs with the reply's arguments.
+  * If the connection fails first, the error handler runs instead, with
+    NSCocoaErrorDomain 4097 (interrupted) or 4099 (invalid).
+  * The synchronous proxy waits for the reply.
+* **Exported objects** are called with the arguments in registers by the
+  exported interface's types. A reply block argument is a block made here
+  that archives its arguments into the reply; it answers once.
+  `+currentConnection` is the connection whose message is being handled.
+* **Handlers:** interruption and invalidation handlers run from the C
+  connection's errors. `-invalidate` on a connection that was never resumed
+  runs the invalidation handler on a global queue.
+* **Listeners** hand each new peer to `-listener:shouldAcceptNewConnection:`;
+  NO cancels it. `+serviceListener`'s `-resume` serves XPC_SERVICE_NAME until
+  the process ends, as `xpc_main` does. `+anonymousListener` has an
+  `-endpoint`.
+* **Not here:**
+  * unarchiving does not enforce the interface's allowed classes
+    (`setClasses:...` is kept, not applied);
+  * proxies and endpoints as arguments, NSXPCCoder-specific coding and
+    NSProgress across XPC fail with an error;
+  * more than eight integer or eight floating-point arguments, and struct
+    arguments, fail with an error.
 
 ## launchctl
 
@@ -202,3 +243,9 @@ These are refused, by the user's decisions of 2026-11-05:
   It covers the service started as the app's child, XPC_SERVICE_NAME and the
   Info.plist environment, one instance for two connections, and an unknown
   name being invalid.
+* `alchemy_launchd_nsxpc_fx` (`NsxpcModel.app`, built from
+  `tests/fixtures/macos/launchd_nsxpc.m` as both client and bundled service).
+  It covers integer, floating-point, BOOL and object arguments and replies, a
+  captured reply block, one-way messages in order, the synchronous proxy, the
+  peer's pid, `+currentConnection`, the invalidation handler, and the error
+  handler for a service that does not exist.

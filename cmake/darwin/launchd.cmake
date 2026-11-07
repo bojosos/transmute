@@ -75,5 +75,32 @@ function(alchemy_launchd_session_tests)
     add_test(NAME alchemy_launchd_xpc_bundle_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${app}/MacOS/launchd_model" xpc-bundle)
     set_tests_properties(alchemy_launchd_xpc_bundle_fx PROPERTIES TIMEOUT 600
         ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0")
+    # NsxpcModel.app (L5): an Objective-C client and its bundled NSXPC service, one source
+    # (launchd_nsxpc.m) built twice; Foundation and the runtime resolve by flat lookup.
+    if(NOT ALCHEMY_GUI_FIXTURES_ENABLED)
+        return()
+    endif()
+    alchemy_gui_object(launchd_nsxpc_client launchd_nsxpc.m)
+    alchemy_gui_object(launchd_nsxpc_service launchd_nsxpc.m -DNSXPC_SERVICE)
+    set(nsxpc_app "${macos_dir}/NsxpcModel.app/Contents")
+    set(nsxpc_service "${nsxpc_app}/XPCServices/com.alchemy.test.nsxpc.xpc/Contents")
+    file(MAKE_DIRECTORY "${nsxpc_app}/MacOS" "${nsxpc_service}/MacOS")
+    file(WRITE "${nsxpc_app}/Info.plist" "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>CFBundleIdentifier</key><string>com.alchemy.test.nsxpc-model</string>\n<key>CFBundleExecutable</key><string>nsxpc_client</string>\n</dict></plist>\n")
+    file(WRITE "${nsxpc_service}/Info.plist" "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>CFBundleIdentifier</key><string>com.alchemy.test.nsxpc</string>\n<key>CFBundleExecutable</key><string>nsxpc_service</string>\n<key>CFBundlePackageType</key><string>XPC!</string>\n<key>XPCService</key><dict><key>ServiceType</key><string>Application</string></dict>\n</dict></plist>\n")
+    foreach(pair IN ITEMS "launchd_nsxpc_client|${nsxpc_app}/MacOS/nsxpc_client" "launchd_nsxpc_service|${nsxpc_service}/MacOS/nsxpc_service")
+        string(REPLACE "|" ";" parts "${pair}")
+        list(GET parts 0 object)
+        list(GET parts 1 output)
+        add_custom_command(OUTPUT "${output}"
+            COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main -undefined dynamic_lookup
+                "${macos_dir}/${object}.o" ${ALCHEMY_GUI_LINK_STUBS} -o "${output}"
+            DEPENDS "${macos_dir}/${object}.o" ${ALCHEMY_GUI_LINK_STUBS} VERBATIM)
+    endforeach()
+    add_custom_target(alchemy_launchd_nsxpc_fixtures DEPENDS "${nsxpc_app}/MacOS/nsxpc_client" "${nsxpc_service}/MacOS/nsxpc_service")
+    add_dependencies(alchemy_launchd_nsxpc_fixtures alchemy_gui_link_stubs)
+    add_dependencies(alchemy_process_model_tests alchemy_launchd_nsxpc_fixtures)
+    add_test(NAME alchemy_launchd_nsxpc_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${nsxpc_app}/MacOS/nsxpc_client" nsxpc)
+    set_tests_properties(alchemy_launchd_nsxpc_fx PROPERTIES TIMEOUT 600
+        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0")
 endfunction()
 alchemy_gui_register_tests(alchemy_launchd_session_tests)
