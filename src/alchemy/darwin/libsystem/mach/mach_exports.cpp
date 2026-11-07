@@ -320,6 +320,9 @@ public:
         return object ? std::make_shared<ForeignObject>(std::move(object)) : nullptr;
     }
     std::optional<std::vector<std::uint8_t>> serialize_object(const std::shared_ptr<KernelObject>& object, std::uint32_t recipient) {
+        // Every process's bootstrap port answers over the process tree's one registry: it arrives
+        // as a bootstrap port of the recipient's.
+        if (std::dynamic_pointer_cast<Bootstrap>(object)) return std::vector<std::uint8_t>{'B'};
         if (const auto fileport = std::dynamic_pointer_cast<Fileport>(object)) {
             PortableDescriptor copy = fileport->descriptor;
             if (copy.kind == 1) {
@@ -403,6 +406,7 @@ public:
             return nullptr;
         }
         if (tagged[0] == 'K') return deserialize_foreign(tagged);
+        if (tagged[0] == 'B') return std::make_shared<Bootstrap>();
         if (tagged[0] != 'M') return nullptr;
         const std::vector<std::uint8_t> data(tagged.begin() + 1, tagged.end());
         if (data.size() < 12) return nullptr;
@@ -1036,6 +1040,13 @@ void MachProvider::install_tasks() {
                 const auto parent = static_cast<std::uint32_t>(call(libsystem, "_getppid", {}));
                 const auto& launch = process.child_launch;
                 auto inherited = launch ? ipc->adopt_special_ports(parent, launch->special_ports) : ipc->inherited_special_ports(parent);
+                for (auto& [slot, right] : inherited) {
+                    // A kernel object (the bootstrap port, a memory entry): a kernel port here.
+                    if (right.port || !right.object) continue;
+                    const auto object = deserialize_object(std::exchange(right.object->bytes, {}));
+                    right = Right{};
+                    if (!object || ipc->take(ipc->make_kernel_port(object), disp::move_send, right) != kern::success) right.dead = true;
+                }
                 std::lock_guard lock(mutex);
                 for (auto& [slot, right] : inherited) {
                     if (const auto previous = special_ports.find(slot); previous != special_ports.end()) ipc->drop(previous->second);
