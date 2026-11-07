@@ -58,3 +58,15 @@ comes from `malloc` rather than a private malloc zone. WAL mode works: its share
 The fixture runs a file database in WAL mode with a second connection, prepared statements, FTS5,
 JSON and math functions, a guest SQL function and collation, the blob and backup APIs, and
 serialize/deserialize.
+
+## ICU: /usr/lib/libicucore.A.dylib
+
+A subset of ICU4C 79.1 (Unicode-3.0), `scripts/build_alchemy_icu.ps1`, compatibility version 1.0.0 and current
+version 79.1.0. Like Apple's libicucore it exports unversioned names (`U_DISABLE_RENAMING`). The export set is
+what macOS applications import from it here (libpsl and raptor2 in darktable and LibreOffice): UTF-8
+conversion, case mapping and string functions, and UTS #46 IDNA, 27 names. The build compiles the 68 sources
+of ICU's common library those need (file I/O, conversion and services off) and links libc++ from the LLVM
+runtime, so runs pass both runtime directories. The only data is UTS #46's normalization: upstream's prebuilt
+`uts46.nrm` in a one-item common-data package (`runtime/icu/make_icudata.ps1`, 61,712 bytes); properties, case
+mapping and NFC are compiled into ICU's sources. Other ICU APIs are absent, so an image importing them still
+stops at load with the missing name.

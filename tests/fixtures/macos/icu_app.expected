@@ -1,0 +1,10 @@
+ICU 79.1
+lower root: i̇stanbul straße ωmega
+lower tr: istanbul straße ωmega
+upper: İSTANBUL STRASSE ΩMEGA
+toASCII Bücher.example -> xn--bcher-kva.example errors 0x0 U_ZERO_ERROR
+toASCII BÜCHER.EXAMPLE -> xn--bcher-kva.example errors 0x0 U_ZERO_ERROR
+toASCII faß.de -> xn--fa-hia.de errors 0x0 U_ZERO_ERROR
+toASCII a..b -> a..b errors 0x1 U_ZERO_ERROR
+toUnicode xn--bcher-kva.example -> bücher.example errors 0x0
+preflight 7 U_BUFFER_OVERFLOW_ERROR
