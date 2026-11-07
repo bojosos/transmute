@@ -1161,6 +1161,256 @@ fragment float4 strip_colour(VertexOut in [[stage_in]]) { return in.color; }
     }
 }
 
+// MTLBufferLayoutStrideDynamic: the vertex buffer's stride comes with the bind
+// (setVertexBuffer:offset:attributeStride:atIndex:). Positions sit 16 bytes
+// apart with a decoy pair between them, so the top wedge (-1,1) (1,1) (0,0)
+// appears only when the bind's stride is used; an 8-byte stride would draw
+// (-1,1) (-1,-1) (1,1), which covers the left pixel.
+void test_dynamic_vertex_stride(const std::shared_ptr<metal::Device>& device) {
+    metal::RenderPipelineDescriptor descriptor;
+    descriptor.vertex = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(vertex_function()));
+    descriptor.fragment = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(fragment_function(false)));
+    descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+    descriptor.attributes[0] = metal::VertexAttribute{29, 0, 0};
+    descriptor.layouts[0] = metal::VertexLayout{metal::dynamic_vertex_stride, 1, 1};
+    descriptor.label = "dynamic stride";
+    const auto pipeline = metal::RenderPipeline::create(device, descriptor);
+    expect(pipeline->dynamic_strides, "a MTLBufferLayoutStrideDynamic layout makes a dynamic-stride pipeline");
+    const float positions[] = {-1, 1, -1, -1, 1, 1, -1, -1, 0, 0, -1, -1};
+    auto vertices = shared_buffer(device, sizeof(positions));
+    std::memcpy(vertices->contents(), positions, sizeof(positions));
+    const float colors[] = {1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1};
+    const float tint[] = {1, 1, 1, 1};
+    metal::RenderPass pass;
+    pass.colors[0].texture = render_target(device);
+    pass.colors[0].load_action = 2;
+    pass.colors[0].store_action = 1;
+    pass.colors[0].clear_color = {0, 0, 1, 1};
+    auto readback = shared_buffer(device, 64 * 256);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_render(pass);
+    commands->set_render_pipeline(pipeline);
+    commands->set_buffer(metal::Stage::vertex, 0, vertices, 0);
+    commands->set_attribute_stride(metal::Stage::vertex, 0, 16);
+    commands->set_bytes(metal::Stage::vertex, 1, {reinterpret_cast<const std::uint8_t*>(colors), sizeof(colors)});
+    commands->set_bytes(metal::Stage::fragment, 0, {reinterpret_cast<const std::uint8_t*>(tint), sizeof(tint)});
+    commands->draw(3, 0, 3, 1, 0);
+    commands->end_encoding();
+    commands->begin_blit();
+    commands->copy_texture_to_buffer(pass.colors[0].texture, 0, 0, {0, 0, 0, 64, 64, 1}, readback, 0, 256, 64 * 256);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "dynamic-stride command buffer completes");
+    const auto top = pixel(readback->contents(), 256, 32, 4), left = pixel(readback->contents(), 256, 4, 28);
+    expect(top == std::array<std::uint8_t, 4>{255, 0, 0, 255}, "the wedge drawn with the bind's stride: " + format_pixel(top));
+    expect(left == std::array<std::uint8_t, 4>{0, 0, 255, 255}, "and not the 8-byte-stride triangle: " + format_pixel(left));
+}
+
+// Vector [[function_constant]]s (float4, int3, bool2): every component is
+// its own specialization constant, filled from the MTLFunctionConstantValues
+// bytes (MSL sizes: an int3 value takes 16 bytes).
+void test_vector_function_constants(const std::shared_ptr<metal::Device>& device) {
+    expect(metal::data_type_size(6) == 16 && metal::data_type_size(31) == 16 && metal::data_type_size(54) == 2 &&
+               metal::data_type_size(18) == 8,
+           "MTLDataType Float4/Int3/Bool2/Half3 sizes");
+    const auto compiled = msl::compile(R"(
+#include <metal_stdlib>
+using namespace metal;
+constant float4 scale [[function_constant(0)]];
+constant int3 offsets [[function_constant(1)]];
+constant bool2 flags [[function_constant(2)]];
+kernel void vector_constants(device float* out [[buffer(0)]], uint id [[thread_position_in_grid]]) {
+    out[id] = scale.x * float(id) + scale.w + float(offsets.z) + (flags.y ? 1000.0f : 0.0f) + (flags.x ? 1.0e6f : 0.0f);
+}
+)", {});
+    expect(compiled.success(), "vector function constant MSL compiles: " + msl::format_diagnostics(compiled.diagnostics));
+    if (!compiled.success()) return;
+    auto shader = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(compiled.functions.at(0)));
+    const auto bytes = [](const auto& value) {
+        const auto* first = reinterpret_cast<const std::uint8_t*>(&value);
+        return std::vector<std::uint8_t>(first, first + sizeof(value));
+    };
+    const float scale[4] = {2, 9, 9, 5};
+    const std::int32_t offsets[4] = {7, 8, 20, 0};
+    const std::uint8_t flags[2] = {0, 1};
+    metal::ConstantValues values;
+    values.by_index[0] = {6, bytes(scale)};
+    values.by_index[1] = {31, bytes(offsets)};
+    values.by_name["flags"] = {54, bytes(flags)};
+    const auto failure = shader->specialize(values);
+    expect(!failure, "vector function constants specialize: " + failure.value_or(""));
+    if (failure) return;
+    const auto pipeline = metal::ComputePipeline::create(device, shader);
+    auto out = shared_buffer(device, 16);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_compute(false);
+    commands->set_compute_pipeline(pipeline);
+    commands->set_buffer(metal::Stage::kernel, 0, out, 0);
+    commands->dispatch_threads({4, 1, 1}, {4, 1, 1});
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "vector function constant kernel completes");
+    const auto* result = reinterpret_cast<const float*>(out->contents());
+    bool correct = true;
+    for (std::uint32_t i = 0; i < 4; ++i) correct &= result[i] == 2.0F * static_cast<float>(i) + 1025.0F;
+    expect(correct, "scale.x, scale.w, offsets.z and flags.y reach the kernel: " + std::to_string(result[0]) + " " +
+                        std::to_string(result[3]));
+}
+
+// A texture buffer, a view of it in another format of the same texel size,
+// and texture-to-texture copies between texture buffers and a 2D texture
+// (one row): the bytes arrive where Metal puts them.
+void test_texture_buffer_views_and_copies(const std::shared_ptr<metal::Device>& device) {
+    auto backing = shared_buffer(device, 256);
+    auto* bytes = static_cast<std::uint8_t*>(backing->contents());
+    for (std::uint32_t i = 0; i < 256; ++i) bytes[i] = static_cast<std::uint8_t>(i);
+    metal::TextureDescriptor d;
+    d.type = metal::TextureType::texture_buffer;
+    d.pixel_format = metal::pixel_format::rgba8_unorm;
+    d.width = 16;
+    d.options = {metal::StorageMode::shared};
+    const auto texels = metal::Texture::create_buffer_texture(backing, d, 0, 64);
+    constexpr std::uint32_t r32_uint = 53;   // MTLPixelFormatR32Uint
+    const auto view = metal::Texture::create_view(texels, r32_uint, metal::TextureType::texture_buffer, 0, 1, 0, 1, {2, 3, 4, 5});
+    expect(view->buffer_view && view->descriptor.width == 16 && view->buffer == backing,
+           "an R32Uint view of an RGBA8 texture buffer is a texel buffer over the same bytes");
+    bool refused{};
+    try { static_cast<void>(metal::Texture::create_view(texels, r32_uint, metal::TextureType::texture_buffer, 0, 1, 0, 1, {5, 4, 3, 2})); }
+    catch (const std::exception&) { refused = true; }
+    expect(refused, "a swizzled texture buffer view stops explicitly");
+
+    metal::TextureDescriptor image;
+    image.pixel_format = metal::pixel_format::rgba8_unorm;
+    image.width = 16;
+    image.height = 4;
+    image.usage = metal::texture_usage::shader_read;
+    image.options = {metal::StorageMode::private_};
+    const auto texture = metal::Texture::create(device, image);
+    auto out = shared_buffer(device, 256);
+    std::memset(out->contents(), 0xee, 256);
+    d.width = 16;
+    const auto target = metal::Texture::create_buffer_texture(out, d, 0, 64);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_blit();
+    // Texels 2..9 of the buffer -> row 1 of the image at x 4; then row 1,
+    // x 4..11 of the image -> the second texture buffer at texel 3; then
+    // texels 0..1 of the first texture buffer -> the second at texel 14.
+    commands->copy_texture(texels, 0, 0, {2, 0, 0, 8, 1, 1}, texture, 0, 0, 4, 1, 0);
+    commands->copy_texture(texture, 0, 0, {4, 1, 0, 8, 1, 1}, target, 0, 0, 3, 0, 0);
+    commands->copy_texture(texels, 0, 0, {0, 0, 0, 2, 1, 1}, target, 0, 0, 14, 0, 0);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "texture buffer copies complete");
+    const auto* result = static_cast<const std::uint8_t*>(out->contents());
+    bool through_image = true, direct = true, untouched = true;
+    for (std::uint32_t i = 0; i < 32; ++i) through_image &= result[12 + i] == static_cast<std::uint8_t>(8 + i);
+    for (std::uint32_t i = 0; i < 8; ++i) direct &= result[56 + i] == static_cast<std::uint8_t>(i);
+    for (std::uint32_t i = 0; i < 12; ++i) untouched &= result[i] == 0xee;
+    expect(through_image, "texture buffer -> texture -> texture buffer keeps texels 2..9 at texel 3");
+    expect(direct, "texture buffer -> texture buffer copies texels 0..1 to texel 14");
+    expect(untouched, "texels before the copied range are untouched");
+}
+
+// MTLHeapTypePlacement: buffers placed at the same offset alias (a GPU fill
+// through one is read through the other), a texture placed at its alignment
+// round-trips through blits, and a misaligned offset stops explicitly.
+void test_placement_heap(const std::shared_ptr<metal::Device>& device) {
+    metal::Heap heap(device, 1 << 20, {metal::StorageMode::shared}, 1);
+    expect(heap.placement && heap.placement->allocation, "a placement heap owns one allocation");
+    const auto buffer_alignment = metal::placed_buffer_requirements(*device, 256).alignment;
+    const auto a = metal::Buffer::create_placed(heap.placement, buffer_alignment, 256, {metal::StorageMode::shared});
+    const auto b = metal::Buffer::create_placed(heap.placement, buffer_alignment, 256, {metal::StorageMode::shared});
+    metal::TextureDescriptor image;
+    image.pixel_format = metal::pixel_format::rgba8_unorm;
+    image.width = image.height = 16;
+    image.options = {metal::StorageMode::shared};
+    const auto texture_requirements = metal::Texture::placed_requirements(device, image);
+    const auto texture_offset = (512 * 1024 + texture_requirements.alignment - 1) / texture_requirements.alignment *
+                                texture_requirements.alignment;
+    const auto texture = metal::Texture::create(device, image, heap.placement, texture_offset);
+    std::cout << "  placement heap: buffer alignment " << buffer_alignment << ", texture size " << texture_requirements.size
+              << " alignment " << texture_requirements.alignment << "\n";
+    auto source = shared_buffer(device, 1024);
+    for (std::uint32_t i = 0; i < 1024; ++i) static_cast<std::uint8_t*>(source->contents())[i] = static_cast<std::uint8_t>(i * 7);
+    auto readback = shared_buffer(device, 1024);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_blit();
+    commands->fill_buffer(a, 0, 256, 0x5a);
+    commands->copy_buffer_to_texture(source, 0, 64, 1024, {0, 0, 0, 16, 16, 1}, texture, 0, 0, 0);
+    commands->copy_texture_to_buffer(texture, 0, 0, {0, 0, 0, 16, 16, 1}, readback, 0, 64, 1024);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "placement heap command buffer completes");
+    const auto* through_b = b->contents();
+    bool aliased = through_b != nullptr;
+    for (std::uint32_t i = 0; aliased && i < 256; ++i) aliased = through_b[i] == 0x5a;
+    expect(aliased, "a fill through one placed buffer is read through another at the same offset");
+    expect(std::memcmp(readback->contents(), source->contents(), 1024) == 0, "a placed texture round-trips through blits");
+    bool refused{};
+    try { static_cast<void>(metal::Buffer::create_placed(heap.placement, buffer_alignment + 4, 16, {metal::StorageMode::shared})); }
+    catch (const std::exception&) { refused = true; }
+    expect(refused, "a misaligned placement offset stops explicitly");
+}
+
+// newTextureWithDescriptor:offset:bytesPerRow: with MTLTextureType2D: a
+// linear image over the buffer's own memory. The buffer's bytes are the
+// texture's texels, and a blit into the texture changes the buffer.
+void test_linear_texture_over_buffer(const std::shared_ptr<metal::Device>& device) {
+    const auto alignment = metal::Texture::linear_alignment(device, metal::pixel_format::rgba8_unorm);
+    std::cout << "  linear RGBA8: row pitch alignment " << alignment.row << ", offset alignment " << alignment.offset << "\n";
+    if (!alignment.row) {
+        std::cout << "SKIP: linear texture over a buffer (no linear RGBA8 images)\n";
+        return;
+    }
+    constexpr std::uint32_t width = 16, height = 8;
+    const auto row = (std::uint64_t{width} * 4 + alignment.row - 1) / alignment.row * alignment.row;
+    auto backing = shared_buffer(device, 65536);   // 64 KiB and more: on the linear offset alignment
+    auto* bytes = static_cast<std::uint8_t*>(backing->contents());
+    for (std::uint64_t i = 0; i < row * height; ++i) bytes[i] = static_cast<std::uint8_t>(i * 3 + 1);
+    metal::TextureDescriptor d;
+    d.type = metal::TextureType::type2d;
+    d.pixel_format = metal::pixel_format::rgba8_unorm;
+    d.width = width;
+    d.height = height;
+    d.usage = metal::texture_usage::shader_read;
+    d.options = {metal::StorageMode::shared};
+    std::shared_ptr<metal::Texture> texture;
+    try {
+        texture = metal::Texture::create_buffer_texture(backing, d, 0, row);
+    } catch (const std::exception& error) {
+        expect(false, std::string("a linear texture over a buffer: ") + error.what());
+        return;
+    }
+    auto readback = shared_buffer(device, width * 4 * height);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_blit();
+    commands->copy_texture_to_buffer(texture, 0, 0, {0, 0, 0, width, height, 1}, readback, 0, width * 4, width * 4 * height);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "linear texture readback completes");
+    bool same = true;
+    for (std::uint32_t y = 0; y < height; ++y)
+        same &= std::memcmp(static_cast<const std::uint8_t*>(readback->contents()) + y * width * 4, bytes + y * row, width * 4) == 0;
+    expect(same, "the texture's texels are the buffer's bytes, row by row at bytesPerRow");
+
+    auto source = shared_buffer(device, 64);
+    std::memset(source->contents(), 0xc3, 64);
+    commands = metal::CommandBuffer::create(device);
+    commands->begin_blit();
+    commands->copy_buffer_to_texture(source, 0, 64, 64, {0, 2, 0, 16, 1, 1}, texture, 0, 0, 0);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "linear texture write completes");
+    bool written = true;
+    for (std::uint32_t i = 0; i < 64; ++i) written &= bytes[2 * row + i] == 0xc3;
+    expect(written && bytes[row] != 0xc3, "a blit into the texture writes row 2 of the buffer");
+
+    bool refused{};
+    try { static_cast<void>(metal::Texture::create_buffer_texture(backing, d, 0, row + alignment.row)); }
+    catch (const std::exception&) { refused = true; }
+    expect(refused, "a bytesPerRow other than the driver's row pitch stops explicitly");
+}
+
 // A multisample resolve asked for after the pass began
 // (setColorStoreAction:MultisampleResolve on an encoder made with
 // MTLStoreActionUnknown): the resolve target gets the triangle over the clear
@@ -1542,6 +1792,11 @@ int main() {
         test_depth_resolve_filters(device);
         test_deferred_resolve(device);
         test_instance_step_rate(device);
+        test_dynamic_vertex_stride(device);
+        test_vector_function_constants(device);
+        test_texture_buffer_views_and_copies(device);
+        test_placement_heap(device);
+        test_linear_texture_over_buffer(device);
         test_barycentric_coordinates(device);
         test_bindless_argument_buffers(device);
         test_argument_buffer_samplers(device);

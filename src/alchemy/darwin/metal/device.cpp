@@ -772,9 +772,9 @@ bool Device::wait(std::uint64_t value, std::uint64_t timeout_ns) const {
     return true;
 }
 
-void Device::queue_initial_layout(VkImage image, VkImageAspectFlags aspects) {
+void Device::queue_initial_layout(VkImage image, VkImageAspectFlags aspects, bool preinitialized) {
     std::lock_guard lock(layout_mutex_);
-    initial_layouts_[image] = aspects;
+    initial_layouts_[image] = aspects | (preinitialized ? preinitialized_bit : 0);
 }
 
 void Device::cancel_initial_layout(VkImage image) {
@@ -815,11 +815,13 @@ std::uint64_t Device::submit(std::vector<Batch>& batches) {
                 barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
                 barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
                 barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                // PREINITIALIZED keeps a linear image's bytes (memory it shares
+                // with a buffer); UNDEFINED discards.
+                barrier.oldLayout = (aspects & preinitialized_bit) ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED;
                 barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
                 barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 barrier.image = image;
-                barrier.subresourceRange = {aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+                barrier.subresourceRange = {aspects & ~preinitialized_bit, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
                 barriers.push_back(barrier);
             }
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};

@@ -57,11 +57,34 @@ struct ResourceOptions {
     }
 };
 
+// The memory of an MTLHeapTypePlacement heap: one allocation (aligned and
+// sized to whole bufferImageGranularity pages, so images placed in it never
+// share a page with resources outside) of a memory type both buffers and
+// optimal images accept. Resources placed in it keep it alive.
+struct PlacementMemory {
+    PlacementMemory(std::shared_ptr<Device> owner, VkDeviceSize size, ResourceOptions options);
+    ~PlacementMemory();
+    PlacementMemory(const PlacementMemory&) = delete;
+    PlacementMemory& operator=(const PlacementMemory&) = delete;
+    const std::shared_ptr<Device> device;
+    Allocation allocation;
+};
+// heapBufferSizeAndAlignWithLength:options:: the Vulkan requirements of such
+// a buffer, alignment raised to bufferImageGranularity and 256 (as
+// Buffer::create allocates buffers). Textures: Texture::placed_requirements.
+[[nodiscard]] VkMemoryRequirements placed_buffer_requirements(Device& device, VkDeviceSize length);
+
 class Buffer {
 public:
     // Throws VulkanError for allocation failures and lengths beyond
     // DeviceProfile::max_buffer_length.
     static std::shared_ptr<Buffer> create(std::shared_ptr<Device> device, VkDeviceSize length, ResourceOptions options);
+    // -[MTLHeap newBufferWithLength:options:offset:]: bound at `offset` of a
+    // placement heap's memory (aliasing whatever else is placed there).
+    // Throws VulkanError when the offset is not aligned to
+    // placed_buffer_requirements or the buffer does not fit.
+    static std::shared_ptr<Buffer> create_placed(std::shared_ptr<PlacementMemory> placement, VkDeviceSize offset,
+                                                 VkDeviceSize length, ResourceOptions options);
     // A buffer over client memory (-newBufferWithBytesNoCopy:length:options:
     // deallocator:): the pages holding [pointer, pointer + length) imported
     // with VK_EXT_external_memory_host (guest VA == host VA), so the CPU and
@@ -94,6 +117,7 @@ private:
     explicit Buffer(std::shared_ptr<Device> owner) : device(std::move(owner)) {}
     bool imported_{};                        // memory is the client's (import_host)
     std::function<void()> released_;
+    std::shared_ptr<PlacementMemory> placement_;   // create_placed: `memory` is the heap's, not freed here
 };
 
 // MTLTextureType.
@@ -155,14 +179,36 @@ public:
 
 class Texture {
 public:
-    static std::shared_ptr<Texture> create(std::shared_ptr<Device> device, const TextureDescriptor& descriptor);
+    // With `placement`, the image is bound at `offset` of that placement
+    // heap's memory (-[MTLHeap newTextureWithDescriptor:offset:]); VulkanError
+    // when the offset is not aligned to placed_texture_requirements or the
+    // texture does not fit.
+    static std::shared_ptr<Texture> create(std::shared_ptr<Device> device, const TextureDescriptor& descriptor,
+                                           std::shared_ptr<PlacementMemory> placement = nullptr, VkDeviceSize offset = 0);
+    // heapTextureSizeAndAlignWithDescriptor:: the requirements of the image
+    // create() would make, alignment raised to bufferImageGranularity.
+    [[nodiscard]] static VkMemoryRequirements placed_requirements(const std::shared_ptr<Device>& device,
+                                                                  const TextureDescriptor& descriptor);
+    // A linear 2D image of `pixel_format` on this device: the row pitch
+    // alignment (the pitch of a one-texel-wide image) and the memory offset
+    // alignment; {0, 0} when the format has no linear sampled/transfer image.
+    // minimumLinearTextureAlignmentForPixelFormat: answers their maximum.
+    struct LinearAlignment { std::uint64_t row{}, offset{}; };
+    [[nodiscard]] static LinearAlignment linear_alignment(const std::shared_ptr<Device>& device, std::uint32_t pixel_format);
     // newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:.
     // Levels and slices are relative to `parent`.
     static std::shared_ptr<Texture> create_view(const std::shared_ptr<Texture>& parent, std::uint32_t pixel_format,
         TextureType type, std::uint32_t first_level, std::uint32_t level_count, std::uint32_t first_slice,
         std::uint32_t slice_count, std::array<std::uint8_t, 4> swizzle);
-    // -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:] with
-    // MTLTextureTypeTextureBuffer: a texel buffer view of the buffer.
+    // -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: with
+    // MTLTextureTypeTextureBuffer a texel buffer view of the buffer; with
+    // MTLTextureType2D a linear-tiled image bound to the buffer's own memory
+    // at `offset`, so both see the same bytes. That needs the driver's row
+    // pitch for the width to equal bytesPerRow (the row bytes rounded up to
+    // minimumLinearTextureAlignmentForPixelFormat:, the pitch alignment), the
+    // offset to meet the driver's linear offset alignment (buffers of 64 KiB
+    // and more start on it) and the format's linear-tiling support;
+    // VulkanError otherwise.
     static std::shared_ptr<Texture> create_buffer_texture(const std::shared_ptr<Buffer>& buffer,
         const TextureDescriptor& descriptor, VkDeviceSize offset, VkDeviceSize bytes_per_row);
     // An image Metal does not own (swapchain image): never destroyed here.
@@ -193,7 +239,11 @@ public:
     VkImageView view{};
     VkImageView storage_view{};
     VkBufferView buffer_view{};            // texture buffers
-    std::shared_ptr<Buffer> buffer;        // texture buffers: the backing buffer
+    std::shared_ptr<Buffer> buffer;        // texture buffers and linear textures: the backing buffer
+    // Memory someone else owns (a placement heap, or `buffer` for a linear
+    // texture): `memory` then only describes the binding and is not freed
+    // here; this keeps the owner alive until the image is destroyed.
+    std::shared_ptr<void> backing;
     VkDeviceSize buffer_offset{}, bytes_per_row{};
     std::shared_ptr<Texture> parent;       // views: the texture owning the image
     std::uint32_t base_level{}, base_layer{};   // of this texture inside the VkImage
@@ -244,6 +294,10 @@ public:
 
 private:
     explicit Texture(std::shared_ptr<Device> owner) : device(std::move(owner)) {}
+    // create() up to the image: the texture's fields and the image's create
+    // info (validated), without a VkImage.
+    static std::shared_ptr<Texture> prepare(std::shared_ptr<Device> owner, const TextureDescriptor& descriptor,
+                                            VkImageCreateInfo& image);
     void repack(const std::uint8_t* source, std::uint64_t source_row, std::uint64_t source_image, std::uint8_t* destination,
                 std::uint64_t destination_row, std::uint64_t destination_image, const Region& region) const;
     void create_shader_views(VkImageViewType type, VkFormat view_format, std::uint32_t levels, std::uint32_t layers,
@@ -307,18 +361,23 @@ private:
 [[nodiscard]] std::uint64_t sampler_token(const std::shared_ptr<Sampler>& sampler);
 [[nodiscard]] std::shared_ptr<Sampler> sampler_from_token(std::uint64_t token);
 
-// MTLHeap (MTLHeapTypeAutomatic): resources are sub-allocated from the
+// MTLHeap. MTLHeapTypeAutomatic (0): resources are sub-allocated from the
 // device allocator and accounted against the heap's size, which gives the
-// documented residency and accounting behaviour. Placement heaps and
-// aliasing (makeAliasable) are not translated.
+// documented residency and accounting behaviour; makeAliasable lets nothing
+// reuse the memory early, which Metal allows. MTLHeapTypePlacement (1): one
+// PlacementMemory; resources are bound where the client places them and
+// alias as the client arranges.
 class Heap {
 public:
     Heap(std::shared_ptr<Device> owner, std::uint64_t heap_size, ResourceOptions heap_options, std::uint32_t heap_type)
-        : device(std::move(owner)), size(heap_size), options(heap_options), type(heap_type) {}
+        : device(std::move(owner)), size(heap_size), options(heap_options), type(heap_type) {
+        if (type == 1) placement = std::make_shared<PlacementMemory>(device, size, options);
+    }
     const std::shared_ptr<Device> device;
     const std::uint64_t size;
     const ResourceOptions options;
     const std::uint32_t type;   // MTLHeapType
+    std::shared_ptr<PlacementMemory> placement;   // MTLHeapTypePlacement
     std::string label;
     std::atomic<std::uint64_t> used{0};
     // Reserves `bytes`; false when the heap is full (Metal returns nil).

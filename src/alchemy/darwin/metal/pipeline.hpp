@@ -33,8 +33,12 @@
 
 namespace alchemy::metal {
 
-// MTLDataType scalars used for function constants.
-[[nodiscard]] std::uint32_t data_type_size(std::uint32_t data_type);   // 0 = unsupported (vectors, structs)
+// MTLDataType scalars and vectors used for function constants and argument
+// buffer members: the MSL size (a 3-vector takes 4 components' bytes).
+[[nodiscard]] std::uint32_t data_type_size(std::uint32_t data_type);   // 0 = unsupported (matrices, structs)
+// A vector MTLDataType's scalar MTLDataType and component count (1 for a
+// scalar); {data_type, 0} for anything else.
+[[nodiscard]] std::pair<std::uint32_t, std::uint32_t> data_type_vector(std::uint32_t data_type);
 
 // MTLFunctionConstantValues contents.
 struct ConstantValue {
@@ -93,6 +97,9 @@ struct ColorAttachmentState {
     std::uint32_t write_mask{0xf};                               // MTLColorWriteMask
 };
 struct VertexAttribute { std::uint32_t format{}, offset{}, buffer_index{}; };
+// MTLBufferLayoutStrideDynamic (NSUIntegerMax, kept as 32 bits): the stride
+// comes with each bind (setVertexBuffer:offset:attributeStride:atIndex:).
+inline constexpr std::uint32_t dynamic_vertex_stride = 0xffffffffU;
 struct VertexLayout { std::uint32_t stride{}, step_function{1}, step_rate{1}; };
 struct RenderPipelineDescriptor {
     std::shared_ptr<ShaderFunction> vertex, fragment;
@@ -155,6 +162,12 @@ public:
     [[nodiscard]] VkPipeline pipeline(std::uint32_t primitive_type, std::uint32_t raster = 0);
     // Vertex buffer indices the vertex input state reads (binding = index).
     std::vector<std::uint32_t> vertex_bindings;
+    // A layout's stride is MTLBufferLayoutStrideDynamic: the pipelines take
+    // every binding's stride at bind time (VK_DYNAMIC_STATE_VERTEX_INPUT_
+    // BINDING_STRIDE), the static ones from `vertex_strides` (per
+    // vertex_bindings entry; dynamic_vertex_stride for the dynamic ones).
+    bool dynamic_strides{};
+    std::vector<std::uint32_t> vertex_strides;
     // Reflection of the linked stages (varying locations agree).
     [[nodiscard]] const msl::Reflection& vertex_reflection() const noexcept { return linked_vertex_.reflection; }
     [[nodiscard]] const msl::Reflection* fragment_reflection() const noexcept {

@@ -162,15 +162,25 @@ void add_required_subgroup_size(const Device& device, VkPipelineShaderStageCreat
 
 } // namespace
 
+std::pair<std::uint32_t, std::uint32_t> data_type_vector(std::uint32_t type) {
+    // Each scalar MTLDataType is followed by its 2-, 3- and 4-component vectors.
+    for (const std::uint32_t scalar : {3U, 16U, 29U, 33U, 37U, 41U, 45U, 49U, 53U, 81U, 85U, 121U})
+        if (type >= scalar && type < scalar + 4) return {scalar, type - scalar + 1};
+    return {type, 0};
+}
+
 std::uint32_t data_type_size(std::uint32_t type) {
-    switch (type) {
-    case 3: case 29: case 33: return 4;    // Float, Int, UInt
-    case 16: case 37: case 41: return 2;   // Half, Short, UShort
-    case 45: case 49: case 53: return 1;   // Char, UChar, Bool
-    case 81: case 85: return 8;            // Long, ULong
-    case 121: return 2;                    // BFloat
+    const auto [scalar, components] = data_type_vector(type);
+    std::uint32_t size;
+    switch (scalar) {
+    case 3: case 29: case 33: size = 4; break;    // Float, Int, UInt
+    case 16: case 37: case 41: size = 2; break;   // Half, Short, UShort
+    case 45: case 49: case 53: size = 1; break;   // Char, UChar, Bool
+    case 81: case 85: size = 8; break;            // Long, ULong
+    case 121: size = 2; break;                    // BFloat
     default: return 0;
     }
+    return size * (components == 3 ? 4 : components);   // MSL vectors: a 3-vector is padded to 4
 }
 
 // ---- functions ------------------------------------------------------------------------
@@ -197,8 +207,28 @@ std::optional<std::string> ShaderFunction::specialize(const ConstantValues& valu
             continue;
         }
         const auto& type = reflection().types.at(constant.type);
+        const std::uint32_t defined = 1;
+        if (type.kind == msl::Type::Kind::vector) {
+            // One specialization constant per component
+            // (msl::reserved_spec_id::function_constant_component_base).
+            const auto element = type.size / (type.packed || type.components != 3 ? type.components : 4);
+            if (!element || value->bytes.size() < std::size_t{element} * type.components)
+                return "function constant " + constant.name + " has a value of the wrong size";
+            for (std::uint32_t component = 0; component < type.components; ++component) {
+                const auto* first = value->bytes.data() + std::size_t{element} * component;
+                std::vector<std::uint8_t> bytes(first, first + element);
+                if (type.scalar == msl::Scalar::boolean) {
+                    const std::uint32_t widened = bytes[0] != 0 ? 1U : 0U;
+                    bytes.assign(reinterpret_cast<const std::uint8_t*>(&widened), reinterpret_cast<const std::uint8_t*>(&widened) + 4);
+                }
+                constants[msl::reserved_spec_id::function_constant_component_base + constant.index * 4 + component] = std::move(bytes);
+            }
+            constants[msl::reserved_spec_id::function_constant_defined_base + constant.index].assign(
+                reinterpret_cast<const std::uint8_t*>(&defined), reinterpret_cast<const std::uint8_t*>(&defined) + 4);
+            continue;
+        }
         if (type.kind != msl::Type::Kind::scalar)
-            return "function constant " + constant.name + ": vector function constants are not translated";
+            return "function constant " + constant.name + " of a matrix or struct type is not translated";
         auto bytes = value->bytes;
         if (type.scalar == msl::Scalar::boolean) {
             const std::uint32_t widened = std::any_of(bytes.begin(), bytes.end(), [](auto b) { return b != 0; }) ? 1U : 0U;
@@ -208,7 +238,6 @@ std::optional<std::string> ShaderFunction::specialize(const ConstantValues& valu
         }
         constants[constant.index] = std::move(bytes);
         // is_function_constant_defined(constant) is true from here on.
-        const std::uint32_t defined = 1;
         constants[msl::reserved_spec_id::function_constant_defined_base + constant.index].assign(
             reinterpret_cast<const std::uint8_t*>(&defined), reinterpret_cast<const std::uint8_t*>(&defined) + 4);
     }
@@ -398,7 +427,12 @@ std::shared_ptr<RenderPipeline> RenderPipeline::create(std::shared_ptr<Device> d
     for (std::uint32_t index = 0; index < descriptor.layouts.size(); ++index) {
         bool used{};
         for (const auto& attribute : descriptor.attributes) used |= attribute && attribute->format && attribute->buffer_index == index;
-        if (used) result->vertex_bindings.push_back(index);
+        if (!used) continue;
+        const auto layout = descriptor.layouts[index].value_or(VertexLayout{});
+        result->vertex_bindings.push_back(index);
+        // A constant step function reads element 0: stride 0.
+        result->vertex_strides.push_back(layout.step_function == 0 ? 0 : layout.stride);
+        result->dynamic_strides |= layout.step_function != 0 && layout.stride == dynamic_vertex_stride;
     }
     // Pipelines with a declared topology class compile now, like Metal.
     if (descriptor.topology_class) static_cast<void>(result->build(descriptor.topology_class, 0));
@@ -468,7 +502,9 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
     std::vector<VkVertexInputAttributeDescription> attributes;
     for (const auto index : vertex_bindings) {
         const auto layout = descriptor.layouts[index].value_or(VertexLayout{});
-        VkVertexInputBindingDescription binding{index, layout.stride, VK_VERTEX_INPUT_RATE_VERTEX};
+        // A dynamic stride is set when the buffer is bound.
+        VkVertexInputBindingDescription binding{index, layout.stride == dynamic_vertex_stride ? 0 : layout.stride,
+                                                VK_VERTEX_INPUT_RATE_VERTEX};
         switch (layout.step_function) {
         case 0: binding.stride = 0; break;   // constant: every vertex reads element 0
         case 1: break;
@@ -571,9 +607,10 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
         VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
         VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
         VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS,
-        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};   // last: only with dynamic_strides
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = static_cast<std::uint32_t>(std::size(dynamic_states));
+    dynamic.dynamicStateCount = static_cast<std::uint32_t>(std::size(dynamic_states)) - (dynamic_strides ? 0 : 1);
     dynamic.pDynamicStates = dynamic_states;
 
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};

@@ -621,7 +621,7 @@ void install_descriptors(Runtime& r) {
         const auto size = data_type_size(static_cast<std::uint32_t>(type));
         if (!size)
             throw std::runtime_error("Alchemy Metal: function constants of MTLDataType " + std::to_string(type) +
-                                     " (vectors, structs) are not translated");
+                                     " (matrices, structs) are not translated");
         ConstantValue value;
         value.data_type = static_cast<std::uint32_t>(type);
         value.bytes.resize(size);

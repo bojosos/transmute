@@ -475,6 +475,40 @@ void install_bindings(Address cls, std::string_view prefix, bool fragment) {
         const auto bytes = guest_bytes(m, s.x[2], s.x[3]);
         e.commands->set_bytes(stage_for(e, fragment), static_cast<std::uint32_t>(s.x[4]), bytes);
     }), false, "v@:^vQQ");
+    if (!fragment) {
+        // The ...attributeStride: forms (vertex and compute stage input): the
+        // stride a MTLBufferLayoutStrideDynamic layout reads with.
+        r.method(cls, name("setBuffer:offset:attributeStride:atIndex:"), on<EncoderState>(what, [](EncoderState& e, CpuState& s, GuestMemory&) {
+            ensure_active(e);
+            const auto stage = stage_for(e, false);
+            const auto index = static_cast<std::uint32_t>(s.x[5]);
+            e.commands->set_buffer(stage, index, buffer_of(s.x[2]), s.x[3]);
+            e.commands->set_attribute_stride(stage, index, s.x[4]);
+        }), false, "v@:@QQQ");
+        r.method(cls, name("setBuffers:offsets:attributeStrides:withRange:"), on<EncoderState>(what, [](EncoderState& e, CpuState& s, GuestMemory& m) {
+            ensure_active(e);
+            const auto stage = stage_for(e, false);
+            for (std::uint64_t i = 0; i < s.x[6]; ++i) {
+                const auto index = static_cast<std::uint32_t>(s.x[5] + i);
+                e.commands->set_buffer(stage, index, buffer_of(m.read64(s.x[2] + 8 * i)), s.x[3] ? m.read64(s.x[3] + 8 * i) : 0);
+                e.commands->set_attribute_stride(stage, index, s.x[4] ? m.read64(s.x[4] + 8 * i) : ~std::uint64_t{0});
+            }
+        }), false, "v@:^@^Q^Q{_NSRange=QQ}");
+        r.method(cls, name("setBufferOffset:attributeStride:atIndex:"), on<EncoderState>(what, [](EncoderState& e, CpuState& s, GuestMemory&) {
+            ensure_active(e);
+            const auto stage = stage_for(e, false);
+            const auto index = static_cast<std::uint32_t>(s.x[4]);
+            e.commands->set_buffer_offset(stage, index, s.x[2]);
+            e.commands->set_attribute_stride(stage, index, s.x[3]);
+        }), false, "v@:QQQ");
+        r.method(cls, name("setBytes:length:attributeStride:atIndex:"), on<EncoderState>(what, [](EncoderState& e, CpuState& s, GuestMemory& m) {
+            ensure_active(e);
+            const auto stage = stage_for(e, false);
+            const auto index = static_cast<std::uint32_t>(s.x[5]);
+            e.commands->set_bytes(stage, index, guest_bytes(m, s.x[2], s.x[3]));
+            e.commands->set_attribute_stride(stage, index, s.x[4]);
+        }), false, "v@:^vQQQ");
+    }
     r.method(cls, name("setTexture:atIndex:"), on<EncoderState>(what, [fragment](EncoderState& e, CpuState& s, GuestMemory&) {
         ensure_active(e);
         e.commands->set_texture(stage_for(e, fragment), static_cast<std::uint32_t>(s.x[3]), texture_of_object(s.x[2]));
@@ -2157,8 +2191,32 @@ void install_small_objects() {
     r.method(classes.heap, "resourceOptions", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) { s.x[0] = h.heap->options.encode(); }), false, "Q@:");
     r.method(classes.heap, "type", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) { s.x[0] = h.heap->type; }), false, "q@:");
     install_purgeable_state(classes.heap);
+    // Placement heaps (MTLHeapTypePlacement): resources are made only at a
+    // client offset; automatic heaps place them themselves. Either form on
+    // the other kind of heap answers nil, as Metal does.
+    r.method(classes.heap, "newBufferWithLength:options:offset:", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) {
+        if (!h.heap->placement) { s.x[0] = 0; return; }
+        auto options = ResourceOptions::decode(s.x[3]);
+        options.storage = h.heap->options.storage;
+        const auto self = s.x[0];
+        auto value = std::make_shared<BufferState>();
+        value->buffer = Buffer::create_placed(h.heap->placement, s.x[4], s.x[2], options);
+        value->device = h.device;
+        value->heap_object = keep_retained(*value, self);
+        s.x[0] = runtime().create(classes.buffer, std::move(value));
+    }), false, "@@:QQQ");
+    r.method(classes.heap, "newTextureWithDescriptor:offset:", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) {
+        if (!h.heap->placement || !s.x[2]) { s.x[0] = 0; return; }
+        auto d = texture_descriptor(s.x[2]);
+        d.options.storage = h.heap->options.storage;
+        const auto self = s.x[0];
+        const auto object = new_texture_object_for(h.device, Texture::create(device_of_object(h.device), d, h.heap->placement, s.x[3]));
+        const auto texture = state<TextureState>(object, "MTLTexture");
+        texture->heap_object = keep_retained(*texture, self);
+        s.x[0] = object;
+    }), false, "@@:@Q");
     r.method(classes.heap, "newBufferWithLength:options:", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) {
-        if (!h.heap->reserve(s.x[2])) { s.x[0] = 0; return; }
+        if (h.heap->placement || !h.heap->reserve(s.x[2])) { s.x[0] = 0; return; }
         auto options = ResourceOptions::decode(s.x[3]);
         options.storage = h.heap->options.storage;
         const auto heap = h.heap;
@@ -2169,6 +2227,7 @@ void install_small_objects() {
         buffer->heap_object = keep_retained(*buffer, self);
     }), false, "@@:QQ");
     r.method(classes.heap, "newTextureWithDescriptor:", on<HeapState>(heap_what, [](HeapState& h, CpuState& s, GuestMemory&) {
+        if (h.heap->placement) { s.x[0] = 0; return; }
         const auto object = new_texture(h.device, s.x[2]);
         if (!object) { s.x[0] = 0; return; }
         const auto texture = state<TextureState>(object, "MTLTexture");
@@ -2423,8 +2482,13 @@ void install_device() {
         for (int axis = 0; axis < 3; ++axis) m.write64(s.x[8] + 8 * axis, p.max_threads_per_threadgroup[axis]);
     }, false, "{MTLSize=QQQ}@:");
     r.method(cls, "currentAllocatedSize", [](CpuState& s, GuestMemory&) { s.x[0] = device_of_object(s.x[0])->allocated_bytes(); }, false, "Q@:");
+    // Linear textures over buffers (Texture::create_buffer_texture): the
+    // driver's row pitch alignment, which bytesPerRow must match. Its offset
+    // alignment (4 KiB on Intel) is larger; buffers of 64 KiB and more start
+    // on it (Buffer::create), other offsets must meet it or stop explicitly.
     r.method(cls, "minimumLinearTextureAlignmentForPixelFormat:", [profile](CpuState& s, GuestMemory&) {
-        s.x[0] = std::max<std::uint64_t>(16, profile(s.x[0]).min_texel_buffer_alignment);
+        const auto linear = Texture::linear_alignment(device_of_object(s.x[0]), static_cast<std::uint32_t>(s.x[2]));
+        s.x[0] = std::max<std::uint64_t>({16, profile(s.x[0]).min_texel_buffer_alignment, linear.row});
     }, false, "Q@:Q");
     r.method(cls, "minimumTextureBufferAlignmentForPixelFormat:", [profile](CpuState& s, GuestMemory&) {
         s.x[0] = std::max<std::uint64_t>(16, profile(s.x[0]).min_texel_buffer_alignment);
@@ -2446,21 +2510,18 @@ void install_device() {
         if (s.x[2]) m.write64(s.x[2], cpu);
         if (s.x[3]) m.write64(s.x[3], gpu ? *gpu : static_cast<std::uint64_t>(static_cast<double>(cpu) / (period > 0 ? period : 1)));
     }, false, "v@:^Q^Q");
+    // The Vulkan requirements of the buffer or image (what a placement heap
+    // binds), alignment raised to bufferImageGranularity: MTLSizeAndAlign
+    // {size, align} in x0/x1, the size rounded up to the alignment.
     r.method(cls, "heapBufferSizeAndAlignWithLength:options:", [](CpuState& s, GuestMemory&) {
-        const auto length = s.x[2];
-        s.x[0] = (length + 255) / 256 * 256;   // MTLSizeAndAlign {size, align} in x0/x1
-        s.x[1] = 256;
+        const auto requirements = placed_buffer_requirements(*device_of_object(s.x[0]), s.x[2]);
+        s.x[0] = (requirements.size + requirements.alignment - 1) / requirements.alignment * requirements.alignment;
+        s.x[1] = requirements.alignment;
     }, false, "{MTLSizeAndAlign=QQ}@:QQ");
     r.method(cls, "heapTextureSizeAndAlignWithDescriptor:", [](CpuState& s, GuestMemory&) {
-        const auto d = texture_descriptor(s.x[2]);
-        const auto* info = pixel_format_info(d.pixel_format);
-        std::uint64_t size = 0;
-        for (std::uint32_t level = 0; level < std::max(1U, d.mipmap_levels); ++level)
-            size += static_cast<std::uint64_t>(std::max(1U, d.width >> level)) * std::max(1U, d.height >> level) *
-                    std::max(1U, d.depth >> level) * (info ? info->block_bytes : 4);
-        size *= std::max(1U, d.array_length) * std::max(1U, d.sample_count) * (d.type == TextureType::cube ? 6 : 1);
-        s.x[0] = (size + 65535) / 65536 * 65536;
-        s.x[1] = 65536;
+        const auto requirements = Texture::placed_requirements(device_of_object(s.x[0]), texture_descriptor(s.x[2]));
+        s.x[0] = (requirements.size + requirements.alignment - 1) / requirements.alignment * requirements.alignment;
+        s.x[1] = requirements.alignment;
     }, false, "{MTLSizeAndAlign=QQ}@:@");
 
     // Object creation.
@@ -2558,7 +2619,7 @@ void install_device() {
     r.method(cls, "newHeapWithDescriptor:", [&r](CpuState& s, GuestMemory&) {
         const auto descriptor = s.x[2];
         const auto type = static_cast<std::uint32_t>(descriptor_u64(descriptor, "type"));
-        if (type != 0) throw std::runtime_error("Alchemy Metal: placement and sparse MTLHeaps are not translated");
+        if (type > 1) throw std::runtime_error("Alchemy Metal: sparse MTLHeaps are not translated");
         auto value = std::make_shared<HeapState>();
         value->heap = std::make_shared<Heap>(device_of_object(s.x[0]), descriptor_u64(descriptor, "size"),
                                              ResourceOptions::decode(descriptor_u64(descriptor, "resourceOptions")), type);

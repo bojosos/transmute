@@ -164,6 +164,9 @@ public:
     void set_buffer(Stage stage, std::uint32_t index, std::shared_ptr<Buffer> buffer, std::uint64_t offset);
     void set_buffer_offset(Stage stage, std::uint32_t index, std::uint64_t offset);
     void set_bytes(Stage stage, std::uint32_t index, std::span<const std::uint8_t> bytes);
+    // The attributeStride: of the ...attributeStride:atIndex: forms, after
+    // the bind itself.
+    void set_attribute_stride(Stage stage, std::uint32_t index, std::uint64_t stride);
     void set_texture(Stage stage, std::uint32_t index, std::shared_ptr<Texture> texture);
     void set_sampler(Stage stage, std::uint32_t index, std::shared_ptr<Sampler> sampler);
 
@@ -282,6 +285,9 @@ private:
         std::uint32_t bytes_length{}; // setBytes: the data's length (at vk_buffer + vk_offset)
         VkBuffer vk_buffer{};         // for vertex input
         VkDeviceSize vk_offset{};
+        // ...attributeStride: binds (MTLAttributeStrideStatic, NSUIntegerMax,
+        // when not given): the stride of a MTLBufferLayoutStrideDynamic layout.
+        std::uint64_t attribute_stride{~std::uint64_t{0}};
     };
     struct StageState {
         std::array<Binding, 31> buffers{};

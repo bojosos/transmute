@@ -156,11 +156,13 @@ json::Value CommandBuffer::foreign_state(bool render) {
                 bound.set("offset", b.offset);
                 bound.set("gpu_address", static_cast<std::uint64_t>(b.buffer->address));
                 bound.set("device_address", static_cast<std::uint64_t>(b.buffer->address));
-                bound.set("attribute_stride", nullptr);
+                if (b.attribute_stride == ~std::uint64_t{0}) bound.set("attribute_stride", nullptr);
+                else bound.set("attribute_stride", b.attribute_stride);
                 wrapped.set("Buffer", std::move(bound));
             } else if (b.vk_buffer) {
                 bound.set("len", b.bytes_length);
-                bound.set("attribute_stride", nullptr);
+                if (b.attribute_stride == ~std::uint64_t{0}) bound.set("attribute_stride", nullptr);
+                else bound.set("attribute_stride", b.attribute_stride);
                 wrapped.set("Bytes", std::move(bound));
             } else {
                 continue;

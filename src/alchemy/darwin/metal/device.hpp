@@ -182,7 +182,11 @@ public:
     // New images start in UNDEFINED; the next submission (of any command
     // buffer) first moves every queued image to VK_IMAGE_LAYOUT_GENERAL, so a
     // texture is in GENERAL before any GPU work can reference it.
-    void queue_initial_layout(VkImage image, VkImageAspectFlags aspects);
+    // `preinitialized`: the image was created PREINITIALIZED (a linear image
+    // over memory with contents), which the move keeps.
+    void queue_initial_layout(VkImage image, VkImageAspectFlags aspects, bool preinitialized = false);
+    // Marks a preinitialized image in initial_layouts_ (no aspect uses it).
+    static constexpr VkImageAspectFlags preinitialized_bit = 0x80000000U;
     void cancel_initial_layout(VkImage image);   // the image is destroyed before any submission
     // Destroys `destroy` once the GPU completed everything submitted so far.
     void defer(std::function<void()> destroy);

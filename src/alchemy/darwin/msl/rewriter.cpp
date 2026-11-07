@@ -907,9 +907,9 @@ private:
         }
         decl.name = text(rest[name_at]);
         decl.type = resolve_spelling(type);
-        if (decl.type.kind != Type::Kind::scalar) {
+        if (decl.type.kind != Type::Kind::scalar && decl.type.kind != Type::Kind::vector) {
             error(attribute.line, "function constant '" + decl.name + "' of type '" + type +
-                  "' is unsupported (only scalar function constants are implemented)");
+                  "' is unsupported (only scalar and vector function constants are implemented)");
             return;
         }
         for (const auto k : rest) T(k).removed = true;

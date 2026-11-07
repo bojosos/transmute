@@ -713,7 +713,9 @@ private:
     // GEP: base + index0 * size(source) + member/element offsets.
     Ptr gep(Value* v) {
         Ptr p = ptr_of(v->operands[0]);
-        if (p.space == Space::constant) fail("address arithmetic on a function constant");
+        // Function constants: constant offsets only (a vector constant's
+        // components); p.id is the constant's index.
+        const bool function_constant = p.space == Space::constant;
         const bool physical = p.space == Space::physical;
         const ir::Type* current = v->aux_type;
         for (std::size_t i = 1; i < v->operands.size(); ++i) {
@@ -738,6 +740,7 @@ private:
                 continue;
             }
             if (index->type->is_vector()) fail("vector GEP indices are unsupported");
+            if (function_constant) fail("a run-time index into a function constant");
             // Dynamic index, sign-extended to the address width.
             auto idx = id_of(index);
             const auto bits = scalar_bits(index->type);
@@ -1983,38 +1986,69 @@ private:
     }
 
     // ---- function constants -----------------------------------------------------------------
-    std::map<std::uint32_t, std::uint32_t> spec_values_, spec_defined_;
+    std::map<std::uint32_t, std::uint32_t> spec_values_, spec_defined_, spec_components_;
     std::set<std::uint32_t> fc_value_used_, fc_defined_used_;
     const FunctionConstantDecl* constant_decl(std::uint32_t index) const {
         for (const auto& c : constants_) if (c.index == index) return &c;
         return nullptr;
     }
-    std::uint32_t function_constant(std::uint32_t index, const ir::Type* t) {
-        fc_value_used_.insert(index);
-        auto& id = spec_values_[index];
-        const auto* decl = constant_decl(index);
-        const auto scalar = decl ? decl->type.scalar : Scalar::int32;
-        if (!id) {
-            switch (scalar) {
-            case Scalar::boolean: id = m_.spec_constant_bool(index, false); break;
-            case Scalar::float32: id = m_.spec_constant(t_f32(), index, {0}); break;
-            case Scalar::half:
-                m_.capability(spv::capability::Float16);
-                id = value_op(sop::FConvert, t_f32(), {m_.spec_constant(m_.type_float(16), index, {0})});
-                break;
-            case Scalar::int16: case Scalar::uint16:
-                m_.capability(spv::capability::Int16);
-                id = m_.spec_constant(m_.type_int(16, false), index, {0});
-                break;
-            case Scalar::int8: case Scalar::uint8:
-                m_.capability(spv::capability::Int8);
-                id = m_.spec_constant(m_.type_int(8, false), index, {0});
-                break;
-            case Scalar::int64: case Scalar::uint64: id = m_.spec_constant(t_u64(), index, {0, 0}); break;
-            default: id = m_.spec_constant(t_u32(), index, {0}); break;
-            }
+    // The specialization constant `spec_id` holding one `scalar`.
+    std::uint32_t scalar_spec_constant(std::uint32_t spec_id, Scalar scalar) {
+        switch (scalar) {
+        case Scalar::boolean: return m_.spec_constant_bool(spec_id, false);
+        case Scalar::float32: return m_.spec_constant(t_f32(), spec_id, {0});
+        case Scalar::half:
+            m_.capability(spv::capability::Float16);
+            return value_op(sop::FConvert, t_f32(), {m_.spec_constant(m_.type_float(16), spec_id, {0})});
+        case Scalar::int16: case Scalar::uint16:
+            m_.capability(spv::capability::Int16);
+            return m_.spec_constant(m_.type_int(16, false), spec_id, {0});
+        case Scalar::int8: case Scalar::uint8:
+            m_.capability(spv::capability::Int8);
+            return m_.spec_constant(m_.type_int(8, false), spec_id, {0});
+        case Scalar::int64: case Scalar::uint64: return m_.spec_constant(t_u64(), spec_id, {0, 0});
+        default: return m_.spec_constant(t_u32(), spec_id, {0});
         }
-        // Convert to the load's register type.
+    }
+    // A function constant read as `t` at byte `offset`. A vector constant has
+    // one specialization constant per component
+    // (reserved_spec_id::function_constant_component_base + index * 4 +
+    // component); the load reads one component or a run of them.
+    std::uint32_t function_constant(std::uint32_t index, const ir::Type* t, std::int64_t offset) {
+        fc_value_used_.insert(index);
+        const auto* decl = constant_decl(index);
+        if (decl && decl->type.kind == Type::Kind::vector) {
+            const auto& type = decl->type;
+            const std::int64_t element_size = [&]() -> std::int64_t {
+                switch (type.scalar) {
+                case Scalar::boolean: case Scalar::int8: case Scalar::uint8: return 1;
+                case Scalar::half: case Scalar::int16: case Scalar::uint16: return 2;
+                case Scalar::int64: case Scalar::uint64: return 8;
+                default: return 4;
+                }
+            }();
+            const auto component = [&](std::int64_t at, const ir::Type* element) {
+                if (at < 0 || at % element_size || at / element_size >= static_cast<std::int64_t>(type.components))
+                    fail("a read of function constant " + decl->name + " outside its components");
+                const auto key = index * 4 + static_cast<std::uint32_t>(at / element_size);
+                auto& id = spec_components_[key];
+                if (!id) id = scalar_spec_constant(reserved_spec_id::function_constant_component_base + key, type.scalar);
+                return function_constant_value(id, type.scalar, element);
+            };
+            if (t->kind != ir::Type::Kind::vector) return component(offset, t);
+            std::vector<std::uint32_t> parts;
+            for (std::uint64_t i = 0; i < t->count; ++i)
+                parts.push_back(component(offset + static_cast<std::int64_t>(i * element_size), t->element));
+            return value_op(sop::CompositeConstruct, reg(t), parts);
+        }
+        if (offset) fail("a read inside scalar function constant " + std::to_string(index));
+        auto& id = spec_values_[index];
+        const auto scalar = decl ? decl->type.scalar : Scalar::int32;
+        if (!id) id = scalar_spec_constant(index, scalar);
+        return function_constant_value(id, scalar, t);
+    }
+    // A scalar specialization constant converted to the load's register type.
+    std::uint32_t function_constant_value(std::uint32_t id, Scalar scalar, const ir::Type* t) {
         if (scalar == Scalar::boolean) {
             if (t->is_int() && t->bits == 1) return id;
             return value_op(sop::Select, reg(t), {id, c_u32(1), c_u32(0)});
@@ -2374,7 +2408,7 @@ private:
             return;
         }
         if (p.space == Space::constant) {
-            return bind(v, function_constant(p.id, v->type));
+            return bind(v, function_constant(p.id, v->type, p.offset));
         }
         if (v->type->is_pointer()) {
             Ptr result;

@@ -38,6 +38,7 @@ namespace alchemy::metal {
     X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkUnmapMemory)                            \
     X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory)    \
     X(vkGetBufferDeviceAddress) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) \
+    X(vkGetDeviceBufferMemoryRequirements) X(vkGetDeviceImageMemoryRequirements) X(vkGetImageSubresourceLayout) \
     X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateBufferView)          \
     X(vkDestroyBufferView) X(vkCreateSampler) X(vkDestroySampler) X(vkCreateSemaphore)             \
     X(vkDestroySemaphore) X(vkGetSemaphoreCounterValue) X(vkWaitSemaphores) X(vkSignalSemaphore)   \

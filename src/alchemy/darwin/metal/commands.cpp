@@ -1196,6 +1196,13 @@ void CommandBuffer::set_bytes(Stage stage, std::uint32_t index, std::span<const 
     state.dirty = true;
 }
 
+void CommandBuffer::set_attribute_stride(Stage stage, std::uint32_t index, std::uint64_t stride) {
+    auto& state = stage_state(stage);
+    if (index >= state.buffers.size()) throw std::out_of_range("Metal buffer index " + std::to_string(index) + " exceeds 30");
+    state.buffers[index].attribute_stride = stride;
+    if (stage == Stage::vertex && index < bound_vertex_buffers_.size()) bound_vertex_buffers_[index] = VK_NULL_HANDLE;
+}
+
 void CommandBuffer::set_texture(Stage stage, std::uint32_t index, std::shared_ptr<Texture> texture) {
     auto& state = stage_state(stage);
     if (index >= state.textures.size()) throw std::out_of_range("Metal texture index " + std::to_string(index) + " exceeds 127");
@@ -1433,10 +1440,26 @@ void CommandBuffer::flush_render(std::uint32_t primitive) {
         }
         stage.dirty = false;
     }
-    for (const auto index : render_pipeline_->vertex_bindings) {
+    for (std::size_t k = 0; k < render_pipeline_->vertex_bindings.size(); ++k) {
+        const auto index = render_pipeline_->vertex_bindings[k];
         const auto& binding = render_stages_[0].buffers[index];
         if (!binding.vk_buffer)
             throw std::runtime_error("Metal draw: vertex descriptor buffer " + std::to_string(index) + " is not bound");
+        if (render_pipeline_->dynamic_strides) {
+            // Every binding's stride comes with the bind: the layout's, or
+            // for MTLBufferLayoutStrideDynamic the bind's attributeStride.
+            VkDeviceSize stride = render_pipeline_->vertex_strides[k];
+            if (stride == dynamic_vertex_stride) {
+                if (binding.attribute_stride == ~std::uint64_t{0})
+                    throw std::runtime_error("Metal draw: vertex buffer " + std::to_string(index) +
+                                             " has a dynamic stride layout but was bound without an attributeStride");
+                stride = binding.attribute_stride;
+            }
+            device->vk.vkCmdBindVertexBuffers2(command, index, 1, &binding.vk_buffer, &binding.vk_offset, nullptr, &stride);
+            perf::add(perf::mtl_vk_binds);
+            bound_vertex_buffers_[index] = VK_NULL_HANDLE;   // the stride is not cached: rebind next time
+            continue;
+        }
         if (bound_vertex_buffers_[index] == binding.vk_buffer && bound_vertex_offsets_[index] == binding.vk_offset) continue;
         device->vk.vkCmdBindVertexBuffers(command, index, 1, &binding.vk_buffer, &binding.vk_offset);
         perf::add(perf::mtl_vk_binds);
@@ -1731,8 +1754,32 @@ void CommandBuffer::copy_texture(const std::shared_ptr<Texture>& source, std::ui
     std::uint32_t destination_level, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     ALCHEMY_BLIT_PROLOGUE("copyFromTexture:...toTexture:");
     if (!region.width || !region.height || !region.depth) return;
-    if (source->is_buffer() || destination->is_buffer())
-        throw std::runtime_error("Metal texture-to-texture copies of texture buffers are not translated");
+    if (source->is_buffer() || destination->is_buffer()) {
+        // A texture buffer is one row of texels in its buffer: the copy is a
+        // buffer copy, or a buffer<->image copy of a single row.
+        if (region.height != 1 || region.depth != 1)
+            throw std::runtime_error("Metal copy between a texture buffer and a texture taller than one row");
+        prepare_texture(source, false);
+        prepare_texture(destination);
+        const auto bytes = static_cast<std::uint64_t>(region.width) * source->info->block_bytes;
+        if (source->is_buffer() && destination->is_buffer()) {
+            const VkBufferCopy copy{source->buffer_offset + static_cast<std::uint64_t>(region.x) * source->info->block_bytes,
+                                    destination->buffer_offset + static_cast<std::uint64_t>(x) * destination->info->block_bytes, bytes};
+            device->vk.vkCmdCopyBuffer(current_, source->buffer->buffer, destination->buffer->buffer, 1, &copy);
+        } else if (source->is_buffer()) {
+            const Region target{x, y, z, region.width, 1, 1};
+            const auto copy = destination->copy_region(
+                source->buffer_offset + static_cast<std::uint64_t>(region.x) * source->info->block_bytes, bytes, bytes, target,
+                destination_level, destination_slice, destination->view_aspects());
+            device->vk.vkCmdCopyBufferToImage(current_, source->buffer->buffer, destination->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        } else {
+            const auto copy = source->copy_region(
+                destination->buffer_offset + static_cast<std::uint64_t>(x) * destination->info->block_bytes, bytes, bytes, region,
+                source_level, source_slice, source->view_aspects());
+            device->vk.vkCmdCopyImageToBuffer(current_, source->image, VK_IMAGE_LAYOUT_GENERAL, destination->buffer->buffer, 1, &copy);
+        }
+        return;
+    }
     prepare_texture(source, false);
     prepare_texture(destination);
     const bool source_volume = source->descriptor.type == TextureType::type3d;

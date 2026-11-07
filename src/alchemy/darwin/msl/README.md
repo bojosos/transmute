@@ -326,7 +326,9 @@ varyings and array vertex attributes, kernel `[[stage_in]]`,
 centroid and sample interpolation of `[[barycentric_coord]]`, mesh/object/tile/
 visible/intersection functions, ray tracing, imageblocks, `memcpy`/`memset`
 with run-time length, recursion and non-inlinable calls, irreducible control
-flow, vector function constants, pixel-coordinate samplers with bias/gradient
+flow, matrix and struct function constants (vector ones are one specialization
+constant per component, `reserved_spec_id::function_constant_component_base`;
+a run-time index into one fails), pixel-coordinate samplers with bias/gradient
 or repeat addressing, `read()` on sampled cube textures, atomics on texture
 arrays and 64-bit threadgroup atomics, program-scope variables with dynamic
 initializers not computed from function constants, `[[stencil]]` outputs

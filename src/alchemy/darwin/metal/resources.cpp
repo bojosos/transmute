@@ -30,7 +30,67 @@ MemoryKind buffer_memory(const ResourceOptions& options) {
 
 std::uint32_t mip_extent(std::uint32_t value, std::uint32_t level) { return std::max(1U, value >> level); }
 
+VkDeviceSize buffer_image_granularity(const Device& d) {
+    VkPhysicalDeviceProperties properties{};
+    d.vk.vkGetPhysicalDeviceProperties(d.physical, &properties);
+    return std::max<VkDeviceSize>(1, properties.limits.bufferImageGranularity);
+}
+
+VkBufferCreateInfo buffer_info(VkDeviceSize length) {
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    // Vulkan buffers cannot be empty; fillBuffer works on 4-byte units.
+    info.size = std::max<VkDeviceSize>(4, (length + 3) & ~VkDeviceSize{3});
+    info.usage = all_buffer_usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    return info;
+}
+
 } // namespace
+
+// ---- placement heaps --------------------------------------------------------------
+
+PlacementMemory::PlacementMemory(std::shared_ptr<Device> owner, VkDeviceSize size, ResourceOptions options)
+    : device(std::move(owner)) {
+    auto& d = *device;
+    if (options.storage == StorageMode::memoryless)
+        throw VulkanError("Alchemy Metal: MTLStorageModeMemoryless placement heaps are invalid");
+    // A memory type both buffers and optimal images accept (images of other
+    // formats are checked when placed).
+    VkDeviceBufferMemoryRequirements buffer_query{VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS};
+    const auto buffer = buffer_info(4);
+    buffer_query.pCreateInfo = &buffer;
+    VkMemoryRequirements2 buffer_requirements{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    d.vk.vkGetDeviceBufferMemoryRequirements(d.device, &buffer_query, &buffer_requirements);
+    TextureDescriptor probe;
+    probe.width = probe.height = 64;
+    probe.options = options;
+    const auto image_requirements = Texture::placed_requirements(device, probe);
+    VkMemoryRequirements requirements{};
+    requirements.memoryTypeBits = buffer_requirements.memoryRequirements.memoryTypeBits & image_requirements.memoryTypeBits;
+    if (!requirements.memoryTypeBits)
+        throw VulkanError("Alchemy Metal: no Vulkan memory type holds both buffers and textures for a placement heap");
+    requirements.alignment = std::max<VkDeviceSize>(65536, buffer_image_granularity(d));
+    requirements.size = (std::max<VkDeviceSize>(size, 1) + requirements.alignment - 1) / requirements.alignment * requirements.alignment;
+    allocation = d.allocate(requirements, buffer_memory(options), false);
+    allocation.size = requirements.size;
+}
+
+PlacementMemory::~PlacementMemory() {
+    Device* owner = device.get();
+    auto memory = allocation;
+    owner->defer([owner, memory]() mutable { owner->free(memory); });
+}
+
+VkMemoryRequirements placed_buffer_requirements(Device& d, VkDeviceSize length) {
+    VkDeviceBufferMemoryRequirements query{VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS};
+    const auto info = buffer_info(length);
+    query.pCreateInfo = &info;
+    VkMemoryRequirements2 requirements{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    d.vk.vkGetDeviceBufferMemoryRequirements(d.device, &query, &requirements);
+    auto result = requirements.memoryRequirements;
+    result.alignment = std::max({result.alignment, VkDeviceSize{256}, buffer_image_granularity(d)});
+    return result;
+}
 
 // ---- buffers ----------------------------------------------------------------------
 
@@ -44,19 +104,56 @@ std::shared_ptr<Buffer> Buffer::create(std::shared_ptr<Device> device, VkDeviceS
     auto& d = *result->device;
     result->length = length;
     result->options = options;
-    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    // Vulkan buffers cannot be empty; fillBuffer works on 4-byte units.
-    info.size = std::max<VkDeviceSize>(4, (length + 3) & ~VkDeviceSize{3});
-    info.usage = all_buffer_usage;
-    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const auto info = buffer_info(length);
     check(d.vk.vkCreateBuffer(d.device, &info, nullptr, &result->buffer), "vkCreateBuffer");
     VkMemoryRequirements requirements{};
     d.vk.vkGetBufferMemoryRequirements(d.device, result->buffer, &requirements);
     // Argument-table addresses and setBytes data are 16-byte aligned at least.
     requirements.alignment = std::max<VkDeviceSize>(requirements.alignment, 256);
+    // Large buffers start where a linear image may be bound (a linear
+    // texture at offset 0, newTextureWithDescriptor:offset:bytesPerRow:).
+    if (length >= 65536)
+        requirements.alignment = std::max<VkDeviceSize>(
+            requirements.alignment, Texture::linear_alignment(result->device, pixel_format::rgba8_unorm).offset);
     result->memory = d.allocate(requirements, buffer_memory(options), false);
     check(d.vk.vkBindBufferMemory(d.device, result->buffer, result->memory.memory, result->memory.offset),
           "vkBindBufferMemory");
+    VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    address.buffer = result->buffer;
+    result->address = d.vk.vkGetBufferDeviceAddress(d.device, &address);
+    return result;
+}
+
+std::shared_ptr<Buffer> Buffer::create_placed(std::shared_ptr<PlacementMemory> placement, VkDeviceSize offset,
+                                              VkDeviceSize length, ResourceOptions options) {
+    auto& d = *placement->device;
+    if (length > d.profile().max_buffer_length)
+        throw VulkanError("Alchemy Metal: buffer length " + std::to_string(length) + " exceeds maxBufferLength " +
+                          std::to_string(d.profile().max_buffer_length));
+    std::shared_ptr<Buffer> result(new Buffer(placement->device));
+    result->length = length;
+    result->options = options;
+    const auto info = buffer_info(length);
+    check(d.vk.vkCreateBuffer(d.device, &info, nullptr, &result->buffer), "vkCreateBuffer");
+    VkMemoryRequirements requirements{};
+    d.vk.vkGetBufferMemoryRequirements(d.device, result->buffer, &requirements);
+    const auto& heap = placement->allocation;
+    const auto alignment = placed_buffer_requirements(d, length).alignment;
+    std::string problem;
+    if (!(requirements.memoryTypeBits & (1U << heap.type))) problem = "the heap's memory type cannot hold this buffer";
+    else if (offset % alignment) problem = "offset " + std::to_string(offset) + " is not aligned to " + std::to_string(alignment);
+    else if (offset > heap.size || requirements.size > heap.size - offset) problem = "the buffer does not fit the heap";
+    if (!problem.empty()) {
+        d.vk.vkDestroyBuffer(d.device, result->buffer, nullptr);
+        result->buffer = VK_NULL_HANDLE;
+        throw VulkanError("Alchemy Metal: newBufferWithLength:options:offset: on a placement heap: " + problem);
+    }
+    result->memory = heap;
+    result->memory.offset = heap.offset + offset;
+    result->memory.size = requirements.size;
+    result->memory.mapped = heap.mapped ? heap.mapped + offset : nullptr;
+    result->placement_ = std::move(placement);
+    check(d.vk.vkBindBufferMemory(d.device, result->buffer, result->memory.memory, result->memory.offset), "vkBindBufferMemory");
     VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     address.buffer = result->buffer;
     result->address = d.vk.vkGetBufferDeviceAddress(d.device, &address);
@@ -134,6 +231,11 @@ Buffer::~Buffer() {
             owner->vk.vkFreeMemory(owner->device, allocation.memory, nullptr);
             if (released) released();
         });
+        return;
+    }
+    if (placement_) {
+        // The heap's memory: it outlives the buffer through `placement`.
+        owner->defer([owner, handle, placement = placement_] { owner->vk.vkDestroyBuffer(owner->device, handle, nullptr); });
         return;
     }
     owner->defer([owner, handle, allocation]() mutable {
@@ -287,7 +389,8 @@ void Texture::create_shader_views(VkImageViewType type, VkFormat view_format, st
     if (storage) storage_view = make(VK_IMAGE_USAGE_STORAGE_BIT, VkComponentMapping{});
 }
 
-std::shared_ptr<Texture> Texture::create(std::shared_ptr<Device> owner, const TextureDescriptor& descriptor) {
+std::shared_ptr<Texture> Texture::prepare(std::shared_ptr<Device> owner, const TextureDescriptor& descriptor,
+                                          VkImageCreateInfo& image) {
     if (descriptor.type == TextureType::texture_buffer)
         throw VulkanError("Alchemy Metal: MTLTextureTypeTextureBuffer textures are created from a buffer");
     const auto* info = pixel_format_info(descriptor.pixel_format);
@@ -309,7 +412,7 @@ std::shared_ptr<Texture> Texture::create(std::shared_ptr<Device> owner, const Te
 
     const auto features = d.format_features(result->format);
     if (!features) throw VulkanError("Alchemy Metal: MTLPixelFormat" + std::string(info->name) + " is not supported by " + d.profile().name);
-    VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     switch (desc.type) {
     case TextureType::type1d: case TextureType::type1d_array: image.imageType = VK_IMAGE_TYPE_1D; break;
     case TextureType::type3d: image.imageType = VK_IMAGE_TYPE_3D; break;
@@ -378,12 +481,89 @@ std::shared_ptr<Texture> Texture::create(std::shared_ptr<Device> owner, const Te
     // contents unobserved either way.
     if (desc.sample_count > 1 && !(d.profile().texture_sample_counts & desc.sample_count))
         throw VulkanError("Alchemy Metal: sample count " + std::to_string(desc.sample_count) + " is not supported");
-    check(d.vk.vkCreateImage(d.device, &image, nullptr, &result->image), "vkCreateImage");
     result->image_usage = image.usage;
     result->image_flags = image.flags;
+    return result;
+}
+
+VkMemoryRequirements Texture::placed_requirements(const std::shared_ptr<Device>& owner, const TextureDescriptor& descriptor) {
+    VkImageCreateInfo image{};
+    static_cast<void>(prepare(owner, descriptor, image));
+    auto& d = *owner;
+    VkDeviceImageMemoryRequirements query{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS};
+    query.pCreateInfo = &image;
+    VkMemoryRequirements2 requirements{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    d.vk.vkGetDeviceImageMemoryRequirements(d.device, &query, &requirements);
+    auto result = requirements.memoryRequirements;
+    result.alignment = std::max(result.alignment, buffer_image_granularity(d));
+    return result;
+}
+
+Texture::LinearAlignment Texture::linear_alignment(const std::shared_ptr<Device>& owner, std::uint32_t pixel_format) {
+    static std::mutex mutex;
+    static std::map<std::pair<const Device*, std::uint32_t>, LinearAlignment> known;
+    std::lock_guard lock(mutex);
+    const auto key = std::make_pair(owner.get(), pixel_format);
+    if (const auto found = known.find(key); found != known.end()) return found->second;
+    auto& d = *owner;
+    LinearAlignment result;
+    const auto* info = pixel_format_info(pixel_format);
+    if (info && !info->compressed() && !info->has_depth() && !info->has_stencil()) {
+        VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image.imageType = VK_IMAGE_TYPE_2D;
+        image.format = d.texture_format(pixel_format);
+        image.extent = {1, 1, 1};
+        image.mipLevels = image.arrayLayers = 1;
+        image.samples = VK_SAMPLE_COUNT_1_BIT;
+        image.tiling = VK_IMAGE_TILING_LINEAR;
+        image.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        image.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+        VkImage probe{};
+        if (d.vk.vkCreateImage(d.device, &image, nullptr, &probe) == VK_SUCCESS) {
+            VkImageSubresource subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+            VkSubresourceLayout layout{};
+            d.vk.vkGetImageSubresourceLayout(d.device, probe, &subresource, &layout);
+            VkMemoryRequirements requirements{};
+            d.vk.vkGetImageMemoryRequirements(d.device, probe, &requirements);
+            result = {layout.rowPitch, requirements.alignment};
+            d.vk.vkDestroyImage(d.device, probe, nullptr);
+        }
+    }
+    return known[key] = result;
+}
+
+std::shared_ptr<Texture> Texture::create(std::shared_ptr<Device> owner, const TextureDescriptor& descriptor,
+                                         std::shared_ptr<PlacementMemory> placement, VkDeviceSize offset) {
+    VkImageCreateInfo image{};
+    auto result = prepare(std::move(owner), descriptor, image);
+    auto& d = *result->device;
+    const auto& desc = result->descriptor;
+    const auto* info = result->info;
+    check(d.vk.vkCreateImage(d.device, &image, nullptr, &result->image), "vkCreateImage");
     VkMemoryRequirements requirements{};
     d.vk.vkGetImageMemoryRequirements(d.device, result->image, &requirements);
-    result->memory = d.allocate(requirements, MemoryKind::device_local, true);
+    if (placement) {
+        // Bound where the client placed it in the heap; the heap's memory
+        // stays the heap's.
+        const auto& heap = placement->allocation;
+        const auto alignment = std::max(requirements.alignment, buffer_image_granularity(d));
+        std::string problem;
+        if (!(requirements.memoryTypeBits & (1U << heap.type))) problem = "the heap's memory type cannot hold this texture";
+        else if (offset % alignment) problem = "offset " + std::to_string(offset) + " is not aligned to " + std::to_string(alignment);
+        else if (offset > heap.size || requirements.size > heap.size - offset) problem = "the texture does not fit the heap";
+        if (!problem.empty()) {
+            d.vk.vkDestroyImage(d.device, result->image, nullptr);
+            result->image = VK_NULL_HANDLE;
+            throw VulkanError("Alchemy Metal: newTextureWithDescriptor:offset: on a placement heap: " + problem);
+        }
+        result->memory = heap;
+        result->memory.offset = heap.offset + offset;
+        result->memory.size = requirements.size;
+        result->memory.mapped = nullptr;
+        result->backing = std::move(placement);
+    } else {
+        result->memory = d.allocate(requirements, MemoryKind::device_local, true);
+    }
     check(d.vk.vkBindImageMemory(d.device, result->image, result->memory.memory, result->memory.offset), "vkBindImageMemory");
     if (image.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT))
         result->create_shader_views(view_type(desc.type), result->format, desc.mipmap_levels, result->layer_count(),
@@ -396,7 +576,22 @@ std::shared_ptr<Texture> Texture::create(std::shared_ptr<Device> owner, const Te
 std::shared_ptr<Texture> Texture::create_view(const std::shared_ptr<Texture>& parent, std::uint32_t pixel_format,
     TextureType type, std::uint32_t first_level, std::uint32_t level_count, std::uint32_t first_slice,
     std::uint32_t slice_count, std::array<std::uint8_t, 4> swizzle) {
-    if (parent->is_buffer()) throw VulkanError("Alchemy Metal: views of texture buffers are not translated");
+    if (parent->is_buffer()) {
+        // Another texel buffer view of the same bytes: the width counts the
+        // new format's texels (Metal requires the same texel size). Texel
+        // buffer views cannot swizzle.
+        if (type != TextureType::texture_buffer || first_level != 0 || level_count != 1 || first_slice != 0 || slice_count != 1)
+            throw VulkanError("Alchemy Metal: a view of a texture buffer must be a texture buffer");
+        if (swizzle != std::array<std::uint8_t, 4>{2, 3, 4, 5})
+            throw VulkanError("Alchemy Metal: swizzled views of texture buffers are not supported (Vulkan texel buffers "
+                              "cannot swizzle)");
+        const auto* view_info = pixel_format_info(pixel_format);
+        if (!view_info || view_info->block_bytes != parent->info->block_bytes)
+            throw VulkanError("Alchemy Metal: a texture buffer view needs a format of the same texel size");
+        auto descriptor = parent->descriptor;
+        descriptor.pixel_format = pixel_format;
+        return create_buffer_texture(parent->buffer, descriptor, parent->buffer_offset, parent->bytes_per_row);
+    }
     const auto* info = pixel_format_info(pixel_format);
     if (!info) throw VulkanError("Alchemy Metal: unsupported MTLPixelFormat " + std::to_string(pixel_format));
     std::shared_ptr<Texture> result(new Texture(parent->device));
@@ -447,8 +642,78 @@ std::shared_ptr<Texture> Texture::create_view(const std::shared_ptr<Texture>& pa
 
 std::shared_ptr<Texture> Texture::create_buffer_texture(const std::shared_ptr<Buffer>& buffer,
     const TextureDescriptor& descriptor, VkDeviceSize offset, VkDeviceSize bytes_per_row) {
+    if (descriptor.type == TextureType::type2d) {
+        // A linear-tiled image bound to the buffer's memory at `offset`.
+        auto desc = descriptor;
+        desc.depth = desc.mipmap_levels = desc.array_length = desc.sample_count = 1;
+        VkImageCreateInfo image{};
+        auto result = prepare(buffer->device, desc, image);
+        auto& d = *result->device;
+        const auto* info = result->info;
+        const auto refuse = [&](const std::string& why) -> std::shared_ptr<Texture> {
+            if (result->image) d.vk.vkDestroyImage(d.device, result->image, nullptr);
+            result->image = VK_NULL_HANDLE;
+            throw VulkanError("Alchemy Metal: a linear MTLPixelFormat" + std::string(info->name) + " texture over a buffer: " + why);
+        };
+        if (info->compressed() || info->has_depth() || info->has_stencil()) return refuse("only uncompressed color formats");
+        // Linear tiling supports fewer usages: the ones the format allows, and
+        // the ones the descriptor asks for must be among them.
+        VkFormatProperties properties{};
+        d.vk.vkGetPhysicalDeviceFormatProperties(d.physical, image.format, &properties);
+        const auto linear = properties.linearTilingFeatures;
+        image.tiling = VK_IMAGE_TILING_LINEAR;
+        image.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+        image.flags &= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        image.usage = 0;
+        if (linear & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) image.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (linear & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) image.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (linear & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) image.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (linear & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) image.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if (linear & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) image.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (((desc.usage & texture_usage::shader_read) && !(image.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) ||
+            ((desc.usage & texture_usage::shader_write) && !(image.usage & VK_IMAGE_USAGE_STORAGE_BIT)) ||
+            ((desc.usage & texture_usage::render_target) && !(image.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)))
+            return refuse("this Vulkan device cannot use the format linearly as the texture's usage asks");
+        VkImageFormatProperties limits{};
+        if (d.vk.vkGetPhysicalDeviceImageFormatProperties(d.physical, image.format, image.imageType, image.tiling, image.usage,
+                                                          image.flags, &limits) != VK_SUCCESS ||
+            limits.maxExtent.width < desc.width || limits.maxExtent.height < desc.height)
+            return refuse("this Vulkan device has no linear image of that size and usage");
+        check(d.vk.vkCreateImage(d.device, &image, nullptr, &result->image), "vkCreateImage");
+        result->image_usage = image.usage;
+        result->image_flags = image.flags;
+        VkImageSubresource subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+        VkSubresourceLayout layout{};
+        d.vk.vkGetImageSubresourceLayout(d.device, result->image, &subresource, &layout);
+        if (layout.offset != 0 || layout.rowPitch != bytes_per_row)
+            return refuse("bytesPerRow " + std::to_string(bytes_per_row) + " is not this Vulkan device's row pitch " +
+                          std::to_string(layout.rowPitch) + " for width " + std::to_string(desc.width));
+        VkMemoryRequirements requirements{};
+        d.vk.vkGetImageMemoryRequirements(d.device, result->image, &requirements);
+        const auto& memory = buffer->memory;
+        if (!memory.memory || !(requirements.memoryTypeBits & (1U << memory.type)))
+            return refuse("the buffer's memory type cannot hold a linear image");
+        if ((memory.offset + offset) % requirements.alignment)
+            return refuse("offset " + std::to_string(offset) + " is not aligned to " + std::to_string(requirements.alignment));
+        if (offset > memory.size || requirements.size > memory.size - offset) return refuse("the texture exceeds its buffer");
+        result->memory = memory;
+        result->memory.offset = memory.offset + offset;
+        result->memory.size = requirements.size;
+        result->memory.mapped = nullptr;
+        result->buffer = buffer;
+        result->backing = buffer;
+        result->buffer_offset = offset;
+        result->bytes_per_row = bytes_per_row;
+        check(d.vk.vkBindImageMemory(d.device, result->image, result->memory.memory, result->memory.offset), "vkBindImageMemory");
+        if (image.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT))
+            result->create_shader_views(VK_IMAGE_VIEW_TYPE_2D, result->format, 1, 1, component_mapping(desc.swizzle, info->swizzle));
+        *result->state->layout = VK_IMAGE_LAYOUT_GENERAL;
+        d.queue_initial_layout(result->image, info->aspects(), true);
+        return result;
+    }
     if (descriptor.type != TextureType::texture_buffer)
-        throw VulkanError("Alchemy Metal: linear textures over buffers are only translated for MTLTextureTypeTextureBuffer");
+        throw VulkanError("Alchemy Metal: linear textures over buffers are translated for MTLTextureType2D and "
+                          "MTLTextureTypeTextureBuffer");
     const auto* info = pixel_format_info(descriptor.pixel_format);
     if (!info || info->compressed() || info->has_depth() || info->has_stencil())
         throw VulkanError("Alchemy Metal: unsupported texture buffer format " + std::to_string(descriptor.pixel_format));
@@ -504,12 +769,13 @@ Texture::~Texture() {
     if (storage_view && storage_view != view) views.push_back(storage_view);
     for (const auto& [key, value] : attachment_views_) views.push_back(value);
     const auto handle = owns_image ? image : VK_NULL_HANDLE;
-    auto allocation = memory;
+    // Memory someone else owns stays theirs (kept alive until the image goes).
+    auto allocation = backing ? Allocation{} : memory;
     auto buffer_view_handle = buffer_view;
     const auto slot = bindless_slot_;
     if (handle) owner->cancel_initial_layout(handle);
     if (views.empty() && !handle && !buffer_view_handle) return;
-    owner->defer([owner, views, handle, allocation, buffer_view_handle, slot]() mutable {
+    owner->defer([owner, views, handle, allocation, buffer_view_handle, slot, kept = backing]() mutable {
         if (slot)
             if (auto* bindless = Bindless::of(*owner)) bindless->remove_texture(slot);
         for (const auto value : views) owner->vk.vkDestroyImageView(owner->device, value, nullptr);

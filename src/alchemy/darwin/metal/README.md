@@ -92,6 +92,21 @@ without one; stepRate 0 always stops. The ...options:completionHandler:
 pipeline forms run their synchronous forms and call the handler before
 returning; tile and mesh render pipelines answer nil with an error.
 
+**Heaps, buffer-backed textures, dynamic strides:** MTLHeapTypePlacement
+heaps own one allocation (PlacementMemory) and bind buffers and textures at
+the client's offsets, aliasing as the client arranges; heapBuffer/
+TextureSizeAndAlign answer the Vulkan requirements (bufferImageGranularity
+included). Sparse heaps stop explicitly. newTextureWithDescriptor:offset:
+bytesPerRow: with MTLTextureType2D is a linear image bound to the buffer's
+memory: bytesPerRow must be the driver's row pitch (the row bytes rounded up
+to minimumLinearTextureAlignmentForPixelFormat:) and the offset must meet the
+driver's linear offset alignment (buffers of 64 KiB and more start on it);
+otherwise it stops explicitly. Texture buffers have views of another format
+of the same texel size (no swizzle) and texture-to-texture copies.
+MTLBufferLayoutStrideDynamic layouts take the ...attributeStride: binds'
+strides (VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE). Vector function
+constants: msl/README.md.
+
 ## Moved from darwin/identities/
 
 * `stage_input_output_shell.cpp`: the MTLStageInputOutputDescriptor shell (the support kit).

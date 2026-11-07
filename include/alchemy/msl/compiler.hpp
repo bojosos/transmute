@@ -137,6 +137,10 @@ inline constexpr std::uint32_t raster_sample_count = 0x10003;
 // + [[function_constant(index)]] index: bool, true when the pipeline provides a
 // value for that constant (is_function_constant_defined). Default false.
 inline constexpr std::uint32_t function_constant_defined_base = 0x20000;
+// + index * 4 + component: one component of a vector [[function_constant(index)]]
+// (its element scalar). Vector constants have no specialization constant at
+// their own index.
+inline constexpr std::uint32_t function_constant_component_base = 0x30000;
 } // namespace reserved_spec_id
 
 // Kernel grid (addition by A5, wave 1). Every kernel pipeline layout has one
