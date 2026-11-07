@@ -1009,8 +1009,16 @@ void DarwinServices::Impl::install_process_services() {
             request.target = resolve(path, read_strings(m, s.x[4]), request.envp);
             if (attributes.flags & 0x40) return exec_in_place(std::move(request));   // POSIX_SPAWN_SETEXEC
             const auto attributes_token = s.x[3] ? m.read64(s.x[3]) : 0;
+            // The special ports travel in the launch specification, written before the
+            // child runs; spawn_started is the path when no provider serializes them.
+            bool handed_over = false;
+            if (context.spawn_special_ports)
+                request.special_ports = [this, attributes_token, &handed_over](std::uint32_t pid) {
+                    handed_over = true;
+                    return context.spawn_special_ports(attributes_token, pid);
+                };
             const auto spawned = start(request, path);
-            if (context.spawn_started) context.spawn_started(attributes_token, spawned.pid);
+            if (context.spawn_started && !handed_over) context.spawn_started(attributes_token, spawned.pid);
             if (s.x[0]) { validate(m, s.x[0], 4, true); m.write32(s.x[0], spawned.pid); }
             return 0;
         } catch (const ServiceError& error) { return error.value; }

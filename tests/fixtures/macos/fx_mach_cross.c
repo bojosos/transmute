@@ -18,7 +18,11 @@
  *   9. the child's answer carries 128 KiB of out-of-line memory (large enough
  *      to travel in a host section) and an audit token with a pid version;
  *  10. the child's task port reaches the parent, which sets and reads the
- *      child's task policy and reads its task_info through it.
+ *      child's task policy and reads its task_info through it;
+ *  11. as GoogleUpdater's launcher: a child passes the bootstrap port to a
+ *      grandchild as its TASK_BOOTSTRAP_PORT and exits at once; the grandchild
+ *      outlives it, checks in a name through that special port (read only
+ *      after its parent is gone), and this process finds the name.
  * No SDK headers. Prints "fx mach cross: ok"; else exits with the step. */
 typedef unsigned mach_port_t;
 typedef int kern_return_t;
@@ -39,6 +43,9 @@ extern int posix_spawnattr_setspecialport_np(posix_spawnattr_t*, mach_port_t, in
 extern int posix_spawn(pid_t*, const char*, void*, posix_spawnattr_t*, char* const[], char* const[]);
 extern pid_t waitpid(pid_t, int*, int);
 extern pid_t getpid(void);
+extern pid_t getppid(void);
+extern int kill(pid_t, int);
+extern int usleep(unsigned);
 extern int puts(const char*);
 extern int pipe(int*);
 extern long write(int, const void*, unsigned long);
@@ -65,6 +72,7 @@ extern kern_return_t task_info(mach_port_t, unsigned, int*, unsigned*);
 #define RCV_AUDIT (3u << 24)
 #define COMPLEX 0x80000000u
 #define TASK_ACCESS_PORT 9
+#define TASK_BOOTSTRAP_PORT 4
 #define NOTIFY_NO_SENDERS 0106
 #define NOTIFY_DEAD_NAME 0110
 
@@ -181,8 +189,35 @@ static int same(const char* a, const char* b) {
     return *a == *b;
 }
 
+/* 11. The launcher: starts the server with this process's bootstrap port as its
+ * TASK_BOOTSTRAP_PORT, then exits without waiting. */
+static int launcher(char* program, char* name) {
+    posix_spawnattr_t attributes;
+    if (posix_spawnattr_init(&attributes) != 0 ||
+        posix_spawnattr_setspecialport_np(&attributes, bootstrap_port, TASK_BOOTSTRAP_PORT) != 0) return 2;
+    char* arguments[] = {program, "server", name, 0};
+    pid_t pid = 0;
+    if (posix_spawn(&pid, program, 0, &attributes, arguments, environ) != 0 || pid <= 0) return 3;
+    return 0;
+}
+/* The server: once its parent has exited, checks in `name` through its special
+ * bootstrap port and waits for one message. */
+static int server(const char* name) {
+    const pid_t parent = getppid();
+    for (int attempt = 0; attempt < 400 && kill(parent, 0) == 0; ++attempt) usleep(25000);
+    if (kill(parent, 0) == 0) return 2;
+    mach_port_t bootstrap = 0, port = 0;
+    if (task_get_special_port(mach_task_self_, TASK_BOOTSTRAP_PORT, &bootstrap) != 0 || !bootstrap) return 3;
+    if (bootstrap_check_in(bootstrap, name, &port) != 0) return 4;
+    buffer_t buffer;
+    if (receive(&buffer, port) != 0 || buffer.header.id != 600) return 5;
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && same(argv[1], "child")) return child(argv[2]);
+    if (argc == 3 && same(argv[1], "launcher")) return launcher(argv[0], argv[2]);
+    if (argc == 3 && same(argv[1], "server")) return server(argv[2]);
     const mach_port_t task = mach_task_self_;
     char service[64] = "org.alchemy.test.cross.";
     decimal(service + 23, (unsigned)getpid());
@@ -260,6 +295,17 @@ int main(int argc, char** argv) {
         if (buffer.header.id == NOTIFY_NO_SENDERS) ++unsent;
     }
     if (dead != 1 || unsent != 1) return 19;
+    /* 11. The orphaned server is still there, and its name came through its special port. */
+    char orphan[64] = "org.alchemy.test.orphan.";
+    decimal(orphan + 24, (unsigned)getpid());
+    char* launcher_arguments[] = {argv[0], "launcher", orphan, 0};
+    pid_t launcher_pid = 0;
+    if (posix_spawn(&launcher_pid, argv[0], 0, 0, launcher_arguments, environ) != 0 || launcher_pid <= 0) return 45;
+    if (waitpid(launcher_pid, &status, 0) != launcher_pid || status != 0) return 46;
+    mach_port_t found = 0;
+    for (int attempt = 0; attempt < 400 && bootstrap_look_up(bootstrap_port, orphan, &found) != 0; ++attempt) usleep(25000);
+    if (!found) return 47;
+    if (send_value(found, 600, 11) != 0) return 48;
     puts("fx mach cross: ok");
     return 0;
 }

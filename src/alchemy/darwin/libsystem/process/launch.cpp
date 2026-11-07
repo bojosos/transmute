@@ -10,6 +10,7 @@
 #include "alchemy/host/sections.hpp"
 #include "alchemy/host/vm.hpp"
 #include "alchemy/path.hpp"
+#include "alchemy/process_tree.hpp"
 
 #include <algorithm>
 #include <array>
@@ -118,6 +119,8 @@ std::vector<std::uint8_t> encode(const ChildLaunch& launch) {
         w.u32(static_cast<std::uint32_t>(fd.socket_protocol));
         w.u32(fd.terminal); w.u32(fd.terminal_master ? 1U : 0U);
     }
+    w.u32(static_cast<std::uint32_t>(launch.special_ports.size()));
+    for (const auto& [which, wire] : launch.special_ports) { w.u32(which); w.blob(wire); }
     return std::move(w.bytes);
 }
 
@@ -145,6 +148,12 @@ ChildLaunch decode(std::span<const std::uint8_t> bytes) {
         fd.socket_protocol = static_cast<std::int32_t>(r.u32());
         fd.terminal = r.u32(); fd.terminal_master = r.u32() != 0;
         launch.fds.push_back(std::move(fd));
+    }
+    const auto specials = r.u32();
+    if (specials > 16) throw std::runtime_error("Alchemy child launch specification has too many special ports");
+    for (std::uint32_t i = 0; i < specials; ++i) {
+        const auto which = r.u32();
+        launch.special_ports.emplace_back(which, r.blob());
     }
     return launch;
 }
@@ -458,7 +467,12 @@ SpawnedProcess spawn_child(const SpawnRequest& request) {
     options.inherit = owned.handles;
     options.new_group = request.new_session || request.new_group;
     options.suspended = true;
-    options.end_with_parent = true;   // every child ends when this process does
+    // The root of an Alchemy process tree (started from the host) puts its children in its
+    // kill-on-close job, and their descendants join it too (nested jobs), so nothing outlives
+    // the tree. Deeper processes don't add their own: as on Darwin, a child outlives the
+    // parent that spawned it (GoogleUpdater's launcher starts its server and exits at once).
+    const auto self_record = process_tree::self();
+    options.end_with_parent = !self_record || self_record->ppid <= 1;
     const auto spawned = host::process::spawn(options);
     if (!spawned) {
         if (spawned.error() == host::Error::out_of_range) throw ProcessError(e2big, "child command line is too long");
@@ -471,7 +485,8 @@ SpawnedProcess spawn_child(const SpawnRequest& request) {
             host::close(value.thread);
         }
     } started{*spawned};
-    if (!sockets.empty()) {
+    if (request.special_ports) launch.special_ports = request.special_ports(spawned->pid);
+    if (!sockets.empty() || !launch.special_ports.empty()) {
         for (const auto& [index, socket] : sockets) {
             auto blob = host::net::export_socket(socket, spawned->pid);
             if (!blob) throw ProcessError(eio, "cannot pass a socket to the child (WSADuplicateSocketW)");

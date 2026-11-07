@@ -758,16 +758,25 @@ void MachProvider::install() {
     static_cast<void>(audit_token());   // computed on this (guest-calling) thread, reused by transport threads
     // posix_spawn: the special ports set with posix_spawnattr_setspecialport_np.
     process.spawn_starting = [weak](std::uint64_t) { if (const auto self = weak.lock()) self->ipc->spawn_starting(); };
-    process.spawn_started = [weak](std::uint64_t attributes, std::uint32_t pid) {
+    const auto specials_of = [](MachProvider& self, std::uint64_t attributes) {
+        std::vector<std::pair<std::uint32_t, Right>> specials;
+        std::lock_guard lock(self.mutex);
+        if (const auto found = self.spawn_specials.find(attributes); found != self.spawn_specials.end())
+            for (const auto& [which, right] : found->second) specials.emplace_back(which, self.ipc->copy_send(right));
+        return specials;
+    };
+    process.spawn_started = [weak, specials_of](std::uint64_t attributes, std::uint32_t pid) {
         const auto self = weak.lock();
         if (!self || !pid) return;   // pid 0: the spawn failed
-        std::vector<std::pair<std::uint32_t, Right>> specials;
-        {
-            std::lock_guard lock(self->mutex);
-            if (const auto found = self->spawn_specials.find(attributes); found != self->spawn_specials.end())
-                for (const auto& [which, right] : found->second) specials.emplace_back(which, self->ipc->copy_send(right));
-        }
-        self->ipc->spawn_started(pid, std::move(specials));
+        self->ipc->spawn_started(pid, specials_of(*self, attributes));
+    };
+    // As on Darwin, the child has them from its first instruction: they go into its launch
+    // specification before it runs, so a parent that exits at once still passes them.
+    process.spawn_special_ports = [weak, specials_of](std::uint64_t attributes, std::uint32_t pid) {
+        std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> wires;
+        const auto self = weak.lock();
+        if (!self || !pid) return wires;
+        return self->ipc->special_port_wires(pid, specials_of(*self, attributes));
     };
     install_ports();
     install_messages();
@@ -1023,7 +1032,10 @@ void MachProvider::install_tasks() {
                 inherited_specials = true;
             }
             if (fetch) {
-                auto inherited = ipc->inherited_special_ports(static_cast<std::uint32_t>(call(libsystem, "_getppid", {})));
+                // From the launch specification (posix_spawn wrote them there), else asked of the parent.
+                const auto parent = static_cast<std::uint32_t>(call(libsystem, "_getppid", {}));
+                const auto& launch = process.child_launch;
+                auto inherited = launch ? ipc->adopt_special_ports(parent, launch->special_ports) : ipc->inherited_special_ports(parent);
                 std::lock_guard lock(mutex);
                 for (auto& [slot, right] : inherited) {
                     if (const auto previous = special_ports.find(slot); previous != special_ports.end()) ipc->drop(previous->second);

@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace alchemy {
@@ -68,6 +69,9 @@ struct ChildLaunch {
     std::uint32_t ignored_signals{};     // SIG_IGN dispositions that survive exec
     std::uint32_t signal_mask{};
     std::vector<ChildFd> fds;            // 0..2 included unless closed
+    // posix_spawnattr_setspecialport_np's ports as Mach wire rights (slot, bytes), written
+    // by the parent before the child runs, so they arrive even when the parent exits at once.
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> special_ports;
 };
 
 // Error from process creation: a Darwin errno and a diagnostic.
@@ -122,6 +126,9 @@ struct SpawnRequest {
     bool new_session{}, new_group{};
     std::uint32_t umask{022}, ignored_signals{}, signal_mask{};
     std::vector<std::string> launch_options;  // runtime options of the Alchemy command line
+    // The child's special ports as wire rights, asked for once its pid is known and before
+    // it runs (ChildLaunch::special_ports); empty when none was set.
+    std::function<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>(std::uint32_t pid)> special_ports;
 };
 struct SpawnedProcess {
     void* process{};       // Windows process HANDLE owned by the caller

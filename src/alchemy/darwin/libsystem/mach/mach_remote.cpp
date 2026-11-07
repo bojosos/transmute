@@ -728,12 +728,14 @@ void MachIpc::spawn_starting() {
     last_spawn_ = std::chrono::steady_clock::now();
 }
 
-void MachIpc::spawn_started(std::uint32_t pid, std::vector<std::pair<std::uint32_t, Right>> specials) {
+std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> MachIpc::special_port_wires(
+    std::uint32_t pid, std::vector<std::pair<std::uint32_t, Right>> specials) {
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> entries;
     if (!transport_) {
         for (auto& [which, right] : specials) { static_cast<void>(which); drop(std::move(right)); }
-        return;
+        return entries;
     }
-    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> entries;
+    transport_->start();   // a right this process hosts is reached through it
     for (auto& [which, right] : specials) {
         Writer wire;
         std::vector<std::shared_ptr<Port>> migrated;
@@ -744,6 +746,15 @@ void MachIpc::spawn_started(std::uint32_t pid, std::vector<std::pair<std::uint32
             port->migrating = false;
         }
     }
+    return entries;
+}
+
+void MachIpc::spawn_started(std::uint32_t pid, std::vector<std::pair<std::uint32_t, Right>> specials) {
+    if (!transport_) {
+        for (auto& [which, right] : specials) { static_cast<void>(which); drop(std::move(right)); }
+        return;
+    }
+    auto entries = special_port_wires(pid, std::move(specials));
     Lock lock(mutex_);
     specials_[pid] = std::move(entries);
     specials_changed_.notify_all();
@@ -757,6 +768,19 @@ std::optional<std::vector<std::uint8_t>> MachIpc::task_call(std::uint32_t pid, c
     if (!answer || answer->empty()) return std::nullopt;
     Reader reader{*answer};
     return reader.blob();
+}
+
+std::vector<std::pair<std::uint32_t, Right>> MachIpc::adopt_special_ports(
+    std::uint32_t parent, const std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>& wires) {
+    std::vector<std::pair<std::uint32_t, Right>> result;
+    if (!transport_) return result;
+    Lock lock(mutex_);
+    for (const auto& [which, wire] : wires) {
+        Reader right{wire};
+        result.emplace_back(which, read_right(right, parent));
+    }
+    touch();
+    return result;
 }
 
 std::vector<std::pair<std::uint32_t, Right>> MachIpc::inherited_special_ports(std::uint32_t parent) {

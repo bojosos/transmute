@@ -316,8 +316,15 @@ public:
     // posix_spawn: special ports the child receives (task_get_special_port).
     void spawn_starting();
     void spawn_started(std::uint32_t pid, std::vector<std::pair<std::uint32_t, Right>> specials);
-    // The child side: its parent's special ports for it (once).
+    // The same rights as wires for child `pid`, for its launch specification (written
+    // before the child runs, so they arrive even when this process exits at once).
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> special_port_wires(
+        std::uint32_t pid, std::vector<std::pair<std::uint32_t, Right>> specials);
+    // The child side: its parent's special ports for it (once), asked for over the transport,
     std::vector<std::pair<std::uint32_t, Right>> inherited_special_ports(std::uint32_t parent);
+    // or read from the wires its launch specification carries.
+    std::vector<std::pair<std::uint32_t, Right>> adopt_special_ports(
+        std::uint32_t parent, const std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>& wires);
     // A routine on the task of process `pid` (Guest::task_call there); empty
     // when that process cannot be reached.
     std::optional<std::vector<std::uint8_t>> task_call(std::uint32_t pid, const std::vector<std::uint8_t>& call);
