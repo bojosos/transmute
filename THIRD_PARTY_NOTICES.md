@@ -20,6 +20,7 @@ guest runtimes ship with are in [runtime/THIRD_PARTY_NOTICES.md](runtime/THIRD_P
 | [dav1d](https://code.videolan.org/videolan/dav1d) 1.5.4 | BSD-2-Clause | `third_party/dav1d/` | The AV1 decoder C sources of dav1d's meson lists (no assembly), unmodified. Hashes in `PROVENANCE.md`. Compiled into alchemy-fx. |
 | [libaom](https://aomedia.googlesource.com/aom) v3.15.2 test vectors | BSD-2-Clause, with the Alliance for Open Media Patent License 1.0 (`PATENTS`) | `third_party/libaom/` | Two AV1 decoder test vectors from libaom's test-data storage with their per-frame MD5s, and `LICENSE` and `PATENTS`, unmodified; URLs, sizes and hashes in `PROVENANCE.md`. Test data only: nothing is compiled. |
 | [libxml2](https://gitlab.gnome.org/GNOME/libxml2) 2.15.4 | MIT (`dict.c` and `list.c`: ISC-style notices of the same terms) | `third_party/libxml2/` | The library sources the upstream CMake build lists for the enabled features, with the headers and `codegen` tables they include, all public headers and `Copyright`, unmodified, hashes in `PROVENANCE.md`. Built into the guest `/usr/lib/libxml2.2.dylib` by `scripts/build_alchemy_libxml2.ps1`. |
+| [libxslt](https://gitlab.gnome.org/GNOME/libxslt) 1.1.45 (with libexslt 0.8.25) | MIT | `third_party/libxslt/` | The library sources of `libxslt/` and `libexslt/` the upstream CMake build lists, the headers they include, all public headers, the config templates and `Copyright`, unmodified, hashes in `PROVENANCE.md`. Built into the guest `/usr/lib/libxslt.1.dylib` and `/usr/lib/libexslt.0.dylib` by `scripts/build_alchemy_libxslt.ps1`. |
 | m2v-capi (project-authored) | **LGPL-3.0-or-later** | `external/m2v-capi/` | The C ABI over metal2vulkan, with its own `COPYING.LESSER` and `COPYING`. Not MIT, and not compiled into anything else: it builds a separate DLL ([below](#loaded-at-run-time-when-present-m2v_capidll-metal2vulkan)). |
 
 Nothing else is vendored. In particular:
@@ -50,6 +51,7 @@ and `runtime/THIRD_PARTY_NOTICES.md` beside its outputs, and records hashes in
 | Combine.framework from OpenCombine 0.14.0 (`third_party/opencombine/`) | MIT | `scripts/build_alchemy_swift.ps1` |
 | Expat 2.8.5 | MIT | `R_2_8_5`, `scripts/build_alchemy_expat.ps1` |
 | libxml2 2.15.4 (`third_party/libxml2/`) | MIT | `scripts/build_alchemy_libxml2.ps1` |
+| libxslt 1.1.45 and libexslt 0.8.25 (`third_party/libxslt/`) | MIT | `scripts/build_alchemy_libxslt.ps1` |
 | CPython 3.11 embedding launcher (optional) | PSF-2.0 | Built from a CPython the user supplies, by `scripts/build_alchemy_python.ps1`. It keeps CPython's license files and is never redistributed. |
 
 Applications that are run or audited (Chrome, Blender, QLab and others) are
