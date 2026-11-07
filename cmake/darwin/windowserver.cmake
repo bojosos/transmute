@@ -19,7 +19,8 @@ function(alchemy_gui_windowserver_tests)
     alchemy_gui_add_unit_test(alchemy_gui_windowserver_win32
         src/alchemy/darwin/windowserver/tests/windowserver_win32_tests.cpp)
     # The GUI-only host areas the window server and media run on (host::ui,
-    # host::audio, host::midi): alchemy_host_tests links alchemy_core alone.
-    alchemy_gui_add_unit_test(alchemy_gui_host src/alchemy/host/tests/host_gui_tests.cpp)
+    # host::audio, host::midi): alchemy_host_tests links alchemy_core alone. Its media part opens every encoder
+    # and decoder of the host (hardware ones take seconds each): 37 s alone, over 60 s under a full ctest -j12.
+    alchemy_gui_add_unit_test(alchemy_gui_host src/alchemy/host/tests/host_gui_tests.cpp TIMEOUT 180)
 endfunction()
 alchemy_gui_register_tests(alchemy_gui_windowserver_tests)
