@@ -192,6 +192,25 @@ public:
     [[nodiscard]] VkDescriptorPool acquire_descriptor_pool();
     void recycle_descriptor_pool(VkDescriptorPool pool);   // after the GPU finished with it
 
+    // ---- pipeline creation ----------------------------------------------------
+    // Held around vkCreateShaderModule, vkCreate*Pipelines and the pipeline
+    // cache's data reads and merges where the driver needs them one at a
+    // time: Intel's Windows driver faults (igvk64.dll, a read near null) in
+    // concurrent compute pipeline compiles that miss its own shader cache, as
+    // Blender's parallel shader compiles do. A no-op lock elsewhere.
+    // ALCHEMY_METAL_SERIAL_PIPELINES=1 / 0 forces it on / off.
+    [[nodiscard]] std::unique_lock<std::mutex> pipeline_creation_lock() {
+        return serial_pipelines_ ? std::unique_lock<std::mutex>(pipeline_creation_mutex_)
+                                 : std::unique_lock<std::mutex>(pipeline_creation_mutex_, std::defer_lock);
+    }
+    [[nodiscard]] bool serial_pipelines() const noexcept { return serial_pipelines_; }
+    // Diagnostics: with ALCHEMY_METAL_SPIRV_SALT set, every shader module gets
+    // a unique OpModuleProcessed string (the value, the process and a
+    // counter), so the driver's own shader cache never hits; a run then
+    // compiles every pipeline as on a first run after an update. `code` is
+    // returned unchanged without it.
+    [[nodiscard]] static std::vector<std::uint32_t> salted_spirv(std::span<const std::uint32_t> code);
+
     // ---- pipeline cache --------------------------------------------------------
     VkPipelineCache pipeline_cache{};
     void save_pipeline_cache();
@@ -226,6 +245,8 @@ public:
     }
 
 private:
+    std::mutex pipeline_creation_mutex_;
+    bool serial_pipelines_{};
     struct Block {
         VkDeviceMemory memory{};
         VkDeviceSize size{};

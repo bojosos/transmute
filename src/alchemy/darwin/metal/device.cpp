@@ -462,6 +462,9 @@ void Device::build_profile() {
     // real name is reported either way, never one chosen for a rating.
     // ALCHEMY_METAL_DEVICE_NAME overrides it for diagnostics only.
     p.name = metal_device_name(properties);
+    // pipeline_creation_lock: Intel's driver (vendor 0x8086) by default.
+    serial_pipelines_ = properties.vendorID == 0x8086;
+    if (const auto forced = environment("ALCHEMY_METAL_SERIAL_PIPELINES"); !forced.empty()) serial_pipelines_ = forced != "0";
     p.registry_id = physical_device_registry_id(properties, id);
     p.unified_memory = properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
                        properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
@@ -990,8 +993,32 @@ void Device::note_pipeline_cache_dirty() noexcept {
     cache_dirty_ms_.store(std::max<std::int64_t>(now, 1), std::memory_order_relaxed);
 }
 
+std::vector<std::uint32_t> Device::salted_spirv(std::span<const std::uint32_t> code) {
+    std::vector<std::uint32_t> result(code.begin(), code.end());
+    static const std::string salt = environment("ALCHEMY_METAL_SPIRV_SALT");
+    if (salt.empty() || result.size() < 5) return result;
+    static std::atomic<std::uint64_t> counter{};
+    const auto text = salt + "-" + std::to_string(host::process::current_pid()) + "-" + std::to_string(counter++);
+    // OpModuleProcessed (330) belongs after the debug names: before the first
+    // instruction that is not a capability, extension, import, memory model,
+    // entry point, execution mode, source or name.
+    std::size_t at = 5;
+    while (at < result.size()) {
+        const auto opcode = result[at] & 0xffff, count = result[at] >> 16;
+        static constexpr std::uint32_t header[] = {2, 3, 4, 5, 6, 7, 10, 11, 14, 15, 16, 17, 330, 331};
+        if (!count || std::find(std::begin(header), std::end(header), opcode) == std::end(header)) break;
+        at += count;
+    }
+    std::vector<std::uint32_t> words((text.size() + 4) / 4, 0);
+    std::memcpy(words.data(), text.data(), text.size());
+    words.insert(words.begin(), (static_cast<std::uint32_t>(words.size() + 1) << 16) | 330U);
+    result.insert(result.begin() + static_cast<std::ptrdiff_t>(at), words.begin(), words.end());
+    return result;
+}
+
 std::vector<std::uint8_t> Device::pipeline_cache_data() {
     if (!pipeline_cache) return {};
+    const auto serial = pipeline_creation_lock();
     std::size_t size{};
     check(vk.vkGetPipelineCacheData(device, pipeline_cache, &size, nullptr), "vkGetPipelineCacheData");
     std::vector<std::uint8_t> data(size);
@@ -1006,6 +1033,7 @@ void Device::merge_pipeline_cache(std::span<const std::uint8_t> data) {
     info.initialDataSize = data.size();
     info.pInitialData = data.data();
     VkPipelineCache loaded{};
+    const auto serial = pipeline_creation_lock();
     check(vk.vkCreatePipelineCache(device, &info, nullptr, &loaded), "vkCreatePipelineCache");
     const auto merged = vk.vkMergePipelineCaches(device, pipeline_cache, 1, &loaded);
     vk.vkDestroyPipelineCache(device, loaded, nullptr);
@@ -1015,12 +1043,14 @@ void Device::merge_pipeline_cache(std::span<const std::uint8_t> data) {
 
 void Device::save_pipeline_cache() {
     if (cache_path_.empty() || !pipeline_cache) return;
+    auto serial = pipeline_creation_lock();
     std::size_t size{};
     check(vk.vkGetPipelineCacheData(device, pipeline_cache, &size, nullptr), "vkGetPipelineCacheData");
     if (size == cache_saved_size_) return;
     std::vector<char> data(size);
     check(vk.vkGetPipelineCacheData(device, pipeline_cache, &size, data.data()), "vkGetPipelineCacheData");
     data.resize(size);
+    if (serial.owns_lock()) serial.unlock();   // the file write needs no lock
     std::error_code error;
     std::filesystem::create_directories(cache_path_.parent_path(), error);
     const auto temporary = cache_path_.string() + ".tmp" +

@@ -40,6 +40,14 @@ Pipelines, ICBs, acceleration structures and function tables in argument
 buffers stop explicitly; useResource:/useHeap: need nothing (textures stay
 in GENERAL).
 
+**Pipeline creation:** on Intel's Windows driver, shader module and pipeline
+creation (and the pipeline cache's data reads) run one at a time
+(Device::pipeline_creation_lock): its compute pipeline compiles fault when
+several run at once and miss the driver's shader cache, as Blender's
+parallel shader compiles do on a first run. ALCHEMY_METAL_SERIAL_PIPELINES=1
+or 0 forces it on or off; ALCHEMY_METAL_SPIRV_SALT=<text> (diagnostics) makes
+every module new to the driver's cache, as on a first run.
+
 **Command buffer times:** kernelStartTime/kernelEndTime are the host's submit
 and observed completion; GPUStartTime/GPUEndTime come from two timestamp
 queries per command buffer, recorded once the process first asked for GPU

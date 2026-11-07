@@ -98,11 +98,15 @@ VkDescriptorType descriptor_type(msl::DescriptorType type) {
 
 VkShaderModule create_module(Device& device, const std::vector<std::uint32_t>& code, const std::string& name) {
     if (code.empty()) throw std::runtime_error("Metal function " + name + " has no SPIR-V");
+    const auto words = Device::salted_spirv(code);
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    info.codeSize = code.size() * sizeof(std::uint32_t);
-    info.pCode = code.data();
+    info.codeSize = words.size() * sizeof(std::uint32_t);
+    info.pCode = words.data();
     VkShaderModule module{};
-    check(device.vk.vkCreateShaderModule(device.device, &info, nullptr, &module), "vkCreateShaderModule");
+    {
+        const auto serial = device.pipeline_creation_lock();
+        check(device.vk.vkCreateShaderModule(device.device, &info, nullptr, &module), "vkCreateShaderModule");
+    }
     device.set_name(VK_OBJECT_TYPE_SHADER_MODULE, reinterpret_cast<std::uint64_t>(module), name);
     return module;
 }
@@ -590,7 +594,10 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
     VkPipeline result{};
     {
         perf::Scope timed(perf::mtl_pipeline_create_ticks, perf::mtl_pipelines_created);
-        check(d.vk.vkCreateGraphicsPipelines(d.device, d.pipeline_cache, 1, &info, nullptr, &result), "vkCreateGraphicsPipelines");
+        {
+            const auto serial = d.pipeline_creation_lock();
+            check(d.vk.vkCreateGraphicsPipelines(d.device, d.pipeline_cache, 1, &info, nullptr, &result), "vkCreateGraphicsPipelines");
+        }
     }
     perf::phase("first VkPipeline created");
     d.set_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(result), descriptor.label);
@@ -685,7 +692,10 @@ VkPipeline ComputePipeline::pipeline(const std::array<std::uint32_t, 3>& threads
     VkPipeline result{};
     {
         perf::Scope timed(perf::mtl_pipeline_create_ticks, perf::mtl_pipelines_created);
-        check(d.vk.vkCreateComputePipelines(d.device, d.pipeline_cache, 1, &info, nullptr, &result), "vkCreateComputePipelines");
+        {
+            const auto serial = d.pipeline_creation_lock();
+            check(d.vk.vkCreateComputePipelines(d.device, d.pipeline_cache, 1, &info, nullptr, &result), "vkCreateComputePipelines");
+        }
     }
     d.set_name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(result), label.empty() ? function->name() : label);
     variants_.emplace(std::move(key), result);

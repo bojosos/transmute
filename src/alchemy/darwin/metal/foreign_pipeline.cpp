@@ -185,12 +185,15 @@ ForeignPipeline::ForeignPipeline(std::shared_ptr<Device> owner, std::shared_ptr<
         check(d.vk.vkCreatePipelineLayout(d.device, &pipeline_layout, nullptr, &layout_), "vkCreatePipelineLayout");
 
         for (std::size_t stage = 0; stage < info["stages"].size(); ++stage) {
-            const auto code = pipeline->spirv(stage);
+            const auto code = Device::salted_spirv(pipeline->spirv(stage));
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = code.size_bytes();
+            module_info.codeSize = code.size() * sizeof(std::uint32_t);
             module_info.pCode = code.data();
             VkShaderModule module{};
-            check(d.vk.vkCreateShaderModule(d.device, &module_info, nullptr, &module), "vkCreateShaderModule");
+            {
+                const auto serial = d.pipeline_creation_lock();
+                check(d.vk.vkCreateShaderModule(d.device, &module_info, nullptr, &module), "vkCreateShaderModule");
+            }
             modules_.push_back(module);
         }
     } catch (...) {
@@ -268,7 +271,10 @@ VkPipeline ForeignPipeline::create_compute(const json::Value& region) {
     VkPipeline result{};
     {
         perf::Scope timed(perf::mtl_pipeline_create_ticks, perf::mtl_pipelines_created);
-        check(d.vk.vkCreateComputePipelines(d.device, d.pipeline_cache, 1, &info, nullptr, &result), "vkCreateComputePipelines");
+        {
+            const auto serial = d.pipeline_creation_lock();
+            check(d.vk.vkCreateComputePipelines(d.device, d.pipeline_cache, 1, &info, nullptr, &result), "vkCreateComputePipelines");
+        }
     }
     note_created(d);
     return result;
@@ -420,7 +426,10 @@ VkPipeline ForeignPipeline::create_render(const json::Value& specialization_key,
     VkPipeline result{};
     {
         perf::Scope timed(perf::mtl_pipeline_create_ticks, perf::mtl_pipelines_created);
-        check(d.vk.vkCreateGraphicsPipelines(d.device, d.pipeline_cache, 1, &create, nullptr, &result), "vkCreateGraphicsPipelines");
+        {
+            const auto serial = d.pipeline_creation_lock();
+            check(d.vk.vkCreateGraphicsPipelines(d.device, d.pipeline_cache, 1, &create, nullptr, &result), "vkCreateGraphicsPipelines");
+        }
     }
     note_created(d);
     return result;
