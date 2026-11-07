@@ -341,6 +341,43 @@ void Video::install_core_video() {
     raw(core_video, "_CVGetHostClockMinimumTimeDelta", [](CpuState& s, GuestMemory&) { s.x[0] = 1; });
     string(core_video, "_kCVImageBufferColorPrimaries_P22", "P22");   // (unverified: naming convention)
     install_code_points();
+    // CVImageBufferCreateColorSpaceFromAttachments(CFDictionaryRef attachments): +1 CGColorSpace, or NULL when the
+    // attachments name none CoreGraphics has. An ICC profile attachment makes its space; otherwise the primaries and
+    // transfer function together: BT.709 with the BT.709, sRGB or linear transfer (ITU-R 709, sRGB, linear sRGB),
+    // P3 D65 with sRGB or linear (Display P3, linear Display P3), BT.2020 with the BT.709 or BT.2020 transfer
+    // (ITU-R 2020). PQ, HLG and the rest have no CoreGraphics space here.
+    raw(core_video, "_CVImageBufferCreateColorSpaceFromAttachments", [this](CpuState& s, GuestMemory&) {
+        const auto attachments = s.x[0];
+        s.x[0] = 0;
+        if (!attachments || cf.kind(attachments) != ObjectKind::dictionary) return;
+        const auto value = [&](const char* key) {
+            const auto name = cf.string(key);
+            const auto found = cf.dictionary_value(attachments, name);
+            release(name);
+            return found;
+        };
+        if (const auto icc = value("CVImageBufferICCProfile"); icc && cf.kind(icc) == ObjectKind::data) {
+            s.x[0] = call(core_graphics, "_CGColorSpaceCreateWithICCData", {icc});
+            return;
+        }
+        const auto text = [&](const char* key) {
+            const auto found = value(key);
+            return found && cf.kind(found) == ObjectKind::string ? cf.utf8(found) : std::string();
+        };
+        const auto primaries = text("CVImageBufferColorPrimaries"), transfer = text("CVImageBufferTransferFunction");
+        const char* space = nullptr;
+        if (primaries == "ITU_R_709_2")
+            space = transfer == "ITU_R_709_2" ? "kCGColorSpaceITUR_709" : transfer == "IEC_sRGB" ? "kCGColorSpaceSRGB"
+                  : transfer == "Linear" ? "kCGColorSpaceLinearSRGB" : nullptr;
+        else if (primaries == "P3_D65")
+            space = transfer == "IEC_sRGB" ? "kCGColorSpaceDisplayP3" : transfer == "Linear" ? "kCGColorSpaceLinearDisplayP3" : nullptr;
+        else if (primaries == "ITU_R_2020")
+            space = transfer == "ITU_R_709_2" || transfer == "ITU_R_2020" ? "kCGColorSpaceITUR_2020" : nullptr;
+        if (!space) return;
+        const auto name = cf.string(space);
+        s.x[0] = call(core_graphics, "_CGColorSpaceCreateWithName", {name});
+        release(name);
+    });
     // CVPixelBufferIsCompatibleWithAttributes(CVPixelBufferRef, CFDictionaryRef): the buffer's width,
     // height and pixel format (one or any of an array) against those the attributes name.
     raw(core_video, "_CVPixelBufferIsCompatibleWithAttributes", [this](CpuState& s, GuestMemory&) {

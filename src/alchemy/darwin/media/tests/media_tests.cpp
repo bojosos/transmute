@@ -173,6 +173,23 @@ void video(Fixture& f) {
     require(f.status(vt, "_VTPixelTransferSessionCreate", {0, out}) == 0 && f.engine.read64(out) != 0, "a pixel transfer session");
     require(f.status(vt, "_VTSessionSetProperty", {0, 0, 0}) == -12902, "session calls");
     require(f.call(vt, "_VTIsHardwareDecodeSupported", {fourcc("avc1")}) == 0, "no hardware decode");
+    // CVImageBufferCreateColorSpaceFromAttachments: the CoreGraphics space of the primaries and transfer function.
+    {
+        const auto cg = "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics";
+        const auto space_of = [&](const char* primaries, const char* transfer) -> std::string {
+            const std::array<std::pair<Address, Address>, 2> entries{{{f.cf.string("CVImageBufferColorPrimaries"), f.cf.string(primaries)},
+                                                                      {f.cf.string("CVImageBufferTransferFunction"), f.cf.string(transfer)}}};
+            const auto space = f.call(cv, "_CVImageBufferCreateColorSpaceFromAttachments", {f.cf.dictionary(entries)});
+            if (!space) return "";
+            const auto name = f.call(cg, "_CGColorSpaceCopyName", {space});
+            return name ? f.cf.utf8(name) : "(unnamed)";
+        };
+        require(space_of("ITU_R_709_2", "ITU_R_709_2") == "kCGColorSpaceITUR_709" && space_of("ITU_R_709_2", "IEC_sRGB") == "kCGColorSpaceSRGB" &&
+                space_of("ITU_R_709_2", "Linear") == "kCGColorSpaceLinearSRGB" && space_of("P3_D65", "IEC_sRGB") == "kCGColorSpaceDisplayP3" &&
+                space_of("ITU_R_2020", "ITU_R_2020") == "kCGColorSpaceITUR_2020", "the color spaces of BT.709, sRGB, Display P3 and BT.2020");
+        require(space_of("ITU_R_2020", "SMPTE_ST_2084_PQ").empty() && space_of("SMPTE_C", "ITU_R_709_2").empty(), "none for PQ or SMPTE C");
+        require(f.call(cv, "_CVImageBufferCreateColorSpaceFromAttachments", {0}) == 0, "none without attachments");
+    }
     // AVFoundation
     require(f.string_constant(av, "_AVMediaTypeVideo") == "vide", "AVMediaTypeVideo");
     for (const auto* type : {"AVCaptureDeviceTypeExternal", "AVCaptureDeviceTypeContinuityCamera", "AVCaptureDeviceTypeMicrophone"})
