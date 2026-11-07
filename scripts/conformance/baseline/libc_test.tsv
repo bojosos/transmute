@@ -298,12 +298,12 @@ regression/malloc-oom	SKIP	fw-system	allocates until failure; needs setrlimit(RL
 regression/mbsrtowcs-overflow	PASS	fw-system	
 regression/memmem-oob	PASS	fw-system	
 regression/memmem-oob-read	PASS	fw-system	
-regression/mkdtemp-failure	PASS	fw-system	
-regression/mkstemp-failure	PASS	fw-system	
+regression/mkdtemp-failure	XFAIL	fw-system	musl rejects a template with fewer than six X's (EINVAL); Darwin accepts it and fails with ENOTDIR
+regression/mkstemp-failure	XFAIL	fw-system	musl rejects a template with fewer than six X's (EINVAL); Darwin accepts it and fails with ENOTDIR
 regression/printf-1e9-oob	PASS	fw-system	
 regression/printf-fmt-g-round	PASS	fw-system	
 regression/printf-fmt-g-zeros	PASS	fw-system	
-regression/printf-fmt-n	FAIL	fw-system	alchemy: stopping after: unsupported Darwin printf conversion %n during synthetic guest call 0x710000001120 [guest pc 0x710000001120, thread 1]
+regression/printf-fmt-n	PASS	fw-system	
 regression/pthread-robust-detach	XFAIL	fw-system	pthread barriers are not on Darwin
 regression/pthread_atfork-errno-clobber	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\common\setrlim.c:21: setrlimit(7, 0): Function not implemented
 regression/pthread_cancel-sem_wait	XFAIL	fw-system	unnamed and timed semaphores are not on Darwin

@@ -259,7 +259,9 @@ def write_baseline(suite, results, module, old):
         else:
             expected = "BUILD" if r.status == "BUILD" else "FAIL"
         owner = prev.get("owner") or module.owner(r.name)
-        note = prev.get("note") or reason or (r.detail if r.status != "PASS" else "")
+        # A note explains a non-pass; a test that passes now drops its old one.
+        note = "" if r.status == "PASS" else (prev.get("note") if prev.get("expected") != "PASS" else "") or \
+            reason or r.detail
         lines.append("\t".join([r.name, expected, owner, note.replace("\t", " ")[:400]]))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

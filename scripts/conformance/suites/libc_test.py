@@ -114,6 +114,8 @@ NOT_ON_DARWIN = [
     (r"crypt\.h", "Darwin has no crypt.h"),
     (r"'pthread_condattr_setclock'", "pthread_condattr_setclock is not on Darwin"),
     (r"sys/syscall\.h", "uses Linux syscall numbers"),
+    (r"mk[ds]temp\(/dev/null/fooXXXX\)",
+     "musl rejects a template with fewer than six X's (EINVAL); Darwin accepts it and fails with ENOTDIR"),
     (r"st_atim'", "Darwin's struct stat has st_atimespec"),
     (r"'(drem|dremf|exp10|exp10f|exp10l|pow10|pow10f|pow10l|scalbf|sincos|sincosf|sincosl|j0f|j1f|jnf|y0f|y1f|ynf)'",
      "musl/glibc-only math function"),

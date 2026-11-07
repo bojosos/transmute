@@ -179,7 +179,7 @@ objc4/swiftMetadataInitializerRealloc	FAIL	fw-system	alchemy: Mach-O: unresolved
 objc4/swiftStubClassList	FAIL	fw-system	BAD: failed assertion 'initCount != 4' (0x00000000 != 0x00000004) at swiftStubClassList.m:52
 objc4/swiftobject-no-custom-core	BUILD	fw-system	ld64.lld: error: library not found for -lc++
 objc4/sync-error-checking	FAIL	fw-system	OK: sync-error-checking.m
-objc4/synchronized	FAIL	fw-system	timed out
+objc4/synchronized	PASS	fw-system	
 objc4/synchronized-counter	BUILD	fw-system	C:\dev\conformance\out\objc4\test\synchronized-counter.m:11:10: fatal error: 'System/pthread_machdep.h' file not found
 objc4/synchronized-grid	PASS	fw-system	
 objc4/taggedNSPointers	BUILD	fw-system	C:\dev\conformance\out\objc4\test\taggedNSPointers.m:6:9: fatal error: 'Foundation/Foundation.h' file not found

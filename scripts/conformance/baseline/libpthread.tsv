@@ -17,14 +17,14 @@ libpthread/cond/cond_signal_thread_np_waiting_different_cond	PASS	fw-system
 libpthread/cond_prepost/cond_prepost_fairshare	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\cond_prepost.c:57: res == 0 (errno 1: Operation not permitted): condition wait on condvar completed
 libpthread/cond_prepost/cond_prepost_firstfit	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\cond_prepost.c:57: res == 0 (errno 1: Operation not permitted): condition wait on condvar completed
 libpthread/cond_timed/cond_timedwait_beforeepochtimeout	SKIP	fw-system	cond_timedwait_beforeepochtimeout: skipped <rdar://38144536>
-libpthread/cond_timed/cond_timedwait_nulltimeout	FAIL	fw-system	
+libpthread/cond_timed/cond_timedwait_nulltimeout	PASS	fw-system	
 libpthread/cond_timed/cond_timedwait_pasttimeout	SKIP	fw-system	cond_timedwait_pasttimeout: skipped <rdar://38144536>
-libpthread/cond_timed/cond_timedwait_relative_nulltimeout	FAIL	fw-system	
-libpthread/cond_timed/cond_timedwait_relative_pasttimeout	FAIL	fw-system	
+libpthread/cond_timed/cond_timedwait_relative_nulltimeout	PASS	fw-system	
+libpthread/cond_timed/cond_timedwait_relative_pasttimeout	PASS	fw-system	
 libpthread/cond_timed/cond_timedwait_timeout	PASS	fw-system	
 libpthread/cond_timed/cond_timedwait_zerotimeout	SKIP	fw-system	cond_timedwait_zerotimeout: skipped <rdar://38144536>
 libpthread/custom_stack/custom_stack	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\custom_stack.c:36: pthread_attr_setstackaddr(&attr, (void *)stackaddr) == 0 (errno 45: Operation not supported)
-libpthread/detach/pthread_detach	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\detach.c:37: pthread_create(&ths[j], ((void*)0), thread_routine, (void *)j) == 0 (errno 35: Resource temporarily unavailable): thread creation
+libpthread/detach/pthread_detach	PASS	fw-system	
 libpthread/join/join	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_create_suspended_np from library ordinal -2
 libpthread/join/pthread_join_3way	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_create_suspended_np from library ordinal -2
 libpthread/join/pthread_join_stress	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_create_suspended_np from library ordinal -2
@@ -76,7 +76,7 @@ libpthread/rdar_32848402/amx_parallelism_on_non_amx_hardware	BUILD	fw-system	C:\
 libpthread/rdar_32848402/thread_request_32848402	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
 libpthread/setrlimit_sigsegv/setrlimit_overflow_segfault	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\setrlimit_sigsegv.c:25: setrlimit(3, &lim) != -1 (errno 78: Function not implemented)
 libpthread/stack/chkstk	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _thread_chkstk_darwin from library ordinal -2
-libpthread/stack/pthread_stack_frame_decode_np	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _thread_chkstk_darwin from library ordinal -2
+libpthread/stack/pthread_stack_frame_decode_np	PASS	fw-system	
 libpthread/stack_aslr/pthread_stack_aslr	BUILD	fw-system	C:\dev\conformance\out\libpthread\src\stack_aslr.c:137:35: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
 libpthread/stack_aslr/wq_stack_aslr	BUILD	fw-system	C:\dev\conformance\out\libpthread\src\stack_aslr.c:137:35: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
 libpthread/stack_size/stack_size_custom	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\stack_size.c:79: pthread_attr_setstackaddr(&attr, (void *)stackaddr) == 0 (errno 45: Operation not supported)

@@ -559,7 +559,7 @@ posix/pthread_key_create/1-1	PASS	fw-system
 posix/pthread_key_create/1-2	PASS	fw-system	
 posix/pthread_key_create/2-1	PASS	fw-system	
 posix/pthread_key_create/3-1	PASS	fw-system	
-posix/pthread_key_create/speculative/5-1	PASS	fw-system	
+posix/pthread_key_create/speculative/5-1	FAIL	fw-system	passed at main d0643b67; at 17b2bec3 pthread_key_create gives EAGAIN after 502 keys (PTHREAD_KEYS_MAX 512). Speculative test: confirm against macOS ground truth
 posix/pthread_key_delete/1-1	PASS	fw-system	
 posix/pthread_key_delete/1-2	PASS	fw-system	
 posix/pthread_key_delete/2-1	PASS	fw-system	

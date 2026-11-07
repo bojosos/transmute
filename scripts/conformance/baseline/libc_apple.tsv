@@ -208,7 +208,7 @@ libc_apple/netbsd_getcwd/getcwd_fts	PASS	fw-system
 libc_apple/netbsd_getcwd/getcwd_nested	PASS	fw-system	
 libc_apple/netbsd_getenv_thread/putenv_thread	FAIL	fw-system	[PASSED] putenv_thread() completed successfully
 libc_apple/netbsd_getenv_thread/setenv_thread	PASS	fw-system	
-libc_apple/netbsd_getenv_thread/unsetenv_thread	FAIL	fw-system	[PASSED] unsetenv_thread() completed successfully
+libc_apple/netbsd_getenv_thread/unsetenv_thread	PASS	fw-system	
 libc_apple/netbsd_glob/glob_star_not	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\netbsd_glob.c:208: glob(p, 0x0040 | flags, ((void*)0), &gl) == 0 (errno -4: Unknown error: -4)
 libc_apple/netbsd_open_memstream/netbsd_open_memstream_test_open_memstream	PASS	fw-system	
 libc_apple/netbsd_printf/netbsd_snprintf_c99	FAIL	fw-system	exited 0 without finishing the case

@@ -3,7 +3,7 @@
 # on Darwin; the note says which), BUILD (does not build yet), SKIP.
 dispatch/after	PASS	fw-system	
 dispatch/api	PASS	fw-system	
-dispatch/apply	FAIL	fw-system	==================================================
+dispatch/apply	PASS	fw-system	
 dispatch/c99	PASS	fw-system	
 dispatch/cascade	PASS	fw-system	
 dispatch/concur	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _dispatch_queue_set_width from library ordinal -2
@@ -14,16 +14,16 @@ dispatch/debug	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _dispatc
 dispatch/drift	FAIL	fw-system	[FAIL] drift (C:\dev\conformance\out\dispatch\src\dispatch_drift.c:92)
 dispatch/group	FAIL	fw-system	==================================================
 dispatch/io	FAIL	fw-system	[FAIL] group wait timed out (C:\dev\conformance\out\dispatch\src\dispatch_io.c:238)
-dispatch/io_muxed	FAIL	fw-system	[FAIL] bind() (C:\dev\conformance\out\dispatch\src\dispatch_io_muxed.c:191)
+dispatch/io_muxed	PASS	fw-system	
 dispatch/io_net	BUILD	fw-system	C:\dev\conformance\out\dispatch\src\dispatch_io_net.c:41:10: fatal error: 'mach-o/dyld.h' file not found
 dispatch/io_pipe	FAIL	fw-system	==================================================
-dispatch/io_pipe_close	FAIL	fw-system	readFD=3, writeFD=4
+dispatch/io_pipe_close	PASS	fw-system	
 dispatch/overcommit	PASS	fw-system	
 dispatch/pingpong	FAIL	fw-system	==================================================
 dispatch/plusplus	PASS	fw-system	
 dispatch/priority	FAIL	fw-system	[FAIL] background priority precedence (C:\dev\conformance\out\dispatch\src\dispatch_priority.c:131)
 dispatch/proc	FAIL	fw-system	==================================================
-dispatch/queue_finalizer	FAIL	fw-system	[FAIL] never_call should not run (C:\dev\conformance\out\dispatch\src\dispatch_queue_finalizer.c:46)
+dispatch/queue_finalizer	PASS	fw-system	
 dispatch/read	FAIL	fw-system	==================================================
 dispatch/read2	FAIL	fw-system	[FAIL] fcntl F_NOCACHE (C:\dev\conformance\out\dispatch\src\dispatch_read2.c:149)
 dispatch/readsync	FAIL	fw-system	==================================================
