@@ -2114,7 +2114,9 @@ public:
         if (is_random_device(name)) {
             if (flags & 0x100000) throw ServiceError{enotdir};
             if ((flags & 3) != 0) throw ServiceError{eacces};
-            if (flags & ~(4ULL | 0x1000000ULL)) throw ServiceError{einval};
+            // As a devfs node: O_CREAT without O_EXCL opens it, O_EXCL with O_CREAT is EEXIST, and
+            // the other flags (O_NOCTTY, O_NOFOLLOW, O_TRUNC, O_SHLOCK...) change nothing.
+            if ((flags & 0xa00) == 0xa00) throw ServiceError{eexist};
             auto record = std::make_shared<File>(); record->random_device = true; record->readable = true;
             record->path = name; record->flags = flags; record->cloexec = (flags & 0x1000000) != 0;
             record->random_flags = std::make_shared<std::uint64_t>(flags & 4);

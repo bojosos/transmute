@@ -286,7 +286,13 @@ void random_device() {
     require(f.call("_write", {descriptor, storage, 1}) == UINT64_MAX && f.error() == 9, "readonly urandom accepted writes");
     require(f.call("_open", {path, 1}) == UINT64_MAX && f.error() == 13, "writable urandom open accepted");
     require(f.call("_open", {path, 0x100000}) == UINT64_MAX && f.error() == 20, "directory urandom open accepted");
-    require(f.call("_open", {path, 0x400}) == UINT64_MAX && f.error() == 22, "urandom truncate flag accepted");
+    // A devfs node: O_TRUNC, O_NOCTTY, O_NOFOLLOW and O_CREAT change nothing (crashpad opens it with
+    // O_NOCTTY | O_NOFOLLOW | O_CLOEXEC); O_CREAT | O_EXCL is EEXIST.
+    for (const std::uint64_t flags : {0x400ULL, 0x20000ULL | 0x100ULL | 0x1000000ULL, 0x200ULL}) {
+        const auto opened = f.call("_open", {path, flags});
+        require(opened != UINT64_MAX && f.call("_close", {opened}) == 0, "urandom open with harmless flags refused");
+    }
+    require(f.call("_open", {path, 0xa00}) == UINT64_MAX && f.error() == 17, "urandom O_CREAT | O_EXCL is not EEXIST");
     require(f.call("_unlink", {path}) == UINT64_MAX && f.error() == 1, "urandom immutable path could be removed");
     require(f.call("_chmod", {path, 0600}) == UINT64_MAX && f.error() == 1, "urandom permissions could be changed");
     require(f.call("_access", {path, 4}) == 0 && f.call("_access", {path, 2}) == UINT64_MAX && f.error() == 13,
