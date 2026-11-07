@@ -15,10 +15,11 @@ constexpr std::string_view expat_source = "https://github.com/libexpat/libexpat"
 constexpr std::string_view libxml2_source = "https://gitlab.gnome.org/GNOME/libxml2";
 constexpr std::string_view libxslt_source = "https://gitlab.gnome.org/GNOME/libxslt";
 constexpr std::string_view curl_source = "https://github.com/curl/curl";
+constexpr std::string_view libffi_source = "https://github.com/libffi/libffi";
 
 constexpr std::string_view swift_source = "https://github.com/swiftlang/swift";
 
-constexpr std::array<RuntimeLibraryIdentity, 23> identities{{
+constexpr std::array<RuntimeLibraryIdentity, 24> identities{{
     {"/usr/lib/libc++.1.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libc++abi.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libunwind.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
@@ -31,6 +32,8 @@ constexpr std::array<RuntimeLibraryIdentity, 23> identities{{
     {"/usr/lib/libexslt.0.dylib", libxslt_source, "scripts/build_alchemy_libxslt.ps1", false},
     // libcurl (third_party/curl): HTTP and FILE, no TLS backend (runtime/libcurl/curl_config.h).
     {"/usr/lib/libcurl.4.dylib", curl_source, "scripts/build_alchemy_libcurl.ps1", false},
+    // Vendored open-source /usr/lib libraries (third_party/<name>, docs/ALCHEMY_OSS_RUNTIMES.md).
+    {"/usr/lib/libffi.dylib", libffi_source, "scripts/build_alchemy_libffi.ps1", false},
     // The Swift runtime and standard library (docs/ALCHEMY_SWIFT.md).
     {"/usr/lib/swift/libswiftCore.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     // Open-source stdlib modules from the same sources (Platform, Concurrency,
