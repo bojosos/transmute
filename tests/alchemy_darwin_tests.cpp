@@ -166,6 +166,17 @@ void test_startup() {
     require(read_string(engine, engine.read64(state.x[3])) ==
                 "executable_path=/authored/program" && engine.read64(state.x[3] + 8) == 0,
             "apple vector wrong");
+    // As xnu: argv, envp and apple strings ascending and contiguous, so the argument area's
+    // size is argv[argc - 1] + strlen + 1 - argv[0] (libuv's process.title).
+    std::uint64_t expected = engine.read64(state.x[1]);
+    const auto follows = [&](std::uint64_t address, std::string_view text) {
+        require(address == expected, "startup strings are not ascending and contiguous");
+        expected += text.size() + 1;
+    };
+    for (std::size_t index = 0; index < arguments.size(); ++index) follows(engine.read64(state.x[1] + index * 8), arguments[index]);
+    for (std::size_t index = 0; index < environment.size(); ++index) follows(engine.read64(state.x[2] + index * 8), environment[index]);
+    follows(engine.read64(state.x[3]), "executable_path=/authored/program");
+    require(expected <= top, "startup strings run past the stack top");
     const auto preserved = state;
     const std::array<std::string, 1> too_large{std::string(1024U * 1024U, 'a')};
     require_error([&] { runtime.initialize_startup(too_large, {}, "program"); },

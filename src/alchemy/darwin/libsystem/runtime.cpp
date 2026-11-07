@@ -297,15 +297,24 @@ void DarwinRuntime::initialize_startup(std::span<const std::string> arguments,
     if (needed > top - base) {
         throw std::runtime_error("Darwin startup data does not fit in the guest stack");
     }
-    auto cursor = top;
+    // As xnu's exec_copyout_strings: the argv, envp and apple strings are one block
+    // at the top of the stack, in that order and ascending, each right after the
+    // previous one. libuv and setproctitle-style code (node's process.title) take
+    // argv[argc - 1] + strlen + 1 - argv[0] as the argument area's size.
+    std::uint64_t strings = 0;
+    for (const auto& argument : arguments) strings += argument.size() + 1;
+    for (const auto& variable : environment) strings += variable.size() + 1;
+    strings += apple.size() + 1;
+    auto cursor = top - strings;
+    auto next = cursor;
     transmute::GuestMemory& memory = engine_;
-    const auto push_string = [&cursor, &memory](std::string_view value) {
-        cursor -= value.size() + 1;
-        const auto address = cursor;
+    const auto push_string = [&next, &memory](std::string_view value) {
+        const auto address = next;
         for (std::size_t index = 0; index < value.size(); ++index) {
             memory.write8(address + index, static_cast<std::uint8_t>(value[index]));
         }
         memory.write8(address + value.size(), 0);
+        next += value.size() + 1;
         return address;
     };
     std::vector<std::uint64_t> argv;
