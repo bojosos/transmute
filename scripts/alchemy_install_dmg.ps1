@@ -100,10 +100,11 @@ try {
         if (-not $target) {
             cmd /c "`"$SevenZip`" x -so -- `"$dmgPath`" `"$($link.Path)`" > `"$targetFile`" 2>nul"
             if ($LASTEXITCODE -ne 0) { throw "cannot read link target of $($link.Path) (exit $LASTEXITCODE)" }
-            # The extracted data can be padded past the target text: it ends at the first NUL.
+            # The extracted data can be padded past the target text: it ends at the first control
+            # byte (an HFS+ link reads back as "<target>\x01\x02\0..." through 7-Zip 26).
             $bytes = [IO.File]::ReadAllBytes($targetFile)
-            $end = [Array]::IndexOf($bytes, [byte]0)
-            if ($end -lt 0) { $end = $bytes.Length }
+            $end = 0
+            while ($end -lt $bytes.Length -and $bytes[$end] -ge 0x20) { ++$end }
             $target = [Text.Encoding]::UTF8.GetString($bytes, 0, $end)
         }
         if (-not $target -or $target.Contains("`n") -or $target.Contains("`t")) { throw "unsupported link target for $($link.Path)" }
