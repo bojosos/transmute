@@ -358,3 +358,74 @@ QuartzCore,CoreGraphics}` and the link-only fixture libraries under
 `tests/fixtures/macos/link_*` are project-authored from the public interface
 (selector names, structure layouts and enumeration values); they contain no
 Apple header text or code.
+
+## libxml2 (guest `/usr/lib/libxml2.2.dylib`)
+
+`scripts/build_alchemy_libxml2.ps1` builds the guest ARM64 libxml2 runtime
+from libxml2 2.15.4: <https://gitlab.gnome.org/GNOME/libxml2>, release
+tarball <https://download.gnome.org/sources/libxml2/2.15/libxml2-2.15.4.tar.xz>
+(SHA-256 `98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821`).
+The sources are vendored unmodified in `third_party/libxml2`. The build copies
+libxml2's `Copyright` as `LICENSE.libxml2.txt` beside its outputs, and also
+copies the public headers there. libxml2's license notice follows verbatim,
+then the notices of `dict.c` and `list.c`.
+
+Except where otherwise noted in the source code (e.g. the files dict.c and
+list.c, which are covered by a similar licence but with different Copyright
+notices) all the files are:
+
+ Copyright (C) 1998-2012 Daniel Veillard.  All Rights Reserved.
+ Copyright (C) The Libxml2 Contributors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is fur-
+nished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FIT-
+NESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+`dict.c`:
+
+dict.c: dictionary of reusable strings, just used to avoid allocation
+and freeing operations.
+
+Copyright (C) 2003-2012 Daniel Veillard.
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR IMPLIED
+WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. THE AUTHORS AND
+CONTRIBUTORS ACCEPT NO RESPONSIBILITY IN ANY CONCEIVABLE MANNER.
+
+Author: Daniel Veillard
+
+`list.c`:
+
+list.c: lists handling implementation
+
+Copyright (C) 2000 Gary Pennington and Daniel Veillard.
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR IMPLIED
+WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. THE AUTHORS AND
+CONTRIBUTORS ACCEPT NO RESPONSIBILITY IN ANY CONCEIVABLE MANNER.
+
+Author: Gary Pennington
