@@ -66,6 +66,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         std::condition_variable changed;
         bool detached{}, joining{}, joined{}, finished{};
         std::uint64_t result{};
+        std::uint64_t stack_size{};   // as libpthread reports it (pthread_get_stacksize_np)
         std::exception_ptr error;
     };
     struct Mutex {
@@ -113,6 +114,10 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
     // Darwin's default stack for a pthread_create thread (libpthread's
     // DEFAULT_STACK_SIZE); the main thread's comes from the executable.
     static constexpr std::uint64_t darwin_default_stack_size = 512 * 1024;
+    // arm64 libpthread allocates its pthread_t in the stack's allocation and adds
+    // PTHREAD_T_OFFSET (12 KiB) to the stack it allocates: the thread has, and
+    // pthread_get_stacksize_np reports, the attribute's size plus 12 KiB.
+    static constexpr std::uint64_t pthread_t_offset = 12 * 1024;
 
     explicit Impl(ProcessContext& value) : process(value) {}
     ProcessContext& process;
@@ -439,8 +444,8 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         const auto output = state.x[0];
         auto worker = std::make_shared<Worker>();
         worker->detached = attribute.detached;
-        worker->engine = EngineAdapter(process.calling_engine()).create_worker(
-            state.x[2], state.x[3], attribute.stack_size ? attribute.stack_size : darwin_default_stack_size);
+        worker->stack_size = (attribute.stack_size ? attribute.stack_size : darwin_default_stack_size) + pthread_t_offset;
+        worker->engine = EngineAdapter(process.calling_engine()).create_worker(state.x[2], state.x[3], worker->stack_size);
         worker->engine->set_instruction_limit(process.instruction_limit);
         worker->engine->set_jit_profiling(process.jit_stats);
         worker->context = process.thread(*worker->engine);
@@ -720,12 +725,17 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             for (const auto& [identity, handle] : self.handles) if (handle == s.x[0]) { m.write64(s.x[1], identity); s.x[0] = 0; return; }
             s.x[0] = esrch;
         });
+        // The size the thread asked for (the engine may round its stack up): the attribute's
+        // size plus PTHREAD_T_OFFSET for a pthread_create thread, LC_MAIN's for the main thread.
         add("_pthread_get_stacksize_np", [](auto& self, auto& s, auto&) {
+            const auto reported = [](std::pair<std::uint64_t, std::uint64_t> bounds, std::uint64_t requested) {
+                const auto size = bounds.second - bounds.first;
+                return requested && requested <= size ? requested : size;
+            };
             const auto own = self.self();
-            if (s.x[0] == own) { const auto bounds = self.process.calling_engine().stack_bounds(); s.x[0] = bounds.second - bounds.first; return; }
             std::lock_guard lock(self.metadata); const auto found = self.workers.find(s.x[0]);
-            if (found == self.workers.end()) { s.x[0] = 0; return; }
-            const auto bounds = found->second->engine->stack_bounds(); s.x[0] = bounds.second - bounds.first;
+            if (found != self.workers.end()) { s.x[0] = reported(found->second->engine->stack_bounds(), found->second->stack_size); return; }
+            s.x[0] = s.x[0] == own ? reported(self.process.calling_engine().stack_bounds(), self.process.main_stack_size) : 0;
         });
         add("_pthread_get_stackaddr_np", [](auto& self, auto& s, auto&) {
             const auto own = self.self();

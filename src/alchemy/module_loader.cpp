@@ -953,6 +953,7 @@ std::uint64_t ModuleLoader::load_main() {
             if (module->image.stack_size() > stack_end - stack_begin) {
                 loader.context.main_engine().resize_stack(module->image.stack_size());
             }
+            loader.context.main_stack_size = module->image.stack_size();
             added = loader.finish(first);
             entry = module->image.entry(module->base);
         } catch (...) { loader.rollback(first); loader.next_base = previous_base; loader.next_id = previous_id; throw; }

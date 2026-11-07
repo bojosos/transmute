@@ -98,7 +98,8 @@ void test_configurable_stacks(bool jit) {
         auto* const current = transmute::ReferenceEngine::current();
         require(current && current != &f.engine, "stack callback ran on main engine");
         const auto [begin, end] = current->stack_bounds();
-        require(end - begin == large_stack, "worker did not receive its requested stack");
+        // arm64 libpthread adds PTHREAD_T_OFFSET (12 KiB) to the stack it allocates.
+        require(end - begin >= large_stack + 12 * 1024, "worker did not receive its requested stack");
         memory.write64(begin + 64, 27);
         require(memory.read64(begin + 64) == 27, "deep worker stack was inaccessible");
         state.x[0] = end - begin;
@@ -109,8 +110,14 @@ void test_configurable_stacks(bool jit) {
     f.engine.set_memory_access(code, true, false, true);
     require(f.call("_pthread_create", {data, data + 128, code, 0}) == 0, "large-stack worker creation failed");
     const auto handle = f.engine.read64(data);
-    require(f.call("_pthread_join", {handle, data + 8}) == 0 && f.engine.read64(data + 8) == large_stack,
+    require(f.call("_pthread_get_stacksize_np", {handle}) == large_stack + 12 * 1024,
+            "pthread_get_stacksize_np is not the attribute's size plus PTHREAD_T_OFFSET");
+    require(f.call("_pthread_join", {handle, data + 8}) == 0 && f.engine.read64(data + 8) >= large_stack + 12 * 1024,
             "large-stack worker result lost");
+    // The main thread reports the size LC_MAIN asked for, not the engine's rounded allocation.
+    f.process.main_stack_size = large_stack - 48 * 1024;
+    require(f.call("_pthread_get_stacksize_np", {f.call("_pthread_self", {})}) == large_stack - 48 * 1024,
+            "the main thread's stack size is not LC_MAIN's");
     require(f.call("_pthread_attr_destroy", {data + 128}) == 0, "stack attribute destruction failed");
     if (jit) require(f.process.worker_execution().native_guest_instructions != 0,
                      "large-stack worker did not execute translated instructions");
