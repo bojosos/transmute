@@ -6,10 +6,11 @@
 # runner, so every Alchemy failure can be classified as an Alchemy bug (passes on macOS) or as a test
 # expectation macOS does not meet either (fails on macOS too).
 #
-# * build (Windows): fetches the pinned upstream sources (official URLs, SHA-256 checked), builds the
-#   sysroot and the suites, and uploads the built test tree with the corresponding source of its
-#   copyleft (GPL-2.0 and APSL-2.0) programs. Nothing is built from the macOS runner's SDK, and no SDK file enters
-#   the repository or an artifact.
+# * build (Windows): fetches the pinned upstream sources from their official URLs, verified by
+#   content digest or archive SHA-256 (fetch_sources.py). It builds the sysroot and the suites, and
+#   uploads the built test tree with the corresponding source of its copyleft (GPL-2.0 and APSL-2.0)
+#   programs. Nothing is built from the macOS runner's SDK, and no SDK file enters the repository or
+#   an artifact.
 # * macos (arm64): runs the programs directly (`conformance.py run --native`) and uploads the results.
 #
 # Compare locally with `conformance.py compare all --macos-results <downloaded results>`.
@@ -39,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Fetch sources (official upstreams, pinned SHA-256)
+      - name: Fetch sources (official upstreams, pinned content)
         run: |
           python -I scripts/conformance/fetch_sources.py --sources "$env:RUNNER_TEMP\conformance"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -57,8 +58,8 @@ jobs:
 
       # The repository is public, so this artifact is public too: any signed-in GitHub user can
       # download it while it is kept (one day). The source of every copyleft suite travels with its
-      # programs, under corresponding-source/: the pinned release archive that fetch_sources.py
-      # checked by SHA-256, plus the licence text. That is Open POSIX (GPL-2.0) and Apple's objc4,
+      # programs, under corresponding-source/: the release archive that fetch_sources.py downloaded
+      # and verified, plus the licence text. That is Open POSIX (GPL-2.0) and Apple's objc4,
       # Libc and libpthread tests (APSL-2.0). libc-test (MIT) and the libdispatch tests (Apache-2.0)
       # ship as programs only.
       - name: Add corresponding source for copyleft suites

@@ -19,6 +19,11 @@ a test that passed in the baseline no longer passes.
 - Upstream sources are downloaded only from the official upstreams listed in `sources.json`. Each
   goes into its own new directory under `C:\dev\conformance\` (`<name>\<archive>`, `SHA256`,
   `SOURCE_URL`, `src\`), never into this repository. They are untrusted data.
+- Pins are reproducible. Archives that a host generates from a tag or commit (GitHub tag archives)
+  are pinned by a digest of their extracted content (`tree_sha256`), because their compressed bytes
+  can change. libc-test is fetched with git at its pinned commit: repo.or.cz serves web snapshots
+  only behind a bot check. LTP's uploaded release asset keeps a byte SHA-256. `fetch_sources.py
+  --digest <name>` prints a source's content digest.
 - GPL code (the Open POSIX suite) is never copied into this repository. It is built from the
   extracted release into the output directory, and `suites/posix.py` only names those paths.
 - When built programs leave the machine (the public artifact of the macOS workflow), their source goes
