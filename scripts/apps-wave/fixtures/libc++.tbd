@@ -1,0 +1,11 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-macos ]
+install-name:    '/usr/lib/libc++.1.dylib'
+current-version: 1700
+exports:
+  - targets:     [ arm64-macos ]
+    symbols:     [ __Znwm, __ZdlPv, __ZdlPvm, ___cxa_allocate_exception, ___cxa_throw, ___cxa_begin_catch,
+                   ___cxa_end_catch, ___cxa_pure_virtual, ___gxx_personality_v0, __ZTIi,
+                   __ZTVN10__cxxabiv117__class_type_infoE, __ZTVN10__cxxabiv120__si_class_type_infoE ]
+...
