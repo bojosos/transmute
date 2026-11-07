@@ -10,10 +10,13 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <filesystem>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -954,6 +957,29 @@ std::uint64_t ModuleLoader::load_main() {
                 loader.context.main_engine().resize_stack(module->image.stack_size());
             }
             loader.context.main_stack_size = module->image.stack_size();
+            // LC_DYLD_ENVIRONMENT: dyld takes the main executable's DYLD_..._PATH settings (others are
+            // ignored). This loader applies no DYLD path variable, which only matters when a directory
+            // they name exists (Firefox's DYLD_VERSIONED_FRAMEWORK_PATH names Safari's staged frameworks,
+            // which a system without them lacks): then it says so.
+            for (const auto& setting : module->image.dyld_environment()) {
+                const auto equals = setting.find('=');
+                if (equals == std::string::npos || !std::string_view(setting).substr(0, equals).ends_with("_PATH")) continue;
+                std::string_view rest = std::string_view(setting).substr(equals + 1);
+                while (!rest.empty()) {
+                    const auto colon = rest.find(':');
+                    const auto directory = rest.substr(0, colon);
+                    rest = colon == std::string_view::npos ? std::string_view{} : rest.substr(colon + 1);
+                    bool present = !directory.starts_with('/');   // @executable_path/@loader_path: not resolved here
+                    if (!present && loader.context.map_guest_path) {
+                        std::error_code error;
+                        try { present = std::filesystem::is_directory(loader.context.map_guest_path(directory), error); }
+                        catch (const std::exception&) {}
+                    }
+                    if (present && !directory.empty())
+                        std::cerr << "alchemy: LC_DYLD_ENVIRONMENT " << setting.substr(0, equals) << " names " << directory
+                                  << ", which is not searched (DYLD path variables are not applied)" << std::endl;
+                }
+            }
             added = loader.finish(first);
             entry = module->image.entry(module->base);
         } catch (...) { loader.rollback(first); loader.next_base = previous_base; loader.next_id = previous_id; throw; }
