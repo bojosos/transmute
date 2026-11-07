@@ -13,10 +13,15 @@
 // for it) and breaks away from the job when allowed, so a short guest process
 // still leaves a finished AOT file for the next run. When it exits, this
 // process maps the new files (cache_load_cold_files).
+//
+// The journal-folding helper (fx-cache-fold.exe, cache_enable_fold_helper)
+// is started the same way, from cache_flush at process exit, for the large
+// main files whose journals are due (request_fold).
 
 #include "fx/cache/cache.hpp"
 #include "fx/cache/cache_internal.hpp"
 #include "fx/host/env.hpp"
+#include "fx/host/file.hpp"
 #include "fx/host/process.hpp"
 #include "fx/host/sync.hpp"
 #include "fx/host/thread.hpp"
@@ -26,6 +31,7 @@
 #include <atomic>
 #include <cwctype>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -151,7 +157,66 @@ unsigned threads_from_environment(unsigned fallback) {
     return static_cast<unsigned>(std::min<unsigned long>(threads, 64));
 }
 
+// The journal-folding helper (cache_enable_fold_helper).
+struct Fold {
+    host::RwLock lock;
+    std::wstring program;   // empty: none
+    std::atomic<cache_detail::FoldLauncher> launcher{nullptr};
+    std::atomic<std::uint64_t> requests{0};
+};
+
+Fold& F() {
+    static Fold* const f = new Fold();   // never destroyed: used during process exit
+    return *f;
+}
+
+bool fold_disabled_by_environment() {
+    wchar_t value[16] = {};
+    const auto n = host::get_env(L"TRANSMUTE_FX_CACHE_FOLD", value, 16);
+    if (n == 0 || n >= 16) return false;
+    const std::wstring v = lower(value);
+    return v == L"0" || v == L"off" || v == L"false" || v == L"no";
+}
+
+bool start_folder(const std::wstring& program, const std::wstring& directory, const std::vector<std::wstring>& names) {
+    std::wstring command = quoted(program) + L" " + quoted(directory);
+    for (const std::wstring& name : names) command += L" " + quoted(name);
+    // Detached, idle priority, unwatched: this process is exiting.
+    return host::spawn_background_process(program, command, nullptr, nullptr);
+}
+
 } // namespace
+
+void cache_enable_fold_helper(const std::wstring& program) {
+    Fold& f = F();
+    f.lock.lock();
+    f.program = fold_disabled_by_environment() ? std::wstring() : program;
+    f.lock.unlock();
+}
+
+std::wstring cache_default_fold_helper() {
+    const std::wstring self = host::executable_path();
+    const std::size_t slash = self.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return {};
+    const std::wstring helper = self.substr(0, slash + 1) + L"fx-cache-fold.exe";
+    return host::file::attributes(helper, nullptr, nullptr) ? helper : std::wstring();
+}
+
+int cache_fold_main(int argc, wchar_t** argv) {
+    if (argc < 3) return 2;
+    for (int i = 2; i < argc; ++i) {
+        const std::wstring_view name = argv[i];
+        if (name.empty() || name.find_first_of(L"\\/:") != std::wstring_view::npos) return 2;
+    }
+    // Started at idle priority; below normal and not EcoQoS instead: at idle
+    // on the efficiency cores, a build kept a fold's thread Ready, unscheduled,
+    // for minutes, and journals wait for it. Below normal still yields to guests.
+    host::set_process_below_normal_priority();
+    host::set_process_qos(false);
+    const std::wstring directory = argv[1];
+    for (int i = 2; i < argc; ++i) cache_detail::fold_stem(directory + L"\\" + argv[i]);
+    return 0;
+}
 
 unsigned cache_default_background_aot_threads() noexcept {
     const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
@@ -232,6 +297,36 @@ bool background_aot_stopping() noexcept { return B().stopping.load(); }
 
 std::uint64_t background_aot_requests() noexcept { return B().requests.load(); }
 std::uint64_t background_aot_helpers() noexcept { return B().helpers.load(); }
+
+void request_fold(const std::wstring& directory, const std::vector<std::wstring>& stems) {
+    Fold& f = F();
+    const FoldLauncher launcher = f.launcher.load();
+    f.lock.lock_shared();
+    const std::wstring program = f.program;
+    f.lock.unlock_shared();
+    if (program.empty() && !launcher) return;
+    std::vector<std::wstring> claimed, names;
+    std::size_t length = program.size() + directory.size() + 16;
+    for (const std::wstring& stem : stems) {
+        const std::wstring name = file_name_of(stem);
+        if (length + name.size() + 3 >= kMaxCommandLine) break;   // the rest: a later exit
+        if (!claim_fold(stem)) continue;
+        claimed.push_back(stem);
+        names.push_back(name);
+        length += name.size() + 3;
+    }
+    if (names.empty()) return;
+    const bool started = launcher ? launcher(directory, names) : start_folder(program, directory, names);
+    if (started) {
+        f.requests.fetch_add(1);
+        return;
+    }
+    for (const std::wstring& stem : claimed) release_fold(stem);
+}
+
+void set_fold_launcher_for_tests(FoldLauncher launcher) noexcept { F().launcher.store(launcher); }
+
+std::uint64_t fold_requests() noexcept { return F().requests.load(); }
 
 } // namespace cache_detail
 } // namespace transmute::fx

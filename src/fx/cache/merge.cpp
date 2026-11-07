@@ -6,6 +6,12 @@
 // keeps its old mapping, new processes see the new file. A journal can be
 // merged only once its writer has closed it (opening it without write
 // sharing fails while the owner is alive); merged journals are deleted.
+// The new main file reaches the disk before the rename and the journals go
+// only after it, so a killed writer or a power loss leaves the old or the new
+// main file, and journals not yet deleted are folded again later (records
+// with the same start are kept once).
+// Large main files are folded by a helper process (fold_stem), claimed by
+// <stem>.fold (claim_fold) so exiting processes ask for one helper at a time.
 
 #include "fx/cache/cache_internal.hpp"
 #include "fx/cache/format.hpp"
@@ -31,6 +37,7 @@ namespace file = host::file;
 constexpr std::uint64_t kSecond = 10'000'000ULL;  // host::wall_time() units (FILETIME)
 constexpr std::uint64_t kStaleKeyAge = 7ULL * 24 * 3600 * kSecond;
 constexpr std::uint64_t kStaleTempAge = 3600ULL * kSecond;
+constexpr std::uint64_t kFoldLeaseAge = 120ULL * kSecond;   // a helper killed before it finished
 
 std::wstring hex16(std::uint64_t value) {
     static constexpr wchar_t kDigits[] = L"0123456789abcdef";
@@ -115,7 +122,10 @@ bool publish_main_locked(const std::wstring& stem, const Key& key, std::uint64_t
         return false;
     }
     HandleSink sink(out);
-    const bool written = cachefmt::build_main(key, generation, records, sink, result) && sink.flush();
+    // On the disk before the rename: after a power loss the main file is the
+    // old one or the complete new one (journals are deleted only after this).
+    const bool written =
+        cachefmt::build_main(key, generation, records, sink, result) && sink.flush() && file::flush_to_disk(out);
     file::close(out);
     if (!written) {
         file::remove(temp);
@@ -145,7 +155,7 @@ void delete_matching(const std::wstring& pattern, const std::wstring& keep_lower
 
 // Removes files of the same module under other keys (old translator ABI,
 // other options, older image versions) once unused for a week, and stale
-// temporary files left by crashed writers.
+// temporary files and fold claims left by crashed writers and helpers.
 void collect_garbage(const std::wstring& stem) {
     const std::wstring directory = directory_of(stem);
     const std::wstring file = stem.substr(directory.size() + 1);
@@ -157,6 +167,7 @@ void collect_garbage(const std::wstring& stem) {
     delete_matching(directory + L"\\" + module + L".*.fxj", own, kStaleKeyAge);
     delete_matching(directory + L"\\" + module + L".*.fxa", own, kStaleKeyAge);
     delete_matching(directory + L"\\" + module + L".*.tmp", std::wstring(), kStaleTempAge);
+    delete_matching(directory + L"\\" + module + L".*.fold", std::wstring(), kStaleTempAge);
 }
 
 struct Journal {
@@ -321,6 +332,31 @@ bool merge_stem(const std::wstring& stem, bool force, bool settled) {
     finish(true, true);
     collect_garbage(stem);
     return true;
+}
+
+bool claim_fold(const std::wstring& stem) {
+    const std::wstring marker = stem + L".fold";
+    std::uint64_t written = 0;
+    const std::uint64_t now = now_filetime();
+    if (file::attributes(marker, nullptr, &written) && now >= written && now - written < kFoldLeaseAge) return false;
+    // Free (no merge or fold holds it) and writable.
+    file::File lock = try_lock(stem);
+    if (!lock) return false;
+    file::File claim = file::open(marker, file::kWrite, file::kRead | file::kDelete, file::Create::create_always,
+                                  file::Flags::normal);
+    file::close(lock);
+    if (!claim) return false;
+    const bool written_now = file::write_all(claim, "f", 1);   // sets the write time the lease runs from
+    file::close(claim);
+    return written_now;
+}
+
+void release_fold(const std::wstring& stem) { file::remove(stem + L".fold"); }
+
+bool fold_stem(const std::wstring& stem) {
+    const bool folded = merge_stem(stem, /*force=*/true);
+    release_fold(stem);
+    return folded;
 }
 
 } // namespace transmute::fx::cache_detail

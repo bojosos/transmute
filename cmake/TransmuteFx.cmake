@@ -108,6 +108,17 @@ if(EXISTS ${PROJECT_SOURCE_DIR}/src/fx/loader/main.cpp)
     endforeach()
 endif()
 
+# The translation-cache folding helper that guest processes start at exit
+# (cache_enable_fold_helper): next to transmute-fx and alchemy-fx.
+if(TARGET fx_cache)
+    add_executable(fx-cache-fold src/fx/cache/fold_main.cpp)
+    fx_component_options(fx-cache-fold)
+    target_link_libraries(fx-cache-fold PRIVATE fx_cache)
+    if(TARGET transmute-fx)
+        add_dependencies(transmute-fx fx-cache-fold)
+    endif()
+endif()
+
 # Static translator coverage audit (integration tool).
 add_executable(fx_coverage tools/fx_coverage.cpp)
 fx_component_options(fx_coverage)

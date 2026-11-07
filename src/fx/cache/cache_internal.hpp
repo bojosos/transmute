@@ -8,6 +8,7 @@
 
 #include <span>
 #include <string>
+#include <vector>
 
 namespace transmute::fx::cache_detail {
 
@@ -54,6 +55,29 @@ void set_background_thread_qos(void* thread) noexcept;
 // preloader sees those records). True if a main file was written.
 inline constexpr std::uint64_t kSettledRewriteBytes = 8u << 20;
 bool merge_stem(const std::wstring& stem, bool force, bool settled = false);
+
+// Folding off the exit path (cache.hpp, cache_enable_fold_helper). Main files
+// over kSettledRewriteBytes are folded by the helper; a process of the module
+// merges inline only once kInlineFoldJournals journals (or half the main
+// file's size) piled up.
+inline constexpr std::size_t kInlineFoldJournals = 32;
+// Claims the right to ask a helper for `stem`: false while its lock is held
+// (a merge or fold runs), while another process asked in the last two minutes
+// (<stem>.fold, refreshed here), or if the directory is read-only.
+bool claim_fold(const std::wstring& stem);
+// Gives a claim back (the helper could not be started).
+void release_fold(const std::wstring& stem);
+// The helper's work for one stem: every closed journal folded in, the claim
+// released. True if a main file was written.
+bool fold_stem(const std::wstring& stem);
+// Asks one helper to fold the claimable `stems` (full stem paths in
+// `directory`). No-op when no helper is enabled.
+void request_fold(const std::wstring& directory, const std::vector<std::wstring>& stems);
+// Testing: replaces starting the helper (and enables folding without a
+// program); null restores it. `names` are stem file names in `directory`.
+using FoldLauncher = bool (*)(const std::wstring& directory, const std::vector<std::wstring>& names);
+void set_fold_launcher_for_tests(FoldLauncher launcher) noexcept;
+std::uint64_t fold_requests() noexcept;   // helpers asked for, this process
 
 // Hash of guest bytes [base + begin, base + end) for each range, SEH-guarded.
 bool guest_memory_hash(std::uint64_t base, const cachefmt::DiskRange* ranges, std::uint32_t count,

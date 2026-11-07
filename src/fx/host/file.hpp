@@ -46,6 +46,8 @@ void close(File file) noexcept;
 
 // The whole buffer, in chunks; false on an error or a zero-byte transfer.
 bool write_all(File file, const void* data, std::size_t size) noexcept;
+// Writes the file's data through to the disk (survives a power loss).
+bool flush_to_disk(File file) noexcept;
 bool read_all(File file, void* data, std::size_t size) noexcept;
 bool seek(File file, std::uint64_t offset) noexcept;
 bool seek_end(File file) noexcept;

@@ -211,6 +211,26 @@ void cache_prepare_exit() noexcept;
 // automatically when a background helper exits).
 void cache_load_cold_files();
 
+// ---- folding journals off the exit path ----------------------------------------
+// Rewriting a large main file (over 8 MiB; a browser's is 300-500 MiB) with
+// its journals takes seconds, which an exiting guest process would otherwise
+// spend before its exit code is set. Once a large main file's journals are
+// due (cache_flush), the exiting process starts a detached helper at idle
+// CPU priority instead,
+//   <program> <cache directory> <stem file name>...
+// (fx-cache-fold.exe, src/fx/cache/fold_main.cpp, which calls
+// cache_fold_main), and only closes its journal. At most one helper is asked
+// per stem every two minutes (<stem>.fold); the stem's lock keeps folders and
+// merges apart. Without a helper, or when one cannot keep up, a process of
+// that module merges its journals itself once 32 have piled up.
+// An empty `program` disables it; so does TRANSMUTE_FX_CACHE_FOLD=0.
+void cache_enable_fold_helper(const std::wstring& program);
+// fx-cache-fold.exe next to this executable; empty if there is none.
+std::wstring cache_default_fold_helper();
+// The helper's main: folds the closed journals of each stem in the cache
+// directory (argv[1]) named by argv[2...]. Returns 0, or 2 for bad arguments.
+int cache_fold_main(int argc, wchar_t** argv);
+
 // ---- background translation of external modules (additive) -------------------
 // aot_translate_image takes PE files. Modules a personality maps itself
 // (register_external_module, e.g. Mach-O images) are translated in-process

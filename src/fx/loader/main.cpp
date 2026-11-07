@@ -118,6 +118,8 @@ int wmain(int argc, wchar_t** argv) {
             // helper process (this executable with --aot-background).
             const std::wstring self = host::executable_path();
             if (!self.empty()) cache_enable_background_aot(self, cache_default_background_aot_threads());
+            // Large main files are folded by fx-cache-fold.exe, off the exit path.
+            cache_enable_fold_helper(cache_default_fold_helper());
         }
         options.stack_reserve = cli.stack_reserve;   // 0: TRANSMUTE_FX_STACK_SIZE or the EXE header
         return launch_guest_process(options);

@@ -41,6 +41,10 @@ void set_process_qos(bool eco) noexcept {
 
 void set_process_idle_priority() noexcept { SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS); }
 
+void set_process_below_normal_priority() noexcept {
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+}
+
 bool process_shutting_down() noexcept {
     using ShutdownFn = BOOLEAN(NTAPI*)();
     static const auto fn = reinterpret_cast<ShutdownFn>(
@@ -83,6 +87,10 @@ bool spawn_background_process(const std::wstring& program, const std::wstring& c
     }
     if (!ok) return false;
     CloseHandle(pi.hThread);
+    if (!on_exit) {
+        CloseHandle(pi.hProcess);
+        return true;
+    }
     auto* watch = new ExitWatch{pi.hProcess, on_exit, context};
     HANDLE wait = nullptr;
     if (!RegisterWaitForSingleObject(&wait, pi.hProcess, &helper_exited, watch, INFINITE,

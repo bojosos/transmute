@@ -23,6 +23,9 @@ bool process_qos_explicit() noexcept;
 void set_process_qos(bool eco) noexcept;
 // Idle CPU priority for the whole process (background helpers).
 void set_process_idle_priority() noexcept;
+// Below-normal CPU priority for the whole process: yields to normal-priority
+// threads, but unlike idle priority is not starved behind other background work.
+void set_process_below_normal_priority() noexcept;
 
 // True once the process is exiting (DLL detach of the whole process).
 bool process_shutting_down() noexcept;
@@ -34,8 +37,9 @@ void terminate_process(std::uint32_t exit_code) noexcept;
 // Starts `program` with `command_line` (the whole line, program included) as
 // a detached background helper: no console, no inherited handles, idle
 // priority, outside the caller's job when that allows it. `on_exit(context)`
-// runs on a host thread-pool thread once the helper exits. False if it could
-// not be started.
+// runs on a host thread-pool thread once the helper exits; null: nothing
+// watches it (a helper started at process exit). False if it could not be
+// started.
 bool spawn_background_process(const std::wstring& program, const std::wstring& command_line,
                               void (*on_exit)(void* context), void* context);
 

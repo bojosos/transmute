@@ -344,51 +344,202 @@ FX_TEST(cache_crash_torn_tail_and_live_journal) {
     cache_detail::testing_reset(false);
 }
 
-// The cache directory is shared by every program: a process's exit folds in
-// another module's journals only while that module's main file is small. A
-// large one waits for the module's own processes.
-FX_TEST(cache_exit_leaves_large_merges_to_the_modules_processes) {
-    TempDir dir(L"foreign");
-    FakeModule big(8u << 20, 31), tool(1u << 20, 32);
-    std::vector<Planned> regions;   // ~32 KiB of code each: a main file over kSettledRewriteBytes
+namespace {
+
+std::vector<std::vector<std::wstring>> g_fold_requests;
+
+bool record_fold_request(const std::wstring&, const std::vector<std::wstring>& names) {
+    g_fold_requests.push_back(names);
+    return true;
+}
+
+// A module whose main file is over kSettledRewriteBytes: 300 regions of ~32 KiB of code.
+std::vector<Planned> make_big_main(const TempDir& dir, const FakeModule& big, const GuestModule& info) {
+    std::vector<Planned> regions;
     for (std::uint32_t i = 0; i < 300; ++i) regions.push_back({0x1000 + i * 0x6000, 2000});
     start_session(dir, false);
-    cache_module_loaded(big.info(kImageHash, L"big.dylib"));
+    cache_module_loaded(info);
     store_all(big, regions, 7);
     cache_flush();   // no main file yet: merged
-    const std::wstring main = cache_file_path(big.info(kImageHash, L"big.dylib"));
-    const std::size_t main_size = read_file(main).size();
-    FX_REQUIRE(main_size > cache_detail::kSettledRewriteBytes);
+    cache_detail::testing_reset(false);
+    return regions;
+}
 
-    // Eight processes of the big module each leave a journal (crashed: no flush).
-    const auto extra = plan(8, 0x5000, 0x6000);
-    for (const Planned& p : extra) {
+// Processes of the module that each leave a journal of one region and crash (no merge).
+void leave_journals(const TempDir& dir, const FakeModule& big, const GuestModule& info,
+                    const std::vector<Planned>& regions) {
+    for (const Planned& p : regions) {
         start_session(dir, false);
-        cache_module_loaded(big.info(kImageHash, L"big.dylib"));
+        cache_module_loaded(info);
         cache_store(make_region(big.base(), p.rva, p.instructions, 8));
         cache_flush_journals();
     }
     cache_detail::testing_reset(false);
+}
+
+std::wstring stem_of(const GuestModule& info) {
+    const std::wstring main = cache_file_path(info);
+    return main.substr(0, main.size() - 4);
+}
+
+} // namespace
+
+// Journals of a large main file are folded by a helper process, not by an
+// exiting one (seconds before its exit code). The cache directory is shared
+// by every program, and a short tool's exit asks for the helper at most.
+FX_TEST(cache_exit_asks_a_helper_to_fold_large_main_files) {
+    TempDir dir(L"fold");
+    FakeModule big(8u << 20, 31), tool(1u << 20, 32);
+    const GuestModule info = big.info(kImageHash, L"big.dylib");
+    const auto regions = make_big_main(dir, big, info);
+    const std::wstring stem = stem_of(info);
+    FX_REQUIRE(read_file(stem + L".fxc").size() > cache_detail::kSettledRewriteBytes);
+    const auto extra = plan(8, 0x5000, 0x6000);
+    leave_journals(dir, big, info, extra);
     FX_REQUIRE(dir.files(L"big.dylib.*.fxj").size() == extra.size());
 
-    // A small tool's exit leaves them; its own journal is merged.
+    g_fold_requests.clear();
+    cache_detail::set_fold_launcher_for_tests(&record_fold_request);
+    // A small tool's exit merges its own journal and asks for one helper.
     start_session(dir, false);
     cache_module_loaded(tool.info(kImageHash + 1, L"tool"));
     store_all(tool, plan(10, 0x1000, 0x1000), 9);
     cache_flush();
     FX_CHECK_EQ(cache_stats().merges, std::uint64_t{1});
-    FX_CHECK_EQ(dir.files(L"big.dylib.*.fxj").size(), extra.size());
     FX_CHECK_EQ(dir.files(L"tool.*.fxj").size(), std::size_t{0});
+    FX_CHECK_EQ(dir.files(L"big.dylib.*.fxj").size(), extra.size());
+    FX_REQUIRE(g_fold_requests.size() == 1);
+    FX_CHECK(g_fold_requests[0] == std::vector<std::wstring>{stem.substr(stem.find_last_of(L'\\') + 1)});
+    FX_CHECK_EQ(dir.files(L"big.dylib.*.fold").size(), std::size_t{1});
 
-    // A process of the big module merges them (eight journals).
+    // A process of the module does not merge either, and the claim keeps it
+    // from asking for a second helper.
     start_session(dir, false);
-    cache_module_loaded(big.info(kImageHash, L"big.dylib"));
+    cache_module_loaded(info);
     TranslatedRegion got;
     FX_CHECK(cache_lookup(big.base() + regions[0].rva, got));   // its files are open
     cache_flush();
+    FX_CHECK_EQ(cache_stats().merges, std::uint64_t{0});
+    FX_CHECK_EQ(g_fold_requests.size(), std::size_t{1});
+    cache_detail::testing_reset(false);
+    cache_detail::set_fold_launcher_for_tests(nullptr);
+
+    // The helper's work: everything folded, the claim released.
+    FX_CHECK(cache_detail::fold_stem(stem));
+    FX_CHECK_EQ(dir.files(L"big.dylib.*.fxj").size(), std::size_t{0});
+    FX_CHECK_EQ(dir.files(L"big.dylib.*.fold").size(), std::size_t{0});
+    start_session(dir, false);
+    cache_module_loaded(info);
+    FX_CHECK_EQ(check_all(big, regions, 7) + check_all(big, extra, 8),
+                static_cast<unsigned>(entry_count(big, regions, 7) + entry_count(big, extra, 8)));
+    cache_detail::testing_reset(false);
+
+    // The helper refuses names that are not stem file names.
+    wchar_t program[] = L"fx-cache-fold", directory[] = L"C:\\cache", name[] = L"..\\big.dylib";
+    wchar_t* argv[] = {program, directory, name};
+    FX_CHECK_EQ(cache_fold_main(3, argv), 2);
+    FX_CHECK_EQ(cache_fold_main(2, argv), 2);
+}
+
+// Without a helper (or with helpers that cannot keep up), a large main
+// file's journals pile up to kInlineFoldJournals; then a process of that
+// module merges them itself, never another program's process.
+FX_TEST(cache_exit_merges_piled_up_journals_without_a_helper) {
+    TempDir dir(L"piled");
+    FakeModule big(8u << 20, 33), tool(1u << 20, 34);
+    const GuestModule info = big.info(kImageHash, L"big.dylib");
+    const auto regions = make_big_main(dir, big, info);
+    const auto extra = plan(static_cast<std::uint32_t>(cache_detail::kInlineFoldJournals), 0x5000, 0x6000);
+    leave_journals(dir, big, info, std::vector<Planned>(extra.begin(), extra.begin() + 8));
+
+    start_session(dir, false);   // eight: due, but they wait for a helper
+    cache_module_loaded(info);
+    TranslatedRegion got;
+    FX_CHECK(cache_lookup(big.base() + regions[0].rva, got));
+    cache_flush();
+    FX_CHECK_EQ(cache_stats().merges, std::uint64_t{0});
+    FX_CHECK_EQ(dir.files(L"big.dylib.*.fxj").size(), std::size_t{8});
+
+    leave_journals(dir, big, info, std::vector<Planned>(extra.begin() + 8, extra.end()));
+    start_session(dir, false);   // another program's exit leaves them
+    cache_module_loaded(tool.info(kImageHash + 1, L"tool"));
+    store_all(tool, plan(10, 0x1000, 0x1000), 9);
+    cache_flush();
+    FX_CHECK_EQ(cache_stats().merges, std::uint64_t{1});
+    FX_CHECK_EQ(dir.files(L"big.dylib.*.fxj").size(), extra.size());
+
+    start_session(dir, false);   // the module's own process merges them
+    cache_module_loaded(info);
+    FX_CHECK(cache_lookup(big.base() + regions[0].rva, got));
+    cache_flush();
     FX_CHECK_EQ(cache_stats().merges, std::uint64_t{1});
     FX_CHECK_EQ(dir.files(L"big.dylib.*.fxj").size(), std::size_t{0});
+    cache_detail::testing_reset(false);
+    start_session(dir, false);
+    cache_module_loaded(info);
     FX_CHECK_EQ(check_all(big, extra, 8), static_cast<unsigned>(entry_count(big, extra, 8)));
+    cache_detail::testing_reset(false);
+}
+
+// Processes open the module while a helper folds: every main file they map
+// is complete (the old one or the new one), and lookups return the right
+// region or miss (a journal folded away between listing and opening it).
+FX_TEST(cache_opens_while_a_helper_folds) {
+    TempDir dir(L"foldrace");
+    FakeModule big(8u << 20, 35);
+    const GuestModule info = big.info(kImageHash, L"big.dylib");
+    const auto regions = make_big_main(dir, big, info);
+    const std::wstring stem = stem_of(info);
+    const auto extra = plan(12, 0x5000, 0x6000);
+    leave_journals(dir, big, info, extra);
+    std::vector<std::vector<std::uint8_t>> journals;   // put back for every fold
+    for (const std::wstring& name : dir.files(L"big.dylib.*.fxj")) journals.push_back(read_file(dir.path() + L"\\" + name));
+    FX_REQUIRE(journals.size() == extra.size());
+
+    std::atomic<bool> done{false};
+    std::atomic<unsigned> folds{0}, opens{0}, torn{0};
+    std::thread folder([&] {
+        for (unsigned round = 0; round < 6; ++round) {
+            for (std::size_t i = 0; i < journals.size(); ++i) {
+                wchar_t suffix[40];
+                std::swprintf(suffix, 40, L".j0000f01d-%04x-%06zx.fxj", round + 1, i);
+                write_file(stem + suffix, journals[i]);
+            }
+            if (cache_detail::fold_stem(stem)) folds.fetch_add(1);
+        }
+        done.store(true);
+    });
+    std::thread reader([&] {
+        while (!done.load()) {
+            pe::MappedFile file;
+            fmt::FileHeader header;
+            fmt::MainView view;
+            if (!file.open(stem + L".fxc", false) ||
+                !fmt::parse_header(file.data(), file.size(), fmt::kKindMain, header) ||
+                !fmt::open_main(file.data(), file.size(), header.key, view))
+                torn.fetch_add(1);
+            opens.fetch_add(1);
+        }
+    });
+    unsigned sessions = 0;
+    while (!done.load()) {
+        start_session(dir, false);
+        cache_module_loaded(info);
+        FX_CHECK_EQ(check_all(big, regions, 7), static_cast<unsigned>(entry_count(big, regions, 7)));
+        check_all(big, extra, 8);   // hits are checked; misses are allowed
+        ++sessions;
+    }
+    folder.join();
+    reader.join();
+    cache_detail::testing_reset(false);
+    FX_CHECK_EQ(folds.load(), 6u);
+    FX_CHECK_EQ(torn.load(), 0u);
+    FX_CHECK(opens.load() > 0 && sessions > 0);
+    FX_CHECK_EQ(dir.files(L"big.dylib.*.fxj").size(), std::size_t{0});
+    start_session(dir, false);
+    cache_module_loaded(info);
+    FX_CHECK_EQ(check_all(big, regions, 7) + check_all(big, extra, 8),
+                static_cast<unsigned>(entry_count(big, regions, 7) + entry_count(big, extra, 8)));
     cache_detail::testing_reset(false);
 }
 

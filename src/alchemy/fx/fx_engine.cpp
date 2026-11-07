@@ -650,6 +650,9 @@ struct FxEngine::Shared {
         options.preload_cached_regions = cache;
         alchemy::perf::phase("fx runtime initialize: start");
         fx::runtime_initialize(options);
+        // Journals of large main files (Chrome Framework's) are folded by
+        // fx-cache-fold.exe after the exit, not before the exit code is set.
+        if (cache) fx::cache_enable_fold_helper(fx::cache_default_fold_helper());
         alchemy::perf::phase("fx runtime initialize: done");
         fx::set_svc_handler(&svc_hook);
         if (placeholder) vm::release(placeholder);

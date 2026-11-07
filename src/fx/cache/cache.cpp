@@ -1341,37 +1341,43 @@ void cache_flush() {
         Shared lock(g.writers_lock);
         for (const auto& [stem, writer] : g.writers) used.insert(stem);
     }
+    std::vector<std::wstring> fold;
     for (const auto& [stem, pending] : stems) {
-        // Journals of a module this process never opened, next to a main file
-        // over kSettledRewriteBytes, wait for that module's own processes: the
-        // cache directory is shared, and a short tool's exit must not rewrite
-        // another program's hundreds of MB (a 50 KB hello's exit rewrote a
-        // browser's 343 MB main file once that had 8 journals).
-        if (!force && used.count(stem) == 0) {
-            std::uint64_t main_size = 0;
-            if (file::attributes(stem + L".fxc", &main_size, nullptr) &&
-                main_size > cache_detail::kSettledRewriteBytes)
-                continue;
-        }
+        std::uint64_t main_size = 0;
+        const bool has_main = file::attributes(stem + L".fxc", &main_size, nullptr);
         // merge_stem keeps journals below its threshold; checking that here
         // from the listing (one attribute query instead of locking, opening
         // and mapping every journal and the main file) keeps a warm exit
-        // cheap while small journals wait for more records. Journals that
-        // earlier processes left (e.g. regions first used by guest
-        // DLL_PROCESS_DETACH, see cache_flush_journals) are folded into a
-        // small main file once instead, so the preloader installs them.
+        // cheap while small journals wait for more records.
+        const bool due = pending.journals >= 8 ||
+                         pending.bytes >= std::max<std::uint64_t>(cache_detail::merge_min_bytes(), main_size / 8);
         bool settled = false;
-        if (!force && pending.journals < 8) {
-            std::uint64_t main_size = 0;
-            if (file::attributes(stem + L".fxc", &main_size, nullptr)) {
-                if (pending.bytes < std::max<std::uint64_t>(cache_detail::merge_min_bytes(), main_size / 8)) {
-                    settled = pending.journals > pending.mine && main_size <= cache_detail::kSettledRewriteBytes;
-                    if (!settled) continue;
-                }
+        if (!force && has_main && main_size > cache_detail::kSettledRewriteBytes) {
+            // A large main file: rewriting it takes seconds (a browser's is
+            // 300-500 MB), which the exit would spend before the exit code is
+            // set. A detached helper folds its due journals instead. This
+            // process merges only its own module's journals, and only once
+            // they piled up (no helper, or helpers that cannot keep up):
+            // the directory is shared, and a short tool's exit must never
+            // rewrite another program's file (a 50 KB hello's exit rewrote a
+            // browser's 343 MB main file once that had 8 journals).
+            if (!due) continue;
+            const bool piled = pending.journals >= cache_detail::kInlineFoldJournals || pending.bytes >= main_size / 2;
+            if (!piled || used.count(stem) == 0) {
+                fold.push_back(stem);
+                continue;
             }
+        } else if (!force && has_main && !due) {
+            // Journals that earlier processes left (e.g. regions first used
+            // by guest DLL_PROCESS_DETACH, see cache_flush_journals) are
+            // folded into a small main file once instead, so the preloader
+            // installs them.
+            settled = pending.journals > pending.mine;
+            if (!settled) continue;
         }
         if (cache_detail::merge_stem(stem, force, settled)) g.merges.fetch_add(1);
     }
+    if (!fold.empty()) cache_detail::request_fold(directory, fold);
 }
 
 void cache_flush_journals() noexcept {

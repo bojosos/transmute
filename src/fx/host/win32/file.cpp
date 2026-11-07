@@ -57,6 +57,8 @@ bool write_all(File file, const void* data, std::size_t size) noexcept {
     return true;
 }
 
+bool flush_to_disk(File file) noexcept { return FlushFileBuffers(native(file)) != FALSE; }
+
 bool read_all(File file, void* data, std::size_t size) noexcept {
     auto* p = static_cast<std::uint8_t*>(data);
     for (std::size_t done = 0; done < size;) {
