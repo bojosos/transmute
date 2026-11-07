@@ -15,7 +15,7 @@ constexpr std::string_view expat_source = "https://github.com/libexpat/libexpat"
 
 constexpr std::string_view swift_source = "https://github.com/swiftlang/swift";
 
-constexpr std::array<RuntimeLibraryIdentity, 18> identities{{
+constexpr std::array<RuntimeLibraryIdentity, 19> identities{{
     {"/usr/lib/libc++.1.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libc++abi.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libunwind.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
@@ -28,6 +28,8 @@ constexpr std::array<RuntimeLibraryIdentity, 18> identities{{
     {"/usr/lib/swift/libswift_Concurrency.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     {"/usr/lib/swift/libswiftObservation.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     {"/usr/lib/swift/libswiftSynchronization.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
+    // Combine from OpenCombine (third_party/opencombine), built by the same script.
+    {"/System/Library/Frameworks/Combine.framework/Versions/A/Combine", swift_source, "scripts/build_alchemy_swift.ps1", false},
     // Project-authored overlays built by the same script (runtime/swift/overlays).
     {"/usr/lib/swift/libswiftFoundation.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     {"/usr/lib/swift/libswiftos.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},

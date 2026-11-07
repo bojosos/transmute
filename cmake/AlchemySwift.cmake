@@ -76,5 +76,32 @@ if(BUILD_TESTING AND ALCHEMY_LD64_LLD AND macos_dir AND TARGET alchemy-fx
             "-DEXPECTED=${CMAKE_SOURCE_DIR}/tests/fixtures/macos/swift_concurrency.expected"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/alchemy_swift_run.cmake")
         set_tests_properties(alchemy_swift_concurrency PROPERTIES TIMEOUT 120 ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1")
+
+        # Combine.framework (OpenCombine, third_party/opencombine), once the runtime directory has it.
+        if(EXISTS "${ALCHEMY_SWIFT_RUNTIME_DIR}/Combine" AND EXISTS "${ALCHEMY_SWIFT_RUNTIME_DIR}/obj/combine/Combine.swiftmodule")
+            add_custom_command(OUTPUT "${macos_dir}/swift_combine.o"
+                COMMAND "${CMAKE_COMMAND}" -E env "${alchemy_swift_env}" "${alchemy_swift_bin}/swift-frontend.exe"
+                    -frontend -c -target arm64-apple-macosx15.0 -module-name swift_combine -O -parse-as-library
+                    -I "${ALCHEMY_SWIFT_RUNTIME_DIR}/obj/core" -I "${alchemy_swift_stdlib}" -I "${ALCHEMY_SWIFT_RUNTIME_DIR}/obj/combine"
+                    -I "${ALCHEMY_SWIFT_SOURCE_DIR}/swift/stdlib/public/SwiftShims/swift/shims"
+                    -Xcc "-I${CMAKE_SOURCE_DIR}/runtime/swift/include" -Xcc "-I${CMAKE_SOURCE_DIR}/runtime/include"
+                    -plugin-path "${alchemy_swift_bin}" -disable-implicit-string-processing-module-import
+                    -runtime-compatibility-version none -module-cache-path "${CMAKE_CURRENT_BINARY_DIR}/swift-module-cache"
+                    "${CMAKE_SOURCE_DIR}/tests/fixtures/macos/swift_combine.swift" -o "${macos_dir}/swift_combine.o"
+                DEPENDS tests/fixtures/macos/swift_combine.swift "${ALCHEMY_SWIFT_RUNTIME_DIR}/Combine" ${alchemy_swift_concurrency_libraries} VERBATIM)
+            add_custom_command(OUTPUT "${macos_dir}/swift_combine"
+                COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main "${macos_dir}/swift_combine.o"
+                    "${ALCHEMY_SWIFT_RUNTIME_DIR}/Combine" ${alchemy_swift_concurrency_libraries} "${macos_dir}/link_system.dylib"
+                    "-L${ALCHEMY_LLVM_RUNTIME_DIR}" -undefined dynamic_lookup -o "${macos_dir}/swift_combine"
+                DEPENDS "${macos_dir}/swift_combine.o" "${macos_dir}/link_system.dylib" VERBATIM)
+            add_custom_target(alchemy_swift_combine_fixture ALL DEPENDS "${macos_dir}/swift_combine")
+            add_dependencies(alchemy_swift_combine_fixture alchemy_macos_fixtures)
+            add_test(NAME alchemy_swift_combine COMMAND "${CMAKE_COMMAND}"
+                "-DALCHEMY=$<TARGET_FILE:alchemy-fx>" "-DPROGRAM=${macos_dir}/swift_combine"
+                "-DRUNTIME_DIRS=${ALCHEMY_LLVM_RUNTIME_DIR};${ALCHEMY_SWIFT_RUNTIME_DIR}"
+                "-DEXPECTED=${CMAKE_SOURCE_DIR}/tests/fixtures/macos/swift_combine.expected"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/alchemy_swift_run.cmake")
+            set_tests_properties(alchemy_swift_combine PROPERTIES TIMEOUT 120 ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1")
+        endif()
     endif()
 endif()

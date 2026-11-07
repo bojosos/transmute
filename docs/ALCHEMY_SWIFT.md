@@ -290,3 +290,30 @@ in runtime_libraries.cpp).
 * **Doctor.** `doctor --deps` reports the names a companion serves as
   `guest` under the companion's identity.
 
+## Combine
+
+`/System/Library/Frameworks/Combine.framework/Versions/A/Combine` is built
+from OpenCombine (MIT, `third_party/opencombine/`) by `build_alchemy_swift.ps1`
+as the resilient module `Combine`, so the names apps import match:
+- `scripts/vendor_opencombine.py` produces the vendored tree from the release
+  archive. It removes the documentation comments, renames `OpenCombine.`
+  qualifiers to `Combine.`, and drops `@inlinable`. `PROVENANCE.md` records
+  the hashes.
+- `runtime/swift/combine/` holds the project's own additions, written from
+  the documented API. The first is `Publishers.MergeMany`, which OpenCombine
+  lacks.
+- The C++ lock helpers compile with exceptions, which they catch at the C
+  boundary.
+
+Maccy 2.8.0 and Pika 2.0.2 import 63 distinct names from Combine, and the
+framework defines all of them. Not provided yet (OpenCombine lacks them, and
+no measured app imports them): `Publishers.CombineLatest`/`3`/`4`,
+`Merge`/`3`-`8`, `Retry`, `Throttle` and `CollectByTime`.
+
+Guest test: `alchemy_swift_combine` (`tests/fixtures/macos/swift_combine`),
+registered once the runtime directory has Combine. `collect()` and `reduce`
+need the Objective-C metadata reader to accept the zero-size ivar entries of
+runtime-instantiated generic Swift classes. The Foundation side of Combine (the
+`NotificationCenter`, `Timer`, `URLSession` and KVO publishers) belongs to
+Foundation's Swift overlay, the companion described above.
+

@@ -544,6 +544,44 @@ if ($Library -eq 'all') {
         }
         Build-Overlay $overlay.Module $overlay.Library $overlay.Source $overlay.Install $overlay.File $overlay.Dependencies $extraFlags $extraInputs
     }
+
+    # /System/Library/Frameworks/Combine.framework/Versions/A/Combine: OpenCombine's code (third_party/opencombine,
+    # vendored by scripts/vendor_opencombine.py) and the project's runtime/swift/combine, as the resilient module
+    # Combine. Its async publishers use _Concurrency, so that module is imported implicitly here.
+    $opencombine = "$repo/third_party/opencombine/Sources"
+    $combineObj = "$obj/combine"
+    $null = New-Item -ItemType Directory -Force -Path "$combineObj/helpers"
+    $helperHeader = Slash "$opencombine/COpenCombineHelpers/include/COpenCombineHelpers.h"
+    $helperMap = "module COpenCombineHelpers [system] {`n  header `"$helperHeader`"`n  export *`n}`n"
+    if (!(Test-Path -LiteralPath "$combineObj/helpers/module.modulemap") -or (Get-Content -LiteralPath "$combineObj/helpers/module.modulemap" -Raw) -ne $helperMap) {
+        [System.IO.File]::WriteAllText("$combineObj/helpers/module.modulemap", $helperMap)
+    }
+    # The C++ lock and identifier helpers (they use exceptions internally and catch them at the C boundary).
+    $helperSource = Slash "$opencombine/COpenCombineHelpers/COpenCombineHelpers.cpp"
+    $helperObject = "$combineObj/COpenCombineHelpers.o"
+    $helperFlags = @('--target=arm64-apple-macos11', '-mcpu=generic', '-march=armv8-a', '-O2', '-g0', '-std=c++17', '-nostdinc',
+        '-isystem', "$llvm/libcxx/include", '-isystem', "$llvm/libcxxabi/include") + @($sysroot | ForEach-Object { @('-isystem', $_) }) +
+        @('-isystem', $resourceInclude, '-D_LIBCPP_DISABLE_AVAILABILITY', '-DNDEBUG', '-fexceptions', '-fno-rtti', '-fvisibility=hidden',
+        '-I', (Slash "$opencombine/COpenCombineHelpers/include"), '-c', $helperSource, '-o', $helperObject)
+    if (Needs-Build $helperObject ($helperFlags -join "`n") @($helperSource, $helperHeader)) {
+        Invoke-Tool $clang $helperFlags "$combineObj/helpers-cc"
+        Set-Content -LiteralPath "$helperObject.flags" -Value ($helperFlags -join "`n") -Encoding utf8
+    }
+    $combineSources = @(@(Get-ChildItem -LiteralPath "$opencombine/OpenCombine" -Recurse -Filter '*.swift') +
+        @(Get-ChildItem -LiteralPath "$repo/runtime/swift/combine" -Filter '*.swift') | Sort-Object FullName | ForEach-Object { Slash $_.FullName })
+    $combineObjects = @($combineSources | ForEach-Object { "$combineObj/Combine-" + [System.IO.Path]::GetFileNameWithoutExtension($_) + '.o' })
+    $combineFlags = @($overlayFlags | Where-Object { $_ -ne '-disable-implicit-concurrency-module-import' }) + @('-I', $stdlibObj,
+        '-Xcc', (Slash "-I$combineObj/helpers"), '-module-name', 'Combine', '-module-link-name', 'Combine',
+        '-emit-module-path', "$combineObj/Combine.swiftmodule")
+    $combineSignature = ($combineFlags + $combineSources) -join "`n"
+    if (Needs-Build $combineObjects[-1] $combineSignature $combineSources) {
+        $arguments = $combineFlags + $combineSources
+        foreach ($object in $combineObjects) { $arguments += @('-o', $object) }
+        Invoke-Tool $frontend $arguments "$combineObj/Combine"
+        Set-Content -LiteralPath "$($combineObjects[-1]).flags" -Value $combineSignature -Encoding utf8
+    }
+    Link-Library 'Combine' '/System/Library/Frameworks/Combine.framework/Versions/A/Combine' @($combineObjects + $helperObject) `
+        @($cxx, "$out/libswiftCore.dylib", "$out/libswift_Concurrency.dylib", "$out/libswiftDarwin.dylib") 'Combine'
 }
 
 # --- Licenses and provenance.
@@ -552,7 +590,8 @@ Copy-Item -LiteralPath "$SourceDirectory/libdispatch/LICENSE" -Destination "$out
 Copy-Item -LiteralPath "$repo/runtime/THIRD_PARTY_NOTICES.md" -Destination "$out/THIRD_PARTY_NOTICES.md"
 $outputs = @(@(Get-ChildItem -LiteralPath $out -File -Filter '*.dylib') +
     @($extraOverlays | Where-Object { $_.File -notlike '*.dylib' -and (Test-Path -LiteralPath "$out/$($_.File)") } |
-        ForEach-Object { Get-Item -LiteralPath "$out/$($_.File)" }) | Sort-Object Name)
+        ForEach-Object { Get-Item -LiteralPath "$out/$($_.File)" }) +
+    @(Get-Item -LiteralPath "$out/Combine" -ErrorAction SilentlyContinue) | Sort-Object Name)
 $headerRecords = @(foreach ($root in $sysroot) {
     $rootPath = (Resolve-Path -LiteralPath $root).Path.TrimEnd('\', '/')
     Get-ChildItem -LiteralPath $root -File -Recurse | Sort-Object FullName | ForEach-Object {
