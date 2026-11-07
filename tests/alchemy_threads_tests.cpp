@@ -58,6 +58,14 @@ void test_mutex_keys_and_once() {
     require(f.call("_pthread_once", {data + 512, initialize}) == 0 &&
             f.call("_pthread_once", {data + 512, initialize}) == 0 && initialized == 1, "once ran twice");
     require(f.call("_pthread_mutex_lock", {0}) == 22, "invalid mutex accepted");
+    // PTHREAD_RECURSIVE_MUTEX_INITIALIZER / PTHREAD_ERRORCHECK_MUTEX_INITIALIZER: their signatures choose the type.
+    f.engine.write64(data + 640, 0x32aaaba2);
+    require(f.call("_pthread_mutex_lock", {data + 640}) == 0 && f.call("_pthread_mutex_lock", {data + 640}) == 0 &&
+            f.call("_pthread_mutex_unlock", {data + 640}) == 0 && f.call("_pthread_mutex_unlock", {data + 640}) == 0,
+            "a static recursive mutex is not recursive");
+    f.engine.write64(data + 704, 0x32aaaba1);
+    require(f.call("_pthread_mutex_lock", {data + 704}) == 0 && f.call("_pthread_mutex_lock", {data + 704}) == 11 &&
+            f.call("_pthread_mutex_unlock", {data + 704}) == 0, "a static errorcheck mutex does not report EDEADLK");
 }
 void test_workers(bool jit) {
     Fixture f;

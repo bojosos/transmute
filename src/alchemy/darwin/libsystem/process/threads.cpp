@@ -19,6 +19,7 @@
 #include <sstream>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -175,6 +176,16 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         std::lock_guard lock(metadata);
         if (const auto found = table.find(address); found != table.end()) return found->second;
         auto value = std::make_shared<T>();
+        // A mutex first seen here was set up statically: PTHREAD_ERRORCHECK_MUTEX_INITIALIZER and
+        // PTHREAD_RECURSIVE_MUTEX_INITIALIZER leave their own signatures (libpthread's
+        // _PTHREAD_ERRORCHECK_MUTEX_SIG_init, _PTHREAD_RECURSIVE_MUTEX_SIG_init) and no attribute.
+        if constexpr (std::is_same_v<T, Mutex>) {
+            if (size >= 8) {
+                const auto signature = memory.read64(address);
+                if (signature == 0x32aaaba1) value->type = 1;
+                else if (signature == 0x32aaaba2) value->type = 2;
+            }
+        }
         table.emplace(address, value);
         return value;
     }
