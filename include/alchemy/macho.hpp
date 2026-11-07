@@ -105,6 +105,8 @@ public:
     [[nodiscard]] const std::vector<MachOImport>& imports() const noexcept { return imports_; }
     [[nodiscard]] const std::vector<MachOExport>& exports() const noexcept { return exports_; }
     [[nodiscard]] const std::vector<std::string>& runpaths() const noexcept { return runpaths_; }
+    // LC_DYLD_ENVIRONMENT strings ("DYLD_..._PATH=value"), in command order.
+    [[nodiscard]] const std::vector<std::string>& dyld_environment() const noexcept { return dyld_environment_; }
     [[nodiscard]] bool has_classic_fixups() const noexcept { return classic_fixups_; }
     [[nodiscard]] const std::string& install_name() const noexcept { return install_name_; }
     [[nodiscard]] std::uint32_t minimum_os() const noexcept { return minimum_os_; }
@@ -181,6 +183,7 @@ private:
     std::vector<MachOImport> imports_;
     std::vector<MachOExport> exports_;
     std::vector<std::string> runpaths_;
+    std::vector<std::string> dyld_environment_;
     mutable std::vector<Fixup> fixups_;
     std::vector<std::uint16_t> pointer_formats_;
     std::uint64_t fixups_offset_{};

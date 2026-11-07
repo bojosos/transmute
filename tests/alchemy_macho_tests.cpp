@@ -669,6 +669,18 @@ void test_rejections() {
     reject([](auto& b) { b.at(0x210c) = 16; }, "resolvers");
     reject([](auto& b) { b.at(0x210c) = 1; }, "thread-local");
     reject([](auto& b) { put32(b, export_command, 0x8000001c); }, "string");
+    {
+        // LC_DYLD_ENVIRONMENT (a dylinker_command, its string right after the 12-byte header) is recorded.
+        auto environment = fixture();
+        put32(environment, export_command, 0x27);
+        put32(environment, export_command + 8, 12);
+        const char text[] = "P=x";
+        for (std::size_t index = 0; index < sizeof(text); ++index) environment.at(export_command + 12 + index) = static_cast<std::uint8_t>(text[index]);
+        const auto parsed = alchemy::MachOImage::parse(environment);
+        expect(parsed.dyld_environment().size() == 1 && parsed.dyld_environment()[0] == "P=x", "LC_DYLD_ENVIRONMENT was not recorded");
+        environment.at(export_command + 12) = 0;
+        reject([&](auto& b) { b = environment; }, "empty LC_DYLD_ENVIRONMENT");
+    }
     reject([](auto& b) { put32(b, data_command + 136, 0x13); }, "misaligned");
     reject([](auto& b) { put32(b, data_command + 132, 1); }, "classic section relocations");
     const auto image = alchemy::MachOImage::parse(fixture());

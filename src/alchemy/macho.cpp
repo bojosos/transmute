@@ -780,7 +780,13 @@ MachOImage MachOImage::parse_omitting(std::span<const std::uint8_t> bytes,
         }
         case 0x80000023: invalid("LC_LOAD_UPWARD_DYLIB unsupported");
         case 0x20: invalid("LC_LAZY_LOAD_DYLIB unsupported");
-        case 0x27: invalid("LC_DYLD_ENVIRONMENT unsupported");
+        case 0x27: {   // LC_DYLD_ENVIRONMENT (a dylinker_command): dyld reads it in the main executable only
+            command.require(0, 12);
+            auto value = command_string(12);
+            if (value.empty()) invalid("empty LC_DYLD_ENVIRONMENT");
+            image.dyld_environment_.push_back(std::move(value));
+            break;
+        }
         case 0x5: invalid("LC_UNIXTHREAD startup unsupported; use LC_MAIN");
         case 0x1a: invalid("LC_ROUTINES_64 initializer startup unsupported");
         case 0x1e: invalid("LC_SEGMENT_SPLIT_INFO unsupported");
