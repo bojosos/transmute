@@ -1,13 +1,12 @@
 #pragma once
 
 // Host area "media_codec" (owner: fw-media). The rules are in include/alchemy/host/host.hpp. The host
-// system's own media encoders (on Windows, the Media Foundation transforms the system provides; nothing
-// is shipped with Alchemy): H.264 and HEVC video from NV12 pictures, AAC audio from 16-bit PCM.
-// VTCompressionSession, AudioConverter, AVAssetWriter and AVAssetExportSession run on this
-// (src/alchemy/darwin/media/). A machine without a given encoder lists none and fails to open one:
-// callers answer their own documented "no encoder" errors. Decoders are not part of this area yet;
-// `Direction` leaves room for them. GUI-only: the backends are src/alchemy/host/<backend>/gui/media_codec.cpp,
-// compiled into alchemy-fx.
+// system's own media encoders and decoders (on Windows, the Media Foundation transforms the system provides;
+// nothing is shipped with Alchemy): H.264 and HEVC video from and to NV12 pictures (P010 above 8 bits), AAC
+// audio from and to 16-bit PCM. VTCompressionSession, VTDecompressionSession, AudioConverter, the audio files,
+// AVAssetReader/Writer, AVPlayer and AVAssetExportSession run on this (src/alchemy/darwin/media/). A machine
+// without a given encoder or decoder lists none and fails to open one: callers answer their own documented
+// errors. GUI-only: the backends are src/alchemy/host/<backend>/gui/media_codec.cpp, compiled into alchemy-fx.
 
 #include "alchemy/host/host.hpp"
 
@@ -21,7 +20,7 @@
 namespace alchemy::host::media_codec {
 
 enum class Codec : std::uint8_t { h264, hevc, aac };
-enum class Direction : std::uint8_t { encode };
+enum class Direction : std::uint8_t { encode, decode };
 
 // One codec component of the host.
 struct Component {
@@ -34,12 +33,15 @@ struct Component {
     // itself reports them.
     std::vector<std::uint32_t> sample_rates, channel_counts, bit_rates;
     // Audio encoders: the frames of delay their output starts with (the priming a player skips), as measured
-    // for this component (measure_delay below); 0: not known.
+    // for this component (measure_delay below); 0: not known. Audio decoders: the frames they hold back to hide
+    // their own delay (given at the drain), as measured; see AudioDecoder.
     std::uint32_t delay{};
 };
 
 // The host's encoders of `codec`, the preferred first. Error::unsupported: none on this host's backend.
 [[nodiscard]] Result<std::vector<Component>> encoders(Codec codec);
+// The host's decoders of `codec`, the preferred first.
+[[nodiscard]] Result<std::vector<Component>> decoders(Codec codec);
 
 // An encoded sample: the bytes, times in units of 100 nanoseconds.
 struct Sample {
@@ -127,5 +129,62 @@ void close(AudioEncoder* encoder) noexcept;
 // the shift that matches the input, plus any frames the decoder held back to hide its own delay (a player that
 // trims by the priming sees those as delay too). Nothing decoded leaves this call. Error::not_found: no decoder.
 [[nodiscard]] Result<std::uint32_t> measure_delay(const AudioSettings& settings);
+
+// ---- video decoding ---------------------------------------------------------------------------------
+
+struct VideoDecoderSettings {
+    Codec codec{Codec::h264};
+    // The parameter sets as NAL units without start codes or lengths (H.264: SPS, PPS; HEVC: VPS, SPS, PPS).
+    std::vector<std::vector<std::uint8_t>> parameter_sets;
+    std::uint32_t width{}, height{};       // the coded size when known (some decoders want it up front)
+    std::string component;                 // a Component id (empty: the first that accepts the stream)
+};
+
+// A decoded picture: NV12 (8 bits) or P010 (above 8 bits: 16-bit little-endian samples, the value in the high bits),
+// `height` rows of luma then `height / 2` rows of interleaved Cb Cr, of the displayed size.
+struct DecodedPicture {
+    std::uint32_t width{}, height{}, bit_depth{8};
+    std::vector<std::uint8_t> luma, chroma;
+    std::size_t luma_stride{}, chroma_stride{};
+    std::int64_t pts{}, duration{};        // 100 ns units, as the samples gave them
+};
+
+class VideoDecoder;
+
+// Error::not_found: no decoder of the codec (or the named component); Error::invalid_argument: parameter sets no
+// decoder takes; Error::unsupported: no media decoders on this host.
+[[nodiscard]] Result<VideoDecoder*> open_video_decoder(const VideoDecoderSettings& settings);
+[[nodiscard]] const Component& component(const VideoDecoder* decoder) noexcept;
+// Decodes a sample (length-prefixed NAL units, 4-byte big-endian lengths, as encode gives them); the pictures ready
+// so far are appended to `out`, in presentation order.
+[[nodiscard]] Status decode(VideoDecoder* decoder, const Sample& sample, std::vector<DecodedPicture>& out);
+// No more samples: every remaining picture is appended.
+[[nodiscard]] Status drain(VideoDecoder* decoder, std::vector<DecodedPicture>& out);
+// Forgets every sample it holds (a seek); decoding resumes at a keyframe.
+void flush(VideoDecoder* decoder) noexcept;
+void close(VideoDecoder* decoder) noexcept;
+
+// ---- audio decoding ---------------------------------------------------------------------------------
+
+struct AudioDecoderSettings {
+    Codec codec{Codec::aac};
+    std::uint32_t sample_rate{}, channels{};
+    std::vector<std::uint8_t> configuration;   // AAC: the AudioSpecificConfig
+    std::string component;
+};
+
+class AudioDecoder;
+
+// A decoder may hold back frames to hide its own delay: the first `held` frames of a stream come out only at the
+// drain (Microsoft's AAC decoder holds one 1024-frame block). component(decoder).delay says how many, as measured
+// for it (the host GUI test keeps it honest); 0 when it holds none.
+[[nodiscard]] Result<AudioDecoder*> open_audio_decoder(const AudioDecoderSettings& settings);
+[[nodiscard]] const Component& component(const AudioDecoder* decoder) noexcept;
+// Decodes one packet (a raw AAC frame); interleaved 16-bit samples ready so far are appended to `out`.
+[[nodiscard]] Status decode(AudioDecoder* decoder, std::span<const std::uint8_t> packet, std::vector<std::int16_t>& out);
+[[nodiscard]] Status drain(AudioDecoder* decoder, std::vector<std::int16_t>& out);
+// Forgets what it holds (a seek).
+void flush(AudioDecoder* decoder) noexcept;
+void close(AudioDecoder* decoder) noexcept;
 
 } // namespace alchemy::host::media_codec
