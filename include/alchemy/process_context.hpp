@@ -284,6 +284,10 @@ public:
     // The argc/argv main receives (guest stack; argv is followed by envp and
     // the apple[] vector as on Darwin). Zero until startup is initialized.
     std::uint64_t startup_argc{}, startup_argv{};
+    // The main thread's stack size the executable asks for (LC_MAIN stacksize;
+    // 0 when it names none), set by the module loader. The engine may round
+    // the stack it allocates up; pthread_get_stacksize_np reports this.
+    std::uint64_t main_stack_size{};
     std::vector<std::string> environment;
     std::uint64_t instruction_limit{10'000'000};
     bool jit{};
