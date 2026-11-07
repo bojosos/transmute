@@ -442,7 +442,7 @@ struct ModuleLoader::Implementation {
     }
 
     // Loads `provider`'s companion for `module` when one of the module's
-    // imports from that dependency (`ordinal`) is a name the provider lacks.
+    // imports from that dependency (`ordinal`) is a Swift-mangled name the provider lacks.
     // Without the companion in the runtime directories nothing changes: the
     // names stay unresolved (or weak-null) as before. The companion is
     // provenance-checked like every runtime identity (load()).
@@ -457,7 +457,7 @@ struct ModuleLoader::Implementation {
         {
             const ProcessContext::RuntimeLookup lookup;   // never a probe stub
             for (const auto& item : module.image.imports()) {
-                if (item.library_ordinal != ordinal || context.resolve(provider, item.symbol)) continue;
+                if (item.library_ordinal != ordinal || !swift_mangled_symbol(item.symbol) || context.resolve(provider, item.symbol)) continue;
                 missing = true;
                 break;
             }
@@ -1059,7 +1059,8 @@ std::optional<RuntimeExport> ModuleLoader::symbol(std::uint64_t handle, std::str
             // A name the provider lacks at run time: its companion loads now,
             // as a dlopen of it would (initializers run without the lock).
             const auto companion = companion_identity(provider);
-            if (!result && !companion.empty() && !loader.resident_companion(provider) && loader.find_path(companion, nullptr)) {
+            if (!result && !companion.empty() && swift_mangled_symbol(mangled) && !loader.resident_companion(provider) &&
+                loader.find_path(companion, nullptr)) {
                 lock.unlock();
                 static_cast<void>(open(companion, 2U | 4U, caller));   // RTLD_NOW | RTLD_LOCAL
                 lock.lock();

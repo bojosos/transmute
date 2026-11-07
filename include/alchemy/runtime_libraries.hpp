@@ -28,9 +28,14 @@ struct RuntimeLibraryIdentity {
 // lacks (its "companion"), or empty. Apps built for macOS 14 and later bind
 // Foundation's Swift overlay ($s10Foundation...) through Foundation.framework
 // itself, older ones through libswiftFoundation. The loader loads a companion
-// only for an image importing a name the provider lacks, and searches it after
+// only for an image importing a Swift-mangled name the provider lacks, and searches it after
 // the provider (docs/ALCHEMY_SWIFT.md).
 [[nodiscard]] std::string_view companion_identity(std::string_view provider) noexcept;
+
+// A Mach-O symbol name (leading underscore) with a Swift mangling prefix: only
+// these load a companion, so a C or Objective-C name a provider lacks (a
+// feature probe) never brings in the Swift runtime.
+[[nodiscard]] bool swift_mangled_symbol(std::string_view name) noexcept;
 
 // The file a runtime identity resolves to in the given runtime directories, by
 // the install name's file name. Returns an empty path when none exists.

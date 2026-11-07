@@ -120,7 +120,7 @@ public:
             else if (ProcessContext::is_provider_library(dependency.install_name)) {
                 report.status = "provider";
                 // The loader's companion of this provider (module_loader.cpp load_companion), when the image
-                // imports a name the provider lacks.
+                // imports a Swift-mangled name the provider lacks.
                 add_companion(*selected.image, dependency.install_name,
                     static_cast<std::int32_t>(selected.dependencies.size() + 1), path, runpaths);
             } else if (!dependency.weak) unsupported_ = true;
@@ -321,7 +321,10 @@ private:
         {
             const ProcessContext::RuntimeLookup lookup;   // never a probe stub
             for (const auto& item : image.imports()) {
-                if (item.library_ordinal == ordinal && !context_.resolve(provider, item.symbol)) { missing = true; break; }
+                if (item.library_ordinal == ordinal && swift_mangled_symbol(item.symbol) && !context_.resolve(provider, item.symbol)) {
+                    missing = true;
+                    break;
+                }
             }
         }
         if (!missing) return;

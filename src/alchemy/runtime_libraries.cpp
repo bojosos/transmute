@@ -282,6 +282,11 @@ std::string_view companion_identity(std::string_view provider) noexcept {
     return {};
 }
 
+bool swift_mangled_symbol(std::string_view name) noexcept {
+    // Swift 5+ ($s), pre-ABI-stability ($S) and Swift 4 (_T0) manglings.
+    return name.starts_with("_$s") || name.starts_with("_$S") || name.starts_with("__T0");
+}
+
 std::filesystem::path find_runtime_library(const RuntimeLibraryIdentity& identity,
     std::span<const std::filesystem::path> runtime_directories) {
     const auto filename = utf8_path(identity.install_name).filename();

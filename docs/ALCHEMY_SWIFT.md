@@ -277,7 +277,8 @@ companion: the runtime identity libswiftFoundation (`companion_identity()`
 in runtime_libraries.cpp).
 
 * **Lazy.** An image loads the companion only when one of its imports from
-  the provider is a name the provider lacks. It's loaded from the runtime
+  the provider is a Swift-mangled name the provider lacks (a C or Objective-C
+  name it lacks, such as a feature probe, never loads it). It's loaded from the runtime
   directories during the dependency load, provenance-checked like any
   runtime identity, and initialized before the image. Processes without
   such an import are unchanged.

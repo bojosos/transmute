@@ -417,10 +417,10 @@ void provider_companion_tests() {
         stream.push_back(0);
         return stream;
     };
-    // The companion: binds a provider name itself (no cycle) and exports a name the provider lacks.
+    // The companion: binds a provider name itself (no cycle) and exports a Swift name the provider lacks.
     auto companion = image(6, false, "/usr/lib/swift/libswiftFoundation.dylib");
     dependency(companion, foundation);
-    exports(companion, "_swift_only", 0, 0x504);
+    exports(companion, "_$s10Foundation9SwiftOnlyVMn", 0, 0x504);
     classic(companion, {{{}, binds({"_provided"}), {}, {}}});
     write(directory / "runtime" / "libswiftFoundation.dylib", companion);
     {
@@ -428,12 +428,18 @@ void provider_companion_tests() {
         provenance << "{\"source\":\"https://github.com/swiftlang/swift\",\"outputs\":[{\"name\":\"libswiftFoundation.dylib\",\"sha256\":\""
                    << alchemy::sha256_file(directory / "runtime" / "libswiftFoundation.dylib") << "\"}]}";
     }
+    // Only provider names, plus a weak import of a C name the provider lacks (a feature probe): no companion.
     auto plain = image(8); dependency(plain, foundation);
-    classic(plain, {{{}, binds({"_provided"}), {}, {}}});
+    std::vector<std::uint8_t> probe = binds({"_provided"});
+    probe.pop_back();
+    probe.push_back(0x41);   // BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | BIND_SYMBOL_FLAGS_WEAK_IMPORT
+    for (const auto byte : std::string_view("_NSNewerFeature")) probe.push_back(static_cast<std::uint8_t>(byte));
+    probe.insert(probe.end(), {0, 0x90, 0});
+    classic(plain, {{{}, probe, {}, {}}});
     const auto plain_source = write(directory / "plain.bundle", plain);
     auto user = image(8); dependency(user, foundation);
     exports(user, "_slots", 0, 0x1000);
-    classic(user, {{{}, binds({"_provided", "_swift_only"}), {}, {}}});
+    classic(user, {{{}, binds({"_provided", "_$s10Foundation9SwiftOnlyVMn"}), {}, {}}});
     const auto user_source = write(directory / "user.bundle", user);
     const auto main = write(directory / "main", image());
     constexpr std::uint64_t provided = 0xf00d0000ULL;
@@ -459,12 +465,12 @@ void provider_companion_tests() {
         const auto user_handle = loader.open(user_source.string(), 2 | 4);
         expect(context.images().size() == images + 3, "the companion was not loaded for a provider miss");
         const auto companion_handle = loader.open("/usr/lib/swift/libswiftFoundation.dylib", 2 | 4 | 0x10);
-        const auto swift_only = loader.symbol(companion_handle, "swift_only");
+        const auto swift_only = loader.symbol(companion_handle, "$s10Foundation9SwiftOnlyVMn");
         expect(swift_only && engine.read32(swift_only->address) == 0xd65f03c0, "companion export missing");
         const auto slots = loader.symbol(user_handle, "slots");
         expect(slots && engine.read64(slots->address) == provided, "a provider name did not bind to the provider");
         expect(engine.read64(slots->address + 8) == swift_only->address, "a provider miss did not bind to the companion export");
-        const auto via_provider = loader.symbol(loader.open(std::string(foundation), 2), "swift_only");
+        const auto via_provider = loader.symbol(loader.open(std::string(foundation), 2), "$s10Foundation9SwiftOnlyVMn");
         expect(via_provider && via_provider->address == swift_only->address, "dlsym(Foundation) missed the companion export");
     }
     {   // Without the companion in the runtime directories: unresolved, as before.
@@ -476,7 +482,7 @@ void provider_companion_tests() {
         loader.initialize({});
         static_cast<void>(loader.open(plain_source.string(), 2 | 4));
         fails([&] { static_cast<void>(loader.open(user_source.string(), 2 | 4)); }, "unresolved strong import");
-        expect(!loader.symbol(loader.open(std::string(foundation), 2), "swift_only"), "a missing companion answered dlsym");
+        expect(!loader.symbol(loader.open(std::string(foundation), 2), "$s10Foundation9SwiftOnlyVMn"), "a missing companion answered dlsym");
     }
     {   // dlsym on a provider handle loads the companion at run time.
         transmute::ReferenceEngine engine(transmute::ExecutionStart{preferred + 0x500});
@@ -486,7 +492,10 @@ void provider_companion_tests() {
         static_cast<void>(loader.load_main());
         loader.initialize({});
         const auto images = context.images().size();
-        const auto found = loader.symbol(loader.open(std::string(foundation), 2), "swift_only");
+        const auto handle = loader.open(std::string(foundation), 2);
+        expect(!loader.symbol(handle, "NSNewerFeature") && context.images().size() == images,
+               "dlsym of a missing C name loaded the companion");
+        const auto found = loader.symbol(handle, "$s10Foundation9SwiftOnlyVMn");
         expect(found && engine.read32(found->address) == 0xd65f03c0 && context.images().size() == images + 1,
                "dlsym(Foundation) did not load the companion");
     }
