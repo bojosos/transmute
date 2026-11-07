@@ -213,6 +213,14 @@ void DarwinServices::Impl::install_extra() {
         return static_cast<std::uint64_t>(count);
     });
     install("_realpath", [this](auto& s, auto& m) {
+        // The guest root is "/": it maps to the host drive (with the Alchemy root's directories in
+        // it), whose own name would otherwise come back as /Volumes/<drive>.
+        if (const auto guest = text(m, s.x[0]); !guest.empty() && guest.front() == '/' &&
+                std::filesystem::path(guest).lexically_normal().generic_string() == "/") {
+            const auto address = s.x[1] ? s.x[1] : allocate(2);
+            put_text(m, address, "/");
+            return address;
+        }
         const auto name = path(m, s.x[0]);
         std::error_code error; const auto canonical = is_random_device(name) ? name : std::filesystem::canonical(name, error);
         if (error) throw ServiceError{host_error(error)};
@@ -853,9 +861,17 @@ void DarwinServices::Impl::install_python_services() {
         if (const auto value = text(m, s.x[0]); !(s.x[1] & 2) && is_virtual_program(value)) return std::uint64_t{0};
         check_access(path(m, s.x[0]), s.x[1]); return std::uint64_t{0};
     });
+    // faccessat flags, as xnu: AT_EACCESS (0x10, effective ids, which are the real ones here) and
+    // AT_SYMLINK_NOFOLLOW (0x20): a final symbolic link is checked itself (lrwxr-xr-x, the caller's
+    // own), not followed, so F_OK holds for a dangling one.
     install("_faccessat", [this, check_access](auto& s, auto& m) {
-        if (s.x[3] != 0 && s.x[3] != 0x10) throw ServiceError{einval};
-        check_access(path_at(m, s.x[0], s.x[1]), s.x[2]); return std::uint64_t{0};
+        if (s.x[3] & ~0x30ULL) throw ServiceError{einval};
+        const auto name = path_at(m, s.x[0], s.x[1]);
+        if (s.x[3] & 0x20) {
+            std::error_code error;
+            if (std::filesystem::is_symlink(std::filesystem::symlink_status(name, error))) return std::uint64_t{0};
+        }
+        check_access(name, s.x[2]); return std::uint64_t{0};
     });
     install("_chmod", [this](auto& s, auto& m) {
         const auto name = filesystem_path(m, s.x[0]);

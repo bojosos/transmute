@@ -2109,6 +2109,15 @@ public:
         return open_path(path(memory, address), flags, mode);
     }
     int open_path(const std::filesystem::path& name, std::uint64_t flags, std::uint64_t mode) {
+        // O_SHLOCK (0x10) / O_EXLOCK (0x20), as xnu's open1: the new descriptor takes a flock lock,
+        // waiting for it, or EWOULDBLOCK under O_NONBLOCK, and is closed again when it cannot have it.
+        if (const auto lock_flags = flags & 0x30) {
+            if (lock_flags == 0x30) throw ServiceError{einval};
+            const auto descriptor = open_path(name, flags & ~0x30ULL, mode);
+            try { static_cast<void>(flock(descriptor, (lock_flags == 0x20 ? 2 : 1) | (flags & 4))); }
+            catch (...) { static_cast<void>(close(descriptor)); throw; }
+            return descriptor;
+        }
         if (const auto opened = open_pseudo_terminal(name, flags)) return *opened;
         if (is_terminal_device(name)) throw ServiceError{6};   // ENXIO: no controlling terminal or console device
         if (is_random_device(name)) {

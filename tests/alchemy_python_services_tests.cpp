@@ -164,6 +164,23 @@ void relative_files_and_identity() {
     const auto created = f.call("_openat", {descriptor, f.string("one"), 2 | 0x200 | 0x400});
     require(created != UINT64_MAX, "relative file create failed");
     require(f.call("_faccessat", {descriptor, f.string("one"), 0, 0}) == 0, "relative access failed");
+    // AT_EACCESS (0x10) and AT_SYMLINK_NOFOLLOW (0x20) are faccessat's flags; anything else is EINVAL.
+    require(f.call("_faccessat", {descriptor, f.string("one"), 0, 0x20}) == 0 &&
+            f.call("_faccessat", {descriptor, f.string("one"), 4, 0x30}) == 0, "faccessat AT_SYMLINK_NOFOLLOW refused");
+    require(f.call("_faccessat", {descriptor, f.string("one"), 0, 0x40}) == UINT64_MAX && f.error() == 22, "faccessat unknown flag accepted");
+    // O_EXLOCK (0x20) / O_SHLOCK (0x10): the open takes a flock lock; O_NONBLOCK makes a held one EWOULDBLOCK.
+    const auto locked = f.call("_openat", {descriptor, f.string("one"), 2 | 0x20});
+    require(locked != UINT64_MAX, "open with O_EXLOCK failed");
+    require(f.call("_openat", {descriptor, f.string("one"), 0 | 0x10 | 4}) == UINT64_MAX && f.error() == 35,
+            "O_SHLOCK | O_NONBLOCK did not see the O_EXLOCK lock");
+    require(f.call("_flock", {created, 2 | 4}) == UINT64_MAX && f.error() == 35, "flock did not see the O_EXLOCK lock");
+    require(f.call("_openat", {descriptor, f.string("one"), 0x30}) == UINT64_MAX && f.error() == 22, "O_SHLOCK | O_EXLOCK accepted");
+    require(f.call("_close", {locked}) == 0, "O_EXLOCK descriptor close failed");
+    const auto shared = f.call("_openat", {descriptor, f.string("one"), 0x10 | 4});
+    require(shared != UINT64_MAX && f.call("_close", {shared}) == 0, "O_SHLOCK after the lock went failed");
+    // realpath("/") is "/" (the guest root, not the host drive's /Volumes name).
+    const auto resolved = f.context.allocate_guest(1024);
+    require(f.call("_realpath", {f.string("/"), resolved}) == resolved && f.read_string(resolved) == "/", "realpath(\"/\") is not \"/\"");
     const auto metadata = f.context.allocate_guest(144);
     require(f.call("_fstatat", {descriptor, f.string("one"), metadata, 0}) == 0 && f.engine.read64(metadata + 96) == 0,
         "relative stat/layout failed");
