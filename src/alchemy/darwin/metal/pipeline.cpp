@@ -464,6 +464,7 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
 
     // Vertex input: binding = Metal buffer index.
     std::vector<VkVertexInputBindingDescription> bindings;
+    std::vector<VkVertexInputBindingDivisorDescriptionKHR> divisors;
     std::vector<VkVertexInputAttributeDescription> attributes;
     for (const auto index : vertex_bindings) {
         const auto layout = descriptor.layouts[index].value_or(VertexLayout{});
@@ -473,9 +474,14 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
         case 1: break;
         case 2:
             binding.inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
-            if (layout.step_rate != 1)
-                throw std::runtime_error("MTLVertexStepFunctionPerInstance with stepRate " + std::to_string(layout.step_rate) +
-                                         " is not translated");
+            if (layout.step_rate != 1) {
+                // A divisor; stepRate 0 (every instance reads element 0) needs
+                // the zero-divisor feature, which is not enabled.
+                if (!d.vertex_attribute_divisor || layout.step_rate == 0)
+                    throw std::runtime_error("MTLVertexStepFunctionPerInstance with stepRate " + std::to_string(layout.step_rate) +
+                                             " needs a vertex attribute divisor this Vulkan device does not support");
+                divisors.push_back({index, layout.step_rate});
+            }
             break;
         default: throw std::runtime_error("tessellation vertex step functions are not translated");
         }
@@ -506,6 +512,12 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
         attributes.push_back({location, attribute->buffer_index, format, attribute->offset});
     }
     VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineVertexInputDivisorStateCreateInfoKHR divisor_state{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR};
+    if (!divisors.empty()) {
+        divisor_state.vertexBindingDivisorCount = static_cast<std::uint32_t>(divisors.size());
+        divisor_state.pVertexBindingDivisors = divisors.data();
+        vertex_input.pNext = &divisor_state;
+    }
     vertex_input.vertexBindingDescriptionCount = static_cast<std::uint32_t>(bindings.size());
     vertex_input.pVertexBindingDescriptions = bindings.data();
     vertex_input.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());

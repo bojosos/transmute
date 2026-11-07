@@ -190,7 +190,11 @@ void counters(Fixture& f) {
     const auto d = device(f);
     if (!d) { std::cout << "  skipped\n"; return; }
     const auto sets = f.send(d, "counterSets");
-    for (Address point = 1; point <= 4; ++point) require(f.send(d, "supportsCounterSampling:", {point}) == 0, "only stage-boundary sampling");
+    // Tile dispatch boundaries (3) need tile shaders; draw (1), dispatch (2)
+    // and blit (4) boundaries follow the timestamp set.
+    require(f.send(d, "supportsCounterSampling:", {3}) == 0, "no tile-dispatch-boundary sampling");
+    for (const Address point : {Address{1}, Address{2}, Address{4}})
+        require(f.send(d, "supportsCounterSampling:", {point}) == (f.cf.length(sets) ? 1U : 0U), "draw/dispatch/blit sampling");
     if (f.cf.length(sets) == 0) {
         require(f.send(d, "supportsCounterSampling:", {0}) == 0, "no timestamps, no sampling");
         std::cout << "  no timestamp counter set on this GPU\n";
@@ -218,8 +222,10 @@ void counters(Fixture& f) {
     const auto queue = f.send(d, "newCommandQueue");
     const auto commands = f.send(queue, "commandBuffer");
     const auto compute = f.send(commands, "computeCommandEncoderWithDescriptor:", {pass});
+    static_cast<void>(f.send(compute, "sampleCountersInBuffer:atSampleIndex:withBarrier:", {samples, 2, 1}));   // dispatch boundary
     static_cast<void>(f.send(compute, "endEncoding"));
     const auto blit = f.send(commands, "blitCommandEncoder");
+    static_cast<void>(f.send(blit, "sampleCountersInBuffer:atSampleIndex:withBarrier:", {samples, 3, 0}));   // blit boundary
     alchemy::CallRegs resolve{};
     resolve.x[2] = samples; resolve.x[3] = 0; resolve.x[4] = 4; resolve.x[5] = destination; resolve.x[6] = 0;
     static_cast<void>(f.objc.send(blit, "resolveCounters:inRange:destinationBuffer:destinationOffset:", resolve));
@@ -230,7 +236,9 @@ void counters(Fixture& f) {
     const auto contents = f.send(destination, "contents");
     const auto start = f.engine.read64(contents), end = f.engine.read64(contents + 8);
     require(start != ~0ULL && end != ~0ULL && start <= end, "start and end timestamps");
-    require(f.engine.read64(contents + 16) == ~0ULL && f.engine.read64(contents + 24) == ~0ULL, "unwritten samples are MTLCounterErrorValue");
+    const auto dispatch = f.engine.read64(contents + 16), blitted = f.engine.read64(contents + 24);
+    require(dispatch != ~0ULL && blitted != ~0ULL && dispatch >= start && blitted >= start,
+            "the dispatch- and blit-boundary samples are written");
     const auto data = f.send(samples, "resolveCounterRange:", {0, 2});
     require(data && f.call(cf_library, "_CFDataGetLength", {data}) == 16, "resolveCounterRange: NSData");
     const auto bytes = f.call(cf_library, "_CFDataGetBytePtr", {data});

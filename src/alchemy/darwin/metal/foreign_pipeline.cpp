@@ -327,8 +327,11 @@ VkPipeline ForeignPipeline::create_render(const json::Value& specialization_key,
         const auto& stride = b["stride"];
         binding.stride = stride.is_object() ? u32_or(stride["Static"], 0) : 0;   // "PerBind": dynamic stride
         const auto divisor = u32_or(b["divisor"], 1);
-        if (binding.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE && divisor != 1)
-            throw std::runtime_error("translated pipeline needs a vertex attribute divisor, which is not enabled");
+        if (binding.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE && divisor != 1) {
+            if (!d.vertex_attribute_divisor || divisor == 0)
+                throw std::runtime_error("translated pipeline needs a vertex attribute divisor, which is not enabled");
+            divisors.push_back({binding.binding, divisor});
+        }
         bindings.push_back(binding);
     }
     std::vector<VkVertexInputAttributeDescription> attributes;
@@ -336,6 +339,12 @@ VkPipeline ForeignPipeline::create_render(const json::Value& specialization_key,
         attributes.push_back({u32(a["location"], "location"), u32(a["binding"], "attribute binding"),
                               static_cast<VkFormat>(u32(a["format"], "attribute format")), u32(a["offset"], "attribute offset")});
     VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineVertexInputDivisorStateCreateInfoKHR divisor_state{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR};
+    if (!divisors.empty()) {
+        divisor_state.vertexBindingDivisorCount = static_cast<std::uint32_t>(divisors.size());
+        divisor_state.pVertexBindingDivisors = divisors.data();
+        vertex_input.pNext = &divisor_state;
+    }
     vertex_input.vertexBindingDescriptionCount = static_cast<std::uint32_t>(bindings.size());
     vertex_input.pVertexBindingDescriptions = bindings.data();
     vertex_input.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());

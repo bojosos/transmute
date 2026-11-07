@@ -75,10 +75,22 @@ as a 2D single-level, single-sample texture of the surface's texel size
 it still pending in the receiving process (Vulkan forbids it; one process
 signalling and the other waiting never does it). GPU counters: only the
 timestamp counter set, sampled at stage boundaries (encoder starts and ends;
-a render pass's vertex and fragment boundaries are its start and end):
-sampleCountersInBuffer: at draw, dispatch or blit boundaries stops
-explicitly. MTLLogState never receives shader logs (shader logging is
-not translated).
+a render pass's vertex and fragment boundaries are its start and end) and at
+draw, dispatch and blit boundaries (sampleCountersInBuffer:atSampleIndex:
+withBarrier:; inside a render pass the pass is suspended around the sample);
+tile dispatch boundaries are not supported. MTLLogState never receives
+shader logs (shader logging is not translated).
+
+**Late store actions, step rates, asynchronous pipelines:** a multisample
+resolve asked for while encoding (setColor/Depth/StencilStoreAction: on an
+encoder made with MTLStoreActionUnknown) runs when the pass ends, as a second
+rendering instance that loads the attachments and resolves them; store action
+options other than None stop explicitly (no programmable sample positions).
+MTLVertexStepFunctionPerInstance with a stepRate above 1 is a vertex
+attribute divisor (VK_KHR/EXT_vertex_attribute_divisor) and stops explicitly
+without one; stepRate 0 always stops. The ...options:completionHandler:
+pipeline forms run their synchronous forms and call the handler before
+returning; tile and mesh render pipelines answer nil with an error.
 
 ## Moved from darwin/identities/
 

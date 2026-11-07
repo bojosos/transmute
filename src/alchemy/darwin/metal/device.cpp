@@ -244,6 +244,8 @@ void Device::initialize(const DeviceOptions& options) {
     const bool barycentric = want_device(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     const bool list_restart = want_device(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
     const bool local_read = want_device(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+    const bool divisor = want_device(VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) ||
+                         want_device(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     // [[stencil]] fragment outputs (SPV_EXT_shader_stencil_export).
     want_device(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     // g3: IOSurface-backed textures copy straight into the surfaces' pages
@@ -257,6 +259,7 @@ void Device::initialize(const DeviceOptions& options) {
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT supported_restart{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR supported_local_read{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR supported_divisor{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
     VkPhysicalDeviceVulkan13Features supported13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features supported12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan11Features supported11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
@@ -268,6 +271,7 @@ void Device::initialize(const DeviceOptions& options) {
     if (barycentric) { *tail = &supported_bary; tail = &supported_bary.pNext; }
     if (list_restart) { *tail = &supported_restart; tail = &supported_restart.pNext; }
     if (local_read) { *tail = &supported_local_read; tail = &supported_local_read.pNext; }
+    if (divisor) { *tail = &supported_divisor; tail = &supported_divisor.pNext; }
     vk.vkGetPhysicalDeviceFeatures2(physical, &supported);
 
     std::string missing;
@@ -288,6 +292,7 @@ void Device::initialize(const DeviceOptions& options) {
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR enabled_bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT enabled_restart{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR enabled_local_read{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR enabled_divisor{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
 #define ALCHEMY_ENABLE(target, source, field) target.field = source.field;
     // Core 1.0: everything Metal's feature set maps to (no geometry or
     // tessellation shaders, no wide lines, no float64, no robustness).
@@ -349,6 +354,11 @@ void Device::initialize(const DeviceOptions& options) {
         enabled_local_read.dynamicRenderingLocalRead = VK_TRUE;
         *tail = &enabled_local_read; tail = &enabled_local_read.pNext;
         dynamic_rendering_local_read = true;
+    }
+    if (divisor && supported_divisor.vertexAttributeInstanceRateDivisor) {
+        enabled_divisor.vertexAttributeInstanceRateDivisor = VK_TRUE;
+        *tail = &enabled_divisor; tail = &enabled_divisor.pNext;
+        vertex_attribute_divisor = true;
     }
     features10 = enabled.features;
     features11 = enabled11;

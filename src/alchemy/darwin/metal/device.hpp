@@ -134,6 +134,9 @@ public:
     // VK_KHR_dynamic_rendering_local_read: Metal framebuffer fetch
     // ([[color(n)]] fragment inputs read as input attachments).
     bool dynamic_rendering_local_read{};
+    // VK_KHR/EXT_vertex_attribute_divisor vertexAttributeInstanceRateDivisor:
+    // MTLVertexStepFunctionPerInstance with a stepRate above 1.
+    bool vertex_attribute_divisor{};
     std::uint32_t timestamp_valid_bits{};           // of the queue family
     // The GPU's timestamp counter now, in the ticks timestamp queries write
     // (VK_KHR/EXT_calibrated_timestamps); nullopt without the extension.

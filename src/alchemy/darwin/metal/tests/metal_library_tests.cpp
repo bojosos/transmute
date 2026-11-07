@@ -375,6 +375,14 @@ void refusals(Fixture& f) {
     static_cast<void>(f.send(descriptor, "setWidth:", {16}));
     static_cast<void>(f.send(descriptor, "setHeight:", {16}));
     require(f.send(d, "newTextureWithDescriptor:", {descriptor}) == 0, "an ASTC texture is nil");
+    // Tile and mesh render pipelines: nil with an MTLLibraryErrorDomain error.
+    for (const auto* selector : {"newRenderPipelineStateWithTileDescriptor:options:reflection:error:",
+                                 "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:"}) {
+        f.engine.write64(error, 0);
+        require(f.send(d, selector, {0, 0, 0, error}) == 0 && f.engine.read64(error) != 0 &&
+                    f.send(f.engine.read64(error), "code") == 1,
+                std::string(selector) + " refuses with an error");
+    }
 }
 
 } // namespace

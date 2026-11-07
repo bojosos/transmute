@@ -230,6 +230,19 @@ public:
     void encode_signal(const std::shared_ptr<Event>& event, std::uint64_t value);
     void encode_wait(const std::shared_ptr<Event>& event, std::uint64_t value);
 
+    // setColorStoreAction:atIndex: / setDepthStoreAction: / setStencilStoreAction:
+    // on an open render encoder (attachment 0-7 colour, 8 depth, 9 stencil).
+    // The pass stored everything it was not told otherwise (MTLStoreActionUnknown
+    // stores); a resolve asked for now runs when the pass ends, with the
+    // modes a resolve given at creation uses.
+    void set_store_action(std::uint32_t attachment, std::uint32_t action);
+
+    // sampleCountersInBuffer:atSampleIndex:withBarrier: on any encoder: a
+    // timestamp at that point (draw, dispatch and blit boundaries). Inside a
+    // render pass the pass is suspended around it (a query reset cannot sit
+    // in a dynamic-rendering instance) and resumes with its contents loaded.
+    void sample_counter(const std::shared_ptr<CounterSampleBuffer>& buffer, std::uint32_t index, bool with_barrier);
+
     // ---- lifecycle ----------------------------------------------------------------------
     void enqueue();
     // Ends an open encoder (Metal requires endEncoding; committing with one
@@ -350,6 +363,15 @@ private:
 
     // Render encoder state.
     RenderPass pass_;
+    std::array<bool, 10> late_resolves_{};
+    // Ends the open dynamic-rendering instance / begins it again with every
+    // attachment loaded and stored (memoryBarrier, counter samples).
+    void suspend_render();
+    void resume_render();   // set_store_action asked these attachments for a resolve
+    // The resolve fields of `info` for `attachment` of `pass` (multisample
+    // resolve modes; explicit stops where Vulkan cannot express Metal's).
+    void set_resolve(VkRenderingAttachmentInfo& info, const RenderPass& pass, const Attachment& attachment, bool color,
+                     bool stencil);
     VkRenderingInfo rendering_{};
     std::vector<VkRenderingAttachmentInfo> color_infos_;
     // Vulkan's *_WITH_COUNT viewport and scissor counts must agree; Metal

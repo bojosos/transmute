@@ -805,6 +805,49 @@ CommandBuffer::StageState& CommandBuffer::stage_state(Stage stage) {
 
 // ---- encoders ---------------------------------------------------------------------------
 
+// Multisample resolves: colour averages (integer formats take sample 0);
+// depth follows depthResolveFilter (Min/Max need the device's MIN/MAX
+// resolve modes); stencil takes sample 0, which is also the sample a
+// Sample0 depth resolve chose (DepthResolvedSample). What Vulkan cannot
+// express stops explicitly instead of resolving differently.
+void CommandBuffer::set_resolve(VkRenderingAttachmentInfo& info, const RenderPass& pass, const Attachment& attachment,
+                                bool color, bool stencil) {
+    const auto& profile = device->profile();
+    VkResolveModeFlagBits mode;
+    if (color) {
+        mode = attachment.texture->info->integer() ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+    } else if (stencil) {
+        if (attachment.resolve_filter == 1 && pass.depth.texture && resolves(pass.depth.store_action) && pass.depth.resolve_filter != 0)
+            throw std::runtime_error("Alchemy Metal: stencilResolveFilter DepthResolvedSample with a Min/Max depth resolve "
+                                     "is not translated (Vulkan resolves stencil on its own)");
+        mode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+    } else {
+        mode = attachment.resolve_filter == 1 ? VK_RESOLVE_MODE_MIN_BIT
+               : attachment.resolve_filter == 2 ? VK_RESOLVE_MODE_MAX_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        if (!(profile.depth_resolve_modes & mode))
+            throw std::runtime_error("Alchemy Metal: depthResolveFilter Min/Max needs a MIN/MAX depth resolve, which this Vulkan "
+                                     "device does not support");
+    }
+    const auto& resolve = *attachment.resolve_texture;
+    const auto resolve_layer = resolve.descriptor.type == TextureType::type3d ? attachment.resolve_depth_plane : attachment.resolve_slice;
+    info.resolveMode = mode;
+    info.resolveImageView = attachment.resolve_texture->attachment_view(attachment.resolve_level, resolve_layer, pass_layers_);
+    info.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+}
+
+void CommandBuffer::set_store_action(std::uint32_t attachment, std::uint32_t action) {
+    require(EncoderKind::render, "setStoreAction");
+    if (attachment > 9) throw std::runtime_error("Alchemy Metal: store action for a colour attachment index past 7");
+    auto& target = attachment < 8 ? pass_.colors[attachment] : attachment == 8 ? pass_.depth : pass_.stencil;
+    if (!target.texture) return;
+    if (resolves(action) && !resolves(target.store_action)) {
+        if (!target.resolve_texture)
+            throw std::runtime_error("Alchemy Metal: a multisample-resolve store action for an attachment without a resolveTexture");
+        late_resolves_[attachment] = true;
+    }
+    target.store_action = action;
+}
+
 void CommandBuffer::begin_render(const RenderPass& pass) {
     perf::add(perf::mtl_render_encoders);
     if (encoder_ != EncoderKind::none) end_encoding();
@@ -858,22 +901,6 @@ void CommandBuffer::begin_render(const RenderPass& pass) {
     // Sample0 depth resolve chose (DepthResolvedSample). What Vulkan cannot
     // express stops explicitly instead of resolving differently.
     const auto& profile = device->profile();
-    const auto resolve_mode = [&](const Attachment& attachment, bool color, bool stencil) -> VkResolveModeFlagBits {
-        if (color) return attachment.texture->info->integer() ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
-        if (stencil) {
-            if (attachment.resolve_filter == 1 && pass.depth.texture && resolves(pass.depth.store_action) &&
-                pass.depth.resolve_filter != 0)
-                throw std::runtime_error("Alchemy Metal: stencilResolveFilter DepthResolvedSample with a Min/Max depth resolve "
-                                         "is not translated (Vulkan resolves stencil on its own)");
-            return VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-        }
-        const auto mode = attachment.resolve_filter == 1 ? VK_RESOLVE_MODE_MIN_BIT
-                          : attachment.resolve_filter == 2 ? VK_RESOLVE_MODE_MAX_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-        if (!(profile.depth_resolve_modes & mode))
-            throw std::runtime_error("Alchemy Metal: depthResolveFilter Min/Max needs a MIN/MAX depth resolve, which this Vulkan "
-                                     "device does not support");
-        return mode;
-    };
     const auto attachment_info = [&](const Attachment& attachment, bool color, bool stencil = false) {
         VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         if (!attachment.texture) return info;
@@ -883,14 +910,7 @@ void CommandBuffer::begin_render(const RenderPass& pass) {
         info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         info.loadOp = load_op(attachment.load_action);
         info.storeOp = store_op(attachment.store_action);
-        if (resolves(attachment.store_action) && attachment.resolve_texture) {
-            const auto& resolve = *attachment.resolve_texture;
-            const auto resolve_layer = resolve.descriptor.type == TextureType::type3d ? attachment.resolve_depth_plane
-                                                                                       : attachment.resolve_slice;
-            info.resolveMode = resolve_mode(attachment, color, stencil);
-            info.resolveImageView = attachment.resolve_texture->attachment_view(attachment.resolve_level, resolve_layer, pass_layers_);
-            info.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        }
+        if (resolves(attachment.store_action) && attachment.resolve_texture) set_resolve(info, pass, attachment, color, stencil);
         if (color) {
             if (texture.info->format_class == FormatClass::color_uint) {
                 for (int c = 0; c < 4; ++c) info.clearValue.color.uint32[c] = static_cast<std::uint32_t>(attachment.clear_color[c]);
@@ -978,6 +998,25 @@ void CommandBuffer::end_render() {
     const auto command = current_;
     if (query_active_) { device->vk.vkCmdEndQuery(command, queries_, query_count_ - 1); query_active_ = false; }
     device->vk.vkCmdEndRendering(command);
+    if (std::any_of(late_resolves_.begin(), late_resolves_.end(), [](bool late) { return late; })) {
+        // Resolves asked for after the pass began: the attachments again,
+        // loaded, with no draws, so the instance's end resolves them.
+        full_barrier();
+        const auto late = [&](VkRenderingAttachmentInfo& info, const Attachment& attachment, std::uint32_t index, bool color,
+                              bool stencil) {
+            if (!attachment.texture) return;
+            info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            info.storeOp = store_op(attachment.store_action);
+            if (late_resolves_[index]) set_resolve(info, pass_, attachment, color, stencil);
+            else info.resolveMode = VK_RESOLVE_MODE_NONE;   // resolved, or not asked, when the pass first ended
+        };
+        for (std::uint32_t index = 0; index < color_infos_.size(); ++index) late(color_infos_[index], pass_.colors[index], index, true, false);
+        late(depth_info_, pass_.depth, 8, false, false);
+        late(stencil_info_, pass_.stencil, 9, false, true);
+        device->vk.vkCmdBeginRendering(command, &rendering_);
+        device->vk.vkCmdEndRendering(command);
+        late_resolves_ = {};
+    }
     write_samples(end_samples_, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     end_samples_.clear();
     if (!indirect_traces_.empty()) {
@@ -1485,9 +1524,17 @@ void CommandBuffer::memory_barrier(std::uint64_t) {
     require(EncoderKind::render, "memoryBarrierWithScope:");
     // A barrier cannot sit inside a dynamic-rendering instance: suspend the
     // pass, barrier, and resume it with the attachments' contents loaded.
+    suspend_render();
+    full_barrier();
+    resume_render();
+}
+
+void CommandBuffer::suspend_render() {
     if (query_active_) { device->vk.vkCmdEndQuery(current_, queries_, query_count_ - 1); query_active_ = false; }
     device->vk.vkCmdEndRendering(current_);
-    full_barrier();
+}
+
+void CommandBuffer::resume_render() {
     for (auto& color : color_infos_) { color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; color.storeOp = VK_ATTACHMENT_STORE_OP_STORE; }
     depth_info_.loadOp = stencil_info_.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     depth_info_.storeOp = stencil_info_.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1497,6 +1544,15 @@ void CommandBuffer::memory_barrier(std::uint64_t) {
         const auto offset = query_offsets_.back();
         set_visibility_mode(1, offset);
     }
+}
+
+void CommandBuffer::sample_counter(const std::shared_ptr<CounterSampleBuffer>& buffer, std::uint32_t index, bool with_barrier) {
+    if (encoder_ == EncoderKind::none) throw std::runtime_error("Metal sampleCountersInBuffer: outside an encoder");
+    const bool render = encoder_ == EncoderKind::render;
+    if (render) suspend_render();
+    if (with_barrier) full_barrier();
+    write_samples({CounterSample{buffer, index}}, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    if (render) resume_render();
 }
 
 // ---- compute ------------------------------------------------------------------------------

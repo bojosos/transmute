@@ -1090,6 +1090,141 @@ void test_depth_resolve_filters(const std::shared_ptr<metal::Device>& device) {
     expect(minimum[60 * 64 + 32] == 1.0F && maximum[60 * 64 + 32] == 1.0F, "outside: every filter gives 1");
 }
 
+// MTLVertexStepFunctionPerInstance with stepRate 2 (a vertex attribute
+// divisor): four instances draw four vertical strips, and the per-instance
+// colour advances every second instance: red, red, green, green.
+void test_instance_step_rate(const std::shared_ptr<metal::Device>& device) {
+    if (!device->vertex_attribute_divisor) {
+        std::cout << "SKIP: instance step rate (no vertex attribute divisor)\n";
+        return;
+    }
+    const auto compiled = msl::compile(R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VertexIn { float2 position [[attribute(0)]]; float4 color [[attribute(1)]]; };
+struct VertexOut { float4 position [[position]]; float4 color; };
+vertex VertexOut strips(VertexIn in [[stage_in]], uint instance [[instance_id]]) {
+    VertexOut out;
+    out.position = float4(in.position.x * 0.25 - 0.75 + 0.5 * float(instance), in.position.y, 0.0, 1.0);
+    out.color = in.color;
+    return out;
+}
+fragment float4 strip_colour(VertexOut in [[stage_in]]) { return in.color; }
+)", {});
+    expect(compiled.success(), "step-rate MSL compiles: " + msl::format_diagnostics(compiled.diagnostics));
+    if (!compiled.success()) return;
+    const auto function = [&](std::string_view name) {
+        for (const auto& item : compiled.functions)
+            if (item.name == name) return std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(item));
+        throw std::runtime_error("missing function " + std::string(name));
+    };
+    metal::RenderPipelineDescriptor descriptor;
+    descriptor.vertex = function("strips");
+    descriptor.fragment = function("strip_colour");
+    descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+    descriptor.attributes[0] = metal::VertexAttribute{29, 0, 0};   // float2 from buffer 0
+    descriptor.attributes[1] = metal::VertexAttribute{31, 0, 2};   // float4 from buffer 2
+    descriptor.layouts[0] = metal::VertexLayout{8, 1, 1};          // per vertex
+    descriptor.layouts[2] = metal::VertexLayout{16, 2, 2};         // per instance, step rate 2
+    descriptor.label = "step rate";
+    const auto pipeline = metal::RenderPipeline::create(device, descriptor);
+    const float quad[] = {-1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1};
+    const float colours[] = {1, 0, 0, 1, 0, 1, 0, 1};
+    auto vertices = shared_buffer(device, sizeof(quad));
+    std::memcpy(vertices->contents(), quad, sizeof(quad));
+    auto instances = shared_buffer(device, sizeof(colours));
+    std::memcpy(instances->contents(), colours, sizeof(colours));
+    metal::RenderPass pass;
+    pass.colors[0].texture = render_target(device);
+    pass.colors[0].load_action = 2;
+    pass.colors[0].store_action = 1;
+    pass.colors[0].clear_color = {0, 0, 1, 1};
+    auto readback = shared_buffer(device, 64 * 256);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_render(pass);
+    commands->set_render_pipeline(pipeline);
+    commands->set_buffer(metal::Stage::vertex, 0, vertices, 0);
+    commands->set_buffer(metal::Stage::vertex, 2, instances, 0);
+    commands->draw(3, 0, 6, 4, 0);   // MTLPrimitiveTypeTriangle, 6 vertices, 4 instances
+    commands->end_encoding();
+    commands->begin_blit();
+    commands->copy_texture_to_buffer(pass.colors[0].texture, 0, 0, {0, 0, 0, 64, 64, 1}, readback, 0, 256, 64 * 256);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "step-rate command buffer completes");
+    const std::array<std::uint8_t, 4> red{255, 0, 0, 255}, green{0, 255, 0, 255};
+    const std::array<std::array<std::uint8_t, 4>, 4> expected{red, red, green, green};
+    for (std::uint32_t strip = 0; strip < 4; ++strip) {
+        const auto p = pixel(readback->contents(), 256, 8 + 16 * strip, 32);
+        expect(p == expected[strip], "instance " + std::to_string(strip) + " reads colour element " + std::to_string(strip / 2) +
+                                         ": " + format_pixel(p));
+    }
+}
+
+// A multisample resolve asked for after the pass began
+// (setColorStoreAction:MultisampleResolve on an encoder made with
+// MTLStoreActionUnknown): the resolve target gets the triangle over the clear
+// colour, as with a resolve given at creation, and edge pixels are blends.
+void test_deferred_resolve(const std::shared_ptr<metal::Device>& device) {
+    if (!(device->profile().texture_sample_counts & 4)) {
+        std::cout << "SKIP: deferred resolve (no 4x multisampling)\n";
+        return;
+    }
+    metal::RenderPipelineDescriptor descriptor;
+    descriptor.vertex = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(vertex_function()));
+    descriptor.fragment = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(fragment_function(false)));
+    descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+    descriptor.sample_count = 4;
+    descriptor.attributes[0] = metal::VertexAttribute{29, 0, 0};
+    descriptor.layouts[0] = metal::VertexLayout{8, 1, 1};
+    descriptor.label = "deferred resolve";
+    const auto pipeline = metal::RenderPipeline::create(device, descriptor);
+    metal::TextureDescriptor ms;
+    ms.type = metal::TextureType::type2d_ms;
+    ms.pixel_format = metal::pixel_format::rgba8_unorm;
+    ms.width = ms.height = 64;
+    ms.sample_count = 4;
+    ms.usage = metal::texture_usage::render_target;
+    ms.options = {metal::StorageMode::private_};
+    metal::RenderPass pass;
+    pass.colors[0].texture = metal::Texture::create(device, ms);
+    pass.colors[0].load_action = 2;
+    pass.colors[0].store_action = 4;   // MTLStoreActionUnknown
+    pass.colors[0].clear_color = {0, 0, 1, 1};
+    const auto resolved = render_target(device);
+    pass.colors[0].resolve_texture = resolved;
+    const float positions[] = {-1, 1, 1, 1, 0, 0};
+    auto vertices = shared_buffer(device, sizeof(positions));
+    std::memcpy(vertices->contents(), positions, sizeof(positions));
+    const float colors[] = {1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1};
+    const float tint[] = {1, 1, 1, 1};
+    auto readback = shared_buffer(device, 64 * 256);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_render(pass);
+    commands->set_render_pipeline(pipeline);
+    commands->set_buffer(metal::Stage::vertex, 0, vertices, 0);
+    commands->set_bytes(metal::Stage::vertex, 1, {reinterpret_cast<const std::uint8_t*>(colors), sizeof(colors)});
+    commands->set_bytes(metal::Stage::fragment, 0, {reinterpret_cast<const std::uint8_t*>(tint), sizeof(tint)});
+    commands->draw(3, 0, 3, 1, 0);
+    commands->set_store_action(0, 2);   // MTLStoreActionMultisampleResolve, after the draw
+    commands->end_encoding();
+    commands->begin_blit();
+    commands->copy_texture_to_buffer(resolved, 0, 0, {0, 0, 0, 64, 64, 1}, readback, 0, 256, 64 * 256);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "deferred resolve command buffer completes");
+    const auto inside = pixel(readback->contents(), 256, 32, 4), outside = pixel(readback->contents(), 256, 32, 60);
+    expect(inside == std::array<std::uint8_t, 4>{255, 0, 0, 255}, "the deferred resolve has the triangle: " + format_pixel(inside));
+    expect(outside == std::array<std::uint8_t, 4>{0, 0, 255, 255}, "and the clear colour outside: " + format_pixel(outside));
+    bool blended = false;
+    for (std::uint32_t y = 0; y < 32 && !blended; ++y)
+        for (std::uint32_t x = 0; x < 64 && !blended; ++x) {
+            const auto p = pixel(readback->contents(), 256, x, y);
+            blended = p[0] > 20 && p[0] < 235 && p[2] > 20 && p[2] < 235;
+        }
+    expect(blended, "edge pixels are resolved blends of the samples");
+}
+
 // [[barycentric_coord]] from MSL source (perspective and center_no_perspective):
 // the top-half triangle's fragments output their barycentrics as colour, so
 // the pixel next to each vertex is nearly pure red, green and blue. Skipped
@@ -1405,6 +1540,8 @@ int main() {
         test_sampler_lod_clamp(device);
         test_framebuffer_fetch(device);
         test_depth_resolve_filters(device);
+        test_deferred_resolve(device);
+        test_instance_step_rate(device);
         test_barycentric_coordinates(device);
         test_bindless_argument_buffers(device);
         test_argument_buffer_samplers(device);

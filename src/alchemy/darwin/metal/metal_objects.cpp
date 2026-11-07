@@ -532,12 +532,13 @@ void install_encoder_common(Address cls) {
     r.method(cls, "insertDebugSignpost:", on<EncoderState>(what, [&r](EncoderState& e, CpuState& s, GuestMemory&) {
         e.commands->insert_debug_signpost(r.utf8(s.x[2]));
     }), false, "v@:@");
-    // Draw, dispatch and blit boundary sampling: -supportsCounterSampling:
-    // answers NO for those points, so calling this is a client error.
-    r.method(cls, "sampleCountersInBuffer:atSampleIndex:withBarrier:", [](CpuState&, GuestMemory&) {
-        throw std::runtime_error("Alchemy Metal: unsupported: sampleCountersInBuffer:atSampleIndex:withBarrier: (only "
-                                 "MTLCounterSamplingPointAtStageBoundary is supported)");
-    }, false, "v@:@QB");
+    // Draw, dispatch and blit boundary sampling: a timestamp at that point
+    // (CommandBuffer::sample_counter).
+    r.method(cls, "sampleCountersInBuffer:atSampleIndex:withBarrier:", on<EncoderState>(what, [](EncoderState& e, CpuState& s, GuestMemory&) {
+        ensure_active(e);
+        const auto samples = state<SampleBufferState>(s.x[2], "MTLCounterSampleBuffer")->samples;
+        e.commands->sample_counter(samples, static_cast<std::uint32_t>(s.x[3]), (s.x[4] & 0xff) != 0);
+    }), false, "v@:@QB");
     // Residency: buffer device addresses need no residency in Vulkan, so
     // useResource:/useHeap: have nothing to do.
     for (const auto selector : {"useResource:usage:", "useResource:usage:stages:", "useResources:count:usage:",
@@ -721,13 +722,25 @@ void install_render_encoder() {
     method("setVisibilityResultMode:offset:", [](EncoderState& e, CpuState& s, GuestMemory&) {
         e.commands->set_visibility_mode(static_cast<std::uint32_t>(s.x[2]), s.x[3]);
     }, "v@:QQ");
-    // Store actions were fixed at encoder creation (MTLStoreActionUnknown
-    // stores); changing to a resolve later cannot be honoured.
-    for (const auto selector : {"setColorStoreAction:atIndex:", "setDepthStoreAction:", "setStencilStoreAction:"})
-        method(selector, [](EncoderState&, CpuState& s, GuestMemory&) {
-            if (s.x[2] == 2 || s.x[2] == 3)
-                throw std::runtime_error("Alchemy Metal: deferred multisample-resolve store actions are not translated");
-        }, "v@:Q");
+    // Store actions set while encoding (the descriptor's MTLStoreActionUnknown
+    // stores): a multisample resolve asked for now runs when the pass ends.
+    method("setColorStoreAction:atIndex:", [](EncoderState& e, CpuState& s, GuestMemory&) {
+        e.commands->set_store_action(static_cast<std::uint32_t>(s.x[3]), static_cast<std::uint32_t>(s.x[2]));
+    }, "v@:QQ");
+    method("setDepthStoreAction:", [](EncoderState& e, CpuState& s, GuestMemory&) {
+        e.commands->set_store_action(8, static_cast<std::uint32_t>(s.x[2]));
+    }, "v@:Q");
+    method("setStencilStoreAction:", [](EncoderState& e, CpuState& s, GuestMemory&) {
+        e.commands->set_store_action(9, static_cast<std::uint32_t>(s.x[2]));
+    }, "v@:Q");
+    // MTLStoreActionOptions: only None; CustomSamplePositions needs
+    // programmable sample positions (areProgrammableSamplePositionsSupported NO).
+    const auto options = [](CpuState& s) {
+        if (s.x[2]) throw std::runtime_error("Alchemy Metal: MTLStoreActionOptionCustomSamplePositions is not supported");
+    };
+    method("setColorStoreActionOptions:atIndex:", [options](EncoderState&, CpuState& s, GuestMemory&) { options(s); }, "v@:QQ");
+    for (const auto selector : {"setDepthStoreActionOptions:", "setStencilStoreActionOptions:"})
+        method(selector, [options](EncoderState&, CpuState& s, GuestMemory&) { options(s); }, "v@:Q");
     method("drawPrimitives:vertexStart:vertexCount:", [](EncoderState& e, CpuState& s, GuestMemory&) {
         e.commands->draw(static_cast<std::uint32_t>(s.x[2]), static_cast<std::uint32_t>(s.x[3]), static_cast<std::uint32_t>(s.x[4]), 1, 0);
     }, "v@:QQQ");
@@ -2378,8 +2391,10 @@ void install_device() {
     // The timestamp counter set when Vulkan has graphics+compute timestamps,
     // sampled at stage boundaries only (MTLCounterSamplingPointAtStageBoundary,
     // 0): encoder starts and ends through sample attachments.
+    // MTLCounterSamplingPoint: stage (0), draw (1), dispatch (2) and blit (4)
+    // boundaries; tile dispatch boundaries (3) need tile shaders.
     r.method(cls, "supportsCounterSampling:", [profile](CpuState& s, GuestMemory&) {
-        s.x[0] = s.x[2] == 0 && profile(s.x[0]).timestamps;
+        s.x[0] = (s.x[2] <= 2 || s.x[2] == 4) && profile(s.x[0]).timestamps;
     }, false, "B@:Q");
     r.method(cls, "counterSets", [&r, profile](CpuState& s, GuestMemory&) {
         std::vector<Address> sets;
@@ -2870,6 +2885,48 @@ void install_device() {
         r.invoke_block(block, {pipeline, failure}, false);
         r.release(pipeline);
     }, false, "v@:@@?");
+    // The ...options:completionHandler: forms through their synchronous
+    // ...options:reflection:error: forms; the handler (pipeline, reflection,
+    // error) runs before this returns, which Metal allows.
+    const auto through_sync = [&r](const char* sync) {
+        return [&r, sync](CpuState& s, GuestMemory& m) {
+            const auto block = s.x[4];
+            const auto scratch = r.process.allocate_guest(16);
+            m.write64(scratch, 0);
+            m.write64(scratch + 8, 0);
+            CallRegs call{};
+            call.x[2] = s.x[2];
+            call.x[3] = s.x[3];
+            call.x[4] = s.x[3] ? scratch : 0;   // reflection only when options ask for it
+            call.x[5] = scratch + 8;
+            const auto pipeline = r.objc.send(s.x[0], sync, call).x0;
+            const auto reflection = m.read64(scratch), failure = m.read64(scratch + 8);
+            r.process.release_guest(scratch);
+            r.invoke_block(block, {pipeline, reflection, failure}, false);
+            r.release(pipeline);
+        };
+    };
+    r.method(cls, "newRenderPipelineStateWithDescriptor:options:completionHandler:",
+             through_sync("newRenderPipelineStateWithDescriptor:options:reflection:error:"), false, "v@:@Q@?");
+    r.method(cls, "newComputePipelineStateWithFunction:options:completionHandler:",
+             through_sync("newComputePipelineStateWithFunction:options:reflection:error:"), false, "v@:@Q@?");
+    // Tile and mesh render pipelines are not translated (no Apple or Metal3
+    // family is claimed): nil with an error, or the handler with one.
+    for (const auto& [selector, what] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"newRenderPipelineStateWithTileDescriptor:options:reflection:error:", "tile render pipelines"},
+             {"newRenderPipelineStateWithMeshDescriptor:options:reflection:error:", "mesh render pipelines"}})
+        r.method(cls, selector, [&r, what](CpuState& s, GuestMemory& m) {
+            r.set_error(m, s.x[5], "MTLLibraryErrorDomain", 1, std::string(what) + " are not supported by Alchemy's Metal on Vulkan");
+            if (s.x[4]) m.write64(s.x[4], 0);
+            s.x[0] = 0;
+        }, false, "@@:@Q^@^@");
+    for (const auto& [selector, what] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"newRenderPipelineStateWithTileDescriptor:options:completionHandler:", "tile render pipelines"},
+             {"newRenderPipelineStateWithMeshDescriptor:options:completionHandler:", "mesh render pipelines"}})
+        r.method(cls, selector, [&r, what](CpuState& s, GuestMemory&) {
+            const auto failure = r.error("MTLLibraryErrorDomain", 1, std::string(what) + " are not supported by Alchemy's Metal on Vulkan");
+            r.invoke_block(s.x[4], {0, 0, failure}, false);
+        }, false, "v@:@Q@?");
 }
 
 } // namespace

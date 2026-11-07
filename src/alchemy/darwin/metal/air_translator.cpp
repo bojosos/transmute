@@ -142,6 +142,7 @@ TranslatorDevice::TranslatorDevice(Device& device) {
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT restart{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR local_read{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
     enabled.pNext = &v11;
     v11.pNext = &v12;
     v12.pNext = &v13;
@@ -158,6 +159,10 @@ TranslatorDevice::TranslatorDevice(Device& device) {
     if (device.dynamic_rendering_local_read) {
         local_read.dynamicRenderingLocalRead = VK_TRUE;
         *tail = &local_read; tail = &local_read.pNext;
+    }
+    if (device.vertex_attribute_divisor) {
+        divisor.vertexAttributeInstanceRateDivisor = VK_TRUE;
+        *tail = &divisor; tail = &divisor.pNext;
     }
     std::vector<const char*> extensions;
     for (const auto& name : device.device_extensions) extensions.push_back(name.c_str());
