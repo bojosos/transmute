@@ -118,6 +118,8 @@ $npmEnv = @{ HOME = (ConvertTo-AwGuestPath (Join-Path $Work 'home')); npm_config
 New-Item -ItemType Directory -Force (Join-Path $Work 'home') | Out-Null
 Step node node-hello $node @('hello.js') -Expect 'hello from node .* value=42'
 Step node node-procs $node @('procs.js') -Expect '(?s)child: 2.*worker: 42.*pipe: through a pipe.*signal: SIGTERM'
+Step node node-deep $node @('node_deep.js') -Timeout 600
+Step node node-rm $node @('rm_probe.js') -Expect '(?s)^(?!.*ENOTEMPTY).*rmSync recursive\s+ok'
 Step node node-title $node @('-e', 'process.title=1;console.log(2)') -Expect '2'
 Step node npm-version $node @($npmCli, '--version') -Environment $npmEnv -Directory (Join-Path $Work 'npm-hello')
 Step node npm-pack $node @($npmCli, 'pack') -Environment $npmEnv -Directory (Join-Path $Work 'npm-hello')
