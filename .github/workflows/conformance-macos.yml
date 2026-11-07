@@ -1,0 +1,109 @@
+# Conformance ground truth on real macOS (scripts/conformance/README.md).
+#
+# The conformance suites are SDK-free arm64 macOS programs: they are built on Windows with Visual
+# Studio's Clang against a sysroot assembled from Apple's open-source releases, and Alchemy runs them
+# under alchemy-fx. This workflow runs the same programs natively on a GitHub-hosted Apple-silicon
+# runner, so every Alchemy failure can be classified as an Alchemy bug (passes on macOS) or as a test
+# expectation macOS does not meet either (fails on macOS too).
+#
+# * build (Windows): fetches the pinned upstream sources (official URLs, SHA-256 checked), builds the
+#   sysroot and the suites, and uploads the built test tree with the corresponding source of its
+#   copyleft (GPL-2.0 and APSL-2.0) programs. Nothing is built from the macOS runner's SDK, and no SDK file enters
+#   the repository or an artifact.
+# * macos (arm64): runs the programs directly (`conformance.py run --native`) and uploads the results.
+#
+# Compare locally with `conformance.py compare all --macos-results <downloaded results>`.
+# This workflow is separate from CI.yml, runs only by hand or weekly, and never gates other jobs.
+name: Conformance (macOS ground truth)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-macos
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build suites (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch sources (official upstreams, pinned SHA-256)
+        run: |
+          python -I scripts/conformance/fetch_sources.py --sources "$env:RUNNER_TEMP\conformance"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build sysroot (Apple open-source headers)
+        run: |
+          python -I scripts/conformance/build_sysroot.py --sources "$env:RUNNER_TEMP\conformance" --out "$env:RUNNER_TEMP\conformance\out\sysroot"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build suites
+        # Tests that need the guest libc++ (not on the runner) report BUILD; the run skips them.
+        run: |
+          python -I scripts/conformance/conformance.py build all --sources "$env:RUNNER_TEMP\conformance" --out "$env:RUNNER_TEMP\conformance\out"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The repository is public, so this artifact is public too: any signed-in GitHub user can
+      # download it while it is kept (one day). The source of every copyleft suite travels with its
+      # programs, under corresponding-source/: the pinned release archive that fetch_sources.py
+      # checked by SHA-256, plus the licence text. That is Open POSIX (GPL-2.0) and Apple's objc4,
+      # Libc and libpthread tests (APSL-2.0). libc-test (MIT) and the libdispatch tests (Apache-2.0)
+      # ship as programs only.
+      - name: Add corresponding source for copyleft suites
+        run: |
+          python -I scripts/conformance/fetch_sources.py --sources "$env:RUNNER_TEMP\conformance" --copy-copyleft "$env:RUNNER_TEMP\conformance\out\corresponding-source"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Built programs, their test lists and the corresponding source above: no sysroot, no objects.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conformance-tree
+          retention-days: 1
+          path: |
+            ${{ runner.temp }}/conformance/out
+            !${{ runner.temp }}/conformance/out/sysroot/**
+            !${{ runner.temp }}/conformance/out/**/obj/**
+
+  macos:
+    name: Run natively (macOS arm64)
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: conformance-tree
+          path: ${{ runner.temp }}/out
+
+      - name: Restore execute permissions
+        # Artifacts do not keep file modes; the programs and test libraries have no extension or .so/.dylib/.exe.
+        run: |
+          python3 -I -c "import os, pathlib, sys; [os.chmod(p, 0o755) for p in pathlib.Path(sys.argv[1]).rglob('*') if p.is_file() and p.suffix in ('', '.exe', '.so', '.dylib')]" "$RUNNER_TEMP/out"
+
+      - name: Run suites natively
+        run: |
+          sw_vers
+          python3 -I scripts/conformance/conformance.py run all --native --out "$RUNNER_TEMP/out" --jobs 3
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-macos-results
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}/out/results
+            ${{ runner.temp }}/out/logs

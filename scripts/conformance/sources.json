@@ -1,0 +1,101 @@
+{
+ "xnu": {
+  "dir": "xnu-12377.121.6",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/xnu/archive/refs/tags/xnu-12377.121.6.tar.gz",
+  "sha256": "3898466e5f4ba16c6e2ea291987e097792349a0b34dda89191c4b5e8da29118c"
+ },
+ "Libc": {
+  "dir": "Libc-1752.120.2",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/Libc/archive/refs/tags/Libc-1752.120.2.tar.gz",
+  "sha256": "b7b6c6d185ef59187c392824ef464a0ebdb6b962d1574abbb93d3aa15e20d826",
+  "ship_with_binaries": true,
+  "licence_file": "Libc:APPLE_LICENSE"
+ },
+ "libpthread": {
+  "dir": "libpthread-539.100.4",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/libpthread/archive/refs/tags/libpthread-539.100.4.tar.gz",
+  "sha256": "c815492b81044b1cf8d53b124a9ac9503697439e96325daac982adad934d7cd4",
+  "ship_with_binaries": true,
+  "licence_file": "Libc:APPLE_LICENSE"
+ },
+ "libplatform": {
+  "dir": "libplatform-375.120.2",
+  "licence": "Apache-2.0",
+  "url": "https://github.com/apple-oss-distributions/libplatform/archive/refs/tags/libplatform-375.120.2.tar.gz",
+  "sha256": "c0962595da8899cf54445698fd71bddc2118edb8ce8e3d6e11a29ef96ad754bc"
+ },
+ "libmalloc": {
+  "dir": "libmalloc-812.100.31",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/libmalloc/archive/refs/tags/libmalloc-812.100.31.tar.gz",
+  "sha256": "a2966b7790c9dc7b66af22160070b9f7faa9aceb8eb1f89b36cbeb82811d5fff"
+ },
+ "Libinfo": {
+  "dir": "Libinfo-600",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/Libinfo/archive/refs/tags/Libinfo-600.tar.gz",
+  "sha256": "ea37be1f7876e8ca20761ab03f484f1cb0fa1ac15c437bb5615167c88529563b"
+ },
+ "libclosure": {
+  "dir": "libclosure-96",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/libclosure/archive/refs/tags/libclosure-96.tar.gz",
+  "sha256": "03b8da2acde57a757f9cb9a585965eec94e7c7bc0a5ed18223f58b8908701198"
+ },
+ "AvailabilityVersions": {
+  "dir": "AvailabilityVersions-157.2",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/AvailabilityVersions/archive/refs/tags/AvailabilityVersions-157.2.tar.gz",
+  "sha256": "d92a052edb3c817caa4407868f66f1d93727425a353c2200a41481c27310fdc2"
+ },
+ "Libm": {
+  "dir": "Libm-2026",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/Libm/archive/refs/tags/Libm-2026.tar.gz",
+  "sha256": "2a33044df4f8a899b49b4531fc5e91abc6c8e10e14567171e8829b2b15ddf84b"
+ },
+ "libdispatch": {
+  "dir": "libdispatch-1542.100.32",
+  "licence": "Apache-2.0",
+  "url": "https://github.com/apple-oss-distributions/libdispatch/archive/refs/tags/libdispatch-1542.100.32.tar.gz",
+  "sha256": "b251152f46d2cc16b87be85d32880144b44aadab62eb0712c31b27ca86556718"
+ },
+ "objc4": {
+  "dir": "objc4-951.7",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/objc4/archive/refs/tags/objc4-951.7.tar.gz",
+  "sha256": "8631c473994e2d53b3baf590b46063ae06feb3532c23c004aad545b533a9cc23",
+  "ship_with_binaries": true,
+  "licence_file": "objc4:APPLE_LICENSE"
+ },
+ "Libsystem": {
+  "dir": "Libsystem-1356",
+  "licence": "APSL-2.0",
+  "url": "https://github.com/apple-oss-distributions/Libsystem/archive/refs/tags/Libsystem-1356.tar.gz",
+  "sha256": "4bc7151681df1ef1aa2328ee533d62ec10eb7f94912902d25fec772febd9353c"
+ },
+ "libc-test": {
+  "dir": "libc-test-63e36e93",
+  "licence": "MIT",
+  "url": "https://repo.or.cz/libc-test.git/snapshot/63e36e934e8f2bedf645303a90b64098e2af6c8f.tar.gz",
+  "sha256": "1618dfc26618f9ca9a6e210404e282ccd4fa4fe4598344bada5c2ad40643aaa8"
+ },
+ "ltp": {
+  "dir": "ltp-20260930",
+  "licence": "GPL-2.0 (out of tree only)",
+  "url": "https://github.com/linux-test-project/ltp/releases/download/20260930/ltp-full-20260930.tar.xz",
+  "sha256": "b9837481134fa6eabce91c2fba57d96695f81360468f83e11e6982584ad4d29d",
+  "ship_with_binaries": true,
+  "licence_file": "ltp:COPYING"
+ },
+ "swift-corelibs-libdispatch": {
+  "dir": "swift-corelibs-libdispatch-swift-6.2-RELEASE",
+  "licence": "Apache-2.0",
+  "url": "https://github.com/swiftlang/swift-corelibs-libdispatch/archive/refs/tags/swift-6.2-RELEASE.tar.gz",
+  "sha256": "d4b8171d6711dabc3cb81093e954cedd521c8e4c170a688c1c369194c9eae4b3",
+  "note": "only tests/ is used; same tag as the Swift runtime build's checkout"
+ }
+}

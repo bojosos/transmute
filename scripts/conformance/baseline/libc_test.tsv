@@ -1,0 +1,346 @@
+# libc_test: expected results under alchemy-fx (scripts/conformance/README.md).
+# test	expected	owner	note. expected: PASS, FAIL (owner bug), XFAIL (honest refusal or not
+# on Darwin; the note says which), BUILD (does not build yet), SKIP.
+functional/argv	PASS	fw-system	
+functional/basename	PASS	fw-system	
+functional/clocale_mbfuncs	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\clocale_mbfuncs.c:28: mbrtowc failed to convert byte f0 to wchar_t
+functional/clock_gettime	PASS	fw-system	
+functional/crypt	XFAIL	fw-system	Darwin has no crypt.h
+functional/dirname	PASS	fw-system	
+functional/dlopen	PASS	fw-system	
+functional/env	XFAIL	fw-system	clearenv is not on Darwin
+functional/fcntl	PASS	fw-system	
+functional/fdopen	PASS	fw-system	
+functional/fnmatch	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\fnmatch.c:159: fnmatch("[[?*\]", "\", 0) failed, got 1 want 0
+functional/fscanf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\fscanf.c:78: ftell(f) failed (13 != 12)
+functional/fwscanf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\fwscanf.c:61: ftell(f) failed (13 != 12)
+functional/iconv_open	BUILD	fw-system	C:\dev\conformance\out\libc-test\src\functional\iconv_open.c:3:10: fatal error: 'iconv.h' file not found
+functional/inet_pton	PASS	fw-system	
+functional/ipc_msg	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _msgctl from library ordinal -2
+functional/ipc_sem	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\ipc_sem.c:115: fork failed: Function not implemented
+functional/ipc_shm	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\ipc_shm.c:39: shmid = shmget(k, 100, IPC_CREAT|0666) failed: Function not implemented
+functional/mbc	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\mbc.c:44: cannot set UTF-8 locale for test (codeset=US-ASCII)
+functional/memstream	PASS	fw-system	
+functional/mntent	XFAIL	fw-system	mntent.h is Linux-only
+functional/popen	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _popen$DARWIN_EXTSN from library ordinal -2
+functional/pthread_cancel	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\pthread_cancel.c:69: sem_init(&sem1, 0, 0) failed: Unknown error: -1 (creating semaphore)
+functional/pthread_cancel-points	XFAIL	fw-system	unnamed and timed semaphores are not on Darwin
+functional/pthread_cond	PASS	fw-system	
+functional/pthread_mutex	XFAIL	fw-system	unnamed and timed semaphores are not on Darwin
+functional/pthread_mutex_pi	XFAIL	fw-system	unnamed and timed semaphores are not on Darwin
+functional/pthread_robust	XFAIL	fw-system	pthread barriers are not on Darwin
+functional/pthread_tsd	PASS	fw-system	
+functional/qsort	PASS	fw-system	
+functional/random	PASS	fw-system	
+functional/search_hsearch	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\search_hsearch.c:26: hcreate((size_t)-1) should fail with ENOMEM got Undefined error: 0
+functional/search_insque	PASS	fw-system	
+functional/search_lsearch	PASS	fw-system	
+functional/search_tsearch	PASS	fw-system	
+functional/sem_init	XFAIL	fw-system	unnamed and timed semaphores are not on Darwin
+functional/sem_open	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\sem_open.c:33: sem_getvalue(sem, &val) == 0 failed: failed to get sem value
+functional/setjmp	PASS	fw-system	
+functional/snprintf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\snprintf.c:191: snprintf(b, sizeof b, "%a", 0.000000) returned 20 wanted 6
+functional/socket	XFAIL	fw-system	SOCK_CLOEXEC is not on Darwin
+functional/spawn	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\spawn.c:35: posix_spawnp(&pid, "echo", &fa, 0, (char *[]){"echo","hello",0}, 0) failed, got 2 want 0
+functional/sscanf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\sscanf.c:83: sscanf("10e", "%lf", &d) failed (got 1 fields, expected no match (0))
+functional/sscanf_long	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\common\setrlim.c:21: setrlimit(3, 102400): Function not implemented
+functional/stat	PASS	fw-system	
+functional/strftime	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\strftime.c:16: "%c": expected "Mon Jan  5 05:17:53 +10009", got nothing
+functional/string	PASS	fw-system	
+functional/string_memcpy	PASS	fw-system	
+functional/string_memmem	PASS	fw-system	
+functional/string_memset	PASS	fw-system	
+functional/string_strchr	PASS	fw-system	
+functional/string_strcspn	PASS	fw-system	
+functional/string_strstr	PASS	fw-system	
+functional/strptime	PASS	fw-system	
+functional/strtod	PASS	fw-system	
+functional/strtod_long	PASS	fw-system	
+functional/strtod_simple	PASS	fw-system	
+functional/strtof	PASS	fw-system	
+functional/strtol	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\strtol.c:123: strtol(s="0xz", &c, 16) failed (wrong final position 0 != 1)
+functional/strtold	PASS	fw-system	
+functional/swprintf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\swprintf.c:113: strcmp(nl_langinfo(CODESET), "UTF-8") failed (no UTF-8 locale; tests might fail)
+functional/tgmath	PASS	fw-system	
+functional/time	PASS	fw-system	
+functional/tls_align	PASS	fw-system	
+functional/tls_align_dlopen	PASS	fw-system	
+functional/tls_init	PASS	fw-system	
+functional/tls_init_dlopen	PASS	fw-system	
+functional/tls_local_exec	PASS	fw-system	
+functional/udiv	PASS	fw-system	
+functional/ungetc	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\ungetc.c:33: ftell(f) failed (1 != 0)
+functional/utime	XFAIL	fw-system	Darwin's struct stat has st_atimespec
+functional/vfork	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\vfork.c:31: vfork failed: Function not implemented
+functional/wcsstr	PASS	fw-system	
+functional/wcstol	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\wcstol.c:79: wcstol(s=L"0xz", &c, 16) failed (wrong final position 0 != 1)
+functional/wordexp	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\functional\wordexp.c:555: wordexp("${X-"$"{A}B}", WRDE_NOCMD) returned 0, want WRDE_BADCHAR
+math/acos	PASS	fw-system	
+math/acosf	PASS	fw-system	
+math/acosh	PASS	fw-system	
+math/acoshf	PASS	fw-system	
+math/acoshl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/acosh.h:10: RN acoshl(0x1.00788c223616fp+0) want 0x1.f0cb8ee812621p-5 got 0x1.f0cb8ee812623p-5 ulperr 1.724 = 0x1.0000000000000p+1 + -0x1.1b0c1a0000000p-2
+math/acosl	PASS	fw-system	
+math/asin	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/asin.h:138: bad fp exception: RN asin(0x0.0000000000001p-1022)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/asinf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/asinf.h:154: bad fp exception: RN asinf(0x1.0000000000000p-149)=0x1.0000000000000p-149, want INEXACT|UNDERFLOW got INEXACT
+math/asinh	PASS	fw-system	
+math/asinhf	PASS	fw-system	
+math/asinhl	PASS	fw-system	
+math/asinl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/asin.h:138: bad fp exception: RN asinl(0x0.0000000000001p-1022)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/atan	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/atan.h:46: bad fp exception: RN atan(0x1.0000000000000p-1022)=0x1.0000000000000p-1022, want INEXACT got INEXACT|UNDERFLOW
+math/atan2	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/atan2.h:124: bad fp exception: RN atan2(0x1.0000000000000p-1022,0x1.fffffffffffffp+1023)=0x0.0000000000000p+0, want INEXACT|UNDERFLOW got INEXACT
+math/atan2f	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/atan2f.h:159: bad fp exception: RN atan2f(0x1.0000000000000p-149,inf)=0x0.0000000000000p+0, want 0 got INEXACT|UNDERFLOW
+math/atan2l	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/atan2.h:124: bad fp exception: RN atan2l(0x1.0000000000000p-1022,0x1.fffffffffffffp+1023)=0x0.0000000000000p+0, want INEXACT|UNDERFLOW got INEXACT
+math/atanf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/atanf.h:165: bad fp exception: RN atanf(0x1.0000000000000p-149)=0x1.0000000000000p-149, want INEXACT|UNDERFLOW got INEXACT
+math/atanh	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/atanh.h:12: bad fp exception: RN atanh(0x0.4000000000000p-1022)=0x0.4000000000000p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/atanhf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/atanhf.h:12: bad fp exception: RN atanhf(0x1.0000000000000p-128)=0x1.0000000000000p-128, want INEXACT|UNDERFLOW got INEXACT
+math/atanhl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/atanh.h:12: bad fp exception: RN atanhl(0x0.4000000000000p-1022)=0x0.4000000000000p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/atanl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/atan.h:46: bad fp exception: RN atanl(0x1.0000000000000p-1022)=0x1.0000000000000p-1022, want INEXACT got INEXACT|UNDERFLOW
+math/cbrt	PASS	fw-system	
+math/cbrtf	PASS	fw-system	
+math/cbrtl	PASS	fw-system	
+math/ceil	PASS	fw-system	
+math/ceilf	PASS	fw-system	
+math/ceill	PASS	fw-system	
+math/copysign	PASS	fw-system	
+math/copysignf	PASS	fw-system	
+math/copysignl	PASS	fw-system	
+math/cos	PASS	fw-system	
+math/cosf	PASS	fw-system	
+math/cosh	PASS	fw-system	
+math/coshf	PASS	fw-system	
+math/coshl	PASS	fw-system	
+math/cosl	FAIL	fw-system	-0x1.0000000000000p+0
+math/drem	XFAIL	fw-system	musl/glibc-only math function
+math/dremf	XFAIL	fw-system	musl/glibc-only math function
+math/erf	PASS	fw-system	
+math/erfc	PASS	fw-system	
+math/erfcf	PASS	fw-system	
+math/erfcl	PASS	fw-system	
+math/erff	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\sanity/erff.h:7: RN erff(-0x1.a05cc80000000p-2) want -0x1.bd28ac0000000p-2 got -0x1.bd28b00000000p-2 ulperr -1.696 = -0x1.0000000000000p+1 + 0x1.3775c20000000p-2
+math/erfl	PASS	fw-system	
+math/exp	FAIL	fw-system	ception: RN exp(-0x1.745779a6b5efap+9)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got 0
+math/exp10	XFAIL	fw-system	musl/glibc-only math function
+math/exp10f	XFAIL	fw-system	musl/glibc-only math function
+math/exp10l	XFAIL	fw-system	musl/glibc-only math function
+math/exp2	FAIL	fw-system	X C:\dev\conformance\out\libc-test\src\math\special/exp2.h:12: bad fp exception: RN exp2(-0x1.ff80000000000p+9)=0x0.8000000000000p-1022, want 0 got INEXACT|UNDERFLOW
+math/exp2f	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/exp2f.h:9: bad fp exception: RN exp2f(-0x1.2c00000000000p+7)=0x0.0000000000000p+0, want INEXACT|UNDERFLOW got 0
+math/exp2l	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/exp2.h:12: bad fp exception: RN exp2l(-0x1.ff80000000000p+9)=0x0.8000000000000p-1022, want 0 got INEXACT|UNDERFLOW
+math/expf	PASS	fw-system	
+math/expl	FAIL	fw-system	779a6b5efap+9)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got 0
+math/expm1	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/expm1.h:62: bad fp exception: RN expm1(-0x1.0000000000000p+81)=-0x1.0000000000000p+0, want INEXACT got INEXACT|UNDERFLOW
+math/expm1f	PASS	fw-system	
+math/expm1l	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/expm1.h:62: bad fp exception: RN expm1l(-0x1.0000000000000p+81)=-0x1.0000000000000p+0, want INEXACT got INEXACT|UNDERFLOW
+math/fabs	PASS	fw-system	
+math/fabsf	PASS	fw-system	
+math/fabsl	PASS	fw-system	
+math/fdim	PASS	fw-system	
+math/fdimf	PASS	fw-system	
+math/fdiml	PASS	fw-system	
+math/fenv	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\fenv.c:78: fetestexcept failed: got 0x1f, want 0x9f (FE_ALL_ECXEPT)
+math/floor	PASS	fw-system	
+math/floorf	PASS	fw-system	
+math/floorl	PASS	fw-system	
+math/fma	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/fma.h:34: bad fp exception: RN fma(inf,0x0.0000000000000p+0,nan)=nan, want INVALID got 0
+math/fmaf	FAIL	fw-system	:\dev\conformance\out\libc-test\src\math\special/fmaf.h:81: bad fp exception: RD fmaf(-0x1.0010000000000p-81,0x1.ffe0020000000p-70,0x1.0002000000000p-133)=0x1.0001000000000p-133, want INEXACT|UNDERFLOW got 0
+math/fmal	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/fma.h:34: bad fp exception: RN fmal(inf,0x0.0000000000000p+0,nan)=nan, want INVALID got 0
+math/fmax	PASS	fw-system	
+math/fmaxf	PASS	fw-system	
+math/fmaxl	PASS	fw-system	
+math/fmin	PASS	fw-system	
+math/fminf	PASS	fw-system	
+math/fminl	PASS	fw-system	
+math/fmod	PASS	fw-system	
+math/fmodf	FAIL	fw-system	0000p+0
+math/fmodl	PASS	fw-system	
+math/fpclassify	PASS	fw-system	
+math/frexp	PASS	fw-system	
+math/frexpf	PASS	fw-system	
+math/frexpl	PASS	fw-system	
+math/hypot	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/hypot.h:87: bad fp exception: RN hypot(-0x1.0000000000000p+1023,nan)=nan, want 0 got INEXACT|OVERFLOW
+math/hypotf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/hypotf.h:189: bad fp exception: RN hypotf(0x1.0000000000000p-149,nan)=nan, want 0 got INEXACT|UNDERFLOW
+math/hypotl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/hypot.h:87: bad fp exception: RN hypotl(-0x1.0000000000000p+1023,nan)=nan, want 0 got INEXACT|OVERFLOW
+math/ilogb	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/ilogb.h:1: bad fp exception: RN ilogb(0x0.0000000000000p+0)=-2147483648, want INVALID got 0
+math/ilogbf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/ilogbf.h:1: bad fp exception: RN ilogbf(0x0.0000000000000p+0)=-2147483648, want INVALID got 0
+math/ilogbl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/ilogb.h:1: bad fp exception: RN ilogbl(0x0.0000000000000p+0)=-2147483648, want INVALID got 0
+math/isless	PASS	fw-system	
+math/j0	FAIL	fw-system	X C:\dev\conformance\out\libc-test\src\math\sanity/j0.h:5: RN j0(0x1.288bbb0d6a1e6p+3) want -0x1.3528d44599379p-3 got -0x1.3528d44599377p-3 ulperr 2.110 = 0x1.0000000000000p+1 + 0x1.c3ab460000000p-4
+math/j0f	XFAIL	fw-system	musl/glibc-only math function
+math/j1	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\sanity/j1.h:1: RN j1(-0x1.02239f3c6a8f1p+3) want -0x1.f2def55fbf5a7p-3 got -0x1.f2def55fbf5a9p-3 ulperr -1.721 = -0x1.0000000000000p+1 + 0x1.1d85fc0000000p-2
+math/j1f	XFAIL	fw-system	musl/glibc-only math function
+math/jn	FAIL	fw-system	X C:\dev\conformance\out\libc-test\src\math\sanity/jn.h:1: RN jn(-2, -0x1.02239f3c6a8f1p+3) want -0x1.8637401cdd96bp-4 got -0x1.8637401cdd969p-4, ulperr 1.788 = 0x1.0000000000000p+1 + -0x1.b2ea520000000p-3
+math/jnf	XFAIL	fw-system	musl/glibc-only math function
+math/ldexp	PASS	fw-system	
+math/ldexpf	PASS	fw-system	
+math/ldexpl	PASS	fw-system	
+math/lgamma	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _signgam from library ordinal -2
+math/lgamma_r	BUILD	fw-system	C:\dev\conformance\out\libc-test\src\math\lgamma_r.c:30:7: error: call to undeclared function 'lgamma_r'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+math/lgammaf	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _signgam from library ordinal -2
+math/lgammaf_r	BUILD	fw-system	C:\dev\conformance\out\libc-test\src\math\lgammaf_r.c:30:7: error: call to undeclared function 'lgammaf_r'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+math/lgammal	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _signgam from library ordinal -2
+math/lgammal_r	BUILD	fw-system	C:\dev\conformance\out\libc-test\src\math\lgammal_r.c:34:7: error: call to undeclared function 'lgammal_r'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+math/llrint	PASS	fw-system	
+math/llrintf	PASS	fw-system	
+math/llrintl	PASS	fw-system	
+math/llround	PASS	fw-system	
+math/llroundf	PASS	fw-system	
+math/llroundl	PASS	fw-system	
+math/log	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/log.h:41: RD log(0x1.0000000000000p+0) want 0x0.0000000000000p+0 got -0x0.0000000000000p+0 ulperr inf = inf + 0x0.0000000000000p+0
+math/log10	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/log10.h:15: RD log10(0x1.0000000000000p+0) want 0x0.0000000000000p+0 got -0x0.0000000000000p+0 ulperr inf = inf + 0x0.0000000000000p+0
+math/log10f	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/log10f.h:64: RD log10f(0x1.0000000000000p+0) want 0x0.0000000000000p+0 got -0x0.0000000000000p+0 ulperr inf = inf + 0x0.0000000000000p+0
+math/log10l	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/log10.h:15: RD log10l(0x1.0000000000000p+0) want 0x0.0000000000000p+0 got -0x0.0000000000000p+0 ulperr inf = inf + 0x0.0000000000000p+0
+math/log1p	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/log1p.h:19: bad fp exception: RN log1p(0x0.0000000000001p-1022)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/log1pf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/log1pf.h:9: bad fp exception: RN log1pf(-0x1.fffffc0000000p-127)=-0x1.fffffc0000000p-127, want INEXACT|UNDERFLOW got INEXACT
+math/log1pl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/log1p.h:19: bad fp exception: RN log1pl(0x0.0000000000001p-1022)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/log2	PASS	fw-system	
+math/log2f	PASS	fw-system	
+math/log2l	PASS	fw-system	
+math/logb	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/logb.h:1: bad fp exception: RN logb(0x0.0000000000000p+0)=-inf, want DIVBYZERO got INEXACT|DIVBYZERO|OVERFLOW
+math/logbf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/logbf.h:1: bad fp exception: RN logbf(0x0.0000000000000p+0)=-inf, want DIVBYZERO got INEXACT|DIVBYZERO|OVERFLOW
+math/logbl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/logb.h:1: bad fp exception: RN logbl(0x0.0000000000000p+0)=-inf, want DIVBYZERO got INEXACT|DIVBYZERO|OVERFLOW
+math/logf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/logf.h:53: RD logf(0x1.0000000000000p+0) want 0x0.0000000000000p+0 got -0x0.0000000000000p+0 ulperr inf = inf + 0x0.0000000000000p+0
+math/logl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/log.h:41: RD logl(0x1.0000000000000p+0) want 0x0.0000000000000p+0 got -0x0.0000000000000p+0 ulperr inf = inf + 0x0.0000000000000p+0
+math/lrint	PASS	fw-system	
+math/lrintf	PASS	fw-system	
+math/lrintl	PASS	fw-system	
+math/lround	PASS	fw-system	
+math/lroundf	PASS	fw-system	
+math/lroundl	PASS	fw-system	
+math/modf	PASS	fw-system	
+math/modff	PASS	fw-system	
+math/modfl	PASS	fw-system	
+math/nearbyint	PASS	fw-system	
+math/nearbyintf	PASS	fw-system	
+math/nearbyintl	PASS	fw-system	
+math/nextafter	PASS	fw-system	
+math/nextafterf	PASS	fw-system	
+math/nextafterl	PASS	fw-system	
+math/nexttoward	PASS	fw-system	
+math/nexttowardf	PASS	fw-system	
+math/nexttowardl	PASS	fw-system	
+math/pow	FAIL	fw-system	0000000000p+0, want INEXACT|UNDERFLOW got INEXACT
+math/pow10	XFAIL	fw-system	musl/glibc-only math function
+math/pow10f	XFAIL	fw-system	musl/glibc-only math function
+math/pow10l	XFAIL	fw-system	musl/glibc-only math function
+math/powf	PASS	fw-system	
+math/powl	FAIL	fw-system	NEXACT|UNDERFLOW got INEXACT
+math/remainder	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/remainder.h:11: bad fp exception: RN remainder(inf,0x1.0000000000000p+0)=nan, want INVALID got 0
+math/remainderf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/remainderf.h:11: bad fp exception: RN remainderf(inf,0x1.0000000000000p+0)=nan, want INVALID got 0
+math/remainderl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/remainder.h:48: bad fp exception: RN remainderl(inf,nan)=nan, want 0 got INVALID
+math/remquo	PASS	fw-system	
+math/remquof	PASS	fw-system	
+math/remquol	PASS	fw-system	
+math/rint	PASS	fw-system	
+math/rintf	PASS	fw-system	
+math/rintl	PASS	fw-system	
+math/round	PASS	fw-system	
+math/roundf	PASS	fw-system	
+math/roundl	PASS	fw-system	
+math/scalb	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _scalb from library ordinal -2
+math/scalbf	XFAIL	fw-system	musl/glibc-only math function
+math/scalbln	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/scalbln.h:17: bad fp exception: RN scalbln(0x1.0010000000000p+0, -1074)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got 0
+math/scalblnf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/scalblnf.h:17: bad fp exception: RN scalblnf(0x1.0010000000000p+0, -149)=0x1.0000000000000p-149, want INEXACT|UNDERFLOW got 0
+math/scalblnl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/scalbln.h:17: bad fp exception: RN scalblnl(0x1.0010000000000p+0, -1074)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got 0
+math/scalbn	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/scalbn.h:17: bad fp exception: RN scalbn(0x1.0010000000000p+0, -1074)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got 0
+math/scalbnf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/scalbnf.h:17: bad fp exception: RN scalbnf(0x1.0010000000000p+0, -149)=0x1.0000000000000p-149, want INEXACT|UNDERFLOW got 0
+math/scalbnl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\special/scalbn.h:17: bad fp exception: RN scalbnl(0x1.0010000000000p+0, -1074)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got 0
+math/sin	FAIL	fw-system	X C:\dev\conformance\out\libc-test\src\math\crlibm/sin.h:43: RU sin(0x1.32ce90b32173ep+18) want -0x1.fffffffffffffp-1 got -0x1.000000013afe4p+0 ulperr -2580424.000 = -0x1.3afe460000000p+21 + 0x1.f8708c0000000p-1
+math/sincos	XFAIL	fw-system	musl/glibc-only math function
+math/sincosf	XFAIL	fw-system	musl/glibc-only math function
+math/sincosl	XFAIL	fw-system	musl/glibc-only math function
+math/sinf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/sinf.h:41: bad fp exception: RN sinf(0x1.0000000000000p-126)=0x1.0000000000000p-126, want INEXACT got INEXACT|UNDERFLOW
+math/sinh	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/sinh.h:19: bad fp exception: RN sinh(0x0.0000000000001p-1022)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/sinhf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/sinhf.h:84: bad fp exception: RN sinhf(0x1.0000000000000p-149)=0x1.0000000000000p-149, want INEXACT|UNDERFLOW got INEXACT
+math/sinhl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/sinh.h:19: bad fp exception: RN sinhl(0x0.0000000000001p-1022)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/sinl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\crlibm/sin.h:43: RU sinl(0x1.32ce90b32173ep+18) want -0x1.fffffffffffffp-1 got -0x1.000000013afe4p+0 ulperr -2580424.000 = -0x1.3afe460000000p+21 + 0x1.f8708c0000000p-1
+math/sqrt	PASS	fw-system	
+math/sqrtf	PASS	fw-system	
+math/sqrtl	PASS	fw-system	
+math/tan	FAIL	fw-system	0x1.64193e0000000p+49 + -0x1.aff4680000000p-5
+math/tanf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/tanf.h:41: bad fp exception: RN tanf(0x1.0000000000000p-126)=0x1.0000000000000p-126, want INEXACT got INEXACT|UNDERFLOW
+math/tanh	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/tanh.h:40: bad fp exception: RN tanh(0x0.0000000000001p-1022)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/tanhf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/tanhf.h:90: bad fp exception: RN tanhf(0x1.0000000000000p-149)=0x1.0000000000000p-149, want INEXACT|UNDERFLOW got INEXACT
+math/tanhl	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\ucb/tanh.h:40: bad fp exception: RN tanhl(0x0.0000000000001p-1022)=0x0.0000000000001p-1022, want INEXACT|UNDERFLOW got INEXACT
+math/tanl	FAIL	fw-system	4824960.000 = -0x1.64193e0000000p+49 + -0x1.aff4680000000p-5
+math/tgamma	FAIL	fw-system	-0x1.6dffffffffffep+7) want -0x0.0000000000003p-1022 got 0x0.0000000000000p+0 ulperr 2.940 = 0x1.8000000000000p+1 + -0x1.eaab460000000p-5
+math/tgammaf	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\sanity/tgammaf.h:3: RN tgammaf(-0x1.0c34b40000000p+3) want -0x1.338b140000000p-15 got -0x1.338b180000000p-15 ulperr -1.727 = -0x1.0000000000000p+1 + 0x1.1732d20000000p-2
+math/tgammal	FAIL	fw-system	7) want 0x0.000000002fd06p-1022 got 0x0.0000000000000p+0 ulperr -195846.203 = -0x1.7e83000000000p+17 + -0x1.98a6f20000000p-3
+math/trunc	PASS	fw-system	
+math/truncf	PASS	fw-system	
+math/truncl	PASS	fw-system	
+math/y0	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\sanity/y0.h:1: bad fp exception: RN y0(-0x1.02239f3c6a8f1p+3)=nan, want INVALID got 0
+math/y0f	XFAIL	fw-system	musl/glibc-only math function
+math/y1	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\sanity/y1.h:1: bad fp exception: RN y1(-0x1.02239f3c6a8f1p+3)=nan, want INVALID got 0
+math/y1f	XFAIL	fw-system	musl/glibc-only math function
+math/yn	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\math\sanity/yn.h:1: bad fp exception: RN yn(-2, -0x1.02239f3c6a8f1p+3)=nan, want INVALID got 0
+math/ynf	XFAIL	fw-system	musl/glibc-only math function
+regression/daemon-failure	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _daemon from library ordinal -2
+regression/dn_expand-empty	BUILD	fw-system	C:\dev\conformance\out\libc-test\src\regression\dn_expand-empty.c:4:10: fatal error: 'resolv.h' file not found
+regression/dn_expand-ptr-0	BUILD	fw-system	C:\dev\conformance\out\libc-test\src\regression\dn_expand-ptr-0.c:4:10: fatal error: 'resolv.h' file not found
+regression/execle-env	FAIL	fw-system	sh: shell control structure '{' is not supported
+regression/fflush-exit	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\fflush-exit.c:25: (pid = fork()) >= 0 failed (errno: Function not implemented)
+regression/fgets-eof	PASS	fw-system	
+regression/fgetwc-buffering	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\common\utf8.c:18: cannot set UTF-8 locale for test (codeset=US-ASCII)
+regression/flockfile-list	PASS	fw-system	
+regression/fpclassify-invalid-ld80	PASS	fw-system	
+regression/ftello-unflushed-append	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\ftello-unflushed-append.c:34: ftello is broken before flush: got 3, want 7
+regression/getpwnam_r-crash	PASS	fw-system	
+regression/getpwnam_r-errno	PASS	fw-system	
+regression/iconv-roundtrips	BUILD	fw-system	C:\dev\conformance\out\libc-test\src\regression\iconv-roundtrips.c:3:10: fatal error: 'iconv.h' file not found
+regression/inet_ntop-v4mapped	PASS	fw-system	
+regression/inet_pton-empty-last-field	PASS	fw-system	
+regression/iswspace-null	PASS	fw-system	
+regression/lrand48-signextend	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\lrand48-signextend.c:10: 1st lrand48() got 851401618 want 0
+regression/lseek-large	PASS	fw-system	
+regression/malloc-0	PASS	fw-system	
+regression/malloc-brk-fail	SKIP	fw-system	allocates until failure; needs setrlimit(RLIMIT_AS), ENOSYS today
+regression/malloc-oom	SKIP	fw-system	allocates until failure; needs setrlimit(RLIMIT_AS), ENOSYS today
+regression/mbsrtowcs-overflow	PASS	fw-system	
+regression/memmem-oob	PASS	fw-system	
+regression/memmem-oob-read	PASS	fw-system	
+regression/mkdtemp-failure	PASS	fw-system	
+regression/mkstemp-failure	PASS	fw-system	
+regression/printf-1e9-oob	PASS	fw-system	
+regression/printf-fmt-g-round	PASS	fw-system	
+regression/printf-fmt-g-zeros	PASS	fw-system	
+regression/printf-fmt-n	FAIL	fw-system	alchemy: stopping after: unsupported Darwin printf conversion %n during synthetic guest call 0x710000001120 [guest pc 0x710000001120, thread 1]
+regression/pthread-robust-detach	XFAIL	fw-system	pthread barriers are not on Darwin
+regression/pthread_atfork-errno-clobber	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\common\setrlim.c:21: setrlimit(7, 0): Function not implemented
+regression/pthread_cancel-sem_wait	XFAIL	fw-system	unnamed and timed semaphores are not on Darwin
+regression/pthread_cond-smasher	PASS	fw-system	
+regression/pthread_cond_wait-cancel_ignored	PASS	fw-system	
+regression/pthread_condattr_setclock	XFAIL	fw-system	pthread_condattr_setclock is not on Darwin
+regression/pthread_create-oom	SKIP	fw-system	allocates until failure; needs setrlimit(RLIMIT_AS), ENOSYS today
+regression/pthread_exit-cancel	PASS	fw-system	
+regression/pthread_exit-dtor	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\pthread_exit-dtor.c:51: fork failed: Function not implemented
+regression/pthread_once-deadlock	XFAIL	fw-system	unnamed and timed semaphores are not on Darwin
+regression/pthread_rwlock-ebusy	PASS	fw-system	
+regression/putenv-doublefree	PASS	fw-system	
+regression/raise-race	XFAIL	fw-system	real-time signals are not on Darwin
+regression/regex-backref-0	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\regex-backref-0.c:16: regcomp(a\0) returned 5 (trailing backslash (\)) wanted 0
+regression/regex-backref-oob	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\regex-backref-oob.c:35: /\(a\|b\|..*\)_\1\(.\)\2/ ~ "ab_񁁁_񁁁__", regexec returned 1 (regexec() failed to match), wanted 0
+regression/regex-bracket-icase	PASS	fw-system	
+regression/regex-ere-backref	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\regex-ere-backref.c:16: regcomp((a)\1) returned 5 (trailing backslash (\)) wanted 0
+regression/regex-escaped-high-byte	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\regex-escaped-high-byte.c:19: regcomp(\\\xfc) returned 5 (trailing backslash (\)) wanted REG_BADPAT
+regression/regex-negated-range	PASS	fw-system	
+regression/regexec-backref	PASS	fw-system	
+regression/regexec-nosub	PASS	fw-system	
+regression/rewind-clear-error	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\rewind-clear-error.c:22: dup failed
+regression/rlimit-open-files	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\rlimit-open-files.c:19: setrlimit(8, 42) failed: Function not implemented
+regression/scanf-bytes-consumed	PASS	fw-system	
+regression/scanf-match-literal-eof	FAIL	fw-system	C:\dev\conformance\out\libc-test\src\regression\scanf-match-literal-eof.c:13: scanf reported match failure instead of input failure on literal EOF match
+regression/scanf-nullbyte-char	PASS	fw-system	
+regression/sem_close-unmap	PASS	fw-system	
+regression/setenv-oom	SKIP	fw-system	allocates until failure; needs setrlimit(RLIMIT_AS), ENOSYS today
+regression/setvbuf-unget	PASS	fw-system	
+regression/sigaltstack	PASS	fw-system	
+regression/sigprocmask-internal	XFAIL	fw-system	real-time signals are not on Darwin
+regression/sigreturn	PASS	fw-system	
+regression/sscanf-eof	PASS	fw-system	
+regression/statvfs	PASS	fw-system	
+regression/strverscmp	XFAIL	fw-system	strverscmp is GNU-only
+regression/syscall-sign-extend	XFAIL	fw-system	uses Linux syscall numbers
+regression/tls_get_new-dtv	XFAIL	fw-system	pthread barriers are not on Darwin
+regression/uselocale-0	PASS	fw-system	
+regression/wcsncpy-read-overflow	PASS	fw-system	
+regression/wcsstr-false-negative	PASS	fw-system	

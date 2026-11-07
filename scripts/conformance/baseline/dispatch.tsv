@@ -1,0 +1,41 @@
+# dispatch: expected results under alchemy-fx (scripts/conformance/README.md).
+# test	expected	owner	note. expected: PASS, FAIL (owner bug), XFAIL (honest refusal or not
+# on Darwin; the note says which), BUILD (does not build yet), SKIP.
+dispatch/after	PASS	fw-system	
+dispatch/api	PASS	fw-system	
+dispatch/apply	FAIL	fw-system	==================================================
+dispatch/c99	PASS	fw-system	
+dispatch/cascade	PASS	fw-system	
+dispatch/concur	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _dispatch_queue_set_width from library ordinal -2
+dispatch/context_for_key	FAIL	fw-system	alchemy: guest thread ended by an error: dispatch_queue_set_specific of an invalid queue during synthetic guest call 0x710000005070 during synthetic guest call 0x710000004db0 [worker guest pc 0x710000004db0, thread 3]
+dispatch/data	PASS	fw-system	
+dispatch/deadname	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _dispatch_mig_server from library ordinal -2
+dispatch/debug	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _dispatch_debug from library ordinal -2
+dispatch/drift	FAIL	fw-system	[FAIL] drift (C:\dev\conformance\out\dispatch\src\dispatch_drift.c:92)
+dispatch/group	FAIL	fw-system	==================================================
+dispatch/io	FAIL	fw-system	[FAIL] group wait timed out (C:\dev\conformance\out\dispatch\src\dispatch_io.c:238)
+dispatch/io_muxed	FAIL	fw-system	[FAIL] bind() (C:\dev\conformance\out\dispatch\src\dispatch_io_muxed.c:191)
+dispatch/io_net	BUILD	fw-system	C:\dev\conformance\out\dispatch\src\dispatch_io_net.c:41:10: fatal error: 'mach-o/dyld.h' file not found
+dispatch/io_pipe	FAIL	fw-system	==================================================
+dispatch/io_pipe_close	FAIL	fw-system	readFD=3, writeFD=4
+dispatch/overcommit	PASS	fw-system	
+dispatch/pingpong	FAIL	fw-system	==================================================
+dispatch/plusplus	PASS	fw-system	
+dispatch/priority	FAIL	fw-system	[FAIL] background priority precedence (C:\dev\conformance\out\dispatch\src\dispatch_priority.c:131)
+dispatch/proc	FAIL	fw-system	==================================================
+dispatch/queue_finalizer	FAIL	fw-system	[FAIL] never_call should not run (C:\dev\conformance\out\dispatch\src\dispatch_queue_finalizer.c:46)
+dispatch/read	FAIL	fw-system	==================================================
+dispatch/read2	FAIL	fw-system	[FAIL] fcntl F_NOCACHE (C:\dev\conformance\out\dispatch\src\dispatch_read2.c:149)
+dispatch/readsync	FAIL	fw-system	==================================================
+dispatch/select	PASS	fw-system	
+dispatch/sema	PASS	fw-system	
+dispatch/starfish	FAIL	fw-system	==================================================
+dispatch/suspend_timer	PASS	fw-system	
+dispatch/timer	PASS	fw-system	
+dispatch/timer_bit31	PASS	fw-system	
+dispatch/timer_bit63	PASS	fw-system	
+dispatch/timer_set_time	PASS	fw-system	
+dispatch/timer_short	PASS	fw-system	
+dispatch/timer_timeout	PASS	fw-system	
+dispatch/vm	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __dispatch_source_type_vm from library ordinal -2
+dispatch/vnode	FAIL	fw-system	[FAIL] VNODE RENAME notifications (C:\dev\conformance\out\dispatch\src\dispatch_vnode.c:110)

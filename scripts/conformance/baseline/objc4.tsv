@@ -1,0 +1,205 @@
+# objc4: expected results under alchemy-fx (scripts/conformance/README.md).
+# test	expected	owner	note. expected: PASS, FAIL (owner bug), XFAIL (honest refusal or not
+# on Darwin; the note says which), BUILD (does not build yet), SKIP.
+objc4/00-defines	SKIP	fw-system	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/01-headers	SKIP	fw-system	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/02-concurrentcat	BUILD	fw-system	C:/dev/conformance/out/objc4/test/02-concurrentcat.m:31:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/03-load-parallel	FAIL	fw-system	BAD: dlopen failed: Objective-C instance layout of C_a_6 (start 0, size 0) overlaps its superclass or isa
+objc4/04-load-image-notification	BUILD	fw-system	C:/dev/conformance/out/objc4/test/load-image-notification-dylib.m:3:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/05-load-image-notification2	BUILD	fw-system	C:/dev/conformance/out/objc4/test/load-image-notification-dylib.m:3:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/06-ARCLayoutsWithoutWeak	BUILD	fw-system	C:/dev/conformance/out/objc4/test/ARCLayouts.m:17:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/ARCLayouts	BUILD	fw-system	C:/dev/conformance/out/objc4/test/ARCLayouts.m:17:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/accessors	BUILD	fw-system	C:\dev\conformance\out\objc4\test\accessors.m:4:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/accessors2	PASS	fw-system	
+objc4/addMethod	FAIL	fw-system	alchemy: Objective-C requires a nonnull string during synthetic guest call 0x710000006090 [guest pc 0x710000006090, thread 1]
+objc4/addMethods	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _class_replaceMethodsBulk from library ordinal -2
+objc4/addProtocol	FAIL	fw-system	alchemy: unknown Objective-C class address during synthetic guest call 0x7100000060a0 [guest pc 0x7100000060a0, thread 1]
+objc4/applescriptobjc	BUILD	fw-system	C:\dev\conformance\out\objc4\test\applescriptobjc.m:6:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/arr-cast	PASS	fw-system	
+objc4/arr-weak	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/arr-weak-error	FAIL	fw-system	BAD: should have crashed
+objc4/association	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/associationForbidden	FAIL	fw-system	BAD: should have crashed trying to set the associated object
+objc4/associationForbidden2	FAIL	fw-system	BAD: should have crashed trying to set the associated object
+objc4/associationForbidden3	FAIL	fw-system	Associated object is 0x1e8560cdef0
+objc4/associationForbidden4	FAIL	fw-system	BAD: should have crashed trying to set the associated object
+objc4/atomicProperty	BUILD	fw-system	ld64.lld: error: library not found for -lc++
+objc4/badAltHandler	SKIP	fw-system	TEST_CONFIG ARCH=x86_64
+objc4/badCache	BUILD	fw-system	C:\dev\conformance\out\objc4\test\badCache.m:18:10: fatal error: 'malloc_private.h' file not found
+objc4/badPool	FAIL	fw-system	alchemy: invalid Objective-C autorelease pool token during synthetic guest call 0x710000006240 [guest pc 0x710000006240, thread 1]
+objc4/badPoolCompat-ios	SKIP	fw-system	TEST_CONFIG OS=iphoneos
+objc4/badPoolCompat-ios-simulator	SKIP	fw-system	TEST_CONFIG OS=iphonesimulator
+objc4/badPoolCompat-macos	SKIP	fw-system	TEST_CONFIG ARCH=x86_64
+objc4/badPoolCompat-tvos	SKIP	fw-system	TEST_CONFIG OS=appletvos
+objc4/badPoolCompat-tvos-simulator	SKIP	fw-system	TEST_CONFIG OS=appletvsimulator
+objc4/badPoolCompat-watchos	SKIP	fw-system	TEST_CONFIG OS=watchos
+objc4/badPoolCompat-watchos-simulator	SKIP	fw-system	TEST_CONFIG OS=watchsimulator
+objc4/badSuperclass	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/badSuperclass2	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/badTagClass	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_registerTaggedPointerClass from library ordinal -2
+objc4/badTagIndex	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_registerTaggedPointerClass from library ordinal -2
+objc4/bigrc	FAIL	fw-system	timed out
+objc4/blocksAsImps	BUILD	fw-system	C:\dev\conformance\out\objc4\test\blocksAsImps.m:6:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/bool	PASS	fw-system	
+objc4/cache-sel-hash	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __method_setImplementationRawUnsafe from library ordinal -2
+objc4/cacheflush	PASS	fw-system	
+objc4/cacheflush-constant	BUILD	fw-system	C:\dev\conformance\out\objc4\test\cacheflush-constant.m:16:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/category	FAIL	fw-system	alchemy: Objective-C metadata: unsupported Swift stub categories (__objc_catlist2)
+objc4/cdtors	BUILD	fw-system	ld64.lld: error: library not found for -lc++
+objc4/classgetclass	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _gdb_class_getClass from library ordinal -2
+objc4/classname	FAIL	fw-system	alchemy: Objective-C object has invalid isa during synthetic guest call 0x710000005960 [guest pc 0x710000005960, thread 1]
+objc4/classpair	BUILD	fw-system	ld64.lld: error: library not found for -lc++
+objc4/classpair-stress	PASS	fw-system	
+objc4/classpairAddMethod	FAIL	fw-system	alchemy: disposing registered Objective-C classes is unsupported during synthetic guest call 0x7100000060f0 [guest pc 0x7100000060f0, thread 1]
+objc4/classversion	FAIL	fw-system	BAD: failed assertion 'class_getVersion(object_getClass(cls)) > 5' at classversion.m:11
+objc4/consolidatePoolPointers	FAIL	fw-system	BAD: failed assertion 'gap != expectedGap * sizeof(id)' (0x0000000000000001 != 0x0000000000000010) at consolidatePoolPointers.m:103
+objc4/copyFixupHandler	BUILD	fw-system	ld64.lld: error: library not found for -lc++
+objc4/copyIvarList	FAIL	fw-system	alchemy: Objective-C instance layout of NoIvars (start 0, size 0) overlaps its superclass or isa
+objc4/copyMethodList	FAIL	fw-system	BAD: failed assertion 'count == 4' at copyMethodList.m:93
+objc4/copyPropertyList	FAIL	fw-system	alchemy: Objective-C instance layout of NoProps (start 0, size 0) overlaps its superclass or isa
+objc4/copyProtocolList	FAIL	fw-system	BAD: failed assertion 'getProtocol(protolist, count, "NSObject")' at copyProtocolList.m:45
+objc4/createInstance	FAIL	fw-system	BAD: failed assertion 'malloc_size((__bridge const void *)s) >= class_getInstanceSize([Super class])' at createInstance.m:25
+objc4/customDeallocInitiation	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __class_setCustomDeallocInitiation from library ordinal -2
+objc4/customrr	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr-nsobject-awz	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr-nsobject-core	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr-nsobject-none	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr-nsobject-rr	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr-nsobject-rrawz	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr2	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/debugScanWeakTables	FAIL	fw-system	BAD: Should have crashed scanning weakLoc
+objc4/definitions	PASS	fw-system	
+objc4/designatedinit	PASS	fw-system	
+objc4/duplicateClass	FAIL	fw-system	BAD: failed assertion 'object_getClass(clone) == object_getClass(cls)' at duplicateClass.m:67
+objc4/duplicatedClasses	FAIL	fw-system	alchemy: duplicate Objective-C class WKWebView
+objc4/duplicatedClasses2	FAIL	fw-system	BAD: couldn't open dylib
+objc4/duplicatedClasses3	FAIL	fw-system	alchemy: duplicate Objective-C class DuplicatedClass
+objc4/enumClasses	FAIL	fw-system	BAD: failed assertion 'hasClaws != 3' (0x00000000 != 0x00000003) at enumClasses.m:250
+objc4/enumDynamicClasses	SKIP	fw-system	Swift test
+objc4/exc	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/exchangeImp	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _class_copyImpCache from library ordinal -2
+objc4/fakeRealizedClass	FAIL	fw-system	alchemy: Objective-C metadata: nonlazy class absent from class list
+objc4/fakeRealizedClass2	FAIL	fw-system	alchemy: Objective-C metadata: nonlazy class absent from class list
+objc4/faultLeaks	FAIL	fw-system	posix_spawn: Undefined error: 0
+objc4/foreach	BUILD	fw-system	C:\dev\conformance\out\objc4\test\foreach.m:5:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/fork	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/forkInitialize	FAIL	fw-system	alchemy: Objective-C instance layout of BlockingRootClass (start 0, size 0) overlaps its superclass or isa
+objc4/forkInitializeDisabled	SKIP	fw-system	TEST_CONFIG ARCH=x86_64
+objc4/forkInitializeSingleThreaded	FAIL	fw-system	alchemy: Objective-C instance layout of BlockingRootClass (start 0, size 0) overlaps its superclass or isa
+objc4/forkSync	FAIL	fw-system	BAD: fork failed (errno 78 Function not implemented)
+objc4/forward	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/forwardDefault	FAIL	fw-system	alchemy: unsupported Objective-C message +[NSObject fakeorama] (doesNotRecognizeSelector:) during synthetic guest call 0x710000034190 [guest pc 0x710000034190, thread 1]
+objc4/forwardDefaultStret	FAIL	fw-system	alchemy: unsupported Objective-C message +[NSObject fakeorama] (doesNotRecognizeSelector:) during synthetic guest call 0x710000034190 [guest pc 0x710000034190, thread 1]
+objc4/future	BUILD	fw-system	ld64.lld: error: library not found for -ld_classic
+objc4/gdb	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _gdb_objc_realized_classes from library ordinal -2
+objc4/getClassHook	FAIL	fw-system	005910 during synthetic guest call 0x710000005910 during synthetic guest call 0x710000005910 during synthetic guest call 0x710000005910 during synthetic guest call 0x710000005910 during synthetic guest call 0x710000005910 during synthetic guest call 0x710000005910 during synthetic guest call 0x71000
+objc4/getImageNameHook	FAIL	fw-system	BAD: failed assertion 'strstr(class_getImageName([One class]), "Image One")' at getImageNameHook.m:61
+objc4/getMethod	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _object_getMethodImplementation from library ordinal -2
+objc4/imageAPIs	FAIL	fw-system	BAD: failed assertion 'myImageName' at imageAPIs.m:30
+objc4/imageorder	FAIL	fw-system	BAD: +[Super(cat1) method] not replaced!
+objc4/imports	SKIP	fw-system	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/include-warnings	SKIP	fw-system	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/includes	BUILD	fw-system	C:\dev\conformance\out\objc4\test\includes.c:14:10: fatal error: 'objc/List.h' file not found
+objc4/includes-objc2	BUILD	fw-system	C:\dev\conformance\out\objc4\test\includes.c:14:10: fatal error: 'objc/List.h' file not found
+objc4/initialize	FAIL	fw-system	alchemy: Objective-C message forwarding does not end: +[Super4 resolveClassMethod:] during synthetic guest call 0x710000034190 during synthetic guest call 0x710000034190 during synthetic guest call 0x710000034190 during synthetic guest call 0x710000034190 during synthetic guest call 0x710000034190 d
+objc4/initialize-autorelease	FAIL	fw-system	BAD: failed assertion 'didDealloc' at initialize-autorelease.m:41
+objc4/initializePriorityDonation	FAIL	fw-system	alchemy: Darwin abort requested SIGABRT; signal delivery is unsupported during synthetic guest call 0x710000001350 [guest pc 0x710000001350, thread 1]
+objc4/initializeVersusWeak	BUILD	fw-system	C:\dev\conformance\out\objc4\test\initializeVersusWeak.m:11:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/instanceSize	FAIL	fw-system	BAD: failed assertion '2*sizeof(id) == class_getInstanceSize([Sub1 class])' at instanceSize.m:37
+objc4/isaValidation	BUILD	fw-system	ld64.lld: error: library not found for -lc++
+objc4/ismeta	PASS	fw-system	
+objc4/ivar	FAIL	fw-system	alchemy: Objective-C requires a nonnull string during synthetic guest call 0x7100000059c0 [guest pc 0x7100000059c0, thread 1]
+objc4/ivarSlide	PASS	fw-system	
+objc4/lazyClassName	FAIL	fw-system	alchemy: Objective-C metadata: null metadata pointer
+objc4/lazyClassNameRace	SKIP	fw-system	Swift test
+objc4/libraryPath	PASS	fw-system	
+objc4/literals	BUILD	fw-system	C:\dev\conformance\out\objc4\test\literals.m:4:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/load	FAIL	fw-system	BAD: failed assertion 'deallocstate == 1' at load.m:94
+objc4/load-map-images	FAIL	fw-system	  #0 0x7fffffff0000
+objc4/load-order	FAIL	fw-system	alchemy: Objective-C instance layout of Three (start 0, size 0) overlaps its superclass or isa
+objc4/load-reentrant	FAIL	fw-system	alchemy: Objective-C instance layout of One (start 0, size 0) overlaps its superclass or isa
+objc4/methodArgs	FAIL	fw-system	BAD: failed assertion '!arg' at methodArgs.m:88
+objc4/methodCacheLeaks	SKIP	fw-system	TEST_CONFIG ARCH=!arm64e,!arm64
+objc4/methodListSize	PASS	fw-system	
+objc4/methodListSmall	BUILD	fw-system	ld64.lld: error: library not found for -lc++
+objc4/methodSetImplementationHook	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _class_replaceMethodsBulk from library ordinal -2
+objc4/msgSend	BUILD	fw-system	C:/dev/conformance/out/objc4/test/msgSend.m:25:10: fatal error: 'simd/simd.h' file not found
+objc4/msgSend-performance	SKIP	fw-system	TEST_CONFIG OS=!macosx
+objc4/msgSend-performance-macos	BUILD	fw-system	C:\dev\conformance\out\objc4\test\msgSend-performance.m:5:10: fatal error: 'simd/simd.h' file not found
+objc4/nilAPIArgs	FAIL	fw-system	alchemy: invalid Objective-C Method replacement during synthetic guest call 0x7100000060b0 [guest pc 0x7100000060b0, thread 1]
+objc4/nonpointerisa	BUILD	fw-system	C:\dev\conformance\out\objc4\test\nonpointerisa.m:8:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/nopool	FAIL	fw-system	BAD: failed assertion '(int)TestRootDealloc != 1' (0x00000000 != 0x00000001) at nopool.m:18
+objc4/nscdtors	BUILD	fw-system	C:\dev\conformance\out\objc4\test\cdtors.mm:4:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/nsexc	BUILD	fw-system	C:\dev\conformance\out\objc4\test\exc.m:18:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/nsobject	FAIL	fw-system	alchemy: unsupported Objective-C message +[NSObject debugDescription] (doesNotRecognizeSelector:) during synthetic guest call 0x710000034190 [guest pc 0x710000034190, thread 1]
+objc4/nsprotocol	PASS	fw-system	
+objc4/objectCopy	FAIL	fw-system	BAD: failed assertion 'malloc_size(o0) == 32' at objectCopy.m:45
+objc4/osVersion	BUILD	fw-system	C:\dev\conformance\out\objc4\test\osVersion.m:5:10: fatal error: 'mach-o/dyld_priv.h' file not found
+objc4/partiallyRealizedClass	PASS	fw-system	
+objc4/patch-class-root	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_patch_root_of_class from library ordinal -2
+objc4/preAttachedCategories	BUILD	fw-system	C:\dev\conformance\out\objc4\test\preAttachedCategories.mm:6:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/preopt-caches	SKIP	fw-system	TEST_CONFIG OS=iphoneos
+objc4/property	PASS	fw-system	
+objc4/propertyDesc	FAIL	fw-system	alchemy: invalid Objective-C property during synthetic guest call 0x710000005c50 [guest pc 0x710000005c50, thread 1]
+objc4/protocol	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __protocol_getMethodTypeEncoding from library ordinal -2
+objc4/protocolSmall	FAIL	fw-system	BAD: failed assertion 'desc.name == @selector(protoMethod)' at protocolSmall.m:89
+objc4/protocol_copyMethodList	PASS	fw-system	
+objc4/protocol_copyPropertyList	PASS	fw-system	
+objc4/ptrauth	SKIP	fw-system	TEST_CONFIG ARCH=arm64e
+objc4/rawisa	FAIL	fw-system	OK: rawisa.m
+objc4/readClassPair	FAIL	fw-system	alchemy: Objective-C metadata: ivar outside class instance extent during synthetic guest call 0x710000006960 [guest pc 0x710000006960, thread 1]
+objc4/readClassPairIvarFixup	FAIL	fw-system	BAD: failed assertion 'ivar_getOffset(ivars1[0]) != 5 * sizeof(id)' (0x0000000000000008 != 0x0000000000000028) at readClassPairIvarFixup.m:54
+objc4/realizedClassGenerationCount	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _objc_debug_realized_class_generation_count from library ordinal -2
+objc4/release-race	FAIL	fw-system	timed out
+objc4/release-workaround	SKIP	fw-system	TEST_CONFIG ARCH=x86_64
+objc4/resolve	PASS	fw-system	
+objc4/restartableRangesSynchronizeStress	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _objc_msgLookup from library ordinal -2
+objc4/restartableRangesSynchronizeStress2	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/retain-release-helpers	FAIL	fw-system	alchemy: unsupported Objective-C message -[OverriddenRetainReleaseChecker _isDeallocating] (doesNotRecognizeSelector:) during synthetic guest call 0x710000034190 during synthetic guest call 0x710000006650 [guest pc 0x710000006650, thread 1]
+objc4/rootMissingCategoryClass	FAIL	fw-system	alchemy: unknown Objective-C class address
+objc4/rootMissingSuperclass	FAIL	fw-system	alchemy: Objective-C metadata: null metadata pointer
+objc4/rr-autorelease	BUILD	fw-system	C:\dev\conformance\out\objc4\test\rr-autorelease2.m:23:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/rr-autorelease-fast	FAIL	fw-system	BAD: Incorrect refcount testing testSuccessful0_0(TWO_NOPS(objc_retainAutoreleaseReturnValue, objc_unsafeClaimAutoreleasedReturnValue);), TestRootAutorelease=1, expected 0, obj 0x28979ccddc0 at rr-autorelease-fast.m:447
+objc4/rr-autorelease-fastarc	SKIP	fw-system	TEST_DISABLED pending clang support for rdar://20530049
+objc4/rr-autorelease-stacklogging	BUILD	fw-system	C:\dev\conformance\out\objc4\test\rr-autorelease2.m:23:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/rr-nsautorelease	BUILD	fw-system	C:\dev\conformance\out\objc4\test\rr-autorelease2.m:23:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/rr-sidetable	SKIP	fw-system	TEST_CONFIG ARCH=x86_64
+objc4/runtime	BUILD	fw-system	C:\dev\conformance\out\objc4\test\runtime.m:20:10: fatal error: 'mach-o/ldsyms.h' file not found
+objc4/sel	FAIL	fw-system	alchemy: guest memory read fault at 0x0 during synthetic guest call 0x710000000e10 [guest pc 0x710000000e10, thread 1]
+objc4/setAssociatedObjectHook	FAIL	fw-system	BAD: failed assertion 'hasAssociations == true' at setAssociatedObjectHook.m:33
+objc4/setSuper	PASS	fw-system	
+objc4/signedMethodSelectors	PASS	fw-system	
+objc4/subscripting	BUILD	fw-system	C:\dev\conformance\out\objc4\test\subscripting.m:4:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/super	PASS	fw-system	
+objc4/supported-inline-refcnt	BUILD	fw-system	C:\dev\conformance\out\objc4\test\supported-inline-refcnt.m:10:10: fatal error: 'CoreFoundation/CoreFoundation.h' file not found
+objc4/swift-allocateClassPair	SKIP	fw-system	Swift test
+objc4/swiftMetaMeta	SKIP	fw-system	TEST_CONFIG ARCH=arm64e
+objc4/swiftMetadataInitializer	FAIL	fw-system	BAD: SwiftSuper's init should not have been called
+objc4/swiftMetadataInitializerRealloc	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _objc_loadClassref from library ordinal -2
+objc4/swiftStubClassList	FAIL	fw-system	BAD: failed assertion 'initCount != 4' (0x00000000 != 0x00000004) at swiftStubClassList.m:52
+objc4/swiftobject-no-custom-core	BUILD	fw-system	ld64.lld: error: library not found for -lc++
+objc4/sync-error-checking	FAIL	fw-system	OK: sync-error-checking.m
+objc4/synchronized	FAIL	fw-system	timed out
+objc4/synchronized-counter	BUILD	fw-system	C:\dev\conformance\out\objc4\test\synchronized-counter.m:11:10: fatal error: 'System/pthread_machdep.h' file not found
+objc4/synchronized-grid	PASS	fw-system	
+objc4/taggedNSPointers	BUILD	fw-system	C:\dev\conformance\out\objc4\test\taggedNSPointers.m:6:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/taggedPointers	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _objc_debug_taggedpointer_obfuscator from library ordinal -2
+objc4/taggedPointersAllClasses	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _objc_debug_tag60_permutations from library ordinal -2
+objc4/taggedPointersDisabled	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _objc_debug_taggedpointer_mask from library ordinal -2
+objc4/taggedPointersTagObfuscationDisabled	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _objc_debug_tag60_permutations from library ordinal -2
+objc4/tbi	SKIP	fw-system	TEST_CONFIG OS=iphoneos
+objc4/unexpectedBuildOutput	BUILD	fw-system	C:\dev\conformance\out\objc4\test\unexpectedBuildOutput.mm:5:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/uniquelyref	BUILD	fw-system	C:\dev\conformance\out\objc4\test\uniquelyref.m:7:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/unload	SKIP	fw-system	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/unrealizedClassSafety	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __class_getIvarMemoryManagement from library ordinal -2
+objc4/unwind	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _objc_addExceptionHandler from library ordinal -2
+objc4/weak-not-registered	FAIL	fw-system	alchemy: invalid or destroyed compatibility object 0x25978a2dd42 (isa 0x83f100000006004c, not a registered class) during synthetic guest call 0x7100000062e0 [guest pc 0x7100000062e0, thread 1]
+objc4/weakReferenceHook	FAIL	fw-system	BAD: failed assertion 'hasWeakRefs == true' at weakReferenceHook.m:30
+objc4/weakcopy	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/weakframework-missing	FAIL	fw-system	alchemy: Objective-C metadata: category has no target class
+objc4/weakframework-not-missing	PASS	fw-system	
+objc4/weakimport-missing	FAIL	fw-system	alchemy: Objective-C metadata: category has no target class
+objc4/weakimport-not-missing	PASS	fw-system	
+objc4/weakrace	PASS	fw-system	
+objc4/willInitializeClassFunc	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_addWillInitializeClassFunc from library ordinal -2
+objc4/zone	PASS	fw-system	

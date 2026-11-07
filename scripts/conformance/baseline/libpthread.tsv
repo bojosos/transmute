@@ -1,0 +1,88 @@
+# libpthread: expected results under alchemy-fx (scripts/conformance/README.md).
+# test	expected	owner	note. expected: PASS, FAIL (owner bug), XFAIL (honest refusal or not
+# on Darwin; the note says which), BUILD (does not build yet), SKIP.
+libpthread/add_timer_termination/add_timer_termination	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/atfork/atfork	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\atfork.c:144: pid >= 0 (-1 vs 0): first fork()
+libpthread/atfork/atfork_enomem	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\atfork.c:179: recorded_events == 2 * registration_count (0 vs 2048): expected event count for child
+libpthread/bsdthread_set_self/bsdthread_set_self_constrained_threads	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/bsdthread_set_self/bsdthread_set_self_constrained_transition	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/bsdthread_set_self/pthread_encode_decode_SPIs	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/bsdthread_set_self/set_override_and_base_pri	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/cond/cond	PASS	fw-system	
+libpthread/cond/cond_cancel_signal_race	PASS	fw-system	
+libpthread/cond/cond_mutex_ping_pong	PASS	fw-system	
+libpthread/cond/cond_signal_thread_np_not_waiting	PASS	fw-system	
+libpthread/cond/cond_signal_thread_np_waiting	PASS	fw-system	
+libpthread/cond/cond_signal_thread_np_waiting_different_cond	PASS	fw-system	
+libpthread/cond_prepost/cond_prepost_fairshare	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\cond_prepost.c:57: res == 0 (errno 1: Operation not permitted): condition wait on condvar completed
+libpthread/cond_prepost/cond_prepost_firstfit	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\cond_prepost.c:57: res == 0 (errno 1: Operation not permitted): condition wait on condvar completed
+libpthread/cond_timed/cond_timedwait_beforeepochtimeout	SKIP	fw-system	cond_timedwait_beforeepochtimeout: skipped <rdar://38144536>
+libpthread/cond_timed/cond_timedwait_nulltimeout	FAIL	fw-system	
+libpthread/cond_timed/cond_timedwait_pasttimeout	SKIP	fw-system	cond_timedwait_pasttimeout: skipped <rdar://38144536>
+libpthread/cond_timed/cond_timedwait_relative_nulltimeout	FAIL	fw-system	
+libpthread/cond_timed/cond_timedwait_relative_pasttimeout	FAIL	fw-system	
+libpthread/cond_timed/cond_timedwait_timeout	PASS	fw-system	
+libpthread/cond_timed/cond_timedwait_zerotimeout	SKIP	fw-system	cond_timedwait_zerotimeout: skipped <rdar://38144536>
+libpthread/custom_stack/custom_stack	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\custom_stack.c:36: pthread_attr_setstackaddr(&attr, (void *)stackaddr) == 0 (errno 45: Operation not supported)
+libpthread/detach/pthread_detach	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\detach.c:37: pthread_create(&ths[j], ((void*)0), thread_routine, (void *)j) == 0 (errno 35: Resource temporarily unavailable): thread creation
+libpthread/join/join	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_create_suspended_np from library ordinal -2
+libpthread/join/pthread_join_3way	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_create_suspended_np from library ordinal -2
+libpthread/join/pthread_join_stress	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_create_suspended_np from library ordinal -2
+libpthread/main_stack/main_stack	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\main_stack.c:19: setrlimit(3, &lim) != -1 (errno 78: Function not implemented)
+libpthread/main_stack_custom/main_stack_custom	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\main_stack_custom.c:7: (size_t)0x124000 == pthread_get_stacksize_np(pthread_self()) (1196032 vs 1048576)
+libpthread/main_stack_legacy/main_stack_legacy	PASS	fw-system	
+libpthread/mutex/mutex	SKIP	fw-system	needs boot-args
+libpthread/mutex/mutex_as_semaphore_lock_owned	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex.c:167: rc == 0 (errno 11: Resource deadlock avoided): recursive lock
+libpthread/mutex/mutex_default_policy	PASS	fw-system	
+libpthread/mutex/mutex_default_policy_envvar	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex.c:104: policy == expected_policy (3 vs 1): Saw the expected default policy
+libpthread/mutex/mutex_default_policy_sysctl	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex.c:121: sysctlbyname("kern.pthread_mutex_default_policy", ((void*)0), ((void*)0), &fairshare_default, sizeof(fairshare_default)) == 0 (errno -1: Unknown error: -1): Changed the default policy sysctl to fairshare
+libpthread/mutex_prepost/mutex_prepost_fairshare	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex_prepost.c:31: res == 0 (errno 1: Operation not permitted): condition wait on condvar completed
+libpthread/mutex_prepost/mutex_prepost_firstfit	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex_prepost.c:31: res == 0 (errno 1: Operation not permitted): condition wait on condvar completed
+libpthread/mutex_try/mutex_trylock	PASS	fw-system	
+libpthread/once_cancel/once_cancel	PASS	fw-system	
+libpthread/perf_contended_mutex_rwlock/perf_contended_ffmutex_bench	SKIP	fw-system	performance test
+libpthread/perf_contended_mutex_rwlock/perf_contended_mutex_bench	SKIP	fw-system	performance test
+libpthread/perf_contended_mutex_rwlock/perf_contended_rwlock_bench	SKIP	fw-system	performance test
+libpthread/perf_contended_mutex_rwlock/perf_contended_unfair_lock_bench	SKIP	fw-system	performance test
+libpthread/perf_contended_mutex_rwlock/perf_uncontended_ffmutex_bench	SKIP	fw-system	performance test
+libpthread/perf_contended_mutex_rwlock/perf_uncontended_mutex_bench	SKIP	fw-system	performance test
+libpthread/perf_contended_mutex_rwlock/perf_uncontended_rwlock_bench	SKIP	fw-system	performance test
+libpthread/perf_contended_mutex_rwlock/perf_uncontended_unfair_lock_bench	SKIP	fw-system	performance test
+libpthread/pthread_attr_setstacksize/pthread_attr_setstacksize	PASS	fw-system	
+libpthread/pthread_bulk_create/pthread_bulk_create	PASS	fw-system	
+libpthread/pthread_cancel/pthread_cancel	PASS	fw-system	
+libpthread/pthread_create_from_mach_thread/pthread_create_from_mach_thread	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _swtch_pri from library ordinal -2
+libpthread/pthread_cwd/pthread_cwd	BUILD	fw-system	C:\dev\conformance\out\libpthread\src\pthread_cwd.c:6:10: fatal error: 'sys/syscall.h' file not found
+libpthread/pthread_dependency/dependency	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_dependency_wait_np from library ordinal -2
+libpthread/pthread_exit/pthread_exit	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_exit/pthread_exit_detached	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_exit/pthread_exit_private_stacks	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_exit/pthread_self_is_exiting_np	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_get_qos_class_np/test_pthread_get_qos_class_np	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\pthread_get_qos_class_np.c:28: qos == (qos_class_t)QOS_CLASS_BACKGROUND (21 vs 9)
+libpthread/pthread_introspection/pthread_introspection	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_introspection_hook_install from library ordinal -2
+libpthread/pthread_jit_write_freeze_callbacks/pthread_jit_write_freeze_callbacks_correct	SKIP	fw-system	needs entitlements and a helper tool
+libpthread/pthread_jit_write_freeze_callbacks/pthread_jit_write_freeze_callbacks_incorrect	SKIP	fw-system	needs entitlements and a helper tool
+libpthread/pthread_jit_write_lockdown/pthread_jit_write_with_callback_no_allowlist	SKIP	fw-system	needs entitlements
+libpthread/pthread_jit_write_protection/pthread_jit_write_protect	SKIP	fw-system	performance test (darwintest_perf.h)
+libpthread/pthread_jit_write_protection/thread_self_restrict_rwx_perf	SKIP	fw-system	performance test (darwintest_perf.h)
+libpthread/pthread_jit_write_with_callback/pthread_jit_write_protect_np_disallowed	SKIP	fw-system	needs entitlements and a helper tool
+libpthread/pthread_jit_write_with_callback/pthread_jit_write_with_callback_allowed	SKIP	fw-system	needs entitlements and a helper tool
+libpthread/pthread_jit_write_with_callback/pthread_jit_write_with_invalid_callback_disallowed	SKIP	fw-system	needs entitlements and a helper tool
+libpthread/pthread_setspecific/pthread_setspecific	PASS	fw-system	
+libpthread/pthread_threadid_np/pthread_threadid_fork	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_threadid_np/pthread_threadid_np	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/rdar_32848402/amx_parallelism	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
+libpthread/rdar_32848402/amx_parallelism_on_non_amx_hardware	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
+libpthread/rdar_32848402/thread_request_32848402	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
+libpthread/setrlimit_sigsegv/setrlimit_overflow_segfault	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\setrlimit_sigsegv.c:25: setrlimit(3, &lim) != -1 (errno 78: Function not implemented)
+libpthread/stack/chkstk	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _thread_chkstk_darwin from library ordinal -2
+libpthread/stack/pthread_stack_frame_decode_np	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _thread_chkstk_darwin from library ordinal -2
+libpthread/stack_aslr/pthread_stack_aslr	BUILD	fw-system	C:\dev\conformance\out\libpthread\src\stack_aslr.c:137:35: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+libpthread/stack_aslr/wq_stack_aslr	BUILD	fw-system	C:\dev\conformance\out\libpthread\src\stack_aslr.c:137:35: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+libpthread/stack_size/stack_size_custom	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\stack_size.c:79: pthread_attr_setstackaddr(&attr, (void *)stackaddr) == 0 (errno 45: Operation not supported)
+libpthread/stack_size/stack_size_customaddr	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\stack_size.c:60: pthread_attr_setstackaddr(&attr, (void *)stackaddr) == 0 (errno 45: Operation not supported)
+libpthread/stack_size/stack_size_customsize	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\stack_size.c:17: pthread_get_stacksize_np(pthread_self()) == expected_size (786432 vs 798720): saw expected pthread_get_stacksize_np
+libpthread/stack_size/stack_size_default	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\stack_size.c:17: pthread_get_stacksize_np(pthread_self()) == expected_size (1048576 vs 536576): saw expected pthread_get_stacksize_np
+libpthread/tsd/cpuid	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_cpu_number_np from library ordinal -2
+libpthread/tsd/tsd	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_cpu_number_np from library ordinal -2
+libpthread/wq_limits/wq_pool_limits	BUILD	fw-system	C:\dev\conformance\out\libpthread\src\wq_limits.c:3:10: fatal error: 'dispatch/private.h' file not found
