@@ -208,6 +208,37 @@ void arrays_and_dictionaries(Fixture& f) {
                 f.call(cf, "_CFDictionaryGetCountOfValue", {dictionary, fig}) == 2, "dictionary counts");
 }
 
+// kCFCopyStringDictionaryKeyCallBacks: keys are stored as immutable copies, so
+// changing a mutable key after it went in doesn't move its entry.
+void copy_string_keys(Fixture& f) {
+    const auto callbacks = f.symbol(cf, "_kCFCopyStringDictionaryKeyCallBacks");
+    const auto value_callbacks = f.symbol(cf, "_kCFTypeDictionaryValueCallBacks");
+    require(f.engine.read64(callbacks + 8) != f.engine.read64(f.symbol(cf, "_kCFTypeDictionaryKeyCallBacks") + 8) &&
+                f.engine.read64(callbacks + 32) == f.engine.read64(f.symbol(cf, "_kCFTypeDictionaryKeyCallBacks") + 32),
+            "the record copies keys and compares them with CFEqual");
+    const auto dictionary = f.call(cf, "_CFDictionaryCreateMutable", {0, 0, callbacks, value_callbacks});
+    const auto key = mutable_string(f, "key"), value = string(f, "value");
+    static_cast<void>(f.call(cf, "_CFDictionarySetValue", {dictionary, key, value}));
+    static_cast<void>(f.call(cf, "_CFStringAppend", {key, string(f, "-changed")}));
+    require(f.call(cf, "_CFDictionaryGetValue", {dictionary, string(f, "key")}) == value &&
+                f.call(cf, "_CFDictionaryGetValue", {dictionary, string(f, "key-changed")}) == 0, "the stored key is a copy");
+    const auto keys = f.block(8), values_out = f.block(8);
+    static_cast<void>(f.call(cf, "_CFDictionaryGetKeysAndValues", {dictionary, keys, values_out}));
+    require(f.engine.read64(keys) != key && f.cf.utf8(f.engine.read64(keys)) == "key", "the key is not the caller's mutable string");
+    // A mutable copy keeps copying keys.
+    const auto copy = f.call(cf, "_CFDictionaryCreateMutableCopy", {0, 0, dictionary});
+    const auto other = mutable_string(f, "other");
+    static_cast<void>(f.call(cf, "_CFDictionarySetValue", {copy, other, value}));
+    static_cast<void>(f.call(cf, "_CFStringAppend", {other, string(f, "!")}));
+    require(f.call(cf, "_CFDictionaryGetValue", {copy, string(f, "other")}) == value && f.call(cf, "_CFDictionaryGetCount", {copy}) == 2,
+            "a mutable copy copies its keys");
+    // CFDictionaryCreate with a copy of the callbacks record, as callers that build their own struct do.
+    const auto record = f.block(48);
+    for (Address offset = 0; offset < 48; offset += 8) f.engine.write64(record + offset, f.engine.read64(callbacks + offset));
+    const auto created = f.call(cf, "_CFDictionaryCreate", {0, values(f, {mutable_string(f, "a")}), values(f, {value}), 1, record, value_callbacks});
+    require(f.call(cf, "_CFDictionaryGetValue", {created, string(f, "a")}) == value, "CFDictionaryCreate with copied key callbacks");
+}
+
 void character_sets(Fixture& f) {
     const auto set = f.call(cf, "_CFCharacterSetCreateWithCharactersInRange", {0, 'a', 26});
     require(f.call(cf, "_CFGetTypeID", {set}) == f.call(cf, "_CFCharacterSetGetTypeID"), "CFCharacterSet type id");
@@ -245,5 +276,6 @@ void character_sets(Fixture& f) {
 
 int main() {
     return run("corefoundation collections", {{"binary heaps", binary_heaps}, {"bit vectors", bit_vectors}, {"trees", trees},
-        {"bags", bags}, {"sets", sets}, {"arrays and dictionaries", arrays_and_dictionaries}, {"character sets", character_sets}});
+        {"bags", bags}, {"sets", sets}, {"arrays and dictionaries", arrays_and_dictionaries}, {"copy-string keys", copy_string_keys},
+        {"character sets", character_sets}});
 }

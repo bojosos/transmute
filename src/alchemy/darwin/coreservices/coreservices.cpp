@@ -17,7 +17,7 @@
 
 // CoreServices interfaces Qt Core and an installer import:
 //   Unicode collation (UnicodeUtilities): LocaleRefFromLocaleString,
-//     UCCreateCollator, UCCompareText, UCGetCollationKey,
+//     UCCreateCollator, UCCompareText, UCCompareTextDefault, UCGetCollationKey,
 //     UCCompareCollationKeys, UCDisposeCollator, over the host's linguistic
 //     comparison (host::locale::compare and sort_key).
 //   Uniform Type Identifiers: UTTypeEqual. (UTTypeConformsTo and the other
@@ -38,6 +38,20 @@ constexpr std::uint32_t collate_compose_insensitive = 1U << 1, collate_width_ins
 std::uint64_t status(std::int64_t value) { return static_cast<std::uint64_t>(value); }
 
 struct Collator { std::string locale; std::uint32_t options{}; };   // locale "" is the user's default
+
+// UCCollateOptions as host::locale comparison options. Punctuation is ignored
+// unless kUCCollatePunctuationSignificantMask asks for it, as documented.
+std::uint32_t collation_options(std::uint32_t options) {
+    namespace locale = host::locale;
+    std::uint32_t result = 0;
+    if (options & collate_case_insensitive) result |= locale::ignore_case_linguistic;
+    if (options & collate_diacrit_insensitive) result |= locale::ignore_diacritics;
+    if (options & collate_width_insensitive) result |= locale::ignore_width;
+    if (options & collate_compose_insensitive) result |= locale::ignore_kana_type;
+    if (!(options & collate_punctuation_significant)) result |= locale::ignore_symbols;
+    if (options & collate_digits_as_number) result |= locale::digits_as_numbers;
+    return result;
+}
 
 std::string lower(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -84,14 +98,7 @@ void install_coreservices(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
                 collator.locale = found->second;
             }
         }
-        namespace locale = host::locale;
-        const auto options = static_cast<std::uint32_t>(s.x[2]);
-        if (options & collate_case_insensitive) collator.options |= locale::ignore_case_linguistic;
-        if (options & collate_diacrit_insensitive) collator.options |= locale::ignore_diacritics;
-        if (options & collate_width_insensitive) collator.options |= locale::ignore_width;
-        if (options & collate_compose_insensitive) collator.options |= locale::ignore_kana_type;
-        if (!(options & collate_punctuation_significant)) collator.options |= locale::ignore_symbols;
-        if (options & collate_digits_as_number) collator.options |= locale::digits_as_numbers;
+        collator.options = collation_options(static_cast<std::uint32_t>(s.x[2]));
         const auto token = process.allocate_guest(16, 16);
         { std::lock_guard lock(handles->mutex); handles->collators[token] = collator; }
         m.write64(s.x[3], token);
@@ -119,6 +126,22 @@ void install_coreservices(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         const auto result = host::locale::compare(collator->locale, left, right, collator->options);
         if (!result) {
             if (result.error() == host::Error::unsupported) throw std::runtime_error("Alchemy UCCompareText requires the host collation service");
+            return status(param_err);
+        }
+        if (s.x[5]) m.write8(s.x[5], *result == 0 ? 1 : 0);
+        if (s.x[6]) m.write32(s.x[6], static_cast<std::uint32_t>(*result));
+        return status(no_err);
+    });
+    // OSStatus UCCompareTextDefault(UCCollateOptions, const UniChar*, UniCharCount, const UniChar*, UniCharCount,
+    //                               Boolean* equivalent, SInt32* order)
+    // UCCompareText with the user's default locale and these options (glib's
+    // g_utf8_collate passes kUCCollateStandardOptions and reads only the order).
+    function("_UCCompareTextDefault", [text](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        if ((s.x[2] && !s.x[1]) || (s.x[4] && !s.x[3])) return status(param_err);
+        const auto left = text(m, s.x[1], s.x[2]), right = text(m, s.x[3], s.x[4]);
+        const auto result = host::locale::compare({}, left, right, collation_options(static_cast<std::uint32_t>(s.x[0])));
+        if (!result) {
+            if (result.error() == host::Error::unsupported) throw std::runtime_error("Alchemy UCCompareTextDefault requires the host collation service");
             return status(param_err);
         }
         if (s.x[5]) m.write8(s.x[5], *result == 0 ? 1 : 0);

@@ -260,7 +260,7 @@ int cf_number_compare(const NumberPayload& left, const NumberPayload& right) {
     return comparison;
 }
 struct ArrayPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint64_t> values; bool mutable_array{}, own{}; };
-struct DictionaryPayload : ObjectPayload { std::mutex mutex; std::vector<std::pair<std::uint64_t, std::uint64_t>> values; std::uint64_t revision{}; bool mutable_dictionary{}, own_keys{}, own_values{}; };
+struct DictionaryPayload : ObjectPayload { std::mutex mutex; std::vector<std::pair<std::uint64_t, std::uint64_t>> values; std::uint64_t revision{}; bool mutable_dictionary{}, own_keys{}, own_values{}, copy_keys{}; };
 struct UrlPayload : ObjectPayload { std::string path; bool directory{}; std::uint64_t string{}; };
 struct DatePayload : ObjectPayload { double time{}; };
 struct EnumeratorPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint64_t> urls; std::size_t next{}; };
@@ -397,7 +397,7 @@ struct CoreFoundation::Impl {
     std::array<std::uint64_t, 5> literal_classes{};
     std::function<bool(std::uint64_t)> foreign_adopter;
     std::vector<std::function<bool(std::uint64_t)>> extra_adopters;
-    std::uint64_t constant_class{}, array_callbacks{}, key_callbacks{}, value_callbacks{}, true_object{}, false_object{};
+    std::uint64_t constant_class{}, array_callbacks{}, key_callbacks{}, value_callbacks{}, copy_string_key_callbacks{}, true_object{}, false_object{};
     std::mutex locale_mutex;
     std::uint64_t current_locale{}, system_locale{};
     using Operation = std::function<std::uint64_t(std::span<const std::uint64_t>)>;
@@ -525,6 +525,10 @@ struct CoreFoundation::Impl {
         if (p.data.size() > p.capacity) { const auto fresh = context.allocate_guest(p.data.size()); context.release_guest(p.storage); p.storage = fresh; p.capacity = p.data.size(); }
         memory().write_bytes(p.storage, p.data);
     }
+    // Key callbacks equal to kCFCopyStringDictionaryKeyCallBacks (the record itself or a copy of it).
+    bool copy_string_keys(std::uint64_t supplied) {
+        return supplied && copy_string_key_callbacks && bytes(memory(), supplied, 48) == bytes(memory(), copy_string_key_callbacks, 48);
+    }
     bool callbacks(std::uint64_t supplied, std::uint64_t expected, unsigned size) {
         if (!supplied) return false;
         const auto record = bytes(memory(), supplied, size);
@@ -543,8 +547,8 @@ struct CoreFoundation::Impl {
             return result;
         } catch (...) { for (std::size_t at = 0; at < retained; ++at) context.objects().release(p->values[at]); throw; }
     }
-    std::uint64_t dictionary(bool mutable_dictionary, bool own_keys, bool own_values) {
-        auto p = std::make_shared<DictionaryPayload>(); p->mutable_dictionary = mutable_dictionary; p->own_keys = own_keys; p->own_values = own_values;
+    std::uint64_t dictionary(bool mutable_dictionary, bool own_keys, bool own_values, bool copy_keys = false) {
+        auto p = std::make_shared<DictionaryPayload>(); p->mutable_dictionary = mutable_dictionary; p->own_keys = own_keys || copy_keys; p->own_values = own_values; p->copy_keys = copy_keys;
         const auto result = create(ObjectKind::dictionary, p, [this, p](auto) { for (auto [key, value] : p->values) { if (p->own_keys) context.objects().release(key); if (p->own_values) context.objects().release(value); } });
         classify(result, ObjectKind::dictionary, mutable_dictionary);
         return result;
@@ -641,13 +645,25 @@ struct CoreFoundation::Impl {
         }
         case ObjectKind::data: { const auto p = payload<DataPayload>(address, ObjectKind::data); std::lock_guard lock(p->mutex); sync_data(*p); return data(p->data, mutable_copy); }
         case ObjectKind::array: { const auto p = payload<ArrayPayload>(address, ObjectKind::array); return array(array_values(address), mutable_copy, p->own); }
-        case ObjectKind::dictionary: { const auto p = payload<DictionaryPayload>(address, ObjectKind::dictionary); const auto result = dictionary(true, p->own_keys, p->own_values); try { for (const auto [key, value] : dictionary_values(address)) dictionary_set(result, key, value); } catch (...) { context.objects().release(result); throw; } freeze(result, mutable_copy); return result; }
+        case ObjectKind::dictionary: { const auto p = payload<DictionaryPayload>(address, ObjectKind::dictionary); const auto result = dictionary(true, p->own_keys, p->own_values, p->copy_keys); try { for (const auto [key, value] : dictionary_values(address)) dictionary_set(result, key, value); } catch (...) { context.objects().release(result); throw; } freeze(result, mutable_copy); return result; }
         default: return context.objects().retain(address);
         }
     }
     void dictionary_set(std::uint64_t address, std::uint64_t key, std::uint64_t value, unsigned mode = 0) {
         if (!key || !value) invalid("null dictionary key or value");
         const auto p = payload<DictionaryPayload>(address, ObjectKind::dictionary); if (!p->mutable_dictionary) invalid("mutation of immutable dictionary");
+        if (p->copy_keys) {
+            // kCFCopyStringDictionaryKeyCallBacks: a new key is stored as an immutable
+            // copy (CFStringCreateCopy), so later changes to a mutable key don't reach it.
+            if (object(key)->kind != ObjectKind::string) invalid("kCFCopyStringDictionaryKeyCallBacks with a key that is not a CFString");
+            const auto copied = copy(key);
+            try { dictionary_store(p, copied, value, mode); } catch (...) { context.objects().release(copied); throw; }
+            context.objects().release(copied);
+            return;
+        }
+        dictionary_store(p, key, value, mode);
+    }
+    void dictionary_store(const std::shared_ptr<DictionaryPayload>& p, std::uint64_t key, std::uint64_t value, unsigned mode) {
         if (p->own_values) object(value);
         if (p->own_keys) object(key);
         for (;;) {
@@ -910,6 +926,14 @@ void CoreFoundation::Impl::install_all() {
     const auto release_callback = context.install_function("__alchemy_cf_callback_release", [this](auto& s, auto&) { object(s.x[1]); context.objects().release(s.x[1]); s.x[0] = 0; }, core_foundation_library);
     auto callback_record = [&](std::string name, bool key) { const auto address = context.allocate_guest(key ? 48 : 40); memory().write64(address, 0); memory().write64(address + 8, retain_callback); memory().write64(address + 16, release_callback); memory().write64(address + 24, callback("CFCopyDescription")); memory().write64(address + 32, callback("CFEqual")); if (key) memory().write64(address + 40, callback("CFHash")); context.install_export(core_foundation_library, "_" + name, {address, ExportKind::data}); return address; };
     array_callbacks = callback_record("kCFTypeArrayCallBacks", false); key_callbacks = callback_record("kCFTypeDictionaryKeyCallBacks", true); value_callbacks = callback_record("kCFTypeDictionaryValueCallBacks", false);
+    // kCFCopyStringDictionaryKeyCallBacks: kCFTypeDictionaryKeyCallBacks with a retain that
+    // copies the CFString key (CFStringCreateCopy) instead of retaining it.
+    const auto copy_string_callback = context.install_function("__alchemy_cf_callback_copy_string", [this](auto& s, auto&) {
+        if (object(s.x[1])->kind != ObjectKind::string) invalid("kCFCopyStringDictionaryKeyCallBacks with a key that is not a CFString");
+        s.x[0] = copy(s.x[1]);
+    }, core_foundation_library);
+    copy_string_key_callbacks = callback_record("kCFCopyStringDictionaryKeyCallBacks", true);
+    memory().write64(copy_string_key_callbacks + 8, copy_string_callback);
     install("CFStringCreateWithCString", 3, [this](auto a) { allocator(a[0]); const auto encoding = static_cast<std::uint32_t>(a[2]); if (!c_string_encoding(encoding)) invalid("C strings cannot be in a UTF-16 or UTF-32 encoding"); bool terminated{}; const auto input = memory().read_string(a[1], 1, limit, &terminated); if (!terminated) invalid("unterminated C string"); try { return string(decode(input, encoding)); } catch (const EncodingError&) { return std::uint64_t{0}; } });
     install("CFStringCreateWithBytes", 5, [this](auto a) { allocator(a[0]); const auto input = bytes(memory(), a[1], a[2]); try { return string(decode(input, static_cast<std::uint32_t>(a[3]), static_cast<std::uint8_t>(a[4]) != 0)); } catch (const EncodingError&) { return std::uint64_t{0}; } });
     install("CFStringCreateWithCharacters", 3, [this](auto a) { allocator(a[0]); return string(decode(bytes(memory(), a[1], count(a[2]) * 2), utf16le)); });
@@ -992,9 +1016,9 @@ void CoreFoundation::Impl::install_all() {
     install("CFArrayInsertValueAtIndex", 3, [array_put](auto a) { array_put(a[0], a[1], a[2], true, false); return 0; });
     install("CFArrayRemoveValueAtIndex", 2, [this](auto a) { const auto p = payload<ArrayPayload>(a[0], ObjectKind::array); if (!p->mutable_array) invalid("mutation of immutable array"); std::uint64_t old; { std::lock_guard lock(p->mutex); range(p->values.size(), a[1], 1); old = p->values[static_cast<std::size_t>(a[1])]; p->values.erase(p->values.begin() + static_cast<std::ptrdiff_t>(a[1])); } if (p->own) context.objects().release(old); return 0; });
     install("CFArrayRemoveAllValues", 1, [this](auto a) { const auto p = payload<ArrayPayload>(a[0], ObjectKind::array); if (!p->mutable_array) invalid("mutation of immutable array"); std::vector<std::uint64_t> old; { std::lock_guard lock(p->mutex); old.swap(p->values); } if (p->own) for (auto value : old) context.objects().release(value); return 0; });
-    install("CFDictionaryCreate", 6, [this, guest_values](auto a) { allocator(a[0]); const auto keys = guest_values(a[1], a[3]), values = guest_values(a[2], a[3]); const auto result = dictionary(true, callbacks(a[4], key_callbacks, 48), callbacks(a[5], value_callbacks, 40)); try { for (std::size_t at = 0; at < keys.size(); ++at) dictionary_set(result, keys[at], values[at]); } catch (...) { context.objects().release(result); throw; } freeze(result, false); return result; });
+    install("CFDictionaryCreate", 6, [this, guest_values](auto a) { allocator(a[0]); const auto keys = guest_values(a[1], a[3]), values = guest_values(a[2], a[3]); const bool copy_keys = copy_string_keys(a[4]); const auto result = dictionary(true, copy_keys || callbacks(a[4], key_callbacks, 48), callbacks(a[5], value_callbacks, 40), copy_keys); try { for (std::size_t at = 0; at < keys.size(); ++at) dictionary_set(result, keys[at], values[at]); } catch (...) { context.objects().release(result); throw; } freeze(result, false); return result; });
     install("CFDictionaryCreateCopy", 2, [this](auto a) { allocator(a[0]); payload<DictionaryPayload>(a[1], ObjectKind::dictionary); return copy(a[1]); });
-    install("CFDictionaryCreateMutable", 4, [this](auto a) { allocator(a[0]); count(a[1]); return dictionary(true, callbacks(a[2], key_callbacks, 48), callbacks(a[3], value_callbacks, 40)); });
+    install("CFDictionaryCreateMutable", 4, [this](auto a) { allocator(a[0]); count(a[1]); const bool copy_keys = copy_string_keys(a[2]); return dictionary(true, copy_keys || callbacks(a[2], key_callbacks, 48), callbacks(a[3], value_callbacks, 40), copy_keys); });
     install("CFDictionaryCreateMutableCopy", 3, [this](auto a) { allocator(a[0]); count(a[1]); payload<DictionaryPayload>(a[2], ObjectKind::dictionary); return copy(a[2], true); });
     install("CFDictionaryGetCount", 1, [this](auto a) { return dictionary_values(a[0]).size(); });
     install("CFDictionaryGetValue", 2, [this](auto a) { return dictionary_value(a[0], a[1]); });

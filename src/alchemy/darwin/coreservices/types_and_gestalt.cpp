@@ -29,7 +29,8 @@ public:
         {"com.compuserve.gif", "gif", "public.image"}, {"com.apple.icns", "icns", "public.image"},
         {"com.adobe.pdf", "pdf", "public.data"}, {"public.url", "", "public.data"},
         {"public.file-url", "", "public.url"}, {"public.zip-archive", "zip", "public.data"},
-        {"public.folder", "", "public.item"}, {"com.apple.application-bundle", "app", "public.item"},
+        {"public.folder", "", "public.item"}, {"public.volume", "", "public.folder"},
+        {"com.apple.application-bundle", "app", "public.item"},
         {"public.unix-executable", "", "public.data"}, {"public.python-script", "py", "public.text"}};
     static const UniformType* uniform_type(std::string_view identifier) {
         for (const auto& type : uniform_types) {
@@ -48,7 +49,8 @@ public:
                  {"_kUTTypeHTML", "public.html"}, {"_kUTTypeImage", "public.image"}, {"_kUTTypePDF", "com.adobe.pdf"},
                  {"_kUTTypePlainText", "public.plain-text"}, {"_kUTTypeTIFF", "public.tiff"},
                  {"_kUTTypeUTF16ExternalPlainText", "public.utf16-external-plain-text"},
-                 {"_kUTTypeUTF16PlainText", "public.utf16-plain-text"}, {"_kUTTypeUTF8PlainText", "public.utf8-plain-text"}})
+                 {"_kUTTypeUTF16PlainText", "public.utf16-plain-text"}, {"_kUTTypeUTF8PlainText", "public.utf8-plain-text"},
+                 {"_kUTTypeVolume", "public.volume"}})
             string_symbol(core_services, std::string(symbol), value);
         function(core_services, "_UTTypeConformsTo", [this](CpuState& s, GuestMemory&) {
             if (!s.x[0] || !s.x[1]) { s.x[0] = 0; return; }

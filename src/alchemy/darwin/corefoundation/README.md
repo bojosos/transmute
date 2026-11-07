@@ -51,6 +51,8 @@
   * the rest of CFSet: copy, membership, get, apply, replace, set, remove;
   * CFArray: count, first and last index of a value, binary search and sort;
   * CFDictionary: the count of a key or a value;
+    kCFCopyStringDictionaryKeyCallBacks (core_foundation.cpp), which stores
+    each new key as an immutable copy of the CFString (CFStringCreateCopy);
   * CFCharacterSet: constructors from a range, a string or a bitmap,
     inverted and copied sets, superset and plane tests, remove, intersect
     and invert.
@@ -77,8 +79,8 @@
   behind the host `time` and `locale` areas.
 - **Unsupported, failing explicitly:**
   * custom CFSet and CFBag callbacks;
-  * kCFCopyStringDictionaryKeyCallBacks and kCFCopyStringSetCallBacks are not
-    exported (collections retain their keys, and these would copy them);
+  * kCFCopyStringSetCallBacks is not exported (sets take only the standard
+    callbacks);
   * non-file URLs without the network provider;
   * managed preferences are read, never written: /Library/Managed
     Preferences/<user>/<domain>.plist and /Library/Managed
