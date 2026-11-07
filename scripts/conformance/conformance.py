@@ -13,12 +13,14 @@ and guest programs run only through alchemy-fx, cloaked and with loopback-only n
 import argparse
 import concurrent.futures
 import dataclasses
+import hashlib
 import importlib.util
 import json
 import os
 import pathlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -119,10 +121,16 @@ class Context:
         names bind at run time to Alchemy's providers (-undefined dynamic_lookup), as the repo's own
         fixtures do."""
         exe.parent.mkdir(parents=True, exist_ok=True)
+        # ld64.lld 19 ignores -stack_size ("not yet implemented"), so it is applied after linking.
+        stack = [f for f in flags if f.startswith("-Wl,-stack_size,")]
+        flags = [f for f in flags if f not in stack]
         cmd = [str(self.clang), "--target=arm64-apple-macos11", f"-isysroot{self.sysroot}", "-fuse-ld=lld",
                "-Wl,-undefined,dynamic_lookup", "-Wl,-fixup_chains", *[str(o) for o in objs],
                *[f"-l{lib}" for lib in libs if lib != "System"], *flags, "-o", str(exe)]
-        return run_tool(cmd)
+        err = run_tool(cmd)
+        if not err and stack:
+            set_main_stack_size(exe, int(stack[-1].rsplit(",", 1)[1], 0))
+        return err
 
     # ---- running -----------------------------------------------------------------------------
     def guest_command(self, test):
@@ -190,6 +198,62 @@ def parallel(fn, items, jobs=None):
     """Runs fn over items on a thread pool (compiles and links are separate processes)."""
     with concurrent.futures.ThreadPoolExecutor(jobs or os.cpu_count()) as pool:
         return list(pool.map(fn, items))
+
+
+LC_MAIN, LC_CODE_SIGNATURE = 0x80000028, 0x1D
+
+
+def set_main_stack_size(path, size):
+    """Writes LC_MAIN's stacksize (what ld64's -stack_size records) into an arm64 executable, then
+    rehashes the page it lives on in lld's ad-hoc code signature, so the program still runs on real
+    macOS. Every other page hash is verified unchanged first."""
+    data = bytearray(pathlib.Path(path).read_bytes())
+    if struct.unpack_from("<I", data, 0)[0] != 0xFEEDFACF:
+        raise SystemExit(f"{path}: not a 64-bit Mach-O")
+    ncmds, off, main, sig = struct.unpack_from("<I", data, 16)[0], 32, None, None
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, off)
+        if cmd == LC_MAIN:
+            main = off
+        elif cmd == LC_CODE_SIGNATURE:
+            sig = struct.unpack_from("<I", data, off + 8)[0]
+        off += cmdsize
+    if main is None:
+        raise SystemExit(f"{path}: no LC_MAIN")
+
+    def code_directory():
+        if sig is None:
+            return None
+        magic, _, count = struct.unpack_from(">III", data, sig)
+        for i in range(count):
+            slot, offset = struct.unpack_from(">II", data, sig + 12 + 8 * i)
+            if slot == 0:  # CSSLOT_CODEDIRECTORY
+                return sig + offset
+        return None
+
+    def page_hashes(cd):
+        hash_offset, _, _, ncode, code_limit = struct.unpack_from(">IIIII", data, cd + 16)
+        hash_size, hash_type, _, page_log2 = struct.unpack_from(">BBBB", data, cd + 36)
+        if hash_type != 2:  # SHA-256
+            raise SystemExit(f"{path}: unexpected code signature hash type {hash_type}")
+        page = 1 << page_log2
+        stored = [bytes(data[cd + hash_offset + i * hash_size: cd + hash_offset + (i + 1) * hash_size])
+                  for i in range(ncode)]
+        computed = [hashlib.sha256(data[i * page: min((i + 1) * page, code_limit)]).digest()[:hash_size]
+                    for i in range(ncode)]
+        return stored, computed, cd + hash_offset, hash_size, page
+
+    cd = code_directory()
+    if cd is not None:
+        stored, computed, _, _, _ = page_hashes(cd)
+        if stored != computed:
+            raise SystemExit(f"{path}: code signature does not verify before patching; not changed")
+    struct.pack_into("<Q", data, main + 16, size)
+    if cd is not None:
+        _, computed, hashes, hash_size, page = page_hashes(cd)
+        index = main // page
+        data[hashes + index * hash_size: hashes + (index + 1) * hash_size] = computed[index]
+    pathlib.Path(path).write_bytes(data)
 
 
 def run_tool(cmd):
