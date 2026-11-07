@@ -1,4 +1,10 @@
-// Win32 host backend, area "media_codec" (include/alchemy/host/media_codec.hpp): the encoder transforms
+// Win32 host backend, area "media_codec" (include/alchemy/host/media_codec.hpp). Decoders are the
+// synchronous software decoder transforms Media Foundation lists (hardware and asynchronous decoders want a
+// Direct3D device manager this layer does not give; Microsoft's decoders use the GPU themselves where they can):
+// H.264 and HEVC from Annex B (the length-prefixed samples converted, the parameter sets ahead of the first
+// sample and each keyframe) to NV12 or P010 read through IMF2DBuffer and cropped to the display aperture;
+// AAC from raw frames and the AudioSpecificConfig (in MF_MT_USER_DATA after the HEAACWAVEINFO fields) to 16-bit
+// PCM. Encoders are the encoder transforms
 // Media Foundation lists (MFTEnumEx: Microsoft's own and the graphics drivers' hardware encoders; nothing
 // is shipped with Alchemy). Each encoder owns a thread that does all its COM work (MTA). Synchronous
 // transforms are driven by ProcessInput / ProcessOutput; asynchronous (hardware) ones are unlocked and
@@ -122,7 +128,8 @@ GUID subtype_of(Codec codec) {
     return codec == Codec::h264 ? MFVideoFormat_H264 : codec == Codec::hevc ? MFVideoFormat_HEVC : MFAudioFormat_AAC;
 }
 
-// The audio encoders' delays (the frames their output starts with), by CLSID, as measure_delay measured them on
+// The audio decoders' held-back frames (counted by the host GUI test: what comes out at the drain of a decoded stream)
+// and the audio encoders' delays (the frames their output starts with), by CLSID, as measure_delay measured them on
 // Windows 11: noise encoded, decoded by the system's AAC decoder, the shift that best matches the input plus the
 // frames the decoder held back to hide its own delay (Microsoft's encoder: shift 0, one 1024-frame block held).
 // The host GUI test measures them again and fails if they differ. An encoder not listed has an unknown delay (0)
@@ -130,27 +137,33 @@ GUID subtype_of(Codec codec) {
 struct KnownDelay { const char* clsid; std::uint32_t frames; };
 constexpr KnownDelay known_delays[] = {
     {"{93AF0C51-2275-45D2-A35B-F2BA21CAED00}", 1024},   // Microsoft AAC Audio Encoder MFT (48 kHz stereo, Windows 11, 2026-11-06)
+    {"{32D186A7-218F-4C75-8876-DD77273A8999}", 1024},   // Microsoft AAC Audio Decoder MFT: frames it holds back until the drain (2026-11-07)
 };
 
-// The encoder transforms of `codec`, preferred first (Media Foundation's sort: hardware before software).
+// The encoder (or decoder) transforms of `codec`, preferred first (Media Foundation's sort: hardware before
+// software). Decoders: the synchronous software ones.
 struct Found {
     Com<IMFActivate> activate;
     Component component;
 };
-std::vector<Found> enumerate(Codec codec) {
+std::vector<Found> enumerate(Codec codec, Direction direction = Direction::encode) {
     std::vector<Found> out;
     if (!started()) return out;
-    const bool audio = codec == Codec::aac;
-    MFT_REGISTER_TYPE_INFO input{audio ? MFMediaType_Audio : MFMediaType_Video, audio ? MFAudioFormat_PCM : MFVideoFormat_NV12};
-    MFT_REGISTER_TYPE_INFO output{audio ? MFMediaType_Audio : MFMediaType_Video, subtype_of(codec)};
+    const bool audio = codec == Codec::aac, decode = direction == Direction::decode;
+    const MFT_REGISTER_TYPE_INFO raw{audio ? MFMediaType_Audio : MFMediaType_Video, audio ? MFAudioFormat_PCM : MFVideoFormat_NV12};
+    const MFT_REGISTER_TYPE_INFO coded{audio ? MFMediaType_Audio : MFMediaType_Video, subtype_of(codec)};
+    MFT_REGISTER_TYPE_INFO input = decode ? coded : raw, output = decode ? raw : coded;
     IMFActivate** list{};
     UINT32 count{};
-    const UINT32 flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
-    if (FAILED(MFTEnumEx(audio ? MFT_CATEGORY_AUDIO_ENCODER : MFT_CATEGORY_VIDEO_ENCODER, flags, &input, &output, &list, &count))) return out;
+    const UINT32 flags = decode ? MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER
+                                : MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+    const GUID category = decode ? (audio ? MFT_CATEGORY_AUDIO_DECODER : MFT_CATEGORY_VIDEO_DECODER) : (audio ? MFT_CATEGORY_AUDIO_ENCODER : MFT_CATEGORY_VIDEO_ENCODER);
+    if (FAILED(MFTEnumEx(category, flags, &input, &output, &list, &count))) return out;
     for (UINT32 i = 0; i < count; ++i) {
         Found f;
         f.activate.p = list[i];
         f.component.codec = codec;
+        f.component.direction = direction;
         wchar_t* name{};
         UINT32 length{};
         if (SUCCEEDED(list[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &length))) {
@@ -258,6 +271,29 @@ public:
     Com<IMFMediaEventGenerator> events;
     Com<ICodecAPI> codec_api;
     DWORD in_id{}, out_id{};
+    // On a stream change: the output subtypes to take, in preference (empty: the first offered), and who to tell.
+    std::vector<GUID> preferred_outputs;
+    std::function<void()> output_type_changed;
+    // Forgets what the transform holds (a seek).
+    void flush() {
+        if (transform) static_cast<void>(transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0));
+        need_input = 0;
+    }
+    // Sets the first output type offered of the preferred subtypes (or the first offered).
+    bool choose_output() {
+        for (const auto& wanted : preferred_outputs.empty() ? std::vector<GUID>{GUID_NULL} : preferred_outputs)
+            for (DWORD i = 0;; ++i) {
+                Com<IMFMediaType> type;
+                if (FAILED(transform->GetOutputAvailableType(out_id, i, type.put()))) break;
+                GUID subtype{};
+                if (wanted != GUID_NULL && (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) || subtype != wanted)) continue;
+                if (SUCCEEDED(transform->SetOutputType(out_id, type.p, 0))) {
+                    if (output_type_changed) output_type_changed();
+                    return true;
+                }
+            }
+        return false;
+    }
 
 private:
     // Every output the transform has now (synchronous transforms).
@@ -286,10 +322,8 @@ private:
         HRESULT hr = transform->ProcessOutput(0, 1, &data, &status);
         if (data.pEvents) data.pEvents->Release();
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            // A new output type (the encoder settled its format): take the first it offers.
-            Com<IMFMediaType> type;
-            if (FAILED(transform->GetOutputAvailableType(out_id, 0, type.put())) || FAILED(transform->SetOutputType(out_id, type.p, 0))) return E_FAIL;
-            return S_OK;
+            // A new output type (the encoder or decoder settled its format).
+            return choose_output() ? S_OK : E_FAIL;
         }
         if (SUCCEEDED(hr) && data.pSample) output(data.pSample);
         if (provides && data.pSample) data.pSample->Release();
@@ -782,82 +816,17 @@ Result<std::uint32_t> measure_delay(const AudioSettings& settings) {
     if (!drain(encoder, packets)) { close(encoder); return Error::io; }
     const auto config = configuration(encoder);
     close(encoder);
-    // Decoded by the host's AAC decoder.
-    Worker worker;
-    std::size_t held = 0;   // samples out before the drain: the rest are what the decoder held back
-    const auto decoded = worker.run([&]() -> Result<std::vector<std::int16_t>> {
-        MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Audio, MFAudioFormat_AAC}, out_info{MFMediaType_Audio, MFAudioFormat_PCM};
-        IMFActivate** list{};
-        UINT32 count{};
-        if (FAILED(MFTEnumEx(MFT_CATEGORY_AUDIO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, &in_info, &out_info, &list, &count)) || !count) {
-            if (list) CoTaskMemFree(list);
-            return Error::not_found;
-        }
-        Com<IMFActivate> activate;
-        activate.p = list[0];
-        for (UINT32 i = 1; i < count; ++i) list[i]->Release();
-        CoTaskMemFree(list);
-        Driver d;
-        if (d.start(activate.p) != Error::none) return Error::io;
-        Com<IMFMediaType> in;
-        if (FAILED(MFCreateMediaType(in.put()))) return Error::no_memory;
-        in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        in->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-        in->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
-        in->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
-        in->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
-        in->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
-        // MF_MT_USER_DATA: HEAACWAVEINFO after WAVEFORMATEX (payload type 0: raw; profile 0x29), then the AudioSpecificConfig.
-        std::vector<std::uint8_t> user(12, 0);
-        user[2] = 0x29;
-        user.insert(user.end(), config.begin(), config.end());
-        in->SetBlob(MF_MT_USER_DATA, user.data(), static_cast<UINT32>(user.size()));
-        if (FAILED(d.transform->SetInputType(d.in_id, in.p, 0))) return Error::invalid_argument;
-        bool typed = false;
-        for (DWORD i = 0; !typed; ++i) {
-            Com<IMFMediaType> offered;
-            if (FAILED(d.transform->GetOutputAvailableType(d.out_id, i, offered.put()))) break;
-            GUID subtype{};
-            UINT32 bits{};
-            if (SUCCEEDED(offered->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == MFAudioFormat_PCM &&
-                SUCCEEDED(offered->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits)) && bits == 16)
-                typed = SUCCEEDED(d.transform->SetOutputType(d.out_id, offered.p, 0));
-        }
-        if (!typed || d.begin() != Error::none) return Error::invalid_argument;
-        std::vector<std::int16_t> pcm;
-        const auto take = [&pcm](IMFSample* s) {
-            const auto bytes = bytes_of(s);
-            const auto at = pcm.size();
-            pcm.resize(at + bytes.size() / 2);
-            std::memcpy(pcm.data() + at, bytes.data(), bytes.size() / 2 * 2);
-        };
-        LONGLONG time = 0;
-        for (const auto& p : packets) {
-            Com<IMFMediaBuffer> buffer;
-            Com<IMFSample> sample;
-            if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(p.data.size()), buffer.put())) || FAILED(MFCreateSample(sample.put())) ||
-                FAILED(sample->AddBuffer(buffer.p)))
-                return Error::no_memory;
-            BYTE* data{};
-            if (FAILED(buffer->Lock(&data, nullptr, nullptr))) return Error::io;
-            std::memcpy(data, p.data.data(), p.data.size());
-            buffer->Unlock();
-            buffer->SetCurrentLength(static_cast<DWORD>(p.data.size()));
-            sample->SetSampleTime(time);
-            sample->SetSampleDuration(1024LL * 10000000 / rate);
-            time += 1024LL * 10000000 / rate;
-            if (d.feed(sample.p, take) != Error::none) return Error::io;
-        }
-        held = pcm.size();   // what came out before the drain
-        if (d.drain(take) != Error::none) return Error::io;
-        d.stop();
-        d.transform.reset();
-        static_cast<void>(activate->ShutdownObject());
-        return pcm;
-    });
-    if (!decoded) return decoded.error();
-    // The shift (in frames, up to 4096) at which the decoded first channel best matches the input's.
-    const auto& out = *decoded;
+    // Decoded by the host's AAC decoder; what it gives before the drain, and what it held back.
+    const auto opened_decoder = open_audio_decoder({Codec::aac, rate, channels, config, {}});
+    if (!opened_decoder) return opened_decoder.error();
+    auto* decoder = *opened_decoder;
+    std::vector<std::int16_t> out;
+    for (const auto& p : packets)
+        if (!decode(decoder, p.data, out)) { close(decoder); return Error::io; }
+    const std::size_t held = out.size();
+    const bool drained = static_cast<bool>(drain(decoder, out));
+    close(decoder);
+    if (!drained) return Error::io;
     const std::size_t span = rate / 2;
     std::uint32_t best = 0;
     double best_score = -1;
@@ -886,6 +855,325 @@ void close(AudioEncoder* encoder) noexcept {
         return 0;
     });
     delete encoder;
+}
+
+// ---- decoding ---------------------------------------------------------------------------------------
+
+Result<std::vector<Component>> decoders(Codec codec) {
+    Worker worker;
+    return worker.run([codec]() -> Result<std::vector<Component>> {
+        if (!started()) return Error::unsupported;
+        std::vector<Component> out;
+        for (auto& f : enumerate(codec, Direction::decode)) out.push_back(std::move(f.component));
+        return out;
+    });
+}
+
+namespace {
+// Annex B: a start code before each NAL unit of a length-prefixed sample.
+void append_annex_b(std::vector<std::uint8_t>& out, std::span<const std::uint8_t> sample) {
+    for (std::size_t at = 0; at + 4 <= sample.size();) {
+        const std::size_t n = (std::size_t(sample[at]) << 24) | (std::size_t(sample[at + 1]) << 16) | (std::size_t(sample[at + 2]) << 8) | sample[at + 3];
+        at += 4;
+        if (n > sample.size() - at) break;
+        out.insert(out.end(), {0, 0, 0, 1});
+        out.insert(out.end(), sample.begin() + static_cast<std::ptrdiff_t>(at), sample.begin() + static_cast<std::ptrdiff_t>(at + n));
+        at += n;
+    }
+}
+} // namespace
+
+class VideoDecoder {
+public:
+    Worker worker;
+    Com<IMFActivate> activate;
+    Driver driver;
+    Component component;
+    std::vector<std::uint8_t> sets;        // the parameter sets, Annex B
+    bool started{};
+    std::vector<DecodedPicture> ready;
+    // The output type: coded size, pitch (from the buffer), the displayed area, the sample size.
+    bool typed{};
+    UINT32 coded_width{}, coded_height{};
+    MFVideoArea area{};
+    std::uint32_t bit_depth{8};
+
+    void refresh() {
+        Com<IMFMediaType> type;
+        typed = SUCCEEDED(driver.transform->GetOutputCurrentType(driver.out_id, type.put()));
+        if (!typed) return;
+        MFGetAttributeSize(type.p, MF_MT_FRAME_SIZE, &coded_width, &coded_height);
+        GUID subtype{};
+        type->GetGUID(MF_MT_SUBTYPE, &subtype);
+        bit_depth = subtype == MFVideoFormat_P010 ? 10 : 8;
+        UINT32 size{};
+        if (FAILED(type->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, reinterpret_cast<UINT8*>(&area), sizeof area, &size)) || size != sizeof area) {
+            area = {};
+            area.Area = {static_cast<LONG>(coded_width), static_cast<LONG>(coded_height)};
+        }
+    }
+    void take(IMFSample* out) {
+        if (!typed) refresh();
+        DecodedPicture p;
+        LONGLONG time{}, duration{};
+        if (SUCCEEDED(out->GetSampleTime(&time))) p.pts = time;
+        if (SUCCEEDED(out->GetSampleDuration(&duration))) p.duration = duration;
+        p.bit_depth = bit_depth;
+        const std::size_t bytes = bit_depth > 8 ? 2 : 1;
+        const auto x = static_cast<std::size_t>(area.OffsetX.value), y = static_cast<std::size_t>(area.OffsetY.value);
+        p.width = static_cast<std::uint32_t>(area.Area.cx) & ~1u;
+        p.height = static_cast<std::uint32_t>(area.Area.cy) & ~1u;
+        Com<IMFMediaBuffer> buffer;
+        if (FAILED(out->GetBufferByIndex(0, buffer.put()))) return;
+        Com<IMF2DBuffer> planar;
+        BYTE* base{};
+        LONG pitch{};
+        DWORD length{};
+        const bool two_d = SUCCEEDED(buffer->QueryInterface(IID_PPV_ARGS(planar.put()))) && SUCCEEDED(planar->Lock2D(&base, &pitch));
+        if (!two_d) {
+            if (FAILED(buffer->Lock(&base, nullptr, &length))) return;
+            pitch = static_cast<LONG>(coded_width * bytes);
+        }
+        if (pitch > 0 && base) {
+            const std::size_t row = std::size_t(p.width) * bytes;
+            p.luma_stride = p.chroma_stride = row;
+            p.luma.resize(row * p.height);
+            p.chroma.resize(row * (p.height / 2));
+            const BYTE* chroma = base + std::size_t(pitch) * coded_height;
+            for (std::uint32_t r = 0; r < p.height; ++r) std::memcpy(p.luma.data() + r * row, base + (y + r) * pitch + x * bytes, row);
+            for (std::uint32_t r = 0; r < p.height / 2; ++r) std::memcpy(p.chroma.data() + r * row, chroma + (y / 2 + r) * pitch + (x & ~std::size_t{1}) * bytes, row);
+            ready.push_back(std::move(p));
+        }
+        if (two_d) planar->Unlock2D();
+        else buffer->Unlock();
+    }
+};
+
+Result<VideoDecoder*> open_video_decoder(const VideoDecoderSettings& settings) {
+    if (settings.codec == Codec::aac) return Error::invalid_argument;
+    auto decoder = std::make_unique<VideoDecoder>();
+    for (const auto& set : settings.parameter_sets) append_annex_b(decoder->sets, [&] {
+        std::vector<std::uint8_t> prefixed{static_cast<std::uint8_t>(set.size() >> 24), static_cast<std::uint8_t>(set.size() >> 16),
+                                           static_cast<std::uint8_t>(set.size() >> 8), static_cast<std::uint8_t>(set.size())};
+        prefixed.insert(prefixed.end(), set.begin(), set.end());
+        return prefixed;
+    }());
+    auto* d = decoder.get();
+    const auto opened = d->worker.run([d, &settings]() -> Error {
+        if (!started()) return Error::unsupported;
+        bool any = false;
+        for (auto& f : enumerate(settings.codec, Direction::decode)) {
+            if (!settings.component.empty() && f.component.id != settings.component) continue;
+            any = true;
+            Driver driver;
+            if (driver.start(f.activate.p) != Error::none) { static_cast<void>(f.activate->ShutdownObject()); continue; }
+            Com<IMFMediaType> in;
+            if (FAILED(MFCreateMediaType(in.put()))) return Error::no_memory;
+            in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+            in->SetGUID(MF_MT_SUBTYPE, subtype_of(settings.codec));
+            in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+            if (settings.width && settings.height) MFSetAttributeSize(in.p, MF_MT_FRAME_SIZE, settings.width, settings.height);
+            driver.preferred_outputs = {MFVideoFormat_NV12, MFVideoFormat_P010};
+            // A decoder that knows its output only from the stream offers none yet: the first stream change sets it.
+            const HRESULT typed = driver.transform->SetInputType(driver.in_id, in.p, 0);
+            if (SUCCEEDED(typed)) static_cast<void>(driver.choose_output());
+            if (FAILED(typed) || driver.begin() != Error::none) {
+                driver.stop();
+                driver.transform.reset();
+                static_cast<void>(f.activate->ShutdownObject());
+                continue;
+            }
+            d->driver = std::move(driver);
+            d->driver.output_type_changed = [d] { d->typed = false; };
+            d->activate = std::move(f.activate);
+            d->component = std::move(f.component);
+            return Error::none;
+        }
+        return any ? Error::invalid_argument : Error::not_found;
+    });
+    if (opened != Error::none) return opened;
+    return decoder.release();
+}
+
+const Component& component(const VideoDecoder* decoder) noexcept { return decoder->component; }
+
+Status decode(VideoDecoder* decoder, const Sample& sample, std::vector<DecodedPicture>& out) {
+    if (!decoder) return Error::invalid_argument;
+    const auto error = decoder->worker.run([&]() -> Error {
+        std::vector<std::uint8_t> bytes;
+        if (!decoder->started || sample.keyframe) bytes = decoder->sets;
+        append_annex_b(bytes, sample.data);
+        decoder->started = true;
+        Com<IMFMediaBuffer> buffer;
+        Com<IMFSample> s;
+        if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(bytes.size()), buffer.put())) || FAILED(MFCreateSample(s.put())) || FAILED(s->AddBuffer(buffer.p)))
+            return Error::no_memory;
+        BYTE* data{};
+        if (FAILED(buffer->Lock(&data, nullptr, nullptr))) return Error::io;
+        std::memcpy(data, bytes.data(), bytes.size());
+        buffer->Unlock();
+        buffer->SetCurrentLength(static_cast<DWORD>(bytes.size()));
+        s->SetSampleTime(sample.pts);
+        s->SetSampleDuration(sample.duration);
+        if (sample.keyframe) s->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
+        return decoder->driver.feed(s.p, [decoder](IMFSample* o) { decoder->take(o); });
+    });
+    for (auto& p : decoder->ready) out.push_back(std::move(p));
+    decoder->ready.clear();
+    if (error != Error::none) return error;
+    return {};
+}
+
+Status drain(VideoDecoder* decoder, std::vector<DecodedPicture>& out) {
+    if (!decoder) return Error::invalid_argument;
+    const auto error = decoder->worker.run([decoder]() -> Error { return decoder->driver.drain([decoder](IMFSample* o) { decoder->take(o); }); });
+    for (auto& p : decoder->ready) out.push_back(std::move(p));
+    decoder->ready.clear();
+    if (error != Error::none) return error;
+    return {};
+}
+
+void flush(VideoDecoder* decoder) noexcept {
+    if (!decoder) return;
+    decoder->worker.run([decoder] {
+        decoder->driver.flush();
+        decoder->started = false;
+        return 0;
+    });
+}
+
+void close(VideoDecoder* decoder) noexcept {
+    if (!decoder) return;
+    decoder->worker.run([decoder] {
+        decoder->driver.stop();
+        decoder->driver.transform.reset();
+        decoder->driver.codec_api.reset();
+        if (decoder->activate) static_cast<void>(decoder->activate->ShutdownObject());
+        decoder->activate.reset();
+        return 0;
+    });
+    delete decoder;
+}
+
+class AudioDecoder {
+public:
+    Worker worker;
+    Com<IMFActivate> activate;
+    Driver driver;
+    Component component;
+    std::uint32_t rate{};
+    std::vector<std::int16_t> ready;
+    void take(IMFSample* out) {
+        const auto bytes = bytes_of(out);
+        const auto at = ready.size();
+        ready.resize(at + bytes.size() / 2);
+        std::memcpy(ready.data() + at, bytes.data(), bytes.size() / 2 * 2);
+    }
+};
+
+Result<AudioDecoder*> open_audio_decoder(const AudioDecoderSettings& settings) {
+    if (settings.codec != Codec::aac || !settings.sample_rate || !settings.channels || settings.configuration.size() < 2) return Error::invalid_argument;
+    auto decoder = std::make_unique<AudioDecoder>();
+    decoder->rate = settings.sample_rate;
+    auto* d = decoder.get();
+    const auto opened = d->worker.run([d, &settings]() -> Error {
+        if (!started()) return Error::unsupported;
+        bool any = false;
+        for (auto& f : enumerate(Codec::aac, Direction::decode)) {
+            if (!settings.component.empty() && f.component.id != settings.component) continue;
+            any = true;
+            Driver driver;
+            if (driver.start(f.activate.p) != Error::none) { static_cast<void>(f.activate->ShutdownObject()); continue; }
+            Com<IMFMediaType> in;
+            if (FAILED(MFCreateMediaType(in.put()))) return Error::no_memory;
+            in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            driver.preferred_outputs = {MFAudioFormat_PCM};
+            in->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+            in->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, settings.sample_rate);
+            in->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, settings.channels);
+            in->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+            in->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+            // MF_MT_USER_DATA: HEAACWAVEINFO after WAVEFORMATEX (payload type 0: raw; profile 0x29), then the AudioSpecificConfig.
+            std::vector<std::uint8_t> user(12, 0);
+            user[2] = 0x29;
+            user.insert(user.end(), settings.configuration.begin(), settings.configuration.end());
+            in->SetBlob(MF_MT_USER_DATA, user.data(), static_cast<UINT32>(user.size()));
+            bool typed = SUCCEEDED(driver.transform->SetInputType(driver.in_id, in.p, 0));
+            for (DWORD i = 0; typed; ++i) {
+                Com<IMFMediaType> offered;
+                if (FAILED(driver.transform->GetOutputAvailableType(driver.out_id, i, offered.put()))) { typed = false; break; }
+                GUID subtype{};
+                UINT32 bits{};
+                if (SUCCEEDED(offered->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == MFAudioFormat_PCM &&
+                    SUCCEEDED(offered->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits)) && bits == 16 && SUCCEEDED(driver.transform->SetOutputType(driver.out_id, offered.p, 0)))
+                    break;
+            }
+            if (!typed || driver.begin() != Error::none) {
+                driver.stop();
+                driver.transform.reset();
+                static_cast<void>(f.activate->ShutdownObject());
+                continue;
+            }
+            d->driver = std::move(driver);
+            d->activate = std::move(f.activate);
+            d->component = std::move(f.component);
+            return Error::none;
+        }
+        return any ? Error::invalid_argument : Error::not_found;
+    });
+    if (opened != Error::none) return opened;
+    return decoder.release();
+}
+
+const Component& component(const AudioDecoder* decoder) noexcept { return decoder->component; }
+
+Status decode(AudioDecoder* decoder, std::span<const std::uint8_t> packet, std::vector<std::int16_t>& out) {
+    if (!decoder) return Error::invalid_argument;
+    const auto error = decoder->worker.run([&]() -> Error {
+        Com<IMFMediaBuffer> buffer;
+        Com<IMFSample> s;
+        if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(packet.size()), buffer.put())) || FAILED(MFCreateSample(s.put())) || FAILED(s->AddBuffer(buffer.p)))
+            return Error::no_memory;
+        BYTE* data{};
+        if (FAILED(buffer->Lock(&data, nullptr, nullptr))) return Error::io;
+        std::memcpy(data, packet.data(), packet.size());
+        buffer->Unlock();
+        buffer->SetCurrentLength(static_cast<DWORD>(packet.size()));
+        return decoder->driver.feed(s.p, [decoder](IMFSample* o) { decoder->take(o); });
+    });
+    out.insert(out.end(), decoder->ready.begin(), decoder->ready.end());
+    decoder->ready.clear();
+    if (error != Error::none) return error;
+    return {};
+}
+
+Status drain(AudioDecoder* decoder, std::vector<std::int16_t>& out) {
+    if (!decoder) return Error::invalid_argument;
+    const auto error = decoder->worker.run([decoder]() -> Error { return decoder->driver.drain([decoder](IMFSample* o) { decoder->take(o); }); });
+    out.insert(out.end(), decoder->ready.begin(), decoder->ready.end());
+    decoder->ready.clear();
+    if (error != Error::none) return error;
+    return {};
+}
+
+void flush(AudioDecoder* decoder) noexcept {
+    if (!decoder) return;
+    decoder->worker.run([decoder] {
+        decoder->driver.flush();
+        return 0;
+    });
+}
+
+void close(AudioDecoder* decoder) noexcept {
+    if (!decoder) return;
+    decoder->worker.run([decoder] {
+        decoder->driver.stop();
+        decoder->driver.transform.reset();
+        if (decoder->activate) static_cast<void>(decoder->activate->ShutdownObject());
+        decoder->activate.reset();
+        return 0;
+    });
+    delete decoder;
 }
 
 } // namespace alchemy::host::media_codec

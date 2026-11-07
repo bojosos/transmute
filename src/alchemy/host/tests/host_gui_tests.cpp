@@ -119,6 +119,34 @@ void media_codecs() {
             std::string(names(codec)) + ": the parameter sets");
         std::cout << names(codec) << " encoder: " << mc::component(encoder).name << (mc::component(encoder).hardware ? " (hardware)" : "") << '\n';
         const auto first_id = mc::component(encoder).id;
+        // Decoded back by the host's decoder: every picture, its time, and the last picture close to what went in.
+        const auto video_decoders = mc::decoders(codec);
+        require(static_cast<bool>(video_decoders), std::string(names(codec)) + " decoders are listed");
+        if (video_decoders->empty()) {
+            std::cout << "no " << names(codec) << " decoder on this host: skipped\n";
+        } else {
+            const auto opened_decoder = mc::open_video_decoder({codec, sets, 320, 240, {}});
+            require(static_cast<bool>(opened_decoder), std::string(names(codec)) + " decoder opens");
+            std::vector<mc::DecodedPicture> pictures;
+            for (const auto& s : samples) require(static_cast<bool>(mc::decode(*opened_decoder, s, pictures)), std::string(names(codec)) + " decodes");
+            require(static_cast<bool>(mc::drain(*opened_decoder, pictures)), std::string(names(codec)) + " decoder drains");
+            require(pictures.size() == 60, std::string(names(codec)) + ": a picture per sample, " + std::to_string(pictures.size()));
+            for (std::size_t i = 0; i < pictures.size(); ++i)
+                require(pictures[i].width == 320 && pictures[i].height == 240 && pictures[i].bit_depth == 8 && pictures[i].pts == static_cast<std::int64_t>(i) * 333333,
+                        std::string(names(codec)) + ": picture " + std::to_string(i) + " in presentation order, displayed size");
+            // The last picture against the last input (luma, PSNR).
+            double error = 0;
+            for (std::uint32_t y = 0; y < 240; ++y)
+                for (std::uint32_t x = 0; x < 320; ++x) {
+                    const double d = double(pictures.back().luma[y * pictures.back().luma_stride + x]) - luma[y * 320 + x];
+                    error += d * d;
+                }
+            const double psnr = 10 * std::log10(255.0 * 255.0 / std::max(error / (320.0 * 240.0), 1e-9));
+            require(psnr > 30, std::string(names(codec)) + ": the decoded picture matches, PSNR " + std::to_string(psnr));
+            std::cout << names(codec) << " decoder: " << mc::component(*opened_decoder).name << ", PSNR " << psnr << " dB\n";
+            mc::flush(*opened_decoder);
+            mc::close(*opened_decoder);
+        }
         mc::close(encoder);
         // Every other component by its id: ten pictures, a sample each (software encoders are synchronous
         // transforms, hardware ones asynchronous).
@@ -171,6 +199,25 @@ void media_codecs() {
     for (const auto& p : packets) require(!p.data.empty() && p.data.size() < 6144 * channels, "an AAC frame");
     std::cout << "AAC encoder: " << c.name << ", " << rate << " Hz, " << channels << " ch, " << mc::bit_rate(encoder) << " b/s, "
               << packets.size() << " packets\n";
+    // Decoded: a 1024-frame block per packet, those the decoder holds back (its recorded delay) at the drain.
+    const auto audio_decoders = mc::decoders(mc::Codec::aac);
+    require(static_cast<bool>(audio_decoders), "AAC decoders are listed");
+    if (audio_decoders->empty()) {
+        std::cout << "no AAC decoder on this host: skipped\n";
+    } else {
+        const auto opened_decoder = mc::open_audio_decoder({mc::Codec::aac, rate, channels, config, {}});
+        require(static_cast<bool>(opened_decoder), "an AAC decoder opens");
+        std::vector<std::int16_t> decoded;
+        for (const auto& p : packets) require(static_cast<bool>(mc::decode(*opened_decoder, p.data, decoded)), "AAC decodes");
+        const auto before = decoded.size() / channels;
+        require(static_cast<bool>(mc::drain(*opened_decoder, decoded)), "the AAC decoder drains");
+        const auto held = decoded.size() / channels - before;
+        std::cout << "AAC decoder " << mc::component(*opened_decoder).name << " " << mc::component(*opened_decoder).id << ": holds back " << held
+                  << ", recorded " << mc::component(*opened_decoder).delay << '\n';
+        require(decoded.size() / channels == packets.size() * 1024 && held == mc::component(*opened_decoder).delay,
+                "the AAC decoder gives a block a packet and holds back its recorded delay");
+        mc::close(*opened_decoder);
+    }
     mc::close(encoder);
     require(mc::open_audio({mc::Codec::aac, 7, channels}).error() == host::Error::invalid_argument, "a rate no encoder takes is refused");
     // Each AAC encoder's recorded delay is what decoding its output measures (the host's decoder; skipped without one).
