@@ -358,7 +358,9 @@ ProcessResult run_program(const std::filesystem::path& executable,
     struct FlushTranslations {
         transmute::ReferenceEngine& engine;
         ~FlushTranslations() {
+            trace_exit_phase("guest state released");
             try { flush_engine_translations(engine); } catch (...) {}
+            trace_exit_phase("translations persisted");
         }
     } flush_translations{engine};
     engine.set_instruction_limit(options.instruction_limit);
