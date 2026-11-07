@@ -1,6 +1,7 @@
 #include "alchemy/darwin/media/media_codecs.hpp"
 
 #include "alchemy/darwin/media/media_container.hpp"
+#include "alchemy/host/media_codec.hpp"
 
 #define MINIMP3_FLOAT_OUTPUT
 #include "minimp3.h"
@@ -399,6 +400,102 @@ private:
     std::uint64_t total_bytes_{}, total_frames_{};
 };
 
+// ---- AAC (the host's decoder) -----------------------------------------------------
+
+// The AudioSpecificConfig in an AAC configuration: an MP4 esds payload (version and flags, then the
+// ES_Descriptor), an ES_Descriptor (tag 3), or the AudioSpecificConfig itself.
+std::vector<std::uint8_t> aac_audio_specific_config(std::span<const std::uint8_t> c) {
+    std::size_t at = 0;
+    if (c.size() > 4 && c[0] == 0 && c[1] == 0 && c[2] == 0 && c[3] == 0 && c[4] == 0x03) at = 4;
+    else if (c.empty() || c[0] != 0x03) return {c.begin(), c.end()};
+    const auto descriptor = [&](std::uint8_t& tag, std::size_t& length) {
+        if (at >= c.size()) return false;
+        tag = c[at++];
+        length = 0;
+        for (int i = 0; i < 4 && at < c.size(); ++i) {
+            const auto b = c[at++];
+            length = (length << 7) | (b & 0x7f);
+            if (!(b & 0x80)) break;
+        }
+        return true;
+    };
+    std::uint8_t tag{};
+    std::size_t length{};
+    if (!descriptor(tag, length) || tag != 3 || at + 3 > c.size()) return {};
+    const auto flags = c[at + 2];
+    at += 3;
+    if (flags & 0x80) at += 2;
+    if (flags & 0x40) { if (at >= c.size()) return {}; at += 1 + c[at]; }
+    if (flags & 0x20) at += 2;
+    if (!descriptor(tag, length) || tag != 4 || at + 13 > c.size()) return {};
+    at += 13;   // objectTypeIndication, streamType, bufferSizeDB, maxBitrate, avgBitrate
+    if (!descriptor(tag, length) || tag != 5 || at + length > c.size()) return {};
+    return {c.begin() + static_cast<std::ptrdiff_t>(at), c.begin() + static_cast<std::ptrdiff_t>(at + length)};
+}
+
+bool aac_decoder_exists() {
+    static const bool exists = [] {
+        const auto listed = alchemy::host::media_codec::decoders(alchemy::host::media_codec::Codec::aac);
+        return listed && !listed->empty();
+    }();
+    return exists;
+}
+
+class AacDecoder final : public AudioDecoder {
+public:
+    ~AacDecoder() override { alchemy::host::media_codec::close(decoder_); }
+    bool open(std::span<const std::uint8_t> config, double container_rate, std::uint32_t container_channels, std::string& why) {
+        namespace mc = alchemy::host::media_codec;
+        const auto asc = aac_audio_specific_config(config);
+        if (asc.size() < 2) { why = "no AudioSpecificConfig in the AAC configuration"; return false; }
+        // The sampling frequency and channel configuration of the AudioSpecificConfig (ISO/IEC 14496-3, 1.6.2.1).
+        static constexpr std::uint32_t rates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
+        const std::uint32_t index = ((asc[0] & 7) << 1) | (asc[1] >> 7);
+        const std::uint32_t channel_config = (asc[1] >> 3) & 15;
+        rate = index < 13 ? rates[index] : container_rate;
+        channels = channel_config >= 1 && channel_config <= 6 ? channel_config : channel_config == 7 ? 8 : container_channels;
+        if (!(rate > 0) || !channels) { why = "the AAC configuration names no rate or channels"; return false; }
+        const auto opened = mc::open_audio_decoder({mc::Codec::aac, static_cast<std::uint32_t>(rate), channels, asc, {}});
+        if (!opened) {
+            why = opened.error() == alchemy::host::Error::not_found || opened.error() == alchemy::host::Error::unsupported ? "no AAC decoder exists on this host"
+                                                                                                                         : "the host's AAC decoder refused the stream";
+            return false;
+        }
+        decoder_ = *opened;
+        held_ = mc::component(decoder_).delay;
+        max_frames = 1024;
+        return true;
+    }
+
+    bool decode(std::span<const std::uint8_t> packet, std::vector<float>& out, std::string& why) override {
+        // The block the host's decoder holds back (its own delay) comes first, as silence: the first block a
+        // decoder that hides nothing gives is that delay, and the container's priming trims it.
+        std::vector<std::int16_t> pcm;
+        if (fresh_) {
+            pcm.assign(std::size_t(held_) * channels, 0);
+            fresh_ = false;
+        }
+        if (!alchemy::host::media_codec::decode(decoder_, packet, pcm)) {
+            why = "the host's AAC decoder rejected the packet";
+            return false;
+        }
+        const auto base = out.size();
+        out.resize(base + pcm.size());
+        for (std::size_t i = 0; i < pcm.size(); ++i) out[base + i] = float(pcm[i]) / 32768.0f;
+        return true;
+    }
+
+    void reset() override {
+        alchemy::host::media_codec::flush(decoder_);
+        fresh_ = true;
+    }
+
+private:
+    alchemy::host::media_codec::AudioDecoder* decoder_{};
+    std::uint32_t held_{};
+    bool fresh_{true};
+};
+
 // ---- video: copies of the decoders' pictures ----------------------------------
 
 void copy_plane(VideoFrame::Plane& plane, const std::uint8_t* data, std::ptrdiff_t stride, std::uint32_t width,
@@ -630,6 +727,7 @@ std::unique_ptr<VideoDecoder> make_video_decoder(std::uint32_t codec, std::span<
 }
 
 bool audio_decoder_available(std::uint32_t codec) {
+    if (codec == fourcc("mp4a") || codec == fourcc("aac ")) return aac_decoder_exists();
     return codec == fourcc(".mp1") || codec == fourcc(".mp2") || codec == fourcc(".mp3") || codec == fourcc("opus") ||
            codec == fourcc("flac") || codec == fourcc("alac");
 }
@@ -664,6 +762,11 @@ std::unique_ptr<AudioDecoder> make_audio_decoder(std::uint32_t codec, double rat
     if (codec == fourcc("alac")) {
         auto d = std::make_unique<AlacDecoder>();
         if (!d->open(config, rate, why)) return nullptr;
+        return d;
+    }
+    if (codec == fourcc("mp4a") || codec == fourcc("aac ")) {
+        auto d = std::make_unique<AacDecoder>();
+        if (!d->open(config, rate, channels, why)) return nullptr;
         return d;
     }
     why = "no decoder for this audio format";

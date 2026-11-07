@@ -74,6 +74,7 @@ struct IsoTrack {
     std::vector<std::uint32_t> sync;
     bool has_sync{};
     std::int64_t edit_media_time{}, edit_empty{};   // edit list: media start, and an initial empty edit (movie timescale)
+    std::int64_t edit_duration{};                   // the presented duration of the media edit (movie timescale)
     Trex trex;
 };
 
@@ -198,6 +199,7 @@ void parse_trak(std::span<const std::uint8_t> trak, std::uint32_t movie_timescal
                 const std::int64_t media = version == 1 ? static_cast<std::int64_t>(be64(e + 8)) : static_cast<std::int32_t>(be32(e + 4));
                 if (media == -1) { t.edit_empty += duration; continue; }
                 t.edit_media_time = media;
+                t.edit_duration = duration;
                 break;
             }
         }
@@ -437,6 +439,7 @@ bool parse_iso(const ReadAt& read, std::uint64_t size, Movie& out, std::string& 
         // The edit list: the media start (audio priming, composition offsets), an initial empty edit.
         t.track.start = t.edit_media_time - (movie_timescale ? t.edit_empty * t.track.timescale / movie_timescale : 0);
         if (t.track.kind == Track::Kind::audio && t.edit_media_time > 0 && !t.track.priming) t.track.priming = static_cast<std::uint32_t>(t.edit_media_time);
+        if (t.edit_duration > 0 && movie_timescale) t.track.presented = t.edit_duration * t.track.timescale / movie_timescale;
         if (!t.track.duration && !t.track.samples.empty()) t.track.duration = t.track.samples.back().dts + t.track.samples.back().duration;
         out.tracks.push_back(std::move(t.track));
     }

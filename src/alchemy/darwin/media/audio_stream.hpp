@@ -24,7 +24,7 @@ public:
     // The stream of the file's first audio track. Null with an OSStatus in `status`:
     // kAudioFileUnsupportedFileTypeError ('typ?') when no container parser recognises the file or
     // it has no audio, kAudioFileUnsupportedDataFormatError ('fmt?') when its codec has no
-    // decoder here (AAC, ...), naming the codec in `why`.
+    // decoder here (AAC on a host without one, ...), naming the codec in `why`.
     static std::unique_ptr<Stream> open(container::ReadAt read, std::uint64_t size, std::int32_t& status, std::string& why);
 
     [[nodiscard]] const container::Movie& movie() const { return movie_; }

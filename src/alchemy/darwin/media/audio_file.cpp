@@ -27,7 +27,8 @@
 //   MP4 and Matroska audio in those codecs) open read-only: AudioFile describes and reads their packets (data format,
 //   packet counts and sizes, magic cookie, packet table, ReadPacketData with descriptions;
 //   ReadBytes answers kAudioFileOperationNotSupportedError), and ExtAudioFile reads them decoded.
-//   Other compressed data (AAC, ...) answers kAudioFileUnsupportedDataFormatError.
+//   AAC reads through the host's decoder where there is one. Other compressed data answers
+//   kAudioFileUnsupportedDataFormatError.
 // - Writing Apple Lossless and AAC: CAF and MPEG-4 (M4A) files of 'alac' or 'aac ' packets (packet_file.hpp;
 //   AAC through the host's encoder, aac_encoder.hpp, its delay as the priming).
 //   AudioFileWritePackets appends packets with their descriptions (from the next packet only), the

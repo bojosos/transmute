@@ -816,7 +816,14 @@ void audio_converter(Fixture& f) {
     require(f.status(at, "_AudioConverterDispose", {converter}) == 0, "AudioConverterDispose");
     const auto aac = asbd(44100, 0, 0, 2, 0);
     f.engine.write32(aac + 8, 0x61616320);   // 'aac '
-    require(static_cast<std::uint32_t>(f.status(at, "_AudioConverterNew", {aac, out_format, converter_out})) == 0x666D743F, "no AAC decoder");
+    // AAC decodes through the host's decoder where there is one; without one the converter refuses with 'fmt?'.
+    const auto aac_status = static_cast<std::uint32_t>(f.status(at, "_AudioConverterNew", {aac, out_format, converter_out}));
+    if (alchemy::gui::completion_kit::media::codecs::audio_decoder_available(alchemy::gui::completion_kit::media::container::fourcc("aac "))) {
+        require(aac_status == 0, "an AAC decoding converter");
+        require(f.status(at, "_AudioConverterDispose", {f.engine.read64(converter_out)}) == 0, "AudioConverterDispose (AAC)");
+    } else {
+        require(aac_status == 0x666D743F, "no AAC decoder");
+    }
     // AudioFormatGetProperty: FormatInfo completes a description; layouts count their channels.
     const auto partial = asbd(48000, 4 | 8, 0, 2, 24);
     f.engine.write32(partial + 16, 0);
@@ -3032,6 +3039,163 @@ void aac_encoding(Fixture& f) {
     std::filesystem::remove_all(directory, ignored);
 }
 
+// AAC both ways through the host's own encoder and decoder (skipped where either is missing): M4A and CAF files written
+// by ExtAudioFile read back through ExtAudioFile, AVAudioFile and AVAssetReader with every frame and in place (a 440 Hz
+// tone: any offset ruins the match), and their packets through AudioConverter with the codec's delay leading.
+void aac_decoding(Fixture& f) {
+    namespace aac = alchemy::gui::completion_kit::media::aac;
+    namespace codecs = alchemy::gui::completion_kit::media::codecs;
+    aac::set_backend({});   // the host's encoder
+    struct Restore { ~Restore() { fake_aac::install(); } } restore;
+    if (!aac::available() || !codecs::audio_decoder_available(alchemy::gui::completion_kit::media::container::fourcc("mp4a"))) {
+        std::cout << "[qlab media] no AAC encoder or decoder on this host: aac_decoding skipped" << std::endl;
+        return;
+    }
+    const auto directory = std::filesystem::temp_directory_path() / "alchemy_qlab_media_aac_decoding";
+    std::filesystem::create_directories(directory);
+    constexpr std::uint32_t frames = 48000, channels = 2;
+    std::vector<float> source(std::size_t(frames) * channels);
+    for (std::uint32_t i = 0; i < frames; ++i)
+        for (std::uint32_t c = 0; c < channels; ++c) source[std::size_t(i) * channels + c] = 0.4f * std::sin(2 * 3.14159265f * 440.0f * float(i) / 48000.0f + float(c));
+    std::vector<std::uint8_t> source_bytes(source.size() * 4);
+    std::memcpy(source_bytes.data(), source.data(), source_bytes.size());
+    const auto pcm = f.block(source_bytes.size());
+    f.memory().write_bytes(pcm, source_bytes);
+    const auto float32 = f.block(40), aac_format = f.block(40), out = f.block(8), size = f.block(8);
+    const auto write_asbd = [&](Address at_, std::uint32_t id, std::uint32_t flags, std::uint32_t bytes_per_packet, std::uint32_t per_packet,
+                                std::uint32_t bytes_per_frame, std::uint32_t bits) {
+        f.engine.write64(at_, std::bit_cast<std::uint64_t>(48000.0));
+        f.engine.write32(at_ + 8, id); f.engine.write32(at_ + 12, flags); f.engine.write32(at_ + 16, bytes_per_packet); f.engine.write32(at_ + 20, per_packet);
+        f.engine.write32(at_ + 24, bytes_per_frame); f.engine.write32(at_ + 28, channels); f.engine.write32(at_ + 32, bits); f.engine.write32(at_ + 36, 0);
+    };
+    write_asbd(float32, 0x6c70636d, 1 | 8, 8, 1, 8, 32);
+    write_asbd(aac_format, 0x61616320, 2, 0, 1024, 0, 0);
+    // The SNR of `got` (interleaved floats from frame 0) against the source over frames [2048, 46000).
+    const auto snr = [&](const std::vector<float>& got) {
+        double signal = 0, noise = 0;
+        for (std::size_t i = 2048 * channels; i < 46000 * channels && i < got.size(); ++i) {
+            signal += double(source[i]) * source[i];
+            noise += (double(got[i]) - source[i]) * (double(got[i]) - source[i]);
+        }
+        return 10 * std::log10(signal / std::max(noise, 1e-12));
+    };
+    const auto read_floats = [&](Address samples, std::size_t count) {
+        std::vector<float> v(count);
+        std::vector<std::uint8_t> bytes(count * 4);
+        f.memory().read_bytes(samples, bytes);
+        std::memcpy(v.data(), bytes.data(), bytes.size());
+        return v;
+    };
+    for (const auto& [type, name] : {std::pair{0x6d346166u, "tone.m4a"}, std::pair{0x63616666u, "tone.caf"}}) {
+        const auto path = directory / name;
+        const auto url = f.cf.file_url(alchemy::guest_path_string(path), false);
+        require(f.status(at, "_ExtAudioFileCreateWithURL", {url, type, aac_format, 0, 1, out}) == 0, std::string(name) + ": created");
+        auto ext = f.engine.read64(out);
+        require(f.status(at, "_ExtAudioFileSetProperty", {ext, 0x63666d74, 40, float32}) == 0, std::string(name) + ": a float client");
+        const auto list = f.block(24);
+        f.engine.write32(list, 1); f.engine.write32(list + 8, channels); f.engine.write32(list + 12, frames * 8); f.engine.write64(list + 16, pcm);
+        require(f.status(at, "_ExtAudioFileWrite", {ext, frames, list}) == 0 && f.status(at, "_ExtAudioFileDispose", {ext}) == 0, std::string(name) + ": written");
+        // ExtAudioFile: every frame, in place.
+        require(f.status(at, "_ExtAudioFileOpenURL", {url, out}) == 0, std::string(name) + ": opens for reading");
+        ext = f.engine.read64(out);
+        require(f.status(at, "_ExtAudioFileSetProperty", {ext, 0x63666d74, 40, float32}) == 0, std::string(name) + ": a float client for reading");
+        f.engine.write32(size, 8);
+        const auto length_status = f.status(at, "_ExtAudioFileGetProperty", {ext, 0x2366726d, size, out});
+        require(length_status == 0 && f.engine.read64(out) == frames,
+                std::string(name) + ": FileLengthFrames (status " + std::to_string(length_status) + ") " + std::to_string(f.engine.read64(out)));
+        const auto back = f.block(std::size_t(frames + 100) * 8), back_list = f.block(24), got = f.block(4);
+        f.engine.write32(back_list, 1); f.engine.write32(back_list + 8, channels); f.engine.write32(back_list + 12, (frames + 100) * 8); f.engine.write64(back_list + 16, back);
+        f.engine.write32(got, frames + 100);
+        require(f.status(at, "_ExtAudioFileRead", {ext, got, back_list}) == 0 && f.engine.read32(got) == frames, std::string(name) + ": every frame read");
+        const auto quality = snr(read_floats(back, std::size_t(frames) * channels));
+        require(quality > 20, std::string(name) + ": in place, SNR " + std::to_string(quality));
+        // A seek lands on the same frames.
+        require(f.status(at, "_ExtAudioFileSeek", {ext, 30000}) == 0, std::string(name) + ": seek");
+        f.engine.write32(got, 1000);
+        f.engine.write32(back_list + 12, 1000 * 8);
+        require(f.status(at, "_ExtAudioFileRead", {ext, got, back_list}) == 0 && f.engine.read32(got) == 1000, std::string(name) + ": a read after a seek");
+        const auto after = read_floats(back, 1000 * channels);
+        double e = 0, s = 0;
+        for (std::size_t i = 0; i < after.size(); ++i) {
+            e += (double(after[i]) - source[30000 * channels + i]) * (double(after[i]) - source[30000 * channels + i]);
+            s += double(source[30000 * channels + i]) * source[30000 * channels + i];
+        }
+        require(10 * std::log10(s / std::max(e, 1e-12)) > 20, std::string(name) + ": the frames after the seek are in place");
+        require(f.status(at, "_ExtAudioFileDispose", {ext}) == 0, std::string(name) + ": dispose");
+        // AVAudioFile and AVAssetReader: the same length.
+        const auto error = f.block(8);
+        const auto av_file = f.send(f.send(f.cls("AVAudioFile"), "alloc"), "initForReading:error:", {url, error});
+        require(av_file && static_cast<std::uint32_t>(f.send(av_file, "length")) == frames, std::string(name) + ": AVAudioFile length");
+        f.send(av_file, "release");
+        const auto asset = f.send(f.cls("AVURLAsset"), "URLAssetWithURL:options:", {url, 0});
+        const auto tracks = f.cf.array_values(f.send(asset, "tracksWithMediaType:", {f.cf.string("soun")}));
+        require(tracks.size() == 1 && (f.send(asset, "isReadable") & 0xff) == 1, std::string(name) + ": a readable AAC track");
+        const auto reader = f.send(f.cls("AVAssetReader"), "assetReaderWithAsset:error:", {asset, error});
+        const auto output = f.send(f.cls("AVAssetReaderAudioMixOutput"), "assetReaderAudioMixOutputWithAudioTracks:audioSettings:", {f.cf.array(std::vector<Address>{tracks[0]}), 0});
+        static_cast<void>(f.send(reader, "addOutput:", {output}));
+        require((f.send(reader, "startReading") & 0xff) == 1, std::string(name) + ": AVAssetReader starts");
+        std::uint64_t read_frames = 0;
+        while (const auto sample = f.send(output, "copyNextSampleBuffer")) {
+            read_frames += f.call(cm, "_CMSampleBufferGetNumSamples", {sample});
+            static_cast<void>(f.call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFRelease", {sample}));
+        }
+        require(read_frames == frames, std::string(name) + ": AVAssetReader reads every frame: " + std::to_string(read_frames));
+    }
+
+    // AudioConverter: the M4A's packets with its cookie; the codec's delay leads the output.
+    const auto url = f.cf.file_url(alchemy::guest_path_string(directory / "tone.m4a"), false);
+    require(f.status(at, "_AudioFileOpenURL", {url, 1, 0, out}) == 0, "AudioFileOpenURL on the AAC M4A");
+    const auto file = f.engine.read64(out);
+    const auto cookie = f.block(256);
+    f.engine.write32(size, 256);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x6d676963, size, cookie}) == 0, "its magic cookie");
+    const auto cookie_size = f.engine.read32(size);
+    f.engine.write32(size, 16);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x706e666f, size, out}) == 0, "its packet table info");
+    const auto priming = f.engine.read32(out + 8);
+    f.engine.write32(size, 8);
+    require(f.status(at, "_AudioFileGetProperty", {file, 0x70636e74, size, out}) == 0, "its packet count");
+    const auto packet_count = static_cast<std::uint32_t>(f.engine.read64(out));
+    const auto room = f.block(4), count = f.block(4), descriptions = f.block(16ULL * packet_count), packets = f.block(768ULL * channels * packet_count);
+    f.engine.write32(room, 768 * channels * packet_count);
+    f.engine.write32(count, packet_count);
+    require(f.status(at, "_AudioFileReadPacketData", {file, 0, room, descriptions, 0, count, packets}) == 0 && f.engine.read32(count) == packet_count, "the packets");
+    require(f.status(at, "_AudioConverterNew", {aac_format, float32, out}) == 0, "AudioConverterNew from AAC");
+    const auto converter = f.engine.read64(out);
+    require(f.status(at, "_AudioConverterSetProperty", {converter, 0x646d6763, cookie_size, cookie}) == 0, "the decompression cookie");
+    static Address aac_packets{}, aac_descriptions{}, aac_one{};
+    static std::uint32_t aac_next{}, aac_total{};
+    aac_packets = packets;
+    aac_descriptions = descriptions;
+    aac_one = f.block(16);
+    aac_next = 0;
+    aac_total = packet_count;
+    const auto input = f.process.install_function("_alchemy_test_aac_packets", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        if (aac_next >= aac_total) { m.write32(s.x[1], 0); s.x[0] = 0; return; }
+        const auto entry = aac_descriptions + 16ULL * aac_next++;
+        const auto bytes = m.read32(entry + 12);
+        m.write32(s.x[1], 1);
+        m.write32(s.x[2] + 8 + 4, bytes);
+        m.write64(s.x[2] + 8 + 8, aac_packets + m.read64(entry));
+        m.write64(aac_one, 0); m.write32(aac_one + 8, 0); m.write32(aac_one + 12, bytes);
+        if (s.x[3]) m.write64(s.x[3], aac_one);
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const std::uint32_t total = packet_count * 1024;
+    const auto decoded = f.block(std::size_t(total) * 8), list = f.block(24), got = f.block(4);
+    f.engine.write32(list, 1); f.engine.write32(list + 8, channels); f.engine.write32(list + 12, total * 8); f.engine.write64(list + 16, decoded);
+    f.engine.write32(got, total);
+    require(f.status(at, "_AudioConverterFillComplexBuffer", {converter, input, 0, got, list, 0}) == 0 && f.engine.read32(got) == total,
+            "a block of 1024 frames a packet: " + std::to_string(f.engine.read32(got)));
+    const auto all = read_floats(decoded, std::size_t(total) * channels);
+    const std::vector<float> trimmed(all.begin() + std::ptrdiff_t(priming) * channels, all.end());
+    const auto quality = snr(trimmed);
+    require(quality > 20, "AudioConverter: the source after the priming (" + std::to_string(priming) + "), SNR " + std::to_string(quality));
+    require(f.status(at, "_AudioConverterDispose", {converter}) == 0 && f.status(at, "_AudioFileClose", {file}) == 0, "dispose and close");
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 // AudioFileStream: minimp3's MP3 vector fed in pieces gives the packets AudioFile reads from the file; a seek
 // to a parsed packet is exact; a WAVE stream gives its frames without descriptions.
 void audio_file_stream(Fixture& f) {
@@ -3164,8 +3328,14 @@ void audio_file_stream(Fixture& f) {
     require(queue_returned == 1, "the played buffer comes back");
     require(f.status(at, "_AudioQueueStop", {queue, 1}) == 0 && f.status(at, "_AudioQueueDispose", {queue, 1}) == 0, "queue stopped and disposed");
     f.engine.write32(stream_format + 8, 0x61616320);   // 'aac '
-    require(f.status(at, "_AudioQueueNewOutput", {stream_format, queue_callback, 0, 0, 0, 0, queue_out}) == static_cast<std::int32_t>(0x666d743f),
-            "AAC has no decoder ('fmt?')");
+    // AAC plays through the host's decoder where there is one; without one the queue refuses it with 'fmt?'.
+    const auto aac_queue = f.status(at, "_AudioQueueNewOutput", {stream_format, queue_callback, 0, 0, 0, 0, queue_out});
+    if (alchemy::gui::completion_kit::media::codecs::audio_decoder_available(alchemy::gui::completion_kit::media::container::fourcc("aac "))) {
+        require(aac_queue == 0, "an AAC queue");
+        require(f.status(at, "_AudioQueueDispose", {f.engine.read64(queue_out), 1}) == 0, "the AAC queue disposed");
+    } else {
+        require(aac_queue == static_cast<std::int32_t>(0x666d743f), "AAC has no decoder ('fmt?')");
+    }
     require(f.status(at, "_AudioFileStreamSetProperty", {stream, 0x64666d74, 40, value}) == static_cast<std::int32_t>(0x6e6f7065),
             "properties cannot be set ('nope')");
     require(f.status(at, "_AudioFileStreamClose", {stream}) == 0, "AudioFileStreamClose");
@@ -4000,6 +4170,7 @@ int main() {
         {"alac_files", alac_files},
         {"alac_writing", alac_writing},
         {"aac_encoding", aac_encoding},
+        {"aac_decoding", aac_decoding},
         {"audio_file_stream", audio_file_stream},
         {"video_toolbox", video_toolbox},
         {"av_video", av_video},

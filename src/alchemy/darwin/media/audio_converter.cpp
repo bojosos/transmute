@@ -41,6 +41,9 @@
 // gives whole packets with their descriptions (a short last packet names its frames) while the
 // output buffer has room for the largest one; kAudioConverterCompressionMagicCookie describes the
 // packets so far.
+// AAC input decodes through the host system's decoder where it has one (the ES descriptor cookie, or
+// without one an AudioSpecificConfig of the input format); each packet gives 1024 frames, the codec's
+// own delay as the first block.
 // AAC ('aac ', AAC-LC: mFormatFlags 0 or kMPEG4Object_AAC_LC) encodes through the host system's AAC
 // encoder (aac_encoder.hpp) when it takes the output's rate and channels (0: the input's); otherwise, and
 // on a host without one, AudioConverterNew answers kAudioConverterErr_FormatNotSupported. Packets are
@@ -110,6 +113,7 @@ bool ensure_aac(Converter& c) {
 std::uint32_t aac_max_packet(const Converter& c) { return 768 * c.out.channels; }
 
 bool decodable(std::uint32_t format_id) {
+    if (format_id == four("aac ")) return codecs::audio_decoder_available(format_id);   // the host's AAC decoder
     return format_id == four(".mp1") || format_id == four(".mp2") || format_id == four(".mp3") || format_id == four("opus") ||
            format_id == four("flac") || format_id == four("alac");
 }
@@ -117,6 +121,15 @@ bool decodable(std::uint32_t format_id) {
 // The decoder's configuration: the cookie, or for FLAC and ALAC without one a STREAMINFO or an
 // ALACSpecificConfig from the format.
 std::vector<std::uint8_t> decoder_config(const Converter& c) {
+    if (c.cookie.empty() && c.codec == four("aac ")) {
+        // The AudioSpecificConfig of the format: AAC-LC (or its flags' object type), the rate's index, the channels.
+        static constexpr std::uint32_t rates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
+        const auto found = std::find(std::begin(rates), std::end(rates), static_cast<std::uint32_t>(c.codec_rate));
+        if (found == std::end(rates) || c.codec_channels > 8 || c.codec_channels == 7) return {};
+        const auto index = static_cast<std::uint32_t>(found - std::begin(rates));
+        const std::uint32_t object = c.codec_flags ? c.codec_flags : 2, channel_config = c.codec_channels == 8 ? 7 : c.codec_channels;
+        return {static_cast<std::uint8_t>((object << 3) | (index >> 1)), static_cast<std::uint8_t>(((index & 1) << 7) | (channel_config << 3))};
+    }
     if (!c.cookie.empty() || (c.codec != four("flac") && c.codec != four("alac"))) return c.cookie;
     const std::uint32_t bits = c.codec_flags == 2 ? 20 : c.codec_flags == 3 ? 24 : c.codec_flags == 4 ? 32 : 16;
     if (c.codec == four("alac")) {
@@ -538,7 +551,8 @@ std::int32_t Converters::get_property(Converter& c, std::uint32_t id, std::vecto
             // The largest packet: an MPEG frame (free format at 640 kb/s), six Opus frames, or a
             // FLAC or ALAC block stored verbatim.
             const auto block = c.codec_frames_per_packet ? c.codec_frames_per_packet : c.codec == four("alac") ? 4096U : 65535U;
-            u32(c.codec == four("opus") ? 6 * 1275 + 7 : c.codec == four("flac") || c.codec == four("alac") ? block * c.codec_channels * 4 + 64 : 2881);
+            u32(c.codec == four("opus") ? 6 * 1275 + 7 : c.codec == four("flac") || c.codec == four("alac") ? block * c.codec_channels * 4 + 64
+                : c.codec == four("aac ") ? 768 * c.codec_channels : 2881);
             return 0;
         }
         u32(c.in.frame_bytes() * (c.in.non_interleaved ? c.in.channels : 1));

@@ -8,7 +8,7 @@
 // subformat; RF64 is not read), AIFF and AIFC ('NONE', 'sowt', 'twos',
 // 'fl32', 'fl64', 'in24', 'in32', and their little-endian forms) and CAF
 // ('lpcm' only). Compressed data is audio_stream.hpp's (MP3, FLAC, Opus, ALAC);
-// other formats (AAC, IMA, ...) are reported as an unsupported data format.
+// AAC through the host's decoder; other formats (IMA, ...) are reported as an unsupported data format.
 //
 // Conversion: any linear PCM description (integer of 8-32 bits in any
 // container, signed or unsigned, either endianness, high- or low-aligned;

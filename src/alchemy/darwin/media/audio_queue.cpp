@@ -57,7 +57,9 @@
 // AudioQueueOfflineRender returns, on the calling thread, so the usual render loop can refill and
 // stop the queue as it goes.
 //
-// Unavailable: other compressed formats (AAC, ...: kAudioFormatUnsupportedDataFormatError),
+// AAC plays where the host has a decoder (its ES descriptor cookie, or none for the format's own
+// AudioSpecificConfig).
+// Unavailable: other compressed formats (kAudioFormatUnsupportedDataFormatError),
 // compressed input (there is no encoder) and processing taps.
 namespace alchemy::gui::completion_kit::media {
 namespace {
@@ -68,7 +70,8 @@ constexpr std::string_view audio_toolbox = "/System/Library/Frameworks/AudioTool
 constexpr std::string_view core_foundation = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
 constexpr std::uint32_t four(const char (&code)[5]) { return af::four(code); }
 bool compressed_playable(std::uint32_t id) {
-    return id == four(".mp1") || id == four(".mp2") || id == four(".mp3") || id == four("flac") || id == four("opus") || id == four("alac");
+    return id == four(".mp1") || id == four(".mp2") || id == four(".mp3") || id == four("flac") || id == four("opus") || id == four("alac") ||
+           (id == four("aac ") && codecs::audio_decoder_available(id));
 }
 
 namespace error {

@@ -78,11 +78,15 @@ std::unique_ptr<Stream> Stream::open(container::ReadAt read, std::uint64_t size,
     const auto exact = s->movie_.brand == fourcc("mp3 ") || s->movie_.brand == fourcc("fLaC") || s->movie_.brand == fourcc("caff");
     s->playable_ = exact && t.duration > 0 ? std::min<std::uint64_t>(static_cast<std::uint64_t>(std::llround(t.duration * scale)), at - s->priming_)
                                            : at - s->priming_;
+    // An MP4 edit list presents a span of the media: the frames after the priming that it covers.
+    if (t.presented > 0) s->playable_ = std::min<std::uint64_t>(s->playable_, static_cast<std::uint64_t>(std::llround(t.presented * scale)));
     s->remainder_ = static_cast<std::uint32_t>(at - s->priming_ - s->playable_);
     // Decoding restarts this far before a seek target: MP3's bit reservoir and filter bank need a
     // few frames; after Opus's 80 ms minimum CELT's predicted band energies are still about a
     // decibel off, so it gets half a second, after which they match a decode from the start.
-    s->preroll_ = t.codec == fourcc("opus") ? 24000 : t.codec == fourcc("flac") || t.codec == fourcc("alac") ? 0 : 4 * 1152;
+    // AAC: the previous packets' overlap (two packets, the first of which decodes to the codec's delay).
+    const bool aac = t.codec == fourcc("mp4a") || t.codec == fourcc("aac ");
+    s->preroll_ = t.codec == fourcc("opus") ? 24000 : t.codec == fourcc("flac") || t.codec == fourcc("alac") ? 0 : aac ? 2048 : 4 * 1152;
     s->buffer_start_ = 0;
     s->next_ = 0;
     status = 0;
@@ -107,6 +111,9 @@ std::vector<std::uint8_t> Stream::asbd() const {
             const auto layer = (first[1] >> 1) & 3;
             format = layer == 3 ? fourcc(".mp1") : layer == 2 ? fourcc(".mp2") : fourcc(".mp3");
         }
+    } else if (format == fourcc("mp4a") || format == fourcc("aac ")) {
+        format = fourcc("aac ");   // kAudioFormatMPEG4AAC, AAC-LC (kMPEG4Object_AAC_LC)
+        flags = 2;
     } else if (format == fourcc("flac") || format == fourcc("alac")) {
         // kAppleLosslessFormatFlag_16/20/24/32BitSourceData
         flags = decoder_->bits <= 16 ? 1 : decoder_->bits <= 20 ? 2 : decoder_->bits <= 24 ? 3 : 4;

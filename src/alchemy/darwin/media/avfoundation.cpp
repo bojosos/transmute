@@ -382,7 +382,7 @@ struct Av {
         }
         return *s;
     }
-    // An AudioStreamBasicDescription of a stored audio track Alchemy cannot decode (AAC, ...).
+    // An AudioStreamBasicDescription of a stored audio track Alchemy cannot decode.
     static std::vector<std::uint8_t> compressed_asbd(const container::Track& t) {
         std::vector<std::uint8_t> out(40, 0);
         const double rate = t.sample_rate;

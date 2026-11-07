@@ -4,14 +4,19 @@
 // (cmake/darwin/media_codecs.cmake): packets in, as the containers in media_container.hpp cut
 // them, and decoded media out.
 // - Audio: MPEG audio layers I-III ('.mp1', '.mp2', '.mp3', minimp3), Opus ('opus', libopus,
-//   always 48 kHz), FLAC ('flac', libFLAC) and Apple Lossless ('alac', Apple's open-source ALAC
-//   codec: 16, 20, 24 or 32 bits, 1-8 channels), as interleaved 32-bit float PCM.
+//   always 48 kHz), FLAC ('flac', libFLAC), Apple Lossless ('alac', Apple's open-source ALAC
+//   codec: 16, 20, 24 or 32 bits, 1-8 channels) and AAC ('mp4a' or 'aac ', through the host
+//   system's decoder, host/media_codec.hpp, where it has one), as interleaved 32-bit float PCM.
+//   An AAC packet decodes to its 1024 frames as a decoder that hides nothing would give them (the
+//   first block after an open or reset is the codec's own delay), so the container's priming trims
+//   it exactly.
 // The codec configuration is what the container stores: dOps or OpusHead for Opus; dfLa, a
 // Matroska "fLaC" CodecPrivate or a bare STREAMINFO block for FLAC; for ALAC the
 // ALACSpecificConfig (the magic cookie, optionally after 'frma' and 'alac' atoms, or the MP4
-// 'alac' box payload with its version and flags); nothing for MPEG audio.
-// Codecs without a decoder here (AAC, H.264, HEVC, ProRes, ...) are not supported; callers answer
-// their own "format not supported" error for them.
+// 'alac' box payload with its version and flags); for AAC an MP4 esds payload, an ES descriptor (CAF's
+// and AudioConverter's magic cookie) or the AudioSpecificConfig itself (Matroska); nothing for MPEG
+// audio. Codecs without a decoder here (H.264, HEVC, ProRes, AAC on a host without one, ...) are not
+// supported; callers answer their own "format not supported" error for them.
 // - Audio encoding: ALAC only (AudioEncoder below).
 
 #include <cstdint>

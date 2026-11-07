@@ -53,6 +53,7 @@ struct Track {
     double sample_rate{};
     std::uint32_t channels{}, bits{};
     std::uint32_t priming{};           // samples to drop at the start (Opus pre-skip, MP4 edit/priming)
+    std::int64_t presented{};          // MP4: the edit list's presented duration, in the timescale (0: no edit)
     std::vector<std::uint8_t> config;  // codec configuration (the box payload or CodecPrivate)
     std::vector<Sample> samples;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;   // (offset, size) runs of scattered samples
