@@ -28,7 +28,8 @@ public:
     virtual ~Encoder() = default;
     // Appends the frames ready so far (raw AAC, one 1024-frame packet each). False on an encoder failure.
     virtual bool encode(std::span<const std::int16_t> samples, std::vector<std::vector<std::uint8_t>>& out) = 0;
-    // No more samples: the rest.
+    // No more samples: the rest, so that the packets cover the priming and every frame given
+    // (ceil((priming + frames) / 1024) packets in all).
     virtual bool drain(std::vector<std::vector<std::uint8_t>>& out) = 0;
     [[nodiscard]] virtual std::vector<std::uint8_t> audio_specific_config() const = 0;
     [[nodiscard]] virtual std::uint32_t bit_rate() const = 0;

@@ -14,7 +14,7 @@ namespace mc = alchemy::host::media_codec;
 
 class HostEncoder final : public Encoder {
 public:
-    explicit HostEncoder(mc::AudioEncoder* encoder) : encoder_(encoder) {}
+    HostEncoder(mc::AudioEncoder* encoder, std::uint32_t channels) : encoder_(encoder), channels_(channels) {}
     ~HostEncoder() override { mc::close(encoder_); }
     bool encode(std::span<const std::int16_t> samples, std::vector<std::vector<std::uint8_t>>& out) override {
         std::vector<mc::Sample> packets;
@@ -23,6 +23,10 @@ public:
         return ok;
     }
     bool drain(std::vector<std::vector<std::uint8_t>>& out) override {
+        // The host's encoder drains to the packets that cover its input, but the last input frames only decode
+        // with the packet after them (the delay): `priming` frames of silence first make the packets cover
+        // the priming and every frame.
+        if (!encode(std::vector<std::int16_t>(std::size_t(priming()) * channels_), out)) return false;
         std::vector<mc::Sample> packets;
         const bool ok = static_cast<bool>(mc::drain(encoder_, packets));
         for (auto& p : packets) out.push_back(std::move(p.data));
@@ -35,6 +39,7 @@ public:
 
 private:
     mc::AudioEncoder* encoder_;
+    std::uint32_t channels_;
 };
 
 std::mutex mutex;
@@ -110,7 +115,7 @@ std::unique_ptr<Encoder> open(std::uint32_t rate, std::uint32_t channels, std::u
                                                                                                     : "no AAC encoder takes this sample rate and channel count";
         return nullptr;
     }
-    return std::make_unique<HostEncoder>(*opened);
+    return std::make_unique<HostEncoder>(*opened, channels);
 }
 
 std::vector<std::uint8_t> es_descriptor(std::span<const std::uint8_t> audio_specific_config, std::uint32_t average_bit_rate,
