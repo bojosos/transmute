@@ -344,6 +344,91 @@ FX_TEST(cache_crash_torn_tail_and_live_journal) {
     cache_detail::testing_reset(false);
 }
 
+// The cache directory is shared by every program: a process's exit folds in
+// another module's journals only while that module's main file is small. A
+// large one waits for the module's own processes.
+FX_TEST(cache_exit_leaves_large_merges_to_the_modules_processes) {
+    TempDir dir(L"foreign");
+    FakeModule big(8u << 20, 31), tool(1u << 20, 32);
+    std::vector<Planned> regions;   // ~32 KiB of code each: a main file over kSettledRewriteBytes
+    for (std::uint32_t i = 0; i < 300; ++i) regions.push_back({0x1000 + i * 0x6000, 2000});
+    start_session(dir, false);
+    cache_module_loaded(big.info(kImageHash, L"big.dylib"));
+    store_all(big, regions, 7);
+    cache_flush();   // no main file yet: merged
+    const std::wstring main = cache_file_path(big.info(kImageHash, L"big.dylib"));
+    const std::size_t main_size = read_file(main).size();
+    FX_REQUIRE(main_size > cache_detail::kSettledRewriteBytes);
+
+    // Eight processes of the big module each leave a journal (crashed: no flush).
+    const auto extra = plan(8, 0x5000, 0x6000);
+    for (const Planned& p : extra) {
+        start_session(dir, false);
+        cache_module_loaded(big.info(kImageHash, L"big.dylib"));
+        cache_store(make_region(big.base(), p.rva, p.instructions, 8));
+        cache_flush_journals();
+    }
+    cache_detail::testing_reset(false);
+    FX_REQUIRE(dir.files(L"big.dylib.*.fxj").size() == extra.size());
+
+    // A small tool's exit leaves them; its own journal is merged.
+    start_session(dir, false);
+    cache_module_loaded(tool.info(kImageHash + 1, L"tool"));
+    store_all(tool, plan(10, 0x1000, 0x1000), 9);
+    cache_flush();
+    FX_CHECK_EQ(cache_stats().merges, std::uint64_t{1});
+    FX_CHECK_EQ(dir.files(L"big.dylib.*.fxj").size(), extra.size());
+    FX_CHECK_EQ(dir.files(L"tool.*.fxj").size(), std::size_t{0});
+
+    // A process of the big module merges them (eight journals).
+    start_session(dir, false);
+    cache_module_loaded(big.info(kImageHash, L"big.dylib"));
+    TranslatedRegion got;
+    FX_CHECK(cache_lookup(big.base() + regions[0].rva, got));   // its files are open
+    cache_flush();
+    FX_CHECK_EQ(cache_stats().merges, std::uint64_t{1});
+    FX_CHECK_EQ(dir.files(L"big.dylib.*.fxj").size(), std::size_t{0});
+    FX_CHECK_EQ(check_all(big, extra, 8), static_cast<unsigned>(entry_count(big, extra, 8)));
+    cache_detail::testing_reset(false);
+}
+
+// fx builds of another cache format share the directory: their files are
+// neither merged nor dropped (their records do not decode here, so a merge
+// would keep only the journals' records).
+FX_TEST(cache_merge_leaves_other_format_files_alone) {
+    TempDir dir(L"otherformat");
+    FakeModule a(4u << 20, 33);
+    start_session(dir);
+    cache_module_loaded(a.info(kImageHash));
+    store_all(a, plan(50, 0x1000, 0x4000), 4);
+    cache_flush();
+    start_session(dir, false);
+    cache_module_loaded(a.info(kImageHash));
+    store_all(a, plan(20, 0x3000, 0x4000), 4);
+    cache_flush();   // small journal next to the main file: kept
+    cache_detail::testing_reset(false);   // unmaps the main file
+    std::vector<std::wstring> paths;
+    for (const wchar_t* pattern : {L"*.fxc", L"*.fxj"})
+        for (const std::wstring& name : dir.files(pattern)) paths.push_back(dir.path() + L"\\" + name);
+    FX_REQUIRE(paths.size() == 2);
+    std::vector<std::vector<std::uint8_t>> saved;
+    for (const std::wstring& path : paths) {
+        std::vector<std::uint8_t> bytes = read_file(path);
+        fmt::FileHeader h;
+        std::memcpy(&h, bytes.data(), sizeof(h));
+        h.key.format_version += 1;
+        h.header_checksum = fmt::header_checksum(h);
+        std::memcpy(bytes.data(), &h, sizeof(h));
+        write_file(path, bytes);
+        saved.push_back(bytes);
+    }
+    start_session(dir);   // merges everything it may
+    cache_flush();
+    FX_CHECK_EQ(cache_stats().merges, std::uint64_t{0});
+    for (std::size_t i = 0; i < paths.size(); ++i) FX_CHECK(read_file(paths[i]) == saved[i]);
+    cache_detail::testing_reset(false);
+}
+
 FX_TEST(cache_rejects_corrupt_truncated_and_mismatched_files) {
     TempDir dir(L"corrupt");
     FakeModule a(4u << 20, 7);

@@ -261,20 +261,30 @@ bool merge_stem(const std::wstring& stem, bool force, bool settled) {
     };
     if (journals.empty()) return finish(false, false);
 
+    // Files of another cache format (an older or newer fx build sharing the
+    // directory) are left alone: their records do not decode here, and the
+    // merge would replace their main file with the journals' records only.
+    const auto keep_all = [&] {
+        for (Journal& j : journals) j.valid = true;
+        return finish(false, false);
+    };
     pe::MappedFile main_file;
     FileHeader main_header{};
     cachefmt::MainView main;
-    bool has_main = main_file.open(stem + L".fxc", false) &&
-                    cachefmt::parse_header(main_file.data(), main_file.size(), cachefmt::kKindMain, main_header) &&
-                    hex16(main_header.key.digest()) == digest &&
+    const bool main_parsed =
+        main_file.open(stem + L".fxc", false) &&
+        cachefmt::parse_header(main_file.data(), main_file.size(), cachefmt::kKindMain, main_header);
+    if (main_parsed && main_header.key.format_version != cachefmt::kFormatVersion) return keep_all();
+    bool has_main = main_parsed && hex16(main_header.key.digest()) == digest &&
                     cachefmt::open_main(main_file.data(), main_file.size(), main_header.key, main);
     Key key = main_header.key;
     bool have_key = has_main;
     std::uint64_t journal_bytes = 0;
     for (Journal& j : journals) {
         FileHeader h;
-        j.valid = j.view && cachefmt::parse_header(j.view, j.size, cachefmt::kKindJournal, h) &&
-                  hex16(h.key.digest()) == digest && (!have_key || h.key == key);
+        const bool parsed = j.view && cachefmt::parse_header(j.view, j.size, cachefmt::kKindJournal, h);
+        if (parsed && h.key.format_version != cachefmt::kFormatVersion) return keep_all();
+        j.valid = parsed && hex16(h.key.digest()) == digest && (!have_key || h.key == key);
         if (j.valid && !have_key) {
             key = h.key;
             have_key = true;

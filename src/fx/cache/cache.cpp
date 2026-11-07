@@ -1335,7 +1335,24 @@ void cache_flush() {
         const std::uint64_t size = entry.size;
         p.bytes += size > sizeof(cachefmt::FileHeader) ? size - sizeof(cachefmt::FileHeader) : 0;
     }
+    // Stems of the modules this process opened (one writer each).
+    std::unordered_set<std::wstring> used;
+    {
+        Shared lock(g.writers_lock);
+        for (const auto& [stem, writer] : g.writers) used.insert(stem);
+    }
     for (const auto& [stem, pending] : stems) {
+        // Journals of a module this process never opened, next to a main file
+        // over kSettledRewriteBytes, wait for that module's own processes: the
+        // cache directory is shared, and a short tool's exit must not rewrite
+        // another program's hundreds of MB (a 50 KB hello's exit rewrote a
+        // browser's 343 MB main file once that had 8 journals).
+        if (!force && used.count(stem) == 0) {
+            std::uint64_t main_size = 0;
+            if (file::attributes(stem + L".fxc", &main_size, nullptr) &&
+                main_size > cache_detail::kSettledRewriteBytes)
+                continue;
+        }
         // merge_stem keeps journals below its threshold; checking that here
         // from the listing (one attribute query instead of locking, opening
         // and mapping every journal and the main file) keeps a warm exit
