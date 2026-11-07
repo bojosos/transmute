@@ -22,7 +22,9 @@
  *  11. as GoogleUpdater's launcher: a child passes the bootstrap port to a
  *      grandchild as its TASK_BOOTSTRAP_PORT and exits at once; the grandchild
  *      outlives it, checks in a name through that special port (read only
- *      after its parent is gone), and this process finds the name.
+ *      after its parent is gone), and this process finds the name;
+ *  12. as GoogleUpdater's named locks: this process checks in a name and
+ *      destroys the receive right; a child's check-in of that name succeeds.
  * No SDK headers. Prints "fx mach cross: ok"; else exits with the step. */
 typedef unsigned mach_port_t;
 typedef int kern_return_t;
@@ -33,6 +35,7 @@ extern mach_port_t bootstrap_port;
 extern char** environ;
 extern kern_return_t mach_port_allocate(mach_port_t, int, mach_port_t*);
 extern kern_return_t mach_port_insert_right(mach_port_t, mach_port_t, mach_port_t, int);
+extern kern_return_t mach_port_mod_refs(mach_port_t, mach_port_t, int, int);
 extern kern_return_t mach_port_request_notification(mach_port_t, mach_port_t, int, unsigned, mach_port_t, int, mach_port_t*);
 extern kern_return_t mach_msg(void*, int, unsigned, unsigned, mach_port_t, unsigned, mach_port_t);
 extern kern_return_t bootstrap_check_in(mach_port_t, const char*, mach_port_t*);
@@ -214,8 +217,15 @@ static int server(const char* name) {
     return 0;
 }
 
+/* 12. The lock taker: checks in a name its parent checked in and released. */
+static int relock(const char* name) {
+    mach_port_t port = 0;
+    return bootstrap_check_in(bootstrap_port, name, &port) == 0 && port ? 0 : 2;
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && same(argv[1], "child")) return child(argv[2]);
+    if (argc == 3 && same(argv[1], "relock")) return relock(argv[2]);
     if (argc == 3 && same(argv[1], "launcher")) return launcher(argv[0], argv[2]);
     if (argc == 3 && same(argv[1], "server")) return server(argv[2]);
     const mach_port_t task = mach_task_self_;
@@ -306,6 +316,16 @@ int main(int argc, char** argv) {
     for (int attempt = 0; attempt < 400 && bootstrap_look_up(bootstrap_port, orphan, &found) != 0; ++attempt) usleep(25000);
     if (!found) return 47;
     if (send_value(found, 600, 11) != 0) return 48;
+    /* 12. A released check-in is free for another process (it answered 1103). */
+    char lock[64] = "org.alchemy.test.lock.";
+    decimal(lock + 22, (unsigned)getpid());
+    mach_port_t held = 0;
+    if (bootstrap_check_in(bootstrap_port, lock, &held) != 0 || !held) return 49;
+    if (mach_port_mod_refs(task, held, RIGHT_RECEIVE, -1) != 0) return 50;
+    char* relock_arguments[] = {argv[0], "relock", lock, 0};
+    pid_t relock_pid = 0;
+    if (posix_spawn(&relock_pid, argv[0], 0, 0, relock_arguments, environ) != 0 || relock_pid <= 0) return 51;
+    if (waitpid(relock_pid, &status, 0) != relock_pid || status != 0) return 52;
     puts("fx mach cross: ok");
     return 0;
 }

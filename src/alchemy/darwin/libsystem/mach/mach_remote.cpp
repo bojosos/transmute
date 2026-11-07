@@ -542,7 +542,13 @@ Transport::Payload MachIpc::request(std::uint32_t from, std::uint32_t type, Read
         const auto service = in.text();
         const auto key = read_key(in);
         Lock lock(mutex_);
-        if (registry_.contains(service)) { answer.u32(bootstrap_service_active); break; }
+        // As for a check-in here: a name whose receive right this process held and destroyed
+        // is free again (GoogleUpdater's named locks are check-ins released that way).
+        if (const auto found = registry_.find(service); found != registry_.end()) {
+            const auto& [host, other] = found->second;
+            const auto hosted = hosted_.find(other);
+            if (host != self_ || (hosted != hosted_.end() && hosted->second->active)) { answer.u32(bootstrap_service_active); break; }
+        }
         registry_[service] = {from, key};
         transport_->watch(from);
         answer.u32(0);

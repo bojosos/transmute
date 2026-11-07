@@ -6,6 +6,7 @@ unsigned mach_task_self_ = 0;
 unsigned bootstrap_port = 0;
 LINK_ONLY(mach_port_allocate)
 LINK_ONLY(mach_port_insert_right)
+LINK_ONLY(mach_port_mod_refs)
 LINK_ONLY(mach_port_request_notification)
 LINK_ONLY(mach_msg)
 LINK_ONLY(bootstrap_check_in)
