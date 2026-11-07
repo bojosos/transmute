@@ -910,13 +910,44 @@ void Machsys::install_libc() {
     // proc_pidinfo(pid, flavor, arg, buffer, size) for this process and any
     // other process of the Alchemy tree (process_tree.hpp): PROC_PIDTASKINFO
     // (memory and CPU times of the host process), PROC_PIDTBSDINFO and
-    // PROC_PIDT_SHORTBSDINFO (identity). Other flavors are not available.
+    // PROC_PIDT_SHORTBSDINFO (identity), and PROC_PIDLISTFDS for the calling process. Other flavors
+    // are not available.
     raw(libsystem, "_proc_pidinfo", [this](CpuState& s, GuestMemory& m) {
         const auto pid = static_cast<std::uint32_t>(s.x[0]);
         const auto flavor = static_cast<std::int32_t>(s.x[1]);
         const auto buffer = s.x[3];
         const auto size = static_cast<std::int32_t>(s.x[4]);
         const auto own = static_cast<std::uint32_t>(call(libsystem, "_getpid", {}));
+        if (flavor == 1) {
+            // PROC_PIDLISTFDS: struct proc_fdinfo {int32 proc_fd; uint32 proc_fdtype} for each open descriptor,
+            // found through fcntl(F_GETFD) and typed by fstat (PROX_FDTYPE_VNODE 1, SOCKET 2, PIPE 6), so a
+            // forked child before exec sees its own table (glib's g_spawn closes descriptors from it). A NULL
+            // buffer answers the size needed, with room for 20 more, as xnu. Other processes' descriptors are
+            // not visible here.
+            if (pid != own) { set_errno(e_notsup); s.x[0] = 0; return; }
+            const auto limit = std::min<std::uint64_t>(call(libsystem, "_getdtablesize", {}) & 0xffffffffU, 1U << 16);
+            const auto stat_buffer = process.allocate_guest(144);
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> found;
+            for (std::uint64_t fd = 0; fd < limit; ++fd) {
+                if ((call(libsystem, "_fcntl", {fd, 1}) & 0xffffffffU) == 0xffffffffU) continue;   // F_GETFD: not open
+                std::uint32_t type = 1;
+                if ((call(libsystem, "_fstat", {fd, stat_buffer}) & 0xffffffffU) == 0) {
+                    const auto format = m.read32(stat_buffer + 4) & 0170000;   // st_mode, the low half
+                    type = format == 0140000 ? 2 : format == 0010000 ? 6 : 1;
+                }
+                found.emplace_back(static_cast<std::uint32_t>(fd), type);
+            }
+            process.release_guest(stat_buffer);
+            if (!buffer) { s.x[0] = (found.size() + 20) * 8; return; }
+            if (size < 0) { set_errno(e_inval); s.x[0] = 0; return; }
+            const auto fits = std::min<std::size_t>(found.size(), static_cast<std::size_t>(size) / 8);
+            for (std::size_t at = 0; at < fits; ++at) {
+                m.write32(buffer + at * 8, found[at].first);
+                m.write32(buffer + at * 8 + 4, found[at].second);
+            }
+            s.x[0] = fits * 8;
+            return;
+        }
         auto record = process_tree::lookup(pid);
         if (!record && pid == own) { record = process_tree::Record{}; record->pid = own; record->host_pid = host::process::current_pid(); }
         if (!record) { set_errno(e_srch); s.x[0] = 0; return; }

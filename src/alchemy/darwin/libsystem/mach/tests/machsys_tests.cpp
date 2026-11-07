@@ -190,6 +190,24 @@ void libc(Fixture& f) {
     require(f.call(sys, "_getsectdatafromheader_64", {header, f.text("__TEXT"), f.text("__text"), size}) == 0x100004000 &&
             f.engine.read64(size) == 0x1234, "getsectdatafromheader_64");
     require(f.call(sys, "_getsectbynamefromheader_64", {header, f.text("__DATA"), f.text("__data")}) == 0, "missing section");
+    // proc_pidinfo PROC_PIDLISTFDS: {fd, type} for each open descriptor; a pipe's are PROX_FDTYPE_PIPE (6).
+    {
+        const auto ends = f.block(8);
+        require(f.call(sys, "_pipe", {ends}) == 0, "pipe");
+        const auto pid = f.call(sys, "_getpid");
+        const auto needed = f.call(sys, "_proc_pidinfo", {pid, 1, 0, 0, 0});
+        require(needed >= 22 * 8 && needed % 8 == 0, "PROC_PIDLISTFDS size with a NULL buffer");
+        const auto list = f.block(needed);
+        const auto written = f.call(sys, "_proc_pidinfo", {pid, 1, 0, list, needed});
+        unsigned pipes = 0;
+        for (std::uint64_t at = 0; at + 8 <= written; at += 8) {
+            const auto fd = f.engine.read32(list + at);
+            if ((fd == f.engine.read32(ends) || fd == f.engine.read32(ends + 4)) && f.engine.read32(list + at + 4) == 6) ++pipes;
+        }
+        require(written % 8 == 0 && pipes == 2, "PROC_PIDLISTFDS lists the pipe");
+        static_cast<void>(f.call(sys, "_close", {f.engine.read32(ends)}));
+        static_cast<void>(f.call(sys, "_close", {f.engine.read32(ends + 4)}));
+    }
     // <mach-o/arch.h>: NXArchInfo {name, cputype, cpusubtype, byteorder, description}.
     const auto local = f.call(sys, "_NXGetLocalArchInfo");
     require(local && f.read_text(f.engine.read64(local)) == "arm64" && f.engine.read32(local + 8) == 0x0100000c &&

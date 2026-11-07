@@ -55,7 +55,7 @@ bool fork_child_may_call(std::string_view symbol) {
         "_setregid", "_initgroups", "_getenv", "_setenv", "_unsetenv",
         "_signal", "_sigaction", "_sigprocmask", "_pthread_sigmask", "_sigemptyset", "_sigfillset", "_sigaddset",
         "_sigdelset", "_sigismember",
-        "_execve", "_execv", "_execvp", "_execvP", "_execl", "_execle", "_execlp", "_fork", "_vfork",
+        "_execve", "_execv", "_execvp", "_execvP", "_execl", "_execle", "_execlp", "_fork", "_vfork", "_proc_pidinfo",
         "_posix_spawn", "_posix_spawnp", "_waitpid", "_wait4", "_wait", "_kill",
         "_nanosleep", "_usleep", "_sleep", "_clock_gettime", "_gettimeofday", "_time",
         "_printf", "_fprintf", "_vprintf", "_vfprintf", "_puts", "_fputs", "_fputc", "_putchar", "_fwrite", "_fflush",
