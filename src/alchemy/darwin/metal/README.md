@@ -68,8 +68,11 @@ resolve and stops explicitly with Min/Max. setPurgeableState: answers the
 previous state; contents are never discarded (Volatile and Empty allow that).
 
 **Unsupported (explicit failures):** for example MTKTextureLoader without a
-device; precompiled libraries (`newLibraryWithData:`, metallib files: Apple
-GPU code); IOSurface-backed textures other than plane 0 of a chunky surface
+device; precompiled libraries (`newLibraryWithData:`, `newLibraryWithURL:`/
+`newLibraryWithFile:`, `newDefaultLibrary`/`newDefaultLibraryWithBundle:`'s
+default.metallib) without the AIR translator DLL (with it they are translated;
+a missing file is MTLLibraryErrorFileNotFound, no default.metallib nil);
+IOSurface-backed textures other than plane 0 of a chunky surface
 as a 2D single-level, single-sample texture of the surface's texel size
 (nil); a host signal of a cross-process shared event past a GPU signal of
 it still pending in the receiving process (Vulkan forbids it; one process
@@ -106,6 +109,14 @@ of the same texel size (no swizzle) and texture-to-texture copies.
 MTLBufferLayoutStrideDynamic layouts take the ...attributeStride: binds'
 strides (VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE). Vector function
 constants: msl/README.md.
+
+**Translated (AIR) pipelines, indirect:** indirect draws, indexed indirect
+draws and indirect dispatches of metallib pipelines run from the arguments
+buffer (the translator's DrawIndirect/DrawIndexedIndirect and indirect
+regions). The translator's indirect-clamp prepass is not recorded: group
+counts above maxComputeWorkGroupCount are not clamped, as for native
+pipelines. An indexed indirect draw that needs its arguments on the CPU, and
+replayed dispatches, stop explicitly.
 
 ## Moved from darwin/identities/
 

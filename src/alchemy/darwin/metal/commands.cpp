@@ -1514,7 +1514,16 @@ void CommandBuffer::draw_indexed(std::uint32_t primitive, std::uint32_t index_co
 
 void CommandBuffer::draw_indirect(std::uint32_t primitive, const std::shared_ptr<Buffer>& indirect, std::uint64_t offset) {
     if (!indirect) throw std::runtime_error("Metal indirect draw without an indirect buffer");
-    if (foreign_render_) throw std::runtime_error("Alchemy Metal: indirect draws of translated pipelines are not implemented");
+    if (foreign_render_) {
+        auto call = json::Value::object(), body = json::Value::object(), reference = json::Value::object();
+        reference.set("token", 2);
+        reference.set("offset", static_cast<std::uint64_t>(offset));
+        body.set("indirect", std::move(reference));
+        body.set("indexed", nullptr);
+        call.set("Indirect", std::move(body));
+        foreign_draw(primitive, call, nullptr, indirect);
+        return;
+    }
     flush_render(primitive);
     retain(indirect);
     // MTLDrawPrimitivesIndirectArguments == VkDrawIndirectCommand.
@@ -1526,7 +1535,22 @@ void CommandBuffer::draw_indexed_indirect(std::uint32_t primitive, std::uint32_t
     const std::shared_ptr<Buffer>& index_buffer, std::uint64_t index_offset, const std::shared_ptr<Buffer>& indirect,
     std::uint64_t offset) {
     if (!indirect || !index_buffer) throw std::runtime_error("Metal indexed indirect draw without its buffers");
-    if (foreign_render_) throw std::runtime_error("Alchemy Metal: indirect draws of translated pipelines are not implemented");
+    if (foreign_render_) {
+        auto call = json::Value::object(), body = json::Value::object(), reference = json::Value::object();
+        auto indexed = json::Value::array(), index_reference = json::Value::object();
+        reference.set("token", 2);
+        reference.set("offset", static_cast<std::uint64_t>(offset));
+        index_reference.set("token", 1);
+        index_reference.set("length", static_cast<std::uint64_t>(index_buffer->length));
+        indexed.push(std::uint32_t{index_type == 0 ? 0U : 1U});   // VK_INDEX_TYPE_UINT16 / UINT32
+        indexed.push(std::move(index_reference));
+        indexed.push(static_cast<std::uint64_t>(index_offset));
+        body.set("indirect", std::move(reference));
+        body.set("indexed", std::move(indexed));
+        call.set("Indirect", std::move(body));
+        foreign_draw(primitive, call, index_buffer, indirect);
+        return;
+    }
     flush_render(primitive);
     retain(index_buffer);
     retain(indirect);
@@ -1677,7 +1701,18 @@ void CommandBuffer::dispatch_threads(const std::array<std::uint32_t, 3>& grid, c
 void CommandBuffer::dispatch_indirect(const std::shared_ptr<Buffer>& indirect, std::uint64_t offset,
                                       const std::array<std::uint32_t, 3>& threads) {
     if (!indirect) throw std::runtime_error("Metal indirect dispatch without an indirect buffer");
-    if (foreign_compute_) throw std::runtime_error("Alchemy Metal: indirect dispatches of translated pipelines are not implemented");
+    if (foreign_compute_) {
+        auto dispatch = json::Value::object(), body = json::Value::object(), reference = json::Value::object();
+        auto t = json::Value::array();
+        for (int i = 0; i < 3; ++i) t.push(threads[i]);
+        reference.set("token", 2);
+        reference.set("offset", static_cast<std::uint64_t>(offset));
+        body.set("indirect", std::move(reference));
+        body.set("threads_per_group", std::move(t));
+        dispatch.set("ThreadgroupsIndirect", std::move(body));
+        foreign_dispatch(dispatch, indirect);
+        return;
+    }
     // The grid lives in GPU memory: threads_per_grid is unknown here (0).
     flush_compute(threads, {0, 0, 0}, false);
     retain(indirect);

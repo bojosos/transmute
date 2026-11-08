@@ -336,8 +336,11 @@ private:
     void foreign_bind(air::ForeignPipeline& pipeline, const json::Value& plan, const json::Value& state,
                       const json::Value& ranges, VkPipelineBindPoint point);
     void foreign_push(air::ForeignPipeline& pipeline, const json::Value& writes);
-    void foreign_draw(std::uint32_t primitive, const json::Value& draw, const std::shared_ptr<Buffer>& index_buffer);
-    void foreign_dispatch(const json::Value& dispatch);
+    // `indirect`: the arguments buffer of an indirect draw/dispatch (token 2
+    // in the translator's call; the index buffer is token 1).
+    void foreign_draw(std::uint32_t primitive, const json::Value& draw, const std::shared_ptr<Buffer>& index_buffer,
+                      const std::shared_ptr<Buffer>& indirect = nullptr);
+    void foreign_dispatch(const json::Value& dispatch, const std::shared_ptr<Buffer>& indirect = nullptr);
     VkImageView foreign_view(const std::shared_ptr<Texture>& texture, const json::Value& view);
     // Restores the dynamic state a translated pipeline does not keep (the
     // *_WITH_COUNT viewports and scissors, depth bias and bounds enables)

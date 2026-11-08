@@ -190,6 +190,15 @@ void precompiled(Fixture& f) {
         // Any bytes: without a translator (or a library) the call fails.
         bytes = {'M', 'T', 'L', 'B', 0, 0, 0, 0};
     }
+    // The file forms: a missing file is MTLLibraryErrorFileNotFound (6); the
+    // test process's main bundle has no default.metallib.
+    const auto file_error = f.block(8);
+    f.engine.write64(file_error, 0);
+    const auto from_file = f.send(d, "newLibraryWithFile:error:", {f.cf.string("/no/such/dir/default.metallib"), file_error});
+    require(from_file == 0 && f.engine.read64(file_error) && f.send(f.engine.read64(file_error), "code") == 6,
+            "newLibraryWithFile: of a missing file fails with MTLLibraryErrorFileNotFound");
+    require(f.send(d, "newDefaultLibrary") == 0, "newDefaultLibrary without a default.metallib is nil");
+
     const auto source = f.block(bytes.size());
     f.engine.write_bytes(source, bytes);
     const auto data = f.call("/usr/lib/libSystem.B.dylib", "_dispatch_data_create", {source, bytes.size(), 0, 0});

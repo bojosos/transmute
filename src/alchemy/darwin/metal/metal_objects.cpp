@@ -2690,73 +2690,100 @@ void install_device() {
         if (const auto label = descriptor_object(descriptor, "label")) value->label = r.cf.copy(label);
         s.x[0] = r.create(classes.sample_buffer, std::move(value));
     }, false, "@@:@^@");
-    r.method(cls, "newDefaultLibrary", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
-    // A bundle's default.metallib is precompiled Apple GPU code, like
-    // -newLibraryWithURL:error:.
-    r.method(cls, "newDefaultLibraryWithBundle:error:", [&r](CpuState& s, GuestMemory& m) {
-        r.set_error(m, s.x[3], "MTLLibraryErrorDomain", 1, "precompiled Metal libraries (default.metallib) are not translated");
-        s.x[0] = 0;
+    // Precompiled libraries (metallib bytes): through the AIR translator
+    // (air_translator.hpp) when its DLL is present, which reads the library
+    // here and compiles pipelines at pipeline-state creation; otherwise
+    // MTLLibraryErrorUnsupported (1). A library the translator refuses fails
+    // with MTLLibraryErrorCompileFailure (3).
+    const auto metallib = [&r](Address device, const std::vector<std::uint8_t>& bytes, GuestMemory& m, Address error_out) -> Address {
+        std::string why;
+        if (air::available(&why)) {
+            try {
+                auto value = std::make_shared<LibraryState>();
+                value->foreign = std::make_shared<const air::Library>(bytes);
+                value->device = device;
+                return r.create(classes.library, std::move(value));
+            } catch (const air::TranslatorError& failure) {
+                r.set_error(m, error_out, "MTLLibraryErrorDomain", 3, std::string("Alchemy AIR translator: ") + failure.what());
+                return 0;
+            }
+        }
+        r.set_error(m, error_out, "MTLLibraryErrorDomain", 1, "precompiled Metal libraries (metallib) are not translated" +
+                    (why.empty() ? std::string() : " (" + why + ")"));
+        return 0;
+    };
+    // A metallib file on the host side of the guest path (map_guest_path);
+    // MTLLibraryErrorFileNotFound (6) when it cannot be read.
+    const auto metallib_file = [&r, metallib](Address device, const std::filesystem::path& path, GuestMemory& m,
+                                              Address error_out) -> Address {
+        std::ifstream file(path, std::ios::binary);
+        if (path.empty() || !file) {
+            r.set_error(m, error_out, "MTLLibraryErrorDomain", 6, "no Metal library at " + path.string());
+            return 0;
+        }
+        const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        return metallib(device, bytes, m, error_out);
+    };
+    // The bundle's default.metallib ([bundle URLForResource:@"default"
+    // withExtension:@"metallib"]); FileNotFound (6) without one.
+    const auto default_library = [&r, metallib_file](Address device, Address bundle, GuestMemory& m, Address error_out) -> Address {
+        Address url = 0;
+        if (bundle) {
+            const auto name = r.cf.string("default"), extension = r.cf.string("metallib");
+            CallRegs call{};
+            call.x[2] = name;
+            call.x[3] = extension;
+            url = r.objc.send(bundle, "URLForResource:withExtension:", call).x0;
+            r.release(name);
+            r.release(extension);
+        }
+        if (!url) {
+            r.set_error(m, error_out, "MTLLibraryErrorDomain", 6, "the bundle has no default.metallib");
+            return 0;
+        }
+        return metallib_file(device, archive_path(url), m, error_out);
+    };
+    // [NSBundle mainBundle]'s default library, nil without one.
+    r.method(cls, "newDefaultLibrary", [&r, default_library](CpuState& s, GuestMemory& m) {
+        const auto bundle_class = r.objc.find_class("NSBundle");
+        const auto bundle = bundle_class ? r.objc.send(bundle_class, "mainBundle").x0 : 0;
+        s.x[0] = default_library(s.x[0], bundle, m, 0);
+    });
+    r.method(cls, "newDefaultLibraryWithBundle:error:", [default_library](CpuState& s, GuestMemory& m) {
+        s.x[0] = default_library(s.x[0], s.x[2], m, s.x[3]);
     }, false, "@@:@^@");
     // A precompiled library handed over in memory (a dispatch_data_t; ANGLE's
     // built-in shaders): with ALCHEMY_MSL_DUMP set its bytes go to the dump
     // directory once (msl::dump_library_data; input for evaluating
     // translators, never for git). It then fails like the file forms below.
-    r.method(cls, "newLibraryWithData:error:", [&r](CpuState& s, GuestMemory& m) {
+    r.method(cls, "newLibraryWithData:error:", [&r, metallib](CpuState& s, GuestMemory& m) {
         const auto data = s.x[2], error_out = s.x[3];
+        std::vector<std::uint8_t> bytes;
         if (data) {
             const auto out = r.call("_malloc", {16});
             if (out) {
                 const auto map = r.call("_dispatch_data_create_map", {data, out, out + 8});
                 const auto buffer = m.read64(out), size = m.read64(out + 8);
                 if (map && buffer && size) {
-                    std::string bytes(static_cast<std::size_t>(size), '\0');
-                    m.read_bytes(buffer, std::span(reinterpret_cast<std::uint8_t*>(bytes.data()), bytes.size()));
-                    static_cast<void>(msl::dump_library_data(bytes));
+                    bytes.resize(static_cast<std::size_t>(size));
+                    m.read_bytes(buffer, std::span(bytes.data(), bytes.size()));
+                    static_cast<void>(msl::dump_library_data(std::string(bytes.begin(), bytes.end())));
                 }
                 if (map) static_cast<void>(r.call("_dispatch_release", {map}));
                 static_cast<void>(r.call("_free", {out}));
             }
         }
-        // With the AIR translator (air_translator.hpp) the library is read
-        // here and its pipelines compiled at pipeline-state creation.
-        std::string why;
-        if (data && air::available(&why)) {
-            try {
-                const auto out = r.call("_malloc", {16});
-                std::vector<std::uint8_t> bytes;
-                if (out) {
-                    const auto map = r.call("_dispatch_data_create_map", {data, out, out + 8});
-                    const auto buffer = m.read64(out), size = m.read64(out + 8);
-                    if (map && buffer && size) {
-                        bytes.resize(static_cast<std::size_t>(size));
-                        m.read_bytes(buffer, std::span(bytes.data(), bytes.size()));
-                    }
-                    if (map) static_cast<void>(r.call("_dispatch_release", {map}));
-                    static_cast<void>(r.call("_free", {out}));
-                }
-                auto value = std::make_shared<LibraryState>();
-                value->foreign = std::make_shared<const air::Library>(bytes);
-                value->device = s.x[0];
-                s.x[0] = r.create(classes.library, std::move(value));
-                return;
-            } catch (const air::TranslatorError& failure) {
-                // MTLLibraryErrorCompileFailure (3): the translator refused it.
-                r.set_error(m, error_out, "MTLLibraryErrorDomain", 3, std::string("Alchemy AIR translator: ") + failure.what());
-                s.x[0] = 0;
-                return;
-            }
-        }
-        // MTLLibraryErrorUnsupported (1): metallib binaries are Apple GPU code.
-        r.set_error(m, error_out, "MTLLibraryErrorDomain", 1, "precompiled Metal libraries (metallib) are not translated" +
-                    (why.empty() ? std::string() : " (" + why + ")"));
-        s.x[0] = 0;
+        s.x[0] = metallib(s.x[0], bytes, m, error_out);
     }, false, "@@:@^@");
-    for (const auto selector : {"newLibraryWithURL:error:", "newLibraryWithFile:error:"})
-        r.method(cls, selector, [&r](CpuState& s, GuestMemory& m) {
-            // MTLLibraryErrorUnsupported (1): metallib binaries are Apple GPU code.
-            r.set_error(m, s.x[3], "MTLLibraryErrorDomain", 1, "precompiled Metal libraries (metallib) are not translated");
-            s.x[0] = 0;
-        }, false, "@@:@^@");
+    r.method(cls, "newLibraryWithURL:error:", [metallib_file](CpuState& s, GuestMemory& m) {
+        s.x[0] = metallib_file(s.x[0], archive_path(s.x[2]), m, s.x[3]);
+    }, false, "@@:@^@");
+    r.method(cls, "newLibraryWithFile:error:", [&r, metallib_file](CpuState& s, GuestMemory& m) {
+        const auto guest = s.x[2] ? r.utf8(s.x[2]) : std::string();
+        const std::filesystem::path path = guest.empty() ? std::filesystem::path()
+                                         : r.process.map_guest_path ? r.process.map_guest_path(guest) : std::filesystem::path(guest);
+        s.x[0] = metallib_file(s.x[0], path, m, s.x[3]);
+    }, false, "@@:@^@");
 
     // `code`: the MTLLibraryError of a failure (CompileFailure unless set).
     const auto compile = [&r](Address device, Address source, Address options, std::string& error, std::int64_t& code) -> Address {

@@ -383,7 +383,8 @@ void CommandBuffer::restore_native_state() {
     device->vk.vkCmdSetDepthBoundsTestEnable(current_, VK_FALSE);
 }
 
-void CommandBuffer::foreign_draw(std::uint32_t primitive, const json::Value& draw, const std::shared_ptr<Buffer>& index_buffer) {
+void CommandBuffer::foreign_draw(std::uint32_t primitive, const json::Value& draw, const std::shared_ptr<Buffer>& index_buffer,
+                                 const std::shared_ptr<Buffer>& indirect) {
     require(EncoderKind::render, "draw");
     auto& foreign = *foreign_render_;
     auto state = foreign_state(true);
@@ -397,6 +398,11 @@ void CommandBuffer::foreign_draw(std::uint32_t primitive, const json::Value& dra
     unsupported_if(commands["index_bounds_pass"], "index bounds pass");
     unsupported_if(commands["mesh_dispatch"], "mesh dispatch");
     unsupported_if(commands["tessellation_dispatch"], "tessellation dispatch");
+    // An indexed indirect draw whose index fetch nothing bounds needs its
+    // arguments on the CPU, which a GPU-written buffer cannot give here.
+    if (commands["indirect_needs_arguments"].as_bool().value_or(false))
+        throw std::runtime_error("Alchemy Metal: a translated indexed indirect draw that needs its arguments on the CPU "
+                                 "is not implemented");
     perf::add(perf::mtl_draws);
     auto& pipeline = *planned.pipeline;
     const auto topology = primitive_topology(primitive);
@@ -449,12 +455,25 @@ void CommandBuffer::foreign_draw(std::uint32_t primitive, const json::Value& dra
                                     u32((*d)["first_index"], "first_index"),
                                     static_cast<std::int32_t>((*d)["vertex_offset"].as_i64().value_or(0)),
                                     u32((*d)["first_instance"], "first_instance"));
+    } else if (const auto* d = call.find("DrawIndirect")) {
+        if (!indirect) throw std::runtime_error("translated draw: an indirect draw without its arguments buffer");
+        retain(indirect);
+        device->vk.vkCmdDrawIndirect(command, indirect->buffer, (*d)["offset"].as_u64().value_or(0),
+                                     u32((*d)["draw_count"], "draw_count"), u32((*d)["stride"], "stride"));
+    } else if (const auto* d = call.find("DrawIndexedIndirect")) {
+        if (!indirect || !index_buffer) throw std::runtime_error("translated draw: an indexed indirect draw without its buffers");
+        retain(indirect);
+        retain(index_buffer);
+        device->vk.vkCmdBindIndexBuffer(command, index_buffer->buffer, (*d)["index_buffer_offset"].as_u64().value_or(0),
+                                        static_cast<VkIndexType>(u32((*d)["index_type"], "index_type")));
+        device->vk.vkCmdDrawIndexedIndirect(command, indirect->buffer, (*d)["offset"].as_u64().value_or(0),
+                                            u32((*d)["draw_count"], "draw_count"), u32((*d)["stride"], "stride"));
     } else {
         throw std::runtime_error("Alchemy Metal: a translated pipeline's draw " + call.dump() + " is not implemented");
     }
 }
 
-void CommandBuffer::foreign_dispatch(const json::Value& dispatch) {
+void CommandBuffer::foreign_dispatch(const json::Value& dispatch, const std::shared_ptr<Buffer>& indirect) {
     require(EncoderKind::compute, "dispatch");
     auto& foreign = *foreign_compute_;
     const auto state = foreign_state(false);
@@ -463,7 +482,12 @@ void CommandBuffer::foreign_dispatch(const json::Value& dispatch) {
     unsupported_if(commands["descriptor_bytes"], "argument and handle tables");
     unsupported_if(commands["push_holes"], "device addresses in push constants");
     unsupported_if(commands["root_table"], "resident root table");
-    unsupported_if(commands["indirect_clamp"], "indirect clamp");
+    // The indirect-clamp prepass (group counts above the device's
+    // maxComputeWorkGroupCount) is not recorded: its ClampScratch regions
+    // dispatch from Metal's arguments directly, as native pipelines do
+    // (CommandBuffer::dispatch_indirect). Counts within the limits are exact.
+    const auto& clamp = commands["indirect_clamp"];
+    const std::uint64_t clamp_source = clamp.is_null() ? 0 : clamp["source"]["offset"].as_u64().value_or(0);
     unsupported_if(commands["region_record"], "region record");
     perf::add(perf::mtl_dispatches);
     if (!concurrent_ && dispatched_)
@@ -474,7 +498,14 @@ void CommandBuffer::foreign_dispatch(const json::Value& dispatch) {
     const auto command = current_;
     bool bound = false;
     for (const auto& region : commands["regions"].items()) {
-        unsupported_if(region["indirect"], "indirect dispatch region");
+        // An indirect region reads Metal's arguments from the buffer
+        // (IndirectArgs::Buffer, or ClampScratch read from the clamp's source
+        // as above); the replay form is not implemented.
+        const auto& where = region["indirect"];
+        const auto* from_buffer = where.is_null() ? nullptr : where.find("Buffer");
+        const bool from_clamp = !where.is_null() && where.as_string() && *where.as_string() == "ClampScratch" && !clamp.is_null();
+        if (!where.is_null() && !from_buffer && !from_clamp)
+            throw std::runtime_error("Alchemy Metal: a translated indirect dispatch region " + where.dump() + " is not implemented");
         const auto vk_pipeline = pipeline.compute(region);
         device->vk.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
         if (!bound) {
@@ -482,8 +513,15 @@ void CommandBuffer::foreign_dispatch(const json::Value& dispatch) {
             bound = true;
         }
         foreign_push(pipeline, region["push_constants"]);
-        const auto& groups = region["group_count"];
-        device->vk.vkCmdDispatch(command, u32(groups[0], "group x"), u32(groups[1], "group y"), u32(groups[2], "group z"));
+        if (from_buffer || from_clamp) {
+            if (!indirect) throw std::runtime_error("translated dispatch: an indirect region without its arguments buffer");
+            retain(indirect);
+            device->vk.vkCmdDispatchIndirect(command, indirect->buffer,
+                                             from_buffer ? (*from_buffer)["offset"].as_u64().value_or(0) : clamp_source);
+        } else {
+            const auto& groups = region["group_count"];
+            device->vk.vkCmdDispatch(command, u32(groups[0], "group x"), u32(groups[1], "group y"), u32(groups[2], "group z"));
+        }
         bound_pipeline_ = vk_pipeline;
     }
     bound_layout_ = pipeline.layout();

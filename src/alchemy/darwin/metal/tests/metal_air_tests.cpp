@@ -314,6 +314,30 @@ void test_clear(const std::shared_ptr<metal::Device>& device, const air::Transla
                   pixels[(8 * 16 + 8) * 4 + 2], pixels[(8 * 16 + 8) * 4 + 3]);
     expect(wrong == 0, std::string("clear: every pixel has ClearParams' color (") + line + ", " + std::to_string(wrong) + " channels off)");
     std::cout << "  clearFloatFS drew " << line << '\n';
+
+    // The same draw from an arguments buffer (drawPrimitives:indirectBuffer:):
+    // MTLDrawPrimitivesIndirectArguments {6, 1, 0, 0}.
+    auto arguments = shared_buffer(device, 16);
+    const std::uint32_t draw_arguments[4] = {6, 1, 0, 0};
+    std::memcpy(arguments->contents(), draw_arguments, sizeof draw_arguments);
+    std::memset(readback->contents(), 0, 16 * 64);
+    commands = metal::CommandBuffer::create(device);
+    commands->begin_render(pass);
+    commands->set_render_pipeline(pipeline);
+    commands->set_bytes(metal::Stage::vertex, 0, bytes);
+    commands->set_bytes(metal::Stage::fragment, 0, bytes);
+    commands->draw_indirect(3, arguments, 0);
+    commands->end_encoding();
+    commands->begin_blit();
+    commands->copy_texture_to_buffer(target, 0, 0, {0, 0, 0, 16, 16, 1}, readback, 0, 64, 16 * 64);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "clear indirect: the command buffer completes");
+    wrong = 0;
+    for (int i = 0; i < 16 * 16; ++i)
+        for (int c = 0; c < 4; ++c) wrong += std::abs(int(pixels[i * 4 + c]) - int(want[c])) > 1;
+    expect(wrong == 0, "clear indirect: the translated pipeline draws from the arguments buffer (" + std::to_string(wrong) +
+                           " channels off)");
 }
 
 // convertIndexU8ToU16: IndexConversionParams {srcOffset, indexCount,
@@ -347,6 +371,28 @@ void test_convert(const std::shared_ptr<metal::Device>& device, const air::Trans
     expect(wrong == 0, "convert: output[i] = input[offset + i] for the 100 indices, nothing past them (" + std::to_string(wrong) +
                            " wrong)");
     std::cout << "  convertIndexU8ToU16 widened " << count << " indices (" << out[0] << ", " << out[1] << ", ...)\n";
+
+    // dispatchThreadgroupsWithIndirectBuffer: {2, 1, 1} groups of 64: the
+    // kernel bounds itself to indexCount, so the output is the same.
+    auto arguments = shared_buffer(device, 12);
+    const std::uint32_t groups[3] = {2, 1, 1};
+    std::memcpy(arguments->contents(), groups, sizeof groups);
+    std::memset(destination->contents(), 0xab, 512);
+    commands = metal::CommandBuffer::create(device);
+    commands->begin_compute(false);
+    commands->set_compute_pipeline(pipeline);
+    commands->set_bytes(metal::Stage::kernel, 0, {params, sizeof params});
+    commands->set_buffer(metal::Stage::kernel, 1, source, 0);
+    commands->set_buffer(metal::Stage::kernel, 2, destination, 0);
+    commands->dispatch_indirect(arguments, 0, {64, 1, 1});
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "convert indirect: the command buffer completes");
+    wrong = 0;
+    for (std::uint32_t i = 0; i < count; ++i) wrong += out[i] != source->contents()[offset + i];
+    for (std::uint32_t i = count; i < 256; ++i) wrong += out[i] != 0xabab;
+    expect(wrong == 0, "convert indirect: the translated kernel dispatches from the arguments buffer (" + std::to_string(wrong) +
+                           " wrong)");
 }
 
 std::string library_path() {
