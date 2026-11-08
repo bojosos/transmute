@@ -22,6 +22,8 @@
 // later frame. The thread ends with the process (or when the link is freed).
 // ALCHEMY_TRACE_PRESENT=1 also logs each link's first frames and every 600th
 // as "[alchemy display-link] link 0x<ref> display <id> frame <n> <kind>".
+// A NULL CVDisplayLinkRef answers each call's failure (kCVReturnInvalidArgument, false, kCGNullDirectDisplay, an
+// indefinite CVTime, 0): Qt 6 asks CVDisplayLinkIsRunning of a link it never made.
 namespace alchemy::gui::support_kit {
 namespace {
 
@@ -201,6 +203,7 @@ void install_display_link(Support& support) {
     support.function(lib, "_CVDisplayLinkRetain", [s](CpuState& c, GuestMemory&) { c.x[0] = s->retain(c.x[0]); });
     support.function(lib, "_CVDisplayLinkRelease", [s](CpuState& c, GuestMemory&) { s->release(c.x[0]); });
     support.function(lib, "_CVDisplayLinkSetOutputCallback", [link_of](CpuState& c, GuestMemory&) {
+        if (!c.x[0]) { c.x[0] = cv_status(cv_invalid_argument); return; }   // a NULL link
         const auto link = link_of(c.x[0]);
         std::lock_guard lock(link->mutex);
         link->callback = c.x[1];
@@ -208,6 +211,7 @@ void install_display_link(Support& support) {
         c.x[0] = cv_success;
     });
     support.function(lib, "_CVDisplayLinkSetOutputHandler", [s, link_of](CpuState& c, GuestMemory&) {
+        if (!c.x[0]) { c.x[0] = cv_status(cv_invalid_argument); return; }   // a NULL link
         const auto link = link_of(c.x[0]);
         const auto copied = c.x[1] ? s->call(libsystem_library, "__Block_copy", {c.x[1]}) : 0;
         Address old{};
@@ -219,6 +223,7 @@ void install_display_link(Support& support) {
         c.x[0] = cv_success;
     });
     support.function(lib, "_CVDisplayLinkStart", [s, link_of](CpuState& c, GuestMemory&) {
+        if (!c.x[0]) { c.x[0] = cv_status(cv_invalid_argument); return; }   // a NULL link
         const auto object = c.x[0];
         const auto link = link_of(object);
         {
@@ -236,18 +241,20 @@ void install_display_link(Support& support) {
         c.x[0] = cv_success;
     });
     support.function(lib, "_CVDisplayLinkStop", [link_of](CpuState& c, GuestMemory&) {
+        if (!c.x[0]) { c.x[0] = cv_status(cv_invalid_argument); return; }   // a NULL link
         const auto link = link_of(c.x[0]);
         if (!link->running.exchange(false)) { c.x[0] = cv_status(cv_not_running); return; }
         ++link->generation;
         c.x[0] = cv_success;
     });
     support.function(lib, "_CVDisplayLinkIsRunning", [link_of](CpuState& c, GuestMemory&) {
-        c.x[0] = link_of(c.x[0])->running.load() ? 1 : 0;
+        c.x[0] = c.x[0] && link_of(c.x[0])->running.load() ? 1 : 0;
     });
     support.function(lib, "_CVDisplayLinkGetCurrentCGDisplay", [link_of](CpuState& c, GuestMemory&) {
-        c.x[0] = link_of(c.x[0])->display;
+        c.x[0] = c.x[0] ? link_of(c.x[0])->display : 0;
     });
     support.function(lib, "_CVDisplayLinkSetCurrentCGDisplay", [link_of](CpuState& c, GuestMemory&) {
+        if (!c.x[0]) { c.x[0] = cv_status(cv_invalid_argument); return; }   // a NULL link
         const auto link = link_of(c.x[0]);
         const auto screen = find_screen(static_cast<std::uint32_t>(c.x[1]));
         if (!screen) { c.x[0] = cv_status(cv_invalid_display); return; }
@@ -258,20 +265,24 @@ void install_display_link(Support& support) {
     });
     // CVTime {int64 timeValue; int32 timeScale; int32 flags} in x0/x1.
     support.function(lib, "_CVDisplayLinkGetNominalOutputVideoRefreshPeriod", [link_of](CpuState& c, GuestMemory&) {
+        if (!c.x[0]) { c.x[1] = std::uint64_t{1} << 32; return; }   // kCVTimeIsIndefinite (c.x[0] stays 0)
         const auto link = link_of(c.x[0]);
         c.x[0] = static_cast<std::uint64_t>(std::llround(1e9 / link->refresh_hz));
         c.x[1] = static_cast<std::uint32_t>(timescale);
     });
     support.function(lib, "_CVDisplayLinkGetOutputVideoLatency", [link_of](CpuState& c, GuestMemory&) {
+        if (!c.x[0]) { c.x[1] = std::uint64_t{1} << 32; return; }   // kCVTimeIsIndefinite
         static_cast<void>(link_of(c.x[0]));
         c.x[0] = 0;
         c.x[1] = static_cast<std::uint32_t>(timescale);
     });
     support.function(lib, "_CVDisplayLinkGetActualOutputVideoRefreshPeriod", [link_of](CpuState& c, GuestMemory&) {
+        if (!c.x[0]) { return_real(c, 0, 0.0); return; }
         const auto link = link_of(c.x[0]);
         return_real(c, 0, link->running.load() ? 1.0 / link->refresh_hz : 0.0);
     });
     support.function(lib, "_CVDisplayLinkGetCurrentTime", [link_of](CpuState& c, GuestMemory& m) {
+        if (!c.x[0]) { c.x[0] = cv_status(cv_invalid_argument); return; }   // a NULL link
         const auto link = link_of(c.x[0]);
         if (!c.x[1]) { c.x[0] = cv_status(cv_invalid_argument); return; }
         const auto period_ns = static_cast<std::int64_t>(std::llround(1e9 / link->refresh_hz));

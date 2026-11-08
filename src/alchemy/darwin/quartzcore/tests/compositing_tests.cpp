@@ -455,6 +455,10 @@ void display_link_cadence(Fixture& f) {
     });
     const auto out = f.block(8);
     require(f.status(corevideo, "_CVDisplayLinkCreateWithCGDisplay", {7, out}) == -6670, "an unknown display: kCVReturnInvalidDisplay");
+    // A NULL link (Qt 6 asks whether one it never made runs): each call's failure, no stop.
+    require(f.call(corevideo, "_CVDisplayLinkIsRunning", {0}) == 0 && f.status(corevideo, "_CVDisplayLinkStart", {0}) == -6661 &&
+            f.status(corevideo, "_CVDisplayLinkStop", {0}) == -6661 && f.status(corevideo, "_CVDisplayLinkSetOutputCallback", {0, 0, 0}) == -6661 &&
+            f.call(corevideo, "_CVDisplayLinkGetCurrentCGDisplay", {0}) == 0, "a NULL link answers each call's failure");
     require(f.status(corevideo, "_CVDisplayLinkCreateWithCGDisplay", {1, out}) == 0, "CVDisplayLinkCreateWithCGDisplay(main display)");
     const auto link = f.engine.read64(out);
     require(f.call(corevideo, "_CVDisplayLinkGetCurrentCGDisplay", {link}) == 1, "the link's display");
