@@ -369,6 +369,11 @@ void Leftovers::install() {
     for (const auto name : {"_acl_get_entry", "_acl_get_tag_type", "_acl_get_permset_mask_np"})
         fn(libsystem, name, [this](CpuState&, GuestMemory&) { set_errno(einval); return minus_one; });
     fn(libsystem, "_acl_get_qualifier", [this](CpuState&, GuestMemory&) -> Address { set_errno(einval); return 0; });
+    // acl_dup(acl) and the acl_set_* calls take an acl_t, and none is ever handed out: EINVAL
+    // (cmake copies a file's ACL with acl_get_fd, which finds none, then acl_set_fd).
+    fn(libsystem, "_acl_dup", [this](CpuState&, GuestMemory&) -> Address { set_errno(einval); return 0; });
+    for (const auto name : {"_acl_set_fd", "_acl_set_fd_np", "_acl_set_file", "_acl_set_link_np"})
+        fn(libsystem, name, [this](CpuState&, GuestMemory&) { set_errno(einval); return minus_one; });
 
     // ---- security and code signing ----
     fn(libsystem, "___mac_syscall", [this](CpuState&, GuestMemory&) { set_errno(enosys); return minus_one; });
