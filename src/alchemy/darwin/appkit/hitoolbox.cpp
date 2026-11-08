@@ -537,6 +537,16 @@ void install_hitoolbox(AppKit& kit) {
         s.x[0] = no_err;
     });
 
+    // HIThemeDrawMenuBackground, HIThemeDrawMenuItem and HIThemeDrawTextBox:
+    // their info structures carry menu and text enumerations whose values the
+    // documentation does not give, so they stop explicitly when called
+    // (LibreOffice's VCL plug-in binds them).
+    for (const auto* name : {"_HIThemeDrawMenuBackground", "_HIThemeDrawMenuItem", "_HIThemeDrawTextBox"}) {
+        const std::string operation = std::string(name).substr(1);
+        kit.function(carbon_library, name, [operation](CpuState&, GuestMemory&) {
+            unsupported(operation + " (the menu / text info enumerations are not documented)");
+        });
+    }
     // GetThemeMetric(ThemeMetric, SInt32* out): the metrics of AppKit's flat
     // theme (the sizes the controls of controls.cpp draw with) for the
     // metrics wxWidgets asks for; any other metric fails explicitly.

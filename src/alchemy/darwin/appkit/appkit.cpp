@@ -416,6 +416,10 @@ void AppKit::install() {
     install_user_defaults_controller();
     install_nib();
     install_storyboards();   // after the nib loader and the controllers
+    // CoreUI.framework (AppKit's private drawing framework): linked by plug-ins
+    // that import nothing from it (LibreOffice's VCL plug-in), so an identity
+    // without symbols.
+    ProcessContext::add_provider_library("/System/Library/PrivateFrameworks/CoreUI.framework/Versions/A/CoreUI");
 }
 
 } // namespace appkit

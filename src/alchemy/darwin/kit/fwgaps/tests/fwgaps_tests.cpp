@@ -147,7 +147,29 @@ void core_text_keys(Fixture& f) {
 
 } // namespace
 
+// LibreOffice's VCL plug-in (libvclplug_osxlo.dylib): the CoreUI identity
+// and the names it binds; the HITheme menu / text-box drawing stops explicitly.
+void libreoffice(Fixture& f) {
+    require(alchemy::ProcessContext::is_provider_library("/System/Library/PrivateFrameworks/CoreUI.framework/Versions/A/CoreUI"), "CoreUI identity");
+    for (const auto& [symbol, value] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"_NSAccessibilityIdentifierAttribute", "AXIdentifier"}, {"_NSAccessibilityPickAction", "AXPick"},
+             {"_NSAccessibilityStandardWindowSubrole", "AXStandardWindow"}, {"_NSAccessibilityTextLinkSubrole", "AXTextLink"},
+             {"_NSAccessibilitySuperscriptTextAttribute", "AXSuperscript"}})
+        require(f.string_constant(appkit, symbol) == value, symbol);
+    require(f.string_constant(ct, "_kCTFontEnabledAttribute") == "NSCTFontEnabledAttribute", "kCTFontEnabledAttribute");
+    for (const auto* name : {"_HIThemeDrawMenuBackground", "_HIThemeDrawMenuItem", "_HIThemeDrawTextBox"}) {
+        bool stopped = false;
+        try { static_cast<void>(f.call(carbon, name, {0, 0, 0, 0, 0})); } catch (const std::exception&) { stopped = true; }
+        require(stopped, std::string(name) + " stops explicitly");
+    }
+    const auto eps = f.cls("NSEPSImageRep");
+    const auto data = f.send(f.cls("NSData"), "dataWithBytes:length:", {f.block(16), 16});
+    require((f.send(eps, "canInitWithData:", {data}) & 0xff) == 0 && f.send(eps, "imageRepWithData:", {data}) == 0 &&
+                f.cf.length(f.send(eps, "imageUnfilteredTypes")) == 0,
+            "NSEPSImageRep interprets no EPS");
+}
+
 int main() {
     return run("fwgaps", {{"imports", imports}, {"appkit", appkit_gaps}, {"graphics", graphics}, {"core text", core_text},
-                          {"core text keys", core_text_keys}});
+                          {"core text keys", core_text_keys}, {"libreoffice", libreoffice}});
 }

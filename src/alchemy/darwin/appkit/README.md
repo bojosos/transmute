@@ -339,6 +339,17 @@ magnification 1; another magnification stops explicitly).
 NSUserDefaultsController applies changes immediately even when a nib says
 NSAppliesImmediately NO (deferred application is not modelled).
 
+**LibreOffice's VCL plug-in (`libvclplug_osxlo.dylib`):**
+* CoreUI.framework is an identity without symbols: the plug-in links it but
+  imports nothing from it.
+* NSEPSImageRep exists, but EPS is not interpreted: no data initializes one,
+  `+canInitWithData:` is NO, and no types are offered.
+* HIThemeDrawMenuBackground, HIThemeDrawMenuItem and HIThemeDrawTextBox stop
+  explicitly when called. Their info structures carry enumerations whose
+  values the documentation does not give.
+* The plug-in's NSAccessibility constants are provided. Their values are
+  unverified: they follow the AX naming of the others.
+
 **Archived toolbars:** a window template's toolbar (archived under
 NSViewClass) is decoded with its settings and its default items, which it
 shows without a delegate. The other items Interface Builder lists for it are

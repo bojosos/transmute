@@ -55,6 +55,7 @@ constexpr std::string_view descriptor_keys[] = {
     "kCTFontURLAttribute|NSCTFontFileURLAttribute", "kCTFontFeatureSettingsAttribute|NSCTFontFeatureSettingsAttribute",
     "kCTFontFixedAdvanceAttribute|NSCTFontFixedAdvanceAttribute", "kCTFontCascadeListAttribute|NSCTFontCascadeListAttribute",
     "kCTFontUIUsageAttribute|NSCTFontUIUsageAttribute", "kCTFontOrientationAttribute|NSCTFontOrientationAttribute",
+    "kCTFontEnabledAttribute|NSCTFontEnabledAttribute",   // unverified value (the NSCT naming of the others)
     "kCTFontFamilyNameKey|CTFontFamilyName", "kCTFontSubFamilyNameKey|CTFontSubFamilyName", "kCTFontStyleNameKey|CTFontSubFamilyName",
     "kCTFontFullNameKey|CTFontFullName", "kCTFontPostScriptNameKey|CTFontPostScriptName", "kCTFontUniqueNameKey|CTFontUniqueName",
     "kCTFontVersionNameKey|CTFontVersionName", "kCTFontCopyrightNameKey|CTFontCopyrightName",

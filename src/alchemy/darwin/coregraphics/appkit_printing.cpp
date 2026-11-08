@@ -448,6 +448,17 @@ void Quartz::install_appkit_printing() {
     method(printer, "printerWithName:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:@", true);
     method(printer, "printerWithType:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:@", true);
 
+    // ---- NSEPSImageRep ----
+    // EPS (PostScript) is not interpreted: no data initializes one (nil, as
+    // for data a rep cannot use), +canInitWithData: is NO and no types are
+    // offered, so NSImage never picks it.
+    const auto eps_rep = declare_class("NSEPSImageRep", "NSImageRep", appkit_library);
+    method(eps_rep, "initWithData:", [q](CpuState& s, GuestMemory&) { q->release(s.x[0]); s.x[0] = 0; }, "@@:@");
+    method(eps_rep, "imageRepWithData:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:@", true);
+    method(eps_rep, "canInitWithData:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:@", true);
+    for (const auto* types : {"imageUnfilteredTypes", "imageTypes"})
+        method(eps_rep, types, [q](CpuState& s, GuestMemory&) { s.x[0] = q->autorelease(q->cf.array(std::vector<Address>{})); }, "@@:", true);
+
     // ---- NSPDFImageRep ----
     const auto pdf_rep = declare_class("NSPDFImageRep", "NSImageRep", appkit_library);
     const auto rep_info = [](Address self) -> PdfRep& {
