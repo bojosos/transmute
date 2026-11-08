@@ -1,0 +1,86 @@
+# libpthread: status of each program on real macOS (conformance-macos workflow).
+libpthread/add_timer_termination/add_timer_termination	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/atfork/atfork	PASS	
+libpthread/atfork/atfork_enomem	PASS	
+libpthread/bsdthread_set_self/bsdthread_set_self_constrained_threads	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/bsdthread_set_self/bsdthread_set_self_constrained_transition	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/bsdthread_set_self/pthread_encode_decode_SPIs	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/bsdthread_set_self/set_override_and_base_pri	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/tsd_private.h:52:10: fatal error: 'machine/cpu_capabilities.h' file not found
+libpthread/cond/cond	PASS	
+libpthread/cond/cond_cancel_signal_race	PASS	
+libpthread/cond/cond_mutex_ping_pong	PASS	
+libpthread/cond/cond_signal_thread_np_not_waiting	PASS	
+libpthread/cond/cond_signal_thread_np_waiting	PASS	
+libpthread/cond/cond_signal_thread_np_waiting_different_cond	PASS	
+libpthread/cond_prepost/cond_prepost_fairshare	PASS	
+libpthread/cond_prepost/cond_prepost_firstfit	PASS	
+libpthread/cond_timed/cond_timedwait_beforeepochtimeout	SKIP	cond_timedwait_beforeepochtimeout: skipped <rdar://38144536>
+libpthread/cond_timed/cond_timedwait_nulltimeout	PASS	
+libpthread/cond_timed/cond_timedwait_pasttimeout	SKIP	cond_timedwait_pasttimeout: skipped <rdar://38144536>
+libpthread/cond_timed/cond_timedwait_relative_nulltimeout	PASS	
+libpthread/cond_timed/cond_timedwait_relative_pasttimeout	PASS	
+libpthread/cond_timed/cond_timedwait_timeout	PASS	
+libpthread/cond_timed/cond_timedwait_zerotimeout	SKIP	cond_timedwait_zerotimeout: skipped <rdar://38144536>
+libpthread/custom_stack/custom_stack	PASS	
+libpthread/detach/pthread_detach	PASS	
+libpthread/join/join	PASS	
+libpthread/join/pthread_join_3way	PASS	
+libpthread/join/pthread_join_stress	PASS	
+libpthread/main_stack/main_stack	PASS	
+libpthread/main_stack_custom/main_stack_custom	PASS	
+libpthread/main_stack_legacy/main_stack_legacy	PASS	
+libpthread/mutex/mutex	SKIP	needs boot-args
+libpthread/mutex/mutex_as_semaphore_lock_owned	PASS	
+libpthread/mutex/mutex_default_policy	PASS	
+libpthread/mutex/mutex_default_policy_envvar	PASS	
+libpthread/mutex/mutex_default_policy_sysctl	FAIL	[FAIL] D:\a\_temp\conformance\out\libpthread\src\mutex.c:121: sysctlbyname("kern.pthread_mutex_default_policy", ((void*)0), ((void*)0), &fairshare_default, sizeof(fairshare_default)) == 0 (errno -1: U
+libpthread/mutex_prepost/mutex_prepost_fairshare	PASS	
+libpthread/mutex_prepost/mutex_prepost_firstfit	PASS	
+libpthread/mutex_try/mutex_trylock	PASS	
+libpthread/once_cancel/once_cancel	PASS	
+libpthread/perf_contended_mutex_rwlock/perf_contended_ffmutex_bench	SKIP	performance test
+libpthread/perf_contended_mutex_rwlock/perf_contended_mutex_bench	SKIP	performance test
+libpthread/perf_contended_mutex_rwlock/perf_contended_rwlock_bench	SKIP	performance test
+libpthread/perf_contended_mutex_rwlock/perf_contended_unfair_lock_bench	SKIP	performance test
+libpthread/perf_contended_mutex_rwlock/perf_uncontended_ffmutex_bench	SKIP	performance test
+libpthread/perf_contended_mutex_rwlock/perf_uncontended_mutex_bench	SKIP	performance test
+libpthread/perf_contended_mutex_rwlock/perf_uncontended_rwlock_bench	SKIP	performance test
+libpthread/perf_contended_mutex_rwlock/perf_uncontended_unfair_lock_bench	SKIP	performance test
+libpthread/pthread_attr_setstacksize/pthread_attr_setstacksize	PASS	
+libpthread/pthread_bulk_create/pthread_bulk_create	PASS	
+libpthread/pthread_cancel/pthread_cancel	PASS	
+libpthread/pthread_create_from_mach_thread/pthread_create_from_mach_thread	PASS	
+libpthread/pthread_cwd/pthread_cwd	BUILD	D:\a\_temp\conformance\out\libpthread\src\pthread_cwd.c:6:10: fatal error: 'sys/syscall.h' file not found
+libpthread/pthread_dependency/dependency	PASS	
+libpthread/pthread_exit/pthread_exit	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_exit/pthread_exit_detached	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_exit/pthread_exit_private_stacks	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_exit/pthread_self_is_exiting_np	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_get_qos_class_np/test_pthread_get_qos_class_np	PASS	
+libpthread/pthread_introspection/pthread_introspection	PASS	
+libpthread/pthread_jit_write_freeze_callbacks/pthread_jit_write_freeze_callbacks_correct	SKIP	needs entitlements and a helper tool
+libpthread/pthread_jit_write_freeze_callbacks/pthread_jit_write_freeze_callbacks_incorrect	SKIP	needs entitlements and a helper tool
+libpthread/pthread_jit_write_lockdown/pthread_jit_write_with_callback_no_allowlist	SKIP	needs entitlements
+libpthread/pthread_jit_write_protection/pthread_jit_write_protect	SKIP	performance test (darwintest_perf.h)
+libpthread/pthread_jit_write_protection/thread_self_restrict_rwx_perf	SKIP	performance test (darwintest_perf.h)
+libpthread/pthread_jit_write_with_callback/pthread_jit_write_protect_np_disallowed	SKIP	needs entitlements and a helper tool
+libpthread/pthread_jit_write_with_callback/pthread_jit_write_with_callback_allowed	SKIP	needs entitlements and a helper tool
+libpthread/pthread_jit_write_with_callback/pthread_jit_write_with_invalid_callback_disallowed	SKIP	needs entitlements and a helper tool
+libpthread/pthread_setspecific/pthread_setspecific	PASS	
+libpthread/pthread_threadid_np/pthread_threadid_fork	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/pthread_threadid_np/pthread_threadid_np	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/private.h:30:10: fatal error: 'os/tsd.h' file not found
+libpthread/rdar_32848402/amx_parallelism	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
+libpthread/rdar_32848402/amx_parallelism_on_non_amx_hardware	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
+libpthread/rdar_32848402/thread_request_32848402	BUILD	D:\a\_temp\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
+libpthread/setrlimit_sigsegv/setrlimit_overflow_segfault	FAIL	[FAIL] D:\a\_temp\conformance\out\libpthread\src\setrlimit_sigsegv.c:47: WIFSIGNALED(status): child exit with a signal
+libpthread/stack/chkstk	PASS	
+libpthread/stack/pthread_stack_frame_decode_np	PASS	
+libpthread/stack_aslr/pthread_stack_aslr	BUILD	D:\a\_temp\conformance\out\libpthread\src\stack_aslr.c:137:35: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declarat
+libpthread/stack_aslr/wq_stack_aslr	BUILD	D:\a\_temp\conformance\out\libpthread\src\stack_aslr.c:137:35: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declarat
+libpthread/stack_size/stack_size_custom	PASS	
+libpthread/stack_size/stack_size_customaddr	PASS	
+libpthread/stack_size/stack_size_customsize	PASS	
+libpthread/stack_size/stack_size_default	PASS	
+libpthread/tsd/cpuid	PASS	
+libpthread/tsd/tsd	PASS	
+libpthread/wq_limits/wq_pool_limits	BUILD	D:\a\_temp\conformance\out\libpthread\src\wq_limits.c:3:10: fatal error: 'dispatch/private.h' file not found

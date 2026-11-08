@@ -208,12 +208,14 @@ class Context:
         seconds = time.monotonic() - start
         text = log.read_bytes().decode("utf-8", "replace")
         code = proc.returncode
-        if status is None:
-            # Crash: a signal on POSIX hosts, an NTSTATUS exception code on Windows. exit(-1) arrives
-            # as 0xFFFFFFFF on Windows and is an ordinary failure.
-            status = "PASS" if code == 0 else ("CRASH" if code < 0 or 0xC0000000 <= code < 0xFFFFFFFF or
-                                               crashed(text) else "FAIL")
-        return Result(test.name, status, code, round(seconds, 2), "", text[-4000:])
+        return Result(test.name, status or exit_status(code, text), code, round(seconds, 2), "", text[-4000:])
+
+
+def exit_status(code, text):
+    # Crash: a signal on POSIX hosts, an NTSTATUS exception code on Windows. exit(-1) arrives as
+    # 0xFFFFFFFF on Windows and is an ordinary failure.
+    return "PASS" if code == 0 else ("CRASH" if code < 0 or 0xC0000000 <= code < 0xFFFFFFFF or
+                                     crashed(text) else "FAIL")
 
 
 def parallel(fn, items, jobs=None):
@@ -348,6 +350,8 @@ def write_baseline(suite, results, module, old):
         # A note explains a non-pass; a test that passes now drops its old one.
         note = "" if r.status == "PASS" else (prev.get("note") if prev.get("expected") != "PASS" else "") or \
             reason or r.detail
+        if reason and prev.get("expected") == "FAIL":
+            note = f"{reason}; under Alchemy: {note}"
         lines.append("\t".join([r.name, expected, owner, note.replace("\t", " ")[:400]]))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -493,7 +497,7 @@ def cmd_compare(ctx, suite, module, args):
     mac_path = pathlib.Path(args.macos_results) / f"{suite}.json"
     if not mac_path.exists():
         raise SystemExit(f"{suite}: no macOS results at {mac_path}")
-    mac = {r["name"]: r for r in json.loads(mac_path.read_text())}
+    mac = {r["name"]: reclassify(r, module, ctx) for r in json.loads(mac_path.read_text())}
     groups = {"Alchemy-only failure": [], "fails on macOS too": [], "passes only under Alchemy": []}
     for name, r in sorted(mine.items()):
         m = mac.get(name)
@@ -514,6 +518,17 @@ def cmd_compare(ctx, suite, module, args):
         print(f"{suite}: {title}: {len(rows)}")
         for r in rows:
             print(f"  {r['status']:7} {r['name']}  {(r['detail'] or '')[:150]}")
+
+
+def reclassify(r, module, ctx):
+    """Classifies a stored result again from its exit code and output with the current harness, so a
+    macOS run made before a harness fix is read the way a new run would be."""
+    if r["status"] in ("TIMEOUT", "SKIP", "BUILD") or r["exit_code"] is None or not hasattr(module, "classify"):
+        return r
+    res = module.classify(Result(**dict(r, status=exit_status(r["exit_code"], r["output"]), detail="")), ctx)
+    if not res.detail and res.status != "PASS":
+        res.detail = first_line(res.output) if res.output else ""
+    return dataclasses.asdict(res)
 
 
 def macos_status(suite):

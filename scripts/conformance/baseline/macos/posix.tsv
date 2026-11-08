@@ -1,0 +1,1609 @@
+# posix: status of each program on real macOS (conformance-macos workflow).
+posix/aio_cancel/1-1	SKIP	UNSUPPORTED: 
+posix/aio_cancel/10-1	SKIP	UNSUPPORTED: 
+posix/aio_cancel/2-1	SKIP	UNSUPPORTED: 
+posix/aio_cancel/2-2	SKIP	UNSUPPORTED: 
+posix/aio_cancel/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\aio_cancel\3-1.c:78:16: error: use of undeclared identifier 'SIGRTMIN'
+posix/aio_cancel/4-1	SKIP	UNSUPPORTED: 
+posix/aio_cancel/5-1	SKIP	UNSUPPORTED: 
+posix/aio_cancel/6-1	SKIP	UNSUPPORTED: 
+posix/aio_cancel/7-1	SKIP	UNSUPPORTED: 
+posix/aio_cancel/8-1	SKIP	UNSUPPORTED: 
+posix/aio_cancel/9-1	SKIP	UNSUPPORTED: 
+posix/aio_error/1-1	SKIP	UNSUPPORTED: 
+posix/aio_error/2-1	SKIP	UNSUPPORTED: 
+posix/aio_error/3-1	SKIP	UNSUPPORTED: 
+posix/aio_fsync/12-1	SKIP	UNSUPPORTED: 
+posix/aio_fsync/14-1	SKIP	UNSUPPORTED: 
+posix/aio_fsync/2-1	SKIP	UNSUPPORTED: 
+posix/aio_fsync/3-1	SKIP	UNSUPPORTED: 
+posix/aio_fsync/4-1	SKIP	UNSUPPORTED: 
+posix/aio_fsync/5-1	SKIP	UNSUPPORTED: 
+posix/aio_fsync/8-1	SKIP	UNSUPPORTED: 
+posix/aio_fsync/8-2	SKIP	UNSUPPORTED: 
+posix/aio_fsync/8-3	SKIP	UNSUPPORTED: 
+posix/aio_fsync/8-4	SKIP	UNSUPPORTED: 
+posix/aio_fsync/9-1	SKIP	UNSUPPORTED: 
+posix/aio_read/1-1	SKIP	UNSUPPORTED: 
+posix/aio_read/10-1	SKIP	UNSUPPORTED: 
+posix/aio_read/11-1	SKIP	UNSUPPORTED: 
+posix/aio_read/11-2	SKIP	UNSUPPORTED: 
+posix/aio_read/3-1	SKIP	UNSUPPORTED: 
+posix/aio_read/3-2	SKIP	UNSUPPORTED: 
+posix/aio_read/4-1	SKIP	UNSUPPORTED: 
+posix/aio_read/5-1	SKIP	UNSUPPORTED: 
+posix/aio_read/7-1	SKIP	UNSUPPORTED: 
+posix/aio_read/8-1	SKIP	UNSUPPORTED: 
+posix/aio_read/9-1	SKIP	UNSUPPORTED: 
+posix/aio_return/1-1	SKIP	UNSUPPORTED: 
+posix/aio_return/2-1	SKIP	UNSUPPORTED: 
+posix/aio_return/3-1	SKIP	UNSUPPORTED: 
+posix/aio_return/3-2	SKIP	UNSUPPORTED: 
+posix/aio_return/4-1	SKIP	UNSUPPORTED: 
+posix/aio_suspend/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\aio_suspend\1-1.c:123:22: error: use of undeclared identifier 'SIGRTMIN'
+posix/aio_suspend/3-1	SKIP	UNSUPPORTED: 
+posix/aio_suspend/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\aio_suspend\4-1.c:113:41: error: use of undeclared identifier 'SIGRTMIN'
+posix/aio_suspend/5-1	SKIP	UNSUPPORTED: 
+posix/aio_suspend/9-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\aio_suspend\9-1.c:115:22: error: use of undeclared identifier 'SIGRTMIN'
+posix/aio_write/1-1	SKIP	UNSUPPORTED: 
+posix/aio_write/1-2	SKIP	UNSUPPORTED: 
+posix/aio_write/2-1	SKIP	UNSUPPORTED: 
+posix/aio_write/3-1	SKIP	UNSUPPORTED: 
+posix/aio_write/5-1	SKIP	UNSUPPORTED: 
+posix/aio_write/6-1	SKIP	UNSUPPORTED: 
+posix/aio_write/7-1	SKIP	UNSUPPORTED: 
+posix/aio_write/8-1	SKIP	UNSUPPORTED: 
+posix/aio_write/8-2	SKIP	UNSUPPORTED: 
+posix/aio_write/9-1	SKIP	UNSUPPORTED: 
+posix/aio_write/9-2	SKIP	UNSUPPORTED: 
+posix/asctime/1-1	PASS	
+posix/clock/1-1	PASS	
+posix/clock/2-1	PASS	
+posix/clock_getcpuclockid/1-1	SKIP	UNSUPPORTED: _POSIX_CPUTIME unsupported
+posix/clock_getcpuclockid/1-2	SKIP	UNSUPPORTED: _POSIX_CPUTIME unsupported
+posix/clock_getcpuclockid/2-1	SKIP	UNSUPPORTED: _POSIX_CPUTIME unsupported
+posix/clock_getcpuclockid/5-1	SKIP	UNSUPPORTED: _POSIX_CPUTIME unsupported
+posix/clock_getcpuclockid/6-1	SKIP	UNSUPPORTED: _POSIX_CPUTIME unsupported
+posix/clock_getres/1-1	PASS	
+posix/clock_getres/3-1	PASS	
+posix/clock_getres/5-1	PASS	
+posix/clock_getres/6-1	PASS	
+posix/clock_getres/6-2	PASS	
+posix/clock_getres/7-1	SKIP	UNSUPPORTED: _POSIX_CPUTIME not supported
+posix/clock_getres/8-1	SKIP	UNSUPPORTED: _POSIX_THREAD_CPUTIME not supported
+posix/clock_gettime/1-1	PASS	
+posix/clock_gettime/1-2	PASS	
+posix/clock_gettime/2-1	PASS	
+posix/clock_gettime/3-1	SKIP	UNSUPPORTED: CLOCK_MONOTONIC unsupported
+posix/clock_gettime/4-1	SKIP	UNSUPPORTED: _POSIX_CPUTIME unsupported
+posix/clock_gettime/7-1	PASS	
+posix/clock_gettime/8-1	PASS	
+posix/clock_gettime/8-2	PASS	
+posix/clock_nanosleep/1-1	CRASH	dyld[11547]: symbol not found in flat namespace '_clock_nanosleep'
+posix/clock_nanosleep/1-3	CRASH	dyld[11548]: symbol not found in flat namespace '_clock_nanosleep'
+posix/clock_nanosleep/1-4	CRASH	dyld[11549]: symbol not found in flat namespace '_clock_nanosleep'
+posix/clock_nanosleep/1-5	CRASH	dyld[11550]: symbol not found in flat namespace '_clock_nanosleep'
+posix/clock_nanosleep/10-1	CRASH	dyld[11551]: symbol not found in flat namespace '_clock_nanosleep'
+posix/clock_nanosleep/11-1	CRASH	dyld[11552]: symbol not found in flat namespace '_clock_nanosleep'
+posix/clock_nanosleep/13-1	CRASH	dyld[11553]: symbol not found in flat namespace '_clock_nanosleep'
+posix/clock_nanosleep/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_nanosleep\2-1.c:39:11: error: use of undeclared identifier 'TIMER_ABSTIME'
+posix/clock_nanosleep/2-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_nanosleep\2-2.c:69:12: error: use of undeclared identifier 'TIMER_ABSTIME'
+posix/clock_nanosleep/2-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_nanosleep\2-3.c:43:12: error: use of undeclared identifier 'TIMER_ABSTIME'
+posix/clock_nanosleep/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_nanosleep\3-1.c:40:11: error: use of undeclared identifier 'TIMER_ABSTIME'
+posix/clock_nanosleep/9-1	CRASH	dyld[11554]: symbol not found in flat namespace '_clock_nanosleep'
+posix/clock_settime/1-1	SKIP	UNTESTED: Run this test as ROOT, not as a Regular User
+posix/clock_settime/17-1	FAIL	UNRESOLVED: This test must be run as superuser
+posix/clock_settime/17-2	FAIL	UNRESOLVED: Test must be run as superuser
+posix/clock_settime/19-1	SKIP	UNTESTED: Run this test as ROOT, not as a Regular User
+posix/clock_settime/20-1	FAIL	UNRESOLVED: Test must be run as superuser
+posix/clock_settime/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_settime\4-1.c:46:20: error: variable has incomplete type 'struct itimerspec'
+posix/clock_settime/4-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_settime\4-2.c:52:20: error: variable has incomplete type 'struct itimerspec'
+posix/clock_settime/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_settime\5-1.c:50:20: error: variable has incomplete type 'struct itimerspec'
+posix/clock_settime/5-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_settime\5-2.c:50:20: error: variable has incomplete type 'struct itimerspec'
+posix/clock_settime/6-1	PASS	
+posix/clock_settime/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_settime\7-1.c:71:13: error: use of undeclared identifier 'TIMER_ABSTIME'
+posix/clock_settime/7-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_settime\7-2.c:72:13: error: use of undeclared identifier 'TIMER_ABSTIME'
+posix/clock_settime/8-1	CRASH	dyld[11561]: symbol not found in flat namespace '_clock_nanosleep'
+posix/clock_settime/speculative/4-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_settime\speculative\4-3.c:61:20: error: variable has incomplete type 'struct itimerspec'
+posix/clock_settime/speculative/4-4	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\clock_settime\speculative\4-4.c:59:20: error: variable has incomplete type 'struct itimerspec'
+posix/ctime/1-1	PASS	
+posix/difftime/1-1	PASS	
+posix/fork/1-1	CRASH	dyld[11564]: symbol not found in flat namespace '_sem_timedwait'
+posix/fork/11-1	PASS	
+posix/fork/12-1	PASS	
+posix/fork/13-1	PASS	
+posix/fork/14-1	FAIL	UNRESOLVED: [21:44:33]
+posix/fork/16-1	FAIL	UNRESOLVED: [21:44:33]
+posix/fork/17-1	CRASH	dyld[11573]: symbol not found in flat namespace '_sched_getparam'
+posix/fork/17-2	CRASH	dyld[11574]: symbol not found in flat namespace '_sched_getparam'
+posix/fork/18-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\fork\18-1.c:67:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/fork/19-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\fork\19-1.c:40:10: fatal error: 'mqueue.h' file not found
+posix/fork/2-1	FAIL	The sigaction flags are different
+posix/fork/21-1	PASS	
+posix/fork/22-1	CRASH	dyld[11579]: symbol not found in flat namespace '_pthread_getcpuclockid'
+posix/fork/3-1	PASS	
+posix/fork/4-1	PASS	
+posix/fork/6-1	PASS	
+posix/fork/7-1	PASS	
+posix/fork/8-1	PASS	
+posix/fork/9-1	PASS	
+posix/fsync/4-1	PASS	
+posix/fsync/5-1	PASS	
+posix/fsync/7-1	FAIL	fsync/7-1.c Test Fail: Expect EINVAL, get: Operation not supported
+posix/getpid/1-1	PASS	
+posix/gmtime/1-1	PASS	
+posix/gmtime/2-1	PASS	
+posix/kill/1-1	PASS	
+posix/kill/1-2	PASS	
+posix/kill/2-1	PASS	
+posix/kill/2-2	FAIL	UNRESOLVED: setuid: Operation not permitted
+posix/kill/3-1	FAIL	UNRESOLVED: setuid: Operation not permitted
+posix/killpg/1-1	PASS	
+posix/killpg/1-2	PASS	
+posix/killpg/2-1	PASS	
+posix/killpg/4-1	PASS	
+posix/killpg/5-1	PASS	
+posix/killpg/6-1	PASS	
+posix/killpg/8-1	PASS	
+posix/lio_listio/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\lio_listio\1-1.c:106:22: error: use of undeclared identifier 'SIGRTMIN'
+posix/lio_listio/10-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\lio_listio\10-1.c:108:41: error: use of undeclared identifier 'SIGRTMIN'
+posix/lio_listio/12-1	SKIP	UNSUPPORTED: 
+posix/lio_listio/13-1	SKIP	UNSUPPORTED: 
+posix/lio_listio/14-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\lio_listio\14-1.c:119:41: error: use of undeclared identifier 'SIGRTMIN'
+posix/lio_listio/15-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\lio_listio\15-1.c:113:41: error: use of undeclared identifier 'SIGRTMIN'
+posix/lio_listio/18-1	SKIP	UNSUPPORTED: 
+posix/lio_listio/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\lio_listio\2-1.c:132:22: error: use of undeclared identifier 'SIGRTMIN'
+posix/lio_listio/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\lio_listio\3-1.c:108:41: error: use of undeclared identifier 'SIGRTMIN'
+posix/lio_listio/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\lio_listio\4-1.c:116:41: error: use of undeclared identifier 'SIGRTMIN'
+posix/lio_listio/5-1	SKIP	UNSUPPORTED: 
+posix/lio_listio/6-1	SKIP	UNSUPPORTED: 
+posix/lio_listio/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\lio_listio\7-1.c:113:41: error: use of undeclared identifier 'SIGRTMIN'
+posix/lio_listio/8-1	SKIP	UNSUPPORTED: 
+posix/lio_listio/9-1	SKIP	UNSUPPORTED: 
+posix/localtime/1-1	PASS	
+posix/mktime/1-1	PASS	
+posix/mlock/10-1	PASS	
+posix/mlock/12-1	FAIL	You have the right to call mlock
+posix/mlock/5-1	PASS	
+posix/mlock/8-1	FAIL	UNRESOLVED: Unexpected error: Undefined error: 0
+posix/mlock/speculative/12-1	FAIL	You have the right to call mlock
+posix/mlockall/13-1	FAIL	Unexpected error: Function not implemented
+posix/mlockall/13-2	FAIL	Unexpected error: Function not implemented
+posix/mlockall/15-1	FAIL	UNRESOLVED: Unexpected error: Function not implemented
+posix/mlockall/3-6	FAIL	UNRESOLVED: An error occurs when calling mlockall(): Function not implemented
+posix/mlockall/3-7	FAIL	UNRESOLVED: An error occurs when calling mlockall(): Function not implemented
+posix/mlockall/8-1	FAIL	UNRESOLVED: Unexpected error: Function not implemented
+posix/mlockall/speculative/15-1	FAIL	UNRESOLVED: Unexpected error: Function not implemented
+posix/mmap/1-1	PASS	
+posix/mmap/1-2	FAIL	UNRESOLVED: Error at write(): Device not configured
+posix/mmap/10-1	PASS	
+posix/mmap/11-1	PASS	
+posix/mmap/11-2	PASS	
+posix/mmap/11-3	FAIL	Error at mmap(): Invalid argument
+posix/mmap/11-4	FAIL	Test FAILED: Modification of the partial page at the end of an object is written out
+posix/mmap/11-5	FAIL	UNRESOLVED: Error at read(): Device not configured
+posix/mmap/11-6	PASS	
+posix/mmap/12-1	PASS	
+posix/mmap/13-1	PASS	
+posix/mmap/14-1	PASS	
+posix/mmap/18-1	FAIL	UNRESOLVED: Error at mlockall(): Function not implemented
+posix/mmap/19-1	PASS	
+posix/mmap/21-1	PASS	
+posix/mmap/23-1	FAIL	Test FAILED: Expect ENODEV, get: Invalid argument
+posix/mmap/24-1	TIMEOUT	
+posix/mmap/24-2	FAIL	Error at mmap(): Invalid argument
+posix/mmap/27-1	PASS	
+posix/mmap/3-1	PASS	
+posix/mmap/31-1	SKIP	UNSUPPORTED: UNSUPPORTED: Cannot be tested on 64 bit architecture
+posix/mmap/32-1	PASS	
+posix/mmap/5-1	FAIL	Combination of PROT_WRITE PROT_EXEC with MAP_SHARED has failed: Permission denied
+posix/mmap/6-1	FAIL	UNRESOLVED: Child process terminated by signal 10
+posix/mmap/6-2	FAIL	UNRESOLVED: Child process terminated by signal 10
+posix/mmap/6-3	FAIL	UNRESOLVED: Child process terminated by signal 10
+posix/mmap/6-4	PASS	
+posix/mmap/6-5	PASS	
+posix/mmap/6-6	PASS	
+posix/mmap/7-1	PASS	
+posix/mmap/7-2	PASS	
+posix/mmap/7-3	FAIL	Error at mmap(): Invalid argument
+posix/mmap/7-4	FAIL	child: Error at mmap: Invalid argument
+posix/mmap/9-1	PASS	
+posix/mq_close/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_close\1-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_close/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_close\2-1.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_close/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_close\3-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_close/3-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_close\3-2.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_close/3-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_close\3-3.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_close/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_close\4-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_getattr/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_getattr\2-1.c:24:10: fatal error: 'mqueue.h' file not found
+posix/mq_getattr/2-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_getattr\2-2.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_getattr/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_getattr\3-1.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_getattr/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_getattr\4-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_getattr/speculative/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_getattr\speculative\7-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_notify/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_notify\1-1.c:24:10: fatal error: 'mqueue.h' file not found
+posix/mq_notify/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_notify\2-1.c:24:10: fatal error: 'mqueue.h' file not found
+posix/mq_notify/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_notify\3-1.c:26:10: fatal error: 'mqueue.h' file not found
+posix/mq_notify/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_notify\4-1.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_notify/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_notify\5-1.c:33:10: fatal error: 'mqueue.h' file not found
+posix/mq_notify/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_notify\8-1.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_notify/9-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_notify\9-1.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\1-1.c:16:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/11-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\11-1.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/12-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\12-1.c:21:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/13-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\13-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/15-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\15-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/16-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\16-1.c:29:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/18-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\18-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/19-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\19-1.c:26:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\2-1.c:26:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/20-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\20-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/21-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\21-1.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/23-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\23-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/25-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\25-2.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/27-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\27-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/27-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\27-2.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/29-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\29-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\3-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\7-1.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/7-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\7-2.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/7-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\7-3.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\8-1.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/8-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\8-2.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/9-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\9-1.c:24:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/9-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\9-2.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/speculative/2-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\speculative\2-2.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/speculative/2-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\speculative\2-3.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/speculative/26-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\speculative\26-1.c:22:10: fatal error: 'mqueue.h' file not found
+posix/mq_open/speculative/6-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_open\speculative\6-1.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\1-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/10-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\10-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/11-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\11-1.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/11-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\11-2.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/12-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\12-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/13-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\13-1.c:21:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\2-1.c:16:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\5-1.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\7-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_receive/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_receive\8-1.c:21:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\1-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/10-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\10-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/11-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\11-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/11-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\11-2.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/12-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\12-1.c:21:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/13-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\13-1.c:16:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/14-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\14-1.c:14:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\2-1.c:14:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\3-1.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/3-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\3-2.c:22:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\4-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/4-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\4-2.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/4-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\4-3.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\5-1.c:28:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/5-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\5-2.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\7-1.c:24:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\8-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_send/9-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_send\9-1.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_setattr/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_setattr\1-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_setattr/1-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_setattr\1-2.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_setattr/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_setattr\2-1.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_setattr/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_setattr\5-1.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\1-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/10-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\10-1.c:16:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/10-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\10-2.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/11-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\11-1.c:21:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/13-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\13-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/14-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\14-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/15-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\15-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/17-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\17-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/17-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\17-2.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/17-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\17-3.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/18-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\18-1.c:21:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/18-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\18-2.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\2-1.c:16:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\5-1.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/5-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\5-2.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/5-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\5-3.c:24:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\7-1.c:17:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\8-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedreceive/speculative/10-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedreceive\speculative\10-2.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\1-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/10-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\10-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/11-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\11-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/11-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\11-2.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/12-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\12-1.c:24:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/13-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\13-1.c:16:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/14-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\14-1.c:14:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/15-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\15-1.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/16-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\16-1.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/18-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\18-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/19-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\19-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\2-1.c:14:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/20-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\20-1.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\3-1.c:21:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/3-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\3-2.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\4-1.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/4-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\4-2.c:15:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/4-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\4-3.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\5-1.c:24:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/5-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\5-2.c:19:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/5-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\5-3.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\7-1.c:23:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\8-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/9-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\9-1.c:20:10: fatal error: 'mqueue.h' file not found
+posix/mq_timedsend/speculative/18-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_timedsend\speculative\18-2.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_unlink/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_unlink\1-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_unlink/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_unlink\2-1.c:31:10: fatal error: 'mqueue.h' file not found
+posix/mq_unlink/2-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_unlink\2-2.c:28:10: fatal error: 'mqueue.h' file not found
+posix/mq_unlink/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_unlink\7-1.c:18:10: fatal error: 'mqueue.h' file not found
+posix/mq_unlink/speculative/7-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\mq_unlink\speculative\7-2.c:19:10: fatal error: 'mqueue.h' file not found
+posix/munlock/10-1	FAIL	UNRESOLVED: Unexpected error: Undefined error: 0
+posix/munlock/11-1	PASS	
+posix/munlock/7-1	PASS	
+posix/munlockall/5-1	SKIP	UNSUPPORTED: Does not support ML (Memory Lock).
+posix/munmap/1-1	PASS	
+posix/munmap/1-2	PASS	
+posix/munmap/2-1	FAIL	UNRESOLVED: Failed to map memory: Operation not supported by device (19)
+posix/munmap/3-1	PASS	
+posix/munmap/4-1	PASS	
+posix/munmap/8-1	PASS	
+posix/munmap/9-1	PASS	
+posix/nanosleep/1-1	PASS	
+posix/nanosleep/1-2	PASS	
+posix/nanosleep/1-3	PASS	
+posix/nanosleep/10000-1	PASS	
+posix/nanosleep/2-1	PASS	
+posix/nanosleep/3-1	PASS	
+posix/nanosleep/3-2	PASS	
+posix/nanosleep/5-1	PASS	
+posix/nanosleep/5-2	PASS	
+posix/nanosleep/6-1	PASS	
+posix/nanosleep/7-1	PASS	
+posix/nanosleep/7-2	PASS	
+posix/pthread_atfork/1-1	PASS	
+posix/pthread_atfork/1-2	PASS	
+posix/pthread_atfork/2-1	PASS	
+posix/pthread_atfork/2-2	PASS	
+posix/pthread_atfork/3-2	PASS	
+posix/pthread_atfork/3-3	FAIL	UNRESOLVED: [21:44:52]
+posix/pthread_atfork/4-1	PASS	
+posix/pthread_attr_destroy/1-1	PASS	
+posix/pthread_attr_destroy/2-1	PASS	
+posix/pthread_attr_destroy/3-1	PASS	
+posix/pthread_attr_getdetachstate/1-1	PASS	
+posix/pthread_attr_getdetachstate/1-2	PASS	
+posix/pthread_attr_getinheritsched/1-1	PASS	
+posix/pthread_attr_getschedparam/1-1	PASS	
+posix/pthread_attr_getschedpolicy/2-1	PASS	
+posix/pthread_attr_getscope/1-1	PASS	
+posix/pthread_attr_getstack/1-1	PASS	
+posix/pthread_attr_getstacksize/1-1	PASS	
+posix/pthread_attr_init/1-1	PASS	
+posix/pthread_attr_init/2-1	PASS	
+posix/pthread_attr_init/3-1	PASS	
+posix/pthread_attr_init/4-1	PASS	
+posix/pthread_attr_setdetachstate/1-1	PASS	
+posix/pthread_attr_setdetachstate/1-2	PASS	
+posix/pthread_attr_setdetachstate/2-1	PASS	
+posix/pthread_attr_setdetachstate/4-1	PASS	
+posix/pthread_attr_setinheritsched/1-1	PASS	
+posix/pthread_attr_setinheritsched/2-1	FAIL	unexpected error: pthread_attr_setinheritsched 2-1: The scheduling attribute is not inherited from creating thread 
+posix/pthread_attr_setinheritsched/2-2	PASS	
+posix/pthread_attr_setinheritsched/2-3	FAIL	Test FAILED
+posix/pthread_attr_setinheritsched/2-4	FAIL	Test FAIL
+posix/pthread_attr_setinheritsched/4-1	PASS	
+posix/pthread_attr_setschedparam/1-1	PASS	
+posix/pthread_attr_setschedparam/1-2	PASS	
+posix/pthread_attr_setschedparam/1-3	PASS	
+posix/pthread_attr_setschedparam/1-4	PASS	
+posix/pthread_attr_setschedparam/speculative/3-1	FAIL	unexpected error: pthread_attr_setschedparam 3-1: pthread_attr_setschedparam did not fail
+posix/pthread_attr_setschedparam/speculative/3-2	FAIL	unexpected error: pthread_attr_setschedparam 3-2: pthread_attr_setschedparam did not fail
+posix/pthread_attr_setschedpolicy/1-1	PASS	
+posix/pthread_attr_setschedpolicy/1-2	PASS	
+posix/pthread_attr_setschedpolicy/1-3	PASS	
+posix/pthread_attr_setschedpolicy/2-1	FAIL	UNRESOLVED: Failed: function: set_affinity_single status: Function not implemented(78)
+posix/pthread_attr_setschedpolicy/4-1	PASS	
+posix/pthread_attr_setschedpolicy/5-1	PASS	
+posix/pthread_attr_setscope/1-1	PASS	
+posix/pthread_attr_setscope/4-1	PASS	
+posix/pthread_attr_setscope/5-1	PASS	
+posix/pthread_attr_setstack/1-1	PASS	
+posix/pthread_attr_setstack/2-1	CRASH	dyld[12130]: symbol not found in flat namespace '_pthread_getattr_np'
+posix/pthread_attr_setstack/4-1	PASS	
+posix/pthread_attr_setstack/6-1	PASS	
+posix/pthread_attr_setstack/7-1	PASS	
+posix/pthread_attr_setstacksize/1-1	PASS	
+posix/pthread_attr_setstacksize/2-1	CRASH	dyld[12135]: symbol not found in flat namespace '_pthread_getattr_np'
+posix/pthread_attr_setstacksize/4-1	PASS	
+posix/pthread_barrier_destroy/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrier_destroy\1-1.c:26:8: error: unknown type name 'pthread_barrier_t'
+posix/pthread_barrier_destroy/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrier_destroy\2-1.c:35:8: error: unknown type name 'pthread_barrier_t'
+posix/pthread_barrier_init/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrier_init\1-1.c:29:8: error: unknown type name 'pthread_barrier_t'
+posix/pthread_barrier_init/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrier_init\3-1.c:29:2: error: use of undeclared identifier 'pthread_barrier_t'
+posix/pthread_barrier_init/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrier_init\4-1.c:31:8: error: unknown type name 'pthread_barrier_t'
+posix/pthread_barrier_wait/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrier_wait\1-1.c:29:8: error: unknown type name 'pthread_barrier_t'
+posix/pthread_barrier_wait/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrier_wait\2-1.c:37:8: error: unknown type name 'pthread_barrier_t'
+posix/pthread_barrier_wait/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrier_wait\3-1.c:34:8: error: unknown type name 'pthread_barrier_t'
+posix/pthread_barrier_wait/3-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrier_wait\3-2.c:32:8: error: unknown type name 'pthread_barrier_t'
+posix/pthread_barrierattr_destroy/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrierattr_destroy\1-1.c:26:2: error: unknown type name 'pthread_barrierattr_t'; did you mean 'pt
+posix/pthread_barrierattr_getpshared/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrierattr_getpshared\1-1.c:26:2: error: unknown type name 'pthread_barrierattr_t'; did you mean 
+posix/pthread_barrierattr_getpshared/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrierattr_getpshared\2-1.c:60:9: error: unknown type name 'pthread_barrier_t'
+posix/pthread_barrierattr_init/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrierattr_init\1-1.c:27:2: error: unknown type name 'pthread_barrierattr_t'; did you mean 'pthre
+posix/pthread_barrierattr_init/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrierattr_init\2-1.c:29:2: error: unknown type name 'pthread_barrierattr_t'; did you mean 'pthre
+posix/pthread_barrierattr_setpshared/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrierattr_setpshared\1-1.c:30:2: error: unknown type name 'pthread_barrierattr_t'; did you mean 
+posix/pthread_barrierattr_setpshared/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_barrierattr_setpshared\2-1.c:33:2: error: unknown type name 'pthread_barrierattr_t'; did you mean 
+posix/pthread_cancel/1-1	PASS	
+posix/pthread_cancel/1-2	PASS	
+posix/pthread_cancel/1-3	PASS	
+posix/pthread_cancel/2-1	PASS	
+posix/pthread_cancel/2-2	PASS	
+posix/pthread_cancel/2-3	PASS	
+posix/pthread_cancel/3-1	FAIL	UNRESOLVED: Test D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_cancel\3-1.c unresolved: got -1 (Function not implemented) on line 69
+posix/pthread_cancel/4-1	PASS	
+posix/pthread_cancel/5-1	PASS	
+posix/pthread_cleanup_pop/1-1	PASS	
+posix/pthread_cleanup_pop/1-2	PASS	
+posix/pthread_cleanup_pop/1-3	PASS	
+posix/pthread_cleanup_push/1-1	PASS	
+posix/pthread_cleanup_push/1-2	PASS	
+posix/pthread_cleanup_push/1-3	PASS	
+posix/pthread_cond_broadcast/1-1	PASS	
+posix/pthread_cond_broadcast/1-2	CRASH	dyld[12624]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_broadcast/2-1	PASS	
+posix/pthread_cond_broadcast/2-2	PASS	
+posix/pthread_cond_broadcast/2-3	CRASH	dyld[12629]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_broadcast/4-1	PASS	
+posix/pthread_cond_broadcast/4-2	FAIL	UNRESOLVED: [21:45:14]
+posix/pthread_cond_destroy/1-1	PASS	
+posix/pthread_cond_destroy/2-1	CRASH	dyld[12633]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_destroy/3-1	PASS	
+posix/pthread_cond_destroy/speculative/4-1	SKIP	UNSUPPORTED: UNSUPPORTED: The standard recommends returning 16, EBUSY, but got 0, Undefined error: 0
+posix/pthread_cond_init/1-1	PASS	
+posix/pthread_cond_init/2-1	PASS	
+posix/pthread_cond_init/3-1	PASS	
+posix/pthread_cond_init/4-1	FAIL	UNRESOLVED: Failed: func: setrlimit() rc: Invalid argument (22)
+posix/pthread_cond_init/4-3	PASS	
+posix/pthread_cond_signal/1-1	PASS	
+posix/pthread_cond_signal/1-2	CRASH	dyld[12647]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_signal/2-1	PASS	
+posix/pthread_cond_signal/2-2	PASS	
+posix/pthread_cond_signal/4-1	PASS	
+posix/pthread_cond_signal/4-2	FAIL	UNRESOLVED: [21:45:17]
+posix/pthread_cond_timedwait/1-1	PASS	
+posix/pthread_cond_timedwait/2-1	PASS	
+posix/pthread_cond_timedwait/2-2	PASS	
+posix/pthread_cond_timedwait/2-3	PASS	
+posix/pthread_cond_timedwait/2-4	CRASH	dyld[12831]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_timedwait/2-5	CRASH	dyld[12832]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_timedwait/2-6	CRASH	dyld[12833]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_timedwait/2-7	CRASH	dyld[12834]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_timedwait/3-1	PASS	
+posix/pthread_cond_timedwait/4-1	PASS	
+posix/pthread_cond_timedwait/4-2	CRASH	dyld[12841]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_timedwait/4-3	FAIL	UNRESOLVED: [21:45:21]
+posix/pthread_cond_wait/1-1	PASS	
+posix/pthread_cond_wait/2-1	PASS	
+posix/pthread_cond_wait/2-2	CRASH	dyld[12855]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_cond_wait/2-3	CRASH	dyld[12856]: symbol not found in flat namespace '_pthread_condattr_setclock'
+posix/pthread_cond_wait/3-1	PASS	
+posix/pthread_cond_wait/4-1	FAIL	UNRESOLVED: [21:45:24]
+posix/pthread_condattr_destroy/1-1	PASS	
+posix/pthread_condattr_destroy/2-1	PASS	
+posix/pthread_condattr_destroy/3-1	PASS	
+posix/pthread_condattr_destroy/4-1	CRASH	
+posix/pthread_condattr_getclock/1-1	CRASH	dyld[12865]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_condattr_getclock/1-2	CRASH	dyld[12866]: symbol not found in flat namespace '_pthread_condattr_getclock'
+posix/pthread_condattr_getpshared/1-1	PASS	
+posix/pthread_condattr_getpshared/1-2	PASS	
+posix/pthread_condattr_getpshared/2-1	PASS	
+posix/pthread_condattr_init/1-1	PASS	
+posix/pthread_condattr_init/3-1	PASS	
+posix/pthread_condattr_setclock/1-1	CRASH	dyld[12872]: symbol not found in flat namespace '_pthread_condattr_setclock'
+posix/pthread_condattr_setclock/1-2	CRASH	dyld[12873]: symbol not found in flat namespace '_pthread_condattr_setclock'
+posix/pthread_condattr_setclock/1-3	SKIP	UNSUPPORTED: _POSIX_CPUTIME unsupported
+posix/pthread_condattr_setclock/2-1	CRASH	dyld[12875]: symbol not found in flat namespace '_pthread_condattr_setclock'
+posix/pthread_condattr_setpshared/1-1	PASS	
+posix/pthread_condattr_setpshared/1-2	PASS	
+posix/pthread_condattr_setpshared/2-1	PASS	
+posix/pthread_create/1-1	PASS	
+posix/pthread_create/1-2	PASS	
+posix/pthread_create/1-3	PASS	
+posix/pthread_create/1-5	FAIL	UNRESOLVED: [21:45:24]
+posix/pthread_create/1-6	FAIL	INFO: Affinity not supported, running 3 threads.
+posix/pthread_create/11-1	SKIP	UNSUPPORTED: _POSIX_THREAD_CPUTIME not supported
+posix/pthread_create/12-1	PASS	
+posix/pthread_create/14-1	FAIL	UNRESOLVED: [21:45:25]
+posix/pthread_create/15-1	FAIL	UNRESOLVED: [21:45:25]
+posix/pthread_create/2-1	PASS	
+posix/pthread_create/3-1	PASS	
+posix/pthread_create/3-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_create\3-2.c:308:2: error: unknown type name 'pthread_barrier_t'
+posix/pthread_create/4-1	PASS	
+posix/pthread_create/5-1	PASS	
+posix/pthread_create/8-1	PASS	
+posix/pthread_detach/1-1	PASS	
+posix/pthread_detach/2-1	PASS	
+posix/pthread_detach/2-2	CRASH	dyld[12895]: symbol not found in flat namespace '_sem_timedwait'
+posix/pthread_detach/3-1	PASS	
+posix/pthread_detach/4-1	PASS	
+posix/pthread_detach/4-2	PASS	
+posix/pthread_detach/4-3	FAIL	UNRESOLVED: [21:45:25]
+posix/pthread_equal/1-1	PASS	
+posix/pthread_equal/1-2	PASS	
+posix/pthread_equal/2-1	FAIL	UNRESOLVED: [21:45:25]
+posix/pthread_exit/1-1	PASS	
+posix/pthread_exit/1-2	FAIL	UNRESOLVED: [21:45:26]
+posix/pthread_exit/2-1	PASS	
+posix/pthread_exit/2-2	FAIL	UNRESOLVED: [21:45:26]
+posix/pthread_exit/3-1	PASS	
+posix/pthread_exit/3-2	FAIL	UNRESOLVED: [21:45:26]
+posix/pthread_exit/4-1	FAIL	UNRESOLVED: [21:45:26]
+posix/pthread_exit/5-1	FAIL	UNRESOLVED: [21:45:26]
+posix/pthread_exit/6-1	FAIL	UNRESOLVED: [21:45:26]
+posix/pthread_exit/6-2	FAIL	UNRESOLVED: [21:45:26]
+posix/pthread_getcpuclockid/1-1	CRASH	dyld[12918]: symbol not found in flat namespace '_pthread_getcpuclockid'
+posix/pthread_getcpuclockid/speculative/3-1	CRASH	dyld[12919]: symbol not found in flat namespace '_pthread_getcpuclockid'
+posix/pthread_getschedparam/1-1	PASS	
+posix/pthread_getschedparam/1-2	PASS	
+posix/pthread_getschedparam/1-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_getschedparam\1-3.c:78:21: error: use of undeclared identifier 'PTHREAD_BARRIER_SERIAL_THREAD'
+posix/pthread_getspecific/1-1	PASS	
+posix/pthread_getspecific/3-1	PASS	
+posix/pthread_join/1-1	PASS	
+posix/pthread_join/1-2	FAIL	UNRESOLVED: [21:45:26]
+posix/pthread_join/2-1	PASS	
+posix/pthread_join/3-1	PASS	
+posix/pthread_join/4-1	FAIL	UNRESOLVED: [21:45:29]
+posix/pthread_join/5-1	PASS	
+posix/pthread_join/6-2	PASS	
+posix/pthread_join/6-3	FAIL	UNRESOLVED: [21:45:29]
+posix/pthread_join/speculative/6-1	PASS	
+posix/pthread_key_create/1-1	PASS	
+posix/pthread_key_create/1-2	PASS	
+posix/pthread_key_create/2-1	PASS	
+posix/pthread_key_create/3-1	PASS	
+posix/pthread_key_create/speculative/5-1	FAIL	EAGAIN returned before the key limit was exceeded
+posix/pthread_key_delete/1-1	PASS	
+posix/pthread_key_delete/1-2	PASS	
+posix/pthread_key_delete/2-1	PASS	
+posix/pthread_kill/1-1	PASS	
+posix/pthread_kill/1-2	PASS	
+posix/pthread_kill/2-1	PASS	
+posix/pthread_kill/3-1	PASS	
+posix/pthread_kill/7-1	PASS	
+posix/pthread_kill/8-1	FAIL	UNRESOLVED: [21:45:31]
+posix/pthread_mutex_destroy/1-1	PASS	
+posix/pthread_mutex_destroy/2-1	PASS	
+posix/pthread_mutex_destroy/2-2	PASS	
+posix/pthread_mutex_destroy/3-1	PASS	
+posix/pthread_mutex_destroy/5-1	PASS	
+posix/pthread_mutex_destroy/5-2	PASS	
+posix/pthread_mutex_destroy/speculative/4-2	PASS	
+posix/pthread_mutex_getprioceiling/1-1	SKIP	UNSUPPORTED: PRIORITY_SCHEDULING not supported
+posix/pthread_mutex_getprioceiling/3-1	SKIP	UNSUPPORTED: PRIORITY_SCHEDULING not supported
+posix/pthread_mutex_getprioceiling/3-2	SKIP	UNSUPPORTED: PRIORITY_SCHEDULING not supported
+posix/pthread_mutex_getprioceiling/3-3	SKIP	UNSUPPORTED: PRIORITY_SCHEDULING not supported
+posix/pthread_mutex_init/1-1	PASS	
+posix/pthread_mutex_init/1-2	FAIL	UNRESOLVED: [21:45:32]
+posix/pthread_mutex_init/2-1	PASS	
+posix/pthread_mutex_init/3-1	PASS	
+posix/pthread_mutex_init/3-2	FAIL	UNRESOLVED: [21:45:32]
+posix/pthread_mutex_init/4-1	PASS	
+posix/pthread_mutex_init/5-1	FAIL	UNRESOLVED: [21:45:32]
+posix/pthread_mutex_init/speculative/5-2	SKIP	UNTESTED: [21:45:32]
+posix/pthread_mutex_lock/1-1	PASS	
+posix/pthread_mutex_lock/2-1	PASS	
+posix/pthread_mutex_lock/3-1	FAIL	UNRESOLVED: [21:45:33]
+posix/pthread_mutex_lock/4-1	FAIL	UNRESOLVED: [21:45:33]
+posix/pthread_mutex_lock/5-1	FAIL	UNRESOLVED: [21:45:33]
+posix/pthread_mutex_setprioceiling/1-1	SKIP	UNSUPPORTED: PRIORITY_SCHEDULING not supported
+posix/pthread_mutex_timedlock/1-1	CRASH	dyld[13151]: symbol not found in flat namespace '_pthread_mutex_timedlock'
+posix/pthread_mutex_timedlock/2-1	CRASH	dyld[13152]: symbol not found in flat namespace '_pthread_mutex_timedlock'
+posix/pthread_mutex_timedlock/4-1	CRASH	dyld[13153]: symbol not found in flat namespace '_pthread_mutex_timedlock'
+posix/pthread_mutex_timedlock/5-1	CRASH	dyld[13154]: symbol not found in flat namespace '_pthread_mutex_timedlock'
+posix/pthread_mutex_timedlock/5-2	CRASH	dyld[13155]: symbol not found in flat namespace '_pthread_mutex_timedlock'
+posix/pthread_mutex_timedlock/5-3	CRASH	dyld[13156]: symbol not found in flat namespace '_pthread_mutex_timedlock'
+posix/pthread_mutex_trylock/1-1	PASS	
+posix/pthread_mutex_trylock/1-2	PASS	
+posix/pthread_mutex_trylock/2-1	PASS	
+posix/pthread_mutex_trylock/3-1	PASS	
+posix/pthread_mutex_trylock/4-1	PASS	
+posix/pthread_mutex_trylock/4-2	PASS	
+posix/pthread_mutex_trylock/4-3	FAIL	UNRESOLVED: [21:45:36]
+posix/pthread_mutex_unlock/1-1	PASS	
+posix/pthread_mutex_unlock/2-1	PASS	
+posix/pthread_mutex_unlock/3-1	PASS	
+posix/pthread_mutex_unlock/5-1	PASS	
+posix/pthread_mutex_unlock/5-2	PASS	
+posix/pthread_mutexattr_destroy/1-1	PASS	
+posix/pthread_mutexattr_destroy/2-1	PASS	
+posix/pthread_mutexattr_destroy/3-1	PASS	
+posix/pthread_mutexattr_destroy/4-1	CRASH	
+posix/pthread_mutexattr_getprioceiling/1-1	FAIL	Test FAILED: Default prioceiling 0 is not compliant with SCHED_FIFO boundary.
+posix/pthread_mutexattr_getprioceiling/1-2	PASS	
+posix/pthread_mutexattr_getprioceiling/3-1	PASS	
+posix/pthread_mutexattr_getprotocol/1-1	PASS	
+posix/pthread_mutexattr_getprotocol/1-2	PASS	
+posix/pthread_mutexattr_getpshared/1-1	PASS	
+posix/pthread_mutexattr_getpshared/1-2	PASS	
+posix/pthread_mutexattr_getpshared/1-3	PASS	
+posix/pthread_mutexattr_getpshared/3-1	PASS	
+posix/pthread_mutexattr_gettype/1-1	PASS	
+posix/pthread_mutexattr_gettype/1-2	PASS	
+posix/pthread_mutexattr_gettype/1-3	PASS	
+posix/pthread_mutexattr_gettype/1-4	PASS	
+posix/pthread_mutexattr_gettype/1-5	PASS	
+posix/pthread_mutexattr_gettype/speculative/3-1	PASS	
+posix/pthread_mutexattr_init/1-1	PASS	
+posix/pthread_mutexattr_init/3-1	PASS	
+posix/pthread_mutexattr_setprioceiling/1-1	PASS	
+posix/pthread_mutexattr_setprioceiling/3-1	PASS	
+posix/pthread_mutexattr_setprioceiling/3-2	PASS	
+posix/pthread_mutexattr_setprotocol/1-1	PASS	
+posix/pthread_mutexattr_setprotocol/3-1	PASS	
+posix/pthread_mutexattr_setprotocol/3-2	PASS	
+posix/pthread_mutexattr_setpshared/1-1	PASS	
+posix/pthread_mutexattr_setpshared/1-2	PASS	
+posix/pthread_mutexattr_setpshared/2-1	PASS	
+posix/pthread_mutexattr_setpshared/2-2	PASS	
+posix/pthread_mutexattr_setpshared/3-1	PASS	
+posix/pthread_mutexattr_setpshared/3-2	PASS	
+posix/pthread_mutexattr_settype/1-1	PASS	
+posix/pthread_mutexattr_settype/2-1	PASS	
+posix/pthread_mutexattr_settype/3-1	PASS	
+posix/pthread_mutexattr_settype/3-2	PASS	
+posix/pthread_mutexattr_settype/3-3	PASS	
+posix/pthread_mutexattr_settype/3-4	PASS	
+posix/pthread_mutexattr_settype/7-1	PASS	
+posix/pthread_once/1-1	PASS	
+posix/pthread_once/1-2	PASS	
+posix/pthread_once/1-3	PASS	
+posix/pthread_once/2-1	PASS	
+posix/pthread_once/3-1	PASS	
+posix/pthread_once/4-1-buildonly	SKIP	build-only test (it compiles)
+posix/pthread_once/6-1	FAIL	UNRESOLVED: [21:45:39]
+posix/pthread_rwlock_destroy/1-1	PASS	
+posix/pthread_rwlock_destroy/3-1	PASS	
+posix/pthread_rwlock_init/1-1	PASS	
+posix/pthread_rwlock_init/2-1	PASS	
+posix/pthread_rwlock_init/3-1	PASS	
+posix/pthread_rwlock_init/6-1	PASS	
+posix/pthread_rwlock_rdlock/1-1	PASS	
+posix/pthread_rwlock_rdlock/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_rwlock_rdlock\2-1.c:151:39: error: use of undeclared identifier 'PTHREAD_RWLOCK_PREFER_WRITER_NONR
+posix/pthread_rwlock_rdlock/2-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_rwlock_rdlock\2-2.c:151:39: error: use of undeclared identifier 'PTHREAD_RWLOCK_PREFER_WRITER_NONR
+posix/pthread_rwlock_rdlock/2-3	FAIL	test_main: attempt read lock
+posix/pthread_rwlock_rdlock/4-1	PASS	
+posix/pthread_rwlock_rdlock/5-1	PASS	
+posix/pthread_rwlock_timedrdlock/1-1	CRASH	dyld[13464]: symbol not found in flat namespace '_pthread_rwlock_timedrdlock'
+posix/pthread_rwlock_timedrdlock/2-1	CRASH	dyld[13465]: symbol not found in flat namespace '_pthread_rwlock_timedrdlock'
+posix/pthread_rwlock_timedrdlock/3-1	CRASH	dyld[13466]: symbol not found in flat namespace '_pthread_rwlock_timedrdlock'
+posix/pthread_rwlock_timedrdlock/5-1	CRASH	dyld[13467]: symbol not found in flat namespace '_pthread_rwlock_timedrdlock'
+posix/pthread_rwlock_timedrdlock/6-1	CRASH	dyld[13468]: symbol not found in flat namespace '_pthread_rwlock_timedrdlock'
+posix/pthread_rwlock_timedrdlock/6-2	CRASH	dyld[13469]: symbol not found in flat namespace '_pthread_rwlock_timedrdlock'
+posix/pthread_rwlock_timedwrlock/1-1	CRASH	dyld[13470]: symbol not found in flat namespace '_pthread_rwlock_timedwrlock'
+posix/pthread_rwlock_timedwrlock/2-1	CRASH	dyld[13471]: symbol not found in flat namespace '_pthread_rwlock_timedwrlock'
+posix/pthread_rwlock_timedwrlock/3-1	CRASH	dyld[13472]: symbol not found in flat namespace '_pthread_rwlock_timedwrlock'
+posix/pthread_rwlock_timedwrlock/5-1	CRASH	dyld[13473]: symbol not found in flat namespace '_pthread_rwlock_timedwrlock'
+posix/pthread_rwlock_timedwrlock/6-1	CRASH	dyld[13474]: symbol not found in flat namespace '_pthread_rwlock_timedwrlock'
+posix/pthread_rwlock_timedwrlock/6-2	CRASH	dyld[13475]: symbol not found in flat namespace '_pthread_rwlock_timedwrlock'
+posix/pthread_rwlock_tryrdlock/1-1	PASS	
+posix/pthread_rwlock_trywrlock/1-1	PASS	
+posix/pthread_rwlock_trywrlock/speculative/3-1	FAIL	UNRESOLVED: main: Error at pthread_rwlock_unlock()
+posix/pthread_rwlock_unlock/1-1	PASS	
+posix/pthread_rwlock_unlock/2-1	PASS	
+posix/pthread_rwlock_unlock/3-1	PASS	
+posix/pthread_rwlock_unlock/4-1	PASS	
+posix/pthread_rwlock_unlock/4-2	PASS	
+posix/pthread_rwlock_wrlock/1-1	PASS	
+posix/pthread_rwlock_wrlock/2-1	PASS	
+posix/pthread_rwlock_wrlock/3-1	PASS	
+posix/pthread_rwlockattr_destroy/1-1	PASS	
+posix/pthread_rwlockattr_destroy/2-1	PASS	
+posix/pthread_rwlockattr_getpshared/1-1	PASS	
+posix/pthread_rwlockattr_getpshared/2-1	PASS	
+posix/pthread_rwlockattr_getpshared/4-1	PASS	
+posix/pthread_rwlockattr_init/1-1	PASS	
+posix/pthread_rwlockattr_init/2-1	PASS	
+posix/pthread_rwlockattr_setpshared/1-1	PASS	
+posix/pthread_self/1-1	PASS	
+posix/pthread_setcancelstate/1-1	PASS	
+posix/pthread_setcancelstate/1-2	PASS	
+posix/pthread_setcancelstate/2-1	PASS	
+posix/pthread_setcancelstate/3-1	PASS	
+posix/pthread_setcanceltype/1-1	FAIL	Test FAILED: Cancel request timed out
+posix/pthread_setcanceltype/1-2	PASS	
+posix/pthread_setcanceltype/2-1	PASS	
+posix/pthread_setschedparam/1-1	PASS	
+posix/pthread_setschedparam/1-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_setschedparam\1-2.c:115:25: error: use of undeclared identifier 'PTHREAD_BARRIER_SERIAL_THREAD'
+posix/pthread_setschedparam/4-1	PASS	
+posix/pthread_setschedparam/5-1	FAIL	UNRESOLVED: [21:46:11]
+posix/pthread_setschedprio/1-1	CRASH	dyld[13958]: symbol not found in flat namespace '_pthread_setschedprio'
+posix/pthread_setspecific/1-1	PASS	
+posix/pthread_setspecific/1-2	PASS	
+posix/pthread_sigmask/10-1	PASS	
+posix/pthread_sigmask/12-1	PASS	
+posix/pthread_sigmask/14-1	PASS	
+posix/pthread_sigmask/15-1	PASS	
+posix/pthread_sigmask/16-1	PASS	
+posix/pthread_sigmask/18-1	FAIL	UNRESOLVED: [21:46:11]
+posix/pthread_sigmask/4-1	PASS	
+posix/pthread_sigmask/5-1	PASS	
+posix/pthread_sigmask/6-1	PASS	
+posix/pthread_sigmask/7-1	PASS	
+posix/pthread_sigmask/8-1	PASS	
+posix/pthread_sigmask/8-2	PASS	
+posix/pthread_sigmask/8-3	PASS	
+posix/pthread_sigmask/9-1	PASS	
+posix/pthread_spin_destroy/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_destroy\1-1.c:27:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlo
+posix/pthread_spin_destroy/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_destroy\3-1.c:32:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlo
+posix/pthread_spin_init/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_init\1-1.c:29:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlock_
+posix/pthread_spin_init/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_init\2-1.c:36:2: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlock_
+posix/pthread_spin_init/2-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_init\2-2.c:43:2: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlock_
+posix/pthread_spin_init/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_init\4-1.c:33:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlock_
+posix/pthread_spin_lock/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_lock\1-1.c:30:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlock_
+posix/pthread_spin_lock/1-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_lock\1-2.c:30:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlock_
+posix/pthread_spin_lock/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_lock\3-1.c:37:2: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlock_
+posix/pthread_spin_lock/3-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_lock\3-2.c:44:2: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlock_
+posix/pthread_spin_trylock/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_trylock\1-1.c:31:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlo
+posix/pthread_spin_trylock/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_trylock\4-1.c:28:2: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwlo
+posix/pthread_spin_unlock/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_unlock\1-1.c:32:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwloc
+posix/pthread_spin_unlock/1-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_unlock\1-2.c:34:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwloc
+posix/pthread_spin_unlock/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_spin_unlock\3-1.c:32:8: error: unknown type name 'pthread_spinlock_t'; did you mean 'pthread_rwloc
+posix/pthread_testcancel/1-1	PASS	
+posix/pthread_testcancel/2-1	PASS	
+posix/raise/1-1	PASS	
+posix/raise/1-2	PASS	
+posix/raise/10000-1	PASS	
+posix/raise/2-1	PASS	
+posix/raise/4-1	PASS	
+posix/raise/6-1	PASS	
+posix/raise/7-1	PASS	
+posix/sched_get_priority_max/1-1	PASS	
+posix/sched_get_priority_max/1-2	PASS	
+posix/sched_get_priority_max/1-3	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_get_priority_max/1-4	PASS	
+posix/sched_get_priority_max/2-1	FAIL	did no returned -1.
+posix/sched_get_priority_min/1-1	PASS	
+posix/sched_get_priority_min/1-2	PASS	
+posix/sched_get_priority_min/1-3	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_get_priority_min/1-4	PASS	
+posix/sched_get_priority_min/2-1	FAIL	did not returned -1.
+posix/sched_getparam/1-1	CRASH	dyld[14201]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_getparam/2-1	CRASH	dyld[14202]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_getparam/3-1	CRASH	dyld[14203]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_getparam/4-1	CRASH	dyld[14204]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_getparam/6-1	CRASH	dyld[14205]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_getparam/speculative/7-1	CRASH	dyld[14206]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_getscheduler/1-1	CRASH	dyld[14207]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_getscheduler/3-1	CRASH	dyld[14208]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_getscheduler/4-1	CRASH	dyld[14209]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_getscheduler/5-1	CRASH	dyld[14210]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_getscheduler/7-1	CRASH	dyld[14211]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_rr_get_interval/1-1	CRASH	dyld[14213]: symbol not found in flat namespace '_sched_rr_get_interval'
+posix/sched_rr_get_interval/2-1	CRASH	dyld[14214]: symbol not found in flat namespace '_sched_rr_get_interval'
+posix/sched_rr_get_interval/3-1	CRASH	dyld[14215]: symbol not found in flat namespace '_sched_rr_get_interval'
+posix/sched_rr_get_interval/speculative/5-1	CRASH	dyld[14216]: symbol not found in flat namespace '_sched_rr_get_interval'
+posix/sched_setparam/1-1	CRASH	dyld[14217]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/2-1	CRASH	dyld[14218]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/2-2	CRASH	dyld[14219]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/20-1	CRASH	dyld[14220]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/21-1	CRASH	dyld[14221]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/21-2	CRASH	dyld[14222]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/22-1	CRASH	dyld[14223]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/23-1	CRASH	dyld[14224]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_setparam/23-2	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setparam/23-3	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setparam/23-4	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setparam/23-5	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setparam/23-6	CRASH	dyld[14229]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_setparam/23-7	CRASH	dyld[14230]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_setparam/25-1	CRASH	dyld[14231]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/25-2	SKIP	UNSUPPORTED: _POSIX_SPORADIC_SERVER support not available
+posix/sched_setparam/25-3	SKIP	UNSUPPORTED: _POSIX_SPORADIC_SERVER support not available
+posix/sched_setparam/25-4	SKIP	UNSUPPORTED: _POSIX_SPORADIC_SERVER support not available
+posix/sched_setparam/26-1	CRASH	dyld[14235]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/27-1	CRASH	dyld[14236]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setparam/5-1	CRASH	dyld[14237]: symbol not found in flat namespace '_sched_getparam'
+posix/sched_setparam/9-1	CRASH	dyld[14238]: symbol not found in flat namespace '_sched_setparam'
+posix/sched_setscheduler/1-1	CRASH	dyld[14239]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_setscheduler/15-1	CRASH	dyld[14240]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_setscheduler/15-2	CRASH	dyld[14241]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_setscheduler/16-1	CRASH	dyld[14242]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_setscheduler/17-1	CRASH	dyld[14243]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_setscheduler/17-2	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setscheduler/17-3	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setscheduler/17-4	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setscheduler/17-5	CRASH	dyld[14247]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_setscheduler/17-6	CRASH	dyld[14248]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_setscheduler/17-7	CRASH	dyld[14249]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_setscheduler/19-1	CRASH	dyld[14250]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_setscheduler/19-2	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setscheduler/19-3	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setscheduler/19-4	SKIP	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
+posix/sched_setscheduler/19-5	CRASH	dyld[14259]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_setscheduler/20-1	CRASH	dyld[14260]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_setscheduler/21-1	CRASH	dyld[14262]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_setscheduler/22-1	CRASH	dyld[14264]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_setscheduler/22-2	CRASH	dyld[14265]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_setscheduler/4-1	CRASH	dyld[14266]: symbol not found in flat namespace '_sched_getscheduler'
+posix/sched_yield/1-1	CRASH	dyld[14267]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sched_yield/2-1	PASS	
+posix/sem_close/1-1	PASS	
+posix/sem_close/2-1	PASS	
+posix/sem_close/3-1	PASS	
+posix/sem_close/3-2	FAIL	UNRESOLVED: [21:46:14]
+posix/sem_destroy/3-1	FAIL	UNRESOLVED: sem_init: Function not implemented
+posix/sem_destroy/4-1	FAIL	UNRESOLVED: unexpected error: sem_destroy 4-1: sem_init: Function not implemented
+posix/sem_getvalue/1-1	FAIL	UNRESOLVED: unexpected error: sem_getvalue 1-1: sem_getvalue: Function not implemented
+posix/sem_getvalue/2-1	FAIL	UNRESOLVED: unexpected error: sem_getvalue 2-1: sem_getvalue: Function not implemented
+posix/sem_getvalue/2-2	FAIL	UNRESOLVED: [21:46:14]
+posix/sem_getvalue/4-1	FAIL	TEST FAILED
+posix/sem_getvalue/5-1	FAIL	UNRESOLVED: unexpected error: sem_getvalue 5-1: sem_getvalue: Function not implemented
+posix/sem_init/1-1	FAIL	UNRESOLVED: unexpected error: sem_init 1-1: sem_getvalue: Function not implemented
+posix/sem_init/2-1	FAIL	UNRESOLVED: unexpected error: sem_init 2-1: sem_init: Function not implemented
+posix/sem_init/2-2	FAIL	UNRESOLVED: unexpected error: sem_init 2-1: sem_init: Function not implemented
+posix/sem_init/3-1	FAIL	UNRESOLVED: sem_init: Function not implemented
+posix/sem_init/3-2	FAIL	UNRESOLVED: [21:46:14]
+posix/sem_init/3-3	FAIL	UNRESOLVED: [21:46:14]
+posix/sem_init/5-1	FAIL	TEST FAILED
+posix/sem_init/5-2	FAIL	TEST FAILED
+posix/sem_init/6-1	FAIL	TEST FAILED
+posix/sem_init/7-1	PASS	
+posix/sem_open/1-1	PASS	
+posix/sem_open/1-2	PASS	
+posix/sem_open/1-3	PASS	
+posix/sem_open/1-4	PASS	
+posix/sem_open/10-1	FAIL	UNRESOLVED: unexpected error: sem_open 10-1: sem_getvalue: Function not implemented
+posix/sem_open/15-1	FAIL	[21:46:14]
+posix/sem_open/2-1	PASS	
+posix/sem_open/2-2	PASS	
+posix/sem_open/3-1	FAIL	UNRESOLVED: unexpected error: sem_open 3-1: sem_open: Undefined error: 0
+posix/sem_open/4-1	PASS	
+posix/sem_open/5-1	PASS	
+posix/sem_open/6-1	PASS	
+posix/sem_post/1-1	FAIL	UNRESOLVED: unexpected error: sem_post 1-1: sem_getvalue: Function not implemented
+posix/sem_post/1-2	FAIL	UNRESOLVED: unexpected error: sem_post 1-2: sem_getvalue: Function not implemented
+posix/sem_post/2-1	PASS	
+posix/sem_post/4-1	PASS	
+posix/sem_post/5-1	FAIL	UNRESOLVED: unexpected error: sem_post 5-1: sem_getvalue: Function not implemented
+posix/sem_post/6-1	FAIL	UNRESOLVED: unexpected error: sem_post 6-1: sem_getvalue: Function not implemented
+posix/sem_post/8-1	CRASH	dyld[14315]: symbol not found in flat namespace '_sched_setscheduler'
+posix/sem_timedwait/1-1	CRASH	dyld[14316]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/10-1	CRASH	dyld[14317]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/11-1	CRASH	dyld[14318]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/2-1	CRASH	dyld[14319]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/2-2	CRASH	dyld[14320]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/3-1	CRASH	dyld[14321]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/4-1	CRASH	dyld[14322]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/6-1	CRASH	dyld[14323]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/6-2	CRASH	dyld[14324]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/7-1	CRASH	dyld[14325]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_timedwait/9-1	CRASH	dyld[14326]: symbol not found in flat namespace '_sem_timedwait'
+posix/sem_unlink/1-1	PASS	
+posix/sem_unlink/2-1	PASS	
+posix/sem_unlink/2-2	PASS	
+posix/sem_unlink/3-1	FAIL	UNRESOLVED: [21:46:15]
+posix/sem_unlink/4-1	PASS	
+posix/sem_unlink/4-2	PASS	
+posix/sem_unlink/5-1	PASS	
+posix/sem_unlink/6-1	FAIL	UNRESOLVED: [21:46:15]
+posix/sem_unlink/7-1	PASS	
+posix/sem_unlink/9-1	PASS	
+posix/sem_wait/1-1	FAIL	UNRESOLVED: unexpected error: sem_wait 1-1: sem_getvalue: Function not implemented
+posix/sem_wait/1-2	FAIL	UNRESOLVED: unexpected error: sem_wait 1-2: sem_getvalue: Function not implemented
+posix/sem_wait/11-1	FAIL	UNRESOLVED: unexpected error: sem_trywait 11-1: sem_getvalue: Function not implemented
+posix/sem_wait/12-1	PASS	
+posix/sem_wait/13-1	FAIL	UNRESOLVED: [21:46:16]
+posix/sem_wait/3-1	FAIL	UNRESOLVED: unexpected error: sem_wait 3-1: sem_getvalue: Function not implemented
+posix/sem_wait/5-1	PASS	
+posix/sem_wait/7-1	PASS	
+posix/shm_open/1-1	PASS	
+posix/shm_open/11-1	PASS	
+posix/shm_open/13-1	FAIL	The file is open for write acces.
+posix/shm_open/14-2	PASS	
+posix/shm_open/15-1	PASS	
+posix/shm_open/16-1	PASS	
+posix/shm_open/17-1	PASS	
+posix/shm_open/18-1	FAIL	shm_open() does not set the rights permissions.
+posix/shm_open/20-1	FAIL	The shared memory object is opened for writing.
+posix/shm_open/20-2	PASS	
+posix/shm_open/20-3	PASS	
+posix/shm_open/21-1	PASS	
+posix/shm_open/22-1	PASS	
+posix/shm_open/23-1	PASS	
+posix/shm_open/25-1	FAIL	UNRESOLVED: An error occurs when calling shm_open(): Invalid argument
+posix/shm_open/26-1	PASS	
+posix/shm_open/26-2	FAIL	UNRESOLVED: You don't have permission to change your UID.
+posix/shm_open/28-1	PASS	
+posix/shm_open/28-2	PASS	
+posix/shm_open/28-3	PASS	
+posix/shm_open/32-1	PASS	
+posix/shm_open/34-1	PASS	
+posix/shm_open/37-1	PASS	
+posix/shm_open/38-1	PASS	
+posix/shm_open/39-1	PASS	
+posix/shm_open/39-2	PASS	
+posix/shm_open/41-1	PASS	
+posix/shm_open/5-1	PASS	
+posix/shm_open/8-1	PASS	
+posix/shm_unlink/1-1	PASS	
+posix/shm_unlink/10-1	FAIL	FAILED: shm_unlink: Invalid argument
+posix/shm_unlink/10-2	FAIL	FAILED: shm_unlink: Invalid argument
+posix/shm_unlink/11-1	PASS	
+posix/shm_unlink/2-1	PASS	
+posix/shm_unlink/3-1	PASS	
+posix/shm_unlink/5-1	PASS	
+posix/shm_unlink/6-1	PASS	
+posix/shm_unlink/8-1	FAIL	UNRESOLVED: You don't have permission to change your UID.
+posix/shm_unlink/9-1	FAIL	UNRESOLVED: You don't have permission to change your UID.
+posix/sigaction/1-1	PASS	
+posix/sigaction/1-10	PASS	
+posix/sigaction/1-11	PASS	
+posix/sigaction/1-12	PASS	
+posix/sigaction/1-13	PASS	
+posix/sigaction/1-14	PASS	
+posix/sigaction/1-15	PASS	
+posix/sigaction/1-16	PASS	
+posix/sigaction/1-17	PASS	
+posix/sigaction/1-18	PASS	
+posix/sigaction/1-19	PASS	
+posix/sigaction/1-2	PASS	
+posix/sigaction/1-20	PASS	
+posix/sigaction/1-21	PASS	
+posix/sigaction/1-22	PASS	
+posix/sigaction/1-23	PASS	
+posix/sigaction/1-24	PASS	
+posix/sigaction/1-25	PASS	
+posix/sigaction/1-26	PASS	
+posix/sigaction/1-3	PASS	
+posix/sigaction/1-4	PASS	
+posix/sigaction/1-5	PASS	
+posix/sigaction/1-6	PASS	
+posix/sigaction/1-7	PASS	
+posix/sigaction/1-8	PASS	
+posix/sigaction/1-9	PASS	
+posix/sigaction/10-1	FAIL	--> Sending SIGSTOP
+posix/sigaction/11-1	PASS	
+posix/sigaction/12-1	PASS	
+posix/sigaction/12-10	PASS	
+posix/sigaction/12-11	PASS	
+posix/sigaction/12-12	PASS	
+posix/sigaction/12-13	PASS	
+posix/sigaction/12-14	PASS	
+posix/sigaction/12-15	PASS	
+posix/sigaction/12-16	PASS	
+posix/sigaction/12-17	PASS	
+posix/sigaction/12-18	PASS	
+posix/sigaction/12-19	PASS	
+posix/sigaction/12-2	PASS	
+posix/sigaction/12-20	PASS	
+posix/sigaction/12-21	PASS	
+posix/sigaction/12-22	PASS	
+posix/sigaction/12-23	PASS	
+posix/sigaction/12-24	PASS	
+posix/sigaction/12-25	PASS	
+posix/sigaction/12-26	PASS	
+posix/sigaction/12-27	PASS	
+posix/sigaction/12-28	PASS	
+posix/sigaction/12-29	PASS	
+posix/sigaction/12-3	PASS	
+posix/sigaction/12-30	PASS	
+posix/sigaction/12-31	PASS	
+posix/sigaction/12-32	PASS	
+posix/sigaction/12-33	PASS	
+posix/sigaction/12-34	PASS	
+posix/sigaction/12-35	PASS	
+posix/sigaction/12-36	PASS	
+posix/sigaction/12-37	PASS	
+posix/sigaction/12-38	PASS	
+posix/sigaction/12-39	PASS	
+posix/sigaction/12-4	PASS	
+posix/sigaction/12-40	PASS	
+posix/sigaction/12-41	PASS	
+posix/sigaction/12-42	PASS	
+posix/sigaction/12-43	PASS	
+posix/sigaction/12-44	PASS	
+posix/sigaction/12-45	PASS	
+posix/sigaction/12-46	PASS	
+posix/sigaction/12-47	PASS	
+posix/sigaction/12-48	PASS	
+posix/sigaction/12-49	PASS	
+posix/sigaction/12-5	PASS	
+posix/sigaction/12-50	PASS	
+posix/sigaction/12-51	PASS	
+posix/sigaction/12-52	PASS	
+posix/sigaction/12-6	PASS	
+posix/sigaction/12-7	PASS	
+posix/sigaction/12-8	PASS	
+posix/sigaction/12-9	PASS	
+posix/sigaction/13-1	PASS	
+posix/sigaction/13-10	PASS	
+posix/sigaction/13-11	PASS	
+posix/sigaction/13-12	PASS	
+posix/sigaction/13-13	PASS	
+posix/sigaction/13-14	PASS	
+posix/sigaction/13-15	PASS	
+posix/sigaction/13-16	PASS	
+posix/sigaction/13-17	PASS	
+posix/sigaction/13-18	PASS	
+posix/sigaction/13-19	PASS	
+posix/sigaction/13-2	PASS	
+posix/sigaction/13-20	PASS	
+posix/sigaction/13-21	PASS	
+posix/sigaction/13-22	PASS	
+posix/sigaction/13-23	PASS	
+posix/sigaction/13-24	PASS	
+posix/sigaction/13-25	PASS	
+posix/sigaction/13-26	PASS	
+posix/sigaction/13-3	PASS	
+posix/sigaction/13-4	PASS	
+posix/sigaction/13-5	PASS	
+posix/sigaction/13-6	PASS	
+posix/sigaction/13-7	PASS	
+posix/sigaction/13-8	PASS	
+posix/sigaction/13-9	PASS	
+posix/sigaction/16-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigaction\16-1.c:80:3: error: use of undeclared identifier 'SIGPOLL'
+posix/sigaction/17-1	PASS	
+posix/sigaction/17-10	PASS	
+posix/sigaction/17-11	PASS	
+posix/sigaction/17-12	PASS	
+posix/sigaction/17-13	PASS	
+posix/sigaction/17-14	PASS	
+posix/sigaction/17-15	PASS	
+posix/sigaction/17-16	PASS	
+posix/sigaction/17-17	PASS	
+posix/sigaction/17-18	PASS	
+posix/sigaction/17-19	PASS	
+posix/sigaction/17-2	PASS	
+posix/sigaction/17-20	PASS	
+posix/sigaction/17-21	PASS	
+posix/sigaction/17-22	PASS	
+posix/sigaction/17-23	PASS	
+posix/sigaction/17-24	PASS	
+posix/sigaction/17-25	PASS	
+posix/sigaction/17-26	PASS	
+posix/sigaction/17-3	PASS	
+posix/sigaction/17-4	PASS	
+posix/sigaction/17-5	PASS	
+posix/sigaction/17-6	PASS	
+posix/sigaction/17-7	PASS	
+posix/sigaction/17-8	PASS	
+posix/sigaction/17-9	PASS	
+posix/sigaction/18-1	PASS	
+posix/sigaction/18-10	PASS	
+posix/sigaction/18-11	PASS	
+posix/sigaction/18-12	PASS	
+posix/sigaction/18-13	PASS	
+posix/sigaction/18-14	PASS	
+posix/sigaction/18-15	PASS	
+posix/sigaction/18-16	PASS	
+posix/sigaction/18-17	PASS	
+posix/sigaction/18-18	PASS	
+posix/sigaction/18-19	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigaction\18-19.c:67:18: error: use of undeclared identifier 'SIGPOLL'
+posix/sigaction/18-2	PASS	
+posix/sigaction/18-20	PASS	
+posix/sigaction/18-21	PASS	
+posix/sigaction/18-22	PASS	
+posix/sigaction/18-23	PASS	
+posix/sigaction/18-24	PASS	
+posix/sigaction/18-25	PASS	
+posix/sigaction/18-26	PASS	
+posix/sigaction/18-3	PASS	
+posix/sigaction/18-4	PASS	
+posix/sigaction/18-5	PASS	
+posix/sigaction/18-6	PASS	
+posix/sigaction/18-7	PASS	
+posix/sigaction/18-8	PASS	
+posix/sigaction/18-9	PASS	
+posix/sigaction/19-1	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-10	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-11	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-12	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-13	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-14	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-15	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-16	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-17	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-18	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-19	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigaction\19-19.c:50:24: error: use of undeclared identifier 'SIGPOLL'
+posix/sigaction/19-2	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-20	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-21	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-22	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-23	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-24	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-25	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-26	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-3	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-4	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-5	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-6	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-7	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-8	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/19-9	SKIP	UNTESTED: This test needs the RTS extension
+posix/sigaction/2-1	PASS	
+posix/sigaction/2-10	PASS	
+posix/sigaction/2-11	PASS	
+posix/sigaction/2-12	PASS	
+posix/sigaction/2-13	PASS	
+posix/sigaction/2-14	PASS	
+posix/sigaction/2-15	PASS	
+posix/sigaction/2-16	PASS	
+posix/sigaction/2-17	PASS	
+posix/sigaction/2-18	PASS	
+posix/sigaction/2-19	PASS	
+posix/sigaction/2-2	PASS	
+posix/sigaction/2-20	PASS	
+posix/sigaction/2-21	PASS	
+posix/sigaction/2-22	PASS	
+posix/sigaction/2-23	PASS	
+posix/sigaction/2-24	PASS	
+posix/sigaction/2-25	PASS	
+posix/sigaction/2-26	PASS	
+posix/sigaction/2-3	PASS	
+posix/sigaction/2-4	PASS	
+posix/sigaction/2-5	PASS	
+posix/sigaction/2-6	PASS	
+posix/sigaction/2-7	PASS	
+posix/sigaction/2-8	PASS	
+posix/sigaction/2-9	PASS	
+posix/sigaction/21-1	PASS	
+posix/sigaction/22-1	PASS	
+posix/sigaction/22-10	PASS	
+posix/sigaction/22-11	PASS	
+posix/sigaction/22-12	PASS	
+posix/sigaction/22-13	PASS	
+posix/sigaction/22-14	PASS	
+posix/sigaction/22-15	PASS	
+posix/sigaction/22-16	PASS	
+posix/sigaction/22-17	PASS	
+posix/sigaction/22-18	PASS	
+posix/sigaction/22-19	PASS	
+posix/sigaction/22-2	PASS	
+posix/sigaction/22-20	PASS	
+posix/sigaction/22-21	PASS	
+posix/sigaction/22-22	PASS	
+posix/sigaction/22-23	PASS	
+posix/sigaction/22-24	PASS	
+posix/sigaction/22-25	PASS	
+posix/sigaction/22-26	PASS	
+posix/sigaction/22-3	PASS	
+posix/sigaction/22-4	PASS	
+posix/sigaction/22-5	PASS	
+posix/sigaction/22-6	PASS	
+posix/sigaction/22-7	PASS	
+posix/sigaction/22-8	PASS	
+posix/sigaction/22-9	PASS	
+posix/sigaction/23-1	PASS	
+posix/sigaction/23-10	PASS	
+posix/sigaction/23-11	PASS	
+posix/sigaction/23-12	PASS	
+posix/sigaction/23-13	PASS	
+posix/sigaction/23-14	PASS	
+posix/sigaction/23-15	PASS	
+posix/sigaction/23-16	PASS	
+posix/sigaction/23-17	PASS	
+posix/sigaction/23-18	PASS	
+posix/sigaction/23-19	PASS	
+posix/sigaction/23-2	PASS	
+posix/sigaction/23-20	PASS	
+posix/sigaction/23-21	PASS	
+posix/sigaction/23-22	PASS	
+posix/sigaction/23-23	PASS	
+posix/sigaction/23-24	PASS	
+posix/sigaction/23-25	PASS	
+posix/sigaction/23-26	PASS	
+posix/sigaction/23-3	PASS	
+posix/sigaction/23-4	PASS	
+posix/sigaction/23-5	PASS	
+posix/sigaction/23-6	PASS	
+posix/sigaction/23-7	PASS	
+posix/sigaction/23-8	PASS	
+posix/sigaction/23-9	PASS	
+posix/sigaction/25-1	PASS	
+posix/sigaction/25-10	PASS	
+posix/sigaction/25-11	PASS	
+posix/sigaction/25-12	PASS	
+posix/sigaction/25-13	PASS	
+posix/sigaction/25-14	PASS	
+posix/sigaction/25-15	PASS	
+posix/sigaction/25-16	PASS	
+posix/sigaction/25-17	PASS	
+posix/sigaction/25-18	PASS	
+posix/sigaction/25-19	PASS	
+posix/sigaction/25-2	PASS	
+posix/sigaction/25-20	PASS	
+posix/sigaction/25-21	PASS	
+posix/sigaction/25-22	PASS	
+posix/sigaction/25-23	PASS	
+posix/sigaction/25-24	PASS	
+posix/sigaction/25-25	PASS	
+posix/sigaction/25-26	PASS	
+posix/sigaction/25-3	PASS	
+posix/sigaction/25-4	PASS	
+posix/sigaction/25-5	PASS	
+posix/sigaction/25-6	PASS	
+posix/sigaction/25-7	PASS	
+posix/sigaction/25-8	PASS	
+posix/sigaction/25-9	PASS	
+posix/sigaction/28-1	PASS	
+posix/sigaction/28-10	PASS	
+posix/sigaction/28-11	PASS	
+posix/sigaction/28-12	PASS	
+posix/sigaction/28-13	PASS	
+posix/sigaction/28-14	PASS	
+posix/sigaction/28-15	PASS	
+posix/sigaction/28-16	PASS	
+posix/sigaction/28-17	PASS	
+posix/sigaction/28-18	PASS	
+posix/sigaction/28-19	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigaction\28-19.c:63:13: error: use of undeclared identifier 'SIGPOLL'
+posix/sigaction/28-2	PASS	
+posix/sigaction/28-20	PASS	
+posix/sigaction/28-21	PASS	
+posix/sigaction/28-22	PASS	
+posix/sigaction/28-23	PASS	
+posix/sigaction/28-24	PASS	
+posix/sigaction/28-25	PASS	
+posix/sigaction/28-26	PASS	
+posix/sigaction/28-3	PASS	
+posix/sigaction/28-4	PASS	
+posix/sigaction/28-5	PASS	
+posix/sigaction/28-6	PASS	
+posix/sigaction/28-7	PASS	
+posix/sigaction/28-8	PASS	
+posix/sigaction/28-9	PASS	
+posix/sigaction/29-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigaction\29-1.c:92:24: error: use of undeclared identifier 'SIGRTMAX'
+posix/sigaction/3-1	PASS	
+posix/sigaction/3-10	PASS	
+posix/sigaction/3-11	PASS	
+posix/sigaction/3-12	PASS	
+posix/sigaction/3-13	PASS	
+posix/sigaction/3-14	PASS	
+posix/sigaction/3-15	PASS	
+posix/sigaction/3-16	PASS	
+posix/sigaction/3-17	PASS	
+posix/sigaction/3-18	PASS	
+posix/sigaction/3-19	PASS	
+posix/sigaction/3-2	PASS	
+posix/sigaction/3-20	PASS	
+posix/sigaction/3-21	PASS	
+posix/sigaction/3-22	PASS	
+posix/sigaction/3-23	PASS	
+posix/sigaction/3-24	PASS	
+posix/sigaction/3-25	PASS	
+posix/sigaction/3-26	PASS	
+posix/sigaction/3-3	PASS	
+posix/sigaction/3-4	PASS	
+posix/sigaction/3-5	PASS	
+posix/sigaction/3-6	PASS	
+posix/sigaction/3-7	PASS	
+posix/sigaction/3-8	PASS	
+posix/sigaction/3-9	PASS	
+posix/sigaction/30-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigaction\30-1.c:111:48: error: use of undeclared identifier 'SIGRTMAX'
+posix/sigaction/4-1	PASS	
+posix/sigaction/4-10	PASS	
+posix/sigaction/4-100	PASS	
+posix/sigaction/4-101	PASS	
+posix/sigaction/4-102	PASS	
+posix/sigaction/4-103	PASS	
+posix/sigaction/4-104	PASS	
+posix/sigaction/4-11	PASS	
+posix/sigaction/4-12	PASS	
+posix/sigaction/4-13	PASS	
+posix/sigaction/4-14	PASS	
+posix/sigaction/4-15	PASS	
+posix/sigaction/4-16	PASS	
+posix/sigaction/4-17	PASS	
+posix/sigaction/4-18	PASS	
+posix/sigaction/4-19	PASS	
+posix/sigaction/4-2	PASS	
+posix/sigaction/4-20	PASS	
+posix/sigaction/4-21	PASS	
+posix/sigaction/4-22	PASS	
+posix/sigaction/4-23	PASS	
+posix/sigaction/4-24	PASS	
+posix/sigaction/4-25	PASS	
+posix/sigaction/4-26	PASS	
+posix/sigaction/4-27	PASS	
+posix/sigaction/4-28	PASS	
+posix/sigaction/4-29	PASS	
+posix/sigaction/4-3	PASS	
+posix/sigaction/4-30	PASS	
+posix/sigaction/4-31	PASS	
+posix/sigaction/4-32	PASS	
+posix/sigaction/4-33	PASS	
+posix/sigaction/4-34	PASS	
+posix/sigaction/4-35	PASS	
+posix/sigaction/4-36	PASS	
+posix/sigaction/4-37	PASS	
+posix/sigaction/4-38	PASS	
+posix/sigaction/4-39	PASS	
+posix/sigaction/4-4	PASS	
+posix/sigaction/4-40	PASS	
+posix/sigaction/4-41	PASS	
+posix/sigaction/4-42	PASS	
+posix/sigaction/4-43	PASS	
+posix/sigaction/4-44	PASS	
+posix/sigaction/4-45	PASS	
+posix/sigaction/4-46	PASS	
+posix/sigaction/4-47	PASS	
+posix/sigaction/4-48	PASS	
+posix/sigaction/4-49	PASS	
+posix/sigaction/4-5	PASS	
+posix/sigaction/4-50	PASS	
+posix/sigaction/4-51	PASS	
+posix/sigaction/4-52	PASS	
+posix/sigaction/4-53	PASS	
+posix/sigaction/4-54	PASS	
+posix/sigaction/4-55	PASS	
+posix/sigaction/4-56	PASS	
+posix/sigaction/4-57	PASS	
+posix/sigaction/4-58	PASS	
+posix/sigaction/4-59	PASS	
+posix/sigaction/4-6	PASS	
+posix/sigaction/4-60	PASS	
+posix/sigaction/4-61	PASS	
+posix/sigaction/4-62	PASS	
+posix/sigaction/4-63	PASS	
+posix/sigaction/4-64	PASS	
+posix/sigaction/4-65	PASS	
+posix/sigaction/4-66	PASS	
+posix/sigaction/4-67	PASS	
+posix/sigaction/4-68	PASS	
+posix/sigaction/4-69	PASS	
+posix/sigaction/4-7	PASS	
+posix/sigaction/4-70	PASS	
+posix/sigaction/4-71	PASS	
+posix/sigaction/4-72	PASS	
+posix/sigaction/4-73	PASS	
+posix/sigaction/4-74	PASS	
+posix/sigaction/4-75	PASS	
+posix/sigaction/4-76	PASS	
+posix/sigaction/4-77	PASS	
+posix/sigaction/4-78	PASS	
+posix/sigaction/4-79	PASS	
+posix/sigaction/4-8	PASS	
+posix/sigaction/4-80	PASS	
+posix/sigaction/4-81	PASS	
+posix/sigaction/4-82	PASS	
+posix/sigaction/4-83	PASS	
+posix/sigaction/4-84	PASS	
+posix/sigaction/4-85	PASS	
+posix/sigaction/4-86	PASS	
+posix/sigaction/4-87	PASS	
+posix/sigaction/4-88	PASS	
+posix/sigaction/4-89	PASS	
+posix/sigaction/4-9	PASS	
+posix/sigaction/4-90	PASS	
+posix/sigaction/4-91	PASS	
+posix/sigaction/4-92	PASS	
+posix/sigaction/4-93	PASS	
+posix/sigaction/4-94	PASS	
+posix/sigaction/4-95	PASS	
+posix/sigaction/4-96	PASS	
+posix/sigaction/4-97	PASS	
+posix/sigaction/4-98	PASS	
+posix/sigaction/4-99	PASS	
+posix/sigaction/6-1	PASS	
+posix/sigaction/6-10	PASS	
+posix/sigaction/6-11	PASS	
+posix/sigaction/6-12	PASS	
+posix/sigaction/6-13	PASS	
+posix/sigaction/6-14	PASS	
+posix/sigaction/6-15	PASS	
+posix/sigaction/6-16	PASS	
+posix/sigaction/6-17	PASS	
+posix/sigaction/6-18	PASS	
+posix/sigaction/6-19	PASS	
+posix/sigaction/6-2	PASS	
+posix/sigaction/6-20	PASS	
+posix/sigaction/6-21	PASS	
+posix/sigaction/6-22	PASS	
+posix/sigaction/6-23	PASS	
+posix/sigaction/6-24	PASS	
+posix/sigaction/6-25	PASS	
+posix/sigaction/6-26	PASS	
+posix/sigaction/6-3	PASS	
+posix/sigaction/6-4	PASS	
+posix/sigaction/6-5	PASS	
+posix/sigaction/6-6	PASS	
+posix/sigaction/6-7	PASS	
+posix/sigaction/6-8	PASS	
+posix/sigaction/6-9	PASS	
+posix/sigaction/8-1	PASS	
+posix/sigaction/8-10	PASS	
+posix/sigaction/8-11	PASS	
+posix/sigaction/8-12	PASS	
+posix/sigaction/8-13	PASS	
+posix/sigaction/8-14	PASS	
+posix/sigaction/8-15	PASS	
+posix/sigaction/8-16	PASS	
+posix/sigaction/8-17	PASS	
+posix/sigaction/8-18	PASS	
+posix/sigaction/8-19	PASS	
+posix/sigaction/8-2	PASS	
+posix/sigaction/8-20	PASS	
+posix/sigaction/8-21	PASS	
+posix/sigaction/8-22	PASS	
+posix/sigaction/8-23	PASS	
+posix/sigaction/8-24	PASS	
+posix/sigaction/8-25	PASS	
+posix/sigaction/8-26	PASS	
+posix/sigaction/8-3	PASS	
+posix/sigaction/8-4	PASS	
+posix/sigaction/8-5	PASS	
+posix/sigaction/8-6	PASS	
+posix/sigaction/8-7	PASS	
+posix/sigaction/8-8	PASS	
+posix/sigaction/8-9	PASS	
+posix/sigaction/9-1	PASS	
+posix/sigaddset/1-1	PASS	
+posix/sigaddset/1-2	PASS	
+posix/sigaddset/1-3	PASS	
+posix/sigaddset/2-1	PASS	
+posix/sigaddset/4-1	FAIL	Failed sigaddset(..., -1) ret=0 errno=0
+posix/sigaltstack/1-1	PASS	
+posix/sigaltstack/10-1	PASS	
+posix/sigaltstack/11-1	PASS	
+posix/sigaltstack/12-1	PASS	
+posix/sigaltstack/2-1	PASS	
+posix/sigaltstack/3-1	PASS	
+posix/sigaltstack/5-1	PASS	
+posix/sigaltstack/6-1	PASS	
+posix/sigaltstack/7-1	PASS	
+posix/sigaltstack/8-1	PASS	
+posix/sigaltstack/9-1	PASS	
+posix/sigdelset/1-1	PASS	
+posix/sigdelset/1-2	PASS	
+posix/sigdelset/1-3	PASS	
+posix/sigdelset/1-4	PASS	
+posix/sigdelset/4-1	FAIL	Failed sigdelset(..., -1) ret=0 errno=0
+posix/sigemptyset/1-1	PASS	
+posix/sigemptyset/2-1	PASS	
+posix/sigfillset/1-1	PASS	
+posix/sigfillset/2-1	PASS	
+posix/sighold/1-1	PASS	
+posix/sighold/2-1	PASS	
+posix/sighold/3-1	PASS	
+posix/sigignore/1-1	PASS	
+posix/sigignore/4-1	PASS	
+posix/sigignore/5-1	PASS	
+posix/sigignore/6-1	PASS	
+posix/sigignore/6-2	PASS	
+posix/sigismember/3-1	PASS	
+posix/sigismember/4-1	PASS	
+posix/sigismember/5-1	FAIL	Failed sigaddset(..., -1) ret=1 errno=0
+posix/signal/1-1	PASS	
+posix/signal/2-1	PASS	
+posix/signal/3-1	PASS	
+posix/signal/5-1	PASS	
+posix/signal/6-1	PASS	
+posix/signal/7-1	PASS	
+posix/sigpause/1-1	PASS	
+posix/sigpause/1-2	PASS	
+posix/sigpause/2-1	PASS	
+posix/sigpause/3-1	PASS	
+posix/sigpause/4-1	PASS	
+posix/sigpending/1-1	PASS	
+posix/sigpending/1-2	PASS	
+posix/sigpending/1-3	PASS	
+posix/sigpending/2-1	PASS	
+posix/sigprocmask/10-1	PASS	
+posix/sigprocmask/12-1	PASS	
+posix/sigprocmask/15-1	PASS	
+posix/sigprocmask/17-1	PASS	
+posix/sigprocmask/4-1	PASS	
+posix/sigprocmask/5-1	PASS	
+posix/sigprocmask/6-1	PASS	
+posix/sigprocmask/7-1	PASS	
+posix/sigprocmask/8-1	PASS	
+posix/sigprocmask/8-2	PASS	
+posix/sigprocmask/8-3	PASS	
+posix/sigprocmask/9-1	PASS	
+posix/sigqueue/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigqueue\1-1.c:34:15: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigqueue/10-1	CRASH	dyld[19920]: symbol not found in flat namespace '_sigqueue'
+posix/sigqueue/11-1	CRASH	dyld[19921]: symbol not found in flat namespace '_sigqueue'
+posix/sigqueue/12-1	CRASH	dyld[19922]: symbol not found in flat namespace '_sigqueue'
+posix/sigqueue/2-1	CRASH	dyld[19923]: symbol not found in flat namespace '_sigqueue'
+posix/sigqueue/2-2	CRASH	dyld[19924]: symbol not found in flat namespace '_sigqueue'
+posix/sigqueue/3-1	CRASH	dyld[19925]: symbol not found in flat namespace '_sigqueue'
+posix/sigqueue/4-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigqueue\4-1.c:50:12: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigqueue/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigqueue\5-1.c:48:12: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigqueue/6-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigqueue\6-1.c:61:12: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigqueue/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigqueue\7-1.c:59:15: error: use of undeclared identifier 'SIGRTMAX'
+posix/sigqueue/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigqueue\8-1.c:51:12: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigqueue/9-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigqueue\9-1.c:67:10: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigrelse/1-1	PASS	
+posix/sigrelse/2-1	PASS	
+posix/sigrelse/3-1	PASS	
+posix/sigset/1-1	PASS	
+posix/sigset/10-1	PASS	
+posix/sigset/2-1	PASS	
+posix/sigset/3-1	PASS	
+posix/sigset/4-1	PASS	
+posix/sigset/5-1	PASS	
+posix/sigset/6-1	PASS	
+posix/sigset/7-1	PASS	
+posix/sigset/8-1	PASS	
+posix/sigset/9-1	PASS	
+posix/sigsuspend/1-1	PASS	
+posix/sigsuspend/3-1	PASS	
+posix/sigsuspend/4-1	PASS	
+posix/sigsuspend/6-1	PASS	
+posix/sigtimedwait/1-1	CRASH	dyld[19975]: symbol not found in flat namespace '_sigtimedwait'
+posix/sigtimedwait/2-1	CRASH	dyld[19977]: symbol not found in flat namespace '_sigtimedwait'
+posix/sigtimedwait/4-1	CRASH	dyld[19979]: symbol not found in flat namespace '_sigtimedwait'
+posix/sigtimedwait/5-1	CRASH	dyld[19981]: symbol not found in flat namespace '_sigtimedwait'
+posix/sigtimedwait/6-1	CRASH	dyld[19982]: symbol not found in flat namespace '_sigtimedwait'
+posix/sigwait/1-1	PASS	
+posix/sigwait/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigwait\2-1.c:42:26: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigwait/3-1	PASS	
+posix/sigwait/4-1	PASS	
+posix/sigwait/6-1	PASS	
+posix/sigwait/6-2	PASS	
+posix/sigwait/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigwait\7-1.c:105:11: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigwait/8-1	PASS	
+posix/sigwaitinfo/1-1	CRASH	dyld[20772]: symbol not found in flat namespace '_sigwaitinfo'
+posix/sigwaitinfo/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigwaitinfo\2-1.c:50:15: error: use of undeclared identifier 'SIGRTMAX'
+posix/sigwaitinfo/3-1	CRASH	dyld[20774]: symbol not found in flat namespace '_sigwaitinfo'
+posix/sigwaitinfo/5-1	CRASH	dyld[20776]: symbol not found in flat namespace '_sigwaitinfo'
+posix/sigwaitinfo/6-1	CRASH	dyld[20778]: symbol not found in flat namespace '_sigwaitinfo'
+posix/sigwaitinfo/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigwaitinfo\7-1.c:53:12: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigwaitinfo/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\sigwaitinfo\8-1.c:52:12: error: use of undeclared identifier 'SIGRTMIN'
+posix/sigwaitinfo/9-1	CRASH	dyld[20781]: symbol not found in flat namespace '_sigwaitinfo'
+posix/strchr/1-1	PASS	
+posix/strcpy/1-1	PASS	
+posix/strftime/1-1	PASS	
+posix/strftime/2-1	PASS	
+posix/strftime/3-1	PASS	
+posix/strlen/1-1	PASS	
+posix/strncpy/1-1	PASS	
+posix/strncpy/2-1	PASS	
+posix/time/1-1	PASS	
+posix/timer_create/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_create\1-1.c:46:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_create/10-1	SKIP	UNSUPPORTED: _POSIX_CPUTIME not defined
+posix/timer_create/11-1	SKIP	UNSUPPORTED: _POSIX_THREAD_CPUTIME not defined
+posix/timer_create/16-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_create\16-1.c:23:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_create/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_create\3-1.c:36:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_create/7-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_create\7-1.c:41:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_create/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_create\8-1.c:58:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_create/9-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_create\9-1.c:41:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_create/speculative/15-1	PASS	
+posix/timer_create/speculative/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_create\speculative\2-1.c:26:8: error: use of undeclared identifier 'timer_t'; did you mean 'time_t'?
+posix/timer_create/speculative/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_create\speculative\5-1.c:53:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_delete/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_delete\1-1.c:44:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_delete/1-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_delete\1-2.c:32:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_delete/speculative/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_delete\speculative\5-1.c:37:3: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_delete/speculative/5-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_delete\speculative\5-2.c:39:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_getoverrun/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_getoverrun\1-1.c:43:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_getoverrun/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_getoverrun\2-1.c:35:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_getoverrun/2-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_getoverrun\2-2.c:38:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_getoverrun/2-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_getoverrun\2-3.c:52:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_getoverrun/speculative/6-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_getoverrun\speculative\6-1.c:37:3: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_getoverrun/speculative/6-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_getoverrun\speculative\6-2.c:30:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_getoverrun/speculative/6-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_getoverrun\speculative\6-3.c:27:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_gettime/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\1-1.c:33:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_gettime/1-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\1-2.c:35:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_gettime/1-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\1-3.c:35:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_gettime/1-4	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\1-4.c:41:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_gettime/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\2-1.c:27:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_gettime/2-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\2-2.c:29:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_gettime/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\3-1.c:34:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_gettime/speculative/6-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\speculative\6-1.c:37:21: error: variable has incomplete type 'struct itimerspec'
+posix/timer_gettime/speculative/6-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\speculative\6-2.c:25:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_gettime/speculative/6-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_gettime\speculative\6-3.c:25:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/1-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\1-1.c:48:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/1-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\1-2.c:40:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/13-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\13-1.c:62:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/2-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\2-1.c:39:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/3-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\3-1.c:44:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/3-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\3-2.c:36:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/3-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\3-3.c:37:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/5-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\5-1.c:43:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/5-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\5-2.c:48:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/5-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\5-3.c:48:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/6-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\6-1.c:35:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/8-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\8-1.c:28:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/8-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\8-2.c:30:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/8-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\8-3.c:34:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/8-4	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\8-4.c:31:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/9-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\9-1.c:40:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/9-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\9-2.c:47:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/speculative/12-1	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\speculative\12-1.c:37:21: error: variable has incomplete type 'struct itimerspec'
+posix/timer_settime/speculative/12-2	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\speculative\12-2.c:29:2: error: unknown type name 'timer_t'; did you mean 'time_t'?
+posix/timer_settime/speculative/12-3	BUILD	D:\a\_temp\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\timer_settime\speculative\12-3.c:27:2: error: unknown type name 'timer_t'; did you mean 'time_t'?

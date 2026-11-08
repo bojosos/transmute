@@ -176,6 +176,12 @@ def build(ctx):
         # A TEST_RUN_OUTPUT block may list alternatives separated by a line holding only OR.
         expected = [alt for block in multiline("TEST_RUN_OUTPUT", text) for alt in re.split(r"\nOR\n", block)]
         crashes = bool(re.search(r"\bTEST_CRASHES\b", text))
+        # test.pl's run environment: the runtime prints "objc[pid]: HALTED" and exits instead of
+        # crashing, and freed memory is scribbled.
+        if crashes:
+            test.env["OBJC_DEBUG_DONT_CRASH"] = "YES"
+        if not re.search(r"\bTEST_NO_MALLOC_SCRIBBLE\b", text):
+            test.env["MallocScribble"] = "1"
         return test, None, {"expected": expected, "crashes": crashes}
 
     # test.pl gettests(): a file is a test when a line starts with TEST_ (after comment characters);
@@ -216,6 +222,9 @@ def classify(result, ctx):
         result.detail = "timed out"
         return result
     if info.get("crashes"):
+        # A run without OBJC_DEBUG_DONT_CRASH (older test lists) dies by a signal and prints no HALTED line.
+        if result.exit_code is not None and result.exit_code < 0:
+            patterns = [re.sub(r"\n?objc\\\[\\d\+\\\]: HALTED", "", p) for p in patterns]
         ok = result.exit_code not in (0, None) and (not patterns or any(re.search(p, text) for p in patterns))
     elif patterns:
         ok = any(re.search(p, text) for p in patterns) and not bad

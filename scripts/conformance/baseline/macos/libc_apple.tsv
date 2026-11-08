@@ -1,0 +1,331 @@
+# libc_apple: status of each program on real macOS (conformance-macos workflow).
+libc_apple/abort_tests/abort_pthread_corrupt_test_full	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/abort_tests/abort_pthread_corrupt_test_sig	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/abort_tests/abort_pthread_handler_test_full	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/abort_tests/abort_pthread_stack_check_corrupt_sig_test	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/abort_tests/abort_pthread_stack_check_test	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/abort_tests/abort_pthread_test	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/abort_tests/abort_workqueue_corrupt_test_full	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/abort_tests/abort_workqueue_corrupt_test_sig	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/abort_tests/abort_workqueue_handler_test_full	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/abort_tests/abort_workqueue_test	BUILD	D:\a\_temp\conformance\out\libc_apple\src\abort_tests.c:9:10: fatal error: 'platform/string.h' file not found
+libc_apple/acl_tests/acl_bad_test	PASS	
+libc_apple/arc4random/arc4random_fork	PASS	
+libc_apple/arc4random/arc4random_stats	PASS	
+libc_apple/arc4random/arc4random_stress	PASS	
+libc_apple/assumes_legacy/os_crash_sanity_legacy	PASS	
+libc_apple/backtrace/backtrace	BUILD	D:\a\_temp\conformance\out\libc_apple\src\backtrace.c:5:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/backtrace/backtrace_async	BUILD	D:\a\_temp\conformance\out\libc_apple\src\backtrace.c:5:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/backtrace/backtrace_from_fp	BUILD	D:\a\_temp\conformance\out\libc_apple\src\backtrace.c:5:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/backtrace/backtrace_image_offsets	BUILD	D:\a\_temp\conformance\out\libc_apple\src\backtrace.c:5:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/backtrace/backtrace_symbols	BUILD	D:\a\_temp\conformance\out\libc_apple\src\backtrace.c:5:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/basename_r/basename_r_null	PASS	
+libc_apple/basename_r/basename_r_pathlen	PASS	
+libc_apple/clock/clock_getres	PASS	
+libc_apple/clock/clock_gettime_cputime	PASS	
+libc_apple/clock/clock_gettime_monotonic	PASS	
+libc_apple/clock/clock_gettime_monotonic_comparison	PASS	
+libc_apple/clock/clock_gettime_monotonic_raw	PASS	
+libc_apple/clock/clock_gettime_nsec_np	PASS	
+libc_apple/clock/clock_gettime_realtime	PASS	
+libc_apple/clock/clock_gettime_uptime_raw	PASS	
+libc_apple/clock/clock_settime_negative	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\clock.c:268: clock_settime(_CLOCK_REALTIME, &old) == 0 (errno -1: Unknown error: -1)
+libc_apple/clock/clock_settime_other	PASS	
+libc_apple/clock/clock_settime_realtime	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\clock.c:222: clock_settime(_CLOCK_REALTIME, &ts) == 0 (errno -1: Unknown error: -1)
+libc_apple/collate/collate_equivalence	PASS	
+libc_apple/collate/collate_lookup	PASS	
+libc_apple/collate/collate_lookup_l	PASS	
+libc_apple/collate/collate_subst_legacy	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\collate.c:379: curloc == "legacy.subst" ("(null)" vs "legacy.subst"): Set LC_COLLATE to a legacy definition
+libc_apple/collections_basic/map_basic_128	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_basic/map_basic_32	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_basic/map_basic_64	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_basic/map_basic_string	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_basic/map_entry_string	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_basic/set_basic_32_ptr	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_basic/set_basic_64_ptr	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_basic/set_basic_str_ptr	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_edgecases/map_edge_32	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_edgecases.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_edgecases/map_edge_64	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_edgecases.c:25:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_perf/map_perf	SKIP	performance test
+libc_apple/collections_perf/set_perf	SKIP	performance test
+libc_apple/collections_random/map_random_32	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_random.c:24:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_random/map_random_64	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_random.c:24:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_random/map_random_string	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_random.c:24:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_random/set_random_32_ptr	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_random.c:24:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_random/set_random_64_ptr	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_random.c:24:10: fatal error: 'os/collections.h' file not found
+libc_apple/collections_random/set_random_str_ptr	BUILD	D:\a\_temp\conformance\out\libc_apple\src\collections_random.c:24:10: fatal error: 'os/collections.h' file not found
+libc_apple/ctermid/ctermid	PASS	
+libc_apple/ctermid/ctermid_null	PASS	
+libc_apple/ctype/ctype_digittoint	PASS	
+libc_apple/ctype/ctype_loadall	SKIP	T_META_ASROOT(true): needs root
+libc_apple/ctype/ctype_maplower	PASS	
+libc_apple/ctype/ctype_mapupper	PASS	
+libc_apple/ctype/ctype_runetype	PASS	
+libc_apple/custom_pcs_func/custom_pcs_func	PASS	
+libc_apple/darwin_bsd/os_parse_boot_arg	BUILD	D:\a\_temp\conformance\Libc-1752.120.2\src\darwin\../libdarwin\internal.h:49:10: fatal error: 'sys/syscall.h' file not found
+libc_apple/darwin_bsd/os_parse_boot_arg_from_buffer_int	BUILD	D:\a\_temp\conformance\Libc-1752.120.2\src\darwin\../libdarwin\internal.h:49:10: fatal error: 'sys/syscall.h' file not found
+libc_apple/darwin_bsd/os_parse_boot_arg_from_buffer_string	BUILD	D:\a\_temp\conformance\Libc-1752.120.2\src\darwin\../libdarwin\internal.h:49:10: fatal error: 'sys/syscall.h' file not found
+libc_apple/darwin_bsd/parse_boot_arg_value	BUILD	D:\a\_temp\conformance\Libc-1752.120.2\src\darwin\../libdarwin\internal.h:49:10: fatal error: 'sys/syscall.h' file not found
+libc_apple/dir/readdir	PASS	
+libc_apple/dir/rewinddir	PASS	
+libc_apple/dir/rewinddir_dup	PASS	
+libc_apple/dir/scandir	PASS	
+libc_apple/dir/scandir_b	PASS	
+libc_apple/dir/seekdir_basic	PASS	
+libc_apple/dir/tell_seek_tell	PASS	
+libc_apple/dirname_r/dirname_r_null	PASS	
+libc_apple/dirname_r/dirname_r_pathlen	PASS	
+libc_apple/dirstat/dirstat	BUILD	D:\a\_temp\conformance\out\libc_apple\src\dirstat.c:3:10: fatal error: 'dirstat.h' file not found
+libc_apple/dirstat/dirstat_fallback	BUILD	D:\a\_temp\conformance\out\libc_apple\src\dirstat.c:3:10: fatal error: 'dirstat.h' file not found
+libc_apple/dirstat/dirstat_flags	BUILD	D:\a\_temp\conformance\out\libc_apple\src\dirstat.c:3:10: fatal error: 'dirstat.h' file not found
+libc_apple/envbuf/envbuf_PR_38637477_full_all	PASS	
+libc_apple/envbuf/envbuf_PR_38637477_full_stdout	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\envbuf.c:83: !(IS_FLAG_SET(stdout, __SLBF)): not line buffered
+libc_apple/envbuf/envbuf_PR_38637477_line_all	PASS	
+libc_apple/envbuf/envbuf_PR_38637477_line_stdout	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\envbuf.c:74: ((__stdoutp)->_bf._size) == 32 (4096 vs 32): buffer size 32
+libc_apple/envbuf/envbuf_PR_38637477_unbuf_all	PASS	
+libc_apple/envbuf/envbuf_PR_38637477_unbuf_stdout	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\envbuf.c:62: IS_FLAG_SET(stdout, __SNBF): unbuffered
+libc_apple/err/err_multiple_exit	PASS	
+libc_apple/err/err_multiple_exit_b	PASS	
+libc_apple/execvp/execvp_failure_EACCES	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_failure_ENAMETOOLONG_absolute	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_failure_ENAMETOOLONG_relative	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_failure_ENOENT_absolute	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_failure_ENOENT_relative	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_failure_EPERM	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_failure_ETXTBSY	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_rdar_107951804	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_success_ENOEXEC	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_success_absolute	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_success_relative	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/execvp_success_searching	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/spawnp_success_absolute	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/spawnp_success_relative	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/execvp/spawnp_success_searching	BUILD	D:\a\_temp\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
+libc_apple/fbounds_safety_includes/fbounds_safety_includes	BUILD	D:\a\_temp\conformance\out\libc_apple\src\fbounds_safety_includes.c:121:10: fatal error: 'os/debug_private.h' file not found
+libc_apple/fclose/libc_hooks_fclose	PASS	
+libc_apple/fflush/fclose_enospc	SKIP	drives hdiutil (disk images)
+libc_apple/fflush/fflush_input	SKIP	drives hdiutil (disk images)
+libc_apple/fflush/fflush_unseekable_input	SKIP	drives hdiutil (disk images)
+libc_apple/fflush/ftell_feof	SKIP	drives hdiutil (disk images)
+libc_apple/fflush/libc_hooks_fflush	SKIP	drives hdiutil (disk images)
+libc_apple/fflush/putc_flush	SKIP	drives hdiutil (disk images)
+libc_apple/fflush/putc_writedrop	SKIP	drives hdiutil (disk images)
+libc_apple/fgets/libc_libc_fgets	PASS	
+libc_apple/flockfile/flockfile_preserve_errno	PASS	
+libc_apple/flockfile/ftrylockfile_preserve_errno	PASS	
+libc_apple/flockfile/funlockfile_preserve_errno	PASS	
+libc_apple/fopen/libc_hooks_fopen	PASS	
+libc_apple/forkpty/forkpty_forkfail	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\forkpty.c:44: pid == -1 && errno == 35: expected fork() to fail
+libc_apple/fprintf/libc_hooks_fprintf_l	PASS	
+libc_apple/fputs/libc_hooks_fputs	PASS	
+libc_apple/fread/libc_hooks_fread	PASS	
+libc_apple/freebsd_fmemopen/freebsd_fmemopen_test_append_binary_pos	PASS	
+libc_apple/freebsd_fmemopen/freebsd_fmemopen_test_autoalloc	PASS	
+libc_apple/freebsd_fmemopen/freebsd_fmemopen_test_binary	PASS	
+libc_apple/freebsd_fmemopen/freebsd_fmemopen_test_data_length	PASS	
+libc_apple/freebsd_fmemopen/freebsd_fmemopen_test_preexisting	PASS	
+libc_apple/freebsd_fmemopen/freebsd_fmemopen_test_size_0	PASS	
+libc_apple/freebsd_glob/glob_pathological_test	PASS	
+libc_apple/freebsd_open_memstream/freebsd_open_memstream_open_group_test	PASS	
+libc_apple/freebsd_open_memstream/freebsd_open_memstream_seek_tests	PASS	
+libc_apple/freebsd_open_memstream/freebsd_open_memstream_simple_tests	PASS	
+libc_apple/freebsd_open_wmemstream/freebsd_open_wmemstream_open_group_test	PASS	
+libc_apple/freebsd_open_wmemstream/freebsd_open_wmemstream_seek_tests	PASS	
+libc_apple/freebsd_open_wmemstream/freebsd_open_wmemstream_simple_tests	PASS	
+libc_apple/freebsd_qsort/qsort	PASS	
+libc_apple/freebsd_qsort/qsort_b	PASS	
+libc_apple/freopen/libc_hooks_freopen	PASS	
+libc_apple/ftell_ungetc/ftell_ungetc	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\ftell_ungetc.c:16: fp != (FILE*)((void*)0) (0 vs 0): Open the file
+libc_apple/fts_fd_leak/fts_fd_leak_symlink	BUILD	D:\a\_temp\conformance\out\libc_apple\src\fts_fd_leak.c:153:25: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declara
+libc_apple/fts_fd_leak/fts_fd_leak_xdev	BUILD	D:\a\_temp\conformance\out\libc_apple\src\fts_fd_leak.c:153:25: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declara
+libc_apple/fts_find/fts_find	PASS	
+libc_apple/fts_find/fts_find_empty_path	PASS	
+libc_apple/fts_nappend/fts_emptydir	PASS	
+libc_apple/fts_nappend/fts_nappend	PASS	
+libc_apple/fts_read_eperm/fts_read_eperm_directory	PASS	
+libc_apple/fts_simple/fts_simple	BUILD	D:\a\_temp\conformance\out\libc_apple\src\fts_simple.c:74:20: error: use of undeclared identifier 'MAXPATHLEN'
+libc_apple/fwide/fwide_fgets	PASS	
+libc_apple/fwide/fwide_fgetwc	PASS	
+libc_apple/fwide/fwide_nop	PASS	
+libc_apple/fwrite/libc_hooks_fwrite	PASS	
+libc_apple/getdate/getdate15	PASS	
+libc_apple/getdate/getdate21	PASS	
+libc_apple/getdate/getdate3	PASS	
+libc_apple/getdate/getdate4	PASS	
+libc_apple/getdate/getdate46	PASS	
+libc_apple/getdate/getdate53	PASS	
+libc_apple/getenv/getenv_copy_np_empty	CRASH	
+libc_apple/getenv/getenv_copy_np_returns_null	CRASH	
+libc_apple/getenv/setenv_accepts_leading_eq_sign	PASS	
+libc_apple/getenv/setenv_accepts_leading_eq_sign_getenv_copy_np	CRASH	
+libc_apple/getenv/setenv_accepts_leading_eq_sign_overwrite	PASS	
+libc_apple/getenv/setenv_accepts_leading_eq_sign_overwrite_getenv_copy_np	CRASH	
+libc_apple/getenv/setenv_dont_overwrite	PASS	
+libc_apple/getenv/setenv_dont_overwrite_getenv_copy_np	CRASH	
+libc_apple/getenv/setenv_getenv	PASS	
+libc_apple/getenv/setenv_getenv_copy_np	CRASH	
+libc_apple/getenv/setenv_overwrite	PASS	
+libc_apple/getenv/setenv_overwrite_getenv_copy_np	CRASH	
+libc_apple/inet_pton/inet_pton_strip_leading_zeros	PASS	
+libc_apple/locale/locale_PR_23679075	SKIP	excluded upstream
+libc_apple/locale/locale_PR_24165555	SKIP	excluded upstream
+libc_apple/locale/locale_PR_28774201	SKIP	excluded upstream
+libc_apple/locale/locale_PR_91564505	SKIP	excluded upstream
+libc_apple/locale/locale_cjk	SKIP	excluded upstream
+libc_apple/mktemp/mkdtemp	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/mktemp/mkostemp_all_flags	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/mktemp/mkostemp_append	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/mktemp/mkostemp_bad_flags	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/mktemp/mkostemp_cloexec	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/mktemp/mkostemp_no_flags	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/mktemp/mkstemp	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/mktemp/mkstemp_dprotected_np	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/mktemp/mktemp	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/mktemp/two_mkstemp_calls	BUILD	D:\a\_temp\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
+libc_apple/net/inet_ntop	PASS	
+libc_apple/net/inet_ntop_PR46867324	PASS	
+libc_apple/net/inet_ntop_resolve_zeroes	PASS	
+libc_apple/net/link_ntoa_basic	PASS	
+libc_apple/net/link_ntoa_overflow	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test00	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test01	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test02	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test03	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test04	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test05	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test06	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test07	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test08	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test09	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test10	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test11	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test13	PASS	
+libc_apple/netbsd_fmemopen/netbsd_fmemopen_test14	PASS	
+libc_apple/netbsd_getcwd/getcwd_err	PASS	
+libc_apple/netbsd_getcwd/getcwd_fts	PASS	
+libc_apple/netbsd_getcwd/getcwd_nested	PASS	
+libc_apple/netbsd_getenv_thread/putenv_thread	PASS	
+libc_apple/netbsd_getenv_thread/setenv_thread	PASS	
+libc_apple/netbsd_getenv_thread/unsetenv_thread	PASS	
+libc_apple/netbsd_glob/glob_star_not	PASS	
+libc_apple/netbsd_open_memstream/netbsd_open_memstream_test_open_memstream	PASS	
+libc_apple/netbsd_printf/netbsd_snprintf_c99	FAIL	exited 0 without finishing the case
+libc_apple/netbsd_printf/netbsd_snprintf_dotzero	PASS	
+libc_apple/netbsd_printf/netbsd_snprintf_float	PASS	
+libc_apple/netbsd_printf/netbsd_sprintf_zeropad	PASS	
+libc_apple/netbsd_stat/stat_chflags	PASS	
+libc_apple/netbsd_stat/stat_dir	PASS	
+libc_apple/netbsd_strerror/netbsd_strerror_basic	PASS	
+libc_apple/netbsd_strerror/netbsd_strerror_err	PASS	
+libc_apple/netbsd_strerror/netbsd_strerror_r_basic	PASS	
+libc_apple/netbsd_strerror/netbsd_strerror_r_err	PASS	
+libc_apple/netbsd_strptime/strptime_common	PASS	
+libc_apple/netbsd_strptime/strptime_day	PASS	
+libc_apple/netbsd_strptime/strptime_month	PASS	
+libc_apple/netbsd_vis/strunvis_hex	PASS	
+libc_apple/netbsd_vis/strvis_basic	PASS	
+libc_apple/netbsd_vis/strvis_cstyle_mbspace	PASS	
+libc_apple/netbsd_vis/strvis_empty	PASS	
+libc_apple/netbsd_vis/strvis_null	PASS	
+libc_apple/netbsd_vis/strvis_overflow_c	PASS	
+libc_apple/netbsd_vis/strvis_overflow_mb	PASS	
+libc_apple/nxheap/nxheap	SKIP	T_META_ASROOT(true): needs root
+libc_apple/open_memstream/perf_open_memstream	SKIP	performance test (darwintest_perf.h)
+libc_apple/os_boot_mode/os_boot_mode_basic	SKIP	excluded upstream
+libc_apple/os_simple_hash/os_simple_hash	BUILD	D:\a\_temp\conformance\out\libc_apple\src\os_simple_hash.c:3:10: fatal error: 'os/stdlib.h' file not found
+libc_apple/os_simple_hash/os_simple_hash_seeds	BUILD	D:\a\_temp\conformance\out\libc_apple\src\os_simple_hash.c:3:10: fatal error: 'os/stdlib.h' file not found
+libc_apple/os_string_include/os_string_include_test	BUILD	D:\a\_temp\conformance\out\libc_apple\src\os_string_include.c:1:10: fatal error: 'os/string.h' file not found
+libc_apple/os_variant/os_status_cache	BUILD	D:\a\_temp\conformance\out\libc_apple\src\os_variant.c:1:10: fatal error: 'os/variant_private.h' file not found
+libc_apple/os_variant/os_variant_asciibetical	BUILD	D:\a\_temp\conformance\out\libc_apple\src\os_variant.c:1:10: fatal error: 'os/variant_private.h' file not found
+libc_apple/os_variant/os_variant_basic	BUILD	D:\a\_temp\conformance\out\libc_apple\src\os_variant.c:1:10: fatal error: 'os/variant_private.h' file not found
+libc_apple/os_variant/os_variant_copy_description	BUILD	D:\a\_temp\conformance\out\libc_apple\src\os_variant.c:1:10: fatal error: 'os/variant_private.h' file not found
+libc_apple/os_variant/os_variant_detailed	BUILD	D:\a\_temp\conformance\out\libc_apple\src\os_variant.c:1:10: fatal error: 'os/variant_private.h' file not found
+libc_apple/os_variant/os_variant_override_parse	BUILD	D:\a\_temp\conformance\out\libc_apple\src\os_variant.c:1:10: fatal error: 'os/variant_private.h' file not found
+libc_apple/pclose/libc_libc_hooks_pclose	PASS	
+libc_apple/popen/libc_hooks_popen	PASS	
+libc_apple/printf/printf_PR_30663523	PASS	
+libc_apple/printf/sprintf_percent_n	PASS	
+libc_apple/psort/psort	PASS	
+libc_apple/qsort/qsort_random	PASS	
+libc_apple/qsort_perf/qsort_perf	SKIP	excluded upstream
+libc_apple/querylocale/querylocale_names	PASS	
+libc_apple/querylocale/querylocale_newlocale_names	PASS	
+libc_apple/querylocale/querylocale_order	PASS	
+libc_apple/quick_exit/quick_exit	PASS	
+libc_apple/readpassphrase/readpassphrase_stdin	PASS	
+libc_apple/realpath/realpath_basic	PASS	
+libc_apple/realpath/realpath_huge	PASS	
+libc_apple/realpath/realpath_symlink	PASS	
+libc_apple/realpath/realpath_trailing	PASS	
+libc_apple/realpath_edge/realpath_buffer_overflow	BUILD	D:\a\_temp\conformance\Libc-1752.120.2\src\darwin\../stdlib/FreeBSD/realpath.c:35:10: fatal error: 'namespace.h' file not found
+libc_apple/regex_limits/regex_limits	TIMEOUT	[LOG] 2^2 == 4
+libc_apple/rpmatch/rpmatch	PASS	
+libc_apple/scanf/scanf_character	PASS	
+libc_apple/scanf/scanf_characters	PASS	
+libc_apple/scanf/scanf_decimal	PASS	
+libc_apple/scanf/scanf_empty	PASS	
+libc_apple/scanf/scanf_hex	PASS	
+libc_apple/scanf/scanf_integer	PASS	
+libc_apple/scanf/scanf_octal	PASS	
+libc_apple/scanf/scanf_percent	PASS	
+libc_apple/scanf/scanf_pointer	PASS	
+libc_apple/scanf/scanf_read	PASS	
+libc_apple/scanf/scanf_string	PASS	
+libc_apple/scanf/scanf_unsigned	PASS	
+libc_apple/signal/sigsetops	PASS	
+libc_apple/sscanf/libc_hooks_sscanf_l	PASS	
+libc_apple/stdio/stdio_PR_22813396	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\stdio.c:93: fdopen(0, "r") == NULL: opening stream beyond limit
+libc_apple/stdio/stdio_PR_22813396_close	FAIL	[FAIL] D:\a\_temp\conformance\out\libc_apple\src\stdio.c:130: fdopen(0, "r") == NULL: opening stream beyond limit
+libc_apple/stdio/stdio_PR_63187147_SC_STREAM_MAX	PASS	
+libc_apple/stdtime/strptime_PR_10842560	PASS	
+libc_apple/stdtime/strptime_PR_24428248	PASS	
+libc_apple/stdtime/strptime_PR_5879606	PASS	
+libc_apple/stdtime/strptime_PR_6882179	PASS	
+libc_apple/stdtime/strptime_asctime	SKIP	strptime_asctime: This test expects the device to be in Pacific time
+libc_apple/stdtime/strptime_five_digit_year	PASS	
+libc_apple/stdtime/strptime_lukemftp	PASS	
+libc_apple/strerror/strerror	PASS	
+libc_apple/strlcat/strlcat	PASS	
+libc_apple/strlcat/strlcat_overlap	PASS	
+libc_apple/strlcpy/strlcpy_PR_30745460	PASS	
+libc_apple/strncat/strncat_empty_empty_unlimited	PASS	
+libc_apple/strncat/strncat_empty_empty_zero	PASS	
+libc_apple/strncat/strncat_empty_nonempty_limited	PASS	
+libc_apple/strncat/strncat_empty_nonempty_unlimited	PASS	
+libc_apple/strncat/strncat_empty_nonempty_zero	PASS	
+libc_apple/strncat/strncat_nonempty_empty_unlimited	PASS	
+libc_apple/strncat/strncat_nonempty_nonempty_limited	PASS	
+libc_apple/strncat/strncat_nonempty_nonempty_unlimited	PASS	
+libc_apple/strncat/strncat_nonempty_nonempty_zero	PASS	
+libc_apple/strptime/strptime_PR_27004626	PASS	
+libc_apple/strptime/strptime_PR_29381762	PASS	
+libc_apple/strptime/strptime_PR_42669744_1	PASS	
+libc_apple/strtod/strtod	PASS	
+libc_apple/strtod/strtod_locale	PASS	
+libc_apple/strtod/strtod_thread_locale	PASS	
+libc_apple/strtof/strtof	PASS	
+libc_apple/strtof/strtof_locale	PASS	
+libc_apple/strtold/strtold_common	PASS	
+libc_apple/strtold/strtold_locale	PASS	
+libc_apple/strtold/strtold_sanity	PASS	
+libc_apple/subsystem_test/subsystem	BUILD	D:\a\_temp\conformance\out\libc_apple\src\subsystem_test.c:33:10: fatal error: 'spawn_private.h' file not found
+libc_apple/swscanf/swscanf	PASS	
+libc_apple/swscanf/swscanf_53347577	PASS	
+libc_apple/tempnam/libc_hooks_tempnam	PASS	
+libc_apple/thread_stack_pcs/thread_stack_async_pcs	BUILD	D:\a\_temp\conformance\out\libc_apple\src\thread_stack_pcs.c:2:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/thread_stack_pcs/thread_stack_pcs	BUILD	D:\a\_temp\conformance\out\libc_apple\src\thread_stack_pcs.c:2:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/thread_stack_pcs/thread_stack_pcs_alt_broken_fp_chain	BUILD	D:\a\_temp\conformance\out\libc_apple\src\thread_stack_pcs.c:2:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/thread_stack_pcs/thread_stack_pcs_alt_exact_frames	BUILD	D:\a\_temp\conformance\out\libc_apple\src\thread_stack_pcs.c:2:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/thread_stack_pcs/thread_stack_pcs_alt_stack	BUILD	D:\a\_temp\conformance\out\libc_apple\src\thread_stack_pcs.c:2:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/thread_stack_pcs/thread_stack_pcs_alt_stack_few_frames	BUILD	D:\a\_temp\conformance\out\libc_apple\src\thread_stack_pcs.c:2:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/thread_stack_pcs/thread_stack_pcs_alt_stack_with_backtrace	BUILD	D:\a\_temp\conformance\out\libc_apple\src\thread_stack_pcs.c:2:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/thread_stack_pcs/thread_stack_pcs_dyld_stack	BUILD	D:\a\_temp\conformance\out\libc_apple\src\thread_stack_pcs.c:2:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/thread_stack_pcs/thread_stack_pcs_non_default_many_frames	BUILD	D:\a\_temp\conformance\out\libc_apple\src\thread_stack_pcs.c:2:10: fatal error: 'mach-o/dyld_priv.h' file not found
+libc_apple/timespec_get/timespec_get	PASS	
+libc_apple/timingsafe_bcmp/timingsafe_bcmp	PASS	
+libc_apple/tmpnam/libc_hooks_tmpnam	PASS	
+libc_apple/vsscanf/test_vsscanf	PASS	
+libc_apple/wchar/wchar_PR_26556792	PASS	
+libc_apple/wchar/wchar_PR_26828480	PASS	
+libc_apple/wcscoll/wcscoll_PR_142386677	PASS	
+libc_apple/wordexp/wordexp_backtick	PASS	

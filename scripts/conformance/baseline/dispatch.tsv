@@ -6,12 +6,12 @@ dispatch/api	PASS	fw-system
 dispatch/apply	PASS	fw-system	
 dispatch/c99	PASS	fw-system	
 dispatch/cascade	PASS	fw-system	
-dispatch/concur	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _dispatch_queue_set_width from library ordinal -2
+dispatch/concur	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: alchemy: Mach-O: unresolved strong import _dispatch_queue_set_width from library ordinal -2
 dispatch/context_for_key	FAIL	fw-system	alchemy: guest thread ended by an error: dispatch_queue_set_specific of an invalid queue during synthetic guest call 0x710000005070 during synthetic guest call 0x710000004db0 [worker guest pc 0x710000004db0, thread 3]
 dispatch/data	PASS	fw-system	
-dispatch/deadname	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _dispatch_mig_server from library ordinal -2
+dispatch/deadname	XFAIL	fw-system	fails on real macOS too (TIMEOUT); under Alchemy: alchemy: Mach-O: unresolved strong import _dispatch_mig_server from library ordinal -2
 dispatch/debug	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _dispatch_debug from library ordinal -2
-dispatch/drift	FAIL	fw-system	[FAIL] drift (C:\dev\conformance\out\dispatch\src\dispatch_drift.c:92)
+dispatch/drift	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] drift (C:\dev\conformance\out\dispatch\src\dispatch_drift.c:92)
 dispatch/group	FAIL	fw-system	==================================================
 dispatch/io	FAIL	fw-system	[FAIL] group wait timed out (C:\dev\conformance\out\dispatch\src\dispatch_io.c:238)
 dispatch/io_muxed	PASS	fw-system	

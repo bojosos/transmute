@@ -1,0 +1,203 @@
+# objc4: status of each program on real macOS (conformance-macos workflow).
+objc4/00-defines	SKIP	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/01-headers	SKIP	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/02-concurrentcat	BUILD	D:/a/_temp/conformance/out/objc4/test/02-concurrentcat.m:31:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/03-load-parallel	PASS	
+objc4/04-load-image-notification	BUILD	D:/a/_temp/conformance/out/objc4/test/load-image-notification-dylib.m:3:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/05-load-image-notification2	BUILD	D:/a/_temp/conformance/out/objc4/test/load-image-notification-dylib.m:3:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/06-ARCLayoutsWithoutWeak	BUILD	D:/a/_temp/conformance/out/objc4/test/ARCLayouts.m:17:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/ARCLayouts	BUILD	D:/a/_temp/conformance/out/objc4/test/ARCLayouts.m:17:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/accessors	BUILD	D:\a\_temp\conformance\out\objc4\test\accessors.m:4:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/accessors2	PASS	
+objc4/addMethod	PASS	
+objc4/addMethods	PASS	
+objc4/addProtocol	PASS	
+objc4/applescriptobjc	BUILD	D:\a\_temp\conformance\out\objc4\test\applescriptobjc.m:6:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/arr-cast	PASS	
+objc4/arr-weak	PASS	
+objc4/arr-weak-error	PASS	
+objc4/association	FAIL	BAD: failed assertion 'objc_getAssociatedObject(dynamicClass, &key) (0x2080633f0) != nil' at association.m:239
+objc4/associationForbidden	PASS	
+objc4/associationForbidden2	PASS	
+objc4/associationForbidden3	PASS	
+objc4/associationForbidden4	PASS	
+objc4/atomicProperty	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/badAltHandler	SKIP	TEST_CONFIG ARCH=x86_64
+objc4/badCache	BUILD	D:\a\_temp\conformance\out\objc4\test\badCache.m:18:10: fatal error: 'malloc_private.h' file not found
+objc4/badPool	PASS	
+objc4/badPoolCompat-ios	SKIP	TEST_CONFIG OS=iphoneos
+objc4/badPoolCompat-ios-simulator	SKIP	TEST_CONFIG OS=iphonesimulator
+objc4/badPoolCompat-macos	SKIP	TEST_CONFIG ARCH=x86_64
+objc4/badPoolCompat-tvos	SKIP	TEST_CONFIG OS=appletvos
+objc4/badPoolCompat-tvos-simulator	SKIP	TEST_CONFIG OS=appletvsimulator
+objc4/badPoolCompat-watchos	SKIP	TEST_CONFIG OS=watchos
+objc4/badPoolCompat-watchos-simulator	SKIP	TEST_CONFIG OS=watchsimulator
+objc4/badSuperclass	PASS	
+objc4/badSuperclass2	PASS	
+objc4/badTagClass	PASS	
+objc4/badTagIndex	PASS	
+objc4/bigrc	PASS	
+objc4/blocksAsImps	BUILD	D:\a\_temp\conformance\out\objc4\test\blocksAsImps.m:6:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/bool	PASS	
+objc4/cache-sel-hash	PASS	
+objc4/cacheflush	PASS	
+objc4/cacheflush-constant	BUILD	D:\a\_temp\conformance\out\objc4\test\cacheflush-constant.m:16:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/category	PASS	
+objc4/cdtors	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/classgetclass	PASS	
+objc4/classname	PASS	
+objc4/classpair	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/classpair-stress	PASS	
+objc4/classpairAddMethod	PASS	
+objc4/classversion	PASS	
+objc4/consolidatePoolPointers	FAIL	BAD: failed assertion 'gap != expectedGap * sizeof(id)' (0x0000000000000098 != 0x0000000000000018) at consolidatePoolPointers.m:103
+objc4/copyFixupHandler	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/copyIvarList	PASS	
+objc4/copyMethodList	PASS	
+objc4/copyPropertyList	PASS	
+objc4/copyProtocolList	PASS	
+objc4/createInstance	PASS	
+objc4/customDeallocInitiation	PASS	
+objc4/customrr	PASS	
+objc4/customrr-nsobject-awz	FAIL	OK: customrr-nsobject-awz.exe
+objc4/customrr-nsobject-core	FAIL	OK: customrr-nsobject-core.exe
+objc4/customrr-nsobject-none	PASS	
+objc4/customrr-nsobject-rr	FAIL	OK: customrr-nsobject-rr.exe
+objc4/customrr-nsobject-rrawz	FAIL	OK: customrr-nsobject-rrawz.exe
+objc4/customrr2	PASS	
+objc4/debugScanWeakTables	CRASH	objc[10381]: Weak reference at 0x16d0d1cf8 contains 0x3535353535353535, should contain 0x600000c70040
+objc4/definitions	PASS	
+objc4/designatedinit	PASS	
+objc4/duplicateClass	PASS	
+objc4/duplicatedClasses	PASS	
+objc4/duplicatedClasses2	PASS	
+objc4/duplicatedClasses3	PASS	
+objc4/enumClasses	FAIL	BAD: failed assertion 'dylibCount != 3' (0x0000000b != 0x00000003) at enumClasses.m:296
+objc4/enumDynamicClasses	SKIP	Swift test
+objc4/exc	PASS	
+objc4/exchangeImp	PASS	
+objc4/fakeRealizedClass	PASS	
+objc4/fakeRealizedClass2	PASS	
+objc4/faultLeaks	FAIL	OK: faultLeaks.m
+objc4/foreach	BUILD	D:\a\_temp\conformance\out\objc4\test\foreach.m:5:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/fork	PASS	
+objc4/forkInitialize	FAIL	BAD: child crashed (waitpid result 6)
+objc4/forkInitializeDisabled	SKIP	TEST_CONFIG ARCH=x86_64
+objc4/forkInitializeSingleThreaded	PASS	
+objc4/forkSync	PASS	
+objc4/forward	PASS	
+objc4/forwardDefault	PASS	
+objc4/forwardDefaultStret	PASS	
+objc4/future	BUILD	ld64.lld: error: library not found for -ld_classic
+objc4/gdb	PASS	
+objc4/getClassHook	PASS	
+objc4/getImageNameHook	PASS	
+objc4/getMethod	PASS	
+objc4/imageAPIs	PASS	
+objc4/imageorder	PASS	
+objc4/imports	SKIP	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/include-warnings	SKIP	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/includes	BUILD	D:\a\_temp\conformance\out\objc4\test\includes.c:14:10: fatal error: 'objc/List.h' file not found
+objc4/includes-objc2	BUILD	D:\a\_temp\conformance\out\objc4\test\includes.c:14:10: fatal error: 'objc/List.h' file not found
+objc4/initialize	PASS	
+objc4/initialize-autorelease	PASS	
+objc4/initializePriorityDonation	PASS	
+objc4/initializeVersusWeak	BUILD	D:\a\_temp\conformance\out\objc4\test\initializeVersusWeak.m:11:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/instanceSize	PASS	
+objc4/isaValidation	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/ismeta	PASS	
+objc4/ivar	PASS	
+objc4/ivarSlide	PASS	
+objc4/lazyClassName	PASS	
+objc4/lazyClassNameRace	SKIP	Swift test
+objc4/libraryPath	PASS	
+objc4/literals	BUILD	D:\a\_temp\conformance\out\objc4\test\literals.m:4:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/load	PASS	
+objc4/load-map-images	PASS	
+objc4/load-order	PASS	
+objc4/load-reentrant	PASS	
+objc4/methodArgs	PASS	
+objc4/methodCacheLeaks	SKIP	TEST_CONFIG ARCH=!arm64e,!arm64
+objc4/methodListSize	PASS	
+objc4/methodListSmall	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/methodSetImplementationHook	CRASH	no output
+objc4/msgSend	BUILD	D:/a/_temp/conformance/out/objc4/test/msgSend.m:25:10: fatal error: 'simd/simd.h' file not found
+objc4/msgSend-performance	SKIP	TEST_CONFIG OS=!macosx
+objc4/msgSend-performance-macos	BUILD	D:\a\_temp\conformance\out\objc4\test\msgSend-performance.m:5:10: fatal error: 'simd/simd.h' file not found
+objc4/nilAPIArgs	PASS	
+objc4/nonpointerisa	BUILD	D:\a\_temp\conformance\out\objc4\test\nonpointerisa.m:8:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/nopool	PASS	
+objc4/nscdtors	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/nsexc	BUILD	D:\a\_temp\conformance\out\objc4\test\exc.m:18:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/nsobject	PASS	
+objc4/nsprotocol	PASS	
+objc4/objectCopy	PASS	
+objc4/osVersion	BUILD	D:\a\_temp\conformance\out\objc4\test\osVersion.m:5:10: fatal error: 'mach-o/dyld_priv.h' file not found
+objc4/partiallyRealizedClass	PASS	
+objc4/patch-class-root	PASS	
+objc4/preAttachedCategories	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/preopt-caches	SKIP	TEST_CONFIG OS=iphoneos
+objc4/property	PASS	
+objc4/propertyDesc	PASS	
+objc4/protocol	PASS	
+objc4/protocolSmall	PASS	
+objc4/protocol_copyMethodList	PASS	
+objc4/protocol_copyPropertyList	PASS	
+objc4/ptrauth	SKIP	TEST_CONFIG ARCH=arm64e
+objc4/rawisa	BUILD	ld64.lld: error: cannot open /dev/null: no such file or directory
+objc4/readClassPair	PASS	
+objc4/readClassPairIvarFixup	PASS	
+objc4/realizedClassGenerationCount	PASS	
+objc4/release-race	PASS	
+objc4/release-workaround	SKIP	TEST_CONFIG ARCH=x86_64
+objc4/resolve	PASS	
+objc4/restartableRangesSynchronizeStress	PASS	
+objc4/restartableRangesSynchronizeStress2	PASS	
+objc4/retain-release-helpers	PASS	
+objc4/rootMissingCategoryClass	PASS	
+objc4/rootMissingSuperclass	PASS	
+objc4/rr-autorelease	BUILD	D:\a\_temp\conformance\out\objc4\test\rr-autorelease2.m:23:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/rr-autorelease-fast	PASS	
+objc4/rr-autorelease-fastarc	SKIP	TEST_DISABLED pending clang support for rdar://20530049
+objc4/rr-autorelease-stacklogging	BUILD	D:\a\_temp\conformance\out\objc4\test\rr-autorelease2.m:23:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/rr-nsautorelease	BUILD	D:\a\_temp\conformance\out\objc4\test\rr-autorelease2.m:23:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/rr-sidetable	SKIP	TEST_CONFIG ARCH=x86_64
+objc4/runtime	BUILD	D:\a\_temp\conformance\out\objc4\test\runtime.m:20:10: fatal error: 'mach-o/ldsyms.h' file not found
+objc4/sel	PASS	
+objc4/setAssociatedObjectHook	PASS	
+objc4/setSuper	PASS	
+objc4/signedMethodSelectors	PASS	
+objc4/subscripting	BUILD	D:\a\_temp\conformance\out\objc4\test\subscripting.m:4:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/super	PASS	
+objc4/supported-inline-refcnt	BUILD	D:\a\_temp\conformance\out\objc4\test\supported-inline-refcnt.m:10:10: fatal error: 'CoreFoundation/CoreFoundation.h' file not found
+objc4/swift-allocateClassPair	SKIP	Swift test
+objc4/swiftMetaMeta	SKIP	TEST_CONFIG ARCH=arm64e
+objc4/swiftMetadataInitializer	PASS	
+objc4/swiftMetadataInitializerRealloc	PASS	
+objc4/swiftStubClassList	PASS	
+objc4/swiftobject-no-custom-core	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/sync-error-checking	PASS	
+objc4/synchronized	PASS	
+objc4/synchronized-counter	BUILD	D:\a\_temp\conformance\out\objc4\test\synchronized-counter.m:11:10: fatal error: 'System/pthread_machdep.h' file not found
+objc4/synchronized-grid	PASS	
+objc4/taggedNSPointers	BUILD	D:\a\_temp\conformance\out\objc4\test\taggedNSPointers.m:6:9: fatal error: 'Foundation/Foundation.h' file not found
+objc4/taggedPointers	PASS	
+objc4/taggedPointersAllClasses	PASS	
+objc4/taggedPointersDisabled	PASS	
+objc4/taggedPointersTagObfuscationDisabled	PASS	
+objc4/tbi	SKIP	TEST_CONFIG OS=iphoneos
+objc4/unexpectedBuildOutput	BUILD	clang++: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+objc4/uniquelyref	BUILD	D:\a\_temp\conformance\out\objc4\test\uniquelyref.m:7:10: fatal error: 'Foundation/Foundation.h' file not found
+objc4/unload	SKIP	TEST_BUILD recipe needs the shell or test.pl internals
+objc4/unrealizedClassSafety	FAIL	OK: unrealizedClassSafety.m
+objc4/unwind	PASS	
+objc4/weak-not-registered	CRASH	no output
+objc4/weakReferenceHook	PASS	
+objc4/weakcopy	PASS	
+objc4/weakframework-missing	PASS	
+objc4/weakframework-not-missing	PASS	
+objc4/weakimport-missing	PASS	
+objc4/weakimport-not-missing	PASS	
+objc4/weakrace	PASS	
+objc4/willInitializeClassFunc	PASS	
+objc4/zone	PASS	

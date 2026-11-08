@@ -64,7 +64,9 @@ python -I scripts/conformance/conformance.py compare all --macos-results <artifa
 ```
 
 `compare` lists Alchemy-only failures (the program passes on macOS, so these are Alchemy bugs),
-failures on both, and programs that pass only under Alchemy. It also records the macOS status in
+failures on both, and programs that pass only under Alchemy. It classifies the macOS results again
+from their exit codes and output with the current harness, so an older run still reads correctly
+after a harness fix. It also records the macOS status in
 `baseline/macos/<suite>.tsv`. From then on, `report --write-baseline` marks a failure that also
 fails on macOS as XFAIL.
 
@@ -104,7 +106,9 @@ Gaps and substitutes:
   behaviour, while the `__*_chk` entry points that optimized builds call are a separate finding.
 - `objc4` follows `test.pl`. A test's output must be exactly `OK: <name>` or match `TEST_RUN_OUTPUT`,
   with no `BAD:` line. The configuration is MEM=arc unless the test allows only mrc. Swift tests are
-  skipped, and so are `TEST_BUILD` recipes that need the shell.
+  skipped, and so are `TEST_BUILD` recipes that need the shell. Tests run in test.pl's environment:
+  `OBJC_DEBUG_DONT_CRASH=YES` for `TEST_CRASHES` tests (the runtime prints `objc[pid]: HALTED` and
+  exits) and `MallocScribble=1`.
 - `libc_apple` and `libpthread` use `darwintest/`, a darwintest-compatible harness. darwintest is not
   open source; the harness implements the macros the way the open-source tests use them. Each
   `T_DECL` is one test, run as `<program> <case>`.

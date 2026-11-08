@@ -31,13 +31,13 @@ libc_apple/clock/clock_gettime_monotonic_raw	PASS	fw-system
 libc_apple/clock/clock_gettime_nsec_np	PASS	fw-system	
 libc_apple/clock/clock_gettime_realtime	PASS	fw-system	
 libc_apple/clock/clock_gettime_uptime_raw	PASS	fw-system	
-libc_apple/clock/clock_settime_negative	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\clock.c:268: clock_settime(_CLOCK_REALTIME, &old) == 0 (errno -1: Unknown error: -1)
+libc_apple/clock/clock_settime_negative	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\clock.c:268: clock_settime(_CLOCK_REALTIME, &old) == 0 (errno -1: Unknown error: -1)
 libc_apple/clock/clock_settime_other	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\clock.c:234: (*__error()) == 22 (1 vs 22)
-libc_apple/clock/clock_settime_realtime	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\clock.c:222: clock_settime(_CLOCK_REALTIME, &ts) == 0 (errno -1: Unknown error: -1)
+libc_apple/clock/clock_settime_realtime	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\clock.c:222: clock_settime(_CLOCK_REALTIME, &ts) == 0 (errno -1: Unknown error: -1)
 libc_apple/collate/collate_equivalence	FAIL	fw-system	alchemy: Mach-O: unresolved strong import ___collate_lookup from library ordinal -2
 libc_apple/collate/collate_lookup	FAIL	fw-system	alchemy: Mach-O: unresolved strong import ___collate_lookup from library ordinal -2
 libc_apple/collate/collate_lookup_l	FAIL	fw-system	alchemy: Mach-O: unresolved strong import ___collate_lookup from library ordinal -2
-libc_apple/collate/collate_subst_legacy	FAIL	fw-system	alchemy: Mach-O: unresolved strong import ___collate_lookup from library ordinal -2
+libc_apple/collate/collate_subst_legacy	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: Mach-O: unresolved strong import ___collate_lookup from library ordinal -2
 libc_apple/collections_basic/map_basic_128	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
 libc_apple/collections_basic/map_basic_32	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
 libc_apple/collections_basic/map_basic_64	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\collections_basic.c:25:10: fatal error: 'os/collections.h' file not found
@@ -81,9 +81,9 @@ libc_apple/dirstat/dirstat	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src
 libc_apple/dirstat/dirstat_fallback	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\dirstat.c:3:10: fatal error: 'dirstat.h' file not found
 libc_apple/dirstat/dirstat_flags	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\dirstat.c:3:10: fatal error: 'dirstat.h' file not found
 libc_apple/envbuf/envbuf_PR_38637477_full_all	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\envbuf.c:52: !(IS_FLAG_SET(fp, __SNBF)): not unbuffered
-libc_apple/envbuf/envbuf_PR_38637477_full_stdout	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\envbuf.c:82: !(IS_FLAG_SET(stdout, __SNBF)): not unbuffered
+libc_apple/envbuf/envbuf_PR_38637477_full_stdout	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\envbuf.c:82: !(IS_FLAG_SET(stdout, __SNBF)): not unbuffered
 libc_apple/envbuf/envbuf_PR_38637477_line_all	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\envbuf.c:43: !(IS_FLAG_SET(fp, __SNBF)): not unbuffered
-libc_apple/envbuf/envbuf_PR_38637477_line_stdout	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\envbuf.c:72: !(IS_FLAG_SET(stdout, __SNBF)): not unbuffered
+libc_apple/envbuf/envbuf_PR_38637477_line_stdout	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\envbuf.c:72: !(IS_FLAG_SET(stdout, __SNBF)): not unbuffered
 libc_apple/envbuf/envbuf_PR_38637477_unbuf_all	PASS	fw-system	
 libc_apple/envbuf/envbuf_PR_38637477_unbuf_stdout	PASS	fw-system	
 libc_apple/err/err_multiple_exit	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _err_set_exit_b from library ordinal -2
@@ -117,7 +117,7 @@ libc_apple/flockfile/flockfile_preserve_errno	PASS	fw-system
 libc_apple/flockfile/ftrylockfile_preserve_errno	PASS	fw-system	
 libc_apple/flockfile/funlockfile_preserve_errno	PASS	fw-system	
 libc_apple/fopen/libc_hooks_fopen	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _libc_set_introspection_hooks from library ordinal -2
-libc_apple/forkpty/forkpty_forkfail	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\forkpty.c:44: pid == -1 && errno == 35: expected fork() to fail
+libc_apple/forkpty/forkpty_forkfail	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\forkpty.c:44: pid == -1 && errno == 35: expected fork() to fail
 libc_apple/fprintf/libc_hooks_fprintf_l	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _libc_set_introspection_hooks from library ordinal -2
 libc_apple/fputs/libc_hooks_fputs	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _libc_set_introspection_hooks from library ordinal -2
 libc_apple/fread/libc_hooks_fread	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _libc_set_introspection_hooks from library ordinal -2
@@ -137,7 +137,7 @@ libc_apple/freebsd_open_wmemstream/freebsd_open_wmemstream_simple_tests	PASS	fw-
 libc_apple/freebsd_qsort/qsort	PASS	fw-system	
 libc_apple/freebsd_qsort/qsort_b	PASS	fw-system	
 libc_apple/freopen/libc_hooks_freopen	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _libc_set_introspection_hooks from library ordinal -2
-libc_apple/ftell_ungetc/ftell_ungetc	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\ftell_ungetc.c:16: fp != (FILE*)((void*)0) (0 vs 0): Open the file
+libc_apple/ftell_ungetc/ftell_ungetc	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\ftell_ungetc.c:16: fp != (FILE*)((void*)0) (0 vs 0): Open the file
 libc_apple/fts_fd_leak/fts_fd_leak_symlink	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\fts_fd_leak.c:153:25: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
 libc_apple/fts_fd_leak/fts_fd_leak_xdev	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\fts_fd_leak.c:153:25: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
 libc_apple/fts_find/fts_find	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _fts_open_b from library ordinal -2
@@ -156,18 +156,18 @@ libc_apple/getdate/getdate3	PASS	fw-system
 libc_apple/getdate/getdate4	PASS	fw-system	
 libc_apple/getdate/getdate46	PASS	fw-system	
 libc_apple/getdate/getdate53	PASS	fw-system	
-libc_apple/getenv/getenv_copy_np_empty	FAIL	fw-system	fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000c6c (getenv+0xc6c) sp=0x1eb33f6e9c0 thread 80612
-libc_apple/getenv/getenv_copy_np_returns_null	FAIL	fw-system	fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000b4c (getenv+0xb4c) sp=0x2c2fdf9e9b0 thread 74860
+libc_apple/getenv/getenv_copy_np_empty	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000c6c (getenv+0xc6c) sp=0x1eb33f6e9c0 thread 80612
+libc_apple/getenv/getenv_copy_np_returns_null	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000b4c (getenv+0xb4c) sp=0x2c2fdf9e9b0 thread 74860
 libc_apple/getenv/setenv_accepts_leading_eq_sign	PASS	fw-system	
-libc_apple/getenv/setenv_accepts_leading_eq_sign_getenv_copy_np	FAIL	fw-system	fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x1000010c8 (getenv+0x10c8) sp=0x20a4c2ee9b0 thread 126644
+libc_apple/getenv/setenv_accepts_leading_eq_sign_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x1000010c8 (getenv+0x10c8) sp=0x20a4c2ee9b0 thread 126644
 libc_apple/getenv/setenv_accepts_leading_eq_sign_overwrite	PASS	fw-system	
-libc_apple/getenv/setenv_accepts_leading_eq_sign_overwrite_getenv_copy_np	FAIL	fw-system	fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100001208 (getenv+0x1208) sp=0x27b69c2e990 thread 145272
+libc_apple/getenv/setenv_accepts_leading_eq_sign_overwrite_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100001208 (getenv+0x1208) sp=0x27b69c2e990 thread 145272
 libc_apple/getenv/setenv_dont_overwrite	PASS	fw-system	
-libc_apple/getenv/setenv_dont_overwrite_getenv_copy_np	FAIL	fw-system	fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000fd4 (getenv+0xfd4) sp=0x1def046e9a0 thread 114792
+libc_apple/getenv/setenv_dont_overwrite_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000fd4 (getenv+0xfd4) sp=0x1def046e9a0 thread 114792
 libc_apple/getenv/setenv_getenv	PASS	fw-system	
-libc_apple/getenv/setenv_getenv_copy_np	FAIL	fw-system	fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000d50 (getenv+0xd50) sp=0x21c6dbee9c0 thread 5376
+libc_apple/getenv/setenv_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000d50 (getenv+0xd50) sp=0x21c6dbee9c0 thread 5376
 libc_apple/getenv/setenv_overwrite	PASS	fw-system	
-libc_apple/getenv/setenv_overwrite_getenv_copy_np	FAIL	fw-system	fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000e90 (getenv+0xe90) sp=0x20bb58fe9b0 thread 23176
+libc_apple/getenv/setenv_overwrite_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000e90 (getenv+0xe90) sp=0x20bb58fe9b0 thread 23176
 libc_apple/inet_pton/inet_pton_strip_leading_zeros	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\inet_pton.c:27: address_octal_pton == int_address_decimal: Address is interpreted the same as the address without leading zeros
 libc_apple/locale/locale_PR_23679075	SKIP	fw-system	excluded upstream
 libc_apple/locale/locale_PR_24165555	SKIP	fw-system	excluded upstream
@@ -211,7 +211,7 @@ libc_apple/netbsd_getenv_thread/setenv_thread	PASS	fw-system
 libc_apple/netbsd_getenv_thread/unsetenv_thread	PASS	fw-system	
 libc_apple/netbsd_glob/glob_star_not	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\netbsd_glob.c:208: glob(p, 0x0040 | flags, ((void*)0), &gl) == 0 (errno -4: Unknown error: -4)
 libc_apple/netbsd_open_memstream/netbsd_open_memstream_test_open_memstream	PASS	fw-system	
-libc_apple/netbsd_printf/netbsd_snprintf_c99	FAIL	fw-system	exited 0 without finishing the case
+libc_apple/netbsd_printf/netbsd_snprintf_c99	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: exited 0 without finishing the case
 libc_apple/netbsd_printf/netbsd_snprintf_dotzero	PASS	fw-system	
 libc_apple/netbsd_printf/netbsd_snprintf_float	PASS	fw-system	
 libc_apple/netbsd_printf/netbsd_sprintf_zeropad	PASS	fw-system	
@@ -260,7 +260,7 @@ libc_apple/realpath/realpath_huge	FAIL	fw-system	[FAIL] C:\dev\conformance\out\l
 libc_apple/realpath/realpath_symlink	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\realpath.c:129: realpath(slnk, resb) != NULL
 libc_apple/realpath/realpath_trailing	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\realpath.c:93: realpath("/usr/null/..", result) == NULL
 libc_apple/realpath_edge/realpath_buffer_overflow	BUILD	fw-system	C:\dev\conformance\Libc-1752.120.2\src\darwin\../stdlib/FreeBSD/realpath.c:35:10: fatal error: 'namespace.h' file not found
-libc_apple/regex_limits/regex_limits	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\regex_limits.c:34: buf = malloc(size + 1) != NULL
+libc_apple/regex_limits/regex_limits	XFAIL	fw-system	fails on real macOS too (TIMEOUT); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\regex_limits.c:34: buf = malloc(size + 1) != NULL
 libc_apple/rpmatch/rpmatch	PASS	fw-system	
 libc_apple/scanf/scanf_character	PASS	fw-system	
 libc_apple/scanf/scanf_characters	PASS	fw-system	
@@ -276,8 +276,8 @@ libc_apple/scanf/scanf_string	PASS	fw-system
 libc_apple/scanf/scanf_unsigned	PASS	fw-system	
 libc_apple/signal/sigsetops	PASS	fw-system	
 libc_apple/sscanf/libc_hooks_sscanf_l	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _libc_set_introspection_hooks from library ordinal -2
-libc_apple/stdio/stdio_PR_22813396	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\stdio.c:83: (unsigned long long)stream_max == rlim.rlim_cur (20 vs 4096): stream limit equals file limit
-libc_apple/stdio/stdio_PR_22813396_close	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\stdio.c:120: (unsigned long long)stream_max == rlim.rlim_cur (20 vs 4096): stream limit equals file limit
+libc_apple/stdio/stdio_PR_22813396	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\stdio.c:83: (unsigned long long)stream_max == rlim.rlim_cur (20 vs 4096): stream limit equals file limit
+libc_apple/stdio/stdio_PR_22813396_close	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\stdio.c:120: (unsigned long long)stream_max == rlim.rlim_cur (20 vs 4096): stream limit equals file limit
 libc_apple/stdio/stdio_PR_63187147_SC_STREAM_MAX	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\stdio.c:46: err != -1: setrlimit(RLIMIT_NOFILE) to RLIM_INFINITY
 libc_apple/stdtime/strptime_PR_10842560	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\stdtime.c:151: Buf == tp->result ("" vs "Sun Feb 12 2012 23:00"): %V:%w:%Y:%H | 6:0:2012:23
 libc_apple/stdtime/strptime_PR_24428248	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\stdtime.c:19: percent_j_out == standard_out (1167516015 vs 1174428015)

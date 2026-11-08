@@ -1,0 +1,344 @@
+# libc_test: status of each program on real macOS (conformance-macos workflow).
+functional/argv	PASS	
+functional/basename	PASS	
+functional/clocale_mbfuncs	PASS	
+functional/clock_gettime	PASS	
+functional/crypt	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\crypt.c:2:10: fatal error: 'crypt.h' file not found
+functional/dirname	PASS	
+functional/dlopen	PASS	
+functional/env	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\env.c:19:6: error: call to undeclared function 'clearenv'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-decl
+functional/fcntl	PASS	
+functional/fdopen	PASS	
+functional/fnmatch	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\fnmatch.c:159: fnmatch("[[?*\]", "\", 0) failed, got 2 want 0
+functional/fscanf	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\fscanf.c:52: fscanf(f, "ld %5i%2i", &x, &y) failed (got 2 fields, expected 1)
+functional/fwscanf	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\fwscanf.c:71: fwscanf(f, L"%lf%n %d", &u, &x, &y) failed (1 != 0)
+functional/iconv_open	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\iconv_open.c:3:10: fatal error: 'iconv.h' file not found
+functional/inet_pton	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\inet_pton.c:108: inet_pton(AF_INET, "1.2.03.4", addr) returned 1, want 0
+functional/ipc_msg	PASS	
+functional/ipc_sem	PASS	
+functional/ipc_shm	PASS	
+functional/mbc	PASS	
+functional/memstream	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\memstream.c:83: getc(f) failed (15 != -1)
+functional/mntent	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\mntent.c:5:10: fatal error: 'mntent.h' file not found
+functional/popen	PASS	
+functional/pthread_cancel	TIMEOUT	D:\a\_temp\conformance\out\libc-test\src\functional\pthread_cancel.c:69: sem_init(&sem1, 0, 0) failed: Unknown error: -1 (creating semaphore)
+functional/pthread_cancel-points	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\pthread_cancel-points.c:43:8: error: call to undeclared function 'sem_timedwait'; ISO C99 and later do not support implicit function declarations [-
+functional/pthread_cond	PASS	
+functional/pthread_mutex	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\pthread_mutex.c:53:6: error: call to undeclared function 'sem_timedwait'; ISO C99 and later do not support implicit function declarations [-Wimplici
+functional/pthread_mutex_pi	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\pthread_mutex_pi.c:54:6: error: call to undeclared function 'sem_timedwait'; ISO C99 and later do not support implicit function declarations [-Wimpl
+functional/pthread_robust	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\pthread_robust.c:21:2: error: call to undeclared function 'pthread_barrier_wait'; ISO C99 and later do not support implicit function declarations [-
+functional/pthread_tsd	PASS	
+functional/qsort	PASS	
+functional/random	PASS	
+functional/search_hsearch	CRASH	
+functional/search_insque	PASS	
+functional/search_lsearch	PASS	
+functional/search_tsearch	PASS	
+functional/sem_init	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\sem_init.c:19:4: error: call to undeclared function 'sem_timedwait'; ISO C99 and later do not support implicit function declarations [-Wimplicit-fun
+functional/sem_open	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\sem_open.c:33: sem_getvalue(sem, &val) == 0 failed: failed to get sem value
+functional/setjmp	PASS	
+functional/snprintf	PASS	
+functional/socket	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\socket.c:38:39: error: use of undeclared identifier 'SOCK_CLOEXEC'
+functional/spawn	PASS	
+functional/sscanf	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\sscanf.c:39: sscanf("hello, world\n", "%8c%8c", a, b) failed (2 fields, expected 1)
+functional/sscanf_long	PASS	
+functional/stat	PASS	
+functional/strftime	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\strftime.c:14: "%c": expected "Mon Jan  5 05:17:53 +10009", got "Mon Jan  5 05:17:53 10009"
+functional/string	PASS	
+functional/string_memcpy	PASS	
+functional/string_memmem	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\string_memmem.c:40: memmem("","") returned 0, wanted str+0
+functional/string_memset	PASS	
+functional/string_strchr	PASS	
+functional/string_strcspn	PASS	
+functional/string_strstr	PASS	
+functional/strptime	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\strptime.c:49: "%z": for "+0200" expected tm_gmtoff 0 but got 7200
+functional/strtod	PASS	
+functional/strtod_long	PASS	
+functional/strtod_simple	PASS	
+functional/strtof	PASS	
+functional/strtol	PASS	
+functional/strtold	PASS	
+functional/swprintf	PASS	
+functional/tgmath	PASS	
+functional/time	PASS	
+functional/tls_align	PASS	
+functional/tls_align_dlopen	PASS	
+functional/tls_init	PASS	
+functional/tls_init_dlopen	PASS	
+functional/tls_local_exec	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\tls_local_exec.c:36: [thread 1]: ptrmod(&d4096, 4096) == 0 failed address is 0x154009800, want 4096 byte alignment.
+functional/udiv	PASS	
+functional/ungetc	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\ungetc.c:34: fscanf(f, "%[h]", a) failed (got 1 fields, expected 0)
+functional/utime	BUILD	D:\a\_temp\conformance\out\libc-test\src\functional\utime.c:31:13: error: no member named 'st_atim' in 'struct stat'
+functional/vfork	PASS	
+functional/wcsstr	PASS	
+functional/wcstol	FAIL	D:\a\_temp\conformance\out\libc-test\src\functional\wcstol.c:79: wcstol(s=L"0xz", &c, 16) failed (wrong final position 0 != 1)
+functional/wordexp	CRASH	
+math/acos	PASS	
+math/acosf	PASS	
+math/acosh	PASS	
+math/acoshf	PASS	
+math/acoshl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/acosh.h:9: RN acoshl(0x1.001f1c62cf304p+0) want 0x1.f8d125ff71ccp-6 got 0x1.f8d125ff71cc2p-6 ulperr 1.853 = 0x1p+1 + -0x1.2d785ap-3
+math/acosl	PASS	
+math/asin	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/asin.h:61: RD asin(0x0p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/asinf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/asinf.h:154: bad fp exception: RN asinf(0x1p-149)=0x1p-149, want INEXACT|UNDERFLOW got INEXACT
+math/asinh	PASS	
+math/asinhf	PASS	
+math/asinhl	PASS	
+math/asinl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/asin.h:61: RD asinl(0x0p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/atan	PASS	
+math/atan2	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/atan2.h:27: bad fp exception: RN atan2(0x1p-1023,0x1p+0)=0x1p-1023, want INEXACT|UNDERFLOW got INEXACT
+math/atan2f	PASS	
+math/atan2l	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/atan2.h:27: bad fp exception: RN atan2l(0x1p-1023,0x1p+0)=0x1p-1023, want INEXACT|UNDERFLOW got INEXACT
+math/atanf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/atanf.h:165: bad fp exception: RN atanf(0x1p-149)=0x1p-149, want INEXACT|UNDERFLOW got INEXACT
+math/atanh	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/atanh.h:12: bad fp exception: RN atanh(0x1p-1024)=0x1p-1024, want INEXACT|UNDERFLOW got INEXACT
+math/atanhf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/atanhf.h:12: bad fp exception: RN atanhf(0x1p-128)=0x1p-128, want INEXACT|UNDERFLOW got INEXACT
+math/atanhl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/atanh.h:12: bad fp exception: RN atanhl(0x1p-1024)=0x1p-1024, want INEXACT|UNDERFLOW got INEXACT
+math/atanl	PASS	
+math/cbrt	PASS	
+math/cbrtf	PASS	
+math/cbrtl	PASS	
+math/ceil	PASS	
+math/ceilf	PASS	
+math/ceill	PASS	
+math/copysign	PASS	
+math/copysignf	PASS	
+math/copysignl	PASS	
+math/cos	FAIL	T got INEXACT|UNDERFLOW
+math/cosf	PASS	
+math/cosh	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/cosh.h:54: RU cosh(0x1.633ce8fb9f87dp+9) want 0x1.ffffffffffd3bp+1023 got inf ulperr 709.104 = 0x1.628002p+9 + 0x1.a6b164p-4
+math/coshf	PASS	
+math/coshl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/cosh.h:54: RU coshl(0x1.633ce8fb9f87dp+9) want 0x1.ffffffffffd3bp+1023 got inf ulperr 709.104 = 0x1.628002p+9 + 0x1.a6b164p-4
+math/cosl	FAIL	a\_temp\conformance\out\libc-test\src\math\ucb/cos.h:95: bad fp exception: RN cosl(0x1.2p-1071)=0x1p+0, want INEXACT got INEXACT|UNDERFLOW
+math/drem	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\drem.c:27:7: error: call to undeclared function 'drem'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+math/dremf	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\dremf.c:27:7: error: call to undeclared function 'dremf'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration
+math/erf	PASS	
+math/erfc	PASS	
+math/erfcf	PASS	
+math/erfcl	PASS	
+math/erff	PASS	
+math/erfl	PASS	
+math/exp	FAIL	NEXACT|UNDERFLOW
+math/exp10	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\exp10.c:27:7: error: call to undeclared function 'exp10'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration
+math/exp10f	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\exp10f.c:27:7: error: call to undeclared function 'exp10f'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declarati
+math/exp10l	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\exp10l.c:33:7: error: call to undeclared function 'exp10l'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declarati
+math/exp2	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/exp2.h:11: bad fp exception: RN exp2(-0x1.ff0cccccccccdp+9)=0x1.ddb680117aa8ep-1023, want INEXACT|UNDERFLOW got INEXACT
+math/exp2f	PASS	
+math/exp2l	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/exp2.h:11: bad fp exception: RN exp2l(-0x1.ff0cccccccccdp+9)=0x1.ddb680117aa8ep-1023, want INEXACT|UNDERFLOW got INEXACT
+math/expf	PASS	
+math/expl	FAIL	\conformance\out\libc-test\src\math\ucb/exp.h:55: bad fp exception: RN expl(-0x1p-1074)=0x1p+0, want INEXACT got INEXACT|UNDERFLOW
+math/expm1	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/expm1.h:20: bad fp exception: RN expm1(0x1p-1074)=0x1p-1074, want INEXACT|UNDERFLOW got 0
+math/expm1f	PASS	
+math/expm1l	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/expm1.h:20: bad fp exception: RN expm1l(0x1p-1074)=0x1p-1074, want INEXACT|UNDERFLOW got 0
+math/fabs	PASS	
+math/fabsf	PASS	
+math/fabsl	PASS	
+math/fdim	PASS	
+math/fdimf	PASS	
+math/fdiml	PASS	
+math/fenv	PASS	
+math/floor	PASS	
+math/floorf	PASS	
+math/floorl	PASS	
+math/fma	PASS	
+math/fmaf	PASS	
+math/fmal	PASS	
+math/fmax	PASS	
+math/fmaxf	PASS	
+math/fmaxl	PASS	
+math/fmin	PASS	
+math/fminf	PASS	
+math/fminl	PASS	
+math/fmod	FAIL	: RZ fmod(-0x1.ffffffffffffep-1023,0x0p+0)=nan, want INVALID got 0
+math/fmodf	FAIL	x1.fffffcp-127,0x0p+0)=nan, want INVALID got 0
+math/fmodl	FAIL	1023,0x0p+0)=nan, want INVALID got 0
+math/fpclassify	PASS	
+math/frexp	PASS	
+math/frexpf	PASS	
+math/frexpl	PASS	
+math/hypot	PASS	
+math/hypotf	PASS	
+math/hypotl	PASS	
+math/ilogb	PASS	
+math/ilogbf	PASS	
+math/ilogbl	PASS	
+math/isless	PASS	
+math/j0	PASS	
+math/j0f	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\j0f.c:28:7: error: call to undeclared function 'j0f'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+math/j1	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/j1.h:4: RN j1(-inf) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/j1f	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\j1f.c:28:7: error: call to undeclared function 'j1f'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+math/jn	FAIL	X D:\a\_temp\conformance\out\libc-test\src\math\sanity/jn.h:8: RN jn(5, 0x1.1f9ef934745cbp-1) want 0x1.e274364abf2d5p-17 got 0x1.e274364abf2d2p-17, ulperr -2.504 = -0x1.8p+1 + 0x1.fbe5c8p-2
+math/jnf	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\jnf.c:27:7: error: call to undeclared function 'jnf'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+math/ldexp	PASS	
+math/ldexpf	PASS	
+math/ldexpl	PASS	
+math/lgamma	FAIL	pecial/lgamma.h:106: RN lgamma(-0x1.59ffffffffffep+7) want -0x1.59c22e3bbae09p+9,-1 got -0x1.59c23a9c02fa5p+9,-1 ulperr -3322184192.000 = -0x1.8c0904p+31 + 0x1.7eb7f4p-2
+math/lgamma_r	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\lgamma_r.c:30:7: error: call to undeclared function 'lgamma_r'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-decla
+math/lgammaf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/lgammaf.h:1: bad fp exception: RN lgammaf(0x0p+0)=inf,1, want DIVBYZERO got 0
+math/lgammaf_r	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\lgammaf_r.c:30:7: error: call to undeclared function 'lgammaf_r'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-dec
+math/lgammal	FAIL	ffffdp+7) want -0x1.59f61483945fbp+9,-1 got -0x1.59f61966cde0dp+9,-1 ulperr -1312004096.000 = -0x1.38ce6p+30 + 0x1.f2d7dap-4
+math/lgammal_r	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\lgammal_r.c:34:7: error: call to undeclared function 'lgammal_r'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-dec
+math/llrint	PASS	
+math/llrintf	PASS	
+math/llrintl	PASS	
+math/llround	PASS	
+math/llroundf	PASS	
+math/llroundl	PASS	
+math/log	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/log.h:41: RD log(0x1p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/log10	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/log10.h:15: RD log10(0x1p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/log10f	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/log10f.h:64: RD log10f(0x1p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/log10l	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/log10.h:15: RD log10l(0x1p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/log1p	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/log1p.h:15: RD log1p(0x0p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/log1pf	PASS	
+math/log1pl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/log1p.h:15: RD log1pl(0x0p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/log2	PASS	
+math/log2f	PASS	
+math/log2l	PASS	
+math/logb	PASS	
+math/logbf	PASS	
+math/logbl	PASS	
+math/logf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/logf.h:53: RD logf(0x1p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/logl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/log.h:41: RD logl(0x1p+0) want 0x0p+0 got -0x0p+0 ulperr inf = inf + 0x0p+0
+math/lrint	PASS	
+math/lrintf	PASS	
+math/lrintl	PASS	
+math/lround	PASS	
+math/lroundf	PASS	
+math/lroundl	PASS	
+math/modf	PASS	
+math/modff	PASS	
+math/modfl	PASS	
+math/nearbyint	PASS	
+math/nearbyintf	PASS	
+math/nearbyintl	PASS	
+math/nextafter	PASS	
+math/nextafterf	PASS	
+math/nextafterl	PASS	
+math/nexttoward	PASS	
+math/nexttowardf	PASS	
+math/nexttowardl	PASS	
+math/pow	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/pow.h:146: bad fp exception: RN pow(0x0p+0,-inf)=inf, want 0 got DIVBYZERO
+math/pow10	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\pow10.c:27:7: error: call to undeclared function 'pow10'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration
+math/pow10f	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\pow10f.c:27:7: error: call to undeclared function 'pow10f'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declarati
+math/pow10l	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\pow10l.c:33:7: error: call to undeclared function 'pow10l'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declarati
+math/powf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/powf.h:280: bad fp exception: RN powf(0x0p+0,-inf)=inf, want 0 got DIVBYZERO
+math/powl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/pow.h:146: bad fp exception: RN powl(0x0p+0,-inf)=inf, want 0 got DIVBYZERO
+math/remainder	PASS	
+math/remainderf	PASS	
+math/remainderl	PASS	
+math/remquo	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\sanity/remquo.h:1: bad fp exception: RN remquo(-0x1.02239f3c6a8f1p+3,0x1.22484b9ef31fp+2)=0x1.01256314447f8p+0,-2, want 0 got INVALID
+math/remquof	PASS	
+math/remquol	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\sanity/remquo.h:1: bad fp exception: RN remquol(-0x1.02239f3c6a8f1p+3,0x1.22484b9ef31fp+2)=0x1.01256314447f8p+0,-2, want 0 got INVALID
+math/rint	PASS	
+math/rintf	PASS	
+math/rintl	PASS	
+math/round	PASS	
+math/roundf	PASS	
+math/roundl	PASS	
+math/scalb	FAIL	2: RN scalb(0x1.161868e18bc67p+2,-0x1.1c6a6cdce75e8p+3) want nan got 0x1.161868e18bc67p-6 ulperr nan = nan + 0x0p+0
+math/scalbf	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\scalbf.c:28:7: error: call to undeclared function 'scalbf'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declarati
+math/scalbln	PASS	
+math/scalblnf	PASS	
+math/scalblnl	PASS	
+math/scalbn	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/scalbn.h:18: RN scalbn(0x1.7ffffffffffffp-1, -1073) want 0x1p-1074 got 0x1p-1073, ulperr 1.000 = 0x1p+0 + 0x0p+0
+math/scalbnf	PASS	
+math/scalbnl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\special/scalbn.h:18: RN scalbnl(0x1.7ffffffffffffp-1, -1073) want 0x1p-1074 got 0x1p-1073 ulperr 1.000 = 0x1p+0 + 0x0p+0
+math/sin	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/sin.h:41: bad fp exception: RN sin(0x1p-1022)=0x1p-1022, want INEXACT got INEXACT|UNDERFLOW
+math/sincos	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\sincos.c:26:3: error: call to undeclared function 'sincos'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declarati
+math/sincosf	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\sincosf.c:26:3: error: call to undeclared function 'sincosf'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declara
+math/sincosl	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\sincosl.c:31:3: error: call to undeclared function 'sincosl'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declara
+math/sinf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/sinf.h:43: bad fp exception: RN sinf(0x1p-149)=0x1p-149, want INEXACT|UNDERFLOW got INEXACT
+math/sinh	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/sinh.h:19: bad fp exception: RN sinh(0x1p-1074)=0x1p-1074, want INEXACT|UNDERFLOW got INEXACT
+math/sinhf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/sinhf.h:84: bad fp exception: RN sinhf(0x1p-149)=0x1p-149, want INEXACT|UNDERFLOW got INEXACT
+math/sinhl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\crlibm/sinh.h:19: bad fp exception: RN sinhl(0x1p-1074)=0x1p-1074, want INEXACT|UNDERFLOW got INEXACT
+math/sinl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/sin.h:41: bad fp exception: RN sinl(0x1p-1022)=0x1p-1022, want INEXACT got INEXACT|UNDERFLOW
+math/sqrt	PASS	
+math/sqrtf	PASS	
+math/sqrtl	PASS	
+math/tan	FAIL	mance\out\libc-test\src\math\crlibm/tan.h:6224: RN tan(-0x1.0782a41f2ea62p+0) want -0x1.a9a9b6e46133dp+0 got -0x1.a9a9b6e46133bp+0 ulperr 2.003 = 0x1p+1 + 0x1.5cfdbcp-9
+math/tanf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/tanf.h:43: bad fp exception: RN tanf(0x1p-149)=0x1p-149, want INEXACT|UNDERFLOW got INEXACT
+math/tanh	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/tanh.h:40: bad fp exception: RN tanh(0x1p-1074)=0x1p-1074, want INEXACT|UNDERFLOW got INEXACT
+math/tanhf	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/tanhf.h:90: bad fp exception: RN tanhf(0x1p-149)=0x1p-149, want INEXACT|UNDERFLOW got INEXACT
+math/tanhl	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\ucb/tanh.h:40: bad fp exception: RN tanhl(0x1p-1074)=0x1p-1074, want INEXACT|UNDERFLOW got INEXACT
+math/tanl	FAIL	h\crlibm/tan.h:6224: RN tanl(-0x1.0782a41f2ea62p+0) want -0x1.a9a9b6e46133dp+0 got -0x1.a9a9b6e46133bp+0 ulperr 2.003 = 0x1p+1 + 0x1.5cfdbcp-9
+math/tgamma	FAIL	c\math\special/tgamma.h:78: RN tgamma(-0x1.5800000000004p+7) want -0x1.b98c8c968aa6ep-992 got -0x1.b98c8c968a737p-992 ulperr 822.969 = 0x1.9b8p+9 + -0x1.01aa08p-5
+math/tgammaf	PASS	
+math/tgammal	FAIL	x1.5800000000002p+7) want -0x1.b98c8c968b35p-991 got -0x1.b98c8c968b698p-991 ulperr -839.878 = -0x1.a4p+9 + 0x1.f3c9bcp-4
+math/trunc	PASS	
+math/truncf	PASS	
+math/truncl	PASS	
+math/y0	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\sanity/y0.h:1: bad fp exception: RN y0(-0x1.02239f3c6a8f1p+3)=nan, want INVALID got 0
+math/y0f	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\y0f.c:28:7: error: call to undeclared function 'y0f'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+math/y1	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\sanity/y1.h:1: bad fp exception: RN y1(-0x1.02239f3c6a8f1p+3)=nan, want INVALID got 0
+math/y1f	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\y1f.c:28:7: error: call to undeclared function 'y1f'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+math/yn	FAIL	D:\a\_temp\conformance\out\libc-test\src\math\sanity/yn.h:1: bad fp exception: RN yn(-2, -0x1.02239f3c6a8f1p+3)=nan, want INVALID got 0
+math/ynf	BUILD	D:\a\_temp\conformance\out\libc-test\src\math\ynf.c:27:7: error: call to undeclared function 'ynf'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+regression/daemon-failure	FAIL	D:\a\_temp\conformance\out\libc-test\src\regression\daemon-failure.c:50: daemon should have failed
+regression/dn_expand-empty	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\dn_expand-empty.c:4:10: fatal error: 'resolv.h' file not found
+regression/dn_expand-ptr-0	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\dn_expand-ptr-0.c:4:10: fatal error: 'resolv.h' file not found
+regression/execle-env	PASS	
+regression/fflush-exit	PASS	
+regression/fgets-eof	PASS	
+regression/fgetwc-buffering	PASS	
+regression/flockfile-list	PASS	
+regression/fpclassify-invalid-ld80	PASS	
+regression/ftello-unflushed-append	PASS	
+regression/getpwnam_r-crash	PASS	
+regression/getpwnam_r-errno	PASS	
+regression/iconv-roundtrips	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\iconv-roundtrips.c:3:10: fatal error: 'iconv.h' file not found
+regression/inet_ntop-v4mapped	PASS	
+regression/inet_pton-empty-last-field	PASS	
+regression/iswspace-null	PASS	
+regression/lrand48-signextend	FAIL	D:\a\_temp\conformance\out\libc-test\src\regression\lrand48-signextend.c:10: 1st lrand48() got 851401618 want 0
+regression/lseek-large	PASS	
+regression/malloc-0	PASS	
+regression/malloc-brk-fail	SKIP	allocates until failure; needs setrlimit(RLIMIT_AS), ENOSYS today
+regression/malloc-oom	SKIP	allocates until failure; needs setrlimit(RLIMIT_AS), ENOSYS today
+regression/mbsrtowcs-overflow	PASS	
+regression/memmem-oob	PASS	
+regression/memmem-oob-read	PASS	
+regression/mkdtemp-failure	FAIL	D:\a\_temp\conformance\out\libc-test\src\regression\mkdtemp-failure.c:25: mkdtemp(/dev/null/fooXXXX) modified the template: /dev/null/fooP9iY
+regression/mkstemp-failure	FAIL	D:\a\_temp\conformance\out\libc-test\src\regression\mkstemp-failure.c:24: mkstemp(/dev/null/fooXXXX) modified the template: /dev/null/fooP9XH
+regression/printf-1e9-oob	PASS	
+regression/printf-fmt-g-round	FAIL	D:\a\_temp\conformance\out\libc-test\src\regression\printf-fmt-g-round.c:13: snprintf("%.12g", 1000000000005.000000) want 1e+12 got 1.00000000000e+12
+regression/printf-fmt-g-zeros	PASS	
+regression/printf-fmt-n	PASS	
+regression/pthread-robust-detach	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\pthread-robust-detach.c:13:8: error: unknown type name 'pthread_barrier_t'
+regression/pthread_atfork-errno-clobber	FAIL	D:\a\_temp\conformance\out\libc-test\src\regression\pthread_atfork-errno-clobber.c:27: errno != 0 failed: fork failed but errno was clobbered
+regression/pthread_cancel-sem_wait	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\pthread_cancel-sem_wait.c:34:2: error: call to undeclared function 'sem_timedwait'; ISO C99 and later do not support implicit function declarations 
+regression/pthread_cond-smasher	PASS	
+regression/pthread_cond_wait-cancel_ignored	PASS	
+regression/pthread_condattr_setclock	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\pthread_condattr_setclock.c:22:6: error: call to undeclared function 'pthread_condattr_setclock'; ISO C99 and later do not support implicit function
+regression/pthread_create-oom	SKIP	allocates until failure; needs setrlimit(RLIMIT_AS), ENOSYS today
+regression/pthread_exit-cancel	PASS	
+regression/pthread_exit-dtor	PASS	
+regression/pthread_once-deadlock	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\pthread_once-deadlock.c:41:4: error: call to undeclared function 'sem_timedwait'; ISO C99 and later do not support implicit function declarations [-
+regression/pthread_rwlock-ebusy	PASS	
+regression/putenv-doublefree	PASS	
+regression/raise-race	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\raise-race.c:35:13: error: use of undeclared identifier 'SIGRTMIN'
+regression/regex-backref-0	PASS	
+regression/regex-backref-oob	FAIL	D:\a\_temp\conformance\out\libc-test\src\regression\regex-backref-oob.c:35: /\(a\|b\|..*\)_\1\(.\)\2/ ~ "ab_񁁁_񁁁__", regexec returned 1 (regexec() failed to match), wanted 0
+regression/regex-bracket-icase	PASS	
+regression/regex-ere-backref	PASS	
+regression/regex-escaped-high-byte	FAIL	D:\a\_temp\conformance\out\libc-test\src\regression\regex-escaped-high-byte.c:19: regcomp(\\\xfc) returned 17 (illegal byte sequence) wanted REG_BADPAT
+regression/regex-negated-range	PASS	
+regression/regexec-backref	PASS	
+regression/regexec-nosub	PASS	
+regression/rewind-clear-error	PASS	
+regression/rlimit-open-files	PASS	
+regression/scanf-bytes-consumed	PASS	
+regression/scanf-match-literal-eof	PASS	
+regression/scanf-nullbyte-char	PASS	
+regression/sem_close-unmap	PASS	
+regression/setenv-oom	SKIP	allocates until failure; needs setrlimit(RLIMIT_AS), ENOSYS today
+regression/setvbuf-unget	PASS	
+regression/sigaltstack	PASS	
+regression/sigprocmask-internal	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\sigprocmask-internal.c:16:19: error: use of undeclared identifier 'SIGRTMIN'
+regression/sigreturn	PASS	
+regression/sscanf-eof	PASS	
+regression/statvfs	PASS	
+regression/strverscmp	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\strverscmp.c:10:9: error: call to undeclared function 'strverscmp'; ISO C99 and later do not support implicit function declarations [-Wimplicit-func
+regression/syscall-sign-extend	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\syscall-sign-extend.c:7:10: fatal error: 'sys/syscall.h' file not found
+regression/tls_get_new-dtv	BUILD	D:\a\_temp\conformance\out\libc-test\src\regression\tls_get_new-dtv.c:10:8: error: unknown type name 'pthread_barrier_t'
+regression/uselocale-0	PASS	
+regression/wcsncpy-read-overflow	PASS	
+regression/wcsstr-false-negative	PASS	

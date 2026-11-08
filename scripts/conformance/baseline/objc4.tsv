@@ -18,7 +18,7 @@ objc4/applescriptobjc	BUILD	fw-system	C:\dev\conformance\out\objc4\test\applescr
 objc4/arr-cast	PASS	fw-system	
 objc4/arr-weak	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
 objc4/arr-weak-error	FAIL	fw-system	BAD: should have crashed
-objc4/association	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/association	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
 objc4/associationForbidden	FAIL	fw-system	BAD: should have crashed trying to set the associated object
 objc4/associationForbidden2	FAIL	fw-system	BAD: should have crashed trying to set the associated object
 objc4/associationForbidden3	FAIL	fw-system	Associated object is 0x1e8560cdef0
@@ -52,7 +52,7 @@ objc4/classpair	BUILD	fw-system	ld64.lld: error: library not found for -lc++
 objc4/classpair-stress	PASS	fw-system	
 objc4/classpairAddMethod	FAIL	fw-system	alchemy: disposing registered Objective-C classes is unsupported during synthetic guest call 0x7100000060f0 [guest pc 0x7100000060f0, thread 1]
 objc4/classversion	FAIL	fw-system	BAD: failed assertion 'class_getVersion(object_getClass(cls)) > 5' at classversion.m:11
-objc4/consolidatePoolPointers	FAIL	fw-system	BAD: failed assertion 'gap != expectedGap * sizeof(id)' (0x0000000000000001 != 0x0000000000000010) at consolidatePoolPointers.m:103
+objc4/consolidatePoolPointers	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: BAD: failed assertion 'gap != expectedGap * sizeof(id)' (0x0000000000000001 != 0x0000000000000010) at consolidatePoolPointers.m:103
 objc4/copyFixupHandler	BUILD	fw-system	ld64.lld: error: library not found for -lc++
 objc4/copyIvarList	FAIL	fw-system	alchemy: Objective-C instance layout of NoIvars (start 0, size 0) overlaps its superclass or isa
 objc4/copyMethodList	FAIL	fw-system	BAD: failed assertion 'count == 4' at copyMethodList.m:93
@@ -61,29 +61,29 @@ objc4/copyProtocolList	FAIL	fw-system	BAD: failed assertion 'getProtocol(protoli
 objc4/createInstance	FAIL	fw-system	BAD: failed assertion 'malloc_size((__bridge const void *)s) >= class_getInstanceSize([Super class])' at createInstance.m:25
 objc4/customDeallocInitiation	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __class_setCustomDeallocInitiation from library ordinal -2
 objc4/customrr	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
-objc4/customrr-nsobject-awz	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
-objc4/customrr-nsobject-core	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr-nsobject-awz	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr-nsobject-core	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
 objc4/customrr-nsobject-none	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
-objc4/customrr-nsobject-rr	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
-objc4/customrr-nsobject-rrawz	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr-nsobject-rr	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
+objc4/customrr-nsobject-rrawz	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
 objc4/customrr2	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
-objc4/debugScanWeakTables	FAIL	fw-system	BAD: Should have crashed scanning weakLoc
+objc4/debugScanWeakTables	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: BAD: Should have crashed scanning weakLoc
 objc4/definitions	PASS	fw-system	
 objc4/designatedinit	PASS	fw-system	
 objc4/duplicateClass	FAIL	fw-system	BAD: failed assertion 'object_getClass(clone) == object_getClass(cls)' at duplicateClass.m:67
 objc4/duplicatedClasses	FAIL	fw-system	alchemy: duplicate Objective-C class WKWebView
 objc4/duplicatedClasses2	FAIL	fw-system	BAD: couldn't open dylib
 objc4/duplicatedClasses3	FAIL	fw-system	alchemy: duplicate Objective-C class DuplicatedClass
-objc4/enumClasses	FAIL	fw-system	BAD: failed assertion 'hasClaws != 3' (0x00000000 != 0x00000003) at enumClasses.m:250
+objc4/enumClasses	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: BAD: failed assertion 'hasClaws != 3' (0x00000000 != 0x00000003) at enumClasses.m:250
 objc4/enumDynamicClasses	SKIP	fw-system	Swift test
 objc4/exc	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
 objc4/exchangeImp	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _class_copyImpCache from library ordinal -2
 objc4/fakeRealizedClass	FAIL	fw-system	alchemy: Objective-C metadata: nonlazy class absent from class list
 objc4/fakeRealizedClass2	FAIL	fw-system	alchemy: Objective-C metadata: nonlazy class absent from class list
-objc4/faultLeaks	FAIL	fw-system	posix_spawn: Undefined error: 0
+objc4/faultLeaks	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: posix_spawn: Undefined error: 0
 objc4/foreach	BUILD	fw-system	C:\dev\conformance\out\objc4\test\foreach.m:5:9: fatal error: 'Foundation/Foundation.h' file not found
 objc4/fork	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
-objc4/forkInitialize	FAIL	fw-system	alchemy: Objective-C instance layout of BlockingRootClass (start 0, size 0) overlaps its superclass or isa
+objc4/forkInitialize	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: Objective-C instance layout of BlockingRootClass (start 0, size 0) overlaps its superclass or isa
 objc4/forkInitializeDisabled	SKIP	fw-system	TEST_CONFIG ARCH=x86_64
 objc4/forkInitializeSingleThreaded	FAIL	fw-system	alchemy: Objective-C instance layout of BlockingRootClass (start 0, size 0) overlaps its superclass or isa
 objc4/forkSync	FAIL	fw-system	BAD: fork failed (errno 78 Function not implemented)
@@ -122,7 +122,7 @@ objc4/methodArgs	FAIL	fw-system	BAD: failed assertion '!arg' at methodArgs.m:88
 objc4/methodCacheLeaks	SKIP	fw-system	TEST_CONFIG ARCH=!arm64e,!arm64
 objc4/methodListSize	PASS	fw-system	
 objc4/methodListSmall	BUILD	fw-system	ld64.lld: error: library not found for -lc++
-objc4/methodSetImplementationHook	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _class_replaceMethodsBulk from library ordinal -2
+objc4/methodSetImplementationHook	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: alchemy: Mach-O: unresolved strong import _class_replaceMethodsBulk from library ordinal -2
 objc4/msgSend	BUILD	fw-system	C:/dev/conformance/out/objc4/test/msgSend.m:25:10: fatal error: 'simd/simd.h' file not found
 objc4/msgSend-performance	SKIP	fw-system	TEST_CONFIG OS=!macosx
 objc4/msgSend-performance-macos	BUILD	fw-system	C:\dev\conformance\out\objc4\test\msgSend-performance.m:5:10: fatal error: 'simd/simd.h' file not found
@@ -191,9 +191,9 @@ objc4/tbi	SKIP	fw-system	TEST_CONFIG OS=iphoneos
 objc4/unexpectedBuildOutput	BUILD	fw-system	C:\dev\conformance\out\objc4\test\unexpectedBuildOutput.mm:5:10: fatal error: 'Foundation/Foundation.h' file not found
 objc4/uniquelyref	BUILD	fw-system	C:\dev\conformance\out\objc4\test\uniquelyref.m:7:10: fatal error: 'Foundation/Foundation.h' file not found
 objc4/unload	SKIP	fw-system	TEST_BUILD recipe needs the shell or test.pl internals
-objc4/unrealizedClassSafety	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __class_getIvarMemoryManagement from library ordinal -2
+objc4/unrealizedClassSafety	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: Mach-O: unresolved strong import __class_getIvarMemoryManagement from library ordinal -2
 objc4/unwind	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _objc_addExceptionHandler from library ordinal -2
-objc4/weak-not-registered	FAIL	fw-system	alchemy: invalid or destroyed compatibility object 0x25978a2dd42 (isa 0x83f100000006004c, not a registered class) during synthetic guest call 0x7100000062e0 [guest pc 0x7100000062e0, thread 1]
+objc4/weak-not-registered	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: alchemy: invalid or destroyed compatibility object 0x25978a2dd42 (isa 0x83f100000006004c, not a registered class) during synthetic guest call 0x7100000062e0 [guest pc 0x7100000062e0, thread 1]
 objc4/weakReferenceHook	FAIL	fw-system	BAD: failed assertion 'hasWeakRefs == true' at weakReferenceHook.m:30
 objc4/weakcopy	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __objc_flush_caches from library ordinal -2
 objc4/weakframework-missing	FAIL	fw-system	alchemy: Objective-C metadata: category has no target class

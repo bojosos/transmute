@@ -35,7 +35,7 @@ libpthread/mutex/mutex	SKIP	fw-system	needs boot-args
 libpthread/mutex/mutex_as_semaphore_lock_owned	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex.c:167: rc == 0 (errno 11: Resource deadlock avoided): recursive lock
 libpthread/mutex/mutex_default_policy	PASS	fw-system	
 libpthread/mutex/mutex_default_policy_envvar	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex.c:104: policy == expected_policy (3 vs 1): Saw the expected default policy
-libpthread/mutex/mutex_default_policy_sysctl	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex.c:121: sysctlbyname("kern.pthread_mutex_default_policy", ((void*)0), ((void*)0), &fairshare_default, sizeof(fairshare_default)) == 0 (errno -1: Unknown error: -1): Changed the default policy sysctl to fairshare
+libpthread/mutex/mutex_default_policy_sysctl	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libpthread\src\mutex.c:121: sysctlbyname("kern.pthread_mutex_default_policy", ((void*)0), ((void*)0), &fairshare_default, sizeof(fairshare_default)) == 0 (errno -1: Unknown error: -1): Changed the default policy sysctl to fairshare
 libpthread/mutex_prepost/mutex_prepost_fairshare	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex_prepost.c:31: res == 0 (errno 1: Operation not permitted): condition wait on condvar completed
 libpthread/mutex_prepost/mutex_prepost_firstfit	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex_prepost.c:31: res == 0 (errno 1: Operation not permitted): condition wait on condvar completed
 libpthread/mutex_try/mutex_trylock	PASS	fw-system	
@@ -74,7 +74,7 @@ libpthread/pthread_threadid_np/pthread_threadid_np	BUILD	fw-system	C:\dev\confor
 libpthread/rdar_32848402/amx_parallelism	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
 libpthread/rdar_32848402/amx_parallelism_on_non_amx_hardware	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
 libpthread/rdar_32848402/thread_request_32848402	BUILD	fw-system	C:\dev\conformance\libpthread-539.100.4\src\private\pthread/qos_private.h:28:10: fatal error: 'pthread/priority_private.h' file not found
-libpthread/setrlimit_sigsegv/setrlimit_overflow_segfault	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\setrlimit_sigsegv.c:25: setrlimit(3, &lim) != -1 (errno 78: Function not implemented)
+libpthread/setrlimit_sigsegv/setrlimit_overflow_segfault	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libpthread\src\setrlimit_sigsegv.c:25: setrlimit(3, &lim) != -1 (errno 78: Function not implemented)
 libpthread/stack/chkstk	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _thread_chkstk_darwin from library ordinal -2
 libpthread/stack/pthread_stack_frame_decode_np	PASS	fw-system	
 libpthread/stack_aslr/pthread_stack_aslr	BUILD	fw-system	C:\dev\conformance\out\libpthread\src\stack_aslr.c:137:35: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]

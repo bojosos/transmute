@@ -94,10 +94,10 @@ posix/clock_nanosleep/2-3	XFAIL	fw-system	optional POSIX feature macOS does not 
 posix/clock_nanosleep/3-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/clock_nanosleep/9-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/clock_settime/1-1	SKIP	fw-system	UNTESTED: Run this test as ROOT, not as a Regular User
-posix/clock_settime/17-1	FAIL	fw-system	UNRESOLVED: This test must be run as superuser
-posix/clock_settime/17-2	FAIL	fw-system	UNRESOLVED: Test must be run as superuser
+posix/clock_settime/17-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: This test must be run as superuser
+posix/clock_settime/17-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: Test must be run as superuser
 posix/clock_settime/19-1	SKIP	fw-system	UNTESTED: Run this test as ROOT, not as a Regular User
-posix/clock_settime/20-1	FAIL	fw-system	UNRESOLVED: Test must be run as superuser
+posix/clock_settime/20-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: Test must be run as superuser
 posix/clock_settime/4-1	XFAIL	fw-system	uses a POSIX option or extension macOS does not provide
 posix/clock_settime/4-2	XFAIL	fw-system	uses a POSIX option or extension macOS does not provide
 posix/clock_settime/5-1	XFAIL	fw-system	uses a POSIX option or extension macOS does not provide
@@ -114,13 +114,13 @@ posix/fork/1-1	XFAIL	fw-system	sem_timedwait is not in macOS's headers
 posix/fork/11-1	FAIL	fw-system	UNRESOLVED: Child found lock is F_UNLCK, should be F_WRLCK
 posix/fork/12-1	FAIL	fw-system	UNRESOLVED: [13:15:32]
 posix/fork/13-1	FAIL	fw-system	UNRESOLVED: [13:15:32]
-posix/fork/14-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _sem_post before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
-posix/fork/16-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _exit before any exec (a fork without exec is not supported); fork() fails with ENOSYS
+posix/fork/14-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _sem_post before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/fork/16-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _exit before any exec (a fork without exec is not supported); fork() fails with ENOSYS
 posix/fork/17-1	XFAIL	fw-system	sched_getparam is not in macOS's headers
 posix/fork/17-2	XFAIL	fw-system	sched_getparam is not in macOS's headers
 posix/fork/18-1	XFAIL	fw-system	uses a POSIX option or extension macOS does not provide
 posix/fork/19-1	XFAIL	fw-system	uses a POSIX option or extension macOS does not provide
-posix/fork/2-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child returned from the function that called fork without exec; fork() fails with ENOSYS
+posix/fork/2-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child returned from the function that called fork without exec; fork() fails with ENOSYS
 posix/fork/21-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _sem_post before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/fork/22-1	XFAIL	fw-system	pthread_getcpuclockid is not in macOS's headers
 posix/fork/3-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _exit before any exec (a fork without exec is not supported); fork() fails with ENOSYS
@@ -131,15 +131,15 @@ posix/fork/8-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child cal
 posix/fork/9-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _alarm before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/fsync/4-1	PASS	fw-system	
 posix/fsync/5-1	PASS	fw-system	
-posix/fsync/7-1	FAIL	fw-system	fsync/7-1.c Test Fail: Expect EINVAL, get: Undefined error: 0
+posix/fsync/7-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: fsync/7-1.c Test Fail: Expect EINVAL, get: Undefined error: 0
 posix/getpid/1-1	FAIL	fw-system	UNRESOLVED: [13:15:40]
 posix/gmtime/1-1	PASS	fw-system	
 posix/gmtime/2-1	PASS	fw-system	
 posix/kill/1-1	PASS	fw-system	
 posix/kill/1-2	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _sigwait before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/kill/2-1	PASS	fw-system	
-posix/kill/2-2	FAIL	fw-system	UNRESOLVED: ESRCH error received
-posix/kill/3-1	FAIL	fw-system	UNRESOLVED: setuid: Operation not permitted
+posix/kill/2-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: ESRCH error received
+posix/kill/3-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: setuid: Operation not permitted
 posix/killpg/1-1	PASS	fw-system	
 posix/killpg/1-2	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _sigpause before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/killpg/2-1	PASS	fw-system	
@@ -165,10 +165,10 @@ posix/lio_listio/9-1	XFAIL	fw-system	optional POSIX feature macOS does not provi
 posix/localtime/1-1	PASS	fw-system	
 posix/mktime/1-1	PASS	fw-system	
 posix/mlock/10-1	PASS	fw-system	
-posix/mlock/12-1	FAIL	fw-system	You have the right to call mlock
+posix/mlock/12-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: You have the right to call mlock
 posix/mlock/5-1	PASS	fw-system	
-posix/mlock/8-1	FAIL	fw-system	alchemy: stopping after: guest memory read fault at 0x7fffffffffffc000 during synthetic guest call 0x71000002a3b0 [guest pc 0x71000002a3b0, thread 1]
-posix/mlock/speculative/12-1	FAIL	fw-system	You have the right to call mlock
+posix/mlock/8-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: stopping after: guest memory read fault at 0x7fffffffffffc000 during synthetic guest call 0x71000002a3b0 [guest pc 0x71000002a3b0, thread 1]
+posix/mlock/speculative/12-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: You have the right to call mlock
 posix/mlockall/13-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/mlockall/13-2	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/mlockall/15-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
@@ -181,34 +181,34 @@ posix/mmap/1-2	PASS	fw-system
 posix/mmap/10-1	PASS	fw-system	
 posix/mmap/11-1	PASS	fw-system	
 posix/mmap/11-2	FAIL	fw-system	alchemy: guest terminated by SIGBUS (signal 10, status 138): EXC_BAD_ACCESS: guest write of 0x1f29a814001 (protection failure) at pc 0x100000550 [host page 0x1f29a814000 protect 0x0 allocation 0x1f29a812000, region 0x1f29a810000+0x8000 rw- shared] [main thread]
-posix/mmap/11-3	FAIL	fw-system	alchemy: guest terminated by SIGBUS (signal 10, status 138): EXC_BAD_ACCESS: guest write of 0x1c514ed4001 (protection failure) at pc 0x100000534 [host page 0x1c514ed4000 protect 0x0 allocation 0x1c514ed2000, region 0x1c514ed0000+0x8000 rw- shared] [main thread]
-posix/mmap/11-4	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _unlink before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
-posix/mmap/11-5	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _shm_unlink before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/mmap/11-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: guest terminated by SIGBUS (signal 10, status 138): EXC_BAD_ACCESS: guest write of 0x1c514ed4001 (protection failure) at pc 0x100000534 [host page 0x1c514ed4000 protect 0x0 allocation 0x1c514ed2000, region 0x1c514ed0000+0x8000 rw- shared] [main thread]
+posix/mmap/11-4	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _unlink before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/mmap/11-5	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _shm_unlink before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/mmap/11-6	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _unlink before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/mmap/12-1	PASS	fw-system	
 posix/mmap/13-1	PASS	fw-system	
 posix/mmap/14-1	FAIL	fw-system	Time before write(): 1794050159
-posix/mmap/18-1	FAIL	fw-system	UNRESOLVED: Error at mlockall(): Function not implemented
+posix/mmap/18-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: Error at mlockall(): Function not implemented
 posix/mmap/19-1	PASS	fw-system	
 posix/mmap/21-1	PASS	fw-system	
 posix/mmap/23-1	PASS	fw-system	
-posix/mmap/24-1	FAIL	fw-system	
-posix/mmap/24-2	FAIL	fw-system	available memory: 9223372036854775807
+posix/mmap/24-1	XFAIL	fw-system	fails on real macOS too (TIMEOUT); under Alchemy: fails on real macOS too (TIMEOUT)
+posix/mmap/24-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: available memory: 9223372036854775807
 posix/mmap/27-1	PASS	fw-system	
 posix/mmap/3-1	FAIL	fw-system	alchemy: mmap(MAP_SHARED | MAP_FIXED) is unsupported: shared file views are placed by Alchemy
 posix/mmap/31-1	SKIP	fw-system	UNSUPPORTED: UNSUPPORTED: Cannot be tested on 64 bit architecture
 posix/mmap/32-1	PASS	fw-system	
-posix/mmap/5-1	FAIL	fw-system	alchemy: mmap(MAP_SHARED) with PROT_EXEC is unsupported: code is never run from a shared file view
-posix/mmap/6-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _ftruncate before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
-posix/mmap/6-2	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _mmap before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
-posix/mmap/6-3	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _mmap before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/mmap/5-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: mmap(MAP_SHARED) with PROT_EXEC is unsupported: code is never run from a shared file view
+posix/mmap/6-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _ftruncate before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/mmap/6-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _mmap before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/mmap/6-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _mmap before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/mmap/6-4	PASS	fw-system	
 posix/mmap/6-5	PASS	fw-system	
 posix/mmap/6-6	FAIL	fw-system	Mapping writeonly file with PROT_READ have not returned EACCES
 posix/mmap/7-1	PASS	fw-system	
 posix/mmap/7-2	PASS	fw-system	
-posix/mmap/7-3	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _mmap before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
-posix/mmap/7-4	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _mmap before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/mmap/7-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _mmap before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/mmap/7-4	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _mmap before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/mmap/9-1	PASS	fw-system	
 posix/mq_close/1-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/mq_close/2-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
@@ -337,13 +337,13 @@ posix/mq_unlink/2-1	XFAIL	fw-system	optional POSIX feature macOS does not provid
 posix/mq_unlink/2-2	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/mq_unlink/7-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/mq_unlink/speculative/7-2	XFAIL	fw-system	optional POSIX feature macOS does not provide
-posix/munlock/10-1	FAIL	fw-system	alchemy: stopping after: guest memory read fault at 0x7fffffffffffc000 during synthetic guest call 0x71000002a3c0 [guest pc 0x71000002a3c0, thread 1]
+posix/munlock/10-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: alchemy: stopping after: guest memory read fault at 0x7fffffffffffc000 during synthetic guest call 0x71000002a3c0 [guest pc 0x71000002a3c0, thread 1]
 posix/munlock/11-1	PASS	fw-system	
 posix/munlock/7-1	PASS	fw-system	
 posix/munlockall/5-1	SKIP	fw-system	UNSUPPORTED: Does not support ML (Memory Lock).
 posix/munmap/1-1	FAIL	fw-system	alchemy: guest terminated by SIGBUS (signal 10, status 138): EXC_BAD_ACCESS: guest write of 0x1d96ec04002 (protection failure) at pc 0x100000588 [host page 0x1d96ec04000 protect 0x4 allocation 0x1d96ec00000] [main thread]
 posix/munmap/1-2	FAIL	fw-system	alchemy: guest terminated by SIGSEGV (signal 11, status 139): EXC_BAD_ACCESS: guest write of 0x2b0a9540000 (unmapped) at pc 0x100000578 [main thread]
-posix/munmap/2-1	FAIL	fw-system	UNRESOLVED: Failed to open /dev/zero: No such file or directory (2)
+posix/munmap/2-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: Failed to open /dev/zero: No such file or directory (2)
 posix/munmap/3-1	PASS	fw-system	
 posix/munmap/4-1	PASS	fw-system	
 posix/munmap/8-1	PASS	fw-system	
@@ -365,7 +365,7 @@ posix/pthread_atfork/1-2	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the
 posix/pthread_atfork/2-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child returned from the function that called fork without exec; fork() fails with ENOSYS
 posix/pthread_atfork/2-2	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _pthread_setcancelstate before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/pthread_atfork/3-2	PASS	fw-system	
-posix/pthread_atfork/3-3	FAIL	fw-system	UNRESOLVED: [13:16:43]
+posix/pthread_atfork/3-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:16:43]
 posix/pthread_atfork/4-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _exit before any exec (a fork without exec is not supported); fork() fails with ENOSYS
 posix/pthread_attr_destroy/1-1	PASS	fw-system	
 posix/pthread_attr_destroy/2-1	PASS	fw-system	
@@ -387,21 +387,21 @@ posix/pthread_attr_setdetachstate/1-2	PASS	fw-system
 posix/pthread_attr_setdetachstate/2-1	PASS	fw-system	
 posix/pthread_attr_setdetachstate/4-1	PASS	fw-system	
 posix/pthread_attr_setinheritsched/1-1	PASS	fw-system	
-posix/pthread_attr_setinheritsched/2-1	FAIL	fw-system	UNRESOLVED: unexpected error: pthread_attr_setinheritsched 2-1: pthread_attr_setschedpolicy: Undefined error: 0
+posix/pthread_attr_setinheritsched/2-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: pthread_attr_setinheritsched 2-1: pthread_attr_setschedpolicy: Undefined error: 0
 posix/pthread_attr_setinheritsched/2-2	FAIL	fw-system	UNRESOLVED: unexpected error: pthread_attr_setinheritsched 2-2: pthread_attr_setschedpolicy
-posix/pthread_attr_setinheritsched/2-3	FAIL	fw-system	UNRESOLVED: unexpected error: scheduler 2-3: pthread_setschedparam
-posix/pthread_attr_setinheritsched/2-4	FAIL	fw-system	UNRESOLVED: unexpected error: scheduler 2-4: pthread_setschedparam
+posix/pthread_attr_setinheritsched/2-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: scheduler 2-3: pthread_setschedparam
+posix/pthread_attr_setinheritsched/2-4	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: scheduler 2-4: pthread_setschedparam
 posix/pthread_attr_setinheritsched/4-1	PASS	fw-system	
 posix/pthread_attr_setschedparam/1-1	FAIL	fw-system	unexpected error: pthread_attr_setschedparam 1-1: pthread_attr_setschedpolicy
 posix/pthread_attr_setschedparam/1-2	FAIL	fw-system	unexpected error: pthread_attr_setschedparam 1-2: pthread_attr_setschedpolicy
 posix/pthread_attr_setschedparam/1-3	FAIL	fw-system	UNRESOLVED: unexpected error: scheduler 1-3: pthread_attr_setschedpolicy
 posix/pthread_attr_setschedparam/1-4	FAIL	fw-system	UNRESOLVED: unexpected error: scheduler 1-4: pthread_attr_setschedpolicy
-posix/pthread_attr_setschedparam/speculative/3-1	FAIL	fw-system	unexpected error: pthread_attr_setschedparam 3-1: pthread_attr_setschedpolicy
-posix/pthread_attr_setschedparam/speculative/3-2	FAIL	fw-system	unexpected error: pthread_attr_setschedparam 3-2: pthread_attr_setschedpolicy
+posix/pthread_attr_setschedparam/speculative/3-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: unexpected error: pthread_attr_setschedparam 3-1: pthread_attr_setschedpolicy
+posix/pthread_attr_setschedparam/speculative/3-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: unexpected error: pthread_attr_setschedparam 3-2: pthread_attr_setschedpolicy
 posix/pthread_attr_setschedpolicy/1-1	PASS	fw-system	
 posix/pthread_attr_setschedpolicy/1-2	FAIL	fw-system	UNRESOLVED: Failed: policy: SCHED_FIFO, func: pthread_attr_setschedpolicy(), rc: Operation not supported (45)
 posix/pthread_attr_setschedpolicy/1-3	FAIL	fw-system	UNRESOLVED: Failed: policy: SCHED_RR, func: pthread_attr_setschedpolicy(), rc: Operation not supported (45)
-posix/pthread_attr_setschedpolicy/2-1	FAIL	fw-system	UNRESOLVED: Failed: function: set_affinity_single status: Function not implemented(78)
+posix/pthread_attr_setschedpolicy/2-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: Failed: function: set_affinity_single status: Function not implemented(78)
 posix/pthread_attr_setschedpolicy/4-1	PASS	fw-system	
 posix/pthread_attr_setschedpolicy/5-1	FAIL	fw-system	Failed: SCHED_FIFO function: pthread_attr_setschedpolicy() error: Operation not supported (45)
 posix/pthread_attr_setscope/1-1	PASS	fw-system	
@@ -437,7 +437,7 @@ posix/pthread_cancel/1-3	PASS	fw-system
 posix/pthread_cancel/2-1	FAIL	fw-system	Test FAILED: Timed out while waiting for cancelation cleanup handlers to execute
 posix/pthread_cancel/2-2	FAIL	fw-system	unexpected error: pthread_cancel 2-2: Test FAIL: Destructor was not executed.
 posix/pthread_cancel/2-3	FAIL	fw-system	unexpected error: pthread_cancel 2-3: Test FAIL: Cleanup handler was not executed.
-posix/pthread_cancel/3-1	FAIL	fw-system	UNRESOLVED: Test C:\dev\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_cancel\3-1.c unresolved: got -1 (Function not implemented) on line 69
+posix/pthread_cancel/3-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: Test C:\dev\conformance\ltp-20260930\src\testcases\open_posix_testsuite\conformance\interfaces\pthread_cancel\3-1.c unresolved: got -1 (Function not implemented) on line 69
 posix/pthread_cancel/4-1	PASS	fw-system	
 posix/pthread_cancel/5-1	PASS	fw-system	
 posix/pthread_cleanup_pop/1-1	PASS	fw-system	
@@ -452,7 +452,7 @@ posix/pthread_cond_broadcast/2-1	PASS	fw-system
 posix/pthread_cond_broadcast/2-2	PASS	fw-system	
 posix/pthread_cond_broadcast/2-3	XFAIL	fw-system	pthread_condattr_getclock is not in macOS's headers
 posix/pthread_cond_broadcast/4-1	PASS	fw-system	
-posix/pthread_cond_broadcast/4-2	FAIL	fw-system	UNRESOLVED: [13:17:14]
+posix/pthread_cond_broadcast/4-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:14]
 posix/pthread_cond_destroy/1-1	PASS	fw-system	
 posix/pthread_cond_destroy/2-1	XFAIL	fw-system	pthread_condattr_getclock is not in macOS's headers
 posix/pthread_cond_destroy/3-1	PASS	fw-system	
@@ -460,14 +460,14 @@ posix/pthread_cond_destroy/speculative/4-1	PASS	fw-system
 posix/pthread_cond_init/1-1	PASS	fw-system	
 posix/pthread_cond_init/2-1	PASS	fw-system	
 posix/pthread_cond_init/3-1	PASS	fw-system	
-posix/pthread_cond_init/4-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _setrlimit before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/pthread_cond_init/4-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _setrlimit before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/pthread_cond_init/4-3	PASS	fw-system	
 posix/pthread_cond_signal/1-1	PASS	fw-system	
 posix/pthread_cond_signal/1-2	XFAIL	fw-system	pthread_condattr_getclock is not in macOS's headers
 posix/pthread_cond_signal/2-1	PASS	fw-system	
 posix/pthread_cond_signal/2-2	PASS	fw-system	
 posix/pthread_cond_signal/4-1	PASS	fw-system	
-posix/pthread_cond_signal/4-2	FAIL	fw-system	UNRESOLVED: [13:17:17]
+posix/pthread_cond_signal/4-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:17]
 posix/pthread_cond_timedwait/1-1	PASS	fw-system	
 posix/pthread_cond_timedwait/2-1	PASS	fw-system	
 posix/pthread_cond_timedwait/2-2	PASS	fw-system	
@@ -479,13 +479,13 @@ posix/pthread_cond_timedwait/2-7	XFAIL	fw-system	pthread_condattr_getclock is no
 posix/pthread_cond_timedwait/3-1	PASS	fw-system	
 posix/pthread_cond_timedwait/4-1	PASS	fw-system	
 posix/pthread_cond_timedwait/4-2	XFAIL	fw-system	pthread_condattr_getclock is not in macOS's headers
-posix/pthread_cond_timedwait/4-3	FAIL	fw-system	UNRESOLVED: [13:17:19]
+posix/pthread_cond_timedwait/4-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:19]
 posix/pthread_cond_wait/1-1	PASS	fw-system	
 posix/pthread_cond_wait/2-1	PASS	fw-system	
 posix/pthread_cond_wait/2-2	XFAIL	fw-system	pthread_condattr_getclock is not in macOS's headers
 posix/pthread_cond_wait/2-3	XFAIL	fw-system	pthread_condattr_setclock is not in macOS's headers
 posix/pthread_cond_wait/3-1	PASS	fw-system	
-posix/pthread_cond_wait/4-1	FAIL	fw-system	UNRESOLVED: [13:17:21]
+posix/pthread_cond_wait/4-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:21]
 posix/pthread_condattr_destroy/1-1	PASS	fw-system	
 posix/pthread_condattr_destroy/2-1	PASS	fw-system	
 posix/pthread_condattr_destroy/3-1	PASS	fw-system	
@@ -507,12 +507,12 @@ posix/pthread_condattr_setpshared/2-1	PASS	fw-system
 posix/pthread_create/1-1	PASS	fw-system	
 posix/pthread_create/1-2	PASS	fw-system	
 posix/pthread_create/1-3	FAIL	fw-system	Test FAILED: Alarm fired while waiting for cancelation
-posix/pthread_create/1-5	FAIL	fw-system	UNRESOLVED: [13:17:24]
-posix/pthread_create/1-6	FAIL	fw-system	UNRESOLVED: INFO: Affinity not supported, running 12 threads.
+posix/pthread_create/1-5	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:24]
+posix/pthread_create/1-6	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: INFO: Affinity not supported, running 12 threads.
 posix/pthread_create/11-1	SKIP	fw-system	UNSUPPORTED: _POSIX_THREAD_CPUTIME not supported
 posix/pthread_create/12-1	PASS	fw-system	
-posix/pthread_create/14-1	FAIL	fw-system	UNRESOLVED: [13:17:25]
-posix/pthread_create/15-1	FAIL	fw-system	UNRESOLVED: [13:17:25]
+posix/pthread_create/14-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:25]
+posix/pthread_create/15-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:25]
 posix/pthread_create/2-1	PASS	fw-system	
 posix/pthread_create/3-1	PASS	fw-system	
 posix/pthread_create/3-2	XFAIL	fw-system	uses a POSIX option or extension macOS does not provide
@@ -525,20 +525,20 @@ posix/pthread_detach/2-2	XFAIL	fw-system	sem_timedwait is not in macOS's headers
 posix/pthread_detach/3-1	PASS	fw-system	
 posix/pthread_detach/4-1	PASS	fw-system	
 posix/pthread_detach/4-2	FAIL	fw-system	Test FAILED: Incorrect return code: 22 instead of ESRCH
-posix/pthread_detach/4-3	FAIL	fw-system	UNRESOLVED: [13:17:26]
+posix/pthread_detach/4-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:26]
 posix/pthread_equal/1-1	PASS	fw-system	
 posix/pthread_equal/1-2	PASS	fw-system	
-posix/pthread_equal/2-1	FAIL	fw-system	UNRESOLVED: [13:17:26]
+posix/pthread_equal/2-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:26]
 posix/pthread_exit/1-1	PASS	fw-system	
-posix/pthread_exit/1-2	FAIL	fw-system	UNRESOLVED: [13:17:27]
+posix/pthread_exit/1-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:27]
 posix/pthread_exit/2-1	PASS	fw-system	
-posix/pthread_exit/2-2	FAIL	fw-system	UNRESOLVED: [13:17:27]
+posix/pthread_exit/2-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:27]
 posix/pthread_exit/3-1	PASS	fw-system	
-posix/pthread_exit/3-2	FAIL	fw-system	UNRESOLVED: [13:17:27]
-posix/pthread_exit/4-1	FAIL	fw-system	UNRESOLVED: [13:17:27]
-posix/pthread_exit/5-1	FAIL	fw-system	UNRESOLVED: [13:17:27]
-posix/pthread_exit/6-1	FAIL	fw-system	UNRESOLVED: [13:17:27]
-posix/pthread_exit/6-2	FAIL	fw-system	UNRESOLVED: [13:17:28]
+posix/pthread_exit/3-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:27]
+posix/pthread_exit/4-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:27]
+posix/pthread_exit/5-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:27]
+posix/pthread_exit/6-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:27]
+posix/pthread_exit/6-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:28]
 posix/pthread_getcpuclockid/1-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/pthread_getcpuclockid/speculative/3-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/pthread_getschedparam/1-1	PASS	fw-system	
@@ -547,13 +547,13 @@ posix/pthread_getschedparam/1-3	XFAIL	fw-system	uses a POSIX option or extension
 posix/pthread_getspecific/1-1	PASS	fw-system	
 posix/pthread_getspecific/3-1	PASS	fw-system	
 posix/pthread_join/1-1	PASS	fw-system	
-posix/pthread_join/1-2	FAIL	fw-system	UNRESOLVED: [13:17:28]
+posix/pthread_join/1-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:28]
 posix/pthread_join/2-1	PASS	fw-system	
 posix/pthread_join/3-1	FAIL	fw-system	UNRESOLVED: Error in pthread_testcancel.  Cancel request timed out.
-posix/pthread_join/4-1	FAIL	fw-system	UNRESOLVED: [13:17:29]
+posix/pthread_join/4-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:29]
 posix/pthread_join/5-1	PASS	fw-system	
 posix/pthread_join/6-2	FAIL	fw-system	Test FAILED: Return code should be ESRCH, but is: 22 instead.
-posix/pthread_join/6-3	FAIL	fw-system	UNRESOLVED: [13:17:29]
+posix/pthread_join/6-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:29]
 posix/pthread_join/speculative/6-1	PASS	fw-system	
 posix/pthread_key_create/1-1	PASS	fw-system	
 posix/pthread_key_create/1-2	PASS	fw-system	
@@ -568,7 +568,7 @@ posix/pthread_kill/1-2	FAIL	fw-system	[13:17:34]
 posix/pthread_kill/2-1	PASS	fw-system	
 posix/pthread_kill/3-1	PASS	fw-system	
 posix/pthread_kill/7-1	PASS	fw-system	
-posix/pthread_kill/8-1	FAIL	fw-system	UNRESOLVED: [13:17:32]
+posix/pthread_kill/8-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:32]
 posix/pthread_mutex_destroy/1-1	PASS	fw-system	
 posix/pthread_mutex_destroy/2-1	PASS	fw-system	
 posix/pthread_mutex_destroy/2-2	PASS	fw-system	
@@ -581,18 +581,18 @@ posix/pthread_mutex_getprioceiling/3-1	SKIP	fw-system	UNSUPPORTED: PRIORITY_SCHE
 posix/pthread_mutex_getprioceiling/3-2	SKIP	fw-system	UNSUPPORTED: PRIORITY_SCHEDULING not supported
 posix/pthread_mutex_getprioceiling/3-3	SKIP	fw-system	UNSUPPORTED: PRIORITY_SCHEDULING not supported
 posix/pthread_mutex_init/1-1	PASS	fw-system	
-posix/pthread_mutex_init/1-2	FAIL	fw-system	UNRESOLVED: [13:17:34]
+posix/pthread_mutex_init/1-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:34]
 posix/pthread_mutex_init/2-1	PASS	fw-system	
 posix/pthread_mutex_init/3-1	PASS	fw-system	
-posix/pthread_mutex_init/3-2	FAIL	fw-system	UNRESOLVED: [13:17:34]
+posix/pthread_mutex_init/3-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:34]
 posix/pthread_mutex_init/4-1	PASS	fw-system	
-posix/pthread_mutex_init/5-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _pthread_mutexattr_init before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/pthread_mutex_init/5-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _pthread_mutexattr_init before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/pthread_mutex_init/speculative/5-2	SKIP	fw-system	UNTESTED: [13:17:35]
 posix/pthread_mutex_lock/1-1	PASS	fw-system	
 posix/pthread_mutex_lock/2-1	PASS	fw-system	
-posix/pthread_mutex_lock/3-1	FAIL	fw-system	UNRESOLVED: [13:17:35]
-posix/pthread_mutex_lock/4-1	FAIL	fw-system	UNRESOLVED: [13:17:36]
-posix/pthread_mutex_lock/5-1	FAIL	fw-system	UNRESOLVED: [13:17:36]
+posix/pthread_mutex_lock/3-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:35]
+posix/pthread_mutex_lock/4-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:36]
+posix/pthread_mutex_lock/5-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:36]
 posix/pthread_mutex_setprioceiling/1-1	SKIP	fw-system	UNSUPPORTED: PRIORITY_SCHEDULING not supported
 posix/pthread_mutex_timedlock/1-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/pthread_mutex_timedlock/2-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
@@ -606,7 +606,7 @@ posix/pthread_mutex_trylock/2-1	PASS	fw-system
 posix/pthread_mutex_trylock/3-1	PASS	fw-system	
 posix/pthread_mutex_trylock/4-1	PASS	fw-system	
 posix/pthread_mutex_trylock/4-2	PASS	fw-system	
-posix/pthread_mutex_trylock/4-3	FAIL	fw-system	UNRESOLVED: [13:17:38]
+posix/pthread_mutex_trylock/4-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:38]
 posix/pthread_mutex_unlock/1-1	PASS	fw-system	
 posix/pthread_mutex_unlock/2-1	PASS	fw-system	
 posix/pthread_mutex_unlock/3-1	PASS	fw-system	
@@ -616,7 +616,7 @@ posix/pthread_mutexattr_destroy/1-1	PASS	fw-system
 posix/pthread_mutexattr_destroy/2-1	PASS	fw-system	
 posix/pthread_mutexattr_destroy/3-1	PASS	fw-system	
 posix/pthread_mutexattr_destroy/4-1	PASS	fw-system	
-posix/pthread_mutexattr_getprioceiling/1-1	FAIL	fw-system	Test FAILED: Default prioceiling 0 is not compliant with SCHED_FIFO boundary.
+posix/pthread_mutexattr_getprioceiling/1-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: Test FAILED: Default prioceiling 0 is not compliant with SCHED_FIFO boundary.
 posix/pthread_mutexattr_getprioceiling/1-2	FAIL	fw-system	UNRESOLVED: Error setting prioceiling to -1
 posix/pthread_mutexattr_getprioceiling/3-1	PASS	fw-system	
 posix/pthread_mutexattr_getprotocol/1-1	PASS	fw-system	
@@ -658,7 +658,7 @@ posix/pthread_once/1-3	PASS	fw-system
 posix/pthread_once/2-1	PASS	fw-system	
 posix/pthread_once/3-1	FAIL	fw-system	UNRESOLVED: Init function timed out (10 secs), thread could not be canceled
 posix/pthread_once/4-1-buildonly	SKIP	fw-system	build-only test (it compiles)
-posix/pthread_once/6-1	FAIL	fw-system	UNRESOLVED: [13:17:45]
+posix/pthread_once/6-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:45]
 posix/pthread_rwlock_destroy/1-1	PASS	fw-system	
 posix/pthread_rwlock_destroy/3-1	PASS	fw-system	
 posix/pthread_rwlock_init/1-1	PASS	fw-system	
@@ -707,14 +707,14 @@ posix/pthread_setcancelstate/1-1	PASS	fw-system
 posix/pthread_setcancelstate/1-2	PASS	fw-system	
 posix/pthread_setcancelstate/2-1	PASS	fw-system	
 posix/pthread_setcancelstate/3-1	PASS	fw-system	
-posix/pthread_setcanceltype/1-1	FAIL	fw-system	Test FAILED: Cancel request timed out
+posix/pthread_setcanceltype/1-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: Test FAILED: Cancel request timed out
 posix/pthread_setcanceltype/1-2	PASS	fw-system	
 posix/pthread_setcanceltype/2-1	PASS	fw-system	
 posix/pthread_setschedparam/1-1	FAIL	fw-system	Error at pthread_setschedparam: rc=45
 posix/pthread_setschedparam/1-2	XFAIL	fw-system	uses a POSIX option or extension macOS does not provide
 posix/pthread_setschedparam/4-1	FAIL	fw-system	UNRESOLVED: [13:18:01]
-posix/pthread_setschedparam/5-1	FAIL	fw-system	UNRESOLVED: [13:18:01]
-posix/pthread_setschedprio/1-1	FAIL	fw-system	UNRESOLVED: Error at pthread_setschedparam: rc=45
+posix/pthread_setschedparam/5-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:18:01]
+posix/pthread_setschedprio/1-1	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: UNRESOLVED: Error at pthread_setschedparam: rc=45
 posix/pthread_setspecific/1-1	PASS	fw-system	
 posix/pthread_setspecific/1-2	PASS	fw-system	
 posix/pthread_sigmask/10-1	PASS	fw-system	
@@ -722,7 +722,7 @@ posix/pthread_sigmask/12-1	PASS	fw-system
 posix/pthread_sigmask/14-1	PASS	fw-system	
 posix/pthread_sigmask/15-1	PASS	fw-system	
 posix/pthread_sigmask/16-1	PASS	fw-system	
-posix/pthread_sigmask/18-1	FAIL	fw-system	UNRESOLVED: [13:18:05]
+posix/pthread_sigmask/18-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:18:05]
 posix/pthread_sigmask/4-1	PASS	fw-system	
 posix/pthread_sigmask/5-1	PASS	fw-system	
 posix/pthread_sigmask/6-1	PASS	fw-system	
@@ -759,12 +759,12 @@ posix/sched_get_priority_max/1-1	FAIL	fw-system	An error occurs: Function not im
 posix/sched_get_priority_max/1-2	FAIL	fw-system	An error occurs: Function not implemented
 posix/sched_get_priority_max/1-3	SKIP	fw-system	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
 posix/sched_get_priority_max/1-4	PASS	fw-system	
-posix/sched_get_priority_max/2-1	FAIL	fw-system	error is not EINVAL: Function not implemented
+posix/sched_get_priority_max/2-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: error is not EINVAL: Function not implemented
 posix/sched_get_priority_min/1-1	FAIL	fw-system	An error occurs: Function not implemented
 posix/sched_get_priority_min/1-2	FAIL	fw-system	An error occurs: Function not implemented
 posix/sched_get_priority_min/1-3	SKIP	fw-system	UNSUPPORTED: Does not support SS (SPORADIC SERVER)
 posix/sched_get_priority_min/1-4	PASS	fw-system	
-posix/sched_get_priority_min/2-1	FAIL	fw-system	error is not EINVAL: Function not implemented
+posix/sched_get_priority_min/2-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: error is not EINVAL: Function not implemented
 posix/sched_getparam/1-1	XFAIL	fw-system	sched_getparam is not in macOS's headers
 posix/sched_getparam/2-1	XFAIL	fw-system	sched_getparam is not in macOS's headers
 posix/sched_getparam/3-1	XFAIL	fw-system	sched_getparam is not in macOS's headers
@@ -828,14 +828,14 @@ posix/sched_yield/2-1	PASS	fw-system
 posix/sem_close/1-1	PASS	fw-system	
 posix/sem_close/2-1	PASS	fw-system	
 posix/sem_close/3-1	PASS	fw-system	
-posix/sem_close/3-2	FAIL	fw-system	UNRESOLVED: [13:18:19]
+posix/sem_close/3-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:18:19]
 posix/sem_destroy/3-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/sem_destroy/4-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
-posix/sem_getvalue/1-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_getvalue 1-1: sem_getvalue: Function not implemented
-posix/sem_getvalue/2-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_getvalue 2-1: sem_getvalue: Function not implemented
-posix/sem_getvalue/2-2	FAIL	fw-system	UNRESOLVED: [13:18:20]
-posix/sem_getvalue/4-1	FAIL	fw-system	TEST FAILED
-posix/sem_getvalue/5-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_getvalue 5-1: sem_getvalue: Function not implemented
+posix/sem_getvalue/1-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_getvalue 1-1: sem_getvalue: Function not implemented
+posix/sem_getvalue/2-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_getvalue 2-1: sem_getvalue: Function not implemented
+posix/sem_getvalue/2-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:18:20]
+posix/sem_getvalue/4-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: TEST FAILED
+posix/sem_getvalue/5-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_getvalue 5-1: sem_getvalue: Function not implemented
 posix/sem_init/1-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/sem_init/2-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/sem_init/2-2	XFAIL	fw-system	optional POSIX feature macOS does not provide
@@ -850,20 +850,20 @@ posix/sem_open/1-1	PASS	fw-system
 posix/sem_open/1-2	PASS	fw-system	
 posix/sem_open/1-3	PASS	fw-system	
 posix/sem_open/1-4	PASS	fw-system	
-posix/sem_open/10-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_open 10-1: sem_getvalue: Function not implemented
-posix/sem_open/15-1	FAIL	fw-system	[13:18:21]
+posix/sem_open/10-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_open 10-1: sem_getvalue: Function not implemented
+posix/sem_open/15-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [13:18:21]
 posix/sem_open/2-1	FAIL	fw-system	TEST FAILED
 posix/sem_open/2-2	PASS	fw-system	
-posix/sem_open/3-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_open 3-1: sem_open: Undefined error: 0
+posix/sem_open/3-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_open 3-1: sem_open: Undefined error: 0
 posix/sem_open/4-1	FAIL	fw-system	TEST FAILED
 posix/sem_open/5-1	PASS	fw-system	
 posix/sem_open/6-1	PASS	fw-system	
-posix/sem_post/1-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_post 1-1: sem_getvalue: Function not implemented
-posix/sem_post/1-2	FAIL	fw-system	UNRESOLVED: unexpected error: sem_post 1-2: sem_getvalue: Function not implemented
+posix/sem_post/1-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_post 1-1: sem_getvalue: Function not implemented
+posix/sem_post/1-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_post 1-2: sem_getvalue: Function not implemented
 posix/sem_post/2-1	PASS	fw-system	
 posix/sem_post/4-1	PASS	fw-system	
-posix/sem_post/5-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_post 5-1: sem_getvalue: Function not implemented
-posix/sem_post/6-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_post 6-1: sem_getvalue: Function not implemented
+posix/sem_post/5-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_post 5-1: sem_getvalue: Function not implemented
+posix/sem_post/6-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_post 6-1: sem_getvalue: Function not implemented
 posix/sem_post/8-1	XFAIL	fw-system	sched_setscheduler is not in macOS's headers
 posix/sem_timedwait/1-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
 posix/sem_timedwait/10-1	XFAIL	fw-system	optional POSIX feature macOS does not provide
@@ -879,30 +879,30 @@ posix/sem_timedwait/9-1	XFAIL	fw-system	optional POSIX feature macOS does not pr
 posix/sem_unlink/1-1	PASS	fw-system	
 posix/sem_unlink/2-1	PASS	fw-system	
 posix/sem_unlink/2-2	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _sem_open before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
-posix/sem_unlink/3-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _sem_open before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/sem_unlink/3-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _sem_open before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/sem_unlink/4-1	FAIL	fw-system	TEST FAILED: semaphore does exist
 posix/sem_unlink/4-2	PASS	fw-system	
 posix/sem_unlink/5-1	PASS	fw-system	
-posix/sem_unlink/6-1	FAIL	fw-system	[13:18:27]
+posix/sem_unlink/6-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [13:18:27]
 posix/sem_unlink/7-1	PASS	fw-system	
 posix/sem_unlink/9-1	PASS	fw-system	
-posix/sem_wait/1-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_wait 1-1: sem_getvalue: Function not implemented
-posix/sem_wait/1-2	FAIL	fw-system	UNRESOLVED: unexpected error: sem_wait 1-2: sem_getvalue: Function not implemented
-posix/sem_wait/11-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_trywait 11-1: sem_getvalue: Function not implemented
+posix/sem_wait/1-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_wait 1-1: sem_getvalue: Function not implemented
+posix/sem_wait/1-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_wait 1-2: sem_getvalue: Function not implemented
+posix/sem_wait/11-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_trywait 11-1: sem_getvalue: Function not implemented
 posix/sem_wait/12-1	PASS	fw-system	
-posix/sem_wait/13-1	FAIL	fw-system	UNRESOLVED: [13:18:30]
-posix/sem_wait/3-1	FAIL	fw-system	UNRESOLVED: unexpected error: sem_wait 3-1: sem_getvalue: Function not implemented
+posix/sem_wait/13-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:18:30]
+posix/sem_wait/3-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: unexpected error: sem_wait 3-1: sem_getvalue: Function not implemented
 posix/sem_wait/5-1	PASS	fw-system	
 posix/sem_wait/7-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _sem_wait before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/shm_open/1-1	PASS	fw-system	
 posix/shm_open/11-1	PASS	fw-system	
-posix/shm_open/13-1	FAIL	fw-system	ftruncate: Bad file descriptor
+posix/shm_open/13-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: ftruncate: Bad file descriptor
 posix/shm_open/14-2	PASS	fw-system	
 posix/shm_open/15-1	PASS	fw-system	
 posix/shm_open/16-1	PASS	fw-system	
 posix/shm_open/17-1	PASS	fw-system	
-posix/shm_open/18-1	FAIL	fw-system	shm_open() does not set the rights permissions.
-posix/shm_open/20-1	FAIL	fw-system	ftruncate: Bad file descriptor
+posix/shm_open/18-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: shm_open() does not set the rights permissions.
+posix/shm_open/20-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: ftruncate: Bad file descriptor
 posix/shm_open/20-2	PASS	fw-system	
 posix/shm_open/20-3	PASS	fw-system	
 posix/shm_open/21-1	PASS	fw-system	
@@ -910,7 +910,7 @@ posix/shm_open/22-1	PASS	fw-system
 posix/shm_open/23-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _srand before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/shm_open/25-1	PASS	fw-system	
 posix/shm_open/26-1	PASS	fw-system	
-posix/shm_open/26-2	FAIL	fw-system	UNRESOLVED: There is no other user than current and root.
+posix/shm_open/26-2	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: There is no other user than current and root.
 posix/shm_open/28-1	PASS	fw-system	
 posix/shm_open/28-2	PASS	fw-system	
 posix/shm_open/28-3	PASS	fw-system	
@@ -931,8 +931,8 @@ posix/shm_unlink/2-1	PASS	fw-system
 posix/shm_unlink/3-1	PASS	fw-system	
 posix/shm_unlink/5-1	PASS	fw-system	
 posix/shm_unlink/6-1	PASS	fw-system	
-posix/shm_unlink/8-1	FAIL	fw-system	UNRESOLVED: There is no other user than current and root.
-posix/shm_unlink/9-1	FAIL	fw-system	UNRESOLVED: There is no other user than current and root.
+posix/shm_unlink/8-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: There is no other user than current and root.
+posix/shm_unlink/9-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: There is no other user than current and root.
 posix/sigaction/1-1	PASS	fw-system	
 posix/sigaction/1-10	PASS	fw-system	
 posix/sigaction/1-11	PASS	fw-system	
@@ -959,7 +959,7 @@ posix/sigaction/1-6	PASS	fw-system
 posix/sigaction/1-7	PASS	fw-system	
 posix/sigaction/1-8	PASS	fw-system	
 posix/sigaction/1-9	PASS	fw-system	
-posix/sigaction/10-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _select$DARWIN_EXTSN before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
+posix/sigaction/10-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: alchemy: fork emulation: the child called _select$DARWIN_EXTSN before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/sigaction/11-1	FAIL	fw-system	UNRESOLVED: alchemy: fork emulation: the child called _select$DARWIN_EXTSN before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported; fork() fails with ENOSYS
 posix/sigaction/12-1	PASS	fw-system	
 posix/sigaction/12-10	PASS	fw-system	
@@ -1438,7 +1438,7 @@ posix/sigaddset/1-1	PASS	fw-system
 posix/sigaddset/1-2	PASS	fw-system	
 posix/sigaddset/1-3	PASS	fw-system	
 posix/sigaddset/2-1	PASS	fw-system	
-posix/sigaddset/4-1	FAIL	fw-system	Failed sigaddset(..., -1) ret=0 errno=0
+posix/sigaddset/4-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: Failed sigaddset(..., -1) ret=0 errno=0
 posix/sigaltstack/1-1	PASS	fw-system	
 posix/sigaltstack/10-1	PASS	fw-system	
 posix/sigaltstack/11-1	PASS	fw-system	
@@ -1454,7 +1454,7 @@ posix/sigdelset/1-1	PASS	fw-system
 posix/sigdelset/1-2	PASS	fw-system	
 posix/sigdelset/1-3	PASS	fw-system	
 posix/sigdelset/1-4	PASS	fw-system	
-posix/sigdelset/4-1	FAIL	fw-system	Failed sigdelset(..., -1) ret=0 errno=0
+posix/sigdelset/4-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: Failed sigdelset(..., -1) ret=0 errno=0
 posix/sigemptyset/1-1	PASS	fw-system	
 posix/sigemptyset/2-1	PASS	fw-system	
 posix/sigfillset/1-1	PASS	fw-system	
@@ -1469,7 +1469,7 @@ posix/sigignore/6-1	PASS	fw-system
 posix/sigignore/6-2	PASS	fw-system	
 posix/sigismember/3-1	PASS	fw-system	
 posix/sigismember/4-1	PASS	fw-system	
-posix/sigismember/5-1	FAIL	fw-system	Failed sigaddset(..., -1) ret=1 errno=0
+posix/sigismember/5-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: Failed sigaddset(..., -1) ret=1 errno=0
 posix/signal/1-1	PASS	fw-system	
 posix/signal/2-1	PASS	fw-system	
 posix/signal/3-1	PASS	fw-system	

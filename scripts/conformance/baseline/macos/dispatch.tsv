@@ -1,0 +1,39 @@
+# dispatch: status of each program on real macOS (conformance-macos workflow).
+dispatch/after	PASS	
+dispatch/api	PASS	
+dispatch/apply	PASS	
+dispatch/c99	PASS	
+dispatch/cascade	PASS	
+dispatch/concur	CRASH	==================================================
+dispatch/context_for_key	PASS	
+dispatch/data	PASS	
+dispatch/deadname	TIMEOUT	==================================================
+dispatch/debug	PASS	
+dispatch/drift	FAIL	[FAIL] drift (D:\a\_temp\conformance\out\dispatch\src\dispatch_drift.c:92)
+dispatch/group	PASS	
+dispatch/io	PASS	
+dispatch/io_muxed	PASS	
+dispatch/io_net	BUILD	D:\a\_temp\conformance\out\dispatch\src\dispatch_io_net.c:41:10: fatal error: 'mach-o/dyld.h' file not found
+dispatch/io_pipe	PASS	
+dispatch/io_pipe_close	PASS	
+dispatch/overcommit	PASS	
+dispatch/pingpong	PASS	
+dispatch/plusplus	BUILD	clang: error: no such file or directory: 'C:\dev\transmute\artifacts\alchemy-llvm-arm64\libc++.1.dylib'
+dispatch/priority	PASS	
+dispatch/proc	PASS	
+dispatch/queue_finalizer	PASS	
+dispatch/read	PASS	
+dispatch/read2	PASS	
+dispatch/readsync	PASS	
+dispatch/select	PASS	
+dispatch/sema	PASS	
+dispatch/starfish	PASS	
+dispatch/suspend_timer	PASS	
+dispatch/timer	PASS	
+dispatch/timer_bit31	PASS	
+dispatch/timer_bit63	PASS	
+dispatch/timer_set_time	PASS	
+dispatch/timer_short	PASS	
+dispatch/timer_timeout	PASS	
+dispatch/vm	PASS	
+dispatch/vnode	PASS	
