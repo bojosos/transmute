@@ -56,6 +56,10 @@ constexpr std::string_view descriptor_keys[] = {
     "kCTFontFixedAdvanceAttribute|NSCTFontFixedAdvanceAttribute", "kCTFontCascadeListAttribute|NSCTFontCascadeListAttribute",
     "kCTFontUIUsageAttribute|NSCTFontUIUsageAttribute", "kCTFontOrientationAttribute|NSCTFontOrientationAttribute",
     "kCTFontEnabledAttribute|NSCTFontEnabledAttribute",   // unverified value (the NSCT naming of the others)
+    // ffmpeg's drawtext, HandBrake, mpv, VLC (character set: unverified value, the NSCT naming);
+    // the OpenType feature setting keys (Audacity, mpv).
+    "kCTFontCharacterSetAttribute|NSCTFontCharacterSetAttribute", "kCTFontOpenTypeFeatureTag|CTFeatureOpenTypeTag",
+    "kCTFontOpenTypeFeatureValue|CTFeatureOpenTypeValue",
     "kCTFontFamilyNameKey|CTFontFamilyName", "kCTFontSubFamilyNameKey|CTFontSubFamilyName", "kCTFontStyleNameKey|CTFontSubFamilyName",
     "kCTFontFullNameKey|CTFontFullName", "kCTFontPostScriptNameKey|CTFontPostScriptName", "kCTFontUniqueNameKey|CTFontUniqueName",
     "kCTFontVersionNameKey|CTFontVersionName", "kCTFontCopyrightNameKey|CTFontCopyrightName",

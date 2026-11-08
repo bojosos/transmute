@@ -9,6 +9,8 @@
 #include <functional>
 #include <mutex>
 
+#include <shlobj.h>
+
 namespace alchemy::host::system {
 
 Result<Memory> memory() {
@@ -131,6 +133,18 @@ Result<std::string> user_name() {
     if (!GetUserNameW(name.data(), &size)) return win32::last_error();
     if (size <= 1) return Error::not_found;
     return win32::narrow(std::wstring_view(name.data(), size - 1));
+}
+
+Result<std::string> fonts_directory() {
+    PWSTR path = nullptr;
+    const auto result = SHGetKnownFolderPath(FOLDERID_Fonts, 0, nullptr, &path);
+    if (FAILED(result) || !path) {
+        if (path) CoTaskMemFree(path);
+        return Error::not_found;
+    }
+    const std::wstring value(path);
+    CoTaskMemFree(path);
+    return win32::narrow(value);
 }
 
 Result<PowerRequest> PowerRequest::create(std::string_view reason, bool system, bool display) {

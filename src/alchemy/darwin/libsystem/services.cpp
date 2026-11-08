@@ -540,7 +540,7 @@ void DarwinServices::Impl::install_all() {
         if (!std::filesystem::remove(value, error)) throw ServiceError{error ? host_error(error) : enoent};
         return std::uint64_t{0};
     });
-    install("_rmdir", [this](auto& s, auto& m) { const auto value = path(m, s.x[0]); if (is_random_device(value)) throw ServiceError{enotdir}; std::error_code error; if (!std::filesystem::is_directory(value, error)) throw ServiceError{error ? host_error(error) : enotdir}; if (!std::filesystem::remove(value, error)) throw ServiceError{error ? host_error(error) : enoent}; return std::uint64_t{0}; });
+    install("_rmdir", [this](auto& s, auto& m) { const auto value = path(m, s.x[0]); if (is_random_device(value)) throw ServiceError{enotdir}; refuse_read_only(value); std::error_code error; if (!std::filesystem::is_directory(value, error)) throw ServiceError{error ? host_error(error) : enotdir}; if (!std::filesystem::remove(value, error)) throw ServiceError{error ? host_error(error) : enoent}; return std::uint64_t{0}; });
     install("_rename", [this](auto& s, auto& m) { rename_path(filesystem_path(m, s.x[0]), filesystem_path(m, s.x[1])); return std::uint64_t{0}; });
     install("_opendir", [this](auto& s, auto& m) { return new_directory(m, path(m, s.x[0])); }, 0);
     install("_readdir", [this](auto& s, auto& m) {

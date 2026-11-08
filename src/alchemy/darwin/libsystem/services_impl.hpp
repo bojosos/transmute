@@ -15,6 +15,7 @@
 #include "alchemy/darwin/libsystem/malloc/malloc_zones.hpp"
 #include "alchemy/darwin/libsystem/fs/symlink_records.hpp"
 #include "alchemy/darwin/libsystem/errno.hpp"
+#include "alchemy/darwin/libsystem/fonts_view.hpp"
 #include "alchemy/host/crypto.hpp"
 #include "alchemy/host/files.hpp"
 #include "alchemy/host/net.hpp"
@@ -1462,10 +1463,16 @@ public:
     std::filesystem::path path(const transmute::GuestMemory& memory, std::uint64_t address) {
         return translate_path(text(memory, address));
     }
-    std::filesystem::path filesystem_path(const transmute::GuestMemory& memory, std::uint64_t address) {
+    // A path the call changes (`write`): the fonts view refuses it (EROFS).
+    std::filesystem::path filesystem_path(const transmute::GuestMemory& memory, std::uint64_t address, bool write = true) {
         const auto result = path(memory, address);
         if (is_random_device(result)) throw ServiceError{eperm};
+        if (write) refuse_read_only(result);
         return result;
+    }
+    // EROFS for a host path inside /System/Library/Fonts' view (fonts_view.hpp).
+    static void refuse_read_only(const std::filesystem::path& host) {
+        if (libsystem::in_fonts_view(host)) throw ServiceError{30};   // EROFS
     }
     std::filesystem::path translate_path(std::string_view value) {
         if (value.empty()) throw ServiceError{enoent};
@@ -1479,7 +1486,13 @@ public:
         if (result.has_root_directory() && !result.has_root_name()) {
             if (value.find('\\') != std::string::npos) throw ServiceError{einval};
             const auto normalized = path_text(result);
-            if (normalized == "/tmp" || normalized.starts_with("/tmp/")) {
+            if (normalized == "/System/Library/Fonts" || normalized.starts_with("/System/Library/Fonts/")) {
+                // The read-only view of the host's system fonts (writes: refuse_read_only).
+                const auto& fonts = libsystem::host_fonts_directory();
+                if (!fonts) throw ServiceError{enoent};
+                result = *fonts;
+                if (normalized.size() > 22) result /= utf8_path(normalized.substr(22));
+            } else if (normalized == "/tmp" || normalized.starts_with("/tmp/")) {
                 result = std::filesystem::temp_directory_path();
                 if (normalized.size() > 5) result /= std::filesystem::path(std::u8string(
                     reinterpret_cast<const char8_t*>(normalized.data() + 5), normalized.size() - 5));
@@ -1942,6 +1955,7 @@ public:
     std::filesystem::path filesystem_path_at(transmute::GuestMemory& memory, std::uint64_t descriptor, std::uint64_t address) {
         const auto result = path_at(memory, descriptor, address);
         if (is_random_device(result)) throw ServiceError{eperm};
+        refuse_read_only(result);
         return result;
     }
     std::uint64_t new_directory(transmute::GuestMemory& memory, const std::filesystem::path& directory_path, std::optional<int> descriptor = {}) {
@@ -2018,6 +2032,7 @@ public:
         if (const auto slash = specification.rfind('/', offset ? offset - 1 : 0); slash != std::string::npos && slash > 0) {
             const auto parent = translate_path(specification.substr(0, slash));
             if (device_node(parent) || is_pseudo_terminal_path(parent)) throw ServiceError{enotdir};
+            refuse_read_only(parent);
             std::error_code error;
             const auto status = std::filesystem::status(parent, error);
             if (status.type() == std::filesystem::file_type::not_found) throw ServiceError{enoent};
@@ -2118,6 +2133,7 @@ public:
             catch (...) { static_cast<void>(close(descriptor)); throw; }
             return descriptor;
         }
+        if (flags & (3 | 8 | 0x200 | 0x400)) refuse_read_only(name);   // O_WRONLY / O_RDWR / O_APPEND / O_CREAT / O_TRUNC
         if (const auto opened = open_pseudo_terminal(name, flags)) return *opened;
         if (is_terminal_device(name)) throw ServiceError{6};   // ENXIO: no controlling terminal or console device
         if (is_random_device(name)) {

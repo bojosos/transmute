@@ -56,6 +56,9 @@ enum class Pressure : std::uint8_t { normal, warning, critical };
 [[nodiscard]] Result<std::string> host_name(bool physical = true);
 // The login name of the user this process runs as (getlogin, NSUserName).
 [[nodiscard]] Result<std::string> user_name();
+// The directory of the host's installed system fonts (Windows: the Fonts
+// known folder); the guest sees it read-only as /System/Library/Fonts.
+[[nodiscard]] Result<std::string> fonts_directory();
 
 // Keeps the system out of idle sleep, the display on, or both, while it is
 // held (IOPMAssertionCreateWithName; an NSProcessInfo activity).

@@ -1,5 +1,6 @@
 #include "alchemy/darwin/kit/export_fill/export_fill.hpp"
 #include "alchemy/darwin/libsystem/install.hpp"
+#include "alchemy/darwin/libsystem/fonts_view.hpp"
 #include "alchemy/host/files.hpp"
 #include "alchemy/path.hpp"
 
@@ -393,6 +394,7 @@ public:
         const auto check = [&](std::uint64_t result) { if (static_cast<std::int32_t>(result) != 0) { const auto error = p_.guest_errno(); free(guest_path); throw Errno{error}; } };
         if (created) {
             const auto host = path_utf8(p_.process().map_guest_path(path));
+            if (libsystem::in_fonts_view(p_.process().map_guest_path(path))) { free(guest_path); throw Errno{30}; }   // EROFS
             if (const auto set_created = host::files::set_creation_time(host, *created, follow); !set_created) {
                 free(guest_path);
                 throw Errno{set_created.error() == host::Error::not_found ? enoent : set_created.error() == host::Error::access_denied ? eacces : einval};

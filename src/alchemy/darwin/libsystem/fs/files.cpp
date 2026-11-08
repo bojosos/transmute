@@ -252,6 +252,7 @@ void DarwinServices::Impl::install_extra() {
         if (record->socket || record->queue) throw ServiceError{45};
         const auto flags = static_cast<std::uint32_t>(s.x[1]);
         if (flags & ~0x8000U) throw ServiceError{45};
+        refuse_read_only(record->path);
         if (const auto set = host::files::set_hidden(path_text(record->path), flags != 0); !set) throw ServiceError{file_failure(set.error())};
         return std::uint64_t{0};
     });
@@ -260,6 +261,7 @@ void DarwinServices::Impl::install_extra() {
         if (record->random_device) throw ServiceError{eperm};
         if (record->socket || record->queue) throw ServiceError{45};
         const auto mode = s.x[1] & 07777;   // chmod(2) ignores the file-type bits (libuv passes st_mode)
+        refuse_read_only(record->path);
         if (const auto changed = host::files::set_read_only(path_text(record->path), !(mode & 0200)); !changed)
             throw ServiceError{crt_failure(changed.error())};
         return std::uint64_t{0};
@@ -1205,7 +1207,7 @@ void DarwinServices::Impl::install_libsystem_files() {
         const auto flags = s.x[3];
         if (s.x[2]) { std::lock_guard lock(mutex); if (!copy_states.contains(s.x[2])) throw ServiceError{einval}; }
         if (!s.x[0] || !s.x[1]) throw ServiceError{einval}; // descriptor-only forms use fcopyfile
-        const auto from = filesystem_path(m, s.x[0]), to = filesystem_path(m, s.x[1]);
+        const auto from = filesystem_path(m, s.x[0], false), to = filesystem_path(m, s.x[1]);
         if (s.x[2]) {
             // The state names the paths and counts the bytes copied (copyfile_state_get).
             const auto source = text(m, s.x[0]), destination = text(m, s.x[1]);
@@ -1286,7 +1288,7 @@ void DarwinServices::Impl::install_libsystem_files() {
     // fails with ENOTSUP.
     constexpr std::uint32_t enoattr = 93;
     const auto xattr_file = [this](auto& m, bool descriptor, std::uint64_t argument) -> std::filesystem::path {
-        if (!descriptor) return filesystem_path(m, argument);
+        if (!descriptor) return filesystem_path(m, argument, false);
         const auto record = file(static_cast<int>(argument));
         if (record->socket || record->pipe || record->queue || record->standard >= 0 || record->random_device || record->path.empty()) throw ServiceError{eperm};
         return record->path;
@@ -1322,6 +1324,7 @@ void DarwinServices::Impl::install_libsystem_files() {
             if (options & ~(1U | 2U | 4U | 0x20U)) throw ServiceError{einval};
             if ((options & 2) && (options & 4)) throw ServiceError{einval};
             const auto host = xattr_file(m, descriptor, s.x[0]);
+            refuse_read_only(host);
             const auto name = xattr_name(m, host, s.x[1]);
             // An attribute the host cannot query counts as absent, as before.
             const auto exists = host::files::has_attribute(path_text(host), name).value_or(false);
@@ -1336,6 +1339,7 @@ void DarwinServices::Impl::install_libsystem_files() {
         });
         install(descriptor ? "_fremovexattr" : "_removexattr", [this, descriptor, xattr_file, xattr_name, attribute_failure](auto& s, auto& m) {
             const auto host = xattr_file(m, descriptor, s.x[0]);
+            refuse_read_only(host);
             if (const auto removed = host::files::remove_attribute(path_text(host), xattr_name(m, host, s.x[1])); !removed)
                 throw ServiceError{attribute_failure(removed.error())};
             return std::uint64_t{0};

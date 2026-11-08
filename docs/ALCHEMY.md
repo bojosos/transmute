@@ -116,6 +116,11 @@ program run in its command-line mode), which installs headless as root
 
 - **Guest file system.** `translate_path` (`darwin/libsystem/services_impl.hpp`) maps an
   absolute guest path as follows. `/tmp` is the host temporary directory.
+  `/System/Library/Fonts/...` is a read-only view of the host's system fonts
+  (the Fonts known folder). fontconfig apps look there, and writes there fail
+  with EROFS (`refuse_read_only`). Not provided yet: statfs does not report
+  MNT_RDONLY for it, `/System` and `/System/Library` are not listed
+  directories, and the host's per-user fonts are not in it.
   `/Volumes/<letter>/...` is that host drive. With an Alchemy root configured
   (`--root`, `ALCHEMY_ROOT`, or a `.alchemy-root` marker above the program),
   `/Applications`, `/Library`, `/Users`, `/etc`, `/opt`, `/private`, `/usr` and

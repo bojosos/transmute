@@ -1885,6 +1885,36 @@ void test_b33(Fixture& f) {
     require(f.sys("_brk", {start + 4096}) == UINT64_MAX && errno_value() == 12, "brk is ENOMEM");
 }
 
+// /System/Library/Fonts: a read-only view of the host's system fonts (fw-ui's
+// design; fontconfig apps look there). Skipped on a host without Arial.
+void test_fonts_view(Fixture& f) {
+    const auto errno_value = [&f] { return f.engine.read32(f.sys("___error")); };
+    const auto status = f.process.allocate_guest(144);
+    if (f.sys("_stat", {f.text("/System/Library/Fonts/arial.ttf"), status}) != 0) {
+        std::cout << "fonts view skipped: no arial.ttf among the host's fonts\n";
+        return;
+    }
+    const auto fd = f.sys("_open", {f.text("/System/Library/Fonts/arial.ttf"), 0});
+    require(fd < 1024, "a font opens for reading");
+    const auto buffer = f.process.allocate_guest(4);
+    require(f.sys("_read", {fd, buffer, 4}) == 4 && f.engine.read32(buffer) == 0x00000100, "its first bytes (sfnt version 1.0)");
+    f.sys("_close", {fd});
+    const auto directory = f.sys("_opendir", {f.text("/System/Library/Fonts")});
+    require(directory != 0, "the directory lists");
+    f.sys("_closedir", {directory});
+    const auto refused = [&](std::uint64_t result, const char* what) {
+        require(result == UINT64_MAX && errno_value() == 30, std::string(what) + " is EROFS");
+    };
+    refused(f.sys("_open", {f.text("/System/Library/Fonts/arial.ttf"), 2}), "open O_RDWR");
+    refused(f.sys("_open", {f.text("/System/Library/Fonts/alchemy-new.ttf"), 0x201, 0644}), "open O_CREAT");
+    refused(f.sys("_unlink", {f.text("/System/Library/Fonts/arial.ttf")}), "unlink");
+    refused(f.sys("_mkdir", {f.text("/System/Library/Fonts/alchemy-dir"), 0755}), "mkdir");
+    refused(f.sys("_rename", {f.text("/System/Library/Fonts/arial.ttf"), f.text("/System/Library/Fonts/arial2.ttf")}), "rename");
+    refused(f.sys("_chmod", {f.text("/System/Library/Fonts/arial.ttf"), 0600}), "chmod");
+    refused(f.sys("_mkstemp", {f.text("/System/Library/Fonts/alchemy-XXXXXX")}), "mkstemp");
+    refused(f.sys("_unlinkat", {static_cast<std::uint64_t>(-2), f.text("/System/Library/Fonts/arial.ttf"), 0}), "unlinkat");
+}
+
 } // namespace
 
 int main() {
@@ -1919,6 +1949,7 @@ int main() {
         stage("b25"); test_b25(f);
         stage("b31"); test_b31(f);
         stage("b33"); test_b33(f);
+        stage("fonts view"); test_fonts_view(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';
         return 1;
