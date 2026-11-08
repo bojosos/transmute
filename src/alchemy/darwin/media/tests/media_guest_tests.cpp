@@ -3772,6 +3772,13 @@ void vt_compression(Fixture& f) {
     f.call(cfl, "_CFRelease", {session});
 
     // AllowTemporalCompression off: every frame a keyframe.
+    // Software encoders only (EnableHardwareAcceleratedVideoEncoder false): the encoder opened is a software one.
+    require(create(64, 48, 0x61766331, spec("EnableHardwareAcceleratedVideoEncoder", f.cf.boolean(false)), 0, 0) == 0 &&
+            f.status(vt, "_VTCompressionSessionPrepareToEncodeFrames", {f.engine.read64(session_out)}) == 0 && fake_video::last.require_software &&
+            f.status(vt, "_VTSessionCopyProperty", {f.engine.read64(session_out), f.cf.string("UsingHardwareAcceleratedVideoEncoder"), 0, out}) == 0 &&
+            f.engine.read64(out) == f.cf.boolean(false), "a software encoder when hardware ones are not enabled");
+    f.call(vt, "_VTCompressionSessionInvalidate", {f.engine.read64(session_out)});
+    f.call(cfl, "_CFRelease", {f.engine.read64(session_out)});
     require(create(64, 48, 0x61766331, 0, 0, 0) == 0, "an H.264 session");
     session = f.engine.read64(session_out);
     require(f.status(vt, "_VTSessionSetProperty", {session, f.cf.string("AllowTemporalCompression"), f.cf.boolean(false)}) == 0, "no temporal compression");
@@ -3835,8 +3842,11 @@ void vt_compression_host(Fixture& f) {
         if (!ok || pictures.empty()) { why = "the decoder gives no pictures"; return false; }
         return true;
     };
-    for (const auto codec : {0x61766331u, 0x68766331u}) {
-        const char* name = codec == 0x61766331u ? "H.264" : "HEVC";
+    // Each codec on the encoder VideoToolbox picks (hardware first where there is one) and on the software encoders
+    // only (kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder false: what a host without a GPU has).
+    for (const auto& [codec, software] : {std::pair{0x61766331u, false}, std::pair{0x61766331u, true}, std::pair{0x68766331u, false},
+                                          std::pair{0x68766331u, true}}) {
+        const std::string name = std::string(codec == 0x61766331u ? "H.264" : "HEVC") + (software ? " (software)" : "");
         const auto mc_codec = codec == 0x61766331u ? mc::Codec::h264 : mc::Codec::hevc;
         const auto decoders = mc::decoders(mc_codec);
         std::string why;
@@ -3846,6 +3856,10 @@ void vt_compression_host(Fixture& f) {
         }
         alchemy::CallRegs r{};
         r.x[1] = 160; r.x[2] = 120; r.x[3] = codec; r.x[7] = callback;
+        if (software) {
+            const std::array<std::pair<Address, Address>, 1> entries{{{f.cf.string("EnableHardwareAcceleratedVideoEncoder"), f.cf.boolean(false)}}};
+            r.x[4] = f.cf.dictionary(entries);
+        }
         r.push_stack(Address{0});
         r.push_stack(session_out);
         const auto created = static_cast<std::int32_t>(f.regs(vt, "_VTCompressionSessionCreate", r).x0);
@@ -3899,7 +3913,8 @@ void vt_compression_host(Fixture& f) {
         require(static_cast<bool>(decoder), std::string(name) + ": the host's decoder opens on the session's parameter sets");
         std::vector<mc::DecodedPicture> pictures;
         for (const auto& e : vt_encoded()) {
-            require(e.status == 0 && e.sample, std::string(name) + ": a sample");
+            require(e.status == 0 && e.sample, name + ": a sample for frame " + std::to_string(e.refcon) + " (status " + std::to_string(e.status) + ", flags " +
+                    std::to_string(e.flags) + ")");
             const auto block = f.call(cm, "_CMSampleBufferGetDataBuffer", {e.sample});
             const auto length = f.call(cm, "_CMBlockBufferGetDataLength", {block});
             const auto bytes = f.block(length);

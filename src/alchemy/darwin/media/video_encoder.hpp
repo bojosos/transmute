@@ -33,7 +33,7 @@ struct Settings {
     std::uint32_t keyframe_interval{}; // frames (0: the encoder's choice)
     Profile profile{};
     std::uint32_t level{};             // level_idc (H.264: 10 x the level; HEVC: 30 x); 0: the encoder's choice
-    bool real_time{}, frame_reordering{}, require_hardware{};
+    bool real_time{}, frame_reordering{}, require_hardware{}, require_software{};
     std::string encoder_id;            // empty: the first encoder of the codec that takes the settings
 };
 
@@ -77,7 +77,7 @@ void set_backend(Backend backend);
 // Every encoder, H.264 first.
 [[nodiscard]] std::vector<EncoderInfo> encoders();
 // Opens an encoder for `settings`: OpenError::not_found when no encoder of the codec (or the named one, or a
-// hardware one when required) exists, invalid_settings when none of them takes the settings.
+// hardware or software one when required) exists, invalid_settings when none of them takes the settings.
 [[nodiscard]] std::unique_ptr<Encoder> open(const Settings& settings, OpenError& error);
 
 } // namespace alchemy::gui::completion_kit::media::video_encoding

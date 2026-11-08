@@ -99,7 +99,7 @@ std::unique_ptr<Encoder> open(const Settings& settings, OpenError& error) {
     for (auto& l : host_encoders()) {
         if (l.info.codec != settings.codec) continue;
         if (!settings.encoder_id.empty() && l.info.id != settings.encoder_id) continue;
-        if (settings.require_hardware && !l.info.hardware) continue;
+        if ((settings.require_hardware && !l.info.hardware) || (settings.require_software && l.info.hardware)) continue;
         candidates.push_back(std::move(l));
     }
     if (candidates.empty()) {

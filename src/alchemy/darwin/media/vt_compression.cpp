@@ -33,7 +33,11 @@
 //   video-range Y'CbCr; kVTEncodeFrameOptionKey_ForceKeyFrame makes a keyframe. Frames are encoded on the calling
 //   thread and each compressed frame goes to the output callback (or the frame's handler) as soon as the encoder
 //   gives it, in decode order, with its frame's sourceFrameRefCon, presentation time and duration (a decode time
-//   when frames are reordered). Its format description is made from the encoder's parameter sets (with the avcC
+//   when frames are reordered). An encoder may move its output times (Microsoft's software H.264 encoder shifts
+//   them by its reordering delay and rounds them): the first packet of a stream is its first frame, so its offset
+//   from that frame's time is the encoder's shift, and each packet is the waiting frame nearest its time less the
+//   shift (within half a frame); its decode time, less the shift, is never after the frame's presentation time.
+//   Its format description is made from the encoder's parameter sets (with the avcC
 //   or hvcC atom, coremedia.cpp); frames other than keyframes carry NotSync and DependsOnOthers.
 //   kVTEncodeInfo_Asynchronous is never set. CompleteFrames delivers what the encoder still holds; a frame it
 //   never gave is reported with kVTEncodeInfo_FrameDropped.
@@ -69,7 +73,7 @@ struct Compressing {
     enc::Codec codec{};
     std::uint32_t codec_type{}, width{}, height{};
     std::string encoder_id;                            // the encoder specification's, or empty
-    bool require_hardware{};
+    bool require_hardware{}, require_software{};
     std::optional<enc::EncoderInfo> expected;          // the encoder the specification selects first
     Address callback{}, refcon{};
     Address source_attributes{}, pool{};               // retained
@@ -80,6 +84,7 @@ struct Compressing {
     std::vector<std::vector<std::uint8_t>> format_sets;
     std::deque<Pending> pending;
     std::int64_t last_key{INT64_MIN};
+    std::optional<std::int64_t> shift;                 // the encoder's output time less the frame's, for this stream
     double frame_rate{30};
     bool temporal{true};
 };
@@ -115,7 +120,7 @@ private:
         return state->invalid ? vt_invalid_session : 0;
     }
     // The encoders an encoder specification allows for `codec`, in order.
-    std::vector<enc::EncoderInfo> allowed(enc::Codec codec, Address specification, std::string& id, bool& hardware, bool& gpu);
+    std::vector<enc::EncoderInfo> allowed(enc::Codec codec, Address specification, std::string& id, bool& hardware, bool& software, bool& gpu);
     std::int32_t create(GuestMemory& m, const CpuState& s);
     std::int32_t refuse(Compressing& c, const std::string& key, Address value);
     std::int32_t tuning(Address session, Tuning& t);
@@ -135,10 +140,9 @@ private:
     Address class_{};
 };
 
-std::vector<enc::EncoderInfo> Compression::allowed(enc::Codec codec, Address specification, std::string& id, bool& hardware, bool& gpu) {
+std::vector<enc::EncoderInfo> Compression::allowed(enc::Codec codec, Address specification, std::string& id, bool& hardware, bool& software, bool& gpu) {
     id.clear();
-    hardware = gpu = false;
-    bool software = false;
+    hardware = software = gpu = false;
     if (specification && cf.kind(specification) == ObjectKind::dictionary) {
         for (const auto& [k, v] : cf.dictionary_entries(specification)) {
             const auto name = cf.utf8(k);
@@ -173,7 +177,7 @@ std::int32_t Compression::create(GuestMemory& m, const CpuState& s) {
     c->width = static_cast<std::uint32_t>(width);
     c->height = static_cast<std::uint32_t>(height);
     bool gpu = false;
-    const auto candidates = allowed(c->codec, s.x[4], c->encoder_id, c->require_hardware, gpu);
+    const auto candidates = allowed(c->codec, s.x[4], c->encoder_id, c->require_hardware, c->require_software, gpu);
     if (candidates.empty() || (c->width & 1) || (c->height & 1)) return vt_could_not_find_encoder;
     c->expected = candidates.front();
     c->source_attributes = s.x[5] ? retain(s.x[5]) : 0;
@@ -308,6 +312,7 @@ std::int32_t Compression::start(Address session, Compressing& c) {
     settings.real_time = t.real_time;
     settings.frame_reordering = t.reordering && t.temporal && t.profile != enc::Profile::h264_baseline;
     settings.require_hardware = c.require_hardware;
+    settings.require_software = c.require_software;
     settings.encoder_id = c.encoder_id;
     enc::OpenError error{};
     c.encoder = enc::open(settings, error);
@@ -458,11 +463,20 @@ void Compression::send(const Compressing& c, const Pending& p, std::int32_t resu
 }
 
 void Compression::deliver(Compressing& c, std::vector<enc::Packet>& packets) {
-    for (const auto& packet : packets) {
-        const auto found = std::find_if(c.pending.begin(), c.pending.end(), [&](const Pending& p) { return p.key == packet.pts; });
+    const auto tolerance = static_cast<std::int64_t>(5e6 / c.frame_rate);   // half a frame, in 100 ns
+    for (auto packet : packets) {
+        if (c.pending.empty()) continue;
+        if (!c.shift) c.shift = packet.pts - c.pending.front().key;   // the stream's first packet is its first frame
+        const auto target = packet.pts - *c.shift;
+        auto found = c.pending.end();
+        for (auto it = c.pending.begin(); it != c.pending.end(); ++it)
+            if (std::llabs(it->key - target) <= tolerance && (found == c.pending.end() || std::llabs(it->key - target) < std::llabs(found->key - target)))
+                found = it;
         if (found == c.pending.end()) continue;
         const auto p = *found;
         c.pending.erase(found);
+        packet.pts = p.key;
+        packet.dts = std::min(packet.dts - *c.shift, p.key);
         const auto sample = sample_buffer(c, packet, p);
         send(c, p, sample ? 0 : vt_encoder_malfunction, sample ? 0 : info_frame_dropped, sample);
         if (sample) release(sample);
@@ -627,6 +641,7 @@ void Compression::install() {
         const bool ok = c->encoder->drain(packets);
         deliver(*c, packets);
         drop_all(*c);
+        c->shift.reset();   // the encoder starts a new stream
         s.x[0] = status(ok ? 0 : vt_encoder_malfunction);
     });
     raw(video_toolbox, "_VTCompressionSessionPrepareToEncodeFrames", [this](CpuState& s, GuestMemory&) {
@@ -692,8 +707,8 @@ void Compression::install() {
         const auto codec_type = static_cast<std::uint32_t>(s.x[2]);
         if (codec_type != fourcc("avc1") && codec_type != fourcc("hvc1")) { s.x[0] = status(vt_could_not_find_encoder); return; }
         std::string id;
-        bool hardware = false, gpu = false;
-        const auto candidates = allowed(codec_type == fourcc("avc1") ? enc::Codec::h264 : enc::Codec::hevc, s.x[3], id, hardware, gpu);
+        bool hardware = false, software = false, gpu = false;
+        const auto candidates = allowed(codec_type == fourcc("avc1") ? enc::Codec::h264 : enc::Codec::hevc, s.x[3], id, hardware, software, gpu);
         if (candidates.empty()) { s.x[0] = status(vt_could_not_find_encoder); return; }
         if (s.x[4]) m.write64(s.x[4], cf.string(candidates.front().id));
         if (s.x[5]) {

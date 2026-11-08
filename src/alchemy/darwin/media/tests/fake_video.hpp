@@ -183,7 +183,9 @@ inline void install(bool none = false) {
     backend.encoders = [none] { return listed(none); };
     backend.open = [none](const enc::Settings& s, enc::OpenError& error) -> std::unique_ptr<enc::Encoder> {
         for (auto& info : listed(none)) {
-            if (info.codec != s.codec || (!s.encoder_id.empty() && info.id != s.encoder_id) || (s.require_hardware && !info.hardware)) continue;
+            if (info.codec != s.codec || (!s.encoder_id.empty() && info.id != s.encoder_id) || (s.require_hardware && !info.hardware) ||
+                (s.require_software && info.hardware))
+                continue;
             if (!s.width || !s.height || (s.width & 1) || (s.height & 1) || s.width > 4096 || s.height > 4096) { error = enc::OpenError::invalid_settings; return nullptr; }
             last = s;
             ++opened;
