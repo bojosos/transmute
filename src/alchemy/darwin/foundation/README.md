@@ -11,6 +11,10 @@
   NSUbiquitousKeyValueStore as a local per-application store (no iCloud:
   nothing is shared and no external change is ever posted) and
   NSItemProvider within this process (kvs_and_item_providers.cpp).
+  NSProxy (proxy.cpp): a root class with a root metaclass; allocation and
+  memory management are NSObject's, and every other message reaches a
+  subclass's -methodSignatureForSelector: / -forwardInvocation:, which
+  NSProxy's own versions refuse (NSInvalidArgumentException).
 - **Also here for now:** libobjc's associated objects (objc_assoc.cpp). They
   belong to the Objective-C runtime (src/alchemy/objc/), which stays put in
   this wave.

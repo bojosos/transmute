@@ -66,6 +66,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/foundation/kvs_and_item_providers.cpp
     src/alchemy/darwin/foundation/invocation_core.cpp
     src/alchemy/darwin/foundation/invocation.cpp
+    src/alchemy/darwin/foundation/proxy.cpp
     src/alchemy/darwin/foundation/undo_core.cpp
     src/alchemy/darwin/foundation/undo.cpp
     src/alchemy/darwin/foundation/kvo.cpp
@@ -203,3 +204,4 @@ target_sources(alchemy_core PRIVATE
 # NSDateInterval, NSISO8601DateFormatter, the components / relative / interval formatters, CFDateFormatter parsing.
 alchemy_gui_add_framework_case(foundation_date_classes src/alchemy/darwin/foundation/tests/date_classes_case.cpp)
 alchemy_gui_add_framework_case(foundation_kvs_and_item_providers src/alchemy/darwin/foundation/tests/kvs_and_item_providers_tests.cpp)
+alchemy_gui_add_framework_case(foundation_proxy src/alchemy/darwin/foundation/tests/proxy_tests.cpp)

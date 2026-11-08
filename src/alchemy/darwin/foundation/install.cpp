@@ -13,6 +13,7 @@ namespace alchemy::gui::completion_kit {
 void install_streams(Support& support);          // streams.cpp
 void install_url_components(Support& support);   // url_components.cpp
 void install_ubiquitous_store_and_item_providers(Support& support);   // kvs_and_item_providers.cpp
+void install_proxy(Support& support);            // proxy.cpp
 } // namespace alchemy::gui::completion_kit
 namespace alchemy::gui::completion_kit::data {
 void install_strings_more(Support& support);       // strings_more.cpp
@@ -77,6 +78,7 @@ void install_foundation_exceptions(support_kit::Support& support) { completion_k
 
 void install_foundation_invocations_undo_kvo(support_kit::Support& support) {
     completion_kit::install_invocations(support);
+    completion_kit::install_proxy(support);
     completion_kit::install_undo_manager(support);
     completion_kit::install_key_value_observing(support);
 }
