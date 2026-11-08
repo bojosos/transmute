@@ -74,6 +74,28 @@ void install_zlib(ProcessContext& process) {
         if (!s.x[1]) { s.x[0] = 1; return; }
         s.x[0] = adler32_update(static_cast<std::uint32_t>(s.x[0]), read(m, s.x[1], static_cast<std::uint32_t>(s.x[2])));
     });
+    // uLong adler32_combine(uLong adler1, uLong adler2, z_off_t len2): the Adler-32 of two blocks
+    // joined, from theirs and the second's length (zlib's adler32_combine_).
+    const auto adler32_combine = [](CpuState& s, GuestMemory&) {
+        constexpr std::uint64_t base = 65521;
+        const auto length = static_cast<std::int64_t>(s.x[2]);
+        if (length < 0) { s.x[0] = 0xffffffffU; return; }
+        const auto first = s.x[0] & 0xffffffffU, second = s.x[1] & 0xffffffffU;
+        const auto remainder = static_cast<std::uint64_t>(length) % base;
+        auto sum1 = first & 0xffff;
+        auto sum2 = (remainder * sum1) % base;
+        sum1 += (second & 0xffff) + base - 1;
+        sum2 += ((first >> 16) & 0xffff) + ((second >> 16) & 0xffff) + base - remainder;
+        if (sum1 >= base) sum1 -= base;
+        if (sum1 >= base) sum1 -= base;
+        if (sum2 >= (base << 1)) sum2 -= (base << 1);
+        if (sum2 >= base) sum2 -= base;
+        s.x[0] = sum1 | (sum2 << 16);
+    };
+    function("_adler32_combine", adler32_combine);
+    function("_adler32_combine64", adler32_combine);
+    // uLong zlibCompileFlags(void): 32-bit uInt, 64-bit uLong, voidpf and z_off_t; no option bits.
+    function("_zlibCompileFlags", [](CpuState& s, GuestMemory&) { s.x[0] = 1 | (2 << 2) | (2 << 4) | (2 << 6); });
     function("_compressBound", [](CpuState& s, GuestMemory&) { s.x[0] = zlib_compress_bound(s.x[0]); });
     // int compress2(Bytef* dest, uLongf* destLen, const Bytef* source, uLong sourceLen, int level)
     function("_compress2", [](CpuState& s, GuestMemory& m) {

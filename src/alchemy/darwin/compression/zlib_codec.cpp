@@ -424,7 +424,7 @@ InflateResult zlib_decompress(std::span<const std::uint8_t> input, std::size_t l
 // ---- Streaming decoder ----------------------------------------------------
 
 struct InflateStream::State {
-    enum class Stage { header, blocks, trailer, done, failed };
+    enum class Stage { header, dictionary, blocks, trailer, done, failed };
     Wrapper requested{Wrapper::zlib}, wrapper{Wrapper::zlib};
     Stage stage{Stage::header};
     std::vector<std::uint8_t> buffer;      // input not yet consumed, from the current block start
@@ -463,11 +463,12 @@ struct InflateStream::State {
             if ((cmf & 0x0f) != 8) { fail("unknown compression method"); return true; }
             if ((cmf >> 4) > 7) { fail("invalid window size"); return true; }
             if (flg & 0x20) {
-                // Preset dictionaries (inflateSetDictionary) are not provided.
+                // A preset dictionary: inflate answers need_dictionary until set_dictionary.
                 if (buffer.size() < 6) return false;
                 dictionary = (std::uint32_t{buffer[2]} << 24) | (std::uint32_t{buffer[3]} << 16) |
                              (std::uint32_t{buffer[4]} << 8) | buffer[5];
-                fail("preset dictionaries are unsupported");
+                buffer.erase(buffer.begin(), buffer.begin() + 6);
+                stage = Stage::dictionary;
                 return true;
             }
             buffer.erase(buffer.begin(), buffer.begin() + 2);
@@ -567,6 +568,18 @@ bool InflateStream::ended() const noexcept { return state_->stage == State::Stag
 std::uint32_t InflateStream::check() const noexcept { return state_->dictionary ? state_->dictionary : state_->check; }
 std::string_view InflateStream::message() const noexcept { return state_->message; }
 void InflateStream::verify(bool enabled) noexcept { state_->verify = enabled; }
+InflateStream::Dictionary InflateStream::set_dictionary(std::span<const std::uint8_t> bytes) {
+    auto& s = *state_;
+    using Stage = State::Stage;
+    const bool raw_start = s.wrapper == Wrapper::raw && s.stage == Stage::blocks && s.total_out == 0 && s.history.empty();
+    if (s.stage != Stage::dictionary && !raw_start) return Dictionary::invalid;
+    if (s.stage == Stage::dictionary && adler32_update(1, bytes) != s.dictionary) return Dictionary::mismatch;
+    const auto keep = std::min<std::size_t>(bytes.size(), 32768);
+    s.history.assign(bytes.end() - static_cast<std::ptrdiff_t>(keep), bytes.end());
+    s.dictionary = 0;
+    s.stage = Stage::blocks;
+    return Dictionary::ok;
+}
 void InflateStream::reset() { reset(state_->requested); }
 void InflateStream::reset(Wrapper wrapper) {
     const auto keep = state_->verify;
@@ -580,10 +593,12 @@ InflateStream::Result InflateStream::feed(std::span<const std::uint8_t> input) {
     if (s.stage == Stage::failed) return {s.dictionary ? Status::need_dictionary : Status::data_error, 0};
     if (s.stage == Stage::done) return {Status::end, 0};
     s.buffer.insert(s.buffer.end(), input.begin(), input.end());
+    if (s.stage == Stage::dictionary) return {Status::need_dictionary, input.size()};
     for (;;) {
         bool progressed = false;
         switch (s.stage) {
         case Stage::header: progressed = s.header(); break;
+        case Stage::dictionary: return {Status::need_dictionary, input.size()};
         case Stage::blocks: progressed = s.blocks(); break;
         case Stage::trailer: progressed = s.trailer(); break;
         case Stage::done: {

@@ -258,6 +258,20 @@ void install_zlib_stream(ProcessContext& process) {
         (*codec)->verify(static_cast<std::uint32_t>(s.x[1]) != 0);
         s.x[0] = code(z_ok);
     });
+    // int inflateSetDictionary(z_streamp, const Bytef* dictionary, uInt dictLength): after inflate answered
+    // Z_NEED_DICT (the dictionary whose Adler-32 the header names: else Z_DATA_ERROR), or for a raw stream
+    // before any data; otherwise Z_STREAM_ERROR.
+    function("_inflateSetDictionary", [lookup](CpuState& s, GuestMemory& m) {
+        const auto state = lookup(m, s.x[0]);
+        auto* codec = state ? std::get_if<std::unique_ptr<InflateStream>>(&state->codec) : nullptr;
+        const auto length = static_cast<std::uint32_t>(s.x[2]);
+        if (!codec || (!s.x[1] && length)) { s.x[0] = code(z_stream_error); return; }
+        std::vector<std::uint8_t> bytes(length);
+        if (length) m.read_bytes(s.x[1], bytes);
+        const auto result = (*codec)->set_dictionary(bytes);
+        s.x[0] = code(result == InflateStream::Dictionary::ok ? z_ok :
+                      result == InflateStream::Dictionary::mismatch ? z_data_error : z_stream_error);
+    });
     // int inflateEnd(z_streamp)
     function("_inflateEnd", [lookup, streams](CpuState& s, GuestMemory& m) {
         const auto state = lookup(m, s.x[0]);

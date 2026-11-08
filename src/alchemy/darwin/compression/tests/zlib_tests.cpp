@@ -168,6 +168,23 @@ void test_streams() {
         const std::uint8_t dictionary[] = {0x78, 0xbb, 0x01, 0x02, 0x03, 0x04, 0x00};
         vd::InflateStream preset(vd::Wrapper::zlib);
         require(preset.feed(dictionary).status == Status::need_dictionary && preset.check() == 0x01020304U, "Z_NEED_DICT");
+        // inflateSetDictionary: streams made by zlib with a preset dictionary (zdict), back-references into it.
+        const auto text = bytes("Alchemy preset dictionary text, ");
+        const std::uint8_t with_dictionary[] = {0x78, 0xf9, 0xc9, 0xbb, 0x0b, 0xfe, 0x73, 0x24, 0x20, 0x9f,
+                                                0x98, 0x9e, 0x98, 0x99, 0x07, 0x00, 0x0b, 0xa4, 0x0d, 0xfe};
+        vd::InflateStream asked(vd::Wrapper::zlib);
+        require(asked.feed(std::span(with_dictionary).first(9)).status == Status::need_dictionary && asked.check() == 0xc9bb0bfeU,
+                "the header's dictionary id");
+        require(asked.set_dictionary(bytes("another dictionary")) == vd::InflateStream::Dictionary::mismatch, "a wrong dictionary accepted");
+        require(asked.set_dictionary(text) == vd::InflateStream::Dictionary::ok, "the right dictionary refused");
+        require(asked.feed(std::span(with_dictionary).subspan(9)).status == Status::end &&
+                asked.output() == bytes("Alchemy preset dictionary text, again"), "inflate after inflateSetDictionary");
+        vd::InflateStream raw(vd::Wrapper::raw);
+        const std::uint8_t raw_with_dictionary[] = {0xc3, 0x23, 0x00, 0x00};
+        require(raw.set_dictionary(text) == vd::InflateStream::Dictionary::ok && raw.feed(raw_with_dictionary).status == Status::end &&
+                raw.output() == bytes("dictionary text, dictionary"), "raw inflate with a dictionary");
+        vd::InflateStream late(vd::Wrapper::zlib);
+        require(late.set_dictionary(text) == vd::InflateStream::Dictionary::invalid, "a dictionary before Z_NEED_DICT accepted");
     }
     // Deflate: a sync flush makes everything so far decodable; finish ends
     // the stream; every wrapper round-trips.
@@ -216,6 +233,9 @@ void test_guest_zlib(Fixture& f) {
     require(static_cast<std::int32_t>(f.call(libz, "_uncompress", {output, output_length, packed, f.engine.read64(packed_length)})) == -5,
             "Z_BUF_ERROR");
     require(f.call(libz, "_crc32", {0, f.text("123456789"), 9}) == 0xcbf43926U, "guest crc32");
+    // adler32("abc") combined with adler32("defgh") is adler32("abcdefgh") (values from zlib).
+    require(f.call(libz, "_adler32_combine", {0x024d0127, 0x05f501ff, 5}) == 0x0e000325U, "adler32_combine");
+    require(f.call(libz, "_zlibCompileFlags") == 0xa9, "zlibCompileFlags");
     require(static_cast<std::int32_t>(f.call(libz, "_compress2", {packed, packed_length, source, input.size(), 12})) == -2, "Z_STREAM_ERROR");
 }
 

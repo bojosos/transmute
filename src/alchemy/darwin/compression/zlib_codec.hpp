@@ -70,6 +70,11 @@ public:
     [[nodiscard]] std::string_view message() const noexcept;
     // Checksum verification of the trailer (inflateValidate).
     void verify(bool enabled) noexcept;
+    // inflateSetDictionary: the preset dictionary a zlib header asked for (need_dictionary; its
+    // Adler-32 must be the header's id), or a raw stream's before any data. Its last 32 KiB become
+    // the back-reference window.
+    enum class Dictionary { ok, mismatch, invalid };
+    Dictionary set_dictionary(std::span<const std::uint8_t> bytes);
     // Restarts for a new stream: with the given wrapper, or the current one.
     void reset(Wrapper wrapper);
     void reset();
