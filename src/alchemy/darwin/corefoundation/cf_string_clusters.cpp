@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <tuple>
+#include <vector>
 
 // CoreFoundation, Foundation, CFNetwork and libobjc gaps of Chrome:
 // - CFDictionaryApplyFunction, CFStringAppend (mutable strings),
@@ -103,6 +105,147 @@ void Provider::install_foundation() {
                     static_cast<void>(call(fill::libsystem, "__Block_release", {block}));
                     return references <= 1;   // that release freed the block
                 });
+            return true;
+        });
+    }
+
+    // Strings, arrays and dictionaries implemented by guest code: instances of guest classes that inherit from
+    // NSString, NSArray or NSDictionary. Swift's bridged strings and collections are such objects, and CF meets
+    // them as arguments (a dictionary key, a notification name, registered defaults). Each joins the object
+    // store as a forwarding record (CoreFoundation::adopt_guest_string/_array/_dictionary): retain and release
+    // are the object's own -retain/-release, and its contents are read through the class cluster's primitive
+    // methods (-length/-getCharacters:range:, -count/-objectAtIndex:, -count/-keyEnumerator/-objectForKey:),
+    // again at every lookup; CF's single-element collection accessors send -count, -objectAtIndex: and
+    // -objectForKey: to the object instead. A class with a guest mutation primitive (its own, or inherited
+    // from a guest subclass of the mutable class) can't be followed by CF, so it stops.
+    {
+        enum class Cluster { string, array, dictionary };
+        struct Base { Cluster cluster; Address cls, mutable_cls, mutation; const char* noun; };
+        std::vector<Base> bases;
+        for (const auto& [cluster, name, mutable_name, mutation, noun] : {
+                 std::tuple{Cluster::string, "NSString", "NSMutableString", "replaceCharactersInRange:withString:", "string"},
+                 std::tuple{Cluster::array, "NSArray", "NSMutableArray", "replaceObjectAtIndex:withObject:", "array"},
+                 std::tuple{Cluster::dictionary, "NSDictionary", "NSMutableDictionary", "setObject:forKey:", "dictionary"}})
+            if (const auto cls = objc.find_class(name)) bases.push_back({cluster, cls, objc.find_class(mutable_name), objc.selector(mutation), noun});
+        const auto retain = objc.selector("retain"), release = objc.selector("release"), retain_count = objc.selector("retainCount");
+        const auto note_associated = objc.selector("_noteAssociatedObjects");
+        const auto length = objc.selector("length"), get_characters = objc.selector("getCharacters:range:");
+        const auto count = objc.selector("count"), object_at = objc.selector("objectAtIndex:");
+        const auto key_enumerator = objc.selector("keyEnumerator"), next_object = objc.selector("nextObject");
+        const auto object_for_key = objc.selector("objectForKey:");
+        const auto class_name = [this](Address cls) {
+            std::string name;
+            const auto text = call(libobjc, "_class_getName", {cls});
+            for (Address at = text; at && name.size() < 256; ++at) {
+                const auto c = memory().read8(at);
+                if (!c) break;
+                name.push_back(static_cast<char>(c));
+            }
+            return name;
+        };
+        const auto element_count = [this, count](Address object, const char* noun) {
+            const auto n = objc.send(object, count).x0;
+            if (n > (1ULL << 28)) throw std::runtime_error(std::string("Alchemy CoreFoundation: a guest ") + noun + " reported an impossible count");
+            return n;
+        };
+        const auto read_string = [this, length, get_characters](Address object) {
+            const auto n = objc.send(object, length).x0;
+            std::vector<std::uint16_t> units(static_cast<std::size_t>(n));
+            if (n == 0) return units;
+            if (n > (1ULL << 30)) throw std::runtime_error("Alchemy CoreFoundation: a guest string reported an impossible length");
+            const auto buffer = process.allocate_guest(n * 2, 8);
+            CallRegs registers{};
+            registers.x[2] = buffer;
+            registers.x[3] = 0;
+            registers.x[4] = n;
+            try { static_cast<void>(objc.send(object, get_characters, registers)); }
+            catch (...) { process.release_guest(buffer); throw; }
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(n * 2));
+            memory().read_bytes(buffer, bytes);
+            process.release_guest(buffer);
+            for (std::size_t at = 0; at < units.size(); ++at) units[at] = static_cast<std::uint16_t>(bytes[at * 2] | bytes[at * 2 + 1] << 8);
+            return units;
+        };
+        // The elements as the collection answers them (Swift bridges each lazily and keeps it with the collection).
+        const auto read_array = [this, element_count, object_at](Address object) {
+            std::vector<Address> values(static_cast<std::size_t>(element_count(object, "array")));
+            for (std::size_t at = 0; at < values.size(); ++at) {
+                CallRegs registers{};
+                registers.x[2] = at;
+                values[at] = objc.send(object, object_at, registers).x0;
+            }
+            return values;
+        };
+        const auto read_dictionary = [this, element_count, key_enumerator, next_object, object_for_key](Address object) {
+            const auto n = element_count(object, "dictionary");
+            std::vector<std::pair<Address, Address>> entries;
+            entries.reserve(static_cast<std::size_t>(n));
+            const auto keys = objc.send(object, key_enumerator).x0;
+            while (const auto key = keys ? objc.send(keys, next_object).x0 : 0) {
+                if (entries.size() == n) throw std::runtime_error("Alchemy CoreFoundation: a guest dictionary enumerated more keys than its count");
+                CallRegs registers{};
+                registers.x[2] = key;
+                entries.emplace_back(key, objc.send(object, object_for_key, registers).x0);
+            }
+            if (entries.size() != n) throw std::runtime_error("Alchemy CoreFoundation: a guest dictionary enumerated fewer keys than its count");
+            return entries;
+        };
+        // CF's single-element accessors ask the collection itself, as CF does for an Objective-C collection.
+        const auto array_count = [element_count](Address object) { return element_count(object, "array"); };
+        const auto dictionary_count = [element_count](Address object) { return element_count(object, "dictionary"); };
+        const auto element_at = [this, object_at](Address object, Address index) {
+            CallRegs registers{};
+            registers.x[2] = index;
+            return objc.send(object, object_at, registers).x0;
+        };
+        const auto value_for_key = [this, object_for_key](Address object, Address key) {
+            CallRegs registers{};
+            registers.x[2] = key;
+            return objc.send(object, object_for_key, registers).x0;
+        };
+        cf.add_foreign_adopter([this, bases, retain, release, retain_count, note_associated, class_name, read_string, read_array,
+                                read_dictionary, array_count, dictionary_count, element_at, value_for_key](Address address) {
+            Address isa{};
+            try { isa = memory().read64(address); } catch (const std::exception&) { return false; }
+            if (!isa || !(call(libobjc, "_object_isClass", {isa}) & 0xff)) return false;
+            const Base* base = nullptr;
+            bool mutable_subclass = false;
+            for (auto cls = isa; cls && !base; cls = call(libobjc, "_class_getSuperclass", {cls}))
+                for (const auto& candidate : bases) {
+                    if (cls == candidate.mutable_cls) mutable_subclass = true;
+                    if (cls == candidate.cls) base = &candidate;
+                }
+            if (!base) return false;
+            const auto own = [&](Address sel) {
+                return call(libobjc, "_class_getMethodImplementation", {isa, sel}) != call(libobjc, "_class_getMethodImplementation", {base->cls, sel});
+            };
+            if (mutable_subclass || own(base->mutation))
+                throw std::runtime_error("Alchemy CoreFoundation: " + class_name(isa) + " is a mutable " + base->noun +
+                    " implemented by guest code; CoreFoundation can't follow its changes");
+            // Its reference count must be its own: the class cluster's -retain would come back to this record.
+            if (!own(retain) || !own(release) || !own(retain_count)) return false;
+            // The record is runtime state attached to the object, as an associated object is: Swift's objects
+            // answer -_noteAssociatedObjects (objc4 sends it for associated objects) by running
+            // objc_destructInstance when they are freed, which retires the record (ObjectStore::note_destructed).
+            // An object that can't be told so isn't adopted.
+            if (!objc.responds(address, note_associated)) return false;
+            static_cast<void>(objc.send(address, note_associated));
+            auto forward_retain = [this, retain](Address object) { static_cast<void>(objc.send(object, retain)); };
+            // -retainCount before -release says whether this release ends the object. Another thread of the runtime
+            // that owns it can race that; the record also leaves the store when the object is destructed (see
+            // -_noteAssociatedObjects above) or its address holds another object.
+            auto forward_release = [this, release, retain_count](Address object) {
+                const auto references = objc.send(object, retain_count).x0;
+                static_cast<void>(objc.send(object, release));
+                return references <= 1;
+            };
+            switch (base->cluster) {
+            case Cluster::string: cf.adopt_guest_string(address, isa, read_string, forward_retain, forward_release); break;
+            case Cluster::array: cf.adopt_guest_array(address, isa, read_array, forward_retain, forward_release, array_count, element_at); break;
+            case Cluster::dictionary:
+                cf.adopt_guest_dictionary(address, isa, read_dictionary, forward_retain, forward_release, dictionary_count, value_for_key);
+                break;
+            }
             return true;
         });
     }

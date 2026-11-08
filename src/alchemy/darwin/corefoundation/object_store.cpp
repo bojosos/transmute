@@ -91,12 +91,16 @@ std::optional<ObjectStore::View> ObjectStore::peek(std::uint64_t address) const 
 }
 
 void ObjectStore::adopt_forwarding(std::uint64_t address, std::uint64_t size, std::uint64_t class_address,
-    std::function<void(std::uint64_t)> retain, std::function<bool(std::uint64_t)> release) {
+    std::function<void(std::uint64_t)> retain, std::function<bool(std::uint64_t)> release,
+    ObjectKind kind, std::shared_ptr<ObjectPayload> payload, std::function<void(std::uint64_t)> destroy) {
     if (address == 0 || size < 8 || !retain || !release) throw std::runtime_error("invalid forwarding compatibility object");
     auto record = std::make_shared<ObjectRecord>();
     record->address = address;
     record->size = size;
     record->class_address = class_address;
+    record->kind = kind;
+    record->payload = std::move(payload);
+    record->destroy = std::move(destroy);
     record->owned_memory = false;
     record->forward_retain = std::move(retain);
     record->forward_release = std::move(release);
@@ -157,6 +161,9 @@ void ObjectStore::finish(const std::shared_ptr<ObjectRecord>& record) {
     }
     if (!removed) return;
     perf::add(perf::objc_dealloc);
+    // A forwarding record's destroy frees only its side storage (the object's
+    // memory is the other runtime's); it runs once, by whoever removed the record.
+    if (record->forward_release && record->destroy) record->destroy(record->address);
     if (record->weakly_referenced && weak_clearer_) weak_clearer_(record->address);
     if (!record->owned_memory) return;
     // A message to the freed object misses the dispatch cache (isa 0) and
@@ -208,10 +215,23 @@ bool ObjectStore::destructed(std::uint64_t address) const {
 
 void ObjectStore::note_destructed(std::uint64_t address) {
     if (address == 0) return;
-    auto& part = shard(address);
-    std::lock_guard lock(part.mutex);
-    const auto found = part.objects.find(address);
-    if (found != part.objects.end() && found->second->destroying) found->second->destructed = true;
+    std::shared_ptr<ObjectRecord> forwarded;
+    {
+        auto& part = shard(address);
+        std::lock_guard lock(part.mutex);
+        const auto found = part.objects.find(address);
+        if (found == part.objects.end()) return;
+        if (found->second->destroying) found->second->destructed = true;
+        else if (found->second->forward_release) forwarded = found->second;
+    }
+    // The runtime that keeps a forwarding record's object is freeing it (Swift's
+    // swift_deallocClassInstance destructs before it frees, and never calls
+    // object_dispose): the record goes with the object.
+    if (forwarded) finish(forwarded);
+}
+
+void ObjectStore::retire_forwarding(const std::shared_ptr<ObjectRecord>& record) {
+    if (record && record->forward_release) finish(record);
 }
 
 void ObjectStore::dispose(std::uint64_t address) {

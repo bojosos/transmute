@@ -88,6 +88,26 @@ CoreFoundation object registry. CF-to-Objective-C casts preserve the guest
 address and ownership. Compiler string literals and runtime-created strings
 work through both interfaces. `NSClassFromString`, `NSSelectorFromString`,
 `NSStringFromClass`, and `NSStringFromSelector` are included.
+A string, array or dictionary implemented by guest code (an instance of a guest
+class that inherits from `NSString`, `NSArray` or `NSDictionary`, as Swift's
+bridged strings and collections are) joins the registry when CoreFoundation
+first meets it: a forwarding record whose retain and release are the object's
+own, with its contents read through the class cluster's primitive methods
+(`-length`/`-getCharacters:range:`, `-count`/`-objectAtIndex:`,
+`-count`/`-keyEnumerator`/`-objectForKey:`) and checked again at each lookup
+(Swift changes its storage in place only while nothing else references it).
+`CFArrayGetCount`, `CFArrayGetValueAtIndex`, `CFDictionaryGetCount` and the
+`CFDictionaryGetValue` family ask the object itself instead (`-count`,
+`-objectAtIndex:`, `-objectForKey:`), as CoreFoundation does for an
+Objective-C collection, so a loop over a large Swift collection stays linear.
+The record leaves the registry when the object is released for good or
+destructed, or when its address holds another object. A guest class with a
+mutation primitive of its own (`-replaceCharactersInRange:withString:`,
+`-replaceObjectAtIndex:withObject:`, `-setObject:forKey:`), or a guest subclass
+of a mutable class, can't be followed by CoreFoundation and stops explicitly.
+Swift's bridged sets have no CoreFoundation counterpart here. A value that
+holds something other than property-list objects makes
+`CFPropertyListCreateData` answer NULL with an NSCocoaErrorDomain 3851 error.
 The subsequent [dependency follow-up](ALCHEMY_PYTHON_FOLLOWUP.md) adds a bounded
 `NSProcessInfo`, `NSAutoreleasePool` and checked `NSLog`/`NSLogv` subset.
 

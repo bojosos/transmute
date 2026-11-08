@@ -54,11 +54,16 @@ public:
         std::function<void(std::uint64_t)> destroy = {}, bool immortal = false);
     void adopt(std::uint64_t address, std::uint64_t size, std::uint64_t class_address,
         ObjectKind kind, std::shared_ptr<ObjectPayload> payload, bool immortal = true);
-    // An object whose reference count another runtime keeps (a heap Block):
-    // retain/release forward to the hooks, and the record goes away when
-    // `release` reports the object gone.
+    // An object whose reference count another runtime keeps (a heap Block, a
+    // guest-implemented string): retain/release forward to the hooks, and the
+    // record goes away when `release` reports the object gone or that runtime
+    // destructs the object (note_destructed). The record may carry a kind and
+    // payload; `destroy` (side storage only, never the object's memory) runs
+    // once, when the record leaves the store.
     void adopt_forwarding(std::uint64_t address, std::uint64_t size, std::uint64_t class_address,
-        std::function<void(std::uint64_t)> retain, std::function<bool(std::uint64_t)> release);
+        std::function<void(std::uint64_t)> retain, std::function<bool(std::uint64_t)> release,
+        ObjectKind kind = ObjectKind::instance, std::shared_ptr<ObjectPayload> payload = {},
+        std::function<void(std::uint64_t)> destroy = {});
     [[nodiscard]] std::shared_ptr<ObjectRecord> find(std::uint64_t address) const;
     [[nodiscard]] std::shared_ptr<ObjectRecord> require(std::uint64_t address) const;
     // The registered class and kind of a live object without taking shared
@@ -77,6 +82,9 @@ public:
     // the memory, as with Apple's runtime, and no new object takes its address. Host deallocs
     // that end an object without [super dealloc] call object_dispose, as Apple's runtime frees.
     void note_destructed(std::uint64_t address);
+    // Removes this forwarding record if it is still the one at its address (its object is gone and a later
+    // object may already have a record of its own there); runs its destroy as release would.
+    void retire_forwarding(const std::shared_ptr<ObjectRecord>& record);
     // Whether a live record was destructed and kept (object_dispose then only frees it: its isa
     // may already name another class, as a zombie's does).
     [[nodiscard]] bool destructed(std::uint64_t address) const;

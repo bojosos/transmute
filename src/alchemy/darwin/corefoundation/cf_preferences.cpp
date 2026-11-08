@@ -259,7 +259,20 @@ void install_cf_preferences(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) 
         if (s.x[4]) m.write64(s.x[4], 0);
         if (!cf_allocators::accepted(process.objects(), s.x[0])) throw std::runtime_error("Alchemy CoreFoundation: allocators other than the default and CFAllocatorCreate's are unsupported");
         if (!s.x[1] || (s.x[2] != plist_xml_format && s.x[2] != plist_binary_format)) { s.x[0] = 0; return; }
-        const auto value = plist_from_guest(process, cf, s.x[1]);
+        // A value holding something that is not a property-list object answers NULL with an error
+        // (NSCocoaErrorDomain 3851, as -[NSDictionary writeToURL:error:] reports), not a stop.
+        Plist value;
+        try { value = plist_from_guest(process, cf, s.x[1]); }
+        catch (const std::runtime_error&) {
+            s.x[0] = 0;
+            if (s.x[4]) {
+                const auto create = process.resolve(core_foundation_library, "_CFErrorCreate");
+                const auto domain = cf.string("NSCocoaErrorDomain");
+                if (create) m.write64(s.x[4], process.calling_engine().invoke_callback(create->address, std::array<std::uint64_t, 4>{0, domain, 3851, 0}));
+                process.objects().release(domain);
+            }
+            return;
+        }
         if (s.x[2] == plist_xml_format) {
             const auto text = plist_to_xml(value);
             s.x[0] = data_object(std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));

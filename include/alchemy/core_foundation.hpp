@@ -28,6 +28,27 @@ public:
     void set_foreign_adopter(std::function<bool(std::uint64_t)> adopter);
     // Another adopter tried before the foreign adopter (Blocks, ...).
     void add_foreign_adopter(std::function<bool(std::uint64_t)> adopter);
+    // A string implemented by guest code (an instance of a guest class that
+    // inherits from NSString, such as Swift's bridged native strings) joins the
+    // object store as a forwarding record: `retain`/`release` are the object's
+    // own (release returns true when the object is gone), and `read` gives its
+    // characters, read again at every lookup. The record leaves the store when
+    // the object is released for good, destructed, or its address reused.
+    void adopt_guest_string(std::uint64_t address, std::uint64_t class_address,
+        std::function<std::vector<std::uint16_t>(std::uint64_t)> read, std::function<void(std::uint64_t)> retain,
+        std::function<bool(std::uint64_t)> release);
+    // The same for arrays and dictionaries implemented by guest code (Swift's
+    // bridged collections): `read` gives the elements, or the key/value pairs;
+    // `count` and `at`/`lookup` are the object's own -count and
+    // -objectAtIndex:/-objectForKey:, which CF's single-element accessors use.
+    void adopt_guest_array(std::uint64_t address, std::uint64_t class_address,
+        std::function<std::vector<std::uint64_t>(std::uint64_t)> read, std::function<void(std::uint64_t)> retain,
+        std::function<bool(std::uint64_t)> release, std::function<std::uint64_t(std::uint64_t)> count,
+        std::function<std::uint64_t(std::uint64_t, std::uint64_t)> at);
+    void adopt_guest_dictionary(std::uint64_t address, std::uint64_t class_address,
+        std::function<std::vector<std::pair<std::uint64_t, std::uint64_t>>(std::uint64_t)> read,
+        std::function<void(std::uint64_t)> retain, std::function<bool(std::uint64_t)> release,
+        std::function<std::uint64_t(std::uint64_t)> count, std::function<std::uint64_t(std::uint64_t, std::uint64_t)> lookup);
     [[nodiscard]] std::uint64_t string(std::string_view utf8);
     [[nodiscard]] std::uint64_t string_utf16(std::span<const std::uint16_t> units);
     [[nodiscard]] std::uint64_t constant_string(std::string_view utf8);

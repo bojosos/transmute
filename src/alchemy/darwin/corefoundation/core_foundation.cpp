@@ -235,7 +235,9 @@ struct StringPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint16
     // An external buffer (bind_external_units): `storage` is the caller's, never ours to free.
     bool external{}; std::uint64_t capacity{};
     std::function<std::uint64_t(std::uint64_t, std::uint64_t)> grow;
-    std::function<void(std::uint64_t)> release_external; };
+    std::function<void(std::uint64_t)> release_external;
+    // A string implemented by guest code (adopt_guest_string): its object's class, and how to read its characters.
+    std::uint64_t guest_class{}; std::function<std::vector<std::uint16_t>(std::uint64_t)> read_guest; };
 struct DataPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint8_t> data; std::uint64_t storage{}, capacity{}; bool mutable_data{}; };
 struct NumberPayload : ObjectPayload { std::int64_t integer{}; double floating{}; unsigned type{}; bool is_float{}; };
 int compare_number(const NumberPayload& left, const NumberPayload& right) {
@@ -263,8 +265,16 @@ int cf_number_compare(const NumberPayload& left, const NumberPayload& right) {
     if (!comparison && (left.is_float ? left.floating == 0 : left.integer == 0) && negative(left) != negative(right)) return negative(left) ? -1 : 1;
     return comparison;
 }
-struct ArrayPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint64_t> values; bool mutable_array{}, own{}; };
-struct DictionaryPayload : ObjectPayload { std::mutex mutex; std::vector<std::pair<std::uint64_t, std::uint64_t>> values; std::uint64_t revision{}; bool mutable_dictionary{}, own_keys{}, own_values{}, copy_keys{}; };
+struct ArrayPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint64_t> values; bool mutable_array{}, own{};
+    // An array implemented by guest code (adopt_guest_array): its object's class, how to read its elements, and
+    // its own -count and -objectAtIndex:.
+    std::uint64_t guest_class{}; std::function<std::vector<std::uint64_t>(std::uint64_t)> read_guest;
+    std::function<std::uint64_t(std::uint64_t)> count_guest; std::function<std::uint64_t(std::uint64_t, std::uint64_t)> at_guest; };
+struct DictionaryPayload : ObjectPayload { std::mutex mutex; std::vector<std::pair<std::uint64_t, std::uint64_t>> values; std::uint64_t revision{}; bool mutable_dictionary{}, own_keys{}, own_values{}, copy_keys{};
+    // A dictionary implemented by guest code (adopt_guest_dictionary): its object's class, how to read its entries,
+    // and its own -count and -objectForKey:.
+    std::uint64_t guest_class{}; std::function<std::vector<std::pair<std::uint64_t, std::uint64_t>>(std::uint64_t)> read_guest;
+    std::function<std::uint64_t(std::uint64_t)> count_guest; std::function<std::uint64_t(std::uint64_t, std::uint64_t)> lookup_guest; };
 struct UrlPayload : ObjectPayload { std::string path; bool directory{}; std::uint64_t string{}; };
 struct DatePayload : ObjectPayload { double time{}; };
 struct EnumeratorPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint64_t> urls; std::size_t next{}; };
@@ -423,9 +433,115 @@ struct CoreFoundation::Impl {
         return context.objects().create(32, class_address(kind), kind, std::move(payload), std::move(destroy), immortal);
     }
     void allocator(std::uint64_t value) { if (!cf_allocators::accepted(context.objects(), value)) invalid("allocators other than the default and CFAllocatorCreate's are unsupported"); }
+    // Writes `units` to new guest storage, retiring the inner pointers handed out for the previous
+    // characters (they stay valid until the string is freed). The payload's mutex is held.
+    void swap_string_units(StringPayload& p, std::vector<std::uint16_t> units) {
+        const auto storage = context.allocate_guest((units.size() + 1) * 2);
+        std::vector<std::uint8_t> data((units.size() + 1) * 2);
+        for (std::size_t at = 0; at < units.size(); ++at) { data[at * 2] = static_cast<std::uint8_t>(units[at]); data[at * 2 + 1] = static_cast<std::uint8_t>(units[at] >> 8); }
+        memory().write_bytes(storage, data);
+        if (p.storage) p.retired.push_back(p.storage);
+        if (p.utf8_storage) p.retired.push_back(p.utf8_storage);
+        for (const auto [encoding, old] : p.encoded) { static_cast<void>(encoding); p.retired.push_back(old); }
+        p.utf8_storage = 0; p.encoded.clear();
+        p.storage = storage; p.units = std::move(units);
+    }
+    // A string implemented by guest code joins the store as a forwarding record (retain/release are the
+    // object's own) with a copy of its characters, which every lookup checks again (current_guest_string).
+    void adopt_guest_string(std::uint64_t address, std::uint64_t class_address, std::function<std::vector<std::uint16_t>(std::uint64_t)> read,
+        std::function<void(std::uint64_t)> retain, std::function<bool(std::uint64_t)> release) {
+        auto p = std::make_shared<StringPayload>();
+        p->guest_class = class_address;
+        p->read_guest = std::move(read);
+        swap_string_units(*p, p->read_guest(address));
+        context.objects().adopt_forwarding(address, 16, class_address, std::move(retain), std::move(release), ObjectKind::string, p,
+            [this, p](auto) {
+                context.release_guest(p->storage); if (p->utf8_storage) context.release_guest(p->utf8_storage);
+                for (const auto [encoding, storage] : p->encoded) { static_cast<void>(encoding); context.release_guest(storage); }
+                for (const auto storage : p->retired) context.release_guest(storage);
+            });
+    }
+    // Arrays and dictionaries implemented by guest code (Swift's bridged collections) join the store the same
+    // way, with their elements read through -count/-objectAtIndex: or -keyEnumerator/-objectForKey:. The
+    // elements are compared and hashed as CF types, and CF holds no reference of its own to them: they belong
+    // to the guest collection.
+    void adopt_guest_array(std::uint64_t address, std::uint64_t class_address, std::function<std::vector<std::uint64_t>(std::uint64_t)> read,
+        std::function<void(std::uint64_t)> retain, std::function<bool(std::uint64_t)> release,
+        std::function<std::uint64_t(std::uint64_t)> count, std::function<std::uint64_t(std::uint64_t, std::uint64_t)> at) {
+        auto p = std::make_shared<ArrayPayload>();
+        p->own = true;
+        p->guest_class = class_address;
+        p->read_guest = std::move(read);
+        p->count_guest = std::move(count);
+        p->at_guest = std::move(at);
+        p->values = p->read_guest(address);
+        context.objects().adopt_forwarding(address, 16, class_address, std::move(retain), std::move(release), ObjectKind::array, p);
+    }
+    void adopt_guest_dictionary(std::uint64_t address, std::uint64_t class_address,
+        std::function<std::vector<std::pair<std::uint64_t, std::uint64_t>>(std::uint64_t)> read,
+        std::function<void(std::uint64_t)> retain, std::function<bool(std::uint64_t)> release,
+        std::function<std::uint64_t(std::uint64_t)> count, std::function<std::uint64_t(std::uint64_t, std::uint64_t)> lookup) {
+        auto p = std::make_shared<DictionaryPayload>();
+        p->own_keys = p->own_values = true;
+        p->guest_class = class_address;
+        p->read_guest = std::move(read);
+        p->count_guest = std::move(count);
+        p->lookup_guest = std::move(lookup);
+        p->values = p->read_guest(address);
+        context.objects().adopt_forwarding(address, 16, class_address, std::move(retain), std::move(release), ObjectKind::dictionary, p);
+    }
+    // An adopted guest collection's payload, without re-reading it, while the address still holds that object.
+    // CF's single-element accessors (count, value at an index, value for a key) ask the object itself, as CF
+    // does for an Objective-C collection, so a loop over a large Swift collection costs one guest send per
+    // element instead of a full re-read per call. Whole-collection operations still re-read (object()).
+    template<class T> std::shared_ptr<T> guest_collection(std::uint64_t address) {
+        if (!address) return nullptr;
+        const auto record = context.objects().find(address);
+        if (!record || !record->forward_release) return nullptr;
+        auto p = std::dynamic_pointer_cast<T>(record->payload);
+        if (!p || !p->guest_class || !p->count_guest) return nullptr;
+        return holds_guest_object(address, record, p->guest_class) ? p : nullptr;
+    }
+    // Whether `address` still holds an object of the guest class its record was made for. Swift frees its
+    // objects itself, so a later object may reuse the address; the stale forwarding record is then retired,
+    // that record only: another thread may already have adopted the later object at the address.
+    bool holds_guest_object(std::uint64_t address, const std::shared_ptr<ObjectRecord>& record, std::uint64_t guest_class) {
+        std::uint64_t isa{};
+        try { isa = memory().read64(address); } catch (const std::exception&) {}
+        if (isa == guest_class) return true;
+        context.objects().retire_forwarding(record);
+        return false;
+    }
+    // The record of a guest-implemented string, array or dictionary, current: nullptr when the address no
+    // longer holds that object, else with its contents re-read. Swift changes a native string's characters, or
+    // a collection's storage, in place only while it is uniquely referenced, never while CF holds a reference
+    // (forward_retain made it shared): retained objects keep their hash and equality, and only an unretained
+    // lookup sees new contents. The guest is read with no store or CF lock held.
+    std::shared_ptr<ObjectRecord> current_guest_object(std::uint64_t address, std::shared_ptr<ObjectRecord> record) {
+        if (const auto p = std::dynamic_pointer_cast<StringPayload>(record->payload); p && p->guest_class) {
+            if (!holds_guest_object(address, record, p->guest_class)) return nullptr;
+            auto units = p->read_guest(address);
+            std::lock_guard lock(p->mutex);
+            if (units != p->units) swap_string_units(*p, std::move(units));
+        } else if (const auto a = std::dynamic_pointer_cast<ArrayPayload>(record->payload); a && a->guest_class) {
+            if (!holds_guest_object(address, record, a->guest_class)) return nullptr;
+            auto values = a->read_guest(address);
+            std::lock_guard lock(a->mutex);
+            if (values != a->values) a->values = std::move(values);
+        } else if (const auto d = std::dynamic_pointer_cast<DictionaryPayload>(record->payload); d && d->guest_class) {
+            if (!holds_guest_object(address, record, d->guest_class)) return nullptr;
+            auto values = d->read_guest(address);
+            std::lock_guard lock(d->mutex);
+            if (values != d->values) { d->values = std::move(values); ++d->revision; }
+        }
+        return record;
+    }
     std::shared_ptr<ObjectRecord> object(std::uint64_t address) {
         if (!address) invalid("null object");
-        if (auto found = context.objects().find(address)) return found;
+        if (auto found = context.objects().find(address)) {
+            if (!found->forward_release || found->kind == ObjectKind::instance) return found;
+            if (auto current = current_guest_object(address, std::move(found))) return current;
+        }
         if (const auto isa = memory().read64(address); isa) {
             const auto literal = std::find(literal_classes.begin(), literal_classes.end(), isa);
             if (literal != literal_classes.end()) return adopt_literal(address, isa, static_cast<LiteralClass>(literal - literal_classes.begin()));
@@ -705,6 +821,7 @@ struct CoreFoundation::Impl {
         }
     }
     std::uint64_t dictionary_value(std::uint64_t address, std::uint64_t key) {
+        if (const auto g = guest_collection<DictionaryPayload>(address)) return g->lookup_guest(address, key);
         const auto p = payload<DictionaryPayload>(address, ObjectKind::dictionary);
         const auto values = dictionary_values(address); const auto found = std::find_if(values.begin(), values.end(), [&](const auto& pair) { return p->own_keys ? equal(key, pair.first) : key == pair.first; });
         return found == values.end() ? 0 : found->second;
@@ -1015,8 +1132,13 @@ void CoreFoundation::Impl::install_all() {
     install("CFArrayCreateCopy", 2, [this](auto a) { allocator(a[0]); payload<ArrayPayload>(a[1], ObjectKind::array); return copy(a[1]); });
     install("CFArrayCreateMutable", 3, [this](auto a) { allocator(a[0]); count(a[1]); return array({}, true, callbacks(a[2], array_callbacks, 40)); });
     install("CFArrayCreateMutableCopy", 3, [this](auto a) { allocator(a[0]); count(a[1]); payload<ArrayPayload>(a[2], ObjectKind::array); return copy(a[2], true); });
-    install("CFArrayGetCount", 1, [this](auto a) { return array_values(a[0]).size(); });
-    install("CFArrayGetValueAtIndex", 2, [this](auto a) { const auto values = array_values(a[0]); range(values.size(), a[1], 1); return values[static_cast<std::size_t>(a[1])]; });
+    install("CFArrayGetCount", 1, [this](auto a) {
+        if (const auto g = guest_collection<ArrayPayload>(a[0])) return g->count_guest(a[0]);
+        return static_cast<std::uint64_t>(array_values(a[0]).size()); });
+    install("CFArrayGetValueAtIndex", 2, [this](auto a) {
+        // As CF sends -objectAtIndex: alone to an Objective-C array: the object checks the index itself.
+        if (const auto g = guest_collection<ArrayPayload>(a[0])) return g->at_guest(a[0], a[1]);
+        const auto values = array_values(a[0]); range(values.size(), a[1], 1); return values[static_cast<std::size_t>(a[1])]; });
     install("CFArrayGetValues", 4, [this](auto a) { const auto values = array_values(a[0]); range(values.size(), a[1], a[2]); for (std::uint64_t at = 0; at < a[2]; ++at) memory().write64(a[3] + at * 8, values[static_cast<std::size_t>(a[1] + at)]); return 0; });
     install("CFArrayContainsValue", 4, [this](auto a) { const auto p = payload<ArrayPayload>(a[0], ObjectKind::array); const auto values = array_values(a[0]); range(values.size(), a[1], a[2]); for (std::uint64_t at = a[1]; at < a[1] + a[2]; ++at) if (p->own ? equal(values[static_cast<std::size_t>(at)], a[3]) : values[static_cast<std::size_t>(at)] == a[3]) return std::uint64_t{1}; return std::uint64_t{0}; });
     auto array_put = [this](std::uint64_t address, std::uint64_t at, std::uint64_t value, bool insert, bool append) {
@@ -1036,7 +1158,9 @@ void CoreFoundation::Impl::install_all() {
     install("CFDictionaryCreateCopy", 2, [this](auto a) { allocator(a[0]); payload<DictionaryPayload>(a[1], ObjectKind::dictionary); return copy(a[1]); });
     install("CFDictionaryCreateMutable", 4, [this](auto a) { allocator(a[0]); count(a[1]); const bool copy_keys = copy_string_keys(a[2]); return dictionary(true, copy_keys || callbacks(a[2], key_callbacks, 48), callbacks(a[3], value_callbacks, 40), copy_keys); });
     install("CFDictionaryCreateMutableCopy", 3, [this](auto a) { allocator(a[0]); count(a[1]); payload<DictionaryPayload>(a[2], ObjectKind::dictionary); return copy(a[2], true); });
-    install("CFDictionaryGetCount", 1, [this](auto a) { return dictionary_values(a[0]).size(); });
+    install("CFDictionaryGetCount", 1, [this](auto a) {
+        if (const auto g = guest_collection<DictionaryPayload>(a[0])) return g->count_guest(a[0]);
+        return static_cast<std::uint64_t>(dictionary_values(a[0]).size()); });
     install("CFDictionaryGetValue", 2, [this](auto a) { return dictionary_value(a[0], a[1]); });
     install("CFDictionaryGetValueIfPresent", 3, [this](auto a) { const auto value = dictionary_value(a[0], a[1]); if (value && a[2]) memory().write64(a[2], value); return value ? 1 : 0; });
     install("CFDictionaryContainsKey", 2, [this](auto a) { return dictionary_value(a[0], a[1]) ? 1 : 0; });
@@ -1244,15 +1368,25 @@ void CoreFoundation::replace_string_units(std::uint64_t object, std::vector<std:
         p->units = std::move(units);
         return;
     }
-    const auto storage = impl_->context.allocate_guest((units.size() + 1) * 2);
-    std::vector<std::uint8_t> data((units.size() + 1) * 2);
-    for (std::size_t at = 0; at < units.size(); ++at) { data[at * 2] = static_cast<std::uint8_t>(units[at]); data[at * 2 + 1] = static_cast<std::uint8_t>(units[at] >> 8); }
-    impl_->memory().write_bytes(storage, data);
-    p->retired.push_back(p->storage);
-    if (p->utf8_storage) p->retired.push_back(p->utf8_storage);
-    for (const auto [encoding, old] : p->encoded) { static_cast<void>(encoding); p->retired.push_back(old); }
-    p->utf8_storage = 0; p->encoded.clear();
-    p->storage = storage; p->units = std::move(units);
+    impl_->swap_string_units(*p, std::move(units));
+}
+void CoreFoundation::adopt_guest_string(std::uint64_t address, std::uint64_t class_address,
+    std::function<std::vector<std::uint16_t>(std::uint64_t)> read, std::function<void(std::uint64_t)> retain,
+    std::function<bool(std::uint64_t)> release) {
+    impl_->adopt_guest_string(address, class_address, std::move(read), std::move(retain), std::move(release));
+}
+void CoreFoundation::adopt_guest_array(std::uint64_t address, std::uint64_t class_address,
+    std::function<std::vector<std::uint64_t>(std::uint64_t)> read, std::function<void(std::uint64_t)> retain,
+    std::function<bool(std::uint64_t)> release, std::function<std::uint64_t(std::uint64_t)> count,
+    std::function<std::uint64_t(std::uint64_t, std::uint64_t)> at) {
+    impl_->adopt_guest_array(address, class_address, std::move(read), std::move(retain), std::move(release), std::move(count), std::move(at));
+}
+void CoreFoundation::adopt_guest_dictionary(std::uint64_t address, std::uint64_t class_address,
+    std::function<std::vector<std::pair<std::uint64_t, std::uint64_t>>(std::uint64_t)> read,
+    std::function<void(std::uint64_t)> retain, std::function<bool(std::uint64_t)> release,
+    std::function<std::uint64_t(std::uint64_t)> count, std::function<std::uint64_t(std::uint64_t, std::uint64_t)> lookup) {
+    impl_->adopt_guest_dictionary(address, class_address, std::move(read), std::move(retain), std::move(release), std::move(count),
+        std::move(lookup));
 }
 void CoreFoundation::bind_external_units(std::uint64_t object, std::uint64_t buffer, std::uint64_t length, std::uint64_t capacity,
                                          std::function<std::uint64_t(std::uint64_t, std::uint64_t)> grow,
