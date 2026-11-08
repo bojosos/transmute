@@ -61,6 +61,13 @@ void jit(Fixture& f) {
     require(f.call(sys, "_pthread_jit_write_protect_supported_np") == 1, "pthread_jit_write_protect_supported_np");
     static_cast<void>(f.call(sys, "_pthread_jit_write_protect_np", {0}));
     static_cast<void>(f.call(sys, "_pthread_jit_write_protect_np", {1}));
+    // The engine hook for TPIDRRO_EL0 (Darwin's TSD base): the calling thread's guest code reads it with MRS.
+    const auto code = f.process.allocate_guest(16384, 16384);
+    f.engine.write32(code, 0xd53bd060);       // mrs x0, tpidrro_el0
+    f.engine.write32(code + 4, 0xd65f03c0);   // ret
+    f.engine.set_memory_access(code, true, false, true);
+    require(alchemy::set_engine_thread_readonly_pointer(f.engine, 0x5a5a5000) &&
+            f.engine.invoke_callback(code, std::span<const std::uint64_t>{}) == 0x5a5a5000, "TPIDRRO_EL0 hook");
 }
 
 void tasks(Fixture& f) {

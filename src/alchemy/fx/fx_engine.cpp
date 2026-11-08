@@ -1430,6 +1430,7 @@ RunResult FxEngine::run(std::uint64_t) {
 }
 
 void FxEngine::set_thread_pointer(std::uint64_t value) { fx::ensure_thread_context().tpidr_el0 = value; }
+void FxEngine::set_thread_readonly_pointer(std::uint64_t value) { fx::ensure_thread_context().tpidrro_el0 = value; }
 
 std::uint64_t FxEngine::invoke_callback(std::uint64_t address, std::uint64_t argument) {
     return invoke_callback(address, std::span(&argument, 1));

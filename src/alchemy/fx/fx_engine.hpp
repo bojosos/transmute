@@ -182,6 +182,9 @@ public:
     [[nodiscard]] const CpuState& state() const noexcept { return state_; }
     // TPIDR_EL0 of the calling thread's guest context (engine_adapter.hpp).
     void set_thread_pointer(std::uint64_t value);
+    // TPIDRRO_EL0 of the calling thread's guest context: Darwin's per-thread
+    // TSD array, read with MRS (engine_adapter.hpp).
+    void set_thread_readonly_pointer(std::uint64_t value);
     // The synthetic call at `address` reads and writes no SIMD/FP register:
     // its entry copies only the integer state (engine_adapter.hpp).
     void set_guest_call_integer_only(std::uint64_t address);

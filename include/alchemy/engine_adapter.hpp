@@ -166,6 +166,18 @@ bool set_engine_thread_pointer(Engine& engine, std::uint64_t value) {
     }
 }
 
+// Optional engine capability: TPIDRRO_EL0 of the calling guest thread, which
+// Darwin points at the thread's TSD array (pthread_getspecific's slots).
+template <class Engine>
+bool set_engine_thread_readonly_pointer(Engine& engine, std::uint64_t value) {
+    if constexpr (requires { engine.set_thread_readonly_pointer(value); }) {
+        engine.set_thread_readonly_pointer(value);
+        return true;
+    } else {
+        return false;
+    }
+}
+
 // Optional engine capability: the synthetic call at `address` uses no
 // SIMD/FP register, so its entry may skip copying them.
 template <class Engine>
