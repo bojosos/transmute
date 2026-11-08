@@ -55,6 +55,7 @@ struct InterfaceVarying {
     TypeSpelling type;
     Interpolation interpolation{Interpolation::perspective};
     std::optional<std::uint32_t> function_constant;
+    bool per_patch{};                      // a post-tessellation function's per-patch attribute
 };
 
 struct InterfaceBuffer {
@@ -135,6 +136,7 @@ struct EntryPoint {
     DepthOutput depth{DepthOutput::none};
     bool writes_stencil{}, writes_sample_mask{}, early_fragment_tests{}, invariant_position{};
     std::uint32_t max_total_threads_per_threadgroup{};
+    std::optional<Patch> patch;                   // [[patch(kind, N)]] vertex (post-tessellation)
     std::vector<std::string> notes;
 };
 

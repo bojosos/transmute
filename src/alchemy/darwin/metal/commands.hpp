@@ -192,6 +192,22 @@ public:
     void draw_indexed_indirect(std::uint32_t primitive, std::uint32_t index_type, const std::shared_ptr<Buffer>& index_buffer,
                                std::uint64_t index_offset, const std::shared_ptr<Buffer>& indirect, std::uint64_t offset);
     // memoryBarrierWithScope: (MTLBarrierScope bits) in render and compute encoders.
+    // Tessellation (M5): setTessellationFactorBuffer:offset:instanceStride:,
+    // setTessellationFactorScale:, and drawPatches / drawIndexedPatches, direct
+    // or (indirect set) with MTLDrawPatchIndirectArguments.
+    void set_tessellation_factor_buffer(std::shared_ptr<Buffer> buffer, std::uint64_t offset, std::uint32_t instance_stride);
+    void set_tessellation_factor_scale(float scale);
+    struct PatchDraw {
+        std::uint32_t control_points{}, patch_start{}, patch_count{}, instance_count{1}, base_instance{};
+        std::shared_ptr<Buffer> patch_indices;
+        std::uint64_t patch_index_offset{};
+        bool indexed{};
+        std::shared_ptr<Buffer> control_point_indices;
+        std::uint64_t control_point_index_offset{};
+        std::shared_ptr<Buffer> indirect;
+        std::uint64_t indirect_offset{};
+    };
+    void draw_patches(const PatchDraw& draw);
     void memory_barrier(std::uint64_t scope);
 
     // Compute state.
@@ -405,6 +421,10 @@ private:
     std::array<StageState, 2> render_stages_{};
     std::uint32_t bound_topology_{UINT32_MAX};
     std::array<VkBuffer, 31> bound_vertex_buffers_{};
+    std::shared_ptr<Buffer> tessellation_factors_;
+    std::uint64_t tessellation_factor_offset_{};
+    std::uint32_t tessellation_instance_stride_{};
+    float tessellation_factor_scale_{1};
     std::array<VkDeviceSize, 31> bound_vertex_offsets_{};
     // Visibility results.
     VkQueryPool queries_{};

@@ -70,6 +70,7 @@ __global void* __msl_buffer(uint index) __attribute__((const));
 // `is_signed`: 1 when the declared interface type is a signed integer scalar
 // or vector (the SPIR-V variable is then a signed int), from __io_sign.
 template<typename T> T __msl_stage_input(uint location, uint interpolation, uint is_signed) __attribute__((const));
+template<typename T> T __msl_patch_input(uint location, uint control_point, uint is_signed) __attribute__((const));
 template<typename T> void __msl_stage_output(uint location, uint is_signed, T value);
 template<typename T> T __msl_builtin_input(uint builtin) __attribute__((const));
 template<typename T> void __msl_builtin_output(uint builtin, uint element, T value);

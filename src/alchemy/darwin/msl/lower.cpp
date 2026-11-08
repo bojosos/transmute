@@ -1279,6 +1279,21 @@ private:
         used_builtins_.insert(b);
         if (b == Builtin::threads_per_threadgroup) return convert_builtin(workgroup_size(), t_vec(t_u32(), 3), t);
         if (b == Builtin::threads_per_grid) return convert_builtin(threads_per_grid(), t_vec(t_u32(), 3), t);
+        if (b == Builtin::position_in_patch) {
+            const auto var = interface_var("bi.in.tesscoord", spv::storage::Input, t_vec(t_f32(), 3), [&](std::uint32_t id) {
+                m_.decorate(id, spv::decoration::BuiltIn, {spv::builtin::TessCoord});
+            });
+            return value_op(sop::Load, t_vec(t_f32(), 3), {var});
+        }
+        if (entry_.patch && (b == Builtin::patch_id || b == Builtin::instance_id)) {
+            // The control stage's patch info: (patch id, instance id).
+            const auto var = interface_var("in.patch_info", spv::storage::Input, t_vec(t_u32(), 2), [&](std::uint32_t id) {
+                m_.decorate(id, spv::decoration::Location, {patch_info_location});
+                m_.decorate(id, spv::decoration::Patch);
+            });
+            const auto info = value_op(sop::Load, t_vec(t_u32(), 2), {var});
+            return convert_builtin(value_op(sop::CompositeExtract, t_u32(), {info, b == Builtin::patch_id ? 0U : 1U}), t_u32(), t);
+        }
         const auto spirv = builtin_spirv(b);
         std::uint32_t type;
         bool array = false;
@@ -1355,6 +1370,8 @@ private:
             array = true;
         } else {
             const auto b = static_cast<Builtin>(id);
+            // Metal's tessellator emits triangles: a point size has no effect.
+            if (entry_.patch && b == Builtin::point_size) return;
             used_builtins_.insert(b);
             spirv = builtin_spirv(b);
             switch (b) {
@@ -2738,6 +2755,28 @@ private:
             (entry_.stage == Stage::vertex ? used_attributes_ : used_inputs_).insert(location);
             return bind(v, from_interface(value_op(sop::Load, var_type, {var}), v->type, is_signed));
         }
+        if (name == "__msl_patch_input") {
+            // Post-tessellation function: control point k of an arrayed input,
+            // or a per-patch input (~0).
+            if (!entry_.patch) fail("patch inputs outside a [[patch]] function");
+            const auto location = static_cast<std::uint32_t>(const_int(ops[0]));
+            const auto control_point = static_cast<std::uint32_t>(const_int(ops[1]));
+            const bool is_signed = const_int(ops[2]) != 0;
+            const auto* varying = find_varying(entry_.attributes, location);
+            const auto var_type = interface_type(v->type, is_signed);
+            note_interface_shape('a', location, v->type, is_signed);
+            used_attributes_.insert(location);
+            const bool per_patch = control_point == 0xffffffffU;
+            const auto declared = per_patch ? var_type : m_.type_array(var_type, c_u32(entry_.patch->control_points));
+            const auto var = interface_var("in." + std::to_string(location), spv::storage::Input, declared, [&](std::uint32_t id) {
+                m_.decorate(id, spv::decoration::Location, {location});
+                if (per_patch) m_.decorate(id, spv::decoration::Patch);
+                if (varying) m_.name(id, varying->name);
+            });
+            const auto pointer = per_patch ? var
+                : value_op(sop::AccessChain, m_.type_pointer(spv::storage::Input, var_type), {var, c_u32(control_point)});
+            return bind(v, from_interface(value_op(sop::Load, var_type, {pointer}), v->type, is_signed));
+        }
         if (name == "__msl_stage_output") {
             const auto location = static_cast<std::uint32_t>(const_int(ops[0]));
             const auto* varying = find_varying(entry_.outputs, location);
@@ -3248,12 +3287,16 @@ private:
     void finish_entry() {
         std::uint32_t model = 0;
         switch (entry_.stage) {
-        case Stage::vertex: model = 0; break;
+        case Stage::vertex: model = entry_.patch ? 2U : 0U; break;   // TessellationEvaluation for [[patch]]
         case Stage::fragment: model = 4; break;
         case Stage::kernel: model = 5; break;
         }
         m_.capability(spv::capability::Shader);
         m_.entry_point(model, function_id_, entry_.name, interface_);
+        if (entry_.patch) {
+            m_.capability(spv::capability::Tessellation);
+            m_.execution_mode(function_id_, entry_.patch->kind == Patch::Kind::quad ? 24U : 22U);   // Quads / Triangles
+        }
         if (entry_.stage == Stage::fragment) {
             m_.execution_mode(function_id_, 7);   // OriginUpperLeft
             if (entry_.early_fragment_tests) m_.execution_mode(function_id_, 9);
@@ -3393,8 +3436,10 @@ private:
             attribute.name = a.name;
             attribute.type = add_reflection_type(r, reflected_spelling('a', a.location, a.type));
             attribute.used = used_attributes_.count(a.location) != 0;
+            attribute.per_patch = a.per_patch;
             r.stage_in.push_back(std::move(attribute));
         }
+        r.patch = entry_.patch;
         for (const auto& o : entry_.outputs) {
             Varying varying;
             varying.name = o.name;

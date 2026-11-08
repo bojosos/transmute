@@ -225,7 +225,7 @@ bool is_msl_attribute(std::string_view name) {
         "max_total_threads_per_threadgroup", "vertex", "fragment", "kernel", "host_name", "visible",
         "stitchable", "patch", "barycentric_coord", "payload", "object", "mesh", "amplification_id",
         "amplification_count", "shared", "intersection", "imageblock_data", "access", "raster_order_group",
-        "required_threads_per_threadgroup", "instance_id"};
+        "required_threads_per_threadgroup", "instance_id", "position_in_patch", "patch_id"};
     return names.count(name) != 0;
 }
 
@@ -251,7 +251,8 @@ const std::map<std::string_view, Builtin>& builtin_attributes() {
         {"simdgroup_index_in_threadgroup", Builtin::simdgroup_index_in_threadgroup},
         {"threads_per_simdgroup", Builtin::threads_per_simdgroup},
         {"simdgroups_per_threadgroup", Builtin::simdgroups_per_threadgroup},
-        {"barycentric_coord", Builtin::barycentric_coord}};
+        {"barycentric_coord", Builtin::barycentric_coord}, {"position_in_patch", Builtin::position_in_patch},
+    {"patch_id", Builtin::patch_id}};
     return map;
 }
 
@@ -276,6 +277,7 @@ const char* builtin_input_type(Builtin builtin) {
     case Builtin::position: return "float4";
     case Builtin::point_coord: return "float2";
     case Builtin::barycentric_coord: case Builtin::barycentric_coord_no_perspective: return "float3";
+    case Builtin::position_in_patch: return "float3";
     case Builtin::front_facing: return "bool";
     case Builtin::thread_position_in_grid: case Builtin::thread_position_in_threadgroup:
     case Builtin::threadgroup_position_in_grid: case Builtin::threads_per_threadgroup:
@@ -296,6 +298,7 @@ bool valid_builtin(Stage stage, Builtin builtin, bool input) {
     switch (builtin) {
     case Builtin::vertex_id: case Builtin::instance_id: case Builtin::base_vertex: case Builtin::base_instance:
         return stage == Stage::vertex && input;
+    case Builtin::position_in_patch: case Builtin::patch_id: return stage == Stage::vertex && input;   // [[patch]] only
     case Builtin::position: return (stage == Stage::fragment && input) || (stage == Stage::vertex && !input);
     case Builtin::point_size: case Builtin::clip_distance: return stage == Stage::vertex && !input;
     case Builtin::front_facing: case Builtin::point_coord: case Builtin::sample_id: case Builtin::primitive_id:
@@ -1439,7 +1442,25 @@ private:
                 auto name = attribute.args[0];
                 name.erase(std::remove(name.begin(), name.end(), '"'), name.end());
                 entry.name = name;
-            } else if (attribute.name == "visible" || attribute.name == "stitchable" || attribute.name == "patch" ||
+            } else if (attribute.name == "patch") {
+                // [[patch(triangle|quad[, N])]]: a post-tessellation vertex function.
+                const auto kind = attribute.args.empty() ? std::string() : attribute.args[0];
+                if (entry.stage != Stage::vertex || (kind != "triangle" && kind != "quad")) {
+                    error(attribute.line, "[[patch]] needs a vertex function and the kind triangle or quad");
+                    continue;
+                }
+                Patch patch;
+                patch.kind = kind == "quad" ? Patch::Kind::quad : Patch::Kind::triangle;
+                if (attribute.args.size() > 1) {
+                    const auto count = evaluate_integer(attribute.args[1]);
+                    if (!count || *count < 1 || *count > 32) {
+                        error(attribute.line, "[[patch]] control point count must be a constant from 1 to 32");
+                        continue;
+                    }
+                    patch.control_points = static_cast<std::uint32_t>(*count);
+                }
+                entry.patch = patch;
+            } else if (attribute.name == "visible" || attribute.name == "stitchable" ||
                        attribute.name == "object" || attribute.name == "mesh" || attribute.name == "intersection")
                 error(attribute.line, "[[" + attribute.name + "]] functions are unsupported");
             else if (attribute.name == "required_threads_per_threadgroup")
@@ -1656,6 +1677,12 @@ private:
                         error(attribute.line, "kernel [[stage_in]] is unsupported");
                         continue;
                     }
+                    if (entry.patch && is_control_points(type)) {
+                        body << "    " << type << ' ' << var << ";\n";
+                        control_points(entry, type, var, body, attribute.line);
+                        args.push_back(var);
+                        continue;
+                    }
                     const auto* def = find_struct(type);
                     if (!def) {
                         error(attribute.line, "cannot find the [[stage_in]] struct '" + type + "'");
@@ -1674,7 +1701,12 @@ private:
                         }
                         builtin = *refined;
                     }
-                    if (!valid_builtin(entry.stage, builtin, true)) {
+                    // A post-tessellation function has patch inputs, not vertex ones.
+                    const bool patch_only = builtin == Builtin::position_in_patch || builtin == Builtin::patch_id;
+                    const bool vertex_only = builtin == Builtin::vertex_id || builtin == Builtin::base_vertex ||
+                                             builtin == Builtin::base_instance;
+                    if (!valid_builtin(entry.stage, builtin, true) || (patch_only && !entry.patch) ||
+                        (vertex_only && entry.patch)) {
                         error(attribute.line, "[[" + kind + "]] is not an input of this stage");
                         continue;
                     }
@@ -1738,6 +1770,49 @@ private:
         entries_.push_back(std::move(entry));
     }
 
+    static bool is_control_points(std::string_view type) {
+        if (type.substr(0, 7) == "metal::") type.remove_prefix(7);
+        return type.substr(0, 19) == "patch_control_point" && type.find('<') != std::string_view::npos;
+    }
+
+    // patch_control_point<T> `access` of a post-tessellation function: each
+    // [[attribute(n)]] member of T for control points 0 .. N-1.
+    void control_points(EntryPoint& entry, const std::string& type, const std::string& access, std::ostringstream& body,
+                        std::uint32_t line) {
+        const auto open = type.find('<'), close = type.rfind('>');
+        auto inner = close == std::string::npos || close < open ? std::string() : type.substr(open + 1, close - open - 1);
+        inner.erase(0, inner.find_first_not_of(" \t"));
+        inner.erase(inner.find_last_not_of(" \t") + 1);
+        const auto* def = find_struct(inner);
+        if (!def) {
+            error(line, "cannot find the control point struct '" + inner + "'");
+            return;
+        }
+        const auto count = entry.patch->control_points;
+        if (!count) {
+            error(line, "[[patch]] without a control point count cannot read control points through [[stage_in]]");
+            return;
+        }
+        for (const auto& member : def->members) {
+            const auto* attribute = find_attribute(member.attributes, "attribute");
+            if (!attribute || !member.array_suffix.empty() || find_attribute(member.attributes, "function_constant")) {
+                error(member.line, "control point member '" + member.name + "' needs an [[attribute(n)]] and no array or function constant");
+                continue;
+            }
+            InterfaceVarying varying;
+            varying.name = member.name;
+            varying.member = member.name;
+            varying.location = attribute->args.empty() ? 0 : evaluate_integer(attribute->args[0]).value_or(0);
+            varying.type = resolve_spelling(member.type);
+            const auto element = access + ".__cp[0]." + member.name;
+            for (std::uint32_t k = 0; k < count; ++k)
+                body << "    " << access << ".__cp[" << k << "]." << member.name << " = metal::__msl_patch_in<decltype("
+                     << element << ")>(" << varying.location << "u, " << k << "u);\n";
+            entry.attributes.push_back(std::move(varying));
+        }
+        body << "    " << access << ".__count = " << count << "u;\n";
+    }
+
     void stage_in(EntryPoint& entry, const StructDef& def, const std::string& var, std::ostringstream& body,
                   std::uint32_t& next_input) {
         for (const auto& member : def.members) {
@@ -1749,6 +1824,10 @@ private:
             const auto guarded = [&](const std::string& statement) {
                 body << "    " << (condition.empty() ? statement : "if (" + condition + ") " + statement) << '\n';
             };
+            if (entry.patch && is_control_points(member.type)) {
+                control_points(entry, member.type, access, body, member.line);
+                continue;
+            }
             if (entry.stage == Stage::vertex) {
                 const auto* attribute = find_attribute(member.attributes, "attribute");
                 if (!attribute) {
@@ -1765,7 +1844,14 @@ private:
                     error(member.line, "array vertex attributes are unsupported");
                     continue;
                 }
-                guarded(access + " = metal::__msl_in<decltype(" + access + ")>(" + std::to_string(varying.location) + "u, 0u);");
+                if (entry.patch) {
+                    // A per-patch attribute of a post-tessellation function.
+                    varying.per_patch = true;
+                    guarded(access + " = metal::__msl_patch_in<decltype(" + access + ")>(" +
+                            std::to_string(varying.location) + "u, 0xffffffffu);");
+                } else {
+                    guarded(access + " = metal::__msl_in<decltype(" + access + ")>(" + std::to_string(varying.location) + "u, 0u);");
+                }
                 entry.attributes.push_back(std::move(varying));
                 continue;
             }

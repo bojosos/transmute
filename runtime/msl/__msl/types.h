@@ -465,6 +465,21 @@ template<typename T, size_t N> struct array {
 };
 template<typename T, size_t N> using array_ref_storage = array<T, N>;
 
+// ---- tessellation -------------------------------------------------------------------
+// A post-tessellation vertex function's control points ([[stage_in]]); the
+// entry wrapper fills the first __count (the [[patch(kind, N)]] count).
+template<typename T> struct patch_control_point {
+    T __cp[32];
+    uint __count;
+    T& operator[](size_t i) { return __cp[i]; }
+    constexpr const T& operator[](size_t i) const { return __cp[i]; }
+    constexpr uint size() const { return __count; }
+};
+
+// MTLTessellationFactorsHalf layouts, for kernels that write factors.
+struct MTLTriangleTessellationFactorsHalf { half edgeTessellationFactor[3]; half insideTessellationFactor; };
+struct MTLQuadTessellationFactorsHalf { half edgeTessellationFactor[4]; half insideTessellationFactor[2]; };
+
 // ---- numeric limits ----------------------------------------------------------------
 template<typename T> struct numeric_limits {
     static constexpr bool is_specialized = false;

@@ -307,7 +307,27 @@ struct VertexAttribute {
     std::string name;
     std::uint32_t type{};
     bool used{true};
+    // Post-tessellation vertex functions (Reflection::patch, M5): a
+    // [[stage_in]] member outside patch_control_point<T> is a per-patch
+    // attribute; the members of T are control-point attributes.
+    bool per_patch{};
 };
+
+// A post-tessellation vertex function (`[[patch(quad, 4)]] vertex`, M5). Its
+// SPIR-V is a TessellationEvaluation entry point (execution mode Triangles or
+// Quads; spacing and vertex order come from the tessellation control stage
+// tessellation_stages() generates). Inputs:
+//   control-point attribute n   Input array [control_points] at Location n
+//   per-patch attribute n       Input at Location n, decorated Patch
+//   [[patch_id]], [[instance_id]]  Input uint2 at patch_info_location,
+//                               decorated Patch: (patch id, instance id)
+//   [[position_in_patch]]       TessCoord (.xy for quads)
+// Its resources use the vertex stage's descriptor set (0).
+struct Patch {
+    enum class Kind : std::uint32_t { triangle, quad } kind{Kind::triangle};
+    std::uint32_t control_points{};       // [[patch(kind, N)]]: N, 0 when omitted
+};
+inline constexpr std::uint32_t patch_info_location = 31;
 
 enum class Interpolation : std::uint32_t { perspective, no_perspective, flat, centroid_perspective,
     centroid_no_perspective, sample_perspective, sample_no_perspective };
@@ -360,7 +380,7 @@ enum class Builtin : std::uint32_t { vertex_id, instance_id, base_vertex, base_i
     viewport_array_index, thread_position_in_grid, thread_position_in_threadgroup, threadgroup_position_in_grid,
     threads_per_threadgroup, threads_per_grid, threadgroups_per_grid, thread_index_in_threadgroup,
     thread_index_in_simdgroup, simdgroup_index_in_threadgroup, threads_per_simdgroup, simdgroups_per_threadgroup,
-    barycentric_coord, barycentric_coord_no_perspective };
+    barycentric_coord, barycentric_coord_no_perspective, position_in_patch, patch_id };
 
 struct Reflection {
     Stage stage{Stage::vertex};
@@ -376,6 +396,7 @@ struct Reflection {
     std::vector<Builtin> builtins;        // builtins the entry point reads or writes
     // Vertex.
     std::vector<VertexAttribute> stage_in;
+    std::optional<Patch> patch;           // a post-tessellation vertex function (M5)
     std::vector<Varying> outputs;         // vertex outputs besides [[position]]/[[point_size]]/[[clip_distance]]
     // Fragment.
     std::vector<Varying> inputs;
@@ -436,6 +457,68 @@ struct LinkResult {
     }
 };
 [[nodiscard]] LinkResult link(const Function& vertex, const Function& fragment);
+
+// ---- tessellation (M5) ----------------------------------------------------------------
+// The stages that run Metal's fixed-function tessellation in front of a
+// post-tessellation vertex function (Reflection::patch), for one render
+// pipeline. Vulkan draws one patch-list vertex per Metal patch
+// (patchControlPoints 1): vkCmdDraw(patchCount, instanceCount, patchStart,
+// baseInstance), so MTLDrawPatchIndirectArguments are VkDrawIndirectCommand
+// unchanged.
+//   vertex   passes (VertexIndex, InstanceIndex) to the control stage.
+//   control  OutputVertices = control_points. Reads TessellationPushConstants;
+//            the patch id is the patch index buffer's element at the vertex
+//            index, or the vertex index; control point i's index is the
+//            control point index buffer's element at patch id * N + i, or
+//            that number. Fetches the vertex descriptor's attributes from
+//            memory (vertex pulling), writes them at their locations
+//            (per-patch ones as patch outputs) with the patch info at
+//            patch_info_location, and the tessellation levels from the
+//            factor buffer (half-precision MTL*TessellationFactorsHalf),
+//            clamped to max_factor, scaled, rounded for pow2.
+// Vulkan's tessellation domain origin must be LOWER_LEFT, as Metal's.
+struct TessellationSetup {
+    Patch::Kind kind{Patch::Kind::triangle};
+    std::uint32_t control_points{};
+    enum class Partition : std::uint32_t { pow2, integer, fractional_odd, fractional_even };   // MTLTessellationPartitionMode
+    Partition partition{Partition::pow2};
+    bool clockwise{true};                 // MTLWindingClockwise
+    float max_factor{16};
+    bool factor_scale{};                  // tessellationFactorScaleEnabled
+    // MTLTessellationFactorStepFunction: 0 constant, 1 per patch, 2 per
+    // instance, 3 per patch and per instance.
+    std::uint32_t factor_step{1};
+    std::uint32_t control_point_index_bytes{};   // 0 (none), 2 or 4
+    struct Attribute {
+        std::uint32_t location{};
+        std::uint32_t buffer{};           // index into TessellationPushConstants::buffers
+        std::uint32_t offset{}, stride{};
+        enum class Numeric : std::uint32_t { unorm, snorm, uint, sint, float_ } numeric{Numeric::float_};
+        std::uint32_t bits{32};           // per component: 8, 16 or 32
+        std::uint32_t components{4};
+        bool bgra{};                      // UChar4Normalized_BGRA
+        // MTLVertexStepFunction: 0 constant, 2 per instance (step_rate), 3
+        // per patch, 4 per patch control point.
+        std::uint32_t step{4}, step_rate{1};
+    };
+    std::vector<Attribute> attributes;
+};
+inline constexpr std::uint32_t tessellation_vertex_buffers = 12;
+// The control stage's push constants (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+// offset 0): buffer device addresses, offsets included.
+struct TessellationPushConstants {
+    std::uint64_t factors{};
+    std::uint64_t patch_indices{};        // 0: none
+    std::uint64_t control_point_indices{};   // 0: none
+    std::uint32_t instance_stride{};      // setTessellationFactorBuffer:...instanceStride:
+    float scale{1};                       // setTessellationFactorScale:
+    std::uint64_t buffers[tessellation_vertex_buffers]{};
+};
+struct TessellationStages {
+    std::vector<std::uint32_t> vertex, control;   // SPIR-V, entry points "main"
+    std::string error;                    // Metal's NSError text when the setup cannot be translated
+};
+[[nodiscard]] TessellationStages tessellation_stages(const Reflection& post_tessellation, const TessellationSetup& setup);
 
 // "program_source:LINE:COL: error: message" lines, as Metal's NSError
 // localizedDescription shows compiler output.

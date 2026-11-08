@@ -1561,6 +1561,60 @@ void CommandBuffer::draw_indexed_indirect(std::uint32_t primitive, std::uint32_t
     if (trace_indirect()) indirect_traces_.push_back({indirect->buffer, offset, 20, pipeline_name(*render_pipeline_)});
 }
 
+void CommandBuffer::set_tessellation_factor_buffer(std::shared_ptr<Buffer> buffer, std::uint64_t offset,
+                                                   std::uint32_t instance_stride) {
+    // The control stage reads the factors as 32-bit words.
+    if (offset % 4) throw std::runtime_error("Metal tessellation factor buffer offset must be a multiple of 4");
+    tessellation_factors_ = std::move(buffer);
+    tessellation_factor_offset_ = offset;
+    tessellation_instance_stride_ = instance_stride;
+}
+
+void CommandBuffer::set_tessellation_factor_scale(float scale) { tessellation_factor_scale_ = scale; }
+
+void CommandBuffer::draw_patches(const PatchDraw& draw) {
+    if (foreign_render_) throw std::runtime_error("Alchemy Metal: tessellation is not translated for precompiled (metallib) pipelines");
+    if (!render_pipeline_) throw std::runtime_error("Metal draw without a render pipeline state");
+    if (!draw.indirect && (!draw.patch_count || !draw.instance_count)) return;
+    if (render_pipeline_->tessellation && draw.control_points != render_pipeline_->control_points)
+        throw std::runtime_error("drawPatches: numberOfPatchControlPoints " + std::to_string(draw.control_points) +
+                                 " differs from the post-tessellation function's " +
+                                 std::to_string(render_pipeline_->control_points));
+    if (!tessellation_factors_) throw std::runtime_error("drawPatches without a tessellation factor buffer");
+    if (draw.indexed && !draw.control_point_indices) throw std::runtime_error("drawIndexedPatches without a control point index buffer");
+    if (draw.indexed && !render_pipeline_->descriptor.tessellation.control_point_index_type)
+        throw std::runtime_error("drawIndexedPatches needs the pipeline's tessellationControlPointIndexType");
+    if (!draw.indexed && render_pipeline_->descriptor.tessellation.control_point_index_type)
+        throw std::runtime_error("drawPatches with a pipeline whose tessellationControlPointIndexType is not None");
+    flush_render(patch_primitive);
+    msl::TessellationPushConstants constants;
+    constants.factors = tessellation_factors_->address + tessellation_factor_offset_;
+    if (draw.patch_indices) constants.patch_indices = draw.patch_indices->address + draw.patch_index_offset;
+    if (draw.indexed) constants.control_point_indices = draw.control_point_indices->address + draw.control_point_index_offset;
+    constants.instance_stride = tessellation_instance_stride_;
+    constants.scale = tessellation_factor_scale_;
+    const auto& buffers = render_pipeline_->tessellation_buffers;
+    for (std::size_t k = 0; k < buffers.size(); ++k) {
+        const auto& binding = render_stages_[0].buffers[buffers[k]];
+        if (!binding.address)
+            throw std::runtime_error("Metal draw: vertex descriptor buffer " + std::to_string(buffers[k]) + " is not bound");
+        constants.buffers[k] = binding.address;
+    }
+    device->vk.vkCmdPushConstants(current_, render_pipeline_->layout, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, 0,
+                                  sizeof(constants), &constants);
+    retain(tessellation_factors_);
+    if (draw.patch_indices) retain(draw.patch_indices);
+    if (draw.indexed) retain(draw.control_point_indices);
+    // One patch-list vertex per patch: MTLDrawPatchIndirectArguments ==
+    // VkDrawIndirectCommand (patchCount, instanceCount, patchStart, baseInstance).
+    if (draw.indirect) {
+        retain(draw.indirect);
+        device->vk.vkCmdDrawIndirect(current_, draw.indirect->buffer, draw.indirect_offset, 1, 16);
+    } else {
+        device->vk.vkCmdDraw(current_, draw.patch_count, draw.instance_count, draw.patch_start, draw.base_instance);
+    }
+}
+
 void CommandBuffer::memory_barrier(std::uint64_t) {
     if (encoder_ == EncoderKind::compute) {
         barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,

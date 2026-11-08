@@ -840,6 +840,41 @@ void test_reflection() {
     using msl::DescriptorType;
     using msl::Stage;
     {
+        // Post-tessellation functions (M5) and the stages generated for them.
+        const auto r = compile_fixture("tessellation.metal");
+        const auto& quad = function(r, "quad_patch").reflection;
+        require(quad.stage == Stage::vertex && quad.patch && quad.patch->kind == msl::Patch::Kind::quad &&
+                    quad.patch->control_points == 4,
+                "[[patch(quad, 4)]] reflection");
+        require(quad.stage_in.size() == 3 && !quad.stage_in[0].per_patch && !quad.stage_in[1].per_patch &&
+                    quad.stage_in[2].per_patch && quad.stage_in[2].index == 2,
+                "control-point and per-patch attributes");
+        const auto& triangle = function(r, "triangle_patch").reflection;
+        require(triangle.patch && triangle.patch->kind == msl::Patch::Kind::triangle && triangle.patch->control_points == 3,
+                "[[patch(triangle, 3)]] reflection");
+        msl::TessellationSetup setup;
+        setup.kind = msl::Patch::Kind::quad;
+        setup.control_points = 4;
+        setup.partition = msl::TessellationSetup::Partition::fractional_odd;
+        setup.factor_scale = true;
+        setup.factor_step = 3;
+        setup.control_point_index_bytes = 2;
+        using Numeric = msl::TessellationSetup::Attribute::Numeric;
+        setup.attributes.push_back({0, 0, 0, 24, Numeric::float_, 32, 4, false, 4, 1});
+        setup.attributes.push_back({1, 0, 16, 24, Numeric::unorm, 16, 2, false, 4, 1});
+        setup.attributes.push_back({2, 1, 0, 4, Numeric::unorm, 8, 4, true, 3, 1});
+        const auto stages = msl::tessellation_stages(quad, setup);
+        require(stages.error.empty(), "tessellation stages: " + stages.error);
+        validate_spirv(stages.vertex, "tessellation.vertex");
+        validate_spirv(stages.control, "tessellation.control");
+        setup.attributes.pop_back();
+        require(msl::tessellation_stages(quad, setup).error.find("no attribute 2") != std::string::npos,
+                "a used attribute missing from the vertex descriptor is an error");
+        const auto vertex = msl::compile("#include <metal_stdlib>\nusing namespace metal;\n"
+                                         "vertex float4 v(uint p [[patch_id]]) { return float4(p); }\n", {});
+        require(!vertex.success(), "[[patch_id]] outside a [[patch]] function is an error");
+    }
+    {
         const auto r = compile_fixture("blender_ui_widget.metal");
         const auto& v = function(r, "vertex_function_entry").reflection;
         require(v.stage == Stage::vertex, "ui vertex stage");

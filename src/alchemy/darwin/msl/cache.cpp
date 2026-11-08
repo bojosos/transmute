@@ -19,7 +19,7 @@ namespace alchemy::msl::detail {
 namespace {
 
 constexpr std::uint32_t format_magic = 0x4c534d41;   // "AMSL"
-constexpr std::uint32_t format_version = 2;   // 2: BufferBinding::arguments
+constexpr std::uint32_t format_version = 3;   // 2: BufferBinding::arguments; 3: Reflection::patch
 
 // One description of every field, used by both directions.
 struct Writer {
@@ -60,6 +60,7 @@ template<typename A> void io(A& a, std::string& value) {
     }
     if (size) a.raw(value.data(), size);
 }
+template<typename A> void io(A& a, Patch& v) { io(a, v.kind); io(a, v.control_points); }
 template<typename A, typename T> void io(A& a, std::optional<T>& value) {
     bool present = value.has_value();
     io(a, present);
@@ -116,7 +117,7 @@ template<typename A> void io(A& a, ArgumentBufferSamplers& v) {
     io(a, v.descriptor); io(a, v.used);
 }
 template<typename A> void io(A& a, ColorInput& v) { io(a, v.color); io(a, v.type); io(a, v.name); io(a, v.descriptor); }
-template<typename A> void io(A& a, VertexAttribute& v) { io(a, v.index); io(a, v.name); io(a, v.type); io(a, v.used); }
+template<typename A> void io(A& a, VertexAttribute& v) { io(a, v.index); io(a, v.name); io(a, v.type); io(a, v.used); io(a, v.per_patch); }
 template<typename A> void io(A& a, Varying& v) { io(a, v.name); io(a, v.type); io(a, v.location); io(a, v.interpolation); }
 template<typename A> void io(A& a, FragmentOutput& v) { io(a, v.color); io(a, v.index); io(a, v.type); }
 template<typename A> void io(A& a, FunctionConstant& v) { io(a, v.index); io(a, v.name); io(a, v.type); io(a, v.required); }
@@ -125,7 +126,7 @@ template<typename A> void io(A& a, Reflection& v) {
     io(a, v.stage); io(a, v.types); io(a, v.argument_table); io(a, v.argument_table_size); io(a, v.buffers);
     io(a, v.textures); io(a, v.samplers); io(a, v.constexpr_samplers); io(a, v.argument_buffers);
     io(a, v.function_constants);
-    io(a, v.builtins); io(a, v.stage_in); io(a, v.outputs); io(a, v.inputs); io(a, v.color_outputs); io(a, v.color_inputs); io(a, v.depth);
+    io(a, v.builtins); io(a, v.stage_in); io(a, v.patch); io(a, v.outputs); io(a, v.inputs); io(a, v.color_outputs); io(a, v.color_inputs); io(a, v.depth);
     io(a, v.writes_sample_mask); io(a, v.writes_stencil); io(a, v.early_fragment_tests); io(a, v.discards);
     io(a, v.max_total_threads_per_threadgroup); io(a, v.threadgroup_memory); io(a, v.uses_simdgroup_operations); io(a, v.bindless);
     io(a, v.notes);

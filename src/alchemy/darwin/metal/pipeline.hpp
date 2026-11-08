@@ -101,6 +101,16 @@ struct VertexAttribute { std::uint32_t format{}, offset{}, buffer_index{}; };
 // comes with each bind (setVertexBuffer:offset:attributeStride:atIndex:).
 inline constexpr std::uint32_t dynamic_vertex_stride = 0xffffffffU;
 struct VertexLayout { std::uint32_t stride{}, step_function{1}, step_rate{1}; };
+// MTLRenderPipelineDescriptor's tessellation properties (Metal's defaults).
+struct TessellationState {
+    std::uint32_t partition{};            // MTLTessellationPartitionMode (pow2)
+    std::uint32_t max_factor{16};
+    bool factor_scale{};
+    std::uint32_t factor_format{};        // MTLTessellationFactorFormat (half)
+    std::uint32_t control_point_index_type{};   // MTLTessellationControlPointIndexType (none)
+    std::uint32_t factor_step{};          // MTLTessellationFactorStepFunction (constant)
+    std::uint32_t winding{};              // MTLWinding (clockwise)
+};
 struct RenderPipelineDescriptor {
     std::shared_ptr<ShaderFunction> vertex, fragment;
     std::array<ColorAttachmentState, 8> colors{};
@@ -110,12 +120,15 @@ struct RenderPipelineDescriptor {
     std::uint32_t topology_class{};                              // MTLPrimitiveTopologyClass, 0 = unspecified
     std::array<std::optional<VertexAttribute>, 31> attributes{};
     std::array<std::optional<VertexLayout>, 31> layouts{};
+    TessellationState tessellation;
     std::string label;
 };
 
 // MTLPrimitiveType -> topology and its class (1 point, 2 line, 3 triangle).
 [[nodiscard]] VkPrimitiveTopology primitive_topology(std::uint32_t primitive_type);
 [[nodiscard]] std::uint32_t topology_class(std::uint32_t primitive_type);
+// The primitive type the encoder passes for drawPatches (topology class 0).
+inline constexpr std::uint32_t patch_primitive = 0xff;
 
 // Render-encoder state that Vulkan bakes into the pipeline: each combination
 // is a pipeline variant. Line fill applies to triangles only.
@@ -168,6 +181,13 @@ public:
     // vertex_bindings entry; dynamic_vertex_stride for the dynamic ones).
     bool dynamic_strides{};
     std::vector<std::uint32_t> vertex_strides;
+    // A post-tessellation vertex function (M5): drawn with drawPatches only.
+    // The control stage fetches the vertex descriptor's buffers from
+    // TessellationPushConstants::buffers[k] = Metal vertex buffer index
+    // tessellation_buffers[k].
+    bool tessellation{};
+    std::uint32_t control_points{};
+    std::vector<std::uint32_t> tessellation_buffers;
     // Reflection of the linked stages (varying locations agree).
     [[nodiscard]] const msl::Reflection& vertex_reflection() const noexcept { return linked_vertex_.reflection; }
     [[nodiscard]] const msl::Reflection* fragment_reflection() const noexcept {
@@ -181,6 +201,7 @@ private:
     std::array<VkPipeline, 4 * raster_variant::count> pipelines_{};   // by topology class + 4 * raster
     msl::Function linked_vertex_, linked_fragment_;
     VkShaderModule vertex_module_{}, fragment_module_{};
+    VkShaderModule patch_vertex_module_{}, patch_control_module_{};   // tessellation_stages()
 };
 
 // ---- compute pipelines ----------------------------------------------------------------

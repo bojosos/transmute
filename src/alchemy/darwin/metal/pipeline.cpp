@@ -368,6 +368,7 @@ VkPrimitiveTopology primitive_topology(std::uint32_t type) {
     case 2: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     case 3: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     case 4: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case patch_primitive: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
     default: throw std::runtime_error("invalid MTLPrimitiveType " + std::to_string(type));
     }
 }
@@ -376,9 +377,106 @@ std::uint32_t topology_class(std::uint32_t type) {
     switch (type) {
     case 0: return 1;
     case 1: case 2: return 2;
+    case patch_primitive: return 0;
     default: return 3;
     }
 }
+
+namespace {
+
+// How the tessellation control stage reads an MTLVertexFormat from memory.
+std::optional<msl::TessellationSetup::Attribute> fetched_format(std::uint32_t format) {
+    using Numeric = msl::TessellationSetup::Attribute::Numeric;
+    msl::TessellationSetup::Attribute a;
+    const auto set = [&](Numeric numeric, std::uint32_t bits, std::uint32_t components) {
+        a.numeric = numeric;
+        a.bits = bits;
+        a.components = components;
+        return a;
+    };
+    // UChar2..4, Char2..4, UChar2..4Normalized, ... Half2..4: groups of three.
+    static constexpr std::pair<Numeric, std::uint32_t> groups[] = {{Numeric::uint, 8}, {Numeric::sint, 8},
+        {Numeric::unorm, 8}, {Numeric::snorm, 8}, {Numeric::uint, 16}, {Numeric::sint, 16}, {Numeric::unorm, 16},
+        {Numeric::snorm, 16}, {Numeric::float_, 16}};
+    if (format >= 1 && format <= 27) {
+        const auto& group = groups[(format - 1) / 3];
+        return set(group.first, group.second, 2 + (format - 1) % 3);
+    }
+    if (format >= 28 && format <= 31) return set(Numeric::float_, 32, format - 27);
+    if (format >= 32 && format <= 35) return set(Numeric::sint, 32, format - 31);
+    if (format >= 36 && format <= 39) return set(Numeric::uint, 32, format - 35);
+    if (format == 42) {   // UChar4Normalized_BGRA
+        set(Numeric::unorm, 8, 4);
+        a.bgra = true;
+        return a;
+    }
+    static constexpr std::pair<Numeric, std::uint32_t> singles[] = {{Numeric::uint, 8}, {Numeric::sint, 8},
+        {Numeric::unorm, 8}, {Numeric::snorm, 8}, {Numeric::uint, 16}, {Numeric::sint, 16}, {Numeric::unorm, 16},
+        {Numeric::snorm, 16}, {Numeric::float_, 16}};
+    if (format >= 45 && format <= 53) return set(singles[format - 45].first, singles[format - 45].second, 1);
+    return std::nullopt;   // packed 10/10/10/2, RG11B10F, RGB9E5F
+}
+
+// The tessellation stages of a pipeline whose vertex function is a
+// post-tessellation function; fills `pipeline.tessellation_buffers`.
+msl::TessellationStages tessellation_stages(RenderPipeline& pipeline, const msl::Reflection& post) {
+    const auto& d = pipeline.descriptor;
+    const auto& t = d.tessellation;
+    if (!pipeline.device->features10.tessellationShader)
+        throw std::runtime_error("tessellation needs Vulkan tessellation shaders, which " + pipeline.device->profile().name +
+                                 " does not have");
+    if (t.factor_format != 0) throw std::runtime_error("unsupported MTLTessellationFactorFormat " + std::to_string(t.factor_format));
+    msl::TessellationSetup setup;
+    setup.kind = post.patch->kind;
+    bool reads_control_points = false;
+    for (const auto& input : post.stage_in) reads_control_points |= input.used && !input.per_patch;
+    setup.control_points = post.patch->control_points ? post.patch->control_points : 1;
+    if (!post.patch->control_points && reads_control_points)
+        throw std::runtime_error("a [[patch]] function without a control point count cannot read control points");
+    if (t.partition > 3) throw std::runtime_error("invalid MTLTessellationPartitionMode " + std::to_string(t.partition));
+    setup.partition = static_cast<msl::TessellationSetup::Partition>(t.partition);
+    setup.clockwise = t.winding == 0;
+    setup.max_factor = static_cast<float>(std::min(t.max_factor, pipeline.device->properties.limits.maxTessellationGenerationLevel));
+    setup.factor_scale = t.factor_scale;
+    setup.factor_step = t.factor_step;
+    setup.control_point_index_bytes = t.control_point_index_type == 1 ? 2 : t.control_point_index_type == 2 ? 4 : 0;
+    for (std::uint32_t location = 0; location < d.attributes.size(); ++location) {
+        const auto& attribute = d.attributes[location];
+        if (!attribute || !attribute->format) continue;
+        auto fetched = fetched_format(attribute->format);
+        if (!fetched)
+            throw std::runtime_error("MTLVertexFormat " + std::to_string(attribute->format) +
+                                     " is not translated for post-tessellation vertex functions");
+        const auto layout = d.layouts[attribute->buffer_index].value_or(VertexLayout{});
+        if (layout.stride == dynamic_vertex_stride)
+            throw std::runtime_error("dynamic vertex strides are not translated for post-tessellation vertex functions");
+        const auto& buffers = pipeline.tessellation_buffers;
+        auto slot = static_cast<std::uint32_t>(std::find(buffers.begin(), buffers.end(), attribute->buffer_index) - buffers.begin());
+        if (slot == buffers.size()) {
+            if (slot == msl::tessellation_vertex_buffers)
+                throw std::runtime_error("a post-tessellation vertex descriptor may use at most " +
+                                         std::to_string(msl::tessellation_vertex_buffers) + " buffers");
+            pipeline.tessellation_buffers.push_back(attribute->buffer_index);
+        }
+        fetched->location = location;
+        fetched->buffer = slot;
+        fetched->offset = attribute->offset;
+        fetched->stride = layout.step_function == 0 ? 0 : layout.stride;
+        fetched->step = layout.step_function;
+        fetched->step_rate = layout.step_rate;
+        if (layout.step_function == 1)
+            throw std::runtime_error("vertex attribute " + std::to_string(location) +
+                                     " steps per vertex; a post-tessellation vertex function needs per-patch, per-control-point, "
+                                     "per-instance or constant steps");
+        setup.attributes.push_back(*fetched);
+    }
+    auto stages = msl::tessellation_stages(post, setup);
+    if (!stages.error.empty()) throw std::runtime_error(stages.error);
+    pipeline.control_points = setup.control_points;
+    return stages;
+}
+
+} // namespace
 
 std::shared_ptr<RenderPipeline> RenderPipeline::create(std::shared_ptr<Device> device, const RenderPipelineDescriptor& descriptor) {
     if (!descriptor.vertex) throw std::runtime_error("No vertex function set");
@@ -408,7 +506,14 @@ std::shared_ptr<RenderPipeline> RenderPipeline::create(std::shared_ptr<Device> d
             result->linked_fragment_ = std::move(linked.fragment);
         }
     }
-    result->stages[0] = make_stage_layout(d, &result->linked_vertex_.reflection, VK_SHADER_STAGE_VERTEX_BIT,
+    // A post-tessellation function (M5) is the tessellation evaluation stage.
+    std::optional<msl::TessellationStages> tessellation;
+    if (result->linked_vertex_.reflection.patch) {
+        tessellation = tessellation_stages(*result, result->linked_vertex_.reflection);
+        result->tessellation = true;
+    }
+    result->stages[0] = make_stage_layout(d, &result->linked_vertex_.reflection,
+                                          tessellation ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_VERTEX_BIT,
                                           &descriptor.vertex->constants);
     result->stages[1] = make_stage_layout(d, descriptor.fragment ? &result->linked_fragment_.reflection : nullptr,
                                           VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -420,11 +525,22 @@ std::shared_ptr<RenderPipeline> RenderPipeline::create(std::shared_ptr<Device> d
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout.setLayoutCount = result->bindless ? 3 : 2;
     layout.pSetLayouts = sets;
+    const VkPushConstantRange control_constants{VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, 0,
+                                                sizeof(msl::TessellationPushConstants)};
+    if (tessellation) {
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &control_constants;
+    }
     check(d.vk.vkCreatePipelineLayout(d.device, &layout, nullptr, &result->layout), "vkCreatePipelineLayout");
     result->vertex_module_ = create_module(d, result->linked_vertex_.spirv, result->linked_vertex_.name);
     if (descriptor.fragment)
         result->fragment_module_ = create_module(d, result->linked_fragment_.spirv, result->linked_fragment_.name);
-    for (std::uint32_t index = 0; index < descriptor.layouts.size(); ++index) {
+    if (tessellation) {
+        result->patch_vertex_module_ = create_module(d, tessellation->vertex, result->linked_vertex_.name + " (patch vertex)");
+        result->patch_control_module_ = create_module(d, tessellation->control, result->linked_vertex_.name + " (patch control)");
+    }
+    // Vertex input (the control stage fetches a tessellation pipeline's attributes).
+    for (std::uint32_t index = 0; index < descriptor.layouts.size() && !tessellation; ++index) {
         bool used{};
         for (const auto& attribute : descriptor.attributes) used |= attribute && attribute->format && attribute->buffer_index == index;
         if (!used) continue;
@@ -435,7 +551,8 @@ std::shared_ptr<RenderPipeline> RenderPipeline::create(std::shared_ptr<Device> d
         result->dynamic_strides |= layout.step_function != 0 && layout.stride == dynamic_vertex_stride;
     }
     // Pipelines with a declared topology class compile now, like Metal.
-    if (descriptor.topology_class) static_cast<void>(result->build(descriptor.topology_class, 0));
+    if (tessellation) static_cast<void>(result->build(0, 0));
+    else if (descriptor.topology_class) static_cast<void>(result->build(descriptor.topology_class, 0));
     else static_cast<void>(result->build(3, 0));
     return result;
 }
@@ -445,7 +562,7 @@ RenderPipeline::~RenderPipeline() {
     auto pipelines = pipelines_;
     auto stage_layouts = stages;
     const auto pipeline_layout = layout;
-    const auto modules = std::array<VkShaderModule, 2>{vertex_module_, fragment_module_};
+    const auto modules = std::array<VkShaderModule, 4>{vertex_module_, fragment_module_, patch_vertex_module_, patch_control_module_};
     owner->defer([owner, pipelines, stage_layouts, pipeline_layout, modules]() mutable {
         for (const auto pipeline : pipelines) if (pipeline) owner->vk.vkDestroyPipeline(owner->device, pipeline, nullptr);
         if (pipeline_layout) owner->vk.vkDestroyPipelineLayout(owner->device, pipeline_layout, nullptr);
@@ -455,6 +572,14 @@ RenderPipeline::~RenderPipeline() {
 }
 
 VkPipeline RenderPipeline::pipeline(std::uint32_t primitive_type, std::uint32_t raster) {
+    if (tessellation != (primitive_type == patch_primitive))
+        throw std::runtime_error(tessellation ? "a post-tessellation pipeline draws with drawPatches only"
+                                              : "drawPatches needs a pipeline whose vertex function is a [[patch]] function");
+    if (tessellation) {
+        std::lock_guard lock(mutex_);
+        if (const auto found = pipelines_[4 * raster]) return found;
+        return build_locked(0, raster);
+    }
     const auto wanted = descriptor.topology_class ? descriptor.topology_class : topology_class(primitive_type);
     if (descriptor.topology_class && descriptor.topology_class != topology_class(primitive_type))
         throw std::runtime_error("draw primitive type does not match the pipeline's inputPrimitiveTopology");
@@ -480,21 +605,27 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
     const std::uint32_t samples = std::max(1U, descriptor.sample_count);
     vertex_constants.add(msl::reserved_spec_id::raster_sample_count, &samples, 4);
     fragment_constants.add(msl::reserved_spec_id::raster_sample_count, &samples, 4);
-    VkPipelineShaderStageCreateInfo shader_stages[2]{};
-    shader_stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    shader_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    shader_stages[0].module = vertex_module_;
-    shader_stages[0].pName = linked_vertex_.name.c_str();
-    shader_stages[0].pSpecializationInfo = vertex_constants.finish();
-    std::uint32_t stage_count = 1;
-    if (descriptor.fragment && descriptor.rasterization) {
-        shader_stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        shader_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        shader_stages[1].module = fragment_module_;
-        shader_stages[1].pName = linked_fragment_.name.c_str();
-        shader_stages[1].pSpecializationInfo = fragment_constants.finish();
-        stage_count = 2;
+    VkPipelineShaderStageCreateInfo shader_stages[4]{};
+    std::uint32_t stage_count = 0;
+    const auto add_stage = [&](VkShaderStageFlagBits stage, VkShaderModule module, const char* name,
+                               const VkSpecializationInfo* constants) {
+        auto& info = shader_stages[stage_count++];
+        info = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        info.stage = stage;
+        info.module = module;
+        info.pName = name;
+        info.pSpecializationInfo = constants;
+    };
+    if (tessellation) {
+        // Generated vertex and control stages, then the post-tessellation function.
+        add_stage(VK_SHADER_STAGE_VERTEX_BIT, patch_vertex_module_, "main", nullptr);
+        add_stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, patch_control_module_, "main", nullptr);
+        add_stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, vertex_module_, linked_vertex_.name.c_str(), vertex_constants.finish());
+    } else {
+        add_stage(VK_SHADER_STAGE_VERTEX_BIT, vertex_module_, linked_vertex_.name.c_str(), vertex_constants.finish());
     }
+    if (descriptor.fragment && descriptor.rasterization)
+        add_stage(VK_SHADER_STAGE_FRAGMENT_BIT, fragment_module_, linked_fragment_.name.c_str(), fragment_constants.finish());
 
     // Vertex input: binding = Metal buffer index.
     std::vector<VkVertexInputBindingDescription> bindings;
@@ -524,7 +655,7 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
         bindings.push_back(binding);
     }
     const auto integer_inputs = integer_input_signedness(linked_vertex_.spirv);
-    for (std::uint32_t location = 0; location < descriptor.attributes.size(); ++location) {
+    for (std::uint32_t location = 0; location < descriptor.attributes.size() && !tessellation; ++location) {
         const auto& attribute = descriptor.attributes[location];
         if (!attribute || !attribute->format) continue;
         const auto* info = vertex_format_info(attribute->format);
@@ -560,8 +691,14 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
     vertex_input.pVertexAttributeDescriptions = attributes.data();
 
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    assembly.topology = wanted == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+    assembly.topology = tessellation ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : wanted == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
                       : wanted == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    // One patch-list vertex per Metal patch; Metal's (u, v) domain has its origin at the lower left.
+    VkPipelineTessellationDomainOriginStateCreateInfo domain{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO};
+    domain.domainOrigin = VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+    VkPipelineTessellationStateCreateInfo patches{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+    patches.pNext = &domain;
+    patches.patchControlPoints = 1;
     VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     VkPipelineRasterizationStateCreateInfo rasterization{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rasterization.polygonMode = raster & raster_variant::fill_lines ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
@@ -633,6 +770,7 @@ VkPipeline RenderPipeline::build_locked(std::uint32_t wanted, std::uint32_t rast
     info.pStages = shader_stages;
     info.pVertexInputState = &vertex_input;
     info.pInputAssemblyState = &assembly;
+    if (tessellation) info.pTessellationState = &patches;
     info.pViewportState = &viewport;
     info.pRasterizationState = &rasterization;
     info.pMultisampleState = &multisample;

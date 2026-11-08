@@ -294,9 +294,10 @@ void Device::initialize(const DeviceOptions& options) {
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR enabled_local_read{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
     VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR enabled_divisor{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
 #define ALCHEMY_ENABLE(target, source, field) target.field = source.field;
-    // Core 1.0: everything Metal's feature set maps to (no geometry or
-    // tessellation shaders, no wide lines, no float64, no robustness).
-#define ALCHEMY_F10(X) X(multiViewport) X(imageCubeArray) X(independentBlend) X(dualSrcBlend) X(fillModeNonSolid) X(depthClamp)     \
+    // Core 1.0: everything Metal's feature set maps to (no geometry shaders,
+    // no wide lines, no float64, no robustness). Tessellation shaders run
+    // Metal's tessellation (M5) where the device has them.
+#define ALCHEMY_F10(X) X(tessellationShader) X(multiViewport) X(imageCubeArray) X(independentBlend) X(dualSrcBlend) X(fillModeNonSolid) X(depthClamp)     \
     X(depthBiasClamp) X(largePoints) X(multiDrawIndirect) X(drawIndirectFirstInstance) X(samplerAnisotropy)       \
     X(textureCompressionBC) X(occlusionQueryPrecise) X(fragmentStoresAndAtomics)                                   \
     X(vertexPipelineStoresAndAtomics) X(shaderImageGatherExtended) X(shaderStorageImageExtendedFormats)           \

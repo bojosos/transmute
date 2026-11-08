@@ -324,7 +324,9 @@ read from argument buffers are supported), atomics on textures and texture
 buffers read from argument buffers, generic pointers stored in memory, array
 varyings and array vertex attributes, kernel `[[stage_in]]`,
 centroid and sample interpolation of `[[barycentric_coord]]`, mesh/object/tile/
-visible/intersection functions, ray tracing, imageblocks, `memcpy`/`memset`
+visible/intersection functions, `[[patch]]` functions without a control
+point count that read `patch_control_point` (post-tessellation functions are
+otherwise TessellationEvaluation entry points: compiler.hpp, Patch), ray tracing, imageblocks, `memcpy`/`memset`
 with run-time length, recursion and non-inlinable calls, irreducible control
 flow, matrix and struct function constants (vector ones are one specialization
 constant per component, `reserved_spec_id::function_constant_component_base`;

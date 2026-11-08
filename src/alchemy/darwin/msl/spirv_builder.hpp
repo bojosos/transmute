@@ -80,13 +80,14 @@ enum : std::uint32_t { UniformConstant = 0, Input = 1, Uniform = 2, Output = 3, 
     Private = 6, Function = 7, PushConstant = 9, Image = 11, StorageBuffer = 12, PhysicalStorageBuffer = 5349 };
 }
 namespace decoration {
-enum : std::uint32_t { SpecId = 1, Block = 2, ArrayStride = 6, BuiltIn = 11, NoPerspective = 13, Flat = 14,
+enum : std::uint32_t { SpecId = 1, Block = 2, ArrayStride = 6, BuiltIn = 11, NoPerspective = 13, Flat = 14, Patch = 15,
     Centroid = 16, Sample = 17, Invariant = 18, NonWritable = 24, NonReadable = 25, Location = 30, Component = 31,
     Index = 32, Binding = 33, DescriptorSet = 34, Offset = 35, Aliased = 20, Restrict = 19, InputAttachmentIndex = 43,
     AliasedPointer = 5356, RestrictPointer = 5355, NonUniform = 5300 };
 }
 namespace builtin {
 enum : std::uint32_t { Position = 0, PointSize = 1, ClipDistance = 3, PrimitiveId = 7, InvocationId = 8, Layer = 9,
+    TessLevelOuter = 11, TessLevelInner = 12, TessCoord = 13,
     ViewportIndex = 10, FragCoord = 15, PointCoord = 16, FrontFacing = 17, SampleId = 18, SampleMask = 20,
     FragDepth = 22, NumWorkgroups = 24, WorkgroupSize = 25, WorkgroupId = 26, LocalInvocationId = 27,
     GlobalInvocationId = 28, LocalInvocationIndex = 29, SubgroupSize = 36, NumSubgroups = 38, SubgroupId = 40,
@@ -94,7 +95,7 @@ enum : std::uint32_t { Position = 0, PointSize = 1, ClipDistance = 3, PrimitiveI
     FragStencilRefEXT = 5014, BaryCoordKHR = 5286, BaryCoordNoPerspKHR = 5287 };
 }
 namespace capability {
-enum : std::uint32_t { Matrix = 0, Shader = 1, Geometry = 2, Float16 = 9, Float64 = 10, Int64 = 11,
+enum : std::uint32_t { Matrix = 0, Shader = 1, Geometry = 2, Tessellation = 3, Float16 = 9, Float64 = 10, Int64 = 11,
     Int16 = 22, ImageGatherExtended = 25, StorageImageMultisample = 27, ClipDistance = 32, Int8 = 39,
     Sampled1D = 43, Image1D = 44, SampledCubeArray = 45, SampledBuffer = 46, ImageBuffer = 47, ImageMSArray = 48,
     StorageImageExtendedFormats = 49, ImageQuery = 50, DerivativeControl = 51, InterpolationFunction = 52,

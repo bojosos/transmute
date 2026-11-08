@@ -118,6 +118,25 @@ counts above maxComputeWorkGroupCount are not clamped, as for native
 pipelines. An indexed indirect draw that needs its arguments on the CPU, and
 replayed dispatches, stop explicitly.
 
+**Tessellation (M5):** a render pipeline whose vertex function is a
+`[[patch(triangle|quad, N)]]` post-tessellation function runs Metal's
+tessellation with Vulkan tessellation shaders (the device feature; without
+it pipeline creation stops explicitly). msl::tessellation_stages() generates
+a vertex stage and a control stage: Vulkan draws one patch-list vertex per
+Metal patch, so drawPatches is vkCmdDraw(patchCount, instanceCount,
+patchStart, baseInstance) and the indirect forms use
+MTLDrawPatchIndirectArguments as VkDrawIndirectCommand unchanged. The control
+stage reads the patch index buffer, the control point index buffer, the
+vertex descriptor's attributes (per control point, per patch, per instance,
+constant; from memory, at most 12 buffers) and the half-precision factors
+(constant / per-patch / per-instance steps, maxTessellationFactor, factor
+scale, pow2 rounding) through push constants. The domain origin is lower-left
+and tessellationOutputWindingOrder maps to the vertex order. Stops: packed
+(10/10/10/2, RG11B10F, RGB9E5F) and dynamic-stride attributes, per-vertex
+steps, a `[[patch]]` function without a count that reads control points,
+drawPrimitives with such a pipeline, and tessellation in metallib (AIR)
+pipelines.
+
 ## Moved from darwin/identities/
 
 * `stage_input_output_shell.cpp`: the MTLStageInputOutputDescriptor shell (the support kit).

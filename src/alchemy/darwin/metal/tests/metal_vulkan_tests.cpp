@@ -1355,6 +1355,117 @@ void test_placement_heap(const std::shared_ptr<metal::Device>& device) {
 // newTextureWithDescriptor:offset:bytesPerRow: with MTLTextureType2D: a
 // linear image over the buffer's own memory. The buffer's bytes are the
 // texture's texels, and a blit into the texture changes the buffer.
+// Tessellation (M5): a post-tessellation vertex function with control-point
+// and per-patch attributes, per-patch factors (0 culls a patch), an indirect
+// drawPatches, and drawIndexedPatches through patch and control point index
+// buffers.
+void test_tessellation(const std::shared_ptr<metal::Device>& device) {
+    const auto compiled = msl::compile(R"(
+#include <metal_stdlib>
+using namespace metal;
+struct ControlPoint { float2 position [[attribute(0)]]; };
+struct PatchIn { patch_control_point<ControlPoint> points; float4 color [[attribute(1)]]; };
+struct Out { float4 position [[position]]; float4 color; };
+[[patch(quad, 4)]]
+vertex Out post(PatchIn in [[stage_in]], float2 uv [[position_in_patch]]) {
+    const auto p = in.points;
+    Out out;
+    out.position = float4(mix(mix(p[0].position, p[1].position, uv.x), mix(p[3].position, p[2].position, uv.x), uv.y), 0, 1);
+    out.color = float4(in.color.r, uv.x, in.color.b, 1);
+    return out;
+}
+fragment float4 color(Out in [[stage_in]]) { return in.color; }
+)", {});
+    expect(compiled.success(), "tessellation MSL compiles: " + msl::format_diagnostics(compiled.diagnostics));
+    if (!compiled.success()) return;
+    const auto find = [&](const char* name) {
+        for (const auto& function : compiled.functions)
+            if (function.name == name)
+                return std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(function));
+        return std::shared_ptr<metal::ShaderFunction>();
+    };
+    metal::RenderPipelineDescriptor descriptor;
+    descriptor.vertex = find("post");
+    descriptor.fragment = find("color");
+    descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+    descriptor.attributes[0] = metal::VertexAttribute{29, 0, 1};   // Float2 control points
+    descriptor.layouts[1] = metal::VertexLayout{8, 4, 1};          // PerPatchControlPoint
+    descriptor.attributes[1] = metal::VertexAttribute{31, 0, 2};   // Float4 colours
+    descriptor.layouts[2] = metal::VertexLayout{16, 3, 1};         // PerPatch
+    descriptor.tessellation.partition = 1;                          // Integer
+    descriptor.tessellation.factor_step = 1;                        // PerPatch
+    descriptor.label = "tessellation";
+    if (!device->features10.tessellationShader) {
+        bool refused = false;
+        try { static_cast<void>(metal::RenderPipeline::create(device, descriptor)); } catch (const std::runtime_error&) { refused = true; }
+        expect(refused, "without tessellation shaders a post-tessellation pipeline is refused");
+        return;
+    }
+    const auto direct = metal::RenderPipeline::create(device, descriptor);
+    descriptor.tessellation.control_point_index_type = 1;           // UInt16
+    const auto indexed = metal::RenderPipeline::create(device, descriptor);
+    expect(direct->tessellation && direct->control_points == 4 && direct->tessellation_buffers.size() == 2,
+           "a [[patch]] vertex function makes a tessellation pipeline");
+
+    // Patch 0: the left half; patch 1: the right half (factor 0: culled);
+    // patch 2 (indexed only): the top-right quadrant.
+    const float points[] = {-1, -1, 0, -1, 0, 1, -1, 1, 0, -1, 1, -1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1};
+    const float colors[] = {1, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1};
+    const std::uint16_t four = 0x4400, one = 0x3C00;   // half 4.0 and 1.0
+    const std::uint16_t factors[] = {four, four, four, four, four, four, 0, 0, 0, 0, 0, 0, one, one, one, one, one, one};
+    const std::uint32_t indirect_arguments[] = {2, 1, 0, 0};   // patchCount, instanceCount, patchStart, baseInstance
+    const std::uint32_t patch_indices[] = {2};
+    const std::uint16_t control_point_indices[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    const auto upload = [&](const void* data, std::size_t size) {
+        auto buffer = shared_buffer(device, size);
+        std::memcpy(buffer->contents(), data, size);
+        return buffer;
+    };
+    const auto point_buffer = upload(points, sizeof(points)), color_buffer = upload(colors, sizeof(colors));
+    const auto factor_buffer = upload(factors, sizeof(factors)), indirect = upload(indirect_arguments, sizeof(indirect_arguments));
+    const auto patch_buffer = upload(patch_indices, sizeof(patch_indices));
+    const auto control_buffer = upload(control_point_indices, sizeof(control_point_indices));
+    metal::RenderPass pass;
+    pass.colors[0].texture = render_target(device);
+    pass.colors[0].load_action = 2;
+    pass.colors[0].store_action = 1;
+    pass.colors[0].clear_color = {0, 0, 1, 1};
+    auto readback = shared_buffer(device, 64 * 256);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_render(pass);
+    commands->set_render_pipeline(direct);
+    commands->set_buffer(metal::Stage::vertex, 1, point_buffer, 0);
+    commands->set_buffer(metal::Stage::vertex, 2, color_buffer, 0);
+    commands->set_tessellation_factor_buffer(factor_buffer, 0, 0);
+    metal::CommandBuffer::PatchDraw draw;
+    draw.control_points = 4;
+    draw.indirect = indirect;
+    commands->draw_patches(draw);
+    commands->set_render_pipeline(indexed);
+    draw = {};
+    draw.control_points = 4;
+    draw.patch_count = 1;
+    draw.patch_indices = patch_buffer;
+    draw.indexed = true;
+    draw.control_point_indices = control_buffer;
+    commands->draw_patches(draw);
+    bool refused = false;
+    try { commands->draw(3, 0, 3, 1, 0); } catch (const std::runtime_error&) { refused = true; }
+    expect(refused, "drawPrimitives with a post-tessellation pipeline is refused");
+    commands->end_encoding();
+    commands->begin_blit();
+    commands->copy_texture_to_buffer(pass.colors[0].texture, 0, 0, {0, 0, 0, 64, 64, 1}, readback, 0, 256, 64 * 256);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "tessellation command buffer completes");
+    const auto near = [](std::uint8_t value, int expected) { return std::abs(static_cast<int>(value) - expected) <= 10; };
+    const auto left = pixel(readback->contents(), 256, 4, 32), middle = pixel(readback->contents(), 256, 28, 32);
+    expect(left[0] == 255 && near(left[1], 36) && left[2] == 0, "patch 0, u near 0: " + format_pixel(left));
+    expect(middle[0] == 255 && near(middle[1], 227) && middle[2] == 0, "patch 0, u near 1: " + format_pixel(middle));
+    const auto culled = pixel(readback->contents(), 256, 48, 48), indexed_patch = pixel(readback->contents(), 256, 48, 16);
+    expect(culled == std::array<std::uint8_t, 4>{0, 0, 255, 255}, "factor 0 culls patch 1: " + format_pixel(culled));
+    expect(indexed_patch[0] == 255 && indexed_patch[2] == 0, "patch 2 through the index buffers: " + format_pixel(indexed_patch));
+}
 void test_linear_texture_over_buffer(const std::shared_ptr<metal::Device>& device) {
     const auto alignment = metal::Texture::linear_alignment(device, metal::pixel_format::rgba8_unorm);
     std::cout << "  linear RGBA8: row pitch alignment " << alignment.row << ", offset alignment " << alignment.offset << "\n";
@@ -1797,6 +1908,7 @@ int main() {
         test_texture_buffer_views_and_copies(device);
         test_placement_heap(device);
         test_linear_texture_over_buffer(device);
+        test_tessellation(device);
         test_barycentric_coordinates(device);
         test_bindless_argument_buffers(device);
         test_argument_buffer_samplers(device);

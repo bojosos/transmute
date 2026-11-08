@@ -44,6 +44,12 @@ template<typename T> inline T __msl_in(uint location, uint interpolation) {
     using IO = __io<remove_cv_t<T>>;
     return IO::wrap(__msl_stage_input<typename IO::raw>(location, interpolation, __io_sign<remove_cv_t<T>>::value));
 }
+// A post-tessellation vertex function's attribute: control point `control_point`
+// of control-point attribute `location`, or (~0u) per-patch attribute `location`.
+template<typename T> inline T __msl_patch_in(uint location, uint control_point) {
+    using IO = __io<remove_cv_t<T>>;
+    return IO::wrap(__msl_patch_input<typename IO::raw>(location, control_point, __io_sign<remove_cv_t<T>>::value));
+}
 template<typename T> inline void __msl_out(uint location, T value) {
     using IO = __io<remove_cv_t<T>>;
     __msl_stage_output<typename IO::raw>(location, __io_sign<remove_cv_t<T>>::value, IO::unwrap(value));

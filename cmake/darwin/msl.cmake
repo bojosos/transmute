@@ -17,7 +17,7 @@ endfunction()
 alchemy_msl_embed_stdlib()
 set(ALCHEMY_MSL_SOURCES
     src/alchemy/darwin/msl/compiler.cpp src/alchemy/darwin/msl/dump.cpp src/alchemy/darwin/msl/frontend.cpp
-    src/alchemy/darwin/msl/rewriter.cpp src/alchemy/darwin/msl/llvm_ir.cpp src/alchemy/darwin/msl/spirv_builder.cpp
+    src/alchemy/darwin/msl/rewriter.cpp src/alchemy/darwin/msl/llvm_ir.cpp src/alchemy/darwin/msl/spirv_builder.cpp src/alchemy/darwin/msl/tessellation.cpp
     src/alchemy/darwin/msl/lower.cpp src/alchemy/darwin/msl/structurize.cpp src/alchemy/darwin/msl/cache.cpp
     src/alchemy/darwin/msl/preprocess.cpp src/alchemy/darwin/msl/prelude.cpp
     "${alchemy_msl_embed}")

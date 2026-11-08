@@ -809,7 +809,68 @@ void install_render_encoder() {
             e.commands->draw_indexed_indirect(static_cast<std::uint32_t>(s.x[2]), static_cast<std::uint32_t>(s.x[3]), buffer_of(s.x[4]),
                                               s.x[5], buffer_of(s.x[6]), s.x[7]);
         }, "v@:QQ@Q@Q");
-    method("memoryBarrierWithScope:afterStages:beforeStages:", [](EncoderState& e, CpuState& s, GuestMemory&) {
+    method("setTessellationFactorBuffer:offset:instanceStride:", [](EncoderState& e, CpuState& s, GuestMemory&) {
+        e.commands->set_tessellation_factor_buffer(buffer_of(s.x[2]), s.x[3], static_cast<std::uint32_t>(s.x[4]));
+    }, "v@:@QQ");
+    method("setTessellationFactorScale:", [](EncoderState& e, CpuState& s, GuestMemory&) {
+        e.commands->set_tessellation_factor_scale(single(s, 0));
+    }, "v@:f");
+    using PatchDraw = CommandBuffer::PatchDraw;
+    const auto u32 = [](std::uint64_t value) { return static_cast<std::uint32_t>(value); };
+    method("drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance:",
+        [u32](EncoderState& e, CpuState& s, GuestMemory& m) {
+            PatchDraw draw;
+            draw.control_points = u32(s.x[2]);
+            draw.patch_start = u32(s.x[3]);
+            draw.patch_count = u32(s.x[4]);
+            draw.patch_indices = buffer_of(s.x[5]);
+            draw.patch_index_offset = s.x[6];
+            draw.instance_count = u32(s.x[7]);
+            draw.base_instance = u32(m.read64(s.sp));
+            e.commands->draw_patches(draw);
+        }, "v@:QQQ@QQQ");
+    method("drawPatches:patchIndexBuffer:patchIndexBufferOffset:indirectBuffer:indirectBufferOffset:",
+        [u32](EncoderState& e, CpuState& s, GuestMemory&) {
+            PatchDraw draw;
+            draw.control_points = u32(s.x[2]);
+            draw.patch_indices = buffer_of(s.x[3]);
+            draw.patch_index_offset = s.x[4];
+            draw.indirect = buffer_of(s.x[5]);
+            draw.indirect_offset = s.x[6];
+            if (!draw.indirect) throw std::runtime_error("Metal indirect drawPatches without an indirect buffer");
+            e.commands->draw_patches(draw);
+        }, "v@:Q@Q@Q");
+    method("drawIndexedPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:"
+           "controlPointIndexBufferOffset:instanceCount:baseInstance:",
+        [u32](EncoderState& e, CpuState& s, GuestMemory& m) {
+            PatchDraw draw;
+            draw.control_points = u32(s.x[2]);
+            draw.patch_start = u32(s.x[3]);
+            draw.patch_count = u32(s.x[4]);
+            draw.patch_indices = buffer_of(s.x[5]);
+            draw.patch_index_offset = s.x[6];
+            draw.indexed = true;
+            draw.control_point_indices = buffer_of(s.x[7]);
+            draw.control_point_index_offset = m.read64(s.sp);
+            draw.instance_count = u32(m.read64(s.sp + 8));
+            draw.base_instance = u32(m.read64(s.sp + 16));
+            e.commands->draw_patches(draw);
+        }, "v@:QQQ@Q@QQQ");
+    method("drawIndexedPatches:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:"
+           "indirectBuffer:indirectBufferOffset:",
+        [u32](EncoderState& e, CpuState& s, GuestMemory& m) {
+            PatchDraw draw;
+            draw.control_points = u32(s.x[2]);
+            draw.patch_indices = buffer_of(s.x[3]);
+            draw.patch_index_offset = s.x[4];
+            draw.indexed = true;
+            draw.control_point_indices = buffer_of(s.x[5]);
+            draw.control_point_index_offset = s.x[6];
+            draw.indirect = buffer_of(s.x[7]);
+            draw.indirect_offset = m.read64(s.sp);
+            if (!draw.indirect) throw std::runtime_error("Metal indirect drawIndexedPatches without an indirect buffer");
+            e.commands->draw_patches(draw);
+        }, "v@:Q@Q@Q@Q");    method("memoryBarrierWithScope:afterStages:beforeStages:", [](EncoderState& e, CpuState& s, GuestMemory&) {
         e.commands->memory_barrier(s.x[2]);
     }, "v@:QQQ");
     method("memoryBarrierWithResources:count:afterStages:beforeStages:", [](EncoderState& e, CpuState&, GuestMemory&) {
@@ -1889,6 +1950,14 @@ std::shared_ptr<RenderPipeline> render_pipeline(Address device, Address descript
     d.alpha_to_one = descriptor_bool(descriptor, "alphaToOneEnabled");
     d.rasterization = descriptor_bool(descriptor, "rasterizationEnabled");
     d.topology_class = static_cast<std::uint32_t>(descriptor_u64(descriptor, "inputPrimitiveTopology"));
+    auto& tessellation = d.tessellation;
+    tessellation.partition = static_cast<std::uint32_t>(descriptor_u64(descriptor, "tessellationPartitionMode"));
+    tessellation.max_factor = static_cast<std::uint32_t>(descriptor_u64(descriptor, "maxTessellationFactor"));
+    tessellation.factor_scale = descriptor_bool(descriptor, "tessellationFactorScaleEnabled");
+    tessellation.factor_format = static_cast<std::uint32_t>(descriptor_u64(descriptor, "tessellationFactorFormat"));
+    tessellation.control_point_index_type = static_cast<std::uint32_t>(descriptor_u64(descriptor, "tessellationControlPointIndexType"));
+    tessellation.factor_step = static_cast<std::uint32_t>(descriptor_u64(descriptor, "tessellationFactorStepFunction"));
+    tessellation.winding = static_cast<std::uint32_t>(descriptor_u64(descriptor, "tessellationOutputWindingOrder"));
     if (descriptor_u64(descriptor, "maxVertexAmplificationCount") > 1)
         throw std::runtime_error("vertex amplification is not translated");
     if (const auto vertex = descriptor_child(descriptor, "vertexDescriptor")) {
