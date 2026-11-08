@@ -24,7 +24,9 @@ param(
     # The same as 'NAME=value;NAME=value' text, for callers going through powershell -File.
     [string]$EnvText = '',
     # -GuestArgs as base64 of a UTF-8 JSON array, for callers going through powershell -File.
-    [string]$GuestArgsBase64 = ''
+    [string]$GuestArgsBase64 = '',
+    # -RuntimeDir as ';'-separated text, for callers going through powershell -File.
+    [string]$RuntimeDirText = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
@@ -35,6 +37,7 @@ if ($GuestArgsBase64) {
     $parsed = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($GuestArgsBase64)) | ConvertFrom-Json
     $GuestArgs = @($parsed | ForEach-Object { [string]$_ })
 }
+if ($RuntimeDirText) { $RuntimeDir = @($RuntimeDirText -split ';' | Where-Object { $_ }) }
 $Root = [IO.Path]::GetFullPath($Root)
 if (-not (Test-Path (Join-Path $Root '.alchemy-root'))) { throw "not an Alchemy root: $Root" }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
