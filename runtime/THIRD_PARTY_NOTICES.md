@@ -77,6 +77,53 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+## libffi (guest `/usr/lib/libffi.dylib`)
+
+`scripts/build_alchemy_libffi.ps1` builds the guest ARM64 libffi runtime from libffi 3.8.0
+(<https://github.com/libffi/libffi>, release archive `libffi-3.8.0.tar.gz`), vendored unmodified in
+`third_party/libffi` (hashes in its `PROVENANCE.md`). libffi is distributed under the MIT license. The
+build's configuration is the project-authored `runtime/libffi/`. The build copies libffi's `LICENSE` as
+`LICENSE.libffi.txt` beside its outputs. libffi's license notice follows verbatim.
+
+libffi - Copyright (c) 1996-2026  Anthony Green, Red Hat, Inc and others.
+See source files for details.
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+``Software''), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED ``AS IS'', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## SQLite (guest `/usr/lib/libsqlite3.dylib`)
+
+`scripts/build_alchemy_sqlite.ps1` builds the guest ARM64 SQLite runtime from the SQLite 3.54.1
+amalgamation (<https://www.sqlite.org>, `sqlite-amalgamation-3540100.zip`), vendored unmodified in
+`third_party/sqlite` (hashes in its `PROVENANCE.md`). SQLite's authors have dedicated the code to the
+public domain; the dedication is at the top of `sqlite3.c` and `sqlite3.h`, and no license notice is
+required. The build's configuration is the project-authored `runtime/sqlite/`.
+
+## ICU (guest `/usr/lib/libicucore.A.dylib`)
+
+`scripts/build_alchemy_icu.ps1` builds the guest ARM64 libicucore runtime from part of ICU4C 79.1
+(<https://github.com/unicode-org/icu>, `icu4c-79.1-sources.tgz`): 68 sources and the headers of
+`source/common/` and the `uts46.nrm` data file, vendored unmodified in `third_party/icu` (hashes in its
+`PROVENANCE.md`). ICU is distributed under the Unicode License v3 (Unicode-3.0), and its `LICENSE` also
+carries the notices of the third-party code and data ICU includes. The full text is
+`third_party/icu/LICENSE`; the build copies it as `LICENSE.icu.txt` beside its outputs.
+
 ## OpenCombine (guest `Combine.framework`)
 
 `third_party/opencombine` vendors OpenCombine's sources:
