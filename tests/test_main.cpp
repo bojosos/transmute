@@ -1858,9 +1858,21 @@ void test_jit_pointer_authentication_disabled_hints() {
     for (const auto opcode : {0xd503231fU, 0xd503235fU, 0xd503239fU,
                              0xd50323dfU, 0xd50330bfU, 0xd503309fU,
                              0xd50330dfU, 0xd65f0bffU, 0xd65f0fffU,
-                             0xd61f0820U, 0xd63f0820U}) {
+                             0xd61f0820U, 0xd63f0820U, 0xd503281fU}) {
         expect(!transmute::decode_integer_block(0x140001000ULL, std::array{opcode}),
                "PAuth hint lowering admitted adjacent hints, barriers or authenticated control flow");
+    }
+}
+
+void test_jit_bti_and_upper_hints() {
+    // HINT #32..#63: BTI (c 0xd503245f, j 0xd503249f, jc 0xd50324df) and CHKFEAT are NOPs
+    // without those features, in the JIT and in ReferenceEngine (libffi's sysv.S).
+    JitIntegerDifferential probe;
+    for (const auto opcode : {0xd503241fU, 0xd503245fU, 0xd503249fU, 0xd50324dfU,
+                             0xd503251fU, 0xd50327ffU}) {
+        for (unsigned flags = 0; flags < 16; ++flags) {
+            probe.check(opcode, jit_integer_register_seed(), flags << 28, "HINT #32..#63");
+        }
     }
 }
 
@@ -26128,6 +26140,7 @@ int main(int argc, char** argv) {
         RUN_TEST(test_jit_integer_multiply_family);
         RUN_TEST(test_jit_conditional_compare_family);
         RUN_TEST(test_jit_pointer_authentication_disabled_hints);
+        RUN_TEST(test_jit_bti_and_upper_hints);
         RUN_TEST(test_jit_direct_branch_link);
         RUN_TEST(test_jit_core_integer_batch_budgets);
         RUN_TEST(test_jit_bit_test_and_unconditional_branches);

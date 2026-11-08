@@ -140,8 +140,10 @@ std::optional<DecodedBlock> decode_integer_block_impl(
         decoded.wide = (word & 0x80000000U) != 0;
         if (word == 0xd503201fU || word == 0xd50320ffU ||
             word == 0xd503233fU || word == 0xd503237fU ||
-            word == 0xd50323bfU || word == 0xd50323ffU) {
-            // Match ReferenceEngine's exact PAuth-disabled HINT policy.
+            word == 0xd50323bfU || word == 0xd50323ffU ||
+            (word & 0xfffffc1fU) == 0xd503241fU) {
+            // Match ReferenceEngine's exact PAuth-disabled HINT policy, plus
+            // HINT #32..#63 (BTI, CHKFEAT, unallocated) as NOPs.
             // Authenticated branches/returns and barriers remain outside it.
             decoded.op = BlockOp::nop;
         } else if (jit_detail::accepts_integer_simd(word)) {

@@ -8092,6 +8092,12 @@ bool ReferenceEngine::execute(std::uint32_t instruction) {
         instruction == 0xd50323ffU) {
         return false;
     }
+    // HINT #32..#63 (BTI landing pads, CHKFEAT and the unallocated hints there)
+    // execute as NOPs on a guest CPU without those features. libffi's sysv.S
+    // emits BTI c/j unconditionally.
+    if ((instruction & 0xfffffc1fU) == 0xd503241fU) {
+        return false;
+    }
     if ((instruction & 0xfffff0ffU) == 0xd50330bfU) {
         std::atomic_thread_fence(std::memory_order_seq_cst); // DMB
         return false;
