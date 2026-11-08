@@ -80,7 +80,10 @@ it (lld, clang and cmake among them). The feature set is upstream's default
 plus Schematron and the HTTP ABI stubs; ICU, zlib and the legacy APIs are off.
 Character sets libxml2 does not decode itself (UTF-32, UCS-4) go through
 `/usr/lib/libiconv.2.dylib`, Alchemy's libiconv provider. Every non-static
-symbol is exported, as upstream builds it. The script fails if the objects
+symbol is exported, as upstream builds it, plus names macOS's libxml2.2 still
+exports and 2.15 dropped: `inputPush`, `valuePush` and `valuePop` (linker aliases of
+`xmlCtxtPushInput`, `xmlXPathValuePush` and `xmlXPathValuePop`) and the nanoFTP
+client, which fails the documented way (`runtime/libxml2/nanoftp_compat.c`). The script fails if the objects
 import any libSystem symbol outside its reviewed list. `runtime/libxml2/config.h`
 replaces the generated configuration header, the script fills in upstream's
 `xmlversion.h.in`, and no Apple SDK is used. The output's `include/` holds the

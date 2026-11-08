@@ -102,6 +102,16 @@ foreach ($file in $files) {
     if ($LASTEXITCODE) { throw "libxml2 compile failed: $file" }
     $objectFiles += $object
 }
+# ABI compatibility names macOS's libxml2.2 still exports (LibreOffice, darktable): the
+# nanoFTP client upstream removed in 2.15, as documented failures, and three pre-2.13
+# names that 2.15 keeps only as macros over exported functions (linker aliases below).
+$compat = Join-Path $config 'nanoftp_compat.c'
+$object = Join-Path $objects 'nanoftp_compat.o'
+& $Clang @flags -c $compat -o $object
+if ($LASTEXITCODE) { throw 'libxml2 compile failed: nanoftp_compat.c' }
+$objectFiles += $object
+$aliases = [ordered]@{ '_xmlCtxtPushInput' = '_inputPush'; '_xmlXPathValuePush' = '_valuePush'; '_xmlXPathValuePop' = '_valuePop' }
+$aliasArguments = @($aliases.Keys | ForEach-Object { '-alias'; $_; $aliases[$_] })
 
 $undefined = @($objectFiles | ForEach-Object { & $nm -u $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique)
 $internal = @($objectFiles | ForEach-Object { & $nm -g --defined-only $_ } | ForEach-Object { ($_ -split '\s+')[-1] } | Sort-Object -Unique)
@@ -128,12 +138,14 @@ Write-Stub $iconvStub '/usr/lib/libiconv.2.dylib' '7.0.0' $iconvImports
 
 $dylib = Join-Path $out 'libxml2.2.dylib'
 & $linker -arch arm64 -platform_version macos 11.0 11.0 -fixup_chains -dylib -install_name $installName `
-    -compatibility_version $compatibilityVersion -current_version $currentVersion @objectFiles $systemStub $iconvStub -o $dylib
+    -compatibility_version $compatibilityVersion -current_version $currentVersion @aliasArguments @objectFiles $systemStub $iconvStub -o $dylib
 if ($LASTEXITCODE) { throw 'libxml2 link failed' }
 $exports = @(& $nm -gU $dylib | ForEach-Object { ($_ -split '\s+')[-1] } | Sort-Object -Unique)
 # The names the toolchains and libxslt bind must be among them.
 foreach ($name in @('_xmlReadMemory', '_xmlDocDumpFormatMemoryEnc', '_xmlNewDoc', '_xmlNewNs', '_xmlSetGenericErrorFunc',
-        '_xmlXPathEval', '_xmlParseFile', '_xmlSAXVersion', '_htmlParseDoc', '_xmlTextReaderRead', '_xmlNewTextWriterMemory')) {
+        '_xmlXPathEval', '_xmlParseFile', '_xmlSAXVersion', '_htmlParseDoc', '_xmlTextReaderRead', '_xmlNewTextWriterMemory',
+        '_inputPush', '_valuePush', '_valuePop', '_xmlNanoFTPInit', '_xmlNanoFTPNewCtxt', '_xmlNanoFTPConnect', '_xmlNanoFTPGet',
+        '_xmlNanoFTPClose')) {
     if ($exports -notcontains $name) { throw "libxml2.2.dylib does not export $name" }
 }
 
@@ -160,6 +172,8 @@ $provenance = [ordered]@{
     guest_header_profile = 'Alchemy-authored Darwin LP64 C/POSIX declarations; no Apple SDK payloads'
     build_script_sha256 = (Get-Sha256 $PSCommandPath)
     configuration_header = [ordered]@{ name = 'runtime/libxml2/config.h'; sha256 = (Get-Sha256 (Join-Path $config 'config.h')) }
+    compatibility_source = [ordered]@{ name = 'runtime/libxml2/nanoftp_compat.c'; sha256 = (Get-Sha256 $compat) }
+    compatibility_aliases = $aliases
     guest_headers = @(Get-ChildItem -LiteralPath $sdk -File -Recurse | Sort-Object FullName | ForEach-Object {
         [ordered]@{ name = (Get-RelativeName $sdk $_.FullName); sha256 = (Get-Sha256 $_.FullName) }
     })
