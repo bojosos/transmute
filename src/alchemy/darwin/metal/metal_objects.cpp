@@ -141,13 +141,17 @@ struct ArgumentState final : Held {
     bool active{true}, depth{};
 };
 struct ReflectionState final : Held { Address vertex{}, fragment{}, kernel{}; };
+// Indirect command buffers (M6): the buffer, and one of its commands.
+struct IndirectBufferState final : Held { std::shared_ptr<IndirectCommandBuffer> commands; Address device{}; std::uint64_t options{}; };
+struct IndirectCommandState final : Held { std::shared_ptr<IndirectCommandBuffer> commands; std::uint32_t index{}; };
 
 // Class addresses.
 struct Classes {
     Address device{}, buffer{}, texture{}, sampler{}, depth_stencil{}, heap{}, library{}, function{}, render_pipeline{},
         compute_pipeline{}, queue{}, command_buffer{}, render_encoder{}, compute_encoder{}, blit_encoder{},
         argument_encoder{}, fence{}, event{}, shared_event{}, listener{}, capture_manager{}, capture_scope{}, archive{},
-        error{}, argument{}, render_reflection{}, compute_reflection{}, log_state{}, counter_set{}, counter{}, sample_buffer{};
+        error{}, argument{}, render_reflection{}, compute_reflection{}, log_state{}, counter_set{}, counter{}, sample_buffer{},
+        indirect_buffer{}, indirect_render_command{}, indirect_compute_command{};
 } classes;
 Address timestamp_set_object{};   // the one MTLCounterSet (immortal), created on first use
 Address timestamp_set();
@@ -273,6 +277,7 @@ Address device_from(const Held& held) {
     if (const auto* value = dynamic_cast<const ArchiveState*>(&held)) return value->device;
     if (const auto* value = dynamic_cast<const LogStateState*>(&held)) return value->device;
     if (const auto* value = dynamic_cast<const SampleBufferState*>(&held)) return value->device;
+    if (const auto* value = dynamic_cast<const IndirectBufferState*>(&held)) return value->device;
     return 0;
 }
 
@@ -2013,7 +2018,9 @@ void install_pipeline_states() {
     auto& r = runtime();
     install_label(classes.render_pipeline);
     install_device_getter(classes.render_pipeline);
-    r.method(classes.render_pipeline, "supportIndirectCommandBuffers", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:");
+    // Indirect command buffers (M6) take native pipelines; metallib ones stop.
+    r.method(classes.render_pipeline, "supportIndirectCommandBuffers", on<RenderPipelineObject>("MTLRenderPipelineState",
+        [](RenderPipelineObject& p, CpuState& s, GuestMemory&) { s.x[0] = p.pipeline ? 1 : 0; }), false, "B@:");
     r.method(classes.render_pipeline, "gpuResourceID", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[0]; }, false, "Q@:");
     for (const auto selector : {"maxTotalThreadsPerObjectThreadgroup", "maxTotalThreadsPerMeshThreadgroup", "objectThreadExecutionWidth"})
         r.method(classes.render_pipeline, selector, [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "Q@:");
@@ -2043,7 +2050,9 @@ void install_pipeline_states() {
         s.x[0] = p.pipeline->static_threadgroup_memory;
     }), false, "Q@:");
     r.method(cls, "imageblockMemoryLengthForDimensions:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "Q@:{MTLSize=QQQ}");
-    r.method(cls, "supportIndirectCommandBuffers", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "B@:");
+    r.method(cls, "supportIndirectCommandBuffers", on<ComputePipelineObject>(what, [](ComputePipelineObject& p, CpuState& s, GuestMemory&) {
+        s.x[0] = p.pipeline ? 1 : 0;
+    }), false, "B@:");
     r.method(cls, "gpuResourceID", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[0]; }, false, "Q@:");
 
     // Reflection objects.
@@ -3220,6 +3229,245 @@ void install_counters(Runtime& r) {
 
 // ---- installation ------------------------------------------------------------------------------------
 
+// ---- indirect command buffers (M6) ------------------------------------------------------
+// Commands are encoded on the CPU into IndirectCommandBuffer and replayed when
+// an encoder executes them (commands.hpp). GPU encoding, and ranges read from
+// a GPU buffer, stop explicitly.
+void install_indirect_command_buffers() {
+    auto& r = runtime();
+    using Kind = IndirectRenderCommand::Kind;
+    r.method(classes.device, "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:", [&r](CpuState& s, GuestMemory&) {
+        const auto descriptor = s.x[2];
+        const auto types = static_cast<std::uint32_t>(descriptor_u64(descriptor, "commandTypes"));
+        const bool render = (types & IndirectCommandBuffer::render_types) != 0;
+        const bool compute = (types & IndirectCommandBuffer::compute_types) != 0;
+        // Mesh commands, and render mixed with compute, answer nil.
+        if (!types || (types & ~(IndirectCommandBuffer::render_types | IndirectCommandBuffer::compute_types)) || (render && compute)) {
+            s.x[0] = 0;
+            return;
+        }
+        auto value = std::make_shared<IndirectBufferState>();
+        value->commands = std::make_shared<IndirectCommandBuffer>(types, static_cast<std::uint32_t>(s.x[3]),
+            descriptor_bool(descriptor, "inheritPipelineState"), descriptor_bool(descriptor, "inheritBuffers"));
+        value->device = s.x[0];
+        value->options = s.x[4];
+        s.x[0] = r.create(classes.indirect_buffer, std::move(value));
+    }, false, "@@:@QQ");
+
+    // MTLIndirectCommandBuffer.
+    const auto cls = classes.indirect_buffer;
+    const auto what = "MTLIndirectCommandBuffer";
+    install_label(cls);
+    install_device_getter(cls);
+    install_purgeable_state(cls);
+    r.method(cls, "size", on<IndirectBufferState>(what, [](IndirectBufferState& b, CpuState& s, GuestMemory&) {
+        s.x[0] = b.commands->size();
+    }), false, "Q@:");
+    r.method(cls, "allocatedSize", on<IndirectBufferState>(what, [](IndirectBufferState& b, CpuState& s, GuestMemory&) {
+        s.x[0] = std::uint64_t{b.commands->size()} * sizeof(IndirectRenderCommand);
+    }), false, "Q@:");
+    r.method(cls, "resourceOptions", on<IndirectBufferState>(what, [](IndirectBufferState& b, CpuState& s, GuestMemory&) {
+        s.x[0] = b.options;
+    }), false, "Q@:");
+    r.method(cls, "storageMode", on<IndirectBufferState>(what, [](IndirectBufferState& b, CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<std::uint64_t>(ResourceOptions::decode(b.options).storage);
+    }), false, "Q@:");
+    r.method(cls, "cpuCacheMode", on<IndirectBufferState>(what, [](IndirectBufferState& b, CpuState& s, GuestMemory&) {
+        s.x[0] = ResourceOptions::decode(b.options).cpu_cache_mode;
+    }), false, "Q@:");
+    r.method(cls, "hazardTrackingMode", [](CpuState& s, GuestMemory&) { s.x[0] = 2; }, false, "Q@:");
+    r.method(cls, "heap", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    r.method(cls, "gpuResourceID", [](CpuState& s, GuestMemory&) { s.x[0] = s.x[0]; }, false, "Q@:");
+    r.method(cls, "resetWithRange:", on<IndirectBufferState>(what, [](IndirectBufferState& b, CpuState& s, GuestMemory&) {
+        b.commands->reset(static_cast<std::uint32_t>(s.x[2]), static_cast<std::uint32_t>(s.x[3]));
+    }), false, "v@:{_NSRange=QQ}");
+    const auto command_at = [&r](Address command_class, bool compute) {
+        return [&r, command_class, compute](CpuState& s, GuestMemory&) {
+            const auto buffer = state<IndirectBufferState>(s.x[0], "MTLIndirectCommandBuffer");
+            const auto& list = compute ? buffer->commands->compute.size() : buffer->commands->render.size();
+            if (s.x[2] >= list)
+                throw std::runtime_error(std::string("Alchemy Metal: no indirect ") + (compute ? "compute" : "render") +
+                                         " command at index " + std::to_string(s.x[2]));
+            auto value = std::make_shared<IndirectCommandState>();
+            value->commands = buffer->commands;
+            value->index = static_cast<std::uint32_t>(s.x[2]);
+            value->keep(r.retain(s.x[0]));
+            s.x[0] = r.autorelease(r.create(command_class, std::move(value)));
+        };
+    };
+    r.method(cls, "indirectRenderCommandAtIndex:", command_at(classes.indirect_render_command, false), false, "@@:Q");
+    r.method(cls, "indirectComputeCommandAtIndex:", command_at(classes.indirect_compute_command, true), false, "@@:Q");
+
+    // MTLIndirectRenderCommand.
+    const auto render_method = [&r](std::string_view selector, auto function, std::string types) {
+        r.method(classes.indirect_render_command, selector, on<IndirectCommandState>("MTLIndirectRenderCommand",
+            [function](IndirectCommandState& c, CpuState& s, GuestMemory& m) {
+                std::lock_guard lock(c.commands->mutex);
+                function(c.commands->render.at(c.index), s, m);
+            }), false, std::move(types));
+    };
+    render_method("setRenderPipelineState:", [](IndirectRenderCommand& c, CpuState& s, GuestMemory&) {
+        const auto pipeline = state<RenderPipelineObject>(s.x[2], "MTLRenderPipelineState");
+        if (!pipeline->pipeline) throw std::runtime_error("Alchemy Metal: indirect command buffers with metallib pipelines are not translated");
+        c.pipeline = pipeline->pipeline;
+    }, "v@:@");
+    const auto bind = [](std::array<IndirectBinding, 31>& list, std::uint64_t index, Address buffer, std::uint64_t offset,
+                         std::uint64_t stride) {
+        if (index >= list.size()) throw std::out_of_range("Metal buffer index " + std::to_string(index) + " exceeds 30");
+        list[index] = {buffer_of(buffer), offset, stride};
+    };
+    render_method("setVertexBuffer:offset:atIndex:", [bind](IndirectRenderCommand& c, CpuState& s, GuestMemory&) {
+        bind(c.vertex, s.x[4], s.x[2], s.x[3], ~std::uint64_t{0});
+    }, "v@:@QQ");
+    render_method("setVertexBuffer:offset:attributeStride:atIndex:", [bind](IndirectRenderCommand& c, CpuState& s, GuestMemory&) {
+        bind(c.vertex, s.x[5], s.x[2], s.x[3], s.x[4]);
+    }, "v@:@QQQ");
+    render_method("setFragmentBuffer:offset:atIndex:", [bind](IndirectRenderCommand& c, CpuState& s, GuestMemory&) {
+        bind(c.fragment, s.x[4], s.x[2], s.x[3], ~std::uint64_t{0});
+    }, "v@:@QQ");
+    const auto u32 = [](std::uint64_t value) { return static_cast<std::uint32_t>(value); };
+    render_method("drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:",
+        [u32](IndirectRenderCommand& c, CpuState& s, GuestMemory&) {
+            c.kind = Kind::draw;
+            c.primitive = u32(s.x[2]);
+            c.vertex_start = u32(s.x[3]);
+            c.count = u32(s.x[4]);
+            c.instance_count = u32(s.x[5]);
+            c.base_instance = u32(s.x[6]);
+        }, "v@:QQQQQ");
+    render_method("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:",
+        [u32](IndirectRenderCommand& c, CpuState& s, GuestMemory& m) {
+            c.kind = Kind::draw_indexed;
+            c.primitive = u32(s.x[2]);
+            c.count = u32(s.x[3]);
+            c.index_type = u32(s.x[4]);
+            c.index_buffer = buffer_of(s.x[5]);
+            c.index_offset = s.x[6];
+            c.instance_count = u32(s.x[7]);
+            c.base_vertex = static_cast<std::int32_t>(m.read64(s.sp));
+            c.base_instance = u32(m.read64(s.sp + 8));
+        }, "v@:QQQ@QQqQ");
+    render_method("drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance:"
+                  "tessellationFactorBuffer:tessellationFactorBufferOffset:tessellationFactorBufferInstanceStride:",
+        [u32](IndirectRenderCommand& c, CpuState& s, GuestMemory& m) {
+            c.kind = Kind::draw_patches;
+            c.patches = {};
+            c.patches.control_points = u32(s.x[2]);
+            c.patches.patch_start = u32(s.x[3]);
+            c.patches.patch_count = u32(s.x[4]);
+            c.patches.patch_indices = buffer_of(s.x[5]);
+            c.patches.patch_index_offset = s.x[6];
+            c.patches.instance_count = u32(s.x[7]);
+            c.patches.base_instance = u32(m.read64(s.sp));
+            c.factors = buffer_of(m.read64(s.sp + 8));
+            c.factor_offset = m.read64(s.sp + 16);
+            c.factor_stride = u32(m.read64(s.sp + 24));
+        }, "v@:QQQ@QQQ@QQ");
+    render_method("drawIndexedPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:"
+                  "controlPointIndexBufferOffset:instanceCount:baseInstance:tessellationFactorBuffer:"
+                  "tessellationFactorBufferOffset:tessellationFactorBufferInstanceStride:",
+        [u32](IndirectRenderCommand& c, CpuState& s, GuestMemory& m) {
+            c.kind = Kind::draw_indexed_patches;
+            c.patches = {};
+            c.patches.control_points = u32(s.x[2]);
+            c.patches.patch_start = u32(s.x[3]);
+            c.patches.patch_count = u32(s.x[4]);
+            c.patches.patch_indices = buffer_of(s.x[5]);
+            c.patches.patch_index_offset = s.x[6];
+            c.patches.indexed = true;
+            c.patches.control_point_indices = buffer_of(s.x[7]);
+            c.patches.control_point_index_offset = m.read64(s.sp);
+            c.patches.instance_count = u32(m.read64(s.sp + 8));
+            c.patches.base_instance = u32(m.read64(s.sp + 16));
+            c.factors = buffer_of(m.read64(s.sp + 24));
+            c.factor_offset = m.read64(s.sp + 32);
+            c.factor_stride = u32(m.read64(s.sp + 40));
+        }, "v@:QQQ@Q@QQQ@QQ");
+    render_method("reset", [](IndirectRenderCommand& c, CpuState&, GuestMemory&) { c = {}; }, "v@:");
+    // Render commands run in order; a barrier between them changes nothing here.
+    render_method("setBarrier", [](IndirectRenderCommand&, CpuState&, GuestMemory&) {}, "v@:");
+    render_method("clearBarrier", [](IndirectRenderCommand&, CpuState&, GuestMemory&) {}, "v@:");
+    for (const auto selector : {"setObjectThreadgroupMemoryLength:atIndex:", "drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+                                "drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"})
+        render_method(selector, [](IndirectRenderCommand&, CpuState&, GuestMemory&) {
+            throw std::runtime_error("Alchemy Metal: mesh commands in indirect command buffers are not translated");
+        }, "v@:");
+
+    // MTLIndirectComputeCommand.
+    const auto compute_method = [&r](std::string_view selector, auto function, std::string types) {
+        r.method(classes.indirect_compute_command, selector, on<IndirectCommandState>("MTLIndirectComputeCommand",
+            [function](IndirectCommandState& c, CpuState& s, GuestMemory& m) {
+                std::lock_guard lock(c.commands->mutex);
+                function(c.commands->compute.at(c.index), s, m);
+            }), false, std::move(types));
+    };
+    compute_method("setComputePipelineState:", [](IndirectComputeCommand& c, CpuState& s, GuestMemory&) {
+        const auto pipeline = state<ComputePipelineObject>(s.x[2], "MTLComputePipelineState");
+        if (!pipeline->pipeline) throw std::runtime_error("Alchemy Metal: indirect command buffers with metallib pipelines are not translated");
+        c.pipeline = pipeline->pipeline;
+    }, "v@:@");
+    compute_method("setKernelBuffer:offset:atIndex:", [bind](IndirectComputeCommand& c, CpuState& s, GuestMemory&) {
+        bind(c.buffers, s.x[4], s.x[2], s.x[3], ~std::uint64_t{0});
+    }, "v@:@QQ");
+    compute_method("setKernelBuffer:offset:attributeStride:atIndex:", [bind](IndirectComputeCommand& c, CpuState& s, GuestMemory&) {
+        bind(c.buffers, s.x[5], s.x[2], s.x[3], s.x[4]);
+    }, "v@:@QQQ");
+    compute_method("setThreadgroupMemoryLength:atIndex:", [](IndirectComputeCommand& c, CpuState& s, GuestMemory&) {
+        if (s.x[3] >= c.threadgroup_memory.size()) throw std::out_of_range("Metal threadgroup memory index exceeds 30");
+        c.threadgroup_memory[s.x[3]] = static_cast<std::uint32_t>(s.x[2]);
+    }, "v@:QQ");
+    compute_method("concurrentDispatchThreadgroups:threadsPerThreadgroup:", [](IndirectComputeCommand& c, CpuState& s, GuestMemory& m) {
+        c.kind = IndirectComputeCommand::Kind::threadgroups;
+        c.grid = read_size(m, s.x[2]);
+        c.threads = read_size(m, s.x[3]);
+    }, "v@:{MTLSize=QQQ}{MTLSize=QQQ}");
+    compute_method("concurrentDispatchThreads:threadsPerThreadgroup:", [](IndirectComputeCommand& c, CpuState& s, GuestMemory& m) {
+        c.kind = IndirectComputeCommand::Kind::threads;
+        c.grid = read_size(m, s.x[2]);
+        c.threads = read_size(m, s.x[3]);
+    }, "v@:{MTLSize=QQQ}{MTLSize=QQQ}");
+    compute_method("setBarrier", [](IndirectComputeCommand& c, CpuState&, GuestMemory&) { c.barrier = true; }, "v@:");
+    compute_method("clearBarrier", [](IndirectComputeCommand& c, CpuState&, GuestMemory&) { c.barrier = false; }, "v@:");
+    compute_method("reset", [](IndirectComputeCommand& c, CpuState&, GuestMemory&) { c = {}; }, "v@:");
+    compute_method("setStageInRegion:", [](IndirectComputeCommand&, CpuState&, GuestMemory&) {
+        throw std::runtime_error("Alchemy Metal: kernel [[stage_in]] is not translated");
+    }, "v@:{MTLRegion={MTLOrigin=QQQ}{MTLSize=QQQ}}");
+    compute_method("setImageblockWidth:height:", [](IndirectComputeCommand&, CpuState&, GuestMemory&) {
+        throw std::runtime_error("Alchemy Metal: imageblocks are not translated");
+    }, "v@:QQ");
+
+    // Encoders: execute; blit: reset, copy, optimize (applied when encoded).
+    for (const auto encoder : {classes.render_encoder, classes.compute_encoder}) {
+        r.method(encoder, "executeCommandsInBuffer:withRange:", on<EncoderState>("MTLCommandEncoder", [](EncoderState& e, CpuState& s, GuestMemory&) {
+            ensure_active(e);
+            const auto buffer = state<IndirectBufferState>(s.x[2], "MTLIndirectCommandBuffer");
+            e.commands->execute_commands(*buffer->commands, static_cast<std::uint32_t>(s.x[3]), static_cast<std::uint32_t>(s.x[4]));
+        }), false, "v@:@{_NSRange=QQ}");
+        r.method(encoder, "executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:", [](CpuState&, GuestMemory&) {
+            throw std::runtime_error("Alchemy Metal: indirect command ranges read from a GPU buffer are not translated");
+        }, false, "v@:@@Q");
+    }
+    const auto blit = [&r](std::string_view selector, auto function, std::string types) {
+        r.method(classes.blit_encoder, selector, on<EncoderState>("MTLBlitCommandEncoder", [function](EncoderState& e, CpuState& s, GuestMemory& m) {
+            ensure_active(e);
+            function(s, m);
+        }), false, std::move(types));
+    };
+    blit("resetCommandsInBuffer:withRange:", [](CpuState& s, GuestMemory&) {
+        state<IndirectBufferState>(s.x[2], "MTLIndirectCommandBuffer")->commands->reset(static_cast<std::uint32_t>(s.x[3]),
+                                                                                        static_cast<std::uint32_t>(s.x[4]));
+    }, "v@:@{_NSRange=QQ}");
+    blit("copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:", [](CpuState& s, GuestMemory&) {
+        const auto source = state<IndirectBufferState>(s.x[2], "MTLIndirectCommandBuffer");
+        const auto destination = state<IndirectBufferState>(s.x[5], "MTLIndirectCommandBuffer");
+        source->commands->copy_to(*destination->commands, static_cast<std::uint32_t>(s.x[3]), static_cast<std::uint32_t>(s.x[4]),
+                                  static_cast<std::uint32_t>(s.x[6]));
+    }, "v@:@{_NSRange=QQ}@Q");
+    blit("optimizeIndirectCommandBuffer:withRange:", [](CpuState& s, GuestMemory&) {
+        static_cast<void>(state<IndirectBufferState>(s.x[2], "MTLIndirectCommandBuffer"));
+    }, "v@:@{_NSRange=QQ}");
+}
+
 void install_objects(Runtime& r) {
     // Concrete classes: project-authored names, Metal protocols adopted.
     const auto make = [&](std::string_view name, std::initializer_list<std::string_view> protocols) {
@@ -3259,6 +3507,9 @@ void install_objects(Runtime& r) {
     classes.render_reflection = make("AlchemyMTLRenderPipelineReflection", {});
     classes.compute_reflection = make("AlchemyMTLComputePipelineReflection", {});
     classes.log_state = make("AlchemyMTLLogState", {"MTLLogState"});
+    classes.indirect_buffer = make("AlchemyMTLIndirectCommandBuffer", {"MTLIndirectCommandBuffer", "MTLResource", "MTLAllocation"});
+    classes.indirect_render_command = make("AlchemyMTLIndirectRenderCommand", {"MTLIndirectRenderCommand"});
+    classes.indirect_compute_command = make("AlchemyMTLIndirectComputeCommand", {"MTLIndirectComputeCommand"});
     install_counters(r);
     r.method(classes.log_state, "addLogHandler:", [](CpuState& s, GuestMemory&) {
         static_cast<void>(state<LogStateState>(s.x[0], "MTLLogState"));
@@ -3278,6 +3529,7 @@ void install_objects(Runtime& r) {
     install_render_encoder();
     install_compute_encoder();
     install_blit_encoder();
+    install_indirect_command_buffers();
     install_small_objects();
     install_shared_events(r);   // g3: cross-process MTLSharedEvent (shared_events.cpp)
     install_listener_dispatch(r);

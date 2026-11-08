@@ -37,6 +37,7 @@
 #include "alchemy/darwin/metal/pipeline.hpp"
 #include "alchemy/darwin/metal/resources.hpp"
 
+#include <algorithm>
 #include <array>
 #include <condition_variable>
 #include <cstdint>
@@ -140,6 +141,8 @@ struct Scissor { std::uint64_t x{}, y{}, width{}, height{}; };
 enum class Stage : std::uint32_t { vertex = 0, fragment = 1, kernel = 2 };
 enum class EncoderKind : std::uint32_t { none, render, compute, blit };
 
+class IndirectCommandBuffer;
+
 class CommandBuffer : public std::enable_shared_from_this<CommandBuffer> {
 public:
     static std::shared_ptr<CommandBuffer> create(std::shared_ptr<Device> device, bool retained_references = true);
@@ -208,6 +211,10 @@ public:
         std::uint64_t indirect_offset{};
     };
     void draw_patches(const PatchDraw& draw);
+    // executeCommandsInBuffer:withRange: (render or compute encoder): replays
+    // the indirect command buffer's commands [first, first + count) as they are
+    // now (M6), then restores the state they changed.
+    void execute_commands(const IndirectCommandBuffer& commands, std::uint32_t first, std::uint32_t count);
     void memory_barrier(std::uint64_t scope);
 
     // Compute state.
@@ -458,6 +465,64 @@ private:
     std::uint64_t submit_ns_{}, complete_ns_{};
     Times times_{};
     void resolve_times();
+};
+
+// ---- indirect command buffers (M6) ----------------------------------------------------
+// MTLIndirectCommandBuffer contents: commands encoded on the CPU
+// (MTLIndirectRenderCommand / MTLIndirectComputeCommand). An encoder replays
+// them when it executes the buffer, so they are read at encoding time, not
+// when the GPU runs the command buffer. GPU encoding (kernels writing
+// commands) is not translated.
+struct IndirectBinding {
+    std::shared_ptr<Buffer> buffer;
+    std::uint64_t offset{};
+    std::uint64_t stride{~std::uint64_t{0}};   // ...attributeStride: binds
+};
+struct IndirectRenderCommand {
+    enum class Kind : std::uint32_t { none, draw, draw_indexed, draw_patches, draw_indexed_patches };
+    Kind kind{Kind::none};
+    std::shared_ptr<RenderPipeline> pipeline;   // not inherited
+    std::array<IndirectBinding, 31> vertex{}, fragment{};   // not inherited
+    std::uint32_t primitive{}, vertex_start{}, count{}, instance_count{}, base_instance{};   // count: vertices or indices
+    std::uint32_t index_type{};
+    std::shared_ptr<Buffer> index_buffer;
+    std::uint64_t index_offset{};
+    std::int32_t base_vertex{};
+    CommandBuffer::PatchDraw patches;
+    std::shared_ptr<Buffer> factors;
+    std::uint64_t factor_offset{};
+    std::uint32_t factor_stride{};
+};
+struct IndirectComputeCommand {
+    enum class Kind : std::uint32_t { none, threadgroups, threads };
+    Kind kind{Kind::none};
+    std::shared_ptr<ComputePipeline> pipeline;   // not inherited
+    std::array<IndirectBinding, 31> buffers{};   // not inherited
+    std::array<std::uint32_t, 31> threadgroup_memory{};
+    std::array<std::uint32_t, 3> grid{}, threads{};
+    bool barrier{};
+};
+class IndirectCommandBuffer {
+public:
+    // MTLIndirectCommandType bits.
+    static constexpr std::uint32_t render_types = 1 | 2 | 4 | 8, compute_types = 32 | 64;
+    IndirectCommandBuffer(std::uint32_t types, std::uint32_t count, bool inherit_pipeline, bool inherit_buffers)
+        : command_types(types), inherit_pipeline(inherit_pipeline), inherit_buffers(inherit_buffers) {
+        if (types & render_types) render.resize(count);
+        if (types & compute_types) compute.resize(count);
+    }
+    const std::uint32_t command_types;
+    const bool inherit_pipeline, inherit_buffers;
+    mutable std::mutex mutex;
+    std::vector<IndirectRenderCommand> render;
+    std::vector<IndirectComputeCommand> compute;
+    [[nodiscard]] std::uint32_t size() const noexcept {
+        return static_cast<std::uint32_t>(std::max(render.size(), compute.size()));
+    }
+    // resetWithRange: / -[MTLBlitCommandEncoder resetCommandsInBuffer:withRange:].
+    void reset(std::uint32_t first, std::uint32_t count);
+    // -[MTLBlitCommandEncoder copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:].
+    void copy_to(IndirectCommandBuffer& destination, std::uint32_t first, std::uint32_t count, std::uint32_t at) const;
 };
 
 } // namespace alchemy::metal

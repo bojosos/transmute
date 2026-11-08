@@ -1615,8 +1615,119 @@ void CommandBuffer::draw_patches(const PatchDraw& draw) {
     }
 }
 
-void CommandBuffer::memory_barrier(std::uint64_t) {
-    if (encoder_ == EncoderKind::compute) {
+void IndirectCommandBuffer::reset(std::uint32_t first, std::uint32_t count) {
+    std::lock_guard lock(mutex);
+    if (std::uint64_t{first} + count > size()) throw std::runtime_error("Metal indirect command range is outside the buffer");
+    for (std::uint32_t i = first; i < first + count; ++i) {
+        if (i < render.size()) render[i] = {};
+        if (i < compute.size()) compute[i] = {};
+    }
+}
+
+void IndirectCommandBuffer::copy_to(IndirectCommandBuffer& destination, std::uint32_t first, std::uint32_t count,
+                                    std::uint32_t at) const {
+    if (std::uint64_t{first} + count > size() || std::uint64_t{at} + count > destination.size())
+        throw std::runtime_error("Metal indirect command copy range is outside a buffer");
+    if (&destination == this) {
+        std::lock_guard lock(mutex);
+        const auto render_copy = render;
+        const auto compute_copy = compute;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            if (first + i < render_copy.size() && at + i < render.size()) destination.render[at + i] = render_copy[first + i];
+            if (first + i < compute_copy.size() && at + i < compute.size()) destination.compute[at + i] = compute_copy[first + i];
+        }
+        return;
+    }
+    std::scoped_lock lock(mutex, destination.mutex);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (first + i < render.size() && at + i < destination.render.size()) destination.render[at + i] = render[first + i];
+        if (first + i < compute.size() && at + i < destination.compute.size()) destination.compute[at + i] = compute[first + i];
+    }
+}
+
+void CommandBuffer::execute_commands(const IndirectCommandBuffer& commands, std::uint32_t first, std::uint32_t count) {
+    std::lock_guard lock(commands.mutex);
+    const auto bind = [&](Stage stage, std::uint32_t index, const IndirectBinding& binding) {
+        if (!binding.buffer) return;
+        set_buffer(stage, index, binding.buffer, binding.offset);
+        if (binding.stride != ~std::uint64_t{0}) set_attribute_stride(stage, index, binding.stride);
+    };
+    if (encoder_ == EncoderKind::render) {
+        if (std::uint64_t{first} + count > commands.render.size())
+            throw std::runtime_error("executeCommandsInBuffer: the range is outside the render commands");
+        if (foreign_render_) throw std::runtime_error("Alchemy Metal: indirect command buffers with metallib pipelines are not translated");
+        const auto pipeline = render_pipeline_;
+        const auto vertex = render_stages_[0].buffers, fragment = render_stages_[1].buffers;
+        const auto factors = tessellation_factors_;
+        const auto factor_offset = tessellation_factor_offset_;
+        const auto factor_stride = tessellation_instance_stride_;
+        for (std::uint32_t i = first; i < first + count; ++i) {
+            const auto& command = commands.render[i];
+            if (command.kind == IndirectRenderCommand::Kind::none) continue;
+            if (!commands.inherit_pipeline) {
+                if (!command.pipeline) throw std::runtime_error("indirect render command " + std::to_string(i) + " has no pipeline state");
+                set_render_pipeline(command.pipeline);
+            }
+            if (!commands.inherit_buffers) {
+                for (std::uint32_t index = 0; index < 31; ++index) {
+                    bind(Stage::vertex, index, command.vertex[index]);
+                    bind(Stage::fragment, index, command.fragment[index]);
+                }
+            }
+            switch (command.kind) {
+            case IndirectRenderCommand::Kind::draw:
+                draw(command.primitive, command.vertex_start, command.count, command.instance_count, command.base_instance);
+                break;
+            case IndirectRenderCommand::Kind::draw_indexed:
+                draw_indexed(command.primitive, command.count, command.index_type, command.index_buffer, command.index_offset,
+                             command.instance_count, command.base_vertex, command.base_instance);
+                break;
+            default:
+                set_tessellation_factor_buffer(command.factors, command.factor_offset, command.factor_stride);
+                draw_patches(command.patches);
+                break;
+            }
+        }
+        // The encoder's own state applies again after the commands.
+        render_pipeline_ = pipeline;
+        render_stages_[0].buffers = vertex;
+        render_stages_[1].buffers = fragment;
+        render_stages_[0].dirty = render_stages_[1].dirty = true;
+        bound_vertex_buffers_ = {};
+        tessellation_factors_ = factors;
+        tessellation_factor_offset_ = factor_offset;
+        tessellation_instance_stride_ = factor_stride;
+        return;
+    }
+    require(EncoderKind::compute, "executeCommandsInBuffer:withRange:");
+    if (std::uint64_t{first} + count > commands.compute.size())
+        throw std::runtime_error("executeCommandsInBuffer: the range is outside the compute commands");
+    if (foreign_compute_) throw std::runtime_error("Alchemy Metal: indirect command buffers with metallib pipelines are not translated");
+    const auto pipeline = compute_pipeline_;
+    const auto buffers = compute_stage_.buffers;
+    const auto memory = threadgroup_memory_;
+    for (std::uint32_t i = first; i < first + count; ++i) {
+        const auto& command = commands.compute[i];
+        if (command.kind == IndirectComputeCommand::Kind::none) continue;
+        if (command.barrier) memory_barrier(1);
+        if (!commands.inherit_pipeline) {
+            if (!command.pipeline) throw std::runtime_error("indirect compute command " + std::to_string(i) + " has no pipeline state");
+            set_compute_pipeline(command.pipeline);
+        }
+        if (!commands.inherit_buffers)
+            for (std::uint32_t index = 0; index < 31; ++index) bind(Stage::kernel, index, command.buffers[index]);
+        for (std::uint32_t index = 0; index < 31; ++index)
+            if (command.threadgroup_memory[index]) set_threadgroup_memory(index, command.threadgroup_memory[index]);
+        if (command.kind == IndirectComputeCommand::Kind::threads) dispatch_threads(command.grid, command.threads);
+        else dispatch_threadgroups(command.grid, command.threads);
+    }
+    compute_pipeline_ = pipeline;
+    compute_stage_.buffers = buffers;
+    compute_stage_.dirty = true;
+    threadgroup_memory_ = memory;
+}
+
+void CommandBuffer::memory_barrier(std::uint64_t) {    if (encoder_ == EncoderKind::compute) {
         barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
                 VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);

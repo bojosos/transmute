@@ -137,6 +137,20 @@ steps, a `[[patch]]` function without a count that reads control points,
 drawPrimitives with such a pipeline, and tessellation in metallib (AIR)
 pipelines.
 
+**Indirect command buffers (M6):** newIndirectCommandBufferWithDescriptor:
+maxCommandCount:options: makes a render (draw, indexed, patch commands) or
+compute (concurrent dispatch) buffer; mesh commands, and render mixed with
+compute, answer nil. MTLIndirectRenderCommand / MTLIndirectComputeCommand
+encode on the CPU (pipelines and buffers when not inherited, threadgroup
+memory, barriers). executeCommandsInBuffer:withRange: replays the commands
+through the encoder when it is encoded, so the buffer's contents count as of
+that moment (Metal reads them when the GPU runs); the encoder's own pipeline
+and buffers apply again afterwards. The blit encoder's resetCommandsInBuffer:,
+copyIndirectCommandBuffer: and optimizeIndirectCommandBuffer: act when
+encoded. supportIndirectCommandBuffers is YES for native (MSL) pipelines.
+Stops: GPU encoding (an ICB in an argument buffer, MSL command_buffer), ranges
+read from a GPU buffer (executeCommandsInBuffer:indirectBuffer:...), metallib
+pipelines, kernel stage-in regions and imageblocks.
 ## Moved from darwin/identities/
 
 * `stage_input_output_shell.cpp`: the MTLStageInputOutputDescriptor shell (the support kit).

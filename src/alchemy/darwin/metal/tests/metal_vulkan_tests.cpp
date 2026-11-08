@@ -1466,6 +1466,113 @@ fragment float4 color(Out in [[stage_in]]) { return in.color; }
     expect(culled == std::array<std::uint8_t, 4>{0, 0, 255, 255}, "factor 0 culls patch 1: " + format_pixel(culled));
     expect(indexed_patch[0] == 255 && indexed_patch[2] == 0, "patch 2 through the index buffers: " + format_pixel(indexed_patch));
 }
+// Indirect command buffers (M6): CPU-encoded render and compute commands
+// with their own pipelines and buffers, reset and copy, replayed by
+// execute_commands; the encoder's own state applies again afterwards.
+void test_indirect_command_buffers(const std::shared_ptr<metal::Device>& device) {
+    metal::RenderPipelineDescriptor descriptor;
+    descriptor.vertex = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(vertex_function()));
+    descriptor.fragment = std::make_shared<metal::ShaderFunction>(device, std::make_shared<msl::Function>(fragment_function(false)));
+    descriptor.colors[0].pixel_format = metal::pixel_format::rgba8_unorm;
+    descriptor.attributes[0] = metal::VertexAttribute{29, 0, 0};
+    descriptor.layouts[0] = metal::VertexLayout{8, 1, 1};
+    descriptor.label = "indirect commands";
+    const auto pipeline = metal::RenderPipeline::create(device, descriptor);
+    const auto upload = [&](std::initializer_list<float> values) {
+        auto buffer = shared_buffer(device, values.size() * 4);
+        std::memcpy(buffer->contents(), values.begin(), values.size() * 4);
+        return buffer;
+    };
+    const auto top = upload({-1, 1, 1, 1, 0, 0}), left = upload({-1, 1, -1, -1, 0, 0}), bottom = upload({-1, -1, 1, -1, 0, 0});
+    const auto right = upload({1, 1, 1, -1, 0, 0});
+    const auto red = upload({1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1}), green = upload({0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1});
+    const auto white = upload({1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}), tint = upload({1, 1, 1, 1});
+    auto commands_buffer = std::make_shared<metal::IndirectCommandBuffer>(1 | 2, 3, false, false);
+    auto other = std::make_shared<metal::IndirectCommandBuffer>(1 | 2, 1, false, false);
+    const auto encode = [&](metal::IndirectRenderCommand& command, const std::shared_ptr<metal::Buffer>& positions,
+                            const std::shared_ptr<metal::Buffer>& colors) {
+        command.kind = metal::IndirectRenderCommand::Kind::draw;
+        command.pipeline = pipeline;
+        command.vertex[0] = {positions, 0};
+        command.vertex[1] = {colors, 0};
+        command.fragment[0] = {tint, 0};
+        command.primitive = 3;
+        command.count = 3;
+        command.instance_count = 1;
+    };
+    encode(commands_buffer->render[0], top, red);
+    encode(commands_buffer->render[1], left, green);
+    commands_buffer->copy_to(*other, 1, 1, 0);
+    encode(commands_buffer->render[1], right, green);   // then reset: draws nothing
+    commands_buffer->reset(1, 1);
+    metal::RenderPass pass;
+    pass.colors[0].texture = render_target(device);
+    pass.colors[0].load_action = 2;
+    pass.colors[0].store_action = 1;
+    pass.colors[0].clear_color = {0, 0, 0, 1};
+    auto readback = shared_buffer(device, 64 * 256);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_render(pass);
+    commands->set_render_pipeline(pipeline);
+    commands->set_buffer(metal::Stage::vertex, 0, bottom, 0);
+    commands->set_buffer(metal::Stage::vertex, 1, white, 0);
+    commands->set_buffer(metal::Stage::fragment, 0, tint, 0);
+    commands->execute_commands(*commands_buffer, 0, 3);
+    commands->execute_commands(*other, 0, 1);
+    commands->draw(3, 0, 3, 1, 0);   // the encoder's own buffers again
+    commands->end_encoding();
+    commands->begin_blit();
+    commands->copy_texture_to_buffer(pass.colors[0].texture, 0, 0, {0, 0, 0, 64, 64, 1}, readback, 0, 256, 64 * 256);
+    commands->end_encoding();
+
+    // Compute: two dispatches with their own buffers, the second behind a barrier.
+    const auto compiled = msl::compile(R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void fill(device uint* out [[buffer(0)]], constant uint& base [[buffer(1)]], uint id [[thread_position_in_grid]]) {
+    out[id] = base + id;
+}
+)", {});
+    expect(compiled.success(), "indirect compute MSL compiles: " + msl::format_diagnostics(compiled.diagnostics));
+    if (!compiled.success()) return;
+    const auto kernel = metal::ComputePipeline::create(device, std::make_shared<metal::ShaderFunction>(device,
+        std::make_shared<msl::Function>(compiled.functions.at(0))));
+    auto out = shared_buffer(device, 32);
+    const std::uint32_t seven = 7, hundred = 100;
+    auto first_base = shared_buffer(device, 4), second_base = shared_buffer(device, 4);
+    std::memcpy(first_base->contents(), &seven, 4);
+    std::memcpy(second_base->contents(), &hundred, 4);
+    metal::IndirectCommandBuffer dispatches(32 | 64, 2, false, false);
+    auto& first = dispatches.compute[0];
+    first.kind = metal::IndirectComputeCommand::Kind::threads;
+    first.pipeline = kernel;
+    first.buffers[0] = {out, 0};
+    first.buffers[1] = {first_base, 0};
+    first.grid = {4, 1, 1};
+    first.threads = {4, 1, 1};
+    auto& second = dispatches.compute[1];
+    second = first;
+    second.kind = metal::IndirectComputeCommand::Kind::threadgroups;
+    second.buffers[0] = {out, 16};
+    second.buffers[1] = {second_base, 0};
+    second.grid = {1, 1, 1};
+    second.barrier = true;
+    commands->begin_compute(false);
+    commands->execute_commands(dispatches, 0, 2);
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "indirect command buffer completes");
+    const auto at = [&](std::uint32_t x, std::uint32_t y) { return pixel(readback->contents(), 256, x, y); };
+    expect(at(32, 4) == std::array<std::uint8_t, 4>{255, 0, 0, 255}, "command 0 draws red: " + format_pixel(at(32, 4)));
+    expect(at(4, 32) == std::array<std::uint8_t, 4>{0, 255, 0, 255}, "the copied command draws green: " + format_pixel(at(4, 32)));
+    expect(at(32, 60) == std::array<std::uint8_t, 4>{255, 255, 255, 255},
+           "the encoder's own draw after the commands: " + format_pixel(at(32, 60)));
+    expect(at(60, 32) == std::array<std::uint8_t, 4>{0, 0, 0, 255}, "the reset command draws nothing: " + format_pixel(at(60, 32)));
+    const auto* values = reinterpret_cast<const std::uint32_t*>(out->contents());
+    bool filled = true;
+    for (std::uint32_t i = 0; i < 4; ++i) filled &= values[i] == 7 + i && values[4 + i] == 100 + i;
+    expect(filled, "indirect compute commands use their own buffers: " + std::to_string(values[0]) + " " + std::to_string(values[4]));
+}
 void test_linear_texture_over_buffer(const std::shared_ptr<metal::Device>& device) {
     const auto alignment = metal::Texture::linear_alignment(device, metal::pixel_format::rgba8_unorm);
     std::cout << "  linear RGBA8: row pitch alignment " << alignment.row << ", offset alignment " << alignment.offset << "\n";
@@ -1909,6 +2016,7 @@ int main() {
         test_placement_heap(device);
         test_linear_texture_over_buffer(device);
         test_tessellation(device);
+        test_indirect_command_buffers(device);
         test_barycentric_coordinates(device);
         test_bindless_argument_buffers(device);
         test_argument_buffer_samplers(device);
