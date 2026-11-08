@@ -29,7 +29,7 @@ libpthread/join/join	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _p
 libpthread/join/pthread_join_3way	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_create_suspended_np from library ordinal -2
 libpthread/join/pthread_join_stress	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_create_suspended_np from library ordinal -2
 libpthread/main_stack/main_stack	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\main_stack.c:19: setrlimit(3, &lim) != -1 (errno 78: Function not implemented)
-libpthread/main_stack_custom/main_stack_custom	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\main_stack_custom.c:7: (size_t)0x124000 == pthread_get_stacksize_np(pthread_self()) (1196032 vs 1048576)
+libpthread/main_stack_custom/main_stack_custom	PASS	fw-system	
 libpthread/main_stack_legacy/main_stack_legacy	PASS	fw-system	
 libpthread/mutex/mutex	SKIP	fw-system	needs boot-args
 libpthread/mutex/mutex_as_semaphore_lock_owned	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\mutex.c:167: rc == 0 (errno 11: Resource deadlock avoided): recursive lock
@@ -81,8 +81,8 @@ libpthread/stack_aslr/pthread_stack_aslr	BUILD	fw-system	C:\dev\conformance\out\
 libpthread/stack_aslr/wq_stack_aslr	BUILD	fw-system	C:\dev\conformance\out\libpthread\src\stack_aslr.c:137:35: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
 libpthread/stack_size/stack_size_custom	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\stack_size.c:79: pthread_attr_setstackaddr(&attr, (void *)stackaddr) == 0 (errno 45: Operation not supported)
 libpthread/stack_size/stack_size_customaddr	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\stack_size.c:60: pthread_attr_setstackaddr(&attr, (void *)stackaddr) == 0 (errno 45: Operation not supported)
-libpthread/stack_size/stack_size_customsize	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\stack_size.c:17: pthread_get_stacksize_np(pthread_self()) == expected_size (786432 vs 798720): saw expected pthread_get_stacksize_np
-libpthread/stack_size/stack_size_default	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libpthread\src\stack_size.c:17: pthread_get_stacksize_np(pthread_self()) == expected_size (1048576 vs 536576): saw expected pthread_get_stacksize_np
+libpthread/stack_size/stack_size_customsize	PASS	fw-system	
+libpthread/stack_size/stack_size_default	PASS	fw-system	
 libpthread/tsd/cpuid	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_cpu_number_np from library ordinal -2
 libpthread/tsd/tsd	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _pthread_cpu_number_np from library ordinal -2
 libpthread/wq_limits/wq_pool_limits	BUILD	fw-system	C:\dev\conformance\out\libpthread\src\wq_limits.c:3:10: fatal error: 'dispatch/private.h' file not found

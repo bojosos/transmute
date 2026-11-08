@@ -206,7 +206,7 @@ libc_apple/netbsd_fmemopen/netbsd_fmemopen_test14	PASS	fw-system
 libc_apple/netbsd_getcwd/getcwd_err	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\netbsd_getcwd.c:56: (*__error()) == 22 (34 vs 22)
 libc_apple/netbsd_getcwd/getcwd_fts	PASS	fw-system	
 libc_apple/netbsd_getcwd/getcwd_nested	PASS	fw-system	
-libc_apple/netbsd_getenv_thread/putenv_thread	FAIL	fw-system	[PASSED] putenv_thread() completed successfully
+libc_apple/netbsd_getenv_thread/putenv_thread	PASS	fw-system	
 libc_apple/netbsd_getenv_thread/setenv_thread	PASS	fw-system	
 libc_apple/netbsd_getenv_thread/unsetenv_thread	PASS	fw-system	
 libc_apple/netbsd_glob/glob_star_not	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\netbsd_glob.c:208: glob(p, 0x0040 | flags, ((void*)0), &gl) == 0 (errno -4: Unknown error: -4)
