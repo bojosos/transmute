@@ -60,11 +60,13 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -764,10 +766,83 @@ inline bool immutable_format(const transmute::GuestMemory& memory, std::uint64_t
 
 // Parse the guest format and read Apple ARM64 stack slots ourselves. Only local
 // host values enter snprintf; a guest pointer or va_list is never forwarded.
+// POSIX numbered arguments (%n$, *m$; LLVM OpenMP's message catalog uses them): the format with the
+// numbers taken out, and the argument (1-based) each of its reads takes, in order. Every Darwin arm64
+// variadic argument is one 8-byte stack slot, so argument n is the n-th slot. A format whose
+// conversions are not numbered answers nullopt; one that mixes both stops (POSIX leaves it undefined).
+inline std::optional<std::pair<std::string, std::vector<std::size_t>>> numbered_format(std::string_view input) {
+    const auto digit = [&](std::size_t at) { return at < input.size() && input[at] >= '0' && input[at] <= '9'; };
+    // "digits$" at `at`: its number, `at` moved past it; else 0 and `at` unchanged.
+    const auto number = [&](std::size_t& at) -> std::size_t {
+        auto end = at;
+        std::size_t value = 0;
+        while (digit(end)) {
+            value = value * 10 + static_cast<std::size_t>(input[end++] - '0');
+            if (value > 9999) throw std::runtime_error("Darwin printf argument number exceeds limit");
+        }
+        if (end == at || end >= input.size() || input[end] != '$' || value == 0) return 0;
+        at = end + 1;
+        return value;
+    };
+    bool numbered = false;
+    for (std::size_t at = 0; at + 1 < input.size(); ++at) {
+        if (input[at] != '%') continue;
+        if (input[at + 1] == '%') { ++at; continue; }
+        auto position = at + 1;
+        if (number(position)) { numbered = true; break; }
+    }
+    if (!numbered) return std::nullopt;
+    std::string format;
+    std::vector<std::size_t> order;
+    const auto mixed = [] { throw std::runtime_error("Darwin printf mixes numbered and unnumbered arguments"); };
+    for (std::size_t at = 0; at < input.size();) {
+        if (input[at] != '%') { format += input[at++]; continue; }
+        format += input[at++];
+        if (at < input.size() && input[at] == '%') { format += input[at++]; continue; }
+        const auto value = number(at);
+        if (!value) mixed();
+        while (at < input.size() && std::string_view("-+ #0'").find(input[at]) != std::string_view::npos) format += input[at++];
+        if (at < input.size() && input[at] == '*') {
+            format += input[at++];
+            const auto width = number(at);
+            if (!width) mixed();
+            order.push_back(width);
+        } else {
+            while (digit(at)) format += input[at++];
+        }
+        if (at < input.size() && input[at] == '.') {
+            format += input[at++];
+            if (at < input.size() && input[at] == '*') {
+                format += input[at++];
+                const auto precision = number(at);
+                if (!precision) mixed();
+                order.push_back(precision);
+            } else {
+                while (digit(at)) format += input[at++];
+            }
+        }
+        while (at < input.size() && std::string_view("hlqztjL").find(input[at]) != std::string_view::npos) format += input[at++];
+        if (at < input.size()) format += input[at++];
+        order.push_back(value);
+    }
+    return std::pair{std::move(format), std::move(order)};
+}
+
 inline std::string format_text(const transmute::GuestMemory& memory, std::string_view input, std::uint64_t& arguments,
                                transmute::GuestMemory* counts = nullptr) {
     std::string output;
+    const auto numbered = numbered_format(input);
+    if (numbered) input = numbered->first;
+    const auto base = arguments;
+    std::size_t read = 0, highest = 0;
     const auto next = [&]() {
+        if (numbered) {
+            if (read >= numbered->second.size()) throw std::runtime_error("Darwin printf numbered argument missing");
+            const auto index = numbered->second[read++];
+            highest = std::max(highest, index);
+            arguments = add(base, highest * 8);
+            return memory.read64(add(base, (index - 1) * 8));
+        }
         const auto value = memory.read64(arguments);
         arguments = add(arguments, 8);
         return value;

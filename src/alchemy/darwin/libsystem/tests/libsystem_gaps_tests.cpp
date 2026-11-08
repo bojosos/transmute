@@ -1883,6 +1883,16 @@ void test_b33(Fixture& f) {
     require(f.sys("_sbrk", {5 * 1024 * 1024}) == UINT64_MAX && errno_value() == 12, "more than the region is ENOMEM");
     require(f.sys("_sbrk", {0}) == start + 100, "a failed sbrk leaves the break");
     require(f.sys("_brk", {start + 4096}) == UINT64_MAX && errno_value() == 12, "brk is ENOMEM");
+    // POSIX numbered printf arguments (LLVM OpenMP's messages): %n$ and *m$; a literal '$' is text.
+    const auto buffer = f.process.allocate_guest(64), list = f.process.allocate_guest(32);
+    f.engine.write64(list, 7); f.engine.write64(list + 8, f.text("x"));
+    require(f.sys("_vsnprintf", {buffer, 64, f.text("%2$s-%1$d"), list}) == 3 && f.read(buffer) == "x-7", "%2$s-%1$d");
+    f.engine.write64(list, 42); f.engine.write64(list + 8, 5);
+    require(f.sys("_vsnprintf", {buffer, 64, f.text("[%1$*2$d|%1$-*2$d]"), list}) == 13 && f.read(buffer) == "[   42|42   ]", "%1$*2$d");
+    require(f.sys("_vsnprintf", {buffer, 64, f.text("$%d"), list}) == 3 && f.read(buffer) == "$42", "a literal $");
+    bool mixed = false;
+    try { static_cast<void>(f.sys("_vsnprintf", {buffer, 64, f.text("%1$d %d"), list})); } catch (const std::runtime_error&) { mixed = true; }
+    require(mixed, "mixed numbered and unnumbered arguments were accepted");
 }
 
 // /System/Library/Fonts: a read-only view of the host's system fonts (fw-ui's
