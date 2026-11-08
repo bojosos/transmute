@@ -19,6 +19,7 @@
 namespace {
 using Address = std::uint64_t;
 constexpr std::string_view gss = "/System/Library/Frameworks/GSS.framework/Versions/A/GSS";
+constexpr std::string_view kerberos = "/System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos";
 constexpr std::uint32_t gss_s_complete = 0, gss_s_bad_name = 2u << 16, gss_s_no_cred = 7u << 16,
     gss_s_no_context = 8u << 16, gss_s_unavailable = 16u << 16;
 
@@ -44,9 +45,9 @@ struct Fixture {
     ~Fixture() {
         try { process.request_exit(0); threads.join_workers(); } catch (...) {}
     }
-    Address symbol(std::string_view name) {
-        const auto found = process.resolve(gss, name);
-        require(found.has_value(), "missing GSS symbol " + std::string(name));
+    Address symbol(std::string_view name, std::string_view library = gss) {
+        const auto found = process.resolve(library, name);
+        require(found.has_value(), "missing symbol " + std::string(name) + " in " + std::string(library));
         return found->address;
     }
     std::uint32_t call(std::string_view name, std::initializer_list<Address> arguments) {
@@ -81,6 +82,28 @@ void identity_and_oids(Fixture& f) {
     f.engine.read_bytes(f.engine.read64(oid + 8), bytes);
     const std::vector<std::uint8_t> expected{0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x01, 0x04};
     require(bytes == expected, "hostbased service OID 1.2.840.113554.1.2.1.4");
+}
+
+// Kerberos.framework: the identity, the same entry points, and gss_OID variables for the name types.
+void kerberos_names(Fixture& f) {
+    require(alchemy::ProcessContext::is_provider_library(kerberos) && alchemy::darwin_framework_library(kerberos), "the Kerberos identity");
+    for (const auto* name : {"_gss_import_name", "_gss_display_name", "_gss_release_name", "_gss_release_buffer", "_gss_acquire_cred",
+                             "_gss_release_cred", "_gss_init_sec_context", "_gss_delete_sec_context", "_gss_inquire_context",
+                             "_gss_wrap", "_gss_unwrap", "_gss_indicate_mechs", "_gss_display_status"})
+        require(f.symbol(name, kerberos) == f.symbol(name), std::string(name) + " under Kerberos");
+    require(f.engine.read64(f.symbol("_GSS_C_NT_USER_NAME", kerberos)) == f.symbol("___gss_c_nt_user_name_oid_desc") &&
+                f.engine.read64(f.symbol("_GSS_C_NT_HOSTBASED_SERVICE", kerberos)) == f.symbol("___gss_c_nt_hostbased_service_oid_desc") &&
+                f.engine.read64(f.symbol("_GSS_C_NT_EXPORT_NAME", kerberos)) == f.symbol("___gss_c_nt_export_name_oid_desc"),
+            "GSS_C_NT_* point at the descriptors");
+    // As LibreOffice's Negotiate code makes them: a host-based service name, then no ticket.
+    const auto minor = f.block(4), name = f.block(8), cred = f.block(8), context = f.block(8);
+    const auto type = f.engine.read64(f.symbol("_GSS_C_NT_HOSTBASED_SERVICE", kerberos));
+    require(f.call("_gss_import_name", {minor, f.buffer("HTTP@intranet.example"), type, name}) == gss_s_complete, "a service name");
+    require(f.call("_gss_acquire_cred", {minor, 0, 0xffffffff, 0, 1, cred, 0, 0}) == gss_s_unavailable && f.engine.read64(cred) == 0,
+            "no Kerberos credentials");
+    f.engine.write64(context, 0);
+    require(f.call("_gss_delete_sec_context", {minor, context, 0}) == gss_s_no_context, "no context");
+    require(f.call("_gss_release_name", {minor, name}) == gss_s_complete, "gss_release_name");
 }
 
 void names(Fixture& f) {
@@ -155,6 +178,7 @@ int main() {
     try {
         Fixture f;
         identity_and_oids(f);
+        kerberos_names(f);
         names(f);
         mechanisms(f);
     } catch (const std::exception& error) {

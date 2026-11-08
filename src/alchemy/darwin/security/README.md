@@ -1,6 +1,7 @@
 # Security
 
-Security.framework, GSS.framework, CommonCrypto and CryptoKit's host core.
+Security.framework, GSS.framework (also under Kerberos.framework's names),
+CommonCrypto and CryptoKit's host core.
 
 - **Covers:** SecCertificate, SecPolicy and SecTrust over the Windows chain
   engine; SecKey over CNG; SecItem keychain items in a DPAPI-protected file
@@ -12,7 +13,8 @@ Security.framework, GSS.framework, CommonCrypto and CryptoKit's host core.
   recorded with the item and reported, never enforced and never prompting;
   SecureTransport (SSLContext) over SChannel; SecRandomCopyBytes;
   CommonCrypto digests, HMAC, random bytes and CCCryptor; MD4; the GSS-API C
-  bindings; CryptoKit's SHA-2, HMAC, HKDF, ChaCha20-Poly1305 and P-521
+  bindings, under GSS.framework and Kerberos.framework (its MIT-style gss_OID
+  name-type variables); CryptoKit's SHA-2, HMAC, HKDF, ChaCha20-Poly1305 and P-521
   (crypto_core.cpp, behind the CryptoKit Swift overlay).
 - **Host dependencies:** crypt32, ncrypt, secur32 and bcrypt (delay-loaded),
   DPAPI. Phase 2 moves them behind the host `crypto` area.

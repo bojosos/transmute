@@ -7,7 +7,7 @@
 # SecCode / Authorization / SecTransform answers, CommonCrypto digests / HMAC /
 # random bytes / CCCryptor, MD4, and NSError / CFError when no other provider
 # exports them. GSS.framework: the GSS-API C bindings (RFC 2744) without any
-# mechanism. CryptoKit's host core (SHA-2, HMAC, HKDF, ChaCha20-Poly1305,
+# mechanism, also under Kerberos.framework's MIT-style names. CryptoKit's host core (SHA-2, HMAC, HKDF, ChaCha20-Poly1305,
 # P-521) behind the CryptoKit Swift overlay (swift/CryptoKit, built by
 # scripts/build_alchemy_swift.ps1).
 #

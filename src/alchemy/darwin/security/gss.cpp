@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // GSS.framework provider (identity
@@ -33,6 +34,14 @@
 //   - release calls accept the null handles these failures leave behind.
 // Callers (Qt's QAuthenticator) therefore report "Negotiate unavailable" and
 // fall back to other authentication methods, as on a Mac without Kerberos.
+//
+// Kerberos.framework (identity /System/Library/Frameworks/Kerberos.framework/
+// Versions/A/Kerberos) exports the same GSS-API calls under its MIT-style names,
+// which LibreOffice (libmergedlo, its libcurl) binds: the gss_* entry points
+// here, at the same addresses, and the name types as RFC 2744 declares them,
+// gss_OID variables (GSS_C_NT_USER_NAME, GSS_C_NT_HOSTBASED_SERVICE,
+// GSS_C_NT_EXPORT_NAME) pointing at the descriptors above. With no Kerberos
+// ticket or realm, credentials and contexts fail as described.
 namespace alchemy::gui {
 namespace {
 
@@ -40,6 +49,7 @@ using transmute::CpuState;
 using transmute::GuestMemory;
 
 constexpr std::string_view gss_library = "/System/Library/Frameworks/GSS.framework/Versions/A/GSS";
+constexpr std::string_view kerberos_library = "/System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos";
 constexpr std::string_view libsystem = "/usr/lib/libSystem.B.dylib";
 
 // <GSS/gssapi.h>: routine errors are shifted by GSS_C_ROUTINE_ERROR_OFFSET.
@@ -150,11 +160,14 @@ std::string major_text(std::uint32_t status) {
 void install_gss(InstallContext& context) {
     auto& process = context.process;
     ProcessContext::add_provider_library(std::string(gss_library));
+    ProcessContext::add_provider_library(std::string(kerberos_library));
     const auto gss = std::make_shared<Gss>(Gss{process});
+    // Each call under GSS.framework, and the same entry point under Kerberos.framework.
     const auto install = [&process](const char* name, auto handler) {
-        static_cast<void>(process.install_function(name, [handler](CpuState& s, GuestMemory& m) {
+        const auto address = process.install_function(name, [handler](CpuState& s, GuestMemory& m) {
             s.x[0] = handler(s, m);
-        }, std::string(gss_library)));
+        }, std::string(gss_library));
+        process.install_export(std::string(kerberos_library), name, {address, ExportKind::function});
     };
     // Exported OID descriptors (gss_OID_desc + elements), RFC 2743/4121/4178.
     const auto oid = [&process](const char* name, std::initializer_list<std::uint8_t> elements) {
@@ -165,10 +178,18 @@ void install_gss(InstallContext& context) {
         engine.write64(block + 8, block + 16);
         engine.write_bytes(block + 16, std::vector<std::uint8_t>(elements));
         process.install_export(std::string(gss_library), name, {block, ExportKind::data});
+        return block;
     };
-    oid("___gss_c_nt_hostbased_service_oid_desc", {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x01, 0x04});
-    oid("___gss_c_nt_user_name_oid_desc", {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x01, 0x01});
-    oid("___gss_c_nt_export_name_oid_desc", {0x2b, 0x06, 0x01, 0x05, 0x06, 0x04});
+    const auto hostbased_service = oid("___gss_c_nt_hostbased_service_oid_desc", {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x01, 0x04});
+    const auto user_name = oid("___gss_c_nt_user_name_oid_desc", {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x01, 0x01});
+    const auto export_name = oid("___gss_c_nt_export_name_oid_desc", {0x2b, 0x06, 0x01, 0x05, 0x06, 0x04});
+    // Kerberos.framework: RFC 2744's "extern gss_OID GSS_C_NT_..." variables, each holding a descriptor's address.
+    for (const auto& [name, descriptor] : std::initializer_list<std::pair<const char*, std::uint64_t>>{
+             {"_GSS_C_NT_USER_NAME", user_name}, {"_GSS_C_NT_HOSTBASED_SERVICE", hostbased_service}, {"_GSS_C_NT_EXPORT_NAME", export_name}}) {
+        const auto cell = process.allocate_guest(8, 8);
+        process.main_engine().write64(cell, descriptor);
+        process.install_export(std::string(kerberos_library), name, {cell, ExportKind::data});
+    }
     oid("___gss_krb5_mechanism_oid_desc", {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02});
     oid("___gss_spnego_mechanism_oid_desc", {0x2b, 0x06, 0x01, 0x05, 0x05, 0x02});
     oid("___gss_ntlm_mechanism_oid_desc", {0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a});
