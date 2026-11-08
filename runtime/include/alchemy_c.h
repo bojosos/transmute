@@ -189,6 +189,8 @@ int sched_yield(void);
 int close(int);
 int dup(int);
 int dup2(int, int);
+int pipe(int[2]);
+int gethostname(char*, size_t);
 pid_t getpid(void);
 pid_t getppid(void);
 uid_t getuid(void);

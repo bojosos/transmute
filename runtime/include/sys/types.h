@@ -1,4 +1,5 @@
 #include "../alchemy_c.h"
+#include "_types/_fd_def.h"
 typedef int dev_t;
 typedef unsigned long long ino_t;
 typedef unsigned short nlink_t;
