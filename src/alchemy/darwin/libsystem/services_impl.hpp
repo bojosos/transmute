@@ -1277,6 +1277,8 @@ struct StreamBackend {
 } // namespace services_detail
 using namespace services_detail;
 void remove_unix_socket_file(const std::filesystem::path& host);   // net/sockets.cpp
+// Whether a host file of `size` bytes is a bound AF_UNIX socket's path (net/sockets.cpp).
+bool unix_socket_path(const std::filesystem::path& host, std::uint64_t size);
 
 class DarwinServices::Impl {
 public:
@@ -2722,7 +2724,10 @@ public:
         memory.write64(result + 96, details.size);
         memory.write64(result + 104, (details.allocated + 511) / 512);
         memory.write32(result + 112, 4096);
-        const auto mode = static_cast<std::uint16_t>(permissions | (details.directory ? 0040000 : 0100000));
+        // An AF_UNIX socket's path, bound now or left by a process that ended, is a socket (S_IFSOCK),
+        // as on Darwin: programs unlink a stale one before binding again (LibreOffice's single-instance pipe).
+        const bool socket = by_path && !details.directory && unix_socket_path(host, details.size);
+        const auto mode = static_cast<std::uint16_t>(permissions | (details.directory ? 0040000 : socket ? 0140000 : 0100000));
         memory.write8(result + 4, static_cast<std::uint8_t>(mode)); memory.write8(result + 5, static_cast<std::uint8_t>(mode >> 8));
         return 0;
     }

@@ -354,6 +354,10 @@ DarwinServices::Impl::UnixAddress DarwinServices::Impl::unix_address(const trans
     return result;
 }
 
+bool unix_socket_path(const std::filesystem::path& host, std::uint64_t size) {
+    return size == unix_placeholder_marker.size() && is_unix_placeholder(host);
+}
+
 // unlink(2) of an AF_UNIX placeholder also removes its socket file.
 void remove_unix_socket_file(const std::filesystem::path& host) {
     if (!is_unix_placeholder(host)) return;

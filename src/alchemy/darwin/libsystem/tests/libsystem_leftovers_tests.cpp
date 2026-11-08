@@ -613,6 +613,21 @@ void unix_sockets(Fixture& f) {
     require(result(third) >= 0, "accept the nonblocking client");
     for (const auto descriptor : {later, third, client, accepted, server, queue}) f.call(sys, "_close", {descriptor});
 
+    // A stale socket path (its socket closed, as when a process ends) is still a socket: stat says S_IFSOCK,
+    // connect is refused, and after unlink the path binds again (LibreOffice's single-instance pipe).
+    const auto status = f.block(144);
+    require(f.call(sys, "_stat", {f.text(path), status}) == 0 && (f.engine.read32(status + 4) & 0170000) == 0140000,
+            "a socket path is not S_IFSOCK");
+    require(f.call(sys, "_lstat", {f.text(path), status}) == 0 && (f.engine.read32(status + 4) & 0170000) == 0140000,
+            "lstat of a socket path is not S_IFSOCK");
+    const auto stale = f.call(sys, "_socket", {1, 1, 0});
+    require(result(f.call(sys, "_connect", {stale, address, 106})) == -1 && guest_errno(f) == 61, "connect to a stale socket: ECONNREFUSED");
+    f.call(sys, "_close", {stale});
+    require(f.call(sys, "_unlink", {f.text(path)}) == 0, "unlink of a stale socket path");
+    const auto again = f.call(sys, "_socket", {1, 1, 0});
+    require(f.call(sys, "_bind", {again, address, 106}) == 0, "bind after the stale path went");
+    f.call(sys, "_close", {again});
+
     // The socket file stays until unlink, as on Darwin; then connect fails with ENOENT.
     require(f.call(sys, "_unlink", {f.text(path)}) == 0, "unlink of the socket file");
     const auto orphan = f.call(sys, "_socket", {1, 1, 0});
