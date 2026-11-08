@@ -40,6 +40,8 @@ void install_vt_decompression(InstallContext& context);
 void install_vt_compression(InstallContext& context);
 void install_audio(InstallContext& context);
 void install_media_accessibility(InstallContext& context);
+// opencl.cpp: OpenCL.framework with no platform (every call answers OpenCL's own error for it).
+void install_opencl(InstallContext& context);
 void install_image_capture(InstallContext& context);
 
 // H.264 sequence parameter set (RBSP with emulation-prevention bytes): the

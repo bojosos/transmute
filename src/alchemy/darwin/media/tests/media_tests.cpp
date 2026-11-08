@@ -206,6 +206,26 @@ void video(Fixture& f) {
     require(f.string_constant(av, "_AVMediaTypeVideo") == "vide", "AVMediaTypeVideo");
     for (const auto* type : {"AVCaptureDeviceTypeExternal", "AVCaptureDeviceTypeContinuityCamera", "AVCaptureDeviceTypeMicrophone"})
         require(f.string_constant(av, std::string("_") + type) == type, std::string("macOS 14 capture device type ") + type);
+    // OpenCL: no platform, so every call answers OpenCL's own error for it (cl.h, cl_ext.h).
+    {
+        const auto cl = "/System/Library/Frameworks/OpenCL.framework/Versions/A/OpenCL";
+        const auto count = f.block(8, 0xff), errcode = f.block(8);
+        require(f.status(cl, "_clGetPlatformIDs", {0, 0, count}) == -1001 && f.engine.read32(count) == 0, "no OpenCL platform (CL_PLATFORM_NOT_FOUND_KHR)");
+        require(f.status(cl, "_clGetPlatformIDs", {0, 0, 0}) == -30, "CL_INVALID_VALUE without anywhere to answer");
+        f.engine.write32(count, 7);
+        require(f.status(cl, "_clGetDeviceIDs", {0, 0xffffffff, 0, 0, count}) == -32 && f.engine.read32(count) == 0, "no devices: CL_INVALID_PLATFORM");
+        require(f.call(cl, "_clCreateContextFromType", {0, 0xffffffff, 0, 0, errcode}) == 0 && static_cast<std::int32_t>(f.engine.read32(errcode)) == -32,
+                "no context");
+        require(f.call(cl, "_clCreateBuffer", {0, 1, 64, 0, errcode}) == 0 && static_cast<std::int32_t>(f.engine.read32(errcode)) == -34, "no buffer");
+        alchemy::CallRegs image{};
+        image.x[3] = 4; image.x[4] = 4; image.x[5] = 4;
+        image.push_stack(Address{0});
+        image.push_stack(errcode);
+        f.engine.write32(errcode, 0);
+        require(f.regs(cl, "_clCreateImage3D", image).x0 == 0 && static_cast<std::int32_t>(f.engine.read32(errcode)) == -34, "errcode_ret on the stack");
+        require(f.status(cl, "_clFinish", {0}) == -36 && f.status(cl, "_clReleaseKernel", {0}) == -48 && f.status(cl, "_clWaitForEvents", {0, 0}) == -30,
+                "calls on objects that cannot exist");
+    }
     // Screen capture through AVFoundation is not available: no screen input is made.
     require(f.send(f.send(f.cls("AVCaptureScreenInput"), "alloc"), "initWithDisplayID:", {1}) == 0, "no AVCaptureScreenInput");
     const auto device = f.cls("AVCaptureDevice");

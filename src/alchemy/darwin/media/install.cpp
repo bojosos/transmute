@@ -14,6 +14,7 @@ void install_media(InstallContext& context) {
     install_core_video_gaps(context);
     install_audio(context);
     install_media_accessibility(context);
+    install_opencl(context);
     install_image_capture(context);
 }
 
