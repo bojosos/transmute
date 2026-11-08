@@ -523,6 +523,8 @@ void PrintCore::install() {
         s.x[0] = ret(pm_no_default_printer);
     });
     function(application_services, "_PMSessionSetCurrentPMPrinter", [this](CpuState& s, GuestMemory&) { s.x[0] = ret(pm_invalid_printer); });
+    // There are no printers to print a file with.
+    function(application_services, "_PMPrinterPrintWithFile", [this](CpuState& s, GuestMemory&) { s.x[0] = ret(pm_invalid_printer); });
     // PMSessionSetDestination(session, settings, type, format, location)
     function(application_services, "_PMSessionSetDestination", [this, session_ok](CpuState& s, GuestMemory&) {
         const auto type = static_cast<std::uint32_t>(s.x[2]);

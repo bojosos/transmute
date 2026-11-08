@@ -426,9 +426,11 @@ void install_c_functions(AppKit& kit) {
         });
     // (title, default, alternate, other, docWindow, modalDelegate, didEndSelector,
     // didDismissSelector, contextInfo (stack), msgFormat (stack), ...)
-    both("_NSBeginAlertSheet", [k, message_of, legacy_alert](CpuState& s, GuestMemory& m) {
+    for (const auto& [sheet_name, sheet_style] : std::initializer_list<std::pair<const char*, std::uint64_t>>{
+             {"_NSBeginAlertSheet", 1}, {"_NSBeginInformationalAlertSheet", 1}, {"_NSBeginCriticalAlertSheet", 2}})
+    both(sheet_name, [k, message_of, legacy_alert, style = sheet_style](CpuState& s, GuestMemory& m) {
         const auto context_info = m.read64(s.sp), format = m.read64(s.sp + 8);
-        const auto alert = legacy_alert(s.x[0], message_of(format, s.sp + 16), s.x[1], s.x[2], s.x[3], 1);
+        const auto alert = legacy_alert(s.x[0], message_of(format, s.sp + 16), s.x[1], s.x[2], s.x[3], style);
         if (!s.x[4]) {
             static_cast<void>(k->send(alert, "runModal"));
             return;

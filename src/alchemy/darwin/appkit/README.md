@@ -339,6 +339,22 @@ magnification 1; another magnification stops explicitly).
 NSUserDefaultsController applies changes immediately even when a nib says
 NSAppliesImmediately NO (deferred application is not modelled).
 
+**The media apps' names (VLC, mpv, OBS, Firefox; Krita):**
+* NSBeginInformationalAlertSheet and NSBeginCriticalAlertSheet run like
+  NSBeginAlertSheet, with their alert styles.
+* NSApplicationLoad makes the shared application.
+* NSAppKitVersionNumber is 2487, the macOS 14 value (unverified).
+* The constants' values follow Apple's naming, unverified, except the About
+  panel option keys: they are the keys the About panel reads.
+* NSSharingServicePickerTouchBarItem only keeps its settings: no Touch Bar is
+  shown.
+* Carbon:
+  * GetCurrentEventKeyModifiers is GetCurrentKeyModifiers;
+  * TISCopyInputSourceForLanguage answers the keyboard source when its
+    language matches;
+  * there is no active TSM document.
+* GetNextProcess finds only the current process.
+
 **LibreOffice's VCL plug-in (`libvclplug_osxlo.dylib`):**
 * CoreUI.framework is an identity without symbols: the plug-in links it but
   imports nothing from it.

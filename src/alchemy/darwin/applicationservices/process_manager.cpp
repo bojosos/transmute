@@ -54,6 +54,15 @@ public:
         // The guest is the only Mac process: the front process is the current
         // one while its application is active; otherwise another (host) program
         // is in front and there is no Mac process to name (procNotFound, kNoProcess).
+        // GetNextProcess walks the processes from kNoProcess: the current one is
+        // the only Mac process, after it procNotFound (and kNoProcess).
+        function(application_services, "_GetNextProcess", [](CpuState& s, GuestMemory& m) {
+            if (!s.x[0]) { s.x[0] = static_cast<std::uint16_t>(param_err); return; }
+            const auto high = m.read32(s.x[0]), low = m.read32(s.x[0] + 4);
+            if (high == 0 && low == 0) { m.write32(s.x[0] + 4, current_process); s.x[0] = 0; return; }
+            if (high == 0 && low == current_process) { m.write32(s.x[0] + 4, 0); s.x[0] = static_cast<std::uint16_t>(proc_not_found); return; }
+            s.x[0] = static_cast<std::uint16_t>(param_err);
+        });
         function(application_services, "_GetFrontProcess", [this](CpuState& s, GuestMemory& m) {
             if (!s.x[0]) { s.x[0] = static_cast<std::uint16_t>(param_err); return; }
             const auto app = application();

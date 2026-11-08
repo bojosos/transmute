@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -435,6 +436,40 @@ void GraphicsGaps::install_core_graphics() {
         if (s.x[2]) m.write64(s.x[2], 0);
         s.x[0] = 0;
     });
+    constant(core_graphics, "_CGDisplayStreamCreateWithDispatchQueue", 0);
+    constant(core_graphics, "_CGDisplayStreamUpdateGetDropCount", 0);
+    // Listening to other applications' input (input monitoring) is not available.
+    constant(core_graphics, "_CGPreflightListenEventAccess", 0);
+    constant(core_graphics, "_CGRequestListenEventAccess", 0);
+    // Display fades: there is no fade reservation to hand out (the display is
+    // the window server's; the host's screen is never faded), so every token
+    // is invalid.
+    constexpr std::int32_t cg_cannot_complete = 1004, cg_none_available = 1011;
+    raw(core_graphics, "_CGAcquireDisplayFadeReservation", [](CpuState& s, GuestMemory& m) {
+        if (s.x[0]) m.write32(s.x[0], 0);   // (seconds in s0, token*)
+        s.x[0] = status(cg_none_available);
+    });
+    for (const auto* name : {"_CGDisplayFade", "_CGReleaseDisplayFadeReservation"})
+        raw(core_graphics, name, [](CpuState& s, GuestMemory&) { s.x[0] = status(cg_illegal_argument); });
+    constant(core_graphics, "_CGDisplayUsesOpenGLAcceleration", 1);   // the GPU presents the display
+    // Gamma: the display has no adjustable transfer table; it reads as the
+    // identity and cannot be changed.
+    raw(core_graphics, "_CGGetDisplayTransferByTable", [](CpuState& s, GuestMemory& m) {
+        // (display, capacity, red*, green*, blue*, sampleCount*)
+        const auto count = static_cast<std::uint32_t>(std::min<std::uint64_t>(static_cast<std::uint32_t>(s.x[1]), 256));
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto value = std::bit_cast<std::uint32_t>(count > 1 ? static_cast<float>(i) / static_cast<float>(count - 1) : 1.0f);
+            for (const auto table : {s.x[2], s.x[3], s.x[4]}) if (table) m.write32(table + i * 4, value);
+        }
+        if (s.x[5]) m.write32(s.x[5], count);
+        s.x[0] = 0;
+    });
+    raw(core_graphics, "_CGSetDisplayTransferByTable", [](CpuState& s, GuestMemory&) { s.x[0] = status(cg_cannot_complete); });
+    // The shielding window's level: the maximum window level (unverified).
+    constant(core_graphics, "_CGShieldingWindowLevel", static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max() - 16));
+    // Font variations are not modelled (CTFontCopyVariationAxes answers NULL too): no axes, no variations, no variant copies.
+    for (const auto* name : {"_CGFontCopyVariationAxes", "_CGFontCopyVariations", "_CGFontCreateCopyWithVariations"})
+        constant(core_graphics, name, 0);
     // CGWindowLevel CGWindowLevelForKey(CGWindowLevelKey): CGWindowLevel.h's
     // levels, which AppKit's NS*WindowLevel values equal (normal 0, floating 3,
     // modal panel 8, main menu 24, status 25, pop-up menu 101, screen saver
@@ -460,7 +495,9 @@ void GraphicsGaps::install_core_graphics() {
     for (const auto* name : {"kCGDisplayStreamColorSpace", "kCGDisplayStreamDestinationRect", "kCGDisplayStreamMinimumFrameTime",
                              "kCGDisplayStreamPreserveAspectRatio", "kCGDisplayStreamShowCursor", "kCGWindowBounds",
                              "kCGWindowIsOnscreen", "kCGWindowLayer", "kCGWindowName", "kCGWindowNumber", "kCGWindowOwnerName",
-                             "kCGWindowOwnerPID", "kCGColorSpaceITUR_2100_HLG", "kCGColorSpaceITUR_2100_PQ"})
+                             "kCGWindowOwnerPID", "kCGColorSpaceITUR_2100_HLG", "kCGColorSpaceITUR_2100_PQ",
+                             "kCGDisplayStreamSourceRect", "kCGDisplayStreamQueueDepth", "kCGDisplayShowDuplicateLowResolutionModes",
+                             "kCGFontVariationAxisName", "kCGColorSpaceDisplayP3_PQ", "kCGColorSpaceDisplayP3_HLG"})
         string(core_graphics, "_" + std::string(name), name);
 }
 
@@ -674,7 +711,10 @@ void GraphicsGaps::install_core_text() {
     });
     // CTFontCopyAvailableTables(font, options): the tags CTFontCopyTable finds
     // (an array of CTFontTableTag values, not CF objects).
-    raw(core_text, "_CTFontCopyAvailableTables", [this](CpuState& s, GuestMemory& m) {
+    // The tables a font has, by probing the known tags with `copy` (an array of
+    // table tag values, not CF objects): CTFontCopyAvailableTables(font,
+    // options) and CGFontCopyTableTags(font).
+    const auto table_tags = [this](CpuState& s, GuestMemory& m, std::string_view library, const char* copy, bool options) {
         static constexpr std::array<const char*, 64> tags{
             "BASE", "CBDT", "CBLC", "CFF ", "CFF2", "COLR", "CPAL", "DSIG", "EBDT", "EBLC", "EBSC", "GDEF", "GPOS", "GSUB",
             "HVAR", "JSTF", "LTSH", "MATH", "MERG", "MVAR", "OS/2", "PCLT", "STAT", "SVG ", "VDMX", "VORG", "VVAR", "ankr",
@@ -686,13 +726,21 @@ void GraphicsGaps::install_core_text() {
             const auto code = (static_cast<std::uint32_t>(static_cast<unsigned char>(tag[0])) << 24) |
                 (static_cast<std::uint32_t>(static_cast<unsigned char>(tag[1])) << 16) |
                 (static_cast<std::uint32_t>(static_cast<unsigned char>(tag[2])) << 8) | static_cast<unsigned char>(tag[3]);
-            const auto table = call(core_text, "_CTFontCopyTable", {s.x[0], code, 0});
+            const auto table = options ? call(library, copy, {s.x[0], code, 0}) : call(library, copy, {s.x[0], code});
             if (table) { found.push_back(code); release(table); }
         }
         const auto values = process.allocate_guest(std::max<std::size_t>(found.size(), 1) * 8);
         for (std::size_t index = 0; index < found.size(); ++index) m.write64(values + index * 8, found[index]);
         s.x[0] = call(core_foundation, "_CFArrayCreate", {0, values, found.size(), 0});
         process.release_guest(values);
+    };
+    raw(core_graphics, "_CGFontCopyTableTags", [table_tags](CpuState& s, GuestMemory& m) {
+        table_tags(s, m, core_graphics, "_CGFontCopyTableForTag", false);
+    });
+    // CTFontCopyFeatures: the fonts' 'feat' feature descriptions are not read, so none are listed.
+    constant(core_text, "_CTFontCopyFeatures", 0);
+    raw(core_text, "_CTFontCopyAvailableTables", [table_tags](CpuState& s, GuestMemory& m) {
+        table_tags(s, m, core_text, "_CTFontCopyTable", true);
     });
     // CTFontCopyCharacterSet(font): the BMP characters the font maps to glyphs.
     raw(core_text, "_CTFontCopyCharacterSet", [this](CpuState& s, GuestMemory& m) {

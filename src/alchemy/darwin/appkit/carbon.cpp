@@ -69,7 +69,7 @@ void AppKit::install_carbon() {
     for (const auto* key : {"TISPropertyInputSourceID", "TISPropertyLocalizedName", "TISPropertyInputSourceLanguages",
              "TISPropertyInputSourceType", "TISPropertyInputSourceCategory", "TISPropertyInputSourceIsEnabled",
              "TISPropertyInputSourceIsSelected", "TISPropertyInputSourceIsSelectCapable", "TISTypeKeyboardLayout",
-             "TISTypeKeyboardInputMode", "TISCategoryKeyboardInputSource"})
+             "TISTypeKeyboardInputMode", "TISCategoryKeyboardInputSource", "TISPropertyBundleID"})
         carbon_string(carbon_library, "_k" + std::string(key), key);
     // The distributed notification sent when the keyboard input source changes
     // (never posted: the window server's layout is fixed for the process).
@@ -92,6 +92,21 @@ void AppKit::install_carbon() {
              "_TISCopyCurrentASCIICapableKeyboardLayoutInputSource", "_TISCopyCurrentASCIICapableKeyboardInputSource"})
         function(carbon_library, name, copy_source);
     function(carbon_library, "_TISCopyInputMethodKeyboardLayoutOverride", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+    // TISCopyInputSourceForLanguage: the keyboard input source (the window
+    // server's layout, the only one) when its language is the one asked for.
+    function(carbon_library, "_TISCopyInputSourceForLanguage", [this, copy_source](CpuState& s, GuestMemory& m) {
+        const auto server = window_server_or_null();
+        const auto wanted = s.x[0] ? cf.utf8(s.x[0]) : std::string();
+        const auto have = server ? server->keyboard_layout().language : std::string();
+        if (wanted.empty() || have.empty() || (have != wanted && !have.starts_with(wanted + "-") && !wanted.starts_with(have + "-"))) {
+            s.x[0] = 0;
+            return;
+        }
+        copy_source(s, m);
+    });
+    // TSMGetActiveDocument: no Text Services Manager document is active (text
+    // input goes through NSTextInputContext).
+    function(carbon_library, "_TSMGetActiveDocument", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     function(carbon_library, "_TISGetInputSourceProperty", [this](CpuState& s, GuestMemory& m) {
         // "Get" rule: the values belong to the input source.
         const auto source = s.x[0], key = s.x[1];

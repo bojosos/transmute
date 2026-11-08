@@ -35,6 +35,19 @@ releasing succeeds.
 
 **Unsupported:** JPEG 2000 images (ImageIO reports them as undecodable).
 
+**Fades, gamma, input monitoring (the media apps):**
+* There is no display fade reservation: CGAcquireDisplayFadeReservation
+  answers kCGErrorNoneAvailable, so every token is invalid.
+* CGGetDisplayTransferByTable reads an identity table, and
+  CGSetDisplayTransferByTable cannot complete: the host's gamma is never
+  changed.
+* Listening to other applications' input is not granted.
+* CGDisplayStream* create nothing.
+* Font variations are not modelled (no axes; NULL variant copies).
+* CGFontCopyTableTags probes the known table tags.
+* kCGColorSpaceDisplayP3_PQ / _HLG are names only: their transfer curves are
+  not modelled, so creating them answers NULL.
+
 **Display modes:** each display reports one mode, its current one (the host
 gives no mode list); `CGDisplaySetDisplayMode` accepts only that mode.
 `CGDisplayPixelsWide`/`High` answer the screen's pixel size; macOS answers

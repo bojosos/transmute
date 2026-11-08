@@ -17,6 +17,8 @@ public:
     void install() {
         // ColorSync: no display device is registered.
         function(color_sync, "_CGDisplayCreateUUIDFromDisplayID", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
+        // No display has a UUID, so none is found from one (kCGNullDirectDisplay).
+        function(color_sync, "_CGDisplayGetDisplayIDFromUUID", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
         function(color_sync, "_ColorSyncDeviceCopyDeviceInfo", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
         constexpr std::pair<std::string_view, std::string_view> sync[] = {
             {"_kColorSyncDisplayDeviceClass", "mntr"}, {"_kColorSyncDeviceDefaultProfileID", "DeviceDefaultProfileID"},

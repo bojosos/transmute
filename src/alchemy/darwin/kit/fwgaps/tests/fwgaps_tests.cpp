@@ -173,7 +173,38 @@ void libreoffice(Fixture& f) {
             "NSEPSImageRep interprets no EPS");
 }
 
+// The media apps' names (VLC, mpv, OBS, Firefox, HandBrake; Krita): what each answers.
+void media(Fixture& f) {
+    require(f.string_constant(appkit, "_NSWorkspaceApplicationKey") == "NSWorkspaceApplicationKey" &&
+                f.string_constant(appkit, "_NSAccessibilityZoomButtonAttribute") == "AXZoomButton" &&
+                f.string_constant(appkit, "_NSImageNameTouchBarPlayTemplate") == "NSTouchBarPlayTemplate" &&
+                f.string_constant(appkit, "_NSAboutPanelOptionApplicationName") == "ApplicationName",
+            "AppKit names");
+    require(std::bit_cast<double>(f.engine.read64(f.symbol(appkit, "_NSAppKitVersionNumber"))) == 2487.0, "NSAppKitVersionNumber");
+    require(f.call(appkit, "_NSApplicationLoad") == 1, "NSApplicationLoad");
+    // Process Manager: the current process, then none.
+    const auto psn = f.block(8);
+    require(f.call(as, "_GetNextProcess", {psn}) == 0 && f.engine.read32(psn + 4) == 2, "GetNextProcess: the current process");
+    require(static_cast<std::int16_t>(f.call(as, "_GetNextProcess", {psn})) == -600, "GetNextProcess: then procNotFound");
+    // CoreGraphics: no fade reservation, an identity gamma table, no input monitoring, no display stream.
+    const auto token = f.block(4);
+    require(static_cast<std::int32_t>(f.call(cg, "_CGAcquireDisplayFadeReservation", {token})) == 1011, "no fade reservation");
+    const auto red = f.block(256 * 4), green = f.block(256 * 4), blue = f.block(256 * 4), samples = f.block(4);
+    require(f.call(cg, "_CGGetDisplayTransferByTable", {1, 256, red, green, blue, samples}) == 0 && f.engine.read32(samples) == 256 &&
+                read_float(f, red, 0) == 0.0f && read_float(f, blue, 255) == 1.0f,
+            "an identity transfer table");
+    require(f.call(cg, "_CGPreflightListenEventAccess") == 0 && f.call(cg, "_CGDisplayStreamCreateWithDispatchQueue") == 0,
+            "no input monitoring, no display stream");
+    // CGFontCopyTableTags lists the font's tables (cmap among them).
+    const auto font = f.call(cg, "_CGFontCreateWithFontName", {string(f, "Arial")});
+    const auto tags = f.call(cg, "_CGFontCopyTableTags", {font});
+    bool cmap = false;
+    for (std::uint64_t i = 0; i < f.call(cf, "_CFArrayGetCount", {tags}); ++i) cmap = cmap || f.call(cf, "_CFArrayGetValueAtIndex", {tags, i}) == 0x636d6170;
+    require(cmap, "CGFontCopyTableTags lists cmap");
+    require(f.call(cg, "_CGFontCopyVariationAxes", {font}) == 0, "font variations are not modelled");
+}
+
 int main() {
     return run("fwgaps", {{"imports", imports}, {"appkit", appkit_gaps}, {"graphics", graphics}, {"core text", core_text},
-                          {"core text keys", core_text_keys}, {"libreoffice", libreoffice}});
+                          {"core text keys", core_text_keys}, {"libreoffice", libreoffice}, {"media", media}});
 }

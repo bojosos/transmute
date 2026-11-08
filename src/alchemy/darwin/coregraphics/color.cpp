@@ -37,6 +37,7 @@ constexpr NamedSpace named_spaces[] = {
     {"kCGColorSpaceAdobeRGB1998", ColorModel::rgb, false, false, true},
     {"kCGColorSpaceITUR_709", ColorModel::rgb, false, false, false},
     {"kCGColorSpaceITUR_2020", ColorModel::rgb, false, false, true},
+    {"kCGColorSpaceLinearITUR_2020", ColorModel::rgb, true, false, true},
     {"kCGColorSpaceROMMRGB", ColorModel::rgb, false, false, true},
     {"kCGColorSpaceACESCGLinear", ColorModel::rgb, true, false, true},
     {"kCGColorSpaceGenericGray", ColorModel::monochrome, false, false, false},

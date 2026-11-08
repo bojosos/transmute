@@ -573,7 +573,9 @@ void install_hitoolbox(AppKit& kit) {
 
     // ---- Carbon event state ----
     // EventModifiers from the window server's NSEventModifierFlags.
-    kit.function(carbon_library, "_GetCurrentKeyModifiers", [](CpuState& s, GuestMemory&) {
+    // GetCurrentEventKeyModifiers: the same state (there is no separate event-queue view of it).
+    for (const auto* modifiers_name : {"_GetCurrentKeyModifiers", "_GetCurrentEventKeyModifiers"})
+    kit.function(carbon_library, modifiers_name, [](CpuState& s, GuestMemory&) {
         const auto server = window_server_or_null();
         const auto flags = server ? server->modifier_flags() : 0;
         std::uint32_t carbon{};

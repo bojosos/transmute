@@ -135,6 +135,36 @@ void Provider::install_appkit() {
                              "NSTouchBarItemIdentifierFlexibleSpace", "NSTouchBarItemIdentifierFixedSpaceSmall",
                              "NSTouchBarItemIdentifierFixedSpaceLarge", "NSTouchBarItemIdentifierOtherItemsProxy"})
         string(appkit, std::string("_") + name, name);
+    // The media apps' names (VLC, mpv, OBS, Firefox; Krita). Values follow
+    // Apple's naming (unverified) unless noted; the About panel options are the
+    // keys -orderFrontStandardAboutPanelWithOptions: reads (application.cpp).
+    for (const auto* name : {"NSWorkspaceApplicationKey", "NSWorkspaceWillSleepNotification",
+                             "NSWorkspaceDidTerminateApplicationNotification", "NSWindowDidChangeScreenProfileNotification"})
+        string(appkit, std::string("_") + name, name);
+    for (const auto* name : {"_NSAccessibilityCloseButtonAttribute", "_NSAccessibilityFullScreenButtonAttribute",
+                             "_NSAccessibilityMinimizeButtonAttribute", "_NSAccessibilityZoomButtonAttribute",
+                             "_NSAccessibilityUnknownOrientationValue"})
+        string(appkit, name, accessibility_value(name));
+    for (const auto* name : {"AudioInput", "Compose", "GoBack", "GoForward", "Pause", "Play", "SkipAhead", "SkipBack"})
+        string(appkit, std::string("_NSImageNameTouchBar") + name + "Template", std::string("NSTouchBar") + name + "Template");
+    for (const auto& [symbol, value] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"_NSImageNameNetwork", "NSNetwork"}, {"_NSWorkspaceRecycleOperation", "recycle"},
+             {"_NSVerticalGlyphFormAttributeName", "CTVerticalForms"}, {"_NSCharacterEncodingDocumentOption", "CharacterEncoding"},
+             {"_NSPrintPanelAccessorySummaryItemNameKey", "name"}, {"_NSPrintPanelAccessorySummaryItemDescriptionKey", "description"},
+             {"_NSAppearanceNameAccessibilityHighContrastVibrantLight", "NSAppearanceNameAccessibilityVibrantLight"},
+             {"_NSAppearanceNameAccessibilityHighContrastVibrantDark", "NSAppearanceNameAccessibilityVibrantDark"},
+             {"_NSAboutPanelOptionApplicationIcon", "ApplicationIcon"}, {"_NSAboutPanelOptionApplicationName", "ApplicationName"},
+             {"_NSAboutPanelOptionApplicationVersion", "ApplicationVersion"}})
+        string(appkit, symbol, value);
+    // NSDarkGray (1/3 of the NSBlack-NSWhite range) and NSAppKitVersionNumber,
+    // the macOS 14 value AppKit reports (NSAppKitVersionNumber14_0, unverified).
+    value(appkit, "_NSDarkGray", std::bit_cast<std::uint64_t>(1.0 / 3.0));
+    value(appkit, "_NSAppKitVersionNumber", std::bit_cast<std::uint64_t>(2487.0));
+    // BOOL NSApplicationLoad(void): Cocoa from Carbon code; the shared application is made.
+    raw(appkit, "_NSApplicationLoad", [this](CpuState& s, GuestMemory&) {
+        const auto application_class = objc.find_class("NSApplication");
+        s.x[0] = application_class && objc.send(application_class, objc.selector("sharedApplication")).x0 ? 1 : 0;
+    });
     string(appkit, "_NSSharingServiceNameAddToSafariReadingList", "com.apple.share.System.add-to-safari-reading-list");
     string(appkit, "_NSSharingServiceNameComposeEmail", "com.apple.share.Mail.compose");
     string(appkit, "_NSSharingServiceNameComposeMessage", "com.apple.share.Messages.compose");
@@ -293,6 +323,10 @@ void Provider::install_appkit() {
     method(item, "view", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     const auto custom_item = cls(appkit, "NSCustomTouchBarItem", "NSTouchBarItem");
     object_properties(custom_item, {"identifier", "customizationLabel", "view", "viewController"});
+    // Touch Bars are never shown (no Touch Bar), so the sharing item only keeps its settings.
+    const auto sharing_item = cls(appkit, "NSSharingServicePickerTouchBarItem", "NSTouchBarItem");
+    object_properties(sharing_item, {"identifier", "customizationLabel", "delegate", "buttonTitle", "buttonImage"});
+    integer_properties(sharing_item, {"enabled"});
     const auto group_item = cls(appkit, "NSGroupTouchBarItem", "NSTouchBarItem");
     object_properties(group_item, {"identifier", "customizationLabel", "groupTouchBar"});
     method(group_item, "groupItemWithIdentifier:items:", [this, touch_bar](CpuState& s, GuestMemory&) {
