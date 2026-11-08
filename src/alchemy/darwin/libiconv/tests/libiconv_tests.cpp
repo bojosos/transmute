@@ -63,6 +63,10 @@ const Case libiconv_case("libiconv", [](Fixture& f) {
     calls = 0;
     f.call(iconv_library, "_iconvlist", {each, 1});
     require(calls == 3, "iconvlist stops when do_one returns non-zero");
+    // libcharset: the locale's encoding is UTF-8, as GNU libcharset answers on Darwin.
+    require(f.read_text(f.call("/usr/lib/libcharset.1.dylib", "_locale_charset")) == "UTF-8", "locale_charset");
+    static_cast<void>(f.call("/usr/lib/libcharset.1.dylib", "_libcharset_set_relocation_prefix", {0, 0}));
+    static_cast<void>(f.call(iconv_library, "_libiconv_set_relocation_prefix", {0, 0}));
 });
 
 } // namespace

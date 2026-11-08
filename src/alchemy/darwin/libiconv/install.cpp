@@ -19,6 +19,8 @@ namespace alchemy::darwin_headless {
 namespace {
 
 constexpr std::string_view iconv_library = darwin_framework_libraries[15];
+constexpr std::string_view charset_library = darwin_framework_libraries[52];
+static_assert(charset_library == "/usr/lib/libcharset.1.dylib");
 
 // <sys/errno.h>
 constexpr std::uint32_t e2big = 7, ebadf = 9, einval = 22, eilseq = 92;
@@ -317,6 +319,14 @@ public:
             function(iconv_library, std::string(prefix) + "iconvlist", list);
         }
         function(iconv_library, "_iconv_canonicalize", canonicalize);
+        // libcharset: const char* locale_charset(void), the locale's character encoding, which GNU
+        // libcharset answers "UTF-8" on Darwin whatever the locale. The relocation prefixes
+        // (libcharset_set_relocation_prefix, libiconv_set_relocation_prefix) move where the
+        // libraries look for their data files; these implementations read none, so they change nothing.
+        const auto charset = name_text("UTF-8");
+        function(charset_library, "_locale_charset", [charset](CpuState& s, GuestMemory&) { s.x[0] = charset; });
+        function(charset_library, "_libcharset_set_relocation_prefix", [](CpuState&, GuestMemory&) {});
+        function(iconv_library, "_libiconv_set_relocation_prefix", [](CpuState&, GuestMemory&) {});
     }
 };
 
