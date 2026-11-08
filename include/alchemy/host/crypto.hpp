@@ -219,6 +219,10 @@ struct TlsOptions {
     bool request_client_certificate{};
 };
 
+// The TLS cipher suites the host's TLS enables, as IANA numbers in its order of
+// preference (SChannel: the local policy's list). Error::unsupported when the host cannot list them.
+[[nodiscard]] Result<std::vector<std::uint16_t>> tls_cipher_suites();
+
 class TlsSession {
 public:
     enum class Status { ok, would_block, closed, error };
@@ -249,6 +253,9 @@ public:
     [[nodiscard]] std::vector<Certificate> peer_certificates() const;   // leaf first
     [[nodiscard]] std::string negotiated_alpn() const;
     [[nodiscard]] TlsVersion negotiated_version() const;
+    // The negotiated cipher suite's IANA number (TLS Cipher Suites registry); 0 before the
+    // handshake completes or when the host does not say.
+    [[nodiscard]] std::uint16_t negotiated_cipher_suite() const;
     [[nodiscard]] const std::string& error() const noexcept;
     // The peer ended the session with close_notify (not a bare transport close).
     [[nodiscard]] bool close_notified() const noexcept;

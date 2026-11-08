@@ -65,6 +65,8 @@ public:
     [[nodiscard]] std::vector<CertificatePtr> peer_certificates() const;   // leaf first
     [[nodiscard]] std::string negotiated_alpn() const { return session_.negotiated_alpn(); }
     [[nodiscard]] TlsVersion negotiated_version() const;
+    // SSLCipherSuite: the IANA cipher suite number; 0 when unknown.
+    [[nodiscard]] std::uint16_t negotiated_cipher_suite() const { return session_.negotiated_cipher_suite(); }
     [[nodiscard]] const std::string& error() const noexcept { return session_.error(); }
     // The peer ended the session with close_notify (not a bare transport close).
     [[nodiscard]] bool close_notified() const noexcept { return session_.close_notified(); }

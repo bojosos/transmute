@@ -21,6 +21,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -959,7 +960,7 @@ void test_secure_transport(Fixture& f, Identity& identity) {
         s.x[0] = sent > 0 ? 0 : static_cast<std::uint64_t>(static_cast<std::int64_t>(-9806));
     }, "alchemy.test");
     const auto name = f.text_buffer("localhost");
-    Server server(identity.identity->context(), 2);
+    Server server(identity.identity->context(), 4);
 
     // 1. Default validation rejects the self-signed server certificate.
     {
@@ -971,6 +972,65 @@ void test_secure_transport(Fixture& f, Identity& identity) {
                 f.status("_SSLSetPeerDomainName", {context, name, 9}) == 0, "SSL configuration");
         const auto status = f.status("_SSLHandshake", {context});
         require(status == -9807, "untrusted server certificate gave " + std::to_string(status));
+        f.release(context);
+        closesocket(socket_handle);
+    }
+    // Cipher suites: the host's list, SSLSetEnabledCiphers, SSLGetNegotiatedCipher (SSLCipherSuite is 16 bits).
+    const auto open_client = [&](SOCKET socket_handle) {
+        const auto context = f.s("_SSLCreateContext", {0, 1, 0});
+        require(f.status("_SSLSetIOFuncs", {context, read_function, write_function}) == 0 &&
+                f.status("_SSLSetConnection", {context, static_cast<Address>(socket_handle)}) == 0 &&
+                f.status("_SSLSetPeerDomainName", {context, name, 9}) == 0 &&
+                f.status("_SSLSetSessionOption", {context, 0, 1}) == 0, "SSL configuration");
+        return context;
+    };
+    const auto suites_at = [&](Address at, std::size_t count) {
+        std::vector<std::uint8_t> bytes(count * 2);
+        f.engine.read_bytes(at, bytes);
+        std::vector<std::uint16_t> out;
+        for (std::size_t i = 0; i < bytes.size(); i += 2) out.push_back(static_cast<std::uint16_t>(bytes[i] | (bytes[i + 1] << 8)));
+        return out;
+    };
+    std::vector<std::uint16_t> supported;
+    std::uint16_t negotiated{};
+    {
+        // 1a. The supported list, and the suite this server negotiates.
+        const auto socket_handle = connect_to(server.port);
+        const auto context = open_client(socket_handle);
+        const auto count = f.cell();
+        require(f.status("_SSLGetNumberSupportedCiphers", {context, count}) == 0 && f.engine.read64(count) > 0, "SSLGetNumberSupportedCiphers");
+        const auto total = f.engine.read64(count);
+        const auto list = f.process.allocate_guest(total * 2 + 2);
+        f.engine.write64(count, total - 1);
+        require(f.status("_SSLGetSupportedCiphers", {context, list, count}) == -9817, "SSLGetSupportedCiphers into a short buffer");
+        f.engine.write64(count, total);
+        require(f.status("_SSLGetSupportedCiphers", {context, list, count}) == 0 && f.engine.read64(count) == total, "SSLGetSupportedCiphers");
+        supported = suites_at(list, static_cast<std::size_t>(total));
+        const auto null_suite = f.process.allocate_guest(2);
+        f.engine.write_bytes(null_suite, std::vector<std::uint8_t>{0, 0});   // TLS_NULL_WITH_NULL_NULL: never the host's
+        require(f.status("_SSLSetEnabledCiphers", {context, null_suite, 1}) == -50, "SSLSetEnabledCiphers with no host suite");
+        require(f.status("_SSLSetEnabledCiphers", {context, list, total}) == 0 && f.status("_SSLGetNumberEnabledCiphers", {context, count}) == 0 &&
+                f.engine.read64(count) == total, "SSLSetEnabledCiphers with the whole list");
+        const auto chosen = f.process.allocate_guest(2);
+        require(f.status("_SSLGetNegotiatedCipher", {context, chosen}) == -909, "SSLGetNegotiatedCipher before the handshake");
+        require(f.status("_SSLHandshake", {context}) == -9841, "handshake to server auth");
+        require(f.status("_SSLGetNegotiatedCipher", {context, chosen}) == 0, "SSLGetNegotiatedCipher");
+        negotiated = suites_at(chosen, 1)[0];
+        require(std::find(supported.begin(), supported.end(), negotiated) != supported.end(), "the negotiated suite is a supported one");
+        f.release(context);
+        closesocket(socket_handle);
+    }
+    {
+        // 1b. Only another suite enabled: the server negotiates the same suite again, which the client refuses.
+        const auto other = std::find_if(supported.begin(), supported.end(), [&](std::uint16_t suite) { return suite != negotiated; });
+        const auto socket_handle = connect_to(server.port);
+        const auto context = open_client(socket_handle);
+        if (other != supported.end()) {
+            const auto one = f.process.allocate_guest(2);
+            f.engine.write_bytes(one, std::vector<std::uint8_t>{static_cast<std::uint8_t>(*other), static_cast<std::uint8_t>(*other >> 8)});
+            require(f.status("_SSLSetEnabledCiphers", {context, one, 1}) == 0, "SSLSetEnabledCiphers with one suite");
+            require(f.status("_SSLHandshake", {context}) == -9818, "errSSLBadCipherSuite for a suite outside the enabled set");
+        }
         f.release(context);
         closesocket(socket_handle);
     }

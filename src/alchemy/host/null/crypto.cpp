@@ -101,6 +101,8 @@ std::size_t TlsSession::buffered() const noexcept { return 0; }
 std::vector<Certificate> TlsSession::peer_certificates() const { return {}; }
 std::string TlsSession::negotiated_alpn() const { return {}; }
 TlsVersion TlsSession::negotiated_version() const { return TlsVersion::unknown; }
+std::uint16_t TlsSession::negotiated_cipher_suite() const { return 0; }
+Result<std::vector<std::uint16_t>> tls_cipher_suites() { return Error::unsupported; }
 const std::string& TlsSession::error() const noexcept {
     static const std::string none{"the null host backend has no TLS"};
     return state_ ? state_->error : none;

@@ -1303,6 +1303,73 @@ std::string TlsSession::negotiated_alpn() const {
     return std::string(reinterpret_cast<const char*>(protocol.ProtocolId), protocol.ProtocolIdSize);
 }
 
+std::uint16_t TlsSession::negotiated_cipher_suite() const {
+    if (!complete()) return 0;
+    SecPkgContext_CipherInfo info{};
+    info.dwVersion = SECPKGCONTEXT_CIPHERINFO_V1;
+    if (QueryContextAttributesW(&state_->context, SECPKG_ATTR_CIPHER_INFO, &info) != SEC_E_OK) return 0;
+    return static_cast<std::uint16_t>(info.dwCipherSuite);
+}
+
+// The SSL provider calls of ncrypt.dll (SslOpenProvider, SslEnumCipherSuites, SslFreeBuffer,
+// SslFreeObject), declared from their documentation: their header ships with the Cryptographic
+// Provider Development Kit, not the Windows SDK.
+namespace ssl_provider {
+struct CipherSuite {   // NCRYPT_SSL_CIPHER_SUITE
+    DWORD protocol, cipher_suite, base_cipher_suite;
+    WCHAR name[64], cipher[64];
+    DWORD cipher_length, cipher_block_length;
+    WCHAR hash[64];
+    DWORD hash_length;
+    WCHAR exchange[64];
+    DWORD min_exchange_length, max_exchange_length;
+    WCHAR certificate[64];
+    DWORD key_type;
+};
+using Open = SECURITY_STATUS(WINAPI*)(NCRYPT_PROV_HANDLE*, LPCWSTR, DWORD);
+using Enumerate = SECURITY_STATUS(WINAPI*)(NCRYPT_PROV_HANDLE, NCRYPT_KEY_HANDLE, CipherSuite**, PVOID*, DWORD);
+using FreeBuffer = SECURITY_STATUS(WINAPI*)(PVOID);
+using FreeObject = SECURITY_STATUS(WINAPI*)(NCRYPT_HANDLE, DWORD);
+} // namespace ssl_provider
+
+// The suites SChannel's local policy enables (BCryptEnumContextFunctions over the SSL
+// context's Schannel interface, by name), numbered through the Schannel provider's
+// suite list (SslEnumCipherSuites, which also lists suites the policy turns off).
+Result<std::vector<std::uint16_t>> tls_cipher_suites() {
+    const auto ncrypt = GetModuleHandleW(L"ncrypt.dll") ? GetModuleHandleW(L"ncrypt.dll") : LoadLibraryW(L"ncrypt.dll");
+    if (!ncrypt) return Error::unsupported;
+    const auto open = reinterpret_cast<ssl_provider::Open>(GetProcAddress(ncrypt, "SslOpenProvider"));
+    const auto enumerate = reinterpret_cast<ssl_provider::Enumerate>(GetProcAddress(ncrypt, "SslEnumCipherSuites"));
+    const auto free_buffer = reinterpret_cast<ssl_provider::FreeBuffer>(GetProcAddress(ncrypt, "SslFreeBuffer"));
+    const auto free_object = reinterpret_cast<ssl_provider::FreeObject>(GetProcAddress(ncrypt, "SslFreeObject"));
+    if (!open || !enumerate || !free_buffer || !free_object) return Error::unsupported;
+    ULONG size = 0;
+    PCRYPT_CONTEXT_FUNCTIONS functions = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptEnumContextFunctions(CRYPT_LOCAL, L"SSL", NCRYPT_SCHANNEL_INTERFACE, &size, &functions)) || !functions)
+        return Error::unsupported;
+    std::vector<std::wstring> enabled(functions->rgpszFunctions, functions->rgpszFunctions + functions->cFunctions);
+    BCryptFreeBuffer(functions);
+    NCRYPT_PROV_HANDLE provider{};
+    if (open(&provider, L"Microsoft SSL Protocol Provider", 0) != ERROR_SUCCESS) return Error::unsupported;   // MS_SCHANNEL_PROVIDER
+    std::map<std::wstring, std::uint16_t> numbers;
+    ssl_provider::CipherSuite* suite = nullptr;
+    PVOID position = nullptr;
+    while (enumerate(provider, 0, &suite, &position, 0) == ERROR_SUCCESS && suite) {
+        numbers.emplace(suite->name, static_cast<std::uint16_t>(suite->cipher_suite));
+        free_buffer(suite);
+        suite = nullptr;
+    }
+    if (position) free_buffer(position);
+    free_object(provider, 0);
+    std::vector<std::uint16_t> result;
+    for (const auto& name : enabled) {
+        const auto found = numbers.find(name);
+        if (found != numbers.end() && std::find(result.begin(), result.end(), found->second) == result.end()) result.push_back(found->second);
+    }
+    if (result.empty()) return Error::unsupported;
+    return result;
+}
+
 TlsVersion TlsSession::negotiated_version() const {
     if (!complete()) return TlsVersion::unknown;
     SecPkgContext_ConnectionInfo info{};

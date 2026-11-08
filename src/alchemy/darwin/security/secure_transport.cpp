@@ -12,8 +12,14 @@
 // policy with the peer domain name) unless the guest breaks on server
 // authentication and evaluates SSLCopyPeerTrust itself.
 //
-// Not provided (explicit errSecUnimplemented): cipher-suite selection
-// (SSLSetEnabledCiphers), custom Diffie-Hellman parameters, datagram (DTLS)
+// Cipher suites (SSLCipherSuite: the IANA number, 16 bits on arm64 macOS) are
+// the host's: the supported list is what the host's TLS enables
+// (host::crypto::tls_cipher_suites), SSLSetEnabledCiphers narrows it to the
+// given suites the host has, and a handshake that negotiates a suite outside
+// that set ends with errSSLBadCipherSuite (the host picks the suite; the
+// choice is checked, not steered).
+//
+// Not provided (explicit errSecUnimplemented): custom Diffie-Hellman parameters, datagram (DTLS)
 // contexts, breaking on certificate requests, and SecIdentityCopyPrivateKey
 // for imported identities (their keys stay inside the host).
 namespace alchemy::gui::security {
@@ -22,7 +28,8 @@ namespace {
 constexpr std::string_view lib = security_library;
 constexpr std::int32_t ssl_protocol = -9800, ssl_would_block = -9803, ssl_closed_graceful = -9805, ssl_closed_abort = -9806,
     ssl_cert_chain_invalid = -9807, ssl_cert_expired = -9814, ssl_cert_not_yet_valid = -9815, ssl_closed_no_notify = -9816,
-    ssl_peer_auth_completed = -9841, ssl_host_name_mismatch = -9843, ssl_bad_configuration = -9848, auth_failed = -25293;
+    ssl_peer_auth_completed = -9841, ssl_host_name_mismatch = -9843, ssl_bad_configuration = -9848, auth_failed = -25293,
+    ssl_buffer_overflow = -9817, ssl_bad_cipher_suite = -9818, bad_request = -909;
 constexpr std::size_t scratch_size = 16384;
 
 enum class SessionState : std::uint32_t { idle = 0, handshake = 1, connected = 2, closed = 3, aborted = 4 };
@@ -38,6 +45,7 @@ struct SslState final : ObjectPayload {
     std::uint32_t client_auth{};              // SSLAuthenticate
     TlsVersion min_version{TlsVersion::tls10}, max_version{TlsVersion::tls13};
     std::vector<std::string> alpn;
+    std::vector<std::uint16_t> enabled_ciphers;   // SSLSetEnabledCiphers; empty: the host's whole list
     std::unique_ptr<TlsSession> session;
     SessionState state{SessionState::idle};
     bool auth_reported{}, auth_done{};
@@ -127,6 +135,14 @@ struct Transport {
             case TlsSession::Status::would_block: return ssl_would_block;
             case TlsSession::Status::closed: st.state = SessionState::aborted; return ssl_closed_abort;
             default: st.state = SessionState::aborted; return ssl_protocol;
+            }
+        }
+        if (!st.enabled_ciphers.empty() && !st.auth_done) {
+            const auto suite = st.session->negotiated_cipher_suite();
+            if (std::find(st.enabled_ciphers.begin(), st.enabled_ciphers.end(), suite) == st.enabled_ciphers.end()) {
+                static_cast<void>(st.session->shutdown(write));
+                st.state = SessionState::aborted;
+                return ssl_bad_cipher_suite;
             }
         }
         if (!st.auth_done) {
@@ -353,8 +369,77 @@ void install_secure_transport(Security& sec) {
         self->b.release_all(values);
         return 0;
     }));
-    for (const auto* name : {"_SSLSetEnabledCiphers", "_SSLSetDiffieHellmanParams"})
-        b.function(lib, name, with([](SslState&, CpuState&, GuestMemory&) -> std::int32_t { return status::unimplemented; }));
+    b.function(lib, "_SSLSetDiffieHellmanParams", with([](SslState&, CpuState&, GuestMemory&) -> std::int32_t { return status::unimplemented; }));
+    // ---- cipher suites ----
+    const auto supported = []() -> const std::vector<std::uint16_t>* {
+        static const auto suites = host::crypto::tls_cipher_suites();
+        return suites ? &*suites : nullptr;
+    };
+    const auto enabled = [supported](const SslState& st) -> const std::vector<std::uint16_t>* {
+        return st.enabled_ciphers.empty() ? supported() : &st.enabled_ciphers;
+    };
+    // An array of SSLCipherSuite (uint16_t) at `at`.
+    const auto write_suites = [](GuestMemory& m, Address at, const std::vector<std::uint16_t>& suites) {
+        std::vector<std::uint8_t> bytes;
+        for (const auto suite : suites) { bytes.push_back(static_cast<std::uint8_t>(suite)); bytes.push_back(static_cast<std::uint8_t>(suite >> 8)); }
+        if (!bytes.empty()) m.write_bytes(at, bytes);
+    };
+    // (count, list): *count is the capacity on input and the number written on output.
+    const auto list = [write_suites](const std::vector<std::uint16_t>* suites, CpuState& s, GuestMemory& m) -> std::int32_t {
+        if (!suites) return status::unimplemented;   // the host cannot list its suites
+        if (!s.x[2] || (!s.x[1] && m.read64(s.x[2]))) return status::param;
+        if (m.read64(s.x[2]) < suites->size()) return ssl_buffer_overflow;
+        write_suites(m, s.x[1], *suites);
+        m.write64(s.x[2], suites->size());
+        return 0;
+    };
+    b.function(lib, "_SSLGetNumberSupportedCiphers", with([supported](SslState&, CpuState& s, GuestMemory& m) -> std::int32_t {
+        if (!s.x[1]) return status::param;
+        const auto suites = supported();
+        if (!suites) return status::unimplemented;
+        m.write64(s.x[1], suites->size());
+        return 0;
+    }));
+    b.function(lib, "_SSLGetSupportedCiphers", with([supported, list](SslState&, CpuState& s, GuestMemory& m) -> std::int32_t {
+        return list(supported(), s, m);
+    }));
+    b.function(lib, "_SSLGetNumberEnabledCiphers", with([enabled](SslState& st, CpuState& s, GuestMemory& m) -> std::int32_t {
+        if (!s.x[1]) return status::param;
+        const auto suites = enabled(st);
+        if (!suites) return status::unimplemented;
+        m.write64(s.x[1], suites->size());
+        return 0;
+    }));
+    b.function(lib, "_SSLGetEnabledCiphers", with([enabled, list](SslState& st, CpuState& s, GuestMemory& m) -> std::int32_t {
+        return list(enabled(st), s, m);
+    }));
+    // SSLSetEnabledCiphers(context, const SSLCipherSuite* ciphers, size_t count): the given suites the
+    // host has, in the caller's order; errSecParam when none of them is the host's.
+    b.function(lib, "_SSLSetEnabledCiphers", with([configurable, supported](SslState& st, CpuState& s, GuestMemory& m) -> std::int32_t {
+        if (!configurable(st)) return status::param;
+        const auto suites = supported();
+        if (!suites) return status::unimplemented;
+        if (!s.x[1] || !s.x[2] || s.x[2] > 0x10000) return status::param;
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(s.x[2]) * 2);
+        m.read_bytes(s.x[1], bytes);
+        std::vector<std::uint16_t> chosen;
+        for (std::size_t i = 0; i < bytes.size(); i += 2) {
+            const auto suite = static_cast<std::uint16_t>(bytes[i] | (bytes[i + 1] << 8));
+            if (std::find(suites->begin(), suites->end(), suite) != suites->end() &&
+                std::find(chosen.begin(), chosen.end(), suite) == chosen.end()) chosen.push_back(suite);
+        }
+        if (chosen.empty()) return status::param;
+        st.enabled_ciphers = std::move(chosen);
+        return 0;
+    }));
+    b.function(lib, "_SSLGetNegotiatedCipher", with([](SslState& st, CpuState& s, GuestMemory& m) -> std::int32_t {
+        if (!s.x[1]) return status::param;
+        if (!st.session || !st.session->complete()) return bad_request;
+        const auto suite = st.session->negotiated_cipher_suite();
+        if (!suite) return status::unimplemented;   // the host did not say
+        m.write_bytes(s.x[1], std::vector<std::uint8_t>{static_cast<std::uint8_t>(suite), static_cast<std::uint8_t>(suite >> 8)});
+        return 0;
+    }));
     b.function(lib, "_SSLHandshake", with([self](SslState& st, CpuState&, GuestMemory&) { return self->handshake(st); }));
     b.function(lib, "_SSLGetSessionState", with([](SslState& st, CpuState& s, GuestMemory& m) -> std::int32_t {
         if (!s.x[1]) return status::param;

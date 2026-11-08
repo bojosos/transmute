@@ -576,7 +576,8 @@ void null_backend() {
                 host::crypto::BlockCipher::create(host::crypto::BlockAlgorithm::aes, {}).error() == host::Error::unsupported &&
                 host::crypto::generate_ec(32).error() == host::Error::unsupported && !host::crypto::supports(host::crypto::Digest::sha256) &&
                 host::crypto::Identity::self_signed("x", {}).error() == host::Error::unsupported &&
-                host::crypto::TlsSession::create({}).error() == host::Error::unsupported,
+                host::crypto::TlsSession::create({}).error() == host::Error::unsupported &&
+                host::crypto::tls_cipher_suites().error() == host::Error::unsupported,
         "null crypto fails");
     require(!host::locale::valid("en-US") && host::locale::locales().error() == host::Error::unsupported, "null knows no locale");
     require(host::http::Session::open("test", {}).error() == host::Error::unsupported &&
@@ -758,6 +759,11 @@ void certificate_area() {
     }
     require(server->complete() && client->complete(), "the TLS handshake completes");
     require(client->negotiated_alpn() == "http/1.1" && client->negotiated_version() >= crypto::TlsVersion::tls12, "ALPN and version");
+    const auto suites = crypto::tls_cipher_suites();
+    require(suites && !suites->empty(), "the host's TLS cipher suites");
+    const auto suite = client->negotiated_cipher_suite();
+    require(suite != 0 && suite == server->negotiated_cipher_suite() && std::find(suites->begin(), suites->end(), suite) != suites->end(),
+            "the negotiated cipher suite is one of the host's");
     const auto peers = client->peer_certificates();
     require(!peers.empty() && peers[0].der() == der, "the client sees the server's certificate");
     std::size_t accepted{}, got{};
