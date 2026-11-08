@@ -147,6 +147,18 @@ void localization(Fixture& f) {
     require(!yes(f.send(one, "loadAndReturnError:", {error})) && f.memory().read64(error) &&
                 f.send(f.memory().read64(error), "code") == 4, "-loadAndReturnError: NSFileNoSuchFileError");
     require(f.send(one, "executableArchitectures") == 0, "no architectures without an executable");
+    // CFBundleCopyExecutableArchitecturesForURL: the CPU type in an arm64 executable's Mach-O header, and NULL
+    // where there is no bundle.
+    const auto arch = root / "Arch.app";
+    write(arch / "Contents/Info.plist", std::string("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>") +
+          "<key>CFBundleIdentifier</key><string>org.alchemy.arch</string><key>CFBundleExecutable</key><string>Arch</string></dict></plist>");
+    write(arch / "Contents/MacOS/Arch", std::vector<std::uint8_t>{0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0,
+                                                                  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const auto types = f.call(cf, "_CFBundleCopyExecutableArchitecturesForURL", {f.cf.file_url(arch.generic_string(), true)});
+    require(types && f.cf.length(types) == 1 && f.cf.number_value(f.cf.element(types, 0)) == 0x0100000c,
+            "CFBundleCopyExecutableArchitecturesForURL");
+    require(f.call(cf, "_CFBundleCopyExecutableArchitecturesForURL", {f.cf.file_url((root / "Missing.app").generic_string(), true)}) == 0,
+            "CFBundleCopyExecutableArchitecturesForURL without a bundle");
     fs::remove_all(root);
 }
 

@@ -49,8 +49,7 @@ void install_constants(Support& support) {
         fill_string(foundation_library, name, value);
     // NSURL resource keys (CoreFoundation's, re-exported by Foundation).
     for (const auto* name : {"NSURLContentTypeKey", "NSURLEffectiveIconKey", "NSURLTotalFileSizeKey", "NSURLVolumeIdentifierKey",
-             "NSURLTotalFileAllocatedSizeKey", "NSURLLocalizedNameKey", "NSURLTypeIdentifierKey", "NSURLIsSystemImmutableKey",
-             "NSURLVolumeSupportsCaseSensitiveNamesKey"}) {
+             "NSURLTotalFileAllocatedSizeKey", "NSURLLocalizedNameKey", "NSURLTypeIdentifierKey"}) {
         fill_string(core_foundation_library, name, name);
         fill_string(foundation_library, name, name);
     }

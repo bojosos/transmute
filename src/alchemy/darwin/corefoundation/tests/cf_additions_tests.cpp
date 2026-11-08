@@ -284,6 +284,10 @@ void test_guest_locale(Fixture& f) {
     require(f.cf.utf8(f.call(cf, "_CFNumberFormatterCreateStringWithValue", {0, currency, 6, value})) == "EUR 1,234.50", "currency style");
     const auto percent = f.call(cf, "_CFNumberFormatterCreate", {0, us, 3});
     require(f.cf.utf8(f.call(cf, "_CFNumberFormatterCreateStringWithNumber", {0, percent, f.cf.real(0.25)})) == "25%", "percent style");
+    // The grouping sizes of the formatter's output: threes, no different secondary group.
+    require(f.cf.number_value(f.call(cf, "_CFNumberFormatterCopyProperty", {decimal, key("_kCFNumberFormatterGroupingSize")})) == 3.0 &&
+                f.cf.number_value(f.call(cf, "_CFNumberFormatterCopyProperty", {decimal, key("_kCFNumberFormatterSecondaryGroupingSize")})) == 0.0,
+            "kCFNumberFormatterGroupingSize");
     // Display names (CFCalendar is NSCalendar now: foundation/tests/cf_time_fixture.c).
     const auto german = f.call(cf, "_CFLocaleCopyDisplayNameForPropertyValue", {us, key("_kCFLocaleIdentifier"), f.cf.string("de_DE")});
     require(german && f.cf.utf8(german) == "German (Germany)", "display name of de_DE in English");

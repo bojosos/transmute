@@ -372,7 +372,8 @@ constexpr std::string_view url_keys[] = {
     "NameKey", "LocalizedNameKey", "IsRegularFileKey", "IsDirectoryKey", "IsSymbolicLinkKey", "IsVolumeKey",
     "IsPackageKey", "IsHiddenKey", "IsReadableKey", "IsWritableKey", "IsExecutableKey", "IsAliasFileKey",
     "FileSizeKey", "ContentModificationDateKey", "VolumeURLKey", "VolumeNameKey", "VolumeLocalizedNameKey",
-    "VolumeIsLocalKey", "VolumeIsEjectableKey", "VolumeIsRemovableKey", "VolumeIsInternalKey", "VolumeIsReadOnlyKey"};
+    "VolumeIsLocalKey", "VolumeIsEjectableKey", "VolumeIsRemovableKey", "VolumeIsInternalKey", "VolumeIsReadOnlyKey",
+    "IsSystemImmutableKey", "VolumeSupportsCaseSensitiveNamesKey", "CreationDateKey", "AttributeModificationDateKey"};
 // CF-lite key strings; the NSLocale names are the same objects.
 constexpr std::pair<std::string_view, std::string_view> locale_keys[] = {
     {"Identifier", "locale:id"}, {"LanguageCode", "locale:language code"}, {"CountryCode", "locale:country code"},
@@ -845,6 +846,15 @@ struct CoreFoundation::Impl {
             const auto written = std::filesystem::last_write_time(host, error);
             if (error) return std::uint64_t{0};
             return date(absolute_time(std::chrono::clock_cast<std::chrono::system_clock>(written)));
+        }
+        // The host's creation (birth) time, and its status-change time for the attributes' last change; no
+        // value where the host does not record one.
+        if (name == "CreationDateKey" || name == "AttributeModificationDateKey") {
+            const auto info = host::files::metadata(utf8_text(host));
+            if (!info) return std::uint64_t{0};
+            const auto ns = name == "CreationDateKey" ? info->created_ns : info->changed_ns;
+            if (!ns) return std::uint64_t{0};
+            return date(static_cast<double>(ns) / 1e9 - absolute_epoch);
         }
         if (!name.starts_with("Volume")) return std::uint64_t{0}; // Properties without a value for this item.
         if (!volume) return std::uint64_t{0};

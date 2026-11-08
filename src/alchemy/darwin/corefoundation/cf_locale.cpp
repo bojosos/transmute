@@ -523,6 +523,7 @@ void install_cf_locale(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     });
 
     // ---- CFNumberFormatter ----
+    static constexpr std::int64_t grouping_size = 3;
     // CFNumberFormatterRef CFNumberFormatterCreate(alloc, CFLocaleRef, CFNumberFormatterStyle)
     function("_CFNumberFormatterCreate", [&process, &cf, number_formatter_class, no_allocator](CpuState& s, GuestMemory&) {
         no_allocator(s.x[0]);
@@ -543,6 +544,8 @@ void install_cf_locale(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         if (key == "kCFNumberFormatterCurrencySymbolKey") value->currency_symbol = cf.utf8(s.x[2]);
         else if (key == "kCFNumberFormatterDecimalSeparatorKey") value->data.decimal = cf.utf8(s.x[2]);
         else if (key == "kCFNumberFormatterGroupingSeparatorKey") value->data.grouping = cf.utf8(s.x[2]);
+        else if ((key == "kCFNumberFormatterGroupingSizeKey" && cf.number_value(s.x[2]) == grouping_size) ||
+                 (key == "kCFNumberFormatterSecondaryGroupingSizeKey" && cf.number_value(s.x[2]) == 0)) {}   // what it already does
         else throw std::runtime_error("Alchemy CFNumberFormatterSetProperty: unsupported property " + key);
         s.x[0] = 0;
     });
@@ -555,6 +558,10 @@ void install_cf_locale(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         else if (key == "kCFNumberFormatterGroupingSeparatorKey") s.x[0] = cf.string(value->data.grouping);
         else if (key == "kCFNumberFormatterMinusSignKey") s.x[0] = cf.string(value->data.minus);
         else if (key == "kCFNumberFormatterPercentSymbolKey") s.x[0] = cf.string(value->data.percent);
+        // The formatter groups integer digits in threes for every locale (host::locale::format_number), with
+        // no different secondary grouping: these are the sizes its output has.
+        else if (key == "kCFNumberFormatterGroupingSizeKey") s.x[0] = cf.integer(grouping_size, 3);
+        else if (key == "kCFNumberFormatterSecondaryGroupingSizeKey") s.x[0] = cf.integer(0, 3);
         else s.x[0] = 0;
     });
     const auto format = [](const NumberFormatter& formatter, double value) -> std::string {

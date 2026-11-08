@@ -32,6 +32,8 @@ const Case corefoundation_time_zones_and_uuids_case("corefoundation_time_zones_a
                 f.engine.read64(value) == f.engine.read64(f.symbol(cf, "_kCFBooleanFalse")), std::string(key) + " is false");
         const auto foundation_name = f.engine.read64(f.symbol("/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation", key));
         require(f.call(cf, "_CFEqual", {foundation_name, name}) == 1, std::string(key) + " under Foundation");
+        const auto cf_name = "_kCFURL" + std::string(key).substr(std::string_view("_NSURL").size());
+        require(f.engine.read64(f.symbol(cf, cf_name)) == name, cf_name + " is the same key");
     }
 });
 

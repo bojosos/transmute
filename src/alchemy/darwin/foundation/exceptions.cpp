@@ -1,6 +1,8 @@
 #include "alchemy/darwin/kit/completion/runtime/common.hpp"
 
 #include <array>
+#include <atomic>
+#include <memory>
 #include <cstdio>
 
 // NSException (CoreFoundation) and the exception name constants.
@@ -142,6 +144,16 @@ void install_exceptions(Support& support) {
         support.process.install_export(std::string(core_foundation), "_OBJC_EHTYPE_$_NSException", {type_info, ExportKind::data});
         support.process.install_export(std::string(foundation_library), "_OBJC_EHTYPE_$_NSException", {type_info, ExportKind::data});
     }
+    // void NSSetUncaughtExceptionHandler(NSUncaughtExceptionHandler*): the handler an exception nothing catches
+    // reaches before the process stops (objc_setUncaughtExceptionHandler's); NSGetUncaughtExceptionHandler
+    // answers the one set here.
+    auto handler = std::make_shared<std::atomic<Address>>(0);
+    support.function(foundation_library, "_NSSetUncaughtExceptionHandler", [&support, handler](CpuState& s, GuestMemory&) {
+        handler->store(s.x[0]);
+        static_cast<void>(support.call(libobjc, "_objc_setUncaughtExceptionHandler", {s.x[0]}));
+        s.x[0] = 0;
+    });
+    support.function(foundation_library, "_NSGetUncaughtExceptionHandler", [handler](CpuState& s, GuestMemory&) { s.x[0] = handler->load(); });
 }
 
 } // namespace alchemy::gui::completion_kit

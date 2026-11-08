@@ -78,7 +78,8 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         constant_string(process, cf, cf_library, std::string("_kCFDateFormatter") + name, std::string("kCFDateFormatter") + name + "Key");
     for (const auto* name : {"CurrencySymbol", "CurrencyCode", "DecimalSeparator", "GroupingSeparator", "MinusSign", "PlusSign",
                              "PercentSymbol", "ZeroSymbol", "NaNSymbol", "InfinitySymbol", "InternationalCurrencySymbol",
-                             "MinFractionDigits", "MaxFractionDigits", "UseGroupingSeparator", "PositivePrefix", "NegativePrefix"})
+                             "MinFractionDigits", "MaxFractionDigits", "UseGroupingSeparator", "PositivePrefix", "NegativePrefix",
+                             "GroupingSize", "SecondaryGroupingSize"})
         constant_string(process, cf, cf_library, std::string("_kCFNumberFormatter") + name, std::string("kCFNumberFormatter") + name + "Key");
     for (const auto* name : {"QuotationBeginDelimiterKey", "QuotationEndDelimiterKey", "AlternateQuotationBeginDelimiterKey",
                              "AlternateQuotationEndDelimiterKey"})
@@ -400,6 +401,21 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     function(cf_library, "_CFBundleUnloadExecutable", [send](CpuState& s, GuestMemory&) { if (s.x[0]) static_cast<void>(send(s.x[0], "unload")); s.x[0] = 0; });
     function(cf_library, "_CFBundleCopyExecutableArchitectures", [send, retained](CpuState& s, GuestMemory&) {
         s.x[0] = s.x[0] ? retained(send(s.x[0], "executableArchitectures")) : 0;
+    });
+    // CFArrayRef CFBundleCopyExecutableArchitecturesForURL(CFURLRef): the same answer for the bundle at a URL,
+    // without keeping a bundle object for it (NULL when there is no bundle there).
+    function(cf_library, "_CFBundleCopyExecutableArchitecturesForURL", [&process, &objc, &cf, bundle_class, send, retained](CpuState& s, GuestMemory&) {
+        if (!s.x[0]) { s.x[0] = 0; return; }
+        const auto path = cf.string(cf.url_path(s.x[0]));
+        std::uint64_t bundle{};
+        try { bundle = send(objc.allocate(bundle_class()), "initWithPath:", {path}); }
+        catch (...) { process.objects().release(path); throw; }
+        process.objects().release(path);
+        std::uint64_t architectures{};
+        try { architectures = bundle ? retained(send(bundle, "executableArchitectures")) : 0; }
+        catch (...) { if (bundle) static_cast<void>(send(bundle, "release")); throw; }
+        if (bundle) static_cast<void>(send(bundle, "release"));
+        s.x[0] = architectures;
     });
     // Symbols of the bundle's executable (loaded on demand): dlsym(3) through a RTLD_NOLOAD handle; the main
     // bundle's are the process's (dlopen(NULL)).

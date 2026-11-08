@@ -23,7 +23,7 @@
 //   CFURLWriteDataAndPropertiesToResource (data only; properties stop);
 //   clearing the resource-value cache does nothing because values are never
 //   cached;
-// - the resource keys CF lacked (kCFURLCreationDateKey, ...), with their
+// - the resource keys CF lacked (kCFURLTypeIdentifierKey, ...), with their
 //   NSURL...Key values.
 // Relative file URLs are made absolute against their base: Alchemy's file
 // URLs keep no base URL.
@@ -209,7 +209,7 @@ void Urls::install() {
     if (!url_class) fail("NSURL is not registered");
 
     // ---- resource keys ----
-    for (const auto* name : {"CreationDate", "TypeIdentifier", "ParentDirectoryURL", "FileResourceIdentifier", "VolumeIdentifier",
+    for (const auto* name : {"TypeIdentifier", "ParentDirectoryURL", "FileResourceIdentifier", "VolumeIdentifier",
                              "FileAllocatedSize", "TotalFileSize", "ContentAccessDate", "LinkCount"})
         string(core_foundation, "_kCFURL" + std::string(name) + "Key", "NSURL" + std::string(name) + "Key");
 
