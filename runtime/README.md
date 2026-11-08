@@ -106,13 +106,32 @@ upstream's `xsltconfig.h.in` and `exsltconfig.h.in`; `runtime/libxslt/config.h`
 replaces the generated configuration header. Run programs with both runtime
 directories (`--runtime-dir <libxslt> --runtime-dir <libxml2>`).
 
+## Guest libcurl
+
+`scripts/build_alchemy_libcurl.ps1` builds curl 8.23.0 (curl license, MIT-style)
+from the sources vendored in `third_party/curl` (checked against its
+`PROVENANCE.md`; the source list is `lib/Makefile.inc`'s `CSOURCES`) into
+`artifacts/alchemy-libcurl-arm64/libcurl.4.dylib`, with the install name
+`/usr/lib/libcurl.4.dylib`, compatibility version 7.0.0 and current version
+9.0.0, the versions cmake and cargo record. `runtime/libcurl/curl_config.h`
+describes the profile: HTTP and FILE, IPv4 and IPv6, Unix sockets and the
+threaded resolver over libSystem's getaddrinfo. There is no TLS backend (curl
+removed Secure Transport in 8.15), so `https://` fails with
+`CURLE_UNSUPPORTED_PROTOCOL`; there is also no zlib, IDN, HTTP/2 or HTTP/3.
+Only the `curl_*` API is exported. curl's macOS initialisation calls
+`SCDynamicStoreCopyProxies` once, as Apple's build does, so the library also
+binds CoreFoundation and SystemConfiguration (served by `alchemy-fx`'s
+framework providers). The script pins the libSystem imports. With this runtime
+cargo starts (it initialises curl in a static constructor) and cmake binds its
+curl calls.
+
 ## Runtime identity allow-list
 
 A Mach-O whose install name lies under `/usr/lib` or `/System/Library` is
 normally rejected, because those identities belong to Alchemy's host
 providers. `include/alchemy/runtime_libraries.hpp` lists the exceptions:
 `libc++.1`, `libc++abi` and `libunwind` from LLVM, `libexpat.1` from Expat,
-and `libxml2.2` from libxml2, and `libxslt.1` and `libexslt.0` from libxslt. Each entry names its upstream repository and build script. The loader
+and `libxml2.2` from libxml2, `libxslt.1` and `libexslt.0` from libxslt, and `libcurl.4` from curl. Each entry names its upstream repository and build script. The loader
 and `doctor` accept an allow-listed identity only when all of these hold:
 
 - The file is found through `--runtime-dir`. `--dylib-dir` and `@rpath` never

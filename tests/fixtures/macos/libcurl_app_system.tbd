@@ -1,0 +1,9 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1.0.0
+exports:
+  - targets:     [ arm64-macos ]
+    symbols:     [ _accept, _bind, _bzero, _close, _fclose, _fopen, _fwrite, _getsockname, _listen, _printf, _pthread_create, _pthread_join, _read, _snprintf, _socket, _sscanf, _strstr, _unlink, _write ]
+...
