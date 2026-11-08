@@ -3809,10 +3809,41 @@ void vt_compression_host(Fixture& f) {
         if (s.x[4]) static_cast<void>(vt_fixture->call(vt_cf, "_CFRetain", {s.x[4]}));
         vt_encoded().push_back({s.x[1], s.x[4], s.x[0], static_cast<std::int32_t>(s.x[2]), static_cast<std::uint32_t>(s.x[3])});
     }, "/usr/lib/alchemy_test_io.dylib");
+    // Whether the host's own encoder and decoder of `codec` work here (a listed codec may not: a server image's): a few
+    // pictures encoded and one decoded back straight through the host layer; the reason when not.
+    const auto usable = [](mc::Codec codec, std::string& why) {
+        mc::VideoSettings settings;
+        settings.codec = codec;
+        settings.width = 160;
+        settings.height = 120;
+        const auto encoder = mc::open_video(settings);
+        if (!encoder) { why = std::string("no encoder opens (") + std::string(alchemy::host::name(encoder.error())) + ")"; return false; }
+        std::vector<std::uint8_t> luma(160 * 120, 100), chroma(160 * 60, 128);
+        std::vector<mc::Sample> samples;
+        bool ok = true;
+        for (int i = 0; i < 3 && ok; ++i) ok = static_cast<bool>(mc::encode(*encoder, {160, 120, luma.data(), 160, chroma.data(), 160, i * 333333LL, 333333}, false, samples));
+        ok = ok && static_cast<bool>(mc::drain(*encoder, samples));
+        const auto sets = mc::parameter_sets(*encoder);
+        mc::close(*encoder);
+        if (!ok || samples.empty() || sets.empty()) { why = "the encoder gives no samples"; return false; }
+        const auto decoder = mc::open_video_decoder({codec, sets, 160, 120, {}});
+        if (!decoder) { why = std::string("no decoder opens (") + std::string(alchemy::host::name(decoder.error())) + ")"; return false; }
+        std::vector<mc::DecodedPicture> pictures;
+        for (const auto& s : samples) ok = ok && static_cast<bool>(mc::decode(*decoder, s, pictures));
+        ok = ok && static_cast<bool>(mc::drain(*decoder, pictures));
+        mc::close(*decoder);
+        if (!ok || pictures.empty()) { why = "the decoder gives no pictures"; return false; }
+        return true;
+    };
     for (const auto codec : {0x61766331u, 0x68766331u}) {
         const char* name = codec == 0x61766331u ? "H.264" : "HEVC";
         const auto mc_codec = codec == 0x61766331u ? mc::Codec::h264 : mc::Codec::hevc;
         const auto decoders = mc::decoders(mc_codec);
+        std::string why;
+        if (decoders && !decoders->empty() && !usable(mc_codec, why)) {
+            std::cout << "[qlab media] the host's " << name << " codecs do not work here (" << why << "): skipped" << std::endl;
+            continue;
+        }
         alchemy::CallRegs r{};
         r.x[1] = 160; r.x[2] = 120; r.x[3] = codec; r.x[7] = callback;
         r.push_stack(Address{0});
