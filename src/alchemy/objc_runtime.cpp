@@ -1378,10 +1378,14 @@ struct ObjcRuntime::Impl {
             s.x[0] = address;
         });
         function("_objc_readClassPair", [this](auto& s, auto&) { s.x[0] = s.x[0] ? register_runtime_pair(s.x[0]) : 0; });
-        const auto hook_setter = [this, function](std::string name, std::atomic<Address> Impl::* slot) {
-            function(std::move(name), [this, slot](auto& s, auto& m) {
+        // Each hook chain ends in a hook that finds nothing (it answers NO or NULL), as Apple's runtime's does:
+        // a newly installed hook receives it as the previous hook and may call it unconditionally (the Swift
+        // runtime's getClass hook does, for names it can't resolve).
+        const auto no_hook = function("__alchemy_objc_hook_none", [](auto& s, auto&) { s.x[0] = 0; });
+        const auto hook_setter = [this, function, no_hook](std::string name, std::atomic<Address> Impl::* slot) {
+            function(std::move(name), [this, slot, no_hook](auto& s, auto& m) {
                 const auto previous = (this->*slot).exchange(s.x[0]);
-                if (s.x[1]) m.write64(s.x[1], previous);
+                if (s.x[1]) m.write64(s.x[1], previous ? previous : no_hook);
             });
         };
         hook_setter("_objc_setHook_getClass", &Impl::get_class_hook);

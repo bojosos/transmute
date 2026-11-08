@@ -645,6 +645,25 @@ void test_destructed_memory_kept() {
     require(!f.process.objects().peek(through).has_value(), "a dealloc reaching NSObject's is freed");
 }
 
+// The Swift runtime installs its hooks with objc_setHook_* and calls the previous hook unconditionally when its
+// own lookup fails, so each setter hands back a callable hook that finds nothing (NO or NULL), and afterwards the
+// hook it replaced.
+void test_hook_chains() {
+    Fixture f;
+    const auto installed = f.code(return_27);
+    for (const auto* setter : {"_objc_setHook_getClass", "_objc_setHook_getImageName", "_objc_setHook_lazyClassNamer"}) {
+        const auto previous = f.process.allocate_guest(8), out = f.process.allocate_guest(8);
+        f.engine.write64(previous, 0);
+        f.call(setter, {installed, previous});
+        const auto default_hook = f.engine.read64(previous);
+        require(default_hook != 0, "a hook setter handed back no previous hook");
+        f.engine.write64(out, 0x55);
+        require(f.call_at(default_hook, {f.string("NoSuchClass"), out}) == 0, "the default previous hook did not answer NO/NULL");
+        f.call(setter, {default_hook, previous});
+        require(f.engine.read64(previous) == installed, "a hook setter did not hand back the hook it replaced");
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc > 2 && std::string_view(argv[1]) == "--encoding") {
@@ -661,6 +680,7 @@ int main(int argc, char** argv) {
         if (!bench_only) test_runtime_api();
         if (!bench_only) test_concurrent_flush();
         if (!bench_only) test_destructed_memory_kept();
+        if (!bench_only) test_hook_chains();
         for (const bool cached : {true, false}) benchmark(cached);
         std::cout << "Alchemy GUI objc runtime tests passed\n";
         return 0;
