@@ -10,6 +10,7 @@ Usage: python -I build_sysroot.py --sources C:\\dev\\conformance --out C:\\dev\\
 """
 import argparse
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -25,7 +26,6 @@ import unifdef  # noqa: E402
 
 import conformance  # noqa: E402
 
-CLANG_HINTS = [d / "clang.exe" for d in conformance.llvm_hints()]
 
 
 def copy_tree(src, dst, pattern="*.h", recursive=False, exclude=()):
@@ -112,9 +112,10 @@ def main():
     for name, path in src.items():
         if not path.is_dir():
             raise SystemExit(f"{name}: {path} missing; download it first (sources.json)")
-    clang = next((p for p in CLANG_HINTS if p.exists()), None)
-    if not clang:
-        raise SystemExit("clang.exe not found (VS 2022 LLVM)")
+    llvm = conformance.find_llvm()  # only the preprocessor runs here (the MIG .defs)
+    if not llvm:
+        raise SystemExit("no LLVM with clang and ld64.lld found (set CONFORMANCE_LLVM to its bin directory)")
+    clang = llvm / ("clang.exe" if os.name == "nt" else "clang")
 
     inc = args.out / "usr" / "include"
     if args.out.exists():

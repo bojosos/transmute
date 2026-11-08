@@ -27,16 +27,38 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+MIN_CLANG = 17  # ld64.lld with chained fixups and arm64 ad-hoc signing, tested with 19.1.5
+
+
 def llvm_hints():
-    """VS 2022's LLVM (any edition: the GitHub runner has Enterprise), or $CONFORMANCE_LLVM."""
+    """Directories that may hold clang.exe and ld64.lld.exe, in order: $CONFORMANCE_LLVM, Visual
+    Studio's LLVM (any VS version and edition), the standalone LLVM install (GitHub's Windows images
+    ship one), then PATH."""
     if os.environ.get("CONFORMANCE_LLVM"):
         yield pathlib.Path(os.environ["CONFORMANCE_LLVM"])
-    for edition in sorted(pathlib.Path(r"C:\Program Files\Microsoft Visual Studio\2022").glob("*")):
+    for edition in sorted(pathlib.Path(r"C:\Program Files\Microsoft Visual Studio").glob("*/*"), reverse=True):
         yield edition / "VC" / "Tools" / "Llvm" / "x64" / "bin"
         yield edition / "VC" / "Tools" / "Llvm" / "bin"
+    yield pathlib.Path(r"C:\Program Files\LLVM\bin")
+    on_path = shutil.which("clang")
+    if on_path:
+        yield pathlib.Path(on_path).parent
 
 
-LLVM_HINTS = list(llvm_hints())
+def find_llvm():
+    """The first LLVM with clang and ld64.lld, after checking its version. None if there is none."""
+    for d in llvm_hints():
+        clang = d / ("clang.exe" if os.name == "nt" else "clang")
+        lld = d / ("ld64.lld.exe" if os.name == "nt" else "ld64.lld")
+        if not (clang.exists() and lld.exists()):
+            continue
+        out = subprocess.run([str(clang), "--version"], capture_output=True, text=True).stdout
+        m = re.search(r"clang version (\d+)\.(\d+)\.(\d+)", out)
+        if not m or int(m.group(1)) < MIN_CLANG:
+            raise SystemExit(f"{clang}: clang {m.group(0) if m else '(unknown version)'} is older than {MIN_CLANG}")
+        print(f"conformance: using {clang} (clang {'.'.join(m.groups())})", file=sys.stderr)
+        return d
+    return None
 GUEST_ENV = {
     # Every guest run is cloaked and loopback-only (never a visible window, never the network).
     "ALCHEMY_GUI_CLOAK": "1", "ALCHEMY_GUI_NO_ACTIVATE": "1", "ALCHEMY_GUI_NO_CRASH_DIALOG": "1",
@@ -73,10 +95,10 @@ class Context:
         self.out = pathlib.Path(args.out)
         self.sysroot = self.out / "sysroot"
         self.manifest = json.loads((HERE / "sources.json").read_text())
-        # Building needs VS 2022's LLVM; running does not (the macOS ground-truth job only runs).
-        self.llvm = next((p for p in LLVM_HINTS if (p / "clang.exe").exists()), None)
+        # Building needs LLVM (find_llvm); running does not (the macOS ground-truth job only runs).
+        self.llvm = find_llvm() if args.command in ("build", "repro") else None
         if not self.llvm and args.command in ("build", "repro"):
-            raise SystemExit("clang.exe not found (VS 2022 LLVM)")
+            raise SystemExit("no LLVM with clang and ld64.lld found (set CONFORMANCE_LLVM to its bin directory)")
         self.clang = self.llvm / "clang.exe" if self.llvm else None
         self.clangxx = self.llvm / "clang++.exe" if self.llvm else None
         # --native runs the programs directly: only on real macOS, for ground truth.
