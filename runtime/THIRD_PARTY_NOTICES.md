@@ -493,3 +493,36 @@ Except as contained in this notice, the name of the authors shall not
 be used in advertising or otherwise to promote the sale, use or other deal-
 ings in this Software without prior written authorization from him.
 ----------------------------------------------------------------------
+
+## curl (guest `/usr/lib/libcurl.4.dylib`)
+
+`scripts/build_alchemy_libcurl.ps1` builds the guest ARM64 libcurl runtime
+from curl 8.23.0: <https://curl.se/>, release tarball
+<https://curl.se/download/curl-8.23.0.tar.gz> (SHA-256
+`e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49`). The
+sources are vendored unmodified in `third_party/curl`. The build copies curl's
+`COPYING` as `LICENSE.curl.txt` beside its outputs, and also copies the public
+headers there. curl's license notice follows verbatim.
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright (c) 1996 - 2026, Daniel Stenberg, <daniel@haxx.se>, and many
+contributors, see the THANKS file.
+
+All rights reserved.
+
+Permission to use, copy, modify, and distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright
+notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF THIRD PARTY RIGHTS. IN
+NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall not
+be used in advertising or otherwise to promote the sale, use or other dealings
+in this Software without prior written authorization of the copyright holder.
