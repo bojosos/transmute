@@ -253,7 +253,8 @@ struct ModuleLoader::Implementation {
         if (auto* found = existing(source)) {
             return found;
         }
-        if (modules.size() >= 256) throw std::runtime_error("guest module limit exceeded");
+        // dyld has no practical limit; VLC loads its 335 plugins at start when it has no plugins.dat.
+        if (modules.size() >= 4096) throw std::runtime_error("guest module limit exceeded (4096 images)");
         auto selected = std::make_unique<Module>();
         if (root && preparsed_main) {
             selected->image = std::move(*preparsed_main);
