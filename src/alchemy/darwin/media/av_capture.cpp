@@ -690,6 +690,7 @@ void Capture::install() {
     discovery_class_ = support.declare_class("AVCaptureDeviceDiscoverySession", ns_object, av_foundation);
     const auto input_class = support.declare_class("AVCaptureInput", ns_object, av_foundation);
     device_input_class_ = support.declare_class("AVCaptureDeviceInput", "AVCaptureInput", av_foundation);
+    const auto screen_input_class = support.declare_class("AVCaptureScreenInput", "AVCaptureInput", av_foundation);
     port_class_ = support.declare_class("AVCaptureInputPort", ns_object, av_foundation);
     connection_class_ = support.declare_class("AVCaptureConnection", ns_object, av_foundation);
     const auto output_class = support.declare_class("AVCaptureOutput", ns_object, av_foundation);
@@ -949,6 +950,14 @@ void Capture::install() {
         const auto found = s.x[2] ? matching(0, s.x[2], s.x[3], static_cast<std::int64_t>(s.x[4])) : std::vector<Address>{};
         s.x[0] = found.empty() ? 0 : found.front();
     }, "@@:@@q", true);
+
+    // ---- AVCaptureScreenInput: screen capture through AVFoundation is not available, so its initializers give nil
+    // (documented for a display that cannot be captured).
+    for (const auto* init : {"init", "initWithDisplayID:"})
+        support.method(screen_input_class, init, [sp](CpuState& s, GuestMemory&) {
+            sp->release(s.x[0]);
+            s.x[0] = 0;
+        }, std::string_view(init) == "init" ? "@@:" : "@@:I");
 
     // ---- AVCaptureDeviceInput and AVCaptureInputPort ---------------------------------------------
     support.method(device_input_class_, "initWithDevice:error:", [self, sp](CpuState& s, GuestMemory&) {

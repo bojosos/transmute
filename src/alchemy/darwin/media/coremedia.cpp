@@ -1017,7 +1017,7 @@ void CoreMedia::install_attachments() {
 }
 
 void CoreMedia::install_keys() {
-    for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 26>{{
+    for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 27>{{
              {"_kCMFormatDescriptionColorPrimaries_DCI_P3", "DCI_P3"},
              {"_kCMFormatDescriptionColorPrimaries_ITU_R_2020", "ITU_R_2020"},
              {"_kCMFormatDescriptionColorPrimaries_P3_D65", "P3_D65"},
@@ -1027,6 +1027,7 @@ void CoreMedia::install_keys() {
              {"_kCMFormatDescriptionExtension_FullRangeVideo", "FullRangeVideo"},
              {"_kCMFormatDescriptionExtension_MasteringDisplayColorVolume", "MasteringDisplayColorVolume"},
              {"_kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms", "SampleDescriptionExtensionAtoms"},
+             {"_kCMFormatDescriptionExtension_VerbatimSampleDescription", "VerbatimSampleDescription"},   // (unverified: naming convention)
              {"_kCMFormatDescriptionTransferFunction_ITU_R_2020", "ITU_R_2020"},
              {"_kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG", "ITU_R_2100_HLG"},
              {"_kCMFormatDescriptionTransferFunction_Linear", "Linear"},
@@ -1557,6 +1558,27 @@ void CoreMedia::install_sample_buffer_more() {
         if (s.x[2]) {
             if (s.x[1] < entries) { s.x[0] = status(sb_array_too_small); return; }
             m.write_bytes(s.x[2], b->timing);
+        }
+        s.x[0] = 0;
+    });
+    // CMSampleBufferGetOutputSampleTimingInfoArray(sbuf, entries, CMSampleTimingInfo *array, CMItemCount *entriesNeededOut):
+    // the timing as it is presented. With an output presentation time set (CMSampleBufferSetOutputPresentationTimeStamp)
+    // the presentation times move by its offset from the first entry's; nothing else here changes output timing (no
+    // speed multiplier or trim attachments are applied).
+    raw(core_media, "_CMSampleBufferGetOutputSampleTimingInfoArray", [sample](CpuState& s, GuestMemory& m) {
+        const auto b = sample(s.x[0]);
+        std::lock_guard lock(b->mutex);
+        const auto entries = b->timing.size() / 72;
+        if (s.x[3]) m.write64(s.x[3], entries);
+        if (!entries) { s.x[0] = status(sb_no_timing); return; }
+        if (s.x[2]) {
+            if (s.x[1] < entries) { s.x[0] = status(sb_array_too_small); return; }
+            m.write_bytes(s.x[2], b->timing);
+            if (b->output_pts) {
+                const auto offset = completion_kit::media::subtract(*b->output_pts, timing_time(b->timing, 24));
+                for (std::size_t i = 0; i < entries; ++i)
+                    write_cmtime(m, s.x[2] + 72 * i + 24, completion_kit::media::add(timing_time(b->timing, 72 * i + 24), offset));
+            }
         }
         s.x[0] = 0;
     });

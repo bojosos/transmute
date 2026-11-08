@@ -155,6 +155,17 @@ void core_media(Fixture& f) {
     require(attachments && f.cf.length(attachments) == 1, "sample attachments");
     require(f.call(cm, "_CMSampleBufferGetSampleAttachmentsArray", {sbuf, 0}) == attachments, "attachments kept");
     require(f.string_constant(cm, "_kCMSampleAttachmentKey_NotSync") == "NotSync", "attachment key");
+    // The output timing: as stored, then moved by an output presentation time (PTS 7/1 shown at 10/1).
+    const auto output = f.block(72), needed = f.block(8);
+    require(f.status(cm, "_CMSampleBufferGetOutputSampleTimingInfoArray", {sbuf, 1, output, needed}) == 0 && f.engine.read64(needed) == 1 &&
+            f.engine.read64(output + 24) == 7, "output timing as stored");
+    const auto shown = f.block(24);
+    f.engine.write64(shown, 10); f.engine.write32(shown + 8, 1); f.engine.write32(shown + 12, 1);
+    require(f.status(cm, "_CMSampleBufferSetOutputPresentationTimeStamp", {sbuf, shown}) == 0, "an output presentation time");
+    require(f.status(cm, "_CMSampleBufferGetOutputSampleTimingInfoArray", {sbuf, 1, output, needed}) == 0 && f.engine.read64(output + 24) == 10 &&
+            f.engine.read32(output + 32) == 1, "output timing at the output presentation time");
+    require(f.status(cm, "_CMSampleBufferGetOutputSampleTimingInfoArray", {sbuf, 0, output, needed}) == -12737, "an array too small");
+    require(f.string_constant(cm, "_kCMFormatDescriptionExtension_VerbatimSampleDescription") == "VerbatimSampleDescription", "VerbatimSampleDescription");
 }
 
 void video(Fixture& f) {
@@ -194,6 +205,8 @@ void video(Fixture& f) {
     require(f.string_constant(av, "_AVMediaTypeVideo") == "vide", "AVMediaTypeVideo");
     for (const auto* type : {"AVCaptureDeviceTypeExternal", "AVCaptureDeviceTypeContinuityCamera", "AVCaptureDeviceTypeMicrophone"})
         require(f.string_constant(av, std::string("_") + type) == type, std::string("macOS 14 capture device type ") + type);
+    // Screen capture through AVFoundation is not available: no screen input is made.
+    require(f.send(f.send(f.cls("AVCaptureScreenInput"), "alloc"), "initWithDisplayID:", {1}) == 0, "no AVCaptureScreenInput");
     const auto device = f.cls("AVCaptureDevice");
     require(f.cf.length(f.send(device, "devicesWithMediaType:", {f.engine.read64(f.symbol(av, "_AVMediaTypeVideo"))})) == 0, "no capture devices");
     require(f.send(device, "defaultDeviceWithMediaType:", {0}) == 0, "no default device");
