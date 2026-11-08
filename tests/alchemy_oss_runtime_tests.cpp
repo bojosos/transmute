@@ -1,8 +1,9 @@
 // Tests of a vendored open-source /usr/lib runtime library (libffi, SQLite, ICU, ...): the loader's
-// allow-list and provenance checks, doctor, and a guest fixture run in alchemy-fx processes.
+// allow-list and provenance checks, doctor, and a guest fixture run in alchemy-fx processes and,
+// with --in-process, under alchemy in this process (interpreter and JIT).
 //
-// Usage: alchemy_oss_runtime_tests <install name> <upstream> <fixture> <expected output> <scratch dir>
-//            <alchemy-fx.exe> <runtime dir> [<more runtime dirs>...]
+// Usage: alchemy_oss_runtime_tests [--in-process] <install name> <upstream> <fixture> <expected output>
+//            <scratch dir> <alchemy-fx.exe> <runtime dir> [<more runtime dirs>...]
 // The first runtime directory holds the library under test (its file is the install name's file
 // name, with provenance.json beside it); the others hold runtimes it depends on (LLVM's libc++).
 // The fixture's stdout must equal the expected-output file (CR characters ignored), at the default
@@ -15,10 +16,12 @@
 #include "alchemy/runtime_libraries.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -52,6 +55,7 @@ struct Test {
     std::filesystem::path program, scratch;
     std::string expected, alchemy_fx;
     std::vector<std::filesystem::path> runtimes;
+    bool in_process{};
     std::string file_name() const { return std::filesystem::path(install_name).filename().string(); }
 };
 
@@ -75,6 +79,28 @@ std::string doctor(const Test& test, const std::vector<std::filesystem::path>& r
     std::ostringstream report;
     status = alchemy::inspect_program(test.program, options, true, false, true, report);
     return report.str();
+}
+
+// The fixture under alchemy in this process: interpreter and JIT, default and rebased load base.
+void run_in_process(const Test& test) {
+    for (const bool jit : {false, true}) for (const bool rebased : {false, true}) {
+        alchemy::RunOptions options;
+        options.jit = options.jit_stats = jit;
+        options.runtime_directories = test.runtimes;
+        options.instruction_limit = 2'000'000'000;
+        if (rebased) options.load_base = 0x120000000ULL;
+        std::string out, err;
+        const auto writer = [&](unsigned descriptor, std::span<const std::uint8_t> bytes) -> alchemy::OutputResult {
+            (descriptor == 1 ? out : err).append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            return {bytes.size(), 0};
+        };
+        const auto process = alchemy::run_program(test.program, {}, options, writer);
+        const auto mode = std::string(jit ? "JIT" : "interpreter") + (rebased ? " rebased" : " default base");
+        require(process.exit_code == 0 && without_cr(out) == test.expected,
+                "alchemy " + mode + " mismatch: status " + std::to_string(process.exit_code) + " output " + out + err);
+        require(!jit || process.jit.native_guest_instructions != 0, "alchemy " + mode + ": no translated guest code executed");
+        std::cout << "  ok   alchemy " << mode << '\n';
+    }
 }
 
 void in_process(const Test& test) {
@@ -199,19 +225,22 @@ void fx(const Test& test) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 8)
-            throw std::runtime_error("usage: alchemy_oss_runtime_tests <install name> <upstream> <fixture> <expected output> "
-                                     "<scratch dir> <alchemy-fx> <runtime dir>...");
         Test test;
-        test.install_name = argv[1];
-        test.upstream = argv[2];
-        test.program = argv[3];
-        test.expected = without_cr(read(argv[4]));
-        test.scratch = argv[5];
-        test.alchemy_fx = argv[6];
-        for (int index = 7; index < argc; ++index) test.runtimes.emplace_back(argv[index]);
+        int first = 1;
+        if (argc > 1 && std::string(argv[1]) == "--in-process") { test.in_process = true; ++first; }
+        if (argc - first < 7)
+            throw std::runtime_error("usage: alchemy_oss_runtime_tests [--in-process] <install name> <upstream> <fixture> "
+                                     "<expected output> <scratch dir> <alchemy-fx> <runtime dir>...");
+        test.install_name = argv[first];
+        test.upstream = argv[first + 1];
+        test.program = argv[first + 2];
+        test.expected = without_cr(read(argv[first + 3]));
+        test.scratch = argv[first + 4];
+        test.alchemy_fx = argv[first + 5];
+        for (int index = first + 6; index < argc; ++index) test.runtimes.emplace_back(argv[index]);
         std::filesystem::create_directories(test.scratch);
         in_process(test);
+        if (test.in_process) run_in_process(test);
         fx(test);
         std::cout << "Alchemy runtime " << test.install_name << " tests passed\n";
         return 0;

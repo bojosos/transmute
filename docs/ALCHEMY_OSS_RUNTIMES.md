@@ -38,9 +38,9 @@ executable source as a copy with execute permission and tells the translator the
 finds the config page. The fixture checks 2600 closures on three trampoline pages, called from guest
 code and as a `qsort` comparator called back from the libSystem provider.
 
-The sources carry BTI landing pads (`hint #34` and `#36`), which are no-ops on cores without BTI.
-alchemy-fx runs them; the in-process reference interpreter does not decode them yet, so the test runs
-the fixture in alchemy-fx processes only.
+The sources carry BTI landing pads (`hint #34` and `#36`), which are no-ops on cores without BTI;
+alchemy-fx, the reference interpreter and the JIT all run them as such, and the test runs the fixture in
+all three (`IN_PROCESS`).
 
 ## SQLite: /usr/lib/libsqlite3.dylib
 
@@ -57,7 +57,8 @@ comes from `malloc` rather than a private malloc zone. WAL mode works: its share
 
 The fixture runs a file database in WAL mode with a second connection, prepared statements, FTS5,
 JSON and math functions, a guest SQL function and collation, the blob and backup APIs, and
-serialize/deserialize.
+serialize/deserialize. It runs in alchemy-fx processes only: WAL's writable `MAP_SHARED` file mapping needs
+the fx engine (the in-process engines have private mappings only).
 
 ## ICU: /usr/lib/libicucore.A.dylib
 

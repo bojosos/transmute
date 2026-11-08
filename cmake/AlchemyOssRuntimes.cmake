@@ -2,16 +2,17 @@
 # Each is built by scripts/build_alchemy_<name>.ps1 into ALCHEMY_<NAME>_RUNTIME_DIR
 # (artifacts/alchemy-<name>-arm64, target alchemy_<name>_runtime) and, once built, tested by
 # alchemy_oss_runtime_tests: allow-list, doctor, provenance refusals, and the guest fixture
-# tests/fixtures/macos/<name>_app.c in alchemy-fx processes against <name>_app.expected.
+# tests/fixtures/macos/<name>_app.c in alchemy-fx processes against <name>_app.expected (IN_PROCESS: also
+# under alchemy in the test process, interpreter and JIT).
 if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD AND macos_dir AND TARGET alchemy-fx)
     add_executable(alchemy_oss_runtime_tests tests/alchemy_oss_runtime_tests.cpp)
     target_link_libraries(alchemy_oss_runtime_tests PRIVATE alchemy_core)
     add_dependencies(alchemy_oss_runtime_tests alchemy-fx)
 endif()
 
-# alchemy_oss_runtime(<name> INSTALL_NAME <path> UPSTREAM <url> [EXTRA_RUNTIMES <dir>...])
+# alchemy_oss_runtime(<name> INSTALL_NAME <path> UPSTREAM <url> [IN_PROCESS] [EXTRA_RUNTIMES <dir>...])
 function(alchemy_oss_runtime name)
-    cmake_parse_arguments(arg "" "INSTALL_NAME;UPSTREAM" "EXTRA_RUNTIMES" ${ARGN})
+    cmake_parse_arguments(arg "IN_PROCESS" "INSTALL_NAME;UPSTREAM" "EXTRA_RUNTIMES" ${ARGN})
     string(TOUPPER "${name}" upper)
     set(ALCHEMY_${upper}_RUNTIME_DIR "${CMAKE_SOURCE_DIR}/artifacts/alchemy-${name}-arm64" CACHE PATH
         "Independently built ARM64 ${name} runtime directory (scripts/build_alchemy_${name}.ps1)")
@@ -34,15 +35,19 @@ function(alchemy_oss_runtime name)
     add_dependencies(alchemy_${name}_fixtures alchemy_macos_fixtures)
     add_dependencies(alchemy_oss_runtime_tests alchemy_${name}_fixtures)
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${name}-scratch")
+    set(mode)
+    if(arg_IN_PROCESS)
+        set(mode --in-process)
+    endif()
     add_test(NAME alchemy_${name}_runtime
-        COMMAND alchemy_oss_runtime_tests "${arg_INSTALL_NAME}" "${arg_UPSTREAM}" "${macos_dir}/${name}_app"
+        COMMAND alchemy_oss_runtime_tests ${mode} "${arg_INSTALL_NAME}" "${arg_UPSTREAM}" "${macos_dir}/${name}_app"
             "${CMAKE_SOURCE_DIR}/tests/fixtures/macos/${name}_app.expected" "${CMAKE_CURRENT_BINARY_DIR}/${name}-scratch"
             "$<TARGET_FILE:alchemy-fx>" "${dir}" ${arg_EXTRA_RUNTIMES})
     set_tests_properties(alchemy_${name}_runtime PROPERTIES TIMEOUT 300
         ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback")
 endfunction()
 
-alchemy_oss_runtime(libffi INSTALL_NAME /usr/lib/libffi.dylib UPSTREAM https://github.com/libffi/libffi)
+alchemy_oss_runtime(libffi INSTALL_NAME /usr/lib/libffi.dylib UPSTREAM https://github.com/libffi/libffi IN_PROCESS)
 alchemy_oss_runtime(sqlite INSTALL_NAME /usr/lib/libsqlite3.dylib UPSTREAM https://www.sqlite.org)
-alchemy_oss_runtime(icu INSTALL_NAME /usr/lib/libicucore.A.dylib UPSTREAM https://github.com/unicode-org/icu
+alchemy_oss_runtime(icu INSTALL_NAME /usr/lib/libicucore.A.dylib UPSTREAM https://github.com/unicode-org/icu IN_PROCESS
     EXTRA_RUNTIMES "${ALCHEMY_LLVM_RUNTIME_DIR}")
