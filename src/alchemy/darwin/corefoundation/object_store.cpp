@@ -120,7 +120,10 @@ std::uint64_t ObjectStore::retain(std::uint64_t address) {
         hook(address);
         return address;
     }
-    if (record.destroying || record.references == 0) throw std::runtime_error("retain during object destruction");
+    // A retain during the object's own destruction (Swift's -dealloc thunk retains self before its deinit
+    // consumes it) changes nothing, as objc4's rootRetain answers for a deallocating object.
+    if (record.destroying) return address;
+    if (record.references == 0) throw std::runtime_error("retain during object destruction");
     if (record.references == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("object retain count overflow");
     ++record.references;
     return address;
@@ -174,7 +177,8 @@ void ObjectStore::release(std::uint64_t address) {
         record = found->second;
         if (record->immortal) return;
         if (!record->forward_release) {
-            if (record->destroying || record->references == 0) throw std::runtime_error("release during object destruction");
+            if (record->destroying) return;   // its own destruction's balancing release (see retain)
+            if (record->references == 0) throw std::runtime_error("release during object destruction");
             if (--record->references != 0) return;
             record->destroying = true;
         }

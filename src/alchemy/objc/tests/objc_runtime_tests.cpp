@@ -645,6 +645,27 @@ void test_destructed_memory_kept() {
     require(!f.process.objects().peek(through).has_value(), "a dealloc reaching NSObject's is freed");
 }
 
+// A dealloc may retain and release its own object (Swift's -dealloc thunk retains self before its deinit
+// consumes it): as with objc4, retain answers the object without counting it, release does nothing, and
+// try_retain (weak loads) fails; the object is still freed when its dealloc ends.
+void test_retain_during_dealloc() {
+    Fixture f;
+    const auto root = f.runtime.find_class("NSObject");
+    const auto cls = f.runtime.register_native_class("RetainingDealloc", root, 16);
+    bool weak_loaded = true;
+    static_cast<void>(f.runtime.add_native_method(cls, "dealloc", [&f, cls, &weak_loaded](auto& s, auto&) {
+        const auto self = s.x[0];
+        require(f.call("_objc_retain", {self}) == self, "a retain during dealloc did not answer the object");
+        weak_loaded = f.process.objects().try_retain(self);
+        static_cast<void>(f.call("_objc_release", {self}));
+        static_cast<void>(f.runtime.send_super(self, cls, f.runtime.selector("dealloc")));
+    }, false, "v@:"));
+    const auto object = f.runtime.allocate(cls);
+    static_cast<void>(f.call("_objc_release", {object}));
+    require(!weak_loaded, "a weak load succeeded during dealloc");
+    require(!f.process.objects().peek(object).has_value(), "an object retained and released by its dealloc was not freed");
+}
+
 // The Swift runtime installs its hooks with objc_setHook_* and calls the previous hook unconditionally when its
 // own lookup fails, so each setter hands back a callable hook that finds nothing (NO or NULL), and afterwards the
 // hook it replaced.
@@ -681,6 +702,7 @@ int main(int argc, char** argv) {
         if (!bench_only) test_concurrent_flush();
         if (!bench_only) test_destructed_memory_kept();
         if (!bench_only) test_hook_chains();
+        if (!bench_only) test_retain_during_dealloc();
         for (const bool cached : {true, false}) benchmark(cached);
         std::cout << "Alchemy GUI objc runtime tests passed\n";
         return 0;

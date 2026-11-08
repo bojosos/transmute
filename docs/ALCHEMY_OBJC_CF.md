@@ -42,6 +42,11 @@ the loader removes new mappings. Closed plugin modules remain resident, so
 reopening does not repeat `+load`. Per-thread cleanup drains destructor-created
 autoreleases too; excessive cleanup fails explicitly at 65,536 releases.
 
+A retain or release of an object during its own destruction changes nothing, as
+with objc4: Swift's `-dealloc` thunk for a Swift subclass of an Objective-C
+class retains `self` before its deinit consumes it. A weak load of such an
+object fails.
+
 ## CoreFoundation values
 
 | Family | Implemented behavior |
