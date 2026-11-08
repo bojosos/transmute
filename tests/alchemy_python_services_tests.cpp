@@ -490,6 +490,39 @@ void child_flock_probe(const std::filesystem::path& path, bool busy) {
 }
 #endif
 
+// LibreOffice's temporary files on macOS (osl): open with O_RDWR | O_CREAT | O_EXCL | O_EXLOCK |
+// O_NONBLOCK | O_CLOEXEC and mode 0600, clear O_NONBLOCK, take a whole-file write lock with
+// F_SETLK, fstat, write, then rename into place. Every step has to succeed for its profile
+// writes to go anywhere (it created temporary files in a loop when one did not).
+void office_temporary_files() {
+    Fixture f;
+    TemporaryDirectory directory(f);
+    const auto name = directory.guest("a1b2c3");
+    f.slot(0600);
+    const auto descriptor = f.call("_open", {name, 0x1000a26});
+    require(descriptor != UINT64_MAX, "temporary open (O_EXCL | O_EXLOCK | O_NONBLOCK) failed, errno " + std::to_string(f.error()));
+    const auto flags = f.call("_fcntl", {descriptor, 3});   // F_GETFL
+    // F_GETFL: the access mode and status flags only (O_RDWR | O_NONBLOCK), no O_CREAT or O_EXCL.
+    require(flags == 6, "F_GETFL of the temporary file is " + std::to_string(flags));
+    f.slot(flags & ~4ULL);   // fcntl's third argument is variadic: on the stack
+    require(f.call("_fcntl", {descriptor, 4}) == 0 && f.call("_fcntl", {descriptor, 3}) == 2,
+            "F_SETFL clearing O_NONBLOCK, errno " + std::to_string(f.error()));
+    const auto lock = f.context.allocate_guest(32);
+    f.memory().fill_bytes(lock, 0, 32);
+    f.memory().write8(lock + 20, 3);   // l_type F_WRLCK; l_whence SEEK_SET, l_start 0, l_len 0 (the whole file)
+    f.slot(lock);
+    require(f.call("_fcntl", {descriptor, 8}) == 0, "F_SETLK write lock on the temporary file, errno " + std::to_string(f.error()));
+    const auto metadata = f.context.allocate_guest(144);
+    require(f.call("_fstat", {descriptor, metadata}) == 0, "fstat of the temporary file, errno " + std::to_string(f.error()));
+    require(f.call("_write", {descriptor, f.string("profile"), 7}) == 7, "write to the temporary file, errno " + std::to_string(f.error()));
+    const auto target = directory.guest("registrymodifications.xcu");
+    require(f.call("_rename", {name, target}) == 0, "rename of the open, locked temporary file, errno " + std::to_string(f.error()));
+    f.memory().write8(lock + 20, 2);   // F_UNLCK
+    f.slot(lock);
+    require(f.call("_fcntl", {descriptor, 8}) == 0 && f.call("_close", {descriptor}) == 0, "unlock and close");
+    require(f.call("_access", {target, 0}) == 0 && f.call("_access", {name, 0}) == UINT64_MAX, "the renamed file is in place");
+}
+
 void advisory_locks_and_waits() {
     Fixture f;
     TemporaryDirectory directory(f);
@@ -595,7 +628,7 @@ int run_tests(const std::filesystem::path& probe = {}, bool busy = false) {
             require(busy ? result == UINT64_MAX && f.error() == 35 : result == 0, "flock child result incorrect");
             return 0;
         }
-        descriptor_io_and_stdio(); descriptor_inheritance_controls(); relative_files_and_identity(); signals_threads_and_once(); random_device();
+        descriptor_io_and_stdio(); descriptor_inheritance_controls(); relative_files_and_identity(); office_temporary_files(); signals_threads_and_once(); random_device();
         temporary_files_and_directory_descriptors(); descriptor_pressure_and_replacement_lifetimes(); advisory_locks_and_waits();
         std::cout << "Alchemy Python services passed\n"; return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

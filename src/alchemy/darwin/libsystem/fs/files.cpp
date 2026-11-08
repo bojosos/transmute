@@ -728,7 +728,9 @@ void DarwinServices::Impl::install_python_services() {
         if (command == 1) return static_cast<std::uint64_t>(descriptor_cloexec(descriptor));
         if (command == 3) { if (!record) return std::uint64_t{descriptor == 0 ? 0ULL : 1ULL}; std::lock_guard lock(record->mutex); if (record->closed) throw ServiceError{ebadf}; if (record->socket) return static_cast<std::uint64_t>(record->socket->status_flags.load());
             if (record->pipe) return (record->flags & 3) | record->pipe_status->load();
-            return record->random_device ? *record->random_flags : record->flags & ~0x1000000ULL; }
+            // As xnu's F_GETFL: the access mode and the status flags (O_NONBLOCK, O_APPEND, O_ASYNC,
+            // O_FSYNC, O_DSYNC), never the open-time flags (O_CREAT, O_EXCL, O_TRUNC, O_CLOEXEC...).
+            return record->random_device ? *record->random_flags : record->flags & (3ULL | 4 | 8 | 0x40 | 0x80 | 0x400000); }
         // Apple ARM64 variadic ints occupy a stack slot whose upper padding is
         // unspecified. Pointer-valued F_GETPATH arguments use the full word.
         const auto argument = command == 50 || (command >= 7 && command <= 9) ? m.read64(s.sp) : static_cast<std::uint64_t>(m.read32(s.sp));
@@ -757,10 +759,18 @@ void DarwinServices::Impl::install_python_services() {
                 std::lock_guard lock(record->mutex);
                 record->flags = (record->flags & ~4ULL) | (argument & 4); return std::uint64_t{0};
             }
-            // Shared open-file status flags need a backend update; do not
-            // advertise a successful append/nonblocking change we cannot make.
-            const auto current = record ? record->flags : (descriptor == 0 ? 0ULL : 1ULL);
-            if ((argument & (4 | 8)) != (current & (4 | 8))) throw ServiceError{enosys};
+            // Files and directories, as xnu's F_SETFL: O_NONBLOCK and O_APPEND are the open file's (shared by
+            // its duplicates). O_NONBLOCK changes nothing for them; O_APPEND makes every write go to the end
+            // (the write path reads it). Other bits are ignored, but O_ASYNC (SIGIO) is not provided.
+            // LibreOffice opens its temporary files nonblocking and then clears the flag.
+            if (argument & 0x40) throw ServiceError{enosys};
+            if (!record) {
+                const auto current = descriptor == 0 ? 0ULL : 1ULL;
+                if ((argument & (4 | 8)) != (current & (4 | 8))) throw ServiceError{enosys};
+                return std::uint64_t{0};
+            }
+            std::lock_guard lock(record->mutex); if (record->closed) throw ServiceError{ebadf};
+            record->flags = (record->flags & ~(4ULL | 8ULL)) | (argument & (4 | 8));
             return std::uint64_t{0};
         }
         if (command >= 7 && command <= 9) {
