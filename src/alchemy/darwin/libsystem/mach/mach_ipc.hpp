@@ -180,6 +180,7 @@ struct Port {
     std::uint64_t remote_refs{}, remote_once{};
     std::map<std::uint32_t, std::uint64_t> holders, once_holders;
     bool migrating{};
+    bool checked_in{};                 // a name in the broker's registry stands for it; the broker learns when it dies
 };
 
 struct PortSet {

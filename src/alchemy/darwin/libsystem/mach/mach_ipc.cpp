@@ -348,6 +348,8 @@ void MachIpc::kill_port(std::shared_ptr<Port> port) {
         std::set<std::uint32_t> told;
         for (const auto& [pid, units] : port->holders) { static_cast<void>(units); told.insert(pid); }
         for (const auto& [pid, units] : port->once_holders) { static_cast<void>(units); told.insert(pid); }
+        // A name checked in for it at the broker is free again (GoogleUpdater's named locks).
+        if (port->checked_in && !port->host && broker_ != self_) told.insert(broker_);
         for (const auto pid : told) {
             Writer frame;
             frame.u32(port->key.pid);

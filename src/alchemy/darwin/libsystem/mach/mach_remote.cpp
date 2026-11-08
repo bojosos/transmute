@@ -485,6 +485,10 @@ void MachIpc::frame(std::uint32_t from, std::uint32_t type, Reader& in) {
     case frame_dead: {
         const auto key = read_key(in);
         Lock lock(mutex_);
+        // Names checked in for the port (the broker's registry) are free again.
+        std::erase_if(registry_, [&](const auto& entry) {
+            return entry.second.first == from && entry.second.second.pid == key.pid && entry.second.second.id == key.id;
+        });
         if (const auto found = proxies_.find({from, key}); found != proxies_.end()) kill_port(found->second);
         return;
     }
@@ -703,6 +707,10 @@ std::uint32_t MachIpc::bootstrap_check_in(const std::string& service, Name& out)
     if (status) {
         static_cast<void>(mod_refs(receive, right::receive, -1));
         return status;
+    }
+    {
+        Lock lock(mutex_);
+        if (auto* entry = find(receive); entry && entry->port) entry->port->checked_in = true;
     }
     out = receive;
     return 0;

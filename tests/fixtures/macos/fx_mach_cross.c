@@ -24,7 +24,10 @@
  *      outlives it, checks in a name through that special port (read only
  *      after its parent is gone), and this process finds the name;
  *  12. as GoogleUpdater's named locks: this process checks in a name and
- *      destroys the receive right; a child's check-in of that name succeeds.
+ *      destroys the receive right; a child's check-in of that name succeeds;
+ *  13. the same between two other processes: a child checks in a name and
+ *      destroys the receive right while it lives on; its child's check-in of
+ *      that name succeeds (the broker learns the right died).
  * No SDK headers. Prints "fx mach cross: ok"; else exits with the step. */
 typedef unsigned mach_port_t;
 typedef int kern_return_t;
@@ -217,15 +220,35 @@ static int server(const char* name) {
     return 0;
 }
 
-/* 12. The lock taker: checks in a name its parent checked in and released. */
+/* 12, 13. The lock taker: checks in a name its parent checked in and released
+ * (retrying for a while, as GoogleUpdater does: the release reaches the broker
+ * asynchronously). */
 static int relock(const char* name) {
     mach_port_t port = 0;
-    return bootstrap_check_in(bootstrap_port, name, &port) == 0 && port ? 0 : 2;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        if (bootstrap_check_in(bootstrap_port, name, &port) == 0 && port) return 0;
+        usleep(25000);
+    }
+    return 2;
+}
+/* 13. The lock holder: checks in `name`, destroys the receive right, and has a
+ * child of its own take the name while this process still lives. */
+static int lockholder(char* program, char* name) {
+    mach_port_t held = 0;
+    if (bootstrap_check_in(bootstrap_port, name, &held) != 0 || !held) return 2;
+    if (mach_port_mod_refs(mach_task_self_, held, RIGHT_RECEIVE, -1) != 0) return 3;
+    char* arguments[] = {program, "relock", name, 0};
+    pid_t pid = 0;
+    int status = -1;
+    if (posix_spawn(&pid, program, 0, 0, arguments, environ) != 0 || pid <= 0) return 4;
+    if (waitpid(pid, &status, 0) != pid) return 5;
+    return status == 0 ? 0 : 6;
 }
 
 int main(int argc, char** argv) {
     if (argc == 3 && same(argv[1], "child")) return child(argv[2]);
     if (argc == 3 && same(argv[1], "relock")) return relock(argv[2]);
+    if (argc == 3 && same(argv[1], "lockholder")) return lockholder(argv[0], argv[2]);
     if (argc == 3 && same(argv[1], "launcher")) return launcher(argv[0], argv[2]);
     if (argc == 3 && same(argv[1], "server")) return server(argv[2]);
     const mach_port_t task = mach_task_self_;
@@ -326,6 +349,13 @@ int main(int argc, char** argv) {
     pid_t relock_pid = 0;
     if (posix_spawn(&relock_pid, argv[0], 0, 0, relock_arguments, environ) != 0 || relock_pid <= 0) return 51;
     if (waitpid(relock_pid, &status, 0) != relock_pid || status != 0) return 52;
+    /* 13. Released in a process other than this one (the broker). */
+    char other_lock[64] = "org.alchemy.test.otherlock.";
+    decimal(other_lock + 27, (unsigned)getpid());
+    char* holder_arguments[] = {argv[0], "lockholder", other_lock, 0};
+    pid_t holder_pid = 0;
+    if (posix_spawn(&holder_pid, argv[0], 0, 0, holder_arguments, environ) != 0 || holder_pid <= 0) return 53;
+    if (waitpid(holder_pid, &status, 0) != holder_pid || status != 0) return 54;
     puts("fx mach cross: ok");
     return 0;
 }
