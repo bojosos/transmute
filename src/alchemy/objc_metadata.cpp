@@ -104,9 +104,9 @@ public:
                     result.selectors.push_back({slot, string(memory_.read64(slot))});
                 }
             } else if (section.name == "__objc_protolist") {
+                // The linker can list a protocol more than once (mpv); objc4 and dyld take each once.
                 pointers(section, [&](auto address) {
-                    if (!listed.insert(address).second) malformed("duplicate protocol-list entry");
-                    pending.push_back(address);
+                    if (listed.insert(address).second) pending.push_back(address);
                 });
             } else if (section.name == "__objc_protorefs") {
                 if (section.size % 8 != 0) malformed("protocol-reference section is not pointer sized");
@@ -452,7 +452,11 @@ std::vector<ObjcImageInfo> parse_objc_images(const ProcessContext& process,
     std::set<std::uint64_t> ids;
     for (const auto& image : images) {
         if (!ids.insert(image.module_id).second) malformed("duplicate image identity in batch");
-        result.push_back(decoder.image(image));
+        // A failure names the image it is in.
+        try { result.push_back(decoder.image(image)); }
+        catch (const std::runtime_error& error) {
+            throw std::runtime_error(std::string(error.what()) + " (in " + (image.name.empty() ? "an unnamed image" : image.name) + ")");
+        }
     }
     return result;
 }

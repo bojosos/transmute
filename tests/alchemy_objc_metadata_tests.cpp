@@ -166,6 +166,19 @@ void protocols_and_references() {
         image.protocol_references.size() == 1 && image.protocol_references[0].slot == base + 2000,
         "class protocol list or protocol reference mismatch");
     require(f.engine.read64(base + 2000) == first && !f.engine.read64(first), "protocol parsing mutated guest metadata");
+    {
+        // The linker can list a protocol twice (mpv): it is taken once.
+        const auto original = f.image.sections[3];
+        f.image.sections[3] = {"__DATA", "__objc_protolist", base + 2496, 16, 0};
+        f.engine.write64(base + 2496, second); f.engine.write64(base + 2504, second);
+        const auto repeated = f.parse();
+        require(repeated[0].protocols.size() == 2 && repeated[0].protocols[0].address == second, "a repeated protocol-list entry was not taken once");
+        f.image.sections[3] = original;
+    }
+    // A failure names the image it is in.
+    f.image.name = "/usr/lib/libfixture.dylib";
+    f.engine.write64(first + 16, base + 2288); f.engine.write64(base + 2288, 1); f.engine.write64(base + 2296, second);
+    rejects([&] { static_cast<void>(f.parse()); }, "(in /usr/lib/libfixture.dylib)");
     f.engine.write64(first + 16, base + 2288); f.engine.write64(base + 2288, 1); f.engine.write64(base + 2296, second);
     rejects([&] { static_cast<void>(f.parse()); }, "cyclic protocol inheritance");
     f.engine.write64(first + 16, 0); f.engine.write32(first + 68, 1U << 31);
