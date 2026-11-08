@@ -13,6 +13,7 @@
 #include <memory>
 #include <exception>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -150,6 +151,39 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
     std::uint64_t worker_generation{};
     std::uint64_t exit_shim{};
     std::atomic<bool> closing{};
+    // Darwin's per-thread TSD array (libpthread's tsd[], whose address TPIDRRO_EL0 holds): slot 0 the
+    // thread's pthread_t, then the pthread_getspecific value of every key below 768 (the framework-
+    // reserved ones below 256). Programs read their slots directly: Go scans the array for the value it
+    // just stored with pthread_setspecific. Keys from 768 (left after many deletions) keep key_values.
+    static constexpr std::uint64_t tsd_slots = 768;
+    std::map<std::uint64_t, std::uint64_t> tsd_arrays;   // thread identity -> array
+
+    // The calling thread's TSD array, made (and given to TPIDRRO_EL0) on first use.
+    std::uint64_t tsd_array(std::uint64_t identity, std::uint64_t handle, transmute::ReferenceEngine& engine) {
+        {
+            std::lock_guard lock(metadata);
+            if (const auto found = tsd_arrays.find(identity); found != tsd_arrays.end()) return found->second;
+        }
+        const auto array = process.allocate_guest(tsd_slots * 8, 16);
+        process.main_engine().fill_bytes(array, 0, tsd_slots * 8);
+        process.main_engine().write64(array, handle);
+        set_engine_thread_readonly_pointer(engine, array);
+        std::lock_guard lock(metadata);
+        tsd_arrays.emplace(identity, array);
+        return array;
+    }
+    // pthread_getspecific is hot (the Swift runtime, ObjC): the host thread keeps its array at hand.
+    struct TsdCache { const Impl* owner{}; std::uint64_t identity{}, array{}; };
+    static TsdCache& tsd_cache() { thread_local TsdCache cache; return cache; }
+    std::uint64_t own_tsd() {
+        auto& cache = tsd_cache();
+        const auto identity = process.current_thread()->identity;
+        if (cache.owner == this && cache.identity == identity && cache.array) return cache.array;
+        const auto handle = self();
+        cache = {this, identity, tsd_array(identity, handle, process.calling_engine())};
+        set_engine_thread_readonly_pointer(process.calling_engine(), cache.array);   // from inside the thread's guest call
+        return cache.array;
+    }
 
     std::uint64_t self() {
         const auto thread = process.current_thread();
@@ -386,15 +420,21 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             static_cast<void>(EngineAdapter(*thread.engine).call(function, arguments));
         }
         // POSIX permits four destructor passes when callbacks repopulate keys.
+        auto& memory = process.main_engine();
         for (unsigned pass = 0; pass < 4; ++pass) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> pending;
             {
                 std::lock_guard lock(metadata);
-                for (auto& [key, value] : thread.key_values) {
-                    const auto destructor = keys.find(key);
-                    if (value != 0 && destructor != keys.end() && destructor->second != 0) {
-                        pending.emplace_back(destructor->second, value);
-                        value = 0;
+                const auto tsd = tsd_arrays.find(thread.identity);
+                for (const auto& [key, destructor] : keys) {
+                    if (!destructor) continue;
+                    if (key < tsd_slots) {
+                        if (tsd == tsd_arrays.end()) continue;
+                        const auto slot = tsd->second + key * 8;
+                        if (const auto value = memory.read64(slot)) { pending.emplace_back(destructor, value); memory.write64(slot, 0); }
+                    } else if (const auto value = thread.key_values.find(key); value != thread.key_values.end() && value->second) {
+                        pending.emplace_back(destructor, value->second);
+                        value->second = 0;
                     }
                 }
             }
@@ -406,6 +446,15 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         }
         if (process.cleanup_objects) process.cleanup_objects(thread);
         forget_cancel(thread.identity);
+        {
+            std::uint64_t array = 0;
+            {
+                std::lock_guard lock(metadata);
+                if (const auto found = tsd_arrays.find(thread.identity); found != tsd_arrays.end()) { array = found->second; tsd_arrays.erase(found); }
+            }
+            if (array) process.release_guest(array);
+            if (auto& cache = tsd_cache(); cache.owner == this && cache.identity == thread.identity) cache = {};
+        }
         for (const auto& [module, address] : thread.tls_blocks) {
             static_cast<void>(module);
             process.release_guest(address);
@@ -487,6 +536,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                 std::uint64_t instructions = 0;
                 try {
                     const GuestStopScope stoppable;   // caught below
+                    static_cast<void>(owned->tsd_array(worker->context->identity, worker->handle, *worker->engine));
                     instructions = worker->engine->run().instructions;
                     worker->result = worker->context->exit_value.value_or(worker->engine->state().x[0]);
                     owned->cleanup(*worker->context);
@@ -1261,18 +1311,29 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                 if ((value->owner == identity) != must_own)
                     throw std::runtime_error(must_own ? "os_unfair_lock is not owned by the current thread" : "os_unfair_lock is owned by the current thread");
             });
-        add("_pthread_key_delete", [](auto& self, auto& s, auto&) {
-            std::lock_guard lock(self.metadata); s.x[0] = self.keys.erase(s.x[0]) != 0 ? 0 : einval;
+        // The values live in each thread's TSD array (keys below 768), as libpthread's: a deleted key's slot
+        // is cleared in every thread.
+        add("_pthread_key_delete", [](auto& self, auto& s, auto& m) {
+            std::lock_guard lock(self.metadata);
+            const auto key = s.x[0];
+            if (!self.keys.erase(key)) { s.x[0] = einval; return; }
+            if (key < Impl::tsd_slots) for (const auto& [identity, array] : self.tsd_arrays) { static_cast<void>(identity); m.write64(array + key * 8, 0); }
+            s.x[0] = 0;
         });
-        add("_pthread_setspecific", [](auto& self, auto& s, auto&) {
+        add("_pthread_setspecific", [](auto& self, auto& s, auto& m) {
+            const auto key = s.x[0];
+            const auto tsd = key < Impl::tsd_slots ? self.own_tsd() : 0;
             const auto thread = self.process.current_thread(); std::lock_guard lock(self.metadata);
-            if (!self.keys.contains(s.x[0])) { s.x[0] = einval; return; }
-            thread->key_values[s.x[0]] = s.x[1]; s.x[0] = 0;
+            if (!self.keys.contains(key)) { s.x[0] = einval; return; }
+            if (tsd) m.write64(tsd + key * 8, s.x[1]); else thread->key_values[key] = s.x[1];
+            s.x[0] = 0;
         });
-        add("_pthread_getspecific", [](auto& self, auto& s, auto&) {
+        add("_pthread_getspecific", [](auto& self, auto& s, auto& m) {
+            const auto key = s.x[0];
+            if (key < Impl::tsd_slots) { s.x[0] = m.read64(self.own_tsd() + key * 8); return; }
             const auto thread = self.process.current_thread(); std::lock_guard lock(self.metadata);
-            const auto value = thread->key_values.find(s.x[0]);
-            s.x[0] = self.keys.contains(s.x[0]) && value != thread->key_values.end() ? value->second : 0;
+            const auto value = thread->key_values.find(key);
+            s.x[0] = self.keys.contains(key) && value != thread->key_values.end() ? value->second : 0;
         });
         add("___ulock_wait", [](auto& self, auto& s, auto& m) {
             const auto operation = static_cast<std::uint32_t>(s.x[0]);

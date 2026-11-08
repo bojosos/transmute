@@ -68,6 +68,18 @@ void jit(Fixture& f) {
     f.engine.set_memory_access(code, true, false, true);
     require(alchemy::set_engine_thread_readonly_pointer(f.engine, 0x5a5a5000) &&
             f.engine.invoke_callback(code, std::span<const std::uint64_t>{}) == 0x5a5a5000, "TPIDRRO_EL0 hook");
+    // Darwin's TSD array at TPIDRRO_EL0 (Go's pattern): pthread_setspecific stores in slot[key], which the
+    // program finds by reading the array; slot 0 is pthread_self; a direct store is what getspecific answers.
+    const auto key_slot = f.block(8);
+    require(f.call(sys, "_pthread_key_create", {key_slot, 0}) == 0, "pthread_key_create");
+    const auto key = f.engine.read64(key_slot);
+    require(f.call(sys, "_pthread_setspecific", {key, 0xc476c475c47957ULL}) == 0, "pthread_setspecific");
+    const auto tsd = f.engine.invoke_callback(code, std::span<const std::uint64_t>{});
+    require(tsd && tsd != 0x5a5a5000 && f.engine.read64(tsd + key * 8) == 0xc476c475c47957ULL, "the key's value is not in its TSD slot");
+    require(f.engine.read64(tsd) == f.call(sys, "_pthread_self"), "TSD slot 0 is not pthread_self");
+    f.engine.write64(tsd + key * 8, 0x1234);
+    require(f.call(sys, "_pthread_getspecific", {key}) == 0x1234, "pthread_getspecific does not read the slot");
+    require(f.call(sys, "_pthread_key_delete", {key}) == 0 && f.engine.read64(tsd + key * 8) == 0, "a deleted key's slot was not cleared");
 }
 
 void tasks(Fixture& f) {
