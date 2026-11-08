@@ -173,14 +173,17 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         return array;
     }
     // pthread_getspecific is hot (the Swift runtime, ObjC): the host thread keeps its array at hand.
-    struct TsdCache { const Impl* owner{}; std::uint64_t identity{}, array{}; };
+    // Keyed by a serial, not the Impl's address: a later Impl (a new process context in the same host
+    // thread) can reuse the address, and the cached array belongs to the earlier one's memory.
+    struct TsdCache { std::uint64_t owner{}, identity{}, array{}; };
     static TsdCache& tsd_cache() { thread_local TsdCache cache; return cache; }
+    const std::uint64_t serial = [] { static std::atomic<std::uint64_t> next{1}; return next.fetch_add(1); }();
     std::uint64_t own_tsd() {
         auto& cache = tsd_cache();
         const auto identity = process.current_thread()->identity;
-        if (cache.owner == this && cache.identity == identity && cache.array) return cache.array;
+        if (cache.owner == serial && cache.identity == identity && cache.array) return cache.array;
         const auto handle = self();
-        cache = {this, identity, tsd_array(identity, handle, process.calling_engine())};
+        cache = {serial, identity, tsd_array(identity, handle, process.calling_engine())};
         set_engine_thread_readonly_pointer(process.calling_engine(), cache.array);   // from inside the thread's guest call
         return cache.array;
     }
@@ -446,14 +449,16 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         }
         if (process.cleanup_objects) process.cleanup_objects(thread);
         forget_cancel(thread.identity);
-        {
+        // A thread's TSD array goes with it, but the main thread's lasts as long as the process: image
+        // terminators and atexit handlers run after this and still read it (mimalloc's process detach).
+        if (thread.engine != &process.main_engine()) {
             std::uint64_t array = 0;
             {
                 std::lock_guard lock(metadata);
                 if (const auto found = tsd_arrays.find(thread.identity); found != tsd_arrays.end()) { array = found->second; tsd_arrays.erase(found); }
             }
             if (array) process.release_guest(array);
-            if (auto& cache = tsd_cache(); cache.owner == this && cache.identity == thread.identity) cache = {};
+            if (auto& cache = tsd_cache(); cache.owner == serial && cache.identity == thread.identity) cache = {};
         }
         for (const auto& [module, address] : thread.tls_blocks) {
             static_cast<void>(module);
@@ -1464,6 +1469,9 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         };
         process.join_workers = [owned] { owned->join_all(); };
         process.cleanup_thread = [owned](auto& thread) { owned->cleanup(thread); };
+        // The main thread has its TSD array from the start, as on Darwin, where libpthread sets it up before
+        // any image's initializers run: mimalloc (Python 3.14) reads tsd[0] through TPIDRRO_EL0 in one.
+        static_cast<void>(own_tsd());
     }
 };
 

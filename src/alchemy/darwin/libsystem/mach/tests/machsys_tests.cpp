@@ -10,6 +10,16 @@ constexpr std::string_view sys = "/usr/lib/libSystem.B.dylib";
 constexpr std::string_view ncurses = "/usr/lib/libncurses.5.4.dylib";
 
 void imports(Fixture& f) {
+    // The main thread's TSD array is there before any pthread call (libpthread's set-up): tsd[0] is
+    // pthread_self, as mimalloc reads it in an image initializer (imports runs first).
+    {
+        const auto probe = f.process.allocate_guest(16384, 16384);
+        f.engine.write32(probe, 0xd53bd060);       // mrs x0, tpidrro_el0
+        f.engine.write32(probe + 4, 0xd65f03c0);   // ret
+        f.engine.set_memory_access(probe, true, false, true);
+        const auto early = f.engine.invoke_callback(probe, std::span<const std::uint64_t>{});
+        require(early && f.engine.read64(early) == f.call(sys, "_pthread_self"), "the main thread's TSD array before any pthread call");
+    }
     imports_resolve(f, {sys, "/usr/lib/libbsm.0.dylib", "/usr/lib/libpmenergy.dylib", "/usr/lib/libpmsample.dylib", ncurses});
 }
 
@@ -66,8 +76,10 @@ void jit(Fixture& f) {
     f.engine.write32(code, 0xd53bd060);       // mrs x0, tpidrro_el0
     f.engine.write32(code + 4, 0xd65f03c0);   // ret
     f.engine.set_memory_access(code, true, false, true);
+    const auto main_tsd = f.engine.invoke_callback(code, std::span<const std::uint64_t>{});
     require(alchemy::set_engine_thread_readonly_pointer(f.engine, 0x5a5a5000) &&
             f.engine.invoke_callback(code, std::span<const std::uint64_t>{}) == 0x5a5a5000, "TPIDRRO_EL0 hook");
+    static_cast<void>(alchemy::set_engine_thread_readonly_pointer(f.engine, main_tsd));   // the main thread's TSD again
     // Darwin's TSD array at TPIDRRO_EL0 (Go's pattern): pthread_setspecific stores in slot[key], which the
     // program finds by reading the array; slot 0 is pthread_self; a direct store is what getspecific answers.
     const auto key_slot = f.block(8);
@@ -75,7 +87,7 @@ void jit(Fixture& f) {
     const auto key = f.engine.read64(key_slot);
     require(f.call(sys, "_pthread_setspecific", {key, 0xc476c475c47957ULL}) == 0, "pthread_setspecific");
     const auto tsd = f.engine.invoke_callback(code, std::span<const std::uint64_t>{});
-    require(tsd && tsd != 0x5a5a5000 && f.engine.read64(tsd + key * 8) == 0xc476c475c47957ULL, "the key's value is not in its TSD slot");
+    require(tsd == main_tsd && f.engine.read64(tsd + key * 8) == 0xc476c475c47957ULL, "the key's value is not in its TSD slot");
     require(f.engine.read64(tsd) == f.call(sys, "_pthread_self"), "TSD slot 0 is not pthread_self");
     f.engine.write64(tsd + key * 8, 0x1234);
     require(f.call(sys, "_pthread_getspecific", {key}) == 0x1234, "pthread_getspecific does not read the slot");

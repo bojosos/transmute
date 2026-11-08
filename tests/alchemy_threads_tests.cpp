@@ -447,21 +447,22 @@ void test_thread_reaping() {
 
 int main() {
     try {
-        test_mutex_keys_and_once();
-        test_condition_wakeup_order();
-        test_thread_reaping();
-        test_workers(false);
-        test_workers(true);
-        test_configurable_stacks(false);
-        test_configurable_stacks(true);
-        test_explicit_thread_exit();
-        test_cancellation();
-        test_recursive_unfair_lock();
-        test_reserved_swift_keys();
-        test_tlv_and_cleanup();
-        test_guards_and_timed_condition();
-        test_address_waits_and_context_release();
-        test_attributes_names_and_stop();
+        const auto stage = [](std::string_view name) { std::cout << "[stage] " << name << std::endl; };
+        stage("test_mutex_keys_and_once()"); test_mutex_keys_and_once();
+        stage("test_condition_wakeup_order()"); test_condition_wakeup_order();
+        stage("test_thread_reaping()"); test_thread_reaping();
+        stage("test_workers(false)"); test_workers(false);
+        stage("test_workers(true)"); test_workers(true);
+        stage("test_configurable_stacks(false)"); test_configurable_stacks(false);
+        stage("test_configurable_stacks(true)"); test_configurable_stacks(true);
+        stage("test_explicit_thread_exit()"); test_explicit_thread_exit();
+        stage("test_cancellation()"); test_cancellation();
+        stage("test_recursive_unfair_lock()"); test_recursive_unfair_lock();
+        stage("test_reserved_swift_keys()"); test_reserved_swift_keys();
+        stage("test_tlv_and_cleanup()"); test_tlv_and_cleanup();
+        stage("test_guards_and_timed_condition()"); test_guards_and_timed_condition();
+        stage("test_address_waits_and_context_release()"); test_address_waits_and_context_release();
+        stage("test_attributes_names_and_stop()"); test_attributes_names_and_stop();
         std::cout << "Alchemy Darwin thread tests passed\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
