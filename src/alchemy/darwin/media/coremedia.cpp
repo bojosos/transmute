@@ -1017,7 +1017,7 @@ void CoreMedia::install_attachments() {
 }
 
 void CoreMedia::install_keys() {
-    for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 27>{{
+    for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 28>{{
              {"_kCMFormatDescriptionColorPrimaries_DCI_P3", "DCI_P3"},
              {"_kCMFormatDescriptionColorPrimaries_ITU_R_2020", "ITU_R_2020"},
              {"_kCMFormatDescriptionColorPrimaries_P3_D65", "P3_D65"},
@@ -1038,6 +1038,7 @@ void CoreMedia::install_keys() {
              {"_kCMSampleAttachmentKey_DisplayImmediately", "DisplayImmediately"},
              {"_kCMSampleAttachmentKey_IsDependedOnByOthers", "IsDependedOnByOthers"},
              {"_kCMSampleAttachmentKey_NotSync", "NotSync"},
+             {"_kCMSampleAttachmentKey_PartialSync", "PartialSync"},   // (unverified: naming convention)
              {"_kCMSampleAttachmentKey_DependsOnOthers", "DependsOnOthers"},
              {"_kCMFormatDescriptionExtension_ContainsAlphaChannel", "ContainsAlphaChannel"},
              {"_kCMFormatDescriptionExtension_PixelAspectRatio", "CVPixelAspectRatio"},

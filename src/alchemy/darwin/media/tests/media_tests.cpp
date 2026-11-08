@@ -165,7 +165,8 @@ void core_media(Fixture& f) {
     require(f.status(cm, "_CMSampleBufferGetOutputSampleTimingInfoArray", {sbuf, 1, output, needed}) == 0 && f.engine.read64(output + 24) == 10 &&
             f.engine.read32(output + 32) == 1, "output timing at the output presentation time");
     require(f.status(cm, "_CMSampleBufferGetOutputSampleTimingInfoArray", {sbuf, 0, output, needed}) == -12737, "an array too small");
-    require(f.string_constant(cm, "_kCMFormatDescriptionExtension_VerbatimSampleDescription") == "VerbatimSampleDescription", "VerbatimSampleDescription");
+    require(f.string_constant(cm, "_kCMFormatDescriptionExtension_VerbatimSampleDescription") == "VerbatimSampleDescription" &&
+            f.string_constant(cm, "_kCMSampleAttachmentKey_PartialSync") == "PartialSync", "VerbatimSampleDescription, PartialSync");
 }
 
 void video(Fixture& f) {
