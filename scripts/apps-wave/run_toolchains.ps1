@@ -122,7 +122,9 @@ Step node node-deep $node @('node_deep.js') -Timeout 600
 Step node node-rm $node @('rm_probe.js') -Expect '(?s)^(?!.*ENOTEMPTY).*rmSync recursive\s+ok'
 Step node node-title $node @('-e', 'process.title=1;console.log(2)') -Expect '2'
 Step node npm-version $node @($npmCli, '--version') -Environment $npmEnv -Directory (Join-Path $Work 'npm-hello')
-Step node npm-pack $node @($npmCli, 'pack') -Environment $npmEnv -Directory (Join-Path $Work 'npm-hello')
+if (Test-Wanted 'node') { Remove-Item -Force (Join-Path $Work 'npm-hello\package.json'), (Join-Path $Work 'npm-hello\*.tgz') -ErrorAction SilentlyContinue }
+Step node npm-init $node @($npmCli, 'init', '-y') -Environment $npmEnv -Directory (Join-Path $Work 'npm-hello')
+Step node npm-pack $node @($npmCli, 'pack') -Environment $npmEnv -Directory (Join-Path $Work 'npm-hello') -Expect 'npm-hello-1\.0\.0\.tgz'
 
 # Go (blocked at load today).
 Step go go-run $go @('run', 'hello.go') -Expect 'hello from go' -Environment @{ GOCACHE = (ConvertTo-AwGuestPath (Join-Path $Work 'home\gocache')); GOPATH = (ConvertTo-AwGuestPath (Join-Path $Work 'home\go')); GOTOOLCHAIN = 'local'; GOFLAGS = '-mod=mod' } -NoRuntime -Timeout 1200
