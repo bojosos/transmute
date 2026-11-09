@@ -707,6 +707,23 @@ void output_units(Fixture& f) {
     require(f.call(au, "_AudioComponentCount", {description}) == 3, "three output units");
     require(f.status(au, "_AudioComponentCopyName", {component, component_out}) == 0 && f.cf.utf8(f.engine.read64(component_out)) == "Apple: DefaultOutputUnit",
             "component name");
+    // AudioComponentInstantiate: the handler gets an instance (and noErr), or NULL and the status for a component that is none.
+    static std::vector<std::pair<Address, std::int32_t>> instantiated;
+    instantiated.clear();
+    const auto handler_fn = f.process.install_function("_alchemy_test_au_instantiated", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        instantiated.emplace_back(s.x[1], static_cast<std::int32_t>(s.x[2]));   // (block, AudioComponentInstance, OSStatus)
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto handler = f.block(32), handler_descriptor = f.block(16);
+    f.engine.write64(handler_descriptor + 8, 32);
+    f.engine.write64(handler, f.process.resolve("/usr/lib/libSystem.B.dylib", "__NSConcreteGlobalBlock")->address);
+    f.engine.write32(handler + 8, 1U << 28);   // BLOCK_IS_GLOBAL
+    f.engine.write64(handler + 16, handler_fn);
+    f.engine.write64(handler + 24, handler_descriptor);
+    f.call(au, "_AudioComponentInstantiate", {component, 0, handler});
+    f.call(au, "_AudioComponentInstantiate", {0, 0, handler});
+    require(instantiated.size() == 2 && instantiated[0].first && instantiated[0].second == 0 && !instantiated[1].first && instantiated[1].second == -50,
+            "AudioComponentInstantiate: an instance, then paramErr for no component");
+    require(f.status(au, "_AudioComponentInstanceDispose", {instantiated[0].first}) == 0, "the instantiated unit disposed");
     require(f.status(au, "_AudioComponentInstanceNew", {component, unit_out}) == 0, "AudioComponentInstanceNew");
     const auto unit = f.engine.read64(unit_out);
     f.engine.write32(size, 4);

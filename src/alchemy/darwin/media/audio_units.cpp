@@ -767,10 +767,11 @@ void AudioUnits::install() {
     });
     // AudioComponentRegister(desc, name, version, factory): no component can be added.
     support_.function(audio_unit_library, "_AudioComponentRegister", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
-    support_.function(audio_unit_library, "_AudioComponentInstanceNew", [self, status](CpuState& s, GuestMemory& m) {
-        if (s.x[1]) m.write64(s.x[1], 0);
-        const auto* c = self->component(s.x[0]);
-        if (!c || !s.x[1]) return status(s, error::param);
+    // A new instance of `component` (its handle in `out`), or the status that refuses it.
+    const auto instantiate = [self](GuestMemory& m, Address component, Address& out) -> std::int32_t {
+        out = 0;
+        const auto* c = self->component(component);
+        if (!c) return error::param;
         auto made = std::make_shared<Unit>();
         made->component = c;
         made->handle = self->support_.process.allocate_guest(64, 16);
@@ -783,8 +784,28 @@ void AudioUnits::install() {
             std::lock_guard lock(self->mutex_);
             self->units_[made->handle] = made;
         }
-        m.write64(s.x[1], made->handle);
-        status(s, 0);
+        out = made->handle;
+        return 0;
+    };
+    support_.function(audio_unit_library, "_AudioComponentInstanceNew", [instantiate, status](CpuState& s, GuestMemory& m) {
+        if (s.x[1]) m.write64(s.x[1], 0);
+        if (!s.x[1]) return status(s, error::param);
+        Address made{};
+        const auto result = instantiate(m, s.x[0], made);
+        m.write64(s.x[1], made);
+        status(s, result);
+    });
+    // AudioComponentInstantiate(component, options, void (^)(AudioComponentInstance, OSStatus)): the instance
+    // AudioComponentInstanceNew would make (or NULL and its status), given to the handler before this returns: the
+    // handler runs on an arbitrary thread, here the caller's. The options (in-process or out-of-process loading) choose
+    // nothing: every component here runs in the process.
+    support_.function(audio_unit_library, "_AudioComponentInstantiate", [self, instantiate](CpuState& s, GuestMemory& m) {
+        const auto handler = s.x[2];
+        if (!handler) return;
+        Address made{};
+        const auto result = instantiate(m, s.x[0], made);
+        const std::array<Address, 3> arguments{handler, made, static_cast<Address>(static_cast<std::int64_t>(result))};
+        static_cast<void>(EngineAdapter(self->support_.process.calling_engine()).call(m.read64(handler + 16), std::span(arguments.begin(), arguments.size())));
     });
     support_.function(audio_unit_library, "_AudioComponentInstanceDispose", [self, status](CpuState& s, GuestMemory&) {
         std::shared_ptr<Unit> gone;
