@@ -69,6 +69,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         bool detached{}, joining{}, joined{}, finished{};
         std::uint64_t result{};
         std::uint64_t stack_size{};   // as libpthread reports it (pthread_get_stacksize_np)
+        std::uint64_t start_routine{};
         std::exception_ptr error;
     };
     struct Mutex {
@@ -156,6 +157,21 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
     // reserved ones below 256). Programs read their slots directly: Go scans the array for the value it
     // just stored with pthread_setspecific. Keys from 768 (left after many deletions) keep key_values.
     static constexpr std::uint64_t tsd_slots = 768;
+    // pthread_introspection_hook_install's hook, void (*)(unsigned event, pthread_t, void* addr, size_t),
+    // called as libpthread does: CREATE (1) in the creating thread with the pthread_t's range, START (2)
+    // on the new thread and TERMINATE (3) as it ends with its stack's range, DESTROY (4) when its
+    // pthread_t goes. The main thread has no CREATE.
+    std::atomic<std::uint64_t> introspection_hook{};
+    // While a hook is installed, a new thread starts in this trampoline, so that START is called by the
+    // thread's own guest code: it keeps x0 (the argument) and lr, asks ___alchemy_pthread_started (which
+    // calls the hook) for the start routine, and branches to it with both restored.
+    std::uint64_t start_trampoline{};
+    void introspect(transmute::ReferenceEngine& engine, std::uint32_t event, std::uint64_t thread, std::uint64_t address, std::uint64_t size) {
+        if (const auto hook = introspection_hook.load()) {
+            const std::array<std::uint64_t, 4> arguments{event, thread, address, size};
+            static_cast<void>(EngineAdapter(engine).call(hook, arguments));
+        }
+    }
     std::map<std::uint64_t, std::uint64_t> tsd_arrays;   // thread identity -> array
 
     // The calling thread's TSD array, made (and given to TPIDRRO_EL0) on first use.
@@ -447,6 +463,15 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
                 static_cast<void>(EngineAdapter(*thread.engine).call(function, arguments));
             }
         }
+        if (thread.engine != &process.main_engine()) {
+            std::uint64_t ending = 0;
+            {
+                std::lock_guard handles_lock(metadata);
+                if (const auto entry = handles.find(thread.identity); entry != handles.end()) ending = entry->second;
+            }
+            const auto [stack_low, stack_high] = thread.engine->stack_bounds();
+            if (ending) introspect(*thread.engine, 3, ending, stack_low, stack_high - stack_low);
+        }
         if (process.cleanup_objects) process.cleanup_objects(thread);
         forget_cancel(thread.identity);
         // A thread's TSD array goes with it, but the main thread's lasts as long as the process: image
@@ -491,6 +516,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         }
         for (const auto& worker : done) {
             if (worker->host.joinable()) worker->host.join();   // already past its guest code
+            introspect(process.calling_engine(), 4, worker->handle, worker->handle, thread_object_size);
             process.release_guest(worker->handle);
         }
     }
@@ -510,7 +536,9 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         auto worker = std::make_shared<Worker>();
         worker->detached = attribute.detached;
         worker->stack_size = (attribute.stack_size ? attribute.stack_size : darwin_default_stack_size) + pthread_t_offset;
-        worker->engine = EngineAdapter(process.calling_engine()).create_worker(state.x[2], state.x[3], worker->stack_size);
+        worker->start_routine = state.x[2];
+        const auto entry = introspection_hook.load() ? start_trampoline : state.x[2];
+        worker->engine = EngineAdapter(process.calling_engine()).create_worker(entry, state.x[3], worker->stack_size);
         worker->engine->set_instruction_limit(process.instruction_limit);
         worker->engine->set_jit_profiling(process.jit_stats);
         worker->context = process.thread(*worker->engine);
@@ -530,6 +558,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             ++worker_generation;
         }
         memory.write64(output, worker->handle);
+        introspect(process.calling_engine(), 1, worker->handle, worker->handle, thread_object_size);
         // The new thread's signal mask is its creator's, its pending set empty (process/process_model.cpp).
         if (const auto inherit = process.resolve("/usr/lib/libSystem.B.dylib", "___alchemy_signal_inherit")) {
             const std::array<std::uint64_t, 1> arguments{worker->context->identity};
@@ -605,6 +634,9 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         }
         if (worker->error) std::rethrow_exception(worker->error);
         if (state.x[1] != 0) memory.write64(state.x[1], worker->result);
+        // A joined thread's pthread_t goes now, as libpthread frees it in pthread_join (its DESTROY
+        // introspection event; the handle is no longer valid).
+        reap();
         state.x[0] = 0;
     }
 
@@ -741,6 +773,24 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             return text.str();
         });
         add("_pthread_create", [](auto& self, auto& s, auto& m) { self.create(s, m); });
+        // pthread_create_from_mach_thread: pthread_create for a caller that is a Mach thread, which every
+        // thread here can call pthread_create from.
+        add("_pthread_create_from_mach_thread", [](auto& self, auto& s, auto& m) { self.create(s, m); });
+        // pthread_introspection_hook_t pthread_introspection_hook_install(hook): the previous hook.
+        add("_pthread_introspection_hook_install", [](auto& self, auto& s, auto&) { s.x[0] = self.introspection_hook.exchange(s.x[0]); });
+        add("___alchemy_pthread_started", [](auto& self, auto& s, auto&) {
+            const auto identity = self.process.current_thread()->identity;
+            std::shared_ptr<Worker> worker;
+            {
+                std::lock_guard lock(self.metadata);
+                if (const auto handle = self.handles.find(identity); handle != self.handles.end())
+                    if (const auto found = self.workers.find(handle->second); found != self.workers.end()) worker = found->second;
+            }
+            if (!worker) throw std::runtime_error("Alchemy pthread start trampoline outside a pthread_create thread");
+            const auto [low, high] = self.process.calling_engine().stack_bounds();
+            self.introspect(self.process.calling_engine(), 2, worker->handle, low, high - low);
+            s.x[0] = worker->start_routine;
+        });
         // A cancellation point on entry; a join already waiting is not interrupted.
         add("_pthread_join", [](auto& self, auto& s, auto& m) { if (!self.cancel_point(s)) self.join(s, m); });
         add("_pthread_self", [](auto& self, auto& s, auto&) { s.x[0] = self.self(); });
@@ -1457,6 +1507,20 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
 
         // Private replacement code terminates the current engine through its
         // existing supervisor-call outcome. This is not a Darwin syscall.
+        start_trampoline = process.allocate_guest(32);
+        if (const auto started = process.resolve("/usr/lib/libSystem.B.dylib", "___alchemy_pthread_started")) {
+            auto& engine = process.main_engine();
+            static constexpr std::array<std::uint32_t, 6> code{
+                0xa9bf7be0,   // stp x0, x30, [sp, #-16]!
+                0x580000b0,   // ldr x16, the literal at +24
+                0xd63f0200,   // blr x16
+                0xaa0003f0,   // mov x16, x0
+                0xa8c17be0,   // ldp x0, x30, [sp], #16
+                0xd61f0200};  // br x16
+            for (std::size_t at = 0; at < code.size(); ++at) engine.write32(start_trampoline + at * 4, code[at]);
+            engine.write64(start_trampoline + 24, started->address);
+            engine.set_memory_access(start_trampoline, true, false, true);
+        }
         exit_shim = process.allocate_guest(16);
         process.main_engine().write32(exit_shim, 0xd4001421); // svc #0xa1
         process.main_engine().write32(exit_shim + 4, 0xd4200000); // brk if handler incorrectly resumes

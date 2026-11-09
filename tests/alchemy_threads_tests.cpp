@@ -4,12 +4,14 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 constexpr std::string_view system_library = "/usr/lib/libSystem.B.dylib";
@@ -67,6 +69,28 @@ void test_mutex_keys_and_once() {
     require(f.call("_pthread_mutex_lock", {data + 704}) == 0 && f.call("_pthread_mutex_lock", {data + 704}) == 11 &&
             f.call("_pthread_mutex_unlock", {data + 704}) == 0, "a static errorcheck mutex does not report EDEADLK");
 }
+// pthread_introspection_hook_install: the hook sees CREATE, START, TERMINATE and DESTROY (at join) with the
+// thread's pthread_t, as libpthread calls it; it answers the previous hook.
+void test_introspection_hook() {
+    Fixture f;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> events;
+    std::mutex events_mutex;
+    const auto hook = f.engine.register_guest_call([&](auto& state, auto&) {
+        std::lock_guard lock(events_mutex);
+        events.emplace_back(state.x[0], state.x[1]);
+    });
+    require(f.call("_pthread_introspection_hook_install", {hook}) == 0, "the first hook has no previous one");
+    f.engine.write32(code, 0xd2824680); // mov x0, #0x1234
+    f.engine.write32(code + 4, 0xd65f03c0); // ret
+    f.engine.set_memory_access(code, true, false, true);
+    require(f.call("_pthread_create_from_mach_thread", {data, 0, code, 0}) == 0, "pthread_create_from_mach_thread failed");
+    const auto handle = f.engine.read64(data);
+    require(f.call("_pthread_join", {handle, data + 8}) == 0 && f.engine.read64(data + 8) == 0x1234, "worker result wrong");
+    require(f.call("_pthread_introspection_hook_install", {0}) == hook, "the previous hook was not answered");
+    std::lock_guard lock(events_mutex);
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> expected{{1, handle}, {2, handle}, {3, handle}, {4, handle}};
+    require(events == expected, "introspection events: " + std::to_string(events.size()));
+}
 void test_workers(bool jit) {
     Fixture f;
     f.engine.set_jit_enabled(jit);
@@ -78,7 +102,7 @@ void test_workers(bool jit) {
     require(f.call("_pthread_create", {data, 0, code, 0}) == 0, "worker create failed");
     const auto handle = f.engine.read64(data);
     require(f.call("_pthread_join", {handle, data + 8}) == 0 && f.engine.read64(data + 8) == 0x1234, "worker result wrong");
-    require(f.call("_pthread_join", {handle, 0}) == 22, "worker joined twice");
+    require(f.call("_pthread_join", {handle, 0}) == 3, "a joined thread is gone (ESRCH, as libpthread)");
     require(f.call("_pthread_self", {}) != handle, "thread identity shared");
     require(f.call("_pthread_create", {data, 0, code, 0}) == 0, "detached create failed");
     const auto detached = f.engine.read64(data);
@@ -450,6 +474,7 @@ int main() {
         const auto stage = [](std::string_view name) { std::cout << "[stage] " << name << std::endl; };
         stage("test_mutex_keys_and_once()"); test_mutex_keys_and_once();
         stage("test_condition_wakeup_order()"); test_condition_wakeup_order();
+        stage("test_introspection_hook()"); test_introspection_hook();
         stage("test_thread_reaping()"); test_thread_reaping();
         stage("test_workers(false)"); test_workers(false);
         stage("test_workers(true)"); test_workers(true);
