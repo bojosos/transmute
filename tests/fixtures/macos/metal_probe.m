@@ -16,6 +16,7 @@
 - (BOOL)hasUnifiedMemory;
 - (uint64_t)recommendedMaxWorkingSetSize;
 - (uint64_t)registryID;
+- (id)architecture;
 - (id)newSharedEvent;
 - (id)newDepthStencilStateWithDescriptor:(id)descriptor;
 @end
@@ -37,6 +38,7 @@ static inline NSRange NSMakeRange(NSUInteger location, NSUInteger length) {
 @interface NSObject (AlchemyProbe)
 - (BOOL)conformsToProtocol:(Protocol *)protocol;
 - (id)localizedDescription;
+- (id)copy;
 - (const char *)UTF8String;
 - (id)frontFaceStencil;
 - (void)setDepthWriteEnabled:(BOOL)value;
@@ -100,6 +102,11 @@ int main(void) {
            (int)[device supportsFamily:2002], (int)[device supportsFamily:1007]);
     if (threads.width < 256 || [device recommendedMaxWorkingSetSize] == 0 || [device registryID] == 0)
         return fail("device limits");
+    /* MTLArchitecture: one object per device, named like the device. */
+    id architecture = [device architecture];
+    if (!architecture || architecture != [device architecture] || architecture != [architecture copy] ||
+        strcmp([[architecture name] UTF8String], [[device name] UTF8String]) != 0)
+        return fail("architecture");
 
     /* Buffers and a blit with a completed handler. */
     id<MTLCommandQueue> queue = [device newCommandQueue];

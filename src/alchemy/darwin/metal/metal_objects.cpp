@@ -40,7 +40,12 @@ namespace {
 
 // ---- states ----------------------------------------------------------------------------
 
-struct DeviceState final : Held { std::shared_ptr<Device> device; Address name{}; };
+struct DeviceState final : Held {
+    std::shared_ptr<Device> device;
+    Address name{};
+    Address architecture{};   // its MTLArchitecture (immortal), made on first use
+};
+struct ArchitectureState final : Held { Address name{}; };
 struct BufferState final : Held { std::shared_ptr<Buffer> buffer; Address device{}, heap_object{}; std::shared_ptr<Heap> heap; };
 struct TextureState final : Held {
     std::shared_ptr<Texture> texture;
@@ -151,7 +156,7 @@ struct Classes {
         compute_pipeline{}, queue{}, command_buffer{}, render_encoder{}, compute_encoder{}, blit_encoder{},
         argument_encoder{}, fence{}, event{}, shared_event{}, listener{}, capture_manager{}, capture_scope{}, archive{},
         error{}, argument{}, render_reflection{}, compute_reflection{}, log_state{}, counter_set{}, counter{}, sample_buffer{},
-        indirect_buffer{}, indirect_render_command{}, indirect_compute_command{};
+        indirect_buffer{}, indirect_render_command{}, indirect_compute_command{}, architecture{};
 } classes;
 Address timestamp_set_object{};   // the one MTLCounterSet (immortal), created on first use
 Address timestamp_set();
@@ -2503,6 +2508,17 @@ void install_device() {
         r.method(cls, selector, [function, profile](CpuState& s, GuestMemory&) { s.x[0] = function(profile(s.x[0])); }, false, types);
     };
     r.method(cls, "name", on<DeviceState>(what, [](DeviceState& d, CpuState& s, GuestMemory&) { s.x[0] = d.name; }));
+    // MTLArchitecture (macOS 14): its name is the Vulkan device's, as -name.
+    r.method(cls, "architecture", on<DeviceState>(what, [&r](DeviceState& d, CpuState& s, GuestMemory&) {
+        std::lock_guard lock(device_mutex);
+        if (!d.architecture) {
+            auto value = std::make_shared<ArchitectureState>();
+            value->name = d.name;
+            d.architecture = r.create(classes.architecture, std::move(value));
+            if (const auto record = r.process.objects().find(d.architecture)) record->immortal = true;
+        }
+        s.x[0] = d.architecture;
+    }), false, "@@:");
     answer("registryID", [](const DeviceProfile& p) { return p.registry_id; });
     answer("hasUnifiedMemory", [](const DeviceProfile& p) -> std::uint64_t { return p.unified_memory; }, "B@:");
     answer("isLowPower", [](const DeviceProfile& p) -> std::uint64_t { return p.low_power; }, "B@:");
@@ -3541,6 +3557,12 @@ void install_objects(Runtime& r) {
     r.objc.add_native_protocol(classes.shared_event, "MTLEvent");
     classes.listener = r.define_class("MTLSharedEventListener");
     classes.capture_manager = r.define_class("MTLCaptureManager");
+    classes.architecture = r.define_class("MTLArchitecture");
+    r.method(classes.architecture, "name", on<ArchitectureState>("MTLArchitecture", [](ArchitectureState& a, CpuState& s, GuestMemory&) {
+        s.x[0] = a.name;
+    }), false, "@@:");
+    // NSCopying: one immortal object per device, so a copy is the object itself.
+    r.method(classes.architecture, "copyWithZone:", [](CpuState&, GuestMemory&) {}, false, "@@:^v");
     classes.capture_scope = make("AlchemyMTLCaptureScope", {"MTLCaptureScope"});
     classes.archive = make("AlchemyMTLBinaryArchive", {"MTLBinaryArchive"});
     classes.error = make("AlchemyMTLError", {});
