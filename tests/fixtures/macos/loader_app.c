@@ -42,6 +42,9 @@ int main(int argc, char** argv) {
     if (!dlsym((void*)-5L, "executable_callback") || dlsym((void*)-5L, "loader_value")) return 14;
     void* process = dlopen((const char*)0, 2);
     if (!process || !dlsym(process, "loader_plugin_run") || dlclose(process) || dlclose(plugin)) return 15;
+    void* implicit = dlopen("loader_rpath.dylib", 2 | 4);   // a leaf name: @rpath/loader_rpath.dylib
+    int (*rpath_value)(void) = implicit ? (int (*)(void))dlsym(implicit, "loader_rpath_value") : 0;
+    if (!rpath_value || rpath_value() != 41) return 17;
     printf("Plugin: %d\n", run(5));
     return 0;
 }

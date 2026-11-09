@@ -1,5 +1,5 @@
 if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD)
-    foreach(name IN ITEMS services_app threaded threaded_tls_app threaded_tls_plugin loader_leaf loader_bridge loader_plugin loader_app)
+    foreach(name IN ITEMS services_app threaded threaded_tls_app threaded_tls_plugin loader_leaf loader_bridge loader_plugin loader_app loader_rpath)
         alchemy_object(${name} ${name}.c)
     endforeach()
     foreach(name IN ITEMS services_app threaded threaded_tls_app)
@@ -28,11 +28,20 @@ if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD)
             -rpath @loader_path "${macos_dir}/loader_plugin.o" "${macos_dir}/loader_bridge.dylib"
             -o "${macos_dir}/loader_plugin.bundle"
         DEPENDS "${macos_dir}/loader_plugin.o" "${macos_dir}/loader_bridge.dylib" VERBATIM)
+    # Only in loader-rpath/, which no directory search covers: loader_app reaches it by leaf name.
+    add_custom_command(OUTPUT "${macos_dir}/loader-rpath/loader_rpath.dylib"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${macos_dir}/loader-rpath"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -dylib
+            -install_name @rpath/loader_rpath.dylib "${macos_dir}/loader_rpath.o"
+            -o "${macos_dir}/loader-rpath/loader_rpath.dylib"
+        DEPENDS "${macos_dir}/loader_rpath.o" VERBATIM)
     add_custom_command(OUTPUT "${macos_dir}/loader_app"
-        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main -rpath @loader_path "-L${macos_dir}"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main -rpath @loader_path
+            -rpath @loader_path/loader-rpath "-L${macos_dir}"
             "${macos_dir}/loader_app.o" "${macos_dir}/loader_bridge.dylib" "${macos_dir}/link_system.dylib"
             -o "${macos_dir}/loader_app"
-        DEPENDS "${macos_dir}/loader_app.o" "${macos_dir}/loader_bridge.dylib" "${macos_dir}/link_system.dylib" VERBATIM)
+        DEPENDS "${macos_dir}/loader_app.o" "${macos_dir}/loader_bridge.dylib" "${macos_dir}/link_system.dylib"
+            "${macos_dir}/loader-rpath/loader_rpath.dylib" VERBATIM)
     add_custom_target(alchemy_expanded_fixtures DEPENDS
         "${macos_dir}/services_app" "${macos_dir}/threaded" "${macos_dir}/threaded_tls_app"
         "${macos_dir}/threaded_tls_plugin.bundle" "${macos_dir}/loader_app" "${macos_dir}/loader_plugin.bundle")

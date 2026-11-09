@@ -227,6 +227,12 @@ struct ModuleLoader::Implementation {
             } else if (!name.starts_with('/')) {
                 if (name_path.is_absolute()) candidates.push_back(name_path);
                 else {
+                    // dyld's implicit @rpath: dlopen of a leaf name also tries @rpath/<leaf> along the
+                    // caller's and the main executable's LC_RPATHs (OBS opens "libobs-metal.dylib" so).
+                    if (dynamic && name.find('/') == std::string_view::npos) {
+                        if (loader) for (const auto& directory : loader->runpaths) candidates.push_back(directory / name_path);
+                        if (main && main != loader) for (const auto& directory : main->runpaths) candidates.push_back(directory / name_path);
+                    }
                     if (dynamic) candidates.push_back(context.map_guest_path
                         ? context.map_guest_path(name) : context.working_directory / name_path);
                     candidates.push_back((loader ? loader->image.source().parent_path() : executable.parent_path()) / name_path);
