@@ -513,7 +513,8 @@ void test_bsd_extra(Fixture& f) {
     require(f.sys("_fmtcheck", {longs, f.text("%ld")}) == longs, "fmtcheck: %lx matches %ld");
     // ctype helpers.
     require(f.sys("___istype", {'a', 0x100}) == 1 && f.sys("___istype", {'1', 0x100}) == 0 && f.sys("___isctype", {300, 0x100}) == 0 &&
-            f.sys("___tolower_l", {'A', 0}) == 'a' && f.sys("___toupper_l", {'z', 0}) == 'Z', "ctype helpers");
+            f.sys("___tolower_l", {'A', 0}) == 'a' && f.sys("___toupper_l", {'z', 0}) == 'Z' &&
+            f.sys("____tolower_l", {'Q', 0}) == 'q' && f.sys("____toupper_l", {'q', 0}) == 'Q', "ctype helpers");
     require(f.engine.read64(f.symbol("/usr/lib/libSystem.B.dylib", "__CurrentRuneLocale")) ==
             f.symbol("/usr/lib/libSystem.B.dylib", "__DefaultRuneLocale"), "_CurrentRuneLocale is the C locale");
 }
@@ -1966,6 +1967,14 @@ void test_b39(Fixture& f) {
     require(f.engine.read64(old) == 0 && f.engine.read64(old + 40) == 0, "the first old hooks are empty, the extra size zeroed");
     static_cast<void>(f.sys("_libc_set_introspection_hooks", {0, old, 40}));
     require(f.engine.read64(old) == 1 && f.engine.read64(old + 32) == 0x1004, "the set hooks come back");
+    // <fstab.h>: one entry, the root file system; getfsfile("/") and getfsspec of its device find it.
+    require(f.sys("_setfsent") == 1, "setfsent");
+    const auto root = f.sys("_getfsent");
+    require(root && f.read(f.engine.read64(root + 8)) == "/" && !f.read(f.engine.read64(root + 16)).empty() &&
+            f.sys("_getfsent") == 0, "getfsent: the root file system, then the end");
+    static_cast<void>(f.sys("_endfsent"));
+    require(f.sys("_getfsfile", {f.text("/")}) == root && f.sys("_getfsspec", {f.engine.read64(root)}) == root &&
+            f.sys("_getfsfile", {f.text("/nowhere")}) == 0, "getfsfile / getfsspec");
     // scandir_b: its selection block (called with itself first) keeps what it answers non-zero for.
     const auto list = f.process.allocate_guest(8);
     const auto all = f.sys("_scandir", {f.text("/tmp"), list, 0, 0});

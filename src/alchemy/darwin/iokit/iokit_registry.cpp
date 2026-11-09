@@ -529,6 +529,12 @@ void install_iokit_registry(Provider& p, ObjcRuntime&, CoreFoundation& cf) {
     // no registry entry has a user client (driver connections need kernel
     // drivers), so opening a service fails with kIOReturnUnsupported; an
     // invalid service with kIOReturnBadArgument.
+    // kern_return_t IOServiceAuthorize(io_service_t, uint32_t options): authorization to open a service; as
+    // no service can be opened (IOServiceOpen), kIOReturnUnsupported; an invalid one, kIOReturnBadArgument.
+    install("_IOServiceAuthorize", [ready](CpuState& s, GuestMemory&) {
+        const auto object = s.x[0] ? ready()->object(static_cast<std::uint32_t>(s.x[0])) : std::nullopt;
+        s.x[0] = object && object->entry ? 0xe00002c7 : 0xe00002c2;
+    });
     install("_IOServiceOpen", [ready](CpuState& s, GuestMemory& m) {
         if (s.x[3]) m.write32(s.x[3], 0);
         const auto object = s.x[0] ? ready()->object(static_cast<std::uint32_t>(s.x[0])) : std::nullopt;

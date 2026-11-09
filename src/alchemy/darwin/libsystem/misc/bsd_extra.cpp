@@ -195,6 +195,62 @@ void install_libsystem_bsd_extra(Provider& p) {
         return 0;
     });
 
+    // ---- <fstab.h> ----
+    // setfsent/getfsent/endfsent, getfsspec/getfsfile: as Libinfo, the entries of /etc/fstab and the root file
+    // system. No guest /etc/fstab exists, so there is one entry: "/", from statfs("/") (its device as fs_spec,
+    // its type, "rw" or "ro"). struct fstab {fs_spec, fs_file, fs_vfstype, fs_mntops, fs_type; int fs_freq,
+    // fs_passno} is 48 bytes, rebuilt on each pass.
+    struct Fstab { std::mutex mutex; std::uint64_t entry{}, buffer{}; bool given{}; std::string spec; };
+    const auto fstab = std::make_shared<Fstab>();
+    const auto root_entry = [&process, p, fstab]() -> std::uint64_t {   // fstab->mutex held
+        transmute::GuestMemory& memory = process.main_engine();
+        if (!fstab->buffer) fstab->buffer = process.allocate_guest(2168 + 1100, 16);
+        const auto info = fstab->buffer, strings = fstab->buffer + 2168;
+        const auto slash = strings;
+        memory.write8(slash, '/'); memory.write8(slash + 1, 0);
+        if (p.call(libsystem_library, "_statfs", {slash, info}) != 0) return 0;
+        const bool read_only = (memory.read32(info + 64) & 1U) != 0;   // f_flags MNT_RDONLY
+        const auto mode = strings + 8;
+        memory.write8(mode, 'r'); memory.write8(mode + 1, read_only ? 'o' : 'w'); memory.write8(mode + 2, 0);
+        if (!fstab->entry) fstab->entry = process.allocate_guest(48, 8);
+        memory.write64(fstab->entry, info + 1112);        // f_mntfromname
+        memory.write64(fstab->entry + 8, slash);
+        memory.write64(fstab->entry + 16, info + 72);     // f_fstypename
+        memory.write64(fstab->entry + 24, mode);
+        memory.write64(fstab->entry + 32, mode);          // FSTAB_RW / FSTAB_RO
+        memory.write32(fstab->entry + 40, 0);
+        memory.write32(fstab->entry + 44, 1);
+        bool terminated{};
+        const auto spec = memory.read_string(info + 1112, 1, 1024, &terminated);
+        fstab->spec.assign(spec.begin(), spec.end());
+        return fstab->entry;
+    };
+    p.libsystem("_setfsent", [fstab](CpuState&, GuestMemory&) -> std::uint64_t {
+        std::lock_guard lock(fstab->mutex); fstab->given = false; return 1;
+    });
+    p.libsystem("_endfsent", [fstab](CpuState&, GuestMemory&) -> std::uint64_t {
+        std::lock_guard lock(fstab->mutex); fstab->given = false; return 0;
+    });
+    p.libsystem("_getfsent", [fstab, root_entry](CpuState&, GuestMemory&) -> std::uint64_t {
+        std::lock_guard lock(fstab->mutex);
+        if (fstab->given) return 0;
+        fstab->given = true;
+        return root_entry();
+    });
+    p.libsystem("_getfsspec", [fstab, root_entry](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        std::lock_guard lock(fstab->mutex);
+        const auto entry = root_entry();
+        bool terminated{};
+        const auto name = m.read_string(s.x[0], 1, 1024, &terminated);
+        return entry && std::string(name.begin(), name.end()) == fstab->spec ? entry : 0;
+    });
+    p.libsystem("_getfsfile", [fstab, root_entry](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        std::lock_guard lock(fstab->mutex);
+        bool terminated{};
+        const auto name = m.read_string(s.x[0], 1, 1024, &terminated);
+        return std::string(name.begin(), name.end()) == "/" ? root_entry() : 0;
+    });
+
     // ---- <unistd.h> break ----
     // void* sbrk(int increment) and void* brk(const void*), as Libc's emulation (emulated/brk.c):
     // a 4 MiB region allocated on first use is handed out in order; a non-positive increment
@@ -883,6 +939,10 @@ void install_libsystem_bsd_extra(Provider& p) {
     });
     p.libsystem("___tolower_l", [p](CpuState& s, GuestMemory&) -> std::uint64_t { return p.call(libsystem_library, "___tolower", {s.x[0]}); });
     p.libsystem("___toupper_l", [p](CpuState& s, GuestMemory&) -> std::uint64_t { return p.call(libsystem_library, "___toupper", {s.x[0]}); });
+    // <xlocale/_ctype.h>'s ___tolower_l / ___toupper_l (C names with three underscores), which inline
+    // tolower_l and toupper_l call for characters outside the ASCII table.
+    p.libsystem("____tolower_l", [p](CpuState& s, GuestMemory&) -> std::uint64_t { return p.call(libsystem_library, "___tolower", {s.x[0]}); });
+    p.libsystem("____toupper_l", [p](CpuState& s, GuestMemory&) -> std::uint64_t { return p.call(libsystem_library, "___toupper", {s.x[0]}); });
     // bool _dyld_is_objc_constant(DyldObjCConstantKind, const void*): whether the address is one of the dyld
     // shared cache's prebuilt Objective-C constants (strings, classes, selectors). Alchemy loads no shared
     // cache, so none is; callers then treat the object as an ordinary one.

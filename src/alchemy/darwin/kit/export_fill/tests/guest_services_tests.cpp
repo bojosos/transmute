@@ -277,6 +277,8 @@ void test_guest_services(Fixture& f) {
         const auto service = f.call(iokit, "_IOServiceGetMatchingService", {0, f.call(iokit, "_IOServiceMatching", {f.text("IOPlatformExpertDevice")})});
         const auto connect = f.process.allocate_guest(4);
         require(service && f.call(iokit, "_IOServiceOpen", {service, 0, 0, connect}) == 0xe00002c7, "IOServiceOpen is unsupported");
+        require(f.call(iokit, "_IOServiceAuthorize", {service, 0}) == 0xe00002c7 && f.call(iokit, "_IOServiceAuthorize", {0, 0}) == 0xe00002c2,
+                "IOServiceAuthorize");
         require(f.call(iokit, "_IOServiceOpen", {0, 0, 0, connect}) == 0xe00002c2, "IOServiceOpen of no service");
     }
 }
