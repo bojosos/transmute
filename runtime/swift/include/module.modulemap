@@ -31,3 +31,10 @@ module Darwin [system] {
   header "AlchemyDarwin.h"
   export *
 }
+
+// CoreGraphics for the overlays that use it: CoreGraphics/CoreGraphics.h layers runtime/include's
+// declarations over this directory's CoreFoundation.
+module CoreGraphics [system] {
+  header "CoreGraphics/CoreGraphics.h"
+  export *
+}

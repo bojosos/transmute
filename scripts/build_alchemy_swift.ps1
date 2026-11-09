@@ -316,6 +316,7 @@ function Link-Library([string]$name, [string]$installName, [string[]]$objects, [
                         @{ Name = 'foundation'; Install = '/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation'; File = 'Foundation' },
                         @{ Name = 'coremedia'; Install = '/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia'; File = 'CoreMedia' },
                         @{ Name = 'corefoundation'; Install = '/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation'; File = 'CoreFoundation' },
+                        @{ Name = 'coregraphics'; Install = '/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics'; File = 'CoreGraphics' },
                         @{ Name = 'system'; Install = '/usr/lib/libSystem.B.dylib'; File = 'libSystem.B.dylib' })) {
         if (!(Select-String -LiteralPath "$interfaces/$($stub.Name).s" -Pattern '^\.globl' -Quiet)) { continue }
         Invoke-Tool $clang @('--target=arm64-apple-macos11', '-c', "$interfaces/$($stub.Name).s", '-o', "$interfaces/$($stub.Name).o") "$interfaces/$($stub.Name)-as"
@@ -558,6 +559,8 @@ if ($Library -eq 'all') {
     # /usr/lib/swift/libswiftCoreFoundation.dylib next: CGFloat and _CFObject, which every overlay that imports
     # CoreFoundation after it sees.
     Build-Overlay 'CoreFoundation' 'swiftCoreFoundation'
+    # /usr/lib/swift/libswiftCoreGraphics.dylib: the documented Swift additions to CGColor, CGPoint, CGSize and CGRect.
+    Build-Overlay 'CoreGraphics' 'swiftCoreGraphics' -dependencies @('libswiftCoreFoundation.dylib')
 
     # /System/Library/Frameworks/Combine.framework/Versions/A/Combine: OpenCombine's code (third_party/opencombine,
     # vendored by scripts/vendor_opencombine.py) and the project's runtime/swift/combine, as the resilient module

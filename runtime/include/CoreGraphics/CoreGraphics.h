@@ -38,6 +38,26 @@ CGError CGDisplayMoveCursorToPoint(CGDirectDisplayID display, CGPoint point);
 CGColorSpaceRef CGColorSpaceCreateWithName(CFStringRef name);
 CGColorSpaceRef CGColorSpaceRetain(CGColorSpaceRef space);
 void CGColorSpaceRelease(CGColorSpaceRef space);
+
+/* Colors and images (Core Foundation types), as the Swift CoreGraphics and SwiftUI overlays use them. */
+typedef struct CGColor *CGColorRef;
+typedef struct CGImage *CGImageRef;
+CGColorRef CGColorCreateGenericGray(CGFloat gray, CGFloat alpha);
+CGColorRef CGColorCreateGenericRGB(CGFloat red, CGFloat green, CGFloat blue, CGFloat alpha);
+CGColorRef CGColorGetConstantColor(CFStringRef colorName);
+size_t CGColorGetNumberOfComponents(CGColorRef color);
+const CGFloat *CGColorGetComponents(CGColorRef color);
+CGFloat CGColorGetAlpha(CGColorRef color);
+extern const CFStringRef kCGColorWhite;
+extern const CFStringRef kCGColorBlack;
+extern const CFStringRef kCGColorClear;
+/* Line caps and joins, with the published values. */
+typedef enum __attribute__((enum_extensibility(open))) CGLineCap : int32_t {
+    kCGLineCapButt = 0, kCGLineCapRound = 1, kCGLineCapSquare = 2
+} CGLineCap;
+typedef enum __attribute__((enum_extensibility(open))) CGLineJoin : int32_t {
+    kCGLineJoinMiter = 0, kCGLineJoinRound = 1, kCGLineJoinBevel = 2
+} CGLineJoin;
 #ifdef __cplusplus
 }
 #endif
