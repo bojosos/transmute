@@ -27,6 +27,7 @@
 #include "alchemy/darwin/colorsync/profiles.hpp"
 #include "alchemy/darwin/storekit/install.hpp"
 #include "alchemy/darwin/coredata/install.hpp"
+#include "alchemy/darwin/systemextensions/install.hpp"
 #include "alchemy/darwin/corefoundation/install.hpp"
 #include "alchemy/darwin/coreservices/install.hpp"
 #include "alchemy/darwin/dispatch/install.hpp"
@@ -120,6 +121,7 @@ constexpr Installer installers[] = {
     {"install_colorsync_profiles", colorsync::install_colorsync_profiles},
     {"install_storekit", storekit::install_storekit},
     {"install_coredata", coredata::install_coredata},
+    {"install_systemextensions", systemextensions::install_systemextensions},
     {"install_values_kit", gui::values::install_values_kit}, // value-class frameworks (after the fill-only set)
 };
 
