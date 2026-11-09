@@ -120,7 +120,11 @@ CompileResult compile_uncached(std::string_view source, const CompileOptions& op
         return result;
     }
     for (const auto& entry : rewritten.entries) {
+        const auto started = std::chrono::steady_clock::now();
         auto lowered = detail::lower(*module, entry, rewritten.function_constants, options);
+        if (PhaseTimer::enabled())
+            std::cerr << "alchemy-msl: lower " << entry.name << ' '
+                      << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() << "ms\n";
         const bool failed = has_error(lowered.diagnostics);
         append(result.diagnostics, std::move(lowered.diagnostics));
         if (failed) continue;
@@ -172,7 +176,7 @@ std::string compiler_version() {
     // and the front end's version are folded in automatically.
     static const std::string value = [] {
         std::ostringstream out;
-        out << "alchemy-msl 12 stdlib-" << std::hex << detail::stdlib_fingerprint();
+        out << "alchemy-msl 13 stdlib-" << std::hex << detail::stdlib_fingerprint();
         const auto& tools = toolchain();
         if (tools.available) out << ' ' << tools.version;
         return out.str();

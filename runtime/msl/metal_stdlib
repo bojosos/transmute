@@ -64,6 +64,10 @@
 
 #ifndef __ALCHEMY_MSL_PREPROCESS
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+// Every library function is always_inline, like the application's code:
+// the lowering needs one function per entry point, and -O2's inliner gives
+// up on very large callers (a renderer's kernels) otherwise.
+#pragma clang attribute push (__attribute__((always_inline)), apply_to = function)
 #include "__msl/types.h"
 #include "__msl/intrinsics.h"
 #include "__msl/math.h"
@@ -71,6 +75,7 @@
 #include "__msl/compute.h"
 #include "__msl/packed.h"
 #include "__msl/entry.h"
+#pragma clang attribute pop
 // Apple's compiler takes as_type<T>() without the metal:: qualifier anywhere,
 // including inside templates written before any `using namespace metal`
 // (ANGLE's generated MSL does that).

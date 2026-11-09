@@ -2083,6 +2083,8 @@ private:
 
     // ---- bitcasts --------------------------------------------------------------------------------
     // Register value -> its memory bytes as u32 words (little endian).
+    std::map<const Value*, std::vector<std::uint32_t>> wide_bitcasts_;   // see lower_cast
+
     std::vector<std::uint32_t> to_bytes(std::uint32_t id, const ir::Type* t) {
         // Returns one u32 per byte.
         std::vector<std::uint32_t> bytes;
@@ -2279,6 +2281,14 @@ private:
             const auto target = spaces_.count(v) ? spaces_.at(v) : p.space;
             if (target != p.space && p.space != Space::none) fail("address space cast between unrelated memories");
             return bind_ptr(v, p);
+        }
+        // A bitcast to a vector wider than SPIR-V's four components (clang's
+        // trunc of a uint3 lane: bitcast <3 x i32> to <6 x i16>, then an
+        // extractelement) keeps the source's bytes; constant-index extracts
+        // read their element from them.
+        if (v->op == Opcode::bitcast && to->is_vector() && to->count > 4) {
+            wide_bitcasts_[v] = to_bytes(id_of(source), from);
+            return;
         }
         if (v->op == Opcode::inttoptr) {
             auto id = id_of(source);
@@ -2563,6 +2573,12 @@ private:
     void lower_vector(Value* v) {
         switch (v->op) {
         case Opcode::extractelement: {
+            if (const auto wide = wide_bitcasts_.find(v->operands[0]); wide != wide_bitcasts_.end()) {
+                const auto index = maybe_const(v->operands[1]);
+                if (!index) fail("dynamic index into a vector wider than 4 components");
+                const auto* element = v->operands[0]->type->element;
+                return bind(v, from_bytes(wide->second, static_cast<std::size_t>(*index) * (scalar_bits(element) / 8), element));
+            }
             const auto* vt = v->operands[0]->type;
             const auto vec = id_of(v->operands[0]);
             if (vt->count == 1) return bind(v, vec);

@@ -217,7 +217,10 @@ void test_rewriter() {
         require(out.find("c ? i : i < 2") != std::string::npos, "conditional with a top-level '<' left alone");
     }
     {
-        const auto bad = rewrite("kernel void k(device float* a) {}\n");
+        // A buffer, texture or sampler parameter takes an implicit index (M3);
+        // any other parameter needs an attribute.
+        require(rewrite("kernel void k(device float* a) {}\n").diagnostics.empty(), "buffer parameter without [[buffer]]");
+        const auto bad = rewrite("kernel void k(float a) {}\n");
         require(!bad.diagnostics.empty() && bad.diagnostics[0].line == 1 &&
                     bad.diagnostics[0].message.find("has no MSL attribute") != std::string::npos,
                 "parameter without attribute is an error");
@@ -273,7 +276,7 @@ void test_rewriter() {
         require(out.find("((__msl_fc_defined(0u) && a)) ? float(__r.d) : metal::__msl_builtin_in<metal::float4, ") !=
                     std::string::npos,
                 "[[depth, function_constant]]: the fragment's own depth when absent");
-        require(out.find("__global const float plain = 2.0f;") != std::string::npos,
+        require(out.find("const __global float plain = 2.0f;") != std::string::npos,
                 "constants without function constants stay globals");
         require(r.function_constants.size() == 2, "derived constants are not function constants");
     }
@@ -873,6 +876,21 @@ void test_reflection() {
         const auto vertex = msl::compile("#include <metal_stdlib>\nusing namespace metal;\n"
                                          "vertex float4 v(uint p [[patch_id]]) { return float4(p); }\n", {});
         require(!vertex.success(), "[[patch_id]] outside a [[patch]] function is an error");
+    }
+    {
+        // Compiler breadth (M3): implicit indices, enumerators as function
+        // constant indices, program-scope builtins.
+        const auto r = compile_fixture("kernel_breadth.metal");
+        const auto& k = function(r, "breadth").reflection;
+        require(buffer(k, 0).name == "out" && buffer(k, 1).name == "params" && buffer(k, 2).name == "packed" &&
+                    buffer(k, 3).name == "half_leaf" && buffer(k, 4).name == "full_leaf" &&
+                    buffer(k, 5).name == "total",
+                "parameters without [[buffer]] take the first free indices in order");
+        require(has_constant(k, 1) && has_constant(k, 7) && has_constant(k, 8), "enumerators as function constant indices");
+        const auto has_builtin = [&](Builtin b) { return std::find(k.builtins.begin(), k.builtins.end(), b) != k.builtins.end(); };
+        require(has_builtin(Builtin::thread_position_in_grid) && has_builtin(Builtin::thread_index_in_simdgroup) &&
+                    has_builtin(Builtin::threads_per_threadgroup),
+                "program-scope builtins are read by the kernel");
     }
     {
         const auto r = compile_fixture("blender_ui_widget.metal");

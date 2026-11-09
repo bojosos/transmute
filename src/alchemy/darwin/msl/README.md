@@ -334,11 +334,29 @@ a run-time index into one fails), pixel-coordinate samplers with bias/gradient
 or repeat addressing, `read()` on sampled cube textures, atomics on texture
 arrays and 64-bit threadgroup atomics, program-scope variables with dynamic
 initializers not computed from function constants, `[[stencil]]` outputs
-with `[[function_constant]]`, `constant`/`device` overloads with different
-bodies. `Reflection::types` describes scalars,
+with `[[function_constant]]`, `const device`/`constant` overloads with
+different bodies (both are `const __global`). `Reflection::types` describes scalars,
 vectors, matrices and textures; buffer struct pointees are named but carry no
 member layout.
 
+**Breadth for large compute libraries (M3, measured on a renderer's kernel
+library):** `constant` is read-only, so `constant T` is `const __global T`
+(pointees, references, objects and `T f() constant` member functions), or
+`__global` next to an explicit `const`; `constant T*` and `device T*`
+overloads are then distinct. Enumerators work wherever an index does
+(`[[function_constant(Enumerator)]]`). MSL 3.1 program-scope builtins
+(`const uint id [[thread_position_in_grid]];`) become inline functions that
+every later use calls, unless a parameter or local of the same name hides
+them. Entry parameters without `[[buffer]]`, `[[texture]]` or `[[sampler]]`
+take the first free index of their kind in parameter order, as Metal assigns
+them. `T& __restrict` parameters, class template specializations (each its
+own scope), OpenCL builtin names used as functions (`to_global`, `to_local`,
+`to_private`), `simd_vote::vote_t`, float atomics (load, store, exchange,
+compare-exchange through the bits) and clang's `bitcast <3 x i32> to
+<6 x i16>` lane reads are handled; the whole metal_stdlib is
+`always_inline`. `ALCHEMY_MSL_ENTRY=<text>` (diagnostics) compiles only the
+entry points whose name contains the text, and `ALCHEMY_MSL_TIMING=1` also
+prints each entry point's lowering time.
 ## Tests
 
 `alchemy_msl_tests <group>` (ctest `alchemy_msl_*`): `rewriter`, `fixtures`

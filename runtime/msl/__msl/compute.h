@@ -25,17 +25,38 @@ typedef _atomic<long> __msl_id_atomic_long;
 // operations); the address space follows the pointer.
 #define __MSL_ATOMICS(AS) \
     template<typename T> inline T atomic_load_explicit(const volatile AS _atomic<T>* o, memory_order) { \
-        return __atomic_load_n(&o->__v, __ATOMIC_RELAXED); } \
+        if constexpr (is_same_v<T, float>) /* float atomics on the bits */ \
+            return __builtin_bit_cast(float, __atomic_load_n((const volatile AS uint*)&o->__v, __ATOMIC_RELAXED)); \
+        else return __atomic_load_n(&o->__v, __ATOMIC_RELAXED); } \
     template<typename T> inline void atomic_store_explicit(volatile AS _atomic<T>* o, type_identity_t<T> v, memory_order) { \
-        __atomic_store_n(&o->__v, v, __ATOMIC_RELAXED); } \
+        if constexpr (is_same_v<T, float>) __atomic_store_n((volatile AS uint*)&o->__v, __builtin_bit_cast(uint, v), __ATOMIC_RELAXED); \
+        else __atomic_store_n(&o->__v, v, __ATOMIC_RELAXED); } \
     template<typename T> inline T atomic_exchange_explicit(volatile AS _atomic<T>* o, type_identity_t<T> v, memory_order) { \
-        return __atomic_exchange_n(&o->__v, v, __ATOMIC_RELAXED); } \
+        if constexpr (is_same_v<T, float>) \
+            return __builtin_bit_cast(float, __atomic_exchange_n((volatile AS uint*)&o->__v, __builtin_bit_cast(uint, v), __ATOMIC_RELAXED)); \
+        else return __atomic_exchange_n(&o->__v, v, __ATOMIC_RELAXED); } \
     template<typename T> inline bool atomic_compare_exchange_weak_explicit(volatile AS _atomic<T>* o, \
         type_identity_t<T>* expected, type_identity_t<T> desired, memory_order, memory_order) { \
-        return __atomic_compare_exchange_n(&o->__v, expected, desired, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED); } \
+        if constexpr (is_same_v<T, float>) { /* float compare-exchange (MSL 3) on the bits */ \
+            uint __e = __builtin_bit_cast(uint, *expected); \
+            const bool __ok = __atomic_compare_exchange_n((volatile AS uint*)&o->__v, &__e, __builtin_bit_cast(uint, desired), true, \
+                __ATOMIC_RELAXED, __ATOMIC_RELAXED); \
+            *expected = __builtin_bit_cast(float, __e); \
+            return __ok; \
+        } else { \
+            return __atomic_compare_exchange_n(&o->__v, expected, desired, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED); \
+        } } \
     template<typename T> inline bool atomic_compare_exchange_strong_explicit(volatile AS _atomic<T>* o, \
         type_identity_t<T>* expected, type_identity_t<T> desired, memory_order, memory_order) { \
-        return __atomic_compare_exchange_n(&o->__v, expected, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED); } \
+        if constexpr (is_same_v<T, float>) { /* float compare-exchange (MSL 3) on the bits */ \
+            uint __e = __builtin_bit_cast(uint, *expected); \
+            const bool __ok = __atomic_compare_exchange_n((volatile AS uint*)&o->__v, &__e, __builtin_bit_cast(uint, desired), false, \
+                __ATOMIC_RELAXED, __ATOMIC_RELAXED); \
+            *expected = __builtin_bit_cast(float, __e); \
+            return __ok; \
+        } else { \
+            return __atomic_compare_exchange_n(&o->__v, expected, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED); \
+        } } \
     template<typename T> inline T atomic_fetch_add_explicit(volatile AS _atomic<T>* o, type_identity_t<T> v, memory_order) { \
         return __atomic_fetch_add(&o->__v, v, __ATOMIC_RELAXED); } \
     template<typename T> inline T atomic_fetch_sub_explicit(volatile AS _atomic<T>* o, type_identity_t<T> v, memory_order) { \
@@ -81,12 +102,17 @@ enum : uint {
     __SPV_GNU_BitwiseXor = 361, __SPV_GNU_QuadBroadcast = 365, __SPV_GNU_QuadSwap = 366,
 };
 struct simd_vote {
+    using vote_t = ulong;
     ulong __m;
     constexpr explicit simd_vote(ulong m = 0) : __m(m) {}
     constexpr bool all() const { return __m == ~0ul; }
     constexpr bool any() const { return __m != 0; }
     constexpr explicit operator ulong() const { return __m; }
     constexpr explicit operator bool() const { return __m != 0; }
+    constexpr simd_vote operator~() const { return simd_vote(~__m); }
+    constexpr simd_vote operator&(simd_vote v) const { return simd_vote(__m & v.__m); }
+    constexpr simd_vote operator|(simd_vote v) const { return simd_vote(__m | v.__m); }
+    constexpr simd_vote operator^(simd_vote v) const { return simd_vote(__m ^ v.__m); }
 };
 template<typename T> inline T __gop(uint f, uint s, uint u, uint group, T x) {
     return T(__msl_group1<decltype(__raw(x))>(__pick<T>(f, s, u), group, __raw(x)));

@@ -1,4 +1,5 @@
 #include "rewriter.hpp"
+#include "frontend.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -327,7 +328,11 @@ public:
     RewriteResult run() {
         parse_scope(0, sig_.size(), {}, true);
         rename_derived_uses();
-        for (auto& entry : pending_entries_) build_entry(entry);
+        // ALCHEMY_MSL_ENTRY=<text> (diagnostics): only entry points whose name
+        // contains it get wrappers, so clang and the lowering see just those.
+        static const std::string only = environment("ALCHEMY_MSL_ENTRY");
+        for (auto& entry : pending_entries_)
+            if (only.empty() || entry.name.find(only) != std::string::npos) build_entry(entry);
         rename_tokens();
         wrap_conditionals();
         RewriteResult result;
@@ -613,6 +618,7 @@ private:
                 std::size_t end = close + 1;
                 while (end < e && !is(end, ";")) ++end;
                 if (kind == 'c') class_definition(s, j, close, end, scope);
+                else enum_definition(j, close);
                 i = std::min(e, end + 1);
             } else if (kind == 'f') {
                 function_definition(s, j, close, scope);
@@ -701,6 +707,7 @@ private:
     void class_definition(std::size_t s, std::size_t open, std::size_t close, std::size_t end, const Scope& scope) {
         StructDef def;
         bool is_typedef = false;
+        std::size_t name_token = open;
         for (auto i = s; i < open; ++i) {
             const auto& t = text(i);
             if (t == "typedef") is_typedef = true;
@@ -712,7 +719,10 @@ private:
                         k = match(k + 1, "(", ")");
                         continue;
                     }
-                    if (T(k).kind == Token::Kind::identifier && text(k) != "final") def.name = text(k);
+                    if (T(k).kind == Token::Kind::identifier && text(k) != "final") {
+                        def.name = text(k);
+                        name_token = k;
+                    }
                     break;
                 }
             }
@@ -723,7 +733,14 @@ private:
         }
         Scope inner = scope;
         inner.in_class = true;
-        if (!def.name.empty()) inner.path.push_back(def.name);
+        if (!def.name.empty()) {
+            // A partial or explicit specialization's arguments are part of its
+            // scope (LeafData<Fp16, N> and LeafData<FpN, N> are different classes).
+            auto scope_name = def.name;
+            if (name_token + 1 < open && is(name_token + 1, "<"))
+                for (auto k = name_token + 1; k <= match_angles(name_token + 1) && k < open; ++k) scope_name += text(k);
+            inner.path.push_back(scope_name);
+        }
         for (const auto& part : scope.path) def.qualified += part + "::";
         def.qualified += def.name;
         current_members_.emplace_back();
@@ -759,18 +776,78 @@ private:
                     function_constant(rest, attribute);
                     return;
                 }
+                if (program_builtin(rest, attribute, e)) return;
                 error(attribute.line, "attribute '" + attribute.name + "' is not valid on this declaration");
             }
             return;
         }
         if (first == "constant") {
             if (derived_constant(s, e)) return;
-            bool constant = false;
-            for (auto i = s; i < e; ++i) constant = constant || is(i, "const") || is(i, "constexpr");
-            if (!constant) T(s).after += " const";
         }
     }
 
+    // ---- enumerators -------------------------------------------------------------------
+    // Values of the enumerators declared so far (an index argument may name
+    // one); nullopt when two enumerations give one name different values or
+    // a value could not be evaluated.
+    std::map<std::string, std::optional<std::uint32_t>> enumerators_;
+
+    void enum_definition(std::size_t open, std::size_t close) {
+        std::optional<std::uint32_t> next = 0;
+        auto i = open + 1;
+        while (i < close) {
+            if (T(i).kind != Token::Kind::identifier) { ++i; continue; }
+            const auto name = text(i);
+            auto j = i + 1;
+            std::optional<std::uint32_t> value = next;
+            if (j < close && is(j, "=")) {
+                std::string expression;
+                int depth = 0;
+                for (++j; j < close; ++j) {
+                    if (is(j, "(")) ++depth;
+                    if (is(j, ")")) --depth;
+                    if (depth == 0 && is(j, ",")) break;
+                    expression += text(j);
+                }
+                value = evaluate_integer(expression);
+            }
+            while (j < close && !is(j, ",")) ++j;
+            const auto [found, inserted] = enumerators_.emplace(name, value);
+            if (!inserted && found->second != value) found->second.reset();
+            next = value ? std::optional<std::uint32_t>(*value + 1) : std::nullopt;
+            i = j + 1;
+        }
+    }
+
+    // ---- program-scope builtins ---------------------------------------------------------
+    // MSL 3.1 `const uint id [[thread_position_in_grid]];` at program scope
+    // (Cycles' __METAL_GLOBAL_BUILTINS__): an inline function reading the
+    // builtin, called by every later use of the name, like a derived
+    // function constant; the lowering reads it in the entry point that inlines it.
+    bool program_builtin(const std::vector<std::size_t>& rest, const Attribute& attribute, std::size_t e) {
+        const auto found = builtin_attributes().find(attribute.name);
+        if (found == builtin_attributes().end() || rest.empty() || T(rest.back()).kind != Token::Kind::identifier) return false;
+        const auto builtin = found->second;
+        if (builtin == Builtin::position || builtin == Builtin::point_size || builtin == Builtin::clip_distance) return false;
+        std::string type;
+        for (std::size_t q = 0; q + 1 < rest.size(); ++q) {
+            const auto& t = text(rest[q]);
+            if (t == "const" || t == "constant" || t == "static") continue;
+            type += (type.empty() ? "" : " ") + t;
+        }
+        if (type.empty()) return false;
+        const auto name = text(rest.back());
+        const auto function = "__msl_pgb_" + name;
+        for (const auto k : rest) T(k).removed = true;
+        if (e < sig_.size() && is(e, ";")) T(e).removed = true;
+        T(rest.front()).before += "inline " + type + ' ' + function + "() { return metal::__msl_builtin_in<" + type + ", " +
+                                  raw_type(builtin_input_type(builtin)) + ">(" +
+                                  std::to_string(static_cast<std::uint32_t>(builtin)) + "u); }\n";
+        derived_[name] = function;
+        program_builtins_.insert(name);
+        derived_uses_.emplace_back(e + 1, name);
+        return true;
+    }
     // ---- derived function constants -------------------------------------------------------
     // `constant bool C = A || B;` with A and B function constants (ANGLE's
     // ANGLESampleMaskWriteEnabled) is a program-scope constant whose value
@@ -818,13 +895,50 @@ private:
         return true;
     }
 
+    // Names of program-scope builtins among derived_ (program_builtin()).
+    std::set<std::string> program_builtins_;
+
+    // `type name` followed by `,` `)` `=` `;` or `[`: a declaration.
+    bool shadowing_declaration(std::size_t i) const {
+        if (i == 0 || i + 1 >= sig_.size() || tokens_[sig_[i - 1]].kind != Token::Kind::identifier) return false;
+        static const std::set<std::string_view> expression_keywords = {"return", "case", "else", "do", "sizeof", "throw",
+                                                                      "new", "delete", "goto", "co_return", "co_yield"};
+        if (expression_keywords.count(text(i - 1))) return false;
+        return is(i + 1, ",") || is(i + 1, ")") || is(i + 1, "=") || is(i + 1, ";") || is(i + 1, "[");
+    }
+    // The last token of the scope a declaration at `i` belongs to: a
+    // parameter's function body, or the enclosing block.
+    std::size_t shadow_end(std::size_t i) const {
+        int paren = 0, brace = 0;
+        for (auto k = i + 1; k < sig_.size(); ++k) {
+            if (is(k, "(")) ++paren;
+            else if (is(k, ")")) {
+                if (paren-- == 0) {
+                    for (auto m = k + 1; m < sig_.size(); ++m) {
+                        if (is(m, "{")) return match(m, "{", "}");
+                        if (is(m, ";")) return m;
+                    }
+                    return sig_.size();
+                }
+            } else if (is(k, "{")) ++brace;
+            else if (is(k, "}") && brace-- == 0) return k;
+        }
+        return sig_.size();
+    }
     void rename_derived_uses() {
         for (const auto& [from, name] : derived_uses_) {
             const auto call = derived_.at(name) + "()";
+            const bool builtin = program_builtins_.count(name) != 0;
             for (auto i = from; i < sig_.size(); ++i) {
                 if (T(i).kind != Token::Kind::identifier || text(i) != name || T(i).removed) continue;
                 if (keep_identifier_.count(sig_[i])) continue;
                 if (i > 0 && (is(i - 1, ".") || is(i - 1, "->") || is(i - 1, "::"))) continue;
+                // A parameter or local of the same name (`const int simdgroup_size,`)
+                // hides a program-scope builtin until its scope ends.
+                if (builtin && shadowing_declaration(i)) {
+                    i = shadow_end(i);
+                    continue;
+                }
                 T(i).out = call;
                 keep_identifier_.insert(sig_[i]);
             }
@@ -931,6 +1045,11 @@ private:
     std::optional<std::uint32_t> evaluate_integer(std::string_view value) const {
         std::string digits;
         for (const auto c : value) if (c != ' ') digits += c;
+        // An enumerator (Cycles' [[function_constant(KernelData_...)]]), by its last name component.
+        if (const auto colon = digits.rfind(':'); !digits.empty() && !std::isdigit(static_cast<unsigned char>(digits[0])) && digits[0] != '(') {
+            const auto found = enumerators_.find(colon == std::string::npos ? digits : digits.substr(colon + 1));
+            if (found != enumerators_.end() && found->second) return *found->second;
+        }
         while (!digits.empty() && (digits.back() == 'u' || digits.back() == 'U' || digits.back() == 'l' ||
                                    digits.back() == 'L')) digits.pop_back();
         if (digits.size() > 2 && digits[0] == '(' && digits.back() == ')') digits = digits.substr(1, digits.size() - 2);
@@ -1070,7 +1189,7 @@ private:
         for (auto k = s; k < open; ++k) {
             const auto& t = text(k);
             if (t == "constant" || t == "device") address_space = true;
-            head += rename_word(t) + ' ';
+            head += address_space_word(k) + ' ';
         }
         if (!address_space) return false;
         for (auto k = open; k <= close; ++k) body += text(k) + ' ';
@@ -1474,6 +1593,7 @@ private:
         if (entry.stage == Stage::kernel) body << "    if (__msl_kernel_outside_grid()) return;\n";
         std::vector<std::string> args;
         std::uint32_t next_input = 0;
+        implicit_indices(pending);
         for (std::size_t p = 0; p < pending.params.size(); ++p) {
             const auto& tokens = pending.params[p];
             const auto& attributes = pending.param_attributes[p];
@@ -1491,7 +1611,14 @@ private:
                 continue;
             }
             const auto name = text(tokens[name_at]);
-            const auto type = param_text(tokens, 0, name_at);
+            auto type = param_text(tokens, 0, name_at);
+            // `T& __restrict name`: the qualifier says nothing the lowering needs.
+            for (const std::string_view qualifier : {"__restrict__", "__restrict", "restrict"}) {
+                if (type.size() > qualifier.size() && type.ends_with(qualifier)) {
+                    type.resize(type.size() - qualifier.size());
+                    while (!type.empty() && type.back() == ' ') type.pop_back();
+                }
+            }
             const auto var = "__p" + std::to_string(p);
             std::optional<std::uint32_t> condition_index;
             std::string condition;
@@ -1768,6 +1895,44 @@ private:
         if (returns) outputs(entry, pending.return_type, body);
         wrappers_ << "extern \"C\" void " << entry.wrapper << "() {\n" << body.str() << "}\n";
         entries_.push_back(std::move(entry));
+    }
+
+    // Buffer, texture and sampler parameters without an index attribute take
+    // the first index of their kind no other parameter names, in parameter
+    // order, as the Metal compiler assigns them (Cycles' kernel entry points).
+    void implicit_indices(PendingEntry& pending) {
+        std::map<std::string, std::set<std::uint32_t>> used;
+        for (const auto& attributes : pending.param_attributes)
+            for (const auto& attribute : attributes)
+                if ((attribute.name == "buffer" || attribute.name == "texture" || attribute.name == "sampler") && !attribute.args.empty())
+                    if (const auto index = evaluate_integer(attribute.args[0])) used[attribute.name].insert(*index);
+        for (std::size_t p = 0; p < pending.params.size(); ++p) {
+            auto& attributes = pending.param_attributes[p];
+            const auto& tokens = pending.params[p];
+            bool resource = false;
+            for (const auto& attribute : attributes) resource = resource || is_msl_attribute(attribute.name);
+            if (resource || tokens.empty()) continue;
+            std::string kind;
+            bool space = false, indirection = false;
+            for (const auto k : tokens) {
+                const auto& t = text(k);
+                if (t == "device" || t == "constant") space = true;
+                if (t == "*" || t == "&") indirection = true;
+                if (t.rfind("texture", 0) == 0 || t.rfind("depth", 0) == 0) kind = "texture";
+                if (t == "sampler") kind = "sampler";
+            }
+            if (kind.empty() && space && indirection) kind = "buffer";
+            if (kind.empty()) continue;
+            auto& taken = used[kind];
+            std::uint32_t index = 0;
+            while (taken.count(index)) ++index;
+            taken.insert(index);
+            Attribute attribute;
+            attribute.name = kind;
+            attribute.args = {std::to_string(index)};
+            attribute.line = line_of(tokens.front());
+            attributes.push_back(std::move(attribute));
+        }
     }
 
     static bool is_control_points(std::string_view type) {
@@ -2047,6 +2212,16 @@ private:
     }
 
     // ---- keyword renames ---------------------------------------------------------------
+    // MSL's constant address space is read-only: `constant T` is
+    // `const __global T` (pointees, references, objects and `T f() constant`
+    // member functions alike), or `__global` where the declaration already
+    // says const next to it (Tint's `const constant`).
+    std::string address_space_word(std::size_t s) const {
+        if (text(s) != "constant") return rename_word(text(s));
+        const bool adjacent = (s > 0 && is(s - 1, "const")) || (s + 1 < sig_.size() && is(s + 1, "const"));
+        return adjacent ? "__global" : "const __global";
+    }
+
     static std::string rename_word(const std::string& word) {
         static const std::map<std::string_view, std::string_view> renames = {
             {"device", "__global"}, {"constant", "__global"}, {"threadgroup", "__local"}, {"thread", ""},
@@ -2056,6 +2231,8 @@ private:
             {"__kernel", "__msl_id___kernel"}, {"image1d_t", "__msl_id_image1d_t"}, {"image2d_t", "__msl_id_image2d_t"},
             {"image3d_t", "__msl_id_image3d_t"}, {"sampler_t", "__msl_id_sampler_t"}, {"event_t", "__msl_id_event_t"},
             {"queue_t", "__msl_id_queue_t"}, {"clk_event_t", "__msl_id_clk_event_t"},
+            // OpenCL 2.0 address-space conversion builtins (Cycles' to_global/to_local).
+            {"to_global", "__msl_id_to_global"}, {"to_local", "__msl_id_to_local"}, {"to_private", "__msl_id_to_private"},
             {"reserve_id_t", "__msl_id_reserve_id_t"}, {"ndrange_t", "__msl_id_ndrange_t"},
             // OpenCL 2.0 builtin atomic typedefs (metal_stdlib declares the
             // renamed MSL ones).
@@ -2141,7 +2318,7 @@ private:
                     error(token.line, "the '" + token.text + "' address space is unsupported");
                     continue;
                 }
-                token.out = rename_word(token.text);
+                token.out = address_space_word(s);
                 continue;
             }
             if (token.kind == Token::Kind::number) {
