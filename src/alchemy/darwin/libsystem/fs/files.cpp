@@ -215,16 +215,21 @@ void DarwinServices::Impl::install_extra() {
     install("_realpath", [this](auto& s, auto& m) {
         // The guest root is "/": it maps to the host drive (with the Alchemy root's directories in
         // it), whose own name would otherwise come back as /Volumes/<drive>.
-        if (const auto guest = text(m, s.x[0]); !guest.empty() && guest.front() == '/' &&
-                std::filesystem::path(guest).lexically_normal().generic_string() == "/") {
-            const auto address = s.x[1] ? s.x[1] : allocate(2);
-            put_text(m, address, "/");
-            return address;
+        // So is /Volumes, whose host directory is in the Alchemy root.
+        if (const auto guest = text(m, s.x[0]); !guest.empty() && guest.front() == '/') {
+            auto normalized = std::filesystem::path(guest).lexically_normal().generic_string();
+            if (normalized.size() > 1 && normalized.back() == '/') normalized.pop_back();
+            if (normalized == "/" || (normalized == "/Volumes" && !guest_root_mapping().host_generic.empty())) {
+                const auto address = s.x[1] ? s.x[1] : allocate(normalized.size() + 1);
+                put_text(m, address, normalized);
+                return address;
+            }
         }
         const auto name = path(m, s.x[0]);
         std::error_code error; const auto canonical = is_random_device(name) ? name : std::filesystem::canonical(name, error);
         if (error) throw ServiceError{host_error(error)};
-        const auto value = guest_path_string(is_random_device(name) ? canonical : resolve_installed_links(canonical));
+        auto value = guest_path_string(is_random_device(name) ? canonical : resolve_installed_links(canonical));
+        if (value.size() > 1 && value.back() == '/') value.pop_back();   // a drive's root (C:/): /Volumes/C
         if (value.size() >= 1024 && s.x[1]) throw ServiceError{erange};
         const auto address = s.x[1] ? s.x[1] : allocate(value.size() + 1);
         put_text(m, address, value);
@@ -823,7 +828,9 @@ void DarwinServices::Impl::install_python_services() {
         }
         if (command == 50 && record) {
             if (record->socket || record->queue) throw ServiceError{45};
-            const auto value = guest_path_string(record->path);
+            std::optional<std::string> virtual_path;
+            { std::lock_guard lock(record->mutex); virtual_path = virtual_directory(*record); }
+            const auto value = virtual_path.value_or(guest_path_string(record->path));   // "/", "/Volumes"
             if (value.size() >= 1024) throw ServiceError{63};
             validate(m, argument, value.size() + 1, true); put_text(m, argument, value);
             return std::uint64_t{0};

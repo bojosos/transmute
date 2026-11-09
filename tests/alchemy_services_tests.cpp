@@ -646,6 +646,7 @@ void libc_leftovers() {
     f.engine.write32(tm + 8, 1); f.engine.write32(tm + 4, 3); f.engine.write32(tm, 52);
     require(get(f.engine, f.call("_asctime", {tm})) == "Sun Sep 16 01:03:52 1973\n", "asctime");
     require(f.engine.read32(symbol(f, "_sys_nerr")) == 107, "sys_nerr");
+    require(f.engine.read32(symbol(f, "__res") + 8) == 0, "_res is an uninitialized res_state (no RES_INIT)");
     require(f.call("_strtoumax", {f.string("18446744073709551615"), 0, 10}) == UINT64_MAX, "strtoumax");
     const auto block = f.call("_malloc", {100});
     const auto stats = f.context.allocate_guest(32);
@@ -724,11 +725,61 @@ void runtime_link_renames() {
             "unlink of a link another process made");
 }
 
+// Under an Alchemy root, /Volumes holds an entry per host drive, and names relative to descriptors opened as "/"
+// and "/Volumes" are guest paths: they reach the host drives (not <root>/.alchemy/Volumes, not the drive's root).
+void volumes_lookups() {
+    const auto base = std::filesystem::temp_directory_path() /
+        ("alchemy-volumes-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto root = alchemy::create_alchemy_root(base / "root");
+    struct Cleanup { std::filesystem::path path; ~Cleanup() { alchemy::clear_alchemy_root(); std::error_code e; std::filesystem::remove_all(path, e); } } cleanup{base};
+    alchemy::configure_alchemy_root(root);
+    const auto work = base / "work";
+    std::filesystem::create_directories(work);
+    std::ofstream(work / "input.txt") << "x";
+    const auto guest_work = alchemy::guest_path_string(work);   // /Volumes/<drive>/...
+    require(guest_work.starts_with("/Volumes/"), "the work directory's guest path");
+    const auto drive = guest_work.substr(9, 1);
+    Fixture f;
+    const auto stat_buffer = f.context.allocate_guest(144);
+    const auto root_fd = f.call("_open", {f.string("/"), 0});
+    const auto volumes_fd = f.call("_open", {f.string("/Volumes"), 0});
+    require(root_fd < 1024 && volumes_fd < 1024, "open / and /Volumes");
+    require(f.call("_fstatat", {root_fd, f.string(guest_work.substr(1) + "/input.txt"), stat_buffer, 0}) == 0,
+        "fstatat from / reaches the drive under Volumes");
+    require(f.call("_fstatat", {volumes_fd, f.string(guest_work.substr(9) + "/input.txt"), stat_buffer, 0}) == 0,
+        "fstatat from /Volumes reaches the drive");
+    require(f.call("_mkdirat", {volumes_fd, f.string(guest_work.substr(9) + "/made"), 0755}) == 0 && std::filesystem::is_directory(work / "made"),
+        "mkdirat from /Volumes creates on the drive");
+    std::error_code error;
+    require(std::filesystem::is_directory(root / ".alchemy" / "Volumes" / drive) &&
+        std::filesystem::is_empty(root / ".alchemy" / "Volumes" / drive, error), "/Volumes lists the drive, and nothing is created below it");
+    const auto resolved = f.context.allocate_guest(1024);
+    require(get(f.engine, f.call("_realpath", {f.string("/Volumes"), resolved})) == "/Volumes" &&
+        get(f.engine, f.call("_realpath", {f.string("/Volumes/" + drive), resolved})) == "/Volumes/" + drive, "realpath of /Volumes and a drive");
+    static_cast<void>(f.call("_close", {root_fd}));
+    static_cast<void>(f.call("_close", {volumes_fd}));
+}
+
+// A freed block with its own guest mapping stays readable for a while (libmalloc keeps freed medium and large
+// blocks' pages), until 64 MiB of later frees push it out.
+void freed_large_blocks() {
+    Fixture f;
+    auto& memory = static_cast<transmute::GuestMemory&>(f.engine);
+    const auto block = f.call("_malloc", {300 * 1024});
+    memory.write8(block + 1000, 0x5a);
+    f.call("_free", {block});
+    require(memory.read8(block + 1000) == 0x5a, "a freed 300 KiB block is still readable");
+    for (int index = 0; index < 70; ++index) f.call("_free", {f.call("_malloc", {1024 * 1024})});
+    bool unmapped = false;
+    try { static_cast<void>(memory.read8(block + 1000)); } catch (const std::exception&) { unmapped = true; }
+    require(unmapped, "64 MiB of later frees unmap the oldest freed block");
+}
+
 int main(int argc, char** argv) {
     try {
         memory_and_format(); files_stdio_syscalls(); environment_clock_mapping(); termination_wrappers(); locale_and_scanning(); guest_path_roundtrips();
         jumps_and_contexts(); blocks_runtime(); mach_and_identity(); patterns_and_directories(); libc_leftovers();
-        runtime_link_renames();
+        runtime_link_renames(); volumes_lookups(); freed_large_blocks();
         if (argc == 2) compiled_fixture(argv[1]);
         std::cout << "Alchemy Darwin services tests passed\n";
         return 0;

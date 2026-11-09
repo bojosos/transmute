@@ -59,6 +59,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -1323,6 +1324,7 @@ public:
         std::shared_ptr<NetworkSocket> socket;
         std::shared_ptr<NetworkQueue> queue;
         bool socket_alias_released{};
+        bool guest_root{};   // opened as "/" (its host directory is also /Volumes/<drive>'s): path_at, F_GETPATH
         std::filesystem::path path;
         // A directory's position (lseek, getattrlistbulk: the entries read so far), shared by its duplicates.
         std::shared_ptr<std::atomic<std::uint64_t>> directory_position;
@@ -1412,6 +1414,10 @@ public:
     std::map<std::string, std::uint64_t> environment_strings;
     std::uint64_t environment_cell{};
     std::uint64_t environment_array{}, environment_capacity{};   // the environ array update_environment owns, in entries
+    std::once_flag volumes_listed;                               // volumes_directory's drive entries
+    std::mutex retired_mutex;                                    // retire_mapping: freed blocks still mapped, oldest first
+    std::deque<std::pair<std::uint64_t, std::uint64_t>> retired;
+    std::uint64_t retired_bytes{};
     std::uint64_t environment_pool{}, environment_pool_left{};   // where the next environment string goes
     std::function<bool(std::uint64_t)> check_locale;
     std::array<bool, 3> closed_standard{};
@@ -1553,6 +1559,34 @@ public:
     static void refuse_read_only(const std::filesystem::path& host) {
         if (libsystem::in_fonts_view(host)) throw ServiceError{30};   // EROFS
     }
+    // <root>/.alchemy/Volumes, created with one empty directory per host drive letter (C, D, ...) the first time.
+    std::filesystem::path volumes_directory() {
+        const auto directory = utf8_path(guest_root_mapping().host_generic + "/.alchemy/Volumes");
+        std::call_once(volumes_listed, [&] {
+            std::error_code error;
+            std::filesystem::create_directories(directory, error);
+            if (const auto roots = host::files::volume_roots())
+                for (const auto& value : *roots)
+                    if (value.size() >= 2 && value[1] == ':' && std::isalpha(static_cast<unsigned char>(value[0])))
+                        std::filesystem::create_directory(directory / std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(value[0])))), error);
+        });
+        return directory;
+    }
+    // The guest path of a directory descriptor opened as "/" or "/Volumes": names relative to those are guest paths
+    // below them (/Volumes/<drive>, /tmp and the root's own directories are elsewhere on the host). The caller
+    // holds the record's mutex.
+    std::optional<std::string> virtual_directory(const File& record) {
+        if (record.guest_root) return std::string("/");
+        if (guest_root_mapping().host_generic.empty()) return std::nullopt;
+        const auto text = [](const std::filesystem::path& value) {
+            auto generic = path_text(value.lexically_normal());
+            while (generic.size() > 1 && generic.back() == '/') generic.pop_back();
+            std::transform(generic.begin(), generic.end(), generic.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return generic;
+        };
+        if (text(record.path) == text(utf8_path(guest_root_mapping().host_generic + "/.alchemy/Volumes"))) return std::string("/Volumes");
+        return std::nullopt;
+    }
     std::filesystem::path translate_path(std::string_view value) {
         if (value.empty()) throw ServiceError{enoent};
         auto result = std::filesystem::path(std::u8string(
@@ -1576,10 +1610,12 @@ public:
                 if (normalized.size() > 5) result /= std::filesystem::path(std::u8string(
                     reinterpret_cast<const char8_t*>(normalized.data() + 5), normalized.size() - 5));
             } else if ((normalized == "/Volumes" || normalized == "/Volumes/") && !guest_root_mapping().host_generic.empty()) {
-                // The directory above the host drives (/Volumes/C, ...): an
-                // empty directory of the Alchemy root, so that walking a path
-                // from "/" (mkdir -p) finds it.
-                result = utf8_path(guest_root_mapping().host_generic + "/.alchemy/Volumes");
+                // The directory above the host drives (/Volumes/C, ...): a
+                // directory of the Alchemy root, so that walking a path from
+                // "/" (mkdir -p) finds it, with an entry per host drive for
+                // listings. Names below it are resolved as guest paths
+                // (path_at), so its entries stand for the drives themselves.
+                result = volumes_directory();
             } else if (normalized.starts_with("/Volumes/")) {
                 // Only /Volumes/<drive letter> exists; any other volume name is absent.
                 if (normalized.size() < 10 || (normalized.size() > 10 && normalized[10] != '/') ||
@@ -1667,7 +1703,27 @@ public:
         const auto block = allocations.take(address);
         if (!block) throw std::runtime_error("Darwin free received an invalid allocation");
         if (block->base) engine_heap_release(context.main_engine(), block->base);
-        else context.release_guest(address);
+        else retire_mapping(address, block->size);
+    }
+    // A freed medium or large block (128 KiB to 16 MiB) with a guest mapping of its own stays mapped until 64 MiB of
+    // later such frees push it out, as libmalloc's medium regions and large cache keep a freed block's pages for
+    // a while: a stale pointer then reads old bytes, as on macOS, instead of faulting (LibreOffice's strncmp on a
+    // freed buffer). Other blocks are unmapped at once.
+    void retire_mapping(std::uint64_t address, std::uint64_t size) {
+        constexpr std::uint64_t kept_limit = 64ULL << 20, smallest = 128ULL << 10, largest = 16ULL << 20;
+        if (size < smallest || size > largest) { context.release_guest(address); return; }
+        std::vector<std::uint64_t> released;
+        {
+            std::lock_guard lock(retired_mutex);
+            retired.emplace_back(address, size);
+            retired_bytes += size;
+            while (retired_bytes > kept_limit) {
+                released.push_back(retired.front().first);
+                retired_bytes -= retired.front().second;
+                retired.pop_front();
+            }
+        }
+        for (const auto value : released) context.release_guest(value);
     }
     std::uint64_t allocation_size(std::uint64_t address, const char* operation) const {
         const auto block = allocations.find(address);
@@ -2029,6 +2085,7 @@ public:
         std::lock_guard lock(record->mutex);
         if (record->closed) throw ServiceError{ebadf};
         if (!record->directory) throw ServiceError{enotdir};
+        if (const auto guest = virtual_directory(*record)) return translate_path((*guest == "/" ? std::string("/") : *guest + "/") + value);
         return (record->path / candidate).lexically_normal();
     }
     std::filesystem::path filesystem_path_at(transmute::GuestMemory& memory, std::uint64_t descriptor, std::uint64_t address) {
@@ -2200,7 +2257,13 @@ public:
         return (flags & 3) == 0 ? host::files::Access::read : (flags & 3) == 1 ? host::files::Access::write : host::files::Access::read_write;
     }
     int open(const transmute::GuestMemory& memory, std::uint64_t address, std::uint64_t flags, std::uint64_t mode) {
-        return open_path(path(memory, address), flags, mode);
+        const auto descriptor = open_path(path(memory, address), flags, mode);
+        if (descriptor >= 0 && path_text(utf8_path(text(memory, address)).lexically_normal()) == "/") {
+            const auto record = file(descriptor);
+            std::lock_guard lock(record->mutex);
+            record->guest_root = true;
+        }
+        return descriptor;
     }
     int open_path(const std::filesystem::path& name, std::uint64_t flags, std::uint64_t mode) {
         // O_SHLOCK (0x10) / O_EXLOCK (0x20), as xnu's open1: the new descriptor takes a flock lock,
