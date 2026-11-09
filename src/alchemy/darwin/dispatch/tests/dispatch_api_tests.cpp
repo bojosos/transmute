@@ -180,6 +180,16 @@ void test_signal_sources(Fixture& f) {
     source = f.libsystem("_dispatch_source_create", {f.symbol(sys, "__dispatch_source_type_signal"), usr1, 0, queue});
     require(source != 0, "DISPATCH_SOURCE_TYPE_SIGNAL");
     require(f.libsystem("_dispatch_source_create", {f.symbol(sys, "__dispatch_source_type_signal"), 40, 0, queue}) == 0, "an invalid signal number");
+    // DISPATCH_SOURCE_TYPE_VM: only DISPATCH_VM_PRESSURE; dispatch_debug writes the object and the message.
+    const auto vm = f.libsystem("_dispatch_source_create", {f.symbol(sys, "__dispatch_source_type_vm"), 0, 0x80000000ULL, queue});
+    require(vm != 0 && f.libsystem("_dispatch_source_create", {f.symbol(sys, "__dispatch_source_type_vm"), 0, 1, queue}) == 0,
+            "DISPATCH_SOURCE_TYPE_VM masks");
+    static_cast<void>(f.libsystem("_dispatch_activate", {vm}));   // a source starts inactive; releasing it so is a crash
+    static_cast<void>(f.libsystem("_dispatch_source_cancel", {vm}));
+    static_cast<void>(f.libsystem("_dispatch_release", {vm}));
+    const auto arguments = f.process.allocate_guest(8);
+    f.engine.write64(arguments, 7);
+    static_cast<void>(f.libsystem("_dispatch_debugv", {queue, f.c_string("debug %d"), arguments}));
     f.libsystem("_dispatch_source_set_event_handler_f", {source, handler});
     f.libsystem("_dispatch_activate", {source});
     f.libsystem("_raise", {usr1});

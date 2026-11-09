@@ -7,6 +7,7 @@
 #include "alchemy/mach_port_events.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -154,7 +155,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         std::vector<std::pair<std::uint64_t, Work>> notifications;   // target queue (retained), work
         bool released{};
     };
-    enum class SourceType { timer, data_add, data_or, data_replace, mach_recv, mach_send, memory_pressure, proc, read, write, vnode, signal, unsupported };
+    enum class SourceType { timer, data_add, data_or, data_replace, mach_recv, mach_send, memory_pressure, vm_pressure, proc, read, write, vnode, signal, unsupported };
     struct Handler { std::uint64_t function{}, block{}; explicit operator bool() const { return function || block; } };
     struct Source {
         std::uint64_t address{}, handle{}, mask{}, queue{}, context{};
@@ -1231,6 +1232,9 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
             // NORMAL 0x1, WARN 0x2, CRITICAL 0x4; the private process-limit
             // (0x10, 0x20) and MSL bits are accepted and never fire.
             if (handle || (mask & ~(0x7ULL | 0x30ULL | 0xf0000000ULL))) return 0;
+        } else if (kind == SourceType::vm_pressure) {
+            // DISPATCH_SOURCE_TYPE_VM (deprecated for MEMORYPRESSURE): only DISPATCH_VM_PRESSURE (0x80000000).
+            if (handle || mask != 0x80000000ULL) return 0;
         } else if (kind == SourceType::read || kind == SourceType::write || kind == SourceType::vnode) {
             // A descriptor; READ and WRITE take no mask, VNODE the DISPATCH_VNODE_*
             // bits (NOTE_DELETE 0x1 ... NOTE_FUNLOCK 0x100).
@@ -1259,7 +1263,7 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         try { std::lock_guard lock(metadata); sources.emplace(source->address, source); }
         catch (...) { reference(target, false); process.release_guest(source->address); throw; }
         if (mach) watch_mach();
-        if (kind == SourceType::memory_pressure || kind == SourceType::proc) start_polling();
+        if (kind == SourceType::memory_pressure || kind == SourceType::vm_pressure || kind == SourceType::proc) start_polling();
         if (kind == SourceType::read || kind == SourceType::write || kind == SourceType::vnode) {
             // The kernel refuses the descriptor: the source is cancelled (libdispatch).
             if (!kevent_change(*source, 1 | (kind == SourceType::vnode ? 0x20 : 0x80))) {
@@ -1454,6 +1458,10 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
                 if (value->type == SourceType::memory_pressure) {
                     any = true;
                     if (changed && (value->mask & level)) { value->pending = level; ready.push_back(value); }
+                } else if (value->type == SourceType::vm_pressure) {
+                    // DISPATCH_VM_PRESSURE when the pressure rises to warn or critical.
+                    any = true;
+                    if (changed && (level & 0x6)) { value->pending = 0x80000000ULL; ready.push_back(value); }
                 } else if (value->type == SourceType::proc) {
                     any = true;
                     if ((value->mask & 0x80000000ULL) && !value->dead_reported) processes.push_back(value);
@@ -2111,12 +2119,12 @@ void Dispatch::install_groups_and_sources() {
         self.group_async(value, s.x[1], function_work(s.x[2], s.x[3], "dispatch_group_async_f")); return std::uint64_t{0};
     });
     // DISPATCH_SOURCE_TYPE_* are addresses of libdispatch data symbols.
-    const std::array<std::pair<const char*, SourceType>, 12> types{{
+    const std::array<std::pair<const char*, SourceType>, 13> types{{
         {"timer", SourceType::timer}, {"data_add", SourceType::data_add}, {"data_or", SourceType::data_or},
         {"data_replace", SourceType::data_replace}, {"read", SourceType::read}, {"write", SourceType::write},
         {"proc", SourceType::proc}, {"signal", SourceType::signal}, {"vnode", SourceType::vnode},
         {"mach_send", SourceType::mach_send}, {"mach_recv", SourceType::mach_recv},
-        {"memorypressure", SourceType::memory_pressure}}};
+        {"memorypressure", SourceType::memory_pressure}, {"vm", SourceType::vm_pressure}}};
     for (const auto& [name, kind] : types) {
         // DISPATCH_SOURCE_TYPE_* are type descriptors, not objects.
         const auto address = process.allocate_guest(16);
@@ -2128,6 +2136,19 @@ void Dispatch::install_groups_and_sources() {
         process.install_export(std::string(system_library), "__dispatch_source_type_" + std::string(name), {address, ExportKind::data});
     }
     install("_dispatch_source_create", [](auto& self, auto& s, auto&) { return self.new_source(s.x[0], s.x[1], s.x[2], s.x[3]); });
+    // dispatch_debug(object, format, ...) / dispatch_debugv(object, format, va_list): the object and the
+    // formatted message, on standard error (where this build's logging goes; libdispatch uses os_log).
+    const auto debug = [](auto& self, std::uint64_t object, std::uint64_t format, std::uint64_t arguments) {
+        const auto buffer = self.process.allocate_guest(2048);
+        static_cast<void>(self.call("_vsnprintf", {buffer, 2048, format, arguments}));
+        const auto bytes = self.process.calling_engine().read_string(buffer, 1, 2048);
+        self.process.release_guest(buffer);
+        std::fprintf(stderr, "dispatch_debug: object 0x%llx: %.*s\n", static_cast<unsigned long long>(object),
+                     static_cast<int>(bytes.size()), reinterpret_cast<const char*>(bytes.data()));
+        return std::uint64_t{0};
+    };
+    install("_dispatch_debug", [debug](auto& self, auto& s, auto&) { return debug(self, s.x[0], s.x[1], s.sp); });
+    install("_dispatch_debugv", [debug](auto& self, auto& s, auto&) { return debug(self, s.x[0], s.x[1], s.x[2]); });
     // DISPATCH_SOURCE_TYPE_SIGNAL: each delivery of the signal adds one to the source's data,
     // as on Darwin also when the signal's action is SIG_IGN.
     process.signal_observed = [weak = std::weak_ptr<Dispatch>(shared_from_this())](int signal) {
