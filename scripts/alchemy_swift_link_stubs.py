@@ -9,6 +9,7 @@ and writes one assembly source per Apple system identity naming them:
                   NSObject)
   foundation.s -> Foundation.framework (its Objective-C classes and NS* names)
   coremedia.s  -> CoreMedia.framework (its CM* C functions)
+  corefoundation.s -> CoreFoundation.framework (its CF* C functions)
   system.s -> /usr/lib/libSystem.B.dylib (everything else)
 The stubs are linked into dylibs that only give the linker two-level
 namespace bindings; they are never loaded (Alchemy's host providers serve
@@ -23,8 +24,10 @@ OBJC = re.compile(r"^_(objc_|_objc_|class_|object_|sel_|protocol_|method_|ivar_|
 FOUNDATION = re.compile(r"^_(OBJC_CLASS_\$_|OBJC_METACLASS_\$_|NS[A-Z])")
 # CoreMedia's C API (CMSampleBufferGetImageBuffer, ...), which the CoreMedia overlay calls.
 COREMEDIA = re.compile(r"^_CM[A-Z]")
+# CoreFoundation's C API (CFHash, CFEqual, ...), which the CoreFoundation overlay calls.
+COREFOUNDATION = re.compile(r"^_CF[A-Z]")
 # Each needed symbol goes to the first group whose pattern it matches; system takes the rest.
-GROUPS = [("objc", OBJC), ("foundation", FOUNDATION), ("coremedia", COREMEDIA)]
+GROUPS = [("objc", OBJC), ("foundation", FOUNDATION), ("coremedia", COREMEDIA), ("corefoundation", COREFOUNDATION)]
 
 
 def symbols(nm: str, paths: list[str], flags: list[str]) -> set[str]:

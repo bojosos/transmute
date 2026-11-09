@@ -315,6 +315,7 @@ function Link-Library([string]$name, [string]$installName, [string[]]$objects, [
     foreach ($stub in @(@{ Name = 'objc'; Install = '/usr/lib/libobjc.A.dylib'; File = 'libobjc.A.dylib' },
                         @{ Name = 'foundation'; Install = '/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation'; File = 'Foundation' },
                         @{ Name = 'coremedia'; Install = '/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia'; File = 'CoreMedia' },
+                        @{ Name = 'corefoundation'; Install = '/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation'; File = 'CoreFoundation' },
                         @{ Name = 'system'; Install = '/usr/lib/libSystem.B.dylib'; File = 'libSystem.B.dylib' })) {
         if (!(Select-String -LiteralPath "$interfaces/$($stub.Name).s" -Pattern '^\.globl' -Quiet)) { continue }
         Invoke-Tool $clang @('--target=arm64-apple-macos11', '-c', "$interfaces/$($stub.Name).s", '-o', "$interfaces/$($stub.Name).o") "$interfaces/$($stub.Name)-as"
@@ -550,6 +551,9 @@ if ($Library -eq 'all') {
     # /usr/lib/swift/libswiftObjectiveC.dylib first: once its module exists, SEL imports as ObjectiveC.Selector and
     # NSObject is Hashable in every overlay built after it.
     Build-Overlay 'ObjectiveC' 'swiftObjectiveC'
+    # /usr/lib/swift/libswiftCoreFoundation.dylib next: CGFloat and _CFObject, which every overlay that imports
+    # CoreFoundation after it sees.
+    Build-Overlay 'CoreFoundation' 'swiftCoreFoundation'
 
     # /System/Library/Frameworks/Combine.framework/Versions/A/Combine: OpenCombine's code (third_party/opencombine,
     # vendored by scripts/vendor_opencombine.py) and the project's runtime/swift/combine, as the resilient module
