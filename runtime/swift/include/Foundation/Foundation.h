@@ -140,6 +140,8 @@ typedef struct {
 @end
 
 @interface NSDictionary<KeyType, ObjectType> : NSObject <NSCopying, NSMutableCopying, NSFastEnumeration>
+- (instancetype)initWithObjects:(const id _Nonnull[_Nullable])objects forKeys:(const id _Nonnull[_Nullable])keys
+                          count:(NSUInteger)count;
 @property (readonly) NSUInteger count;
 - (nullable ObjectType)objectForKey:(KeyType)aKey;
 - (NSEnumerator<KeyType>*)keyEnumerator;

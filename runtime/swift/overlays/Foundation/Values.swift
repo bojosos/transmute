@@ -226,6 +226,15 @@ extension StringProtocol {
         return Data._unconditionallyBridgeFromObjectiveC(data)
     }
 
+    /// The string's bytes in `encoding` followed by a terminating NUL, or nil when it can't be encoded
+    /// (without loss), as swift-corelibs-foundation answers.
+    public func cString(using encoding: String.Encoding) -> [CChar]? {
+        guard let data = data(using: encoding) else { return nil }
+        var bytes: [CChar] = unsafe data.withUnsafeBytes { raw in unsafe Array(raw.bindMemory(to: CChar.self)) }
+        bytes.append(0)
+        return bytes
+    }
+
     public func contains<T: StringProtocol>(_ other: T) -> Bool {
         let needle = Array(other.unicodeScalars)
         if needle.isEmpty { return true }
