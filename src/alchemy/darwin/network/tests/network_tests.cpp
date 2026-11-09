@@ -933,6 +933,65 @@ void test_resolver(Fixture& f, bool online) {
             std::cout << "res_nsearch example.com: " << length << "-byte answer, " << ((header[6] << 8) | header[7]) << " records\n";
         }
     }
+
+    auto& memory = static_cast<GuestMemory&>(f.engine);
+    // dn_expand: labels, a compression pointer, escapes, the root, a pointer loop, a short buffer.
+    const Bytes message_bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0,   // 12: www.example.com
+        4, 'a', '.', 'b', 1, 0xc0, 12,                                              // 29: "a.b\001" -> 12
+        0,                                                                          // 36: the root
+        0xc0, 37};                                                                  // 37: points at itself
+    const auto message = f.process.allocate_guest(message_bytes.size());
+    f.engine.write_bytes(message, message_bytes);
+    const auto end = message + message_bytes.size();
+    const auto expanded = f.process.allocate_guest(256);
+    const auto expand = [&](std::uint64_t at, std::int32_t size) {
+        return static_cast<std::int64_t>(f.call(lib, "_res_9_dn_expand", {message, end, message + at, expanded, static_cast<Address>(size)}));
+    };
+    const auto text = [&] {
+        std::string value;
+        for (auto at = expanded; memory.read8(at); ++at) value.push_back(static_cast<char>(memory.read8(at)));
+        return value;
+    };
+    require(expand(12, 256) == 17 && text() == "www.example.com", "dn_expand labels");
+    require(expand(29, 256) == 7 && text() == "a\\.b\\001.www.example.com", "dn_expand pointer and escapes: " + text());
+    require(expand(36, 256) == 1 && text().empty(), "dn_expand root");
+    require(expand(37, 256) == -1, "dn_expand pointer loop");
+    require(expand(12, 15) == -1 && expand(12, 16) == 17, "dn_expand buffer size");
+
+    // res_nmkquery: buf and buflen are its 9th and 10th arguments, on the callee's stack.
+    const auto query = f.process.allocate_guest(512);
+    const auto mkquery = [&](Address op, std::string_view name, std::int32_t capacity) {
+        const auto sp = (f.engine.state().sp - 256) & ~15ULL;
+        f.engine.write64(sp, query);
+        f.engine.write32(sp + 8, static_cast<std::uint32_t>(capacity));
+        return static_cast<std::int64_t>(f.call(lib, "_res_9_nmkquery", {state, op, cstring(name), 1, 28, 0, 0, 0}));
+    };
+    require(mkquery(0, "www.example.com", 512) == 33, "res_nmkquery length");
+    Bytes built(33);
+    f.engine.read_bytes(query, built);
+    require(built[0] == memory.read8(state + 65) && built[1] == memory.read8(state + 64) && built[2] == 0x01 && built[5] == 1 &&
+        built[12] == 3 && built[29] == 0 && built[30] == 28 && built[32] == 1, "res_nmkquery message (id, RD, QDCOUNT, AAAA IN)");
+    require(mkquery(1, "www.example.com", 512) == -1 && mkquery(0, "www.example.com", 32) == -1 && mkquery(0, "a..b", 512) == -1,
+        "res_nmkquery refuses IQUERY, a short buffer and an empty label");
+
+    // res_setservers / res_getservers, and res_nsend refused when no server may be asked.
+    const auto set = f.process.allocate_guest(256);
+    f.engine.fill_bytes(set, 0, 256);
+    memory.write8(set, 16); memory.write8(set + 1, 2); memory.write8(set + 2, 0x14); memory.write8(set + 3, 0xe9);   // 5353
+    f.engine.write_bytes(set + 4, Bytes{192, 0, 2, 1});
+    memory.write8(set + 128, 28); memory.write8(set + 129, 30); memory.write8(set + 128 + 23, 1);   // [::1]:53
+    static_cast<void>(f.call(lib, "_res_9_setservers", {state, set, 2}));
+    require(f.engine.read32(state + 12) == 1 && memory.read8(state + 16 + 4) == 192, "res_setservers fills nsaddr_list");
+    const auto listed = f.process.allocate_guest(128 * 4);
+    require(f.call(lib, "_res_9_getservers", {state, listed, 4}) == 2 && memory.read8(listed + 3) == 0xe9 &&
+        memory.read8(listed + 129) == 30 && memory.read8(listed + 128 + 3) == 53, "res_getservers returns the set list");
+    alchemy::network_policy::set_mode_for_testing(alchemy::network_policy::Mode::loopback);
+    f.engine.write_bytes(set + 128 + 8, Bytes{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});   // 2001:db8::1
+    static_cast<void>(f.call(lib, "_res_9_setservers", {state, set, 2}));
+    require(static_cast<std::int64_t>(f.call(lib, "_res_9_nsend", {state, query, 33, answer, 4096})) == -1,
+        "res_nsend asks no external server under loopback");
+    alchemy::network_policy::set_mode_for_testing(std::nullopt);
     static_cast<void>(f.call(lib, "_res_9_ndestroy", {state}));
 }
 

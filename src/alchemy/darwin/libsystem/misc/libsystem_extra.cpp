@@ -1577,6 +1577,12 @@ void install_libc(const std::shared_ptr<State>& state) {
         context.calling_engine().write32(count, 107); // ELAST + 1
         context.install_export(std::string(system_library), "_sys_nerr", {count, ExportKind::data});
     }
+    {
+        // _res: the process-wide struct __res_state (552 bytes) of the legacy res_init and res_query. It stays
+        // zeroed, options without RES_INIT (not initialized); libresolv's res_9_n* calls take their own state.
+        const auto resolver_state = context.allocate_guest(552, 8);
+        context.install_export(std::string(system_library), "__res", {resolver_state, ExportKind::data});
+    }
     // A single virtual user (uid/gid 1000, matching getuid) backed by the host profile.
     const auto record = [state] {
         std::lock_guard lock(state->mutex);
