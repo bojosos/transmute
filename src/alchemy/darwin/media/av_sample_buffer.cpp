@@ -587,6 +587,11 @@ void Renderers::install() {
     }, "@@:");
 
     // ---- AVSampleBufferAudioRenderer ------------------------------------------------------------------
+    // The renderer's output never changes configuration and never flushes on its own (no device switch happens under
+    // it), so these are never posted.
+    for (const auto* name : {"AVSampleBufferAudioRendererOutputConfigurationDidChangeNotification",
+                             "AVSampleBufferAudioRendererWasFlushedAutomaticallyNotification"})
+        support.string_constant(av_foundation, std::string("_") + name, name);
     support.method(audio, "enqueueSampleBuffer:", [self](CpuState& s, GuestMemory&) { self->enqueue_audio(s.x[0], s.x[2]); }, "v@:^{opaqueCMSampleBuffer=}");
     support.method(audio, "flush", [self](CpuState& s, GuestMemory&) {
         auto a = self->state<AudioState>(s.x[0]);

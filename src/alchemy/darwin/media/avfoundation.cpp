@@ -2207,6 +2207,11 @@ void install_av_foundation(Support& support) {
             support.method(generic, selector, [name](CpuState&, GuestMemory&) { cannot_exist(name); }, "v@:B");
         }
     }
+    // ---- AUPannerView (CoreAudioKit): a panner unit's view. No panner unit exists here, so none is made.
+    if (support.objc.find_class("NSView")) {
+        const auto panner = support.declare_class("AUPannerView", "NSView", core_audio_kit);
+        support.method(panner, "AUPannerViewWithAudioUnit:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "@@:^{ComponentInstanceRecord=}", true);
+    }
     install_compositions(av, support);
     install_av_player(support);
     install_av_sample_buffer_renderers(support);

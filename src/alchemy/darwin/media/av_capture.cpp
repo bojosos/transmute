@@ -704,7 +704,7 @@ void Capture::install() {
                              "AVCaptureSessionPresetPhoto", "AVCaptureSessionPresetInputPriority", "AVCaptureSessionPreset320x240",
                              "AVCaptureSessionPreset352x288", "AVCaptureSessionPreset640x480", "AVCaptureSessionPreset960x540",
                              "AVCaptureSessionPreset1280x720", "AVCaptureSessionPreset1920x1080", "AVCaptureSessionPreset3840x2160",
-                             "AVCaptureSessionPresetiFrame960x540", "AVCaptureSessionPresetiFrame1280x720"})
+                             "AVCaptureSessionPresetiFrame960x540", "AVCaptureSessionPresetiFrame1280x720", "AVCaptureDeviceTypeDeskViewCamera"})
         support.string_constant(av_foundation, std::string("_") + name, name);
 
     const auto text = [sp](const std::string& value) { return sp->send_id(sp->cf.string(value), "autorelease"); };

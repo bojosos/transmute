@@ -34,6 +34,10 @@ void Provider::install() {
     string(media_player, "_MPNowPlayingInfoPropertyElapsedPlaybackTime", "MPNowPlayingInfoPropertyElapsedPlaybackTime");
     string(media_player, "_MPNowPlayingInfoPropertyPlaybackRate", "MPNowPlayingInfoPropertyPlaybackRate");
     string(media_player, "_MPNowPlayingInfoPropertyCurrentPlaybackDate", "MPNowPlayingInfoPropertyCurrentPlaybackDate");
+    // (unverified) VLC and mpv.
+    string(media_player, "_MPMediaItemPropertyAlbumTrackNumber", "albumTrackNumber");
+    for (const auto* name : {"MPNowPlayingInfoPropertyIsLiveStream", "MPNowPlayingInfoPropertyMediaType", "MPNowPlayingInfoPropertyPlaybackProgress"})
+        string(media_player, std::string("_") + name, name);
     const auto now_playing = cls(media_player, "MPNowPlayingInfoCenter", "NSObject");
     singleton(now_playing, "defaultCenter");
     object_properties(now_playing, {"nowPlayingInfo"});
@@ -60,6 +64,12 @@ void Provider::install() {
     });
     const auto position_command = cls(media_player, "MPChangePlaybackPositionCommand", "MPRemoteCommand");
     static_cast<void>(position_command);
+    // The events a command's targets receive: the host sends no remote command, so none is ever made for them.
+    const auto event = cls(media_player, "MPRemoteCommandEvent", "NSObject");
+    object_properties(event, {"command"});
+    real_properties(event, {"timestamp"});
+    const auto position_event = cls(media_player, "MPChangePlaybackPositionCommandEvent", "MPRemoteCommandEvent");
+    real_properties(position_event, {"positionTime"});
     const auto rate_command = cls(media_player, "MPChangePlaybackRateCommand", "MPRemoteCommand");
     object_properties(rate_command, {"supportedPlaybackRates"});
     const auto skip_command = cls(media_player, "MPSkipIntervalCommand", "MPRemoteCommand");

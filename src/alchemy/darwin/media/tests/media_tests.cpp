@@ -226,6 +226,18 @@ void video(Fixture& f) {
         require(f.status(cl, "_clFinish", {0}) == -36 && f.status(cl, "_clReleaseKernel", {0}) == -48 && f.status(cl, "_clWaitForEvents", {0, 0}) == -30,
                 "calls on objects that cannot exist");
     }
+    // The apps-wave names: MediaPlayer's (VLC, mpv), the renderer notifications (mpv), the desk view camera type (OBS),
+    // the command event classes, and AUPannerView, which no panner unit can show.
+    {
+        const auto mp = "/System/Library/Frameworks/MediaPlayer.framework/Versions/A/MediaPlayer";
+        require(f.string_constant(mp, "_MPMediaItemPropertyAlbumTrackNumber") == "albumTrackNumber" &&
+                f.string_constant(mp, "_MPNowPlayingInfoPropertyPlaybackProgress") == "MPNowPlayingInfoPropertyPlaybackProgress" &&
+                f.string_constant(av, "_AVCaptureDeviceTypeDeskViewCamera") == "AVCaptureDeviceTypeDeskViewCamera" &&
+                f.string_constant(av, "_AVSampleBufferAudioRendererWasFlushedAutomaticallyNotification") ==
+                    "AVSampleBufferAudioRendererWasFlushedAutomaticallyNotification", "MediaPlayer and AVFoundation names");
+        require(f.cls("MPChangePlaybackPositionCommandEvent") != 0 && f.cls("MPRemoteCommandEvent") != 0, "the command event classes");
+        require(f.send(f.cls("AUPannerView"), "AUPannerViewWithAudioUnit:", {0}) == 0, "no panner view");
+    }
     // Screen capture through AVFoundation is not available: no screen input is made.
     require(f.send(f.send(f.cls("AVCaptureScreenInput"), "alloc"), "initWithDisplayID:", {1}) == 0, "no AVCaptureScreenInput");
     const auto device = f.cls("AVCaptureDevice");
