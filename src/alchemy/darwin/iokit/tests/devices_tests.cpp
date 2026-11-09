@@ -91,6 +91,13 @@ void power(Fixture& f) {
     require(f.status(iokit, "_IOPMAssertionRelease", {f.engine.read32(assertion)}) == static_cast<std::int32_t>(0xe00002c2U), "double release");
     require(f.status(iokit, "_IOPMAssertionCreateWithName", {f.cf.string("UnknownAssertionType"), 255, f.cf.string("x"), assertion}) ==
             static_cast<std::int32_t>(0xe00002c7U), "unknown assertion type");
+    for (const Address user : {0, 1}) {
+        require(f.status(iokit, "_IOPMAssertionDeclareUserActivity", {f.cf.string("alchemy user"), user, assertion}) == 0,
+                "IOPMAssertionDeclareUserActivity");
+        require(f.status(iokit, "_IOPMAssertionRelease", {f.engine.read32(assertion)}) == 0, "release the user activity assertion");
+    }
+    require(f.status(iokit, "_IOPMAssertionDeclareUserActivity", {f.cf.string("alchemy user"), 2, assertion}) ==
+            static_cast<std::int32_t>(0xe00002c2U), "an unknown user type");
     const auto info = f.call(iokit, "_IOPSCopyPowerSourcesInfo");
     const auto list = f.call(iokit, "_IOPSCopyPowerSourcesList", {info});
     require(info && list, "power sources");

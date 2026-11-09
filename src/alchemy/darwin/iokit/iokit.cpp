@@ -249,18 +249,22 @@ public:
 
     // The host request for an assertion of `type` (IOPMAssertionCreateWithName's types) at `level`;
     // empty for a type it cannot hold. Level 0 (kIOPMAssertionLevelOff) holds nothing.
-    std::optional<alchemy::host::system::PowerRequest> power_request(const std::string& type, std::uint32_t level, const std::string& name) {
+    // UserIsActive (IOPMAssertionDeclareUserActivity) keeps the display on, or only the system for a remote user.
+    std::optional<alchemy::host::system::PowerRequest> power_request(const std::string& type, std::uint32_t level, const std::string& name,
+                                                                     bool remote = false) {
         bool display = false, system = false;
         if (type == "PreventUserIdleDisplaySleep" || type == "NoDisplaySleepAssertion") display = system = true;
         else if (type == "PreventUserIdleSystemSleep" || type == "NoIdleSleepAssertion" || type == "PreventSystemSleep") system = true;
+        else if (type == "UserIsActive") { system = true; display = !remote; }
         else return std::nullopt;
         auto request = alchemy::host::system::PowerRequest::create(name, system && level != 0, display && level != 0);
         if (!request) return std::nullopt;
         return std::move(*request);
     }
     // An assertion of `type`; 0 or an IOReturn (x0 image).
-    Address create_assertion(const std::string& type, std::uint32_t level, const std::string& name, Address out, GuestMemory& m) {
-        auto request = power_request(type, level, name);
+    Address create_assertion(const std::string& type, std::uint32_t level, const std::string& name, Address out, GuestMemory& m,
+                             bool remote = false) {
+        auto request = power_request(type, level, name, remote);
         if (!request) return status(io_return_unsupported);
         std::lock_guard lock(mutex);
         const auto id = next_assertion++;
@@ -634,6 +638,15 @@ void IoKit::install_power() {
         if (std::bit_cast<double>(s.v[0][0]) > 0)
             throw std::runtime_error("unsupported: IOPMAssertionCreateWithDescription with a timeout");
         s.x[0] = create_assertion(cf.utf8(s.x[0]), 255, cf.utf8(s.x[1]), s.x[6], m);
+    });
+    // IOPMAssertionDeclareUserActivity(name, IOPMUserActiveType, IOPMAssertionID *): a UserIsActive assertion that
+    // keeps the display and the system awake (kIOPMUserActiveLocal, 0) or the system only (kIOPMUserActiveRemote,
+    // 1) until it is released. It does not turn an already dark display back on, and it is not released on its
+    // own when the display-sleep time passes; the caller releases it, as the API asks.
+    raw(iokit, "_IOPMAssertionDeclareUserActivity", [this](CpuState& s, GuestMemory& m) {
+        const auto type = static_cast<std::uint32_t>(s.x[1]);
+        if (!s.x[0] || !s.x[2] || type > 1) { s.x[0] = status(io_return_bad_argument); return; }
+        s.x[0] = create_assertion("UserIsActive", 255, cf.utf8(s.x[0]), s.x[2], m, type == 1);
     });
     // IOReturn IOPMCopyAssertionsByProcess(CFDictionaryRef *): {pid: [assertion]}.
     raw(iokit, "_IOPMCopyAssertionsByProcess", [this](CpuState& s, GuestMemory& m) {
