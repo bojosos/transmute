@@ -284,7 +284,9 @@ function Invoke-Tool([string]$exe, [string[]]$arguments, [string]$log) {
 }
 # Links one guest library: its link-only libobjc/Foundation/libSystem
 # interfaces are generated from what the objects import beyond `$runtimes`.
-function Link-Library([string]$name, [string]$installName, [string[]]$objects, [string[]]$runtimes, [string]$fileName = "lib$name.dylib") {
+# `$aliases` ('existing=alias' symbol pairs) export extra names for existing symbols (ld64 -alias).
+function Link-Library([string]$name, [string]$installName, [string[]]$objects, [string[]]$runtimes, [string]$fileName = "lib$name.dylib",
+        [string[]]$aliases = @()) {
     $interfaces = "$stubs/$name"
     $null = New-Item -ItemType Directory -Force -Path $interfaces
     # Swift's autolink force-load references (weak __swift_FORCE_LOAD_$_<library>, one for each module an
@@ -313,6 +315,7 @@ function Link-Library([string]$name, [string]$installName, [string[]]$objects, [
     if ($LASTEXITCODE) { throw "link interface generation failed for $name" }
     $libraries = @()
     foreach ($stub in @(@{ Name = 'objc'; Install = '/usr/lib/libobjc.A.dylib'; File = 'libobjc.A.dylib' },
+                        @{ Name = 'appkit'; Install = '/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit'; File = 'AppKit' },
                         @{ Name = 'foundation'; Install = '/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation'; File = 'Foundation' },
                         @{ Name = 'coremedia'; Install = '/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia'; File = 'CoreMedia' },
                         @{ Name = 'corefoundation'; Install = '/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation'; File = 'CoreFoundation' },
@@ -327,7 +330,8 @@ function Link-Library([string]$name, [string]$installName, [string[]]$objects, [
     $dylib = "$out/$fileName"
     Invoke-Tool $linker (@('-arch', 'arm64', '-platform_version', 'macos', '11.0', '11.0', '-fixup_chains', '-dylib',
         '-install_name', $installName, '-compatibility_version', '1.0.0', '-current_version', '6.2.0',
-        '-L', (Slash (Split-Path $cxx)), '-o', $dylib) + $objects + $runtimes + $libraries) "$obj/link-$name"
+        '-L', (Slash (Split-Path $cxx)), '-o', $dylib) + $objects + $runtimes + $libraries +
+        @($aliases | ForEach-Object { $pair = $_ -split '=', 2; @('-alias', $pair[0], $pair[1]) })) "$obj/link-$name"
     Write-Host "Built $dylib"
 }
 Link-Library 'swiftCore' '/usr/lib/swift/libswiftCore.dylib' @($coreObjects + $cObjects) @($cxx)
@@ -496,14 +500,17 @@ $null = New-Item -ItemType Directory -Force -Path "$obj/overlays"
 # compiled into `$fileName` with install name `$installName`, linked against
 # libswiftCore and the given already-built `$dependencies` (output file names).
 # `$extraFlags` (for example -Xcc -I<dir> of a module-specific Clang module)
-# come after the shared overlay flags.
+# come after the shared overlay flags. `-concurrency` imports _Concurrency implicitly (async API);
+# `$aliases` go to Link-Library.
 function Build-Overlay([string]$module, [string]$library, [string]$sourceDirectory = "$repo/runtime/swift/overlays/$module",
         [string]$installName = "/usr/lib/swift/lib$library.dylib", [string]$fileName = "lib$library.dylib",
-        [string[]]$dependencies = @(), [string[]]$extraFlags = @(), [string[]]$extraInputs = @()) {
+        [string[]]$dependencies = @(), [string[]]$extraFlags = @(), [string[]]$extraInputs = @(), [switch]$concurrency,
+        [string[]]$aliases = @()) {
     $sources = @(Get-ChildItem -LiteralPath $sourceDirectory -Filter '*.swift' | Sort-Object Name | ForEach-Object { Slash $_.FullName })
     if (!$sources.Count) { throw "No Swift sources for overlay $module in $sourceDirectory" }
     $objects = @($sources | ForEach-Object { "$obj/overlays/$module-" + [System.IO.Path]::GetFileNameWithoutExtension($_) + '.o' })
-    $flags = $overlayFlags + $extraFlags + @('-module-name', $module, '-module-link-name', $library,
+    $base = if ($concurrency) { @($overlayFlags | Where-Object { $_ -ne '-disable-implicit-concurrency-module-import' }) } else { $overlayFlags }
+    $flags = $base + $extraFlags + @('-module-name', $module, '-module-link-name', $library,
         '-emit-module-path', "$obj/overlays/$module.swiftmodule")
     $signature = ($flags + $sources) -join "`n"
     if (Needs-Build $objects[-1] $signature @($sources + $extraInputs)) {
@@ -512,7 +519,8 @@ function Build-Overlay([string]$module, [string]$library, [string]$sourceDirecto
         Invoke-Tool $frontend $arguments "$obj/overlays/$module"
         Set-Content -LiteralPath "$($objects[-1]).flags" -Value $signature -Encoding utf8
     }
-    Link-Library $library $installName $objects (@($cxx, "$out/libswiftCore.dylib") + @($dependencies | ForEach-Object { "$out/$_" })) $fileName
+    Link-Library $library $installName $objects (@($cxx, "$out/libswiftCore.dylib") + @($dependencies | ForEach-Object { "$out/$_" })) $fileName `
+        $aliases
 }
 # Overlays authored outside runtime/swift/overlays (QLab gap group G6,
 # src/alchemy/darwin/swift): Apple SDK Swift modules that
@@ -607,6 +615,14 @@ if ($Library -eq 'all') {
     Build-Overlay 'Foundation' 'swiftFoundation' -dependencies @('libswiftObjectiveC.dylib', 'Combine', 'libswift_Concurrency.dylib',
         'libswiftDarwin.dylib')
     Build-Overlay 'os' 'swiftos'
+    # /System/Library/Frameworks/SwiftUI.framework/Versions/A/SwiftUI (runtime/swift/swiftui): SwiftUI's declarations
+    # over AppKit, with an explicit stop in every body Alchemy does not implement yet. ForEach.create is declared in
+    # Apple's SwiftUI module on a type from SwiftUICore, so its name has an extension context one module cannot
+    # produce: it is exported as an alias of the same method.
+    Build-Overlay 'SwiftUI' 'SwiftUI' "$repo/runtime/swift/swiftui" '/System/Library/Frameworks/SwiftUI.framework/Versions/A/SwiftUI' 'SwiftUI' `
+        -dependencies @('libswiftCoreGraphics.dylib', 'Combine', 'libswiftFoundation.dylib', 'libswiftos.dylib', 'libswiftObservation.dylib',
+        'libswift_Concurrency.dylib') -concurrency -aliases @(
+        '_$s7SwiftUI7ForEachV6create_2id7contentACyxq_q0_Gx_s7KeyPathCy7ElementQzq_Gq0_AKctFZ=_$s7SwiftUI7ForEachVAAE6create_2id7contentACyxq_q0_Gx_s7KeyPathCy7ElementQzq_Gq0_AKctFZ')
     foreach ($overlay in $extraOverlays) {
         if (!(Test-Path -LiteralPath $overlay.Source)) { continue }
         $extraFlags = @()
@@ -628,7 +644,7 @@ Copy-Item -LiteralPath "$repo/runtime/THIRD_PARTY_NOTICES.md" -Destination "$out
 $outputs = @(@(Get-ChildItem -LiteralPath $out -File -Filter '*.dylib') +
     @($extraOverlays | Where-Object { $_.File -notlike '*.dylib' -and (Test-Path -LiteralPath "$out/$($_.File)") } |
         ForEach-Object { Get-Item -LiteralPath "$out/$($_.File)" }) +
-    @(Get-Item -LiteralPath "$out/Combine" -ErrorAction SilentlyContinue) | Sort-Object Name)
+    @(Get-Item -LiteralPath "$out/Combine", "$out/SwiftUI" -ErrorAction SilentlyContinue) | Sort-Object Name)
 $headerRecords = @(foreach ($root in $sysroot) {
     $rootPath = (Resolve-Path -LiteralPath $root).Path.TrimEnd('\', '/')
     Get-ChildItem -LiteralPath $root -File -Recurse | Sort-Object FullName | ForEach-Object {

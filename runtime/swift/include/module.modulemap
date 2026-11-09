@@ -32,9 +32,15 @@ module Darwin [system] {
   export *
 }
 
-// CoreGraphics for the overlays that use it: CoreGraphics/CoreGraphics.h layers runtime/include's
-// declarations over this directory's CoreFoundation.
+// CoreGraphics and AppKit for the overlays that use them (libswiftCoreGraphics,
+// SwiftUI): CoreGraphics/CoreGraphics.h layers runtime/include's declarations
+// over this directory's CoreFoundation; AppKit/AppKit.h is this directory's own.
 module CoreGraphics [system] {
   header "CoreGraphics/CoreGraphics.h"
+  export *
+}
+
+module AppKit [system] {
+  header "AppKit/AppKit.h"
   export *
 }

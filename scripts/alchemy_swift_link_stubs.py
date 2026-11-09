@@ -7,6 +7,8 @@ given runtime dylibs (the guest libc++/libc++abi, libswiftCore, ...) define,
 and writes one assembly source per Apple system identity naming them:
   objc.s       -> /usr/lib/libobjc.A.dylib (Objective-C runtime entry points,
                   NSObject)
+  appkit.s     -> AppKit.framework (the classes runtime/swift/include/AppKit
+                  declares)
   foundation.s -> Foundation.framework (its Objective-C classes and NS* names)
   coremedia.s  -> CoreMedia.framework (its CM* C functions)
   corefoundation.s -> CoreFoundation.framework (its CF* C functions)
@@ -16,11 +18,16 @@ The stubs are linked into dylibs that only give the linker two-level
 namespace bindings; they are never loaded (Alchemy's host providers serve
 these identities), like the project's tests/fixtures/macos/link_*.c inputs.
 """
+import os
 import re
 import subprocess
 import sys
 
 OBJC = re.compile(r"^_(objc_|_objc_|class_|object_|sel_|protocol_|method_|ivar_|imp_|OBJC_CLASS_\$_NSObject$|OBJC_METACLASS_\$_NSObject$|OBJC_EHTYPE_)")
+# AppKit's classes are the ones the Swift-build AppKit header declares (read from it, so the two stay in step).
+APPKIT_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime", "swift", "include", "AppKit", "AppKit.h")
+APPKIT_CLASSES = sorted(set(re.findall(r"^@interface\s+(\w+)", open(APPKIT_HEADER, encoding="utf-8").read(), re.M)))
+APPKIT = re.compile(r"^_OBJC_(META)?CLASS_\$_(" + "|".join(APPKIT_CLASSES) + r")$")
 # Other Objective-C classes (NSString, NSData, ...) are Foundation's.
 FOUNDATION = re.compile(r"^_(OBJC_CLASS_\$_|OBJC_METACLASS_\$_|NS[A-Z])")
 # CoreMedia's C API (CMSampleBufferGetImageBuffer, ...), which the CoreMedia overlay calls.
@@ -30,8 +37,8 @@ COREFOUNDATION = re.compile(r"^_CF[A-Z]")
 # CoreGraphics' C API and constants (CGColorGetComponents, kCGColorBlack, ...), which the CoreGraphics overlay uses.
 COREGRAPHICS = re.compile(r"^_(CG|kCG)[A-Z]")
 # Each needed symbol goes to the first group whose pattern it matches; system takes the rest.
-GROUPS = [("objc", OBJC), ("foundation", FOUNDATION), ("coremedia", COREMEDIA), ("corefoundation", COREFOUNDATION),
-          ("coregraphics", COREGRAPHICS)]
+GROUPS = [("objc", OBJC), ("appkit", APPKIT), ("foundation", FOUNDATION), ("coremedia", COREMEDIA),
+          ("corefoundation", COREFOUNDATION), ("coregraphics", COREGRAPHICS)]
 
 
 def symbols(nm: str, paths: list[str], flags: list[str]) -> set[str]:
