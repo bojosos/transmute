@@ -209,6 +209,11 @@ void media(Fixture& f) {
     require(archived != 0, "an NSColorSpace archives with secure coding");
     const auto unarchived = f.send(f.cls("NSKeyedUnarchiver"), "unarchivedObjectOfClass:fromData:error:", {f.cls("NSColorSpace"), archived, 0});
     require(unarchived == srgb, "and unarchives to the sRGB color space");
+    // Godot: a view's layer contents redraw policy (DuringViewResize by default).
+    const auto policy_view = f.send(f.send(f.cls("NSView"), "alloc"), "init");
+    require(f.send(policy_view, "layerContentsRedrawPolicy") == 2, "the default redraw policy");
+    static_cast<void>(f.send(policy_view, "setLayerContentsRedrawPolicy:", {1}));
+    require(f.send(policy_view, "layerContentsRedrawPolicy") == 1, "setLayerContentsRedrawPolicy:");
     // Godot: Help-menu search handlers are kept (retained) until unregistered.
     const auto app = f.send(f.cls("NSApplication"), "sharedApplication");
     const auto handler = f.send(f.send(f.cls("NSObject"), "alloc"), "init");

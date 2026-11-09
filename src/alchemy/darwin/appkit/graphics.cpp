@@ -340,7 +340,7 @@ void AppKit::display_window(Address target, bool force) {
         static_cast<void>(send_optional(value, "viewWillDraw"));
         if (layer_contents::view_updates_layer(objc, value)) {
             layer_contents::update_view_layer(objc, value);
-        } else if (!layer_hosting(value) || view_draws(value)) {
+        } else if ((!layer_hosting(value) || view_draws(value)) && !(info->wants_layer && info->redraw_policy == 0)) {
             const auto previous = begin_view_drawing(value, visible);
             // Drawn-text notes for the autopress diagnostic (drawn_text.hpp).
             const auto previous_drawing = std::exchange(drawing_view, autopress ? value : 0);

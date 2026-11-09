@@ -340,6 +340,11 @@ NSUserDefaultsController applies changes immediately even when a nib says
 NSAppliesImmediately NO (deferred application is not modelled).
 
 **Godot, Pika, OBS:**
+* NSView keeps its `layerContentsRedrawPolicy` (default
+  NSViewLayerContentsRedrawDuringViewResize). With Never, a layer-backed view's
+  `-drawRect:` is not called: its layer contents are the application's. The
+  other policies redraw when the view needs display and when it is resized;
+  the timing within a resize and Crossfade's animation are not modelled.
 * NSApplication keeps the Help-menu search handlers registered with
   `-registerUserInterfaceItemSearchHandler:` until they are unregistered. No
   Help-menu search field queries them.

@@ -280,6 +280,10 @@ struct ViewState final : ResponderState {
     std::uint64_t autoresizing_mask{}, allowed_touch_types{};
     bool wants_layer{}, backing_layer{}, needs_display{}, hidden{}, posts_frame_changes{true}, posts_bounds_changes{true};
     bool autoresizes_subviews{true}, best_resolution_gl{};
+    // -layerContentsRedrawPolicy (NSViewLayerContentsRedrawPolicy):
+    // NSViewLayerContentsRedrawDuringViewResize (2) by default; Never (0) keeps
+    // a layer-backed view's drawRect: from drawing (graphics.cpp).
+    std::int64_t redraw_policy{2};
     Rect dirty;                               // -setNeedsDisplayInRect: union (bounds coordinates)
     Address focus_previous{};                 // -lockFocus: the context to restore (+1)
     bool focus_locked{};

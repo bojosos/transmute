@@ -993,6 +993,15 @@ void AppKit::install_view() {
     // ---- layers and display ----
     method(v, "wantsLayer", [this](CpuState& s, GuestMemory&) { return_bool(s, view_state(s.x[0])->wants_layer); }, "B@:");
     method(v, "setWantsLayer:", [this](CpuState& s, GuestMemory&) { view_state(s.x[0])->wants_layer = bool_arg(s, 2); }, "v@:B");
+    // The layer contents redraw policy (Godot's content view sets it): Never
+    // (0) leaves a layer-backed view's contents to the application, so
+    // -drawRect: is not called for it. The others are kept; views are redrawn
+    // when they need display and when they are resized, whichever is set
+    // (when during a resize, and Crossfade's animation, are not modelled).
+    method(v, "layerContentsRedrawPolicy", [this](CpuState& s, GuestMemory&) { s.x[0] = static_cast<Address>(view_state(s.x[0])->redraw_policy); }, "q@:");
+    method(v, "setLayerContentsRedrawPolicy:", [this](CpuState& s, GuestMemory&) {
+        view_state(s.x[0])->redraw_policy = static_cast<std::int64_t>(s.x[2]);
+    }, "v@:q");
     method(v, "wantsUpdateLayer", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, "B@:");
     method(v, "makeBackingLayer", [this](CpuState& s, GuestMemory&) {
         const auto layer_class = objc.find_class("CALayer");
