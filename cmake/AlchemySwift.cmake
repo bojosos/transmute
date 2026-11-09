@@ -120,9 +120,11 @@ if(BUILD_TESTING AND ALCHEMY_LD64_LLD AND macos_dir AND TARGET alchemy-fx
         add_custom_command(OUTPUT "${macos_dir}/swift_metal.o"
             COMMAND "${CMAKE_COMMAND}" -E env "${alchemy_swift_env}" "${alchemy_swift_bin}/swift-frontend.exe"
                 -frontend -c -target arm64-apple-macosx11.0 -module-name swift_metal -O -parse-as-library
-                -I "${ALCHEMY_SWIFT_RUNTIME_DIR}/obj/core" -I "${overlays}"
+                -I "${ALCHEMY_SWIFT_RUNTIME_DIR}/obj/core" -I "${ALCHEMY_SWIFT_RUNTIME_DIR}/obj/stdlib"
+                -I "${ALCHEMY_SWIFT_RUNTIME_DIR}/obj/combine" -I "${overlays}"
                 -I "${ALCHEMY_SWIFT_SOURCE_DIR}/swift/stdlib/public/SwiftShims/swift/shims"
-                -Xcc "-I${CMAKE_SOURCE_DIR}/runtime/swift/include" -Xcc "-I${CMAKE_SOURCE_DIR}/src/alchemy/darwin/swift/include"
+                -Xcc "-I${CMAKE_SOURCE_DIR}/runtime/swift/include" -Xcc "-I${CMAKE_SOURCE_DIR}/runtime/include"
+                -Xcc "-I${CMAKE_SOURCE_DIR}/src/alchemy/darwin/swift/include"
                 -disable-implicit-concurrency-module-import -disable-implicit-string-processing-module-import
                 -runtime-compatibility-version none -module-cache-path "${CMAKE_CURRENT_BINARY_DIR}/swift-module-cache"
                 "${CMAKE_SOURCE_DIR}/tests/fixtures/macos/swift_metal.swift" -o "${macos_dir}/swift_metal.o"
