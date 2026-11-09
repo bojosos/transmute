@@ -117,6 +117,17 @@ function(alchemy_darwin_foundation_tests)
     alchemy_gui_program(qlab_archive_fixture qlab_archive_fixture)
     add_custom_target(alchemy_gui_foundation_data_fixtures ALL DEPENDS "${macos_dir}/qlab_archive_fixture")
     add_dependencies(alchemy_gui_foundation_data_fixtures alchemy_gui_link_stubs)
+    # NSThread objects started with -start (threads_and_localizations.cpp): a target and selector, a block and a
+    # subclass's -main, each on its own pthread. Blocks and the runtime calls resolve by flat lookup.
+    alchemy_gui_object(foundation_thread_fixture ../../../src/alchemy/darwin/foundation/tests/thread_fixture.m)
+    add_custom_command(OUTPUT "${macos_dir}/foundation_thread_fixture"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main -undefined dynamic_lookup
+            "${macos_dir}/foundation_thread_fixture.o" ${ALCHEMY_GUI_LINK_STUBS} -o "${macos_dir}/foundation_thread_fixture"
+        DEPENDS "${macos_dir}/foundation_thread_fixture.o" ${ALCHEMY_GUI_LINK_STUBS} VERBATIM)
+    add_custom_target(alchemy_gui_foundation_thread_fixtures ALL DEPENDS "${macos_dir}/foundation_thread_fixture")
+    add_dependencies(alchemy_gui_foundation_thread_fixtures alchemy_gui_link_stubs)
+    alchemy_gui_add_fixture_test(alchemy_gui_foundation_thread_fixture "${macos_dir}/foundation_thread_fixture"
+        PROGRESS "Alchemy NSThread fixture: launched" COMPLETE "Alchemy NSThread fixture: complete")
     alchemy_gui_add_fixture_test(alchemy_gui_foundation_archive_fixture "${macos_dir}/qlab_archive_fixture"
         PROGRESS "Alchemy keyed archive fixture: launched" COMPLETE "Alchemy keyed archive fixture: complete")
     # Foundation's exceptions and forwarding (exceptions.cpp, invocation.cpp): @catch of -raise and
