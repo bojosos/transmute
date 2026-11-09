@@ -254,6 +254,14 @@ void install_libsystem_process(Provider& p) {
             if (s.x[0] >= image.begin && s.x[0] < image.end) return image.header;
         return 0;
     }, 0);
+    // bool _dyld_bind_fully_image_containing_address(const void* address): the loader binds every image's lazy
+    // pointers when it maps it (macho.cpp), so an image that holds `address` is already fully bound (true); an
+    // address in no image is false.
+    p.libsystem("__dyld_bind_fully_image_containing_address", [&process](CpuState& s, GuestMemory&) -> std::uint64_t {
+        for (const auto& image : process.images())
+            if (s.x[0] >= image.begin && s.x[0] < image.end) return 1;
+        return 0;
+    }, 0);
     p.libsystem("_dyld_image_path_containing_address", [&process, names](CpuState& s, GuestMemory&) -> std::uint64_t {
         for (const auto& image : process.images()) {
             if (s.x[0] < image.begin || s.x[0] >= image.end) continue;

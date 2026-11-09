@@ -1337,8 +1337,10 @@ void test_b24(Fixture& f) {
             f.sys("__dyld_get_shared_cache_uuid", {uuid}) == 0, "no shared cache");
     require(f.sys("__dyld_is_memory_immutable", {header, 16}) == 0 && f.sys("__dyld_image_containing_address", {header}) == 0,
             "heap memory is neither immutable nor in an image");
+    require(f.sys("__dyld_bind_fully_image_containing_address", {header}) == 0, "no image to bind for heap memory");
     const auto program = f.sys("__dyld_get_prog_image_header", {});
     require(!program || f.engine.read32(program + 12) == 2, "_dyld_get_prog_image_header is an executable's");
+    require(!program || f.sys("__dyld_bind_fully_image_containing_address", {program}) == 1, "the executable is fully bound");
 }
 
 // B25: fsgetpath, getifmaddrs, malloc_zones / malloc_num_zones.
