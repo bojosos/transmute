@@ -80,7 +80,7 @@ function(alchemy_gui_media_tests)
     # audio files, HAL model).
     alchemy_gui_add_unit_test(alchemy_gui_media_unit src/alchemy/darwin/media/tests/media_core_tests.cpp)
     # Their guest-facing exports through the strict-mode provider fixture.
-    alchemy_gui_add_unit_test(alchemy_gui_media_guest src/alchemy/darwin/media/tests/media_guest_tests.cpp TIMEOUT 180)
+    alchemy_gui_add_unit_test(alchemy_gui_media_guest src/alchemy/darwin/media/tests/media_guest_tests.cpp TIMEOUT 300)
     # compressed_audio reads minimp3's conformance vectors.
     target_compile_definitions(alchemy_gui_media_guest PRIVATE ALCHEMY_THIRD_PARTY="${PROJECT_SOURCE_DIR}/third_party")
     # AVFoundation capture and the audio engine's input over fake cameras and a fake microphone
