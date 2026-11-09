@@ -1,6 +1,7 @@
 #include "alchemy/objc_runtime.hpp"
 #include "transmute/jit.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -8,6 +9,7 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace {
 using Address = std::uint64_t;
@@ -145,6 +147,29 @@ void test_dynamic_registration() {
         f.call("_method_setImplementation", {0, first}) == 0, "a NULL Method was not nil");
     static_cast<void>(f.call("_method_exchangeImplementations", {method, 0}));
     require(f.call("_objc_msgSend", {object, sel}) == 27, "exchanging with a NULL Method changed the method");
+    // objc4 SPI: class_replaceMethodsBulk, object_getMethodImplementation, _method_setImplementationRawUnsafe,
+    // objc_loadClassref, gdb_class_getClass, _objc_flush_caches, _objc_addWillInitializeClassFunc, _objc_load_image.
+    {
+        const auto names = f.process.allocate_guest(8), imps = f.process.allocate_guest(8), kinds = f.process.allocate_guest(8);
+        f.engine.write64(names, sel); f.engine.write64(imps, second); f.engine.write64(kinds, encoding);
+        static_cast<void>(f.call("_class_replaceMethodsBulk", {cls, names, imps, kinds, 1}));
+        require(f.call("_objc_msgSend", {object, sel}) == 42 && f.call("_object_getMethodImplementation", {object, sel}) == second,
+                "class_replaceMethodsBulk / object_getMethodImplementation");
+        require(f.call("__method_setImplementationRawUnsafe", {method, first}) == second && f.call("_objc_msgSend", {object, sel}) == 27,
+                "_method_setImplementationRawUnsafe");
+        const auto reference = f.process.allocate_guest(8);
+        f.engine.write64(reference, cls);
+        require(f.call("_objc_loadClassref", {reference}) == cls && f.call("_gdb_class_getClass", {cls}) == cls, "objc_loadClassref / gdb_class_getClass");
+        static_cast<void>(f.call("__objc_flush_caches", {0}));
+        require(f.call("_objc_msgSend", {object, sel}) == 27, "a message after _objc_flush_caches");
+        std::vector<std::uint64_t> seen;
+        const auto observer = f.engine.register_guest_call([&seen](auto& s, auto&) { seen.push_back(s.x[1]); });
+        static_cast<void>(f.call("__objc_addWillInitializeClassFunc", {observer, 0x77}));
+        require(std::find(seen.begin(), seen.end(), cls) != seen.end(), "_objc_addWillInitializeClassFunc misses an initialized class");
+        bool refused = false;
+        try { static_cast<void>(f.call("__objc_load_image", {0, 0x1234000})); } catch (const std::exception&) { refused = true; }
+        require(refused, "_objc_load_image of an image the loader did not map");
+    }
     const auto inherited = f.runtime.selector("hash");
     const auto inherited_method = f.call("_class_getInstanceMethod", {cls, inherited});
     require(f.call("_class_replaceMethod", {cls, inherited, second, encoding}) == 0 &&

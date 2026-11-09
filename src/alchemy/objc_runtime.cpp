@@ -309,6 +309,10 @@ struct ObjcRuntime::Impl {
     // class records) packed into shared guest pages.
     struct Arena { std::mutex mutex; Address cursor{}, end{}; } arena;
     static constexpr std::uint64_t arena_chunk = 64 * 1024;
+    // _objc_addWillInitializeClassFunc's functions, void (*)(void* context, Class): called for each class
+    // before its +initialize (and, when added, for each class already initialized).
+    std::mutex will_initialize_mutex;
+    std::vector<std::pair<Address, Address>> will_initialize;
     Address sel_retain{}, sel_release{}, sel_autorelease{}, sel_dealloc{}, sel_initialize{}, sel_alloc{}, sel_init{},
         sel_construct{}, sel_destruct{}, sel_resolve_instance{}, sel_resolve_class{}, sel_forwarding_target{};
     Address forward_handler{};   // objc_setForwardHandler
@@ -744,6 +748,9 @@ struct ObjcRuntime::Impl {
             value.state = Class::State::running; value.owner = std::this_thread::get_id();
         }
         try {
+            std::vector<std::pair<Address, Address>> observers;
+            { std::lock_guard lock(will_initialize_mutex); observers = will_initialize; }
+            for (const auto& [function, context] : observers) static_cast<void>(invoke_imp(function, {context, address}));
             if (const auto entry = method(value.meta, sel_initialize))
                 static_cast<void>(invoke_imp(entry->implementation, {address, sel_initialize}));
             { std::lock_guard lock(value.initialize_mutex); value.state = Class::State::complete; }
@@ -2240,6 +2247,64 @@ struct ObjcRuntime::Impl {
         function("_class_addMethod", [this](auto& s, auto& m) { auto value = make_method(text(m, s.x[1]), s.x[2], text(m, s.x[3]));
             std::lock_guard lock(mutex); auto target = cls(s.x[0]); const auto [it, added] = target->methods.emplace(value.selector, value);
             static_cast<void>(it); if (added) { method_owners[value.descriptor] = target->address; flush_caches(); } s.x[0] = added; });
+        // objc4 SPI the conformance suite links:
+        // _objc_flush_caches(Class): every method cache goes (any class's; a NULL class too).
+        function("__objc_flush_caches", [this](auto&, auto&) { std::lock_guard lock(mutex); flush_caches(); });
+        // class_replaceMethodsBulk(cls, const SEL* names, const IMP* imps, const char** types, uint32_t count):
+        // class_replaceMethod for each.
+        function("_class_replaceMethodsBulk", [this](auto& s, auto& m) {
+            if (!s.x[0] || !s.x[4]) return;
+            const auto replace = process.resolve(objc_library, "_class_replaceMethod");
+            if (!replace) throw std::runtime_error("class_replaceMethodsBulk: class_replaceMethod is not provided");
+            for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(s.x[4]); ++index)
+                static_cast<void>(invoke_imp(replace->address, {s.x[0], m.read64(s.x[1] + index * 8ULL), m.read64(s.x[2] + index * 8ULL),
+                                                                s.x[3] ? m.read64(s.x[3] + index * 8ULL) : 0}));
+        });
+        // Class objc_loadClassref(Class* ref): classes are realized when their image loads.
+        function("_objc_loadClassref", [](auto& s, auto& m) { s.x[0] = s.x[0] ? m.read64(s.x[0]) : 0; });
+        // Class gdb_class_getClass(Class): the debugger's view of a realized class is the class.
+        function("_gdb_class_getClass", [](auto&, auto&) {});
+        // IMP object_getMethodImplementation(id, SEL): its class's, NULL for nil.
+        function("_object_getMethodImplementation", [this](auto& s, auto&) {
+            s.x[0] = s.x[0] ? implementation_or_forward(object_class(s.x[0]), s.x[1]) : 0;
+        });
+        // _method_setImplementationRawUnsafe(Method, IMP): method_setImplementation.
+        function("__method_setImplementationRawUnsafe", [this](auto& s, auto&) {
+            const auto set = process.resolve(objc_library, "_method_setImplementation");
+            if (!set) throw std::runtime_error("_method_setImplementationRawUnsafe: method_setImplementation is not provided");
+            s.x[0] = invoke_imp(set->address, {s.x[0], s.x[1]});
+        });
+        // _objc_addWillInitializeClassFunc(func, context): func(context, cls) now for every class already
+        // initialized, then before each class's +initialize.
+        function("__objc_addWillInitializeClassFunc", [this](auto& s, auto&) {
+            const auto function_address = s.x[0], context = s.x[1];
+            std::vector<Address> done;
+            {
+                std::lock_guard lock(mutex);
+                for (const auto& [name, address] : names) {
+                    static_cast<void>(name);
+                    const auto record = cls(address);
+                    if (!record->metaclass && record->initialized.load(std::memory_order_acquire)) done.push_back(address);
+                }
+            }
+            { std::lock_guard lock(will_initialize_mutex); will_initialize.emplace_back(function_address, context); }
+            for (const auto address : done) static_cast<void>(invoke_imp(function_address, {context, address}));
+        });
+        // _objc_map_images(count, paths, headers) and _objc_load_image(path, header): dyld's notifications. The
+        // loader registers every image it maps; an image it did not map stops here.
+        const auto known_image = [this](Address header) {
+            for (const auto& image : process.images()) if (image.header == header) return true;
+            return false;
+        };
+        function("__objc_map_images", [known_image](auto& s, auto& m) {
+            for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(s.x[0]); ++index) {
+                const auto header = m.read64(s.x[2] + index * 8ULL);
+                if (!known_image(header)) throw std::runtime_error("_objc_map_images: an image the loader did not map");
+            }
+        });
+        function("__objc_load_image", [known_image](auto& s, auto&) {
+            if (!known_image(s.x[1])) throw std::runtime_error("_objc_load_image: an image the loader did not map");
+        });
         function("_class_replaceMethod", [this](auto& s, auto& m) {
             const auto name = text(m, s.x[1]); const auto sel = selector(name);
             if (!s.x[2]) throw std::runtime_error("Objective-C method has null implementation");
