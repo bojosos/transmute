@@ -23,6 +23,8 @@ OBJC = re.compile(r"^_(objc_|_objc_|class_|object_|sel_|protocol_|method_|ivar_|
 FOUNDATION = re.compile(r"^_(OBJC_CLASS_\$_|OBJC_METACLASS_\$_|NS[A-Z])")
 # CoreMedia's C API (CMSampleBufferGetImageBuffer, ...), which the CoreMedia overlay calls.
 COREMEDIA = re.compile(r"^_CM[A-Z]")
+# Each needed symbol goes to the first group whose pattern it matches; system takes the rest.
+GROUPS = [("objc", OBJC), ("foundation", FOUNDATION), ("coremedia", COREMEDIA)]
 
 
 def symbols(nm: str, paths: list[str], flags: list[str]) -> set[str]:
@@ -56,12 +58,10 @@ def main() -> None:
     defined = symbols(nm, objects, ["-g", "--defined-only", "-j"]) | symbols(nm, runtimes, ["-g", "--defined-only", "-j"])
     # The linker defines ___dso_handle (#dsohandle) in every image.
     needed = sorted(undefined - defined - {"___dso_handle"})
-    groups = {
-        "objc": [s for s in needed if OBJC.match(s)],
-        "foundation": [s for s in needed if not OBJC.match(s) and FOUNDATION.match(s)],
-        "coremedia": [s for s in needed if not OBJC.match(s) and not FOUNDATION.match(s) and COREMEDIA.match(s)],
-        "system": [s for s in needed if not OBJC.match(s) and not FOUNDATION.match(s) and not COREMEDIA.match(s)],
-    }
+    groups: dict[str, list[str]] = {name: [] for name, _ in GROUPS}
+    groups["system"] = []
+    for symbol in needed:
+        groups[next((name for name, pattern in GROUPS if pattern.match(symbol)), "system")].append(symbol)
     for name, names in groups.items():
         with open(f"{out}/{name}.s", "w", encoding="ascii", newline="\n") as stream:
             stream.write("// Generated link-only interface; never executed.\n.text\n.p2align 2\n")

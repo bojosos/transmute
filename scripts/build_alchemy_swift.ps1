@@ -287,6 +287,18 @@ function Invoke-Tool([string]$exe, [string[]]$arguments, [string]$log) {
 function Link-Library([string]$name, [string]$installName, [string[]]$objects, [string[]]$runtimes, [string]$fileName = "lib$name.dylib") {
     $interfaces = "$stubs/$name"
     $null = New-Item -ItemType Directory -Force -Path $interfaces
+    # Swift's autolink force-load references (weak __swift_FORCE_LOAD_$_<library>, one for each module an
+    # object imports, transitively) bind to that library when this build has made it, rather than to the
+    # libSystem stub: it joins the libraries the link resolves against.
+    $forceLoaded = @()
+    for ($at = 0; $at -lt $objects.Count; $at += 64) {
+        $batch = $objects[$at..([Math]::Min($at + 63, $objects.Count - 1))]
+        $forceLoaded += @(& $nm -u -j @batch 2>$null | ForEach-Object { if ($_ -match '^__swift_FORCE_LOAD_\$_(.+)$') { $Matches[1] } })
+    }
+    foreach ($library in @($forceLoaded | Sort-Object -Unique)) {
+        $file = @("$out/lib$library.dylib", "$out/$library") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($file -and $file -ne "$out/$fileName" -and $runtimes -notcontains $file) { $runtimes += $file }
+    }
     $stubScript = "$repo/scripts/alchemy_swift_link_stubs.py"
     $stubArguments = @($nm, $interfaces) + @($runtimes + @($cxxabi, $unwind)) + @('--') + @($objects)
     if ((($stubArguments | Measure-Object -Property Length -Sum).Sum + $stubArguments.Count * 3) -lt 30000) {
