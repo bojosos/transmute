@@ -104,4 +104,43 @@ if(BUILD_TESTING AND ALCHEMY_LD64_LLD AND macos_dir AND TARGET alchemy-fx
             set_tests_properties(alchemy_swift_combine PROPERTIES TIMEOUT 120 ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1")
         endif()
     endif()
+
+    # The Metal overlay (libswiftMetal, metal-parity M8), once the runtime
+    # directory has it: its array and Range forms on Alchemy's Metal provider.
+    # Registered after the GUI fixtures (deferred like them), whose Metal
+    # link stub the fixture links against for MTLCreateSystemDefaultDevice.
+    function(alchemy_swift_metal_fixture)
+        set(overlays "${ALCHEMY_SWIFT_RUNTIME_DIR}/obj/overlays")
+        if(NOT TARGET alchemy_gui_link_stubs OR NOT EXISTS "${ALCHEMY_SWIFT_RUNTIME_DIR}/libswiftMetal.dylib"
+           OR NOT EXISTS "${overlays}/Metal.swiftmodule")
+            return()
+        endif()
+        set(libraries "${ALCHEMY_SWIFT_RUNTIME_DIR}/libswiftMetal.dylib" "${ALCHEMY_SWIFT_RUNTIME_DIR}/libswiftFoundation.dylib"
+            "${ALCHEMY_SWIFT_RUNTIME_DIR}/libswiftCore.dylib")
+        add_custom_command(OUTPUT "${macos_dir}/swift_metal.o"
+            COMMAND "${CMAKE_COMMAND}" -E env "${alchemy_swift_env}" "${alchemy_swift_bin}/swift-frontend.exe"
+                -frontend -c -target arm64-apple-macosx11.0 -module-name swift_metal -O -parse-as-library
+                -I "${ALCHEMY_SWIFT_RUNTIME_DIR}/obj/core" -I "${overlays}"
+                -I "${ALCHEMY_SWIFT_SOURCE_DIR}/swift/stdlib/public/SwiftShims/swift/shims"
+                -Xcc "-I${CMAKE_SOURCE_DIR}/runtime/swift/include" -Xcc "-I${CMAKE_SOURCE_DIR}/src/alchemy/darwin/swift/include"
+                -disable-implicit-concurrency-module-import -disable-implicit-string-processing-module-import
+                -runtime-compatibility-version none -module-cache-path "${CMAKE_CURRENT_BINARY_DIR}/swift-module-cache"
+                "${CMAKE_SOURCE_DIR}/tests/fixtures/macos/swift_metal.swift" -o "${macos_dir}/swift_metal.o"
+            DEPENDS tests/fixtures/macos/swift_metal.swift ${libraries} VERBATIM)
+        add_custom_command(OUTPUT "${macos_dir}/swift_metal"
+            COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main "${macos_dir}/swift_metal.o" ${libraries}
+                "${macos_dir}/link_metal.dylib" "${macos_dir}/link_objc.dylib" "${macos_dir}/link_system.dylib"
+                "-L${ALCHEMY_LLVM_RUNTIME_DIR}" -undefined dynamic_lookup -o "${macos_dir}/swift_metal"
+            DEPENDS "${macos_dir}/swift_metal.o" "${macos_dir}/link_system.dylib" VERBATIM)
+        add_custom_target(alchemy_swift_metal_fixture ALL DEPENDS "${macos_dir}/swift_metal")
+        add_dependencies(alchemy_swift_metal_fixture alchemy_gui_link_stubs alchemy_macos_fixtures)
+        add_test(NAME alchemy_swift_metal COMMAND "${CMAKE_COMMAND}"
+            "-DALCHEMY=$<TARGET_FILE:alchemy-fx>" "-DPROGRAM=${macos_dir}/swift_metal"
+            "-DRUNTIME_DIRS=${ALCHEMY_LLVM_RUNTIME_DIR};${ALCHEMY_SWIFT_RUNTIME_DIR}"
+            "-DEXPECTED=${CMAKE_SOURCE_DIR}/tests/fixtures/macos/swift_metal.expected"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/alchemy_swift_run.cmake")
+        set_tests_properties(alchemy_swift_metal PROPERTIES TIMEOUT 120
+            ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1")
+    endfunction()
+    cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL alchemy_swift_metal_fixture)
 endif()

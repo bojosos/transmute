@@ -527,6 +527,10 @@ $extraOverlays = @(
         Dependencies = @(); IncludeDirectory = "$qlabSwift/include" },
     [ordered]@{ Module = 'AVFoundation'; Library = 'swiftAVFoundation'; Source = "$qlabSwift/AVFoundation"
         Install = '/usr/lib/swift/libswiftAVFoundation.dylib'; File = 'libswiftAVFoundation.dylib'
+        Dependencies = @('libswiftFoundation.dylib'); IncludeDirectory = "$qlabSwift/include" },
+    # libswiftMetal (metal-parity M8): Apple's Swift extensions of the Metal protocols.
+    [ordered]@{ Module = 'Metal'; Library = 'swiftMetal'; Source = "$qlabSwift/Metal"
+        Install = '/usr/lib/swift/libswiftMetal.dylib'; File = 'libswiftMetal.dylib'
         Dependencies = @('libswiftFoundation.dylib'); IncludeDirectory = "$qlabSwift/include" }
 )
 $extraIncludeRoots = [System.Collections.Generic.List[string]]::new()

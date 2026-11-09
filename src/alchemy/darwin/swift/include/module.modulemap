@@ -30,3 +30,8 @@ module AVFoundation [system] {
   header "AlchemyAVFoundation.h"
   export *
 }
+
+module Metal [system] {
+  header "AlchemyMetal.h"
+  export *
+}

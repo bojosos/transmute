@@ -2193,6 +2193,12 @@ void install_argument_encoder() {
             throw std::runtime_error(std::string("Alchemy Metal: -[MTLArgumentEncoder ") + selector +
                                      "] (resources other than buffers in argument buffers) is not translated");
         }, false, "v@:@Q");
+    for (const auto selector : {"setRenderPipelineStates:withRange:", "setComputePipelineStates:withRange:",
+                                "setIndirectCommandBuffers:withRange:"})
+        r.method(cls, selector, [selector](CpuState&, GuestMemory&) {
+            throw std::runtime_error(std::string("Alchemy Metal: -[MTLArgumentEncoder ") + selector +
+                                     "] (resources other than buffers in argument buffers) is not translated");
+        }, false, "v@:^@{_NSRange=QQ}");
     r.method(cls, "newArgumentEncoderForBufferAtIndex:", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, false, "@@:Q");
 }
 
@@ -2704,6 +2710,24 @@ void install_device() {
         value->device = s.x[0];
         s.x[0] = r.create(classes.heap, std::move(value));
     }, false, "@@:@");
+    // Where the device samples: Vulkan's standard sample locations (the device
+    // reports standardSampleLocations), the pixel centre otherwise.
+    r.method(cls, "getDefaultSamplePositions:count:", [](CpuState& s, GuestMemory& m) {
+        static constexpr float two[] = {0.75F, 0.75F, 0.25F, 0.25F};
+        static constexpr float four[] = {0.375F, 0.125F, 0.875F, 0.375F, 0.125F, 0.625F, 0.625F, 0.875F};
+        static constexpr float eight[] = {0.5625F, 0.3125F, 0.4375F, 0.6875F, 0.8125F, 0.5625F, 0.3125F, 0.1875F,
+                                          0.1875F, 0.8125F, 0.0625F, 0.4375F, 0.6875F, 0.9375F, 0.9375F, 0.0625F};
+        const auto device = device_of_object(s.x[0]);
+        const auto count = s.x[3];
+        const float* table = nullptr;
+        if (device->properties.limits.standardSampleLocations)
+            table = count == 2 ? two : count == 4 ? four : count == 8 ? eight : nullptr;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const float x = table ? table[2 * i] : 0.5F, y = table ? table[2 * i + 1] : 0.5F;
+            m.write32(s.x[2] + 8 * i, std::bit_cast<std::uint32_t>(x));
+            m.write32(s.x[2] + 8 * i + 4, std::bit_cast<std::uint32_t>(y));
+        }
+    }, false, "v@:^{MTLSamplePosition=ff}Q");
     r.method(cls, "newFence", [&r](CpuState& s, GuestMemory&) {
         auto value = std::make_shared<FenceState>();
         value->device = s.x[0];
