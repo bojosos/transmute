@@ -215,7 +215,52 @@ void print_core(Fixture& f) {
 
 } // namespace
 
+// The apps wave's names (GTK's print backend, darktable, Inkscape).
+void apps(Fixture& f) {
+    // cupsAddOption appends, then replaces; cupsParseOptions reads quoted and bare values.
+    const auto slot = f.block(8);
+    auto count = f.call(cups, "_cupsAddOption", {f.text("media"), f.text("A4"), 0, slot});
+    count = f.call(cups, "_cupsAddOption", {f.text("copies"), f.text("2"), count, slot});
+    count = f.call(cups, "_cupsAddOption", {f.text("media"), f.text("Letter"), count, slot});
+    require(count == 2 && f.read_text(f.call(cups, "_cupsGetOption", {f.text("media"), count, f.engine.read64(slot)})) == "Letter",
+            "cupsAddOption replaces a same-named option");
+    count = f.call(cups, "_cupsParseOptions", {f.text("job-name='My Job' landscape sides=two-sided-long-edge"), count, slot});
+    const auto options = f.engine.read64(slot);
+    require(count == 5 && f.read_text(f.call(cups, "_cupsGetOption", {f.text("job-name"), count, options})) == "My Job" &&
+                f.read_text(f.call(cups, "_cupsGetOption", {f.text("landscape"), count, options})) == "true",
+            "cupsParseOptions");
+    static_cast<void>(f.call(cups, "_cupsFreeOptions", {count, options}));
+    // No destinations, no printing; settings kept.
+    const auto dests = f.block(8, 0xff);
+    require(f.call(cups, "_cupsGetDests", {dests}) == 0 && f.engine.read64(dests) == 0 && f.call(cups, "_cupsLastError") == 0x0503, "cupsGetDests");
+    require(f.call(cups, "_cupsPrintFile", {f.text("p"), f.text("/tmp/x"), f.text("t"), 0, 0}) == 0, "cupsPrintFile");
+    static_cast<void>(f.call(cups, "_cupsSetEncryption", {2}));
+    require(f.call(cups, "_cupsEncryption") == 2, "cupsEncryption");
+    // IPP: operation, request id, booleans, resolutions, status strings.
+    const auto request = f.call(cups, "_ippNew");
+    require(f.call(cups, "_ippSetOperation", {request, 0x000b}) == 1 && f.call(cups, "_ippGetOperation", {request}) == 0x000b, "ippSet/GetOperation");
+    const auto resolution = f.call(cups, "_ippAddResolution", {request, 0x02, f.text("printer-resolution"), 3, 600, 300});
+    const auto yres = f.block(4), units = f.block(4);
+    require(f.call(cups, "_ippGetResolution", {resolution, 0, yres, units}) == 600 && f.engine.read32(yres) == 300 && f.engine.read32(units) == 3,
+            "ippAddResolution");
+    static_cast<void>(f.call(cups, "_ippDelete", {request}));
+    require(f.read_text(f.call(cups, "_ippErrorString", {0x0406})) == "client-error-not-found", "ippErrorString");
+    const auto media = f.call(cups, "_pwgMediaForPWG", {f.text("iso_a4_210x297mm")});
+    require(media && f.engine.read32(media + 24) == 21000 && f.call(cups, "_pwgMediaForPWG", {f.text("nonesuch")}) == 0, "pwgMediaForPWG");
+    // No http_t and no PPD exist: NULL handles answer their failure.
+    require(static_cast<std::int32_t>(f.call(cups, "_httpGetFd", {0})) == -1 && f.call(cups, "_ppdPageSize", {0, f.text("A4")}) == 0,
+            "NULL http_t / ppd_file_t");
+    const auto host = f.block(256);
+    require(f.call(cups, "_httpGetHostname", {0, host, 256}) == host && !f.read_text(host).empty(), "httpGetHostname without a connection");
+    const auto address = f.block(16);
+    f.engine.write32(address, 0x0210);   // sa_len 16, sa_family AF_INET
+    require(f.call(cups, "_httpAddrLength", {address}) == 16, "httpAddrLength");
+    bool stopped = false;
+    try { static_cast<void>(f.call(cups, "_cupsLangDefault")); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "cupsLangDefault stops explicitly");
+}
+
 int main() {
     return run("printing", {{"imports", imports}, {"scheduler", scheduler}, {"options and destinations", options_and_destinations},
-                            {"ipp", ipp}, {"print core", print_core}});
+                            {"ipp", ipp}, {"print core", print_core}, {"apps", apps}});
 }

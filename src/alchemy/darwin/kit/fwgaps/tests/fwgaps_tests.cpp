@@ -202,6 +202,10 @@ void media(Fixture& f) {
     for (std::uint64_t i = 0; i < f.call(cf, "_CFArrayGetCount", {tags}); ++i) cmap = cmap || f.call(cf, "_CFArrayGetValueAtIndex", {tags, i}) == 0x636d6170;
     require(cmap, "CGFontCopyTableTags lists cmap");
     require(f.call(cg, "_CGFontCopyVariationAxes", {font}) == 0, "font variations are not modelled");
+    // Inkscape and LibreOffice: no ATS platform font maps to a CGFont; LibreOffice's dispatcher target.
+    require(f.call(cg, "_CGFontCreateWithPlatformFont", {f.block(8)}) == 0, "CGFontCreateWithPlatformFont");
+    const auto dispatcher = f.call(carbon, "_GetEventDispatcherTarget");
+    require(dispatcher && dispatcher != f.call(carbon, "_GetApplicationEventTarget"), "GetEventDispatcherTarget");
 }
 
 int main() {

@@ -20,6 +20,10 @@ public:
         const auto target = context.allocate_guest(16);
         memory().fill_bytes(target, 0, 16);
         function(carbon, "_GetApplicationEventTarget", [target](CpuState& s, GuestMemory&) { s.x[0] = target; });
+        // The event dispatcher's target: handlers installed on it are kept, like the application's, and never called.
+        const auto dispatcher = context.allocate_guest(16);
+        memory().fill_bytes(dispatcher, 0, 16);
+        function(carbon, "_GetEventDispatcherTarget", [dispatcher](CpuState& s, GuestMemory&) { s.x[0] = dispatcher; });
         // Handlers are accepted; Alchemy never delivers Carbon events to them.
         function(carbon, "_InstallEventHandler", [this](CpuState& s, GuestMemory& m) {
             if (s.x[5]) { const auto reference = context.allocate_guest(16); m.fill_bytes(reference, 0, 16); m.write64(s.x[5], reference); }

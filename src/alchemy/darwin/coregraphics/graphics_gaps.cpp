@@ -467,6 +467,10 @@ void GraphicsGaps::install_core_graphics() {
     raw(core_graphics, "_CGSetDisplayTransferByTable", [](CpuState& s, GuestMemory&) { s.x[0] = status(cg_cannot_complete); });
     // The shielding window's level: the maximum window level (unverified).
     constant(core_graphics, "_CGShieldingWindowLevel", static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max() - 16));
+    // CGFontCreateWithPlatformFont(platformFontReference): an ATS font
+    // reference; there are no ATS fonts, so none maps to a CGFont (NULL, as
+    // for a reference that cannot be used).
+    constant(core_graphics, "_CGFontCreateWithPlatformFont", 0);
     // Font variations are not modelled (CTFontCopyVariationAxes answers NULL too): no axes, no variations, no variant copies.
     for (const auto* name : {"_CGFontCopyVariationAxes", "_CGFontCopyVariations", "_CGFontCreateCopyWithVariations"})
         constant(core_graphics, name, 0);

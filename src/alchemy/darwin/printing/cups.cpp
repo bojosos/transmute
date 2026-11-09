@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -23,8 +24,29 @@
 // names), ippCopyAttribute / ippDeleteAttribute, cupsUser / cupsUserAgent,
 // pwgMediaForSize (the standard sizes, else a custom size name);
 // cupsSendRequest / cupsGetResponse need the scheduler and fail.
+// For GTK's print backend, darktable and Inkscape (the apps wave) also:
+// cupsAddOption / cupsParseOptions, the client settings (encryption, password
+// callback), ippGet/SetOperation, ippSetRequestId / State, ippGetBoolean,
+// ippAddResolution, ippErrorString, pwgMediaForPWG (the standard sizes),
+// httpAddrLength and httpGetHostname without a connection; the destination and
+// job calls fail like the others; calls on an http_t, ppd_file_t or
+// cups_array_t (none can exist) answer their failure for NULL and stop for
+// anything else. Not provided (explicit stops): IPP wire encoding (ippLength /
+// ippRead / ippWrite), the URI helpers (httpSeparateURI / httpAssembleURIf),
+// localization (cupsLangDefault) and libcupsimage's raster streams.
 namespace alchemy::gui::fill {
 namespace {
+
+constexpr std::string_view libcupsimage = "/usr/lib/libcupsimage.2.dylib";
+
+// IPP status names (cupsLastErrorString, ippErrorString).
+std::string_view ipp_status_text(std::int32_t code) {
+    static const std::map<std::int32_t, std::string_view> texts{
+        {0, "successful-ok"}, {0x0400, "client-error-bad-request"}, {0x0406, "client-error-not-found"},
+        {0x0500, "server-error-internal-error"}, {0x0503, "server-error-service-unavailable"}};
+    const auto found = texts.find(code);
+    return found == texts.end() ? "unknown" : found->second;
+}
 
 constexpr std::int32_t ipp_service_unavailable = 0x0503, http_status_error = -1;
 constexpr std::int32_t ppd_internal_error = 6;
@@ -45,7 +67,7 @@ struct IppAttribute {
     Address language{};
 };
 struct Ipp {
-    std::int32_t major{2}, minor{0}, operation{}, request_id{}, status{};
+    std::int32_t major{2}, minor{0}, operation{}, request_id{}, status{}, state{};
     std::vector<IppAttribute> attributes;
     std::size_t cursor{};
 };
@@ -60,6 +82,8 @@ public:
     std::map<Address, std::pair<Address, std::size_t>> attribute_owner;   // attribute handle -> (ipp, index)
     std::int32_t next_request{1};
     std::int32_t ppd_error{};
+    std::int32_t encryption{};      // HTTP_ENCRYPTION_IF_REQUESTED
+    Address password_callback{};    // kept; no request ever asks for a password
 
     void unavailable() { std::lock_guard lock(mutex); last_error = ipp_service_unavailable; }
     std::string text(GuestMemory& m, Address address) { return read_cstring(m, address, 4096); }
@@ -95,6 +119,28 @@ public:
     void install();
     void install_ipp();
     void install_ipp_extras();
+    void install_more();
+    // cupsAddOption's rule: a same-named option takes the value, else one is appended; the new count.
+    std::uint32_t add_option(GuestMemory& m, const std::string& name, const std::string& value, std::uint32_t count, Address slot) {
+        const auto options = m.read64(slot);
+        for (std::uint32_t i = 0; i < count && options; ++i)
+            if (text(m, m.read64(options + i * 16ULL)) == name) {
+                free(m.read64(options + i * 16ULL + 8));
+                m.write64(options + i * 16ULL + 8, strdup(value));
+                return count;
+            }
+        const auto grown = malloc((count + 1) * 16ULL);
+        if (count && options) {
+            std::vector<std::uint8_t> bytes(count * 16ULL);
+            m.read_bytes(options, bytes);
+            m.write_bytes(grown, bytes);
+        }
+        if (options) free(options);
+        m.write64(grown + count * 16ULL, strdup(name));
+        m.write64(grown + count * 16ULL + 8, strdup(value));
+        m.write64(slot, grown);
+        return count + 1;
+    }
     // A copy of `source` with fresh string and collection copies (lock held).
     IppAttribute copy_attribute(const IppAttribute& source);
     Address copy_message(Address ipp);   // lock held
@@ -136,11 +182,7 @@ void Cups::install() {
     raw(libcups, "_cupsLastErrorString", [this](CpuState& s, GuestMemory&) {
         std::int32_t code{};
         { std::lock_guard lock(mutex); code = last_error; }
-        static const std::map<std::int32_t, std::string_view> texts{
-            {0, "successful-ok"}, {0x0400, "client-error-bad-request"}, {0x0406, "client-error-not-found"},
-            {0x0500, "server-error-internal-error"}, {0x0503, "server-error-service-unavailable"}};
-        const auto found = texts.find(code);
-        const std::string_view value = found == texts.end() ? "unknown" : found->second;
+        const auto value = ipp_status_text(code);
         std::lock_guard lock(mutex);
         static std::map<std::string_view, Address> cache;
         auto& slot = cache[value];
@@ -400,8 +442,13 @@ void Cups::install_ipp() {
         const auto value = with_attribute(s.x[0], [element](IppAttribute& a) {
             return element < a.integers.size() ? a.integers[element] : std::int64_t{0};
         });
-        if (s.x[2]) m.write32(s.x[2], static_cast<std::uint32_t>(value));
-        if (s.x[3]) m.write32(s.x[3], 3);   // IPP_RES_PER_INCH
+        // The y resolution and units ippAddResolution stored (else x, IPP_RES_PER_INCH).
+        const auto [y, units] = with_attribute(s.x[0], [element, value](IppAttribute& a) {
+            return std::pair<std::int64_t, std::int64_t>{element < a.uppers.size() ? a.uppers[element] : value,
+                                                         element < a.units.size() ? a.units[element] : 3};
+        });
+        if (s.x[2]) m.write32(s.x[2], static_cast<std::uint32_t>(y));
+        if (s.x[3]) m.write32(s.x[3], static_cast<std::uint32_t>(units));
         s.x[0] = static_cast<std::uint32_t>(value);
     });
     raw(libcups, "_ippGetString", [with_attribute](CpuState& s, GuestMemory& m) {
@@ -427,6 +474,7 @@ void Cups::install_ipp() {
         s.x[0] = valid;
     });
     install_ipp_extras();
+    install_more();
 }
 
 IppAttribute Cups::copy_attribute(const IppAttribute& source) {
@@ -623,6 +671,193 @@ void Cups::install_ipp_extras() {
         }
         s.x[0] = slot;
     });
+}
+
+void Cups::install_more() {
+    // ---- destinations and jobs: no scheduler ----
+    raw(libcups, "_cupsGetDests", [this](CpuState& s, GuestMemory& m) { if (s.x[0]) m.write64(s.x[0], 0); unavailable(); s.x[0] = 0; });
+    // cupsConnectDest(dest, flags, msec, cancel, resource, resourcesize, cb, user_data)
+    raw(libcups, "_cupsConnectDest", [this](CpuState& s, GuestMemory& m) {
+        if (s.x[4] && s.x[5]) m.write8(s.x[4], 0);
+        unavailable();
+        s.x[0] = 0;
+    });
+    constant(libcups, "_cupsGetDestMediaCount", 0);
+    constant(libcups, "_cupsGetDestMediaByIndex", 0);
+    raw(libcups, "_cupsPrintFile", [this](CpuState& s, GuestMemory&) { unavailable(); s.x[0] = 0; });
+    raw(libcups, "_cupsDoAuthentication", [this](CpuState& s, GuestMemory&) { unavailable(); s.x[0] = static_cast<std::uint32_t>(-1); });
+    // ---- client settings ----
+    raw(libcups, "_cupsSetPasswordCB", [this](CpuState& s, GuestMemory&) { std::lock_guard lock(mutex); password_callback = s.x[0]; });
+    raw(libcups, "_cupsSetEncryption", [this](CpuState& s, GuestMemory&) { std::lock_guard lock(mutex); encryption = static_cast<std::int32_t>(s.x[0]); });
+    raw(libcups, "_cupsEncryption", [this](CpuState& s, GuestMemory&) { std::lock_guard lock(mutex); s.x[0] = static_cast<std::uint32_t>(encryption); });
+    // ---- options (real) ----
+    // int cupsAddOption(name, value, num_options, cups_option_t **options)
+    raw(libcups, "_cupsAddOption", [this](CpuState& s, GuestMemory& m) {
+        const auto count = static_cast<std::uint32_t>(s.x[2]);
+        if (!s.x[0] || !s.x[1] || !s.x[3]) { s.x[0] = count; return; }
+        s.x[0] = add_option(m, text(m, s.x[0]), text(m, s.x[1]), count, s.x[3]);
+    });
+    // int cupsParseOptions(arg, num_options, options): space-separated
+    // name=value pairs. A value may be quoted ('...' or "...") or a braced
+    // collection ({...}, kept with its braces); a backslash escapes the next
+    // character; a name without a value gets "true".
+    raw(libcups, "_cupsParseOptions", [this](CpuState& s, GuestMemory& m) {
+        auto count = static_cast<std::uint32_t>(s.x[1]);
+        if (!s.x[0] || !s.x[2]) { s.x[0] = count; return; }
+        const auto arg = text(m, s.x[0]);
+        std::size_t i = 0;
+        const auto spaces = [&] { while (i < arg.size() && std::isspace(static_cast<unsigned char>(arg[i]))) ++i; };
+        for (spaces(); i < arg.size(); spaces()) {
+            std::string name, value;
+            while (i < arg.size() && arg[i] != '=' && !std::isspace(static_cast<unsigned char>(arg[i]))) name += arg[i++];
+            if (i < arg.size() && arg[i] == '=') {
+                ++i;
+                int depth = 0;
+                char quote = 0;
+                while (i < arg.size()) {
+                    const char c = arg[i];
+                    if (c == '\\' && i + 1 < arg.size()) { value += arg[i + 1]; i += 2; continue; }
+                    if (quote) { if (c == quote) quote = 0; else value += c; ++i; continue; }
+                    if (c == '\'' || c == '"') { quote = c; ++i; continue; }
+                    if (c == '{') ++depth;
+                    if (c == '}') --depth;
+                    if (depth <= 0 && std::isspace(static_cast<unsigned char>(c))) break;
+                    value += c;
+                    ++i;
+                }
+            } else value = "true";
+            if (!name.empty()) count = add_option(m, name, value, count, s.x[2]);
+        }
+        s.x[0] = count;
+    });
+    // ---- IPP messages ----
+    const auto with_message = [this](Address ipp, auto f) {
+        std::lock_guard lock(mutex);
+        const auto found = messages.find(ipp);
+        return found == messages.end() ? decltype(f(std::declval<Ipp&>())){} : f(found->second);
+    };
+    raw(libcups, "_ippGetOperation", [with_message](CpuState& s, GuestMemory&) {
+        s.x[0] = static_cast<std::uint32_t>(with_message(s.x[0], [](Ipp& ipp) { return ipp.operation; }));
+    });
+    for (const auto& [name, field] : std::initializer_list<std::pair<const char*, std::int32_t Ipp::*>>{
+             {"_ippSetOperation", &Ipp::operation}, {"_ippSetRequestId", &Ipp::request_id}, {"_ippSetState", &Ipp::state}})
+        raw(libcups, name, [with_message, field](CpuState& s, GuestMemory&) {
+            const auto value = static_cast<std::int32_t>(s.x[1]);
+            s.x[0] = with_message(s.x[0], [field, value](Ipp& ipp) { ipp.*field = value; return 1; });
+        });
+    raw(libcups, "_ippGetBoolean", [this](CpuState& s, GuestMemory&) {
+        std::lock_guard lock(mutex);
+        const auto* value = attribute(s.x[0]);
+        const auto element = s.x[1];
+        s.x[0] = value && value->value_tag == tag_boolean && element < value->integers.size() && value->integers[element] ? 1 : 0;
+    });
+    // ippAddResolution(ipp, group, name, units, xres, yres)
+    raw(libcups, "_ippAddResolution", [this](CpuState& s, GuestMemory& m) {
+        IppAttribute value;
+        value.group = static_cast<std::int32_t>(s.x[1]); value.value_tag = 0x32;   // IPP_TAG_RESOLUTION
+        value.name = text(m, s.x[2]);
+        value.name_copy = strdup(value.name);
+        value.units.push_back(static_cast<std::int32_t>(s.x[3]));
+        value.integers.push_back(static_cast<std::int32_t>(s.x[4]));
+        value.uppers.push_back(static_cast<std::int32_t>(s.x[5]));
+        std::lock_guard lock(mutex);
+        s.x[0] = add_attribute(s.x[0], std::move(value));
+    });
+    raw(libcups, "_ippErrorString", [this](CpuState& s, GuestMemory&) {
+        const auto value = ipp_status_text(static_cast<std::int32_t>(s.x[0]));
+        std::lock_guard lock(mutex);
+        static std::map<std::string_view, Address> cache;
+        auto& slot = cache[value];
+        if (!slot) slot = cstring(value);
+        s.x[0] = slot;
+    });
+    for (const auto* name : {"_ippLength", "_ippRead", "_ippWrite"}) {
+        const std::string what(name + 1);
+        raw(libcups, name, [what](CpuState&, GuestMemory&) {
+            throw std::runtime_error("unsupported: Alchemy: " + what + " (IPP wire encoding is not provided: there is no scheduler to talk to)");
+        });
+    }
+    // pwgMediaForPWG(pwg): the standard size of that PWG name (pwgMediaForSize's table), else NULL.
+    raw(libcups, "_pwgMediaForPWG", [this](CpuState& s, GuestMemory& m) {
+        static constexpr std::array<std::pair<std::string_view, std::pair<int, int>>, 12> names{{
+            {"iso_a3_297x420mm", {29700, 42000}}, {"iso_a4_210x297mm", {21000, 29700}}, {"iso_a5_148x210mm", {14800, 21000}},
+            {"iso_a6_105x148mm", {10500, 14800}}, {"iso_b4_250x353mm", {25000, 35300}}, {"iso_b5_176x250mm", {17600, 25000}},
+            {"jis_b4_257x364mm", {25700, 36400}}, {"jis_b5_182x257mm", {18200, 25700}}, {"na_letter_8.5x11in", {21590, 27940}},
+            {"na_legal_8.5x14in", {21590, 35560}}, {"na_ledger_11x17in", {27940, 43180}}, {"na_executive_7.25x10.5in", {18415, 26670}}}};
+        const auto name = s.x[0] ? text(m, s.x[0]) : std::string();
+        for (const auto& [pwg, size] : names)
+            if (name == pwg) {
+                s.x[0] = call(libcups, "_pwgMediaForSize", {static_cast<Address>(size.first), static_cast<Address>(size.second)});
+                return;
+            }
+        s.x[0] = 0;
+    });
+    // ---- HTTP: no http_t exists (httpConnect2 makes none) ----
+    const auto no_http = [this](const char* name, std::uint64_t failure) {
+        const std::string what(name + 1);
+        raw(libcups, name, [what, failure](CpuState& s, GuestMemory&) {
+            if (s.x[0]) throw std::runtime_error("Alchemy: " + what + " of an http_t that cannot exist");
+            s.x[0] = failure;
+        });
+    };
+    constexpr std::uint64_t minus_one = 0xffffffffU, minus_one_long = UINT64_MAX;
+    for (const auto* name : {"_httpWrite2", "_httpRead2", "_httpGetLength2"}) no_http(name, minus_one_long);
+    for (const auto* name : {"_httpUpdate", "_httpReconnect2", "_httpGet", "_httpPost", "_httpGetFd", "_httpEncryption"}) no_http(name, minus_one);
+    for (const auto* name : {"_httpWait", "_httpSetField", "_httpClearFields", "_httpFlush", "_httpGetField", "_httpGetAuthString"}) no_http(name, 0);
+    // httpGetHostname(http, s, slen): without a connection, this host's name.
+    raw(libcups, "_httpGetHostname", [this](CpuState& s, GuestMemory& m) {
+        if (s.x[0]) throw std::runtime_error("Alchemy: httpGetHostname of an http_t that cannot exist");
+        const auto buffer = s.x[1];
+        const auto size = static_cast<std::uint32_t>(s.x[2]);
+        if (!buffer || size < 2) { s.x[0] = 0; return; }
+        if (static_cast<std::int32_t>(call(libsystem, "_gethostname", {buffer, size})) != 0) { s.x[0] = 0; return; }
+        m.write8(buffer + size - 1, 0);
+        s.x[0] = buffer;
+    });
+    // httpAddrLength(addr): the sockaddr length of an http_addr_t (Darwin: sa_len, sa_family).
+    raw(libcups, "_httpAddrLength", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[0]) { s.x[0] = 0; return; }
+        const auto family = m.read8(s.x[0] + 1);
+        if (family == 2) s.x[0] = 16;                      // AF_INET
+        else if (family == 30) s.x[0] = 28;                // AF_INET6
+        else if (family == 1) s.x[0] = 2 + read_cstring(m, s.x[0] + 2, 104).size() + 1;   // AF_LOCAL
+        else s.x[0] = 0;
+    });
+    raw(libcups, "_httpAddrFreeList", [](CpuState& s, GuestMemory&) {
+        if (s.x[0]) throw std::runtime_error("Alchemy: httpAddrFreeList of a list that cannot exist (httpAddrGetList makes none)");
+    });
+    for (const auto* name : {"_httpSeparateURI", "_httpAssembleURIf"}) {
+        const std::string what(name + 1);
+        raw(libcups, name, [what](CpuState&, GuestMemory&) { throw std::runtime_error("unsupported: Alchemy: " + what + " (the CUPS URI helpers are not provided)"); });
+    }
+    // ---- PPD: no ppd_file_t exists (ppdOpen* make none) ----
+    const auto no_ppd = [this](const char* name, std::uint64_t failure) {
+        const std::string what(name + 1);
+        raw(libcups, name, [what, failure](CpuState& s, GuestMemory&) {
+            if (s.x[0]) throw std::runtime_error("Alchemy: " + what + " of a PPD object that cannot exist");
+            s.x[0] = failure;
+        });
+    };
+    for (const auto* name : {"_ppdFindCustomOption", "_ppdFirstCustomParam", "_ppdNextCustomParam", "_ppdPageSize", "_ppdConflicts", "_ppdMarkOption"})
+        no_ppd(name, 0);
+    no_ppd("_ppdLocalize", minus_one);
+    // ---- arrays and languages ----
+    raw(libcups, "_cupsArrayFirst", [](CpuState& s, GuestMemory&) {
+        if (s.x[0]) throw std::runtime_error("Alchemy: cupsArrayFirst of a cups_array_t that cannot exist");
+        s.x[0] = 0;
+    });
+    raw(libcups, "_cupsLangDefault", [](CpuState&, GuestMemory&) {
+        throw std::runtime_error("unsupported: Alchemy: cupsLangDefault (CUPS localization, cups_lang_t, is not provided)");
+    });
+    raw(libcups, "_cupsLangFree", [](CpuState& s, GuestMemory&) {
+        if (s.x[0]) throw std::runtime_error("Alchemy: cupsLangFree of a cups_lang_t that cannot exist");
+    });
+    // ---- libcupsimage: raster streams are not provided ----
+    ProcessContext::add_provider_library(std::string(libcupsimage));
+    for (const auto* name : {"_cupsRasterOpen", "_cupsRasterClose", "_cupsRasterWriteHeader2", "_cupsRasterWritePixels"}) {
+        const std::string what(name + 1);
+        raw(libcupsimage, name, [what](CpuState&, GuestMemory&) { throw std::runtime_error("unsupported: Alchemy: " + what + " (CUPS raster streams are not provided)"); });
+    }
 }
 
 } // namespace
