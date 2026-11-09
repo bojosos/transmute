@@ -78,6 +78,43 @@ void editing(Fixture& f) {
     require(refused, "appending to an immutable string stops");
 }
 
+// CFStringCreateMutableWithExternalCharactersNoCopy: the string edits the caller's buffer; the caller's own
+// changes are seen after CFStringSetExternalCharactersNoCopy; a default-allocator buffer grows (realloc).
+void external_characters(Fixture& f) {
+    const auto read_units = [&](Address at, std::size_t count) {
+        std::vector<std::uint8_t> raw(count * 2);
+        f.engine.read_bytes(at, raw);
+        std::string text;
+        for (std::size_t i = 0; i < count; ++i) text.push_back(static_cast<char>(raw[i * 2]));
+        return text;
+    };
+    const auto put_units = [&](Address at, std::string_view text) {
+        std::vector<std::uint8_t> raw;
+        for (const auto c : text) { raw.push_back(static_cast<std::uint8_t>(c)); raw.push_back(0); }
+        f.engine.write_bytes(at, raw);
+    };
+    const auto null_allocator = f.engine.read64(f.symbol(cf, "_kCFAllocatorNull"));
+    const auto buffer = f.block(16);
+    put_units(buffer, "abc");
+    const auto text = f.call(cf, "_CFStringCreateMutableWithExternalCharactersNoCopy", {0, buffer, 3, 8, null_allocator});
+    require(f.cf.utf8(text) == "abc" && f.call(cf, "_CFStringGetCharactersPtr", {text}) == buffer, "the string reads the caller's buffer");
+    static_cast<void>(f.call(cf, "_CFStringAppend", {text, string(f, "de")}));
+    require(f.cf.utf8(text) == "abcde" && read_units(buffer, 5) == "abcde", "a change is written to the buffer");
+    put_units(buffer, "xyz");
+    require(f.cf.utf8(text) == "abcde", "the caller's change is not seen yet");
+    static_cast<void>(f.call(cf, "_CFStringSetExternalCharactersNoCopy", {text, buffer, 3, 8}));
+    require(f.cf.utf8(text) == "xyz", "CFStringSetExternalCharactersNoCopy");
+    static_cast<void>(f.call(cf, "_CFRelease", {text}));
+    // The default contents allocator: a malloc buffer, grown by the string.
+    const auto heap = f.call("/usr/lib/libSystem.B.dylib", "_malloc", {4});
+    put_units(heap, "hi");
+    const auto grown = f.call(cf, "_CFStringCreateMutableWithExternalCharactersNoCopy", {0, heap, 2, 2, 0});
+    static_cast<void>(f.call(cf, "_CFStringAppend", {grown, string(f, " there")}));
+    const auto now = f.call(cf, "_CFStringGetCharactersPtr", {grown});
+    require(f.cf.utf8(grown) == "hi there" && now && read_units(now, 8) == "hi there", "the buffer grows past its capacity");
+    static_cast<void>(f.call(cf, "_CFRelease", {grown}));   // the string frees the buffer
+}
+
 void padding_and_trimming(Fixture& f) {
     const auto text = mutable_string(f, "abc");
     static_cast<void>(f.call(cf, "_CFStringPad", {text, string(f, "xy"), 7, 1}));
@@ -276,7 +313,8 @@ void diagnostics(Fixture& f) {
 } // namespace
 
 int main() {
-    return run("corefoundation strings", {{"editing", editing}, {"padding and trimming", padding_and_trimming},
+    return run("corefoundation strings", {{"editing", editing}, {"external characters", external_characters},
+        {"padding and trimming", padding_and_trimming},
         {"case and folding", case_and_folding}, {"transforms", transforms}, {"search", search}, {"lines", lines},
         {"splitting and scanning", splitting_and_scanning}, {"encodings", encodings}, {"diagnostics", diagnostics}});
 }

@@ -455,6 +455,44 @@ void Strings::install_editing() {
         s.x[0] = cf.mutable_copy(empty);
         context.objects().release(empty);
     });
+    // CFMutableStringRef CFStringCreateMutableWithExternalCharactersNoCopy(alloc, UniChar* chars, CFIndex numChars,
+    //     CFIndex capacity, CFAllocatorRef externalCharactersAllocator): the string's characters live in `chars`
+    // (bind_external_units). Past `capacity` the buffer grows through the contents allocator (realloc for the
+    // default one, CFAllocatorReallocate for a CFAllocatorCreate one); with kCFAllocatorNull it cannot, and
+    // that mutation stops. The string hands the buffer back to that allocator when it goes, except with
+    // kCFAllocatorNull. Changes the caller makes to `chars` are seen after CFStringSetExternalCharactersNoCopy.
+    function(core_foundation_library, "_CFStringCreateMutableWithExternalCharactersNoCopy", [this](CpuState& s, GuestMemory&) {
+        if (!cf_allocators::accepted(context.objects(), s.x[0])) fail("allocators other than the default and CFAllocatorCreate's are unsupported");
+        const auto contents = s.x[4];
+        const auto null_symbol = context.resolve(core_foundation_library, "_kCFAllocatorNull");
+        const bool fixed = contents && null_symbol && contents == context.main_engine().read64(null_symbol->address);
+        if (contents && !fixed && !cf_allocators::find(context.objects(), contents))
+            fail("external characters allocators other than the default, kCFAllocatorNull and CFAllocatorCreate's are unsupported");
+        const auto empty = cf.string("");
+        const auto object = cf.mutable_copy(empty);
+        context.objects().release(empty);
+        try {
+            cf.bind_external_units(object, s.x[1], s.x[2], s.x[3],
+                [this, contents, fixed](Address buffer, std::uint64_t length) -> Address {
+                    if (fixed) fail("CFMutableString: its external buffer (kCFAllocatorNull) cannot grow to " + std::to_string(length) + " characters");
+                    const auto grown = contents ? guest_call(core_foundation_library, "_CFAllocatorReallocate", {contents, buffer, length * 2, 0})
+                                                : guest_call(libsystem, "_realloc", {buffer, length * 2});
+                    if (!grown) fail("CFMutableString: its external buffer could not grow");
+                    return grown;
+                },
+                [this, contents, fixed](Address buffer) {
+                    if (fixed || !buffer) return;
+                    if (contents) static_cast<void>(guest_call(core_foundation_library, "_CFAllocatorDeallocate", {contents, buffer}));
+                    else static_cast<void>(guest_call(libsystem, "_free", {buffer}));
+                });
+        } catch (...) { context.objects().release(object); throw; }
+        s.x[0] = object;
+    });
+    // void CFStringSetExternalCharactersNoCopy(CFMutableStringRef, UniChar* chars, CFIndex length, CFIndex capacity)
+    function(core_foundation_library, "_CFStringSetExternalCharactersNoCopy", [this](CpuState& s, GuestMemory&) {
+        require(s.x[0], "CFStringSetExternalCharactersNoCopy");
+        cf.bind_external_units(s.x[0], s.x[1], s.x[2], s.x[3], {}, {});
+    });
     // void CFStringAppendCharacters(CFMutableStringRef, const UniChar*, CFIndex)
     function(core_foundation_library, "_CFStringAppendCharacters", [this](CpuState& s, GuestMemory& m) {
         require(s.x[0], "CFStringAppendCharacters");

@@ -231,7 +231,11 @@ Encoded encode(std::span<const std::uint16_t> input, std::uint32_t encoding, std
 struct StringPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint16_t> units; std::uint64_t storage{}, utf8_storage{}; std::map<std::uint32_t, std::uint64_t> encoded;
     // CFMutableString: replace_string_units retires (never frees early) inner
     // pointers handed out before a mutation; they are freed with the string.
-    bool mutable_string{}; std::vector<std::uint64_t> retired; };
+    bool mutable_string{}; std::vector<std::uint64_t> retired;
+    // An external buffer (bind_external_units): `storage` is the caller's, never ours to free.
+    bool external{}; std::uint64_t capacity{};
+    std::function<std::uint64_t(std::uint64_t, std::uint64_t)> grow;
+    std::function<void(std::uint64_t)> release_external; };
 struct DataPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint8_t> data; std::uint64_t storage{}, capacity{}; bool mutable_data{}; };
 struct NumberPayload : ObjectPayload { std::int64_t integer{}; double floating{}; unsigned type{}; bool is_float{}; };
 int compare_number(const NumberPayload& left, const NumberPayload& right) {
@@ -509,7 +513,9 @@ struct CoreFoundation::Impl {
         for (std::size_t at = 0; at < p->units.size(); ++at) { data[at * 2] = static_cast<std::uint8_t>(p->units[at]); data[at * 2 + 1] = static_cast<std::uint8_t>(p->units[at] >> 8); }
         memory().write_bytes(p->storage, data);
         return create(ObjectKind::string, p, [this, p](auto) {
-            context.release_guest(p->storage); if (p->utf8_storage) context.release_guest(p->utf8_storage);
+            if (!p->external) context.release_guest(p->storage);
+            else if (p->release_external) p->release_external(p->storage);
+            if (p->utf8_storage) context.release_guest(p->utf8_storage);
             for (const auto [encoding, storage] : p->encoded) { static_cast<void>(encoding); context.release_guest(storage); }
             for (const auto storage : p->retired) context.release_guest(storage);
         }, immortal);
@@ -1224,6 +1230,20 @@ void CoreFoundation::replace_string_units(std::uint64_t object, std::vector<std:
     const auto p = impl_->payload<StringPayload>(object, ObjectKind::string);
     std::lock_guard lock(p->mutex);
     if (!p->mutable_string) invalid("mutation of an immutable string");
+    if (p->external) {
+        if (units.size() > p->capacity) {
+            p->storage = p->grow(p->storage, units.size());
+            p->capacity = units.size();
+        }
+        std::vector<std::uint8_t> data(units.size() * 2);
+        for (std::size_t at = 0; at < units.size(); ++at) { data[at * 2] = static_cast<std::uint8_t>(units[at]); data[at * 2 + 1] = static_cast<std::uint8_t>(units[at] >> 8); }
+        if (!data.empty()) impl_->memory().write_bytes(p->storage, data);
+        if (p->utf8_storage) p->retired.push_back(p->utf8_storage);
+        for (const auto [encoding, old] : p->encoded) { static_cast<void>(encoding); p->retired.push_back(old); }
+        p->utf8_storage = 0; p->encoded.clear();
+        p->units = std::move(units);
+        return;
+    }
     const auto storage = impl_->context.allocate_guest((units.size() + 1) * 2);
     std::vector<std::uint8_t> data((units.size() + 1) * 2);
     for (std::size_t at = 0; at < units.size(); ++at) { data[at * 2] = static_cast<std::uint8_t>(units[at]); data[at * 2 + 1] = static_cast<std::uint8_t>(units[at] >> 8); }
@@ -1233,6 +1253,33 @@ void CoreFoundation::replace_string_units(std::uint64_t object, std::vector<std:
     for (const auto [encoding, old] : p->encoded) { static_cast<void>(encoding); p->retired.push_back(old); }
     p->utf8_storage = 0; p->encoded.clear();
     p->storage = storage; p->units = std::move(units);
+}
+void CoreFoundation::bind_external_units(std::uint64_t object, std::uint64_t buffer, std::uint64_t length, std::uint64_t capacity,
+                                         std::function<std::uint64_t(std::uint64_t, std::uint64_t)> grow,
+                                         std::function<void(std::uint64_t)> release) {
+    const auto p = impl_->payload<StringPayload>(object, ObjectKind::string);
+    if (length > capacity || capacity > (1ull << 30) || (capacity && !buffer)) invalid("external characters: a length beyond the buffer's capacity");
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(length) * 2);
+    if (!data.empty()) impl_->memory().read_bytes(buffer, data);
+    std::vector<std::uint16_t> units(static_cast<std::size_t>(length));
+    for (std::size_t at = 0; at < units.size(); ++at) units[at] = static_cast<std::uint16_t>(data[at * 2] | (data[at * 2 + 1] << 8));
+    std::lock_guard lock(p->mutex);
+    if (!p->mutable_string) invalid("external characters for an immutable string");
+    if (!grow) {
+        if (!p->external) invalid("CFStringSetExternalCharactersNoCopy on a string without external characters");
+    } else {
+        if (p->external) invalid("external characters bound twice");
+        p->retired.push_back(p->storage);   // the string's own storage until now
+        p->grow = std::move(grow);
+        p->release_external = std::move(release);
+        p->external = true;
+    }
+    if (p->utf8_storage) p->retired.push_back(p->utf8_storage);
+    for (const auto [encoding, old] : p->encoded) { static_cast<void>(encoding); p->retired.push_back(old); }
+    p->utf8_storage = 0; p->encoded.clear();
+    p->storage = buffer;
+    p->capacity = capacity;
+    p->units = std::move(units);
 }
 std::uint64_t CoreFoundation::description(std::uint64_t object) { return impl_->utf8_string(impl_->description(object)); }
 std::optional<ObjectKind> CoreFoundation::kind(std::uint64_t object) {

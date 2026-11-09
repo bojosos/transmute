@@ -45,6 +45,15 @@ public:
     // Replaces the characters of a mutable string (one made by mutable_copy).
     // Inner pointers obtained earlier stay valid until the string is freed.
     void replace_string_units(std::uint64_t object, std::vector<std::uint16_t> units);
+    // Binds a mutable string (mutable_copy) to an external UniChar buffer of `capacity` units holding
+    // `length` (CFStringCreateMutableWithExternalCharactersNoCopy): its characters are read from there
+    // now, every later change is written there (no terminator), and CFStringGetCharactersPtr answers it.
+    // `grow` returns a buffer for at least the given length (it stops when the buffer cannot grow);
+    // `release` takes the buffer back when the string goes. Binding an external string again with empty
+    // functions re-reads a new buffer and keeps them (CFStringSetExternalCharactersNoCopy).
+    void bind_external_units(std::uint64_t object, std::uint64_t buffer, std::uint64_t length, std::uint64_t capacity,
+                             std::function<std::uint64_t(std::uint64_t buffer, std::uint64_t length)> grow,
+                             std::function<void(std::uint64_t buffer)> release);
     [[nodiscard]] std::uint64_t description(std::uint64_t object);
     [[nodiscard]] std::optional<ObjectKind> kind(std::uint64_t object);
     [[nodiscard]] bool is_mutable(std::uint64_t object);
