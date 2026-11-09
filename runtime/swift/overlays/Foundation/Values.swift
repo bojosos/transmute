@@ -13,12 +13,12 @@ public struct URL: Hashable, Equatable, CustomStringConvertible, CustomDebugStri
 
     internal init(_reference url: NSURL) { _url = url.copy() as! NSURL }
 
-    public init?(string: String) {
+    public init?(string: __shared String) {
         guard let url = NSURL(string: string._bridgeToObjectiveC()) else { return nil }
         _url = url
     }
 
-    public init(fileURLWithPath path: String) {
+    public init(fileURLWithPath path: __shared String) {
         _url = NSURL(fileURLWithPath: path._bridgeToObjectiveC())
     }
 
@@ -100,6 +100,9 @@ public struct Date: Comparable, Hashable, CustomStringConvertible, Sendable {
         return .orderedSame
     }
 
+    public static var distantFuture: Date { return Date(timeIntervalSinceReferenceDate: 63113904000.0) }
+    public static var distantPast: Date { return Date(timeIntervalSinceReferenceDate: -63114076800.0) }
+
     public static func < (lhs: Date, rhs: Date) -> Bool { return lhs._time < rhs._time }
     public static func == (lhs: Date, rhs: Date) -> Bool { return lhs._time == rhs._time }
     public func hash(into hasher: inout Hasher) { hasher.combine(_time) }
@@ -123,6 +126,19 @@ extension Date: _ObjectiveCBridgeable {
     public static func _unconditionallyBridgeFromObjectiveC(_ source: NSDate?) -> Date {
         guard let source = source else { return Date(timeIntervalSinceReferenceDate: 0) }
         return Date(timeIntervalSinceReferenceDate: source.timeIntervalSinceReferenceDate)
+    }
+}
+
+extension Date: Codable {
+    /// A date codes as its time interval since the reference date.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        _time = try container.decode(Double.self)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(_time)
     }
 }
 

@@ -534,21 +534,6 @@ if ($Library -eq 'all') {
     # NSObject is Hashable in every overlay built after it.
     Build-Overlay 'ObjectiveC' 'swiftObjectiveC'
 
-    Build-Overlay 'Foundation' 'swiftFoundation'
-    Build-Overlay 'os' 'swiftos'
-    foreach ($overlay in $extraOverlays) {
-        if (!(Test-Path -LiteralPath $overlay.Source)) { continue }
-        $extraFlags = @()
-        $extraInputs = @()
-        if ($overlay.Contains('IncludeDirectory')) {
-            $include = Slash (Resolve-Path -LiteralPath $overlay.IncludeDirectory).Path
-            $extraFlags = @('-Xcc', "-I$include")
-            $extraInputs = @(Get-ChildItem -LiteralPath $include -File -Recurse | ForEach-Object { $_.FullName })
-            if (!$extraIncludeRoots.Contains($include)) { $extraIncludeRoots.Add($include) }
-        }
-        Build-Overlay $overlay.Module $overlay.Library $overlay.Source $overlay.Install $overlay.File $overlay.Dependencies $extraFlags $extraInputs
-    }
-
     # /System/Library/Frameworks/Combine.framework/Versions/A/Combine: OpenCombine's code (third_party/opencombine,
     # vendored by scripts/vendor_opencombine.py) and the project's runtime/swift/combine, as the resilient module
     # Combine. Its async publishers use _Concurrency, so that module is imported implicitly here.
@@ -586,6 +571,26 @@ if ($Library -eq 'all') {
     }
     Link-Library 'Combine' '/System/Library/Frameworks/Combine.framework/Versions/A/Combine' @($combineObjects + $helperObject) `
         @($cxx, "$out/libswiftCore.dylib", "$out/libswift_Concurrency.dylib", "$out/libswiftDarwin.dylib") 'Combine'
+
+    # Foundation's Combine publishers (NotificationCenter.Publisher, Timer.TimerPublisher) and their locks (Darwin's
+    # os_unfair_lock) need Combine, _Concurrency and Darwin. Foundation's interface names Combine, so every overlay
+    # compiled after it (any that imports Foundation) finds those modules too.
+    $overlayFlags += @('-I', $stdlibObj, '-I', $combineObj)
+    Build-Overlay 'Foundation' 'swiftFoundation' -dependencies @('libswiftObjectiveC.dylib', 'Combine', 'libswift_Concurrency.dylib',
+        'libswiftDarwin.dylib')
+    Build-Overlay 'os' 'swiftos'
+    foreach ($overlay in $extraOverlays) {
+        if (!(Test-Path -LiteralPath $overlay.Source)) { continue }
+        $extraFlags = @()
+        $extraInputs = @()
+        if ($overlay.Contains('IncludeDirectory')) {
+            $include = Slash (Resolve-Path -LiteralPath $overlay.IncludeDirectory).Path
+            $extraFlags = @('-Xcc', "-I$include")
+            $extraInputs = @(Get-ChildItem -LiteralPath $include -File -Recurse | ForEach-Object { $_.FullName })
+            if (!$extraIncludeRoots.Contains($include)) { $extraIncludeRoots.Add($include) }
+        }
+        Build-Overlay $overlay.Module $overlay.Library $overlay.Source $overlay.Install $overlay.File $overlay.Dependencies $extraFlags $extraInputs
+    }
 }
 
 # --- Licenses and provenance.

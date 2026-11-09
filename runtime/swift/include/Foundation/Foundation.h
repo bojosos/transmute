@@ -226,6 +226,204 @@ NS_ROOT_CLASS
 
 @interface NSCoder : NSObject
 @end
+
+/* The classes behind the Swift value types applications reach on launch
+   (Notification, CharacterSet, UUID, URLComponents, the Combine publishers,
+   key-value observing). */
+typedef NS_OPTIONS(NSUInteger, NSStringCompareOptions) {
+    NSCaseInsensitiveSearch = 1,
+    NSLiteralSearch = 2,
+    NSBackwardsSearch = 4,
+    NSAnchoredSearch = 8,
+    NSNumericSearch = 64,
+    NSDiacriticInsensitiveSearch = 128,
+    NSWidthInsensitiveSearch = 256,
+    NSForcedOrderingSearch = 512,
+    NSRegularExpressionSearch = 1024
+};
+typedef NS_OPTIONS(NSUInteger, NSDataReadingOptions) {
+    NSDataReadingMappedIfSafe = 1UL << 0,
+    NSDataReadingUncached = 1UL << 1,
+    NSDataReadingMappedAlways = 1UL << 3
+};
+typedef NS_OPTIONS(NSUInteger, NSDataWritingOptions) {
+    NSDataWritingAtomic = 1UL << 0,
+    NSDataWritingWithoutOverwriting = 1UL << 1
+};
+typedef NS_OPTIONS(NSUInteger, NSKeyValueObservingOptions) {
+    NSKeyValueObservingOptionNew = 0x01,
+    NSKeyValueObservingOptionOld = 0x02,
+    NSKeyValueObservingOptionInitial = 0x04,
+    NSKeyValueObservingOptionPrior = 0x08
+};
+typedef NS_ENUM(NSUInteger, NSKeyValueChange) {
+    NSKeyValueChangeSetting = 1,
+    NSKeyValueChangeInsertion = 2,
+    NSKeyValueChangeRemoval = 3,
+    NSKeyValueChangeReplacement = 4
+};
+typedef NSString* NSKeyValueChangeKey NS_TYPED_EXTENSIBLE_ENUM;
+extern NSKeyValueChangeKey const NSKeyValueChangeKindKey;
+extern NSKeyValueChangeKey const NSKeyValueChangeNewKey;
+extern NSKeyValueChangeKey const NSKeyValueChangeOldKey;
+extern NSKeyValueChangeKey const NSKeyValueChangeIndexesKey;
+extern NSKeyValueChangeKey const NSKeyValueChangeNotificationIsPriorKey;
+
+@interface NSObject (NSKeyValueObserving)
+- (void)observeValueForKeyPath:(nullable NSString*)keyPath ofObject:(nullable id)object
+                        change:(nullable NSDictionary<NSKeyValueChangeKey, id>*)change context:(nullable void*)context;
+- (void)addObserver:(NSObject*)observer forKeyPath:(NSString*)keyPath options:(NSKeyValueObservingOptions)options
+            context:(nullable void*)context;
+- (void)removeObserver:(NSObject*)observer forKeyPath:(NSString*)keyPath context:(nullable void*)context;
+- (void)willChangeValueForKey:(NSString*)key;
+- (void)didChangeValueForKey:(NSString*)key;
+@end
+
+@interface NSString (NSStringExtensionMethods)
+- (instancetype)initWithFormat:(NSString*)format arguments:(va_list)argList;
+- (instancetype)initWithFormat:(NSString*)format locale:(nullable id)locale arguments:(va_list)argList;
+@property (readonly, copy) NSString* capitalizedString;
+- (NSComparisonResult)caseInsensitiveCompare:(NSString*)string;
+- (NSString*)stringByReplacingOccurrencesOfString:(NSString*)target withString:(NSString*)replacement
+                                          options:(NSStringCompareOptions)options range:(NSRange)searchRange;
+- (BOOL)writeToURL:(NSURL*)url atomically:(BOOL)useAuxiliaryFile encoding:(NSStringEncoding)enc error:(NSError**)error;
+@end
+
+@interface NSNumber (NSNumberCreation)
++ (NSNumber*)numberWithBool:(BOOL)value;
++ (NSNumber*)numberWithInteger:(NSInteger)value;
++ (NSNumber*)numberWithFloat:(float)value;
++ (NSNumber*)numberWithDouble:(double)value;
+@property (readonly) BOOL boolValue;
+@property (readonly) NSInteger integerValue;
+@property (readonly) float floatValue;
+@property (readonly) double doubleValue;
+@end
+
+@interface NSURL (NSURLComponentAccessors)
+- (nullable NSURL*)URLByAppendingPathComponent:(NSString*)pathComponent isDirectory:(BOOL)isDirectory;
+@property (nullable, readonly, copy) NSString* scheme;
+@property (nullable, readonly, copy) NSString* host;
+@property (nullable, readonly, copy) NSString* fragment;
+@property (nullable, readonly, copy) NSArray<NSString*>* pathComponents;
+@end
+
+@interface NSData (NSDataFiles)
++ (nullable instancetype)dataWithContentsOfURL:(NSURL*)url options:(NSDataReadingOptions)readOptionsMask error:(NSError**)errorPtr;
+- (BOOL)writeToURL:(NSURL*)url options:(NSDataWritingOptions)writeOptionsMask error:(NSError**)errorPtr;
+@end
+
+@interface NSDate (NSDateDistantDates)
+@property (class, readonly, copy) NSDate* distantFuture;
+@property (class, readonly, copy) NSDate* distantPast;
+@end
+
+@interface NSBundle (NSBundleLocalization)
+- (NSString*)localizedStringForKey:(NSString*)key value:(nullable NSString*)value table:(nullable NSString*)tableName;
+@end
+
+@class NSNotification;
+typedef NSString* NSNotificationName NS_TYPED_EXTENSIBLE_ENUM;
+
+@interface NSNotification : NSObject <NSCopying, NSCoding>
+@property (readonly, copy) NSNotificationName name;
+@property (nullable, readonly, retain) id object;
+@property (nullable, readonly, copy) NSDictionary* userInfo;
+- (instancetype)initWithName:(NSNotificationName)name object:(nullable id)object userInfo:(nullable NSDictionary*)userInfo
+    NS_DESIGNATED_INITIALIZER;
++ (instancetype)notificationWithName:(NSNotificationName)aName object:(nullable id)anObject userInfo:(nullable NSDictionary*)aUserInfo;
+@end
+
+@interface NSOperationQueue : NSObject
+@end
+
+@interface NSNotificationCenter : NSObject
+@property (class, readonly, strong) NSNotificationCenter* defaultCenter;
+- (id<NSObject>)addObserverForName:(nullable NSNotificationName)name object:(nullable id)obj queue:(nullable NSOperationQueue*)queue
+                        usingBlock:(void (^)(NSNotification* notification))block;
+- (void)removeObserver:(id)observer;
+- (void)postNotification:(NSNotification*)notification;
+- (void)postNotificationName:(NSNotificationName)aName object:(nullable id)anObject userInfo:(nullable NSDictionary*)aUserInfo;
+@end
+
+@interface NSCharacterSet : NSObject <NSCopying, NSMutableCopying, NSSecureCoding>
+@property (class, readonly, copy) NSCharacterSet* whitespaceCharacterSet;
+@property (class, readonly, copy) NSCharacterSet* whitespaceAndNewlineCharacterSet;
+@property (class, readonly, copy) NSCharacterSet* newlineCharacterSet;
+@property (class, readonly, copy) NSCharacterSet* decimalDigitCharacterSet;
+@property (class, readonly, copy) NSCharacterSet* alphanumericCharacterSet;
+@property (class, readonly, copy) NSCharacterSet* URLQueryAllowedCharacterSet;
++ (NSCharacterSet*)characterSetWithCharactersInString:(NSString*)aString;
+- (BOOL)longCharacterIsMember:(uint32_t)theLongChar;
+@property (readonly, copy) NSCharacterSet* invertedSet;
+@end
+
+@interface NSMutableCharacterSet : NSCharacterSet
+- (void)addCharactersInString:(NSString*)aString;
+- (void)removeCharactersInString:(NSString*)aString;
+- (void)formUnionWithCharacterSet:(NSCharacterSet*)otherSet;
+@end
+
+@interface NSString (NSCharacterSetMethods)
+- (NSString*)stringByTrimmingCharactersInSet:(NSCharacterSet*)set;
+- (NSArray<NSString*>*)componentsSeparatedByCharactersInSet:(NSCharacterSet*)separator NS_SWIFT_NAME(components(separatedBy:));
+- (nullable NSString*)stringByAddingPercentEncodingWithAllowedCharacters:(NSCharacterSet*)allowedCharacters;
+@end
+
+@interface NSUUID : NSObject <NSCopying, NSSecureCoding>
+- (instancetype)initWithUUIDBytes:(const unsigned char*)bytes;
+- (void)getUUIDBytes:(unsigned char*)uuid;
+@property (readonly, copy) NSString* UUIDString;
+@end
+
+@interface NSURLQueryItem : NSObject <NSSecureCoding, NSCopying>
++ (instancetype)queryItemWithName:(NSString*)name value:(nullable NSString*)value;
+@property (readonly) NSString* name;
+@property (nullable, readonly) NSString* value;
+@end
+
+@interface NSURLComponents : NSObject <NSCopying>
++ (nullable instancetype)componentsWithURL:(NSURL*)url resolvingAgainstBaseURL:(BOOL)resolve;
+@property (nullable, readonly, copy) NSURL* URL;
+@property (nullable, copy) NSString* scheme;
+@property (nullable, copy) NSString* host;
+@property (copy) NSString* path;
+@property (nullable, copy) NSString* query;
+@property (nullable, copy) NSString* fragment;
+@property (nullable, copy) NSArray<NSURLQueryItem*>* queryItems;
+@end
+
+typedef NSString* NSRunLoopMode NS_TYPED_EXTENSIBLE_ENUM;
+extern NSRunLoopMode const NSDefaultRunLoopMode;
+extern NSRunLoopMode const NSRunLoopCommonModes;
+
+@interface NSTimer : NSObject
++ (NSTimer*)timerWithTimeInterval:(NSTimeInterval)interval repeats:(BOOL)repeats block:(void (^)(NSTimer* timer))block;
+- (void)invalidate;
+@property NSTimeInterval tolerance;
+@end
+
+@interface NSRunLoop : NSObject
+@property (class, readonly, strong) NSRunLoop* currentRunLoop;
+@property (class, readonly, strong) NSRunLoop* mainRunLoop;
+- (void)addTimer:(NSTimer*)timer forMode:(NSRunLoopMode)mode;
+- (void)runUntilDate:(NSDate*)limitDate;
+@end
+
+@interface NSKeyedUnarchiver : NSCoder
++ (nullable id)unarchivedObjectOfClass:(Class)cls fromData:(NSData*)data error:(NSError**)error NS_REFINED_FOR_SWIFT;
++ (nullable id)unarchiveTopLevelObjectWithData:(NSData*)data error:(NSError**)error NS_REFINED_FOR_SWIFT;
+@end
+
+@interface NSUserDefaults : NSObject
+@property (class, readonly, strong) NSUserDefaults* standardUserDefaults;
+- (void)registerDefaults:(NSDictionary*)registrationDictionary;
+- (nullable id)objectForKey:(NSString*)defaultName;
+- (NSInteger)integerForKey:(NSString*)defaultName;
+- (BOOL)boolForKey:(NSString*)defaultName;
+@end
+
+void NSLogv(NSString* format, va_list args);
 NS_ASSUME_NONNULL_END
 #endif
 #endif
