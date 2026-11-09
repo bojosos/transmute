@@ -477,15 +477,8 @@ void DarwinServices::Impl::install_all() {
         if (key.empty() || key.find('=') != std::string::npos) return std::uint64_t{0};
         std::lock_guard lock(mutex);
         const auto* child_environment = fork_child_environment();
-        for (const auto& value : child_environment ? *child_environment : context.environment) if (value.starts_with(key + '=')) {
-            auto found = environment_strings.find(value);
-            if (found == environment_strings.end()) {
-                const auto address = context.allocate_guest(value.size() + 1);
-                put_text(m, address, value);
-                found = environment_strings.emplace(value, address).first;
-            }
-            return add(found->second, key.size() + 1);
-        }
+        for (const auto& value : child_environment ? *child_environment : context.environment) if (value.starts_with(key + '='))
+            return add(environment_string(m, value), key.size() + 1);
         return std::uint64_t{0};
     }, 0);
     install("_setenv", [this](auto& s, auto& m) {

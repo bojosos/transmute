@@ -1411,6 +1411,8 @@ public:
     std::map<std::uint64_t, CopyState> copy_states;
     std::map<std::string, std::uint64_t> environment_strings;
     std::uint64_t environment_cell{};
+    std::uint64_t environment_array{}, environment_capacity{};   // the environ array update_environment owns, in entries
+    std::uint64_t environment_pool{}, environment_pool_left{};   // where the next environment string goes
     std::function<bool(std::uint64_t)> check_locale;
     std::array<bool, 3> closed_standard{};
     std::array<bool, 3> standard_cloexec{};
@@ -2611,23 +2613,43 @@ public:
             throw;
         }
     }
+    // The guest copy of one "NAME=value" string (the caller holds `mutex`). Copies live as long as the
+    // process, as getenv's results may still be in use, and come from 64 KiB blocks: a mapping of its
+    // own per string was a host mapping for every value a setenv loop wrote.
+    std::uint64_t environment_string(transmute::GuestMemory& memory, const std::string& value) {
+        if (const auto found = environment_strings.find(value); found != environment_strings.end()) return found->second;
+        const auto size = (static_cast<std::uint64_t>(value.size()) + 1 + 7) & ~std::uint64_t{7};
+        std::uint64_t address;
+        if (size > 4096) address = context.allocate_guest(size);
+        else {
+            if (size > environment_pool_left) {
+                environment_pool = context.allocate_guest(64 * 1024);
+                environment_pool_left = 64 * 1024;
+            }
+            address = environment_pool;
+            environment_pool += size;
+            environment_pool_left -= size;
+        }
+        put_text(memory, address, value);
+        environment_strings.emplace(value, address);
+        return address;
+    }
     void update_environment() {
         auto& memory = context.calling_engine();
         std::vector<std::uint64_t> values;
-        for (const auto& value : context.environment) {
-            const auto found = environment_strings.find(value);
-            if (found != environment_strings.end()) values.push_back(found->second);
-            else {
-                const auto address = context.allocate_guest(value.size() + 1);
-                put_text(memory, address, value);
-                environment_strings.emplace(value, address);
-                values.push_back(address);
-            }
+        for (const auto& value : context.environment) values.push_back(environment_string(memory, value));
+        // One array, rewritten in place and grown geometrically, as Libc's setenv reallocs environ and
+        // unsetenv shifts it in place. (A new array per call is a new host mapping each time: a threaded
+        // setenv loop left hundreds of thousands of them, and their teardown held up process exit for
+        // over a minute.) A grown-out array stays mapped: another thread may still be reading it.
+        if (values.size() + 1 > environment_capacity) {
+            const auto capacity = std::max<std::uint64_t>(64, (values.size() + 1) * 2);
+            environment_array = context.allocate_guest(capacity * 8);
+            environment_capacity = capacity;
         }
-        const auto array = context.allocate_guest((values.size() + 1) * 8);
-        for (std::size_t index = 0; index < values.size(); ++index) memory.write64(array + index * 8, values[index]);
-        memory.write64(array + values.size() * 8, 0);
-        memory.write64(environment_cell, array);
+        for (std::size_t index = 0; index < values.size(); ++index) memory.write64(environment_array + index * 8, values[index]);
+        memory.write64(environment_array + values.size() * 8, 0);
+        memory.write64(environment_cell, environment_array);
     }
     std::uint64_t stat(transmute::GuestMemory& memory, std::uint64_t pathname, std::uint64_t result, bool descriptor) {
         validate(memory, result, 144, true);

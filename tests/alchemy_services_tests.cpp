@@ -195,6 +195,26 @@ void environment_clock_mapping() {
     const auto environment_export = f.context.resolve(system_library, "_environ");
     require(environment_export && get(f.engine, f.engine.read64(f.engine.read64(environment_export->address))) == "ALCHEMY_TEST=value", "environ data export wrong");
     require(f.call("_unsetenv", {name}) == 0 && f.call("_getenv", {name}) == 0, "unsetenv failed");
+    // setenv and unsetenv rewrite one environ array in place (a new one per call left a host mapping each).
+    const auto array = f.engine.read64(environment_export->address);
+    for (int round = 0; round < 2000; ++round)
+        require(f.call("_setenv", {name, value, 1}) == 0 && f.call("_unsetenv", {name}) == 0, "setenv/unsetenv loop failed");
+    require(f.call("_setenv", {name, value, 1}) == 0 && f.engine.read64(environment_export->address) == array,
+        "setenv replaced the environ array");
+    bool listed = false;
+    for (auto entry = array; f.engine.read64(entry); entry += 8) listed |= get(f.engine, f.engine.read64(entry)) == "ALCHEMY_TEST=value";
+    require(listed && f.call("_unsetenv", {name}) == 0 && f.engine.read64(environment_export->address) == array,
+        "environ array lost the entry or moved");
+    for (auto entry = array; f.engine.read64(entry); entry += 8)
+        require(get(f.engine, f.engine.read64(entry)) != "ALCHEMY_TEST=value", "unsetenv left the entry in environ");
+    // Distinct values share pooled guest storage; every getenv result stays readable.
+    std::vector<std::uint64_t> results;
+    for (int round = 0; round < 3000; ++round) {
+        require(f.call("_setenv", {name, f.string("value " + std::to_string(round)), 1}) == 0, "setenv of a new value failed");
+        if (round % 1000 == 0) results.push_back(f.call("_getenv", {name}));
+    }
+    require(get(f.engine, f.call("_getenv", {name})) == "value 2999" && get(f.engine, results[0]) == "value 0" &&
+        get(f.engine, results[2]) == "value 2000" && f.call("_unsetenv", {name}) == 0, "pooled environment strings wrong");
     const auto timestamp = f.context.allocate_guest(16);
     require(f.call("_clock_gettime", {6, timestamp}) == 0 && f.engine.read64(timestamp + 8) < 1000000000, "monotonic clock malformed");
     const auto monotonic = f.engine.read64(timestamp) * 1000000000 + f.engine.read64(timestamp + 8);
