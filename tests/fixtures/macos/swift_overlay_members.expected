@@ -1,0 +1,6 @@
+cString 72,105,0 nil 6
+dictionary 2 2
+cgfloat 3.0 1.75 false
+cfobject true true 1
+cmtime 1.5 true true
+done
