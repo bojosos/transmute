@@ -173,6 +173,16 @@ public:
                             if (context_.resolve(library, imported.symbol)) { report.status = "provider"; break; }
                         }
                     }
+                    // As the loader's flat lookup (module_loader.cpp global_symbol): also the provider libraries the
+                    // inspected images link (libfbclient's flat _iconv finds libiconv.2.dylib's).
+                    for (const auto& candidate : items_) {
+                        if (report.status != "unresolved") break;
+                        for (const auto& dependency : candidate->dependencies)
+                            if (dependency.status == "provider" && context_.resolve(dependency.identity, imported.symbol)) {
+                                report.status = "provider";
+                                break;
+                            }
+                    }
                 } else report.status = "invalid-ordinal";
                 if (report.status == "provider") {
                     if (const auto feature = deferred_object_api(imported.symbol); !feature.empty()) {
