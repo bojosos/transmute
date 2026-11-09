@@ -71,6 +71,15 @@ match). Matching is by font:
   face.
 * Exclusions apply to the matches, by PostScript name or family.
 
+**Attribute keys the apps bind (values unverified):**
+* kCTFontEnabledAttribute (LibreOffice), kCTFontCharacterSetAttribute (ffmpeg,
+  HandBrake, mpv, VLC) and kCTFontFeaturesAttribute (Inkscape, darktable) follow
+  the NSCT naming of the documented keys ("NSCTFont...Attribute").
+* kCTFontOpenTypeFeatureTag / Value (Audacity, mpv) are "CTFeatureOpenTypeTag"
+  / "CTFeatureOpenTypeValue".
+* The documentation gives none of these values. The descriptors read none of
+  them, and CTFontCopyFeatures answers NULL ('feat' descriptions are not read).
+
 The font manager makes descriptors from font data, orders family
 names case-insensitively, and keeps fonts enabled (disabling stops
 explicitly). Not provided yet: CTGlyphInfo, ruby annotations, font features.
