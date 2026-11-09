@@ -72,9 +72,10 @@ device; precompiled libraries (`newLibraryWithData:`, `newLibraryWithURL:`/
 `newLibraryWithFile:`, `newDefaultLibrary`/`newDefaultLibraryWithBundle:`'s
 default.metallib) without the AIR translator DLL (with it they are translated;
 a missing file is MTLLibraryErrorFileNotFound, no default.metallib nil);
-IOSurface-backed textures other than plane 0 of a chunky surface
-as a 2D single-level, single-sample texture of the surface's texel size
-(nil); a host signal of a cross-process shared event past a GPU signal of
+IOSurface-backed textures other than a 2D single-level, single-sample texture
+of plane 0 of a chunky surface or of any plane of a planar one (video
+frames: '420v'/'420f' as R8 + RG8, 'x420' as R16 + RG16) whose 1x1-pixel
+elements are the format's texel size (nil); a host signal of a cross-process shared event past a GPU signal of
 it still pending in the receiving process (Vulkan forbids it; one process
 signalling and the other waiting never does it). GPU counters: only the
 timestamp counter set, sampled at stage boundaries (encoder starts and ends;
