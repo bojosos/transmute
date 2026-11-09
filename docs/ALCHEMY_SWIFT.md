@@ -317,3 +317,43 @@ runtime-instantiated generic Swift classes. The Foundation side of Combine (the
 `NotificationCenter`, `Timer`, `URLSession` and KVO publishers) belongs to
 Foundation's Swift overlay, the companion described above.
 
+## Foundation's value types and the ObjectiveC overlay
+
+`runtime/swift/overlays/Foundation` grows to the Foundation Swift API that
+Pika 2.0.2 binds (123 names, all defined), written from Apple's public
+documentation over the Foundation provider's classes:
+- `Notification` (bridged to NSNotification), and the Combine publishers
+  `NotificationCenter.Publisher` and `Timer.TimerPublisher`, with
+  `RunLoop.SchedulerOptions`. libswiftFoundation therefore builds after
+  Combine and links it.
+- `CharacterSet`, `UUID`, `URLComponents` and `URLQueryItem`, `IndexSet`, URL's
+  component accessors, `Date.distantFuture` and Date's `Codable`, and Data's
+  file reading and writing.
+- `JSONEncoder` and `JSONDecoder`: pure Swift, with the documented defaults.
+  Dates use their own `Codable` form, Data codes as base64, URL as its
+  absolute string, and `/` is escaped unless `.withoutEscapingSlashes` is set.
+- Key-value observing by key path (`observe(_:options:changeHandler:)`,
+  `NSKeyValueObservation`, `willChangeValue`/`didChangeValue(for:)`) over the
+  provider's KVO.
+- The String conveniences (`String(format:)`, `trimmingCharacters(in:)`,
+  `components(separatedBy:)`, NSRange conversions, …), `NSLog`,
+  `NSLocalizedString`, `LocalizedStringResource`, and NSNumber bridging for
+  Bool, Int, Float and Double.
+- An NSString used as an `AnyHashable` (a bridged userInfo key, for example)
+  compares and hashes as its String.
+
+`/usr/lib/swift/libswiftObjectiveC.dylib` is the project's own ObjectiveC
+overlay. It defines `Selector`, a single `OpaquePointer` with C `SEL`'s layout,
+and NSObject's `Equatable` and `Hashable` over `-isEqual:` and `-hash`. It
+builds before every other overlay, since its module changes how they import
+`SEL`. A build of every overlay before and after it shows identical exports
+apart from the intended additions.
+
+`libswiftos` adds `os_log(_:dso:log:type:_:)` and
+`os_log(_:dso:log:_:_:)` with `OSLog.default`. The message and its arguments
+reach libSystem's `os_log_with_args` as a C `va_list`, which formats them
+(`%@` and the `{public}`/`{private}` annotations included). The CoreMedia
+overlay adds `CMSampleBuffer.imageBuffer`.
+
+Guest test: `alchemy_swift_foundation` (`tests/fixtures/macos/swift_foundation`),
+registered once the runtime directory has libswiftObjectiveC.
