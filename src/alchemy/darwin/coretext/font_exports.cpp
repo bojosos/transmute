@@ -60,6 +60,8 @@ constexpr std::string_view descriptor_keys[] = {
     // the OpenType feature setting keys (Audacity, mpv).
     "kCTFontCharacterSetAttribute|NSCTFontCharacterSetAttribute", "kCTFontOpenTypeFeatureTag|CTFeatureOpenTypeTag",
     "kCTFontOpenTypeFeatureValue|CTFeatureOpenTypeValue",
+    // Inkscape, darktable (unverified value, the NSCT naming).
+    "kCTFontFeaturesAttribute|NSCTFontFeaturesAttribute",
     "kCTFontFamilyNameKey|CTFontFamilyName", "kCTFontSubFamilyNameKey|CTFontSubFamilyName", "kCTFontStyleNameKey|CTFontSubFamilyName",
     "kCTFontFullNameKey|CTFontFullName", "kCTFontPostScriptNameKey|CTFontPostScriptName", "kCTFontUniqueNameKey|CTFontUniqueName",
     "kCTFontVersionNameKey|CTFontVersionName", "kCTFontCopyrightNameKey|CTFontCopyrightName",

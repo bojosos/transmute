@@ -161,6 +161,7 @@ void libreoffice(Fixture& f) {
                 f.string_constant(ct, "_kCTFontOpenTypeFeatureTag") == "CTFeatureOpenTypeTag" &&
                 f.string_constant(ct, "_kCTFontOpenTypeFeatureValue") == "CTFeatureOpenTypeValue",
             "the character set and OpenType feature keys");
+    require(f.string_constant(ct, "_kCTFontFeaturesAttribute") == "NSCTFontFeaturesAttribute", "kCTFontFeaturesAttribute");
     for (const auto* name : {"_HIThemeDrawMenuBackground", "_HIThemeDrawMenuItem", "_HIThemeDrawTextBox"}) {
         bool stopped = false;
         try { static_cast<void>(f.call(carbon, name, {0, 0, 0, 0, 0})); } catch (const std::exception&) { stopped = true; }
