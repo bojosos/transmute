@@ -24,6 +24,20 @@ const Case coremediaio_case("coremediaio", [](Fixture& f) {
             f.engine.read64(out) == 0, "no stream clock ('unop')");
     require(f.string_constant(LIBRARY, "_CMIOExtensionPropertyProviderName") == "CMIOExtensionPropertyProviderName", "an extension property key");
     require(f.cls("CMIOExtensionProvider") != 0 && f.cls("CMIOExtensionStreamProperties") != 0, "the extension classes");
+    // The properties the Swift overlay sets: kept as given.
+    const auto properties = f.send(f.send(f.cls("CMIOExtensionStreamProperties"), "alloc"), "init");
+    const auto index = f.cf.integer(2);
+    f.send(properties, "setActiveFormatIndex:", {index});
+    require(f.cf.number_value(f.send(properties, "activeFormatIndex")) == 2.0, "activeFormatIndex kept");
+    const auto max = f.block(24), min = f.block(24), time = f.block(24);
+    f.engine.write64(max, 1); f.engine.write32(max + 8, 30); f.engine.write32(max + 12, 1);
+    f.engine.write64(min, 1); f.engine.write32(min + 8, 60); f.engine.write32(min + 12, 1);
+    const auto format = f.send(f.send(f.cls("CMIOExtensionStreamFormat"), "alloc"), "initWithFormatDescription:maxFrameDuration:minFrameDuration:validFrameDurations:",
+                               {0, max, min, 0});
+    alchemy::CallRegs r{};
+    r.indirect_result = time;
+    static_cast<void>(f.objc.send(format, "maxFrameDuration", r));
+    require(format != 0 && f.engine.read64(time) == 1 && f.engine.read32(time + 8) == 30, "a stream format's maximum frame duration (1/30)");
 });
 
 #undef LIBRARY

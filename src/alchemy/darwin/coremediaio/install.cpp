@@ -1,6 +1,9 @@
 #include "alchemy/darwin/coremediaio/install.hpp"
 #include "alchemy/gui/value_provider.hpp"
 
+#include <algorithm>
+#include <array>
+
 // CoreMediaIO: no DAL plug-in objects exist (kCMIOHardwareBadObjectError).
 // Chrome 155 first linked the framework (moved from
 // darwin/identities/identities.cpp).
@@ -8,7 +11,10 @@
 // The DAL plug-in and camera extension side (OBS's virtual camera) runs only inside the system's camera host,
 // which does not exist here: a plug-in's objects, devices and streams answer CoreMediaIO's documented errors
 // (kCMIOHardwareBadObjectError '!obj', BadDeviceError '!dev', BadStreamError '!str', UnsupportedOperationError
-// 'unop'), and the CMIOExtension classes are shells nothing instantiates. The CMIOExtensionProperty* strings
+// 'unop'), and the CMIOExtension classes are shells nothing here instantiates. The properties the Swift overlay
+// (libswiftCoreMediaIO) reaches are stored as given: the stream properties' activeFormatIndex, frameDuration,
+// sinkBufferQueueSize and sinkBuffersRequiredForStartup, the device properties' transportType, and a stream
+// format's description, frame durations (CMTimes) and valid frame durations. The CMIOExtensionProperty* strings
 // are valued by their names: the public documentation gives no values (unverified).
 namespace alchemy::coremediaio {
 namespace {
@@ -71,9 +77,37 @@ void Provider::install() {
                              "CMIOExtensionPropertyStreamSinkEndOfData"})
         string(core_media_io, std::string("_") + name, name);
     // The camera extension classes: a camera extension runs only in the system's camera host.
-    for (const auto* name : {"CMIOExtensionProvider", "CMIOExtensionProviderProperties", "CMIOExtensionDevice", "CMIOExtensionDeviceProperties",
-                             "CMIOExtensionStream", "CMIOExtensionStreamFormat", "CMIOExtensionStreamProperties", "CMIOExtensionScheduledOutput"})
+    for (const auto* name : {"CMIOExtensionProvider", "CMIOExtensionProviderProperties", "CMIOExtensionDevice", "CMIOExtensionStream",
+                             "CMIOExtensionScheduledOutput"})
         static_cast<void>(cls(core_media_io, name, "NSObject"));
+    const auto stream_properties = cls(core_media_io, "CMIOExtensionStreamProperties", "NSObject");
+    object_properties(stream_properties, {"activeFormatIndex", "frameDuration", "sinkBufferQueueSize", "sinkBuffersRequiredForStartup"});
+    const auto device_properties = cls(core_media_io, "CMIOExtensionDeviceProperties", "NSObject");
+    object_properties(device_properties, {"transportType"});
+    // CMIOExtensionStreamFormat: -initWithFormatDescription:maxFrameDuration:minFrameDuration:validFrameDurations: (the
+    // CMTimes by reference, as 24-byte arguments travel) and its read-only properties; the CMTimes are kept as their bytes.
+    const auto stream_format = cls(core_media_io, "CMIOExtensionStreamFormat", "NSObject");
+    object_properties(stream_format, {"formatDescription", "validFrameDurations"});
+    method(stream_format, "initWithFormatDescription:maxFrameDuration:minFrameDuration:validFrameDurations:", [this](CpuState& s, GuestMemory& m) {
+        store(s.x[0], "formatDescription", s.x[2]);
+        for (const auto& [key, at] : {std::pair{"maxFrameDuration", s.x[3]}, std::pair{"minFrameDuration", s.x[4]}}) {
+            std::array<std::uint8_t, 24> time{};
+            if (at) m.read_bytes(at, time);
+            const auto data = bridge->data(time);
+            store(s.x[0], key, data);
+            release(data);
+        }
+        store(s.x[0], "validFrameDurations", s.x[5]);
+    }, false, "@@:^{opaqueCMFormatDescription=}{?=qiIq}{?=qiIq}@");
+    for (const auto* key : {"maxFrameDuration", "minFrameDuration"})
+        method(stream_format, key, [this, key = std::string(key)](CpuState& s, GuestMemory& m) {
+            std::array<std::uint8_t, 24> time{};   // kCMTimeInvalid when not given
+            if (const auto data = stored(s.x[0], key); data && bridge->is_data(data)) {
+                const auto bytes = bridge->bytes(data);
+                std::copy_n(bytes.begin(), std::min<std::size_t>(bytes.size(), time.size()), time.begin());
+            }
+            if (s.x[8]) m.write_bytes(s.x[8], time);   // the CMTime by indirect result
+        }, false, "{?=qiIq}@:");
 }
 
 } // namespace

@@ -7,7 +7,8 @@
   The DAL plug-in and camera extension side (OBS's virtual camera) runs only in the system's camera host:
   `CMIOObjectCreate` and `CMIOObjectsPublishedAndDied` answer '!obj', `CMIODeviceStart/StopStream` '!dev',
   `CMIOStreamCopyBufferQueue` '!str', `CMIOStreamClockCreate` and `CMIOSampleBufferCreateForImageBuffer`
-  `kCMIOHardwareUnsupportedOperationError` ('unop'); the `CMIOExtension*` classes are shells.
+  `kCMIOHardwareUnsupportedOperationError` ('unop'); the `CMIOExtension*` classes are shells, with the properties
+  the Swift overlay sets stored as given (stream and device properties, a stream format's description and durations).
 * **Unverified values:** the `CMIOExtensionProperty*` strings are their names; the public documentation gives no values.
 * **Host dependencies:** none.
 * **Registration:** `install_coremediaio`, one row of the installer table after the
