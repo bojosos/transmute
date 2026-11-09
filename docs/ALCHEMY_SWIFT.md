@@ -404,3 +404,47 @@ the timer fires once.
 Guest tests: `alchemy_swift_overlay_members`
 (`tests/fixtures/macos/swift_overlay_members`) and `alchemy_swift_dispatch_timer`
 (`tests/fixtures/macos/swift_dispatch_timer`).
+
+## SwiftUI as declarations
+
+`/System/Library/Frameworks/SwiftUI.framework/Versions/A/SwiftUI` is built
+from `runtime/swift/swiftui`. It is our own SwiftUI declarations, written from
+Apple's public documentation, and it exports every SwiftUI name Pika 2.0.2
+binds (890). Every body Alchemy doesn't implement yet stops with "SwiftUI:
+<API> is not implemented in Alchemy yet"; nothing returns a silent default.
+
+What runs: `App.main` builds the app and its scene tree, installs an
+`NSApplicationDelegateAdaptor`'s delegate, and runs `NSApplication`. An app
+whose UI comes from its AppKit delegate gets that far, as Pika's does. Scene
+bodies and views stop explicitly until a renderer exists.
+
+The 18 types Apple documents as `@frozen` (State, Binding, Text, Color,
+AnyView, Transaction, Environment, ModifiedContent, TupleView, EdgeInsets,
+Spacer, Image, ObservedObject, EnvironmentObject, FocusState, EmptyView,
+HStack, VStack) are frozen here too. Apps compiled against Apple's SwiftUI
+build, pass and return them by Apple's stored layout, which no public document
+gives. Until the layout survey establishes a type's layout from an app's own
+Swift metadata, each of its members stops at entry: "SwiftUI: <Type>'s stored
+layout is not established yet". The stop runs before anything touches the
+layout or a result pointer, so no member ever runs on a guessed layout. Their
+stored fields are placeholders until then. Pika 2.0.2 reaches that stop for
+ObservedObject when it builds its first view.
+
+ForEach is declared in Apple's SwiftUICore module and its `create(_:id:content:)`
+in SwiftUI. That name has an extension context one module can't produce, so it
+is exported as a linker alias of our same method.
+
+Two more pieces it builds on:
+- `libswiftCoreGraphics` adds CGColor's `black`/`white`/`clear`/`components`,
+  `Equatable` and `Codable` for CGPoint and CGSize, and `Equatable` for CGRect.
+- `runtime/swift/include` gains Clang modules for Swift builds:
+  - `CoreGraphics/CoreGraphics.h` layers `runtime/include/CoreGraphics` over
+    this directory's CoreFoundation;
+  - `AppKit/AppKit.h` declares the AppKit classes the overlays use (fw-ui
+    reviews changes). It promises only what Alchemy's AppKit provider does.
+
+The link stubs bind those AppKit classes to AppKit.framework, read from the
+header's `@interface` names, and CoreGraphics' `CG*`/`kCG*` names to
+CoreGraphics.framework.
+
+Guest test: `alchemy_swift_swiftui_app` (`tests/fixtures/macos/swift_swiftui_app`).
