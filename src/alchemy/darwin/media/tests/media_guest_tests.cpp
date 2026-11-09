@@ -810,7 +810,8 @@ void output_units(Fixture& f) {
     const auto graph_render = f.process.install_function("_alchemy_test_graph_render", [](transmute::CpuState& s, transmute::GuestMemory& m) {
         const auto list = s.x[5];
         for (std::uint32_t b = 0; b < m.read32(list); ++b) {
-            const auto bytes = m.read32(list + 8 + 16ULL * b + 4), data = m.read64(list + 8 + 16ULL * b + 8);
+            const auto bytes = m.read32(list + 8 + 16ULL * b + 4);
+            const auto data = m.read64(list + 8 + 16ULL * b + 8);
             for (std::uint32_t i = 0; i + 4 <= bytes; i += 4) m.write32(data + i, std::bit_cast<std::uint32_t>(0.25f));
         }
         s.x[0] = 0;
