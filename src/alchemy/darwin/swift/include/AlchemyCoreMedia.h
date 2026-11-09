@@ -20,8 +20,10 @@ enum CMTimeFlags : uint32_t {
     kCMTimeFlags_ImpliedValueFlagsMask = kCMTimeFlags_PositiveInfinity | kCMTimeFlags_NegativeInfinity | kCMTimeFlags_Indefinite,
 };
 
-/* A rational time value: value / timescale seconds, with flags and an epoch. */
-typedef struct CMTime {
+/* A rational time value: value / timescale seconds, with flags and an epoch.
+   Both time types are typedefs of anonymous structs, as published, so Swift
+   names them by the typedef (CMTime is __C.CMTime as a type alias). */
+typedef struct {
     CMTimeValue value;
     CMTimeScale timescale;
     CMTimeFlags flags;
@@ -29,7 +31,7 @@ typedef struct CMTime {
 } CMTime;
 
 /* A time range: a start time and a duration. */
-typedef struct CMTimeRange {
+typedef struct {
     CMTime start;
     CMTime duration;
 } CMTimeRange;
@@ -40,5 +42,12 @@ typedef struct __CVBuffer* CVBufferRef;
 typedef CVBufferRef CVImageBufferRef;
 /* The sample buffer's image buffer (not retained for the caller), or NULL. */
 CVImageBufferRef CMSampleBufferGetImageBuffer(CMSampleBufferRef sbuf);
+/* The earliest presentation timestamp of the buffer's samples. */
+CMTime CMSampleBufferGetPresentationTimeStamp(CMSampleBufferRef sbuf);
+
+/* Format descriptions (a Core Foundation type) and their media subtype, a four-character code. */
+typedef uint32_t FourCharCode;
+typedef const struct opaqueCMFormatDescription* CMFormatDescriptionRef;
+FourCharCode CMFormatDescriptionGetMediaSubType(CMFormatDescriptionRef desc);
 
 #endif
