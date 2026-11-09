@@ -1573,6 +1573,37 @@ kernel void fill(device uint* out [[buffer(0)]], constant uint& base [[buffer(1)
     for (std::uint32_t i = 0; i < 4; ++i) filled &= values[i] == 7 + i && values[4 + i] == 100 + i;
     expect(filled, "indirect compute commands use their own buffers: " + std::to_string(values[0]) + " " + std::to_string(values[4]));
 }
+// Lazy libraries (msl::outline): functions compile on first use, and one
+// that cannot be compiled fails alone.
+void test_lazy_library(const std::shared_ptr<metal::Device>& device) {
+    const std::string source = "#include <metal_stdlib>\nusing namespace metal;\n"
+                               "kernel void fill(device uint* p [[buffer(0)]], uint i [[thread_position_in_grid]]) { p[i] = i * 3; }\n"
+                               "kernel void doubles(device double* p [[buffer(0)]]) { p[0] = 1.0; }\n";
+    auto outline = msl::outline(source, {});
+    expect(outline.success() && outline.functions.size() == 2, "lazy library outline: " + msl::format_diagnostics(outline.diagnostics));
+    if (!outline.success()) return;
+    metal::ShaderLibrary library(device, source, {}, std::move(outline.functions));
+    expect(library.lazy() && library.functions.size() == 2 && library.functions[0]->spirv.empty(), "a lazy library holds the outline");
+    bool refused = false;
+    try { static_cast<void>(library.find("doubles")); } catch (const std::runtime_error&) { refused = true; }
+    expect(refused, "a lazy function the lowering refuses fails on its own");
+    expect(library.find("missing") == nullptr, "an unknown name is not found");
+    const auto fill = library.find("fill");
+    expect(fill && !fill->spirv.empty() && library.find("fill") == fill, "a lazy function compiles once on first use");
+    if (!fill) return;
+    const auto pipeline = metal::ComputePipeline::create(device, std::make_shared<metal::ShaderFunction>(device, fill));
+    auto out = shared_buffer(device, 16);
+    auto commands = metal::CommandBuffer::create(device);
+    commands->begin_compute(false);
+    commands->set_compute_pipeline(pipeline);
+    commands->set_buffer(metal::Stage::kernel, 0, out, 0);
+    commands->dispatch_threads({4, 1, 1}, {4, 1, 1});
+    commands->end_encoding();
+    commands->commit();
+    expect(commands->wait(UINT64_MAX), "lazy kernel command buffer completes");
+    const auto* values = reinterpret_cast<const std::uint32_t*>(out->contents());
+    expect(values[0] == 0 && values[3] == 9, "the lazily compiled kernel runs: " + std::to_string(values[3]));
+}
 void test_linear_texture_over_buffer(const std::shared_ptr<metal::Device>& device) {
     const auto alignment = metal::Texture::linear_alignment(device, metal::pixel_format::rgba8_unorm);
     std::cout << "  linear RGBA8: row pitch alignment " << alignment.row << ", offset alignment " << alignment.offset << "\n";
@@ -2017,6 +2048,7 @@ int main() {
         test_linear_texture_over_buffer(device);
         test_tessellation(device);
         test_indirect_command_buffers(device);
+        test_lazy_library(device);
         test_barycentric_coordinates(device);
         test_bindless_argument_buffers(device);
         test_argument_buffer_samplers(device);

@@ -598,12 +598,14 @@ ClangOutput build_pch(std::string_view header, const std::filesystem::path& outp
     return result;
 }
 
-ClangOutput compile_to_ir(std::string_view source, const CompileOptions& options, const std::filesystem::path& prelude) {
+ClangOutput compile_to_ir(std::string_view source, const CompileOptions& options, const std::filesystem::path& prelude,
+                          bool syntax_only) {
     ClangOutput result;
 #ifdef _WIN32
     auto args = ir_arguments(options);
     for (const auto& [name, value] : options.macros) args.push_back("-D" + name + "=" + value);
-    for (const auto* arg : {"-S", "-emit-llvm", "-o", "-"}) args.push_back(arg);
+    if (syntax_only) args.push_back("-fsyntax-only");
+    else for (const auto* arg : {"-S", "-emit-llvm", "-o", "-"}) args.push_back(arg);
     if (!prelude.empty()) {
         args.push_back("-include-pch");
         args.push_back(prelude.string());

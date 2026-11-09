@@ -77,14 +77,28 @@ private:
     VkShaderModule module_{};
 };
 
-// An MTLLibrary: the compiled entry points of one source.
+// An MTLLibrary: the compiled entry points of one source. A lazy library
+// (msl::outline, for large libraries) holds only the entry points' names and
+// stages and compiles each one on first use.
 class ShaderLibrary {
 public:
     ShaderLibrary(std::shared_ptr<Device> owner, std::vector<msl::Function> functions);
+    ShaderLibrary(std::shared_ptr<Device> owner, std::string source, msl::CompileOptions options,
+                  std::vector<msl::Function> outline);
     const std::shared_ptr<Device> device;
+    // Every entry point; in a lazy library, names and stages only.
     std::vector<std::shared_ptr<const msl::Function>> functions;
     std::string label;
+    // nullptr when the library has no such entry point. A lazy library's
+    // compile failure throws std::runtime_error with the compiler's text.
     [[nodiscard]] std::shared_ptr<const msl::Function> find(std::string_view name) const;
+    [[nodiscard]] bool lazy() const noexcept { return lazy_; }
+private:
+    bool lazy_{};
+    std::string source_;
+    msl::CompileOptions options_;
+    mutable std::mutex mutex_;
+    mutable std::map<std::string, std::shared_ptr<const msl::Function>, std::less<>> compiled_;
 };
 
 // ---- render pipelines ---------------------------------------------------------------

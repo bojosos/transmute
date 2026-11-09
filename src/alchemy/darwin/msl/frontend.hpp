@@ -35,8 +35,9 @@ struct ClangOutput {
 // With `pch` (a prelude PCH from build_pch, which includes metal_stdlib), the
 // source is compiled after it instead; when clang refuses that PCH the result
 // has pch_rejected set and nothing else is tried.
+// `syntax_only`: clang -fsyntax-only instead (outline(): diagnostics, no IR).
 [[nodiscard]] ClangOutput compile_to_ir(std::string_view source, const CompileOptions& options,
-                                        const std::filesystem::path& pch = {});
+                                        const std::filesystem::path& pch = {}, bool syntax_only = false);
 // Precompiles `header` (text, read from stdin by clang, so no file has to stay
 // unchanged for the PCH to remain valid) with the IR compile's arguments
 // into `output` (written under a private name and renamed).

@@ -175,7 +175,9 @@ struct RewriteResult {
     std::vector<Diagnostic> diagnostics;
 };
 
-// `preprocessed`: clang -E output of the library source.
-[[nodiscard]] RewriteResult rewrite(std::string_view preprocessed);
+// `preprocessed`: clang -E output of the library source. Every entry point is
+// checked; when `only` is not empty, only those entry points get wrappers and
+// are in RewriteResult::entries (lazy compiles).
+[[nodiscard]] RewriteResult rewrite(std::string_view preprocessed, const std::vector<std::string>& only = {});
 
 } // namespace alchemy::msl::detail

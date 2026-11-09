@@ -878,6 +878,32 @@ void test_reflection() {
         require(!vertex.success(), "[[patch_id]] outside a [[patch]] function is an error");
     }
     {
+        // Lazy libraries: outline() names every entry point without
+        // compiling one; compile() with entries compiles just those.
+        const std::string source = "#include <metal_stdlib>\nusing namespace metal;\n"
+                                   "kernel void a(device uint* p [[buffer(0)]]) { p[0] = 1; }\n"
+                                   "kernel void b(device uint* p [[buffer(0)]], uint i [[thread_position_in_grid]]) { p[i] = i; }\n"
+                                   "kernel void c(device double* p [[buffer(0)]]) { p[0] = 1.0; }\n";
+        const auto outline = msl::outline(source, {});
+        require(outline.success() && outline.functions.size() == 3 && outline.functions[1].name == "b" &&
+                    outline.functions[1].stage == Stage::kernel && outline.functions[1].spirv.empty(),
+                "outline: every entry point, no SPIR-V (c's double fails only when compiled)");
+        msl::CompileOptions only_b;
+        only_b.entries = {"b"};
+        const auto b = msl::compile(source, only_b);
+        require(b.success() && b.functions.size() == 1 && b.functions[0].name == "b" && !b.functions[0].spirv.empty(),
+                "compile with entries: just that function");
+        validate_spirv(b.functions[0].spirv, "lazy.b");
+        msl::CompileOptions only_c;
+        only_c.entries = {"c"};
+        require(!msl::compile(source, only_c).success(), "a lowering failure stays with its function");
+        msl::CompileOptions missing;
+        missing.entries = {"nope"};
+        require(!msl::compile(source, missing).success(), "an unknown entry point is an error");
+        const auto broken = msl::outline("kernel void k(device uint* p [[buffer(0)]]) { p[0] = undeclared; }\n", {});
+        require(!broken.success(), "outline reports the library's clang errors");
+    }
+    {
         // Compiler breadth (M3): implicit indices, enumerators as function
         // constant indices, program-scope builtins.
         const auto r = compile_fixture("kernel_breadth.metal");

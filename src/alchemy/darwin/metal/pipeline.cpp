@@ -272,10 +272,30 @@ ShaderLibrary::ShaderLibrary(std::shared_ptr<Device> owner, std::vector<msl::Fun
     for (auto& function : list) functions.push_back(std::make_shared<const msl::Function>(std::move(function)));
 }
 
+ShaderLibrary::ShaderLibrary(std::shared_ptr<Device> owner, std::string source, msl::CompileOptions options,
+                             std::vector<msl::Function> outline)
+    : device(std::move(owner)), lazy_(true), source_(std::move(source)), options_(std::move(options)) {
+    for (auto& function : outline) functions.push_back(std::make_shared<const msl::Function>(std::move(function)));
+}
+
 std::shared_ptr<const msl::Function> ShaderLibrary::find(std::string_view name) const {
-    for (const auto& function : functions)
-        if (function->name == name) return function;
-    return nullptr;
+    const auto known = std::find_if(functions.begin(), functions.end(), [&](const auto& f) { return f->name == name; });
+    if (known == functions.end()) return nullptr;
+    if (!lazy_) return *known;
+    {
+        std::lock_guard lock(mutex_);
+        if (const auto found = compiled_.find(name); found != compiled_.end()) return found->second;
+    }
+    // Compiled outside the lock: other functions of the library compile in
+    // parallel (a first use of the same one may compile it twice).
+    auto options = options_;
+    options.entries = {std::string(name)};
+    auto result = msl::compile(source_, options);
+    if (!result.success()) throw std::runtime_error(msl::format_diagnostics(result.diagnostics));
+    if (result.functions.size() != 1) throw std::runtime_error("the MSL compiler returned no function " + std::string(name));
+    auto function = std::make_shared<const msl::Function>(std::move(result.functions.front()));
+    std::lock_guard lock(mutex_);
+    return compiled_.try_emplace(std::string(name), std::move(function)).first->second;
 }
 
 // ---- layouts --------------------------------------------------------------------------

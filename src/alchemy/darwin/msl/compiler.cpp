@@ -98,8 +98,13 @@ CompileResult compile_uncached(std::string_view source, const CompileOptions& op
         return result;
     }
     keep(source, options, ".pre", preprocessed.output);
-    auto rewritten = detail::rewrite(preprocessed.output);
+    auto rewritten = detail::rewrite(preprocessed.output, options.entries);
     timer.mark("rewrite");
+    for (const auto& name : options.entries) {
+        const bool found = std::any_of(rewritten.entries.begin(), rewritten.entries.end(),
+                                       [&](const detail::EntryPoint& entry) { return entry.name == name; });
+        if (!found) result.diagnostics.push_back(error("no entry point named '" + name + "'"));
+    }
     keep(source, options, ".rewritten.cpp", rewritten.source);
     append(result.diagnostics, std::move(rewritten.diagnostics));
     if (has_error(result.diagnostics)) return result;
@@ -201,6 +206,46 @@ CompileResult compile(std::string_view source, const CompileOptions& options) {
     if (!toolchain().available) throw std::runtime_error("MSL compiler toolchain unavailable: " + toolchain().error);
     perf::Scope timed(perf::msl_compile_ticks, perf::msl_compiles);
     auto result = compile_uncached(source, options);
+    detail::cache_store(key, result);
+    return result;
+}
+
+CompileResult outline(std::string_view source, const CompileOptions& options) {
+    CompileOptions outline_options = options;
+    outline_options.entries = {"\x1foutline"};   // its own cache entry
+    const auto key = detail::cache_key(source, outline_options);
+    if (auto cached = detail::cache_lookup(key)) return std::move(*cached);
+    (void)dump_source(source, options);
+    if (!toolchain().available) throw std::runtime_error("MSL compiler toolchain unavailable: " + toolchain().error);
+    CompileResult result;
+    PhaseTimer timer(options);
+    const auto preprocessed = detail::preprocess(source, options);
+    timer.mark("preprocess");
+    append(result.diagnostics, preprocessed.diagnostics);
+    if (!preprocessed.ok) {
+        if (!has_error(result.diagnostics)) result.diagnostics.push_back(error("preprocessing failed"));
+        return result;
+    }
+    auto rewritten = detail::rewrite(preprocessed.output);
+    timer.mark("rewrite");
+    append(result.diagnostics, std::move(rewritten.diagnostics));
+    if (has_error(result.diagnostics)) return result;
+    // Semantic analysis only: the whole library's errors, without optimizing
+    // or lowering any entry point.
+    const auto checked = detail::compile_to_ir(rewritten.source, options, {}, true);
+    timer.mark("clang -fsyntax-only");
+    append(result.diagnostics, checked.diagnostics);
+    if (!checked.ok) {
+        if (!has_error(result.diagnostics)) result.diagnostics.push_back(error("compilation failed"));
+        return result;
+    }
+    for (const auto& entry : rewritten.entries) {
+        Function function;
+        function.name = entry.name;
+        function.stage = entry.stage;
+        function.reflection.stage = entry.stage;
+        result.functions.push_back(std::move(function));
+    }
     detail::cache_store(key, result);
     return result;
 }

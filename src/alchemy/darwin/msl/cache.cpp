@@ -177,6 +177,7 @@ std::string cache_key(std::string_view source, const CompileOptions& options) {
     field(std::to_string(options.vulkan_major) + "." + std::to_string(options.vulkan_minor));
     field(std::to_string(options.subgroup_size));
     field(options.debug_info ? "debug" : "");
+    for (const auto& entry : options.entries) field("entry:" + entry);
     field(hex(fnv1a(source)) + ":" + std::to_string(source.size()));
     return key;
 }

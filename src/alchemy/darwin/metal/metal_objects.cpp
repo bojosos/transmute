@@ -1653,7 +1653,13 @@ Address new_function(LibraryState& library, Address device, std::string_view nam
         value->specialized = values != nullptr;
         return runtime().create(classes.function, std::move(value));
     }
-    const auto found = library.library->find(name);
+    std::shared_ptr<const msl::Function> found;
+    try {
+        found = library.library->find(name);   // a lazy library compiles it now
+    } catch (const std::exception& failure) {
+        error = failure.what();
+        return 0;
+    }
     if (!found) { error = "Function " + std::string(name) + " was not found in the library"; return 0; }
     auto function = std::make_shared<ShaderFunction>(library.library->device, found);
     if (values) {
@@ -2908,16 +2914,27 @@ void install_device() {
             return 0;
         }
         static_cast<void>(msl::dump_source(text, settings));
+        // A large source is outlined first (its errors still surface here);
+        // with many entry points it becomes a lazy library whose functions
+        // compile on first use (msl::outline).
+        constexpr std::size_t lazy_source_size = 256 * 1024;
         msl::CompileResult result;
+        bool lazy = false;
         try {
-            result = msl::compile(text, settings);
+            if (text.size() > lazy_source_size) {
+                result = msl::outline(text, settings);
+                lazy = result.success() && result.functions.size() > msl::lazy_entry_threshold;
+            }
+            if (!lazy && result.success()) result = msl::compile(text, settings);
         } catch (const std::exception& failure) {
             error = std::string("Alchemy MSL compiler: ") + failure.what();
             return 0;
         }
         if (!result.success()) { error = msl::format_diagnostics(result.diagnostics); return 0; }
         auto value = std::make_shared<LibraryState>();
-        value->library = std::make_shared<ShaderLibrary>(device_of_object(device), std::move(result.functions));
+        value->library = lazy ? std::make_shared<ShaderLibrary>(device_of_object(device), std::move(text), settings,
+                                                                std::move(result.functions))
+                              : std::make_shared<ShaderLibrary>(device_of_object(device), std::move(result.functions));
         value->device = device;
         return r.create(classes.library, std::move(value));
     };

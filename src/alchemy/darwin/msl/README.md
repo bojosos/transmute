@@ -357,6 +357,15 @@ compare-exchange through the bits) and clang's `bitcast <3 x i32> to
 `always_inline`. `ALCHEMY_MSL_ENTRY=<text>` (diagnostics) compiles only the
 entry points whose name contains the text, and `ALCHEMY_MSL_TIMING=1` also
 prints each entry point's lowering time.
+**Lazy libraries:** `outline()` checks a whole source (preprocessor, rewriter,
+clang `-fsyntax-only`) and lists its entry points without compiling one;
+`compile()` with `CompileOptions::entries` compiles only those (the rewriter
+checks every entry point but emits wrappers for the selected ones; the
+entries are part of the cache key). Metal (A5) outlines sources over 256 KB and
+makes those with more than `lazy_entry_threshold` (16) entry points lazy
+libraries whose functions compile on first use; a function the lowering
+refuses then fails alone, at newFunctionWithName:.
+
 ## Tests
 
 `alchemy_msl_tests <group>` (ctest `alchemy_msl_*`): `rewriter`, `fixtures`

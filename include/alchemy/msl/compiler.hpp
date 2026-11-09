@@ -169,6 +169,10 @@ struct CompileOptions {
     std::uint32_t vulkan_major{1}, vulkan_minor{3};   // SPIR-V 1.6 for Vulkan 1.3
     std::uint32_t subgroup_size{32};      // simdgroup width the device guarantees (threadExecutionWidth)
     bool debug_info{false};               // OpLine / OpName for RenderDoc
+    // Lazy libraries: when not empty, only these entry points are compiled
+    // (the rest of the source is still parsed); see outline(). Part of the
+    // cache key.
+    std::vector<std::string> entries;
 };
 
 // ---- types -----------------------------------------------------------------------------
@@ -444,6 +448,18 @@ struct CompileResult {
 // Compiles one MTLLibrary's source. See the header comment for the rules.
 [[nodiscard]] CompileResult compile(std::string_view source, const CompileOptions& options);
 
+// Lazy libraries. A large library's functions are compiled one at a time on
+// first use: a renderer's kernel library has hundreds of kernels that each
+// inline most of the library, so compiling them all up front takes hours.
+// outline() checks the whole source as compile() does up to clang's
+// semantic analysis (preprocessor, rewriter, clang -fsyntax-only): its
+// diagnostics are the library's compile errors, and its functions carry a
+// name and stage but no SPIR-V or reflection. compile() with
+// CompileOptions::entries then compiles just those entry points. Failures
+// the lowering finds stay with the function that has them.
+[[nodiscard]] CompileResult outline(std::string_view source, const CompileOptions& options);
+// Libraries with more entry points than this compile lazily (A5).
+inline constexpr std::size_t lazy_entry_threshold = 16;
 // Makes a vertex and a fragment function of one render pipeline agree on
 // varying locations: returns copies whose SPIR-V Location decorations match
 // by varying name. Fragment inputs the vertex stage does not write are an

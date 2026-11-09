@@ -325,14 +325,12 @@ public:
         }
     }
 
+    void select(const std::vector<std::string>& only) { only_ = only; }
+
     RewriteResult run() {
         parse_scope(0, sig_.size(), {}, true);
         rename_derived_uses();
-        // ALCHEMY_MSL_ENTRY=<text> (diagnostics): only entry points whose name
-        // contains it get wrappers, so clang and the lowering see just those.
-        static const std::string only = environment("ALCHEMY_MSL_ENTRY");
-        for (auto& entry : pending_entries_)
-            if (only.empty() || entry.name.find(only) != std::string::npos) build_entry(entry);
+        for (auto& entry : pending_entries_) build_entry(entry);
         rename_tokens();
         wrap_conditionals();
         RewriteResult result;
@@ -372,8 +370,21 @@ public:
         out += user_code_end;
         out += "# 1 \"<alchemy-msl-entry>\"\n";
         out += wrappers_.str();
+        // Every entry point is checked; only the selected ones get their
+        // extern "C" wrapper, so clang and the lowering see just those: the
+        // lazy compile's entries, or (diagnostics) ALCHEMY_MSL_ENTRY=<text>,
+        // the entry points whose name contains the text.
+        static const std::string only = environment("ALCHEMY_MSL_ENTRY");
+        std::vector<EntryPoint> selected;
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            const auto& name = entries_[i].name;
+            if (!only_.empty() && std::find(only_.begin(), only_.end(), name) == only_.end()) continue;
+            if (!only.empty() && name.find(only) == std::string::npos) continue;
+            out += entry_wrappers_[i];
+            selected.push_back(std::move(entries_[i]));
+        }
         result.source = std::move(out);
-        result.entries = std::move(entries_);
+        result.entries = std::move(selected);
         result.function_constants = std::move(constants_);
         result.threadgroup_variables = threadgroup_ids_;
         result.diagnostics = std::move(diagnostics_);
@@ -406,6 +417,8 @@ private:
     std::vector<EntryPoint> entries_;
     std::vector<Diagnostic> diagnostics_;
     std::ostringstream wrappers_;
+    std::vector<std::string> entry_wrappers_;   // per entries_ element
+    std::vector<std::string> only_;             // the lazy compile's entry points (empty: all)
     std::uint32_t threadgroup_ids_{};
     std::set<std::size_t> keep_identifier_;     // tokens exempt from keyword renaming
     // Type aliases at namespace and class scope (`using ivec2 = int2;`,
@@ -1893,7 +1906,7 @@ private:
         for (std::size_t a = 0; a < args.size(); ++a) body << (a ? ", " : "") << args[a];
         body << ");\n";
         if (returns) outputs(entry, pending.return_type, body);
-        wrappers_ << "extern \"C\" void " << entry.wrapper << "() {\n" << body.str() << "}\n";
+        entry_wrappers_.push_back("extern \"C\" void " + entry.wrapper + "() {\n" + body.str() + "}\n");
         entries_.push_back(std::move(entry));
     }
 
@@ -2457,8 +2470,10 @@ TypeSpelling parse_type_spelling(std::string_view input) {
     return result;
 }
 
-RewriteResult rewrite(std::string_view preprocessed) {
-    return Rewriter(preprocessed).run();
+RewriteResult rewrite(std::string_view preprocessed, const std::vector<std::string>& only) {
+    Rewriter rewriter(preprocessed);
+    rewriter.select(only);
+    return rewriter.run();
 }
 
 } // namespace alchemy::msl::detail
