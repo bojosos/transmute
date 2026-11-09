@@ -26,6 +26,11 @@ module CoreMedia [system] {
   export *
 }
 
+module CoreMediaIO [system] {
+  header "AlchemyCoreMediaIO.h"
+  export *
+}
+
 module AVFoundation [system] {
   header "AlchemyAVFoundation.h"
   export *

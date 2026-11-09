@@ -538,6 +538,10 @@ $extraOverlays = @(
     [ordered]@{ Module = 'CoreMedia'; Library = 'swiftCoreMedia'; Source = "$qlabSwift/CoreMedia"
         Install = '/usr/lib/swift/libswiftCoreMedia.dylib'; File = 'libswiftCoreMedia.dylib'
         Dependencies = @(); IncludeDirectory = "$qlabSwift/include" },
+    # libswiftCoreMediaIO: the camera-extension classes' Swift members (OBS's camera extension).
+    [ordered]@{ Module = 'CoreMediaIO'; Library = 'swiftCoreMediaIO'; Source = "$qlabSwift/CoreMediaIO"
+        Install = '/usr/lib/swift/libswiftCoreMediaIO.dylib'; File = 'libswiftCoreMediaIO.dylib'
+        Dependencies = @('libswiftFoundation.dylib', 'libswiftCoreMedia.dylib'); IncludeDirectory = "$qlabSwift/include" },
     [ordered]@{ Module = 'AVFoundation'; Library = 'swiftAVFoundation'; Source = "$qlabSwift/AVFoundation"
         Install = '/usr/lib/swift/libswiftAVFoundation.dylib'; File = 'libswiftAVFoundation.dylib'
         Dependencies = @('libswiftFoundation.dylib'); IncludeDirectory = "$qlabSwift/include" },

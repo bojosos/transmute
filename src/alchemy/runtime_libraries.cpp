@@ -21,7 +21,7 @@ constexpr std::string_view icu_source = "https://github.com/unicode-org/icu";
 
 constexpr std::string_view swift_source = "https://github.com/swiftlang/swift";
 
-constexpr std::array<RuntimeLibraryIdentity, 29> identities{{
+constexpr std::array<RuntimeLibraryIdentity, 30> identities{{
     {"/usr/lib/libc++.1.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libc++abi.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
     {"/usr/lib/libunwind.dylib", llvm_source, "scripts/build_alchemy_llvm.ps1", true},
@@ -61,6 +61,7 @@ constexpr std::array<RuntimeLibraryIdentity, 29> identities{{
     {"/usr/lib/swift/libswiftCoreAudio.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     {"/usr/lib/swift/libswiftCoreMIDI.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     {"/usr/lib/swift/libswiftCoreMedia.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
+    {"/usr/lib/swift/libswiftCoreMediaIO.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
     // Metal overlay (metal-parity M8).
     {"/usr/lib/swift/libswiftMetal.dylib", swift_source, "scripts/build_alchemy_swift.ps1", false},
 }};
