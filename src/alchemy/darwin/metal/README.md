@@ -151,6 +151,18 @@ encoded. supportIndirectCommandBuffers is YES for native (MSL) pipelines.
 Stops: GPU encoding (an ICB in an argument buffer, MSL command_buffer), ranges
 read from a GPU buffer (executeCommandsInBuffer:indirectBuffer:...), metallib
 pipelines, kernel stage-in regions and imageblocks.
+**MetalKit's MTKView** (metalkit.cpp): an NSView subclass (AppKit's, so
+applications subclass it) backed by QuartzCore's CAMetalLayer through
+-makeBackingLayer. Each frame -draw sets currentDrawable and
+currentRenderPassDescriptor (colour clear, the depth/stencil and multisample
+textures the view owns for depthStencilPixelFormat and sampleCount) and calls
+-drawRect:, whose MTKView implementation forwards to the delegate's
+-drawInMTKView:; a subclass's override draws itself. Frames come from a
+run-loop timer at preferredFramesPerSecond while the view is in a window and
+neither paused nor in setNeedsDisplay mode (then AppKit's -drawRect: draws).
+With autoResizeDrawable the drawable follows bounds x contentsScale and the
+delegate hears -mtkView:drawableSizeWillChange:. Fixture:
+alchemy_gui_metalkit_view (cloaked).
 ## Moved from darwin/identities/
 
 * `stage_input_output_shell.cpp`: the MTLStageInputOutputDescriptor shell (the support kit).

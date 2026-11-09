@@ -137,6 +137,32 @@ function(alchemy_gui_metal_tests)
     alchemy_gui_add_fixture_test(alchemy_metal_probe "${macos_dir}/metal_probe"
         PROGRESS "Alchemy Metal probe: (device|no device)"
         COMPLETE "Alchemy Metal probe: (triangle drawn.*Alchemy Metal probe: done|no device)")
+    # MetalKit's MTKView (metalkit.cpp): a delegate drawing on the view's own
+    # frames (clear colour, depth attachment, read back), a resize the delegate
+    # hears, and a paused subclass drawing in -drawRect: on -draw. Fully
+    # cloaked and loopback-only. MetalKit gets its own link stub here.
+    alchemy_gui_object(link_metalkit link_metalkit.m)
+    add_custom_command(OUTPUT "${macos_dir}/link_metalkit.dylib"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -dylib
+            -install_name /System/Library/Frameworks/MetalKit.framework/Versions/A/MetalKit "${macos_dir}/link_metalkit.o"
+            "${macos_dir}/link_appkit.dylib" "${macos_dir}/link_objc.dylib" "${macos_dir}/link_foundation.dylib"
+            -o "${macos_dir}/link_metalkit.dylib"
+        DEPENDS "${macos_dir}/link_metalkit.o" "${macos_dir}/link_appkit.dylib" VERBATIM)
+    alchemy_gui_object(gui_metalkit_view gui_metalkit_view.m)
+    set(metalkit_libc "${macos_dir}/gui_link_libc.dylib")   # quartzcore.cmake's stdio stub
+    add_custom_command(OUTPUT "${macos_dir}/gui_metalkit_view"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main -rpath @loader_path
+            "${macos_dir}/gui_metalkit_view.o" ${ALCHEMY_GUI_LINK_STUBS} "${metalkit_libc}" "${macos_dir}/link_metalkit.dylib"
+            -o "${macos_dir}/gui_metalkit_view"
+        DEPENDS "${macos_dir}/gui_metalkit_view.o" ${ALCHEMY_GUI_LINK_STUBS} "${macos_dir}/link_metalkit.dylib" VERBATIM)
+    add_custom_target(alchemy_metalkit_fixtures ALL DEPENDS "${macos_dir}/gui_metalkit_view")
+    # gui_link_libc.dylib comes from the quartzcore fixtures (registered later, same condition).
+    add_dependencies(alchemy_metalkit_fixtures alchemy_gui_link_stubs alchemy_gui_quartzcore_fixtures)
+    alchemy_gui_add_fixture_test(alchemy_gui_metalkit_view "${macos_dir}/gui_metalkit_view"
+        PROGRESS "gui_metalkit_view: start"
+        COMPLETE "gui_metalkit_view: frame 3.*readback centre=0,0,255,255 corner=255,0,0,255.*depth=1.*size (400x300|800x600).*subclass centre=0,255,0,255 corner=0,255,0,255.*gui_metalkit_view: done")
+    set_tests_properties(alchemy_gui_metalkit_view PROPERTIES
+        ENVIRONMENT "ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback")
 endfunction()
 alchemy_gui_register_tests(alchemy_gui_metal_tests)
 

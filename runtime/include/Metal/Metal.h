@@ -172,6 +172,8 @@ typedef void (^MTLCommandBufferHandler)(id<MTLCommandBuffer> buffer);
 @interface MTLRenderPassDescriptor : NSObject
 + (MTLRenderPassDescriptor *)renderPassDescriptor;
 - (MTLRenderPassColorAttachmentDescriptorArray *)colorAttachments;
+/* The depth attachment (its texture, MTLRenderPassAttachmentDescriptor). */
+- (id)depthAttachment;
 @end
 @interface MTLRenderPipelineColorAttachmentDescriptor : NSObject
 - (void)setPixelFormat:(MTLPixelFormat)format;
@@ -183,6 +185,7 @@ typedef void (^MTLCommandBufferHandler)(id<MTLCommandBuffer> buffer);
 - (void)setVertexFunction:(id<MTLFunction>)function;
 - (void)setFragmentFunction:(id<MTLFunction>)function;
 - (MTLRenderPipelineColorAttachmentDescriptorArray *)colorAttachments;
+- (void)setDepthAttachmentPixelFormat:(MTLPixelFormat)format;
 @end
 @interface MTLTextureDescriptor : NSObject
 + (MTLTextureDescriptor *)texture2DDescriptorWithPixelFormat:(MTLPixelFormat)format width:(NSUInteger)width
