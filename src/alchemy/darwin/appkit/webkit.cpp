@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/completion/graphics/providers.hpp"
+#include "alchemy/darwin/kit/completion/runtime/common.hpp"
 
 #include "alchemy/darwin/quartzcore/graphics_support.hpp"
 
@@ -119,6 +120,40 @@ void install_webkit(Support& support) {
             bag_set_raw(*sp, s.x[0], "isPersistent", {0, 0, 0, 0});
         }
     }, "@@:@");
+
+    // ---- WKContentRuleListStore: no content rule lists (OBS) ---------------------------------
+    // There is no engine to apply a rule list to, so none is compiled or
+    // found. The completion handlers run before the call returns, with the
+    // WKErrorDomain errors WKErrorContentRuleListStoreCompileFailed (6),
+    // ...LookUpFailed (7) and ...RemoveFailed (8); the identifier list is empty.
+    const auto rule_store = support.declare_class("WKContentRuleListStore", "NSObject", webkit_library);
+    auto default_rule_store = std::make_shared<Address>(0);
+    support.method(rule_store, "defaultStore", [sp, rule_store, default_rule_store](CpuState& s, GuestMemory&) {
+        if (!*default_rule_store) {
+            *default_rule_store = sp->send_id(sp->send_id(rule_store, "alloc"), "init");
+            if (const auto record = sp->process.objects().find(*default_rule_store)) record->immortal = true;
+        }
+        s.x[0] = *default_rule_store;
+    }, "@@:", true);
+    support.method(rule_store, "storeWithURL:", [sp, rule_store](CpuState& s, GuestMemory&) {
+        s.x[0] = sp->send_id(sp->send_id(sp->send_id(rule_store, "alloc"), "init"), "autorelease");
+    }, "@@:@", true);
+    const auto rule_error = [sp](std::int64_t code, std::string_view what) {
+        return rt::error(*sp, "WKErrorDomain", code, std::string(what) + ": Alchemy has no web engine, so there are no content rule lists");
+    };
+    // (identifier, encodedContentRuleList, completionHandler(WKContentRuleList *, NSError *))
+    support.method(rule_store, "compileContentRuleListForIdentifier:encodedContentRuleList:completionHandler:", [sp, rule_error](CpuState& s, GuestMemory&) {
+        if (s.x[4]) static_cast<void>(rt::invoke_block(*sp, s.x[4], {0, rule_error(6, "compiling a content rule list")}));
+    }, "v@:@@@?");
+    support.method(rule_store, "lookUpContentRuleListForIdentifier:completionHandler:", [sp, rule_error](CpuState& s, GuestMemory&) {
+        if (s.x[3]) static_cast<void>(rt::invoke_block(*sp, s.x[3], {0, rule_error(7, "looking up a content rule list")}));
+    }, "v@:@@?");
+    support.method(rule_store, "removeContentRuleListForIdentifier:completionHandler:", [sp, rule_error](CpuState& s, GuestMemory&) {
+        if (s.x[3]) static_cast<void>(rt::invoke_block(*sp, s.x[3], {rule_error(8, "removing a content rule list")}));
+    }, "v@:@@?");
+    support.method(rule_store, "getAvailableContentRuleListIdentifiers:", [sp](CpuState& s, GuestMemory&) {
+        if (s.x[2]) static_cast<void>(rt::invoke_block(*sp, s.x[2], {rt::array(*sp, std::span<const Address>{})}));
+    }, "v@:@?");
 
     // ---- WKUserScript, WKUserContentController ------------------------------------------------
     const auto script = support.declare_class("WKUserScript", "NSObject", webkit_library);

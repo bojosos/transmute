@@ -623,6 +623,27 @@ void AppKit::install_application() {
         for (const auto target : targets) static_cast<void>(send_optional(target, "update"));
     }, "v@:");
     method(a, "setWindowsNeedUpdate:", [](CpuState&, GuestMemory&) {}, "v@:B");
+    // Help-menu search handlers (NSUserInterfaceItemSearching): registered
+    // handlers are kept (+1) until unregistered. The Help menu's search never
+    // queries them here (there is no Help-menu search field).
+    auto search_handlers = std::make_shared<std::vector<Address>>();
+    method(a, "registerUserInterfaceItemSearchHandler:", [this, search_handlers](CpuState& s, GuestMemory&) {
+        if (!s.x[2]) return;
+        std::lock_guard lock(mutex);
+        if (std::find(search_handlers->begin(), search_handlers->end(), s.x[2]) == search_handlers->end())
+            search_handlers->push_back(retain(s.x[2]));
+    }, "v@:@");
+    method(a, "unregisterUserInterfaceItemSearchHandler:", [this, search_handlers](CpuState& s, GuestMemory&) {
+        Address removed{};
+        {
+            std::lock_guard lock(mutex);
+            const auto found = std::find(search_handlers->begin(), search_handlers->end(), s.x[2]);
+            if (found == search_handlers->end()) return;
+            removed = *found;
+            search_handlers->erase(found);
+        }
+        release(removed);
+    }, "v@:@");
     // The standard About panel: the application's name, version, copyright
     // and credits, from the options (NSAboutPanelOption* keys) else the
     // main bundle, shown as an alert with the application icon.

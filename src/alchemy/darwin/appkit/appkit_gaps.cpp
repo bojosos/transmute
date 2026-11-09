@@ -323,6 +323,34 @@ void Provider::install_appkit() {
     method(item, "view", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     const auto custom_item = cls(appkit, "NSCustomTouchBarItem", "NSTouchBarItem");
     object_properties(custom_item, {"identifier", "customizationLabel", "view", "viewController"});
+    // TextKit 2 content storage (OBS): the text lives in an NSTextStorage
+    // (made on first use) that -attributedString answers, with the delegate
+    // kept. TextKit 2 layout (NSTextLayoutManager) is not provided, so the
+    // content manager has no layout managers and adding one stops explicitly.
+    const auto content_manager = cls(appkit, "NSTextContentManager", "NSObject");
+    weak_properties(content_manager, {"delegate"});
+    method(content_manager, "textLayoutManagers", [this](CpuState& s, GuestMemory&) {
+        s.x[0] = objc.send(objc.send(objc.find_class("NSArray"), objc.selector("array")).x0, objc.selector("self")).x0;
+    });
+    method(content_manager, "addTextLayoutManager:", [](CpuState&, GuestMemory&) {
+        throw std::runtime_error("unsupported: Alchemy: -[NSTextContentManager addTextLayoutManager:] (TextKit 2 layout is not provided)");
+    }, false, "v@:@");
+    const auto content_storage = cls(appkit, "NSTextContentStorage", "NSTextContentManager");
+    const auto text_storage_of = [this](Address self) {
+        auto value = stored(self, "textStorage");
+        if (!value) {
+            if (const auto storage_class = objc.find_class("NSTextStorage")) {
+                const auto made = create(storage_class);
+                store(self, "textStorage", made);
+                objc.send(made, objc.selector("release"));
+                value = made;
+            }
+        }
+        return value;
+    };
+    method(content_storage, "textStorage", [text_storage_of](CpuState& s, GuestMemory&) { s.x[0] = text_storage_of(s.x[0]); });
+    method(content_storage, "setTextStorage:", [this](CpuState& s, GuestMemory&) { store(s.x[0], "textStorage", s.x[2]); }, false, "v@:@");
+    method(content_storage, "attributedString", [text_storage_of](CpuState& s, GuestMemory&) { s.x[0] = text_storage_of(s.x[0]); });
     // Touch Bars are never shown (no Touch Bar), so the sharing item only keeps its settings.
     const auto sharing_item = cls(appkit, "NSSharingServicePickerTouchBarItem", "NSTouchBarItem");
     object_properties(sharing_item, {"identifier", "customizationLabel", "delegate", "buttonTitle", "buttonImage"});

@@ -1588,6 +1588,38 @@ void AppKit::install_resources() {
         cg_color_spaces.emplace(state->name, space);
         s.x[0] = space;
     }, "^v@:");
+    // NSSecureCoding (Pika archives its color space into NSUserDefaults). A
+    // named space archives its CoreGraphics name (and model) under Alchemy's
+    // keys and decodes back to the same singleton; an unnamed space decodes to
+    // a space of its model. Archives round-trip between Alchemy processes:
+    // macOS's own keys for color spaces are not documented, so an archive
+    // without Alchemy's keys stops explicitly instead of being guessed.
+    objc.add_native_protocol(cs, "NSSecureCoding");
+    class_method(cs, "supportsSecureCoding", [](CpuState& s, GuestMemory&) { s.x[0] = 1; }, "B@:");
+    method(cs, "encodeWithCoder:", [this](CpuState& s, GuestMemory&) {
+        const auto state = objc.host_state<ColorSpaceState>(s.x[0]);
+        static_cast<void>(send_id(s.x[2], "encodeObject:forKey:", {auto_string(state->name), auto_string("AlchemyColorSpaceName")}));
+        static_cast<void>(send_id(s.x[2], "encodeInteger:forKey:", {static_cast<Address>(state->model), auto_string("AlchemyColorSpaceModel")}));
+    }, "v@:@");
+    method(cs, "initWithCoder:", [this](CpuState& s, GuestMemory&) {
+        const auto self = s.x[0], coder = s.x[2];
+        if (!send_bool(coder, "containsValueForKey:", {auto_string("AlchemyColorSpaceModel")}))
+            unsupported("-[NSColorSpace initWithCoder:] of an archive made outside Alchemy (macOS's color space keys are not documented)");
+        const auto name_object = send_id(coder, "decodeObjectOfClass:forKey:", {objc.find_class("NSString"), auto_string("AlchemyColorSpaceName")});
+        const auto name = name_object ? text(name_object) : std::string();
+        const auto model = static_cast<std::int64_t>(send_id(coder, "decodeIntegerForKey:", {auto_string("AlchemyColorSpaceModel")}));
+        static const std::map<std::string, const char*> singletons{
+            {"kCGColorSpaceSRGB", "sRGBColorSpace"}, {"kCGColorSpaceGenericRGB", "genericRGBColorSpace"},
+            {"kCGColorSpaceExtendedSRGB", "extendedSRGBColorSpace"}, {"kCGColorSpaceDisplayP3", "displayP3ColorSpace"}};
+        if (const auto found = singletons.find(name); found != singletons.end()) {
+            release(self);
+            s.x[0] = retain(send(color_space, found->second).x0);
+            return;
+        }
+        if (!name.empty()) unsupported("-[NSColorSpace initWithCoder:] of the color space " + name);
+        objc.host_state<ColorSpaceState>(self)->model = static_cast<decltype(ColorSpaceState::model)>(model);
+        s.x[0] = self;
+    });
 
     // ---- NSAppearance ----
     const auto ap = appearance;

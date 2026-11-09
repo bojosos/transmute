@@ -339,6 +339,21 @@ magnification 1; another magnification stops explicitly).
 NSUserDefaultsController applies changes immediately even when a nib says
 NSAppliesImmediately NO (deferred application is not modelled).
 
+**Godot, Pika, OBS:**
+* NSApplication keeps the Help-menu search handlers registered with
+  `-registerUserInterfaceItemSearchHandler:` until they are unregistered. No
+  Help-menu search field queries them.
+* NSColorSpace adopts NSSecureCoding. Named spaces archive their CoreGraphics
+  name and decode back to the same singleton; unnamed ones archive their
+  model. Archives round-trip between Alchemy processes; one made outside
+  Alchemy stops explicitly, since macOS's keys are not documented.
+* NSTextContentStorage keeps its text in an NSTextStorage. TextKit 2 layout is
+  not provided, so a content manager has no layout managers and adding one
+  stops explicitly.
+* WebKit's WKContentRuleListStore has no rule lists: compiling, looking up and
+  removing one give the documented WKErrorDomain errors, and the identifier
+  list is empty.
+
 **The media apps' names (VLC, mpv, OBS, Firefox; Krita):**
 * NSBeginInformationalAlertSheet and NSBeginCriticalAlertSheet run like
   NSBeginAlertSheet, with their alert styles.

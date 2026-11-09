@@ -203,6 +203,36 @@ void media(Fixture& f) {
     for (std::uint64_t i = 0; i < f.call(cf, "_CFArrayGetCount", {tags}); ++i) cmap = cmap || f.call(cf, "_CFArrayGetValueAtIndex", {tags, i}) == 0x636d6170;
     require(cmap, "CGFontCopyTableTags lists cmap");
     require(f.call(cg, "_CGFontCopyVariationAxes", {font}) == 0, "font variations are not modelled");
+    // Pika: NSColorSpace archives securely and decodes back to the same named space.
+    const auto srgb = f.send(f.cls("NSColorSpace"), "sRGBColorSpace");
+    const auto archived = f.send(f.cls("NSKeyedArchiver"), "archivedDataWithRootObject:requiringSecureCoding:error:", {srgb, 1, 0});
+    require(archived != 0, "an NSColorSpace archives with secure coding");
+    const auto unarchived = f.send(f.cls("NSKeyedUnarchiver"), "unarchivedObjectOfClass:fromData:error:", {f.cls("NSColorSpace"), archived, 0});
+    require(unarchived == srgb, "and unarchives to the sRGB color space");
+    // Godot: Help-menu search handlers are kept (retained) until unregistered.
+    const auto app = f.send(f.cls("NSApplication"), "sharedApplication");
+    const auto handler = f.send(f.send(f.cls("NSObject"), "alloc"), "init");
+    const auto count_before = f.send(handler, "retainCount");
+    static_cast<void>(f.send(app, "registerUserInterfaceItemSearchHandler:", {handler}));
+    require(f.send(handler, "retainCount") == count_before + 1, "the search handler is kept");
+    static_cast<void>(f.send(app, "unregisterUserInterfaceItemSearchHandler:", {handler}));
+    require(f.send(handler, "retainCount") == count_before, "and released when unregistered");
+    // OBS: TextKit 2 content storage (no layout managers) and WebKit's rule list store (no rule lists).
+    const auto content = f.send(f.send(f.cls("NSTextContentStorage"), "alloc"), "init");
+    const auto storage = f.send(content, "textStorage");
+    require(storage && f.send(content, "attributedString") == storage && f.cf.length(f.send(content, "textLayoutManagers")) == 0,
+            "NSTextContentStorage");
+    bool stopped = false;
+    try { static_cast<void>(f.send(content, "addTextLayoutManager:", {0})); } catch (const std::exception&) { stopped = true; }
+    require(stopped, "TextKit 2 layout stops explicitly");
+    const auto bridge = alchemy::gui::security::bridge();
+    std::int64_t lookup_code = 0;
+    const auto lookup = bridge->make_block([&](transmute::CpuState& s, transmute::GuestMemory&) {
+        lookup_code = s.x[1] == 0 && s.x[2] ? static_cast<std::int64_t>(f.send(s.x[2], "code")) : -1;
+    });
+    static_cast<void>(f.send(f.send(f.cls("WKContentRuleListStore"), "defaultStore"), "lookUpContentRuleListForIdentifier:completionHandler:",
+                             {f.cf.string("rules"), lookup}));
+    require(lookup_code == 7, "no content rule list is found (WKErrorContentRuleListStoreLookUpFailed)");
     // Inkscape and LibreOffice: no ATS platform font maps to a CGFont; LibreOffice's dispatcher target.
     require(f.call(cg, "_CGFontCreateWithPlatformFont", {f.block(8)}) == 0, "CGFontCreateWithPlatformFont");
     const auto dispatcher = f.call(carbon, "_GetEventDispatcherTarget");
