@@ -38,6 +38,7 @@
 #include "alchemy/engine_adapter.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/perf.hpp"
+#include "alchemy/released_ranges.hpp"
 #undef ReferenceEngine
 
 namespace transmute {
@@ -101,6 +102,14 @@ void release_if_overlaps(std::uint64_t base, std::uint64_t size) noexcept {
 [[noreturn]] void memory_fault(const char* operation, std::uint64_t address) {
     std::ostringstream message;
     message << "guest memory " << operation << " fault at 0x" << std::hex << address;
+    // A stale pointer into a mapping Alchemy released: whose it was (released_ranges.hpp).
+    if (const auto released = alchemy::released_ranges::find(address)) {
+        const auto& [entry, later] = *released;
+        message << " (in a released 0x" << entry.size << "-byte mapping at 0x" << entry.address << ", freed by the call at pc 0x"
+                << entry.pc;
+        if (const auto name = alchemy::perf::address_name(entry.pc); !name.empty()) message << " (" << name << ')';
+        message << " from lr 0x" << entry.lr << std::dec << ", " << later << " releases ago)";
+    }
     throw std::runtime_error(message.str());
 }
 

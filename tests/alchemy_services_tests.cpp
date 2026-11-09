@@ -2,6 +2,7 @@
 #include "alchemy/darwin_services.hpp"
 #include "alchemy/process.hpp"
 #include "alchemy/path.hpp"
+#include "alchemy/released_ranges.hpp"
 
 #include <array>
 #include <bit>
@@ -770,9 +771,12 @@ void freed_large_blocks() {
     f.call("_free", {block});
     require(memory.read8(block + 1000) == 0x5a, "a freed 300 KiB block is still readable");
     for (int index = 0; index < 70; ++index) f.call("_free", {f.call("_malloc", {1024 * 1024})});
-    bool unmapped = false;
-    try { static_cast<void>(memory.read8(block + 1000)); } catch (const std::exception&) { unmapped = true; }
-    require(unmapped, "64 MiB of later frees unmap the oldest freed block");
+    std::string fault;
+    try { static_cast<void>(memory.read8(block + 1000)); } catch (const std::exception& error) { fault = error.what(); }
+    require(!fault.empty(), "64 MiB of later frees unmap the oldest freed block");
+    // The release is on record, for fx's fault message (released_ranges.hpp).
+    const auto released = alchemy::released_ranges::find(block + 1000);
+    require(released && released->first.address == block && released->first.size >= 300 * 1024, "the released mapping is on record");
 }
 
 int main(int argc, char** argv) {

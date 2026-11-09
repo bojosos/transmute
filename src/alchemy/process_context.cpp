@@ -4,6 +4,7 @@
 #include "alchemy/host/process.hpp"
 #include "alchemy/darwin_frameworks.hpp"
 #include "alchemy/object_store.hpp"
+#include "alchemy/released_ranges.hpp"
 #include "alchemy/perf.hpp"
 #include "alchemy/placeholder_exports.hpp"
 #include "alchemy/registration_audit.hpp"
@@ -254,6 +255,12 @@ void ProcessContext::release_guest(std::uint64_t address) {
     const auto found = allocations_.find(address);
     if (found == allocations_.end()) throw std::runtime_error("invalid Alchemy guest allocation");
     engine_.unmap_memory(address);
+    {
+        // The releasing call, for a later fault on this range (released_ranges.hpp).
+        std::uint64_t pc = 0, lr = 0;
+        try { const auto& state = calling_engine().state(); pc = state.pc; lr = state.x[30]; } catch (...) {}
+        released_ranges::record(address, found->second, pc, lr);
+    }
     allocations_.erase(found);
 }
 
