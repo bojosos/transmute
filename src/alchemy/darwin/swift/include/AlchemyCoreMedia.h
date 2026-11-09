@@ -34,4 +34,11 @@ typedef struct CMTimeRange {
     CMTime duration;
 } CMTimeRange;
 
+/* Sample buffers and the image buffers they carry (Core Foundation types). */
+typedef struct opaqueCMSampleBuffer* CMSampleBufferRef;
+typedef struct __CVBuffer* CVBufferRef;
+typedef CVBufferRef CVImageBufferRef;
+/* The sample buffer's image buffer (not retained for the caller), or NULL. */
+CVImageBufferRef CMSampleBufferGetImageBuffer(CMSampleBufferRef sbuf);
+
 #endif

@@ -8,6 +8,7 @@ and writes one assembly source per Apple system identity naming them:
   objc.s       -> /usr/lib/libobjc.A.dylib (Objective-C runtime entry points,
                   NSObject)
   foundation.s -> Foundation.framework (its Objective-C classes and NS* names)
+  coremedia.s  -> CoreMedia.framework (its CM* C functions)
   system.s -> /usr/lib/libSystem.B.dylib (everything else)
 The stubs are linked into dylibs that only give the linker two-level
 namespace bindings; they are never loaded (Alchemy's host providers serve
@@ -20,6 +21,8 @@ import sys
 OBJC = re.compile(r"^_(objc_|_objc_|class_|object_|sel_|protocol_|method_|ivar_|imp_|OBJC_CLASS_\$_NSObject$|OBJC_METACLASS_\$_NSObject$|OBJC_EHTYPE_)")
 # Other Objective-C classes (NSString, NSData, ...) are Foundation's.
 FOUNDATION = re.compile(r"^_(OBJC_CLASS_\$_|OBJC_METACLASS_\$_|NS[A-Z])")
+# CoreMedia's C API (CMSampleBufferGetImageBuffer, ...), which the CoreMedia overlay calls.
+COREMEDIA = re.compile(r"^_CM[A-Z]")
 
 
 def symbols(nm: str, paths: list[str], flags: list[str]) -> set[str]:
@@ -56,7 +59,8 @@ def main() -> None:
     groups = {
         "objc": [s for s in needed if OBJC.match(s)],
         "foundation": [s for s in needed if not OBJC.match(s) and FOUNDATION.match(s)],
-        "system": [s for s in needed if not OBJC.match(s) and not FOUNDATION.match(s)],
+        "coremedia": [s for s in needed if not OBJC.match(s) and not FOUNDATION.match(s) and COREMEDIA.match(s)],
+        "system": [s for s in needed if not OBJC.match(s) and not FOUNDATION.match(s) and not COREMEDIA.match(s)],
     }
     for name, names in groups.items():
         with open(f"{out}/{name}.s", "w", encoding="ascii", newline="\n") as stream:

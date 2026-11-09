@@ -3,7 +3,7 @@
 // written from Apple's public documentation and implemented in Swift from
 // CMTime's documented semantics (CMTimeMake, CMTimeMakeWithSeconds,
 // CMTimeGetSeconds, CMTimeCompare, the CMTIME_* and CMTIMERANGE_* macros).
-// No CoreMedia function is called. CMTime arithmetic (CMTimeAdd and friends,
+// No CoreMedia function is called for CMTime. CMTime arithmetic (CMTimeAdd and friends,
 // with their least-common-timescale and rounding rules) is not provided.
 
 @_exported import CoreMedia // The Clang module (Alchemy's CoreMedia declarations).

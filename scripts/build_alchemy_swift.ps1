@@ -302,6 +302,7 @@ function Link-Library([string]$name, [string]$installName, [string[]]$objects, [
     $libraries = @()
     foreach ($stub in @(@{ Name = 'objc'; Install = '/usr/lib/libobjc.A.dylib'; File = 'libobjc.A.dylib' },
                         @{ Name = 'foundation'; Install = '/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation'; File = 'Foundation' },
+                        @{ Name = 'coremedia'; Install = '/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia'; File = 'CoreMedia' },
                         @{ Name = 'system'; Install = '/usr/lib/libSystem.B.dylib'; File = 'libSystem.B.dylib' })) {
         if (!(Select-String -LiteralPath "$interfaces/$($stub.Name).s" -Pattern '^\.globl' -Quiet)) { continue }
         Invoke-Tool $clang @('--target=arm64-apple-macos11', '-c', "$interfaces/$($stub.Name).s", '-o', "$interfaces/$($stub.Name).o") "$interfaces/$($stub.Name)-as"
