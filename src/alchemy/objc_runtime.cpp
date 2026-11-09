@@ -511,8 +511,13 @@ struct ObjcRuntime::Impl {
             return view->class_address;
         }
         const auto actual = process.calling_engine().read64(object);
-        if (actual != view->class_address || !is_class(actual))
-            throw std::runtime_error("Objective-C object has invalid isa");
+        if (actual != view->class_address || !is_class(actual)) {
+            std::ostringstream detail;
+            detail << "Objective-C object has invalid isa: 0x" << std::hex << object << " holds isa 0x" << actual << ", its record class 0x"
+                   << view->class_address;
+            if (const auto* value = class_table.find(view->class_address); value && !value->protocol_marker) detail << " (" << value->name << ")";
+            throw std::runtime_error(detail.str());
+        }
         return actual;
     }
     std::optional<Method> method(Address start, Address sel, bool own = false) {
@@ -1276,8 +1281,66 @@ struct ObjcRuntime::Impl {
         // An initializer that did not call back still wrote its layout.
         if (value.swift_pending.load(std::memory_order_acquire)) publish_swift_layout(value.address);
     }
+    // Slides a class's ivars past a larger superclass, as objc4's reconcileInstanceVariables does when it
+    // realizes a class. The Swift runtime lays out a class with an Objective-C superclass from the class's
+    // static InstanceStart and leaves this slide to the runtime; its ivar entries point at the field offset
+    // globals or at the metadata's field offset vector, which therefore receive the slid offsets.
+    void slide_ivars(Address address) {
+        auto& memory = process.main_engine();
+        const auto super = memory.read64(address + 8), ro = memory.read64(address + 32) & ~7ULL;
+        if (!super || !ro || (memory.read32(ro) & 1U)) return;   // root classes and metaclasses (RO_META)
+        std::uint32_t super_size{};
+        {
+            std::lock_guard lock(mutex);
+            if (!classes.contains(super)) return;
+            super_size = cls(super)->size;
+        }
+        const auto start = memory.read32(ro + 4), size = memory.read32(ro + 8);
+        if (start >= super_size) return;
+        std::vector<Address> offsets;
+        std::uint64_t alignment = 1;
+        if (const auto ivars = memory.read64(ro + 48)) {
+            const auto stride = memory.read32(ivars), count = memory.read32(ivars + 4);
+            if (stride != 32 || count > 65536) throw std::runtime_error("Objective-C class has an invalid ivar list");
+            for (std::uint32_t index = 0; index < count; ++index) {
+                const auto entry = ivars + 8 + 32ULL * index;
+                const auto offset = memory.read64(entry);
+                if (!offset) continue;   // no offset to slide (anonymous bit fields)
+                const auto exponent = memory.read32(entry + 24);
+                if (exponent != UINT32_MAX && exponent > 20) throw std::runtime_error("Objective-C ivar has an invalid alignment");
+                alignment = std::max<std::uint64_t>(alignment, exponent == UINT32_MAX ? 8 : 1ULL << exponent);
+                offsets.push_back(offset);
+            }
+        }
+        const auto diff = (super_size - start + alignment - 1) & ~(alignment - 1);
+        if (size + diff > (1U << 26)) throw std::runtime_error("Objective-C instance exceeds limit after ivar sliding");
+        const auto slid = writable_ro(address, ro);
+        for (const auto offset : offsets) memory.write32(offset, static_cast<std::uint32_t>(memory.read32(offset) + diff));
+        memory.write32(slid + 4, static_cast<std::uint32_t>(start + diff));
+        memory.write32(slid + 8, static_cast<std::uint32_t>(size + diff));
+    }
+    // The class_ro_t slide_ivars may write. The Swift runtime's classes keep theirs in writable memory (it updates
+    // InstanceStart and InstanceSize itself), as do objc_readClassPair's; a statically emitted one may sit in a
+    // read-only __objc_const, so the class then gets a writable copy, as objc4's make_ro_writeable gives it. The
+    // ivar offsets it points at are __DATA globals or Swift metadata, both writable.
+    Address writable_ro(Address address, Address ro) {
+        auto& memory = process.main_engine();
+        try {
+            memory.write32(ro + 4, memory.read32(ro + 4));
+            return ro;
+        } catch (const std::runtime_error&) {}
+        // RO_HAS_SWIFT_INITIALIZER (0x40): the trailing _swiftMetadataInitializer_NEVER_USE[0].
+        const std::size_t size = (memory.read32(ro) & 0x40U) ? 80 : 72;
+        std::vector<std::uint8_t> bytes(size);
+        memory.read_bytes(ro, bytes);
+        const auto copy = process.allocate_guest(size);
+        memory.write_bytes(copy, bytes);
+        memory.write64(address + 32, copy | (memory.read64(address + 32) & 7));
+        return copy;
+    }
     // Rebuilds a class's layout from its (Swift-updated) class_ro_t.
     void publish_swift_layout(Address address) {
+        slide_ivars(address);
         const auto info = parse_objc_runtime_class(process, process.main_engine(), address, false);
         std::lock_guard lock(mutex);
         const auto value = cls(address);
@@ -1292,6 +1355,9 @@ struct ObjcRuntime::Impl {
     // _objc_realizeClassFromSwift for a class no image lists).
     Address register_runtime_pair(Address address) {
         auto& memory = process.main_engine();
+        bool known{};
+        { std::lock_guard lock(mutex); known = classes.contains(address); }
+        if (!known) slide_ivars(address);
         auto info = parse_objc_runtime_class(process, memory, address, false);
         auto meta_info = parse_objc_runtime_class(process, memory, info.metaclass, true);
         if (info.name.empty() || meta_info.name.empty()) {

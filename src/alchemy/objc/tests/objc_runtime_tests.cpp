@@ -685,6 +685,53 @@ void test_hook_chains() {
     }
 }
 
+// The Swift runtime lays out a class with an Objective-C superclass from the class's static InstanceStart (0 when
+// the compiler doesn't know the superclass's size) and leaves sliding the ivars past the superclass to the runtime:
+// _objc_realizeClassFromSwift and objc_readClassPair slide them, updating the offsets the ivar entries point at
+// (here 64-bit field offset cells, as in Swift metadata) and the class's extent.
+void test_runtime_class_ivar_sliding() {
+    Fixture f;
+    const auto root = f.runtime.find_class("NSObject");
+    const auto base = f.runtime.register_native_class("SlideBase", root, 16);
+    const auto base_meta = f.engine.read64(base), root_meta = f.engine.read64(base_meta);
+    const auto pair = [&](std::string_view name, std::uint32_t start, bool read_only_ro = false) {
+        const auto data = f.process.allocate_guest(1024), label = f.string(name);
+        for (Address at = data; at < data + 1024; at += 8) f.engine.write64(at, 0);
+        const Address cls = data, meta = data + 64, meta_ro = data + 256, ivars = data + 384, cell = data + 512;
+        const Address ro = read_only_ro ? f.process.allocate_guest(4096) : data + 128;
+        for (Address at = ro; at < ro + 72; at += 8) f.engine.write64(at, 0);
+        f.engine.write64(cls, meta); f.engine.write64(cls + 8, base); f.engine.write64(cls + 32, ro);
+        f.engine.write64(meta, root_meta); f.engine.write64(meta + 8, base_meta); f.engine.write64(meta + 32, meta_ro);
+        f.engine.write32(ro, 0); f.engine.write32(ro + 4, start); f.engine.write32(ro + 8, start + 8);
+        f.engine.write64(ro + 24, label); f.engine.write64(ro + 48, ivars);
+        f.engine.write32(meta_ro, 1); f.engine.write32(meta_ro + 4, 40); f.engine.write32(meta_ro + 8, 40); f.engine.write64(meta_ro + 24, label);
+        f.engine.write32(ivars, 32); f.engine.write32(ivars + 4, 1);
+        f.engine.write64(ivars + 8, cell); f.engine.write64(ivars + 16, f.string("value")); f.engine.write64(ivars + 24, f.string("q"));
+        f.engine.write32(ivars + 32, 3); f.engine.write32(ivars + 36, 8);
+        f.engine.write64(cell, start);
+        if (read_only_ro) f.engine.set_memory_access(ro, true, false, false);
+        return std::pair{cls, cell};
+    };
+    for (const auto* entry : {"__objc_realizeClassFromSwift", "_objc_readClassPair"}) {
+        const auto [cls, cell] = pair(std::string("Slid") + (entry[1] == '_' ? "Swift" : "Pair"), 0);
+        require(f.call(entry, {cls, cls}) == cls, "a runtime class pair was not registered");
+        require(f.engine.read64(cell) == 16, "a runtime class's ivar was not slid past its superclass");
+        require(f.call("_class_getInstanceSize", {cls}) == 24, "a runtime class's slid instance size");
+        const auto ivar = f.call("_class_getInstanceVariable", {cls, f.string("value")});
+        require(ivar && f.call("_ivar_getOffset", {ivar}) == 16, "ivar_getOffset after sliding a runtime class");
+    }
+    const auto [placed, cell] = pair("PlacedPair", 16);
+    require(f.call("_objc_readClassPair", {placed, 0}) == placed && f.engine.read64(cell) == 16 &&
+            f.call("_class_getInstanceSize", {placed}) == 24, "a class laid out past its superclass was moved");
+    // A class_ro_t in read-only memory is copied before it is slid, as objc4's make_ro_writeable copies it.
+    const auto [sealed, sealed_cell] = pair("SealedPair", 0, true);
+    const auto sealed_ro = f.engine.read64(sealed + 32);
+    require(f.call("_objc_readClassPair", {sealed, 0}) == sealed && f.engine.read64(sealed_cell) == 16 &&
+            f.call("_class_getInstanceSize", {sealed}) == 24, "a class with a read-only class_ro_t was not slid");
+    require(f.engine.read64(sealed + 32) != sealed_ro && f.engine.read32(sealed_ro + 4) == 0,
+            "a read-only class_ro_t was not copied before sliding");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc > 2 && std::string_view(argv[1]) == "--encoding") {
@@ -703,6 +750,7 @@ int main(int argc, char** argv) {
         if (!bench_only) test_destructed_memory_kept();
         if (!bench_only) test_hook_chains();
         if (!bench_only) test_retain_during_dealloc();
+        if (!bench_only) test_runtime_class_ivar_sliding();
         for (const bool cached : {true, false}) benchmark(cached);
         std::cout << "Alchemy GUI objc runtime tests passed\n";
         return 0;
