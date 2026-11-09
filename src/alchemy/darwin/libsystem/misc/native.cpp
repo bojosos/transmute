@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <charconv>
@@ -303,11 +304,27 @@ void install_darwin_native(ProcessContext& context) {
             } catch (const NativeError& error) { context.set_errno(error.value); state.x[0] = UINT32_MAX; }
         }));
     }
-    static_cast<void>(context.install_function("_backtrace", [&context](auto& state, auto& memory) {
+    // backtrace_set_pcs_func(func): backtrace() gathers its addresses with func(buffer, max, &count, skip 1,
+    // NULL) instead of walking the frames, as Libc's; NULL restores the frame walk. Trailing NULL entries
+    // are not counted.
+    const auto pcs_function = std::make_shared<std::atomic<std::uint64_t>>(0);
+    static_cast<void>(context.install_function("_backtrace_set_pcs_func", [pcs_function](auto& state, auto&) { pcs_function->store(state.x[0]); }));
+    static_cast<void>(context.install_function("_backtrace", [&context, pcs_function](auto& state, auto& memory) {
         const auto count = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[1]));
         if (count <= 0) { state.x[0] = 0; return; }
         if (count > 1024 || !accessible(memory, state.x[0], static_cast<std::uint64_t>(count) * 8, true)) {
             context.set_errno(count > 1024 ? 22U : 14U); state.x[0] = 0; return;
+        }
+        if (const auto function = pcs_function->load()) {
+            const auto found = context.allocate_guest(8);
+            memory.write64(found, 0);
+            const std::array<std::uint64_t, 5> arguments{state.x[0], static_cast<std::uint64_t>(count), found, 1, 0};
+            static_cast<void>(EngineAdapter(context.calling_engine()).call(function, arguments));
+            auto frames = std::min<std::uint64_t>(memory.read32(found), static_cast<std::uint64_t>(count));
+            context.release_guest(found);
+            while (frames >= 1 && !memory.read64(state.x[0] + (frames - 1) * 8)) --frames;
+            state.x[0] = frames;
+            return;
         }
         auto frame = state.x[29], address = state.x[30];
         unsigned written{};

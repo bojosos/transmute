@@ -47,6 +47,7 @@ struct Node {
 struct Tree {
     std::uint64_t options{};
     Address compar{};
+    bool compar_block{};   // fts_open_b: compar is a (copied) block, called through its invoke function
     std::vector<Node> nodes;
     std::vector<std::size_t> roots;
     std::size_t next_root{};
@@ -186,7 +187,10 @@ struct Fts {
         std::stable_sort(list.begin(), list.end(), [&](std::size_t a, std::size_t b) {
             support.memory().write64(cells, tree.nodes[a].entry);
             support.memory().write64(cells + 8, tree.nodes[b].entry);
-            return static_cast<std::int32_t>(call_address(support, tree.compar, {cells, cells + 8})) < 0;
+            const auto order = tree.compar_block
+                ? call_address(support, support.memory().read64(tree.compar + 16), {tree.compar, cells, cells + 8})
+                : call_address(support, tree.compar, {cells, cells + 8});
+            return static_cast<std::int32_t>(order) < 0;
         });
     }
     std::uint16_t info_of(const Tree& tree, std::size_t index) { return static_cast<std::uint16_t>(support.memory().read32(tree.nodes[index].entry + 88)); }
@@ -262,12 +266,15 @@ void install_fts_err(Support& support) {
 
     // ---- fts ----
     // FTS *fts_open(char * const *argv, int options, int (*compar)(const FTSENT **, const FTSENT **))
-    support.function(libsystem, "_fts_open", [self](CpuState& s, GuestMemory& m) {
+    // fts_open_b(argv, options, int (^compar)(const FTSENT **, const FTSENT **)): the block is copied
+    // (Block_copy, as Libc's) and released by fts_close.
+    const auto open_tree = [self](CpuState& s, GuestMemory& m, bool block) {
         constexpr std::uint64_t valid_options = 0xfff;
         if (!s.x[0] || (s.x[1] & ~valid_options)) { self->support.process.set_errno(22); s.x[0] = 0; return; }
         auto tree = std::make_shared<Tree>();
         tree->options = s.x[1];
-        tree->compar = s.x[2];
+        tree->compar_block = block && s.x[2];
+        tree->compar = tree->compar_block ? self->support.call(libsystem, "__Block_copy", {s.x[2]}) : s.x[2];
         tree->root_parent = self->guest_alloc(*tree, 112);
         m.write32(tree->root_parent + 84, static_cast<std::uint32_t>(static_cast<std::uint16_t>(-1)) << 16);   // fts_level -1
         for (Address at = s.x[0];; at += 8) {
@@ -288,7 +295,9 @@ void install_fts_err(Support& support) {
         const auto handle = self->guest_alloc(*tree, 64);
         { std::lock_guard lock(self->mutex); self->trees[handle] = tree; }
         s.x[0] = handle;
-    });
+    };
+    support.function(libsystem, "_fts_open", [open_tree](CpuState& s, GuestMemory& m) { open_tree(s, m, false); });
+    support.function(libsystem, "_fts_open_b", [open_tree](CpuState& s, GuestMemory& m) { open_tree(s, m, true); });
     const auto tree_of = [self](Address handle) {
         std::lock_guard lock(self->mutex);
         const auto found = self->trees.find(handle);
@@ -334,6 +343,7 @@ void install_fts_err(Support& support) {
             tree = found->second;
             self->trees.erase(found);
         }
+        if (tree->compar_block) static_cast<void>(self->support.call(libsystem, "__Block_release", {tree->compar}));
         for (const auto address : tree->allocations) self->support.process.release_guest(address);
         s.x[0] = 0;
     });
@@ -342,10 +352,20 @@ void install_fts_err(Support& support) {
     // "<progname>: <message>[: <strerror(errno)>]\n" on standard error (or err_set_file's stream).
     struct ErrHooks {
         std::atomic<Address> file{}, exit_callback{};
+        std::atomic<bool> exit_block{};   // err_set_exit_b: a copied block
     };
     const auto hooks = std::make_shared<ErrHooks>();
     support.function(libsystem, "_err_set_file", [hooks](CpuState& s, GuestMemory&) { hooks->file = s.x[0]; });
-    support.function(libsystem, "_err_set_exit", [hooks](CpuState& s, GuestMemory&) { hooks->exit_callback = s.x[0]; });
+    support.function(libsystem, "_err_set_exit", [&support, hooks](CpuState& s, GuestMemory&) {
+        const auto previous = hooks->exit_callback.exchange(s.x[0]);
+        if (hooks->exit_block.exchange(false) && previous) static_cast<void>(support.call(libsystem, "__Block_release", {previous}));
+    });
+    // err_set_exit_b(void (^)(int)): the block is copied (Block_copy, as Libc's).
+    support.function(libsystem, "_err_set_exit_b", [&support, hooks](CpuState& s, GuestMemory&) {
+        const auto copy = s.x[0] ? support.call(libsystem, "__Block_copy", {s.x[0]}) : 0;
+        const auto previous = hooks->exit_callback.exchange(copy);
+        if (hooks->exit_block.exchange(copy != 0) && previous) static_cast<void>(support.call(libsystem, "__Block_release", {previous}));
+    });
     const auto report = [&support, hooks](Address format, Address arguments, bool with_errno, std::uint32_t code) {
         std::string line;
         if (const auto progname = support.process.resolve(libsystem, "___progname")) {
@@ -373,8 +393,11 @@ void install_fts_err(Support& support) {
         // err/errx never return: err_set_exit's function, then continue into exit(status).
         const auto exit_function = support.process.resolve(libsystem, "_exit");
         if (!exit_function) fail("err: exit is not provided");
-        if (const auto callback = hooks->exit_callback.load())
-            static_cast<void>(call_address(support, callback, {static_cast<std::uint32_t>(status)}));
+        if (const auto callback = hooks->exit_callback.load()) {
+            if (hooks->exit_block.load())
+                static_cast<void>(call_address(support, support.memory().read64(callback + 16), {callback, static_cast<std::uint32_t>(status)}));
+            else static_cast<void>(call_address(support, callback, {static_cast<std::uint32_t>(status)}));
+        }
         s.x[0] = status;
         s.x[30] = exit_function->address;
     };

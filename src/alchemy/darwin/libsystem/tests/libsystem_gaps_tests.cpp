@@ -1925,6 +1925,59 @@ void test_fonts_view(Fixture& f) {
     refused(f.sys("_unlinkat", {static_cast<std::uint64_t>(-2), f.text("/System/Library/Fonts/arial.ttf"), 0}), "unlinkat");
 }
 
+// Conformance exports (macOS comparison): getenv_copy_np, link_ntoa, backtrace_set_pcs_func,
+// libc_set_introspection_hooks, scandir_b, fts_open_b.
+void test_b39(Fixture& f) {
+    const auto system = "/usr/lib/libSystem.B.dylib";
+    // A global block (Block_copy answers it unchanged) whose invoke is `function`.
+    const auto block = [&f, system](std::uint64_t function) {
+        const auto descriptor = f.process.allocate_guest(16), value = f.process.allocate_guest(32);
+        f.engine.write64(descriptor, 0); f.engine.write64(descriptor + 8, 32);
+        f.engine.write64(value, f.symbol(system, "__NSConcreteGlobalBlock"));
+        f.engine.write32(value + 8, 1U << 28); f.engine.write32(value + 12, 0);   // BLOCK_IS_GLOBAL
+        f.engine.write64(value + 16, function); f.engine.write64(value + 24, descriptor);
+        return value;
+    };
+    require(f.sys("_setenv", {f.text("ALCHEMY_B39"), f.text("copied"), 1}) == 0, "setenv");
+    const auto copy = f.sys("_getenv_copy_np", {f.text("ALCHEMY_B39")});
+    require(copy && copy != f.sys("_getenv", {f.text("ALCHEMY_B39")}) && f.read(copy) == "copied", "getenv_copy_np is a copy");
+    f.sys("_free", {copy});
+    require(f.sys("_getenv_copy_np", {f.text("ALCHEMY_B39_UNSET")}) == 0, "getenv_copy_np of an unset name");
+    // struct sockaddr_dl {len, family, index, type, nlen, alen, slen, data[]}: "en0" and 00:1e:c2:0a:ff:01.
+    const auto link = f.process.allocate_guest(32);
+    const std::array<std::uint8_t, 17> sdl{20, 18, 1, 0, 6, 3, 6, 0, 'e', 'n', '0', 0x00, 0x1e, 0xc2, 0x0a, 0xff, 0x01};
+    f.engine.write_bytes(link, sdl);
+    require(f.read(f.sys("_link_ntoa", {link})) == "en0:0.1e.c2.a.ff.1", "link_ntoa");
+    // backtrace_set_pcs_func: backtrace takes its addresses from the function; NULL restores the walk.
+    const auto pcs = f.engine.register_guest_call([&f](auto& state, auto&) {
+        f.engine.write64(state.x[0], 0xdeadbeef); f.engine.write32(state.x[2], 1);
+    });
+    static_cast<void>(f.sys("_backtrace_set_pcs_func", {pcs}));
+    const auto frames = f.process.allocate_guest(16);
+    f.engine.write64(frames, 0); f.engine.write64(frames + 8, 0);
+    require(f.sys("_backtrace", {frames, 2}) == 1 && f.engine.read64(frames) == 0xdeadbeef && f.engine.read64(frames + 8) == 0,
+            "backtrace uses the custom pcs function");
+    static_cast<void>(f.sys("_backtrace_set_pcs_func", {0}));
+    // libc_set_introspection_hooks: the old hooks come back, zero to begin with, then the set ones.
+    const auto hooks = f.process.allocate_guest(40), old = f.process.allocate_guest(48);
+    for (unsigned at = 0; at < 5; ++at) f.engine.write64(hooks + at * 8, at == 0 ? 1 : 0x1000 + at);
+    f.engine.write64(old + 40, 0x77);
+    static_cast<void>(f.sys("_libc_set_introspection_hooks", {hooks, old, 48}));
+    require(f.engine.read64(old) == 0 && f.engine.read64(old + 40) == 0, "the first old hooks are empty, the extra size zeroed");
+    static_cast<void>(f.sys("_libc_set_introspection_hooks", {0, old, 40}));
+    require(f.engine.read64(old) == 1 && f.engine.read64(old + 32) == 0x1004, "the set hooks come back");
+    // scandir_b: its selection block (called with itself first) keeps what it answers non-zero for.
+    const auto list = f.process.allocate_guest(8);
+    const auto all = f.sys("_scandir", {f.text("/tmp"), list, 0, 0});
+    std::uint64_t seen_block = 0;
+    const auto keep = [&](std::uint64_t answer) {
+        return block(f.engine.register_guest_call([&seen_block, answer](auto& state, auto&) { seen_block = state.x[0]; state.x[0] = answer; }));
+    };
+    const auto keep_all = keep(1), keep_none = keep(0);
+    require(all != UINT64_MAX && f.sys("_scandir_b", {f.text("/tmp"), list, keep_all, 0}) == all && (all == 0 || seen_block == keep_all) &&
+            f.sys("_scandir_b", {f.text("/tmp"), list, keep_none, 0}) == 0, "scandir_b selects through its block");
+}
+
 } // namespace
 
 int main() {
@@ -1959,6 +2012,7 @@ int main() {
         stage("b25"); test_b25(f);
         stage("b31"); test_b31(f);
         stage("b33"); test_b33(f);
+        stage("b39"); test_b39(f);
         stage("fonts view"); test_fonts_view(f);
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';

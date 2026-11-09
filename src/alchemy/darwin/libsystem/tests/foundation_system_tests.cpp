@@ -232,6 +232,28 @@ void test_libsystem_extras(Fixture& f) {
     for (const auto& value : seen) got += value + " ";
     require(seen == expected, "fts order and info: " + got);
     require(f.call(lib, "_fts_close", {tree}) == 0, "fts_close");
+    // fts_open_b: the same walk ordered by a block (a global one, called with itself first), here in reverse.
+    const auto reverse = f.process.install_function("_g2_test_fts_compare_b", [](CpuState& s, GuestMemory& m) {
+        const auto a = m.read64(s.x[1]), b = m.read64(s.x[2]);
+        const auto left = alchemy::gui::completion_kit::rt::c_string(m, a + 104, 1024), right = alchemy::gui::completion_kit::rt::c_string(m, b + 104, 1024);
+        s.x[0] = static_cast<Address>(static_cast<std::int64_t>(left > right ? -1 : left < right ? 1 : 0));
+    });
+    const auto descriptor = f.process.allocate_guest(16), block = f.process.allocate_guest(32);
+    f.engine.write64(descriptor, 0); f.engine.write64(descriptor + 8, 32);
+    f.engine.write64(block, f.process.resolve(lib, "__NSConcreteGlobalBlock")->address);
+    f.engine.write32(block + 8, 1U << 28); f.engine.write32(block + 12, 0);   // BLOCK_IS_GLOBAL
+    f.engine.write64(block + 16, reverse); f.engine.write64(block + 24, descriptor);
+    const auto reversed = f.call(lib, "_fts_open_b", {argv, 0x010 | 0x004, block});
+    require(reversed != 0, "fts_open_b");
+    seen.clear();
+    for (auto entry = f.call(lib, "_fts_read", {reversed}); entry; entry = f.call(lib, "_fts_read", {reversed})) {
+        auto& m = static_cast<GuestMemory&>(f.engine);
+        seen.push_back(alchemy::gui::completion_kit::rt::c_string(m, entry + 104, 1024) + ":" + std::to_string(m.read32(entry + 88) & 0xffff));
+    }
+    const std::vector<std::string> reverse_order{"alchemy_g2_fts:1", "b:1", "c.txt:8", "b:6", "a.txt:8", "alchemy_g2_fts:6"};
+    got.clear();
+    for (const auto& value : seen) got += value + " ";
+    require(seen == reverse_order && f.call(lib, "_fts_close", {reversed}) == 0, "fts_open_b order: " + got);
     fs::remove_all(base);
 }
 

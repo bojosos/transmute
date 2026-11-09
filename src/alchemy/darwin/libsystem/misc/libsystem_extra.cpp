@@ -1303,7 +1303,9 @@ void install_patterns(const std::shared_ptr<State>& state) {
     });
 
     // scandir builds its results with the guest allocator: callers free() each entry and the array.
-    install(state, "_scandir", [state](auto& s, auto& m) {
+    // scandir_b takes blocks for the selection and the comparison (called through their invoke
+    // functions; the sort is qsort_b's).
+    const auto scan = [state](auto& s, auto& m, bool blocks) {
         validate(m, s.x[1], 8, true);
         const auto directory = state->call("_opendir", {s.x[0]});
         if (!directory) throw ExtraError{state->errno_value()};
@@ -1313,7 +1315,10 @@ void install_patterns(const std::shared_ptr<State>& state) {
             for (;;) {
                 const auto entry = state->call("_readdir", {directory});
                 if (!entry) break;
-                if (s.x[2] && !static_cast<std::uint32_t>(state->invoke(s.x[2], {entry}))) continue;
+                if (s.x[2]) {
+                    const auto keep = blocks ? state->invoke(m.read64(s.x[2] + 16), {s.x[2], entry}) : state->invoke(s.x[2], {entry});
+                    if (!static_cast<std::uint32_t>(keep)) continue;
+                }
                 const std::uint64_t size = std::max<std::uint64_t>(read16(m, entry + 16), 22ULL + read16(m, entry + 18));
                 const auto copy = state->guest_malloc(size);
                 entries.push_back(copy);
@@ -1322,7 +1327,7 @@ void install_patterns(const std::shared_ptr<State>& state) {
             static_cast<void>(state->call("_closedir", {directory}));
             array = state->guest_malloc(std::max<std::size_t>(entries.size(), 1) * 8);
             for (std::size_t index = 0; index < entries.size(); ++index) m.write64(array + index * 8, entries[index]);
-            if (s.x[3] && entries.size() > 1) static_cast<void>(state->call("_qsort", {array, entries.size(), 8, s.x[3]}));
+            if (s.x[3] && entries.size() > 1) static_cast<void>(state->call(blocks ? "_qsort_b" : "_qsort", {array, entries.size(), 8, s.x[3]}));
         } catch (...) {
             for (const auto entry : entries) state->guest_free(entry);
             state->guest_free(array);
@@ -1330,6 +1335,52 @@ void install_patterns(const std::shared_ptr<State>& state) {
         }
         m.write64(s.x[1], array);
         return static_cast<std::uint64_t>(entries.size());
+    };
+    install(state, "_scandir", [scan](auto& s, auto& m) { return scan(s, m, false); });
+    install(state, "_scandir_b", [scan](auto& s, auto& m) { return scan(s, m, true); });
+    // char* getenv_copy_np(const char* name): a malloc'd copy of getenv(name), or NULL.
+    install(state, "_getenv_copy_np", [state](auto& s, auto&) -> std::uint64_t {
+        const auto value = state->call("_getenv", {s.x[0]});
+        return value ? state->call("_strdup", {value}) : 0;
+    });
+    // char* link_ntoa(const struct sockaddr_dl*), as Libc's linkaddr.c: the interface name, ':', then the
+    // link-level address bytes in hex (no leading zero) separated by '.', in a static buffer of 64.
+    const auto link_text = std::make_shared<std::uint64_t>(0);
+    install(state, "_link_ntoa", [state, link_text](auto& s, auto& m) -> std::uint64_t {
+        constexpr std::string_view hex = "0123456789abcdef";
+        const auto name_length = m.read8(s.x[0] + 5), address_length = m.read8(s.x[0] + 6);
+        std::string out;
+        if (name_length + 3U * address_length < 64) {
+            for (unsigned at = 0; at < name_length; ++at) out += static_cast<char>(m.read8(s.x[0] + 8 + at));
+            if (name_length && address_length) out += ':';
+            for (unsigned at = 0; at < address_length; ++at) {
+                if (at) out += '.';
+                const auto byte = m.read8(s.x[0] + 8 + name_length + at);
+                if (byte > 0xf) out += hex[byte >> 4];
+                out += hex[byte & 0xf];
+            }
+        }
+        std::lock_guard lock(state->mutex);
+        if (!*link_text) *link_text = state->context.allocate_guest(64);
+        m.write_bytes(*link_text, std::span(reinterpret_cast<const std::uint8_t*>(out.c_str()), out.size() + 1));
+        return *link_text;
+    });
+    // void libc_set_introspection_hooks(const libc_hooks_t* new, libc_hooks_t* old, size_t size): Libc's
+    // SPI for address sanitizers (version, will_read, will_read_cstring, will_read_wcstring, will_write).
+    // The hooks are kept and handed back as Libc does; no libc function here calls them (a note says so).
+    const auto hooks = std::make_shared<std::array<std::uint64_t, 5>>();
+    install(state, "_libc_set_introspection_hooks", [state, hooks](auto& s, auto& m) -> std::uint64_t {
+        std::lock_guard lock(state->mutex);
+        if (s.x[1]) {
+            if (s.x[2] > hooks->size() * 8) m.fill_bytes(s.x[1] + hooks->size() * 8, 0, s.x[2] - hooks->size() * 8);
+            for (std::size_t at = 0; at < hooks->size(); ++at) m.write64(s.x[1] + at * 8, (*hooks)[at]);
+        }
+        if (s.x[0]) {
+            for (std::size_t at = 0; at < hooks->size(); ++at) (*hooks)[at] = m.read64(s.x[0] + at * 8);
+            static std::once_flag noted;
+            std::call_once(noted, [] { std::fprintf(stderr, "alchemy: libc introspection hooks are recorded, but no libc function calls them\n"); });
+        }
+        return 0;
     });
     install(state, "_alphasort", [](auto& s, auto& m) {
         const auto left = text(m, m.read64(s.x[0]) + 21), right = text(m, m.read64(s.x[1]) + 21);
