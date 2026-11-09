@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 
 // Independent implementation of the published formats: RFC 1950 (zlib),
 // RFC 1951 (DEFLATE) and the CRC-32 of ISO 3309 / ITU-T V.42.
@@ -627,6 +628,7 @@ struct DeflateStream::State {
     std::uint32_t check{};
     std::uint64_t total_in{};
     bool header{}, finished{};
+    std::optional<std::uint32_t> dictionary;   // a zlib header's FDICT id
 
     void drain() {
         output.insert(output.end(), writer.output.begin(), writer.output.end());
@@ -640,6 +642,7 @@ struct DeflateStream::State {
         total_in = 0;
         header = false;
         finished = false;
+        dictionary.reset();
     }
 };
 
@@ -653,6 +656,21 @@ std::vector<std::uint8_t>& DeflateStream::output() noexcept { return state_->out
 bool DeflateStream::finished() const noexcept { return state_->finished; }
 std::uint32_t DeflateStream::check() const noexcept { return state_->check; }
 void DeflateStream::reset() { state_->start(); }
+bool DeflateStream::set_dictionary(std::span<const std::uint8_t> bytes) {
+    auto& s = *state_;
+    if (s.wrapper == Wrapper::gzip || s.header) return false;
+    if (s.wrapper == Wrapper::zlib) s.dictionary = adler32_update(1, bytes);
+    return true;
+}
+void DeflateStream::set_level(int level) {
+    auto& s = *state_;
+    if (!s.pending.empty() && !s.finished) {
+        deflate_into(s.writer, s.pending, s.level, false);
+        s.pending.clear();
+        s.drain();
+    }
+    s.level = level < 0 ? 6 : std::min(level, 9);
+}
 
 void DeflateStream::feed(std::span<const std::uint8_t> input, Flush flush) {
     auto& s = *state_;
@@ -661,9 +679,11 @@ void DeflateStream::feed(std::span<const std::uint8_t> input, Flush flush) {
         if (s.wrapper == Wrapper::zlib) {
             const std::uint8_t cmf = 0x78;
             const std::uint8_t flevel = s.level <= 1 ? 0 : s.level < 6 ? 1 : s.level == 6 ? 2 : 3;
-            auto flg = static_cast<std::uint8_t>(flevel << 6);
+            auto flg = static_cast<std::uint8_t>((flevel << 6) | (s.dictionary ? 0x20 : 0));
             flg = static_cast<std::uint8_t>(flg + (31 - (cmf * 256 + flg) % 31) % 31);
             s.output.insert(s.output.end(), {cmf, flg});
+            if (s.dictionary)
+                for (int shift = 24; shift >= 0; shift -= 8) s.output.push_back(static_cast<std::uint8_t>(*s.dictionary >> shift));
         } else if (s.wrapper == Wrapper::gzip) {
             // No name or modification time; XFL by level; OS 3 (Unix), as on macOS.
             const std::uint8_t xfl = s.level == 9 ? 2 : s.level == 1 ? 4 : 0;

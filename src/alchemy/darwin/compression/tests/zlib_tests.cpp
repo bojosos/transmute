@@ -185,6 +185,22 @@ void test_streams() {
                 raw.output() == bytes("dictionary text, dictionary"), "raw inflate with a dictionary");
         vd::InflateStream late(vd::Wrapper::zlib);
         require(late.set_dictionary(text) == vd::InflateStream::Dictionary::invalid, "a dictionary before Z_NEED_DICT accepted");
+        // deflateSetDictionary: the header names the dictionary (FDICT), and an inflater given it decodes the stream;
+        // deflateParams mid-stream keeps one valid stream.
+        vd::DeflateStream named(vd::Wrapper::zlib, 6);
+        require(named.set_dictionary(text), "deflate dictionary refused");
+        named.feed(bytes("first part, "), vd::DeflateStream::Flush::none);
+        named.set_level(1);
+        named.feed(bytes("second part"), vd::DeflateStream::Flush::finish);
+        const auto stream = named.output();
+        require(stream.size() > 6 && (stream[1] & 0x20) && stream[2] == 0xc9 && stream[3] == 0xbb && stream[4] == 0x0b && stream[5] == 0xfe,
+                "FDICT and the dictionary's Adler-32 in the header");
+        require(!named.set_dictionary(text), "a dictionary after output accepted");
+        vd::InflateStream reader(vd::Wrapper::zlib);
+        require(reader.feed(stream).status == Status::need_dictionary && reader.set_dictionary(text) == vd::InflateStream::Dictionary::ok &&
+                reader.feed({}).status == Status::end && reader.output() == bytes("first part, second part"), "the named stream decodes");
+        vd::DeflateStream gzip_named(vd::Wrapper::gzip, 6);
+        require(!gzip_named.set_dictionary(text), "a gzip dictionary accepted");
     }
     // Deflate: a sync flush makes everything so far decodable; finish ends
     // the stream; every wrapper round-trips.

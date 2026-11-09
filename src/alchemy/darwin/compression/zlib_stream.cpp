@@ -342,6 +342,29 @@ void install_zlib_stream(ProcessContext& process) {
         begin(m, s.x[0], m.read64(s.x[0] + state_field), (*codec)->check());
         s.x[0] = code(z_ok);
     });
+    // int deflateSetDictionary(z_streamp, const Bytef*, uInt): before the first deflate (not gzip); the
+    // stream's adler is then the dictionary's Adler-32, as zlib's.
+    function("_deflateSetDictionary", [lookup](CpuState& s, GuestMemory& m) {
+        const auto state = lookup(m, s.x[0]);
+        auto* codec = state ? std::get_if<std::unique_ptr<DeflateStream>>(&state->codec) : nullptr;
+        const auto length = static_cast<std::uint32_t>(s.x[2]);
+        if (!codec || (!s.x[1] && length)) { s.x[0] = code(z_stream_error); return; }
+        std::vector<std::uint8_t> bytes(length);
+        if (length) m.read_bytes(s.x[1], bytes);
+        if (!(*codec)->set_dictionary(bytes)) { s.x[0] = code(z_stream_error); return; }
+        m.write64(s.x[0] + adler_field, adler32_update(1, bytes));
+        s.x[0] = code(z_ok);
+    });
+    // int deflateParams(z_streamp, int level, int strategy): level -1..9 and strategy 0..4 (Z_FILTERED,
+    // Z_HUFFMAN_ONLY, Z_RLE, Z_FIXED only change how well data compresses; this encoder has one way).
+    function("_deflateParams", [lookup](CpuState& s, GuestMemory& m) {
+        const auto state = lookup(m, s.x[0]);
+        auto* codec = state ? std::get_if<std::unique_ptr<DeflateStream>>(&state->codec) : nullptr;
+        const auto level = static_cast<std::int32_t>(s.x[1]), strategy = static_cast<std::int32_t>(s.x[2]);
+        if (!codec || level < -1 || level > 9 || strategy < 0 || strategy > 4) { s.x[0] = code(z_stream_error); return; }
+        (*codec)->set_level(level);
+        s.x[0] = code(z_ok);
+    });
     // int deflateEnd(z_streamp): Z_DATA_ERROR when output was still pending.
     function("_deflateEnd", [lookup, streams](CpuState& s, GuestMemory& m) {
         const auto state = lookup(m, s.x[0]);

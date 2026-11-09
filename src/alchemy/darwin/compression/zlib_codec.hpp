@@ -101,6 +101,12 @@ public:
     // Adler-32 (zlib) or CRC-32 (gzip) of the input so far.
     [[nodiscard]] std::uint32_t check() const noexcept;
     void reset();
+    // deflateSetDictionary, before any output (not for gzip): a zlib stream's header names the
+    // dictionary (FDICT and its Adler-32). The encoder keeps no history, so the data makes no
+    // back-references into it: a valid stream any inflater decodes, only less compressed.
+    bool set_dictionary(std::span<const std::uint8_t> bytes);
+    // deflateParams: input waiting for a flush is encoded at the old level, then the new one applies.
+    void set_level(int level);
 
 private:
     struct State;
