@@ -394,5 +394,13 @@ references (`__swift_FORCE_LOAD_$_<library>`, one per module it imports,
 transitively) bind to that library once the build has made it, rather than
 to the libSystem stub.
 
-Guest test: `alchemy_swift_overlay_members`
-(`tests/fixtures/macos/swift_overlay_members`).
+The Dispatch overlay adds the timer source the camera extension uses:
+`DispatchTimeInterval`, `DispatchSource.TimerFlags` (`.strict`),
+`DispatchSource.makeTimerSource(flags:queue:)` and
+`DispatchSourceTimer.schedule(deadline:repeating:leeway:)`, over libdispatch's
+timer source type and `dispatch_source_set_timer`. An infinite interval means
+the timer fires once.
+
+Guest tests: `alchemy_swift_overlay_members`
+(`tests/fixtures/macos/swift_overlay_members`) and `alchemy_swift_dispatch_timer`
+(`tests/fixtures/macos/swift_dispatch_timer`).

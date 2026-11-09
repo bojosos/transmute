@@ -6,8 +6,10 @@
 // init(label:qos:attributes:autoreleaseFrequency:target:) and
 // async(group:qos:flags:execute:); and what Maccy and Pika (SwiftUI apps) add:
 // DispatchTime (now, +), DispatchWorkItem, asyncAfter, global(qos:),
-// DispatchGroup.notify and the file-system object source. Written from
-// Apple's public documentation.
+// DispatchGroup.notify and the file-system object source; and what OBS
+// Studio's camera extension adds: DispatchTimeInterval and the timer source
+// (makeTimerSource, TimerFlags, schedule(deadline:repeating:leeway:)).
+// Written from Apple's public documentation.
 // QoS classes and the QoS-related work item flags are scheduling hints:
 // Alchemy's libdispatch runs work on host threads without QoS, so they do
 // not change where or when work runs; the barrier flag is honored.
@@ -228,6 +230,38 @@ public struct DispatchTime: Comparable {
     public static func < (a: DispatchTime, b: DispatchTime) -> Bool { return a.rawValue < b.rawValue }
 }
 
+/// A time interval, in seconds, milliseconds, microseconds or nanoseconds, or never.
+public enum DispatchTimeInterval: Equatable, Sendable {
+    case seconds(Int)
+    case milliseconds(Int)
+    case microseconds(Int)
+    case nanoseconds(Int)
+    case never
+
+    /// The interval in nanoseconds, saturating at Int.max (as never is).
+    internal var _nanoseconds: Int {
+        func scaled(_ value: Int, _ factor: Int) -> Int {
+            let (product, overflow) = value.multipliedReportingOverflow(by: factor)
+            return overflow ? (value < 0 ? Int.min : Int.max) : product
+        }
+        switch self {
+        case .seconds(let value): return scaled(value, 1_000_000_000)
+        case .milliseconds(let value): return scaled(value, 1_000_000)
+        case .microseconds(let value): return scaled(value, 1_000)
+        case .nanoseconds(let value): return value
+        case .never: return Int.max
+        }
+    }
+
+    public static func == (lhs: DispatchTimeInterval, rhs: DispatchTimeInterval) -> Bool {
+        switch (lhs, rhs) {
+        case (.never, .never): return true
+        case (.never, _), (_, .never): return false
+        default: return lhs._nanoseconds == rhs._nanoseconds
+        }
+    }
+}
+
 /// Returns a time the given number of seconds after a time (the distant future for one beyond the clock's range).
 public func + (time: DispatchTime, seconds: Double) -> DispatchTime {
     precondition(!seconds.isNaN, "Dispatch: a NaN interval")
@@ -337,6 +371,21 @@ extension DispatchSource {
                                               eventMask.rawValue, queue)
         return unsafeBitCast(source, to: DispatchSourceFileSystemObject.self)
     }
+
+    /// The flags of a timer source (DISPATCH_TIMER_*).
+    public struct TimerFlags: OptionSet, RawRepresentable {
+        public let rawValue: UInt
+        public init(rawValue: UInt) { self.rawValue = rawValue }
+
+        /// The timer fires as close to its deadline as possible, instead of coalescing with other timers.
+        public static let strict = TimerFlags(rawValue: 0x1)
+    }
+
+    /// Creates a timer source; it fires once scheduled (schedule(deadline:repeating:leeway:)) and resumed.
+    public static func makeTimerSource(flags: TimerFlags = [], queue: DispatchQueue? = nil) -> DispatchSourceTimer {
+        let source = __dispatch_source_create(___alchemy_dispatch_source_type_timer(), 0, flags.rawValue, queue)
+        return unsafeBitCast(source, to: DispatchSourceTimer.self)
+    }
 }
 
 extension DispatchSourceProtocol {
@@ -365,6 +414,18 @@ extension DispatchSourceProtocol {
 
     /// Cancels the dispatch source: its event handler does not run again, and its cancellation handler runs.
     public func cancel() { __dispatch_source_cancel(_dispatchSource(self)) }
+}
+
+extension DispatchSourceTimer {
+    /// Schedules the timer: it fires at the deadline, then every `interval` seconds (once only when the interval is
+    /// infinite), within `leeway`.
+    public func schedule(deadline: DispatchTime, repeating interval: Double, leeway: DispatchTimeInterval = .nanoseconds(0)) {
+        precondition(!interval.isNaN, "Dispatch: a NaN interval")
+        let nanoseconds = interval * 1_000_000_000
+        let repeats: UInt64 = interval.isInfinite || nanoseconds >= Double(UInt64.max) ? ~0 : UInt64(max(nanoseconds, 0))
+        let slack = leeway._nanoseconds
+        __dispatch_source_set_timer(_dispatchSource(self), deadline.rawValue, repeats, slack == Int.max ? ~0 : UInt64(max(slack, 0)))
+    }
 }
 
 extension DispatchSourceFileSystemObject {

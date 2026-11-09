@@ -26,16 +26,20 @@ __attribute__((objc_runtime_visible)) __attribute__((swift_name("DispatchGroup")
 @end
 /* Dispatch sources, as Apple's headers declare them for Swift: the class OS_dispatch_source (DispatchSource), the
    protocol of the same name every source adopts (DispatchSourceProtocol), and one protocol per source type
-   (OS_dispatch_source_vnode: DispatchSourceFileSystemObject). The overlay's extensions on them mangle as Apple's
-   ($sSo18OS_dispatch_sourceP8DispatchE..., $sSo24OS_dispatch_source_vnodeP8DispatchE...). */
+   (OS_dispatch_source_vnode: DispatchSourceFileSystemObject, OS_dispatch_source_timer: DispatchSourceTimer). The
+   overlay's extensions on them mangle as Apple's ($sSo18OS_dispatch_sourceP8DispatchE...,
+   $sSo24OS_dispatch_source_vnodeP8DispatchE..., $sSo24OS_dispatch_source_timerP8DispatchE...). */
 __attribute__((swift_name("DispatchSourceProtocol")))
 @protocol OS_dispatch_source
 @end
 __attribute__((swift_name("DispatchSourceFileSystemObject")))
 @protocol OS_dispatch_source_vnode <OS_dispatch_source>
 @end
+__attribute__((swift_name("DispatchSourceTimer")))
+@protocol OS_dispatch_source_timer <OS_dispatch_source>
+@end
 __attribute__((objc_runtime_visible)) __attribute__((swift_name("DispatchSource")))
-@interface OS_dispatch_source : OS_dispatch_object <OS_dispatch_source, OS_dispatch_source_vnode>
+@interface OS_dispatch_source : OS_dispatch_object <OS_dispatch_source, OS_dispatch_source_vnode, OS_dispatch_source_timer>
 @end
 typedef OS_dispatch_object* dispatch_object_t;
 typedef OS_dispatch_queue* dispatch_queue_t;
@@ -115,16 +119,23 @@ void _alchemy_dispatch_source_set_event_handler(dispatch_source_t source, void* 
 void _alchemy_dispatch_source_set_cancel_handler(dispatch_source_t source, void* handler)
     __asm__("_dispatch_source_set_cancel_handler") __attribute__((swift_private));
 
-/* Dispatch sources: DISPATCH_SOURCE_TYPE_VNODE is the address of a libdispatch data symbol. */
+/* Dispatch sources: DISPATCH_SOURCE_TYPE_VNODE and DISPATCH_SOURCE_TYPE_TIMER are the addresses of libdispatch data
+   symbols. */
 extern struct dispatch_source_type_s _dispatch_source_type_vnode;
 __attribute__((swift_private)) static inline const void* _alchemy_dispatch_source_type_vnode(void) {
     return &_dispatch_source_type_vnode;
+}
+extern struct dispatch_source_type_s _dispatch_source_type_timer;
+__attribute__((swift_private)) static inline const void* _alchemy_dispatch_source_type_timer(void) {
+    return &_dispatch_source_type_timer;
 }
 dispatch_source_t dispatch_source_create(const void* type, uintptr_t handle, uintptr_t mask, dispatch_queue_t _Nullable queue)
     __attribute__((ns_returns_retained)) __attribute__((swift_private));
 void dispatch_source_set_event_handler(dispatch_source_t source, dispatch_block_t _Nullable handler) __attribute__((swift_private));
 void dispatch_source_set_cancel_handler(dispatch_source_t source, dispatch_block_t _Nullable handler) __attribute__((swift_private));
 unsigned long dispatch_source_get_data(dispatch_source_t source) __attribute__((swift_private));
+void dispatch_source_set_timer(dispatch_source_t source, dispatch_time_t start, uint64_t interval, uint64_t leeway)
+    __attribute__((swift_private));
 void dispatch_source_cancel(dispatch_source_t source) __attribute__((swift_private));
 void dispatch_resume(dispatch_object_t object) __attribute__((swift_private));
 
