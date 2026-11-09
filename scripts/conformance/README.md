@@ -53,6 +53,33 @@ existing owners, notes and XFAIL labels, and labels the expected failures each s
 The default `alchemy-fx` is `build-ninja\Release\alchemy-fx.exe` in this checkout. `--alchemy`
 selects another. `repro <file.c>` builds one source against the sysroot and runs it the same way.
 
+## In CI
+
+The `conformance` job in `.github/workflows/ci.yml` builds the suites on a hosted Windows runner,
+runs them under the fx job's `alchemy-fx` and judges them with `gate`:
+
+```
+python -I scripts/conformance/conformance.py gate all --alchemy <alchemy-fx.exe> --jobs 4 --tsv results.tsv
+```
+
+- A test the baseline expects to pass (or a FAIL test that now does not build) that fails three
+  times in a row is a regression and fails the job. Expected failures, XFAILs and Alchemy-only
+  failures never do.
+- A baseline-PASS test that fails and then passes on a rerun is reported as unstable, with a
+  warning, and does not fail the job.
+- A newly passing test prints "update the baseline" and does not fail the job.
+- `ci.tsv` lists known-flaky tests and tests a hosted runner cannot run honestly. A flaky test runs
+  up to three times and never decides the job. A skipped test is reported as skipped, with its
+  reason, and never counts as a pass.
+- C++ tests need the guest libc++ from `artifacts/`, which a runner lacks. The gate reports them as
+  skipped.
+- Pushes and pull requests run `gate --quick`, which leaves out the tests the baseline expects to
+  fail. Those cannot regress, so the verdict is the same. The weekly run (Wednesdays) and runs started
+  by hand run every test and also report the ones that start passing.
+
+The job prints a summary table, adds it to the job summary, and uploads `conformance-results` (the
+TSV, plus `results/*.json` with each test's output tail).
+
 ## Ground truth on real macOS
 
 `.github/workflows/conformance-macos.yml` builds the suites on a Windows runner and runs the same

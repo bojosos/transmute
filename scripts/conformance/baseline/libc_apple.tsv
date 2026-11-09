@@ -63,16 +63,16 @@ libc_apple/ctype/ctype_loadall	SKIP	fw-system	T_META_ASROOT(true): needs root
 libc_apple/ctype/ctype_maplower	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\ctype.c:208: "en_US.UTF-8" == setlocale(2, "en_US.UTF-8") ("en_US.UTF-8" vs "(null)")
 libc_apple/ctype/ctype_mapupper	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\ctype.c:232: "en_US.UTF-8" == setlocale(2, "en_US.UTF-8") ("en_US.UTF-8" vs "(null)")
 libc_apple/ctype/ctype_runetype	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\ctype.c:121: "en_US.UTF-8" == setlocale(2, "en_US.UTF-8") ("en_US.UTF-8" vs "(null)")
-libc_apple/custom_pcs_func/custom_pcs_func	FAIL	fw-system	fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x10000057c (custom_pcs_func+0x57c) sp=0x1db6294e9a0 thread 150972
+libc_apple/custom_pcs_func/custom_pcs_func	PASS	fw-system	
 libc_apple/darwin_bsd/os_parse_boot_arg	BUILD	fw-system	C:\dev\conformance\Libc-1752.120.2\src\darwin\../libdarwin\internal.h:49:10: fatal error: 'sys/syscall.h' file not found
 libc_apple/darwin_bsd/os_parse_boot_arg_from_buffer_int	BUILD	fw-system	C:\dev\conformance\Libc-1752.120.2\src\darwin\../libdarwin\internal.h:49:10: fatal error: 'sys/syscall.h' file not found
 libc_apple/darwin_bsd/os_parse_boot_arg_from_buffer_string	BUILD	fw-system	C:\dev\conformance\Libc-1752.120.2\src\darwin\../libdarwin\internal.h:49:10: fatal error: 'sys/syscall.h' file not found
 libc_apple/darwin_bsd/parse_boot_arg_value	BUILD	fw-system	C:\dev\conformance\Libc-1752.120.2\src\darwin\../libdarwin\internal.h:49:10: fatal error: 'sys/syscall.h' file not found
 libc_apple/dir/readdir	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _scandir_b from library ordinal -2
-libc_apple/dir/rewinddir	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _scandir_b from library ordinal -2
-libc_apple/dir/rewinddir_dup	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _scandir_b from library ordinal -2
-libc_apple/dir/scandir	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _scandir_b from library ordinal -2
-libc_apple/dir/scandir_b	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _scandir_b from library ordinal -2
+libc_apple/dir/rewinddir	PASS	fw-system	
+libc_apple/dir/rewinddir_dup	PASS	fw-system	
+libc_apple/dir/scandir	PASS	fw-system	
+libc_apple/dir/scandir_b	PASS	fw-system	
 libc_apple/dir/seekdir_basic	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _scandir_b from library ordinal -2
 libc_apple/dir/tell_seek_tell	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _scandir_b from library ordinal -2
 libc_apple/dirname_r/dirname_r_null	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\dirname_r.c:31: sig == 11 (0 vs 11): dirname_r(NULL, NULL)
@@ -86,8 +86,8 @@ libc_apple/envbuf/envbuf_PR_38637477_line_all	FAIL	fw-system	[FAIL] C:\dev\confo
 libc_apple/envbuf/envbuf_PR_38637477_line_stdout	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\envbuf.c:72: !(IS_FLAG_SET(stdout, __SNBF)): not unbuffered
 libc_apple/envbuf/envbuf_PR_38637477_unbuf_all	PASS	fw-system	
 libc_apple/envbuf/envbuf_PR_38637477_unbuf_stdout	PASS	fw-system	
-libc_apple/err/err_multiple_exit	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _err_set_exit_b from library ordinal -2
-libc_apple/err/err_multiple_exit_b	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _err_set_exit_b from library ordinal -2
+libc_apple/err/err_multiple_exit	PASS	fw-system	
+libc_apple/err/err_multiple_exit_b	PASS	fw-system	
 libc_apple/execvp/execvp_failure_EACCES	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
 libc_apple/execvp/execvp_failure_ENAMETOOLONG_absolute	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
 libc_apple/execvp/execvp_failure_ENAMETOOLONG_relative	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\execvp.c:3:10: fatal error: 'copyfile.h' file not found
@@ -140,7 +140,7 @@ libc_apple/freopen/libc_hooks_freopen	FAIL	fw-system	alchemy: Mach-O: unresolved
 libc_apple/ftell_ungetc/ftell_ungetc	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] C:\dev\conformance\out\libc_apple\src\ftell_ungetc.c:16: fp != (FILE*)((void*)0) (0 vs 0): Open the file
 libc_apple/fts_fd_leak/fts_fd_leak_symlink	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\fts_fd_leak.c:153:25: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
 libc_apple/fts_fd_leak/fts_fd_leak_xdev	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\fts_fd_leak.c:153:25: error: call to undeclared function 'mkdir'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
-libc_apple/fts_find/fts_find	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _fts_open_b from library ordinal -2
+libc_apple/fts_find/fts_find	PASS	fw-system	
 libc_apple/fts_find/fts_find_empty_path	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _fts_open_b from library ordinal -2
 libc_apple/fts_nappend/fts_emptydir	PASS	fw-system	
 libc_apple/fts_nappend/fts_nappend	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\fts_nappend.c:31: ent->fts_path == *expect ("/usr/bin" vs "/bin"): /bin
@@ -156,18 +156,18 @@ libc_apple/getdate/getdate3	PASS	fw-system
 libc_apple/getdate/getdate4	PASS	fw-system	
 libc_apple/getdate/getdate46	PASS	fw-system	
 libc_apple/getdate/getdate53	PASS	fw-system	
-libc_apple/getenv/getenv_copy_np_empty	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000c6c (getenv+0xc6c) sp=0x1eb33f6e9c0 thread 80612
-libc_apple/getenv/getenv_copy_np_returns_null	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000b4c (getenv+0xb4c) sp=0x2c2fdf9e9b0 thread 74860
+libc_apple/getenv/getenv_copy_np_empty	PASS	fw-system	
+libc_apple/getenv/getenv_copy_np_returns_null	PASS	fw-system	
 libc_apple/getenv/setenv_accepts_leading_eq_sign	PASS	fw-system	
-libc_apple/getenv/setenv_accepts_leading_eq_sign_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x1000010c8 (getenv+0x10c8) sp=0x20a4c2ee9b0 thread 126644
+libc_apple/getenv/setenv_accepts_leading_eq_sign_getenv_copy_np	PASS	fw-system	
 libc_apple/getenv/setenv_accepts_leading_eq_sign_overwrite	PASS	fw-system	
-libc_apple/getenv/setenv_accepts_leading_eq_sign_overwrite_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100001208 (getenv+0x1208) sp=0x27b69c2e990 thread 145272
+libc_apple/getenv/setenv_accepts_leading_eq_sign_overwrite_getenv_copy_np	PASS	fw-system	
 libc_apple/getenv/setenv_dont_overwrite	PASS	fw-system	
-libc_apple/getenv/setenv_dont_overwrite_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000fd4 (getenv+0xfd4) sp=0x1def046e9a0 thread 114792
+libc_apple/getenv/setenv_dont_overwrite_getenv_copy_np	PASS	fw-system	
 libc_apple/getenv/setenv_getenv	PASS	fw-system	
-libc_apple/getenv/setenv_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000d50 (getenv+0xd50) sp=0x21c6dbee9c0 thread 5376
+libc_apple/getenv/setenv_getenv_copy_np	PASS	fw-system	
 libc_apple/getenv/setenv_overwrite	PASS	fw-system	
-libc_apple/getenv/setenv_overwrite_getenv_copy_np	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: fx runtime: branch to memory that is neither guest code nor host code at guest pc 0x0; x30=0x100000e90 (getenv+0xe90) sp=0x20bb58fe9b0 thread 23176
+libc_apple/getenv/setenv_overwrite_getenv_copy_np	PASS	fw-system	
 libc_apple/inet_pton/inet_pton_strip_leading_zeros	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\inet_pton.c:27: address_octal_pton == int_address_decimal: Address is interpreted the same as the address without leading zeros
 libc_apple/locale/locale_PR_23679075	SKIP	fw-system	excluded upstream
 libc_apple/locale/locale_PR_24165555	SKIP	fw-system	excluded upstream
@@ -184,11 +184,11 @@ libc_apple/mktemp/mkstemp	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\
 libc_apple/mktemp/mkstemp_dprotected_np	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
 libc_apple/mktemp/mktemp	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
 libc_apple/mktemp/two_mkstemp_calls	BUILD	fw-system	C:\dev\conformance\out\libc_apple\src\mktemp.c:6:10: fatal error: 'System/sys/content_protection.h' file not found
-libc_apple/net/inet_ntop	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _link_ntoa from library ordinal -2
+libc_apple/net/inet_ntop	PASS	fw-system	
 libc_apple/net/inet_ntop_PR46867324	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _link_ntoa from library ordinal -2
-libc_apple/net/inet_ntop_resolve_zeroes	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _link_ntoa from library ordinal -2
-libc_apple/net/link_ntoa_basic	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _link_ntoa from library ordinal -2
-libc_apple/net/link_ntoa_overflow	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _link_ntoa from library ordinal -2
+libc_apple/net/inet_ntop_resolve_zeroes	PASS	fw-system	
+libc_apple/net/link_ntoa_basic	PASS	fw-system	
+libc_apple/net/link_ntoa_overflow	PASS	fw-system	
 libc_apple/netbsd_fmemopen/netbsd_fmemopen_test00	PASS	fw-system	
 libc_apple/netbsd_fmemopen/netbsd_fmemopen_test01	PASS	fw-system	
 libc_apple/netbsd_fmemopen/netbsd_fmemopen_test02	PASS	fw-system	
@@ -256,7 +256,7 @@ libc_apple/querylocale/querylocale_order	FAIL	fw-system	[FAIL] C:\dev\conformanc
 libc_apple/quick_exit/quick_exit	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\quick_exit.c:60: pid != -1: expect fork() to succeed
 libc_apple/readpassphrase/readpassphrase_stdin	PASS	fw-system	
 libc_apple/realpath/realpath_basic	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\realpath.c:83: ptr == paths[i].result ("/Volumes/C/" vs "/"): Real path matches expected path
-libc_apple/realpath/realpath_huge	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\realpath.c:104: strlen(result) == (size_t) 1 (11 vs 1)
+libc_apple/realpath/realpath_huge	PASS	fw-system	
 libc_apple/realpath/realpath_symlink	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\realpath.c:129: realpath(slnk, resb) != NULL
 libc_apple/realpath/realpath_trailing	FAIL	fw-system	[FAIL] C:\dev\conformance\out\libc_apple\src\realpath.c:93: realpath("/usr/null/..", result) == NULL
 libc_apple/realpath_edge/realpath_buffer_overflow	BUILD	fw-system	C:\dev\conformance\Libc-1752.120.2\src\darwin\../stdlib/FreeBSD/realpath.c:35:10: fatal error: 'namespace.h' file not found

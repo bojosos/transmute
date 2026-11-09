@@ -8,17 +8,26 @@
 #
 # The runner has no artifacts/ directory (guest LLVM, Swift and Expat runtimes,
 # application roots), and CMake leaves out the tests that need it.
+#
+# * conformance: runs the conformance suites (scripts/conformance/README.md) under the fx
+#   job's alchemy-fx and fails only on regressions against scripts/conformance/baseline/.
+#   Pushes and pull requests run the tests the baseline expects to pass; the weekly run and runs
+#   started by hand run every test.
 name: CI
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 5 * * 3"
 
 permissions:
   contents: read
 
+# Per event, so a push to main does not cancel the weekly full run.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -57,9 +66,87 @@ jobs:
           cmake --build build --config Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # The conformance job runs its suites under this alchemy-fx (one self-contained executable).
+      - name: Upload alchemy-fx for the conformance job
+        if: matrix.name == 'fx'
+        uses: actions/upload-artifact@v4
+        with:
+          name: alchemy-fx
+          retention-days: 1
+          if-no-files-found: error
+          path: build/Release/alchemy-fx.exe
+
       # A few core tests assert that worker threads overlap, which a loaded
       # machine can miss; a failing test gets up to three tries.
       - name: Test
         run: |
           ctest --test-dir build -C Release -j 2 --output-on-failure --timeout 900 --repeat until-pass:3
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # Six open-source suites, built as SDK-free arm64 macOS programs the way conformance-macos.yml
+  # builds them, run under the fx job's alchemy-fx. `conformance.py gate` fails the job only when a
+  # test the baseline expects to pass fails three times in a row. Expected failures, XFAILs and
+  # Alchemy-only failures do not; newly passing tests ask for a baseline update. Known-flaky tests
+  # and tests a hosted runner cannot run honestly (GPU, network, timing) are listed in
+  # scripts/conformance/ci.tsv and reported as flaky or skipped, never as passes.
+  conformance:
+    name: Conformance (alchemy-fx)
+    needs: windows
+    # Runs when the fx build succeeded, whatever the ctest results of either configuration.
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download alchemy-fx (from the fx job)
+        uses: actions/download-artifact@v4
+        with:
+          name: alchemy-fx
+          path: ${{ runner.temp }}/fx
+
+      # The pinned upstream sources change only with sources.json; the cache spares the upstreams a
+      # download on every push. fetch_sources.py verifies what it downloads and leaves cached
+      # directories alone.
+      - name: Cache sources
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/conformance-sources
+          key: conformance-sources-${{ hashFiles('scripts/conformance/sources.json') }}
+
+      - name: Fetch sources (official upstreams, pinned content)
+        run: |
+          python -I scripts/conformance/fetch_sources.py --sources "$env:RUNNER_TEMP\conformance-sources"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build sysroot and suites
+        # C++ tests need the guest libc++ from artifacts/, which the runner lacks; the gate skips them.
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\no-runtime" | Out-Null
+          python -I scripts/conformance/build_sysroot.py --sources "$env:RUNNER_TEMP\conformance-sources" --out "$env:RUNNER_TEMP\conformance\sysroot"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I scripts/conformance/conformance.py build all --sources "$env:RUNNER_TEMP\conformance-sources" --out "$env:RUNNER_TEMP\conformance" --runtime-dir "$env:RUNNER_TEMP\no-runtime"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # --quick leaves out the tests the baseline expects to fail: they cannot regress, so the verdict
+      # is the same. The full run (weekly, or by hand) also reports the ones that start passing.
+      - name: Run suites under alchemy-fx and compare with the baselines
+        env:
+          QUICK: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+        run: |
+          $scope = @(); if ($env:QUICK -eq 'true') { $scope = @('--quick') }
+          python -I scripts/conformance/conformance.py gate all @scope --out "$env:RUNNER_TEMP\conformance" --alchemy "$env:RUNNER_TEMP\fx\alchemy-fx.exe" --runtime-dir "$env:RUNNER_TEMP\no-runtime" --jobs 4 --tsv "$env:RUNNER_TEMP\conformance\conformance-results.tsv"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Results only (status, verdict and output tail of each test), no programs.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-results
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/conformance/conformance-results.tsv
+            ${{ runner.temp }}/conformance/results

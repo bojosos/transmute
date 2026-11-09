@@ -86,6 +86,13 @@ def build(ctx):
                 "__ptrauth_objc_isa_pointer", "__ptrauth_objc_super_pointer", "__ptrauth_objc_class_ro",
                 "__ptrauth_objc_method_list_imp", "__ptrauth_objc_method_list_pointer")))
     testdir = out / "test"
+    # Recipes name /dev/null as an empty input (rawisa's -sectcreate); a Windows linker would open
+    # \dev\null on the current drive instead.
+    empty = out / "empty"
+    empty.write_bytes(b"")
+
+    def host_path(arg):
+        return str(empty) if arg == "/dev/null" else arg
 
     def compiler(language, mem, link=True):
         cxx = language in ("objective-c++", "c++")
@@ -162,11 +169,11 @@ def build(ctx):
                                 "COMPILE_M": "objective-c"}.get(var, language)
                         args += compiler(lang, "mrc" if var.endswith("NOMEM") else mem, link="NOLINK" not in var)
                     else:
-                        args.append(tok)
+                        args.append(host_path(tok))
                 commands.append(args)
         else:
             m = re.search(r"\bTEST_CFLAGS\b(.*)$", text, re.M)
-            cflags = shlex.split(m.group(1)) if m else []
+            cflags = [host_path(a) for a in shlex.split(m.group(1))] if m else []
             commands = [compiler(language, mem) + cflags + [str(path), "-o", f"{name}.exe"]]
         for cmd in commands:
             err = run_in(cmd, builddir)

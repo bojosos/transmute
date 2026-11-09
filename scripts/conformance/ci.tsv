@@ -1,0 +1,6 @@
+# How the CI gate (`conformance.py gate`, .github/workflows/ci.yml) treats tests on a hosted runner.
+# suite	test (regular expression, whole name)	kind	reason
+# kind flaky: known to fail intermittently. It runs up to three times and never decides the job.
+# kind skip: needs what a hosted runner does not have (this machine's GPU, the network, or timing a
+# shared 4-core runner cannot keep). It is not run, and the job reports it as skipped, not passed.
+dispatch	dispatch/context_for_key	flaky	"invalid queue" race in dispatch_queue_set_specific: passed 1 of 3 reruns (2026-11-09)

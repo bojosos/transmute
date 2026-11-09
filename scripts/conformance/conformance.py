@@ -4,6 +4,7 @@ alchemy-fx, and compare the results with the expected-results baseline in baseli
     python -I scripts/conformance/conformance.py build  <suite|all>
     python -I scripts/conformance/conformance.py run    <suite|all> [--filter RE] [--jobs N]
     python -I scripts/conformance/conformance.py report <suite|all> [--write-baseline]
+    python -I scripts/conformance/conformance.py gate   <suite|all> [--tsv FILE]   (CI: run and judge)
 
 Suites live in suites/<name>.py. Upstream sources are untrusted data under --sources (default
 C:\\dev\\conformance, see sources.json and README.md); every output goes under --out (default
@@ -107,6 +108,7 @@ class Context:
         self.llvm_source = pathlib.Path(args.llvm_source)
         self.runtime_dirs = [pathlib.Path(p) for p in (args.runtime_dir or [r"C:\dev\transmute\artifacts\alchemy-llvm-arm64"])]
         self.jobs = args.jobs
+        self.gate = []  # (suite, rows, seconds) per suite the gate ran
 
     def source(self, name):
         path = self.sources / self.manifest[name]["dir"] / "src"
@@ -429,16 +431,31 @@ def cmd_run(ctx, suite, module, args):
     tests = load_tests(ctx, suite)
     if args.filter:
         tests = [t for t in tests if re.search(args.filter, t.name)]
+    results = run_tests(ctx, module, tests, args)
+    save_results(ctx, suite, results, args)
+    summarize(suite, results)
+
+
+def run_one(ctx, module, test):
+    r = ctx.run_test(test)
+    if r.status not in ("BUILD", "SKIP") and hasattr(module, "classify"):
+        r = module.classify(r, ctx)
+    if not r.detail and r.status != "PASS":
+        r.detail = first_line(r.output) if r.output else ""
+    return r
+
+
+def run_tests(ctx, module, tests, args):
     results = []
     with concurrent.futures.ThreadPoolExecutor(ctx.jobs) as pool:
-        for r in pool.map(ctx.run_test, tests):
-            if r.status not in ("BUILD",):
-                r = module.classify(r, ctx) if hasattr(module, "classify") and r.status != "SKIP" else r
-            if not r.detail and r.status != "PASS":
-                r.detail = first_line(r.output) if r.output else ""
+        for r in pool.map(lambda t: run_one(ctx, module, t), tests):
             results.append(r)
             if args.verbose or r.status not in ("PASS", "BUILD", "SKIP"):
                 print(f"{r.status:7} {r.seconds:6.1f}s {r.name}  {r.detail[:120]}", flush=True)
+    return results
+
+
+def save_results(ctx, suite, results, args):
     previous = {}
     path = results_path(ctx, suite)
     if args.filter and path.exists():
@@ -446,7 +463,6 @@ def cmd_run(ctx, suite, module, args):
     previous.update({r.name: dataclasses.asdict(r) for r in results})
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(sorted(previous.values(), key=lambda r: r["name"]), indent=1))
-    summarize(suite, results)
 
 
 def summarize(suite, results):
@@ -485,6 +501,148 @@ def cmd_report(ctx, suite, module, args):
                 print(f"  {r.status:7} {r.name}  {r.detail[:150]}")
     if regressions:
         sys.exit(1)
+
+
+# ---- CI gate ----------------------------------------------------------------------------------
+TRIES = 3  # a failing test that decides the gate runs up to three times in all
+
+
+def ci_rules(suite):
+    """ci.tsv: tests a hosted CI runner treats specially. `flaky`: known to fail intermittently; it runs
+    up to TRIES times and never decides the job. `skip`: needs what the runner does not have (this
+    machine's GPU, the network, or timing a shared runner cannot keep); not run, reported as skipped."""
+    rules = []
+    for line in (HERE / "ci.tsv").read_text(encoding="utf-8").splitlines():
+        if line.strip() and not line.startswith("#"):
+            name, pattern, kind, reason = line.split("\t")
+            if name == suite:
+                rules.append((re.compile(pattern), kind, reason))
+    return rules
+
+
+def ci_rule(rules, name):
+    return next(((kind, reason) for pattern, kind, reason in rules if pattern.fullmatch(name)), (None, ""))
+
+
+def cmd_gate(ctx, suite, module, args):
+    """Runs a suite the way CI does and judges it against the baseline: a test the baseline expects to
+    pass (or to build) that fails TRIES times in a row is a regression. Everything else is reported.
+    --quick leaves out the tests the baseline expects to fail: they cannot regress, so the verdict is the
+    same, but a quick run does not see them start passing (the full run does)."""
+    start = time.monotonic()
+    rules, baseline = ci_rules(suite), load_baseline(suite)
+    tests = load_tests(ctx, suite)
+    if args.filter:
+        tests = [t for t in tests if re.search(args.filter, t.name)]
+    not_run = []
+    if args.quick:
+        not_run = [t for t in tests if baseline.get(t.name, {}).get("expected") in ("FAIL", "XFAIL", "BUILD", "SKIP")
+                   and not t.build_error and ci_rule(rules, t.name)[0] != "flaky"]
+        tests = [t for t in tests if t not in not_run]
+    for t in tests:
+        kind, reason = ci_rule(rules, t.name)
+        if kind == "skip" and not t.skip:
+            t.skip = f"not on a CI runner: {reason}"
+    results = {r.name: r for r in run_tests(ctx, module, tests, args)}
+    for r in results.values():
+        # The guest libc++ comes from artifacts/ (scripts/build_alchemy_llvm.ps1), which a CI runner
+        # does not have; a C++ test there cannot build.
+        if r.status == "BUILD" and re.search(r"libc\+\+\.1\.dylib", r.output):
+            r.status, r.detail = "SKIP", "not on a CI runner: needs the guest libc++ from artifacts/"
+
+    def decides(r):
+        expected = baseline.get(r.name, {}).get("expected")
+        return r.status != "PASS" and (expected == "PASS" or (expected == "FAIL" and r.status == "BUILD"))
+
+    tries = {name: 1 for name in results}
+    first = dict(results)  # the first try's result, which an unstable test's report names
+    by_name = {t.name: t for t in tests}
+    for _ in range(TRIES - 1):
+        again = [by_name[n] for n, r in results.items() if r.status not in ("PASS", "SKIP", "BUILD") and
+                 (decides(r) or ci_rule(rules, n)[0] == "flaky")]
+        for r in run_tests(ctx, module, again, args):
+            tries[r.name] += 1
+            results[r.name] = r
+    rows = []
+    for name, r in sorted(results.items()):
+        expected = baseline.get(name, {}).get("expected")
+        kind, reason = ci_rule(rules, name)
+        retried = tries[name] > 1
+        if r.status == "SKIP":
+            verdict = "skipped"
+        elif kind == "flaky":
+            verdict = "flaky"
+        elif expected is None:
+            verdict = "new"
+        elif r.status == "PASS" and expected == "PASS":
+            verdict = "unstable" if retried else "pass"
+        elif r.status == "PASS":
+            verdict = "newly passing"
+        elif decides(r):
+            verdict = "regression"
+        else:
+            verdict = "expected failure"
+        detail = r.detail or reason
+        if retried and r.status == "PASS":
+            detail = f"first try {first[name].status} in {first[name].seconds:.0f}s: {first[name].detail}"
+        rows.append({"suite": suite, "test": name, "status": r.status, "expected": expected or "", "verdict": verdict,
+                     "tries": tries[name], "seconds": r.seconds, "detail": detail})
+    rows += [{"suite": suite, "test": t.name, "status": "", "expected": baseline[t.name]["expected"],
+              "verdict": "not run", "tries": 0, "seconds": 0, "detail": "quick run: the baseline expects it to fail"}
+             for t in not_run]
+    save_results(ctx, suite, list(results.values()), args)
+    ctx.gate.append((suite, rows, time.monotonic() - start))
+
+
+GATE_COLUMNS = ("pass", "expected failure", "not run", "skipped", "flaky", "unstable", "newly passing", "new",
+                "regression")
+
+
+def gate_report(ctx, args):
+    """Prints the gate's summary table (and adds it to the GitHub job summary), writes the results TSV,
+    and returns whether any regression failed the gate."""
+    rows = [row for _, suite_rows, _ in ctx.gate for row in suite_rows]
+    lines = ["| suite | tests | " + " | ".join(GATE_COLUMNS) + " | minutes |",
+             "|---" * (len(GATE_COLUMNS) + 3) + "|"]
+    for suite, suite_rows, seconds in ctx.gate + [("**all**", rows, sum(s for _, _, s in ctx.gate))]:
+        counts = [sum(1 for row in suite_rows if row["verdict"] == c) for c in GATE_COLUMNS]
+        lines.append(f"| {suite} | {len(suite_rows)} | " + " | ".join(map(str, counts)) + f" | {seconds / 60:.1f} |")
+    notes = []
+    for verdict, title in (("regression", "Regressions: the baseline expects these to pass; they failed "
+                                          f"{TRIES} times in a row"),
+                           ("unstable", "Unstable: failed, then passed on a rerun (fix it, or list it as flaky in "
+                                        "scripts/conformance/ci.tsv)"),
+                           ("flaky", "Known flaky (scripts/conformance/ci.tsv): run up to "
+                                     f"{TRIES} times, never decide the job"),
+                           ("newly passing", "Newly passing: update the baseline (`report <suite> --write-baseline`)"),
+                           ("new", "Not in the baseline yet"),
+                           ("skipped", "Skipped on the CI runner")):
+        picked = [row for row in rows if row["verdict"] == verdict]
+        if verdict == "skipped":
+            picked = [row for row in picked if row["detail"].startswith("not on a CI runner")]
+        if picked:
+            notes += ["", f"{title} ({len(picked)}):"]
+            notes += [f"- {row['suite']} {row['test']}: {row['status']} after {row['tries']} "
+                      f"{'try' if row['tries'] == 1 else 'tries'}  {row['detail'][:160]}" for row in picked]
+    text = "\n".join(lines + notes)
+    print("\n" + text)
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+            f.write("## Conformance under alchemy-fx\n\n" + text + "\n")
+    if os.environ.get("GITHUB_ACTIONS"):
+        for row in rows:
+            if row["verdict"] in ("regression", "unstable"):
+                level = "error" if row["verdict"] == "regression" else "warning"
+                print(f"::{level} title=conformance {row['verdict']}::{row['suite']} {row['test']}: "
+                      f"{row['status']}  {row['detail'][:200]}")
+    if args.tsv:
+        path = pathlib.Path(args.tsv)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        keys = ("suite", "test", "status", "expected", "verdict", "tries", "seconds", "detail")
+        path.write_text("\t".join(keys) + "\n" + "".join(
+            "\t".join(str(row[k]).replace("\t", " ").replace("\n", " ") for k in keys) + "\n" for row in rows),
+            encoding="utf-8")
+    return any(row["verdict"] == "regression" for row in rows)
 
 
 def cmd_compare(ctx, suite, module, args):
@@ -556,7 +714,7 @@ def cmd_repro(ctx, path, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("build", "run", "report", "repro", "compare"))
+    ap.add_argument("command", choices=("build", "run", "report", "repro", "compare", "gate"))
     ap.add_argument("suite", help="a suite name, all, or (repro) a source file")
     ap.add_argument("--sources", default=r"C:\dev\conformance")
     ap.add_argument("--out", default=r"C:\dev\conformance\out")
@@ -571,6 +729,9 @@ def main():
     ap.add_argument("--native", action="store_true",
                     help="run the programs directly instead of under alchemy-fx (real macOS only)")
     ap.add_argument("--macos-results", help="compare: the results directory of a --native run on real macOS")
+    ap.add_argument("--tsv", help="gate: write every test's status and verdict to this TSV file")
+    ap.add_argument("--quick", action="store_true",
+                    help="gate: leave out the tests the baseline expects to fail (they cannot regress)")
     args = ap.parse_args()
     # Guest output can hold any bytes; the console code page must not end the run.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -587,13 +748,15 @@ def main():
     for name in names:
         module = load_suite(name)
         try:
-            {"build": cmd_build, "run": cmd_run, "report": cmd_report,
-             "compare": cmd_compare}[args.command](ctx, name, module, args)
+            {"build": cmd_build, "run": cmd_run, "report": cmd_report, "compare": cmd_compare,
+             "gate": cmd_gate}[args.command](ctx, name, module, args)
         except SystemExit as e:
             if e.code not in (0, None):
                 failed = True
                 if isinstance(e.code, str):
                     print(e.code, file=sys.stderr)
+    if args.command == "gate" and gate_report(ctx, args):
+        failed = True
     sys.exit(1 if failed else 0)
 
 

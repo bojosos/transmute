@@ -524,7 +524,7 @@ posix/pthread_detach/2-1	PASS	fw-system
 posix/pthread_detach/2-2	XFAIL	fw-system	sem_timedwait is not in macOS's headers
 posix/pthread_detach/3-1	PASS	fw-system	
 posix/pthread_detach/4-1	PASS	fw-system	
-posix/pthread_detach/4-2	FAIL	fw-system	Test FAILED: Incorrect return code: 22 instead of ESRCH
+posix/pthread_detach/4-2	PASS	fw-system	
 posix/pthread_detach/4-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:26]
 posix/pthread_equal/1-1	PASS	fw-system	
 posix/pthread_equal/1-2	PASS	fw-system	
@@ -552,7 +552,7 @@ posix/pthread_join/2-1	PASS	fw-system
 posix/pthread_join/3-1	FAIL	fw-system	UNRESOLVED: Error in pthread_testcancel.  Cancel request timed out.
 posix/pthread_join/4-1	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:29]
 posix/pthread_join/5-1	PASS	fw-system	
-posix/pthread_join/6-2	FAIL	fw-system	Test FAILED: Return code should be ESRCH, but is: 22 instead.
+posix/pthread_join/6-2	PASS	fw-system	
 posix/pthread_join/6-3	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: UNRESOLVED: [13:17:29]
 posix/pthread_join/speculative/6-1	PASS	fw-system	
 posix/pthread_key_create/1-1	PASS	fw-system	

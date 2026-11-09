@@ -126,7 +126,7 @@ objc4/methodSetImplementationHook	XFAIL	fw-system	fails on real macOS too (CRASH
 objc4/msgSend	BUILD	fw-system	C:/dev/conformance/out/objc4/test/msgSend.m:25:10: fatal error: 'simd/simd.h' file not found
 objc4/msgSend-performance	SKIP	fw-system	TEST_CONFIG OS=!macosx
 objc4/msgSend-performance-macos	BUILD	fw-system	C:\dev\conformance\out\objc4\test\msgSend-performance.m:5:10: fatal error: 'simd/simd.h' file not found
-objc4/nilAPIArgs	FAIL	fw-system	alchemy: invalid Objective-C Method replacement during synthetic guest call 0x7100000060b0 [guest pc 0x7100000060b0, thread 1]
+objc4/nilAPIArgs	PASS	fw-system	
 objc4/nonpointerisa	BUILD	fw-system	C:\dev\conformance\out\objc4\test\nonpointerisa.m:8:10: fatal error: 'Foundation/Foundation.h' file not found
 objc4/nopool	FAIL	fw-system	BAD: failed assertion '(int)TestRootDealloc != 1' (0x00000000 != 0x00000001) at nopool.m:18
 objc4/nscdtors	BUILD	fw-system	C:\dev\conformance\out\objc4\test\cdtors.mm:4:10: fatal error: 'Foundation/Foundation.h' file not found

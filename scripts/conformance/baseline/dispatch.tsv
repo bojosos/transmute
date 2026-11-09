@@ -10,7 +10,7 @@ dispatch/concur	XFAIL	fw-system	fails on real macOS too (CRASH); under Alchemy: 
 dispatch/context_for_key	FAIL	fw-system	alchemy: guest thread ended by an error: dispatch_queue_set_specific of an invalid queue during synthetic guest call 0x710000005070 during synthetic guest call 0x710000004db0 [worker guest pc 0x710000004db0, thread 3]
 dispatch/data	PASS	fw-system	
 dispatch/deadname	XFAIL	fw-system	fails on real macOS too (TIMEOUT); under Alchemy: alchemy: Mach-O: unresolved strong import _dispatch_mig_server from library ordinal -2
-dispatch/debug	FAIL	fw-system	alchemy: Mach-O: unresolved strong import _dispatch_debug from library ordinal -2
+dispatch/debug	PASS	fw-system	
 dispatch/drift	XFAIL	fw-system	fails on real macOS too (FAIL); under Alchemy: [FAIL] drift (C:\dev\conformance\out\dispatch\src\dispatch_drift.c:92)
 dispatch/group	FAIL	fw-system	==================================================
 dispatch/io	FAIL	fw-system	[FAIL] group wait timed out (C:\dev\conformance\out\dispatch\src\dispatch_io.c:238)
@@ -24,7 +24,7 @@ dispatch/plusplus	PASS	fw-system
 dispatch/priority	FAIL	fw-system	[FAIL] background priority precedence (C:\dev\conformance\out\dispatch\src\dispatch_priority.c:131)
 dispatch/proc	FAIL	fw-system	==================================================
 dispatch/queue_finalizer	PASS	fw-system	
-dispatch/read	FAIL	fw-system	==================================================
+dispatch/read	PASS	fw-system	
 dispatch/read2	FAIL	fw-system	[FAIL] fcntl F_NOCACHE (C:\dev\conformance\out\dispatch\src\dispatch_read2.c:149)
 dispatch/readsync	FAIL	fw-system	==================================================
 dispatch/select	PASS	fw-system	
@@ -37,5 +37,5 @@ dispatch/timer_bit63	PASS	fw-system
 dispatch/timer_set_time	PASS	fw-system	
 dispatch/timer_short	PASS	fw-system	
 dispatch/timer_timeout	PASS	fw-system	
-dispatch/vm	FAIL	fw-system	alchemy: Mach-O: unresolved strong import __dispatch_source_type_vm from library ordinal -2
+dispatch/vm	PASS	fw-system	
 dispatch/vnode	FAIL	fw-system	[FAIL] VNODE RENAME notifications (C:\dev\conformance\out\dispatch\src\dispatch_vnode.c:110)
