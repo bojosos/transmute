@@ -1118,6 +1118,60 @@ void CoreFoundation::Impl::install_extended() {
         catch (...) { context.objects().release(language); throw; }
     });
     install("CFLocaleCreateCanonicalLocaleIdentifierFromString", 2, [this](auto a) { allocator(a[0]); return utf8_string(parse_locale(utf8(a[1])).identifier); });
+    // CFDictionaryRef CFLocaleCreateComponentsFromLocaleIdentifier(alloc, CFStringRef identifier): its language,
+    // script, country and variant codes under kCFLocaleLanguageCode, kCFLocaleScriptCode, kCFLocaleCountryCode and
+    // kCFLocaleVariantCode (only the parts it has), and each "@key=value;..." keyword under its key.
+    install("CFLocaleCreateComponentsFromLocaleIdentifier", 2, [this](auto a) {
+        allocator(a[0]);
+        const auto text = a[1] ? utf8(a[1]) : std::string();
+        const auto parts = parse_locale(text);
+        std::vector<std::pair<std::string, std::string>> entries;
+        for (const auto& [key, value] : {std::pair<std::string_view, const std::string*>{"locale:language code", &parts.language},
+                 {"locale:script code", &parts.script}, {"locale:country code", &parts.country}, {"locale:variant code", &parts.variant}})
+            if (!value->empty()) entries.emplace_back(key, *value);
+        if (const auto at = text.find('@'); at != std::string::npos) {
+            for (std::size_t from = at + 1; from < text.size();) {
+                const auto end = std::min(text.find(';', from), text.size());
+                const auto item = text.substr(from, end - from);
+                if (const auto equals = item.find('='); equals != std::string::npos && equals > 0 && equals + 1 < item.size())
+                    entries.emplace_back(cased(item.substr(0, equals), false), item.substr(equals + 1));
+                from = end + 1;
+            }
+        }
+        const auto result = dictionary(true, true, true);
+        try {
+            for (const auto& [key, value] : entries) {
+                const auto k = utf8_string(key), v = utf8_string(value);
+                try { dictionary_set(result, k, v); } catch (...) { context.objects().release(k); context.objects().release(v); throw; }
+                context.objects().release(k);
+                context.objects().release(v);
+            }
+        } catch (...) { context.objects().release(result); throw; }
+        freeze(result, false);
+        return result;
+    });
+    // CFStringRef CFLocaleCreateLocaleIdentifierFromComponents(alloc, CFDictionaryRef): the codes joined with "_",
+    // then the other string entries as "@key=value;..." keywords in key order.
+    install("CFLocaleCreateLocaleIdentifierFromComponents", 2, [this](auto a) {
+        allocator(a[0]);
+        if (!a[1]) return std::uint64_t{0};
+        std::map<std::string, std::string> values;
+        for (const auto [key, value] : dictionary_values(a[1]))
+            if (object(key)->kind == ObjectKind::string && object(value)->kind == ObjectKind::string) values[utf8(key)] = utf8(value);
+        std::string identifier;
+        for (const auto* key : {"locale:language code", "locale:script code", "locale:country code", "locale:variant code"}) {
+            const auto found = values.find(key);
+            if (found == values.end()) continue;
+            if (!found->second.empty()) { if (!identifier.empty()) identifier += '_'; identifier += found->second; }
+            values.erase(found);
+        }
+        std::string keywords;
+        for (const auto& [key, value] : values) {
+            if (key.starts_with("locale:")) continue;   // other locale properties are not identifier parts
+            keywords += (keywords.empty() ? "@" : ";") + key + "=" + value;
+        }
+        return utf8_string(identifier + keywords);
+    });
     install("CFLocaleCreateCanonicalLanguageIdentifierFromString", 2, [this](auto a) { allocator(a[0]); return utf8_string(bcp47(parse_locale(utf8(a[1])))); });
     auto set_double = [](transmute::CpuState& state, double value) { state.v[0] = {std::bit_cast<std::uint64_t>(value), 0}; };
     install_raw("CFAbsoluteTimeGetCurrent", [set_double](auto& state, auto&) { set_double(state, absolute_time(std::chrono::system_clock::now())); });

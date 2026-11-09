@@ -1342,6 +1342,8 @@ struct Extra {
         for (const auto& [selector, function] : lists)   // CoreFoundation's guest functions (cf_locale.cpp)
             method(l, selector, [this, function](auto& state, auto&) { state.x[0] = autorelease(call(core_foundation_library, function, {})); }, true);
         method(l, "canonicalLocaleIdentifierFromString:",[this](auto& state, auto&) { state.x[0] = autorelease(cf.invoke("CFLocaleCreateCanonicalLocaleIdentifierFromString", std::array<Address, 2>{0, state.x[2]})); }, true);
+        method(l, "componentsFromLocaleIdentifier:", [this](auto& state, auto&) { state.x[0] = autorelease(cf.invoke("CFLocaleCreateComponentsFromLocaleIdentifier", std::array<Address, 2>{0, state.x[2]})); }, true);
+        method(l, "localeIdentifierFromComponents:", [this](auto& state, auto&) { state.x[0] = autorelease(cf.invoke("CFLocaleCreateLocaleIdentifierFromComponents", std::array<Address, 2>{0, state.x[2]})); }, true);
         const std::array<std::pair<const char*, const char*>, 9> keyed{{
             {"localeIdentifier", "kCFLocaleIdentifier"}, {"languageCode", "kCFLocaleLanguageCode"}, {"countryCode", "kCFLocaleCountryCode"},
             {"regionCode", "kCFLocaleCountryCode"}, {"scriptCode", "kCFLocaleScriptCode"}, {"variantCode", "kCFLocaleVariantCode"},

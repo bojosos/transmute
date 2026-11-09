@@ -263,6 +263,24 @@ void test_guest_locale(Fixture& f) {
     const auto cf = alchemy::core_foundation_library;
     const auto us = f.call(cf, "_CFLocaleCreate", {0, f.cf.string("en_US")});
     const auto key = [&](const char* name) { return f.engine.read64(f.symbol(cf, name)); };
+    // Locale identifier components, and back (LibreOffice: +[NSLocale componentsFromLocaleIdentifier:]).
+    const auto components = f.call(cf, "_CFLocaleCreateComponentsFromLocaleIdentifier", {0, f.cf.string("zh-hant_tw@calendar=chinese;collation=stroke")});
+    const auto part = [&](Address name) { const auto value = f.cf.dictionary_value(components, name); return value ? f.cf.utf8(value) : std::string("<none>"); };
+    require(part(key("_kCFLocaleLanguageCode")) == "zh" && part(key("_kCFLocaleScriptCode")) == "Hant" && part(key("_kCFLocaleCountryCode")) == "TW" &&
+                part(key("_kCFLocaleVariantCode")) == "<none>" && part(f.cf.string("calendar")) == "chinese" && part(f.cf.string("collation")) == "stroke" &&
+                f.call(cf, "_CFDictionaryGetCount", {components}) == 5, "CFLocaleCreateComponentsFromLocaleIdentifier");
+    require(f.cf.utf8(f.call(cf, "_CFLocaleCreateLocaleIdentifierFromComponents", {0, components})) == "zh_Hant_TW@calendar=chinese;collation=stroke",
+            "CFLocaleCreateLocaleIdentifierFromComponents");
+    const auto locale_class = f.objc.find_class("NSLocale");
+    const auto locale_send = [&](const char* selector, Address argument) {
+        alchemy::CallRegs registers{};
+        registers.x[2] = argument;
+        return f.objc.send(locale_class, selector, registers).x0;
+    };
+    const auto de_components = locale_send("componentsFromLocaleIdentifier:", f.cf.string("de_DE"));
+    require(f.call(cf, "_CFDictionaryGetCount", {de_components}) == 2 && f.cf.utf8(f.cf.dictionary_value(de_components, key("_kCFLocaleCountryCode"))) == "DE" &&
+                f.cf.utf8(locale_send("localeIdentifierFromComponents:", de_components)) == "de_DE",
+            "+[NSLocale componentsFromLocaleIdentifier:] and +localeIdentifierFromComponents:");
     // Date formatter patterns and symbols.
     const auto short_date = f.call(cf, "_CFDateFormatterCreate", {0, us, 1, 0});
     require(f.cf.utf8(f.call(cf, "_CFDateFormatterGetFormat", {short_date})) == "M/d/y", "en_US short date pattern");
