@@ -76,9 +76,9 @@ struct sampler {
 };
 
 // ---- sample options -------------------------------------------------------------------
-struct bias { float value; constexpr bias(float v) : value(v) {} };
-struct level { float value; constexpr level(float v) : value(v) {} };
-struct min_lod_clamp { float value; constexpr min_lod_clamp(float v) : value(v) {} };
+struct bias { float value; explicit constexpr bias(float v) : value(v) {} };
+struct level { float value; explicit constexpr level(float v) : value(v) {} };
+struct min_lod_clamp { float value; explicit constexpr min_lod_clamp(float v) : value(v) {} };
 struct gradient2d { float2 dx, dy; gradient2d(float2 a, float2 b) : dx(a), dy(b) {} };
 struct gradient3d { float3 dx, dy; gradient3d(float3 a, float3 b) : dx(a), dy(b) {} };
 struct gradientcube { float3 dx, dy; gradientcube(float3 a, float3 b) : dx(a), dy(b) {} };

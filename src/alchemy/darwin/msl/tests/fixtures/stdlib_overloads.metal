@@ -77,7 +77,9 @@ fragment float4 overloads_fs(Interp in [[stage_in]], constant Params& params [[b
   g.uv = in.uv;
   g.flags = in.flags;
   // metal::mix(float, float, float) next to the user templates above.
-  const float d = glyphs.sample(glyph_sampler, g.uv).r;
+  // A bare integer third argument is the int2 offset: bias, level and
+  // min_lod_clamp only convert explicitly (OBS's generated shaders pass 0).
+  const float d = glyphs.sample(glyph_sampler, g.uv, 0).r;
   const float a = mix(0.0f, 1.0f, g.smooth(d));
   const float b = mix(a, 0.5f, d > params.threshold);           // user mix(T, T, bool)
   const float4 c = mix(g.color, float4(b), 0.5f);              // metal::mix(vec, vec, float)
