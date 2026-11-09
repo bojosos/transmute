@@ -306,6 +306,48 @@ void test_guest_zstream(Fixture& f) {
     require(static_cast<std::int32_t>(f.call(libz, "_inflate", {inflater, 0})) == -3 && f.engine.read64(inflater + 48) != 0, "Z_DATA_ERROR");
     require(f.read(f.call(libz, "_zError", {static_cast<std::uint64_t>(-3)})) == "data error", "zError");
     static_cast<void>(f.call(libz, "_inflateEnd", {inflater}));
+
+    // inflateSync: raw data with a full flush between two parts; the first part is damaged. The sync point's
+    // 00 00 FF FF is split across two calls; afterwards inflate decodes the second part.
+    const auto first = repeat("Lost before the flush point. ", 40), second = repeat("Found after the flush point. ", 50);
+    const auto first_text = f.text(first), second_text = f.text(second);
+    f.engine.fill_bytes(deflater, 0, 112);
+    require(static_cast<std::int32_t>(f.call(libz, "_deflateInit2_", {deflater, 6, 8, static_cast<std::uint64_t>(-15), 8, 0, version, 112})) == 0,
+        "deflateInit2_ raw");
+    f.engine.write64(deflater + 24, packed);
+    f.engine.write32(deflater + 32, 16384);
+    f.engine.write64(deflater + 0, first_text);
+    f.engine.write32(deflater + 8, static_cast<std::uint32_t>(first.size()));
+    require(static_cast<std::int32_t>(f.call(libz, "_deflate", {deflater, 3})) == 0, "deflate Z_FULL_FLUSH");
+    const auto flushed = f.engine.read64(deflater + 40);
+    f.engine.write64(deflater + 0, second_text);
+    f.engine.write32(deflater + 8, static_cast<std::uint32_t>(second.size()));
+    require(static_cast<std::int32_t>(f.call(libz, "_deflate", {deflater, 4})) == 1, "deflate Z_FINISH after a full flush");
+    const auto raw_size = f.engine.read64(deflater + 40);
+    static_cast<void>(f.call(libz, "_deflateEnd", {deflater}));
+    std::vector<std::uint8_t> marker(4);
+    f.engine.read_bytes(packed + flushed - 4, marker);
+    require(marker == std::vector<std::uint8_t>{0, 0, 0xff, 0xff}, "a full flush ends with 00 00 FF FF");
+    f.engine.fill_bytes(packed, 0xa5, 4);   // damage the first part
+    f.engine.fill_bytes(inflater, 0, 112);
+    require(static_cast<std::int32_t>(f.call(libz, "_inflateInit2_", {inflater, static_cast<std::uint64_t>(-15), version, 112})) == 0,
+        "inflateInit2_ raw");
+    f.engine.write64(inflater + 24, unpacked);
+    f.engine.write32(inflater + 32, 16384);
+    require(static_cast<std::int32_t>(f.call(libz, "_inflateSync", {inflater})) == -5, "inflateSync without input: Z_BUF_ERROR");
+    f.engine.write64(inflater + 0, packed);
+    f.engine.write32(inflater + 8, static_cast<std::uint32_t>(flushed - 2));
+    require(static_cast<std::int32_t>(f.call(libz, "_inflateSync", {inflater})) == -3 && f.engine.read32(inflater + 8) == 0,
+        "inflateSync skips all input before the sync point: Z_DATA_ERROR");
+    f.engine.write32(inflater + 8, static_cast<std::uint32_t>(raw_size - (flushed - 2)));
+    require(static_cast<std::int32_t>(f.call(libz, "_inflateSync", {inflater})) == 0 && f.engine.read64(inflater + 16) == flushed,
+        "inflateSync finds the sync point across calls; total_in marks it");
+    require(static_cast<std::int32_t>(f.call(libz, "_inflate", {inflater, 4})) == 1 && f.engine.read64(inflater + 40) == second.size(),
+        "inflate after inflateSync");
+    std::vector<std::uint8_t> recovered(second.size());
+    f.engine.read_bytes(unpacked, recovered);
+    require(recovered == bytes(second), "inflateSync output");
+    static_cast<void>(f.call(libz, "_inflateEnd", {inflater}));
 }
 
 // libpng's IDAT reader (png_read_IDAT_data): one row of output per inflate

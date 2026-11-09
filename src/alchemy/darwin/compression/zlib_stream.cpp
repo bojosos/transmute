@@ -12,14 +12,13 @@
 // /usr/lib/libz.1.dylib streaming interface (zlib.h z_stream): deflateInit_,
 // deflateInit2_, deflate, deflateReset, deflateEnd, deflateBound, inflateInit_,
 // inflateInit2_, inflate, inflateReset, inflateReset2, inflateValidate,
-// inflateEnd and zError, over the project-authored InflateStream and
+// inflateSetDictionary, inflateSync, inflateEnd, deflateSetDictionary,
+// deflateParams and zError, over the project-authored InflateStream and
 // DeflateStream (zlib_codec.hpp). Qt Core/Gui/Network/Svg, Boost.Iostreams and
 // OpenVDB in a renderer plug-in import them. The z_stream's `state` holds an
 // opaque guest token naming the host state; zalloc/zfree are not called.
-// Not provided (unresolved at bind): preset dictionaries
-// (inflateSetDictionary/deflateSetDictionary: a stream that needs one fails
-// with Z_NEED_DICT), deflateParams, deflateTune, inflateSync, inflateCopy,
-// deflateCopy and inflateBack. The gz* file interface is zlib_files.cpp.
+// Not provided (unresolved at bind): deflateTune, inflateCopy, deflateCopy and
+// inflateBack. The gz* file interface is zlib_files.cpp.
 namespace alchemy::export_fill {
 namespace {
 
@@ -40,6 +39,8 @@ struct Stream {
     std::variant<std::unique_ptr<InflateStream>, std::unique_ptr<DeflateStream>> codec;
     std::size_t delivered{};   // bytes of codec output() already copied to the guest
     bool deflate_flushed_finish{};
+    unsigned sync_matched{};   // inflateSync: bytes of 00 00 FF FF matched so far
+
 };
 
 class Streams {
@@ -241,6 +242,7 @@ void install_zlib_stream(ProcessContext& process) {
             (*codec)->reset();   // inflateReset keeps the wrapper chosen at initialization
         }
         state->delivered = 0;
+        state->sync_matched = 0;
         begin(m, stream, m.read64(stream + state_field), (*codec)->check());
         return z_ok;
     };
@@ -271,6 +273,33 @@ void install_zlib_stream(ProcessContext& process) {
         const auto result = (*codec)->set_dictionary(bytes);
         s.x[0] = code(result == InflateStream::Dictionary::ok ? z_ok :
                       result == InflateStream::Dictionary::mismatch ? z_data_error : z_stream_error);
+    });
+    // int inflateSync(z_streamp): skips input up to a full flush point, the 00 00 FF FF of the empty stored block
+    // a full flush ends with, matched across calls. Found: Z_OK, the input after it is next, and inflate goes on
+    // from it as raw deflate data (the window and the header are behind; as zlib, the check is no longer
+    // computed, and a zlib or gzip trailer is not read). All input skipped: Z_DATA_ERROR (Z_BUF_ERROR with none).
+    // total_in and total_out keep counting, so total_in then tells where the good data starts.
+    function("_inflateSync", [lookup](CpuState& s, GuestMemory& m) {
+        const auto stream = s.x[0];
+        const auto state = lookup(m, stream);
+        auto* codec = state ? std::get_if<std::unique_ptr<InflateStream>>(&state->codec) : nullptr;
+        if (!codec) { s.x[0] = code(z_stream_error); return; }
+        const auto input = take_input(m, stream);
+        if (input.empty()) { s.x[0] = code(z_buf_error); return; }
+        auto matched = state->sync_matched;
+        std::size_t next = 0;
+        for (; next < input.size() && matched < 4; ++next) {
+            if (input[next] == (matched < 2 ? 0 : 0xff)) ++matched;
+            else if (input[next]) matched = 0;
+            else matched = 4 - matched;   // a zero after 00 00 FF keeps one zero matched (zlib's syncsearch)
+        }
+        consume(m, stream, next);
+        if (matched != 4) { state->sync_matched = matched; s.x[0] = code(z_data_error); return; }
+        state->sync_matched = 0;
+        (*codec)->reset(Wrapper::raw);
+        state->delivered = 0;
+        m.write64(stream + msg, 0);
+        s.x[0] = code(z_ok);
     });
     // int inflateEnd(z_streamp)
     function("_inflateEnd", [lookup, streams](CpuState& s, GuestMemory& m) {
