@@ -530,6 +530,10 @@ $extraOverlays = @(
 )
 $extraIncludeRoots = [System.Collections.Generic.List[string]]::new()
 if ($Library -eq 'all') {
+    # /usr/lib/swift/libswiftObjectiveC.dylib first: once its module exists, SEL imports as ObjectiveC.Selector and
+    # NSObject is Hashable in every overlay built after it.
+    Build-Overlay 'ObjectiveC' 'swiftObjectiveC'
+
     Build-Overlay 'Foundation' 'swiftFoundation'
     Build-Overlay 'os' 'swiftos'
     foreach ($overlay in $extraOverlays) {
