@@ -113,6 +113,13 @@ privacy setting; WASAPI / MMDevice on win32), `host::camera` (Media Foundation o
 needs encoding, sample-rate conversion or channel remapping, and audio-mix
 volume ramps.
 
+**Unverified values:** string constants carry the values of the public documentation. Where it gives none, the
+value follows the framework's naming convention (usually the name without its `kVT...`/`kCM...` prefix) and the
+code marks it "(unverified: ...)": VideoToolbox compression keys, profile levels, entropy modes and encoder list
+keys (`video.cpp`, `media_gaps.cpp`), `kCMSampleAttachmentKey_PartialSync` and
+`kCMFormatDescriptionExtension_VerbatimSampleDescription` (`coremedia.cpp`), and the CoreVideo, AVFoundation and
+AudioToolbox names marked in `media_gaps.cpp` and `pixel_transfer.cpp`.
+
 ## Moved from darwin/identities/
 
 * `pixel_buffers.cpp`: headless, every build: CoreVideo pixel buffers are unsupported (kCVReturnUnsupported).

@@ -2189,16 +2189,15 @@ void install_av_foundation(Support& support) {
     support.method(bus, "shouldAllocateBuffer", [av](CpuState& s, GuestMemory&) { s.x[0] = av->state<BusState>(s.x[0])->allocate; }, "B@:");
     support.method(bus, "setShouldAllocateBuffer:", [av](CpuState& s, GuestMemory&) { av->state<BusState>(s.x[0])->allocate = (s.x[2] & 0xff) != 0; }, "v@:B");
 
-    // ---- AUGenericView (CoreAudioKit): needs an audio unit -------------------------------------------
+    // ---- AUGenericView (CoreAudioKit): no generic view of a unit's parameters is drawn, so none is made -----
     if (const auto view = support.objc.find_class("NSView")) {
         static_cast<void>(view);
         const auto generic = support.declare_class("AUGenericView", "NSView", core_audio_kit);
         for (const auto& [selector, types] : std::initializer_list<std::pair<const char*, const char*>>{
                  {"initWithAudioUnit:", "@@:^{ComponentInstanceRecord=}"}, {"initWithAudioUnit:displayFlags:", "@@:^{ComponentInstanceRecord=}I"}}) {
             const std::string name = std::string("-[AUGenericView ") + selector + "]";
-            support.method(generic, selector, [av, name](CpuState& s, GuestMemory&) {
-                if (s.x[2]) cannot_exist(name + " with an AudioUnit");
-                av->release(s.x[0]);   // a NULL unit makes no view
+            support.method(generic, selector, [av](CpuState& s, GuestMemory&) {
+                av->release(s.x[0]);
                 s.x[0] = 0;
             }, types);
         }
