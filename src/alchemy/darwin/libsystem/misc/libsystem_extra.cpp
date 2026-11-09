@@ -130,46 +130,60 @@ std::optional<std::pair<std::size_t, bool>> bracket(std::string_view pattern, st
     if (index >= pattern.size()) return std::nullopt;
     return std::pair{index + 1, matched != negate};
 }
-bool fnmatch_at(std::string_view pattern, std::size_t p, std::string_view value, std::size_t s, int flags, unsigned depth) {
-    if (depth > 4096) throw std::runtime_error("Darwin fnmatch pattern recursion limit");
+// Iterative, with one backtrack point (the last '*'), as FreeBSD's fnmatch: a later star never needs
+// an earlier one to match differently, so the work is O(pattern x value). (Trying every split at
+// every star took C(n + k, k) steps for k stars; glob's pathological test timed out.)
+bool fnmatch(std::string_view pattern, std::string_view value, int flags) {
     const auto leading = [&](std::size_t at) { return at == 0 || ((flags & fnm_pathname) && value[at - 1] == '/'); };
-    while (p < pattern.size()) {
-        const auto c = pattern[p];
-        if (c == '?') {
-            if (s == value.size() || ((flags & fnm_pathname) && value[s] == '/') ||
-                ((flags & fnm_period) && value[s] == '.' && leading(s))) return false;
-            ++p; ++s; continue;
-        }
-        if (c == '*') {
-            while (p < pattern.size() && pattern[p] == '*') ++p;
-            if ((flags & fnm_period) && s < value.size() && value[s] == '.' && leading(s)) return false;
-            if (p == pattern.size()) {
-                if (!(flags & fnm_pathname) || (flags & fnm_leading_dir)) return true;
-                return value.find('/', s) == std::string_view::npos;
+    std::size_t p = 0, s = 0;
+    std::size_t star_pattern = std::string_view::npos, star_value = 0;   // the pattern after the last '*', and where it resumes
+    for (;;) {
+        bool mismatch = false;
+        if (p < pattern.size()) {
+            const auto c = pattern[p];
+            if (c == '*') {
+                while (p < pattern.size() && pattern[p] == '*') ++p;
+                if ((flags & fnm_period) && s < value.size() && value[s] == '.' && leading(s)) return false;
+                if (p == pattern.size()) {
+                    if (!(flags & fnm_pathname) || (flags & fnm_leading_dir)) return true;
+                    return value.find('/', s) == std::string_view::npos;
+                }
+                star_pattern = p; star_value = s;
+                continue;
             }
-            for (auto at = s; at <= value.size(); ++at) {
-                if (fnmatch_at(pattern, p, value, at, flags, depth + 1)) return true;
-                if (at < value.size() && (flags & fnm_pathname) && value[at] == '/') break;
+            const bool stops = s == value.size() || ((flags & fnm_pathname) && value[s] == '/') ||
+                               ((flags & fnm_period) && value[s] == '.' && leading(s));
+            if (c == '?') {
+                if (stops) mismatch = true;
+                else { ++p; ++s; continue; }
+            } else {
+                std::optional<std::pair<std::size_t, bool>> result;
+                if (c == '[' && !stops) result = bracket(pattern, p, value[s], flags);
+                if (result) {
+                    if (result->second) { p = result->first; ++s; continue; }
+                    mismatch = true;
+                } else if (c == '[' && stops) {
+                    mismatch = true;
+                } else {
+                    auto literal = c;
+                    auto next = p + 1;
+                    if (c == '\\' && !(flags & fnm_noescape) && next < pattern.size()) literal = pattern[next++];
+                    if (s == value.size() || ((flags & fnm_casefold) ? fold(literal) != fold(value[s]) : literal != value[s])) mismatch = true;
+                    else { p = next; ++s; continue; }
+                }
             }
-            return false;
+        } else {
+            if (s == value.size() || ((flags & fnm_leading_dir) && value[s] == '/')) return true;
+            mismatch = true;
         }
-        if (c == '[') {
-            if (s == value.size() || ((flags & fnm_pathname) && value[s] == '/') ||
-                ((flags & fnm_period) && value[s] == '.' && leading(s))) return false;
-            if (const auto result = bracket(pattern, p, value[s], flags)) {
-                if (!result->second) return false;
-                p = result->first; ++s; continue;
-            }
-        }
-        auto literal = c;
-        if (c == '\\' && !(flags & fnm_noescape) && p + 1 < pattern.size()) literal = pattern[++p];
-        if (s == value.size()) return false;
-        if ((flags & fnm_casefold) ? fold(literal) != fold(value[s]) : literal != value[s]) return false;
-        ++p; ++s;
+        static_cast<void>(mismatch);
+        // Backtrack: the last star takes one more character (never a '/' under FNM_PATHNAME).
+        if (star_pattern == std::string_view::npos || star_value >= value.size()) return false;
+        if ((flags & fnm_pathname) && value[star_value] == '/') return false;
+        ++star_value;
+        p = star_pattern; s = star_value;
     }
-    return s == value.size() || ((flags & fnm_leading_dir) && value[s] == '/');
 }
-bool fnmatch(std::string_view pattern, std::string_view value, int flags) { return fnmatch_at(pattern, 0, value, 0, flags, 0); }
 bool has_magic(std::string_view pattern, bool noescape) {
     for (std::size_t at = 0; at < pattern.size(); ++at) {
         if (pattern[at] == '\\' && !noescape) { ++at; continue; }

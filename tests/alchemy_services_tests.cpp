@@ -526,6 +526,19 @@ void patterns_and_directories() {
     require(f.call("_fnmatch", {f.string("*/*"), f.string("a/.b"), 6}) == 1, "FNM_PERIOD after a separator");
     require(f.call("_fnmatch", {f.string("[a-c]x[!0-9]"), f.string("bxz"), 0}) == 0, "fnmatch brackets");
     require(f.call("_fnmatch", {f.string("A*"), f.string("abc"), 16}) == 0, "FNM_CASEFOLD");
+    // Backtracking: a later star takes over (one backtrack point), escapes, FNM_LEADING_DIR.
+    require(f.call("_fnmatch", {f.string("*ab*cd"), f.string("xxabyyabzzcd"), 0}) == 0, "two stars");
+    require(f.call("_fnmatch", {f.string("a*b?c"), f.string("axxbyc"), 0}) == 0 && f.call("_fnmatch", {f.string("a*b?c"), f.string("axxbc"), 0}) == 1,
+            "star then question mark");
+    require(f.call("_fnmatch", {f.string("*\\*"), f.string("ab*"), 0}) == 0 && f.call("_fnmatch", {f.string("*\\*"), f.string("ab"), 0}) == 1,
+            "an escaped star");
+    require(f.call("_fnmatch", {f.string("a*/c"), f.string("ab/x/c"), 2}) == 1, "FNM_PATHNAME star does not take a slash when backtracking");
+    require(f.call("_fnmatch", {f.string("a*"), f.string("ab/c"), 2 | 8}) == 0, "FNM_LEADING_DIR");
+    // glob's pathological pattern: 30 stars against 100 'a's is immediate (the recursion took C(n + k, k) steps).
+    std::string stars, name(100, 'a');
+    for (int index = 0; index < 30; ++index) stars += "a*";
+    require(f.call("_fnmatch", {f.string(stars + "b"), f.string(name), 0}) == 1 && f.call("_fnmatch", {f.string(stars), f.string(name), 0}) == 0,
+            "a pathological pattern");
     const auto regex = f.context.allocate_guest(32), matches = f.context.allocate_guest(64);
     require(f.call("_regcomp", {regex, f.string("^a(b+)c$"), 1}) == 0 && f.engine.read64(regex + 8) == 1, "ERE compile");
     require(f.call("_regexec", {regex, f.string("abbbc"), 2, matches, 0}) == 0, "ERE match");
