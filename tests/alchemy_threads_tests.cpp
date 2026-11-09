@@ -305,7 +305,10 @@ void test_tlv_and_cleanup() {
     require(f.call("___alchemy_pthread_cleanup_push", {data + 160, cleanup, 43}) == 0, "cleanup repush failed");
     auto thread = f.process.thread(f.engine);
     f.threads.cleanup_thread(*thread);
-    require(finalizers == 1 && thread->tls_blocks.empty(), "thread cleanup incomplete");
+    // The main thread's thread-local storage outlives its cleanup (exit runs image terminators and atexit
+    // handlers after it, which may still read a thread_local), as on Darwin.
+    require(&f.engine == &f.process.main_engine(), "the fixture runs on the main engine");
+    require(finalizers == 1 && !thread->tls_blocks.empty() && f.engine.read32(value) == 27, "main thread cleanup released its TLS");
     require(cleanup_order == std::vector<std::uint64_t>({42, 43, 27}), "pthread cleanup order wrong");
 }
 void test_guards_and_timed_condition() {

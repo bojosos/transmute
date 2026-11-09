@@ -485,6 +485,9 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             if (array) process.release_guest(array);
             if (auto& cache = tsd_cache(); cache.owner == serial && cache.identity == thread.identity) cache = {};
         }
+        // So do the main thread's thread-local variables, as Darwin's: a static destructor or atexit handler that
+        // reads one (LibreOffice's strncmp after its last document) would otherwise fault on a released block.
+        if (thread.engine == &process.main_engine()) return;
         for (const auto& [module, address] : thread.tls_blocks) {
             static_cast<void>(module);
             process.release_guest(address);
