@@ -357,3 +357,42 @@ overlay adds `CMSampleBuffer.imageBuffer`.
 
 Guest test: `alchemy_swift_foundation` (`tests/fixtures/macos/swift_foundation`),
 registered once the runtime directory has libswiftObjectiveC.
+
+## OBS's overlay members: CoreFoundation, CoreMediaIO, CoreMedia, Foundation
+
+OBS Studio's Metal renderer and its camera extension bind these. All are
+written from Apple's public documentation.
+
+- `/usr/lib/swift/libswiftCoreFoundation.dylib` is new. It defines `CGFloat`
+  (a wrapper over Double), which mangles under CoreGraphics, where apps expect
+  it (`@_originallyDefinedIn`). It also defines `_CFObject`, whose `==` and
+  hashing are `CFEqual` and `CFHash`. It builds right after the ObjectiveC
+  overlay, so every overlay that imports CoreFoundation sees it. CGFloat's
+  comparisons call Double's `isEqual(to:)` and `isLess(than:)` by name:
+  written as `native < native`, Swift's implicit Double-to-CGFloat conversion
+  resolves the operator back to CGFloat's own, an endless loop.
+- `/usr/lib/swift/libswiftCoreMediaIO.dylib` is new. It adds the
+  camera-extension classes' Swift members over their Objective-C properties:
+  `CMIOExtensionStreamFormat`'s initializer and `validFrameDurations`;
+  `CMIOExtensionStreamProperties.activeFormatIndex`, `frameDuration`,
+  `sinkBufferQueueSize` and `sinkBuffersRequiredForStartup`; and
+  `CMIOExtensionDeviceProperties.transportType`. The optional integers are
+  NSNumbers, and the CMTimes are CMTime dictionaries
+  (`CMTimeCopyAsDictionary`, `CMTimeMakeFromDictionary`).
+- CoreMedia declares `CMTime` and `CMTimeRange` as typedefs of anonymous
+  structs, as published, so Swift names them by the typedef: `CMTime` is the
+  type alias `__C.CMTime`, as in apps' symbols. Its exports were the struct
+  form, which no app binds. New: `CMSampleBuffer.presentationTimeStamp`,
+  `CMFormatDescription.MediaSubType` and `mediaSubType`.
+- Foundation adds `StringProtocol.cString(using:)`: the bytes and a
+  terminating NUL, or nil when the string can't be encoded. It also adds
+  `NSDictionary(dictionaryLiteral:)`.
+
+The link stubs bind CoreFoundation's `CF*` C names to CoreFoundation.framework,
+as they bind `CM*` names to CoreMedia.framework. Each overlay's weak autolink
+references (`__swift_FORCE_LOAD_$_<library>`, one per module it imports,
+transitively) bind to that library once the build has made it, rather than
+to the libSystem stub.
+
+Guest test: `alchemy_swift_overlay_members`
+(`tests/fixtures/macos/swift_overlay_members`).
