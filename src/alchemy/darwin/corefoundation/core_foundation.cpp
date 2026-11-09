@@ -340,7 +340,8 @@ std::vector<std::uint16_t> locale_separator(const LocaleParts& parts, bool decim
 }
 // Host volumes appear to the guest as /Volumes/<drive letter>, matching Alchemy's
 // guest path translation; elsewhere the root file system is the only volume.
-struct HostVolume { std::filesystem::path root; std::string name; bool local{true}, ejectable{}, removable{}, read_only{}; };
+struct HostVolume { std::filesystem::path root; std::string name; bool local{true}, ejectable{}, removable{}, read_only{};
+    std::optional<std::uint64_t> total, available; };   // bytes; available is what this user may use
 std::string utf8_text(const std::filesystem::path& path) {
     const auto bytes = path.u8string();
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
@@ -365,6 +366,7 @@ std::optional<HostVolume> host_volume(const std::filesystem::path& path) {
     result.ejectable = result.removable;
     result.read_only = volume->read_only || volume->kind == Kind::optical;
     result.name = volume->name.empty() ? root.substr(0, 1) : volume->name;
+    if (volume->total) { result.total = volume->total; result.available = volume->available; }
     return result;
 }
 std::vector<std::filesystem::path> host_volume_roots() {
@@ -989,6 +991,16 @@ struct CoreFoundation::Impl {
         if (name == "VolumeIsInternalKey") return boolean(volume->local && !volume->removable);
         if (name == "VolumeIsReadOnlyKey") return boolean(volume->read_only);
         if (name == "VolumeSupportsCaseSensitiveNamesKey") return boolean(false);   // host volumes compare names case-insensitively
+        // Capacities: the host volume's size and the bytes this user may still use. The host keeps no purgeable
+        // space apart, so the important- and opportunistic-usage capacities are that same available figure.
+        const auto bytes = [this](std::uint64_t value) {
+            auto number = std::make_shared<NumberPayload>(); number->type = 4; number->integer = static_cast<std::int64_t>(value);
+            return create(ObjectKind::number, number);
+        };
+        if (name == "VolumeTotalCapacityKey") return volume->total ? bytes(*volume->total) : std::uint64_t{0};
+        if (name == "VolumeAvailableCapacityKey" || name == "VolumeAvailableCapacityForImportantUsageKey" ||
+            name == "VolumeAvailableCapacityForOpportunisticUsageKey")
+            return volume->available ? bytes(*volume->available) : std::uint64_t{0};
         return std::uint64_t{0};
     }
     std::uint64_t volume_enumerator() {

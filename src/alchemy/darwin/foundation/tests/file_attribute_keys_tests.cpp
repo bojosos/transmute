@@ -28,6 +28,22 @@ const Case foundation_file_attribute_keys_case("foundation_file_attribute_keys",
                     f.call(cf, "_CFGetTypeID", {f.engine.read64(value)}) == f.call(cf, "_CFDateGetTypeID"), std::string(key) + " is a date");
     }
 
+    // Volume capacities: the host volume's size and what this user may use (important and opportunistic usage
+    // answer that same figure).
+    const auto capacity = [&](const char* key) -> std::int64_t {
+        f.engine.write64(value, 0);
+        const auto name = f.engine.read64(f.symbol(cf, std::string("_kCFURL") + key));
+        require(f.engine.read64(f.symbol(foundation, std::string("_NSURL") + key)) == name || f.call(cf, "_CFEqual", {
+                    f.engine.read64(f.symbol(foundation, std::string("_NSURL") + key)), name}) == 1, std::string(key) + " under Foundation");
+        require(f.call(cf, "_CFURLCopyResourcePropertyForKey", {folder, name, value, 0}) == 1 && f.engine.read64(value), std::string(key));
+        return static_cast<std::int64_t>(*f.cf.number_value(f.engine.read64(value)));
+    };
+    const auto total = capacity("VolumeTotalCapacityKey"), available = capacity("VolumeAvailableCapacityKey");
+    require(total > 0 && available > 0 && available <= total, "the volume's total and available capacity");
+    require(capacity("VolumeAvailableCapacityForImportantUsageKey") > 0 && capacity("VolumeAvailableCapacityForOpportunisticUsageKey") > 0,
+            "the important- and opportunistic-usage capacities");
+    require(f.string_constant(foundation, "_NSPresentationIntentAttributeName") == "NSPresentationIntent", "NSPresentationIntentAttributeName");
+
     // NSSetUncaughtExceptionHandler / NSGetUncaughtExceptionHandler.
     const auto handler = f.block(16);
     f.call(foundation, "_NSSetUncaughtExceptionHandler", {handler});

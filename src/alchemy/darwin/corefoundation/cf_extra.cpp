@@ -84,7 +84,8 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     for (const auto* name : {"QuotationBeginDelimiterKey", "QuotationEndDelimiterKey", "AlternateQuotationBeginDelimiterKey",
                              "AlternateQuotationEndDelimiterKey"})
         constant_string(process, cf, cf_library, std::string("_kCFLocale") + name, std::string("kCFLocale") + name);
-    for (const auto* name : {"VolumeAvailableCapacityKey", "VolumeTotalCapacityKey"}) {
+    for (const auto* name : {"VolumeAvailableCapacityKey", "VolumeTotalCapacityKey", "VolumeAvailableCapacityForImportantUsageKey",
+                             "VolumeAvailableCapacityForOpportunisticUsageKey"}) {
         constant_string(process, cf, cf_library, std::string("_kCFURL") + name, std::string("NSURL") + name);
         constant_string(process, cf, foundation_library, std::string("_NSURL") + name, std::string("NSURL") + name);
     }
@@ -201,13 +202,8 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         try {
             for (const auto key : keys) {
                 const auto name = cf.utf8(key);
-                std::optional<std::uint64_t> value;
-                if (name == "NSURLVolumeAvailableCapacityKey" || name == "NSURLVolumeTotalCapacityKey") {
-                    const auto root = host_path(process, cf.url_path(s.x[0])).root_path().u8string();
-                    if (const auto volume = host::files::volume(std::string(reinterpret_cast<const char*>(root.data()), root.size())))
-                        value = cf.integer(static_cast<std::int64_t>(name == "NSURLVolumeTotalCapacityKey" ? volume->total : volume->available), 4);
-                } else value = cf.resource_value(s.x[0], key);
-                if (!value) continue;
+                const auto value = cf.resource_value(s.x[0], key);   // capacities included
+                if (!value || !*value) continue;
                 owned.push_back(*value);
                 entries.emplace_back(key, *value);
             }

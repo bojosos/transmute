@@ -47,6 +47,10 @@ void install_constants(Support& support) {
              {"NSKeyValueChangeIndexesKey", "indexes"}, {"NSKeyValueChangeNotificationIsPriorKey", "notificationIsPrior"},
              {"NSKeyedArchiveRootObjectKey", "root"}})
         fill_string(foundation_library, name, value);
+    // Presentation-intent attributes of NSAttributedString (the attribute names swift-foundation, Apache-2.0,
+    // gives them).
+    fill_string(foundation_library, "NSPresentationIntentAttributeName", "NSPresentationIntent");
+    fill_string(foundation_library, "NSInlinePresentationIntentAttributeName", "NSInlinePresentationIntent");
     // NSURL resource keys (CoreFoundation's, re-exported by Foundation).
     for (const auto* name : {"NSURLContentTypeKey", "NSURLEffectiveIconKey", "NSURLTotalFileSizeKey", "NSURLVolumeIdentifierKey",
              "NSURLTotalFileAllocatedSizeKey", "NSURLLocalizedNameKey", "NSURLTypeIdentifierKey"}) {

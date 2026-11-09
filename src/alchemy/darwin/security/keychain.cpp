@@ -1351,6 +1351,26 @@ void install_keychain(Security& sec) {
         m.write64(s.x[2], self->identity_ref(certificate, *key));
         s.x[0] = 0;
     });
+    // SecIdentityRef SecIdentityCreate(CFAllocatorRef, SecCertificateRef, SecKeyRef privateKey): an identity of the
+    // certificate and the private key of its public key; NULL when the key is not a private key or not the
+    // certificate's (compared as the keychain pairs them, by the public key).
+    b.function(lib, "_SecIdentityCreate", [self](CpuState& s, GuestMemory&) {
+        const auto certificate = self->sec.certificate_of(s.x[1]);
+        const auto key = s.x[2] ? self->sec.key_of(s.x[2]) : nullptr;
+        const auto certified = certificate ? key_from_spki(certificate->subject_public_key_info()) : nullptr;
+        if (!certificate || !key || !key->is_private || !certified || certified->public_external() != key->public_external()) {
+            s.x[0] = 0;
+            return;
+        }
+        const auto object = self->b.objc.allocate(self->sec.identity_class);
+        auto state = std::make_shared<IdentityState>();
+        state->certificate = self->sec.make_certificate(certificate);
+        state->private_key = key;
+        const auto key_state = self->b.objc.find_host_state<KeyState>(s.x[2]);
+        state->private_key_extractable = !key_state || key_state->extractable;
+        static_cast<void>(self->b.objc.host_state<IdentityState>(object, [&] { return state; }));
+        s.x[0] = object;
+    });
     // Identity preferences: a record of the keychain naming the identity's certificate (issuer and
     // serial number) under `name`; keyUsage is not distinguished.
     // OSStatus SecIdentitySetPreferred(SecIdentityRef identity, CFStringRef name, CFArrayRef keyUsage): NULL removes it.

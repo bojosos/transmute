@@ -824,6 +824,21 @@ void test_keychain_keys(Fixture& f) {
     const auto certificate = f.s("_SecCertificateCreateWithData", {0, certificate_data});
     require(key && certificate, "the test key and certificate");
 
+    // SecIdentityCreate: the certificate with its own private key, nothing for another key or a public key.
+    const auto made = f.s("_SecIdentityCreate", {0, certificate, key});
+    const auto made_certificate = f.cell(), made_key = f.cell();
+    require(made != 0, "SecIdentityCreate of the certificate and its private key");
+    require(f.status("_SecIdentityCopyCertificate", {made, made_certificate}) == 0 &&
+                f.core("_CFEqual", {f.s("_SecCertificateCopyData", {f.engine.read64(made_certificate)}), certificate_data}) == 1,
+            "SecIdentityCreate keeps the certificate");
+    require(f.status("_SecIdentityCopyPrivateKey", {made, made_key}) == 0 && f.engine.read64(made_key), "SecIdentityCreate keeps the key");
+    require(f.s("_SecIdentityCreate", {0, certificate, f.s("_SecKeyCopyPublicKey", {key})}) == 0, "a public key makes no identity");
+    const auto other_parameters = f.dictionary({{k("kSecAttrKeyType"), k("kSecAttrKeyTypeECSECPrimeRandom")},
+                                                {k("kSecAttrKeySizeInBits"), f.cf.integer(256)}});
+    const auto other_key = f.s("_SecKeyCreateRandomKey", {other_parameters, error});
+    require(other_key && f.s("_SecIdentityCreate", {0, certificate, other_key}) == 0, "another key makes no identity");
+    f.release(made);
+
     // 1. A certificate alone is no identity.
     require(f.status("_SecIdentityCreateWithCertificate", {0, certificate, out}) == sec::status::item_not_found, "no stored key: no identity");
     const auto add_certificate = f.dictionary({{k("kSecClass"), k("kSecClassCertificate")}, {k("kSecValueRef"), certificate}});
