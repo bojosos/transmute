@@ -6,6 +6,7 @@
    provider implements these functions. No SDK content. */
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <objc/NSObject.h>
 
 #ifdef __OBJC__
@@ -36,6 +37,13 @@ bool os_log_type_enabled(os_log_t _Nonnull oslog, os_log_type_t type);
 void _os_log_impl(void* _Nonnull dso, os_log_t _Nonnull log, os_log_type_t type, const char* _Nonnull format,
                   uint8_t* _Nonnull buffer, uint32_t size);
 extern struct mach_header __dso_handle;
+/* Logs `format` with C variadic `args` (os_log's {public}/{private} annotations
+   allowed); `ret_addr` identifies the calling image. */
+void os_log_with_args(os_log_t _Nonnull oslog, os_log_type_t type, const char* _Nonnull format, va_list args,
+                      void* _Nullable ret_addr);
+/* The default log object: OS_LOG_DEFAULT is its address. Declared as a byte,
+   since only the address is used. */
+extern char _os_log_default;
 #ifdef __cplusplus
 }
 #endif
