@@ -145,6 +145,8 @@ void test_dynamic_registration() {
         f.call("_method_getTypeEncoding", {0}) == 0 && f.call("_method_getNumberOfArguments", {0}) == 0 &&
         f.call("_method_copyReturnType", {0}) == 0 && f.call("_method_getDescription", {0}) == 0 &&
         f.call("_method_setImplementation", {0, first}) == 0, "a NULL Method was not nil");
+    require(f.call("_method_setImplementation", {method, 0}) == 0 && f.call("_objc_msgSend", {object, sel}) == 27,
+        "a NULL IMP changed the method (objc4 answers nil)");
     static_cast<void>(f.call("_method_exchangeImplementations", {method, 0}));
     require(f.call("_objc_msgSend", {object, sel}) == 27, "exchanging with a NULL Method changed the method");
     // objc4 SPI: class_replaceMethodsBulk, object_getMethodImplementation, _method_setImplementationRawUnsafe,

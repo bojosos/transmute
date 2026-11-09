@@ -2389,8 +2389,16 @@ struct ObjcRuntime::Impl {
             target->methods[sel] = value; method_owners[value.descriptor] = target->address; s.x[0] = 0;
             flush_caches();
         });
-        function("_method_setImplementation", [this](auto& s, auto& m) { if (!s.x[0]) return; std::lock_guard lock(mutex); const auto owner = method_owners.find(s.x[0]);
-            if (owner == method_owners.end() || !s.x[1]) throw std::runtime_error("invalid Objective-C Method replacement");
+        // IMP method_setImplementation(Method, IMP): nil, changing nothing, for a NULL Method or IMP (objc4's
+        // _method_setImplementation; Qt's swizzling passes method_getImplementation of a method that may be missing).
+        // A Method this runtime does not hold stays an error: its dispatch would not change.
+        function("_method_setImplementation", [this](auto& s, auto& m) { if (!s.x[0] || !s.x[1]) { s.x[0] = 0; return; }
+            std::lock_guard lock(mutex); const auto owner = method_owners.find(s.x[0]);
+            if (owner == method_owners.end()) {
+                std::ostringstream message;
+                message << "method_setImplementation: Method 0x" << std::hex << s.x[0] << " is not one of this runtime's";
+                throw std::runtime_error(message.str());
+            }
             const auto previous = m.read64(s.x[0] + 16); m.write64(s.x[0] + 16, s.x[1]);
             auto& value = cls(owner->second)->methods.at(m.read64(s.x[0]));
             if (value.descriptor == s.x[0]) value.implementation = s.x[1];
