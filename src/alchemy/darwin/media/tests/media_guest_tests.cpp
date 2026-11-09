@@ -782,6 +782,57 @@ void output_units(Fixture& f) {
             f.status(au, "_AudioUnitInitialize", {hal_unit}) == -10875, "no input device");
     require(f.status(au, "_AudioUnitRender", {hal_unit, 0, 0, 1, 64, value}) == -10876, "no input to pull");
     require(f.status(au, "_AudioComponentInstanceDispose", {hal_unit}) == 0, "AUHAL disposed");
+
+    // AUGraph: a default output node fed by a node input callback plays; a DLS synth node has no component here, so
+    // the graph does not open with it; two output units do not connect; no unit is a music device.
+    const auto graph_out = f.block(8), node_out = f.block(4), output_node_out = f.block(4), flag = f.block(4), unit_info = f.block(8);
+    require(f.status(at, "_NewAUGraph", {graph_out}) == 0, "NewAUGraph");
+    const auto graph = f.engine.read64(graph_out);
+    f.engine.write32(description, 0x61756F75);        // 'auou'
+    f.engine.write32(description + 4, 0x64656620);    // 'def '
+    f.engine.write32(description + 8, 0x6170706C);    // 'appl'
+    require(f.status(at, "_AUGraphAddNode", {graph, description, output_node_out}) == 0, "an output node");
+    const auto output_node = f.engine.read32(output_node_out);
+    const auto synth = f.block(20);
+    f.engine.write32(synth, 0x61756D75); f.engine.write32(synth + 4, 0x646C7320); f.engine.write32(synth + 8, 0x6170706C);   // 'aumu' 'dls ' 'appl'
+    require(f.status(at, "_AUGraphAddNode", {graph, synth, node_out}) == 0, "a DLS synth node (kept until open)");
+    const auto synth_node = f.engine.read32(node_out);
+    require(f.status(at, "_AUGraphOpen", {graph}) == -10864 && f.status(at, "_AUGraphIsOpen", {graph, flag}) == 0 && (f.engine.read32(flag) & 0xff) == 0,
+            "no DLS synth: kAUGraphErr_InvalidAudioUnit, still closed");
+    require(f.status(at, "_AUGraphRemoveNode", {graph, synth_node}) == 0 && f.status(at, "_AUGraphGetNodeCount", {graph, flag}) == 0 &&
+            f.engine.read32(flag) == 1, "the synth node removed");
+    require(f.status(at, "_AUGraphOpen", {graph}) == 0, "AUGraphOpen");
+    require(f.status(at, "_AUGraphNodeInfo", {graph, output_node, 0, unit_info}) == 0 && f.engine.read64(unit_info) != 0, "the output node's unit");
+    const auto graph_unit = f.engine.read64(unit_info);
+    require(static_cast<std::uint32_t>(f.status(at, "_MusicDeviceMIDIEvent", {graph_unit, 0x90, 60, 100, 0})) == 0x80008002U,
+            "an output unit is not a music device (badComponentSelector)");
+    // The callback writes 0.25 into every float sample of every buffer.
+    const auto graph_render = f.process.install_function("_alchemy_test_graph_render", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        const auto list = s.x[5];
+        for (std::uint32_t b = 0; b < m.read32(list); ++b) {
+            const auto bytes = m.read32(list + 8 + 16ULL * b + 4), data = m.read64(list + 8 + 16ULL * b + 8);
+            for (std::uint32_t i = 0; i + 4 <= bytes; i += 4) m.write32(data + i, std::bit_cast<std::uint32_t>(0.25f));
+        }
+        s.x[0] = 0;
+    }, "/usr/lib/alchemy_test_io.dylib");
+    f.engine.write64(value, graph_render);
+    f.engine.write64(value + 8, 0);
+    require(f.status(at, "_AUGraphSetNodeInputCallback", {graph, output_node, 0, value}) == 0, "a node input callback");
+    require(f.status(at, "_AUGraphStart", {graph}) == -10863, "not initialized: kAUGraphErr_CannotDoInCurrentContext");
+    require(f.status(at, "_AUGraphInitialize", {graph}) == 0 && f.status(at, "_AUGraphStart", {graph}) == 0 &&
+            f.status(at, "_AUGraphIsRunning", {graph, flag}) == 0 && (f.engine.read32(flag) & 0xff) == 1, "the graph runs");
+    static_cast<void>(FakeStream::play_until_sound(256));
+    std::vector<float> graph_steady;
+    for (int i = 0; i < 8; ++i) graph_steady = FakeStream::play_paced(256);
+    require(std::fabs(graph_steady[200] - 0.25f) < 0.01f, "the graph's output plays its callback");
+    require(f.status(at, "_AUGraphStop", {graph}) == 0 && f.status(at, "_AUGraphUninitialize", {graph}) == 0, "stopped");
+    // A second output node connected into the first: output units take no connection, so initializing fails.
+    require(f.status(at, "_AUGraphAddNode", {graph, description, node_out}) == 0, "a second output node");
+    require(f.status(at, "_AUGraphConnectNodeInput", {graph, f.engine.read32(node_out), 0, output_node, 0}) == 0 &&
+            f.status(at, "_AUGraphInitialize", {graph}) == -10879, "the connection is refused at initialize");
+    require(f.status(at, "_AUGraphConnectNodeInput", {graph, output_node, 0, output_node, 0}) == -10861, "no node connects to itself");
+    require(f.status(at, "_AUGraphConnectNodeInput", {graph, 99, 0, output_node, 0}) == -10860, "an unknown node");
+    require(f.status(at, "_DisposeAUGraph", {graph}) == 0 && f.status(at, "_AUGraphOpen", {graph}) == -50, "disposed");
 }
 
 // AudioConverter: 16-bit stereo 44.1 kHz to float mono 48 kHz through the input procedure.

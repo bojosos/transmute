@@ -15,6 +15,7 @@ void install_media(InstallContext& context) {
     install_audio(context);
     install_media_accessibility(context);
     install_opencl(context);
+    install_au_graph(context);
     install_image_capture(context);
 }
 

@@ -40,6 +40,8 @@ void install_vt_decompression(InstallContext& context);
 void install_vt_compression(InstallContext& context);
 void install_audio(InstallContext& context);
 void install_media_accessibility(InstallContext& context);
+// au_graph.cpp: AUGraph over the audio units there are, and the music device calls (no music device exists).
+void install_au_graph(InstallContext& context);
 // opencl.cpp: OpenCL.framework with no platform (every call answers OpenCL's own error for it).
 void install_opencl(InstallContext& context);
 void install_image_capture(InstallContext& context);

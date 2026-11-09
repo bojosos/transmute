@@ -26,9 +26,9 @@
 // schedules each 200 ms window of note, channel and raw-data events as
 // timestamped CoreMIDI packets (the MIDI server holds them until their host
 // time) and calls the sequence's user callback for user events with the
-// window as the slice. Tracks honour mute, solo, offset and loop info. There
-// is no AUGraph (no music device or audio unit can exist), so a sequence
-// without a MIDI endpoint cannot play (kAudioToolboxError_NoTrackDestination),
+// window as the slice. Tracks honour mute, solo, offset and loop info. No
+// music device exists (an AUGraph, au_graph.cpp, can hold only output units), so
+// a sequence without a MIDI endpoint cannot play (kAudioToolboxError_NoTrackDestination),
 // and parameter, AU preset and extended-note events, which address audio
 // units, are not dispatched. Stopping or moving the play position drops the
 // held packets of the destination and ends the notes that are sounding.
@@ -36,7 +36,7 @@
 // Editing: MusicTrackClear, Cut, CopyInsert, Merge and MoveEvents, MusicSequenceReverse
 // (music_core.hpp), MusicEventIteratorSetEventTime and SetEventInfo. Copied AU preset events retain
 // their preset again. MusicSequenceSetSequenceType takes beats or seconds (a seconds sequence's tempo
-// track becomes 60 BPM, so beats are seconds); samples need an AUGraph. MusicSequenceFileCreate writes
+// track becomes 60 BPM, so beats are seconds); samples need a music device's AUGraph. MusicSequenceFileCreate writes
 // the Standard MIDI File through the guest's libSystem.
 namespace alchemy::gui::completion_kit::media {
 namespace {
@@ -942,7 +942,7 @@ void install_music(Support& support) {
             if (!player) return status(s, music::error::param);
             std::lock_guard player_lock(player->mutex);
             if (!player->sequence) return status(s, music::error::no_sequence);
-            if (!player->sequence->endpoint) return status(s, music::error::no_track_destination);   // no AUGraph exists
+            if (!player->sequence->endpoint) return status(s, music::error::no_track_destination);   // no music device exists
             if (player->playing) return status(s, 0);
             player->playing = true;
             player->anchor_host = host_time_now();
