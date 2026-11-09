@@ -1168,9 +1168,26 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         };
         // DISPATCH_APPLY_AUTO (NULL) and concurrent queues run iterations in
         // parallel on workers and the caller; serial queues run them in order.
+        // As libdispatch, a nested dispatch_apply shares the threads: it gets the
+        // CPUs divided by the iterations of the applies around it (at least the
+        // caller, which then runs everything inline). Every helper of a nested
+        // apply would otherwise start helpers of its own, and 32^3 nested
+        // iterations started over a thousand workers.
+        thread_local std::uint64_t enclosing = 1;   // product of the enclosing applies' iterations on this thread
         const bool parallel = address == 0 || queue(address)->kind == Kind::concurrent;
-        const auto helpers = parallel ? std::min<std::uint64_t>(concurrency() - 1, iterations - 1) : 0;
-        if (!helpers) { for (std::uint64_t index = 0; index < iterations; ++index) invoke(index); return; }
+        const auto share = std::max<std::uint64_t>(1, concurrency() / enclosing);
+        const auto helpers = parallel ? std::min<std::uint64_t>(share - 1, iterations - 1) : 0;
+        const auto nested = std::min<std::uint64_t>(enclosing * iterations, std::uint64_t{1} << 32);
+        struct Nesting {
+            std::uint64_t previous;
+            explicit Nesting(std::uint64_t value) : previous(enclosing) { enclosing = value; }
+            ~Nesting() { enclosing = previous; }
+        };
+        if (!helpers) {
+            const Nesting scope(nested);
+            for (std::uint64_t index = 0; index < iterations; ++index) invoke(index);
+            return;
+        }
         struct Apply {
             std::atomic<std::uint64_t> next{0};
             std::atomic<unsigned> running{0};
@@ -1181,7 +1198,8 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
         };
         auto state = std::make_shared<Apply>();
         state->total = iterations;
-        const auto run = [state, invoke] {
+        const auto run = [state, invoke, nested] {
+            const Nesting scope(nested);
             ++state->running;
             for (;;) {
                 const auto index = state->next.fetch_add(1);
