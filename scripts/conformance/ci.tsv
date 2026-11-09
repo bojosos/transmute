@@ -1,6 +1,9 @@
 # How the CI gate (`conformance.py gate`, .github/workflows/ci.yml) treats tests on a hosted runner.
-# suite	test (regular expression, whole name)	kind	reason
-# kind flaky: known to fail intermittently. It runs up to three times and never decides the job.
-# kind skip: needs what a hosted runner does not have (this machine's GPU, the network, or timing a
-# shared 4-core runner cannot keep). It is not run, and the job reports it as skipped, not passed.
-dispatch	dispatch/context_for_key	flaky	"invalid queue" race in dispatch_queue_set_specific: passed 1 of 3 reruns (2026-11-09)
+# suite	test (regular expression, whole name)	kind	reason	[timeout in seconds]
+# kind flaky: known to fail intermittently. It runs once (with the timeout, if one is given) and never
+# decides the job.
+# kind skip: needs what a hosted runner does not have (this machine's GPU, the network, timing a shared
+# 4-core runner cannot keep, or a host file system setting). It is not run, and the job reports it as
+# skipped, not passed.
+dispatch	dispatch/context_for_key	flaky	"invalid queue" race in dispatch_queue_set_specific: passed 1 of 3 reruns (2026-11-09); 0.2 s on macOS	30
+posix	posix/mmap/13-1	skip	st_atime comes from NTFS last-access times, and the runner's volume does not update them (fsutil behavior query disablelastaccess); passes where updates are on

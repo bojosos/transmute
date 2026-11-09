@@ -69,7 +69,7 @@ python -I scripts/conformance/conformance.py gate all --alchemy <alchemy-fx.exe>
   warning, and does not fail the job.
 - A newly passing test prints "update the baseline" and does not fail the job.
 - `ci.tsv` lists known-flaky tests and tests a hosted runner cannot run honestly. A flaky test runs
-  up to three times and never decides the job. A skipped test is reported as skipped, with its
+  once, with the shorter timeout `ci.tsv` gives it, and never decides the job. A skipped test is reported as skipped, with its
   reason, and never counts as a pass.
 - C++ tests need the guest libc++ from `artifacts/`, which a runner lacks. The gate reports them as
   skipped.

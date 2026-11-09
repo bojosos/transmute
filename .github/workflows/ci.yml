@@ -137,6 +137,8 @@ jobs:
         env:
           QUICK: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
         run: |
+          # The runner's file system settings that ci.tsv's skips name.
+          cmd /c "fsutil behavior query disablelastaccess 2>&1"
           $scope = @(); if ($env:QUICK -eq 'true') { $scope = @('--quick') }
           python -I scripts/conformance/conformance.py gate all @scope --out "$env:RUNNER_TEMP\conformance" --alchemy "$env:RUNNER_TEMP\fx\alchemy-fx.exe" --runtime-dir "$env:RUNNER_TEMP\no-runtime" --jobs 4 --tsv "$env:RUNNER_TEMP\conformance\conformance-results.tsv"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

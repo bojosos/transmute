@@ -509,19 +509,21 @@ TRIES = 3  # a failing test that decides the gate runs up to three times in all
 
 def ci_rules(suite):
     """ci.tsv: tests a hosted CI runner treats specially. `flaky`: known to fail intermittently; it runs
-    up to TRIES times and never decides the job. `skip`: needs what the runner does not have (this
-    machine's GPU, the network, or timing a shared runner cannot keep); not run, reported as skipped."""
+    once, with the rule's timeout if it has one, and never decides the job. `skip`: needs what the runner
+    does not have (this machine's GPU, the network, or timing a shared runner cannot keep); not run,
+    reported as skipped."""
     rules = []
     for line in (HERE / "ci.tsv").read_text(encoding="utf-8").splitlines():
         if line.strip() and not line.startswith("#"):
-            name, pattern, kind, reason = line.split("\t")
+            name, pattern, kind, reason, *timeout = line.split("\t")
             if name == suite:
-                rules.append((re.compile(pattern), kind, reason))
+                rules.append((re.compile(pattern), kind, reason, float(timeout[0]) if timeout else None))
     return rules
 
 
 def ci_rule(rules, name):
-    return next(((kind, reason) for pattern, kind, reason in rules if pattern.fullmatch(name)), (None, ""))
+    """(kind, reason, timeout) of the first rule that matches the whole test name."""
+    return next((rule[1:] for rule in rules if rule[0].fullmatch(name)), (None, "", None))
 
 
 def cmd_gate(ctx, suite, module, args):
@@ -540,9 +542,11 @@ def cmd_gate(ctx, suite, module, args):
                    and not t.build_error and ci_rule(rules, t.name)[0] != "flaky"]
         tests = [t for t in tests if t not in not_run]
     for t in tests:
-        kind, reason = ci_rule(rules, t.name)
+        kind, reason, timeout = ci_rule(rules, t.name)
         if kind == "skip" and not t.skip:
             t.skip = f"not on a CI runner: {reason}"
+        if kind == "flaky" and timeout:
+            t.timeout = timeout
     results = {r.name: r for r in run_tests(ctx, module, tests, args)}
     for r in results.values():
         # The guest libc++ comes from artifacts/ (scripts/build_alchemy_llvm.ps1), which a CI runner
@@ -559,14 +563,14 @@ def cmd_gate(ctx, suite, module, args):
     by_name = {t.name: t for t in tests}
     for _ in range(TRIES - 1):
         again = [by_name[n] for n, r in results.items() if r.status not in ("PASS", "SKIP", "BUILD") and
-                 (decides(r) or ci_rule(rules, n)[0] == "flaky")]
+                 decides(r) and ci_rule(rules, n)[0] != "flaky"]
         for r in run_tests(ctx, module, again, args):
             tries[r.name] += 1
             results[r.name] = r
     rows = []
     for name, r in sorted(results.items()):
         expected = baseline.get(name, {}).get("expected")
-        kind, reason = ci_rule(rules, name)
+        kind, reason, _ = ci_rule(rules, name)
         retried = tries[name] > 1
         if r.status == "SKIP":
             verdict = "skipped"
@@ -612,8 +616,7 @@ def gate_report(ctx, args):
                                           f"{TRIES} times in a row"),
                            ("unstable", "Unstable: failed, then passed on a rerun (fix it, or list it as flaky in "
                                         "scripts/conformance/ci.tsv)"),
-                           ("flaky", "Known flaky (scripts/conformance/ci.tsv): run up to "
-                                     f"{TRIES} times, never decide the job"),
+                           ("flaky", "Known flaky (scripts/conformance/ci.tsv): run once, never decide the job"),
                            ("newly passing", "Newly passing: update the baseline (`report <suite> --write-baseline`)"),
                            ("new", "Not in the baseline yet"),
                            ("skipped", "Skipped on the CI runner")):
