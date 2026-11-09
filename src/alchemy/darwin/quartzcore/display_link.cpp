@@ -263,6 +263,19 @@ void install_display_link(Support& support) {
         link->refresh_hz = refresh_of(*screen);
         c.x[0] = cv_success;
     });
+    // CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext(link, CGLContextObj, CGLPixelFormatObj): the display the context
+    // presents on, which here is the main display (the first screen) whatever the context.
+    support.function(lib, "_CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext", [link_of](CpuState& c, GuestMemory&) {
+        if (!c.x[0] || !c.x[1]) { c.x[0] = cv_status(cv_invalid_argument); return; }
+        const auto link = link_of(c.x[0]);
+        const auto server = layer_contents::presentation_server();
+        if (!server || server->screens().empty()) { c.x[0] = cv_status(cv_invalid_display); return; }
+        const auto screen = server->screens().front();
+        std::lock_guard lock(link->mutex);
+        link->display = screen.id;
+        link->refresh_hz = refresh_of(screen);
+        c.x[0] = cv_success;
+    });
     // CVTime {int64 timeValue; int32 timeScale; int32 flags} in x0/x1.
     support.function(lib, "_CVDisplayLinkGetNominalOutputVideoRefreshPeriod", [link_of](CpuState& c, GuestMemory&) {
         if (!c.x[0]) { c.x[1] = std::uint64_t{1} << 32; return; }   // kCVTimeIsIndefinite (c.x[0] stays 0)

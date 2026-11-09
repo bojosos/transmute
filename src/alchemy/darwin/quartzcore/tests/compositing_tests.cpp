@@ -462,6 +462,10 @@ void display_link_cadence(Fixture& f) {
     require(f.status(corevideo, "_CVDisplayLinkCreateWithCGDisplay", {1, out}) == 0, "CVDisplayLinkCreateWithCGDisplay(main display)");
     const auto link = f.engine.read64(out);
     require(f.call(corevideo, "_CVDisplayLinkGetCurrentCGDisplay", {link}) == 1, "the link's display");
+    // An OpenGL context presents on the main display; a NULL context is refused.
+    require(f.status(corevideo, "_CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext", {link, 0x1000, 0x2000}) == 0 &&
+            f.call(corevideo, "_CVDisplayLinkGetCurrentCGDisplay", {link}) == 1 &&
+            f.status(corevideo, "_CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext", {link, 0, 0}) == -6661, "the OpenGL context's display");
     require(f.status(corevideo, "_CVDisplayLinkStart", {link}) == -6673, "no callback: kCVReturnCallbacksNotSet... (-6673)");
     require(f.status(corevideo, "_CVDisplayLinkSetOutputCallback", {link, handler, 0}) == 0, "set the output callback");
     const auto period = f.regs(corevideo, "_CVDisplayLinkGetNominalOutputVideoRefreshPeriod", [&] { alchemy::CallRegs r; r.x[0] = link; return r; }());
