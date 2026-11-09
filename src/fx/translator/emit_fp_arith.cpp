@@ -283,18 +283,119 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
 // sa | (~sb & nb) (NM); the winner is quieted only if it is a NaN.
 // TRANSMUTE_FX_FP=oldminmax keeps the earlier lowering (NaN payloads as host
 // policy).
-struct MinMaxGuard {
-    Gp reg;
-    bool jrcxz;
-};
-
-// The NaN-lane test's GPR: RCX (JRCXZ leaves the host flags alone), else any
-// temp after a flag save (clobber_host_flags). Before the first label.
-MinMaxGuard minmax_guard(FpEmit& e) {
+LaneGuard lane_guard(FpEmit& e) {
     const Gp rcx = e.ctx.temp_gpr_prefer(Gp::rcx);
     if (rcx != Gp::none) return {rcx, true};
     e.ctx.clobber_host_flags();
     return {e.gtmp(), false};
+}
+
+// ---- tininess before rounding (knob tinybefore) ----------------------------------------------
+// A64 FPRound signals Underflow when the exponent is too small before rounding
+// and the result is inexact; x64 tests the result rounded to the destination
+// precision with an unbounded exponent. The two differ only when a value just
+// below min_normal rounds up in magnitude to min_normal: A64 sets UFC and IXC,
+// x64 PE alone. Rounded toward zero, a result is below min_normal exactly when
+// the unrounded value is, and is inexact exactly when the original was, so the
+// same operation run again toward zero raises UE precisely for A64's UFC. Its
+// other flags are a subset of the original's (overflow toward zero needs a
+// larger value; IE, ZE and DE depend on the operands alone). Sums and
+// differences are exact near min_normal (every operand is a multiple of the
+// smallest denormal). Not covered: FMULX, FRECPS/FRSQRTS and half precision.
+// A result of exactly +-min_normal is rare: the common path is an AND, a
+// compare, a mask move and a not-taken branch; the slow path rewrites MXCSR
+// twice.
+void tiny_before_fixup(FpEmit& e, unsigned es, bool scalar, unsigned width, Xmm r, Xmm t0, Xmm t1,
+                       const LaneGuard& guard, const std::function<void(Xmm)>& compute) {
+    auto& a = e.as;
+    const bool dbl = es == 64;
+    const std::uint64_t mag = FpEmit::abs_bits(es), min_normal = dbl ? 0x0010000000000000ull : 0x00800000ull;
+    e.op(dbl ? op::andpd : op::andps, t0, r, Opnd::at(scalar ? e.kscalar(es, mag) : e.ksplat(es, mag)));
+    e.op(dbl ? op::pcmpeqq : op::pcmpeqd, t0, t0, Opnd::at(e.ksplat(es, min_normal)));
+    if (scalar) {
+        if (dbl) e.movq(guard.reg, t0);
+        else e.movd(guard.reg, t0);
+    } else if (width == 64) {
+        e.movq(guard.reg, t0);
+    } else {
+        a.movmskps(guard.reg, t0);
+    }
+    const auto done = a.new_label();
+    if (guard.jrcxz) {
+        a.jrcxz_short(done);
+    } else {
+        a.test(64, guard.reg, guard.reg);
+        a.jcc_short(x64::Cond::e, done);
+    }
+    // FPCR and FPSR (adjacent words) are the MXCSR scratch: kept in the guard
+    // GPR. Only moves and vector ops below: the host flags stay as they are.
+    const Mem slot = ctx_mem(kFpcrDisp);
+    a.mov(64, guard.reg, slot);
+    a.stmxcsr(slot);
+    e.un(op::movsd, t1, Opnd::at(slot));                                // MXCSR (and FPSR above)
+    e.op(op::orps, t0, t1, Opnd::at(e.kscalar(32, 0x6000)));            // RC = toward zero
+    a.movq(slot, t0);
+    a.ldmxcsr(slot);
+    compute(t0);
+    a.stmxcsr(slot);
+    e.un(op::movsd, t0, Opnd::at(slot));
+    e.op(op::andps, t0, t0, Opnd::at(e.kscalar(32, 0x10)));             // UE from the rerun
+    e.op(op::orps, t0, t0, t1);                                         // the original mode and flags
+    a.movq(slot, t0);
+    a.ldmxcsr(slot);
+    a.mov(64, slot, guard.reg);
+    a.bind(done);
+}
+
+bool emit_arith_tiny_before(FpEmit& e, const Inst& in) {
+    const Shape s = in.sh;
+    if (s.es != 32 && s.es != 64) return false;
+    const bool fused = in.k == K::fmla || in.k == K::fmls || in.k == K::fmadd || in.k == K::fmsub ||
+                       in.k == K::fnmadd || in.k == K::fnmsub;
+    if (!fused && in.k != K::fmul && in.k != K::fdiv && in.k != K::fnmul) return false;
+    if (fused && !e.feat.fma) return false;
+    const bool dbl = s.dbl();
+    const unsigned w = s.width();
+    e.allow_vec_temps(5);
+    const Xmm a = e.vec(in.rn);
+    const Xmm b = in.index >= 0 ? element(e, s, in.rm, in.index) : e.vec(in.rm);
+    const bool acc = in.k == K::fmla || in.k == K::fmls;
+    const Xmm c = !fused ? Xmm{} : e.vec(acc ? in.rd : in.ra);
+    // Every register before the first label: the guard GPR, the temps, Vd.
+    const auto guard = lane_guard(e);
+    const Xmm t0 = e.tmp(), t1 = e.tmp();
+    const Xmm d = e.dest(in.rd);
+    const bool alias = d == a || d == b || (fused && d == c);   // the sources must survive the rerun
+    const Xmm T = alias ? e.tmp() : d;
+    FmaKind kind = FmaKind::fmadd;   // FMADD a+n*m, FMSUB a-n*m, FNMADD -a-n*m, FNMSUB -a+n*m
+    switch (in.k) {
+    case K::fmls: case K::fmsub: kind = FmaKind::fnmadd; break;
+    case K::fnmadd: kind = FmaKind::fnmsub; break;
+    case K::fnmsub: kind = FmaKind::fmsub; break;
+    default: break;
+    }
+    const auto compute = [&](Xmm out) {
+        switch (in.k) {
+        case K::fmul: e.op(s.pick(fops::mul), out, a, b); break;
+        case K::fdiv: e.op(s.pick(fops::div), out, a, b); break;
+        case K::fnmul:
+            e.op(s.pick(fops::mul), out, a, b);
+            e.op(s.pick(fops::xor_), out, out, Opnd::at(e.kscalar(s.es, FpEmit::sign_bits(s.es))));
+            break;
+        default:
+            e.mov(out, c);
+            e.fma(kind, FmaForm::f231, dbl, s.scalar, out, a, b);
+            break;
+        }
+    };
+    compute(T);
+    tiny_before_fixup(e, s.es, s.scalar, w, T, t0, t1, guard, compute);
+    if (alias) e.mov(d, T);
+    // Scalar results take their upper lanes from the first source (the
+    // addend for the fused forms); 64-bit vectors compute the upper lanes.
+    const bool zero = s.scalar && e.zero_above(fused ? (acc ? in.rd : in.ra) : in.rn, w);
+    if (w != 128 && !zero) e.zero_upper(d, w);
+    return true;
 }
 
 // T = op(a, b) (base kind), bit-exact. T, t0, t1, t2 are distinct and differ
@@ -302,7 +403,7 @@ MinMaxGuard minmax_guard(FpEmit& e) {
 // MOVD/MOVMSKPS between the label and its target (no host flags written).
 // `width`: the bits that matter (scalar: the element; vector: 64 or 128).
 void minmax_exact_core(FpEmit& e, K kind, Shape s, unsigned width, Xmm T, Xmm a, Xmm b, Xmm t0, Xmm t1, Xmm t2,
-                       const MinMaxGuard& guard) {
+                       const LaneGuard& guard) {
     const bool nm = kind == K::fmaxnm || kind == K::fminnm;
     const bool is_max = kind == K::fmax || kind == K::fmaxnm;
     const bool dbl = s.dbl();
@@ -362,7 +463,7 @@ void emit_minmax_exact(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     const Xmm a = e.vec(in.rn), b = e.vec(in.rm);
     const bool zero = s.scalar ? e.zero_above(in.rn, w) && e.zero_above(in.rm, w) : w == 128;
     // Every register before the first label: the guard GPR, the temps, Vd.
-    const auto guard = minmax_guard(e);
+    const auto guard = lane_guard(e);
     const Xmm t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
     const Xmm d = e.dest(in.rd);
     const bool alias = d == a || d == b;   // a and b must survive until the fixup
@@ -435,6 +536,7 @@ bool emit_arith(FpEmit& e, const Inst& in) {
     if (s.es == 16) return emit_arith_h(e, in);
     const unsigned w = s.width();
     const bool dbl = s.dbl();
+    if (fp_tiny_before_on() && emit_arith_tiny_before(e, in)) return true;
     switch (in.k) {
     case K::fadd: case K::fsub: case K::fmul: case K::fdiv: {
         const FOps& f = in.k == K::fadd ? fops::add : in.k == K::fsub ? fops::sub
@@ -648,7 +750,7 @@ bool emit_arith(FpEmit& e, const Inst& in) {
             const K kind = base_minmax(in.k);
             if (s.scalar) {
                 const Xmm n = e.vec(in.rn);
-                const auto guard = minmax_guard(e);
+                const auto guard = lane_guard(e);
                 const Xmm o = e.tmp(), t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
                 const Xmm d = e.dest(in.rd);
                 const Xmm T = d == n ? e.tmp() : d;
@@ -672,7 +774,7 @@ bool emit_arith(FpEmit& e, const Inst& in) {
                 e.op_i(op::shufps, ev, od, od, 0x88);
                 e.op_i(op::shufps, od, od, od, 0xdd);
             }
-            const auto guard = minmax_guard(e);
+            const auto guard = lane_guard(e);
             const Xmm t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
             const Xmm d = e.dest(in.rd);
             minmax_exact_core(e, kind, s, w, d, ev, od, t0, t1, t2, guard);
@@ -750,7 +852,7 @@ bool emit_arith(FpEmit& e, const Inst& in) {
             e.allow_vec_temps(5);
             const K kind = base_minmax(in.k);
             const Xmm n = e.vec(in.rn);
-            const auto guard = minmax_guard(e);
+            const auto guard = lane_guard(e);
             const Xmm o = e.tmp(), r = e.tmp(), t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
             const Xmm d = e.dest(in.rd);
             e.un(op::movshdup, o, n);
@@ -793,6 +895,7 @@ bool emit_fused_h(FpEmit& e, const Inst& in);
 bool emit_fused(FpEmit& e, const Inst& in) {
     const Shape s = in.sh;
     if (s.es == 16) return emit_fused_h(e, in);
+    if (fp_tiny_before_on() && emit_arith_tiny_before(e, in)) return true;
     const bool dbl = s.dbl();
     const unsigned w = s.width();
     // The product n * m is commutative: one factor in a register, the other

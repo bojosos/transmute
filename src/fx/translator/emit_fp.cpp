@@ -1247,6 +1247,7 @@ std::uint32_t env_knob_bits() {
             if (all || has("oldcvt")) b |= fp_old_cvt;
             if (all || has("noconstminmax")) b |= fp_no_const_minmax;
             if (all || has("oldminmax")) b |= fp_old_minmax;
+            if (has("tinybefore")) b |= fp_tiny_before;
         }
         return b;
     }();
@@ -1273,6 +1274,7 @@ const FamilyEmitter& fp_family() {
         n += (b & fpx::fp_old_cvt) ? "+oldcvt" : "+cvt2";   // +cvt2: the imm8 INT_MIN check
         n += (b & fpx::fp_no_const_minmax) ? "+noconstminmax" : "+constmm";
         n += (b & fpx::fp_old_minmax) ? "+oldminmax" : "+minmaxnan";
+        if (b & fpx::fp_tiny_before) n += "+tinybefore";
         // The core keeps V zero-above facts across labels (Plan::vzero_join; its
         // knob novzjoin is in the layout bits): cached fp code must follow it.
         n += "+vzj";

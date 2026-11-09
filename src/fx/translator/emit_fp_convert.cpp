@@ -649,6 +649,19 @@ bool emit_convert(FpEmit& e, const Inst& in) {
         return i2f_vector(e, in);
     case K::fcvt: {
         const unsigned from = s.es, to = in.dst_es;
+        if (fp_tiny_before_on() && from == 64 && to == 32) {   // narrowing can round up to min_normal
+            const Xmm n = e.vec(in.rn);
+            const auto guard = lane_guard(e);
+            const Xmm t0 = e.tmp(), t1 = e.tmp();
+            const Xmm d = e.dest(in.rd);
+            const Xmm T = d == n ? e.tmp() : d;
+            const auto compute = [&](Xmm out) { e.sc(op::cvtsd2ss, out, n); };
+            compute(T);
+            tiny_before_fixup(e, 32, true, 32, T, t0, t1, guard, compute);
+            if (T != d) e.mov(d, T);
+            e.zero_upper(d, 32);
+            return true;
+        }
         if (e.avx() && ((from == 32 && to == 64) || (from == 64 && to == 32))) {
             // d[0] = cvt(n[0]); the upper lanes come from the first source:
             // n itself when it has zeros above the result, else a zeroed temp.
@@ -751,6 +764,13 @@ bool emit_convert(FpEmit& e, const Inst& in) {
             e.movq(t, t);
             e.splat(32, b, 0x3f800000u);
             e.op(op::mulps, t, t, b);
+        } else if (s.es == 64 && fp_tiny_before_on()) {
+            const auto guard = lane_guard(e);
+            const Xmm t0 = e.tmp(), t1 = e.tmp();
+            static_cast<void>(e.dest(in.rd));   // every register before the fixup's label
+            const auto compute = [&](Xmm out) { e.un(op::cvtpd2ps, out, n); };
+            compute(t);
+            tiny_before_fixup(e, 32, false, 64, t, t0, t1, guard, compute);
         } else if (s.es == 64) {
             e.un(op::cvtpd2ps, t, n);
         } else {

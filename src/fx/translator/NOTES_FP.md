@@ -131,6 +131,21 @@ object so tests link without the core). Tests: `emit_fp_tests*.cpp`.
   [min_normal * (1 - 2^-p), min_normal) is flushed by A64 but becomes
   min_normal on x64 (comparator tolerance `fz_tininess`). x64 sets UE|PE on an
   FTZ flush where A64 sets only UFC.
+* FZ = 0: the same difference in the flags. A result that rounds up in
+  magnitude to min_normal from below is tiny before rounding (A64 FPRound:
+  UFC|IXC) but not after (x64: PE alone, so IXC without UFC). Only products,
+  quotients, fused results and narrowing conversions can do it: sums and
+  differences near min_normal are exact. `fp_zz_tininess_before_rounding_report`
+  counts it on boundary operands. `TRANSMUTE_FX_FP=tinybefore` (off by
+  default) fixes it for FMUL, FDIV, FNMUL, FMADD/FMSUB/FNMADD/FNMSUB,
+  FMLA/FMLS (vector and by element), FCVT S<-D and FCVTN: the result is
+  compared with +-min_normal (AND, compare, mask move and a not-taken
+  branch, flag-free through JRCXZ), and only on a hit the operation runs
+  again toward zero, which raises UE exactly when A64 raises UFC and no other
+  new flag; MXCSR is rewritten around it with moves and vector ops only (the
+  FPCR/FPSR context words are the scratch). Tests: `fp_tiny_before_rounding_exact_flags`,
+  `fp_tiny_before_rounding_results_bit_exact`. Not covered: FMULX,
+  FRECPS/FRSQRTS, half-precision arithmetic (computed in single and narrowed).
 * FCVTZS/FCVTZU/FCVT[NPMA]*: `roundss/sd` with an explicit mode, then `cvtt*`
   with saturation and NaN -> 0 fixed up behind a branch. FCVTA*/FRINTA use an
   exact trunc / doubled-remainder sequence. FRINTA(+-inf) sets a spurious IOC.

@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 
 namespace transmute::fx::fpx {
@@ -39,6 +40,11 @@ using x64::Xmm;
 //             instead of converts + one FMA; SCVTF/UCVTF S from a SIMD
 //             register through a GPR instead of in the vector domain
 //   old     - all of the above
+// and enable lowerings that are off by default:
+//   tinybefore - FPSR.UFC with tininess detected before rounding, as A64
+//             does: a result that rounds up to +-min_normal sets UFC (x64
+//             detects tininess after rounding and sets PE alone). FMUL, FDIV,
+//             FNMUL, FMADD/FMSUB/FNMADD/FNMSUB, FMLA/FMLS, FCVT S<-D, FCVTN.
 enum FpKnob : std::uint32_t {
     fp_no_slot = 1u,
     fp_old_imm = 2u,
@@ -46,9 +52,11 @@ enum FpKnob : std::uint32_t {
     fp_old_cvt = 8u,
     fp_no_const_minmax = 16u,
     fp_old_minmax = 32u,
+    fp_tiny_before = 64u,   // enables (not part of "old")
 };
 std::uint32_t fp_knob_bits();
 inline bool fp_on(std::uint32_t knob) { return (fp_knob_bits() & knob) == 0; }
+inline bool fp_tiny_before_on() { return (fp_knob_bits() & fp_tiny_before) != 0; }
 
 // ---- opcodes (legacy SSE form; VEX forms derive from them) -------------------
 namespace op {
@@ -427,6 +435,25 @@ void emit_round_away(FpEmit& e, Shape s, Xmm out, Xmm x, bool exact, const Xmm (
 void emit_narrow_round_odd(FpEmit& e, bool packed, Xmm out, Xmm x, Xmm b, Xmm m);
 // VFPExpandImm.
 std::uint64_t expand_fp_imm(unsigned imm8, unsigned es);
+// GPR for a lane-mask branch: RCX (JRCXZ leaves the host flags alone), else
+// any temp after a flag save (clobber_host_flags). Before the first label.
+struct LaneGuard {
+    Gp reg;
+    bool jrcxz;
+};
+LaneGuard lane_guard(FpEmit& e);
+// Tininess before rounding (knob tinybefore). `r` holds the result just
+// computed by `compute(out)` (es-bit lanes; scalar: lane 0; else the low
+// `width` bits). When a lane of r is +-min_normal, compute is run again into
+// t0 toward zero, which sets MXCSR.UE exactly when A64 sets UFC; no other
+// flag changes. compute must leave its sources and r intact and use no
+// register besides `out` (it runs after a label). r, t0 and t1 are distinct
+// and differ from compute's sources.
+void tiny_before_fixup(FpEmit& e, unsigned es, bool scalar, unsigned width, Xmm r, Xmm t0, Xmm t1,
+                       const LaneGuard& guard, const std::function<void(Xmm)>& compute);
+// Vd = op(...) with the fixup above for FMUL, FDIV, FNMUL and the fused forms
+// (S/D shapes); false when the instruction is not one of them.
+bool emit_arith_tiny_before(FpEmit& e, const Inst& in);
 
 // Displacements of FP context fields.
 inline constexpr std::int32_t kFpcrDisp = ctx_disp(offsetof(GuestContext, fpcr));
