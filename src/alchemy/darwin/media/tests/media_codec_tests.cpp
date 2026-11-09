@@ -583,7 +583,7 @@ void configuration_record_tests() {
 
 void unsupported_tests() {
     std::string why;
-    for (const char* code : {"avc1"}) {   // ('mp4a' decodes where the host has an AAC decoder)
+    for (const char* code : {"apcn"}) {   // ProRes ('mp4a', 'avc1', 'hvc1' decode where the host has a decoder)
         const char c[5] = {code[0], code[1], code[2], code[3], 0};
         require(!codecs::audio_decoder_available(mc::fourcc(c)) && !codecs::make_audio_decoder(mc::fourcc(c), 44100, 2, {}, why) && !why.empty(),
                 std::string(code) + " has no decoder");

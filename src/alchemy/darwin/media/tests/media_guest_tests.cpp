@@ -3432,7 +3432,8 @@ void audio_file_stream(Fixture& f) {
 }
 
 // VTDecompressionSession: libvpx's VP9 test vector (through our WebM parser) and libaom's AV1 test
-// vectors decoded into CVPixelBuffers, compared with the projects' per-frame MD5s; H.264 has no decoder.
+// vectors decoded into CVPixelBuffers, compared with the projects' per-frame MD5s; ProRes has no decoder (H.264 and
+// HEVC are vt_compression_host's).
 struct DecodedImage { Address image; std::int64_t pts; std::uint32_t flags; std::int32_t status; };
 Fixture* vt_fixture{};
 constexpr std::string_view vt_cf = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
@@ -3600,12 +3601,12 @@ void video_toolbox(Fixture& f) {
                 f.call(cv, "_CVPixelBufferGetWidth", {images[0].image}) == 16, "a 16x16 BGRA picture");
         f.call(vt_cf, "_CFRelease", {images[0].image});
     }
-    // H.264 has no decoder (until the patent question is decided).
+    // ProRes has no decoder.
     {
         const auto format_out = f.block(8), session_out = f.block(8);
-        require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, 0x61766331 /* 'avc1' */, 64, 64, 0, format_out}) == 0, "an H.264 description");
+        require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, 0x6170636e /* 'apcn' */, 64, 64, 0, format_out}) == 0, "a ProRes description");
         require(f.status(vt, "_VTDecompressionSessionCreate", {0, f.engine.read64(format_out), 0, 0, record, session_out}) == -12906 &&
-                f.engine.read64(session_out) == 0, "kVTCouldNotFindVideoDecoderErr for H.264");
+                f.engine.read64(session_out) == 0, "kVTCouldNotFindVideoDecoderErr for ProRes");
     }
 }
 
@@ -3977,6 +3978,51 @@ void vt_compression_host(Fixture& f) {
             std::vector<std::uint8_t> set(f.engine.read64(size));
             f.memory().read_bytes(f.engine.read64(pointer), set);
             sets.push_back(std::move(set));
+        }
+        // The same samples through VTDecompressionSession (over the host's decoder): IOSurface-backed 420v pictures, in
+        // presentation order, each close to its frame.
+        {
+            static const Address output = f.process.install_function("_alchemy_test_vt_output_host", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+                // (refcon, sourceFrameRefCon, status, infoFlags, imageBuffer, CMTime *pts, CMTime *duration)
+                if (s.x[4]) static_cast<void>(vt_fixture->call(vt_cf, "_CFRetain", {s.x[4]}));
+                vt_images().push_back({s.x[4], static_cast<std::int64_t>(m.read64(s.x[5])), static_cast<std::uint32_t>(s.x[3]),
+                                       static_cast<std::int32_t>(s.x[2])});
+            }, "/usr/lib/alchemy_test_io.dylib");
+            const auto record = f.block(16), decoded_out = f.block(8);
+            f.engine.write64(record, output);
+            const std::array<std::pair<Address, Address>, 2> wanted{{{f.cf.string("PixelFormatType"), f.cf.integer(0x34323076)},
+                                                                     {f.cf.string("IOSurfaceProperties"), f.cf.dictionary({})}}};
+            require(f.status(vt, "_VTDecompressionSessionCreate", {0, format, 0, f.cf.dictionary(wanted), record, decoded_out}) == 0,
+                    name + ": VTDecompressionSessionCreate on the session's format description");
+            const auto decompression = f.engine.read64(decoded_out);
+            vt_images().clear();
+            for (const auto& e : vt_encoded())
+                require(f.status(vt, "_VTDecompressionSessionDecodeFrame", {decompression, e.sample, 0, 0, info}) == 0, name + ": VTDecompressionSessionDecodeFrame");
+            require(f.status(vt, "_VTDecompressionSessionFinishDelayedFrames", {decompression}) == 0, name + ": FinishDelayedFrames");
+            require(vt_images().size() == 30, name + ": 30 decoded images, " + std::to_string(vt_images().size()));
+            double worst_decoded = 1e9;
+            for (std::size_t i = 0; i < vt_images().size(); ++i) {
+                const auto& d = vt_images()[i];
+                require(d.status == 0 && d.image && d.pts == static_cast<std::int64_t>(i), name + ": image " + std::to_string(i) + " in order");
+                require(f.call(cv, "_CVPixelBufferGetPixelFormatType", {d.image}) == 0x34323076 && f.call(cv, "_CVPixelBufferGetIOSurface", {d.image}) != 0 &&
+                        f.call(cv, "_CVPixelBufferGetWidth", {d.image}) == 160 && f.call(cv, "_CVPixelBufferGetHeight", {d.image}) == 120,
+                        name + ": a 160x120 IOSurface-backed 420v buffer");
+                f.call(cv, "_CVPixelBufferLockBaseAddress", {d.image, 1});
+                const auto base = f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {d.image, 0}), row = f.call(cv, "_CVPixelBufferGetBytesPerRowOfPlane", {d.image, 0});
+                double error = 0;
+                for (Address y = 0; y < 120; ++y) {
+                    std::vector<std::uint8_t> line(160);
+                    f.memory().read_bytes(base + y * row, line);
+                    for (std::size_t x = 0; x < 160; ++x) error += (double(line[x]) - grey[i][y * 160 + x]) * (double(line[x]) - grey[i][y * 160 + x]);
+                }
+                f.call(cv, "_CVPixelBufferUnlockBaseAddress", {d.image, 1});
+                worst_decoded = std::min(worst_decoded, 10 * std::log10(255.0 * 255.0 / std::max(error / (160.0 * 120.0), 1e-9)));
+                f.call(cfl, "_CFRelease", {d.image});
+            }
+            require(worst_decoded > 30, name + ": every decoded image close to its frame, worst PSNR " + std::to_string(worst_decoded));
+            std::cout << "[qlab media] " << name << " through VTDecompressionSession: worst PSNR " << worst_decoded << " dB" << std::endl;
+            f.call(vt, "_VTDecompressionSessionInvalidate", {decompression});
+            f.call(cfl, "_CFRelease", {decompression});
         }
         const auto decoder = mc::open_video_decoder({mc_codec, sets, 160, 120, {}});
         require(static_cast<bool>(decoder), std::string(name) + ": the host's decoder opens on the session's parameter sets");
@@ -4450,20 +4496,20 @@ void sample_buffer_renderers(Fixture& f) {
     stop.set_s(0, 0.0f);
     static_cast<void>(f.objc.send(sync, f.objc.selector("setRate:"), stop));
 
-    // Samples with no decoder (H.264 here) fail the layer.
+    // Samples with no decoder (ProRes here) fail the layer.
     const auto failing = f.send(f.send(f.cls("AVSampleBufferDisplayLayer"), "alloc"), "init");
     const auto avc = f.block(8), avc_block = f.block(8), avc_sample = f.block(8);
-    require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, 0x61766331, 16, 16, 0, avc}) == 0, "an H.264 description");
+    require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, 0x6170636e, 16, 16, 0, avc}) == 0, "a ProRes description");
     alchemy::CallRegs small{};
     small.x[2] = 16; small.x[6] = 16; small.x[7] = 1;
     small.push_stack(avc_block);
-    require(f.regs(cm, "_CMBlockBufferCreateWithMemoryBlock", small).x0 == 0, "an H.264 block");
+    require(f.regs(cm, "_CMBlockBufferCreateWithMemoryBlock", small).x0 == 0, "a ProRes block");
     alchemy::CallRegs make{};
     make.x[1] = f.engine.read64(avc_block); make.x[2] = f.engine.read64(avc); make.x[3] = 1;
     make.push_stack(avc_sample);
-    require(f.regs(cm, "_CMSampleBufferCreateReady", make).x0 == 0, "an H.264 sample");
+    require(f.regs(cm, "_CMSampleBufferCreateReady", make).x0 == 0, "a ProRes sample");
     f.send(failing, "enqueueSampleBuffer:", {f.engine.read64(avc_sample)});
-    require(f.send(failing, "status") == 2 && f.send(failing, "error") != 0, "no H.264 decoder: the layer fails with an error");
+    require(f.send(failing, "status") == 2 && f.send(failing, "error") != 0, "no ProRes decoder: the layer fails with an error");
 }
 
 // AVMutableComposition of two WAVE files (A: mono 48 kHz at 0.5; B: stereo 44.1 kHz at -0.25), edited with

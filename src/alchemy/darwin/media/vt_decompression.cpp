@@ -16,20 +16,23 @@
 #include <vector>
 
 // VTDecompressionSession (<VideoToolbox/VTDecompressionSession.h>) for AV1 ('av01'), VP9 ('vp09')
-// and VP8 ('vp08') video, over media_codecs.hpp's software decoders (dav1d, libvpx).
+// and VP8 ('vp08') video over media_codecs.hpp's software decoders (dav1d, libvpx), and H.264
+// ('avc1') and HEVC ('hvc1', 'hev1') over the host system's decoders where it has them.
 // - Create reads the format description's codec type, dimensions and its sample-description
-//   extension atoms (av1C configuration OBUs). Other codecs (H.264, HEVC, ProRes, ...) answer
-//   kVTCouldNotFindVideoDecoderErr, as does a destination format list with no format
-//   video_frames.hpp writes.
+//   extension atoms (av1C configuration OBUs, the vpcC, avcC or hvcC record). Other codecs
+//   (ProRes, ...), H.264 and HEVC on a host without a decoder, and a destination format list with
+//   no format video_frames.hpp writes answer kVTCouldNotFindVideoDecoderErr.
 // - Frames decode synchronously in DecodeFrame / DecodeFrameWithOutputHandler: each picture goes
 //   to the output callback (or handler) in presentation order as a new CVPixelBuffer in the first
 //   writable kCVPixelBufferPixelFormatTypeKey of the destination attributes (else 420v/420f, x420
 //   for more than 8 bits, 422/444 bi-planar for those layouts), made with those attributes
 //   (IOSurface, Metal compatibility) at the picture's size, with its Y'CbCr matrix, primaries and
 //   transfer function attached. A sample that shows no picture (a VP9 hidden frame) is reported
-//   with kVTDecodeInfo_FrameDropped; one the decoder rejects with kVTVideoDecoderBadDataErr.
-//   kVTDecodeInfo_Asynchronous is never set, so WaitForAsynchronousFrames has nothing to wait
-//   for; FinishDelayedFrames delivers what the decoder still holds.
+//   with kVTDecodeInfo_FrameDropped; one the decoder rejects with kVTVideoDecoderBadDataErr. The
+//   host's H.264 and HEVC decoders hold pictures back (reordering, latency): a sample's picture then
+//   goes to the callback during a later decode call, matched to its sample. kVTDecodeInfo_Asynchronous
+//   is never set, so WaitForAsynchronousFrames has nothing to wait for; FinishDelayedFrames delivers
+//   what the decoder still holds and reports a sample that never showed as dropped.
 // - Properties are vt_session.hpp's (VTSessionSetProperty and the rest, pixel_transfer.cpp).
 namespace alchemy::gui::fill {
 namespace {
@@ -100,7 +103,7 @@ std::int32_t Decompression::create(GuestMemory& m, Address format, Address attri
     if (!format || !out) return vt_parameter;
     if (call(core_media, "_CMFormatDescriptionGetMediaType", {format}) != fourcc("vide")) return vt_parameter;
     const auto codec = static_cast<std::uint32_t>(call(core_media, "_CMFormatDescriptionGetMediaSubType", {format}));
-    if (!codecs::video_decoder_available(codec)) return vt_could_not_find_decoder;   // H.264, HEVC, ProRes, ...
+    if (!codecs::video_decoder_available(codec)) return vt_could_not_find_decoder;   // ProRes, ...; H.264 and HEVC without a host decoder
     auto d = std::make_shared<Decoding>();
     d->codec = codec;
     const auto dimensions = call(core_media, "_CMVideoFormatDescriptionGetDimensions", {format});   // CMVideoDimensions in x0
@@ -111,7 +114,8 @@ std::int32_t Decompression::create(GuestMemory& m, Address format, Address attri
     const auto atoms = call(core_media, "_CMFormatDescriptionGetExtension", {format, atoms_key});
     release(atoms_key);
     if (atoms && cf.kind(atoms) == ObjectKind::dictionary) {
-        const auto name = cf.string(codec == fourcc("av01") ? "av1C" : "vpcC");
+        const auto name = cf.string(codec == fourcc("av01") ? "av1C" : codec == fourcc("avc1") ? "avcC"
+                                    : codec == fourcc("hvc1") || codec == fourcc("hev1") ? "hvcC" : "vpcC");
         const auto value = cf.dictionary_value(atoms, name);
         release(name);
         if (value && bridge->is_data(value)) {
@@ -236,7 +240,7 @@ void Decompression::deliver_ready(Decoding& d, const Deliver& deliver, std::opti
         call_deliver(deliver, image ? 0 : vt_bad_data, image ? 0 : info_frame_dropped, image, entry);
         release(image);
     }
-    if (sent && !sent_shown) {
+    if (sent && !sent_shown && !d.decoder->holds_pictures()) {
         const auto found = std::find_if(d.in_flight.begin(), d.in_flight.end(), [&](const InFlight& e) { return e.serial == *sent; });
         // A sample that shows nothing now (a hidden frame) and will not later (no reordering here).
         if (found != d.in_flight.end()) {
@@ -362,10 +366,13 @@ void Decompression::install() {
         d->decoder->drain();
         if (d->callback) {
             const auto callback = d->callback, refcon = d->refcon;
-            deliver_ready(*d, [this, callback, refcon](std::int32_t result, std::uint32_t flags, Address image, Address pts, Address duration, Address source) {
+            const Deliver deliver = [this, callback, refcon](std::int32_t result, std::uint32_t flags, Address image, Address pts, Address duration, Address source) {
                 static_cast<void>(EngineAdapter(process.calling_engine()).call(callback, std::array<Address, 7>{refcon, source,
                     static_cast<Address>(static_cast<std::int64_t>(result)), flags, image, pts, duration}));
-            }, std::nullopt);
+            };
+            deliver_ready(*d, deliver, std::nullopt);
+            // A held sample that never showed.
+            for (const auto& entry : d->in_flight) call_deliver(deliver, 0, info_frame_dropped, 0, entry);
         }
         d->in_flight.clear();
         s.x[0] = 0;

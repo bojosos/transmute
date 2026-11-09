@@ -170,11 +170,11 @@ void core_media(Fixture& f) {
 }
 
 void video(Fixture& f) {
-    // H.264 has no decoder (AV1, VP9 and VP8 do: media_guest_tests' video_toolbox).
+    // ProRes has no decoder (AV1, VP9 and VP8 do, and H.264 and HEVC where the host has one: media_guest_tests).
     const auto out = f.block(8, 0xff), format_out = f.block(8);
-    require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, fourcc("avc1"), 640, 480, 0, format_out}) == 0, "an H.264 description");
+    require(f.status(cm, "_CMVideoFormatDescriptionCreate", {0, fourcc("apcn"), 640, 480, 0, format_out}) == 0, "a ProRes description");
     require(f.status(vt, "_VTDecompressionSessionCreate", {0, f.engine.read64(format_out), 0, 0, 0, out}) == -12906 && f.engine.read64(out) == 0,
-            "no H.264 decoder");
+            "no ProRes decoder");
     // H.264 and HEVC encode where the host has an encoder (media_guest_tests' vt_compression); JPEG never does.
     alchemy::CallRegs compress{};
     compress.x[1] = 640; compress.x[2] = 480; compress.x[3] = fourcc("jpeg");

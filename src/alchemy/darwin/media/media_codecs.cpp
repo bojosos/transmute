@@ -1,6 +1,7 @@
 #include "alchemy/darwin/media/media_codecs.hpp"
 
 #include "alchemy/darwin/media/media_container.hpp"
+#include "alchemy/darwin/media/video_config.hpp"
 #include "alchemy/host/media_codec.hpp"
 
 #define MINIMP3_FLOAT_OUTPUT
@@ -15,10 +16,17 @@
 #include "dav1d/dav1d.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <deque>
+
+namespace alchemy::gui::fill {
+// The SPS's displayed size (coremedia.cpp).
+std::optional<std::pair<std::int32_t, std::int32_t>> h264_sps_dimensions(std::span<const std::uint8_t> nal);
+std::optional<std::pair<std::int32_t, std::int32_t>> hevc_sps_dimensions(std::span<const std::uint8_t> nal);
+} // namespace alchemy::gui::fill
 
 namespace alchemy::gui::completion_kit::media::codecs {
 
@@ -605,6 +613,131 @@ private:
 
 // ---- AV1 (dav1d) ------------------------------------------------------------
 
+// ---- H.264 and HEVC (the host's decoders) ----------------------------------------
+
+bool host_video_decoder_exists(alchemy::host::media_codec::Codec codec) {
+    namespace mc = alchemy::host::media_codec;
+    static const std::array<bool, 2> exists = [] {
+        std::array<bool, 2> out{};
+        for (const auto c : {mc::Codec::h264, mc::Codec::hevc}) {
+            const auto listed = mc::decoders(c);
+            out[c == mc::Codec::h264 ? 0 : 1] = listed && !listed->empty();
+        }
+        return out;
+    }();
+    return exists[codec == mc::Codec::h264 ? 0 : 1];
+}
+
+class HostVideoDecoder final : public VideoDecoder {
+public:
+    ~HostVideoDecoder() override { alchemy::host::media_codec::close(decoder_); }
+    bool open(bool hevc, std::span<const std::uint8_t> config, std::string& why) {
+        namespace mc = alchemy::host::media_codec;
+        namespace vc = video_config;
+        hevc_ = hevc;
+        const auto record = hevc ? vc::read_hevc_configuration(config) : vc::read_avc_configuration(config);
+        if (!record || record->sets.empty()) { why = hevc ? "no hvcC configuration" : "no avcC configuration"; return false; }
+        length_size_ = record->nal_length_size;
+        // The size from the SPS: the HEVC decoder takes no stream without one.
+        std::uint32_t width = 0, height = 0;
+        for (const auto& set : record->sets)
+            if (const auto size = hevc ? alchemy::gui::fill::hevc_sps_dimensions(set) : alchemy::gui::fill::h264_sps_dimensions(set)) {
+                width = static_cast<std::uint32_t>(size->first);
+                height = static_cast<std::uint32_t>(size->second);
+                break;
+            }
+        const auto opened = mc::open_video_decoder({hevc ? mc::Codec::hevc : mc::Codec::h264, record->sets, width, height, {}});
+        if (!opened) {
+            why = opened.error() == alchemy::host::Error::not_found || opened.error() == alchemy::host::Error::unsupported
+                ? (hevc ? "no HEVC decoder exists on this host" : "no H.264 decoder exists on this host")
+                : "the host's decoder refused the stream's parameter sets";
+            return false;
+        }
+        decoder_ = *opened;
+        return true;
+    }
+    bool send(std::span<const std::uint8_t> packet, std::int64_t pts, std::string& why) override {
+        namespace mc = alchemy::host::media_codec;
+        // The host's decoders take 4-byte lengths; the sample's own size may be 1, 2 or 4.
+        mc::Sample sample;
+        bool key = false;
+        for (std::size_t at = 0; at + length_size_ <= packet.size();) {
+            std::size_t length = 0;
+            for (unsigned i = 0; i < length_size_; ++i) length = (length << 8) | packet[at + i];
+            at += length_size_;
+            if (length == 0 || at + length > packet.size()) { why = "a NAL unit runs past the sample"; return false; }
+            const auto type = hevc_ ? (packet[at] >> 1) & 0x3f : packet[at] & 0x1f;
+            key = key || (hevc_ ? type >= 16 && type <= 21 : type == 5);
+            for (int shift = 24; shift >= 0; shift -= 8) sample.data.push_back(static_cast<std::uint8_t>(length >> shift));
+            sample.data.insert(sample.data.end(), packet.begin() + static_cast<std::ptrdiff_t>(at), packet.begin() + static_cast<std::ptrdiff_t>(at + length));
+            at += length;
+        }
+        if (sample.data.empty()) { why = "an empty sample"; return false; }
+        // Times reach the host's decoder as a 30 frames per second sequence of the packets' numbers, and come back to them.
+        sample.pts = sample.dts = pts * tick;
+        sample.duration = tick;
+        sample.keyframe = key;
+        if (!mc::decode(decoder_, sample, ready_)) { why = "the host's decoder rejected the sample"; return false; }
+        return true;
+    }
+    bool receive(VideoFrame& out) override {
+        if (ready_.empty()) return false;
+        const auto p = std::move(ready_.front());
+        ready_.erase(ready_.begin());
+        out = VideoFrame{};
+        out.width = p.width;
+        out.height = p.height;
+        out.bit_depth = p.bit_depth;
+        out.pts = static_cast<std::int64_t>(std::llround(static_cast<double>(p.pts) / tick));
+        const bool wide = p.bit_depth > 8;
+        const std::uint32_t bytes = wide ? 2 : 1, shift = wide ? 16 - p.bit_depth : 0;
+        const auto chroma_width = (p.width + 1) / 2, chroma_height = (p.height + 1) / 2;
+        auto& y = out.planes[0];
+        y.width = p.width;
+        y.height = p.height;
+        y.stride = p.width * bytes;
+        y.data.resize(std::size_t(y.stride) * p.height);
+        for (std::uint32_t row = 0; row < p.height; ++row)
+            for (std::uint32_t x = 0; x < p.width; ++x) {
+                if (!wide) { y.data[std::size_t(row) * y.stride + x] = p.luma[row * p.luma_stride + x]; continue; }
+                const auto at = row * p.luma_stride + 2 * x;
+                const auto value = static_cast<std::uint16_t>((p.luma[at] | (p.luma[at + 1] << 8)) >> shift);
+                y.data[std::size_t(row) * y.stride + 2 * x] = static_cast<std::uint8_t>(value);
+                y.data[std::size_t(row) * y.stride + 2 * x + 1] = static_cast<std::uint8_t>(value >> 8);
+            }
+        // Interleaved Cb Cr into two planes.
+        for (int c = 0; c < 2; ++c) {
+            auto& plane = out.planes[1 + c];
+            plane.width = chroma_width;
+            plane.height = chroma_height;
+            plane.stride = chroma_width * bytes;
+            plane.data.resize(std::size_t(plane.stride) * chroma_height);
+            for (std::uint32_t row = 0; row < chroma_height; ++row)
+                for (std::uint32_t x = 0; x < chroma_width; ++x) {
+                    const auto at = row * p.chroma_stride + (2 * x + c) * bytes;
+                    if (!wide) { plane.data[std::size_t(row) * plane.stride + x] = p.chroma[at]; continue; }
+                    const auto value = static_cast<std::uint16_t>((p.chroma[at] | (p.chroma[at + 1] << 8)) >> shift);
+                    plane.data[std::size_t(row) * plane.stride + 2 * x] = static_cast<std::uint8_t>(value);
+                    plane.data[std::size_t(row) * plane.stride + 2 * x + 1] = static_cast<std::uint8_t>(value >> 8);
+                }
+        }
+        return true;
+    }
+    void drain() override { static_cast<void>(alchemy::host::media_codec::drain(decoder_, ready_)); }
+    void reset() override {
+        alchemy::host::media_codec::flush(decoder_);
+        ready_.clear();
+    }
+    bool holds_pictures() const override { return true; }
+
+private:
+    static constexpr std::int64_t tick = 333333;   // 100 ns units
+    alchemy::host::media_codec::VideoDecoder* decoder_{};
+    bool hevc_{};
+    unsigned length_size_{4};
+    std::vector<alchemy::host::media_codec::DecodedPicture> ready_;
+};
+
 class Dav1dDecoder final : public VideoDecoder {
 public:
     bool open(std::span<const std::uint8_t> config, std::string& why) {
@@ -708,6 +841,9 @@ private:
 } // namespace
 
 bool video_decoder_available(std::uint32_t codec) {
+    namespace mc = alchemy::host::media_codec;
+    if (codec == fourcc("avc1")) return host_video_decoder_exists(mc::Codec::h264);
+    if (codec == fourcc("hvc1") || codec == fourcc("hev1")) return host_video_decoder_exists(mc::Codec::hevc);
     return codec == fourcc("vp08") || codec == fourcc("vp09") || codec == fourcc("av01");
 }
 
@@ -720,6 +856,11 @@ std::unique_ptr<VideoDecoder> make_video_decoder(std::uint32_t codec, std::span<
     if (codec == fourcc("av01")) {
         auto d = std::make_unique<Dav1dDecoder>();
         if (!d->open(config, why)) return nullptr;
+        return d;
+    }
+    if (codec == fourcc("avc1") || codec == fourcc("hvc1") || codec == fourcc("hev1")) {
+        auto d = std::make_unique<HostVideoDecoder>();
+        if (!d->open(codec != fourcc("avc1"), config, why)) return nullptr;
         return d;
     }
     why = "no decoder for this video format";

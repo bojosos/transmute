@@ -92,8 +92,11 @@ struct VideoFrame {
     Plane planes[3];
 };
 
-// Video: VP8 ('vp08') and VP9 ('vp09', profiles 0-3, libvpx), AV1 ('av01', dav1d). Packets go in
-// with their presentation times; pictures come out in presentation order.
+// Video: VP8 ('vp08') and VP9 ('vp09', profiles 0-3, libvpx), AV1 ('av01', dav1d), and H.264 ('avc1') and HEVC
+// ('hvc1', 8 and 10 bits) through the host system's decoders (host/media_codec.hpp) where it has them; their
+// configuration is the avcC or hvcC record, their packets length-prefixed NAL units of its length size. Packets go in
+// with their presentation times; pictures come out in presentation order. The host's decoders give no colour
+// description, so H.264 and HEVC pictures carry none (unspecified: the size decides the matrix) and video range.
 class VideoDecoder {
 public:
     virtual ~VideoDecoder() = default;
@@ -105,6 +108,9 @@ public:
     virtual void drain() = 0;
     // Forgets everything (after a seek); decoding resumes at a keyframe.
     virtual void reset() = 0;
+    // Whether a packet's picture may come out only after later packets (reordering, decoder latency); false: a packet
+    // that gives no picture at once shows none (a hidden frame).
+    [[nodiscard]] virtual bool holds_pictures() const { return false; }
 };
 
 bool video_decoder_available(std::uint32_t codec);
