@@ -861,6 +861,7 @@ void DarwinServices::Impl::install_all() {
     install_python_services();
     install_memory_streams();
     install_process_identity();
+    install_fault_signals();
     install_file_services();
     install_network_services();
     install_libsystem_files();

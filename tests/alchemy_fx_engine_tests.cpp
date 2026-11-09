@@ -115,14 +115,15 @@ int main(int argc, char** argv) {
     }
     const std::string fx = argv[1], threads = argv[2], frint = argv[3];
     // Optional: --vm-remap=<fixture>, --vm-reserve=<fixture>, --jit-flush=<fixture>, --vm-lazy=<fixture>,
-    // then the threaded fixture.
-    std::string vm_remap, vm_reserve, jit_flush, vm_lazy, threaded;
+    // --exec-fault=<fixture>, then the threaded fixture.
+    std::string vm_remap, vm_reserve, jit_flush, vm_lazy, exec_fault, threaded;
     for (int i = 4; i < argc; ++i) {
         const std::string argument = argv[i];
         if (argument.rfind("--vm-remap=", 0) == 0) vm_remap = argument.substr(11);
         else if (argument.rfind("--vm-reserve=", 0) == 0) vm_reserve = argument.substr(13);
         else if (argument.rfind("--jit-flush=", 0) == 0) jit_flush = argument.substr(12);
         else if (argument.rfind("--vm-lazy=", 0) == 0) vm_lazy = argument.substr(10);
+        else if (argument.rfind("--exec-fault=", 0) == 0) exec_fault = argument.substr(13);
         else threaded = argument;
     }
     try {
@@ -254,6 +255,15 @@ int main(int argc, char** argv) {
             expect(outcome.status == 139 && contains(outcome.output, "SIGSEGV") &&
                        contains(outcome.output, "write of 0x10") && contains(outcome.output, "fx_threads+0x"),
                    "null-page write -> SIGSEGV with guest backtrace", outcome, "expected status 139");
+        }
+        if (!exec_fault.empty()) {
+            // A BLR to 0 without a handler: Darwin's crash (SIGSEGV, status 139,
+            // the guest backtrace), not fx's diagnostic stop.
+            const auto outcome = run({fx, exec_fault, "unhandled"});
+            expect(outcome.status == 139 && contains(outcome.output, "SIGSEGV") &&
+                       contains(outcome.output, "execute of 0x0") && contains(outcome.output, "fx_exec_fault+0x") &&
+                       !contains(outcome.output, "fx runtime:"),
+                   "unhandled BLR to 0 -> SIGSEGV", outcome, "expected status 139");
         }
         {
             const auto outcome = run({fx, threads, "worker-fault"});

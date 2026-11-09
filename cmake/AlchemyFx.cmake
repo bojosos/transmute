@@ -88,6 +88,7 @@ if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD AND macos_dir)
     alchemy_object(fx_leaf_calls fx_leaf_calls.c)
     alchemy_object(fx_table_shadow fx_table_shadow.c)
     alchemy_object(fx_inline_cache fx_inline_cache.c)
+    alchemy_object(fx_exec_fault fx_exec_fault.c)
     add_custom_command(OUTPUT "${macos_dir}/fx_link_system.dylib"
         COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -dylib
             -install_name /usr/lib/libSystem.B.dylib "${macos_dir}/fx_link_system.o"
@@ -150,15 +151,20 @@ if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD AND macos_dir)
         COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main
             "${macos_dir}/fx_inline_cache.o" "${macos_dir}/fx_link_system.dylib" -o "${macos_dir}/fx_inline_cache"
         DEPENDS "${macos_dir}/fx_inline_cache.o" "${macos_dir}/fx_link_system.dylib" VERBATIM)
+    add_custom_command(OUTPUT "${macos_dir}/fx_exec_fault"
+        COMMAND "${ALCHEMY_LD64_LLD}" ${macos_link_options} -e _main
+            "${macos_dir}/fx_exec_fault.o" "${macos_dir}/fx_link_system.dylib" -o "${macos_dir}/fx_exec_fault"
+        DEPENDS "${macos_dir}/fx_exec_fault.o" "${macos_dir}/fx_link_system.dylib" VERBATIM)
     add_custom_target(alchemy_fx_engine_fixtures DEPENDS "${macos_dir}/fx_threads" "${macos_dir}/fx_frint_probe"
         "${macos_dir}/fx_tlv" "${macos_dir}/fx_tlv_plugin.bundle" "${macos_dir}/fx_leaf_calls" "${macos_dir}/fx_table_shadow"
         "${macos_dir}/fx_vm_remap" "${macos_dir}/fx_vm_reserve" "${macos_dir}/fx_vm_lazy" "${macos_dir}/fx_mach_ports"
-        "${macos_dir}/fx_mach_cross" "${macos_dir}/fx_jit_flush" "${macos_dir}/fx_inline_cache")
+        "${macos_dir}/fx_mach_cross" "${macos_dir}/fx_jit_flush" "${macos_dir}/fx_inline_cache" "${macos_dir}/fx_exec_fault")
     add_executable(alchemy_fx_engine_tests tests/alchemy_fx_engine_tests.cpp)
     add_dependencies(alchemy_fx_engine_tests alchemy_fx_engine_fixtures alchemy-fx)
     set(alchemy_fx_engine_test_arguments "$<TARGET_FILE:alchemy-fx>" "${macos_dir}/fx_threads"
         "${macos_dir}/fx_frint_probe" "--vm-remap=${macos_dir}/fx_vm_remap" "--vm-reserve=${macos_dir}/fx_vm_reserve"
-        "--jit-flush=${macos_dir}/fx_jit_flush" "--vm-lazy=${macos_dir}/fx_vm_lazy")
+        "--jit-flush=${macos_dir}/fx_jit_flush" "--vm-lazy=${macos_dir}/fx_vm_lazy"
+        "--exec-fault=${macos_dir}/fx_exec_fault")
     if(TARGET alchemy_expanded_fixtures)
         add_dependencies(alchemy_fx_engine_tests alchemy_expanded_fixtures)
         list(APPEND alchemy_fx_engine_test_arguments "${macos_dir}/threaded")
@@ -208,6 +214,17 @@ if(BUILD_TESTING AND ALCHEMY_CLANG AND ALCHEMY_LD64_LLD AND macos_dir)
     add_test(NAME alchemy_fx_inline_cache_ic1 COMMAND alchemy-fx "${macos_dir}/fx_inline_cache")
     set_tests_properties(alchemy_fx_inline_cache_ic1 PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx inline cache: ok"
         ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1;TRANSMUTE_FX_CORE=ic1")
+    # Instruction fetches from memory without code (null and stale function
+    # pointers) raise the guest's SIGSEGV/SIGBUS for its handler: BR/BLR/RET,
+    # inline caches, mispredicted returns, unmapped JIT code, sigreturn,
+    # sigaltstack; also with the inline caches off and the masked (old) RSB.
+    # The unhandled case (status 139): alchemy_fx_engine.
+    add_test(NAME alchemy_fx_exec_fault COMMAND alchemy-fx "${macos_dir}/fx_exec_fault")
+    set_tests_properties(alchemy_fx_exec_fault PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx exec fault: ok"
+        ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1")
+    add_test(NAME alchemy_fx_exec_fault_plain COMMAND alchemy-fx "${macos_dir}/fx_exec_fault")
+    set_tests_properties(alchemy_fx_exec_fault_plain PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "fx exec fault: ok"
+        ENVIRONMENT "ALCHEMY_GUI_NO_CRASH_DIALOG=1;TRANSMUTE_FX_CORE=noinlinecache,oldrsb")
     # BRs through a writable dispatch table (V8's Ignition) take fx's table
     # shadows: handlers rewritten, table entries changed, two tables, threads;
     # and the same with the shadows off.

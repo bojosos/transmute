@@ -125,10 +125,13 @@ void raise_simple(GuestContext& ctx, std::uint32_t code, std::uint32_t count_par
     raise(ctx, record);
 }
 
-void raise_execute_fault(GuestContext& ctx, const char* reason) {
+// `expected`: a fetch from memory that holds no code (a null or stale
+// function pointer), which guests may handle (Darwin SIGSEGV/SIGBUS); it
+// prints like other access violations. Else a runtime failure, always printed.
+void raise_execute_fault(GuestContext& ctx, const char* reason, bool expected = false) {
     host::vm::RegionInfo info;
     const bool committed = host::vm::query(reinterpret_cast<const void*>(ctx.pc), info) && info.committed();
-    report(ctx, reason);
+    if (!expected || trace_exceptions()) report(ctx, reason);
     raise_simple(ctx, kStatusAccessViolation, 2, committed ? 8 : 0, ctx.pc);
 }
 
@@ -210,7 +213,7 @@ void interpret_step(GuestContext& ctx) {
     count(g_counters.interpreted);
     std::uint32_t word;
     if ((ctx.pc & 3) != 0) { raise_misaligned(ctx); return; }
-    if (!safe_read32(ctx.pc, word)) { raise_execute_fault(ctx, "instruction fetch from unreadable memory"); return; }
+    if (!safe_read32(ctx.pc, word)) { raise_execute_fault(ctx, "instruction fetch from unreadable memory", true); return; }
     if (is_brk(word)) { raise_brk(ctx, imm16(word)); return; }
     if (is_svc(word)) { ctx.pc += 4; handle_svc(ctx, imm16(word)); return; }
     if (interpret_system_register(ctx, word)) return;
@@ -261,7 +264,7 @@ const void* code_for_pc(GuestContext& ctx) {
             raise_execute_fault(ctx, "host code target could not be bound");
             continue;
         }
-        raise_execute_fault(ctx, "branch to memory that is neither guest code nor host code");
+        raise_execute_fault(ctx, "branch to memory that is neither guest code nor host code", true);
     }
 }
 

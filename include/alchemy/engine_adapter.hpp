@@ -46,6 +46,38 @@ private:
     throw GuestSignalTermination(signal, reason);
 }
 
+// A synchronous fault signal (SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE) of the
+// calling guest thread, as Darwin's trap delivery describes it: si_code,
+// si_addr, and the exception state (mcontext __es: far, esr, exception).
+struct FaultSignal {
+    int signal{};
+    int code{};
+    std::uint64_t address{};
+    std::uint32_t esr{};
+    std::uint32_t exception{};
+};
+
+// The personality's delivery of fault signals to guest handlers (libSystem's
+// sigaction table). An engine whose fault continuation is a synthetic call
+// offers the fault here, with `state` the faulting thread's registers and
+// state.pc the faulting instruction, before the default action. Delivery
+// returns true after pointing `state` at the handler (and setting
+// resume_at_pc); false leaves `state` unchanged and the default action
+// applies. One per process: set once, before guest code runs.
+using FaultSignalDelivery = std::function<bool(transmute::CpuState&, transmute::GuestMemory&, const FaultSignal&)>;
+inline FaultSignalDelivery& fault_signal_delivery() {
+    static FaultSignalDelivery delivery;
+    return delivery;
+}
+
+// Set by a synthetic call handler that resumes the guest at state.pc with
+// every register as it left them (signal handler entry, sigreturn), instead
+// of returning to x30. The engine clears it when it resumes.
+inline bool& resume_at_pc() {
+    thread_local bool value = false;
+    return value;
+}
+
 // Optional engine capability: page-granular protection inside an existing
 // mapping (Darwin partial mprotect). False when the engine cannot express it.
 template <class Engine>

@@ -2840,6 +2840,7 @@ public:
     void install_python_services();
     void install_memory_streams();   // fs/memory_streams.cpp
     void install_process_identity();
+    void install_fault_signals();    // process/fault_signals.cpp
     void install_file_services();
     void install_libsystem_files();
     void install_terminals();

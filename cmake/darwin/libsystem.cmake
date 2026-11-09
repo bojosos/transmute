@@ -24,6 +24,7 @@ target_sources(alchemy_core PRIVATE
     src/alchemy/darwin/libsystem/misc/libsystem_extra.cpp
     src/alchemy/darwin/libsystem/net/sockets.cpp
     src/alchemy/darwin/libsystem/process/identity.cpp
+    src/alchemy/darwin/libsystem/process/fault_signals.cpp
     src/alchemy/darwin/libsystem/process/launch.cpp
     src/alchemy/darwin/libsystem/process/process_model.cpp
     src/alchemy/darwin/libsystem/process/process_tree.cpp

@@ -346,14 +346,16 @@ void svc_hook(fx::GuestContext& ctx, std::uint32_t immediate) {
 // fx dispatches guest faults to PE SEH (vectored handlers, .pdata frame
 // handlers, the unhandled-exception filter). Mach-O code has none of these, so
 // Alchemy installs the process unhandled-exception filter: a synthetic call
-// that maps the NT status to the Darwin signal whose default action applies,
-// then resumes the faulting thread at a second synthetic call that raises
-// GuestSignalTermination on that thread's own dispatcher (never inside SEH
-// dispatch frames). Unknown codes continue the search to fx's own report.
+// that maps the NT status to the Darwin signal, then resumes the faulting
+// thread at a second synthetic call on that thread's own dispatcher (never
+// inside SEH dispatch frames). There a guest handler for the signal runs
+// (alchemy::fault_signal_delivery), else GuestSignalTermination applies the
+// default action. Unknown codes continue the search to fx's own report.
 struct PendingFault {
     int signal{};
     std::string reason;
     std::uint64_t pc{};
+    alchemy::FaultSignal info{};
 };
 thread_local std::optional<PendingFault> t_fault;
 
@@ -685,11 +687,12 @@ struct FxEngine::Shared {
         const auto raise_index = kMaximumGuestCalls - 1;
         g_rethrow_call = kGuestCallBase + (kMaximumGuestCalls - 2) * kGuestCallStride;
         fault_raise_call = kGuestCallBase + raise_index * kGuestCallStride;
-        calls[raise_index] = std::make_shared<const GuestCallHandler>([](CpuState& state, GuestMemory&) {
+        calls[raise_index] = std::make_shared<const GuestCallHandler>([](CpuState& state, GuestMemory& memory) {
             if (!t_fault) throw std::runtime_error("alchemy-fx: fault continuation without a pending fault");
             const auto fault = std::move(*t_fault);
             t_fault.reset();
-            state.pc = fault.pc;   // diagnostics name the faulting instruction
+            state.pc = fault.pc;   // the handler's mcontext; diagnostics name the faulting instruction
+            if (const auto& deliver = alchemy::fault_signal_delivery(); deliver && deliver(state, memory, fault.info)) return;
             alchemy::terminate_by_signal(fault.signal, fault.reason);
         });
         call_table[raise_index].store(calls[raise_index].get(), std::memory_order_release);
@@ -867,6 +870,7 @@ struct FxEngine::Shared {
         std::ostringstream reason;
         reason << std::hex;
         int signal = 0;
+        alchemy::FaultSignal signal_info{};
         switch (code) {
         case fx::host::kFaultAccessViolation:
         case fx::host::kFaultGuardPage: {
@@ -881,7 +885,13 @@ struct FxEngine::Shared {
                 mapped = region && region->mapped;
             }
             signal = mapped ? 10 : 11;
-            reason << "EXC_BAD_ACCESS: guest " << access_name(parameter(0)) << " of 0x" << address
+            // xnu: SIGSEGV is SEGV_MAPERR, SIGBUS BUS_ADRALN; esr an instruction
+            // abort (a fetch: the address is the pc) or data abort from EL0,
+            // translation or permission fault at level 3.
+            const bool fetch = address == pc, write = parameter(0) == 1;
+            signal_info = {signal, 1, address,
+                    (fetch ? 0x20u : 0x24u) << 26 | 1u << 25 | (write ? 0x40u : 0u) | (mapped ? 0x0fu : 0x07u), 1};
+            reason << "EXC_BAD_ACCESS: guest " << (fetch ? "execute" : access_name(parameter(0))) << " of 0x" << address
                    << (mapped ? " (protection failure)" : " (unmapped)") << " at pc 0x" << pc;
             if (mapped) {
                 // What the host and fx know about the page (a protection failure
@@ -900,6 +910,7 @@ struct FxEngine::Shared {
         }
         case fx::host::kFaultStackOverflow:
             signal = 11;
+            signal_info = {signal, 1, sp, 0x24u << 26 | 1u << 25 | 0x47u, 1};
             reason << "EXC_BAD_ACCESS: guest stack overflow (sp 0x" << sp << ") at pc 0x" << pc;
             break;
         case fx::host::kFaultInPageError:
@@ -937,7 +948,13 @@ struct FxEngine::Shared {
         default:
             return std::nullopt;
         }
-        return PendingFault{signal, reason.str(), pc};
+        if (!signal_info.signal) {
+            // EXC_BAD_ACCESS (misaligned, in-page): BUS_ADRALN; EXC_BAD_INSTRUCTION:
+            // ILL_ILLOPC; EXC_BREAKPOINT: TRAP_BRKPT; EXC_ARITHMETIC: FPE_INTDIV.
+            const std::uint32_t exception = signal == 4 ? 2 : signal == 5 ? 6 : signal == 8 ? 3 : 1;
+            signal_info = {signal, 1, signal == 10 ? parameter(1) : pc, 0, exception};
+        }
+        return PendingFault{signal, reason.str(), pc, signal_info};
     }
 
     // ---- region table (memory_lock held) -----------------------------------
@@ -1734,7 +1751,7 @@ void FxEngine::invoke_synthetic(void* guest_context, std::uint64_t pc) {
         if (const auto name = alchemy::perf::address_name(pc); !name.empty()) message << " (" << name << ')';
         throw std::runtime_error(message.str());
     }
-    state_.pc = state_.x[30];
+    if (!std::exchange(alchemy::resume_at_pc(), false)) state_.pc = state_.x[30];
     store_state(state_, ctx, vectors);
     ctx.pc = state_.pc;
 }
