@@ -402,6 +402,8 @@ void LaunchServices::install() {
     string(core_services, "_kLSQuarantineTypeWebDownload", "LSQuarantineTypeWebDownload");
     // Spotlight metadata cannot be set (MDItemSetAttribute below); items and queries are file_manager.cpp's.
     string(core_services, "_kMDItemWhereFroms", "kMDItemWhereFroms");
+    // An item's text content: no Spotlight importer extracts it, so items have no such value.
+    string(core_services, "_kMDItemTextContent", "kMDItemTextContent");
     // Private calls: no compatibility fixes and no LaunchServices connection exist.
     raw(core_services, "__CSCheckFixDisable", [](CpuState&, GuestMemory&) {});
     constant(core_services, "__LSSetApplicationLaunchServicesServerConnectionStatus", 0);

@@ -15,6 +15,9 @@
   memory management are NSObject's, and every other message reaches a
   subclass's -methodSignatureForSelector: / -forwardInvocation:, which
   NSProxy's own versions refuse (NSInvalidArgumentException).
+  NSMetadataQuery with no Spotlight index (a started query gathers nothing)
+  and NSHost through libSystem's resolver (metadata_and_hosts.cpp);
+  NSProtocolFromString / NSStringFromProtocol (foundation_bridge.cpp).
 - **Also here for now:** libobjc's associated objects (objc_assoc.cpp). They
   belong to the Objective-C runtime (src/alchemy/objc/), which stays put in
   this wave.

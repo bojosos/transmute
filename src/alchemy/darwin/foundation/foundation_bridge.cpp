@@ -149,6 +149,17 @@ struct FoundationBridge::Impl {
         foundation_function("_NSStringFromSelector", [this](auto& state, auto& memory) {
             state.x[0] = name_string("_sel_getName", state.x[0], memory);
         });
+        // NSProtocolFromString / NSStringFromProtocol: objc_getProtocol of the name, protocol_getName.
+        foundation_function("_NSProtocolFromString", [this](auto& state, auto&) {
+            if (!state.x[0]) return;
+            const auto service = process.resolve(objc_library, "_objc_getProtocol");
+            if (!service) throw std::runtime_error("Foundation bridge: missing objc_getProtocol");
+            const std::array arguments{cf.c_string(state.x[0], 0x08000100)};   // kCFStringEncodingUTF8
+            state.x[0] = process.calling_engine().invoke_callback(service->address, arguments);
+        });
+        foundation_function("_NSStringFromProtocol", [this](auto& state, auto& memory) {
+            state.x[0] = state.x[0] ? name_string("_protocol_getName", state.x[0], memory) : 0;
+        });
         extra = detail::install_foundation_extra(process, objc, cf);
     }
     static std::string filename(const std::filesystem::path& path) {
