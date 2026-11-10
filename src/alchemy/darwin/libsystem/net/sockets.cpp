@@ -2,6 +2,7 @@
 // the file table; native sockets never escape into guest structures.
 #include "alchemy/darwin/libsystem/services_impl.hpp"
 #include "alchemy/darwin/libsystem/net/interface_names.hpp"
+#include "alchemy/host/system.hpp"
 
 namespace alchemy {
 namespace {
@@ -246,8 +247,9 @@ std::optional<std::uint32_t> inet_aton_value(std::string_view text) {
 // %LOCALAPPDATA%, so neither the Windows temporary directory nor the default
 // Alchemy root: bind succeeds there but connect fails with WSAEINVAL and the
 // socket file cannot be removed) and allows 108-byte paths. The home is the
-// first of ALCHEMY_SOCKET_DIR, <root>/.alchemy/sockets and
-// %USERPROFILE%/.alchemy/sockets where a bind/listen/connect self-test
+// first of ALCHEMY_SOCKET_DIR, <root>/.alchemy/sockets and the user's home's
+// .alchemy/sockets (host::system::known_directory: %USERPROFILE% on Windows,
+// $HOME on Linux) where a bind/listen/connect self-test
 // passes. Darwin's pathname rules hold for the placeholder: bind fails with
 // EADDRINUSE when the path exists, unlink removes it (and the socket file),
 // connect fails with ENOENT without it and ECONNREFUSED when it is not a
@@ -284,7 +286,8 @@ std::filesystem::path unix_socket_home() {
         std::vector<std::filesystem::path> candidates;
         if (const auto value = host::process::environment("ALCHEMY_SOCKET_DIR"); value && !value->empty()) candidates.push_back(utf8_path(*value));
         if (const auto root = configured_alchemy_root()) candidates.push_back(*root / ".alchemy" / "sockets");
-        if (const auto profile = host::process::environment("USERPROFILE"); profile && !profile->empty()) candidates.push_back(utf8_path(*profile) / ".alchemy" / "sockets");
+        if (const auto user_home = host::system::known_directory(host::system::Directory::home); user_home && !user_home->empty())
+            candidates.push_back(utf8_path(*user_home) / ".alchemy" / "sockets");
         for (const auto& candidate : candidates) if (unix_home_works(candidate)) { home = candidate; break; }
         if (!home) std::fprintf(stderr, "alchemy: no directory supports AF_UNIX sockets (set ALCHEMY_SOCKET_DIR); AF_UNIX bind and connect fail with EOPNOTSUPP\n");
     }

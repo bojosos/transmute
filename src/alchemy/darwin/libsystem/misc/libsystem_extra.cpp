@@ -522,7 +522,8 @@ struct State : std::enable_shared_from_this<State> {
         Password value;
         value.name = "alchemy"; // the virtual login name getlogin() reports
         if (const auto home = environment("HOME")) value.directory = *home;
-        else if (const auto profile = environment("USERPROFILE")) value.directory = guest_path_string(utf8_path(*profile));
+        else if (const auto user_home = host::system::known_directory(host::system::Directory::home))
+            value.directory = guest_path_string(utf8_path(*user_home));
         else value.directory = "/";
         return value;
     }
