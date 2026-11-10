@@ -26,6 +26,8 @@
 #include <wctype.h>
 #include <copyfile.h>
 #include <MacTypes.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <os/lock.h>
 #include <sys/ioctl.h>
 #include <sys/proc.h>

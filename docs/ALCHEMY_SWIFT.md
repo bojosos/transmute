@@ -430,6 +430,25 @@ layout or a result pointer, so no member ever runs on a guessed layout. Their
 stored fields are placeholders until then. Pika 2.0.2 reaches that stop for
 ObservedObject when it builds its first view.
 
+`ALCHEMY_SWIFTUI_LAYOUTS=report` runs the layout survey at `App.main`, before
+the app is built.
+- It walks the main executable's `__swift5_types` and calls each non-generic
+  struct's metadata accessor.
+- It enumerates the struct's fields with the runtime's own field enumeration.
+- For every field typed as one of the 18 types, it reports the room the app
+  gives it, with the container's size, value-witness flags and extra
+  inhabitants, on standard error as `SwiftUI layout:` lines.
+- Only structs the compiler laid out (static field offsets) are evidence of
+  Apple's layouts; the report marks the ones the runtime lays out.
+- The survey reads data and calls nothing in the app except metadata accessors.
+- Classes are not surveyed yet: the field enumeration of a class with
+  Objective-C ancestry goes through ivar lists Alchemy doesn't answer for
+  every class.
+
+Pika 2.0.2's report gives ObservedObject 16 bytes: 8-aligned, not POD, with a
+reference's extra inhabitants. It doesn't show which word holds the reference,
+so ObservedObject's stop stays, as do all the others.
+
 ForEach is declared in Apple's SwiftUICore module and its `create(_:id:content:)`
 in SwiftUI. That name has an extension context one module can't produce, so it
 is exported as a linker alias of our same method.

@@ -11,6 +11,7 @@ extension App {
     /// Scenes are not shown yet (each scene type stops explicitly when its body is needed); an app whose UI comes
     /// from its AppKit delegate runs.
     public static func main() {
+        _LayoutSurvey.runIfRequested()
         let app = Self()
         _ = app.body
         let application = NSApplication.shared
