@@ -500,6 +500,10 @@ void GraphicsGaps::install_core_graphics() {
     for (const auto* name : {"_CGSSetWindowAlpha", "_CGSSetWindowTransform", "_CGSSetWindowWarp", "_CGSSetDenyWindowServerConnections",
                              "_CGSShutdownServerConnections"})
         failure(core_graphics, name, cg_invalid_connection);
+    // CGImageRef CGSCreateRegisteredCursorImage(connection, name, hotSpot*)
+    // (as VLC's open-source screen module declares it): no connection, no
+    // registered cursor image (NULL; the hot spot is left as it is).
+    constant(core_graphics, "_CGSCreateRegisteredCursorImage", 0);
     // Keys.
     for (const auto* name : {"kCGDisplayStreamColorSpace", "kCGDisplayStreamDestinationRect", "kCGDisplayStreamMinimumFrameTime",
                              "kCGDisplayStreamPreserveAspectRatio", "kCGDisplayStreamShowCursor", "kCGWindowBounds",

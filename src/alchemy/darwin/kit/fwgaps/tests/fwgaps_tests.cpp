@@ -193,6 +193,8 @@ void firefox(Fixture& f) {
     f.call(cg, "_CGContextSetBaseCTM", {context, affine({2, 0, 0, 2, 0, 0})});
     require(ctm() == std::array<double, 6>{2, 0, 0, 2, 10, 14}, "CGContextSetBaseCTM keeps the user transform");
     require(static_cast<std::int32_t>(f.call(cg, "_CGSShutdownServerConnections")) == 1002, "no CGS connection to shut down");
+    // VLC's screen module: no CGS connection, no registered cursor image.
+    require(f.call(cg, "_CGSCreateRegisteredCursorImage", {0, f.text("arrow"), f.block(16)}) == 0, "no registered cursor image");
     require(f.string_constant(appkit, "_NSMenuWillSendActionNotification") == "NSMenuWillSendActionNotification" &&
                 f.string_constant(appkit, "_NSMenuDidSendActionNotification") == "NSMenuDidSendActionNotification",
             "the menu action notifications");
