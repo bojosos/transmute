@@ -5,7 +5,9 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 
 // Mach user-library leftovers (fill-only), over the Mach IPC and VM calls already provided:
 //   mach_msg_server_once, mach_msg_server  the MIG server loop: receive on a port, call the
@@ -18,6 +20,8 @@
 //   mach_task_is_self, mach_vm_behavior_set and vm_behavior_set (madvise's advice)
 //   bootstrap_look_up2, bootstrap_register2  bootstrap_look_up / bootstrap_register (the pid
 //       and flags select nothing more here)
+//   exc_server, exception_raise, exception_raise_state, exception_raise_state_identity  the exc
+//       subsystem's MIG server and client routines (install_libsystem_exc)
 namespace alchemy::export_fill {
 namespace {
 
@@ -30,6 +34,8 @@ constexpr std::uint64_t max_trailer_size = 68;   // sizeof(mach_msg_max_trailer_
 constexpr std::uint32_t kern_success = 0, kern_invalid_address = 1, kern_invalid_argument = 4, kern_invalid_value = 18;
 
 } // namespace
+
+void install_libsystem_exc(Provider& p);
 
 void install_libsystem_mach_extra(Provider& p) {
     auto& process = p.process();
@@ -177,6 +183,173 @@ void install_libsystem_mach_extra(Provider& p) {
     });
     p.libsystem("_bootstrap_register2", [p](CpuState& s, GuestMemory&) -> std::uint64_t {
         return p.call(libsystem_library, "_bootstrap_register", {s.x[0], s.x[1], s.x[2]}) & 0xffffffffULL;
+    });
+
+    install_libsystem_exc(p);
+}
+
+// The exc subsystem (exc.defs, MIG ids 2401-2403): its server routine exc_server, which calls the program's
+// own catch_exception_raise, catch_exception_raise_state and catch_exception_raise_state_identity, and its
+// client routines exception_raise, exception_raise_state and exception_raise_state_identity, which send the
+// request and wait for the reply. The layouts are MIG's for exc.defs on arm64 (32-bit codes,
+// exception_data_t integer_t[2], thread_state_t natural_t[THREAD_STATE_MAX]).
+void install_libsystem_exc(Provider& p) {
+    auto& process = p.process();
+    constexpr std::uint32_t raise_id = 2401, state_id = 2402, identity_id = 2403, reply_offset = 100;
+    constexpr std::int32_t mig_bad_id = -303, mig_bad_arguments = -304, mig_reply_mismatch = -301, mig_array_too_large = -307;
+    constexpr std::uint32_t state_max = 1296;   // THREAD_STATE_MAX (natural_t)
+    constexpr std::uint32_t copy_send = 19, make_send_once = 21, port_descriptor = 0;
+    constexpr std::array<std::uint8_t, 8> ndr{0, 0, 0, 0, 1, 0, 0, 0};   // NDR_record: little-endian integers
+    const auto write_ndr = [ndr](GuestMemory& m, std::uint64_t at) { m.write_bytes(at, ndr); };
+    // The program's catch_* routine (dlsym RTLD_DEFAULT, as dyld binds exc_server's references).
+    const auto handler = [p](GuestMemory& m, std::string_view name) -> std::uint64_t {
+        const std::string text(name);
+        const auto string = p.malloc(text.size() + 1);
+        m.write_bytes(string, std::span(reinterpret_cast<const std::uint8_t*>(text.c_str()), text.size() + 1));
+        const auto address = p.call(libsystem_library, "_dlsym", {static_cast<std::uint64_t>(-2), string});
+        static_cast<void>(p.call(libsystem_library, "_free", {string}));
+        if (!address) throw std::runtime_error("exc_server: the program defines no " + text);
+        return address;
+    };
+
+    // boolean_t exc_server(mach_msg_header_t* InHeadP, mach_msg_header_t* OutHeadP)
+    p.libsystem("_exc_server", [&process, handler, write_ndr](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        const auto in = s.x[0], out = s.x[1];
+        if (!in || !out) return 0;
+        const auto bits = m.read32(in), size = m.read32(in + 4), id = m.read32(in + 20);
+        // The reply's header: the request's reply right back to its sender, id + 100.
+        m.write32(out, bits & 0x1f);
+        m.write32(out + 4, 36);
+        m.write32(out + 8, m.read32(in + 8));   // a received request's remote port is the sender's reply port
+        m.write32(out + 12, 0);
+        m.write32(out + 16, 0);
+        m.write32(out + 20, id + reply_offset);
+        write_ndr(m, out + 24);
+        const auto fail = [&](std::int32_t code) { m.write32(out + 32, static_cast<std::uint32_t>(code)); };
+        if (id < raise_id || id > identity_id) { fail(mig_bad_id); return 0; }
+        const auto port = m.read32(in + 12);   // msgh_local_port: the exception port the request came to
+        const bool identity = id == identity_id, complex = id != state_id;
+        // Complex requests carry the thread and task port descriptors before the NDR record.
+        const std::uint64_t args = in + (complex ? 60 : 32);
+        if ((complex && (!(bits & msgh_bits_complex) || m.read32(in + 24) != 2)) || size < (args - in) + 8) { fail(mig_bad_arguments); return 1; }
+        const auto thread = complex ? m.read32(in + 28) : 0, task = complex ? m.read32(in + 40) : 0;
+        const auto exception = m.read32(args), code_count = m.read32(args + 4);
+        const auto code = args + 8;
+        if (code_count > 2) { fail(mig_bad_arguments); return 1; }
+        if (id == raise_id) {
+            if (size != (code - in) + 4 * code_count) { fail(mig_bad_arguments); return 1; }
+            const auto result = EngineAdapter(process.calling_engine()).call(handler(m, "catch_exception_raise"),
+                std::array<std::uint64_t, 6>{port, thread, task, exception, code, code_count});
+            fail(static_cast<std::int32_t>(result));
+            return 1;
+        }
+        const auto flavor_at = code + 4 * code_count;
+        const std::uint32_t old_count = m.read32(flavor_at + 4);
+        const std::uint64_t old_state = flavor_at + 8;
+        if (old_count > state_max || size != (old_state - in) + 4 * old_count) { fail(mig_bad_arguments); return 1; }
+        // Reply: RetCode, flavor (in/out), new_stateCnt (in: its capacity), new_state.
+        m.write32(out + 36, m.read32(flavor_at));
+        m.write32(out + 40, state_max);
+        CallRegs registers;
+        if (identity) {
+            registers.x = {port, thread, task, exception, code, code_count, out + 36, old_state};
+            registers.push_stack(old_count);
+            registers.push_stack(out + 44);
+            registers.push_stack(out + 40);
+        } else {
+            registers.x = {port, exception, code, code_count, out + 36, old_state, old_count, out + 44};
+            registers.push_stack(out + 40);
+        }
+        const auto result = static_cast<std::int32_t>(EngineAdapter(process.calling_engine())
+            .call_regs(handler(m, identity ? "catch_exception_raise_state_identity" : "catch_exception_raise_state"), registers).x0);
+        fail(result);
+        if (result != 0) return 1;   // an error reply: RetCode only
+        const auto new_count = std::min(m.read32(out + 40), state_max);
+        m.write32(out + 40, new_count);
+        m.write32(out + 4, 44 + 4 * new_count);
+        return 1;
+    });
+
+    // The client routines: the request to the exception port, the reply on the thread's MIG reply port.
+    const auto exchange = [p, write_ndr](GuestMemory& m, std::uint32_t exception_port, std::uint32_t id, std::uint32_t thread,
+                                          std::uint32_t task, std::uint32_t exception, std::uint64_t code, std::uint32_t code_count,
+                                          std::uint64_t flavor, std::uint64_t old_state, std::uint32_t old_count,
+                                          std::uint64_t new_state, std::uint64_t new_count) -> std::uint32_t {
+        if (code_count > 2 || old_count > state_max || (code_count && !code) || (old_count && !old_state))
+            return static_cast<std::uint32_t>(mig_bad_arguments);
+        const bool complex = id != state_id, state = id != raise_id;
+        const auto capacity = static_cast<std::uint64_t>(44 + 4 * state_max) + max_trailer_size;
+        const auto buffer = p.malloc(std::max<std::uint64_t>(capacity, 76 + 4 * (2 + state_max)));
+        const auto reply_port = static_cast<std::uint32_t>(p.call(libsystem_library, "_mig_get_reply_port", {}));
+        m.fill_bytes(buffer, 0, 76);
+        m.write32(buffer, copy_send | (make_send_once << 8) | (complex ? msgh_bits_complex : 0));
+        m.write32(buffer + 8, exception_port);
+        m.write32(buffer + 12, reply_port);
+        m.write32(buffer + 20, id);
+        std::uint64_t at = buffer + 24;
+        if (complex) {
+            m.write32(at, 2);   // two port descriptors: the thread and the task, copied send rights
+            for (const auto name : {thread, task}) {
+                m.write32(at + 4, name);
+                m.write32(at + 8, 0);
+                m.write8(at + 14, static_cast<std::uint8_t>(copy_send));
+                m.write8(at + 15, static_cast<std::uint8_t>(port_descriptor));
+                at += 12;
+            }
+            at += 4;
+        }
+        write_ndr(m, at);
+        m.write32(at + 8, exception);
+        m.write32(at + 12, code_count);
+        at += 16;
+        for (std::uint32_t index = 0; index < code_count; ++index, at += 4) m.write32(at, m.read32(code + 4 * index));
+        if (state) {
+            m.write32(at, flavor ? m.read32(flavor) : 0);
+            m.write32(at + 4, old_count);
+            at += 8;
+            for (std::uint32_t index = 0; index < old_count; ++index, at += 4) m.write32(at, m.read32(old_state + 4 * index));
+        }
+        const auto send_size = static_cast<std::uint32_t>(at - buffer);
+        auto result = static_cast<std::uint32_t>(p.call(libsystem_library, "_mach_msg",
+            {buffer, mach_send_msg | mach_rcv_msg, send_size, capacity, reply_port, 0, 0}));
+        if (result == kern_success) {
+            const auto reply_id = m.read32(buffer + 20), code_value = m.read32(buffer + 32);
+            if (reply_id != id + reply_offset) result = static_cast<std::uint32_t>(mig_reply_mismatch);
+            else if (code_value != 0 || !state) result = code_value;
+            else {
+                const auto count = m.read32(buffer + 40), room = new_count ? m.read32(new_count) : 0;
+                if (flavor) m.write32(flavor, m.read32(buffer + 36));
+                const auto copied = std::min(count, room);
+                for (std::uint32_t index = 0; index < copied; ++index) m.write32(new_state + 4 * index, m.read32(buffer + 44 + 4 * index));
+                if (new_count) m.write32(new_count, count);
+                result = count > room ? static_cast<std::uint32_t>(mig_array_too_large) : kern_success;
+            }
+        } else if (result != mach_send_invalid_dest && result != mach_send_timed_out) {
+            // A receive failure leaves the reply port in an unknown state: MIG drops it.
+            static_cast<void>(p.call(libsystem_library, "_mig_dealloc_reply_port", {reply_port}));
+        }
+        static_cast<void>(p.call(libsystem_library, "_free", {buffer}));
+        return result;
+    };
+    // kern_return_t exception_raise(mach_port_t exception_port, mach_port_t thread, mach_port_t task,
+    //     exception_type_t exception, exception_data_t code, mach_msg_type_number_t codeCnt)
+    p.libsystem("_exception_raise", [exchange](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        return exchange(m, static_cast<std::uint32_t>(s.x[0]), raise_id, static_cast<std::uint32_t>(s.x[1]), static_cast<std::uint32_t>(s.x[2]),
+                        static_cast<std::uint32_t>(s.x[3]), s.x[4], static_cast<std::uint32_t>(s.x[5]), 0, 0, 0, 0, 0);
+    });
+    // kern_return_t exception_raise_state(mach_port_t exception_port, exception_type_t exception,
+    //     const exception_data_t code, mach_msg_type_number_t codeCnt, int* flavor, const thread_state_t old_state,
+    //     mach_msg_type_number_t old_stateCnt, thread_state_t new_state, mach_msg_type_number_t* new_stateCnt [stack])
+    p.libsystem("_exception_raise_state", [exchange](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        return exchange(m, static_cast<std::uint32_t>(s.x[0]), state_id, 0, 0, static_cast<std::uint32_t>(s.x[1]), s.x[2],
+                        static_cast<std::uint32_t>(s.x[3]), s.x[4], s.x[5], static_cast<std::uint32_t>(s.x[6]), s.x[7], m.read64(s.sp));
+    });
+    // kern_return_t exception_raise_state_identity(exception_port, thread, task, exception, code, codeCnt, int* flavor,
+    //     old_state, old_stateCnt [stack, 4 bytes], new_state [stack, 8], new_stateCnt* [stack, 8])
+    p.libsystem("_exception_raise_state_identity", [exchange](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        return exchange(m, static_cast<std::uint32_t>(s.x[0]), identity_id, static_cast<std::uint32_t>(s.x[1]),
+                        static_cast<std::uint32_t>(s.x[2]), static_cast<std::uint32_t>(s.x[3]), s.x[4],
+                        static_cast<std::uint32_t>(s.x[5]), s.x[6], s.x[7], m.read32(s.sp), m.read64(s.sp + 8), m.read64(s.sp + 16));
     });
 }
 

@@ -592,6 +592,62 @@ void exports_msg_server(Fixture& f) {
             "mach_msg_server returns on a receive error");
 }
 
+// The exc subsystem (mach/mach_extra.cpp): exception_raise sends a request MIG's way, and exc_server decodes
+// one and calls the program's catch_exception_raise.
+void exports_exc(Fixture& f) {
+    const auto self = f.engine.read32(f.symbol(sys, "_mach_task_self_"));
+    const auto name = f.block(4);
+    require(f.status(sys, "_mach_port_allocate", {self, 1, name}) == 0, "exception port");
+    const auto exception_port = f.engine.read32(name);
+    require(f.status(sys, "_mach_port_insert_right", {self, exception_port, exception_port, disp::make_send}) == 0, "send right");
+    // The client receives on the thread's MIG reply port: an answer is queued there first.
+    const auto reply_port = static_cast<std::uint32_t>(f.call(sys, "_mig_get_reply_port"));
+    require(f.status(sys, "_mach_port_insert_right", {self, reply_port, reply_port, disp::make_send}) == 0, "reply port send right");
+    const auto answer = f.block(36);
+    f.engine.write32(answer, disp::copy_send);
+    f.engine.write32(answer + 4, 36);
+    f.engine.write32(answer + 8, reply_port);
+    f.engine.write32(answer + 20, 2501);
+    require(f.status(sys, "_mach_msg", {answer, option::send_msg, 36, 0, 0, 0, 0}) == 0, "queued reply");
+    const auto code = f.block(8);
+    f.engine.write32(code, 1);
+    f.engine.write32(code + 4, 0x1234);
+    const auto thread = static_cast<std::uint32_t>(f.call(sys, "_mach_thread_self"));
+    require(f.status(sys, "_exception_raise", {exception_port, thread, self, 1, code, 2}) == 0, "exception_raise answered KERN_SUCCESS");
+    // The request it sent: MIG's exception_raise, two port descriptors, the codes.
+    const auto request = f.block(256);
+    require(f.status(sys, "_mach_msg", {request, option::rcv_msg | option::rcv_timeout, 0, 256, exception_port, 100, 0}) == 0, "request received");
+    require(f.engine.read32(request + 20) == 2401 && (f.engine.read32(request) & 0x80000000U) && f.engine.read32(request + 4) == 76 &&
+            f.engine.read32(request + 24) == 2 && f.engine.read32(request + 60) == 1 && f.engine.read32(request + 64) == 2 &&
+            f.engine.read32(request + 68) == 1 && f.engine.read32(request + 72) == 0x1234, "exception_raise's request");
+    // exc_server calls catch_exception_raise with the request's arguments and replies with its result.
+    static std::array<std::uint64_t, 6> seen{};
+    static std::uint64_t catcher = 0;
+    catcher = f.process.install_function("_catch_exception_raise", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+        seen = {s.x[0], s.x[1], s.x[2], s.x[3], m.read32(s.x[4] + 4), s.x[5]};
+        s.x[0] = 5;   // KERN_FAILURE: the exception is not handled
+    });
+    // exc_server finds the program's routine with dlsym(RTLD_DEFAULT); this fixture has no module loader, so its
+    // dlsym is a stand-in that knows that one name.
+    if (!f.process.resolve(sys, "_dlsym"))
+        static_cast<void>(f.process.install_function("_dlsym", [](transmute::CpuState& s, transmute::GuestMemory& m) {
+            std::string symbol;
+            for (auto at = s.x[1]; m.read8(at); ++at) symbol.push_back(static_cast<char>(m.read8(at)));
+            s.x[0] = s.x[0] == static_cast<std::uint64_t>(-2) && symbol == "catch_exception_raise" ? catcher : 0;
+        }));
+    const auto reply = f.block(256);
+    require(f.call(sys, "_exc_server", {request, reply}) == 1, "exc_server handles 2401");
+    require(seen[0] == exception_port && seen[3] == 1 && seen[4] == 0x1234 && seen[5] == 2, "catch_exception_raise's arguments");
+    require(f.engine.read32(reply + 20) == 2501 && f.engine.read32(reply + 4) == 36 && f.engine.read32(reply + 32) == 5,
+            "exc_server's reply carries the result");
+    // An id outside the subsystem: MIG_BAD_ID, not handled.
+    f.engine.write32(request + 20, 2400);
+    require(f.call(sys, "_exc_server", {request, reply}) == 0 && static_cast<std::int32_t>(f.engine.read32(reply + 32)) == -303,
+            "an unknown id is MIG_BAD_ID");
+    // A client send to a dead name fails at once.
+    require(f.status(sys, "_exception_raise", {0xfffff0, thread, self, 1, code, 2}) != 0, "exception_raise to no port fails");
+}
+
 void exports_kevent(Fixture& f) {
     const auto self = f.engine.read32(f.symbol(sys, "_mach_task_self_"));
     const auto name = f.block(4);
@@ -1361,6 +1417,7 @@ int main(int argc, char** argv) {
         {"exports_ports_and_messages", exports_ports_and_messages},
         {"exports_kevent", exports_kevent},
         {"exports_msg_server", exports_msg_server},
+        {"exports_exc", exports_exc},
         {"exports_tasks_and_bootstrap", exports_tasks_and_bootstrap},
         {"exports_task_policies", exports_task_policies},
         {"exports_memory_entries", exports_memory_entries},
