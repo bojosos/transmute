@@ -123,7 +123,8 @@ This page maps each host area to Linux. The Linux backends are in progress.
     * it orders ICO frames differently.
 * **Fonts and text layout** (`gui/fonts.cpp`, `gui/text_layout.cpp`).
   `apt install libpango1.0-dev` (it brings FreeType, fontconfig, HarfBuzz
-  and FriBidi). They work as follows:
+  and FriBidi), plus `fonts-liberation` for metric-compatible Arial, Times
+  New Roman and Courier New. They work as follows:
   * The system fonts are fontconfig's system font set.
   * `register_font_file` adds a file to its application font set. The bytes
     go into a memfd, kept open and added by its `/proc/self/fd` path.
@@ -131,6 +132,11 @@ This page maps each host area to Linux. The Linux backends are in progress.
     slope come from OS/2, and vertical metrics follow Windows (usWin*, or
     the OS/2 typographic values under USE_TYPO_METRICS).
   * Families match in the CSS order (stretch, style, weight).
+  * The Windows families the macOS layer maps Apple names to (Segoe UI,
+    Arial, Consolas, Times New Roman, ...; `coretext/fonts.cpp`) get
+    fontconfig's stand-in when the system lacks them. The family's own
+    aliases come first (Arial gives Liberation Sans), then its generic
+    family in its language. Other unknown families stay not found.
   * Fallback is fontconfig's sorted list for the family.
   * `layout_text` is a Pango layout over the same fontconfig configuration:
     HarfBuzz shaping, FriBidi, fontconfig fallback, word and character

@@ -340,6 +340,12 @@ void fonts_area() {
     const auto faces = gpu::family_faces(*system, sans.family);
     require(faces && faces->size() >= 2, "the sans family's faces");
     require(!gpu::family_font(*system, "No Such Family 4711", 400, 0, 5), "an unknown family");
+    // The Windows UI families the macOS layer maps Apple names to resolve on
+    // every host (on Linux, fontconfig's stand-ins for them).
+    const auto ui_face = gpu::family_font(*system, "Segoe UI", 400, 0, 5);
+    const auto mono_face = gpu::family_font(*system, "Consolas", 400, 0, 5);
+    require(ui_face && mono_face && mono_face->info() && mono_face->info()->monospace && ui_face->info() && !ui_face->info()->monospace,
+        "the system UI and monospace families");
     require(gpu::register_font_file({}).error() == host::Error::invalid_argument &&
                 gpu::register_font_file(std::vector<std::uint8_t>(64, 1)).error() == host::Error::unsupported,
         "font files that are not fonts");

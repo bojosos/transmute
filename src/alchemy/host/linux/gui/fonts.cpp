@@ -16,7 +16,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <map>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -526,10 +528,66 @@ FontCollection registered_fonts() {
     return freetype::registered_;
 }
 
+namespace {
+
+// The Windows families the macOS layer names: coretext/fonts.cpp maps Apple
+// families to them, and win32 has them installed. Where this system lacks
+// one, fontconfig picks its stand-in. The family's own aliases come first
+// (Arial gives Liberation Sans, metric-compatible), then the generic family
+// in the family's language. Other unknown families stay not found.
+struct StandIn {
+    std::string_view family, generic, lang;
+};
+constexpr StandIn stand_ins[] = {
+    {"Segoe UI", "sans-serif", ""},          {"Arial", "sans-serif", ""},       {"Verdana", "sans-serif", ""},
+    {"Tahoma", "sans-serif", ""},            {"Times New Roman", "serif", ""},  {"Georgia", "serif", ""},
+    {"Consolas", "monospace", ""},           {"Courier New", "monospace", ""},  {"Segoe UI Emoji", "emoji", ""},
+    {"Segoe UI Symbol", "sans-serif", ""},   {"Microsoft YaHei", "sans-serif", "zh-cn"},
+    {"Microsoft JhengHei", "sans-serif", "zh-tw"}, {"Yu Gothic UI", "sans-serif", "ja"}, {"Malgun Gothic", "sans-serif", "ko"},
+};
+
+// The stand-in family for `family`, or nothing; under freetype_mutex().
+std::optional<std::string> stand_in_family(std::string_view family, int weight, int style, int stretch) {
+    auto* config = freetype::config();
+    const auto entry = std::find_if(std::begin(stand_ins), std::end(stand_ins), [&](const StandIn& s) {
+        return same_name(reinterpret_cast<const FcChar8*>(std::string(s.family).c_str()), family);
+    });
+    if (!config || entry == std::end(stand_ins)) return std::nullopt;
+    FcPattern* pattern = FcPatternCreate();
+    const std::string name(family), generic(entry->generic), lang(entry->lang);
+    FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(name.c_str()));
+    FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(generic.c_str()));
+    if (!lang.empty()) FcPatternAddString(pattern, FC_LANG, reinterpret_cast<const FcChar8*>(lang.c_str()));
+    FcPatternAddDouble(pattern, FC_WEIGHT, FcWeightFromOpenTypeDouble(weight));
+    FcPatternAddInteger(pattern, FC_SLANT, static_cast<int>(fc_slant(style)));
+    FcPatternAddDouble(pattern, FC_WIDTH, fc_width(stretch));
+    FcConfigSubstitute(config, pattern, FcMatchPattern);
+    FcDefaultSubstitute(pattern);
+    FcResult result{};
+    FcPattern* match = FcFontMatch(config, pattern, &result);
+    FcPatternDestroy(pattern);
+    if (!match) return std::nullopt;
+    auto found = pattern_string(match, FC_FAMILY, FC_FAMILYLANG);
+    FcPatternDestroy(match);
+    if (found.empty()) return std::nullopt;
+    return found;
+}
+
+// The members of `family`, or of its stand-in in the system collection.
+std::vector<Candidate> members_or_stand_in(const FontCollection& collection, std::string_view family, int weight, int style, int stretch) {
+    auto* set = font_set(collection);
+    auto members = family_members(set, family);
+    if (members.empty() && collection.impl()->set == FcSetSystem)
+        if (const auto stand_in = stand_in_family(family, weight, style, stretch)) members = family_members(set, *stand_in);
+    return members;
+}
+
+} // namespace
+
 Result<Font> family_font(const FontCollection& collection, std::string_view family, int weight, int style, int stretch) {
     if (!collection) return Error::bad_handle;
     Lock lock(freetype::freetype_mutex());
-    const auto members = family_members(font_set(collection), family);
+    const auto members = members_or_stand_in(collection, family, weight, style, stretch);
     if (members.empty()) return Error::not_found;
     const auto best = std::min_element(members.begin(), members.end(), [&](const Candidate& a, const Candidate& b) {
         return match_key(a, weight, style, stretch) < match_key(b, weight, style, stretch);
@@ -561,7 +619,7 @@ Result<Font> named_font(const FontCollection& collection, FontName kind, std::st
 Result<std::vector<Font>> family_faces(const FontCollection& collection, std::string_view family) {
     if (!collection) return Error::bad_handle;
     Lock lock(freetype::freetype_mutex());
-    auto members = family_members(font_set(collection), family);
+    auto members = members_or_stand_in(collection, family, font_weight::normal, font_style::normal, font_stretch::normal);
     if (members.empty()) return Error::not_found;
     std::stable_sort(members.begin(), members.end(), [](const Candidate& a, const Candidate& b) {
         return std::tie(a.stretch, a.style, a.weight) < std::tie(b.stretch, b.style, b.weight);
