@@ -255,6 +255,13 @@ void apps(Fixture& f) {
     const auto address = f.block(16);
     f.engine.write32(address, 0x0210);   // sa_len 16, sa_family AF_INET
     require(f.call(cups, "_httpAddrLength", {address}) == 16, "httpAddrLength");
+    f.engine.write32(address, 0x50000210);   // port 80 in network order
+    require(f.call(cups, "_httpAddrPort", {address}) == 80 && static_cast<std::int32_t>(f.call(cups, "_httpAddrPort", {0})) == -1,
+            "httpAddrPort");
+    require(f.call(cups, "_httpGetAddress", {0}) == 0, "httpGetAddress of no connection");
+    const auto size = f.block(64);
+    require(f.call(cups, "_cupsGetDestMediaDefault", {0, 0, 0, 0, size}) == 0 && f.call(cups, "_cupsLocalizeDestMedia", {0, 0, 0, 0, size}) == 0,
+            "no cups_dinfo_t: no default media");
     bool stopped = false;
     try { static_cast<void>(f.call(cups, "_cupsLangDefault")); } catch (const std::exception&) { stopped = true; }
     require(stopped, "cupsLangDefault stops explicitly");

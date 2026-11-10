@@ -684,6 +684,10 @@ void Cups::install_more() {
     });
     constant(libcups, "_cupsGetDestMediaCount", 0);
     constant(libcups, "_cupsGetDestMediaByIndex", 0);
+    // cupsGetDestMediaDefault(http, dest, dinfo, flags, size): false, and cupsLocalizeDestMedia: NULL; both need a
+    // cups_dinfo_t, which cupsCopyDestInfo never makes here.
+    raw(libcups, "_cupsGetDestMediaDefault", [this](CpuState& s, GuestMemory&) { unavailable(); s.x[0] = 0; });
+    raw(libcups, "_cupsLocalizeDestMedia", [this](CpuState& s, GuestMemory&) { unavailable(); s.x[0] = 0; });
     raw(libcups, "_cupsPrintFile", [this](CpuState& s, GuestMemory&) { unavailable(); s.x[0] = 0; });
     raw(libcups, "_cupsDoAuthentication", [this](CpuState& s, GuestMemory&) { unavailable(); s.x[0] = static_cast<std::uint32_t>(-1); });
     // ---- client settings ----
@@ -823,6 +827,13 @@ void Cups::install_more() {
         else if (family == 1) s.x[0] = 2 + read_cstring(m, s.x[0] + 2, 104).size() + 1;   // AF_LOCAL
         else s.x[0] = 0;
     });
+    // httpAddrPort(addr): the port in host order of an AF_INET / AF_INET6 address, 0 for another family, -1 for NULL.
+    raw(libcups, "_httpAddrPort", [](CpuState& s, GuestMemory& m) {
+        if (!s.x[0]) { s.x[0] = 0xffffffffU; return; }
+        const auto family = m.read8(s.x[0] + 1);
+        s.x[0] = family == 2 || family == 30 ? static_cast<std::uint64_t>((m.read8(s.x[0] + 2) << 8) | m.read8(s.x[0] + 3)) : 0;
+    });
+    no_http("_httpGetAddress", 0);   // httpGetAddress(http): the peer address of a connection; none exists
     raw(libcups, "_httpAddrFreeList", [](CpuState& s, GuestMemory&) {
         if (s.x[0]) throw std::runtime_error("Alchemy: httpAddrFreeList of a list that cannot exist (httpAddrGetList makes none)");
     });
