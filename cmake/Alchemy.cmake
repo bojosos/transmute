@@ -146,8 +146,13 @@ if(BUILD_TESTING)
             set_tests_properties(alchemy_external_cli PROPERTIES TIMEOUT 60)
         endif()
         add_test(NAME alchemy_process COMMAND alchemy_process_tests ${macos_fixture_arguments})
+        # The x64 JIT is built for Windows only (src/jit_x64_unavailable.cpp elsewhere).
+        set(alchemy_cli_jit)
+        if(NOT WIN32)
+            set(alchemy_cli_jit "-DWITH_JIT=OFF")
+        endif()
         add_test(NAME alchemy_cli COMMAND "${CMAKE_COMMAND}"
-            "-DALCHEMY=$<TARGET_FILE:alchemy>" "-DPROGRAM=${macos_dir}/hello"
+            "-DALCHEMY=$<TARGET_FILE:alchemy>" "-DPROGRAM=${macos_dir}/hello" ${alchemy_cli_jit}
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/alchemy_cli_smoke.cmake")
         set_tests_properties(alchemy_process alchemy_cli PROPERTIES TIMEOUT 60)
     else()

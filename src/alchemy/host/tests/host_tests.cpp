@@ -787,6 +787,8 @@ void certificate_area() {
     require(crypto::TlsSession::create(bad).error() == host::Error::invalid_argument, "a TLS server needs an identity");
 }
 
+void power_area();
+
 void dns_sd_area() {
     namespace dns_sd = host::dns_sd;
     // Address lookups go through the host resolver: localhost is loopback.
@@ -1291,7 +1293,8 @@ void real_backend() {
     require(host::process::current_pid() != 0, "pid");
     require(!host::process::environment("ALCHEMY_HOST_TEST_SURELY_UNSET").has_value(), "unset environment variable");
 
-    // ALCHEMY_HOST_TEST_SKIP_AREAS=locale,icu,... leaves those areas out, so a
+    // ALCHEMY_HOST_TEST_SKIP_AREAS=locale,icu,... leaves those areas out (also
+    // http, crypto, certificate, dns_sd and power), so a
     // backend in progress can test the areas it has written.
     const auto skipped = host::process::environment("ALCHEMY_HOST_TEST_SKIP_AREAS").value_or(std::string());
     const auto run_area = [&](std::string_view name, void (*area)()) {
@@ -1313,9 +1316,15 @@ void real_backend() {
     run_area("certificate", certificate_area);
     run_area("dns_sd", dns_sd_area);
 
-    // system names and power requests
+    // system names
     require(host::system::host_name() && !host::system::host_name()->empty() && host::system::host_name(false), "host names");
     require(host::system::user_name() && !host::system::user_name()->empty(), "user name");
+    run_area("power", power_area);
+}
+
+// Power requests and the power source (a container without a session
+// manager has neither: ALCHEMY_HOST_TEST_SKIP_AREAS=power).
+void power_area() {
     {
         // Known directories: home and temporary exist; data and cache are Alchemy's own (not created).
         namespace sys = host::system;

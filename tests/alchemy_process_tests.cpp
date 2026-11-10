@@ -9,6 +9,14 @@
 #include <string_view>
 
 namespace {
+// The reference x64 JIT is built for Windows hosts only (src/jit_x64_unavailable.cpp
+// elsewhere): other hosts run the interpreter cases.
+#ifdef _WIN32
+constexpr bool kHaveX64Jit = true;
+#else
+constexpr bool kHaveX64Jit = false;
+#endif
+
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -51,6 +59,7 @@ int main(int argc, char** argv) {
             require(!alchemy::child_preload_setting(false, std::string("0")), "a top-level process keeps its setting");
         });
         for (const bool jit : {false, true}) {
+            if (jit && !kHaveX64Jit) continue;
             const std::string mode = jit ? "jit" : "interpreter";
             runner.run("hello_" + mode, [&] { run_fixture(argv[1], "Hello World from MacOS: 27\n", 0, jit); });
             runner.run("hello_rebased_" + mode, [&] { run_fixture(argv[1], "Hello World from MacOS: 27\n", 0, jit, true); });

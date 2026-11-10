@@ -1,7 +1,16 @@
 if(NOT DEFINED ALCHEMY OR NOT DEFINED PROGRAM)
     message(FATAL_ERROR "ALCHEMY and PROGRAM are required")
 endif()
-foreach(mode IN ITEMS interpreter jit)
+# WITH_JIT=OFF: the host has no x64 JIT (it is built for Windows only); only
+# the interpreter runs.
+if(NOT DEFINED WITH_JIT)
+    set(WITH_JIT ON)
+endif()
+set(modes interpreter)
+if(WITH_JIT)
+    list(APPEND modes jit)
+endif()
+foreach(mode IN LISTS modes)
     set(options)
     if(mode STREQUAL "jit")
         list(APPEND options --jit)
@@ -12,11 +21,13 @@ foreach(mode IN ITEMS interpreter jit)
         message(FATAL_ERROR "${mode}: exit=${result}, stdout=[${output}], stderr=[${errors}]")
     endif()
 endforeach()
-execute_process(COMMAND "${ALCHEMY}" --jit-stats "${PROGRAM}"
-    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 15)
-if(NOT result STREQUAL "0" OR NOT output STREQUAL "Hello World from MacOS: 27\n" OR
-   NOT errors MATCHES "native guest instructions [1-9][0-9]*")
-    message(FATAL_ERROR "JIT proof failed: exit=${result}, stdout=[${output}], stderr=[${errors}]")
+if(WITH_JIT)
+    execute_process(COMMAND "${ALCHEMY}" --jit-stats "${PROGRAM}"
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 15)
+    if(NOT result STREQUAL "0" OR NOT output STREQUAL "Hello World from MacOS: 27\n" OR
+       NOT errors MATCHES "native guest instructions [1-9][0-9]*")
+        message(FATAL_ERROR "JIT proof failed: exit=${result}, stdout=[${output}], stderr=[${errors}]")
+    endif()
 endif()
 execute_process(COMMAND "${ALCHEMY}" doctor "${PROGRAM}"
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 15)
