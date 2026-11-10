@@ -25,6 +25,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -1014,11 +1015,21 @@ void asset_writer_movie(Fixture& f) {
     std::filesystem::remove(mp4, ignored);
 }
 
+// Sets (or, with an empty value, clears) an environment variable of this process.
+void set_environment(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    if (*value) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
+
 // Alchemy's own test devices (ALCHEMY_CAMERA=pattern, ALCHEMY_AUDIO_INPUT=tone) through the host backends: the
 // colour-bar camera and the 440 Hz microphone, which replace the host's devices (none is opened).
 void test_devices(Fixture&) {
-    _putenv_s("ALCHEMY_CAMERA", "pattern");
-    _putenv_s("ALCHEMY_AUDIO_INPUT", "tone");
+    set_environment("ALCHEMY_CAMERA", "pattern");
+    set_environment("ALCHEMY_AUDIO_INPUT", "tone");
     const auto cameras = capture::make_host_backend();
     const auto listed = cameras->cameras();
     require(listed.size() == 1 && listed[0].id == "alchemy-test-pattern" && listed[0].formats.size() == 2, "the test pattern is the only camera");
@@ -1061,8 +1072,8 @@ void test_devices(Fixture&) {
     for (const auto v : samples) { squares += double(v) * v; peak = std::max(peak, std::fabs(double(v))); }
     const auto rms = std::sqrt(squares / samples.size());
     require(std::fabs(peak - 0.25) < 0.001 && std::fabs(rms - 0.25 / std::sqrt(2.0)) < 0.002, "a sine at a quarter of full scale: " + std::to_string(rms));
-    _putenv_s("ALCHEMY_CAMERA", "");
-    _putenv_s("ALCHEMY_AUDIO_INPUT", "");
+    set_environment("ALCHEMY_CAMERA", "");
+    set_environment("ALCHEMY_AUDIO_INPUT", "");
 }
 
 } // namespace
