@@ -273,7 +273,7 @@ void spin_until_stopped() {
     while (g_spin) {}
 }
 
-#if defined(TRANSMUTE_FX_HOST_WIN32)   // the linux backend cannot sample threads yet (linux/sample.cpp)
+#if defined(TRANSMUTE_FX_HOST_WIN32) || defined(TRANSMUTE_FX_HOST_LINUX)
 FX_TEST(host_sample_thread) {
     namespace sample = host::sample;
     std::atomic<std::uint32_t> id{0};
