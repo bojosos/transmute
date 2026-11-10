@@ -1,7 +1,62 @@
 # A Linux host for Alchemy
 
-This page describes what a Linux backend would take. It is a map, not a
-plan: no Linux backend exists yet.
+This page maps each host area to Linux. The Linux backends are in progress.
+
+## State (2026-11-10)
+
+* **Build.** Clang 21 on Ubuntu 26.04 (x86-64) builds `alchemy`, `alchemy-fx`,
+  `alchemy_host_tests` and `fx_host_tests`:
+
+  ```sh
+  cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_LINKER_TYPE=LLD \
+    -DTRANSMUTE_WITH_FX=ON -DALCHEMY_HOST=linux
+  ```
+
+  `ALCHEMY_HOST=null` builds too. The Mach-O fixtures build with the
+  distribution's clang and `ld64.lld`.
+* **fx** has a Linux host backend (`src/fx/host/linux/`). It covers the
+  following, and `fx_host_tests` passes:
+  * faults through `sigaction` on an alternate signal stack;
+  * guarded access through per-thread `sigsetjmp` recovery points;
+  * an address-space table behind `vm::query`, with placeholders as
+    `PROT_NONE` reservations and memfd views;
+  * futex locks;
+  * pthreads.
+* **The PE guest personality** (`fx/loader`, `fx/abi`) is Windows-only. On
+  Linux:
+  * `src/fx/runtime/pe_absent.cpp` keeps the external (Mach-O) module
+    registry;
+  * `fx/seh` builds with its own copies of the ARM64 exception layouts
+    (`fx/seh/arm64_nt.hpp`).
+* **Calling convention.** Generated code keeps the Win64 convention on every
+  host. `FX_GENERATED_ABI` (`transmute/fx/context.hpp`) marks the C++ side of
+  each crossing as `ms_abi` on System V hosts: helpers, host callbacks and
+  leaves, the enter and abort stubs. `host_call_bridge` takes the System V
+  convention on Linux, because system libraries call it.
+* **Alchemy** has a Linux host backend (`src/alchemy/host/linux/`). These areas
+  are written: files, process (fork + execve spawns, pidfds), sync (eventfds),
+  time, vm, sections (memfd, POSIX shared memory), net (BSD sockets), system,
+  debug, and crypto's random bytes. The other areas fail with
+  `Error::unsupported`: dns_sd, http, ipc, locale, icu, the rest of crypto,
+  and the GUI areas.
+* **What runs** (cloaked, `ALCHEMY_NETWORK=loopback`):
+  * the console Mach-O fixtures (hello, dylib_app, weak_import, syscalls);
+  * Blender's CPython 3.11 (`--version`, `-c` with json/hashlib/re/os,
+    `site`, exit codes);
+  * LLVM 23's `clang --version`, `ld64.lld --version` and `clang -c`, with
+    the LLVM and libxml2 runtimes from `--runtime-dir`.
+* **Not done yet:**
+  * DWARF CFI for the code arena, so C++ exceptions crossing translated frames
+    fail on Linux;
+  * thread sampling;
+  * named sync objects;
+  * passing descriptors to other processes;
+  * case-insensitive lookups under the Alchemy root (WSL's kernel has no ext4
+    casefold);
+  * ICU and locale;
+  * TLS;
+  * the GUI.
 
 The macOS layer (`src/alchemy/darwin/`, the loader, the Objective-C
 runtime) talks to the operating system only through the host API in
