@@ -450,11 +450,18 @@ answers that from the app's own compiled copy and destroy code.
 - In one word of that field at a time, with every other byte zero, it places a
   probe object. It copies the struct with the app's `initializeWithCopy` value
   witness and destroys the copy with its `destroy` witness.
-- It reports, per word, how the probe object's retain count changed and whether
+- It reports, per word, whether the copy and the destroy retained or released
+  the probe object, by Swift or by Objective-C reference counting, and whether
   the copy's bytes match.
+  - The probe object is an NSObject subclass, so an Objective-C retain shows in
+    its `-retainCount`.
+  - Its first stored property sits where a native Swift object keeps its inline
+    reference counts, so a Swift retain shows there.
 - It calls nothing in the app except metadata accessors and those two witnesses.
-- It probes ObservedObject only when the observed object's class uses Swift
-  reference counting, as the probe objects do.
+- It probes ObservedObject and Binding.
+- For a one-field struct, it also calls the app's own enum-tag witnesses
+  (`storeEnumTagSinglePayload`, `getEnumTagSinglePayload`), to find which word
+  an absent Optional zeroes (below).
 
 Established layouts, each from the evidence named here:
 - ObservedObject: 16 bytes, 8-aligned. The first word is 8 bytes of plain data,
@@ -466,8 +473,18 @@ Established layouts, each from the evidence named here:
   - the survey: room 16 in all 17 compiler-laid-out fields, and a one-field
     struct of size 16, alignment 8, non-POD and bitwise-takable, with 2³¹−1
     extra inhabitants (a reference's).
-  What the first word means isn't known; Alchemy's is 0.
+  What the first word means isn't known; Alchemy's is 0. A second container
+  agrees: `UpdateControl._driver`, whose observed object uses Objective-C
+  reference counting, gives word 0 nothing and word 1 an Objective-C
+  retain and release.
+  The enum-tag witnesses agree too: for `UpdateControl`, storing an
+  Optional's empty case zeroes word 1 and reads back as empty.
 - The other 17 types still stop.
+
+For the enum-tag probe (one-field structs only), every word of a buffer holds
+the probe object's address. The probe stores the payload case and reads the
+tag back, then stores the one empty case, and reports the words that changed
+and the tag read back. Nothing is retained or released.
 
 ForEach is declared in Apple's SwiftUICore module and its `create(_:id:content:)`
 in SwiftUI. That name has an extension context one module can't produce, so it
