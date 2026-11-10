@@ -423,12 +423,11 @@ AnyView, Transaction, Environment, ModifiedContent, TupleView, EdgeInsets,
 Spacer, Image, ObservedObject, EnvironmentObject, FocusState, EmptyView,
 HStack, VStack) are frozen here too. Apps compiled against Apple's SwiftUI
 build, pass and return them by Apple's stored layout, which no public document
-gives. Until the layout survey establishes a type's layout from an app's own
-Swift metadata, each of its members stops at entry: "SwiftUI: <Type>'s stored
-layout is not established yet". The stop runs before anything touches the
-layout or a result pointer, so no member ever runs on a guessed layout. Their
-stored fields are placeholders until then. Pika 2.0.2 reaches that stop for
-ObservedObject when it builds its first view.
+gives. Until the layout survey and probe establish a type's layout from an
+app's own Swift metadata and compiled code, each of its members stops at entry:
+"SwiftUI: <Type>'s stored layout is not established yet". The stop runs before
+anything touches the layout or a result pointer, so no member ever runs on a
+guessed layout. Their stored fields are placeholders until then.
 
 `ALCHEMY_SWIFTUI_LAYOUTS=report` runs the layout survey at `App.main`, before
 the app is built.
@@ -457,7 +456,18 @@ answers that from the app's own compiled copy and destroy code.
 - It probes ObservedObject only when the observed object's class uses Swift
   reference counting, as the probe objects do.
 
-No layout is established yet; every type still stops.
+Established layouts, each from the evidence named here:
+- ObservedObject: 16 bytes, 8-aligned. The first word is 8 bytes of plain data,
+  and the second is the observed object's reference. Evidence (Pika 2.0.2,
+  `ColorPickCrosshair._viewModel`, an `ObservedObject<ColorPickOverlayViewModel>`
+  at offset 8 of a 24-byte struct, same result in two runs):
+  - word 0: copy +0, destroy +0, bytes copied as they are;
+  - word 1: copy +1, destroy −1;
+  - the survey: room 16 in all 17 compiler-laid-out fields, and a one-field
+    struct of size 16, alignment 8, non-POD and bitwise-takable, with 2³¹−1
+    extra inhabitants (a reference's).
+  What the first word means isn't known; Alchemy's is 0.
+- The other 17 types still stop.
 
 ForEach is declared in Apple's SwiftUICore module and its `create(_:id:content:)`
 in SwiftUI. That name has an extension context one module can't produce, so it

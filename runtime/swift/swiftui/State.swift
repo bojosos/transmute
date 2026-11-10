@@ -80,18 +80,27 @@ public struct FocusState<Value: Hashable>: DynamicProperty {
 
 // MARK: - Observable objects
 
-// @frozen as Apple documents it. The stored fields are placeholders until the layout survey establishes the
-// type's layout from an app's own metadata; until then every member stops (_alchemyLayoutUnestablished).
+// @frozen as Apple documents it. Its layout comes from the layout survey (docs/ALCHEMY_SWIFT.md): 16 bytes, 8-aligned,
+// with 8 bytes of plain data first and the observed object's reference second. An app's own copy and destroy code
+// copies the first word as bytes and retains and releases the second. What the first word means is not known; ours
+// is 0.
 @frozen @propertyWrapper
 public struct ObservedObject<ObjectType: ObservableObject>: DynamicProperty {
     @dynamicMemberLookup
     public struct Wrapper {
         internal let root: ObjectType
-        public subscript<Subject>(dynamicMember keyPath: ReferenceWritableKeyPath<ObjectType, Subject>) -> SwiftUI.Binding<Subject> { _alchemyLayoutUnestablished("ObservedObject") }
+        public subscript<Subject>(dynamicMember keyPath: ReferenceWritableKeyPath<ObjectType, Subject>) -> SwiftUI.Binding<Subject> {
+            let root = self.root
+            return SwiftUI.Binding(get: { root[keyPath: keyPath] }, set: { root[keyPath: keyPath] = $0 })
+        }
     }
+    internal var _plainWord: Int
     public var wrappedValue: ObjectType
-    public init(wrappedValue: ObjectType) { _alchemyLayoutUnestablished("ObservedObject") }
-    public var projectedValue: ObservedObject<ObjectType>.Wrapper { _alchemyLayoutUnestablished("ObservedObject") }
+    public init(wrappedValue: ObjectType) {
+        _plainWord = 0
+        self.wrappedValue = wrappedValue
+    }
+    public var projectedValue: ObservedObject<ObjectType>.Wrapper { Wrapper(root: wrappedValue) }
 }
 
 // @frozen as Apple documents it. The stored fields are placeholders until the layout survey establishes the
