@@ -51,6 +51,12 @@ CGFloat CGColorGetAlpha(CGColorRef color);
 extern const CFStringRef kCGColorWhite;
 extern const CFStringRef kCGColorBlack;
 extern const CFStringRef kCGColorClear;
+/* Contexts and paths (Core Foundation types), as the Swift CoreGraphics overlay uses them. */
+typedef struct CGContext *CGContextRef;
+typedef const struct CGPath *CGPathRef;
+void CGContextDrawImage(CGContextRef c, CGRect rect, CGImageRef image);
+void CGContextDrawTiledImage(CGContextRef c, CGRect rect, CGImageRef image);
+bool CGRectMakeWithDictionaryRepresentation(CFDictionaryRef dict, CGRect *rect);
 /* Line caps and joins, with the published values. */
 typedef enum __attribute__((enum_extensibility(open))) CGLineCap : int32_t {
     kCGLineCapButt = 0, kCGLineCapRound = 1, kCGLineCapSquare = 2
