@@ -370,6 +370,18 @@ void IoKit::install_hid() {
         if (s.x[4]) m.write32(s.x[4], 0);
         s.x[0] = status(s.x[0] ? io_return_unsupported : io_return_no_device);
     });
+    // IODestroyPlugInInterface(IOCFPlugInInterface **): IOCreatePlugInInterfaceForService makes none, so only NULL
+    // can arrive (kIOReturnBadArgument; the real call would call through it).
+    raw(iokit, "_IODestroyPlugInInterface", [](CpuState& s, GuestMemory&) {
+        impossible(s.x[0], "IODestroyPlugInInterface");
+        s.x[0] = status(io_return_bad_argument);
+    });
+    // IOServiceRequestProbe(service, options): no driver here re-probes (kIOReturnUnsupported); MACH_PORT_NULL is
+    // MACH_SEND_INVALID_DEST, as the MIG call reports it.
+    raw(iokit, "_IOServiceRequestProbe", [](CpuState& s, GuestMemory&) {
+        constexpr std::int32_t send_invalid_dest = 0x10000003;
+        s.x[0] = status(s.x[0] ? io_return_unsupported : send_invalid_dest);
+    });
     // TypeIDs of the HID object types (no device, element or value object can exist).
     constant(iokit, "_IOHIDDeviceGetTypeID", static_cast<Address>(TypeId::hid_device));
     constant(iokit, "_IOHIDElementGetTypeID", static_cast<Address>(TypeId::hid_element));

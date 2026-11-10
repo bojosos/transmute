@@ -44,6 +44,12 @@ void hid(Fixture& f) {
     const auto plugin = f.block(8, 0xff);
     require(f.status(iokit, "_IOCreatePlugInInterfaceForService", {0, 0, 0, plugin, f.block(4)}) == static_cast<std::int32_t>(0xe00002c0U) &&
             f.engine.read64(plugin) == 0, "no plug-in interfaces");
+    require(f.status(iokit, "_IODestroyPlugInInterface", {0}) == static_cast<std::int32_t>(0xe00002c2U), "IODestroyPlugInInterface(NULL)");
+    refused = false;
+    try { static_cast<void>(f.call(iokit, "_IODestroyPlugInInterface", {plugin})); } catch (const std::exception&) { refused = true; }
+    require(refused, "a plug-in interface cannot exist");
+    require(f.status(iokit, "_IOServiceRequestProbe", {0x1234, 0}) == static_cast<std::int32_t>(0xe00002c7U) &&
+            f.status(iokit, "_IOServiceRequestProbe", {0, 0}) == 0x10000003, "IOServiceRequestProbe");
 }
 
 void notifications(Fixture& f) {
