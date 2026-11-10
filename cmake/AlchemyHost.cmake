@@ -98,3 +98,12 @@ if(BUILD_TESTING AND WIN32)
                 -File "${PROJECT_SOURCE_DIR}/scripts/check_host_boundary.ps1" -Root "${PROJECT_SOURCE_DIR}")
     endif()
 endif()
+
+# fw-ui: the Linux canvas, fonts and images. Fonts are FreeType faces found
+# through fontconfig; text layout is Pango's (HarfBuzz shaping, FriBidi,
+# fontconfig fallback) over the same fontconfig configuration.
+if(ALCHEMY_HOST STREQUAL "linux" AND alchemy_host_gui_sources)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ALCHEMY_LINUX_TEXT REQUIRED IMPORTED_TARGET freetype2 fontconfig harfbuzz pangoft2)
+    list(APPEND ALCHEMY_GUI_LINK_LIBRARIES PkgConfig::ALCHEMY_LINUX_TEXT)
+endif()

@@ -53,8 +53,39 @@ This page maps each host area to Linux. The Linux backends are in progress.
 
   Not written yet: XRandR screens and HiDPI, cursors, the X clipboard (the
   clipboard is process-local), drag and drop, IME. The other GUI areas
-  (canvas, fonts, gpu, audio, media codecs, ...) still fail with
+  (canvas, gpu, audio, media codecs, ...) still fail with
   `Error::unsupported`, so a window shows no drawing yet.
+* **Fonts and text layout** (`gui/fonts.cpp`, `gui/text_layout.cpp`).
+  `apt install libpango1.0-dev` (it brings FreeType, fontconfig, HarfBuzz
+  and FriBidi). They work as follows:
+  * The system fonts are fontconfig's system font set.
+  * `register_font_file` adds a file to its application font set. The bytes
+    go into a memfd, kept open and added by its `/proc/self/fd` path.
+  * Faces are FreeType faces. Names come from fontconfig. Weight, width and
+    slope come from OS/2, and vertical metrics follow Windows (usWin*, or
+    the OS/2 typographic values under USE_TYPO_METRICS).
+  * Families match in the CSS order (stretch, style, weight).
+  * Fallback is fontconfig's sorted list for the family.
+  * `layout_text` is a Pango layout over the same fontconfig configuration:
+    HarfBuzz shaping, FriBidi, fontconfig fallback, word and character
+    wrapping without inserted hyphens, justification and tabs. Each span's
+    tag travels as a foreground colour.
+
+  Checked against DirectWrite on the same `arial.ttf`
+  (`ALCHEMY_HOST_TEST_FONT_REPORT=<file> alchemy_gui_host` prints both
+  hosts' readings). Names, metrics, glyph metrics, glyphs, tables, kerned
+  advances and line breaks are equal. Outlines agree to 0.003 px.
+  Remaining differences:
+  * run baselines: DirectWrite adds the line gap above each line (CoreText
+    reads only x);
+  * letter spacing: Pango puts half before each character;
+  * a tab that ends a wrapped line is a zero-width space glyph rather than
+    no glyph.
+
+  `alchemy_gui_host` checks fonts with DejaVu Sans on Linux and Arial on
+  Windows. `ALCHEMY_HOST_TEST_SKIP_AREAS` (images, fonts, canvas,
+  raster_text, midi, audio, platform, media_codecs) leaves out the areas
+  that aren't written yet.
 * **What runs** (cloaked, `ALCHEMY_NETWORK=loopback`):
   * the console Mach-O fixtures (hello, dylib_app, weak_import, syscalls);
   * Blender's CPython 3.11 (`--version`, `-c` with json/hashlib/re/os,
@@ -74,7 +105,7 @@ This page maps each host area to Linux. The Linux backends are in progress.
     casefold);
   * ICU and locale;
   * TLS;
-  * 2D drawing, fonts, Vulkan and the rest of the GUI areas.
+  * 2D drawing, Vulkan and the rest of the GUI areas.
 
 The macOS layer (`src/alchemy/darwin/`, the loader, the Objective-C
 runtime) talks to the operating system only through the host API in
