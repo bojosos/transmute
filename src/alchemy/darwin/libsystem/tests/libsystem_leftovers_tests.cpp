@@ -387,6 +387,62 @@ void bz2_stream(Fixture& f) {
     f.engine.write32(bad + 32, 100);
     require(f.status(bz2, "_BZ2_bzDecompress", {bad}) == -5, "BZ_DATA_ERROR_MAGIC");
     f.call(bz2, "_BZ2_bzDecompressEnd", {bad});
+
+    // The streaming compressor: BZ_RUN in chunks, BZ_FINISH through small output windows; the result decodes back.
+    const auto source = f.block(plain.size()), packed_out = f.block(plain.size() + 1024);
+    f.engine.write_bytes(source, plain);
+    const auto writer = f.block(80);
+    require(f.status(bz2, "_BZ2_bzCompressInit", {writer, 9, 0, 0}) == 0, "BZ2_bzCompressInit");
+    require(f.status(bz2, "_BZ2_bzCompressInit", {f.block(80), 10, 0, 0}) == -2, "a block size over 9 is BZ_PARAM_ERROR");
+    f.engine.write64(writer + 24, packed_out);
+    for (std::size_t at = 0; at < plain.size(); at += 30000) {
+        f.engine.write64(writer, source + at);
+        f.engine.write32(writer + 8, static_cast<std::uint32_t>(std::min<std::size_t>(30000, plain.size() - at)));
+        f.engine.write32(writer + 32, 0);
+        require(f.status(bz2, "_BZ2_bzCompress", {writer, 0}) == 1, "BZ_RUN_OK");
+    }
+    result = 3;
+    for (rounds = 0; result == 3 && rounds < 10000; ++rounds) {
+        f.engine.write32(writer + 32, 512);
+        result = f.status(bz2, "_BZ2_bzCompress", {writer, 2});
+    }
+    require(result == 4, "BZ_FINISH ends with BZ_STREAM_END");
+    const auto packed_size = f.engine.read32(writer + 36);
+    std::vector<std::uint8_t> compressed(packed_size);
+    f.engine.read_bytes(packed_out, compressed);
+    const auto decoded = alchemy::gui::completion_kit::bzip2::decode(compressed);
+    require(decoded.error == alchemy::gui::completion_kit::bzip2::Error::none && decoded.output == plain &&
+            f.engine.read32(writer + 12) == plain.size(), "the compressed stream decodes back; total_in");
+    require(f.status(bz2, "_BZ2_bzCompress", {writer, 0}) == -1, "BZ_RUN after BZ_FINISH is BZ_SEQUENCE_ERROR");
+    require(f.status(bz2, "_BZ2_bzCompressEnd", {writer}) == 0, "BZ2_bzCompressEnd");
+
+    // The file calls: bzopen "w", bzwrite, bzclose, then bzopen "r", bzread to the end, bzerror.
+    const auto path = (std::filesystem::temp_directory_path() / ("alchemy-bz2-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bz2"));
+    const auto guest_path = f.text(alchemy::guest_path_string(path));
+    const auto out_file = f.call(bz2, "_BZ2_bzopen", {guest_path, f.text("w9")});
+    require(out_file != 0 && f.status(bz2, "_BZ2_bzwrite", {out_file, source, plain.size()}) == static_cast<std::int32_t>(plain.size()),
+            "bzopen w / bzwrite");
+    require(f.status(bz2, "_BZ2_bzflush", {out_file}) == 0, "bzflush");
+    f.call(bz2, "_BZ2_bzclose", {out_file});
+    const auto in_file = f.call(bz2, "_BZ2_bzopen", {guest_path, f.text("r")});
+    require(in_file != 0, "bzopen r");
+    std::vector<std::uint8_t> read_back;
+    const auto buffer = f.block(8192);
+    for (int guard = 0; guard < 1000; ++guard) {
+        const auto count = f.status(bz2, "_BZ2_bzread", {in_file, buffer, 8192});
+        require(count >= 0, "bzread");
+        if (count == 0) break;
+        std::vector<std::uint8_t> piece(static_cast<std::size_t>(count));
+        f.engine.read_bytes(buffer, piece);
+        read_back.insert(read_back.end(), piece.begin(), piece.end());
+    }
+    require(read_back == plain, "bzread returns what bzwrite wrote");
+    const auto errnum = f.block(4, 0x55);
+    require(f.read_text(f.call(bz2, "_BZ2_bzerror", {in_file, errnum})) == "OK" && f.engine.read32(errnum) == 0, "bzerror after the end");
+    f.call(bz2, "_BZ2_bzclose", {in_file});
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    require(f.read_text(f.call(bz2, "_BZ2_bzlibVersion")).starts_with("1.0."), "BZ2_bzlibVersion");
 }
 
 void misc(Fixture& f) {
