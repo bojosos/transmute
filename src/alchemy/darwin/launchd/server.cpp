@@ -379,6 +379,14 @@ private:
             const auto owner = service_owner_.find(service);
             const auto job = owner == service_owner_.end() ? jobs_.end() : jobs_.find(owner->second);
             if (!mach_ || job == jobs_.end()) { out.i32(wire::status_no_such_service); break; }
+            // A job that has exited but whose exit is not handled yet (its watch runs late under
+            // load) still holds the service's dead port: handle the exit now, which makes the
+            // port of the next run (a client looks the service up again after an interruption).
+            // The unfired watch's small context is not freed then (its callback frees it).
+            if (const auto pid = job->second.pid; pid && exited(pid)) {
+                { std::lock_guard events(events_mutex_); exited_.push_back(pid); }
+                drain_events(lock);
+            }
             const auto& spec = job->second.spec.mach_services;
             const auto entry = std::find_if(spec.begin(), spec.end(), [&](const MachService& item) { return item.name == service; });
             if (entry != spec.end() && entry->hide_until_check_in && !checked_in_.contains(service)) { out.i32(wire::status_no_such_service); break; }
@@ -748,6 +756,13 @@ private:
         for (const auto& [label, wanted] : keep.other_job_enabled)
             if (jobs_.contains(label) == wanted) return true;
         return false;
+    }
+
+    // Whether job process `pid` has ended: its exit code is set, which can be long before its
+    // handle is signalled and its watch runs (the host tears the address space down first).
+    bool exited(std::uint32_t pid) const {
+        const auto process = processes_.find(pid);
+        return process != processes_.end() && static_cast<bool>(host::process::exit_code(process->second.handle));
     }
 
     void drain_events(std::unique_lock<std::mutex>&) {
