@@ -100,6 +100,8 @@ set(FX_COMPONENT_FILES
 # exception model, serves Mach-O guests too and builds everywhere.
 if(NOT WIN32)
     list(REMOVE_ITEM FX_COMPONENT_FILES src/fx/loader/component.cmake src/fx/abi/component.cmake)
+    message(STATUS "fx: no PE guest personality on this host (Windows only): fx_loader, fx_abi, transmute-fx, "
+                   "fx_seh_tests and the reference x64 JIT are not built; the runtime uses src/fx/runtime/pe_absent.cpp")
 endif()
 foreach(component_file IN LISTS FX_COMPONENT_FILES)
     if(EXISTS ${PROJECT_SOURCE_DIR}/${component_file})
