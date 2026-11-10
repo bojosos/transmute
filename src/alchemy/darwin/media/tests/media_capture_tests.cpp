@@ -27,6 +27,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -557,6 +562,22 @@ void ioproc_input(Fixture& f) {
 
 // AVAudioRecorder: 0.5 s of the fake microphone (mono 0.25 at 48 kHz) into a 16-bit stereo 16 kHz WAVE file,
 // with metering; AVAudioApplication's record permission.
+// This process's own directory under the temporary directory (its id in the name): other processes running the
+// tests at the same time write elsewhere, and main() removes only this one.
+const std::filesystem::path& test_directory() {
+    static const std::filesystem::path directory = [] {
+#ifdef _WIN32
+        const auto id = _getpid();
+#else
+        const auto id = getpid();
+#endif
+        auto path = std::filesystem::temp_directory_path() / ("alchemy_media_capture_" + std::to_string(id));
+        std::filesystem::create_directories(path);
+        return path;
+    }();
+    return directory;
+}
+
 void recorder(Fixture& f) {
     constexpr std::string_view run_loop = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
     const auto mode = f.engine.read64(f.symbol(run_loop, "_kCFRunLoopDefaultMode"));
@@ -571,7 +592,7 @@ void recorder(Fixture& f) {
     static_cast<void>(f.objc.add_native_method(delegate_class, "audioRecorderDidFinishRecording:successfully:",
                                                [](transmute::CpuState& s, transmute::GuestMemory&) { if (s.x[3] & 0xff) ++finished; }, false, "v@:@B"));
     const auto delegate = f.send(f.send(delegate_class, "alloc"), "init");
-    const auto path = std::filesystem::temp_directory_path() / "alchemy_recorder_test.wav";
+    const auto path = test_directory() / "alchemy_recorder_test.wav";
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
     const auto url = f.cf.file_url(alchemy::guest_path_string(path), false);
@@ -659,7 +680,7 @@ void asset_writer(Fixture& f) {
     auto& seen = writer_seen();
     const auto b = alchemy::gui::security::bridge();
     const auto error = f.block(8);
-    const auto directory = std::filesystem::temp_directory_path();
+    const auto directory = test_directory();
     const auto wav = directory / "alchemy_writer_test.wav", caf = directory / "alchemy_writer_test.caf";
     std::error_code ignored;
     std::filesystem::remove(wav, ignored);
@@ -817,7 +838,7 @@ void asset_writer_movie(Fixture& f) {
     fake_aac::install();
     movie_fixture = &f;
     const auto error = f.block(8);
-    const auto directory = std::filesystem::temp_directory_path();
+    const auto directory = test_directory();
     const auto mov = directory / "alchemy_writer_test.mov", mp4 = directory / "alchemy_writer_test.mp4";
     std::error_code ignored;
     std::filesystem::remove(mov, ignored);
@@ -1097,7 +1118,7 @@ void asset_export(Fixture& f) {
     namespace mc = alchemy::gui::completion_kit::media::container;
     fake_video::install();
     fake_aac::install();
-    const auto directory = std::filesystem::temp_directory_path();
+    const auto directory = test_directory();
     const auto source = directory / "alchemy_export_source.mov", wav = directory / "alchemy_export_source.wav";
     const auto passed = directory / "alchemy_export_passthrough.mp4", trimmed = directory / "alchemy_export_trimmed.mp4", m4a = directory / "alchemy_export.m4a",
                encoded = directory / "alchemy_export_encoded.mov";
@@ -1292,7 +1313,7 @@ int main() {
     }
     media::set_hal_backend_factory([] { return std::make_unique<FakeHal>(); });
     media::set_capture_backend_factory([] { return std::make_unique<FakeCameras>(); });
-    return fill_test::run("media capture", {
+    const auto result = fill_test::run("media capture", {
         {"devices", devices},
         {"authorization", authorization},
         {"session", session},
@@ -1306,4 +1327,7 @@ int main() {
         {"asset_export", asset_export},
         {"test_devices", test_devices},
     });
+    std::error_code ignored;
+    std::filesystem::remove_all(test_directory(), ignored);
+    return result;
 }
