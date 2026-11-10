@@ -120,3 +120,27 @@ if(ALCHEMY_HOST STREQUAL "linux" AND alchemy_host_gui_sources)
     pkg_check_modules(ALCHEMY_MEDIA REQUIRED IMPORTED_TARGET libpulse alsa)
     list(APPEND ALCHEMY_GUI_LINK_LIBRARIES PkgConfig::ALCHEMY_MEDIA)
 endif()
+
+# The Linux host codecs (src/alchemy/host/linux/gui/media_codec.cpp): GStreamer with the system's own plugins,
+# opened at run time (dlopen), so only its headers are used to build (`apt install libgstreamer1.0-dev
+# libgstreamer-plugins-base1.0-dev`); nothing links against it. Without the headers the file builds as "no host
+# codecs".
+if(ALCHEMY_HOST STREQUAL "linux" AND alchemy_host_gui_sources)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ALCHEMY_GSTREAMER QUIET gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0)
+    if(ALCHEMY_GSTREAMER_FOUND)
+        set(alchemy_gstreamer_options)
+        foreach(dir IN LISTS ALCHEMY_GSTREAMER_INCLUDE_DIRS)
+            # The default directory itself stays where the compiler has it (an -isystem /usr/include would put it ahead
+            # of the C++ library's wrappers).
+            if(NOT dir STREQUAL "/usr/include")
+                list(APPEND alchemy_gstreamer_options "-isystem" "${dir}")
+            endif()
+        endforeach()
+        set_source_files_properties("${PROJECT_SOURCE_DIR}/src/alchemy/host/linux/gui/media_codec.cpp" PROPERTIES
+            COMPILE_OPTIONS "${alchemy_gstreamer_options}" COMPILE_DEFINITIONS ALCHEMY_HOST_GSTREAMER=1)
+        list(APPEND ALCHEMY_GUI_LINK_LIBRARIES ${CMAKE_DL_LIBS})
+    else()
+        message(STATUS "GStreamer headers not found: the Linux host builds without host codecs")
+    endif()
+endif()
