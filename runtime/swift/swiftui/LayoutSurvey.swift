@@ -23,6 +23,8 @@ import ObjectiveC
 internal let _frozenSwiftUITypes: Set<String> = [
     "State", "Binding", "Text", "Color", "AnyView", "Transaction", "Environment", "ModifiedContent", "TupleView",
     "EdgeInsets", "Spacer", "Image", "ObservedObject", "EnvironmentObject", "FocusState", "EmptyView", "HStack", "VStack",
+    "StateObject", "GestureMask", "AnyGradient", "UnevenRoundedRectangle", "RectangleCornerRadii", "GraphicsContext",
+    "LinkShapeStyle", "EquatableView", "Path",
 ]
 
 /// The objects the probe places in a value's words; their counts show what the app's witnesses did. An Objective-C

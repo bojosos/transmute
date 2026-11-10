@@ -635,7 +635,7 @@ if ($Library -eq 'all') {
     # produce: it is exported as an alias of the same method.
     Build-Overlay 'SwiftUI' 'SwiftUI' "$repo/runtime/swift/swiftui" '/System/Library/Frameworks/SwiftUI.framework/Versions/A/SwiftUI' 'SwiftUI' `
         -dependencies @('libswiftCoreGraphics.dylib', 'Combine', 'libswiftFoundation.dylib', 'libswiftos.dylib', 'libswiftObservation.dylib',
-        'libswift_Concurrency.dylib') -concurrency -aliases @(
+        'libswift_Concurrency.dylib', 'libswiftUniformTypeIdentifiers.dylib', 'DeveloperToolsSupport') -concurrency -aliases @(
         '_$s7SwiftUI7ForEachV6create_2id7contentACyxq_q0_Gx_s7KeyPathCy7ElementQzq_Gq0_AKctFZ=_$s7SwiftUI7ForEachVAAE6create_2id7contentACyxq_q0_Gx_s7KeyPathCy7ElementQzq_Gq0_AKctFZ')
     foreach ($overlay in $extraOverlays) {
         if (!(Test-Path -LiteralPath $overlay.Source)) { continue }

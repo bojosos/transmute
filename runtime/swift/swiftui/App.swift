@@ -27,6 +27,7 @@ extension App {
 public protocol Scene {
     associatedtype Body: Scene
     @SceneBuilder var body: Body { get }
+    static func _makeScene(scene: _GraphValue<Self>, inputs: _SceneInputs) -> _SceneOutputs
 }
 
 extension Never: Scene {}

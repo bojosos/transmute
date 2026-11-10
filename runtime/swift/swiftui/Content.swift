@@ -238,7 +238,11 @@ public struct RadialGradient: ShapeStyle, View {
     public var body: Never { _alchemyUnimplemented("RadialGradient.body") }
 }
 
-public enum BlendMode: Hashable { case normal, multiply, screen, overlay, plusLighter }
+public enum BlendMode: Hashable {
+    case normal, multiply, screen, overlay, darken, lighten, colorDodge, colorBurn, softLight, hardLight,
+         difference, exclusion, hue, saturation, color, luminosity, sourceAtop, destinationOver, destinationOut,
+         plusDarker, plusLighter
+}
 
 public enum ColorScheme: CaseIterable, Hashable { case light, dark }
 
@@ -314,21 +318,23 @@ public struct StrokeStyle: Equatable {
     }
 }
 
+// @frozen as Apple documents it. The stored field is a placeholder until the layout survey establishes the
+// type's layout from an app's own metadata; until then every member stops (_alchemyLayoutUnestablished).
+@frozen
 public struct Path: Equatable {
-    internal var elements: [Element] = []
-    internal enum Element: Equatable { case move(CGPoint), line(CGPoint), close }
-    public init() {}
-    public init(_ callback: (inout Path) -> ()) {
-        var path = Path()
-        callback(&path)
-        self = path
-    }
-    public mutating func move(to end: CGPoint) { elements.append(.move(end)) }
-    public mutating func addLine(to end: CGPoint) { elements.append(.line(end)) }
+    internal var _placeholder: Int
+    public init() { _alchemyLayoutUnestablished("Path") }
+    public init(_ callback: (inout Path) -> ()) { _alchemyLayoutUnestablished("Path") }
+    public mutating func move(to end: CGPoint) { _alchemyLayoutUnestablished("Path") }
+    public mutating func addLine(to end: CGPoint) { _alchemyLayoutUnestablished("Path") }
+    public static func == (lhs: Path, rhs: Path) -> Bool { _alchemyLayoutUnestablished("Path") }
 }
 
 public protocol Shape: Animatable, View {
     func path(in rect: CGRect) -> Path
+    static var role: ShapeRole { get }
+    var layoutDirectionBehavior: LayoutDirectionBehavior { get }
+    func sizeThatFits(_ proposal: ProposedViewSize) -> CGSize
 }
 
 extension Shape {

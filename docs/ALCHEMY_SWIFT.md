@@ -427,10 +427,13 @@ What runs: `App.main` builds the app and its scene tree, installs an
 whose UI comes from its AppKit delegate gets that far, as Pika's does. Scene
 bodies and views stop explicitly until a renderer exists.
 
-The 18 types Apple documents as `@frozen` (State, Binding, Text, Color,
-AnyView, Transaction, Environment, ModifiedContent, TupleView, EdgeInsets,
-Spacer, Image, ObservedObject, EnvironmentObject, FocusState, EmptyView,
-HStack, VStack) are frozen here too. Apps compiled against Apple's SwiftUI
+The 27 types Apple documents as `@frozen` that Alchemy declares (State,
+Binding, Text, Color, AnyView, Transaction, Environment, ModifiedContent,
+TupleView, EdgeInsets, Spacer, Image, ObservedObject, EnvironmentObject,
+FocusState, EmptyView, HStack, VStack, StateObject, GestureMask, AnyGradient,
+UnevenRoundedRectangle, RectangleCornerRadii, GraphicsContext, LinkShapeStyle,
+EquatableView and Path) are frozen here too. The frozen enums Edge,
+Visibility, HorizontalEdge and VerticalEdge carry their documented cases. Apps compiled against Apple's SwiftUI
 build, pass and return them by Apple's stored layout, which no public document
 gives. Until the layout survey and probe establish a type's layout from an
 app's own Swift metadata and compiled code, each of its members stops at entry:
@@ -443,7 +446,7 @@ the app is built.
 - It walks the main executable's `__swift5_types` and calls each non-generic
   struct's metadata accessor.
 - It enumerates the struct's fields with the runtime's own field enumeration.
-- For every field typed as one of the 18 types, it reports the room the app
+- For every field typed as one of the 27 types, it reports the room the app
   gives it, with the container's size, value-witness flags and extra
   inhabitants, on standard error as `SwiftUI layout:` lines.
 - Only structs the compiler laid out (static field offsets) are evidence of
@@ -453,7 +456,7 @@ the app is built.
 
 Sizes don't say which word of a type holds what. `ALCHEMY_SWIFTUI_LAYOUTS=probe`
 answers that from the app's own compiled copy and destroy code.
-- It takes each struct the compiler laid out whose only field of the 18 types
+- It takes each struct the compiler laid out whose only field of the 27 types
   is a probed type, and whose other fields are zero-safe. Zero bytes are a
   valid value of plain data, a class reference or a function (null), an
   Optional of either (nil), and a struct of only such fields, checked
@@ -510,7 +513,7 @@ Established layouts, each from the evidence named here:
     word 1 and nothing else. `getEnumTagSinglePayload` reads that back as
     empty, and a stored payload case back as payload;
   - `Binding<String>` has room 32: 16, plus the String's 16.
-- The other 16 types still stop.
+- The other 25 types still stop.
 
 Partial evidence, not yet enough to remove a stop:
 - EnvironmentObject: 16 bytes. Word 0 is the object's reference and word 1 is
@@ -535,9 +538,30 @@ ForEach is declared in Apple's SwiftUICore module and its `create(_:id:content:)
 in SwiftUI. That name has an extension context one module can't produce, so it
 is exported as a linker alias of our same method.
 
-Two more pieces it builds on:
+It also exports every SwiftUI name Ice 0.11.12 binds: gestures, scenes and
+windows, list and split views, styles, shapes, graphics contexts and the
+modifiers it uses (`runtime/swift/swiftui/Surface.swift` and
+`Resources.swift`). The protocols gain the requirements apps' conformances
+name, with defaults: Scene's `_makeScene`, Shape's role, layout direction
+behaviour and sizing, the button and toggle styles' `makeBody`, the variadic
+roots' list entry points, and `CoordinateSpaceProtocol.coordinateSpace`. Maccy
+2.8.0 still lacks 190 names.
+
+Pieces it builds on:
+- Three more libraries, each with an identity row:
+  - `libswift_StringProcessing` has `RangeReplaceableCollection.trimPrefix(while:)`
+    (no Regex yet);
+  - `libswiftUniformTypeIdentifiers` has `UTType` as an identifier, with the
+    well-known public types and their filename extensions. Conformance and
+    other extensions need the system's type database, and stop;
+  - `DeveloperToolsSupport.framework` has `ColorResource` and `ImageResource`.
+- Dispatch makes `DispatchQueue` a Combine `Scheduler`.
+- Foundation adds `LocalizedError`.
 - `libswiftCoreGraphics` adds CGColor's `black`/`white`/`clear`/`components`,
   `Equatable` and `Codable` for CGPoint and CGSize, and `Equatable` for CGRect.
+  It also adds `CGPathFillRule`, `CGContext.draw(_:in:byTiling:)` and
+  `CGRect(dictionaryRepresentation:)`. `CGPath.union(_:using:)` needs path
+  boolean operations, and stops.
 - `runtime/swift/include` gains Clang modules for Swift builds:
   - `CoreGraphics/CoreGraphics.h` layers `runtime/include/CoreGraphics` over
     this directory's CoreFoundation;

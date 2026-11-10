@@ -50,12 +50,30 @@ public protocol ButtonStyle {
     typealias Configuration = ButtonStyleConfiguration
 }
 
-public protocol PrimitiveButtonStyle {}
+public protocol PrimitiveButtonStyle {
+    associatedtype Body: View
+    @ViewBuilder func makeBody(configuration: Configuration) -> Body
+    typealias Configuration = PrimitiveButtonStyleConfiguration
+}
 
-public struct PlainButtonStyle: PrimitiveButtonStyle { public init() {} }
-public struct BorderedButtonStyle: PrimitiveButtonStyle { public init() {} }
-public struct BorderedProminentButtonStyle: PrimitiveButtonStyle { public init() {} }
-public struct LinkButtonStyle: PrimitiveButtonStyle { public init() {} }
+public struct PlainButtonStyle: PrimitiveButtonStyle {
+    public init() {}
+    public func makeBody(configuration: Configuration) -> Never { _alchemyUnimplemented("PlainButtonStyle.makeBody(configuration:)") }
+}
+public struct BorderedButtonStyle: PrimitiveButtonStyle {
+    public init() {}
+    public func makeBody(configuration: Configuration) -> Never { _alchemyUnimplemented("BorderedButtonStyle.makeBody(configuration:)") }
+}
+public struct BorderedProminentButtonStyle: PrimitiveButtonStyle {
+    public init() {}
+    public func makeBody(configuration: Configuration) -> Never {
+        _alchemyUnimplemented("BorderedProminentButtonStyle.makeBody(configuration:)")
+    }
+}
+public struct LinkButtonStyle: PrimitiveButtonStyle {
+    public init() {}
+    public func makeBody(configuration: Configuration) -> Never { _alchemyUnimplemented("LinkButtonStyle.makeBody(configuration:)") }
+}
 
 extension View {
     public func buttonStyle<S: ButtonStyle>(_ style: S) -> some View {
@@ -80,9 +98,19 @@ public struct Toggle<Label: View>: View {
     public var body: Never { _alchemyUnimplemented("Toggle.body") }
 }
 
-public protocol ToggleStyle {}
-public struct SwitchToggleStyle: ToggleStyle { public init() {} }
-public struct CheckboxToggleStyle: ToggleStyle { public init() {} }
+public protocol ToggleStyle {
+    associatedtype Body: View
+    @ViewBuilder func makeBody(configuration: Configuration) -> Body
+    typealias Configuration = ToggleStyleConfiguration
+}
+public struct SwitchToggleStyle: ToggleStyle {
+    public init() {}
+    public func makeBody(configuration: Configuration) -> Never { _alchemyUnimplemented("SwitchToggleStyle.makeBody(configuration:)") }
+}
+public struct CheckboxToggleStyle: ToggleStyle {
+    public init() {}
+    public func makeBody(configuration: Configuration) -> Never { _alchemyUnimplemented("CheckboxToggleStyle.makeBody(configuration:)") }
+}
 
 public struct Picker<Label: View, SelectionValue: Hashable, Content: View>: View {
     internal var selection: Binding<SelectionValue>

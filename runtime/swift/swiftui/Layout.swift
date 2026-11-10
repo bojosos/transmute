@@ -384,14 +384,18 @@ public struct GeometryReader<Content: View>: View {
     public var body: Never { _alchemyUnimplemented("GeometryReader.body") }
 }
 
-public protocol CoordinateSpaceProtocol {}
+public protocol CoordinateSpaceProtocol {
+    var coordinateSpace: CoordinateSpace { get }
+}
 
 public struct LocalCoordinateSpace: CoordinateSpaceProtocol {
     public init() {}
+    public var coordinateSpace: CoordinateSpace { .local }
 }
 
 public struct NamedCoordinateSpace: CoordinateSpaceProtocol, Equatable {
     internal var name: AnyHashable
+    public var coordinateSpace: CoordinateSpace { .named(name) }
 }
 
 extension CoordinateSpaceProtocol where Self == LocalCoordinateSpace {
