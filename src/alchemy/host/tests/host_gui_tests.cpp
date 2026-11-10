@@ -308,6 +308,12 @@ void images_area() {
     const auto frame = host::gpu::image_frame(*png, 0, true);
     require(frame && frame->rgba == pixels.rgba && frame->orientation == 1, "a PNG frame's pixels");
     require(host::gpu::image_frame(*png, 1, false).error() == host::Error::out_of_range, "no second PNG frame");
+    // A GIF keeps a transparent pixel transparent (its transparent index).
+    const host::gpu::Pixels clear{2, 1, {255, 0, 0, 255, 0, 0, 0, 0}};
+    const auto clear_gif = host::gpu::encode_image(clear, host::gpu::ImageFormat::gif);
+    const auto clear_frame = clear_gif ? host::gpu::image_frame(*clear_gif, 0, true) : host::Result<host::gpu::ImageFrame>(host::Error::io);
+    require(clear_frame && clear_frame->has_alpha && clear_frame->rgba.size() == 8 && clear_frame->rgba[3] == 255 && clear_frame->rgba[7] == 0,
+        "a GIF's transparent pixel");
 }
 
 void fonts_area() {

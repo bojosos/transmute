@@ -72,6 +72,8 @@ Result<Pixels> decode_image(std::span<const std::uint8_t> bytes) {
 Result<std::vector<std::uint8_t>> encode_image(const Pixels& pixels, ImageFormat type) {
     if (!pixels.width || !pixels.height || pixels.rgba.size() != static_cast<std::size_t>(pixels.width) * pixels.height * 4)
         return Error::invalid_argument;
+    // GIF through ImageIO's encoder (imageio.cpp), which keeps transparent pixels.
+    if (type == ImageFormat::gif) return encode_image_frames(type, std::span<const Pixels>(&pixels, 1), 0.9);
     GUID container{};
     switch (type) {
     case ImageFormat::tiff: container = GUID_ContainerFormatTiff; break;

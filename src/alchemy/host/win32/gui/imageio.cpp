@@ -44,6 +44,7 @@ std::optional<std::uint32_t> metadata_number(IWICBitmapFrameDecode& frame, const
         if (value.vt == VT_UI2) result = value.uiVal;
         else if (value.vt == VT_UI4) result = value.ulVal;
         else if (value.vt == VT_UI1) result = value.bVal;
+        else if (value.vt == VT_BOOL) result = value.boolVal != VARIANT_FALSE ? 1U : 0U;
     }
     PropVariantClear(&value);
     return result;
@@ -89,6 +90,10 @@ Result<ImageFrame> image_frame(std::span<const std::uint8_t> bytes, std::size_t 
     static_cast<void>(source->decoder->GetContainerFormat(&container));
     if (container == GUID_ContainerFormatGif) {
         if (const auto delay = metadata_number(*frame.Get(), L"/grctlext/Delay")) result.delay = *delay / 100.0;
+        // A frame with a transparent index has alpha: WIC's palette gives that
+        // index alpha 0, though the indexed pixel format reports no transparency
+        // (without this the pixels below were made opaque in the index's colour).
+        if (metadata_number(*frame.Get(), L"/grctlext/TransparencyFlag").value_or(0) != 0) result.has_alpha = true;
     } else if (container == GUID_ContainerFormatJpeg) {
         if (const auto orientation = metadata_number(*frame.Get(), L"/app1/ifd/{ushort=274}")) result.orientation = *orientation;
     } else if (container == GUID_ContainerFormatTiff) {
@@ -152,12 +157,37 @@ Result<std::vector<std::uint8_t>> encode_image_frames(ImageFormat type, std::spa
             if (requested == GUID_WICPixelFormat8bppIndexed) {
                 ComPtr<IWICPalette> palette;
                 ComPtr<IWICFormatConverter> converter;
+                // Pixels below half alpha take the palette's transparent entry,
+                // which the frame's graphic control extension then names (WIC's
+                // GIF encoder writes neither by itself).
                 if (FAILED(factory->CreatePalette(&palette)) || FAILED(palette->InitializeFromBitmap(bitmap.Get(), 256, TRUE)) ||
                     FAILED(factory->CreateFormatConverter(&converter)) ||
-                    FAILED(converter->Initialize(bitmap.Get(), requested, WICBitmapDitherTypeNone, palette.Get(), 0, WICBitmapPaletteTypeCustom)))
+                    FAILED(converter->Initialize(bitmap.Get(), requested, WICBitmapDitherTypeNone, palette.Get(), 50, WICBitmapPaletteTypeCustom)))
                     return Error::io;
                 static_cast<void>(target->SetPalette(palette.Get()));
                 source = converter;
+                bool transparent_pixels = false;
+                for (std::size_t at = 3; at < frame.rgba.size() && !transparent_pixels; at += 4) transparent_pixels = frame.rgba[at] < 128;
+                UINT colours{};
+                WICColor entries[256]{};
+                ComPtr<IWICMetadataQueryWriter> metadata;
+                if (transparent_pixels && SUCCEEDED(palette->GetColors(256, entries, &colours)) && SUCCEEDED(target->GetMetadataQueryWriter(&metadata))) {
+                    for (UINT index = 0; index < colours; ++index) {
+                        if ((entries[index] >> 24) != 0) continue;   // ARGB: the transparent entry
+                        PROPVARIANT flag;
+                        PropVariantInit(&flag);
+                        flag.vt = VT_BOOL;
+                        flag.boolVal = VARIANT_TRUE;
+                        PROPVARIANT which;
+                        PropVariantInit(&which);
+                        which.vt = VT_UI1;
+                        which.bVal = static_cast<BYTE>(index);
+                        if (FAILED(metadata->SetMetadataByName(L"/grctlext/TransparencyFlag", &flag)) ||
+                            FAILED(metadata->SetMetadataByName(L"/grctlext/TransparentColorIndex", &which)))
+                            return Error::io;
+                        break;
+                    }
+                }
             } else {
                 ComPtr<IWICBitmapSource> converted;
                 if (FAILED(WICConvertBitmapSource(requested, bitmap.Get(), &converted))) return Error::io;

@@ -77,8 +77,27 @@ Result<RasterMetrics> raster_metrics(const RasterFont& font) {
     result.leading = metrics.tmExternalLeading;
     result.average_width = metrics.tmAveCharWidth;
     result.max_width = metrics.tmMaxCharWidth;
-    if (have_outline && outline.otmsCapEmHeight) result.cap_height = outline.otmsCapEmHeight;
-    if (have_outline && outline.otmsXHeight) result.x_height = outline.otmsXHeight;
+    // Cap and x heights from the face's OS/2 table (version 2 and later),
+    // scaled to the pixel em; else the top of H's and x's hinted boxes.
+    // OUTLINETEXTMETRIC's otmsCapEmHeight and otmsXHeight are documented as
+    // unsupported (they read as em/2 and em/4).
+    const auto em = metrics.tmHeight - metrics.tmInternalLeading;
+    std::uint8_t os2[90]{};
+    if (have_outline && outline.otmEMSquare && em > 0 &&
+        GetFontData(g.dc, 0x322f534f /* 'OS/2' read little-endian */, 0, os2, sizeof os2) == sizeof os2 && (os2[0] << 8 | os2[1]) >= 2) {
+        const auto design = [&](std::size_t at) { return static_cast<std::int16_t>(os2[at] << 8 | os2[at + 1]); };
+        const auto pixels = [&](int units) { return std::round(static_cast<double>(units) * em / outline.otmEMSquare); };
+        if (design(88) > 0) result.cap_height = pixels(design(88));   // sCapHeight
+        if (design(86) > 0) result.x_height = pixels(design(86));     // sxHeight
+    }
+    const MAT2 identity{{0, 1}, {0, 0}, {0, 0}, {0, 1}};
+    const auto glyph_top = [&](wchar_t c) -> std::optional<double> {
+        GLYPHMETRICS glyph{};
+        if (GetGlyphOutlineW(g.dc, c, GGO_METRICS, &glyph, 0, nullptr, &identity) == GDI_ERROR) return std::nullopt;
+        return static_cast<double>(glyph.gmptGlyphOrigin.y);
+    };
+    if (!result.cap_height) result.cap_height = glyph_top(L'H');
+    if (!result.x_height) result.x_height = glyph_top(L'x');
     return result;
 }
 
