@@ -1254,8 +1254,14 @@ void real_backend() {
     require(total && total->user_ns + total->system_ns + total->idle_ns > 0, "system CPU times");
     require(processors && !processors->empty(), "per-processor CPU times");
     const auto first_load = host::system::load_average(), second_load = host::system::load_average();
+    // The Windows backend derives its load from CPU busy time, so it stays
+    // within the processor count. A Unix load average counts runnable threads
+    // and passes it under a parallel build: there it need only be finite.
+    const bool bounded = host::backend() == "win32";
     const auto load_in_range = [&](const auto& load) {
-        return load && std::ranges::all_of(*load, [&](double value) { return value >= 0 && value <= static_cast<double>(processors->size()) + 0.01; });
+        return load && std::ranges::all_of(*load, [&](double value) {
+                   return value >= 0 && value < 1e9 && (!bounded || value <= static_cast<double>(processors->size()) + 0.01);
+               });
     };
     require(load_in_range(first_load) && load_in_range(second_load), "load averages within the processor count");
     const auto uuid = host::system::machine_uuid();
