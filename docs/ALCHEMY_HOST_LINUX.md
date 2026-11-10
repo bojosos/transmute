@@ -37,10 +37,17 @@ This page maps each host area to Linux. The Linux backends are in progress.
 * **Alchemy** has a Linux host backend (`src/alchemy/host/linux/`). These areas
   are written: files, process (fork + execve spawns, pidfds), sync (eventfds;
   named mutexes and semaphores as FIFOs), time, vm, sections (memfd, POSIX
-  shared memory), net (BSD sockets), ipc (abstract UNIX sockets), system,
-  debug, http (libcurl) and crypto (OpenSSL: digests, ciphers, keys, X.509,
-  chains and TLS). The other areas fail with `Error::unsupported`: dns_sd,
-  locale and icu.
+  shared memory), net (BSD sockets), ipc (abstract UNIX sockets), system
+  (power requests through logind), debug, locale and icu (the distribution's
+  ICU), crypto and http (OpenSSL 3, libcurl; data protection below), and
+  dns_sd's address lookups. The debug area's fatal-fault handler passes each
+  fault to the fx engine's
+  handler first (a guarded read or a guest fault is the engine's), in either
+  installation order.
+* **Guest paths.** As on Windows, libSystem maps the Alchemy root's
+  directories (`/Applications`, `/Library`, `/Users`, `/etc`, `/usr`, ...)
+  and the fonts view (`/System/Library/Fonts`) to their host locations; any
+  other absolute guest path is the host's own.
 * **Data protection** (`crypto::protect` / `unprotect`, DPAPI on Windows)
   seals data with AES-256-GCM under a 32-byte per-user key kept in the
   desktop's secret store (the Secret Service: GNOME Keyring, KWallet).
@@ -59,19 +66,32 @@ This page maps each host area to Linux. The Linux backends are in progress.
     desktop. GLib falls back to `$XDG_RUNTIME_DIR/bus`, so unsetting
     DBUS_SESSION_BUS_ADDRESS alone is not enough.
 * **The window server** (`src/alchemy/host/linux/gui/window_server.cpp`)
-  speaks X11 through XCB, with xkbcommon for keys. `apt install
-  libxcb1-dev libxcb-xkb-dev libxcb-cursor-dev libxcb-icccm4-dev
-  libxkbcommon-dev libxkbcommon-x11-dev`. It covers:
+  speaks X11 through XCB, with xkbcommon for keys (the packages are listed
+  in `cmake/AlchemyHost.cmake`). It covers:
   * top-level windows;
   * expose, move, resize, focus and close notifications;
   * mouse buttons, click counts, the wheel and motion;
   * keys with macOS key codes and NSEvent function-key characters;
   * `present_bitmap` through PutImage;
-  * a run-loop wait that polls the X socket with the handles.
+  * a run-loop wait that polls the X socket with the handles;
+  * screens: RandR 1.5 monitors, the primary one at AppKit's origin, the
+    window manager's work area as the visible frame;
+  * the X CLIPBOARD selection for UTF-8 text and PNG images, both ways (INCR
+    transfers too; XFixes counts other clients' changes);
+  * cursors from the cursor theme (the core cursor font's names as
+    fallbacks), Render ARGB cursors from images, XFixes hiding.
 
-  Not written yet: XRandR screens and HiDPI, cursors, the X clipboard (the
-  clipboard is process-local), drag and drop, IME. The other GUI areas
-  (gpu's Vulkan half, ...) still fail with `Error::unsupported`.
+  Not written yet: HiDPI, drag and drop, IME, cursor confinement and relative
+  mouse mode.
+* **The ui area** (`gui/ui.cpp`): idle time (X ScreenSaver), the keyboard
+  kind (the XKB layout), appearance and accessibility from GTK's settings,
+  the pixel under the pointer, a timerfd frame timer, `xdg-open` for opening
+  and revealing, and Hunspell spell checking (loaded at run time, with the
+  dictionaries in `/usr/share/hunspell`). No native alerts or file panels.
+* **Vulkan** (`gui/gpu.cpp`): the system loader (`libvulkan.so.1`) and
+  `VK_KHR_xcb_surface` windows. On WSL the device is Mesa's lavapipe
+  (`apt install libvulkan1 mesa-vulkan-drivers`). The MSL compiler runs the
+  distribution's clang as on Windows.
 * **Media** (`gui/audio.cpp`, `midi.cpp`, `camera.cpp`, `speech.cpp`,
   `media_codec.cpp`). `apt install libpulse-dev libasound2-dev`, and for
   codecs `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`.
@@ -169,20 +189,26 @@ This page maps each host area to Linux. The Linux backends are in progress.
     `site`, exit codes);
   * LLVM 23's `clang --version`, `ld64.lld --version` and `clang -c`, with
     the LLVM and libxml2 runtimes from `--runtime-dir`;
-  * `macos/gui_window_events`, on a private display: `Xvfb :99` and
-    `DISPLAY=:99`, not the desktop. Driven with real X input through
-    `xdotool`, it reports clicks, double clicks, the wheel, shifted keys,
-    arrows, function keys and modifier changes.
+  * on a private display (`Xvfb :99`, `DISPLAY=:99`, not the desktop):
+    `gui_link_smoke`, `gui_window_events`, `gui_text_input`, and Metal's
+    `gui_metal_compute` and `gui_metal_triangle` on lavapipe. Driven with
+    real X input through `xdotool`, `gui_window_events` reports clicks,
+    double clicks, the wheel, shifted keys, arrows, function keys and
+    modifier changes;
+  * QLab gets through `NSApplicationMain` and loads its main nib, then
+    stops at its first system font: CoreText maps Apple's UI fonts to
+    Windows families (Segoe UI, Arial), which need a substitute on Linux.
 * **Not done yet:**
   * DWARF CFI for the code arena, so C++ exceptions crossing translated frames
     fail on Linux;
-  * thread sampling;
   * passing descriptors to other processes;
   * case-insensitive lookups under the Alchemy root (WSL's kernel has no ext4
     casefold);
-  * ICU and locale;
-  * TLS;
-  * Vulkan and the rest of the GUI areas.
+  * font family substitution for the Windows names CoreText asks for;
+  * the x64 reference JIT and the PE personality (Windows-only by design).
+* **CI.** `.github/workflows/linux.yml` builds both backends in an Ubuntu
+  26.04 container and runs `alchemy_host`, `fx_host_tests`,
+  `alchemy_process`, `alchemy_cli` and `alchemy_gui_host` (on Xvfb).
 
 The macOS layer (`src/alchemy/darwin/`, the loader, the Objective-C
 runtime) talks to the operating system only through the host API in

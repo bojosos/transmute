@@ -66,10 +66,16 @@ endif()
 file(GLOB alchemy_host_gui_sources CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/src/alchemy/host/${ALCHEMY_HOST}/gui/*.cpp")
 list(APPEND ALCHEMY_GUI_SOURCES ${alchemy_host_gui_sources})
-# The Linux GUI areas speak X11 through XCB, with xkbcommon for keyboards.
+# The Linux GUI areas speak X11 through XCB, with xkbcommon for keyboards, RandR
+# for screens, XFixes for clipboard changes, Render for colour cursors and
+# ScreenSaver for idle time (`apt install libxcb1-dev libxcb-xkb-dev
+# libxcb-cursor-dev libxcb-icccm4-dev libxcb-randr0-dev libxcb-xfixes0-dev
+# libxcb-render0-dev libxcb-render-util0-dev libxcb-screensaver0-dev
+# libxkbcommon-dev libxkbcommon-x11-dev`).
 if(ALCHEMY_HOST STREQUAL "linux" AND alchemy_host_gui_sources)
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(ALCHEMY_X11 REQUIRED IMPORTED_TARGET xcb xcb-xkb xcb-cursor xcb-icccm xkbcommon xkbcommon-x11)
+    pkg_check_modules(ALCHEMY_X11 REQUIRED IMPORTED_TARGET xcb xcb-xkb xcb-cursor xcb-icccm xcb-randr xcb-xfixes
+        xcb-render xcb-renderutil xcb-screensaver xkbcommon xkbcommon-x11)
     list(APPEND ALCHEMY_GUI_LINK_LIBRARIES PkgConfig::ALCHEMY_X11)
 endif()
 
@@ -78,6 +84,9 @@ if(ALCHEMY_HOST STREQUAL "linux")
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(ALCHEMY_LINUX_NET REQUIRED IMPORTED_TARGET libcurl openssl)
     target_link_libraries(alchemy_core PRIVATE PkgConfig::ALCHEMY_LINUX_NET)
+    # alchemy_core_fx compiles alchemy_core's sources again (cmake/AlchemyFx.cmake)
+    # and links these too.
+    list(APPEND ALCHEMY_HOST_LINK_LIBRARIES PkgConfig::ALCHEMY_LINUX_NET)
 endif()
 
 if(BUILD_TESTING)

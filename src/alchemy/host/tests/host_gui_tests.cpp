@@ -537,7 +537,8 @@ void real_backend() {
     {
         const auto loader = host::gpu::vulkan_get_instance_proc_addr();
         require(loader ? *loader != nullptr : loader.error() == host::Error::not_found, "the Vulkan loader");
-        require(host::gpu::vulkan_surface_extension() == "VK_KHR_win32_surface", "the window surface extension");
+        require(host::gpu::vulkan_surface_extension() == (host::backend() == "win32" ? "VK_KHR_win32_surface" : "VK_KHR_xcb_surface"),
+                "the window surface extension");
         require(host::ui::window_client_size(0).error() == host::Error::not_found, "no window, no client area");
     }
 

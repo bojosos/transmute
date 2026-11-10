@@ -18,4 +18,34 @@ namespace alchemy::host::linux_gui {
 // socket would miss them).
 [[nodiscard]] bool events_queued() noexcept;
 
+// The window server's connection, else a short-lived one of the caller's own
+// (queries that work before any window exists: monitors, idle time, ...).
+// `connection` is nullptr without an X display.
+struct AnyConnection {
+    xcb_connection_t* connection{};
+    xcb_screen_t* screen{};
+    bool owned{};
+    AnyConnection() {
+        int preferred = 0;
+        connection = linux_gui::connection();
+        if (!connection) {
+            connection = xcb_connect(nullptr, &preferred);
+            owned = true;
+            if (xcb_connection_has_error(connection)) {
+                xcb_disconnect(connection);
+                connection = nullptr;
+                return;
+            }
+        }
+        auto iterator = xcb_setup_roots_iterator(xcb_get_setup(connection));
+        for (int i = 0; i < preferred && iterator.rem; ++i) xcb_screen_next(&iterator);
+        screen = iterator.data;
+    }
+    ~AnyConnection() {
+        if (owned && connection) xcb_disconnect(connection);
+    }
+    AnyConnection(const AnyConnection&) = delete;
+    AnyConnection& operator=(const AnyConnection&) = delete;
+};
+
 } // namespace alchemy::host::linux_gui

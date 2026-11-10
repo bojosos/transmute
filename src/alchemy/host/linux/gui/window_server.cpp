@@ -2,9 +2,11 @@
 // counterpart of the Win32 one (include/alchemy/gui/window_server.hpp).
 //
 // - One X connection ($DISPLAY), opened by the first request. Windows are
-//   top-level X windows the window manager decorates; AppKit's bottom-left
-//   screen points are X root pixels flipped against the root height (one
-//   screen, backing scale 1 for now).
+//   top-level X windows the window manager decorates. Screens are RandR
+//   monitors (the root window without RandR). AppKit's screen points have
+//   their origin at the primary monitor's bottom-left with y up, so a point
+//   is X root pixels flipped against that monitor's bottom edge (backing
+//   scale 1 for now).
 // - Events are read in dispatch_messages and delivered to the window's sink
 //   on the main thread; an exception from a sink is rethrown after the
 //   batch. Expose, configure (move and resize), focus, map/unmap and the
@@ -14,17 +16,30 @@
 // - present_bitmap puts the BGRA pixels with PutImage (the X server's 24/32-bit
 //   TrueColor layout is BGRX on little-endian hosts), in strips that fit the
 //   maximum request size.
-// - Not yet: XRandR screens and HiDPI, real cursors, the X clipboard (the
-//   clipboard is process-local), drag and drop, IME, status items.
+// - The clipboard is the X CLIPBOARD selection: a hidden window owns it
+//   while this process holds the clipboard (UTF-8 text, or an image as PNG)
+//   and answers other clients' requests; reading converts the selection
+//   (INCR transfers too). XFixes reports other owners for the change count.
+// - Cursors come from the cursor theme by name (xcb-cursor; the core cursor
+//   font's names as fallbacks); images become Render ARGB cursors.
+// - Not yet: HiDPI, drag and drop, IME, status items, cursor confinement
+//   and relative mouse mode.
 #include "alchemy/host/linux/gui/x11.hpp"
+#include "alchemy/host/gpu.hpp"
 #include "alchemy/host/ui.hpp"
 #include "alchemy/gui/runloop.hpp"
 
+#include <xcb/randr.h>
+#include <xcb/render.h>
+#include <xcb/xcb_cursor.h>
 #include <xcb/xcb_icccm.h>
+#include <xcb/xcb_renderutil.h>
+#include <xcb/xfixes.h>
 #include <xkbcommon/xkbcommon-x11.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -215,7 +230,7 @@ public:
         record.accepts_mouse_moved = description.accepts_mouse_moved;
         record.parent = description.parent;
         const auto pixels = to_x(record.content);
-        const std::uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
+        const std::uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK | XCB_CW_CURSOR;
         const std::uint32_t values[] = {
             screen_->white_pixel,
             // Borderless windows at a level above normal (menus, pop-ups,
@@ -224,7 +239,8 @@ public:
             XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS |
                 XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
                 XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_LEAVE_WINDOW |
-                XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE};
+                XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE,
+            current_cursor_};   // set_cursor's cursor (XCB_NONE: the parent's)
         xcb_create_window(connection_, XCB_COPY_FROM_PARENT, record.xid, screen_->root, static_cast<std::int16_t>(pixels.x),
                           static_cast<std::int16_t>(pixels.y), static_cast<std::uint16_t>(std::max(1, pixels.width)),
                           static_cast<std::uint16_t>(std::max(1, pixels.height)), 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
@@ -401,7 +417,21 @@ public:
     bool is_visible(WindowId window) const override { return find(window, "is_visible").visible; }
     bool window_exists(WindowId window) const override { return windows_.count(window) != 0; }
     double backing_scale(WindowId window) const override { find(window, "backing_scale"); return 1.0; }
-    ScreenId window_screen(WindowId window) const override { find(window, "window_screen"); return 1; }
+    ScreenId window_screen(WindowId window) const override {
+        const auto& record = find(window, "window_screen");
+        // The monitor with the largest share of the window (the primary when none).
+        ScreenId best = monitors_.empty() ? 1 : monitors_.front().info.id;
+        double best_area = 0;
+        for (const auto& monitor : monitors_) {
+            const auto& frame = monitor.info.frame;
+            const double width = std::min(frame.origin.x + frame.size.width, record.content.origin.x + record.content.size.width) -
+                                 std::max(frame.origin.x, record.content.origin.x);
+            const double height = std::min(frame.origin.y + frame.size.height, record.content.origin.y + record.content.size.height) -
+                                  std::max(frame.origin.y, record.content.origin.y);
+            if (width > 0 && height > 0 && width * height > best_area) best_area = width * height, best = monitor.info.id;
+        }
+        return best;
+    }
     Size content_pixel_size(WindowId window) const override { return find(window, "content_pixel_size").content.size; }
     void* native_handle(WindowId window) const override {
         return reinterpret_cast<void*>(static_cast<std::uintptr_t>(find(window, "native_handle").xid));
@@ -414,7 +444,7 @@ public:
         if (!const_cast<X11WindowServer*>(this)->open()) return {};
         auto* reply = xcb_query_pointer_reply(connection_, xcb_query_pointer(connection_, screen_->root), nullptr);
         if (!reply) return {};
-        const Point point{static_cast<double>(reply->root_x), screen_height() - reply->root_y};
+        const Point point = to_appkit(reply->root_x, reply->root_y);
         std::free(reply);
         return point;
     }
@@ -422,51 +452,147 @@ public:
     double key_repeat_delay() const override { return 0.5; }
     double key_repeat_interval() const override { return 1.0 / 30; }
 
-    // ---- cursors (the default arrow until cursor themes are wired) ----
+    // ---- cursors ----
+    // System cursors keep the ids enum + 1; images get ids from 1000 on.
     CursorId system_cursor(SystemCursor cursor) override { return static_cast<CursorId>(cursor) + 1; }
-    CursorId create_cursor(const Image&, Point) override { return 1; }
-    void destroy_cursor(CursorId) override {}
-    void set_cursor(CursorId) override {}
-    void set_cursor_visible(bool) override {}
+
+    CursorId create_cursor(const Image& image, Point hot_spot) override {
+        require_open("create_cursor");
+        if (!image.width || !image.height || image.rgba.size() < static_cast<std::size_t>(image.width) * image.height * 4)
+            throw std::runtime_error("Alchemy window server: create_cursor: an empty or short image");
+        const xcb_render_pictforminfo_t* format = nullptr;
+        if (const auto* formats = render_formats())
+            format = xcb_render_util_find_standard_format(formats, XCB_PICT_STANDARD_ARGB_32);
+        if (!format) return system_cursor(SystemCursor::arrow);   // no Render: the arrow stands in
+        // Render cursors take premultiplied ARGB32 (BGRA in memory on little-endian hosts).
+        std::vector<std::uint8_t> argb(image.rgba.size());
+        for (std::size_t i = 0; i + 3 < image.rgba.size(); i += 4) {
+            const unsigned alpha = image.rgba[i + 3];
+            argb[i + 0] = static_cast<std::uint8_t>(image.rgba[i + 2] * alpha / 255);
+            argb[i + 1] = static_cast<std::uint8_t>(image.rgba[i + 1] * alpha / 255);
+            argb[i + 2] = static_cast<std::uint8_t>(image.rgba[i + 0] * alpha / 255);
+            argb[i + 3] = static_cast<std::uint8_t>(alpha);
+        }
+        const auto width = static_cast<std::uint16_t>(image.width), height = static_cast<std::uint16_t>(image.height);
+        const xcb_pixmap_t pixmap = xcb_generate_id(connection_);
+        xcb_create_pixmap(connection_, 32, pixmap, screen_->root, width, height);
+        const xcb_gcontext_t gc = xcb_generate_id(connection_);
+        xcb_create_gc(connection_, gc, pixmap, 0, nullptr);
+        xcb_put_image(connection_, XCB_IMAGE_FORMAT_Z_PIXMAP, pixmap, gc, width, height, 0, 0, 0, 32,
+                      static_cast<std::uint32_t>(argb.size()), argb.data());
+        const xcb_render_picture_t picture = xcb_generate_id(connection_);
+        xcb_render_create_picture(connection_, picture, pixmap, format->id, 0, nullptr);
+        const xcb_cursor_t cursor = xcb_generate_id(connection_);
+        xcb_render_create_cursor(connection_, cursor, picture,
+                                 static_cast<std::uint16_t>(std::clamp(hot_spot.x, 0.0, static_cast<double>(width - 1))),
+                                 static_cast<std::uint16_t>(std::clamp(hot_spot.y, 0.0, static_cast<double>(height - 1))));
+        xcb_render_free_picture(connection_, picture);
+        xcb_free_gc(connection_, gc);
+        xcb_free_pixmap(connection_, pixmap);
+        xcb_flush(connection_);
+        const CursorId id = next_cursor_++;
+        custom_cursors_[id] = cursor;
+        return id;
+    }
+
+    void destroy_cursor(CursorId id) override {
+        const auto it = custom_cursors_.find(id);
+        if (it == custom_cursors_.end()) return;   // system cursors stay
+        if (current_cursor_ == it->second) apply_cursor(XCB_NONE);
+        xcb_free_cursor(connection_, it->second);
+        custom_cursors_.erase(it);
+        xcb_flush(connection_);
+    }
+
+    void set_cursor(CursorId id) override {
+        if (!open()) return;
+        xcb_cursor_t cursor = XCB_NONE;
+        if (const auto it = custom_cursors_.find(id); it != custom_cursors_.end()) cursor = it->second;
+        else if (id >= 1 && id <= static_cast<CursorId>(SystemCursor::wait) + 1) cursor = load_system_cursor(static_cast<SystemCursor>(id - 1));
+        apply_cursor(cursor);
+    }
+
+    void set_cursor_visible(bool visible) override {
+        if (!open() || !xfixes_ || visible == cursor_visible_) return;
+        // XFixes hides the cursor while it is over this client's windows.
+        if (visible) xcb_xfixes_show_cursor(connection_, screen_->root);
+        else xcb_xfixes_hide_cursor(connection_, screen_->root);
+        cursor_visible_ = visible;
+        xcb_flush(connection_);
+    }
+
     void warp_cursor(Point screen_location) override {
         require_open("warp_cursor");
-        xcb_warp_pointer(connection_, XCB_NONE, screen_->root, 0, 0, 0, 0, static_cast<std::int16_t>(screen_location.x),
-                         static_cast<std::int16_t>(screen_height() - screen_location.y));
+        const auto [x, y] = to_root(screen_location);
+        xcb_warp_pointer(connection_, XCB_NONE, screen_->root, 0, 0, 0, 0, static_cast<std::int16_t>(x), static_cast<std::int16_t>(y));
         xcb_flush(connection_);
     }
     void associate_mouse_and_cursor(bool) override {}
     void confine_cursor(WindowId, std::optional<Rect>) override {}
 
-    // ---- clipboard (process-local for now) ----
-    std::optional<std::string> clipboard_text() const override { return clipboard_text_; }
+    // ---- clipboard: the X CLIPBOARD selection ----
+    std::optional<std::string> clipboard_text() const override {
+        auto& self = const_cast<X11WindowServer&>(*this);
+        if (!self.open()) return clipboard_text_;
+        if (owns_clipboard()) return clipboard_text_;
+        const auto offered = self.offered_targets();
+        for (const xcb_atom_t target : {utf8_string_, text_plain_utf8_, static_cast<xcb_atom_t>(XCB_ATOM_STRING)}) {
+            if (target == XCB_NONE || (offered && std::find(offered->begin(), offered->end(), target) == offered->end())) continue;
+            if (auto bytes = self.convert_clipboard(target)) return std::string(bytes->begin(), bytes->end());
+        }
+        return std::nullopt;
+    }
+
     void set_clipboard_text(std::string_view text) override {
         clipboard_text_ = std::string(text);
         clipboard_image_.reset();
-        ++clipboard_changes_;
+        clipboard_png_.clear();
+        take_clipboard();
     }
-    std::optional<Image> clipboard_image() const override { return clipboard_image_; }
+
+    std::optional<Image> clipboard_image() const override {
+        auto& self = const_cast<X11WindowServer&>(*this);
+        if (!self.open() || owns_clipboard()) return clipboard_image_;
+        if (png_ == XCB_NONE) return std::nullopt;
+        if (const auto offered = self.offered_targets(); offered && std::find(offered->begin(), offered->end(), png_) == offered->end())
+            return std::nullopt;
+        const auto bytes = self.convert_clipboard(png_);
+        if (!bytes) return std::nullopt;
+        auto pixels = gpu::decode_image(*bytes);
+        if (!pixels) return std::nullopt;
+        return Image{pixels->width, pixels->height, std::move(pixels->rgba)};
+    }
+
     void set_clipboard_image(const Image& image) override {
         clipboard_image_ = image;
         clipboard_text_.reset();
-        ++clipboard_changes_;
+        clipboard_png_.clear();
+        if (auto png = gpu::encode_image(gpu::Pixels{image.width, image.height, image.rgba}, gpu::ImageFormat::png)) clipboard_png_ = std::move(*png);
+        take_clipboard();
     }
-    std::int64_t clipboard_change_count() const override { return clipboard_changes_; }
+
+    std::int64_t clipboard_change_count() const override {
+        // Another client's new selection (XFixes reports it in dispatch_messages;
+        // a changed owner is noticed here as well, between dispatches).
+        auto& self = const_cast<X11WindowServer&>(*this);
+        if (self.open()) {
+            if (auto* reply = xcb_get_selection_owner_reply(connection_, xcb_get_selection_owner(connection_, clipboard_), nullptr)) {
+                if (reply->owner != self.last_clipboard_owner_) {
+                    self.last_clipboard_owner_ = reply->owner;
+                    if (reply->owner != clipboard_window_) ++self.clipboard_changes_;
+                }
+                std::free(reply);
+            }
+        }
+        return clipboard_changes_;
+    }
 
     // ---- screens and keyboard ----
     std::vector<ScreenInfo> screens() const override {
         if (!const_cast<X11WindowServer*>(this)->open()) return {};
-        ScreenInfo info;
-        info.id = 1;
-        info.frame = {{0, 0}, {static_cast<double>(screen_->width_in_pixels), static_cast<double>(screen_->height_in_pixels)}};
-        info.visible_frame = info.frame;
-        info.pixel_width = screen_->width_in_pixels;
-        info.pixel_height = screen_->height_in_pixels;
-        info.millimeters_width = screen_->width_in_millimeters;
-        info.millimeters_height = screen_->height_in_millimeters;
-        info.refresh_rate = 60;
-        info.name = "X11 screen";
-        info.primary = true;
-        return {info};
+        std::vector<ScreenInfo> result;
+        for (const auto& monitor : monitors_) result.push_back(monitor.info);
+        return result;
     }
 
     KeyboardLayout keyboard_layout() const override {
@@ -614,6 +740,43 @@ private:
         net_wm_state_maximized_horz_ = atom("_NET_WM_STATE_MAXIMIZED_HORZ");
         net_wm_state_demands_attention_ = atom("_NET_WM_STATE_DEMANDS_ATTENTION");
         net_active_window_ = atom("_NET_ACTIVE_WINDOW");
+        net_workarea_ = atom("_NET_WORKAREA");
+        clipboard_ = atom("CLIPBOARD");
+        targets_ = atom("TARGETS");
+        incr_ = atom("INCR");
+        text_atom_ = atom("TEXT");
+        text_plain_utf8_ = atom("text/plain;charset=utf-8");
+        png_ = atom("image/png");
+        transfer_ = atom("ALCHEMY_SELECTION");
+        // The hidden window that owns the clipboard and receives conversions.
+        clipboard_window_ = xcb_generate_id(connection_);
+        const std::uint32_t helper_events = XCB_EVENT_MASK_PROPERTY_CHANGE;
+        xcb_create_window(connection_, XCB_COPY_FROM_PARENT, clipboard_window_, screen_->root, -10, -10, 1, 1, 0,
+                          XCB_WINDOW_CLASS_INPUT_ONLY, XCB_COPY_FROM_PARENT, XCB_CW_EVENT_MASK, &helper_events);
+        // RandR (screens and their changes), XFixes (other clients' clipboard
+        // and cursor hiding), Render (colour cursors), xcb-cursor (themes).
+        if (const auto* randr = xcb_get_extension_data(connection_, &xcb_randr_id); randr && randr->present) {
+            if (auto* version = xcb_randr_query_version_reply(connection_, xcb_randr_query_version(connection_, 1, 5), nullptr)) {
+                randr_event_ = randr->first_event;
+                randr_monitors_ = version->major_version > 1 || version->minor_version >= 5;
+                std::free(version);
+                xcb_randr_select_input(connection_, screen_->root, XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE);
+            }
+        }
+        if (const auto* xfixes = xcb_get_extension_data(connection_, &xcb_xfixes_id); xfixes && xfixes->present) {
+            if (auto* version = xcb_xfixes_query_version_reply(connection_, xcb_xfixes_query_version(connection_, 5, 0), nullptr)) {
+                std::free(version);
+                xfixes_ = true;
+                xfixes_event_ = xfixes->first_event;
+                xcb_xfixes_select_selection_input(connection_, clipboard_window_, clipboard_,
+                                                  XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER |
+                                                      XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY |
+                                                      XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE);
+            }
+        }
+        if (xcb_cursor_context_new(connection_, screen_, &cursor_context_) < 0) cursor_context_ = nullptr;
+        refresh_screens();
+        xcb_flush(connection_);
         // Keyboard: xkbcommon's view of the X server's keymap.
         if (xkb_x11_setup_xkb_extension(connection_, XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION,
                                         XKB_X11_SETUP_XKB_EXTENSION_NO_FLAGS, nullptr, nullptr, nullptr, nullptr)) {
@@ -660,12 +823,317 @@ private:
                        reinterpret_cast<const char*>(&message));
     }
 
-    double screen_height() const { return screen_ ? screen_->height_in_pixels : 0; }
-
+    // ---- coordinates: AppKit points from the primary monitor's bottom-left, y up ----
+    Point to_appkit(int root_x, int root_y) const {
+        return {static_cast<double>(root_x - primary_left_), static_cast<double>(primary_bottom_ - root_y)};
+    }
+    std::pair<int, int> to_root(Point point) const {
+        return {static_cast<int>(std::lround(point.x)) + primary_left_, primary_bottom_ - static_cast<int>(std::lround(point.y))};
+    }
     XRect to_x(const Rect& rect) const {
-        return {static_cast<int>(std::lround(rect.origin.x)),
-                static_cast<int>(std::lround(screen_height() - rect.origin.y - rect.size.height)),
+        return {static_cast<int>(std::lround(rect.origin.x)) + primary_left_,
+                primary_bottom_ - static_cast<int>(std::lround(rect.origin.y + rect.size.height)),
                 static_cast<int>(std::lround(rect.size.width)), static_cast<int>(std::lround(rect.size.height))};
+    }
+    Rect from_x(int x, int y, int width, int height) const {
+        return {{static_cast<double>(x - primary_left_), static_cast<double>(primary_bottom_ - (y + height))},
+                {static_cast<double>(width), static_cast<double>(height)}};
+    }
+
+    // ---- screens ----
+    struct MonitorRecord {
+        ScreenInfo info;
+        int x{}, y{}, width{}, height{};   // root pixels
+    };
+
+    std::string atom_name(xcb_atom_t value) {
+        std::string name;
+        if (auto* reply = xcb_get_atom_name_reply(connection_, xcb_get_atom_name(connection_, value), nullptr)) {
+            name.assign(xcb_get_atom_name_name(reply), static_cast<std::size_t>(xcb_get_atom_name_name_length(reply)));
+            std::free(reply);
+        }
+        return name;
+    }
+
+    // The refresh rate of the CRTC that drives `output` (0: unknown).
+    double refresh_rate(xcb_randr_output_t output, const xcb_randr_get_screen_resources_current_reply_t* resources) {
+        if (!resources) return 0;
+        double rate = 0;
+        auto* info = xcb_randr_get_output_info_reply(connection_, xcb_randr_get_output_info(connection_, output, resources->config_timestamp), nullptr);
+        if (!info) return 0;
+        if (info->crtc != XCB_NONE) {
+            if (auto* crtc = xcb_randr_get_crtc_info_reply(connection_, xcb_randr_get_crtc_info(connection_, info->crtc, resources->config_timestamp), nullptr)) {
+                const auto* modes = xcb_randr_get_screen_resources_current_modes(resources);
+                const int count = xcb_randr_get_screen_resources_current_modes_length(resources);
+                for (int i = 0; i < count; ++i)
+                    if (modes[i].id == crtc->mode && modes[i].htotal && modes[i].vtotal)
+                        rate = static_cast<double>(modes[i].dot_clock) / (static_cast<double>(modes[i].htotal) * modes[i].vtotal);
+                std::free(crtc);
+            }
+        }
+        std::free(info);
+        return rate;
+    }
+
+    void refresh_screens() {
+        std::vector<MonitorRecord> found;
+        if (randr_monitors_) {
+            auto* resources = xcb_randr_get_screen_resources_current_reply(
+                connection_, xcb_randr_get_screen_resources_current(connection_, screen_->root), nullptr);
+            if (auto* reply = xcb_randr_get_monitors_reply(connection_, xcb_randr_get_monitors(connection_, screen_->root, 1), nullptr)) {
+                for (auto it = xcb_randr_get_monitors_monitors_iterator(reply); it.rem; xcb_randr_monitor_info_next(&it)) {
+                    const auto* monitor = it.data;
+                    MonitorRecord record;
+                    record.x = monitor->x, record.y = monitor->y, record.width = monitor->width, record.height = monitor->height;
+                    record.info.id = monitor->name ? monitor->name : static_cast<ScreenId>(found.size() + 1);
+                    record.info.name = atom_name(monitor->name);
+                    record.info.primary = monitor->primary;
+                    record.info.pixel_width = monitor->width;
+                    record.info.pixel_height = monitor->height;
+                    record.info.millimeters_width = monitor->width_in_millimeters;
+                    record.info.millimeters_height = monitor->height_in_millimeters;
+                    if (xcb_randr_monitor_info_outputs_length(monitor) > 0)
+                        record.info.refresh_rate = refresh_rate(xcb_randr_monitor_info_outputs(monitor)[0], resources);
+                    found.push_back(std::move(record));
+                }
+                std::free(reply);
+            }
+            std::free(resources);
+        }
+        if (found.empty()) {   // no RandR 1.5 (or no monitors): the root window is the screen
+            MonitorRecord record;
+            record.width = screen_->width_in_pixels, record.height = screen_->height_in_pixels;
+            record.info.id = 1;
+            record.info.name = "X11 screen";
+            record.info.primary = true;
+            record.info.pixel_width = screen_->width_in_pixels;
+            record.info.pixel_height = screen_->height_in_pixels;
+            record.info.millimeters_width = screen_->width_in_millimeters;
+            record.info.millimeters_height = screen_->height_in_millimeters;
+            found.push_back(std::move(record));
+        }
+        // The primary first (NSScreen.screens[0] is the one with the origin).
+        auto primary = std::find_if(found.begin(), found.end(), [](const MonitorRecord& record) { return record.info.primary; });
+        if (primary == found.end()) primary = found.begin();
+        primary->info.primary = true;
+        std::rotate(found.begin(), primary, primary + 1);
+        primary_left_ = found.front().x;
+        primary_bottom_ = found.front().y + found.front().height;
+        // The window manager's work area (_NET_WORKAREA: x, y, width, height of the current desktop).
+        std::optional<XRect> work;
+        if (net_workarea_ != XCB_NONE)
+            if (auto* reply = xcb_get_property_reply(
+                    connection_, xcb_get_property(connection_, 0, screen_->root, net_workarea_, XCB_ATOM_CARDINAL, 0, 4), nullptr)) {
+                if (reply->format == 32 && xcb_get_property_value_length(reply) >= 16) {
+                    const auto* values = static_cast<const std::uint32_t*>(xcb_get_property_value(reply));
+                    work = XRect{static_cast<int>(values[0]), static_cast<int>(values[1]), static_cast<int>(values[2]), static_cast<int>(values[3])};
+                }
+                std::free(reply);
+            }
+        for (auto& record : found) {
+            record.info.frame = from_x(record.x, record.y, record.width, record.height);
+            record.info.visible_frame = record.info.frame;
+            if (work) {
+                const int left = std::max(record.x, work->x), top = std::max(record.y, work->y);
+                const int right = std::min(record.x + record.width, work->x + work->width);
+                const int bottom = std::min(record.y + record.height, work->y + work->height);
+                if (right > left && bottom > top) record.info.visible_frame = from_x(left, top, right - left, bottom - top);
+            }
+        }
+        monitors_ = std::move(found);
+    }
+
+    // ---- cursors ----
+    const xcb_render_query_pict_formats_reply_t* render_formats() {
+        if (!render_formats_ && !render_checked_) {
+            render_checked_ = true;
+            if (const auto* render = xcb_get_extension_data(connection_, &xcb_render_id); render && render->present)
+                render_formats_ = xcb_render_util_query_formats(connection_);
+        }
+        return render_formats_;
+    }
+
+    xcb_cursor_t load_system_cursor(SystemCursor kind) {
+        if (const auto it = system_cursors_.find(kind); it != system_cursors_.end()) return it->second;
+        // Cursor-theme names first (the CSS set), then the core cursor font's.
+        static const std::map<SystemCursor, std::vector<const char*>> names = {
+            {SystemCursor::arrow, {"default", "left_ptr"}},
+            {SystemCursor::ibeam, {"text", "xterm"}},
+            {SystemCursor::crosshair, {"crosshair", "cross"}},
+            {SystemCursor::closed_hand, {"grabbing", "closedhand", "fleur"}},
+            {SystemCursor::open_hand, {"grab", "openhand", "hand1"}},
+            {SystemCursor::pointing_hand, {"pointer", "hand2"}},
+            {SystemCursor::resize_left, {"w-resize", "left_side"}},
+            {SystemCursor::resize_right, {"e-resize", "right_side"}},
+            {SystemCursor::resize_left_right, {"ew-resize", "col-resize", "sb_h_double_arrow"}},
+            {SystemCursor::resize_up, {"n-resize", "top_side"}},
+            {SystemCursor::resize_down, {"s-resize", "bottom_side"}},
+            {SystemCursor::resize_up_down, {"ns-resize", "row-resize", "sb_v_double_arrow"}},
+            {SystemCursor::disappearing_item, {"pirate", "X_cursor"}},
+            {SystemCursor::operation_not_allowed, {"not-allowed", "crossed_circle", "circle"}},
+            {SystemCursor::drag_link, {"alias", "dnd-link", "link"}},
+            {SystemCursor::drag_copy, {"copy", "dnd-copy", "plus"}},
+            {SystemCursor::contextual_menu, {"context-menu", "left_ptr"}},
+            {SystemCursor::ibeam_vertical, {"vertical-text", "xterm"}},
+            {SystemCursor::wait, {"wait", "watch"}},
+        };
+        xcb_cursor_t cursor = XCB_NONE;
+        if (cursor_context_)
+            if (const auto it = names.find(kind); it != names.end())
+                for (const char* name : it->second)
+                    if ((cursor = xcb_cursor_load_cursor(cursor_context_, name)) != XCB_NONE) break;
+        system_cursors_[kind] = cursor;
+        return cursor;
+    }
+
+    // X cursors belong to windows: set_cursor's cursor goes on every window
+    // (and on the ones created later).
+    void apply_cursor(xcb_cursor_t cursor) {
+        current_cursor_ = cursor;
+        for (const auto& [id, record] : windows_) xcb_change_window_attributes(connection_, record.xid, XCB_CW_CURSOR, &cursor);
+        xcb_flush(connection_);
+    }
+
+    // ---- clipboard ----
+    bool owns_clipboard() const noexcept { return owns_clipboard_; }
+
+    void take_clipboard() {
+        ++clipboard_changes_;
+        if (!open()) return;
+        xcb_set_selection_owner(connection_, clipboard_window_, clipboard_, XCB_CURRENT_TIME);
+        owns_clipboard_ = false;
+        if (auto* reply = xcb_get_selection_owner_reply(connection_, xcb_get_selection_owner(connection_, clipboard_), nullptr)) {
+            owns_clipboard_ = reply->owner == clipboard_window_;
+            last_clipboard_owner_ = reply->owner;
+            std::free(reply);
+        }
+    }
+
+    // Waits (up to `timeout_ms`) for the next event `accept` takes; other
+    // events queue for dispatch_messages.
+    template <class Accept>
+    xcb_generic_event_t* wait_for_event(Accept accept, int timeout_ms) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        for (;;) {
+            while (auto* event = xcb_poll_for_event(connection_)) {
+                if (accept(event)) return event;
+                linux_gui::pending().push_back(event);
+            }
+            if (xcb_connection_has_error(connection_) || std::chrono::steady_clock::now() >= deadline) return nullptr;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+
+    // The targets the clipboard's owner offers (nullopt: it does not say, so
+    // every target is worth asking for).
+    std::optional<std::vector<xcb_atom_t>> offered_targets() {
+        const auto bytes = convert_clipboard(targets_);
+        if (!bytes || bytes->size() < sizeof(xcb_atom_t)) return std::nullopt;
+        std::vector<xcb_atom_t> atoms(bytes->size() / sizeof(xcb_atom_t));
+        std::memcpy(atoms.data(), bytes->data(), atoms.size() * sizeof(xcb_atom_t));
+        return atoms;
+    }
+
+    // Another client's clipboard as `target` (INCR transfers included).
+    std::optional<std::vector<std::uint8_t>> convert_clipboard(xcb_atom_t target) {
+        xcb_delete_property(connection_, clipboard_window_, transfer_);
+        xcb_convert_selection(connection_, clipboard_window_, clipboard_, target, transfer_, XCB_CURRENT_TIME);
+        xcb_flush(connection_);
+        auto* notify = wait_for_event(
+            [&](xcb_generic_event_t* event) {
+                return (event->response_type & 0x7f) == XCB_SELECTION_NOTIFY &&
+                       reinterpret_cast<xcb_selection_notify_event_t*>(event)->requestor == clipboard_window_;
+            },
+            1000);
+        if (!notify) return std::nullopt;
+        const auto property = reinterpret_cast<xcb_selection_notify_event_t*>(notify)->property;
+        std::free(notify);
+        if (property == XCB_NONE) return std::nullopt;   // the owner cannot give that target
+        const auto read = [&](bool& incremental) -> std::optional<std::vector<std::uint8_t>> {
+            auto* reply = xcb_get_property_reply(
+                connection_, xcb_get_property(connection_, 1, clipboard_window_, transfer_, XCB_GET_PROPERTY_TYPE_ANY, 0, 0x1fffffff), nullptr);
+            if (!reply) return std::nullopt;
+            incremental = reply->type == incr_;
+            const auto* data = static_cast<const std::uint8_t*>(xcb_get_property_value(reply));
+            std::vector<std::uint8_t> bytes(data, data + xcb_get_property_value_length(reply));
+            std::free(reply);
+            return bytes;
+        };
+        bool incremental = false;
+        auto bytes = read(incremental);
+        if (!bytes || !incremental) return bytes;
+        // INCR: the owner writes chunks; each delete asks for the next, an empty one ends it.
+        std::vector<std::uint8_t> whole;
+        xcb_flush(connection_);
+        for (;;) {
+            auto* event = wait_for_event(
+                [&](xcb_generic_event_t* candidate) {
+                    const auto* change = reinterpret_cast<xcb_property_notify_event_t*>(candidate);
+                    return (candidate->response_type & 0x7f) == XCB_PROPERTY_NOTIFY && change->window == clipboard_window_ &&
+                           change->atom == transfer_ && change->state == XCB_PROPERTY_NEW_VALUE;
+                },
+                2000);
+            if (!event) return std::nullopt;
+            std::free(event);
+            bool more = false;
+            auto chunk = read(more);
+            xcb_flush(connection_);
+            if (!chunk) return std::nullopt;
+            if (chunk->empty()) return whole;
+            whole.insert(whole.end(), chunk->begin(), chunk->end());
+        }
+    }
+
+    // Another client asks for our clipboard.
+    void answer_selection_request(const xcb_selection_request_event_t& request) {
+        xcb_selection_notify_event_t notify{};
+        notify.response_type = XCB_SELECTION_NOTIFY;
+        notify.time = request.time;
+        notify.requestor = request.requestor;
+        notify.selection = request.selection;
+        notify.target = request.target;
+        notify.property = XCB_NONE;
+        const xcb_atom_t property = request.property != XCB_NONE ? request.property : request.target;   // obsolete clients
+        const std::size_t limit = static_cast<std::size_t>(xcb_get_maximum_request_length(connection_)) * 4 - 64;
+        const auto put = [&](xcb_atom_t type, std::uint8_t format, std::uint32_t count, const void* data) {
+            xcb_change_property(connection_, XCB_PROP_MODE_REPLACE, request.requestor, property, type, format, count, data);
+            notify.property = property;
+        };
+        if (request.selection == clipboard_ && owns_clipboard_) {
+            const bool text = clipboard_text_.has_value();
+            const bool image = !clipboard_png_.empty();
+            if (request.target == targets_) {
+                std::vector<xcb_atom_t> offered{targets_};
+                if (text) offered.insert(offered.end(), {utf8_string_, text_plain_utf8_, static_cast<xcb_atom_t>(XCB_ATOM_STRING), text_atom_});
+                if (image) offered.push_back(png_);
+                put(XCB_ATOM_ATOM, 32, static_cast<std::uint32_t>(offered.size()), offered.data());
+            } else if (text && (request.target == utf8_string_ || request.target == text_plain_utf8_ || request.target == text_atom_ ||
+                                request.target == XCB_ATOM_STRING)) {
+                // STRING is Latin-1: characters past it become '?'.
+                std::string bytes = *clipboard_text_;
+                if (request.target == XCB_ATOM_STRING) {
+                    std::string latin;
+                    for (std::size_t i = 0; i < bytes.size();) {
+                        const auto lead = static_cast<unsigned char>(bytes[i]);
+                        char32_t c = lead;
+                        std::size_t length = 1;
+                        if (lead >= 0xc0 && lead < 0xe0 && i + 1 < bytes.size()) c = ((lead & 0x1f) << 6) | (bytes[i + 1] & 0x3f), length = 2;
+                        else if (lead >= 0xe0 && lead < 0xf0) c = 0xfffd, length = 3;
+                        else if (lead >= 0xf0) c = 0xfffd, length = 4;
+                        latin += c < 0x100 ? static_cast<char>(c) : '?';
+                        i += length;
+                    }
+                    bytes = std::move(latin);
+                }
+                if (bytes.size() <= limit)
+                    put(request.target == XCB_ATOM_STRING ? XCB_ATOM_STRING : utf8_string_, 8, static_cast<std::uint32_t>(bytes.size()),
+                        bytes.data());
+            } else if (image && request.target == png_ && clipboard_png_.size() <= limit) {
+                put(png_, 8, static_cast<std::uint32_t>(clipboard_png_.size()), clipboard_png_.data());
+            }
+        }
+        xcb_send_event(connection_, 0, request.requestor, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char*>(&notify));
+        xcb_flush(connection_);
     }
 
     WindowRecord& find(WindowId window, const char* operation) {
@@ -712,7 +1180,7 @@ private:
         event.owner = record.owner;
         event.timestamp = gui::monotonic_seconds();
         event.location = {static_cast<double>(x), record.content.size.height - y};
-        event.screen_location = {static_cast<double>(root_x), screen_height() - root_y};
+        event.screen_location = to_appkit(root_x, root_y);
         event.modifier_flags = modifiers_;
         event.pressed_buttons = buttons_;
     }
@@ -860,8 +1328,7 @@ private:
             root_y = reply->dst_y;
             std::free(reply);
         }
-        const Rect content{{static_cast<double>(root_x), screen_height() - root_y - configure.height},
-                           {static_cast<double>(configure.width), static_cast<double>(configure.height)}};
+        const Rect content = from_x(root_x, root_y, configure.width, configure.height);
         const bool resized = content.size.width != record->content.size.width || content.size.height != record->content.size.height;
         const bool moved = content.origin.x != record->content.origin.x || content.origin.y != record->content.origin.y;
         record->content = content;
@@ -973,7 +1440,26 @@ private:
                 deliver_application(Notification::keyboard_layout_changed);
             }
             return;
-        default: return;
+        case XCB_SELECTION_REQUEST: answer_selection_request(*reinterpret_cast<xcb_selection_request_event_t*>(generic)); return;
+        case XCB_SELECTION_CLEAR: {
+            const auto& clear = *reinterpret_cast<xcb_selection_clear_event_t*>(generic);
+            if (clear.selection != clipboard_ || clear.owner != clipboard_window_) return;
+            owns_clipboard_ = false;   // another client took the clipboard
+            if (!xfixes_) ++clipboard_changes_;
+            return;
+        }
+        default: break;
+        }
+        const auto kind = generic->response_type & 0x7f;
+        if (randr_event_ && kind == randr_event_ + XCB_RANDR_SCREEN_CHANGE_NOTIFY) {
+            refresh_screens();
+            deliver_application(Notification::screens_changed);
+        } else if (xfixes_ && kind == xfixes_event_ + XCB_XFIXES_SELECTION_NOTIFY) {
+            const auto& change = *reinterpret_cast<xcb_xfixes_selection_notify_event_t*>(generic);
+            if (change.selection == clipboard_ && change.owner != clipboard_window_) {
+                ++clipboard_changes_;
+                last_clipboard_owner_ = change.owner;
+            }
         }
     }
 
@@ -983,7 +1469,29 @@ private:
     xcb_gcontext_t gc_{};
     xcb_atom_t wm_protocols_{}, wm_delete_window_{}, wm_change_state_{}, net_wm_name_{}, utf8_string_{}, net_wm_state_{},
         net_wm_state_above_{}, net_wm_state_fullscreen_{}, net_wm_state_maximized_vert_{}, net_wm_state_maximized_horz_{},
-        net_wm_state_demands_attention_{}, net_active_window_{};
+        net_wm_state_demands_attention_{}, net_active_window_{}, net_workarea_{}, clipboard_{}, targets_{}, incr_{},
+        text_atom_{}, text_plain_utf8_{}, png_{}, transfer_{};
+    // Extensions.
+    std::uint8_t randr_event_{}, xfixes_event_{};
+    bool randr_monitors_{}, xfixes_{};
+    const xcb_render_query_pict_formats_reply_t* render_formats_{};
+    bool render_checked_{};
+    xcb_cursor_context_t* cursor_context_{};
+    // Screens: the primary monitor's left and bottom edges in root pixels
+    // (AppKit's origin).
+    std::vector<MonitorRecord> monitors_;
+    int primary_left_{}, primary_bottom_{};
+    // Cursors.
+    std::map<SystemCursor, xcb_cursor_t> system_cursors_;
+    std::map<CursorId, xcb_cursor_t> custom_cursors_;
+    CursorId next_cursor_{1000};
+    xcb_cursor_t current_cursor_{XCB_NONE};
+    bool cursor_visible_{true};
+    // Clipboard.
+    xcb_window_t clipboard_window_{};
+    bool owns_clipboard_{};
+    xcb_window_t last_clipboard_owner_{};
+    std::vector<std::uint8_t> clipboard_png_;
     xkb_context* xkb_context_{};
     xkb_keymap* keymap_{};
     xkb_state* xkb_state_{};
@@ -1010,25 +1518,76 @@ private:
 
 std::unique_ptr<WindowSystem> create_window_server() { return std::make_unique<X11WindowServer>(); }
 
+namespace {
+
+// EDID manufacturer and product codes (bytes 8-11) of a RandR output.
+void read_edid(xcb_connection_t* connection, xcb_randr_output_t output, Monitor& monitor) {
+    static constexpr char name[] = "EDID";
+    auto* atom = xcb_intern_atom_reply(connection, xcb_intern_atom(connection, 1, sizeof(name) - 1, name), nullptr);
+    if (!atom) return;
+    const auto edid = atom->atom;
+    std::free(atom);
+    if (edid == XCB_NONE) return;
+    auto* reply = xcb_randr_get_output_property_reply(
+        connection, xcb_randr_get_output_property(connection, output, edid, XCB_GET_PROPERTY_TYPE_ANY, 0, 32, 0, 0), nullptr);
+    if (!reply) return;
+    if (reply->format == 8 && xcb_randr_get_output_property_data_length(reply) >= 12) {
+        const auto* bytes = xcb_randr_get_output_property_data(reply);
+        monitor.edid_vendor = static_cast<std::uint16_t>((bytes[8] << 8) | bytes[9]);
+        monitor.edid_product = static_cast<std::uint16_t>(bytes[10] | (bytes[11] << 8));
+    }
+    std::free(reply);
+}
+
+} // namespace
+
 Result<PixelSize> window_client_size(std::uintptr_t window) {
-    auto* connection = linux_gui::connection();
-    if (!connection) return Error::not_found;
-    auto* reply = xcb_get_geometry_reply(connection, xcb_get_geometry(connection, static_cast<xcb_window_t>(window)), nullptr);
+    linux_gui::AnyConnection any;
+    if (!any.connection) return Error::unsupported;
+    auto* reply = xcb_get_geometry_reply(any.connection, xcb_get_geometry(any.connection, static_cast<xcb_window_t>(window)), nullptr);
     if (!reply) return Error::not_found;
     const PixelSize size{reply->width, reply->height};
     std::free(reply);
     return size;
 }
 
+// RandR 1.5 monitors (with their outputs' EDID), else the root window.
 Result<std::vector<Monitor>> monitors() {
-    auto* connection = linux_gui::connection();
-    if (!connection) return Error::unsupported;
-    const auto* screen = xcb_setup_roots_iterator(xcb_get_setup(connection)).data;
-    Monitor monitor;
-    monitor.width = screen->width_in_pixels;
-    monitor.height = screen->height_in_pixels;
-    monitor.primary = true;
-    return std::vector<Monitor>{monitor};
+    linux_gui::AnyConnection any;
+    if (!any.connection) return Error::unsupported;
+    std::vector<Monitor> result;
+    if (const auto* randr = xcb_get_extension_data(any.connection, &xcb_randr_id); randr && randr->present) {
+        auto* version = xcb_randr_query_version_reply(any.connection, xcb_randr_query_version(any.connection, 1, 5), nullptr);
+        const bool has_monitors = version && (version->major_version > 1 || version->minor_version >= 5);
+        std::free(version);
+        if (has_monitors)
+            if (auto* reply = xcb_randr_get_monitors_reply(any.connection, xcb_randr_get_monitors(any.connection, any.screen->root, 1), nullptr)) {
+                for (auto it = xcb_randr_get_monitors_monitors_iterator(reply); it.rem; xcb_randr_monitor_info_next(&it)) {
+                    Monitor monitor;
+                    monitor.left = it.data->x;
+                    monitor.top = it.data->y;
+                    monitor.width = it.data->width;
+                    monitor.height = it.data->height;
+                    monitor.primary = it.data->primary;
+                    if (xcb_randr_monitor_info_outputs_length(it.data) > 0)
+                        read_edid(any.connection, xcb_randr_monitor_info_outputs(it.data)[0], monitor);
+                    result.push_back(monitor);
+                }
+                std::free(reply);
+            }
+    }
+    if (result.empty()) {
+        Monitor monitor;
+        monitor.width = any.screen->width_in_pixels;
+        monitor.height = any.screen->height_in_pixels;
+        result.push_back(monitor);
+    }
+    // One primary: RandR's, else the one at the desktop origin, else the first.
+    if (std::none_of(result.begin(), result.end(), [](const Monitor& monitor) { return monitor.primary; })) {
+        const auto origin = std::find_if(result.begin(), result.end(), [](const Monitor& monitor) { return monitor.left == 0 && monitor.top == 0; });
+        (origin != result.end() ? *origin : result.front()).primary = true;
+    }
+    return result;
 }
 
 } // namespace alchemy::host::ui

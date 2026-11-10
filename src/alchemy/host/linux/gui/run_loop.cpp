@@ -26,7 +26,7 @@ constexpr std::size_t kWaitLimit = 63;   // plus the X socket
 std::size_t wait_limit() noexcept { return kWaitLimit; }
 
 Result<std::size_t> wait_for_input(std::span<const Handle> handles, std::uint32_t timeout_ms, bool messages) {
-    if (handles.size() > kWaitLimit) return Error::invalid_argument;
+    if (handles.size() > kWaitLimit || (handles.empty() && !messages)) return Error::invalid_argument;   // nothing to wait for
     auto* connection = messages ? linux_gui::connection() : nullptr;
     const bool forever = timeout_ms == 0xffffffffu;
     const auto deadline = time::monotonic_ns() + static_cast<std::uint64_t>(timeout_ms) * 1000000;
