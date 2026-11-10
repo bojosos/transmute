@@ -13,6 +13,12 @@
 #   job's alchemy-fx and fails only on regressions against scripts/conformance/baseline/.
 #   Pushes and pull requests run the tests the baseline expects to pass; the weekly run and runs
 #   started by hand run every test.
+#
+# * linux: the Linux port (docs/ALCHEMY_HOST_LINUX.md) on a GitHub-hosted Ubuntu runner with
+#   Clang 21, for both host backends. ALCHEMY_HOST=linux builds and runs the tests listed in
+#   scripts/ci/linux_tests.txt (the ones correct on Linux today; that file says what is left
+#   out and why) and alchemy_gui_host on Xvfb. ALCHEMY_HOST=null builds alchemy with the OS
+#   headers poisoned and runs alchemy_host.
 name: CI
 
 on:
@@ -82,6 +88,91 @@ jobs:
         run: |
           ctest --test-dir build -C Release -j 2 --output-on-failure --timeout 900 --repeat until-pass:3
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # The Linux port. Clang 21 from apt.llvm.org (the code is built and tested with Clang 21; the
+  # runner's own Clang is older), the distribution's -dev packages for the Linux host, ccache
+  # between runs. Guest runs are cloaked and loopback-only, as on Windows.
+  linux:
+    name: Linux x64 (Release, ALCHEMY_HOST=${{ matrix.host }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [linux, null]
+    env:
+      ALCHEMY_GUI_CLOAK: "1"
+      ALCHEMY_GUI_NO_ACTIVATE: "1"
+      ALCHEMY_GUI_NO_CRASH_DIALOG: "1"
+      ALCHEMY_NETWORK: loopback
+      # Skipped host-test area, with its reason:
+      # power: logind's Inhibit needs a user session's polkit rights, which the runner's
+      #   service account does not have (it passes in a desktop session).
+      ALCHEMY_HOST_TEST_SKIP_AREAS: power
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Clang 21 and the Linux host's packages
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 21
+          sudo apt-get update
+          # The Linux host's libraries (cmake/AlchemyHost.cmake), GStreamer's headers (codecs are
+          # loaded at run time), and for the tests: Xvfb, Mesa's lavapipe Vulkan driver, fonts.
+          sudo apt-get install -y --no-install-recommends ninja-build ccache \
+            libxcb1-dev libxcb-xkb-dev libxcb-cursor-dev libxcb-icccm4-dev libxcb-randr0-dev \
+            libxcb-xfixes0-dev libxcb-render0-dev libxcb-render-util0-dev libxcb-screensaver0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libpango1.0-dev libcairo2-dev libfreetype-dev libfontconfig-dev libharfbuzz-dev \
+            libturbojpeg0-dev libpng-dev libtiff-dev libgif-dev \
+            libcurl4-openssl-dev libssl-dev libpulse-dev libasound2-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libvulkan-dev mesa-vulkan-drivers xvfb fonts-dejavu-core fonts-liberation
+
+      - name: Restore the compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-linux-${{ matrix.host }}-${{ github.sha }}
+          restore-keys: ccache-linux-${{ matrix.host }}-
+
+      - name: Configure
+        run: |
+          llvm=/usr/lib/llvm-21/bin
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=$llvm/clang -DCMAKE_CXX_COMPILER=$llvm/clang++ -DCMAKE_LINKER_TYPE=LLD \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DALCHEMY_CLANG=$llvm/clang -DALCHEMY_LD64_LLD=$llvm/ld64.lld \
+            -DTRANSMUTE_WITH_FX=ON -DALCHEMY_HOST=${{ matrix.host }}
+
+      - name: Build (null)
+        if: matrix.host == 'null'
+        run: cmake --build build --target alchemy alchemy_host_tests
+
+      - name: Build (linux)
+        if: matrix.host == 'linux'
+        run: |
+          python3 scripts/ci/linux_ctest.py build build scripts/ci/linux_tests.txt
+          cmake --build build --target alchemy_gui_host
+
+      - name: Test (null)
+        if: matrix.host == 'null'
+        run: ctest --test-dir build -R '^alchemy_host$' --output-on-failure --timeout 600
+
+      - name: Test (linux)
+        if: matrix.host == 'linux'
+        run: python3 scripts/ci/linux_ctest.py test build scripts/ci/linux_tests.txt
+
+      # alchemy_gui_host's window server, screens, cursors and input queries need an X server.
+      - name: Test alchemy_gui_host (linux, Xvfb)
+        if: matrix.host == 'linux'
+        run: xvfb-run -a -s "-screen 0 1280x800x24" ctest --test-dir build -R '^alchemy_gui_host$' --output-on-failure --timeout 600
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats
 
   # Six open-source suites, built as SDK-free arm64 macOS programs the way conformance-macos.yml
   # builds them, run under the fx job's alchemy-fx. `conformance.py gate` fails the job only when a

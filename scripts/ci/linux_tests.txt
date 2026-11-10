@@ -1,0 +1,212 @@
+# The ctest tests the Linux CI job runs (.github/workflows/ci.yml, job "linux";
+# scripts/ci/linux_ctest.py builds what they need and runs them). They are the
+# tests that pass on Linux today, headless, with a clean environment
+# (no session bus, no audio server, no display). alchemy_gui_host runs in its
+# own step on Xvfb.
+#
+# Left out, with the reason (counts at 79dd8df0 + the Linux batch, 2026-11-10):
+# - 53 test targets do not build on Linux: Windows-only test sources (the PE
+#   loader, the Win64 ABI and SEH, the x64 JIT, the Win32 window server's
+#   tables, ...).
+# - 29 run their guests through the x64 JIT, which is built for Windows only
+#   (src/jit_x64_unavailable.cpp elsewhere): alchemy_objc*, alchemy_threads,
+#   the CF/Foundation/dispatch workloads, ...
+# - 7 need an X display (they pass on a local Xvfb): alchemy_gui_window_events,
+#   alchemy_gui_text_input, alchemy_gui_metal_triangle(_resize),
+#   alchemy_gui_metal_iosurface_present, alchemy_gui_metalkit_view,
+#   alchemy_gui_quartzcore_backingstore.
+# - 3 pass Mach ports or IOSurfaces between processes, which needs descriptor
+#   passing (SCM_RIGHTS) on Linux, not written yet: alchemy_fx_mach_cross,
+#   alchemy_gui_metal_iosurface_cross, alchemy_gui_quartzcore_iosurface_cross.
+# - 1 registers a Bonjour service (alchemy_gui_bonjour_fixture; it fails on
+#   the Windows runner too).
+# - 20 fail on Linux gaps still open, each a follow-up:
+#   alchemy_fx_crash_report, alchemy_gui_appkit_controls_behaviour,
+#   alchemy_gui_appkit_unit and alchemy_gui_appkit_windows_unit (Windows
+#   paths in expectations), alchemy_gui_corefoundation_additions (the en_US
+#   short date pattern), alchemy_gui_coreservices and
+#   alchemy_gui_coretext_unit (case-insensitive compares),
+#   alchemy_gui_coreservices_system_services, alchemy_gui_coretext_fonts and
+#   alchemy_gui_framework_cases (they need C:/Windows/Fonts/arial.ttf),
+#   alchemy_gui_devices (power messages), alchemy_gui_foundation_bundle_fixture,
+#   alchemy_gui_foundation_runtime (enumerator order),
+#   alchemy_gui_libsystem_foundation, alchemy_gui_libsystem_gaps (idle ticks),
+#   alchemy_metal_objects, alchemy_objc_unsupported, alchemy_python_loader,
+#   alchemy_services, alchemy_services_process.
+alchemy_cli
+alchemy_core_foundation
+alchemy_darwin
+alchemy_dispatch
+alchemy_doctor_json
+alchemy_engine
+alchemy_fx_exec_fault
+alchemy_fx_exec_fault_plain
+alchemy_fx_inline_cache
+alchemy_fx_inline_cache_ic1
+alchemy_fx_inline_cache_off
+alchemy_fx_leaf_calls
+alchemy_fx_leaf_calls_globals
+alchemy_fx_leaf_calls_handlers
+alchemy_fx_leaf_calls_no_alloc_leaf
+alchemy_fx_leaf_calls_no_probe_leaf
+alchemy_fx_mach_ports
+alchemy_fx_table_shadow
+alchemy_fx_table_shadow_off
+alchemy_fx_tlv
+alchemy_gui_accelerate
+alchemy_gui_accessibility
+alchemy_gui_appkit_api
+alchemy_gui_appkit_controls_unit
+alchemy_gui_appkit_drawing
+alchemy_gui_appkit_events
+alchemy_gui_appkit_fixture
+alchemy_gui_appkit_smoke
+alchemy_gui_appkit_text_alignment
+alchemy_gui_appkit_windows
+alchemy_gui_appkit_workspace
+alchemy_gui_applicationservices
+alchemy_gui_authenticationservices
+alchemy_gui_avfaudio
+alchemy_gui_colorsync
+alchemy_gui_compression_unit
+alchemy_gui_controls_fixture
+alchemy_gui_coredata
+alchemy_gui_corefoundation_allocators
+alchemy_gui_corefoundation_collections
+alchemy_gui_corefoundation_gaps
+alchemy_gui_corefoundation_string_clusters
+alchemy_gui_corefoundation_strings
+alchemy_gui_corefoundation_strings_fixture
+alchemy_gui_corefoundation_time_zones_and_uuids
+alchemy_gui_coregraphics_displays
+alchemy_gui_coregraphics_events
+alchemy_gui_coregraphics_pdf
+alchemy_gui_corehaptics
+alchemy_gui_coremediaio
+alchemy_gui_coreml
+alchemy_gui_coreservices_application_registry
+alchemy_gui_coreservices_carbon_core
+alchemy_gui_coreservices_file_manager
+alchemy_gui_coreservices_launch_services
+alchemy_gui_coreservices_uttype
+alchemy_gui_cryptotokenkit
+alchemy_gui_diskarbitration
+alchemy_gui_dispatch_api
+alchemy_gui_dispatch_data
+alchemy_gui_dispatch_objects
+alchemy_gui_foundation_archive_fixture
+alchemy_gui_foundation_bundles
+alchemy_gui_foundation_cf_time_fixture
+alchemy_gui_foundation_core_classes
+alchemy_gui_foundation_data_unit
+alchemy_gui_foundation_date_classes
+alchemy_gui_foundation_file_attribute_keys
+alchemy_gui_foundation_gaps
+alchemy_gui_foundation_kvs_and_item_providers
+alchemy_gui_foundation_metadata_and_hosts
+alchemy_gui_foundation_proxy
+alchemy_gui_foundation_streams
+alchemy_gui_foundation_support_unit
+alchemy_gui_foundation_thread_fixture
+alchemy_gui_foundation_urls
+alchemy_gui_foundation_value_classes
+alchemy_gui_fwgaps
+alchemy_gui_gss
+alchemy_gui_guest_services
+alchemy_gui_iokit_gpu
+alchemy_gui_iokit_registry
+alchemy_gui_launchd_service_management
+alchemy_gui_libc_extra
+alchemy_gui_libiconv
+alchemy_gui_libsystem_errno
+alchemy_gui_link_smoke
+alchemy_gui_localauthenticationembeddedui
+alchemy_gui_mach_ipc
+alchemy_gui_mach_ipc_teardown_entry
+alchemy_gui_mach_ipc_teardown_mapped-entry
+alchemy_gui_mach_ipc_teardown_vm
+alchemy_gui_machsys
+alchemy_gui_media_capture
+alchemy_gui_media_codecs
+alchemy_gui_media_unit
+alchemy_gui_mediaplayer
+alchemy_gui_metal_compute
+alchemy_gui_metal_iosurface
+alchemy_gui_metal_iosurface_staged
+alchemy_gui_metalfx
+alchemy_gui_network_cookies
+alchemy_gui_network_framework
+alchemy_gui_objc_dispatch_encoding
+alchemy_gui_objc_exception_types
+alchemy_gui_objc_fx_cache_abi
+alchemy_gui_objc_fx_cache_arc
+alchemy_gui_objc_fx_cache_blocks
+alchemy_gui_objc_fx_cache_cf_bridge
+alchemy_gui_objc_fx_cache_dispatch
+alchemy_gui_objc_fx_cache_weak
+alchemy_gui_objc_fx_cache_worker_pools
+alchemy_gui_objc_fx_nocache_abi
+alchemy_gui_objc_fx_nocache_arc
+alchemy_gui_objc_fx_nocache_blocks
+alchemy_gui_objc_fx_nocache_cf_bridge
+alchemy_gui_objc_fx_nocache_dispatch
+alchemy_gui_objc_fx_nocache_weak
+alchemy_gui_objc_fx_nocache_worker_pools
+alchemy_gui_objc_runtime
+alchemy_gui_objc_smoke
+alchemy_gui_openal
+alchemy_gui_opendirectory
+alchemy_gui_opengl
+alchemy_gui_quartz2d_fixture
+alchemy_gui_quartz2d_unit
+alchemy_gui_quartzcore_core_image
+alchemy_gui_quartzcore_graphics
+alchemy_gui_quartzcore_graphics_math
+alchemy_gui_quartzcore_layer_kinds
+alchemy_gui_quartzcore_layer_tree
+alchemy_gui_quartzcore_renderer
+alchemy_gui_quartzcore_smoke
+alchemy_gui_quicklookthumbnailing
+alchemy_gui_quicklookui
+alchemy_gui_registration_audit
+alchemy_gui_runloop_fixture
+alchemy_gui_runloop_probe
+alchemy_gui_runloop_smoke
+alchemy_gui_safariservices
+alchemy_gui_screencapturekit
+alchemy_gui_screencapturekit_own_content
+alchemy_gui_security_crypto
+alchemy_gui_security_cssm_and_tasks
+alchemy_gui_security_md4
+alchemy_gui_securityinterface
+alchemy_gui_servicemanagement
+alchemy_gui_skylight
+alchemy_gui_storekit
+alchemy_gui_sysconfig
+alchemy_gui_systemconfiguration_errors_and_aliases
+alchemy_gui_systemextensions
+alchemy_gui_terminal
+alchemy_gui_usernotifications
+alchemy_gui_value_provider
+alchemy_gui_vision
+alchemy_gui_windowserver_smoke
+alchemy_gui_xpc
+alchemy_gui_zlib
+alchemy_host
+alchemy_install
+alchemy_launchd_units
+alchemy_mach_vm
+alchemy_macho
+alchemy_metal_external_memory
+alchemy_metal_probe
+alchemy_metal_smoke
+alchemy_metal_vulkan
+alchemy_msl_smoke
+alchemy_network
+alchemy_objc_doctor
+alchemy_objc_metadata
+alchemy_objects
+alchemy_process
+alchemy_python_services
+fx_emit_neon_tests
+fx_host_tests
