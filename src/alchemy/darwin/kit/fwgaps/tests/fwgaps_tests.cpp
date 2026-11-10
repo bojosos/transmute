@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cmath>
+#include <iostream>
 
 namespace {
 using namespace fill_test;
@@ -137,7 +138,24 @@ void core_text(Fixture& f) {
     bool cmap = false;
     for (std::uint64_t i = 0; i < f.call(cf, "_CFArrayGetCount", {tables}); ++i) cmap = cmap || f.call(cf, "_CFArrayGetValueAtIndex", {tables, i}) == 0x636d6170;
     require(cmap, "cmap table listed");
-    require(f.call(ct, "_CTFontCopyVariationAxes", {font}) == 0, "variations not modelled");
+    require(f.call(ct, "_CTFontCopyVariationAxes", {font}) == 0, "a font without fvar has no variation axes");
+    // A variable font (Bahnschrift: weight 300-700, width 75-100): its axes and current (default) values.
+    registers.x[0] = string(f, "Bahnschrift");
+    const auto variable = f.regs(ct, "_CTFontCreateWithName", registers).x0;
+    if (!variable || f.cf.utf8(f.call(ct, "_CTFontCopyFamilyName", {variable})) != "Bahnschrift") {
+        std::cout << "no Bahnschrift on this host: variable-font checks skipped" << std::endl;
+        return;
+    }
+    const auto axes = f.call(ct, "_CTFontCopyVariationAxes", {variable});
+    require(axes && f.call(cf, "_CFArrayGetCount", {axes}) == 2, "Bahnschrift's two axes");
+    const auto weight = f.call(cf, "_CFArrayGetValueAtIndex", {axes, 0});
+    const auto identifier = f.call(cf, "_CFDictionaryGetValue", {weight, f.engine.read64(f.symbol(ct, "_kCTFontVariationAxisIdentifierKey"))});
+    const auto name = f.call(cf, "_CFDictionaryGetValue", {weight, f.engine.read64(f.symbol(ct, "_kCTFontVariationAxisNameKey"))});
+    const auto maximum = f.call(cf, "_CFDictionaryGetValue", {weight, f.engine.read64(f.symbol(ct, "_kCTFontVariationAxisMaximumValueKey"))});
+    require(f.cf.number_value(identifier).value_or(0) == 0x77676874 && f.cf.utf8(name) == "Weight" && f.cf.number_value(maximum).value_or(0) == 700,
+            "the weight axis: 'wght', named Weight, up to 700");
+    const auto variation = f.call(ct, "_CTFontCopyVariation", {variable});
+    require(variation && f.call(cf, "_CFDictionaryGetCount", {variation}) == 2, "the current variation");
 }
 
 void core_text_keys(Fixture& f) {
@@ -202,7 +220,21 @@ void media(Fixture& f) {
     bool cmap = false;
     for (std::uint64_t i = 0; i < f.call(cf, "_CFArrayGetCount", {tags}); ++i) cmap = cmap || f.call(cf, "_CFArrayGetValueAtIndex", {tags, i}) == 0x636d6170;
     require(cmap, "CGFontCopyTableTags lists cmap");
-    require(f.call(cg, "_CGFontCopyVariationAxes", {font}) == 0, "font variations are not modelled");
+    require(f.call(cg, "_CGFontCopyVariationAxes", {font}) == 0 && f.call(cg, "_CGFontCopyVariations", {font}) == 0,
+            "a font without fvar has no variations");
+    const auto bahnschrift = f.call(cg, "_CGFontCreateWithFontName", {string(f, "Bahnschrift")});
+    const auto cg_axes = bahnschrift ? f.call(cg, "_CGFontCopyVariationAxes", {bahnschrift}) : 0;
+    const auto cg_family = bahnschrift ? f.call(cg, "_CGFontCopyFullName", {bahnschrift}) : 0;
+    if (cg_family && f.cf.utf8(cg_family).starts_with("Bahnschrift")) {   // a variable font where the host has it
+        require(cg_axes && f.call(cf, "_CFArrayGetCount", {cg_axes}) == 2, "Bahnschrift's CG axes");
+        const auto first = f.call(cf, "_CFArrayGetValueAtIndex", {cg_axes, 0});
+        const auto minimum = f.call(cf, "_CFDictionaryGetValue", {first, f.engine.read64(f.symbol(cg, "_kCGFontVariationAxisMinValue"))});
+        require(f.cf.utf8(f.call(cf, "_CFDictionaryGetValue", {first, f.engine.read64(f.symbol(cg, "_kCGFontVariationAxisName"))})) == "Weight" &&
+                    f.cf.number_value(minimum).value_or(0) == 300,
+                "the CG weight axis from 300");
+        const auto values = f.call(cg, "_CGFontCopyVariations", {bahnschrift});
+        require(values && f.call(cf, "_CFDictionaryGetCount", {values}) == 2, "CGFontCopyVariations");
+    }
     // Pika: NSColorSpace archives securely and decodes back to the same named space.
     const auto srgb = f.send(f.cls("NSColorSpace"), "sRGBColorSpace");
     const auto archived = f.send(f.cls("NSKeyedArchiver"), "archivedDataWithRootObject:requiringSecureCoding:error:", {srgb, 1, 0});

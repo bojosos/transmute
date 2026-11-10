@@ -43,7 +43,7 @@ releasing succeeds.
   changed.
 * Listening to other applications' input is not granted.
 * CGDisplayStream* create nothing.
-* Font variations are not modelled (no axes; NULL variant copies).
+* Font variations: CGFontCopyVariationAxes / CGFontCopyVariations and CTFontCopyVariationAxes / CTFontCopyVariation read a variable font's `fvar` axes, named from its `name` table (English). Faces are at their default instance, so the current variation is each axis's default. A font without `fvar` gives NULL. CGFontCreateCopyWithVariations makes no variant copies (NULL).
 * CGFontCopyTableTags probes the known table tags.
 * kCGColorSpaceDisplayP3_PQ / _HLG are names only: their transfer curves are
   not modelled, so creating them answers NULL.

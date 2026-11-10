@@ -471,9 +471,10 @@ void GraphicsGaps::install_core_graphics() {
     // reference; there are no ATS fonts, so none maps to a CGFont (NULL, as
     // for a reference that cannot be used).
     constant(core_graphics, "_CGFontCreateWithPlatformFont", 0);
-    // Font variations are not modelled (CTFontCopyVariationAxes answers NULL too): no axes, no variations, no variant copies.
-    for (const auto* name : {"_CGFontCopyVariationAxes", "_CGFontCopyVariations", "_CGFontCreateCopyWithVariations"})
-        constant(core_graphics, name, 0);
+    // Font variations: see install_variations (CGFontCopyVariationAxes, CGFontCopyVariations).
+    // Variant copies are not made: the host faces have no variation instances (NULL, as for a
+    // font that cannot be varied).
+    constant(core_graphics, "_CGFontCreateCopyWithVariations", 0);
     // CGWindowLevel CGWindowLevelForKey(CGWindowLevelKey): CGWindowLevel.h's
     // levels, which AppKit's NS*WindowLevel values equal (normal 0, floating 3,
     // modal panel 8, main menu 24, status 25, pop-up menu 101, screen saver
@@ -501,7 +502,8 @@ void GraphicsGaps::install_core_graphics() {
                              "kCGWindowIsOnscreen", "kCGWindowLayer", "kCGWindowName", "kCGWindowNumber", "kCGWindowOwnerName",
                              "kCGWindowOwnerPID", "kCGColorSpaceITUR_2100_HLG", "kCGColorSpaceITUR_2100_PQ",
                              "kCGDisplayStreamSourceRect", "kCGDisplayStreamQueueDepth", "kCGDisplayShowDuplicateLowResolutionModes",
-                             "kCGFontVariationAxisName", "kCGColorSpaceDisplayP3_PQ", "kCGColorSpaceDisplayP3_HLG"})
+                             "kCGFontVariationAxisName", "kCGFontVariationAxisMinValue", "kCGFontVariationAxisMaxValue",
+                             "kCGFontVariationAxisDefaultValue", "kCGColorSpaceDisplayP3_PQ", "kCGColorSpaceDisplayP3_HLG"})
         string(core_graphics, "_" + std::string(name), name);
 }
 
@@ -775,9 +777,124 @@ void GraphicsGaps::install_core_text() {
         process.release_guest(glyphs);
         s.x[0] = set;
     });
-    // Font variations are not modelled.
-    constant(core_text, "_CTFontCopyVariation", 0);
-    constant(core_text, "_CTFontCopyVariationAxes", 0);
+    // Font variations: the axes of a variable font's 'fvar' table (OpenType
+    // spec), named from its 'name' table (English). A font without 'fvar' has
+    // none (NULL). Faces are always at their default instance, so the current
+    // variation is each axis's default.
+    struct Axis {
+        std::uint32_t tag{};
+        double minimum{}, fallback{}, maximum{};
+        std::string name;
+    };
+    const auto axes_of = [this](GuestMemory& m, Address font, std::string_view library, const char* copy, bool options) {
+        const auto table = [&](std::uint32_t tag) {
+            std::vector<std::uint8_t> bytes;
+            const auto data = options ? call(library, copy, {font, tag, 0}) : call(library, copy, {font, tag});
+            if (!data) return bytes;
+            bytes.resize(static_cast<std::size_t>(call(core_foundation, "_CFDataGetLength", {data})));
+            if (!bytes.empty()) m.read_bytes(call(core_foundation, "_CFDataGetBytePtr", {data}), bytes);
+            release(data);
+            return bytes;
+        };
+        std::vector<Axis> axes;
+        if (!font) return axes;
+        const auto fvar = table(0x66766172);   // 'fvar'
+        const auto u16 = [](const std::vector<std::uint8_t>& b, std::size_t at) -> std::uint32_t { return at + 2 <= b.size() ? (b[at] << 8 | b[at + 1]) : 0; };
+        const auto u32 = [&](const std::vector<std::uint8_t>& b, std::size_t at) { return u16(b, at) << 16 | u16(b, at + 2); };
+        const auto fixed = [&](const std::vector<std::uint8_t>& b, std::size_t at) { return static_cast<std::int32_t>(u32(b, at)) / 65536.0; };
+        if (fvar.size() < 16) return axes;
+        const auto offset = u16(fvar, 4), count = u16(fvar, 8), size = u16(fvar, 10);
+        if (size < 20) return axes;
+        const auto names = table(0x6e616d65);   // 'name'
+        const auto name_of = [&](std::uint32_t id) {
+            // Windows English (UTF-16BE), then Macintosh English, then Unicode.
+            std::string best;
+            int rank = 0;
+            const auto records = u16(names, 2), storage = u16(names, 4);
+            for (std::uint32_t r = 0; r < records; ++r) {
+                const std::size_t at = 6 + static_cast<std::size_t>(r) * 12;
+                if (at + 12 > names.size() || u16(names, at + 6) != id) continue;
+                const auto platform = u16(names, at), language = u16(names, at + 4), length = u16(names, at + 8);
+                const std::size_t start = storage + u16(names, at + 10);
+                if (start + length > names.size()) continue;
+                const int this_rank = platform == 3 && language == 0x409 ? 3 : platform == 1 && language == 0 ? 2 : platform == 0 ? 1 : 0;
+                if (this_rank <= rank) continue;
+                std::string text;
+                if (platform == 1) text.assign(names.begin() + static_cast<std::ptrdiff_t>(start), names.begin() + static_cast<std::ptrdiff_t>(start + length));
+                else
+                    for (std::size_t i = start; i + 1 < start + length; i += 2) {
+                        const auto unit = u16(names, i);   // the axis names are ASCII in practice; others become '?'
+                        text.push_back(unit < 0x80 ? static_cast<char>(unit) : '?');
+                    }
+                best = std::move(text);
+                rank = this_rank;
+            }
+            return best;
+        };
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const std::size_t at = offset + static_cast<std::size_t>(i) * size;
+            if (at + 20 > fvar.size()) break;
+            Axis axis{u32(fvar, at), fixed(fvar, at + 4), fixed(fvar, at + 8), fixed(fvar, at + 12), name_of(u16(fvar, at + 18))};
+            if (axis.name.empty())
+                for (int shift = 24; shift >= 0; shift -= 8) axis.name.push_back(static_cast<char>(axis.tag >> shift));   // its tag
+            axes.push_back(std::move(axis));
+        }
+        return axes;
+    };
+    // CGFontCopyVariationAxes: dictionaries of kCGFontVariationAxisName / MinValue / MaxValue / DefaultValue.
+    raw(core_graphics, "_CGFontCopyVariationAxes", [this, axes_of](CpuState& s, GuestMemory& m) {
+        const auto axes = axes_of(m, s.x[0], core_graphics, "_CGFontCopyTableForTag", false);
+        if (axes.empty()) { s.x[0] = 0; return; }
+        const auto key = [this](const char* name) { return bridge->constant(core_graphics, name); };
+        std::vector<Address> dictionaries;
+        for (const auto& axis : axes) {
+            const std::pair<Address, Address> entries[] = {{key("_kCGFontVariationAxisName"), cf.string(axis.name)},
+                                                           {key("_kCGFontVariationAxisMinValue"), cf.real(axis.minimum)},
+                                                           {key("_kCGFontVariationAxisMaxValue"), cf.real(axis.maximum)},
+                                                           {key("_kCGFontVariationAxisDefaultValue"), cf.real(axis.fallback)}};
+            dictionaries.push_back(cf.dictionary(entries));
+            for (const auto& [name, value] : entries) release(value);
+        }
+        s.x[0] = cf.array(dictionaries);
+        for (const auto dictionary : dictionaries) release(dictionary);
+    });
+    // CGFontCopyVariations: each axis's name to its (default) value.
+    raw(core_graphics, "_CGFontCopyVariations", [this, axes_of](CpuState& s, GuestMemory& m) {
+        const auto axes = axes_of(m, s.x[0], core_graphics, "_CGFontCopyTableForTag", false);
+        if (axes.empty()) { s.x[0] = 0; return; }
+        std::vector<std::pair<Address, Address>> entries;
+        for (const auto& axis : axes) entries.push_back({cf.string(axis.name), cf.real(axis.fallback)});
+        s.x[0] = cf.dictionary(entries);
+        for (const auto& [name, value] : entries) { release(name); release(value); }
+    });
+    // CTFontCopyVariationAxes: dictionaries of the axis identifier (its tag as a number), minimum,
+    // maximum, default and name.
+    raw(core_text, "_CTFontCopyVariationAxes", [this, axes_of](CpuState& s, GuestMemory& m) {
+        const auto axes = axes_of(m, s.x[0], core_text, "_CTFontCopyTable", true);
+        if (axes.empty()) { s.x[0] = 0; return; }
+        const auto key = [this](const char* name) { return bridge->constant(core_text, name); };
+        std::vector<Address> dictionaries;
+        for (const auto& axis : axes) {
+            const std::pair<Address, Address> entries[] = {{key("_kCTFontVariationAxisIdentifierKey"), cf.integer(axis.tag)},
+                                                           {key("_kCTFontVariationAxisMinimumValueKey"), cf.real(axis.minimum)},
+                                                           {key("_kCTFontVariationAxisMaximumValueKey"), cf.real(axis.maximum)},
+                                                           {key("_kCTFontVariationAxisDefaultValueKey"), cf.real(axis.fallback)},
+                                                           {key("_kCTFontVariationAxisNameKey"), cf.string(axis.name)}};
+            dictionaries.push_back(cf.dictionary(entries));
+            for (const auto& [name, value] : entries) release(value);
+        }
+        s.x[0] = cf.array(dictionaries);
+        for (const auto dictionary : dictionaries) release(dictionary);
+    });
+    // CTFontCopyVariation: each axis identifier to its (default) value.
+    raw(core_text, "_CTFontCopyVariation", [this, axes_of](CpuState& s, GuestMemory& m) {
+        const auto axes = axes_of(m, s.x[0], core_text, "_CTFontCopyTable", true);
+        if (axes.empty()) { s.x[0] = 0; return; }
+        std::vector<std::pair<Address, Address>> entries;
+        for (const auto& axis : axes) entries.push_back({cf.integer(axis.tag), cf.real(axis.fallback)});
+        s.x[0] = cf.dictionary(entries);
+        for (const auto& [name, value] : entries) { release(name); release(value); }
+    });
     // ATS font references do not exist.
     raw(core_text, "_CTFontGetPlatformFont", [](CpuState& s, GuestMemory& m) { if (s.x[1]) m.write64(s.x[1], 0); s.x[0] = 0; });
     // System UI fonts have names starting with '.' (".SFNS-Regular").
