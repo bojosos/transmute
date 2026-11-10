@@ -123,11 +123,17 @@ const Case foundation_firefox_xul_case("foundation_firefox_xul", [](Fixture& f) 
     const auto action = f.send(f.cls("NSUserNotificationAction"), "actionWithIdentifier:title:", {f.cf.string("reply"), f.cf.string("Reply")});
     require(f.cf.utf8(f.send(action, "identifier")) == "reply" && f.cf.utf8(f.send(action, "title")) == "Reply", "NSUserNotificationAction");
 
-    // Launch Services over FSRefs and MIME types (no application here handles PNG files).
+    // Launch Services over FSRefs and MIME types: the same application as the content-type and URL calls
+    // (or kLSApplicationNotFoundErr where they find none; other cases may have registered applications).
     const auto app_url = f.block(8, 0xff);
-    require(f.status(cs, "_LSCopyApplicationForMIMEType", {f.cf.string("image/png"), 0xffffffff, app_url}) == -10814 && f.engine.read64(app_url) == 0,
+    const auto path_of = [&f](Address url) { return url ? f.cf.url_path(url) : std::string(); };
+    const auto for_type = f.call(cs, "_LSCopyDefaultApplicationURLForContentType", {f.cf.string("public.png"), 0xffffffff, 0});
+    const auto by_mime = f.status(cs, "_LSCopyApplicationForMIMEType", {f.cf.string("image/png"), 0xffffffff, app_url});
+    require(for_type ? by_mime == 0 && path_of(f.engine.read64(app_url)) == path_of(for_type) : by_mime == -10814 && f.engine.read64(app_url) == 0,
             "LSCopyApplicationForMIMEType");
-    require(f.status(cs, "_LSGetApplicationForItem", {ref, 0xffffffff, 0, app_url}) == -10814, "LSGetApplicationForItem");
+    const auto for_url = f.call(cs, "_LSCopyDefaultApplicationURLForURL", {file, 0xffffffff, 0});
+    const auto by_item = f.status(cs, "_LSGetApplicationForItem", {ref, 0xffffffff, 0, app_url});
+    require(for_url ? by_item == 0 && path_of(f.engine.read64(app_url)) == path_of(for_url) : by_item == -10814, "LSGetApplicationForItem");
     require(f.status(cs, "_LSOpenFromRefSpec", {0, 0}) == -50, "LSOpenFromRefSpec without a spec");
     const auto spec = f.block(48);
     f.engine.write64(spec, ref);   // an application FSRef: launching a guest application is refused
