@@ -147,6 +147,11 @@ typedef struct {
 - (NSEnumerator<KeyType>*)keyEnumerator;
 @end
 
+@interface NSMutableDictionary<KeyType, ObjectType> : NSDictionary<KeyType, ObjectType>
+- (void)removeObjectForKey:(KeyType)aKey;
+- (void)setObject:(ObjectType)anObject forKey:(KeyType <NSCopying>)aKey;
+@end
+
 @interface NSSet<ObjectType> : NSObject <NSCopying, NSMutableCopying, NSFastEnumeration>
 @property (readonly) NSUInteger count;
 @end
