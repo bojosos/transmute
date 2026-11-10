@@ -513,6 +513,8 @@ ProcessResult run_program(const std::filesystem::path& executable,
                 // other threads still run, then every thread ends (pthread_exit
                 // on the main thread instead waits for the last thread).
                 if (!context.requested_exit() && !context.thread(engine)->exit_value) {
+                    // As exit(): the autorelease drain waits for the finalizers (ThreadContext::exiting_process).
+                    context.thread(engine)->exiting_process = true;
                     threads.cleanup_thread(*context.thread(engine));
                     context.run_finalizers();
                     objc.cleanup_thread(*context.thread(engine));
@@ -524,6 +526,7 @@ ProcessResult run_program(const std::filesystem::path& executable,
         join_stopped_workers(threads, engine, context.requested_exit().value_or(exit));
         trace_exit_phase("guest threads joined");
         if (!context.requested_exit()) {
+            context.thread(engine)->exiting_process = true;   // as exit(): the drain waits for the finalizers
             threads.cleanup_thread(*context.thread(engine));
             context.run_finalizers();
             objc.cleanup_thread(*context.thread(engine));

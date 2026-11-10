@@ -276,6 +276,21 @@ void test_recursive_unfair_lock() {
     require(f.engine.read32(lock + 4) == 0 && elsewhere() == 1, "the last unlock releases it");
 }
 
+// A thread's cleanup drains its Objective-C autoreleases unless it is exit()'s (Darwin drains no pool at exit).
+void test_exit_keeps_autoreleases() {
+    Fixture f;
+    unsigned drains = 0;
+    f.process.cleanup_objects = [&](alchemy::ThreadContext&) { ++drains; };
+    auto thread = f.process.thread(f.engine);
+    thread->exiting_process = true;
+    f.threads.cleanup_thread(*thread);
+    require(drains == 0, "exit drained the autorelease pools");
+    thread->exiting_process = false;
+    f.threads.cleanup_thread(*thread);
+    require(drains == 1, "an ending thread's cleanup did not drain its autorelease pools");
+    f.process.cleanup_objects = {};
+}
+
 void test_tlv_and_cleanup() {
     Fixture f;
     alchemy::TlsTemplate tls;
@@ -489,6 +504,7 @@ int main() {
         stage("test_reserved_swift_keys()"); test_reserved_swift_keys();
         stage("test_tlv_and_cleanup()"); test_tlv_and_cleanup();
         stage("test_guards_and_timed_condition()"); test_guards_and_timed_condition();
+        stage("test_exit_keeps_autoreleases()"); test_exit_keeps_autoreleases();
         stage("test_address_waits_and_context_release()"); test_address_waits_and_context_release();
         stage("test_attributes_names_and_stop()"); test_attributes_names_and_stop();
         std::cout << "Alchemy Darwin thread tests passed\n";

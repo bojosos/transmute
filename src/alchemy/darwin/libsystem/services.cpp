@@ -681,9 +681,13 @@ void DarwinServices::Impl::install_all() {
             // exit() on the child side of an emulated fork must not run the
             // parent's atexit handlers or thread cleanup: it is _exit there.
             if (fork_child) return;
-            if (context.cleanup_thread) context.cleanup_thread(*context.current_thread());
+            // The autoreleased objects stay alive for the atexit handlers and static destructors, as on
+            // Darwin (LibreOffice's read a string an early drain had freed); they are drained after them.
+            const auto current = context.current_thread();
+            current->exiting_process = true;
+            if (context.cleanup_thread) context.cleanup_thread(*current);
             context.run_finalizers();
-            if (context.cleanup_objects) context.cleanup_objects(*context.current_thread());
+            if (context.cleanup_objects) context.cleanup_objects(*current);
         }, "alchemy.internal");
     const std::array<std::uint32_t, 14> exit_instructions{
         0xd10083ffU, // sub sp, sp, #32

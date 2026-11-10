@@ -472,7 +472,9 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             const auto [stack_low, stack_high] = thread.engine->stack_bounds();
             if (ending) introspect(*thread.engine, 3, ending, stack_low, stack_high - stack_low);
         }
-        if (process.cleanup_objects) process.cleanup_objects(thread);
+        // A thread that ends drains its autorelease pools here; exit() drains them only after the atexit
+        // handlers and static destructors (ThreadContext::exiting_process).
+        if (process.cleanup_objects && !thread.exiting_process) process.cleanup_objects(thread);
         forget_cancel(thread.identity);
         // A thread's TSD array goes with it, but the main thread's lasts as long as the process: image
         // terminators and atexit handlers run after this and still read it (mimalloc's process detach).
