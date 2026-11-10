@@ -107,7 +107,9 @@ void ivars_categories_and_nonlazy_lists() {
     rejects([&] { static_cast<void>(f.parse()); }, "ivar outside");
     f.engine.write64(base + 96, (base + 160) | 2);   // FAST_IS_SWIFT_STABLE
     decoded = f.parse();
-    require(decoded[0].classes[0].swift && decoded[0].classes[0].ivars.empty(), "a Swift ivar of size 0 was not skipped");
+    // Kept (unchecked), so the ivar list matches the Swift fields by index (reflection reads it so).
+    require(decoded[0].classes[0].swift && decoded[0].classes[0].ivars.size() == 1 && decoded[0].classes[0].ivars[0].size == 0 &&
+            decoded[0].classes[0].ivars[0].offset == 0, "a Swift ivar of size 0 is kept at its index");
 }
 void malformed_metadata_is_transactional() {
     Fixture f;

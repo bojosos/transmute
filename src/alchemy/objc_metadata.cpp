@@ -407,12 +407,13 @@ private:
             ivar.size = memory_.read32(add(entry, 28));
             if (exponent != UINT32_MAX && exponent > 20) malformed("invalid ivar alignment exponent");
             ivar.alignment = exponent == UINT32_MAX ? 8 : (1U << exponent);
-            // The Swift runtime's instantiated generic classes (Combine's ReduceProducer)
-            // can list fields with size 0 and offset 0 that their metadata lays out; objc4
-            // does not check them, and nothing reads them through the ivar list.
-            if (!ivar.size && swift) continue;
-            if (ivar.offset < result.instance_start || ivar.offset > result.instance_size ||
-                ivar.size > result.instance_size - ivar.offset || !ivar.size)
+            // Zero-size Swift fields (an empty struct; Combine's ReduceProducer lists them
+            // at offset 0) stay in the list unchecked, as objc4 keeps them: Swift
+            // reflection reads class_copyIvarList(cls)[field index], so dropping one
+            // shifts every later field (Pika's MetalShader.Coordinator.parent).
+            const bool zero_size_swift = !ivar.size && swift;
+            if (!zero_size_swift && (ivar.offset < result.instance_start || ivar.offset > result.instance_size ||
+                ivar.size > result.instance_size - ivar.offset || !ivar.size))
                 malformed("ivar outside class instance extent");
             if (!names.insert(ivar.name).second) malformed("duplicate ivar name");
             // Block ivars ("@?") hold object pointers that compiled code copies and releases.
