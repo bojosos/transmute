@@ -24,6 +24,10 @@ table that `launchctl`, `SMJobSubmit` and friends talk to.
   (updaters install after the application quits). Where a job object Alchemy
   did not make refuses breakaway (a test driver's), the server stays in it and
   ends with it.
+* **One per user, root and Alchemy executable**, named by a hash of the three.
+  `ALCHEMY_LAUNCHD_SESSION=<text>` adds to the name: a session of its own. Tests
+  that run at once each set one, since a server started by one test ends with
+  that test.
 * **Lifetime.** Every client names the root of its Alchemy process tree (the
   process the user started, `ALCHEMY_MACH_BROKER`). The session stays alive
   while one of those trees runs. After the last one ends:

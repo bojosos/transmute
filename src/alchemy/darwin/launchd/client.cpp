@@ -86,9 +86,13 @@ std::string pipe_name() {
     const auto domain = host::process::environment("USERDOMAIN").value_or("");
     // One session per user, root and Alchemy executable: two builds never share one.
     const auto program = host::process::image_path(host::process::current_pid());
+    // ALCHEMY_LAUNCHD_SESSION=<text>: a session of its own. Tests that run at once each have one:
+    // a session launchd stays in the job of the test that started it, and ends with that test.
+    const auto session = host::process::environment("ALCHEMY_LAUNCHD_SESSION").value_or("");
     char hash[17];
     std::snprintf(hash, sizeof hash, "%016llx", static_cast<unsigned long long>(
-        fnv1a(lower(domain + "\\" + user) + "|" + root_text() + "|" + lower(program ? *program : std::string()))));
+        fnv1a(lower(domain + "\\" + user) + "|" + root_text() + "|" + lower(program ? *program : std::string()) +
+              (session.empty() ? std::string() : "|" + session))));
     return std::string("alchemy-launchd-") + hash;
 }
 

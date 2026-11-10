@@ -69,12 +69,14 @@ function(alchemy_launchd_session_tests)
     add_custom_target(alchemy_launchd_fixtures DEPENDS "${macos_dir}/launchd_model" "${app}/MacOS/launchd_model" "${service}/MacOS/echo_service")
     add_dependencies(alchemy_process_model_tests alchemy_launchd_fixtures)
     add_test(NAME alchemy_launchd_session_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${macos_dir}/launchd_model" launchctl mach sockets xpc)
+    # Each test has a session launchd of its own (ALCHEMY_LAUNCHD_SESSION): one started by a test
+    # ends with that test, so tests running at once must not share it.
     set_tests_properties(alchemy_launchd_session_fx PROPERTIES TIMEOUT 600
-        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0")
+        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0;ALCHEMY_LAUNCHD_SESSION=session_fx")
     # Bundled XPC services: the model run from inside its application bundle.
     add_test(NAME alchemy_launchd_xpc_bundle_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${app}/MacOS/launchd_model" xpc-bundle)
     set_tests_properties(alchemy_launchd_xpc_bundle_fx PROPERTIES TIMEOUT 600
-        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0")
+        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0;ALCHEMY_LAUNCHD_SESSION=xpc_bundle_fx")
     # NsxpcModel.app (L5): an Objective-C client and its bundled NSXPC service, one source
     # (launchd_nsxpc.m) built twice; Foundation and the runtime resolve by flat lookup.
     if(NOT ALCHEMY_GUI_FIXTURES_ENABLED)
@@ -101,6 +103,6 @@ function(alchemy_launchd_session_tests)
     add_dependencies(alchemy_process_model_tests alchemy_launchd_nsxpc_fixtures)
     add_test(NAME alchemy_launchd_nsxpc_fx COMMAND alchemy_process_model_tests "$<TARGET_FILE:alchemy-fx>" "${nsxpc_app}/MacOS/nsxpc_client" nsxpc)
     set_tests_properties(alchemy_launchd_nsxpc_fx PROPERTIES TIMEOUT 600
-        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0")
+        ENVIRONMENT "ALCHEMY_GUI_NO_ACTIVATE=1;ALCHEMY_GUI_CLOAK=1;ALCHEMY_GUI_NO_CRASH_DIALOG=1;ALCHEMY_NETWORK=loopback;ALCHEMY_LAUNCHD_LINGER=0;ALCHEMY_LAUNCHD_GRACE=0;ALCHEMY_LAUNCHD_SESSION=nsxpc_fx")
 endfunction()
 alchemy_gui_register_tests(alchemy_launchd_session_tests)

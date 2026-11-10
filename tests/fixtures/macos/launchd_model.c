@@ -427,7 +427,9 @@ static void test_sockets(void) {
     int status = launchctl(bootstrap, output, sizeof output);
     check(status == 0, t, "bootstrap a job with Sockets", status);
     check(wait_for(marker, "sockets ", text, sizeof text, 60000), t, "the job reports its sockets", 0);
-    check(field(text, "error") == 0 && field(text, "count") == 1 && field(text, "fd") == 3, t, "Listeners: one socket at descriptor 3", field(text, "fd"));
+    /* Reported: the error, else the descriptor. */
+    check(field(text, "error") == 0 && field(text, "count") == 1 && field(text, "fd") == 3, t, "Listeners: one socket at descriptor 3",
+          field(text, "error") ? 1000 + field(text, "error") : field(text, "fd"));
     check(field(text, "missing") == 2, t, "an unknown key: ENOENT", field(text, "missing"));
     check(field(text, "checkin_label") == 7 && field(text, "checkin_fd") == 3, t, "launch_msg CheckIn: Label and Sockets", field(text, "checkin_fd"));
     char* bootout[] = {(char*)"launchctl", (char*)"bootout", service, 0};
@@ -583,7 +585,9 @@ static void test_xpc(void) {
     request = echo_request(7, -1);
     reply = xpc_connection_send_message_with_reply_sync(connection, request);
     xpc_release(request);
-    const long long second_pid = xpc_get_type(reply) == &_xpc_type_dictionary ? xpc_dictionary_get_int64(reply, "pid") : -1;
+    /* Reported: the pid, else -1 (interrupted), -2 (invalid) or -3 (another object). */
+    const long long second_pid = xpc_get_type(reply) == &_xpc_type_dictionary ? xpc_dictionary_get_int64(reply, "pid")
+        : reply == (const void*)&_xpc_error_connection_interrupted ? -1 : reply == (const void*)&_xpc_error_connection_invalid ? -2 : -3;
     check(second_pid > 0 && second_pid != first_pid && xpc_dictionary_get_int64(reply, "value") == 8, t, "after an interruption a new run answers", (long)second_pid);
     xpc_release(reply);
     /* Cancel: invalid last. */
