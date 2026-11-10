@@ -441,13 +441,23 @@ the app is built.
 - Only structs the compiler laid out (static field offsets) are evidence of
   Apple's layouts; the report marks the ones the runtime lays out.
 - The survey reads data and calls nothing in the app except metadata accessors.
-- Classes are not surveyed yet: the field enumeration of a class with
-  Objective-C ancestry goes through ivar lists Alchemy doesn't answer for
-  every class.
+- Classes are not surveyed: SwiftUI's values live in views, which are structs.
 
-Pika 2.0.2's report gives ObservedObject 16 bytes: 8-aligned, not POD, with a
-reference's extra inhabitants. It doesn't show which word holds the reference,
-so ObservedObject's stop stays, as do all the others.
+Sizes don't say which word of a type holds what. `ALCHEMY_SWIFTUI_LAYOUTS=probe`
+answers that from the app's own compiled copy and destroy code.
+- It takes each struct the compiler laid out whose only field of the 18 types
+  is a probed type, and whose other fields are plain data or class references
+  (so zero bytes are a valid value of them).
+- In one word of that field at a time, with every other byte zero, it places a
+  probe object. It copies the struct with the app's `initializeWithCopy` value
+  witness and destroys the copy with its `destroy` witness.
+- It reports, per word, how the probe object's retain count changed and whether
+  the copy's bytes match.
+- It calls nothing in the app except metadata accessors and those two witnesses.
+- It probes ObservedObject only when the observed object's class uses Swift
+  reference counting, as the probe objects do.
+
+No layout is established yet; every type still stops.
 
 ForEach is declared in Apple's SwiftUICore module and its `create(_:id:content:)`
 in SwiftUI. That name has an extension context one module can't produce, so it
