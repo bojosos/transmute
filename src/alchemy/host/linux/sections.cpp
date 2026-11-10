@@ -58,6 +58,12 @@ Result<Handle> create_file_section(Handle file, bool writable) {
 }
 
 Result<std::uintptr_t> map(Handle section, std::uint64_t offset, std::size_t size, bool writable) {
+    if (size == 0) {   // the rest of the section, as MapViewOfFile maps it (a child's inherited section)
+        struct stat status {};
+        if (fstat(fd_of(section), &status) != 0) return last_error();
+        if (status.st_size <= 0 || offset >= static_cast<std::uint64_t>(status.st_size)) return Error::invalid_argument;
+        size = static_cast<std::size_t>(static_cast<std::uint64_t>(status.st_size) - offset);
+    }
     void* view = mmap(nullptr, size, PROT_READ | (writable ? PROT_WRITE : 0), MAP_SHARED, fd_of(section),
                       static_cast<off_t>(offset));
     if (view == MAP_FAILED) return last_error();
@@ -85,15 +91,18 @@ bool same(Handle first, Handle second) noexcept {
     return fstat(fd_of(first), &a) == 0 && fstat(fd_of(second), &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
-// Into this process: the section reopened (read-only when not `writable`, so
-// it cannot be mapped writable). Pushing a descriptor into another process
-// needs that process's help (SCM_RIGHTS over a socket), which is not done yet.
+// The section reopened (read-only when not `writable`, so it cannot be mapped
+// writable there), for this process or handed to another one's descriptor
+// broker (fd_broker.cpp).
 Result<std::uint64_t> duplicate_into(Handle section, std::uint32_t target_pid, bool writable) {
-    if (target_pid != 0 && target_pid != static_cast<std::uint32_t>(getpid())) return Error::unsupported;
     const auto path = "/proc/self/fd/" + std::to_string(fd_of(section));
     const int fd = ::open(path.c_str(), (writable ? O_RDWR : O_RDONLY) | O_CLOEXEC);
     if (fd < 0) return last_error();
-    return handle_of(fd).value;
+    if (target_pid == 0 || target_pid == static_cast<std::uint32_t>(getpid())) return handle_of(fd).value;
+    const auto remote = linux_backend::send_descriptor(fd, target_pid);
+    ::close(fd);
+    if (!remote) return remote.error();
+    return handle_of(*remote).value;
 }
 
 Status flush(std::uintptr_t address, std::size_t size) {

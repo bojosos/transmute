@@ -33,6 +33,16 @@ void forget_process(int fd) noexcept;
 // The ipc.cpp part: a pending listener closed before it accepted.
 void forget_listener(int fd) noexcept;
 
+// Descriptors for other processes (fd_broker.cpp): a duplicate of `fd` handed
+// to process `pid`'s descriptor broker, as its descriptor number there (the
+// receiver owns it, as a DuplicateHandle target owns its handle). `pid` 0 or
+// this process: a local duplicate. Error::not_found: no broker answers for
+// `pid` (not an Alchemy process of this user, or gone).
+[[nodiscard]] Result<int> send_descriptor(int fd, std::uint32_t pid);
+// The process.cpp part: a child started suspended takes descriptors over its
+// gate until it is resumed (Error::not_found: `pid` is no such child).
+[[nodiscard]] Result<int> send_to_gated_child(int fd, std::uint32_t pid);
+
 // A NUL-terminated copy of a path for the system calls.
 [[nodiscard]] inline std::string zstring(std::string_view text) { return std::string(text); }
 

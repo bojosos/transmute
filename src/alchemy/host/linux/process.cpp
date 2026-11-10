@@ -1,17 +1,21 @@
 // Linux host backend, area "process".
 //
 // Children are started with fork + execve, so a suspended start is a gate:
-// the child waits on a pipe before it executes, and resume() writes to the
-// pipe (Child::thread holds its write end). Handles in Spawn::inherit stay
+// the child waits on a socket pair before it executes, and resume() sends it
+// the go (Child::thread holds the parent's end). Until then the gate also
+// carries descriptors to the child (send_to_gated_child), which it keeps
+// across execve: DuplicateHandle into a suspended process. Handles in Spawn::inherit stay
 // open under the same descriptor numbers in the child (their close-on-exec
 // flag is cleared there); every other descriptor is closed at exec. A child's
 // process Handle is a pidfd, which poll(2) reports readable once the child has
 // ended; the child stays unreaped (waitid WNOWAIT) until its last handle is
 // closed, so its pid is not reused meanwhile, as on Windows.
 //
+// duplicate_into another process hands the descriptor to that process's
+// descriptor broker (fd_broker.cpp).
+//
 // Not done yet: end_with_parent (PR_SET_PDEATHSIG fires when the spawning
-// thread exits, not the process, so it needs a subreaper), and
-// duplicate_into another process (descriptors travel over UNIX sockets).
+// thread exits, not the process, so it needs a subreaper).
 #include "alchemy/host/linux/linux.hpp"
 #include "alchemy/host/process.hpp"
 
@@ -22,6 +26,7 @@
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -354,6 +359,15 @@ Result<std::string> image_path(std::uint32_t host_pid) {
     return std::string(target, static_cast<std::size_t>(length));
 }
 
+namespace {
+// Suspended children still waiting on their gate (pid -> our end of it).
+std::mutex g_gates_lock;
+std::map<std::uint32_t, int>& gates() {
+    static auto* map = new std::map<std::uint32_t, int>;
+    return *map;
+}
+} // namespace
+
 Result<Child> spawn(const Spawn& options) {
     std::vector<std::string> arguments;
     arguments.push_back(options.program);
@@ -366,9 +380,11 @@ Result<Child> spawn(const Spawn& options) {
     const int standard[3] = {options.standard_input ? fd_of(options.standard_input) : -1,
                              options.standard_output ? fd_of(options.standard_output) : -1,
                              options.standard_error ? fd_of(options.standard_error) : -1};
-    // The gate (suspended starts) and the exec-error report, both close-on-exec.
+    // The gate (suspended starts: a socket pair, which also carries
+    // descriptors to the waiting child) and the exec-error report, both
+    // close-on-exec.
     int gate[2] = {-1, -1}, report[2] = {-1, -1};
-    if (options.suspended && pipe2(gate, O_CLOEXEC) != 0) return last_error();
+    if (options.suspended && socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, gate) != 0) return last_error();
     if (pipe2(report, O_CLOEXEC) != 0) {
         const auto error = last_error();
         if (gate[0] >= 0) { ::close(gate[0]); ::close(gate[1]); }
@@ -400,9 +416,28 @@ Result<Child> spawn(const Spawn& options) {
         for (const int fd : inherit) fcntl(fd, F_SETFD, 0);
         if (!options.working_directory.empty() && chdir(options.working_directory.c_str()) != 0) fail(errno);
         if (gate[0] >= 0) {
+            // Waits for the go (one byte) or the parent's end closing. Until
+            // then a message 'f' carries a descriptor (send_descriptor): it is
+            // kept, without close-on-exec, and its number goes back.
             ::close(gate[1]);
-            char go = 0;
-            while (::read(gate[0], &go, 1) < 0 && errno == EINTR) {
+            for (;;) {
+                char kind = 0;
+                iovec part{&kind, 1};
+                alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+                msghdr message{};
+                message.msg_iov = &part;
+                message.msg_iovlen = 1;
+                message.msg_control = control;
+                message.msg_controllen = sizeof(control);
+                const auto got = ::recvmsg(gate[0], &message, 0);
+                if (got < 0 && errno == EINTR) continue;
+                if (got <= 0 || kind != 'f') break;
+                std::int32_t received = -1;
+                for (auto* header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header))
+                    if (header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS)
+                        std::memcpy(&received, CMSG_DATA(header), sizeof(received));
+                while (::send(gate[0], &received, sizeof(received), MSG_NOSIGNAL) < 0 && errno == EINTR) {
+                }
             }
         }
         execve(options.program.c_str(), argv.data(), environ);
@@ -432,12 +467,24 @@ Result<Child> spawn(const Spawn& options) {
     child.pid = static_cast<std::uint32_t>(pid);
     child.process = remember(pidfd, pid, true);
     child.thread = gate[1] >= 0 ? handle_of(gate[1]) : handle_of(fcntl(pidfd, F_DUPFD_CLOEXEC, 0));
+    if (gate[1] >= 0) {
+        std::lock_guard guard(g_gates_lock);
+        gates()[child.pid] = gate[1];
+    }
     return child;
 }
 
 Status resume(Handle thread) {
+    {
+        std::lock_guard guard(g_gates_lock);
+        for (auto it = gates().begin(); it != gates().end(); ++it)
+            if (it->second == fd_of(thread)) {
+                gates().erase(it);
+                break;
+            }
+    }
     const char go = 1;
-    if (::write(fd_of(thread), &go, 1) != 1 && errno != EPIPE) return last_error();
+    if (::send(fd_of(thread), &go, 1, MSG_NOSIGNAL) != 1 && errno != EPIPE) return last_error();
     return {};
 }
 
@@ -465,10 +512,9 @@ Result<Piped> spawn_piped(std::string_view program, std::span<const std::string>
 }
 
 Result<std::uint64_t> duplicate_into(Handle handle, std::uint32_t target_pid) {
-    if (target_pid != 0 && target_pid != current_pid()) return Error::unsupported;
-    const auto copy = host::duplicate(handle);
-    if (!copy) return copy.error();
-    return copy->value;
+    const auto remote = linux_backend::send_descriptor(fd_of(handle), target_pid);
+    if (!remote) return remote.error();
+    return handle_of(*remote).value;
 }
 
 } // namespace alchemy::host::process
@@ -478,6 +524,15 @@ namespace alchemy::host::linux_backend {
 // A closed child pidfd: reap the child (now or, if it still runs, when it ends).
 void forget_process(int fd) noexcept {
     using namespace process;
+    {
+        // A gate closed without a resume: the child runs on (its read ends).
+        std::lock_guard guard(g_gates_lock);
+        for (auto it = gates().begin(); it != gates().end(); ++it)
+            if (it->second == fd) {
+                gates().erase(it);
+                break;
+            }
+    }
     pid_t pid = 0;
     {
         std::lock_guard guard(g_lock);
@@ -494,6 +549,37 @@ void forget_process(int fd) noexcept {
         } catch (...) {
         }
     }
+}
+
+// A descriptor for a child still waiting on its gate (spawn with suspended):
+// the child keeps it across execve under the number it sends back.
+// Error::not_found when `pid` is no such child.
+Result<int> send_to_gated_child(int fd, std::uint32_t pid) {
+    using namespace process;
+    std::lock_guard guard(g_gates_lock);
+    const auto it = gates().find(pid);
+    if (it == gates().end()) return Error::not_found;
+    const int gate = it->second;
+    char kind = 'f';
+    iovec part{&kind, 1};
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+    msghdr message{};
+    message.msg_iov = &part;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    auto* header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    std::memcpy(CMSG_DATA(header), &fd, sizeof(int));
+    if (::sendmsg(gate, &message, MSG_NOSIGNAL) < 0) return last_error();
+    std::int32_t remote = -1;
+    ssize_t got = 0;
+    while ((got = ::recv(gate, &remote, sizeof(remote), 0)) < 0 && errno == EINTR) {
+    }
+    if (got != static_cast<ssize_t>(sizeof(remote)) || remote < 0) return Error::io;
+    return static_cast<int>(remote);
 }
 
 } // namespace alchemy::host::linux_backend

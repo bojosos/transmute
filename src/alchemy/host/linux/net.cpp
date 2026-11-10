@@ -1,9 +1,9 @@
 // Linux host backend, area "net": BSD sockets.
 //
 // Sockets are descriptors (Handle = descriptor + 1), non-blocking and
-// close-on-exec. export_socket hands a socket to this same process only: a
-// descriptor for another process has to travel over a UNIX socket
-// (SCM_RIGHTS), which the macOS layer's process launcher does not do yet.
+// close-on-exec. export_socket hands the socket to the target process's
+// descriptor broker (fd_broker.cpp); the blob is its descriptor number there
+// and the target's pid, which import_socket checks.
 #include "alchemy/host/linux/linux.hpp"
 #include "alchemy/host/net.hpp"
 
@@ -460,13 +460,13 @@ Result<std::uint16_t> ready(Handle socket, std::uint16_t events, std::uint64_t t
 }
 
 Result<std::vector<std::uint8_t>> export_socket(Handle socket, std::uint32_t target_pid) {
-    if (target_pid != 0 && target_pid != static_cast<std::uint32_t>(getpid())) return Error::unsupported;
-    const int fd = fcntl(fd_of(socket), F_DUPFD_CLOEXEC, 0);
-    if (fd < 0) return last_error();
+    const auto remote = linux_backend::send_descriptor(fd_of(socket), target_pid);
+    if (!remote) return remote.error();
+    const int fd = *remote;
     std::vector<std::uint8_t> blob(sizeof(int) + sizeof(pid_t));
-    const pid_t self = getpid();
+    const pid_t owner = target_pid == 0 ? getpid() : static_cast<pid_t>(target_pid);
     std::memcpy(blob.data(), &fd, sizeof(fd));
-    std::memcpy(blob.data() + sizeof(fd), &self, sizeof(self));
+    std::memcpy(blob.data() + sizeof(fd), &owner, sizeof(owner));
     return blob;
 }
 
