@@ -2522,6 +2522,16 @@ void FxEngine::map_memory(std::uint64_t base, std::size_t size) {
         std::ostringstream message;
         message << "alchemy-fx: cannot commit guest range 0x" << std::hex << base << "+0x" << size
                 << " (error " << std::dec << fx::host::last_error() << ')';
+        // What the host has there, piece by piece (its state, kind and allocation).
+        for (auto address = begin; address < end;) {
+            vm::RegionInfo info;
+            if (!vm::query(host(address), info)) break;
+            message << std::hex << "; 0x" << info.base << "+0x" << info.size << " state " << std::dec
+                    << static_cast<int>(info.state) << " type " << static_cast<int>(info.type) << " allocation 0x"
+                    << std::hex << info.allocation_base;
+            if (info.size == 0) break;
+            address = info.base + info.size;
+        }
         throw std::runtime_error(message.str());
     }
     // A partially shared first/last page may hold stale bytes from an earlier region.
