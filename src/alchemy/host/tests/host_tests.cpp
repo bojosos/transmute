@@ -614,7 +614,8 @@ void crypto_area() {
     const std::string secret = "keychain contents";
     const std::string entropy = "entropy", other = "other";
     const auto sealed = crypto::protect(std::as_bytes(std::span(secret)), std::as_bytes(std::span(entropy)), "Alchemy host test");
-    // A host without a per-user sealing key refuses explicitly (Linux, until where that key lives is decided).
+    // A host without an open per-user secret store refuses explicitly (Linux without a Secret Service,
+    // a default collection, or with that collection locked); it never prompts.
     if (sealed || sealed.error() != host::Error::unsupported) {
         require(sealed && !sealed->empty(), "protect");
         const auto opened = crypto::unprotect(std::as_bytes(std::span(*sealed)), std::as_bytes(std::span(entropy)));

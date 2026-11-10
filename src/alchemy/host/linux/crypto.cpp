@@ -12,8 +12,16 @@
 //   user and admin stores are empty: Linux keeps one system-wide store.
 // - TLS runs over memory BIOs between the caller's read and write callbacks. A client never judges
 //   the server's chain (the caller does, from peer_certificates()).
-// - protect / unprotect (data sealed for this user) are Error::unsupported: where the per-user key
-//   lives on Linux (libsecret, or a 0600 key file) is the user's decision, not yet made.
+// - protect / unprotect seal data for this user with a per-user key kept in the desktop's secret
+//   store (the Secret Service: GNOME Keyring, KWallet), through libsecret loaded at run time. The key
+//   (32 random bytes, item "org.alchemy.Protect" / purpose=protect in the default collection) is
+//   made on the first protect. A sealed blob is AES-256-GCM: "ALPR", version 1, the description's
+//   length and bytes (in the clear), a 12-byte nonce, the ciphertext and the 16-byte tag; the
+//   header and the caller's entropy are authenticated, so other entropy does not unseal. They never
+//   prompt: the key is read and stored only in the existing, unlocked collection the "default" alias
+//   names. Without libsecret, a Secret Service that answers, a default collection, or with that
+//   collection locked, both are Error::unsupported; no collection is created or unlocked, and the
+//   key is never kept in a file.
 #include "alchemy/host/crypto.hpp"
 #include "alchemy/host/linux/linux.hpp"
 
@@ -31,6 +39,7 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include <dlfcn.h>
 #include <sys/random.h>
 
 #include <algorithm>
@@ -237,9 +246,190 @@ void secure_zero(Bytes buffer) noexcept {
     for (std::size_t index = 0; index < buffer.size(); ++index) at[index] = std::byte{};
 }
 
-// No per-user sealing key yet (see the head comment).
-Result<std::vector<std::uint8_t>> protect(ConstBytes, ConstBytes, std::string_view) { return Error::unsupported; }
-Result<std::vector<std::uint8_t>> unprotect(ConstBytes, ConstBytes) { return Error::unsupported; }
+namespace {
+
+// libsecret's simple password API (secret-schema.h, secret-password.h), loaded at run time; glib's
+// g_error_free comes with it.
+struct SecretSchemaAttribute { const char* name; int type; };   // SECRET_SCHEMA_ATTRIBUTE_STRING is 0
+struct SecretSchema {
+    const char* name;
+    int flags;                                                   // SECRET_SCHEMA_NONE is 0
+    SecretSchemaAttribute attributes[32];
+    int reserved;
+    void* reserved1; void* reserved2; void* reserved3; void* reserved4; void* reserved5; void* reserved6; void* reserved7;
+};
+struct GlibError;
+struct SecretApi {
+    using Lookup = char* (*)(const SecretSchema*, void* cancellable, GlibError** error, ...);
+    using Store = int (*)(const SecretSchema*, const char* collection, const char* label, const char* password, void* cancellable,
+                          GlibError** error, ...);
+    using FreePassword = void (*)(char*);
+    using FreeError = void (*)(GlibError*);
+    using ServiceGet = void* (*)(int flags, void* cancellable, GlibError** error);   // SecretService*, SECRET_SERVICE_NONE is 0
+    using ForAlias = void* (*)(void* service, const char* alias, int flags, void* cancellable, GlibError** error);   // SecretCollection*
+    using GetLocked = int (*)(void* collection);
+    using Unref = void (*)(void* object);
+    Lookup lookup{};
+    Store store{};
+    FreePassword free_password{};
+    FreeError free_error{};
+    ServiceGet service_get{};
+    ForAlias for_alias{};
+    GetLocked get_locked{};
+    Unref unref{};
+};
+const SecretApi* secret_api() {
+    static const SecretApi api = [] {
+        SecretApi loaded;
+        const auto library = dlopen("libsecret-1.so.0", RTLD_NOW | RTLD_LOCAL);
+        if (!library) return loaded;
+        loaded.lookup = reinterpret_cast<SecretApi::Lookup>(dlsym(library, "secret_password_lookup_sync"));
+        loaded.store = reinterpret_cast<SecretApi::Store>(dlsym(library, "secret_password_store_sync"));
+        loaded.free_password = reinterpret_cast<SecretApi::FreePassword>(dlsym(library, "secret_password_free"));
+        loaded.free_error = reinterpret_cast<SecretApi::FreeError>(dlsym(library, "g_error_free"));   // glib, a dependency
+        loaded.service_get = reinterpret_cast<SecretApi::ServiceGet>(dlsym(library, "secret_service_get_sync"));
+        loaded.for_alias = reinterpret_cast<SecretApi::ForAlias>(dlsym(library, "secret_collection_for_alias_sync"));
+        loaded.get_locked = reinterpret_cast<SecretApi::GetLocked>(dlsym(library, "secret_collection_get_locked"));
+        loaded.unref = reinterpret_cast<SecretApi::Unref>(dlsym(library, "g_object_unref"));   // gobject, a dependency
+        return loaded;
+    }();
+    return api.lookup && api.store && api.free_password && api.free_error && api.service_get && api.for_alias && api.get_locked && api.unref
+               ? &api
+               : nullptr;
+}
+// Whether the default collection exists and is unlocked, asked without creating or unlocking anything
+// (SECRET_COLLECTION_NONE): only then may the password calls run, which would otherwise prompt.
+bool default_collection_open(const SecretApi& api) {
+    GlibError* error = nullptr;
+    const auto service = api.service_get(0, nullptr, &error);
+    if (error) api.free_error(error);
+    if (!service) return false;
+    error = nullptr;
+    const auto collection = api.for_alias(service, "default", 0, nullptr, &error);
+    if (error) api.free_error(error);
+    const bool open = collection && !api.get_locked(collection);
+    if (collection) api.unref(collection);
+    api.unref(service);
+    return open;
+}
+const SecretSchema protect_schema{"org.alchemy.Protect", 0, {{"purpose", 0}, {nullptr, 0}}, 0,
+                                  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+constexpr std::size_t key_size = 32, nonce_size = 12, tag_size = 16;
+constexpr std::array<std::uint8_t, 4> seal_magic{'A', 'L', 'P', 'R'};
+
+std::string hex(const Buffer& data) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string text;
+    for (const auto byte : data) { text.push_back(digits[byte >> 4]); text.push_back(digits[byte & 15]); }
+    return text;
+}
+std::optional<Buffer> unhex(std::string_view text) {
+    if (text.size() % 2) return std::nullopt;
+    Buffer out;
+    for (std::size_t at = 0; at < text.size(); at += 2) {
+        const auto nibble = [](char c) -> int {
+            return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+        };
+        const auto high = nibble(text[at]), low = nibble(text[at + 1]);
+        if (high < 0 || low < 0) return std::nullopt;
+        out.push_back(static_cast<std::uint8_t>(high << 4 | low));
+    }
+    return out;
+}
+
+// The per-user sealing key: Error::unsupported without a Secret Service; Error::not_found when there is
+// none yet and `create` is false.
+Result<Buffer> sealing_key(bool create) {
+    const auto api = secret_api();
+    if (!api) return Error::unsupported;
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    if (!default_collection_open(*api)) return Error::unsupported;   // never create or unlock a collection
+    GlibError* error = nullptr;
+    char* stored = api->lookup(&protect_schema, nullptr, &error, "purpose", "protect", static_cast<const char*>(nullptr));
+    if (error) {
+        api->free_error(error);
+        if (stored) api->free_password(stored);
+        return Error::unsupported;   // no Secret Service answered
+    }
+    if (stored) {
+        auto key = unhex(stored);
+        secure_zero(std::as_writable_bytes(std::span(stored, std::strlen(stored))));
+        api->free_password(stored);
+        if (!key || key->size() != key_size) return Error::invalid_argument;
+        return std::move(*key);
+    }
+    if (!create) return Error::not_found;
+    Buffer key(key_size);
+    if (!random(std::as_writable_bytes(std::span(key)))) return Error::other;
+    auto text = hex(key);
+    const auto stored_ok = api->store(&protect_schema, "default", "Alchemy data protection key", text.c_str(), nullptr, &error, "purpose", "protect",
+                                      static_cast<const char*>(nullptr));
+    secure_zero(std::as_writable_bytes(std::span(text)));
+    if (error) {
+        api->free_error(error);
+        return Error::unsupported;
+    }
+    if (!stored_ok) return Error::unsupported;
+    return key;
+}
+
+// AES-256-GCM over `input` with `aad`: the output, and the tag (encrypting) or a check of `tag` (decrypting).
+bool seal_cipher(bool encrypt, const Buffer& key, const std::uint8_t* nonce, const Buffer& aad, const std::uint8_t* input, std::size_t size,
+                 std::uint8_t* output, std::uint8_t* tag) {
+    Owned<EVP_CIPHER_CTX, EVP_CIPHER_CTX_free> context(EVP_CIPHER_CTX_new());
+    int written = 0;
+    if (!context || !EVP_CipherInit_ex2(context.get(), EVP_aes_256_gcm(), key.data(), nonce, encrypt ? 1 : 0, nullptr)) return false;
+    if (!aad.empty() && !EVP_CipherUpdate(context.get(), nullptr, &written, aad.data(), static_cast<int>(aad.size()))) return false;
+    if (size && !EVP_CipherUpdate(context.get(), output, &written, input, static_cast<int>(size))) return false;
+    if (!encrypt && !EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_SET_TAG, static_cast<int>(tag_size), tag)) return false;
+    if (EVP_CipherFinal_ex(context.get(), output + written, &written) <= 0) return false;
+    return !encrypt || EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_GET_TAG, static_cast<int>(tag_size), tag) > 0;
+}
+
+} // namespace
+
+Result<std::vector<std::uint8_t>> protect(ConstBytes data, ConstBytes entropy, std::string_view description) {
+    if (description.size() > 0xffff || data.size() > 0x7fffffff) return Error::invalid_argument;
+    auto key = sealing_key(true);
+    if (!key) return key.error();
+    Buffer sealed(seal_magic.begin(), seal_magic.end());
+    sealed.push_back(1);   // version
+    sealed.push_back(static_cast<std::uint8_t>(description.size()));
+    sealed.push_back(static_cast<std::uint8_t>(description.size() >> 8));
+    sealed.insert(sealed.end(), description.begin(), description.end());
+    Buffer aad(sealed);
+    aad.insert(aad.end(), bytes(entropy), bytes(entropy) + entropy.size());
+    const auto nonce_at = sealed.size();
+    sealed.resize(nonce_at + nonce_size + data.size() + tag_size);
+    const auto ok = random(std::as_writable_bytes(std::span(sealed.data() + nonce_at, nonce_size))) &&
+                    seal_cipher(true, *key, sealed.data() + nonce_at, aad, bytes(data), data.size(), sealed.data() + nonce_at + nonce_size,
+                                sealed.data() + nonce_at + nonce_size + data.size());
+    secure_zero(std::as_writable_bytes(std::span(*key)));
+    if (!ok) return Error::other;
+    return sealed;
+}
+
+Result<std::vector<std::uint8_t>> unprotect(ConstBytes data, ConstBytes entropy) {
+    const auto blob = bytes(data);
+    if (data.size() < seal_magic.size() + 3 || !std::equal(seal_magic.begin(), seal_magic.end(), blob) || blob[4] != 1) return Error::invalid_argument;
+    const std::size_t description = blob[5] | (static_cast<std::size_t>(blob[6]) << 8);
+    const auto nonce_at = seal_magic.size() + 3 + description;
+    if (data.size() < nonce_at + nonce_size + tag_size) return Error::invalid_argument;
+    auto key = sealing_key(false);
+    if (!key) return key.error() == Error::not_found ? Error::access_denied : key.error();   // nothing was ever sealed for this user
+    Buffer aad(blob, blob + nonce_at);
+    aad.insert(aad.end(), bytes(entropy), bytes(entropy) + entropy.size());
+    const auto size = data.size() - nonce_at - nonce_size - tag_size;
+    Buffer opened(size), tag(blob + data.size() - tag_size, blob + data.size());
+    const auto ok = seal_cipher(false, *key, blob + nonce_at, aad, blob + nonce_at + nonce_size, size, opened.data(), tag.data());
+    secure_zero(std::as_writable_bytes(std::span(*key)));
+    if (!ok) {
+        secure_zero(std::as_writable_bytes(std::span(opened)));
+        return Error::invalid_argument;   // other entropy, another user's key, or a damaged blob
+    }
+    return opened;
+}
 
 // ---- Block ciphers ----
 
