@@ -53,8 +53,21 @@ This page maps each host area to Linux. The Linux backends are in progress.
 
   Not written yet: XRandR screens and HiDPI, cursors, the X clipboard (the
   clipboard is process-local), drag and drop, IME. The other GUI areas
-  (gpu's Vulkan half, audio, media codecs, ...) still fail with
-  `Error::unsupported`.
+  (gpu's Vulkan half, ...) still fail with `Error::unsupported`.
+* **Media** (`gui/audio.cpp`, `midi.cpp`, `camera.cpp`, `speech.cpp`,
+  `media_codec.cpp`). `apt install libpulse-dev libasound2-dev`, and for
+  codecs `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`.
+  * audio: PulseAudio's client library (PipeWire and WSLg serve it);
+  * MIDI: ALSA's sequencer (none in WSL);
+  * cameras: V4L2, NV12 and YUYV (none in WSL);
+  * speech: unsupported (speech-dispatcher only speaks aloud; eSpeak NG is
+    GPL);
+  * codecs: GStreamer and the plug-ins the system already has, opened at
+    run time (dlopen); nothing is bundled. Built without its headers, or
+    run without GStreamer, the codecs answer `Error::unsupported`; a codec
+    without a plug-in is listed empty. On Ubuntu 26.04 with the
+    distribution's plug-in sets: x264enc, openh264enc and x265enc;
+    voaacenc and avenc_aac; avdec_h264, avdec_h265 and avdec_aac.
 * **2D drawing** (`gui/canvas.cpp`). Surfaces are Cairo image surfaces of
   premultiplied BGRA. They cover:
   * paths, clips, the three blends and the brushes (solid, tiles, linear
@@ -180,11 +193,11 @@ below. Nothing in `src/alchemy/darwin/` changes.
 | `crypto` | BCrypt, NCrypt, Cert*, DPAPI, SChannel | `getrandom`; OpenSSL (libcrypto/libssl) or a bundled library for digests, ciphers, keys, X.509 and TLS; the keychain in a file store encrypted with a key from the Secret Service (libsecret) or a local key. |
 | `system` | GlobalMemoryStatusEx, power APIs, registry, adapters | `/proc/meminfo`, `sysinfo`, PSI (`/proc/pressure/memory`) for memory pressure, `/sys/class/power_supply` for battery, UPower or logind (D-Bus) for sleep/wake and power assertions (inhibitors), `uname`, `gethostname`. |
 | `ui` | Win32 windows, messages, DPI, clipboard, OLE drag and drop, IMM, DWM cloak, TaskDialog, shell | Wayland (xdg-shell, xdg-decoration, fractional-scale, text-input-v3, data-device for clipboard and drag and drop, xdg-desktop-portal for file dialogs) with X11 (XCB) as a fallback; "cloaked" runs as an off-screen or headless compositor (e.g. `weston --backend=headless`). |
-| `audio` | WASAPI device enumeration, output and capture streams, the microphone consent store | PipeWire (or ALSA directly) for devices and streams. |
-| `midi` | WinMM `midiIn*`/`midiOut*` | ALSA sequencer, or PipeWire MIDI. |
-| `speech` | SAPI 5 `ISpVoice` speaking into a memory stream | speech-dispatcher or eSpeak NG into a buffer. |
-| `camera` | Media Foundation source readers (`MFEnumDeviceSources`, NV12 output) and the webcam consent store | V4L2 (or PipeWire camera portals), converting to NV12. |
-| `media_codec` | Media Foundation encoder transforms (`MFTEnumEx`: H.264, HEVC and AAC; the system's own and the drivers' hardware encoders) | VA-API or V4L2 memory-to-memory encoders, and GStreamer's system plug-ins where installed; none listed otherwise. |
+| `audio` | WASAPI device enumeration, output and capture streams, the microphone consent store | PulseAudio's client library for devices and streams (PipeWire and WSLg serve it). |
+| `midi` | WinMM `midiIn*`/`midiOut*` | ALSA sequencer. |
+| `speech` | SAPI 5 `ISpVoice` speaking into a memory stream | Unsupported: speech-dispatcher speaks to the output itself, and eSpeak NG is GPL. |
+| `camera` | Media Foundation source readers (`MFEnumDeviceSources`, NV12 output) and the webcam consent store | V4L2, converting to NV12. |
+| `media_codec` | Media Foundation encoder transforms (`MFTEnumEx`: H.264, HEVC and AAC; the system's own and the drivers' hardware encoders) | GStreamer, opened at run time, with the system's own plug-ins (software, VA-API, V4L2 memory-to-memory, as installed); none listed otherwise. |
 | `gpu` | Vulkan loader + `vkCreateWin32SurfaceKHR`; D2D, DirectWrite and WIC under CoreGraphics, CoreText and ImageIO | Vulkan with `VK_KHR_wayland_surface`/`xcb_surface` (Vulkan code is unchanged). The 2D stack needs a replacement for D2D/DirectWrite/WIC: Skia, or Cairo + FreeType + HarfBuzz + libpng/libjpeg, behind the same `gpu` area calls. This is the largest single piece of a port. |
 | `debug` | SetUnhandledExceptionFilter and SetErrorMode, RtlLookupFunctionEntry/RtlVirtualUnwind, RtlCaptureStackBackTrace, GetModuleHandleEx | `sigaction` for SIGSEGV/SIGBUS/SIGILL/SIGFPE on an alternate stack, `backtrace()` or libunwind, `dladdr` for module and offset. |
 | network policy (`ALCHEMY_NETWORK`) | in `src/alchemy/host/common/`, above the backends | unchanged: every backend inherits it. |
