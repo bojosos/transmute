@@ -25,7 +25,6 @@ FrameTimer::FrameTimer(FrameTimer&&) noexcept = default;
 FrameTimer& FrameTimer::operator=(FrameTimer&&) noexcept = default;
 FrameTimer::~FrameTimer() = default;
 Status FrameTimer::wait(std::uint64_t, std::uint32_t) { return Error::unsupported; }
-Result<std::vector<StackFrame>> sample_thread_stack(std::uint64_t, std::size_t) { return Error::unsupported; }
 Result<AlertAnswer> show_alert(const AlertDialog&) { return Error::unsupported; }
 Result<std::optional<std::vector<std::string>>> run_file_dialog(const FileDialog&) { return Error::unsupported; }
 std::vector<std::uintptr_t> disable_windows(std::span<const std::uintptr_t>, std::uintptr_t) { return {}; }
