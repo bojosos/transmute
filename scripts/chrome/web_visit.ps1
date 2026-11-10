@@ -668,7 +668,9 @@ try {
     Step "FAILED: $failure"
 } finally {
     if (-not $process.HasExited) {
-        & taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null
+        # A process of the tree that is already exiting cannot be terminated: taskkill reports it on stderr,
+        # which PowerShell 5.1 turns into a terminating error under 'Stop'.
+        try { & taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null } catch {}
         $process.WaitForExit(10000) | Out-Null
         Step "killed the tree of pid $($process.Id)"
     }

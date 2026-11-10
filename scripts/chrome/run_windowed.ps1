@@ -332,7 +332,8 @@ try {
 } finally {
     if (-not $process.HasExited) {
         # Only this run's own process tree.
-        & taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null
+        # A process already exiting makes taskkill write to stderr, a terminating error under 'Stop'.
+        try { & taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null } catch {}
         $process.WaitForExit(10000) | Out-Null
         Step "killed the tree of pid $($process.Id)"
     }
