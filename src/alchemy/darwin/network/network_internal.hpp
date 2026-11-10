@@ -5,6 +5,7 @@
 // friends) and CFNetwork. Not a contract header.
 
 #include "alchemy/darwin/security/security_internal.hpp"
+#include "alchemy/host/net.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -14,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace alchemy::gui::network {
@@ -98,6 +100,18 @@ void install_system_configuration_store(const std::shared_ptr<Bridge>& b);
 void install_system_configuration_network(const std::shared_ptr<Bridge>& b);
 // libresolv res_9_n* DNS queries against the Windows DNS servers (resolver.cpp).
 void install_resolver(const std::shared_ptr<Bridge>& b);
+// Unicast record queries for dns_sd's DNSServiceQueryRecord (resolver.cpp; host only, any thread).
+// unicast_servers: the DNS servers `api` may ask for `name`, or nullopt when the network policy refuses it
+// (ALCHEMY_NETWORK_DENY, or ALCHEMY_NETWORK=loopback with no loopback server; the denial line printed). Empty
+// when the host has no DNS server. unicast_records: one exchange; the answer records of `type` (255: any)
+// and `klass` (255: any), or a kDNSServiceErr_* code (no_such_name for NXDOMAIN, no_such_record for none,
+// timeout when no server answered).
+struct UnicastRecord { std::uint16_t type{}, klass{}; std::uint32_t ttl{}; std::vector<std::uint8_t> rdata; };
+[[nodiscard]] std::optional<std::vector<host::net::Address>> unicast_servers(std::string_view api, std::string_view name);
+[[nodiscard]] std::variant<std::vector<UnicastRecord>, std::int32_t> unicast_records(
+    std::string_view api, const std::vector<host::net::Address>& servers, std::string_view name, std::uint16_t klass, std::uint16_t type);
+// Tests: the servers unicast_servers starts from instead of the host's (nullopt restores the host's).
+void set_unicast_servers_for_testing(std::optional<std::vector<host::net::Address>> servers);
 // CFSocket (socket.cpp); replaces the installer frameworks' explicit failures.
 void install_sockets(const std::shared_ptr<Bridge>& b);
 

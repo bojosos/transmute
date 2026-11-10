@@ -49,7 +49,9 @@ struct Event {
     std::uint16_t port{};             // host byte order
     Bytes txt;                        // TXT record in wire format (resolved)
     std::vector<Bytes> addresses;     // Darwin sockaddr_in / sockaddr_in6 bytes with the service port (resolved, address)
-    std::uint32_t ttl{};              // address
+    std::uint32_t ttl{};              // address, record
+    std::uint16_t rrtype{}, rrclass{}; // record (dns_sd's unicast DNSServiceQueryRecord, kind found)
+    Bytes rdata;                      // record, names in it uncompressed
 };
 
 // Receives events on a host thread (the DNS-SD client's callback thread or a worker).

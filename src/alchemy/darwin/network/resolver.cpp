@@ -1,4 +1,5 @@
 #include "alchemy/darwin/network/network_internal.hpp"
+#include "alchemy/darwin/network/mdns.hpp"
 #include "alchemy/host/net.hpp"
 #include "alchemy/host/network_policy.hpp"
 #include "alchemy/host/time.hpp"
@@ -296,6 +297,43 @@ std::variant<Bytes, int> query(const std::vector<host::net::Address>& servers, s
     return std::move(*answer);
 }
 
+// The rdata of one answer record [at, at + length) with the domain names in it uncompressed, as dns_sd hands
+// rdata to a DNSServiceQueryRecord callback: NS, CNAME, PTR, MX, AFSDB, SRV and SOA (the types whose names
+// servers compress); other types are copied as they are. nullopt for a malformed record.
+std::optional<Bytes> plain_rdata(std::span<const std::uint8_t> message, std::size_t at, std::size_t length, std::uint16_t type) {
+    const auto end = at + length;
+    Bytes out;
+    auto position = at;
+    const auto name = [&] {
+        const auto expanded = expand_name(message, position);
+        if (!expanded) return false;
+        const auto wire = encode_name(expanded->first);
+        if (!wire) return false;
+        out.insert(out.end(), wire->begin(), wire->end());
+        position += expanded->second;
+        return position <= end;
+    };
+    const auto raw = [&](std::size_t count) {
+        if (position + count > end) return false;
+        out.insert(out.end(), message.begin() + static_cast<std::ptrdiff_t>(position), message.begin() + static_cast<std::ptrdiff_t>(position + count));
+        position += count;
+        return true;
+    };
+    bool good = true;
+    switch (type) {
+    case 2: case 5: case 12: good = name(); break;                  // NS, CNAME, PTR
+    case 15: case 18: good = raw(2) && name(); break;               // MX, AFSDB
+    case 33: good = raw(6) && name(); break;                        // SRV
+    case 6: good = name() && name() && raw(20); break;              // SOA
+    default: good = raw(length); break;
+    }
+    if (!good || position != end) return std::nullopt;
+    return out;
+}
+
+std::mutex unicast_test_mutex;
+std::optional<std::vector<host::net::Address>> unicast_test_servers;
+
 // A res_sockaddr_union entry (128 bytes: sockaddr_in or Darwin's sockaddr_in6), or nullopt for another family.
 std::optional<host::net::Address> server_entry(GuestMemory& m, Address at) {
     const auto family = m.read8(at + 1);
@@ -324,6 +362,73 @@ std::string read_cstring(GuestMemory& m, Address at) {
 }
 
 } // namespace
+
+void set_unicast_servers_for_testing(std::optional<std::vector<host::net::Address>> servers) {
+    std::lock_guard lock(unicast_test_mutex);
+    unicast_test_servers = std::move(servers);
+}
+
+std::optional<std::vector<host::net::Address>> unicast_servers(std::string_view api, std::string_view name) {
+    if (network_policy::refuse_listed_host(api, name)) return std::nullopt;   // ALCHEMY_NETWORK_DENY
+    std::vector<host::net::Address> servers;
+    {
+        std::lock_guard lock(unicast_test_mutex);
+        servers = unicast_test_servers ? *unicast_test_servers : configuration().servers;
+    }
+    if (servers.empty()) return servers;
+    if (network_policy::loopback_only()) {   // ALCHEMY_NETWORK=loopback: only loopback servers may be asked
+        std::erase_if(servers, [](const host::net::Address& server) { return !network_policy::loopback_address(server); });
+        if (servers.empty()) { network_policy::deny(api, name); return std::nullopt; }
+    }
+    network_policy::allowed(api, name);
+    return servers;
+}
+
+std::variant<std::vector<UnicastRecord>, std::int32_t> unicast_records(
+    std::string_view api, const std::vector<host::net::Address>& servers, std::string_view name, std::uint16_t klass, std::uint16_t type) {
+    namespace err = mdns::error;
+    const auto message = encode_query(name, random_id(), klass, type);
+    if (!message) return err::bad_param;
+    if (servers.empty()) return err::timeout;
+    const auto answer = send_message(api, servers, *message);
+    if (!answer) return err::timeout;
+    const std::span<const std::uint8_t> bytes(*answer);
+    const auto rcode = bytes[3] & 0x0f;
+    if (rcode == 3) return err::no_such_name;   // NXDOMAIN
+    if (rcode != 0) return err::no_such_record;
+    const auto count16 = [&](std::size_t at) { return static_cast<std::size_t>((bytes[at] << 8) | bytes[at + 1]); };
+    const auto questions = count16(4), answers = count16(6);
+    std::size_t at = 12;
+    for (std::size_t index = 0; index < questions; ++index) {
+        const auto skipped = expand_name(bytes, at);
+        if (!skipped || at + skipped->second + 4 > bytes.size()) return err::no_such_record;
+        at += skipped->second + 4;
+    }
+    std::vector<UnicastRecord> records;
+    for (std::size_t index = 0; index < answers; ++index) {
+        const auto owner = expand_name(bytes, at);
+        if (!owner || at + owner->second + 10 > bytes.size()) break;
+        at += owner->second;
+        UnicastRecord record;
+        record.type = static_cast<std::uint16_t>(count16(at));
+        record.klass = static_cast<std::uint16_t>(count16(at + 2));
+        record.ttl = static_cast<std::uint32_t>(count16(at + 4) << 16 | count16(at + 6));
+        const auto length = count16(at + 8);
+        at += 10;
+        if (at + length > bytes.size()) break;
+        // A recursive server answers through a CNAME chain with the chain's records first: those are skipped
+        // unless they were asked for.
+        if ((type == 255 || record.type == type) && (klass == 255 || record.klass == klass)) {
+            auto rdata = plain_rdata(bytes, at, length, record.type);
+            if (!rdata) break;
+            record.rdata = std::move(*rdata);
+            records.push_back(std::move(record));
+        }
+        at += length;
+    }
+    if (records.empty()) return err::no_such_record;
+    return records;
+}
 
 void install_resolver(const std::shared_ptr<Bridge>& b) {
     const auto install = [b](std::string name, transmute::GuestCallHandler handler) {
