@@ -483,6 +483,13 @@ void misc(Fixture& f) {
     require(f.status(sys, "_acl_valid", {0x1000}) == -1, "acl_valid: no acl_t exists");
     require(f.call(sys, "_acl_dup", {0x1000}) == 0 && f.status(sys, "_acl_set_fd", {0, 0x1000}) == -1 &&
             f.status(sys, "_acl_set_file", {f.text("/tmp"), 0x100, 0x1000}) == -1, "acl_dup / acl_set_*: no acl_t exists");
+    const auto acl_errno = [&] { return f.memory().read32(f.call(sys, "___error")); };
+    require(f.call(sys, "_acl_init", {4}) == 0 && acl_errno() == 45 && f.call(sys, "_acl_from_text", {f.text("!#acl 1\n")}) == 0 &&
+            acl_errno() == 45, "acl_init / acl_from_text: ENOTSUP");
+    const auto out = f.block(8);
+    require(f.status(sys, "_acl_create_entry", {out, out}) == -1 && acl_errno() == 22 && f.status(sys, "_acl_get_permset", {0x1000, out}) == -1 &&
+            f.status(sys, "_acl_add_perm", {0x1000, 2}) == -1 && f.status(sys, "_acl_get_flagset_np", {0x1000, out}) == -1 &&
+            f.call(sys, "_acl_to_text", {0x1000, 0}) == 0, "the editing calls: no acl_t exists (EINVAL)");
     require(f.status(sys, "_fsetattrlist", {0, f.block(24), f.block(16), 16, 0}) == -1, "fsetattrlist: no attribute lists");
     // QoS overrides are tokens.
     const auto override_token = f.call(sys, "_pthread_override_qos_class_start_np", {f.call(sys, "_pthread_self"), 0x19, 0});

@@ -39,7 +39,8 @@
 // Documented failures:
 // - ACLs: files carry no extended ACL. acl_get_link_np returns NULL with
 //   ENOENT (macOS's answer for a file without one); the entry and permset
-//   accessors fail with EINVAL, as no acl_t can exist.
+//   accessors and the editing calls fail with EINVAL, as no acl_t can exist:
+//   acl_init and acl_from_text, which would make one, fail with ENOTSUP.
 // - __mac_syscall: no MAC policy module is loaded (ENOSYS).
 // - getattrlist and its family: fs/attrlist.cpp (installed earlier, with the gaps).
 // - csops operations other than CS_OPS_STATUS: ENOTSUP (no code signature).
@@ -373,6 +374,17 @@ void Leftovers::install() {
     // (cmake copies a file's ACL with acl_get_fd, which finds none, then acl_set_fd).
     fn(libsystem, "_acl_dup", [this](CpuState&, GuestMemory&) -> Address { set_errno(einval); return 0; });
     for (const auto name : {"_acl_set_fd", "_acl_set_fd_np", "_acl_set_file", "_acl_set_link_np"})
+        fn(libsystem, name, [this](CpuState&, GuestMemory&) { set_errno(einval); return minus_one; });
+    // Building an ACL in memory (acl_init, acl_from_text) is not provided: Alchemy has no ACL support, so it
+    // hands out no acl_t, and these fail with ENOTSUP (libarchive's tar --acls takes that as "no ACLs").
+    for (const auto name : {"_acl_init", "_acl_from_text"})
+        fn(libsystem, name, [this](CpuState&, GuestMemory&) -> Address { set_errno(enotsup); return 0; });
+    // The editing calls take an acl_t, an entry, a permset or a flagset, and none can exist: EINVAL
+    // (acl_to_text returns NULL).
+    fn(libsystem, "_acl_to_text", [this](CpuState&, GuestMemory&) -> Address { set_errno(einval); return 0; });
+    for (const auto name : {"_acl_create_entry", "_acl_create_entry_np", "_acl_set_tag_type", "_acl_set_qualifier", "_acl_get_permset",
+                            "_acl_get_perm_np", "_acl_add_perm", "_acl_clear_perms", "_acl_get_flagset_np", "_acl_get_flag_np",
+                            "_acl_add_flag_np", "_acl_clear_flags_np"})
         fn(libsystem, name, [this](CpuState&, GuestMemory&) { set_errno(einval); return minus_one; });
 
     // ---- security and code signing ----
