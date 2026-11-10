@@ -264,7 +264,7 @@ void install_libsystem_exc(Provider& p) {
             .call_regs(handler(m, identity ? "catch_exception_raise_state_identity" : "catch_exception_raise_state"), registers).x0);
         fail(result);
         if (result != 0) return 1;   // an error reply: RetCode only
-        const auto new_count = std::min(m.read32(out + 40), state_max);
+        const auto new_count = std::min(m.read32(out + 40), std::uint32_t{state_max});
         m.write32(out + 40, new_count);
         m.write32(out + 4, 44 + 4 * new_count);
         return 1;
