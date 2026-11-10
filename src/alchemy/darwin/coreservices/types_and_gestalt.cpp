@@ -1,5 +1,6 @@
 #include "alchemy/darwin/headless_additions.hpp"
 #include "alchemy/darwin/headless_provider.hpp"
+#include "alchemy/darwin/coreservices/uttype.hpp"
 
 #include <cctype>
 #include <optional>
@@ -13,6 +14,8 @@
 // binds them first); registered in both builds by install_darwin_frameworks.
 namespace alchemy::darwin_headless {
 namespace {
+
+namespace uti = alchemy::gui::completion_kit::uttype;
 
 class TypesAndGestalt final : public Provider {
 public:
@@ -64,16 +67,33 @@ public:
             }
             s.x[0] = 0;
         });
+        // The MIME type and OSType tags (and extensions of types this short table lacks) come from the
+        // type table (coreservices/uttype.cpp).
         function(core_services, "_UTTypeCopyPreferredTagWithClass", [this](CpuState& s, GuestMemory&) {
-            const auto* type = s.x[0] ? uniform_type(cf.utf8(s.x[0])) : nullptr;
-            const bool extension_class = s.x[1] && cf.utf8(s.x[1]) == "public.filename-extension";
-            s.x[0] = type && extension_class && !type->extension.empty() ? cf.string(type->extension) : 0;
+            if (!s.x[0] || !s.x[1]) { s.x[0] = 0; return; }
+            const auto identifier = cf.utf8(s.x[0]), tag_class = cf.utf8(s.x[1]);
+            const auto* type = uniform_type(identifier);
+            if (tag_class == "public.filename-extension" && type && !type->extension.empty()) { s.x[0] = cf.string(type->extension); return; }
+            const auto tag = tag_class == "public.filename-extension" ? std::optional(uti::Tag::filename_extension)
+                             : tag_class == "public.mime-type"        ? std::optional(uti::Tag::mime_type)
+                             : tag_class == "com.apple.ostype"        ? std::optional(uti::Tag::ostype)
+                                                                      : std::nullopt;
+            const auto value = tag ? uti::preferred_tag(identifier, *tag) : std::nullopt;
+            s.x[0] = value ? cf.string(*value) : 0;
         });
         function(core_services, "_UTTypeCreatePreferredIdentifierForTag", [this](CpuState& s, GuestMemory&) {
             if (!s.x[0] || !s.x[1]) { s.x[0] = 0; return; }
             const auto tag_class = cf.utf8(s.x[0]);
             auto tag = cf.utf8(s.x[1]);
+            const auto declared = [&](uti::Tag kind, std::string_view value) -> std::optional<std::string> {
+                const auto found = uti::for_tag(kind, value, s.x[2] ? cf.utf8(s.x[2]) : std::string());
+                return found && uti::find(*found) ? found : std::nullopt;
+            };
+            if (tag_class == "com.apple.ostype")   // OSTypes are case-sensitive
+                if (const auto found = declared(uti::Tag::ostype, tag)) { s.x[0] = cf.string(*found); return; }
             for (auto& c : tag) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (tag_class == "public.mime-type")
+                if (const auto found = declared(uti::Tag::mime_type, tag)) { s.x[0] = cf.string(*found); return; }
             if (tag_class == "public.filename-extension") {
                 if (tag == "jpeg") tag = "jpg";
                 if (tag == "htm") tag = "html";

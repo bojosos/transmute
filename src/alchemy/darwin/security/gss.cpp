@@ -27,7 +27,10 @@
 //   - names are real mechanism-independent objects (gss_import_name,
 //     gss_display_name, gss_compare_name, gss_duplicate_name,
 //     gss_release_name), as the bindings allow without any mechanism;
-//   - gss_indicate_mechs reports an empty mechanism set;
+//   - gss_indicate_mechs reports an empty mechanism set; OID sets are real
+//     (gss_create_empty_oid_set, gss_add_oid_set_member, gss_test_oid_set_member,
+//     gss_release_oid_set), and gss_release_oid clears the handle (only static
+//     OIDs are ever handed out);
 //   - everything that needs a mechanism (credentials, contexts, per-message
 //     tokens) fails with GSS_S_UNAVAILABLE and minor status
 //     alchemy_minor_no_mechanism; gss_display_status explains it;
@@ -265,13 +268,76 @@ void install_gss(InstallContext& context) {
         m.write64(s.x[1], set);
         return gss_s_complete;
     });
-    // OM_uint32 gss_release_oid_set(OM_uint32* minor, gss_OID_set* set)
+    // OM_uint32 gss_release_oid_set(OM_uint32* minor, gss_OID_set* set): the set, its array and each member's
+    // elements (all malloc blocks of the calls below).
     install("_gss_release_oid_set", [gss](CpuState& s, GuestMemory& m) -> std::uint64_t {
         Gss::minor(m, s.x[0], 0);
         if (!s.x[1]) return gss_s_failure;
         const auto set = m.read64(s.x[1]);
-        if (set) { gss->free(m.read64(set + 8)); gss->free(set); }
+        if (set) {
+            const auto count = m.read64(set), members = m.read64(set + 8);
+            for (std::uint64_t index = 0; members && index < count; ++index) gss->free(m.read64(members + index * 16 + 8));
+            gss->free(members);
+            gss->free(set);
+        }
         m.write64(s.x[1], 0);
+        return gss_s_complete;
+    });
+    // OM_uint32 gss_create_empty_oid_set(OM_uint32* minor, gss_OID_set* set)
+    install("_gss_create_empty_oid_set", [gss](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        Gss::minor(m, s.x[0], 0);
+        if (!s.x[1]) return gss_s_failure;
+        const auto set = gss->malloc(16);
+        m.write64(set, 0);
+        m.write64(set + 8, 0);
+        m.write64(s.x[1], set);
+        return gss_s_complete;
+    });
+    // Whether `set` holds an OID with these elements.
+    const auto holds = [](GuestMemory& m, std::uint64_t set, const std::vector<std::uint8_t>& wanted) {
+        const auto count = m.read64(set), members = m.read64(set + 8);
+        for (std::uint64_t index = 0; members && index < count; ++index)
+            if (Gss::read_oid(m, members + index * 16) == wanted) return true;
+        return false;
+    };
+    // OM_uint32 gss_add_oid_set_member(OM_uint32* minor, const gss_OID member, gss_OID_set* set): a copy of the
+    // member, unless the set already holds it.
+    install("_gss_add_oid_set_member", [gss, holds](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        Gss::minor(m, s.x[0], 0);
+        if (!s.x[1] || !s.x[2] || !m.read64(s.x[2])) return gss_s_failure;
+        const auto set = m.read64(s.x[2]);
+        std::vector<std::uint8_t> member;
+        try { member = Gss::read_oid(m, s.x[1]); } catch (const std::invalid_argument&) { return gss_s_failure; }
+        if (holds(m, set, member)) return gss_s_complete;
+        const auto count = m.read64(set), old_members = m.read64(set + 8);
+        const auto members = gss->malloc((count + 1) * 16);
+        for (std::uint64_t index = 0; index < count; ++index) {
+            m.write64(members + index * 16, m.read64(old_members + index * 16));
+            m.write64(members + index * 16 + 8, m.read64(old_members + index * 16 + 8));
+        }
+        const auto elements = gss->malloc(member.size());
+        if (!member.empty()) m.write_bytes(elements, member);
+        m.write32(members + count * 16, static_cast<std::uint32_t>(member.size()));
+        m.write32(members + count * 16 + 4, 0);
+        m.write64(members + count * 16 + 8, elements);
+        m.write64(set, count + 1);
+        m.write64(set + 8, members);
+        gss->free(old_members);
+        return gss_s_complete;
+    });
+    // OM_uint32 gss_test_oid_set_member(OM_uint32* minor, const gss_OID member, const gss_OID_set set, int* present)
+    install("_gss_test_oid_set_member", [holds](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        Gss::minor(m, s.x[0], 0);
+        if (!s.x[1] || !s.x[2] || !s.x[3]) return gss_s_failure;
+        try { m.write32(s.x[3], holds(m, s.x[2], Gss::read_oid(m, s.x[1])) ? 1 : 0); }
+        catch (const std::invalid_argument&) { return gss_s_failure; }
+        return gss_s_complete;
+    });
+    // OM_uint32 gss_release_oid(OM_uint32* minor, gss_OID* oid): these calls hand out only the static OIDs
+    // exported below, so there is nothing to free; the handle is cleared.
+    install("_gss_release_oid", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        Gss::minor(m, s.x[0], 0);
+        if (s.x[1]) m.write64(s.x[1], 0);
         return gss_s_complete;
     });
     // Everything that needs a mechanism. The output handles are cleared.
@@ -329,6 +395,15 @@ void install_gss(InstallContext& context) {
         if (s.x[3]) m.write32(s.x[3], 0);
         if (s.x[4]) m.write32(s.x[4], 0);
         if (s.x[5]) m.write64(s.x[5], 0);
+        return gss_s_no_cred;
+    });
+    // gss_inquire_cred_by_mech(minor, cred, mech, name*, initiator lifetime*, acceptor lifetime*, usage*)
+    install("_gss_inquire_cred_by_mech", [](CpuState& s, GuestMemory& m) -> std::uint64_t {
+        Gss::minor(m, s.x[0], alchemy_minor_no_mechanism);
+        if (s.x[3]) m.write64(s.x[3], 0);
+        if (s.x[4]) m.write32(s.x[4], 0);
+        if (s.x[5]) m.write32(s.x[5], 0);
+        if (s.x[6]) m.write32(s.x[6], 0);
         return gss_s_no_cred;
     });
     // Per-message calls need an established context, which never exists.

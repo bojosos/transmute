@@ -277,7 +277,7 @@ struct DictionaryPayload : ObjectPayload { std::mutex mutex; std::vector<std::pa
     std::function<std::uint64_t(std::uint64_t)> count_guest; std::function<std::uint64_t(std::uint64_t, std::uint64_t)> lookup_guest; };
 struct UrlPayload : ObjectPayload { std::string path; bool directory{}; std::uint64_t string{}; };
 struct DatePayload : ObjectPayload { double time{}; };
-struct EnumeratorPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint64_t> urls; std::size_t next{}; };
+struct EnumeratorPayload : ObjectPayload { std::mutex mutex; std::vector<std::uint64_t> urls; std::size_t next{}; bool failed{}; };
 // Locale identifiers follow the ICU/CFLocale form language[_Script][_COUNTRY][_VARIANT].
 struct LocaleParts { std::string identifier, language, script, country, variant; };
 struct LocalePayload : ObjectPayload { LocaleParts parts; std::mutex mutex; std::map<std::string, std::uint64_t, std::less<>> values; };
@@ -389,7 +389,8 @@ constexpr std::string_view url_keys[] = {
     "IsPackageKey", "IsHiddenKey", "IsReadableKey", "IsWritableKey", "IsExecutableKey", "IsAliasFileKey",
     "FileSizeKey", "ContentModificationDateKey", "VolumeURLKey", "VolumeNameKey", "VolumeLocalizedNameKey",
     "VolumeIsLocalKey", "VolumeIsEjectableKey", "VolumeIsRemovableKey", "VolumeIsInternalKey", "VolumeIsReadOnlyKey",
-    "IsSystemImmutableKey", "VolumeSupportsCaseSensitiveNamesKey", "CreationDateKey", "AttributeModificationDateKey"};
+    "IsSystemImmutableKey", "VolumeSupportsCaseSensitiveNamesKey", "CreationDateKey", "AttributeModificationDateKey",
+    "IsApplicationKey", "QuarantinePropertiesKey"};
 // CF-lite key strings; the NSLocale names are the same objects.
 constexpr std::pair<std::string_view, std::string_view> locale_keys[] = {
     {"Identifier", "locale:id"}, {"LanguageCode", "locale:language code"}, {"CountryCode", "locale:country code"},
@@ -957,6 +958,8 @@ struct CoreFoundation::Impl {
         }
         if (name == "IsHiddenKey") return boolean(hidden_item || (file_name.size() > 1 && file_name[0] == '.' && file_name != ".."));
         if (name == "IsSystemImmutableKey") return boolean(false);   // host files have no system-immutable flag
+        if (name == "IsApplicationKey") return boolean(directory && host.extension() == ".app");
+        if (name == "QuarantinePropertiesKey") return std::uint64_t{0};   // Alchemy quarantines nothing
         if (name == "IsReadableKey") return boolean(error ? false : (permissions & std::filesystem::perms::owner_read) != std::filesystem::perms::none);
         if (name == "IsWritableKey") return boolean(!read_only_item && !(volume && volume->read_only));
         if (name == "IsExecutableKey") return boolean(directory || (!error && (permissions & std::filesystem::perms::owner_exec) != std::filesystem::perms::none));
@@ -1002,6 +1005,26 @@ struct CoreFoundation::Impl {
             name == "VolumeAvailableCapacityForOpportunisticUsageKey")
             return volume->available ? bytes(*volume->available) : std::uint64_t{0};
         return std::uint64_t{0};
+    }
+    // The items of a directory, read when the enumerator is made; one that cannot be read reports
+    // kCFURLEnumeratorError from its first CFURLEnumeratorGetNextURL.
+    std::uint64_t directory_enumerator(std::uint64_t directory_url) {
+        const auto directory = payload<UrlPayload>(directory_url, ObjectKind::url);
+        auto p = std::make_shared<EnumeratorPayload>();
+        try {
+            std::error_code error;
+            std::filesystem::directory_iterator items(host_path(*directory), error);
+            if (error) p->failed = true;
+            for (; !error && items != std::filesystem::directory_iterator(); items.increment(error)) {
+                const auto name = utf8_text(items->path().filename());
+                auto path = directory->path;
+                if (path.empty() || path.back() != '/') path.push_back('/');
+                std::error_code kind_error;
+                p->urls.push_back(make_url(path + name, items->is_directory(kind_error)));
+            }
+            if (error) p->failed = true;
+        } catch (...) { for (const auto value : p->urls) context.objects().release(value); throw; }
+        return create(ObjectKind::url_enumerator, p, [this, p](auto) { for (const auto value : p->urls) context.objects().release(value); });
     }
     std::uint64_t volume_enumerator() {
         auto p = std::make_shared<EnumeratorPayload>();
@@ -1338,9 +1361,22 @@ void CoreFoundation::Impl::install_extended() {
         if (a[2]) payload<ArrayPayload>(a[2], ObjectKind::array); // Prefetch keys only; properties are read on demand.
         return volume_enumerator();
     });
+    // CFURLEnumeratorCreateForDirectoryURL(allocator, directoryURL, option, propertyKeys): the directory's own
+    // items (kCFURLEnumeratorDefaultBehavior). Other options stop explicitly.
+    install("CFURLEnumeratorCreateForDirectoryURL", 4, [this](auto a) {
+        allocator(a[0]);
+        if (a[2]) invalid("CFURLEnumeratorCreateForDirectoryURL: only the default behaviour (option 0) is supported");
+        if (a[3]) payload<ArrayPayload>(a[3], ObjectKind::array); // Prefetch keys only; properties are read on demand.
+        return directory_enumerator(a[1]);
+    });
     install("CFURLEnumeratorGetNextURL", 3, [this](auto a) {
         const auto p = payload<EnumeratorPayload>(a[0], ObjectKind::url_enumerator);
         std::lock_guard lock(p->mutex);
+        if (p->failed && p->urls.empty() && p->next == 0) {
+            if (a[2]) memory().write64(a[2], 0);   // CFError objects are not produced
+            ++p->next;
+            return std::uint64_t{3};   // kCFURLEnumeratorError
+        }
         if (p->next >= p->urls.size()) return std::uint64_t{2}; // kCFURLEnumeratorEnd
         if (a[1]) memory().write64(a[1], p->urls[p->next]);
         ++p->next;

@@ -14,7 +14,7 @@ namespace alchemy {
 // GPU, audio device, input source or IOKit registry exists, so queries answer
 // "none" and operations that would need a device return the framework's
 // documented failure code. Absent symbols stay unresolved and fail at bind.
-inline constexpr std::array<std::string_view, 55> darwin_framework_libraries{
+inline constexpr std::array<std::string_view, 56> darwin_framework_libraries{
     "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit",
     "/System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa",
     "/System/Library/Frameworks/Metal.framework/Versions/A/Metal",
@@ -108,7 +108,9 @@ inline constexpr std::array<std::string_view, 55> darwin_framework_libraries{
     // Apple's HVF (hierarchical variable font) part renderer, which FreeType's HVF driver links
     // (mpv's bundled libfreetype): no HVF renderer exists, so FreeType treats HVF fonts as
     // unreadable (src/alchemy/darwin/coregraphics/graphics_gaps.cpp).
-    "/usr/lib/libhvf.dylib"};
+    "/usr/lib/libhvf.dylib",
+    // An always-empty address book (Firefox, VLC, LibreOffice; src/alchemy/darwin/addressbook).
+    "/System/Library/Frameworks/AddressBook.framework/Versions/A/AddressBook"};
 
 [[nodiscard]] inline bool darwin_framework_library(std::string_view library) {
     return std::find(darwin_framework_libraries.begin(), darwin_framework_libraries.end(), library) !=

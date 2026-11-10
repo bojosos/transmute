@@ -18,6 +18,7 @@
 #include "alchemy/darwin/opengl/install.hpp"
 #include "alchemy/darwin/openal/openal.hpp"
 #include "alchemy/darwin/safariservices/install.hpp"
+#include "alchemy/darwin/addressbook/install.hpp"
 #include "alchemy/darwin/usernotifications/install.hpp"
 #include "alchemy/darwin/vision/install.hpp"
 #include "alchemy/darwin/screencapturekit/install.hpp"
@@ -112,6 +113,7 @@ constexpr Installer installers[] = {
     {"install_mediaplayer", mediaplayer::install_mediaplayer},
     {"install_metalfx", metalfx::install_metalfx},
     {"install_safariservices", safariservices::install_safariservices},
+    {"install_addressbook", addressbook::install_addressbook},
     {"install_usernotifications", usernotifications::install_usernotifications},
     {"install_vision", vision::install_vision},
     {"install_screencapturekit", screencapturekit::install_screencapturekit},
@@ -122,6 +124,7 @@ constexpr Installer installers[] = {
     {"install_storekit", storekit::install_storekit},
     {"install_coredata", coredata::install_coredata},
     {"install_systemextensions", systemextensions::install_systemextensions},
+    {"install_foundation_legacy_classes", gui::install_foundation_legacy_classes},   // NSConnection, NSURLFileTypeMappings, ...
     {"install_values_kit", gui::values::install_values_kit}, // value-class frameworks (after the fill-only set)
 };
 

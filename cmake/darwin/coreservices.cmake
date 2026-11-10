@@ -12,7 +12,6 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/coreservices/services.cpp
     src/alchemy/darwin/coreservices/apple_events.cpp
     src/alchemy/darwin/coreservices/fsevents.cpp
-    src/alchemy/darwin/coreservices/uttype.cpp
     src/alchemy/darwin/coreservices/uttype_provider.cpp
     src/alchemy/darwin/coreservices/install.cpp)
 
@@ -50,7 +49,9 @@ alchemy_gui_add_framework_case(coreservices_application_registry src/alchemy/dar
 # Headless additions (both builds; darwin/headless_additions.hpp), moved from
 # darwin/identities/installer_frameworks.cpp:
 target_sources(alchemy_core PRIVATE
-    src/alchemy/darwin/coreservices/types_and_gestalt.cpp)
+    src/alchemy/darwin/coreservices/types_and_gestalt.cpp
+    # The type table (host-only) is both builds': the headless tag functions read its MIME and OSType tags.
+    src/alchemy/darwin/coreservices/uttype.cpp)
 # Headless shell (darwin/foundation/headless_shells.hpp): alchemy.exe only; the
 # _fx twin is empty, because there launch_services.cpp's registry owns the name.
 target_sources(alchemy_core PRIVATE src/alchemy/darwin/coreservices/launch_services_headless.cpp)

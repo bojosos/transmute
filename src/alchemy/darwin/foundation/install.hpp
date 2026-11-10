@@ -57,5 +57,7 @@ void install_foundation_kvc_collections_and_queues(support_kit::Support& support
 void install_foundation_files_and_bundles(support_kit::Support& support);        // streams.cpp, files.cpp, bundles.cpp
 void install_foundation_scripting(support_kit::Support& support);                // scripting.cpp
 void install_foundation_property_list_serialization(InstallContext& context);  // property_list_serialization.cpp
+// Its own installer-table row, with the fill-only frameworks:
+void install_foundation_legacy_classes(InstallContext& context);   // legacy_classes.cpp
 
 } // namespace alchemy::gui

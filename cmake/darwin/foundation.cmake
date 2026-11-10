@@ -83,6 +83,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/foundation/mutable_string.cpp
     src/alchemy/darwin/foundation/notification_blocks.cpp
     src/alchemy/darwin/foundation/property_list_serialization.cpp
+    src/alchemy/darwin/foundation/legacy_classes.cpp
     src/alchemy/darwin/foundation/value_classes.cpp
     src/alchemy/darwin/foundation/notification_center_fx.cpp
     src/alchemy/darwin/foundation/install.cpp)
@@ -206,6 +207,8 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/foundation/file_attribute_keys.cpp
     src/alchemy/darwin/foundation/threads_and_localizations.cpp)
 alchemy_gui_add_framework_case(foundation_file_attribute_keys src/alchemy/darwin/foundation/tests/file_attribute_keys_tests.cpp)
+alchemy_gui_add_framework_case(foundation_firefox_xul src/alchemy/darwin/foundation/tests/firefox_xul_tests.cpp)
+alchemy_gui_add_framework_case(foundation_vlc_mpv src/alchemy/darwin/foundation/tests/firefox_xul_tests.cpp)
 
 # Headless additions (both builds; darwin/headless_additions.hpp), moved from
 # darwin/identities/installer_frameworks.cpp:

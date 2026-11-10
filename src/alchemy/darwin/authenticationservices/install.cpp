@@ -78,7 +78,10 @@ void Provider::install() {
                              "ASAuthorizationPublicKeyCredentialLargeBlobRegistrationInput",
                              "ASAuthorizationPublicKeyCredentialPRFAssertionInput",
                              "ASAuthorizationPublicKeyCredentialPRFAssertionInputValues",
-                             "ASAuthorizationPublicKeyCredentialPRFRegistrationInput"})
+                             "ASAuthorizationPublicKeyCredentialPRFRegistrationInput",
+                             // No single sign-on extension issues a credential, and no web authentication session
+                             // is ever handed to this browser (Firefox's XUL).
+                             "ASAuthorizationSingleSignOnCredential", "ASWebAuthenticationSessionRequest"})
         static_cast<void>(cls(authentication_services, name, "NSObject"));
     // The browser session manager: Chrome registers its session handler; the
     // system never starts a web authentication session in this browser.

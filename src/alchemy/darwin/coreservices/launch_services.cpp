@@ -32,7 +32,9 @@
 //   or content type comes before the ranked choice. UTTypeIsDeclared,
 //   UTTypeIsDynamic and UTTypeCopyDeclaringBundleURL (the system types are
 //   CoreTypes.bundle's) answer from the UTI table. The item queries over
-//   FSRefs and URLs are file_manager.cpp's.
+//   FSRefs and URLs are file_manager.cpp's. LSCopyApplicationForMIMEType,
+//   LSGetApplicationForItem and LSOpenFromRefSpec (Firefox's XUL) answer as
+//   the content-type, URL and URL-spec calls do.
 // - Spotlight attributes cannot be set; Time Machine excludes nothing.
 // - Component Manager: no components (OpenDefaultComponent returns NULL).
 // The Qt WebEngine images first imported them (moved from
@@ -588,6 +590,76 @@ void LaunchServices::install() {
     raw(core_services, "_LSGetApplicationForURL", [this](CpuState& s, GuestMemory& m) {
         const auto apps = for_url(s.x[0], static_cast<std::uint32_t>(s.x[1]));
         s.x[0] = status(deliver(m, apps.empty() ? nullptr : apps[0], s.x[2], s.x[3]));
+    });
+    // OSStatus LSCopyApplicationForMIMEType(CFStringRef MIMEType, LSRolesMask, CFURLRef *outAppURL): the default
+    // application for the MIME type's content type.
+    raw(core_services, "_LSCopyApplicationForMIMEType", [this](CpuState& s, GuestMemory& m) {
+        if (s.x[2]) m.write64(s.x[2], 0);
+        const auto mime = lower(text_of(s.x[0]));
+        if (mime.empty() || !s.x[2]) { s.x[0] = status(param_err); return; }
+        const auto type = uti::for_tag(uti::Tag::mime_type, mime);
+        const auto apps = type ? for_type(*type, {}, static_cast<std::uint32_t>(s.x[1])) : std::vector<const Application*>{};
+        s.x[0] = status(deliver(m, apps.empty() ? nullptr : apps[0], 0, s.x[2]));
+    });
+    // OSStatus LSGetApplicationForItem(const FSRef *item, LSRolesMask, FSRef *outAppRef, CFURLRef *outAppURL): as
+    // LSGetApplicationForURL for the item's file URL.
+    raw(core_services, "_LSGetApplicationForItem", [this](CpuState& s, GuestMemory& m) {
+        if (s.x[3]) m.write64(s.x[3], 0);
+        if (!s.x[0]) { s.x[0] = status(param_err); return; }
+        const auto url = call(core_foundation, "_CFURLCreateFromFSRef", {0, s.x[0]});
+        if (!url) { s.x[0] = status(fnf_err); return; }
+        std::int32_t result = 0;
+        try {
+            const auto apps = for_url(url, static_cast<std::uint32_t>(s.x[1]));
+            result = deliver(m, apps.empty() ? nullptr : apps[0], s.x[2], s.x[3]);
+        } catch (...) { release(url); throw; }
+        release(url);
+        s.x[0] = status(result);
+    });
+    // OSStatus LSOpenFromRefSpec(const LSLaunchFSRefSpec *, FSRef *outLaunchedRef), the spec being
+    // { const FSRef *appRef; ItemCount numDocs; const FSRef *itemRefs; const AEDesc *passThruParams;
+    // LSLaunchFlags launchFlags; void *asyncRefCon; }: LSOpenFromURLSpec with the items' file URLs. The
+    // launched application is not a guest application, so outLaunchedRef is cleared.
+    raw(core_services, "_LSOpenFromRefSpec", [this](CpuState& s, GuestMemory& m) {
+        constexpr std::uint64_t fs_ref_size = 80;
+        if (s.x[1]) for (std::uint64_t at = 0; at < fs_ref_size; at += 8) m.write64(s.x[1] + at, 0);
+        if (!s.x[0]) { s.x[0] = status(param_err); return; }
+        const auto app_ref = m.read64(s.x[0]), count = m.read64(s.x[0] + 8), item_refs = m.read64(s.x[0] + 16);
+        const auto pass_through = m.read64(s.x[0] + 24);
+        const auto flags = m.read32(s.x[0] + 32);
+        const auto refcon = m.read64(s.x[0] + 40);
+        if (count && !item_refs) { s.x[0] = status(param_err); return; }
+        std::vector<Address> urls;
+        Address app_url = 0, items = 0;
+        const auto cleanup = [&] {
+            for (const auto url : urls) release(url);
+            if (app_url) release(app_url);
+            if (items) release(items);
+        };
+        std::int32_t result = 0;
+        try {
+            if (app_ref && !(app_url = call(core_foundation, "_CFURLCreateFromFSRef", {0, app_ref}))) result = fnf_err;
+            for (std::uint64_t index = 0; !result && index < count; ++index) {
+                const auto url = call(core_foundation, "_CFURLCreateFromFSRef", {0, item_refs + index * fs_ref_size});
+                if (!url) result = fnf_err;
+                else urls.push_back(url);
+            }
+            if (!result) {
+                items = urls.empty() ? 0 : cf.array(urls);
+                // LSLaunchURLSpec: { CFURLRef appURL; CFArrayRef itemURLs; const AEDesc *passThruParams; LSLaunchFlags launchFlags; void *asyncRefCon; }
+                const auto spec = process.allocate_guest(40, 8);
+                m.write64(spec, app_url);
+                m.write64(spec + 8, items);
+                m.write64(spec + 16, pass_through);
+                m.write64(spec + 24, flags);
+                m.write64(spec + 32, refcon);
+                try { result = static_cast<std::int32_t>(call(core_services, "_LSOpenFromURLSpec", {spec, 0})); }
+                catch (...) { process.release_guest(spec); throw; }
+                process.release_guest(spec);
+            }
+        } catch (...) { cleanup(); throw; }
+        cleanup();
+        s.x[0] = status(result);
     });
     // OSStatus LSGetApplicationForInfo(OSType type, OSType creator, CFStringRef extension, LSRolesMask, FSRef *, CFURLRef *)
     raw(core_services, "_LSGetApplicationForInfo", [this](CpuState& s, GuestMemory& m) {

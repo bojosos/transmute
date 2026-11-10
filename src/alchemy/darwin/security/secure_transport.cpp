@@ -451,6 +451,19 @@ void install_secure_transport(Security& sec) {
         m.write64(s.x[1], self->make_trust(st));
         return 0;
     }));
+    // SSLCopyPeerCertificates(ctx, CFArrayRef *certs) (deprecated; VLC): the peer's chain, leaf first, as
+    // SecCertificateRefs. NULL when the peer has sent none yet.
+    b.function(lib, "_SSLCopyPeerCertificates", with([self](SslState& st, CpuState& s, GuestMemory& m) -> std::int32_t {
+        if (!s.x[1]) return status::param;
+        m.write64(s.x[1], 0);
+        if (!st.session) return 0;
+        std::vector<Address> certificates;
+        for (const auto& certificate : st.session->peer_certificates()) certificates.push_back(self->sec.make_certificate(certificate));
+        if (certificates.empty()) return 0;
+        m.write64(s.x[1], self->b.cf.array(certificates));
+        for (const auto certificate : certificates) self->b.release(certificate);
+        return 0;
+    }));
     b.function(lib, "_SSLGetBufferedReadSize", with([](SslState& st, CpuState& s, GuestMemory& m) -> std::int32_t {
         if (!s.x[1]) return status::param;
         m.write64(s.x[1], st.session ? st.session->buffered() : 0);

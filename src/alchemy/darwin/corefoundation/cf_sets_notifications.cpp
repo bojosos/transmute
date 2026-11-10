@@ -20,6 +20,9 @@
 //   The Darwin notify center is another such object (name-only notify(3)
 //   notifications). CFNotificationCenterRemoveObserver removes the observer's
 //   registrations that match the name and object (NULL matches any).
+//   CFNotificationCenterPostNotification(WithOptions) delivers at once, on the
+//   posting thread: through NSNotificationCenter for the local center, and to
+//   this process's matching observers for the other two.
 // - CFArrayApplyFunction/ReplaceValues, CFBundleGetFunctionPointerForName
 //   (dlsym in the bundle's executable), CFBundleGetPackageInfo,
 //   CFStringCreateWithBytesNoCopy, CFStringGetFileSystemRepresentation
@@ -84,6 +87,7 @@ public:
     void install();
     void install_sets();
     void install_notification_centers();
+    void post_notification(Address center, Address name, Address object, Address user_info);
     void remove_observers(Address center, Address observer, Address name, Address object);
     void install_strings();
     void install_misc();
@@ -263,6 +267,41 @@ void CoreFoundationGaps::install_notification_centers() {
     raw(core_foundation, "_CFNotificationCenterRemoveObserver", [this](CpuState& s, GuestMemory&) {
         remove_observers(s.x[0], s.x[1], s.x[2], s.x[3]);
     });
+    // CFNotificationCenterPostNotification(center, name, object, userInfo, deliverImmediately) and
+    // ...WithOptions(center, name, object, userInfo, options): delivered now, on this thread.
+    const auto post = [this](CpuState& s, GuestMemory&) {
+        const auto center = s.x[0], name = s.x[1], object = s.x[2], user_info = s.x[3];
+        if (!center || !name) throw std::runtime_error("Alchemy: CFNotificationCenterPostNotification with a null center or name");
+        post_notification(center, name, object, user_info);
+    };
+    raw(core_foundation, "_CFNotificationCenterPostNotification", post);
+    raw(core_foundation, "_CFNotificationCenterPostNotificationWithOptions", post);
+}
+
+// The local center posts through NSNotificationCenter. The distributed and Darwin centers reach the
+// observers this process registered on them (no other process shares them): a NULL registered name
+// or object matches any. Darwin notifications carry no object or user info.
+void CoreFoundationGaps::post_notification(Address center, Address name, Address object, Address user_info) {
+    std::vector<DistributedObserver> targets;
+    bool own = false, darwin = false;
+    {
+        std::lock_guard lock(mutex);
+        own = own_center(center);
+        darwin = own && center == darwin_center;
+        if (own)
+            for (const auto& entry : distributed)
+                if (entry.center == center && (!entry.name || cf.equal(entry.name, name)) &&
+                    (darwin || !entry.object || entry.object == object || (object && cf.equal(entry.object, object))))
+                    targets.push_back(entry);
+    }
+    if (!own) {
+        static_cast<void>(send(center, "postNotificationName:object:userInfo:", {name, object, user_info}));
+        return;
+    }
+    for (const auto& entry : targets) {
+        const std::array<Address, 5> arguments{center, entry.observer, name, darwin ? 0 : object, darwin ? 0 : user_info};
+        static_cast<void>(bridge->call_address(entry.callback, arguments));
+    }
 }
 
 // Removes `observer`'s registrations on `center` whose name and object match
@@ -342,7 +381,6 @@ void CoreFoundationGaps::install_strings() {
     string(core_foundation, "_NSCalendarIdentifierGregorian", "gregorian");
     string(core_foundation, "_NSSystemTimeZoneDidChangeNotification", "NSSystemTimeZoneDidChangeNotification");
     string(core_foundation, "_kCFTimeZoneSystemTimeZoneDidChangeNotification", "NSSystemTimeZoneDidChangeNotification");
-    string(core_foundation, "_NSURLQuarantinePropertiesKey", "NSURLQuarantinePropertiesKey");
 }
 
 void CoreFoundationGaps::install_misc() {

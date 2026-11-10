@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -27,7 +28,11 @@
 //     CFStringCreateWithFileSystemRepresentation, CFStringCreateMutableCopy,
 //     CFArrayAppendArray, CFAutorelease, CFStringGetSystemEncoding;
 //   - CFUUID bytes, CFURLCopyResourcePropertiesForKeys (with volume
-//     capacities), and the bookmark functions (hosts have no alias files).
+//     capacities), and the bookmark functions (hosts have no alias files);
+//   - for Firefox's XUL: CFBundleIsArchitectureLoadable (arm64), CFURLGetFSRef
+//     and CFURLCreateFromFSRef (through CoreServices' FSRefs),
+//     CFPropertyListCreateWithStream (the stream's bytes, then
+//     CFPropertyListCreateWithData), CFMessagePortCreateRunLoopSource.
 namespace alchemy::export_fill {
 namespace {
 
@@ -608,6 +613,152 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
         }
         if (error_out) m.write32(error_out, 0);
         s.x[0] = 1;
+    });
+
+    // ---- Firefox's XUL ----
+    const auto call_export = [&process](std::string_view library, std::string_view symbol, std::initializer_list<std::uint64_t> arguments) {
+        const auto found = process.resolve(library, symbol);
+        if (!found) throw std::runtime_error("Alchemy CoreFoundation: missing " + std::string(symbol));
+        return process.calling_engine().invoke_callback(found->address, std::span(arguments.begin(), arguments.size()));
+    };
+    // Boolean CFBundleIsArchitectureLoadable(cpu_type_t): this process runs arm64 code only (CPU_TYPE_ARM64).
+    function(cf_library, "_CFBundleIsArchitectureLoadable", [](CpuState& s, GuestMemory&) {
+        constexpr std::uint32_t cpu_type_arm64 = 0x0100000C;
+        s.x[0] = static_cast<std::uint32_t>(s.x[0]) == cpu_type_arm64;
+    });
+    // Boolean CFURLGetFSRef(CFURLRef, FSRef*): the file system item at a file URL, through CoreServices'
+    // FSPathMakeRef (false for a missing item or a URL that is not a file URL).
+    function(cf_library, "_CFURLGetFSRef", [&process, call_export](CpuState& s, GuestMemory&) {
+        if (!s.x[0] || !s.x[1]) { s.x[0] = 0; return; }
+        constexpr std::uint64_t capacity = 4096;
+        const auto buffer = process.allocate_guest(capacity, 1);
+        bool made = false;
+        try {
+            made = (call_export(core_foundation_library, "_CFURLGetFileSystemRepresentation", {s.x[0], 1, buffer, capacity}) & 0xff) != 0 &&
+                   static_cast<std::int32_t>(call_export(core_services_library, "_FSPathMakeRef", {buffer, s.x[1], 0})) == 0;
+        } catch (...) { process.release_guest(buffer); throw; }
+        process.release_guest(buffer);
+        s.x[0] = made;
+    });
+    // CFURLRef CFURLCreateFromFSRef(allocator, const FSRef*): a file URL for the item (NULL when the
+    // reference no longer names one).
+    function(cf_library, "_CFURLCreateFromFSRef", [&process, call_export](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) { s.x[0] = 0; return; }
+        constexpr std::uint64_t capacity = 4096;
+        const auto buffer = process.allocate_guest(capacity, 1);
+        std::uint64_t url = 0;
+        try {
+            if (static_cast<std::int32_t>(call_export(core_services_library, "_FSRefMakePath", {s.x[1], buffer, capacity})) == 0) {
+                std::string path;
+                for (std::uint64_t at = buffer; at < buffer + capacity; ++at) {
+                    const auto byte = m.read8(at);
+                    if (!byte) break;
+                    path.push_back(static_cast<char>(byte));
+                }
+                std::error_code error;
+                const bool directory = std::filesystem::is_directory(host_path(process, path), error);
+                url = call_export(core_foundation_library, "_CFURLCreateFromFileSystemRepresentation", {s.x[0], buffer, path.size(), directory});
+            }
+        } catch (...) { process.release_guest(buffer); throw; }
+        process.release_guest(buffer);
+        s.x[0] = url;
+    });
+    // CFPropertyListRef CFPropertyListCreateWithStream(allocator, CFReadStreamRef stream, CFIndex streamLength,
+    // CFOptionFlags options, CFPropertyListFormat* format, CFErrorRef* error): reads the opened stream
+    // (streamLength bytes, or to its end when 0) and parses the bytes as CFPropertyListCreateWithData does.
+    function(cf_library, "_CFPropertyListCreateWithStream", [&process, call_export](CpuState& s, GuestMemory& m) {
+        const auto allocator = s.x[0], stream = s.x[1], options = s.x[3], format = s.x[4], error_out = s.x[5];
+        const auto wanted = static_cast<std::int64_t>(s.x[2]);
+        if (error_out) m.write64(error_out, 0);   // CFError objects are not produced; the failure is the NULL result
+        if (!stream || wanted < 0) { s.x[0] = 0; return; }
+        constexpr std::uint64_t chunk = 65536;
+        const auto buffer = process.allocate_guest(chunk, 1);
+        std::vector<std::uint8_t> bytes;
+        bool failed = false;
+        try {
+            while (wanted == 0 || static_cast<std::int64_t>(bytes.size()) < wanted) {
+                const auto ask = wanted == 0 ? chunk : std::min<std::uint64_t>(chunk, static_cast<std::uint64_t>(wanted) - bytes.size());
+                const auto got = static_cast<std::int64_t>(call_export(core_foundation_library, "_CFReadStreamRead", {stream, buffer, ask}));
+                if (got < 0) { failed = true; break; }
+                if (got == 0) break;
+                const auto old = bytes.size();
+                bytes.resize(old + static_cast<std::size_t>(got));
+                m.read_bytes(buffer, std::span(bytes.data() + old, static_cast<std::size_t>(got)));
+            }
+        } catch (...) { process.release_guest(buffer); throw; }
+        process.release_guest(buffer);
+        if (failed || bytes.empty()) { s.x[0] = 0; return; }
+        const auto staging = process.allocate_guest(bytes.size(), 1);
+        process.main_engine().write_bytes(staging, bytes);
+        std::uint64_t data = 0, list = 0;
+        try {
+            data = call_export(core_foundation_library, "_CFDataCreate", {0, staging, bytes.size()});
+            list = call_export(core_foundation_library, "_CFPropertyListCreateWithData", {allocator, data, options, format, error_out});
+        } catch (...) {
+            process.release_guest(staging);
+            if (data) process.objects().release(data);
+            throw;
+        }
+        process.release_guest(staging);
+        if (data) process.objects().release(data);
+        s.x[0] = list;
+    });
+    // CFRunLoopSourceRef CFMessagePortCreateRunLoopSource(allocator, CFMessagePortRef local, CFIndex order): a
+    // source to schedule. Requests to a local port run its callout synchronously when they are sent
+    // (libsystem/misc/system_c.cpp), so the source is never signalled.
+    const auto port_perform = process.install_function("___alchemy_cf_message_port_source_perform", [](CpuState&, GuestMemory&) {},
+                                                       "alchemy.internal");
+    function(cf_library, "_CFMessagePortCreateRunLoopSource", [&process, call_export, port_perform](CpuState& s, GuestMemory& m) {
+        if (!s.x[1]) { s.x[0] = 0; return; }
+        // CFRunLoopSourceContext (version 0): version, info, retain, release, copyDescription, equal, hash, schedule, cancel, perform.
+        const auto context = process.allocate_guest(80, 8);
+        for (std::uint64_t at = 0; at < 80; at += 8) m.write64(context + at, 0);
+        m.write64(context + 8, s.x[1]);
+        m.write64(context + 72, port_perform);
+        std::uint64_t source = 0;
+        try { source = call_export(core_foundation_library, "_CFRunLoopSourceCreate", {s.x[0], s.x[2], context}); }
+        catch (...) { process.release_guest(context); throw; }
+        process.release_guest(context);
+        s.x[0] = source;
+    });
+    constant_string(process, cf, cf_library, "_kCFLocaleCurrentLocaleDidChangeNotification", "kCFLocaleCurrentLocaleDidChangeNotification");
+    // CFStringRef CFStringTokenizerCopyBestStringLanguage(CFStringRef, CFRange) (VLC): a language only where the
+    // writing system names one (kana: ja, Hangul: ko, Thai, Greek, Hebrew, Armenian, Georgian), from the
+    // letters in the range; NULL when it cannot be determined (Latin, Cyrillic, Arabic or Han text alone),
+    // as the call documents.
+    function(cf_library, "_CFStringTokenizerCopyBestStringLanguage", [&cf](CpuState& s, GuestMemory&) {
+        const auto string = s.x[0];
+        const auto location = static_cast<std::int64_t>(s.x[1]), length = static_cast<std::int64_t>(s.x[2]);
+        s.x[0] = 0;
+        if (!string || location < 0 || length < 0) return;
+        const auto text = cf.utf8(string);
+        std::map<std::string, std::size_t> votes;
+        bool kana = false;
+        std::int64_t unit = 0;   // UTF-16 position
+        for (std::size_t at = 0; at < text.size();) {
+            const auto lead = static_cast<unsigned char>(text[at]);
+            const std::size_t size = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+            std::uint32_t code = size == 1 ? lead : lead & (0xff >> (size + 1));
+            for (std::size_t i = 1; i < size && at + i < text.size(); ++i) code = (code << 6) | (static_cast<unsigned char>(text[at + i]) & 0x3f);
+            at += size;
+            const std::int64_t units = code >= 0x10000 ? 2 : 1;
+            const bool inside = unit >= location && unit < location + length;
+            unit += units;
+            if (!inside) continue;
+            if ((code >= 0x3040 && code <= 0x30ff) || (code >= 0x31f0 && code <= 0x31ff)) kana = true;
+            else if ((code >= 0xac00 && code <= 0xd7af) || (code >= 0x1100 && code <= 0x11ff) || (code >= 0x3130 && code <= 0x318f)) ++votes["ko"];
+            else if (code >= 0x0e00 && code <= 0x0e7f) ++votes["th"];
+            else if (code >= 0x0370 && code <= 0x03ff) ++votes["el"];
+            else if (code >= 0x0590 && code <= 0x05ff) ++votes["he"];
+            else if (code >= 0x0530 && code <= 0x058f) ++votes["hy"];
+            else if (code >= 0x10a0 && code <= 0x10ff) ++votes["ka"];
+        }
+        std::string best = kana ? "ja" : "";
+        std::size_t most = 0;
+        if (!kana)
+            for (const auto& [language, count] : votes)
+                if (count > most) { most = count; best = language; }
+        if (!best.empty()) s.x[0] = cf.string(best);
     });
 
     // __NSDictionary0__struct: the immortal empty dictionary that clang emits
