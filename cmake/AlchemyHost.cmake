@@ -73,6 +73,13 @@ if(ALCHEMY_HOST STREQUAL "linux" AND alchemy_host_gui_sources)
     list(APPEND ALCHEMY_GUI_LINK_LIBRARIES PkgConfig::ALCHEMY_X11)
 endif()
 
+# Linux areas crypto and http (fw-foundation): OpenSSL 3 (libcrypto, libssl) and libcurl.
+if(ALCHEMY_HOST STREQUAL "linux")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ALCHEMY_LINUX_NET REQUIRED IMPORTED_TARGET libcurl openssl)
+    target_link_libraries(alchemy_core PRIVATE PkgConfig::ALCHEMY_LINUX_NET)
+endif()
+
 if(BUILD_TESTING)
     add_executable(alchemy_host_tests src/alchemy/host/tests/host_tests.cpp)
     target_link_libraries(alchemy_host_tests PRIVATE alchemy_core)

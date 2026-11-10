@@ -614,10 +614,13 @@ void crypto_area() {
     const std::string secret = "keychain contents";
     const std::string entropy = "entropy", other = "other";
     const auto sealed = crypto::protect(std::as_bytes(std::span(secret)), std::as_bytes(std::span(entropy)), "Alchemy host test");
-    require(sealed && !sealed->empty(), "protect");
-    const auto opened = crypto::unprotect(std::as_bytes(std::span(*sealed)), std::as_bytes(std::span(entropy)));
-    require(opened && std::string(opened->begin(), opened->end()) == secret, "unprotect");
-    require(!crypto::unprotect(std::as_bytes(std::span(*sealed)), std::as_bytes(std::span(other))), "unprotect with other entropy fails");
+    // A host without a per-user sealing key refuses explicitly (Linux, until where that key lives is decided).
+    if (sealed || sealed.error() != host::Error::unsupported) {
+        require(sealed && !sealed->empty(), "protect");
+        const auto opened = crypto::unprotect(std::as_bytes(std::span(*sealed)), std::as_bytes(std::span(entropy)));
+        require(opened && std::string(opened->begin(), opened->end()) == secret, "unprotect");
+        require(!crypto::unprotect(std::as_bytes(std::span(*sealed)), std::as_bytes(std::span(other))), "unprotect with other entropy fails");
+    }
     std::array<std::byte, 4> wipe{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
     crypto::secure_zero(wipe);
     require(wipe == std::array<std::byte, 4>{}, "secure_zero");
