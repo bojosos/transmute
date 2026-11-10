@@ -51,6 +51,8 @@ void install_av_capture(Support& support);
 // av_asset_writer.cpp: AVAssetWriter, AVAssetWriterInput and AVAssetWriterInputPixelBufferAdaptor: audio files and
 // MPEG-4, M4V and QuickTime movies (from install_av_foundation).
 void install_av_asset_writer(Support& support);
+// av_asset_export.cpp: AVAssetExportSession over AVAssetReader, AVAssetWriter and the movie muxer (from install_av_foundation).
+void install_av_asset_export(Support& support);
 // AVAuthorizationStatus of the camera (video) or microphone as AVCaptureDevice reports it; with `request`, after
 // +requestAccessForMediaType: would have decided it (no prompt). AVAudioApplication's record permission uses it.
 std::int64_t capture_authorization(bool video, bool request);

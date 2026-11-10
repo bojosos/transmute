@@ -100,6 +100,20 @@ and formats a container cannot hold, answer with the AudioFile errors.
 - Refused, as documented: settings no encoder here takes; linear PCM, and uncompressed video without settings,
   in movies; MP3 files.
 
+**AVAssetExportSession (real, `av_asset_export.cpp`):**
+- Passthrough remuxes an MPEG-4 or QuickTime file's H.264, HEVC, AAC and Apple Lossless samples. A time range keeps the
+  video from the sync sample before it, and the audio's pre-roll, trimmed by edit lists.
+- AppleM4A encodes the decodable audio (a composition's too, with its audio mix) as AAC.
+- The H.264 and HEVC presets read the first video track decoded and the audio, and encode them through AVAssetWriter:
+  - the sizes fit the preset's box and are never larger than the source (Alchemy's choices; the documentation
+    names the presets only);
+  - audio is AAC at the source's rate where the encoder takes it, at most two channels.
+- Discovery (`exportPresetsCompatibleWithAsset:`, `determineCompatibility...`, `supportedFileTypes`) lists what this
+  machine's decoders and encoders allow for the asset.
+- Errors: AVErrorEncoderNotFound, AVErrorDecoderNotFound, AVErrorFileAlreadyExists, and
+  AVErrorOperationNotSupportedForAsset (composition video; Passthrough of what does not remux).
+- An AVVideoComposition stops with an explicit message.
+
 **CoreMIDI 2.0 event lists (real, `coremidi.cpp`, `midi_ump.cpp`):** `MIDIEventListInit`/`Add`,
 `MIDISendEventList`, `MIDIReceivedEventList`, and ports and endpoints with a protocol or a block
 (`MIDIInputPortCreateWithProtocol`/`WithBlock`, `MIDIDestinationCreateWithProtocol`/`WithBlock`,
@@ -141,7 +155,7 @@ AudioToolbox names marked in `media_gaps.cpp` and `pixel_transfer.cpp`. AVAssetW
 - `AVVideoWidthKey` and the other dictionary keys carry their own names;
 - the compression properties carry the VideoToolbox keys' values (`AverageBitRate`, ...);
 - the codec types (`AVVideoCodecTypeH264`, `AVVideoCodecTypeHEVC`) carry the codecs' four-char codes (`avc1`,
-  `hvc1`).
+  `hvc1`). The `AVAssetExportPreset...` constants carry their own names (`av_asset_export.cpp`).
 
 ## Moved from darwin/identities/
 

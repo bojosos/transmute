@@ -1016,6 +1016,210 @@ void asset_writer_movie(Fixture& f) {
     std::filesystem::remove(mp4, ignored);
 }
 
+std::atomic<int>& exports_done() { static std::atomic<int> value{0}; return value; }
+
+// A QuickTime movie through AVAssetWriter: `frames` H.264 frames at 30 per second from the adaptor (a keyframe every
+// tenth) and `buffers` 0.1 s float buffers as AAC (the encoders installed decide which: fakes or the host's).
+void write_movie(Fixture& f, const std::filesystem::path& path, int frames, int buffers) {
+    const auto error = f.block(8);
+    const auto key = [&](const char* symbol) { return f.engine.read64(f.symbol(av, symbol)); };
+    const auto compression = f.cf.dictionary(std::vector<std::pair<Address, Address>>{{key("_AVVideoMaxKeyFrameIntervalKey"), f.cf.integer(10, 3)}});
+    const auto video_settings = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {key("_AVVideoCodecKey"), key("_AVVideoCodecTypeH264")}, {key("_AVVideoWidthKey"), f.cf.integer(64, 3)},
+        {key("_AVVideoHeightKey"), f.cf.integer(48, 3)}, {key("_AVVideoCompressionPropertiesKey"), compression}});
+    const auto aac_settings = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("AVFormatIDKey"), f.cf.integer(four("aac "), 3)}, {f.cf.string("AVSampleRateKey"), f.cf.real(48000)},
+        {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(2, 3)}});
+    const auto writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:",
+                               {f.cf.file_url(alchemy::guest_path_string(path), false), key("_AVFileTypeQuickTimeMovie"), error});
+    const auto video = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("vide"), video_settings});
+    const auto adaptor = f.send(f.cls("AVAssetWriterInputPixelBufferAdaptor"), "assetWriterInputPixelBufferAdaptorWithAssetWriterInput:sourcePixelBufferAttributes:", {video, 0});
+    const auto audio = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), aac_settings});
+    f.send(writer, "addInput:", {video});
+    f.send(writer, "addInput:", {audio});
+    require((f.send(writer, "startWriting") & 0xff) == 1, "writing the source movie");
+    f.send(writer, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+    const auto pool = f.send(adaptor, "pixelBufferPool");
+    const auto buffer_out = f.block(8), time = f.block(24);
+    for (int i = 0; i < std::max(frames, buffers); ++i) {
+        if (i < frames) {
+            require(f.status(cv, "_CVPixelBufferPoolCreatePixelBuffer", {0, pool, buffer_out}) == 0, "a pixel buffer");
+            const auto picture = f.engine.read64(buffer_out);
+            // A moving gradient in the luma plane.
+            f.call(cv, "_CVPixelBufferLockBaseAddress", {picture, 0});
+            const auto base = f.call(cv, "_CVPixelBufferGetBaseAddressOfPlane", {picture, 0}), row = f.call(cv, "_CVPixelBufferGetBytesPerRowOfPlane", {picture, 0});
+            for (Address y = 0; base && y < 48; ++y)
+                for (Address x = 0; x < 64; x += 4) {
+                    std::uint32_t word = 0;
+                    for (Address k = 0; k < 4; ++k) word |= static_cast<std::uint32_t>(((x + k) * 3 + y + static_cast<Address>(i) * 4) & 0xff) << (8 * k);
+                    f.engine.write32(base + y * row + x, word);
+                }
+            f.call(cv, "_CVPixelBufferUnlockBaseAddress", {picture, 0});
+            f.engine.write64(time, static_cast<std::uint64_t>(i * 20));
+            f.engine.write32(time + 8, 600);
+            f.engine.write32(time + 12, 1);
+            f.engine.write64(time + 16, 0);
+            require((f.send(adaptor, "appendPixelBuffer:withPresentationTime:", {picture, time}) & 0xff) == 1, "a source frame");
+        }
+        if (i < buffers) require((f.send(audio, "appendSampleBuffer:", {float_sample_buffer(f, 4800, 4800LL * i)}) & 0xff) == 1, "source audio");
+    }
+    f.send(video, "markAsFinished");
+    f.send(audio, "markAsFinished");
+    require((f.send(writer, "finishWriting") & 0xff) == 1, "the source movie completes");
+}
+
+// An export run to its end: the session's status.
+std::int64_t run_export(Fixture& f, Address asset, const char* preset, const char* type, const std::filesystem::path& out, Address range = 0) {
+    const auto b = alchemy::gui::security::bridge();
+    const auto session = f.send(f.cls("AVAssetExportSession"), "exportSessionWithAsset:presetName:", {asset, f.engine.read64(f.symbol(av, preset))});
+    require(session != 0, std::string("an export session for ") + preset);
+    f.send(session, "setOutputURL:", {f.cf.file_url(alchemy::guest_path_string(out), false)});
+    f.send(session, "setOutputFileType:", {f.engine.read64(f.symbol(av, type))});
+    if (range) f.send(session, "setTimeRange:", {range});
+    const auto before = exports_done().load();
+    const auto done = b->make_block([](transmute::CpuState&, transmute::GuestMemory&) { ++exports_done(); });
+    f.send(session, "exportAsynchronouslyWithCompletionHandler:", {done});
+    require(wait_for([&] { return exports_done() > before; }), std::string("the export finishes: ") + preset);
+    const auto status = static_cast<std::int64_t>(f.send(session, "status"));
+    if (status != 3) {
+        const auto error = f.send(session, "error");
+        std::cout << "[media capture] export " << preset << ": status " << status << ", error "
+                  << (error ? static_cast<std::int64_t>(f.send(error, "code")) : 0) << " "
+                  << (error ? f.cf.utf8(f.send(error, "localizedDescription")) : std::string{}) << std::endl;
+    }
+    return status;
+}
+
+// AVAssetExportSession (fakes): Passthrough of a movie into MPEG-4 (whole, and a time range), AppleM4A of a WAVE file,
+// the presets each asset allows, and an existing output file refused. Then, with the host's own codecs (skipped
+// without them), a movie re-encoded through a video preset.
+void asset_export(Fixture& f) {
+    namespace mc = alchemy::gui::completion_kit::media::container;
+    fake_video::install();
+    fake_aac::install();
+    const auto directory = std::filesystem::temp_directory_path();
+    const auto source = directory / "alchemy_export_source.mov", wav = directory / "alchemy_export_source.wav";
+    const auto passed = directory / "alchemy_export_passthrough.mp4", trimmed = directory / "alchemy_export_trimmed.mp4", m4a = directory / "alchemy_export.m4a",
+               encoded = directory / "alchemy_export_encoded.mov";
+    std::error_code ignored;
+    for (const auto& p : {source, wav, passed, trimmed, m4a, encoded}) std::filesystem::remove(p, ignored);
+    write_movie(f, source, 20, 7);
+    const auto asset = f.send(f.cls("AVURLAsset"), "URLAssetWithURL:options:", {f.cf.file_url(alchemy::guest_path_string(source), false), 0});
+    // The presets.
+    const auto names = [&](Address array) {
+        std::vector<std::string> out;
+        for (const auto item : f.cf.array_values(array)) out.push_back(f.cf.utf8(item));
+        return out;
+    };
+    const auto all = names(f.send(f.cls("AVAssetExportSession"), "allExportPresets"));
+    require(all.size() == 13 && std::find(all.begin(), all.end(), "AVAssetExportPresetPassthrough") != all.end(), "every preset: " + std::to_string(all.size()));
+    const auto movie_presets = names(f.send(f.cls("AVAssetExportSession"), "exportPresetsCompatibleWithAsset:", {asset}));
+    require(std::find(movie_presets.begin(), movie_presets.end(), "AVAssetExportPresetPassthrough") != movie_presets.end(), "the movie passes through");
+    // Passthrough into MPEG-4, optimized for network use.
+    require(run_export(f, asset, "_AVAssetExportPresetPassthrough", "_AVFileTypeMPEG4", passed) == 3, "Passthrough completes");
+    {
+        std::vector<std::uint8_t> original, copy;
+        const auto a = read_movie(source, original), b = read_movie(passed, copy);
+        require(b.brand == mc::fourcc("mp42") && b.tracks.size() == 2, "an MPEG-4 file of two tracks");
+        for (std::size_t t = 0; t < 2; ++t) {
+            require(a.tracks[t].codec == b.tracks[t].codec && a.tracks[t].samples.size() == b.tracks[t].samples.size() && a.tracks[t].priming == b.tracks[t].priming,
+                    "track " + std::to_string(t) + " as it was: " + std::to_string(a.tracks[t].samples.size()) + "/" + std::to_string(b.tracks[t].samples.size()) +
+                        " samples, priming " + std::to_string(a.tracks[t].priming) + "/" + std::to_string(b.tracks[t].priming) + ", codec " +
+                        std::to_string(a.tracks[t].codec) + "/" + std::to_string(b.tracks[t].codec));
+            for (std::size_t k = 0; k < a.tracks[t].samples.size(); ++k) {
+                const auto& x = a.tracks[t].samples[k];
+                const auto& y = b.tracks[t].samples[k];
+                require(x.size == y.size && x.pts - x.dts == y.pts - y.dts && x.keyframe == y.keyframe &&
+                            std::equal(original.begin() + static_cast<std::ptrdiff_t>(x.offset), original.begin() + static_cast<std::ptrdiff_t>(x.offset + x.size),
+                                       copy.begin() + static_cast<std::ptrdiff_t>(y.offset)),
+                        "sample " + std::to_string(k) + " of track " + std::to_string(t) + " as it was");
+            }
+        }
+    }
+    // A time range: 0.4 s from 0.4 s. The video from the keyframe before it (frame 10), the audio exactly (to its own end).
+    const auto range = f.block(48);
+    for (const auto [at, value] : std::initializer_list<std::pair<int, std::int64_t>>{{0, 240}, {24, 240}}) {
+        f.engine.write64(range + at, static_cast<std::uint64_t>(value));
+        f.engine.write32(range + at + 8, 600);
+        f.engine.write32(range + at + 12, 1);
+    }
+    require(run_export(f, asset, "_AVAssetExportPresetPassthrough", "_AVFileTypeMPEG4", trimmed, range) == 3, "Passthrough of a time range completes");
+    {
+        std::vector<std::uint8_t> bytes, original;
+        const auto cut = read_movie(trimmed, bytes);
+        const auto whole = read_movie(source, original);
+        const auto& v = cut.tracks[0];
+        const auto& a = cut.tracks[1];
+        const auto& sv = whole.tracks[0];
+        require(v.samples.size() == 10 && v.samples[0].keyframe, "the video from the keyframe before the range: " + std::to_string(v.samples.size()) + " frames");
+        // Each frame is presented 0.4 s (240 units) earlier than in the source.
+        for (std::size_t k = 0; k < v.samples.size(); ++k)
+            require((v.samples[k].pts - v.start) == (sv.samples[10 + k].pts - sv.start) - 240,
+                    "frame " + std::to_string(k) + " presented at its time less the range's start");
+        // The source's audio ends at 0.7 s: 0.3 s of it is in the range.
+        require(a.presented == 14400 && a.samples.size() <= 18, "the audio exactly: " + std::to_string(a.presented) + " frames presented, " +
+                                                                    std::to_string(a.samples.size()) + " packets");
+    }
+    // An existing output file is not replaced.
+    require(run_export(f, asset, "_AVAssetExportPresetPassthrough", "_AVFileTypeMPEG4", passed) == 4, "an existing file: failed");
+    // AppleM4A of a WAVE file (linear PCM, decodable) through the AAC encoder.
+    {
+        const auto error = f.block(8);
+        const auto settings = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+            {f.cf.string("AVFormatIDKey"), f.cf.integer(four("lpcm"), 3)}, {f.cf.string("AVSampleRateKey"), f.cf.real(48000)},
+            {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(2, 3)}, {f.cf.string("AVLinearPCMBitDepthKey"), f.cf.integer(16, 3)}});
+        const auto writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:",
+                                   {f.cf.file_url(alchemy::guest_path_string(wav), false), f.engine.read64(f.symbol(av, "_AVFileTypeWAVE")), error});
+        const auto input = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), settings});
+        f.send(writer, "addInput:", {input});
+        f.send(writer, "startWriting");
+        f.send(writer, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+        for (int i = 0; i < 5; ++i) f.send(input, "appendSampleBuffer:", {float_sample_buffer(f, 4800, 4800LL * i)});
+        f.send(input, "markAsFinished");
+        require((f.send(writer, "finishWriting") & 0xff) == 1, "the WAVE source");
+    }
+    const auto wav_asset = f.send(f.cls("AVURLAsset"), "URLAssetWithURL:options:", {f.cf.file_url(alchemy::guest_path_string(wav), false), 0});
+    const auto wav_presets = names(f.send(f.cls("AVAssetExportSession"), "exportPresetsCompatibleWithAsset:", {wav_asset}));
+    require(wav_presets == std::vector<std::string>{"AVAssetExportPresetAppleM4A"}, "a WAVE file exports to M4A only");
+    require(run_export(f, wav_asset, "_AVAssetExportPresetAppleM4A", "_AVFileTypeAppleM4A", m4a) == 3, "AppleM4A completes");
+    {
+        std::vector<std::uint8_t> bytes;
+        const auto out = read_movie(m4a, bytes);
+        require(out.tracks.size() == 1 && out.tracks[0].codec == mc::fourcc("mp4a") && out.tracks[0].priming == fake_aac::priming &&
+                    out.tracks[0].samples.size() == (fake_aac::priming + 24000 + 1023) / 1024,
+                "the M4A: " + std::to_string(out.tracks[0].samples.size()) + " packets");
+    }
+    // The host's own codecs: the real movie through a video preset (64x48 stays 64x48: never larger than the source).
+    alchemy::gui::completion_kit::media::video_encoding::set_backend({});
+    alchemy::gui::completion_kit::media::aac::set_backend({});
+    const auto host_encoders = alchemy::gui::completion_kit::media::video_encoding::encoders();
+    const bool host_h264 = std::any_of(host_encoders.begin(), host_encoders.end(), [](const auto& e) {
+        return e.codec == alchemy::gui::completion_kit::media::video_encoding::Codec::h264;
+    });
+    if (!host_h264 || !alchemy::gui::completion_kit::media::aac::available()) {
+        std::cout << "[media capture] no host H.264 or AAC encoder: the re-encoded export is skipped" << std::endl;
+    } else {
+        std::filesystem::remove(source, ignored);
+        write_movie(f, source, 30, 10);
+        const auto real = f.send(f.cls("AVURLAsset"), "URLAssetWithURL:options:", {f.cf.file_url(alchemy::guest_path_string(source), false), 0});
+        const auto real_presets = names(f.send(f.cls("AVAssetExportSession"), "exportPresetsCompatibleWithAsset:", {real}));
+        if (std::find(real_presets.begin(), real_presets.end(), "AVAssetExportPreset1280x720") == real_presets.end()) {
+            std::cout << "[media capture] no host H.264 decoder: the re-encoded export is skipped" << std::endl;
+        } else {
+            require(run_export(f, real, "_AVAssetExportPreset1280x720", "_AVFileTypeQuickTimeMovie", encoded) == 3, "the 1280x720 preset completes");
+            std::vector<std::uint8_t> bytes;
+            const auto out = read_movie(encoded, bytes);
+            require(out.tracks.size() == 2 && out.tracks[0].codec == mc::fourcc("avc1") && out.tracks[0].width == 64 && out.tracks[0].height == 48 &&
+                        out.tracks[0].samples.size() == 30 && out.tracks[1].codec == mc::fourcc("mp4a") && out.tracks[1].samples.size() >= 47,
+                    "the re-encoded movie: " + std::to_string(out.tracks.size()) + " tracks, " +
+                        (out.tracks.empty() ? std::string("-") : std::to_string(out.tracks[0].samples.size())) + " frames");
+            std::cout << "[media capture] re-encoded export: " << out.tracks[0].samples.size() << " H.264 frames, " << out.tracks[1].samples.size()
+                      << " AAC packets, " << bytes.size() << " bytes" << std::endl;
+        }
+    }
+    for (const auto& p : {source, wav, passed, trimmed, m4a, encoded}) std::filesystem::remove(p, ignored);
+}
+
 // Sets (or, with an empty value, clears) an environment variable of this process.
 void set_environment(const char* name, const char* value) {
 #ifdef _WIN32
@@ -1099,6 +1303,7 @@ int main() {
         {"recorder", recorder},
         {"asset_writer", asset_writer},
         {"asset_writer_movie", asset_writer_movie},
+        {"asset_export", asset_export},
         {"test_devices", test_devices},
     });
 }
