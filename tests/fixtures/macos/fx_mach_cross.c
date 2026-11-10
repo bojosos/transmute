@@ -336,7 +336,8 @@ int main(int argc, char** argv) {
     if (posix_spawn(&launcher_pid, argv[0], 0, 0, launcher_arguments, environ) != 0 || launcher_pid <= 0) return 45;
     if (waitpid(launcher_pid, &status, 0) != launcher_pid || status != 0) return 46;
     mach_port_t found = 0;
-    for (int attempt = 0; attempt < 400 && bootstrap_look_up(bootstrap_port, orphan, &found) != 0; ++attempt) usleep(25000);
+    /* Up to 30 s: the server is a grandchild that starts from cold (about 6 s on a loaded Linux host). */
+    for (int attempt = 0; attempt < 1200 && bootstrap_look_up(bootstrap_port, orphan, &found) != 0; ++attempt) usleep(25000);
     if (!found) return 47;
     if (send_value(found, 600, 11) != 0) return 48;
     /* 12. A released check-in is free for another process (it answered 1103). */
