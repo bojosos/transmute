@@ -39,10 +39,11 @@ OBJC_ROOT_CLASS
 }
 + (void)load;
 + (void)initialize;
-- (instancetype)init;
-+ (instancetype)new;
-+ (instancetype)allocWithZone:(struct _NSZone*)zone;
-+ (instancetype)alloc;
+/* Never nil, so Swift imports init() as non-failable, as apps compiled against the SDK see it. */
+- (nonnull instancetype)init;
++ (nonnull instancetype)new;
++ (nonnull instancetype)allocWithZone:(struct _NSZone*)zone;
++ (nonnull instancetype)alloc;
 - (void)dealloc;
 - (id)copy;
 - (id)mutableCopy;
