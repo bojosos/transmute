@@ -401,10 +401,34 @@ void canvas_area() {
     red.color = {1, 0, 0, 1};
     require(static_cast<bool>((*surface)->fill(*geometry, red)), "fill the square");
     require(static_cast<bool>((*surface)->end()), "end drawing");
-    const auto locked = (*surface)->lock({0, 0, 8, 8}, false);
-    require(locked && locked->at(4, 4, {0, 0, 8, 8})[2] == 255 && locked->at(4, 4, {0, 0, 8, 8})[3] == 255 &&
-                locked->at(0, 0, {0, 0, 8, 8})[3] == 0,
-        "the square is red, the corner clear");
+    {
+        const auto locked = (*surface)->lock({0, 0, 8, 8}, false);   // one lock at a time (WIC)
+        require(locked && locked->at(4, 4, {0, 0, 8, 8})[2] == 255 && locked->at(4, 4, {0, 0, 8, 8})[3] == 255 &&
+                    locked->at(0, 0, {0, 0, 8, 8})[3] == 0,
+            "the square is red, the corner clear");
+    }
+
+    // Stroke hits and widening; an axis clip; pixels written through a lock.
+    require(geometry->stroke_contains({4, 2.2}, 1).value_or(false) && !geometry->stroke_contains({4, 4}, 1).value_or(true),
+        "a point on the stroke, one inside");
+    const auto outline = geometry->widened(2, {}, {});
+    require(outline && outline->size() > 4 && outline->front().op == gpu::PathOp::move, "the stroke's outline");
+    {
+        const auto written = (*surface)->lock({0, 0, 8, 8}, true);
+        require(static_cast<bool>(written), "a lock for writing");
+        written->at(6, 7, {0, 0, 8, 8})[3] = 255;
+    }
+    require(static_cast<bool>((*surface)->begin()), "begin again");
+    (*surface)->push_axis_clip({0, 0, 3, 8}, false);
+    gpu::Brush blue;
+    blue.color = {0, 0, 1, 1};
+    require(static_cast<bool>((*surface)->fill_rect({0, 0, 8, 8}, blue)), "fill under a clip");
+    (*surface)->pop_axis_clip();
+    require(static_cast<bool>((*surface)->end()), "end again");
+    const auto clipped = (*surface)->lock({0, 0, 8, 8}, false);
+    require(clipped && clipped->at(1, 1, {0, 0, 8, 8})[0] == 255 && clipped->at(6, 7, {0, 0, 8, 8})[3] == 255 &&
+                clipped->at(4, 4, {0, 0, 8, 8})[2] == 255 && clipped->at(7, 0, {0, 0, 8, 8})[3] == 0,
+        "the clip kept the fill left; the written pixel stayed");
 }
 
 void raster_text_area() {
@@ -621,12 +645,231 @@ void font_report(const std::string& path) {
         for (const auto cluster : run.clusters) std::cout << " " << cluster;
         std::cout << '\n';
     }
+    // System text rasterizing of the family (the registered file where the host's raster fonts see it).
+    for (const int quarters : {48, 64, 256}) {
+        const gpu::RasterFont raster{info->family, quarters};
+        const auto metrics = gpu::raster_metrics(raster);
+        const auto prefix = gpu::raster_prefix_widths(raster, u"Hello, AVA!");
+        const auto coverage = gpu::raster_coverage(raster, u"Hag", 120, 90, 2, 70);
+        require(metrics && prefix && coverage, "raster text");
+        double ink = 0;
+        for (const auto value : *coverage) ink += value;
+        std::cout << "raster " << quarters / 4.0 << "px ascent " << metrics->ascent << " descent " << metrics->descent << " leading " << metrics->leading
+                  << " average " << metrics->average_width << " max " << metrics->max_width << " cap " << metrics->cap_height.value_or(-1) << " x "
+                  << metrics->x_height.value_or(-1) << "\n  prefix";
+        for (const auto width : *prefix) std::cout << " " << width;
+        std::cout << "\n  ink " << ink << '\n';
+    }
+}
+
+// ALCHEMY_HOST_TEST_CANVAS_REPORT=<output file>: one fixed scene drawn on a
+// 256 x 256 surface, its premultiplied BGRA rows written to the file, for
+// comparing two hosts' pixels. ALCHEMY_HOST_TEST_FONT_FILE=<font file> adds
+// a line of glyphs from that file (the same file on both hosts).
+void canvas_report(const std::string& output) {
+    namespace gpu = host::gpu;
+    constexpr std::uint32_t size = 256;
+    auto made = gpu::Surface::create(size, size);
+    require(static_cast<bool>(made), "a surface");
+    auto& surface = **made;
+    const auto path = [](std::initializer_list<gpu::PathElement> elements, bool even_odd = false) {
+        const std::vector<gpu::PathElement> list(elements);
+        auto geometry = gpu::Geometry::path(list, even_odd);
+        require(static_cast<bool>(geometry), "a geometry");
+        return *geometry;
+    };
+    const auto move = [](double x, double y) { return gpu::PathElement{gpu::PathOp::move, {gpu::Point{x, y}}}; };
+    const auto line = [](double x, double y) { return gpu::PathElement{gpu::PathOp::line, {gpu::Point{x, y}}}; };
+    const auto cubic = [](double x1, double y1, double x2, double y2, double x, double y) {
+        return gpu::PathElement{gpu::PathOp::cubic, {gpu::Point{x1, y1}, gpu::Point{x2, y2}, gpu::Point{x, y}}};
+    };
+    const auto quad = [](double x1, double y1, double x, double y) { return gpu::PathElement{gpu::PathOp::quad, {gpu::Point{x1, y1}, gpu::Point{x, y}}}; };
+    const gpu::PathElement close{gpu::PathOp::close, {}};
+    const auto solid = [](double r, double g, double b, double a) {
+        gpu::Brush brush;
+        brush.color = {r, g, b, a};
+        return brush;
+    };
+    require(static_cast<bool>(surface.begin()), "begin");
+    // A translucent backdrop and an antialiased circle (cubics).
+    require(static_cast<bool>(surface.fill_rect({4, 4, 252, 60}, solid(0.2, 0.4, 0.8, 0.5))), "fill_rect");
+    const double k = 0.5523 * 24;
+    require(static_cast<bool>(surface.fill(path({move(40, 8), cubic(40 + k, 8, 64, 32 - k, 64, 32), cubic(64, 32 + k, 40 + k, 56, 40, 56),
+                                                 cubic(40 - k, 56, 16, 32 + k, 16, 32), cubic(16, 32 - k, 40 - k, 8, 40, 8), close}),
+                                            solid(1, 0.5, 0, 1))),
+        "fill a circle");
+    // An even-odd star and a quadratic, under a rotation.
+    surface.set_transform({0.866, 0.5, -0.5, 0.866, 120, -40});
+    require(static_cast<bool>(surface.fill(path({move(100, 10), line(118, 60), line(72, 28), line(128, 28), line(82, 60), close}, true),
+                                            solid(0, 0.6, 0.2, 0.9))),
+        "fill a star");
+    surface.set_transform({});
+    require(static_cast<bool>(surface.fill(path({move(150, 60), quad(200, 0, 250, 60), close}), solid(0.5, 0, 0.5, 1))), "fill a quad");
+    // Strokes: miter joins, round caps with dashes, a square-capped dot.
+    gpu::StrokeStyle miter;
+    miter.miter_limit = 10;
+    require(static_cast<bool>(surface.stroke(path({move(10, 80), line(60, 70), line(20, 110)}), solid(0, 0, 0, 1), 6, miter)), "stroke miter");
+    gpu::StrokeStyle dashed;
+    dashed.cap = gpu::StrokeStyle::Cap::round;
+    dashed.join = gpu::StrokeStyle::Join::round;
+    dashed.dashes = {2, 1.5};
+    dashed.dash_offset = 0.5;
+    require(static_cast<bool>(surface.stroke(path({move(80, 75), cubic(120, 60, 140, 120, 180, 90)}), solid(0.8, 0, 0, 1), 4, dashed)),
+        "stroke dashes");
+    gpu::StrokeStyle bevel;
+    bevel.join = gpu::StrokeStyle::Join::bevel;
+    bevel.cap = gpu::StrokeStyle::Cap::square;
+    require(static_cast<bool>(surface.stroke(path({move(200, 70), line(240, 70), line(220, 110), close}), solid(0, 0.3, 0.3, 1), 3, bevel)),
+        "stroke bevel");
+    // A linear gradient with opacity; tiles under a scale.
+    gpu::Brush gradient;
+    gradient.kind = gpu::Brush::Kind::linear_gradient;
+    const gpu::GradientStop stops[] = {{0, {1, 0, 0, 1}}, {0.5, {1, 1, 0, 0.5}}, {1, {0, 0, 1, 1}}};
+    gradient.stops = stops;
+    gradient.start = {10, 0};
+    gradient.end = {120, 0};
+    gradient.opacity = 0.8;
+    require(static_cast<bool>(surface.fill_rect({10, 120, 120, 150}, gradient)), "gradient");
+    const std::uint8_t checker[] = {255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255};   // 2 x 2, BGRA
+    gpu::Brush tiles;
+    tiles.kind = gpu::Brush::Kind::tiles;
+    tiles.tiles = {2, 2, checker};
+    tiles.tiles_transform = {4, 0, 0, 4, 130, 120};
+    tiles.opacity = 1;
+    require(static_cast<bool>(surface.fill_rect({130, 120, 250, 150}, tiles)), "tiles");
+    // Bitmaps: a 4 x 4 gradient scaled up, nearest and linear.
+    std::vector<std::uint8_t> bitmap;
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x) bitmap.insert(bitmap.end(), {static_cast<std::uint8_t>(x * 80), static_cast<std::uint8_t>(y * 80), 0, 255});
+    require(static_cast<bool>(surface.draw_bitmap({4, 4, bitmap.data()}, {10, 160, 50, 200}, 1, gpu::Interpolation::nearest)), "bitmap nearest");
+    require(static_cast<bool>(surface.draw_bitmap({4, 4, bitmap.data()}, {60, 160, 100, 200}, 0.7, gpu::Interpolation::linear)), "bitmap linear");
+    // Clips: an aliased axis clip and an antialiased circle clip around a fill.
+    surface.push_axis_clip({110, 160, 150, 200}, false);
+    require(static_cast<bool>(surface.fill_rect({100, 150, 160, 210}, solid(0, 0.5, 1, 1))), "fill in an axis clip");
+    surface.pop_axis_clip();
+    require(static_cast<bool>(surface.push_clip(path({move(180, 160), cubic(180 + k, 160, 204, 184 - k, 204, 184), cubic(204, 184 + k, 180 + k, 208, 180, 208),
+                                                      cubic(180 - k, 208, 156, 184 + k, 156, 184), cubic(156, 184 - k, 180 - k, 160, 180, 160), close}),
+                                                 true)),
+        "a geometry clip");
+    require(static_cast<bool>(surface.fill_rect({150, 150, 210, 210}, solid(1, 0, 0.5, 1))), "fill in a geometry clip");
+    surface.pop_clip();
+    // Blends: copy and add.
+    if (surface.blend_modes()) {
+        surface.set_blend(gpu::Blend::copy);
+        require(static_cast<bool>(surface.fill_rect({215, 160, 235, 200}, solid(0, 1, 0, 0.5))), "copy");
+        surface.set_blend(gpu::Blend::add);
+        require(static_cast<bool>(surface.fill_rect({225, 170, 250, 210}, solid(0.5, 0, 0, 0.5))), "add");
+        surface.set_blend(gpu::Blend::source_over);
+    }
+    // A widened path, filled, and aliased drawing.
+    gpu::StrokeStyle round;
+    round.join = gpu::StrokeStyle::Join::round;
+    round.cap = gpu::StrokeStyle::Cap::round;
+    const auto outline = path({move(20, 220), line(60, 240), line(100, 215)}).widened(8, round, {});
+    require(outline && !outline->empty(), "a widened path");
+    require(static_cast<bool>(surface.fill(*gpu::Geometry::path(*outline, false), solid(0.3, 0.3, 0.3, 1))), "fill the widened path");
+    surface.set_antialias(false);
+    require(static_cast<bool>(surface.fill(path({move(110, 215), line(140, 225), line(115, 250), close}), solid(0, 0, 0, 1))), "aliased fill");
+    surface.set_antialias(true);
+    // Glyphs from the given font file.
+    if (const auto file_name = host::process::environment("ALCHEMY_HOST_TEST_FONT_FILE")) {
+        std::ifstream file(*file_name, std::ios::binary);
+        const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        const auto font = gpu::font_from_data(bytes);
+        require(static_cast<bool>(font), "the font file loads");
+        const std::uint32_t text[] = {'H', 'a', 'g', 'e', 'l'};
+        const auto glyphs = font->glyphs(text);
+        const auto metrics = font->glyph_metrics(*glyphs);
+        const double em = 20, units = font->info()->metrics.units_per_em;
+        std::vector<gpu::Point> offsets;
+        double pen = 0;
+        for (const auto& m : *metrics) {
+            offsets.push_back({pen, 0});
+            pen += m.advance_width * em / units;
+        }
+        surface.set_transform({1, 0, 0, 1, 150, 245});
+        require(static_cast<bool>(surface.draw_glyphs(*font, em, *glyphs, offsets, solid(0, 0, 0, 1))), "glyphs");
+        surface.set_transform({});
+    }
+    require(static_cast<bool>(surface.end()), "end");
+    const auto locked = surface.lock({0, 0, static_cast<std::int32_t>(size), static_cast<std::int32_t>(size)}, false);
+    require(static_cast<bool>(locked), "lock");
+    std::ofstream out(output, std::ios::binary);
+    for (std::uint32_t y = 0; y < size; ++y) out.write(reinterpret_cast<const char*>(locked->data + static_cast<std::size_t>(y) * locked->stride), size * 4);
+    require(static_cast<bool>(out), "the report is written");
+}
+
+// ALCHEMY_HOST_TEST_IMAGE_REPORT=<file>;<file>...: each image file's frames
+// as the host reads them (facts, pixel sums and a checksum), for comparing
+// two hosts. ALCHEMY_HOST_TEST_IMAGE_OUT=<directory> also writes a fixed
+// test image in every format there, for the other host to read back.
+void image_report(const std::string& list) {
+    namespace gpu = host::gpu;
+    if (const auto directory = host::process::environment("ALCHEMY_HOST_TEST_IMAGE_OUT")) {
+        gpu::Pixels pixels{37, 23, {}};
+        for (std::uint32_t y = 0; y < pixels.height; ++y)
+            for (std::uint32_t x = 0; x < pixels.width; ++x)
+                pixels.rgba.insert(pixels.rgba.end(), {static_cast<std::uint8_t>(x * 7), static_cast<std::uint8_t>(y * 11),
+                                                      static_cast<std::uint8_t>((x * y) & 0xff), static_cast<std::uint8_t>(x < 4 ? 0 : 255)});
+        const std::pair<gpu::ImageFormat, const char*> formats[] = {{gpu::ImageFormat::png, "png"}, {gpu::ImageFormat::jpeg, "jpg"},
+                                                                    {gpu::ImageFormat::tiff, "tif"}, {gpu::ImageFormat::bmp, "bmp"},
+                                                                    {gpu::ImageFormat::gif, "gif"}};
+        for (const auto& [format, extension] : formats) {
+            const auto bytes = gpu::encode_image(pixels, format);
+            require(static_cast<bool>(bytes), std::string("encode ") + extension);
+            std::ofstream out(*directory + "/" + host::backend().data() + "." + extension, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+        }
+    }
+    std::size_t start = 0;
+    while (start < list.size()) {
+        const auto end = std::min(list.find(';', start), list.size());
+        const auto name = list.substr(start, end - start);
+        start = end + 1;
+        if (name.empty()) continue;
+        std::ifstream file(name, std::ios::binary);
+        const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        const auto slash = name.find_last_of("/\\");
+        std::cout << (slash == std::string::npos ? name : name.substr(slash + 1));
+        const auto count = gpu::image_frame_count(bytes);
+        if (!count) {
+            std::cout << " error " << host::name(count.error()) << '\n';
+            continue;
+        }
+        std::cout << " frames " << *count << '\n';
+        for (std::size_t index = 0; index < *count; ++index) {
+            const auto frame = gpu::image_frame(bytes, index, true);
+            if (!frame) {
+                std::cout << "  frame " << index << " error " << host::name(frame.error()) << '\n';
+                continue;
+            }
+            std::uint64_t sums[4]{}, hash = 1469598103934665603ULL;
+            for (std::size_t i = 0; i < frame->rgba.size(); ++i) {
+                sums[i % 4] += frame->rgba[i];
+                hash = (hash ^ frame->rgba[i]) * 1099511628211ULL;
+            }
+            const double n = std::max<double>(1, static_cast<double>(frame->width) * frame->height);
+            std::cout << "  frame " << index << " " << frame->width << "x" << frame->height << " alpha " << frame->has_alpha << " dpi "
+                      << frame->dpi_x << "/" << frame->dpi_y << " delay " << frame->delay << " orientation " << frame->orientation << " bits "
+                      << frame->bits_per_component << " mean " << sums[0] / n << " " << sums[1] / n << " " << sums[2] / n << " " << sums[3] / n
+                      << " hash " << std::hex << hash << std::dec << '\n';
+        }
+    }
 }
 
 int main() {
     try {
+        if (const auto report = host::process::environment("ALCHEMY_HOST_TEST_IMAGE_REPORT")) {
+            std::cout << std::fixed << std::setprecision(3);
+            image_report(*report);
+            return 0;
+        }
         if (const auto report = host::process::environment("ALCHEMY_HOST_TEST_FONT_REPORT")) {
             font_report(*report);
+            return 0;
+        }
+        if (const auto report = host::process::environment("ALCHEMY_HOST_TEST_CANVAS_REPORT")) {
+            canvas_report(*report);
             return 0;
         }
         // ALCHEMY_HOST_TEST_SKIP_AREAS=fonts,canvas,... leaves those areas out,

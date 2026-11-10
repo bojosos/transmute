@@ -23,6 +23,7 @@ struct Font::Impl {
     std::shared_ptr<const std::vector<std::uint8_t>> bytes;  // the data of an in-memory face
     int index{};                                             // face index (named-instance bits included)
     FT_Face face{};                                          // opened on first use, under freetype_mutex()
+    std::shared_ptr<void> canvas_face;                       // canvas.cpp's cairo font face, made on first use
     ~Impl();
 };
 

@@ -53,8 +53,43 @@ This page maps each host area to Linux. The Linux backends are in progress.
 
   Not written yet: XRandR screens and HiDPI, cursors, the X clipboard (the
   clipboard is process-local), drag and drop, IME. The other GUI areas
-  (canvas, gpu, audio, media codecs, ...) still fail with
-  `Error::unsupported`, so a window shows no drawing yet.
+  (gpu's Vulkan half, audio, media codecs, ...) still fail with
+  `Error::unsupported`.
+* **2D drawing** (`gui/canvas.cpp`). Surfaces are Cairo image surfaces of
+  premultiplied BGRA. They cover:
+  * paths, clips, the three blends and the brushes (solid, tiles, linear
+    gradients);
+  * bitmaps, at the three interpolations;
+  * glyphs, drawn through cairo-ft with vertical-only hinting, as
+    DirectWrite's natural mode draws them.
+
+  `Geometry::widened` is its own polygon stroker (Cairo has no public
+  widening): flattening to 0.05, dashes, joins and caps. Its result fills
+  with the non-zero rule. Compared with Direct2D on a fixed scene
+  (`ALCHEMY_HOST_TEST_CANVAS_REPORT=<file>`, with
+  `ALCHEMY_HOST_TEST_FONT_FILE` for glyphs), pixels differ by 0.6 per
+  channel on average. The differences are antialiased edges, aliased
+  diagonals and glyph coverage.
+* **System text rasterizing** (`gui/raster_text.cpp`), GDI's counterpart.
+  fontconfig picks the face, which FreeType hints. Ascent, descent and
+  advances come from the face's VDMX and hdmx tables where it has them, as
+  GDI reads them. With arial.ttf registered, the metrics and advances equal
+  GDI's at 12, 16 and 64 px, with two exceptions:
+  * cap and x heights are the face's real ones; win32 reports em/2 and
+    em/4, because GDI documents those fields as unsupported;
+  * one advance at 64 px differs.
+* **Image files** (`gui/images.cpp`). PNG uses libpng, JPEG uses TurboJPEG,
+  TIFF uses libtiff with pages as frames, and GIF uses giflib with frames as
+  stored. BMP and ICO are read here. Frame facts follow WIC's, including
+  96 dpi when a file names none.
+  * Checked (`ALCHEMY_HOST_TEST_IMAGE_REPORT`, `ALCHEMY_HOST_TEST_IMAGE_OUT`):
+    JPEG pixels are identical to WIC's. Each host reads the other's PNG,
+    TIFF, BMP, JPEG and GIF output.
+  * Where WIC differs:
+    * it makes a GIF's transparent index opaque (in its palette colour);
+      Linux keeps it clear;
+    * it reports 10 bits for its own BMP;
+    * it orders ICO frames differently.
 * **Fonts and text layout** (`gui/fonts.cpp`, `gui/text_layout.cpp`).
   `apt install libpango1.0-dev` (it brings FreeType, fontconfig, HarfBuzz
   and FriBidi). They work as follows:
@@ -105,7 +140,7 @@ This page maps each host area to Linux. The Linux backends are in progress.
     casefold);
   * ICU and locale;
   * TLS;
-  * 2D drawing, Vulkan and the rest of the GUI areas.
+  * Vulkan and the rest of the GUI areas.
 
 The macOS layer (`src/alchemy/darwin/`, the loader, the Objective-C
 runtime) talks to the operating system only through the host API in

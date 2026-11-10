@@ -101,11 +101,16 @@ endif()
 
 # fw-ui: the Linux canvas, fonts and images. Fonts are FreeType faces found
 # through fontconfig; text layout is Pango's (HarfBuzz shaping, FriBidi,
-# fontconfig fallback) over the same fontconfig configuration.
+# fontconfig fallback) over the same fontconfig configuration; 2D drawing
+# is Cairo's (cairo-ft draws the glyphs). Image files: libpng, TurboJPEG,
+# libtiff and giflib (`apt install libpango1.0-dev libturbojpeg0-dev
+# libpng-dev libtiff-dev libgif-dev`).
 if(ALCHEMY_HOST STREQUAL "linux" AND alchemy_host_gui_sources)
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(ALCHEMY_LINUX_TEXT REQUIRED IMPORTED_TARGET freetype2 fontconfig harfbuzz pangoft2)
-    list(APPEND ALCHEMY_GUI_LINK_LIBRARIES PkgConfig::ALCHEMY_LINUX_TEXT)
+    pkg_check_modules(ALCHEMY_LINUX_TEXT REQUIRED IMPORTED_TARGET freetype2 fontconfig harfbuzz pangoft2 cairo cairo-ft
+                      libpng libturbojpeg libtiff-4)
+    find_library(ALCHEMY_LINUX_GIF_LIBRARY gif REQUIRED)   # giflib has no pkg-config file
+    list(APPEND ALCHEMY_GUI_LINK_LIBRARIES PkgConfig::ALCHEMY_LINUX_TEXT ${ALCHEMY_LINUX_GIF_LIBRARY})
 endif()
 
 # The Linux media areas (src/alchemy/host/linux/gui/audio.cpp, midi.cpp): PulseAudio's client library for audio
