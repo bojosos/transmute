@@ -92,6 +92,9 @@ struct ThreadContext {
     std::optional<std::uint64_t> exit_value;
     std::vector<AutoreleasePool> autorelease_pools;
     std::vector<std::uint64_t> unpooled_autoreleases;
+    // Set by exit() before this thread's cleanup: its autoreleased objects then stay alive through the
+    // atexit handlers and static destructors, which may still use them, and are drained after them.
+    bool exiting_process{};
     // ALCHEMY_TRACE_CALLS_RING=<n>: this thread's last n traced provider calls, oldest first from
     // call_ring_next (printed when a fatal signal on this thread ends the process).
     std::vector<std::string> call_ring;
