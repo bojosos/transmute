@@ -60,6 +60,12 @@ if(BUILD_TESTING)
         add_test(NAME alchemy_${group} COMMAND alchemy_${group}_tests)
         set_tests_properties(alchemy_${group} PROPERTIES TIMEOUT 60)
     endforeach()
+    # alchemy_threads creates and ends about 2,400 host threads (test_thread_reaping goes past the
+    # 1024-worker limit, joinable and detached). Host thread creation and exit slow down about 30 times
+    # when every CPU is busy (plain Python threads too, on the same host), and single thread exits
+    # stalled for tens of seconds: about 7 s alone became 60-120 s under a parallel ctest. It runs
+    # alone, with room to spare.
+    set_tests_properties(alchemy_threads PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
     set(ALCHEMY_EXTERNAL_SMOKE_BINARY "" CACHE FILEPATH "Optional user-owned Mach-O smoke binary; never copied or distributed")
     get_filename_component(alchemy_llvm_bin "${TRANS_MUTE_CLANG_CL}" DIRECTORY)
     find_program(ALCHEMY_CLANG clang HINTS "${alchemy_llvm_bin}"
