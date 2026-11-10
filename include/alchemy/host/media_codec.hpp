@@ -1,8 +1,8 @@
 #pragma once
 
 // Host area "media_codec" (owner: fw-media). The rules are in include/alchemy/host/host.hpp. The host
-// system's own media encoders and decoders (on Windows, the Media Foundation transforms the system provides;
-// nothing is shipped with Alchemy): H.264 and HEVC video from and to NV12 pictures (P010 above 8 bits), AAC
+// system's own media encoders and decoders (on Windows, the Media Foundation transforms the system provides; on
+// Linux, GStreamer and the plug-ins the system has; nothing is shipped with Alchemy): H.264 and HEVC video from and to NV12 pictures (P010 above 8 bits), AAC
 // audio from and to 16-bit PCM. VTCompressionSession, VTDecompressionSession, AudioConverter, the audio files,
 // AVAssetReader/Writer, AVPlayer and AVAssetExportSession run on this (src/alchemy/darwin/media/). A machine
 // without a given encoder or decoder lists none and fails to open one: callers answer their own documented
