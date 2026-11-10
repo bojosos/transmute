@@ -128,7 +128,11 @@ Status accept(Handle listener) {
         pending_listeners().erase(it);
         const int replaced = dup3(connection, placeholder, O_CLOEXEC);
         ::close(connection);
-        release_listener(name);
+        // The listening socket stays open for the server's next listen():
+        // closing it here would refuse a client that connects before then and
+        // drop the clients already waiting in its backlog. It closes when the
+        // server closes a listener that never accepted (forget_listener).
+        if (const auto server = servers().find(name); server != servers().end()) --server->second.pending;
         if (replaced < 0) return last_error();
         return {};
     }
