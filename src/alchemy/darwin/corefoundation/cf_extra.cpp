@@ -84,10 +84,24 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     for (const auto* name : {"QuotationBeginDelimiterKey", "QuotationEndDelimiterKey", "AlternateQuotationBeginDelimiterKey",
                              "AlternateQuotationEndDelimiterKey"})
         constant_string(process, cf, cf_library, std::string("_kCFLocale") + name, std::string("kCFLocale") + name);
+    // The volume capacity keys: one object under kCFURL...Key and NSURL...Key, the NSURL names exported by
+    // CoreFoundation as well as Foundation (OBS binds them to CoreFoundation).
     for (const auto* name : {"VolumeAvailableCapacityKey", "VolumeTotalCapacityKey", "VolumeAvailableCapacityForImportantUsageKey",
                              "VolumeAvailableCapacityForOpportunisticUsageKey"}) {
-        constant_string(process, cf, cf_library, std::string("_kCFURL") + name, std::string("NSURL") + name);
-        constant_string(process, cf, foundation_library, std::string("_NSURL") + name, std::string("NSURL") + name);
+        const auto ns_name = std::string("NSURL") + name;
+        const std::array<std::pair<std::string_view, std::string>, 3> symbols{{
+            {cf_library, std::string("_kCFURL") + name}, {cf_library, "_" + ns_name}, {foundation_library, "_" + ns_name}}};
+        std::uint64_t string = 0;
+        for (const auto& [library, symbol] : symbols) {
+            if (provided(process, library, symbol)) continue;
+            if (!string) {
+                string = cf.string(ns_name);
+                if (const auto record = process.objects().find(string)) record->immortal = true;
+            }
+            const auto cell = process.allocate_guest(8);
+            process.main_engine().write64(cell, string);
+            process.install_export(std::string(library), symbol, {cell, ExportKind::data});
+        }
     }
     // Uniform Type Identifiers (CoreServices LaunchServices UTCoreTypes.h).
     for (const auto& [name, value] : std::array<std::pair<const char*, const char*>, 15>{{

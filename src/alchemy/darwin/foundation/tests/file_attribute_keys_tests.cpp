@@ -33,8 +33,9 @@ const Case foundation_file_attribute_keys_case("foundation_file_attribute_keys",
     const auto capacity = [&](const char* key) -> std::int64_t {
         f.engine.write64(value, 0);
         const auto name = f.engine.read64(f.symbol(cf, std::string("_kCFURL") + key));
-        require(f.engine.read64(f.symbol(foundation, std::string("_NSURL") + key)) == name || f.call(cf, "_CFEqual", {
-                    f.engine.read64(f.symbol(foundation, std::string("_NSURL") + key)), name}) == 1, std::string(key) + " under Foundation");
+        require(f.engine.read64(f.symbol(foundation, std::string("_NSURL") + key)) == name &&
+                    f.engine.read64(f.symbol(cf, std::string("_NSURL") + key)) == name,
+                std::string(key) + ": the same object as NSURL" + key + " under Foundation and CoreFoundation");
         require(f.call(cf, "_CFURLCopyResourcePropertyForKey", {folder, name, value, 0}) == 1 && f.engine.read64(value), std::string(key));
         return static_cast<std::int64_t>(*f.cf.number_value(f.engine.read64(value)));
     };
