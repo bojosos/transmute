@@ -107,3 +107,11 @@ if(ALCHEMY_HOST STREQUAL "linux" AND alchemy_host_gui_sources)
     pkg_check_modules(ALCHEMY_LINUX_TEXT REQUIRED IMPORTED_TARGET freetype2 fontconfig harfbuzz pangoft2)
     list(APPEND ALCHEMY_GUI_LINK_LIBRARIES PkgConfig::ALCHEMY_LINUX_TEXT)
 endif()
+
+# The Linux media areas (src/alchemy/host/linux/gui/audio.cpp, midi.cpp): PulseAudio's client library for audio
+# (PipeWire and WSLg serve it too) and ALSA's sequencer for MIDI.
+if(ALCHEMY_HOST STREQUAL "linux" AND alchemy_host_gui_sources)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ALCHEMY_MEDIA REQUIRED IMPORTED_TARGET libpulse alsa)
+    list(APPEND ALCHEMY_GUI_LINK_LIBRARIES PkgConfig::ALCHEMY_MEDIA)
+endif()
