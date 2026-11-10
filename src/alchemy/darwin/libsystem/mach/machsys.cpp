@@ -1203,6 +1203,108 @@ void Machsys::install_terminfo() {
         if (found != state->strings.end()) { s.x[0] = found->second; return; }
         s.x[0] = flags_on.contains(name) || flags_off.contains(name) || numbers.contains(name) ? static_cast<Address>(-1) : 0;
     });
+
+    // The termcap interface over the same entry (ncurses' termcap emulation): two-letter capability codes
+    // for the terminfo names above. tgetent loads the entry as setupterm does (1; 0 for a terminal not
+    // found) and sets UP and BC (the cursor up and back strings) and PC (no padding character). The
+    // strings keep their terminfo parameters, which tgoto expands through tparm.
+    static const std::map<std::string, std::string> termcap{
+        {"cl", "clear"}, {"cm", "cup"}, {"ho", "home"}, {"ce", "el"}, {"cd", "ed"}, {"up", "cuu1"}, {"do", "cud1"}, {"nd", "cuf1"},
+        {"le", "cub1"}, {"bc", "cub1"}, {"cr", "cr"}, {"bl", "bel"}, {"md", "bold"}, {"mh", "dim"}, {"us", "smul"}, {"ue", "rmul"},
+        {"mb", "blink"}, {"mr", "rev"}, {"so", "smso"}, {"se", "rmso"}, {"mk", "invis"}, {"me", "sgr0"}, {"AF", "setaf"},
+        {"AB", "setab"}, {"op", "op"}, {"ti", "smcup"}, {"te", "rmcup"}, {"vi", "civis"}, {"ve", "cnorm"}, {"ks", "smkx"},
+        {"ke", "rmkx"}, {"ku", "kcuu1"}, {"kd", "kcud1"}, {"kr", "kcuf1"}, {"kl", "kcub1"}, {"kh", "khome"}, {"@7", "kend"},
+        {"kb", "kbs"}, {"kD", "kdch1"}, {"kI", "kich1"}, {"kN", "knp"}, {"kP", "kpp"}, {"k1", "kf1"}, {"k2", "kf2"}, {"k3", "kf3"},
+        {"k4", "kf4"}, {"k5", "kf5"}, {"k6", "kf6"}, {"k7", "kf7"}, {"k8", "kf8"}, {"k9", "kf9"}, {"k;", "kf10"}, {"F1", "kf11"},
+        {"F2", "kf12"},
+        // flags
+        {"am", "am"}, {"ut", "bce"}, {"km", "km"}, {"mi", "mir"}, {"ms", "msgr"}, {"xn", "xenl"}, {"NP", "npc"}, {"bw", "bw"},
+        {"hc", "hc"}, {"hs", "hs"}, {"os", "os"}, {"eo", "eo"}, {"gn", "gn"}, {"hz", "hz"}, {"in", "in"}, {"da", "da"}, {"db", "db"},
+        {"xo", "xon"},
+        // numbers
+        {"co", "cols"}, {"li", "lines"}, {"Co", "colors"}, {"pa", "pairs"}, {"it", "it"}, {"lm", "lm"}, {"NC", "ncv"}};
+    // The guest copy of the terminfo name for a termcap code (made once per name); 0 for an unknown code.
+    const auto names = std::make_shared<std::map<std::string, Address>>();
+    const auto terminfo_name = [this, state, names](GuestMemory& m, Address id) -> Address {
+        if (!id) return 0;
+        const std::string code{static_cast<char>(m.read8(id)), m.read8(id) ? static_cast<char>(m.read8(id + 1)) : '\0'};
+        const auto found = termcap.find(code);
+        if (found == termcap.end()) return 0;
+        std::lock_guard lock(state->mutex);
+        auto& address = (*names)[found->second];
+        if (!address) address = cstring(found->second);
+        return address;
+    };
+    const auto pc = data(libncurses, "_PC", std::array<std::uint8_t, 1>{}, 1);
+    const auto up = data(libncurses, "_UP", std::array<std::uint8_t, 8>{}, 8);
+    const auto bc = data(libncurses, "_BC", std::array<std::uint8_t, 8>{}, 8);
+    // int tgetent(char* bp, const char* name): bp is not used (ncurses keeps the entry itself).
+    raw(libncurses, "_tgetent", [this, state, pc, up, bc](CpuState& s, GuestMemory& m) {
+        const auto errret = process.allocate_guest(4);
+        const auto loaded = static_cast<std::int32_t>(call(libncurses, "_setupterm", {s.x[1], 1, errret}));
+        const auto found = m.read32(errret);
+        process.release_guest(errret);
+        if (loaded != 0) { s.x[0] = found == 0 ? 0 : status(err); return; }
+        {
+            std::lock_guard lock(state->mutex);
+            m.write64(up, state->strings.at("cuu1"));
+            m.write64(bc, state->strings.at("cub1"));
+        }
+        m.write8(pc, 0);
+        s.x[0] = 1;
+    });
+    // int tgetflag(const char* id) / int tgetnum(const char* id): 0 and -1 for a capability the entry lacks.
+    raw(libncurses, "_tgetflag", [this, terminfo_name](CpuState& s, GuestMemory& m) {
+        const auto name = terminfo_name(m, s.x[0]);
+        const auto value = name ? static_cast<std::int32_t>(call(libncurses, "_tigetflag", {name})) : -1;
+        s.x[0] = value == 1 ? 1 : 0;
+    });
+    raw(libncurses, "_tgetnum", [this, terminfo_name](CpuState& s, GuestMemory& m) {
+        const auto name = terminfo_name(m, s.x[0]);
+        const auto value = name ? static_cast<std::int32_t>(call(libncurses, "_tigetnum", {name})) : -2;
+        s.x[0] = status(value < 0 ? -1 : value);
+    });
+    // char* tgetstr(const char* id, char** area): NULL for a capability the entry lacks; with an area, the
+    // string is copied there and *area moves past it, as in ncurses.
+    raw(libncurses, "_tgetstr", [this, terminfo_name](CpuState& s, GuestMemory& m) {
+        const auto name = terminfo_name(m, s.x[0]);
+        const auto value = name ? call(libncurses, "_tigetstr", {name}) : Address{0};
+        if (!value || value == static_cast<Address>(-1)) { s.x[0] = 0; return; }
+        const auto area = s.x[1];
+        if (!area || !m.read64(area)) { s.x[0] = value; return; }
+        const auto text = read_cstring(m, value, 4096);
+        const auto destination = m.read64(area);
+        m.write_bytes(destination, std::vector<std::uint8_t>(text.begin(), text.end()));
+        m.write8(destination + text.size(), 0);
+        m.write64(area, destination + text.size() + 1);
+        s.x[0] = destination;
+    });
+    // char* tgoto(const char* cap, int col, int row): the cursor motion string for row and column (tparm's
+    // parameters are row, then column).
+    raw(libncurses, "_tgoto", [this](CpuState& s, GuestMemory&) {
+        if (!s.x[0]) { s.x[0] = 0; return; }
+        CallRegs registers;
+        registers.x[0] = s.x[0];
+        const std::array<std::uint64_t, 9> parameters{static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(s.x[2]))),
+                                                      static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(s.x[1])))};
+        for (const auto parameter : parameters) registers.push_stack(parameter);   // tparm's variadic slots
+        s.x[0] = call_regs(libncurses, "_tparm", registers).x0;
+    });
+    // int tputs(const char* str, int affcnt, int (*putc)(int)): each character to putc; padding ($<n>) is
+    // skipped (a terminal emulator needs none).
+    raw(libncurses, "_tputs", [this](CpuState& s, GuestMemory& m) {
+        if (!s.x[0] || !s.x[2]) { s.x[0] = status(err); return; }
+        const auto text = read_cstring(m, s.x[0], 1 << 16);
+        for (std::size_t at = 0; at < text.size(); ++at) {
+            if (text[at] == '$' && at + 1 < text.size() && text[at + 1] == '<') {
+                const auto end = text.find('>', at);
+                if (end != std::string::npos) { at = end; continue; }
+            }
+            const std::array<std::uint64_t, 1> argument{static_cast<unsigned char>(text[at])};
+            static_cast<void>(EngineAdapter(process.calling_engine()).call(s.x[2], argument));
+        }
+        s.x[0] = 0;
+    });
 }
 
 void Machsys::install() {

@@ -343,6 +343,34 @@ void terminfo(Fixture& f) {
     require(f.call(ncurses, "_set_curterm", {0}) == terminal && f.call(ncurses, "_set_curterm", {terminal}) == 0, "set_curterm swaps cur_term");
     require(f.status(ncurses, "_del_curterm", {terminal}) == 0 && f.engine.read64(f.symbol(ncurses, "_cur_term")) == 0, "del_curterm");
     require(f.status(ncurses, "_del_curterm", {0}) == -1, "del_curterm(NULL)");
+
+    // The termcap interface over the same entry.
+    require(f.call(ncurses, "_tgetent", {0, f.text("no-such-terminal")}) == 0, "tgetent: an unknown terminal is not found");
+    require(f.call(ncurses, "_tgetent", {0, f.text("xterm-256color")}) == 1, "tgetent xterm-256color");
+    require(f.call(ncurses, "_tgetflag", {f.text("am")}) == 1 && f.call(ncurses, "_tgetflag", {f.text("hc")}) == 0 &&
+            f.call(ncurses, "_tgetflag", {f.text("zz")}) == 0, "tgetflag");
+    require(f.call(ncurses, "_tgetnum", {f.text("Co")}) == 256 && static_cast<std::int32_t>(f.call(ncurses, "_tgetnum", {f.text("zz")})) == -1,
+            "tgetnum");
+    auto& memory = static_cast<transmute::GuestMemory&>(f.engine);
+    const auto read = [&](std::uint64_t at) {
+        std::string text;
+        for (; memory.read8(at); ++at) text.push_back(static_cast<char>(memory.read8(at)));
+        return text;
+    };
+    require(read(f.engine.read64(f.symbol(ncurses, "_UP"))) == "\x1b[A" && read(f.engine.read64(f.symbol(ncurses, "_BC"))) == "\b",
+            "tgetent sets UP and BC");
+    const auto area = f.block(64), cursor = f.block(8);
+    f.engine.write64(cursor, area);
+    const auto cm = f.call(ncurses, "_tgetstr", {f.text("cm"), cursor});
+    require(cm == area && f.engine.read64(cursor) == area + read(area).size() + 1, "tgetstr copies into the area and moves it");
+    require(f.call(ncurses, "_tgetstr", {f.text("zz"), 0}) == 0, "tgetstr of a capability the entry lacks");
+    require(read(f.call(ncurses, "_tgoto", {cm, 4, 9})) == "\x1b[10;5H", "tgoto: row 9, column 4");
+    static std::string written;
+    written.clear();
+    const auto putc = f.process.install_function("_machsys_test_putc", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        written.push_back(static_cast<char>(s.x[0]));
+    });
+    require(f.call(ncurses, "_tputs", {f.text("\x1b[H$<5>\x1b[2J"), 1, putc}) == 0 && written == "\x1b[H\x1b[2J", "tputs skips padding");
 }
 
 void signposts(Fixture& f) {
