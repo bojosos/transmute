@@ -12,6 +12,8 @@
 #include "alchemy/darwin/media/media_support.hpp"
 #include "alchemy/darwin/media/media_container.hpp"
 #include "fake_aac.hpp"
+#include "fake_video.hpp"
+#include "alchemy/darwin/media/aac_encoder.hpp"
 #include "alchemy/darwin/kit/support/support_kit.hpp"
 #include "alchemy/darwin/security/bridge.hpp"
 #include "alchemy/host/time.hpp"
@@ -25,6 +27,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <mutex>
 #include <thread>
@@ -649,7 +652,7 @@ struct WriterSeen {
 WriterSeen& writer_seen() { static WriterSeen value; return value; }
 
 // AVAssetWriter: float sample buffers into a 16-bit WAVE (settings) and into a CAF (nil settings, through
-// requestMediaDataWhenReadyOnQueue:); video inputs and movie files are refused.
+// requestMediaDataWhenReadyOnQueue:); video inputs in audio files and MP3 files are refused.
 void asset_writer(Fixture& f) {
     auto& seen = writer_seen();
     const auto b = alchemy::gui::security::bridge();
@@ -661,9 +664,9 @@ void asset_writer(Fixture& f) {
     std::filesystem::remove(caf, ignored);
     const auto wav_url = f.cf.file_url(alchemy::guest_path_string(wav), false), caf_url = f.cf.file_url(alchemy::guest_path_string(caf), false);
     const auto type = [&](const char* symbol) { return f.engine.read64(f.symbol(av, symbol)); };
-    require(f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:", {wav_url, type("_AVFileTypeQuickTimeMovie"), error}) == 0 &&
+    require(f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:", {wav_url, type("_AVFileTypeMPEGLayer3"), error}) == 0 &&
                 f.engine.read64(error) != 0,
-            "no movie writer");
+            "no MP3 writer");
     const auto writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:", {wav_url, type("_AVFileTypeWAVE"), error});
     require(writer && f.send(writer, "status") == 0, "a WAVE writer");
     const auto video = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("vide"), 0});
@@ -781,6 +784,236 @@ void asset_writer(Fixture& f) {
     std::filesystem::remove(m4a, ignored);
 }
 
+std::vector<Address>& passthrough_samples() { static std::vector<Address> value; return value; }
+Fixture* movie_fixture = nullptr;
+
+// The file's tracks, read back by the container parser.
+alchemy::gui::completion_kit::media::container::Movie read_movie(const std::filesystem::path& file, std::vector<std::uint8_t>& bytes) {
+    namespace mc = alchemy::gui::completion_kit::media::container;
+    std::ifstream in(file, std::ios::binary);
+    bytes.assign(std::istreambuf_iterator<char>(in), {});
+    mc::Movie movie;
+    std::string why;
+    const mc::ReadAt reader = [&bytes](std::uint64_t at, std::span<std::uint8_t> o) -> std::size_t {
+        if (at >= bytes.size()) return 0;
+        const auto n = std::min<std::size_t>(o.size(), bytes.size() - static_cast<std::size_t>(at));
+        std::memcpy(o.data(), bytes.data() + at, n);
+        return n;
+    };
+    require(mc::parse(reader, bytes.size(), movie, why), "the movie parses: " + why);
+    return movie;
+}
+
+// AVAssetWriter movies over the fake encoders (fake_video.hpp, fake_aac.hpp): a QuickTime movie of H.264 frames from an
+// AVAssetWriterInputPixelBufferAdaptor (reordered, every tenth a keyframe, a quarter turn) and AAC from float buffers,
+// optimized for network use; an MPEG-4 file of the compressed samples a VTCompressionSession made, as they are; and the
+// refusals (no encoder, video in an audio file, uncompressed frames without settings).
+void asset_writer_movie(Fixture& f) {
+    namespace mc = alchemy::gui::completion_kit::media::container;
+    constexpr std::string_view vt = "/System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox";
+    fake_video::install();
+    fake_aac::install();
+    movie_fixture = &f;
+    const auto error = f.block(8);
+    const auto directory = std::filesystem::temp_directory_path();
+    const auto mov = directory / "alchemy_writer_test.mov", mp4 = directory / "alchemy_writer_test.mp4";
+    std::error_code ignored;
+    std::filesystem::remove(mov, ignored);
+    std::filesystem::remove(mp4, ignored);
+    const auto type = [&](const char* symbol) { return f.engine.read64(f.symbol(av, symbol)); };
+    const auto key = [&](const char* symbol) { return f.engine.read64(f.symbol(av, symbol)); };
+    const auto compression = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {key("_AVVideoAverageBitRateKey"), f.cf.integer(500000, 3)}, {key("_AVVideoMaxKeyFrameIntervalKey"), f.cf.integer(10, 3)},
+        {key("_AVVideoAllowFrameReorderingKey"), f.cf.boolean(true)}, {key("_AVVideoProfileLevelKey"), key("_AVVideoProfileLevelH264HighAutoLevel")}});
+    const auto video_settings = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {key("_AVVideoCodecKey"), key("_AVVideoCodecTypeH264")}, {key("_AVVideoWidthKey"), f.cf.integer(64, 3)},
+        {key("_AVVideoHeightKey"), f.cf.integer(48, 3)}, {key("_AVVideoCompressionPropertiesKey"), compression}});
+    const auto aac_settings = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {f.cf.string("AVFormatIDKey"), f.cf.integer(four("aac "), 3)}, {f.cf.string("AVSampleRateKey"), f.cf.real(48000)},
+        {f.cf.string("AVNumberOfChannelsKey"), f.cf.integer(2, 3)}});
+    // Refusals: video in an audio file, a codec without an encoder, no encoders at all.
+    const auto wav = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:",
+                            {f.cf.file_url(alchemy::guest_path_string(directory / "alchemy_writer_refused.wav"), false), type("_AVFileTypeWAVE"), error});
+    require((f.send(wav, "canApplyOutputSettings:forMediaType:", {video_settings, f.cf.string("vide")}) & 0xff) == 0, "no video in a WAVE file");
+    const auto writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:",
+                               {f.cf.file_url(alchemy::guest_path_string(mov), false), type("_AVFileTypeQuickTimeMovie"), error});
+    require(writer && f.send(writer, "status") == 0, "a QuickTime movie writer");
+    const auto jpeg = f.cf.dictionary(std::vector<std::pair<Address, Address>>{
+        {key("_AVVideoCodecKey"), key("_AVVideoCodecTypeJPEG")}, {key("_AVVideoWidthKey"), f.cf.integer(64, 3)}, {key("_AVVideoHeightKey"), f.cf.integer(48, 3)}});
+    require((f.send(writer, "canApplyOutputSettings:forMediaType:", {jpeg, f.cf.string("vide")}) & 0xff) == 0, "no JPEG encoder");
+    fake_video::install(true);
+    require((f.send(writer, "canApplyOutputSettings:forMediaType:", {video_settings, f.cf.string("vide")}) & 0xff) == 0, "no H.264 encoder: refused");
+    fake_video::install();
+    require((f.send(writer, "canApplyOutputSettings:forMediaType:", {video_settings, f.cf.string("vide")}) & 0xff) == 1, "H.264 settings apply");
+    // The QuickTime movie.
+    const auto video = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("vide"), video_settings});
+    const auto turn = f.block(48);
+    for (const auto [i, v] : std::initializer_list<std::pair<int, double>>{{0, 0}, {1, 1}, {2, -1}, {3, 0}, {4, 48}, {5, 0}})
+        f.engine.write64(turn + 8 * i, std::bit_cast<std::uint64_t>(v));
+    f.send(video, "setTransform:", {turn});
+    const auto adaptor = f.send(f.cls("AVAssetWriterInputPixelBufferAdaptor"), "assetWriterInputPixelBufferAdaptorWithAssetWriterInput:sourcePixelBufferAttributes:", {video, 0});
+    require(adaptor && f.send(adaptor, "assetWriterInput") == video && f.send(adaptor, "pixelBufferPool") == 0, "an adaptor, no pool before writing");
+    const auto audio = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), aac_settings});
+    require((f.send(writer, "canAddInput:", {video}) & 0xff) == 1 && (f.send(writer, "canAddInput:", {audio}) & 0xff) == 1, "both inputs fit");
+    f.send(writer, "addInput:", {video});
+    f.send(writer, "addInput:", {audio});
+    f.send(writer, "setShouldOptimizeForNetworkUse:", {1});
+    require((f.send(writer, "startWriting") & 0xff) == 1 && f.send(writer, "status") == 1, "writing the movie");
+    const auto pool = f.send(adaptor, "pixelBufferPool");
+    require(pool != 0, "the adaptor's pool");
+    f.send(writer, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+    const auto buffer_out = f.block(8), time = f.block(24);
+    for (int i = 0; i < 20; ++i) {
+        require(f.status(cv, "_CVPixelBufferPoolCreatePixelBuffer", {0, pool, buffer_out}) == 0, "a pixel buffer");
+        f.engine.write64(time, static_cast<std::uint64_t>(i * 20));
+        f.engine.write32(time + 8, 600);
+        f.engine.write32(time + 12, 1);
+        f.engine.write64(time + 16, 0);
+        require((f.send(adaptor, "appendPixelBuffer:withPresentationTime:", {f.engine.read64(buffer_out), time}) & 0xff) == 1, "frame " + std::to_string(i));
+        if (i < 7) require((f.send(audio, "appendSampleBuffer:", {float_sample_buffer(f, 4800, 4800LL * i)}) & 0xff) == 1, "audio " + std::to_string(i));
+    }
+    require(fake_video::last.frame_reordering && fake_video::last.bit_rate == 500000 && fake_video::last.keyframe_interval == 10 &&
+                fake_video::last.profile == fake_video::enc::Profile::h264_high,
+            "the compression properties reach the encoder (opened at the first frame)");
+    f.send(video, "markAsFinished");
+    f.send(audio, "markAsFinished");
+    require((f.send(writer, "finishWriting") & 0xff) == 1 && f.send(writer, "status") == 2, "the movie completes");
+    {
+        std::vector<std::uint8_t> bytes;
+        const auto movie = read_movie(mov, bytes);
+        require(movie.brand == mc::fourcc("qt  ") && movie.tracks.size() == 2, "a QuickTime movie of two tracks");
+        const auto& v = movie.tracks[0];
+        const auto& a = movie.tracks[1];
+        require(v.kind == mc::Track::Kind::video && v.codec == mc::fourcc("avc1") && v.width == 64 && v.height == 48 && !v.config.empty() &&
+                    v.samples.size() == 20 && v.samples[0].keyframe && v.samples[10].keyframe == true,
+                "the H.264 track: " + std::to_string(v.samples.size()) + " frames");
+        bool reordered = false;
+        for (const auto& s : v.samples) reordered = reordered || s.pts != s.dts;
+        require(reordered, "reordered frames keep their presentation times");
+        require(a.kind == mc::Track::Kind::audio && a.codec == mc::fourcc("mp4a") && a.priming == fake_aac::priming &&
+                    a.samples.size() == (fake_aac::priming + 33600 + 1023) / 1024,
+                "the AAC track: priming " + std::to_string(a.priming) + ", " + std::to_string(a.samples.size()) + " packets");
+        // moov ahead of mdat (optimized for network use).
+        const auto at = [&](const char* box) {
+            const auto found = std::search(bytes.begin(), bytes.end(), box, box + 4);
+            return found == bytes.end() ? bytes.size() : static_cast<std::size_t>(found - bytes.begin());
+        };
+        require(at("moov") < at("mdat"), "the moov comes first");
+    }
+    // MPEG-4 of compressed samples as they are: a VTCompressionSession's output through a passthrough input.
+    const auto handler_fn = f.process.install_function("_alchemy_test_writer_vt_handled", [](transmute::CpuState& s, transmute::GuestMemory&) {
+        // block(OSStatus, VTEncodeInfoFlags, CMSampleBufferRef)
+        if (s.x[3] && !s.x[1]) {
+            static_cast<void>(movie_fixture->call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFRetain", {s.x[3]}));
+            passthrough_samples().push_back(s.x[3]);
+        }
+    }, "/usr/lib/alchemy_test_io.dylib");
+    const auto handler = f.block(32), descriptor = f.block(16);
+    f.engine.write64(descriptor + 8, 32);
+    f.engine.write64(handler, f.process.resolve("/usr/lib/libSystem.B.dylib", "__NSConcreteGlobalBlock")->address);
+    f.engine.write32(handler + 8, 1U << 28);   // BLOCK_IS_GLOBAL
+    f.engine.write64(handler + 16, handler_fn);
+    f.engine.write64(handler + 24, descriptor);
+    const auto session_out = f.block(8);
+    alchemy::CallRegs create{};
+    create.x[1] = 64;
+    create.x[2] = 48;
+    create.x[3] = four("avc1");
+    create.push_stack(0);
+    create.push_stack(session_out);
+    require(static_cast<std::int32_t>(f.regs(vt, "_VTCompressionSessionCreate", create).x0) == 0, "a compression session");
+    const auto session = f.engine.read64(session_out);
+    const auto session_pool = f.call(vt, "_VTCompressionSessionGetPixelBufferPool", {session});
+    const auto duration = f.block(24);
+    f.engine.write64(duration, 20);
+    f.engine.write32(duration + 8, 600);
+    f.engine.write32(duration + 12, 1);
+    for (int i = 0; i < 6; ++i) {
+        require(f.status(cv, "_CVPixelBufferPoolCreatePixelBuffer", {0, session_pool, buffer_out}) == 0, "a pixel buffer");
+        f.engine.write64(time, static_cast<std::uint64_t>(i * 20));
+        f.engine.write32(time + 8, 600);
+        f.engine.write32(time + 12, 1);
+        require(f.status(vt, "_VTCompressionSessionEncodeFrameWithOutputHandler", {session, f.engine.read64(buffer_out), time, duration, 0, 0, handler}) == 0, "encoded");
+    }
+    f.engine.write32(time + 12, 0);
+    require(f.status(vt, "_VTCompressionSessionCompleteFrames", {session, time}) == 0, "CompleteFrames");
+    require(passthrough_samples().size() == 6, "six compressed samples");
+    const auto mp4_writer = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:",
+                                   {f.cf.file_url(alchemy::guest_path_string(mp4), false), type("_AVFileTypeMPEG4"), error});
+    const auto passthrough = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("vide"), 0});
+    require((f.send(mp4_writer, "canAddInput:", {passthrough}) & 0xff) == 1, "a passthrough video input");
+    f.send(mp4_writer, "addInput:", {passthrough});
+    require((f.send(mp4_writer, "startWriting") & 0xff) == 1, "writing the MPEG-4 file");
+    f.send(mp4_writer, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+    for (const auto sample : passthrough_samples()) require((f.send(passthrough, "appendSampleBuffer:", {sample}) & 0xff) == 1, "a compressed sample");
+    f.send(passthrough, "markAsFinished");
+    require((f.send(mp4_writer, "finishWriting") & 0xff) == 1, "the MPEG-4 file completes");
+    {
+        std::vector<std::uint8_t> bytes;
+        const auto movie = read_movie(mp4, bytes);
+        require(movie.brand == mc::fourcc("mp42") && movie.tracks.size() == 1 && movie.tracks[0].codec == mc::fourcc("avc1") &&
+                    movie.tracks[0].samples.size() == 6 && movie.tracks[0].samples[0].keyframe && !movie.tracks[0].config.empty(),
+                "the passthrough H.264 track");
+    }
+    // Uncompressed frames need settings.
+    const auto refused = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:",
+                                {f.cf.file_url(alchemy::guest_path_string(directory / "alchemy_writer_refused.mp4"), false), type("_AVFileTypeMPEG4"), error});
+    const auto raw = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("vide"), 0});
+    f.send(refused, "addInput:", {raw});
+    f.send(refused, "startWriting");
+    f.send(refused, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+    const auto adaptor_less = f.send(f.cls("AVAssetWriterInputPixelBufferAdaptor"), "assetWriterInputPixelBufferAdaptorWithAssetWriterInput:sourcePixelBufferAttributes:",
+                                     {f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("vide"), 0}), 0});
+    require(adaptor_less && f.send(adaptor_less, "pixelBufferPool") == 0, "no pool without settings");
+    f.send(refused, "cancelWriting");
+    require(f.send(refused, "status") == 4, "cancelled");
+    for (const auto sample : passthrough_samples()) f.call("/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "_CFRelease", {sample});
+    passthrough_samples().clear();
+    f.call(vt, "_VTCompressionSessionInvalidate", {session});
+    // The host's own encoders (skipped where there is none): ten frames and a fifth of a second of AAC into a movie.
+    alchemy::gui::completion_kit::media::video_encoding::set_backend({});
+    alchemy::gui::completion_kit::media::aac::set_backend({});
+    const auto host_encoders = alchemy::gui::completion_kit::media::video_encoding::encoders();
+    const bool host_h264 = std::any_of(host_encoders.begin(), host_encoders.end(), [](const auto& e) {
+        return e.codec == alchemy::gui::completion_kit::media::video_encoding::Codec::h264;
+    });
+    if (!host_h264 || !alchemy::gui::completion_kit::media::aac::available()) {
+        std::cout << "[media capture] no host H.264 or AAC encoder: the real movie is skipped" << std::endl;
+    } else {
+        const auto real = f.send(f.cls("AVAssetWriter"), "assetWriterWithURL:fileType:error:",
+                                 {f.cf.file_url(alchemy::guest_path_string(mov), false), type("_AVFileTypeQuickTimeMovie"), error});
+        const auto real_video = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("vide"), video_settings});
+        const auto real_adaptor = f.send(f.cls("AVAssetWriterInputPixelBufferAdaptor"), "assetWriterInputPixelBufferAdaptorWithAssetWriterInput:sourcePixelBufferAttributes:",
+                                         {real_video, 0});
+        const auto real_audio = f.send(f.cls("AVAssetWriterInput"), "assetWriterInputWithMediaType:outputSettings:", {f.cf.string("soun"), aac_settings});
+        f.send(real, "addInput:", {real_video});
+        f.send(real, "addInput:", {real_audio});
+        require((f.send(real, "startWriting") & 0xff) == 1, "writing with the host's encoders");
+        f.send(real, "startSessionAtSourceTime:", {f.symbol(cm, "_kCMTimeZero")});
+        const auto real_pool = f.send(real_adaptor, "pixelBufferPool");
+        for (int i = 0; i < 10; ++i) {
+            require(f.status(cv, "_CVPixelBufferPoolCreatePixelBuffer", {0, real_pool, buffer_out}) == 0, "a pixel buffer");
+            f.engine.write64(time, static_cast<std::uint64_t>(i * 20));
+            f.engine.write32(time + 8, 600);
+            f.engine.write32(time + 12, 1);
+            require((f.send(real_adaptor, "appendPixelBuffer:withPresentationTime:", {f.engine.read64(buffer_out), time}) & 0xff) == 1, "a real frame");
+            if (i < 2) require((f.send(real_audio, "appendSampleBuffer:", {float_sample_buffer(f, 4800, 4800LL * i)}) & 0xff) == 1, "real audio");
+        }
+        f.send(real_video, "markAsFinished");
+        f.send(real_audio, "markAsFinished");
+        require((f.send(real, "finishWriting") & 0xff) == 1, "the real movie completes");
+        std::vector<std::uint8_t> bytes;
+        const auto movie = read_movie(mov, bytes);
+        require(movie.tracks.size() == 2 && movie.tracks[0].codec == mc::fourcc("avc1") && movie.tracks[0].samples.size() == 10 &&
+                    movie.tracks[0].samples[0].keyframe && movie.tracks[1].codec == mc::fourcc("mp4a") && movie.tracks[1].samples.size() >= 10,
+                "the real movie: " + std::to_string(movie.tracks.size()) + " tracks");
+        std::cout << "[media capture] real movie: " << movie.tracks[0].samples.size() << " H.264 frames, " << movie.tracks[1].samples.size()
+                  << " AAC packets (priming " << movie.tracks[1].priming << "), " << bytes.size() << " bytes" << std::endl;
+    }
+    std::filesystem::remove(mov, ignored);
+    std::filesystem::remove(mp4, ignored);
+}
+
 // Alchemy's own test devices (ALCHEMY_CAMERA=pattern, ALCHEMY_AUDIO_INPUT=tone) through the host backends: the
 // colour-bar camera and the 440 Hz microphone, which replace the host's devices (none is opened).
 void test_devices(Fixture&) {
@@ -847,6 +1080,7 @@ int main() {
         {"ioproc_input", ioproc_input},
         {"recorder", recorder},
         {"asset_writer", asset_writer},
+        {"asset_writer_movie", asset_writer_movie},
         {"test_devices", test_devices},
     });
 }

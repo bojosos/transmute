@@ -82,6 +82,24 @@ from and to any linear PCM client format at the file's rate. An existing file op
 when its header is the one Alchemy writes (a canonical WAVE, or an Alchemy-written file); others,
 and formats a container cannot hold, answer with the AudioFile errors.
 
+**AVAssetWriter (real, `av_asset_writer.cpp`, `movie_file.cpp`):**
+- Audio files (WAVE, AIFF, AIFC, CAF, M4A) go through ExtAudioFile.
+- MPEG-4, M4V and QuickTime movies go through Alchemy's muxer, and may hold any number of video and audio inputs:
+  - Video with H.264 or HEVC settings is encoded by a VTCompressionSession of its own (the host's encoders),
+    from `AVAssetWriterInputPixelBufferAdaptor` pixel buffers (its pool is the session's) or from sample buffers
+    of images.
+  - Audio with AAC or Apple Lossless settings is encoded from linear PCM, converted to the settings' channels
+    and rate.
+  - Inputs without settings take compressed samples as they are.
+- The files have:
+  - avcC/hvcC, esds or alac configurations (QuickTime audio in a version 1 sound description with `wave`);
+  - ctts for reordered frames, stss, and edit lists for priming;
+  - half-second interleaved chunks;
+  - each input's transform;
+  - the moov in front when `shouldOptimizeForNetworkUse` is set.
+- Refused, as documented: settings no encoder here takes; linear PCM, and uncompressed video without settings,
+  in movies; MP3 files.
+
 **CoreMIDI 2.0 event lists (real, `coremidi.cpp`, `midi_ump.cpp`):** `MIDIEventListInit`/`Add`,
 `MIDISendEventList`, `MIDIReceivedEventList`, and ports and endpoints with a protocol or a block
 (`MIDIInputPortCreateWithProtocol`/`WithBlock`, `MIDIDestinationCreateWithProtocol`/`WithBlock`,
@@ -118,7 +136,12 @@ value follows the framework's naming convention (usually the name without its `k
 code marks it "(unverified: ...)": VideoToolbox compression keys, profile levels, entropy modes and encoder list
 keys (`video.cpp`, `media_gaps.cpp`), `kCMSampleAttachmentKey_PartialSync` and
 `kCMFormatDescriptionExtension_VerbatimSampleDescription` (`coremedia.cpp`), and the CoreVideo, AVFoundation and
-AudioToolbox names marked in `media_gaps.cpp` and `pixel_transfer.cpp`.
+AudioToolbox names marked in `media_gaps.cpp` and `pixel_transfer.cpp`. AVAssetWriter's video settings keys
+(`av_asset_writer.cpp`) are another such case:
+- `AVVideoWidthKey` and the other dictionary keys carry their own names;
+- the compression properties carry the VideoToolbox keys' values (`AverageBitRate`, ...);
+- the codec types (`AVVideoCodecTypeH264`, `AVVideoCodecTypeHEVC`) carry the codecs' four-char codes (`avc1`,
+  `hvc1`).
 
 ## Moved from darwin/identities/
 
