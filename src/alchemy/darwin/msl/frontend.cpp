@@ -25,6 +25,13 @@
 // Clang front end (owner: A6). See frontend.hpp.
 namespace alchemy::msl::detail {
 
+// The front end runs the host's clang as a child process (host::process::
+// spawn_piped): Windows and Linux. Elsewhere every compile reports that it is
+// unavailable.
+#if defined(_WIN32) || defined(__linux__)
+#define ALCHEMY_MSL_FRONTEND 1
+#endif
+
 #ifndef ALCHEMY_MSL_CLANG_DEFAULT_PATH
 #define ALCHEMY_MSL_CLANG_DEFAULT_PATH ""
 #endif
@@ -55,7 +62,7 @@ std::uint64_t fnv1a(std::string_view data, std::uint64_t hash) {
 
 namespace {
 
-#ifdef _WIN32
+#ifdef ALCHEMY_MSL_FRONTEND
 struct ProcessResult {
     std::uint32_t exit_code{~0U};
     std::string out, err;
@@ -353,7 +360,7 @@ const std::filesystem::path& stdlib_directory() {
 
 ClangOutput preprocess_with_clang(std::string_view source, const CompileOptions& options) {
     ClangOutput result;
-#ifdef _WIN32
+#ifdef ALCHEMY_MSL_FRONTEND
     if (clang_path().empty()) throw std::runtime_error("no clang configured for the MSL compiler (set ALCHEMY_MSL_CLANG)");
     auto args = common_arguments(options);
     args.push_back("-D__ALCHEMY_MSL_PREPROCESS=1");
@@ -367,12 +374,12 @@ ClangOutput preprocess_with_clang(std::string_view source, const CompileOptions&
 #else
     (void)source;
     (void)options;
-    throw std::runtime_error("the MSL compiler front end is implemented for Windows hosts only");
+    throw std::runtime_error("the MSL compiler front end is not implemented on this host");
 #endif
     return result;
 }
 
-#ifdef _WIN32
+#ifdef ALCHEMY_MSL_FRONTEND
 namespace {
 
 // clang's predefined macros for the preprocessing configuration (and what
@@ -457,7 +464,7 @@ std::optional<MacroSets> predefined_macros(const CompileOptions& options) {
 #endif
 
 InHouseOutput preprocess_in_house(std::string_view source, const CompileOptions& options) {
-#ifdef _WIN32
+#ifdef ALCHEMY_MSL_FRONTEND
     const auto sets = predefined_macros(options);
     if (!sets) return {false, {}, "clang's predefined macros are unavailable"};
     return preprocess_in_house(source, *sets->builtins, *sets->stdlib, options.macros);
@@ -485,7 +492,7 @@ ClangOutput preprocess(std::string_view source, const CompileOptions& options) {
     return preprocess_with_clang(source, options);
 }
 
-#ifdef _WIN32
+#ifdef ALCHEMY_MSL_FRONTEND
 namespace {
 
 // Arguments shared by the IR compile and the precompiled metal_stdlib: a PCH
@@ -557,7 +564,7 @@ std::filesystem::path stdlib_pch(const CompileOptions& options) {
 #endif
 
 std::uint64_t ir_configuration_hash(const CompileOptions& options) {
-#ifdef _WIN32
+#ifdef ALCHEMY_MSL_FRONTEND
     std::uint64_t hash = fnv1a(alchemy::msl::toolchain().version + "\n" + clang_path());
     for (const auto& arg : ir_arguments(options)) hash = fnv1a(arg + "\n", hash);
     return hash;
@@ -569,7 +576,7 @@ std::uint64_t ir_configuration_hash(const CompileOptions& options) {
 
 ClangOutput build_pch(std::string_view header, const std::filesystem::path& output, const CompileOptions& options) {
     ClangOutput result;
-#ifdef _WIN32
+#ifdef ALCHEMY_MSL_FRONTEND
     auto staging = output;
     staging += ".tmp" + std::to_string(host::process::current_pid()) + "-" + std::to_string(host::process::current_thread_id());
     auto args = ir_arguments(options);
@@ -601,7 +608,7 @@ ClangOutput build_pch(std::string_view header, const std::filesystem::path& outp
 ClangOutput compile_to_ir(std::string_view source, const CompileOptions& options, const std::filesystem::path& prelude,
                           bool syntax_only) {
     ClangOutput result;
-#ifdef _WIN32
+#ifdef ALCHEMY_MSL_FRONTEND
     auto args = ir_arguments(options);
     for (const auto& [name, value] : options.macros) args.push_back("-D" + name + "=" + value);
     if (syntax_only) args.push_back("-fsyntax-only");
@@ -668,7 +675,7 @@ ClangOutput compile_to_ir(std::string_view source, const CompileOptions& options
 #else
     (void)source;
     (void)options;
-    throw std::runtime_error("the MSL compiler front end is implemented for Windows hosts only");
+    throw std::runtime_error("the MSL compiler front end is not implemented on this host");
 #endif
     return result;
 }
@@ -685,7 +692,7 @@ const Toolchain& toolchain() {
             result.error = "no clang configured (set ALCHEMY_MSL_CLANG or the ALCHEMY_CLANG CMake cache entry)";
             return result;
         }
-#ifdef _WIN32
+#ifdef ALCHEMY_MSL_FRONTEND
         try {
             const auto process = detail::run_process(result.path, {"--version"}, {});
             if (process.exit_code != 0) {
@@ -699,7 +706,7 @@ const Toolchain& toolchain() {
             result.error = failure.what();
         }
 #else
-        result.error = "the MSL compiler front end is implemented for Windows hosts only";
+        result.error = "the MSL compiler front end is not implemented on this host";
 #endif
         return result;
     }();
