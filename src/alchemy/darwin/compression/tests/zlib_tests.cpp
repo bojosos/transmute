@@ -348,6 +348,93 @@ void test_guest_zstream(Fixture& f) {
     f.engine.read_bytes(unpacked, recovered);
     require(recovered == bytes(second), "inflateSync output");
     static_cast<void>(f.call(libz, "_inflateEnd", {inflater}));
+
+    // deflateSetHeader / inflateGetHeader: a gzip member header with every field, read back (gz_header, LP64: text 0,
+    // time 8, xflags 16, os 20, extra 24, extra_len 32, extra_max 36, name 40, name_max 48, comment 56, comm_max 64,
+    // hcrc 68, done 72).
+    auto& memory = static_cast<transmute::GuestMemory&>(f.engine);
+    const auto head = f.process.allocate_guest(80);
+    f.engine.fill_bytes(head, 0, 80);
+    const auto extra = f.process.allocate_guest(8);
+    f.engine.write_bytes(extra, std::vector<std::uint8_t>{'A', 'P', 2, 0, 7, 9});
+    f.engine.write32(head + 0, 1);
+    f.engine.write64(head + 8, 1700000000);
+    f.engine.write32(head + 20, 3);
+    f.engine.write64(head + 24, extra);
+    f.engine.write32(head + 32, 6);
+    f.engine.write64(head + 40, f.text("photo.raw"));
+    f.engine.write64(head + 56, f.text("a comment"));
+    f.engine.write32(head + 68, 1);
+    f.engine.fill_bytes(deflater, 0, 112);
+    require(static_cast<std::int32_t>(f.call(libz, "_deflateInit2_", {deflater, 6, 8, 15, 8, 0, version, 112})) == 0, "deflateInit2_ zlib");
+    require(static_cast<std::int32_t>(f.call(libz, "_deflateSetHeader", {deflater, head})) == -2, "deflateSetHeader on a zlib stream");
+    static_cast<void>(f.call(libz, "_deflateEnd", {deflater}));
+    f.engine.fill_bytes(deflater, 0, 112);
+    require(static_cast<std::int32_t>(f.call(libz, "_deflateInit2_", {deflater, 6, 8, 31, 8, 0, version, 112})) == 0, "deflateInit2_ gzip");
+    require(static_cast<std::int32_t>(f.call(libz, "_deflateSetHeader", {deflater, head})) == 0, "deflateSetHeader");
+    f.engine.write64(deflater + 0, source);
+    f.engine.write32(deflater + 8, static_cast<std::uint32_t>(text.size()));
+    f.engine.write64(deflater + 24, packed);
+    f.engine.write32(deflater + 32, 16384);
+    require(static_cast<std::int32_t>(f.call(libz, "_deflate", {deflater, 4})) == 1, "gzip with a header: Z_STREAM_END");
+    const auto gzip_size = f.engine.read64(deflater + 40);
+    static_cast<void>(f.call(libz, "_deflateEnd", {deflater}));
+    require(memory.read8(packed + 3) == (1 | 2 | 4 | 8 | 16), "FTEXT, FHCRC, FEXTRA, FNAME and FCOMMENT are set");
+    // Read back through inflateGetHeader, with a name buffer one byte short (the name is cut there).
+    const auto got = f.process.allocate_guest(80), got_extra = f.process.allocate_guest(16), got_name = f.process.allocate_guest(16),
+               got_comment = f.process.allocate_guest(32);
+    f.engine.fill_bytes(got, 0, 80);
+    f.engine.fill_bytes(got_name, 0x55, 16);
+    f.engine.write64(got + 24, got_extra);
+    f.engine.write32(got + 36, 16);
+    f.engine.write64(got + 40, got_name);
+    f.engine.write32(got + 48, 9);   // "photo.raw" is 9 bytes: no room for the terminator
+    f.engine.write64(got + 56, got_comment);
+    f.engine.write32(got + 64, 32);
+    f.engine.fill_bytes(inflater, 0, 112);
+    require(static_cast<std::int32_t>(f.call(libz, "_inflateInit2_", {inflater, static_cast<std::uint64_t>(-15), version, 112})) == 0, "raw inflate");
+    require(static_cast<std::int32_t>(f.call(libz, "_inflateGetHeader", {inflater, got})) == -2, "inflateGetHeader on a raw stream");
+    static_cast<void>(f.call(libz, "_inflateEnd", {inflater}));
+    f.engine.fill_bytes(inflater, 0, 112);
+    require(static_cast<std::int32_t>(f.call(libz, "_inflateInit2_", {inflater, 47, version, 112})) == 0, "automatic inflate");
+    require(static_cast<std::int32_t>(f.call(libz, "_inflateGetHeader", {inflater, got})) == 0 && f.engine.read32(got + 72) == 0,
+            "inflateGetHeader: not done before inflate");
+    f.engine.write64(inflater + 0, packed);
+    f.engine.write32(inflater + 8, static_cast<std::uint32_t>(gzip_size));
+    f.engine.write64(inflater + 24, unpacked);
+    f.engine.write32(inflater + 32, 16384);
+    require(static_cast<std::int32_t>(f.call(libz, "_inflate", {inflater, 0})) == 1, "inflate of the headed gzip stream");
+    std::vector<std::uint8_t> extra_back(6), name_back(10);
+    f.engine.read_bytes(got_extra, extra_back);
+    f.engine.read_bytes(got_name, name_back);
+    std::string comment_back;
+    for (auto at = got_comment; memory.read8(at); ++at) comment_back.push_back(static_cast<char>(memory.read8(at)));
+    require(f.engine.read32(got + 72) == 1 && f.engine.read32(got + 0) == 1 && f.engine.read64(got + 8) == 1700000000 &&
+            f.engine.read32(got + 20) == 3 && f.engine.read32(got + 32) == 6 && f.engine.read32(got + 68) == 1, "gz_header fields");
+    require(extra_back == std::vector<std::uint8_t>{'A', 'P', 2, 0, 7, 9} && comment_back == "a comment", "extra and comment");
+    require(std::string(name_back.begin(), name_back.begin() + 9) == "photo.raw" && name_back[9] == 0x55,
+            "the name is cut at name_max, unterminated");
+    static_cast<void>(f.call(libz, "_inflateEnd", {inflater}));
+    // A zlib stream through an automatic inflater: done -1.
+    f.engine.fill_bytes(deflater, 0, 112);
+    require(static_cast<std::int32_t>(f.call(libz, "_deflateInit_", {deflater, 6, version, 112})) == 0, "deflateInit_");
+    f.engine.write64(deflater + 0, source);
+    f.engine.write32(deflater + 8, static_cast<std::uint32_t>(text.size()));
+    f.engine.write64(deflater + 24, packed);
+    f.engine.write32(deflater + 32, 16384);
+    static_cast<void>(f.call(libz, "_deflate", {deflater, 4}));
+    const auto zlib_size = f.engine.read64(deflater + 40);
+    static_cast<void>(f.call(libz, "_deflateEnd", {deflater}));
+    f.engine.fill_bytes(inflater, 0, 112);
+    require(static_cast<std::int32_t>(f.call(libz, "_inflateInit2_", {inflater, 47, version, 112})) == 0 &&
+            static_cast<std::int32_t>(f.call(libz, "_inflateGetHeader", {inflater, got})) == 0, "automatic inflater with a gz_header");
+    f.engine.write64(inflater + 0, packed);
+    f.engine.write32(inflater + 8, static_cast<std::uint32_t>(zlib_size));
+    f.engine.write64(inflater + 24, unpacked);
+    f.engine.write32(inflater + 32, 16384);
+    require(static_cast<std::int32_t>(f.call(libz, "_inflate", {inflater, 0})) == 1 && static_cast<std::int32_t>(f.engine.read32(got + 72)) == -1,
+            "a zlib stream's gz_header: done -1");
+    static_cast<void>(f.call(libz, "_inflateEnd", {inflater}));
 }
 
 // libpng's IDAT reader (png_read_IDAT_data): one row of output per inflate

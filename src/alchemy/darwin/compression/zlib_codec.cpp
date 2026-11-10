@@ -438,6 +438,7 @@ struct InflateStream::State {
     std::uint64_t total_out{};
     bool verify{true};
     std::string_view message;
+    std::optional<ParsedHeader> parsed;   // the header once read (inflateGetHeader)
 
     void emit(std::span<const std::uint8_t> bytes) {
         output.insert(output.end(), bytes.begin(), bytes.end());
@@ -452,6 +453,7 @@ struct InflateStream::State {
         stage = value == Wrapper::raw ? Stage::blocks : Stage::header;
         buffer.clear(); bit_offset = 0; history.clear(); emitted_in_block = 0; output.clear();
         check = wrapper == Wrapper::zlib ? 1U : 0U; dictionary = 0; total_out = 0; message = {};
+        parsed.reset();
     }
     // Parses the zlib or gzip header; false when more input is needed.
     bool header() {
@@ -470,10 +472,12 @@ struct InflateStream::State {
                              (std::uint32_t{buffer[4]} << 8) | buffer[5];
                 buffer.erase(buffer.begin(), buffer.begin() + 6);
                 stage = Stage::dictionary;
+                parsed = ParsedHeader{Wrapper::zlib, {}};
                 return true;
             }
             buffer.erase(buffer.begin(), buffer.begin() + 2);
             stage = Stage::blocks;
+            parsed = ParsedHeader{Wrapper::zlib, {}};
             return true;
         }
         // RFC 1952 member header.
@@ -482,16 +486,29 @@ struct InflateStream::State {
         if (buffer[2] != 8) { fail("unknown compression method"); return true; }
         const auto flags = buffer[3];
         if (flags & 0xe0) { fail("unknown header flags set"); return true; }
+        GzipHeader fields;
+        fields.text = flags & 1;
+        fields.hcrc = (flags & 2) != 0;
+        fields.time = std::uint32_t{buffer[4]} | (std::uint32_t{buffer[5]} << 8) | (std::uint32_t{buffer[6]} << 16) |
+                      (std::uint32_t{buffer[7]} << 24);
+        fields.xflags = buffer[8];
+        fields.os = buffer[9];
         std::size_t at = 10;
         if (flags & 4) {
             if (buffer.size() < at + 2) return false;
-            at += 2 + (std::size_t{buffer[at]} | (std::size_t{buffer[at + 1]} << 8));
-            if (buffer.size() < at) return false;
+            const auto length = std::size_t{buffer[at]} | (std::size_t{buffer[at + 1]} << 8);
+            if (buffer.size() < at + 2 + length) return false;
+            fields.extra.emplace(buffer.begin() + static_cast<std::ptrdiff_t>(at + 2),
+                                 buffer.begin() + static_cast<std::ptrdiff_t>(at + 2 + length));
+            at += 2 + length;
         }
         for (const std::uint8_t field : {std::uint8_t{8}, std::uint8_t{16}}) {
             if (!(flags & field)) continue;
+            const auto start = at;
             while (at < buffer.size() && buffer[at] != 0) ++at;
             if (at >= buffer.size()) return false;
+            (field == 8 ? fields.name : fields.comment)
+                .emplace(reinterpret_cast<const char*>(buffer.data() + start), at - start);
             ++at;
         }
         if (flags & 2) {
@@ -505,6 +522,7 @@ struct InflateStream::State {
         }
         buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(at));
         stage = Stage::blocks;
+        parsed = ParsedHeader{Wrapper::gzip, std::move(fields)};
         return true;
     }
     // Decodes complete blocks; false when more input is needed.
@@ -569,6 +587,10 @@ bool InflateStream::ended() const noexcept { return state_->stage == State::Stag
 std::uint32_t InflateStream::check() const noexcept { return state_->dictionary ? state_->dictionary : state_->check; }
 std::string_view InflateStream::message() const noexcept { return state_->message; }
 void InflateStream::verify(bool enabled) noexcept { state_->verify = enabled; }
+std::optional<InflateStream::ParsedHeader> InflateStream::parsed_header() const { return state_->parsed; }
+bool InflateStream::accepts_gzip() const noexcept {
+    return state_->requested == Wrapper::gzip || state_->requested == Wrapper::automatic;
+}
 InflateStream::Dictionary InflateStream::set_dictionary(std::span<const std::uint8_t> bytes) {
     auto& s = *state_;
     using Stage = State::Stage;
@@ -629,6 +651,7 @@ struct DeflateStream::State {
     std::uint64_t total_in{};
     bool header{}, finished{};
     std::optional<std::uint32_t> dictionary;   // a zlib header's FDICT id
+    std::optional<GzipHeader> gzip_header;     // deflateSetHeader's fields
 
     void drain() {
         output.insert(output.end(), writer.output.begin(), writer.output.end());
@@ -642,7 +665,7 @@ struct DeflateStream::State {
         total_in = 0;
         header = false;
         finished = false;
-        dictionary.reset();
+        dictionary.reset();   // gzip_header stays for the next stream, as zlib's deflateReset keeps it
     }
 };
 
@@ -660,6 +683,12 @@ bool DeflateStream::set_dictionary(std::span<const std::uint8_t> bytes) {
     auto& s = *state_;
     if (s.wrapper == Wrapper::gzip || s.header) return false;
     if (s.wrapper == Wrapper::zlib) s.dictionary = adler32_update(1, bytes);
+    return true;
+}
+bool DeflateStream::set_gzip_header(GzipHeader header) {
+    auto& s = *state_;
+    if (s.wrapper != Wrapper::gzip || s.header) return false;
+    s.gzip_header = std::move(header);
     return true;
 }
 void DeflateStream::set_level(int level) {
@@ -685,9 +714,36 @@ void DeflateStream::feed(std::span<const std::uint8_t> input, Flush flush) {
             if (s.dictionary)
                 for (int shift = 24; shift >= 0; shift -= 8) s.output.push_back(static_cast<std::uint8_t>(*s.dictionary >> shift));
         } else if (s.wrapper == Wrapper::gzip) {
-            // No name or modification time; XFL by level; OS 3 (Unix), as on macOS.
+            // Without deflateSetHeader: no name or modification time; XFL by level; OS 3 (Unix), as on macOS.
             const std::uint8_t xfl = s.level == 9 ? 2 : s.level == 1 ? 4 : 0;
-            s.output.insert(s.output.end(), {0x1f, 0x8b, 8, 0, 0, 0, 0, 0, xfl, 3});
+            if (!s.gzip_header) {
+                s.output.insert(s.output.end(), {0x1f, 0x8b, 8, 0, 0, 0, 0, 0, xfl, 3});
+            } else {
+                // The caller's fields, in RFC 1952 order; FHCRC is the low 16 bits of the header's CRC-32.
+                const auto& head = *s.gzip_header;
+                const auto start = s.output.size();
+                const std::uint8_t flags = static_cast<std::uint8_t>((head.text ? 1 : 0) | (head.hcrc ? 2 : 0) | (head.extra ? 4 : 0) |
+                                                                     (head.name ? 8 : 0) | (head.comment ? 16 : 0));
+                s.output.insert(s.output.end(), {0x1f, 0x8b, 8, flags, static_cast<std::uint8_t>(head.time),
+                                                 static_cast<std::uint8_t>(head.time >> 8), static_cast<std::uint8_t>(head.time >> 16),
+                                                 static_cast<std::uint8_t>(head.time >> 24), xfl, head.os});
+                if (head.extra) {
+                    const auto length = std::min<std::size_t>(head.extra->size(), 0xffff);
+                    s.output.push_back(static_cast<std::uint8_t>(length));
+                    s.output.push_back(static_cast<std::uint8_t>(length >> 8));
+                    s.output.insert(s.output.end(), head.extra->begin(), head.extra->begin() + static_cast<std::ptrdiff_t>(length));
+                }
+                for (const auto* text : {&head.name, &head.comment})
+                    if (*text) {
+                        s.output.insert(s.output.end(), (*text)->begin(), (*text)->end());
+                        s.output.push_back(0);
+                    }
+                if (head.hcrc) {
+                    const auto crc = crc32_update(0, std::span(s.output.data() + start, s.output.size() - start));
+                    s.output.push_back(static_cast<std::uint8_t>(crc));
+                    s.output.push_back(static_cast<std::uint8_t>(crc >> 8));
+                }
+            }
         }
         s.header = true;
     }

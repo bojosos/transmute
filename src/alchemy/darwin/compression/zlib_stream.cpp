@@ -6,14 +6,16 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <variant>
 #include <vector>
 
 // /usr/lib/libz.1.dylib streaming interface (zlib.h z_stream): deflateInit_,
 // deflateInit2_, deflate, deflateReset, deflateEnd, deflateBound, inflateInit_,
 // inflateInit2_, inflate, inflateReset, inflateReset2, inflateValidate,
-// inflateSetDictionary, inflateSync, inflateEnd, deflateSetDictionary,
-// deflateParams and zError, over the project-authored InflateStream and
+// inflateSetDictionary, inflateSync, inflateGetHeader, inflateEnd,
+// deflateSetDictionary, deflateParams, deflateSetHeader and zError, over the
+// project-authored InflateStream and
 // DeflateStream (zlib_codec.hpp). Qt Core/Gui/Network/Svg, Boost.Iostreams and
 // OpenVDB in a renderer plug-in import them. The z_stream's `state` holds an
 // opaque guest token naming the host state; zalloc/zfree are not called.
@@ -40,6 +42,8 @@ struct Stream {
     std::size_t delivered{};   // bytes of codec output() already copied to the guest
     bool deflate_flushed_finish{};
     unsigned sync_matched{};   // inflateSync: bytes of 00 00 FF FF matched so far
+    std::uint64_t gzip_head{};   // inflateGetHeader's gz_header, filled once the header is read
+    bool gzip_head_filled{};
 
 };
 
@@ -137,6 +141,40 @@ std::vector<std::uint8_t> take_input(GuestMemory& memory, std::uint64_t stream) 
     return bytes;
 }
 
+// struct gz_header_s (zlib.h, LP64): text 0, time 8 (uLong), xflags 16, os 20, extra 24, extra_len 32, extra_max 36,
+// name 40, name_max 48, comment 56, comm_max 64, hcrc 68, done 72.
+constexpr std::uint64_t gz_text = 0, gz_time = 8, gz_xflags = 16, gz_os = 20, gz_extra = 24, gz_extra_len = 32, gz_extra_max = 36,
+    gz_name = 40, gz_name_max = 48, gz_comment = 56, gz_comm_max = 64, gz_hcrc = 68, gz_done = 72;
+
+// inflateGetHeader: the parsed header into the caller's gz_header, as zlib fills it: extra copied up to extra_max
+// (extra_len is the whole length), name and comment up to name_max / comm_max, done 1; done -1 for a zlib stream.
+void fill_gzip_head(GuestMemory& memory, std::uint64_t head, const InflateStream::ParsedHeader& parsed) {
+    if (parsed.wrapper != Wrapper::gzip) { memory.write32(head + gz_done, static_cast<std::uint32_t>(-1)); return; }
+    const auto& fields = parsed.gzip;
+    memory.write32(head + gz_text, fields.text ? 1 : 0);
+    memory.write64(head + gz_time, fields.time);
+    memory.write32(head + gz_xflags, fields.xflags);
+    memory.write32(head + gz_os, fields.os);
+    if (const auto extra = memory.read64(head + gz_extra); extra && fields.extra) {
+        const auto count = std::min<std::size_t>(fields.extra->size(), memory.read32(head + gz_extra_max));
+        if (count) memory.write_bytes(extra, std::span(fields.extra->data(), count));
+    }
+    memory.write32(head + gz_extra_len, fields.extra ? static_cast<std::uint32_t>(fields.extra->size()) : 0);
+    for (const auto& [text, at, limit] : {std::tuple{&fields.name, gz_name, gz_name_max}, std::tuple{&fields.comment, gz_comment, gz_comm_max}}) {
+        const auto destination = memory.read64(head + at);
+        if (!destination || !*text) continue;
+        const auto capacity = memory.read32(head + limit);
+        if (!capacity) continue;
+        // The text and its terminator, cut at the capacity (zlib stops copying there, terminated or not).
+        std::vector<std::uint8_t> bytes((*text)->begin(), (*text)->end());
+        bytes.push_back(0);
+        bytes.resize(std::min<std::size_t>(bytes.size(), capacity));
+        memory.write_bytes(destination, bytes);
+    }
+    memory.write32(head + gz_hcrc, fields.hcrc ? 1 : 0);
+    memory.write32(head + gz_done, 1);
+}
+
 void consume(GuestMemory& memory, std::uint64_t stream, std::uint64_t count) {
     if (!count) return;
     memory.write64(stream + next_in, memory.read64(stream + next_in) + count);
@@ -219,6 +257,11 @@ void install_zlib_stream(ProcessContext& process) {
             if (whole && status == Status::more && pending() == 0) feed(all.subspan(head));
         }
         m.write64(stream + adler_field, inflater.check());
+        if (state->gzip_head && !state->gzip_head_filled)
+            if (const auto parsed = inflater.parsed_header()) {
+                fill_gzip_head(m, state->gzip_head, *parsed);
+                state->gzip_head_filled = true;
+            }
         if (status == Status::data_error) {
             m.write64(stream + msg, streams->message(inflater.message()));
             s.x[0] = code(z_data_error);
@@ -243,6 +286,8 @@ void install_zlib_stream(ProcessContext& process) {
         }
         state->delivered = 0;
         state->sync_matched = 0;
+        state->gzip_head = 0;   // as zlib's inflateReset: the gz_header is no longer filled
+        state->gzip_head_filled = false;
         begin(m, stream, m.read64(stream + state_field), (*codec)->check());
         return z_ok;
     };
@@ -299,6 +344,23 @@ void install_zlib_stream(ProcessContext& process) {
         (*codec)->reset(Wrapper::raw);
         state->delivered = 0;
         m.write64(stream + msg, 0);
+        s.x[0] = code(z_ok);
+    });
+    // int inflateGetHeader(z_streamp, gz_headerp head): a gzip stream's header goes to *head as inflate reads it
+    // (head->done 0 until then, 1 after; -1 when the stream turns out to be zlib). Z_STREAM_ERROR for a stream
+    // that cannot be gzip (zlib or raw windowBits).
+    function("_inflateGetHeader", [lookup](CpuState& s, GuestMemory& m) {
+        const auto state = lookup(m, s.x[0]);
+        auto* codec = state ? std::get_if<std::unique_ptr<InflateStream>>(&state->codec) : nullptr;
+        if (!codec || !(*codec)->accepts_gzip()) { s.x[0] = code(z_stream_error); return; }
+        state->gzip_head = s.x[1];
+        state->gzip_head_filled = false;
+        if (s.x[1]) m.write32(s.x[1] + gz_done, 0);
+        if (s.x[1])
+            if (const auto parsed = (*codec)->parsed_header()) {   // already read: fill it now
+                fill_gzip_head(m, s.x[1], *parsed);
+                state->gzip_head_filled = true;
+            }
         s.x[0] = code(z_ok);
     });
     // int inflateEnd(z_streamp)
@@ -393,6 +455,33 @@ void install_zlib_stream(ProcessContext& process) {
         if (!codec || level < -1 || level > 9 || strategy < 0 || strategy > 4) { s.x[0] = code(z_stream_error); return; }
         (*codec)->set_level(level);
         s.x[0] = code(z_ok);
+    });
+    // int deflateSetHeader(z_streamp, gz_headerp head): the gzip member header's fields (text, time, os, extra,
+    // name, comment, hcrc), taken now; a gzip stream only, before its first output (else Z_STREAM_ERROR). XFL
+    // follows the level, as in zlib.
+    function("_deflateSetHeader", [lookup](CpuState& s, GuestMemory& m) {
+        const auto state = lookup(m, s.x[0]);
+        auto* codec = state ? std::get_if<std::unique_ptr<DeflateStream>>(&state->codec) : nullptr;
+        const auto head = s.x[1];
+        if (!codec || !head) { s.x[0] = code(z_stream_error); return; }
+        GzipHeader fields;
+        fields.text = m.read32(head + gz_text) != 0;
+        fields.time = static_cast<std::uint32_t>(m.read64(head + gz_time));
+        fields.os = static_cast<std::uint8_t>(m.read32(head + gz_os));
+        if (const auto extra = m.read64(head + gz_extra)) {
+            std::vector<std::uint8_t> bytes(m.read32(head + gz_extra_len));
+            if (!bytes.empty()) m.read_bytes(extra, bytes);
+            fields.extra = std::move(bytes);
+        }
+        const auto text_at = [&m](std::uint64_t address) {
+            std::string text;
+            for (; text.size() < 65536 && m.read8(address); ++address) text.push_back(static_cast<char>(m.read8(address)));
+            return text;
+        };
+        if (const auto name = m.read64(head + gz_name)) fields.name = text_at(name);
+        if (const auto comment = m.read64(head + gz_comment)) fields.comment = text_at(comment);
+        fields.hcrc = m.read32(head + gz_hcrc) != 0;
+        s.x[0] = code((*codec)->set_gzip_header(std::move(fields)) ? z_ok : z_stream_error);
     });
     // int deflateEnd(z_streamp): Z_DATA_ERROR when output was still pending.
     function("_deflateEnd", [lookup, streams](CpuState& s, GuestMemory& m) {

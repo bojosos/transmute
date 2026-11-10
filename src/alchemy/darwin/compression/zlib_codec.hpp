@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <span>
 #include <vector>
@@ -46,6 +47,17 @@ struct InflateResult {
 // RFC 1950 zlib, RFC 1952 gzip, none, or (inflate only) zlib-or-gzip.
 enum class Wrapper { zlib, gzip, raw, automatic };
 
+// An RFC 1952 member header's fields (zlib.h gz_header): FTEXT, MTIME, XFL, OS, FEXTRA, FNAME,
+// FCOMMENT and FHCRC.
+struct GzipHeader {
+    bool text{};
+    std::uint32_t time{};
+    std::uint8_t xflags{}, os{3};
+    std::optional<std::vector<std::uint8_t>> extra;
+    std::optional<std::string> name, comment;
+    bool hcrc{};
+};
+
 // Incremental decoder behind inflate(). Input is taken in any split; output
 // becomes available block by block (and inside an incomplete block, as far as
 // it has been decoded). A block is re-decoded from its start when it is
@@ -78,6 +90,15 @@ public:
     // Restarts for a new stream: with the given wrapper, or the current one.
     void reset(Wrapper wrapper);
     void reset();
+    // inflateGetHeader: once the header has been read, the wrapper it was (zlib or gzip) and, for gzip,
+    // its fields; nullopt before then (and for raw data).
+    struct ParsedHeader {
+        Wrapper wrapper{};
+        GzipHeader gzip;
+    };
+    [[nodiscard]] std::optional<ParsedHeader> parsed_header() const;
+    // Whether the stream can carry a gzip header (gzip or automatic).
+    [[nodiscard]] bool accepts_gzip() const noexcept;
 
 private:
     struct State;
@@ -107,6 +128,9 @@ public:
     bool set_dictionary(std::span<const std::uint8_t> bytes);
     // deflateParams: input waiting for a flush is encoded at the old level, then the new one applies.
     void set_level(int level);
+    // deflateSetHeader, before any output (gzip only): the member header's fields. XFL still follows the
+    // level, as in zlib.
+    bool set_gzip_header(GzipHeader header);
 
 private:
     struct State;
