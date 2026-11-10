@@ -535,15 +535,28 @@ namespace {
 // one, fontconfig picks its stand-in. The family's own aliases come first
 // (Arial gives Liberation Sans, metric-compatible), then the generic family
 // in the family's language. Other unknown families stay not found.
+// `close` lists installed families nearer in width than the generic one,
+// best first. For Segoe UI: Selawik (Microsoft's metric-compatible open
+// font), then Open Sans (+4.5% wider on mixed text, against DejaVu Sans's
+// +13%, measured with HarfBuzz on Windows's segoeui.ttf).
 struct StandIn {
-    std::string_view family, generic, lang;
+    std::string_view family, close, generic, lang;
 };
 constexpr StandIn stand_ins[] = {
-    {"Segoe UI", "sans-serif", ""},          {"Arial", "sans-serif", ""},       {"Verdana", "sans-serif", ""},
-    {"Tahoma", "sans-serif", ""},            {"Times New Roman", "serif", ""},  {"Georgia", "serif", ""},
-    {"Consolas", "monospace", ""},           {"Courier New", "monospace", ""},  {"Segoe UI Emoji", "emoji", ""},
-    {"Segoe UI Symbol", "sans-serif", ""},   {"Microsoft YaHei", "sans-serif", "zh-cn"},
-    {"Microsoft JhengHei", "sans-serif", "zh-tw"}, {"Yu Gothic UI", "sans-serif", "ja"}, {"Malgun Gothic", "sans-serif", "ko"},
+    {"Segoe UI", "Selawik,Open Sans", "sans-serif", ""},
+    {"Arial", "", "sans-serif", ""},
+    {"Verdana", "", "sans-serif", ""},
+    {"Tahoma", "", "sans-serif", ""},
+    {"Times New Roman", "", "serif", ""},
+    {"Georgia", "", "serif", ""},
+    {"Consolas", "", "monospace", ""},
+    {"Courier New", "", "monospace", ""},
+    {"Segoe UI Emoji", "", "emoji", ""},
+    {"Segoe UI Symbol", "", "sans-serif", ""},
+    {"Microsoft YaHei", "", "sans-serif", "zh-cn"},
+    {"Microsoft JhengHei", "", "sans-serif", "zh-tw"},
+    {"Yu Gothic UI", "", "sans-serif", "ja"},
+    {"Malgun Gothic", "", "sans-serif", "ko"},
 };
 
 // The stand-in family for `family`, or nothing; under freetype_mutex().
@@ -556,6 +569,12 @@ std::optional<std::string> stand_in_family(std::string_view family, int weight, 
     FcPattern* pattern = FcPatternCreate();
     const std::string name(family), generic(entry->generic), lang(entry->lang);
     FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(name.c_str()));
+    for (std::size_t start = 0; start < entry->close.size();) {
+        const auto end = std::min(entry->close.find(',', start), entry->close.size());
+        const std::string close(entry->close.substr(start, end - start));
+        FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(close.c_str()));
+        start = end + 1;
+    }
     FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(generic.c_str()));
     if (!lang.empty()) FcPatternAddString(pattern, FC_LANG, reinterpret_cast<const FcChar8*>(lang.c_str()));
     FcPatternAddDouble(pattern, FC_WEIGHT, FcWeightFromOpenTypeDouble(weight));
