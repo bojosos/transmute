@@ -1,5 +1,6 @@
 // CoreML (src/alchemy/darwin/coreml/): the identity, the documented
-// "unavailable" answers, and the data classes (MLMultiArray, MLFeatureValue).
+// "unavailable" answers, and the data classes (MLMultiArray, MLFeatureValue,
+// MLModelConfiguration and MLOptimizationHints, MLDictionaryFeatureProvider).
 #include "alchemy/call_regs.hpp"
 
 #include <bit>
@@ -56,6 +57,34 @@ const Case coreml_case("coreml", [](Fixture& f) {
     require(f.send(wrapped, "type") == 5 && f.send(wrapped, "multiArrayValue") == array, "a multi-array feature");
     require((f.send(integer, "isEqualToFeatureValue:", {f.send(f.cls("MLFeatureValue"), "featureValueWithInt64:", {7})}) & 0xff) == 1 &&
             (f.send(integer, "isEqualToFeatureValue:", {real}) & 0xff) == 0, "feature equality");
+
+    // MLModelConfiguration: all compute units and default hints until set; a copy has its own hints.
+    const auto config = f.send(f.send(f.cls("MLModelConfiguration"), "alloc"), "init");
+    const auto hints = f.send(config, "optimizationHints");
+    require(f.send(config, "computeUnits") == 2 && hints && f.send(hints, "specializationStrategy") == 0, "MLComputeUnitsAll and default hints");
+    f.send(hints, "setSpecializationStrategy:", {1});
+    f.send(config, "setComputeUnits:", {0});
+    const auto config_copy = f.send(config, "copy");
+    require(f.send(config_copy, "computeUnits") == 0 && f.send(f.send(config_copy, "optimizationHints"), "specializationStrategy") == 1 &&
+                f.send(config_copy, "optimizationHints") != hints,
+            "a configuration copy with hints of its own");
+    // MLDictionaryFeatureProvider: values by name; NSNumbers and multi-arrays wrapped as feature values.
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> entries{
+        {f.cf.string("count"), f.cf.integer(3)}, {f.cf.string("scale"), f.cf.real(0.5)}, {f.cf.string("input"), array}, {f.cf.string("seven"), integer}};
+    const auto features = f.send(f.send(f.cls("MLDictionaryFeatureProvider"), "alloc"), "initWithDictionary:error:", {f.cf.dictionary(entries), 0});
+    require(features && f.send(f.send(features, "featureNames"), "count") == 4, "a provider of four features");
+    require(f.send(features, "featureValueForName:", {f.cf.string("seven")}) == integer, "a feature value as it is");
+    const auto count = f.send(features, "featureValueForName:", {f.cf.string("count")});
+    require(f.send(count, "type") == 1 && f.send(count, "int64Value") == 3, "an NSNumber integer as an Int64 feature");
+    const auto scale = f.send(features, "objectForKeyedSubscript:", {f.cf.string("scale")});
+    require(f.send(scale, "type") == 2 && f.objc.send(scale, f.objc.selector("doubleValue")).d(0) == 0.5, "an NSNumber double as a Double feature");
+    require(f.send(f.send(features, "featureValueForName:", {f.cf.string("input")}), "multiArrayValue") == array, "a multi-array wrapped");
+    require(f.send(features, "featureValueForName:", {f.cf.string("missing")}) == 0, "no such feature");
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> wrong{{f.cf.string("date"), f.cf.date(0)}};
+    const auto refused = f.block(8);
+    require(f.send(f.send(f.cls("MLDictionaryFeatureProvider"), "alloc"), "initWithDictionary:error:", {f.cf.dictionary(wrong), refused}) == 0 &&
+                f.engine.read64(refused),
+            "a value no feature wraps fails with an error");
 });
 
 #undef LIBRARY

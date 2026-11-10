@@ -16,9 +16,12 @@
 // com.apple.CoreML domain, or the completion handler gets the error); neither
 // can a compute plan, so no compute device is ever handed out. The data
 // classes are real: MLMultiArray (Double, Float32, Float16 and Int32 elements
-// in guest memory, any strides), MLFeatureValue and MLPredictionOptions.
-// Chrome 155 first linked the framework (moved from
-// darwin/identities/identities.cpp).
+// in guest memory, any strides), MLFeatureValue, MLDictionaryFeatureProvider,
+// MLPredictionOptions, MLOptimizationHints and MLModelConfiguration (by default
+// MLComputeUnitsAll, with default hints). Chrome 155 first linked the framework
+// (moved from darwin/identities/identities.cpp); darktable's bundled ONNX
+// Runtime imports eight of the classes for its CoreML execution provider, and
+// its CPU provider does the work when no model loads.
 namespace alchemy::coreml {
 namespace {
 
@@ -96,6 +99,7 @@ private:
     std::shared_ptr<MultiArray> multi_array(Address object) { return object ? objc.find_host_state<MultiArray>(object) : nullptr; }
     void install_multi_array();
     void install_feature_value();
+    void install_feature_provider();
     double element(GuestMemory& m, const MultiArray& a, std::int64_t offset);
     void set_element(GuestMemory& m, const MultiArray& a, std::int64_t offset, double value);
     Address numbers(const std::vector<std::int64_t>& values);
@@ -342,6 +346,65 @@ void Provider::install_feature_value() {
     }, false, "B@:@");
 }
 
+// MLDictionaryFeatureProvider: feature values by name, from a dictionary whose values are MLFeatureValues or what
+// one wraps (NSNumber as Int64 or Double, NSString, MLMultiArray).
+void Provider::install_feature_provider() {
+    const auto provider = cls(core_ml, "MLDictionaryFeatureProvider", "NSObject");
+    object_properties(provider, {"dictionary"});
+    const auto kind_of = [this](Address object, Address cls_) {
+        CallRegs r{};
+        r.x[2] = cls_;
+        return cls_ && (objc.send(object, objc.selector("isKindOfClass:"), r).x0 & 0xff) != 0;
+    };
+    // The feature value of a dictionary value (+0: the value itself, or an autoreleased wrapper), or nil.
+    const auto feature_of = [this, kind_of](Address value) -> Address {
+        if (!value) return 0;
+        if (kind_of(value, feature_class)) return value;
+        const auto wrap = [this](const char* selector, Address argument) {
+            CallRegs r{};
+            r.x[2] = argument;
+            return objc.send(feature_class, objc.selector(selector), r).x0;
+        };
+        if (kind_of(value, multi_array_class)) return wrap("featureValueWithMultiArray:", value);
+        if (cf.kind(value) == ObjectKind::string) return wrap("featureValueWithString:", value);
+        if (cf.kind(value) == ObjectKind::number) {
+            const auto encoding = read_cstring(memory(), objc.send(value, objc.selector("objCType")).x0);
+            if (encoding == "f" || encoding == "d") {
+                CallRegs r{};
+                r.set_d(0, cf.number_value(value).value_or(0));
+                return objc.send(feature_class, objc.selector("featureValueWithDouble:"), r).x0;
+            }
+            return wrap("featureValueWithInt64:", static_cast<Address>(static_cast<std::int64_t>(cf.number_value(value).value_or(0))));
+        }
+        return 0;
+    };
+    method(provider, "initWithDictionary:error:", [this, feature_of](CpuState& s, GuestMemory&) {
+        bool valid = s.x[2] && cf.kind(s.x[2]) == ObjectKind::dictionary;
+        if (valid)
+            for (const auto& [key, value] : cf.dictionary_entries(s.x[2])) valid = valid && cf.kind(key) == ObjectKind::string && feature_of(value) != 0;
+        if (!valid) {
+            fail(s.x[3], "MLDictionaryFeatureProvider: the dictionary maps feature names to MLFeatureValues, NSNumbers, NSStrings or MLMultiArrays");
+            release(s.x[0]);
+            s.x[0] = 0;
+            return;
+        }
+        const auto copy = cf.copy(s.x[2]);
+        store(s.x[0], "dictionary", copy);
+        release(copy);
+    }, false, "@@:@^@");
+    method(provider, "featureNames", [this](CpuState& s, GuestMemory&) {
+        const auto dictionary = stored(s.x[0], "dictionary");
+        CallRegs r{};
+        r.x[2] = dictionary ? objc.send(dictionary, objc.selector("allKeys")).x0 : 0;
+        s.x[0] = objc.send(objc.find_class("NSSet"), objc.selector(r.x[2] ? "setWithArray:" : "set"), r).x0;
+    });
+    for (const auto* selector : {"featureValueForName:", "objectForKeyedSubscript:"})
+        method(provider, selector, [this, feature_of](CpuState& s, GuestMemory&) {
+            const auto dictionary = stored(s.x[0], "dictionary");
+            s.x[0] = dictionary && s.x[2] ? feature_of(cf.dictionary_value(dictionary, s.x[2])) : 0;
+        }, false, "@@:@");
+}
+
 void Provider::install() {
     ProcessContext::add_provider_library(std::string(core_ml));
     install_multi_array();
@@ -352,9 +415,41 @@ void Provider::install() {
     // The compute devices a compute plan or MLAllComputeDevices would hand out; no plan loads.
     for (const auto* name : {"MLCPUComputeDevice", "MLGPUComputeDevice", "MLNeuralEngineComputeDevice"})
         static_cast<void>(cls(core_ml, name, "NSObject"));
+    // MLOptimizationHints (NSCopying): MLReshapeFrequencyHint and MLSpecializationStrategy, both 0 (frequent,
+    // default) until set.
+    const auto hints = cls(core_ml, "MLOptimizationHints", "NSObject");
+    integer_properties(hints, {"reshapeFrequency", "specializationStrategy"});
+    method(hints, "copyWithZone:", [this, hints](CpuState& s, GuestMemory&) {
+        const auto copy = create(hints);
+        copy_properties(s.x[0], copy);
+        s.x[0] = copy;
+    }, false, "@@:^{_NSZone=}");
+    // MLModelConfiguration (NSCopying): MLComputeUnitsAll (2) and default hints until set.
     const auto configuration = cls(core_ml, "MLModelConfiguration", "NSObject");
     integer_properties(configuration, {"computeUnits", "allowLowPrecisionAccumulationOnGPU"});
-    object_properties(configuration, {"modelDisplayName", "preferredMetalDevice"});
+    object_properties(configuration, {"modelDisplayName", "preferredMetalDevice", "optimizationHints", "parameters", "functionName"});
+    method(configuration, "init", [this, configuration, hints](CpuState& s, GuestMemory&) {
+        const auto self = objc.send_super(s.x[0], configuration, objc.selector("init")).x0;
+        if (self) {
+            store_integer(self, "computeUnits", 2);
+            const auto defaults = create(hints);
+            store(self, "optimizationHints", defaults);
+            release(defaults);
+        }
+        s.x[0] = self;
+    });
+    method(configuration, "copyWithZone:", [this, configuration](CpuState& s, GuestMemory&) {
+        const auto copy = objc.send_super(objc.send(configuration, objc.selector("alloc")).x0, configuration, objc.selector("init")).x0;
+        copy_properties(s.x[0], copy);
+        // The copy has hints of its own.
+        if (const auto own = stored(s.x[0], "optimizationHints")) {
+            const auto hints_copy = objc.send(own, objc.selector("copy")).x0;
+            store(copy, "optimizationHints", hints_copy);
+            release(hints_copy);
+        }
+        s.x[0] = copy;
+    }, false, "@@:^{_NSZone=}");
+    install_feature_provider();
     const auto model = cls(core_ml, "MLModel", "NSObject");
     const auto model_error = [this](Address out) {
         bridge->store_error(out, bridge->error("com.apple.CoreML", ml_model_error_generic, "Core ML is not available"), true);
