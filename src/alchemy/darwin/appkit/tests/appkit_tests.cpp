@@ -481,6 +481,13 @@ void resources(Fixture& f) {
     require(f.text(f.id(board, "stringForType:", {type})) == "from host", "-stringForType:");
     const auto types = f.id(board, "types");
     require(f.cf.length(types) >= 1 && f.text(f.cf.element(types, 0)) == "public.utf8-plain-text", "-types");
+    // A busy host clipboard (another program holds it open): reads answer nothing, writes are refused, nothing ends.
+    f.server.clipboard_busy = true;
+    require(f.id(board, "stringForType:", {type}) == 0, "a busy clipboard reads as empty");
+    require((f.id(board, "setString:forType:", {f.str("later"), type}) & 0xff) == 0 && f.server.clipboard == "from host",
+            "a busy clipboard refuses the write");
+    f.server.clipboard_busy = false;
+    require(f.text(f.id(board, "stringForType:", {type})) == "from host", "and reads again once free");
 
     // Cursors.
     static_cast<void>(f.id(f.id(f.cls("NSCursor"), "IBeamCursor"), "set"));

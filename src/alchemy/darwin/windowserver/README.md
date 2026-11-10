@@ -3,6 +3,8 @@
 **Covers:** the window server behind AppKit
 (`include/alchemy/gui/window_server.hpp`): windows, input, cursors,
 clipboard, screens, IME, presentation, cloaking (`ALCHEMY_GUI_CLOAK`).
+
+**Busy clipboard:** when another program keeps the host clipboard open, the window server waits about a second (growing pauses), then throws `ClipboardBusy`. It is never fatal: Carbon's `PasteboardSynchronize` reports no change, reads answer nothing (`clipboard_text_if_free` / `clipboard_image_if_free`), and writes are refused (`-setString:forType:` NO, `PasteboardPutItemFlavor` badPasteboardSyncErr).
 This directory installs it (`install.cpp`), keeps the screen
 geometry (`screen_layout.cpp`) and a copy of what the process presented in
 its own windows (`presented_pixels.cpp`, recorded by AppKit's software

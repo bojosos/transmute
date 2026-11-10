@@ -95,10 +95,13 @@ std::uint64_t synchronize(Board& board) {
     auto& server = window_server();
     const auto change = server.clipboard_change_count();
     if (change == board.seen_change) return board.owner ? sync_owner : 0;
+    // A busy host clipboard is read on a later synchronization: nothing changed yet.
+    std::optional<std::string> text;
+    try { text = server.clipboard_text(); } catch (const ClipboardBusy&) { return board.owner ? sync_owner : 0; }
     board.seen_change = change;
     board.owner = false;
     board.items.clear();
-    if (const auto text = server.clipboard_text()) {
+    if (text) {
         Item item{1, {}};
         item.flavors.emplace_back("public.utf8-plain-text", Flavor{std::vector<std::uint8_t>(text->begin(), text->end()), 0});
         item.flavors.emplace_back("public.utf16-plain-text", Flavor{utf16_of(*text), 0});
@@ -107,12 +110,15 @@ std::uint64_t synchronize(Board& board) {
     return sync_modified;
 }
 
-void export_text(Board& board, const std::string& flavor, const std::vector<std::uint8_t>& data) {
-    if (!host_clipboard(board) || !text_flavor(flavor)) return;
+// False when the host clipboard was busy: the item stays on this process's
+// pasteboard but did not reach the host's.
+bool export_text(Board& board, const std::string& flavor, const std::vector<std::uint8_t>& data) {
+    if (!host_clipboard(board) || !text_flavor(flavor)) return true;
     const auto text = flavor == "public.utf16-plain-text" ? utf8_of_utf16(data) : std::string(data.begin(), data.end());
     auto& server = window_server();
-    server.set_clipboard_text(text);
+    try { server.set_clipboard_text(text); } catch (const ClipboardBusy&) { return false; }
     board.seen_change = server.clipboard_change_count();
+    return true;
 }
 
 } // namespace
@@ -264,8 +270,8 @@ void install_pasteboard(Support& support) {
         } else {
             found->flavors.emplace_back(flavor, Flavor{data, static_cast<std::uint32_t>(c.x[4])});
         }
-        if (data) export_text(*board, flavor, *data);
-        c.x[0] = no_err;
+        // badPasteboardSyncErr when the host clipboard was busy (the item is kept here).
+        c.x[0] = data && !export_text(*board, flavor, *data) ? status(-25130) : no_err;
     });
     support.function(lib, "_PasteboardSetPromiseKeeper", [board_of](CpuState& c, GuestMemory&) {
         const auto board = board_of(c.x[0]);

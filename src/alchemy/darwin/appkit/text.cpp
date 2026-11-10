@@ -693,7 +693,7 @@ void AppKit::install_text() {
         const auto state = ts(self);
         if (!state->editable) return;
         const auto server = window_server_or_null();
-        const auto clip = server ? server->clipboard_text() : std::nullopt;
+        const auto clip = server ? clipboard_text_if_free(*server) : std::nullopt;
         if (!clip) return;
         auto value = drawing::utf16(*clip);
         if (state->field_editor) std::replace_if(value.begin(), value.end(), [](char16_t c) { return c == u'\n' || c == u'\r'; }, u' ');

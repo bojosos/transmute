@@ -742,8 +742,8 @@ void AppKit::install_resources() {
         };
         if (state->general) {
             if (const auto server = window_server_or_null()) {
-                if (server->clipboard_text()) { add("public.utf8-plain-text"); add("NSStringPboardType"); }
-                if (server->clipboard_image()) { add("public.tiff"); add("public.png"); add("NSTIFFPboardType"); }
+                if (clipboard_text_if_free(*server)) { add("public.utf8-plain-text"); add("NSStringPboardType"); }
+                if (clipboard_image_if_free(*server)) { add("public.tiff"); add("public.png"); add("NSTIFFPboardType"); }
             }
         } else if (!state->drag) {
             for (const auto& [type, value_text] : state->strings) { static_cast<void>(value_text); add(type); }
@@ -816,7 +816,8 @@ void AppKit::install_resources() {
         if (state->drag) return false;
         if (state->general) {
             if (!string_type(type)) return false;
-            require_window_server("-[NSPasteboard setString:forType:]").set_clipboard_text(value);
+            try { require_window_server("-[NSPasteboard setString:forType:]").set_clipboard_text(value); }
+            catch (const ClipboardBusy&) { return false; }   // the host clipboard is busy: not written
         } else {
             state->strings[std::string(type)] = value;
         }
@@ -832,7 +833,7 @@ void AppKit::install_resources() {
         if (state->general) {
             if (!string_type(type)) return std::nullopt;
             const auto server = window_server_or_null();
-            return server ? server->clipboard_text() : std::nullopt;
+            return server ? clipboard_text_if_free(*server) : std::nullopt;
         }
         const auto found = state->strings.find(std::string(type));
         if (found == state->strings.end()) return std::nullopt;
@@ -868,7 +869,7 @@ void AppKit::install_resources() {
         if (image_type(type)) {
             // The clipboard image in the requested file format.
             const auto server = board(s.x[0])->general ? window_server_or_null() : nullptr;
-            const auto pixels = server ? server->clipboard_image() : std::nullopt;
+            const auto pixels = server ? clipboard_image_if_free(*server) : std::nullopt;
             const auto bytes = pixels ? encode_image(*pixels, type.find("png") != std::string::npos || type.find("PNG") != std::string::npos
                                                                    ? ImageFileType::png : ImageFileType::tiff)
                                       : std::nullopt;
@@ -885,7 +886,8 @@ void AppKit::install_resources() {
         if (image_type(type)) {
             const auto decoded = board(s.x[0])->general ? decode_image(bytes) : std::nullopt;
             if (!decoded) { s.x[0] = 0; return; }
-            require_window_server("-[NSPasteboard setData:forType:]").set_clipboard_image(decoded->pixels);
+            try { require_window_server("-[NSPasteboard setData:forType:]").set_clipboard_image(decoded->pixels); }
+            catch (const ClipboardBusy&) { s.x[0] = 0; return; }   // the host clipboard is busy
             s.x[0] = 1;
             return;
         }
@@ -902,7 +904,7 @@ void AppKit::install_resources() {
                 if (const auto value = read_string(self, "public.utf8-plain-text")) found.push_back(auto_string(*value));
             } else if (wanted == image) {
                 if (state->general) if (const auto server = window_server_or_null())
-                    if (const auto pixels = server->clipboard_image()) found.push_back(autorelease(image_from_pixels(*pixels)));
+                    if (const auto pixels = clipboard_image_if_free(*server)) found.push_back(autorelease(image_from_pixels(*pixels)));
             }
             if (!found.empty()) break;
         }
@@ -923,7 +925,8 @@ void AppKit::install_resources() {
             } else if (is_kind(value, image)) {
                 const auto pixels = image_pixels(value);
                 if (!pixels || !board(s.x[0])->general) { written = false; continue; }
-                require_window_server("-[NSPasteboard writeObjects:]").set_clipboard_image(*pixels);
+                try { require_window_server("-[NSPasteboard writeObjects:]").set_clipboard_image(*pixels); }
+                catch (const ClipboardBusy&) { written = false; }   // the host clipboard is busy
             } else if (cf.kind(value) == ObjectKind::url) {
                 written = write_string(s.x[0], "public.utf8-plain-text", cf.url_path(value)) && written;
             } else {
@@ -1220,13 +1223,13 @@ void AppKit::install_resources() {
     class_method(im, "canInitWithPasteboard:", [this](CpuState& s, GuestMemory&) {
         const auto state = objc.host_state<PasteboardState>(s.x[2]);
         const auto server = state->general ? window_server_or_null() : nullptr;
-        return_bool(s, server && server->clipboard_image().has_value());
+        return_bool(s, server && clipboard_image_if_free(*server).has_value());
     }, "B@:@");
     method(im, "initWithPasteboard:", [this, image_of](CpuState& s, GuestMemory&) {
         const auto self = s.x[0];
         const auto state = objc.host_state<PasteboardState>(s.x[2]);
         const auto server = state->general ? window_server_or_null() : nullptr;
-        const auto pixels = server ? server->clipboard_image() : std::nullopt;
+        const auto pixels = server ? clipboard_image_if_free(*server) : std::nullopt;
         if (!pixels) { release(self); s.x[0] = 0; return; }
         const auto source = image_from_pixels(*pixels);
         const auto info = image_of(self);

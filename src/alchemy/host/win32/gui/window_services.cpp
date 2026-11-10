@@ -23,12 +23,17 @@ namespace {
 class ClipboardLease {
 public:
     explicit ClipboardLease(HWND owner) {
-        // Another process may hold the clipboard for a moment.
-        for (int attempt = 0; attempt < 20 && !open_; ++attempt) {
-            open_ = OpenClipboard(owner) != FALSE;
-            if (!open_) Sleep(5);
+        // Another process may hold the clipboard for a while: retry with a
+        // growing pause, about a second in all, then report it busy
+        // (ClipboardBusy: the callers answer it; it never ends the process).
+        DWORD pause = 5, waited = 0;
+        while (!(open_ = OpenClipboard(owner) != FALSE) && waited < 1000) {
+            Sleep(pause);
+            waited += pause;
+            pause = std::min<DWORD>(pause * 2, 100);
         }
-        if (!open_) fail_win32("OpenClipboard");
+        if (!open_) throw ClipboardBusy("Alchemy window server: the host clipboard is busy (OpenClipboard, Win32 error " +
+                                        std::to_string(GetLastError()) + ")");
     }
     ~ClipboardLease() {
         if (open_) CloseClipboard();

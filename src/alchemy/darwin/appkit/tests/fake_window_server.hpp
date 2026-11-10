@@ -52,6 +52,7 @@ public:
     std::optional<bool> associated;
     std::optional<std::string> clipboard;
     std::optional<Image> clipboard_picture;
+    bool clipboard_busy{};
     std::int64_t change_count{};
     int beeps{}, attention{}, discards{};
     // Status items: their images and tool tips.
@@ -294,10 +295,12 @@ public:
     void associate_mouse_and_cursor(bool value) override { associated = value; }
     void confine_cursor(WindowId, std::optional<Rect>) override {}
 
-    std::optional<std::string> clipboard_text() const override { return clipboard; }
-    void set_clipboard_text(std::string_view text) override { clipboard = std::string(text); ++change_count; }
-    std::optional<Image> clipboard_image() const override { return clipboard_picture; }
-    void set_clipboard_image(const Image& image) override { clipboard_picture = image; ++change_count; }
+    // clipboard_busy: another program holds the host clipboard (ClipboardBusy).
+    void busy_check() const { if (clipboard_busy) throw ClipboardBusy("fake window server: the clipboard is busy"); }
+    std::optional<std::string> clipboard_text() const override { busy_check(); return clipboard; }
+    void set_clipboard_text(std::string_view text) override { busy_check(); clipboard = std::string(text); ++change_count; }
+    std::optional<Image> clipboard_image() const override { busy_check(); return clipboard_picture; }
+    void set_clipboard_image(const Image& image) override { busy_check(); clipboard_picture = image; ++change_count; }
     std::int64_t clipboard_change_count() const override { return change_count; }
 
     std::vector<ScreenInfo> screens() const override {

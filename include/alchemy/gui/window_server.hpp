@@ -40,7 +40,10 @@
 // ---- Failure ---------------------------------------------------------------
 // Operations Win32 cannot perform throw std::runtime_error naming the
 // operation ("Alchemy window server: ..."). Queries that have a natural empty
-// answer (no clipboard text) return std::nullopt instead.
+// answer (no clipboard text) return std::nullopt instead. The clipboard calls
+// throw ClipboardBusy (below) when another program keeps the host clipboard
+// open for longer than the window server waits: a transient condition the
+// callers answer (nothing read, a write refused), never fatal.
 
 #include <cstdint>
 #include <memory>
@@ -56,6 +59,11 @@ using WindowId = std::uint64_t;   // 0 = no window
 using CursorId = std::uint64_t;   // 0 = no cursor
 using StatusItemId = std::uint64_t;   // 0 = no status item
 using ScreenId = std::uint32_t;   // CGDirectDisplayID; 0 = none
+
+// The host clipboard stayed busy (another program holds it open).
+struct ClipboardBusy : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 struct Point { double x{}, y{}; };
 struct Size { double width{}, height{}; };
@@ -463,5 +471,14 @@ public:
 // the host has no interactive desktop). Any thread.
 [[nodiscard]] WindowServer& window_server();
 [[nodiscard]] bool window_server_available() noexcept;
+
+// Clipboard reads that answer "nothing" while the host clipboard is busy
+// (ClipboardBusy): the data is read again on a later call.
+[[nodiscard]] inline std::optional<std::string> clipboard_text_if_free(const WindowServer& server) {
+    try { return server.clipboard_text(); } catch (const ClipboardBusy&) { return std::nullopt; }
+}
+[[nodiscard]] inline std::optional<Image> clipboard_image_if_free(const WindowServer& server) {
+    try { return server.clipboard_image(); } catch (const ClipboardBusy&) { return std::nullopt; }
+}
 
 } // namespace alchemy::gui
