@@ -1280,12 +1280,27 @@ void real_backend() {
     require(host::process::current_pid() != 0, "pid");
     require(!host::process::environment("ALCHEMY_HOST_TEST_SURELY_UNSET").has_value(), "unset environment variable");
 
-    locale_area();
-    icu_area();
-    http_area();
-    crypto_area();
-    certificate_area();
-    dns_sd_area();
+    // ALCHEMY_HOST_TEST_SKIP_AREAS=locale,icu,... leaves those areas out, so a
+    // backend in progress can test the areas it has written.
+    const auto skipped = host::process::environment("ALCHEMY_HOST_TEST_SKIP_AREAS").value_or(std::string());
+    const auto run_area = [&](std::string_view name, void (*area)()) {
+        std::size_t start = 0;
+        while (start <= skipped.size()) {
+            const auto end = std::min(skipped.find(',', start), skipped.size());
+            if (std::string_view(skipped).substr(start, end - start) == name) {
+                std::cout << "skipped area " << name << '\n';
+                return;
+            }
+            start = end + 1;
+        }
+        area();
+    };
+    run_area("locale", locale_area);
+    run_area("icu", icu_area);
+    run_area("http", http_area);
+    run_area("crypto", crypto_area);
+    run_area("certificate", certificate_area);
+    run_area("dns_sd", dns_sd_area);
 
     // system names and power requests
     require(host::system::host_name() && !host::system::host_name()->empty() && host::system::host_name(false), "host names");

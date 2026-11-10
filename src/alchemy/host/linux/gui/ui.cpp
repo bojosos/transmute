@@ -1,10 +1,10 @@
-// Linux host backend (not written yet), area "ui": every call fails with Error::unsupported
-// (include/alchemy/host/host.hpp).
+// Linux host backend, area "ui": the calls not written yet fail with
+// Error::unsupported (include/alchemy/host/host.hpp). The window server,
+// monitors() and window_client_size() are in window_server.cpp.
 #include "alchemy/host/ui.hpp"
 
 namespace alchemy::host::ui {
 
-Result<std::vector<Monitor>> monitors() { return Error::unsupported; }
 Result<std::uint32_t> idle_ms() { return Error::unsupported; }
 Result<KeyboardKind> keyboard_kind() { return Error::unsupported; }
 Result<bool> reduce_motion() { return Error::unsupported; }
@@ -26,8 +26,6 @@ FrameTimer& FrameTimer::operator=(FrameTimer&&) noexcept = default;
 FrameTimer::~FrameTimer() = default;
 Status FrameTimer::wait(std::uint64_t, std::uint32_t) { return Error::unsupported; }
 Result<std::vector<StackFrame>> sample_thread_stack(std::uint64_t, std::size_t) { return Error::unsupported; }
-std::unique_ptr<WindowSystem> create_window_server() { return nullptr; }   // no windows
-Result<PixelSize> window_client_size(std::uintptr_t) { return Error::unsupported; }
 Result<AlertAnswer> show_alert(const AlertDialog&) { return Error::unsupported; }
 Result<std::optional<std::vector<std::string>>> run_file_dialog(const FileDialog&) { return Error::unsupported; }
 std::vector<std::uintptr_t> disable_windows(std::span<const std::uintptr_t>, std::uintptr_t) { return {}; }

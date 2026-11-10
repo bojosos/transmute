@@ -35,28 +35,46 @@ This page maps each host area to Linux. The Linux backends are in progress.
   leaves, the enter and abort stubs. `host_call_bridge` takes the System V
   convention on Linux, because system libraries call it.
 * **Alchemy** has a Linux host backend (`src/alchemy/host/linux/`). These areas
-  are written: files, process (fork + execve spawns, pidfds), sync (eventfds),
-  time, vm, sections (memfd, POSIX shared memory), net (BSD sockets), system,
+  are written: files, process (fork + execve spawns, pidfds), sync (eventfds;
+  named mutexes and semaphores as FIFOs), time, vm, sections (memfd, POSIX
+  shared memory), net (BSD sockets), ipc (abstract UNIX sockets), system,
   debug, and crypto's random bytes. The other areas fail with
-  `Error::unsupported`: dns_sd, http, ipc, locale, icu, the rest of crypto,
-  and the GUI areas.
+  `Error::unsupported`: dns_sd, http, locale, icu and the rest of crypto.
+* **The window server** (`src/alchemy/host/linux/gui/window_server.cpp`)
+  speaks X11 through XCB, with xkbcommon for keys. `apt install
+  libxcb1-dev libxcb-xkb-dev libxcb-cursor-dev libxcb-icccm4-dev
+  libxkbcommon-dev libxkbcommon-x11-dev`. It covers:
+  * top-level windows;
+  * expose, move, resize, focus and close notifications;
+  * mouse buttons, click counts, the wheel and motion;
+  * keys with macOS key codes and NSEvent function-key characters;
+  * `present_bitmap` through PutImage;
+  * a run-loop wait that polls the X socket with the handles.
+
+  Not written yet: XRandR screens and HiDPI, cursors, the X clipboard (the
+  clipboard is process-local), drag and drop, IME. The other GUI areas
+  (canvas, fonts, gpu, audio, media codecs, ...) still fail with
+  `Error::unsupported`, so a window shows no drawing yet.
 * **What runs** (cloaked, `ALCHEMY_NETWORK=loopback`):
   * the console Mach-O fixtures (hello, dylib_app, weak_import, syscalls);
   * Blender's CPython 3.11 (`--version`, `-c` with json/hashlib/re/os,
     `site`, exit codes);
   * LLVM 23's `clang --version`, `ld64.lld --version` and `clang -c`, with
-    the LLVM and libxml2 runtimes from `--runtime-dir`.
+    the LLVM and libxml2 runtimes from `--runtime-dir`;
+  * `macos/gui_window_events`, on a private display: `Xvfb :99` and
+    `DISPLAY=:99`, not the desktop. Driven with real X input through
+    `xdotool`, it reports clicks, double clicks, the wheel, shifted keys,
+    arrows, function keys and modifier changes.
 * **Not done yet:**
   * DWARF CFI for the code arena, so C++ exceptions crossing translated frames
     fail on Linux;
   * thread sampling;
-  * named sync objects;
   * passing descriptors to other processes;
   * case-insensitive lookups under the Alchemy root (WSL's kernel has no ext4
     casefold);
   * ICU and locale;
   * TLS;
-  * the GUI.
+  * 2D drawing, fonts, Vulkan and the rest of the GUI areas.
 
 The macOS layer (`src/alchemy/darwin/`, the loader, the Objective-C
 runtime) talks to the operating system only through the host API in

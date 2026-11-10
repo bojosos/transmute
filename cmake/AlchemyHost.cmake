@@ -66,6 +66,12 @@ endif()
 file(GLOB alchemy_host_gui_sources CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/src/alchemy/host/${ALCHEMY_HOST}/gui/*.cpp")
 list(APPEND ALCHEMY_GUI_SOURCES ${alchemy_host_gui_sources})
+# The Linux GUI areas speak X11 through XCB, with xkbcommon for keyboards.
+if(ALCHEMY_HOST STREQUAL "linux" AND alchemy_host_gui_sources)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ALCHEMY_X11 REQUIRED IMPORTED_TARGET xcb xcb-xkb xcb-cursor xcb-icccm xkbcommon xkbcommon-x11)
+    list(APPEND ALCHEMY_GUI_LINK_LIBRARIES PkgConfig::ALCHEMY_X11)
+endif()
 
 if(BUILD_TESTING)
     add_executable(alchemy_host_tests src/alchemy/host/tests/host_tests.cpp)
