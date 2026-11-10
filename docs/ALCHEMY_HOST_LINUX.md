@@ -38,8 +38,26 @@ This page maps each host area to Linux. The Linux backends are in progress.
   are written: files, process (fork + execve spawns, pidfds), sync (eventfds;
   named mutexes and semaphores as FIFOs), time, vm, sections (memfd, POSIX
   shared memory), net (BSD sockets), ipc (abstract UNIX sockets), system,
-  debug, and crypto's random bytes. The other areas fail with
-  `Error::unsupported`: dns_sd, http, locale, icu and the rest of crypto.
+  debug, http (libcurl) and crypto (OpenSSL: digests, ciphers, keys, X.509,
+  chains and TLS). The other areas fail with `Error::unsupported`: dns_sd,
+  locale and icu.
+* **Data protection** (`crypto::protect` / `unprotect`, DPAPI on Windows)
+  seals data with AES-256-GCM under a 32-byte per-user key kept in the
+  desktop's secret store (the Secret Service: GNOME Keyring, KWallet).
+  libsecret is loaded at run time.
+  * It never prompts. The key is read and stored only in the existing,
+    unlocked collection that the "default" alias names. That is checked
+    first, without creating or unlocking anything.
+  * Without libsecret, a Secret Service, a default collection, or with that
+    collection locked, both calls return `Error::unsupported`. There is no
+    fallback to a key file.
+  * One race is left: a collection locked between the check and the key
+    lookup can still make libsecret ask to unlock it.
+  * Tests that reach a keyring run inside `dbus-run-session` with their own
+    unlocked `gnome-keyring-daemon`. DISPLAY and WAYLAND_DISPLAY are unset,
+    and HOME and XDG_RUNTIME_DIR are private, so no prompt can reach a
+    desktop. GLib falls back to `$XDG_RUNTIME_DIR/bus`, so unsetting
+    DBUS_SESSION_BUS_ADDRESS alone is not enough.
 * **The window server** (`src/alchemy/host/linux/gui/window_server.cpp`)
   speaks X11 through XCB, with xkbcommon for keys. `apt install
   libxcb1-dev libxcb-xkb-dev libxcb-cursor-dev libxcb-icccm4-dev
@@ -190,7 +208,7 @@ below. Nothing in `src/alchemy/darwin/` changes.
 | `sync` | Events, named semaphores, WaitForMultipleObjects, thread-pool timers | `eventfd`, `timerfd`, `epoll` as the multi-wait; futexes for in-process waits; cross-process semaphores in a shared `memfd` (`sem_init(pshared)`). |
 | `time` | QueryUnbiasedInterruptTimePrecise, GetSystemTimePreciseAsFileTime | `clock_gettime(CLOCK_MONOTONIC)` (mach_absolute_time excludes sleep, like MONOTONIC), `CLOCK_REALTIME`, `clock_nanosleep`. |
 | `locale` | NLS (LCMapStringEx, CompareStringEx, NormalizeString), ICU time zones | ICU (the system `libicu`) for collation, normalization, case mapping and time zones; `/etc/localtime` and `TZ` for the zone. |
-| `crypto` | BCrypt, NCrypt, Cert*, DPAPI, SChannel | `getrandom`; OpenSSL (libcrypto/libssl) or a bundled library for digests, ciphers, keys, X.509 and TLS; the keychain in a file store encrypted with a key from the Secret Service (libsecret) or a local key. |
+| `crypto` | BCrypt, NCrypt, Cert*, DPAPI, SChannel | `getrandom`; OpenSSL (libcrypto/libssl) or a bundled library for digests, ciphers, keys, X.509 and TLS; data protection with a per-user key in the Secret Service (libsecret), never a local key file. |
 | `system` | GlobalMemoryStatusEx, power APIs, registry, adapters | `/proc/meminfo`, `sysinfo`, PSI (`/proc/pressure/memory`) for memory pressure, `/sys/class/power_supply` for battery, UPower or logind (D-Bus) for sleep/wake and power assertions (inhibitors), `uname`, `gethostname`. |
 | `ui` | Win32 windows, messages, DPI, clipboard, OLE drag and drop, IMM, DWM cloak, TaskDialog, shell | Wayland (xdg-shell, xdg-decoration, fractional-scale, text-input-v3, data-device for clipboard and drag and drop, xdg-desktop-portal for file dialogs) with X11 (XCB) as a fallback; "cloaked" runs as an off-screen or headless compositor (e.g. `weston --backend=headless`). |
 | `audio` | WASAPI device enumeration, output and capture streams, the microphone consent store | PulseAudio's client library for devices and streams (PipeWire and WSLg serve it). |
