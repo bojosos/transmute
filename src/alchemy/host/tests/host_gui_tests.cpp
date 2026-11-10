@@ -4,11 +4,13 @@
 // exist without opening anything; on the null backend every call fails with
 // Error::unsupported.
 #include "alchemy/host/audio.hpp"
+#include "alchemy/host/camera.hpp"
 #include "alchemy/host/gpu.hpp"
 #include "alchemy/host/host.hpp"
 #include "alchemy/host/media_codec.hpp"
 #include "alchemy/host/midi.hpp"
 #include "alchemy/host/process.hpp"
+#include "alchemy/host/speech.hpp"
 #include "alchemy/host/sync.hpp"
 #include "alchemy/host/time.hpp"
 #include "alchemy/host/ui.hpp"
@@ -82,6 +84,14 @@ void null_backend() {
 void media_codecs() {
     namespace mc = host::media_codec;
     const auto names = [](mc::Codec c) { return c == mc::Codec::h264 ? "H.264" : c == mc::Codec::hevc ? "HEVC" : "AAC"; };
+    // A backend without host codecs (Linux, until its codecs are decided) says so for every codec.
+    if (mc::encoders(mc::Codec::h264).error() == host::Error::unsupported) {
+        for (const auto codec : {mc::Codec::h264, mc::Codec::hevc, mc::Codec::aac})
+            require(mc::encoders(codec).error() == host::Error::unsupported && mc::decoders(codec).error() == host::Error::unsupported,
+                std::string("no host ") + names(codec) + " codecs");
+        std::cout << "no host media codecs on this backend: skipped" << std::endl;
+        return;
+    }
     // Video: 60 pictures of a moving gradient, a keyframe forced at 45.
     for (const auto codec : {mc::Codec::h264, mc::Codec::hevc}) {
         const auto listed = mc::encoders(codec);
@@ -425,8 +435,44 @@ void midi_area() {
 
 void audio_area() {
     const auto endpoints = host::audio::endpoints();
-    require(static_cast<bool>(endpoints), "audio endpoints list");
+    require(static_cast<bool>(endpoints) || endpoints.error() == host::Error::unsupported, "audio endpoints list (or no audio on this host)");
+    if (!endpoints) return;
     for (const auto& endpoint : endpoints->endpoints) require(!endpoint.uid.empty(), "audio endpoints have uids");
+    require(host::audio::open_output("no such endpoint 4711", 0, 0, [](float*, std::uint32_t, std::uint32_t) {}).error() == host::Error::not_found,
+        "an unknown output endpoint is not found");
+    // The default output asks for frames once started; they are silence, so nothing is heard.
+    if (endpoints->default_output.empty()) return;
+    std::atomic<std::uint32_t> rendered{0}, channels{0};
+    const auto output = host::audio::open_output("", 0, 0, [&](float* samples, std::uint32_t frames, std::uint32_t) {
+        std::fill(samples, samples + std::size_t(frames) * channels, 0.0F);
+        rendered += frames;
+    });
+    require(static_cast<bool>(output), "the default output opens");
+    const auto format = host::audio::output_format(*output);
+    require(format.sample_rate > 0 && format.channels > 0 && format.period_frames > 0, "its format");
+    channels = format.channels;   // before the start: render is not called until then
+    require(static_cast<bool>(host::audio::start_output(*output)), "the default output starts");
+    const auto deadline = host::time::monotonic_ns() + 2'000'000'000ULL;
+    while (rendered < format.sample_rate / 20 && host::time::monotonic_ns() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    host::audio::stop_output(*output);
+    const std::uint32_t after_stop = rendered;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    require(after_stop >= format.sample_rate / 20 && rendered == after_stop, "50 ms of silence rendered, none after the stop");
+    host::audio::close_output(*output);
+}
+
+void camera_area() {
+    // Listed (none is opened); an unknown one is refused.
+    const auto cameras = host::camera::cameras();
+    require(static_cast<bool>(cameras), "cameras list");
+    for (const auto& camera : *cameras) require(!camera.id.empty() && !camera.formats.empty(), "cameras have ids and formats");
+    const auto unknown = host::camera::open("no such camera 4711", 0, 0, 0, [](const host::camera::Picture&) {});
+    require(!unknown && (unknown.error() == host::Error::not_found || unknown.error() == host::Error::unsupported), "an unknown camera is refused");
+}
+
+void speech_area() {
+    const auto voices = host::speech::voices();
+    require(static_cast<bool>(voices) || voices.error() == host::Error::unsupported, "speech voices list (or no speech on this host)");
 }
 
 void real_backend() {
@@ -608,6 +654,8 @@ int main() {
             run_area("raster_text", raster_text_area);
             run_area("midi", midi_area);
             run_area("audio", audio_area);
+            run_area("camera", camera_area);
+            run_area("speech", speech_area);
             run_area("platform", real_backend);
             run_area("media_codecs", media_codecs);
         }

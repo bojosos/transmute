@@ -1,5 +1,7 @@
-// Linux host backend (not written yet), area "media_codec": no encoders or decoders; every call fails with Error::unsupported
-// (include/alchemy/host/host.hpp).
+// Linux host backend, area "media_codec": no host codecs. Every call fails with Error::unsupported, so H.264, HEVC
+// and AAC are encoded and decoded nowhere on this host, and the media group answers its documented "no encoder" and
+// "no decoder" errors. Which system codecs Linux may use (for example the distribution's GStreamer plugins, never
+// bundled ones) waits on the user's licensing decision.
 #include "alchemy/host/media_codec.hpp"
 
 namespace alchemy::host::media_codec {
