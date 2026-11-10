@@ -243,3 +243,227 @@ extension Double: _ObjectiveCBridgeable {
     @_effects(readonly)
     public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> Double { return source?.doubleValue ?? 0 }
 }
+
+/// The number's value as a T when it has one exactly: no fraction, and in T's range (a negative number is no
+/// unsigned value).
+private func _exactInteger<T: FixedWidthInteger>(_ number: NSNumber) -> T? {
+    let double = number.doubleValue
+    guard double.isFinite, double == double.rounded(.towardZero) else { return nil }
+    return double < 0 ? T(exactly: number.longLongValue) : T(exactly: number.unsignedLongLongValue)
+}
+
+extension Int8: _ObjectiveCBridgeable {
+    @_semantics("convertToObjectiveC")
+    public func _bridgeToObjectiveC() -> NSNumber { return NSNumber(char: self) }
+
+    public static func _forceBridgeFromObjectiveC(_ x: NSNumber, result: inout Int8?) {
+        guard _conditionallyBridgeFromObjectiveC(x, result: &result) else {
+            fatalError("Unable to bridge \(type(of: x)) to Int8")
+        }
+    }
+
+    public static func _conditionallyBridgeFromObjectiveC(_ x: NSNumber, result: inout Int8?) -> Bool {
+        result = _exactInteger(x)
+        return result != nil
+    }
+
+    @_effects(readonly)
+    public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> Int8 {
+        var result: Int8?
+        guard let source else { return 0 }
+        _forceBridgeFromObjectiveC(source, result: &result)
+        return result!
+    }
+}
+
+extension Int16: _ObjectiveCBridgeable {
+    @_semantics("convertToObjectiveC")
+    public func _bridgeToObjectiveC() -> NSNumber { return NSNumber(short: self) }
+
+    public static func _forceBridgeFromObjectiveC(_ x: NSNumber, result: inout Int16?) {
+        guard _conditionallyBridgeFromObjectiveC(x, result: &result) else {
+            fatalError("Unable to bridge \(type(of: x)) to Int16")
+        }
+    }
+
+    public static func _conditionallyBridgeFromObjectiveC(_ x: NSNumber, result: inout Int16?) -> Bool {
+        result = _exactInteger(x)
+        return result != nil
+    }
+
+    @_effects(readonly)
+    public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> Int16 {
+        var result: Int16?
+        guard let source else { return 0 }
+        _forceBridgeFromObjectiveC(source, result: &result)
+        return result!
+    }
+}
+
+extension Int32: _ObjectiveCBridgeable {
+    @_semantics("convertToObjectiveC")
+    public func _bridgeToObjectiveC() -> NSNumber { return NSNumber(int: self) }
+
+    public static func _forceBridgeFromObjectiveC(_ x: NSNumber, result: inout Int32?) {
+        guard _conditionallyBridgeFromObjectiveC(x, result: &result) else {
+            fatalError("Unable to bridge \(type(of: x)) to Int32")
+        }
+    }
+
+    public static func _conditionallyBridgeFromObjectiveC(_ x: NSNumber, result: inout Int32?) -> Bool {
+        result = _exactInteger(x)
+        return result != nil
+    }
+
+    @_effects(readonly)
+    public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> Int32 {
+        var result: Int32?
+        guard let source else { return 0 }
+        _forceBridgeFromObjectiveC(source, result: &result)
+        return result!
+    }
+}
+
+extension Int64: _ObjectiveCBridgeable {
+    @_semantics("convertToObjectiveC")
+    public func _bridgeToObjectiveC() -> NSNumber { return NSNumber(longLong: self) }
+
+    public static func _forceBridgeFromObjectiveC(_ x: NSNumber, result: inout Int64?) {
+        guard _conditionallyBridgeFromObjectiveC(x, result: &result) else {
+            fatalError("Unable to bridge \(type(of: x)) to Int64")
+        }
+    }
+
+    public static func _conditionallyBridgeFromObjectiveC(_ x: NSNumber, result: inout Int64?) -> Bool {
+        result = _exactInteger(x)
+        return result != nil
+    }
+
+    @_effects(readonly)
+    public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> Int64 {
+        var result: Int64?
+        guard let source else { return 0 }
+        _forceBridgeFromObjectiveC(source, result: &result)
+        return result!
+    }
+}
+
+extension UInt: _ObjectiveCBridgeable {
+    @_semantics("convertToObjectiveC")
+    public func _bridgeToObjectiveC() -> NSNumber { return NSNumber(unsignedInteger: self) }
+
+    public static func _forceBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt?) {
+        guard _conditionallyBridgeFromObjectiveC(x, result: &result) else {
+            fatalError("Unable to bridge \(type(of: x)) to UInt")
+        }
+    }
+
+    public static func _conditionallyBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt?) -> Bool {
+        result = _exactInteger(x)
+        return result != nil
+    }
+
+    @_effects(readonly)
+    public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> UInt {
+        var result: UInt?
+        guard let source else { return 0 }
+        _forceBridgeFromObjectiveC(source, result: &result)
+        return result!
+    }
+}
+
+extension UInt8: _ObjectiveCBridgeable {
+    @_semantics("convertToObjectiveC")
+    public func _bridgeToObjectiveC() -> NSNumber { return NSNumber(unsignedChar: self) }
+
+    public static func _forceBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt8?) {
+        guard _conditionallyBridgeFromObjectiveC(x, result: &result) else {
+            fatalError("Unable to bridge \(type(of: x)) to UInt8")
+        }
+    }
+
+    public static func _conditionallyBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt8?) -> Bool {
+        result = _exactInteger(x)
+        return result != nil
+    }
+
+    @_effects(readonly)
+    public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> UInt8 {
+        var result: UInt8?
+        guard let source else { return 0 }
+        _forceBridgeFromObjectiveC(source, result: &result)
+        return result!
+    }
+}
+
+extension UInt16: _ObjectiveCBridgeable {
+    @_semantics("convertToObjectiveC")
+    public func _bridgeToObjectiveC() -> NSNumber { return NSNumber(unsignedShort: self) }
+
+    public static func _forceBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt16?) {
+        guard _conditionallyBridgeFromObjectiveC(x, result: &result) else {
+            fatalError("Unable to bridge \(type(of: x)) to UInt16")
+        }
+    }
+
+    public static func _conditionallyBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt16?) -> Bool {
+        result = _exactInteger(x)
+        return result != nil
+    }
+
+    @_effects(readonly)
+    public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> UInt16 {
+        var result: UInt16?
+        guard let source else { return 0 }
+        _forceBridgeFromObjectiveC(source, result: &result)
+        return result!
+    }
+}
+
+extension UInt32: _ObjectiveCBridgeable {
+    @_semantics("convertToObjectiveC")
+    public func _bridgeToObjectiveC() -> NSNumber { return NSNumber(unsignedInt: self) }
+
+    public static func _forceBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt32?) {
+        guard _conditionallyBridgeFromObjectiveC(x, result: &result) else {
+            fatalError("Unable to bridge \(type(of: x)) to UInt32")
+        }
+    }
+
+    public static func _conditionallyBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt32?) -> Bool {
+        result = _exactInteger(x)
+        return result != nil
+    }
+
+    @_effects(readonly)
+    public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> UInt32 {
+        var result: UInt32?
+        guard let source else { return 0 }
+        _forceBridgeFromObjectiveC(source, result: &result)
+        return result!
+    }
+}
+
+extension UInt64: _ObjectiveCBridgeable {
+    @_semantics("convertToObjectiveC")
+    public func _bridgeToObjectiveC() -> NSNumber { return NSNumber(unsignedLongLong: self) }
+
+    public static func _forceBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt64?) {
+        guard _conditionallyBridgeFromObjectiveC(x, result: &result) else {
+            fatalError("Unable to bridge \(type(of: x)) to UInt64")
+        }
+    }
+
+    public static func _conditionallyBridgeFromObjectiveC(_ x: NSNumber, result: inout UInt64?) -> Bool {
+        result = _exactInteger(x)
+        return result != nil
+    }
+
+    @_effects(readonly)
+    public static func _unconditionallyBridgeFromObjectiveC(_ source: NSNumber?) -> UInt64 {
+        var result: UInt64?
+        guard let source else { return 0 }
+        _forceBridgeFromObjectiveC(source, result: &result)
+        return result!
+    }
+}

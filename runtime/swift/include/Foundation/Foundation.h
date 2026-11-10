@@ -301,10 +301,21 @@ extern NSKeyValueChangeKey const NSKeyValueChangeNotificationIsPriorKey;
 + (NSNumber*)numberWithInteger:(NSInteger)value;
 + (NSNumber*)numberWithFloat:(float)value;
 + (NSNumber*)numberWithDouble:(double)value;
++ (NSNumber*)numberWithChar:(char)value;
++ (NSNumber*)numberWithUnsignedChar:(unsigned char)value;
++ (NSNumber*)numberWithShort:(short)value;
++ (NSNumber*)numberWithUnsignedShort:(unsigned short)value;
++ (NSNumber*)numberWithInt:(int)value;
++ (NSNumber*)numberWithUnsignedInt:(unsigned int)value;
++ (NSNumber*)numberWithLongLong:(long long)value;
++ (NSNumber*)numberWithUnsignedLongLong:(unsigned long long)value;
++ (NSNumber*)numberWithUnsignedInteger:(NSUInteger)value;
 @property (readonly) BOOL boolValue;
 @property (readonly) NSInteger integerValue;
 @property (readonly) float floatValue;
 @property (readonly) double doubleValue;
+@property (readonly) long long longLongValue;
+@property (readonly) unsigned long long unsignedLongLongValue;
 @end
 
 @interface NSURL (NSURLComponentAccessors)
