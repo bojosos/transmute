@@ -3,6 +3,7 @@
 
 #include "alchemy/alchemy_root.hpp"
 #include "alchemy/host/process.hpp"
+#include "alchemy/host/system.hpp"
 #include "alchemy/path.hpp"
 #include "alchemy/install/install_internal.hpp"
 
@@ -132,11 +133,9 @@ std::optional<std::filesystem::path> environment_path(const char* name) {
 } // namespace
 
 std::filesystem::path default_alchemy_root() {
-#ifdef _WIN32
-    if (const auto local = environment_path("LOCALAPPDATA")) return *local / "Alchemy" / "root";
-#endif
+    if (const auto data = host::system::known_directory(host::system::Directory::data)) return utf8_path(*data) / "root";
     if (const auto home = environment_path("HOME")) return *home / ".alchemy" / "root";
-    throw std::runtime_error("cannot select a default Alchemy root (LOCALAPPDATA/HOME unset); pass --root");
+    throw std::runtime_error("cannot select a default Alchemy root (no per-user data directory, HOME unset); pass --root");
 }
 
 std::optional<std::filesystem::path> find_alchemy_root(const std::filesystem::path& start) {

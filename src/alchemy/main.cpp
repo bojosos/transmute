@@ -61,8 +61,9 @@ void usage() {
                  "                 handle); MODE r, w (create/truncate), a (append) or rw\n"
                  "Doctor:  --deps --scan-bundle --json\n"
                  "Root:    guest /Applications and /Library live in the Alchemy root (--root, ALCHEMY_ROOT,\n"
-                 "         or the root containing the program; install defaults to "
-                 "%LOCALAPPDATA%\\Alchemy\\root)\n"
+                 "         or the root containing the program; install defaults to root in the\n"
+                 "         per-user Alchemy data directory: %LOCALAPPDATA%\\Alchemy\\root on Windows,\n"
+                 "         $XDG_DATA_HOME/alchemy/root or ~/.local/share/alchemy/root on Linux)\n"
                  "Profile: ARM64 headless runtime, independent Darwin replacements\n";
 }
 

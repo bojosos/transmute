@@ -11,6 +11,7 @@
 #include "alchemy/host/network_policy.hpp"
 #include "alchemy/host/process.hpp"
 #include "alchemy/host/sync.hpp"
+#include "alchemy/host/system.hpp"
 #include "alchemy/path.hpp"
 #include "alchemy/process_tree.hpp"
 
@@ -87,14 +88,17 @@ std::filesystem::path host_path(std::string_view guest) {
     return (std::filesystem::current_path().root_path() / utf8_path(generic).relative_path()).lexically_normal();
 }
 
+// The guest's HOME: the host's HOME when it is set (a POSIX path is taken as it is), else the host
+// user's home directory (Windows: %USERPROFILE%).
 std::string guest_home() {
-    for (const auto* name : {"HOME", "USERPROFILE"}) {
-        const auto value = host::process::environment(name);
-        if (!value || value->empty()) continue;
-        if (value->starts_with('/')) return *value;
-        return guest_path_string(utf8_path(*value));
+    auto value = host::process::environment("HOME");
+    if (!value || value->empty()) {
+        auto home = host::system::known_directory(host::system::Directory::home);
+        if (!home || home->empty()) return "/";
+        value = std::move(*home);
     }
-    return "/";
+    if (value->starts_with('/')) return *value;
+    return guest_path_string(utf8_path(*value));
 }
 
 bool signal_ignored_by_default(std::uint32_t signal) { return signal == 16 || signal == 19 || signal == 20 || signal == 23 || signal == 28 || signal == 29; }

@@ -33,7 +33,9 @@ struct InstalledLink {
 // Marker file identifying a directory as an Alchemy root.
 inline constexpr std::string_view alchemy_root_marker = ".alchemy-root";
 
-// %LOCALAPPDATA%\Alchemy\root (or $HOME/.alchemy/root off Windows).
+// root in the per-user Alchemy data directory (host::system::known_directory:
+// %LOCALAPPDATA%\Alchemy\root on Windows, $XDG_DATA_HOME/alchemy/root or
+// ~/.local/share/alchemy/root on Linux), else $HOME/.alchemy/root.
 [[nodiscard]] std::filesystem::path default_alchemy_root();
 // Nearest ancestor of start (inclusive) that carries the root marker.
 [[nodiscard]] std::optional<std::filesystem::path> find_alchemy_root(const std::filesystem::path& start);
