@@ -913,6 +913,18 @@ void GraphicsGaps::install_core_text() {
         release(name);
         s.x[0] = system;
     });
+    // libhvf (/usr/lib/libhvf.dylib): Apple's HVF part renderer, as FreeType's
+    // open-source HVF driver (src/hvf) calls it. No HVF renderer exists here:
+    // HVF_part_renderer_storage_size answers 0, which FreeType reads as "no
+    // renderer" and refuses the face (Invalid_Table), so no renderer is ever
+    // opened. The calls on a renderer fail (nonzero), report no axes, and
+    // closing or clearing one does nothing.
+    constexpr std::string_view libhvf = "/usr/lib/libhvf.dylib";
+    constant(libhvf, "_HVF_part_renderer_storage_size", 0);
+    for (const auto* name : {"_HVF_open_part_renderer", "_HVF_set_render_part", "_HVF_render_current_part", "_HVF_set_axis_value"})
+        constant(libhvf, name, 0xffffffffU);   // int -1
+    constant(libhvf, "_HVF_render_part_axis_count", 0);
+    for (const auto* name : {"_HVF_close_part_renderer", "_HVF_clear_part_cache"}) constant(libhvf, name, 0);
 }
 
 void GraphicsGaps::install_misc() {
