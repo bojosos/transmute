@@ -534,7 +534,7 @@ $extraOverlays = @(
         Dependencies = @('libswiftFoundation.dylib') },
     [ordered]@{ Module = 'Dispatch'; Library = 'swiftDispatch'; Source = "$qlabSwift/Dispatch"
         Install = '/usr/lib/swift/libswiftDispatch.dylib'; File = 'libswiftDispatch.dylib'
-        Dependencies = @('libswiftos.dylib'); IncludeDirectory = "$qlabSwift/include" },
+        Dependencies = @('libswiftos.dylib', 'Combine'); IncludeDirectory = "$qlabSwift/include" },
     [ordered]@{ Module = 'OSLog'; Library = 'swiftOSLog'; Source = "$qlabSwift/OSLog"
         Install = '/usr/lib/swift/libswiftOSLog.dylib'; File = 'libswiftOSLog.dylib'
         Dependencies = @('libswiftFoundation.dylib'); IncludeDirectory = "$qlabSwift/include" },
