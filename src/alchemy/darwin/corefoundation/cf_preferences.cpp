@@ -2,6 +2,7 @@
 #include "alchemy/darwin/corefoundation/cf_allocators.hpp"
 #include "alchemy/darwin/corefoundation/cf_plist.hpp"
 
+#include "alchemy/host/system.hpp"
 #include "alchemy/path.hpp"
 
 #include <algorithm>
@@ -164,9 +165,9 @@ public:
     }
     std::string home() {
         auto value = environment_value(process_, "HOME");
-        if (value.empty()) {
-            const auto profile = environment_value(process_, "USERPROFILE");
-            value = profile.empty() ? std::string("/") : guest_path_string(utf8_path(profile));
+        if (value.empty()) {   // the guest has no HOME: the host user's home
+            const auto profile = host::system::known_directory(host::system::Directory::home);
+            value = profile ? guest_path_string(utf8_path(*profile)) : std::string("/");
         }
         while (value.size() > 1 && value.back() == '/') value.pop_back();
         return value;

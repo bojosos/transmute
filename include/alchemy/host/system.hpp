@@ -60,6 +60,21 @@ enum class Pressure : std::uint8_t { normal, warning, critical };
 // known folder); the guest sees it read-only as /System/Library/Fonts.
 [[nodiscard]] Result<std::string> fonts_directory();
 
+// Per-user host directories, as host paths in UTF-8 (not created here).
+//   home       the user's home: Windows %USERPROFILE%; Linux $HOME, else the
+//              password database's entry for this user.
+//   data       Alchemy's own per-user data: Windows %LOCALAPPDATA%\Alchemy;
+//              Linux $XDG_DATA_HOME/alchemy, else ~/.local/share/alchemy.
+//   cache      Alchemy's own per-user cache: Windows %LOCALAPPDATA%\Alchemy;
+//              Linux $XDG_CACHE_HOME/alchemy, else ~/.cache/alchemy.
+//   temporary  the host's temporary directory: Windows GetTempPath; Linux
+//              $TMPDIR, else /tmp.
+// Error::not_found when the variable it rests on is unset (and, for home on
+// Linux, the user has no password entry). Relative XDG values are ignored, as
+// the XDG Base Directory specification says.
+enum class Directory : std::uint8_t { home, data, cache, temporary };
+[[nodiscard]] Result<std::string> known_directory(Directory which);
+
 // Keeps the system out of idle sleep, the display on, or both, while it is
 // held (IOPMAssertionCreateWithName; an NSProcessInfo activity).
 class PowerRequest {

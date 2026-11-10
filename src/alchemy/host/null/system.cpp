@@ -13,6 +13,7 @@ Result<std::array<double, 3>> load_average() { return Error::unsupported; }
 Result<std::string> host_name(bool) { return Error::unsupported; }
 Result<std::string> user_name() { return Error::unsupported; }
 Result<std::string> fonts_directory() { return Error::unsupported; }
+Result<std::string> known_directory(Directory) { return Error::unsupported; }
 Result<PowerRequest> PowerRequest::create(std::string_view, bool, bool) { return Error::unsupported; }
 PowerRequest& PowerRequest::operator=(PowerRequest&& other) noexcept {
     handle_ = std::exchange(other.handle_, {});

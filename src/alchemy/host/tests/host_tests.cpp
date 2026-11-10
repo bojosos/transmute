@@ -568,6 +568,7 @@ void null_backend() {
                 host::system::load_average().error() == host::Error::unsupported &&
                 host::system::host_name().error() == host::Error::unsupported &&
                 host::system::user_name().error() == host::Error::unsupported &&
+                host::system::known_directory(host::system::Directory::home).error() == host::Error::unsupported &&
                 host::system::PowerRequest::create("test", true, false).error() == host::Error::unsupported &&
                 host::system::power_status().error() == host::Error::unsupported &&
                 host::system::watch_sleep([](bool) {}).error() == host::Error::unsupported &&
@@ -1315,6 +1316,32 @@ void real_backend() {
     // system names and power requests
     require(host::system::host_name() && !host::system::host_name()->empty() && host::system::host_name(false), "host names");
     require(host::system::user_name() && !host::system::user_name()->empty(), "user name");
+    {
+        // Known directories: home and temporary exist; data and cache are Alchemy's own (not created).
+        namespace sys = host::system;
+        const auto as_path = [](const std::string& text) { return std::filesystem::path(std::u8string(text.begin(), text.end())); };
+        const auto home = sys::known_directory(sys::Directory::home), temporary = sys::known_directory(sys::Directory::temporary);
+        const auto data = sys::known_directory(sys::Directory::data), cache = sys::known_directory(sys::Directory::cache);
+        require(home && std::filesystem::is_directory(as_path(*home)), "known directory: home");
+        require(temporary && std::filesystem::is_directory(as_path(*temporary)), "known directory: temporary");
+        require(data && as_path(*data).is_absolute() && cache && as_path(*cache).is_absolute(), "known directories: data and cache");
+#if defined(ALCHEMY_HOST_WIN32)
+        const auto local = host::process::environment("LOCALAPPDATA");
+        require(local && as_path(*data) == as_path(*local) / "Alchemy" && *cache == *data, "known directories: %LOCALAPPDATA%\\Alchemy");
+        require(*home == host::process::environment("USERPROFILE").value_or(""), "known directory: home is %USERPROFILE%");
+#elif defined(ALCHEMY_HOST_LINUX)
+        // XDG: absolute values are used, relative ones ignored (the fallback under the home directory).
+        const auto saved_data = host::process::environment("XDG_DATA_HOME"), saved_cache = host::process::environment("XDG_CACHE_HOME");
+        require(host::process::set_environment("XDG_DATA_HOME", "/tmp/alchemy-xdg-data/") &&
+                    host::process::set_environment("XDG_CACHE_HOME", "relative/cache"),
+                "set XDG variables");
+        const auto xdg_data = sys::known_directory(sys::Directory::data), xdg_cache = sys::known_directory(sys::Directory::cache);
+        require(xdg_data && *xdg_data == "/tmp/alchemy-xdg-data/alchemy", "known directory: $XDG_DATA_HOME/alchemy");
+        require(xdg_cache && *xdg_cache == *home + "/.cache/alchemy", "known directory: a relative XDG_CACHE_HOME is ignored");
+        (void)host::process::set_environment("XDG_DATA_HOME", saved_data);
+        (void)host::process::set_environment("XDG_CACHE_HOME", saved_cache);
+#endif
+    }
     {
         auto awake = host::system::PowerRequest::create("Alchemy host test", true, false);
         require(static_cast<bool>(awake), "power request");

@@ -53,15 +53,6 @@ std::optional<std::uint32_t> cf_encoding(Address encoding) {
 double as_double(std::uint64_t bits) { return std::bit_cast<double>(bits); }
 void return_double(CpuState& state, double value) { state.v[0] = {std::bit_cast<std::uint64_t>(value), 0}; }
 std::string host_text(const std::filesystem::path& path) { const auto bytes = path.u8string(); return {reinterpret_cast<const char*>(bytes.data()), bytes.size()}; }
-std::optional<std::string> host_variable(const char* name) {
-#ifdef _MSC_VER
-    char* buffer = nullptr; std::size_t size = 0;
-    if (_dupenv_s(&buffer, &size, name) || !buffer) return std::nullopt;
-    std::string value(buffer); std::free(buffer); return value;
-#else
-    const auto* value = std::getenv(name); if (!value) return std::nullopt; return std::string(value);
-#endif
-}
 // Lexical POSIX path operations with NSString path semantics.
 std::vector<std::string> components(std::string_view path) {
     std::vector<std::string> result;
@@ -716,11 +707,8 @@ struct Extra {
     }
     std::string home() {
         for (const auto& entry : process.environment) if (entry.starts_with("HOME=") && entry.size() > 5) return trim_slashes(entry.substr(5));
-#ifdef _WIN32
-        if (const auto profile = host_variable("USERPROFILE")) return trim_slashes(guest_path_string(utf8_path(*profile)));
-#else
-        if (const auto value = host_variable("HOME")) return trim_slashes(*value);
-#endif
+        if (const auto profile = host::system::known_directory(host::system::Directory::home))
+            return trim_slashes(guest_path_string(utf8_path(*profile)));
         return "/";
     }
     std::string expand_tilde(const std::string& value) {

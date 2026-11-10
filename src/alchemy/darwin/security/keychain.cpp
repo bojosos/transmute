@@ -25,7 +25,9 @@
 // passwords. The default keychain is one file per Windows user, encrypted
 // with DPAPI for that user: <Alchemy root>/.alchemy/keychain/<user>.alchemy-keychain
 // when an Alchemy root is configured (outside the guest-visible /Applications
-// and /Library), otherwise %LOCALAPPDATA%/Alchemy/keychain/login.alchemy-keychain;
+// and /Library), otherwise keychain/login.alchemy-keychain in the host's per-user
+// Alchemy data directory (host::system::known_directory: %LOCALAPPDATA%\Alchemy on
+// Windows, $XDG_DATA_HOME/alchemy or ~/.local/share/alchemy on Linux);
 // ALCHEMY_KEYCHAIN overrides the path. Keys and certificates are
 // stored in the same file (nothing goes to the Windows certificate store):
 // a key item holds the SecKey external representation, a certificate item
@@ -116,9 +118,9 @@ std::filesystem::path keychain_path() {
         if (!user) fail("cannot read the user name for the keychain location");
         return *root / ".alchemy" / "keychain" / utf8_path(*user + ".alchemy-keychain");
     }
-    const auto local = host_environment("LOCALAPPDATA");
-    if (local.empty()) fail("LOCALAPPDATA is not set; the keychain has no location");
-    return utf8_path(local) / "Alchemy" / "keychain" / "login.alchemy-keychain";
+    const auto data = host::system::known_directory(host::system::Directory::data);
+    if (!data) fail("the host has no per-user data directory; the keychain has no location");
+    return utf8_path(*data) / "keychain" / "login.alchemy-keychain";
 }
 
 void put32(Bytes& out, std::uint32_t value) { for (int i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>(value >> (8 * i))); }
