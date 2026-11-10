@@ -445,8 +445,13 @@ the app is built.
 Sizes don't say which word of a type holds what. `ALCHEMY_SWIFTUI_LAYOUTS=probe`
 answers that from the app's own compiled copy and destroy code.
 - It takes each struct the compiler laid out whose only field of the 18 types
-  is a probed type, and whose other fields are plain data or class references
-  (so zero bytes are a valid value of them).
+  is a probed type, and whose other fields are zero-safe. Zero bytes are a
+  valid value of plain data, a class reference or a function (null), an
+  Optional of either (nil), and a struct of only such fields, checked
+  recursively. A skipped container names the field that isn't zero-safe.
+- For a struct of several fields, it reports the struct's and the other
+  fields' extra-inhabitant counts. A struct's come from the first field with
+  the most, so the counts say whether the probed field can supply them.
 - In one word of that field at a time, with every other byte zero, it places a
   probe object. It copies the struct with the app's `initializeWithCopy` value
   witness and destroys the copy with its `destroy` witness.
@@ -458,7 +463,7 @@ answers that from the app's own compiled copy and destroy code.
   - Its first stored property sits where a native Swift object keeps its inline
     reference counts, so a Swift retain shows there.
 - It calls nothing in the app except metadata accessors and those two witnesses.
-- It probes ObservedObject and Binding.
+- It probes ObservedObject, Binding and EnvironmentObject.
 - For a one-field struct, it also calls the app's own enum-tag witnesses
   (`storeEnumTagSinglePayload`, `getEnumTagSinglePayload`), to find which word
   an absent Optional zeroes (below).
@@ -497,6 +502,20 @@ Established layouts, each from the evidence named here:
     empty, and a stored payload case back as payload;
   - `Binding<String>` has room 32: 16, plus the String's 16.
 - The other 16 types still stop.
+
+Partial evidence, not yet enough to remove a stop:
+- EnvironmentObject: 16 bytes. Word 0 is the object's reference and word 1 is
+  8 bytes of plain data, the reverse of ObservedObject. Pika's
+  `CopySettingsSection._eyedroppers` and `AppearanceSection._eyedroppers`
+  agree:
+  - word 0: Swift copy +1, destroy −1;
+  - word 1: nothing, bytes copied as they are.
+- So word 0 supplies the extra inhabitants, but how many is unknown: 2³¹−1
+  for a non-optional reference, 2³¹−2 for an Optional one. That decides
+  whether an absent `Optional<EnvironmentObject>` is word 0 = 0 or 1.
+- Both containers have several fields, and their counts tie (2³¹−1 each), so
+  the tag probe, which needs a one-field struct, can't run on them.
+  EnvironmentObject keeps its stop until an app has a one-field struct for it.
 
 For the enum-tag probe (one-field structs only), every word of a buffer holds
 the probe object's address. The probe stores the payload case and reads the

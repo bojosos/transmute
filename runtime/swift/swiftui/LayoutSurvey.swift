@@ -8,8 +8,8 @@
 // those SwiftUI types, the room the app gives it.
 //
 // Sizes do not say which word of a type holds what. The probe answers that from the app's own compiled value
-// witnesses: for an app struct whose only @frozen SwiftUI field is the type probed and whose other fields are plain
-// data or class references, it places a probe object in one word of that field at a time (every other byte zero),
+// witnesses: for an app struct whose only @frozen SwiftUI field is the type probed and whose other fields are
+// zero-safe (zero bytes are a valid value of them), it places a probe object in one word of that field at a time (every other byte zero),
 // copies the struct with the app's initializeWithCopy witness, destroys the copy with its destroy witness, and reports
 // which words were retained and released, and how (Swift or Objective-C reference counting). For a one-field struct it
 // also stores and reads back an Optional's tags with the app's enum-tag witnesses, to see which word supplies the
@@ -144,7 +144,36 @@ internal enum _LayoutSurvey {
 
     /// The @frozen types the probe handles: those whose words it may fill with probe objects one at a time, the
     /// other words zero.
-    private static let probedTypes: Set<String> = ["ObservedObject", "Binding"]
+    private static let probedTypes: Set<String> = ["ObservedObject", "Binding", "EnvironmentObject"]
+
+    /// Why zero bytes may not be a valid value of a type, or nil when they are:
+    /// - plain data;
+    /// - a class reference, which is then null (retain and release ignore it);
+    /// - a function, whose context is then null;
+    /// - an Optional of a class or a function, which is then nil;
+    /// - a struct whose fields are all of these.
+    /// The kinds are the runtime's metadata kinds: struct 0x200, Optional 0x202, function 0x302.
+    private static func zeroUnsafety(_ type: Any.Type, depth: Int = 0) -> String? {
+        if extent(type).flags & nonPOD == 0 || type is AnyObject.Type { return nil }
+        let metadata = unsafeBitCast(type, to: UnsafeRawPointer.self)
+        switch metadata.load(as: UInt.self) {
+        case 0x302:
+            return nil
+        case 0x202:
+            let wrapped = unsafeBitCast(metadata.load(fromByteOffset: 16, as: UnsafeRawPointer.self), to: Any.Type.self)
+            if wrapped is AnyObject.Type || unsafeBitCast(wrapped, to: UnsafeRawPointer.self).load(as: UInt.self) == 0x302 { return nil }
+            return _typeName(type, qualified: true)
+        case 0x200 where depth < 8:
+            var reason: String?
+            _ = _forEachField(of: type, options: []) { name, _, fieldType, _ in
+                if let inner = zeroUnsafety(fieldType, depth: depth + 1) { reason = "\(String(cString: name)): \(inner)"; return false }
+                return true
+            }
+            return reason
+        default:
+            return _typeName(type, qualified: true)
+        }
+    }
 
     /// The Objective-C runtime's retain count of a probe object (-retainCount through its implementation).
     private static func objectiveCCount(_ object: _LayoutProbeObject) -> Int {
@@ -207,11 +236,18 @@ internal enum _LayoutSurvey {
             let frozen = fields.filter { frozenName($0.type) != nil }
             guard frozen.count == 1, let field = frozen.first, let name = frozenName(field.type), probedTypes.contains(name) else { return }
             let label = "probe \(_typeName(type, qualified: true)).\(field.name) \(_typeName(field.type, qualified: true))"
-            // Every other field must be plain data or a class reference, so that zero bytes are a valid value of it
-            // (a null reference, which retain and release ignore) and its copy touches no probe object.
-            if let other = fields.first(where: { $0.offset != field.offset && extent($0.type).flags & nonPOD != 0 && !($0.type is AnyObject.Type) }) {
-                emit("\(label): skipped, field \(other.name) is neither plain data nor a class reference")
-                return
+            // Zero bytes must be a valid value of every other field (zeroUnsafety), so that its copy touches nothing.
+            for other in fields where other.offset != field.offset {
+                if let reason = zeroUnsafety(other.type) {
+                    emit("\(label): skipped, zero bytes may not be a valid \(other.name) (\(reason))")
+                    return
+                }
+            }
+            if fields.count > 1 {
+                // Which field supplies a struct's extra inhabitants is the first with the most; the counts say whether
+                // the probed field can be that one.
+                let others = fields.filter { $0.offset != field.offset }.map { "\($0.name) \(extent($0.type).extraInhabitants)" }
+                emit("\(label): extra inhabitants: struct \(extent(type).extraInhabitants); other fields: \(others.joined(separator: ", "))")
             }
             let container = extent(type)
             // The room the app's layout gives the field (up to the next field or the end of the struct), not our size.
