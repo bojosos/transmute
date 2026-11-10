@@ -1628,6 +1628,22 @@ public:
                 result = std::move(*in_root); // /Applications and /Library live in the Alchemy root
             } else result = root / result.relative_path();
         }
+#else
+        // A POSIX host shares the guest's path syntax: the fonts view and the
+        // Alchemy root's directories (/Applications, /Library, /Users, /etc,
+        // /usr, ...) are mapped as on Windows; any other absolute path is the
+        // host's own (there are no drives, so no /Volumes/<drive>).
+        if (result.has_root_directory()) {
+            const auto normalized = path_text(result);
+            if (normalized == "/System/Library/Fonts" || normalized.starts_with("/System/Library/Fonts/")) {
+                const auto& fonts = libsystem::host_fonts_directory();
+                if (!fonts) throw ServiceError{enoent};
+                result = *fonts;
+                if (normalized.size() > 22) result /= utf8_path(normalized.substr(22));
+            } else if (auto in_root = guest_root_host_path(normalized)) {
+                result = std::move(*in_root);
+            }
+        }
 #endif
         if (result.is_relative()) {
             if (overlay) result = overlay->cwd / result;
