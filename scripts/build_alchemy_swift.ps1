@@ -606,7 +606,11 @@ if ($Library -eq 'all') {
         Set-Content -LiteralPath "$($combineObjects[-1]).flags" -Value $combineSignature -Encoding utf8
     }
     Link-Library 'Combine' '/System/Library/Frameworks/Combine.framework/Versions/A/Combine' @($combineObjects + $helperObject) `
-        @($cxx, "$out/libswiftCore.dylib", "$out/libswift_Concurrency.dylib", "$out/libswiftDarwin.dylib") 'Combine'
+        @($cxx, "$out/libswiftCore.dylib", "$out/libswift_Concurrency.dylib", "$out/libswiftDarwin.dylib") 'Combine' `
+        -aliases @(
+        # Publisher.encode(encoder:), declared by OpenCombine with its Output: Encodable requirement on the method; Combine
+        # declares it in an extension where Output: Encodable, which is the same function under another name.
+        '_$s7Combine9PublisherPAAE6encode7encoderAA10PublishersO6EncodeVy_xqd__Gqd___tAA15TopLevelEncoderRd__SE6OutputRpzlF=_$s7Combine9PublisherPAASE6OutputRpzrlE6encode7encoderAA10PublishersO6EncodeVy_xqd__Gqd___tAA15TopLevelEncoderRd__lF')
 
     # Foundation's Combine publishers (NotificationCenter.Publisher, Timer.TimerPublisher) and their locks (Darwin's
     # os_unfair_lock) need Combine, _Concurrency and Darwin. Foundation's interface names Combine, so every overlay

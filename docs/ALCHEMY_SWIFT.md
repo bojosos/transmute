@@ -306,9 +306,18 @@ as the resilient module `Combine`, so the names apps import match:
   boundary.
 
 Maccy 2.8.0 and Pika 2.0.2 import 63 distinct names from Combine, and the
-framework defines all of them. Not provided yet (OpenCombine lacks them, and
-no measured app imports them): `Publishers.CombineLatest`/`3`/`4`,
-`Merge`/`3`-`8`, `Retry`, `Throttle` and `CollectByTime`.
+framework defines all of them. Ice 0.11.12 adds 15, which are now provided:
+- `runtime/swift/combine/MergeCombineLatest.swift` adds `Publishers.Merge`,
+  `Merge3`, `Merge4` and `CombineLatest`, `Publisher.merge(with:)` for another
+  publisher type, and `combineLatest(_:)`, over `MergeMany`.
+- `Publisher.encode(encoder:)` is OpenCombine's, which states its
+  `Output: Encodable` requirement on the method; Combine states it on the
+  extension. The same function is exported under Combine's name as a linker
+  alias.
+
+Not provided yet (OpenCombine lacks them, and no measured app imports them):
+`Publishers.CombineLatest3`/`4`, `Merge5`-`8`, `Retry`, `Throttle` and
+`CollectByTime`.
 
 Guest test: `alchemy_swift_combine` (`tests/fixtures/macos/swift_combine`),
 registered once the runtime directory has Combine. `collect()` and `reduce`
