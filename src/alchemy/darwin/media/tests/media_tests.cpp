@@ -7,6 +7,7 @@
 #include "alchemy/gui/tests/fill_fixture.hpp"
 #include "alchemy/darwin/media/media.hpp"
 
+#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <thread>
@@ -509,11 +510,20 @@ void game_controller(Fixture& f) {
 
 } // namespace
 
+// Sets an environment variable of this process (the Windows and POSIX calls).
+static void set_environment(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 int main() {
     // The host's MIDI and audio devices stay out of these tests (deterministic lists).
-    _putenv_s("ALCHEMY_MIDI_DEVICES", "none");
-    _putenv_s("ALCHEMY_AUDIO_DEVICES", "none");
-    _putenv_s("ALCHEMY_CAMERA", "none");
+    set_environment("ALCHEMY_MIDI_DEVICES", "none");
+    set_environment("ALCHEMY_AUDIO_DEVICES", "none");
+    set_environment("ALCHEMY_CAMERA", "none");
     return run("media", {{"imports", imports}, {"core media", core_media}, {"core media timing", core_media_timing}, {"video", video}, {"audio", audio}, {"accessibility", accessibility},
                          {"bearers and taps", bearers_and_taps}, {"game controller", game_controller}});
 }

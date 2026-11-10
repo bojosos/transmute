@@ -20,6 +20,7 @@
 #include "alchemy/host/media_codec.hpp"
 #include "alchemy/host/speech.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <functional>
 #include <atomic>
@@ -4682,12 +4683,21 @@ void compositions(Fixture& f) {
 
 } // namespace
 
+// Sets an environment variable of this process (the Windows and POSIX calls).
+static void set_environment(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 int main() {
     alchemy::gui::completion_kit::media::set_midi_backend_factory([] { return std::make_unique<FakeMidi>(); });
     alchemy::gui::completion_kit::media::set_hal_backend_factory([] { return std::make_unique<FakeHal>(); });
     fake_aac::install();   // AAC and video results do not depend on the host's encoders
     fake_video::install();
-    _putenv_s("ALCHEMY_CAMERA", "none");   // the host's cameras stay out (media_capture_tests.cpp fakes them)
+    set_environment("ALCHEMY_CAMERA", "none");   // the host's cameras stay out (media_capture_tests.cpp fakes them)
     return fill_test::run("qlab media", {
         {"core_media", core_media},
         {"core_video", core_video},

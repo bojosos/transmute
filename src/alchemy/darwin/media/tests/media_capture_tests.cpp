@@ -1100,7 +1100,9 @@ std::int64_t run_export(Fixture& f, Address asset, const char* preset, const cha
     const auto before = exports_done().load();
     const auto done = b->make_block([](transmute::CpuState&, transmute::GuestMemory&) { ++exports_done(); });
     f.send(session, "exportAsynchronouslyWithCompletionHandler:", {done});
-    require(wait_for([&] { return exports_done() > before; }), std::string("the export finishes: ") + preset);
+    // A real export decodes and encodes every frame (the host's codecs under load can take seconds): two minutes still
+    // catch a hang.
+    require(wait_for([&] { return exports_done() > before; }, 120), std::string("the export finishes: ") + preset);
     const auto status = static_cast<std::int64_t>(f.send(session, "status"));
     if (status != 3) {
         const auto error = f.send(session, "error");
