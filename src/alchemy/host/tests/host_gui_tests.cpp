@@ -215,6 +215,33 @@ void media_codecs() {
                 std::string(names(codec)) + ": profile " + std::to_string(profile) + ", level_idc " + std::to_string(level));
             mc::close(*again);
         }
+        // Reordered frames (B-frames where the encoder makes them): the decoder gives every picture back in presentation
+        // order, from the first one on.
+        if (!video_decoders->empty()) {
+            auto reordered = settings;
+            reordered.frame_reordering = true;
+            if (const auto again = mc::open_video(reordered)) {
+                std::vector<mc::Sample> coded;
+                for (int i = 0; i < 20; ++i) {
+                    mc::Picture p{320, 240, luma.data(), 320, chroma.data(), 320, i * 333333LL, 333333};
+                    require(static_cast<bool>(mc::encode(*again, p, false, coded)), std::string(names(codec)) + ": a reordered encode");
+                }
+                require(static_cast<bool>(mc::drain(*again, coded)) && coded.size() == 20, std::string(names(codec)) + ": twenty reordered samples");
+                bool out_of_order = false;
+                for (std::size_t i = 1; i < coded.size(); ++i) out_of_order = out_of_order || coded[i].pts < coded[i - 1].pts;
+                const auto decoder = mc::open_video_decoder({codec, mc::parameter_sets(*again), 320, 240, {}});
+                require(static_cast<bool>(decoder), std::string(names(codec)) + ": a decoder for the reordered stream");
+                std::vector<mc::DecodedPicture> shown;
+                for (const auto& sample : coded) require(static_cast<bool>(mc::decode(*decoder, sample, shown)), std::string(names(codec)) + ": decodes reordered");
+                require(static_cast<bool>(mc::drain(*decoder, shown)) && shown.size() == 20, std::string(names(codec)) + ": twenty pictures");
+                for (std::size_t i = 0; i < shown.size(); ++i)
+                    require(shown[i].pts == static_cast<std::int64_t>(i) * 333333, std::string(names(codec)) + ": reordered picture " + std::to_string(i) +
+                                                                                     " in presentation order (" + std::to_string(shown[i].pts) + ")");
+                std::cout << names(codec) << ": " << (out_of_order ? "B-frames" : "no reordering from this encoder") << ", decoded in presentation order" << '\n';
+                mc::close(*decoder);
+                mc::close(*again);
+            }
+        }
         settings.width = 321;
         require(mc::open_video(settings).error() == host::Error::invalid_argument, "odd sizes are refused");
         settings.width = 320;

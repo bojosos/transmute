@@ -720,7 +720,7 @@ bool Writers::encode_image(WriterState& w, WriterInput& in, Address image, const
         support_.call(video_toolbox, "_VTCompressionSessionEncodeFrameWithOutputHandler", {in.movie.session, image, times, times + 24, 0, 0, in.movie.handler}));
     support_.process.release_guest(times);
     if (status) {
-        fail(w, status, "AVAssetWriter could not encode the frame (VTCompressionSessionEncodeFrame)");
+        fail(w, status, "AVAssetWriter could not encode the frame (VTCompressionSessionEncodeFrame " + std::to_string(status) + ")");
         return false;
     }
     std::lock_guard lock(w.movie_mutex);

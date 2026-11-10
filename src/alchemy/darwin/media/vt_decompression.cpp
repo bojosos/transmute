@@ -5,6 +5,8 @@
 #include "alchemy/engine_adapter.hpp"
 
 #include <algorithm>
+#include <cstring>
+#include <cmath>
 #include <array>
 #include <deque>
 #include <functional>
@@ -47,6 +49,10 @@ constexpr std::int32_t cv_success = 0;
 
 struct InFlight {
     std::int64_t serial{};
+    // What the decoder is given as the sample's time and gives back with its picture: the presentation time in
+    // microseconds (unique among the samples in flight). Decoders that reorder expect times that rise in presentation
+    // order; GStreamer's rewrites the times of pictures whose times fall.
+    std::int64_t key{};
     std::array<std::uint8_t, 24> pts{}, duration{};   // CMTime
     Address source_refcon{};
 };
@@ -62,6 +68,7 @@ struct Decoding {
     std::vector<std::uint32_t> formats; // the destination formats requested, in order
     Address callback{}, refcon{};       // VTDecompressionOutputCallbackRecord
     std::int64_t serial{};
+    std::int64_t last_key{};   // the largest key given so far
     std::deque<InFlight> in_flight;
 };
 
@@ -231,17 +238,17 @@ void Decompression::deliver_ready(Decoding& d, const Deliver& deliver, std::opti
     codecs::VideoFrame f;
     bool sent_shown = false;
     while (d.decoder->receive(f)) {
-        const auto found = std::find_if(d.in_flight.begin(), d.in_flight.end(), [&](const InFlight& e) { return e.serial == f.pts; });
+        const auto found = std::find_if(d.in_flight.begin(), d.in_flight.end(), [&](const InFlight& e) { return e.key == f.pts; });
         if (found == d.in_flight.end()) continue;
         const auto entry = *found;
         d.in_flight.erase(found);
-        if (sent && entry.serial == *sent) sent_shown = true;
+        if (sent && entry.key == *sent) sent_shown = true;
         const auto image = pixel_buffer(d, f);
         call_deliver(deliver, image ? 0 : vt_bad_data, image ? 0 : info_frame_dropped, image, entry);
         release(image);
     }
     if (sent && !sent_shown && !d.decoder->holds_pictures()) {
-        const auto found = std::find_if(d.in_flight.begin(), d.in_flight.end(), [&](const InFlight& e) { return e.serial == *sent; });
+        const auto found = std::find_if(d.in_flight.begin(), d.in_flight.end(), [&](const InFlight& e) { return e.key == *sent; });
         // A sample that shows nothing now (a hidden frame) and will not later (no reordering here).
         if (found != d.in_flight.end()) {
             const auto entry = *found;
@@ -281,14 +288,28 @@ std::int32_t Decompression::decode(Decoding& d, Address sample, Address source_r
         call_deliver(deliver, vt_bad_data, info_frame_dropped, 0, entry);
         return vt_bad_data;
     }
+    // The key: the presentation time in microseconds (one past the last key for a sample without a time; bumped past
+    // a key still in flight).
+    {
+        std::int64_t value{};
+        std::int32_t timescale{};
+        std::uint32_t flags{};
+        std::memcpy(&value, entry.pts.data(), 8);
+        std::memcpy(&timescale, entry.pts.data() + 8, 4);
+        std::memcpy(&flags, entry.pts.data() + 12, 4);
+        const bool numeric = (flags & 1) && !(flags & (4 | 8 | 16)) && timescale > 0;
+        entry.key = numeric ? static_cast<std::int64_t>(std::llround(static_cast<long double>(value) * 1000000.0L / timescale)) : d.last_key + 1;
+        while (std::any_of(d.in_flight.begin(), d.in_flight.end(), [&](const InFlight& e) { return e.key == entry.key; })) ++entry.key;
+        d.last_key = std::max(d.last_key, entry.key);
+    }
     d.in_flight.push_back(entry);
     std::string why;
-    if (!d.decoder->send(bytes, entry.serial, why)) {
+    if (!d.decoder->send(bytes, entry.key, why)) {
         d.in_flight.pop_back();
         call_deliver(deliver, vt_bad_data, info_frame_dropped, 0, entry);
         return vt_bad_data;
     }
-    deliver_ready(d, deliver, entry.serial);
+    deliver_ready(d, deliver, entry.key);
     return 0;
 }
 

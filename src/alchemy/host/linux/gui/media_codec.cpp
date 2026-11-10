@@ -77,6 +77,7 @@ void close(AudioDecoder*) noexcept {}
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <type_traits>
 
 namespace alchemy::host::media_codec {
@@ -961,6 +962,23 @@ public:
     std::vector<std::uint8_t> sets;        // the parameter sets, Annex B
     bool started{};
     std::vector<DecodedPicture> ready;
+    // Presentation order: a decoder may give the first pictures of a stream with B-frames in decode order (until it
+    // has seen how deep the reordering goes). Pictures wait in `held` until every sample with an earlier presentation
+    // time has come out; `pending` is the presentation times of the samples given and not yet out.
+    std::vector<DecodedPicture> held;
+    std::multiset<std::int64_t> pending;
+
+    // The held pictures that are next in presentation order go to `ready` (all of them with `everything`).
+    void release(bool everything) {
+        std::stable_sort(held.begin(), held.end(), [](const DecodedPicture& a, const DecodedPicture& b) { return a.pts < b.pts; });
+        std::size_t out = 0;
+        while (out < held.size() && (everything || pending.empty() || held[out].pts <= *pending.begin())) {
+            if (const auto found = pending.find(held[out].pts); found != pending.end()) pending.erase(found);
+            ready.push_back(std::move(held[out++]));
+        }
+        held.erase(held.begin(), held.begin() + static_cast<std::ptrdiff_t>(out));
+        if (everything) pending.clear();
+    }
 
     // A picture: NV12 or P010 of the displayed size, rows copied tight.
     void take(GstBuffer* out, GstCaps* caps) {
@@ -986,7 +1004,8 @@ public:
         for (std::uint32_t r = 0; r < p.height; ++r) std::memcpy(p.luma.data() + r * row, luma + r * luma_pitch, row);
         for (std::uint32_t r = 0; r < p.height / 2; ++r) std::memcpy(p.chroma.data() + r * row, chroma + r * chroma_pitch, row);
         gst()->gst_video_frame_unmap(&frame);
-        ready.push_back(std::move(p));
+        held.push_back(std::move(p));
+        release(false);
     }
 };
 
@@ -1009,7 +1028,13 @@ Result<VideoDecoder*> open_video_decoder(const VideoDecoderSettings& settings) {
         // Annex B in whole access units to the decoder itself, or through the codec's parser.
         std::vector<GstElement*> elements;
         if (!template_takes(f.factory, GST_PAD_SINK, coded_caps(settings.codec))) elements.push_back(make(parser_of(settings.codec)));
-        elements.push_back(make(f.factory));
+        GstElement* codec = make(f.factory);
+        // The libav decoders in "auto" compliance treat a pipeline they think live (this one, driven by our own pads)
+        // as low-latency. Then a stream whose SPS doesn't state its reorder depth has its first B-frames given in
+        // decode order, and GstVideoDecoder overwrites their times ("decreasing timestamp"). Strict compliance waits
+        // for the stream's real reordering instead.
+        if (codec) set(codec, "std-compliance", "strict");
+        elements.push_back(codec);
         elements.push_back(make("videoconvert"));
         auto decoder = std::make_unique<VideoDecoder>();
         decoder->sets = sets;
@@ -1036,6 +1061,10 @@ Status decode(VideoDecoder* decoder, const Sample& sample, std::vector<DecodedPi
     GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(to_gst(sample.pts));
     GST_BUFFER_DURATION(buffer) = sample.duration > 0 ? static_cast<GstClockTime>(to_gst(sample.duration)) : GST_CLOCK_TIME_NONE;
     if (!sample.keyframe) GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+    {
+        std::lock_guard lock(decoder->chain.mutex_);
+        decoder->pending.insert(sample.pts);
+    }
     const auto error = decoder->chain.push(buffer);
     std::lock_guard lock(decoder->chain.mutex_);
     for (auto& p : decoder->ready) out.push_back(std::move(p));
@@ -1048,6 +1077,7 @@ Status drain(VideoDecoder* decoder, std::vector<DecodedPicture>& out) {
     if (!decoder) return Error::invalid_argument;
     const auto error = decoder->chain.drain();
     std::lock_guard lock(decoder->chain.mutex_);
+    decoder->release(true);
     for (auto& p : decoder->ready) out.push_back(std::move(p));
     decoder->ready.clear();
     if (error != Error::none) return error;
@@ -1060,6 +1090,8 @@ void flush(VideoDecoder* decoder) noexcept {
     decoder->started = false;
     std::lock_guard lock(decoder->chain.mutex_);
     decoder->ready.clear();
+    decoder->held.clear();
+    decoder->pending.clear();
 }
 
 void close(VideoDecoder* decoder) noexcept { delete decoder; }

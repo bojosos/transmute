@@ -673,7 +673,8 @@ public:
             at += length;
         }
         if (sample.data.empty()) { why = "an empty sample"; return false; }
-        // Times reach the host's decoder as a 30 frames per second sequence of the packets' numbers, and come back to them.
+        // Times reach the host's decoder as the caller's keys (rising in presentation order) on a 30 frames per second
+        // scale, and come back as those keys.
         sample.pts = sample.dts = pts * tick;
         sample.duration = tick;
         sample.keyframe = key;
