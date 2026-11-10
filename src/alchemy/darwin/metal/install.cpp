@@ -1,5 +1,6 @@
 #include "alchemy/gui/install.hpp"
 #include "alchemy/host/process.hpp"
+#include "alchemy/path.hpp"
 #include "alchemy/darwin/metal/bridge.hpp"
 #include "alchemy/macho.hpp"
 #include "alchemy/msl/compiler.hpp"
@@ -19,15 +20,22 @@ std::string environment_value(const char* name) {
     return host::process::environment(name).value_or(std::string());
 }
 // The seed set of this executable: <root>/<LC_UUID>, root ALCHEMY_MSL_SEED
-// or %LOCALAPPDATA%\Alchemy\msl-seed.
+// or %LOCALAPPDATA%\Alchemy\msl-seed ($XDG_CACHE_HOME or ~/.cache/alchemy/msl-seed off Windows).
 std::filesystem::path msl_seed_directory(const std::filesystem::path& root, const std::filesystem::path& executable) {
     const auto uuid = macho_uuid(executable);
     return uuid ? root / *uuid : std::filesystem::path{};
 }
 std::filesystem::path msl_seed_root() {
-    if (auto value = environment_value("ALCHEMY_MSL_SEED"); !value.empty()) return value == "0" ? std::filesystem::path{} : value;
-    const auto local = environment_value("LOCALAPPDATA");
-    return local.empty() ? std::filesystem::path{} : std::filesystem::path(local) / "Alchemy" / "msl-seed";
+    if (auto value = environment_value("ALCHEMY_MSL_SEED"); !value.empty())
+        return value == "0" ? std::filesystem::path{} : utf8_path(value);
+    if (const auto local = environment_value("LOCALAPPDATA"); !local.empty()) return utf8_path(local) / "Alchemy" / "msl-seed";
+#if defined(_WIN32)
+    return {};
+#else
+    if (const auto cache = environment_value("XDG_CACHE_HOME"); !cache.empty()) return utf8_path(cache) / "alchemy" / "msl-seed";
+    const auto home = environment_value("HOME");
+    return home.empty() ? std::filesystem::path{} : utf8_path(home) / ".cache" / "alchemy" / "msl-seed";
+#endif
 }
 } // namespace
 
@@ -54,7 +62,7 @@ int seed_msl_corpus(const std::filesystem::path& corpus, const std::filesystem::
         return 1;
     }
     // The compiler's cache root becomes the seed directory (before its first use).
-    if (_wputenv_s(L"ALCHEMY_MSL_CACHE", seed.wstring().c_str()) != 0) return 1;
+    if (!host::process::set_environment("ALCHEMY_MSL_CACHE", path_utf8(seed))) return 1;
     // The simdgroup width Metal compiles for on this device.
     std::uint32_t width = 32;
     try { width = metal::system_device()->profile().thread_execution_width; }
