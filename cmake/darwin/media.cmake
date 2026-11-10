@@ -33,6 +33,7 @@ list(APPEND ALCHEMY_GUI_SOURCES
     src/alchemy/darwin/media/resampler.cpp
     src/alchemy/darwin/media/audio_source.cpp
     src/alchemy/darwin/media/packet_file.cpp
+    src/alchemy/darwin/media/movie_file.cpp
     src/alchemy/darwin/media/aac_encoder.cpp
     src/alchemy/darwin/media/opencl.cpp
     src/alchemy/darwin/media/au_graph.cpp

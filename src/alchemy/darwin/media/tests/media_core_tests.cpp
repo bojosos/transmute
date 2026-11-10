@@ -14,6 +14,9 @@
 #include "alchemy/darwin/media/audio_file_stream_core.hpp"
 #include "alchemy/darwin/media/audio_source.hpp"
 #include "alchemy/darwin/media/resampler.hpp"
+#include "alchemy/darwin/media/movie_file.hpp"
+#include "alchemy/darwin/media/video_config.hpp"
+#include "alchemy/darwin/media/aac_encoder.hpp"
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -1180,6 +1183,121 @@ void audio_source_tests() {
         require(std::fabs(a[i] - 0.25) < 0.01 && std::fabs(a[i] - b[i]) < 1e-6, "resampled constant at " + std::to_string(i) + ": " + std::to_string(a[i]));
 }
 
+// The movie muxer: an H.264 track whose frames are reordered (B-frames: decode times before presentation times) and
+// an AAC track with priming, interleaved, in each brand, with the moov after the data and in front of it, read back
+// by the container parser.
+void movie_file_tests() {
+    namespace mf = cm::movie_file;
+    namespace mc = cm::container;
+    const std::vector<std::uint8_t> sps{0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50}, pps{0x68, 0xeb, 0xe3, 0xcb};
+    const auto avcc = cm::video_config::avc_configuration({sps, pps});
+    const std::vector<std::uint8_t> asc{0x11, 0x90};
+    const auto esds = cm::aac::es_descriptor(asc, 128000, 128000, 1536);
+    require(!avcc.empty() && !esds.empty(), "the configurations");
+    // Decode order: each I or P frame, then the two B-frames presented before it.
+    std::vector<int> presentation;
+    for (int g = 0; g < 20; ++g) {
+        presentation.push_back(g * 3);
+        if (g) { presentation.push_back(g * 3 - 2); presentation.push_back(g * 3 - 1); }
+    }
+    presentation.push_back(58);
+    presentation.push_back(59);
+    require(presentation.size() == 60, "60 frames");
+    for (const auto brand : {mf::Brand::mp4, mf::Brand::m4v, mf::Brand::quicktime})
+        for (const bool front : {false, true}) {
+            const std::string what = std::string(brand == mf::Brand::mp4 ? "MP4" : brand == mf::Brand::m4v ? "M4V" : "QuickTime") + (front ? ", moov first" : "");
+            mf::Writer w(brand);
+            Bytes file = w.header();
+            const auto apply = [&](const mf::Writes& writes) {
+                for (const auto& [at, bytes] : writes) {
+                    if (file.size() < at + bytes.size()) file.resize(at + bytes.size());
+                    std::copy(bytes.begin(), bytes.end(), file.begin() + static_cast<std::ptrdiff_t>(at));
+                }
+            };
+            mf::TrackFormat video;
+            video.video = true;
+            video.codec = mc::fourcc("avc1");
+            video.timescale = 600;
+            video.width = 320;
+            video.height = 240;
+            video.transform = {0, 1, -1, 0, 240, 0};   // a quarter turn
+            const auto v = w.add_track(video);
+            w.set_config(v, avcc);
+            mf::TrackFormat audio;
+            audio.codec = mc::fourcc("mp4a");
+            audio.timescale = 48000;
+            audio.sample_rate = 48000;
+            audio.channels = 2;
+            const auto a = w.add_track(audio);
+            w.set_config(a, esds);
+            w.set_trim(a, 1024, 96000);
+            // Two seconds: 60 frames at 30 per second (20 units of 600) and 95 AAC packets (1024 + 96000 frames).
+            const auto add_packet = [&](std::size_t packet) {
+                apply(w.add_sample(a, Bytes(300 + packet % 7, static_cast<std::uint8_t>(0x80 + packet % 64)), static_cast<std::int64_t>(packet) * 1024,
+                                   static_cast<std::int64_t>(packet) * 1024, 1024, true));
+            };
+            std::size_t packet = 0;
+            for (std::size_t k = 0; k < presentation.size(); ++k) {
+                const auto p = presentation[k];
+                apply(w.add_sample(v, Bytes(100 + static_cast<std::size_t>(p), static_cast<std::uint8_t>(p)), (static_cast<std::int64_t>(k) - 1) * 20, p * 20, 20,
+                                   p % 30 == 0));
+                while (packet < 95 && static_cast<std::int64_t>(packet) * 1024 * 600 <= (static_cast<std::int64_t>(k) + 1) * 20 * 48000) add_packet(packet++);
+            }
+            while (packet < 95) add_packet(packet++);
+            const auto done = w.finish(front);
+            if (done.move_by) file.insert(file.begin() + static_cast<std::ptrdiff_t>(done.move_from), done.move_by, 0);
+            apply(done.writes);
+            // The top-level boxes, in order.
+            std::vector<std::uint32_t> top;
+            for (std::size_t at = 0; at + 8 <= file.size();) {
+                std::uint64_t size = (std::uint64_t(file[at]) << 24) | (std::uint64_t(file[at + 1]) << 16) | (std::uint64_t(file[at + 2]) << 8) | file[at + 3];
+                top.push_back((std::uint32_t(file[at + 4]) << 24) | (std::uint32_t(file[at + 5]) << 16) | (std::uint32_t(file[at + 6]) << 8) | file[at + 7]);
+                if (size == 1) {
+                    size = 0;
+                    for (int i = 0; i < 8; ++i) size = (size << 8) | file[at + 8 + i];
+                }
+                require(size >= 8 && at + size <= file.size(), what + ": box sizes");
+                at += size;
+            }
+            const std::vector<std::uint32_t> expected_top = front ? std::vector<std::uint32_t>{mc::fourcc("ftyp"), mc::fourcc("moov"), mc::fourcc("mdat")}
+                                                                  : std::vector<std::uint32_t>{mc::fourcc("ftyp"), mc::fourcc("mdat"), mc::fourcc("moov")};
+            require(top == expected_top, what + ": ftyp, then mdat and moov in order");
+            mc::Movie movie;
+            std::string why;
+            require(mc::parse(reader(file), file.size(), movie, why), what + " parses: " + why);
+            require(movie.brand == (brand == mf::Brand::mp4 ? mc::fourcc("mp42") : brand == mf::Brand::m4v ? mc::fourcc("M4V ") : mc::fourcc("qt  ")),
+                    what + ": the brand");
+            require(movie.tracks.size() == 2, what + ": two tracks");
+            const auto& vt = movie.tracks[0];
+            const auto& at = movie.tracks[1];
+            require(vt.kind == mc::Track::Kind::video && vt.codec == mc::fourcc("avc1") && vt.width == 320 && vt.height == 240 && vt.timescale == 600 &&
+                        vt.config == avcc,
+                    what + ": the video track");
+            require(vt.samples.size() == 60, what + ": 60 frames, " + std::to_string(vt.samples.size()));
+            for (std::size_t k = 0; k < vt.samples.size(); ++k) {
+                const auto p = presentation[k];
+                const auto& s = vt.samples[k];
+                require(s.dts == static_cast<std::int64_t>(k) * 20 && s.pts - s.dts == p * 20 - (static_cast<std::int64_t>(k) - 1) * 20 &&
+                            s.keyframe == (p % 30 == 0) && s.size == 100u + static_cast<std::uint64_t>(p),
+                        what + ": frame " + std::to_string(k));
+                const auto bytes = mc::read_sample(reader(file), vt, s);
+                require(bytes.size() == s.size && bytes.front() == static_cast<std::uint8_t>(p) && bytes.back() == static_cast<std::uint8_t>(p), what + ": frame bytes");
+            }
+            require(vt.start == 20, what + ": the presentation starts at the first frame's composition time: " + std::to_string(vt.start));
+            require(at.kind == mc::Track::Kind::audio && at.codec == mc::fourcc("mp4a") && at.sample_rate == 48000 && at.channels == 2 && at.timescale == 48000 &&
+                        at.priming == 1024 && at.samples.size() == 95,
+                    what + ": the AAC track, priming " + std::to_string(at.priming) + ", " + std::to_string(at.samples.size()) + " packets");
+            require(at.config.size() >= esds.size() && std::equal(esds.begin(), esds.end(), at.config.end() - static_cast<std::ptrdiff_t>(esds.size())),
+                    what + ": the ES descriptor");
+            for (std::size_t k = 0; k < at.samples.size(); k += 13) {
+                const auto bytes = mc::read_sample(reader(file), at, at.samples[k]);
+                require(bytes.size() == 300 + k % 7 && bytes[0] == static_cast<std::uint8_t>(0x80 + k % 64), what + ": packet " + std::to_string(k));
+            }
+            // Interleaved: neither track's samples all come before the other's.
+            require(vt.samples.back().offset > at.samples.front().offset && at.samples.back().offset > vt.samples.front().offset, what + ": interleaved");
+        }
+}
+
 int main() {
     try {
         resampler_tests();
@@ -1193,6 +1311,7 @@ int main() {
         audio_file_writing_tests();
         ump_tests();
         container_tests();
+        movie_file_tests();
         audio_file_stream_tests();
         audio_source_tests();
     } catch (const std::exception& error) {
