@@ -14,6 +14,14 @@ const Case vision_case("vision", [](Fixture& f) {
     const auto handler = f.send(f.send(f.cls("VNImageRequestHandler"), "alloc"), "initWithCGImage:options:", {0, 0});
     require(f.send(handler, "performRequests:error:", {f.cf.array({}), error}) == 0 && f.engine.read64(error), "Vision fails");
     require(f.string_constant(LIBRARY, "_VNErrorDomain") == "com.apple.Vision", "error domain");
+    {
+        const auto text = f.send(f.send(f.cls("VNRecognizeTextRequest"), "alloc"), "init");
+        f.send(text, "setRecognitionLevel:", {1});
+        const auto error = f.block(8, 0xff);
+        require(text && f.send(text, "recognitionLevel") == 1 &&
+                    f.cf.array_values(f.send(text, "supportedRecognitionLanguagesAndReturnError:", {error})).empty() && f.engine.read64(error) == 0,
+                "VNRecognizeTextRequest: its settings, no supported language");
+    }
     const auto landmarks = f.send(f.send(f.cls("VNDetectFaceLandmarksRequest"), "alloc"), "init");
     f.send(landmarks, "setConstellation:", {2});
     require(f.send(landmarks, "constellation") == 2, "a face-landmarks request keeps its constellation");

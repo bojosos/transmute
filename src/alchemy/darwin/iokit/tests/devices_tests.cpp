@@ -171,6 +171,7 @@ void other_devices(Fixture& f) {
     require(f.send(f.send(f.cls("CWWiFiClient"), "sharedWiFiClient"), "interface") == 0, "no Wi-Fi interface");
     require(f.send(f.cls("CLLocationManager"), "locationServicesEnabled") == 0, "location services disabled");
     require(std::bit_cast<double>(f.engine.read64(f.symbol(cl, "_kCLLocationAccuracyHundredMeters"))) == 100.0, "kCLLocationAccuracyHundredMeters");
+    require(std::bit_cast<double>(f.engine.read64(f.symbol(cl, "_kCLLocationAccuracyNearestTenMeters"))) == 10.0, "kCLLocationAccuracyNearestTenMeters");
     const auto context = f.send(f.send(f.cls("LAContext"), "alloc"), "init");
     const auto error = f.block(8);
     require(f.send(context, "canEvaluatePolicy:error:", {1, error}) == 0, "no biometry");

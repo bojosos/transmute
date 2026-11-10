@@ -53,6 +53,29 @@ void Provider::install() {
     const auto landmarks = cls(vision, "VNDetectFaceLandmarksRequest", "VNImageBasedRequest");
     integer_properties(landmarks, {"constellation"});
     object_properties(landmarks, {"inputFaceObservations"});
+    // VNRecognizeTextRequest (Firefox's XUL): its settings are kept; no language is recognized here, so the supported
+    // languages are none, and performing it fails like every request.
+    const auto text = cls(vision, "VNRecognizeTextRequest", "VNImageBasedRequest");
+    integer_properties(text, {"recognitionLevel", "usesLanguageCorrection", "automaticallyDetectsLanguage"});
+    object_properties(text, {"recognitionLanguages", "customWords"});
+    real_properties(text, {"minimumTextHeight"}, true);
+    method(text, "supportedRecognitionLanguagesAndReturnError:", [this](CpuState& s, GuestMemory& m) {
+        if (s.x[2]) m.write64(s.x[2], 0);
+        s.x[0] = bridge->autorelease(cf.array({}));
+    }, false, "@@:^@");
+    method(text, "supportedRecognitionLanguagesForTextRecognitionLevel:revision:error:", [this](CpuState& s, GuestMemory& m) {
+        if (s.x[4]) m.write64(s.x[4], 0);
+        s.x[0] = bridge->autorelease(cf.array({}));
+    }, true, "@@:qQ^@");
+    // -[VNRequest initWithCompletionHandler:]: the handler is kept (no request completes).
+    object_properties(vn_request, {"completionHandler"});
+    method(vn_request, "initWithCompletionHandler:", [this](CpuState& s, GuestMemory&) {
+        if (s.x[2]) {
+            const auto block = bridge->block_copy(s.x[2]);
+            store(s.x[0], "completionHandler", block);
+            bridge->block_release(block);
+        }
+    }, false, "@@:@?");
     const auto handler = cls(vision, "VNImageRequestHandler", "NSObject");
     object_properties(handler, {"image", "options"});
     for (const auto* selector : {"initWithCVPixelBuffer:options:", "initWithCGImage:options:", "initWithCIImage:options:",

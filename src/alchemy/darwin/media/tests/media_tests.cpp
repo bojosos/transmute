@@ -81,6 +81,12 @@ void core_media(Fixture& f) {
     seconds.x[0] = time;
     require(f.regs(cm, "_CMTimeGetSeconds", seconds).d(0) == 1.5, "CMTimeGetSeconds");
     seconds.x[0] = f.symbol(cm, "_kCMTimeInvalid");
+    {
+        const auto timing = f.symbol(cm, "_kCMTimingInfoInvalid");
+        bool invalid = timing != 0;
+        for (Address at = 0; invalid && at < 72; at += 8) invalid = f.engine.read64(timing + at) == 0;
+        require(invalid, "kCMTimingInfoInvalid: three invalid times");
+    }
     require(std::isnan(f.regs(cm, "_CMTimeGetSeconds", seconds).d(0)), "invalid time is NaN");
     // CMBlockBuffer
     const auto out = f.block(8);

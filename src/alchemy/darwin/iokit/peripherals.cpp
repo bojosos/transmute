@@ -218,11 +218,13 @@ void Peripherals::install_misc() {
     method(wifi, "interface", [](CpuState& s, GuestMemory&) { s.x[0] = 0; });
     method(wifi, "interfaces", [this](CpuState& s, GuestMemory&) { s.x[0] = bridge->autorelease(cf.array({})); });
     // CoreLocation: location services are disabled.
-    const std::array<double, 2> accuracies{-1.0, 100.0};
-    for (std::size_t i = 0; i < accuracies.size(); ++i) {
+    // CLLocationAccuracy: metres (Best is -1).
+    const std::array<std::pair<const char*, double>, 3> accuracies{{
+        {"_kCLLocationAccuracyBest", -1.0}, {"_kCLLocationAccuracyNearestTenMeters", 10.0}, {"_kCLLocationAccuracyHundredMeters", 100.0}}};
+    for (const auto& [name, metres] : accuracies) {
         std::array<std::uint8_t, 8> bytes{};
-        std::memcpy(bytes.data(), &accuracies[i], 8);
-        static_cast<void>(data(core_location, i == 0 ? "_kCLLocationAccuracyBest" : "_kCLLocationAccuracyHundredMeters", bytes, 8));
+        std::memcpy(bytes.data(), &metres, 8);
+        static_cast<void>(data(core_location, name, bytes, 8));
     }
     const auto location = cls(core_location, "CLLocationManager", "NSObject");
     method(location, "locationServicesEnabled", [](CpuState& s, GuestMemory&) { s.x[0] = 0; }, true, "B@:");

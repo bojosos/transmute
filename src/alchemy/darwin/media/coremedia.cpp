@@ -1336,6 +1336,8 @@ void CoreMedia::install_time_more() {
     }
     data(core_media, "_kCMTimeRangeZero", zero_range, 8);
     data(core_media, "_kCMTimeRangeInvalid", std::array<std::uint8_t, 48>{}, 8);
+    // CMSampleTimingInfo {duration, presentationTimeStamp, decodeTimeStamp}, each kCMTimeInvalid (Firefox's XUL).
+    data(core_media, "_kCMTimingInfoInvalid", std::array<std::uint8_t, 72>{}, 8);
     for (const auto& [symbol, value] : std::array<std::pair<const char*, const char*>, 6>{{
              {"_kCMTimeValueKey", "value"}, {"_kCMTimeScaleKey", "timescale"}, {"_kCMTimeEpochKey", "epoch"}, {"_kCMTimeFlagsKey", "flags"},
              {"_kCMTimeRangeStartKey", "start"}, {"_kCMTimeRangeDurationKey", "duration"}}})
