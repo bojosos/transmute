@@ -184,6 +184,17 @@ void install_libsystem_mach_extra(Provider& p) {
     p.libsystem("_bootstrap_register2", [p](CpuState& s, GuestMemory&) -> std::uint64_t {
         return p.call(libsystem_library, "_bootstrap_register", {s.x[0], s.x[1], s.x[2]}) & 0xffffffffULL;
     });
+    // The deprecated server and subset calls: bootstrap_create_server(bp, cmd, uid, on_demand, port*),
+    // bootstrap_create_service(bp, name, port*) and bootstrap_subset(bp, requestor, port*). Alchemy's bootstrap
+    // namespace launches no servers on demand and makes no subsets: BOOTSTRAP_NOT_PRIVILEGED, as launchd answers a
+    // caller it does not let do so; *port stays MACH_PORT_NULL.
+    constexpr std::uint32_t bootstrap_not_privileged = 1100;
+    for (const auto& [name, out] : std::array<std::pair<const char*, int>, 3>{{
+             {"_bootstrap_create_server", 4}, {"_bootstrap_create_service", 2}, {"_bootstrap_subset", 2}}})
+        p.libsystem(name, [out = out, refused = bootstrap_not_privileged](CpuState& s, GuestMemory& m) -> std::uint64_t {
+            if (const auto port = s.x[static_cast<std::size_t>(out)]) m.write32(port, 0);
+            return refused;
+        });
 
     install_libsystem_exc(p);
 }

@@ -647,6 +647,8 @@ void libc_leftovers() {
     f.engine.write32(tm + 8, 1); f.engine.write32(tm + 4, 3); f.engine.write32(tm, 52);
     require(get(f.engine, f.call("_asctime", {tm})) == "Sun Sep 16 01:03:52 1973\n", "asctime");
     require(f.engine.read32(symbol(f, "_sys_nerr")) == 107, "sys_nerr");
+    require(get(f.engine, f.engine.read64(symbol(f, "_sys_errlist") + 8)) == "Operation not permitted" &&
+            get(f.engine, f.engine.read64(symbol(f, "_sys_errlist") + 106 * 8)) == get(f.engine, f.call("_strerror", {106})), "sys_errlist");
     require(f.engine.read32(symbol(f, "__res") + 8) == 0, "_res is an uninitialized res_state (no RES_INIT)");
     require(f.call("_strtoumax", {f.string("18446744073709551615"), 0, 10}) == UINT64_MAX, "strtoumax");
     const auto block = f.call("_malloc", {100});

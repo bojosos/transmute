@@ -369,6 +369,9 @@ void install_libsystem_net(Provider& p) {
         if (timeval) process.release_guest(timeval);
         return result;
     });
+    // pselect$DARWIN_EXTSN: the variant newer SDKs bind (the same call here).
+    if (const auto pselect = process.resolve(libsystem_library, "_pselect"); pselect && !process.resolve(libsystem_library, "_pselect$DARWIN_EXTSN"))
+        process.install_export(std::string(libsystem_library), "_pselect$DARWIN_EXTSN", *pselect);
 
     // int connectx(int, const sa_endpoints_t*, sae_associd_t, unsigned flags,
     //              const struct iovec*, unsigned iovcnt, size_t* len, sae_connid_t*)

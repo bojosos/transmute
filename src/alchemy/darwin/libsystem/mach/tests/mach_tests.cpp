@@ -592,6 +592,19 @@ void exports_msg_server(Fixture& f) {
             "mach_msg_server returns on a receive error");
 }
 
+// The deprecated bootstrap server and subset calls: BOOTSTRAP_NOT_PRIVILEGED, the out port NULL.
+void exports_bootstrap_servers(Fixture& f) {
+    const auto port = f.block(4, 0x55);
+    require(f.status(sys, "_bootstrap_create_server", {0, f.text("/bin/true"), 0, 1, port}) == 1100 && f.engine.read32(port) == 0,
+            "bootstrap_create_server");
+    f.engine.write32(port, 7);
+    require(f.status(sys, "_bootstrap_create_service", {0, f.text("svc"), port}) == 1100 && f.engine.read32(port) == 0,
+            "bootstrap_create_service");
+    f.engine.write32(port, 7);
+    require(f.status(sys, "_bootstrap_subset", {0, 0, port}) == 1100 && f.engine.read32(port) == 0, "bootstrap_subset");
+    require(f.symbol(sys, "_pselect$DARWIN_EXTSN") == f.symbol(sys, "_pselect"), "pselect$DARWIN_EXTSN is pselect");
+}
+
 // The exc subsystem (mach/mach_extra.cpp): exception_raise sends a request MIG's way, and exc_server decodes
 // one and calls the program's catch_exception_raise.
 void exports_exc(Fixture& f) {
@@ -1418,6 +1431,7 @@ int main(int argc, char** argv) {
         {"exports_kevent", exports_kevent},
         {"exports_msg_server", exports_msg_server},
         {"exports_exc", exports_exc},
+        {"exports_bootstrap_servers", exports_bootstrap_servers},
         {"exports_tasks_and_bootstrap", exports_tasks_and_bootstrap},
         {"exports_task_policies", exports_task_policies},
         {"exports_memory_entries", exports_memory_entries},

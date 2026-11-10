@@ -130,6 +130,10 @@ void test_terminfo(Fixture& f) {
 }
 
 void test_curses(Fixture& f) {
+    // The $NCURSES60 names are the same calls; newterm only takes the guest's standard streams.
+    for (const auto* name : {"_initscr", "_wgetch", "_newterm"})
+        require(f.symbol(curses, std::string(name) + "$NCURSES60") == f.symbol(curses, name), std::string(name) + "$NCURSES60");
+    require(f.call(curses, "_newterm", {f.text("xterm"), 0x1000, 0x2000}) == 0, "newterm on other streams is NULL");
     Terminal terminal(f);
     const auto screen = f.call(curses, "_initscr");
     require(screen != 0 && f.engine.read64(f.symbol(curses, "_stdscr")) == screen, "initscr");

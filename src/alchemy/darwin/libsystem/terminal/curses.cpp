@@ -1346,6 +1346,37 @@ void install_ncurses(Provider& p) {
         k.mirror(*w);
         return w->guest;
     }, 0);
+
+    // SCREEN* newterm(const char* type, FILE* out, FILE* in): curses here drives the guest's standard output and
+    // input on an xterm-family terminal (the built-in description). For those streams and a type of that family
+    // (NULL: $TERM) newterm starts curses as initscr does and returns the one SCREEN; any other terminal or streams
+    // is NULL, ncurses' failure.
+    auto& process = p.process();
+    const auto screen = process.allocate_guest(16);
+    add("_newterm", [&process, screen](Curses& k, CpuState& s, GuestMemory& m) -> std::uint64_t {
+        std::string type;
+        if (s.x[0]) type = guest_string(m, s.x[0], 256);
+        else {
+            const auto name = process.allocate_guest(8);
+            m.write_bytes(name, std::array<std::uint8_t, 5>{'T', 'E', 'R', 'M', 0});
+            const auto value = k.sys("_getenv", {name});
+            process.release_guest(name);
+            if (value) type = guest_string(m, value, 256);
+        }
+        bool known = type == "ansi" || type == "linux";
+        for (const auto* prefix : {"xterm", "screen", "tmux", "rxvt", "vt100", "vt220"}) known = known || type.starts_with(prefix);
+        const auto standard = [&](const char* cell) {
+            const auto found = process.resolve(libsystem_library, cell);
+            return found ? m.read64(found->address) : std::uint64_t{0};
+        };
+        if (!known || !s.x[1] || !s.x[2] || s.x[1] != standard("___stdoutp") || s.x[2] != standard("___stdinp")) return 0;
+        return k.start() ? screen : 0;
+    }, 0);
+    // The $NCURSES60 names newer SDKs bind: the same calls.
+    for (const auto* name : {"_endwin", "_init_pair", "_initscr", "_keypad", "_newterm", "_resize_term", "_start_color", "_ungetch",
+                             "_waddch", "_wattr_on", "_wattrset", "_wgetch", "_wrefresh"})
+        if (const auto found = process.resolve(ncurses, name); found && !process.resolve(ncurses, std::string(name) + "$NCURSES60"))
+            process.install_export(std::string(ncurses), std::string(name) + "$NCURSES60", *found);
 }
 
 } // namespace alchemy::export_fill

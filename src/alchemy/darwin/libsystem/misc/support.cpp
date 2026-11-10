@@ -558,6 +558,25 @@ void install_darwin_support(ProcessContext& context) {
     install(state, "_qsort_r", sorter(Comparator::thunk));
     install(state, "_qsort_b", sorter(Comparator::block));
     install(state, "_strerror", [state](auto& s, auto&) { return state->error_buffer(false, error_text(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(s.x[0])))); }, 0);
+    {
+        // const char* const sys_errlist[sys_nerr]: strerror's messages for 0 .. ELAST (sys_nerr is 107), in one block.
+        constexpr std::int32_t count = 107;
+        std::vector<std::string> messages;
+        std::size_t total = 0;
+        for (std::int32_t value = 0; value < count; ++value) {
+            messages.push_back(error_text(value));
+            total += messages.back().size() + 1;
+        }
+        auto& memory = context.calling_engine();
+        const auto texts = context.allocate_guest(total), list = context.allocate_guest(count * 8);
+        std::uint64_t at = texts;
+        for (std::int32_t value = 0; value < count; ++value) {
+            put_text(memory, at, messages[static_cast<std::size_t>(value)]);
+            memory.write64(list + static_cast<std::uint64_t>(value) * 8, at);
+            at += messages[static_cast<std::size_t>(value)].size() + 1;
+        }
+        context.install_export(std::string(system_library), "_sys_errlist", {list, ExportKind::data});
+    }
     install(state, "_strerror_r", [](auto& s, auto& m) { const auto value = error_text(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(s.x[0]))); if (s.x[2] <= value.size()) return std::uint64_t{erange}; put_text(m, s.x[1], value); return std::uint64_t{0}; });
     install(state, "_perror", [state](auto& s, auto& m) { const auto error = m.read32(state->context.current_thread()->errno_address); std::string value = s.x[0] ? text(m, s.x[0]) : ""; if (!value.empty()) value += ": "; value += error_text(std::bit_cast<std::int32_t>(error)) + '\n'; std::span bytes(reinterpret_cast<const std::uint8_t*>(value.data()), value.size()); while (!bytes.empty()) { const auto result = state->context.output(2, bytes); if (result.error || !result.bytes_written || result.bytes_written > bytes.size()) throw std::runtime_error("Darwin perror output failed"); bytes = bytes.subspan(result.bytes_written); } return s.x[0]; });
     install(state, "_strsignal", [state](auto& s, auto&) {
