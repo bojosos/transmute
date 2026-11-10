@@ -16,6 +16,7 @@
 #include "alchemy/darwin/media/aac_encoder.hpp"
 #include "alchemy/darwin/kit/support/support_kit.hpp"
 #include "alchemy/darwin/security/bridge.hpp"
+#include "alchemy/host/net.hpp"
 #include "alchemy/host/time.hpp"
 
 #include <algorithm>
@@ -1079,6 +1080,12 @@ void test_devices(Fixture&) {
 } // namespace
 
 int main() {
+    // The guest's libSystem needs the host's sockets. A backend without them (null) refuses honestly, and nothing here
+    // can run.
+    if (const auto sockets = alchemy::host::net::initialize(); !sockets && sockets.error() == alchemy::host::Error::unsupported) {
+        std::cout << "[media capture] no host sockets on this backend (" << alchemy::host::backend() << "): skipped" << std::endl;
+        return 0;
+    }
     media::set_hal_backend_factory([] { return std::make_unique<FakeHal>(); });
     media::set_capture_backend_factory([] { return std::make_unique<FakeCameras>(); });
     return fill_test::run("media capture", {
