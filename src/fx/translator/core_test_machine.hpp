@@ -67,8 +67,14 @@ public:
     // exit. `max_dispatches` bounds C++ dispatch round trips.
     RunResult run(GuestContext& ctx, const CodeSource& code, std::uint64_t stop_pc,
                   unsigned max_dispatches = 100000);
-    // Enters translated code once.
+    // Enters translated code once. As the runtime's dispatcher: MXCSR follows
+    // ctx.fpcr (rounding mode, FZ) and ctx.fpsr's cumulative flags while the
+    // code runs, the flags it raises fold back into ctx.fpsr, and the host's
+    // MXCSR is restored afterwards (FP state convention, emit_fp.hpp).
     void enter(GuestContext& ctx, const void* host) const;
+    // The MXCSR `enter` runs guest code with: fp_mxcsr_for_state(fpcr, fpsr),
+    // duplicated here because fx_translator_tests does not link the fp family.
+    static std::uint32_t guest_mxcsr(std::uint32_t fpcr, std::uint32_t fpsr);
     // Forgets all translations (code arena is reused).
     void reset();
 
@@ -136,6 +142,7 @@ public:
     GuestContext expected{}, actual{};
     unsigned oracle_steps{};
     bool compare_memory = true;
+    bool compare_fpsr = false;   // also FPSR (cumulative exception flags) against the reference
     bool image_code = true;   // the program's BufferCode::image (false: like the guest's JIT memory)
     bool report = true;
     // Fails the run if a translated region embeds a guest code address

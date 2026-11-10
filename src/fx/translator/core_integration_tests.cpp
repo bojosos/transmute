@@ -7,6 +7,7 @@
 #include "fx/translator/core_test_encode.hpp"
 #include "fx/translator/core_test_gen.hpp"
 #include "fx/translator/core_test_machine.hpp"
+#include "fx/translator/emit_fp.hpp"
 #include "fx/translator/region_emitter.hpp"
 #include "fx/translator/translator.hpp"
 
@@ -275,4 +276,43 @@ FX_TEST(core_integration_perf_neon_fma_loop) {
         for (const auto& pin : region.pins) vpins += pin.vector ? 1u : 0u;
     std::printf("    NEON FMA loop: native %.3f ns/iter, translated %.3f ns/iter, ratio %.2fx (%u vector pins)\n",
                 tn[2] * 1e9 / n, tt[2] * 1e9 / n, tt[2] / tn[2], vpins);
+}
+
+// FPCR.RMode reaches translated code: DiffRunner's TestMachine runs it with
+// MXCSR from ctx.fpcr/ctx.fpsr, as the runtime's dispatcher does (before,
+// the translated side ran with the host's MXCSR, round to nearest, whatever
+// FPCR said). Inexact operations on +-1/3 and pi under all four rounding
+// modes, including FRINTI (rounds with the current mode) and an MRS FPSR,
+// against the reference, FPSR compared. Also: TestMachine::guest_mxcsr, its
+// local copy, matches fp_mxcsr_for_state.
+FX_TEST(core_integration_fp_rounding_modes) {
+    register_all();
+    for (std::uint32_t fpcr = 0; fpcr < 8; ++fpcr)
+        for (std::uint32_t fpsr = 0; fpsr < 0x20; ++fpsr)
+            FX_CHECK_EQ(TestMachine::guest_mxcsr(fpcr << 22, fpsr), fp_mxcsr_for_state(fpcr << 22, fpsr));
+    const std::vector<std::uint32_t> prog = {
+        0x1e622820u,   // fadd d0, d1, d2
+        0x1e620823u,   // fmul d3, d1, d2
+        0x1e621824u,   // fdiv d4, d1, d2
+        0x1e61c045u,   // fsqrt d5, d2
+        0x1e624026u,   // fcvt s6, d1
+        0x1e67c027u,   // frinti d7, d1
+        0x1e2a2928u,   // fadd s8, s9, s10
+        0xd53b442bu,   // mrs x11, fpsr
+    };
+    static DiffRunner r;
+    r.compare_fpsr = true;
+    for (std::uint32_t mode = 0; mode < 4; ++mode)
+        for (const bool negative : {false, true}) {
+            auto ctx = r.context(9100 + mode * 2 + (negative ? 1 : 0));
+            ctx.fpcr = mode << 22;
+            ctx.fpsr = 0;
+            ctx.v[1][0] = negative ? 0xbfd5555555555555ull : 0x3fd5555555555555ull;   // -+1/3
+            ctx.v[2][0] = 0x400921fb54442d18ull;                                       // pi
+            ctx.v[9][0] = negative ? 0xbeaaaaabull : 0x3eaaaaabull;                     // -+1/3f
+            ctx.v[10][0] = 0x40490fdbull;                                               // pi f
+            for (const unsigned v : {1u, 2u, 9u, 10u}) ctx.v[v][1] = 0;
+            r.run(prog, ctx, "rounding mode " + std::to_string(mode) + (negative ? " negative" : ""));
+        }
+    r.compare_fpsr = false;
 }

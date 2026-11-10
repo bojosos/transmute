@@ -9,6 +9,7 @@
 #include <cstdio>
 
 #include <windows.h>
+#include <xmmintrin.h>
 
 #include <algorithm>
 #include <cstring>
@@ -268,9 +269,25 @@ const void* TestMachine::install(TranslatedRegion region, bool replace) {
     return host + regions.back().entries[0].offset;
 }
 
+std::uint32_t TestMachine::guest_mxcsr(std::uint32_t fpcr, std::uint32_t fpsr) {
+    static constexpr std::uint32_t kRc[4] = {0, 2, 1, 3};   // RN, RP->up, RM->down, RZ
+    std::uint32_t m = 0x1f80u | kRc[(fpcr >> 22) & 3u] << 13;   // exceptions masked
+    if (fpcr & (1u << 24)) m |= 0x8040u;                       // FZ -> FTZ | DAZ
+    return m | (fpsr & 1u) | ((fpsr & 0x1eu) << 1);           // IOC..IXC -> IE, ZE..PE
+}
+
 void TestMachine::enter(GuestContext& ctx, const void* host) const {
     using EnterFn = void (*)(void*, const void*);
+    // FPSR's mirrored flags live in MXCSR while guest code runs (as the
+    // dispatcher clears them from ctx.fpsr), and come back from it.
+    constexpr std::uint32_t kMirrored = 0x1fu;
+    const auto host_mxcsr = _mm_getcsr();
+    _mm_setcsr(guest_mxcsr(ctx.fpcr, ctx.fpsr));
+    ctx.fpsr &= ~kMirrored;
     reinterpret_cast<EnterFn>(const_cast<void*>(enter_))(reinterpret_cast<char*>(&ctx) + kContextBias, host);
+    const auto mxcsr = _mm_getcsr();
+    _mm_setcsr(host_mxcsr);
+    ctx.fpsr |= (mxcsr & 1u) | ((mxcsr >> 1) & 0x1eu);
     nzcv_normalize(ctx);   // as the runtime's dispatcher: a region exit's raw flags
 }
 
@@ -568,7 +585,9 @@ bool DiffRunner::run(const std::vector<std::uint32_t>& words, const GuestContext
         }
     }
     if (report) {
-        equal = testing::compare_contexts(expected, actual, label);
+        testing::CompareOptions options;
+        options.compare_fpsr = compare_fpsr;
+        equal = testing::compare_contexts(expected, actual, label, options);
     } else {
         equal = std::memcmp(expected.x, actual.x, sizeof expected.x) == 0 && expected.pc == actual.pc &&
                 (expected.nzcv & 0xf0000000u) == (actual.nzcv & 0xf0000000u);
