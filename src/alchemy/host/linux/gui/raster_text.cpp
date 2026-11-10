@@ -90,6 +90,8 @@ RasterFace* raster_face(const RasterFont& spec) {
     if (!config || !library) return nullptr;
     FcPattern* pattern = FcPatternCreate();
     FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(spec.family.c_str()));
+    // AppKit asks for the Windows families (Segoe UI for the system font): the same stand-ins as fonts.cpp's.
+    freetype::add_stand_in_families(pattern, spec.family);
     FcPatternAddInteger(pattern, FC_WEIGHT, spec.bold ? FC_WEIGHT_BOLD : FC_WEIGHT_REGULAR);
     FcPatternAddInteger(pattern, FC_SLANT, spec.italic ? FC_SLANT_ITALIC : FC_SLANT_ROMAN);
     FcPatternAddBool(pattern, FC_SCALABLE, FcTrue);

@@ -36,6 +36,10 @@ FT_Library library();
 FcConfig* config();
 // Changes each time a font file is registered.
 std::uint64_t registration_serial();
+// For a Windows family the macOS layer names (Segoe UI, Arial, Consolas, ...):
+// appends its stand-ins' families (nearer families, then the generic one) and
+// language to a fontconfig pattern that already names it. False for others.
+bool add_stand_in_families(FcPattern* pattern, std::string_view family);
 // The face of a font file (one shared handle per file and index).
 Font font_for_file(const std::string& path, int index);
 // The FreeType face of `font`, opened on first use with its Unicode charmap

@@ -559,24 +559,40 @@ constexpr StandIn stand_ins[] = {
     {"Malgun Gothic", "", "sans-serif", "ko"},
 };
 
-// The stand-in family for `family`, or nothing; under freetype_mutex().
-std::optional<std::string> stand_in_family(std::string_view family, int weight, int style, int stretch) {
-    auto* config = freetype::config();
+const StandIn* stand_in_entry(std::string_view family) {
     const auto entry = std::find_if(std::begin(stand_ins), std::end(stand_ins), [&](const StandIn& s) {
         return same_name(reinterpret_cast<const FcChar8*>(std::string(s.family).c_str()), family);
     });
-    if (!config || entry == std::end(stand_ins)) return std::nullopt;
-    FcPattern* pattern = FcPatternCreate();
-    const std::string name(family), generic(entry->generic), lang(entry->lang);
-    FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(name.c_str()));
+    return entry == std::end(stand_ins) ? nullptr : entry;
+}
+
+} // namespace
+
+bool freetype::add_stand_in_families(FcPattern* pattern, std::string_view family) {
+    const auto* entry = stand_in_entry(family);
+    if (!entry) return false;
     for (std::size_t start = 0; start < entry->close.size();) {
         const auto end = std::min(entry->close.find(',', start), entry->close.size());
         const std::string close(entry->close.substr(start, end - start));
         FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(close.c_str()));
         start = end + 1;
     }
+    const std::string generic(entry->generic), lang(entry->lang);
     FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(generic.c_str()));
     if (!lang.empty()) FcPatternAddString(pattern, FC_LANG, reinterpret_cast<const FcChar8*>(lang.c_str()));
+    return true;
+}
+
+namespace {
+
+// The stand-in family for `family`, or nothing; under freetype_mutex().
+std::optional<std::string> stand_in_family(std::string_view family, int weight, int style, int stretch) {
+    auto* config = freetype::config();
+    if (!config || !stand_in_entry(family)) return std::nullopt;
+    FcPattern* pattern = FcPatternCreate();
+    const std::string name(family);
+    FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(name.c_str()));
+    freetype::add_stand_in_families(pattern, family);
     FcPatternAddDouble(pattern, FC_WEIGHT, FcWeightFromOpenTypeDouble(weight));
     FcPatternAddInteger(pattern, FC_SLANT, static_cast<int>(fc_slant(style)));
     FcPatternAddDouble(pattern, FC_WIDTH, fc_width(stretch));

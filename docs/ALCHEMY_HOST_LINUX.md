@@ -160,6 +160,8 @@ This page maps each host area to Linux. The Linux backends are in progress.
     where installed, then its generic family in its language. Other unknown
     families stay not found.
     * Segoe UI tries Selawik (metric-compatible) and then Open Sans.
+    * System text rasterizing (`gui/raster_text.cpp`), which AppKit's
+      software text uses with these family names, takes the same stand-ins.
     * Measured with HarfBuzz against Windows's segoeui.ttf on mixed text:
       Open Sans is 4.5% wider and DejaVu Sans 13% wider.
   * Fallback is fontconfig's sorted list for the family.
