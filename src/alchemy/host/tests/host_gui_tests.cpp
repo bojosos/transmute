@@ -84,7 +84,7 @@ void null_backend() {
 void media_codecs() {
     namespace mc = host::media_codec;
     const auto names = [](mc::Codec c) { return c == mc::Codec::h264 ? "H.264" : c == mc::Codec::hevc ? "HEVC" : "AAC"; };
-    // A backend without host codecs (Linux, until its codecs are decided) says so for every codec.
+    // A backend without host codecs (null; Linux built or run without GStreamer) says so for every codec.
     if (mc::encoders(mc::Codec::h264).error() == host::Error::unsupported) {
         for (const auto codec : {mc::Codec::h264, mc::Codec::hevc, mc::Codec::aac})
             require(mc::encoders(codec).error() == host::Error::unsupported && mc::decoders(codec).error() == host::Error::unsupported,
