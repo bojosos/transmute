@@ -54,6 +54,22 @@ queries per command buffer, recorded once the process first asked for GPU
 times, mapped to the host clock through the calibrated device clock
 (`commands.hpp`, CommandBuffer::times).
 
+**GPU families** (`device.cpp`, build_profile): Common1-3 always; Mac1 with
+BC compression, cube arrays, depth clamp and shaderOutputLayer; Mac2 with
+Mac1, tier-2 argument buffers and tier-2 read-write textures. The Apple
+families and Metal3 are never claimed (tile memory, imageblocks,
+programmable blending, memoryless targets, mesh shading and function
+pointers are not translated). Known gap, accepted (2026-11-10): a GPU
+without Vulkan's tessellationShader still claims Mac1/Mac2/Common2/3, whose
+feature sets include tessellation; there a tessellation pipeline stops
+explicitly when it is created, and everything else (Blender's shaders, for
+example) works. Apps that require an Apple family take their other path:
+Godot's Metal driver supports Apple silicon only (its startup loop over
+MTLGPUFamilyApple9..Apple1 wraps around and never ends without one), so
+Godot runs on its Vulkan driver (MoltenVK) here, as on Intel Macs.
+ALCHEMY_METAL_FAMILIES=<comma-separated values> replaces the list
+(diagnostics only).
+
 **Binary archives:** what an archive can hold for VkPipelines is the device's
 VkPipelineCache. Adding a compute or render pipeline creates it;
 serializeToURL: writes the cache behind an Alchemy header; an archive made
