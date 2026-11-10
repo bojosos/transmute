@@ -2509,9 +2509,16 @@ struct ObjcRuntime::Impl {
                 s.x[0] = autorelease(retained);
             } else s.x[0] = value;
         });
-        function("_objc_autoreleasePoolPush", [this](auto& s, auto&) { Address token{}; { std::lock_guard lock(mutex); token = next_pool++; }
+        const auto pool_push = function("_objc_autoreleasePoolPush", [this](auto& s, auto&) { Address token{}; { std::lock_guard lock(mutex); token = next_pool++; }
             process.current_thread()->autorelease_pools.push_back({token, {}}); s.x[0] = token; });
-        function("_objc_autoreleasePoolPop", [this](auto& s, auto&) { drain(*process.current_thread(), s.x[0]); });
+        const auto pool_pop = function("_objc_autoreleasePoolPop", [this](auto& s, auto&) { drain(*process.current_thread(), s.x[0]); });
+        // _objc_autoreleasePoolPush / Pop: objc4's SPI names of the same calls (NSObject.mm), which some
+        // frameworks' code links directly.
+        process.install_export(objc_library, "__objc_autoreleasePoolPush", {pool_push, ExportKind::function});
+        process.install_export(objc_library, "__objc_autoreleasePoolPop", {pool_pop, ExportKind::function});
+        // _objc_empty_vtable: an absolute symbol of value 0 in objc4 (objc-cache.mm), which old compilers put in a
+        // class's vtable field; binding it gives 0, as there.
+        process.install_export(objc_library, "__objc_empty_vtable", {0, ExportKind::data});
         // void objc_autoreleasePoolPrint(void): the calling thread's pools and the objects each will release, on
         // the guest's stderr (a debugging aid; the layout is Alchemy's).
         function("_objc_autoreleasePoolPrint", [this](auto&, auto&) {

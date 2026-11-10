@@ -70,6 +70,13 @@ void test_ownership_and_pools() {
     f.call("_objc_autorelease", {f.runtime.allocate(cls)});
     f.call("_objc_autoreleasePoolPop", {inner}); require(destroyed == 3, "nested pool did not drain independently");
     f.call("_objc_autoreleasePoolPop", {outer}); require(destroyed == 4, "outer pool did not drain");
+    // objc4's SPI names of the pool calls, and _objc_empty_vtable (an absolute symbol of value 0).
+    const auto push = f.process.resolve(alchemy::objc_library, "__objc_autoreleasePoolPush"),
+               pop = f.process.resolve(alchemy::objc_library, "__objc_autoreleasePoolPop"),
+               vtable = f.process.resolve(alchemy::objc_library, "__objc_empty_vtable");
+    require(push && push->address == f.process.resolve(alchemy::objc_library, "_objc_autoreleasePoolPush")->address &&
+            pop && pop->address == f.process.resolve(alchemy::objc_library, "_objc_autoreleasePoolPop")->address &&
+            vtable && vtable->address == 0, "_objc_autoreleasePoolPush/Pop and _objc_empty_vtable");
     bool rejected{}; try { f.call("_objc_autoreleasePoolPop", {outer}); } catch (const std::runtime_error&) { rejected = true; }
     require(rejected, "stale autorelease pool token accepted");
     f.call("_objc_autorelease", {f.runtime.allocate(cls)});
