@@ -479,7 +479,24 @@ Established layouts, each from the evidence named here:
   retain and release.
   The enum-tag witnesses agree too: for `UpdateControl`, storing an
   Optional's empty case zeroes word 1 and reads back as empty.
-- The other 17 types still stop.
+- Binding: two Swift references, then the Value.
+  - Word 0 is a reference with fewer extra inhabitants than word 1, so an
+    Optional one.
+  - Word 1 supplies the Binding's extra inhabitants.
+
+  Alchemy keeps a shared empty object in word 0, the getter and setter in word
+  1, and in the Value the value the getter gave when the binding was made.
+  Evidence (Pika's `WindowAccessor._window` and `SplashWindowAccessor._window`,
+  each a `Binding<Optional<NSWindow>>` filling a 24-byte one-field struct, the
+  same in both and in two runs):
+  - word 0: Swift copy +1, destroy −1;
+  - word 1: Swift copy +1, destroy −1;
+  - word 2: Objective-C copy +1, destroy −1 (the NSWindow value);
+  - the app's `storeEnumTagSinglePayload` for an Optional's empty case zeroes
+    word 1 and nothing else. `getEnumTagSinglePayload` reads that back as
+    empty, and a stored payload case back as payload;
+  - `Binding<String>` has room 32: 16, plus the String's 16.
+- The other 16 types still stop.
 
 For the enum-tag probe (one-field structs only), every word of a buffer holds
 the probe object's address. The probe stores the payload case and reads the

@@ -21,16 +21,35 @@ public struct State<Value>: DynamicProperty {
     public var projectedValue: Binding<Value> { _alchemyLayoutUnestablished("State") }
 }
 
-// @frozen as Apple documents it. The stored fields are placeholders until the layout survey establishes the
-// type's layout from an app's own metadata; until then every member stops (_alchemyLayoutUnestablished).
+/// Word 0 of every Binding Alchemy makes (one shared empty object).
+internal let _bindingContext = _StateBox<Void>(())
+
+// @frozen as Apple documents it. Its layout comes from the value-witness probe (docs/ALCHEMY_SWIFT.md): two Swift
+// references, then the value.
+// - Word 0 is a reference with fewer extra inhabitants than word 1, so an Optional one.
+// - Word 1 is a reference whose extra inhabitants are the Binding's; an absent Optional<Binding> zeroes it.
+// Alchemy keeps a shared empty object in word 0 and the getter and setter in word 1. The value is the one the getter
+// gave when the binding was made; wrappedValue always goes through the getter and setter.
 @frozen @propertyWrapper @dynamicMemberLookup
 public struct Binding<Value> {
-    internal var getter: () -> Value
-    internal var setter: (Value) -> Void
-    public init(get: @escaping () -> Value, set: @escaping (Value) -> Void) { _alchemyLayoutUnestablished("Binding") }
-    public var wrappedValue: Value { get { _alchemyLayoutUnestablished("Binding") } nonmutating set { _alchemyLayoutUnestablished("Binding") } }
-    public var projectedValue: Binding<Value> { _alchemyLayoutUnestablished("Binding") }
-    public subscript<Subject>(dynamicMember keyPath: WritableKeyPath<Value, Subject>) -> Binding<Subject> { _alchemyLayoutUnestablished("Binding") }
+    internal var _context: _StateBox<Void>?
+    internal var _access: _StateBox<(get: () -> Value, set: (Value) -> Void)>
+    internal var _value: Value
+    public init(get: @escaping () -> Value, set: @escaping (Value) -> Void) {
+        _context = _bindingContext
+        _access = _StateBox((get: get, set: set))
+        _value = get()
+    }
+    public var wrappedValue: Value {
+        get { _access.value.get() }
+        nonmutating set { _access.value.set(newValue) }
+    }
+    public var projectedValue: Binding<Value> { self }
+    public subscript<Subject>(dynamicMember keyPath: WritableKeyPath<Value, Subject>) -> Binding<Subject> {
+        let access = _access
+        return Binding<Subject>(get: { access.value.get()[keyPath: keyPath] },
+                                set: { var whole = access.value.get(); whole[keyPath: keyPath] = $0; access.value.set(whole) })
+    }
 }
 
 extension Binding: DynamicProperty {}
