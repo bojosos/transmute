@@ -90,6 +90,19 @@ class InputStream;
 void stop_input(InputStream* stream) noexcept;
 void close_input(InputStream* stream) noexcept;
 
+// ---- loopback (process taps) ----
+// What a loopback stream captures: the audio a host process tree plays, or everything the host plays except that
+// tree's. Only for a program's explicit request to tap or capture other audio (CoreAudio's process taps).
+struct LoopbackTarget {
+    std::uint32_t process_id{};        // a host process id (this process when 0)
+    bool include{true};                // true: that process tree only; false: everything else
+};
+// Opens an input stream (start_input and the rest, as above) that hands `capture` what the target plays, in
+// `sample_rate` and `channels` (48000 and 2 when 0). Error::not_found: no such process; Error::access_denied: the
+// host refuses it; Error::unsupported: no process loopback on this host (the null and Linux backends, Windows
+// before the process-loopback activation of Windows 10 build 20348).
+[[nodiscard]] Result<InputStream*> open_loopback(const LoopbackTarget& target, std::uint32_t sample_rate, std::uint32_t channels, Capture capture);
+
 // What the host's privacy settings say about this (desktop) application using the microphone:
 // unknown when they say nothing either way. Reading them shows no prompt.
 enum class Access { unknown, allowed, denied };
