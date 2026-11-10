@@ -378,6 +378,10 @@ public:
     }
 };
 
+// Process loopback: PulseAudio's sink monitors carry everything a sink plays, not one process tree's audio (or
+// everything but it); that needs PipeWire's per-stream links. Unsupported here.
+Result<InputStream*> open_loopback(const LoopbackTarget&, std::uint32_t, std::uint32_t, Capture) { return Error::unsupported; }
+
 Result<InputStream*> open_input(std::string_view uid, std::uint32_t sample_rate, std::uint32_t channels, Capture capture) {
     auto* s = Server::get();
     if (!s) return Error::unsupported;

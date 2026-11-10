@@ -494,6 +494,27 @@ void audio_area() {
     const std::uint32_t after_stop = rendered;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     require(after_stop >= format.sample_rate / 20 && rendered == after_stop, "50 ms of silence rendered, none after the stop");
+    // Process loopback of this process alone (never another program's audio): its silent output comes back, in the
+    // asked default format. A process that does not exist is not found.
+    std::atomic<std::uint64_t> looped{0};
+    const auto tap = host::audio::open_loopback({0, true}, 0, 0, [&](const float*, std::uint32_t frames, std::uint64_t) { looped += frames; });
+    if (!tap) {
+        require(tap.error() == host::Error::unsupported, std::string("process loopback opens, or is unsupported here: ") + std::string(host::name(tap.error())));
+        std::cout << "no process loopback on this backend: skipped" << std::endl;
+    } else {
+        const auto tap_format = host::audio::input_format(*tap);
+        require(tap_format.sample_rate == 48000 && tap_format.channels == 2, "the loopback's default format");
+        require(static_cast<bool>(host::audio::start_output(*output)) && static_cast<bool>(host::audio::start_input(*tap)), "the output and its loopback start");
+        const auto until = host::time::monotonic_ns() + 3'000'000'000ULL;
+        while (looped < 2400 && host::time::monotonic_ns() < until) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        host::audio::stop_input(*tap);
+        host::audio::stop_output(*output);
+        require(looped >= 2400, "this process's own silence comes back: " + std::to_string(looped.load()) + " frames");
+        host::audio::close_input(*tap);
+        std::cout << "process loopback of this process: " << looped.load() << " frames at " << tap_format.sample_rate << " Hz" << std::endl;
+    }
+    const auto missing = host::audio::open_loopback({0x7ffffff0u, true}, 0, 0, [](const float*, std::uint32_t, std::uint64_t) {});
+    require(!missing && (missing.error() == host::Error::not_found || missing.error() == host::Error::unsupported), "no loopback of a process that does not exist");
     host::audio::close_output(*output);
 }
 
