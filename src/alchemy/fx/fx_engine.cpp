@@ -1573,7 +1573,7 @@ bool stack_probe_leaf() {
 }
 
 template <Leaf kind>
-bool leaf_call(fx::GuestContext& ctx) {
+FX_GENERATED_ABI bool leaf_call(fx::GuestContext& ctx) {
     auto& x = ctx.x;
     if constexpr (kind == kLeafStackProbe) {
         // ___chkstk_darwin probes [sp - w9, sp) and keeps every register. A
@@ -1606,7 +1606,7 @@ bool leaf_call(fx::GuestContext& ctx) {
     }
 }
 
-bool custom_leaf_call(fx::GuestContext& ctx, void* data) {
+FX_GENERATED_ABI bool custom_leaf_call(fx::GuestContext& ctx, void* data) {
     const auto& custom = *static_cast<const FxEngine::Shared::CustomLeaf*>(data);
     return custom.leaf(ctx.x, custom.data);
 }
@@ -1671,7 +1671,7 @@ void FxEngine::install_native_entry(std::uint64_t pc) {
 
 // Native host-callback entry of a synthetic call: called from translated code
 // on the guest thread, without a dispatcher exit.
-void FxEngine::host_callback(fx::GuestContext& ctx, void* user) {
+FX_GENERATED_ABI void FxEngine::host_callback(fx::GuestContext& ctx, void* user) {
     const auto pc = reinterpret_cast<std::uint64_t>(user);
     bool failed = false;
     {

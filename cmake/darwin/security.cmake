@@ -45,8 +45,10 @@ list(APPEND ALCHEMY_GUI_SOURCES
 # Authorization Services; in alchemy-fx code_signing.cpp owns them.
 target_sources(alchemy_core PRIVATE src/alchemy/darwin/security/authorization_headless.cpp)
 list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES src/alchemy/darwin/security/authorization_headless.cpp)
-list(APPEND ALCHEMY_GUI_LINK_LIBRARIES crypt32 ncrypt secur32 delayimp
-    -DELAYLOAD:crypt32.dll -DELAYLOAD:ncrypt.dll -DELAYLOAD:secur32.dll)
+if(WIN32)
+    list(APPEND ALCHEMY_GUI_LINK_LIBRARIES crypt32 ncrypt secur32 delayimp
+        -DELAYLOAD:crypt32.dll -DELAYLOAD:ncrypt.dll -DELAYLOAD:secur32.dll)
+endif()
 
 function(alchemy_darwin_security_tests)
     alchemy_gui_add_unit_test(alchemy_gui_security src/alchemy/darwin/security/tests/security_tests.cpp TIMEOUT 120)

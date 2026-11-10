@@ -3,6 +3,7 @@
 // RtlInstallFunctionTableCallback, RtlAddGrowableFunctionTable).
 
 #include "fx/seh/seh.hpp"
+#include "fx/host/sync.hpp"
 #include "fx/seh/dispatch.hpp"
 
 #include <algorithm>
@@ -28,7 +29,7 @@ struct DynamicTable {
     std::uint64_t context{};
 };
 
-SRWLOCK g_lock = SRWLOCK_INIT;
+host::RwLock g_lock;
 std::vector<DynamicTable>& tables() {
     static std::vector<DynamicTable> instance;
     return instance;
@@ -104,10 +105,10 @@ std::uint64_t lookup_function_entry(std::uint64_t pc, std::uint64_t* image_base)
                                      module->base, pc, true);
     }
     std::vector<DynamicTable> candidates;
-    AcquireSRWLockShared(&g_lock);
+    g_lock.lock_shared();
     for (const auto& table : tables())
         if (pc >= table.range_begin && pc < table.range_end) candidates.push_back(table);
-    ReleaseSRWLockShared(&g_lock);
+    g_lock.unlock_shared();
     for (const auto& table : candidates) {
         std::uint64_t entry = 0;
         if (table.kind == TableKind::callback) {
@@ -137,15 +138,15 @@ bool add_function_table(std::uint64_t table, std::uint32_t count, std::uint64_t 
     entry.count = count;
     entry.maximum = count;
     if (!measure_table(table, count, base_address, entry)) return false;
-    AcquireSRWLockExclusive(&g_lock);
+    g_lock.lock();
     tables().push_back(entry);
-    ReleaseSRWLockExclusive(&g_lock);
+    g_lock.unlock();
     return true;
 }
 
 bool delete_function_table(std::uint64_t table) {
     bool removed = false;
-    AcquireSRWLockExclusive(&g_lock);
+    g_lock.lock();
     auto& list = tables();
     for (auto it = list.begin(); it != list.end(); ++it) {
         if (it->kind != TableKind::growable && it->identifier == table) {
@@ -154,7 +155,7 @@ bool delete_function_table(std::uint64_t table) {
             break;
         }
     }
-    ReleaseSRWLockExclusive(&g_lock);
+    g_lock.unlock();
     return removed;
 }
 
@@ -169,9 +170,9 @@ bool install_function_table_callback(std::uint64_t identifier, std::uint64_t bas
     entry.range_end = base_address + length;
     entry.callback = callback;
     entry.context = context;
-    AcquireSRWLockExclusive(&g_lock);
+    g_lock.lock();
     tables().push_back(entry);
-    ReleaseSRWLockExclusive(&g_lock);
+    g_lock.unlock();
     return true;
 }
 
@@ -188,37 +189,37 @@ std::uint32_t add_growable_function_table(std::uint64_t* handle, std::uint64_t t
     entry.count = count;
     entry.maximum = maximum;
     entry.sorted = true;
-    AcquireSRWLockExclusive(&g_lock);
+    g_lock.lock();
     entry.identifier = g_next_growable_handle;
     g_next_growable_handle += 0x10;
     tables().push_back(entry);
-    ReleaseSRWLockExclusive(&g_lock);
+    g_lock.unlock();
     *handle = entry.identifier;
     return 0;
 }
 
 void grow_function_table(std::uint64_t handle, std::uint32_t count) {
-    AcquireSRWLockExclusive(&g_lock);
+    g_lock.lock();
     for (auto& table : tables())
         if (table.kind == TableKind::growable && table.identifier == handle)
             table.count = std::min(count, table.maximum);
-    ReleaseSRWLockExclusive(&g_lock);
+    g_lock.unlock();
 }
 
 void delete_growable_function_table(std::uint64_t handle) {
-    AcquireSRWLockExclusive(&g_lock);
+    g_lock.lock();
     auto& list = tables();
     list.erase(std::remove_if(list.begin(), list.end(), [&](const DynamicTable& table) {
                    return table.kind == TableKind::growable && table.identifier == handle;
                }),
                list.end());
-    ReleaseSRWLockExclusive(&g_lock);
+    g_lock.unlock();
 }
 
 void reset_dynamic_function_tables() {
-    AcquireSRWLockExclusive(&g_lock);
+    g_lock.lock();
     tables().clear();
-    ReleaseSRWLockExclusive(&g_lock);
+    g_lock.unlock();
 }
 
 } // namespace transmute::fx::seh

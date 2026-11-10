@@ -622,7 +622,7 @@ struct ModuleLoader::Implementation {
                 tls_begin = std::min(tls_begin, address);
                 tls_end = std::max(tls_end, checked_add(address, section.size));
                 if (type == 0x11) initialized_end = std::max(initialized_end, checked_add(address, section.size));
-                tls.alignment = std::max(tls.alignment, 1ULL << section.alignment);
+                tls.alignment = std::max<std::uint64_t>(tls.alignment, std::uint64_t{1} << section.alignment);
             }
             if (type == 0x13) for (std::uint64_t offset = 0; offset < section.size; offset += 24) tls.descriptors.push_back(address + offset);
             if (type == 0x15) for (std::uint64_t offset = 0; offset < section.size; offset += 8) {

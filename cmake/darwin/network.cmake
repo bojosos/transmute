@@ -42,7 +42,9 @@ list(APPEND ALCHEMY_GUI_SOURCES
 target_sources(alchemy_core PRIVATE src/alchemy/darwin/network/cfsocket_headless.cpp)
 list(APPEND ALCHEMY_HEADLESS_ONLY_SOURCES src/alchemy/darwin/network/cfsocket_headless.cpp)
 # dnsapi's DNS-SD entry points are resolved at run time (mdns.cpp).
-list(APPEND ALCHEMY_GUI_LINK_LIBRARIES winhttp ws2_32 iphlpapi -DELAYLOAD:winhttp.dll)
+if(WIN32)
+    list(APPEND ALCHEMY_GUI_LINK_LIBRARIES winhttp ws2_32 iphlpapi -DELAYLOAD:winhttp.dll)
+endif()
 
 function(alchemy_darwin_network_tests)
     alchemy_gui_add_unit_test(alchemy_gui_network src/alchemy/darwin/network/tests/network_tests.cpp TIMEOUT 180)

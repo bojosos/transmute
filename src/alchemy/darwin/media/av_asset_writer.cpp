@@ -226,7 +226,7 @@ bool Writers::append(Address input_object, Address sample) {
     if (!frames || !length) return true;
     const auto planes = pcm->non_interleaved ? pcm->channels : 1U;
     const auto scratch = support_.process.allocate_guest(40 + 8 + 16ULL * planes + length, 16);
-    const auto list = scratch + 40, data = list + 8 + 16ULL * planes;
+    const std::uint64_t list = scratch + 40, data = list + 8 + 16ULL * planes;
     std::int32_t status = 0;
     if (w->client != asbd) {
         m.write_bytes(scratch, asbd);

@@ -17,8 +17,16 @@ void neon_begin_region(x64::Assembler& as);
 void neon_end_region(x64::Assembler& as);
 void neon_region_hook_absent(x64::Assembler&) {}
 } // namespace transmute::fx
+#if defined(_MSC_VER)
 #pragma comment(linker, "/alternatename:?neon_begin_region@fx@transmute@@YAXAEAVAssembler@x64@12@@Z=?neon_region_hook_absent@fx@transmute@@YAXAEAVAssembler@x64@12@@Z")
 #pragma comment(linker, "/alternatename:?neon_end_region@fx@transmute@@YAXAEAVAssembler@x64@12@@Z=?neon_region_hook_absent@fx@transmute@@YAXAEAVAssembler@x64@12@@Z")
+#else
+// Weak defaults the neon library's definitions replace when it is linked.
+namespace transmute::fx {
+[[gnu::weak]] void neon_begin_region(x64::Assembler& as) { neon_region_hook_absent(as); }
+[[gnu::weak]] void neon_end_region(x64::Assembler& as) { neon_region_hook_absent(as); }
+} // namespace transmute::fx
+#endif
 
 namespace transmute::fx::core {
 

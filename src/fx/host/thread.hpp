@@ -15,6 +15,8 @@
 
 #if defined(TRANSMUTE_FX_HOST_WIN32)
 #include "fx/host/win32/thread.hpp"
+#elif defined(TRANSMUTE_FX_HOST_LINUX)
+#include "fx/host/linux/thread.hpp"
 #endif
 
 namespace transmute::fx::host {

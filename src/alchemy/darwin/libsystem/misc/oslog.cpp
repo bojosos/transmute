@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/completion/completion_kit.hpp"
+#include "alchemy/host/process.hpp"
 #include "alchemy/darwin/libsystem/misc/log_store.hpp"
 
 #include <cstdio>
@@ -36,12 +37,8 @@ struct Logs {
 
 bool os_log_diagnostics() {
     static const bool enabled = [] {
-        char* value = nullptr;
-        std::size_t length = 0;
-        if (_dupenv_s(&value, &length, "ALCHEMY_OS_LOG") != 0 || !value) return false;
-        const bool on = *value && std::string_view(value) != "0";
-        std::free(value);
-        return on;
+        const auto value = host::process::environment("ALCHEMY_OS_LOG");
+        return value && !value->empty() && *value != "0";
     }();
     return enabled;
 }

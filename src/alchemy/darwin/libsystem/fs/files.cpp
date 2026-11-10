@@ -735,7 +735,7 @@ void DarwinServices::Impl::install_python_services() {
             if (record->pipe) return (record->flags & 3) | record->pipe_status->load();
             // As xnu's F_GETFL: the access mode and the status flags (O_NONBLOCK, O_APPEND, O_ASYNC,
             // O_FSYNC, O_DSYNC), never the open-time flags (O_CREAT, O_EXCL, O_TRUNC, O_CLOEXEC...).
-            return record->random_device ? *record->random_flags : record->flags & (3ULL | 4 | 8 | 0x40 | 0x80 | 0x400000); }
+            return record->random_device ? *record->random_flags : record->flags & std::uint64_t{3 | 4 | 8 | 0x40 | 0x80 | 0x400000}; }
         // Apple ARM64 variadic ints occupy a stack slot whose upper padding is
         // unspecified. Pointer-valued F_GETPATH arguments use the full word.
         const auto argument = command == 50 || (command >= 7 && command <= 9) ? m.read64(s.sp) : static_cast<std::uint64_t>(m.read32(s.sp));

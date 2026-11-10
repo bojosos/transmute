@@ -1,4 +1,5 @@
 #include "alchemy/darwin/kit/support/support_kit.hpp"
+#include "alchemy/host/process.hpp"
 
 #include <fstream>
 #include <sstream>
@@ -12,11 +13,9 @@
 namespace alchemy::gui::support_kit {
 
 void run_selector_audit(Support& support) {
-    char* value = nullptr;
-    std::size_t length = 0;
-    if (_dupenv_s(&value, &length, "ALCHEMY_SELECTOR_AUDIT") != 0 || value == nullptr) return;
-    const std::string path(value);
-    std::free(value);
+    const auto value = host::process::environment("ALCHEMY_SELECTOR_AUDIT");
+    if (!value) return;
+    const std::string path = *value;
     std::ifstream in(path);
     if (!in) { diagnostic("audit: cannot read " + path); return; }
     std::vector<Address> probes, classes;

@@ -1,4 +1,5 @@
 #include "alchemy/darwin/metal/pipeline.hpp"
+#include "alchemy/host/process.hpp"
 
 #include "alchemy/darwin/metal/bindless.hpp"
 
@@ -243,9 +244,8 @@ std::optional<std::string> ShaderFunction::specialize(const ConstantValues& valu
     }
     // ALCHEMY_METAL_TRACE_CONSTANTS=1: the specialization of every function.
     static const bool trace = [] {
-        char value[8]{};
-        std::size_t length{};
-        return getenv_s(&length, value, sizeof(value), "ALCHEMY_METAL_TRACE_CONSTANTS") == 0 && length > 1 && value[0] != '0';
+        const auto value = host::process::environment("ALCHEMY_METAL_TRACE_CONSTANTS");
+        return value && !value->empty() && (*value)[0] != '0';
     }();
     if (trace) {
         std::string line = "[metal constants] " + name();

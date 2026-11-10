@@ -5,9 +5,10 @@
 
 #include "fx/common/cpu_features.hpp"
 
-#include <intrin.h>
+#include "transmute/intrinsics.hpp"
 
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -42,17 +43,17 @@ HostFeatures detect_host() {
     h.sha = f.sha && f.sse41;
     h.bmi2 = f.bmi2;
     int r[4]{};
-    __cpuid(r, 0);
+    cpuid(r, 0);
     const int max_leaf = r[0];
-    __cpuid(r, 1);
+    cpuid(r, 1);
     h.rdrand = (static_cast<unsigned>(r[2]) & (1u << 30)) != 0;
     if (max_leaf >= 7) {
-        __cpuidex(r, 7, 0);
+        cpuid(r, 7, 0);
         h.rdseed = (static_cast<unsigned>(r[1]) & (1u << 18)) != 0;
     }
-    __cpuid(r, static_cast<int>(0x80000000u));
+    cpuid(r, static_cast<int>(0x80000000u));
     if (static_cast<unsigned>(r[0]) >= 0x80000007u) {
-        __cpuid(r, static_cast<int>(0x80000007u));
+        cpuid(r, static_cast<int>(0x80000007u));
         h.invariant_tsc = (static_cast<unsigned>(r[3]) & (1u << 8)) != 0;
     }
     return h;
@@ -553,7 +554,7 @@ bool decode_bit_mask(unsigned n, unsigned imms, unsigned immr, bool is64, std::u
     if (!is64 && n) return false;
     const unsigned combined = (n << 6) | (~imms & 0x3fu);
     if (combined == 0) return false;
-    unsigned len = 31 - static_cast<unsigned>(__lzcnt(combined));
+    unsigned len = 31 - static_cast<unsigned>(std::countl_zero(combined));
     if (len < 1) return false;
     const unsigned esize = 1u << len;
     const unsigned levels = esize - 1;

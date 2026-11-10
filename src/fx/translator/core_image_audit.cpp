@@ -14,6 +14,7 @@
 #include "fx/translator/region_emitter.hpp"   // core_counters
 #include "fx/translator/region_plan.hpp"
 #include "fx/translator/translator.hpp"
+#include "fx/host/file.hpp"
 #include "fx/host/sample.hpp"
 #include "fx/host/thread.hpp"
 #include "fx/host/time.hpp"
@@ -611,12 +612,12 @@ int wmain(int argc, wchar_t** argv) {
                 core::instruction_map_sink() = nullptr;
                 wchar_t name[64];
                 std::swprintf(name, 64, L"\\r_%llx.bin", static_cast<unsigned long long>(rva));
-                if (FILE* f = _wfopen((dump_dir + name).c_str(), L"wb")) {
+                if (FILE* f = host::file::open_stdio(dump_dir + name, "wb")) {
                     std::fwrite(r.code.data(), 1, r.code.size(), f);
                     std::fclose(f);
                 }
                 std::swprintf(name, 64, L"\\r_%llx.map", static_cast<unsigned long long>(rva));
-                if (FILE* mf = _wfopen((dump_dir + name).c_str(), L"w")) {
+                if (FILE* mf = host::file::open_stdio(dump_dir + name, "w")) {
                     std::fprintf(mf, "base %llx hot %u retries %llu\n", static_cast<unsigned long long>(base),
                                  r.stats.hot_bytes ? r.stats.hot_bytes : static_cast<unsigned>(r.code.size()),
                                  static_cast<unsigned long long>(core::core_counters().retries.load() - retries_before));
@@ -726,7 +727,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!dump_dir.empty() && k < 10) {
             wchar_t name[64];
             std::swprintf(name, 64, L"\\hit_%08x_%llx.bin", h.rva, static_cast<unsigned long long>(h.at));
-            if (FILE* f = _wfopen((dump_dir + name).c_str(), L"wb")) {
+            if (FILE* f = host::file::open_stdio(dump_dir + name, "wb")) {
                 std::fwrite(h.code.data(), 1, h.code.size(), f);
                 std::fclose(f);
             }

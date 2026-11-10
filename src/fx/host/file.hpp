@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -89,5 +90,7 @@ bool attributes(const std::wstring& path, std::uint64_t* bytes, std::uint64_t* w
 std::wstring full_path(const std::wstring& path);
 // The host's directory for temporary files, as it reports it (may end in a separator).
 std::wstring temp_directory();
+// A C stdio stream on `path` (_wfopen; fopen of the UTF-8 path); nullptr on failure.
+std::FILE* open_stdio(const std::wstring& path, const char* mode) noexcept;
 
 } // namespace transmute::fx::host::file

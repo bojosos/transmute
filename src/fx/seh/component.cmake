@@ -14,6 +14,8 @@ fx_add_library(fx_seh
 )
 target_link_libraries(fx_seh PUBLIC fx_common)
 
+# The tests drive real Win64 host exceptions (RtlUnwindEx, vectored handlers).
+if(WIN32)
 fx_add_test(fx_seh_tests
     SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/tests/test_unwind.cpp
@@ -24,3 +26,4 @@ fx_add_test(fx_seh_tests
         ${CMAKE_CURRENT_LIST_DIR}/tests/call_guest_stub.cpp
     LIBS fx_seh
 )
+endif()

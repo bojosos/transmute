@@ -256,7 +256,12 @@ void sum_exit_counts(std::uint64_t (&exits)[16]) {
         for (unsigned i = 0; i < 16; ++i) exits[i] += ts->exits[i];
 }
 
-__declspec(noinline) void clear_stack_residue() noexcept {
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+[[gnu::noinline]]
+#endif
+void clear_stack_residue() noexcept {
     volatile std::uint64_t words[1024];   // 8 KiB below the caller
     for (auto& word : words) word = 0;
 }

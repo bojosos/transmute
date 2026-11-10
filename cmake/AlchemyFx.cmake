@@ -41,6 +41,8 @@ if(WIN32)
 endif()
 if(MSVC)
     target_compile_options(alchemy_core_fx PRIVATE /W3 /permissive- "/FI${alchemy_fx_prelude}")
+else()
+    target_compile_options(alchemy_core_fx PRIVATE -include "${alchemy_fx_prelude}")
 endif()
 # GUI providers (cmake/AlchemyGui.cmake): fx-only, never part of alchemy_core.
 if(ALCHEMY_GUI_SOURCES)
@@ -64,6 +66,9 @@ if(MSVC)
     # Host threads run fx dispatchers and nested guest<->host callback frames;
     # guest stacks are separate fx allocations. 8 MiB is reserve, not commit.
     target_link_options(alchemy-fx PRIVATE /DEBUG /STACK:8388608)
+else()
+    # The main thread's stack is the host's limit (ulimit -s, usually 8 MiB).
+    target_compile_options(alchemy-fx PRIVATE -include "${alchemy_fx_prelude}")
 endif()
 
 # Engine tests: Mach-O fixtures run in separate alchemy-fx processes.

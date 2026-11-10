@@ -11,6 +11,18 @@
 #include <cstddef>
 #include <cstdint>
 
+// Generated code calls host functions, and is called by them, with the Win64
+// calling convention (rcx, rdx, r8, r9; shadow space; rsi, rdi and xmm6-15
+// preserved): helpers, host callbacks and leaves, the entry stubs.
+// FX_GENERATED_ABI marks the C++ side of those calls: nothing on Windows,
+// where it is the native convention, and ms_abi on System V hosts, so the
+// compiler saves what Win64 code expects preserved.
+#if defined(_WIN32)
+#define FX_GENERATED_ABI
+#else
+#define FX_GENERATED_ABI __attribute__((ms_abi))
+#endif
+
 namespace transmute::fx {
 
 inline constexpr std::int32_t kContextBias = 128;

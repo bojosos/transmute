@@ -61,15 +61,6 @@ std::string base64_encode(std::span<const std::uint8_t> bytes) {
 // ---- dates (seconds since 2001-01-01 UTC <-> ISO 8601) ------------------------------------------------
 constexpr std::int64_t reference_epoch = 978307200;   // 2001-01-01T00:00:00Z in Unix time
 
-std::int64_t days_from_civil(std::int64_t y, unsigned m, unsigned d) {
-    y -= m <= 2;
-    const auto era = (y >= 0 ? y : y - 399) / 400;
-    const auto yoe = static_cast<unsigned>(y - era * 400);
-    const auto doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    const auto doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
-}
-
 std::string iso_date(double reference_seconds) {
     const auto unix_seconds = static_cast<std::int64_t>(std::floor(reference_seconds)) + reference_epoch;
     auto days = unix_seconds / 86400;

@@ -171,6 +171,8 @@ function(alchemy_gui_add_unit_test name)
     if(MSVC)
         target_compile_options(${name} PRIVATE /W3 /permissive-
             "/FI${PROJECT_SOURCE_DIR}/src/alchemy/fx/alchemy_fx_prelude.hpp")
+    else()
+        target_compile_options(${name} PRIVATE -include "${PROJECT_SOURCE_DIR}/src/alchemy/fx/alchemy_fx_prelude.hpp")
     endif()
     add_test(NAME ${name} COMMAND ${name})
     set_tests_properties(${name} PROPERTIES TIMEOUT ${unit_TIMEOUT})

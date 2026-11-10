@@ -194,4 +194,10 @@ std::wstring temp_directory() {
     return std::wstring(temp, n);
 }
 
+std::FILE* open_stdio(const std::wstring& path, const char* mode) noexcept {
+    wchar_t wide[8]{};
+    for (std::size_t i = 0; i + 1 < std::size(wide) && mode[i]; ++i) wide[i] = static_cast<wchar_t>(mode[i]);
+    return _wfopen(path.c_str(), wide);
+}
+
 } // namespace transmute::fx::host::file

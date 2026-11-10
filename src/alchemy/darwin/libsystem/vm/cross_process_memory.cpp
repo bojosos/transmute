@@ -15,7 +15,7 @@ namespace alchemy::xmem {
 namespace {
 
 // <mach/kern_return.h>, <mach/vm_prot.h>
-constexpr std::uint32_t kern_protection_failure = 2, kern_invalid_argument = 4, kern_not_supported = 46;
+constexpr std::uint32_t kern_protection_failure = 2, kern_invalid_argument = 4;
 constexpr std::uint32_t prot_read = 1, prot_write = 2, prot_execute = 4;
 constexpr std::uint64_t page = 16384;
 

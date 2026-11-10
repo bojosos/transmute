@@ -29,12 +29,20 @@ struct Plist {
     bool boolean{};
     std::vector<std::uint8_t> bytes;                    // data
     std::vector<Plist> items;                           // array
-    std::vector<std::pair<std::string, Plist>> entries; // dictionary (keys are strings)
+    // dictionary (keys are strings). Entry is {first: key, second: value}, not
+    // a std::pair, which would need Plist complete here.
+    struct Entry;
+    std::vector<Entry> entries;
 
     [[nodiscard]] const Plist* find(std::string_view key) const;
     Plist* find(std::string_view key);
     void set(std::string key, Plist value);
     bool erase(std::string_view key);
+};
+
+struct Plist::Entry {
+    std::string first;
+    Plist second;
 };
 
 // kCFPropertyListOpenStepFormat (read only) / kCFPropertyListXMLFormat_v1_0 / kCFPropertyListBinaryFormat_v1_0.

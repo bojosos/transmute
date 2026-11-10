@@ -9,7 +9,11 @@
 
 #include "transmute/fx/process.hpp"
 
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include "fx/seh/arm64_nt.hpp"
+#endif
 
 #include <cstddef>
 #include <cstdint>

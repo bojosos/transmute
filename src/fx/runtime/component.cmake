@@ -16,6 +16,9 @@ fx_add_library(fx_runtime
 )
 # fx_emit_fp: the FPCR/FPSR <-> MXCSR protocol (fp_mxcsr_for_state, fp_read_fpsr, ...).
 target_link_libraries(fx_runtime PUBLIC fx_common fx_emit_fp)
+if(NOT WIN32)
+    target_sources(fx_runtime PRIVATE ${CMAKE_CURRENT_LIST_DIR}/pe_absent.cpp)
+endif()
 
 # Tests provide stub definitions of the other components' functions
 # (translate_region, cache_*, loader_*, bind_unknown_host_target,

@@ -584,7 +584,7 @@ void install_libsystem_bsd_extra(Provider& p) {
         const auto size = static_cast<std::int32_t>(s.x[2]);
         std::int32_t count = 0;
         for (auto frame = s.x[0]; frame && !(frame & 15) && count < size && m.query_region(frame);) {
-            const auto next = m.read64(frame), address = m.read64(frame + 8) & 0x0000ffffffffffffULL;
+            const std::uint64_t next = m.read64(frame), address = m.read64(frame + 8) & 0x0000ffffffffffffULL;
             if (!address) break;
             m.write64(s.x[1] + static_cast<std::uint64_t>(count++) * 8, address);
             if (next <= frame) break;

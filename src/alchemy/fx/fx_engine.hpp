@@ -14,6 +14,7 @@
 
 #include "alchemy/call_regs.hpp"
 #include "transmute/a64.hpp"
+#include "transmute/fx/context.hpp"   // FX_GENERATED_ABI
 #include "transmute/jit.hpp"
 
 #include <cstdint>
@@ -204,7 +205,7 @@ public:
     // SVC slot or a native host-callback entry) and sets the resume pc.
     void invoke_synthetic(void* guest_context, std::uint64_t pc);
     // fx::HostCallback entry of a synthetic call (user = its guest address).
-    static void host_callback(fx::GuestContext& ctx, void* user);
+    static FX_GENERATED_ABI void host_callback(fx::GuestContext& ctx, void* user);
     // Gives the synthetic call at `pc` its native host-callback entry, once
     // (from its first call, which takes the SVC slot).
     void install_native_entry(std::uint64_t pc);

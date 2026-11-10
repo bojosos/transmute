@@ -48,7 +48,9 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_MSC_VER)
 #pragma comment(lib, "dbghelp.lib")
+#endif
 
 namespace transmute::fx::rt {
 namespace {
@@ -149,9 +151,9 @@ void reset_locked(Profile& p) {
 struct ReportFile {
     std::wstring path, temp;
     FILE* f = nullptr;
-    ReportFile(const std::wstring& target, const wchar_t* mode) : path(target) {
+    ReportFile(const std::wstring& target, const char* mode) : path(target) {
         temp = path + L".tmp" + std::to_wstring(host::process_id());
-        f = _wfopen(temp.c_str(), mode);
+        f = host::file::open_stdio(temp, mode);
     }
     // Closes and renames into place; false (temp removed) if anything failed.
     bool commit() {
@@ -238,14 +240,14 @@ void dump_regions(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ho
         if (!sample_region(rip, r)) continue;
         offsets[r.code].emplace_back(r.offset, n);
     }
-    ReportFile index_file(p.path + L".regions.txt", L"w");
+    ReportFile index_file(p.path + L".regions.txt", "w");
     FILE* index = index_file.f;
     if (!index) return;
     unsigned shown = 0;
     for (const auto& [code, n] : hot) {
         if (++shown > p.window.dump_regions) break;
         const RegionSample& r = p.region_info[code];
-        ReportFile bin(p.path + L".r" + std::to_wstring(shown) + L".bin", L"wb");
+        ReportFile bin(p.path + L".r" + std::to_wstring(shown) + L".bin", "wb");
         if (bin.f) {
             std::fwrite(reinterpret_cast<const void*>(r.code), 1, r.size, bin.f);
             bin.commit();
@@ -456,7 +458,7 @@ void write_footprint(FILE* f, const std::vector<std::pair<std::uint64_t, std::ui
 void write_report() {
     Profile& p = *g_profile;
     p.dirty = false;
-    ReportFile report(p.path, L"w");
+    ReportFile report(p.path, "w");
     FILE* f = report.f;
     if (!f) return;
     const double total = p.samples ? static_cast<double>(p.samples) : 1.0;

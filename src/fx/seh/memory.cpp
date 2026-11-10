@@ -1,26 +1,18 @@
 // Guarded guest memory access for the unwinder and dispatcher.
 
 #include "fx/seh/seh.hpp"
+#include "fx/host/guard.hpp"
 
 #include <cstring>
 
 namespace transmute::fx::seh {
 namespace {
 
-int filter_memory_fault(unsigned code) noexcept {
-    return (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR ||
-            code == EXCEPTION_GUARD_PAGE || code == EXCEPTION_DATATYPE_MISALIGNMENT)
-               ? EXCEPTION_EXECUTE_HANDLER
-               : EXCEPTION_CONTINUE_SEARCH;
-}
-
+// memcpy raises nothing but memory faults (access violations, in-page
+// errors, guard pages, misalignment), so any fault means the copy failed.
 bool copy_guarded(void* destination, const void* source, std::size_t size) noexcept {
-    __try {
-        std::memcpy(destination, source, size);
-        return true;
-    } __except (filter_memory_fault(GetExceptionCode())) {
-        return false;
-    }
+    host::FaultRecord fault{};
+    return host::call_guarded([&] { std::memcpy(destination, source, size); }, fault);
 }
 
 } // namespace

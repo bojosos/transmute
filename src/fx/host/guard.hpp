@@ -52,4 +52,6 @@ bool guarded_compare(const void* a, const void* b, std::size_t size, long long& 
 
 #if defined(TRANSMUTE_FX_HOST_WIN32)
 #include "fx/host/win32/guard.hpp"
+#elif defined(TRANSMUTE_FX_HOST_LINUX)
+#include "fx/host/linux/guard.hpp"
 #endif

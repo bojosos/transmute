@@ -1,4 +1,5 @@
 #include "alchemy/gui/install.hpp"
+#include "alchemy/host/process.hpp"
 #include "alchemy/darwin/metal/bridge.hpp"
 #include "alchemy/macho.hpp"
 #include "alchemy/msl/compiler.hpp"
@@ -15,14 +16,7 @@ namespace alchemy::gui {
 
 namespace {
 std::string environment_value(const char* name) {
-    char* buffer = nullptr;
-    std::size_t length = 0;
-    std::string value;
-    if (_dupenv_s(&buffer, &length, name) == 0 && buffer) {
-        value = buffer;
-        std::free(buffer);
-    }
-    return value;
+    return host::process::environment(name).value_or(std::string());
 }
 // The seed set of this executable: <root>/<LC_UUID>, root ALCHEMY_MSL_SEED
 // or %LOCALAPPDATA%\Alchemy\msl-seed.

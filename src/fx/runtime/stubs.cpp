@@ -46,7 +46,14 @@ const RegisterConvention& register_convention_absent() {
     return none;
 }
 } // namespace transmute::fx
+#if defined(_MSC_VER)
 #pragma comment(linker, "/alternatename:?translator_register_convention@fx@transmute@@YAAEBURegisterConvention@12@XZ=?register_convention_absent@fx@transmute@@YAAEBURegisterConvention@12@XZ")
+#else
+// A weak default the translator's definition replaces when it is linked.
+namespace transmute::fx {
+[[gnu::weak]] const RegisterConvention& translator_register_convention() { return register_convention_absent(); }
+} // namespace transmute::fx
+#endif
 
 namespace transmute::fx::rt {
 
@@ -359,11 +366,31 @@ void generate_stubs() {
 
     // ---- host_call_bridge --------------------------------------------------
     // Entered (by redirecting an execute fault) exactly as if the host had
-    // called the guest function: [rsp] = return address, Win64 arguments,
-    // r10 = guest target.
+    // called the guest function: [rsp] = return address, the host's own
+    // calling convention's arguments, r10 = guest target.
     a.align(16);
     const auto bridge_offset = a.size();
     std::vector<UnwindOp> bridge_ops;
+#if !defined(_WIN32)
+    // System V: rdi, rsi, rdx, rcx, r8, r9 and xmm0-7 go to a frame of
+    // 6 * 8 + 8 * 16 bytes (+ 8 to align), handed to an ordinary C++ entry.
+    constexpr std::int32_t kSysvRegs = 0, kSysvXmm = 48, kSysvFrame = 184;
+    a.sub(64, Gp::rsp, kSysvFrame);
+    const auto bridge_prolog = a.size() - bridge_offset;
+    bridge_ops.push_back({static_cast<std::uint8_t>(bridge_prolog), kAllocLarge, 0, kSysvFrame / 8});
+    const Gp sysv_args[] = {Gp::rdi, Gp::rsi, Gp::rdx, Gp::rcx, Gp::r8, Gp::r9};
+    for (unsigned i = 0; i < 6; ++i) a.mov(64, ptr(Gp::rsp, kSysvRegs + 8 * static_cast<std::int32_t>(i)), sysv_args[i]);
+    for (unsigned i = 0; i < 8; ++i) a.movdqu(ptr(Gp::rsp, kSysvXmm + 16 * static_cast<std::int32_t>(i)), x64::xmm(i));
+    a.mov(64, Gp::rdi, Gp::r10);
+    a.lea(64, Gp::rsi, ptr(Gp::rsp, kSysvRegs));
+    a.lea(64, Gp::rdx, ptr(Gp::rsp, kSysvFrame + 8));
+    a.lea(64, Gp::rcx, ptr(Gp::rsp, kSysvXmm));
+    a.mov_imm64(Gp::rax, reinterpret_cast<std::uint64_t>(&host_call_bridge_entry_sysv));
+    a.call(Gp::rax);
+    a.movdqu(x64::xmm(0), ptr(Gp::rsp, kSysvXmm));
+    a.add(64, Gp::rsp, kSysvFrame);
+    a.ret();
+#else
     a.mov(64, ptr(Gp::rsp, 8), Gp::rcx);
     a.mov(64, ptr(Gp::rsp, 16), Gp::rdx);
     a.mov(64, ptr(Gp::rsp, 24), Gp::r8);
@@ -381,6 +408,7 @@ void generate_stubs() {
     a.movdqu(x64::xmm(0), ptr(Gp::rsp, 32));
     a.add(64, Gp::rsp, kBridgeFrame);
     a.ret();
+#endif
     const auto bridge_end = a.size();
 
     a.finalize();

@@ -504,7 +504,7 @@ void AudioUnits::render(Unit& u, float* mix, std::uint32_t frames, std::uint32_t
         while (done < count) {
             const auto chunk = static_cast<std::uint32_t>(std::min<std::size_t>(count - done, u.max_frames));
             const auto base = buffers(u, chunk);
-            const auto list = base + 72, data = list + 8 + 16ULL * channel_buffers;
+            const std::uint64_t list = base + 72, data = list + 8 + 16ULL * channel_buffers;
             const auto buffer_bytes = static_cast<std::size_t>(chunk) * client.frame_bytes();
             m.write32(list, channel_buffers);
             for (std::uint32_t b = 0; b < channel_buffers; ++b) {

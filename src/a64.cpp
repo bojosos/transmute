@@ -181,7 +181,7 @@ std::uint64_t floating_minmax_bits(std::uint64_t lhs, std::uint64_t rhs,
         return (bits & exponent) == exponent && (bits & fraction) != 0;
     };
     const auto flush_input = [exponent, fraction, sign, &state](
-                                 std::uint64_t bits) {
+                                 std::uint64_t bits) -> std::uint64_t {
         if ((state.fpcr & (1U << 24)) != 0 &&
             (bits & exponent) == 0 && (bits & fraction) != 0) {
             record_fp_exception(state, 7, 15); // IDC / IDE
@@ -249,7 +249,7 @@ std::uint32_t floating_compare_flags(std::uint64_t lhs, std::uint64_t rhs,
         rhs = static_cast<std::uint32_t>(rhs);
     }
     const auto flush_input = [exponent, fraction, sign, &state](
-                                 std::uint64_t bits) {
+                                 std::uint64_t bits) -> std::uint64_t {
         if ((state.fpcr & (1U << 24)) != 0 &&
             (bits & exponent) == 0 && (bits & fraction) != 0) {
             record_fp_exception(state, 7, 15); // IDC / IDE
@@ -882,7 +882,7 @@ std::uint64_t floating_multiply_bits(std::uint64_t lhs, std::uint64_t rhs,
     const auto default_nan = infinity | quiet;
     const auto sign = (lhs ^ rhs) & sign_mask;
     const auto flush_input = [&state, infinity, fraction_mask, sign_mask](
-                                 std::uint64_t bits) {
+                                 std::uint64_t bits) -> std::uint64_t {
         if ((state.fpcr & (1U << 24)) != 0 &&
             (bits & infinity) == 0 && (bits & fraction_mask) != 0) {
             record_fp_exception(state, 7, 15); // IDC / IDE
@@ -971,7 +971,7 @@ std::uint64_t floating_multiply_bits(std::uint64_t lhs, std::uint64_t rhs,
         if (count == 64) return product.low != 0;
         return (product.low & ((1ULL << count) - 1)) != 0;
     };
-    const auto shift_right = [product](unsigned shift) {
+    const auto shift_right = [product](unsigned shift) -> std::uint64_t {
         if (shift >= 128) return 0ULL;
         if (shift >= 64) return product.high >> (shift - 64);
         if (shift == 0) return product.low;
@@ -1026,7 +1026,7 @@ std::uint64_t floating_add_sub_bits(std::uint64_t lhs, std::uint64_t rhs,
                           fraction_bits;
     const auto quiet = 1ULL << (fraction_bits - 1);
     const auto flush_input = [&state, infinity, fraction_mask, sign_mask](
-                                 std::uint64_t bits) {
+                                 std::uint64_t bits) -> std::uint64_t {
         if ((state.fpcr & (1U << 24)) != 0 &&
             (bits & infinity) == 0 && (bits & fraction_mask) != 0) {
             record_fp_exception(state, 7, 15); // IDC / IDE
@@ -1081,7 +1081,7 @@ std::uint64_t floating_add_sub_bits(std::uint64_t lhs, std::uint64_t rhs,
     const auto right_power = right_exp == 0 ? minimum_exponent :
                              static_cast<int>(right_exp) - bias;
     auto exponent = std::max(left_power, right_power);
-    const auto shift_right_jam = [](std::uint64_t value, unsigned distance) {
+    const auto shift_right_jam = [](std::uint64_t value, unsigned distance) -> std::uint64_t {
         if (distance == 0) return value;
         if (distance >= 64) return value != 0 ? 1ULL : 0ULL;
         return (value >> distance) |
@@ -1169,7 +1169,7 @@ std::uint64_t floating_divide_bits(std::uint64_t lhs, std::uint64_t rhs,
                           fraction_bits;
     const auto quiet = 1ULL << (fraction_bits - 1);
     const auto flush_input = [&state, infinity, fraction_mask, sign_mask](
-                                 std::uint64_t bits) {
+                                 std::uint64_t bits) -> std::uint64_t {
         if ((state.fpcr & (1U << 24)) != 0 &&
             (bits & infinity) == 0 && (bits & fraction_mask) != 0) {
             record_fp_exception(state, 7, 15); // IDC / IDE
@@ -1260,7 +1260,7 @@ std::uint64_t floating_divide_bits(std::uint64_t lhs, std::uint64_t rhs,
                        (infinity - (1ULL << fraction_bits)) | fraction_mask);
     };
     if (exponent > maximum_exponent) return overflow();
-    const auto shift_right_jam = [](std::uint64_t value, unsigned distance) {
+    const auto shift_right_jam = [](std::uint64_t value, unsigned distance) -> std::uint64_t {
         if (distance == 0) return value;
         if (distance >= 64) return value != 0 ? 1ULL : 0ULL;
         return (value >> distance) |
@@ -1373,7 +1373,7 @@ std::uint64_t floating_multiply_add_bits(std::uint64_t addend,
                           fraction_bits;
     const auto quiet = 1ULL << (fraction_bits - 1);
     const auto flush_input = [&state, infinity, fraction_mask, sign_mask](
-                                 std::uint64_t bits) {
+                                 std::uint64_t bits) -> std::uint64_t {
         if ((state.fpcr & (1U << 24)) != 0 &&
             (bits & infinity) == 0 && (bits & fraction_mask) != 0) {
             record_fp_exception(state, 7, 15); // IDC / IDE
@@ -1573,7 +1573,7 @@ std::uint64_t floating_reciprocal_step_bits(std::uint64_t lhs,
     const auto infinity = wide ? 0x7ff0000000000000ULL : 0x7f800000ULL;
     const auto fraction = wide ? 0x000fffffffffffffULL : 0x007fffffULL;
     const auto flush_input = [&state, sign_mask, infinity, fraction](
-                                 std::uint64_t bits) {
+                                 std::uint64_t bits) -> std::uint64_t {
         if ((state.fpcr & (1U << 24)) != 0 &&
             (bits & infinity) == 0 && (bits & fraction) != 0) {
             record_fp_exception(state, 7, 15); // IDC / IDE
@@ -4795,7 +4795,7 @@ bool ReferenceEngine::execute(std::uint32_t instruction) {
                 const auto maximum = vector_narrow_class == 0x0e214800U
                     ? (1LL << (destination_bytes * 8 - 1)) - 1
                     : static_cast<std::int64_t>(mask);
-                const auto clamped = std::clamp(signed_value, minimum, maximum);
+                const auto clamped = std::clamp<std::int64_t>(signed_value, minimum, maximum);
                 if (clamped != signed_value) state_.fpsr |= 1U << 27;
                 value = static_cast<std::uint64_t>(clamped) & mask;
             }
@@ -5781,7 +5781,7 @@ bool ReferenceEngine::execute(std::uint32_t instruction) {
                 }
                 if (rounding && remainder >= divisor / 2) ++shifted;
             }
-            const auto clamped = std::clamp(shifted, minimum, maximum);
+            const auto clamped = std::clamp<std::int64_t>(shifted, minimum, maximum);
             if (clamped != shifted) state_.fpsr |= 1U << 27;
             const auto destination_byte = (upper ? 8U : 0U) +
                                           lane * destination_bytes;

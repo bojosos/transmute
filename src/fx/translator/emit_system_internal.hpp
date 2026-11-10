@@ -150,12 +150,12 @@ bool describe_crypto(std::uint32_t word, InstructionUse& use);
 
 // ---- helpers (emit_system_helpers.cpp) ------------------------------------------
 std::uint64_t timer_multiplier();          // (nominal << 32) / tsc_hz, 0 if rdtsc unusable
-std::uint64_t helper_counter(GuestContext* ctx);
-void helper_ic_ivau(GuestContext* ctx, std::uint64_t address);
-void helper_ic_iallu(GuestContext* ctx);
-std::uint64_t helper_crc32(GuestContext* ctx, std::uint64_t acc, std::uint64_t data,
+FX_GENERATED_ABI std::uint64_t helper_counter(GuestContext* ctx);
+FX_GENERATED_ABI void helper_ic_ivau(GuestContext* ctx, std::uint64_t address);
+FX_GENERATED_ABI void helper_ic_iallu(GuestContext* ctx);
+FX_GENERATED_ABI std::uint64_t helper_crc32(GuestContext* ctx, std::uint64_t acc, std::uint64_t data,
                            std::uint64_t kind);
-void helper_crypto(GuestContext* ctx, std::uint64_t word);
+FX_GENERATED_ABI void helper_crypto(GuestContext* ctx, std::uint64_t word);
 
 // Software CRC32 (ISO-HDLC, reflected 0xEDB88320) / CRC32C (0x82F63B78) of
 // the low `bytes` bytes of `data`, as the A64 CRC32* instructions define them.

@@ -160,8 +160,8 @@ void arena_install_unwind(const std::vector<host::UnwindEntry>& precise, std::ui
 
 // ---- stubs ----------------------------------------------------------------------------
 // fx_enter(ctx, code, guest mxcsr) -> guest mxcsr at exit
-using EnterFn = std::uint32_t (*)(GuestContext* ctx, const void* code, std::uint32_t mxcsr);
-using AbortFn = void (*)(GuestContext* ctx);
+using EnterFn = std::uint32_t (FX_GENERATED_ABI*)(GuestContext* ctx, const void* code, std::uint32_t mxcsr);
+using AbortFn = void (FX_GENERATED_ABI*)(GuestContext* ctx);
 
 struct Stubs {
     EnterFn enter{};
@@ -531,10 +531,17 @@ void process_interrupts(GuestContext& ctx);
 // Called by the host-call bridge stub: target = guest function, args = Win64
 // argument slots (rcx, rdx, r8, r9 homed, then caller stack args), xmm =
 // xmm0..xmm3 (16 bytes each); xmm[0..1] receives v0 on return.
-std::uint64_t host_call_bridge_entry(std::uint64_t target, const std::uint64_t* args,
+FX_GENERATED_ABI std::uint64_t host_call_bridge_entry(std::uint64_t target, const std::uint64_t* args,
                                      std::uint64_t* xmm);
-void interpret_one_helper(GuestContext* ctx);
-void check_interrupt_helper(GuestContext* ctx);
+#if !defined(_WIN32)
+// The System V form of the bridge (a host call from System V code): regs =
+// rdi, rsi, rdx, rcx, r8, r9; stack = the caller's stack arguments; xmm =
+// xmm0..xmm7; xmm[0..1] receives v0 on return. An ordinary C++ function.
+std::uint64_t host_call_bridge_entry_sysv(std::uint64_t target, const std::uint64_t* regs, const std::uint64_t* stack,
+                                          std::uint64_t* xmm);
+#endif
+FX_GENERATED_ABI void interpret_one_helper(GuestContext* ctx);
+FX_GENERATED_ABI void check_interrupt_helper(GuestContext* ctx);
 
 // ---- exception handler ----------------------------------------------------------------------
 void veh_initialize();

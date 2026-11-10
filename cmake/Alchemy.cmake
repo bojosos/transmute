@@ -27,10 +27,15 @@ function(alchemy_hash_map_options target)
     target_compile_definitions(${target} PUBLIC ALCHEMY_ROBIN_MAP=$<BOOL:${ALCHEMY_ROBIN_MAP}>)
 endfunction()
 alchemy_hash_map_options(alchemy_core)
+# GCC and Clang: the warnings MSVC's /W4 also gives, as errors. Two of theirs
+# are off: captures Clang calls unneeded are ones MSVC requires (constexpr
+# locals used in lambdas), and member-wise designated initializers that leave
+# fields to their defaults are the house style.
+set(ALCHEMY_GNU_WARNINGS -Wall -Wextra -Werror -pedantic -Wno-unused-lambda-capture -Wno-missing-field-initializers)
 if(MSVC)
     target_compile_options(alchemy_core PRIVATE /W4 /WX /permissive-)
 else()
-    target_compile_options(alchemy_core PRIVATE -Wall -Wextra -Werror -pedantic)
+    target_compile_options(alchemy_core PRIVATE ${ALCHEMY_GNU_WARNINGS})
 endif()
 add_executable(alchemy src/alchemy/main.cpp)
 if(MSVC)
@@ -41,7 +46,7 @@ target_link_libraries(alchemy PRIVATE alchemy_core)
 if(MSVC)
     target_compile_options(alchemy PRIVATE /W4 /WX /permissive-)
 else()
-    target_compile_options(alchemy PRIVATE -Wall -Wextra -Werror -pedantic)
+    target_compile_options(alchemy PRIVATE ${ALCHEMY_GNU_WARNINGS})
 endif()
 
 if(BUILD_TESTING)

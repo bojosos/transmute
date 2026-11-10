@@ -1,9 +1,10 @@
 #include "fx/testing/harness.hpp"
 
 #include "fx/common/interpreter.hpp"
+#include "fx/host/vm.hpp"
+#include "transmute/fx/context.hpp"
 #include "fx/testing/test.hpp"
 
-#include <windows.h>
 
 #include <cstring>
 #include <sstream>
@@ -29,7 +30,7 @@ constexpr x64::Cond kSubConditions[14] = {
     x64::Cond::g, x64::Cond::le,
 };
 
-using EntryFn = void (*)(void* biased_context, const void* code, std::uint32_t mxcsr);
+using EntryFn = void (FX_GENERATED_ABI*)(void* biased_context, const void* code, std::uint32_t mxcsr);
 
 EntryFn entry_trampoline() {
     static EntryFn entry = [] {
@@ -52,11 +53,10 @@ EntryFn entry_trampoline() {
         for (int i = 7; i >= 0; --i) a.pop(saved[i]);
         a.ret();
         a.finalize();
-        auto* memory = static_cast<std::uint8_t*>(VirtualAlloc(
-            nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        auto* memory = static_cast<std::uint8_t*>(host::vm::allocate(nullptr, 4096, host::vm::kExecuteReadWrite));
         if (!memory) throw std::runtime_error("cannot allocate test trampoline");
         std::memcpy(memory, a.data(), a.size());
-        FlushInstructionCache(GetCurrentProcess(), memory, a.size());
+        host::vm::flush_instruction_cache(memory, a.size());
         return reinterpret_cast<EntryFn>(memory);
     }();
     return entry;
@@ -226,14 +226,13 @@ void MemoryEmitContext::begin_instruction(std::uint64_t pc) {
 // ---- Snippet ---------------------------------------------------------------
 
 Snippet::Snippet(const std::vector<std::uint8_t>& code) : size_(code.size()) {
-    code_ = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size_ + 16, MEM_COMMIT | MEM_RESERVE,
-                                                    PAGE_EXECUTE_READWRITE));
+    code_ = static_cast<std::uint8_t*>(host::vm::allocate(nullptr, size_ + 16, host::vm::kExecuteReadWrite));
     if (!code_) throw std::runtime_error("cannot allocate snippet memory");
     std::memcpy(code_, code.data(), size_);
-    FlushInstructionCache(GetCurrentProcess(), code_, size_);
+    host::vm::flush_instruction_cache(code_, size_);
 }
 
-Snippet::~Snippet() { if (code_) VirtualFree(code_, 0, MEM_RELEASE); }
+Snippet::~Snippet() { if (code_) host::vm::release(code_); }
 
 void Snippet::run(GuestContext& ctx, std::uint32_t mxcsr) const {
     entry_trampoline()(reinterpret_cast<char*>(&ctx) + kContextBias, code_, mxcsr);
@@ -333,10 +332,10 @@ bool compare_contexts(const GuestContext& expected, const GuestContext& actual,
 }
 
 Buffer::Buffer(std::size_t size) : size_(size) {
-    data_ = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    data_ = static_cast<std::uint8_t*>(host::vm::allocate(nullptr, size, host::vm::kReadWrite));
     if (!data_) throw std::runtime_error("cannot allocate test buffer");
 }
 
-Buffer::~Buffer() { if (data_) VirtualFree(data_, 0, MEM_RELEASE); }
+Buffer::~Buffer() { if (data_) host::vm::release(data_); }
 
 } // namespace transmute::fx::testing

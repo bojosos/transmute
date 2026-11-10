@@ -251,7 +251,8 @@ void set_background_thread_qos(void* thread) noexcept {
     static const bool eco = [] {
         wchar_t value[16] = {};
         const auto n = host::get_env(L"TRANSMUTE_FX_BACKGROUND_QOS", value, 16);
-        return n == 0 || n >= 16 || _wcsicmp(value, L"eco") == 0;
+        return n == 0 || n >= 16 ||
+               ((value[0] | 0x20) == L'e' && (value[1] | 0x20) == L'c' && (value[2] | 0x20) == L'o' && value[3] == 0);
     }();
     if (!eco) return;
     host::set_thread_eco_qos(thread);

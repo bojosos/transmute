@@ -56,7 +56,14 @@
 namespace transmute::fx {
 std::uint64_t cache_family_fingerprint_absent() { return 0; }
 }
+#if defined(_MSC_VER)
 #pragma comment(linker, "/alternatename:?translator_family_fingerprint@fx@transmute@@YA_KXZ=?cache_family_fingerprint_absent@fx@transmute@@YA_KXZ")
+#else
+// A weak default the translator's definition replaces when it is linked.
+namespace transmute::fx {
+[[gnu::weak]] std::uint64_t translator_family_fingerprint() { return cache_family_fingerprint_absent(); }
+}
+#endif
 
 namespace transmute::fx {
 namespace {

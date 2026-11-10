@@ -2,6 +2,8 @@
 # only way to the operating system. One backend per build, chosen here:
 #
 #   ALCHEMY_HOST=win32   Windows (the default on Windows)
+#   ALCHEMY_HOST=linux   Linux (docs/ALCHEMY_HOST_LINUX.md; in progress, so not
+#                        yet the default off Windows)
 #   ALCHEMY_HOST=null    every call fails with host::Error::unsupported; builds
 #                        on any compiler and proves that no OS header leaks out
 #                        of the backends (docs/ALCHEMY_HOST_LINUX.md)
@@ -17,8 +19,8 @@ if(WIN32)
 else()
     set(alchemy_host_default null)
 endif()
-set(ALCHEMY_HOST "${alchemy_host_default}" CACHE STRING "Alchemy host OS backend (win32, null)")
-set_property(CACHE ALCHEMY_HOST PROPERTY STRINGS win32 null)
+set(ALCHEMY_HOST "${alchemy_host_default}" CACHE STRING "Alchemy host OS backend (win32, linux, null)")
+set_property(CACHE ALCHEMY_HOST PROPERTY STRINGS win32 linux null)
 if(NOT IS_DIRECTORY "${PROJECT_SOURCE_DIR}/src/alchemy/host/${ALCHEMY_HOST}")
     message(FATAL_ERROR "ALCHEMY_HOST=${ALCHEMY_HOST}: no backend src/alchemy/host/${ALCHEMY_HOST}/")
 endif()
@@ -40,13 +42,21 @@ target_compile_definitions(alchemy_core PUBLIC ALCHEMY_HOST_${alchemy_host_upper
 set(ALCHEMY_HOST_POISON_DIRECTORY "")
 if(ALCHEMY_HOST STREQUAL "null")
     set(ALCHEMY_HOST_POISON_DIRECTORY "${CMAKE_BINARY_DIR}/alchemy-host-poison")
-    foreach(header IN ITEMS windows.h winsock2.h ws2tcpip.h mswsock.h afunix.h winhttp.h wininet.h bcrypt.h ncrypt.h
-                            wincrypt.h schannel.h sspi.h security.h mmdeviceapi.h audioclient.h functiondiscoverykeys_devpkey.h
-                            mmsystem.h mmreg.h d2d1.h d2d1_1.h d2d1_1helper.h dwrite.h dwrite_3.h wincodec.h dwmapi.h
-                            shlobj.h shellapi.h shlwapi.h shobjidl.h objbase.h combaseapi.h ole2.h oleauto.h propidl.h
-                            propvarutil.h iphlpapi.h windns.h winternl.h winioctl.h psapi.h tlhelp32.h sddl.h aclapi.h
-                            commctrl.h imm.h windowsx.h spellcheck.h realtimeapiset.h vulkan/vulkan_win32.h wrl/client.h
-                            unistd.h pthread.h dlfcn.h sys/mman.h sys/socket.h netinet/in.h arpa/inet.h)
+    file(REMOVE_RECURSE "${ALCHEMY_HOST_POISON_DIRECTORY}")
+    set(alchemy_host_poisoned windows.h winsock2.h ws2tcpip.h mswsock.h afunix.h winhttp.h wininet.h bcrypt.h ncrypt.h
+                              wincrypt.h schannel.h sspi.h security.h mmdeviceapi.h audioclient.h functiondiscoverykeys_devpkey.h
+                              mmsystem.h mmreg.h d2d1.h d2d1_1.h d2d1_1helper.h dwrite.h dwrite_3.h wincodec.h dwmapi.h
+                              shlobj.h shellapi.h shlwapi.h shobjidl.h objbase.h combaseapi.h ole2.h oleauto.h propidl.h
+                              propvarutil.h iphlpapi.h windns.h winternl.h winioctl.h psapi.h tlhelp32.h sddl.h aclapi.h
+                              commctrl.h imm.h windowsx.h spellcheck.h realtimeapiset.h vulkan/vulkan_win32.h wrl/client.h
+                              dlfcn.h sys/mman.h sys/socket.h netinet/in.h arpa/inet.h)
+    # On POSIX hosts the C++ standard library includes <unistd.h> and
+    # <pthread.h> itself (libstdc++'s gthr-posix.h), so only Windows poisons
+    # them; elsewhere scripts/check_host_boundary.ps1's scan covers them.
+    if(WIN32)
+        list(APPEND alchemy_host_poisoned unistd.h pthread.h)
+    endif()
+    foreach(header IN LISTS alchemy_host_poisoned)
         file(WRITE "${ALCHEMY_HOST_POISON_DIRECTORY}/${header}"
             "#error \"<${header}> is an OS header: only src/alchemy/host/<backend>/ may include it (ALCHEMY_HOST=null boundary check)\"\n")
     endforeach()

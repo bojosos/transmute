@@ -465,7 +465,12 @@ void spawn_general(const std::string& self) {
 // A process has ended once its exit code is set (before the host has torn it down);
 // one whose exit code is STILL_ACTIVE's 259 only once its handle is signalled.
 void exit_codes(const std::string& self) {
-    for (const std::uint32_t code : {7U, 259U}) {
+#if defined(ALCHEMY_HOST_WIN32)
+    const auto codes = {7U, 259U};
+#else   // POSIX exit statuses are 8 bits: there is no STILL_ACTIVE to confuse with
+    const auto codes = {7U};
+#endif
+    for (const std::uint32_t code : codes) {
         host::process::Spawn options;
         options.program = self;
         options.arguments = {"--exit-child", std::to_string(code)};
@@ -940,10 +945,17 @@ void real_backend() {
     const auto usage = host::process::usage();
     require(usage && usage->resident > 0 && usage->virtual_size > 0, "this process's usage");
     // Priority classes as nice values, and the calling thread's background mode.
-    require(host::process::set_priority(5) && *host::process::priority() == 5 && host::process::set_priority(0) &&
-            *host::process::priority() == 0, "set_priority and priority");
-    require(host::process::set_background(false, true) && host::process::set_background(false, true) &&
-            host::process::set_background(false, false), "set_background on the calling thread");
+    require(host::process::set_priority(5) && *host::process::priority() == 5, "set_priority and priority");
+    // Raising it again needs privilege on POSIX hosts (as on Darwin): an unprivileged process may be refused.
+    const auto restored = host::process::set_priority(0);
+    require((restored && *host::process::priority() == 0) ||
+                restored.error() == host::Error::access_denied || restored.error() == host::Error::permission,
+            "set_priority back to 0");
+    require(host::process::set_background(false, true) && host::process::set_background(false, true),
+            "set_background on the calling thread");
+    const auto foreground = host::process::set_background(false, false);   // may need privilege on POSIX hosts
+    require(foreground || foreground.error() == host::Error::access_denied || foreground.error() == host::Error::permission,
+            "set_background back to the foreground");
     const auto processes = host::process::list();
     bool listed = false;
     if (processes) for (const auto& entry : *processes) listed = listed || entry.pid == host::process::current_pid();
@@ -980,10 +992,15 @@ void real_backend() {
     {
         const auto before = host::process::memory_usage();
         std::vector<char> block(8 << 20, 1);   // 8 MiB from malloc
+        // A volatile access keeps the compiler from eliding the allocation (Clang does).
+        static_cast<void>(*static_cast<volatile char*>(block.data() + block.size() - 1));
         const auto after = host::process::memory_usage();
         require(before && after && after->heap_committed_bytes >= before->heap_committed_bytes &&
                     after->private_bytes >= after->heap_committed_bytes && after->private_bytes > before->private_bytes + (6 << 20),
-                "memory_usage counts private bytes and the heap");
+                "memory_usage counts private bytes and the heap (private " +
+                    std::to_string(before ? before->private_bytes : 0) + " -> " + std::to_string(after ? after->private_bytes : 0) +
+                    ", heap " + std::to_string(before ? before->heap_committed_bytes : 0) + " -> " +
+                    std::to_string(after ? after->heap_committed_bytes : 0) + ")");
         static_cast<void>(block);
     }
 

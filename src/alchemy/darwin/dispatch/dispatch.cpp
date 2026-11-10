@@ -613,7 +613,12 @@ struct Dispatch : std::enable_shared_from_this<Dispatch> {
     }
 
     // ---- queues -------------------------------------------------------------
-    std::uint64_t new_queue(Kind kind, std::string_view label, bool immortal, const Attribute& attribute = {}) {
+    // (An overload, not a defaulted Attribute argument: Clang needs Attribute's
+    // member initializers before Dispatch is complete.)
+    std::uint64_t new_queue(Kind kind, std::string_view label, bool immortal) {
+        return new_queue(kind, label, immortal, Attribute{});
+    }
+    std::uint64_t new_queue(Kind kind, std::string_view label, bool immortal, const Attribute& attribute) {
         auto queue = std::make_shared<Queue>();
         queue->kind = kind; queue->immortal = immortal;
         queue->qos = attribute.qos;

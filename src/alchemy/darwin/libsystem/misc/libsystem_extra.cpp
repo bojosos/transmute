@@ -37,7 +37,7 @@ namespace alchemy {
 namespace {
 constexpr std::string_view system_library = "/usr/lib/libSystem.B.dylib";
 constexpr std::string_view objc_library = "/usr/lib/libobjc.A.dylib";
-constexpr std::uint32_t enoent = 2, esrch = 3, eio = 5, echild = 10, enomem = 12, efault = 14,
+constexpr std::uint32_t esrch = 3, eio = 5, enomem = 12, efault = 14,
     einval = 22, erange = 34, enosys = 78;
 constexpr std::uint64_t string_limit = 1024 * 1024;
 constexpr std::uint64_t page_size = 16384;
@@ -582,7 +582,7 @@ std::uint64_t private_code(ProcessContext& context, std::span<const std::uint32_
 }
 
 // ---- Mach -------------------------------------------------------------------------
-constexpr std::uint64_t kern_success = 0, kern_invalid_argument = 4, kern_aborted = 14, kern_invalid_name = 15,
+constexpr std::uint64_t kern_success = 0, kern_invalid_argument = 4, kern_aborted = 14,
     kern_terminated = 37, kern_not_supported = 46, kern_operation_timed_out = 49;
 constexpr std::uint32_t task_port = libsystem::headless_task_port, host_port = 0xa1c3, system_clock_port = 0xa1d1, calendar_clock_port = 0xa1d3;
 

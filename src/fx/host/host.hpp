@@ -7,7 +7,7 @@
 // Rules:
 // - Only src/fx/host/<backend>/ includes OS headers. Every other fx file uses
 //   the headers in src/fx/host/.
-// - One backend is compiled in, chosen by CMake (TRANSMUTE_FX_HOST=win32,
+// - One backend is compiled in, chosen by CMake (TRANSMUTE_FX_HOST=win32|linux,
 //   src/fx/host/component.cmake). There are no virtual calls: a header
 //   declares free functions or small concrete classes, and the backend
 //   defines them. Calls on hot paths (locks, the tick counter, guarded
@@ -23,13 +23,15 @@
 
 #if defined(TRANSMUTE_FX_HOST_WIN32)
 #define TRANSMUTE_FX_HOST_BACKEND "win32"
+#elif defined(TRANSMUTE_FX_HOST_LINUX)
+#define TRANSMUTE_FX_HOST_BACKEND "linux"
 #else
 #error "fx: no host backend selected (TRANSMUTE_FX_HOST, src/fx/host/component.cmake)"
 #endif
 
 namespace transmute::fx::host {
 
-// The backend compiled in ("win32").
+// The backend compiled in ("win32", "linux").
 inline constexpr const char* kBackend = TRANSMUTE_FX_HOST_BACKEND;
 
 } // namespace transmute::fx::host

@@ -1,4 +1,6 @@
 #include "alchemy/darwin/kit/support/support_kit.hpp"
+#include "alchemy/host/process.hpp"
+#include "alchemy/path.hpp"
 
 #include "alchemy/darwin/quartzcore/layer_tree.hpp"
 #include "alchemy/darwin/quartzcore/presenter.hpp"
@@ -91,11 +93,9 @@ WindowServer* server_or_null() noexcept {
 
 const std::filesystem::path& capture_directory() {
     static const std::filesystem::path directory = [] {
-        char* value = nullptr;
-        std::size_t length = 0;
-        if (_dupenv_s(&value, &length, "ALCHEMY_CONTENTS_CAPTURE") != 0 || value == nullptr) return std::filesystem::path{};
-        std::filesystem::path result(value);
-        std::free(value);
+        const auto value = host::process::environment("ALCHEMY_CONTENTS_CAPTURE");
+        if (!value) return std::filesystem::path{};
+        std::filesystem::path result = utf8_path(*value);
         if (!result.empty()) std::filesystem::create_directories(result);
         return result;
     }();
@@ -320,11 +320,8 @@ void resolve(Support& support, quartzcore::tree::Layer& layer, std::vector<std::
 // 50th, print their trees (geometry, visibility, contents and a sample of their pixels).
 bool layer_trace_enabled() {
     static const bool enabled = [] {
-        char* value = nullptr;
-        std::size_t length = 0;
-        const bool set = _dupenv_s(&value, &length, "ALCHEMY_TRACE_LAYERS") == 0 && value && *value && *value != '0';
-        std::free(value);
-        return set;
+        const auto value = host::process::environment("ALCHEMY_TRACE_LAYERS");
+        return value && !value->empty() && (*value)[0] != '0';
     }();
     return enabled;
 }

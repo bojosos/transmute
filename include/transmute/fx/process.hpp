@@ -110,7 +110,7 @@ void register_host_entry(std::uint64_t guest_pc, const void* host_code);
 // exit_to_dispatcher. When it returns, execution continues at ctx.x[30]
 // (through the return-stack buffer), or at ctx.pc if the callback changed
 // ctx.pc. Registering a pc again replaces the entry.
-using HostCallback = void (*)(GuestContext& ctx, void* user);
+using HostCallback = void (FX_GENERATED_ABI*)(GuestContext& ctx, void* user);
 void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void* user);
 // A leaf in front of a host callback, for calls that only read and write
 // integer argument and result registers (x0..x9 in ctx; sp in x[31], read
@@ -124,10 +124,10 @@ void register_host_callback(std::uint64_t guest_pc, HostCallback callback, void*
 // runs `callback` exactly as register_host_callback would. When the
 // convention holds some of x0..x9 (TRANSMUTE_FX_GLOBALS), the entry stores
 // them to their context slots before the leaf and loads them back after it.
-using HostLeaf = bool (*)(GuestContext& ctx);
+using HostLeaf = bool (FX_GENERATED_ABI*)(GuestContext& ctx);
 void register_host_leaf(std::uint64_t guest_pc, HostLeaf leaf, HostCallback callback, void* user);
 // The same with `leaf_data` passed to the leaf (its second argument).
-using HostLeafWithData = bool (*)(GuestContext& ctx, void* leaf_data);
+using HostLeafWithData = bool (FX_GENERATED_ABI*)(GuestContext& ctx, void* leaf_data);
 void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* leaf_data, HostCallback callback, void* user);
 // Removes a register_host_entry / register_host_callback entry (no-op if
 // `guest_pc` has none). Exits linked to it are unlinked; the next branch to

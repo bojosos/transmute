@@ -80,11 +80,9 @@ std::string host_stack(std::uint64_t id) {
 } // namespace
 
 void install_wait_trace(Support& support) {
-    char* value = nullptr;
-    std::size_t length = 0;
-    if (_dupenv_s(&value, &length, "ALCHEMY_WAIT_DUMP") != 0 || value == nullptr) return;
-    const auto seconds = std::max(1L, std::strtol(value, nullptr, 10));
-    std::free(value);
+    const auto value = host::process::environment("ALCHEMY_WAIT_DUMP");
+    if (!value) return;
+    const auto seconds = std::max(1L, std::strtol(value->c_str(), nullptr, 10));
     auto* s = &support;
     for (const auto* name : {"_pthread_cond_wait", "_pthread_cond_timedwait", "_dispatch_semaphore_wait", "_semaphore_wait",
                              "___ulock_wait", "_pthread_join", "_dispatch_group_wait", "_usleep", "_nanosleep", "_sched_yield",
@@ -212,11 +210,8 @@ void install_wait_trace(Support& support) {
     // ALCHEMY_WRITE_MARK=<text>: a write(2) whose bytes contain <text>
     // prints the writing host thread and its guest backtrace (which thread
     // logged a given line).
-    char* mark_value = nullptr;
-    std::size_t mark_length = 0;
-    if (_dupenv_s(&mark_value, &mark_length, "ALCHEMY_WRITE_MARK") == 0 && mark_value) {
-        const std::string mark = mark_value;
-        std::free(mark_value);
+    if (const auto mark_value = host::process::environment("ALCHEMY_WRITE_MARK")) {
+        const std::string mark = *mark_value;
         // (function, register holding the bytes, length: register index or -1 for a C string, element-size register or -1)
         struct Writer { const char* name; int bytes; int length; int size; };
         for (const auto writer : {Writer{"_write", 1, 2, -1}, Writer{"_fwrite", 0, 2, 1}, Writer{"_fputs", 0, -1, -1}, Writer{"_puts", 0, -1, -1}}) {

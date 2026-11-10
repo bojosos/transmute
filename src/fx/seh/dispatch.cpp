@@ -299,7 +299,7 @@ std::uint32_t dispatch_to_handler(BoundaryKind kind, const Arm64Context& continu
     dispatcher.HandlerData = reinterpret_cast<PVOID>(static_cast<std::uintptr_t>(handler_data));
     dispatcher.HistoryTable = nullptr;
     dispatcher.ScopeIndex = 0;
-    dispatcher.ControlPcIsUnwound = control_pc_is_unwound ? TRUE : FALSE;
+    dispatcher.ControlPcIsUnwound = control_pc_is_unwound ? 1 : 0;
     dispatcher.NonVolatileRegisters = reinterpret_cast<PBYTE>(static_cast<std::uintptr_t>(nonvol_address));
     const std::uint64_t dispatcher_address = allocate_guest_scratch(sizeof(dispatcher), 16);
     write_guest(dispatcher_address, &dispatcher, sizeof(dispatcher));

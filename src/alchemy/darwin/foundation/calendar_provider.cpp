@@ -513,7 +513,7 @@ void install_calendars(Support& support) {
         case calendar::quarter: return {1, 4};
         case calendar::week_of_year: return {1, maximum ? 53u : 52u};
         case calendar::week_of_month: return {1, maximum ? 6u : 4u};
-        default: return {cf_not_found, cf_not_found};
+        default: return {Address{cf_not_found}, Address{cf_not_found}};
         }
     };
     support.function(cf_library, "_CFCalendarGetMinimumRangeOfUnit", [limits](CpuState& s, GuestMemory&) {

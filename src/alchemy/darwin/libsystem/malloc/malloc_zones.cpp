@@ -600,7 +600,7 @@ void install_malloc_zones(ProcessContext& context, HostHeap heap, std::uint64_t 
         const auto function = introspection(s.x[0], zone_layout::introspection::enable_discharge_checking);
         if (!function) return std::uint64_t{0};
         const std::array<std::uint64_t, 1> arguments{s.x[0]};
-        return zones->call(function, arguments) & 0xffffffffULL;
+        return zones->call(function, arguments) & std::uint64_t{0xffffffff};
     });
     for (const auto& [name, member] : std::array<std::pair<const char*, std::uint64_t>, 2>{{
              {"_malloc_zone_disable_discharge_checking", zone_layout::introspection::disable_discharge_checking},
@@ -621,7 +621,7 @@ void install_malloc_zones(ProcessContext& context, HostHeap heap, std::uint64_t 
         if (s.x[0] != zones->system() && zones->version(s.x[0]) >= 10)
             if (const auto function = zones->slot(s.x[0], zone_layout::claimed_address)) {
                 const std::array<std::uint64_t, 2> arguments{s.x[0], s.x[1]};
-                return zones->call(function, arguments) & 0xffffffffULL;
+                return zones->call(function, arguments) & std::uint64_t{0xffffffff};
             }
         return std::uint64_t{zones->owner(s.x[1]) == s.x[0] ? 1U : 0U};
     });

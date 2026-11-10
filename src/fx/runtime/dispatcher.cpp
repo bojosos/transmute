@@ -6,6 +6,7 @@
 #include "fx/runtime/runtime_internal.hpp"
 #include "fx/translator/emit_fp.hpp"
 #include "fx/host/env.hpp"
+#include "fx/host/process.hpp"
 #include "fx/host/text.hpp"
 #include "fx/host/vm.hpp"
 
@@ -138,7 +139,12 @@ void raise_misaligned(GuestContext& ctx) {
 
 void raise_brk(GuestContext& ctx, std::uint32_t immediate) {
     switch (immediate) {
-    case 0xf003: __fastfail(static_cast<unsigned>(ctx.x[0]));     // __fastfail: terminate like native
+    case 0xf003:   // __fastfail: terminate like native
+#if defined(_MSC_VER)
+        __fastfail(static_cast<unsigned>(ctx.x[0]));
+#else
+        host::terminate_process(0xC0000409u);   // STATUS_STACK_BUFFER_OVERRUN, as __fastfail reports
+#endif
     case 0xf001: raise_simple(ctx, kStatusAssertionFailure); return;
     case 0xf004: raise_simple(ctx, kStatusIntegerDivideByZero); return;
     default: raise_simple(ctx, kStatusBreakpoint, 1, 0); return;
@@ -478,6 +484,36 @@ std::uint64_t host_call_bridge_entry(std::uint64_t target, const std::uint64_t* 
     return ctx.x[0];
 }
 
+#if !defined(_WIN32)
+std::uint64_t host_call_bridge_entry_sysv(std::uint64_t target, const std::uint64_t* regs, const std::uint64_t* stack,
+                                          std::uint64_t* xmm) {
+    count(g_counters.host_callbacks);
+    GuestContext& ctx = ensure_thread_context();
+    SavedState saved;
+    save_state(ctx, saved);
+    // Positional integer marshalling: the six argument registers -> x0..x5,
+    // the caller's stack slots -> x6, x7 and then the guest stack (only those
+    // inside the host stack), xmm0..7 -> v0..v7.
+    const auto stack_end = host::thread_stack_base();
+    const auto slots_available = (stack_end - reinterpret_cast<std::uint64_t>(stack)) / 8;
+    const auto stack_slots = static_cast<std::size_t>(std::min<std::uint64_t>(10, slots_available));
+    std::uint64_t values[16] = {};
+    std::memcpy(values, regs, 6 * 8);
+    std::memcpy(values + 6, stack, stack_slots * 8);
+    const auto slots = 6 + stack_slots;
+    push_stack_args(ctx, values + 8, slots > 8 ? slots - 8 : 0);
+    for (unsigned i = 0; i < 8; ++i) ctx.x[i] = values[i];
+    for (unsigned i = 0; i < 8; ++i) {
+        ctx.v[i][0] = xmm[2 * i];
+        ctx.v[i][1] = xmm[2 * i + 1];
+    }
+    invoke(ctx, target, saved);
+    xmm[0] = ctx.v[0][0];
+    xmm[1] = ctx.v[0][1];
+    return ctx.x[0];
+}
+#endif
+
 // helper_interpret_one: the instruction at ctx->pc, without leaving translated code.
 void interpret_one_helper(GuestContext* ctx) {
     fp_sync_fpsr(*ctx);   // cumulative MXCSR flags -> ctx.fpsr before the interpreter runs
@@ -534,7 +570,11 @@ void set_svc_handler(SvcHandler handler) { rt::g_svc_handler.store(handler, std:
     ctx.exit_reason = static_cast<std::uint32_t>(reason);
     ctx.exit_arg = arg;
     rt::g_stubs.abort_to_dispatcher(&ctx);
+#if defined(_MSC_VER)
     __assume(0);
+#else
+    __builtin_unreachable();
+#endif
 }
 
 void call_guest_prepared(GuestContext& ctx, std::uint64_t entry) {

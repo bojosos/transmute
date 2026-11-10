@@ -10,7 +10,9 @@ list(APPEND ALCHEMY_GUI_SOURCES
 # System libraries of every supported Windows version (user32/gdi32 for
 # windows and input, imm32 for IME, ole32/shell32 for file drops, shcore for
 # per-monitor DPI). Nothing touches them before the guest asks for a window.
-list(APPEND ALCHEMY_GUI_LINK_LIBRARIES user32 gdi32 imm32 ole32 shell32 shcore dwmapi)
+if(WIN32)
+    list(APPEND ALCHEMY_GUI_LINK_LIBRARIES user32 gdi32 imm32 ole32 shell32 shcore dwmapi)
+endif()
 function(alchemy_gui_windowserver_tests)
     alchemy_gui_add_unit_test(alchemy_gui_windowserver_smoke
         src/alchemy/darwin/windowserver/tests/windowserver_smoke_tests.cpp)

@@ -1287,7 +1287,7 @@ struct ObjcRuntime::Impl {
     // globals or at the metadata's field offset vector, which therefore receive the slid offsets.
     void slide_ivars(Address address) {
         auto& memory = process.main_engine();
-        const auto super = memory.read64(address + 8), ro = memory.read64(address + 32) & ~7ULL;
+        const std::uint64_t super = memory.read64(address + 8), ro = memory.read64(address + 32) & ~std::uint64_t{7};
         if (!super || !ro || (memory.read32(ro) & 1U)) return;   // root classes and metaclasses (RO_META)
         std::uint32_t super_size{};
         {

@@ -3,7 +3,7 @@
 #include "fx/host/vm.hpp"
 #include "transmute/a64.hpp"
 
-#include <intrin.h>
+#include "transmute/intrinsics.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -137,10 +137,10 @@ std::uint64_t atomic_cas(std::uint64_t address, unsigned bytes, std::uint64_t ex
 // 128-bit compare-exchange (lock cmpxchg16b). value[0] = low, value[1] = high.
 // On return `expected` holds the old memory value.
 bool atomic_cas128(std::uint64_t address, std::uint64_t expected[2], const std::uint64_t desired[2]) {
-    auto* target = reinterpret_cast<volatile long long*>(static_cast<std::uintptr_t>(address));
-    long long comparand[2] = {static_cast<long long>(expected[0]), static_cast<long long>(expected[1])};
-    const bool ok = _InterlockedCompareExchange128(target, static_cast<long long>(desired[1]),
-                                                   static_cast<long long>(desired[0]), comparand) != 0;
+    auto* target = reinterpret_cast<volatile std::int64_t*>(static_cast<std::uintptr_t>(address));
+    std::int64_t comparand[2] = {static_cast<std::int64_t>(expected[0]), static_cast<std::int64_t>(expected[1])};
+    const bool ok = compare_exchange_128(target, static_cast<std::int64_t>(desired[1]),
+                                         static_cast<std::int64_t>(desired[0]), comparand);
     expected[0] = static_cast<std::uint64_t>(comparand[0]);
     expected[1] = static_cast<std::uint64_t>(comparand[1]);
     return ok;

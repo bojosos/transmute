@@ -51,7 +51,8 @@ void set_background_thread_qos(host::ThreadHandle thread) noexcept {
     static const bool eco = [] {
         char value[16] = {};
         const auto n = host::get_env("TRANSMUTE_FX_BACKGROUND_QOS", value, sizeof(value));
-        return n == 0 || n >= sizeof(value) || _stricmp(value, "eco") == 0;
+        return n == 0 || n >= sizeof(value) ||
+               ((value[0] | 0x20) == 'e' && (value[1] | 0x20) == 'c' && (value[2] | 0x20) == 'o' && value[3] == 0);
     }();
     if (!eco) return;
     host::set_thread_eco_qos(thread);

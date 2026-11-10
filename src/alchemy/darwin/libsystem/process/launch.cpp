@@ -28,8 +28,8 @@
 namespace alchemy {
 namespace {
 
-constexpr std::uint32_t eperm = 1, enoent = 2, eio = 5, e2big = 7, enoexec = 8, ebadf = 9, enomem = 12,
-    eacces = 13, einval = 22, enotdir = 20, eisdir = 21, emfile = 24, enametoolong = 63, enosys = 78;
+constexpr std::uint32_t eperm = 1, enoent = 2, eio = 5, e2big = 7, enoexec = 8, enomem = 12,
+    eacces = 13, einval = 22;
 
 std::string lower(std::string value) {
     for (auto& c : value) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');

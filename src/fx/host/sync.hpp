@@ -25,6 +25,8 @@
 
 #if defined(TRANSMUTE_FX_HOST_WIN32)
 #include "fx/host/win32/sync.hpp"
+#elif defined(TRANSMUTE_FX_HOST_LINUX)
+#include "fx/host/linux/sync.hpp"
 #endif
 
 namespace transmute::fx::host {

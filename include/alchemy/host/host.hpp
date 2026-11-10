@@ -13,7 +13,7 @@
 // - The API speaks host-neutral types: Handle, Error, byte spans, UTF-8
 //   paths and strings. Never Darwin types (errno values, struct stat,
 //   kern_return_t: the macOS layer translates) and never OS types.
-// - One backend is compiled in, chosen by CMake (ALCHEMY_HOST=win32|null).
+// - One backend is compiled in, chosen by CMake (ALCHEMY_HOST=win32|linux|null).
 //   Headers declare free functions and small concrete classes that the
 //   backend defines: no virtual calls, so a host call costs what the OS call
 //   costs. Inline helpers here must not depend on the backend.
@@ -37,7 +37,7 @@
 
 namespace alchemy::host {
 
-// The backend compiled in ("win32", "null").
+// The backend compiled in ("win32", "linux", "null").
 [[nodiscard]] std::string_view backend() noexcept;
 
 // Host-neutral failure reasons. They name POSIX error kinds (the macOS layer

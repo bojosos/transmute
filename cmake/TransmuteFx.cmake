@@ -15,8 +15,12 @@ add_library(fx_oracle STATIC
     src/jit_simd_fusion.cpp
     src/jit_fp.cpp
     src/jit_atomic.cpp
-    src/jit_x64_windows.cpp
 )
+if(WIN32)
+    target_sources(fx_oracle PRIVATE src/jit_x64_windows.cpp)
+else()
+    target_sources(fx_oracle PRIVATE src/jit_x64_unavailable.cpp)
+endif()
 target_include_directories(fx_oracle PUBLIC ${PROJECT_SOURCE_DIR}/include PRIVATE ${PROJECT_SOURCE_DIR}/src)
 if(MSVC)
     target_compile_options(fx_oracle PRIVATE /permissive- /W3)
@@ -89,6 +93,14 @@ set(FX_COMPONENT_FILES
     src/fx/cache/component.cmake
     tests/fx/component.cmake
 )
+# The PE guest personality (docs/FX_HOST_SEAMS.md) implements Windows for
+# Windows ARM64 guests by binding them to the host's own Win32 DLLs: it exists
+# on Windows hosts only. Elsewhere the runtime's loader hooks and the external
+# (Mach-O) module registry are in src/fx/runtime/pe_absent.cpp. seh, the guest
+# exception model, serves Mach-O guests too and builds everywhere.
+if(NOT WIN32)
+    list(REMOVE_ITEM FX_COMPONENT_FILES src/fx/loader/component.cmake src/fx/abi/component.cmake)
+endif()
 foreach(component_file IN LISTS FX_COMPONENT_FILES)
     if(EXISTS ${PROJECT_SOURCE_DIR}/${component_file})
         include(${PROJECT_SOURCE_DIR}/${component_file})
@@ -97,7 +109,7 @@ endforeach()
 
 # Integration executable. Links whichever component libraries exist; the
 # loader component provides src/fx/loader/main.cpp.
-if(EXISTS ${PROJECT_SOURCE_DIR}/src/fx/loader/main.cpp)
+if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/src/fx/loader/main.cpp)
     add_executable(transmute-fx src/fx/loader/main.cpp)
     fx_component_options(transmute-fx)
     foreach(lib fx_loader fx_runtime fx_abi fx_seh fx_cache fx_translator

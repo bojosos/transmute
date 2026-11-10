@@ -441,7 +441,7 @@ void install_darwin_support(ProcessContext& context) {
     for (const auto bounded : {false, true}) for (const auto localized : {false, true})
         missing(std::string(bounded ? "_strncasecmp" : "_strcasecmp") + (localized ? "_l" : ""), [state, bounded, localized](auto& s, auto& m) {
             if (localized) {
-                const std::array arguments{0ULL, s.x[bounded ? 3 : 2]};
+                const std::array<std::uint64_t, 2> arguments{0, s.x[bounded ? 3 : 2]};
                 if (state->call("_tolower_l", arguments) != 0) throw SupportError{einval};
             }
             const auto maximum = bounded ? std::min(s.x[2], string_limit) : string_limit;
@@ -470,7 +470,7 @@ void install_darwin_support(ProcessContext& context) {
         return std::uint64_t{0};
     }, 0);
     install(state, "___sprintf_chk", [state](auto& s, auto&) {
-        const std::array probe{0ULL, 0ULL, s.x[3], s.sp}; const auto count = state->call("_vsnprintf", probe);
+        const std::array<std::uint64_t, 4> probe{0, 0, s.x[3], s.sp}; const auto count = state->call("_vsnprintf", probe);
         if (count == UINT32_MAX || count == UINT64_MAX) return count;
         if (count >= s.x[2]) throw std::runtime_error("Darwin fortified sprintf exceeds destination bound");
         const std::array arguments{s.x[0], s.x[2], s.x[3], s.sp}; return state->call("_vsnprintf", arguments);
@@ -512,7 +512,7 @@ void install_darwin_support(ProcessContext& context) {
     }, 0);
     for (const auto narrow : {false, true}) install(state, narrow ? "_wcstombs" : "_mbstowcs", [state, narrow](auto& s, auto& m) {
         const auto cell = state->context.allocate_guest(8);
-        try { m.write64(cell, s.x[1]); const std::array arguments{s.x[0], cell, s.x[2], 0ULL}; const auto result = state->call(narrow ? "_wcsrtombs" : "_mbsrtowcs", arguments); state->context.release_guest(cell); return result; }
+        try { m.write64(cell, s.x[1]); const std::array<std::uint64_t, 4> arguments{s.x[0], cell, s.x[2], 0}; const auto result = state->call(narrow ? "_wcsrtombs" : "_mbsrtowcs", arguments); state->context.release_guest(cell); return result; }
         catch (...) { state->context.release_guest(cell); throw; }
     });
     install(state, "_memset_pattern16", [](auto& s, auto& m) { if (s.x[2] > transfer_limit) throw SupportError{einval}; std::array<std::uint8_t, 16> pattern{}; m.read_bytes(s.x[1], pattern); for (std::uint64_t at = 0; at < s.x[2]; at += 16) m.write_bytes(add(s.x[0], at), std::span(pattern).first(static_cast<std::size_t>(std::min<std::uint64_t>(16, s.x[2] - at)))); return s.x[0]; });

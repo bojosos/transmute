@@ -71,4 +71,6 @@ void trace_fault(const FaultRecord& record, const CpuContext& context, bool (*an
 
 #if defined(TRANSMUTE_FX_HOST_WIN32)
 #include "fx/host/win32/fault.hpp"
+#elif defined(TRANSMUTE_FX_HOST_LINUX)
+#include "fx/host/linux/fault.hpp"
 #endif

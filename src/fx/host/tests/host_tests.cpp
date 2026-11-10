@@ -120,12 +120,16 @@ FX_TEST(host_thread_block_and_stack) {
     const auto here = reinterpret_cast<std::uint64_t>(&local);
     FX_CHECK(host::thread_stack_base() > here);
     FX_CHECK(host::thread_stack_base() - here < (64u << 20));
+#if defined(TRANSMUTE_FX_HOST_WIN32)   // the linux backend has no thread environment block
     void* teb = host::thread_block();
     FX_CHECK(teb != nullptr);
     std::uint8_t copy[0x2000]{};
     const auto bytes = host::copy_thread_block(copy, sizeof(copy));
     FX_CHECK(bytes >= 0x1000 && bytes <= sizeof(copy));
     FX_CHECK(std::memcmp(copy, teb, 0x40) == 0);
+#else
+    FX_CHECK(host::thread_block() == nullptr);
+#endif
 }
 
 FX_TEST(host_thread_pool_and_process) {
@@ -148,7 +152,7 @@ FX_TEST(host_text) {
 
 } // namespace
 
-// Defined in host_win32_tests.cpp (the seam has no remove-directory call).
+// Defined in host_<backend>_tests.cpp (the seam has no remove-directory call).
 void remove_directory_for_tests(const std::wstring& path);
 
 namespace {
@@ -235,7 +239,11 @@ FX_TEST(host_auto_reset_event) {
 FX_TEST(host_process_queries) {
     FX_CHECK(host::process_age_ms() > 0);
     const std::wstring self = host::executable_path();
+#if defined(TRANSMUTE_FX_HOST_WIN32)
     FX_CHECK(self.size() > 4 && self.substr(self.size() - 4) == L".exe");
+#else
+    FX_CHECK(!self.empty() && self.front() == L'/');
+#endif
     const std::wstring full = host::file::full_path(L"relative.txt");
     FX_CHECK(full.size() > 12 && full.find(L"relative.txt") == full.size() - 12);
     host::set_thread_affinity(host::current_thread(), ~std::uint64_t{0} >> 1);   // keeps every processor
@@ -265,6 +273,7 @@ void spin_until_stopped() {
     while (g_spin) {}
 }
 
+#if defined(TRANSMUTE_FX_HOST_WIN32)   // the linux backend cannot sample threads yet (linux/sample.cpp)
 FX_TEST(host_sample_thread) {
     namespace sample = host::sample;
     std::atomic<std::uint32_t> id{0};
@@ -308,6 +317,7 @@ FX_TEST(host_sample_thread) {
     const sample::Thread self = sample::open_current_thread();
     FX_CHECK(self != nullptr);
 }
+#endif
 
 FX_TEST(host_env) {
     char value[16]{};
@@ -570,16 +580,20 @@ FX_TEST(host_fault_handler_resumes) {
     vm::release(const_cast<std::uint8_t*>(page));
 }
 
+#if defined(TRANSMUTE_FX_HOST_WIN32)
 // The unwinder finds an entry through the registered lookup.
 host::UnwindEntry g_unwind_entry{0x10, 0x20, 0x100};
 std::uint64_t g_unwind_base = 0;
 host::UnwindEntry* test_lookup(std::uint64_t pc) {
     return pc - g_unwind_base >= 0x10 && pc - g_unwind_base < 0x20 ? &g_unwind_entry : nullptr;
 }
+#endif
 
 } // namespace
 
-// Defined in host_win32_tests.cpp (needs the host's unwinder API).
+#if defined(TRANSMUTE_FX_HOST_WIN32)
+// Defined in host_win32_tests.cpp (needs the host's unwinder API). The linux
+// backend registers no unwind data yet (linux/unwind.cpp).
 const host::UnwindEntry* lookup_function_entry_for_tests(std::uint64_t pc, std::uint64_t* image_base);
 
 namespace {
@@ -595,4 +609,5 @@ FX_TEST(host_unwind_lookup_registration) {
 }
 
 } // namespace
+#endif
 } // namespace transmute::fx

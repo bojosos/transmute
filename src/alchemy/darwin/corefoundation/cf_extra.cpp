@@ -524,7 +524,7 @@ void install_cf_extra(Provider& p, ObjcRuntime& objc, CoreFoundation& cf) {
     //     representation (a BOM for the UTF-16/UTF-32 host-order encodings);
     //     NULL when a character cannot be converted and lossByte is 0.
     function(cf_library, "_CFStringCreateExternalRepresentation", [&process, &cf](CpuState& s, GuestMemory& m) {
-        const auto string = s.x[1], encoding = s.x[2] & 0xffffffffULL, loss = s.x[3] & 0xff;
+        const std::uint64_t string = s.x[1], encoding = s.x[2] & 0xffffffff, loss = s.x[3] & 0xff;
         if (!string) { s.x[0] = 0; return; }
         const auto length = cf.length(string);
         const auto used = process.allocate_guest(8);

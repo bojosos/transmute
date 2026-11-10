@@ -1,16 +1,15 @@
 #include "fx/common/cpu_features.hpp"
 
-#include <intrin.h>
-#include <immintrin.h>
+#include "transmute/intrinsics.hpp"
 
 namespace transmute::fx {
 namespace {
 CpuFeatures detect() noexcept {
     CpuFeatures f;
     int r[4]{};
-    __cpuid(r, 0);
+    cpuid(r, 0);
     const int max_leaf = r[0];
-    __cpuid(r, 1);
+    cpuid(r, 1);
     const unsigned ecx1 = static_cast<unsigned>(r[2]);
     f.sse3 = ecx1 & (1u << 0);
     f.pclmul = ecx1 & (1u << 1);
@@ -26,11 +25,11 @@ CpuFeatures detect() noexcept {
     f.avx = ecx1 & (1u << 28);
     f.f16c = ecx1 & (1u << 29);
     unsigned long long xcr0 = 0;
-    if (osxsave) xcr0 = _xgetbv(0);
+    if (osxsave) xcr0 = xgetbv0();
     f.os_avx = (xcr0 & 6) == 6;
     const bool os_avx512 = (xcr0 & 0xe6) == 0xe6;
     if (max_leaf >= 7) {
-        __cpuidex(r, 7, 0);
+        cpuid(r, 7, 0);
         const unsigned ebx7 = static_cast<unsigned>(r[1]);
         const unsigned edx7 = static_cast<unsigned>(r[3]);
         f.bmi1 = ebx7 & (1u << 3);
@@ -43,19 +42,19 @@ CpuFeatures detect() noexcept {
         f.gfni = (static_cast<unsigned>(r[2]) & (1u << 8)) != 0;   // CPUID.7.0:ECX[8]
         f.avx512bw = (ebx7 & (1u << 30)) && os_avx512;
         f.avx512vl = (ebx7 & (1u << 31)) && os_avx512;
-        __cpuidex(r, 7, 1);
+        cpuid(r, 7, 1);
         f.apx = (static_cast<unsigned>(r[3]) & (1u << 21)) != 0;
         (void)edx7;
     }
     if (!f.os_avx) { f.avx = false; f.fma = false; f.f16c = false; }
-    __cpuid(r, static_cast<int>(0x80000000u));
+    cpuid(r, static_cast<int>(0x80000000u));
     if (static_cast<unsigned>(r[0]) >= 0x80000001u) {
-        __cpuid(r, static_cast<int>(0x80000001u));
+        cpuid(r, static_cast<int>(0x80000001u));
         f.lzcnt = static_cast<unsigned>(r[2]) & (1u << 5);
     }
-    __cpuid(r, static_cast<int>(0x80000000u));
+    cpuid(r, static_cast<int>(0x80000000u));
     if (static_cast<unsigned>(r[0]) >= 0x80000007u) {
-        __cpuid(r, static_cast<int>(0x80000007u));
+        cpuid(r, static_cast<int>(0x80000007u));
         f.invariant_tsc = static_cast<unsigned>(r[3]) & (1u << 8);
     }
     return f;
