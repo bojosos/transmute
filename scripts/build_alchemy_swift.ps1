@@ -615,6 +615,16 @@ if ($Library -eq 'all') {
     Build-Overlay 'Foundation' 'swiftFoundation' -dependencies @('libswiftObjectiveC.dylib', 'Combine', 'libswift_Concurrency.dylib',
         'libswiftDarwin.dylib')
     Build-Overlay 'os' 'swiftos'
+    # /usr/lib/swift/libswift_StringProcessing.dylib: the collection algorithms of Swift's string processing library
+    # (trimPrefix); Regex is not here yet.
+    Build-Overlay '_StringProcessing' 'swift_StringProcessing'
+    # /usr/lib/swift/libswiftUniformTypeIdentifiers.dylib: UTType as an identifier, without the system's type database.
+    Build-Overlay 'UniformTypeIdentifiers' 'swiftUniformTypeIdentifiers'
+    # /System/Library/Frameworks/DeveloperToolsSupport.framework/Versions/A/DeveloperToolsSupport: the asset resource
+    # types (ColorResource, ImageResource) Xcode's generated accessors name.
+    Build-Overlay 'DeveloperToolsSupport' 'DeveloperToolsSupport' "$repo/runtime/swift/overlays/DeveloperToolsSupport" `
+        '/System/Library/Frameworks/DeveloperToolsSupport.framework/Versions/A/DeveloperToolsSupport' 'DeveloperToolsSupport' `
+        -dependencies @('libswiftFoundation.dylib')
     # /System/Library/Frameworks/SwiftUI.framework/Versions/A/SwiftUI (runtime/swift/swiftui): SwiftUI's declarations
     # over AppKit, with an explicit stop in every body Alchemy does not implement yet. ForEach.create is declared in
     # Apple's SwiftUI module on a type from SwiftUICore, so its name has an extension context one module cannot
@@ -644,7 +654,7 @@ Copy-Item -LiteralPath "$repo/runtime/THIRD_PARTY_NOTICES.md" -Destination "$out
 $outputs = @(@(Get-ChildItem -LiteralPath $out -File -Filter '*.dylib') +
     @($extraOverlays | Where-Object { $_.File -notlike '*.dylib' -and (Test-Path -LiteralPath "$out/$($_.File)") } |
         ForEach-Object { Get-Item -LiteralPath "$out/$($_.File)" }) +
-    @(Get-Item -LiteralPath "$out/Combine", "$out/SwiftUI" -ErrorAction SilentlyContinue) | Sort-Object Name)
+    @(Get-Item -LiteralPath "$out/Combine", "$out/SwiftUI", "$out/DeveloperToolsSupport" -ErrorAction SilentlyContinue) | Sort-Object Name)
 $headerRecords = @(foreach ($root in $sysroot) {
     $rootPath = (Resolve-Path -LiteralPath $root).Path.TrimEnd('\', '/')
     Get-ChildItem -LiteralPath $root -File -Recurse | Sort-Object FullName | ForEach-Object {
