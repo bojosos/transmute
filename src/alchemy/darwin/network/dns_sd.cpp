@@ -10,6 +10,8 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <system_error>
+#include <thread>
 
 // dns_sd (libSystem's DNS Service Discovery client API, /usr/include/dns_sd.h)
 // over the host mDNS engine (mdns.hpp). libndi (NDI discovery in QLab)
@@ -31,14 +33,19 @@
 // Provided: DNSServiceCreateConnection, DNSServiceRefSockFD,
 // DNSServiceProcessResult, DNSServiceRefDeallocate, DNSServiceBrowse,
 // DNSServiceResolve, DNSServiceRegister, DNSServiceGetAddrInfo,
-// DNSServiceConstructFullName and the TXTRecord* helpers. Only the "local."
-// domain exists: another domain, a host-proxy registration (host != NULL)
-// and the LocalOnly / Unicast / P2P / BLE interface indexes return
-// kDNSServiceErr_Unsupported. Resolves call back once (Windows resolves are
-// one-shot) and registrations keep the requested name (Windows reports no
-// rename). Not provided (unresolved, so callers fail at bind time):
-// DNSServiceQueryRecord, Add/Update/RemoveRecord, EnumerateDomains,
-// NATPortMapping, GetProperty, ReconfirmRecord.
+// DNSServiceQueryRecord, DNSServiceConstructFullName and the TXTRecord*
+// helpers. Only the "local." domain exists for discovery: another domain, a
+// host-proxy registration (host != NULL) and the LocalOnly / Unicast / P2P /
+// BLE interface indexes return kDNSServiceErr_Unsupported. Resolves call
+// back once (Windows resolves are one-shot) and registrations keep the
+// requested name (Windows reports no rename). DNSServiceQueryRecord is a
+// unicast DNS query through libresolv's exchange (resolver.cpp) on a worker
+// thread: one callback per answer record, or one with the error
+// (NoSuchName for NXDOMAIN, NoSuchRecord for no records, Timeout when no
+// server answered), and no updates after that; ".local" names (multicast
+// record queries) return kDNSServiceErr_Unsupported. Not provided
+// (unresolved, so callers fail at bind time): Add/Update/RemoveRecord,
+// EnumerateDomains, NATPortMapping, GetProperty, ReconfirmRecord.
 namespace alchemy::gui::network {
 namespace {
 
@@ -52,7 +59,7 @@ namespace interface_index {
 inline constexpr std::uint32_t local_only = 0xffffffffu, unicast = 0xfffffffeu, p2p = 0xfffffffdu, ble = 0xfffffffcu;
 } // namespace interface_index
 
-enum class Kind { connection, browse, resolve, registration, address };
+enum class Kind { connection, browse, resolve, registration, address, query };
 
 struct Pending { Address handle; mdns::Event event; };
 
@@ -91,6 +98,78 @@ std::string read_cstring(GuestMemory& m, Address at, std::size_t limit = 1024) {
     }
     return text;
 }
+
+// True for a name in the multicast "local." domain ("local", "host.local", "host.local.").
+bool multicast_name(std::string_view name) {
+    if (!name.empty() && name.back() == '.') name.remove_suffix(1);
+    if (name.size() < 5) return false;
+    auto tail = std::string(name.substr(name.size() - 5));
+    for (auto& c : tail) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return tail == "local" && (name.size() == 5 || name[name.size() - 6] == '.');
+}
+
+// DNSServiceQueryRecord's unicast query: a detached worker owns its inputs and the shared state, and
+// never touches the process or guest memory; cancel() stops delivery (the sink runs under the mutex).
+class UnicastQuery final : public mdns::Operation {
+public:
+    struct State {
+        std::mutex mutex;
+        mdns::Sink sink;   // empty once cancelled
+    };
+    static std::unique_ptr<mdns::Operation> start(std::vector<host::net::Address> servers, std::string name, std::uint16_t klass,
+                                                  std::uint16_t type, std::uint32_t interface_index, mdns::Sink sink,
+                                                  std::int32_t& status) {
+        auto state = std::make_shared<State>();
+        state->sink = std::move(sink);
+        try {
+            std::thread([state, servers = std::move(servers), name = std::move(name), klass, type, interface_index] {
+                const auto result = unicast_records("DNSServiceQueryRecord", servers, name, klass, type);
+                std::vector<mdns::Event> events;
+                const auto full = name.back() == '.' ? name : name + ".";
+                if (const auto* records = std::get_if<std::vector<UnicastRecord>>(&result)) {
+                    for (const auto& record : *records) {
+                        mdns::Event event;
+                        event.kind = mdns::Event::Kind::found;
+                        event.interface_index = interface_index;
+                        event.host = full;
+                        event.rrtype = record.type;
+                        event.rrclass = record.klass;
+                        event.ttl = record.ttl;
+                        event.rdata = record.rdata;
+                        events.push_back(std::move(event));
+                    }
+                } else {
+                    mdns::Event event;
+                    event.error = std::get<std::int32_t>(result);
+                    event.interface_index = interface_index;
+                    event.host = full;
+                    event.rrtype = type;
+                    event.rrclass = klass;
+                    events.push_back(std::move(event));
+                }
+                std::lock_guard lock(state->mutex);
+                for (std::size_t index = 0; index < events.size() && state->sink; ++index) {
+                    events[index].more_coming = index + 1 < events.size();
+                    state->sink(std::move(events[index]));
+                }
+            }).detach();
+        } catch (const std::system_error&) {
+            status = err::no_memory;
+            return nullptr;
+        }
+        status = err::none;
+        return std::make_unique<UnicastQuery>(std::move(state));
+    }
+    explicit UnicastQuery(std::shared_ptr<State> state) : state_(std::move(state)) {}
+    ~UnicastQuery() override { cancel(); }
+    void cancel() override {
+        std::lock_guard lock(state_->mutex);
+        state_->sink = nullptr;
+    }
+
+private:
+    std::shared_ptr<State> state_;
+};
 
 class DnsSd : public std::enable_shared_from_this<DnsSd> {
 public:
@@ -355,6 +434,22 @@ public:
             static_cast<void>(b->call_address(record.callback, arguments));
             break;
         }
+        case Kind::query: {
+            if (!failed) flags |= flag::add;
+            // DNSServiceQueryRecordReply(sdRef, flags, interfaceIndex, errorCode, fullname, rrtype, rrclass, rdlen,
+            //                            rdata (stack +0), ttl (+8, uint32), context (+16))
+            CallRegs registers;
+            registers.x = {record.handle, flags, event.interface_index, error, text(event.host), event.rrtype, event.rrclass,
+                           failed ? 0 : event.rdata.size()};
+            registers.stack.resize(24);
+            const Address rdata = failed ? 0 : text.bytes(event.rdata);
+            const std::uint64_t ttl = failed ? 0 : event.ttl;
+            std::memcpy(registers.stack.data(), &rdata, 8);
+            std::memcpy(registers.stack.data() + 8, &ttl, 8);
+            std::memcpy(registers.stack.data() + 16, &record.context, 8);
+            static_cast<void>(EngineAdapter(b->process.calling_engine()).call_regs(record.callback, registers));
+            break;
+        }
         case Kind::connection: break;
         }
     }
@@ -497,6 +592,29 @@ void install_dns_sd(const std::shared_ptr<Bridge>& b) {
         }
         std::int32_t status{};
         auto operation = mdns::get_addr_info(host, static_cast<std::uint32_t>(protocol), static_cast<std::uint32_t>(index),
+                                             self->sink(record), status);
+        set_status(s, self->finish(out, record, std::move(operation), status));
+    });
+    // DNSServiceQueryRecord(sdRef*, flags, interfaceIndex, fullname, rrtype, rrclass, callBack, context)
+    define("_DNSServiceQueryRecord", [self, set_status](CpuState& s, GuestMemory& m) {
+        const auto out = s.x[0], flags = s.x[1], index = s.x[2], callback = s.x[6], context = s.x[7];
+        const auto name = read_cstring(m, s.x[3]);
+        const auto type = static_cast<std::uint16_t>(s.x[4]), klass = static_cast<std::uint16_t>(s.x[5]);
+        if (!out || name.empty() || !callback) { set_status(s, err::bad_param); return; }
+        const auto value = static_cast<std::uint32_t>(index);
+        if (value == interface_index::local_only || value == interface_index::p2p || value == interface_index::ble ||
+            multicast_name(name)) {
+            set_status(s, err::unsupported);
+            return;
+        }
+        auto servers = unicast_servers("DNSServiceQueryRecord", name);
+        if (!servers) { set_status(s, err::no_such_name); return; }   // refused by the network policy
+        std::shared_ptr<Record> record;
+        if (const auto status = self->make_record(out, flags, Kind::query, callback, context, record); status != err::none) {
+            set_status(s, status); return;
+        }
+        std::int32_t status{};
+        auto operation = UnicastQuery::start(std::move(*servers), name, klass, type, value == interface_index::unicast ? 0 : value,
                                              self->sink(record), status);
         set_status(s, self->finish(out, record, std::move(operation), status));
     });

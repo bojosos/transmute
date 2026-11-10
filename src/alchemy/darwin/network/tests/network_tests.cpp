@@ -33,6 +33,7 @@
 #include "alchemy/foundation_bridge.hpp"
 #include "alchemy/gui/install.hpp"
 #include "alchemy/gui/runloop.hpp"
+#include "alchemy/host/net.hpp"
 #include "alchemy/host/network_policy.hpp"
 
 #include <winsock2.h>
@@ -44,6 +45,8 @@
 #include <bit>
 #include <chrono>
 #include <filesystem>
+#include <functional>
+#include <optional>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -53,6 +56,10 @@
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
+
+namespace alchemy::gui::network {
+void set_unicast_servers_for_testing(std::optional<std::vector<host::net::Address>> servers);   // resolver.cpp
+} // namespace alchemy::gui::network
 
 namespace {
 using Address = std::uint64_t;
@@ -993,6 +1000,177 @@ void test_resolver(Fixture& f, bool online) {
         "res_nsend asks no external server under loopback");
     alchemy::network_policy::set_mode_for_testing(std::nullopt);
     static_cast<void>(f.call(lib, "_res_9_ndestroy", {state}));
+}
+
+// A loopback UDP DNS server: `answer` builds the reply to each query.
+class LoopbackDns {
+public:
+    explicit LoopbackDns(std::function<Bytes(const Bytes&)> answer) : answer_(std::move(answer)) {
+        socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        require(bind(socket_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "DNS server bind");
+        int size = sizeof(address);
+        getsockname(socket_, reinterpret_cast<sockaddr*>(&address), &size);
+        port_ = ntohs(address.sin_port);
+        thread_ = std::thread([this] {
+            while (!stop_) {
+                fd_set set;
+                FD_ZERO(&set);
+                FD_SET(socket_, &set);
+                timeval timeout{0, 50'000};
+                if (select(0, &set, nullptr, nullptr, &timeout) <= 0) continue;
+                std::array<char, 512> buffer{};
+                sockaddr_in from{};
+                int length = sizeof(from);
+                const auto got = recvfrom(socket_, buffer.data(), static_cast<int>(buffer.size()), 0, reinterpret_cast<sockaddr*>(&from), &length);
+                if (got < 12) continue;
+                const auto reply = answer_(Bytes(buffer.begin(), buffer.begin() + got));
+                sendto(socket_, reinterpret_cast<const char*>(reply.data()), static_cast<int>(reply.size()), 0, reinterpret_cast<sockaddr*>(&from), length);
+            }
+        });
+    }
+    ~LoopbackDns() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+        closesocket(socket_);
+    }
+    [[nodiscard]] std::uint16_t port() const { return port_; }
+
+private:
+    std::function<Bytes(const Bytes&)> answer_;
+    SOCKET socket_{INVALID_SOCKET};
+    std::uint16_t port_{};
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+};
+
+// dns_sd's DNSServiceQueryRecord against a loopback DNS server: a TXT answer behind a CNAME (the CNAME
+// skipped), an MX whose exchange name is compressed (handed over uncompressed), two A records (MoreComing
+// on the first), NXDOMAIN, a ".local" name (unsupported) and the loopback policy with no loopback server.
+void test_query_record(Fixture& f) {
+    const std::string lib = "/usr/lib/libSystem.B.dylib";
+    auto& guest = static_cast<GuestMemory&>(f.engine);
+    const auto cstring = [&](std::string_view text) {
+        const auto address = f.process.allocate_guest(text.size() + 1);
+        f.engine.write_bytes(address, std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+        f.engine.fill_bytes(address + text.size(), 0, 1);
+        return address;
+    };
+    const auto read_text = [&](Address at) {
+        std::string text;
+        for (; at; ++at) { const auto c = guest.read8(at); if (!c) break; text.push_back(static_cast<char>(c)); }
+        return text;
+    };
+    const auto wire = [](std::string_view name) {
+        Bytes out;
+        while (!name.empty()) {
+            const auto dot = name.find('.');
+            const auto label = name.substr(0, dot);
+            out.push_back(static_cast<std::uint8_t>(label.size()));
+            out.insert(out.end(), label.begin(), label.end());
+            name = dot == std::string_view::npos ? std::string_view{} : name.substr(dot + 1);
+        }
+        out.push_back(0);
+        return out;
+    };
+    LoopbackDns server([&](const Bytes& query) {
+        std::string name;
+        std::size_t at = 12;
+        while (at < query.size() && query[at]) {
+            if (!name.empty()) name.push_back('.');
+            name.append(reinterpret_cast<const char*>(query.data() + at + 1), query[at]);
+            at += 1 + query[at];
+        }
+        Bytes reply(query.begin(), query.begin() + static_cast<std::ptrdiff_t>(at + 5));
+        reply[2] = 0x81;   // QR, RD
+        reply[3] = 0x80;   // RA, NOERROR
+        std::uint16_t count = 0;
+        const auto record = [&](Bytes owner, std::uint16_t type, std::uint32_t ttl, const Bytes& rdata) {
+            reply.insert(reply.end(), owner.begin(), owner.end());
+            for (const auto value : {type, std::uint16_t{1}}) { reply.push_back(static_cast<std::uint8_t>(value >> 8)); reply.push_back(static_cast<std::uint8_t>(value)); }
+            for (int shift = 24; shift >= 0; shift -= 8) reply.push_back(static_cast<std::uint8_t>(ttl >> shift));
+            reply.push_back(static_cast<std::uint8_t>(rdata.size() >> 8));
+            reply.push_back(static_cast<std::uint8_t>(rdata.size()));
+            reply.insert(reply.end(), rdata.begin(), rdata.end());
+            ++count;
+        };
+        const Bytes question{0xc0, 0x0c};
+        if (name == "txt.example.test") {
+            const auto target = static_cast<std::uint8_t>(reply.size() + 12);   // the CNAME's rdata
+            record(question, 5, 60, wire("target.example.test"));
+            record(Bytes{0xc0, target}, 16, 300, Bytes{3, 'v', '=', '1'});
+        } else if (name == "mx.example.test") {
+            record(question, 15, 120, Bytes{0, 10, 0xc0, 0x0c});
+        } else if (name == "two.example.test") {
+            record(question, 1, 30, Bytes{192, 0, 2, 1});
+            record(question, 1, 30, Bytes{192, 0, 2, 2});
+        } else {
+            reply[3] = 0x83;   // NXDOMAIN
+        }
+        reply[6] = static_cast<std::uint8_t>(count >> 8);
+        reply[7] = static_cast<std::uint8_t>(count);
+        return reply;
+    });
+    alchemy::gui::network::set_unicast_servers_for_testing(
+        std::vector{alchemy::host::net::Address::ipv4({127, 0, 0, 1}, server.port())});
+
+    struct Seen { std::int32_t error; std::uint64_t flags; std::string name; std::uint64_t type, klass; Bytes rdata; std::uint32_t ttl; Address context; };
+    static std::vector<Seen>* seen_list = nullptr;
+    std::vector<Seen> seen;
+    seen_list = &seen;
+    const auto reply = f.process.install_function("test_dnssd_query", [&](CpuState& s, GuestMemory& m) {
+        // (sdRef, flags, interfaceIndex, errorCode, fullname, rrtype, rrclass, rdlen, rdata, ttl, context)
+        Seen item{static_cast<std::int32_t>(s.x[3]), s.x[1], read_text(s.x[4]), s.x[5], s.x[6], {}, m.read32(s.sp + 8), m.read64(s.sp + 16)};
+        item.rdata.resize(static_cast<std::uint16_t>(s.x[7]));
+        if (!item.rdata.empty()) f.engine.read_bytes(m.read64(s.sp), item.rdata);
+        seen_list->push_back(std::move(item));
+        s.x[0] = 0;
+    }, "alchemy.test");
+    const auto cell = f.process.allocate_guest(8), pollfd = f.process.allocate_guest(8);
+    const auto query = [&](std::string_view name, std::uint16_t type, std::size_t expected) {
+        seen.clear();
+        const auto status = static_cast<std::int32_t>(f.call(lib, "_DNSServiceQueryRecord", {cell, 0, 0, cstring(name), type, 1, reply, 0x1234}));
+        require(status == 0, "DNSServiceQueryRecord " + std::string(name) + ": " + std::to_string(status));
+        const auto ref = f.engine.read64(cell);
+        const auto fd = static_cast<std::int32_t>(f.call(lib, "_DNSServiceRefSockFD", {ref}));
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (seen.size() < expected) {
+            require(std::chrono::steady_clock::now() < until, "timed out: DNSServiceQueryRecord " + std::string(name));
+            f.engine.write32(pollfd, static_cast<std::uint32_t>(fd));
+            f.engine.write32(pollfd + 4, 1);   // POLLIN
+            if (static_cast<std::int32_t>(f.call(lib, "_poll", {pollfd, 1, 100})) == 1)
+                require(f.call(lib, "_DNSServiceProcessResult", {ref}) == 0, "DNSServiceProcessResult");
+        }
+        static_cast<void>(f.call(lib, "_DNSServiceRefDeallocate", {ref}));
+        require(seen.size() == expected, "DNSServiceQueryRecord " + std::string(name) + " callbacks");
+    };
+
+    query("txt.example.test", 16, 1);
+    require(seen[0].error == 0 && seen[0].flags == 2 && seen[0].name == "txt.example.test." && seen[0].type == 16 && seen[0].klass == 1 &&
+            seen[0].rdata == Bytes{3, 'v', '=', '1'} && seen[0].ttl == 300 && seen[0].context == 0x1234,
+            "the TXT record behind the CNAME (kDNSServiceFlagsAdd)");
+    query("mx.example.test.", 15, 1);
+    auto mx = Bytes{0, 10};
+    const auto exchange = wire("mx.example.test");
+    mx.insert(mx.end(), exchange.begin(), exchange.end());
+    require(seen[0].error == 0 && seen[0].type == 15 && seen[0].rdata == mx && seen[0].ttl == 120, "the MX exchange name uncompressed");
+    query("two.example.test", 1, 2);
+    require(seen[0].flags == 3 && seen[1].flags == 2 && seen[0].rdata == Bytes({192, 0, 2, 1}) && seen[1].rdata == Bytes({192, 0, 2, 2}),
+            "two A records, kDNSServiceFlagsMoreComing on the first");
+    query("missing.example.test", 1, 1);
+    require(seen[0].error == -65538 && seen[0].rdata.empty() && seen[0].type == 1, "NXDOMAIN: kDNSServiceErr_NoSuchName");
+    require(static_cast<std::int32_t>(f.call(lib, "_DNSServiceQueryRecord", {cell, 0, 0, cstring("printer.local."), 16, 1, reply, 0})) == -65544,
+            "a multicast (.local) record query is unsupported");
+    require(static_cast<std::int32_t>(f.call(lib, "_DNSServiceQueryRecord", {cell, 0, 0, 0, 16, 1, reply, 0})) == -65540, "no name: BadParam");
+    alchemy::gui::network::set_unicast_servers_for_testing(std::vector{alchemy::host::net::Address::ipv4({192, 0, 2, 53}, 53)});
+    alchemy::network_policy::set_mode_for_testing(alchemy::network_policy::Mode::loopback);
+    require(static_cast<std::int32_t>(f.call(lib, "_DNSServiceQueryRecord", {cell, 0, 0, cstring("txt.example.test"), 16, 1, reply, 0})) == -65538,
+            "ALCHEMY_NETWORK=loopback with no loopback server: refused");
+    alchemy::network_policy::set_mode_for_testing(std::nullopt);
+    alchemy::gui::network::set_unicast_servers_for_testing(std::nullopt);
+    seen_list = nullptr;
 }
 
 void test_sessions(Fixture& f, Harness& h, HttpsServer& server) {
@@ -2156,6 +2334,7 @@ int main() {
         test_system_configuration(fixture);
         test_system_configuration_network(fixture);
         test_resolver(fixture, sec::host_environment("ALCHEMY_TEST_OFFLINE").empty());
+        test_query_record(fixture);
         // DNS-SD multicast leaves the machine: refused by design under ALCHEMY_NETWORK=loopback.
         if (alchemy::network_policy::loopback_only()) std::cout << "Bonjour: skipped (ALCHEMY_NETWORK=loopback)\n";
         else test_bonjour(fixture);
