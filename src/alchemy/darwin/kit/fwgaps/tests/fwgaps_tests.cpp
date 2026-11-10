@@ -10,6 +10,7 @@
 #include "alchemy/darwin/security/bridge.hpp"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <iostream>
 
@@ -165,6 +166,38 @@ void core_text_keys(Fixture& f) {
 
 } // namespace
 
+// Firefox's XUL: the private CTM setters, the CGS shutdown and the menu action notifications.
+void firefox(Fixture& f) {
+    const auto space = f.call(cg, "_CGColorSpaceCreateDeviceRGB");
+    const auto context = f.call(cg, "_CGBitmapContextCreate", {0, 16, 16, 8, 64, space, 1});   // premultiplied last
+    require(context != 0, "a bitmap context");
+    const auto affine = [&](std::array<double, 6> m) {
+        const auto block = f.block(48);
+        for (std::size_t i = 0; i < 6; ++i) f.engine.write64(block + i * 8, std::bit_cast<std::uint64_t>(m[i]));
+        return block;
+    };
+    const auto ctm = [&] {
+        alchemy::CallRegs registers{};
+        registers.x[0] = context;
+        registers.indirect_result = f.block(48);   // x8
+        static_cast<void>(f.regs(cg, "_CGContextGetCTM", registers));
+        std::array<double, 6> m{};
+        for (std::size_t i = 0; i < 6; ++i) m[i] = std::bit_cast<double>(f.engine.read64(registers.indirect_result + i * 8));
+        return m;
+    };
+    const auto base = ctm();
+    require(base[0] == 1 && base[3] == 1 && base[4] == 0 && base[5] == 0, "a bitmap context starts at the identity");
+    f.call(cg, "_CGContextSetCTM", {context, affine({1, 0, 0, 1, 5, 7})});
+    require(ctm() == std::array<double, 6>{1, 0, 0, 1, 5, 7}, "CGContextSetCTM sets the whole transform");
+    // A new base (device) transform under the kept user transform: translate, then scale by 2.
+    f.call(cg, "_CGContextSetBaseCTM", {context, affine({2, 0, 0, 2, 0, 0})});
+    require(ctm() == std::array<double, 6>{2, 0, 0, 2, 10, 14}, "CGContextSetBaseCTM keeps the user transform");
+    require(static_cast<std::int32_t>(f.call(cg, "_CGSShutdownServerConnections")) == 1002, "no CGS connection to shut down");
+    require(f.string_constant(appkit, "_NSMenuWillSendActionNotification") == "NSMenuWillSendActionNotification" &&
+                f.string_constant(appkit, "_NSMenuDidSendActionNotification") == "NSMenuDidSendActionNotification",
+            "the menu action notifications");
+}
+
 // LibreOffice's VCL plug-in (libvclplug_osxlo.dylib): the CoreUI identity
 // and the names it binds; the HITheme menu / text-box drawing stops explicitly.
 void libreoffice(Fixture& f) {
@@ -278,5 +311,6 @@ void media(Fixture& f) {
 
 int main() {
     return run("fwgaps", {{"imports", imports}, {"appkit", appkit_gaps}, {"graphics", graphics}, {"core text", core_text},
-                          {"core text keys", core_text_keys}, {"libreoffice", libreoffice}, {"media", media}});
+                          {"core text keys", core_text_keys}, {"libreoffice", libreoffice}, {"firefox", firefox},
+                          {"media", media}});
 }

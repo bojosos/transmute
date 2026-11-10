@@ -44,6 +44,7 @@ releasing succeeds.
 * Listening to other applications' input is not granted.
 * CGDisplayStream* create nothing.
 * Font variations: CGFontCopyVariationAxes / CGFontCopyVariations and CTFontCopyVariationAxes / CTFontCopyVariation read a variable font's `fvar` axes, named from its `name` table (English). Faces are at their default instance, so the current variation is each axis's default. A font without `fvar` gives NULL. CGFontCreateCopyWithVariations makes no variant copies (NULL).
+* Firefox's private SPI, from the declarations in its own open source: CGContextSetCTM sets the whole current transform (what CGContextGetCTM answers), CGContextSetBaseCTM replaces the base (device) transform under the kept user transform (both meanings unverified). CGSShutdownServerConnections answers kCGErrorInvalidConnection: there is no CGS connection (CGSMainConnectionID is 0).
 * CGFontCopyTableTags probes the known table tags.
 * kCGColorSpaceDisplayP3_PQ / _HLG are names only: their transfer curves are
   not modelled, so creating them answers NULL.

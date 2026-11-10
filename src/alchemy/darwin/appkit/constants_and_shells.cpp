@@ -24,6 +24,9 @@ void install_appkit_constants_and_shells(Support& support) {
              {"_NSHTMLTextDocumentType", "NSHTML"},
              {"_NSRTFTextDocumentType", "NSRTF"},
              {"_NSMenuDidBeginTrackingNotification", "NSMenuDidBeginTrackingNotification"},
+             // Posted around a menu item's action (resources.cpp).
+             {"_NSMenuWillSendActionNotification", "NSMenuWillSendActionNotification"},
+             {"_NSMenuDidSendActionNotification", "NSMenuDidSendActionNotification"},
              {"_NSPasteboardTypeColor", "com.apple.cocoa.pasteboard.color"},
              {"_NSPasteboardTypeFont", "com.apple.cocoa.pasteboard.character-formatting"},
              {"_NSPasteboardTypeHTML", "public.html"},

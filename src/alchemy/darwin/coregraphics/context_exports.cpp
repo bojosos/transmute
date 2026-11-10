@@ -138,6 +138,17 @@ void Quartz::install_contexts() {
     context_function("_CGContextTranslateCTM", [](CpuState& s, GuestMemory&, ContextState& c) { c.g.ctm = Affine::translation(d(s, 0), d(s, 1)).then(c.g.ctm); });
     context_function("_CGContextRotateCTM", [](CpuState& s, GuestMemory&, ContextState& c) { c.g.ctm = Affine::rotation(d(s, 0)).then(c.g.ctm); });
     context_function("_CGContextConcatCTM", [this](CpuState& s, GuestMemory&, ContextState& c) { c.g.ctm = read_affine(s.x[1]).then(c.g.ctm); });
+    // Private SPI, declared in Firefox's open source as (CGContextRef,
+    // CGAffineTransform). CGContextSetCTM sets the whole current transform, the
+    // matrix CGContextGetCTM answers (so a set of a got value changes nothing).
+    // CGContextSetBaseCTM replaces the base (device) transform under the user
+    // transform, which is kept. Both meanings are unverified.
+    context_function("_CGContextSetCTM", [this](CpuState& s, GuestMemory&, ContextState& c) { c.g.ctm = read_affine(s.x[1]); });
+    context_function("_CGContextSetBaseCTM", [this](CpuState& s, GuestMemory&, ContextState& c) {
+        const auto user = c.base_ctm.inverse() ? c.g.ctm.then(*c.base_ctm.inverse()) : c.g.ctm;
+        c.base_ctm = read_affine(s.x[1]);
+        c.g.ctm = user.then(c.base_ctm);
+    });
     function(cg, "_CGContextGetCTM", [this, with](CpuState& s, GuestMemory&) {
         Affine value{};
         with(s.x[0], [&](ContextState& c) { value = c.g.ctm; });

@@ -494,7 +494,11 @@ void GraphicsGaps::install_core_graphics() {
     // Private window-server connection calls.
     constant(core_graphics, "_CGSMainConnectionID", 0);
     constant(core_graphics, "__CGSDefaultConnection", 0);
-    for (const auto* name : {"_CGSSetWindowAlpha", "_CGSSetWindowTransform", "_CGSSetWindowWarp", "_CGSSetDenyWindowServerConnections"})
+    // There is no CGS connection (the main one is 0), so none can be changed or
+    // shut down (CGSShutdownServerConnections, which Firefox's content processes
+    // call, answers kCGErrorInvalidConnection).
+    for (const auto* name : {"_CGSSetWindowAlpha", "_CGSSetWindowTransform", "_CGSSetWindowWarp", "_CGSSetDenyWindowServerConnections",
+                             "_CGSShutdownServerConnections"})
         failure(core_graphics, name, cg_invalid_connection);
     // Keys.
     for (const auto* name : {"kCGDisplayStreamColorSpace", "kCGDisplayStreamDestinationRect", "kCGDisplayStreamMinimumFrameTime",
