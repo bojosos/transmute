@@ -416,6 +416,36 @@ FX_TEST(isel_folded_access_faults_are_exact) {
           add_shift(true, false, false, 0, 10, 2, 9, 21), ldst_uimm(2, 2, 1, 21, 21), add_imm(true, false, false, 21, 21, 1),
           add_imm(true, false, false, 21, 21, 1)},
          3},
+        {"ubfiz #2,#11 + sub + ldr self (V8 LoadIC)",
+         {add_imm(true, false, false, 10, 10, 0x800),   // upper bits masked off by #11
+          bitfield(true, 2, 62, 10, 10, 10),           // ubfiz x10, x10, #2, #11
+          add_imm(true, true, false, 10, 10, 1),       // sub x10, x10, #1
+          ldst_reg(2, 1, 10, 3, false, 9, 10),         // ldr w10, [x9, x10]
+          add_imm(true, false, false, 0, 10, 1)},
+         1},
+        {"ubfiz #2,#8 + add + ldr dead",
+         {bitfield(true, 2, 62, 7, 10, 8),             // ubfiz x8, x10, #2, #8 (movzx)
+          add_imm(true, false, false, 8, 8, 4),        // add x8, x8, #4
+          ldst_reg(2, 1, 8, 3, false, 9, 0),           // ldr w0, [x9, x8]
+          movw(true, 2, 0, 9, 8)},
+         0},
+        {"ubfiz #3,#11 + ldr 2-insn self",
+         {bitfield(true, 2, 61, 10, 10, 8),            // ubfiz x8, x10, #3, #11
+          ldst_reg(3, 1, 8, 3, false, 9, 8),           // ldr x8, [x9, x8]
+          add_imm(true, false, false, 0, 8, 1)},
+         0},
+        {"movz + str dead (disp8)",
+         {add_imm(true, false, false, 20, 20, 3),
+          movw(false, 2, 0, 0x1234, 8),                // movz w8, #0x1234
+          ldst_uimm(2, 0, 4, 9, 8),                    // str w8, [x9, #16]
+          movw(false, 2, 0, 9, 8)},
+         1},
+        {"movz + movk + str dead (disp8)",
+         {movw(false, 2, 0, 0x5678, 8),                // movz w8, #0x5678
+          movw(false, 3, 1, 0x1234, 8),                // movk w8, #0x1234, lsl #16
+          ldst_uimm(2, 0, 2, 9, 8),                    // str w8, [x9, #8]
+          movw(false, 2, 0, 7, 8)},
+         0},
     };
     for (const auto& c : cases) check_fold_fault(c.prog, c.fault_word, c.label);
     // LDP with a pinned first and an unpinned second destination loads the
@@ -834,8 +864,8 @@ FX_TEST(core_gpr_dest_reuse) {
     auto& r = runner();
     Rng rng(0x6e05e);
     InstGen g(rng);
-    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_gpr_reuse), static_cast<unsigned>(core::knob_merge_dirty),
-                                static_cast<unsigned>(core::knob_merge_dirty | core::knob_no_gpr_reuse)}) {
+    for (const unsigned knob : {0u, static_cast<unsigned>(core::knob_no_gpr_reuse), static_cast<unsigned>(core::knob_no_merge_dirty),
+                                static_cast<unsigned>(core::knob_no_merge_dirty | core::knob_no_gpr_reuse)}) {
         core::set_p2_knobs_for_testing(knob);
         int failures = 0;
         for (unsigned i = 0; i < 300 && failures < 6; ++i) {
@@ -946,4 +976,703 @@ FX_TEST(core_ccmp_fusion_parks_without_holding_a_register) {
         for (unsigned k = 0; k < 4; ++k) r.run(prog, r.context(40027669u + k), "ccmp fusion park " + std::to_string(knob));
     }
     core::set_p2_knobs_for_testing(~0u);
+}
+
+// Wave D: in-place RMW ALU reuse (ORR x6, x28, x6), BFI zero32 mask skip,
+// in-place RBIT+CLZ pair, and ALU->CBZ/CBNZ zero-flag forwarding.
+FX_TEST(core_wave_d_peepholes) {
+    using namespace a64;
+    auto& r = runner();
+
+    // 1. In-place RMW ORR x6, x28, x6 & ADD x4/x5, x28, #imm + ORR -> CBZ/CBNZ ZF reuse.
+    const std::vector<std::uint32_t> rmw_and_zf = {
+        add_imm(true, false, false, 4, 28, 0x2d),            // add x4, x28, #0x2d
+        add_imm(true, false, false, 5, 28, 0x11),            // add x5, x28, #0x11
+        add_imm(true, false, false, 6, 4, 0x4),              // add x6, x4, #4
+        logic_shift(true, 1, 0, false, 6, 0, 28, 6),         // orr x6, x28, x6 (in-place RMW!)
+        logic_shift(false, 1, 0, false, 7, 0, 8, 7),         // orr w7, w8, w7 -> sets ZF
+        cbz(false, false, 2, 7),                             // cbz w7, +2 (reuses ZF)
+        add_imm(true, false, false, 9, 6, 1),                // add x9, x6, #1
+        logic_imm(false, 0, 0, 0, 3, 7, 7),                  // and w7, w7, #0xf -> sets ZF
+        cbz(false, true, 2, 7),                              // cbnz w7, +2 (reuses ZF)
+        add_imm(true, false, false, 10, 5, 3),               // add x10, x5, #3
+        nop(),
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0xd100 + k);
+        if (k % 2 == 0) ctx.x[7] = ctx.x[8] = 0;
+        else if (k % 4 == 1) { ctx.x[7] = 0x10; ctx.x[8] = 0; }
+        r.run(rmw_and_zf, ctx, "wave d rmw/zf " + std::to_string(k));
+    }
+
+    // 2. BFI X9, X8, #32, #32 after W-register write (ext_zero32 skips `and x9, 0xffffffff`).
+    // BFI X9, X8, #32, #32: sf=1, opc=01, N=1, immr=32, imms=31 -> 0xb3607d09
+    const std::vector<std::uint32_t> bfi_z32 = {
+        add_imm(false, false, false, 9, 10, 5),              // add w9, w10, #5 (ext_zero32!)
+        0xb3607d09u,                                         // bfi x9, x8, #32, #32
+        ret(),
+    };
+    for (unsigned k = 0; k < 4; ++k) r.run(bfi_z32, r.context(0xd200 + k), "wave d bfi z32 " + std::to_string(k));
+
+    // 3. In-place RBIT X11, X11; CLZ X0, X11 followed by a faulting store (RBIT cannot be elided,
+    //    but TZCNT breaks the dependency chain while leaving X11 bit-reversed!).
+    // RBIT X11, X11: 0xdac0016b; CLZ X0, X11: 0xdac01160; STR X0, [SP]: 0xf90003e0
+    const std::vector<std::uint32_t> rbit_inplace = {
+        0xdac0016bu,                                         // rbit x11, x11
+        0xdac01160u,                                         // clz  x0, x11
+        0xf90003e0u,                                         // str  x0, [sp]
+        ret(),
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0xd300 + k);
+        if (k == 0) ctx.x[11] = 0;
+        else if (k == 1) ctx.x[11] = 1ull << 63;
+        else if (k == 2) ctx.x[11] = 1ull << 31;
+        r.run(rbit_inplace, ctx, "wave d rbit+clz inplace " + std::to_string(k));
+    }
+}
+
+// Wave E: direct MUL (pinned/unpinned/in-place/commutative), SBFX SmiUntag
+// (movsxd+sar), shift->CBZ/CBNZ ZF forwarding, and single-reader boolean flag
+// parking across long ALU chains (ANDS -> 10 ALU ops -> B.EQ / CSEL).
+FX_TEST(core_wave_e_peepholes) {
+    using namespace a64;
+    auto& r = runner();
+
+    // 1. Direct MUL (32-bit & 64-bit, in-place rn/rm, fresh dst, square x*x)
+    //    + SBFX Xd, Xn, #1, #31 (SmiUntag) + LSL/LSR -> CBZ/CBNZ.
+    // MUL Wd, Wn, Wm = MADD Wd, Wn, Wm, WZR: 0x1b007c00 | (rm<<16) | (rn<<5) | rd
+    // MUL Xd, Xn, Xm = MADD Xd, Xn, Xm, XZR: 0x9b007c00 | (rm<<16) | (rn<<5) | rd
+    const auto mul32 = [](unsigned rd, unsigned rn, unsigned rm) { return 0x1b007c00u | (rm << 16) | (rn << 5) | rd; };
+    const auto mul64 = [](unsigned rd, unsigned rn, unsigned rm) { return 0x9b007c00u | (rm << 16) | (rn << 5) | rd; };
+    const std::vector<std::uint32_t> mul_sbfx_zf = {
+        mul32(19, 19, 20),                                   // mul w19, w19, w20 (pinned in-place rn)
+        mul32(20, 19, 20),                                   // mul w20, w19, w20 (pinned in-place rm)
+        mul32(21, 19, 20),                                   // mul w21, w19, w20 (pinned fresh dst)
+        mul32(8, 8, 9),                                      // mul w8, w8, w9 (unpinned in-place rn)
+        mul32(9, 8, 9),                                      // mul w9, w8, w9 (unpinned in-place rm)
+        mul32(10, 8, 9),                                     // mul w10, w8, w9 (unpinned fresh dst)
+        mul64(11, 11, 11),                                   // mul x11, x11, x11 (square)
+        bitfield(true, 0, 1, 31, 10, 12),                    // sbfx x12, x10, #1, #31 (SmiUntag -> movsxd + sar)
+        cbz(true, false, 2, 12),                             // cbz x12, +2 (reuses sar ZF)
+        add_imm(true, false, false, 13, 12, 7),              // add x13, x12, #7
+        bitfield(false, 2, 31, 30, 8, 8),                    // lsl w8, w8, #1 (sets ZF)
+        cbz(false, true, 2, 8),                              // cbnz w8, +2 (reuses shl ZF)
+        add_imm(false, false, false, 14, 9, 3),              // add w14, w9, #3
+        bitfield(false, 2, 1, 31, 9, 9),                     // lsr w9, w9, #1 (sets ZF)
+        cbz(false, false, 2, 9),                             // cbz w9, +2 (reuses shr ZF)
+        add_imm(false, false, false, 15, 10, 5),             // add w15, w10, #5
+        nop(),
+    };
+    for (unsigned k = 0; k < 10; ++k) {
+        auto ctx = r.context(0xe100 + k);
+        if (k == 0) { ctx.x[8] = 0x80000000u; ctx.x[9] = 1; ctx.x[10] = 0; }
+        else if (k == 1) { ctx.x[8] = 0xffffffffu; ctx.x[9] = 0x80000001u; }
+        r.run(mul_sbfx_zf, ctx, "wave e mul/sbfx/zf " + std::to_string(k));
+    }
+
+    // 2. Single-reader boolean flag parking across 8 clobbering ALU ops (Sobol pattern).
+    // ANDS W11, W11, W8 -> 8 EOR/MUL/ADD ops -> B.EQ (NZCV dead after B.EQ).
+    const std::vector<std::uint32_t> long_flag_park = {
+        logic_shift(false, 3, 0, false, 8, 0, 11, 11),       // ands w11, w11, w8
+        mul32(12, 12, 13),                                   // clobbers EFLAGS -> triggers park_single_reader_bool
+        logic_shift(false, 2, 0, false, 12, 0, 14, 14),      // eor w14, w14, w12
+        add_imm(false, false, false, 14, 14, 0x123),         // add w14, w14, #0x123
+        mul32(14, 14, 15),                                   // mul w14, w14, w15
+        logic_shift(false, 2, 0, false, 14, 0, 15, 15),      // eor w15, w15, w14
+        bitfield(false, 2, 16, 31, 15, 15),                  // lsr w15, w15, #16
+        bcond(0, 2),                                         // b.eq +2 (consumes parked bool)
+        add_imm(false, false, false, 0, 14, 1),              // add w0, w14, #1
+        add_imm(true, true, true, 31, 0, 0),                 // cmp x0, #0 (kills NZCV)
+        nop(),
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0xe200 + k);
+        if (k % 2 == 0) { ctx.x[8] = 0; ctx.x[11] = 0x55; }
+        else { ctx.x[8] = 0xff; ctx.x[11] = 0x55; }
+        r.run(long_flag_park, ctx, "wave e flag park " + std::to_string(k));
+    }
+}
+
+// Wave F: indexed-register offset folding (ADD+LDR [base, idx] and
+// UBFIZ/LSL+ADD+LDR [base, idx]), ORR/AND/EOR -> TST Xd, Xd flag forwarding,
+// and dead-temp LDR literal + CMP fusion.
+FX_TEST(core_wave_f_peepholes) {
+    using namespace a64;
+    auto& r = runner();
+
+    // 1. FixedArray-style indexed offset folding:
+    //    - ADD x11, x11, #7; LDR w11, [x16, x11] (2-insn self-load)
+    //    - UBFIZ x11, x10, #2, #32; ADD x11, x11, #7; LDR w11, [x16, x11] (3-insn self-load)
+    //    - LSL x12, x13, #3; ADD x12, x12, #8; LDR x14, [x16, x12]; MOV x12, #1 (3-insn dead-after)
+    //    - UBFIZ x15, x10, #2, #32; ADD x15, x15, #4; STR w8, [x17, x15]; MOV x15, #2 (3-insn store dead-after)
+    const std::vector<std::uint32_t> indexed_folds = {
+        add_imm(true, false, false, 11, 11, 7),              // add x11, x11, #7
+        ldst_reg(2, 1, 11, 3, false, 16, 11),                // ldr w11, [x16, x11]
+        bitfield(true, 2, 62, 31, 10, 11),                   // ubfiz x11, x10, #2, #32 (garbage upper 32 of x10!)
+        add_imm(true, false, false, 11, 11, 7),              // add x11, x11, #7
+        ldst_reg(2, 1, 11, 3, false, 16, 11),                // ldr w11, [x16, x11]
+        add_imm(false, false, false, 10, 10, 1),             // add w10, w10, #1 (ext_zero32!)
+        bitfield(true, 2, 62, 31, 10, 12),                   // ubfiz x12, x10, #2, #32
+        add_imm(true, false, false, 12, 12, 7),              // add x12, x12, #7
+        ldst_reg(2, 1, 12, 3, false, 16, 12),                // ldr w12, [x16, x12]
+        bitfield(true, 2, 61, 60, 13, 14),                   // lsl x14, x13, #3
+        add_imm(true, false, false, 14, 14, 8),              // add x14, x14, #8
+        ldst_reg(3, 1, 14, 3, false, 16, 15),                // ldr x15, [x16, x14]
+        movw(true, 2, 0, 1, 14),                             // mov x14, #1 (kills x14)
+        bitfield(true, 2, 62, 31, 10, 14),                   // ubfiz x14, x10, #2, #32
+        add_imm(true, false, false, 14, 14, 4),              // add x14, x14, #4
+        ldst_reg(2, 0, 14, 3, false, 17, 8),                 // str w8, [x17, x14]
+        movw(true, 2, 0, 2, 14),                             // mov x14, #2 (kills x14)
+        nop(),
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0xf100 + k);
+        ctx.x[11] = (k * 4u) & 63u;
+        ctx.x[10] = (0xdeadbeefULL << 32) | ((k * 3u) & 31u);   // non-zero upper 32 bits!
+        ctx.x[13] = k & 15u;
+        r.run(indexed_folds, ctx, "wave f indexed fold " + std::to_string(k));
+    }
+
+    // 2. ORR/AND/EOR -> TST Xd, Xd exact NZCV forwarding (N, Z, C=0, V=0).
+    const std::vector<std::uint32_t> logic_tst = {
+        logic_shift(false, 1, 0, false, 9, 0, 8, 8),         // orr w8, w8, w9
+        logic_shift(false, 3, 0, false, 8, 0, 8, 31),        // tst w8, w8 (elided!)
+        csel(false, false, 10, 0, 0, 11, 0),                 // csel w0, w11, w10, eq
+        csel(false, false, 10, 4, 0, 11, 1),                 // csel w1, w11, w10, mi (tests N!)
+        logic_imm(true, 0, 1, 0, 3, 12, 12),                 // and x12, x12, #0xf
+        logic_shift(true, 3, 0, false, 12, 0, 12, 31),       // tst x12, x12 (elided!)
+        bcond(0, 2),                                         // b.eq +2
+        add_imm(true, false, false, 2, 2, 9),                // add x2, x2, #9
+        logic_shift(true, 2, 0, false, 13, 0, 14, 14),       // eor x14, x14, x13
+        logic_shift(true, 3, 0, false, 14, 0, 14, 31),       // tst x14, x14 (elided!)
+        csel(true, false, 10, 4, 0, 11, 3),                  // csel x3, x11, x10, mi
+        nop(),
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0xf200 + k);
+        if (k == 0) { ctx.x[8] = ctx.x[9] = 0; ctx.x[12] = 0; ctx.x[13] = ctx.x[14] = 0; }
+        else if (k == 1) { ctx.x[8] = 0x80000000u; ctx.x[9] = 0; ctx.x[13] = 1ull << 63; ctx.x[14] = 0; }
+        else if (k == 2) { ctx.x[8] = 0x7fffffffu; ctx.x[9] = 0; ctx.x[12] = 0x10; }
+        r.run(logic_tst, ctx, "wave f logic->tst " + std::to_string(k));
+    }
+
+    // 3. LDR Wt/Xt, =literal; CMP Wn/Xn, Wt/Xt fusion when Wt/Xt is dead after CMP.
+    const std::vector<std::uint32_t> lit_cmp = {
+        ldr_literal(0, -10, 16),                             // ldr w16, [pc - 40]
+        add_shift(false, true, true, 0, 16, 0, 8, 31),       // cmp w8, w16 (fused!)
+        movw(false, 2, 0, 0x42, 16),                         // mov w16, #0x42 (kills w16)
+        csel(false, false, 10, 0, 0, 11, 0),                 // csel w0, w11, w10, eq
+        ldr_literal(1, -20, 17),                             // ldr x17, [pc - 80]
+        add_shift(true, true, true, 0, 17, 0, 9, 31),        // cmp x9, x17 (fused!)
+        movw(true, 2, 0, 0x99, 17),                          // mov x17, #0x99 (kills x17)
+        csel(true, false, 10, 11, 0, 11, 1),                 // csel x1, x11, x10, lt
+        nop(),
+    };
+    const auto* pool32 = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base() - 40));
+    const auto* pool64 = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(r.program_base() + 16 - 80));
+    for (unsigned k = 0; k < 6; ++k) {
+        auto ctx = r.context(0xf300 + k);
+        if (k == 0) { ctx.x[8] = *pool32; ctx.x[9] = *pool64; }
+        else if (k == 1) { ctx.x[8] = *pool32 - 1; ctx.x[9] = *pool64 + 1; }
+        r.run(lit_cmp, ctx, "wave f ldr+cmp " + std::to_string(k));
+    }
+}
+
+// Wave H: CSET/CSETM -> CBZ/CBNZ direct flag branch, generalized masked 2/3-insn
+// UBFIZ+[ADD/SUB]+LDR/STR folding, commutative shifted logic, TBZ/CBZ gpr_read_soon
+// cache load, SUBS/ADDS -> CBZ/CBNZ preserving live flags, and Tier-1 dead-store
+// elimination + GPR copy aliases on complete lazy regions.
+FX_TEST(core_wave_h_peepholes) {
+    using namespace a64;
+    auto& r = runner();
+
+    // 1. CSET / CSETM -> CBZ / CBNZ (32-bit, 64-bit, cross-width, live NZCV after branch).
+    // CSINC Wd, WZR, WZR, inv_cond = CSET Wd, cond; CSINV = CSETM.
+    const std::vector<std::uint32_t> cset_cbz = {
+        add_imm(false, true, true, 31, 8, 2),                // cmp w8, #2
+        csel(false, false, 31, 1, 1, 31, 11),                // cset w11, eq (csinc w11, wzr, wzr, ne)
+        cbz(false, true, 2, 11),                             // cbnz w11, +2 (branches on eq; NZCV stays live!)
+        add_imm(false, false, false, 0, 0, 1),               // add w0, w0, #1
+        csel(false, false, 10, 0, 0, 9, 1),                  // csel w1, w9, w10, eq (reads preserved NZCV!)
+        add_shift(true, true, true, 0, 13, 0, 12, 31),       // cmp x12, x13
+        csel(true, true, 31, 11, 0, 31, 14),                 // csetm x14, ge (csinv x14, xzr, xzr, lt)
+        cbz(false, false, 2, 14),                            // cbz w14, +2 (cross-width 64->32!)
+        add_imm(true, false, false, 2, 2, 5),                // add x2, x2, #5
+        csel(true, false, 10, 10, 0, 9, 3),                  // csel x3, x9, x10, ge (reads preserved NZCV!)
+        nop(),
+    };
+    for (unsigned k = 0; k < 12; ++k) {
+        auto ctx = r.context(0x10100 + k);
+        ctx.x[8] = k % 3;
+        ctx.x[12] = static_cast<std::uint64_t>(static_cast<std::int64_t>(k) - 6);
+        ctx.x[13] = 0;
+        r.run(cset_cbz, ctx, "wave h cset->cbz " + std::to_string(k));
+    }
+
+    // 2. Generalized 3-insn masked UBFIZ + ADD/SUB + LDR/STR & 2-insn UBFIZ/LSL + LDR/STR,
+    //    including LoadIC self-load (rn == rd), len=8/16 (movzx) and len=11 (and), plus live flags!
+    const std::vector<std::uint32_t> ubfiz_folds = {
+        bitfield(true, 2, 62, 10, 10, 10),                   // ubfiz x10, x10, #2, #11 (self-load!)
+        add_imm(true, true, false, 10, 10, 1),               // sub x10, x10, #1
+        ldst_reg(2, 1, 10, 3, false, 16, 10),                // ldr w10, [x16, x10]
+        bitfield(true, 2, 62, 7, 11, 12),                    // ubfiz x12, x11, #2, #8 (movzx!)
+        add_imm(true, false, false, 12, 12, 4),              // add x12, x12, #4
+        ldst_reg(2, 1, 12, 3, false, 16, 12),                // ldr w12, [x16, x12]
+        add_imm(true, true, true, 31, 8, 5),                 // cmp x8, #5 (flags live across fold!)
+        bitfield(true, 2, 62, 10, 11, 13),                   // ubfiz x13, x11, #2, #11 (must NOT clobber flags!)
+        add_imm(true, false, false, 13, 13, 4),              // add x13, x13, #4
+        ldst_reg(2, 1, 13, 3, false, 16, 13),                // ldr w13, [x16, x13]
+        csel(true, false, 10, 0, 0, 12, 0),                  // csel x0, x12, x10, eq (checks flags intact!)
+        bitfield(true, 2, 63, 7, 11, 14),                    // ubfiz x14, x11, #1, #8 (2-insn movzx!)
+        ldst_reg(1, 1, 14, 3, false, 16, 14),                // ldrh w14, [x16, x14]
+        bitfield(true, 2, 61, 60, 15, 1),                    // lsl x1, x15, #3 (2-insn LSL!)
+        ldst_reg(3, 1, 1, 3, false, 16, 1),                  // ldr x1, [x16, x1]
+        bitfield(true, 2, 62, 15, 11, 2),                    // ubfiz x2, x11, #2, #16 (movzx 16!)
+        add_imm(true, false, false, 2, 2, 8),                // add x2, x2, #8
+        ldst_reg(2, 0, 2, 3, false, 17, 10),                 // str w10, [x17, x2]
+        movw(true, 2, 0, 7, 2),                              // mov x2, #7 (kills x2)
+        nop(),
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0x10200 + k);
+        ctx.x[10] = 0xffff'ffff'ffff'f800ULL | (1u + (k & 7u));   // upper bits must be masked!
+        ctx.x[11] = 0xdead'beef'0001'0000ULL | (k & 7u);
+        ctx.x[15] = k & 7u;
+        ctx.x[8] = (k % 2 == 0) ? 5u : 6u;
+        r.run(ubfiz_folds, ctx, "wave h ubfiz fold " + std::to_string(k));
+    }
+
+    // 3. Commutative shifted logic (EOR/ORR/AND/ANDS), TBZ/CBZ + LDR, SUBS/ADDS -> CBNZ loop with live NZCV.
+    const std::vector<std::uint32_t> logic_br_loop = {
+        logic_shift(true, 2, 1, false, 11, 12, 11, 12),      // eor x12, x11, x11, lsr #12 (LoadIC hash!)
+        logic_shift(true, 1, 0, false, 12, 3, 11, 12),       // orr x12, x11, x12, lsl #3 (in-place rm == rd!)
+        logic_shift(true, 3, 1, false, 11, 4, 12, 13),       // ands x13, x12, x11, lsr #4 (flags + direct dst!)
+        csel(true, false, 12, 0, 0, 11, 0),                  // csel x0, x11, x12, eq
+        tbz(true, 0, 2, 16),                                 // tbnz w16, #0, +2 (gpr_read_soon on x16!)
+        ldst_uimm(2, 1, 0, 16, 1),                           // ldr w1, [x16]
+        cbz(true, false, 2, 17),                             // cbz x17, +2 (gpr_read_soon on x17!)
+        ldst_uimm(2, 1, 0, 17, 2),                           // ldr w2, [x17]
+        movw(false, 2, 0, 6, 14),                            // mov w14, #6
+        add_imm(true, false, false, 3, 3, 7),                // loop: add x3, x3, #7
+        add_imm(true, true, true, 14, 14, 1),                // subs x14, x14, #1
+        cbz(true, true, -2, 14),                             // cbnz x14, loop (reuses ZF, keeps host_sub live!)
+        csel(true, false, 3, 0, 0, 1, 4),                    // csel x4, x1, x3, eq (reads NZCV from final SUBS!)
+        nop(),
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0x10300 + k);
+        if (k == 0) ctx.x[11] = 0;
+        r.run(logic_br_loop, ctx, "wave h logic/br/loop " + std::to_string(k));
+    }
+
+    // 4. Tier-1 lazy loop-free region (dead-store elimination + GPR copy aliases).
+    const std::vector<std::uint32_t> lazy_loadic = {
+        logic_shift(true, 1, 0, false, 2, 0, 31, 9),         // mov x9, x2 (galias)
+        add_imm(true, false, false, 10, 9, 13),              // add x10, x9, #13
+        logic_shift(true, 2, 1, false, 10, 5, 10, 11),       // eor x11, x10, x10, lsr #5
+        add_imm(true, false, false, 12, 11, 7),              // add x12, x11, #7
+        add_imm(true, false, false, 13, 12, 3),              // add x13, x12, #3
+        add_imm(true, false, false, 14, 13, 1),              // add x14, x13, #1
+        movw(true, 2, 0, 1, 9),                              // overwrites x9 (dead before!)
+        movw(true, 2, 0, 2, 10),                             // overwrites x10 (dead before!)
+        movw(true, 2, 0, 3, 11),                             // overwrites x11 (dead before!)
+        movw(true, 2, 0, 4, 12),                             // overwrites x12 (dead before!)
+        add_shift(true, false, false, 0, 14, 0, 13, 0),      // add x0, x13, x14
+        nop(),
+    };
+    const bool old_lazy = r.machine.options.lazy;
+    r.machine.options.lazy = true;
+    for (unsigned k = 0; k < 6; ++k) r.run(lazy_loadic, r.context(0x10400 + k), "wave h lazy t1 " + std::to_string(k));
+    r.machine.options.lazy = old_lazy;
+}
+
+// Wave I: upgraded target_flags_dead (32-insn budget + unconditional B veneers),
+// UBFX lsb==0, known_constant ALU/CMP/LEA folding, dead-temp MOVZ/MOVN[+MOVK]
+// fusion with CMP/ADD/SUB/STR, and adjacent non-flag ADD/SUB #imm fusion.
+FX_TEST(core_wave_i_target_flags_dead) {
+    using namespace a64;
+    const auto cmp12 = add_shift(true, true, true, 0, 2, 0, 1, 31);   // cmp x1, x2
+    const auto cmp34 = add_shift(true, true, true, 0, 4, 0, 3, 31);   // cmp x3, x4
+    const auto csel = a64::csel(true, false, 6, 0, 0, 5, 7);          // csel x7, x5, x6, eq
+    auto& r = runner();
+    const auto translate = [&](const std::vector<std::uint32_t>& words, bool image) {
+        auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
+        std::memcpy(program, words.data(), words.size() * 4);
+        BufferCode code(r.code_base(), r.program_base() + words.size() * 4);
+        code.image = image;
+        TranslateOptions options;
+        options.max_instructions = 2;
+        return translate_region(r.program_base(), code, options);
+    };
+    const auto lists = [&](const TranslatedRegion& region, std::uint64_t begin, std::uint64_t end) {
+        for (const auto& range : region.guest_ranges)
+            if (range.first == begin && range.second == end) return true;
+        return false;
+    };
+    const bool on = core::codegen_on(core::knob_no_dead_targets);
+
+    // 1. Long prologue (> 16 insns, <= 32 insns) before first CMP: flags dead.
+    //    (End with csel rather than ret so call inlining does not inline the target.)
+    std::vector<std::uint32_t> long_prologue = {cmp12, bl(2), nop()};
+    for (unsigned k = 0; k < 22; ++k) long_prologue.push_back(add_imm(true, false, false, 9, 9, 1));
+    long_prologue.push_back(cmp34);
+    long_prologue.push_back(csel);
+    const auto reg_long = translate(long_prologue, true);
+    FX_CHECK_EQ(contains(reg_long, kRawStore), !on);
+    const auto t_long = r.program_base() + 12;
+    FX_CHECK_EQ(lists(reg_long, t_long, t_long + 23 * 4), on);
+
+    // 2. Unconditional B veneer -> B veneer -> CMP: follows up to 2 hops and records all slices.
+    // word 0: cmp12; word 1: bl +2 (word 3); word 2: nop;
+    // word 3: b +2 (word 5); word 4: nop;
+    // word 5: b +2 (word 7); word 6: nop;
+    // word 7: nop; word 8: cmp34; word 9: csel.
+    const std::vector<std::uint32_t> two_hop = {cmp12, bl(2), nop(), b(2), nop(), b(2), nop(), nop(), cmp34, csel};
+    const auto reg_hop = translate(two_hop, true);
+    FX_CHECK_EQ(contains(reg_hop, kRawStore), !on);
+    FX_CHECK_EQ(lists(reg_hop, r.program_base() + 3 * 4, r.program_base() + 4 * 4), on);
+    FX_CHECK_EQ(lists(reg_hop, r.program_base() + 5 * 4, r.program_base() + 6 * 4), on);
+    FX_CHECK_EQ(lists(reg_hop, r.program_base() + 7 * 4, r.program_base() + 9 * 4), on);
+
+    // 3. Veneer into a target that reads flags first, a B cycle, or 3 hops: stays live (kRawStore present).
+    FX_CHECK(contains(translate({cmp12, bl(2), nop(), b(2), nop(), csel, cmp34}, true), kRawStore));
+    FX_CHECK(contains(translate({cmp12, bl(2), nop(), b(0)}, true), kRawStore));
+    FX_CHECK(contains(translate({cmp12, bl(2), nop(), b(2), nop(), b(2), nop(), b(2), nop(), cmp34}, true), kRawStore));
+    FX_CHECK(contains(translate(two_hop, false), kRawStore));   // non-image code never scanned
+}
+
+FX_TEST(core_wave_i_const_and_add_fusions) {
+    using namespace a64;
+    auto& r = runner();
+
+    // 1. UBFX lsb==0, dead-temp MOVZ/MOVN[+MOVK] + CMP/ADD/SUB/STR,
+    //    known_constant ALU/CMP/LEA reuse, and adjacent non-flag ADD/SUB #imm.
+    const std::vector<std::uint32_t> prog = {
+        // UBFX W8, W9, #0, #5 (lsb == 0: must not emit rorx 0)
+        bitfield(false, 2, 0, 4, 9, 8),
+        // UBFX X10, X11, #0, #13
+        bitfield(true, 2, 0, 12, 11, 10),
+        // MOVZ + MOVK + CMP (dead temp w12)
+        movw(false, 2, 0, 0xfffd, 12),
+        movw(false, 3, 1, 0x0002, 12),
+        add_shift(false, true, true, 0, 12, 0, 8, 31),       // cmp w8, w12 (0x2fffd)
+        movw(false, 2, 0, 1, 12),                            // kills w12
+        csel(false, false, 10, 0, 0, 9, 0),                  // csel w0, w9, w10, eq
+        // MOVN + CMP (64-bit negative imm32, dead temp x12)
+        movw(true, 0, 0, 0x007c, 12),                        // movn x12, #0x7c (~0x7c = -125)
+        add_shift(true, true, true, 0, 12, 0, 11, 31),       // cmp x11, x12
+        movw(true, 2, 0, 2, 12),                             // kills x12
+        csel(true, false, 10, 11, 0, 9, 1),                  // csel x1, x9, x10, lt
+        // MOVZ + ADD (self-overwrite, Cycles pattern) and MOVZ + SUB (dead temp)
+        movw(true, 2, 0, 0xc758, 12),                        // movz x12, #0xc758
+        add_shift(true, false, false, 0, 12, 0, 10, 12),     // add x12, x10, x12
+        movw(true, 2, 0, 0x1234, 13),                        // movz x13, #0x1234
+        add_shift(true, true, false, 0, 13, 0, 12, 2),       // sub x2, x12, x13
+        movw(true, 2, 0, 3, 13),                             // kills x13
+        // MOVZ + STR (dead temp, disp8; both non-zero imm and 0, plus imm==1 safe fallback)
+        movw(false, 2, 0, 0x4242, 13),
+        ldst_uimm(2, 0, 2, 17, 13),                          // str w13, [x17, #8]
+        movw(false, 2, 0, 0, 13),
+        ldst_uimm(2, 0, 3, 17, 13),                          // str w13, [x17, #12]
+        movw(false, 2, 0, 1, 13),                            // imm == 1: keeps relocation hygiene
+        ldst_uimm(2, 0, 4, 17, 13),                          // str w13, [x17, #16]
+        movw(true, 0, 0, 5, 13),                             // movn x13, #5 (-6)
+        ldst_uimm(3, 0, 3, 17, 13),                          // str x13, [x17, #24]
+        movw(true, 2, 0, 4, 13),                             // kills x13
+        // known_constant reuse across ADD, SUBS, CMP, AND, ORR, EOR, TST (x14 kept live!)
+        movw(true, 2, 0, 0x00ff, 14),                        // x14 = 0xff (reused, not dead)
+        add_shift(true, false, false, 0, 14, 0, 2, 3),       // add x3, x2, x14
+        add_shift(true, false, false, 0, 2, 0, 14, 4),       // add x4, x14, x2 (commutative)
+        logic_shift(true, 0, 0, false, 14, 0, 11, 5),        // and x5, x11, x14 (movzx!)
+        logic_shift(true, 1, 0, false, 14, 0, 5, 6),         // orr x6, x5, x14
+        logic_shift(true, 2, 0, false, 14, 0, 6, 7),         // eor x7, x6, x14
+        logic_shift(true, 3, 0, false, 14, 0, 11, 31),       // tst x11, x14
+        csel(true, false, 6, 0, 0, 7, 15),                   // csel x15, x7, x6, eq
+        add_shift(true, true, true, 0, 14, 0, 3, 3),         // subs x3, x3, x14
+        csel(true, false, 4, 2, 0, 5, 6),                    // csel x6, x5, x4, cs
+        // Adjacent non-flag ADD/SUB #imm chains (Cycles prologue/frame address patterns):
+        add_imm(true, true, false, 31, 31, 0x200),           // sub sp, sp, #0x200
+        add_imm(true, true, false, 31, 31, 0x30),            // sub sp, sp, #0x30 -> one lea!
+        add_imm(true, false, false, 12, 31, 0x100),          // add x12, sp, #0x100
+        add_imm(true, false, false, 12, 12, 0x34),           // add x12, x12, #0x34 -> one lea!
+        add_imm(true, false, false, 31, 31, 0x200),          // add sp, sp, #0x200
+        add_imm(true, false, false, 31, 31, 0x30),           // add sp, sp, #0x30 -> restores sp!
+        // Cancelling pair (disp == 0) + SP-must-not-fuse check:
+        add_imm(false, false, false, 5, 5, 0x80),            // add w5, w5, #0x80
+        add_imm(false, true, false, 5, 5, 0x80),             // sub w5, w5, #0x80 -> zero-ext copy
+        add_imm(true, true, false, 31, 31, 0x40),            // sub sp, sp, #0x40 (must update sp!)
+        add_imm(true, false, false, 7, 31, 0x10),            // add x7, sp, #0x10 (must NOT drop sp sub!)
+        add_imm(true, false, false, 31, 31, 0x40),           // add sp, sp, #0x40
+        nop(),
+    };
+    for (unsigned k = 0; k < 10; ++k) {
+        auto ctx = r.context(0x11100 + k);
+        if (k == 0) { ctx.x[9] = 0x1f; ctx.x[11] = static_cast<std::uint64_t>(-125); }
+        else if (k == 1) { ctx.x[8] = 0x2fffd; ctx.x[11] = 0; }
+        r.run(prog, ctx, "wave i const/add " + std::to_string(k));
+    }
+
+    // 2. Deterministic codegen check: UBFX lsb==0 emits no RORX (VEX map 3, opc 0xf0),
+    //    and adjacent SUB SP + SUB SP shrinks compared to a barrier in between.
+    const auto ubfx_reg = translate_words({bitfield(false, 2, 0, 4, 9, 8), ret()}, false);
+    // RORX r32, r32, 0 uses 3-byte VEX C4 .. 7B F0 .. 00; check 0x7b 0xf0 does not appear.
+    FX_CHECK(!contains(ubfx_reg, {0x7b, 0xf0}));
+    const auto sp_fused = translate_words({
+        add_imm(true, true, false, 31, 31, 0x200),
+        add_imm(true, true, false, 31, 31, 0x30),
+        ret(),
+    }, false);
+    const auto sp_split = translate_words({
+        add_imm(true, true, false, 31, 31, 0x200),
+        add_imm(true, false, false, 0, 1, 7),
+        add_imm(true, true, false, 31, 31, 0x30),
+        ret(),
+    }, false);
+    if (core::isel_on(core::isel_no_fold)) FX_CHECK(sp_fused.stats.hot_bytes < sp_split.stats.hot_bytes);
+}
+
+// Waves M–P:
+// 1. M4: CSET -> TBNZ/CBZ flag forwarding across zero-byte inline_ret.
+// 2. O3/P1: Load-op fusion (`LDR + EOR/ADD/SUB/AND/ORR/CMP/TST` & `ADD + LDR + EOR`
+//    Sobol pattern, both straight-line dead_after and full-CFG s_.olive_out).
+// 3. O4: Cold CCMP deferral when flags_live_out == true (B.cond -> exit).
+// 4. O5b: Tier-2 bounded shift-until-zero Sobol loop (`CLZ; ADD; LDR; EOR; LSLV;
+//    ADDS r, r, r; B.NE` + `LSR #1; CBNZ`) interrupt-check elision.
+// 5. P2: Dead-source host handoff (`LDR w7, [x16]; ORR x6, x28, x7`, `AND`/`EOR`/
+//    `SUB`/`ADDS`/`SUBS`, `d.rn == d.rm` aliasing, and live-flags edge cases).
+// 6. P3: `rax` retention at `!flags_live_in` merge + Tier-2 `dirty_into_merge`.
+FX_TEST(core_waves_m_to_p_fusions_handoff_and_sobol) {
+    using namespace a64;
+    auto& r = runner();
+    constexpr auto clz32 = [](unsigned rd, unsigned rn) { return 0x5ac01000u | (rn << 5) | rd; };
+    constexpr auto lslv32 = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x1ac02000u | (rm << 16) | (rn << 5) | rd;
+    };
+
+    // 1. O3/P1 Load-op fusion + P2 dead-source host handoff (32-bit & 64-bit, RMW & non-RMW).
+    const std::vector<std::uint32_t> load_op_and_handoff = {
+        // Standalone LDR + EOR / ADD / SUB / AND / ORR (dead load reg w8/x8, both RMW and rd==d.rd)
+        ldst_uimm(2, 1, 0, 16, 8),                           // ldr w8, [x16]
+        logic_shift(false, 2, 0, false, 8, 0, 19, 19),       // eor w19, w19, w8 (pinned RMW!)
+        ldst_uimm(2, 1, 1, 16, 8),                           // ldr w8, [x16, #4]
+        add_shift(false, false, false, 0, 8, 0, 2, 2),       // add w2, w2, w8 (cached RMW!)
+        ldst_uimm(3, 1, 1, 16, 8),                           // ldr x8, [x16, #8]
+        add_shift(true, true, false, 0, 8, 0, 3, 4),         // sub x4, x3, x8 (unpinned rd != other!)
+        ldst_uimm(2, 1, 4, 16, 8),                           // ldr w8, [x16, #16]
+        logic_shift(false, 0, 0, false, 8, 0, 5, 8),         // and w8, w5, w8 (rd == d.rd!)
+        ldst_uimm(2, 1, 5, 16, 9),                           // ldr w9, [x16, #20]
+        add_imm(false, true, true, 31, 9, 42),               // cmp w9, #42 (fused CMP [mem], imm!)
+        movw(false, 2, 0, 0, 9),                             // kills w9
+        csel(false, false, 4, 0, 0, 5, 6),                   // csel w6, w5, w4, eq
+        ldst_uimm(2, 1, 6, 16, 9),                           // ldr w9, [x16, #24]
+        logic_imm(false, 3, 0, 0, 3, 9, 31),                 // tst w9, #0xf (fused TST [mem], imm!)
+        movw(false, 2, 0, 0, 9),                             // kills w9
+        csel(false, false, 6, 1, 0, 2, 7),                   // csel w7, w2, w6, ne
+        ldst_uimm(3, 1, 4, 16, 9),                           // ldr x9, [x16, #32]
+        add_shift(true, true, true, 0, 9, 0, 3, 31),         // cmp x3, x9 (fused CMP reg, [mem]!)
+        movw(true, 2, 0, 0, 9),                              // kills x9
+        csel(true, false, 7, 11, 0, 4, 10),                  // csel x10, x4, x7, lt
+        // V8 compressed-pointer idiom: LDR w7, [x16]; ORR x6, x28, x7 (dead x7 -> handoff!)
+        ldst_uimm(2, 1, 2, 16, 7),                           // ldr w7, [x16, #8]
+        logic_shift(true, 1, 0, false, 7, 0, 28, 6),         // orr x6, x28, x7 (x7 dead!)
+        movw(true, 2, 0, 3, 7),                              // kills x7
+        // P2 handoff edge cases: d.rn == d.rm (must NOT lose source), logic_imm, add_sub_imm, sub
+        logic_shift(true, 2, 0, false, 6, 0, 6, 11),         // eor x11, x6, x6 (rn == rm -> 0)
+        logic_imm(false, 0, 0, 0, 4, 6, 12),                 // and w12, w6, #0x1f (x6 dead after!)
+        movw(true, 2, 0, 5, 6),                              // kills x6
+        add_imm(false, true, true, 13, 12, 1),               // subs w13, w12, #1 (w12 dead!)
+        movw(false, 2, 0, 9, 12),                            // kills w12
+        add_shift(true, true, false, 0, 10, 0, 13, 14),      // sub x14, x13, x10 (x13 dead!)
+        movw(true, 2, 0, 1, 13),                             // kills x13
+        nop(),
+    };
+    for (unsigned k = 0; k < 10; ++k) {
+        auto ctx = r.context(0x12000 + k);
+        ctx.x[28] = 0x000002f000000000ULL;
+        if (k == 0) *reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(ctx.x[16] + 20)) = 42;
+        FX_CHECK(r.run(load_op_and_handoff, ctx, "wave op load-op & handoff " + std::to_string(k)));
+    }
+
+    // 2. O3 + O5b: Cycles Sobol RNG inner loop (ADD + LDR + EOR + bounded shift-until-zero
+    //    `LSLV + ADDS w11, w11, w11 + B.NE` + right-shift `LSR #1 + CBNZ`) in Tier-2.
+    const std::vector<std::uint32_t> sobol_loop = {
+        movw(false, 2, 0, 0, 10),                            // 0  mov w10, #0 (result)
+        movw(false, 2, 0, 0, 12),                            // 1  mov w12, #0 (dim idx)
+        // loop1 (offset 2):
+        clz32(13, 11),                                       // 2  clz w13, w11
+        add_shift(false, false, false, 0, 13, 0, 12, 12),    // 3  add w12, w12, w13
+        add_shift(true, false, false, 0, 12, 2, 16, 8),      // 4  add x8, x16, x12, lsl #2
+        ldst_uimm(2, 1, 0x20, 8, 8),                         // 5  ldr w8, [x8, #0x80]
+        logic_shift(false, 2, 0, false, 8, 0, 10, 10),       // 6  eor w10, w10, w8
+        add_imm(false, false, false, 12, 12, 1),             // 7  add w12, w12, #1
+        lslv32(11, 11, 13),                                  // 8  lslv w11, w11, w13
+        add_shift(false, false, true, 0, 11, 0, 11, 11),     // 9  adds w11, w11, w11 (w11 <<= 1, sets ZF!)
+        bcond(1, -8),                                        // 10 b.ne loop1
+        // loop2 (offset 11): LSR #1 + CBNZ
+        add_shift(false, false, false, 0, 14, 0, 10, 10),    // 11 add w10, w10, w14
+        bitfield(false, 2, 1, 31, 14, 14),                   // 12 lsr w14, w14, #1
+        cbz(false, true, -2, 14),                            // 13 cbnz w14, loop2
+        nop(),
+    };
+    const auto saved_opt = r.machine.options.optimize;
+    r.machine.options.optimize = 1;
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0x12100 + k);
+        ctx.x[11] = (k == 0) ? 0x80000001u : (k == 1) ? 0xffffffffu : (0x00010101u * (k + 1));
+        ctx.x[14] = (k == 0) ? 1u : (0x12345678u >> k);
+        FX_CHECK(r.run(sobol_loop, ctx, "wave o5b sobol bounded shift loop " + std::to_string(k)));
+    }
+
+    // 3. P3: Multi-predecessor rejoin merge into `!flags_live_in` with 6+ live unpinned regs
+    //    (stresses `rax` retention in merge_entry/build_presets & Tier-2 `dirty_into_merge`).
+    const std::vector<std::uint32_t> rax_merge = {
+        add_imm(true, false, false, 1, 1, 3),                // 0
+        add_imm(true, false, false, 2, 2, 5),                // 1
+        add_imm(true, false, false, 3, 3, 7),                // 2
+        add_imm(true, false, false, 4, 4, 11),               // 3
+        add_imm(true, false, false, 5, 5, 13),               // 4
+        add_imm(true, false, false, 6, 6, 17),               // 5 (fills all scratches incl. rax!)
+        tbz(true, 0, 5, 0),                                  // 6 tbnz w0, #0, slow (11)
+        // merge (offset 7, !flags_live_in): reads x1..x6 directly!
+        add_shift(true, false, false, 0, 2, 0, 1, 1),        // 7
+        add_shift(true, false, false, 0, 4, 0, 3, 3),        // 8
+        add_shift(true, false, false, 0, 6, 0, 5, 5),        // 9
+        b(3),                                                // 10 -> done (13)
+        // slow (offset 11): rejoins merge (7) via backward jump!
+        add_imm(true, false, false, 6, 6, 1),                // 11
+        b(-5),                                               // 12 -> merge (7)
+        // done (offset 13):
+        add_shift(true, false, false, 0, 3, 0, 1, 0),        // 13
+        add_shift(true, false, false, 0, 5, 0, 0, 0),        // 14
+    };
+    for (unsigned k = 0; k < 6; ++k) {
+        auto ctx = r.context(0x12200 + k);
+        ctx.x[0] = k;
+        FX_CHECK(r.run(rax_merge, ctx, "wave p3 rax merge " + std::to_string(k)));
+    }
+    r.machine.options.optimize = saved_opt;
+
+    // 4. M4: CSET -> TBNZ/CBZ across zero-byte inline_ret, plus O4 CCMP+B.cond
+    //    both in-region (feeding CSEL) and exiting the region (defer_cold NZCV).
+    const std::vector<std::uint32_t> prog4 = {
+        bl(7),                                               // 0  bl helper (7)
+        tbz(true, 0, 2, 0),                                  // 1  tbnz w0, #0, skip (3)
+        add_imm(true, false, false, 3, 3, 19),               // 2
+        add_shift(false, true, true, 0, 2, 0, 1, 31),        // 3  cmp w1, w2
+        ccmp(false, true, true, 5, 1, 1, 4),                 // 4  ccmp w1, #5, #4, ne (nzcv=4 -> EQ true!)
+        bcond(0, 5),                                         // 5  b.eq done (10)
+        b(4),                                                // 6  b done (10)
+        // helper (offset 7): CMP + CSET + RET (inlined!)
+        add_shift(false, true, true, 0, 5, 0, 4, 31),        // 7  cmp w4, w5
+        csel(false, false, 31, 1, 1, 31, 0),                 // 8  cset w0, eq (csinc w0, wzr, wzr, ne)
+        ret(),                                               // 9  ret
+        // done (offset 10):
+        csel(true, false, 2, 0, 0, 3, 6),                    // 10 csel x6, x3, x2, eq (reads NZCV from CCMP!)
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0x12300 + k);
+        ctx.x[4] = k & 1;
+        ctx.x[5] = (k >> 1) & 1;
+        ctx.x[1] = (k == 2) ? 5 : (k & 3);
+        ctx.x[2] = (k == 3) ? ctx.x[1] : 99;
+        FX_CHECK(r.run(prog4, ctx, "wave m4/o4 inline cset & ccmp " + std::to_string(k)));
+    }
+
+    // 5. O4: CCMP + B.EQ exiting directly out of the region (triggers defer_cold immediate-NZCV path).
+    const std::vector<std::uint32_t> prog5 = {
+        add_shift(false, true, true, 0, 2, 0, 1, 31),        // 0  cmp w1, w2
+        ccmp(false, true, true, 5, 1, 1, 4),                 // 1  ccmp w1, #5, #4, ne
+        bcond(0, 2),                                         // 2  b.eq exit (4 = stop)
+        add_imm(true, false, false, 3, 3, 7),                // 3  fallthrough
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = r.context(0x12400 + k);
+        ctx.x[1] = (k == 0 || k == 1) ? 5 : k;
+        ctx.x[2] = (k == 1 || k == 2) ? ctx.x[1] : 99;
+        FX_CHECK(r.run(prog5, ctx, "wave o4 ccmp exit defer_cold " + std::to_string(k)));
+    }
+}
+
+// Wave Q2: universal CCMP+B.cond taken-target cold deferral (both flags-live
+// and flags-dead in-region targets) and branchless dead-CSET byte-OR/AND fusion
+// (including CMP SP, #imm and live-CSET non-fusion controls).
+FX_TEST(core_wave_q2_ccmp_defer_and_cset_bool_fusion) {
+    auto& r = runner();
+    using namespace a64;
+    const auto saved_opt = r.machine.options.optimize;
+    r.machine.options.optimize = 1;
+
+    // 1. CCMP+B.EQ into in-region targets: one reads NZCV (CSEL), one overwrites NZCV.
+    const std::vector<std::uint32_t> ccmp_in_region = {
+        add_imm(false, true, true, 1, 31, 0x2d),            // 0  cmp w1, #0x2d
+        ccmp(false, true, false, 2, 1, 1, 4),               // 1  ccmp w1, w2, #4, ne (nzcv=Z -> EQ taken!)
+        bcond(0, 5),                                        // 2  b.eq live_flags_tgt (7)
+        add_imm(false, true, true, 3, 31, 0x11),            // 3  cmp w3, #0x11
+        ccmp(false, true, false, 4, 1, 3, 4),               // 4  ccmp w3, w4, #4, ne
+        bcond(0, 4),                                        // 5  b.eq dead_flags_tgt (9)
+        b(5),                                               // 6  b done (11)
+        // live_flags_tgt (7): reads NZCV from CCMP!
+        csel(true, false, 5, 0, 0, 6, 0),                   // 7  csel x0, x6, x5, eq
+        b(3),                                               // 8  b done (11)
+        // dead_flags_tgt (9): overwrites NZCV immediately
+        add_imm(false, true, true, 0, 31, 0),               // 9  cmp w0, #0
+        add_imm(true, false, false, 0, 0, 77),              // 10 add x0, x0, #77
+        // done (11):
+        nop(),                                              // 11
+    };
+    for (unsigned k = 0; k < 12; ++k) {
+        auto ctx = r.context(0x13000 + k);
+        ctx.x[1] = (k % 3 == 0) ? 0x2du : (k % 3 == 1) ? 0x55u : 0x77u;
+        ctx.x[2] = 0x55u;
+        ctx.x[3] = ((k / 3) % 3 == 0) ? 0x11u : ((k / 3) % 3 == 1) ? 0x66u : 0x88u;
+        ctx.x[4] = 0x66u;
+        FX_CHECK(r.run(ccmp_in_region, ctx, "wave q2 ccmp defer in-region " + std::to_string(k)));
+    }
+
+    // 2. Branchless dead-CSET byte-OR / byte-AND fusion (V8 2-map check idiom),
+    //    plus CMP SP, #imm, plus live-CSET control that must keep full zero-ext.
+    const std::vector<std::uint32_t> cset_bool = {
+        // (a) ORR + CBZ (w8, w9 dead after CBZ)
+        add_shift(false, true, true, 0, 2, 0, 1, 31),       // 0  cmp w1, w2
+        csel(false, false, 31, 1, 1, 31, 8),                // 1  cset w8, eq
+        add_shift(false, true, true, 0, 3, 0, 1, 31),       // 2  cmp w1, w3
+        csel(false, false, 31, 1, 1, 31, 9),                // 3  cset w9, eq
+        logic_shift(false, 1, 0, false, 8, 0, 9, 9),        // 4  orr w9, w9, w8
+        cbz(false, false, 2, 9),                            // 5  cbz w9, +2 (7)
+        add_imm(true, false, false, 0, 0, 11),              // 6  add x0, x0, #11
+        // (b) AND + TBNZ #0 with CMP SP, #imm (w8, w9, w10 dead)
+        add_imm(true, true, true, 4, 31, 7),                // 7  cmp x4, #7
+        csel(false, false, 31, 10, 1, 31, 8),               // 8  cset w8, lt (inv=GE=10)
+        add_imm(true, true, true, 31, 31, 0),               // 9  cmp sp, #0
+        csel(false, false, 31, 0, 1, 31, 9),                // 10 cset w9, ne (inv=EQ=0)
+        logic_shift(false, 0, 0, false, 8, 0, 9, 10),       // 11 and w10, w9, w8
+        tbz(true, 0, 2, 10),                                // 12 tbnz w10, #0, +2 (14)
+        add_imm(true, false, false, 0, 0, 13),              // 13 add x0, x0, #13
+        // Overwrite w8, w9, w10 on both paths so olive_out sees them dead:
+        movw(false, 2, 0, 0, 8),                            // 14 mov w8, #0
+        movw(false, 2, 0, 0, 9),                            // 15 mov w9, #0
+        movw(false, 2, 0, 0, 10),                           // 16 mov w10, #0
+        // (c) Control: w8 IS live after CBZ (must preserve upper zero bits of w8!)
+        add_shift(false, true, true, 0, 2, 0, 1, 31),       // 17 cmp w1, w2
+        csel(false, false, 31, 1, 1, 31, 8),                // 18 cset w8, eq
+        add_shift(false, true, true, 0, 3, 0, 1, 31),       // 19 cmp w1, w3
+        csel(false, false, 31, 1, 1, 31, 9),                // 20 cset w9, eq
+        logic_shift(false, 1, 0, false, 8, 0, 9, 9),        // 21 orr w9, w9, w8
+        cbz(false, false, 2, 9),                            // 22 cbz w9, +2 (24)
+        add_shift(true, false, false, 0, 8, 0, 0, 0),       // 23 add x0, x0, x8 (reads full 64-bit x8!)
+        add_shift(true, false, false, 0, 8, 0, 0, 0),       // 24 add x0, x0, x8
+    };
+    for (unsigned k = 0; k < 16; ++k) {
+        auto ctx = r.context(0x13100 + k);
+        ctx.x[1] = (k & 3);
+        ctx.x[2] = 1;
+        ctx.x[3] = 2;
+        ctx.x[4] = (k & 4) ? 3u : 10u;
+        ctx.x[8] = 0xdeadbeefcafebabeULL;
+        ctx.x[9] = 0x123456789abcdef0ULL;
+        ctx.x[10] = 0xfeedface11223344ULL;
+        FX_CHECK(r.run(cset_bool, ctx, "wave q2 cset bool fusion " + std::to_string(k)));
+    }
+    r.machine.options.optimize = saved_opt;
 }

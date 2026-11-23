@@ -23,6 +23,7 @@ namespace {
 
 constexpr std::uint64_t kLookupMask = (std::uint64_t{1} << kLookupIndexBits) - 1;
 constexpr std::size_t kLookupBytes = (kLookupMask + 1) * sizeof(std::uint64_t);
+constexpr std::size_t kFastLookupBytes = kFastLookupSlots * 2 * sizeof(std::uint64_t);
 std::size_t lookup_slot(std::uint64_t pc) { return static_cast<std::size_t>(((pc >> 2) ^ (pc >> kLookupTagShift)) & kLookupMask); }
 
 } // namespace
@@ -64,6 +65,9 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
     if (!arena_) throw std::runtime_error("TestMachine: cannot allocate code arena");
     lookup_ = static_cast<std::uint64_t*>(VirtualAlloc(nullptr, kLookupBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!lookup_) throw std::runtime_error("TestMachine: cannot allocate the lookup table");
+    fast_lookup_ = static_cast<std::uint64_t*>(VirtualAlloc(nullptr, kFastLookupBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!fast_lookup_) throw std::runtime_error("TestMachine: cannot allocate the fast lookup table");
+    for (std::size_t i = 0; i < kFastLookupSlots; ++i) fast_lookup_[2 * i] = kFastLookupEmpty;
     helpers_[helper_interpret_one] = reinterpret_cast<const void*>(&helper_interpret);
 
     x64::Assembler a;
@@ -119,6 +123,7 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
     for (unsigned i = 0; i < 10; ++i) a.movdqu(ptr(Gp::rsp, 32 + 16 * static_cast<int>(i)), x64::xmm(6 + i));
     a.mov(64, Gp::r15, Gp::rcx);
     a.mov(64, ptr(Gp::r15, host_rsp), Gp::rsp);
+    a.mov(32, ptr(Gp::r15, ctx_disp(offsetof(GuestContext, hw_rsb_free))), static_cast<std::int32_t>(kHwRsbEntries));
     for (unsigned g = 0; g < 32; ++g)
         if ((conv.guest_mask >> g) & 1u) a.mov(64, x64::gp(static_cast<unsigned>(conv.host[g])), ptr(Gp::r15, x_disp(g)));
     a.jmp(Gp::rdx);
@@ -126,6 +131,7 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
     a.align(16);
     a.bind(ret_label);
     a.mov(64, Gp::rsp, ptr(Gp::r15, host_rsp));
+    a.mov(32, ptr(Gp::r15, ctx_disp(offsetof(GuestContext, hw_rsb_free))), static_cast<std::int32_t>(kHwRsbEntries));
     for (unsigned i = 0; i < 10; ++i) a.movdqu(x64::xmm(6 + i), ptr(Gp::rsp, 32 + 16 * static_cast<int>(i)));
     a.add(64, Gp::rsp, kFrame);
     for (int i = 7; i >= 0; --i) a.pop(saved[i]);
@@ -163,10 +169,14 @@ TestMachine::TestMachine(TranslateOptions opts, std::size_t arena_bytes) : optio
 TestMachine::~TestMachine() {
     if (arena_) VirtualFree(arena_, 0, MEM_RELEASE);
     if (lookup_) VirtualFree(lookup_, 0, MEM_RELEASE);
+    if (fast_lookup_) VirtualFree(fast_lookup_, 0, MEM_RELEASE);
 }
 
 void TestMachine::reset() {
-    for (const auto& e : entries_) lookup_[lookup_slot(e.first)] = 0;   // every installed slot has its entry
+    for (const auto& e : entries_) {
+        lookup_[lookup_slot(e.first)] = 0;   // every installed slot has its entry
+        fast_lookup_[2 * fast_lookup_index(e.first)] = kFastLookupEmpty;
+    }
     entries_.clear();
     flags_dead_.clear();
     region_hosts_.clear();
@@ -194,20 +204,30 @@ void TestMachine::prepare(GuestContext& ctx) const {
     // 4 MiB through the miss stub at arena offset 0).
     static const auto* const never = static_cast<const std::uint64_t*>(
         VirtualAlloc(nullptr, kLookupBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY));
+    static auto* const never_fast = []() {
+        auto* p = static_cast<std::uint64_t*>(
+            VirtualAlloc(nullptr, kFastLookupBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        for (std::size_t i = 0; i < kFastLookupSlots; ++i) p[2 * i] = kFastLookupEmpty;
+        DWORD old = 0;
+        VirtualProtect(p, kFastLookupBytes, PAGE_READONLY, &old);
+        return p;
+    }();
     ctx.lookup_table = inline_lookup ? lookup_ : never;
     ctx.lookup_mask = kLookupMask;
+    ctx.fast_lookup = inline_lookup ? fast_lookup_ : never_fast;
     ctx.arena_base = arena_;
     ctx.table_shadow_base = 0;
-    ctx.table_shadow = empty_shadow_.data() + 1;
+    ctx.table_shadow = empty_shadow_.data() + 2;
     ctx.table_shadow_retry = table_shadows ? 1u : ~0u;
+    ctx.hw_rsb_free = kHwRsbEntries;
     for (unsigned i = 0; i < kHelperSlots; ++i) ctx.helpers[i] = helpers_[i];
 }
 
 std::vector<std::uint64_t> TestMachine::make_shadow() const {
-    std::vector<std::uint64_t> s(1 + 3 * kTableShadowSlots, 0);
+    std::vector<std::uint64_t> s(2 + 2 * kTableShadowSlots, 0);
     const auto miss = reinterpret_cast<std::uint64_t>(stub_shadow_miss_);
-    s[0] = miss;
-    std::fill(s.begin() + 1 + kTableShadowSlots, s.end(), miss);
+    s[1] = miss;
+    for (std::size_t i = 0; i < kTableShadowSlots; ++i) s[2 + 2 * i + 1] = miss;
     return s;
 }
 
@@ -231,13 +251,16 @@ const void* TestMachine::install(TranslatedRegion region, bool replace) {
             const auto old = reinterpret_cast<std::uint64_t>(it->second);
             for (auto& [base, s] : shadows_)
                 for (std::size_t i = 0; i < kTableShadowSlots; ++i)
-                    if (s[1 + kTableShadowSlots + i] == old) s[1 + kTableShadowSlots + i] = s[0];
+                    if (s[2 + 2 * i + 1] == old) s[2 + 2 * i + 1] = s[1];
         }
         if (replace) entries_[e.guest_pc] = host + e.offset;
         else entries_.emplace(e.guest_pc, host + e.offset);
         if (replace) flags_dead_[e.guest_pc] = e.flags_dead;
         else flags_dead_.emplace(e.guest_pc, e.flags_dead);
         lookup_[lookup_slot(e.guest_pc)] = ((e.guest_pc >> kLookupTagShift) << 32) | static_cast<std::uint32_t>(host + e.offset - arena_);
+        const auto fi = fast_lookup_index(e.guest_pc);
+        fast_lookup_[2 * fi] = e.guest_pc;
+        fast_lookup_[2 * fi + 1] = reinterpret_cast<std::uint64_t>(host + e.offset);
     }
     FlushInstructionCache(GetCurrentProcess(), host, region.code.size());
     regions.push_back(std::move(region));
@@ -319,18 +342,23 @@ RunResult TestMachine::run(GuestContext& ctx, const CodeSource& code, std::uint6
             ++r.shadow_misses;
             auto& s = shadows_[ctx.table_shadow_base];
             if (s.empty()) s = make_shadow();
-            ctx.table_shadow = s.data() + 1;
+            ctx.table_shadow = s.data() + 2;
             ctx.table_shadow_retry = kTableShadowRetry;
             const auto index = ctx.exit_arg;
             const auto before2 = regions.size();
-            const auto* host = index < kTableShadowSlots && ctx.pc != stop_pc ? entry_for(ctx.pc, code) : nullptr;
+            const auto* target_host = index < kTableShadowSlots && ctx.pc != stop_pc ? entry_for(ctx.pc, code) : nullptr;
             r.translations += static_cast<unsigned>(regions.size() - before2);
-            auto* pcs = s.data() + 1;
-            if (host && (pcs[index] == 0 || pcs[index] == ctx.pc)) {
-                pcs[kTableShadowSlots + index] = reinterpret_cast<std::uint64_t>(host);
-                if (pcs[index] == 0) {
-                    pcs[index] = ctx.pc;
-                    pcs[2 * kTableShadowSlots + index] = reinterpret_cast<std::uint64_t>(arena_);   // the lookup's miss
+            auto* entries = s.data() + 2;
+            if (target_host) {
+                auto& slot_pc = entries[2 * index];
+                auto& slot_host = entries[2 * index + 1];
+                if (slot_pc == 0 || slot_pc == ctx.pc) {
+                    slot_host = reinterpret_cast<std::uint64_t>(target_host);
+                    slot_pc = ctx.pc;
+                } else {
+                    // Changed/colliding entry -> permanently take site's inline lookup.
+                    slot_host = s[1];
+                    slot_pc = 1u;
                 }
             }
             break;

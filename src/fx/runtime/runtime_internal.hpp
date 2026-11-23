@@ -206,10 +206,12 @@ inline std::size_t lookup_index(std::uint64_t pc) noexcept {
 }
 void lookup_install(std::uint64_t pc, const void* host) noexcept;
 void lookup_remove(std::uint64_t pc, const void* host) noexcept;
+void fast_lookup_scrub(std::uint64_t pc) noexcept;
 
 // ---- table shadows (GuestContext::table_shadow, runtime.hpp) ------------------------------
 void table_shadow_initialize();   // after generate_stubs
 void table_shadow_init_context(GuestContext& ctx) noexcept;
+void table_shadow_destroy_context(GuestContext& ctx) noexcept;
 // ExitReason::table_shadow, after ctx.pc's entry was found or made: makes the
 // shadow of ctx.table_shadow_base this thread's and fills slot `index` with
 // `target`'s host entry (with_map_entry), unless it holds another target.
@@ -419,6 +421,9 @@ private:
 // Inside memory registered with register_guest_code_memory (not image
 // text). Lock-free.
 bool in_registered_code_memory(std::uint64_t address) noexcept;
+// Inside memory registered with register_explicit_flush_code_memory (Darwin
+// MAP_JIT). Lock-free.
+bool in_explicit_flush_code_memory(std::uint64_t address) noexcept;
 // register_guest_code_copy: if `address` is in a copy of guest code, sets
 // `delta` (copy - source) and returns true. Lock-free.
 bool guest_code_copy_delta(std::uint64_t address, std::int64_t& delta) noexcept;

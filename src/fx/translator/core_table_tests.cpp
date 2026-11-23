@@ -799,3 +799,283 @@ FX_TEST(table_dispatch_changed_table) {
         testing::compare_contexts(expect, got, "changed table " + std::to_string(trial));
     }
 }
+
+// Apple ld64 relaxes ADRP+ADD into ADR+NOP before an LLVM 32-bit byte-offset
+// switch table (`adr x8, table; nop; adr x9, base; ldrsw x10, [x8, x27, lsl #2];
+// add x9, x9, x10; br x9`). The NOP must not break table or bound recognition.
+FX_TEST(table_dispatch_adr_nop_llvm) {
+    auto& r = runner();
+    using namespace a64;
+    std::vector<std::uint32_t> w;
+    w.push_back(movw(false, 2, 0, 40, 12));                         // 0  movz w12, #40
+    const auto dispatch = w.size();
+    w.push_back(add_imm(false, false, false, 27, 27, 1));           // 1  add w27, w27, #1
+    w.push_back(logic_imm(false, 0, 0, 0, 1, 27, 27));              // 2  and w27, w27, #3
+    w.push_back(add_imm(false, true, true, 31, 27, 3));             // 3  cmp w27, #3
+    const auto b_hi_at = w.size();
+    w.push_back(bcond(8, 0));                                       // 4  b.hi default
+    const auto adr_tab_at = w.size();
+    w.push_back(adr(false, 0, 8));                                  // 5  adr x8, table
+    w.push_back(nop());                                             // 6  nop (ld64 relaxation)
+    const auto adr_base_at = w.size();
+    w.push_back(adr(false, 0, 9));                                  // 7  adr x9, base (self)
+    w.push_back(ldst_reg(2, 2, 27, 3, true, 8, 10));                // 8  ldrsw x10, [x8, x27, lsl #2]
+    w.push_back(add_shift(true, false, false, 0, 10, 0, 9, 9));     // 9  add x9, x9, x10
+    w.push_back(br(9));                                             // 10 br x9
+    std::size_t case_at[4]{};
+    std::vector<std::size_t> to_tail;
+    for (unsigned k = 0; k < 4; ++k) {
+        case_at[k] = w.size();
+        w.push_back(add_imm(true, false, false, 0, 0, 10 + k * 7));
+        to_tail.push_back(w.size());
+        w.push_back(b(0));
+    }
+    const auto def_at = w.size();
+    w.push_back(add_imm(true, false, false, 0, 0, 99));
+    const auto tail = w.size();
+    w.push_back(add_imm(false, true, true, 12, 12, 1));             // subs w12, w12, #1
+    w.push_back(bcond(1, static_cast<std::int32_t>(dispatch) - static_cast<std::int32_t>(w.size())));
+    const auto to_end = w.size();
+    w.push_back(b(0));
+    const auto tab_at = w.size();
+    for (unsigned k = 0; k < 4; ++k) {
+        const auto off = static_cast<std::int32_t>(4 * (static_cast<std::int64_t>(case_at[k]) - static_cast<std::int64_t>(adr_base_at)));
+        w.push_back(static_cast<std::uint32_t>(off));
+    }
+    const auto end = w.size();
+    w[b_hi_at] = bcond(8, static_cast<std::int32_t>(def_at) - static_cast<std::int32_t>(b_hi_at));
+    w[adr_tab_at] = adr(false, static_cast<std::int32_t>(4 * (tab_at - adr_tab_at)), 8);
+    for (const auto at : to_tail) w[at] = b(static_cast<std::int32_t>(tail) - static_cast<std::int32_t>(at));
+    w[to_end] = b(static_cast<std::int32_t>(end) - static_cast<std::int32_t>(to_end));
+
+    const auto base = r.program_base();
+    auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(base));
+    std::memcpy(program, w.data(), w.size() * 4);
+    program[w.size()] = brk(0xdead);
+    const BufferCode code(r.code_base(), base + (w.size() + 1) * 4);
+    const auto region = translate_region(base, code);
+    if (cases_in_region()) {
+        for (const auto at : case_at) {
+            bool covered = false;
+            for (const auto& [b0, e0] : region.guest_ranges) covered |= base + 4 * at >= b0 && base + 4 * at < e0;
+            FX_CHECK(covered);
+        }
+    }
+    auto ctx = r.context(9191);
+    FX_CHECK(r.run(w, ctx, "adr+nop llvm table"));
+}
+
+// V8 15 JSDispatchTable pattern: stride-16 entries indexed by `handle >> 8`
+// with in-place base advance (`add x20, x20, x2, lsl #4`) and overwritten
+// index (`ldr x2, [x20]; mov x17, x2; br x17`). Must hit table_shadow.
+FX_TEST(table_dispatch_stride16_shadow) {
+    auto& r = runner();
+    using namespace a64;
+    std::vector<std::uint32_t> w;
+    w.push_back(movw(false, 2, 0, 40, 12));                         // 0  movz w12, #40
+    const auto dispatch = w.size();
+    w.push_back(add_imm(true, false, false, 14, 14, 1));            // 1  add x14, x14, #1
+    w.push_back(logic_imm(true, 0, 1, 0, 2, 14, 14));               // 2  and x14, x14, #7
+    w.push_back(bitfield(true, 2, 56, 55, 14, 4));                  // 3  lsl x4, x14, #8 (dispatch handle)
+    w.push_back(logic_shift(true, 1, 0, false, 18, 0, 31, 20));     // 4  mov x20, x18 (table base)
+    w.push_back(bitfield(true, 2, 8, 63, 4, 2));                    // 5  lsr x2, x4, #8
+    w.push_back(add_shift(true, false, false, 0, 2, 4, 20, 20));    // 6  add x20, x20, x2, lsl #4
+    w.push_back(ldst_uimm(3, 1, 0, 20, 2));                         // 7  ldr x2, [x20]
+    w.push_back(logic_shift(true, 1, 0, false, 2, 0, 31, 17));      // 8  mov x17, x2
+    w.push_back(br(17));                                            // 9  br x17
+    std::size_t case_at[4]{};
+    std::vector<std::size_t> to_tail;
+    for (unsigned k = 0; k < 4; ++k) {
+        case_at[k] = w.size();
+        w.push_back(add_imm(true, false, false, 0, 0, 3 + k * 5));
+        to_tail.push_back(w.size());
+        w.push_back(b(0));
+    }
+    const auto tail = w.size();
+    w.push_back(add_imm(false, true, true, 12, 12, 1));
+    w.push_back(bcond(1, static_cast<std::int32_t>(dispatch) - static_cast<std::int32_t>(w.size())));
+    const auto to_end = w.size();
+    w.push_back(b(0));
+    if (w.size() & 1) w.push_back(0);
+    const auto tab_at = w.size();
+    const auto base = r.program_base();
+    for (unsigned k = 0; k < 8; ++k) {
+        const auto target = base + 4 * case_at[k % 4];
+        w.push_back(static_cast<std::uint32_t>(target));
+        w.push_back(static_cast<std::uint32_t>(target >> 32));
+        w.push_back(0x12345678u + k);   // second 8-byte metadata word of stride-16 entry
+        w.push_back(0);
+    }
+    const auto end = w.size();
+    for (const auto at : to_tail) w[at] = b(static_cast<std::int32_t>(tail) - static_cast<std::int32_t>(at));
+    w[to_end] = b(static_cast<std::int32_t>(end) - static_cast<std::int32_t>(to_end));
+
+    auto start = r.context(9292);
+    start.x[18] = base + 4 * tab_at;
+    FX_CHECK(r.run(w, start, "stride16 table dispatch"));
+
+    // High indices (e.g. V8 JSDispatchTable handles >= kTableShadowSlots) with
+    // adjusted base pointer must also execute identically to the oracle.
+    const std::uint64_t high_idx = kTableShadowSlots + 37u;
+    std::vector<std::uint32_t> w2 = w;
+    // Replace `and x14, x14, #7` with `and x14, x14, #7; add x14, x14, #high_idx` via x15 holding high_idx.
+    w2[2] = logic_imm(true, 0, 1, 0, 2, 14, 14);
+    w2.insert(w2.begin() + 3, add_shift(true, false, false, 0, 15, 0, 14, 14));   // add x14, x14, x15
+    // Re-patch branches shifted by +1 instruction (case_at and tail shifted by +1).
+    for (unsigned k = 0; k < 4; ++k) w2[to_tail[k] + 1] = b(static_cast<std::int32_t>(tail) - static_cast<std::int32_t>(to_tail[k]));
+    w2[tail + 2] = bcond(1, static_cast<std::int32_t>(dispatch) - static_cast<std::int32_t>(tail + 2));
+    w2[to_end + 1] = b(static_cast<std::int32_t>(end) - static_cast<std::int32_t>(to_end));
+    // Re-adjust table entries for the +1 shift (aligned to 8 bytes if needed).
+    FX_REQUIRE(w2.size() == w.size() + 1);
+    const std::size_t tab2 = tab_at + 1;
+    // Ensure 8-byte alignment isn't needed (x64 unaligned ok), update targets by +4.
+    for (unsigned k = 0; k < 8; ++k) {
+        const auto target = base + 4 * (case_at[k % 4] + 1);
+        w2[tab2 + 4 * k + 0] = static_cast<std::uint32_t>(target);
+        w2[tab2 + 4 * k + 1] = static_cast<std::uint32_t>(target >> 32);
+    }
+    auto start2 = r.context(9393);
+    start2.x[15] = high_idx;
+    start2.x[18] = (base + 4 * tab2) - high_idx * 16u;
+    FX_CHECK(r.run(w2, start2, "stride16 high-index dispatch"));
+}
+
+// Wave F1: Clang/LLVM switch with LSL #2 (`ldrsw x10, [x8, x11, lsl #2]`) and
+// unmodified index whose case span exceeds kMaxTargetSpan (16 KiB) — Cycles
+// SVM shader pattern. Must use indexed dispatch (not target-span rejected),
+// AND must also recognize image-code switches whose cases exceed window_forward.
+FX_TEST(table_dispatch_lsl_wide_span) {
+    auto& r = runner();
+    using namespace a64;
+    std::vector<std::uint32_t> w;
+    w.push_back(movw(false, 2, 0, 32, 12));                         // 0  movz w12, #32
+    const auto dispatch = w.size();
+    w.push_back(add_imm(false, false, false, 11, 11, 1));           // 1  add w11, w11, #1 (zero-extends x11)
+    w.push_back(logic_imm(false, 0, 0, 0, 1, 11, 11));              // 2  and w11, w11, #3
+    w.push_back(add_imm(false, true, true, 31, 11, 3));             // 3  cmp w11, #3
+    const auto b_hi_at = w.size();
+    w.push_back(bcond(8, 0));                                       // 4  b.hi default
+    const auto adr_tab_at = w.size();
+    w.push_back(adr(false, 0, 8));                                  // 5  adr x8, table
+    const auto adr_base_at = w.size();
+    w.push_back(adr(false, 0, 9));                                  // 6  adr x9, base
+    w.push_back(ldst_reg(2, 2, 11, 3, true, 8, 10));                // 7  ldrsw x10, [x8, x11, lsl #2]
+    w.push_back(add_shift(true, false, false, 0, 10, 0, 9, 9));     // 8  add x9, x9, x10
+    w.push_back(br(9));                                             // 9  br x9
+    std::size_t case_at[4]{};
+    std::vector<std::size_t> to_tail;
+    for (unsigned k = 0; k < 4; ++k) {
+        case_at[k] = w.size();
+        w.push_back(add_imm(true, false, false, 0, 0, 5 + k * 3));
+        to_tail.push_back(w.size());
+        w.push_back(b(0));
+        // Pad > 4200 words (~16.8 KiB) after case 0 so hi_t - lo_t > kMaxTargetSpan (16 KiB).
+        if (k == 0) w.insert(w.end(), 4200, nop());
+    }
+    const auto def_at = w.size();
+    w.push_back(add_imm(true, false, false, 0, 0, 77));
+    const auto tail = w.size();
+    w.push_back(add_imm(false, true, true, 12, 12, 1));             // subs w12, w12, #1
+    w.push_back(bcond(1, static_cast<std::int32_t>(dispatch) - static_cast<std::int32_t>(w.size())));
+    const auto to_end = w.size();
+    w.push_back(b(0));
+    const auto tab_at = w.size();
+    for (unsigned k = 0; k < 4; ++k) {
+        const auto off = static_cast<std::int32_t>(4 * (static_cast<std::int64_t>(case_at[k]) - static_cast<std::int64_t>(adr_base_at)));
+        w.push_back(static_cast<std::uint32_t>(off));
+    }
+    const auto end = w.size();
+    w[b_hi_at] = bcond(8, static_cast<std::int32_t>(def_at) - static_cast<std::int32_t>(b_hi_at));
+    w[adr_tab_at] = adr(false, static_cast<std::int32_t>(4 * (tab_at - adr_tab_at)), 8);
+    for (const auto at : to_tail) w[at] = b(static_cast<std::int32_t>(tail) - static_cast<std::int32_t>(at));
+    w[to_end] = b(static_cast<std::int32_t>(end) - static_cast<std::int32_t>(to_end));
+
+    // 1. Full region (unbounded): indexed dispatch handles >16 KiB span with 0 lookups.
+    FX_CHECK(r.run(w, r.context(0xf501), "lsl wide span"));
+    if (tables_enabled()) FX_CHECK_EQ(r.last.lookups, 0u);
+
+    // 2. Synthetic window_forward = 8192 (Mach-O without .pdata): cases past
+    //    8 KiB become linkable direct exits instead of rejecting the table.
+    const auto saved_fwd = r.machine.options.window_forward;
+    const auto saved_bwd = r.machine.options.window_backward;
+    r.machine.options.window_forward = 8192;
+    r.machine.options.window_backward = 2048;
+    FX_CHECK(r.run(w, r.context(0xf502), "lsl wide span windowed"));
+    if (tables_enabled()) FX_CHECK_EQ(r.last.lookups, 0u);
+    r.machine.options.window_forward = saved_fwd;
+    r.machine.options.window_backward = saved_bwd;
+}
+
+// Wave M2 / O2: Explicit regression test for interleaved 16-byte table_shadow
+// (kTableShadowSlots = 8192) even when no_shadows is enabled by default, plus
+// Wave O1 wide-arm switch direct exits preserving live NZCV into a case.
+FX_TEST(table_dispatch_interleaved_shadow_explicit) {
+    auto& r = runner();
+    core::PlanOverrides o = core::default_plan_overrides();
+    o.no_shadows = false;
+    core::set_overrides_for_testing(&o);
+    struct Guard {
+        ~Guard() { core::set_overrides_for_testing(nullptr); }
+    } guard;
+    for (const unsigned offset : {0u, 2000u, static_cast<unsigned>(kTableShadowSlots)}) {
+        const auto s = make_heap_switch(8100 + offset, r.program_base(), 5, 32, offset, false, false);
+        auto start = r.context(8200 + offset);
+        start.x[18] = r.program_base() + 4 * s.table;
+        FX_CHECK(r.run(s.words, start, "explicit shadow +" + std::to_string(offset)));
+        if (offset + 16 <= kTableShadowSlots) {
+            FX_CHECK(r.last.shadow_misses >= 1u);
+            FX_CHECK_EQ(r.last.lookups, 0u);
+        }
+    }
+
+    // Wave O1: Wide-gap C++ switch (> 256 B between cases -> linkable direct exits)
+    // where case 0 reads incoming NZCV from the bounds CMP via CSEL (tests raw_ok
+    // in e_table_branch + normalize_entry_flags on the target region).
+    using namespace a64;
+    std::vector<std::uint32_t> w;
+    w.push_back(movw(false, 2, 0, 16, 12));                         // 0  mov w12, #16
+    const auto dispatch = w.size();
+    w.push_back(add_imm(false, false, false, 11, 11, 1));           // 1  add w11, w11, #1
+    w.push_back(logic_imm(false, 0, 0, 0, 1, 11, 11));              // 2  and w11, w11, #3
+    w.push_back(add_imm(false, true, true, 31, 11, 3));             // 3  cmp w11, #3 (sets NZCV!)
+    const auto b_hi_at = w.size();
+    w.push_back(bcond(8, 0));                                       // 4  b.hi default
+    const auto adr_tab_at = w.size();
+    w.push_back(adr(false, 0, 8));                                  // 5  adr x8, table
+    const auto adr_base_at = w.size();
+    w.push_back(adr(false, 0, 9));                                  // 6  adr x9, base
+    w.push_back(ldst_reg(2, 2, 11, 3, true, 8, 10));                // 7  ldrsw x10, [x8, x11, lsl #2]
+    w.push_back(add_shift(true, false, false, 0, 10, 0, 9, 9));     // 8  add x9, x9, x10
+    w.push_back(br(9));                                             // 9  br x9
+    std::size_t case_at[4]{};
+    std::vector<std::size_t> to_tail;
+    for (unsigned k = 0; k < 4; ++k) {
+        case_at[k] = w.size();
+        // Read NZCV from CMP w11, #3 right at case entry!
+        w.push_back(csel(true, false, 1, 0, 0, 0, 0));              // csel x0, x0, x1, eq (true iff w11==3)
+        w.push_back(add_imm(true, false, false, 0, 0, 1 + k * 2));
+        to_tail.push_back(w.size());
+        w.push_back(b(0));
+        // 80 NOPs (320 B > 256 B) between cases so Wave O1 keeps cases as linkable direct exits.
+        w.insert(w.end(), 80, nop());
+    }
+    const auto def_at = w.size();
+    w.push_back(add_imm(true, false, false, 0, 0, 77));
+    const auto tail = w.size();
+    w.push_back(add_imm(false, true, true, 12, 12, 1));
+    w.push_back(bcond(1, static_cast<std::int32_t>(dispatch) - static_cast<std::int32_t>(w.size())));
+    const auto to_end = w.size();
+    w.push_back(b(0));
+    const auto tab_at = w.size();
+    for (unsigned k = 0; k < 4; ++k) {
+        const auto off = static_cast<std::int32_t>(4 * (static_cast<std::int64_t>(case_at[k]) - static_cast<std::int64_t>(adr_base_at)));
+        w.push_back(static_cast<std::uint32_t>(off));
+    }
+    const auto end = w.size();
+    w[b_hi_at] = bcond(8, static_cast<std::int32_t>(def_at) - static_cast<std::int32_t>(b_hi_at));
+    w[adr_tab_at] = adr(false, static_cast<std::int32_t>(4 * (tab_at - adr_tab_at)), 8);
+    for (const auto at : to_tail) w[at] = b(static_cast<std::int32_t>(tail) - static_cast<std::int32_t>(at));
+    w[to_end] = b(static_cast<std::int32_t>(end) - static_cast<std::int32_t>(to_end));
+    FX_CHECK(r.run(w, r.context(8300), "wave o1 wide-gap switch raw nzcv"));
+    if (tables_enabled()) FX_CHECK_EQ(r.last.lookups, 0u);
+}

@@ -36,8 +36,10 @@
 #include "transmute/fx/context.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <span>
+#include <stdexcept>
 
 namespace transmute::fx {
 
@@ -216,6 +218,13 @@ public:
         (void)swapped;
         return false;
     }
+    // FCCMP/FCCMPE fusion: when the only consumer of the resulting NZCV is a
+    // B.cond or CSEL-family instruction in the same block with NZCV dead after
+    // it, returns that consumer's ARM condition (0..13), else -1. The emitter
+    // then leaves the boolean result in host ZF (NE iff consumer holds) and
+    // calls set_fccmp_bool() instead of building NZCV in ctx->nzcv.
+    [[nodiscard]] virtual int fccmp_consumer_cond() const { return -1; }
+    virtual void set_fccmp_bool() {}
 
     // ---- deferred vector writes (added by translator core; additive) ----------
     // True if a write_vec(index) register becomes guest-visible only when the
@@ -225,6 +234,30 @@ public:
     [[nodiscard]] virtual bool vec_write_deferred(unsigned index) const {
         (void)index;
         return false;
+    }
+    // True if guest vector register `index` is pinned in a callee-saved host
+    // register (consumes no scratch XMMs when read or written). Pure query.
+    [[nodiscard]] virtual bool vec_pinned(unsigned index) const {
+        (void)index;
+        return false;
+    }
+    // Number of scratch XMM registers currently free for this instruction.
+    [[nodiscard]] virtual unsigned vec_scratch_avail() const { return 6; }
+    // True if guest vector register `index` is overwritten before any read,
+    // fault, or control-flow transfer starting `consumed` instructions after
+    // the current instruction in the same basic block (or dead across the CFG).
+    [[nodiscard]] virtual bool vec_dead_after(unsigned consumed, unsigned index) const {
+        (void)consumed;
+        (void)index;
+        return false;
+    }
+    // True if the sign of zero in `es`-bit FP lanes (32 or 64) of vector
+    // register `index` is unobservable starting `consumed` instructions after
+    // the current instruction (dead, or only read by sign-of-zero-insensitive
+    // `es`-bit vector compares/FABS before being overwritten or becoming dead).
+    [[nodiscard]] virtual bool vec_sz_dead_after(unsigned consumed, unsigned index, unsigned es) const {
+        (void)es;
+        return vec_dead_after(consumed, index);
     }
 
     // ---- current context slots (added by neon/fp; additive) -------------------
@@ -348,6 +381,22 @@ public:
         (void)index;
         (void)es;
         return false;
+    }
+
+    // ---- cold out-of-line stubs & host flags liveness (additive) -------------
+    // True if host EFLAGS currently hold live guest NZCV that must be
+    // preserved (flag-clobbering checks should call clobber_host_flags() or
+    // use a flag-free guard). Default true (conservative).
+    [[nodiscard]] virtual bool host_flags_live() const { return true; }
+    // True if guest NZCV produced by this instruction may be read later (or
+    // escapes the region). Default true (conservative).
+    [[nodiscard]] virtual bool flags_live_out() const { return true; }
+    // True if defer_cold() will emit callbacks out-of-line in the region's
+    // cold section (before constant pool finalization).
+    [[nodiscard]] virtual bool can_defer_cold() const { return false; }
+    virtual void defer_cold(std::function<void()> fn) {
+        (void)fn;
+        throw std::logic_error("defer_cold() called without support");
     }
 };
 

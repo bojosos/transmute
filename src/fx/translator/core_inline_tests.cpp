@@ -243,12 +243,17 @@ LONG CALLBACK inline_fault_handler(EXCEPTION_POINTERS* info) {
 
 std::uint64_t nzcv_at_fault(const GuestContext& ctx) {
     const auto f = g_fc.eflags;
-    const std::uint64_t n = (f >> 7) & 1, z = (f >> 6) & 1, cf = f & 1, v = (f >> 11) & 1;
+    const std::uint64_t n = (f >> 7) & 1, z = (f >> 6) & 1, p = (f >> 2) & 1, cf = f & 1, v = (f >> 11) & 1;
     switch (g_fc.flags) {
     case FlagsLocation::host_sub: return (n << 31) | (z << 30) | ((cf ^ 1) << 29) | (v << 28);
     case FlagsLocation::host_add:
     case FlagsLocation::host_logic: return (n << 31) | (z << 30) | (cf << 29) | (v << 28);
     case FlagsLocation::host_register: return g_fc.flags_value & 0xf0000000u;
+    case FlagsLocation::host_fcmp:
+    case FlagsLocation::host_fcmp_swapped:
+        if (p) return 0x30000000u;
+        if (z) return 0x60000000u;
+        return ((g_fc.flags == FlagsLocation::host_fcmp) ? cf : !cf) ? 0x80000000u : 0x20000000u;
     default: return ctx.nzcv;
     }
 }

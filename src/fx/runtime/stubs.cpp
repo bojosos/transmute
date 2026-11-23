@@ -71,6 +71,7 @@ constexpr std::int32_t kExitReason = ctx_disp(offsetof(GuestContext, exit_reason
 constexpr std::int32_t kExitArg = ctx_disp(offsetof(GuestContext, exit_arg));
 constexpr std::int32_t kHostRsp = ctx_disp(offsetof(GuestContext, host_rsp));
 constexpr std::int32_t kLookupTable = ctx_disp(offsetof(GuestContext, lookup_table));
+constexpr std::int32_t kFastLookup = ctx_disp(offsetof(GuestContext, fast_lookup));
 
 constexpr std::int32_t kFrameSize = 232;
 constexpr std::int32_t kHostMxcsr = 32;
@@ -191,23 +192,45 @@ void generate_stubs() {
     a.mov(64, Gp::rax, ptr(Gp::r15, kPc));
     a.test(8, Gp::rax, 3);
     a.jcc(Cond::ne, miss);
+    a.mov(64, Gp::r8, Gp::rax);                                           // r8 = guest pc
     a.mov(64, Gp::rcx, Gp::rax);
     a.shr(64, Gp::rax, static_cast<std::uint8_t>(kLookupTagShift));
     a.shr(64, Gp::rcx, 2);
     a.xor_(32, Gp::rcx, Gp::rax);
     a.and_(32, Gp::rcx, static_cast<std::int32_t>(kLookupMask));
-    a.mov(64, Gp::rdx, ptr(Gp::r15, kLookupTable));
-    a.mov(64, Gp::rdx, ptr(Gp::rdx, Gp::rcx, 8));
-    a.test(64, Gp::rdx, Gp::rdx);   // an empty slot would "hit" offset 0, which stores rcx and the globals
+    a.mov(64, Gp::r10, ptr(Gp::r15, kLookupTable));
+    a.lea(64, Gp::r10, ptr(Gp::r10, Gp::rcx, 8));                         // r10 = &g_table[main_idx]
+    a.mov(64, Gp::r11, ptr(Gp::r10));                                     // r11 = entry
+    a.test(64, Gp::r11, Gp::r11);   // an empty slot would "hit" offset 0, which stores rcx and the globals
     a.jcc(Cond::e, miss);
-    a.mov(64, Gp::rcx, Gp::rdx);
+    a.mov(64, Gp::rcx, Gp::r11);
     a.shr(64, Gp::rcx, 32);
     a.cmp(64, Gp::rax, Gp::rcx);
     a.jcc(Cond::ne, miss);
-    a.mov(32, Gp::rax, Gp::rdx);
+    a.mov(32, Gp::rax, Gp::r11);
     a.lea(64, Gp::rcx, x64::rip(start));
-    a.add(64, Gp::rax, Gp::rcx);
-    load_globals(a);   // rax, rcx, rdx are not convention hosts
+    a.add(64, Gp::rax, Gp::rcx);                                          // rax = host entry
+    // Populate this thread's L1 fast_lookup slot (lock-free, linearizable with lookup_remove).
+    {
+        const Label done_fill = a.new_label();
+        a.mov(64, Gp::r9, ptr(Gp::r15, kFastLookup));
+        a.test(64, Gp::r9, Gp::r9);
+        a.jcc_short(Cond::e, done_fill);
+        a.mov(32, Gp::rcx, Gp::r8);
+        a.shr(32, Gp::rcx, static_cast<std::uint8_t>(kFastLookupBits));
+        a.xor_(32, Gp::rcx, Gp::r8);
+        a.and_(32, Gp::rcx, static_cast<std::int32_t>(kFastLookupMask4));
+        a.lea(64, Gp::r9, ptr(Gp::r9, Gp::rcx, 4));
+        a.mov(64, ptr(Gp::r9), static_cast<std::int32_t>(kFastLookupEmpty));
+        a.mov(64, ptr(Gp::r9, 8), Gp::rax);
+        a.mov(64, Gp::rcx, Gp::r8);
+        a.xchg(64, ptr(Gp::r9), Gp::rcx);                                 // seq_cst publish guest_pc
+        a.cmp(64, Gp::r11, ptr(Gp::r10));                                 // re-verify g_table slot unchanged
+        a.jcc_short(Cond::e, done_fill);
+        a.mov(64, ptr(Gp::r9), static_cast<std::int32_t>(kFastLookupEmpty));
+        a.bind(done_fill);
+    }
+    load_globals(a);   // rax is not a convention host
     a.jmp(Gp::rax);
 
     // ---- indirect_live: from translated code ---------------------------------
@@ -312,6 +335,7 @@ void generate_stubs() {
     if (!globals) exit_live_offset = exit_offset;
     a.bind(dispatch_exit);
     a.mov(64, Gp::rsp, ptr(Gp::r15, kHostRsp));
+    a.mov(32, ptr(Gp::r15, ctx_disp(offsetof(GuestContext, hw_rsb_free))), static_cast<std::int32_t>(kHwRsbEntries));
     a.stmxcsr(ptr(Gp::rsp, kGuestMxcsr));
     {
         const Label same = a.new_label();     // ldmxcsr only when the value changes
@@ -360,6 +384,7 @@ void generate_stubs() {
     a.mov(64, Gp::rax, ptr(Gp::r15, kHostRsp));
     a.mov(64, ptr(Gp::rsp, kOldHostRsp), Gp::rax);
     a.mov(64, ptr(Gp::r15, kHostRsp), Gp::rsp);
+    a.mov(32, ptr(Gp::r15, ctx_disp(offsetof(GuestContext, hw_rsb_free))), static_cast<std::int32_t>(kHwRsbEntries));
     load_globals(a);   // rdx (code) is not a convention host
     a.jmp(Gp::rdx);
     const auto enter_end = a.size();

@@ -31,7 +31,13 @@ struct DemandCommitEntry {
 std::atomic<const DemandCommitEntry*> g_demand_commit{nullptr};
 
 std::uint64_t nzcv_from_eflags(std::uint32_t eflags, FlagsLocation location) {
-    const bool cf = eflags & 0x1, zf = eflags & 0x40, sf = eflags & 0x80, of = eflags & 0x800;
+    const bool cf = eflags & 0x1, pf = eflags & 0x4, zf = eflags & 0x40, sf = eflags & 0x80, of = eflags & 0x800;
+    if (location == FlagsLocation::host_fcmp || location == FlagsLocation::host_fcmp_swapped) {
+        if (pf) return 0x30000000ull;   // UN
+        if (zf) return 0x60000000ull;   // EQ
+        const bool lt = (location == FlagsLocation::host_fcmp) ? cf : !cf;
+        return lt ? 0x80000000ull : 0x20000000ull;   // LT : GT
+    }
     std::uint64_t nzcv = (sf ? 1ull << 31 : 0) | (zf ? 1ull << 30 : 0);
     switch (location) {
     case FlagsLocation::host_sub: nzcv |= (cf ? 0 : 1ull << 29) | (of ? 1ull << 28 : 0); break;

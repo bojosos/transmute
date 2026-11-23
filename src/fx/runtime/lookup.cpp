@@ -48,9 +48,14 @@ void lookup_install(std::uint64_t pc, const void* host) noexcept {
 void lookup_remove(std::uint64_t pc, const void* host) noexcept {
     table_shadow_scrub(host);   // every path that drops an entry comes here
     std::uint64_t value;
-    if (!encode(pc, host, value)) return;
-    auto s = slot(pc);
-    if (s.load(std::memory_order_relaxed) == value) s.store(0, std::memory_order_release);
+    if (encode(pc, host, value)) {
+        auto s = slot(pc);
+        std::uint64_t expected = value;
+        // Full fence so concurrent stub_indirect fast_lookup fills either get
+        // scrubbed below or observe the cleared g_table slot on their re-check.
+        s.compare_exchange_strong(expected, 0, std::memory_order_seq_cst, std::memory_order_relaxed);
+    }
+    fast_lookup_scrub(pc);
 }
 
 const void* lookup_probe(std::uint64_t pc) noexcept {

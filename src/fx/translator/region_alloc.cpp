@@ -86,6 +86,90 @@ void RegionEmitter::compute_tier2() {
             }
         }
         if (budget == 0) std::fill(s_.no_check.begin(), s_.no_check.end(), std::uint8_t{0});
+
+        // Provably bounded shift-until-zero single-block loops (e.g. Cycles Sobol
+        // `lzcnt; add; ldr; eor; lslv; adds r, r, r; b.ne` — guaranteed <= 64
+        // iterations): skip the per-iteration interrupt check; any pending
+        // interrupt is serviced immediately on loop exit / next region or header.
+        for (std::int32_t h = 0; h < n; ++h) {
+            if (!insts[static_cast<std::size_t>(h)].loop_header || s_.no_check[static_cast<std::size_t>(h)]) continue;
+            const auto e = s_.loop_end[static_cast<std::size_t>(h)];
+            if (e <= h || e - h > 16) continue;
+            bool straight = true;
+            for (std::int32_t i = h; i < e && straight; ++i) {
+                const auto& pi = insts[static_cast<std::size_t>(i)];
+                if (pi.flow != Flow::normal || pi.fall != i + 1 || pi.conservative_writes || pi.inst.kind == Kind::unknown)
+                    straight = false;
+                if (i > h && (pi.leader || pi.entry)) straight = false;
+            }
+            if (!straight) continue;
+            const auto& pe = insts[static_cast<std::size_t>(e)];
+            if (pe.taken != h || pe.fall != e + 1) continue;
+            unsigned ind = 31;
+            bool sf = false;
+            int dir = 0;   // +1: monotonic logical left-shift, -1: monotonic logical right-shift
+            bool strict = false;
+            if (pe.inst.kind == Kind::compare_branch && pe.inst.op == 1 && pe.inst.rd < 31) {
+                // CBNZ r, h
+                ind = pe.inst.rd;
+                sf = pe.inst.sf;
+            } else if (pe.inst.kind == Kind::branch_cond && pe.inst.cond == 1) {
+                // B.NE h: last flag writer in [h..e-1] must be ADDS r, r, r (r <<= 1, Z=(r==0)).
+                std::int32_t fw = -1;
+                for (std::int32_t i = e - 1; i >= h; --i) {
+                    if (insts[static_cast<std::size_t>(i)].writes_flags) {
+                        fw = i;
+                        break;
+                    }
+                }
+                if (fw < h) continue;
+                const auto& f = insts[static_cast<std::size_t>(fw)].inst;
+                if (f.kind != Kind::add_sub_shift || f.op != 0 || !f.s || f.shift != 0 || f.amount != 0 ||
+                    f.rd >= 31 || f.rn != f.rd || f.rm != f.rd)
+                    continue;
+                ind = f.rd;
+                sf = f.sf;
+                dir = 1;
+                strict = true;
+            } else {
+                continue;
+            }
+            const auto bit = 1u << ind;
+            bool ok = true;
+            for (std::int32_t i = h; i < e && ok; ++i) {
+                const auto& pi = insts[static_cast<std::size_t>(i)];
+                if ((pi.writes & bit) == 0) continue;
+                const auto& d = pi.inst;
+                if (d.rd != ind || d.sf != sf) { ok = false; break; }
+                int op_dir = 0;
+                bool op_strict = false;
+                if (d.kind == Kind::add_sub_shift && d.op == 0 && d.shift == 0 && d.amount == 0 &&
+                    d.rn == ind && d.rm == ind) {
+                    op_dir = 1;   // ADD/ADDS r, r, r => r <<= 1
+                    op_strict = true;
+                } else if (d.kind == Kind::dp2 && d.rn == ind && (d.op == dp2_lslv || d.op == dp2_lsrv)) {
+                    op_dir = d.op == dp2_lslv ? 1 : -1;   // LSLV / LSRV r, r, shift
+                } else if (d.kind == Kind::bitfield && d.op == 2 && d.rn == ind) {
+                    const unsigned width = sf ? 64u : 32u;
+                    if (d.imms == width - 1 && d.amount > 0 && d.amount < width) {
+                        op_dir = -1;   // LSR r, r, #k (k >= 1)
+                        op_strict = true;
+                    } else if (d.amount > 0 && d.amount < width && d.imms + 1 == d.amount) {
+                        op_dir = 1;    // LSL r, r, #k (k >= 1)
+                        op_strict = true;
+                    } else {
+                        ok = false;
+                    }
+                } else {
+                    ok = false;
+                }
+                if (!ok) break;
+                if (dir == 0) dir = op_dir;
+                else if (dir != op_dir) ok = false;
+                strict |= op_strict;
+            }
+            if (ok && dir != 0 && strict) s_.no_check[static_cast<std::size_t>(h)] = 1;
+        }
     }
 
     // Pin lending (see "pin lending" below): innermost loops first, ranges
@@ -137,6 +221,12 @@ void RegionEmitter::compute_tier2() {
         }
     }
 
+    compute_liveness();
+}
+
+void RegionEmitter::compute_liveness() {
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    const auto& insts = plan_.insts;
     // Liveness (backward, to a fixed point).
     s_.olive_in.assign(static_cast<std::size_t>(n), 0);
     s_.olive_out.assign(static_cast<std::size_t>(n), 0);
@@ -164,13 +254,29 @@ void RegionEmitter::compute_tier2() {
             const auto rin = reads | (rout & ~writes);
             // Observation points: a fault (the state before the instruction),
             // unknown family usage, an interrupt check at the block start, an
-            // ADD/SUB whose result an adjacent access may fold (a fault there
-            // reports the ADD's pc with the state before the ADD).
+            // ADD/SUB or UBFIZ/LSL whose result an adjacent access may fold
+            // (a fault there reports the producer's pc with the state before it).
             bool obs = pi.may_fault || pi.conservative_writes || pi.flow == Flow::interpret ||
                        (pi.loop_header && options_.interrupt_checks && !s_.no_check[static_cast<std::size_t>(i)]);
             if (!obs && is_add_sub(pi.inst.kind) && i + 1 < n && insts[static_cast<std::size_t>(i) + 1].may_fault &&
                 !insts[static_cast<std::size_t>(i) + 1].leader)
                 obs = true;
+            if (!obs && pi.inst.kind == Kind::bitfield && i + 1 < n &&
+                !insts[static_cast<std::size_t>(i) + 1].leader &&
+                (insts[static_cast<std::size_t>(i) + 1].may_fault ||
+                 (i + 2 < n && insts[static_cast<std::size_t>(i) + 1].inst.kind == Kind::add_sub_imm &&
+                  insts[static_cast<std::size_t>(i) + 2].may_fault && !insts[static_cast<std::size_t>(i) + 2].leader)))
+                obs = true;
+            if (!obs && pi.inst.kind == Kind::move_wide && pi.inst.op != 3) {
+                std::int32_t k = i + 1;
+                while (k < n && k <= i + 3 && !insts[static_cast<std::size_t>(k)].leader &&
+                       insts[static_cast<std::size_t>(k)].inst.kind == Kind::move_wide &&
+                       insts[static_cast<std::size_t>(k)].inst.op == 3 &&
+                       insts[static_cast<std::size_t>(k)].inst.rd == pi.inst.rd)
+                    ++k;
+                if (k < n && !insts[static_cast<std::size_t>(k)].leader && insts[static_cast<std::size_t>(k)].may_fault)
+                    obs = true;
+            }
             const auto oin = obs ? kAll : reads | (oout & ~writes);
             auto& ri = s_.rlive_in[static_cast<std::size_t>(i)];
             auto& oi = s_.olive_in[static_cast<std::size_t>(i)];
@@ -285,7 +391,9 @@ void RegionEmitter::build_presets() {
         while (b < recs.size() && recs[b].to == recs[a].to) ++b;
         const auto t = recs[a].to;
         const auto& pt = plan_.insts[static_cast<std::size_t>(t)];
-        const bool need = pt.loop_header || pt.first_pred >= t;
+        const bool in_loop_merge = !pt.loop_header && !pt.entry && pt.preds > 1 && pt.first_pred < t &&
+                                   s_.loop_of[static_cast<std::size_t>(t)] >= 0;
+        const bool need = pt.loop_header || pt.first_pred >= t || in_loop_merge;
         if (need) {
             std::uint32_t total = 0;
             for (auto k = a; k < b; ++k) total += weight(recs[k].from);
@@ -307,11 +415,16 @@ void RegionEmitter::build_presets() {
                     }
                 }
                 const unsigned shift = vec ? 32u : 0u;
-                auto rlive = static_cast<std::uint32_t>(s_.rlive_in[static_cast<std::size_t>(t)] >> shift);
+                const auto rlive_all = static_cast<std::uint32_t>(s_.rlive_in[static_cast<std::size_t>(t)] >> shift);
+                const auto olive_all = static_cast<std::uint32_t>(s_.olive_in[static_cast<std::size_t>(t)] >> shift);
+                auto rlive = rlive_all;
                 // Like tier 1's loop-header rule: registers the header's block
                 // reads before writing them (keeping everything live there, or
                 // what the loop reads, added pressure and measured worse),
                 // nearest first; at most all but two of the cache's hosts.
+                // For in-loop forward diamond merges, keep only unanimous entries
+                // (zero moves/reloads on every incoming edge) that remain live or
+                // dirty-observed, eliminating redundant diamond-arm flushes.
                 std::int32_t first_read[32];
                 std::fill(std::begin(first_read), std::end(first_read), 1 << 20);
                 {
@@ -325,7 +438,7 @@ void RegionEmitter::build_presets() {
                         wr |= vec ? pj.vwrites : pj.writes;
                         if (pj.flow != Flow::normal || (j + 1 < n && plan_.insts[static_cast<std::size_t>(j) + 1].leader)) break;
                     }
-                    rlive &= seen;
+                    if (!in_loop_merge) rlive &= seen;
                 }
                 struct Cand {
                     std::uint32_t score;
@@ -337,9 +450,16 @@ void RegionEmitter::build_presets() {
                     unsigned best = 16;
                     for (unsigned h = 0; h < 16; ++h)
                         if (score[g][h] != 0 && (best == 16 || score[g][h] > score[g][best])) best = h;
-                    if (best == 16 || (!vec && best == 0)) continue;
-                    if (2u * score[g][best] < total) continue;
-                    if (!((rlive >> g) & 1u) || nc == 64) continue;   // not read there before written
+                    if (best == 16 || (!vec && best == 0 && pt.flags_live_in)) continue;
+                    if (in_loop_merge) {
+                        if (score[g][best] < total) continue;   // unanimous across all incoming edges: 0 moves/reloads
+                        const bool keep_live = ((rlive_all >> g) & 1u) != 0 ||
+                                               (dscore[g][best] != 0 && ((olive_all >> g) & 1u) != 0);
+                        if (!keep_live || nc == 64) continue;
+                    } else {
+                        if (2u * score[g][best] < total) continue;
+                        if (!((rlive >> g) & 1u) || nc == 64) continue;   // not read there before written
+                    }
                     cands[nc++] = {score[g][best], static_cast<std::uint8_t>(g), static_cast<std::uint8_t>(best)};
                 }
                 std::stable_sort(cands, cands + nc, [&](const Cand& x, const Cand& y) {
@@ -347,7 +467,7 @@ void RegionEmitter::build_presets() {
                 });
                 auto& out = vec ? e.vec : e.gpr;
                 const auto hosts = static_cast<std::uint32_t>(cache_hosts_at(t) >> shift);   // pin lending
-                const auto cap = std::max(1, std::popcount(hosts) - 2);
+                const auto cap = std::max(1, std::popcount(hosts) - (in_loop_merge ? 1 : 2));
                 for (unsigned k = 0; k < nc && std::popcount(out.mask) < cap; ++k) {
                     const auto g = cands[k].g, h = cands[k].h;
                     if (out.host[g] >= 0 || out.guest[h] >= 0 || !((hosts >> h) & 1u)) continue;
@@ -357,6 +477,10 @@ void RegionEmitter::build_presets() {
                     out.mask |= 1u << h;
                     if (2u * dscore[g][h] >= score[g][h]) out.dirty |= 1u << h;
                 }
+            }
+            if (in_loop_merge && e.gpr.mask == 0 && e.vec.mask == 0) {
+                a = b;
+                continue;
             }
             // Diagnostics: TRANSMUTE_FX_TRACE_PRESETS=1 prints every chosen entry state.
             static const bool trace = std::getenv("TRANSMUTE_FX_TRACE_PRESETS") != nullptr;

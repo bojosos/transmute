@@ -110,11 +110,13 @@ struct RegionExit {
 };
 
 enum class FlagsLocation : std::uint8_t {
-    context = 0,        // ctx->nzcv
-    host_sub = 1,       // EFLAGS with FlagsProducer::sub meaning
+    context = 0,            // ctx->nzcv
+    host_sub = 1,           // EFLAGS with FlagsProducer::sub meaning
     host_add = 2,
     host_logic = 3,
-    host_register = 4,  // ARM-layout NZCV in host GPR `flags_register`
+    host_register = 4,      // ARM-layout NZCV in host GPR `flags_register`
+    host_fcmp = 5,          // EFLAGS from (u)comis(Rn, Rm)
+    host_fcmp_swapped = 6,  // EFLAGS from (u)comis(Rm, Rn)
 };
 
 // Host code range whose faults belong to guest instruction `guest_pc`. Guest

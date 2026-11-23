@@ -25,7 +25,14 @@ std::atomic<const RangeSet*> g_ranges{nullptr};
 std::mutex g_ranges_mutex;
 std::vector<std::unique_ptr<RangeSet>> g_range_sets;
 
-void publish(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) {
+// Explicit-flush guest code ranges (Darwin MAP_JIT): same lock-free
+// copy-on-write sorted disjoint list as g_ranges.
+std::atomic<const RangeSet*> g_explicit_flush_ranges{nullptr};
+std::mutex g_explicit_flush_mutex;
+std::vector<std::unique_ptr<RangeSet>> g_explicit_flush_sets;
+
+void publish_into(std::atomic<const RangeSet*>& slot, std::vector<std::unique_ptr<RangeSet>>& retired,
+                  std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) {
     std::sort(ranges.begin(), ranges.end());
     auto set = std::make_unique<RangeSet>();
     for (const auto& r : ranges) {
@@ -36,8 +43,12 @@ void publish(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) {
             set->ranges.push_back(r);
         }
     }
-    g_ranges.store(set.get(), std::memory_order_release);
-    g_range_sets.push_back(std::move(set));
+    slot.store(set.get(), std::memory_order_release);
+    retired.push_back(std::move(set));
+}
+
+void publish(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    publish_into(g_ranges, g_range_sets, std::move(ranges));
     count(g_counters.code_range_publishes);
 }
 
@@ -71,8 +82,8 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> current_ranges() {
     return set ? set->ranges : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
 }
 
-bool in_registered_ranges(std::uint64_t address) noexcept {
-    const auto* set = g_ranges.load(std::memory_order_acquire);
+bool in_range_set(const std::atomic<const RangeSet*>& slot, std::uint64_t address) noexcept {
+    const auto* set = slot.load(std::memory_order_acquire);
     if (!set || set->ranges.empty()) return false;
     const auto& r = set->ranges;
     auto it = std::upper_bound(r.begin(), r.end(), address,
@@ -81,6 +92,8 @@ bool in_registered_ranges(std::uint64_t address) noexcept {
     --it;
     return address >= it->first && address < it->second;
 }
+
+bool in_registered_ranges(std::uint64_t address) noexcept { return in_range_set(g_ranges, address); }
 
 // Copies of guest code (register_guest_code_copy): sorted, disjoint
 // [begin, end) of the copy with copy - source. Published like RangeSet; a
@@ -131,6 +144,10 @@ bool read_pdata_words(const std::uint32_t* entry, std::uint32_t& begin, std::uin
 } // namespace
 
 bool in_registered_code_memory(std::uint64_t address) noexcept { return in_registered_ranges(address); }
+
+bool in_explicit_flush_code_memory(std::uint64_t address) noexcept {
+    return in_range_set(g_explicit_flush_ranges, address);
+}
 
 bool guest_code_copy_delta(std::uint64_t address, std::int64_t& delta) noexcept {
     const auto* set = g_copies.load(std::memory_order_acquire);
@@ -243,8 +260,18 @@ bool LiveCodeSource::read(std::uint64_t address, std::uint32_t& word) const {
 bool LiveCodeSource::image_code(std::uint64_t address) const {
     // A PE image or an external module (Mach-O): its text is image code even
     // where the personality registered it as guest code memory (Alchemy does).
+    // Isolate-local copies of immutable image text (register_guest_code_copy,
+    // e.g. V8's embedded builtins copy) are image code too while paired; a
+    // write or unmap drops the pairing and invalidates dependent regions.
     const auto* module = find_guest_module(address & ~std::uint64_t{0xfff});
-    return module && address >= module->text_begin && address < module->text_end;
+    if (module && address >= module->text_begin && address < module->text_end) return true;
+    std::int64_t delta = 0;
+    if (guest_code_copy_delta(address, delta)) {
+        const auto source = address - static_cast<std::uint64_t>(delta);
+        const auto* src_module = find_guest_module(source & ~std::uint64_t{0xfff});
+        return src_module && source >= src_module->text_begin && source < src_module->text_end;
+    }
+    return false;
 }
 
 bool LiveCodeSource::read_data(std::uint64_t address, std::uint32_t& word) const {
@@ -364,6 +391,37 @@ void unregister_guest_code_memory(std::uint64_t base, std::uint64_t size) {
         }
     }
     invalidate_guest_code(base, size);
+}
+
+void register_explicit_flush_code_memory(std::uint64_t base, std::uint64_t size) {
+    if (size == 0) return;
+    const auto end = base + size < base ? ~std::uint64_t{0} : base + size;
+    std::lock_guard lock(rt::g_explicit_flush_mutex);
+    const auto* set = rt::g_explicit_flush_ranges.load(std::memory_order_acquire);
+    if (set) {
+        const auto it = rt::range_at_or_after(set->ranges, base);
+        if (it != set->ranges.end() && it->first <= base && end <= it->second) return;
+    }
+    auto ranges = set ? set->ranges : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
+    ranges.emplace_back(base, end);
+    rt::publish_into(rt::g_explicit_flush_ranges, rt::g_explicit_flush_sets, std::move(ranges));
+}
+
+void unregister_explicit_flush_code_memory(std::uint64_t base, std::uint64_t size) {
+    if (size == 0) return;
+    const auto end = base + size < base ? ~std::uint64_t{0} : base + size;
+    std::lock_guard lock(rt::g_explicit_flush_mutex);
+    const auto* set = rt::g_explicit_flush_ranges.load(std::memory_order_acquire);
+    if (!set || set->ranges.empty()) return;
+    const auto it = rt::range_at_or_after(set->ranges, base);
+    if (it == set->ranges.end() || it->first >= end) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    for (const auto& r : set->ranges) {
+        if (r.second <= base || r.first >= end) { result.push_back(r); continue; }
+        if (r.first < base) result.emplace_back(r.first, base);
+        if (r.second > end) result.emplace_back(end, r.second);
+    }
+    rt::publish_into(rt::g_explicit_flush_ranges, rt::g_explicit_flush_sets, std::move(result));
 }
 
 } // namespace transmute::fx

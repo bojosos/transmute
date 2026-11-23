@@ -90,13 +90,17 @@ class ImageMemorySource final : public CodeSource {
 public:
     ImageMemorySource(const MappedImage& image, const pe::Image& file);
     bool read(std::uint64_t address, std::uint32_t& word) const override;
+    bool image_code(std::uint64_t address) const override;
+    bool read_data(std::uint64_t address, std::uint32_t& word) const override;
     bool function_bounds(std::uint64_t address, std::uint64_t& begin, std::uint64_t& end) const override;
 
 private:
+    bool read_from(const std::vector<pe::Section>& sections, std::uint64_t address, std::uint32_t& word) const;
     std::uint64_t base_;
     std::uint64_t size_;
     std::vector<pe::Function> functions_;
     std::vector<pe::Section> executable_;
+    std::vector<pe::Section> read_only_;
 };
 
 double now_seconds();

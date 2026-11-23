@@ -33,7 +33,8 @@ struct PlanInst {
     std::int16_t family{-1};          // family whose describe() accepted the word
     bool leader{};                    // block start (entry or internal branch target)
     bool entry{};                     // expects the flushed state
-    bool loop_header{};               // target of a back edge
+    bool loop_header{};               // target of a true CFG cycle back-edge
+    std::int32_t loop_end{-1};        // loop header -> furthest true cycle back-edge source (else -1)
     bool inherit_flags{};             // single predecessor laid out before: inherits its flags state
     bool conservative_writes{};       // family usage unknown: assume all registers written
     bool try_family{};                // not a core instruction: offer it to the families
@@ -70,13 +71,15 @@ struct PlanInst {
     // index into Plan::tables, else -1. The BR keeps Flow::indirect (its
     // fallback is an indirect exit); its table targets are internal edges.
     std::int32_t table{-1};
-    // A BR to xT loaded by `ldr xT, [xB, xI, lsl #3]` (or `uxtw #3`) from a
-    // table that is not a label table (GuestContext::table_shadow): xB and xI,
-    // unchanged up to the BR, else -1. The target is compared, so they only
-    // decide how fast the BR is.
+    // A BR to xT loaded from a heap dispatch table (GuestContext::table_shadow):
+    // either `ldr xT, [xB, xI, lsl/uxtw #3]` or stride-2^s pointer arithmetic
+    // `[lsr xI, xH, #rshift]; add xP, xB, xI, lsl #s; ldr xT, [xP]`. The target
+    // is compared, so these fields only decide how fast the BR is.
     std::int8_t shadow_base{-1};
     std::int8_t shadow_index{-1};
-    bool shadow_index32{};            // uxtw #3: the index is wI
+    bool shadow_index32{};            // uxtw / 32-bit index: zero-extend wI first
+    std::uint8_t shadow_rshift{};     // right-shift index register before table lookup
+    std::uint8_t shadow_sub_stride{}; // base register holds base + (index << s): subtract back
 };
 
 // A BR whose target comes from a jump table (MSVC ARM64 switch lowering):
@@ -96,6 +99,8 @@ struct JumpTable {
     std::uint32_t count;              // entries (bound from cmp + b.hi/b.hs, uxtb, ...)
     std::uint8_t index_reg;           // wI: the table index at the BR (UXTW); unused by_target
     bool by_target{};                 // dispatch on the target (index unknown at the BR)
+    bool proven_bounded{};            // immutable image code + straight-line bound: generic fallback unreachable
+    bool cases_flags_dead{};          // all table targets write NZCV before reading it (only generic may need raw flags)
 };
 
 struct PlanEntry {
@@ -232,7 +237,7 @@ struct PlanOverrides {
     std::vector<std::uint64_t> conservative;
     bool no_pins{};
     bool no_extra_pins{};
-    unsigned vector_pin_limit{10};    // xmm6..xmm15
+    unsigned vector_pin_limit{12};    // xmm4..xmm15 (xmm4..xmm5 saved around call_helper)
     bool no_reg_cache{};
     bool no_fcmp_fusion{};
     bool exact_flags{};               // NZCV live across BL/BLR/RET (not assumed dead per AAPCS64)

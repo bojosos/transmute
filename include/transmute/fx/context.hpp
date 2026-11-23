@@ -29,6 +29,7 @@ inline constexpr std::int32_t kContextBias = 128;
 // 256: translated code reads rsb_top's low byte (movzx) and wraps it with byte
 // arithmetic, without touching EFLAGS; other users mask with kRsbEntries - 1.
 inline constexpr unsigned kRsbEntries = 256;
+inline constexpr unsigned kHwRsbEntries = 64;
 inline constexpr unsigned kSpillSlots = 64;
 inline constexpr unsigned kHelperSlots = 128;
 
@@ -169,6 +170,20 @@ struct alignas(64) GuestContext {
     std::uint64_t table_shadow_base;
     const std::uint64_t* table_shadow;
     std::uint32_t table_shadow_retry;
+    // ---- appended (translator core: native x64 hardware CALL/RET RSB) ------
+    // Count of remaining slots in the host-stack hardware RSB (kHwRsbEntries =
+    // empty, 0 = full). hw_rsb_guest[hw_rsb_free] holds the expected guest
+    // return PC for the top host return address at [rsp]. Scrubbing sets
+    // hw_rsb_guest[i] = 1 (never matches a 4-byte-aligned PC) without touching
+    // another thread's live host stack.
+    std::uint32_t hw_rsb_free;
+    std::uint64_t hw_rsb_guest[kHwRsbEntries];
+    // ---- appended (translator core: L1-resident indirect lookup cache) -----
+    // Per-thread direct-mapped 2^kFastLookupBits table of 16-byte {guest_pc,
+    // host_entry} slots (64 KiB, 16 pages: L1d & L1 dTLB resident). Written
+    // only by this thread in stub_indirect on main lookup_table hits and
+    // scrubbed to kFastLookupEmpty (1) by lookup_remove.
+    std::uint64_t* fast_lookup;
 };
 
 // Region exits may leave NZCV in the translator's raw form: the low 16 bits

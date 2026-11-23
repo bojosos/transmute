@@ -604,12 +604,50 @@ FX_TEST(core_tier2_interrupt_checks_header_chain) {
     FX_CHECK_EQ(count_checks(translate_region(r.program_base(), code, plain)), 4u);   // start, case, tail, dispatch
     FX_CHECK_EQ(count_checks(translate_region(r.program_base(), code, opt)), 2u);     // start, dispatch
     for (const int optimize : {0, 1}) {
-        r.machine.options.optimize = optimize;
+        r.machine.options.optimize = static_cast<std::int8_t>(optimize);
         FX_CHECK(r.run(prog, r.context(7), "header chain"));
         auto ctx = r.context(8);
         ctx.interrupt_pending = 1;
         FX_REQUIRE(r.run(prog, ctx, "interrupt in a header chain"));
         FX_CHECK(r.last.interrupts >= 1u);
+    }
+    r.machine.options.optimize = -1;
+}
+
+// Tier-2 in-loop forward diamond merge presets (Wave F2): both arms of an
+// if/else diamond inside a hot loop hold the same dirty unpinned registers in
+// matching hosts before converging at the merge block that reads them.
+FX_TEST(core_tier2_in_loop_diamond_merge) {
+    register_families();
+    DiffRunner r;
+    using namespace a64;
+    const std::vector<std::uint32_t> prog = {
+        movw(false, 2, 0, 30, 12),                       // 0  mov w12, #30 (loop count)
+        // loop header (1):
+        add_imm(true, false, false, 4, 4, 1),            // 1  add x4, x4, #1
+        add_imm(true, false, false, 5, 5, 3),            // 2  add x5, x5, #3
+        add_imm(true, false, false, 6, 6, 5),            // 3  add x6, x6, #5
+        add_imm(true, false, false, 7, 7, 7),            // 4  add x7, x7, #7
+        tbz(false, 0, 4, 12),                            // 5  tbz w12, #0, arm2 (9)
+        // arm1 (6..8): modifies x4, x5, x6, x7
+        add_imm(true, false, false, 4, 4, 2),            // 6
+        add_imm(true, false, false, 5, 5, 4),            // 7
+        b(3),                                            // 8  b merge (11)
+        // arm2 (9..10): modifies x4, x5, x6, x7
+        add_imm(true, false, false, 4, 4, 6),            // 9
+        add_imm(true, false, false, 5, 5, 8),            // 10
+        // merge (11): reads all 4 unpinned regs immediately
+        add_shift(true, false, false, 0, 5, 0, 4, 0),    // 11 add x0, x4, x5
+        add_shift(true, false, false, 0, 7, 0, 6, 1),    // 12 add x1, x6, x7
+        add_shift(true, false, false, 0, 1, 0, 0, 0),    // 13 add x0, x0, x1
+        add_imm(false, true, true, 12, 12, 1),           // 14 subs w12, w12, #1
+        bcond(1, -14),                                   // 15 b.ne header (1)
+        nop(),                                           // 16
+    };
+    for (const int optimize : {0, 1}) {
+        r.machine.options.optimize = static_cast<std::int8_t>(optimize);
+        for (unsigned k = 0; k < 6; ++k)
+            FX_CHECK(r.run(prog, r.context(0xf400 + k), "tier2 diamond " + std::to_string(optimize) + "/" + std::to_string(k)));
     }
     r.machine.options.optimize = -1;
 }

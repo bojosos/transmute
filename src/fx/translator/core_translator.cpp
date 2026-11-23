@@ -79,6 +79,7 @@ const PlanOverrides& default_overrides() {
     static const PlanOverrides o = [] {
         PlanOverrides d;
         d.tier2 = kTier2ByDefault;
+        d.no_shadows = true;   // opt-in via TRANSMUTE_FX_CORE=shadows (1-load indirect lookup wins on V8 Ignition)
         if (const char* v = std::getenv("TRANSMUTE_FX_CORE")) {
             const std::string s(v);
             const auto k = [&](const char* name) { return has_knob(s, name); };
@@ -125,7 +126,7 @@ const PlanOverrides& default_overrides() {
             d.align_loops = k("loopalign");
             d.align_hot = k("hotalign");
             d.align32 = k("align32");
-            d.no_shadows = k("noshadows");
+            d.no_shadows = !k("shadows") || k("noshadows");
             d.no_flag_skip = k("noflagskip");
             d.no_loop_inline = k("noloopinline");
             d.rsb_call = k("rsbcall");
@@ -142,7 +143,7 @@ const PlanOverrides& default_overrides() {
 
 std::uint32_t codegen_knob_bits() {
     const auto& o = default_overrides();
-    return (o.no_pins ? 1u : 0u) | (o.no_extra_pins ? 2u : 0u) | (o.vector_pin_limit != 10 ? 4u : 0u) |
+    return (o.no_pins ? 1u : 0u) | (o.no_extra_pins ? 2u : 0u) | (o.vector_pin_limit != 12 ? 4u : 0u) |
            (o.no_reg_cache ? 8u : 0u) | (o.no_fcmp_fusion ? 16u : 0u) | (o.exact_flags ? 32u : 0u) |
            (o.family_pins7 ? 64u : 0u) | (o.no_rbit_fusion ? 128u : 0u) | (o.no_write_back ? 256u : 0u) |
            (o.wb_unsafe ? 512u : 0u) | (o.no_fault_maps ? 1024u : 0u) |
@@ -338,7 +339,7 @@ void translate_region(std::uint64_t guest_pc, const CodeSource& code, const Tran
             }
             if (retry.resource == core::RetryTranslation::Resource::vec && plan.vpinned != 0 &&
                 overrides.vector_pin_limit > 0) {   // give xmm scratch back first
-                overrides.vector_pin_limit = overrides.vector_pin_limit > 4 ? 4 : 0;
+                overrides.vector_pin_limit = overrides.vector_pin_limit > 10 ? 10 : overrides.vector_pin_limit > 4 ? 4 : 0;
                 continue;
             }
             if (plan.extra_pins && !overrides.no_extra_pins) {   // first give the scratch registers back

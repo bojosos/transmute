@@ -79,6 +79,34 @@ FX_TEST(lookup_table_install_probe_alias_remove) {
     FX_CHECK(rt::lookup_probe(0x8000'0000'0000'0000ULL) == nullptr);
 }
 
+FX_TEST(fast_lookup_populate_and_scrub) {
+    init();
+    GuestContext& ctx = ensure_thread_context();
+    FX_REQUIRE(ctx.fast_lookup != nullptr);
+    const std::uint64_t pc = 0x0000'0123'4567'8900ULL;
+    const std::size_t fi = fast_lookup_index(pc);
+    FX_CHECK_EQ(ctx.fast_lookup[2 * fi], kFastLookupEmpty);
+    rt::lookup_install(pc, rt::g_stubs.return_to_host);
+    ctx.pc = pc;
+    ctx.exit_reason = 0;
+    const auto mxcsr = mxcsr_for_guest(ctx.fpcr, ctx.fpsr);
+    rt::g_stubs.enter(&ctx, rt::g_stubs.indirect, mxcsr);
+    FX_CHECK_EQ(ctx.exit_reason, static_cast<std::uint32_t>(ExitReason::return_to_host));
+    FX_CHECK_EQ(ctx.fast_lookup[2 * fi], pc);
+    FX_CHECK_EQ(ctx.fast_lookup[2 * fi + 1], reinterpret_cast<std::uint64_t>(rt::g_stubs.return_to_host));
+    // lookup_remove clears both the main table and every live thread's fast_lookup slot.
+    rt::lookup_remove(pc, rt::g_stubs.return_to_host);
+    FX_CHECK(rt::lookup_probe(pc) == nullptr);
+    FX_CHECK_EQ(ctx.fast_lookup[2 * fi], kFastLookupEmpty);
+    // Null and misaligned targets always miss cleanly without polluting fast_lookup.
+    for (const std::uint64_t bad : {0ULL, 1ULL, pc + 2}) {
+        ctx.pc = bad;
+        ctx.exit_reason = 0;
+        rt::g_stubs.enter(&ctx, rt::g_stubs.indirect, mxcsr);
+        FX_CHECK_EQ(ctx.exit_reason, static_cast<std::uint32_t>(ExitReason::lookup_miss));
+    }
+}
+
 FX_TEST(mxcsr_mapping) {
     FX_CHECK_EQ(mxcsr_for_guest(0, 0), 0x1f80u);
     FX_CHECK_EQ(mxcsr_for_guest(1u << 22, 0), 0x5f80u);    // RP -> round up
@@ -150,6 +178,20 @@ FX_TEST(live_code_source_image_code) {
     FX_CHECK(!source.image_code(module.text_end));   // registered, but the module's data
     FX_CHECK(!source.image_code(module.base));
     FX_CHECK(!source.image_code(jit));               // registered code memory outside any module
+    // Isolate-local copies of image text (register_guest_code_copy, e.g. V8
+    // embedded builtins) are image code while paired, whereas copies of
+    // non-image code or module data are not.
+    const std::uint64_t copy = 0x0000'0558'0000'0000ULL;
+    const std::uint64_t data_copy = 0x0000'0559'0000'0000ULL;
+    register_guest_code_copy(copy, module.text_begin, 0x2000);
+    register_guest_code_copy(data_copy, module.base, 0x1000);
+    FX_CHECK(source.image_code(copy));
+    FX_CHECK(source.image_code(copy + 0x1ffc));
+    FX_CHECK(!source.image_code(copy + 0x2000));
+    FX_CHECK(!source.image_code(data_copy));         // source is outside module text
+    invalidate_guest_code(copy, 0x2000);             // drops pairing
+    invalidate_guest_code(data_copy, 0x1000);
+    FX_CHECK(!source.image_code(copy));
     unregister_guest_code_memory(module.base, module.size);
     unregister_guest_code_memory(jit, 0x2000);
     set_fake_module(nullptr);

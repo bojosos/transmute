@@ -114,12 +114,15 @@ void reserve(State& s, std::uint64_t begin, std::uint64_t end) {
     std::uint64_t g = begin & ~(kGranule - 1);
     const std::uint64_t last = (end + kGranule - 1) & ~(kGranule - 1);
     while (g < last) {
-        if (reservation_of(s, g)) {
-            g += kGranule;
-            continue;
+        auto it = s.reservations.upper_bound(g);
+        if (it != s.reservations.begin()) {
+            auto prev = std::prev(it);
+            if (g - prev->first < prev->second) {
+                g = prev->first + prev->second;
+                continue;
+            }
         }
-        std::uint64_t run = g;
-        while (run < last && !reservation_of(s, run)) run += kGranule;
+        const std::uint64_t run = (it != s.reservations.end() && it->first < last) ? it->first : last;
         void* got = vm::reserve_placeholder(host(g), static_cast<std::size_t>(run - g));
         if (reinterpret_cast<std::uint64_t>(got) != g) {
             if (got) vm::release(got);
@@ -648,8 +651,12 @@ bool reserve_guest_space(std::uint64_t base, std::uint64_t size) {
     rt::ensure_initialized();
     rt::State& s = rt::S();
     rt::Exclusive lock(s.lock);
-    for (std::uint64_t g = base; g < base + size; g += rt::kGranule)
-        if (rt::reservation_of(s, g)) return false;
+    auto it = s.reservations.upper_bound(base);
+    if (it != s.reservations.begin()) {
+        auto prev = std::prev(it);
+        if (base - prev->first < prev->second) return false;
+    }
+    if (it != s.reservations.end() && it->first < base + size) return false;
     void* got = rt::vm::reserve_placeholder(rt::host(base), static_cast<std::size_t>(size));
     if (reinterpret_cast<std::uint64_t>(got) != base) {
         if (got) rt::vm::release(got);

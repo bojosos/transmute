@@ -9,6 +9,7 @@
 #include "fx/host/vm.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -87,6 +88,13 @@ void destroy_state(ThreadState* ts, bool detach) {
     host::sample::close_thread(ts->scan_handle);
     free_guest_stack(ts->own_stack);
     if (ts->teb) host::vm::release(ts->teb);
+    if (ts->ctx) {
+        table_shadow_destroy_context(*ts->ctx);
+        if (ts->ctx->fast_lookup) {
+            host::vm::release(ts->ctx->fast_lookup);
+            ts->ctx->fast_lookup = nullptr;
+        }
+    }
     delete ts->ctx;
     delete ts;
 }
@@ -138,6 +146,20 @@ ThreadState* create_state(std::uint64_t stack_size, bool borrowed) {
     ctx->stub_host_return = g_stubs.host_return;
     ctx->stub_link = g_stubs.link;
     ctx->arena_base = arena_base();   // translated code inlines the stub_indirect lookup
+    ctx->hw_rsb_free = kHwRsbEntries;
+    auto* fl = static_cast<std::uint64_t*>(
+        host::vm::allocate(nullptr, kFastLookupSlots * 2 * sizeof(std::uint64_t), host::vm::kReadWrite));
+    if (!fl) {
+        host::vm::release(ts->teb);
+        free_guest_stack(ts->own_stack);
+        throw std::bad_alloc();
+    }
+    const auto miss_addr = reinterpret_cast<std::uint64_t>(arena_base());
+    for (std::size_t i = 0; i < kFastLookupSlots; ++i) {
+        fl[2 * i] = kFastLookupEmpty;
+        fl[2 * i + 1] = miss_addr;
+    }
+    ctx->fast_lookup = fl;
     table_shadow_init_context(*ctx);
     ts->ctx = ctx.release();
     {
@@ -241,6 +263,19 @@ bool registry_lock_free() noexcept {
 void for_each_context(const std::function<void(GuestContext&)>& fn) {
     SharedLock lock(g_registry);
     for (ThreadState* ts : g_threads) fn(*ts->ctx);
+}
+
+void fast_lookup_scrub(std::uint64_t pc) noexcept {
+    const std::size_t slot_off = 2 * fast_lookup_index(pc);
+    SharedLock lock(g_registry);
+    for (ThreadState* ts : g_threads) {
+        if (std::uint64_t* fl = ts->ctx->fast_lookup) {
+            std::atomic_ref<std::uint64_t> key(fl[slot_off]);
+            std::uint64_t expected = pc;
+            key.compare_exchange_strong(expected, kFastLookupEmpty, std::memory_order_seq_cst,
+                                        std::memory_order_relaxed);
+        }
+    }
 }
 
 void registered_threads(std::vector<std::pair<std::uint32_t, GuestContext*>>& threads) {

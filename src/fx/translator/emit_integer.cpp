@@ -129,11 +129,12 @@ std::uint32_t codegen_p2_knob_bits() {
             if (s.find("noflagsave") != std::string::npos) b |= knob_no_flag_save;
             if (s.find("noccmpfusion") != std::string::npos) b |= knob_no_ccmp_fusion;
             if (s.find("nogprreuse") != std::string::npos) b |= knob_no_gpr_reuse;
-            if (s.find("mergedirty") != std::string::npos) b |= knob_merge_dirty;
+            if (s.find("nomergedirty") != std::string::npos) b |= knob_no_merge_dirty;
             if (s.find("noaliastarget") != std::string::npos) b |= knob_no_alias_target;
             if (s.find("norawflags") != std::string::npos) b |= knob_no_raw_flags;
             if (s.find("abiflags") != std::string::npos) b |= knob_abi_flags;
             if (s.find("nodeadtargets") != std::string::npos) b |= knob_no_dead_targets;
+            if (s.find("hwrsb") != std::string::npos && s.find("nohwrsb") == std::string::npos) b |= knob_hw_rsb;
         }
         return b;
     }();
@@ -234,13 +235,23 @@ bool fold_address(const Plan& plan, std::int32_t index, Inst& access) {
     const auto& m = pb.inst;
     if (!a.sf || a.s || a.rd == 31) return false;   // 64-bit, no flags, not SP
     if (m.kind != Kind::load_store && m.kind != Kind::load_store_pair) return false;
-    if (m.mode != AddrMode::offset || m.rn != a.rd || m.mem == MemOp::prefetch) return false;
+    if (m.mem == MemOp::prefetch) return false;
     const bool pair = m.kind == Kind::load_store_pair;
     const bool uses = m.rd == a.rd || (pair && m.ra == a.rd);
-    if (m.mem == MemOp::store) {
-        if (uses) return false;   // the stored value is the address itself
-    }
+    if (m.mem == MemOp::store && uses) return false;   // the stored value is the address itself
     const bool self = m.mem != MemOp::store && uses;   // the load rewrites Xd
+    // ADD/SUB Xd, Xn, #imm feeding LDR/STR [xBase, Xd] (e.g. V8 FixedArray load):
+    // fold into [xBase + Xn + imm] when Xd is overwritten or dead after.
+    if (!pair && m.mode == AddrMode::reg && a.kind == Kind::add_sub_imm && m.rm == a.rd && m.rn != a.rd &&
+        m.shift == 3 && m.amount == 0 && m.imm == 0 && a.rn != 31) {
+        const auto imm = a.op ? -a.imm : a.imm;
+        if (imm != static_cast<std::int32_t>(imm)) return false;
+        access = m;
+        access.rm = a.rn;
+        access.imm = imm;
+        return self || dead_after(plan, index + 1, a.rd);
+    }
+    if (m.mode != AddrMode::offset || m.rn != a.rd) return false;
     access = m;
     switch (a.kind) {
     case Kind::add_sub_imm: {
@@ -272,6 +283,60 @@ bool fold_address(const Plan& plan, std::int32_t index, Inst& access) {
     return self || dead_after(plan, index + 1, a.rd);
 }
 
+unsigned fold_indexed_address(const Plan& plan, std::int32_t index, Inst& access, unsigned& index_mask_bits,
+                              bool allow_flag_clobber) {
+    index_mask_bits = 0;
+    const auto n = static_cast<std::int32_t>(plan.insts.size());
+    if (index + 1 >= n) return 0;
+    const auto& pa = plan.insts[static_cast<std::size_t>(index)];
+    const auto& pb = plan.insts[static_cast<std::size_t>(index) + 1];
+    if (pb.leader || pb.pc != pa.pc + 4 || pa.flow != Flow::normal || pb.flow != Flow::normal) return 0;
+    const auto& a = pa.inst;
+    // UBFM 64-bit: UBFIZ Xd, Xn, #pos, #len (imms < 32, len = imms + 1) or LSL Xd, Xn, #pos (imms == 63 - pos),
+    // with pos in 1..3.
+    if (a.kind != Kind::bitfield || !a.sf || a.op != 2 || a.rd == 31 || a.rn == 31) return 0;
+    if (a.amount < 61 || a.amount > 63) return 0;
+    const unsigned pos = 64u - a.amount;
+    unsigned option = 3;
+    unsigned mask_bits = 0;
+    if (a.imms == 31) {
+        option = 2;   // UXTW << pos
+    } else if (a.imms == 63u - pos) {
+        option = 3;   // LSL << pos
+    } else if (a.imms < 31) {
+        mask_bits = a.imms + 1u;   // 1..31-bit zero-extended mask
+        if (mask_bits != 8u && mask_bits != 16u && !allow_flag_clobber) return 0;
+    } else {
+        return 0;
+    }
+    const auto try_access = [&](const Inst& m, std::int32_t access_index, std::int64_t imm) -> bool {
+        if (m.kind != Kind::load_store || m.mode != AddrMode::reg || m.mem == MemOp::prefetch) return false;
+        if (m.rm != a.rd || m.rn == a.rd || m.shift != 3 || m.amount != 0 || m.imm != 0) return false;
+        if (m.mem == MemOp::store && m.rd == a.rd) return false;
+        const bool self = m.mem != MemOp::store && m.rd == a.rd;
+        if (!self && !dead_after(plan, access_index, a.rd)) return false;
+        access = m;
+        access.rm = a.rn;
+        access.shift = static_cast<std::uint8_t>(option);
+        access.amount = static_cast<std::uint8_t>(pos);
+        access.imm = imm;
+        index_mask_bits = mask_bits;
+        return true;
+    };
+    // 3-instruction form: UBFIZ/LSL + ADD/SUB Xd, Xd, #imm + LDR/STR [xBase, Xd].
+    const auto& b = pb.inst;
+    if (index + 2 < n && b.kind == Kind::add_sub_imm && b.sf && !b.s && b.rd == a.rd && b.rn == a.rd) {
+        const auto& pc = plan.insts[static_cast<std::size_t>(index) + 2];
+        const auto imm = b.op ? -b.imm : b.imm;
+        if (!pc.leader && pc.pc == pb.pc + 4 && pc.flow == Flow::normal && imm == static_cast<std::int32_t>(imm) &&
+            try_access(pc.inst, index + 2, imm))
+            return 3;
+    }
+    // 2-instruction form: UBFIZ/LSL + LDR/STR [xBase, Xd].
+    if (try_access(b, index + 1, 0)) return 2;
+    return 0;
+}
+
 unsigned RegionEmitter::emit_core(const PlanInst& pi) {
     const auto& d = pi.inst;
     switch (d.kind) {
@@ -285,12 +350,50 @@ unsigned RegionEmitter::emit_core(const PlanInst& pi) {
         if (isel_on(isel_no_fold)) {
             Inst access;
             if (fold_address(plan_, index_, access)) {
-                if (access.kind == Kind::load_store) e_load_store(access);
+                folded_access_ = true;
+                unsigned extra = 0;
+                if (access.kind == Kind::load_store) extra = e_load_store(access, 0, index_ + 1);
                 else e_load_store_pair(access);
-                return 2;
+                folded_access_ = false;
+                return 2u + extra;
             }
             // neon (additive): the same for a SIMD&FP access (emit_load_store.cpp).
             if (const auto consumed = fold_family_access(d); consumed != 0) return consumed;
+        }
+        // Adjacent non-flag ADD/SUB #imm chain (e.g. SUB SP, SP, #0x2000;
+        // SUB SP, SP, #0x3b0 or ADD Xd, SP, #hi; ADD Xd, Xd, #lo): one lea.
+        if (d.kind == Kind::add_sub_imm && !d.s && isel_on(isel_no_fold) &&
+            index_ + 1 < static_cast<std::int32_t>(plan_.insts.size())) {
+            const auto& pb = plan_.insts[static_cast<std::size_t>(index_) + 1];
+            const auto& b = pb.inst;
+            if (!pb.leader && pb.pc == pi.pc + 4 && pb.flow == Flow::normal && b.kind == Kind::add_sub_imm && !b.s &&
+                b.sf == d.sf && b.rn == d.rd && (b.rd == d.rd || (d.rd != 31 && dead_after(plan_, index_ + 1, d.rd)))) {
+                const std::int64_t a_imm = d.op ? -d.imm : d.imm;
+                const std::int64_t b_imm = b.op ? -b.imm : b.imm;
+                const unsigned bits = d.sf ? 64 : 32;
+                const std::uint64_t eff = static_cast<std::uint64_t>(a_imm + b_imm) & ones(bits);
+                if (fits_imm32(eff, bits)) {
+                    const auto disp = static_cast<std::int32_t>(static_cast<std::uint32_t>(eff));
+                    const auto n = val(d.rn, true);
+                    const auto t = dst(b.rd, true);
+                    if (disp == 0) {
+                        load(bits, t, n);
+                    } else {
+                        const auto nv = resolve(n);
+                        Gp nr = nv.r;
+                        if (!nv.is_reg()) {
+                            if (nv.is_mem() && may_cache() && std::popcount(free_gpr_) >= 2 && gpr_read_soon(nv.g)) {
+                                nr = read_unpinned(nv.g);
+                            } else {
+                                load(64, t, nv);
+                                nr = t;
+                            }
+                        }
+                        a_.lea(bits, t, ptr(nr, disp));
+                    }
+                    return 2;
+                }
+            }
         }
         if (d.kind == Kind::add_sub_imm) e_add_sub_imm(d);
         else if (d.kind == Kind::add_sub_shift) e_add_sub_shift(d);
@@ -299,18 +402,31 @@ unsigned RegionEmitter::emit_core(const PlanInst& pi) {
     case Kind::logic_imm: e_logic_imm(d); return 1;
     case Kind::move_wide: return e_move_wide(pi);
     case Kind::adr: return e_adr(pi);
-    case Kind::bitfield: e_bitfield(d); return 1;
+    case Kind::bitfield:
+        if (isel_on(isel_no_fold)) {
+            Inst access;
+            unsigned mask_bits = 0;
+            const bool allow_clobber = !keep_flags() && !flags_saved_ && bool_reader_ < 0;
+            if (const auto consumed = fold_indexed_address(plan_, index_, access, mask_bits, allow_clobber); consumed != 0) {
+                folded_access_ = true;
+                const auto extra = e_load_store(access, mask_bits, index_ + static_cast<std::int32_t>(consumed) - 1);
+                folded_access_ = false;
+                return consumed + extra;
+            }
+        }
+        e_bitfield(d);
+        return 1;
     case Kind::extr: e_extr(d); return 1;
     case Kind::adc: e_adc(d); return 1;
     case Kind::logic_shift: e_logic_shift(d); return 1;
     case Kind::ccmp: e_ccmp(d); return 1;
-    case Kind::csel: e_csel(d); return 1;
-    case Kind::dp1: e_dp1(d); return 1;
+    case Kind::csel: return e_csel(d);
+    case Kind::dp1: return e_dp1(pi);
     case Kind::dp2: e_dp2(d); return 1;
     case Kind::dp3: e_dp3(d); return 1;
-    case Kind::load_store: e_load_store(d); return 1;
+    case Kind::load_store: return 1u + e_load_store(d, 0, index_);
     case Kind::load_store_pair: e_load_store_pair(d); return 1;
-    case Kind::load_literal: e_load_literal(d); return 1;
+    case Kind::load_literal: return e_load_literal(pi);
     case Kind::branch: e_branch(pi); return 1;
     case Kind::branch_link:
     case Kind::branch_link_reg: e_call(pi); return 1;
@@ -536,6 +652,14 @@ void RegionEmitter::field_extract(unsigned bits, Gp d, Gp n, unsigned lsb, unsig
         shift_imm(sign ? Shift::sar : Shift::shr, bits, d, n, lsb);
         return;
     }
+    // SBFX Xd, Xn, #lsb, #(32 - lsb) (e.g. V8 SmiUntag SBFX xD, xN, #1, #31):
+    // sign-extend low 32 bits then arithmetic-shift right (2 insns instead of 3).
+    if (sign && bits == 64 && lsb > 0 && lsb + len == 32 && !keep_flags()) {
+        prepare_clobber();
+        a_.movsx(64, d, n, 32);
+        a_.sar(64, d, static_cast<std::uint8_t>(lsb));
+        return;
+    }
     const bool bmi2 = cpu_features().bmi2 && isel_on(isel_no_srcreg);
     if (bmi2 && (len == 8 || len == 16 || len == 32)) {
         // Rotate the field to the bottom (copying n), then extend it: two
@@ -553,8 +677,9 @@ void RegionEmitter::field_extract(unsigned bits, Gp d, Gp n, unsigned lsb, unsig
     }
     if (bmi2 && !sign && len <= 31 && !keep_flags() && d != n) {
         prepare_clobber();
-        a_.rorx(bits, d, n, static_cast<std::uint8_t>(lsb));   // copy + move the field down
-        a_.and_(bits, d, static_cast<std::int32_t>(ones(len)));
+        if (lsb == 0) a_.mov(32, d, n);
+        else a_.rorx(bits, d, n, static_cast<std::uint8_t>(lsb));   // copy + move the field down
+        a_.and_(32, d, static_cast<std::int32_t>(ones(len)));
         return;
     }
     if (!sign && len <= 31 && !keep_flags()) {
@@ -631,8 +756,12 @@ void RegionEmitter::e_add_sub_imm(const Inst& d) {
         const auto nv = resolve(n);   // a cached source needs no copy
         Gp nr = nv.r;
         if (!nv.is_reg()) {
-            load(64, t, nv);
-            nr = t;
+            if (nv.is_mem() && may_cache() && std::popcount(free_gpr_) >= 2 && gpr_read_soon(nv.g)) {
+                nr = read_unpinned(nv.g);
+            } else {
+                load(64, t, nv);
+                nr = t;
+            }
         }
         a_.lea(bits, t, ptr(nr, sub ? -imm : imm));
         return;
@@ -648,10 +777,18 @@ void RegionEmitter::e_add_sub_imm(const Inst& d) {
         set_flags(FlagsProducer::sub);
         return;
     } else {
-        const auto t = d.rd == 31 ? alloc() : dst(d.rd);
-        if (!(n.is_reg() && n.r == t)) load(bits, t, n);
+        Gp t = d.rd < 31 && d.rd != d.rn ? handoff_dead_src(d.rd, d.rn) : Gp::none;
+        const bool handed = t != Gp::none;
+        if (!handed) t = d.rd == 31 ? alloc() : dst(d.rd);
+        const Gp nr = handed ? t : (n.is_reg() ? n.r : (n.is_mem() ? cached_gpr(n.g) : Gp::none));
+        if (nr != t) load(bits, t, n);
         if (sub) a_.sub(bits, t, imm);
         else a_.add(bits, t, imm);
+        if (d.rd != 31 && !flags_saved_) {
+            zf_inst_ = index_;
+            zf_guest_ = static_cast<std::uint8_t>(d.rd);
+            zf_bits_ = static_cast<std::uint8_t>(bits);
+        }
     }
     set_flags(sub ? FlagsProducer::sub : FlagsProducer::add);
 }
@@ -674,21 +811,30 @@ void RegionEmitter::e_logic_imm(const Inst& d) {
                 a_.test(bits, in_reg(n), t);
             }
         } else {
-            const auto t = dst(d.rd);
-            if (!(n.is_reg() && n.r == t)) load(bits, t, n);
+            Gp t = d.rd != d.rn ? handoff_dead_src(d.rd, d.rn) : Gp::none;
+            const bool handed = t != Gp::none;
+            if (!handed) t = dst(d.rd);
+            const Gp nr = handed ? t : (n.is_reg() ? n.r : (n.is_mem() ? cached_gpr(n.g) : Gp::none));
+            if (nr != t) load(bits, t, n);
             alu_imm(Alu::and_, bits, t, imm);
+            if (!flags_saved_) {
+                zf_inst_ = index_;
+                zf_guest_ = static_cast<std::uint8_t>(d.rd);
+                zf_bits_ = static_cast<std::uint8_t>(bits);
+            }
         }
         set_flags(FlagsProducer::logic);
         return;
     }
-    const auto t = dst(d.rd, true);
     if (n.is_zero()) {
+        const auto t = dst(d.rd, true);
         if (d.op == 0) a_.mov_imm(t, 0);
         else mov_literal(t, imm);
         return;
     }
     if (d.op == 0) {
         if (imm == 0xff || imm == 0xffff) {
+            const auto t = dst(d.rd, true);
             const unsigned width = imm == 0xff ? 8 : 16;
             const Gp h = n.is_reg() ? n.r : cached_gpr(n.g);
             if (h != Gp::none) a_.movzx(32, t, h, width);
@@ -696,13 +842,23 @@ void RegionEmitter::e_logic_imm(const Inst& d) {
             return;
         }
         if (imm == 0xffffffffULL) {
-            load(32, t, n);
+            load(32, dst(d.rd, true), n);
             return;
         }
     }
     prepare_clobber();
-    if (!(n.is_reg() && n.r == t)) load(bits, t, n);
+    Gp t = d.rd < 31 && d.rd != d.rn ? handoff_dead_src(d.rd, d.rn) : Gp::none;
+    const bool handed = t != Gp::none;
+    if (!handed) t = dst(d.rd, true);
+    const Gp nr = handed ? t : (n.is_reg() ? n.r : (n.is_mem() ? cached_gpr(n.g) : Gp::none));
+    if (nr != t) load(bits, t, n);
     alu_imm(ops[d.op], bits, t, imm);
+    if (d.rd != 31 && !flags_saved_) {
+        zf_inst_ = index_;
+        logic_flags_inst_ = index_;
+        zf_guest_ = static_cast<std::uint8_t>(d.rd);
+        zf_bits_ = static_cast<std::uint8_t>(bits);
+    }
 }
 
 unsigned RegionEmitter::e_move_wide(const PlanInst& pi) {
@@ -761,6 +917,167 @@ unsigned RegionEmitter::e_move_wide(const PlanInst& pi) {
         value = (value & ~(0xffffULL << s)) | (static_cast<std::uint64_t>(pj.inst.imm) << s);
         ++consumed;
     }
+    if (d.rd == 31) return consumed;
+    // Fuse a dead-temp constant chain (MOVZ/MOVN [+ MOVK...]) directly into
+    // an immediately following CMP, non-flag ADD/SUB, or disp8 STR.
+    const auto next_idx = index_ + static_cast<std::int32_t>(consumed);
+    if (isel_on(isel_no_fold) && consumed <= 3 && next_idx < n) {
+        const auto& pb = plan_.insts[static_cast<std::size_t>(next_idx)];
+        const auto& c = pb.inst;
+        if (!pb.leader && pb.pc == pi.pc + 4ull * consumed && pb.flow == Flow::normal) {
+            // MOVZ/MOVN[+MOVK] Xt, #imm; CMP Xn, Xt (Xt dead after) -> cmp Xn, imm32.
+            if (c.kind == Kind::add_sub_shift && c.op == 1 && c.s && c.rd == 31 && c.amount == 0 && c.rm == d.rd &&
+                c.rn != d.rd && c.rn < 31 && bool_reader_ < 0 && !flags_saved_) {
+                const unsigned cbits = c.sf ? 64 : 32;
+                const auto kval = value & ones(cbits);
+                if (fits_imm32(kval, cbits) && dead_after(plan_, next_idx, d.rd)) {
+                    const auto i32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(kval));
+                    const auto nv = val(c.rn);
+                    const Gp h = nv.is_mem() ? cached_gpr(nv.g) : nv.r;
+                    if (h == Gp::none) a_.cmp(cbits, gmem(nv.g), i32);
+                    else a_.cmp(cbits, h, i32);
+                    set_flags(FlagsProducer::sub);
+                    return consumed + 1;
+                }
+            }
+            // MOVZ/MOVN[+MOVK] Xt, #imm; ADD/SUB Xd, Xn, Xt (or ADD Xd, Xt, Xm) -> lea.
+            if (c.kind == Kind::add_sub_shift && !c.s && c.amount == 0 &&
+                ((c.rm == d.rd && c.rn != d.rd) || (!c.op && c.rn == d.rd && c.rm != d.rd)) &&
+                (c.rd == d.rd || dead_after(plan_, next_idx, d.rd))) {
+                const unsigned cbits = c.sf ? 64 : 32;
+                const auto kval = value & ones(cbits);
+                const auto eff = (c.op ? (0ULL - kval) : kval) & ones(cbits);
+                if (fits_imm32(eff, cbits)) {
+                    const unsigned base_g = c.rm == d.rd ? c.rn : c.rm;
+                    const auto base_v = val(base_g);
+                    const auto dd = dst(c.rd);
+                    if (base_v.is_zero()) {
+                        mov_literal(dd, eff);
+                    } else if (eff == 0) {
+                        load(cbits, dd, base_v);
+                    } else {
+                        const auto disp = static_cast<std::int32_t>(static_cast<std::uint32_t>(eff));
+                        const auto bv = resolve(base_v);
+                        Gp br = bv.r;
+                        if (!bv.is_reg()) {
+                            if (bv.is_mem() && may_cache() && std::popcount(free_gpr_) >= 2 && gpr_read_soon(bv.g)) {
+                                br = read_unpinned(bv.g);
+                            } else {
+                                load(64, dd, bv);
+                                br = dd;
+                            }
+                        }
+                        a_.lea(cbits, dd, ptr(br, disp));
+                    }
+                    return consumed + 1;
+                }
+            }
+            // MOVZ/MOVN[+MOVK] Xt, #imm; AND/ORR/EOR/ANDS/TST Xd, Xn, Xt (Xt dead after) -> imm ALU/TEST.
+            if (c.kind == Kind::logic_shift && !c.invert && c.amount == 0 &&
+                ((c.rm == d.rd && c.rn != d.rd) || (c.rn == d.rd && c.rm != d.rd)) &&
+                (!c.s || (bool_reader_ < 0 && !flags_saved_)) &&
+                (c.rd == d.rd || dead_after(plan_, next_idx, d.rd))) {
+                const unsigned cbits = c.sf ? 64 : 32;
+                const auto kval = value & ones(cbits);
+                const unsigned base_g = c.rm == d.rd ? c.rn : c.rm;
+                const auto base_v = val(base_g);
+                if (!base_v.is_zero() && fits_imm32(kval, cbits)) {
+                    static constexpr Alu lops[4] = {Alu::and_, Alu::or_, Alu::xor_, Alu::and_};
+                    const auto i32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(kval));
+                    if (c.s && c.rd == 31) {
+                        if (base_v.is_mem() && i32 != 1 && cached_gpr(base_v.g) == Gp::none)
+                            a_.test(cbits, gmem(base_v.g), i32);
+                        else
+                            a_.test(cbits, in_reg(base_v), i32);
+                        set_flags(FlagsProducer::logic);
+                        return consumed + 1;
+                    }
+                    if (!c.s && c.rd == 31) return consumed + 1;
+                    if (!c.s && c.op == 0) {
+                        if (kval == 0xff || kval == 0xffff) {
+                            const auto dd = dst(c.rd);
+                            const unsigned width = kval == 0xff ? 8 : 16;
+                            const Gp h = base_v.is_reg() ? base_v.r : cached_gpr(base_v.g);
+                            if (h != Gp::none) a_.movzx(32, dd, h, width);
+                            else a_.movzx(32, dd, gmem(base_v.g), width);
+                            return consumed + 1;
+                        }
+                        if (kval == 0xffffffffULL) {
+                            load(32, dst(c.rd), base_v);
+                            return consumed + 1;
+                        }
+                    }
+                    if (!c.s) prepare_clobber();
+                    const auto dd = dst(c.rd);
+                    const Gp br = base_v.is_reg() ? base_v.r : (base_v.is_mem() ? cached_gpr(base_v.g) : Gp::none);
+                    if (br != dd) load(cbits, dd, base_v);
+                    a_.alu(lops[c.op], cbits, dd, i32);
+                    if (c.rd != 31 && !flags_saved_) {
+                        zf_inst_ = next_idx;
+                        logic_flags_inst_ = next_idx;
+                        zf_guest_ = static_cast<std::uint8_t>(c.rd);
+                        zf_bits_ = static_cast<std::uint8_t>(cbits);
+                    }
+                    if (c.s) set_flags(FlagsProducer::logic);
+                    return consumed + 1;
+                }
+            }
+            // MOVZ/MOVN[+MOVK] Xt, #imm; MUL Xd, Xn, Xt (Xt dead after) -> imul Xd, Xn, imm32.
+            if (c.kind == Kind::dp3 && c.op == dp3_madd && c.ra == 31 && !keep_flags() &&
+                ((c.rm == d.rd && c.rn != d.rd) || (c.rn == d.rd && c.rm != d.rd)) &&
+                (c.rd == d.rd || dead_after(plan_, next_idx, d.rd))) {
+                const unsigned cbits = c.sf ? 64 : 32;
+                const auto kval = value & ones(cbits);
+                const unsigned base_g = c.rm == d.rd ? c.rn : c.rm;
+                const auto base_v = val(base_g);
+                if (fits_imm32(kval, cbits)) {
+                    if (c.rd == 31) return consumed + 1;
+                    if (base_v.is_zero() || kval == 0) {
+                        a_.mov_imm(dst(c.rd), 0);
+                        return consumed + 1;
+                    }
+                    prepare_clobber();
+                    const auto i32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(kval));
+                    const Gp br = base_v.is_reg() ? base_v.r : (base_v.is_mem() ? borrow_gpr(base_v.g) : Gp::none);
+                    const auto dd = dst(c.rd);
+                    if (br != Gp::none) {
+                        a_.imul(cbits, dd, br, i32);
+                    } else {
+                        load(cbits, dd, base_v);
+                        a_.imul(cbits, dd, dd, i32);
+                    }
+                    return consumed + 1;
+                }
+            }
+            // MOVZ/MOVN[+MOVK] Xt, #imm; STR Xt, [base, #disp8] (Xt dead after) -> mov [m], imm.
+            // Relocation hygiene: disp8(m) and (sbits < 32 || i32 != 1) avoid module-window byte patterns.
+            // Fault sites report the MOVZ/MOVN pc with Xt unchanged so re-execution is exact.
+            if (c.kind == Kind::load_store && c.mem == MemOp::store &&
+                (c.mode == AddrMode::offset || c.mode == AddrMode::reg) && c.rd == d.rd && c.rn != d.rd &&
+                (c.mode == AddrMode::offset || c.rm != d.rd) && c.imm >= -128 && c.imm <= 127 && c.imm != 1) {
+                const unsigned sbits = 8u << c.size;
+                const auto sval = value & ones(sbits);
+                const auto i32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(sval));
+                if (fits_imm32(sval, sbits) && (sbits < 32 || i32 != 1) && dead_after(plan_, next_idx, d.rd)) {
+                    folded_access_ = true;
+                    EmitContext::GuestAddress ga;
+                    ga.base = c.rn;
+                    ga.disp = static_cast<std::int32_t>(c.imm);
+                    if (c.mode == AddrMode::reg) {
+                        ga.index = c.rm;
+                        ga.option = c.shift;
+                        ga.shift = c.amount;
+                    }
+                    const Mem m = address(ga);
+                    mark_may_fault();
+                    a_.mov(sbits, m, i32);
+                    fault_close();
+                    folded_access_ = false;
+                    return consumed + 1;
+                }
+            }
+        }
+    }
     const auto t = dst(d.rd);
     mov_literal(t, value);
     return consumed;
@@ -809,7 +1126,9 @@ void RegionEmitter::e_bitfield(const Inst& d) {
             else field_insert_zero(bits, t, nr, pos, len, false);
         }
         const auto inv = ~(ones(len) << pos) & ones(bits);
-        alu_imm(Alu::and_, bits, dd, inv);
+        const bool skip_mask =
+            bits == 64 && inv == 0xffffffffULL && isel_on(isel_no_zext) && (ext_facts(plan_, index_, d.rd) & ext_zero32);
+        if (!skip_mask) alu_imm(Alu::and_, bits, dd, inv);
         if (t != Gp::none) a_.or_(bits, dd, t);
         return;
     }
@@ -825,8 +1144,25 @@ void RegionEmitter::e_bitfield(const Inst& d) {
         load(64, dd, nv);
         n = dd;
     }
+    const bool had_keep = keep_flags();
     if (s >= r) field_extract(bits, dd, n, r, s - r + 1, sign);
     else field_insert_zero(bits, dd, n, bits - r, s + 1, sign);
+    if (d.rd != 31 && !had_keep && !flags_saved_) {
+        bool sets_zf = false;
+        if (s >= r) {
+            const unsigned len = s - r + 1;
+            if (r > 0 && (r + len == bits || (sign && bits == 64 && r + len == 32))) sets_zf = true;
+        } else {
+            const unsigned pos = bits - r, len = s + 1;
+            if (pos > 0 && pos + len >= bits && !(dd != n && pos <= 3 && isel_on(isel_no_srcreg))) sets_zf = true;
+        }
+        if (sets_zf) {
+            if (is_host(flags_)) flags_ = FlagsState::ctx;   // dead host flags were clobbered by the shift
+            zf_inst_ = index_;
+            zf_guest_ = static_cast<std::uint8_t>(d.rd);
+            zf_bits_ = static_cast<std::uint8_t>(bits);
+        }
+    }
 }
 
 void RegionEmitter::e_extr(const Inst& d) {
@@ -884,16 +1220,114 @@ void RegionEmitter::e_add_sub_shift(const Inst& d) {
     const unsigned bits = d.sf ? 64 : 32;
     const bool sub = d.op != 0;
     const auto n = val(d.rn);
+    // Known constant operand (unshifted): fold to lea / cmp / add / sub imm32.
+    if (d.amount == 0 && isel_on(isel_no_fold)) {
+        std::uint64_t cval = 0;
+        unsigned base_g = d.rn;
+        bool have_const = known_constant(plan_, index_, d.rm, cval);
+        if (!have_const && !sub && known_constant(plan_, index_, d.rn, cval)) {
+            have_const = true;
+            base_g = d.rm;
+        }
+        if (have_const) {
+            const auto base_v = val(base_g);
+            const auto kval = cval & ones(bits);
+            if (!d.s) {
+                const auto eff = (sub ? (0ULL - kval) : kval) & ones(bits);
+                if (fits_imm32(eff, bits)) {
+                    const auto dd = dst(d.rd);
+                    if (base_v.is_zero()) {
+                        mov_literal(dd, eff);
+                    } else if (eff == 0) {
+                        load(bits, dd, base_v);
+                    } else {
+                        const auto disp = static_cast<std::int32_t>(static_cast<std::uint32_t>(eff));
+                        const auto bv = resolve(base_v);
+                        Gp br = bv.r;
+                        if (!bv.is_reg()) {
+                            if (bv.is_mem() && may_cache() && std::popcount(free_gpr_) >= 2 && gpr_read_soon(bv.g)) {
+                                br = read_unpinned(bv.g);
+                            } else {
+                                load(64, dd, bv);
+                                br = dd;
+                            }
+                        }
+                        a_.lea(bits, dd, ptr(br, disp));
+                    }
+                    return;
+                }
+            } else if (!base_v.is_zero() && fits_imm32(kval, bits)) {
+                const auto i32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(kval));
+                const bool cmn_as_cmp = d.rd == 31 && !sub && i32 != 0 && i32 != INT32_MIN && isel_on(isel_no_srcreg);
+                if (d.rd == 31 && (sub || cmn_as_cmp)) {
+                    const auto k = sub ? i32 : -i32;
+                    const Gp h = base_v.is_mem() ? cached_gpr(base_v.g) : base_v.r;
+                    if (h == Gp::none) a_.cmp(bits, gmem(base_v.g), k);
+                    else a_.cmp(bits, h, k);
+                    set_flags(FlagsProducer::sub);
+                    return;
+                }
+                if (d.rd != 31) {
+                    const auto t = dst(d.rd);
+                    const Gp br = base_v.is_reg() ? base_v.r : (base_v.is_mem() ? cached_gpr(base_v.g) : Gp::none);
+                    if (br != t) load(bits, t, base_v);
+                    if (sub) a_.sub(bits, t, i32);
+                    else a_.add(bits, t, i32);
+                    if (!flags_saved_) {
+                        zf_inst_ = index_;
+                        zf_guest_ = static_cast<std::uint8_t>(d.rd);
+                        zf_bits_ = static_cast<std::uint8_t>(bits);
+                    }
+                    set_flags(sub ? FlagsProducer::sub : FlagsProducer::add);
+                    return;
+                }
+            }
+        }
+    }
     if (!d.s) {
-        const auto dd = dst(d.rd);
         if (!sub && d.shift == 0 && d.amount <= 3) {
-            add_value(bits, dd, n, val(d.rm), d.amount);
+            add_value(bits, dst(d.rd), n, val(d.rm), d.amount);
             return;
         }
+        if (sub && d.amount == 0 && d.rd < 31 && d.rn != d.rm && d.rd != d.rn && !n.is_zero()) {
+            prepare_clobber();
+            if (const auto dd = handoff_dead_src(d.rd, d.rn); dd != Gp::none) {
+                alu(Alu::sub, bits, dd, resolve(val(d.rm)));
+                if (!flags_saved_) {
+                    zf_inst_ = index_;
+                    zf_guest_ = static_cast<std::uint8_t>(d.rd);
+                    zf_bits_ = static_cast<std::uint8_t>(bits);
+                }
+                return;
+            }
+        }
+        const auto dd = dst(d.rd);
         const auto m = shifted(d.rm, d.shift, d.amount, bits);
         if (sub) sub_value(bits, dd, n, m);
         else add_value(bits, dd, n, m, 0);
         return;
+    }
+    if (d.amount == 0 && d.rd < 31 && d.rn != d.rm && !n.is_zero()) {
+        const auto mv = val(d.rm);
+        if (!mv.is_zero()) {
+            Gp dd = Gp::none;
+            const Val* other = nullptr;
+            if (d.rd != d.rn && (dd = handoff_dead_src(d.rd, d.rn)) != Gp::none) {
+                other = &mv;
+            } else if (!sub && d.rd != d.rm && (dd = handoff_dead_src(d.rd, d.rm)) != Gp::none) {
+                other = &n;
+            }
+            if (dd != Gp::none) {
+                alu(sub ? Alu::sub : Alu::add, bits, dd, resolve(*other));
+                set_flags(sub ? FlagsProducer::sub : FlagsProducer::add);
+                if (!flags_saved_) {
+                    zf_inst_ = index_;
+                    zf_guest_ = static_cast<std::uint8_t>(d.rd);
+                    zf_bits_ = static_cast<std::uint8_t>(bits);
+                }
+                return;
+            }
+        }
     }
     const auto m = shifted(d.rm, d.shift, d.amount, bits);
     if (sub) {
@@ -909,6 +1343,11 @@ void RegionEmitter::e_add_sub_shift(const Inst& d) {
             binop(Alu::add, bits, dst(d.rd), n, m, true);
         }
         set_flags(FlagsProducer::add);
+    }
+    if (d.rd != 31 && !flags_saved_) {
+        zf_inst_ = index_;
+        zf_guest_ = static_cast<std::uint8_t>(d.rd);
+        zf_bits_ = static_cast<std::uint8_t>(bits);
     }
 }
 
@@ -943,6 +1382,11 @@ void RegionEmitter::e_add_sub_ext(const Inst& d) {
             binop(Alu::add, bits, dst(d.rd), n, m, true);
         }
         set_flags(FlagsProducer::add);
+    }
+    if (d.rd != 31 && !flags_saved_) {
+        zf_inst_ = index_;
+        zf_guest_ = static_cast<std::uint8_t>(d.rd);
+        zf_bits_ = static_cast<std::uint8_t>(bits);
     }
 }
 
@@ -1013,16 +1457,117 @@ void RegionEmitter::e_logic_shift(const Inst& d) {
             }
             return;
         }
-        prepare_clobber();
+    }
+    static constexpr Alu ops[4] = {Alu::and_, Alu::or_, Alu::xor_, Alu::and_};
+    // Known constant operand (unshifted, non-inverted): fold to immediate ALU/TEST.
+    if (!d.invert && d.amount == 0 && isel_on(isel_no_fold)) {
+        std::uint64_t cval = 0;
+        unsigned base_g = d.rn;
+        bool have_const = known_constant(plan_, index_, d.rm, cval);
+        if (!have_const && known_constant(plan_, index_, d.rn, cval)) {
+            have_const = true;
+            base_g = d.rm;
+        }
+        if (have_const) {
+            const auto base_v = val(base_g);
+            const auto kval = cval & ones(bits);
+            if (!base_v.is_zero() && fits_imm32(kval, bits)) {
+                const auto i32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(kval));
+                if (d.s && d.rd == 31) {
+                    if (base_v.is_mem() && i32 != 1 && cached_gpr(base_v.g) == Gp::none) a_.test(bits, gmem(base_v.g), i32);
+                    else a_.test(bits, in_reg(base_v), i32);
+                    set_flags(FlagsProducer::logic);
+                    return;
+                }
+                if (!d.s && d.rd == 31) return;
+                if (!d.s && d.op == 0) {
+                    if (kval == 0xff || kval == 0xffff) {
+                        const auto dd = dst(d.rd);
+                        const unsigned width = kval == 0xff ? 8 : 16;
+                        const Gp h = base_v.is_reg() ? base_v.r : cached_gpr(base_v.g);
+                        if (h != Gp::none) a_.movzx(32, dd, h, width);
+                        else a_.movzx(32, dd, gmem(base_v.g), width);
+                        return;
+                    }
+                    if (kval == 0xffffffffULL) {
+                        load(32, dst(d.rd), base_v);
+                        return;
+                    }
+                }
+                if (!d.s) prepare_clobber();
+                const auto dd = dst(d.rd);
+                const Gp br = base_v.is_reg() ? base_v.r : (base_v.is_mem() ? cached_gpr(base_v.g) : Gp::none);
+                if (br != dd) load(bits, dd, base_v);
+                a_.alu(ops[d.op], bits, dd, i32);
+                if (d.rd != 31 && !flags_saved_) {
+                    zf_inst_ = index_;
+                    logic_flags_inst_ = index_;
+                    zf_guest_ = static_cast<std::uint8_t>(d.rd);
+                    zf_bits_ = static_cast<std::uint8_t>(bits);
+                }
+                if (d.s) set_flags(FlagsProducer::logic);
+                return;
+            }
+        }
+    }
+    if (!d.s) prepare_clobber();
+    // Dead-source host handoff for unshifted non-inverted AND/ORR/EOR/ANDS:
+    // avoids `mov dst, rn; or dst, rm` when an unpinned cached source is dead
+    // (notably V8 compressed-pointer `LDR wTmp, [obj]; ORR xDst, x28, xTmp`).
+    if (!d.invert && d.amount == 0 && d.rd < 31 && d.rn != d.rm && d.rd != d.rn && d.rd != d.rm &&
+        !n.is_zero() && !mraw.is_zero()) {
+        Gp dd = Gp::none;
+        const Val* other = nullptr;
+        if ((dd = handoff_dead_src(d.rd, d.rn)) != Gp::none) other = &mraw;
+        else if ((dd = handoff_dead_src(d.rd, d.rm)) != Gp::none) other = &n;
+        if (dd != Gp::none) {
+            alu(ops[d.op], bits, dd, resolve(*other));
+            if (!flags_saved_) {
+                zf_inst_ = index_;
+                logic_flags_inst_ = index_;
+                zf_guest_ = static_cast<std::uint8_t>(d.rd);
+                zf_bits_ = static_cast<std::uint8_t>(bits);
+            }
+            if (d.s) set_flags(FlagsProducer::logic);
+            return;
+        }
+    }
+    // Commutative shifted AND/ORR/EOR/ANDS: shift rm directly into dd when dd
+    // will not alias rn, saving a scratch temp and a mov (e.g. V8 LoadIC hash).
+    if (!d.invert && d.amount != 0 && !mraw.is_zero() && !(d.s && d.rd == 31) &&
+        !(n.is_reg() && d.rd == d.rn) &&
+        !(n.is_mem() && d.rd == d.rn && reusable_gpr(d.rd) != Gp::none)) {
+        const auto dd = dst(d.rd);
+        const auto mv = resolve(mraw);
+        Gp src = mv.r;
+        if (!mv.is_reg()) {
+            load(64, dd, mv);
+            src = dd;
+        }
+        shift_imm(shift_op(d.shift), bits, dd, src, d.amount);
+        alu(ops[d.op], bits, dd, n);
+        if (d.rd != 31 && !flags_saved_) {
+            zf_inst_ = index_;
+            logic_flags_inst_ = index_;
+            zf_guest_ = static_cast<std::uint8_t>(d.rd);
+            zf_bits_ = static_cast<std::uint8_t>(bits);
+        }
+        if (d.s) set_flags(FlagsProducer::logic);
+        return;
     }
     auto ms = shifted(d.rm, d.shift, d.amount, bits);
-    static constexpr Alu ops[4] = {Alu::and_, Alu::or_, Alu::xor_, Alu::and_};
     if (d.invert) {
         if ((d.op == 0 || d.op == 3) && cpu_features().bmi1) {   // BIC / BICS: andn
             const auto mr = in_reg(ms);
             const auto nr = in_reg(n);
             const auto dd = d.rd == 31 ? alloc() : dst(d.rd);
             a_.andn(bits, dd, mr, nr);
+            if (d.rd != 31 && !flags_saved_) {
+                zf_inst_ = index_;
+                logic_flags_inst_ = index_;
+                zf_guest_ = static_cast<std::uint8_t>(d.rd);
+                zf_bits_ = static_cast<std::uint8_t>(bits);
+            }
             if (d.s) set_flags(FlagsProducer::logic);
             return;
         }
@@ -1032,6 +1577,14 @@ void RegionEmitter::e_logic_shift(const Inst& d) {
         ms = Val{Val::K::reg, t, 0};
     }
     if (d.s && d.rd == 31) {   // TST
+        // Redundant TST Xd, Xd right after an x64 AND/OR/XOR/ANDN writing Xd
+        // at the same width: host EFLAGS already hold exact SF/ZF/CF=0/OF=0.
+        if (!d.invert && d.op == 3 && d.amount == 0 && d.rn == d.rm && d.rn < 31 &&
+            logic_flags_inst_ == index_ - 1 && !cur_->leader && zf_guest_ == d.rn && zf_bits_ == bits &&
+            !flags_saved_ && bool_reader_ < 0) {
+            set_flags(FlagsProducer::logic);
+            return;
+        }
         const auto mr = in_reg(ms);
         const auto nr = in_reg(n);
         a_.test(bits, nr, mr);
@@ -1039,6 +1592,12 @@ void RegionEmitter::e_logic_shift(const Inst& d) {
         return;
     }
     binop(ops[d.op], bits, dst(d.rd), n, ms, true);
+    if (d.rd != 31 && !flags_saved_) {
+        zf_inst_ = index_;
+        logic_flags_inst_ = index_;
+        zf_guest_ = static_cast<std::uint8_t>(d.rd);
+        zf_bits_ = static_cast<std::uint8_t>(bits);
+    }
     if (d.s) set_flags(FlagsProducer::logic);
 }
 
@@ -1108,20 +1667,54 @@ void RegionEmitter::e_ccmp(const Inst& d) {
     }
     const auto c = condition(d.cond);
     const auto lfalse = a_.new_label(), ldone = a_.new_label();
-    a_.jcc_short(x64::invert(c), lfalse);
-    do_compare();
-    a_.jmp_short(ldone);
-    a_.bind(lfalse);
-    {
-        const unsigned nz = d.imms;
-        const bool fn = nz & 8, fz = nz & 4, fc = nz & 2, fv = nz & 1;
-        const bool cf = ccmn ? fc : !fc;
-        const unsigned ah = (fn ? 0x80u : 0u) | (fz ? 0x40u : 0u) | (cf ? 1u : 0u);
-        a_.mov_imm(Gp::rax, (ah << 8) | (fv ? 1u : 0u));
+    const unsigned nz = d.imms;
+    const bool fn = (nz & 8) != 0, fz = (nz & 4) != 0, fc = (nz & 2) != 0, fv = (nz & 1) != 0;
+    const bool cf = ccmn ? fc : !fc;
+    const unsigned ah = (fn ? 0x80u : 0u) | (fz ? 0x40u : 0u) | (cf ? 1u : 0u);
+    const unsigned imm = (ah << 8) | (fv ? 1u : 0u);
+    // When CCMP feeds an adjacent B.cond:
+    //  - If the immediate-NZCV outcome forces B.cond taken (k == true), defer
+    //    the immediate-NZCV sahf block out-of-line jumping straight to B.cond's
+    //    taken destination (via cond_branch): zero hot jmp, zero hot sahf bytes,
+    //    strictly better or equal on every path (0/1/2 jumps vs 1/2/2 inline).
+    //  - If k == false and the fallthrough exits the region, defer back to ldone.
+    bool defer_taken = false;
+    bool defer_ldone = false;
+    if (can_defer_cold() && index_ + 1 < static_cast<std::int32_t>(plan_.insts.size())) {
+        const auto& pb = plan_.insts[static_cast<std::size_t>(index_) + 1];
+        if (pb.inst.kind == Kind::branch_cond && !pb.leader && pb.pc == cur_->pc + 4 && pb.inst.cond < 14) {
+            const bool k = condition_holds(pb.inst.cond, static_cast<std::uint32_t>(d.imms) << 28);
+            if (k) defer_taken = true;
+            else if (pb.fall < 0) defer_ldone = true;
+        }
+    }
+    if (defer_taken) {
+        a_.jcc(x64::invert(c), lfalse);
+        do_compare();
+        ccmp_cold_inst_ = index_ + 1;
+        ccmp_cold_label_ = lfalse;
+        ccmp_cold_nzcv_ = nz;
+    } else if (defer_ldone) {
+        a_.jcc(x64::invert(c), lfalse);
+        do_compare();
+        a_.bind(ldone);
+        defer_cold([this, lfalse, ldone, imm]() {
+            a_.bind(lfalse);
+            a_.mov_imm(Gp::rax, imm);
+            a_.alu(Alu::add, 8, Gp::rax, 0x7f);   // OF = (al == 1)
+            a_.sahf();                            // SF ZF CF from ah
+            a_.jmp(ldone);
+        });
+    } else {
+        a_.jcc_short(x64::invert(c), lfalse);
+        do_compare();
+        a_.jmp_short(ldone);
+        a_.bind(lfalse);
+        a_.mov_imm(Gp::rax, imm);
         a_.alu(Alu::add, 8, Gp::rax, 0x7f);   // OF = (al == 1)
         a_.sahf();                            // SF ZF CF from ah
+        a_.bind(ldone);
     }
-    a_.bind(ldone);
     set_flags(producer);
 }
 
@@ -1129,9 +1722,11 @@ void RegionEmitter::e_ccmp(const Inst& d) {
 // CSEL-family instruction in the same block after which NZCV is dead, with
 // at most three instructions in between that neither touch the flags nor
 // may fault (they keep EFLAGS or park the answer: RegionEmitter::park_bool);
-// else -1.
+// else -1. Single-flag FCMP conditions (e.g. LE/GT/GE/LT/VS/VC) fuse directly
+// via their native x64 condition without needing parity checks.
 std::int32_t RegionEmitter::ccmp_bool_reader() const {
-    if (!codegen_on(knob_no_ccmp_fusion) || is_fcmp(flags_)) return -1;
+    if (!codegen_on(knob_no_ccmp_fusion)) return -1;
+    if (is_fcmp(flags_) && (cur_->inst.cond >= 14 || fcmp_cond(cur_->inst.cond).k != FcmpCond::K::single)) return -1;
     const auto n = static_cast<std::int32_t>(plan_.insts.size());
     for (std::int32_t j = index_ + 1; j < n && j <= index_ + 4; ++j) {
         const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
@@ -1148,21 +1743,100 @@ std::int32_t RegionEmitter::ccmp_bool_reader() const {
     return -1;
 }
 
-void RegionEmitter::e_csel(const Inst& d) {
+// Branchless dead-CSET byte-OR/AND fusion:
+//   CSET w1, c1 ; CMP a, b ; CSET w2, c2 ; ORR/AND w3, w1, w2 ; CBZ/CBNZ/TBZ#0/TBNZ#0 w3
+// When w1, w2, w3 are unpinned and observably dead after the branch and NZCV is
+// dead after CSET2, skips both 32-bit zero-extensions (`mov r32, 0`), evaluates
+// `setcc t1b; cmp; setcc t2b; or/test t1b, t2b` in two scratch bytes, and feeds
+// the adjacent branch via cset_inst_ (consumed = 4).
+unsigned RegionEmitter::try_fuse_cset_bool(const Inst& d) {
+    if (flags_saved_ || bool_reader_ >= 0 || d.rd >= 31 || pinned(d.rd)) return 0;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    if (index_ + 4 >= n) return 0;
+    for (std::int32_t k = 1; k <= 4; ++k) {
+        const auto& pk = plan_.insts[static_cast<std::size_t>(index_ + k)];
+        if (pk.leader || pk.pc != cur_->pc + 4u * static_cast<unsigned>(k) || pk.may_fault || pk.conservative_writes ||
+            pk.family >= 0 || pk.try_family || pk.inline_call || pk.inline_ret)
+            return 0;
+        if (k <= 3 && pk.flow != Flow::normal) return 0;
+    }
+    const auto& p1 = plan_.insts[static_cast<std::size_t>(index_ + 1)];
+    const auto& p2 = plan_.insts[static_cast<std::size_t>(index_ + 2)];
+    const auto& p3 = plan_.insts[static_cast<std::size_t>(index_ + 3)];
+    const auto& p4 = plan_.insts[static_cast<std::size_t>(index_ + 4)];
+    const auto& c1 = p1.inst;
+    const bool cmp_imm = c1.kind == Kind::add_sub_imm && c1.op == 1 && c1.s && c1.rd == 31;
+    const bool cmp_reg = c1.kind == Kind::add_sub_shift && c1.op == 1 && c1.s && c1.rd == 31 && c1.amount == 0;
+    if (!cmp_imm && !cmp_reg) return 0;
+    const unsigned w1 = d.rd;
+    if ((p1.reads >> w1) & 1u) return 0;
+    const auto& c2 = p2.inst;
+    if (c2.kind != Kind::csel || c2.op != 1 || c2.rn != 31 || c2.rm != 31 || c2.cond >= 14 || c2.rd >= 31 ||
+        c2.rd == w1 || pinned(c2.rd) || p2.flags_live_out)
+        return 0;
+    const unsigned w2 = c2.rd;
+    const auto& c3 = p3.inst;
+    if (c3.kind != Kind::logic_shift || (c3.op != 0 && c3.op != 1) || c3.invert || c3.amount != 0 || c3.s ||
+        c3.rd >= 31 || pinned(c3.rd))
+        return 0;
+    if (!((c3.rn == w1 && c3.rm == w2) || (c3.rn == w2 && c3.rm == w1))) return 0;
+    const unsigned w3 = c3.rd;
+    const auto& c4 = p4.inst;
+    const bool br_ok = (c4.kind == Kind::compare_branch && c4.rd == w3) ||
+                       (c4.kind == Kind::test_branch && c4.rd == w3 && c4.amount == 0);
+    if (!br_ok || p4.flags_live_in) return 0;
+    if (!gpr_dead_after(index_ + 4, w1) || !gpr_dead_after(index_ + 4, w2) || !gpr_dead_after(index_ + 4, w3))
+        return 0;
+
+    const auto t1 = alloc();
+    a_.setcc(x64::invert(condition(d.cond)), t1);
+    const unsigned cbits = c1.sf ? 64 : 32;
+    if (cmp_imm) {
+        const auto cn = val(c1.rn, true);
+        if (cn.is_reg()) a_.cmp(cbits, cn.r, static_cast<std::int32_t>(c1.imm));
+        else if (const auto h = cached_gpr(cn.g); h != Gp::none) a_.cmp(cbits, h, static_cast<std::int32_t>(c1.imm));
+        else a_.cmp(cbits, gmem(cn.g), static_cast<std::int32_t>(c1.imm));
+    } else {
+        compare(cbits, val(c1.rn), val(c1.rm));
+    }
+    set_flags(FlagsProducer::sub);
+    const auto t2 = alloc();
+    a_.setcc(x64::invert(condition(c2.cond)), t2);
+    if (c3.op == 1) a_.alu(Alu::or_, 8, t1, t2);
+    else a_.test(8, t1, t2);
+    cache_drop_guest(gc_, w1);
+    cache_drop_guest(gc_, w2);
+    cache_drop_guest(gc_, w3);
+    flags_ = FlagsState::ctx;
+    cset_inst_ = index_ + 3;
+    cset_guest_ = static_cast<std::uint8_t>(w3);
+    cset_cond_ = Cond::ne;
+    return 4;
+}
+
+unsigned RegionEmitter::e_csel(const Inst& d) {
     const unsigned bits = d.sf ? 64 : 32;
     const auto n = val(d.rn), m = val(d.rm);
+    // Fused FCMP flags whose condition needs the parity flag as well: two cmovs.
+    const bool pair = d.cond < 14 && is_fcmp(flags_) && fcmp_cond(d.cond).k != FcmpCond::K::single;
+    if (d.cond < 14 && d.op == 1 && n.is_zero() && m.is_zero() && !pair) {
+        if (const unsigned consumed = try_fuse_cset_bool(d); consumed != 0) return consumed;
+    }
     const auto dd = dst(d.rd);
     if (d.cond >= 14) {
         load(bits, dd, n);
-        return;
+        return 1;
     }
-    // Fused FCMP flags whose condition needs the parity flag as well: two cmovs.
-    const bool pair = is_fcmp(flags_) && fcmp_cond(d.cond).k != FcmpCond::K::single;
     if (d.op == 1 && n.is_zero() && m.is_zero() && !pair) {   // CSET
         a_.mov_imm(dd, 0);
         const auto c = condition(d.cond);
         a_.setcc(x64::invert(c), dd);
-        return;
+        if (d.rd < 31 && !flags_saved_) {
+            cset_inst_ = index_;
+            cset_guest_ = static_cast<std::uint8_t>(d.rd);
+            cset_cond_ = x64::invert(c);
+        }
+        return 1;
     }
     if (d.op == 2 && n.is_zero() && m.is_zero() && !pair) {   // CSETM
         const auto t = alloc();
@@ -1170,7 +1844,12 @@ void RegionEmitter::e_csel(const Inst& d) {
         mov_literal(t, ones(bits));
         const auto c = condition(d.cond);
         a_.cmov(x64::invert(c), bits, dd, t);
-        return;
+        if (d.rd < 31 && !flags_saved_) {
+            cset_inst_ = index_;
+            cset_guest_ = static_cast<std::uint8_t>(d.rd);
+            cset_cond_ = x64::invert(c);
+        }
+        return 1;
     }
     // x = else-value f(m)
     const bool dd_is_n = n.is_reg() && n.r == dd;
@@ -1224,7 +1903,7 @@ void RegionEmitter::e_csel(const Inst& d) {
                 a_.cmov(Cond::p, bits, x, dd);
                 a_.mov(bits, dd, x);
             }
-            return;
+            return 1;
         }
         // t = n in a writable register.
         const auto t = alloc();
@@ -1237,12 +1916,12 @@ void RegionEmitter::e_csel(const Inst& d) {
             a_.cmov(fc.c, bits, x, t);
             a_.cmov(Cond::p, bits, x, t);
         }
-        return;
+        return 1;
     }
     if (dd_is_n) {
         const auto c = condition(d.cond);
         a_.cmov(x64::invert(c), bits, dd, x);
-        return;
+        return 1;
     }
     Gp zr = Gp::none;
     if (n.is_zero()) {
@@ -1254,47 +1933,93 @@ void RegionEmitter::e_csel(const Inst& d) {
     else if (n.is_reg()) a_.cmov(c, bits, x, n.r);
     else if (const auto h = cached_gpr(n.g); h != Gp::none) a_.cmov(c, bits, x, h);
     else a_.cmov(c, bits, x, gmem(n.g));
+    return 1;
 }
 
-// RBIT Xd, Xn whose only reader is a CLZ Xm, Xd a few instructions later
-// (the ARM64 count-trailing-zeros idiom), with Xd overwritten before any other
-// read and nothing in between that may fault or leave the block: RBIT emits
-// nothing and the CLZ emits TZCNT Xm, Xn. Xd is never observable meanwhile.
-std::int32_t RegionEmitter::rbit_clz_target(const Inst& d) const {
+// RBIT Xd, Xn feeding CLZ Xm, Xd a few instructions later (the ARM64
+// count-trailing-zeros idiom):
+//  - When Xd is overwritten before any other read and nothing in between may
+//    fault or leave the block (`elide_rbit = true`), RBIT emits nothing and
+//    CLZ emits TZCNT Xm, Xn.
+//  - Otherwise (`elide_rbit = false`), when Xd != Xn and neither is written
+//    before the CLZ, RBIT still emits for exact architectural state (e.g. a
+//    following faulting load), while CLZ emits TZCNT Xm, Xn directly on Xn to
+//    break the RBIT latency chain.
+std::int32_t RegionEmitter::rbit_clz_target(const Inst& d, bool& elide_rbit) const {
+    elide_rbit = false;
     if (!plan_.rbit_fusion || !cpu_features().bmi1 || d.rd == 31) return -1;
     const auto n = static_cast<std::int32_t>(plan_.insts.size());
     const std::uint32_t xd = 1u << d.rd, xn = d.rn == 31 ? 0u : 1u << d.rn;
     std::int32_t clz = -1;
+    bool can_elide = true;
     for (std::int32_t j = index_ + 1; j < n && j <= index_ + 16; ++j) {
         const auto& pj = plan_.insts[j];
-        if (pj.leader || pj.flow != Flow::normal || pj.may_fault || pj.conservative_writes) return -1;
+        if (pj.leader || pj.flow != Flow::normal || pj.conservative_writes) break;
+        if (pj.may_fault) {
+            if (clz < 0) return -1;
+            can_elide = false;
+            break;
+        }
         if (clz < 0) {
             if (pj.reads & xd) {
                 const auto& c = pj.inst;
                 if (c.kind != Kind::dp1 || c.op != dp1_clz || c.sf != d.sf || c.rn != d.rd) return -1;
                 clz = j;
-                if (c.rd == d.rd) return clz;   // the CLZ overwrites Xd itself
+                if (c.rd == d.rd) {
+                    elide_rbit = true;
+                    return clz;   // the CLZ overwrites Xd itself
+                }
                 continue;
             }
             if (pj.writes & (xd | xn)) return -1;
         } else {
-            if (pj.reads & xd) return -1;
-            if (pj.writes & xd) return clz;     // Xd overwritten: the RBIT value is dead
+            if (pj.reads & xd) {
+                can_elide = false;
+                break;
+            }
+            if (pj.writes & xd) {
+                elide_rbit = true;
+                return clz;     // Xd overwritten: the RBIT value is dead
+            }
         }
+    }
+    if (clz >= 0 && d.rd != d.rn) {
+        (void)can_elide;
+        elide_rbit = false;
+        return clz;
     }
     return -1;
 }
 
-void RegionEmitter::e_dp1(const Inst& d) {
+unsigned RegionEmitter::e_dp1(const PlanInst& pi) {
+    const auto& d = pi.inst;
     const unsigned bits = d.sf ? 64 : 32;
+    unsigned consumed = 1;
+    Gp in_place_nr = Gp::none;
     if (d.op == dp1_rbit) {
         // One fusion at a time: a second RBIT before the first one's CLZ (two
         // ctz idioms interleaved) is emitted plainly, or it would take over
         // the pending CLZ and leave the first RBIT's register unwritten.
-        if (const auto j = tz_clz_ < 0 ? rbit_clz_target(d) : -1; j >= 0) {
+        bool elide_rbit = false;
+        if (const auto j = tz_clz_ < 0 ? rbit_clz_target(d, elide_rbit) : -1; j >= 0) {
             tz_clz_ = j;   // emitted by the CLZ as TZCNT of Xn
             tz_src_ = static_cast<std::uint8_t>(d.rn);
-            return;
+            if (elide_rbit) return 1;
+        } else if (plan_.rbit_fusion && cpu_features().bmi1 && tz_clz_ < 0 && d.rd != 31 && d.rd == d.rn &&
+                   index_ + 1 < static_cast<std::int32_t>(plan_.insts.size())) {
+            // In-place RBIT Xd, Xd immediately followed by CLZ Xm, Xd (Xm != Xd)
+            // where RBIT could not be elided (e.g. a faulting load/store follows):
+            // emit TZCNT Xm, Xd BEFORE RBIT overwrites Xd to break the dependency chain.
+            const auto& next = plan_.insts[static_cast<std::size_t>(index_ + 1)];
+            if (!next.leader && next.pc == pi.pc + 4 && next.inst.kind == Kind::dp1 && next.inst.op == dp1_clz &&
+                next.inst.sf == d.sf && next.inst.rn == d.rd && next.inst.rd != d.rd && next.inst.rd != 31 &&
+                !next.may_fault && next.flow == Flow::normal) {
+                prepare_clobber();
+                in_place_nr = in_reg(val(d.rn));
+                const auto clz_dst = dst(next.inst.rd);
+                a_.tzcnt(bits, clz_dst, in_place_nr);
+                consumed = 2;
+            }
         }
     } else if (d.op == dp1_clz && index_ == tz_clz_) {
         tz_clz_ = -1;
@@ -1303,7 +2028,7 @@ void RegionEmitter::e_dp1(const Inst& d) {
         prepare_clobber();
         if (src.is_zero()) a_.mov_imm(dd, bits);
         else a_.tzcnt(bits, dd, in_reg(src));
-        return;
+        return 1;
     }
     const auto nv = val(d.rn);
     const auto dd = dst(d.rd);
@@ -1312,20 +2037,20 @@ void RegionEmitter::e_dp1(const Inst& d) {
     case dp1_rev:
         load(bits, dd, nv);
         a_.bswap(bits, dd);
-        return;
+        return 1;
     case dp1_rev32:   // 64-bit only
         load(64, dd, nv);
         a_.bswap(64, dd);
         if (cpu.bmi2) a_.rorx(64, dd, dd, 32);
         else { prepare_clobber(); a_.ror(64, dd, 32); }
-        return;
+        return 1;
     case dp1_rev16:
         if (bits == 32) {
             load(32, dd, nv);
             a_.bswap(32, dd);
             if (cpu.bmi2) a_.rorx(32, dd, dd, 16);
             else { prepare_clobber(); a_.ror(32, dd, 16); }
-            return;
+            return 1;
         }
         {
             prepare_clobber();
@@ -1340,13 +2065,13 @@ void RegionEmitter::e_dp1(const Inst& d) {
             a_.or_(64, t, u);
             a_.mov(64, dd, t);
         }
-        return;
+        return 1;
     case dp1_clz: {
         prepare_clobber();
         const auto nr = in_reg(nv);
         if (cpu.lzcnt) {
             a_.lzcnt(bits, dd, nr);
-            return;
+            return 1;
         }
         const auto t = alloc(), c = alloc();
         a_.mov_imm(c, ones(64));
@@ -1354,7 +2079,7 @@ void RegionEmitter::e_dp1(const Inst& d) {
         a_.cmov(Cond::e, 64, t, c);
         a_.neg(64, t);
         a_.lea(bits, dd, ptr(t, static_cast<std::int32_t>(bits - 1)));
-        return;
+        return 1;
     }
     case dp1_cls: {
         prepare_clobber();
@@ -1371,28 +2096,31 @@ void RegionEmitter::e_dp1(const Inst& d) {
             a_.mov_imm(dd, bits - 1);
             a_.sub(bits, dd, u);
         }
-        return;
+        return 1;
     }
     default: {   // RBIT
-        if (cpu.gfni && cpu.avx && std::popcount(free_xmm_) >= 2) {
-            // Reverse the bits of every byte with GF2P8AFFINEQB (matrix
-            // 0x8040201008040201), then the byte order with BSWAP. Flag-free.
-            const auto k = alloc();
-            mov_literal(k, 0x8040201008040201ULL);
-            const auto x = alloc_vec(), m = alloc_vec();
+        if (cpu.gfni && cpu.avx && std::popcount(free_xmm_) >= 1) {
+            // Reverse the bits of every byte with GF2P8AFFINEQB using a
+            // per-region RIP-relative matrix (0x8040201008040201), then the
+            // byte order with BSWAP. Flag-free, 1 XMM temp, 0 GPR temps.
+            if (!rbit_const_label_.valid()) rbit_const_label_ = a_.new_label();
+            const auto x = alloc_vec();
             const bool w = bits == 64;
-            if (nv.is_zero()) a_.vex_rr({1, 1, 0xef, false}, false, x64::id(x), x64::id(x), x64::id(x));   // vpxor
+            if (in_place_nr != Gp::none)
+                a_.vex_rr({1, 1, 0x6e, w}, false, x64::id(x), 0, x64::id(in_place_nr));
+            else if (nv.is_zero()) a_.vex_rr({1, 1, 0xef, false}, false, x64::id(x), x64::id(x), x64::id(x));   // vpxor
             else a_.vex_rr({1, 1, 0x6e, w}, false, x64::id(x), 0, x64::id(in_reg(nv)));                   // vmovq/d x, n
-            a_.vex_rr({1, 1, 0x6e, true}, false, x64::id(m), 0, x64::id(k));                               // vmovq m, k
-            a_.vex_rr({1, 3, 0xce, true}, false, x64::id(x), x64::id(x), x64::id(m));                      // vgf2p8affineqb
+            rbit_sites_.push_back(static_cast<std::uint32_t>(a_.size()));
+            a_.vex_rm({1, 3, 0xce, true}, false, x64::id(x), x64::id(x), x64::rip(rbit_const_label_), 1); // vgf2p8affineqb
             a_.db(0);
             a_.vex_rr({1, 1, 0x7e, w}, false, x64::id(x), 0, x64::id(dd));                                // vmovq/d dd, x
             a_.bswap(bits, dd);
-            return;
+            return consumed;
         }
         prepare_clobber();
         const auto t = alloc(), u = alloc();
-        load(bits, t, nv);
+        if (in_place_nr != Gp::none) a_.mov(bits, t, in_place_nr);
+        else load(bits, t, nv);
         a_.bswap(bits, t);
         struct Step { unsigned k; std::uint64_t mask; };
         static constexpr Step steps[3] = {{4, 0x0f0f0f0f0f0f0f0fULL}, {2, 0x3333333333333333ULL}, {1, 0x5555555555555555ULL}};
@@ -1416,7 +2144,7 @@ void RegionEmitter::e_dp1(const Inst& d) {
             }
         }
         a_.mov(bits, dd, t);
-        return;
+        return consumed;
     }
     }
 }
@@ -1573,15 +2301,100 @@ void RegionEmitter::e_dp3(const Inst& d) {
             p = widen_operand(nv);
             const auto q = widen_operand(mv);
             a_.imul(64, p, q);
+        } else if (av.is_zero() && !sub && isel_on(isel_no_zext)) {
+            // MUL Xd/Wd, Xn/Wn, Xm/Wm: emit directly into destination (1 insn
+            // in-place, 2 insns otherwise, 0 extra scratch GPRs).
+            if (d.rd == 31) return;
+            // Known-constant multiplier (e.g. Owen-scrambling hash constants):
+            // 3-operand imul dst, src, imm32 eliminates memory loads & extra mov.
+            if (isel_on(isel_no_fold)) {
+                std::uint64_t cval = 0;
+                unsigned base_g = d.rn;
+                bool have_const = known_constant(plan_, index_, d.rm, cval);
+                if (!have_const && known_constant(plan_, index_, d.rn, cval)) {
+                    have_const = true;
+                    base_g = d.rm;
+                }
+                if (have_const) {
+                    const auto kval = cval & ones(bits);
+                    if (fits_imm32(kval, bits)) {
+                        const auto bv = val(base_g);
+                        const auto i32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(kval));
+                        const Gp br = bv.is_reg() ? bv.r : (bv.is_mem() ? borrow_gpr(bv.g) : Gp::none);
+                        const auto dd = dst(d.rd);
+                        if (br != Gp::none) {
+                            a_.imul(bits, dd, br, i32);
+                        } else {
+                            load(bits, dd, bv);
+                            a_.imul(bits, dd, dd, i32);
+                        }
+                        return;
+                    }
+                }
+            }
+            if (pinned(d.rd)) {
+                const auto dd = pin(d.rd);
+                note_write(d.rd);
+                if (nv.is_reg() && nv.r == dd) {
+                    const Gp mh = mv.is_reg() ? mv.r : cached_gpr(mv.g);
+                    if (mh != Gp::none) a_.imul(bits, dd, mh);
+                    else a_.imul(bits, dd, gmem(mv.g));
+                } else if (mv.is_reg() && mv.r == dd) {
+                    const Gp nh = nv.is_reg() ? nv.r : cached_gpr(nv.g);
+                    if (nh != Gp::none) a_.imul(bits, dd, nh);
+                    else a_.imul(bits, dd, gmem(nv.g));
+                } else {
+                    load(bits, dd, nv);
+                    const Gp mh = mv.is_reg() ? mv.r : cached_gpr(mv.g);
+                    if (mh != Gp::none) a_.imul(bits, dd, mh);
+                    else a_.imul(bits, dd, gmem(mv.g));
+                }
+                return;
+            }
+            const auto try_reuse = [&](unsigned g) -> Gp {
+                if (!codegen_on(knob_no_gpr_reuse) || !may_cache()) return Gp::none;
+                const auto h = gc_.host[g];
+                const bool ok = (h >= 8 && h <= 11) || h == 1 || h == 2;
+                if (!ok) return Gp::none;
+                const auto r = x64::gp(static_cast<unsigned>(h));
+                if (!is_free(r) || galias_of_[static_cast<unsigned>(h)] != 0) return Gp::none;
+                if (pending_gpr_count_ >= std::size(pending_gpr_)) return Gp::none;
+                free_gpr_ &= ~(1u << static_cast<unsigned>(h));
+                pending_gpr_[pending_gpr_count_++] = {static_cast<std::uint8_t>(g), r};
+                note_write(g);
+                return r;
+            };
+            if (d.rd == d.rn || d.rd == d.rm) {
+                if (const auto dd = try_reuse(d.rd); dd != Gp::none) {
+                    const Val& other = d.rd == d.rn ? mv : nv;
+                    const Gp oh = other.is_reg() ? other.r : cached_gpr(other.g);
+                    if (oh != Gp::none) a_.imul(bits, dd, oh);
+                    else a_.imul(bits, dd, gmem(other.g));
+                    return;
+                }
+            }
+            const Gp nh = nv.is_reg() ? nv.r : (nv.is_mem() ? borrow_gpr(nv.g) : Gp::none);
+            const Gp mh = mv.is_reg() ? mv.r : (mv.is_mem() ? borrow_gpr(mv.g) : Gp::none);
+            const auto dd = dst(d.rd);
+            if (nh != Gp::none) a_.mov(bits, dd, nh);
+            else a_.mov(bits, dd, gmem(nv.g));
+            if (mh != Gp::none) a_.imul(bits, dd, mh);
+            else a_.imul(bits, dd, gmem(mv.g));
+            return;
         } else {
-            // MADD Xd, Xd, Xm, Xa with a pinned Xd: multiply in place.
-            const bool in_place = !sub && nv.is_reg() && pinned(d.rd) && d.rd != 31 && nv.r == pin(d.rd) &&
-                                  !(av.is_reg() && av.r == nv.r);
-            p = in_place ? nv.r : copy_of(nv);
+            // MADD/MSUB Xd, Xn, Xm, Xa with a pinned Xd: multiply in place when Xd aliases Xn or Xm.
+            const bool n_alias = !sub && nv.is_reg() && pinned(d.rd) && d.rd != 31 && nv.r == pin(d.rd) &&
+                                 !(av.is_reg() && av.r == nv.r);
+            const bool m_alias = !n_alias && !sub && mv.is_reg() && pinned(d.rd) && d.rd != 31 && mv.r == pin(d.rd) &&
+                                 !(av.is_reg() && av.r == mv.r);
+            const Val& first = m_alias ? mv : nv;
+            const Val& second = m_alias ? nv : mv;
+            const bool in_place = n_alias || m_alias;
+            p = in_place ? first.r : copy_of(first);
             if (in_place) note_write(d.rd);
-            const Gp mh = mv.is_reg() ? mv.r : cached_gpr(mv.g);
-            if (mh != Gp::none) a_.imul(bits, p, mh);
-            else a_.imul(bits, p, gmem(mv.g));
+            const Gp sh = second.is_reg() ? second.r : cached_gpr(second.g);
+            if (sh != Gp::none) a_.imul(bits, p, sh);
+            else a_.imul(bits, p, gmem(second.g));
         }
     }
     const auto dd = dst(d.rd);

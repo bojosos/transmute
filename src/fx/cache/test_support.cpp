@@ -98,7 +98,7 @@ TranslatedRegion make_region(std::uint64_t base, std::uint32_t rva, std::uint32_
     }
     for (std::uint32_t k = 0; k < 4; ++k)
         r.faults.push_back({56 + 8 * k, 60 + 8 * k, start + 4ull * k,
-                            static_cast<FlagsLocation>(k % 5), static_cast<std::uint8_t>(k)});
+                            static_cast<FlagsLocation>((k + n) % 7), static_cast<std::uint8_t>(k)});
     r.pins = {{19, 3, false}, {20, 6, false}, {1, 7, true}};
     r.fault_maps = {{0, 2}, {2, 1}};
     r.fault_map_regs = {{9, 8, false}, {2, 1, true}, {20, kFaultMapContext, false}};
@@ -357,20 +357,37 @@ ImageMemorySource::ImageMemorySource(const MappedImage& image, const pe::Image& 
     functions_.erase(std::unique(functions_.begin(), functions_.end(),
                                  [](const pe::Function& a, const pe::Function& b) { return a.begin == b.begin; }),
                      functions_.end());
-    for (const pe::Section& s : file.sections())
+    for (const pe::Section& s : file.sections()) {
         if (s.executable) executable_.push_back(s);
+        constexpr std::uint32_t kRead = 0x40000000u, kWrite = 0x80000000u;
+        if (!s.executable && (s.characteristics & kRead) && !(s.characteristics & kWrite)) read_only_.push_back(s);
+    }
 }
 
-bool ImageMemorySource::read(std::uint64_t address, std::uint32_t& word) const {
+bool ImageMemorySource::read_from(const std::vector<pe::Section>& sections, std::uint64_t address,
+                                  std::uint32_t& word) const {
     if (address < base_ || address - base_ + 4 > size_ || (address & 3)) return false;
     const auto rva = static_cast<std::uint32_t>(address - base_);
-    for (const pe::Section& s : executable_) {
+    for (const pe::Section& s : sections) {
         if (rva >= s.rva && std::uint64_t{rva - s.rva} + 4 <= s.raw_size) {
             std::memcpy(&word, reinterpret_cast<const void*>(address), 4);
             return true;
         }
     }
     return false;
+}
+
+bool ImageMemorySource::read(std::uint64_t address, std::uint32_t& word) const {
+    return read_from(executable_, address, word);
+}
+
+bool ImageMemorySource::image_code(std::uint64_t address) const {
+    std::uint32_t word = 0;
+    return read_from(executable_, address, word);
+}
+
+bool ImageMemorySource::read_data(std::uint64_t address, std::uint32_t& word) const {
+    return read_from(executable_, address, word) || read_from(read_only_, address, word);
 }
 
 bool ImageMemorySource::function_bounds(std::uint64_t address, std::uint64_t& begin, std::uint64_t& end) const {

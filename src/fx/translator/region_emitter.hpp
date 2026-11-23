@@ -23,7 +23,9 @@
 #include "fx/translator/translator.hpp"
 
 #include <atomic>
+#include <bit>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -107,9 +109,17 @@ public:
     GprSrc gsrc(unsigned index, bool sp) override;
     bool fcmp_swap() override;
     bool set_fcmp_flags(bool swapped) override;
+    [[nodiscard]] int fccmp_consumer_cond() const override;
+    void set_fccmp_bool() override;
     [[nodiscard]] bool vec_write_deferred(unsigned index) const override {
         return index < 32 && !vpinned(index) && !reusable_vec(index);
     }
+    [[nodiscard]] bool vec_pinned(unsigned index) const override { return index < 32 && vpinned(index); }
+    [[nodiscard]] unsigned vec_scratch_avail() const override {
+        return static_cast<unsigned>(std::popcount(free_xmm_));
+    }
+    [[nodiscard]] bool vec_dead_after(unsigned consumed, unsigned index) const override;
+    [[nodiscard]] bool vec_sz_dead_after(unsigned consumed, unsigned index, unsigned es) const override;
     // ---- vector upper-bit knowledge (fp/neon; additive) ----
     [[nodiscard]] std::uint32_t vec_zero_above(unsigned width) const override {
         return width == 32 ? vzero32_ : width == 64 ? vzero64_ : width >= 128 ? ~0u : 0u;
@@ -133,6 +143,13 @@ public:
     bool vec_derived(unsigned index, unsigned kind, x64::Mem& slot) override;   // tier 2
     bool vec_fp_const(unsigned index, unsigned es, unsigned width, std::uint64_t& bits) override;   // p3
     bool vec_fp_quiet(unsigned index, unsigned es) override;                                       // p3
+    [[nodiscard]] bool host_flags_live() const override {
+        return is_host(flags_) && !flags_saved_ &&
+               (bool_reader_ >= 0 || cur_reads_flags_ || (live_out_ && !cur_writes_flags_));
+    }
+    [[nodiscard]] bool flags_live_out() const override { return live_out_; }
+    [[nodiscard]] bool can_defer_cold() const override { return plan_.cold_layout && !cold_; }
+    void defer_cold(std::function<void()> fn) override { cold_fns_.push_back(std::move(fn)); }
 
 private:
     // fp/neon (additive): forget which V registers are known zero above bit
@@ -332,7 +349,8 @@ private:
     void galias_promote(unsigned g);                 // alias g owns its host's entry, the owner becomes the alias
     void galias_drop_host(unsigned host);            // store dirty aliases of host, forget them
     [[nodiscard]] std::uint32_t galias_touched() const;   // alias guests and the owners of their hosts
-    [[nodiscard]] bool vec_read_soon(unsigned v) const;   // lookahead in the block
+    [[nodiscard]] bool vec_read_soon(unsigned v) const;
+    [[nodiscard]] bool gpr_read_soon(unsigned g) const;   // lookahead in the block
 
     // ---- guest operands ------------------------------------------------------
     // Pinned here: tier 2 lends the host of a pin a loop never uses to the
@@ -358,6 +376,7 @@ private:
     // Region entries (start, entry stubs): evicted convention registers go to
     // the context, then the other pins are loaded (convention pins are live).
     void entry_pins(std::int32_t index);   // at the entry of instruction `index`
+    void compute_pin_need();               // backward pin-read liveness across faults & CFG
     // Pinned GPRs the straight-line code from entry `index` overwrites before
     // anything can observe them (read, fault, exit, block end): not loaded there.
     [[nodiscard]] std::uint32_t pins_dead_at_entry(std::int32_t index) const;
@@ -378,6 +397,8 @@ private:
     bool save_flags_around();
     [[nodiscard]] std::int32_t ccmp_bool_reader() const;
     [[nodiscard]] Gp reusable_gpr(unsigned index) const;
+    [[nodiscard]] bool gpr_dead_after(std::int32_t at, unsigned g) const;
+    Gp handoff_dead_src(unsigned dst_g, unsigned src_g);
     void prepare_clobber();
     void materialize(bool raw = false);
     // raw: a region exit's store, the raw form (lahf/seto in the low 16 bits
@@ -419,8 +440,12 @@ private:
     // mov r, constant. A 10-byte movabs records a literal_imm64 fixup so the
     // persistent cache knows the 8 bytes are a constant, not an address.
     void mov_literal(Gp r, std::uint64_t value);
-    void emit_direct_exit(std::uint64_t target, std::uint64_t dirty, FlagsState flags, bool restore = true);
-    void emit_exit_jump(std::uint64_t target, std::uint32_t skip_field);   // emit_direct_exit's jmp B and tail
+    void emit_direct_exit(std::uint64_t target, std::uint64_t dirty, FlagsState flags, bool restore = true,
+                          bool is_call = false);
+    void emit_exit_jump(std::uint64_t target, std::uint32_t skip_field, bool is_call = false);   // emit_direct_exit's jmp/call B and tail
+    [[nodiscard]] bool use_hw_rsb() const {
+        return !codegen_on(knob_hw_rsb) && plan_.cold_layout && plan_.rsb_push == Plan::RsbPush::inline_flag_free;
+    }
     void emit_exit_with_reason(std::uint64_t pc, ExitReason reason, std::uint64_t arg, bool has_arg);
     void emit_interpret_exit(std::int32_t index);
     // Pins to the context (evicted convention registers back), then an exit
@@ -448,6 +473,10 @@ private:
     // stub laid out there costs no jump (start_block).
     bool cold_{};
     std::size_t no_fall_at_{~std::size_t{0}};
+    std::vector<std::function<void()>> cold_fns_;
+    x64::Label rbit_const_label_{};
+    x64::Label fcmp_const_label_{};
+    std::vector<std::uint32_t> rbit_sites_;
     x64::Label add_stub(Stub::K kind, FlagsState flags, std::uint64_t dirty, std::uint64_t pc, std::int32_t target,
                         std::int32_t snap = -1, bool boundary = false);
     x64::Label taken_label(std::int32_t taken, FlagsState state);
@@ -469,13 +498,47 @@ private:
     void e_adc(const Inst& d);
     void e_logic_shift(const Inst& d);
     void e_ccmp(const Inst& d);
-    void e_csel(const Inst& d);
-    void e_dp1(const Inst& d);
-    // RBIT Xd, Xn feeding only CLZ ?, Xd (count trailing zeros): index of the
-    // CLZ, which then emits TZCNT of Xn, or -1. See emit_integer.cpp.
-    [[nodiscard]] std::int32_t rbit_clz_target(const Inst& d) const;
+    unsigned e_csel(const Inst& d);
+    unsigned try_fuse_cset_bool(const Inst& d);
+    // Deferred CCMP immediate-NZCV cold stub feeding the adjacent B.cond's
+    // taken label directly (when the immediate NZCV forces B.cond taken).
+    std::int32_t ccmp_cold_inst_{-1};
+    x64::Label ccmp_cold_label_{};
+    unsigned ccmp_cold_nzcv_{0};
+    unsigned e_dp1(const PlanInst& pi);
+    // RBIT Xd, Xn feeding CLZ ?, Xd (count trailing zeros): index of the CLZ,
+    // which then emits TZCNT of Xn, or -1. `elide_rbit` is true when Xd is
+    // dead before any read/fault so RBIT itself is skipped; otherwise RBIT
+    // still runs for exact architectural state while CLZ breaks the chain.
+    [[nodiscard]] std::int32_t rbit_clz_target(const Inst& d, bool& elide_rbit) const;
     std::int32_t tz_clz_{-1};
     std::uint8_t tz_src_{};
+    // Adjacent ALU->CBZ/CBNZ zero-flag forwarding: instruction `zf_inst_` ended
+    // with an x86 ALU op setting ZF = (guest `zf_guest_` low `zf_bits_` == 0).
+    // When `logic_flags_inst_ == zf_inst_`, it specifically ended with x86
+    // AND/OR/XOR/ANDN, setting full SF/ZF/CF=0/OF=0 (exact FlagsProducer::logic
+    // for a following TST Xd, Xd).
+    std::int32_t zf_inst_{-1};
+    std::int32_t logic_flags_inst_{-1};
+    std::uint8_t zf_guest_{31};
+    std::uint8_t zf_bits_{0};
+    // Adjacent CSET/CSETM -> CBZ/CBNZ flag forwarding: instruction `cset_inst_`
+    // wrote 1/~0 to `cset_guest_` iff `cset_cond_` holds in host EFLAGS (0 otherwise)
+    // without clobbering EFLAGS, so a following CBZ/CBNZ branches directly.
+    std::int32_t cset_inst_{-1};
+    std::uint8_t cset_guest_{31};
+    Cond cset_cond_{Cond::e};
+    bool folded_access_{};
+    // Per-block literal-pool base register reuse (e_load_literal): when a free
+    // uncached scratch GPR still holds a previously materialized literal pool
+    // guest address `lit_base_pc_`, nearby LDR_lit loads reuse `[reg + disp]`
+    // instead of re-emitting a 10-byte `movabs`.
+    Gp lit_base_reg_{Gp::none};
+    std::uint64_t lit_base_pc_{0};
+    void kill_lit_base(unsigned h) {
+        if (lit_base_reg_ != Gp::none && x64::id(lit_base_reg_) == h) lit_base_reg_ = Gp::none;
+    }
+    void clear_lit_base() { lit_base_reg_ = Gp::none; }
     void e_dp2(const Inst& d);
     void e_dp3(const Inst& d);
     Val shifted(unsigned rm, unsigned type, unsigned amount, unsigned bits);
@@ -490,9 +553,10 @@ private:
     void field_insert_zero(unsigned bits, Gp d, Gp n, unsigned pos, unsigned len, bool sign);
 
     // ---- loads/stores (emit_load_store.cpp) -------------------------------------
-    void e_load_store(const Inst& d);
+    unsigned e_load_store(const Inst& d, unsigned index_mask_bits = 0, std::int32_t load_index = -1);
+    unsigned try_fuse_load_alu(const Inst& d, const Mem& m, std::int32_t load_index);
     void e_load_store_pair(const Inst& d);
-    void e_load_literal(const Inst& d);
+    unsigned e_load_literal(const PlanInst& pi);
     void access(const Inst& d, Gp value, const Mem& m, unsigned size, MemOp op, bool sf);
     static bool disp8(const Mem& m);
     Gp zero_reg();
@@ -537,7 +601,8 @@ private:
     void e_trap(const PlanInst& pi);
     // ---- switch dispatch (Plan::tables; emit_branch.cpp) ----
     void e_table_branch(const PlanInst& pi);
-    void e_shadow_branch(const PlanInst& pi);   // BR on a table shadow (PlanInst::shadow_base)
+    void e_shadow_branch(const PlanInst& pi);        // BR on a table shadow (PlanInst::shadow_base)
+    void emit_shadow_dispatch(const PlanInst& pi);   // shadow probe/jump (rcx=target, rdx=index, r9=base, state flushed)
     // Label for the multiway edge from the current (empty-cache, flags in
     // ctx) state into leader `target`: the block, a pending edge, or an edge
     // stub that loads the target's entry state (no inline edge code).
@@ -597,6 +662,7 @@ private:
         const FamilyFacts* facts;
     };
     void prepare_facts();
+    void lane_masks_compute();
     void emit_fact_checks(std::int32_t index, unsigned consumed);
     // Reaching definitions of V`vec` at insts[index] (at most kMaxDefs), false if unknown.
     static constexpr unsigned kMaxDefs = 16;
@@ -732,6 +798,8 @@ private:
         std::vector<std::int32_t> pred_head, pred_next, pred_from;   // predecessor lists (all internal edges)
         std::vector<std::uint32_t> visit;     // reaching_def visit stamps
         std::uint32_t visit_stamp{};
+        std::vector<std::uint32_t> lmask_in, lmask_at;   // 32-bit all-0/all-1 lane-mask bitmasks
+        std::vector<std::int32_t> lmask_slot;            // instruction -> leader slot, -1
         // tier 2 (region_alloc.cpp)
         std::vector<std::uint64_t> olive_in, olive_out, rlive_in;
         std::vector<std::uint8_t> depth;      // loop nesting depth
@@ -767,6 +835,9 @@ private:
         std::vector<FpConst> fpc_in;              // 32 per leader slot (fpc_slot)
         std::vector<std::int32_t> fpc_slot;       // instruction -> leader slot, -1
         std::vector<FpConstUse> fpc_uses;         // constants read by FP min/max, by index
+        // Cross-fault & CFG dead-at-entry pin elimination (compute_pin_need):
+        // non-global, non-lent pins needed in host registers at each instruction.
+        std::vector<std::uint64_t> pin_need_in;
     };
     // ---- cross-block register cache --------------------------------------------
     // Every leader has an entry state (s_.cache_slot -> s_.cache_snaps): the
@@ -797,9 +868,10 @@ private:
     void jump_edge(std::int32_t target, std::int32_t from, bool fall_through);
     bool carry_{true};
     bool carry_clean_{};   // carried entries are always clean (dirty ones stored before every branch)
-    std::int32_t bool_reader_{-1};   // e_ccmp fusion: this reader's condition() is NE
-    bool bool_in_slot_{};             // e_ccmp fusion: the answer is parked in the context (park_bool)
+    std::int32_t bool_reader_{-1};   // e_ccmp / single-reader fusion: this reader's condition() is NE
+    bool bool_in_slot_{};             // the answer is parked in the context (park_bool)
     void park_bool();
+    bool park_single_reader_bool();
     bool flags_saved_{};   // save_flags_around: host flags saved in ah/al until end_instruction
     bool branch_dirty_{};
     bool merge_dirty_{};   // opt-in: dirty entries cross forward edges into merge points (dirty_into_merge)  // dirty entries cross branches into single-predecessor blocks (dirty_crosses_branch)
@@ -812,6 +884,7 @@ private:
     // before being overwritten on some path; "read" = read by a guest
     // instruction or at an exit. Loop depth, dropped interrupt checks.
     void compute_tier2();
+    void compute_liveness();
     // True if the current value of the guest register may be observed from
     // the current point (always true without Plan::t2_dead).
     [[nodiscard]] bool observed(unsigned g, bool vec) const;
@@ -825,6 +898,7 @@ private:
     bool loop_counting_{};
     std::vector<std::uint32_t> loop_counter_fields_;
     bool dead_on_{};
+    std::uint64_t pin_unloaded_any_{};   // pins skipped by >=1 entry (kFaultMapContext while clean)
     bool in_instruction_{};
     std::int32_t after_last_{};   // last word of the instruction just emitted (olive_out between instructions)
     static Scratch& scratch();

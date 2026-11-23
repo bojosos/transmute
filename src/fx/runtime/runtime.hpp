@@ -25,17 +25,35 @@ inline constexpr unsigned kLookupIndexBits = 20;
 inline constexpr unsigned kLookupTagShift = kLookupIndexBits + 2;
 const void* runtime_arena_base() noexcept;
 
+// ---- per-thread L1 indirect lookup cache (GuestContext::fast_lookup) -------
+// Direct-mapped 2^kFastLookupBits interleaved 16-byte {guest_pc, host_entry}
+// slots (64 KiB, 16 pages). Empty/scrubbed slots hold kFastLookupEmpty (1,
+// impossible aligned A64 PC). Inline lookups reject misaligned targets first,
+// then compare all 64 bits of guest_pc and jump straight to host_entry.
+inline constexpr unsigned kFastLookupBits = 12;
+inline constexpr std::size_t kFastLookupSlots = std::size_t{1} << kFastLookupBits;
+inline constexpr std::uint32_t kFastLookupMask4 = static_cast<std::uint32_t>((kFastLookupSlots - 1) << 2);
+inline constexpr std::uint64_t kFastLookupEmpty = 1;
+inline std::size_t fast_lookup_index(std::uint64_t pc) noexcept {
+    const auto x = static_cast<std::uint32_t>(pc);
+    return ((x ^ (x >> kFastLookupBits)) >> 2) & (kFastLookupSlots - 1);
+}
+
 // ---- table shadows (GuestContext::table_shadow) ---------------------------------
-// A shadow is kTableShadowSlots guest pcs, then as many host entries, then as
-// many miss targets; the word before the pcs holds its miss stub. For a BR to
-// rcx = table[rdx] (rdx < kTableShadowSlots) on this thread's table:
-//   if (pc[rdx] == rcx) jmp host[rdx]; else jmp miss[rdx]
-// with the cross-region convention registers live and rcx, rdx kept. An empty
-// slot's miss target is the miss stub (fills the slot, ExitReason::table_shadow),
-// a filled slot's is a stub that takes the inline lookup's path for rcx. A slot's
-// pc never changes once set (its host entry may: stores host first, then pc),
-// so a reader that sees the pc sees a host entry that was valid for it.
-inline constexpr unsigned kTableShadowSlots = 1024;
+// A shadow is kTableShadowSlots interleaved 16-byte {pc, host} entries
+// (16-byte aligned, single cache line per slot); the word immediately before
+// entries[0] (`entries[-1]`) holds its miss stub. For a BR/BLR to rcx =
+// table[rdx] on this thread's table (slot = rdx & (kTableShadowSlots - 1)):
+//   if (entry[slot].pc == rcx) jmp entry[slot].host;
+//   else if (entry[slot].pc == 1) <site's own inline lookup>;
+//   else jmp entries[-1] (table_shadow_miss);
+// with cross-region convention registers live and rcx, slot kept. pc == 0 is an
+// empty slot; pc == 1 marks a disabled or permanently colliding slot (never a
+// valid aligned A64 PC), sending misses directly to the site's own inline lookup
+// with its own BTB entry and no stub spill/reload. Stores write host first, then
+// pc, so a reader that sees pc sees a valid host entry (or the miss stub after
+// a scrub).
+inline constexpr unsigned kTableShadowSlots = 8192;
 inline constexpr std::uint32_t kTableShadowRetry = 4096;   // BRs on other tables before a switch
 
 // ---- FP control mapping -------------------------------------------------------

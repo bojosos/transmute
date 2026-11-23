@@ -54,6 +54,8 @@ inline bool isel_on(std::uint32_t knob) { return (isel_knob_bits() & knob) == 0;
 //   norawflags    - region exits store NZCV in the ARM layout, not the raw
 //                   lahf/seto form the next reader converts
 //                   (materialize_state, normalize_entry_flags)
+//   nomergedirty  - dirty cached registers are stored before forward edges
+//                   into merge points outside loops (dirty_into_merge)
 // and opt-in ones (on when named):
 //   abiflags      - the AAPCS64 flags model (TranslateOptions::abi_flags,
 //                   off by default since exact NZCV): NZCV dead at BL/BLR/RET.
@@ -62,9 +64,8 @@ inline bool isel_on(std::uint32_t knob) { return (isel_knob_bits() & knob) == 0;
 //   brdeadflags   - NZCV is dead at a BR that does not look intra-function
 //                   (no recognised table, no ADR/ADRP in its block), as at
 //                   BL/BLR/RET (abi_flags; region_plan.cpp flags liveness)
-//   mergedirty    - dirty cached registers also cross forward jumps and
-//                   fall-throughs into merge points outside loops
-//                   (dirty_into_merge)
+//   hwrsb         - hardware x64 call/ret shadow stack for BL/BLR/RET (opt-in:
+//                   SW 256-entry RSB outperforms on deep/mismatched call stacks)
 // All are folded into the translator fingerprint (region_plan.cpp).
 enum CodegenKnob : std::uint32_t {
     knob_no_branch_dirty = 1u,
@@ -73,11 +74,12 @@ enum CodegenKnob : std::uint32_t {
     knob_no_flag_save = 8u,
     knob_no_ccmp_fusion = 16u,
     knob_no_gpr_reuse = 32u,
-    knob_merge_dirty = 64u,
+    knob_no_merge_dirty = 64u,
     knob_no_alias_target = 128u,
     knob_no_raw_flags = 256u,
     knob_abi_flags = 512u,
     knob_no_dead_targets = 1024u,
+    knob_hw_rsb = 2048u,
 };
 std::uint32_t codegen_p2_knob_bits();
 // Tests: use `bits` instead of the environment (~0u: the environment again).
@@ -109,5 +111,14 @@ bool dead_after(const Plan& plan, std::int32_t index, unsigned g);
 // reports the ADD's pc with the state before it (Xd unchanged), which is
 // exactly the state of re-executing both instructions.
 bool fold_address(const Plan& plan, std::int32_t index, Inst& access);
+// UBFIZ Xd, Xn, #s, #len (len in 1..32) or LSL Xd, Xn, #s (s in 1..3),
+// optionally followed by ADD/SUB Xd, Xd, #imm, feeding LDR/STR [xBase, Xd]:
+// folds all 2 or 3 instructions into one AddrMode::reg access
+// [xBase + ext/masked(Xn) << s + imm]. Returns guest instructions consumed
+// (0, 2, or 3); `index_mask_bits` is 0 for UXTW/LSL or 1..31 for a narrow
+// UBFIZ mask (len != 8 && len != 16 requires `allow_flag_clobber`). Faults
+// report the bitfield pc with Xd and Xn intact.
+unsigned fold_indexed_address(const Plan& plan, std::int32_t index, Inst& access, unsigned& index_mask_bits,
+                              bool allow_flag_clobber);
 
 } // namespace transmute::fx::core

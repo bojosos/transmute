@@ -448,3 +448,40 @@ FX_TEST(jit_write_window_close_sees_other_threads_stores) {
     FX_CHECK_EQ(run(a), 4u);
     set_mini_translator(false);
 }
+
+// Explicit-flush code memory (Darwin MAP_JIT): translated pages are never
+// write-protected, stores cause 0 SMC write faults and leave stale code until
+// flush_guest_code invalidates the rewritten range; empty flushes avoid
+// invalidating unrelated live regions.
+FX_TEST(explicit_flush_code_memory_skips_smc_protection_and_flushes_on_demand) {
+    init();
+    set_mini_translator(true);
+    GuestCode code({});
+    const auto a = code.at(0), b = code.at(16);
+    register_explicit_flush_code_memory(a, 0x1000);
+    code.words()[0] = movz(0, 11);
+    code.words()[1] = kRet;
+    code.words()[16] = movz(0, 22);
+    code.words()[17] = kRet;
+    FX_CHECK_EQ(run(a), 11u);
+    FX_CHECK_EQ(run(b), 22u);
+    FX_CHECK_EQ(guest_page_protection(a), 0u);
+    const auto s0 = runtime_stats();
+    code.words()[0] = movz(0, 33);
+    code.words()[200] = movz(0, 44);
+    code.words()[201] = kRet;
+    const auto s1 = runtime_stats();
+    FX_CHECK_EQ(s1.smc_write_faults - s0.smc_write_faults, 0u);
+    FX_CHECK_EQ(run(a), 11u);   // stale until explicit flush
+    // Flushing an unrelated unwritten subrange keeps both a and b live.
+    flush_guest_code(code.at(200), 8);
+    FX_CHECK_EQ(rt::live_regions_on_page(a), 2u);
+    FX_CHECK_EQ(run(a), 11u);
+    // Flushing a invalidates only a; b remains translated.
+    flush_guest_code(a, 8);
+    FX_CHECK_EQ(rt::live_regions_on_page(a), 1u);
+    FX_CHECK_EQ(run(a), 33u);
+    FX_CHECK_EQ(run(b), 22u);
+    unregister_explicit_flush_code_memory(a, 0x1000);
+    set_mini_translator(false);
+}

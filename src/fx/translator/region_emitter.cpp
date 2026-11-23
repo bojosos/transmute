@@ -158,11 +158,16 @@ std::uint64_t RegionEmitter::evict_cost(unsigned g, bool dirty, bool vec, std::u
 // belady_), stored first if dirty.
 Gp RegionEmitter::alloc() {
     Gp victim = Gp::none;
+    Gp lit_fallback = Gp::none;
     std::uint64_t oldest = UINT64_MAX;
     const auto consider = [&](Gp r) {
         if (!is_free(r)) return false;
         const auto h = x64::id(r);
         if (!((gc_.mask >> h) & 1u)) {
+            if (r == lit_base_reg_) {
+                lit_fallback = r;
+                return false;
+            }
             free_gpr_ &= ~(1u << h);
             victim = r;
             return true;
@@ -182,8 +187,17 @@ Gp RegionEmitter::alloc() {
         if (consider(r)) return r;
     for (auto m = lent_hosts_; m; m &= m - 1)   // tier 2: hosts of pins lent inside this loop
         if (consider(x64::gp(static_cast<unsigned>(std::countr_zero(m))))) return victim;
+    // Prefer evicting a clean dead cached GPR (cost 0: no store, no reload) over
+    // clobbering lit_base_reg_, so consecutive literal-pool loads reuse [reg+disp].
+    if (lit_fallback != Gp::none && !(victim != Gp::none && (oldest >> 48) == 0)) {
+        const auto h = x64::id(lit_fallback);
+        kill_lit_base(h);
+        free_gpr_ &= ~(1u << h);
+        return lit_fallback;
+    }
     if (victim == Gp::none) throw RetryTranslation{pc_, false, RetryTranslation::Resource::gpr};
     evict_gpr(x64::id(victim));
+    kill_lit_base(x64::id(victim));
     free_gpr_ &= ~(1u << x64::id(victim));
     return victim;
 }
@@ -193,6 +207,7 @@ void RegionEmitter::take(Gp r) {
                                                            // (SMULH/UMULH): the flags go to ctx->nzcv after all
     if (!is_free(r)) throw std::logic_error("RegionEmitter::take: register in use");
     evict_gpr(x64::id(r));
+    kill_lit_base(x64::id(r));
     free_gpr_ &= ~(1u << x64::id(r));
 }
 
@@ -201,6 +216,7 @@ void RegionEmitter::take_value(Gp r, const Val& v) {
     if (v.is_mem() && gc_.host[v.g] == static_cast<std::int8_t>(h) && is_free(r) && galias_of_[h] == 0) {
         if ((gc_.dirty >> h) & 1u) a_.mov(64, gmem(v.g), r);   // the context gets the value too
         cache_drop_host(gc_, h);
+        kill_lit_base(h);
         free_gpr_ &= ~(1u << h);
         return;
     }
@@ -256,6 +272,7 @@ void RegionEmitter::cache_clear() {
     galias_dirty_ = 0;
     reset_cache(gc_);
     reset_cache(vc_);
+    clear_lit_base();
     alias_forget_knowledge();
 }
 
@@ -281,6 +298,7 @@ void RegionEmitter::cache_drop_guest(RegCache& c, unsigned g) {
 
 void RegionEmitter::cache_set(RegCache& c, unsigned g, unsigned h) {
     if (!cache_on_) return;
+    if (&c == &gc_) kill_lit_base(h);
     cache_drop_guest(c, g);   // a dirty older value of g is dead: overwritten
     cache_drop_host(c, h);
     c.host[g] = static_cast<std::int8_t>(h);
@@ -382,17 +400,29 @@ bool RegionEmitter::dirty_crosses_branch(std::int32_t index) const {
         if (!s.leader) return t == index + 1;   // the fall-through continues the block with the cache as it is
         return (t > index && s.inherit_flags && s.first_pred == index) || dirty_into_merge(t);
     };
-    return single(pi.taken) && single(pi.fall);
+    if (single(pi.taken) && single(pi.fall)) return true;
+    // Cold-branch deferred dirty flush: when the fall-through continues the
+    // current block (or enters a pending non-loop merge via dirty_into_merge)
+    // and the taken target is a forward block (e.g. a shared slow path or deopt
+    // merge), keep dirty registers live on the hot fall-through and flush them
+    // in the cold taken edge stub.
+    if (plan_.cold_layout && pi.fall == index + 1 &&
+        (!plan_.insts[static_cast<std::size_t>(pi.fall)].leader || dirty_into_merge(pi.fall)) &&
+        lent_at(pi.fall) == lent_ && pi.taken > index && lent_at(pi.taken) == lent_) {
+        const auto& s = plan_.insts[static_cast<std::size_t>(pi.taken)];
+        if (s.leader && (is_pending_target(pi.taken) || s_.cache_slot[static_cast<std::size_t>(pi.taken)] >= 0))
+            return true;
+    }
+    return false;
 }
 
-// Opt-in TRANSMUTE_FX_CORE=mergedirty: a forward edge into a merge point
-// outside loops whose entry state is not decided yet carries its dirty
-// entries too. The merge keeps those every predecessor holds in the same
-// host (dirty if dirty in any); the edges store the rest (edge stubs for
-// jumps, inline on the fall-through), instead of every predecessor storing
-// everything first.
+// Forward edge into a merge point outside loops whose entry state is not
+// decided yet (including tier-2 pass 2 for non-preset blocks): carries dirty
+// entries into the merge instead of flushing them on the hot fall-through.
+// The merge keeps those every predecessor holds in the same host (dirty if
+// dirty in any); other edges reconcile in cold stubs or inline.
 bool RegionEmitter::dirty_into_merge(std::int32_t t) const {
-    if (!merge_dirty_ || !carry_ || !write_back_ || !fault_maps_ || alloc_pass_ == 2 || t <= index_) return false;
+    if (!merge_dirty_ || !carry_ || !write_back_ || !fault_maps_ || t <= index_) return false;
     const auto& s = plan_.insts[static_cast<std::size_t>(t)];
     return s.leader && !s.inherit_flags && !s.entry && !s.loop_header && s_.loop_of[static_cast<std::size_t>(t)] < 0 &&
            s_.loop_of[static_cast<std::size_t>(index_)] < 0 && lent_at(t) == lent_ && is_pending_target(t);
@@ -464,6 +494,23 @@ x64::Xmm RegionEmitter::borrow_vec(unsigned v) {
     vc_.used[h] = ++cache_clock_;
     free_xmm_ &= ~(1u << static_cast<unsigned>(h));
     return x64::xmm(static_cast<unsigned>(h));
+}
+
+// True if guest GPR `g` is read again soon along the current straight-line
+// path before being written (worth caching once in gc_ instead of reloading
+// from GuestContext on every ALU op, e.g. V8's x28 cage base / x26 root).
+bool RegionEmitter::gpr_read_soon(unsigned g) const {
+    if (!cur_ || g >= 31 || ((cur_->writes >> g) & 1u)) return false;
+    const auto n = static_cast<std::int32_t>(plan_.uses.size());
+    const auto bit = 1u << g;
+    for (std::int32_t j = index_ + 1; j < n && j <= index_ + 16; ++j) {
+        const auto& u = plan_.uses[static_cast<std::size_t>(j)];
+        if (u.bits & (kUseLeader | kUseOpaque)) return false;
+        if (u.reads & bit) return true;
+        if (u.writes & bit) return false;
+        if (!(u.bits & kUseStraight)) return false;
+    }
+    return false;
 }
 
 // True if guest vector `v` is read again soon in this block before being
@@ -559,21 +606,56 @@ Gp RegionEmitter::dst(unsigned index, bool sp) {
     return t;
 }
 
-// A core instruction that overwrites guest `index` without reading it, and
-// cannot fault or branch, writes the result into the host register that
-// caches the old value (r8-r11 only: rax, rcx and rdx have implicit users
-// that take() them later). The guest then stays in one host across
-// instructions, so the predecessors of a merge point agree more often (no
-// reload there). TRANSMUTE_FX_CORE=nogprreuse: a fresh register each time.
+// A core instruction that overwrites guest `index` and cannot fault or branch
+// writes the result into the host register that caches the old value. Pure
+// non-faulting ALU ops (ADD/SUB/AND/ORR/EOR) also reuse the destination host
+// in place when reading it (e.g. `ORR x6, x28, x6` -> `or r9, r11`) and may
+// reuse rcx/rdx since they never take() fixed scratch registers. The guest
+// then stays in one host across instructions, reducing moves and merge reloads.
+// TRANSMUTE_FX_CORE=nogprreuse: a fresh register each time.
 Gp RegionEmitter::reusable_gpr(unsigned index) const {
-    if (!codegen_on(knob_no_gpr_reuse) || family_mode_ || !cur_ || !may_cache()) return Gp::none;
-    if (((cur_->reads >> index) & 1u) || cur_->may_fault || cur_->conservative_writes || cur_->flow != Flow::normal ||
-        cur_->inst.kind == Kind::unknown)
+    if (!codegen_on(knob_no_gpr_reuse) || family_mode_ || !cur_ || !may_cache() || folded_access_) return Gp::none;
+    if (cur_->may_fault || cur_->conservative_writes || cur_->flow != Flow::normal || cur_->inst.kind == Kind::unknown)
         return Gp::none;
+    const auto k = cur_->inst.kind;
+    const bool rmw_alu = k == Kind::add_sub_imm || k == Kind::add_sub_shift || k == Kind::add_sub_ext ||
+                         k == Kind::logic_imm || k == Kind::logic_shift;
+    if (((cur_->reads >> index) & 1u) && !rmw_alu) return Gp::none;
     const auto h = gc_.host[index];
-    if (h < 8 || h > 11) return Gp::none;
+    const bool ok_host = (h >= 8 && h <= 11) || (rmw_alu && (h == 1 || h == 2 || (h == 0 && !keep_flags())));
+    if (!ok_host) return Gp::none;
     const auto r = x64::gp(static_cast<unsigned>(h));
     if (!is_free(r) || galias_of_[static_cast<unsigned>(h)] != 0) return Gp::none;
+    return r;
+}
+
+bool RegionEmitter::gpr_dead_after(std::int32_t at, unsigned g) const {
+    if (g >= 31) return false;
+    if (dead_after(plan_, at, g)) return true;
+    return dead_on_ && at >= 0 && static_cast<std::size_t>(at) < s_.olive_out.size() &&
+           ((s_.olive_out[static_cast<std::size_t>(at)] >> g) & 1u) == 0;
+}
+
+// For a non-faulting, unshifted ALU `dst_g = op(src_g, other)` whose unpinned
+// destination is not already one of its sources: if unpinned cached `src_g` is
+// dead after this instruction and occupies a free scratch host `h` with no
+// copy aliases, hand `h` directly to `dst_g` so x64 runs in-place without a
+// `mov` (e.g. V8 `LDR w7, [obj]; ORR x6, x28, x7` -> `or rax, r11`).
+Gp RegionEmitter::handoff_dead_src(unsigned dst_g, unsigned src_g) {
+    if (!codegen_on(knob_no_gpr_reuse) || family_mode_ || !cur_ || !may_cache() || !write_back_) return Gp::none;
+    if (dst_g >= 31 || src_g >= 31 || dst_g == src_g || pinned(dst_g) || pinned(src_g)) return Gp::none;
+    if (pending_gpr_count_ >= std::size(pending_gpr_)) return Gp::none;
+    const auto h = gc_.host[src_g];
+    if (h < 0) return Gp::none;
+    const auto uh = static_cast<unsigned>(h);
+    const auto r = x64::gp(uh);
+    if (!is_free(r) || galias_of_[uh] != 0) return Gp::none;
+    if (!gpr_dead_after(index_, src_g)) return Gp::none;
+    gc_.dirty &= ~(1u << uh);
+    cache_drop_host(gc_, uh);
+    free_gpr_ &= ~(1u << uh);
+    note_write(dst_g);
+    pending_gpr_[pending_gpr_count_++] = {static_cast<std::uint8_t>(dst_g), r};
     return r;
 }
 
@@ -584,7 +666,21 @@ Gp RegionEmitter::dst_rmw(unsigned index, bool sp) {
     return d;
 }
 
-void RegionEmitter::binop(Alu op, unsigned bits, Gp d, const Val& n, const Val& m, bool commutative) {
+void RegionEmitter::binop(Alu op, unsigned bits, Gp d, const Val& n0, const Val& m0, bool commutative) {
+    const auto cache_if_hot = [&](const Val& v) {
+        if (v.is_mem() && may_cache() && cached_gpr(v.g) == Gp::none &&
+            (free_gpr_ & ~gc_.mask & ~1u) != 0 && std::popcount(free_gpr_) >= 3 && gpr_read_soon(v.g))
+            (void)read_unpinned(v.g);
+    };
+    cache_if_hot(n0);
+    cache_if_hot(m0);
+    const auto res = [&](const Val& v) {
+        if (!v.is_mem()) return v;
+        const auto h = borrow_gpr(v.g);
+        return h != Gp::none ? Val{Val::K::reg, h, v.g} : v;
+    };
+    const auto n = res(n0);
+    const auto m = res(m0);
     if (n.is_reg() && n.r == d) {
         alu(op, bits, d, m);
         return;
@@ -631,15 +727,85 @@ std::uint32_t RegionEmitter::pins_dead_at_entry(std::int32_t index) const {
         if (pj.family >= 0 || pj.try_family || pj.inst.kind == Kind::unknown || pj.conservative_writes ||
             pj.may_fault || pj.flow != Flow::normal || pj.inline_call || pj.inline_ret)
             break;
-        // An ADD/SUB the next access may fold reports a fault there with its own state before it.
+        // An ADD/SUB (or UBFIZ/LSL+ADD) the next access may fold reports a fault there with its own state before it.
         if ((pj.inst.kind == Kind::add_sub_imm || pj.inst.kind == Kind::add_sub_shift || pj.inst.kind == Kind::add_sub_ext) &&
             j + 1 < n && plan_.insts[static_cast<std::size_t>(j) + 1].may_fault)
             break;
+        if (pj.inst.kind == Kind::bitfield && j + 1 < n && !plan_.insts[static_cast<std::size_t>(j) + 1].leader &&
+            (plan_.insts[static_cast<std::size_t>(j) + 1].may_fault ||
+             (j + 2 < n && plan_.insts[static_cast<std::size_t>(j) + 1].inst.kind == Kind::add_sub_imm &&
+              plan_.insts[static_cast<std::size_t>(j) + 2].may_fault &&
+              !plan_.insts[static_cast<std::size_t>(j) + 2].leader)))
+            break;
+        if (pj.inst.kind == Kind::move_wide && pj.inst.op != 3) {
+            std::int32_t k = j + 1;
+            while (k < n && k <= j + 3 && !plan_.insts[static_cast<std::size_t>(k)].leader &&
+                   plan_.insts[static_cast<std::size_t>(k)].inst.kind == Kind::move_wide &&
+                   plan_.insts[static_cast<std::size_t>(k)].inst.op == 3 &&
+                   plan_.insts[static_cast<std::size_t>(k)].inst.rd == pj.inst.rd)
+                ++k;
+            if (k < n && !plan_.insts[static_cast<std::size_t>(k)].leader &&
+                plan_.insts[static_cast<std::size_t>(k)].may_fault)
+                break;
+        }
         want &= ~pj.reads;
         dead |= pj.writes & want;
         want &= ~pj.writes;
     }
     return dead;
+}
+
+void RegionEmitter::compute_pin_need() {
+    s_.pin_need_in.clear();
+    pin_unloaded_any_ = 0;
+    if (!codegen_on(knob_no_dead_pin_loads) || !fault_maps_ || !fault_flush_) return;
+    const std::uint64_t non_global =
+        static_cast<std::uint64_t>(plan_.pinned & ~plan_.globals) | (static_cast<std::uint64_t>(plan_.vpinned) << 32);
+    if (non_global == 0) return;
+    std::uint64_t ever_lent = 0;
+    for (const auto l : s_.lent) ever_lent |= l;
+    const std::uint64_t cand = non_global & ~ever_lent;
+    if (cand == 0) return;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    s_.pin_need_in.assign(static_cast<std::size_t>(n), 0);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::int32_t i = n - 1; i >= 0; --i) {
+            const auto& pi = plan_.insts[static_cast<std::size_t>(i)];
+            const bool opaque = (pi.family < 0 && (pi.try_family || pi.inst.kind == Kind::unknown)) ||
+                                pi.conservative_writes || pi.flow == Flow::interpret || pi.flow == Flow::svc;
+            std::uint64_t in = 0;
+            if (opaque) {
+                in = cand;
+            } else {
+                std::uint64_t out = 0;
+                plan_.for_each_successor(i, [&](std::int32_t s) {
+                    if (s >= 0) out |= s_.pin_need_in[static_cast<std::size_t>(s)];
+                });
+                std::uint64_t reads =
+                    static_cast<std::uint64_t>(pi.reads) | (static_cast<std::uint64_t>(pi.vreads) << 32);
+                if (pi.shadow_base >= 0) reads |= 1ull << static_cast<unsigned>(pi.shadow_base);
+                if (pi.shadow_index >= 0) reads |= 1ull << static_cast<unsigned>(pi.shadow_index);
+                if (pi.table >= 0 && !plan_.tables[static_cast<std::size_t>(pi.table)].by_target)
+                    reads |= 1ull << plan_.tables[static_cast<std::size_t>(pi.table)].index_reg;
+                const std::uint64_t writes =
+                    static_cast<std::uint64_t>(pi.writes) | (static_cast<std::uint64_t>(pi.vwrites) << 32);
+                const std::uint64_t dirty =
+                    static_cast<std::uint64_t>(pi.dirty_in) | (static_cast<std::uint64_t>(pi.vdirty_in) << 32);
+                in = cand & (((out & ~writes) | reads) | dirty);
+            }
+            if (in != s_.pin_need_in[static_cast<std::size_t>(i)]) {
+                s_.pin_need_in[static_cast<std::size_t>(i)] = in;
+                changed = true;
+            }
+        }
+    }
+    std::uint64_t unloaded_any = 0;
+    for (const auto& e : plan_.entries) {
+        if (e.index >= 0 && static_cast<std::size_t>(e.index) < s_.pin_need_in.size())
+            unloaded_any |= cand & ~s_.pin_need_in[static_cast<std::size_t>(e.index)];
+    }
+    pin_unloaded_any_ = unloaded_any;
 }
 
 void RegionEmitter::entry_pins(std::int32_t index) {
@@ -649,10 +815,18 @@ void RegionEmitter::entry_pins(std::int32_t index) {
         const auto g = static_cast<unsigned>(std::countr_zero(m));
         a_.mov(64, gmem(g), x64::gp(static_cast<unsigned>(conv.host[g])));
     }
-    const auto dead = pins_dead_at_entry(index);
+    std::uint32_t dead = 0;
+    std::uint32_t vdead = 0;
+    if (!s_.pin_need_in.empty() && index >= 0 && static_cast<std::size_t>(index) < s_.pin_need_in.size()) {
+        const std::uint64_t skip = pin_unloaded_any_ & ~s_.pin_need_in[static_cast<std::size_t>(index)];
+        dead = static_cast<std::uint32_t>(skip);
+        vdead = static_cast<std::uint32_t>(skip >> 32);
+    } else {
+        dead = pins_dead_at_entry(index);
+        vdead = vpins_dead_at_entry(index);
+    }
     for (unsigned g = 0; g < 32; ++g)
         if (pinned(g) && !global(g) && !((dead >> g) & 1u)) a_.mov(64, pin(g), gmem(g));
-    const auto vdead = vpins_dead_at_entry(index);
     for (unsigned v = 0; v < 32; ++v)
         if (vpinned(v) && !((vdead >> v) & 1u)) vmove(vpin(v), ptr(Gp::r15, v_disp(v)));
 }
@@ -675,10 +849,27 @@ std::uint32_t RegionEmitter::vpins_dead_at_entry(std::int32_t index) const {
         if ((pj.family < 0 && (pj.try_family || pj.inst.kind == Kind::unknown)) || pj.conservative_writes ||
             pj.may_fault || pj.flow != Flow::normal || pj.inline_call || pj.inline_ret)
             break;
-        // An ADD/SUB the next access may fold reports a fault there with its own state before it.
+        // An ADD/SUB (or UBFIZ/LSL+ADD) the next access may fold reports a fault there with its own state before it.
         if ((pj.inst.kind == Kind::add_sub_imm || pj.inst.kind == Kind::add_sub_shift || pj.inst.kind == Kind::add_sub_ext) &&
             j + 1 < n && plan_.insts[static_cast<std::size_t>(j) + 1].may_fault)
             break;
+        if (pj.inst.kind == Kind::bitfield && j + 1 < n && !plan_.insts[static_cast<std::size_t>(j) + 1].leader &&
+            (plan_.insts[static_cast<std::size_t>(j) + 1].may_fault ||
+             (j + 2 < n && plan_.insts[static_cast<std::size_t>(j) + 1].inst.kind == Kind::add_sub_imm &&
+              plan_.insts[static_cast<std::size_t>(j) + 2].may_fault &&
+              !plan_.insts[static_cast<std::size_t>(j) + 2].leader)))
+            break;
+        if (pj.inst.kind == Kind::move_wide && pj.inst.op != 3) {
+            std::int32_t k = j + 1;
+            while (k < n && k <= j + 3 && !plan_.insts[static_cast<std::size_t>(k)].leader &&
+                   plan_.insts[static_cast<std::size_t>(k)].inst.kind == Kind::move_wide &&
+                   plan_.insts[static_cast<std::size_t>(k)].inst.op == 3 &&
+                   plan_.insts[static_cast<std::size_t>(k)].inst.rd == pj.inst.rd)
+                ++k;
+            if (k < n && !plan_.insts[static_cast<std::size_t>(k)].leader &&
+                plan_.insts[static_cast<std::size_t>(k)].may_fault)
+                break;
+        }
         want &= ~pj.vreads;
         dead |= pj.vwrites & want;
         want &= ~pj.vwrites;
@@ -730,10 +921,47 @@ void RegionEmitter::prepare_clobber() {
         return;
     }
     if (save_flags_around()) return;
+    if (park_single_reader_bool()) return;
     // Flags kept only for an exit (nothing in the region reads them before
     // the next write; under exact flags, mostly the next call or return):
     // the raw form, as at the exit itself.
     materialize(!cur_reads_flags_ && !flags_read_after());
+}
+
+// When host flags are about to be clobbered before a single B.cond/CSEL reader
+// later in the same block after which NZCV is dead (with no intervening faults,
+// branches, or flag reads/writes), park that reader's 1-bit boolean directly
+// via setcc + byte store (2 insns) instead of the 6-insn packed NZCV multiply.
+bool RegionEmitter::park_single_reader_bool() {
+    if (!codegen_on(knob_no_flag_save) || !in_instruction_ || family_mode_ || !cur_ || is_fcmp(flags_)) return false;
+    if (cur_reads_flags_ || cur_writes_flags_ || cur_->may_fault || cur_->flow != Flow::normal || cur_->conservative_writes)
+        return false;
+    if ((free_gpr_ & kScratchMask) == 0) return false;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    std::int32_t reader = -1;
+    for (std::int32_t j = index_ + 1; j < n && j <= index_ + 32; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (pj.leader || pj.pc != plan_.insts[static_cast<std::size_t>(j) - 1].pc + 4 || pj.family >= 0 ||
+            pj.try_family || pj.inst.kind == Kind::unknown || pj.conservative_writes || pj.inline_call || pj.inline_ret)
+            return false;
+        if (pj.reads_flags) {
+            if (pj.flags_live_out || pj.writes_flags || pj.may_fault) return false;
+            if ((pj.inst.kind != Kind::branch_cond && pj.inst.kind != Kind::csel) || pj.inst.cond >= 14) return false;
+            reader = j;
+            break;
+        }
+        if (pj.writes_flags || pj.may_fault || pj.flow != Flow::normal) return false;
+    }
+    if (reader < 0) return false;
+    const auto c = host_condition(plan_.insts[static_cast<std::size_t>(reader)].inst.cond);
+    const auto t = alloc();
+    a_.setcc(c, t);
+    a_.mov(8, ptr(Gp::r15, spill_disp(kBoolSlot)), t);
+    free_gpr_ |= 1u << x64::id(t);
+    bool_reader_ = reader;
+    bool_in_slot_ = true;
+    flags_ = FlagsState::ctx;
+    return true;
 }
 
 bool RegionEmitter::flags_read_after() const {
@@ -820,6 +1048,7 @@ void RegionEmitter::materialize(bool raw) {
 // (nzcv_normalize). Most targets write the flags before they read any.
 void RegionEmitter::materialize_state(FlagsState state, bool save_rax, bool raw) {
     if (!is_host(state)) return;
+    if (!save_rax) kill_lit_base(0);
     if (is_fcmp(state)) {
         materialize_fcmp(state == FlagsState::host_fcmp_swapped, save_rax);
         return;
@@ -860,17 +1089,15 @@ void RegionEmitter::normalize_entry_flags(std::int32_t index) {
 
 // Fused FCMP EFLAGS -> NZCV (GT 0010, LT 1000, EQ 0110, UN 0011) using only
 // rax: (u)comis(a, b) sets CF for a < b or UN, ZF for a == b or UN, PF for
-// UN; the cmov sources are staged in a spill slot (mov m32, imm keeps EFLAGS).
+// UN; the cmov sources are read from a per-region RIP-relative constant table
+// (no store-forwarding stalls).
 void RegionEmitter::materialize_fcmp(bool swapped, bool save_rax) {
-    const auto k = ptr(Gp::r15, spill_disp(kFcmpConstSlot));
+    if (!fcmp_const_label_.valid()) fcmp_const_label_ = a_.new_label();
     if (save_rax) a_.mov(64, ptr(Gp::r15, spill_disp(kRaxSaveSlot)), Gp::rax);
     a_.mov_imm(Gp::rax, swapped ? 0x80000000u : 0x20000000u);   // a > b
-    a_.mov(32, k, static_cast<std::int32_t>(swapped ? 0x20000000u : 0x80000000u));
-    a_.cmov(Cond::b, 32, Gp::rax, k);                            // a < b (or UN)
-    a_.mov(32, k, 0x60000000);
-    a_.cmov(Cond::e, 32, Gp::rax, k);                            // a == b (or UN)
-    a_.mov(32, k, 0x30000000);
-    a_.cmov(Cond::p, 32, Gp::rax, k);                            // UN
+    a_.cmov(Cond::b, 32, Gp::rax, x64::rip(fcmp_const_label_, swapped ? 0 : 4));   // a < b (or UN)
+    a_.cmov(Cond::e, 32, Gp::rax, x64::rip(fcmp_const_label_, 8));                 // a == b (or UN)
+    a_.cmov(Cond::p, 32, Gp::rax, x64::rip(fcmp_const_label_, 12));                // UN
     a_.mov(64, ptr(Gp::r15, kNzcvDisp), Gp::rax);
     if (save_rax) a_.mov(64, Gp::rax, ptr(Gp::r15, spill_disp(kRaxSaveSlot)));
 }
@@ -913,6 +1140,8 @@ FlagsLocation RegionEmitter::fault_flags() const {
     case FlagsState::host_sub: return FlagsLocation::host_sub;
     case FlagsState::host_add: return FlagsLocation::host_add;
     case FlagsState::host_logic: return FlagsLocation::host_logic;
+    case FlagsState::host_fcmp: return FlagsLocation::host_fcmp;
+    case FlagsState::host_fcmp_swapped: return FlagsLocation::host_fcmp_swapped;
     default: return FlagsLocation::context;
     }
 }
@@ -988,8 +1217,6 @@ void RegionEmitter::mark_may_fault() {
     if (slot_alias_count_ != 0)   // tier 2: materialized before instructions that may fault
         throw RetryTranslation{pc_, false, RetryTranslation::Resource::aliases};
     fault_close();
-    // FlagsLocation has no FCMP form: a fault must find NZCV in the context.
-    if (is_fcmp(flags_)) prepare_clobber();
     // Write-back: the fault handler rebuilds guest state from the pins, the
     // site's fault map (dirty cached registers: host register -> guest) and
     // the context. Without fault maps every dirty register is stored first.
@@ -1007,11 +1234,16 @@ std::uint16_t RegionEmitter::dirty_map() {
     if (slot_alias_count_ != 0)   // tier 2: fault maps cannot name another slot
         throw RetryTranslation{pc_, false, RetryTranslation::Resource::aliases};
     // Tier 2: lent pins are in the context, not in their host (overrides the region pin map).
+    // Dead-at-entry unloaded pins that have not been written yet (not in dirty_in) are also
+    // exact in the context, so the fault handler must keep their context slot untouched.
     const auto lent = lent_ & (static_cast<std::uint64_t>(plan_.pinned) | (static_cast<std::uint64_t>(plan_.vpinned) << 32));
-    if (!(gc_.dirty | vc_.dirty | valias_dirty_ | galias_dirty_) && lent == 0) return 0;
+    const std::uint64_t cur_dirty_in =
+        cur_ ? (static_cast<std::uint64_t>(cur_->dirty_in) | (static_cast<std::uint64_t>(cur_->vdirty_in) << 32)) : 0ull;
+    const std::uint64_t ctx_override = lent | (pin_unloaded_any_ & ~cur_dirty_in);
+    if (!(gc_.dirty | vc_.dirty | valias_dirty_ | galias_dirty_) && ctx_override == 0) return 0;
     PinnedRegister regs[128];
     unsigned n = 0;
-    for (auto m = lent; m; m &= m - 1) {
+    for (auto m = ctx_override; m; m &= m - 1) {
         const auto b = static_cast<unsigned>(std::countr_zero(m));
         regs[n++] = {static_cast<std::uint8_t>(b & 31u), kFaultMapContext, b >= 32};
     }
@@ -1090,14 +1322,15 @@ void RegionEmitter::mov_literal(Gp r, std::uint64_t value) {
 // `jmp A` reaches the flag store and the exit's `jmp B` (in the cold section
 // with Plan::cold_layout, else right after A). Linked to an entry that writes
 // NZCV first, A jumps there and skips the store (RegionExit).
-void RegionEmitter::emit_direct_exit(std::uint64_t target, std::uint64_t dirty, FlagsState flags, bool restore) {
+void RegionEmitter::emit_direct_exit(std::uint64_t target, std::uint64_t dirty, FlagsState flags, bool restore,
+                                     bool is_call) {
     const bool skip = plan_.flag_skip && is_host(flags);
     if (!skip) emit_exit_flags(flags);
     exit_pins(dirty, restore);
     a_.align_rel32_after(1);
     if (skip && plan_.cold_layout && !cold_) {
         Stub s{Stub::K::flags_exit, a_.new_label(), flags, 0, target, -1};
-        s.skip_field = static_cast<std::uint32_t>(a_.jmp(s.label));
+        s.skip_field = static_cast<std::uint32_t>(is_call ? a_.call(s.label) : a_.jmp(s.label));
         stubs_.push_back(s);
         no_fall_at_ = a_.size();
         return;
@@ -1110,19 +1343,19 @@ void RegionEmitter::emit_direct_exit(std::uint64_t target, std::uint64_t dirty, 
         emit_exit_flags(flags);
         a_.align_rel32_after(1);
     }
-    emit_exit_jump(target, skip_field);
+    emit_exit_jump(target, skip_field, is_call);
 }
 
-// The patchable jmp of a direct exit (4-byte aligned rel32) and its unlinked
-// tail; skip_field: the exit's jmp A (RegionExit::skip_rel32_offset).
-void RegionEmitter::emit_exit_jump(std::uint64_t target, std::uint32_t skip_field) {
+// The patchable jmp (or call for HW RSB BL) of a direct exit (4-byte aligned
+// rel32) and its unlinked tail; skip_field: the exit's jmp/call A.
+void RegionEmitter::emit_exit_jump(std::uint64_t target, std::uint32_t skip_field, bool is_call) {
     if (plan_.cold_layout && !cold_) {
-        // In the body only the patchable jmp: its unlinked tail (dead once
-        // linked) is cold. The runtime records the jmp's initial rel32 at
-        // install and restores it on unlink, wherever the tail is.
+        // In the body only the patchable jmp/call: its unlinked tail (dead once
+        // linked) is cold. The runtime records the initial rel32 at install and
+        // restores it on unlink, wherever the tail is.
         Stub s{Stub::K::exit_tail, a_.new_label(), FlagsState::ctx, 0, target, -1};
         s.field = a_.bound_label();   // the opcode; the rel32 field follows it
-        const auto field_offset = static_cast<std::uint32_t>(a_.jmp(s.label));
+        const auto field_offset = static_cast<std::uint32_t>(is_call ? a_.call(s.label) : a_.jmp(s.label));
         stubs_.push_back(s);
         out_.exits.push_back({field_offset, target, skip_field});
         no_fall_at_ = a_.size();
@@ -1284,8 +1517,8 @@ Label RegionEmitter::taken_label(std::int32_t taken, FlagsState state) {
         if (t.inherit_flags) inherited_[taken] = state;   // the stub's moves keep EFLAGS
         return add_stub(Stub::K::edge, needs_edge_materialize(taken) ? state : FlagsState::ctx, 0, 0, taken, push_snap());
     }
-    if (alloc_pass_ == 2 && t.leader && (taken > index_ || leaves_loop(index_, taken)) &&
-        s_.cache_slot[static_cast<std::size_t>(taken)] >= 0) {
+    if (((plan_.cold_layout && taken > index_) || (alloc_pass_ == 2 && leaves_loop(index_, taken))) &&
+        t.leader && s_.cache_slot[static_cast<std::size_t>(taken)] >= 0) {
         const auto& e = s_.cache_snaps[static_cast<std::size_t>(s_.cache_slot[static_cast<std::size_t>(taken)])];
         const bool mat = needs_edge_materialize(taken);
         if (mat || reconcile_needs_code({gc_, vc_}, e, dead_at(taken)))
@@ -1302,8 +1535,30 @@ Label RegionEmitter::taken_label(std::int32_t taken, FlagsState state) {
 void RegionEmitter::cond_branch(Cond c, std::int32_t taken, std::uint64_t taken_pc, std::int32_t fall,
                                 std::uint64_t fall_pc) {
     const auto state = flags_;
-    if (taken >= 0) jcc_label(c, taken_label(taken, state));
-    else a_.jcc(c, add_stub(Stub::K::direct_exit, state, current_dirty(), taken_pc, -1, dirty_snap()));
+    const auto dst = taken >= 0 ? taken_label(taken, state)
+                                : add_stub(Stub::K::direct_exit, state, current_dirty(), taken_pc, -1, dirty_snap());
+    if (taken >= 0) jcc_label(c, dst);
+    else a_.jcc(c, dst);
+    if (ccmp_cold_inst_ == index_) {
+        const auto lfalse = ccmp_cold_label_;
+        const unsigned nz = ccmp_cold_nzcv_;
+        const bool need_flags = taken < 0 || plan_.insts[static_cast<std::size_t>(taken)].flags_live_in;
+        const bool fn = (nz & 8) != 0, fz = (nz & 4) != 0, fc = (nz & 2) != 0, fv = (nz & 1) != 0;
+        // state reflects any host_add -> host_sub conversion performed by host_condition (HI/LS).
+        const bool cf = (state == FlagsState::host_add) ? fc : !fc;
+        const unsigned ah = (fn ? 0x80u : 0u) | (fz ? 0x40u : 0u) | (cf ? 1u : 0u);
+        const unsigned imm = (ah << 8) | (fv ? 1u : 0u);
+        ccmp_cold_inst_ = -1;
+        defer_cold([this, lfalse, dst, imm, need_flags]() {
+            a_.bind(lfalse);
+            if (need_flags) {
+                a_.mov_imm(Gp::rax, imm);
+                a_.alu(Alu::add, 8, Gp::rax, 0x7f);   // OF = (al == 1)
+                a_.sahf();                            // SF ZF CF from ah
+            }
+            a_.jmp(dst);
+        });
+    }
     if (fall >= 0) {
         // Tier 2: loop-carried dirty values leave the loop stored.
         if (alloc_pass_ == 2 && !plan_.insts[static_cast<std::size_t>(fall)].leader && leaves_loop(index_, fall))
@@ -1518,7 +1773,12 @@ void RegionEmitter::merge_entry(std::int32_t target, bool with_current, CacheSna
         reset_cache(e.gpr);
         reset_cache(e.vec);
     }
-    drop_entry(e.gpr, 0);   // rax
+    if (plan_.insts[static_cast<std::size_t>(target)].flags_live_in)
+        drop_entry(e.gpr, 0);   // rax (edge flag materialization clobbers it)
+    if ((loop >= 0 && carry_clean_) || (loop < 0 && !merge_dirty_)) {
+        e.gpr.dirty = 0;
+        e.vec.dirty = 0;
+    }
     e.gpr.dirty &= e.gpr.mask;
     e.vec.dirty &= e.vec.mask;
     if (loop == target) {
@@ -1582,6 +1842,7 @@ void RegionEmitter::reconcile(const CacheSnapshot& e, bool keep_rest, std::uint6
 // then fill t's registers by moves (ordered so no source is overwritten
 // first; cycles go through the context) and context loads.
 void RegionEmitter::reconcile_class(RegCache& c, const RegCache& t, bool vec, bool keep_rest, std::uint32_t dead) {
+    if (!vec) clear_lit_base();
     const auto store = [&](unsigned g, unsigned h) {
         if (vec) vmove(ptr(Gp::r15, v_disp(g)), x64::xmm(h));
         else a_.mov(64, gmem(g), x64::gp(h));
@@ -1633,10 +1894,27 @@ void RegionEmitter::reconcile_class(RegCache& c, const RegCache& t, bool vec, bo
             --left;
             progress = true;
         }
-        if (!progress) {   // a cycle of moves: one value goes through the context
+        if (!progress) {   // a cycle of moves: GPRs use xchg (no spill/reload stall), vectors go through the context
             for (unsigned i = 0; i < n; ++i) {
                 if (mv[i].done || mv[i].src < 0) continue;
                 const auto src = static_cast<unsigned>(mv[i].src);
+                if (!vec) {
+                    const auto dst = static_cast<unsigned>(mv[i].dst);
+                    a_.xchg(64, x64::gp(dst), x64::gp(src));
+                    mv[i].done = true;
+                    --left;
+                    for (unsigned j = 0; j < n; ++j) {
+                        if (!mv[j].done && mv[j].src == static_cast<std::int8_t>(dst)) {
+                            mv[j].src = static_cast<std::int8_t>(src);
+                            if (mv[j].src == static_cast<std::int8_t>(mv[j].dst)) {
+                                mv[j].done = true;
+                                --left;
+                            }
+                            break;
+                        }
+                    }
+                    break;
+                }
                 if ((c.dirty >> src) & 1u) store(mv[i].g, src);
                 mv[i].src = -1;
                 break;
@@ -1667,6 +1945,7 @@ void RegionEmitter::begin_instruction(std::int32_t index) {
     pc_ = cur_->pc;
     fault_pc_ = pc_;          // neon (additive): see fold_family_access
     afold_.active = false;
+    folded_access_ = false;
     set_lent(lent_at(index));   // tier 2 (before reset_scratch: lent hosts are scratch)
     reset_scratch();
     written_ = 0;
@@ -1732,6 +2011,7 @@ void RegionEmitter::end_instruction() {
 }
 
 void RegionEmitter::start_block(std::int32_t index) {
+    clear_lit_base();
     const auto& pi = plan_.insts[index];
     set_lent(lent_at(index));   // tier 2: the code above handled the lending change of its edge
     // A continuation entry right after code that never falls through (the
@@ -1769,6 +2049,10 @@ void RegionEmitter::start_block(std::int32_t index) {
     alias_guard();       // tier 2: resolved by every predecessor
     alias_forget_knowledge();
     tz_clz_ = -1;        // RBIT->TZCNT never spans blocks
+    zf_inst_ = -1;       // ALU->CBZ zero-flag forwarding never spans blocks
+    logic_flags_inst_ = -1;
+    cset_inst_ = -1;     // CSET->CBZ flag forwarding never spans blocks
+    ccmp_cold_inst_ = -1;
     // The block starts with its entry state (decided by its first edge; a
     // block no edge reached yet starts empty). Code laid out before it that
     // does not fall through has handled its own cache state.
@@ -1822,6 +2106,7 @@ void RegionEmitter::start_block(std::int32_t index) {
 }
 
 unsigned RegionEmitter::try_families(std::int32_t index) {
+    clear_lit_base();
     const auto table = registered_families();
     const auto n = static_cast<std::int32_t>(plan_.insts.size());
     std::int32_t len = 1;
@@ -1830,6 +2115,7 @@ unsigned RegionEmitter::try_families(std::int32_t index) {
         ++len;
     const std::span<const std::uint32_t> words(plan_.words.data() + index, static_cast<std::size_t>(len));
     const auto faults_before = out_.faults.size();
+    const auto cold_before = cold_fns_.size();
     for (unsigned f = 0; f < table.count; ++f) {
         reset_scratch();
         pending_gpr_count_ = 0;
@@ -1842,6 +2128,7 @@ unsigned RegionEmitter::try_families(std::int32_t index) {
         if (consumed == 0) {
             fault_open_ = false;
             out_.faults.resize(faults_before);
+            cold_fns_.resize(cold_before);
             continue;
         }
         if (consumed > words.size()) throw RetryTranslation{pc_, false};
@@ -1878,10 +2165,12 @@ void RegionEmitter::emit_fallthrough(std::int32_t index, unsigned consumed) {
     // Leaving the region (or entering an entry stub): store the dirty cache.
     // Edges into leaders reconcile it (edge_inline); without carry it is
     // stored before every leader.
-    if (!adjacent || pi.flow == Flow::interpret ||
-        ((!carry_ || carry_clean_) && plan_.insts[next].leader && !dirty_into_merge(next))) {
+    if (!adjacent || pi.flow == Flow::interpret) {
         flush_dirty();
-    } else if (alloc_pass_ == 2 && plan_.insts[next].leader &&
+    } else if ((!carry_ || carry_clean_) && plan_.insts[next].leader && !dirty_into_merge(next)) {
+        if (dead_on_) flush_dirty_except(0, 0, dead_at(next));
+        else flush_dirty();
+    } else if (alloc_pass_ == 2 && plan_.insts[next].leader && !dirty_into_merge(next) &&
                !(next < static_cast<std::int32_t>(s_.preset_of.size()) && s_.preset_of[static_cast<std::size_t>(next)] >= 0)) {
         // tier 2: only the loop's carried values stay dirty into another block
         std::uint32_t keep_g = 0, keep_v = 0;
@@ -1975,11 +2264,19 @@ void RegionEmitter::emit_instruction(std::int32_t index) {
         plan_.for_each_successor(index, [&](std::int32_t t) {
             dead &= dead_at(t);
             const auto slot = s_.cache_slot[static_cast<std::size_t>(t)];
-            if (t > index || !plan_.insts[static_cast<std::size_t>(t)].leader || slot < 0) return;
+            const bool has_preset = t < static_cast<std::int32_t>(s_.preset_of.size()) &&
+                                    s_.preset_of[static_cast<std::size_t>(t)] >= 0;
+            if ((t > index && !has_preset) || !plan_.insts[static_cast<std::size_t>(t)].leader || slot < 0) return;
             keep_matching(s_.cache_snaps[static_cast<std::size_t>(slot)], keep_g, keep_v);
         });
         if (pi.flow == Flow::cond ? (pi.taken < 0 || pi.fall < 0) : pi.taken < 0) dead = 0;   // an exit observes everything
         flush_dirty_except(keep_g, keep_v, dead);
+    } else if (dead_on_ && (pi.flow == Flow::jump || pi.flow == Flow::cond) && pi.table < 0 &&
+               (!carry_ || carry_clean_ || s_.loop_of[static_cast<std::size_t>(index)] < 0)) {
+        std::uint64_t dead = ~std::uint64_t{0};
+        plan_.for_each_successor(index, [&](std::int32_t t) { dead &= dead_at(t); });
+        if (pi.flow == Flow::cond ? (pi.taken < 0 || pi.fall < 0) : pi.taken < 0) dead = 0;
+        flush_dirty_except(0, 0, dead);
     } else if (pi.flow != Flow::normal &&
                (!carry_ || carry_clean_ || (pi.flow != Flow::jump && pi.flow != Flow::cond) ||
                 s_.loop_of[static_cast<std::size_t>(index)] < 0)) {
@@ -2131,6 +2428,7 @@ void RegionEmitter::emit_stubs() {
         load_entry_state(plan_.entries[k].index);
         a_.jmp(label_of(plan_.entries[k].index));
     }
+    for (auto& fn : cold_fns_) fn();
 }
 
 void RegionEmitter::run() {
@@ -2139,10 +2437,7 @@ void RegionEmitter::run() {
     s_.cache_slot.assign(static_cast<std::size_t>(n), -1);
     s_.cache_snaps.clear();
     s_.loop_end.assign(static_cast<std::size_t>(n), -1);
-    for (std::int32_t i = 0; i < n; ++i)
-        plan_.for_each_successor(i, [&](std::int32_t t) {
-            if (t <= i) s_.loop_end[static_cast<std::size_t>(t)] = std::max(s_.loop_end[static_cast<std::size_t>(t)], i);
-        });
+    for (std::int32_t h = 0; h < n; ++h) s_.loop_end[static_cast<std::size_t>(h)] = plan_.insts[static_cast<std::size_t>(h)].loop_end;
     // Flags read before written inside the region (backward, to a fixed
     // point): the plan's liveness without the exits.
     s_.flags_read.assign(static_cast<std::size_t>(n), 0);
@@ -2173,6 +2468,10 @@ void RegionEmitter::run() {
     s_.entry_inline.assign(plan_.entries.size(), 0);
     cold_ = false;
     no_fall_at_ = ~std::size_t{0};
+    cold_fns_.clear();
+    rbit_const_label_ = {};
+    fcmp_const_label_ = {};
+    rbit_sites_.clear();
     out_.guest_start = plan_.start;
     reset_scratch();
     forget_vec_zero();       // fp/neon
@@ -2187,12 +2486,17 @@ void RegionEmitter::run() {
     carry_clean_ = plan_.carry_clean;
     belady_ = plan_.belady;
     branch_dirty_ = codegen_on(knob_no_branch_dirty);
-    merge_dirty_ = (codegen_p2_knob_bits() & knob_merge_dirty) != 0;
+    merge_dirty_ = codegen_on(knob_no_merge_dirty);
+    zf_inst_ = -1;
+    logic_flags_inst_ = -1;
+    cset_inst_ = -1;
+    ccmp_cold_inst_ = -1;
+    clear_lit_base();
     // Tier 2 (region_alloc.cpp): liveness, dropped interrupt checks; pass 2
     // starts every block that has a preset with it, and dirty values cross
     // edges (each edge stores what its target does not keep).
     if (!plan_.optimize || !carry_ || !write_back_) alloc_pass_ = 0;
-    dead_on_ = plan_.optimize && plan_.t2_dead && write_back_ && plan_.fault_maps && plan_.wb_fault_flush;
+    dead_on_ = plan_.t2_dead && write_back_ && plan_.fault_maps && plan_.wb_fault_flush;
     in_instruction_ = false;
     after_last_ = 0;
     s_.edge_recs.clear();
@@ -2202,6 +2506,7 @@ void RegionEmitter::run() {
     } else {
         s_.no_check.assign(static_cast<std::size_t>(n), 0);
         s_.lent.clear();
+        if (dead_on_) compute_liveness();
     }
     if (alloc_pass_ == 2) {
         carry_clean_ = false;
@@ -2213,6 +2518,7 @@ void RegionEmitter::run() {
     }
     fault_flush_ = plan_.wb_fault_flush;
     fault_maps_ = write_back_ && plan_.fault_maps;
+    compute_pin_need();
     out_.fault_maps.clear();
     out_.fault_map_regs.clear();
     reset_cache(gc_);
@@ -2297,6 +2603,20 @@ void RegionEmitter::run() {
     emit_stubs();
     const auto pool_begin = a_.size();
     neon_end_region(a_);     // after the last unconditional jump: never executed
+    if (rbit_const_label_.valid()) {
+        a_.align(16);
+        a_.bind(rbit_const_label_);
+        a_.dq(0x8040201008040201ULL);
+        a_.dq(0x8040201008040201ULL);
+    }
+    if (fcmp_const_label_.valid()) {
+        a_.align(4);
+        a_.bind(fcmp_const_label_);
+        a_.dd(0x20000000u);   // +0: GT
+        a_.dd(0x80000000u);   // +4: LT
+        a_.dd(0x60000000u);   // +8: EQ
+        a_.dd(0x30000000u);   // +12: UN
+    }
     const auto pool_end = a_.size();
     emit_host_tables();      // switch dispatch data (never executed)
     emit_inline_cache_slots();   // BLR inline caches' targets (data)
@@ -2329,6 +2649,19 @@ void RegionEmitter::run() {
         std::size_t at = pool_begin;
         for (; at + 8 <= pool_end; at += 8) mark(at);
         if (at != pool_end) mark(pool_end - 8);
+    }
+    // RIP-relative vgf2p8affineqb ends in `<rel32> 0x00`; when rel32 falls in
+    // 0x140..0x14f or 0x180..0x18f an unaligned 8-byte window resembles an
+    // image address (0x14xxxxxxx / 0x18xxxxxxx). Mark any such window literal.
+    for (const auto site : rbit_sites_) {
+        for (std::size_t off = site; off + 8 <= a_.size() && off <= static_cast<std::size_t>(site) + 4; ++off) {
+            std::uint64_t value;
+            std::memcpy(&value, a_.data() + off, 8);
+            if ((value >> 28) == 0x14 || (value >> 28) == 0x18) {
+                out_.fixups.push_back({static_cast<std::uint32_t>(off), FixupKind::literal_imm64, value});
+                break;
+            }
+        }
     }
 
     out_.entries.clear();
@@ -2435,8 +2768,10 @@ x64::Xmm RegionEmitter::read_vec(unsigned index) {
 EmitContext::VecSrc RegionEmitter::vsrc(unsigned index) {
     if (vpinned(index)) return {vpin(index), {}, false};
     if (const auto h = borrow_vec(index); x64::id(h) < 16) return {h, {}, false};
-    // Read again soon: load it once into a cached register (if one is spare).
-    if (may_cache() && std::popcount(free_xmm_) >= 4 && vec_read_soon(index)) return {read_vec(index), {}, false};
+    // Read again soon: load it once into a cached register only if an uncached
+    // scratch XMM is spare (never evict a live cached vector just to fold a mem op).
+    if (may_cache() && (free_xmm_ & ~vc_.mask) != 0 && std::popcount(free_xmm_) >= 4 && vec_read_soon(index))
+        return {read_vec(index), {}, false};
     // tier 2: a slot alias is loaded. Its source slot could be overwritten
     // later in this instruction (an eviction of the source's newer value).
     if (vslot_alias_[index] >= 0) return {read_vec(index), {}, false};
@@ -2668,15 +3003,41 @@ std::uint8_t fp_arith_quiet(std::uint32_t w) {
         return 0;
     }
     if ((w & 0x7f3e0000u) == 0x1e220000u) return scalar((w >> 22) & 3u);   // SCVTF/UCVTF from W/X: never NaN
-    // Vector three same (single/double; Q and sz free): FADD, FSUB, FMUL, FDIV,
-    // FMLA, FMLS, FMAX, FMIN, FMAXNM, FMINNM, FMULX, FABD.
-    static constexpr std::uint32_t kThreeSame[] = {0x0e20d400u, 0x0ea0d400u, 0x2e20dc00u, 0x2e20fc00u, 0x0e20cc00u, 0x0ea0cc00u,
-                                                   0x0e20f400u, 0x0ea0f400u, 0x0e20c400u, 0x0ea0c400u, 0x0e20dc00u, 0x2ea0d400u};
-    for (const auto v : kThreeSame)
-        if ((w & 0xbfa0fc00u) == v) return (w >> 22) & 1u ? 2 : 1;
-    // By element (single/double): FMLA, FMLS, FMUL.
-    if ((w & 0xbf80f400u) == 0x0f801000u || (w & 0xbf80f400u) == 0x0f805000u || (w & 0xbf80f400u) == 0x0f809000u)
-        return (w >> 22) & 1u ? 2 : 1;
+    // AdvSIMD scalar SCVTF/UCVTF (vector register source): never NaN.
+    if ((w & 0xdf3e0c00u) == 0x5e200800u && !((w >> 23) & 1u) && ((w >> 12) & 31u) == 0x1d)
+        return ((w >> 22) & 1u) ? 2 : 3;
+    // Vector three same (single/double; Q and sz free, sz=1 requires Q=1):
+    // FADD, FSUB, FMUL, FDIV, FMLA, FMLS, FMAX, FMIN, FMAXNM, FMINNM, FMULX,
+    // FABD, FADDP, FMAXP, FMINP, FMAXNMP, FMINNMP, FRECPS, FRSQRTS.
+    static constexpr std::uint32_t kThreeSame[] = {
+        0x0e20d400u, 0x0ea0d400u, 0x2e20dc00u, 0x2e20fc00u, 0x0e20cc00u, 0x0ea0cc00u,
+        0x0e20f400u, 0x0ea0f400u, 0x0e20c400u, 0x0ea0c400u, 0x0e20dc00u, 0x2ea0d400u,
+        0x2e20d400u, 0x2e20f400u, 0x2ea0f400u, 0x2e20c400u, 0x2ea0c400u, 0x0e20fc00u, 0x0ea0fc00u,
+    };
+    const bool q = ((w >> 30) & 1u) != 0, sz = ((w >> 22) & 1u) != 0;
+    if (q || !sz) {
+        for (const auto v : kThreeSame)
+            if ((w & 0xbfa0fc00u) == v) return sz ? 2 : 1;
+    }
+    // Vector two-register misc: SCVTF/UCVTF, FSQRT, FRINT*, FRECPE/FRSQRTE, FCVTL/FCVTN/FCVTXN.
+    if ((w & 0x9f3e0c00u) == 0x0e200800u) {
+        const bool u = ((w >> 29) & 1u) != 0, a = ((w >> 23) & 1u) != 0;
+        const unsigned opc = (w >> 12) & 31u;
+        if (!a && !u && opc == 0x17) return sz ? 2 : 1;                 // FCVTL/FCVTL2 (32->64 or 16->32)
+        if (!a && opc == 0x16 && sz) return 1;                          // FCVTN/FCVTXN (64->32)
+        if (q || !sz) {
+            if (!a && (opc == 0x18 || opc == 0x19 || opc == 0x1d || opc == 0x1e || opc == 0x1f))
+                return sz ? 2 : 1;                                      // FRINTN/A/M/X/32/64, SCVTF/UCVTF
+            if (a && ((opc == 0x18 && !u) || opc == 0x19 || opc == 0x1d || (opc == 0x1f && u)))
+                return sz ? 2 : 1;                                      // FRINTP/Z/I, FRECPE/FRSQRTE, FSQRT
+        }
+    }
+    // By element (single/double): FMLA, FMLS, FMUL, FMULX.
+    if (q || !sz) {
+        if ((w & 0xbf80f400u) == 0x0f801000u || (w & 0xbf80f400u) == 0x0f805000u ||
+            (w & 0xbf80f400u) == 0x0f809000u || (w & 0xbf80f400u) == 0x2f809000u)
+            return sz ? 2 : 1;
+    }
     return 0;
 }
 
@@ -2687,17 +3048,23 @@ std::uint8_t fp_arith_quiet(std::uint32_t w) {
 // elements), joined at block starts to a fixpoint (loop-invariant constants and
 // loop-carried arithmetic results keep their class across back edges).
 // Constants come from FMOV (scalar and vector immediate), the families'
-// constant definitions (FamilyFacts::def: MOVI/MVNI) and FMOV S/D from a W/X
-// register set by MOVZ/MOVN/MOVK earlier in the same block; quiet values from
-// FP arithmetic (fp_arith_quiet). Every other write, an interpreted or
-// conservatively described instruction, and region entries make registers
-// unknown and possibly signalling. Only what the FP min/max instructions read
-// is kept (s_.fpc_uses).
+// constant definitions (FamilyFacts::def: MOVI/MVNI), FMOV S/D and DUP from a
+// W/X register set by MOVZ/MOVN/MOVK earlier in the same block, and propagate
+// through MOV, scalar FMOV, FABS/FNEG, and DUP by element; quiet values also
+// come from FP arithmetic (fp_arith_quiet) and propagate through copies, DUP,
+// and FABS/FNEG. Every other write, an interpreted or conservatively described
+// instruction, and region entries make registers unknown and possibly
+// signalling. Only what the FP min/max instructions read is kept (s_.fpc_uses).
 void RegionEmitter::fpconst_compute() {
     using FpConst = Scratch::FpConst;
     constexpr FpConst kUnknown{2, 0, 0, 0};
     const auto n = static_cast<std::int32_t>(plan_.insts.size());
     s_.fpc_uses.clear();
+    bool has_minmax = false;
+    for (std::int32_t i = 0; i < n && !has_minmax; ++i)
+        has_minmax = is_fp_minmax_word(plan_.words[static_cast<std::size_t>(i)]);
+    if (!has_minmax) return;
+
     s_.fpc_slot.assign(static_cast<std::size_t>(n), -1);
     std::vector<std::int32_t> leaders;
     for (std::int32_t i = 0; i < n; ++i)
@@ -2716,12 +3083,6 @@ void RegionEmitter::fpconst_compute() {
         if (entry[static_cast<std::size_t>(leaders[k])])
             for (unsigned r = 0; r < 32; ++r) s_.fpc_in[k * 32 + r] = kUnknown;
     const auto table = registered_families();
-    // A register's state depends only on its own definitions (no copies are
-    // tracked), so only the registers some min/max reads need joining.
-    std::uint32_t tracked = 0;
-    for (std::int32_t i = 0; i < n; ++i)
-        if (is_fp_minmax_word(plan_.words[static_cast<std::size_t>(i)])) tracked |= plan_.insts[static_cast<std::size_t>(i)].vreads;
-    if (tracked == 0) return;
 
     struct Gpr {
         bool known;
@@ -2738,7 +3099,7 @@ void RegionEmitter::fpconst_compute() {
         const unsigned rd = w & 31u;
         bool defined = true;
         FpConst c{1, 0, 0, 0};
-        if (!((tracked >> rd) & 1u)) {   // its state is never read: unknown, like the other writes
+        if (pi.vwrites == 0) {
             defined = false;
         } else if ((w & 0xff201fe0u) == 0x1e201000u && ((w >> 22) & 3u) < 2) {   // FMOV S/D, #imm
             c.lo = fp_expand_imm8((w >> 13) & 0xffu, ((w >> 22) & 3u) == 1);
@@ -2755,6 +3116,83 @@ void RegionEmitter::fpconst_compute() {
             const std::uint64_t v = rn == 31 ? 0 : g[rn].value;
             if (known) c.lo = x ? v : (v & 0xffffffffu);
             else c = kUnknown;
+        } else if ((w & 0xffe0fc00u) == 0x4ea01c00u && ((w >> 16) & 31u) == ((w >> 5) & 31u)) {   // MOV Vd.16B, Vn.16B
+            c = st[(w >> 5) & 31u];
+        } else if ((w & 0xffbffc00u) == 0x1e204000u || (w & 0xffbffc00u) == 0x1e20c000u ||
+                   (w & 0xffbffc00u) == 0x1e214000u) {   // scalar FMOV/FABS/FNEG S/D
+            const bool dbl = ((w >> 22) & 1u) != 0;
+            const unsigned opc = (w >> 15) & 63u;
+            const FpConst& src = st[(w >> 5) & 31u];
+            if (src.state == 1) {
+                std::uint64_t lo = dbl ? src.lo : (src.lo & 0xffffffffull);
+                const std::uint64_t sb = dbl ? (1ull << 63) : (1ull << 31);
+                if (opc == 1) lo &= ~sb;
+                else if (opc == 2) lo ^= sb;
+                c = FpConst{1, 0, lo, 0};
+            } else if (src.state == 2) {
+                c = FpConst{2, static_cast<std::uint8_t>(dbl ? (src.quiet & 2u) : ((src.quiet & 1u) ? 3u : 0u)), 0, 0};
+            } else {
+                c = src;
+            }
+        } else if ((w & 0x9fbffc00u) == 0x0ea0f800u && (((w >> 30) & 1u) || !((w >> 22) & 1u))) {   // vector FABS/FNEG
+            const bool q = ((w >> 30) & 1u) != 0, neg = ((w >> 29) & 1u) != 0, dbl = ((w >> 22) & 1u) != 0;
+            const FpConst& src = st[(w >> 5) & 31u];
+            if (src.state == 1) {
+                const std::uint64_t sb = dbl ? (1ull << 63) : 0x8000000080000000ull;
+                c.lo = neg ? (src.lo ^ sb) : (src.lo & ~sb);
+                c.hi = q ? (neg ? (src.hi ^ sb) : (src.hi & ~sb)) : 0;
+            } else if (src.state == 2) {
+                c = FpConst{2, static_cast<std::uint8_t>(dbl ? (src.quiet & 2u) : (src.quiet & 1u)), 0, 0};
+            } else {
+                c = src;
+            }
+        } else if ((w & 0xbfe0fc00u) == 0x0e000400u) {   // DUP element (.2S/.4S/.2D)
+            const bool q = ((w >> 30) & 1u) != 0;
+            const unsigned imm5 = (w >> 16) & 31u;
+            const FpConst& src = st[(w >> 5) & 31u];
+            if ((imm5 & 7u) == 4u) {
+                const unsigned idx = imm5 >> 3;
+                if (src.state == 1) {
+                    const std::uint64_t word = idx < 2 ? src.lo : src.hi;
+                    const std::uint64_t v = (word >> (32u * (idx & 1u))) & 0xffffffffull;
+                    c.lo = v | (v << 32);
+                    c.hi = q ? c.lo : 0;
+                } else if (src.state == 2) {
+                    c = FpConst{2, static_cast<std::uint8_t>(src.quiet & 1u), 0, 0};
+                } else {
+                    c = src;
+                }
+            } else if (q && (imm5 & 15u) == 8u) {
+                const unsigned idx = imm5 >> 4;
+                if (src.state == 1) {
+                    c.lo = c.hi = idx ? src.hi : src.lo;
+                } else if (src.state == 2) {
+                    c = FpConst{2, static_cast<std::uint8_t>(src.quiet & 2u), 0, 0};
+                } else {
+                    c = src;
+                }
+            } else {
+                defined = false;
+            }
+        } else if ((w & 0xbfe0fc00u) == 0x0e000c00u) {   // DUP general (.2S/.4S/.2D from W/X)
+            const bool q = ((w >> 30) & 1u) != 0;
+            const unsigned imm5 = (w >> 16) & 31u, rn = (w >> 5) & 31u;
+            const bool known = rn == 31 || g[rn].known;
+            const std::uint64_t v = rn == 31 ? 0 : g[rn].value;
+            if (imm5 == 4u) {
+                if (known) {
+                    const std::uint64_t lane = v & 0xffffffffull;
+                    c.lo = lane | (lane << 32);
+                    c.hi = q ? c.lo : 0;
+                } else {
+                    c = kUnknown;
+                }
+            } else if (q && imm5 == 8u) {
+                if (known) c.lo = c.hi = v;
+                else c = kUnknown;
+            } else {
+                defined = false;
+            }
         } else if (const std::uint8_t q = fp_arith_quiet(w); q != 0 && ((pi.vwrites >> rd) & 1u)) {
             c = FpConst{2, q, 0, 0};
         } else {
@@ -2769,14 +3207,14 @@ void RegionEmitter::fpconst_compute() {
                     }
             }
         }
-        if (c.state == 1) c.quiet = quiet_bits(c.lo, c.hi);
-        if (defined) {
+        if (defined && c.state == 1) c.quiet = quiet_bits(c.lo, c.hi);
+        if (defined && ((pi.vwrites >> rd) & 1u)) {
             for (auto m = pi.vwrites & ~(1u << rd); m; m &= m - 1) st[std::countr_zero(m)] = kUnknown;
             st[rd] = c;
         } else {
             for (auto m = pi.vwrites; m; m &= m - 1) st[std::countr_zero(m)] = kUnknown;
         }
-        // W/X constants for FMOV from a general register: MOVZ/MOVN/MOVK.
+        // W/X constants for FMOV/DUP from a general register: MOVZ/MOVN/MOVK.
         const std::uint32_t mov = w & 0x7f800000u;
         if (mov == 0x52800000u || mov == 0x12800000u || mov == 0x72800000u) {
             const bool sf = (w >> 31) & 1u;
@@ -2821,8 +3259,7 @@ void RegionEmitter::fpconst_compute() {
                     if (t < 0 || t >= n || entry[static_cast<std::size_t>(t)]) return;
                     const auto slot = s_.fpc_slot[static_cast<std::size_t>(t)];
                     if (slot < 0) return;   // the next instruction of this block
-                    for (auto m = tracked; m; m &= m - 1) {
-                        const auto r = static_cast<unsigned>(std::countr_zero(m));
+                    for (unsigned r = 0; r < 32; ++r) {
                         auto& in = s_.fpc_in[static_cast<std::size_t>(slot) * 32 + r];
                         const auto j = join(in, st[r]);
                         if (j.state != in.state || j.quiet != in.quiet || j.lo != in.lo || j.hi != in.hi) {
@@ -2879,6 +3316,58 @@ bool RegionEmitter::vec_fp_quiet(unsigned index, unsigned es) {
     return false;
 }
 
+bool RegionEmitter::vec_dead_after(unsigned consumed, unsigned index) const {
+    if (index >= 32) return false;
+    const auto at = index_ + static_cast<std::int32_t>(consumed) - 1;
+    if (dead_on_ && at >= 0 && static_cast<std::size_t>(at) < s_.olive_out.size() &&
+        ((s_.olive_out[static_cast<std::size_t>(at)] >> (32u + index)) & 1u) == 0)
+        return true;
+    const auto bit = 1u << index;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    const auto start = index_ + static_cast<std::int32_t>(consumed);
+    for (std::int32_t j = start; j < n && j < start + 16; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (pj.leader || pj.flow == Flow::interpret || pj.conservative_writes) return false;
+        if (pj.vreads & bit) return false;
+        if (pj.vwrites & bit) return !pj.may_fault && pj.flow == Flow::normal;
+        if (pj.may_fault || pj.flow != Flow::normal) return false;
+    }
+    return false;
+}
+
+bool RegionEmitter::vec_sz_dead_after(unsigned consumed, unsigned index, unsigned es) const {
+    if (vec_dead_after(consumed, index)) return true;
+    if (index >= 32 || (es != 32 && es != 64)) return false;
+    const unsigned want_sz = es == 64 ? 1u : 0u;
+    const auto is_sz_insens_vec = [want_sz](std::uint32_t w) -> bool {
+        const unsigned sz = (w >> 22) & 1u;
+        if (sz != want_sz) return false;
+        if (sz != 0 && ((w >> 30) & 1u) == 0) return false;   // reject invalid .1D
+        // Vector FCMEQ/FCMGE/FCMGT (reg): .2S/.4S/.2D
+        const std::uint32_t t = w & 0xbfa0fc00u;
+        if (t == 0x0e20e400u || t == 0x2e20e400u || t == 0x2ea0e400u) return true;
+        // Vector FCMEQ/FCMGE/FCMGT/FCMLE/FCMLT (#0) and FABS: .2S/.4S/.2D
+        const std::uint32_t z = w & 0xbfbffc00u;
+        return z == 0x0ea0c800u || z == 0x2ea0c800u || z == 0x0ea0d800u || z == 0x2ea0d800u || z == 0x0ea0e800u ||
+               z == 0x0ea0f800u;
+    };
+    const auto bit = 1u << index;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    const auto start = index_ + static_cast<std::int32_t>(consumed);
+    for (std::int32_t j = start; j < n && j < start + 16; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (pj.leader || pj.flow != Flow::normal || pj.conservative_writes || pj.may_fault) return false;
+        if (pj.vreads & bit) {
+            if (!is_sz_insens_vec(plan_.words[static_cast<std::size_t>(j)])) return false;
+        }
+        if (pj.vwrites & bit) return true;
+        if (dead_on_ && static_cast<std::size_t>(j) < s_.olive_out.size() &&
+            ((s_.olive_out[static_cast<std::size_t>(j)] >> (32u + index)) & 1u) == 0)
+            return true;
+    }
+    return false;
+}
+
 void RegionEmitter::clobber_host_flags() { prepare_clobber(); }
 
 void RegionEmitter::set_flags(FlagsProducer producer) {
@@ -2901,7 +3390,7 @@ void RegionEmitter::set_nzcv(Gp value) {
 // flags writer or a block end in between; -1 otherwise.
 int RegionEmitter::next_flags_condition() const {
     const auto n = static_cast<std::int32_t>(plan_.insts.size());
-    for (std::int32_t j = index_ + 1; j < n && j <= index_ + 8; ++j) {
+    for (std::int32_t j = index_ + 1; j < n && j <= index_ + 16; ++j) {
         const auto& pj = plan_.insts[j];
         if (pj.leader) return -1;
         if (pj.reads_flags) {
@@ -2933,6 +3422,39 @@ bool RegionEmitter::set_fcmp_flags(bool swapped) {
     if (!plan_.fcmp_fusion) return false;
     flags_ = swapped ? FlagsState::host_fcmp_swapped : FlagsState::host_fcmp;
     return true;
+}
+
+int RegionEmitter::fccmp_consumer_cond() const {
+    if (!codegen_on(knob_no_ccmp_fusion) || !plan_.fcmp_fusion) return -1;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    for (std::int32_t j = index_ + 1; j < n && j <= index_ + 4; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (pj.leader || pj.pc != plan_.insts[static_cast<std::size_t>(j) - 1].pc + 4 || pj.family >= 0 ||
+            pj.try_family || pj.inst.kind == Kind::unknown || pj.conservative_writes || pj.inline_call || pj.inline_ret)
+            return -1;
+        if (pj.reads_flags) {
+            if (pj.flags_live_out || pj.writes_flags) return -1;
+            if (pj.inst.kind != Kind::branch_cond && pj.inst.kind != Kind::csel) return -1;
+            return pj.inst.cond < 14 ? static_cast<int>(pj.inst.cond) : -1;
+        }
+        if (pj.writes_flags || pj.may_fault || pj.flow != Flow::normal) return -1;
+    }
+    return -1;
+}
+
+void RegionEmitter::set_fccmp_bool() {
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    std::int32_t reader = -1;
+    for (std::int32_t j = index_ + 1; j < n && j <= index_ + 4; ++j) {
+        const auto& pj = plan_.insts[static_cast<std::size_t>(j)];
+        if (pj.reads_flags) {
+            reader = j;
+            break;
+        }
+    }
+    flags_ = FlagsState::host_logic;
+    bool_reader_ = reader;
+    bool_in_slot_ = false;
 }
 
 // B.cond over fused FCMP flags whose condition needs the parity flag too.
@@ -3064,24 +3586,49 @@ Gp RegionEmitter::call_helper(unsigned id, std::initializer_list<HelperArg> args
         }
         ++i;
     }
-    // Pins in volatile host registers (r10/r11) do not survive the call: their
-    // context slots receive the current value and they are reloaded after.
+    // Pins in volatile host registers (r10/r11, xmm0..xmm5) do not survive the
+    // Win64 call: their context slots receive dirty values and they are reloaded.
     const std::uint32_t volatile_pins = plan_.pin_hosts & kScratchMask;
+    const std::uint32_t volatile_vpins = plan_.vpin_hosts & 0x3fu;
     if (effects != HelperEffects::pure) {
         flush_pins(current_dirty());
-    } else if (volatile_pins != 0) {
-        const auto dirty = static_cast<std::uint32_t>(current_dirty());
-        for (unsigned g = 0; g < 32; ++g)
-            if (pinned(g) && ((volatile_pins >> x64::id(pin(g))) & 1u) && ((dirty >> g) & 1u)) a_.mov(64, gmem(g), pin(g));
+    } else if ((volatile_pins | volatile_vpins) != 0) {
+        const auto dirty = current_dirty();
+        if (volatile_pins != 0) {
+            const auto gdirty = static_cast<std::uint32_t>(dirty);
+            for (unsigned g = 0; g < 32; ++g)
+                if (pinned(g) && ((volatile_pins >> x64::id(pin(g))) & 1u) && ((gdirty >> g) & 1u))
+                    a_.mov(64, gmem(g), pin(g));
+        }
+        if (volatile_vpins != 0) {
+            const auto vdirty = static_cast<std::uint32_t>(dirty >> 32);
+            for (unsigned v = 0; v < 32; ++v)
+                if (vpinned(v) && ((volatile_vpins >> x64::id(vpin(v))) & 1u) && ((vdirty >> v) & 1u))
+                    vmove(ptr(Gp::r15, v_disp(v)), vpin(v));
+        }
     }
+    // Re-entrantly align rsp to 16 bytes + 32-byte shadow space so any hardware
+    // RSB return addresses above rsp stay intact across the Win64 helper call.
+    a_.mov(64, Gp::rax, Gp::rsp);
+    a_.and_(64, Gp::rsp, -16);
+    a_.sub(64, Gp::rsp, 48);
+    a_.mov(64, ptr(Gp::rsp, 32), Gp::rax);
     a_.lea(64, Gp::rcx, ptr(Gp::r15, -kContextBias));
     a_.call(ptr(Gp::r15, helper_disp(id)));
+    a_.mov(64, Gp::rsp, ptr(Gp::rsp, 32));
     if (effects == HelperEffects::reads_writes_state) {
         load_pins();
         flags_ = FlagsState::ctx;
-    } else if (volatile_pins != 0) {
-        for (unsigned g = 0; g < 32; ++g)
-            if (pinned(g) && ((volatile_pins >> x64::id(pin(g))) & 1u)) a_.mov(64, pin(g), gmem(g));
+    } else {
+        if (volatile_pins != 0) {
+            for (unsigned g = 0; g < 32; ++g)
+                if (pinned(g) && ((volatile_pins >> x64::id(pin(g))) & 1u)) a_.mov(64, pin(g), gmem(g));
+        }
+        if (volatile_vpins != 0) {
+            for (unsigned v = 0; v < 32; ++v)
+                if (vpinned(v) && ((volatile_vpins >> x64::id(vpin(v))) & 1u))
+                    vmove(vpin(v), ptr(Gp::r15, v_disp(v)));
+        }
     }
     reset_scratch();
     take(Gp::rax);
@@ -3144,11 +3691,158 @@ bool RegionEmitter::reaching_defs(std::int32_t index, unsigned vec, std::int32_t
     return count != 0;
 }
 
+// Forward bitmask dataflow over the plan: bit `r` of s_.lmask_at[i] is 1 iff
+// every 32-bit lane of V`r` is proven to be 0x00000000 or 0xffffffff on every
+// path reaching instruction `i`. Tracks 32/64-bit compares (.2S/.4S/.2D), SSHR
+// sign-splats, copies (MOV), bitwise mask algebra (AND/BIC/ORR/ORN/EOR/NOT/
+// BSL/BIT/BIF), SXTL/SXTL2 .2D, DUP .S/.D, ZIP/UZP/TRN .S/.D, and all-0/all-1
+// MOVI/MVNI constants.
+void RegionEmitter::lane_masks_compute() {
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    s_.lmask_at.assign(static_cast<std::size_t>(n), 0u);
+    s_.lmask_slot.assign(static_cast<std::size_t>(n), -1);
+    std::vector<std::int32_t> leaders;
+    for (std::int32_t i = 0; i < n; ++i)
+        if (i == 0 || plan_.insts[static_cast<std::size_t>(i)].leader) {
+            s_.lmask_slot[static_cast<std::size_t>(i)] = static_cast<std::int32_t>(leaders.size());
+            leaders.push_back(i);
+        }
+    s_.lmask_in.assign(leaders.size(), ~0u);
+    std::vector<std::uint8_t> entry(static_cast<std::size_t>(n), 0);
+    entry[0] = 1;
+    for (const auto& e : plan_.entries)
+        if (e.index >= 0 && e.index < n) entry[static_cast<std::size_t>(e.index)] = 1;
+    for (std::int32_t i = 0; i < n; ++i)
+        if (plan_.insts[static_cast<std::size_t>(i)].entry) entry[static_cast<std::size_t>(i)] = 1;
+    std::vector<std::uint8_t> seen(leaders.size(), 0);
+    for (std::size_t k = 0; k < leaders.size(); ++k)
+        if (entry[static_cast<std::size_t>(leaders[k])]) {
+            s_.lmask_in[k] = 0u;
+            seen[k] = 1;
+        }
+    const auto table = registered_families();
+
+    const auto is_compare_or_sshr = [](std::uint32_t w) -> bool {
+        const bool valid_sz = ((w >> 30) & 1u) != 0 || ((w >> 22) & 1u) == 0;
+        if (valid_sz) {
+            static constexpr std::uint32_t kThree[] = {
+                0x0e20e400u, 0x2e20e400u, 0x2ea0e400u, 0x2e20ec00u, 0x2ea0ec00u,
+                0x0ea03400u, 0x0ea03c00u, 0x2ea03400u, 0x2ea03c00u, 0x2ea08c00u, 0x0ea08c00u,
+            };
+            const std::uint32_t t = w & 0xbfa0fc00u;
+            for (const auto e : kThree)
+                if (t == e) return true;
+            static constexpr std::uint32_t kZero[] = {
+                0x0ea0c800u, 0x2ea0c800u, 0x0ea0d800u, 0x2ea0d800u, 0x0ea0e800u,
+                0x0ea08800u, 0x2ea08800u, 0x0ea09800u, 0x2ea09800u, 0x0ea0a800u,
+            };
+            const std::uint32_t z = w & 0xbfbffc00u;
+            for (const auto e : kZero)
+                if (z == e) return true;
+        }
+        return (w & 0xbffffc00u) == 0x0f210400u || (w & 0xfffffc00u) == 0x4f410400u;
+    };
+
+    const auto transfer = [&](std::uint32_t mask, std::int32_t i) -> std::uint32_t {
+        const auto& pi = plan_.insts[static_cast<std::size_t>(i)];
+        if (pi.flow == Flow::interpret || pi.conservative_writes ||
+            (pi.family < 0 && (pi.try_family || pi.inst.kind == Kind::unknown)))
+            return 0u;
+        if (pi.vwrites == 0) return mask;
+        const std::uint32_t w = plan_.words[static_cast<std::size_t>(i)];
+        const unsigned rd = w & 31u;
+        bool produces = false;
+        if ((pi.vwrites >> rd) & 1u) {
+            if (is_compare_or_sshr(w)) {
+                produces = true;
+            } else if ((w & 0x9f20fc00u) == 0x0e201c00u) {   // AND/BIC/ORR(MOV)/ORN/EOR/BSL/BIT/BIF (.8B/.16B)
+                const bool u = ((w >> 29) & 1u) != 0;
+                const unsigned size = (w >> 22) & 3u;
+                const unsigned rn = (w >> 5) & 31u, rm = (w >> 16) & 31u;
+                if (!u || size == 0) produces = ((mask >> rn) & (mask >> rm) & 1u) != 0;
+                else produces = ((mask >> rd) & (mask >> rn) & (mask >> rm) & 1u) != 0;
+            } else if ((w & 0xbffffc00u) == 0x2e205800u) {   // NOT (.8B/.16B)
+                produces = ((mask >> ((w >> 5) & 31u)) & 1u) != 0;
+            } else if ((w & 0xbffffc00u) == 0x0f20a400u) {   // SXTL/SXTL2 Vd.2D, Vn.2S/4S
+                produces = ((mask >> ((w >> 5) & 31u)) & 1u) != 0;
+            } else if ((w & 0xbfe0fc00u) == 0x0e000400u) {   // DUP element (.2S/.4S/.2D)
+                const unsigned imm5 = (w >> 16) & 31u;
+                if ((imm5 & 7u) == 4u || (((w >> 30) & 1u) && (imm5 & 15u) == 8u))
+                    produces = ((mask >> ((w >> 5) & 31u)) & 1u) != 0;
+            } else if ((w & 0xbf208c00u) == 0x0e000800u) {   // ZIP/UZP/TRN (.2S/.4S/.2D)
+                const unsigned size = (w >> 22) & 3u, opc = (w >> 12) & 7u;
+                if ((opc & 3u) != 0 && (size == 2 || (size == 3 && ((w >> 30) & 1u))))
+                    produces = ((mask >> ((w >> 5) & 31u)) & (mask >> ((w >> 16) & 31u)) & 1u) != 0;
+            } else {
+                EmitContext::VecValue value{};
+                for (unsigned f = 0; f < table.count; ++f) {
+                    if (const auto* ff = table.families[f].facts; ff && ff->def) {
+                        const auto def = ff->def(w, rd, value);
+                        if (def == FamilyFactDef::lane_masks) {
+                            produces = true;
+                            break;
+                        }
+                        if (def == FamilyFactDef::constant) {
+                            const auto ok32 = [](std::uint32_t v) { return v == 0u || v == 0xffffffffu; };
+                            produces = ok32(static_cast<std::uint32_t>(value.lo)) &&
+                                       ok32(static_cast<std::uint32_t>(value.lo >> 32)) &&
+                                       ok32(static_cast<std::uint32_t>(value.hi)) &&
+                                       ok32(static_cast<std::uint32_t>(value.hi >> 32));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        mask &= ~pi.vwrites;
+        if (produces) mask |= 1u << rd;
+        return mask;
+    };
+
+    const auto walk = [&](bool record) {
+        bool changed = false;
+        for (std::size_t k = 0; k < leaders.size(); ++k) {
+            if (!seen[k]) {
+                if (!record) continue;
+            }
+            std::uint32_t m = seen[k] ? s_.lmask_in[k] : 0u;
+            for (std::int32_t i = leaders[k]; i < n; ++i) {
+                if (i != leaders[k] && s_.lmask_slot[static_cast<std::size_t>(i)] >= 0) break;
+                if (record) s_.lmask_at[static_cast<std::size_t>(i)] = m;
+                m = transfer(m, i);
+                if (record) continue;
+                plan_.for_each_successor(i, [&](std::int32_t t) {
+                    if (t < 0 || t >= n || entry[static_cast<std::size_t>(t)]) return;
+                    const auto slot = s_.lmask_slot[static_cast<std::size_t>(t)];
+                    if (slot < 0) return;
+                    const auto u = static_cast<std::size_t>(slot);
+                    if (!seen[u]) {
+                        seen[u] = 1;
+                        s_.lmask_in[u] = m;
+                        changed = true;
+                    } else if ((s_.lmask_in[u] & m) != s_.lmask_in[u]) {
+                        s_.lmask_in[u] &= m;
+                        changed = true;
+                    }
+                });
+            }
+        }
+        return changed;
+    };
+    for (unsigned round = 0; round < 64; ++round)
+        if (!walk(false)) {
+            walk(true);
+            return;
+        }
+    std::fill(s_.lmask_at.begin(), s_.lmask_at.end(), 0u);
+}
+
 void RegionEmitter::prepare_facts() {
     s_.fact_uses.clear();
     s_.fact_flags.clear();
     s_.fact_checks.clear();
     s_.derived.clear();
+    s_.lmask_at.clear();
     facts_helper_ = false;
     facts_on_ = plan_.vec_facts;
     if (!facts_on_) return;
@@ -3165,6 +3859,7 @@ void RegionEmitter::prepare_facts() {
     static const bool trace = std::getenv("TRANSMUTE_FX_TRACE_FACTS") != nullptr;   // diagnostics
     const auto n = static_cast<std::int32_t>(plan_.insts.size());
     bool preds_built = false;
+    bool lmasks_built = false;
     for (std::int32_t i = 0; i < n; ++i) {
         const auto& pi = plan_.insts[static_cast<std::size_t>(i)];
         if (!(pi.try_family || pi.family >= 0) || pi.flow != Flow::normal) continue;
@@ -3181,6 +3876,18 @@ void RegionEmitter::prepare_facts() {
             for (unsigned k = 0; k < count; ++k) {
                 const auto& w = want[k];
                 if (w.vec >= 32) continue;
+                if (w.k == FamilyFactWant::K::lane_masks) {
+                    if (!lmasks_built) {
+                        lmasks_built = true;
+                        lane_masks_compute();
+                    }
+                    if (trace)
+                        std::fprintf(stderr, "facts: region %llx at %llx v%u lanes:%s\n",
+                                     static_cast<unsigned long long>(plan_.start), static_cast<unsigned long long>(pi.pc),
+                                     static_cast<unsigned>(w.vec),
+                                     ((s_.lmask_at[static_cast<std::size_t>(i)] >> w.vec) & 1u) ? " exact" : " (unknown)");
+                    continue;
+                }
                 if (w.k == FamilyFactWant::K::derived && (!plan_.t2_derived || !wanting[f]->derive)) continue;
                 if (!preds_built) {
                     preds_built = true;
@@ -3302,9 +4009,9 @@ bool RegionEmitter::vec_derived(unsigned index, unsigned kind, x64::Mem& slot) {
 }
 
 bool RegionEmitter::vec_lane_masks(unsigned index) {
-    if (!facts_on_ || !cur_) return false;
-    for (const auto& u : s_.fact_uses)
-        if (u.index == index_ && u.vec == index && u.kind == 2) return true;
+    if (!facts_on_ || !cur_ || index >= 32) return false;
+    if (static_cast<std::size_t>(index_) < s_.lmask_at.size())
+        return ((s_.lmask_at[static_cast<std::size_t>(index_)] >> index) & 1u) != 0;
     return false;
 }
 

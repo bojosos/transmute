@@ -608,6 +608,9 @@ public:
     void vex_is4(VexOp op, Xmm dst, Xmm src1, Xmm src2, Xmm mask, bool l256 = false) {
         vex_rr(op, l256, id(dst), id(src1), id(src2)); db(static_cast<std::uint8_t>(id(mask) << 4));
     }
+    void vex_is4(VexOp op, Xmm dst, Xmm src1, const Mem& src2, Xmm mask, bool l256 = false) {
+        vex_rm(op, l256, id(dst), id(src1), src2, 1); db(static_cast<std::uint8_t>(id(mask) << 4));
+    }
 
     // ---- patching (on live code) --------------------------------------------
     // Rewrites the rel32 at `field` (4-byte aligned) to reach `target`. The

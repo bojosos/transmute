@@ -93,6 +93,7 @@ private:
     std::unordered_map<std::uint64_t, bool> flags_dead_;   // RegionEntry::flags_dead by pc, as entries_
     std::vector<std::uint8_t*> region_hosts_;               // regions[i]'s code in the arena
     std::uint64_t* lookup_{};   // the runtime's size and encoding (fx/runtime/runtime.hpp)
+    std::uint64_t* fast_lookup_{};   // per-thread L1 lookup cache (fx/runtime/runtime.hpp)
     // Table shadows as the runtime keeps them (fx/runtime/table_shadow.cpp):
     // [miss stub] pcs hosts misses, by table base. Filled slots miss to the
     // stub at arena offset 0 (the lookup's miss: ExitReason::lookup_miss).

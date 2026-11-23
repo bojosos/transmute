@@ -603,6 +603,74 @@ FX_TEST(core_write_back_exact_at_faults) {
     VirtualFree(guard, 0, MEM_RELEASE);
 }
 
+// Wave O3/P1: VEH fault exactness on fused load-op (`LDR + EOR`, `ADD + LDR + EOR`,
+// `LDR + CMP`) when the memory access faults on a guard page — pre-fault guest
+// registers (pinned accumulator, unpinned cached destination, base/index, and
+// live host flags) must remain 100% unmodified at the reported fault_pc.
+FX_TEST(core_load_op_fusion_fault_exactness) {
+    auto& r = runner();
+    using namespace a64;
+    auto* guard = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS));
+    FX_REQUIRE(guard);
+    // Variant 0: ADD x8, x9, x10, lsl #2; LDR w8, [x8, #0x80]; EOR w19, w19, w8 (pinned RMW dest)
+    // Variant 1: LDR x8, [x9, #8]; EOR x3, x4, x8 (unpinned dest != other) with live CMP flags before
+    // Variant 2: LDR w8, [x9, #8]; CMP w19, w8; MOV w8, #0 (fused CMP with live pre-fault flags)
+    for (unsigned variant = 0; variant < 3; ++variant) {
+        std::vector<std::uint32_t> prog = {
+            add_imm(true, false, false, 19, 19, 7),         // x19 += 7 (pinned, dirty)
+            add_imm(true, false, false, 3, 3, 11),          // x3 += 11 (unpinned, dirty)
+            add_imm(true, false, false, 4, 4, 13),          // x4 += 13 (unpinned, dirty)
+            add_shift(true, true, true, 0, 2, 0, 1, 31),    // cmp x1, x2 (live host flags)
+        };
+        const std::uint64_t expected_fault_pc = r.program_base() + prog.size() * 4;
+        if (variant == 0) {
+            prog.push_back(add_shift(true, false, false, 0, 10, 2, 9, 8));    // add x8, x9, x10, lsl #2
+            prog.push_back(ldst_uimm(2, 1, 0x20, 8, 8));                      // ldr w8, [x8, #0x80]
+            prog.push_back(logic_shift(false, 2, 0, false, 8, 0, 19, 19));    // eor w19, w19, w8
+            prog.push_back(movw(false, 2, 0, 0, 8));                          // mov w8, #0 (kills w8)
+        } else if (variant == 1) {
+            prog.push_back(ldst_uimm(3, 1, 1, 9, 8));                         // ldr x8, [x9, #8]
+            prog.push_back(logic_shift(true, 2, 0, false, 8, 0, 4, 3));       // eor x3, x4, x8
+            prog.push_back(movw(true, 2, 0, 0, 8));                           // mov x8, #0 (kills x8)
+        } else {
+            prog.push_back(ldst_uimm(2, 1, 2, 9, 8));                         // ldr w8, [x9, #8]
+            prog.push_back(add_shift(false, true, true, 0, 8, 0, 19, 31));    // cmp w19, w8
+            prog.push_back(movw(false, 2, 0, 0, 8));                          // mov w8, #0 (kills w8)
+        }
+        prog.push_back(csel(true, false, 19, 0, 0, 3, 5));                    // csel x5, x3, x19, eq
+        auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
+        std::memcpy(program, prog.data(), prog.size() * 4);
+        program[prog.size()] = brk(0xdead);
+        const BufferCode code(r.code_base(), r.program_base() + (prog.size() + 1) * 4);
+        r.machine.reset();
+        auto ctx = r.context(99200 + variant);
+        ctx.x[9] = reinterpret_cast<std::uint64_t>(guard);
+        ctx.x[10] = 4;
+        const auto initial = ctx;
+        r.machine.prepare(ctx);
+        const auto* host = r.machine.entry_for(r.program_base(), code);
+        FX_REQUIRE(host != nullptr);
+        g_fault = {};
+        g_fault.region = &r.machine.regions.back();
+        g_fault.host = reinterpret_cast<std::uintptr_t>(host) - r.machine.regions.back().entries[0].offset;
+        g_fault.resume = ctx.stub_dispatch_exit;
+        auto* handler = AddVectoredExceptionHandler(1, fault_handler);
+        ctx.pc = r.program_base();
+        r.machine.enter(ctx, host);
+        RemoveVectoredExceptionHandler(handler);
+        FX_REQUIRE(g_fault.hit);
+        FX_CHECK_EQ(g_fault.guest_pc, expected_fault_pc);
+        const auto read_g = [&](unsigned g) {
+            return ((g_fault.in_host >> g) & 1u) ? g_fault.pinned_values[g] : ctx.x[g];
+        };
+        FX_CHECK_EQ(read_g(19), initial.x[19] + 7);
+        FX_CHECK_EQ(read_g(3), initial.x[3] + 11);
+        FX_CHECK_EQ(read_g(4), initial.x[4] + 13);
+        FX_CHECK_EQ(read_g(8), initial.x[8]);
+    }
+    VirtualFree(guard, 0, MEM_RELEASE);
+}
+
 FX_TEST(core_small_regions_linked_and_unlinked) {
     auto& r = runner();
     Rng rng(123);

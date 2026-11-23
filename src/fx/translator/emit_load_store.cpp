@@ -206,18 +206,171 @@ EmitContext::GuestAddress guest_address_of(const Inst& d) {
 }
 } // namespace
 
-void RegionEmitter::e_load_store(const Inst& d) {
+unsigned RegionEmitter::try_fuse_load_alu(const Inst& d, const Mem& m, std::int32_t load_index) {
+    if (!isel_on(isel_no_fold) || d.mem != MemOp::load || (d.size != 2 && d.size != 3) || d.rd >= 31) return 0;
+    if (bool_reader_ >= 0 || flags_saved_) return 0;
+    const auto alu_index = load_index + 1;
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    if (alu_index >= n) return 0;
+    const auto& pl = plan_.insts[static_cast<std::size_t>(load_index)];
+    const auto& pb = plan_.insts[static_cast<std::size_t>(alu_index)];
+    if (pb.leader || pb.pc != pl.pc + 4 || pb.flow != Flow::normal) return 0;
+    const auto& c = pb.inst;
+    const bool is64 = d.size == 3;
+    const unsigned bits = is64 ? 64u : 32u;
+    if (c.sf != is64) return 0;
+
+    // 1. LDR Wt/Xt, [mem]; CMP Wt/Xt, #imm (dead load destination).
+    if (c.kind == Kind::add_sub_imm && c.op == 1 && c.s && c.rd == 31 && c.rn == d.rd &&
+        gpr_dead_after(alu_index, d.rd)) {
+        const auto imm = static_cast<std::int64_t>(c.imm);
+        if (imm == static_cast<std::int32_t>(imm) && (imm != 0 || disp8(m))) {
+            mark_may_fault();
+            a_.alu(x64::Alu::cmp, bits, m, static_cast<std::int32_t>(imm));
+            fault_close();
+            if (!pinned(d.rd)) cache_drop_guest(gc_, d.rd);
+            set_flags(FlagsProducer::sub);
+            return 1;
+        }
+    }
+    // 2. LDR Wt/Xt, [mem]; TST Wt/Xt, #imm (dead load destination; avoid imm32 0/1 AOT pattern).
+    if (c.kind == Kind::logic_imm && c.op == 3 && c.s && c.rd == 31 && c.rn == d.rd &&
+        gpr_dead_after(alu_index, d.rd)) {
+        const auto kval = static_cast<std::uint64_t>(c.imm) & (is64 ? ~0ULL : 0xffffffffULL);
+        const bool fits = is64 ? static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(kval))) == kval
+                               : true;
+        const auto i32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(kval));
+        if (fits && i32 != 0 && i32 != 1) {
+            mark_may_fault();
+            a_.test(bits, m, i32);
+            fault_close();
+            if (!pinned(d.rd)) cache_drop_guest(gc_, d.rd);
+            set_flags(FlagsProducer::logic);
+            return 1;
+        }
+    }
+    // 3. LDR Wt/Xt, [mem]; CMP Wn/Xn, Wt/Xt (or CMP Wt/Xt, Wm/Xm).
+    if (c.kind == Kind::add_sub_shift && c.op == 1 && c.s && c.rd == 31 && c.amount == 0 &&
+        gpr_dead_after(alu_index, d.rd)) {
+        if (c.rm == d.rd && c.rn != d.rd) {
+            const auto nv = val(c.rn);
+            const Gp nr = nv.is_zero() ? zero_reg() : in_reg(nv);
+            mark_may_fault();
+            a_.alu(x64::Alu::cmp, bits, nr, m);
+            fault_close();
+            if (!pinned(d.rd)) cache_drop_guest(gc_, d.rd);
+            set_flags(FlagsProducer::sub);
+            return 1;
+        }
+        if (c.rn == d.rd && c.rm != d.rd) {
+            const auto mv = val(c.rm);
+            const Gp mr = mv.is_zero() ? zero_reg() : in_reg(mv);
+            mark_may_fault();
+            a_.alu(x64::Alu::cmp, bits, m, mr);
+            fault_close();
+            if (!pinned(d.rd)) cache_drop_guest(gc_, d.rd);
+            set_flags(FlagsProducer::sub);
+            return 1;
+        }
+    }
+    // 4. LDR Wt/Xt, [mem]; EOR/ORR/AND/ANDS/ADD/ADDS/SUB/SUBS Wd/Xd, Wn, Wm (unshifted).
+    x64::Alu alu_op = x64::Alu::xor_;
+    FlagsProducer prod = FlagsProducer::logic;
+    bool is_logic = false;
+    unsigned other = 31;
+    if (c.kind == Kind::logic_shift && !c.invert && c.amount == 0 && c.rd < 31) {
+        static constexpr x64::Alu kOps[4] = {x64::Alu::and_, x64::Alu::or_, x64::Alu::xor_, x64::Alu::and_};
+        if (c.rm == d.rd && c.rn != d.rd) other = c.rn;
+        else if (c.rn == d.rd && c.rm != d.rd) other = c.rm;
+        alu_op = kOps[c.op];
+        prod = FlagsProducer::logic;
+        is_logic = true;
+    } else if (c.kind == Kind::add_sub_shift && c.amount == 0 && c.rd < 31) {
+        if (c.op == 0) {
+            if (c.rm == d.rd && c.rn != d.rd) other = c.rn;
+            else if (c.rn == d.rd && c.rm != d.rd) other = c.rm;
+            alu_op = x64::Alu::add;
+            prod = FlagsProducer::add;
+        } else if (c.rm == d.rd && c.rn != d.rd) {
+            other = c.rn;
+            alu_op = x64::Alu::sub;
+            prod = FlagsProducer::sub;
+        }
+    }
+    if (other >= 31) return 0;
+    if (c.rd != d.rd && !gpr_dead_after(alu_index, d.rd)) return 0;
+    // VEH fault exactness: never overwrite a pinned destination before the faulting load-op.
+    if (c.rd != other && pinned(c.rd)) return 0;
+    if (!pinned(c.rd) && pending_gpr_count_ >= std::size(pending_gpr_)) return 0;
+
+    // Materialize live host flags to ctx->nzcv before mark_may_fault() (never
+    // save_flags_around into rax, which would desync fault_flags() on a fault).
+    if (!c.s && keep_flags()) materialize();
+    Gp dd = Gp::none;
+    if (c.rd == other && pinned(c.rd)) {
+        note_write(c.rd);
+        dd = pin(c.rd);
+    } else if (c.rd == other && gc_.host[c.rd] >= 0 &&
+               is_free(x64::gp(static_cast<unsigned>(gc_.host[c.rd]))) &&
+               galias_of_[static_cast<unsigned>(gc_.host[c.rd])] == 0) {
+        const auto h = static_cast<unsigned>(gc_.host[c.rd]);
+        free_gpr_ &= ~(1u << h);
+        note_write(c.rd);
+        dd = x64::gp(h);
+        pending_gpr_[pending_gpr_count_++] = {static_cast<std::uint8_t>(c.rd), dd};
+    } else {
+        dd = alloc();
+        load(bits, dd, val(other));
+        note_write(c.rd);
+        pending_gpr_[pending_gpr_count_++] = {static_cast<std::uint8_t>(c.rd), dd};
+    }
+    mark_may_fault();
+    a_.alu(alu_op, bits, dd, m);
+    fault_close();
+    if (d.rd != c.rd && !pinned(d.rd)) cache_drop_guest(gc_, d.rd);
+    if (!flags_saved_) {
+        zf_inst_ = alu_index;
+        if (is_logic) logic_flags_inst_ = alu_index;
+        zf_guest_ = static_cast<std::uint8_t>(c.rd);
+        zf_bits_ = static_cast<std::uint8_t>(bits);
+    }
+    if (c.s) set_flags(prod);
+    return 1;
+}
+
+unsigned RegionEmitter::e_load_store(const Inst& d, unsigned index_mask_bits, std::int32_t load_index) {
+    if (load_index < 0) load_index = index_;
     const unsigned size = 1u << d.size;
     const bool writeback = d.mode == AddrMode::pre || d.mode == AddrMode::post;
     // Pinned, cached or loaded (read-only); writeback forms keep the register.
     const Gp base = writeback ? in_reg(val(d.rn, true)) : Gp::none;
     const auto imm = static_cast<std::int32_t>(d.imm);
     Mem m;
-    switch (d.mode) {
-    case AddrMode::offset:
-    case AddrMode::reg: m = address(guest_address_of(d)); break;
-    case AddrMode::pre: m = ptr(base, imm); break;
-    case AddrMode::post: m = ptr(base, 0); break;
+    if (index_mask_bits != 0) {
+        const Gp b = in_reg(val(d.rn, true));
+        const auto iv = val(d.rm);
+        const Gp ir = iv.is_reg() ? iv.r : borrow_gpr(iv.g);
+        const Gp idx = alloc();
+        if (index_mask_bits == 8 || index_mask_bits == 16) {
+            if (ir != Gp::none) a_.movzx(32, idx, ir, index_mask_bits);
+            else a_.movzx(32, idx, gmem(iv.g), index_mask_bits);
+        } else {
+            prepare_clobber();
+            if (ir != Gp::none) a_.mov(32, idx, ir);
+            else a_.mov(32, idx, gmem(iv.g));
+            a_.and_(32, idx, static_cast<std::int32_t>((1u << index_mask_bits) - 1u));
+        }
+        m = ptr(b, idx, 1u << d.amount, imm);
+    } else {
+        switch (d.mode) {
+        case AddrMode::offset:
+        case AddrMode::reg: m = address(guest_address_of(d)); break;
+        case AddrMode::pre: m = ptr(base, imm); break;
+        case AddrMode::post: m = ptr(base, 0); break;
+        }
+    }
+    if (!writeback) {
+        if (const auto extra = try_fuse_load_alu(d, m, load_index); extra != 0) return extra;
     }
     if (d.mem == MemOp::store) {
         const auto v = val(d.rd);
@@ -241,6 +394,7 @@ void RegionEmitter::e_load_store(const Inst& d) {
         const auto w = dst(d.rn, true);
         a_.lea(64, w, ptr(base, imm));
     }
+    return 0;
 }
 
 void RegionEmitter::e_load_store_pair(const Inst& d) {
@@ -306,13 +460,58 @@ void RegionEmitter::e_load_store_pair(const Inst& d) {
     }
 }
 
-void RegionEmitter::e_load_literal(const Inst& d) {
-    const auto address = alloc();
-    fixup_imm64(address, static_cast<std::uint64_t>(d.imm));
+unsigned RegionEmitter::e_load_literal(const PlanInst& pi) {
+    const auto& d = pi.inst;
+    const auto target = static_cast<std::uint64_t>(d.imm);
+    auto lit_mem = [&]() -> Mem {
+        // Reuse a free uncached scratch GPR already holding a nearby literal
+        // pool address in the same basic block: avoids repeated 10-byte movabs
+        // on consecutive V8 TurboFan map/constant pool loads while keeping
+        // AOT relocations invariant (relative offset within the same block).
+        if (lit_base_reg_ != Gp::none && is_free(lit_base_reg_) &&
+            !((gc_.mask >> x64::id(lit_base_reg_)) & 1u)) {
+            const auto delta = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(lit_base_pc_);
+            if (delta >= -1048576 && delta <= 1048576) {
+                free_gpr_ &= ~(1u << x64::id(lit_base_reg_));
+                return ptr(lit_base_reg_, static_cast<std::int32_t>(delta));
+            }
+        }
+        const auto address = alloc();
+        fixup_imm64(address, target);
+        lit_base_reg_ = address;
+        lit_base_pc_ = target;
+        return ptr(address, 0);
+    };
+    // Fuse `LDR Wt/Xt, =lit; CMP Wn/Xn, Wt/Xt` when Wt/Xt is dead after CMP:
+    // compares directly against memory [address], avoiding a scratch/cache reg
+    // allocation and eviction while preserving exact live read & FaultSite.
+    const auto n = static_cast<std::int32_t>(plan_.insts.size());
+    if (isel_on(isel_no_fold) && d.rd < 31 && d.mem == MemOp::load && (d.size == 2 || d.size == 3) &&
+        index_ + 1 < n && bool_reader_ < 0 && !flags_saved_) {
+        const auto& pb = plan_.insts[static_cast<std::size_t>(index_) + 1];
+        const auto& c = pb.inst;
+        const bool is_cmp = !pb.leader && pb.pc == pi.pc + 4 && pb.flow == Flow::normal &&
+                            c.kind == Kind::add_sub_shift && c.op == 1 && c.s && c.rd == 31 && c.amount == 0 &&
+                            c.sf == (d.size == 3) && c.rm == d.rd && c.rn != d.rd;
+        if (is_cmp && gpr_dead_after(index_ + 1, d.rd)) {
+            const unsigned bits = d.size == 3 ? 64 : 32;
+            const Mem m = lit_mem();
+            const auto nv = val(c.rn);
+            const Gp nr = nv.is_zero() ? zero_reg() : in_reg(nv);
+            mark_may_fault();
+            a_.alu(x64::Alu::cmp, bits, nr, m);
+            fault_close();
+            if (!pinned(d.rd)) cache_drop_guest(gc_, d.rd);
+            set_flags(FlagsProducer::sub);
+            return 2;
+        }
+    }
+    const Mem m = lit_mem();
     const auto value = d.rd == 31 ? alloc() : dst(d.rd);
     mark_may_fault();
-    access(d, value, ptr(address, 0), 1u << d.size, d.mem, d.sf);
+    access(d, value, m, 1u << d.size, d.mem, d.sf);
     fault_close();
+    return 1;
 }
 
 } // namespace transmute::fx::core

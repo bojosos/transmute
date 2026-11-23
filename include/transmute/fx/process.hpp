@@ -296,6 +296,13 @@ bool release_guest_space(std::uint64_t base, std::uint64_t size);
 // with PAGE_EXECUTE*). Host protection stays non-executable.
 void register_guest_code_memory(std::uint64_t base, std::uint64_t size);
 void unregister_guest_code_memory(std::uint64_t base, std::uint64_t size);
+// (additive) Guest-executable memory whose contract requires explicit
+// instruction-cache invalidation (flush_guest_code / IC IVAU) after code
+// writes, such as Darwin MAP_JIT. Translations inside these ranges skip
+// write-protecting guest pages for SMC faults (TRANSMUTE_FX_MAP_JIT_SMC=1
+// restores write-protection for A/B debugging).
+void register_explicit_flush_code_memory(std::uint64_t base, std::uint64_t size);
+void unregister_explicit_flush_code_memory(std::uint64_t base, std::uint64_t size);
 // True for addresses inside guest images' executable sections or registered
 // guest code memory. Lock-free.
 bool is_guest_code(std::uint64_t address) noexcept;

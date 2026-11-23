@@ -586,6 +586,8 @@ void kill(Region& r, Kill why = Kill::invalidated) {
             const auto host = reinterpret_cast<std::uint64_t>(entry.host_entry);
             if (host >= begin && host < end) entry.host_entry = redispatch;
         }
+        if (ctx.hw_rsb_free < kHwRsbEntries)
+            for (auto& gpc : ctx.hw_rsb_guest) gpc = 1;
     });
     if (why == Kill::evicted) {
         count(g_counters.evicted_regions);
@@ -676,10 +678,32 @@ bool invalidate_locked(std::uint64_t begin, std::uint64_t end, bool restore_prot
     return !victims.empty();
 }
 
+// TRANSMUTE_FX_MAP_JIT_SMC=1: write-protect explicit-flush (MAP_JIT) pages
+// for SMC faults as ordinary code memory (A/B toggle; default: trust explicit
+// flush_guest_code / IC IVAU per the Darwin MAP_JIT contract).
+bool explicit_flush_skip_protect() noexcept {
+    static const bool skip = [] {
+        char value[8] = {};
+        return !(host::get_env("TRANSMUTE_FX_MAP_JIT_SMC", value, sizeof(value)) > 0 && value[0] == '1');
+    }();
+    return skip;
+}
+
+bool page_explicit_flush(std::uint64_t page) {
+    if (!explicit_flush_skip_protect() || !in_explicit_flush_code_memory(page)) return false;
+    if (g_shared_aliases.load(std::memory_order_acquire)) {
+        std::vector<std::uint64_t> aliases;
+        shared_memory_aliases(page, aliases);
+        if (!aliases.empty()) return false;
+    }
+    return true;
+}
+
 // Map lock held exclusively. Write-protects one guest page unless fx already
 // protects it or it is not writable. True if it was writable by the guest.
 bool protect_page(std::uint64_t page) {
     if (g.protected_pages.count(page) || known_readonly(page)) return false;
+    if (page_explicit_flush(page)) return false;
     vm::RegionInfo info;
     if (!vm::query(reinterpret_cast<const void*>(page), info) || !info.committed()) return false;
     const vm::Protection protect = info.protect;
@@ -951,7 +975,8 @@ const void* install(const TranslatedRegion& t, std::uint64_t pc, std::uint64_t e
     if (!source && g.epoch.load(std::memory_order_acquire) != epoch) return nullptr;
     const bool newly_protected = protect_pages(*region);
     if (source && !verify_reads(*source)) return nullptr;                   // modified meanwhile: retry
-    if (source && in_registered_code_memory(pc)) region->guest_hash = guest_bytes_hash(*region);
+    if (source && in_registered_code_memory(pc) && !page_explicit_flush(pc & ~(kPage - 1)))
+        region->guest_hash = guest_bytes_hash(*region);
     if (!source && newly_protected) {
         if (recheck) *recheck = true;
         return nullptr;
@@ -998,6 +1023,10 @@ const void* install(const TranslatedRegion& t, std::uint64_t pc, std::uint64_t e
             for (auto& slot : ctx.rsb)
                 for (const auto& rp : replaced)
                     if (slot.guest_return == rp.pc && slot.host_entry == rp.old_host) slot.host_entry = rp.host;
+            if (ctx.hw_rsb_free < kHwRsbEntries)
+                for (auto& gpc : ctx.hw_rsb_guest)
+                    for (const auto& rp : replaced)
+                        if (gpc == rp.pc) gpc = 1;
         });
         count(g_counters.tier_replaced_entries, replaced.size());
     }
@@ -2127,12 +2156,16 @@ std::unordered_map<const void*, const void*> g_adapters;
 std::unordered_set<const void*> g_adapter_code;
 
 const void* host_entry_adapter(const void* host) {
-    if (translator_register_convention().guest_mask == 0) return host;
     const auto address = reinterpret_cast<std::uint64_t>(host);
     const auto stubs = reinterpret_cast<std::uint64_t>(arena_base());
     if (address - stubs < kStubAreaSize || g_adapter_code.count(host)) return host;
     if (const auto it = g_adapters.find(host); it != g_adapters.end()) return it->second;
     x64::Assembler a(96);
+    // Reset host rsp and hardware RSB before entering host callbacks / ABI
+    // thunks so Win64 SEH unwind info (rsp == ctx->host_rsp) stays exact.
+    a.mov(64, x64::Gp::rsp, x64::ptr(x64::Gp::r15, ctx_disp(offsetof(GuestContext, host_rsp))));
+    a.mov(32, x64::ptr(x64::Gp::r15, ctx_disp(offsetof(GuestContext, hw_rsb_free))),
+          static_cast<std::int32_t>(kHwRsbEntries));
     store_globals(a);
     const x64::Label data = a.new_label();
     a.jmp(x64::rip(data));
@@ -2448,15 +2481,23 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* lea
         fallback = rt::host_entry_adapter(fallback);
     }
     const int lr_host = (conv.guest_mask >> 30) & 1u ? conv.host[30] : -1;
-    x64::Assembler a(256);
-    const x64::Label slow = a.new_label(), miss = a.new_label(), interrupt = a.new_label(), data = a.new_label();
+    x64::Assembler a(320);
+    const x64::Label slow = a.new_label(), miss = a.new_label(), interrupt = a.new_label(),
+                     sw_rsb = a.new_label(), data = a.new_label();
     if ((conv.guest_mask >> 31) & 1u)   // sp for the leaf (Darwin's stack probe)
         a.mov(64, ptr(Gp::r15, x_disp(31)), x64::gp(static_cast<unsigned>(conv.host[31])));
     each_argument([&](x64::Mem slot, Gp host) { a.mov(64, slot, host); });
+    // Align rsp to 16 bytes + 32-byte shadow space while keeping any HW RSB
+    // frames above rsp intact (100% re-entrant).
+    a.mov(64, Gp::rax, Gp::rsp);
+    a.and_(64, Gp::rsp, -16);
+    a.sub(64, Gp::rsp, 48);
+    a.mov(64, ptr(Gp::rsp, 32), Gp::rax);
     a.lea(64, Gp::rcx, ptr(Gp::r15, -kContextBias));
     a.mov_imm64(Gp::rdx, reinterpret_cast<std::uint64_t>(leaf_data));
     a.mov_imm64(Gp::rax, reinterpret_cast<std::uint64_t>(leaf));
     a.call(Gp::rax);
+    a.mov(64, Gp::rsp, ptr(Gp::rsp, 32));
     a.test(8, Gp::rax, Gp::rax);
     a.jcc(x64::Cond::e, slow);
     each_argument([&](x64::Mem slot, Gp host) { a.mov(64, host, slot); });
@@ -2465,6 +2506,18 @@ void register_host_leaf(std::uint64_t guest_pc, HostLeafWithData leaf, void* lea
     else a.mov(64, x30, ptr(Gp::r15, x_disp(30)));
     a.cmp(32, field(offsetof(GuestContext, interrupt_pending)), 0);   // as host_callback_code
     a.jcc(x64::Cond::ne, interrupt);
+    // Hardware RSB hit first (translated BL/BLR callers): paired x64 ret.
+    a.mov(32, Gp::rax, field(offsetof(GuestContext, hw_rsb_free)));
+    a.cmp(32, Gp::rax, static_cast<std::int32_t>(kHwRsbEntries));
+    a.jcc_short(x64::Cond::ae, sw_rsb);
+    a.cmp(64, x30, ptr(Gp::r15, Gp::rax, 8, ctx_disp(offsetof(GuestContext, hw_rsb_guest))));
+    a.jcc_short(x64::Cond::ne, sw_rsb);
+    a.lea(32, Gp::rdx, ptr(Gp::rax, 1));
+    a.mov(32, field(offsetof(GuestContext, hw_rsb_free)), Gp::rdx);
+    a.ret();
+    a.bind(sw_rsb);
+    a.mov(64, Gp::rsp, field(offsetof(GuestContext, host_rsp)));
+    a.mov(32, field(offsetof(GuestContext, hw_rsb_free)), static_cast<std::int32_t>(kHwRsbEntries));
     a.mov(32, Gp::rax, field(offsetof(GuestContext, rsb_top)));
     a.sub(32, Gp::rax, 1);
     a.and_(32, Gp::rax, static_cast<std::int32_t>(kRsbEntries - 1));
@@ -2545,6 +2598,24 @@ void flush_guest_code(std::uint64_t address, std::uint64_t size) {
     const auto end = address + size < address ? ~std::uint64_t{0} : address + size;
     rt::count(rt::g_counters.code_flushes);
     rt::count(rt::g_counters.code_flush_bytes, end - address);
+    // Common case for a guest JIT (V8): flushing newly written code that has
+    // no overlapping translation yet. Check under the shared map lock first so
+    // an empty flush does not stall translators or bump the invalidation epoch.
+    const auto first = address & ~(rt::kPage - 1);
+    if (end - first <= 64 * rt::kPage && !rt::g_shared_aliases.load(std::memory_order_acquire)) {
+        rt::SharedLock shared(rt::g.map);
+        bool needs_exclusive = false;
+        for (auto page = first; page < end && !needs_exclusive; page += rt::kPage) {
+            if (!rt::g.protected_pages.empty() && rt::g.protected_pages.count(page)) {
+                needs_exclusive = true;
+                break;
+            }
+            rt::g.pages.for_each(page, [&](rt::Region* r) {
+                if (rt::overlaps(*r, address, end)) needs_exclusive = true;
+            });
+        }
+        if (!needs_exclusive) return;
+    }
     rt::ExclusiveLock lock(rt::g.map);
     if (rt::invalidate_locked(address, end, true)) rt::count(rt::g_counters.code_flush_hits);
 }

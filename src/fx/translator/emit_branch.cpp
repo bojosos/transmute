@@ -25,21 +25,14 @@ void RegionEmitter::emit_indirect_jump() {
     const auto stub = a_.new_label();
     a_.test(8, Gp::rcx, 3);
     a_.jcc_short(Cond::ne, stub);
-    a_.mov(64, Gp::rax, Gp::rcx);
-    a_.shr(64, Gp::rax, static_cast<std::uint8_t>(kLookupTagShift));   // tag
-    a_.mov(32, Gp::rdx, Gp::rcx);
-    a_.shr(32, Gp::rdx, 2);
-    a_.xor_(32, Gp::rdx, Gp::rax);
-    a_.and_(32, Gp::rdx, static_cast<std::int32_t>((1u << kLookupIndexBits) - 1));
-    a_.mov(64, Gp::r9, ctx_mem(offsetof(GuestContext, lookup_table)));
-    a_.mov(64, Gp::rdx, ptr(Gp::r9, Gp::rdx, 8));                      // entry = tag:offset
-    a_.mov(64, Gp::r9, Gp::rdx);
-    a_.shr(64, Gp::r9, 32);
-    a_.cmp(64, Gp::rax, Gp::r9);
+    a_.mov(32, Gp::rax, Gp::rcx);
+    a_.shr(32, Gp::rax, static_cast<std::uint8_t>(kFastLookupBits));
+    a_.xor_(32, Gp::rax, Gp::rcx);
+    a_.and_(32, Gp::rax, static_cast<std::int32_t>(kFastLookupMask4));
+    a_.mov(64, Gp::r9, ctx_mem(offsetof(GuestContext, fast_lookup)));
+    a_.cmp(64, Gp::rcx, ptr(Gp::r9, Gp::rax, 4));
     a_.jcc_short(Cond::ne, stub);
-    a_.mov(32, Gp::rdx, Gp::rdx);
-    a_.alu(x64::Alu::add, 64, Gp::rdx, ctx_mem(offsetof(GuestContext, arena_base)));
-    a_.jmp(Gp::rdx);
+    a_.jmp(ptr(Gp::r9, Gp::rax, 4, 8));
     a_.bind(stub);
     a_.mov(64, ctx_mem(offsetof(GuestContext, pc)), Gp::rcx);       // the miss path reads it
     a_.jmp(ctx_mem(offsetof(GuestContext, stub_indirect_live)));   // convention registers live
@@ -154,8 +147,27 @@ void RegionEmitter::e_compare_branch(const PlanInst& pi) {
         }
         return;
     }
+    // CSET/CSETM -> CBZ/CBNZ: EFLAGS still hold the condition directly, so
+    // skip prepare_clobber() and test and branch straight off the compare.
+    if (cset_inst_ == index_ - 1 && !pi.leader && cset_guest_ == d.rd && !flags_saved_ && bool_reader_ < 0) {
+        if (is_host(flags_) && !pi.flags_live_in) flags_ = FlagsState::ctx;
+        cond_branch(d.op == 0 ? x64::invert(cset_cond_) : cset_cond_, pi.taken, target, pi.fall, pi.pc + 4);
+        return;
+    }
+    // ALU/shift -> CBZ/CBNZ: host ZF already equals (Rd == 0), so skip
+    // prepare_clobber() and test (preserving live host flags across the branch).
+    const bool reuse_zf = zf_inst_ == index_ - 1 && !pi.leader && zf_guest_ == d.rd && zf_bits_ == bits &&
+                          !flags_saved_ && bool_reader_ < 0;
+    if (reuse_zf) {
+        if (is_host(flags_) && !pi.flags_live_in) flags_ = FlagsState::ctx;
+        cond_branch(d.op == 0 ? Cond::e : Cond::ne, pi.taken, target, pi.fall, pi.pc + 4);
+        return;
+    }
     prepare_clobber();
-    const Gp r = v.is_reg() ? v.r : cached_gpr(v.g);
+    Gp r = v.is_reg() ? v.r : cached_gpr(v.g);
+    if (r == Gp::none && may_cache() && pi.fall == index_ + 1 && (free_gpr_ & ~gc_.mask & ~1u) != 0 &&
+        gpr_read_soon(v.g))
+        r = read_unpinned(v.g);
     if (r != Gp::none) a_.test(bits, r, r);
     else a_.cmp(bits, gmem(v.g), 0);
     cond_branch(d.op == 0 ? Cond::e : Cond::ne, pi.taken, target, pi.fall, pi.pc + 4);
@@ -177,9 +189,19 @@ void RegionEmitter::e_test_branch(const PlanInst& pi) {
         }
         return;
     }
+    // CSET/CSETM -> TBZ/TBNZ #0: bit 0 equals the condition in host EFLAGS.
+    if (bit == 0 && cset_inst_ == index_ - 1 && !pi.leader && cset_guest_ == d.rd && !flags_saved_ &&
+        bool_reader_ < 0) {
+        if (is_host(flags_) && !pi.flags_live_in) flags_ = FlagsState::ctx;
+        cond_branch(d.op == 0 ? x64::invert(cset_cond_) : cset_cond_, pi.taken, target, pi.fall, pi.pc + 4);
+        return;
+    }
     prepare_clobber();
     Cond taken_if_set;
-    const Gp r = v.is_reg() ? v.r : cached_gpr(v.g);
+    Gp r = v.is_reg() ? v.r : cached_gpr(v.g);
+    if (r == Gp::none && may_cache() && pi.fall == index_ + 1 && (free_gpr_ & ~gc_.mask & ~1u) != 0 &&
+        gpr_read_soon(v.g))
+        r = read_unpinned(v.g);
     if (r == Gp::none) {
         a_.test(8, ptr(Gp::r15, x_disp(v.g) + static_cast<std::int32_t>(bit / 8)), static_cast<std::int32_t>(1u << (bit % 8)));
         taken_if_set = Cond::ne;
@@ -206,9 +228,11 @@ void RegionEmitter::e_call(const PlanInst& pi) {
         return;
     }
     const bool indirect = d.kind == Kind::branch_link_reg;
+    const bool hw_rsb = use_hw_rsb();
     // The target first (before x30 changes: BLR x30), while the register
     // cache may still hold it in rax/rdx/r8.
     if (indirect) take_value(Gp::rcx, val(d.rn));
+    else if (hw_rsb) take(Gp::rcx);
     take(Gp::rax);
     take(Gp::rdx);
     take(Gp::r8);
@@ -234,11 +258,107 @@ void RegionEmitter::e_call(const PlanInst& pi) {
     }
     cache_drop_guest(gc_, 30);
     note_write(30);
+    if (hw_rsb) {
+        exit_pins(current_dirty());
+        const auto free_mem = ctx_mem(offsetof(GuestContext, hw_rsb_free));
+        const auto guest_disp = ctx_disp(offsetof(GuestContext, hw_rsb_guest));
+        const bool cont_follows =
+            plan_.cold_layout && plan_.inline_entries && !keep_flags &&
+            pi.continuation == index_ + 1 &&
+            plan_.insts[static_cast<std::size_t>(pi.continuation)].entry &&
+            plan_.insts[static_cast<std::size_t>(pi.continuation)].entry_slot > 0 &&
+            !plan_.insts[static_cast<std::size_t>(pi.continuation)].loop_header;
+        const auto cont_host = [&]() -> x64::Label {
+            if (pi.continuation >= 0)
+                return entry_labels_[static_cast<std::size_t>(
+                    plan_.insts[static_cast<std::size_t>(pi.continuation)].entry_slot)];
+            return add_stub(Stub::K::return_trampoline, FlagsState::ctx, 0, return_pc, -1);
+        };
+        if (indirect) {
+            const auto full = a_.new_label(), do_store = a_.new_label(), do_blr = a_.new_label();
+            a_.mov(32, Gp::rax, free_mem);
+            a_.sub(32, Gp::rax, 1);
+            a_.jcc(Cond::b, full);
+            a_.bind(do_store);
+            a_.mov(32, free_mem, Gp::rax);
+            a_.mov(64, ptr(Gp::r15, Gp::rax, 8, guest_disp), ret_reg);
+            a_.call(do_blr);
+            if (!cont_follows) a_.jmp(cont_host());
+            defer_cold([this, full, do_store, do_blr]() {
+                a_.bind(full);
+                a_.mov(64, Gp::rsp, ctx_mem(offsetof(GuestContext, host_rsp)));
+                a_.mov_imm(Gp::rax, kHwRsbEntries - 1);
+                a_.jmp(do_store);
+                a_.bind(do_blr);
+                if (plan_.inline_cache_entries) emit_inline_cache();
+                else emit_indirect_jump();
+            });
+            return;
+        }
+        const auto exit_flags = flags_;
+        flags_ = FlagsState::ctx;
+        if (keep_flags) {
+            // Preserve live EFLAGS across the HW RSB push using jrcxz + lea.
+            const auto full_local = a_.new_label(), full_cold = a_.new_label(), do_store = a_.new_label();
+            a_.mov(32, Gp::rcx, free_mem);
+            a_.jrcxz_short(full_local);
+            a_.bind(do_store);
+            a_.lea(32, Gp::r8, ptr(Gp::rcx, -1));
+            a_.mov(32, free_mem, Gp::r8);
+            a_.mov(64, ptr(Gp::r15, Gp::r8, 8, guest_disp), ret_reg);
+            defer_cold([this, full_cold, do_store]() {
+                a_.bind(full_cold);
+                a_.mov(64, Gp::rsp, ctx_mem(offsetof(GuestContext, host_rsp)));
+                a_.mov_imm(Gp::rcx, kHwRsbEntries);
+                a_.jmp(do_store);
+            });
+            emit_direct_exit(static_cast<std::uint64_t>(d.imm), 0, exit_flags, false, true);
+            a_.jmp(cont_host());
+            a_.bind(full_local);
+            a_.jmp(full_cold);
+            return;
+        }
+        const auto full = a_.new_label(), do_store = a_.new_label();
+        a_.mov(32, Gp::rcx, free_mem);
+        a_.sub(32, Gp::rcx, 1);
+        a_.jcc(Cond::b, full);
+        a_.bind(do_store);
+        a_.mov(32, free_mem, Gp::rcx);
+        a_.mov(64, ptr(Gp::r15, Gp::rcx, 8, guest_disp), ret_reg);
+        defer_cold([this, full, do_store]() {
+            a_.bind(full);
+            a_.mov(64, Gp::rsp, ctx_mem(offsetof(GuestContext, host_rsp)));
+            a_.mov_imm(Gp::rcx, kHwRsbEntries - 1);
+            a_.jmp(do_store);
+        });
+        emit_direct_exit(static_cast<std::uint64_t>(d.imm), 0, exit_flags, false, true);
+        if (!cont_follows) a_.jmp(cont_host());
+        return;
+    }
     rsb_push(return_pc, pi.continuation, ret_reg);
     exit_pins(current_dirty());
     if (indirect) {
-        if (plan_.inline_cache_entries) emit_inline_cache();
-        else emit_indirect_jump();
+        if (pi.shadow_base >= 0) {
+            // After exit_pins: convention globals are in their convention hosts
+            // (callee-saved, never rcx/rdx/r9) and all other guest GPRs are in context.
+            const auto& conv = translator_register_convention();
+            const auto load_after_exit = [&](Gp dst_reg, unsigned g) {
+                if ((conv.guest_mask >> g) & 1u) {
+                    const auto h = x64::gp(static_cast<unsigned>(conv.host[g]));
+                    if (h != dst_reg) a_.mov(64, dst_reg, h);
+                } else {
+                    a_.mov(64, dst_reg, gmem(g));
+                }
+            };
+            load_after_exit(Gp::rdx, static_cast<unsigned>(pi.shadow_index));
+            load_after_exit(Gp::r9, static_cast<unsigned>(pi.shadow_base));
+            if (pi.shadow_index32) a_.mov(32, Gp::rdx, Gp::rdx);
+            emit_shadow_dispatch(pi);
+        } else if (plan_.inline_cache_entries) {
+            emit_inline_cache();
+        } else {
+            emit_indirect_jump();
+        }
         return;
     }
     // Calls always leave the region: the callee is translated as its own region.
@@ -263,9 +383,20 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
     take(Gp::rdx);
     take(Gp::r8);
     take(Gp::r9);
-    materialize_state(flags_, false);   // clobbers rax only
+    if (pi.flags_live_out) {
+        // Out-of-region direct exits and generic indirect exits accept raw flags
+        // (next entry normalizes via normalize_entry_flags if needed); only an
+        // in-region switch case that reads NZCV requires canonical flags here.
+        bool raw_ok = codegen_on(knob_no_raw_flags);
+        for (std::uint32_t k = 0; k < t.count && raw_ok; ++k) {
+            const auto target = plan_.table_targets[t.first + k];
+            if (target >= 0 && s_.flags_read[static_cast<std::size_t>(target)]) raw_ok = false;
+        }
+        materialize_state(flags_, false, raw_ok);   // clobbers rax only
+    }
     flags_ = FlagsState::ctx;
-    load(64, Gp::rcx, val(pi.inst.rn));          // target
+    const bool direct_bounded = t.proven_bounded && !t.by_target;
+    if (!direct_bounded) load(64, Gp::rcx, val(pi.inst.rn));          // target
     if (!t.by_target) load(32, Gp::rdx, val(t.index_reg));   // index (UXTW)
     reset_cache(gc_);                            // clean (stored): the context holds every value
     reset_cache(vc_);
@@ -274,7 +405,6 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
     // by the checks' jumps: cold with Plan::cold_layout.
     const auto dirty = current_dirty();
     const bool cold = plan_.cold_layout;
-    const auto generic = cold ? add_stub(Stub::K::indirect_exit, FlagsState::ctx, dirty, 0, -1) : a_.new_label();
     auto& ht = host_tables_.emplace_back();
     ht.label = a_.new_label();
     ht.table = pi.table;
@@ -284,6 +414,26 @@ void RegionEmitter::e_table_branch(const PlanInst& pi) {
         return target >= 0 ? multiway_label(target)
                            : add_stub(Stub::K::direct_exit, FlagsState::ctx, dirty, plan_.table_pcs[t.first + k], -1, -1);
     };
+    if (direct_bounded) {
+        // Proven immutable image code + straight-line bound check: wI < count
+        // and every table target is exact, so dispatch directly through a dense
+        // 4-byte host offset table with no bounds/target check or fallback.
+        a_.lea(64, Gp::r8, x64::rip(ht.label));
+        a_.movsx(64, Gp::r9, ptr(Gp::r8, Gp::rdx, 4), 32);
+        a_.add(64, Gp::r9, Gp::r8);
+        a_.jmp(Gp::r9);
+        ht.entries.resize(t.count);
+        for (std::uint32_t k = 0; k < t.count; ++k) {
+            const auto pc = plan_.table_pcs[t.first + k];
+            std::uint32_t same = k;
+            for (std::uint32_t j = 0; j < k && same == k; ++j)
+                if (plan_.table_pcs[t.first + j] == pc) same = j;
+            ht.entries[k] = same != k ? ht.entries[same] : case_label(k);
+        }
+        core_counters().tables.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto generic = cold ? add_stub(Stub::K::indirect_exit, FlagsState::ctx, dirty, 0, -1) : a_.new_label();
     if (t.by_target) {
         // Target dispatch (LLVM tables): d = xN - lo selects host table slot
         // d / 4 when d <= hi - lo and d is aligned; slots of case pcs hold
@@ -420,38 +570,65 @@ void RegionEmitter::patch_host_tables() {
 void RegionEmitter::e_shadow_branch(const PlanInst& pi) {
     // As e_indirect: a target the register cache holds is used in place (take_value).
     take_value(Gp::rcx, val(pi.inst.rn));                                            // target
-    take_value(Gp::rdx, val(static_cast<unsigned>(pi.shadow_index)));                // index
-    take_value(Gp::r9, val(static_cast<unsigned>(pi.shadow_base)));                  // table
+    take_value(Gp::rdx, val(static_cast<unsigned>(pi.shadow_index)));                // index (or handle)
+    take_value(Gp::r9, val(static_cast<unsigned>(pi.shadow_base)));                  // table (or entry ptr)
     if (pi.shadow_index32) a_.mov(32, Gp::rdx, Gp::rdx);
     materialize_state(flags_, false, true);   // a region exit: the raw form; clobbers rax only
     flags_ = FlagsState::ctx;
     exit_pins(current_dirty());
-    constexpr std::int32_t kHost = kTableShadowSlots * 8, kMiss = 2 * kTableShadowSlots * 8;
-    const auto lookup = a_.new_label(), other = a_.new_label(), miss = a_.new_label();
-    a_.cmp(64, Gp::rdx, static_cast<std::int32_t>(kTableShadowSlots));
-    a_.jcc(Cond::ae, lookup);
+    emit_shadow_dispatch(pi);
+}
+
+void RegionEmitter::emit_shadow_dispatch(const PlanInst& pi) {
+    if (pi.shadow_rshift) a_.shr(64, Gp::rdx, pi.shadow_rshift);
+    if (pi.shadow_sub_stride) {
+        a_.mov(64, Gp::rax, Gp::rdx);
+        a_.shl(64, Gp::rax, pi.shadow_sub_stride);
+        a_.sub(64, Gp::r9, Gp::rax);
+    }
+    static_assert((kTableShadowSlots & (kTableShadowSlots - 1)) == 0, "kTableShadowSlots must be power of 2");
+    // Interleaved 16-byte {pc, host} shadow (single cache line per dispatch).
+    // rdx keeps the masked slot index untouched for table_shadow_miss.
+    a_.and_(32, Gp::rdx, static_cast<std::int32_t>(kTableShadowSlots - 1));
+    const auto other = a_.new_label(), miss = a_.new_label();
     a_.cmp(64, Gp::r9, ctx_mem(offsetof(GuestContext, table_shadow_base)));
     a_.jcc(Cond::ne, other);
     a_.mov(64, Gp::rax, ctx_mem(offsetof(GuestContext, table_shadow)));
-    a_.cmp(64, Gp::rcx, ptr(Gp::rax, Gp::rdx, 8));
-    a_.jcc_short(Cond::ne, miss);
-    a_.jmp(ptr(Gp::rax, Gp::rdx, 8, kHost));
-    a_.bind(miss);
-    a_.jmp(ptr(Gp::rax, Gp::rdx, 8, kMiss));
-    a_.bind(other);
-    a_.alu(x64::Alu::sub, 32, ctx_mem(offsetof(GuestContext, table_shadow_retry)), 1);
-    a_.jcc(Cond::ne, lookup);
-    a_.mov(64, ctx_mem(offsetof(GuestContext, table_shadow_base)), Gp::r9);
-    a_.mov(64, Gp::rax, ctx_mem(offsetof(GuestContext, table_shadow)));
-    a_.jmp(ptr(Gp::rax, -8));   // the miss stub
-    a_.bind(lookup);
-    emit_indirect_jump();
+    a_.lea(64, Gp::r9, ptr(Gp::rax, Gp::rdx, 8));
+    a_.cmp(64, Gp::rcx, ptr(Gp::r9, Gp::rdx, 8));
+    a_.jcc(Cond::ne, miss);
+    a_.jmp(ptr(Gp::r9, Gp::rdx, 8, 8));
+    const auto emit_slow = [this, other, miss]() {
+        const auto lookup = a_.new_label();
+        a_.bind(miss);
+        a_.cmp(64, ptr(Gp::r9, Gp::rdx, 8), 1);   // kDisabledPc: colliding/disabled slot -> own inline lookup
+        a_.jcc_short(Cond::e, lookup);
+        a_.jmp(ptr(Gp::rax, -8));                 // table_shadow_miss (rcx = target, rdx = slot)
+        a_.bind(other);
+        a_.alu(x64::Alu::sub, 32, ctx_mem(offsetof(GuestContext, table_shadow_retry)), 1);
+        a_.jcc_short(Cond::ne, lookup);
+        a_.mov(64, ctx_mem(offsetof(GuestContext, table_shadow_base)), Gp::r9);
+        a_.mov(64, Gp::rax, ctx_mem(offsetof(GuestContext, table_shadow)));
+        a_.jmp(ptr(Gp::rax, -8));                 // the miss stub
+        a_.bind(lookup);
+        emit_indirect_jump();
+    };
+    if (plan_.cold_layout && !cold_) defer_cold(emit_slow);
+    else emit_slow();
 }
 
 void RegionEmitter::e_indirect(const PlanInst& pi) {
     const auto& d = pi.inst;
     if (pi.inline_ret) {   // RET X30 of an inlined callee: x30 == link_pc here
-        if (pi.flow == Flow::jump) jump_to(pi.taken, pi.link_pc);
+        if (pi.flow == Flow::jump) {
+            jump_to(pi.taken, pi.link_pc);
+        } else {
+            // Zero-byte fallthrough into the continuation: keep adjacent
+            // CSET/ALU flag forwarding alive across the return boundary.
+            if (cset_inst_ == index_ - 1) cset_inst_ = index_;
+            if (zf_inst_ == index_ - 1) zf_inst_ = index_;
+            if (logic_flags_inst_ == index_ - 1) logic_flags_inst_ = index_;
+        }
         return;            // Flow::normal: the continuation follows
     }
     if (pi.table >= 0) {
@@ -480,6 +657,27 @@ void RegionEmitter::e_indirect(const PlanInst& pi) {
     flags_ = FlagsState::ctx;
     exit_pins(current_dirty());
     if (d.kind == Kind::ret) {
+        if (use_hw_rsb()) {
+            const auto free_mem = ctx_mem(offsetof(GuestContext, hw_rsb_free));
+            const auto guest_disp = ctx_disp(offsetof(GuestContext, hw_rsb_guest));
+            const auto miss = a_.new_label();
+            a_.mov(32, Gp::rax, free_mem);
+            a_.cmp(32, Gp::rax, static_cast<std::int32_t>(kHwRsbEntries));
+            a_.jcc(Cond::ae, miss);
+            a_.cmp(64, target, ptr(Gp::r15, Gp::rax, 8, guest_disp));
+            a_.jcc(Cond::ne, miss);
+            a_.lea(32, Gp::rdx, ptr(Gp::rax, 1));
+            a_.mov(32, free_mem, Gp::rdx);
+            a_.ret();
+            defer_cold([this, miss, target]() {
+                a_.bind(miss);
+                a_.mov(64, Gp::rsp, ctx_mem(offsetof(GuestContext, host_rsp)));
+                a_.mov(32, ctx_mem(offsetof(GuestContext, hw_rsb_free)), static_cast<std::int32_t>(kHwRsbEntries));
+                if (target != Gp::rcx) a_.mov(64, Gp::rcx, target);
+                emit_indirect_jump();
+            });
+            return;
+        }
         // RSB: compare with the top entry, pop and jump directly on a hit.
         // Plan::cold_layout: the miss path (the full lookup) is cold.
         const auto top = ctx_mem(offsetof(GuestContext, rsb_top));
