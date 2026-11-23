@@ -1008,6 +1008,33 @@ unsigned emit_three_same(EmitContext& ctx, std::uint32_t w) {
             const Src ms = rm == rn ? ns : source(ctx, rm);
             const Src ds = rd == rn ? ns : rd == rm ? ms : source(ctx, rd);
             const bool upper_zero = !q && zero_above_64(ctx, rn) && zero_above_64(ctx, rm) && zero_above_64(ctx, rd);
+            // Proven 32-bit all-ones/all-zeros lane mask (FCMxx/CMxx/SSHR #31):
+            // 1 instruction (vblendvps), 0 scratch XMMs, memory second source supported.
+            const unsigned mask_reg = size == 1 ? rd : rm;
+            if (v.avx && ctx.vec_lane_masks(mask_reg)) {
+                Xmm d;
+                if (size == 1) {   // BSL: mask=ds ? ns : ms
+                    const Xmm mr = in_reg(ctx, ms);
+                    const Xmm dr = in_reg(ctx, ds);
+                    d = ctx.write_vec(rd);
+                    if (ns.is_mem) v.a.vex_is4(vop::vblendvps, d, mr, ns.mem, dr);
+                    else v.a.vex_is4(vop::vblendvps, d, mr, ns.reg, dr);
+                } else if (size == 2) {   // BIT: mask=ms ? ns : ds
+                    const Xmm dr = in_reg(ctx, ds);
+                    const Xmm mr = in_reg(ctx, ms);
+                    d = ctx.write_vec(rd);
+                    if (ns.is_mem) v.a.vex_is4(vop::vblendvps, d, dr, ns.mem, mr);
+                    else v.a.vex_is4(vop::vblendvps, d, dr, ns.reg, mr);
+                } else {   // BIF: mask=ms ? ds : ns
+                    const Xmm nr = in_reg(ctx, ns);
+                    const Xmm mr = in_reg(ctx, ms);
+                    d = ctx.write_vec(rd);
+                    if (ds.is_mem) v.a.vex_is4(vop::vblendvps, d, nr, ds.mem, mr);
+                    else v.a.vex_is4(vop::vblendvps, d, nr, ds.reg, mr);
+                }
+                if (!upper_zero) v.finish(d, q);
+                return 1;
+            }
             const Xmm t = v.temp();
             Xmm d;
             if (size == 1) {

@@ -2,6 +2,11 @@
 // multiply-add, unary operations, selects and moves (owner: fp).
 #include "fx/translator/emit_fp_internal.hpp"
 
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <span>
+
 namespace transmute::fx::fpx {
 
 namespace {
@@ -233,36 +238,194 @@ void emit_minmax(FpEmit& e, K kind, Shape s, Xmm out, Xmm a, Xmm b, Xmm u, Xmm v
 }
 
 // FMAX/FMIN/FMAXNM/FMINNM where one operand holds a constant known at
-// translation time (EmitContext::vec_fp_const) that is finite and normal in
-// every element, so never NaN, zero or denormal, and the other operand x can
-// hold no signalling NaN (EmitContext::vec_fp_quiet: an FP arithmetic result
-// or a constant): one x64 min/max, bit-exact for every x with FPCR.DN = 0.
-// x64 returns its second operand on NaN or equality, so FMAXNM/FMINNM put the
-// constant second (a quiet NaN x yields c, as A64 does) and FMAX/FMIN put x
-// second (a quiet NaN x is returned unchanged: A64 returns it quieted, which
-// is the same bits). A tie x == c has no +-0 case (c is non-zero) and returns
-// equal bits; a denormal x under FZ is flushed by both lowerings.
+// translation time (EmitContext::vec_fp_const):
+//  - finite normal constant + quiet x: one x64 min/max, bit-exact for every x.
+//  - FMAXNM(x, +0.0) / FMINNM(x, -0.0) + quiet x: one x64 vmax(x, +0.0) /
+//    vmin(x, -0.0), bit-exact (-0/+0 tie and qNaN both return the 2nd operand).
+//  - scalar FMAX(x, +0.0) / FMIN(x, -0.0) + quiet x (dead flags, cold defer):
+//    `ucomis x, x; jp cold; vmax/vmin d, x, c` (2-3 insns hot).
+//  - finite normal or +-0.0 constant + ANY x (dead flags, cold defer):
+//    check NaN on x alone -> 1 single x64 min/max (ordered so +-0 tie yields
+//    A64's exact sign) -> deferred bit-exact FPProcessNaNs cold stub.
 // TRANSMUTE_FX_FP=noconstminmax.
 bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     const unsigned es = s.es;
+    const bool nm = in.k == K::fmaxnm || in.k == K::fminnm;
+    const bool is_max = in.k == K::fmax || in.k == K::fmaxnm;
+    const bool dbl = s.dbl();
+    const std::uint64_t sign_bit = FpEmit::sign_bits(es);
     const auto normal = [es](std::uint64_t v) {
         const unsigned exp = es == 32 ? static_cast<unsigned>((v >> 23) & 0xffu) : static_cast<unsigned>((v >> 52) & 0x7ffu);
         return exp != 0 && exp != (es == 32 ? 0xffu : 0x7ffu);
     };
+    const auto exact_zero = [is_max, sign_bit](std::uint64_t v) {
+        return is_max ? (v == 0) : (v == sign_bit);
+    };
+    const auto any_zero = [sign_bit](std::uint64_t v) { return v == 0 || v == sign_bit; };
     const unsigned span = s.scalar ? es : w;
-    const auto usable = [&](unsigned c_reg, unsigned x_reg) {
+    enum class Match { none, one_insn, scalar_zero_nan, deferred_single };
+    std::uint64_t matched_c = 0;
+    const auto classify = [&](unsigned c_reg, unsigned x_reg) -> Match {
         std::uint64_t c = 0;
-        return e.ctx.vec_fp_const(c_reg, es, span, c) && normal(c) && e.ctx.vec_fp_quiet(x_reg, es);
+        if (!e.ctx.vec_fp_const(c_reg, es, span, c)) return Match::none;
+        const bool is_norm = normal(c);
+        if (!is_norm && !any_zero(c)) return Match::none;
+        matched_c = c;
+        if (e.ctx.vec_fp_quiet(x_reg, es)) {
+            if (is_norm) return Match::one_insn;
+            if (exact_zero(c)) {
+                if (nm) return Match::one_insn;
+                if (s.scalar && e.ctx.can_defer_cold() && !e.ctx.host_flags_live()) return Match::scalar_zero_nan;
+            }
+        }
+        if (fp_on(fp_old_minmax) && e.ctx.can_defer_cold() && !e.ctx.host_flags_live()) return Match::deferred_single;
+        return Match::none;
     };
     unsigned cr = in.rm, xr = in.rn;
-    if (!usable(in.rm, in.rn)) {
-        if (!usable(in.rn, in.rm)) return false;
-        cr = in.rn;
-        xr = in.rm;
+    Match match = classify(in.rm, in.rn);
+    if (match == Match::none || (match == Match::deferred_single && in.rn != in.rm)) {
+        const std::uint64_t first_c = matched_c;
+        const Match alt = classify(in.rn, in.rm);
+        if (alt != Match::none && (match == Match::none || (match == Match::deferred_single && alt != Match::deferred_single))) {
+            match = alt;
+            cr = in.rn;
+            xr = in.rm;
+        } else {
+            matched_c = first_c;
+        }
     }
-    const bool nm = in.k == K::fmaxnm || in.k == K::fminnm;
-    const bool is_max = in.k == K::fmax || in.k == K::fmaxnm;
+    if (match == Match::none) return false;
     const Xmm x = e.vec(xr), cv = e.vec(cr);
+    if (match == Match::scalar_zero_nan) {
+        e.ctx.clobber_host_flags();
+        const bool zero = e.zero_above(xr, w);
+        const Xmm d = e.dest(in.rd);
+        const Label done = e.as.new_label();
+        e.ucomi(dbl, x, x, false);
+        if (d == x) {
+            e.as.jcc_short(Cond::p, done);
+            e.op(s.pick(is_max ? fops::max : fops::min), d, x, cv);
+            e.as.bind(done);
+        } else {
+            const Label cold = e.as.new_label();
+            e.as.jcc(Cond::p, cold);
+            e.op(s.pick(is_max ? fops::max : fops::min), d, x, cv);
+            e.as.bind(done);
+            x64::Assembler* as = &e.as;
+            const bool avx = e.avx();
+            e.ctx.defer_cold([as, avx, d, x, cold, done] {
+                as->bind(cold);
+                if (avx) as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(x));
+                else as->movaps(d, x);
+                as->jmp(done);
+            });
+        }
+        if (!zero) e.zero_upper(d, w);
+        return true;
+    }
+    if (match == Match::deferred_single) {
+        e.ctx.clobber_host_flags();
+        const Xmm a = (xr == in.rn) ? x : cv;
+        const Xmm b = (xr == in.rm) ? x : cv;
+        const Xmm t0 = e.tmp();
+        const Gp g = (!s.scalar && w == 64) ? e.gtmp() : Gp::none;
+        const Xmm d = e.dest(in.rd);
+        const SseOp mm = s.pick(is_max ? fops::max : fops::min), cmp = s.pick(fops::cmp);
+        const SseOp and_ = s.pick(fops::and_), or_ = s.pick(fops::or_), andn = s.pick(fops::andn);
+        const Label cold = e.as.new_label(), done = e.as.new_label();
+        // c is known finite (never NaN): check NaN on x alone.
+        if (s.scalar) {
+            e.ucomi(dbl, x, x, false);
+            e.as.jcc(Cond::p, cold);
+        } else if (w == 128) {
+            e.op_i(cmp, t0, x, x, pred_unord);
+            e.as.vex_rr(vex_of(op::ptest), false, x64::id(t0), 0, x64::id(t0));
+            e.as.jcc(Cond::ne, cold);
+        } else {
+            e.op_i(cmp, t0, x, x, pred_unord);
+            e.movq(g, t0);
+            e.as.test(64, g, g);
+            e.as.jcc(Cond::ne, cold);
+        }
+        // x is guaranteed non-NaN here. Order (first, second) so that a +-0 tie
+        // returns the A64-exact signed zero (x64 returns the 2nd operand on tie).
+        const bool c_second = normal(matched_c) || exact_zero(matched_c);
+        e.op(mm, d, c_second ? x : cv, c_second ? cv : x);
+        e.as.bind(done);
+        const bool zero = s.scalar ? (e.zero_above(in.rn, w) && e.zero_above(in.rm, w)) : w == 128;
+        if (!zero) e.zero_upper(d, w);
+
+        const Mem quiet = e.ksplat(es, dbl ? 0x0008000000000000ull : 0x00400000ull);
+        const bool alias = d == a || d == b;
+        std::uint32_t used = (1u << x64::id(a)) | (1u << x64::id(b)) | (1u << x64::id(d)) | (1u << x64::id(t0));
+        const auto pick_free = [&]() {
+            for (unsigned r = 0; r < 16; ++r) {
+                if (!((used >> r) & 1u)) {
+                    used |= 1u << r;
+                    return x64::xmm(r);
+                }
+            }
+            throw std::logic_error("fp: no free xmm for cold const minmax stub");
+        };
+        const Xmm t1 = pick_free(), t2 = pick_free();
+        const Xmm T = alias ? pick_free() : d;
+        auto* const as = &e.as;
+        const std::uint8_t shift = dbl ? 12 : 9;
+        const SseOp max_op = s.pick(fops::max);
+
+        e.ctx.defer_cold([=]() {
+            const auto vspill = [](unsigned slot) {
+                return x64::ptr(Gp::r15, ctx_disp(offsetof(GuestContext, vspill) + 16u * slot));
+            };
+            const auto vop_rr = [as](SseOp o, Xmm dst, Xmm s1, Xmm s2) {
+                as->vex_rr(vex_of(o), false, x64::id(dst), x64::id(s1), x64::id(s2));
+            };
+            const auto vop_rm = [as](SseOp o, Xmm dst, Xmm s1, const Mem& s2) {
+                as->vex_rm(vex_of(o), false, x64::id(dst), x64::id(s1), s2);
+            };
+            const auto vop_rri = [as](SseOp o, Xmm dst, Xmm s1, Xmm s2, std::uint8_t imm) {
+                as->vex_rr(vex_of(o), false, x64::id(dst), x64::id(s1), x64::id(s2));
+                as->db(imm);
+            };
+            const auto vshl = [as, dbl, shift](Xmm dst, Xmm src) {
+                as->vex_rr(VexOp{1, 1, static_cast<std::uint8_t>(dbl ? 0x73 : 0x72), false}, false, 6, x64::id(dst),
+                           x64::id(src));
+                as->db(shift);
+            };
+
+            as->bind(cold);
+            as->movups(vspill(28), t1);
+            as->movups(vspill(29), t2);
+            if (alias) as->movups(vspill(30), T);
+
+            vop_rri(cmp, t0, a, a, pred_unord);
+            vop_rri(cmp, t1, b, b, pred_unord);
+            vshl(t2, b);
+            vop_rr(andn, t2, t2, t1);
+            vop_rr(andn, t2, t2, nm ? t1 : t0);
+            vshl(T, a);
+            vop_rr(andn, T, T, t0);
+            vop_rr(or_, t2, t2, T);
+            vop_rm(and_, T, t0, quiet);
+            vop_rr(or_, T, T, a);
+            vop_rr(or_, t0, t0, t1);
+            vop_rm(and_, t1, t1, quiet);
+            vop_rr(or_, t1, t1, b);
+            as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, t1, t1, T, t2);
+            if (nm) vop_rr(max_op, t1, t1, t1);
+            vop_rr(mm, T, a, b);
+            vop_rr(mm, t2, b, a);
+            vop_rr(is_max ? and_ : or_, T, T, t2);
+            as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, T, T, t1, t0);
+            if (alias) as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(T));
+
+            if (alias) as->movups(T, vspill(30));
+            as->movups(t2, vspill(29));
+            as->movups(t1, vspill(28));
+            as->jmp(done);
+        });
+        return true;
+    }
     const unsigned first = nm ? xr : cr;   // a scalar result takes its upper lanes from here
     const bool zero = s.scalar ? e.zero_above(first, w) : w == 128;
     const Xmm d = e.dest(in.rd);
@@ -459,9 +622,148 @@ void minmax_exact_core(FpEmit& e, K kind, Shape s, unsigned width, Xmm T, Xmm a,
     e.as.bind(done);
 }
 
+// Out-of-line NaN fixup for AVX bit-exact min/max (when ctx.can_defer_cold()):
+// Fast path checks NaN first (leaving a, b intact) and runs numeric min/max
+// using ONLY 1 XMM temp (t0), 0 alias moves, 0 taken branches, and 0 GPRs
+// when host flags are dead (scalar: vucomiss/sd + jp; 128-bit vector: vptest
+// + jnz). Cold stub saves/restores 2-3 XMMs to GuestContext::vspill[28..30].
+void minmax_exact_deferred(FpEmit& e, K kind, Shape s, unsigned width, Xmm d, Xmm a, Xmm b, Xmm t0,
+                           bool flags_live, const LaneGuard& guard) {
+    const bool nm = kind == K::fmaxnm || kind == K::fminnm;
+    const bool is_max = kind == K::fmax || kind == K::fmaxnm;
+    const bool dbl = s.dbl();
+    const SseOp mm = s.pick(is_max ? fops::max : fops::min), cmp = s.pick(fops::cmp);
+    const SseOp and_ = s.pick(fops::and_), or_ = s.pick(fops::or_), andn = s.pick(fops::andn);
+
+    const auto cold = e.as.new_label(), done = e.as.new_label();
+    if (!flags_live) {
+        if (s.scalar) {
+            e.ucomi(dbl, a, b, false);
+            e.as.jcc(x64::Cond::p, cold);
+        } else if (width == 128) {
+            e.op_i(cmp, t0, a, b, pred_unord);
+            e.as.vex_rr(vex_of(op::ptest), false, x64::id(t0), 0, x64::id(t0));
+            e.as.jcc(x64::Cond::ne, cold);
+        } else {
+            e.op_i(cmp, t0, a, b, pred_unord);
+            e.movq(guard.reg, t0);
+            e.as.test(64, guard.reg, guard.reg);
+            e.as.jcc(x64::Cond::ne, cold);
+        }
+    } else {
+        e.op_i(cmp, t0, a, b, pred_unord);
+        if (s.scalar) {
+            if (dbl) e.movq(guard.reg, t0);
+            else e.movd(guard.reg, t0);
+        } else if (width == 64) {
+            e.movq(guard.reg, t0);
+        } else {
+            e.as.movmskps(guard.reg, t0);
+        }
+        if (guard.jrcxz) {
+            const auto fast = e.as.new_label();
+            e.as.jrcxz_short(fast);
+            e.as.jmp(cold);
+            e.as.bind(fast);
+        } else {
+            e.as.test(64, guard.reg, guard.reg);
+            e.as.jcc(x64::Cond::ne, cold);
+        }
+    }
+
+    // Numeric fast path: safe even when d == a or d == b (t0 != a, b, d).
+    e.op(mm, t0, b, a);
+    e.op(mm, d, a, b);
+    e.op(is_max ? and_ : or_, d, d, t0);
+    e.as.bind(done);
+
+    const Mem quiet = e.ksplat(s.es, dbl ? 0x0008000000000000ull : 0x00400000ull);
+    const bool alias = d == a || d == b;
+    std::uint32_t used = (1u << x64::id(a)) | (1u << x64::id(b)) | (1u << x64::id(d)) | (1u << x64::id(t0));
+    const auto pick_free = [&]() {
+        for (unsigned r = 0; r < 16; ++r) {
+            if (!((used >> r) & 1u)) {
+                used |= 1u << r;
+                return x64::xmm(r);
+            }
+        }
+        throw std::logic_error("fp: no free xmm for cold minmax stub");
+    };
+    const Xmm t1 = pick_free(), t2 = pick_free();
+    const Xmm T = alias ? pick_free() : d;
+    auto* const as = &e.as;
+    const std::uint8_t shift = dbl ? 12 : 9;
+    const SseOp max_op = s.pick(fops::max);
+
+    e.ctx.defer_cold([=]() {
+        const auto vspill = [](unsigned slot) {
+            return x64::ptr(Gp::r15, ctx_disp(offsetof(GuestContext, vspill) + 16u * slot));
+        };
+        const auto vop_rr = [as](SseOp o, Xmm dst, Xmm s1, Xmm s2) {
+            as->vex_rr(vex_of(o), false, x64::id(dst), x64::id(s1), x64::id(s2));
+        };
+        const auto vop_rm = [as](SseOp o, Xmm dst, Xmm s1, const Mem& s2) {
+            as->vex_rm(vex_of(o), false, x64::id(dst), x64::id(s1), s2);
+        };
+        const auto vop_rri = [as](SseOp o, Xmm dst, Xmm s1, Xmm s2, std::uint8_t imm) {
+            as->vex_rr(vex_of(o), false, x64::id(dst), x64::id(s1), x64::id(s2));
+            as->db(imm);
+        };
+        const auto vshl = [as, dbl, shift](Xmm dst, Xmm src) {
+            as->vex_rr(VexOp{1, 1, static_cast<std::uint8_t>(dbl ? 0x73 : 0x72), false}, false, 6, x64::id(dst), x64::id(src));
+            as->db(shift);
+        };
+
+        as->bind(cold);
+        as->movups(vspill(28), t1);
+        as->movups(vspill(29), t2);
+        if (alias) as->movups(vspill(30), T);
+
+        vop_rri(cmp, t0, a, a, pred_unord);   // na
+        vop_rri(cmp, t1, b, b, pred_unord);   // nb
+        vshl(t2, b);
+        vop_rr(andn, t2, t2, t1);             // sb
+        vop_rr(andn, t2, t2, nm ? t1 : t0);   // ~sb & nb (NM) / ~sb & na
+        vshl(T, a);
+        vop_rr(andn, T, T, t0);               // sa
+        vop_rr(or_, t2, t2, T);               // a wins
+        vop_rm(and_, T, t0, quiet);
+        vop_rr(or_, T, T, a);                 // a, quieted if NaN
+        vop_rr(or_, t0, t0, t1);              // NaN lanes
+        vop_rm(and_, t1, t1, quiet);
+        vop_rr(or_, t1, t1, b);               // b, quieted if NaN
+        as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, t1, t1, T, t2);
+        if (nm) vop_rr(max_op, t1, t1, t1);
+        vop_rr(mm, T, a, b);
+        vop_rr(mm, t2, b, a);
+        vop_rr(is_max ? and_ : or_, T, T, t2);
+        as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, T, T, t1, t0);
+        if (alias) as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(T));
+
+        if (alias) as->movups(T, vspill(30));
+        as->movups(t2, vspill(29));
+        as->movups(t1, vspill(28));
+        as->jmp(done);
+    });
+}
+
 void emit_minmax_exact(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     const Xmm a = e.vec(in.rn), b = e.vec(in.rm);
     const bool zero = s.scalar ? e.zero_above(in.rn, w) && e.zero_above(in.rm, w) : w == 128;
+    if (e.ctx.can_defer_cold()) {
+        const bool flags_live = e.ctx.host_flags_live();
+        LaneGuard guard{};
+        if (flags_live) guard = lane_guard(e);
+        else {
+            e.ctx.clobber_host_flags();
+            if (!s.scalar && w == 64) guard = {e.gtmp(), false};
+        }
+        const Xmm t0 = e.tmp();
+        const Xmm d = e.dest(in.rd);
+        minmax_exact_deferred(e, in.k, s, w, d, a, b, t0, flags_live, guard);
+        if (!zero) e.zero_upper(d, w);
+        return;
+    }
     // Every register before the first label: the guard GPR, the temps, Vd.
     const auto guard = lane_guard(e);
     const Xmm t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
@@ -471,6 +773,520 @@ void emit_minmax_exact(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     minmax_exact_core(e, in.k, s, w, T, a, b, t0, t1, t2, guard);
     if (alias) e.mov(d, T);
     if (!zero) e.zero_upper(d, w);
+}
+
+// Batched NaN check for 2..8 consecutive 128-bit FMAX/FMIN/FMAXNM/FMINNM ops
+// of the same element size (AVX, cold deferral, dead host flags), optionally
+// bridged by pure 128-bit FNEG/FABS/FCMEQ/FCMGE/FCMGT ops whose destinations
+// do not feed a later minmax step (e.g. min3 -> fneg/fcmge -> max3 on the same
+// 3 inputs). Read-only context-slot inputs stay in memory when scratch XMMs
+// are tight so 6-op BVH8 slab chains fuse under a single vptest+jne instead of
+// splitting. If any minmax input is NaN, the cold stub replays every step in
+// exact program order with bit-exact FPProcessNaNs on the intact inputs.
+unsigned emit_minmax_chain(FpEmit& e, std::span<const std::uint32_t> words) {
+    if (words.size() < 2 || !e.avx() || fp_tiny_before_on() || !fp_on(fp_old_minmax) || !e.ctx.can_defer_cold() ||
+        e.ctx.host_flags_live())
+        return 0;
+    const auto is_vec128_mm = [](const Inst& in) {
+        return (in.k == K::fmax || in.k == K::fmin || in.k == K::fmaxnm || in.k == K::fminnm) && !in.sh.scalar &&
+               in.sh.q && (in.sh.es == 32 || in.sh.es == 64);
+    };
+    const auto is_vec128_pass = [](const Inst& in, unsigned es) {
+        return (in.k == K::fneg || in.k == K::fabs || in.k == K::fcmeq || in.k == K::fcmge || in.k == K::fcmgt) &&
+               !in.sh.scalar && in.sh.q && in.sh.es == es;
+    };
+    constexpr unsigned kMaxChain = 16;
+    Inst chain[kMaxChain];
+    if (!decode(words[0], chain[0]) || !is_vec128_mm(chain[0])) return 0;
+    const Shape s = chain[0].sh;
+    const unsigned es = s.es;
+    const bool dbl = s.dbl();
+    // Preserve 1-instruction constant-operand minmax when it applies to words[0].
+    if (fp_on(fp_no_const_minmax)) {
+        std::uint64_t dummy = 0;
+        if ((e.ctx.vec_fp_const(chain[0].rm, es, 128, dummy) && e.ctx.vec_fp_quiet(chain[0].rn, es)) ||
+            (e.ctx.vec_fp_const(chain[0].rn, es, 128, dummy) && e.ctx.vec_fp_quiet(chain[0].rm, es)))
+            return 0;
+    }
+
+    const unsigned avail = e.ctx.vec_scratch_avail();
+    const auto has_two_mem = [&](unsigned cur_len, std::uint32_t mem_mask) -> bool {
+        if (mem_mask == 0) return false;
+        std::uint32_t w = 0;
+        for (unsigned k = 0; k < cur_len; ++k) {
+            const bool unary = chain[k].k == K::fneg || chain[k].k == K::fabs;
+            if (!unary) {
+                const bool a_mem = ((mem_mask & ~w) >> chain[k].rn) & 1u;
+                const bool b_mem = ((mem_mask & ~w) >> chain[k].rm) & 1u;
+                if (a_mem && b_mem) return true;
+            }
+            w |= 1u << chain[k].rd;
+        }
+        return false;
+    };
+    const auto min_scratch = [&](unsigned cur_len, std::uint32_t in_mask, std::uint32_t nan_mask,
+                                 std::uint32_t dst_mask, unsigned& unpinned_dests) -> unsigned {
+        unpinned_dests = 0;
+        unsigned sc = 0;
+        std::uint32_t slot_mask = 0;
+        Mem dummy{};
+        for (std::uint32_t m = dst_mask; m; m &= m - 1) {
+            const auto g = static_cast<unsigned>(std::countr_zero(m));
+            if (e.ctx.vec_pinned(g)) continue;
+            ++unpinned_dests;
+            ++sc;
+            if (((in_mask >> g) & 1u) && e.ctx.vec_write_deferred(g)) ++sc;
+        }
+        for (std::uint32_t m = in_mask & ~dst_mask; m; m &= m - 1) {
+            const auto g = static_cast<unsigned>(std::countr_zero(m));
+            if (e.ctx.vec_pinned(g)) continue;
+            if (e.ctx.vec_slot(g, dummy)) slot_mask |= 1u << g;
+            else ++sc;
+        }
+        // During the NaN check (before any step writes), any pure-destination
+        // register (dst_mask & ~in_mask) can double as t1_nan. A dedicated t1
+        // scratch register is only required for a 2-memory-operand step, or
+        // when >2 NaN inputs exist with no pure destination to borrow.
+        const bool need_dedicated_t1 =
+            has_two_mem(cur_len, slot_mask) || (std::popcount(nan_mask) > 2 && (dst_mask & ~in_mask) == 0);
+        sc += need_dedicated_t1 ? 2u : 1u;   // t0 [, t1]
+        return sc;
+    };
+
+    std::uint32_t all_inputs = (1u << chain[0].rn) | (1u << chain[0].rm);
+    std::uint32_t nan_inputs = all_inputs;
+    std::uint32_t all_dests = 1u << chain[0].rd;
+    std::uint32_t pass_dests = 0;
+    unsigned cur_unpinned_dests = 0;
+    if (min_scratch(1, all_inputs, nan_inputs, all_dests, cur_unpinned_dests) > avail || cur_unpinned_dests > 8)
+        return 0;
+
+    unsigned best_len = 1, best_mm = 1;
+    std::uint32_t best_all_in = all_inputs, best_nan_in = nan_inputs, best_dests = all_dests;
+    unsigned num_mm = 1;
+
+    const auto max_len = std::min<std::size_t>(words.size(), kMaxChain);
+    for (unsigned i = 1; i < max_len; ++i) {
+        Inst in;
+        if (!decode(words[i], in)) break;
+        const bool is_mm = is_vec128_mm(in) && in.sh.es == es;
+        const bool is_pass = !is_mm && is_vec128_pass(in, es);
+        if (!is_mm && !is_pass) break;
+        const bool unary = in.k == K::fneg || in.k == K::fabs;
+        const std::uint32_t reads = (1u << in.rn) | (unary ? 0u : (1u << in.rm));
+        if (is_mm && (reads & pass_dests) != 0) break;
+        const std::uint32_t new_in = reads & ~all_dests;
+        const std::uint32_t cand_all_in = all_inputs | new_in;
+        const std::uint32_t cand_nan_in = nan_inputs | (is_mm ? new_in : 0u);
+        const std::uint32_t cand_dests = all_dests | (1u << in.rd);
+        chain[i] = in;
+        unsigned ud = 0;
+        if (std::popcount(cand_all_in) > 16 ||
+            min_scratch(i + 1, cand_all_in, cand_nan_in, cand_dests, ud) > avail || ud > 8)
+            break;
+        all_inputs = cand_all_in;
+        nan_inputs = cand_nan_in;
+        all_dests = cand_dests;
+        if (is_mm) {
+            pass_dests &= ~(1u << in.rd);
+            ++num_mm;
+            best_len = i + 1;
+            best_mm = num_mm;
+            best_all_in = all_inputs;
+            best_nan_in = nan_inputs;
+            best_dests = all_dests;
+        } else {
+            pass_dests |= 1u << in.rd;
+            // Absorb a trailing compare (FCMEQ/FCMGE/FCMGT) consuming a chain
+            // minmax result so sign-of-zero-dead analysis can see it.
+            if (num_mm >= 2 && (in.k == K::fcmeq || in.k == K::fcmge || in.k == K::fcmgt) &&
+                (reads & all_dests) != 0) {
+                best_len = i + 1;
+                best_mm = num_mm;
+                best_all_in = all_inputs;
+                best_nan_in = nan_inputs;
+                best_dests = all_dests;
+            }
+        }
+    }
+    if (best_mm < 2) return 0;
+
+    const unsigned len = best_len;
+    all_inputs = best_all_in;
+    nan_inputs = best_nan_in;
+    all_dests = best_dests;
+    // Sign-of-zero deadness for each minmax step: on non-NaN inputs, a single
+    // x64 vmin/vmax differs from A64 FMIN/FMAX only in the sign of zero when
+    // pairing +0.0 and -0.0. If every consumer of step i's destination is
+    // sign-of-zero insensitive (FCMEQ/FCMGE/FCMGT/FABS, or another sz_dead
+    // minmax step) and the destination is overwritten before escaping (or
+    // dead immediately after the chain), one vmin/vmax is bit-exact.
+    bool sz_dead[kMaxChain]{};
+    for (unsigned i = len; i-- > 0;) {
+        if (!is_vec128_mm(chain[i])) continue;
+        const unsigned g = chain[i].rd;
+        bool dead = true;
+        bool overwritten = false;
+        for (unsigned j = i + 1; j < len; ++j) {
+            const auto& cj = chain[j];
+            const bool unary = cj.k == K::fneg || cj.k == K::fabs;
+            if (cj.rn == g || (!unary && cj.rm == g)) {
+                const bool insens = cj.k == K::fcmeq || cj.k == K::fcmge || cj.k == K::fcmgt || cj.k == K::fabs ||
+                                    (is_vec128_mm(cj) && sz_dead[j]);
+                if (!insens) {
+                    dead = false;
+                    break;
+                }
+            }
+            if (cj.rd == g) {
+                overwritten = true;
+                break;
+            }
+        }
+        if (dead && !overwritten) dead = e.ctx.vec_sz_dead_after(len, g, es);
+        sz_dead[i] = dead;
+    }
+    // Drop inputs proven to hold a non-NaN constant (finite or +/-inf).
+    for (std::uint32_t m = nan_inputs; m; m &= m - 1) {
+        const auto g = static_cast<unsigned>(std::countr_zero(m));
+        std::uint64_t cbits = 0;
+        if (e.ctx.vec_fp_const(g, es, 128, cbits)) {
+            const bool is_nan =
+                dbl ? ((cbits & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (cbits & 0x000fffffffffffffull) != 0)
+                    : ((cbits & 0x7f800000u) == 0x7f800000u && (cbits & 0x007fffffu) != 0);
+            if (!is_nan) nan_inputs &= ~(1u << g);
+        }
+    }
+
+    // Count how many times each initial input is read before being overwritten.
+    unsigned read_uses[32]{};
+    {
+        std::uint32_t written = 0;
+        for (unsigned i = 0; i < len; ++i) {
+            const bool unary = chain[i].k == K::fneg || chain[i].k == K::fabs;
+            if (!((written >> chain[i].rn) & 1u)) ++read_uses[chain[i].rn];
+            if (!unary && chain[i].rm != chain[i].rn && !((written >> chain[i].rm) & 1u)) ++read_uses[chain[i].rm];
+            written |= 1u << chain[i].rd;
+        }
+    }
+
+    // Decide which read-only vec_slot inputs stay in memory vs promote to regs.
+    std::uint32_t reg_inputs = 0;
+    std::uint32_t mem_cand = 0;
+    unsigned base_sc = 0;
+    Mem dummy_slot{};
+    for (std::uint32_t m = all_dests; m; m &= m - 1) {
+        const auto g = static_cast<unsigned>(std::countr_zero(m));
+        if (e.ctx.vec_pinned(g)) continue;
+        ++base_sc;
+        if (((all_inputs >> g) & 1u) && e.ctx.vec_write_deferred(g)) ++base_sc;
+    }
+    for (std::uint32_t m = all_inputs; m; m &= m - 1) {
+        const auto g = static_cast<unsigned>(std::countr_zero(m));
+        if (e.ctx.vec_pinned(g) || ((all_dests >> g) & 1u)) {
+            reg_inputs |= 1u << g;
+        } else if (e.ctx.vec_slot(g, dummy_slot)) {
+            mem_cand |= 1u << g;
+        } else {
+            reg_inputs |= 1u << g;
+            ++base_sc;
+        }
+    }
+    const unsigned n_nan_total = static_cast<unsigned>(std::popcount(nan_inputs));
+    const std::uint32_t pure_dests = all_dests & ~all_inputs;
+    const unsigned temp_base = (n_nan_total > 2 && pure_dests == 0) ? 2u : 1u;
+    // Try promoting ALL mem_cand to registers if they fit without needing t1 for mem.
+    if (mem_cand != 0 && base_sc + temp_base + static_cast<unsigned>(std::popcount(mem_cand)) <= avail) {
+        reg_inputs |= mem_cand;
+        mem_cand = 0;
+    } else if (mem_cand != 0) {
+        // Some inputs will stay in memory: promote hottest first while budget allows.
+        const unsigned temp_need = (has_two_mem(len, mem_cand) || (n_nan_total > 2 && pure_dests == 0)) ? 2u : 1u;
+        unsigned spare = avail > (base_sc + temp_need) ? (avail - (base_sc + temp_need)) : 0u;
+        for (unsigned pass = 0; pass < 2 && spare > 0; ++pass) {
+            for (std::uint32_t m = mem_cand; m && spare > 0; m &= m - 1) {
+                const auto g = static_cast<unsigned>(std::countr_zero(m));
+                const bool hot = read_uses[g] >= 2 || ((nan_inputs >> g) & 1u);
+                if ((pass == 0) == hot) {
+                    reg_inputs |= 1u << g;
+                    mem_cand &= ~(1u << g);
+                    --spare;
+                }
+            }
+        }
+    }
+    const bool need_t1 = has_two_mem(len, mem_cand) || (n_nan_total > 2 && pure_dests == 0);
+
+    if (n_nan_total > 0) e.ctx.clobber_host_flags();
+
+    // Allocate in order: read_vec -> write_vec -> t0/t1 -> mem slots.
+    // Reading inputs before allocating temps avoids evicting an input that
+    // read_vec is about to borrow.
+    Opnd in_op[32]{};
+    for (std::uint32_t m = reg_inputs; m; m &= m - 1) {
+        const auto g = static_cast<unsigned>(std::countr_zero(m));
+        in_op[g] = Opnd::of(e.ctx.read_vec(g));
+    }
+    Xmm dst_xmm[32]{};
+    for (std::uint32_t m = all_dests; m; m &= m - 1) {
+        const auto g = static_cast<unsigned>(std::countr_zero(m));
+        dst_xmm[g] = e.ctx.write_vec(g);
+    }
+    const Xmm t0 = e.tmp();
+    const Xmm t1 = need_t1 ? e.tmp() : (pure_dests != 0 ? dst_xmm[std::countr_zero(pure_dests)] : Xmm{});
+    for (std::uint32_t m = mem_cand; m; m &= m - 1) {
+        const auto g = static_cast<unsigned>(std::countr_zero(m));
+        Mem slot = x64::ptr(Gp::r15, v_disp(g));
+        in_op[g] = Opnd::at(slot);
+    }
+
+    Opnd nan_list[16]{};
+    unsigned n_nan = 0;
+    for (std::uint32_t m = nan_inputs; m; m &= m - 1) {
+        const auto g = static_cast<unsigned>(std::countr_zero(m));
+        nan_list[n_nan++] = in_op[g];
+    }
+
+    struct Step {
+        K kind;
+        Opnd a, b;
+        Xmm d;
+    };
+    Step steps[kMaxChain]{};
+    Opnd cur_op[32];
+    for (unsigned g = 0; g < 32; ++g) cur_op[g] = in_op[g];
+    bool need_sign = false, need_abs = false;
+    for (unsigned i = 0; i < len; ++i) {
+        const bool unary = chain[i].k == K::fneg || chain[i].k == K::fabs;
+        if (chain[i].k == K::fneg) need_sign = true;
+        else if (chain[i].k == K::fabs) need_abs = true;
+        steps[i] = {chain[i].k, cur_op[chain[i].rn], unary ? Opnd{} : cur_op[chain[i].rm], dst_xmm[chain[i].rd]};
+        cur_op[chain[i].rd] = Opnd::of(dst_xmm[chain[i].rd]);
+    }
+
+    const SseOp cmp = s.pick(fops::cmp), and_ = s.pick(fops::and_), or_ = s.pick(fops::or_), andn = s.pick(fops::andn);
+    const SseOp xor_ = s.pick(fops::xor_), max_op = s.pick(fops::max), min_op = s.pick(fops::min);
+    const Mem sign_mem = need_sign ? e.ksplat(es, FpEmit::sign_bits(es)) : Mem{};
+    const Mem abs_mem = need_abs ? e.ksplat(es, abs_bits(es)) : Mem{};
+    const auto cold = e.as.new_label(), done = e.as.new_label();
+
+    // Batched NaN check over all unique minmax initial inputs BEFORE any write.
+    if (n_nan > 0) {
+        const auto emit_unord_pair = [&](Xmm dst, const Opnd& x, const Opnd& y) {
+            if (!x.is_mem) {
+                e.op_i(cmp, dst, x.reg, y, pred_unord);
+            } else if (!y.is_mem) {
+                e.op_i(cmp, dst, y.reg, x, pred_unord);
+            } else {
+                e.un(op::movups, dst, x);
+                e.op_i(cmp, dst, dst, y, pred_unord);
+            }
+        };
+        emit_unord_pair(t0, nan_list[0], n_nan > 1 ? nan_list[1] : nan_list[0]);
+        for (unsigned p = 2; p < n_nan; p += 2) {
+            emit_unord_pair(t1, nan_list[p], p + 1 < n_nan ? nan_list[p + 1] : nan_list[p]);
+            e.op(or_, t0, t0, t1);
+        }
+        e.as.vex_rr(vex_of(op::ptest), false, x64::id(t0), 0, x64::id(t0));
+        e.as.jcc(x64::Cond::ne, cold);
+    }
+
+    // Numeric fast path (zero NaNs guaranteed across every minmax step).
+    for (unsigned i = 0; i < len; ++i) {
+        const auto& st = steps[i];
+        if (st.kind == K::fneg) {
+            if (st.a.is_mem) {
+                e.un(op::movups, t0, st.a);
+                e.op(xor_, st.d, t0, Opnd::at(sign_mem));
+            } else {
+                e.op(xor_, st.d, st.a.reg, Opnd::at(sign_mem));
+            }
+            continue;
+        }
+        if (st.kind == K::fabs) {
+            if (st.a.is_mem) {
+                e.un(op::movups, t0, st.a);
+                e.op(and_, st.d, t0, Opnd::at(abs_mem));
+            } else {
+                e.op(and_, st.d, st.a.reg, Opnd::at(abs_mem));
+            }
+            continue;
+        }
+        if (st.kind == K::fcmeq || st.kind == K::fcmge || st.kind == K::fcmgt) {
+            const auto pred = st.kind == K::fcmeq ? pred_eq : st.kind == K::fcmge ? pred_ge_os : pred_gt_os;
+            if (st.a.is_mem) {
+                e.un(op::movups, t0, st.a);
+                e.op_i(cmp, st.d, t0, st.b, pred);
+            } else {
+                e.op_i(cmp, st.d, st.a.reg, st.b, pred);
+            }
+            continue;
+        }
+        const bool is_max = st.kind == K::fmax || st.kind == K::fmaxnm;
+        const SseOp mm = is_max ? max_op : min_op;
+        if (sz_dead[i]) {
+            if (!st.a.is_mem) {
+                e.op(mm, st.d, st.a.reg, st.b);
+            } else if (!st.b.is_mem) {
+                e.op(mm, st.d, st.b.reg, st.a);
+            } else {
+                e.un(op::movups, t0, st.a);
+                e.op(mm, st.d, t0, st.b);
+            }
+            continue;
+        }
+        if (!st.a.is_mem && !st.b.is_mem) {
+            e.op(mm, t0, st.b.reg, st.a.reg);
+            e.op(mm, st.d, st.a.reg, st.b.reg);
+            e.op(is_max ? and_ : or_, st.d, st.d, t0);
+        } else if (!st.a.is_mem) {
+            e.un(op::movups, t0, st.b);
+            e.op(mm, t0, t0, st.a.reg);
+            e.op(mm, st.d, st.a.reg, st.b);
+            e.op(is_max ? and_ : or_, st.d, st.d, t0);
+        } else if (!st.b.is_mem) {
+            e.un(op::movups, t0, st.a);
+            e.op(mm, t0, t0, st.b.reg);
+            e.op(mm, st.d, st.b.reg, st.a);
+            e.op(is_max ? and_ : or_, st.d, st.d, t0);
+        } else {
+            e.un(op::movups, t1, st.a);
+            e.un(op::movups, t0, st.b);
+            e.op(mm, t0, t0, t1);
+            e.op(mm, st.d, t1, st.b);
+            e.op(is_max ? and_ : or_, st.d, st.d, t0);
+        }
+    }
+    if (n_nan == 0) return len;
+    e.as.bind(done);
+
+    const Mem quiet = e.ksplat(es, dbl ? 0x0008000000000000ull : 0x00400000ull);
+    auto* const as = &e.as;
+    const std::uint8_t shift = dbl ? 12 : 9;
+    std::array<Step, kMaxChain> cold_steps{};
+    for (unsigned i = 0; i < len; ++i) cold_steps[i] = steps[i];
+
+    e.ctx.defer_cold([=]() {
+        const auto vspill = [](unsigned slot) {
+            return x64::ptr(Gp::r15, ctx_disp(offsetof(GuestContext, vspill) + 16u * slot));
+        };
+        const auto vop_rr = [as](SseOp o, Xmm dst, Xmm s1, Xmm s2) {
+            as->vex_rr(vex_of(o), false, x64::id(dst), x64::id(s1), x64::id(s2));
+        };
+        const auto vop_rm = [as](SseOp o, Xmm dst, Xmm s1, const Mem& s2) {
+            as->vex_rm(vex_of(o), false, x64::id(dst), x64::id(s1), s2);
+        };
+        const auto vop_rri = [as](SseOp o, Xmm dst, Xmm s1, Xmm s2, std::uint8_t imm) {
+            as->vex_rr(vex_of(o), false, x64::id(dst), x64::id(s1), x64::id(s2));
+            as->db(imm);
+        };
+        const auto vop_rmi = [as](SseOp o, Xmm dst, Xmm s1, const Mem& s2, std::uint8_t imm) {
+            as->vex_rm(vex_of(o), false, x64::id(dst), x64::id(s1), s2);
+            as->db(imm);
+        };
+        const auto vload = [as](Xmm dst, const Mem& m) {
+            as->vex_rm(vex_of(op::movups), false, x64::id(dst), 0, m);
+        };
+        const auto vshl = [as, dbl, shift](Xmm dst, Xmm src) {
+            as->vex_rr(VexOp{1, 1, static_cast<std::uint8_t>(dbl ? 0x73 : 0x72), false}, false, 6, x64::id(dst),
+                       x64::id(src));
+            as->db(shift);
+        };
+
+        as->bind(cold);
+        for (unsigned i = 0; i < len; ++i) {
+            const auto& st = cold_steps[i];
+            if (st.kind == K::fneg) {
+                if (st.a.is_mem) {
+                    vload(t0, st.a.mem);
+                    vop_rm(xor_, st.d, t0, sign_mem);
+                } else {
+                    vop_rm(xor_, st.d, st.a.reg, sign_mem);
+                }
+                continue;
+            }
+            if (st.kind == K::fabs) {
+                if (st.a.is_mem) {
+                    vload(t0, st.a.mem);
+                    vop_rm(and_, st.d, t0, abs_mem);
+                } else {
+                    vop_rm(and_, st.d, st.a.reg, abs_mem);
+                }
+                continue;
+            }
+            if (st.kind == K::fcmeq || st.kind == K::fcmge || st.kind == K::fcmgt) {
+                const auto pred = st.kind == K::fcmeq ? pred_eq : st.kind == K::fcmge ? pred_ge_os : pred_gt_os;
+                Xmm lhs = st.a.reg;
+                if (st.a.is_mem) {
+                    vload(t0, st.a.mem);
+                    lhs = t0;
+                }
+                if (st.b.is_mem) vop_rmi(cmp, st.d, lhs, st.b.mem, pred);
+                else vop_rri(cmp, st.d, lhs, st.b.reg, pred);
+                continue;
+            }
+            const bool nm = st.kind == K::fmaxnm || st.kind == K::fminnm;
+            const bool is_max = st.kind == K::fmax || st.kind == K::fmaxnm;
+            const SseOp mm = is_max ? max_op : min_op;
+            const bool alias = (!st.a.is_mem && st.d == st.a.reg) || (!st.b.is_mem && st.d == st.b.reg);
+            std::uint32_t used = (1u << x64::id(st.d)) | (1u << x64::id(t0));
+            if (!st.a.is_mem) used |= 1u << x64::id(st.a.reg);
+            if (!st.b.is_mem) used |= 1u << x64::id(st.b.reg);
+            const auto pick_free = [&]() {
+                for (unsigned r = 0; r < 16; ++r) {
+                    if (!((used >> r) & 1u)) {
+                        used |= 1u << r;
+                        return x64::xmm(r);
+                    }
+                }
+                throw std::logic_error("fp: no free xmm for cold minmax chain");
+            };
+            const Xmm s1 = pick_free(), s2 = pick_free();
+            const Xmm T = alias ? pick_free() : st.d;
+            const Xmm ra = st.a.is_mem ? pick_free() : st.a.reg;
+            const Xmm rb = st.b.is_mem ? pick_free() : st.b.reg;
+            as->movups(vspill(28), s1);
+            as->movups(vspill(29), s2);
+            if (alias) as->movups(vspill(30), T);
+            if (st.a.is_mem) {
+                as->movups(vspill(27), ra);
+                vload(ra, st.a.mem);
+            }
+            if (st.b.is_mem) {
+                as->movups(vspill(26), rb);
+                vload(rb, st.b.mem);
+            }
+
+            vop_rri(cmp, t0, ra, ra, pred_unord);   // na
+            vop_rri(cmp, s1, rb, rb, pred_unord);   // nb
+            vshl(s2, rb);
+            vop_rr(andn, s2, s2, s1);               // sb
+            vop_rr(andn, s2, s2, nm ? s1 : t0);     // ~sb & nb (NM) / ~sb & na
+            vshl(T, ra);
+            vop_rr(andn, T, T, t0);                 // sa
+            vop_rr(or_, s2, s2, T);                 // a wins
+            vop_rm(and_, T, t0, quiet);
+            vop_rr(or_, T, T, ra);                  // a, quieted if NaN
+            vop_rr(or_, t0, t0, s1);                // NaN lanes
+            vop_rm(and_, s1, s1, quiet);
+            vop_rr(or_, s1, s1, rb);                // b, quieted if NaN
+            as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, s1, s1, T, s2);
+            if (nm) vop_rr(max_op, s1, s1, s1);
+            vop_rr(mm, T, ra, rb);
+            vop_rr(mm, s2, rb, ra);
+            vop_rr(is_max ? and_ : or_, T, T, s2);
+            as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, T, T, s1, t0);
+            if (alias) as->vex_rr(vex_of(op::movaps), false, x64::id(st.d), 0, x64::id(T));
+
+            if (st.b.is_mem) as->movups(rb, vspill(26));
+            if (st.a.is_mem) as->movups(ra, vspill(27));
+            if (alias) as->movups(T, vspill(30));
+            as->movups(s2, vspill(29));
+            as->movups(s1, vspill(28));
+        }
+        as->jmp(done);
+    });
+    return len;
 }
 
 void emit_minmax_scratch(FpEmit& e, K kind, Shape s, Xmm out, Xmm a, Xmm b, Xmm u) {
@@ -750,6 +1566,19 @@ bool emit_arith(FpEmit& e, const Inst& in) {
             const K kind = base_minmax(in.k);
             if (s.scalar) {
                 const Xmm n = e.vec(in.rn);
+                if (e.ctx.can_defer_cold()) {
+                    const bool flags_live = e.ctx.host_flags_live();
+                    LaneGuard guard{};
+                    if (flags_live) guard = lane_guard(e);
+                    else e.ctx.clobber_host_flags();
+                    const Xmm o = e.tmp(), t0 = e.tmp();
+                    const Xmm d = e.dest(in.rd);
+                    if (dbl) e.psrldq(o, n, 8);
+                    else e.op_i(op::insertps, o, n, n, 0x4e);
+                    minmax_exact_deferred(e, kind, s, w, d, n, o, t0, flags_live, guard);
+                    e.zero_upper(d, w);
+                    return true;
+                }
                 const auto guard = lane_guard(e);
                 const Xmm o = e.tmp(), t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
                 const Xmm d = e.dest(in.rd);
@@ -773,6 +1602,20 @@ bool emit_arith(FpEmit& e, const Inst& in) {
                 e.op(op::unpcklpd, od, a, b);   // [a0 a1 b0 b1]
                 e.op_i(op::shufps, ev, od, od, 0x88);
                 e.op_i(op::shufps, od, od, od, 0xdd);
+            }
+            if (e.ctx.can_defer_cold()) {
+                const bool flags_live = e.ctx.host_flags_live();
+                LaneGuard guard{};
+                if (flags_live) guard = lane_guard(e);
+                else {
+                    e.ctx.clobber_host_flags();
+                    if (w == 64) guard = {e.gtmp(), false};
+                }
+                const Xmm t0 = e.tmp();
+                const Xmm d = e.dest(in.rd);
+                minmax_exact_deferred(e, kind, s, w, d, ev, od, t0, flags_live, guard);
+                e.zero_upper(d, w);
+                return true;
             }
             const auto guard = lane_guard(e);
             const Xmm t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
@@ -849,9 +1692,28 @@ bool emit_arith(FpEmit& e, const Inst& in) {
     case K::fmaxv: case K::fminv: case K::fmaxnmv: case K::fminnmv: {
         // Reduce(op, Vn.4S) = op(op(n0, n1), op(n2, n3)).
         if (e.avx() && fp_on(fp_old_minmax)) {   // NaN-exact, A64's operand order
-            e.allow_vec_temps(5);
             const K kind = base_minmax(in.k);
             const Xmm n = e.vec(in.rn);
+            if (e.ctx.can_defer_cold()) {
+                const bool flags_live = e.ctx.host_flags_live();
+                LaneGuard guard{};
+                if (flags_live) guard = lane_guard(e);
+                else e.ctx.clobber_host_flags();
+                const Xmm o = e.tmp(), r = e.tmp(), t0 = e.tmp();
+                const Xmm d = e.dest(in.rd);
+                e.un(op::movshdup, o, n);
+                Shape packed = s;
+                packed.scalar = false;
+                packed.q = true;
+                minmax_exact_deferred(e, kind, packed, 128, r, n, o, t0, flags_live, guard);   // r0, r2
+                e.op_i(op::insertps, o, r, r, 0x8e);                                           // {r[2], 0, 0, 0}
+                Shape scalar = s;
+                scalar.scalar = true;
+                minmax_exact_deferred(e, kind, scalar, 32, d, r, o, t0, flags_live, guard);
+                e.zero_upper(d, 32);
+                return true;
+            }
+            e.allow_vec_temps(5);
             const auto guard = lane_guard(e);
             const Xmm o = e.tmp(), r = e.tmp(), t0 = e.tmp(), t1 = e.tmp(), t2 = e.tmp();
             const Xmm d = e.dest(in.rd);
@@ -891,6 +1753,46 @@ bool emit_arith(FpEmit& e, const Inst& in) {
 // ---- fused multiply-add -----------------------------------------------------------------------
 
 bool emit_fused_h(FpEmit& e, const Inst& in);
+
+bool emit_elem_pair(FpEmit& e, const Inst& in0, const Inst& in1) {
+    if (!e.avx() || fp_tiny_before_on()) return false;
+    const auto ok_kind = [&](K k) { return k == K::fmul || ((k == K::fmla || k == K::fmls) && e.feat.fma); };
+    if (!ok_kind(in0.k) || !ok_kind(in1.k)) return false;
+    const Shape s = in0.sh;
+    if (s.scalar || !s.q || (s.es != 32 && s.es != 64) || in0.index < 0) return false;
+    if (in1.sh.scalar || !in1.sh.q || in1.sh.es != s.es || in1.rm != in0.rm || in1.index != in0.index) return false;
+    // Require no RAW, WAR, or WAW hazards between in0 and in1 (self-update rd == rn is allowed).
+    if (in0.rd == in0.rm || in1.rd == in0.rm || in0.rd == in1.rd || in0.rd == in1.rn || in1.rd == in0.rn) return false;
+    const Opnd b = element_op(e, s, in0.rm, in0.index);
+    const bool dbl = s.dbl();
+    const auto emit_one = [&](const Inst& in) {
+        if (in.k == K::fmul) {
+            const Opnd n = e.src(in.rn);
+            const Xmm d = e.ctx.write_vec(in.rd);
+            if (n.is_mem) e.op(s.pick(fops::mul), d, b.reg, n);
+            else e.op(s.pick(fops::mul), d, n.reg, b.reg);
+            return;
+        }
+        const Opnd acc = e.src(in.rd);
+        const Opnd n = e.src(in.rn);
+        const Xmm d = e.ctx.write_vec(in.rd);
+        const FmaKind kind = in.k == K::fmla ? FmaKind::fmadd : FmaKind::fnmadd;
+        if (!acc.is_mem && d == acc.reg) {
+            e.fma(kind, FmaForm::f231, dbl, false, d, b.reg, n);
+        } else if (acc.is_mem) {
+            e.un(op::movups, d, acc);
+            e.fma(kind, FmaForm::f231, dbl, false, d, b.reg, n);
+        } else if (!n.is_mem && d == n.reg) {
+            e.fma(kind, FmaForm::f213, dbl, false, d, b.reg, acc);
+        } else {
+            e.mov(d, acc.reg);
+            e.fma(kind, FmaForm::f231, dbl, false, d, b.reg, n);
+        }
+    };
+    emit_one(in0);
+    emit_one(in1);
+    return true;
+}
 
 bool emit_fused(FpEmit& e, const Inst& in) {
     const Shape s = in.sh;
@@ -1278,6 +2180,67 @@ void nzcv_from_ucomi(FpEmit& e, Gp v, Gp c) {
     a.cmov(Cond::p, 32, v, c);
 }
 
+// Evaluates ARM condition `cond` (0..13) on a 4-bit NZCV immediate (N=8,Z=4,C=2,V=1).
+bool a64_cond_holds_imm(unsigned cond, unsigned nzcv4) {
+    const bool n = (nzcv4 & 8u) != 0, z = (nzcv4 & 4u) != 0, c = (nzcv4 & 2u) != 0, v = (nzcv4 & 1u) != 0;
+    bool holds = true;
+    switch (cond >> 1) {
+    case 0: holds = z; break;
+    case 1: holds = c; break;
+    case 2: holds = n; break;
+    case 3: holds = v; break;
+    case 4: holds = c && !z; break;
+    case 5: holds = n == v; break;
+    case 6: holds = !z && (n == v); break;
+    default: holds = true; break;
+    }
+    return (cond & 1u) ? !holds : holds;
+}
+
+// Sets byte `dst` to 1 iff ARM condition `cond` (0..13) holds on x64 (u)comis(Rn, Rm)
+// EFLAGS (GT: Z0P0C0, LT: Z0P0C1, EQ: Z1P0C0, UN: Z1P1C1), else 0.
+void ucomi_cond_byte(FpEmit& e, unsigned cond, Gp dst, Gp tmp) {
+    auto& a = e.as;
+    switch (cond) {
+    case 0:   // EQ: e && np
+        a.setcc(Cond::e, dst);
+        a.setcc(Cond::np, tmp);
+        a.alu(x64::Alu::and_, 8, dst, tmp);
+        return;
+    case 1:   // NE: ne || p
+        a.setcc(Cond::ne, dst);
+        a.setcc(Cond::p, tmp);
+        a.alu(x64::Alu::or_, 8, dst, tmp);
+        return;
+    case 2: case 5:   // CS/PL: ae || p
+        a.setcc(Cond::ae, dst);
+        a.setcc(Cond::p, tmp);
+        a.alu(x64::Alu::or_, 8, dst, tmp);
+        return;
+    case 3: case 4:   // CC/MI: b && np
+        a.setcc(Cond::b, dst);
+        a.setcc(Cond::np, tmp);
+        a.alu(x64::Alu::and_, 8, dst, tmp);
+        return;
+    case 6: a.setcc(Cond::p, dst); return;    // VS
+    case 7: a.setcc(Cond::np, dst); return;   // VC
+    case 8:   // HI: a || p
+        a.setcc(Cond::a, dst);
+        a.setcc(Cond::p, tmp);
+        a.alu(x64::Alu::or_, 8, dst, tmp);
+        return;
+    case 9:   // LS: be && np
+        a.setcc(Cond::be, dst);
+        a.setcc(Cond::np, tmp);
+        a.alu(x64::Alu::and_, 8, dst, tmp);
+        return;
+    case 10: a.setcc(Cond::ae, dst); return;   // GE
+    case 11: a.setcc(Cond::b, dst); return;    // LT
+    case 12: a.setcc(Cond::a, dst); return;    // GT
+    default: a.setcc(Cond::be, dst); return;   // LE
+    }
+}
+
 } // namespace
 
 bool emit_select(FpEmit& e, const Inst& in) {
@@ -1329,22 +2292,85 @@ bool emit_select(FpEmit& e, const Inst& in) {
             m = Opnd::of(h_to_s(e, m.reg));
         }
         const Gp v = e.gtmp(), c = e.gtmp();
-        e.ctx.clobber_host_flags();
+        if (in.cond >= 14) {
+            e.ucomi(dbl, n, m, in.signal);
+            if (e.ctx.set_fcmp_flags(false)) return true;
+            nzcv_from_ucomi(e, v, c);
+            e.ctx.set_nzcv(v);
+            return true;
+        }
+        // Evaluate incoming condition directly from live host EFLAGS before
+        // ucomi clobbers them: avoids 7-insn NZCV packing + STL stall, and
+        // skips ucomi when in.cond is false (exact A64 FCCMPE NaN semantics).
+        if (const int c2 = e.ctx.fccmp_consumer_cond(); c2 >= 0) {
+            const bool k = a64_cond_holds_imm(static_cast<unsigned>(c2), in.nzcv);
+            const Cond cc = e.ctx.condition(in.cond);
+            const auto use_imm = a.new_label(), done = a.new_label();
+            a.jcc_short(x64::invert(cc), use_imm);
+            e.ucomi(dbl, n, m, in.signal);
+            ucomi_cond_byte(e, static_cast<unsigned>(c2), v, c);
+            a.jmp_short(done);
+            a.bind(use_imm);
+            a.mov_imm(v, k ? 1 : 0);
+            a.bind(done);
+            a.test(8, v, v);
+            e.ctx.set_fccmp_bool();
+            return true;
+        }
+        const Cond cc = e.ctx.condition(in.cond);
+        const auto use_imm = a.new_label(), done = a.new_label();
+        a.jcc_short(x64::invert(cc), use_imm);
         e.ucomi(dbl, n, m, in.signal);
         nzcv_from_ucomi(e, v, c);
-        if (in.cond < 14) {
-            a.mov_imm(c, static_cast<std::uint64_t>(in.nzcv) << 28);
-            const Cond cc = e.ctx.condition(in.cond);
-            a.cmov(x64::invert(cc), 32, v, c);
-        }
+        a.jmp_short(done);
+        a.bind(use_imm);
+        a.mov_imm(v, static_cast<std::uint64_t>(in.nzcv) << 28);
+        a.bind(done);
         e.ctx.set_nzcv(v);
         return true;
     }
     case K::fcsel: {
-        // In-memory sources are read straight into (or cmov'ed from) GPRs.
+        // On AVX for S/D with at least one source already in an XMM register,
+        // select in the vector domain with vblendvps/vblendvpd so FP values
+        // avoid 2-3 XMM<->GPR domain crossings on the critical path.
+        // Because vmovd/vmovq zero bits [127:w] of the mask, vblendv takes its
+        // upper lanes from its first operand (a); placing a zero-upper operand
+        // in `a` makes A64 upper-lane zeroing free.
         const Opnd n = e.src(in.rn), m = e.src(in.rm);
-        const Gp gn = e.gtmp(), gm = e.gtmp();
         const unsigned bits = dbl ? 64 : 32;
+        if (e.avx() && s.es >= 32 && (!n.is_mem || !m.is_mem)) {
+            const unsigned w = s.width();
+            if (in.cond >= 14) {
+                const Xmm d = e.dest(in.rd);
+                if (n.is_mem) e.un(dbl ? op::movsd : op::movss, d, n);
+                else if (e.zero_above(in.rn, w)) e.mov(d, n.reg);
+                else if (dbl) e.movq(d, n.reg);
+                else e.ins0(d, n.reg);
+                return true;
+            }
+            const bool n_zero = n.is_mem || e.zero_above(in.rn, w);
+            const bool m_zero = m.is_mem || e.zero_above(in.rm, w);
+            const bool swap = (!m_zero && n_zero) || (m_zero == n_zero && m.is_mem && !n.is_mem);
+            const Opnd& a_op = swap ? n : m;
+            const Opnd& b_op = swap ? m : n;
+            const bool need_zero = !(swap ? n_zero : m_zero);
+            const Cond cc = swap ? x64::invert(e.ctx.condition(in.cond)) : e.ctx.condition(in.cond);
+            const Gp g = e.gtmp();
+            a.mov_imm(g, 0);
+            a.cmov(cc, bits, g, e.kconst(~0ULL, ~0ULL));
+            const Xmm mask = e.tmp();
+            if (dbl) e.movq(mask, g);
+            else e.movd(mask, g);
+            const Xmm ar = load_opnd(e, a_op, s);
+            const Xmm d = e.dest(in.rd);
+            const VexOp blend = dbl ? vop::vblendvpd : vop::vblendvps;
+            if (b_op.is_mem) a.vex_is4(blend, d, ar, b_op.mem, mask);
+            else a.vex_is4(blend, d, ar, b_op.reg, mask);
+            if (need_zero) e.zero_upper(d, w);
+            return true;
+        }
+        // SSE, FP16, or both sources in memory: select in GPRs.
+        const Gp gn = e.gtmp(), gm = e.gtmp();
         if (!n.is_mem) { if (dbl) e.movq(gn, n.reg); else e.movd(gn, n.reg); }
         if (m.is_mem) a.mov(bits, gm, m.mem);
         else if (dbl) e.movq(gm, m.reg);

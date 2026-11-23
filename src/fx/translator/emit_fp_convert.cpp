@@ -35,12 +35,47 @@ void raise_invalid(FpEmit& e, Xmm scratch) {
 // `ibits` integer: NaN -> 0, out of range -> the nearest bound. Branches
 // only off the in-range path. Emits labels: every operand must already be
 // allocated. Clobbers EFLAGS (the caller has called clobber_host_flags()).
+// When EmitContext::can_defer_cold() is available, the rare NaN/overflow
+// fixup is emitted out-of-line in the cold section so the hot path is 3-4 insns.
 void cvtt_scalar(FpEmit& e, bool dbl, Xmm x, Gp g, unsigned ibits, bool uns, Gp gt, Xmm tc, Xmm tx) {
     auto& a = e.as;
     const Label done = a.new_label();
+    const bool defer = e.ctx.can_defer_cold();
+    const bool avx = e.avx();
+    x64::Assembler* as = &a;
     if (!uns) {
         cvtt(e, dbl, g, x, ibits);
         // x64 returns the "integer indefinite" (INT_MIN) for NaN and overflow.
+        if (defer) {
+            const Label cold = a.new_label();
+            if (ibits == 32 && !fp_on(fp_old_cvt)) {
+                a.cmp(32, g, static_cast<std::int32_t>(0x80000000u));
+                a.jcc(Cond::e, cold);
+            } else {
+                a.cmp(ibits, g, 1);   // overflows only for INT_MIN / INT64_MIN
+                a.jcc(Cond::o, cold);
+            }
+            a.bind(done);
+            e.ctx.defer_cold([as, avx, dbl, x, g, ibits, gt, cold, done] {
+                as->bind(cold);
+                if (dbl) {
+                    if (avx) as->vex_rr(VexOp{1, 1, 0x7e, true}, false, x64::id(x), 0, x64::id(gt));
+                    else as->movq(gt, x);
+                } else {
+                    if (avx) as->vex_rr(VexOp{1, 1, 0x7e, false}, false, x64::id(x), 0, x64::id(gt));
+                    else as->movd(gt, x);
+                    as->shl(64, gt, 32);
+                }
+                as->sar(64, gt, 63);
+                as->not_(64, gt);
+                as->xor_(ibits, g, gt);
+                as->xor_(32, gt, gt);
+                as->sse_raw(dbl ? op::ucomisd : op::ucomiss, false, x64::id(x), x64::id(x));
+                as->cmov(Cond::p, ibits, g, gt);
+                as->jmp(done);
+            });
+            return;
+        }
         if (ibits == 32 && !fp_on(fp_old_cvt)) {
             a.cmp(32, g, static_cast<std::int32_t>(0x80000000u));
             a.jcc_short(Cond::ne, done);
@@ -67,6 +102,25 @@ void cvtt_scalar(FpEmit& e, bool dbl, Xmm x, Gp g, unsigned ibits, bool uns, Gp 
         cvtt(e, dbl, g, x, 64);
         a.mov(32, gt, g);
         a.cmp(64, gt, g);
+        if (defer) {
+            const Label cold = a.new_label();
+            a.jcc(Cond::ne, cold);
+            a.bind(done);
+            e.ctx.defer_cold([as, avx, dbl, x, g, gt, tc, cold, done] {
+                as->bind(cold);
+                if (avx) as->vex_rr(vex_of(op::xorps), false, x64::id(tc), x64::id(tc), x64::id(tc));
+                else as->sse_raw(op::xorps, false, x64::id(tc), x64::id(tc));
+                as->sse_raw(dbl ? op::ucomisd : op::ucomiss, false, x64::id(x), x64::id(tc));
+                as->mov_imm(g, 0xffffffffu);
+                as->mov_imm(gt, 0);
+                as->cmov(Cond::be, 32, g, gt);
+                if (avx) as->vex_rr(vex_of(op::pcmpeqd), false, x64::id(tc), x64::id(tc), x64::id(tc));
+                else as->sse_raw(op::pcmpeqd, false, x64::id(tc), x64::id(tc));
+                as->sse_raw(op::comiss, false, x64::id(tc), x64::id(tc));
+                as->jmp(done);
+            });
+            return;
+        }
         a.jcc_short(Cond::e, done);
         // Out of [0, 2^32): positive -> UINT32_MAX, negative or NaN -> 0.
         e.zero(tc);
@@ -76,6 +130,50 @@ void cvtt_scalar(FpEmit& e, bool dbl, Xmm x, Gp g, unsigned ibits, bool uns, Gp 
         a.cmov(Cond::be, 32, g, gt);
         raise_invalid(e, tc);
         a.bind(done);
+        return;
+    }
+    if (defer) {
+        const Label cold = a.new_label();
+        cvtt(e, dbl, g, x, 64);
+        a.test(64, g, g);
+        a.jcc(Cond::s, cold);
+        a.bind(done);
+        e.ctx.defer_cold([as, avx, dbl, x, g, gt, tc, tx, cold, done] {
+            const Label zero_l = as->new_label(), sat_l = as->new_label(), raise_l = as->new_label();
+            as->bind(cold);
+            as->mov_imm(gt, dbl ? 0x43e0000000000000ULL : 0x5f000000ULL);   // 2^63
+            if (dbl) {
+                if (avx) as->vex_rr(VexOp{1, 1, 0x6e, true}, false, x64::id(tc), 0, x64::id(gt));
+                else as->movq(tc, gt);
+            } else {
+                if (avx) as->vex_rr(VexOp{1, 1, 0x6e, false}, false, x64::id(tc), 0, x64::id(gt));
+                else as->movd(tc, gt);
+            }
+            as->sse_raw(dbl ? op::ucomisd : op::ucomiss, false, x64::id(x), x64::id(tc));
+            as->jcc_short(Cond::b, zero_l);   // below 2^63 or unordered
+            if (avx) {
+                as->vex_rr(vex_of(dbl ? op::subsd : op::subss), false, x64::id(tx), x64::id(x), x64::id(tc));
+            } else {
+                if (tx != x) as->movaps(tx, x);
+                as->sse_raw(dbl ? op::subsd : op::subss, false, x64::id(tx), x64::id(tc));
+            }
+            if (dbl) as->cvttsd2si(g, tx, 64);
+            else as->cvttss2si(g, tx, 64);
+            as->test(64, g, g);
+            as->jcc_short(Cond::s, sat_l);
+            as->btc(64, g, 63);
+            as->jmp(done);
+            as->bind(sat_l);
+            as->mov_imm(g, ~0ULL);
+            as->jmp_short(raise_l);
+            as->bind(zero_l);
+            as->mov_imm(g, 0);
+            as->bind(raise_l);
+            if (avx) as->vex_rr(vex_of(op::pcmpeqd), false, x64::id(tc), x64::id(tc), x64::id(tc));
+            else as->sse_raw(op::pcmpeqd, false, x64::id(tc), x64::id(tc));
+            as->sse_raw(op::comiss, false, x64::id(tc), x64::id(tc));
+            as->jmp(done);
+        });
         return;
     }
     const Label zero_l = a.new_label(), sat_l = a.new_label(), raise_l = a.new_label();
@@ -568,34 +666,113 @@ bool i2f_vector(FpEmit& e, const Inst& in) {
 // Z set iff the conversion was exact and in int32 range (and not -0).
 bool emit_fjcvtzs(FpEmit& e, const Inst& in) {
     auto& a = e.as;
+    const bool flags_live = e.ctx.flags_live_out();
     const Xmm x = e.vec(in.rn);
+    if (e.ctx.can_defer_cold()) {
+        const Xmm T0 = flags_live ? e.tmp() : Xmm{};
+        const Gp gx = flags_live ? e.gtmp() : Gp{};
+        const Gp t = e.gtmp();
+        const Gp z = flags_live ? e.gtmp() : Gp{};
+        const Gp r = e.gdest(in.rd);
+        const Mem k2m32 = e.kscalar(64, 0x3df0000000000000ULL);   // 2^-32
+        const Mem k2p32 = e.kscalar(64, 0x41f0000000000000ULL);   // 2^32
+        std::uint32_t used = 1u << x64::id(x);
+        const auto pick_free = [&]() {
+            for (unsigned i = 0; i < 16; ++i) {
+                if (!((used >> i) & 1u)) {
+                    used |= 1u << i;
+                    return x64::xmm(i);
+                }
+            }
+            throw std::logic_error("fp: no free xmm for cold fjcvtzs stub");
+        };
+        const Xmm c0 = pick_free(), c1 = pick_free();
+        const Label huge = a.new_label(), done = a.new_label();
+        e.ctx.clobber_host_flags();
+        if (flags_live) e.movq(gx, x);
+        // Branchless for all |x| < 2^63 (including JS int32-overflowing sums):
+        //   cvttsd2si r64, x -> exact int64 trunc(x) (low 32 bits = mod 2^32), sets PE if fractional
+        //   cvttsd2si t32, x -> sets MXCSR.IE (IOC) iff trunc(x) outside int32 or NaN/Inf
+        //   cmp r64, 1; jo huge -> taken only when r64 == INT64_MIN (|x| >= 2^63, Inf, NaN)
+        a.cvttsd2si(r, x, 64);
+        a.cvttsd2si(t, x, 32);
+        a.cmp(64, r, 1);
+        a.jcc(Cond::o, huge);
+        if (flags_live) {
+            // Z = (double)(int32)r has the exact bits of x. Because cvtsi2sd uses
+            // 32-bit sign-extended r, any |x| >= 2^31 yields a double in [-2^31, 2^31-1]
+            // which cannot match x, and -0 / inexact / FZ-flushed denormals also mismatch.
+            e.zero(T0);
+            e.cvtsi2s(true, T0, r, 32);
+            e.movq(t, T0);
+            a.xor_(32, z, z);
+            a.cmp(64, t, gx);
+            a.setcc(Cond::e, z);
+            a.shl(32, z, 30);
+        }
+        a.bind(done);
+        a.mov(32, r, r);
+        if (flags_live) e.ctx.set_nzcv(z);
+        auto* const as = &e.as;
+        const bool avx = e.avx();
+        e.ctx.defer_cold([=]() {
+            const auto vspill = [](unsigned slot) {
+                return x64::ptr(Gp::r15, ctx_disp(offsetof(GuestContext, vspill) + 16u * slot));
+            };
+            as->bind(huge);
+            if (flags_live) as->mov_imm(z, 0);
+            // |x| >= 2^63, inf or NaN (cvttsd2si t32 already raised MXCSR.IE):
+            // x - 2^32 * trunc(x / 2^32) is exact for finite x and NaN otherwise (-> 0).
+            as->movups(vspill(28), c0);
+            as->movups(vspill(29), c1);
+            if (avx) {
+                as->vex_rm(vex_of(op::mulsd), false, x64::id(c1), x64::id(x), k2m32);
+                as->vex_rr(vex_of(op::roundsd), false, x64::id(c1), x64::id(c1), x64::id(c1));
+                as->db(0x0b);
+                as->vex_rm(vex_of(op::mulsd), false, x64::id(c1), x64::id(c1), k2p32);
+                as->vex_rr(vex_of(op::subsd), false, x64::id(c0), x64::id(x), x64::id(c1));
+            } else {
+                as->sse(op::movsd, c0, k2m32);
+                as->sse(op::mulsd, c0, x);
+                as->sse_imm(op::roundsd, c1, c0, 0x0b);
+                as->sse(op::mulsd, c1, k2p32);
+                as->sse(op::movaps, c0, x);
+                as->sse(op::subsd, c0, c1);
+            }
+            as->cvttsd2si(r, c0, 64);
+            as->movups(c1, vspill(29));
+            as->movups(c0, vspill(28));
+            as->jmp(done);
+        });
+        return true;
+    }
     const Xmm T0 = e.tmp(), T1 = e.tmp();
-    const Gp gx = e.gtmp(), t = e.gtmp(), z = e.gtmp();
+    const Gp gx = flags_live ? e.gtmp() : Gp{};
+    const Gp t = e.gtmp();
+    const Gp z = flags_live ? e.gtmp() : Gp{};
     e.const_gpr();
     const Gp r = e.gdest(in.rd);
-    const Label big = a.new_label(), raise = a.new_label(), done = a.new_label();
+    const Label huge = a.new_label(), done = a.new_label();
     e.ctx.clobber_host_flags();
-    e.movq(gx, x);
+    if (flags_live) e.movq(gx, x);
     a.cvttsd2si(r, x, 64);
-    a.movsx(64, t, r, 32);
-    a.cmp(64, t, r);
-    a.jcc(Cond::ne, big);
-    // In range: Z = (double)result has the bits of x (excludes -0, inexact,
-    // and denormals flushed by FZ).
-    e.zero(T0);
-    e.cvtsi2s(true, T0, r, 64);
-    e.movq(t, T0);
-    a.xor_(32, z, z);
-    a.cmp(64, t, gx);
-    a.setcc(Cond::e, z);
-    a.shl(32, z, 30);
-    a.jmp(done);
-    a.bind(big);
-    a.mov_imm(z, 0);
+    a.cvttsd2si(t, x, 32);
     a.cmp(64, r, 1);
-    a.jcc(Cond::no, raise);   // |x| < 2^63: the 64-bit truncation is exact
-    // |x| >= 2^63, inf or NaN: x - 2^32 * trunc(x / 2^32) is exact for a
-    // finite x and NaN otherwise (converting to 0 below).
+    a.jcc(Cond::o, huge);
+    if (flags_live) {
+        e.zero(T0);
+        e.cvtsi2s(true, T0, r, 32);
+        e.movq(t, T0);
+        a.xor_(32, z, z);
+        a.cmp(64, t, gx);
+        a.setcc(Cond::e, z);
+        a.shl(32, z, 30);
+    }
+    a.jmp(done);
+    a.bind(huge);
+    if (flags_live) a.mov_imm(z, 0);
+    // |x| >= 2^63, inf or NaN (cvttsd2si t32 already raised MXCSR.IE):
+    // x - 2^32 * trunc(x / 2^32) is exact for finite x and NaN otherwise (-> 0).
     e.scalar_const(64, T0, 0x3df0000000000000ULL);   // 2^-32
     e.op(op::mulsd, T1, x, T0);
     e.sc_i(op::roundsd, T1, T1, 0x0b);
@@ -603,12 +780,9 @@ bool emit_fjcvtzs(FpEmit& e, const Inst& in) {
     e.op(op::mulsd, T1, T1, T0);
     e.op(op::subsd, T0, x, T1);
     a.cvttsd2si(r, T0, 64);
-    a.bind(raise);
-    e.ones(T1);
-    e.ucomi(false, T1, T1, true);   // IOC: out of int32 range
     a.bind(done);
     a.mov(32, r, r);
-    e.ctx.set_nzcv(z);
+    if (flags_live) e.ctx.set_nzcv(z);
     return true;
 }
 

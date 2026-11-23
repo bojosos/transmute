@@ -12,6 +12,7 @@
 #include "fx/translator/translator.hpp"
 
 #include <windows.h>
+#include <xmmintrin.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -823,8 +824,10 @@ FX_TEST(neon_region_mask_facts_differential) {
                     if (!neon::features().avx2) continue;
                     bool flag = false, inline_guard = false;
                     for (const auto& r : runner.machine.regions) {
-                        flag |= contains(r.code, {0x41, 0x0f, 0xb7, 0x8f});   // movzx ecx, word [r15 + disp32]
-                        inline_guard |= contains(r.code, {0x48, 0x8d, 0x49, 0xf1, 0xe3});   // lea rcx, [rcx - 15]; jrcxz
+                        flag |= contains(r.code, {0x41, 0x0f, 0xb7, 0x8f}) ||   // movzx ecx, word [r15 + disp32]
+                                contains(r.code, {0x66, 0x41, 0x83, 0xbf});     // cmp word [r15 + disp32], 0
+                        inline_guard |= contains(r.code, {0x48, 0x8d, 0x49, 0xf1, 0xe3}) ||   // lea rcx, [rcx - 15]; jrcxz
+                                        contains(r.code, {0x0f, 0x0f, 0x85});                 // cmp r32, 15; jne rel32
                     }
                     // Loaded counts with an exact mask (MOVI #1 or USHR) use the checked flag.
                     const bool want_flag = v.counts == Src::load && (v.ushr || v.mask == Src::movi1);
@@ -2241,4 +2244,593 @@ FX_TEST(fp_region_minmax_nan_keeps_flags) {
     }
     runner.machine.options.optimize = -1;
     std::printf("    %u runs bit-exact, flags intact\n", runs);
+}
+
+// Wave D: BSL/BIT/BIF with proven 32-bit lane masks (FCMGT, CMEQ, SSHR #31,
+// SSHR .2D #63) lower to 1-instruction vblendvps, while arbitrary bitmasks
+// still use exact bit-level blending.
+FX_TEST(neon_region_bsl_lane_mask_vblend) {
+    ensure_registered();
+    // Program 1: proven lane masks from FCMGT .4S, SSHR .4S #31, CMEQ .4S, SSHR .2D #63
+    // feeding BSL .16B, BIT .16B, BIF .16B, and BSL .8B.
+    const std::vector<std::uint32_t> masked{
+        0x6ea1e402u,   // fcmgt v2.4s, v0.4s, v1.4s
+        0x6e641c62u,   // bsl   v2.16b, v3.16b, v4.16b
+        0x4f2104a5u,   // sshr  v5.4s, v5.4s, #31
+        0x6ea51cc6u,   // bit   v6.16b, v6.16b, v5.16b  (wait: BIT Vd, Vn, Vm -> v6, v7, v5: 0x6ea51ce6)
+        0x6ea51ce7u,   // bit   v7.16b, v7.16b, v5.16b
+        0x6ea88c08u,   // cmeq  v8.4s, v0.4s, v8.4s
+        0x6ee81d29u,   // bif   v9.16b, v9.16b, v8.16b
+        0x4f41054au,   // sshr  v10.2d, v10.2d, #63
+        0x2e6c1d6au,   // bsl   v10.8b, v11.8b, v12.8b
+    };
+    // Program 2: arbitrary bitmask (not from a lane-mask producer) must remain bit-exact.
+    const std::vector<std::uint32_t> bitwise{
+        0x6e641c62u,   // bsl v2.16b, v3.16b, v4.16b (v2 holds arbitrary bits from entry)
+        0x6ea51ce7u,   // bit v7.16b, v7.16b, v5.16b
+        0x6ee81d29u,   // bif v9.16b, v9.16b, v8.16b
+    };
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    coretest::Rng rng(0xd2002026u);
+    for (const auto& prog : {masked, bitwise}) {
+        for (const int optimize : {1, 0}) {
+            runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+            for (unsigned k = 0; k < 24; ++k) {
+                auto ctx = runner.context(91000 + k);
+                for (unsigned r = 0; r < 14; ++r) {
+                    ctx.v[r][0] = rng.next();
+                    ctx.v[r][1] = rng.next();
+                }
+                if (k == 0) {   // force sign-bit edge cases + equal floats + NaNs
+                    ctx.v[0][0] = 0x3f800000bf800000ull;
+                    ctx.v[0][1] = 0x7fc0000000000000ull;
+                    ctx.v[1][0] = 0xbf8000003f800000ull;
+                    ctx.v[1][1] = 0x0000000080000000ull;
+                    ctx.v[5][0] = 0x800000007fffffffull;
+                    ctx.v[5][1] = 0x00000000ffffffffull;
+                    ctx.v[8][0] = ctx.v[0][0];
+                    ctx.v[10][0] = 0x8000000000000000ull;
+                    ctx.v[10][1] = 0x7fffffffffffffffull;
+                }
+                runner.report = false;
+                runner.last = {};
+                const bool equal = runner.run(prog, ctx, "");
+                runner.report = true;
+                const bool same = equal && runner.last.ok && runner.expected.pc == runner.actual.pc &&
+                                  std::memcmp(runner.expected.v, runner.actual.v, sizeof runner.expected.v) == 0;
+                if (!same) {
+                    runner.run(prog, ctx, "bsl/bit/bif lane mask vblend");
+                    runner.machine.options.optimize = -1;
+                    FX_CHECK(false);
+                    return;
+                }
+            }
+        }
+    }
+    runner.machine.options.optimize = -1;
+}
+
+// Wave D: batched NaN checks across consecutive 128-bit FMAX/FMIN/FMAXNM/FMINNM
+// chains (4S and 2D, with RAW/WAW/in-place dependencies, ±0.0, sNaN, qNaN).
+FX_TEST(fp_region_minmax_chain_exact) {
+    ensure_registered();
+    // 4-op 4S chain matching Embree's triangle intersector topology (RAW + in-place):
+    //   fmin   v4.4s, v4.4s, v5.4s   (0x4ea5f484)
+    //   fmax   v2.4s, v2.4s, v3.4s   (0x4e23f442)
+    //   fminnm v1.4s, v1.4s, v4.4s   (0x4ea4c421)
+    //   fmaxnm v0.4s, v0.4s, v2.4s   (0x4e22c400)
+    const std::vector<std::uint32_t> chain4s{0x4ea5f484u, 0x4e23f442u, 0x4ea4c421u, 0x4e22c400u};
+    // 3-op 2D chain with shared inputs & WAW:
+    //   fmax   v2.2d, v0.2d, v1.2d   (0x4e61f402)
+    //   fmin   v3.2d, v0.2d, v1.2d   (0x4ee1f403)
+    //   fminnm v2.2d, v2.2d, v3.2d   (0x4ee3c442)
+    const std::vector<std::uint32_t> chain2d{0x4e61f402u, 0x4ee1f403u, 0x4ee3c442u};
+    static constexpr std::uint32_t kEdge32[] = {
+        0x00000000u, 0x80000000u, 0x3f800000u, 0xbf800000u, 0x7f800000u, 0xff800000u,
+        0x7fc00001u, 0xffc00002u, 0x7fa00003u, 0xff800004u, 0x00000001u, 0x80000001u,
+    };
+    static constexpr std::uint64_t kEdge64[] = {
+        0x0000000000000000ull, 0x8000000000000000ull, 0x3ff0000000000000ull, 0xbff0000000000000ull,
+        0x7ff0000000000000ull, 0xfff0000000000000ull, 0x7ff8000000000001ull, 0xfff8000000000002ull,
+        0x7ff4000000000003ull, 0xfff0000000000004ull,
+    };
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    coretest::Rng rng(0xd3002026u);
+    for (const int optimize : {1, 0}) {
+        runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+        for (unsigned k = 0; k < 48; ++k) {
+            auto ctx = runner.context(92000 + k);
+            for (unsigned r = 0; r < 6; ++r) {
+                for (unsigned h = 0; h < 2; ++h) {
+                    const std::uint32_t lo = kEdge32[k < 8 ? rng.below(6) : rng.below(static_cast<unsigned>(std::size(kEdge32)))];
+                    const std::uint32_t hi = kEdge32[k < 8 ? rng.below(6) : rng.below(static_cast<unsigned>(std::size(kEdge32)))];
+                    ctx.v[r][h] = static_cast<std::uint64_t>(lo) | (static_cast<std::uint64_t>(hi) << 32);
+                }
+            }
+            runner.report = false;
+            runner.last = {};
+            const bool equal = runner.run(chain4s, ctx, "");
+            runner.report = true;
+            const bool same = equal && runner.last.ok && runner.expected.pc == runner.actual.pc &&
+                              std::memcmp(runner.expected.v, runner.actual.v, sizeof runner.expected.v) == 0;
+            if (!same) {
+                runner.run(chain4s, ctx, "minmax chain 4s");
+                runner.machine.options.optimize = -1;
+                FX_CHECK(false);
+                return;
+            }
+        }
+        for (unsigned k = 0; k < 32; ++k) {
+            auto ctx = runner.context(93000 + k);
+            for (unsigned r = 0; r < 4; ++r)
+                for (unsigned h = 0; h < 2; ++h)
+                    ctx.v[r][h] = kEdge64[k < 6 ? rng.below(6) : rng.below(static_cast<unsigned>(std::size(kEdge64)))];
+            runner.report = false;
+            runner.last = {};
+            const bool equal = runner.run(chain2d, ctx, "");
+            runner.report = true;
+            const bool same = equal && runner.last.ok && runner.expected.pc == runner.actual.pc &&
+                              std::memcmp(runner.expected.v, runner.actual.v, sizeof runner.expected.v) == 0;
+            if (!same) {
+                runner.run(chain2d, ctx, "minmax chain 2d");
+                runner.machine.options.optimize = -1;
+                FX_CHECK(false);
+                return;
+            }
+        }
+    }
+    runner.machine.options.optimize = -1;
+}
+
+// Wave G: lane-mask dataflow through MOV, SXTL .2D, AND/NOT, .2S compare -> vblendvps;
+// bridged min3 + fneg + fcmge + max3 chain under one vptest; 6-op BVH8 FMIN chain
+// under high vector pressure; const minmax on non-quiet (entry) inputs with +-0/NaN.
+FX_TEST(neon_wave_g_lane_masks_and_minmax) {
+    ensure_registered();
+    // 1. Embree sorting-network + SXTL .2D + bitwise mask algebra -> BSL/BIT uses vblendvps.
+    //   sshr  v0.4s, v0.4s, #31          (0x4f210400)
+    //   mov   v7.16b, v0.16b             (0x4ea01c07)  <- copy of lane_masks!
+    //   bsl   v7.16b, v1.16b, v2.16b     (0x6e621c27)  <- must lower to vblendvps
+    //   not   v6.16b, v0.16b             (0x6e205806)  <- NOT of lane_masks
+    //   and   v6.16b, v6.16b, v0.16b     (0x4e201cc6)  <- AND of lane_masks
+    //   bit   v3.16b, v1.16b, v6.16b     (0x6ea61c23)  <- must lower to vblendvps
+    //   fcmge v4.2s, v4.2s, #0.0         (0x2ea0c884)  <- .2S (Q=0) compare!
+    //   sxtl  v4.2d, v4.2s               (0x0f20a484)  <- sign-extend .2S -> .2D!
+    //   bit   v5.16b, v1.16b, v4.16b     (0x6ea41c25)  <- must lower to vblendvps
+    const std::vector<std::uint32_t> blend_prog{
+        0x4f210400u, 0x4ea01c07u, 0x6e621c27u,
+        0x6e205806u, 0x4e201cc6u, 0x6ea61c23u,
+        0x2ea0c884u, 0x0f20a484u, 0x6ea41c25u,
+    };
+    const auto count_vblendvps = [](const std::vector<TranslatedRegion>& regs) {
+        unsigned n = 0;
+        for (const auto& t : regs)
+            for (std::size_t k = 0; k + 4 < t.code.size(); ++k)
+                if (t.code[k] == 0xc4 && (t.code[k + 1] & 0x1fu) == 3u && (t.code[k + 2] & 3u) == 1u &&
+                    t.code[k + 3] == 0x4au)
+                    ++n;
+        return n;
+    };
+    const auto count_vptest = [](const std::vector<TranslatedRegion>& regs) {
+        unsigned n = 0;
+        for (const auto& t : regs)
+            for (std::size_t k = 0; k + 3 < t.code.size(); ++k)
+                if (t.code[k] == 0xc4 && (t.code[k + 1] & 0x1fu) == 2u && (t.code[k + 2] & 3u) == 1u &&
+                    t.code[k + 3] == 0x17u)
+                    ++n;
+        return n;
+    };
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    {
+        for (unsigned k = 0; k < 8; ++k)
+            FX_CHECK(runner.run(blend_prog, runner.context(94000 + k), "wave_g lane masks"));
+        if (cpu_features().avx) FX_CHECK(count_vblendvps(runner.machine.regions) >= 3u);
+    }
+
+    // 2. Bridged min3 + fneg + fcmge + max3 on the SAME 3 inputs (v5, v7, v1):
+    //   fmin  v12.4s, v5.4s, v7.4s       (0x4ea7f4ac)
+    //   fmin  v12.4s, v12.4s, v1.4s      (0x4ea1f58c)
+    //   fneg  v3.4s, v10.4s              (0x6ea0f943)
+    //   fcmge v12.4s, v12.4s, v3.4s      (0x6e23e58c)
+    //   fmax  v0.4s, v5.4s, v7.4s        (0x4e27f4a0)
+    //   fmax  v1.4s, v0.4s, v1.4s        (0x4e21f401)
+    const std::vector<std::uint32_t> bridged_prog{
+        0x4ea7f4acu, 0x4ea1f58cu, 0x6ea0f943u, 0x6e23e58cu, 0x4e27f4a0u, 0x4e21f401u,
+    };
+
+    // 3. 6-op BVH8 slab FMIN chain with 7 read-only inputs (exercises mem-slot inputs).
+    //   fmin v8.4s,  v0.4s, v1.4s        (0x4ea1f408)
+    //   fmin v9.4s,  v2.4s, v3.4s        (0x4ea3f449)
+    //   fmin v10.4s, v4.4s, v6.4s        (0x4ea6f48a)
+    //   fmin v11.4s, v5.4s, v6.4s        (0x4ea6f4ab)
+    //   fmin v8.4s,  v8.4s, v10.4s       (0x4eaaf508)
+    //   fmin v9.4s,  v9.4s, v11.4s       (0x4eabf529)
+    const std::vector<std::uint32_t> bvh8_prog{
+        0x4ea1f408u, 0x4ea3f449u, 0x4ea6f48au, 0x4ea6f4abu, 0x4eaaf508u, 0x4eabf529u,
+    };
+
+    // 4. Const minmax with non-quiet entry input + MOV/DUP propagated constants (+1.0, +0.0, -0.0).
+    //   fmov  v16.4s, #1.0               (0x4f03f610)
+    //   mov   v17.16b, v16.16b           (0x4eb01e11)
+    //   fmin  v2.4s, v0.4s, v17.4s       (0x4eb1f402)
+    //   movi  v18.4s, #0                 (0x4f000412)
+    //   fneg  v19.4s, v18.4s             (0x6ea0fa53)  <- -0.0
+    //   fmax  v3.4s, v1.4s, v19.4s       (0x4e33f423)  <- FMAX(x, -0.0) on non-quiet x
+    //   fmin  v4.4s, v1.4s, v18.4s       (0x4eb2f424)  <- FMIN(x, +0.0) on non-quiet x
+    const std::vector<std::uint32_t> const_prog{
+        0x4f03f610u, 0x4eb01e11u, 0x4eb1f402u, 0x4f000412u, 0x6ea0fa53u, 0x4e33f423u, 0x4eb2f424u,
+    };
+
+    static constexpr std::uint32_t kEdge32[] = {
+        0x00000000u, 0x80000000u, 0x3f800000u, 0xbf800000u, 0x7f800000u, 0xff800000u,
+        0x7fc00001u, 0xffc00002u, 0x7fa00003u, 0xff800004u, 0x00000001u, 0x80000001u,
+    };
+    coretest::Rng rng(0x9a1e2026u);
+    for (unsigned p = 0; p < 3; ++p) {
+        const auto& prog = p == 0 ? bridged_prog : p == 1 ? bvh8_prog : const_prog;
+        for (const int optimize : {1, 0}) {
+            runner.machine.options.optimize = static_cast<std::int8_t>(optimize);
+            for (unsigned k = 0; k < 24; ++k) {
+                auto ctx = runner.context(95000 + p * 100 + k);
+                const bool fz = k >= 20;
+                if (fz) ctx.fpcr |= 1u << 24;   // FZ=1
+                for (unsigned r = 0; r < 12; ++r) {
+                    for (unsigned h = 0; h < 2; ++h) {
+                        const std::uint32_t lo = kEdge32[k < 4 ? rng.below(6) : rng.below(static_cast<unsigned>(std::size(kEdge32)))];
+                        const std::uint32_t hi = kEdge32[k < 4 ? rng.below(6) : rng.below(static_cast<unsigned>(std::size(kEdge32)))];
+                        ctx.v[r][h] = static_cast<std::uint64_t>(lo) | (static_cast<std::uint64_t>(hi) << 32);
+                    }
+                }
+                // TestMachine::enter does not load MXCSR from ctx.fpcr; sync host DAZ|FTZ for FZ=1 runs.
+                struct MxcsrGuard {
+                    unsigned saved;
+                    explicit MxcsrGuard(bool enable_fz) : saved(_mm_getcsr()) {
+                        if (enable_fz) _mm_setcsr(saved | 0x8040u);
+                    }
+                    ~MxcsrGuard() { _mm_setcsr(saved); }
+                };
+                runner.report = false;
+                runner.last = {};
+                bool equal = false;
+                {
+                    MxcsrGuard guard(fz);
+                    equal = runner.run(prog, ctx, "");
+                }
+                runner.report = true;
+                const bool same = equal && runner.last.ok && runner.expected.pc == runner.actual.pc &&
+                                  std::memcmp(runner.expected.v, runner.actual.v, sizeof runner.expected.v) == 0;
+                if (!same) {
+                    MxcsrGuard guard(fz);
+                    runner.run(prog, ctx, "wave_g minmax");
+                    runner.machine.options.optimize = -1;
+                    FX_CHECK(false);
+                    return;
+                }
+                if (k == 0 && optimize == 1 && p < 2 && cpu_features().avx)
+                    FX_CHECK_EQ(count_vptest(runner.machine.regions), 1u);
+            }
+        }
+    }
+    runner.machine.options.optimize = -1;
+}
+
+// Wave I: target_flags_dead scanning through FP/SIMD prologues (STP D8, D9) +
+// FCMP (writes_flags) and rejecting FCSEL (reads_flags), plus region-level
+// AVX XMM-domain FCSEL (vblendvps/vblendvpd) sharing live integer and fused
+// FCMP flags across back-to-back selects.
+FX_TEST(neon_wave_i_fcsel_and_fp_prologue_dead_flags) {
+    ensure_registered();
+    DiffRunner runner;
+    runner.check_relocatable = false;
+
+    // 1. target_flags_dead through STP D8, D9, [SP, #-32]! + >16 insns + FCMP S0, S1.
+    constexpr std::uint32_t kCmpX1X2 = 0xeb02003fu;     // cmp x1, x2
+    constexpr std::uint32_t kBl2 = 0x94000002u;         // bl +8 (word 3)
+    constexpr std::uint32_t kNop = 0xd503201fu;         // nop
+    constexpr std::uint32_t kStpD8D9 = 0x6dbe27e8u;     // stp d8, d9, [sp, #-32]!
+    constexpr std::uint32_t kFcmpS0S1 = 0x1e212000u;    // fcmp s0, s1 (writes_flags)
+    constexpr std::uint32_t kFcselEq = 0x1e210c02u;     // fcsel s2, s0, s1, eq (reads_flags)
+
+    const auto translate_cut = [&](const std::vector<std::uint32_t>& words) {
+        auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(runner.program_base()));
+        std::memcpy(program, words.data(), words.size() * 4);
+        BufferCode code(runner.code_base(), runner.program_base() + words.size() * 4);
+        code.image = true;
+        TranslateOptions options;
+        options.max_instructions = 2;
+        return translate_region(runner.program_base(), code, options);
+    };
+    const auto has_raw_store = [](const TranslatedRegion& reg) {
+        constexpr std::int32_t kNzcv = ctx_disp(offsetof(GuestContext, nzcv));
+        const std::uint8_t pat[8] = {
+            0x66, 0x41, 0x89, 0x87,
+            static_cast<std::uint8_t>(static_cast<std::uint32_t>(kNzcv)),
+            static_cast<std::uint8_t>(static_cast<std::uint32_t>(kNzcv) >> 8),
+            static_cast<std::uint8_t>(static_cast<std::uint32_t>(kNzcv) >> 16),
+            static_cast<std::uint8_t>(static_cast<std::uint32_t>(kNzcv) >> 24),
+        };
+        return std::search(reg.code.begin(), reg.code.end(), pat, pat + 8) != reg.code.end();
+    };
+    const bool dead_on = core::codegen_on(core::knob_no_dead_targets);
+
+    // Cycles-style prologue starting with STP D8, D9 (family insn at k==0) then 18 NOPs then FCMP.
+    // (End with kNop rather than kRet so call inlining keeps the BL as an exit.)
+    std::vector<std::uint32_t> fp_prologue = {kCmpX1X2, kBl2, kNop, kStpD8D9};
+    for (unsigned i = 0; i < 18; ++i) fp_prologue.push_back(kNop);
+    fp_prologue.push_back(kFcmpS0S1);
+    fp_prologue.push_back(kNop);
+    FX_CHECK_EQ(has_raw_store(translate_cut(fp_prologue)), !dead_on);
+
+    // Prologue starting with STP D8, D9 then FCSEL (reads flags!): must keep raw store.
+    FX_CHECK(has_raw_store(translate_cut({kCmpX1X2, kBl2, kNop, kStpD8D9, kFcselEq, kFcmpS0S1, kNop})));
+
+    // 2. Back-to-back FCSEL S/D sharing live flags (both integer CMP and fused FCMP,
+    //    covering ordered/unordered conditions: EQ, GT, LE, LT, GE, MI, HI) + AVX vblendv check.
+    const auto fcsel_w = [](unsigned ftype, unsigned rd, unsigned rn, unsigned rm, unsigned cond) {
+        return 0x1e200c00u | (ftype << 22) | (rm << 16) | (cond << 12) | (rn << 5) | rd;
+    };
+    const std::vector<std::uint32_t> fcsel_prog = {
+        0x1e212800u,                  // fadd s0, s0, s1 (zero_above 32)
+        0x1e222821u,                  // fadd s1, s1, s2 (zero_above 32)
+        0x1e632842u,                  // fadd d2, d2, d3 (zero_above 64)
+        0x1e642863u,                  // fadd d3, d3, d4 (zero_above 64)
+        0xeb02003fu,                  // cmp x1, x2 (integer flags shared across 2 FCSELs)
+        fcsel_w(0, 5, 0, 1, 0),       // fcsel s5, s0, s1, eq
+        fcsel_w(1, 6, 2, 3, 12),      // fcsel d6, d2, d3, gt (reads same integer flags!)
+        0x1e212000u,                  // fcmp s0, s1 (fused FCMP flags!)
+        fcsel_w(0, 7, 5, 0, 12),      // fcsel s7, s5, s0, gt (and_np condition, flags live!)
+        fcsel_w(0, 8, 1, 5, 13),      // fcsel s8, s1, s5, le (or_p condition, flags live!)
+        fcsel_w(1, 9, 6, 2, 4),       // fcsel d9, d6, d2, mi (single condition, flags live!)
+        fcsel_w(1, 10, 3, 6, 8),      // fcsel d10, d3, d6, hi
+        0x1e632040u,                  // fcmp d2, d3
+        fcsel_w(1, 11, 9, 10, 11),    // fcsel d11, d9, d10, lt
+        fcsel_w(0, 12, 7, 8, 10),     // fcsel s12, s7, s8, ge
+    };
+    const auto count_vblendv = [](const std::vector<TranslatedRegion>& regs, std::uint8_t opc) {
+        unsigned n = 0;
+        for (const auto& t : regs)
+            for (std::size_t k = 0; k + 4 < t.code.size(); ++k)
+                if (t.code[k] == 0xc4 && (t.code[k + 1] & 0x1fu) == 3u && (t.code[k + 2] & 3u) == 1u &&
+                    t.code[k + 3] == opc)
+                    ++n;
+        return n;
+    };
+    static constexpr std::uint32_t kEdgeS[] = {0x00000000u, 0x80000000u, 0x3f800000u, 0xbf800000u, 0x7fc12345u};
+    static constexpr std::uint64_t kEdgeD[] = {0x0000000000000000ULL, 0x8000000000000000ULL, 0x3ff0000000000000ULL,
+                                               0xbff0000000000000ULL, 0x7ff8123456789abcULL};
+    for (unsigned k = 0; k < 16; ++k) {
+        auto ctx = runner.context(96000 + k);
+        if (k < 5) {
+            ctx.x[1] = k;
+            ctx.x[2] = 2;
+            ctx.v[0][0] = 0xdeadbeef00000000ULL | kEdgeS[k];
+            ctx.v[0][1] = 0xcafebabe01234567ULL;
+            ctx.v[1][0] = 0x1122334400000000ULL | kEdgeS[(k + 2) % 5];
+            ctx.v[2][0] = kEdgeD[k];
+            ctx.v[2][1] = 0xfedcba9876543210ULL;
+            ctx.v[3][0] = kEdgeD[(k + 3) % 5];
+        }
+        FX_CHECK(runner.run(fcsel_prog, ctx, "wave i region fcsel " + std::to_string(k)));
+        if (k == 0 && cpu_features().avx) {
+            FX_CHECK(count_vblendv(runner.machine.regions, 0x4au) >= 4u);   // vblendvps
+            FX_CHECK(count_vblendv(runner.machine.regions, 0x4bu) >= 4u);   // vblendvpd
+        }
+    }
+}
+
+// Wave N3 + O5a:
+// 1. emit_minmax_chain sz_dead single-op vminps/vmaxps lowering when feeding
+//    FCMGE/FCMEQ/FCMGT and result is overwritten, while preserving exact signed
+//    zeros (-0.0 vs +0.0) when an intermediate or final reduction escapes or
+//    crosses a may_fault instruction!
+// 2. emit_mask_reduce dead-Vd elision (when fused FMOV extracts to Wt and Vd is
+//    immediately overwritten) vs live-Vd preservation.
+FX_TEST(neon_waves_n_to_p_minmax_sz_dead_and_mask_drop) {
+    ensure_registered();
+    DiffRunner runner;
+    runner.check_relocatable = false;
+
+    const auto fmin4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x4ea0f400u | (rm << 16) | (rn << 5) | rd;   // fmin Vd.4S, Vn.4S, Vm.4S
+    };
+    const auto fmax4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x4e20f400u | (rm << 16) | (rn << 5) | rd;   // fmax Vd.4S, Vn.4S, Vm.4S
+    };
+    const auto fcmge4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x6e20e400u | (rm << 16) | (rn << 5) | rd;   // fcmge Vd.4S, Vn.4S, Vm.4S
+    };
+    const auto fneg4s = [](unsigned rd, unsigned rn) {
+        return 0x6ea0f800u | (rn << 5) | rd;                // fneg Vd.4S, Vn.4S
+    };
+    const auto eor16b = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x6e201c00u | (rm << 16) | (rn << 5) | rd;   // eor Vd.16B, Vn.16B, Vm.16B
+    };
+    const auto and16b = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x4e201c00u | (rm << 16) | (rn << 5) | rd;   // and Vd.16B, Vn.16B, Vm.16B
+    };
+    const auto ushl4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x6ea04400u | (rm << 16) | (rn << 5) | rd;   // ushl Vd.4S, Vn.4S, Vm.4S
+    };
+    const auto addv4s = [](unsigned rd, unsigned rn) {
+        return 0x4eb1b800u | (rn << 5) | rd;                // addv Sd, Vn.4S
+    };
+    const auto fmov_w_s = [](unsigned wt, unsigned sn) {
+        return 0x1e260000u | (sn << 5) | wt;                // fmov Wt, Sn
+    };
+
+    // Program 1: Embree-style sz_dead reduction chain (FMIN+FMIN+FNEG+FCMGE overwriting v12)
+    // followed by escaping FMIN+FMIN into v13 and escaping FMAX+FMAX into v14 (must keep exact signed zero!).
+    const std::vector<std::uint32_t> minmax_prog = {
+        fmin4s(12, 1, 7),      // v12 = min(v1, v7)
+        fmin4s(12, 12, 5),     // v12 = min(v12, v5)
+        fneg4s(2, 10),         // v2 = -v10
+        fcmge4s(12, 12, 2),    // v12 = (v12 >= v2) -> overwrites v12: sz_dead!
+        fmin4s(13, 1, 7),      // escaping reduction: FMIN(FMIN(+0.0, -0.0), +0.0) MUST be -0.0!
+        fmin4s(13, 13, 5),
+        fmax4s(14, 1, 7),      // escaping reduction: FMAX(FMAX(-0.0, +0.0), -0.0) MUST be +0.0!
+        fmax4s(14, 14, 5),
+    };
+    // Test all signed-zero, normal, infinity, quiet-NaN, and signaling-NaN combinations.
+    static constexpr std::uint32_t kVals[] = {
+        0x00000000u, 0x80000000u, 0x3f800000u, 0xbf800000u,
+        0x7f800000u, 0xff800000u, 0x7fc12345u, 0x7f800001u,
+    };
+    const auto pack4 = [](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        return std::pair<std::uint64_t, std::uint64_t>{
+            static_cast<std::uint64_t>(a) | (static_cast<std::uint64_t>(b) << 32),
+            static_cast<std::uint64_t>(c) | (static_cast<std::uint64_t>(d) << 32),
+        };
+    };
+    for (unsigned k = 0; k < 16; ++k) {
+        auto ctx = runner.context(97000 + k);
+        const auto p1 = pack4(kVals[k & 7], kVals[(k + 1) & 7], kVals[(k + 2) & 7], kVals[(k + 3) & 7]);
+        const auto p7 = pack4(kVals[(k + 1) & 7], kVals[k & 7], kVals[(k + 4) & 7], kVals[(k + 5) & 7]);
+        const auto p5 = pack4(kVals[k & 7], kVals[(k + 2) & 7], kVals[(k + 6) & 7], kVals[(k + 7) & 7]);
+        const auto p10 = pack4(0x00000000u, 0x80000000u, 0x3f800000u, 0xbf800000u);
+        ctx.v[1][0] = p1.first;  ctx.v[1][1] = p1.second;
+        ctx.v[7][0] = p7.first;  ctx.v[7][1] = p7.second;
+        ctx.v[5][0] = p5.first;  ctx.v[5][1] = p5.second;
+        ctx.v[10][0] = p10.first; ctx.v[10][1] = p10.second;
+        FX_CHECK(runner.run(minmax_prog, ctx, "wave n3 minmax sz_dead " + std::to_string(k)));
+    }
+
+    // Program 2: Wave O5a emit_mask_reduce with dead Vd (immediately overwritten by eor v4, v1, v2)
+    // and with live Vd (escaping v5), tested on both exact {0,1,2,3} fast path and fallback shifts.
+    const std::vector<std::uint32_t> mask_prog = {
+        and16b(4, 10, 11),     // v4 = v10 & v11 (mask = 1s)
+        ushl4s(4, 4, 12),      // v4 = ushl(v4, v12) (shifts = {0,1,2,3} or non-standard)
+        addv4s(4, 4),          // s4 = addv(v4.4s)
+        fmov_w_s(0, 4),        // w0 = s4
+        eor16b(4, 1, 2),       // overwrites v4 immediately -> drop_vd!
+        and16b(5, 10, 11),     // second idiom where v5 stays live!
+        ushl4s(5, 5, 12),
+        addv4s(5, 5),
+        fmov_w_s(1, 5),
+    };
+    for (unsigned k = 0; k < 8; ++k) {
+        auto ctx = runner.context(97500 + k);
+        const auto m = pack4((k & 1) ? 0xffffffffu : 0u, (k & 2) ? 0xffffffffu : 0u,
+                             (k & 4) ? 0xffffffffu : 0u, (k & 1) ? 0u : 0xffffffffu);
+        ctx.v[10][0] = m.first; ctx.v[10][1] = m.second;
+        const auto ones = pack4(1u, 1u, 1u, 1u);
+        const auto shifts = (k < 4) ? pack4(0u, 1u, 2u, 3u) : pack4(0u, 2u, 0xffffffffu, 4u);
+        ctx.v[11][0] = ones.first;   ctx.v[11][1] = ones.second;
+        ctx.v[12][0] = shifts.first; ctx.v[12][1] = shifts.second;
+        FX_CHECK(runner.run(mask_prog, ctx, "wave o5a mask_reduce drop_vd " + std::to_string(k)));
+    }
+
+    // Program 3: Wave O4 FCMP + CCMP + B.NE single-cond fusion (Cycles Blender+0x2e48e0c idiom:
+    // `fcmp s10, #0.0; ccmp w9, #3, #0, le; b.ne target`) across <0, -0.0, +0.0, >0, and NaN!
+    const std::vector<std::uint32_t> fcmp_ccmp_prog = {
+        0x1e202148u,                                         // 0  fcmp s10, #0.0
+        0x7a43d920u,                                         // 1  ccmp w9, #3, #0, le (cond=13 LE, nzcv=0)
+        0x54000041u,                                         // 2  b.ne +2 (4)
+        0x91005400u,                                         // 3  add x0, x0, #21
+        0x91002c00u,                                         // 4  add x0, x0, #11
+        0x1e202148u,                                         // 5  fcmp s10, #0.0
+        0x7a43c924u,                                         // 6  ccmp w9, #3, #4, gt (cond=12 GT, nzcv=4)
+        0x54000040u,                                         // 7  b.eq +2 (9)
+        0x91007401u,                                         // 8  add x1, x1, #29
+        0x91000401u,                                         // 9  add x1, x1, #1
+    };
+    static constexpr std::uint32_t kFcmpVals[] = {
+        0xbf800000u, 0x80000000u, 0x00000000u, 0x3f800000u, 0x7fc00000u,
+    };
+    for (unsigned i = 0; i < std::size(kFcmpVals); ++i) {
+        for (unsigned w9 : {2u, 3u, 4u}) {
+            auto ctx = runner.context(97800 + i * 10 + w9);
+            ctx.v[10][0] = kFcmpVals[i];
+            ctx.x[9] = w9;
+            FX_CHECK(runner.run(fcmp_ccmp_prog, ctx, "wave o4 fcmp+ccmp " + std::to_string(i) + "/" + std::to_string(w9)));
+        }
+    }
+}
+
+// Wave Q1: 13-instruction Embree BVH8-style minmax chain (kMaxChain=16) with
+// vec_sz_dead_after crossing 4 intervening NEON mask ops to a second FCMGE,
+// preserving bit-exact signed zero on escaping outputs and NaN inputs.
+FX_TEST(neon_wave_q1_embree_minmax_chain_and_sz_dead) {
+    ensure_registered();
+    coretest::DiffRunner runner;
+    runner.check_relocatable = false;
+    auto fmax4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x4e20f400u | (rm << 16) | (rn << 5) | rd;
+    };
+    auto fmin4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x4ea0f400u | (rm << 16) | (rn << 5) | rd;
+    };
+    auto fcmge4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x6e20e400u | (rm << 16) | (rn << 5) | rd;
+    };
+    auto and16b = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x4e201c00u | (rm << 16) | (rn << 5) | rd;
+    };
+    auto ushl4s = [](unsigned rd, unsigned rn, unsigned rm) {
+        return 0x6ea04400u | (rm << 16) | (rn << 5) | rd;
+    };
+    auto addv4s = [](unsigned rd, unsigned rn) {
+        return 0x4eb1b800u | (rn << 5) | rd;
+    };
+    auto fmov_w_s = [](unsigned rd, unsigned rn) {
+        return 0x1e260000u | (rn << 5) | rd;
+    };
+    const std::vector<std::uint32_t> bvh8 = {
+        // 6 FMAX (tNear_lo -> v9, tNear_hi -> v11, both escape!)
+        fmax4s(9, 9, 8),
+        fmax4s(11, 11, 4),
+        fmax4s(8, 7, 14),
+        fmax4s(4, 2, 14),
+        fmax4s(9, 9, 8),
+        fmax4s(11, 11, 4),
+        // 6 FMIN (tFar_lo -> v8, tFar_hi -> v4; v7 & v2 escape so must stay exact!)
+        fmin4s(8, 0, 15),
+        fmin4s(4, 1, 16),
+        fmin4s(7, 1, 17),
+        fmin4s(2, 1, 18),
+        fmin4s(8, 8, 7),
+        fmin4s(4, 4, 2),
+        // 13th op in unified chain: FCMGE v4, v4, v11
+        fcmge4s(4, 4, 11),
+        // 4 intervening mask-reduce ops on v4 (do not touch v8)
+        and16b(4, 4, 3),
+        ushl4s(4, 4, 10),
+        addv4s(4, 4),
+        fmov_w_s(14, 4),
+        // Second FCMGE overwriting v8 -> proves v8 sz_dead across intervening NEON!
+        fcmge4s(8, 8, 9),
+        and16b(8, 8, 3),
+        ushl4s(8, 8, 10),
+        addv4s(8, 8),
+        fmov_w_s(12, 8),
+    };
+    static constexpr std::uint32_t kVals[] = {
+        0x00000000u, 0x80000000u, 0x3f800000u, 0xbf800000u,
+        0x40400000u, 0x7f800000u, 0xff800000u, 0x7fc01234u,
+    };
+    const auto pack4 = [](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        return std::pair<std::uint64_t, std::uint64_t>{
+            static_cast<std::uint64_t>(a) | (static_cast<std::uint64_t>(b) << 32),
+            static_cast<std::uint64_t>(c) | (static_cast<std::uint64_t>(d) << 32),
+        };
+    };
+    for (unsigned k = 0; k < 16; ++k) {
+        auto ctx = runner.context(98100 + k);
+        const auto ones = pack4(1u, 1u, 1u, 1u);
+        const auto shifts = pack4(0u, 1u, 2u, 3u);
+        ctx.v[3][0] = ones.first;   ctx.v[3][1] = ones.second;
+        ctx.v[10][0] = shifts.first; ctx.v[10][1] = shifts.second;
+        for (unsigned reg : {0u, 1u, 2u, 4u, 7u, 8u, 9u, 11u, 14u, 15u, 16u, 17u, 18u}) {
+            const unsigned base = (k + reg) & 7u;
+            // Keep k < 12 NaN-free (fast path) and k >= 12 with NaNs (cold path).
+            const unsigned mask = (k < 12) ? 6u : 7u;
+            const auto p = pack4(kVals[base & mask], kVals[(base + 1) & mask],
+                                 kVals[(base + 2) & mask], kVals[(base + 3) & mask]);
+            ctx.v[reg][0] = p.first;
+            ctx.v[reg][1] = p.second;
+        }
+        FX_CHECK(runner.run(bvh8, ctx, "wave q1 embree bvh8 13-op chain " + std::to_string(k)));
+    }
 }

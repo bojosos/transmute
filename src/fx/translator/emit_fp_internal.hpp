@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <stdexcept>
 
 namespace transmute::fx::fpx {
@@ -394,6 +395,13 @@ bool emit_estimate(FpEmit& e, const Inst& in);    // frecpe/frsqrte/frecpx/frecp
 bool emit_sysreg(FpEmit& e, const Inst& in);      // MRS/MSR FPCR/FPSR
 bool emit_frint_n(FpEmit& e, const Inst& in);     // FRINT32*/FRINT64*
 bool emit_fhm(FpEmit& e, const Inst& in);         // FMLAL/FMLSL(2)
+// Consecutive independent 128-bit by-element FMUL/FMLA/FMLS pair sharing (es, rm, index):
+// broadcasts rm[index] once and emits both operations.
+bool emit_elem_pair(FpEmit& e, const Inst& in0, const Inst& in1);
+// Consecutive 128-bit FMAX/FMIN/FMAXNM/FMINNM chain (AVX, cold deferral, dead host flags):
+// checks NaN once across all unique initial inputs before writing any destination, then runs
+// the numeric fast paths sequentially (cold stub runs exact FPProcessNaNs on intact inputs).
+unsigned emit_minmax_chain(FpEmit& e, std::span<const std::uint32_t> words);
 
 // Shared building blocks.
 // out = exact A64 FMAX/FMIN/FMAXNM/FMINNM (kind) of (a, b) for shape s,

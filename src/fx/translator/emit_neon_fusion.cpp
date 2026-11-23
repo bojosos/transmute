@@ -68,7 +68,8 @@ bool match_mask_idiom(std::span<const std::uint32_t> words, MaskIdiom& m) {
     return true;
 }
 
-// FCMxx / FACxx / CMxx (register and zero forms) with 32- or 64-bit lanes:
+// FCMxx / FACxx / CMxx (register and zero forms) with 32- or 64-bit lanes,
+// plus SSHR .4S/.2S #31 and SSHR .2D #63 (sign-bit splat to all ones/zeros):
 // each 32-bit lane of the result is all ones or all zeros.
 bool is_lane_mask_compare(std::uint32_t w) {
     static constexpr std::uint32_t kThree[] = {   // mask 0xffa0fc00 (bit 22: S/D)
@@ -83,6 +84,8 @@ bool is_lane_mask_compare(std::uint32_t w) {
         if ((w & 0xffa0fc00u) == e) return true;
     for (const auto e : kZero)
         if ((w & 0xffbffc00u) == e) return true;
+    if ((w & 0xbffffc00u) == 0x0f210400u) return true;   // SSHR Vd.4S/.2S, Vn, #31 (upper 64 zero for 2S)
+    if ((w & 0xfffffc00u) == 0x4f410400u) return true;   // SSHR Vd.2D, Vn.2D, #63
     return false;
 }
 
@@ -254,6 +257,16 @@ unsigned mask_fact_want(std::span<const std::uint32_t> words, FamilyFactWant* ou
             out[count++] = {FamilyFactWant::K::derived, static_cast<std::uint8_t>(bits(words[0], 9, 5)), {kn, 0}};
         return count;
     }
+    // BSL/BIT/BIF with a proven 32-bit all-ones/all-zeros lane mask lowers to
+    // a single 1-uop vblendvps with zero scratch XMM registers.
+    if ((words[0] & 0xbf20fc00u) == 0x2e201c00u) {
+        const unsigned size = (words[0] >> 22) & 3u;
+        if (size != 0) {
+            const unsigned mask_reg = size == 1 ? (words[0] & 31u) : ((words[0] >> 16) & 31u);
+            out[0] = {FamilyFactWant::K::lane_masks, static_cast<std::uint8_t>(mask_reg), {}};
+            return 1;
+        }
+    }
     MaskIdiom m;
     if (!neon_on(neon_no_mask_fusion) || !match_mask_idiom(words, m)) return 0;
     unsigned n = 0;
@@ -338,12 +351,19 @@ unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words
     }
     if (!exact && !features().avx2) return 0;   // the general path uses vpsllvd/vpsrlvd
 
+    const bool defer = !exact && ctx.can_defer_cold();
+    const bool flags_live = ctx.host_flags_live();
     // A preceding compare often still feeds a later B.cond: a guard with RCX
-    // (JRCXZ) keeps the host flags; otherwise the context saves live flags.
+    // (JRCXZ) keeps the host flags; when host flags are dead, a direct flag
+    // compare avoids RCX/JRCXZ and macro-fuses with jne.
     Gp counter = Gp::none;
     if (!exact) {
-        counter = neon_on(neon_mask_no_rcx) ? ctx.temp_gpr_prefer(Gp::rcx) : Gp::none;
-        if (counter == Gp::none) ctx.clobber_host_flags();
+        if (!flags_live) {
+            ctx.clobber_host_flags();
+        } else {
+            counter = neon_on(neon_mask_no_rcx) ? ctx.temp_gpr_prefer(Gp::rcx) : Gp::none;
+            if (counter == Gp::none) ctx.clobber_host_flags();
+        }
     }
     V v(ctx);
     auto& a = v.a;
@@ -365,18 +385,25 @@ unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words
         counts = inline_counts ? source(ctx, m.shifts) : lazy(m.shifts);
         if (!m.ushr) mask = inline_mask ? source(ctx, m.rm) : lazy(m.rm);
     }
-    const Xmm t0 = (!exact || !sign_is_bit0) ? ctx.temp_vec() : Xmm{};
-    const Xmm t1 = !exact ? ctx.temp_vec() : Xmm{};
-    const Xmm t2 = !exact ? ctx.temp_vec() : Xmm{};
-    const Gp guard = !exact ? (counter != Gp::none ? counter : ctx.temp_gpr()) : Gp::none;
+    const bool need_inline_cmp = inline_counts || inline_mask;
+    const Xmm t0 = ((!exact && (!defer || need_inline_cmp)) || !sign_is_bit0) ? ctx.temp_vec() : Xmm{};
+    const Xmm t1 = (!exact && (!defer || inline_mask)) ? ctx.temp_vec() : Xmm{};
+    const Xmm t2 = (!exact && !defer) ? ctx.temp_vec() : Xmm{};
+    const Gp guard = !exact && (counter != Gp::none || need_inline_cmp)
+                         ? (counter != Gp::none ? counter : ctx.temp_gpr())
+                         : Gp::none;
     const Gp out = m.extract ? ctx.write_gpr(m.wt) : ctx.temp_gpr();
     // The destination too: allocated after the labels it could evict a dirty
     // cached register there, a write-back retry that leaves the whole region
     // without write-back (every vector result stored at once). Allocating it
     // early is safe: dst is written only by the final MOVD, after every read
     // of n, the counts and the mask (also when one of them is Vd: its host
-    // or its unchanged slot still holds the old value until then).
-    const Xmm dst = ctx.write_vec(m.rd);
+    // or its unchanged slot still holds the old value until then). When the
+    // fused FMOV extracts the result to Wt and Vd is dead immediately after,
+    // skip writing Vd (saves MOVD and frees an XMM register).
+    const unsigned consumed = m.extract ? 4u : 3u;
+    const bool drop_vd = m.extract && ctx.vec_dead_after(consumed, m.rd);
+    const Xmm dst = drop_vd ? Xmm{} : ctx.write_vec(m.rd);
     const auto fast = a.new_label(), done = a.new_label();
 
     if (!exact) {
@@ -393,6 +420,85 @@ unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words
             a.movmskps(guard, t0);
             if (counter != Gp::none) a.lea(64, counter, x64::ptr(counter, -15));
             else a.cmp(32, guard, 15);
+        }
+        if (defer) {
+            const auto cold = a.new_label();
+            if (counter != Gp::none) {
+                a.jrcxz_short(fast);
+                a.jmp(cold);
+                a.bind(fast);
+            } else {
+                a.jcc(x64::Cond::ne, cold);
+            }
+            // Fast path runs straight through inline; general fallback is deferred cold.
+            if (sign_is_bit0) {
+                a.movmskps(out, n);
+            } else {
+                v.pslld(t0, n, 31);
+                a.movmskps(out, t0);
+            }
+            a.bind(done);
+            if (!drop_vd) {
+                a.movd(dst, out);   // every source is consumed
+                ctx.note_vec_zero_above(m.rd, 32);
+            }
+
+            const Mem neg1 = v.k(splat32(0xffffffffu));
+            std::uint32_t used = 1u << x64::id(n);
+            if (!drop_vd) used |= 1u << x64::id(dst);
+            if (!counts.is_mem) used |= 1u << x64::id(counts.reg);
+            if (!m.ushr && !mask.is_mem) used |= 1u << x64::id(mask.reg);
+            const auto pick_free = [&]() {
+                for (unsigned r = 0; r < 16; ++r) {
+                    if (!((used >> r) & 1u)) {
+                        used |= 1u << r;
+                        return x64::xmm(r);
+                    }
+                }
+                throw std::logic_error("neon: no free xmm for cold mask_reduce stub");
+            };
+            const Xmm ct0 = pick_free(), ct1 = pick_free(), ct2 = pick_free();
+            auto* const as = &a;
+            const bool ushr = m.ushr;
+
+            ctx.defer_cold([=]() {
+                const auto vspill = [](unsigned slot) {
+                    return x64::ptr(Gp::r15, ctx_disp(offsetof(GuestContext, vspill) + 16u * slot));
+                };
+                as->bind(cold);
+                as->movups(vspill(28), ct0);
+                as->movups(vspill(29), ct1);
+                as->movups(vspill(30), ct2);
+
+                if (ushr) {
+                    as->vex_rr({1, 1, 0x72, false}, false, 2, x64::id(ct2), x64::id(n));   // vpsrld ct2, n, 31
+                    as->db(31);
+                } else if (mask.is_mem) {
+                    as->vex_rm({1, 1, 0xdb, false}, false, x64::id(ct2), x64::id(n), mask.mem);   // vpand
+                } else {
+                    as->vex_rr({1, 1, 0xdb, false}, false, x64::id(ct2), x64::id(n), x64::id(mask.reg));
+                }
+                Xmm c = ct1;
+                if (counts.is_mem) as->movdqu(c, counts.mem);
+                else c = counts.reg;
+                as->vex_rr({1, 1, 0x72, false}, false, 6, x64::id(ct1), x64::id(c));     // vpslld ct1, c, 24
+                as->db(24);
+                as->vex_rr({1, 1, 0x72, false}, false, 4, x64::id(ct1), x64::id(ct1));   // vpsrad ct1, ct1, 24
+                as->db(24);
+                as->vex_rr(vop::vpsllvd, false, x64::id(ct0), x64::id(ct2), x64::id(ct1));
+                as->vex_rm({1, 2, 0x0a, false}, false, x64::id(ct1), x64::id(ct1), neg1);   // vpsignd
+                as->vex_rr(vop::vpsrlvd, false, x64::id(ct2), x64::id(ct2), x64::id(ct1));
+                as->vex_rr({1, 1, 0xeb, false}, false, x64::id(ct2), x64::id(ct2), x64::id(ct0));   // vpor
+                as->vex_rr({1, 2, 0x02, false}, false, x64::id(ct2), x64::id(ct2), x64::id(ct2));   // vphaddd
+                as->vex_rr({1, 2, 0x02, false}, false, x64::id(ct2), x64::id(ct2), x64::id(ct2));   // vphaddd
+                as->movd(out, ct2);
+
+                as->movups(ct2, vspill(30));
+                as->movups(ct1, vspill(29));
+                as->movups(ct0, vspill(28));
+                as->jmp(done);
+            });
+            return m.extract ? 4u : 3u;
         }
         if (counter != Gp::none) a.jrcxz_short(fast);
         else a.jcc_short(x64::Cond::e, fast);
@@ -423,9 +529,11 @@ unsigned emit_mask_reduce(EmitContext& ctx, std::span<const std::uint32_t> words
         a.movmskps(out, t0);
     }
     a.bind(done);
-    a.movd(dst, out);   // every source is consumed
-    ctx.note_vec_zero_above(m.rd, 32);
-    return m.extract ? 4u : 3u;
+    if (!drop_vd) {
+        a.movd(dst, out);   // every source is consumed
+        ctx.note_vec_zero_above(m.rd, 32);
+    }
+    return consumed;
 }
 
 // Pairs of 16-bit long multiplies by element into one accumulator (8-tap

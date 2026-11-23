@@ -207,3 +207,80 @@ FX_TEST(fp_fjcvtzs_matches_reference) {
     };
     run_specs({s});
 }
+
+// Wave M1: Branchless FJCVTZS exhaustive IEEE edge-case check (exact Wd, NZCV,
+// and FPSR/MXCSR IXC/IOC across +-0, subnormals, fractional, INT32/UINT32/INT64
+// boundaries, |x| >= 2^63, +-inf, qNaN, sNaN, and both FPCR=0 and FPCR.FZ).
+FX_TEST(fp_fjcvtzs_branchless_edge_cases) {
+    static const std::uint64_t kBits[] = {
+        0x0000000000000000ULL,   // +0.0 (Z=1)
+        0x8000000000000000ULL,   // -0.0 (Z=0!)
+        0x0000000000000001ULL,   // +min subnormal (Z=0, IXC!)
+        0x8000000000000001ULL,   // -min subnormal
+        0x3ff0000000000000ULL,   // +1.0 (Z=1)
+        0xbff0000000000000ULL,   // -1.0 (Z=1)
+        0x3ff8000000000000ULL,   // +1.5 (Z=0)
+        0xbff8000000000000ULL,   // -1.5 (Z=0)
+        0x41dfffffffc00000ULL,   // +2147483647.0 (INT32_MAX, Z=1)
+        0x41e0000000000000ULL,   // +2147483648.0 (INT32_MAX+1, Z=0, wrap -> 0x80000000)
+        0xc1e0000000000000ULL,   // -2147483648.0 (INT32_MIN, Z=1)
+        0xc1e0000000200000ULL,   // -2147483649.0 (INT32_MIN-1, Z=0, wrap -> 0x7fffffff)
+        0x41f0000000000000ULL,   // +2^32 (Z=0, wrap -> 0)
+        0x41f0000000100000ULL,   // +2^32 + 1 (Z=0, wrap -> 1)
+        0xc1f0000000000000ULL,   // -2^32 (Z=0, wrap -> 0)
+        0x43dfffffffffffffULL,   // largest double < 2^63 (fits cvttsd2si r64!)
+        0x43e0000000000000ULL,   // +2^63 (overflows cvttsd2si r64 -> cold huge path!)
+        0xc3e0000000000000ULL,   // -2^63 (exactly 0x8000000000000000 -> cold huge path!)
+        0x43f0000000000000ULL,   // +2^64 (wrap -> 0)
+        0x7ff0000000000000ULL,   // +inf (0, Z=0)
+        0xfff0000000000000ULL,   // -inf (0, Z=0)
+        0x7ff8000000000000ULL,   // qNaN (0, Z=0)
+        0x7ff0000000000001ULL,   // sNaN (0, Z=0, IOC)
+    };
+    CheckOptions opt = exact_opt();
+    opt.reference = ref_fjcvtzs;
+    for (unsigned fpcr : {0u, 1u << 24}) {
+        for (unsigned k = 0; k < std::size(kBits); ++k) {
+            GuestContext ctx = testing::random_context(0x2f100u + fpcr + k);
+            ctx.fpcr = fpcr;
+            ctx.fpsr = 0;
+            ctx.v[1][0] = kBits[k];
+            ctx.v[1][1] = 0xdeadbeefcafebabeULL;
+            ctx.x[0] = 0x1122334455667788ULL;   // upper 32 bits must be zeroed!
+            check_word(0x1e7e0020u /* fjcvtzs w0, d1 */, ctx, opt, "wave m1 fjcvtzs edge");
+        }
+    }
+}
+
+// Wave I: AVX XMM-domain FCSEL (vblendvps/vblendvpd) across all 16 conditions,
+// NaN payloads, -0.0/+0.0, dirty upper lanes, aliasing (rd==rn, rd==rm, rn==rm),
+// and mixed register/memory sources via all alias_variants().
+FX_TEST(fp_fcsel_xmm_edge_cases) {
+    static const std::uint64_t kS[] = {0x00000000ULL, 0x80000000ULL, 0x3f800000ULL, 0xbf800000ULL,
+                                       0x7fc12345ULL, 0x7f800001ULL, 0xffc54321ULL, 0x00000001ULL};
+    static const std::uint64_t kD[] = {0x0000000000000000ULL, 0x8000000000000000ULL, 0x3ff0000000000000ULL,
+                                       0xbff0000000000000ULL, 0x7ff8123456789abcULL, 0x7ff0000000000001ULL,
+                                       0xfff8fedcba987654ULL, 0x0000000000000001ULL};
+    for (unsigned es : {32u, 64u}) {
+        const unsigned ftype = ftype_of(es);
+        const std::uint64_t* vals = es == 32 ? kS : kD;
+        // Distinct registers + rd==rn + rd==rm + rn==rm across all 16 conditions.
+        const unsigned triplets[][3] = {{2, 0, 1}, {0, 0, 1}, {1, 0, 1}, {2, 0, 0}};
+        for (const auto& t : triplets) {
+            for (unsigned cond = 0; cond < 16; ++cond) {
+                const std::uint32_t w = enc::fcsel(ftype, t[0], t[1], t[2], cond);
+                for (unsigned k = 0; k < 4; ++k) {
+                    GuestContext ctx = testing::random_context(0x1f000u + es * 1000u + cond * 16u + k);
+                    ctx.nzcv = ((cond ^ k) & 15u) << 28;
+                    ctx.v[0][0] = es == 32 ? (0xdeadbeef00000000ULL | vals[k * 2]) : vals[k * 2];
+                    ctx.v[0][1] = 0xcafebabefeedfaceULL;   // dirty upper lanes must be zeroed
+                    ctx.v[1][0] = es == 32 ? (0x1234567800000000ULL | vals[k * 2 + 1]) : vals[k * 2 + 1];
+                    ctx.v[1][1] = 0x0123456789abcdefULL;
+                    ctx.v[2][0] = 0xa5a5a5a5a5a5a5a5ULL;
+                    ctx.v[2][1] = 0x5a5a5a5a5a5a5a5aULL;
+                    check_word(w, ctx, exact_opt(), "wave i fcsel");
+                }
+            }
+        }
+    }
+}

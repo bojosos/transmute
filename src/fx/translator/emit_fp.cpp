@@ -1208,6 +1208,20 @@ unsigned fp_emit(EmitContext& ctx, std::span<const std::uint32_t> words) {
     auto& as = ctx.as();
     const auto start = as.size();
     neon::begin_instruction_constants(as);
+    if (words.size() >= 2 && in.index >= 0 && !in.sh.scalar && in.sh.q) {
+        fpx::Inst in1;
+        if (fpx::decode(words[1], in1) && fpx::supported(in1, e.feat) && fpx::emit_elem_pair(e, in, in1)) {
+            neon::flush_instruction_constants(as);
+            return 2;
+        }
+    }
+    if (words.size() >= 2 && !in.sh.scalar && in.sh.q &&
+        (in.k == fpx::K::fmax || in.k == fpx::K::fmin || in.k == fpx::K::fmaxnm || in.k == fpx::K::fminnm)) {
+        if (const unsigned consumed = fpx::emit_minmax_chain(e, words); consumed != 0) {
+            neon::flush_instruction_constants(as);
+            return consumed;
+        }
+    }
     if (!fpx::emit_inst(e, in)) {
         if (as.size() != start) throw std::logic_error("fp: emitter declined after emitting code");
         neon::begin_instruction_constants(as);   // drop pending constants
