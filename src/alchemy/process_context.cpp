@@ -386,6 +386,10 @@ void ProcessContext::set_call_leaf(std::uint64_t address, std::string_view symbo
     if (!traced_call(symbol)) mark_engine_call_custom_leaf(engine_, address, leaf, data);
 }
 
+bool ProcessContext::fast_path_allowed(std::string_view symbol) const {
+    return !traced_call(symbol) && !perf::enabled();
+}
+
 std::uint64_t ProcessContext::install_function(std::string symbol,
     transmute::GuestCallHandler handler, std::string library, const std::source_location& where) {
     registration_audit::record_export(system_alias(library) ? libsystem : std::string_view(library), symbol, where,
@@ -477,8 +481,12 @@ std::uint64_t ProcessContext::install_function(std::string symbol,
     // SIMD/FP register: their entries copy only the integer state. A callee
     // that runs guest code (objc_release -> dealloc) is fine: the vector
     // registers it leaves behind are caller-saved or restored by the callee.
-    static const std::array<std::string_view, 31> integer_only{
-        "___tlv_bootstrap", "__tlv_bootstrap", "__alchemy_tlv_bootstrap_slow_path", "_malloc", "_calloc", "_free", "_realloc", "_posix_memalign", "_malloc_size",
+    static const std::array<std::string_view, 37> integer_only{
+        "___tlv_bootstrap", "__tlv_bootstrap", "__alchemy_tlv_bootstrap_slow_path",
+        "__alchemy_pthread_self_slow", "__alchemy_pthread_getspecific_slow",
+        "__alchemy_os_unfair_lock_lock_slow", "__alchemy_os_unfair_lock_trylock_slow", "__alchemy_os_unfair_lock_unlock_slow",
+        "_sched_yield",
+        "_malloc", "_calloc", "_free", "_realloc", "_posix_memalign", "_malloc_size",
         "_memcpy", "_memmove", "_memset", "_bzero", "_memcmp", "_memchr", "_strlen", "_strcmp", "_strncmp", "_strchr",
         "_strcpy", "_pthread_self", "_pthread_equal", "_pthread_mutex_lock", "_pthread_mutex_unlock",
         "_pthread_mutex_trylock", "_pthread_getspecific", "_pthread_setspecific", "___error", "_objc_retain",

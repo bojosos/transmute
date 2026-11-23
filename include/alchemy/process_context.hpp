@@ -158,6 +158,9 @@ public:
     // `symbol` (engine_adapter.hpp's CallLeaf). Not set while `symbol` is
     // traced (ALCHEMY_TRACE_CALLS): the trace keeps every call.
     void set_call_leaf(std::uint64_t address, std::string_view symbol, bool (*leaf)(std::uint64_t* x, void* data), void* data);
+    // True when a provider may export a guest-code fast path for `symbol`
+    // (not traced by ALCHEMY_TRACE_CALLS and not profiled by ALCHEMY_PERF).
+    [[nodiscard]] bool fast_path_allowed(std::string_view symbol) const;
     void install_export(std::string library, std::string symbol, RuntimeExport value,
         const std::source_location& where = std::source_location::current());
     [[nodiscard]] std::optional<RuntimeExport> resolve(std::string_view library,

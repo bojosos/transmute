@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -591,6 +593,15 @@ struct FxEngine::Shared {
         return !(length == 1 && value[0] == '0');
     }();
 
+    // MAP_JIT ranges tracked until the guest actually uses the Apple Silicon
+    // MAP_JIT W^X contract (pthread_jit_write_protect_np): programs that never
+    // call it (e.g. synthetic tests rewriting MAP_JIT without icache flushes)
+    // keep exact SMC write protection; real JITs (V8, JSC) activate explicit-
+    // flush mode on their very first pthread_jit_write_protect_np call.
+    std::mutex explicit_flush_lock;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> map_jit_ranges;
+    std::atomic<bool> explicit_flush_active{false};
+
     mutable std::shared_mutex call_lock;
     std::vector<std::shared_ptr<const GuestCallHandler>> calls;
     // Lock-free view of `calls` for the dispatch path (every synthetic call):
@@ -1094,6 +1105,7 @@ struct FxEngine::Shared {
         }
         unregister_pending_code(begin, end);
         forget_pending(begin, end);
+        fx::unregister_explicit_flush_code_memory(begin, end - begin);
         unregister_code(begin, end);
         invalidate_committed(begin, end);
         auto first = align_down(begin, kPage), last = align_up(end, kPage);
@@ -1457,6 +1469,32 @@ RunResult FxEngine::run(std::uint64_t) {
 
 void FxEngine::set_thread_pointer(std::uint64_t value) { fx::ensure_thread_context().tpidr_el0 = value; }
 void FxEngine::set_thread_readonly_pointer(std::uint64_t value) { fx::ensure_thread_context().tpidrro_el0 = value; }
+void FxEngine::register_explicit_flush_code(std::uint64_t base, std::uint64_t size) {
+    if (size == 0) return;
+    const auto end = base + size < base ? ~std::uint64_t{0} : base + size;
+    {
+        std::lock_guard lock(shared_->explicit_flush_lock);
+        shared_->map_jit_ranges.emplace_back(base, end);
+    }
+    if (shared_->explicit_flush_active.load(std::memory_order_acquire))
+        fx::register_explicit_flush_code_memory(base, size);
+}
+void FxEngine::unregister_explicit_flush_code(std::uint64_t base, std::uint64_t size) {
+    if (size == 0) return;
+    const auto end = base + size < base ? ~std::uint64_t{0} : base + size;
+    {
+        std::lock_guard lock(shared_->explicit_flush_lock);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> kept;
+        kept.reserve(shared_->map_jit_ranges.size());
+        for (const auto& r : shared_->map_jit_ranges) {
+            if (r.second <= base || r.first >= end) { kept.push_back(r); continue; }
+            if (r.first < base) kept.emplace_back(r.first, base);
+            if (r.second > end) kept.emplace_back(end, r.second);
+        }
+        shared_->map_jit_ranges = std::move(kept);
+    }
+    fx::unregister_explicit_flush_code_memory(base, size);
+}
 
 std::uint64_t FxEngine::invoke_callback(std::uint64_t address, std::uint64_t argument) {
     return invoke_callback(address, std::span(&argument, 1));
@@ -1574,10 +1612,28 @@ std::uint64_t FxEngine::register_guest_call(GuestCallHandler handler) {
 // once when the probed range is inside the thread's guest stack.
 namespace {
 enum Leaf : std::uint8_t {
-    kLeafNone, kLeafMemcpy, kLeafBcopy, kLeafMemset, kLeafBzero, kLeafMemcmp, kLeafStrlen, kLeafStackProbe, kLeafCustom
+    kLeafNone, kLeafMemcpy, kLeafBcopy, kLeafMemset, kLeafBzero, kLeafMemcmp, kLeafStrlen, kLeafStackProbe, kLeafCustom,
+    // Runtime & MAP_JIT maintenance leaves (skip invoke_synthetic + FP handoff).
+    kLeafSchedYield, kLeafJitWriteProtect, kLeafJitWriteProtectSupported,
+    kLeafIcacheInvalidate, kLeafClearCache, kLeafDcacheFlush,
+    // libm FP leaves (run directly on GuestContext::v when FPCR has default RN,
+    // no FZ, no FP traps enabled, and inputs/results stay in-domain & normal;
+    // any edge case declines cleanly to numeric_math.cpp's FloatingEnvironment).
+    kLeafSincosfStret, kLeafSincosStret,
+    kLeafSinf, kLeafSin, kLeafCosf, kLeafCos, kLeafTanf, kLeafTan,
+    kLeafAsinf, kLeafAsin, kLeafAcosf, kLeafAcos, kLeafAtanf, kLeafAtan,
+    kLeafExpf, kLeafExp, kLeafExp2f, kLeafExp2,
+    kLeafLogf, kLeafLog, kLeafLog2f, kLeafLog2, kLeafLog10f, kLeafLog10,
+    kLeafSqrtf, kLeafSqrt,
+    kLeafFloorf, kLeafFloor, kLeafCeilf, kLeafCeil,
+    kLeafTruncf, kLeafTrunc, kLeafRoundf, kLeafRound, kLeafFabsf, kLeafFabs,
+    kLeafAtan2f, kLeafAtan2, kLeafPowf, kLeafPow,
+    kLeafFmodf, kLeafFmod, kLeafHypotf, kLeafHypot, kLeafCopysignf, kLeafCopysign,
 };
 
 constexpr std::size_t kLeafStringLimit = std::size_t{1} << 20;   // = services' string_limit
+// Non-default rounding mode (23:22), FZ (24), or any FP exception trap enable (15, 12..8).
+constexpr std::uint32_t kNonDefaultFpcrMask = 0x01c09f00u;
 
 // ALCHEMY_FX_STACK_PROBE_LEAF=0: ___chkstk_darwin always runs its handler (A/B measurement).
 bool stack_probe_leaf() {
@@ -1589,6 +1645,206 @@ bool stack_probe_leaf() {
     return on;
 }
 
+// ALCHEMY_FX_MATH_LEAF=0: libm calls always run numeric_math.cpp's handler (A/B measurement).
+bool math_leaf() {
+    static const bool on = [] {
+        char value[8]{};
+        const auto length = fx::host::get_env("ALCHEMY_FX_MATH_LEAF", value, sizeof(value));
+        return !(length == 1 && value[0] == '0');
+    }();
+    return on;
+}
+
+template <typename R>
+R fp_arg(const fx::GuestContext& ctx, unsigned index) noexcept {
+    if constexpr (sizeof(R) == 4) return std::bit_cast<float>(static_cast<std::uint32_t>(ctx.v[index][0]));
+    else return std::bit_cast<double>(ctx.v[index][0]);
+}
+
+template <typename R>
+void fp_ret(fx::GuestContext& ctx, R value, unsigned index = 0) noexcept {
+    if constexpr (sizeof(R) == 4) ctx.v[index][0] = std::bit_cast<std::uint32_t>(value);
+    else ctx.v[index][0] = std::bit_cast<std::uint64_t>(value);
+    ctx.v[index][1] = 0;
+}
+
+template <typename R>
+bool is_finite_fast(R value) noexcept {
+    if constexpr (sizeof(R) == 4)
+        return (std::bit_cast<std::uint32_t>(value) & 0x7f800000u) != 0x7f800000u;
+    else
+        return (std::bit_cast<std::uint64_t>(value) & 0x7ff0000000000000ull) != 0x7ff0000000000000ull;
+}
+
+template <typename R>
+bool is_normal_fast(R value) noexcept {
+    if constexpr (sizeof(R) == 4) {
+        const auto a = std::bit_cast<std::uint32_t>(value) & 0x7fffffffu;
+        return a >= 0x00800000u && a < 0x7f800000u;
+    } else {
+        const auto a = std::bit_cast<std::uint64_t>(value) & 0x7fffffffffffffffull;
+        return a >= 0x0010000000000000ull && a < 0x7ff0000000000000ull;
+    }
+}
+
+template <typename R>
+bool safe_normal_or_zero(R value) noexcept {
+    if constexpr (sizeof(R) == 4) {
+        const auto a = std::bit_cast<std::uint32_t>(value) & 0x7fffffffu;
+        return a == 0 || (a >= 0x00800000u && a < 0x7f800000u);
+    } else {
+        const auto a = std::bit_cast<std::uint64_t>(value) & 0x7fffffffffffffffull;
+        return a == 0 || (a >= 0x0010000000000000ull && a < 0x7ff0000000000000ull);
+    }
+}
+
+template <typename R, R (*Fn)(R)>
+FX_GENERATED_ABI bool leaf_trig(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0);
+    if (!safe_normal_or_zero(x)) return false;
+    const R r = Fn(x);
+    if (!safe_normal_or_zero(r)) return false;
+    fp_ret(ctx, r);
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_sincos_stret(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0);
+    if (!safe_normal_or_zero(x)) return false;
+    const R s = std::sin(x);
+    const R c = std::cos(x);
+    if (!safe_normal_or_zero(s) || !is_finite_fast(c)) return false;
+    fp_ret(ctx, s, 0);
+    fp_ret(ctx, c, 1);
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_asin(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0);
+    if (!(x >= R{-1} && x <= R{1}) || !safe_normal_or_zero(x)) return false;
+    fp_ret(ctx, std::asin(x));
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_acos(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0);
+    if (!(x >= R{-1} && x <= R{1})) return false;
+    fp_ret(ctx, std::acos(x));
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_exp(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0);
+    if constexpr (sizeof(R) == 4) { if (!(x >= -87.0f && x <= 88.0f)) return false; }
+    else { if (!(x >= -708.0 && x <= 709.0)) return false; }
+    fp_ret(ctx, std::exp(x));
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_exp2(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0);
+    if constexpr (sizeof(R) == 4) { if (!(x >= -125.0f && x <= 127.0f)) return false; }
+    else { if (!(x >= -1021.0 && x <= 1023.0)) return false; }
+    fp_ret(ctx, std::exp2(x));
+    return true;
+}
+
+template <typename R, R (*Fn)(R)>
+FX_GENERATED_ABI bool leaf_log(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0);
+    if (!(x > R{0}) || !is_finite_fast(x)) return false;
+    fp_ret(ctx, Fn(x));
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_sqrt(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0);
+    if (!(x >= R{0}) || !is_finite_fast(x)) return false;
+    fp_ret(ctx, std::sqrt(x));
+    return true;
+}
+
+template <typename R, R (*Fn)(R)>
+FX_GENERATED_ABI bool leaf_finite_unary(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0);
+    if (!is_finite_fast(x)) return false;
+    fp_ret(ctx, Fn(x));
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_atan2(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R y = fp_arg<R>(ctx, 0), x = fp_arg<R>(ctx, 1);
+    if (!is_finite_fast(y) || !is_finite_fast(x)) return false;
+    const R r = std::atan2(y, x);
+    if ((r == R{0} && y != R{0}) || !safe_normal_or_zero(r)) return false;
+    fp_ret(ctx, r);
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_pow(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0), y = fp_arg<R>(ctx, 1);
+    if (!is_finite_fast(x) || !is_finite_fast(y)) return false;
+    if (x == R{0} && !std::signbit(x) && y > R{0}) {
+        fp_ret(ctx, R{0});
+        return true;
+    }
+    if (!(x > R{0})) return false;
+    const R r = std::pow(x, y);
+    if (!is_normal_fast(r)) return false;
+    fp_ret(ctx, r);
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_fmod(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0), y = fp_arg<R>(ctx, 1);
+    if (!is_finite_fast(x) || !is_finite_fast(y) || y == R{0}) return false;
+    const R r = std::fmod(x, y);
+    if (!safe_normal_or_zero(r)) return false;
+    fp_ret(ctx, r);
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_hypot(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0), y = fp_arg<R>(ctx, 1);
+    if (!is_finite_fast(x) || !is_finite_fast(y)) return false;
+    const R r = std::hypot(x, y);
+    if (!safe_normal_or_zero(r)) return false;
+    fp_ret(ctx, r);
+    return true;
+}
+
+template <typename R>
+FX_GENERATED_ABI bool leaf_copysign(fx::GuestContext& ctx) {
+    if ((ctx.fpcr & kNonDefaultFpcrMask) != 0) return false;
+    const R x = fp_arg<R>(ctx, 0), y = fp_arg<R>(ctx, 1);
+    if (!is_finite_fast(x) || !is_finite_fast(y)) return false;
+    fp_ret(ctx, std::copysign(x, y));
+    return true;
+}
+
 template <Leaf kind>
 FX_GENERATED_ABI bool leaf_call(fx::GuestContext& ctx) {
     auto& x = ctx.x;
@@ -1598,26 +1854,46 @@ FX_GENERATED_ABI bool leaf_call(fx::GuestContext& ctx) {
         // needs no probe; anything else is the handler's (it checks the range).
         const std::uint64_t size = static_cast<std::uint32_t>(x[9]), sp = x[31];
         return size <= sp && sp <= ctx.guest_stack_base && sp - size >= ctx.guest_stack_limit;
-    }
-    if constexpr (kind == kLeafMemcpy) {
-        if (x[2] && !guarded_move(host(x[0]), host(x[1]), x[2])) return false;
-    } else if constexpr (kind == kLeafBcopy) {
-        if (x[2] && !guarded_move(host(x[1]), host(x[0]), x[2])) return false;
-    } else if constexpr (kind == kLeafMemset) {
-        if (x[2] && !guarded_fill(host(x[0]), static_cast<std::uint8_t>(x[1]), x[2])) return false;
-    } else if constexpr (kind == kLeafBzero) {
-        if (x[1] && !guarded_fill(host(x[0]), 0, x[1])) return false;
-    } else if constexpr (kind == kLeafMemcmp) {
-        // In place: up to the first difference (its 8-byte chunk), as a native memcmp reads.
-        long long result = 0;
-        if (x[2] && !guarded_compare(host(x[0]), host(x[1]), x[2], result)) return false;
-        x[0] = static_cast<std::uint64_t>(result);
-    } else if constexpr (kind == kLeafStrlen) {
-        const auto length = guarded_length(static_cast<const std::uint8_t*>(host(x[0])), 1, kLeafStringLimit);
-        if (length < 0 || static_cast<std::size_t>(length) >= kLeafStringLimit) return false;
-        x[0] = static_cast<std::uint64_t>(length);
-    }
-    if constexpr (kind != kLeafStackProbe) {   // (returned above: no unreachable tail)
+    } else if constexpr (kind == kLeafSchedYield) {
+        std::this_thread::yield();
+        x[0] = 0;
+        return true;
+    } else if constexpr (kind == kLeafJitWriteProtect) {
+        fx::guest_jit_write_window(x[0] == 0);
+        return true;
+    } else if constexpr (kind == kLeafJitWriteProtectSupported) {
+        x[0] = 1;
+        return true;
+    } else if constexpr (kind == kLeafIcacheInvalidate) {
+        fx::flush_guest_code(x[0], x[1]);
+        x[0] = 0;
+        return true;
+    } else if constexpr (kind == kLeafClearCache) {
+        if (x[1] > x[0]) fx::flush_guest_code(x[0], x[1] - x[0]);
+        x[0] = 0;
+        return true;
+    } else if constexpr (kind == kLeafDcacheFlush) {
+        x[0] = 0;
+        return true;
+    } else {
+        if constexpr (kind == kLeafMemcpy) {
+            if (x[2] && !guarded_move(host(x[0]), host(x[1]), x[2])) return false;
+        } else if constexpr (kind == kLeafBcopy) {
+            if (x[2] && !guarded_move(host(x[1]), host(x[0]), x[2])) return false;
+        } else if constexpr (kind == kLeafMemset) {
+            if (x[2] && !guarded_fill(host(x[0]), static_cast<std::uint8_t>(x[1]), x[2])) return false;
+        } else if constexpr (kind == kLeafBzero) {
+            if (x[1] && !guarded_fill(host(x[0]), 0, x[1])) return false;
+        } else if constexpr (kind == kLeafMemcmp) {
+            // In place: up to the first difference (its 8-byte chunk), as a native memcmp reads.
+            long long result = 0;
+            if (x[2] && !guarded_compare(host(x[0]), host(x[1]), x[2], result)) return false;
+            x[0] = static_cast<std::uint64_t>(result);
+        } else if constexpr (kind == kLeafStrlen) {
+            const auto length = guarded_length(static_cast<const std::uint8_t*>(host(x[0])), 1, kLeafStringLimit);
+            if (length < 0 || static_cast<std::size_t>(length) >= kLeafStringLimit) return false;
+            x[0] = static_cast<std::uint64_t>(length);
+        }
         x[1] = 0;
         return true;
     }
@@ -1646,6 +1922,60 @@ void FxEngine::set_guest_call_leaf(std::uint64_t address, std::string_view symbo
     else if (symbol == "_memcmp") kind = kLeafMemcmp;
     else if (symbol == "_strlen") kind = kLeafStrlen;
     else if (symbol == "___chkstk_darwin" && stack_probe_leaf()) kind = kLeafStackProbe;
+    else if (symbol == "_sched_yield" || symbol == "_pthread_yield_np") kind = kLeafSchedYield;
+    else if (symbol == "_pthread_jit_write_protect_np") kind = kLeafJitWriteProtect;
+    else if (symbol == "_pthread_jit_write_protect_supported_np") kind = kLeafJitWriteProtectSupported;
+    else if (symbol == "_sys_icache_invalidate") kind = kLeafIcacheInvalidate;
+    else if (symbol == "___clear_cache") kind = kLeafClearCache;
+    else if (symbol == "_sys_dcache_flush") kind = kLeafDcacheFlush;
+    else if (math_leaf()) {
+        if (symbol == "___sincosf_stret") kind = kLeafSincosfStret;
+        else if (symbol == "___sincos_stret") kind = kLeafSincosStret;
+        else if (symbol == "_sinf") kind = kLeafSinf;
+        else if (symbol == "_sin" || symbol == "_sinl") kind = kLeafSin;
+        else if (symbol == "_cosf") kind = kLeafCosf;
+        else if (symbol == "_cos" || symbol == "_cosl") kind = kLeafCos;
+        else if (symbol == "_tanf") kind = kLeafTanf;
+        else if (symbol == "_tan" || symbol == "_tanl") kind = kLeafTan;
+        else if (symbol == "_asinf") kind = kLeafAsinf;
+        else if (symbol == "_asin" || symbol == "_asinl") kind = kLeafAsin;
+        else if (symbol == "_acosf") kind = kLeafAcosf;
+        else if (symbol == "_acos" || symbol == "_acosl") kind = kLeafAcos;
+        else if (symbol == "_atanf") kind = kLeafAtanf;
+        else if (symbol == "_atan" || symbol == "_atanl") kind = kLeafAtan;
+        else if (symbol == "_expf") kind = kLeafExpf;
+        else if (symbol == "_exp" || symbol == "_expl") kind = kLeafExp;
+        else if (symbol == "_exp2f") kind = kLeafExp2f;
+        else if (symbol == "_exp2" || symbol == "_exp2l") kind = kLeafExp2;
+        else if (symbol == "_logf") kind = kLeafLogf;
+        else if (symbol == "_log" || symbol == "_logl") kind = kLeafLog;
+        else if (symbol == "_log2f") kind = kLeafLog2f;
+        else if (symbol == "_log2" || symbol == "_log2l") kind = kLeafLog2;
+        else if (symbol == "_log10f") kind = kLeafLog10f;
+        else if (symbol == "_log10" || symbol == "_log10l") kind = kLeafLog10;
+        else if (symbol == "_sqrtf") kind = kLeafSqrtf;
+        else if (symbol == "_sqrt" || symbol == "_sqrtl") kind = kLeafSqrt;
+        else if (symbol == "_floorf") kind = kLeafFloorf;
+        else if (symbol == "_floor" || symbol == "_floorl") kind = kLeafFloor;
+        else if (symbol == "_ceilf") kind = kLeafCeilf;
+        else if (symbol == "_ceil" || symbol == "_ceill") kind = kLeafCeil;
+        else if (symbol == "_truncf") kind = kLeafTruncf;
+        else if (symbol == "_trunc" || symbol == "_truncl") kind = kLeafTrunc;
+        else if (symbol == "_roundf") kind = kLeafRoundf;
+        else if (symbol == "_round" || symbol == "_roundl") kind = kLeafRound;
+        else if (symbol == "_fabsf") kind = kLeafFabsf;
+        else if (symbol == "_fabs" || symbol == "_fabsl") kind = kLeafFabs;
+        else if (symbol == "_atan2f") kind = kLeafAtan2f;
+        else if (symbol == "_atan2" || symbol == "_atan2l") kind = kLeafAtan2;
+        else if (symbol == "_powf") kind = kLeafPowf;
+        else if (symbol == "_pow" || symbol == "_powl") kind = kLeafPow;
+        else if (symbol == "_fmodf") kind = kLeafFmodf;
+        else if (symbol == "_fmod" || symbol == "_fmodl") kind = kLeafFmod;
+        else if (symbol == "_hypotf") kind = kLeafHypotf;
+        else if (symbol == "_hypot" || symbol == "_hypotl") kind = kLeafHypot;
+        else if (symbol == "_copysignf") kind = kLeafCopysignf;
+        else if (symbol == "_copysign" || symbol == "_copysignl") kind = kLeafCopysign;
+    }
     shared_->leaf[(address - kGuestCallBase) / kGuestCallStride].store(kind, std::memory_order_relaxed);
 }
 
@@ -1677,6 +2007,58 @@ void FxEngine::install_native_entry(std::uint64_t pc) {
         case kLeafMemcmp: leaf = &leaf_call<kLeafMemcmp>; break;
         case kLeafStrlen: leaf = &leaf_call<kLeafStrlen>; break;
         case kLeafStackProbe: leaf = &leaf_call<kLeafStackProbe>; break;
+        case kLeafSchedYield: leaf = &leaf_call<kLeafSchedYield>; break;
+        case kLeafJitWriteProtect: leaf = &leaf_call<kLeafJitWriteProtect>; break;
+        case kLeafJitWriteProtectSupported: leaf = &leaf_call<kLeafJitWriteProtectSupported>; break;
+        case kLeafIcacheInvalidate: leaf = &leaf_call<kLeafIcacheInvalidate>; break;
+        case kLeafClearCache: leaf = &leaf_call<kLeafClearCache>; break;
+        case kLeafDcacheFlush: leaf = &leaf_call<kLeafDcacheFlush>; break;
+        case kLeafSincosfStret: leaf = &leaf_sincos_stret<float>; break;
+        case kLeafSincosStret: leaf = &leaf_sincos_stret<double>; break;
+        case kLeafSinf: leaf = &leaf_trig<float, std::sin>; break;
+        case kLeafSin: leaf = &leaf_trig<double, std::sin>; break;
+        case kLeafCosf: leaf = &leaf_trig<float, std::cos>; break;
+        case kLeafCos: leaf = &leaf_trig<double, std::cos>; break;
+        case kLeafTanf: leaf = &leaf_trig<float, std::tan>; break;
+        case kLeafTan: leaf = &leaf_trig<double, std::tan>; break;
+        case kLeafAsinf: leaf = &leaf_asin<float>; break;
+        case kLeafAsin: leaf = &leaf_asin<double>; break;
+        case kLeafAcosf: leaf = &leaf_acos<float>; break;
+        case kLeafAcos: leaf = &leaf_acos<double>; break;
+        case kLeafAtanf: leaf = &leaf_trig<float, std::atan>; break;
+        case kLeafAtan: leaf = &leaf_trig<double, std::atan>; break;
+        case kLeafExpf: leaf = &leaf_exp<float>; break;
+        case kLeafExp: leaf = &leaf_exp<double>; break;
+        case kLeafExp2f: leaf = &leaf_exp2<float>; break;
+        case kLeafExp2: leaf = &leaf_exp2<double>; break;
+        case kLeafLogf: leaf = &leaf_log<float, std::log>; break;
+        case kLeafLog: leaf = &leaf_log<double, std::log>; break;
+        case kLeafLog2f: leaf = &leaf_log<float, std::log2>; break;
+        case kLeafLog2: leaf = &leaf_log<double, std::log2>; break;
+        case kLeafLog10f: leaf = &leaf_log<float, std::log10>; break;
+        case kLeafLog10: leaf = &leaf_log<double, std::log10>; break;
+        case kLeafSqrtf: leaf = &leaf_sqrt<float>; break;
+        case kLeafSqrt: leaf = &leaf_sqrt<double>; break;
+        case kLeafFloorf: leaf = &leaf_finite_unary<float, std::floor>; break;
+        case kLeafFloor: leaf = &leaf_finite_unary<double, std::floor>; break;
+        case kLeafCeilf: leaf = &leaf_finite_unary<float, std::ceil>; break;
+        case kLeafCeil: leaf = &leaf_finite_unary<double, std::ceil>; break;
+        case kLeafTruncf: leaf = &leaf_finite_unary<float, std::trunc>; break;
+        case kLeafTrunc: leaf = &leaf_finite_unary<double, std::trunc>; break;
+        case kLeafRoundf: leaf = &leaf_finite_unary<float, std::round>; break;
+        case kLeafRound: leaf = &leaf_finite_unary<double, std::round>; break;
+        case kLeafFabsf: leaf = &leaf_finite_unary<float, std::fabs>; break;
+        case kLeafFabs: leaf = &leaf_finite_unary<double, std::fabs>; break;
+        case kLeafAtan2f: leaf = &leaf_atan2<float>; break;
+        case kLeafAtan2: leaf = &leaf_atan2<double>; break;
+        case kLeafPowf: leaf = &leaf_pow<float>; break;
+        case kLeafPow: leaf = &leaf_pow<double>; break;
+        case kLeafFmodf: leaf = &leaf_fmod<float>; break;
+        case kLeafFmod: leaf = &leaf_fmod<double>; break;
+        case kLeafHypotf: leaf = &leaf_hypot<float>; break;
+        case kLeafHypot: leaf = &leaf_hypot<double>; break;
+        case kLeafCopysignf: leaf = &leaf_copysign<float>; break;
+        case kLeafCopysign: leaf = &leaf_copysign<double>; break;
         default: break;
         }
     }
@@ -2003,6 +2385,7 @@ void FxEngine::unmap_memory(std::uint64_t base) {
     shared_->regions.erase(found);
     if (region.stack) return;
     if (region.executable) {
+        fx::unregister_explicit_flush_code_memory(region.base, region.size);
         fx::unregister_guest_code_memory(region.base, region.size);
         fx::invalidate_guest_code(region.base, region.size);
     }
@@ -2017,6 +2400,7 @@ void FxEngine::unmap_memory(std::uint64_t base) {
     // A reservation's pages may have become code through protect_range,
     // which the region record does not show.
     if (region.lazy) {
+        fx::unregister_explicit_flush_code_memory(begin, end - begin);
         unregister_code(begin, end);
         shared_->unregister_pending_code(begin, end);
         shared_->forget_pending(begin, end);
@@ -2365,7 +2749,21 @@ void FxEngine::flush_translations() {
 
 void FxEngine::invalidate_code(std::uint64_t address, std::uint64_t size) { fx::flush_guest_code(address, size); }
 
-void FxEngine::jit_write_window(bool open) { fx::guest_jit_write_window(open); }
+void FxEngine::jit_write_window(bool open) {
+    if (!shared_->explicit_flush_active.load(std::memory_order_acquire)) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        {
+            std::lock_guard lock(shared_->explicit_flush_lock);
+            if (!shared_->explicit_flush_active.load(std::memory_order_relaxed)) {
+                ranges = shared_->map_jit_ranges;
+                shared_->explicit_flush_active.store(true, std::memory_order_release);
+            }
+        }
+        for (const auto& [begin, end] : ranges)
+            if (end > begin) fx::register_explicit_flush_code_memory(begin, end - begin);
+    }
+    fx::guest_jit_write_window(open);
+}
 
 void FxEngine::code_copy(std::uint64_t copy, std::uint64_t source, std::uint64_t size) {
     fx::register_guest_code_copy(copy, source, size);

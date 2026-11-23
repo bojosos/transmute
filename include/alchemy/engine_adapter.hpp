@@ -174,6 +174,19 @@ void engine_jit_write_window(Engine& engine, bool open) {
     if constexpr (requires { engine.jit_write_window(open); }) engine.jit_write_window(open);
 }
 
+// Optional engine capability: mark [base, base + size) as explicit-flush code
+// memory (Darwin MAP_JIT), where writes are announced by sys_icache_invalidate.
+template <class Engine>
+void engine_register_explicit_flush_code(Engine& engine, std::uint64_t base, std::uint64_t size) {
+    if constexpr (requires { engine.register_explicit_flush_code(base, size); })
+        engine.register_explicit_flush_code(base, size);
+}
+template <class Engine>
+void engine_unregister_explicit_flush_code(Engine& engine, std::uint64_t base, std::uint64_t size) {
+    if constexpr (requires { engine.unregister_explicit_flush_code(base, size); })
+        engine.unregister_explicit_flush_code(base, size);
+}
+
 // Optional engine capability: [copy, copy + size) was just filled with an
 // exact copy of the guest code at [source, source + size) (vm_remap of image
 // text), so the engine may reuse the source's translations there.
@@ -200,6 +213,10 @@ bool set_engine_thread_pointer(Engine& engine, std::uint64_t value) {
 
 // Optional engine capability: TPIDRRO_EL0 of the calling guest thread, which
 // Darwin points at the thread's TSD array (pthread_getspecific's slots).
+template <class Engine>
+inline constexpr bool engine_has_thread_readonly_pointer =
+    requires(Engine& engine) { engine.set_thread_readonly_pointer(std::uint64_t{}); };
+
 template <class Engine>
 bool set_engine_thread_readonly_pointer(Engine& engine, std::uint64_t value) {
     if constexpr (requires { engine.set_thread_readonly_pointer(value); }) {

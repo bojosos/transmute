@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <sstream>
 #include <thread>
@@ -174,15 +175,33 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
     }
     std::map<std::uint64_t, std::uint64_t> tsd_arrays;   // thread identity -> array
 
+    // Per-thread non-zero even 32-bit lock owner token for in-memory
+    // os_unfair_lock (bit 0 is the contended-waiters flag). Stored at
+    // tsd_array + tsd_slots * 8 so guest fast paths load it via TPIDRRO_EL0.
+    static constexpr std::uint32_t unfair_token(std::uint64_t identity) noexcept {
+        const auto token = static_cast<std::uint32_t>(identity << 1);
+        return token ? token : 2u;
+    }
+    struct UnfairWaitBucket {
+        std::mutex gate;
+        std::condition_variable changed;
+    };
+    static constexpr std::size_t unfair_wait_buckets = 64;
+    std::array<UnfairWaitBucket, unfair_wait_buckets> unfair_waits;
+    UnfairWaitBucket& unfair_bucket(std::uint64_t address) noexcept {
+        return unfair_waits[address_hash{}(address) & (unfair_wait_buckets - 1)];
+    }
+
     // The calling thread's TSD array, made (and given to TPIDRRO_EL0) on first use.
     std::uint64_t tsd_array(std::uint64_t identity, std::uint64_t handle, transmute::ReferenceEngine& engine) {
         {
             std::lock_guard lock(metadata);
             if (const auto found = tsd_arrays.find(identity); found != tsd_arrays.end()) return found->second;
         }
-        const auto array = process.allocate_guest(tsd_slots * 8, 16);
-        process.main_engine().fill_bytes(array, 0, tsd_slots * 8);
+        const auto array = process.allocate_guest((tsd_slots + 1) * 8, 16);
+        process.main_engine().fill_bytes(array, 0, (tsd_slots + 1) * 8);
         process.main_engine().write64(array, handle);
+        process.main_engine().write32(array + tsd_slots * 8, unfair_token(identity));
         set_engine_thread_readonly_pointer(engine, array);
         std::lock_guard lock(metadata);
         tsd_arrays.emplace(identity, array);
@@ -479,6 +498,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         // A thread's TSD array goes with it, but the main thread's lasts as long as the process: image
         // terminators and atexit handlers run after this and still read it (mimalloc's process detach).
         if (thread.engine != &process.main_engine()) {
+            set_engine_thread_readonly_pointer(*thread.engine, 0);
             std::uint64_t array = 0;
             {
                 std::lock_guard lock(metadata);
@@ -674,6 +694,98 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         } while (true);
     }
 
+    // ---- in-memory os_unfair_lock (engines with TPIDRRO_EL0 / direct host VA) ----
+    // The 32-bit guest lock word holds:
+    //   0               unlocked
+    //   owner_token     locked by owner_token (even, non-zero), no waiters
+    //   owner_token | 1 locked by owner_token, waiters present (wake on unlock)
+    // Uncontended lock/trylock/unlock run directly in guest ARM64 fast paths
+    // (1 fused x64 LOCK CMPXCHG); contention, errors and unset-TSD threads
+    // fall through here.
+    bool unfair_lock_in_memory(transmute::GuestMemory& memory, std::uint64_t address, bool attempt) {
+        if (!address || (address & 3) != 0 || !accessible(memory, address, 4)) {
+            if (attempt) return false;
+            throw std::runtime_error("os_unfair_lock_lock failed (recursive acquisition or invalid lock)");
+        }
+        static_cast<void>(own_tsd());
+        const auto me = unfair_token(process.current_thread()->identity);
+        auto atom = word(address);
+        std::uint32_t expected = 0;
+        if (atom.compare_exchange_strong(expected, me, std::memory_order_acquire, std::memory_order_relaxed)) return true;
+        if ((expected & ~1u) == me) {
+            if (attempt) return false;
+            throw std::runtime_error("os_unfair_lock_lock failed (recursive acquisition or invalid lock)");
+        }
+        if (attempt) return false;
+        auto& bucket = unfair_bucket(address);
+        std::unique_lock lock(bucket.gate);
+        for (;;) {
+            std::uint32_t current = atom.load(std::memory_order_acquire);
+            if (current == 0) {
+                if (atom.compare_exchange_strong(current, me | 1u, std::memory_order_acquire, std::memory_order_relaxed))
+                    return true;
+                continue;
+            }
+            if ((current & ~1u) == me)
+                throw std::runtime_error("os_unfair_lock_lock failed (recursive acquisition or invalid lock)");
+            if ((current & 1u) == 0) {
+                if (!atom.compare_exchange_strong(current, current | 1u, std::memory_order_relaxed, std::memory_order_relaxed))
+                    continue;
+            }
+            bucket.changed.wait_for(lock, poll_period);
+            if (stopping()) {
+                lock.unlock();
+                stop_point();
+                throw std::runtime_error("os_unfair_lock_lock interrupted by process exit");
+            }
+        }
+    }
+
+    void unfair_unlock_in_memory(transmute::GuestMemory& memory, std::uint64_t address) {
+        if (!address || (address & 3) != 0 || !accessible(memory, address, 4))
+            throw std::runtime_error("os_unfair_lock_unlock of a lock not owned by this thread");
+        static_cast<void>(own_tsd());
+        const auto me = unfair_token(process.current_thread()->identity);
+        auto atom = word(address);
+        std::uint32_t current = atom.load(std::memory_order_relaxed);
+        if ((current & ~1u) != me)
+            throw std::runtime_error("os_unfair_lock_unlock of a lock not owned by this thread");
+        if (current == me &&
+            atom.compare_exchange_strong(current, 0, std::memory_order_release, std::memory_order_relaxed))
+            return;
+        auto& bucket = unfair_bucket(address);
+        {
+            std::lock_guard lock(bucket.gate);
+            atom.store(0, std::memory_order_release);
+        }
+        bucket.changed.notify_all();
+    }
+
+    // Guest ARM64 fast paths packed into one read-execute page (zero host transitions):
+    //   _pthread_equal, _pthread_self, _pthread_getspecific,
+    //   _os_unfair_lock_{trylock,lock,lock_with_options,unlock}.
+    std::uint64_t fast_path_page{};
+    std::uint64_t fast_path_cursor{};
+    std::uint64_t emit_fast_path(std::span<const std::uint32_t> code, std::optional<std::uint64_t> slow_host) {
+        auto& memory = process.main_engine();
+        if (!fast_path_page) {
+            fast_path_page = process.allocate_guest(1024, 16);
+            fast_path_cursor = fast_path_page;
+        }
+        const auto start = (fast_path_cursor + 15) & ~std::uint64_t{15};
+        for (std::size_t i = 0; i < code.size(); ++i) memory.write32(start + i * 4, code[i]);
+        auto end = start + code.size() * 4;
+        if (slow_host) {
+            memory.write64(end, *slow_host);
+            end += 8;
+        }
+        fast_path_cursor = end;
+        return start;
+    }
+    void finalize_fast_paths() {
+        if (fast_path_page) process.main_engine().set_memory_access(fast_path_page, true, false, true);
+    }
+
     // Guest fast path of __tlv_bootstrap (engines with a thread pointer): the
     // descriptor's module id indexes this thread's table at TPIDR_EL0; an
     // empty table, entry or out-of-range id tail-calls the host handler
@@ -798,8 +910,27 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         });
         // A cancellation point on entry; a join already waiting is not interrupted.
         add("_pthread_join", [](auto& self, auto& s, auto& m) { if (!self.cancel_point(s)) self.join(s, m); });
-        add("_pthread_self", [](auto& self, auto& s, auto&) { s.x[0] = self.self(); });
-        add("_pthread_equal", [](auto&, auto& s, auto&) { s.x[0] = s.x[0] == s.x[1] ? 1 : 0; });
+        if constexpr (engine_has_thread_readonly_pointer<transmute::ReferenceEngine>) {
+            if (process.fast_path_allowed("_pthread_self")) {
+                const auto host = process.install_function("__alchemy_pthread_self_slow",
+                    [owned](auto& s, auto&) { static_cast<void>(owned->own_tsd()); s.x[0] = owned->self(); }, "alchemy.internal");
+                // mrs x0, tpidrro_el0; cbz x0, slow; ldr x0, [x0]; ret; slow: ldr x16, =host; br x16
+                static constexpr std::array<std::uint32_t, 6> code{
+                    0xd53bd060u, 0xb4000060u, 0xf9400000u, 0xd65f03c0u, 0x58000050u, 0xd61f0200u};
+                process.install_export("/usr/lib/libSystem.B.dylib", "_pthread_self", {emit_fast_path(code, host)});
+            } else {
+                add("_pthread_self", [](auto& self, auto& s, auto&) { s.x[0] = self.self(); });
+            }
+        } else {
+            add("_pthread_self", [](auto& self, auto& s, auto&) { s.x[0] = self.self(); });
+        }
+        if (process.fast_path_allowed("_pthread_equal")) {
+            // cmp x0, x1; cset x0, eq; ret
+            static constexpr std::array<std::uint32_t, 3> code{0xeb01001fu, 0x9a9f17e0u, 0xd65f03c0u};
+            process.install_export("/usr/lib/libSystem.B.dylib", "_pthread_equal", {emit_fast_path(code, std::nullopt)});
+        } else {
+            add("_pthread_equal", [](auto&, auto& s, auto&) { s.x[0] = s.x[0] == s.x[1] ? 1 : 0; });
+        }
         add("_pthread_attr_init", [](auto& self, auto& s, auto& m) {
             if (!accessible(m, s.x[0], 64)) { s.x[0] = einval; return; }
             std::lock_guard lock(self.metadata); self.thread_attributes[s.x[0]] = {};
@@ -1322,55 +1453,147 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         });
         // os_unfair_lock: a 32-bit lock word, zero-initialized, owned by one
         // thread; contended waits block like pthread mutexes.
-        add("_os_unfair_lock_lock", [](auto& self, auto& s, auto& m) {
-            const auto result = self.mutex_lock(self.object(self.mutexes, m, s.x[0], 4), false);
-            if (result) throw std::runtime_error("os_unfair_lock_lock failed (recursive acquisition or invalid lock)");
-        });
-        add("_os_unfair_lock_lock_with_options", [](auto& self, auto& s, auto& m) {
-            const auto result = self.mutex_lock(self.object(self.mutexes, m, s.x[0], 4), false);
-            if (result) throw std::runtime_error("os_unfair_lock_lock failed (recursive acquisition or invalid lock)");
-        });
-        add("_os_unfair_lock_trylock", [](auto& self, auto& s, auto& m) {
-            s.x[0] = self.mutex_lock(self.object(self.mutexes, m, s.x[0], 4), true) == 0;
-        });
-        add("_os_unfair_lock_unlock", [](auto& self, auto& s, auto& m) {
-            if (self.mutex_unlock(self.object(self.mutexes, m, s.x[0], 4)))
-                throw std::runtime_error("os_unfair_lock_unlock of a lock not owned by this thread");
-        });
-        // os_unfair_recursive_lock {os_unfair_lock ourl_lock; uint32_t ourl_count}: the owner taking it again
-        // counts in ourl_count; unlock counts down before it releases the lock. The options are hints.
-        const auto recursive_owner = [](auto& self, auto& m, std::uint64_t address) {
-            const auto value = self.object(self.mutexes, m, address, 4);
-            if (!value || !accessible(m, address, 8)) throw std::runtime_error("os_unfair_recursive_lock on an invalid lock");
-            std::lock_guard lock(value->gate);
-            return std::pair{value, value->owner == self.process.current_thread()->identity};
-        };
-        add("_os_unfair_recursive_lock_lock_with_options", [recursive_owner](auto& self, auto& s, auto& m) {
-            const auto [value, owned] = recursive_owner(self, m, s.x[0]);
-            if (owned) { m.write32(s.x[0] + 4, m.read32(s.x[0] + 4) + 1); return; }
-            if (self.mutex_lock(value, false)) throw std::runtime_error("os_unfair_recursive_lock_lock failed");
-        });
-        add("_os_unfair_recursive_lock_trylock", [recursive_owner](auto& self, auto& s, auto& m) {
-            const auto address = s.x[0];
-            const auto [value, owned] = recursive_owner(self, m, address);
-            if (owned) { m.write32(address + 4, m.read32(address + 4) + 1); s.x[0] = 1; return; }
-            s.x[0] = self.mutex_lock(value, true) == 0;
-        });
-        add("_os_unfair_recursive_lock_unlock", [recursive_owner](auto& self, auto& s, auto& m) {
-            const auto [value, owned] = recursive_owner(self, m, s.x[0]);
-            if (!owned) throw std::runtime_error("os_unfair_recursive_lock_unlock of a lock not owned by this thread");
-            if (const auto count = m.read32(s.x[0] + 4)) { m.write32(s.x[0] + 4, count - 1); return; }
-            if (self.mutex_unlock(value)) throw std::runtime_error("os_unfair_recursive_lock_unlock failed");
-        });
-        for (const auto must_own : {true, false}) add(must_own ? "_os_unfair_lock_assert_owner" : "_os_unfair_lock_assert_not_owner",
-            [must_own](auto& self, auto& s, auto& m) {
-                const auto value = self.object(self.mutexes, m, s.x[0], 4, false);
-                if (!value) throw std::runtime_error("os_unfair_lock assertion on an invalid lock");
-                const auto identity = self.process.current_thread()->identity;
-                std::lock_guard lock(value->gate);
-                if ((value->owner == identity) != must_own)
-                    throw std::runtime_error(must_own ? "os_unfair_lock is not owned by the current thread" : "os_unfair_lock is owned by the current thread");
+        if constexpr (engine_has_thread_readonly_pointer<transmute::ReferenceEngine>) {
+            std::uint64_t unfair_lock_stub = 0;
+            const auto install_unfair_lock = [&](std::string name) {
+                if (process.fast_path_allowed(name)) {
+                    if (!unfair_lock_stub) {
+                        const auto host = process.install_function("__alchemy_os_unfair_lock_lock_slow",
+                            [owned](auto& s, auto& m) { static_cast<void>(owned->unfair_lock_in_memory(m, s.x[0], false)); },
+                            "alchemy.internal");
+                        // cbz x0, slow; tst x0, #3; b.ne slow; mrs x2, tpidrro_el0; cbz x2, slow;
+                        // ldr w3, [x2, #6144]; ldaxr w4, [x0]; cbnz w4, +3; stlxr w5, w3, [x0]; cbnz w5, -3;
+                        // cbnz w4, slow_clrex; ret; slow_clrex: clrex; nop; slow: ldr x16, =host; br x16
+                        static constexpr std::array<std::uint32_t, 16> code{
+                            0xb40001c0u, 0xf240041fu, 0x54000181u, 0xd53bd062u, 0xb4000142u, 0xb9580043u,
+                            0x885ffc04u, 0x35000064u, 0x8805fc03u, 0x35ffffa5u, 0x35000044u, 0xd65f03c0u,
+                            0xd5033f5fu, 0xd503201fu, 0x58000050u, 0xd61f0200u};
+                        unfair_lock_stub = emit_fast_path(code, host);
+                    }
+                    process.install_export("/usr/lib/libSystem.B.dylib", std::move(name), {unfair_lock_stub});
+                } else {
+                    add(std::move(name), [](auto& self, auto& s, auto& m) {
+                        static_cast<void>(self.unfair_lock_in_memory(m, s.x[0], false));
+                    });
+                }
+            };
+            install_unfair_lock("_os_unfair_lock_lock");
+            install_unfair_lock("_os_unfair_lock_lock_with_options");
+            if (process.fast_path_allowed("_os_unfair_lock_trylock")) {
+                const auto host = process.install_function("__alchemy_os_unfair_lock_trylock_slow",
+                    [owned](auto& s, auto& m) { s.x[0] = owned->unfair_lock_in_memory(m, s.x[0], true) ? 1 : 0; },
+                    "alchemy.internal");
+                // cbz x0, slow; tst x0, #3; b.ne slow; mrs x2, tpidrro_el0; cbz x2, slow;
+                // ldr w3, [x2, #6144]; ldaxr w4, [x0]; cbnz w4, +3; stlxr w5, w3, [x0]; cbnz w5, -3;
+                // cbnz w4, busy; mov w0, #1; ret; busy: clrex; mov w0, #0; ret; slow: ldr x16, =host; br x16
+                static constexpr std::array<std::uint32_t, 18> code{
+                    0xb4000200u, 0xf240041fu, 0x540001c1u, 0xd53bd062u, 0xb4000182u, 0xb9580043u,
+                    0x885ffc04u, 0x35000064u, 0x8805fc03u, 0x35ffffa5u, 0x35000064u, 0x52800020u,
+                    0xd65f03c0u, 0xd5033f5fu, 0x52800000u, 0xd65f03c0u, 0x58000050u, 0xd61f0200u};
+                process.install_export("/usr/lib/libSystem.B.dylib", "_os_unfair_lock_trylock", {emit_fast_path(code, host)});
+            } else {
+                add("_os_unfair_lock_trylock", [](auto& self, auto& s, auto& m) {
+                    s.x[0] = self.unfair_lock_in_memory(m, s.x[0], true) ? 1 : 0;
+                });
+            }
+            if (process.fast_path_allowed("_os_unfair_lock_unlock")) {
+                const auto host = process.install_function("__alchemy_os_unfair_lock_unlock_slow",
+                    [owned](auto& s, auto& m) { owned->unfair_unlock_in_memory(m, s.x[0]); },
+                    "alchemy.internal");
+                // cbz x0, slow; tst x0, #3; b.ne slow; mrs x2, tpidrro_el0; cbz x2, slow;
+                // ldr w3, [x2, #6144]; ldaxr w4, [x0]; cmp w4, w3; b.ne +3; stlxr w5, wzr, [x0]; cbnz w5, -4;
+                // cmp w4, w3; b.ne slow_clrex; ret; slow_clrex: clrex; nop; slow: ldr x16, =host; br x16
+                static constexpr std::array<std::uint32_t, 18> code{
+                    0xb4000200u, 0xf240041fu, 0x540001c1u, 0xd53bd062u, 0xb4000182u, 0xb9580043u,
+                    0x885ffc04u, 0x6b03009fu, 0x54000061u, 0x8805fc1fu, 0x35ffff85u, 0x6b03009fu,
+                    0x54000041u, 0xd65f03c0u, 0xd5033f5fu, 0xd503201fu, 0x58000050u, 0xd61f0200u};
+                process.install_export("/usr/lib/libSystem.B.dylib", "_os_unfair_lock_unlock", {emit_fast_path(code, host)});
+            } else {
+                add("_os_unfair_lock_unlock", [](auto& self, auto& s, auto& m) {
+                    self.unfair_unlock_in_memory(m, s.x[0]);
+                });
+            }
+            const auto recursive_owner = [](auto& self, auto& m, std::uint64_t address) {
+                if (!address || (address & 3) != 0 || !accessible(m, address, 8))
+                    throw std::runtime_error("os_unfair_recursive_lock on an invalid lock");
+                const auto me = Impl::unfair_token(self.process.current_thread()->identity);
+                return (Impl::word(address).load(std::memory_order_acquire) & ~1u) == me;
+            };
+            add("_os_unfair_recursive_lock_lock_with_options", [recursive_owner](auto& self, auto& s, auto& m) {
+                if (recursive_owner(self, m, s.x[0])) { m.write32(s.x[0] + 4, m.read32(s.x[0] + 4) + 1); return; }
+                static_cast<void>(self.unfair_lock_in_memory(m, s.x[0], false));
             });
+            add("_os_unfair_recursive_lock_trylock", [recursive_owner](auto& self, auto& s, auto& m) {
+                const auto address = s.x[0];
+                if (recursive_owner(self, m, address)) { m.write32(address + 4, m.read32(address + 4) + 1); s.x[0] = 1; return; }
+                s.x[0] = self.unfair_lock_in_memory(m, address, true) ? 1 : 0;
+            });
+            add("_os_unfair_recursive_lock_unlock", [recursive_owner](auto& self, auto& s, auto& m) {
+                if (!recursive_owner(self, m, s.x[0]))
+                    throw std::runtime_error("os_unfair_recursive_lock_unlock of a lock not owned by this thread");
+                if (const auto count = m.read32(s.x[0] + 4)) { m.write32(s.x[0] + 4, count - 1); return; }
+                self.unfair_unlock_in_memory(m, s.x[0]);
+            });
+            for (const auto must_own : {true, false}) add(must_own ? "_os_unfair_lock_assert_owner" : "_os_unfair_lock_assert_not_owner",
+                [must_own](auto& self, auto& s, auto& m) {
+                    if (!s.x[0] || (s.x[0] & 3) != 0 || !accessible(m, s.x[0], 4, false))
+                        throw std::runtime_error("os_unfair_lock assertion on an invalid lock");
+                    const auto me = Impl::unfair_token(self.process.current_thread()->identity);
+                    const bool owned = (Impl::word(s.x[0]).load(std::memory_order_acquire) & ~1u) == me;
+                    if (owned != must_own)
+                        throw std::runtime_error(must_own ? "os_unfair_lock is not owned by the current thread" : "os_unfair_lock is owned by the current thread");
+                });
+        } else {
+            add("_os_unfair_lock_lock", [](auto& self, auto& s, auto& m) {
+                const auto result = self.mutex_lock(self.object(self.mutexes, m, s.x[0], 4), false);
+                if (result) throw std::runtime_error("os_unfair_lock_lock failed (recursive acquisition or invalid lock)");
+            });
+            add("_os_unfair_lock_lock_with_options", [](auto& self, auto& s, auto& m) {
+                const auto result = self.mutex_lock(self.object(self.mutexes, m, s.x[0], 4), false);
+                if (result) throw std::runtime_error("os_unfair_lock_lock failed (recursive acquisition or invalid lock)");
+            });
+            add("_os_unfair_lock_trylock", [](auto& self, auto& s, auto& m) {
+                s.x[0] = self.mutex_lock(self.object(self.mutexes, m, s.x[0], 4), true) == 0;
+            });
+            add("_os_unfair_lock_unlock", [](auto& self, auto& s, auto& m) {
+                if (self.mutex_unlock(self.object(self.mutexes, m, s.x[0], 4)))
+                    throw std::runtime_error("os_unfair_lock_unlock of a lock not owned by this thread");
+            });
+            // os_unfair_recursive_lock {os_unfair_lock ourl_lock; uint32_t ourl_count}: the owner taking it again
+            // counts in ourl_count; unlock counts down before it releases the lock. The options are hints.
+            const auto recursive_owner = [](auto& self, auto& m, std::uint64_t address) {
+                const auto value = self.object(self.mutexes, m, address, 4);
+                if (!value || !accessible(m, address, 8)) throw std::runtime_error("os_unfair_recursive_lock on an invalid lock");
+                std::lock_guard lock(value->gate);
+                return std::pair{value, value->owner == self.process.current_thread()->identity};
+            };
+            add("_os_unfair_recursive_lock_lock_with_options", [recursive_owner](auto& self, auto& s, auto& m) {
+                const auto [value, owned] = recursive_owner(self, m, s.x[0]);
+                if (owned) { m.write32(s.x[0] + 4, m.read32(s.x[0] + 4) + 1); return; }
+                if (self.mutex_lock(value, false)) throw std::runtime_error("os_unfair_recursive_lock_lock failed");
+            });
+            add("_os_unfair_recursive_lock_trylock", [recursive_owner](auto& self, auto& s, auto& m) {
+                const auto address = s.x[0];
+                const auto [value, owned] = recursive_owner(self, m, address);
+                if (owned) { m.write32(address + 4, m.read32(address + 4) + 1); s.x[0] = 1; return; }
+                s.x[0] = self.mutex_lock(value, true) == 0;
+            });
+            add("_os_unfair_recursive_lock_unlock", [recursive_owner](auto& self, auto& s, auto& m) {
+                const auto [value, owned] = recursive_owner(self, m, s.x[0]);
+                if (!owned) throw std::runtime_error("os_unfair_recursive_lock_unlock of a lock not owned by this thread");
+                if (const auto count = m.read32(s.x[0] + 4)) { m.write32(s.x[0] + 4, count - 1); return; }
+                if (self.mutex_unlock(value)) throw std::runtime_error("os_unfair_recursive_lock_unlock failed");
+            });
+            for (const auto must_own : {true, false}) add(must_own ? "_os_unfair_lock_assert_owner" : "_os_unfair_lock_assert_not_owner",
+                [must_own](auto& self, auto& s, auto& m) {
+                    const auto value = self.object(self.mutexes, m, s.x[0], 4, false);
+                    if (!value) throw std::runtime_error("os_unfair_lock assertion on an invalid lock");
+                    const auto identity = self.process.current_thread()->identity;
+                    std::lock_guard lock(value->gate);
+                    if ((value->owner == identity) != must_own)
+                        throw std::runtime_error(must_own ? "os_unfair_lock is not owned by the current thread" : "os_unfair_lock is owned by the current thread");
+                });
+        }
         // The values live in each thread's TSD array (keys below 768), as libpthread's: a deleted key's slot
         // is cleared in every thread.
         add("_pthread_key_delete", [](auto& self, auto& s, auto& m) {
@@ -1388,13 +1611,29 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
             if (tsd) m.write64(tsd + key * 8, s.x[1]); else thread->key_values[key] = s.x[1];
             s.x[0] = 0;
         });
-        add("_pthread_getspecific", [](auto& self, auto& s, auto& m) {
+        const auto getspecific_slow = [](Impl& self, transmute::CpuState& s, transmute::GuestMemory& m) {
             const auto key = s.x[0];
             if (key < Impl::tsd_slots) { s.x[0] = m.read64(self.own_tsd() + key * 8); return; }
             const auto thread = self.process.current_thread(); std::lock_guard lock(self.metadata);
             const auto value = thread->key_values.find(key);
             s.x[0] = self.keys.contains(key) && value != thread->key_values.end() ? value->second : 0;
-        });
+        };
+        if constexpr (engine_has_thread_readonly_pointer<transmute::ReferenceEngine>) {
+            if (process.fast_path_allowed("_pthread_getspecific")) {
+                const auto host = process.install_function("__alchemy_pthread_getspecific_slow",
+                    [owned, getspecific_slow](auto& s, auto& m) { getspecific_slow(*owned, s, m); }, "alchemy.internal");
+                // cmp x0, #768; b.hs slow; mrs x1, tpidrro_el0; cbz x1, slow;
+                // ldr x0, [x1, x0, lsl #3]; ret; slow: ldr x16, =host; br x16
+                static constexpr std::array<std::uint32_t, 8> code{
+                    0xf10c001fu, 0x540000a2u, 0xd53bd061u, 0xb4000061u,
+                    0xf8607820u, 0xd65f03c0u, 0x58000050u, 0xd61f0200u};
+                process.install_export("/usr/lib/libSystem.B.dylib", "_pthread_getspecific", {emit_fast_path(code, host)});
+            } else {
+                add("_pthread_getspecific", getspecific_slow);
+            }
+        } else {
+            add("_pthread_getspecific", getspecific_slow);
+        }
         add("___ulock_wait", [](auto& self, auto& s, auto& m) {
             const auto operation = static_cast<std::uint32_t>(s.x[0]);
             const auto address = s.x[1];
@@ -1538,6 +1777,7 @@ struct DarwinThreads::Impl : std::enable_shared_from_this<Impl> {
         };
         process.join_workers = [owned] { owned->join_all(); };
         process.cleanup_thread = [owned](auto& thread) { owned->cleanup(thread); };
+        finalize_fast_paths();
         // The main thread has its TSD array from the start, as on Darwin, where libpthread sets it up before
         // any image's initializers run: mimalloc (Python 3.14) reads tsd[0] through TPIDRRO_EL0 in one.
         static_cast<void>(own_tsd());

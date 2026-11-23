@@ -96,7 +96,10 @@ struct DarwinServices::Impl::ForkChild : ForkChildGuard {
         // cleanup, the malloc zone and __tlv_bootstrap's slow path (the first
         // use of a thread-local on the child's thread).
         if (library == "alchemy.internal" && (symbol == "__alchemy_exit_cleanup" || symbol.starts_with("__alchemy_zone_") ||
-                                              symbol == "__alchemy_tlv_bootstrap_slow_path")) return;
+                                              symbol == "__alchemy_tlv_bootstrap_slow_path" ||
+                                              symbol == "__alchemy_pthread_self_slow" ||
+                                              symbol == "__alchemy_pthread_getspecific_slow" ||
+                                              symbol.starts_with("__alchemy_os_unfair_lock_"))) return;
         if ((library == system_library || library.starts_with("/usr/lib/system/")) && fork_child_may_call(symbol)) return;
         throw ForkChildViolation{"the child called " + std::string(symbol) + (library == system_library ? std::string() : " (" + std::string(library) + ")") +
             " before exec; between fork and exec only descriptor, directory, signal-disposition, wait and exec operations are supported"};

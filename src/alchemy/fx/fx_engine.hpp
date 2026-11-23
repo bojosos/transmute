@@ -119,6 +119,9 @@ public:
     // The calling thread opens or closes a JIT write window
     // (pthread_jit_write_protect_np; fx::guest_jit_write_window).
     void jit_write_window(bool open);
+    // Explicit-flush code range (Darwin MAP_JIT).
+    void register_explicit_flush_code(std::uint64_t base, std::uint64_t size);
+    void unregister_explicit_flush_code(std::uint64_t base, std::uint64_t size);
     // [copy, copy + size) holds an exact copy of the code at source
     // (fx::register_guest_code_copy).
     void code_copy(std::uint64_t copy, std::uint64_t source, std::uint64_t size);

@@ -244,11 +244,13 @@ int main(void) {
             pthread_jit_write_protect_np(1);
             if (a() != 51 || b() != (int)(80 + i) || n() != (int)(60 + i)) return 52;
         }
-        /* Never flushed: current once the window has closed (fx checks the
-         * code it deferred; Darwin would need the flush). */
+        /* Darwin MAP_JIT contract: explicit-flush code memory does not write-protect
+         * translated pages, so a rewrite without sys_icache_invalidate stays stale
+         * until flushed and becomes current immediately on the flush. */
         pthread_jit_write_protect_np(0);
         put_code((volatile unsigned*)(code + 0x100), 53);
         pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(code + 0x100, 8);
         if (a() != 53 || b() != 99) return 53;
         /* A thread spinning in code on the page leaves it at the flush. */
         volatile unsigned* w = (volatile unsigned*)(code + 0x800);

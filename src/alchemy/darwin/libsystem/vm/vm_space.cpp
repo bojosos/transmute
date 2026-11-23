@@ -148,6 +148,8 @@ std::uint64_t DarwinVmSpace::map(std::uint64_t address, std::uint64_t length, st
             disown(address, end);
             throw DarwinVmError{enomem};
         }
+        if (flags & map_jit) engine_register_explicit_flush_code(engine, address, size);
+        else engine_unregister_explicit_flush_code(engine, address, size);
         own(address, end);
         return address;
     }
@@ -171,6 +173,7 @@ std::uint64_t DarwinVmSpace::map(std::uint64_t address, std::uint64_t length, st
             throw DarwinVmError{enomem};
         }
     }
+    if (flags & map_jit) engine_register_explicit_flush_code(engine, base, size);
     if (executable) protect_engine_range(engine, base, size, readable, writable, true);
     own(base, base + size);
     return base;
@@ -187,6 +190,7 @@ std::uint64_t DarwinVmSpace::unmap(std::uint64_t address, std::uint64_t length) 
     for (; it != owned_.end() && it->first < end; ++it)
         if (it->second > address) parts.emplace_back(std::max(address, it->first), std::min(end, it->second));
     for (const auto& [begin, part_end] : parts) {
+        engine_unregister_explicit_flush_code(context_.main_engine(), begin, part_end - begin);
         engine_unmap_range(context_.main_engine(), begin, part_end - begin);
         disown(begin, part_end);
     }
