@@ -247,11 +247,9 @@ void emit_minmax(FpEmit& e, K kind, Shape s, Xmm out, Xmm a, Xmm b, Xmm u, Xmm v
 
 // FMAX/FMIN/FMAXNM/FMINNM where one operand holds a constant known at
 // translation time (EmitContext::vec_fp_const):
-//  - finite normal constant + quiet x: one x64 min/max, bit-exact for every x.
-//  - FMAXNM(x, +0.0) / FMINNM(x, -0.0) + quiet x: one x64 vmax(x, +0.0) /
-//    vmin(x, -0.0), bit-exact (-0/+0 tie and qNaN both return the 2nd operand).
-//  - scalar FMAX(x, +0.0) / FMIN(x, -0.0) + quiet x (dead flags, cold defer):
-//    `ucomis x, x; jp cold; vmax/vmin d, x, c` (2-3 insns hot).
+//  - scalar finite normal constant or FMAX(x,+0)/FMIN(x,-0)/FMAXNM(x,+0)/FMINNM(x,-0)
+//    + quiet x (dead flags, cold defer): `ucomis x, x; jp cold/done; vmax/vmin d, x, c`
+//    (2-3 insns hot, never feeds a quiet NaN to vmax/vmin so MXCSR.IE stays clear).
 //  - finite normal or +-0.0 constant + ANY x (dead flags, cold defer):
 //    check NaN on x alone -> 1 single x64 min/max (ordered so +-0 tie yields
 //    A64's exact sign) -> deferred bit-exact FPProcessNaNs cold stub.
@@ -271,7 +269,7 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     };
     const auto any_zero = [sign_bit](std::uint64_t v) { return v == 0 || v == sign_bit; };
     const unsigned span = s.scalar ? es : w;
-    enum class Match { none, one_insn, scalar_zero_nan, deferred_single };
+    enum class Match { none, scalar_quiet_nan, deferred_single };
     std::uint64_t matched_c = 0;
     const auto classify = [&](unsigned c_reg, unsigned x_reg) -> Match {
         std::uint64_t c = 0;
@@ -279,13 +277,9 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
         const bool is_norm = normal(c);
         if (!is_norm && !any_zero(c)) return Match::none;
         matched_c = c;
-        if (e.ctx.vec_fp_quiet(x_reg, es)) {
-            if (is_norm) return Match::one_insn;
-            if (exact_zero(c)) {
-                if (nm) return Match::one_insn;
-                if (s.scalar && e.ctx.can_defer_cold() && !e.ctx.host_flags_live()) return Match::scalar_zero_nan;
-            }
-        }
+        if (s.scalar && e.ctx.vec_fp_quiet(x_reg, es) && (is_norm || exact_zero(c)) &&
+            e.ctx.can_defer_cold() && !e.ctx.host_flags_live())
+            return Match::scalar_quiet_nan;
         if (fp_on(fp_old_minmax) && e.ctx.can_defer_cold() && !e.ctx.host_flags_live()) return Match::deferred_single;
         return Match::none;
     };
@@ -304,13 +298,14 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
     }
     if (match == Match::none) return false;
     const Xmm x = e.vec(xr), cv = e.vec(cr);
-    if (match == Match::scalar_zero_nan) {
+    if (match == Match::scalar_quiet_nan) {
         e.ctx.clobber_host_flags();
-        const bool zero = e.zero_above(xr, w);
+        const Xmm nan_val = nm ? cv : x;
+        const bool zero = e.zero_above(xr, w) && (!nm || e.zero_above(cr, w));
         const Xmm d = e.dest(in.rd);
         const Label done = e.as.new_label();
         e.ucomi(dbl, x, x, false);
-        if (d == x) {
+        if (d == nan_val) {
             e.as.jcc_short(Cond::p, done);
             e.op(s.pick(is_max ? fops::max : fops::min), d, x, cv);
             e.as.bind(done);
@@ -321,10 +316,10 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
             e.as.bind(done);
             x64::Assembler* as = &e.as;
             const bool avx = e.avx();
-            e.ctx.defer_cold([as, avx, d, x, cold, done] {
+            e.ctx.defer_cold([as, avx, d, nan_val, cold, done] {
                 as->bind(cold);
-                if (avx) as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(x));
-                else as->movaps(d, x);
+                if (avx) as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(nan_val));
+                else as->movaps(d, nan_val);
                 as->jmp(done);
             });
         }
@@ -447,12 +442,7 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
         });
         return true;
     }
-    const unsigned first = nm ? xr : cr;   // a scalar result takes its upper lanes from here
-    const bool zero = s.scalar ? e.zero_above(first, w) : w == 128;
-    const Xmm d = e.dest(in.rd);
-    e.op(s.pick(is_max ? fops::max : fops::min), d, nm ? x : cv, nm ? cv : x);
-    if (!zero) e.zero_upper(d, w);
-    return true;
+    return false;
 }
 
 // FMAX/FMIN/FMAXNM/FMINNM bit-exact with FPCR.DN = 0, NaNs included (AVX).
@@ -863,13 +853,6 @@ unsigned emit_minmax_chain(FpEmit& e, std::span<const std::uint32_t> words) {
     const Shape s = chain[0].sh;
     const unsigned es = s.es;
     const bool dbl = s.dbl();
-    // Preserve 1-instruction constant-operand minmax when it applies to words[0].
-    if (fp_on(fp_no_const_minmax)) {
-        std::uint64_t dummy = 0;
-        if ((e.ctx.vec_fp_const(chain[0].rm, es, 128, dummy) && e.ctx.vec_fp_quiet(chain[0].rn, es)) ||
-            (e.ctx.vec_fp_const(chain[0].rn, es, 128, dummy) && e.ctx.vec_fp_quiet(chain[0].rm, es)))
-            return 0;
-    }
 
     const unsigned avail = e.ctx.vec_scratch_avail();
     const auto has_two_mem = [&](unsigned cur_len, std::uint32_t mem_mask) -> bool {

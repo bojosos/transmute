@@ -153,6 +153,24 @@ std::uint32_t exception_flags(std::uint32_t status) { return (status & 31U) | ((
 transmute::GuestCallHandler numeric_floating_handler(transmute::GuestCallHandler handler);
 namespace {
 
+template <class R, bool IsMax>
+R ieee_fminmax(R a, R b) noexcept {
+    using U = std::conditional_t<sizeof(R) == 4, std::uint32_t, std::uint64_t>;
+    constexpr U kExpMask = sizeof(R) == 4 ? 0x7f800000u : 0x7ff0000000000000ull;
+    constexpr U kSignBit = sizeof(R) == 4 ? 0x80000000u : 0x8000000000000000ull;
+    constexpr U kQuietBit = sizeof(R) == 4 ? 0x00400000u : 0x0008000000000000ull;
+    const U ba = std::bit_cast<U>(a), bb = std::bit_cast<U>(b);
+    const bool na = (ba & ~kSignBit) > kExpMask;
+    const bool nb = (bb & ~kSignBit) > kExpMask;
+    if (na || nb) {
+        if ((na && !(ba & kQuietBit)) || (nb && !(bb & kQuietBit))) std::feraiseexcept(FE_INVALID);
+        if (na && nb) return std::bit_cast<R>(ba | kQuietBit);
+        return na ? b : a;
+    }
+    if (((ba | bb) & ~kSignBit) == 0) return std::bit_cast<R>(IsMax ? (ba & bb) : (ba | bb));
+    return IsMax ? (a > b ? a : b) : (a < b ? a : b);
+}
+
 // The rest of C99/POSIX libm and Darwin's extensions: rounding to integers (lround, llround,
 // lrint, llrint, nearbyint), fmax/fmin/fdim/fma, tgamma, lgamma_r, remquo, remainder, ilogb,
 // scalbln, nan, nexttoward (long double is binary64 on Apple arm64, so *l is double), the
@@ -177,8 +195,8 @@ template<class R> void install_precision_extra(ProcessContext& context, const st
     install("lrint", [integer](auto& s, auto&) { s.x[0] = integer(std::llrint(argument<R>(s, 0))); });
     install("llrint", [integer](auto& s, auto&) { s.x[0] = integer(std::llrint(argument<R>(s, 0))); });
     install("nearbyint", [](auto& s, auto&) { result(s, std::nearbyint(argument<R>(s, 0))); });
-    install("fmax", [](auto& s, auto&) { result(s, std::fmax(argument<R>(s, 0), argument<R>(s, 1))); });
-    install("fmin", [](auto& s, auto&) { result(s, std::fmin(argument<R>(s, 0), argument<R>(s, 1))); });
+    install("fmax", [](auto& s, auto&) { result(s, ieee_fminmax<R, true>(argument<R>(s, 0), argument<R>(s, 1))); });
+    install("fmin", [](auto& s, auto&) { result(s, ieee_fminmax<R, false>(argument<R>(s, 0), argument<R>(s, 1))); });
     install("fdim", [](auto& s, auto&) { result(s, std::fdim(argument<R>(s, 0), argument<R>(s, 1))); });
     install("fma", [](auto& s, auto&) { result(s, std::fma(argument<R>(s, 0), argument<R>(s, 1), argument<R>(s, 2))); });
     install("tgamma", [](auto& s, auto&) { result(s, std::tgamma(argument<R>(s, 0))); });

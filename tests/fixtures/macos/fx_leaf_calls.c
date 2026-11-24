@@ -69,6 +69,10 @@ extern float log2f(float);
 extern double log2(double);
 extern float sqrtf(float);
 extern double sqrt(double);
+extern float fmaxf(float, float);
+extern double fmax(double, double);
+extern float fminf(float, float);
+extern double fmin(double, double);
 struct fx_float2 { float sinval; float cosval; };
 extern struct fx_float2 __sincosf_stret(float);
 
@@ -425,6 +429,10 @@ static float (*volatile p_log2f)(float) = log2f;
 static double (*volatile p_log2)(double) = log2;
 static float (*volatile p_sqrtf)(float) = sqrtf;
 static double (*volatile p_sqrt)(double) = sqrt;
+static float (*volatile p_fmaxf)(float, float) = fmaxf;
+static double (*volatile p_fmax)(double, double) = fmax;
+static float (*volatile p_fminf)(float, float) = fminf;
+static double (*volatile p_fmin)(double, double) = fmin;
 static struct fx_float2 (*volatile p_sincosf)(float) = __sincosf_stret;
 
 static unsigned long read_fpsr(void) {
@@ -514,6 +522,29 @@ static int math_leaves(void) {
             __asm__ volatile("fmaxnm %d0, %d1, %d2" : "=w"(dout) : "w"(dqn), "w"(d1));
             __asm__ volatile("fminnm %d0, %d1, %d2" : "=w"(dout) : "w"(d1), "w"(dqn));
             if (fout != 1.0f || dout != 1.0 || (read_fpsr() & 1UL) != 0) return 0;
+
+            /* Darwin libm fmax/fmin: exact +-0 sign and quiet-NaN / signaling-NaN FPSR.IOC */
+            const double dpz = 0.0, dnz = dfrom(0x8000000000000000UL);
+            const double dsnan = dfrom(0x7ff0000000000001UL);
+            const float fsnan = ffrom(0x7fa00001u);
+            union { double d; unsigned long u; } du;
+            clear_fpsr();
+            if (fbits(p_fmaxf(pz, nz)) != 0x00000000u || fbits(p_fmaxf(nz, pz)) != 0x00000000u) return 0;
+            if (fbits(p_fminf(pz, nz)) != 0x80000000u || fbits(p_fminf(nz, pz)) != 0x80000000u) return 0;
+            du.d = p_fmax(dpz, dnz); if (du.u != 0UL) return 0;
+            du.d = p_fmax(dnz, dpz); if (du.u != 0UL) return 0;
+            du.d = p_fmin(dpz, dnz); if (du.u != 0x8000000000000000UL) return 0;
+            du.d = p_fmin(dnz, dpz); if (du.u != 0x8000000000000000UL) return 0;
+            if (p_fmaxf(nanv, 1.0f) != 1.0f || p_fmaxf(1.0f, nanv) != 1.0f) return 0;
+            if (p_fminf(nanv, 1.0f) != 1.0f || p_fminf(1.0f, nanv) != 1.0f) return 0;
+            if (p_fmax(dnan, 1.0) != 1.0 || p_fmax(1.0, dnan) != 1.0) return 0;
+            if (p_fmin(dnan, 1.0) != 1.0 || p_fmin(1.0, dnan) != 1.0) return 0;
+            rf = p_fmaxf(nanv, nanv); rd = p_fmin(dnan, dnan);
+            if (rf == rf || rd == rd || (read_fpsr() & 1UL) != 0) return 0;
+            clear_fpsr();
+            if (p_fmaxf(fsnan, 1.0f) != 1.0f || (read_fpsr() & 1UL) == 0) return 0;
+            clear_fpsr();
+            if (p_fmin(1.0, dsnan) != 1.0 || (read_fpsr() & 1UL) == 0) return 0;
         }
 
         /* Dense sweep checking sin/cos/sincos/atan/atan2/acos identities across all quadrants */

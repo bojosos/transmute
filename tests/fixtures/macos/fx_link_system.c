@@ -103,5 +103,9 @@ float log2f(float x) { return x; }
 double log2(double x) { return x; }
 float sqrtf(float x) { return x; }
 double sqrt(double x) { return x; }
+float fmaxf(float a, float b) { (void)b; return a; }
+double fmax(double a, double b) { (void)b; return a; }
+float fminf(float a, float b) { (void)b; return a; }
+double fmin(double a, double b) { (void)b; return a; }
 struct fx_float2 { float s; float c; };
 struct fx_float2 __sincosf_stret(float x) { struct fx_float2 r = {x, x}; return r; }
