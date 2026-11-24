@@ -168,6 +168,19 @@ public:
         (void)index;
         (void)width;
     }
+    // ---- vector broadcast knowledge (fp/neon; additive) ----------------------
+    // Bit v set = every `es`-bit lane (32 or 64) of Vv holds the exact same
+    // value on the current straight-line path (e.g. from 128-bit DUP.4S/.2D).
+    // Query before write_vec() of the same register; write_vec forgets it.
+    // Implementations forget everything at labels, helper calls and exits.
+    [[nodiscard]] virtual std::uint32_t vec_broadcast(unsigned es) const {
+        (void)es;
+        return 0;
+    }
+    virtual void note_vec_broadcast(unsigned index, unsigned es) {
+        (void)index;
+        (void)es;
+    }
 
     // ---- source operands without a scratch register (added by translator
     // core; additive) ----------------------------------------------------------

@@ -2977,3 +2977,182 @@ FX_TEST(neon_wave_r_fp_derived_faddp_and_dup_fsqrt) {
     runner.machine.reset();
     runner.machine.options.optimize = -1;
 }
+
+// Wave S: non-adjacent DUP ... FSQRT via vec_broadcast, MOVI/FMOV_vimm + vector
+// FADD/FSUB/FMUL/FDIV constant folding, and hoisted FP by-element pin exclusion.
+FX_TEST(neon_wave_s_broadcast_fsqrt_and_const_fparith) {
+    ensure_registered();
+    DiffRunner runner;
+    runner.machine.options.optimize = 1;
+    // Encodings:
+    const auto dup4s = [](unsigned d, unsigned n, unsigned idx) {
+        return 0x4e040400u | ((idx & 3u) << 19) | (n << 5) | d;
+    };
+    const auto dup2d = [](unsigned d, unsigned n, unsigned idx) {
+        return 0x4e080400u | ((idx & 1u) << 20) | (n << 5) | d;
+    };
+    const auto fsqrt4s = [](unsigned d, unsigned n) { return 0x6ea1f800u | (n << 5) | d; };
+    const auto fsqrt2d = [](unsigned d, unsigned n) { return 0x6ee1f800u | (n << 5) | d; };
+    const auto fabs4s = [](unsigned d, unsigned n) { return 0x4ea0f800u | (n << 5) | d; };
+    const auto fabs2d = [](unsigned d, unsigned n) { return 0x4ee0f800u | (n << 5) | d; };
+    const auto fadd4s = [](unsigned d, unsigned n, unsigned m) { return 0x4e20d400u | (m << 16) | (n << 5) | d; };
+    const auto fsub4s = [](unsigned d, unsigned n, unsigned m) { return 0x4ea0d400u | (m << 16) | (n << 5) | d; };
+    const auto fmul4s = [](unsigned d, unsigned n, unsigned m) { return 0x6e20dc00u | (m << 16) | (n << 5) | d; };
+    const auto fdiv4s = [](unsigned d, unsigned n, unsigned m) { return 0x6e20fc00u | (m << 16) | (n << 5) | d; };
+    const auto fadd2d = [](unsigned d, unsigned n, unsigned m) { return 0x4e60d400u | (m << 16) | (n << 5) | d; };
+    const auto fmul2d = [](unsigned d, unsigned n, unsigned m) { return 0x6e60dc00u | (m << 16) | (n << 5) | d; };
+    const auto mov16b = [](unsigned d, unsigned n) { return 0x4ea01c00u | (n << 16) | (n << 5) | d; };
+    // MOVI Vd.4S, #imm8, LSL #24 -> 0x4f006400 | (abc << 16) | (defgh << 5) | rd
+    const auto movi4s_lsl24 = [](unsigned d, unsigned imm8) {
+        return 0x4f006400u | (((imm8 >> 5) & 7u) << 16) | ((imm8 & 31u) << 5) | d;
+    };
+    // FMOV Vd.4S, #imm8 -> 0x4f00f400 | (abc << 16) | (defgh << 5) | rd (0x70 = 1.0f, 0x60 = 0.5f, 0x00 = 2.0f)
+    const auto fmov4s = [](unsigned d, unsigned imm8) {
+        return 0x4f00f400u | (((imm8 >> 5) & 7u) << 16) | ((imm8 & 31u) << 5) | d;
+    };
+    // FMOV Vd.2D, #imm8 -> 0x6f00f400 | (abc << 16) | (defgh << 5) | rd (0x70 = 1.0, 0x60 = 0.5)
+    const auto fmov2d = [](unsigned d, unsigned imm8) {
+        return 0x6f00f400u | (((imm8 >> 5) & 7u) << 16) | ((imm8 & 31u) << 5) | d;
+    };
+
+    const std::vector<std::uint32_t> prog = {
+        // 1. Non-adjacent DUP.4S + intervening op + FSQRT.4S (both in-place and via MOV alias)
+        fabs4s(0, 0),
+        dup4s(15, 0, 2),
+        fsub4s(14, 1, 2),          // intervening instruction breaks adjacent pair
+        fsqrt4s(15, 15),           // must use vec_broadcast scalar vsqrtss + vpbroadcastd
+        mov16b(13, 15),            // MOV propagates vec_broadcast
+        fsqrt4s(13, 13),           // second broadcast FSQRT
+        // 2. Non-adjacent DUP.2D + intervening op + FSQRT.2D
+        fabs2d(3, 3),
+        dup2d(12, 3, 1),
+        fadd2d(11, 4, 5),
+        fsqrt2d(12, 12),
+        // 3. MOVI + FMUL/FADD/FSUB/FDIV (.4S): 0x3f<<24 = 0x3f000000 = 0.5f, 0x40<<24 = 2.0f
+        movi4s_lsl24(6, 0x3fu),    // v6 = {0.5f}
+        fmul4s(6, 1, 6),           // rm == rd0, overwrite rd0
+        movi4s_lsl24(7, 0x40u),    // v7 = {2.0f}
+        fadd4s(8, 7, 2),           // rn == rd0 (commutative swap), v7 dead after (overwritten next)
+        movi4s_lsl24(7, 0x3fu),    // v7 = {0.5f}
+        fsub4s(7, 8, 7),           // FSUB rm == rd0
+        movi4s_lsl24(9, 0x40u),    // v9 = {2.0f}
+        fdiv4s(9, 7, 9),           // FDIV rm == rd0
+        // 4. FMOV_vimm + FMUL/FADD/FSUB/FDIV (.4S and .2D)
+        fmov4s(10, 0x70u),         // v10 = {1.0f}
+        fadd4s(10, 10, 9),         // commutative rn == rd0
+        fmov4s(10, 0x60u),         // v10 = {0.5f}
+        fdiv4s(10, 1, 10),         // non-commutative rm == rd0
+        fmov2d(16, 0x70u),         // v16 = {1.0}
+        fmul2d(16, 4, 16),         // .2D FMUL
+        fmov2d(17, 0x60u),         // v17 = {0.5}
+        fadd2d(17, 17, 16),        // .2D FADD commutative
+        // 5. MOVI + 128-bit bitwise AND/BIC/ORR/ORN/EOR (.16B)
+        movi4s_lsl24(18, 0x80u),                                         // v18 = sign-bit mask
+        0x6e201c00u | (18u << 16) | (1u << 5) | 18u,                     // EOR v18.16B, v1.16B, v18.16B
+        movi4s_lsl24(19, 0x7fu),                                         // v19 = 0x7f000000
+        0x4e201c00u | (2u << 16) | (19u << 5) | 19u,                     // AND v19.16B, v19.16B, v2.16B (rn==rd0)
+        movi4s_lsl24(20, 0x80u),                                         // v20 = 0x80000000
+        0x4e601c00u | (20u << 16) | (1u << 5) | 20u,                     // BIC v20.16B, v1.16B, v20.16B (rm==rd0)
+        movi4s_lsl24(21, 0x55u),                                         // v21 = 0x55000000
+        0x4e601c00u | (2u << 16) | (21u << 5) | 21u,                     // BIC v21.16B, v21.16B, v2.16B (rn==rd0)
+        movi4s_lsl24(22, 0x3fu),                                         // v22 = 0x3f000000
+        0x4ea01c00u | (22u << 16) | (1u << 5) | 22u,                     // ORR v22.16B, v1.16B, v22.16B
+        movi4s_lsl24(23, 0x80u),                                         // v23 = 0x80000000
+        0x4ee01c00u | (23u << 16) | (2u << 5) | 23u,                     // ORN v23.16B, v2.16B, v23.16B
+    };
+    const auto pack4 = [](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        return std::pair<std::uint64_t, std::uint64_t>{
+            static_cast<std::uint64_t>(a) | (static_cast<std::uint64_t>(b) << 32),
+            static_cast<std::uint64_t>(c) | (static_cast<std::uint64_t>(d) << 32),
+        };
+    };
+    static constexpr std::uint32_t kVals[] = {
+        0x3f800000u, 0x40400000u, 0xbf000000u, 0x00000000u,
+        0x80000000u, 0x41200000u, 0xc0800000u, 0x3dcccccdu,
+    };
+    for (unsigned k = 0; k < 12; ++k) {
+        auto ctx = runner.context(98700 + k);
+        const auto p0 = pack4(kVals[k & 7], kVals[(k + 1) & 7], kVals[(k + 2) & 7], kVals[(k + 3) & 7]);
+        const auto p1 = pack4(kVals[(k + 4) & 7], kVals[(k + 5) & 7], kVals[(k + 6) & 7], kVals[(k + 7) & 7]);
+        ctx.v[0][0] = p0.first; ctx.v[0][1] = p0.second;
+        ctx.v[1][0] = p1.first; ctx.v[1][1] = p1.second;
+        ctx.v[2][0] = p0.second; ctx.v[2][1] = p1.first;
+        ctx.v[3][0] = 0x4010000000000000ULL;
+        ctx.v[3][1] = (k & 1) ? 0x8000000000000000ULL : 0x4022000000000000ULL;
+        ctx.v[4][0] = 0x3ff8000000000000ULL; ctx.v[4][1] = 0xc004000000000000ULL;
+        ctx.v[5][0] = 0x4000000000000000ULL; ctx.v[5][1] = 0x3fe0000000000000ULL;
+        FX_CHECK(runner.run(prog, ctx, "wave s broadcast_fsqrt+const_fparith " + std::to_string(k)));
+    }
+    runner.machine.reset();
+    runner.machine.options.optimize = -1;
+}
+
+// Region-level deferred minmax stubs (scalar/vector minmax_exact_deferred,
+// emit_minmax_const, emit_minmax_chain) must never raise FPSR.IOC on quiet NaN,
+// while still raising FPSR.IOC on signaling NaN.
+FX_TEST(fp_region_minmax_qnan_no_spurious_ioc) {
+    ensure_registered();
+    DiffRunner runner;
+    runner.check_relocatable = false;
+    constexpr std::uint32_t kMsrFpsrXzr = 0xd51b443fu;   // msr fpsr, xzr
+    constexpr std::uint32_t kMrsX0Fpsr = 0xd53b4420u;    // mrs x0, fpsr
+    const auto run_check = [&](const std::vector<std::uint32_t>& body, GuestContext ctx,
+                               std::uint64_t want_ioc, const char* label) {
+        std::vector<std::uint32_t> prog;
+        prog.push_back(kMsrFpsrXzr);
+        prog.insert(prog.end(), body.begin(), body.end());
+        prog.push_back(kMrsX0Fpsr);
+        for (const int opt : {0, 1}) {
+            runner.machine.options.optimize = static_cast<std::int8_t>(opt);
+            FX_CHECK(runner.run(prog, ctx, label));
+            FX_CHECK_EQ(runner.actual.x[0] & 1u, want_ioc);
+        }
+    };
+    const auto pack4 = [](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        return std::pair<std::uint64_t, std::uint64_t>{
+            static_cast<std::uint64_t>(a) | (static_cast<std::uint64_t>(b) << 32),
+            static_cast<std::uint64_t>(c) | (static_cast<std::uint64_t>(d) << 32),
+        };
+    };
+
+    // 1. Scalar FMAXNM/FMINNM/FMAX/FMIN (S and D, distinct and aliasing rd==rn).
+    for (const std::uint32_t insn : {
+             0x1e226823u, 0x1e227823u, 0x1e224823u, 0x1e225823u,   // s3 = op(s1, s2)
+             0x1e226821u, 0x1e227821u,                             // s1 = op(s1, s2) alias
+             0x1e626823u, 0x1e627823u, 0x1e624823u, 0x1e625823u,   // d3 = op(d1, d2)
+             0x1e626821u, 0x1e627821u,                             // d1 = op(d1, d2) alias
+         }) {
+        const bool dbl = (insn & (1u << 22)) != 0;
+        const std::uint64_t one = dbl ? 0x3ff0000000000000ULL : 0x3f800000ULL;
+        const std::uint64_t qnan = dbl ? 0x7ff8000000000001ULL : 0x7fc00001ULL;
+        const std::uint64_t snan = dbl ? 0x7ff0000000000001ULL : 0x7fa00001ULL;
+        for (const auto [a, b, ioc] : {std::tuple{qnan, one, 0ULL}, std::tuple{one, qnan, 0ULL},
+                                       std::tuple{qnan, qnan, 0ULL}, std::tuple{snan, one, 1ULL},
+                                       std::tuple{one, snan, 1ULL}}) {
+            auto ctx = runner.context(99100);
+            ctx.v[1][0] = a; ctx.v[1][1] = 0;
+            ctx.v[2][0] = b; ctx.v[2][1] = 0;
+            run_check({insn}, ctx, ioc, "scalar minmax deferred ioc");
+        }
+    }
+
+    // 2. Vector .4S/.2D single deferred + const deferred_single + 2-op chain cold stub.
+    const std::vector<std::uint32_t> vec_single{0x4e22c423u};                  // fmaxnm v3.4s, v1.4s, v2.4s
+    const std::vector<std::uint32_t> vec_const{0x4f03f610u, 0x4eb0c423u};      // fmov v16.4s, #1.0; fminnm v3.4s, v1.4s, v16.4s
+    const std::vector<std::uint32_t> vec_chain{0x4e22c423u, 0x4ea2f464u};      // fmaxnm v3.4s, v1, v2; fmin v4.4s, v3, v2
+    for (const auto& prog : {vec_single, vec_const, vec_chain}) {
+        auto ctx_q = runner.context(99200);
+        const auto pq1 = pack4(0x7fc00001u, 0x40000000u, 0x80000000u, 0x3f800000u);
+        const auto pq2 = pack4(0x3f800000u, 0x7fc00002u, 0x00000000u, 0xbf800000u);
+        ctx_q.v[1][0] = pq1.first; ctx_q.v[1][1] = pq1.second;
+        ctx_q.v[2][0] = pq2.first; ctx_q.v[2][1] = pq2.second;
+        run_check(prog, ctx_q, 0u, "vector minmax qnan no ioc");
+
+        auto ctx_s = ctx_q;
+        const auto ps1 = pack4(0x7fa00001u, 0x40000000u, 0x80000000u, 0x3f800000u);
+        ctx_s.v[1][0] = ps1.first; ctx_s.v[1][1] = ps1.second;
+        run_check(prog, ctx_s, 1u, "vector minmax snan sets ioc");
+    }
+    runner.machine.reset();
+    runner.machine.options.optimize = -1;
+}

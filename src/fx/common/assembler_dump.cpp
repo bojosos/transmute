@@ -172,6 +172,6 @@ int main() {
     emit("HEX:ebfe", [](Assembler& a) { auto l = a.bound_label(); a.jmp_short(l); });
     emit("lea rax, [rip]", [](Assembler& a) { auto l = a.new_label(); a.lea(64, G::rax, rip(l)); a.bind(l); });
     emit("cmp dword ptr [rip], 0x1", [](Assembler& a) { auto l = a.new_label(); a.cmp(32, rip(l), 1); a.bind(l); });
-    emit("HEX:909090", [](Assembler& a) { a.nop(); a.align_rel32_after(1); });
+    emit("HEX:906690", [](Assembler& a) { a.nop(); a.align_rel32_after(1); });
     return 0;
 }

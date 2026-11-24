@@ -83,6 +83,7 @@ const char* neon_knob_suffix() {
         n += (b & neon_old_ushl8) ? "+oldushl8" : "+ushl8mul";
         n += (b & neon_no_elem_derived) ? "+noelemderived" : "+elemderived";
         n += (b & neon_no_widen_derived) ? "+nowidenderived" : "+widenderived";
+        n += "+ws2";
         return n;
     }();
     return suffix.c_str();

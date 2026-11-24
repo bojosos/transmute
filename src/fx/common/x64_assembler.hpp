@@ -161,10 +161,10 @@ public:
         finalized_refs_ = refs_.size();
     }
 
-    // Pads with NOPs so that the next `opcode_length` bytes end on a 4-byte
-    // boundary: a following rel32 field is then atomically patchable.
+    // Pads with multi-byte NOPs so that the next `opcode_length` bytes end on
+    // a 4-byte boundary: a following rel32 field is then atomically patchable.
     void align_rel32_after(unsigned opcode_length) {
-        while ((size_ + opcode_length) % 4 != 0) db(0x90);
+        nop(static_cast<unsigned>((4 - (size_ + opcode_length) % 4) % 4));
     }
     void align(unsigned alignment) {
         const auto pad = (alignment - size_ % alignment) % alignment;

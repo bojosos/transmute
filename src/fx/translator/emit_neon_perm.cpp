@@ -113,6 +113,7 @@ unsigned emit_copy(EmitContext& ctx, std::uint32_t w) {
             const Src n = dup_source(v, size, element_source(ctx, rn, size));
             const Xmm d = ctx.write_vec(rd);
             dup_element(v, size, d, n, index);
+            if (size == 2 || size == 3) ctx.note_vec_broadcast(rd, size == 2 ? 32u : 64u);
             return 1;
         }
         const Xmm n = ctx.read_vec(rn);
@@ -130,6 +131,7 @@ unsigned emit_copy(EmitContext& ctx, std::uint32_t w) {
                                                  vop::vpbroadcastq};
                 const Xmm d = ctx.write_vec(rd);
                 v.vex2(ops[size], d, g.mem);
+                if (size == 2 || size == 3) ctx.note_vec_broadcast(rd, size == 2 ? 32u : 64u);
                 return 1;
             }
         }
@@ -142,6 +144,7 @@ unsigned emit_copy(EmitContext& ctx, std::uint32_t w) {
             static constexpr VexOp ops[4] = {vop::vpbroadcastb, vop::vpbroadcastw, vop::vpbroadcastd,
                                              vop::vpbroadcastq};
             v.vex2(ops[size], d, t);
+            if (size == 2 || size == 3) ctx.note_vec_broadcast(rd, size == 2 ? 32u : 64u);
             return 1;
         }
         switch (size) {
@@ -157,6 +160,7 @@ unsigned emit_copy(EmitContext& ctx, std::uint32_t w) {
         case 2: v.pshufd(d, t, q ? 0x00 : 0x50); break;
         default: v.op(op::punpcklqdq, d, t, t, true); break;
         }
+        if (q && (size == 2 || size == 3)) ctx.note_vec_broadcast(rd, size == 2 ? 32u : 64u);
         return 1;
     }
     case 0x3: {   // INS (general)
@@ -545,6 +549,10 @@ unsigned emit_modified_immediate(EmitContext& ctx, std::uint32_t w) {
         const std::uint64_t value = invert ? ~imm64 : imm64;
         const Xmm d = ctx.write_vec(rd);
         v.load_const(d, Const128{value, q ? value : 0});
+        if (q) {
+            if ((cmode >> 1) <= 6 || !opb) ctx.note_vec_broadcast(rd, 32);
+            else ctx.note_vec_broadcast(rd, 64);
+        }
         return 1;
     }
     const Xmm dold = ctx.read_vec(rd);

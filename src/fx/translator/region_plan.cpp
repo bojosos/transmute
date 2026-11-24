@@ -1987,6 +1987,65 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
                                    plan.insts[static_cast<std::size_t>(idx - 1)].continuation == idx;
             return next_call_or_interp || prev_call;
         };
+        // Pre-scan Tier-2 FP by-element (.4S/.2D FMUL/FMULX/FMLA/FMLS) reads
+        // whose broadcast will be hoisted by vec_derived (outer-depth def or
+        // >= 3 uses of the same (rm, lane)). Those consumers read the derived
+        // context slot directly rather than Vm, so exclude Vm from their
+        // vbenefit to keep hoisted vectors from stealing pinned XMMs.
+        std::uint8_t fp_elem_hoisted[32][6]{};
+        const auto decode_fp_elem_q = [](std::uint32_t w, unsigned& rm, unsigned& slot, unsigned& rn, unsigned& rd,
+                                         bool& acc) -> bool {
+            if ((w & 0xdf000400u) != 0x4f000000u) return false;
+            const bool u = ((w >> 29) & 1u) != 0;
+            const unsigned size = (w >> 22) & 3u;
+            const unsigned opc = (w >> 12) & 15u;
+            if (!((!u && (opc == 1 || opc == 5 || opc == 9)) || (u && opc == 9))) return false;
+            const unsigned l = (w >> 21) & 1u, h = (w >> 11) & 1u;
+            if (size == 2) {
+                slot = (h << 1) | l;
+            } else if (size == 3 && l == 0) {
+                slot = 4u + h;
+            } else {
+                return false;
+            }
+            rm = (w >> 16) & 31u;
+            rn = (w >> 5) & 31u;
+            rd = w & 31u;
+            acc = !u && (opc == 1 || opc == 5);
+            return true;
+        };
+        if (plan.t2_derived) {
+            std::int32_t max_vwrite_depth[32];
+            std::fill(std::begin(max_vwrite_depth), std::end(max_vwrite_depth), -1);
+            std::uint16_t elem_count[32][6]{};
+            std::uint8_t elem_max_depth[32][6]{};
+            std::int32_t scan_level = 0;
+            for (std::int32_t i = 0; i < n; ++i) {
+                scan_level += depth[i];
+                const auto& pi = plan.insts[static_cast<std::size_t>(i)];
+                if (pi.flow == Flow::interpret || pi.conservative_writes) continue;
+                for (auto vm = pi.vwrites; vm; vm &= vm - 1) {
+                    const auto r = static_cast<unsigned>(std::countr_zero(vm));
+                    if (scan_level > max_vwrite_depth[r]) max_vwrite_depth[r] = scan_level;
+                }
+                unsigned rm, slot, rn, rd;
+                bool acc;
+                if (decode_fp_elem_q(pi.inst.word, rm, slot, rn, rd, acc)) {
+                    if (elem_count[rm][slot] < 255) ++elem_count[rm][slot];
+                    if (static_cast<unsigned>(scan_level) > elem_max_depth[rm][slot])
+                        elem_max_depth[rm][slot] = static_cast<std::uint8_t>(std::min(scan_level, 255));
+                }
+            }
+            for (unsigned r = 0; r < 32; ++r) {
+                for (unsigned s = 0; s < 6; ++s) {
+                    if (elem_count[r][s] >= 3 ||
+                        (elem_count[r][s] > 0 && max_vwrite_depth[r] >= 0 &&
+                         max_vwrite_depth[r] < static_cast<std::int32_t>(elem_max_depth[r][s]))) {
+                        fp_elem_hoisted[r][s] = 1;
+                    }
+                }
+            }
+        }
         for (std::int32_t i = 0; i < n; ++i) {
             level += depth[i];
             const auto& pi = plan.insts[i];
@@ -2030,23 +2089,32 @@ void build_plan(std::uint64_t guest_pc, const CodeSource& code, const TranslateO
             }
             if (pi.leader) seen = wseen = vseen = vwseen = 0;
             if (pi.flow == Flow::interpret || pi.conservative_writes) continue;
-            vexposed |= pi.vreads & ~vwseen;
-            vused |= pi.vreads | pi.vwrites;
+            std::uint32_t eff_vreads = pi.vreads;
+            if (plan.t2_derived && eff_vreads) {
+                unsigned rm, slot, rn, rd;
+                bool acc;
+                if (decode_fp_elem_q(pi.inst.word, rm, slot, rn, rd, acc) && fp_elem_hoisted[rm][slot] &&
+                    rm != rn && (!acc || rm != rd)) {
+                    eff_vreads &= ~(1u << rm);
+                }
+            }
+            vexposed |= eff_vreads & ~vwseen;
+            vused |= eff_vreads | pi.vwrites;
             if (!overrides.old_pins) {
                 const auto first = (pi.reads & ~seen) | (pi.writes & ~wseen);
-                const auto vfirst = (pi.vreads & ~vseen) | (pi.vwrites & ~vwseen);
+                const auto vfirst = (eff_vreads & ~vseen) | (pi.vwrites & ~vwseen);
                 const auto rest_w = std::max<std::int32_t>(1, w / 4);
                 add(first, w);
                 add((pi.reads | pi.writes) & ~first, rest_w);
                 vadd(vfirst, w);
-                vadd((pi.vreads | pi.vwrites) & ~vfirst, rest_w);
+                vadd((eff_vreads | pi.vwrites) & ~vfirst, rest_w);
                 seen |= pi.reads | pi.writes;
                 wseen |= pi.writes;
-                vseen |= pi.vreads | pi.vwrites;
+                vseen |= eff_vreads | pi.vwrites;
                 vwseen |= pi.vwrites;
             } else {
                 add(pi.reads | pi.writes, w);
-                vadd(pi.vreads | pi.vwrites, w);
+                vadd(eff_vreads | pi.vwrites, w);
             }
         }
         std::int32_t use_benefit[32];   // uses only (convention registers pay nothing at entries and exits)

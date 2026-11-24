@@ -125,6 +125,10 @@ public:
         return width == 32 ? vzero32_ : width == 64 ? vzero64_ : width >= 128 ? ~0u : 0u;
     }
     void note_vec_zero_above(unsigned index, unsigned width) override;
+    [[nodiscard]] std::uint32_t vec_broadcast(unsigned es) const override {
+        return es == 32 ? vdup32_ : es == 64 ? vdup64_ : 0u;
+    }
+    void note_vec_broadcast(unsigned index, unsigned es) override;
     // ---- guest address operands (neon; additive): EmitContext::address ----
     x64::Mem address(const GuestAddress& g) override;
     // ---- current context slots (neon/fp; additive): EmitContext::vec_slot ----
@@ -153,9 +157,10 @@ public:
 
 private:
     // fp/neon (additive): forget which V registers are known zero above bit
-    // 32/64. Called at labels, helper calls and exits.
+    // 32/64 or known broadcast. Called at labels, helper calls and exits.
     void forget_vec_zero() {
         vzero32_ = vzero64_ = 0;
+        vdup32_ = vdup64_ = 0;
         vzwritten_ = ~0u;   // p3: as if every V register were written (vzero_record)
     }
     using Gp = x64::Gp;
@@ -725,9 +730,12 @@ private:
     // region state
     FlagsState flags_{FlagsState::ctx};
     // fp/neon (additive): guest V registers whose bits above 32 / 64 are known
-    // zero on the current straight-line path (see EmitContext::vec_zero_above).
+    // zero on the current straight-line path (see EmitContext::vec_zero_above),
+    // and registers known to hold identical 32-/64-bit lanes (vec_broadcast).
     std::uint32_t vzero32_{};
     std::uint32_t vzero64_{};
+    std::uint32_t vdup32_{};
+    std::uint32_t vdup64_{};
     // p3 (Plan::vzero_join): the facts survive labels. After every emitted
     // instruction the facts are recorded with the V registers its block wrote
     // so far (vzero_record). A block starts with the AND of its predecessors'

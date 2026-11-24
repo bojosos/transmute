@@ -1054,14 +1054,18 @@ void RegionEmitter::materialize_state(FlagsState state, bool save_rax, bool raw)
         return;
     }
     if (save_rax) a_.mov(64, ptr(Gp::r15, spill_disp(kRaxSaveSlot)), Gp::rax);
-    if (state == FlagsState::host_sub) a_.cmc();
-    a_.lahf();
-    a_.setcc(Cond::o, Gp::rax);
     if (raw && codegen_on(knob_no_raw_flags)) {
+        if (state == FlagsState::host_sub) a_.cmc();
+        a_.lahf();
+        a_.setcc(Cond::o, Gp::rax);
         a_.mov(16, ptr(Gp::r15, kNzcvDisp), Gp::rax);
         if (save_rax) a_.mov(64, Gp::rax, ptr(Gp::r15, spill_disp(kRaxSaveSlot)));
         return;
     }
+    a_.mov_imm(Gp::rax, 0u);
+    a_.lahf();
+    if (state != FlagsState::host_logic) a_.setcc(Cond::o, Gp::rax);
+    if (state == FlagsState::host_sub) a_.xor_(32, Gp::rax, 0x100);
     a_.and_(32, Gp::rax, 0xc101);
     a_.imul(32, Gp::rax, Gp::rax, 0x10210000);
     a_.and_(32, Gp::rax, static_cast<std::int32_t>(0xf0000000u));
@@ -2554,8 +2558,10 @@ void RegionEmitter::run() {
     // loops is final), or, with t2entries, its entries.
     bool has_loops = false;
     for (std::int32_t i = 0; i < n && !has_loops; ++i) has_loops = plan_.insts[static_cast<std::size_t>(i)].loop_header;
+    const bool selective_entry_counter =
+        options_.lazy && !plan_.truncated && plan_.count_hot && plan_.count_loop_headers && !has_loops && n >= 48;
     const bool entry_counter =
-        options_.lazy && (plan_.truncated || (plan_.count_hot && !plan_.count_loop_headers));
+        options_.lazy && (plan_.truncated || (plan_.count_hot && !plan_.count_loop_headers) || selective_entry_counter);
     loop_counting_ = options_.lazy && !entry_counter && plan_.count_loop_headers && has_loops && options_.interrupt_checks;
     loop_counter_fields_.clear();
     const bool tier0 = entry_counter || loop_counting_;
@@ -2622,9 +2628,16 @@ void RegionEmitter::run() {
     emit_inline_cache_slots();   // BLR inline caches' targets (data)
     std::uint32_t counter_slot = 0;
     if (entry_counter) {
-        a_.align(4);
+        // A cache line of its own: 64 bytes on either side hold no code (the
+        // region's start is only 16-byte aligned), so the counter's stores
+        // never invalidate fetched code (SMC machine clears).
+        for (unsigned k = 0; k < 16; ++k) a_.dd(0);
         counter_slot = static_cast<std::uint32_t>(a_.size());
-        a_.dd(std::max(1u, options_.tier_threshold));
+        const auto init = selective_entry_counter
+            ? static_cast<std::uint32_t>(std::clamp<std::uint64_t>(16ull * std::max(1u, options_.tier_threshold), 1, 0x7fffffffu))
+            : std::max(1u, options_.tier_threshold);
+        a_.dd(init);
+        for (unsigned k = 0; k < 15; ++k) a_.dd(0);
     } else if (loop_counting_) {
         // A cache line of its own: 64 bytes on either side hold no code (the
         // region's start is only 16-byte aligned), so the counter's stores
@@ -2790,6 +2803,8 @@ EmitContext::GprSrc RegionEmitter::gsrc(unsigned index, bool sp) {
 x64::Xmm RegionEmitter::write_vec(unsigned index) {
     vzero32_ &= ~(1u << index);   // fp/neon: re-noted by the writer if known
     vzero64_ &= ~(1u << index);
+    vdup32_ &= ~(1u << index);
+    vdup64_ &= ~(1u << index);
     vzwritten_ |= 1u << index;    // p3: written in this block (vzero_record)
     if (vpinned(index)) {
         vwritten_ |= 1u << index;
@@ -2824,6 +2839,19 @@ void RegionEmitter::note_vec_zero_above(unsigned index, unsigned width) {
     if (!written) return;
     if (width <= 32) vzero32_ |= 1u << index;
     if (width <= 64) vzero64_ |= 1u << index;
+}
+
+void RegionEmitter::note_vec_broadcast(unsigned index, unsigned es) {
+    if (index >= 32) return;
+    bool written = ((vwritten_ >> index) & 1u) != 0;
+    for (unsigned i = 0; i < pending_vec_count_ && !written; ++i) written = pending_vec_[i].guest == index;
+    if (!written) return;
+    if (es == 32) {
+        vdup32_ |= 1u << index;
+        vdup64_ |= 1u << index;
+    } else if (es == 64) {
+        vdup64_ |= 1u << index;
+    }
 }
 
 // ---- p3: zero-above facts across labels (Plan::vzero_join) -------------------------------------
@@ -4293,6 +4321,8 @@ bool RegionEmitter::emit_vec_copy(const PlanInst& pi) {
     }
     vzero32_ = (vzero32_ & ~bit_d) | ((vzero32_ & bit_n) ? bit_d : 0u);   // fp/neon: a copy
     vzero64_ = (vzero64_ & ~bit_d) | ((vzero64_ & bit_n) ? bit_d : 0u);
+    vdup32_ = (vdup32_ & ~bit_d) | ((vdup32_ & bit_n) ? bit_d : 0u);
+    vdup64_ = (vdup64_ & ~bit_d) | ((vdup64_ & bit_n) ? bit_d : 0u);
     vzwritten_ |= bit_d;   // p3
     reset_scratch();
     return true;

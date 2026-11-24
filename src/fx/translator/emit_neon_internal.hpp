@@ -402,6 +402,8 @@ unsigned widen_derived_kind(std::uint32_t w, unsigned which);
 unsigned emit_mull_pair(EmitContext& ctx, std::span<const std::uint32_t> words);
 // DUP Vd.4S/.2D, Vn.S/D[i] + FSQRT Vd2.4S/.2D, Vd.4S/.2D -> scalar sqrt + broadcast: 2, else 0.
 unsigned emit_dup_fsqrt(EmitContext& ctx, std::span<const std::uint32_t> words);
+// MOVI/MVNI Vd.4S/.2D, #imm + FADD/FSUB/FMUL/FDIV Vd2.4S/.2D, Vn, Vm -> pooled memory operand: 2, else 0.
+unsigned emit_movi_fparith(EmitContext& ctx, std::span<const std::uint32_t> words);
 
 // ---- shared building blocks (emit_neon_arith.cpp) ----
 enum class Narrow { truncate, sat_signed, sat_unsigned, sat_signed_to_unsigned };

@@ -23,13 +23,13 @@ using x64::ptr;
 // (ctx->lookup_mask is not read). Clobbers rax, rdx, r9 and EFLAGS.
 void RegionEmitter::emit_indirect_jump() {
     const auto stub = a_.new_label();
+    a_.mov(64, Gp::r9, ctx_mem(offsetof(GuestContext, fast_lookup)));
     a_.test(8, Gp::rcx, 3);
     a_.jcc_short(Cond::ne, stub);
     a_.mov(32, Gp::rax, Gp::rcx);
     a_.shr(32, Gp::rax, static_cast<std::uint8_t>(kFastLookupBits));
     a_.xor_(32, Gp::rax, Gp::rcx);
     a_.and_(32, Gp::rax, static_cast<std::int32_t>(kFastLookupMask4));
-    a_.mov(64, Gp::r9, ctx_mem(offsetof(GuestContext, fast_lookup)));
     a_.cmp(64, Gp::rcx, ptr(Gp::r9, Gp::rax, 4));
     a_.jcc_short(Cond::ne, stub);
     a_.jmp(ptr(Gp::r9, Gp::rax, 4, 8));

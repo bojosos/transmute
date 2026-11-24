@@ -538,7 +538,8 @@ FX_TEST(core_tier2_interrupt_checks) {
     };
     auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
     std::memcpy(program, prog.data(), prog.size() * 4);
-    const BufferCode code(r.code_base(), r.program_base() + prog.size() * 4);
+    BufferCode code(r.code_base(), r.program_base() + prog.size() * 4);
+    code.image = true;
     const auto count_checks = [](const TranslatedRegion& t) {   // cmp dword [r15 + disp32(interrupt_pending)], 0
         const auto disp = static_cast<std::int32_t>(offsetof(GuestContext, interrupt_pending)) - static_cast<std::int32_t>(kContextBias);
         unsigned n = 0;
@@ -587,7 +588,8 @@ FX_TEST(core_tier2_interrupt_checks_header_chain) {
     };
     auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
     std::memcpy(program, prog.data(), prog.size() * 4);
-    const BufferCode code(r.code_base(), r.program_base() + prog.size() * 4);
+    BufferCode code(r.code_base(), r.program_base() + prog.size() * 4);
+    code.image = true;
     const auto disp = static_cast<std::int32_t>(offsetof(GuestContext, interrupt_pending)) - static_cast<std::int32_t>(kContextBias);
     const auto count_checks = [&](const TranslatedRegion& t) {
         unsigned n = 0;
@@ -648,6 +650,41 @@ FX_TEST(core_tier2_in_loop_diamond_merge) {
         r.machine.options.optimize = static_cast<std::int8_t>(optimize);
         for (unsigned k = 0; k < 6; ++k)
             FX_CHECK(r.run(prog, r.context(0xf400 + k), "tier2 diamond " + std::to_string(optimize) + "/" + std::to_string(k)));
+    }
+    r.machine.options.optimize = -1;
+}
+
+// Wave S: large loop-free lazy regions (>= 48 instructions) get a 64-byte
+// cache-line-isolated selective entry counter (threshold 16 * tier_threshold)
+// so hot loop-free shaders/builtins can tier up to Tier 2 without SMC stalls.
+FX_TEST(core_tier2_selective_entry_counter) {
+    register_families();
+    DiffRunner r;
+    using namespace a64;
+    std::vector<std::uint32_t> prog;
+    for (unsigned i = 0; i < 56; ++i)
+        prog.push_back(add_imm(true, false, false, i & 7u, i & 7u, 1));
+    prog.push_back(nop());
+    auto* program = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(r.program_base()));
+    std::memcpy(program, prog.data(), prog.size() * 4);
+    const BufferCode code(r.code_base(), r.program_base() + prog.size() * 4);
+
+    TranslateOptions lazy_opt;
+    lazy_opt.lazy = true;
+    lazy_opt.optimize = 1;
+    lazy_opt.tier_threshold = 4;
+    const auto reg = translate_region(r.program_base(), code, lazy_opt);
+    FX_CHECK_EQ(reg.tier, 0u);
+    FX_CHECK(reg.tier_counter != 0u);
+    FX_CHECK(reg.tier_counter_slot >= 64u);
+    FX_CHECK(reg.tier_counter_slot + 64u <= reg.code.size());
+    std::uint32_t init_count = 0;
+    std::memcpy(&init_count, reg.code.data() + reg.tier_counter_slot, 4);
+    FX_CHECK_EQ(init_count, 64u);   // 16 * tier_threshold
+    // Differential execution check at both lazy (tier 0) and optimized (tier 2).
+    for (const int optimize : {0, 1}) {
+        r.machine.options.optimize = static_cast<std::int8_t>(optimize);
+        FX_CHECK(r.run(prog, r.context(0xf500 + optimize), "selective entry counter"));
     }
     r.machine.options.optimize = -1;
 }

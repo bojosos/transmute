@@ -27,6 +27,9 @@
 // TRANSMUTE_FX_CORE=nofacts makes every span use the inline comparison.
 #include "fx/translator/emit_neon_internal.hpp"
 
+#include <cstdlib>
+#include <string>
+
 namespace transmute::fx::neon {
 
 namespace {
@@ -626,6 +629,134 @@ unsigned emit_dup_fsqrt(EmitContext& ctx, std::span<const std::uint32_t> words) 
         // vmovddup d, d (VEX.F2.0F 12)
         a.vex_rr(VexOp{3, 1, 0x12, false}, false, x64::id(d), 0, x64::id(d));
     }
+    ctx.note_vec_broadcast(rd1, is_s ? 32u : 64u);
+    return 2;
+}
+
+// Constant-load + vector FP arithmetic fusion (Embree/Cycles):
+//   MOVI/MVNI Vd.4S/.2D, #imm   (q=1, not ORR/BIC)
+//   FADD/FSUB/FMUL/FDIV Vd2.4S/.2D, Vn, Vm
+// when AVX is available, Vd is an operand (for FSUB/FDIV only Vm; for FADD/FMUL
+// either operand when the constant contains no NaN), and Vd2 == Vd or Vd is dead
+// after the pair. Folding the constant directly into the VEX memory operand
+// eliminates the vmovdqa load and frees a scratch XMM register.
+unsigned emit_movi_fparith(EmitContext& ctx, std::span<const std::uint32_t> words) {
+    if (words.size() < 2) return 0;
+    const auto w0 = words[0], w1 = words[1];
+    if (!bit(w0, 30)) return 0;   // q == 1 (128-bit) only
+    Value val{};
+    if (!modified_immediate_value(w0, val)) return 0;
+    const unsigned rd0 = w0 & 31u;
+
+    // Also fold MOVI/MVNI + 128-bit bitwise AND/BIC/ORR/ORN/EOR (.16B) directly
+    // into a single AVX memory-operand bitwise op (vpand/vpandn/vpor/vpxor).
+    const std::uint32_t bitop = w1 & 0xffe0fc00u;
+    if (bitop == 0x4e201c00u || bitop == 0x4e601c00u || bitop == 0x4ea01c00u || bitop == 0x4ee01c00u ||
+        bitop == 0x6e201c00u) {
+        const unsigned rd1 = w1 & 31u, rn1 = (w1 >> 5) & 31u, rm1 = (w1 >> 16) & 31u;
+        if (rn1 == rm1) return 0;
+        if (rd1 != rd0 && !ctx.vec_dead_after(2, rd0)) return 0;
+        std::uint8_t opc = 0;
+        unsigned src_g = 0;
+        Const128 cval{val.lo, val.hi};
+        if (bitop == 0x4e201c00u) {   // AND
+            if (rm1 == rd0) src_g = rn1;
+            else if (rn1 == rd0) src_g = rm1;
+            else return 0;
+            opc = 0xdb;   // vpand
+        } else if (bitop == 0x4e601c00u) {   // BIC: Vn & ~Vm
+            if (rm1 == rd0) {
+                src_g = rn1;
+                cval = {~val.lo, ~val.hi};
+                opc = 0xdb;   // vpand(Vn, ~const)
+            } else if (rn1 == rd0) {
+                src_g = rm1;
+                opc = 0xdf;   // vpandn(Vm, const) = ~Vm & const
+            } else {
+                return 0;
+            }
+        } else if (bitop == 0x4ea01c00u) {   // ORR
+            if (rm1 == rd0) src_g = rn1;
+            else if (rn1 == rd0) src_g = rm1;
+            else return 0;
+            opc = 0xeb;   // vpor
+        } else if (bitop == 0x4ee01c00u) {   // ORN: Vn | ~Vm
+            if (rm1 == rd0) {
+                src_g = rn1;
+                cval = {~val.lo, ~val.hi};
+                opc = 0xeb;   // vpor(Vn, ~const)
+            } else {
+                return 0;
+            }
+        } else {   // EOR
+            if (rm1 == rd0) src_g = rn1;
+            else if (rn1 == rd0) src_g = rm1;
+            else return 0;
+            opc = 0xef;   // vpxor
+        }
+        V v(ctx);
+        if (!v.avx) return 0;
+        const Xmm src = ctx.read_vec(src_g);
+        const Xmm d = ctx.write_vec(rd1);
+        v.a.vex_rm(VexOp{1, 1, opc, false}, false, x64::id(d), x64::id(src), constant(ctx, cval));
+        return 2;
+    }
+
+    // Decode 128-bit vector FADD/FSUB/FMUL/FDIV (.4S or .2D).
+    const std::uint32_t base1 = w1 & 0xffa0fc00u;
+    const bool dbl = ((w1 >> 22) & 1u) != 0;
+    std::uint8_t opcode = 0;
+    bool commutative = false;
+    bool may_tiny = false;
+    switch (base1) {
+    case 0x4e20d400u: opcode = 0x58; commutative = true; break;                       // FADD
+    case 0x4ea0d400u: opcode = 0x5c; break;                                           // FSUB
+    case 0x6e20dc00u: opcode = 0x59; commutative = true; may_tiny = true; break;      // FMUL
+    case 0x6e20fc00u: opcode = 0x5e; may_tiny = true; break;                          // FDIV
+    default: return 0;
+    }
+    if (may_tiny) {
+        static const bool tiny_before = [] {
+            if (const char* v = std::getenv("TRANSMUTE_FX_FP")) {
+                const std::string s = std::string(",") + v + ",";
+                return s.find(",tinybefore,") != std::string::npos;
+            }
+            return false;
+        }();
+        if (tiny_before) return 0;
+    }
+    const unsigned rd1 = w1 & 31u, rn1 = (w1 >> 5) & 31u, rm1 = (w1 >> 16) & 31u;
+    if (rn1 == rm1) return 0;   // both operands are the constant (rare)
+    unsigned src_g = 0;
+    if (rm1 == rd0) {
+        src_g = rn1;
+    } else if (commutative && rn1 == rd0) {
+        // Swapping operands of FADD/FMUL is bit-exact when the constant has no NaN lanes.
+        bool has_nan = false;
+        if (!dbl) {
+            for (const std::uint64_t half : {val.lo, val.hi}) {
+                const auto lo32 = static_cast<std::uint32_t>(half);
+                const auto hi32 = static_cast<std::uint32_t>(half >> 32);
+                if ((lo32 & 0x7fffffffu) > 0x7f800000u || (hi32 & 0x7fffffffu) > 0x7f800000u) has_nan = true;
+            }
+        } else {
+            if ((val.lo & 0x7fffffffffffffffULL) > 0x7ff0000000000000ULL ||
+                (val.hi & 0x7fffffffffffffffULL) > 0x7ff0000000000000ULL)
+                has_nan = true;
+        }
+        if (has_nan) return 0;
+        src_g = rm1;
+    } else {
+        return 0;
+    }
+    if (rd1 != rd0 && !ctx.vec_dead_after(2, rd0)) return 0;
+
+    V v(ctx);
+    if (!v.avx) return 0;
+    const Xmm src = ctx.read_vec(src_g);
+    const Xmm d = ctx.write_vec(rd1);
+    const Mem cm = constant(ctx, Const128{val.lo, val.hi});
+    v.a.vex_rm(VexOp{static_cast<std::uint8_t>(dbl ? 1 : 0), 1, opcode, false}, false, x64::id(d), x64::id(src), cm);
     return 2;
 }
 

@@ -364,6 +364,7 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
         if (!zero) e.zero_upper(d, w);
 
         const Mem quiet = e.ksplat(es, dbl ? 0x0008000000000000ull : 0x00400000ull);
+        const Mem one = nm ? e.ksplat(es, dbl ? 0x3ff0000000000000ull : 0x3f800000ull) : Mem{};
         const bool alias = d == a || d == b;
         std::uint32_t used = (1u << x64::id(a)) | (1u << x64::id(b)) | (1u << x64::id(d)) | (1u << x64::id(t0));
         const auto pick_free = [&]() {
@@ -377,9 +378,10 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
         };
         const Xmm t1 = pick_free(), t2 = pick_free();
         const Xmm T = alias ? pick_free() : d;
+        const Xmm t3 = !s.scalar ? pick_free() : Xmm{};
         auto* const as = &e.as;
         const std::uint8_t shift = dbl ? 12 : 9;
-        const SseOp max_op = s.pick(fops::max);
+        const SseOp mul_op = s.pick(fops::mul);
 
         e.ctx.defer_cold([=]() {
             const auto vspill = [](unsigned slot) {
@@ -405,6 +407,7 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
             as->movups(vspill(28), t1);
             as->movups(vspill(29), t2);
             if (alias) as->movups(vspill(30), T);
+            if (!s.scalar) as->movups(vspill(31), t3);
 
             vop_rri(cmp, t0, a, a, pred_unord);
             vop_rri(cmp, t1, b, b, pred_unord);
@@ -420,13 +423,23 @@ bool emit_minmax_const(FpEmit& e, const Inst& in, Shape s, unsigned w) {
             vop_rm(and_, t1, t1, quiet);
             vop_rr(or_, t1, t1, b);
             as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, t1, t1, T, t2);
-            if (nm) vop_rr(max_op, t1, t1, t1);
-            vop_rr(mm, T, a, b);
-            vop_rr(mm, t2, b, a);
-            vop_rr(is_max ? and_ : or_, T, T, t2);
-            as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, T, T, t1, t0);
-            if (alias) as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(T));
+            // Multiply by 1.0 instead of vmax(t1, t1) to flush denormals under
+            // DAZ/FTZ without raising MXCSR.IE on a quiet NaN.
+            if (nm) vop_rm(mul_op, t1, t1, one);
+            if (s.scalar) {
+                as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(t1));
+            } else {
+                // Mask NaN lanes to +0.0 so vmax/vmin never sees a quiet NaN.
+                vop_rr(andn, T, t0, a);
+                vop_rr(andn, t2, t0, b);
+                vop_rr(mm, t3, t2, T);
+                vop_rr(mm, T, T, t2);
+                vop_rr(is_max ? and_ : or_, T, T, t3);
+                as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, T, T, t1, t0);
+                if (alias) as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(T));
+            }
 
+            if (!s.scalar) as->movups(t3, vspill(31));
             if (alias) as->movups(T, vspill(30));
             as->movups(t2, vspill(29));
             as->movups(t1, vspill(28));
@@ -580,12 +593,53 @@ void minmax_exact_core(FpEmit& e, K kind, Shape s, unsigned width, Xmm T, Xmm a,
     const bool dbl = s.dbl();
     const SseOp mm = s.pick(is_max ? fops::max : fops::min), cmp = s.pick(fops::cmp);
     const SseOp and_ = s.pick(fops::and_), or_ = s.pick(fops::or_), andn = s.pick(fops::andn);
-    const auto numeric = [&](Xmm out, Xmm scratch) {
-        e.op(mm, out, a, b);
-        e.op(mm, scratch, b, a);
+    const auto numeric = [&](Xmm out, Xmm scratch, Xmm x, Xmm y) {
+        e.op(mm, out, x, y);
+        e.op(mm, scratch, y, x);
         e.op(is_max ? and_ : or_, out, out, scratch);
     };
-    numeric(T, t1);
+    const auto emit_nan_fixup = [&]() {
+        const std::uint8_t shift = dbl ? 12 : 9;   // the quiet bit to the sign position
+        const Mem quiet = e.ksplat(s.es, dbl ? 0x0008000000000000ull : 0x00400000ull);
+        const auto shl = [&](Xmm dst, Xmm src) {
+            if (dbl) e.psllq(dst, src, shift);
+            else e.pslld(dst, src, shift);
+        };
+        e.op_i(cmp, t0, a, a, pred_unord);   // na
+        e.op_i(cmp, t1, b, b, pred_unord);   // nb
+        shl(t2, b);
+        e.op(andn, t2, t2, t1);              // sb (sign bit)
+        e.op(andn, t2, t2, nm ? t1 : t0);    // ~sb & nb (NM) / ~sb & na
+        shl(T, a);                           // T is a temp of the fixup until the end
+        e.op(andn, T, T, t0);                // sa
+        e.op(or_, t2, t2, T);                // a wins
+        e.op(and_, T, t0, Opnd::at(quiet));
+        e.op(or_, T, T, a);                  // a, quieted if NaN
+        e.op(or_, t0, t0, t1);               // NaN lanes
+        e.op(and_, t1, t1, Opnd::at(quiet));
+        e.op(or_, t1, t1, b);                // b, quieted if NaN
+        e.blend(dbl, t1, t1, T, t2, t2);     // the NaN lanes' result
+        // NM can return the number of a lone quiet NaN pair: with FZ (MXCSR.DAZ)
+        // A64 flushes it. Multiply by 1.0 instead of max(x, x) so quiet NaNs
+        // do not raise a spurious MXCSR.IE.
+        if (nm) e.op(s.pick(fops::mul), t1, t1, Opnd::at(e.ksplat(s.es, dbl ? 0x3ff0000000000000ull : 0x3f800000ull)));
+        if (s.scalar) {
+            e.mov(T, t1);
+        } else {
+            // Mask NaN lanes to +0.0 before vmax/vmin so quiet NaNs never raise MXCSR.IE.
+            const Mem spill = x64::ptr(Gp::r15, ctx_disp(offsetof(GuestContext, vspill) + 16u * 31u));
+            e.as.movups(spill, t1);
+            e.op(andn, T, t0, a);
+            e.op(andn, t2, t0, b);
+            e.op(mm, t1, t2, T);
+            e.op(mm, T, T, t2);
+            e.op(is_max ? and_ : or_, T, T, t1);
+            e.as.movups(t1, spill);
+            e.blend(dbl, T, T, t1, t0, t0);
+        }
+    };
+
+    // Test NaNs BEFORE running vmax/vmin so quiet NaNs never raise MXCSR.IE.
     e.op_i(cmp, t0, a, b, pred_unord);
     if (s.scalar) {
         if (dbl) e.movq(guard.reg, t0);
@@ -595,39 +649,26 @@ void minmax_exact_core(FpEmit& e, K kind, Shape s, unsigned width, Xmm T, Xmm a,
     } else {
         e.as.movmskps(guard.reg, t0);
     }
-    const auto done = e.as.new_label();
+    const auto fast = e.as.new_label(), done = e.as.new_label();
     if (guard.jrcxz) {
-        e.as.jrcxz_short(done);
+        const auto fixup = e.as.new_label();
+        e.as.jrcxz_short(fast);
+        e.as.jmp(fixup);
+        e.as.bind(fast);
+        numeric(T, t1, a, b);
+        e.as.jmp(done);
+        e.as.bind(fixup);
+        emit_nan_fixup();
+        e.as.bind(done);
     } else {
         e.as.test(64, guard.reg, guard.reg);   // MOVQ: lane 1 is in bits 63:32
-        e.as.jcc_short(x64::Cond::e, done);
+        e.as.jcc(x64::Cond::e, fast);
+        emit_nan_fixup();
+        e.as.jmp_short(done);
+        e.as.bind(fast);
+        numeric(T, t1, a, b);
+        e.as.bind(done);
     }
-    const std::uint8_t shift = dbl ? 12 : 9;   // the quiet bit to the sign position
-    const Mem quiet = e.ksplat(s.es, dbl ? 0x0008000000000000ull : 0x00400000ull);
-    const auto shl = [&](Xmm dst, Xmm src) {
-        if (dbl) e.psllq(dst, src, shift);
-        else e.pslld(dst, src, shift);
-    };
-    e.op_i(cmp, t0, a, a, pred_unord);   // na
-    e.op_i(cmp, t1, b, b, pred_unord);   // nb
-    shl(t2, b);
-    e.op(andn, t2, t2, t1);              // sb (sign bit)
-    e.op(andn, t2, t2, nm ? t1 : t0);    // ~sb & nb (NM) / ~sb & na
-    shl(T, a);                           // T is a temp of the fixup until the end
-    e.op(andn, T, T, t0);                // sa
-    e.op(or_, t2, t2, T);                // a wins
-    e.op(and_, T, t0, Opnd::at(quiet));
-    e.op(or_, T, T, a);                  // a, quieted if NaN
-    e.op(or_, t0, t0, t1);               // NaN lanes
-    e.op(and_, t1, t1, Opnd::at(quiet));
-    e.op(or_, t1, t1, b);                // b, quieted if NaN
-    e.blend(dbl, t1, t1, T, t2, t2);     // the NaN lanes' result
-    // NM can return the number of a lone quiet NaN pair: with FZ (MXCSR.DAZ)
-    // A64 flushes it, which max(x, x) does too (a NaN comes back unchanged).
-    if (nm) e.op(s.pick(fops::max), t1, t1, t1);
-    numeric(T, t2);
-    e.blend(dbl, T, T, t1, t0, t0);
-    e.as.bind(done);
 }
 
 // Out-of-line NaN fixup for AVX bit-exact min/max (when ctx.can_defer_cold()):
@@ -686,6 +727,7 @@ void minmax_exact_deferred(FpEmit& e, K kind, Shape s, unsigned width, Xmm d, Xm
     e.as.bind(done);
 
     const Mem quiet = e.ksplat(s.es, dbl ? 0x0008000000000000ull : 0x00400000ull);
+    const Mem one = nm ? e.ksplat(s.es, dbl ? 0x3ff0000000000000ull : 0x3f800000ull) : Mem{};
     const bool alias = d == a || d == b;
     std::uint32_t used = (1u << x64::id(a)) | (1u << x64::id(b)) | (1u << x64::id(d)) | (1u << x64::id(t0));
     const auto pick_free = [&]() {
@@ -699,9 +741,10 @@ void minmax_exact_deferred(FpEmit& e, K kind, Shape s, unsigned width, Xmm d, Xm
     };
     const Xmm t1 = pick_free(), t2 = pick_free();
     const Xmm T = alias ? pick_free() : d;
+    const Xmm t3 = !s.scalar ? pick_free() : Xmm{};
     auto* const as = &e.as;
     const std::uint8_t shift = dbl ? 12 : 9;
-    const SseOp max_op = s.pick(fops::max);
+    const SseOp mul_op = s.pick(fops::mul);
 
     e.ctx.defer_cold([=]() {
         const auto vspill = [](unsigned slot) {
@@ -726,6 +769,7 @@ void minmax_exact_deferred(FpEmit& e, K kind, Shape s, unsigned width, Xmm d, Xm
         as->movups(vspill(28), t1);
         as->movups(vspill(29), t2);
         if (alias) as->movups(vspill(30), T);
+        if (!s.scalar) as->movups(vspill(31), t3);
 
         vop_rri(cmp, t0, a, a, pred_unord);   // na
         vop_rri(cmp, t1, b, b, pred_unord);   // nb
@@ -741,13 +785,23 @@ void minmax_exact_deferred(FpEmit& e, K kind, Shape s, unsigned width, Xmm d, Xm
         vop_rm(and_, t1, t1, quiet);
         vop_rr(or_, t1, t1, b);               // b, quieted if NaN
         as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, t1, t1, T, t2);
-        if (nm) vop_rr(max_op, t1, t1, t1);
-        vop_rr(mm, T, a, b);
-        vop_rr(mm, t2, b, a);
-        vop_rr(is_max ? and_ : or_, T, T, t2);
-        as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, T, T, t1, t0);
-        if (alias) as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(T));
+        // Multiply by 1.0 instead of vmax(t1, t1) to flush denormals under
+        // DAZ/FTZ without raising MXCSR.IE on a quiet NaN.
+        if (nm) vop_rm(mul_op, t1, t1, one);
+        if (s.scalar) {
+            as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(t1));
+        } else {
+            // Mask NaN lanes to +0.0 so vmax/vmin never sees a quiet NaN.
+            vop_rr(andn, T, t0, a);
+            vop_rr(andn, t2, t0, b);
+            vop_rr(mm, t3, t2, T);
+            vop_rr(mm, T, T, t2);
+            vop_rr(is_max ? and_ : or_, T, T, t3);
+            as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, T, T, t1, t0);
+            if (alias) as->vex_rr(vex_of(op::movaps), false, x64::id(d), 0, x64::id(T));
+        }
 
+        if (!s.scalar) as->movups(t3, vspill(31));
         if (alias) as->movups(T, vspill(30));
         as->movups(t2, vspill(29));
         as->movups(t1, vspill(28));
@@ -1169,6 +1223,8 @@ unsigned emit_minmax_chain(FpEmit& e, std::span<const std::uint32_t> words) {
     e.as.bind(done);
 
     const Mem quiet = e.ksplat(es, dbl ? 0x0008000000000000ull : 0x00400000ull);
+    const Mem one = e.ksplat(es, dbl ? 0x3ff0000000000000ull : 0x3f800000ull);
+    const SseOp mul_op = s.pick(fops::mul);
     auto* const as = &e.as;
     const std::uint8_t shift = dbl ? 12 : 9;
     std::array<Step, kMaxChain> cold_steps{};
@@ -1249,12 +1305,13 @@ unsigned emit_minmax_chain(FpEmit& e, std::span<const std::uint32_t> words) {
                 }
                 throw std::logic_error("fp: no free xmm for cold minmax chain");
             };
-            const Xmm s1 = pick_free(), s2 = pick_free();
+            const Xmm s1 = pick_free(), s2 = pick_free(), s3 = pick_free();
             const Xmm T = alias ? pick_free() : st.d;
             const Xmm ra = st.a.is_mem ? pick_free() : st.a.reg;
             const Xmm rb = st.b.is_mem ? pick_free() : st.b.reg;
             as->movups(vspill(28), s1);
             as->movups(vspill(29), s2);
+            as->movups(vspill(31), s3);
             if (alias) as->movups(vspill(30), T);
             if (st.a.is_mem) {
                 as->movups(vspill(27), ra);
@@ -1279,16 +1336,22 @@ unsigned emit_minmax_chain(FpEmit& e, std::span<const std::uint32_t> words) {
             vop_rm(and_, s1, s1, quiet);
             vop_rr(or_, s1, s1, rb);                // b, quieted if NaN
             as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, s1, s1, T, s2);
-            if (nm) vop_rr(max_op, s1, s1, s1);
-            vop_rr(mm, T, ra, rb);
-            vop_rr(mm, s2, rb, ra);
-            vop_rr(is_max ? and_ : or_, T, T, s2);
+            // Multiply by 1.0 instead of vmax(s1, s1) to flush denormals under
+            // DAZ/FTZ without raising MXCSR.IE on a quiet NaN.
+            if (nm) vop_rm(mul_op, s1, s1, one);
+            // Mask NaN lanes to +0.0 so vmax/vmin never sees a quiet NaN.
+            vop_rr(andn, T, t0, ra);
+            vop_rr(andn, s2, t0, rb);
+            vop_rr(mm, s3, s2, T);
+            vop_rr(mm, T, T, s2);
+            vop_rr(is_max ? and_ : or_, T, T, s3);
             as->vex_is4(dbl ? vop::vblendvpd : vop::vblendvps, T, T, s1, t0);
             if (alias) as->vex_rr(vex_of(op::movaps), false, x64::id(st.d), 0, x64::id(T));
 
             if (st.b.is_mem) as->movups(rb, vspill(26));
             if (st.a.is_mem) as->movups(ra, vspill(27));
             if (alias) as->movups(T, vspill(30));
+            as->movups(s3, vspill(31));
             as->movups(s2, vspill(29));
             as->movups(s1, vspill(28));
         }
@@ -1769,6 +1832,35 @@ bool emit_fused_h(FpEmit& e, const Inst& in);
 // pairs [n0,n2,n0,n2] and [n1,n3,n1,n3] via 1-cycle vpermilps so vaddps
 // performs the exact same (n0+n1) and (n2+n3) additions with identical IEEE
 // rounding and zero spurious MXCSR exceptions, avoiding slow 3-uop vhaddps.
+// FMOV Vd.4S/.2D, #imm + FADD/FSUB/FMUL/FDIV Vd2.4S/.2D, Vn, Vm -> direct
+// VEX memory operand from the constant pool when Vd is dead after the pair.
+bool emit_fmov_fparith(FpEmit& e, const Inst& in0, const Inst& in1) {
+    if (!e.avx() || !fp_on(fp_old_imm)) return false;
+    const Shape s = in0.sh;
+    if (s.scalar || !s.q || (s.es != 32 && s.es != 64)) return false;
+    if (in1.sh.scalar || !in1.sh.q || in1.sh.es != s.es) return false;
+    const bool is_add = in1.k == K::fadd, is_sub = in1.k == K::fsub;
+    const bool is_mul = in1.k == K::fmul, is_div = in1.k == K::fdiv;
+    if (!is_add && !is_sub && !is_mul && !is_div) return false;
+    if ((is_mul || is_div) && fp_tiny_before_on()) return false;
+    if (in1.rn == in1.rm) return false;
+    const unsigned rd0 = in0.rd;
+    unsigned src_g = 0;
+    if (in1.rm == rd0) {
+        src_g = in1.rn;
+    } else if ((is_add || is_mul) && in1.rn == rd0) {
+        src_g = in1.rm;   // expand_fp_imm is always finite (never NaN)
+    } else {
+        return false;
+    }
+    if (in1.rd != rd0 && !e.ctx.vec_dead_after(2, rd0)) return false;
+    const Xmm src = e.vec(src_g);
+    const Xmm d = e.dest(in1.rd);
+    const FOps& f = is_add ? fops::add : is_sub ? fops::sub : is_mul ? fops::mul : fops::div;
+    e.op(s.pick(f), d, src, Opnd::at(e.ksplat(s.es, in0.imm)));
+    return true;
+}
+
 bool emit_faddp_reduce(FpEmit& e, const Inst& in0, const Inst& in1) {
     if (!e.avx() || fp_tiny_before_on()) return false;
     if (in1.k != K::faddp || !in1.sh.scalar || in1.sh.es != 32 || in1.rn != in0.rd) return false;
@@ -2050,6 +2142,32 @@ bool emit_unary(FpEmit& e, const Inst& in) {
             const Xmm out = e.dest(in.rd);
             emit_round_away(e, s, out, n, false, T);
             e.zero_upper(out, w);
+            return true;
+        }
+        // When every lane of Vn holds the exact same value (e.g. from an earlier
+        // DUP.4S/.2D even with intervening instructions), scalar vsqrtss/vsqrtsd
+        // + broadcast is bit-exact, FPSR-exact, and 2x faster on E-cores.
+        if (sqrt && !s.scalar && s.q && e.feat.avx2 && ((e.ctx.vec_broadcast(s.es) >> in.rn) & 1u) != 0) {
+            const Opnd n = e.src(in.rn);
+            const Xmm d = e.dest(in.rd);
+            if (s.es == 32) {
+                if (n.is_mem) {
+                    e.un(op::movss, d, n);
+                    e.as.vex_rr(vex_of(op::sqrtss), false, x64::id(d), x64::id(d), x64::id(d));
+                } else {
+                    e.as.vex_rr(vex_of(op::sqrtss), false, x64::id(d), x64::id(n.reg), x64::id(n.reg));
+                }
+                e.as.vex_rr(vop::vpbroadcastd, false, x64::id(d), 0, x64::id(d));
+            } else {
+                if (n.is_mem) {
+                    e.un(op::movsd, d, n);
+                    e.as.vex_rr(vex_of(op::sqrtsd), false, x64::id(d), x64::id(d), x64::id(d));
+                } else {
+                    e.as.vex_rr(vex_of(op::sqrtsd), false, x64::id(d), x64::id(n.reg), x64::id(n.reg));
+                }
+                e.as.vex_rr(vex_of(op::movddup), false, x64::id(d), 0, x64::id(d));
+            }
+            e.ctx.note_vec_broadcast(in.rd, s.es);
             return true;
         }
         const SseOp o = s.pick(sqrt ? fops::sqrt : fops::round);

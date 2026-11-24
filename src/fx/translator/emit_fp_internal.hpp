@@ -467,6 +467,8 @@ void tiny_before_fixup(FpEmit& e, unsigned es, bool scalar, unsigned width, Xmm 
 // Vd = op(...) with the fixup above for FMUL, FDIV, FNMUL and the fused forms
 // (S/D shapes); false when the instruction is not one of them.
 bool emit_arith_tiny_before(FpEmit& e, const Inst& in);
+// FMOV Vd.4S/.2D, #imm + FADD/FSUB/FMUL/FDIV Vd2.4S/.2D, Vn, Vm -> pooled memory operand.
+bool emit_fmov_fparith(FpEmit& e, const Inst& in0, const Inst& in1);
 
 // Displacements of FP context fields.
 inline constexpr std::int32_t kFpcrDisp = ctx_disp(offsetof(GuestContext, fpcr));

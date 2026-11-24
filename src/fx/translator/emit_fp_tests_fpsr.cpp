@@ -111,6 +111,21 @@ FX_TEST(fp_mrs_fpsr_reports_accumulated_flags) {
         {"frint64z nan -> IOC", enc::fp1(18, 0, 0, 1), 0x7fc00000, 0, 0x01},
         {"frint64x inf -> IOC", enc::fp1(19, 1, 0, 1), 0x7ff0000000000000ULL, 0, 0x01},
         {"frint32z 2^31 -> IOC", enc::v2(0, 0, 0, 0x1e, 0, 1), f2b(2147483648.0f), 0, 0x01},
+        {"fmaxnm s qnan,1 -> none", enc::fp2(6, 0, 0, 1, 2), 0x7fc00000, f2b(1.0f), 0x00},
+        {"fmaxnm s 1,qnan -> none", enc::fp2(6, 0, 0, 1, 2), f2b(1.0f), 0x7fc00000, 0x00},
+        {"fmaxnm s qnan,qnan -> none", enc::fp2(6, 0, 0, 1, 2), 0x7fc00001, 0xffc00002, 0x00},
+        {"fminnm d qnan,1 -> none", enc::fp2(7, 1, 0, 1, 2), 0x7ff8000000000000ULL, d2b(1.0), 0x00},
+        {"fmax d qnan,1 -> none", enc::fp2(4, 1, 0, 1, 2), 0x7ff8000000000000ULL, d2b(1.0), 0x00},
+        {"fmin s qnan,1 -> none", enc::fp2(5, 0, 0, 1, 2), 0x7fc00000, f2b(1.0f), 0x00},
+        {"fmaxnm s snan,1 -> IOC", enc::fp2(6, 0, 0, 1, 2), 0x7fa00001, f2b(1.0f), 0x01},
+        {"fminnm d 1,snan -> IOC", enc::fp2(7, 1, 0, 1, 2), d2b(1.0), 0x7ff0000000000001ULL, 0x01},
+        {"fmaxnm 4s qnan,1 -> none", enc::v3(1, 0, 0, 0x18, 0, 1, 2),
+         0x7fc00000ULL | (f2b(2.0f) << 32), f2b(1.0f) | (f2b(3.0f) << 32), 0x00},
+        {"fminnm 2d qnan,1 -> none", enc::v3(1, 0, 3, 0x18, 0, 1, 2), 0x7ff8000000000000ULL, d2b(1.0), 0x00},
+        {"fmax 4s qnan,1 -> none", enc::v3(1, 0, 0, 0x1e, 0, 1, 2),
+         0x7fc00000ULL | (f2b(2.0f) << 32), f2b(1.0f) | (f2b(3.0f) << 32), 0x00},
+        {"fminnm 4s snan,1 -> IOC", enc::v3(1, 0, 2, 0x18, 0, 1, 2),
+         0x7fa00001ULL | (f2b(2.0f) << 32), f2b(1.0f) | (f2b(3.0f) << 32), 0x01},
     };
     for (const auto& c : cases) {
         GuestContext ctx = testing::random_context(3);
