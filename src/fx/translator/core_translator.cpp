@@ -185,8 +185,9 @@ std::uint32_t codegen_tier2_bits() {
 } // namespace core
 
 // The cross-region register convention (translator.hpp). Default: SP, x19,
-// x20, x21, x22, FP and LR in the seven host callee-saved registers; SP in
-// rbx (the most common base register), LR in r13 (never a base), FP in rbp.
+// x20, FP and LR in five host callee-saved registers (leaving r14 and r12 as
+// zero-eviction-cost callee-saved pin hosts for hot non-AAPCS registers such
+// as V8's x26/x28 and loop temporaries); SP in rbx, LR in r13, FP in rbp.
 const RegisterConvention& translator_register_convention() {
     static const RegisterConvention conv = [] {
         RegisterConvention c;
@@ -196,7 +197,7 @@ const RegisterConvention& translator_register_convention() {
         static constexpr Pref kPreferred[] = {{31, 3 /*rbx*/}, {19, 6 /*rsi*/}, {20, 7 /*rdi*/}, {21, 14 /*r14*/},
                                               {22, 12 /*r12*/}, {29, 5 /*rbp*/}, {30, 13 /*r13*/}};
         static constexpr std::uint8_t kHosts[] = {3, 6, 7, 14, 12, 5, 13};
-        std::uint32_t want = (1u << 31) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 22) | (1u << 29) | (1u << 30);
+        std::uint32_t want = (1u << 31) | (1u << 19) | (1u << 20) | (1u << 29) | (1u << 30);
         if (const char* v = std::getenv("TRANSMUTE_FX_CORE"); v && std::string(v).find("noglobals") != std::string::npos)
             want = 0;
         if (const char* v = std::getenv("TRANSMUTE_FX_GLOBALS")) {
